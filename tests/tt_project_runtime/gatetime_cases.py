@@ -370,6 +370,13 @@ def test_post_land_failure_that_passes_on_rerun_is_flaky_quarantined_and_never_r
     assert "tests/t.py::test_x" in gatejudge.active(p.state, time.time())
     assert not p.db.q("SELECT id FROM tasks WHERE title LIKE 'Revert%' OR title LIKE 'Fix%'")
     assert not p.db.q("SELECT id FROM push_queue WHERE status='approved'")
+    # A fix owner, as the tests gate's flakes get: the day's deflake task of its module lists it.
+    (t,) = p.db.q("SELECT * FROM tasks WHERE title LIKE 'Deflake %'")
+    assert t["title"] == "Deflake tests/t.py: test_x" and t["kind"] == "code" and t["status"] == "queued"
+    assert "- tests/t.py::test_x" in t["spec"] and pushed[:12] in t["spec"] and "post_land_checks" in t["spec"]
+    assert p.db.kv(postland.KEY)["last"]["deflake"] == [t["id"]]
+    assert p.db.q("SELECT id FROM events WHERE text LIKE ?", (f"%flaky%deflake task #{t['id']}",))
+    assert gatejudge.file_orphans(p) == [], "already owned: the daemon's sweep files nothing more"
 
 
 def test_post_land_first_full_run_spills_and_its_reruns_bisect_and_revert_run_here(env, tmp_path, monkeypatch):

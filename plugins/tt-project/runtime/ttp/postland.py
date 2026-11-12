@@ -229,8 +229,9 @@ def apply(p: Project, job: dict, got: dict) -> str:
         return f"post-landing checks passed on {sha}"
     ids = " ".join(got.get("ids") or [])
     if out == "flaky":
+        owners = " ".join(f"#{t}" for t in got.get("deflake") or [])
         _event(db, f"Post-landing checks on {sha}: failed, then passed on a rerun (flaky, quarantined, not "
-                   f"reverted): {ids}", kind=EVENT, queued=False)
+                   f"reverted): {ids}" + (f"; deflake task {owners}" if owners else ""), kind=EVENT, queued=False)
         return "flaky"
     if out != "guilty":   # not this landing's (pre_existing) is only recorded; the rest is the coordinator's
         _event(db, f"Post-landing checks on {sha}: {out}: {got.get('why') or ''} {ids}".strip(),
@@ -365,10 +366,13 @@ def _drive(p: Project, job: dict, checks: list, run) -> dict:
         out.update(revert(p, Path(job["repo"]), job, e, cmd, ids, run))
         return out
     if flaky:
-        s = gatejudge.settings(p.config())
-        gatejudge.quarantine(p.state, flaky, {"head": sha, "check": "post_land_checks", "host": gatejudge.host()},
-                             time.time(), s["days"])
-        return {"outcome": "flaky", "ids": flaky}
+        from .budget import task_default_usd
+        cfg, now = p.config(), time.time()
+        seen = {"head": sha, "check": "post_land_checks", "host": gatejudge.host()}
+        new = gatejudge.quarantine(p.state, flaky, seen, now, gatejudge.settings(cfg)["days"])
+        # a fix owner like the tests gate's flakes get: the day's deflake task of each module
+        tasks = gatejudge.deflake(p.db, new, seen, now, p, task_default_usd(cfg, "standard")) if new else []
+        return {"outcome": "flaky", "ids": flaky, "deflake": tasks}
     return {"outcome": "pass"}
 
 

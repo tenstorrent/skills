@@ -451,6 +451,27 @@ def deflake(db, ids: list[str], evidence: dict, now: float, where, budget_usd: f
     return sorted(out)
 
 
+def unfiled(db, q: dict) -> list[str]:
+    """The ids of quarantine entries `q` ({id: entry}) that no deflake record has listed since the entry was
+    first seen: quarantined without a fix owner (a path that quarantines without filing, or before it did)."""
+    recs = [v for v in db.kv_dict(DEFLAKE_KEY)[0].values() if isinstance(v, dict)]
+    return sorted(i for i, e in q.items() if not any(
+        i in (v.get("ids") or []) and float(v.get("ts") or 0) >= float(e.get("first_seen") or 0) for v in recs))
+
+
+def file_orphans(p, now: float | None = None, budget_usd: float | None = None) -> list[int]:
+    """The daemon's sweep: file each active quarantine entry with no fix owner (unfiled) into its module's
+    deflake task, as the tests gate files its new flakes (deflake), with the entry's last evidence. Model-free;
+    one quarantine read and one kv read when there is none. The tasks touched, ascending."""
+    now = time.time() if now is None else now
+    q = active(p.state, now)
+    out: set[int] = set()
+    for i in unfiled(p.db, q) if q else []:
+        ev = [x for x in q[i].get("evidence") or [] if isinstance(x, dict)]
+        out.update(deflake(p.db, [i], ev[-1] if ev else {}, now, p, budget_usd))
+    return sorted(out)
+
+
 def lift_due(p, now: float | None = None) -> list[dict]:
     """The daemon's sweep: lift each active entry whose fix landed (see the module docstring). Local refs
     only, never a fetch. The lifts made: [{id, why, commit}]."""

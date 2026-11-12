@@ -3032,6 +3032,11 @@ class Daemon:
                 log(self.p, f"quarantine: lifted {x['id']}: {x['why']}")
         except Exception:
             log(self.p, "quarantine lift sweep failed\n" + traceback.format_exc())
+        try:   # entries quarantined with no fix owner get one, as the tests gate's flakes do
+            for t in gatejudge.file_orphans(self.p, now, bud.task_default_usd(self.cfg, "standard")):
+                log(self.p, f"quarantine: unowned flaky tests filed into deflake task #{t}")
+        except Exception:
+            log(self.p, "quarantine deflake sweep failed\n" + traceback.format_exc())
 
     def _machine_pages(self, pages: list[dict], now: float) -> bool:
         """Deliver one group of machine_ledger.batches: a project's expired-change pages as one item, else one

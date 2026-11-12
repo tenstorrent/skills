@@ -475,6 +475,35 @@ def test_tests_quarantined_on_one_day_share_one_deflake_task_per_module(env):
     assert not p.db.q("SELECT id FROM events WHERE status='queued'")
 
 
+def test_a_quarantined_test_with_no_fix_owner_is_filed_once_by_the_daemons_sweep(env):
+    """An entry quarantined by a path that filed no deflake task (or before it did) gets one from the sweep,
+    exactly once across ticks; one an open deflake task lists is never filed again."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from ttp import gatejudge
+    p = make(env)
+    now = datetime(2026, 1, 5, 10, 0, tzinfo=ZoneInfo("America/Los_Angeles")).timestamp()
+    owned, orphan, other = "tests/test_m.py::test_a", "tests/test_m.py::test_b", "tests/test_n.py::test_c"
+    ev = {"head": "e" * 40, "check": "post_land_checks"}
+    gatejudge.quarantine(p.state, [owned, orphan, other], ev, now - 600, 7)
+    (t0,) = gatejudge.deflake(p.db, [owned], ev, now - 300, p)
+    assert gatejudge.unfiled(p.db, gatejudge.active(p.state, now)) == [orphan, other]
+    got = gatejudge.file_orphans(p, now, 4.0)
+    assert len(got) == 2 and t0 in got, "the module's queued, never-started task takes its orphan"
+    assert all(f"- {i}" in p.db.task(t0)["spec"] for i in (owned, orphan))
+    (t1,) = set(got) - {t0}
+    assert "- " + other in p.db.task(t1)["spec"] and p.db.task(t1)["budget_usd"] == 4.0
+    assert "e" * 12 in p.db.task(t1)["spec"], "the entry's last evidence"
+    n = p.db.q("SELECT count(*) AS n FROM tasks")[0]["n"]
+    for k in range(1, 4):   # repeated ticks file nothing more
+        assert gatejudge.file_orphans(p, now + k * 600) == []
+    # A finished deflake task still owns its tests for that quarantine: no second task.
+    p.db.update_task(t1, status="done")
+    assert gatejudge.file_orphans(p, now + 3600) == []
+    assert p.db.q("SELECT count(*) AS n FROM tasks")[0]["n"] == n
+    assert gatejudge.file_orphans(p, now + 30 * 86400) == [], "expired entries are not filed"
+
+
 def test_a_deflake_tasks_landing_lifts_its_tests_model_free_even_past_its_cut_title(env, monkeypatch):
     from ttp import cli, gatejudge, worktree
     names = [f"test_{n}_" + "x" * 80 for n in "abc"]
