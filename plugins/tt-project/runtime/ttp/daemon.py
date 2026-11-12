@@ -7501,6 +7501,8 @@ class Daemon:
             head, _ = self._branch_tip(branch)
             if head:
                 self._has_changes(task)
+                if task.get("kind") == "code" and splitgate.split_lines(self.cfg):   # _split_back, _auto_review's size line
+                    self._split_size(task, branch)
                 if (self.cfg.get("delivery") or {}).get("push_branch"):
                     gitmemo.cached(("landed.equivalent", branch), lambda: landed.equivalent(
                         self.p, branch, (self.cfg.get("delivery") or {}).get("version_bump")))
@@ -20401,7 +20403,7 @@ class Daemon:
             return ""
         db, key = self.p.db, str(task["id"])
         try:
-            changes, based = gitmemo.cached(("splitgate.size", branch), lambda: self._split_size(task, branch))
+            changes, based = self._split_size(task, branch)
         except subprocess.TimeoutExpired as e:
             tries, _ = db.kv_dict(KV_SPLIT_UNREAD)
             n = int(tries.pop(key, 0) or 0) + 1
@@ -20448,9 +20450,11 @@ class Daemon:
     def _split_size(self, task: dict, branch: str) -> tuple[dict | None, str]:
         """(lines changed per file, the base they were measured against) of task `task`'s change on `branch`
         for the split check: against its own base (worktree.own_base), never the gap between another base
-        and the push branch."""
-        base, name = worktree.own_base(self.p, task, branch)
-        return worktree.diff_lines(self.p, [branch], base=base), name
+        and the push branch. Read once within a gitmemo scope (warmed by _prefetch_hop)."""
+        def read() -> tuple[dict | None, str]:
+            base, name = worktree.own_base(self.p, task, branch)
+            return worktree.diff_lines(self.p, [branch], base=base), name
+        return gitmemo.cached(("splitgate.size", branch), read)
 
     def _branch_tip(self, branch: str) -> tuple[str, str]:
         """(head, its subject) of `branch`, ('', '') when it is missing; read once within a gitmemo scope."""
