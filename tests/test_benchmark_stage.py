@@ -151,9 +151,9 @@ def test_missing_benchmark_evidence_fails_closed(tmp_path):
         check(tmp_path / 'models/autoports/model')
 
 
-def performance_fixture(requests, output_tokens=128):
-    return dict(completed=requests, failed=0, input_lens=[4096] * requests,
-                output_lens=[output_tokens] * requests, total_input_tokens=4096 * requests,
+def performance_fixture(requests, output_tokens=128, input_tokens=4096):
+    return dict(completed=requests, failed=0, input_lens=[input_tokens] * requests,
+                output_lens=[output_tokens] * requests, total_input_tokens=input_tokens * requests,
                 total_output_tokens=output_tokens * requests,
                 **{field: 7 for field in PERFORMANCE_METRICS})
 
@@ -216,6 +216,21 @@ def fake_server_command(argv):
     return True
 
 
+def fake_bench(argv, events=None):
+    """Write the raw vllm-bench result the runner asked for; return (name, concurrency)."""
+    count = int(argv[argv.index('--num-prompts') + 1])
+    batch = int(argv[argv.index('--max-concurrency') + 1])
+    isl = int(argv[argv.index('--random-input-len') + 1])
+    path = Path(argv[argv.index('--result-dir') + 1]) / argv[argv.index('--result-filename') + 1]
+    path.write_text(json.dumps(dict(performance_fixture(count, input_tokens=isl), model_id='org/model', max_concurrency=batch)))
+    if events is not None:
+        kind = 'warmup' if 'warmup' in path.name else 'measure'
+        if '-c1-' in path.name:
+            kind += '-' + path.stem.split('-c1-')[1].replace('-warmup', '')
+        events.append((kind, str(batch)))
+    return path.name, batch
+
+
 def fake_roofline_command(argv):
     if argv[0] != 'collector':
         return False
@@ -226,6 +241,8 @@ def fake_roofline_command(argv):
 
 
 def valid_gate_fixture(tmp_path):
+    from benchmark_stage.answers import task_statistics
+    from benchmark_stage.plan import batch_plan, lone_user_profiles
     root = tmp_path / 'models/autoports/model'
     evidence = root / 'doc/benchmark'
     evidence.mkdir(parents=True)
@@ -243,16 +260,20 @@ def valid_gate_fixture(tmp_path):
     manifest['manifest_sha256'] = digest(manifest)
     write('run/manifest.json', manifest)
     write('identity.json', server_fixture(32))
-    write('run/run_config.json', dict(model='org/model', base_url='http://unused', tasks=tasks,
-                                     budget_seconds=3600, output_tokens=128))
-    summary = dict(status='completed', elapsed_seconds=30, accuracy={}, performance={})
+    config = dict(model='org/model', base_url='http://unused', tasks=tasks, batch_sizes=[1, 32],
+                  output_tokens=128, generation={t: {'max_gen_toks': 4096} for t in tasks})
+    write('run/run_config.json', config)
+    summary = dict(status='completed', elapsed_seconds=30, client_seconds=20, setup_seconds=10,
+                   accuracy={}, performance={}, lone_user={}, answer_statistics={},
+                   accuracy_prefix_caching=False, **batch_plan(config))
     for task in tasks:
         stage = dict(model='org/model', subset_sha256=manifest['manifest_sha256'],
-                     responses=2, expected_samples=2, concurrency=32, finish_reasons={'stop': 2})
+                     responses=2, expected_samples=2, concurrency=32, finish_reasons={'stop': 2},
+                     generation_overrides=config['generation'][task])
         summary['accuracy'][task] = stage
         write(f'run/{task}/results.json', dict(results={task: {'acc,none': 0.5}}, benchmark_stage=stage))
-        (evidence / f'run/{task}/samples_{task}.jsonl').write_text(''.join(json.dumps({'doc_id': i, 'doc': d}) + '\n' for i, d in enumerate(docs)))
-        response = dict(choices=[dict(index=0, message=dict(content='answer'), finish_reason='stop')])
+        (evidence / f'run/{task}/samples_{task}.jsonl').write_text(''.join(json.dumps({'doc_id': i, 'doc': d, 'filtered_resps': ['answer']}) + '\n' for i, d in enumerate(docs)))
+        response = dict(choices=[dict(index=0, message=dict(content='answer'), finish_reason='stop')], usage=dict(completion_tokens=300))
         (evidence / f'run/{task}/responses.jsonl').write_text((json.dumps(response) + '\n') * 2)
     for b in (1, 32):
         server = write_server_fixture(evidence / 'run', b)
@@ -260,12 +281,34 @@ def valid_gate_fixture(tmp_path):
         raw = dict(performance_fixture(requests), model_id='org/model', max_concurrency=b)
         summary['performance'][str(b)] = dict(raw, concurrency=b, server_max_num_seqs=b,
                                               server_identity_sha256=digest(server), requested_input_tokens=4096,
-                                              requested_output_tokens=128, requests=requests)
+                                              requested_output_tokens=128, requests=requests,
+                                              server_prefix_caching=False)
         write(f'run/perf-b{b}.json', raw)
         write(f'run/perf-b{b}-warmup.json', dict(performance_fixture(b), model_id='org/model', max_concurrency=b))
+    for profile in lone_user_profiles(32, 131072, 128):
+        raw = dict(performance_fixture(profile['requests'], input_tokens=profile['input_tokens']),
+                   model_id='org/model', max_concurrency=1)
+        write(f"run/{profile['file']}.json", raw)
+        summary['lone_user'][profile['name']] = dict(
+            raw, concurrency=1, server_max_num_seqs=32, server_identity_sha256=digest(server),
+            requested_input_tokens=profile['input_tokens'], requested_output_tokens=128,
+            requests=profile['requests'], server_prefix_caching=False, file=profile['file'] + '.json')
+    for task in tasks:
+        summary['answer_statistics'][task] = task_statistics(evidence / 'run', config, manifest, task)
     write('run/summary.json', summary)
     roofline_fixture(evidence / 'run')
     return root, evidence
+
+
+def refresh_answer_statistics(evidence):
+    """Recompute stored statistics after a test edits raw responses or samples."""
+    from benchmark_stage.answers import task_statistics
+    run = evidence / 'run'
+    config, manifest = (json.loads((run / f).read_text()) for f in ('run_config.json', 'manifest.json'))
+    summary = json.loads((run / 'summary.json').read_text())
+    for task in config['tasks']:
+        summary['answer_statistics'][task] = task_statistics(run, config, manifest, task)
+    (run / 'summary.json').write_text(json.dumps(summary))
 
 
 @pytest.mark.parametrize('mutation', ['reference_metric', 'model', 'raw_perf', 'transcript', 'batch', 'layers', 'manifest', 'sample_ids', 'truncation'])
@@ -333,6 +376,7 @@ def test_gate_preserves_multiple_filters_per_question(tmp_path):
     rows = [json.loads(line) for line in path.read_text().splitlines()]
     rows += [dict(row, filter='second-filter') for row in rows]
     path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+    refresh_answer_statistics(evidence)
     assert check(root, 'org/model') == evidence
     rows.pop()
     path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
@@ -352,10 +396,7 @@ def test_reporting_budget_and_manifest_snapshot(tmp_path, monkeypatch):
     monkeypatch.setattr(runner.time, 'monotonic', lambda: clock[0])
     def completed(argv, log, deadline):
         if fake_server_command(argv) or fake_roofline_command(argv): return
-        count = int(argv[argv.index('--num-prompts') + 1])
-        batch = int(argv[argv.index('--max-concurrency') + 1])
-        path = Path(argv[argv.index('--result-dir') + 1]) / argv[argv.index('--result-filename') + 1]
-        path.write_text(json.dumps(dict(performance_fixture(count), model_id='org/model', max_concurrency=batch)))
+        fake_bench(argv)
         source.write_text(json.dumps({'manifest_sha256': 'later-profile'}))
     monkeypatch.setattr(runner, 'command', completed)
     def slow_report(output, cfg, summary):
@@ -377,8 +418,7 @@ def test_budget_failure_report_does_not_say_completed(tmp_path,monkeypatch):
  clock=[0];monkeypatch.setattr(runner.time,'monotonic',lambda:clock[0])
  def command(argv,log,deadline):
   if fake_server_command(argv) or fake_roofline_command(argv): return
-  count=int(argv[argv.index('--num-prompts')+1]);batch=int(argv[argv.index('--max-concurrency')+1]);out=Path(argv[argv.index('--result-dir')+1])/argv[argv.index('--result-filename')+1]
-  out.write_text(json.dumps(dict(performance_fixture(count),model_id='org/model',max_concurrency=batch)))
+  fake_bench(argv)
  monkeypatch.setattr(runner,'command',command);original=report.write_report
  def slow_report(output,config,summary):
   original(output,config,summary);clock[0]=2
@@ -450,6 +490,8 @@ def test_gate_requires_exhaustion_count_without_accuracy_assessment(tmp_path):
         metadata = data['accuracy']['ifeval'] if stage == 'summary' else data['benchmark_stage']
         metadata['empty_final_length_responses'] = 1
         path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match='answer statistics disagree'): check(root)
+    refresh_answer_statistics(evidence)
     assert check(root) == evidence
 
 
@@ -478,8 +520,13 @@ def test_empty_exhausted_final_with_pinned_upstream_parser_and_ifeval(monkeypatc
     assert utils.process_results(doc, ['control'])['prompt_level_strict_acc'] is True
 
 
-@pytest.mark.parametrize('mutation', [None, 'link_id', 'doc_id', 'request_hash', 'scored_answer'])
+@pytest.mark.parametrize('mutation', [None, 'duplicate_prompt', 'link_id', 'doc_id', 'request_hash', 'scored_answer',
+                                      'instance_hash', 'repeated_instance'])
 def test_shared_gate_reconciles_requests_with_scored_answers(tmp_path, mutation):
+    """Identity is the frozen document instance; identical prompts on two documents are valid.
+
+    TriviaQA rc.nocontext has 56 duplicate question pairs; uniqueness by request text rejected them.
+    """
     root, evidence = valid_gate_fixture(tmp_path)
     config_path = evidence / 'run/run_config.json'
     config = json.loads(config_path.read_text())
@@ -498,20 +545,28 @@ def test_shared_gate_reconciles_requests_with_scored_answers(tmp_path, mutation)
         samples = [json.loads(line) for line in sample_path.read_text().splitlines()]
         responses, links = [], []
         for row in samples:
-            row.update(arguments=[[f'question {row["doc_id"]}', {'until': []}]], resps=[['answer']])
+            prompt = 'question 0' if mutation == 'duplicate_prompt' else f'question {row["doc_id"]}'
+            row.update(arguments=[[prompt, {'until': []}]], resps=[['answer']])
             response_id = f'{task}-{row["doc_id"]}'
-            responses.append(dict(id=response_id, choices=[dict(index=0, message=dict(content='answer'), finish_reason='stop')]))
+            responses.append(dict(id=response_id, choices=[dict(index=0, message=dict(content='answer'), finish_reason='stop')],
+                                  usage=dict(completion_tokens=300)))
+            request = digest(row['arguments'][0])
             links.append(dict(group=task, task=task, doc_id=row['doc_id'], response_id=response_id,
-                              request_sha256=digest(row['arguments'][0])))
+                              request_sha256=request, request_instance_sha256=digest([task, row['doc_id'], request])))
         if task == 'ifeval':
             if mutation == 'link_id': links[0]['response_id'] = 'wrong'
             elif mutation == 'doc_id': links[0]['doc_id'] = 3
             elif mutation == 'request_hash': links[0]['request_sha256'] = 'wrong'
             elif mutation == 'scored_answer': samples[0]['resps'] = [['different answer']]
+            elif mutation == 'instance_hash': links[0]['request_instance_sha256'] = digest(['ifeval', 1, links[0]['request_sha256']])
+            elif mutation == 'repeated_instance': links[1]['request_instance_sha256'] = links[0]['request_instance_sha256']
+            if mutation == 'duplicate_prompt':
+                assert links[0]['request_sha256'] == links[1]['request_sha256']
         for name, rows in [(sample_path.name, samples), ('responses.jsonl', responses), ('request_links.jsonl', links)]:
             (sample_path.parent / name).write_text(''.join(json.dumps(row) + '\n' for row in rows))
     summary_path.write_text(json.dumps(summary))
-    if mutation:
+    refresh_answer_statistics(evidence)
+    if mutation and mutation != 'duplicate_prompt':
         with pytest.raises(ValueError): check(root)
     else:
         assert check(root) == evidence
@@ -622,48 +677,88 @@ def test_roofline_rejects_invalid_measurement_inputs(tmp_path, mutation):
 
 
 @pytest.mark.parametrize('collect', [True, False])
-def test_runner_collects_each_profile_before_switching_with_same_deadline(tmp_path, monkeypatch, collect):
+def test_runner_collects_each_profile_before_switching_with_split_clocks(tmp_path, monkeypatch, collect):
     from benchmark_stage import run as runner
     source = tmp_path / 'manifest.json'
     source.write_text(json.dumps({'manifest_sha256': 'fixture', 'groups': {}}))
     config_path = tmp_path / 'config.json'
     config_path.write_text(json.dumps(dict(model='org/model', base_url='http://unused', performance_server_command=['server-control'],
-        manifest=str(source), tasks=[], roofline_command=['collector'])))
-    deadlines = []
+        manifest=str(source), tasks=[], roofline_command=['collector'], batch_sizes=[1, 32],
+        budget_seconds=1000, setup_budget_seconds=500)))
+    monkeypatch.setattr(runner.time, 'monotonic', lambda: 0)
+    deadlines = {}
     events = []
     def completed(argv, log, deadline):
-        deadlines.append(deadline)
         if fake_server_command(argv):
             events.append(('server', argv[argv.index('--max-num-seqs') + 1]))
-            return
-        if argv[0] == 'collector':
+        elif argv[0] == 'collector':
             action = argv[argv.index('--action') + 1]
             capacity = argv[argv.index('--concurrency') + 1]
             events.append((action, capacity))
             if action == 'collect' and collect:
                 fake_roofline_command(argv)
-            return
-        count = int(argv[argv.index('--num-prompts') + 1])
-        batch = int(argv[argv.index('--max-concurrency') + 1])
-        path = Path(argv[argv.index('--result-dir') + 1]) / argv[argv.index('--result-filename') + 1]
-        events.append(('warmup' if 'warmup' in path.name else 'measure', str(batch)))
-        path.write_text(json.dumps(dict(performance_fixture(count), model_id='org/model', max_concurrency=batch)))
+        else:
+            fake_bench(argv, events)
+        deadlines.setdefault(events[-1][0], set()).add(deadline)
     monkeypatch.setattr(runner, 'command', completed)
     if collect:
         assert runner.run(config_path=config_path, output=tmp_path / 'run')['status'] == 'completed'
         report = (tmp_path / 'run/REPORT.md').read_text()
         assert '| 50.00 | 50.00 |' in report
         assert 'phase-timings.json' in report
-        assert events == [('server', '32'), ('check', '32'), ('warmup', '32'), ('measure', '32'),
-                          ('collect', '32'), ('server', '1'), ('check', '1'), ('warmup', '1'),
-                          ('measure', '1'), ('collect', '1')]
+        assert events == [('server', '32'), ('check', '32'), ('warmup', '32'), ('measure', '32'), ('collect', '32'),
+                          ('warmup-functional', '1'), ('measure-functional', '1'),
+                          ('warmup-long_context', '1'), ('measure-long_context', '1'),
+                          ('server', '1'), ('check', '1'), ('warmup', '1'), ('measure', '1'), ('collect', '1')]
+        # Launch, readiness check and warmup run on the setup clock; the rest on the client clock.
+        for kind in ('server', 'check', 'warmup', 'warmup-functional', 'warmup-long_context'):
+            assert deadlines[kind] == {500}
+        for kind in ('measure', 'collect', 'measure-functional', 'measure-long_context'):
+            assert deadlines[kind] == {1000}
     else:
         with pytest.raises(ValueError, match='missing required roofline.json'):
             runner.run(config_path=config_path, output=tmp_path / 'run')
         assert json.loads((tmp_path / 'run/summary.json').read_text())['status'] == 'failed'
         assert ('server', '1') not in events
         assert '| 32 users | 32 | 32 |' in (tmp_path / 'run/REPORT.md').read_text()
-    assert len(deadlines) == (10 if collect else 5) and len(set(deadlines)) == 1
+
+
+def test_setup_time_is_excluded_from_client_clock_and_bounded_separately(tmp_path, monkeypatch):
+    """A slow server launch/compile no longer consumes the client budget; it has its own bound."""
+    from benchmark_stage import run as runner
+    source = tmp_path / 'manifest.json'
+    source.write_text(json.dumps({'manifest_sha256': 'fixture', 'groups': {}}))
+    clock = [0.0]
+    monkeypatch.setattr(runner.time, 'monotonic', lambda: clock[0])
+    def completed(argv, log, deadline):
+        if fake_server_command(argv):
+            clock[0] += 900  # 15-minute launch and compile per server
+            return
+        if fake_roofline_command(argv): return
+        fake_bench(argv)
+        clock[0] += 10
+    monkeypatch.setattr(runner, 'command', completed)
+    def run(name, **extra):
+        config_path = tmp_path / f'{name}.json'
+        config_path.write_text(json.dumps(dict(model='org/model', base_url='http://unused', performance_server_command=['server-control'],
+            manifest=str(source), tasks=[], roofline_command=['collector'], batch_sizes=[1, 32], **extra)))
+        return runner.run(config_path=config_path, output=tmp_path / name)
+    summary = run('ok', budget_seconds=200)
+    assert summary['setup_seconds'] > summary['client_budget_seconds'] > summary['client_seconds']
+    assert summary['setup_seconds_by_batch']['32'] >= 900 and summary['setup_seconds_by_batch']['1'] >= 900
+    assert 'Server setup (launch, compile, warmup):' in (tmp_path / 'ok/REPORT.md').read_text()
+    with pytest.raises(RuntimeError, match='setup'):
+        run('slow_setup', setup_budget_seconds=1500)
+    assert json.loads((tmp_path / 'slow_setup/summary.json').read_text())['status'] == 'failed'
+
+
+@pytest.mark.parametrize('budget', [3601, 0])
+def test_client_budget_is_thirty_minutes_per_configured_batch(tmp_path, budget):
+    from benchmark_stage.plan import batch_plan
+    assert batch_plan({})['client_budget_seconds'] == 4 * 1800
+    assert batch_plan({'batch_sizes': [1, 32]})['client_budget_seconds'] == 3600
+    with pytest.raises(ValueError, match='budget_seconds'):
+        batch_plan({'batch_sizes': [1, 32], 'budget_seconds': budget})
 
 
 @pytest.mark.parametrize('mutation', ['capacity', 'launch_command', 'precision', 'context', 'evidence', 'summary'])
@@ -693,7 +788,7 @@ def test_runner_switches_server_capacity_before_each_performance_profile(tmp_pat
     manifest = tmp_path / 'manifest.json'
     manifest.write_text(json.dumps({'manifest_sha256': 'fixture', 'groups': {'ifeval': {'tasks': ['ifeval'], 'sample_count': 1, 'population': 1}}}))
     config_path = tmp_path / 'config.json'
-    config_path.write_text(json.dumps(dict(model='org/model', base_url='http://unused',
+    config_path.write_text(json.dumps(dict(model='org/model', base_url='http://unused', batch_sizes=[1, 32],
         manifest=str(manifest), tasks=['ifeval'], performance_server_command=['server-control'], roofline_command=['collector'])))
     events = []
     def completed(argv, log, deadline):
@@ -709,32 +804,79 @@ def test_runner_switches_server_capacity_before_each_performance_profile(tmp_pat
                 path.write_text(json.dumps(server))
             return
         if 'evaluate' in argv:
-            events.append(('accuracy', 32))
+            events.append(('accuracy', int(argv[argv.index('--concurrency') + 1])))
             task_output = Path(argv[argv.index('--output') + 1])
             task_output.mkdir()
             (task_output / 'results.json').write_text(json.dumps({
                 'results': {'ifeval': {'acc,none': 0.5}},
                 'benchmark_stage': {'responses': 1, 'finish_reasons': {'stop': 1}, 'elapsed_seconds': 1}}))
+            (task_output / 'responses.jsonl').write_text(json.dumps(dict(
+                choices=[dict(index=0, message=dict(content='x'), finish_reason='stop')], usage=dict(completion_tokens=5))) + '\n')
+            (task_output / 'samples_ifeval.jsonl').write_text(json.dumps(dict(doc_id=0, filtered_resps=['x'])) + '\n')
             return
-        capacity = int(argv[argv.index('--max-concurrency') + 1])
-        count = int(argv[argv.index('--num-prompts') + 1])
-        events.append(('measure', capacity))
-        path = Path(argv[argv.index('--result-dir') + 1]) / argv[argv.index('--result-filename') + 1]
-        path.write_text(json.dumps(dict(performance_fixture(count), model_id='org/model', max_concurrency=capacity)))
+        name, capacity = fake_bench(argv)
+        if '-c1-' not in name:
+            events.append(('measure', capacity))
     monkeypatch.setattr(runner, 'command', completed)
     if wrong_capacity:
         with pytest.raises(ValueError, match='1-slot server'):
             runner.run(config_path=config_path, output=tmp_path / 'run')
-        assert events == [('server', 32), ('accuracy', 32), ('measure', 32), ('measure', 32), ('server', 1)]
+        assert events == [('server', 32), ('measure', 32), ('accuracy', 32), ('measure', 32), ('server', 1)]
         assert not (tmp_path / 'run/perf-b1.json').exists()
     else:
         summary = runner.run(config_path=config_path, output=tmp_path / 'run')
-        assert events == [('server', 32), ('accuracy', 32), ('measure', 32), ('measure', 32),
+        assert events == [('server', 32), ('measure', 32), ('accuracy', 32), ('measure', 32),
                           ('server', 1), ('measure', 1), ('measure', 1)]
         assert summary['performance']['1']['server_max_num_seqs'] == 1
         assert summary['performance']['32']['server_max_num_seqs'] == 32
+        assert summary['answer_statistics']['ifeval']['answer_tokens'] == {'median': 5, 'p90': 5, 'max': 5}
         report = (tmp_path / 'run/REPORT.md').read_text()
         assert report.index('| Single user | 1 | 1 |') < report.index('| 32 users | 32 | 32 |')
+        assert '## Answer quality' in report
+
+
+def test_default_batch_sizes_measure_largest_first_with_accuracy_on_the_largest(tmp_path, monkeypatch):
+    """Default is 1/8/16/32; each profile sets max-num-seqs = concurrency = b. Skips carry a reason."""
+    from benchmark_stage import run as runner
+    source = tmp_path / 'manifest.json'
+    source.write_text(json.dumps({'manifest_sha256': 'fixture', 'groups': {}}))
+    events = []
+    def completed(argv, log, deadline):
+        if fake_server_command(argv):
+            events.append(('server', int(argv[argv.index('--max-num-seqs') + 1])))
+        elif not fake_roofline_command(argv):
+            name, batch = fake_bench(argv)
+            if 'warmup' not in name and '-c1-' not in name:
+                events.append(('measure', batch))
+    monkeypatch.setattr(runner, 'command', completed)
+    def run(name, **extra):
+        config_path = tmp_path / f'{name}.json'
+        config_path.write_text(json.dumps(dict(model='org/model', base_url='http://unused', tasks=[], manifest=str(source),
+            performance_server_command=['server-control'], roofline_command=['collector'], **extra)))
+        events.clear()
+        return runner.run(config_path=config_path, output=tmp_path / name)
+    summary = run('default')
+    assert [c for kind, c in events if kind == 'server'] == [32, 16, 8, 1]
+    assert [c for kind, c in events if kind == 'measure'] == [32, 16, 8, 1]
+    assert summary['measured_batch_sizes'] == [32, 16, 8, 1] and summary['accuracy_concurrency'] == 32
+    assert set(summary['lone_user']) == {'functional', 'long_context'}
+    assert summary['lone_user']['functional']['requested_input_tokens'] == 128
+    assert summary['lone_user']['long_context']['requested_input_tokens'] == 32768
+    assert summary['lone_user']['long_context']['server_max_num_seqs'] == 32
+    summary = run('skip', skipped_batch_sizes={'32': 'Stage 10 could not validate 32 slots: trace capture OOM'})
+    assert [c for kind, c in events if kind == 'server'] == [16, 8, 1]
+    assert summary['accuracy_concurrency'] == 16
+    assert summary['lone_user']['functional']['server_max_num_seqs'] == 16
+    assert 'trace capture OOM' in (tmp_path / 'skip/REPORT.md').read_text()
+
+
+@pytest.mark.parametrize('config', [{'batch_sizes': []}, {'batch_sizes': [8, 8]}, {'batch_sizes': [0]},
+                                    {'skipped_batch_sizes': {'32': ''}}, {'skipped_batch_sizes': {'64': 'x'}},
+                                    {'batch_sizes': [1], 'skipped_batch_sizes': {'1': 'x'}}])
+def test_invalid_batch_configuration_is_rejected(config):
+    from benchmark_stage.plan import batch_plan
+    with pytest.raises(ValueError):
+        batch_plan(config)
 
 
 def test_runner_rejects_implicit_shared_server_before_accuracy(tmp_path, monkeypatch):
@@ -839,3 +981,190 @@ def test_roofline_percentage_is_a_result_not_an_acceptance_threshold(tmp_path):
     assert results['1']['prefill']['percent'] == .025
     assert results['1']['decode']['percent'] == 200  # Do not clamp modeled estimates.
     assert check(root) == evidence
+
+
+@pytest.mark.parametrize('value,ok', [(False, True), (True, True), (None, False), ('off', False)])
+def test_prefix_caching_must_be_recorded_not_disabled(tmp_path, value, ok):
+    """#42 requires prefix caching for evals; the gate needs a recorded bool, not False."""
+    root, evidence = valid_gate_fixture(tmp_path)
+    path = evidence / 'identity.json'
+    identity = json.loads(path.read_text())
+    if value is None: del identity['prefix_caching']
+    else: identity['prefix_caching'] = value
+    path.write_text(json.dumps(identity))
+    if ok:
+        assert check(root) == evidence
+    else:
+        with pytest.raises(ValueError, match='prefix_caching'): check(root)
+
+
+def test_perf_server_with_prefix_caching_on_is_recorded(tmp_path):
+    from benchmark_stage.evidence import validate_server
+    server = server_fixture(32)
+    validate_server(dict(server, prefix_caching=True), 32, 'org/model', 'http://unused')
+    with pytest.raises(ValueError, match='prefix_caching'):
+        validate_server({k: v for k, v in server.items() if k != 'prefix_caching'}, 32, 'org/model', 'http://unused')
+
+
+@pytest.mark.parametrize('mutation', ['missing_row', 'wrong_isl', 'wrong_server', 'missing_raw', 'raw_metric'])
+def test_gate_requires_lone_user_rows_on_largest_server(tmp_path, mutation):
+    root, evidence = valid_gate_fixture(tmp_path)
+    summary_path = evidence / 'run/summary.json'
+    summary = json.loads(summary_path.read_text())
+    lone = summary['lone_user']
+    if mutation == 'missing_row': del lone['long_context']
+    elif mutation == 'wrong_isl': lone['functional']['requested_input_tokens'] = 4096
+    elif mutation == 'wrong_server': lone['functional']['server_identity_sha256'] = summary['performance']['1']['server_identity_sha256']
+    elif mutation == 'missing_raw': (evidence / 'run' / lone['functional']['file']).unlink()
+    else: lone['long_context']['mean_tpot_ms'] += 1
+    summary_path.write_text(json.dumps(summary))
+    with pytest.raises((ValueError, OSError)): check(root)
+
+
+def test_long_context_row_uses_max_context_when_smaller():
+    from benchmark_stage.plan import lone_user_profiles
+    rows = {p['name']: p for p in lone_user_profiles(32, 16384, 128)}
+    assert rows['functional']['input_tokens'] == 128 and rows['functional']['concurrency'] == 1
+    assert rows['long_context']['input_tokens'] == 16384 - 128
+    assert {p['name']: p['input_tokens'] for p in lone_user_profiles(32, 131072, 128)}['long_context'] == 32768
+
+
+@pytest.mark.parametrize('mutation', ['skip_without_reason', 'accuracy_not_largest', 'perf_row_missing', 'roofline_missing'])
+def test_gate_checks_measured_batch_profiles(tmp_path, mutation):
+    root, evidence = valid_gate_fixture(tmp_path)
+    run = evidence / 'run'
+    config, summary = (json.loads((run / f).read_text()) for f in ('run_config.json', 'summary.json'))
+    if mutation == 'skip_without_reason':
+        summary['skipped_batch_sizes'] = {'1': 'not validated'}  # recorded skip absent from the config
+    elif mutation == 'accuracy_not_largest':
+        for task in config['tasks']:
+            summary['accuracy'][task]['concurrency'] = 1
+    elif mutation == 'perf_row_missing':
+        del summary['performance']['1']
+    else:
+        data = json.loads((run / 'roofline.json').read_text()); del data['1']
+        (run / 'roofline.json').write_text(json.dumps(data))
+    (run / 'summary.json').write_text(json.dumps(summary))
+    with pytest.raises(ValueError): check(root)
+
+
+@pytest.mark.parametrize('field,value,match', [('client_seconds', 3600, 'client clock'), ('setup_seconds', 3600, 'setup'),
+                                               ('elapsed_seconds', 31, 'wall time'), ('client_seconds', None, 'wall time')])
+def test_gate_checks_split_clocks(tmp_path, field, value, match):
+    root, evidence = valid_gate_fixture(tmp_path)
+    path = evidence / 'run/summary.json'
+    summary = json.loads(path.read_text())
+    summary[field] = value
+    if field == 'client_seconds' and value:
+        summary['elapsed_seconds'] = value + summary['setup_seconds']
+    if field == 'setup_seconds':
+        summary['elapsed_seconds'] = value + summary['client_seconds']
+    path.write_text(json.dumps(summary))
+    with pytest.raises(ValueError, match=match): check(root)
+
+
+@pytest.mark.parametrize('reduction,ok', [({'from': 280, 'to': 2, 'reason': '41 s/answer at batch 32; 280 would take 55 min'}, True),
+                                          ({'from': 280, 'to': 2, 'reason': ''}, False),
+                                          ({'from': 280, 'to': 3, 'reason': 'speed'}, False),
+                                          ({'from': 2, 'to': 2, 'reason': 'speed'}, False)])
+def test_sample_reduction_is_recorded_and_matches_frozen_subset(tmp_path, reduction, ok):
+    root, evidence = valid_gate_fixture(tmp_path)
+    path = evidence / 'run/run_config.json'
+    config = json.loads(path.read_text())
+    config['sample_reduction'] = {'ifeval': reduction}
+    path.write_text(json.dumps(config))
+    if ok:
+        assert check(root) == evidence
+    else:
+        with pytest.raises(ValueError, match='sample_reduction'): check(root)
+
+
+def test_recommended_cap_is_power_of_two_k_never_below_current():
+    from benchmark_stage.answers import recommended_cap, nearest_rank
+    assert recommended_cap(300, 4096) == 4096
+    assert recommended_cap(3000, 4096) == 8192
+    assert recommended_cap(32768, 32768) == 65536
+    assert recommended_cap(10, 128) == 1024
+    assert nearest_rank(list(range(1, 11)), 0.9) == 9 and nearest_rank([7], 0.5) == 7
+
+
+def rewrite_task(evidence, task, *, samples=None, responses=None):
+    run = evidence / 'run' / task
+    if samples is not None:
+        (run / f'samples_{task}.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in samples))
+    if responses is not None:
+        (run / 'responses.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in responses))
+
+
+def test_answer_statistics_flag_unextractable_and_blank_answers_as_advisory(tmp_path):
+    """Granite strict 0/10 vs flexible 7/10; Kolibri 9/40 GPQA blank at 32K."""
+    from benchmark_stage.answers import task_statistics, advisories
+    root, evidence = valid_gate_fixture(tmp_path)
+    docs = [{'question': 'one'}, {'question': 'two'}]
+    samples = [{'doc_id': i, 'doc': d, 'filter': 'strict-match', 'filtered_resps': ['[invalid]']} for i, d in enumerate(docs)]
+    samples += [{'doc_id': i, 'doc': d, 'filter': 'flexible-extract', 'filtered_resps': [['42']]} for i, d in enumerate(docs)]
+    raw_path = evidence / 'run/gsm8k_cot/results.json'
+    raw = json.loads(raw_path.read_text())
+    raw['results']['gsm8k_cot'] = {'exact_match,strict-match': 0.0, 'exact_match,flexible-extract': 1.0}
+    raw_path.write_text(json.dumps(raw))
+    blank = exhausted_response()
+    blank['usage']['completion_tokens'] = 4096
+    answered = dict(choices=[dict(index=0, message=dict(content='42'), finish_reason='stop')], usage=dict(completion_tokens=900))
+    rewrite_task(evidence, 'gsm8k_cot', samples=samples, responses=[blank, answered])
+    for path, key in ((evidence / 'run/summary.json', 'summary'), (raw_path, 'raw')):
+        data = json.loads(path.read_text())
+        meta = data['accuracy']['gsm8k_cot'] if key == 'summary' else data['benchmark_stage']
+        meta.update(finish_reasons={'length': 1, 'stop': 1}, empty_final_length_responses=1)
+        path.write_text(json.dumps(data))
+    run = evidence / 'run'
+    stats = task_statistics(run, json.loads((run / 'run_config.json').read_text()),
+                            json.loads((run / 'manifest.json').read_text()), 'gsm8k_cot')
+    assert stats['extraction']['strict-match'] == {'extracted': 0, 'answers': 2, 'share': 0.0}
+    assert stats['extraction']['flexible-extract']['share'] == 1.0
+    assert stats['blank_at_cap'] == 1 and stats['blank_at_cap_share'] == 0.5
+    assert stats['answer_tokens'] == {'median': 900, 'p90': 4096, 'max': 4096}
+    assert stats['output_cap'] == 4096 and stats['recommended_output_cap'] == 8192
+    lines = advisories('gsm8k_cot', stats)
+    assert len(lines) == 2 and 'strict-match' in lines[0] and 'blank at the output cap' in lines[1]
+    refresh_answer_statistics(evidence)
+    found = []
+    assert check(root, advisories=found) == evidence  # advisory, not critical
+    assert found == lines
+    env = dict(os.environ, PYTHONPATH=str(RUNTIME))
+    result = subprocess.run([sys.executable, '-m', 'benchmark_stage.check', '--model-dir', str(root)],
+                            capture_output=True, text=True, env=env)
+    assert result.returncode == 1 and result.stdout.count('ADVISORY') == 2
+    from benchmark_stage.report import write_report
+    config = json.loads((run / 'run_config.json').read_text()); config['manifest'] = str(run / 'manifest.json')
+    manifest = json.loads((run / 'manifest.json').read_text())
+    for group in manifest['groups'].values(): group['population'] = 2
+    (run / 'manifest.json').write_text(json.dumps(manifest))
+    write_report(run, config, json.loads((run / 'summary.json').read_text()))
+    report = (run / 'REPORT.md').read_text()
+    assert '## Answer quality' in report and 'strict-match 0/2 (0.0%)' in report and '| 900 / 4096 / 4096 | 4096 | 8192 |' in report
+
+
+@pytest.mark.parametrize('mutation', ['missing_task', 'missing_all', 'stale', 'no_usage', 'no_filtered'])
+def test_missing_or_stale_answer_statistics_are_critical(tmp_path, mutation):
+    root, evidence = valid_gate_fixture(tmp_path)
+    path = evidence / 'run/summary.json'
+    summary = json.loads(path.read_text())
+    if mutation == 'missing_task': del summary['answer_statistics']['ifeval']
+    elif mutation == 'missing_all': del summary['answer_statistics']
+    elif mutation == 'stale': summary['answer_statistics']['ifeval']['blank_at_cap'] = 0.5
+    path.write_text(json.dumps(summary))
+    if mutation == 'no_usage':
+        rewrite_task(evidence, 'ifeval', responses=[dict(choices=[dict(index=0, message=dict(content='a'), finish_reason='stop')])] * 2)
+    elif mutation == 'no_filtered':
+        rewrite_task(evidence, 'ifeval', samples=[{'doc_id': i, 'doc': d} for i, d in enumerate([{'question': 'one'}, {'question': 'two'}])])
+    with pytest.raises(ValueError, match='answer statistics|usage|filtered_resps'): check(root)
+    result = subprocess.run([sys.executable, '-m', 'benchmark_stage.check', '--model-dir', str(root)],
+                            capture_output=True, text=True, env=dict(os.environ, PYTHONPATH=str(RUNTIME)))
+    assert result.returncode == 2 and result.stdout.startswith('CRITICAL')
+
+
+def test_clean_evidence_exits_zero(tmp_path):
+    root, evidence = valid_gate_fixture(tmp_path)
+    result = subprocess.run([sys.executable, '-m', 'benchmark_stage.check', '--model-dir', str(root), '--hf-model', 'org/model'],
+                            capture_output=True, text=True, env=dict(os.environ, PYTHONPATH=str(RUNTIME)))
+    assert result.returncode == 0, result.stdout

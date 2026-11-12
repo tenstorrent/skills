@@ -22,8 +22,8 @@ def validate_server(server, capacity, model, base_url, *, baseline=None, output=
         raise ValueError(f'performance requires a {capacity}-slot server')
     if server.get('model') != model or server.get('base_url') != base_url:
         raise ValueError('performance server model/endpoint mismatch')
-    if server.get('prefix_caching') is not False:
-        raise ValueError('performance server must disable prefix caching')
+    if type(server.get('prefix_caching')) is not bool:
+        raise ValueError('performance server must record prefix_caching as true or false')
     for field in SERVER_FIELDS:
         if not server.get(field):
             raise ValueError(f'missing performance server identity: {field}')
@@ -54,14 +54,14 @@ def finite_number(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
-def validate_performance(raw, requests, output_tokens):
+def validate_performance(raw, requests, output_tokens, input_tokens=4096):
     if raw.get('completed') != requests or raw.get('failed', 0):
         raise ValueError('incomplete performance requests')
-    for field, length in (('input_lens', 4096), ('output_lens', output_tokens)):
+    for field, length in (('input_lens', input_tokens), ('output_lens', output_tokens)):
         values = raw.get(field, [])
         if len(values) != requests or any(v != length for v in values):
             raise ValueError(f'performance {field}: expected {requests} requests of {length} tokens')
-    if raw.get('total_input_tokens') != requests * 4096 or raw.get('total_output_tokens') != requests * output_tokens:
+    if raw.get('total_input_tokens') != requests * input_tokens or raw.get('total_output_tokens') != requests * output_tokens:
         raise ValueError('performance total token counts disagree with requested lengths')
     for field in PERFORMANCE_METRICS:
         value = raw.get(field)
