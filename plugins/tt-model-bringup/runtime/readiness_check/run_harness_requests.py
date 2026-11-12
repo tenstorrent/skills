@@ -89,7 +89,10 @@ def _declared_capability(model_dir: Path, key: str) -> Optional[str]:
         text = read_text(path)
         match = re.search(rf"['\"]{key}['\"]\s*:\s*([\w.]+)", text)
         if match:
-            return match.group(1)
+            value = match.group(1)
+            # A module-level constant (MAX_DEVICE_TOP_K = 64): resolve it in the same file.
+            const = re.search(rf"^{re.escape(value)}\s*(?::[^=]+)?=\s*([\w.]+)", text, re.M)
+            return const.group(1) if const and not value[:1].isdigit() else value
     return None
 
 

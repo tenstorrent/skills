@@ -396,3 +396,13 @@ def test_served_probe_profiles_resolve_model_card_and_respect_thinking_none(mode
     assert "chat_template_kwargs" not in body
     _, body = sp.build_request("http://s", "m", sp.load_profile("lm_eval_reasoning"), content="q", max_tokens=5)
     assert body["chat_template_kwargs"] == {"enable_thinking": True}
+
+
+def test_p2_declared_top_k_resolves_module_constant(tmp_path):
+    from readiness_check import run_harness_requests as p2_mod
+    tt = tmp_path / "tt"
+    tt.mkdir()
+    (tt / "generator.py").write_text('MAX_DEVICE_TOP_K = 64\ncaps = {"max_device_top_k": MAX_DEVICE_TOP_K}\n')
+    assert p2_mod._declared_capability(tmp_path, "max_device_top_k") == "64"
+    (tt / "generator.py").write_text('caps = {"max_device_top_k": 32}\n')
+    assert p2_mod._declared_capability(tmp_path, "max_device_top_k") == "32"
