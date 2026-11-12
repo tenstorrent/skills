@@ -120,7 +120,7 @@ def test_skill_graph_and_package_links_resolve():
             assert target.exists(), (path, ref)
 
 
-@pytest.mark.parametrize('stage', ['06-full-model', '07-optimized-full-model', '09-vllm', '10-optimized-vllm', '11-benchmark'])
+@pytest.mark.parametrize('stage', ['06-full-model', '07-optimized-full-model', '08-datatype-sweep', '09-vllm', '10-optimized-vllm', '11-benchmark'])
 def test_installed_gates_fail_critical_for_missing_evidence(installed, stage):
     plugin, target, env = installed
     env['MODEL_DIR'] = 'models/autoports/org_model'
