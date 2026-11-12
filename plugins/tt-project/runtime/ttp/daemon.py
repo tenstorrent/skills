@@ -20672,7 +20672,8 @@ class Daemon:
                 fid = db.add_task(f"Fix review #{review['id']}: {base_title}"[:200], "", kind="code", tier=tier,
                                   tier_source=tsrc, priority=chainprio.of(db, code, review), origin="daemon",
                                   budget_usd=float(cfg["budget"]["task_default_usd"].get(tier, 8.0)),
-                                  labels=untrusted.inherit([f"continues:{code['id']}", f"review_fix:{review['id']}"], code),
+                                  labels=untrusted.inherit([f"continues:{code['id']}", f"review_fix:{review['id']}",
+                                                            f"{runclass.ROUND_LABEL}{rounds}"], code),
                                   **pin_of(code))
                 fbranch = f"ttp/t{fid}-{worktree.slug(base_title)}"
             # The stack's pr_branch goes with its `ttp push --own` step: the re-review carries it as a label,
@@ -20754,7 +20755,8 @@ class Daemon:
                     f"Findings to fix:\n{found}",
                     f"The review's hand-off: {spans.wrap(coord.clip(summary, AUTO_REVIEW_SUMMARY_CHARS), _handoff_of(review), tag)}"])
                 db.update_task(fid, spec=f"{(prfix or hop)['spec'] or ''}\n{extra}",
-                               labels=[*json.loads((prfix or hop)["labels"] or "[]"), f"review_fix:{review['id']}"])
+                               labels=[*json.loads((prfix or hop)["labels"] or "[]"), f"review_fix:{review['id']}",
+                                       f"{runclass.ROUND_LABEL}{rounds}"])
                 for r in db.q("SELECT dir FROM runs WHERE task=? AND status='running'", (fid,)):
                     if r["dir"]:
                         coord._append_update(Path(r["dir"], "steer.md"), extra, f"review-fix-{review['id']}")

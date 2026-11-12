@@ -16088,6 +16088,7 @@ def test_a_failed_review_never_hands_its_findings_to_a_hop_that_waits_on_the_rev
     assert len(fixes) == 1, "no fix task: the hop waiting on the landing took the findings"
     fix = fixes[0]
     assert f"review_fix:{rev}" in _labels(p, fix["id"]) and f"continues:{root}" in _labels(p, fix["id"])
+    assert "review_round:1" in _labels(p, fix["id"])   # the code route keeps a fix of a later round on Opus
     assert p.db.task(hop)["spec"] == spec and f"review_fix:{rev}" not in _labels(p, hop)
     (rr,) = p.db.q("SELECT * FROM tasks WHERE kind='review' AND id!=?", (rev,))
     assert json.loads(rr["depends_on"]) == [fix["id"]]
@@ -16105,7 +16106,7 @@ def test_a_failed_review_still_gives_a_working_split_hop_its_findings(env):
                         kind="review", tier="standard", origin="coordinator")
     _fail_review(env, p, rev, [{"title": "fix the parser", "spec": "the parser drops the last token"}])
     assert not p.db.q("SELECT id FROM tasks WHERE title LIKE 'Fix review%'")
-    assert f"review_fix:{rev}" in _labels(p, hop["id"])
+    assert f"review_fix:{rev}" in _labels(p, hop["id"]) and "review_round:1" in _labels(p, hop["id"])
     (rr,) = p.db.q("SELECT * FROM tasks WHERE kind='review' AND id!=?", (rev,))
     assert json.loads(rr["depends_on"]) == [hop["id"]]
 

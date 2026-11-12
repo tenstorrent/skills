@@ -40,15 +40,16 @@ On by default (ROUTINE_MODEL; `route.core_cheap.routine` {"model", "effort"} pic
 (routine_quality): when routine's failed and needs_review share over QUALITY_WINDOW_S beats hard's by more
 than QUALITY_GAP, with ALARM_MIN runs in each, the daemon raises one run_class_quality event per window.
 
-Code on Sonnet (CODE_KEY): standard-tier code tasks of a CODE_KINDS kind ("new", or "continue": one that
-continues another task) run on Sonnet at high effort (CODE_MODEL) on the Claude core provider when their
+Code on Sonnet (CODE_KEY): standard-tier code tasks of a CODE_KINDS kind ("new"; "continue": one that
+continues another task; "review_fix": one that fixes a failed review, review_fix:<id>) run on Sonnet at high effort (CODE_MODEL) on the Claude core provider when their
 kind's quality allows it (code_quality, by the daemon each hour into the kv CODE_STATE_KV): "full" once Sonnet
 had CODE_FULL_MIN tasks with a known outcome over CODE_WINDOW_S and its bad share (failed, needs_review, or its
 first review asked for changes) is within QUALITY_GAP of Opus's; "off" once it is worse by more, with
 ALARM_MIN tasks each (the daemon raises one run_class_quality event when a kind moves back to Opus); else
-"canary": a stable CODE_CANARY share of its tasks (by task id; `route.code_sonnet.share`). Review fixes stay
-on Opus (route.kept_core), and so do urgent, needs_deep, user_deep, pinned (provider, model or effort),
-tier-up retries, deep, plan and device runs. Off with `route.code_sonnet` false or `route.core_cheap` false;
+"canary": a stable CODE_CANARY share of its tasks (by task id; `route.code_sonnet.share`). Each kind has its
+own state and alarm. Review fixes take this route though route.kept_core keeps them off every other one, except
+a fix after REVIEW_ROUND_MAX failed reviews where the round is known (review_round). Urgent, needs_deep,
+user_deep, pinned (provider, model or effort), tier-up retries, deep, plan and device runs stay on Opus. Off with `route.code_sonnet` false or `route.core_cheap` false;
 `route.code_sonnet.kinds` narrows the kinds.
 
 Report: by_class counts runs per class per model per hour with their real cost (`ttp stats --by-class`),
@@ -95,7 +96,9 @@ ROUTINE_MODEL = {"model": "sonnet", "effort": "high"}
 CORE_CHEAP[ROUTINE] = dict(ROUTINE_MODEL)
 CHEAP_PROVIDER = "claude"
 CODE_KEY = "code"                 # on a cheap note: the code kind that took CODE_MODEL
-CODE_KINDS = ("new", "continue")
+CODE_KINDS = ("new", "continue", "review_fix")
+REVIEW_ROUND_MAX = 2   # a review fix after this many failed reviews of its change stays on Opus
+ROUND_LABEL = "review_round:"   # the daemon's fix task: review_round:<failed reviews of the stack so far>
 CODE_MODEL = {"model": "sonnet", "effort": "high"}
 CODE_CANARY = 0.2
 CODE_FULL_MIN = 30
@@ -272,6 +275,14 @@ def code_kind(task: dict | None, cfg: dict | None = None) -> str:
     return "continue" if any(lb.startswith("continues:") for lb in labels) else "new"
 
 
+def review_round(task: dict | None) -> int:
+    """How many failed reviews a review fix answers: its ROUND_LABEL, else one per review_fix:<id> label it
+    carries (a fix hop that took over a later round's findings has both); 0 when unknown or not a fix."""
+    labels = _labels(task or {})
+    rounds = [int(lb[len(ROUND_LABEL):]) for lb in labels if lb.startswith(ROUND_LABEL) and lb[len(ROUND_LABEL):].isdigit()]
+    return max([*rounds, sum(1 for lb in labels if lb.startswith("review_fix:"))])
+
+
 def code_settings(cfg: dict) -> dict | None:
     """{"share", "kinds"} for the code route, or None when it is off (`route.code_sonnet` or
     `route.core_cheap` false)."""
@@ -299,8 +310,13 @@ def code_sonnet(cfg: dict, task: dict | None, picked: dict | None = None, state:
     `state`: {kind: "full" | "canary" | "off"} (the daemon's CODE_STATE_KV; a kind missing is canary)."""
     kind = code_kind(task, cfg)
     on = code_settings(cfg)
-    if not on or kind not in on["kinds"] or str((task or {}).get("effort") or "") \
-            or not routable(task, {"pick": picked or {}, KEY: "hard"}):   # urgent work stays on Opus
+    if not on or kind not in on["kinds"] or str((task or {}).get("effort") or ""):
+        return None
+    if kind == "review_fix":   # its review_fix label keeps it off other routes, not this one
+        if review_round(task) >= REVIEW_ROUND_MAX:
+            return None
+        task = {**task, "labels": [lb for lb in _labels(task) if not lb.startswith("review_fix")]}
+    if not routable(task, {"pick": picked or {}, KEY: "hard"}):   # urgent work stays on Opus
         return None
     mode = (state or {}).get(kind) or "canary"
     if mode == "off" or (mode != "full" and not canary(task.get("id"), on["share"])):

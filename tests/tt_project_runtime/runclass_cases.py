@@ -412,7 +412,7 @@ def test_wake_keeps_effort_is_only_a_code_task_worker_wake_with_no_chat_reply():
     assert tierfloor.wake_keeps_effort({**code, "reply_chat": "c1"}, "worker_wake") is False
 
 
-def test_code_tasks_take_sonnet_by_kind_canary_then_full_and_opus_keeps_fixes_pins_and_urgent_work():
+def test_code_tasks_take_sonnet_by_kind_canary_then_full_and_opus_keeps_pins_and_urgent_work():
     from ttp import runclass
     t = {"id": 7, "kind": "code", "tier": "standard", "title": "add a flag", "labels": "[]"}
     assert runclass.classify(t) == "hard"   # accounting unchanged: the route is a cheap model, not a class
@@ -436,8 +436,8 @@ def test_code_tasks_take_sonnet_by_kind_canary_then_full_and_opus_keeps_fixes_pi
     assert runclass.core_cheap({}, {**t, "id": tid}, "hard", "standard", "claude", None, None, {"new": "off"}) is None
     cont = {**t, "id": tid, "labels": '["continues:5"]'}
     assert runclass.core_cheap({}, cont, "hard", "standard", "claude", None, None, {"new": "off"})[runclass.CODE_KEY] == "continue"
-    # Opus keeps review fixes, urgent, needs_deep, pins, tier-up retries, other tiers and device work.
-    for extra in ({"labels": '["review_fix:9"]'}, {"spec": "urgent: the user is waiting"}, {"labels": '["needs_deep"]'},
+    # Opus keeps urgent, needs_deep, pins, tier-up retries, other tiers and device work.
+    for extra in ({"spec": "urgent: the user is waiting"}, {"labels": '["needs_deep"]'},
                   {"model": "opus"}, {"provider": "claude"}, {"effort": "xhigh"},
                   {"spec": "run it on the device (tt-smi reset)"}):
         assert runclass.core_cheap({}, {**t, **extra}, "hard", "standard", "claude", None, None, full) is None, extra
@@ -450,6 +450,84 @@ def test_code_tasks_take_sonnet_by_kind_canary_then_full_and_opus_keeps_fixes_pi
         assert runclass.core_cheap(cfg, t, "hard", "standard", "claude", None, None, full) is None, cfg
     assert runclass.code_sonnet({"route": {"code_sonnet": {"share": 0}}}, {**t, "id": tid}) is None
     assert runclass.code_sonnet({"route": {"code_sonnet": {"share": 1}}}, {**t, "id": other})
+
+
+def test_review_fixes_take_the_code_sonnet_route_with_their_own_state_and_opus_keeps_late_rounds():
+    from ttp import runclass
+    fix = {"id": 7, "kind": "code", "tier": "standard", "title": "Fix review #9: add a flag",
+           "labels": '["continues:5", "review_fix:9", "review_round:1"]'}
+    assert runclass.code_kind(fix) == "review_fix" and "review_fix" in runclass.CODE_KINDS
+    # Canary: the same stable share of ids as the other kinds; full: every one; off: none.
+    ids = range(1, 2001)
+    picked = [i for i in ids if runclass.code_sonnet({}, {**fix, "id": i})]
+    assert 0.15 < len(picked) / 2000 < 0.25
+    got = runclass.core_cheap({}, {**fix, "id": picked[0]}, "hard", "standard", "claude")
+    assert (got["model"], got["effort"], got[runclass.CODE_KEY]) == ("sonnet", "high", "review_fix")
+    full = {"review_fix": "full"}
+    assert runclass.core_cheap({}, fix, "hard", "standard", "claude", None, None, full)[runclass.CODE_KEY] == "review_fix"
+    # Its own state: the other kinds' states never move it, and its own never moves them.
+    assert runclass.core_cheap({}, fix, "hard", "standard", "claude", None, None,
+                               {"new": "full", "continue": "full", "review_fix": "off"}) is None
+    new = {**fix, "id": next(i for i in ids if i not in picked), "labels": "[]", "title": "add a flag"}
+    assert runclass.core_cheap({}, new, "hard", "standard", "claude", None, None, {"review_fix": "full"}) is None
+    # A fix after two failed reviews stays on Opus, by its round label or by the review_fix labels it carries.
+    assert runclass.review_round(fix) == 1 and runclass.review_round(new) == 0
+    for labels in ('["continues:5", "review_fix:9", "review_round:2"]', '["review_fix:9", "review_fix:11"]'):
+        assert runclass.review_round({**fix, "labels": labels}) == 2
+        assert runclass.core_cheap({}, {**fix, "labels": labels}, "hard", "standard", "claude", None, None, full) is None
+    # Opus keeps urgent, needs_deep, user_deep, pins, tier-up retries, deep and device fixes.
+    for extra in ({"spec": "urgent: the user is waiting"}, {"model": "opus"}, {"provider": "claude"},
+                  {"effort": "xhigh"}, {"spec": "run it on the device (tt-smi reset)"},
+                  {"labels": '["review_fix:9", "needs_deep"]'}, {"labels": '["review_fix:9", "user_deep"]'}):
+        assert runclass.core_cheap({}, {**fix, **extra}, "hard", "standard", "claude", None, None, full) is None, extra
+    assert runclass.core_cheap({}, fix, "hard", "standard", "claude", None, {"by": "retry"}, full) is None
+    assert runclass.core_cheap({}, fix, "hard", "deep", "claude", None, None, full) is None
+    # The review_fix label still keeps it off the routine and chat routes.
+    assert runclass.core_cheap({}, {**fix, "kind": "work"}, "routine", "standard", "claude") is None
+    # Off-switches and a narrower kind list.
+    for cfg in ({"route": {"code_sonnet": False}}, {"route": {"core_cheap": False}},
+                {"route": {"code_sonnet": {"kinds": ["new", "continue"]}}}):
+        assert runclass.core_cheap(cfg, fix, "hard", "standard", "claude", None, None, full) is None, cfg
+    assert runclass.core_cheap({"route": {"code_sonnet": {"kinds": ["review_fix"]}}}, fix, "hard", "standard",
+                               "claude", None, None, full)[runclass.CODE_KEY] == "review_fix"
+
+
+def test_review_fix_quality_has_its_own_alarm_judged_by_the_first_run_and_its_first_re_review(env):
+    from ttp import runclass
+    p = make(env)
+    now = time.time()
+    fix_labels = '["continues:1", "review_fix:2", "review_round:1"]'
+
+    def task(sonnet, bad, escalated=False):
+        t = p.db.add_task("Fix review #2: x", "", kind="code", tier="standard", priority=3, budget_usd=1.0)
+        p.db.x("UPDATE tasks SET status='done', result=?, labels=? WHERE id=?",
+               (json.dumps({"status": "done"}), fix_labels, t))
+        note = json.dumps({runclass.CHEAP_KEY: {"provider": "claude", "model": "sonnet", "effort": "high",
+                                                "class": "hard", runclass.CODE_KEY: "review_fix"}}) if sonnet else None
+        p.db.x("INSERT INTO runs(task,role,provider,model,started,status,cost_usd,note) VALUES(?,?,?,?,?,?,?,?)",
+               (t, "worker", "claude", "sonnet" if sonnet else "claude-opus-5-5", now - 900,
+                "failed" if escalated else "ok", 0.1, note))
+        if escalated:   # retried a tier up on Opus, which passed: still bad, on the side it started on
+            p.db.x("UPDATE tasks SET tier='deep', tier_source='retry_tier_up' WHERE id=?", (t,))
+            p.db.x("INSERT INTO runs(task,role,provider,model,started,status,cost_usd) VALUES(?,?,?,?,?,?,?)",
+                   (t, "worker", "claude", "claude-opus-5-5", now - 600, "ok", 0.5))
+        r = p.db.add_task(f"Re-review #2: x", "", kind="review", tier="standard", priority=3, budget_usd=1.0)
+        p.db.x("UPDATE tasks SET status=?, labels=? WHERE id=?",
+               ("failed" if bad else "done", json.dumps([f"auto_review:{t}", "continues:2"]), r))
+    for i in range(10):   # Opus: 2 of 10 re-reviews failed
+        task(False, i < 2)
+    for i in range(runclass.CODE_FULL_MIN):   # Sonnet: 6 of 30, same 20%
+        task(True, i < 6)
+    q = runclass.code_quality(p.db, {}, now - runclass.CODE_WINDOW_S, now)
+    v = q["review_fix"]
+    assert (v["sonnet"]["tasks"], v["sonnet"]["bad"], v["opus"]["tasks"], v["opus"]["bad"]) == (30, 6, 10, 2)
+    assert v["state"] == "full" and q["new"]["state"] == q["continue"]["state"] == "canary"
+    for _ in range(6):   # six Sonnet fixes fail and pass only on an Opus retry a tier up: 12/36 (33%) vs 20%
+        task(True, False, escalated=True)
+    v = runclass.code_quality(p.db, {}, now - runclass.CODE_WINDOW_S, now)["review_fix"]
+    assert (v["sonnet"]["tasks"], v["sonnet"]["bad"], v["opus"]["tasks"]) == (36, 12, 10)
+    assert v["state"] == "off"
+    assert "Code tasks (review_fix)" in runclass.code_quality_text("review_fix", v, 168)
 
 
 def test_code_quality_moves_a_kind_full_when_sonnet_matches_opus_and_back_to_opus_with_one_event(env):
@@ -481,7 +559,7 @@ def test_code_quality_moves_a_kind_full_when_sonnet_matches_opus_and_back_to_opu
     assert q["new"]["state"] == "full" and q["continue"]["state"] == "canary"
     d = Daemon(p.base)
     d.watch_run_classes()
-    assert d._code_state() == {"new": "full", "continue": "canary"}
+    assert d._code_state() == {"new": "full", "continue": "canary", "review_fix": "canary"}
     assert p.db.one("SELECT COUNT(*) n FROM events WHERE kind='run_class_quality'")["n"] == 0
     # Sonnet goes wrong 10 more times: 16/40 (40%) vs 20%: back to Opus, told once.
     for _ in range(10):
