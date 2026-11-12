@@ -719,6 +719,43 @@ def test_a_change_with_no_why_is_flagged_once_in_the_next_digest(env):
     assert "no recorded why" not in coord.digest(p, {}, [], [])
 
 
+READ_ONLY_CALLS = ["cat notes.md | head -20", "grep -rn lock src 2>/dev/null", "ls -la", "tail -50 log 2>&1",
+                   "git log --oneline -5", "git -C repo show HEAD:a.py", "git status && git diff", "git merge-base a b",
+                   "git fetch origin", "ttp eta 12", "ttp paths", "ttp task demo show 5", "ttp quarantine list",
+                   "ttp memory --search lock", "ttp audit fixes", "launchctl print gui/501/x",
+                   "systemctl --user status ttp --no-pager", "ssh box true", "ssh -o ConnectTimeout=5 box 'cat /x | grep y'"]
+CHANGING_CALLS = ["rm -rf build", "echo x > notes.md", "ttp note hi", "git commit -m fix", "ssh box rm x",
+                  "launchctl load x.plist", "frobnicate --all", "git branch topic", "sed -i s/a/b/ f", "cat a | tee b"]
+
+
+def test_read_only_calls_are_logged_but_never_flagged_for_a_missing_why(env, tmp_path, monkeypatch):
+    from ttp import coordfix, coordtools
+    p = make(env)
+    _, _, run = _full_env(tmp_path, monkeypatch)
+    now = time.time()
+    p.db.x("INSERT INTO runs(role,status,started,dir) VALUES('coordinator','running',?,?)", (now - 60, str(run)))
+    for cmd in READ_ONLY_CALLS:
+        _coord_post({"tool_name": "Bash", "tool_input": {"command": cmd}})
+    rows = [json.loads(line) for line in (run / coordtools.AUDIT).read_text().splitlines()]
+    assert [r["target"] for r in rows] == [c for c in READ_ONLY_CALLS if coordtools.bash_refusal(c)]   # still logged
+    assert all(r["reads"] for r in rows) and "(read-only)" in (run / "progress.md").read_text()
+    assert coordfix.digest_lines(p.db, now - 60) == [], "a turn of reads alone has no unexplained change"
+    assert coordfix.audit_line(p.db, now - 60).startswith(f"coordinator hands-on fixes: {len(rows)}, by order: "
+                                                         f"{coordfix.READS} ({len(rows)}): ")
+    for cmd in CHANGING_CALLS:   # each state-changing call with no why is flagged
+        _coord_post({"tool_name": "Bash", "tool_input": {"command": cmd}})
+    flagged = coordfix.digest_lines(p.db, now - 60)
+    assert flagged[0].startswith(f"## Hands-on changes with no recorded why: {len(CHANGING_CALLS)} ")
+    assert "Bash rm -rf build" in flagged[1] and not any("git log" in x for x in flagged)
+    coordfix.declare(run, "the build dir was stale", "o3", "none: rebuilt on demand")   # `ttp audit why`
+    _coord_post({"tool_name": "Bash", "tool_input": {"command": "git commit -am rebuild"}})
+    assert json.loads((run / coordtools.AUDIT).read_text().splitlines()[-1])["serves"] == "o3"
+    assert coordfix.digest_lines(p.db, now - 60)[0] == flagged[0], "a change after its why is covered"
+    old = _fix_rows(p, [{"ts": now - 30, "tool": "Bash", "target": "git log -3", "what": "Bash git log -3", "exit": 0}],
+                    now - 40)   # an entry logged before the mark is read again
+    assert old and coordfix.digest_lines(p.db, now - 60)[0] == flagged[0]
+
+
 def test_the_daily_review_and_ttp_audit_fixes_list_the_days_fixes_by_order(env, capsys):
     from ttp import audit
     p = make(env)

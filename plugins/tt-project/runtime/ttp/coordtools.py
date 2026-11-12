@@ -662,7 +662,7 @@ def post_tool_use(payload: dict, failed: bool = False) -> tuple[dict | None, Non
     """Put back what a full-tools coordinator's Bash call wrote to a protected file out of band (guard;
     its notice goes into the tool result), and log the coordinator's mutating call (Edit, Write, a Bash
     command off the read-only list) with its exit to the run's AUDIT file and progress.md (the web app's
-    run view). A failed call's exit code is read from its error ("Exit code N"), else 1. Never blocks
+    run view); a Bash call that only reads (coordfix.reads_only) is marked `reads`, never flagged. A failed call's exit code is read from its error ("Exit code N"), else 1. Never blocks
     the call."""
     notice = None
     try:
@@ -694,11 +694,13 @@ def post_tool_use(payload: dict, failed: bool = False) -> tuple[dict | None, Non
         from .project import durable_append
         said = " ".join(str(args.get("description") or "").split())[:300] if tool == "Bash" else ""
         why = coordfix.intent(run)   # the why, order and undo declared before it (coordfix.py)
+        reads = tool == "Bash" and coordfix.reads_only(what)   # logged, never flagged for a missing why
         durable_append(Path(run) / AUDIT, json.dumps({"ts": time.time(), "tool": tool, "target": what[:2000],
                                                       "what": said or f"{tool} {what[:300]}", "exit": code,
-                                                      **why}) + "\n")
+                                                      **({"reads": True} if reads else {}), **why}) + "\n")
         line = " ".join(what.split())[:200]
-        tag = f" (why: {why['why'][:120]}; serves {why['serves']})" if why else " (no why recorded)"
+        tag = (f" (why: {why['why'][:120]}; serves {why['serves']})" if why
+               else " (read-only)" if reads else " (no why recorded)")
         durable_append(Path(run) / "progress.md", f"{timefmt.clock()} coordinator {tool} exit {code}: {line}{tag}\n")
     except Exception:
         pass
