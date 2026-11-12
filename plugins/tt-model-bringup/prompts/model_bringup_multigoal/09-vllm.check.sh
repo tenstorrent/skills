@@ -14,26 +14,31 @@ else
   echo "Neither MODEL_DIR nor HF_MODEL is set; cannot scope the check to the target model." >&2
   exit 3
 fi
-python "${TT_MODEL_BRINGUP_ROOT}/runtime/readiness_check/check_degenerate_output.py" \
-  "${scope_args[@]}" --missing-artifacts critical --scope vllm || exit $?
+# Every sub-check runs; the worst code wins, and 3 (or any code above 3) is a
+# checker error that stops the gate.
+worst=0
+gate() {
+  "$@"
+  local rc=$?
+  if [ "$rc" -ge 3 ]; then echo "check error (exit $rc): ${2:-$1}" >&2; exit 3; fi
+  if [ "$rc" -gt "$worst" ]; then worst=$rc; fi
+}
 
-python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_context_contract.py" \
+gate python "${TT_MODEL_BRINGUP_ROOT}/runtime/readiness_check/check_degenerate_output.py" \
+  "${scope_args[@]}" --missing-artifacts critical --scope vllm
+
+gate python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_context_contract.py" \
   --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}" \
-  --stage vllm --require-contract || exit $?
+  --stage vllm --require-contract
 
-python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_serving_contract.py" \
+gate python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_serving_contract.py" \
   --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}" --require-contract
-contract_rc=$?
-[ "$contract_rc" -gt 1 ] && exit "$contract_rc"
 
-python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_prefill_features.py" \
-  --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}" --stage vllm || exit $?
+gate python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_prefill_features.py" \
+  --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}" --stage vllm
 
 # Eval-readiness probes P2 (harness requests), P3 (chat conformance) and the
 # P5 accuracy part. The worst code wins; 3 is an error.
-python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_eval_readiness.py" \
+gate python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_eval_readiness.py" \
   --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}" --stage vllm
-eval_rc=$?
-[ "$eval_rc" -ge 3 ] && exit "$eval_rc"
-[ "$eval_rc" -gt "$contract_rc" ] && exit "$eval_rc"
-exit "$contract_rc"
+exit "$worst"

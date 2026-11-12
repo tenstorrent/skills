@@ -12,12 +12,23 @@ else
   echo "Neither MODEL_DIR nor HF_MODEL is set; cannot scope the check to the target model." >&2
   exit 3
 fi
-python "${TT_MODEL_BRINGUP_ROOT}/runtime/readiness_check/check_degenerate_output.py" \
-  "${scope_args[@]}" --missing-artifacts critical --scope autoregressive || exit $?
+# Every sub-check runs; the worst code wins, and 3 (or any code above 3) is a
+# checker error that stops the gate.
+worst=0
+gate() {
+  "$@"
+  local rc=$?
+  if [ "$rc" -ge 3 ]; then echo "check error (exit $rc): ${2:-$1}" >&2; exit 3; fi
+  if [ "$rc" -gt "$worst" ]; then worst=$rc; fi
+}
 
-python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_context_contract.py" \
+gate python "${TT_MODEL_BRINGUP_ROOT}/runtime/readiness_check/check_degenerate_output.py" \
+  "${scope_args[@]}" --missing-artifacts critical --scope autoregressive
+
+gate python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_context_contract.py" \
   --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}" \
-  --stage full-model --require-contract || exit $?
+  --stage full-model --require-contract
 
-python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_serving_contract.py" \
+gate python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_serving_contract.py" \
   --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}" --require-contract
+exit "$worst"

@@ -43,7 +43,7 @@
       "destination": "prompts/model_bringup_multigoal/06-full-model.check.sh",
       "blob": "836320fcff1f6ac4a5bf5fe740bf387c00001db9",
       "source_sha256": "d71d21efed8cd079a8a58ac8d1c572f00149cab8ea2838c182b9c1fb07805846",
-      "packaged_sha256": "570f39713b951ceae5e32bf2b0bf68740cfbc36db4f31248baef96774e202713"
+      "packaged_sha256": "2e6b26a2503570a50b92740e811185f65d2e358e455e956c679e6e60fe2e4b71"
     },
     {
       "source": ".agents/prompts/model_bringup_multigoal/06-full-model.txt",
@@ -57,7 +57,7 @@
       "destination": "prompts/model_bringup_multigoal/07-optimized-full-model.check.sh",
       "blob": "cc6e7957b8b6e093595e1114686479a277e0d446",
       "source_sha256": "b65c6ad1294395b12a50ddcd55bcd5043b6569caddc88885f2dd441875c7fb1a",
-      "packaged_sha256": "f22eaca030c42b906c4f5b985920d480d14d6e03d501f1c8e8c2fe53a072876c"
+      "packaged_sha256": "15de5cbe7ac14771a5e081091df47fe4042c2fd41006cfd8710cda4706334012"
     },
     {
       "source": ".agents/prompts/model_bringup_multigoal/07-optimized-full-model.txt",
@@ -78,7 +78,7 @@
       "destination": "prompts/model_bringup_multigoal/09-vllm.check.sh",
       "blob": "54873057b0cd77d369de89e8732a5f7bf6810027",
       "source_sha256": "e5860d4f3d9a3f5076062814db09b403ad7de9d0bef6d8aeec02325bccb626ba",
-      "packaged_sha256": "7b9aeef88cb8ff8b1f5f45de61f1398154f0bb38926d3f0c746843d8678a491f"
+      "packaged_sha256": "f1c98b70b733f83d8a68b536b26e77622aa8fb40c0a5678dc5bd20a3cd0b3490"
     },
     {
       "source": ".agents/prompts/model_bringup_multigoal/09-vllm.txt",
@@ -92,7 +92,7 @@
       "destination": "prompts/model_bringup_multigoal/10-optimized-vllm.check.sh",
       "blob": "f591fa622e04bcb3258bf0cd5a1fdd47a1b2f983",
       "source_sha256": "a0412e5076c40f17077c5d172563c6e0e6c279da5234bcc21c356362713f9ae9",
-      "packaged_sha256": "354b5eb5734a76203d4fe251c1707b48e263e5941caee234f42d4382be0d9852"
+      "packaged_sha256": "d5138250dffa2060809234e23f853ba1b6e84a2ee5fb2348841a01470d61ff9a"
     },
     {
       "source": ".agents/prompts/model_bringup_multigoal/10-optimized-vllm.txt",
