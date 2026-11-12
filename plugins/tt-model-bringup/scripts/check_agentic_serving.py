@@ -1,40 +1,41 @@
 #!/usr/bin/env python3
 """Check agentic-serving evidence for one bringup stage (see the agentic-serving skill).
 
-Critical (2) only when evidence is missing, or a measured shortfall has no recorded reason.
-A shortfall with a `reason` is advisory (1), so a hard problem never blocks later stages;
-goal 12 must price each one in hours on its release run in its survey. The runner gives each failure one
-remediation goal.
-Exit 0 pass, 1 advisory, 2 critical.
+Stages 06-10: missing evidence is critical; a measured shortfall with a recorded reason is advisory.
+Stage 11 (benchmark): serving_rates.json covers the batch x input-length grid and the release rows.
+Goal 12 (agentic-evals): the goal itself. Each phase of the mode passed (score within the band of
+its reference, wall time explained by the serving rates), the run was collected, every failed task
+has a cause, no list is voided, and limits are never above the harness reference. An operator
+decision in inputs.json turns a failed phase into an advisory.
+Exit 0 pass, 1 advisory, 2 critical, 3 error.
 """
-
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sys
 from pathlib import Path
 
 EVIDENCE = Path("doc/agentic_serving.json")
 EVALS = Path("doc/agentic_evals")
-MIN_HIT_FRACTION = 0.9
-SURVEY_CHECKS = ("time_split", "busy_rows", "live_prefill_rows", "trace_captures", "served_step", "prefix_hits",
-                 "cache_pressure", "cache_bytes", "memory_headroom", "cutoffs", "eval_validity", "accuracy_drift",
-                 "generation_share", "prefill_under_load", "host_contention")
-SURVEY_CALCULATIONS = ("batch", "agents", "run_hours", "task_lists", "agent_timeout", "output_cap", "bytes",
-                       "cache_agents", "block_cost", "prefill_padding")
-PREFLIGHT = ("release_values", "registry", "disk", "admission", "release_route", "smoke")
-LEARNED = ("harness_facts", "suite_timings", "generic_fixes")
-LIST_SOURCES = ("inputs", "harness", "default_rule")
-MODES = ("light", "extended")
+RATES = Path("doc/benchmark/serving_rates.json")
 INPUTS = Path("bringup/agentic_evals/inputs.json")
+MIN_HIT_FRACTION = 0.9
+MODES = {"quick": ("phase1",), "agentic": ("phase1", "phase2"), "extended": ("phase1", "phase2")}
+DEFAULT_MODE = "agentic"
+ENTRIES = ("autoport", "existing")
+DEFAULT_TASKS = 10
+DEFAULT_EXTENDED_SUITES = ("r1_gpqa_diamond", "swe_bench_verified")
 DEFAULT_RUN_TIMEOUT_HOURS = 12
-EFFORT_STATUS = ("done", "running", "not_run")
-CHANGES = ("kept", "dropped", "none")
-PROBLEM_STATUS = ("solved", "open")
-BASES = ("measured", "calculated", "guess")
-RELEASE_LIMITS = ("agent_timeout_s", "request_timeout_s", "output_cap_tokens")
+DEFAULT_EXPLAIN_TOLERANCE = 0.25
+CAUSES = ("wrong", "loop_cap", "malformed_tool_call", "cutoff_progressing", "stalled", "infrastructure",
+          "fetched_solution")
+LIMITS = ("agent_timeout_s", "request_timeout_s", "output_cap_tokens")
+RATE_FIELDS = ("prefill_tok_s", "decode_tok_s_user", "ttft_s", "step_ms")
+LONG_CONTEXT_TOKENS = 28672
+LEARNED = ("best_config", "harness_facts", "generic_fixes")
 
 
 def shortfall(problems: list, reason, message: str) -> None:
@@ -118,229 +119,253 @@ def number(value) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
-def check_survey(evals: Path, carried: int, problems: list) -> None:
-    survey = read(evals / "survey.json", problems)
-    if not survey:
-        return
-    checks, calculations = survey.get("checks") or {}, survey.get("calculations") or {}
-    for key in SURVEY_CHECKS:
-        row = checks.get(key)
-        if not isinstance(row, dict) or not ("healthy" in row or row.get("not_measured")):
-            problems.append((2, f"survey check {key!r} needs a value and healthy, or not_measured with a reason"))
-    for key in SURVEY_CALCULATIONS:
-        if key not in calculations:
-            problems.append((2, f"survey calculation {key!r} is missing"))
-    priced = [row for row in survey.get("shortfalls") or [] if isinstance(row, dict) and number(row.get("hours"))]
-    if len(priced) < carried:
-        problems.append((2, f"{carried} shortfall(s) carried from earlier stages, {len(priced)} priced in hours"))
+def wilson(solved: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    p = solved / n
+    denominator = 1 + z * z / n
+    centre = (p + z * z / (2 * n)) / denominator
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denominator
+    return 100 * (centre - half), 100 * (centre + half)
 
 
-def check_preflight(evals: Path, problems: list) -> None:
-    preflight = read(evals / "preflight.json", problems)
-    if not preflight:
-        return
-    for key in PREFLIGHT:
-        row = preflight.get(key)
-        if not isinstance(row, dict) or row.get("ok") is not True:
-            problems.append((2, f"preflight {key!r} did not pass; the release depends on it"))
+def operator_inputs(model_dir: Path, problems: list) -> dict:
+    """The operator's goal-12 inputs, from the target checkout (the gate's working directory) or the model dir."""
+    for path in (INPUTS, model_dir / INPUTS):
+        if path.is_file():
+            inputs = read(path, problems)
+            if inputs.get("mode", DEFAULT_MODE) not in MODES:
+                problems.append((2, f"{INPUTS} mode must be one of {', '.join(MODES)}"))
+            if inputs.get("entry", "autoport") not in ENTRIES:
+                problems.append((2, f"{INPUTS} entry must be one of {', '.join(ENTRIES)}"))
+            return inputs
+    return {}
 
 
-def check_prediction(row: dict, name, problems: list) -> None:
-    predicted, confirm = row.get("predicted") or {}, row.get("confirm") or {}
-    savings = predicted.get("saving_hours")
-    if not (isinstance(savings, dict) and savings and all(number(v) for v in savings.values())
-            and number(predicted.get("device_hours")) and predicted.get("basis") in BASES):
-        problems.append((2, f"effort {name!r} needs predicted saving_hours per eval, device_hours and basis "
-                            f"({', '.join(BASES)}); guess when it cannot be calculated"))
-    if not (confirm.get("method") and confirm.get("success")):
-        problems.append((2, f"effort {name!r} needs confirm.method and confirm.success: how it shows it worked"))
+def accepted(inputs: dict, item: str) -> str | None:
+    """The operator's reason for accepting `item` (a phase, or extended:<suite>), if inputs.json records one."""
+    decisions = inputs.get("decisions") or []
+    rows = decisions.items() if isinstance(decisions, dict) else [
+        (row.get("accept"), row.get("reason")) for row in decisions if isinstance(row, dict)]
+    for name, reason in rows:
+        if name == item and reason:
+            return str(reason)
+    return None
 
 
-def check_outcome(row: dict, name, problems: list) -> None:
-    status = row.get("status")
-    if status == "not_run":
-        if not row.get("reason"):
-            problems.append((2, f"effort {name!r} did not run and needs a reason"))
-        return
-    if not (row.get("owner") and number(row.get("box_hours")) and row.get("goal") and row.get("plan")):
-        problems.append((2, f"effort {name!r} needs an owner, box_hours, and its own goal and plan"))
-        return
-    if status == "running":
-        problems.append((1, f"effort {name!r} is still running at the end of the stage"))
-        return
-    if not (number(row.get("used_device_hours")) and row.get("change") in CHANGES
-            and row.get("problem_status") in PROBLEM_STATUS and row.get("confirmed") and row.get("evidence")):
-        problems.append((2, f"effort {name!r} needs used_device_hours, change, problem_status, confirmed and evidence"))
-    elif row["used_device_hours"] > row["box_hours"] * 1.1 and not row.get("re_estimate"):
-        problems.append((1, f"effort {name!r} used {row['used_device_hours']} h against a {row['box_hours']} h box "
-                            "without a re-estimate"))
+def unmet(problems: list, inputs: dict, item: str, message: str) -> None:
+    """A goal shortfall: critical unless the operator accepted it."""
+    reason = accepted(inputs, item)
+    problems.append((1, f"{message} (accepted by the operator: {reason})") if reason else (2, message))
 
 
-def check_rankings(rankings, problems: list) -> None:
-    if not isinstance(rankings, list) or not rankings:
-        problems.append((2, "efforts.json needs rankings: the first order and one after every effort"))
-        return
-    for index, ranking in enumerate(rankings):
-        order = ranking.get("order") if isinstance(ranking, dict) else None
-        if not (isinstance(order, list) and order and all(
-                isinstance(row, dict) and number(row.get("saving_hours")) and number(row.get("device_hours"))
-                and row["device_hours"] > 0 for row in order)):
-            problems.append((2, f"ranking {index} needs order rows with saving_hours and device_hours"))
-            continue
-        if ranking.get("reason"):
-            continue
-        unblocks = [bool(row.get("unblocks")) for row in order]
-        if any(not a and b for a, b in zip(unblocks, unblocks[1:])):
-            problems.append((2, f"ranking {index} puts speed work above a validity problem (unblocks) and records no "
-                                "reason"))
-            continue
-        speed = [row["saving_hours"] / row["device_hours"] for row in order if not row.get("unblocks")]
-        if any(a < b for a, b in zip(speed, speed[1:])):
-            problems.append((2, f"ranking {index} is not by saving per device hour and records no reason"))
-
-
-def check_efforts(evals: Path, problems: list) -> None:
-    ledger = read(evals / "efforts.json", problems)
-    efforts = ledger.get("efforts")
-    if not isinstance(efforts, list) or not efforts:
-        if efforts is not None or (evals / "efforts.json").is_file():
-            problems.append((2, "efforts.json lists no efforts; rank the survey's problems"))
-        return
-    for row in efforts:
-        if not isinstance(row, dict) or not row.get("problem") or row.get("status") not in EFFORT_STATUS:
-            problems.append((2, f"each effort needs a problem and a status ({', '.join(EFFORT_STATUS)})"))
-            continue
-        check_prediction(row, row["problem"], problems)
-        check_outcome(row, row["problem"], problems)
-    check_rankings(ledger.get("rankings"), problems)
-
-
-def check_serving_config(evals: Path, problems: list) -> None:
-    config = read(evals / "serving_config.json", problems)
-    if not config:
-        return
-    release = config.get("release_limits")
-    if not isinstance(release, dict) or not all(number(release.get(key)) for key in RELEASE_LIMITS):
-        problems.append((2, f"serving_config.release_limits needs {', '.join(RELEASE_LIMITS)} from the release values"))
-    else:
-        for key in RELEASE_LIMITS:
-            if not number(config.get(key)):
-                problems.append((2, f"serving_config.{key} is missing"))
-            elif config[key] < release[key]:
-                shortfall(problems, config.get("limits_reason"),
-                          f"{key} {config[key]} is below the release value {release[key]}")
-    validated, batches = config.get("validated_batches"), config.get("batch_by_eval")
-    if not (isinstance(validated, list) and validated and all(positive_int(b) for b in validated)
-            and isinstance(batches, dict) and batches):
-        problems.append((2, "serving_config needs validated_batches and batch_by_eval"))
-        return
-    seqs = config.get("max_num_seqs")
-    for name, row in batches.items():
-        row = row or {}
-        batch, clients = row.get("batch"), row.get("planned_clients")
-        if not (positive_int(batch) and positive_int(clients)):
-            problems.append((2, f"batch_by_eval.{name} needs batch and planned_clients"))
-            continue
-        expected = min((b for b in validated if b >= clients), default=max(validated))
-        if batch != expected:
-            shortfall(problems, row.get("batch_reason"),
-                      f"{name} ran {clients} agents on batch {batch}; the rule picks batch {expected}")
-        if positive_int(seqs) and clients > seqs:
-            shortfall(problems, row.get("agents_reason"),
-                      f"{name} planned {clients} agents against max_num_seqs {seqs}; the rest queue")
-
-
-def operator_inputs(problems: list) -> dict:
-    """The operator's goal-12 inputs, read from the target checkout the gate runs in."""
-    if not INPUTS.is_file():
-        return {}
-    inputs = read(INPUTS, problems)
-    if inputs.get("mode", "light") not in MODES:
-        problems.append((2, f"{INPUTS} mode must be one of {', '.join(MODES)}"))
-    return inputs
-
-
-def run_timeout_hours(inputs: dict) -> float:
-    limit = inputs.get("run_timeout_hours", DEFAULT_RUN_TIMEOUT_HOURS)
-    return limit if number(limit) else DEFAULT_RUN_TIMEOUT_HOURS
-
-
-def check_cohorts(evals: Path, problems: list) -> None:
-    cohorts = read(evals / "cohorts.json", problems)
-    if not cohorts:
-        return
-    for name, row in cohorts.items():
-        rungs = row.get("rungs") if isinstance(row, dict) else None
-        if not (row.get("source") in LIST_SOURCES and row.get("rule") and isinstance(rungs, dict) and rungs
-                and all(isinstance(tasks, list) and tasks for tasks in rungs.values())):
-            problems.append((2, f"cohorts.json {name!r} needs source ({', '.join(LIST_SOURCES)}), the selection rule "
-                                "and the tasks of each rung"))
-
-
-def check_evals(model_dir: Path, carried: int, problems: list) -> None:
-    evals = model_dir / EVALS
-    for name in ("plan.json", "serving_config.json", "REPORT.md"):
-        if not (evals / name).is_file():
-            problems.append((2, f"missing {evals / name}"))
-    check_survey(evals, carried, problems)
-    check_preflight(evals, problems)
-    check_efforts(evals, problems)
-    check_serving_config(evals, problems)
-    check_cohorts(evals, problems)
-    inputs = operator_inputs(problems)
-    plan = read(evals / "plan.json", problems) if (evals / "plan.json").is_file() else {}
-    mode = inputs.get("mode", "light")
-    if (evals / "plan.json").is_file() and (plan.get("mode") != mode or not plan.get("schedule")):
-        problems.append((2, f"plan.json needs mode {mode!r} (from inputs, default light) and the schedule"))
-    decisions = read(evals / "estimate.json", problems).get("evals") or {}
-    release = plan.get("release") if isinstance(plan, dict) else None
-    if (evals / "plan.json").is_file() and any((row or {}).get("decision") == "go" for row in decisions.values()):
-        limit, projected = run_timeout_hours(inputs), (release or {}).get("projected_hours")
-        per_run = projected if isinstance(projected, dict) else {"the release run": projected}
-        if not (isinstance(release, dict) and release.get("dry_run") and per_run
-                and all(number(hours) for hours in per_run.values())):
-            problems.append((2, "plan.json release needs its dry_run and projected_hours"))
-        elif not (release.get("benchmarks") and release.get("benchmark_source")):
-            problems.append((2, "plan.json release needs the benchmark matrix and the similar models it came from"))
+def check_rates(model_dir: Path, evidence: dict, problems: list, full: bool) -> list:
+    """Stage-11 serving rates; `full` checks the whole grid and the release rows (stage 11's own gate)."""
+    path = model_dir / RATES
+    rates = read(path, problems) if path.is_file() or full else {}
+    if not path.is_file() and not full:
+        problems.append((2, f"missing {path}; stage 11 writes it and stage 12 reads it"))
+        return []
+    validated = rates.get("validated_batches")
+    if not (isinstance(validated, list) and validated and all(positive_int(b) for b in validated)):
+        problems.append((2, "serving_rates.json needs validated_batches"))
+        return []
+    rows = [row for row in rates.get("rows") or [] if isinstance(row, dict)]
+    for batch in validated:
+        if not any(row.get("batch") == batch for row in rows):
+            problems.append((2, f"serving_rates.json has no rate row for batch {batch}"))
+    if not full:
+        return validated
+    workload = evidence.get("workload") or {}
+    lengths = {4096, *(workload.get(key) for key in ("typical_context_tokens", "working_set_tokens")
+                       if positive_int(workload.get(key)))}
+    for batch in validated:
+        measured = {row.get("input_tokens") for row in rows if row.get("batch") == batch}
+        for length in sorted(lengths - measured):
+            problems.append((2, f"serving_rates.json batch {batch} lacks input length {length}"))
+        if not any(positive_int(length) and length >= LONG_CONTEXT_TOKENS for length in measured):
+            problems.append((2, f"serving_rates.json batch {batch} lacks a long-context row (>= {LONG_CONTEXT_TOKENS})"))
+    for row in rows:
+        name = f"batch {row.get('batch')} input {row.get('input_tokens')}"
+        predicted = row.get("predicted") or {}
+        if not all(number(row.get(key)) for key in RATE_FIELDS):
+            problems.append((2, f"serving_rates.json {name} needs {', '.join(RATE_FIELDS)}"))
+        elif not (number(predicted.get("decode_tok_s_user_low")) or number(predicted.get("decode_tok_s_user"))):
+            problems.append((2, f"serving_rates.json {name} needs a predicted decode rate written before measuring"))
         else:
-            for name, hours in per_run.items():
-                if hours > limit:
-                    problems.append((2, f"{name} projected at {hours} h against run_timeout_hours {limit}; "
-                                        "release a smaller list"))
+            low = predicted.get("decode_tok_s_user_low", predicted.get("decode_tok_s_user"))
+            if row["decode_tok_s_user"] < low and not row.get("cause"):
+                problems.append((2, f"serving_rates.json {name} is below its predicted range with no recorded cause"))
+    release = rates.get("release_rows")
+    if not (isinstance(release, list) and release and rates.get("release_source")):
+        problems.append((2, "serving_rates.json needs release_rows and release_source (the spec they came from)"))
+    else:
+        for row in release:
+            if not (isinstance(row, dict) and row.get("route") == "eval" and number(row.get("decode_tok_s_user"))):
+                problems.append((2, f"release row {row} is not measured on the eval route"))
+    return validated
+
+
+def check_run(run: dict, inputs: dict, validated: list, collected: set, item: str, tasks: int,
+              problems: list) -> bool:
+    """One scored run. Goal shortfalls go through `unmet`; rule breaks are always critical. True when it passes."""
+    name, ok = run.get("id", "?"), True
+    if not (run.get("collected") is True and name in collected):
+        unmet(problems, inputs, item, f"run {name} was not collected by the runner (results.json and runs.json)")
+        ok = False
+    listed = (run.get("tasks") or {})
+    if not listed.get("rule"):
+        problems.append((2, f"run {name} needs tasks.rule, recorded before any score"))
+    score = run.get("score") or {}
+    solved, n = score.get("solved"), score.get("n")
+    if not (isinstance(solved, int) and positive_int(n) and 0 <= solved <= n):
+        problems.append((2, f"run {name} needs score.solved and score.n"))
+        return False
+    if n < tasks:
+        unmet(problems, inputs, item, f"run {name} scored {n} tasks; the phase needs {tasks}")
+        ok = False
+    interval = score.get("interval_95")
+    low, high = wilson(solved, n)
+    if not (isinstance(interval, list) and len(interval) == 2 and all(number(v) for v in interval)
+            and abs(interval[0] - low) <= 1 and abs(interval[1] - high) <= 1):
+        problems.append((2, f"run {name} interval_95 {interval} is not the Wilson interval "
+                            f"[{low:.1f}, {high:.1f}] for {solved}/{n}"))
+    failures = [row for row in run.get("failures") or [] if isinstance(row, dict)]
+    counted = 0
+    for row in failures:
+        if row.get("cause") not in CAUSES or not row.get("evidence") or not row.get("task"):
+            problems.append((2, f"run {name}: failure row {row.get('task')!r} needs task, cause "
+                                f"({', '.join(CAUSES)}) and evidence"))
+        rerun = row.get("rerun") or {}
+        if rerun.get("counted"):
+            counted += 1
+            if row.get("cause") != "infrastructure":
+                problems.append((2, f"run {name}: rerun of {row.get('task')!r} changed the score but its first "
+                                    "failure was not infrastructure"))
+    if len({row.get("task") for row in failures}) != n - solved + counted:
+        problems.append((2, f"run {name}: {n - solved + counted} first-attempt failures, "
+                            f"{len(failures)} failure rows; every failed task needs one"))
+    reference = run.get("reference") or {}
+    if not (number(reference.get("value")) and reference.get("source")):
+        unmet(problems, inputs, item, f"run {name} has no reference value and source; the phase cannot pass")
+        return False
+    percent, ref, band = 100 * solved / n, reference["value"], inputs.get("ok_band")
+    band_pass = (percent >= ref - band) if number(band) else (low <= ref <= high or ref <= percent)
+    if run.get("band_pass") is not band_pass:
+        problems.append((2, f"run {name} band_pass is {run.get('band_pass')}; the gate computes {band_pass}"))
+    if not band_pass:
+        unmet(problems, inputs, item, f"run {name} scored {percent:.1f}% against reference {ref} "
+                                      f"(interval {low:.1f}-{high:.1f})")
+        ok = False
+    measured, explained = run.get("measured_hours"), run.get("explained_hours")
+    tolerance = inputs.get("explain_tolerance", DEFAULT_EXPLAIN_TOLERANCE)
+    if not (number(measured) and measured > 0 and number(explained)):
+        problems.append((2, f"run {name} needs measured_hours and explained_hours"))
+        ok = False
+    elif abs(measured - explained) / measured > tolerance:
+        unmet(problems, inputs, item, f"run {name} took {measured} h; tokens over the serving rates explain "
+                                      f"{explained} h (tolerance {tolerance:.0%})")
+        ok = False
+    check_config(run, validated, problems)
+    return ok
+
+
+def check_config(run: dict, validated: list, problems: list) -> None:
+    name, config = run.get("id", "?"), run.get("config") or {}
+    agents, batch, seqs = config.get("agents"), config.get("batch"), config.get("max_num_seqs")
+    if not (positive_int(agents) and positive_int(batch) and positive_int(seqs)):
+        problems.append((2, f"run {name} config needs agents, batch and max_num_seqs"))
+    else:
+        if agents > seqs:
+            problems.append((2, f"run {name}: {agents} agents against max_num_seqs {seqs}; the rest queue"))
+        expected = min((b for b in validated if b >= agents), default=max(validated, default=batch))
+        if batch != expected and not config.get("batch_reason"):
+            problems.append((1, f"run {name}: {agents} agents on batch {batch}; the smallest validated batch "
+                                f"that holds them is {expected}"))
+    limits = config.get("limits") or {}
+    reference = limits.get("reference") or {}
+    if not limits.get("source") or not all(number(limits.get(k)) and number(reference.get(k)) for k in LIMITS):
+        problems.append((2, f"run {name} config.limits needs {', '.join(LIMITS)}, their harness reference values "
+                            "and the source"))
+    else:
+        for key in LIMITS:
+            if limits[key] > reference[key]:
+                problems.append((2, f"run {name}: {key} {limits[key]} is above the harness reference "
+                                    f"{reference[key]}; limits are never raised"))
+            elif limits[key] < reference[key]:
+                problems.append((1, f"run {name}: {key} {limits[key]} is below the harness reference {reference[key]}"))
+    if not config.get("sha"):
+        problems.append((2, f"run {name} config needs the sha it ran"))
+
+
+def check_evals(model_dir: Path, inputs: dict, evidence: dict, problems: list) -> None:
+    evals = model_dir / EVALS
+    validated = check_rates(model_dir, evidence, problems, full=False)
+    results = read(evals / "results.json", problems)
+    ledger = read(evals / "runs.json", problems) if (evals / "runs.json").is_file() else {}
+    if not (evals / "runs.json").is_file():
+        problems.append((2, f"missing {evals / 'runs.json'}; the runner records every run it collected"))
+    collected = {row.get("id") for row in (ledger.get("runs") or []) if isinstance(row, dict) and row.get("conclusion")}
+    runs = {row.get("id"): row for row in results.get("runs") or [] if isinstance(row, dict)}
+    phases = results.get("phases") or {}
+    mode = inputs.get("mode", DEFAULT_MODE)
+    for phase in MODES.get(mode, ()):
+        spec = inputs.get(phase) or {}
+        tasks = spec.get("tasks", DEFAULT_TASKS)
+        run = runs.get((phases.get(phase) or {}).get("run"))
+        if not run or run.get("phase") != phase:
+            unmet(problems, inputs, phase, f"{phase} has no scored run in results.json")
+            continue
+        passed = check_run(run, inputs, validated, collected, phase, tasks, problems)
+        if (phases.get(phase) or {}).get("pass") is not passed:
+            problems.append((2, f"{phase} pass is {(phases.get(phase) or {}).get('pass')}; the gate computes {passed}"))
+    for run in runs.values():
+        if run.get("voided") or run.get("excluded"):
+            problems.append((2, f"run {run.get('id')} is voided or excluded; void per task, never the list"))
+    if mode == "extended":
+        limit = inputs.get("run_timeout_hours", DEFAULT_RUN_TIMEOUT_HOURS)
+        estimates = results.get("estimates") or {}
+        for suite in inputs.get("extended_suites", DEFAULT_EXTENDED_SUITES):
+            item = f"extended:{suite}"
+            if not number(estimates.get(suite)):
+                problems.append((2, f"estimates needs the projected full-suite hours for {suite}"))
+            scored = [r for r in runs.values() if r.get("phase") == "extended" and r.get("suite") == suite]
+            if not scored:
+                unmet(problems, inputs, item, f"extended has no scored run for {suite}")
+                continue
+            run = max(scored, key=lambda r: (r.get("score") or {}).get("n") or 0)
+            if not (number(run.get("predicted_hours")) and run["predicted_hours"] <= limit):
+                unmet(problems, inputs, item, f"extended {suite} run {run.get('id')} was not admitted on a "
+                                              f"projection within run_timeout_hours {limit}")
+            check_run(run, inputs, validated, collected, item, 0, problems)
+    if not (evals / "REPORT.md").is_file():
+        problems.append((2, f"missing {evals / 'REPORT.md'}"))
     learned = read(evals / "learned.json", problems)
-    if learned and not all(isinstance(learned.get(key), list) for key in LEARNED):
-        problems.append((2, f"learned.json needs {', '.join(LEARNED)} as lists, empty when there is nothing"))
-    if not decisions:
-        problems.append((2, "estimate.json has no per-eval decisions"))
-    for name, row in decisions.items():
-        if row.get("decision") not in ("go", "stop") or not row.get("reason"):
-            problems.append((2, f"{name}: estimate needs decision go/stop and a reason"))
-        elif row["decision"] == "stop":
-            if not positive_int(row.get("functional_at")):
-                problems.append((1, f"{name}: stopped with no cohort completed: {row['reason']}"))
-        elif not isinstance(read(evals / "release" / name / "results.json", problems).get("actual_hours"), (int, float)):
-            problems.append((2, f"{name}: release results lack actual_hours"))
+    if learned and not all(isinstance(learned.get(key), (list, dict)) for key in LEARNED):
+        problems.append((2, f"learned.json needs {', '.join(LEARNED)}, empty when there is nothing"))
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--model-dir", default="")
     parser.add_argument("--hf-model", default="")
-    parser.add_argument("--stage", required=True, choices=("full-model", "vllm", "optimized-vllm", "agentic-evals"))
+    parser.add_argument("--stage", required=True,
+                        choices=("full-model", "vllm", "optimized-vllm", "benchmark", "agentic-evals"))
     args = parser.parse_args()
     if not (args.model_dir or args.hf_model):
         print("Neither --model-dir nor --hf-model was given.", file=sys.stderr)
         return 3
     model_dir = Path(args.model_dir or "models/autoports/" + re.sub(r"[^a-z0-9]+", "_", args.hf_model.lower()).strip("_"))
     problems: list = []
-    evidence = read(model_dir / EVIDENCE, problems)
-    if evidence:
+    inputs = operator_inputs(model_dir, problems) if args.stage in ("benchmark", "agentic-evals") else {}
+    existing = inputs.get("entry") == "existing"
+    evidence = {} if existing else read(model_dir / EVIDENCE, problems)
+    if evidence and args.stage in ("full-model", "vllm", "optimized-vllm", "agentic-evals"):
         check_memory(evidence, problems)
         if args.stage != "full-model":
             check_serving(evidence, args.stage, problems)
-        if args.stage == "agentic-evals":
-            carried = sum(1 for level, _ in problems if level == 1)
-            check_evals(model_dir, carried, problems)
+    if args.stage == "benchmark":
+        check_rates(model_dir, evidence, problems, full=True)
+    if args.stage == "agentic-evals" and (evidence or existing):
+        check_evals(model_dir, inputs, evidence, problems)
     for level, message in problems:
         print(f"{'CRITICAL' if level == 2 else 'ADVISORY'}: {message}", file=sys.stderr)
     return max((level for level, _ in problems), default=0)

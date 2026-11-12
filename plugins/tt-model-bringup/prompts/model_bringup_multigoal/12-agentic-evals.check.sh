@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 TT_MODEL_BRINGUP_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYTHON="${PYTHON:-$(command -v python3 || command -v python)}"
-# Runner-side gate for the agentic-evals stage: serving invariants still hold; the survey,
-# preflight, cohorts and two-tier ranked efforts exist; release limits and the batch rule
-# hold; and the estimate decisions (a stop with functional_at passes), full-suite results,
-# serving config, learned facts and report exist. Scores are reported, not gated.
+# Runner-side gate for the agentic-evals stage: serving invariants still hold (autoport entry);
+# each phase of the mode passed (score within the band of its reference, wall time explained by
+# the stage-11 serving rates), its run was collected, every failed task has a cause, no list is
+# voided and limits are never above the harness reference. An operator decision in inputs.json
+# turns a failed phase into an advisory.
 # Exit 0 pass, 1 advisory, 2 critical, 3 error.
 if [ -z "${MODEL_DIR:-}" ] && [ -z "${HF_MODEL:-}" ]; then
   echo "Neither MODEL_DIR nor HF_MODEL is set; cannot scope the check to the target model." >&2

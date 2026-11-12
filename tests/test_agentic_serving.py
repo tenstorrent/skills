@@ -83,188 +83,224 @@ CALCULATIONS = ('batch', 'agents', 'run_hours', 'task_lists', 'agent_timeout', '
 PREFLIGHT = ('release_values', 'registry', 'disk', 'admission', 'release_route', 'smoke')
 
 
-def goal12(model, **overrides):
-    """Write a complete, passing goal-12 evidence set; overrides replace whole files."""
+
+BATCHES = [1, 8, 16, 32]
+LIMITS = {'agent_timeout_s': 21600, 'request_timeout_s': 3600, 'output_cap_tokens': 32768}
+
+
+def rates(lengths=(4096, 20000, 32768)):
+    rows = [{'batch': b, 'input_tokens': n, 'prefill_tok_s': 900.0, 'decode_tok_s_user': 20.0, 'ttft_s': 4.0,
+             'step_ms': 50.0, 'predicted': {'decode_tok_s_user_low': 18.0}} for b in BATCHES for n in lengths]
+    return {'server': {'max_num_seqs': 32}, 'validated_batches': BATCHES, 'rows': rows,
+            'release_rows': [{'isl': 4096, 'osl': 128, 'concurrency': 8, 'route': 'eval', 'decode_tok_s_user': 19.5}],
+            'release_source': 'tt-inference-server model spec (closest model)'}
+
+
+def scored_run(run_id='gpqa10', phase='phase1', suite='r1_gpqa_diamond', solved=7, n=10):
+    failures = [{'task': f'{suite}-{i}', 'cause': 'wrong', 'evidence': 'final answer B, key C'}
+                for i in range(n - solved)]
+    return {'id': run_id, 'phase': phase, 'suite': suite,
+            'tasks': {'rule': 'stratified by domain, fixed list', 'names': [f'{suite}-{i}' for i in range(n)]},
+            'config': {'pool_tokens': 400000, 'agents': 8, 'batch': 8, 'max_num_seqs': 8, 'sha': 'abc123',
+                       'network': 'per task allow_internet',
+                       'limits': {**LIMITS, 'reference': dict(LIMITS), 'source': 'tt-inference-server eval config'}},
+            'score': {'solved': solved, 'n': n, 'interval_95': [round(v, 1) for v in wilson(solved, n)]},
+            'reference': {'value': 84.3, 'source': 'model card'}, 'band_pass': True,
+            'predicted_hours': 2.0, 'explained_hours': 1.8, 'measured_hours': 2.0, 'collected': True,
+            'failures': failures}
+
+
+def wilson(solved, n, z=1.96):
+    p = solved / n
+    d = 1 + z * z / n
+    c = (p + z * z / (2 * n)) / d
+    h = z * (p * (1 - p) / n + z * z / (4 * n * n)) ** 0.5 / d
+    return 100 * (c - h), 100 * (c + h)
+
+
+def goal12(model, runs=None, phases=None, inputs=None, data=None, extra=None):
+    """Write a passing quick-mode goal-12 evidence set at `model` and run the gate; returns (code, stderr)."""
+    runs = runs if runs is not None else [scored_run()]
     evals = model / 'doc/agentic_evals'
-    (evals / 'release/swe').mkdir(parents=True, exist_ok=True)
-    files = {
-        'plan.json': {'mode': 'light', 'schedule': [{'step': 'release', 'start_hours': 20}],
-                      'release': {'dry_run': 'runs/release-dry-run', 'projected_hours': 9.5,
-                                  'benchmarks': [{'isl': 4096, 'osl': 128, 'concurrency': 8}],
-                                  'benchmark_source': ['similar/model']}},
-        'REPORT.md': '# Report',
-        'estimate.json': {'evals': {'swe': {'decision': 'go', 'reason': 'fits'}}},
-        'release/swe/results.json': {'actual_hours': 6.5},
-        'survey.json': {'checks': {k: {'value': 1, 'healthy': True} for k in CHECKS},
-                        'calculations': {k: 1 for k in CALCULATIONS}, 'shortfalls': []},
-        'preflight.json': {k: {'ok': True} for k in PREFLIGHT},
-        'cohorts.json': {'swe': {'source': 'default_rule', 'rule': 'hash order within repositories, round-robin',
-                                 'rungs': {'smoke': ['astropy__astropy-14508', 'django__django-14034']}}},
-        'learned.json': {'harness_facts': [], 'suite_timings': [], 'generic_fixes': []},
-        'efforts.json': {
-            'efforts': [
-                {'problem': 'padded prefill', 'owner': 'prefill', 'status': 'done',
-                 'goal': 'prefill one live row at batch-1 cost', 'plan': 'runs/prefill/plan.md',
-                 'predicted': {'saving_hours': {'swe': 3.0, 'terminal': 1.5}, 'device_hours': 2, 'basis': 'calculated'},
-                 'confirm': {'method': 'prefill vs batch shape', 'success': 'one live row costs batch-1 time'},
-                 'box_hours': 4, 'used_device_hours': 3, 'change': 'kept', 'problem_status': 'solved',
-                 'confirmed': 'prefill 0.9 s per live row', 'evidence': 'runs/prefill'},
-                {'problem': 'block size', 'status': 'not_run', 'reason': 'below the budget line',
-                 'predicted': {'saving_hours': {'swe': 0.5}, 'device_hours': 3, 'basis': 'guess'},
-                 'confirm': {'method': 'cache replay', 'success': 'hit rate above 0.9'}},
-            ],
-            'rankings': [{'after': 'survey', 'order': [
-                {'problem': 'padded prefill', 'saving_hours': 4.5, 'device_hours': 2},
-                {'problem': 'block size', 'saving_hours': 0.5, 'device_hours': 3}]}],
-        },
-        'serving_config.json': {'agent_timeout_s': 6300, 'request_timeout_s': 3600, 'output_cap_tokens': 81920,
-                                'release_limits': {'agent_timeout_s': 6300, 'request_timeout_s': 3600,
-                                                   'output_cap_tokens': 81920},
-                                'validated_batches': [1, 8, 16, 32], 'max_num_seqs': 32,
-                                'batch_by_eval': {'swe': {'batch': 32, 'planned_clients': 29}}},
-    }
-    files.update(overrides)
-    for name, body in files.items():
-        if body is None:
-            (evals / name).unlink(missing_ok=True)
-        else:
-            (evals / name).write_text(body if isinstance(body, str) else json.dumps(body))
-    return files
+    evals.mkdir(parents=True, exist_ok=True)
+    (model / 'doc/benchmark').mkdir(parents=True, exist_ok=True)
+    (model / 'doc/benchmark/serving_rates.json').write_text(json.dumps(rates()))
+    results = {'runs': runs, 'phases': phases if phases is not None else {'phase1': {'run': 'gpqa10', 'pass': True}}}
+    results.update(extra or {})
+    (evals / 'results.json').write_text(json.dumps(results))
+    (evals / 'runs.json').write_text(json.dumps({'runs': [{'id': r['id'], 'conclusion': 'collected'} for r in runs
+                                                          if r.get('collected')]}))
+    (evals / 'learned.json').write_text(json.dumps({'best_config': {}, 'harness_facts': [], 'generic_fixes': []}))
+    (evals / 'REPORT.md').write_text('# Phases\n')
+    return check(model, 'agentic-evals', data if data is not None else evidence(),
+                 inputs if inputs is not None else {'mode': 'quick'})
 
 
-def test_agentic_evals_requires_decisions_and_results(tmp_path):
-    goal12(tmp_path, **{'release/swe/results.json': None})
-    assert check(tmp_path, 'agentic-evals', evidence())[0] == 2
-    goal12(tmp_path, **{'estimate.json': {'evals': {
-        'swe': {'decision': 'go', 'reason': 'fits'}, 'terminal': {'decision': 'stop', 'reason': 'latest start passed'}}}})
-    code, stderr = check(tmp_path, 'agentic-evals', evidence())
-    assert code == 1 and 'latest start passed' in stderr
+def test_quick_run_passes(tmp_path):
+    assert goal12(tmp_path) == (0, '')
 
 
-def test_complete_goal12_evidence_passes(tmp_path):
-    goal12(tmp_path)
-    assert check(tmp_path, 'agentic-evals', evidence()) == (0, '')
+def drop_failure_row(run):
+    run['failures'].pop()
 
 
-@pytest.mark.parametrize('name', ['survey.json', 'preflight.json', 'efforts.json', 'cohorts.json', 'learned.json'])
-def test_goal12_requires_survey_preflight_and_efforts(tmp_path, name):
-    goal12(tmp_path, **{name: None})
-    assert check(tmp_path, 'agentic-evals', evidence())[0] == 2
+def raise_agent_limit(run):
+    run['config']['limits']['agent_timeout_s'] = 36000
 
 
-def test_survey_must_answer_every_check(tmp_path):
-    files = goal12(tmp_path)
-    survey = files['survey.json']
-    del survey['checks']['live_prefill_rows']
-    goal12(tmp_path, **{'survey.json': survey})
-    code, stderr = check(tmp_path, 'agentic-evals', evidence())
-    assert code == 2 and 'live_prefill_rows' in stderr
-    survey['checks']['live_prefill_rows'] = {'not_measured': 'needs the prefill-shape test'}
-    goal12(tmp_path, **{'survey.json': survey})
-    assert check(tmp_path, 'agentic-evals', evidence()) == (0, '')
+def drop_reference(run):
+    del run['reference']
 
 
-def test_carried_shortfalls_must_be_priced(tmp_path):
-    data = evidence()
-    data['ledger']['weights'][0].update(copies=2, copy_reason='measured: fused copy')
-    files = goal12(tmp_path)
-    code, stderr = check(tmp_path, 'agentic-evals', data)
-    assert code == 2 and 'priced in hours' in stderr
-    survey = files['survey.json']
-    survey['shortfalls'] = [{'name': 'attention held twice', 'hours': 1.5}]
-    goal12(tmp_path, **{'survey.json': survey})
-    assert check(tmp_path, 'agentic-evals', data)[0] == 1
+def explain_badly(run):
+    run.update(measured_hours=3.0, explained_hours=1.8)
 
 
-def test_failed_release_route_preflight_is_critical(tmp_path):
-    files = goal12(tmp_path)
-    preflight = files['preflight.json']
-    preflight['release_route'] = {'ok': False, 'error': 'GHCR 403'}
-    goal12(tmp_path, **{'preflight.json': preflight})
-    code, stderr = check(tmp_path, 'agentic-evals', evidence())
-    assert code == 2 and 'release_route' in stderr
+def uncollect(run):
+    run['collected'] = False
 
 
-def efforts_with(tmp_path, change):
-    files = goal12(tmp_path)
-    ledger = files['efforts.json']
-    change(ledger)
-    goal12(tmp_path, **{'efforts.json': ledger})
-    return check(tmp_path, 'agentic-evals', evidence())
-
-
-def test_effort_over_its_box_without_a_re_estimate_is_advisory(tmp_path):
-    code, stderr = efforts_with(tmp_path, lambda e: e['efforts'][0].update(used_device_hours=9))
-    assert code == 1 and '4 h box' in stderr
-
-
-def test_effort_over_its_box_with_a_re_estimate_passes(tmp_path):
-    code, stderr = efforts_with(tmp_path, lambda e: e['efforts'][0].update(used_device_hours=9, re_estimate='2 h left'))
-    assert code == 0, stderr
-
-
-@pytest.mark.parametrize('field', ['predicted', 'confirm'])
-def test_every_effort_needs_a_prediction_and_a_confirmation(tmp_path, field):
-    code, stderr = efforts_with(tmp_path, lambda e: e['efforts'][1].pop(field))
-    assert code == 2 and 'block size' in stderr
-
-
-@pytest.mark.parametrize('field', ['goal', 'plan'])
-def test_effort_that_ran_needs_its_own_goal_and_plan(tmp_path, field):
-    code, stderr = efforts_with(tmp_path, lambda e: e['efforts'][0].pop(field))
-    assert code == 2 and 'goal and plan' in stderr
-
-
-def test_kept_change_with_open_problem_passes(tmp_path):
-    code, stderr = efforts_with(tmp_path, lambda e: e['efforts'][0].update(problem_status='open'))
-    assert code == 0, stderr
-
-
-def test_done_effort_needs_a_confirmed_result(tmp_path):
-    code, stderr = efforts_with(tmp_path, lambda e: e['efforts'][0].pop('confirmed'))
-    assert code == 2 and 'confirmed' in stderr
-
-
-def test_effort_that_did_not_run_needs_a_reason(tmp_path):
-    code, stderr = efforts_with(tmp_path, lambda e: e['efforts'][1].pop('reason'))
-    assert code == 2 and 'did not run' in stderr
-
-
-def test_rankings_are_required(tmp_path):
-    code, stderr = efforts_with(tmp_path, lambda e: e.pop('rankings'))
-    assert code == 2 and 'rankings' in stderr
-
-
-def test_reordered_ranking_needs_a_reason(tmp_path):
-    code, stderr = efforts_with(tmp_path, lambda e: e['rankings'][0]['order'].reverse())
-    assert code == 2 and 'no reason' in stderr
-
-    def reorder_with_reason(ledger):
-        ledger['rankings'][0]['order'].reverse()
-        ledger['rankings'][0]['reason'] = 'block size unblocks the cache effort'
-
-    code, stderr = efforts_with(tmp_path, reorder_with_reason)
-    assert code == 0, stderr
-
-
-@pytest.mark.parametrize('mutate, message', [
-    (lambda c: c.update(agent_timeout_s=900), 'agent_timeout_s 900 is below'),
-    (lambda c: c.update(output_cap_tokens=16384), 'output_cap_tokens 16384 is below'),
-    (lambda c: c['batch_by_eval']['swe'].update(batch=8), 'the rule picks batch 32'),
-    (lambda c: c['batch_by_eval']['swe'].update(planned_clients=8), 'the rule picks batch 8'),
-    (lambda c: c.update(max_num_seqs=8), 'against max_num_seqs 8'),
+@pytest.mark.parametrize('fault, message', [
+    (drop_failure_row, 'every failed task needs one'),
+    (raise_agent_limit, 'above the harness reference'),
+    (drop_reference, 'no reference value'),
+    (explain_badly, 'explain'),
+    (uncollect, 'not collected'),
 ])
-def test_release_limits_and_batch_choice(tmp_path, mutate, message):
-    files = goal12(tmp_path)
-    config = files['serving_config.json']
-    mutate(config)
-    goal12(tmp_path, **{'serving_config.json': config})
-    code, stderr = check(tmp_path, 'agentic-evals', evidence())
+def test_quick_run_fault_is_critical(tmp_path, fault, message):
+    run = scored_run()
+    fault(run)
+    code, stderr = goal12(tmp_path, runs=[run], phases={'phase1': {'run': 'gpqa10', 'pass': False}})
     assert code == 2 and message in stderr
-    config['limits_reason'] = config['batch_by_eval']['swe']['batch_reason'] = 'measured: recorded cause'
-    config['batch_by_eval']['swe']['agents_reason'] = 'measured: recorded cause'
-    goal12(tmp_path, **{'serving_config.json': config})
-    assert check(tmp_path, 'agentic-evals', evidence())[0] == 1
+
+
+@pytest.mark.parametrize('fault', [drop_reference, explain_badly, uncollect])
+def test_operator_decision_turns_a_failed_phase_into_an_advisory(tmp_path, fault):
+    run = scored_run()
+    fault(run)
+    inputs = {'mode': 'quick', 'decisions': [{'accept': 'phase1', 'reason': 'operator: accept for rehearsal'}]}
+    code, stderr = goal12(tmp_path, runs=[run], phases={'phase1': {'run': 'gpqa10', 'pass': False}}, inputs=inputs)
+    assert code == 1 and 'accepted by the operator' in stderr
+
+
+def test_decision_does_not_excuse_a_rule_break(tmp_path):
+    run = scored_run()
+    raise_agent_limit(run)
+    inputs = {'mode': 'quick', 'decisions': [{'accept': 'phase1', 'reason': 'operator'}]}
+    assert goal12(tmp_path, runs=[run], inputs=inputs)[0] == 2
+
+
+def test_score_outside_the_band_fails_the_phase(tmp_path):
+    run = scored_run(solved=4)
+    run['band_pass'] = False
+    code, stderr = goal12(tmp_path, runs=[run], phases={'phase1': {'run': 'gpqa10', 'pass': False}})
+    assert code == 2 and 'against reference 84.3' in stderr
+
+
+def test_recorded_pass_must_agree_with_the_gate(tmp_path):
+    run = scored_run(solved=4)
+    code, stderr = goal12(tmp_path, runs=[run])
+    assert code == 2 and 'band_pass is True' in stderr
+
+
+def test_interval_must_be_wilson(tmp_path):
+    run = scored_run()
+    run['score']['interval_95'] = [55.0, 85.0]
+    code, stderr = goal12(tmp_path, runs=[run])
+    assert code == 2 and 'Wilson' in stderr
+
+
+def test_a_voided_list_is_critical(tmp_path):
+    run = scored_run()
+    run['voided'] = True
+    code, stderr = goal12(tmp_path, runs=[run])
+    assert code == 2 and 'never the list' in stderr
+
+
+def test_rerun_counts_only_for_infrastructure(tmp_path):
+    run = scored_run(solved=8)
+    run['failures'].append({'task': 'x', 'cause': 'wrong', 'evidence': 'e', 'rerun': {'solved': True, 'counted': True}})
+    code, stderr = goal12(tmp_path, runs=[run])
+    assert code == 2 and 'not infrastructure' in stderr
+    run['failures'][-1]['cause'] = 'infrastructure'
+    assert goal12(tmp_path, runs=[run]) == (0, '')
+
+
+def test_agents_above_max_num_seqs_and_batch_choice(tmp_path):
+    run = scored_run()
+    run['config']['batch'] = 32
+    code, stderr = goal12(tmp_path, runs=[run])
+    assert code == 1 and 'smallest validated batch' in stderr
+    run['config'].update(agents=16, batch=16)
+    assert goal12(tmp_path, runs=[run])[0] == 2
+
+
+def test_agentic_mode_needs_phase_2(tmp_path):
+    code, stderr = goal12(tmp_path, inputs={'mode': 'agentic'})
+    assert code == 2 and 'phase2 has no scored run' in stderr
+    runs = [scored_run(), scored_run('swe10', 'phase2', 'swe_bench_verified', solved=6)]
+    for run in runs[1:]:
+        run['reference'] = {'value': 61.2, 'source': 'operator floor'}
+    phases = {'phase1': {'run': 'gpqa10', 'pass': True}, 'phase2': {'run': 'swe10', 'pass': True}}
+    assert goal12(tmp_path, runs=runs, phases=phases, inputs={'mode': 'agentic'}) == (0, '')
+
+
+def test_extended_mode_needs_estimates_and_fitting_runs(tmp_path):
+    runs = [scored_run(), scored_run('swe10', 'phase2', 'swe_bench_verified', solved=6),
+            scored_run('gpqa80', 'extended', 'r1_gpqa_diamond', solved=66, n=80),
+            scored_run('swe40', 'extended', 'swe_bench_verified', solved=24, n=40)]
+    for run in runs:
+        if run['suite'] == 'swe_bench_verified':
+            run['reference'] = {'value': 61.2, 'source': 'operator floor'}
+    phases = {'phase1': {'run': 'gpqa10', 'pass': True}, 'phase2': {'run': 'swe10', 'pass': True}}
+    estimates = {'estimates': {'r1_gpqa_diamond': 18.0, 'swe_bench_verified': 30.0}}
+    assert goal12(tmp_path, runs=runs, phases=phases, inputs={'mode': 'extended'}, extra=estimates) == (0, '')
+    runs[2]['predicted_hours'] = 14.0
+    code, stderr = goal12(tmp_path, runs=runs, phases=phases, inputs={'mode': 'extended'}, extra=estimates)
+    assert code == 2 and 'run_timeout_hours' in stderr
+
+
+def test_existing_entry_skips_the_serving_evidence(tmp_path):
+    code, stderr = goal12(tmp_path, inputs={'mode': 'quick', 'entry': 'existing'}, data={})
+    assert (code, stderr) == (0, '')
+
+
+def test_unknown_mode_is_critical(tmp_path):
+    assert goal12(tmp_path, inputs={'mode': 'light'})[0] == 2
+
+
+def test_stage_12_needs_stage_11_rates(tmp_path):
+    goal12(tmp_path)
+    (tmp_path / 'doc/benchmark/serving_rates.json').unlink()
+    code, stderr = check(tmp_path, 'agentic-evals', evidence(), {'mode': 'quick'})
+    assert code == 2 and 'serving_rates.json' in stderr
+
+
+def benchmark(model, data):
+    (model / 'doc/benchmark').mkdir(parents=True, exist_ok=True)
+    (model / 'doc/benchmark/serving_rates.json').write_text(json.dumps(data))
+    return check(model, 'benchmark', evidence(), {})
+
+
+def test_stage_11_grid_passes(tmp_path):
+    assert benchmark(tmp_path, rates()) == (0, '')
+
+
+def test_stage_11_needs_long_context_and_release_rows(tmp_path):
+    code, stderr = benchmark(tmp_path, rates(lengths=(4096, 20000)))
+    assert code == 2 and 'long-context' in stderr
+    data = rates()
+    data['release_rows'][0]['route'] = 'local'
+    code, stderr = benchmark(tmp_path, data)
+    assert code == 2 and 'eval route' in stderr
+
+
+def test_stage_11_row_below_prediction_needs_a_cause(tmp_path):
+    data = rates()
+    data['rows'][0]['decode_tok_s_user'] = 10.0
+    assert benchmark(tmp_path, data)[0] == 2
+    data['rows'][0]['cause'] = 'host contention during the long prefill'
+    assert benchmark(tmp_path, data) == (0, '')
 
 
 def test_benchmark_server_records_prefix_caching_instead_of_rejecting_it():
@@ -279,55 +315,6 @@ def test_benchmark_server_records_prefix_caching_instead_of_rejecting_it():
         validate_server(server, 32, 'org/model', 'http://unused')
 
 
-def test_stop_with_a_banked_cohort_passes_and_without_one_is_advisory(tmp_path):
-    estimate = {'evals': {'swe': {'decision': 'go', 'reason': 'fits'},
-                          'terminal': {'decision': 'stop', 'reason': 'rung 2 does not fit', 'functional_at': 32}}}
-    goal12(tmp_path, **{'estimate.json': estimate})
-    assert check(tmp_path, 'agentic-evals', evidence()) == (0, '')
-    del estimate['evals']['terminal']['functional_at']
-    goal12(tmp_path, **{'estimate.json': estimate})
-    code, stderr = check(tmp_path, 'agentic-evals', evidence())
-    assert code == 1 and 'no cohort completed' in stderr
-
-
-@pytest.mark.parametrize('row', [
-    {'source': 'default_rule', 'rungs': {'smoke': ['a']}},
-    {'source': 'guess', 'rule': 'r', 'rungs': {'smoke': ['a']}},
-    {'source': 'inputs', 'rule': 'r', 'rungs': {'smoke': []}},
-])
-def test_task_lists_need_source_rule_and_tasks(tmp_path, row):
-    goal12(tmp_path, **{'cohorts.json': {'swe': row}})
-    code, stderr = check(tmp_path, 'agentic-evals', evidence())
-    assert code == 2 and 'selection rule' in stderr
-
-
-@pytest.mark.parametrize('plan', [{'mode': 'everything', 'schedule': [{}]}, {'mode': 'extended'}])
-def test_plan_needs_a_mode_and_a_schedule(tmp_path, plan):
-    goal12(tmp_path, **{'plan.json': plan})
-    code, stderr = check(tmp_path, 'agentic-evals', evidence())
-    assert code == 2 and 'mode' in stderr
-
-
-def test_learned_needs_its_lists(tmp_path):
-    goal12(tmp_path, **{'learned.json': {'harness_facts': []}})
-    code, stderr = check(tmp_path, 'agentic-evals', evidence())
-    assert code == 2 and 'suite_timings' in stderr
-
-
-def validity_ranking(ledger, unblocks_first):
-    order = [{'problem': 'padded prefill', 'saving_hours': 4.5, 'device_hours': 2},
-             {'problem': 'terminal verifier offline', 'saving_hours': 0, 'device_hours': 3, 'unblocks': 'terminal'}]
-    ledger['rankings'][0]['order'] = order[::-1] if unblocks_first else order
-
-
-def test_validity_problem_ranks_above_speed_without_a_reason(tmp_path):
-    code, stderr = efforts_with(tmp_path, lambda e: validity_ranking(e, True))
-    assert code == 0, stderr
-
-
-def test_speed_above_a_validity_problem_needs_a_reason(tmp_path):
-    code, stderr = efforts_with(tmp_path, lambda e: validity_ranking(e, False))
-    assert code == 2 and 'validity problem' in stderr
 
 
 def test_fixed_pool_budget_is_a_shortfall(tmp_path):
@@ -395,52 +382,6 @@ def test_agent_replay_reports_hits_and_prefill_amplification(tmp_path):
     assert summary['prefilled_per_final_context'] == 1.0
     assert summary['preemptions'] == 0
 
-
-@pytest.mark.parametrize('mode, release, message', [
-    ('light', {'projected_hours': 9.5}, 'dry_run'),
-    ('light', {'dry_run': 'runs/d', 'projected_hours': 13, 'benchmarks': [{}], 'benchmark_source': ['m']},
-     'smaller list'),
-    ('extended', {'dry_run': 'runs/d', 'projected_hours': {'swe': 11, 'terminal': 14}, 'benchmarks': [{}],
-                  'benchmark_source': ['m']}, 'terminal projected'),
-    ('light', {'dry_run': 'runs/d', 'projected_hours': 9}, 'benchmark matrix'),
-])
-def test_release_needs_a_dry_run_and_a_projection_that_fits(tmp_path, mode, release, message):
-    plan = {'mode': mode, 'schedule': [{}], 'release': release}
-    goal12(tmp_path, **{'plan.json': plan})
-    code, stderr = check(tmp_path, 'agentic-evals', evidence(), inputs={'mode': mode})
-    assert code == 2 and message in stderr
-
-
-def test_extended_mode_projects_each_suite_against_run_timeout_hours(tmp_path):
-    plan = {'mode': 'extended', 'schedule': [{}],
-            'release': {'dry_run': 'runs/d', 'projected_hours': {'swe': 11.5, 'terminal': 9},
-                        'benchmarks': [{}], 'benchmark_source': ['m']}}
-    goal12(tmp_path, **{'plan.json': plan})
-    assert check(tmp_path, 'agentic-evals', evidence(), inputs={'mode': 'extended'}) == (0, '')
-
-
-def test_no_release_needed_when_every_eval_stopped(tmp_path):
-    goal12(tmp_path, **{'plan.json': {'mode': 'light', 'schedule': [{}]},
-                        'estimate.json': {'evals': {'swe': {'decision': 'stop', 'reason': 'r', 'functional_at': 5}}}})
-    assert check(tmp_path, 'agentic-evals', evidence()) == (0, '')
-
-
-@pytest.mark.parametrize('inputs, passes', [
-    ({'run_timeout_hours': 8}, False),
-    ({'run_timeout_hours': 10}, True),
-    ({}, True),
-])
-def test_release_limit_comes_from_the_operator_inputs(tmp_path, inputs, passes):
-    """projected 9.5 h against run_timeout_hours from inputs.json, default 12."""
-    goal12(tmp_path)
-    code, stderr = check(tmp_path, 'agentic-evals', evidence(), inputs=inputs)
-    assert (code == 0) == passes, stderr
-
-
-def test_plan_mode_must_match_the_operator_inputs(tmp_path):
-    goal12(tmp_path)
-    code, stderr = check(tmp_path, 'agentic-evals', evidence(), inputs={'mode': 'extended'})
-    assert code == 2 and "mode 'extended'" in stderr
 
 
 @pytest.mark.parametrize('stage, key', [
