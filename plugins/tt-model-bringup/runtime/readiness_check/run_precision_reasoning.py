@@ -477,7 +477,8 @@ def hf_fit_reason(hf_model: str) -> Optional[str]:
     """None when the HF model fits in host RAM, else why the HF slice is skipped."""
     need, have = hf_weight_bytes(hf_model), mem_available_bytes()
     if need is None:
-        return f"could not size the HF checkpoint {hf_model} locally; pass --hf-positions 0 or download it"
+        return (f"no local weight files for the HF checkpoint {hf_model} (its cached snapshot may hold only configs); "
+                "pass the checkpoint directory as --hf-model, download it, or pass --hf-positions 0")
     if have is None:
         return "could not read MemAvailable"
     if need * 1.2 + HF_HEADROOM_BYTES > have:

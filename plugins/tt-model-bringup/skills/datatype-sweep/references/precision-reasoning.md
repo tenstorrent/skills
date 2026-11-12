@@ -86,6 +86,8 @@ and fidelities.
 `--hf-positions 2048` scores the reference against the original HF model on the
 CPU (bf16) when the checkpoint fits in free host RAM; otherwise the check is
 skipped with the reason. This catches a loss the reference itself has.
+`--hf-model` may be a local checkpoint directory; pass the one the model loads
+when the hub cache's default snapshot holds only configs.
 
 ## Checks and defaults
 
