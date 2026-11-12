@@ -40,6 +40,17 @@ On by default (ROUTINE_MODEL; `route.core_cheap.routine` {"model", "effort"} pic
 (routine_quality): when routine's failed and needs_review share over QUALITY_WINDOW_S beats hard's by more
 than QUALITY_GAP, with ALARM_MIN runs in each, the daemon raises one run_class_quality event per window.
 
+Code on Sonnet (CODE_KEY): standard-tier code tasks of a CODE_KINDS kind ("new", or "continue": one that
+continues another task) run on Sonnet at high effort (CODE_MODEL) on the Claude core provider when their
+kind's quality allows it (code_quality, by the daemon each hour into the kv CODE_STATE_KV): "full" once Sonnet
+had CODE_FULL_MIN tasks with a known outcome over CODE_WINDOW_S and its bad share (failed, needs_review, or its
+first review asked for changes) is within QUALITY_GAP of Opus's; "off" once it is worse by more, with
+ALARM_MIN tasks each (the daemon raises one run_class_quality event when a kind moves back to Opus); else
+"canary": a stable CODE_CANARY share of its tasks (by task id; `route.code_sonnet.share`). Review fixes stay
+on Opus (route.kept_core), and so do urgent, needs_deep, user_deep, pinned (provider, model or effort),
+tier-up retries, deep, plan and device runs. Off with `route.code_sonnet` false or `route.core_cheap` false;
+`route.code_sonnet.kinds` narrows the kinds.
+
 Report: by_class counts runs per class per model per hour with their real cost (`ttp stats --by-class`),
 and the share of runs whose class routes to chat. Alarm: quiet_classes names a class meant for cheap
 models (routed to chat, or with a cheap core model) that had at least ALARM_MIN runs in the window and none
@@ -83,6 +94,13 @@ CORE_CHEAP = {"wake_decision": {"model": "haiku", "effort": "low"},
 ROUTINE_MODEL = {"model": "sonnet", "effort": "high"}
 CORE_CHEAP[ROUTINE] = dict(ROUTINE_MODEL)
 CHEAP_PROVIDER = "claude"
+CODE_KEY = "code"                 # on a cheap note: the code kind that took CODE_MODEL
+CODE_KINDS = ("new", "continue")
+CODE_MODEL = {"model": "sonnet", "effort": "high"}
+CODE_CANARY = 0.2
+CODE_FULL_MIN = 30
+CODE_WINDOW_S = 7 * 86400.0
+CODE_STATE_KV = "code_sonnet_state"
 REPORT = re.compile(r"(?i)\b(status|report|measure(?:d|ment|s)?|count|stats|summar(?:y|ise|ize)|digest|brief)\b")
 
 
@@ -213,13 +231,16 @@ def cheap_models(cfg: dict) -> dict[str, dict]:
 
 
 def core_cheap(cfg: dict, task: dict | None, cls: str, tier: str, provider: str, routed: dict | None = None,
-               picked: dict | None = None) -> dict | None:
+               picked: dict | None = None, code_state: dict | None = None) -> dict | None:
     """The cheap Claude model a run of class `cls` takes when it starts on `provider` (the core one) at
     `tier`: {"provider", "model", "effort", "class", "why"}, or None (its tier's model): not the Claude core
     provider, not a CHAT class, not the standard tier, the run goes to the chat provider (`routed` with no
     fallback), the task is one routing could not move, or `route.classes` keeps the class on core."""
-    if provider != CHEAP_PROVIDER or (cfg.get("core_provider") or "claude") != provider \
-            or cls not in (*CHAT, ROUTINE) or tier != "standard":
+    if provider != CHEAP_PROVIDER or (cfg.get("core_provider") or "claude") != provider or tier != "standard":
+        return None
+    if cls == "hard":
+        return code_sonnet(cfg, task, picked, code_state)
+    if cls not in (*CHAT, ROUTINE):
         return None
     from .route import kept_core
     if cls == ROUTINE and task and (str(task.get("effort") or "") or kept_core(task)):
@@ -235,6 +256,57 @@ def core_cheap(cfg: dict, task: dict | None, cls: str, tier: str, provider: str,
         return None
     why = "routine work" if cls == ROUTINE else str((routed or {}).get("fallback") or "") if routed else "no chat model"
     return {"provider": provider, "model": m["model"], "effort": m["effort"], "class": cls, "why": why or "no chat model"}
+
+
+def code_kind(task: dict | None, cfg: dict | None = None) -> str:
+    """A standard-tier code task's kind for the Sonnet route: "review_fix", "continue" or "new"; "" for
+    anything else (other kinds, other tiers, device work)."""
+    if not task or task.get("kind") != "code" or str(task.get("tier") or "standard") != "standard":
+        return ""
+    from . import tierfloor
+    if tierfloor.device_run(task, cfg) or tierfloor.DEVICE_SPEC.search(str(task.get("spec") or "")):
+        return ""
+    labels = _labels(task)
+    if any(lb.startswith("review_fix") for lb in labels):
+        return "review_fix"
+    return "continue" if any(lb.startswith("continues:") for lb in labels) else "new"
+
+
+def code_settings(cfg: dict) -> dict | None:
+    """{"share", "kinds"} for the code route, or None when it is off (`route.code_sonnet` or
+    `route.core_cheap` false)."""
+    r = cfg.get("route") or {}
+    got = r.get("code_sonnet")
+    if got is False or r.get("core_cheap") is False:
+        return None
+    got = got if isinstance(got, dict) else {}
+    share = got.get("share")
+    share = float(share) if isinstance(share, (int, float)) and not isinstance(share, bool) and 0 <= share <= 1 \
+        else CODE_CANARY
+    kinds = got.get("kinds")
+    kinds = tuple(k for k in kinds if k in CODE_KINDS) if isinstance(kinds, list) else CODE_KINDS
+    return {"share": share, "kinds": kinds}
+
+
+def canary(task_id, share: float) -> bool:
+    """A stable `share` of task ids: the same task gets the same answer on every run."""
+    import hashlib
+    return int(hashlib.sha256(f"code-canary:{task_id}".encode()).hexdigest()[:8], 16) % 1000 < share * 1000
+
+
+def code_sonnet(cfg: dict, task: dict | None, picked: dict | None = None, state: dict | None = None) -> dict | None:
+    """The cheap note for a code run that takes CODE_MODEL, else None (Opus): see the module docstring.
+    `state`: {kind: "full" | "canary" | "off"} (the daemon's CODE_STATE_KV; a kind missing is canary)."""
+    kind = code_kind(task, cfg)
+    on = code_settings(cfg)
+    if not on or kind not in on["kinds"] or str((task or {}).get("effort") or "") \
+            or not routable(task, {"pick": picked or {}, KEY: "hard"}):   # urgent work stays on Opus
+        return None
+    mode = (state or {}).get(kind) or "canary"
+    if mode == "off" or (mode != "full" and not canary(task.get("id"), on["share"])):
+        return None
+    return {"provider": CHEAP_PROVIDER, **CODE_MODEL, "class": "hard", CODE_KEY: kind,
+            "why": f"code {kind} on Sonnet ({'within quality of Opus' if mode == 'full' else 'canary'})"}
 
 
 def cheap_run(note: dict | None, provider: str) -> dict | None:
@@ -291,7 +363,7 @@ def by_class(db, cfg: dict, since: float, until: float | None = None) -> dict:
         task, note = tasks.get(r["task"]), _note(r)
         cls = classify(task, r, cfg)
         add(cls, f"{r['provider'] or '?'}:{r['model'] or '?'}", float(r["cost_usd"] or 0), routable(task, note))
-        if cheap_run(note, str(r["provider"] or "")):
+        if (cn := cheap_run(note, str(r["provider"] or ""))) and not cn.get(CODE_KEY):
             cheap[cls] = cheap.get(cls, 0) + 1
         rn = note.get(ROUTE_KEY)
         fell = str(rn.get("fallback") or "") if isinstance(rn, dict) else ""
@@ -354,6 +426,66 @@ def quality_text(q: dict, hours: float) -> str:
     return (f"Routine runs (Sonnet, high effort) went wrong more often than hard ones (Opus) in the last {hours:g} h: "
             f"{r['bad']}/{r['tasks']} tasks failed or needs_review ({r['share']:.0%}) vs {h['bad']}/{h['tasks']} "
             f"({h['share']:.0%}). Check them; `route.classes.routine` \"core\" moves routine work back to Opus.")
+
+
+def code_quality(db, cfg: dict, since: float, until: float | None = None) -> dict:
+    """Code tasks on Sonnet (CODE_KEY) vs on Opus per kind in [since, until), each task by its last worker run
+    there and counted once its outcome is known: {kind: {"sonnet", "opus": {"tasks", "bad", "share"}, "gap",
+    "state"}}. Bad: the run or task failed, a needs_review hand-off, or its first review (auto_review:<id>)
+    asked for changes. "state": "off" (ALARM_MIN each, Sonnet worse by more than QUALITY_GAP), "full"
+    (CODE_FULL_MIN Sonnet tasks, ALARM_MIN Opus ones, within QUALITY_GAP) or "canary"."""
+    until = time.time() if until is None else until
+    last: dict = {}
+    for r in db.q("SELECT task, provider, model, status, note FROM runs WHERE role='worker' AND task IS NOT NULL "
+                  "AND started>=? AND started<? AND status!='running' ORDER BY started", (since, until)):
+        last[r["task"]] = dict(r)
+    tasks = {t["id"]: dict(t) for t in db.q(
+        f"SELECT * FROM tasks WHERE kind='code' AND id IN ({','.join('?' * len(last))})", tuple(last))} if last else {}
+    first: dict = {}
+    if tasks:
+        for r in db.q("SELECT id, status, labels FROM tasks WHERE kind='review' AND status IN ('done','failed') "
+                      "AND created>=? ORDER BY id", (since,)):
+            for lb in _labels(dict(r)):
+                if lb.startswith("auto_review:") and lb[12:].isdigit():
+                    first.setdefault(int(lb[12:]), r["status"])
+    out = {k: {m: {"tasks": 0, "bad": 0, "share": 0.0} for m in ("sonnet", "opus")} for k in CODE_KINDS}
+    for tid, task in tasks.items():
+        r = last[tid]
+        kind = code_kind(task, cfg)
+        if kind not in out:
+            continue
+        cheap = cheap_run(_note(r), str(r["provider"] or ""))
+        side = "sonnet" if (cheap or {}).get(CODE_KEY) else "opus" if not cheap and \
+            "opus" in str(r["model"] or "") else None
+        if not side:
+            continue
+        try:
+            got = json.loads(task.get("result") or "{}")
+        except (TypeError, ValueError):
+            got = {}
+        hand = got.get("status") if isinstance(got, dict) else None
+        bad = r["status"] == "failed" or task.get("status") == "failed" or hand in ("failed", "needs_review") \
+            or first.get(tid) == "failed"
+        if not bad and tid not in first:
+            continue   # outcome not known yet: no review verdict
+        out[kind][side]["tasks"] += 1
+        out[kind][side]["bad"] += int(bad)
+    for k, v in out.items():
+        for m in ("sonnet", "opus"):
+            v[m]["share"] = round(v[m]["bad"] / v[m]["tasks"], 3) if v[m]["tasks"] else 0.0
+        v["gap"] = round(v["sonnet"]["share"] - v["opus"]["share"], 3)
+        enough = v["opus"]["tasks"] >= ALARM_MIN
+        v["state"] = "off" if enough and v["sonnet"]["tasks"] >= ALARM_MIN and v["gap"] > QUALITY_GAP else \
+            "full" if enough and v["sonnet"]["tasks"] >= CODE_FULL_MIN else "canary"
+    return out
+
+
+def code_quality_text(kind: str, v: dict, hours: float) -> str:
+    s, o = v["sonnet"], v["opus"]
+    return (f"Code tasks ({kind}) on Sonnet went wrong more often than on Opus in the last {hours:g} h: "
+            f"{s['bad']}/{s['tasks']} failed, needs_review or changes asked at first review ({s['share']:.0%}) vs "
+            f"{o['bad']}/{o['tasks']} ({o['share']:.0%}). New {kind} code tasks run on Opus again; "
+            f"`route.code_sonnet` false turns the Sonnet route off.")
 
 
 def decider(decision) -> str:

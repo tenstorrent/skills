@@ -410,3 +410,88 @@ def test_wake_keeps_effort_is_only_a_code_task_worker_wake_with_no_chat_reply():
     assert tierfloor.wake_keeps_effort({"kind": "review"}, "worker_wake") is False
     assert tierfloor.wake_keeps_effort({"kind": "question"}, "worker_wake") is False
     assert tierfloor.wake_keeps_effort({**code, "reply_chat": "c1"}, "worker_wake") is False
+
+
+def test_code_tasks_take_sonnet_by_kind_canary_then_full_and_opus_keeps_fixes_pins_and_urgent_work():
+    from ttp import runclass
+    t = {"id": 7, "kind": "code", "tier": "standard", "title": "add a flag", "labels": "[]"}
+    assert runclass.classify(t) == "hard"   # accounting unchanged: the route is a cheap model, not a class
+    assert runclass.code_kind(t) == "new"
+    assert runclass.code_kind({**t, "labels": '["continues:5"]'}) == "continue"
+    assert runclass.code_kind({**t, "labels": '["review_fix:9", "continues:5"]'}) == "review_fix"
+    assert runclass.code_kind({**t, "tier": "deep"}) == runclass.code_kind({**t, "kind": "work"}) == ""
+    # Canary: a stable share of task ids, the same answer on every run of a task.
+    ids = range(1, 2001)
+    picked = [i for i in ids if runclass.code_sonnet({}, {**t, "id": i})]
+    assert 0.15 < len(picked) / 2000 < 0.25
+    assert [i for i in ids if runclass.code_sonnet({}, {**t, "id": i})] == picked
+    tid = picked[0]
+    got = runclass.core_cheap({}, {**t, "id": tid}, "hard", "standard", "claude")
+    assert (got["model"], got["effort"], got[runclass.CODE_KEY]) == ("sonnet", "high", "new") and "canary" in got["why"]
+    other = next(i for i in ids if i not in picked)
+    assert runclass.core_cheap({}, {**t, "id": other}, "hard", "standard", "claude") is None
+    # Full: every task of the kind; off: none; a kind's state never moves another kind.
+    full = {"new": "full"}
+    assert runclass.core_cheap({}, {**t, "id": other}, "hard", "standard", "claude", None, None, full)["model"] == "sonnet"
+    assert runclass.core_cheap({}, {**t, "id": tid}, "hard", "standard", "claude", None, None, {"new": "off"}) is None
+    cont = {**t, "id": tid, "labels": '["continues:5"]'}
+    assert runclass.core_cheap({}, cont, "hard", "standard", "claude", None, None, {"new": "off"})[runclass.CODE_KEY] == "continue"
+    # Opus keeps review fixes, urgent, needs_deep, pins, tier-up retries, other tiers and device work.
+    for extra in ({"labels": '["review_fix:9"]'}, {"spec": "urgent: the user is waiting"}, {"labels": '["needs_deep"]'},
+                  {"model": "opus"}, {"provider": "claude"}, {"effort": "xhigh"},
+                  {"spec": "run it on the device (tt-smi reset)"}):
+        assert runclass.core_cheap({}, {**t, **extra}, "hard", "standard", "claude", None, None, full) is None, extra
+    assert runclass.core_cheap({}, t, "hard", "standard", "claude", None, {"by": "retry"}, full) is None
+    assert runclass.core_cheap({}, t, "hard", "deep", "claude", None, None, full) is None
+    assert runclass.core_cheap({}, t, "hard", "standard", "codex", None, None, full) is None
+    # Off-switches, a narrower kind list and the share.
+    for cfg in ({"route": {"code_sonnet": False}}, {"route": {"core_cheap": False}},
+                {"route": {"code_sonnet": {"kinds": ["continue"]}}}):
+        assert runclass.core_cheap(cfg, t, "hard", "standard", "claude", None, None, full) is None, cfg
+    assert runclass.code_sonnet({"route": {"code_sonnet": {"share": 0}}}, {**t, "id": tid}) is None
+    assert runclass.code_sonnet({"route": {"code_sonnet": {"share": 1}}}, {**t, "id": other})
+
+
+def test_code_quality_moves_a_kind_full_when_sonnet_matches_opus_and_back_to_opus_with_one_event(env):
+    from ttp import runclass
+    from ttp.daemon import Daemon
+    p = make(env)
+    now = time.time()
+
+    def task(sonnet, bad, labels="[]", review=True):
+        t = p.db.add_task("t", "", kind="code", tier="standard", priority=3, budget_usd=1.0)
+        p.db.x("UPDATE tasks SET status='done', result=?, labels=? WHERE id=?",
+               (json.dumps({"status": "done"}), labels, t))
+        note = json.dumps({runclass.CHEAP_KEY: {"provider": "claude", "model": "sonnet", "effort": "high",
+                                                "class": "hard", runclass.CODE_KEY: "new"}}) if sonnet else None
+        p.db.x("INSERT INTO runs(task,role,provider,model,started,status,cost_usd,note) VALUES(?,?,?,?,?,?,?,?)",
+               (t, "worker", "claude", "sonnet" if sonnet else "claude-opus-5-5", now - 600, "ok", 0.1, note))
+        if review:   # its first review: changes asked when bad
+            r = p.db.add_task(f"Review #{t}", "", kind="review", tier="standard", priority=3, budget_usd=1.0)
+            p.db.x("UPDATE tasks SET status=?, labels=? WHERE id=?",
+                   ("failed" if bad else "done", json.dumps([f"auto_review:{t}"]), r))
+        return t
+    for i in range(10):   # Opus: 2 of 10 had changes asked
+        task(False, i < 2)
+    for i in range(runclass.CODE_FULL_MIN):   # Sonnet: 6 of 30 (20%: same as Opus)
+        task(True, i < 6)
+    task(True, False, review=False)   # no verdict yet: not counted
+    q = runclass.code_quality(p.db, {}, now - runclass.CODE_WINDOW_S, now)
+    assert (q["new"]["sonnet"]["tasks"], q["new"]["sonnet"]["bad"], q["new"]["opus"]["tasks"]) == (30, 6, 10)
+    assert q["new"]["state"] == "full" and q["continue"]["state"] == "canary"
+    d = Daemon(p.base)
+    d.watch_run_classes()
+    assert d._code_state() == {"new": "full", "continue": "canary"}
+    assert p.db.one("SELECT COUNT(*) n FROM events WHERE kind='run_class_quality'")["n"] == 0
+    # Sonnet goes wrong 10 more times: 16/40 (40%) vs 20%: back to Opus, told once.
+    for _ in range(10):
+        task(True, True)
+    d._run_class_checked = d._code_quality_checked = 0.0
+    d.watch_run_classes()
+    d._run_class_checked = d._code_quality_checked = 0.0
+    d.watch_run_classes()
+    assert d._code_state()["new"] == "off"
+    ev = p.db.q("SELECT text FROM events WHERE kind='run_class_quality'")
+    assert len(ev) == 1 and "Code tasks (new)" in ev[0]["text"] and "route.code_sonnet" in ev[0]["text"]
+    t = {"id": 1, "kind": "code", "tier": "standard", "title": "x", "labels": "[]"}
+    assert runclass.core_cheap({}, t, "hard", "standard", "claude", None, None, d._code_state()) is None

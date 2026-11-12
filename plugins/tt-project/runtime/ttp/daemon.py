@@ -2489,6 +2489,14 @@ class Daemon:
             self.alert("effort-ab-decided", f"Effort A/B ended: {got} effort is now the standard for code tasks "
                        f"(`ttp stats --effort-ab`).", severity="low", every_s=0)
 
+    def _code_state(self) -> dict:
+        """runclass.CODE_STATE_KV: {code kind: "full" | "canary" | "off"}; {} (all canary) when unset or bad."""
+        try:
+            got = json.loads(self.p.db.kv(runclass.CODE_STATE_KV, "") or "{}")
+        except (TypeError, ValueError):
+            return {}
+        return got if isinstance(got, dict) else {}
+
     def watch_run_classes(self, every_s: float = 300, window_s: float = 3600) -> None:
         """Model-free alarm (runclass.quiet_classes): a class routed to the chat provider that had at least
         runclass.ALARM_MIN eligible runs in the last hour and none there, or a wake gate with no chat
@@ -2517,6 +2525,17 @@ class Daemon:
                 self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
                             (now, "daemon", "run_class_quality", "normal",
                              runclass.quality_text(q, runclass.QUALITY_WINDOW_S / 3600)[:500], "queued"))
+        # Code kinds on Sonnet: their state (full, canary, off) each hour; a kind moving off raises one event.
+        if now - getattr(self, "_code_quality_checked", 0.0) >= 3600:
+            self._code_quality_checked = now
+            q = runclass.code_quality(self.p.db, self.cfg, now - runclass.CODE_WINDOW_S, now)
+            old = self._code_state()
+            self.p.db.set_kv(runclass.CODE_STATE_KV, json.dumps({k: v["state"] for k, v in q.items()}))
+            for k, v in q.items():
+                if v["state"] == "off" and old.get(k) != "off":
+                    self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                                (now, "daemon", "run_class_quality", "normal",
+                                 runclass.code_quality_text(k, v, runclass.CODE_WINDOW_S / 3600)[:500], "queued"))
         # Cheap classes on Claude with none on a tt model: told once per outage, never as a repeating alarm.
         down = runclass.tt_unavailable(s)
         told = self.p.db.kv("tt_unavailable_told", "") or ""
@@ -12654,7 +12673,8 @@ class Daemon:
                     to = route.target(self.cfg, tier)
                     note[untrusted.KEY] = {"set": True, **({"kept_core": f"{to[0]}:{to[1]}"} if to else {})}
                 # A cheap class on the Claude core provider (no tt model serves it): a cheap Claude model.
-                cheap = None if dp else runclass.core_cheap(self.cfg, task, run_cls, tier, run_prov, routed, picked)
+                cheap = None if dp else runclass.core_cheap(self.cfg, task, run_cls, tier, run_prov, routed, picked,
+                                                            self._code_state())
                 if cheap:
                     note[runclass.CHEAP_KEY] = cheap
                 try:   # a routed model pick runs its option's effort: no A/B arm; nor does a cheap core run
