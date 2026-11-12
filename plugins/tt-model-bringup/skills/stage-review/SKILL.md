@@ -1,6 +1,6 @@
 ---
 name: stage-review
-description: Independently review a TTNN model bringup stage before it is allowed to pass. Use when a stage is complete or near-complete and Codex needs a fresh xhigh subagent to compare the stage output against the original goal contract, skill requirements, logs, generated model outputs, checks, benchmarks, and code artifacts; identify bugs, oddities, contradictions, weak dismissals, or suspicious behavior that hard-edged stage gates missed; and return a clean-pass or more-work-needed verdict.
+description: Independently review a TTNN model bringup stage before it is allowed to pass. Use when a stage is complete or near-complete and Codex needs a fresh xhigh subagent to compare the stage output against the original goal contract, skill requirements, logs, generated model outputs, checks, benchmarks, and code artifacts; identify bugs, oddities, contradictions, weak dismissals, or suspicious behavior that hard-edged stage gates missed; and return a clean-pass, pass-with-carried or more-work-needed verdict.
 ---
 
 # Stage Review
@@ -48,7 +48,8 @@ paths and a compact stage contract over passing your conclusions.
 Reviewer mode: when your prompt says you are the independent reviewer, or you
 were spawned with this skill plus a concrete stage contract and artifact paths,
 perform the review directly. Do not spawn another reviewer. In this mode your
-verdict can be `clean-pass` or `more-work-needed`.
+verdict can be `clean-pass`, `pass-with-carried` (round 3 only, see below) or
+`more-work-needed`.
 
 In main-agent mode, if no subagent tool is available, do a serial review only as
 a temporary fallback and mark the result `not-independent`. This means the
@@ -80,7 +81,8 @@ and useful.
   output, wrong numbers, a broken or missing required gate, or an eval-visible
   defect. Every other item (performance candidates, evidence-format requests,
   docs, cleanup) becomes a hand-off note in the stage work log under
-  `Carried to next stage`, and the stage may complete.
+  `Carried to next stage`. The round-3 reviewer then returns
+  `pass-with-carried`, and the stage may complete.
 - A follow-up review is a new, fresh subagent with a diff-only brief: the
   previous round's findings (verbatim), the files and artifacts changed since
   that round, and the commands that produced new evidence. It checks whether
@@ -447,7 +449,8 @@ New evidence: <paths>
 
 For each previous finding say closed / open with evidence. Then check only the
 changed files for new problems. In round 3, put any finding that is not a
-correctness or accuracy defect under Other Concerns as a hand-off note.
+correctness or accuracy defect under Other Concerns as a hand-off note; if no
+correctness or accuracy finding remains, the verdict is pass-with-carried.
 ```
 
 ## Verdict Format
@@ -457,7 +460,7 @@ Require this output:
 ```markdown
 # Stage Review
 
-Verdict: clean-pass | more-work-needed
+Verdict: clean-pass | pass-with-carried | more-work-needed
 
 ## Required Work
 - P1/P2: <title>
@@ -490,19 +493,22 @@ Verdict: clean-pass | more-work-needed
 - ...
 ```
 
-Only `clean-pass` with no required work satisfies this skill.
+Only `clean-pass` with no required work, or `pass-with-carried` in round 3,
+satisfies this skill.
 
 Required Work is reserved for correctness, contract, or missing-evidence gaps.
 A performance candidate that was not measured is Other Concerns unless the goal
 names it. Record push state from the run plan (the supervisor pushes stage
 commits; the stage agent never does) instead of inferring it from the reflog.
 
-Closure after the allowed rounds (3 per stage, see above): a finding raised in
-round 3 that is not a correctness or accuracy defect carries to the next stage
-with a work-log entry under `Carried to next stage`, and the recorded verdict
-stays `more-work-needed`; a carried item that the stage then fixes with device
-evidence is recorded as fixed under that unchanged verdict, with the evidence
-path. The next stage's review checks that carried items were closed.
+`pass-with-carried`: allowed only in round 3, when Required Work is empty and
+every remaining finding is not a correctness or accuracy defect (wrong output,
+wrong numbers, a broken or missing required gate, an eval-visible defect). Each
+such finding carries to the next stage as a hand-off note under `Carried to
+next stage` in the stage work log. A carried item that the stage then fixes with
+device evidence is recorded as fixed, with the evidence path. The next stage's
+review checks that carried items were closed. Before round 3, or with any
+correctness finding left, the verdict is `more-work-needed`.
 
 If the main agent could not obtain an independent review, report
 `not-independent` as a fallback status outside the reviewer verdict. Do not use
@@ -521,9 +527,10 @@ After the reviewer returns:
    to resolve it, rerun the affected gates, then start a fresh reviewer with
    the diff-only follow-up brief. Stop after round 3 as described in
    [When To Review](#when-to-review-and-how-many-rounds).
-3. If the verdict is `clean-pass`, record the review artifact or subagent final
-   answer path in the stage work log.
-4. After `clean-pass`, create local checkpoint commits for stage-owned changes
+3. If the verdict is `clean-pass` or `pass-with-carried`, record the review
+   artifact or subagent final answer path in the stage work log, and for
+   `pass-with-carried` the `Carried to next stage` notes.
+4. After either passing verdict, create local checkpoint commits for stage-owned changes
    in each touched repo: `tt-metal`, and the serving plugin or vLLM checkout
    only for changes with a complete
    [plugin changes](../vllm-integration/references/plugin-changes.md) record.

@@ -89,7 +89,8 @@ single-chip is then the target topology, not a fallback, and the later stages sa
 
 `tt-device-usage`, `tt-enable-tracing`, `qualitative-check` and `stage-review` provide shared
 requirements. AutoDebug/AutoTriage/AutoFix come from the explicit dependency. Implementation
-stages 1–10 require independent review with `clean-pass`; findings require repairs and rereview.
+stages 1–10 require independent review with `clean-pass`, or `pass-with-carried` after 3 rounds;
+findings require repairs and rereview.
 The final benchmark stage produces results for the bringup owner and checks measurement
 completeness without an accuracy acceptance review. Preserve original goal
 criteria, local commit boundaries and the prohibition on pushing stage changes automatically.
@@ -177,18 +178,10 @@ The [hook API](../../telemetry-hooks.md) contains no endpoint or upload implemen
 
 ## Optimization stop rule
 
-Optimization stages (2, 3, 5, 7, 10) stop on the first of these, not when every idea is exhausted:
-
-- the measured path is within 1.5x of its roofline (decode: bytes moved per step over DRAM
-  bandwidth; prefill: FLOPs over peak compute), stated with the calculation;
-- three candidates in a row each gained less than 3% end to end on the stage's primary metric;
-- the stage time box: 8 h of wall time on the stage, unless the operator set another.
-
-These are defaults the operator can tune. In the work log, list every candidate that was not
-tried and why, next to the before/after table and the rejected candidates with their evidence. The
-stop rule bounds effort only. It never relaxes PCC, context, quality or readiness gates. The
-FUNCTIONAL performance bar (1 user, 128 in / 128 out, at least 10% of theoretical) is a floor that
-must be met, not a target to stop at.
+Optimization stages (2, 3, 5, 7, 10) use the one stop rule in
+[`$optimize` Stop Rule](../optimize/SKILL.md#stop-rule): at least 70% of roofline and the last two
+kept candidates each under 3%, or the 8 h device-time box; untried items become hand-off notes in
+the work log. It bounds effort only and never relaxes PCC, context, quality or readiness gates.
 
 ## Default authorizations
 

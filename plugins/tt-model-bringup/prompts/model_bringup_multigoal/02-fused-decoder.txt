@@ -16,7 +16,7 @@ Fused decoder completion requirements:
 - The final fused runtime path has no unnecessary torch/from_torch/to_torch, tilize/untilize, reshard, or host fallback in measured prefill/decode.
 - Stress or repeated-run coverage and a watcher-clean fused correctness run exist.
 - models/autoports/<model>/doc/fused_decoder/README.md and work_log.md record commands, before/after PCC and perf, chosen configs, tt-perf-report conclusions, rejected options, limitations, and exact artifacts.
-- Every $graph-fusing pattern is assessed for this model; applicable ones are tried and kept or rejected with before/after evidence, until the $model-bringup stop rule: within 1.5x of roofline, 3 candidates in a row under 3% gain, or the 8 h time box. The work log lists untried items and why; quality gates are unchanged.
-- $stage-review returns `clean-pass`; findings fixed/rereviewed. Local commit stage-owned touched-repo changes; never push; log SHAs.
+- Every $graph-fusing pattern is assessed for this model; applicable ones are tried and kept or rejected with before/after evidence, until the $optimize Stop Rule (≥70% roofline and last 2 kept <3%, or 8 h device time); untried items go in the work log as hand-off notes; quality gates are unchanged.
+- $stage-review returns `clean-pass` (or `pass-with-carried` after 3 rounds); findings fixed/rereviewed. Local commit stage-owned touched-repo changes; never push; log SHAs.
 
 Unmet requirements, review findings, failed gates: work. Stop only after `$autofix` fails.

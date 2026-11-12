@@ -2,7 +2,7 @@
 
 Subagents are authorized when a selected skill requests or recommends them.
 
-This creates full-model state for the repo-local TTNN autoport pipeline. Start from the completed optimized multichip decoder and work on models/autoports/<model>/tt/model.py and tt/generator.py; do not begin vLLM work.
+This creates full-model state for the repo-local TTNN autoport pipeline. Start from the completed optimized multichip decoder and work on tt/model.py and tt/generator.py; do not begin vLLM work.
 
 Goal completion requirements:
 - models/autoports/<model>/tt/model.py and tt/generator.py implement the full HF autoregressive path and standard Metal readiness generator contract.
@@ -22,9 +22,9 @@ Goal completion requirements:
 - Top of README.md reports full-model TTFT and trace-verified batch-1 decode t/s/u, separating teacher-forcing and token-out decode when they differ.
 - Runtime fallback audit covers model/generator paths, cache ownership, host-logit boundaries, sampling, and reset behavior.
 - Before chasing a qualitative or eval failure, run the $qualitative-check HF control (matched seeds, blind); if HF does the same, record a known limitation and continue.
-- models/autoports/<model>/doc/full_model/README.md and work_log.md record commands, top-k accuracy, qualitative verdict, perf, limitations, and exact artifacts.
+- doc/full_model/README.md and work_log.md record commands, top-k accuracy, qualitative verdict, perf, limitations, and exact artifacts.
 - If sampler ops dominate token-out decode, fix the LM-head/sampling contract before completing.
 - An explicit host-sampling compatibility mode exists for tests that need it; the measured token-out path stays on-device traced sampling.
-- $stage-review returns `clean-pass`; findings fixed/rereviewed. Local commit stage-owned touched-repo changes; never push; log SHAs.
+- $stage-review returns `clean-pass` (or `pass-with-carried` after 3 rounds); findings fixed/rereviewed. Local commit stage-owned touched-repo changes; never push; log SHAs.
 
 Unmet requirements, review findings, failed gates: work. Stop only after `$autofix` fails.

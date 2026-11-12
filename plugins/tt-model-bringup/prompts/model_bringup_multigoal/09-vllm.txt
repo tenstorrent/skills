@@ -1,6 +1,6 @@
 /goal Use $vllm-integration and $tt-device-usage for HF_MODEL.
 
-As the user, I explicitly authorize you to use subagents when a selected skill requests or recommends them.
+Subagents are authorized when a selected skill requests or recommends them.
 
 This goal creates the vLLM state. Start from the completed datatype-sweep stage; work on models/autoports/<model>/tt/generator_vllm.py and vLLM TT plugin registration.
 
@@ -23,9 +23,9 @@ Goal completion requirements:
 - Record the CI serving-burst workload config and metrics from `vllm_ci_serving_benchmark.json`; it is not the headline decode t/s/u (burst admission and chunked prefill affect TPOT).
 - Serving performance is compared with full-model teacher-forcing only as a lower bound; no avoidable vLLM-specific decode overhead remains in the measured path.
 - Runtime fallback and process cleanup are audited; no leftover vLLM/EngineCore process holds devices.
-- models/autoports/<model>/doc/vllm_integration/README.md and work_log.md record commands, serving status, qualitative verdict, benchmark metrics, limitations, and exact artifacts.
+- doc/vllm_integration/README.md and work_log.md record commands, serving status, qualitative verdict, benchmark metrics, limitations, and exact artifacts.
 - Primary single-user vLLM TTFT and decode t/s/u are reported at the top of README.md, with CI serving-burst metrics secondary and workload shapes next to every number.
 - Any host-sampling mode needed by shared tests is explicit and optional; it never replaces the on-device traced sampling path used for performance.
-- $stage-review returns `clean-pass`; findings fixed/rereviewed. Local commit stage-owned touched-repo changes; never push; log SHAs.
+- $stage-review returns `clean-pass` (or `pass-with-carried` after 3 rounds); findings fixed/rereviewed. Local commit stage-owned touched-repo changes; never push; log SHAs.
 
 Unmet requirements, review findings, failed gates: work. Stop only after `$autofix` fails or a plugin change needs authorization.

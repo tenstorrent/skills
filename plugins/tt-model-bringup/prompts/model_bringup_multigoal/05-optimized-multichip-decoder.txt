@@ -17,9 +17,9 @@ Goal completion requirements:
 - The final path avoids gather/reshard/all-reduce between decoder layers. Any remaining inter-layer collective has measured evidence showing it is faster overall. Write down the inter-layer residual layout contract so full-model bringup can preserve it instead of rediscovering it.
 - Runtime fallback audit is clean, stress coverage matches risk, and watcher-clean evidence exists.
 - models/autoports/<model>/doc/optimized_multichip_decoder/README.md and work_log.md record commands, before/after PCC/perf, CCL findings, rejected options, limitations, and artifacts.
-- Applicable items in this prompt and `$optimize` are tried with evidence until the $model-bringup stop rule: within 1.5x of roofline, 3 candidates in a row under 3% gain, or the 8 h time box. The work log lists untried items and why; quality gates are unchanged.
+- Applicable items in this prompt and `$optimize` are tried with evidence until the $optimize Stop Rule (≥70% roofline and last 2 kept <3%, or 8 h device time); untried items go in the work log as hand-off notes; quality gates are unchanged.
 - MoE: keep gate-selected active-expert execution; dense all-expert execution needs evidence it is faster in decode. Follow the $multichip MoE rule; report decode at batch 1 and the largest batch with diverse routing, plus the MoE share of the step.
-- $stage-review returns `clean-pass`; findings fixed/rereviewed. Local commit stage-owned touched-repo changes; never push; log SHAs.
+- $stage-review returns `clean-pass` (or `pass-with-carried` after 3 rounds); findings fixed/rereviewed. Local commit stage-owned touched-repo changes; never push; log SHAs.
 - Final optimized numbers come from the final default path, not from an earlier candidate that the default no longer reproduces.
 
 Unmet requirements, review findings, failed gates: work. Stop only after `$autofix` fails.

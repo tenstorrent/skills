@@ -23,13 +23,13 @@ This file is the map. Each checklist line below links to its detail in `referenc
 
 ## Stop Rule
 
-Optimization ends at a measured point, not when every idea is exhausted. Stop optimizing and write the final evidence when any of these holds:
+This is the one optimization stop rule for every optimization stage (2, 3, 5, 7 and 10); other skills and stage prompts link here. Optimization ends at a measured point, not when every idea is exhausted. Stop optimizing and write the final evidence when any of these holds:
 
 1. Every checklist line below has a measurement, a kept/rejected decision, or an exact blocker.
 2. The target workload is close to the hardware limit: traced decode reaches at least 70% of the roofline estimate from [performance accounting](references/perf-accounting.md), and the last two kept candidates each gained less than 3%. These are defaults; the stage brief or owner may set others.
 3. The optimization time box is spent: by default 8 hours of device work in this stage, counted from the first candidate measurement.
 
-When rule 2 or 3 fires, list every untried item in the work log under `Not tried (stop rule)`, with its expected gain when known. These are hand-off notes, not blockers, and a reviewer treats them that way. The stop rule never waives correctness: functional checks, PCC, trace replay, watcher, the context contract, larger-batch correctness and the FUNCTIONAL bar must still pass. Wherever a reference says a stage "is not optimized" or "is incomplete" until a performance item is tried, read it as "until the item is tried or the stop rule fires".
+When rule 2 or 3 fires, list every untried item in the work log under `Not tried (stop rule)`, with its expected gain when known. These are hand-off notes, not blockers, and a reviewer treats them that way. The stop rule bounds effort only and never waives correctness: functional checks, PCC, trace replay, watcher, the context contract, larger-batch correctness and the FUNCTIONAL bar (1 user, 128 in / 128 out, at least 10% of theoretical; a floor, not a target to stop at) must still pass. Wherever a reference says a stage "is not optimized" or "is incomplete" until a performance item is tried, read it as "until the item is tried or the stop rule fires".
 
 ## Checklist
 
