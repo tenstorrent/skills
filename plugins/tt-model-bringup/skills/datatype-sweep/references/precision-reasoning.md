@@ -46,9 +46,12 @@ P1 measures exactly this, on the model's generator, before vLLM.
      template with thinking on (`--chat-template-kwargs`, default
      `{"enable_thinking": true, "thinking": true}`).
      Model-card sampling (`generation_config.json`, or `--sampling`) is passed
-     to `generate()` only for the keywords it declares (`temperature`, `top_p`,
-     `top_k`, `seed`). Without them the answers are greedy and loops are dropped;
-     add those keywords to `generate()` if most answers are dropped.
+     to `generate()` as the keywords it declares (`temperature`, `top_p`,
+     `top_k`, `seed`), or as a `sampling_params=` object built from the
+     generator module's `SamplingParams` dataclass. Without either the answers
+     are greedy and loops are dropped; add sampling to `generate()` if most
+     answers are dropped. Pass `--sampling` when the card's `top_k` exceeds what
+     the on-device sampler supports.
    - Or bring traces: `--text-file traces.jsonl`, one row per answer, either
      `{"prompt_token_ids": [...], "completion_token_ids": [...]}` or
      `{"messages": [...], "response": "<thinking and answer text>"}`.

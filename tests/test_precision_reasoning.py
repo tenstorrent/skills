@@ -213,3 +213,31 @@ def test_bundled_prompts_and_candidate_limit(tmp_path):
     f.write_text(json.dumps({str(i): {} for i in range(6)}))
     with pytest.raises(SystemExit, match="max-candidates"):
         p1.load_candidates(f, 5)
+
+
+def test_sampling_params_object_is_built_from_the_generator_module():
+    import dataclasses
+
+    @dataclasses.dataclass
+    class SamplingParams:
+        temperature: float = 0.0
+        top_p: float = 1.0
+        seed: int = 0
+
+    seen = []
+
+    class ObjGen(FakeGenerator):
+        def generate(self, prompt_token_ids, max_new_tokens, *, next_input=None, enable_trace=True, sampling_params=None):
+            seen.append(sampling_params)
+            return FakeGenerator.generate(self, prompt_token_ids, max_new_tokens, temperature=sampling_params.temperature,
+                                          seed=sampling_params.seed)
+
+    sys.modules[ObjGen.__module__].SamplingParams = SamplingParams
+    try:
+        texts = p1.generate_texts(ObjGen(TinyLM()), FakeTokenizer(), p1.load_prompts(p1.DEFAULT_PROMPTS)[:3], num_texts=3,
+                                  max_new_tokens=120, sampling={"temperature": 0.8, "top_k": 64}, template_kwargs={},
+                                  min_answer_tokens=100, max_text_tokens=4096, log=lambda m: None)
+    finally:
+        del sys.modules[ObjGen.__module__].SamplingParams
+    assert len(texts) == 3
+    assert [s.seed for s in seen] == [1000, 1001, 1002] and all(s.temperature == 0.8 for s in seen)

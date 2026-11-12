@@ -15,7 +15,8 @@ Steps:
 1. Text. ``--text-file`` (JSONL traces) or, by default, about 30 answers
    generated once by the reference configuration through the generator, with
    thinking on via the HF chat template and the model-card sampling
-   (``generation_config.json``) when ``generate()`` declares sampling keywords.
+   (``generation_config.json``) when ``generate()`` declares sampling keywords
+   or a ``sampling_params`` object.
    The token ids are cached in ``doc/eval_readiness/precision_reasoning/text.jsonl``
    so every candidate scores the same tokens.
 2. Scoring. For each candidate (``--candidates``: id -> ``build_generator``
@@ -197,6 +198,9 @@ def generate_texts(
     """
     params = inspect.signature(generator.generate).parameters
     declared = {k for k in SAMPLING_KEYS if k in params}
+    use_object = not declared and "sampling_params" in params
+    if use_object:
+        declared = set(SAMPLING_KEYS)
     texts: List[dict] = []
     dropped = 0
     for i, prompt in enumerate(prompts):
@@ -208,7 +212,8 @@ def generate_texts(
             kwargs["seed"] = int(sampling.get("seed", 1000)) + i
         if i:
             generator.reset()
-        out = generator.generate(prompt_ids, max_new_tokens, next_input=None, enable_trace=True, **kwargs)
+        call_kwargs = {"sampling_params": make_sampling_params(generator, kwargs)} if use_object else kwargs
+        out = generator.generate(prompt_ids, max_new_tokens, next_input=None, enable_trace=True, **call_kwargs)
         answer = [int(x) for x in (out.tolist() if hasattr(out, "tolist") else out)]
         if len(answer) < min_answer_tokens or is_degenerate(answer):
             dropped += 1
@@ -221,6 +226,25 @@ def generate_texts(
     log(f"generated {len(texts)} texts ({dropped} dropped: shorter than {min_answer_tokens} tokens or looping); "
         f"sampling {'greedy (generate() declares no sampling keywords)' if not declared else sorted(declared)}")
     return texts
+
+
+def make_sampling_params(generator: Any, values: dict) -> Any:
+    """Build the generator's own ``SamplingParams`` (looked up in its module, then the
+    tt-metal common one) from temperature/top_p/top_k/seed; a namespace as a last resort."""
+    import dataclasses
+    import importlib
+    from types import SimpleNamespace
+
+    cls = getattr(sys.modules.get(type(generator).__module__), "SamplingParams", None)
+    if cls is None:
+        try:
+            cls = importlib.import_module("models.common.sampling.sampling_params").SamplingParams
+        except Exception:  # noqa: BLE001
+            cls = None
+    if cls is None or not dataclasses.is_dataclass(cls):
+        return SimpleNamespace(**values)
+    fields = {f.name for f in dataclasses.fields(cls)}
+    return cls(**{k: v for k, v in values.items() if k in fields})
 
 
 # --------------------------------------------------------------------------- scoring math
