@@ -726,6 +726,7 @@ open(log, 'a').write(json.dumps(sys.argv[1:]) + '\\n')
 if 'ttp-bridge-clean' in sys.argv[-1]:
     print('ended 2301 4242 3600')
     print("kept 2302 4343 not this computer's session")
+    print('ended rec 4545 7200')
     sys.exit(0)
 step = json.load(open(os.path.join(d, 'plan.json')))[sum(1 for c in calls if 'ttp-bridge-clean' not in c[-1])]
 if step == 'fwd':
@@ -774,10 +775,11 @@ def test_bridge_forward_failure_cleans_once_and_retries(tmp_path, capfd):
     assert "-R" not in clean and "ForwardAgent=/agents/a.sock" not in clean and "ExitOnForwardFailure=yes" not in clean
     assert {"-a", "ForwardAgent=no", "ClearAllForwardings=yes", "ConnectTimeout=10", "BatchMode=yes",
             "IdentityFile=/keys/login.pub"} <= set(clean)
-    assert clean[clean.index("--") + 1] == "box-a" and clean[-1].endswith(f" {tag} 2301 2302")
+    assert clean[clean.index("--") + 1] == "box-a" and clean[-1].endswith(f" {tag} bridge-{cid}+box-a+auto+ 2301 2302")
     err = capfd.readouterr().err
     assert "remote port forwarding failed" in err   # passed through to the log
     assert "box-a: ended a stale session holding port 2301 (pid 4242, 3600 s old)" in err
+    assert "box-a: ended a stale session found by its record (pid 4545, 7200 s old)" in err
 
 
 def test_bridge_second_forward_failure_exits_after_one_cleanup(tmp_path, capfd):
@@ -826,8 +828,9 @@ def test_bridge_box_cleanup_ends_only_this_computers_tagged_session(tmp_path):
         (bin_ / "ss").write_text("#!/bin/sh\ncat <<'X'\n" + "".join(
             f'LISTEN 0 128 127.0.0.1:{p} 0.0.0.0:* users:(("sshd",pid={pid},fd=9))\n' for p, pid in rows) + "X\n")
         (bin_ / "ss").chmod(0o755)
-        env = dict(os.environ, PATH=f"{bin_}:{os.environ['PATH']}")
-        r = subprocess.run(["sh", "-c", bridge_relay.CLEANUP, "x", tag, "2301", "2302", "2303", "2304"],
+        env = dict(os.environ, PATH=f"{bin_}:{os.environ['PATH']}", XDG_CACHE_HOME=str(tmp_path / "cache"))
+        r = subprocess.run(["sh", "-c", bridge_relay.CLEANUP, "x", tag, "bridge-aaaaaaaaaaaa+box-a+auto+",
+                            "2301", "2302", "2303", "2304"],
                            capture_output=True, text=True, env=env, timeout=30)
         out = r.stdout.splitlines()
         assert [ln.split()[:3] for ln in out if ln.startswith("ended")] == [["ended", "2301", str(stale.pid)]]
@@ -1236,3 +1239,85 @@ def test_bridge_agent_alert_grace_min_is_retired_and_an_upgrade_drops_it(env):
     assert len(notes) == 1 and "bridge.agent_alert_grace_min" in notes[0], notes
     assert p.raw_config()["bridge"] == {"agent_steady_min": 20}
     assert cli._drop_retired_keys(p) == [], "a rerun is a no-op"
+
+
+def test_bridge_session_record_is_written_private_and_removed_on_exit(tmp_path):
+    # cells: session-record
+    # The tagged remote command run here by sh, as the box's login shell would, under a temp cache dir.
+    import os
+    import subprocess
+    from ttp import bridge_relay
+    cache = tmp_path / "cache"
+    seen = tmp_path / "seen"
+    for tail, rc in ((f'cat "$ttp_rec" > {seen}; stat -c %a "$ttp_rec" >> {seen}; echo "$$" >> {seen}', 0),
+                     ("exit 3", 3)):
+        cmd = bridge_relay.tagged(["ssh", "--", "box-a", tail], "aaaaaaaaaaaa/box a/auto/0001")[-1]
+        r = subprocess.run(["sh", "-c", cmd], env=dict(os.environ, XDG_CACHE_HOME=str(cache)), timeout=30)
+        assert r.returncode == rc
+        assert (cache / "tt-project").is_dir() and list((cache / "tt-project").iterdir()) == []   # removed on exit
+    sshd_pid, shell_pid, mode, own = seen.read_text().split()
+    assert sshd_pid == str(os.getpid()) and shell_pid == own and mode == "600"
+
+
+def test_bridge_box_cleanup_reads_session_records_and_spares_reused_pids(tmp_path):
+    # cells: record-cleanup
+    # The box's sshd made the stale session non-dumpable: ss shows no pid for its port (a fake ss says
+    # nothing), so only its record finds it. Records naming a reused pid (another program, another
+    # account) or a dead one are removed and their processes left alone; another computer's record stays.
+    import os
+    import shlex
+    import subprocess
+    import time
+    from ttp import bridge_relay
+    tag = "ttp-bridge-tag=aaaaaaaaaaaa/box-a/auto/"
+    stale = subprocess.Popen(["bash", "-c", 'exec -a "sshd: u@notty" bash -c ' + shlex.quote(
+        f"sh -c ': {tag}0001; sleep 300; :' & wait")])
+    reused = subprocess.Popen(["sleep", "300"])
+    dead = subprocess.Popen(["true"])
+    dead.wait()
+    try:
+        time.sleep(0.5)
+        recs = tmp_path / "cache" / "tt-project"
+        recs.mkdir(parents=True)
+        mine = "bridge-aaaaaaaaaaaa+box-a+auto+"
+        for sid, pid in (("0001", stale.pid), ("0002", reused.pid), ("0003", 1), ("0004", dead.pid)):
+            (recs / f"{mine}{sid}.pid").write_text(f"{pid} {pid + 1}\n")
+        (recs / "bridge-bbbbbbbbbbbb+box-a+auto+0005.pid").write_text(f"{stale.pid} 1\n")
+        bin_ = tmp_path / "bin"
+        bin_.mkdir()
+        (bin_ / "ss").write_text("#!/bin/sh\nexit 0\n")
+        (bin_ / "ss").chmod(0o755)
+        env = dict(os.environ, PATH=f"{bin_}:{os.environ['PATH']}", XDG_CACHE_HOME=str(tmp_path / "cache"))
+        r = subprocess.run(["sh", "-c", bridge_relay.CLEANUP, "x", tag, mine, "2301"],
+                           capture_output=True, text=True, env=env, timeout=30)
+        out = r.stdout.splitlines()
+        assert [ln.split()[:3] for ln in out if ln.startswith("ended")] == [["ended", "rec", str(stale.pid)]]
+        assert f"kept rec {reused.pid} not an sshd session" in out
+        assert "kept rec 1 another account" in out or os.getuid() == 0
+        assert not any(f" {dead.pid} " in f" {ln} " for ln in out)
+        assert sorted(f.name for f in recs.iterdir()) == ["bridge-bbbbbbbbbbbb+box-a+auto+0005.pid"]
+        stale.wait(timeout=10)
+        assert reused.poll() is None
+    finally:
+        for p in (stale, reused):
+            if p.poll() is None:
+                p.kill()
+                p.wait()
+
+
+def test_bridge_status_says_could_not_check_when_the_probe_did_not_run(monkeypatch):
+    # cells: status-unknown
+    import subprocess
+    from ttp import bridge
+    cfg = _bridge_cfg()
+    monkeypatch.setattr(bridge, "running", lambda *a, **k: True)
+    for rc, out, err, want in (
+            (255, "", "Connection timed out", "box-1: unreachable from here"),
+            (124, "", "timed out after 40s", "box-1: could not check (link down or no answer; exit 124: timed out"),
+            (1, "", "", "box-1: could not check (link down or no answer; exit 1)"),
+            (0, "block no\nagent auto up 1\nport 2301 up\nport 2302 up\nagent git up 1\n", "",
+             "box-1: the ssh config block is missing")):
+        monkeypatch.setattr(bridge, "_box", lambda *a, **k: subprocess.CompletedProcess([], rc, out, err))
+        lines, code = bridge.status(cfg, ["box-1"])
+        assert code == 1 and lines[0].startswith(want), lines
+        assert ("missing" in " ".join(lines)) == (out != "")

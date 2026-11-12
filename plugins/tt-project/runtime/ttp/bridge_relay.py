@@ -19,12 +19,18 @@ With --tag it also recovers from a stale session. Each session's remote command 
 use and kept next to the socket dir; the session id is new each run). When a network change leaves
 the box's sshd holding an earlier session's reverse-forward ports, ssh exits 255 with 'remote port
 forwarding failed'. The relay then runs one cleanup login to the box (the same login options, no
-forwards, no agent, a short timeout) that ends only sshd processes of the box account itself that
-listen on 127.0.0.1 at one of this session's forward ports and whose session carries this
-computer's tag for the same box and agent (this computer's session for them has just failed, so
-such a session has no live peer here): SIGTERM, then SIGKILL after 5 s. It never uses sudo and
-leaves untagged, interactive and other accounts' sessions alone. The session then starts again at
-once; a second forward failure in a row exits nonzero, so the service's own restart pacing applies.
+forwards, no agent, a short timeout) that ends only sshd processes of the box account itself (by
+their real uid, as ps reads it) whose session carries this computer's tag for the same box and agent
+(this computer's session for them has just failed, so such a session has no live peer here) and that
+either listen on 127.0.0.1 at one of this session's forward ports or are named in a session record:
+SIGTERM, then SIGKILL after 5 s. Each session's remote command writes that record first,
+`${XDG_CACHE_HOME:-~/.cache}/tt-project/bridge-<computer id>+<box>+<agent>+<session id>.pid` (its
+sshd's pid and its own, mode 600), and removes it when it exits; the cleanup reads and removes this
+computer's records for the box and agent. The record is what finds a session sshd made non-dumpable
+(its sockets and /proc entries hidden from ss and from the box account), as after the computer
+rebooted while the box still held its sessions. It never uses sudo and leaves untagged, interactive
+and other accounts' sessions alone. The session then starts again at once; a second forward failure
+in a row exits nonzero, so the service's own restart pacing applies.
 
 When the box-side loop finds this session's forwarded agent dead (exit 5: two failed `ssh-add -l`
 in a row, 30 s apart), the session reconnects after 5, 20, then 60 s; a fourth dead agent within
@@ -157,9 +163,10 @@ AGENT_DEAD = 5  # the box-side loop's exit when this session's forwarded agent s
 AGENT_RETRY_S = (5, 20, 60)   # reconnects after a dead agent, then the service's own restart pacing
 AGENT_STEADY_S = 600   # a session that stayed up this long starts a fresh count of dead-agent reconnects
 
-# On the box (POSIX sh; ss, else /proc): $1 the tag prefix, then the ports. Prints `ended <port>
-# <pid> <age s>` per session it ends and `kept <port> <pid> <why>` per listener it leaves.
-CLEANUP = r"""tag=$1; shift; me=$(id -u)
+# On the box (POSIX sh; ss, else /proc): $1 the tag prefix, $2 the record name prefix, then the ports.
+# Prints `ended <port> <pid> <age s>` per session it ends and `kept <port> <pid> <why>` per listener it
+# leaves; <port> is `rec` for a session found by its record.
+CLEANUP = r"""tag=$1; rec=$2; shift 2; me=$(id -u); seen=
 listeners() {
   if command -v ss >/dev/null 2>&1; then
     ss -Hltnp 2>/dev/null | awk -v a="127.0.0.1:$1" '$4 == a' | grep -o 'pid=[0-9]*' | cut -d= -f2
@@ -172,19 +179,27 @@ listeners() {
     done
   fi
 }
-alive() { kill -0 "$1" 2>/dev/null && ! ps -o stat= -p "$1" 2>/dev/null | grep -q Z; }   # a zombie has ended
+alive() { kill -0 "$1" 2>/dev/null && case "$(ps -o stat= -p "$1" 2>/dev/null)" in *Z*) false;; esac; }   # a zombie has ended
+end_one() {   # $1 the port (or rec), $2 the pid
+  case " $seen " in *" $2 "*) return;; esac; seen="$seen $2"
+  [ "$(ps -o uid= -p "$2" 2>/dev/null | tr -d ' ')" = "$me" ] || { echo "kept $1 $2 another account"; return; }
+  case "$(tr '\0' ' ' < "/proc/$2/cmdline" 2>/dev/null)" in sshd*) ;; *) echo "kept $1 $2 not an sshd session"; return;; esac
+  ps -o ppid=,args= -e 2>/dev/null | awk -v p="$2" -v t="$tag" '$1 == p && index($0, t) {f = 1} END {exit !f}' \
+    || { echo "kept $1 $2 not this computer's session"; return; }
+  age=$(ps -o etimes= -p "$2" 2>/dev/null | tr -d ' ')
+  kill -TERM "$2" 2>/dev/null; n=0
+  while alive "$2" && [ $n -lt 5 ]; do sleep 1; n=$((n+1)); done
+  alive "$2" && kill -KILL "$2" 2>/dev/null
+  echo "ended $1 $2 ${age:-?}"
+}
 for port in "$@"; do
-  for pid in $(listeners "$port" | sort -u); do
-    [ "$(stat -c %u "/proc/$pid" 2>/dev/null)" = "$me" ] || { echo "kept $port $pid another account"; continue; }
-    case "$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)" in sshd*) ;; *) echo "kept $port $pid not an sshd session"; continue;; esac
-    ps -o ppid=,args= -e 2>/dev/null | awk -v p="$pid" '$1 == p' | grep -qF -- "$tag" \
-      || { echo "kept $port $pid not this computer's session"; continue; }
-    age=$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ')
-    kill -TERM "$pid" 2>/dev/null; n=0
-    while alive "$pid" && [ $n -lt 5 ]; do sleep 1; n=$((n+1)); done
-    alive "$pid" && kill -KILL "$pid" 2>/dev/null
-    echo "ended $port $pid ${age:-?}"
-  done
+  for pid in $(listeners "$port" | sort -u); do end_one "$port" "$pid"; done
+done
+for f in "${XDG_CACHE_HOME:-$HOME/.cache}/tt-project/$rec"*.pid; do
+  [ -f "$f" ] && [ ! -L "$f" ] || continue
+  pid=; read -r pid _ < "$f" 2>/dev/null
+  case "$pid" in ''|*[!0-9]*) ;; *) case "$(ps -o stat= -p "$pid" 2>/dev/null)" in ''|*Z*) ;; *) end_one rec "$pid";; esac;; esac
+  rm -f "$f"
 done"""
 
 
@@ -211,9 +226,17 @@ def forward_ports(ssh: list[str]) -> list[int]:
             for m in [re.match(r"127\.0\.0\.1:(\d+):", b)] if m]
 
 
+def rec_name(tag: str) -> str:
+    """The box-side record name of a session tag (or the prefix of a tag prefix): bridge-<cid>+<box>+<agent>+<sid>."""
+    return "bridge-" + "+".join(re.sub(r"[^A-Za-z0-9._-]", "_", p) for p in tag.split("/"))
+
+
 def tagged(ssh: list[str], tag: str) -> list[str]:
-    """The session with its tag at the head of its remote command (a no-op `:` the box can read)."""
-    return ssh[:-1] + [f": {TAG}{tag}; " + ssh[-1]]
+    """The session with its tag at the head of its remote command (a no-op `:` the box can read), then
+    the session record: its sshd's pid and its own, written private and removed when it exits."""
+    rec = '"${XDG_CACHE_HOME:-$HOME/.cache}/tt-project/"' + shlex.quote(rec_name(tag) + ".pid")
+    return ssh[:-1] + [f": {TAG}{tag}; ttp_rec={rec}; (umask 077; mkdir -p \"${{ttp_rec%/*}}\" && "
+                       f'echo "$PPID $$" > "$ttp_rec") 2>/dev/null; trap \'rm -f "$ttp_rec"\' EXIT; ' + ssh[-1]]
 
 
 def cleanup_argv(ssh: list[str], prefix: str, ports: list[int]) -> list[str]:
@@ -230,7 +253,7 @@ def cleanup_argv(ssh: list[str], prefix: str, ports: list[int]) -> list[str]:
             continue
         out.append(a)
     script = "sh -c " + shlex.quote(CLEANUP) + " ttp-bridge-clean " + " ".join(
-        shlex.quote(x) for x in [TAG + prefix, *map(str, ports)])
+        shlex.quote(x) for x in [TAG + prefix, rec_name(prefix), *map(str, ports)])
     return out + ["-a", "-o", "ForwardAgent=no", "-o", "ClearAllForwardings=yes", "-o", "ConnectTimeout=10",
                   "--", ssh[cut + 1], script]
 
@@ -246,12 +269,13 @@ def clean(ssh: list[str], prefix: str, ports: list[int]) -> None:
     ended = 0
     for ln in r.stdout.splitlines():
         w = ln.split()
+        what = "found by its record" if w[1:2] == ["rec"] else f"holding port {w[1] if len(w) > 1 else '?'}"
         if w[:1] == ["ended"] and len(w) == 4:
             ended += 1
-            print(f"ttp bridge: {box}: ended a stale session holding port {w[1]} (pid {w[2]}, {w[3]} s old)",
+            print(f"ttp bridge: {box}: ended a stale session {what} (pid {w[2]}, {w[3]} s old)",
                   file=sys.stderr, flush=True)
         elif w[:1] == ["kept"] and len(w) >= 3:
-            print(f"ttp bridge: {box}: port {w[1]} is held by pid {w[2]} ({' '.join(w[3:])}): left alone",
+            print(f"ttp bridge: {box}: a session {what} (pid {w[2]}) is left alone: {' '.join(w[3:])}",
                   file=sys.stderr, flush=True)
     if r.returncode or not ended:
         print(f"ttp bridge: {box}: the cleanup ended no session (exit {r.returncode}"

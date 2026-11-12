@@ -33,8 +33,10 @@ Stale sessions recover by themselves. Every session runs inside the relay wrappe
 agent and the session. When a network change leaves the box's sshd holding an earlier session's
 reverse-forward ports, the new session fails with 'remote port forwarding failed'; the wrapper then
 makes one cleanup login (no forwards, no agent, a short timeout) that ends only the box account's
-own sshd sessions with this computer's tag for the same box and agent listening on 127.0.0.1 at one
-of this session's ports, logs one line per ended session, and starts the session again at once. A
+own sshd sessions with this computer's tag for the same box and agent that listen on 127.0.0.1 at one
+of this session's ports or are named in a session record (each session's remote command writes one
+under the box account's cache dir, so a session sshd made non-dumpable is still found after this
+computer rebooted), logs one line per ended session, and starts the session again at once. A
 second forward failure in a row exits, so the service's restart pacing applies. No sudo, no other
 account, no untagged or interactive session, no box sshd change. `ttp setup` and upgrades re-install
 services whose command changed, so an older workstation picks this up with no step of its own.
@@ -632,6 +634,11 @@ def status(cfg: dict, boxes: list[str], platform: str | None = None, deep: bool 
             bad += 1
             continue
         p = parse_probe(r.stdout)
+        if not re.search(r"^block (yes|no)$", r.stdout, re.M):   # the probe did not run: unknown, not missing
+            lines.append(f"{box}: could not check (link down or no answer; exit {r.returncode}"
+                         f"{': ' + r.stderr.strip()[-160:] if r.stderr.strip() else ''})")
+            bad += 1
+            continue
         if not p["block"]:
             bad += 1
             lines.append(f"{box}: the ssh config block is missing (`ttp bridge setup {box}`)")
