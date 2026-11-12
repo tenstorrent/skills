@@ -47553,6 +47553,19 @@ def test_both_signals_and_the_tick_overrun_dump_write_to_the_one_stacks_file(env
         faulthandler.unregister(signal.SIGUSR2)
 
 
+def test_a_stack_dump_signal_survives_a_handler_restored_since_an_earlier_registration(tmp_path):
+    # faulthandler installs its OS handler only on a signal's first registration; a stop handler saved
+    # and restored since then leaves SIGUSR1 at its default, which kills the process on the next dump
+    code = ("import os, signal, sys; from pathlib import Path; import ttp.daemon as dm; "
+            "s = Path(sys.argv[1]); dm.register_stack_dump(s); "
+            "old = signal.signal(signal.SIGUSR1, lambda *a: None); signal.signal(signal.SIGUSR1, old); "
+            "f = dm.register_stack_dump(s); os.kill(os.getpid(), signal.SIGUSR1); f.flush(); print('alive')")
+    r = subprocess.run([sys.executable, "-c", code, str(tmp_path)], capture_output=True, text=True,
+                       env={**os.environ, "PYTHONPATH": str(RUNTIME)}, timeout=HANG_S)
+    assert r.returncode == 0 and "alive" in r.stdout, (r.returncode, r.stderr)
+    assert "Current thread" in (tmp_path / "daemon-stacks.log").read_text()
+
+
 def test_a_host_sleep_during_a_tick_is_no_overrun(env, monkeypatch):
     import ttp.daemon as dm
     p = make(env)

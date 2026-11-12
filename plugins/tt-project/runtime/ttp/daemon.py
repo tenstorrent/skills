@@ -22852,6 +22852,15 @@ def start_marker(p: Project) -> dict | None:
 _STACK_FILE: list = []   # the one file faulthandler writes to, kept open while it is registered
 
 
+def _register_dump(sig, f) -> None:
+    """faulthandler.register installs its OS handler only on a signal's first registration; a later one
+    only swaps the file. A signal.signal() since then (a stop handler saved and restored, a test's
+    cleanup) silently drops that handler, so the signal would kill the process. Unregister first, so the
+    handler is installed afresh each time."""
+    faulthandler.unregister(sig)
+    faulthandler.register(sig, file=f, all_threads=True)
+
+
 def register_stack_dump(state: Path):
     """SIGUSR1 or SIGUSR2 makes this process append every thread's stack to state/STACKS_FILE
     (faulthandler: it works while the main thread is stuck, and needs no ptrace, which hardened hosts
@@ -22863,11 +22872,11 @@ def register_stack_dump(state: Path):
         if path.exists() and path.stat().st_size > STACKS_MAX_BYTES:
             path.replace(path.with_name(path.name + ".1"))
         f = open_append(path)
-        faulthandler.register(signal.SIGUSR1, file=f, all_threads=True)
+        _register_dump(signal.SIGUSR1, f)
     except (OSError, ValueError, AttributeError, RuntimeError):
         return None
     try:
-        faulthandler.register(signal.SIGUSR2, file=f, all_threads=True)
+        _register_dump(signal.SIGUSR2, f)
     except (ValueError, AttributeError, RuntimeError):
         pass
     for old in _STACK_FILE:
