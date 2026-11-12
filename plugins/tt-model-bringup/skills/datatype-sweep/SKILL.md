@@ -63,6 +63,17 @@ If an existing reference has fewer than 100 generated tokens, regenerate the mai
 
 Teacher-forcing decode performance is valid only when the measured path uses traced decode. Eager/untraced teacher-forcing results may be used for temporary correctness debugging, but they are not acceptable sweep evidence and must not be used to rank candidates, draw Pareto charts, or select the fastest passing config. If traced teacher forcing fails, fix tracing before continuing the sweep.
 
+## Precision on Reasoning Text (P1)
+
+Short top-1/top-5 references let BFP4 through while it loses eval points on long reasoning answers. Two rules follow:
+
+- Start from a BFP8 weight baseline. A weight group moves to BFP4 only if that candidate passes P1, `python -m readiness_check.run_precision_reasoning`, within noise of the highest-precision reference that fits.
+- Memory fit comes first. Offer P1 only candidates that fit the full advertised context with their KV cache (`doc/context_contract.json` and the stage-6 memory reading). If BFP4 is the only fitting option, keep it, let P1 report the loss, and record a limitation so the eval risk is known.
+
+More precision also means less free DRAM for the KV pool, so fewer long answers run at once. Record the free-DRAM change of the selected config in the README.
+
+How to run it, candidate file format, defaults, the usual fixes and the limitation format: [precision-reasoning.md](references/precision-reasoning.md). The runner gate `08-datatype-sweep.check.sh` fails the stage when `doc/eval_readiness/precision_reasoning.json` is missing or its selected config is worse than noise without a recorded limitation.
+
 ## Default Search
 
 Use this coarse search first. It usually finds most of the available win with a small number of full-model runs.
@@ -70,7 +81,7 @@ Use this coarse search first. It usually finds most of the available win with a 
 1. Evaluate the closest canonical performance and accuracy policies, if any.
 2. Try BFP8 KV cache as a yes/no switch. Any candidate that changes the KV-cache dtype must also pass the short-prefix case (about 32 cached tokens) and the batch-32 same-input per-user comparison at the full-model bar; a long-prompt layer PCC pass does not cover them (a BFP8 cache passed 1024-token layer PCC and failed 0.995 per user on a short prefix).
 3. Try BFP8 CCL or residual-transfer activations as a yes/no switch.
-4. Try BFP4 for eligible MLP/expert matmul groups, excluding the first and last layer by default unless the canonical policy says otherwise.
+4. Try BFP4 for eligible MLP/expert matmul groups, excluding the first and last layer by default unless the canonical policy says otherwise. Keep a BFP4 group only if its candidate also passes P1; top-1/top-5 alone are not enough.
 5. If full-model accuracy fails, restore the highest-risk groups first until top-1 and top-5 pass.
 6. Once a passing inner-layer config is found, optionally try extending the surviving choices to the first and last layer. Keep that only if full-model accuracy still passes.
 
@@ -158,7 +169,7 @@ Pass a candidate's precision config to the readiness runners through `--build-kw
 
 ## Final Selection
 
-Select the fastest config that satisfies the acceptance bar on every reference. Measurement noise is the spread between the repeated serial baseline runs recorded in the baseline section; a candidate counts as a gain only when it beats the baseline by more than that spread, and two configs inside it are a tie, where the simpler and safer one wins.
+Select the fastest config that satisfies the acceptance bar on every reference and passes P1 (or carries a recorded required-to-fit limitation). Measurement noise is the spread between the repeated serial baseline runs recorded in the baseline section; a candidate counts as a gain only when it beats the baseline by more than that spread, and two configs inside it are a tie, where the simpler and safer one wins.
 
 Before finishing:
 
@@ -169,5 +180,6 @@ Before finishing:
 - use `$qualitative-check` to rerun the shared qualitative prompt suite on the selected config, with HF controls. If visible text quality selects or rejects a dtype/fidelity candidate, the verdict must come from this prompt-correct suite;
 - add a short propagation check proving `build_generator` and the vLLM adapter load the same selected weight/activation/CCL/KV/fidelity policy used by the winning sweep result.
 - update the context contract for the selected KV-cache dtype and prove later construction paths use a matching max context.
+- run P1 with `--selected <the selected id>` as the last P1 run, so `doc/eval_readiness/precision_reasoning.json` describes the shipped config.
 
 If no lower-precision config passes, keep the baseline and leave evidence that the sweep actually tested the likely wins.
