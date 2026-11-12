@@ -481,7 +481,6 @@ def end(p: Project, rc: Path, why: str, task: int | None = None, reason: str = "
         detach.record_stop(rc, why)
     if locks.job_lock(rc).name not in held:
         drop_lock(rc)
-    mark_dead(rc, why, "SIGKILL" if pgid else None)
     out = {"task": task, "job": rc.stem, "rc": str(rc), "pgid": pgid, "broker_jobs": ids, "freed": freed,
            "held": held, "requeued": extra, "note": note if pgid else "no live process group found for it",
            **(fields or {})}
@@ -645,82 +644,6 @@ def checks_adopter(p: Project, task: int, info: dict) -> str | None:
         if not (level := nxt):
             break
     return None
-
-
-def mark_dead(rc: Path, why: str, sig: str | None = None, now: float | None = None) -> dict | None:
-    """Close the registry record of a job jobstop stopped (`sig` sent) or found gone (None): "died", with
-    when, the signal and why, so detached.json never shows it running. None while it still runs or
-    is queued (detach.close: it closes once its .rc or loss is on record)."""
-    rc = Path(rc)
-    if detach.close(rc, now) is None:
-        return None
-    out = None
-    with detach.registry(rc.parent) as jobs:
-        for j in jobs:
-            if isinstance(j, dict) and isinstance(j.get("rc"), str) and os.path.abspath(j["rc"]) == os.path.abspath(rc):
-                if sig and not j.get("killed_at"):
-                    j.update(status="died", killed_at=time.time() if now is None else now, signal=sig,
-                             why=f"stopped: {why}")
-                elif not sig and not j.get("killed_at") and j.get("status") == "died" and not str(j.get("why") or "").startswith("gone:"):
-                    j["why"] = f"gone: {j.get('why') or why}"
-                out = j
-    return out
-
-
-def heir(p: Project, task: int) -> dict | None:
-    """The newest open task (any status but OPEN_WAITER_SKIP) down the chain of tasks that continue this
-    one, ADOPT_HOPS deep at most, or None: it takes over the ended task's detached jobs."""
-    from .db import continues_id
-    level, seen, best = [task], {task}, None
-    for _ in range(ADOPT_HOPS):
-        nxt = []
-        for tid in level:
-            for t in p.db.q("SELECT id, status, labels FROM tasks WHERE labels LIKE ?", (f'%"continues:{tid}"%',)):
-                if t["id"] in seen or continues_id(t) != tid:
-                    continue
-                seen.add(t["id"])
-                nxt.append(t["id"])
-                if t["status"] not in OPEN_WAITER_SKIP and (best is None or t["id"] > best["id"]):
-                    best = t
-        if not (level := nxt):
-            break
-    return p.db.task(best["id"]) if best else None
-
-
-def ancestors(p: Project, task: int) -> list[int]:
-    """The tasks this one continues, nearest first (the continues chain upward, ADOPT_HOPS deep at most)."""
-    from .db import continues_id
-    out, t = [], p.db.task(int(task))
-    while t is not None and len(out) < ADOPT_HOPS and (up := continues_id(t)) is not None and up not in out + [task]:
-        out.append(up)
-        t = p.db.task(up)
-    return out
-
-
-def adopter(p: Project, rc: Path, started_by: int) -> dict | None:
-    """The task that took over the job at this .rc from task `started_by` (its registry entry names it,
-    and the db's continues chain leads from it back to `started_by`), else None."""
-    tid = detach._entry(Path(rc)).get("task")
-    if not isinstance(tid, int) or tid == started_by or started_by not in ancestors(p, tid):
-        return None
-    return p.db.task(tid)
-
-
-def adopt(p: Project, rc: Path, frm: int, to: int, now: float | None = None) -> dict | None:
-    """Re-own the running job at this .rc to task `to`, which continues ended task `frm`: its registry
-    entry names `to`, with whom it came from and when. Its summary, or None when `to` owns it already."""
-    now = time.time() if now is None else now
-    rc, prev = Path(rc), None
-    with detach.registry(rc.parent) as jobs:
-        for j in jobs:
-            if isinstance(j, dict) and isinstance(j.get("rc"), str) and os.path.abspath(j["rc"]) == os.path.abspath(rc) \
-                    and j.get("task") != to:
-                prev = j.get("task") or frm
-                j.update(task=to, adopted_from=prev, adopted_at=now)
-    if prev is None:
-        return None
-    return {"task": to, "job": rc.stem, "rc": str(rc), "adopted_from": prev,
-            "text": f"detached job {rc.stem} of task #{prev} kept running: open task #{to} continues #{frm} and owns it now"}
 
 
 def checks_waiter(p: Project, run_dir: Path) -> str | None:
@@ -1144,8 +1067,6 @@ def task_live_jobs(p: Project, task: int, now: float | None = None) -> list[Path
     for row in p.db.q("SELECT DISTINCT dir FROM runs WHERE task=? AND dir IS NOT NULL AND COALESCE(started, 0)>? "
                       "ORDER BY id", (task, now - SWEEP_DAYS * 86400)):
         out += [rc for rc in _live_jobs(Path(row["dir"])) if rc not in out]
-    out += [rc for _, j in task_jobs(p, task, now) if j.get("adopted_from") and str(j.get("task")) == str(task)
-            and j.get("status") not in detach.CLOSED and running(rc := Path(j["rc"])) and rc not in out]
     return out
 
 
@@ -1170,8 +1091,6 @@ def task_of(p: Project, rc: Path) -> dict | None:
                  (str(d), str(d.resolve())))
     if t is None and (tid := precheck_task(p, d)) is not None:
         return p.db.one("SELECT * FROM tasks WHERE id=?", (tid,))
-    if t is not None and (a := adopter(p, rc, t["id"])) is not None:   # a task continuing it took it over
-        return a
     return t
 
 
@@ -1247,21 +1166,10 @@ def sweep(p: Project, now: float | None = None) -> list[dict]:
             if not (isinstance(j, dict) and j.get("rc")) or j.get("status") in detach.CLOSED:
                 continue
             rc = Path(j["rc"])
-            if not running(rc):
-                mark_dead(rc, f"task #{row['id']} is {row['status']}", now=now)
+            if not running(rc) or waited_on(p, rc) is not None:
                 continue
-            if waited_on(p, rc) is not None:
-                continue
-            if (h := heir(p, row["id"])) is not None:   # a task that continues it still needs the job
-                if r := adopt(p, rc, row["id"], h["id"], now):
-                    out.append(r)
-                continue
-            who, why = row["id"], f"task #{row['id']} is {row['status']}"
-            if (a := adopter(p, rc, row["id"])) is not None:
-                if a["status"] in HANDED_OFF and names_job(load_result(a["result"]), rc):
-                    continue
-                who, why = a["id"], f"task #{a['id']} (it took the job over from #{row['id']}) is {a['status']}"
-            if r := end(p, rc, why, who, "jobstop.sweep"):
+            r = end(p, rc, f"task #{row['id']} is {row['status']}", row["id"], "jobstop.sweep")
+            if r:
                 out.append(r)
     out += _sweep_handed_off(p, now)
     out += sweep_done_checks(p, now)
@@ -1360,19 +1268,17 @@ def task_jobs(p: Project, task: int, now: float | None = None) -> list[tuple[int
     now = time.time() if now is None else now
     out = []
     runs = Path(os.path.realpath(p.runs))
-    for tid in [int(task), *ancestors(p, task)]:   # plus the jobs it took over from the tasks it continues
-        for row in p.db.q("SELECT id, dir FROM runs WHERE task=? AND dir IS NOT NULL AND COALESCE(started, 0)>? "
-                          "ORDER BY id", (tid, now - SWEEP_DAYS * 86400)):
-            d = Path(os.path.realpath(row["dir"]))
-            if d.parent != runs:
-                continue
-            try:
-                jobs = json.loads((d / detach.REGISTRY).read_text())
-            except (OSError, ValueError):
-                continue
-            out += [(row["id"], j) for j in (jobs if isinstance(jobs, list) else [])
-                    if isinstance(j, dict) and j.get("rc") and Path(os.path.realpath(j["rc"])).parent == d
-                    and (tid == int(task) or str(j.get("task")) == str(task))]
+    for row in p.db.q("SELECT id, dir FROM runs WHERE task=? AND dir IS NOT NULL AND COALESCE(started, 0)>? "
+                      "ORDER BY id", (int(task), now - SWEEP_DAYS * 86400)):
+        d = Path(os.path.realpath(row["dir"]))
+        if d.parent != runs:
+            continue
+        try:
+            jobs = json.loads((d / detach.REGISTRY).read_text())
+        except (OSError, ValueError):
+            continue
+        out += [(row["id"], j) for j in (jobs if isinstance(jobs, list) else [])
+                if isinstance(j, dict) and j.get("rc") and Path(os.path.realpath(j["rc"])).parent == d]
     return out
 
 

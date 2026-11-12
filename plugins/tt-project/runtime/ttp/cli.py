@@ -9474,8 +9474,7 @@ def _detach_list() -> int:
     for run, j in jobs:
         st, why = detach.state(Path(j["rc"]))
         print(f"run {run}  {j.get('name') or Path(j['rc']).stem}  {st}{f' ({why})' if why and st != 'running' else ''}"
-              f"  pid {j.get('pid') or '-'}  {j['rc']}"
-              + (f"  (taken over from task #{j['adopted_from']})" if j.get("adopted_from") else ""))
+              f"  pid {j.get('pid') or '-'}  {j['rc']}")
     if not jobs:
         print(f"task #{me[1]} has no detached jobs in its runs of the last {jobstop.SWEEP_DAYS} days")
     return 0
