@@ -4,12 +4,15 @@ The daemon asks babysit.ask(..., target="coordinator") once per set of queued ev
 batch: no turn starts, the events stay queued on disk and ride the next wake's digest; the same set is
 not asked again, and it wakes without asking once its oldest event is coordinator.wake_triage_max_s old
 (default 1800). A new event changes the set and asks again. "wake" or "flag" wakes as before; the
-coordinator's effort tier never changes here. Any watcher error wakes and logs the model and the error.
-Off with coordinator.wake_triage false.
+coordinator's effort tier never changes here. A watcher error Haiku cannot settle wakes and logs the
+model and the error. Off with coordinator.wake_triage false.
 
-Without a chat provider (babysit.settings is None) the core provider's cheap model decides instead
-(cheapdecide.Haiku: Claude Haiku at low effort, no tools), on by default while Haiku is on
-(cheapdecide.settings); off with coordinator.wake_triage_fallback false. It only decides whether the
+Without a usable chat provider the core provider's cheap model decides instead (cheapdecide.Haiku: Claude
+Haiku at low effort, no tools): when none is set (babysit.settings is None), and while its key is known
+missing or refused as logged out (babysit.key_problem, read model-free, so no failed chat call per wake;
+a newly saved key brings the chat model back at once, with no restart). A chat call that fails
+(Unavailable, an unparsed answer) is put to Haiku the same way before anything wakes. On by default
+while Haiku is on (cheapdecide.settings); off with coordinator.wake_triage_fallback false. It only decides whether the
 coordinator wakes now; it never answers in the coordinator's place. Its call runs in the background: while the answer
 is on its way the batch waits (never past wake_triage_max_s), and a later tick reads it. Its cost is
 booked by Haiku's own path under purpose wake_decision. The same exclusions hold for both: the daemon
@@ -46,11 +49,15 @@ ASK = {"wake": {"type": "noul",
                              "false": "every event is routine progress that can wait for the next wake"}}}
 
 
-def fallback_on(cfg: dict) -> bool:
-    """Whether Haiku decides because there is no chat provider."""
-    return babysit.settings(cfg) is None and \
-        (cfg.get("coordinator") or {}).get("wake_triage_fallback", True) is not False and \
+def haiku_ok(cfg: dict) -> bool:
+    """Whether Haiku may decide in the chat provider's place."""
+    return (cfg.get("coordinator") or {}).get("wake_triage_fallback", True) is not False and \
         cheapdecide.settings(cfg) is not None
+
+
+def fallback_on(cfg: dict) -> bool:
+    """Whether Haiku decides because there is no usable chat provider (none set, or no key, or logged out)."""
+    return haiku_ok(cfg) and (babysit.settings(cfg) is None or bool(babysit.key_problem(cfg)))
 
 
 def on(cfg: dict) -> bool:
@@ -82,7 +89,8 @@ def state(db, ids: list[int]) -> str:
 
 def fold(db, cfg: dict, evs: list[dict], now: float, ask=None, haiku=None) -> tuple[bool, str]:
     """(True, log line) when this batch folds into the next wake, else (False, log line or "")."""
-    fallback = ask is None and fallback_on(cfg)
+    injected = ask is not None
+    fallback = not injected and fallback_on(cfg)
     ask = ask or (_haiku_ask(haiku) if fallback else babysit.ask)
     ids = sorted(e["id"] for e in evs)
     seen = db.kv(KEY, {}) or {}
@@ -91,16 +99,27 @@ def fold(db, cfg: dict, evs: list[dict], now: float, ask=None, haiku=None) -> tu
             return True, ""
         return False, f"coordinator wake: events {ids} waited {int(max_s(cfg))} s after a watcher skip, waking"
     model = ((cheapdecide.settings(cfg) if fallback else babysit.settings(cfg)) or {}).get("model") or "none"
+    text, chat_err = state(db, ids), ""
     try:
-        d = ask(cfg, state(db, ids), QUESTION, target="coordinator", db=db, purpose="coordinator_wake")
-    except Exception as e:   # the watcher only saves money: any error wakes
-        return False, f"coordinator wake triage failed, waking ({model}): {type(e).__name__}: {str(e)[:300]}"
+        d = ask(cfg, text, QUESTION, target="coordinator", db=db, purpose="coordinator_wake")
+    except Exception as e:   # the watcher only saves money: any error wakes, after Haiku had its say
+        chat_err = f"{type(e).__name__}: {str(e)[:300]}"
+        if fallback or (injected and haiku is None) or not haiku_ok(cfg):
+            return False, f"coordinator wake triage failed, waking ({model}): {chat_err}"
+        chat, model = model, (cheapdecide.settings(cfg) or {}).get("model") or "haiku"
+        try:
+            d = _haiku_ask(haiku)(cfg, text, QUESTION, target="coordinator", db=db, purpose=PURPOSE)
+        except Exception as e2:
+            return False, (f"coordinator wake triage failed, waking ({chat}, then {model}): {chat_err}; "
+                           f"{type(e2).__name__}: {str(e2)[:200]}")
+        chat_err = f"; chat model {chat} failed: {chat_err[:200]}"
     if d["verb"] == "pending":   # Haiku's answer is on its way: wait for it, never past max_s
         if now - min(e["ts"] for e in evs) < max_s(cfg):
             return True, ""
         return False, f"coordinator wake: events {ids} waited {int(max_s(cfg))} s for the watcher, waking"
     db.set_kv(KEY, {"ids": ids, "verb": d["verb"], "at": now, "model": d.get("model") or model})
     if d["verb"] == "skip":
-        return True, (f"coordinator wake folded by the watcher ({d.get('model') or model}): events {ids} "
-                      f"stay queued for the next wake, at most {int(max_s(cfg))} s")
-    return False, ""
+        return True, (f"coordinator wake folded by the watcher ({d.get('model') or model}{chat_err}): events "
+                      f"{ids} stay queued for the next wake, at most {int(max_s(cfg))} s")
+    return False, (f"coordinator wake: the watcher ({d.get('model') or model}{chat_err}) says wake"
+                   if chat_err else "")

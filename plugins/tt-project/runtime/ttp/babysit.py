@@ -67,6 +67,40 @@ class _Cool:
 
 
 _REFUSED: dict[tuple[str, str], float] = {}   # (endpoint, model) -> until: answered 404, not asked meanwhile
+AUTH_S = 1800.0   # a missing or refused key (HTTP 401/403: logged out) is not tried again for this long
+_AUTH: dict[str, tuple[float, str]] = {}   # endpoint -> (until, fingerprint of the refused key; "" none saved)
+
+
+def _fingerprint(alias: str) -> str:
+    import hashlib
+    got = endpoint.credentials(alias)
+    return hashlib.sha256(got[0].encode()).hexdigest()[:16] if got else ""
+
+
+def key_problem(cfg: dict | None, now: float | None = None) -> str:
+    """Why the chat provider cannot be asked, read model-free: a call within AUTH_S found no key saved for
+    its endpoint, or the saved key refused (logged out), and the saved key is still the same; "" when it
+    may be asked (or there is no chat provider). Saving a key clears it at once, with no restart."""
+    s = settings(cfg)
+    if s is None or (mark := _AUTH.get(s["alias"])) is None:
+        return ""
+    until, bad = mark
+    try:
+        same = until > (time.time() if now is None else now) and _fingerprint(s["alias"]) == bad
+    except Exception:   # an unreadable store proves nothing: ask, and fail as before
+        same = False
+    if not same:
+        _AUTH.pop(s["alias"], None)
+        return ""
+    return (f"the key saved for endpoint {s['alias']!r} was refused (logged out)" if bad
+            else f"no key saved for endpoint {s['alias']!r}")
+
+
+def _auth_refused(alias: str, now: float) -> None:
+    try:
+        _AUTH[alias] = (now + AUTH_S, _fingerprint(alias))
+    except Exception:
+        pass
 
 
 class Unavailable(Exception):
@@ -175,6 +209,9 @@ def ask(cfg: dict, state: str, question: str, target: str = "coordinator", post=
         except Unavailable as e:
             if "HTTP 404" not in str(e):
                 err = f"{model}: {e}"
+                if "no key saved" in str(e) or re.search(r"HTTP 40[13]\b", str(e)):   # no stand-in helps
+                    _auth_refused(s["alias"], now)
+                    raise Unavailable(err) from None
                 break
             _REFUSED[(s["alias"], model)] = now + REFUSED_S   # not served: try the next candidate
             err = f"model {model} refused: {e}"
@@ -215,7 +252,7 @@ class Babysitter:
         self.last_decision: dict | None = None
 
     def _chat_on(self) -> bool:
-        return settings(self.cfg) is not None and time.time() >= self.pause.until
+        return settings(self.cfg) is not None and time.time() >= self.pause.until and not key_problem(self.cfg)
 
     def enabled(self) -> bool:
         return self._chat_on() or bool(self.jev is not None and self.jev.enabled())
@@ -260,6 +297,9 @@ class Babysitter:
         if time.time() < self.pause.until:
             self.fell_back(purpose, None)
             return None
+        if why := key_problem(self.cfg):   # known model-free: no failed call, no cool-down
+            self.fell_back(purpose, f"Unavailable: {why}")
+            return None
         try:
             d = ask(self.cfg, state, question, target=target, post=self.post, db=self.db, purpose=purpose,
                     served=self._served())
@@ -298,7 +338,8 @@ class Babysitter:
                     self.pause.until = time.time() + COOL_S
                 self.fell_back(purpose, f"{type(e).__name__}: {e}")
         elif wake_only and settings(self.cfg) is not None:
-            self.fell_back(purpose, None)   # cooling down after an error
+            why = key_problem(self.cfg)   # no key or logged out (no call made), else cooling down
+            self.fell_back(purpose, f"Unavailable: {why}" if why else None)
         if self.jev is not None and self.jev.enabled():
             ans = self.jev.decide(state=state, questions=questions, purpose=purpose, timeout=timeout)
             self.last_cost = getattr(self.jev, "last_cost", 0.0)

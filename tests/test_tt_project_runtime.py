@@ -516,6 +516,8 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     monkeypatch.setenv("TTP_TEST_CYCLE_NOTICES", str(tmp_path / "no-cycle-notice.json"))   # never the real /run notice (cyclenotice.py)
     from ttp import probespawn
     monkeypatch.setattr(probespawn, "_timeouts", {})   # a probe's timeouts in a row never carry over from another test
+    from ttp import babysit
+    monkeypatch.setattr(babysit, "_AUTH", {})   # nor a chat key one test found missing or refused
     from ttp import gitcache, statcache
     gitcache.clear()   # git and file answers kept by one test never answer another's (fakes, reused paths)
     statcache.clear()

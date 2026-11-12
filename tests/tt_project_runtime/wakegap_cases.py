@@ -255,6 +255,105 @@ def test_waketriage_haiku_pending_holds_the_batch_but_never_past_max_s(env):
     assert not folded and "triage failed" in line
 
 
+def _wg_fold_chat(env, cfg_extra=None):
+    """A project with the chat watcher set (its endpoint has no key saved in the test home) and one
+    queued routine event; returns (p, cfg, a function giving a new event-only batch)."""
+    from ttp import configwho, waketriage
+    p = make(env)
+    p.set_config("providers.chat", _WG_CHAT, by=configwho.by("user", via="cli"))
+    for k, v in (cfg_extra or {}).items():
+        p.set_config(k, v, by=configwho.by("user", via="cli"))
+    p.db.x("DELETE FROM kv WHERE key=?", (waketriage.KEY,))
+
+    def batch():
+        p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) "
+               "VALUES(100,'task:1','task_done','normal','x','queued')")
+        return [dict(r) for r in p.db.q("SELECT * FROM events")][-1:]
+    return p, p.config(), batch
+
+
+def test_waketriage_a_missing_chat_key_falls_back_to_haiku_and_stops_asking_the_chat_model(env, monkeypatch):
+    """On a host whose chat model's endpoint has no key saved, every wake logged "coordinator wake triage
+    failed, waking" and woke the coordinator: Haiku covered only a missing chat provider, not a missing key."""
+    from ttp import babysit, waketriage
+    calls = _wg_haiku(monkeypatch)
+    real, posts = babysit._post, []
+    monkeypatch.setattr(babysit, "_post", lambda s, m, t: (posts.append(s["model"]), real(s, m, t))[1])
+    p, cfg, batch = _wg_fold_chat(env)
+    folded, line = waketriage.fold(p.db, cfg, batch(), 160)
+    assert folded and "triage failed" not in line and len(calls) == 1, line
+    assert "no key saved" in line and len(posts) == 1   # the one call that found it: no network, no model
+    assert "no key saved" in babysit.key_problem(cfg) and waketriage.fallback_on(cfg)
+    folded, line = waketriage.fold(p.db, cfg, batch(), 170)   # known now: Haiku at once, no chat call
+    assert folded and len(calls) == 2 and len(posts) == 1, (line, posts)
+    # A saved key brings the chat model back on the next wake, with no restart.
+    monkeypatch.setattr(babysit, "_fingerprint", lambda alias: "a-saved-key")
+    monkeypatch.setattr(babysit, "_post", lambda s, m, t: (posts.append(s["model"]), {
+        "choices": [{"message": {"content": "skip"}}]})[1])
+    assert not babysit.key_problem(cfg) and not waketriage.fallback_on(cfg)
+    folded, line = waketriage.fold(p.db, cfg, batch(), 180)
+    assert folded and len(posts) == 2 and len(calls) == 2 and "example-org/small-model" in line, line
+
+
+def test_waketriage_a_logged_out_chat_provider_falls_back_to_haiku_until_a_new_key(env, monkeypatch):
+    from ttp import babysit, waketriage
+    calls = _wg_haiku(monkeypatch, answer="wake: yes")
+    posts, key = [], ["old-key"]
+    monkeypatch.setattr(babysit, "_fingerprint", lambda alias: key[0])
+
+    def refused(s, m, t):
+        posts.append(s["model"])
+        raise babysit.Unavailable("HTTP 401")
+    monkeypatch.setattr(babysit, "_post", refused)
+    p, cfg, batch = _wg_fold_chat(env)
+    folded, line = waketriage.fold(p.db, cfg, batch(), 160)
+    assert not folded and "triage failed" not in line and "HTTP 401" in line and len(calls) == 1, line
+    assert "logged out" in babysit.key_problem(cfg) and len(posts) == 1   # no stand-in tried on a refused key
+    waketriage.fold(p.db, cfg, batch(), 170)
+    assert len(posts) == 1 and len(calls) == 2
+    key[0] = "new-key"   # the user saved a new key: the chat model is asked again
+    assert not babysit.key_problem(cfg)
+    waketriage.fold(p.db, cfg, batch(), 180)
+    assert len(posts) == 2
+
+
+def test_waketriage_a_chat_model_error_still_wakes_without_haiku_and_is_settled_by_haiku_with_it(env, monkeypatch):
+    from ttp import babysit, waketriage
+
+    def down(s, m, t):
+        raise babysit.Unavailable("HTTP 503")
+    monkeypatch.setattr(babysit, "_post", down)
+    monkeypatch.setattr(babysit, "_fingerprint", lambda alias: "a-saved-key")
+    p, cfg, batch = _wg_fold_chat(env)
+    folded, line = waketriage.fold(p.db, cfg, batch(), 160)   # no Haiku (a fake core provider): as before
+    assert not folded and "triage failed" in line and "HTTP 503" in line, line
+    assert not babysit.key_problem(cfg), "a model error marked the key bad"
+    calls = _wg_haiku(monkeypatch)
+    folded, line = waketriage.fold(p.db, cfg, batch(), 170)
+    assert folded and len(calls) == 1 and "HTTP 503" in line and "triage failed" not in line, line
+    # Off-switches: coordinator.wake_triage_fallback false wakes on the error, without Haiku.
+    p, cfg, batch = _wg_fold_chat(env, {"coordinator.wake_triage_fallback": False})
+    folded, line = waketriage.fold(p.db, cfg, batch(), 180)
+    assert not folded and "triage failed" in line and len(calls) == 1, line
+    p.set_config("coordinator.wake_triage", False)
+    assert not waketriage.on(p.config())
+
+
+def test_babysitter_with_a_known_missing_key_asks_no_chat_model_and_sets_no_cool_down(env, monkeypatch):
+    """wake_gate and wake_tier logged a failed chat call per decision and cooled down; a key known
+    missing is read model-free and goes straight to the fallback (Jev, with Haiku behind it)."""
+    from ttp import babysit
+    p, cfg, _ = _wg_fold_chat(env)
+    real, posts, lines = babysit._post, [], []
+    monkeypatch.setattr(babysit, "_post", lambda s, m, t: (posts.append(1), real(s, m, t))[1])
+    b = babysit.Babysitter(cfg, log=lines.append)
+    assert b.decision("state", "q?", purpose="wake_gate") is None and len(posts) == 1   # the call that learns it
+    b.pause.until = 0.0
+    assert b.decision("state", "q?", purpose="wake_tier") is None and len(posts) == 1
+    assert b.pause.until == 0.0 and not b._chat_on()
+    assert "no key saved" in lines[-1] and "wake_tier" in lines[-1], lines
+
+
 def _wg_msg(p, clock, text, provenance="cli-peer", context=None):
     p.db.x("INSERT INTO messages(ts,direction,chat,text,handled,provenance,context) VALUES(?,?,?,?,0,?,?)",
            (clock[0], "in", "web", text, provenance, context))
