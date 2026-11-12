@@ -922,6 +922,73 @@ def test_a_job_an_open_task_still_waits_on_is_not_stopped(env, tmp_path):
         _end_group(pgid)
 
 
+def test_a_cancelled_tasks_job_is_taken_over_by_the_open_task_that_continues_it(env, tmp_path):
+    """Cancelling task A while open task C continues B, which continues A: the sweep kills nothing; the
+    job keeps running, owned by C (the newest open task down the chain) with who it came from and when,
+    and C's status, listing and stop rules see it as C's."""
+    from ttp import detach, jobstop, locks as lk
+    p = make(env)
+    broker = _stub_broker(tmp_path)
+    a = p.db.add_task("soak", "s", kind="work", tier="light", origin="user")
+    rc, pgid = _locked_job(p, a, broker, status="cancelled")
+    try:
+        b = p.db.add_task("soak again", "s", kind="work", tier="light", origin="user", labels=[f"continues:{a}"],
+                          status="cancelled")
+        c = p.db.add_task("soak once more", "s", kind="work", tier="light", origin="user",
+                          labels=[f"continues:{b}"], status="queued")
+        (r,) = jobstop.sweep(p)
+        assert r["task"] == c and f"open task #{c} continues #{a}" in r["text"], r
+        assert not lk.any_free([lk.job_lock(rc)]) and jobstop.members(pgid) and not _stopped_events(p)
+        assert not rc.with_suffix(".lost").exists() and _signal_rows(p) == []
+        e = detach._entry(rc)
+        assert (e["task"], e["adopted_from"], e["status"]) == (c, a, "running") and e["adopted_at"] > 0
+        assert jobstop.task_of(p, rc)["id"] == c and jobstop.task_live_jobs(p, c) == [rc]
+        assert [j["rc"] for _, j in jobstop.task_jobs(p, c)] == [e["rc"]] and jobstop.task_jobs(p, b) == []
+        assert jobstop.sweep(p) == []   # owned already: nothing more to say
+        p.db.update_task(c, status="cancelled")   # its new owner ended too: now it is stopped and marked dead
+        (r,) = jobstop.sweep(p)
+        assert r["task"] == c and f"task #{c} (it took the job over from #{a}) is cancelled" in r["text"], r
+        assert lk.any_free([lk.job_lock(rc)])
+        e = detach._entry(rc)
+        assert (e["status"], e["exit"], e["stopped"], e["signal"], e["why"]) == ("ended", 137, True, "SIGKILL", f"stopped: {r['text'].split(': ')[1].split(';')[0]}")
+        assert e["killed_at"] > 0
+    finally:
+        _end_group(pgid)
+
+
+def test_a_cancelled_tasks_job_without_a_continuation_is_stopped_and_marked_dead(env, tmp_path):
+    from ttp import detach, jobstop, locks as lk
+    p = make(env)
+    broker = _stub_broker(tmp_path)
+    a = p.db.add_task("soak", "s", kind="work", tier="light", origin="user")
+    rc, pgid = _locked_job(p, a, broker, status="cancelled")
+    try:
+        p.db.add_task("unrelated", "s", kind="work", tier="light", origin="user", status="queued")
+        (r,) = jobstop.sweep(p)
+        assert r["task"] == a and lk.any_free([lk.job_lock(rc)])
+        e = detach._entry(rc)
+        assert (e["status"], e["exit"], e["stopped"], e["signal"], e["why"]) == ("ended", 137, True, "SIGKILL", f"stopped: task #{a} is cancelled")
+        assert e["killed_at"] > 0 and detach.state(rc)[0] == "ended"
+        assert jobstop.sweep(p) == []
+    finally:
+        _end_group(pgid)
+
+
+def test_a_cancelled_tasks_job_already_gone_is_marked_dead(env):
+    from ttp import detach, jobstop
+    p = make(env)
+    a = p.db.add_task("soak", "s", kind="work", tier="light", origin="user", status="cancelled")
+    run_dir = p.runs / f"gone-{a}"
+    run_dir.mkdir(parents=True)
+    p.db.x("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(?,?,?,?,?,?)",
+           (a, "worker", "fake", time.time() - 60, "ok", str(run_dir)))
+    rc = run_dir / "loop.rc"
+    (run_dir / detach.REGISTRY).write_text(json.dumps([{"name": "loop", "rc": str(rc), "pid": 999999, "task": a}]))
+    assert jobstop.sweep(p) == [] and not _stopped_events(p)
+    e = detach._entry(rc)
+    assert e["status"] == "died" and e["ended"] > 0 and e["why"].startswith("gone: ") and "killed_at" not in e
+
+
 def _later_run(p, tid):
     """A later run of task tid, after the one that started its job."""
     d = p.runs / f"later-{tid}"
@@ -1311,7 +1378,7 @@ def test_an_owners_stop_writes_the_rc_so_a_reader_of_the_rc_alone_sees_a_stop_no
         assert "gone without an exit code" not in c.stdout, c.stdout
         assert "stopped on purpose" in detach.failed_why(f"ttp detach --check {rc}", 4)
         e = detach.close(rc)
-        assert (e["status"], e["exit"], e["stopped"]) == ("ended", 137, True) and "superseded" in e["why"], e
+        assert (e["status"], e["exit"], e["stopped"]) == ("ended", 137, True) and "superseded" in e["why"] and e["signal"] == "SIGKILL", e
     finally:
         _end_group(pgid)
 
