@@ -76,7 +76,8 @@ time spent generating bounds what any serving change can save.
 
 ## Stage 11: serving rates
 
-Stage 11 is benchmarks only. It measures, on the route goal 12 will use, a batch × input-length grid
+Stage 11 is benchmarks only. It measures, on the route goal 12 will use and with the sampling settings
+its harness sends, a batch × input-length grid
 (each validated batch; inputs of 4096, `typical_context_tokens`, `working_set_tokens` and ≥ 28K) plus every
 benchmark row the release spec lists for this model. Every row completes; a row the budget leaves
 unmeasured goes in `missing_rows` (batch, input_tokens, reason) and the stage completes. Each row is compared with its
