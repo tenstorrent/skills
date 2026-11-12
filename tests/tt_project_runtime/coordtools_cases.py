@@ -728,6 +728,27 @@ CHANGING_CALLS = ["rm -rf build", "echo x > notes.md", "ttp note hi", "git commi
                   "launchctl load x.plist", "frobnicate --all", "git branch topic", "sed -i s/a/b/ f", "cat a | tee b"]
 
 
+# Reads a coordinator wake ran and the audit flagged as changes (0.2.1157), and their writing neighbours.
+LOOKUP_READS = ["ttp deployed 2>&1 | head -30", "ttp deployed 0.2.9 --json", "ttp audit --help 2>&1 | head",
+                "ttp push -h", "ttp config demo bridge.agent_alert_after_min", "ttp config demo budget",
+                "awk '$1>=\"a\"' f | grep -c x", "awk -F: '{print $1}' f", "awk -v n=3 'NR<n || /x/' f",
+                "gawk 'NF>2{n++} END{print n}' f"]
+LOOKUP_CHANGES = ["ttp deployed --after-push", "ttp config demo k 5", "ttp config demo k ''",
+                  "ttp config bridge.agent_alert_after_min 60", "ttp config --account k", "ttp devq run -h",
+                  "ttp note hi -h", "awk '{print > \"x\"}' f", "awk '{printf \"%s\", $1 >> \"x\"}' f",
+                  "awk '{print | \"sh\"}' f", "awk '{\"date\" | getline d}' f", "awk 'BEGIN{system(\"rm x\")}'",
+                  "gawk -i inplace '{print}' f", "awk -f prog.awk f", "awk --exec=x f", "awk",
+                  "python3 -c 'print(1)'", "sed -i s/a/b/ f"]
+
+
+def test_deployed_help_a_one_key_config_read_and_plain_awk_count_as_reads():
+    """`ttp deployed` (not --after-push), `ttp CMD --help`, `ttp config NAME [KEY]` and awk whose inline
+    program writes nowhere only read; a value, a left-out project with a value, a later -h a positional may
+    swallow, an awk redirect, pipe, system(), -f or -i, inline python and sed -i stay changes."""
+    from ttp import coordfix
+    assert [c for c in LOOKUP_READS if not coordfix.reads_only(c)] == []
+    assert [c for c in LOOKUP_CHANGES if coordfix.reads_only(c)] == []
+
 def test_read_only_calls_are_logged_but_never_flagged_for_a_missing_why(env, tmp_path, monkeypatch):
     from ttp import coordfix, coordtools
     p = make(env)

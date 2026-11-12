@@ -180,7 +180,45 @@ def _git_reads(args: list[str]) -> bool:
 def _ttp_reads(args: list[str]) -> bool:
     if args and args[0] == "audit" and args[1:2] == ["why"]:
         return True   # the record itself (post_tool_use skips a plain one)
+    if args[1:2] in (["--help"], ["-h"]):
+        return True   # `ttp CMD --help`: argparse prints and exits (later, a positional may swallow it)
+    if args[:1] == ["deployed"]:
+        return "--after-push" not in args   # that one records follow-ups and alerts
+    if args[:1] == ["config"]:
+        return _ttp_config_reads(args[1:])
     return any(len(args) >= len(r) and all(w == a or w == "*" and not a.startswith("-") for w, a in zip(r, args)) for r in TTP_READS)
+
+
+def _ttp_config_reads(args: list[str]) -> bool:
+    """`ttp config NAME [KEY]` prints a value; a flag, a third word or `KEY VALUE` with the project left out
+    (cmd_config reads a first word naming a config section as a key) may set one."""
+    from .project import DEFAULT_CONFIG
+    if not args or len(args) > 2 or any(a.startswith("-") for a in args):
+        return False
+    return len(args) == 1 or args[0].split(".")[0] not in DEFAULT_CONFIG
+
+
+AWK_WRITES = re.compile(r"\bsystem\s*\(|\||\bprintf?\b[^;{}\n]*>")
+AWK_OPTS = {"-F", "-v", "--field-separator", "--assign"}   # each takes one word; any other flag may load code
+
+
+def _awk_reads(args: list[str]) -> bool:
+    """awk whose inline program writes nowhere: no print or printf redirect, no pipe (`print | cmd` or
+    `cmd | getline`), no system(); options only -F and -v (not -f, -i inplace, -E, -l: code it cannot see)."""
+    k = 0
+    while k < len(args) and args[k].startswith("-") and args[k] != "-":
+        if args[k] == "--":
+            k += 1
+            break
+        if args[k] in AWK_OPTS:
+            k += 2
+        elif args[k][:2] in ("-F", "-v") or args[k].split("=", 1)[0] in AWK_OPTS:
+            k += 1
+        else:
+            return False
+    if k >= len(args):
+        return False
+    return not AWK_WRITES.search(args[k].replace("||", " "))
 
 
 def _ssh_reads(args: list[str], depth: int) -> bool:
@@ -211,7 +249,7 @@ def _words_read(w: list[str], depth: int) -> bool:
     if name == "sed":
         return not any(a.startswith(("-i", "--in-place")) or re.fullmatch(r"-[a-zA-Z]*i[a-zA-Z]*", a) for a in args)
     if name in ("awk", "gawk", "mawk", "nawk"):
-        return not any("system" in a or ">" in a or "|" in a for a in args)
+        return _awk_reads(args)
     if name == "find":
         return not any(a in ("-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprintf", "-fls",
                              "-fprint0") for a in args)

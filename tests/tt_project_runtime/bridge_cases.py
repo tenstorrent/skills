@@ -1218,3 +1218,21 @@ def test_upgrade_fails_naming_the_links_a_bridge_restart_left_down(env, tmp_path
     assert ("bridge: still down after its restart: box-1 auto (launchd refused it: Bootstrap failed: 5: "
             "Input/output error)") in said, said
     assert "the access bridge is still down after its restart" in err.getvalue()
+
+
+def test_bridge_agent_alert_grace_min_is_retired_and_an_upgrade_drops_it(env):
+    """0.2.1158 replaced bridge.agent_alert_grace_min with agent_alert_after_min and agent_steady_min: `ttp
+    config` names the retirement and `ttp upgrade` removes the key from project.json, keeping the rest."""
+    from ttp import cli
+    from ttp.project import unknown_key_hint
+    hint = unknown_key_hint("bridge.agent_alert_grace_min")
+    assert hint and "retired" in hint and "agent_alert_after_min" in hint and "agent_steady_min" in hint
+    assert unknown_key_hint("bridge.agent_alert_after_min") is None and unknown_key_hint("bridge.agent_steady_min") is None
+    p = make(env)
+    raw = p.raw_config()
+    raw.setdefault("bridge", {}).update({"agent_alert_grace_min": 60, "agent_steady_min": 20})
+    p.config_path.write_text(json.dumps(raw))
+    notes = cli._drop_retired_keys(p)
+    assert len(notes) == 1 and "bridge.agent_alert_grace_min" in notes[0], notes
+    assert p.raw_config()["bridge"] == {"agent_steady_min": 20}
+    assert cli._drop_retired_keys(p) == [], "a rerun is a no-op"

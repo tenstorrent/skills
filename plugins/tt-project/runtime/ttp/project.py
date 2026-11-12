@@ -1042,6 +1042,8 @@ RETIRED_KEYS = {
     "upgrade.merge_retry_h": "a conflicting upgrade queues its merge task at once, never on a timer",
     "upgrade.task_every_h": "a conflicting upgrade queues its merge task at once, never on a timer",
     "coordinator.unblock_effort": "every coordinator runs at one effort level, coordinator.effort",
+    "bridge.agent_alert_grace_min": "replaced by bridge.agent_alert_after_min (when the user is told) and "
+                                    "bridge.agent_steady_min (when an outage ends)",
 }
 
 
