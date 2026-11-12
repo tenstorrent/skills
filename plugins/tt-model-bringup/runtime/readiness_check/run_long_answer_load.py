@@ -207,7 +207,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--model-dir", required=True, type=Path)
     p.add_argument("--model", default="", help="served model id; default: the first entry of /v1/models")
     p.add_argument("--server-log", type=Path, default=None, help="server log for trace captures and engine errors")
-    p.add_argument("--profile", default="default", help="profile name in eval_request_profiles.json")
+    p.add_argument("--profile", default="lm_eval_reasoning", help="profile name in eval_request_profiles.json (default: the lm-eval reasoning settings)")
     p.add_argument("--profiles-file", type=Path, default=None)
     p.add_argument("--plain-profile", default="plain", help="reference profile for the host-sampling ratio")
     p.add_argument("--users", type=int, default=32)

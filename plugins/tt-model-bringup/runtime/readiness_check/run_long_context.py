@@ -360,7 +360,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--server-log", type=Path, default=None)
     p.add_argument("--text-file", type=Path, default=None, help="long natural text (.txt or .bz2)")
     p.add_argument("--tt-metal", type=Path, default=None, help="tt-metal checkout to find the readiness book in")
-    p.add_argument("--profile", default="default", help="accepted for symmetry with P4; accuracy runs at temperature 0")
+    p.add_argument("--profile", default="lm_eval_reasoning", help="accepted for symmetry with P4; accuracy runs at temperature 0")
     p.add_argument("--profiles-file", type=Path, default=None)
     p.add_argument("--lengths", default="", help=f"accuracy default {DEFAULT_ACCURACY_LENGTHS}; timing default {DEFAULT_TIMING_LENGTHS}")
     p.add_argument("--depths", default="0.1,0.5,0.9")

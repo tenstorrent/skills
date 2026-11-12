@@ -31,6 +31,15 @@ BUILTIN_PROFILES: dict[str, dict[str, Any]] = {
         "thinking": True,
         "request": {"temperature": 0.6, "top_p": 0.95, "top_k": 20},
     },
+    # Mirror of eval_request_profiles.json `lm_eval_reasoning` (the P4/P5 default), used only
+    # when that file is absent or overridden by a missing --profiles-file.
+    "lm_eval_reasoning": {
+        "name": "lm_eval_reasoning",
+        "source": "built-in mirror of eval_request_profiles.json lm_eval_reasoning",
+        "chat": True,
+        "thinking": True,
+        "request": {"temperature": 1.0, "top_p": 0.95, "top_k": 40, "seed": 42},
+    },
     # Reference for the host-sampling comparison: settings every device sampler supports.
     "plain": {
         "name": "plain",

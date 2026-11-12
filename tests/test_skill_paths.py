@@ -17,7 +17,7 @@ paths_mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(paths_mod)
 
 # TODO(integrator): remove once the stale-path map for optimize/SKILL.md is applied.
-EXEMPT_FILES = {"skills/optimize/SKILL.md"}
+EXEMPT_FILES: set = set()
 
 
 def _missing(refs, snapshot):
@@ -67,8 +67,6 @@ def test_check_fails_on_a_path_absent_from_the_snapshot():
     snapshot = {"models", "models/demos", "models/demos/gpt_oss"}
     refs = {"models/demos/gpt_oss": {"skills/a/SKILL.md"}, "models/common/modules/mlp/mlp_1d.py": {"skills/b/SKILL.md"}}
     assert _missing(refs, snapshot) == {"models/common/modules/mlp/mlp_1d.py": ["skills/b/SKILL.md"]}
-    exempt_only = {"models/common/modules/mlp/mlp_1d.py": {"skills/optimize/SKILL.md"}}
-    assert _missing(exempt_only, snapshot) == {}
 
 
 def test_build_snapshot_keeps_only_referenced_paths_and_parents():

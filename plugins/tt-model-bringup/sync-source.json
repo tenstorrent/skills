@@ -15,28 +15,28 @@
       "destination": "prompts/model_bringup_multigoal/02-fused-decoder.txt",
       "blob": "40bd12d6917899849a0d1e4376670ea51e3621f1",
       "source_sha256": "d79961f8c22be1d499d73cba1d059250606801f5b6cb47f5c5db2809edee6417",
-      "packaged_sha256": "d79961f8c22be1d499d73cba1d059250606801f5b6cb47f5c5db2809edee6417"
+      "packaged_sha256": "16879059be1825198ac1a91b42f549bcb9c09e5438758a2c97410c2c0f9efa41"
     },
     {
       "source": ".agents/prompts/model_bringup_multigoal/03-optimized-decoder.txt",
       "destination": "prompts/model_bringup_multigoal/03-optimized-decoder.txt",
       "blob": "96b53dbad52f26c32a9333dc55c7f84c2c1f7c3a",
       "source_sha256": "86a8ce4e96f9f1b1227ba87d9eb2ef8ba51ba3d84410318d88bf222e96e552d9",
-      "packaged_sha256": "86a8ce4e96f9f1b1227ba87d9eb2ef8ba51ba3d84410318d88bf222e96e552d9"
+      "packaged_sha256": "3a760e5d75dc9cc73b0ab66ef2713a7e13b0dd865bc656692ef0f7111f6eea4f"
     },
     {
       "source": ".agents/prompts/model_bringup_multigoal/04-multichip-decoder.txt",
       "destination": "prompts/model_bringup_multigoal/04-multichip-decoder.txt",
       "blob": "d36726dce73b1f54ac67f959fc01df2161c2bb7a",
       "source_sha256": "dbb26cede472925099237a8bd025624f815f8bff6a826e589c871a12b65a65a9",
-      "packaged_sha256": "dbb26cede472925099237a8bd025624f815f8bff6a826e589c871a12b65a65a9"
+      "packaged_sha256": "fd29b90302fa0114765d18b0b94c1bde2c30f0e99e3a79f4f59e049f8bc442cb"
     },
     {
       "source": ".agents/prompts/model_bringup_multigoal/05-optimized-multichip-decoder.txt",
       "destination": "prompts/model_bringup_multigoal/05-optimized-multichip-decoder.txt",
       "blob": "aeb4df1163ff0c03c341972220a7738ffb76c2a0",
       "source_sha256": "2153d6ef772602377aba44aa0f4b0676eccb52188fdabcd3983bfa61141205fb",
-      "packaged_sha256": "2153d6ef772602377aba44aa0f4b0676eccb52188fdabcd3983bfa61141205fb"
+      "packaged_sha256": "339ab59ebbc1a2d3e79286bcb73aa33fa4caf43f49f35991193474bfa02a37fc"
     },
     {
       "source": ".agents/prompts/model_bringup_multigoal/06-full-model.check.sh",
@@ -50,7 +50,7 @@
       "destination": "prompts/model_bringup_multigoal/06-full-model.txt",
       "blob": "bff9bb890a6052bfa0fff9f06f12891ce1ad0f10",
       "source_sha256": "9ffedb6e7af6dcbbd32fc8002b5add7cd599967ef163eb9e0191af47bb14cf09",
-      "packaged_sha256": "fb6ed32d707c84ae48069ce6fe533d870f84d599a11692fc375cefbae3138101"
+      "packaged_sha256": "d8d14d52ce3c990bf6564b09412544daf4b5b090b8f5258c95d0f098e9801594"
     },
     {
       "source": ".agents/prompts/model_bringup_multigoal/07-optimized-full-model.check.sh",
@@ -71,35 +71,35 @@
       "destination": "prompts/model_bringup_multigoal/08-datatype-sweep.txt",
       "blob": "29a35149aa4699d19f1a4a938f93d5da24fc02f5",
       "source_sha256": "2f104bfb9a6e777063a2843868ac9fc6351901b0b641a5d3bdcc73cad3310cb4",
-      "packaged_sha256": "2f104bfb9a6e777063a2843868ac9fc6351901b0b641a5d3bdcc73cad3310cb4"
+      "packaged_sha256": "858babbbf7b78267a726f9ca682672b739d2874d6cee145a19defd97cef9acec"
     },
     {
       "source": ".agents/prompts/model_bringup_multigoal/09-vllm.check.sh",
       "destination": "prompts/model_bringup_multigoal/09-vllm.check.sh",
       "blob": "54873057b0cd77d369de89e8732a5f7bf6810027",
       "source_sha256": "e5860d4f3d9a3f5076062814db09b403ad7de9d0bef6d8aeec02325bccb626ba",
-      "packaged_sha256": "a098cefdfd7fa4dc0d363bbb1f20ba545ea9c95e4a7bed4b0573631abb962c49"
+      "packaged_sha256": "7b9aeef88cb8ff8b1f5f45de61f1398154f0bb38926d3f0c746843d8678a491f"
     },
     {
       "source": ".agents/prompts/model_bringup_multigoal/09-vllm.txt",
       "destination": "prompts/model_bringup_multigoal/09-vllm.txt",
       "blob": "fc930a5472158d07221c2c5440786a7c5aed9ed2",
       "source_sha256": "65e532c7e54a6e1bd348575f4471fa0708990fe93e91ef06bbfa9695c60ca727",
-      "packaged_sha256": "d5faa42f694802861d1e04130cbce98e9f29ca9cf3dad4b68c33d3695ef164e8"
+      "packaged_sha256": "354b542b8dbd1dc5fb12aaa6e4811e319ee0711cd0a466b740588e09055be3a1"
     },
     {
       "source": ".agents/prompts/model_bringup_multigoal/10-optimized-vllm.check.sh",
       "destination": "prompts/model_bringup_multigoal/10-optimized-vllm.check.sh",
       "blob": "f591fa622e04bcb3258bf0cd5a1fdd47a1b2f983",
       "source_sha256": "a0412e5076c40f17077c5d172563c6e0e6c279da5234bcc21c356362713f9ae9",
-      "packaged_sha256": "d13bdee83f2e42fea2d41ea48aabd1870f47a41b0cd0cca711a364979edbe967"
+      "packaged_sha256": "354b5eb5734a76203d4fe251c1707b48e263e5941caee234f42d4382be0d9852"
     },
     {
       "source": ".agents/prompts/model_bringup_multigoal/10-optimized-vllm.txt",
       "destination": "prompts/model_bringup_multigoal/10-optimized-vllm.txt",
       "blob": "7c661791b3c29bbad8de5ce8d50176d13633657f",
       "source_sha256": "6817dc59aa6d8cdc9c50404aa4e919240f1a07e3ce772dab04ae21d4561bec24",
-      "packaged_sha256": "dbfe798db148d294479654ed1034ed541afdf214946f1aef79ce9435fea5fafc"
+      "packaged_sha256": "fd804535730ee5ba2f336b685dc075d9926e2569cf9a1012c709241e0e66e4f5"
     },
     {
       "source": ".agents/requirements.txt",
@@ -113,21 +113,21 @@
       "destination": "scripts/check_context_contract.py",
       "blob": "53418ff24d91abd4552e64ff89885d756e411f62",
       "source_sha256": "b5a234f85e2d29603947eb36671b09f0442adbb4a219224baa7da16b7f2e8f09",
-      "packaged_sha256": "943138760111aede7596f57d2caf374b25049d5df795a9c098104128bffc7b6e"
+      "packaged_sha256": "b668ee9632a6c69f542dbd65c7f70d314b62035bb910f89c062b0541fcb06ef7"
     },
     {
       "source": ".agents/scripts/multigoal",
       "destination": "scripts/multigoal",
       "blob": "11ba52778be9b7d6e86483df6e77b270063c93fd",
       "source_sha256": "ef6e721f22958f5b99e22867370c20d4d9db8f87a16fce1cb7603693dcc1e4b8",
-      "packaged_sha256": "ef692f58bdcc034890e0e630b69e98f869c5204bae0a142478b9ccaf0db567f6"
+      "packaged_sha256": "445b6a7e78d1ee48944ef63c7bc4f3fed0779a177a07446f0b8f1598fbe32011"
     },
     {
       "source": ".agents/skills/datatype-sweep/SKILL.md",
       "destination": "skills/datatype-sweep/SKILL.md",
       "blob": "457749253d5a2a220e7545c02f4e433cc984af12",
       "source_sha256": "25b874a7b6cf277e4e11d28c06c84056790b4ff61064defb24216ec1844d5764",
-      "packaged_sha256": "29bcb087ec2007dc0e5b3b20eae608051865b3ae99abf26c9602ccace250e973"
+      "packaged_sha256": "c079a72a3dd15247e650b4aa45a896ea6a2528ab378597e88ba37ba32f347ab6"
     },
     {
       "source": ".agents/skills/datatype-sweep/agents/openai.yaml",
@@ -141,7 +141,7 @@
       "destination": "skills/full-model/SKILL.md",
       "blob": "de994d5552a74b4f1cdcaf64f6ba364178b8d5a4",
       "source_sha256": "0618a7bd6ee01f995cb98dd73a9b2c46d8fd3daab9fcecdafde67501c529d2f8",
-      "packaged_sha256": "76268571ba42b51c5038196ea7045ef5d9d5c4dd129a5b4526252bcd1dfb7698"
+      "packaged_sha256": "ba8057b5ded1ebf6759e148d17506f7091175b8467a282b5ab024663cb1d8c11"
     },
     {
       "source": ".agents/skills/full-model/agents/openai.yaml",
@@ -155,7 +155,7 @@
       "destination": "skills/functional-decoder/SKILL.md",
       "blob": "5ea84505c81347d6773fc8325c3115d31094e5d8",
       "source_sha256": "133caffc050d9bb0343a37509ce09a6b2a4e640294761e7226e52f8f82037b71",
-      "packaged_sha256": "bc27657687980b27b7a4424c9e83e3cf41c6dcea27db7fa149a8901351c77d04"
+      "packaged_sha256": "69e95007ad2aa45e08e2b91a4ee46ea9302a6741a38825de34987085104f72dd"
     },
     {
       "source": ".agents/skills/functional-decoder/agents/openai.yaml",
@@ -169,7 +169,7 @@
       "destination": "skills/graph-fusing/SKILL.md",
       "blob": "dfdc9e58fe3dc32637a06f28b6fa4da7a393a42b",
       "source_sha256": "4b487b8032b056b83b9bb099b51464044561919b773295d8c563ffcacb014602",
-      "packaged_sha256": "d7b00f48b6ac2ccaa28edc2e166680f1fa0af0605302b6b6008b426df87db7bc"
+      "packaged_sha256": "3a4f78d77cc82efd4110f11ab8fee7553053f73e9c36d0fa8843e9d92957a95e"
     },
     {
       "source": ".agents/skills/graph-fusing/agents/openai.yaml",
@@ -183,7 +183,7 @@
       "destination": "skills/multichip/SKILL.md",
       "blob": "664b6e6b1383d948226185bfa7ba139b9ff1c9b2",
       "source_sha256": "a7430e0f96204dfcd0b70aa689ee88d8ddf61e37a9260ffdfae6ca799f6e6494",
-      "packaged_sha256": "ebbd90d2e4c82bbfb1fb0222d5b46a29049ec5a448cd65bf84a353e91e0ab25c"
+      "packaged_sha256": "00384619f2b37e8673bacc4c5f7e126f6cf1e4d10621333285d3905fa931dac7"
     },
     {
       "source": ".agents/skills/multichip/agents/openai.yaml",
@@ -197,7 +197,7 @@
       "destination": "skills/optimize/SKILL.md",
       "blob": "280abb027d839f1f076ab8a524fc6f61ed6df587",
       "source_sha256": "c4b4015ed198c305ed19f73c2ef6a539923212457588319767d08489a5331c8b",
-      "packaged_sha256": "94cf708cf4a68452c7d4c202f6743e188cd371e5aa06da28cf74b1c3430aed0c"
+      "packaged_sha256": "1cc47b489c0183c383375f62dbee64d5906332a1573aaba5b9d4baee106d27ea"
     },
     {
       "source": ".agents/skills/optimize/agents/openai.yaml",
@@ -211,7 +211,7 @@
       "destination": "skills/qualitative-check/SKILL.md",
       "blob": "47623b7658024f8cd40cd47a589dce9572bc74a3",
       "source_sha256": "e4dbff5cff348b0c04b43221a94ea4ca7e88cba2f328b440dc03ea9cc0713788",
-      "packaged_sha256": "8d1700a238c7e5df172d1bfa5d9478bfb6eff5ad4d871f98c169645bee80af7d"
+      "packaged_sha256": "5ca94560d885504e60cb94aaafa38433582335d41e956eb2c0ff4d736e81e8ed"
     },
     {
       "source": ".agents/skills/qualitative-check/agents/openai.yaml",
@@ -225,7 +225,7 @@
       "destination": "skills/stage-review/SKILL.md",
       "blob": "7c89b9d281aa1a853a273d3ff4b1c16ad8ccac0d",
       "source_sha256": "b84c344e6a2c0130569dc7e4147ad748d44aa04afa11f181b0711d00afbe3466",
-      "packaged_sha256": "0cabbe2ef578457289eaf988937ff523290ac7359b13de010aab3d2b2e428393"
+      "packaged_sha256": "bb02ae09f9bbd6c4a196c8c6d109621209c37ddb3df60fb5f68538f916f9e4c7"
     },
     {
       "source": ".agents/skills/stage-review/agents/openai.yaml",
@@ -239,7 +239,7 @@
       "destination": "skills/tt-device-usage/SKILL.md",
       "blob": "273f20c58cbd80640677004635e43ce47d759891",
       "source_sha256": "b32b5685e47932e1356762c96f70f2ee5cc226ce23d5e1781f9a6bfe26a66502",
-      "packaged_sha256": "e63febed2730ebe69b60308b29af22049ca0893c76f3637064e1dfb60f0b5d29"
+      "packaged_sha256": "83ff8928ebbd9d8b1169c50b89b241d5cb00ca5ca3b652c9218987dbd9ec426b"
     },
     {
       "source": ".agents/skills/tt-device-usage/agents/openai.yaml",
@@ -253,7 +253,7 @@
       "destination": "skills/tt-enable-tracing/SKILL.md",
       "blob": "379f135ff209af802207532f5ad1dc1a88a70627",
       "source_sha256": "2b708c499a67a0fccd6618d6f0c2956f532605b5643c6d70e18a5c70f5bbb1da",
-      "packaged_sha256": "b5bc74494a6e06ec6defef0dd7edec1bcc46e7f7e196f42a93171f319e693418"
+      "packaged_sha256": "f4db3074b52a9dc7b7e43c00d332a236ff507a461f40aae4c2b5e2f8de48d67e"
     },
     {
       "source": ".agents/skills/tt-enable-tracing/advanced_perf_optimizations.md",
@@ -274,7 +274,7 @@
       "destination": "skills/vllm-integration/SKILL.md",
       "blob": "05d9e19f7cfbb596d209c504cc49e063b9361da1",
       "source_sha256": "a23a516ab0e8afc3a5dd6ddd72a42781997fb454872139e70605ecbd234e114c",
-      "packaged_sha256": "0e7fd95bc63326f0ac2d4f49952d7a306b80342b22e8b9ab29c79321f3e6c470"
+      "packaged_sha256": "0295e3307ece27035ea69d599d0837b1075e4da7584ca2ec0726e9d01db15853"
     },
     {
       "source": ".agents/skills/vllm-integration/agents/openai.yaml",
@@ -309,7 +309,7 @@
       "destination": "runtime/readiness_check/check_degenerate_output.py",
       "blob": "e48bf14f4f5faff1141c2f0a4fe9cde989e90b16",
       "source_sha256": "2629d86ae7be926a21e4839d151d21037e0851e98266f1b9a100e7cf14541db4",
-      "packaged_sha256": "8f4b95b367a0d91b43c352b21ffa31c757f219c652b7675120546827177874a3"
+      "packaged_sha256": "52e968b9e14a51d796edd30eb216cdb16f2076e0896820a0e8f14c25d956033f"
     },
     {
       "source": "models/common/readiness_check/contract.py",
@@ -330,7 +330,7 @@
       "destination": "runtime/readiness_check/generate.py",
       "blob": "645b6c947b04066a9c1f65671c0a0d18948c62c4",
       "source_sha256": "2d4b380d325f964aa2b1d65d51c6a8657802f7069082fa1cd78f144610aab347",
-      "packaged_sha256": "d8014f9fb34c94893e2daf1e502a3eec13de64ac8e176e6ef3af08f4f3cd2500"
+      "packaged_sha256": "d4bbcd6488225c7fbc156304e154c3699a4d8ab5268182d74a01f307290dc179"
     },
     {
       "source": "models/common/readiness_check/mesh_device.py",
@@ -344,7 +344,7 @@
       "destination": "runtime/readiness_check/run_autoregressive.py",
       "blob": "ed00364cfde309bc72984fa943bb47e09e01bab6",
       "source_sha256": "e30d619594db5ae0de004946d9b064a17e639b26d99885804a7ed9672e2d0ed3",
-      "packaged_sha256": "b342030dfd0dc7fb5cdc285878ae13d17fa64c08ddc0a4a5c412cc6c97700e6e"
+      "packaged_sha256": "9b8bde56f054df82430095f7191ceb14f660206403de797425093edf1c55ab65"
     },
     {
       "source": "models/common/readiness_check/run_prefill_check.py",
@@ -435,14 +435,14 @@
       "destination": "skills/tti-release/scripts/check-evidence.sh",
       "blob": "9cf16e6d4a2a45ab49fc88337fae474010a05ff2",
       "source_sha256": "7f2e4e78a03f9de87daa6086626643b45c5331d7a25e5dfb1213e95e8712294b",
-      "packaged_sha256": "8be4fc14ba3bdfffabad5b2583e3880fa3d79b7940d9906000ba326bff7ddb1c"
+      "packaged_sha256": "fe92fdb563fd15f4dc08c5bd1ee96080eed71787d2e138d9772e234fbc8fe13d"
     },
     {
       "source": ".agents/skills/tti-release/SKILL.md",
       "destination": "skills/tti-release/SKILL.md",
       "blob": "af09c19651cadaceb231edab4de3c9707801bc75",
       "source_sha256": "bec4650d82fd95793652014d078125ee9370528c09a3f95cfb381f4ef1447fef",
-      "packaged_sha256": "288f0eab0fdc5225f85609aa375616a79c075db3450469af1d0c12ae6c6df5ec"
+      "packaged_sha256": "e7346c2cdf8f250ef7caa797536e5effd56fd409029a77106a0dc7ebfa00e6ac"
     },
     {
       "source": ".agents/skills/tti-release/agents/openai.yaml",

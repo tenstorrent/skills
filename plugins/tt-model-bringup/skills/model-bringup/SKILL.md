@@ -141,6 +141,20 @@ To resume a stopped stage, use the same prompt selection/replacements, Codex hom
 use `--start-index N` only when the supplied first prompt itself is stage N. Resume reuses the
 recorded thread and appends attempt logs. Do not restart earlier completed stages unnecessarily.
 
+Unattended-run options (see `scripts/multigoal --help`):
+- transient API errors (model at capacity, stream disconnects, 5xx) resume the same thread with
+  backoff (`--transient-retries`, `--transient-backoff`);
+- `--wait-on-usage-limit` waits for a usage-limit reset and resumes; the runner pauses between
+  stages when less than `--min-headroom-pct` of the limit is left;
+- `--notify-cmd` runs a command whenever a stage blocks, fails or the run finishes;
+- `--resume-stage N --message-file F` sends an owner decision as the resume turn;
+- advisory check results (exit 1) are recorded without a remediation goal
+  (`--remediate-advisory` restores it); remediation reuses the stage thread
+  (`--remediation-thread new` restores a fresh thread).
+
+Inside a stage, wait for long jobs with `scripts/wait_for` instead of sleep-and-poll loops; see
+`$tt-device-usage`.
+
 ### Optional telemetry integration
 
 [Startup telemetry setup](references/telemetry-setup.md) automatically installs the

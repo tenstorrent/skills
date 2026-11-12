@@ -292,8 +292,7 @@ to the running server: [eval-readiness requests](references/eval-readiness-reque
 P2 (`run_harness_requests`: harness sampling profiles accepted and decoded on the device) and P3
 (`run_chat_conformance`: chat, tools and thinking), with commands, the usual fix per failing check,
 and the 2 h time box. The load and long-context probes (P4, P5, including stage 9's
-`run_long_context --part accuracy`) are in the load reference, `eval-readiness-load.md` in this
-skill's `references/` folder. The gate is
+`run_long_context --part accuracy`) are in [eval-readiness load](references/eval-readiness-load.md). The gate is
 `scripts/check_eval_readiness.py --stage vllm`.
 
 ## Evidence To Leave
