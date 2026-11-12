@@ -120,13 +120,11 @@ def test_a_missing_ranking_key_is_a_status_line_with_or_without_a_ranking(env):
     p = make(env)
     d = Daemon(p.base)
     d.alert(rankfresh.NEEDS_KEY, rankfresh.NEEDS_KEY_TEXT, severity="normal")   # an item from before
-    assert _needs(p, rankfresh.NEEDS_KEY)
+    assert not _needs(p, rankfresh.NEEDS_KEY), "a missing key is never raised as needs-you (user msgs #2679, #2681)"
     d.needs_ranking_key(False)   # no ranking at all: the open item is lowered to a feed line too
     assert not _needs(p, rankfresh.NEEDS_KEY)
     d.needs_ranking_key(True)
-    assert not _needs(p, rankfresh.NEEDS_KEY) and len(_chat_alerts(p, rankfresh.NEEDS_KEY)) == 1
-    open_ = p.db.q("SELECT severity FROM alerts WHERE key=? AND cleared IS NULL", (rankfresh.NEEDS_KEY,))
-    assert [a["severity"] for a in open_] == ["low"]
+    assert not _needs(p, rankfresh.NEEDS_KEY) and not _chat_alerts(p, rankfresh.NEEDS_KEY)
 
 
 def test_a_missing_chat_key_is_a_status_line_and_a_saved_key_resumes_its_work_unprompted(env, monkeypatch):
