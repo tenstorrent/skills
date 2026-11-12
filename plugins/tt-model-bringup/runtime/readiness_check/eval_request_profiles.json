@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "notes": [
+    "Request profiles that the eval harnesses send, used by the eval-readiness probes (P2 run_harness_requests, P4 run_long_answer_load, P5 run_long_context).",
+    "request holds OpenAI request fields as the harness sends them. max_tokens is the harness budget; probes cap it to their own output length.",
+    "thinking: true asks for thinking mode (the probe adds the model's chat-template switch), false asks for it off, null leaves the template default.",
+    "request_from: hf_generation_config means the request is built at run time from the checkpoint's generation_config.json (see eval_request_profiles.py).",
+    "Refresh the values when the TTI eval configs or the pinned lm-eval fork change; record the source of each change."
+  ],
+  "profiles": [
+    {
+      "name": "plain",
+      "source": "probe baseline: greedy, no seed, no top_k; every device sampler serves it",
+      "chat": true,
+      "thinking": null,
+      "request": {"temperature": 0.0}
+    },
+    {
+      "name": "lm_eval_reasoning",
+      "source": "lm-eval fork tstescoTT/lm-evaluation-harness@321e3bb6 lm_eval/tasks/r1_evals/gpqa_reasoning_diamond.yaml generation_kwargs (top_k 40, top_p 0.95, n 1, max_gen_toks 32768); tenstorrent/tt-inference-server reference_config/evals/eval_config.py EvalTask r1_gpqa_diamond gen_kwargs override temperature 1.0, top_p 0.95, until [] (IFM/K2-Horizon-MoVA-36B-A4B, google/gemma-4-* entries, use_chat_api=True); llm_module/eval_command.py _inject_seed_into_gen_kwargs adds seed 42 (EvalTask.seed); lm_eval/models/openai_completions.py LocalChatCompletion._create_payload drops do_sample and maps max_gen_toks to max_tokens",
+      "chat": true,
+      "thinking": true,
+      "request": {"temperature": 1.0, "top_p": 0.95, "top_k": 40, "seed": 42, "n": 1, "max_tokens": 32768}
+    },
+    {
+      "name": "lm_eval_non_reasoning",
+      "source": "lm-eval fork tstescoTT/lm-evaluation-harness@321e3bb6 lm_eval/tasks/ifeval/ifeval.yaml generation_kwargs (temperature 0.0, max_gen_toks 1280, until []); tt-inference-server EvalTask defaults use_chat_api=False (local-completions with client-side chat template) and seed 42 propagated by eval_command.py _inject_seed_into_gen_kwargs; LocalCompletionsAPI._create_payload sends seed, temperature and max_tokens",
+      "chat": false,
+      "thinking": false,
+      "request": {"temperature": 0.0, "seed": 42, "max_tokens": 1280}
+    },
+    {
+      "name": "model_card",
+      "source": "the checkpoint's generation_config.json, read at run time. vLLM (--generation-config auto, the default) applies the same keys to requests that omit them: temperature, top_p, top_k, min_p, repetition_penalty, max_new_tokens",
+      "chat": true,
+      "thinking": null,
+      "request_from": "hf_generation_config",
+      "request": {}
+    },
+    {
+      "name": "agentic",
+      "source": "tt-inference-server reference_config/evals/eval_config.py TerminalBenchEvalConfig, Harbor agent terminus-2 agent_kwargs for IFM/K2-Horizon-MoVA-36B-A4B: temperature 1.0, llm_kwargs top_p 0.95 and max_tokens 32768, interleaved_thinking true (reasoning_content sent back in history); Harbor sends no seed and no top_k unless llm_kwargs or extra_body set one",
+      "chat": true,
+      "thinking": true,
+      "request": {"temperature": 1.0, "top_p": 0.95, "max_tokens": 32768}
+    }
+  ]
+}
