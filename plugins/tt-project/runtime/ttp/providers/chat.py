@@ -117,6 +117,20 @@ class Chat(Claude):
             return str(argv[argv.index(name) + 1]) if name in argv[:-1] else ""
         return {"model": flag("--model"), "effort": flag("--effort")}
 
+    def key_missing(self, cfg: dict | None = None) -> bool:
+        # No key saved yet for the project's endpoint alias (an unreadable store says nothing): the
+        # logout is a status line until one is saved, and the saved key's new stamp ends it (check_logins).
+        from .. import endpoint
+        from ..project import SecretsUnreadable
+        s = ((cfg or {}).get("providers") or {}).get(self.name) if cfg is not None else self.entry
+        alias = str(s.get("endpoint") or "") if isinstance(s, dict) else ""
+        if not endpoint.ALIAS_RE.match(alias):
+            return False
+        try:
+            return endpoint.credentials(alias) is None
+        except SecretsUnreadable:
+            return False
+
     account = Provider.account
     account_kind = Provider.account_kind
 

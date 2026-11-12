@@ -1,6 +1,6 @@
 # Parked-alert cases: an alert the user acknowledged stays quiet for its condition while that condition is
 # unchanged, and nothing asks the user for what other providers or a fallback already cover (alerts.py
-# condition_acked, userstep.silent, Daemon.logout_alert, Daemon.needs_ranking_key).
+# condition_acked, userstep.silent, Daemon.logout_alert, Daemon.needs_ranking_key; a missing key is a status line).
 # Run from tests/test_tt_project_runtime.py (see _include_cases there): helpers, fixtures and imports
 # come from that file, and pytest collects these tests under it.
 from __future__ import annotations
@@ -113,13 +113,50 @@ def test_a_logout_whose_work_fails_over_is_a_feed_line_only(env, monkeypatch):
     assert rows and all(r["severity"] == "low" and r["channel"] == alerts.QUIET for r in rows)
 
 
-def test_a_missing_ranking_key_with_a_ranking_in_use_is_no_needs_you_item(env):
+def test_a_missing_ranking_key_is_a_status_line_with_or_without_a_ranking(env):
+    # Until the user saves a ranking key, nothing alerts or asks about it (user msg #2681).
     from ttp import alerts, rankfresh
     from ttp.daemon import Daemon
     p = make(env)
     d = Daemon(p.base)
-    d.needs_ranking_key(False)
+    d.alert(rankfresh.NEEDS_KEY, rankfresh.NEEDS_KEY_TEXT, severity="normal")   # an item from before
     assert _needs(p, rankfresh.NEEDS_KEY)
-    d.needs_ranking_key(True)   # a ranking stays in use: the open item is lowered to a feed line
+    d.needs_ranking_key(False)   # no ranking at all: the open item is lowered to a feed line too
     assert not _needs(p, rankfresh.NEEDS_KEY)
-    assert len(_chat_alerts(p, rankfresh.NEEDS_KEY)) == 1
+    d.needs_ranking_key(True)
+    assert not _needs(p, rankfresh.NEEDS_KEY) and len(_chat_alerts(p, rankfresh.NEEDS_KEY)) == 1
+    open_ = p.db.q("SELECT severity FROM alerts WHERE key=? AND cleared IS NULL", (rankfresh.NEEDS_KEY,))
+    assert [a["severity"] for a in open_] == ["low"]
+
+
+def test_a_missing_chat_key_is_a_status_line_and_a_saved_key_resumes_its_work_unprompted(env, monkeypatch):
+    # The chat endpoint's key is not saved yet: its logout is a status line, never a sign-in ask, even
+    # for work pinned to it. Saving the key resumes routing on the next check_logins tick, with no
+    # coordinator turn, and the pinned task may start (user msg #2681).
+    from ttp import alerts, endpoint, project
+    from ttp.daemon import Daemon
+    from ttp.providers import get_provider
+    monkeypatch.setattr(project, "HOME_DIR", env["tmp"] / "key-home")
+    p = make(env)
+    p.set_config("providers.chat", {"endpoint": "cloud", "base_url": "https://api.example.com/v1",
+                                    "tiers": {"standard": {"model": "org/Base-Model-2"}}})
+    d = Daemon(p.base)
+    turns = []
+    monkeypatch.setattr(d, "observe", lambda *a, **k: turns.append(a))
+    tid = p.db.add_task("chat work", "", kind="work", tier="standard", priority=3, budget_usd=8.0, labels=[])
+    p.db.update_task(tid, provider="chat")   # pinned: nothing else runs it, so a login would be 'needed'
+    assert get_provider("chat").key_missing(d.cfg) and not get_provider("fake").key_missing(d.cfg)
+    d.open_breaker("chat", "failed to authenticate: no key saved for endpoint 'cloud'")
+    d.logout_alert("chat", "chat is logged out: log in")
+    assert not _needs(p, "auth:chat") and not _chat_alerts(p, "auth:chat")
+    line = p.db.one("SELECT severity, text FROM messages WHERE ref='auth:chat'")
+    assert line["severity"] == "low" and "once a key is saved" in line["text"] and "log in" not in line["text"]
+    assert d._no_room("chat", {"now": time.time(), "busy": {}}) == "auth"
+    monkeypatch.setattr(endpoint, "verify", lambda *a, **k: (True, "HTTP 200"))
+    endpoint.save("cloud", "https://api.example.com/v1", "sk-placeholder-0000", True, "HTTP 200")
+    assert not get_provider("chat").key_missing(d.cfg)
+    d.check_logins()   # the saved key changed the store's stamp: checked at once, not on the backoff
+    assert not d._logged_out("chat") and alerts.breaker(p.db, "chat") is None
+    assert d._no_room("chat", {"now": time.time(), "busy": {}}) != "auth"
+    assert p.db.one("SELECT status FROM tasks WHERE id=?", (tid,))["status"] == "queued"
+    assert not turns, "no coordinator turn was needed"

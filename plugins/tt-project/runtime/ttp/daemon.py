@@ -4739,15 +4739,17 @@ class Daemon:
         self._rank_job.start()
 
     def needs_ranking_key(self, fallback: bool) -> None:
-        """No ranking key: a user-only item while nothing ranks the chat models, else (`fallback`: a
-        ranking stays in use) one low feed line, an open item lowered to it quietly."""
+        """No ranking key: one low feed line, never a user item, whether a ranking stays in use
+        (`fallback`) or not (user msg #2681); an open item raised before is lowered to it quietly. The
+        refresh retries every few minutes, so a saved key resumes the ranking by itself and the line
+        clears (alerts.holds)."""
         from . import rankfresh
         db, key, text = self.p.db, rankfresh.NEEDS_KEY, rankfresh.NEEDS_KEY_TEXT
         cur = db.one("SELECT * FROM alerts WHERE key=? AND cleared IS NULL ORDER BY id DESC LIMIT 1", (key,))
-        if fallback and cur and cur["severity"] != "low":
+        if cur and cur["severity"] != "low":
             with db.tx():   # no Cleared post: the item only drops to the feed
-                alerts._close(db, cur, time.time(), "a ranking stays in use")
-        self.alert(key, text, severity="low" if fallback else "normal", quiet=fallback)
+                alerts._close(db, cur, time.time(), "a status line until a key is saved")
+        self.alert(key, text, severity="low", quiet=True)
 
     def refresh_model_scores(self) -> None:
         """Replace this project's live rows in the account's model scoreboard and publish the per-class chat
@@ -11640,11 +11642,22 @@ class Daemon:
         except Exception as e:
             log(self.p, f"{prov}: logout waits not read: {type(e).__name__}: {e}")
             w = {"need": True}
-        if coordinator or w["need"]:
+        try:
+            no_key = prov != (self.cfg.get("core_provider") or "claude") and get_provider(prov).key_missing(self.cfg)
+        except Exception:
+            no_key = False
+        if no_key and not coordinator:
+            # No key saved yet (user msg #2681): a status line only; a saved key resumes it (check_logins).
+            self.alert(f"auth:{prov}", self._key_status(prov, w.get("to") or []), "low", quiet=True)
+        elif coordinator or w["need"]:
             self.alert(f"auth:{prov}", text, "high")
         else:
             # A feed line only: its work runs elsewhere, so it asks nothing of the user.
             self.alert(f"auth:{prov}", self._logout_status(prov, time.time(), w["to"]), "low", quiet=True)
+
+    def _key_status(self, prov: str, to: list[str]) -> str:
+        return (f"{prov}: no key saved for its endpoint yet; its work "
+                + (f"runs on {', '.join(to)}" if to else "waits") + " and moves back to it by itself once a key is saved.")
 
     def _logout_status(self, prov: str, since: float, to: list[str]) -> str:
         try:

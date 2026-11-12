@@ -3232,7 +3232,8 @@ def test_live_rows_count_a_tasks_first_chat_run_and_skip_endpoint_faults(env, mo
 
 
 def test_a_newly_served_model_refreshes_the_ranking_through_the_daemon(env, monkeypatch):
-    """The served-models check lists a new model: the daemon refreshes at once; no key, one user-only item."""
+    """The served-models check lists a new model: the daemon refreshes at once; no key, one status line (no
+    user item, user msg #2681), and a saved key resumes the ranking on its next try with no coordinator turn."""
     from ttp import alerts, modelrank, rankfresh, route
     from ttp.daemon import Daemon
     home = _rank_home(env, monkeypatch)
@@ -3253,12 +3254,12 @@ def test_a_newly_served_model_refreshes_the_ranking_through_the_daemon(env, monk
         d.refresh_model_ranking()   # posts what the thread found
     route.write_served(p.state, "chat", True, "HTTP 200", ["rank-b"], time.time())
     for _ in range(4):
-        tick()   # no key: nothing fetched, one user-only item, however often it is tried
+        tick()   # no key: nothing fetched, one status line, however often it is tried
     d = Daemon(p.base)   # a restart says nothing new either
     d._load_config()
     tick()
     rows = p.db.q("SELECT severity FROM messages WHERE ref=?", (rankfresh.NEEDS_KEY,))
-    assert [r["severity"] for r in rows] == ["normal"] and not (home / rankfresh.STATE).exists()
+    assert [r["severity"] for r in rows] == ["low"] and not (home / rankfresh.STATE).exists()
     assert alerts.holds(p.db, rankfresh.NEEDS_KEY, 0, time.time())
     monkeypatch.setattr(d, "alert", lambda key, text, severity="high", **k: posted.append((key, text, severity)))
     monkeypatch.setattr(d, "observe", lambda source, text, **k: seen.append((source, text, k)))

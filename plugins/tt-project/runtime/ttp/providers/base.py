@@ -312,6 +312,11 @@ class Provider:
         (an endpoint alias) also checks, model-free, that the key is saved."""
         return self.login_check()
 
+    def key_missing(self, cfg: dict | None = None) -> bool:
+        """Whether no key is saved yet for the endpoint a project setting names (model-free, no request):
+        its logout is then a status line only, never a sign-in ask, and runs resume once a key is saved."""
+        return False
+
     def build(self, *, role: str, model: str, effort: str, cwd: str, budget_usd: float | None,
               read_only: bool, schema: dict | None, restrictions: dict,
               disallowed_tools: list[str] | tuple = (), denied_reads: list[str] | tuple = (),
