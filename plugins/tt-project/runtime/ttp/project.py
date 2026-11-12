@@ -341,9 +341,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # the user's own channels, wake at the debounce (msgwake.py; 0: off).
                     "relay_window_s": 90,
                     # The watcher model (babysit.ask) folds such a batch into the next wake, kept on disk;
-                    # a folded batch wakes once its oldest event is wake_triage_max_s old (waketriage.py).
+                    # a folded batch is asked again each wake_triage_max_s and wakes regardless once its
+                    # oldest event is wake_triage_hold_max_s old (waketriage.py).
                     "wake_triage": True,
-                    "wake_triage_max_s": 1800,
+                    "wake_triage_max_s": 1800, "wake_triage_hold_max_s": 14400,
                     # Without a chat provider, Claude Haiku (low effort, no tools) decides instead.
                     "wake_triage_fallback": True,
                     # High events within this long after the turn high events woke (from its end) start

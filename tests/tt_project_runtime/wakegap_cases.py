@@ -114,12 +114,18 @@ def test_waketriage_skip_folds_the_batch_into_the_next_wake(env, monkeypatch):
     p.db.x("INSERT INTO messages(ts,direction,chat,text,handled) VALUES(?,?,?,?,0)", (clock[0], "in", "web", "hi"))
     assert _turn_within(d, clock, starts, 60)
     assert eid in notes[-1], "the folded event was missing from the next wake's digest"
-    # Left folded, the batch still wakes once its oldest event is wake_triage_max_s old.
+    # Left folded, the batch is asked again each wake_triage_max_s, and wakes regardless once its oldest
+    # event is wake_triage_hold_max_s old.
     p, d, clock, starts, notes = _wg_setup(env, monkeypatch, chat=True)
+    p.set_config("coordinator.wake_triage_hold_max_s", 5000)
+    d.cfg = p.config()
+    asked.clear()
     clock[0] += 1000
     _event(p, clock, "task_done")
-    assert not _turn_within(d, clock, starts, 600)
-    assert _turn_within(d, clock, starts, 1300), "a folded batch never woke the coordinator"
+    assert not _turn_within(d, clock, starts, 1900, step=20), "a batch the watcher skipped woke at max_s"
+    assert len(asked) == 2, "the folded batch was not asked again after max_s"
+    assert _turn_within(d, clock, starts, 3300, step=20), "a folded batch never woke the coordinator"
+    assert len(asked) == 3
 
 
 def test_waketriage_a_watcher_error_wakes_and_logs_the_model(env, monkeypatch, capsys):
@@ -163,8 +169,8 @@ def test_waketriage_without_a_chat_provider_haiku_holds_routine_events_until_max
     assert len(calls) == 1 and "--model" in calls[0][0] and "low" in calls[0][0]
     assert "task_done happened" in calls[0][1] and "upstream_note happened" in calls[0][1]
     assert p.db.one("SELECT COUNT(*) n FROM ledger WHERE source='haiku:wake_decision'")["n"] == 1
-    assert _turn_within(d, clock, starts, 1300), "a folded batch never woke the coordinator"
-    assert len(calls) == 1
+    assert not _turn_within(d, clock, starts, 1300), "a batch Haiku skipped again woke at max_s"
+    assert len(calls) == 2, "Haiku was not asked again after max_s"
     # A user message wakes at once, without asking.
     p, d, clock, starts, notes = _wg_setup(env, monkeypatch, haiku=True)
     clock[0] += 1000

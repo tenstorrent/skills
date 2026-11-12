@@ -1,9 +1,11 @@
 """Before an event-only coordinator wake, the watcher model decides whether it needs the coordinator now.
 
 The daemon asks babysit.ask(..., target="coordinator") once per set of queued events. "skip" folds the
-batch: no turn starts, the events stay queued on disk and ride the next wake's digest; the same set is
-not asked again, and it wakes without asking once its oldest event is coordinator.wake_triage_max_s old
-(default 1800). A new event changes the set and asks again. "wake" or "flag" wakes as before; the
+batch: no turn starts, the events stay queued on disk and ride the next wake's digest. The same set is
+asked again once its last answer is coordinator.wake_triage_max_s old (default 1800), so a batch with
+nothing to do never forces a turn by age alone; it wakes without asking only once its oldest event is
+coordinator.wake_triage_hold_max_s old (default 14400, never below max_s). A new event changes the set
+and asks again. "wake" or "flag" wakes as before; the
 coordinator's effort tier never changes here. A watcher error Haiku cannot settle wakes and logs the
 model and the error. Off with coordinator.wake_triage false.
 
@@ -25,6 +27,7 @@ from . import babysit, cheapdecide
 
 KEY = "wake_triage"
 MAX_S = 1800.0
+HOLD_MAX_S = 14400.0   # the longest a batch a watcher keeps skipping is held before it wakes regardless
 # The question without its answer form: the chat provider answers babysit's schema line (skip or wake
 # coordinator), Haiku answers ASK's yes or no; a mixed form lets Haiku answer "skip", which ASK cannot read
 EVENTS = ("A batch of project events (below) would wake the project's coordinator, an expensive model run. "
@@ -40,6 +43,14 @@ def max_s(cfg: dict) -> float:
         return max(float((cfg.get("coordinator") or {}).get("wake_triage_max_s", MAX_S)), 0.0)
     except (TypeError, ValueError):
         return MAX_S
+
+
+def hold_max_s(cfg: dict) -> float:
+    try:
+        v = float((cfg.get("coordinator") or {}).get("wake_triage_hold_max_s", HOLD_MAX_S))
+    except (TypeError, ValueError):
+        v = HOLD_MAX_S
+    return max(v, max_s(cfg))
 
 
 PURPOSE = "wake_decision"
@@ -94,10 +105,11 @@ def fold(db, cfg: dict, evs: list[dict], now: float, ask=None, haiku=None) -> tu
     ask = ask or (_haiku_ask(haiku) if fallback else babysit.ask)
     ids = sorted(e["id"] for e in evs)
     seen = db.kv(KEY, {}) or {}
-    if seen.get("ids") == ids and seen.get("verb") == "skip":
-        if now - min(e["ts"] for e in evs) < max_s(cfg):
-            return True, ""
-        return False, f"coordinator wake: events {ids} waited {int(max_s(cfg))} s after a watcher skip, waking"
+    age = now - min(e["ts"] for e in evs)
+    if age >= hold_max_s(cfg):
+        return False, f"coordinator wake: events {ids} held {int(hold_max_s(cfg))} s by watcher skips, waking"
+    if seen.get("ids") == ids and seen.get("verb") == "skip" and now - float(seen.get("at") or 0) < max_s(cfg):
+        return True, ""
     model = ((cheapdecide.settings(cfg) if fallback else babysit.settings(cfg)) or {}).get("model") or "none"
     text, chat_err = state(db, ids), ""
     try:
@@ -113,13 +125,15 @@ def fold(db, cfg: dict, evs: list[dict], now: float, ask=None, haiku=None) -> tu
             return False, (f"coordinator wake triage failed, waking ({chat}, then {model}): {chat_err}; "
                            f"{type(e2).__name__}: {str(e2)[:200]}")
         chat_err = f"; chat model {chat} failed: {chat_err[:200]}"
-    if d["verb"] == "pending":   # Haiku's answer is on its way: wait for it, never past max_s
-        if now - min(e["ts"] for e in evs) < max_s(cfg):
+    if d["verb"] == "pending":   # Haiku's answer is on its way: wait for it, never past max_s after the
+        # oldest event, or after this set's last skip when it is asked again
+        start = max(min(e["ts"] for e in evs), float(seen.get("at") or 0) if seen.get("ids") == ids else 0.0)
+        if now - start < max_s(cfg):
             return True, ""
         return False, f"coordinator wake: events {ids} waited {int(max_s(cfg))} s for the watcher, waking"
     db.set_kv(KEY, {"ids": ids, "verb": d["verb"], "at": now, "model": d.get("model") or model})
     if d["verb"] == "skip":
         return True, (f"coordinator wake folded by the watcher ({d.get('model') or model}{chat_err}): events "
-                      f"{ids} stay queued for the next wake, at most {int(max_s(cfg))} s")
+                      f"{ids} stay queued for the next wake, asked again in {int(max_s(cfg))} s")
     return False, (f"coordinator wake: the watcher ({d.get('model') or model}{chat_err}) says wake"
                    if chat_err else "")
