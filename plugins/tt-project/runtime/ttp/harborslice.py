@@ -14,8 +14,10 @@ HTTP 429 is waited out ("retry after N s", else RETRY_S) and rerun, never scored
 exception before any verifier reward) reruns once, then counts as a fault, not a fail. A model's result
 (score) is {passed, trials, pass_rate, median_min, faults}, booked as suite "terminalbench".
 
-Task names: <modelbench.home()>/harbor-tasks.txt (setting tasks_file), one per line; none there: the public
-DEFAULT_TASKS subset. Settings: model_bench.terminalbench {on, tasks_file, agent, limit_s, concurrency,
+Task names: <modelbench.home()>/harbor-tasks.txt (setting tasks_file), one per line, an optional override;
+none there: the full set of a local dataset folder (setting dataset, each task a folder with task.toml),
+the DEFAULT_TASKS subset first so a partial cycle still compares with earlier subset runs; a registry
+dataset name (no folder): the DEFAULT_TASKS subset only. Settings: model_bench.terminalbench {on, tasks_file, agent, limit_s, concurrency,
 floor_share, dataset} (settings). The older suite slice (`ttp model-bench suite --harbor N`) uses the same
 trial runner. Harbor is installed only into a venv the run owns (`python3 -m venv`, then that venv's pip
 under cellenv.env), never with `pip install --user`; a failed install skips the run with its reason.
@@ -42,7 +44,7 @@ COMMAND = ("harbor run -y -q --dataset {dataset} -a {agent} -m openai/{model} -o
            "-i {task} --ak 'llm_call_kwargs={{\"num_retries\":8}}'")
 RESUME = "harbor job resume -p {job}"
 INSTALL_TIMEOUT_S, TASK_TIMEOUT_S, RETRY_S, CORES_PER_TRIAL, MAX_SLOTS, MAX_RATE_WAITS = 900, 3600, 60, 4, 8, 24
-# A public 20-task subset of Terminal-Bench 2.0, used when the tasks file is missing or empty.
+# A public 20-task subset of Terminal-Bench 2.0: run first in each cycle; alone without a local dataset folder.
 DEFAULT_TASKS = ("adaptive-rejection-sampler", "code-from-image", "count-dataset-tokens", "custom-memory-heap-crash",
                  "db-wal-recovery", "dna-insert", "financial-document-processor", "gcode-to-text", "git-multibranch",
                  "llm-inference-batching-scheduler", "model-extraction-relu-logits", "mteb-retrieve",
@@ -69,7 +71,12 @@ def settings(cfg: dict) -> dict:
 def tasks(home: Path, st: dict) -> list[str]:
     f = home / st["tasks_file"]
     names = [x.strip() for x in f.read_text().splitlines() if x.strip() and not x.startswith("#")] if f.is_file() else []
-    return names or list(DEFAULT_TASKS)
+    if names:
+        return names
+    d = Path(st["dataset"]).expanduser()
+    full = sorted(t.parent.name for t in d.glob("*/task.toml")) if d.is_dir() else []
+    first = [t for t in DEFAULT_TASKS if t in full] if full else list(DEFAULT_TASKS)
+    return first + [t for t in full if t not in first]
 
 
 def slug(s: str) -> str:

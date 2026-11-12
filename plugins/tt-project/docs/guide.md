@@ -1499,8 +1499,10 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    bench and the public index. It decides the verdict: under `floor_share` of the best served model's
    rate parks the model, a pass frees it, and endpoint faults leave it inconclusive. Settings live under
    `model_bench.terminalbench` (`on`, `tasks_file`, `agent`, `limit_s` default 900, `concurrency` 0 =
-   free cores / 4, `floor_share` default 0.5, `dataset` default `terminal-bench@2.0`); with no tasks file a
-   shipped public 20-task subset is used. The adapter is tested with fakes only.
+   free cores / 4, `floor_share` default 0.5, `dataset` default `terminal-bench@2.0`). Point `dataset` at a
+   local Terminal-Bench folder to run its full task set, the shipped public 20-task subset first; a
+   registry name runs only that subset, and a tasks file overrides both. Each model runs one trial at a
+   time. The adapter is tested with fakes only.
    Endpoint faults (down, rate limit, auth) park nothing. With no ranked model served, or the whole endpoint
    cooling down, runs start on the core provider as before. Only `chat` has a served list: Claude
    Code, Codex and Cursor models are not ranked (provider failover covers a provider that cannot start

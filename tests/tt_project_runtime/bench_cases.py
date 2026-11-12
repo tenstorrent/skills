@@ -1003,6 +1003,13 @@ def test_harbor_slice_failed_install_skips_it_without_another_route(env, tmp_pat
     assert len(calls) == 2, "a failed install is never retried"
     (d / harborslice.TASKS).unlink()
     assert harborslice.tasks(d, harborslice.settings({})) == list(harborslice.DEFAULT_TASKS), "no names: the public subset"
+    ds = tmp_path / "tb2"
+    for t in ("zz-extra", harborslice.DEFAULT_TASKS[3], "aa-extra"):
+        (ds / t).mkdir(parents=True)
+        (ds / t / "task.toml").write_text("[agent]\ntimeout_sec = 600\n")
+    st = harborslice.settings({"model_bench": {"terminalbench": {"dataset": str(ds)}}})
+    assert harborslice.tasks(d, st) == [harborslice.DEFAULT_TASKS[3], "aa-extra", "zz-extra"], \
+        "a local dataset: its full set, the subset first"
 
 
 def _fake_trial(cmd, reward=None, exc=None, finished=True):
