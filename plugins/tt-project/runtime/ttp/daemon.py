@@ -6151,9 +6151,7 @@ class Daemon:
                 folder = self.p.state / "receipts"
                 folder.mkdir(parents=True, exist_ok=True)
                 path = folder / f"codex-resume-rebook-{int(time.time())}.json"
-                tmp = path.with_suffix(".tmp")
-                tmp.write_text(json.dumps({"at": time.time(), "runs": receipt}, indent=1) + "\n")
-                os.replace(tmp, path)
+                durable_write(path, json.dumps({"at": time.time(), "runs": receipt}, indent=1) + "\n")
             db.set_kv(CODEX_REBOOK_KEY, {"at": time.time(), "runs": len(changed),
                                          "usd_before": round(sum(c[1] for c in changed), 6),
                                          "usd_after": round(sum(c[2] for c in changed), 6)})
