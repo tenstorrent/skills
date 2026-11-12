@@ -374,10 +374,8 @@ DELETED = "deleted-branches.jsonl"   # each branch delete's tip, kept past prune
 
 
 def _deleted(d: Path, row: dict) -> None:
-    with open(d / DELETED, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(row) + "\n")
-        fh.flush()
-        os.fsync(fh.fileno())
+    from .project import durable_append
+    durable_append(d / DELETED, json.dumps(row) + "\n")
 
 
 def put(results, home=None) -> int:
