@@ -104,12 +104,12 @@ rates explain. It runs on the local machine; no CI is needed.
 | `references` | per suite; see References |
 | `ok_band` | the reference lies inside the score's 95% interval, or the score is above it |
 | `explain_tolerance` | 0.25 (measured wall within ±25% of the explained time) |
-| `stage_budget_hours` | quick 12; agentic 24 (phase 1 ≤ 12); extended +24 |
+| `stage_budget_hours` | quick 12; agentic 24 (phase 1 up to 12, phase 2 the rest); extended +24 |
 | `run_timeout_hours` | 12 per run; extended lists target ≈ 10 h |
 | `usage_budget` | the Codex points this stage may use; the runner reads the account at start |
 | `network` | per task `allow_internet` (Terminal-Bench); SWE agent in main's `no-network` mode with `allow_agent_endpoint` |
 | `limits` | agent and request limits and output cap from the harness reference (never raised) |
-| `decisions` | operator answers, e.g. accepting a failed phase |
+| `decisions` | operator answers to a blocked goal's question, e.g. a reference to use |
 
 Before stage 9 the operator proves the setup: Docker (or the harness's container runtime), gated dataset
 credentials, host RAM and disk for task containers, and the usage budget. A mode or machine change
@@ -131,13 +131,19 @@ phase cannot pass: ask the operator. Record the source next to each score.
 
 ### Phases
 
-- **Phase 1 (`quick`, ≤ 12 h; target run < 5 h):** `phase1`, scored on main's harness on this machine.
-- **Phase 2 (`agentic`, 12 h):** `phase2`, the fixed diverse SWE-bench list, same rule.
+- **Phase 1 (`quick`):** `phase1`, scored on main's harness on this machine, within stage hours 0–12
+  (target run < 5 h).
+- **Phase 2 (`agentic`):** `phase2`, the fixed diverse SWE-bench list, same rule. It starts when phase 1
+  passes or at stage hour 12, whichever comes first, and has the rest of the 24 h. Plan both from the start.
 - A phase **passes** when its score is within `ok_band` of the reference and its wall time is explained:
   explained hours = Σ over model calls (uncached input ÷ prefill rate + output tokens ÷ decode rate per user,
   both from `serving_rates.json` at the run's batch and length) + measured time outside the server, spread
   over the agents. Measured wall within `explain_tolerance` of that passes; otherwise find the gap.
 - **A mode is done when all its phases pass**: release ready for that mode.
+- **Not passed yet:** a phase whose time ends below its band or with unexplained time is a result. Keep its
+  score, interval, reference and per-task analysis as they are, record the reason, and move on; never
+  discard it or call it failing. If phase 2 started after hour 12, REPORT.md says so plainly: the setup or
+  the text was not tested right. Phase timing is reported, not gated.
 - **Extended (+24 h, after agentic passes):** estimate each full suite (198, 500, 89) from the phase runs'
   tokens per task, the rates and the measured tail; do speed work by the Measurement method; then run per
   suite in `extended_suites` the largest list whose projected run fits `run_timeout_hours` with margin
@@ -164,6 +170,8 @@ from the best-known config in `learned.json` for this model or its closest model
   solution (the upstream fix, a later release, the resolving discussion) is a failure and stays in the
   denominator; report how many. Never void a list.
 - **Task resources** come from each task's definition, never a blanket value.
+- **Reasoning:** thinking on or off and the reasoning effort are chosen per suite by Failure analysis.
+  Record the setting with each run and the reference's own setting with the reference.
 - **Harness and route** are main's, unchanged. A real harness defect is fixed on a generic branch named for
   the defect and listed in `learned.json`.
 
@@ -176,12 +184,21 @@ each list and its rule in `results.json` before any score on it.
 
 ### Failure analysis
 
-Every failed or timed-out task gets a row: cause (wrong answer or patch, loop to the cap, malformed tool
-call, cut off while progressing, stalled, infrastructure, fetched solution), evidence (trajectory lines,
-tokens, time) and the rerun result if rerun. Rerun failing tasks individually, never the whole list. A
-rerun changes the score only when the first failure was infrastructure (verifier setup, image pull);
-otherwise it is reported beside the score. Name what a cause would need to fix and whether it is the model,
-the serving stack or the harness.
+This is iteration on the phase's failing tasks inside its time, never growth of the list.
+
+1. Every failed or timed-out task gets a row: cause (wrong answer or patch, loop to the cap, malformed tool
+   call, cut off while progressing, stalled, infrastructure, fetched solution) and evidence (trajectory
+   lines, tokens, time).
+2. Each task that hit the agent or request limit or the output cap is rerun on its own to tell `loop_cap`,
+   `cutoff_progressing` or `stalled`. On those tasks also try thinking on and off and each reasoning effort
+   the server offers; thinking on is not always better. Record each attempt in the row's `rerun.tried`
+   (setting, result, tokens, time).
+3. If another setting does better on those tasks, run the whole list with it as a new run; the phase takes
+   the run that scores best within its time.
+4. A single-task rerun changes the score only when the first failure was infrastructure (verifier setup,
+   image pull); otherwise it is reported beside the score.
+
+Name what each cause would need to fix and whether it is the model, the serving stack or the harness.
 
 ### Runner, usage and sub-agents
 
@@ -198,13 +215,15 @@ before starting.
 In `doc/agentic_evals/`:
 
 - `results.json`: per run `phase`, `suite`, `tasks` (names, list rule), `config` (pool, agents, batch,
-  limits and their source, network mode, SHAs), `score` (`solved`, `n`, `interval_95`), `reference`
-  (`value`, `source`), `band_pass`, `predicted_hours`, `explained_hours`, `measured_hours`, `collected`,
-  and `failures` (one row per failed task, as Failure analysis says); plus `phases` with `pass` per phase.
+  limits and their source, network mode, `reasoning`, SHAs), `score` (`solved`, `n`, `interval_95`),
+  `reference` (`value`, `source`, `reasoning`), `band_pass`, `predicted_hours`, `explained_hours`,
+  `measured_hours`, `collected`, and `failures` (one row per failed task, as Failure analysis says); plus
+  `phases`: per phase `run`, `start_hour`, `pass`, and `reason` when not passed.
 - `runs.json`: the runner's append-only run records.
 - `learned.json`: `best_config` per suite (the config, list size and hours of the best valid run),
   `harness_facts` and `generic_fixes`, for the next model.
-- `REPORT.md`: phases passed or not, scores with intervals against references, hours predicted against
-  measured, the failure analysis, then what remains.
+- `REPORT.md`: each phase passed or not passed yet (with the reason), scores with intervals and reasoning
+  settings against references, hours predicted against measured, a late phase 2 start if any, the per-task
+  analysis, then what remains.
 
 Update `workload` in `agentic_serving.json` with the measured values.
