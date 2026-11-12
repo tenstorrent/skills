@@ -22434,3 +22434,64 @@ def test_the_install_check_reads_its_repository_only_from_a_github_remote(tmp_pa
     assert installcheck.slug(repo, {}) == ""
     rec = installcheck.run(None, repo, "HEAD", tmp_path / "out")
     assert not rec["passed"] and "no commit" in rec["error"]
+
+
+def _held_reply_code(env, monkeypatch, s, review=True):
+    """Code task s.code (reply_chat c1) hands off done; its review (s.review, or none) is the daemon's."""
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage as Usage
+    monkeypatch.setattr(Daemon, "_auto_review",
+                        lambda self, task, summary, add=True: (s.review, True) if review else None)
+    s.p.db.update_task(s.code, status="running", reply_chat="c1")
+    run_dir = env["tmp"] / f"run-code-{time.monotonic_ns()}"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps({"status": "done", "summary": "fixed it",
+                                                     "message": "The relay fix is in."}))
+    d = Daemon(s.p.base)
+    with d.p.db.tx():
+        d._finish_worker({"task": s.code}, Usage(cost_usd=1.0), "ok", run_dir)
+    return s.p.db.task(s.code)
+
+
+def _c1_replies(p):
+    return [m["text"] for m in p.db.q("SELECT text FROM messages WHERE direction='out' AND kind='reply' "
+                                      "AND chat='c1' ORDER BY id")]
+
+
+def test_a_code_reply_is_held_until_its_review_passes_and_the_push_queue_ships_it(env, monkeypatch):
+    """#8518 told its chat "shipped" before its review ran and before anything landed: the done reply
+    of a code task whose review is ahead is held, then posted once with the landing."""
+    from ttp import replymsg
+    from ttp.daemon import Daemon
+    s = _pq(env, monkeypatch)
+    t = _held_reply_code(env, monkeypatch, s)
+    assert t["status"] == "done" and _c1_replies(s.p) == [], "posted before its review and landing"
+    assert json.loads(t["result"])[replymsg.HELD] == "The relay fix is in."
+    sha = "ab" * 20
+    _pq_plan(s, outcome="pushed", sha=sha, tip="cd" * 20, version="0.3.1")
+    _pq_hand_off(env, s)
+    assert _c1_replies(s.p) == [], "posted at approval, before the push"
+    s.p.db.set_kv("last_coordinator_turn", time.time())
+    d = Daemon(s.p.base)
+    assert _run_until(d, s.p, lambda: s.p.db.task(s.review)["status"] == "done" and not s.p.db.one(
+        "SELECT id FROM push_batches WHERE after_finalized IS NULL"), timeout=60)
+    assert _c1_replies(s.p) == [f"The relay fix is in. (shipped by review #{s.review}: pushed {sha[:7]} as 0.3.1 "
+                                f"to origin/proj)"]
+    assert replymsg.HELD not in json.loads(s.p.db.task(s.code)["result"])
+    d.tick()
+    assert len(_c1_replies(s.p)) == 1, "posted twice"
+
+
+def test_a_held_code_reply_posts_nothing_when_its_review_fails(env, monkeypatch):
+    s = _pq(env, monkeypatch)
+    _held_reply_code(env, monkeypatch, s)
+    t = _pq_hand_off(env, s, push=False, status="failed", summary="the relay drops its listener")
+    assert t["status"] == "failed" and _c1_replies(s.p) == []
+
+
+def test_a_code_reply_with_no_review_ahead_posts_at_its_hand_off(env, monkeypatch):
+    from ttp import replymsg
+    s = _pq(env, monkeypatch)
+    t = _held_reply_code(env, monkeypatch, s, review=False)
+    assert _c1_replies(s.p) == ["The relay fix is in."]
+    assert replymsg.HELD not in json.loads(t["result"])

@@ -14,6 +14,9 @@ from __future__ import annotations
 import re
 
 FIELD = "message"
+# A code task's done reply held until its review passes and the push queue ships it (pushq.post_held):
+# the chat never hears "shipped" while the review and landing are still ahead.
+HELD = "reply_held"
 
 # Phrases of a run describing its own delivery, not delivering. Narrow on purpose: each names the
 # reply itself as an object ("them as the message", "the steps to the user", "is above"), never a

@@ -8564,15 +8564,20 @@ class Daemon:
                                 f"{', '.join(f'#{i}' for i in marked)} recorded as superseded by it")
             except Exception as e:   # a miss never stops the hand-off
                 log(self.p, f"review {task['id']}: earlier reviews not marked superseded: {e}")
+        reply_text = None   # a code change's done reply, posted or held once its review is known
         if task["reply_chat"] and new in ("done", "failed", "blocked"):
             text = db.for_user(replymsg.text(result) if new == "done" else f"(task #{task['id']} {outcome}) {summary}")
             need = db.for_user(upd.get("blocked_reason")) if new == "blocked" else None
             if need and need not in summary:
                 text += f"\nNeeds from you: {need}"
             # The chat's status pace (chatdigest.handoff): at once only when owed or the user must act.
+            # A code change's done reply waits for the review decision below (_hold_reply).
             from . import chatdigest
-            chatdigest.handoff(db, self.cfg, task, new, msgparts.cut(
-                text, f"task #{task['id']}'s hand-off (`ttp task {self.p.name} show {task['id']}`)"))
+            if new == "done" and self._code_change(task):
+                reply_text = text
+            else:
+                chatdigest.handoff(db, self.cfg, task, new, msgparts.cut(
+                    text, f"task #{task['id']}'s hand-off (`ttp task {self.p.name} show {task['id']}`)"))
         sev = "high" if new == "blocked" else "normal"
         fups = result.get("followups") if isinstance(result, dict) else None
         fups = [f for f in fups if isinstance(f, dict) and f.get("title")] if isinstance(fups, list) else []
@@ -8687,11 +8692,14 @@ class Daemon:
             db.update_task(r["id"], status="blocked", blocked_reason=why)
             text += f"\nRe-review #{r['id']} blocked: {why}. Requeue a fix, or cancel the re-review."
             log(self.p, f"task {task['id']}: re-review {r['id']} blocked, the fix added no commits")
+        known = db.task(review[0]) if review and not review[1] else None
         if review:
-            known = None if review[1] else db.task(review[0])
             text += f"\nReview #{review[0]} " + ("queued by the daemon." if review[1] else
                                                  "already accepted this head: no new review." if known and
                                                  known["status"] == "done" else "was already queued.")
+        if reply_text is not None:
+            self._hold_reply(task, reply_text, bool(
+                split or resplit or unread or review and (review[1] or not known or known["status"] != "done")))
         # A review that failed with fix specs gets its fix and re-review from the daemon, and what waited
         # on it waits on the re-review instead of being blocked. A failure without them still blocks.
         # Upstream notes (also those rerouted to this project) and deferred follow-ups are not fixes:
@@ -20603,6 +20611,23 @@ class Daemon:
             return ""
         log(self.p, f"task {task['id']}: split at {head[:12]}: no review until its last continue hop finishes")
         return head
+
+    def _hold_reply(self, task: dict, text: str, ahead: bool) -> None:
+        """Post code task `task`'s done reply `text`, or, with its review or landing still `ahead` (a review
+        queued or open, a split hop, a review deferred or a split order), hold it in its result
+        (replymsg.HELD): the push queue posts it once, with the landing, after a covering review passes and
+        its change is pushed or landed (pushq.post_held). A failed review or a refused push posts nothing."""
+        db = self.p.db
+        from . import chatdigest
+        if not ahead:
+            chatdigest.handoff(db, self.cfg, task, "done", msgparts.cut(
+                text, f"task #{task['id']}'s hand-off (`ttp task {self.p.name} show {task['id']}`)"))
+            return
+        row = db.task(task["id"]) or task
+        stored = load_result(row.get("result"))
+        stored = stored if isinstance(stored, dict) else {}
+        db.update_task(task["id"], result=dump_result({**stored, replymsg.HELD: text}))
+        log(self.p, f"task {task['id']}: its chat reply is held until its review passes and the change lands")
 
     def _split_back(self, task: dict, result, attempts: int) -> str:
         """splitgate at the hand-off of task `task` (its row before this hand-off; `result` the new one):

@@ -520,6 +520,29 @@ def _reply(db, task: dict, new: str, text: str, need: str | None = None) -> None
     chatdigest.handoff(db, None, task, new, msgparts.cut(text, f"task #{task['id']}'s hand-off"))
 
 
+def post_held(db, ids, tail: str) -> list[int]:
+    """Post once, with the landing `tail`, the chat reply each done task in `ids` held at its hand-off
+    (replymsg.HELD, Daemon._hold_reply): its covering review passed and the change was pushed or landed.
+    The held text is cleared in the same transaction, so it never posts twice. The ids posted."""
+    out = []
+    for i in sorted(ids):
+        t = db.task(i)
+        if not t or t["status"] != "done" or not t["reply_chat"]:
+            continue
+        prev = load_result(t["result"])
+        held = prev.get(replymsg.HELD) if isinstance(prev, dict) else None
+        if not isinstance(held, str):
+            continue
+        prev.pop(replymsg.HELD)
+        with db.tx():
+            db.update_task(i, result=dump_result(prev))
+            if held.strip():
+                chatdigest.handoff(db, None, t, "done", msgparts.cut(f"{held.rstrip()} ({tail})",
+                                                                     f"task #{i}'s hand-off"))
+                out.append(i)
+    return out
+
+
 def _done_text(prev: dict, summary: str, tail: str) -> str:
     """A landed task's reply: its hand-off's `message` (replymsg) with how it landed, else its summary."""
     msg = prev.get(replymsg.FIELD)
@@ -2470,7 +2493,9 @@ def _settle(p: Project, tid: int, b: dict, m: dict, now: float) -> None:
         _event(db, task, "task_done", f"#{tid} {task['title']} → done ({tail}, batch {b['id']}): {summary[:1200]}",
                queued=False)
         _reply(db, task, "done", _done_text(prev, result["summary"], tail))
-        settle_reviewed(db, now, only=_covers(db, task, rows))
+        covered = _covers(db, task, rows)
+        settle_reviewed(db, now, only=covered)
+        post_held(db, covered, f"shipped by review #{tid}: {tail}")
     # else: some of its rows are still approved or batched; it keeps waiting.
 
 
@@ -2636,6 +2661,7 @@ def settle_reviewed(db, now: float | None = None, only: set[int] | None = None) 
                   "shipped_by": latest["id"],
                   "pushed": [{"branch": x["branch"], "head": x["head"], "sha": x["pushed_sha"], "version": x["version"],
                               "batch": x["batch"], "status": x["status"]} for x in shipped]}
+        result.pop(replymsg.HELD, None)   # its reply below is the one post: a held one never follows it
         with db.tx():
             if not db.conn.execute("UPDATE tasks SET status='done', blocked_reason=NULL, result=?, updated=? "
                                    "WHERE id=? AND status='review'", (dump_result(result), now, t["id"])).rowcount:
