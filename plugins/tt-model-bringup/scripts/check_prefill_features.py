@@ -6,7 +6,14 @@ The full-model stage records whether the generator supports prefix caching in
 resumed-prefill check, the served ``prefix_cache`` check, the run summary, and
 the ``prefill_burst`` benchmark under ``readiness`` and ``readiness_vllm``.
 This runner-side gate checks that the evidence exists, passed, and agrees with
-the declared capability. Exit 0 pass, 1 advisory, 2 critical, 3 error.
+the declared capability.
+
+Batched prefill is optional (D5): the burst TTFT ratio is measured and recorded,
+and a missing burst artifact or a ratio above the limits is advisory at both
+stages unless ``--burst-critical`` is passed. Correctness stays critical: an
+incomplete burst, a burst arm measured on a warm prefix cache, and, when the
+serving contract declares ``batched_prefill`` supported, missing batched-equals-solo
+evidence. Exit 0 pass, 1 advisory, 2 critical, 3 error.
 """
 
 from __future__ import annotations
@@ -168,9 +175,26 @@ def check_prefix_cache(model_dir: Path, row: dict, critical: list[str], advisory
             )
 
 
+def check_batched_prefill(model_dir: Path, contract: dict, critical: list[str]) -> None:
+    """When batched prefill is enabled, its batched-equals-solo evidence must exist."""
+    rows = contract.get("rows") if isinstance(contract.get("rows"), list) else []
+    row = next((r for r in rows if isinstance(r, dict) and r.get("item") == "batched_prefill"), None)
+    if row is None or row.get("status") != "supported":
+        return
+    evidence = row.get("evidence")
+    if not isinstance(evidence, str) or not evidence.strip():
+        critical.append("batched_prefill is supported but names no batched-equals-solo evidence")
+        return
+    if not any((base / evidence).exists() for base in (model_dir, Path.cwd())):
+        critical.append(
+            f"batched_prefill is supported but its batched-equals-solo evidence {evidence} does not exist; "
+            "run the acceptance in prefill-features.md or switch batched prefill off and mark the row not_supported"
+        )
+
+
 def check_burst(
     model_dir: Path,
-    require: bool,
+    burst_critical: bool,
     ratio_max: float,
     mean_ratio_max: float,
     critical: list[str],
@@ -178,7 +202,7 @@ def check_burst(
 ) -> None:
     burst_path = model_dir / BURST_PATH
     burst = load_json(burst_path)
-    sink = critical if require else advisory
+    sink = critical if burst_critical else advisory
     if burst is None:
         sink.append(f"{BURST_PATH} is missing; run the prefill_burst stage")
         return
@@ -223,7 +247,7 @@ def check_burst(
             sink.append(f"prefill burst {label} TTFT ratio {ratio:.3f} exceeds {limit}; batched prefill did not deliver")
 
 
-def run(model_dir: Path, *, stage: str, require_burst: bool, ratio_max: float, mean_ratio_max: float) -> int:
+def run(model_dir: Path, *, stage: str, burst_critical: bool, ratio_max: float, mean_ratio_max: float) -> int:
     contract = load_json(model_dir / CONTRACT_PATH)
     if contract is None:
         raise CheckError(f"Missing serving contract {model_dir / CONTRACT_PATH}")
@@ -260,7 +284,8 @@ def run(model_dir: Path, *, stage: str, require_burst: bool, ratio_max: float, m
     else:
         check_prefix_cache(model_dir, row, critical, advisory)
 
-    check_burst(model_dir, require_burst, ratio_max, mean_ratio_max, critical, advisory)
+    check_batched_prefill(model_dir, contract, critical)
+    check_burst(model_dir, burst_critical, ratio_max, mean_ratio_max, critical, advisory)
 
     for line in critical:
         print(f"critical: {line}", file=sys.stderr)
@@ -286,7 +311,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--model-dir", default=None)
     parser.add_argument("--hf-model", default=None)
     parser.add_argument("--stage", choices=("vllm", "optimized-vllm"), default="vllm")
-    parser.add_argument("--require-burst", action="store_true", help="Treat a missing or failed prefill burst as critical.")
+    parser.add_argument(
+        "--require-burst",
+        action="store_true",
+        help="Accepted for older check scripts. The burst stays advisory unless --burst-critical is passed.",
+    )
+    parser.add_argument(
+        "--burst-critical",
+        action="store_true",
+        help="Treat a missing burst artifact or a failed burst ratio as critical (the pre-D5 Stage 10 rule).",
+    )
     parser.add_argument("--burst-ttft-ratio-max", type=float, default=DEFAULT_BURST_TTFT_RATIO_MAX)
     parser.add_argument("--burst-ttft-mean-ratio-max", type=float, default=DEFAULT_BURST_TTFT_MEAN_RATIO_MAX)
     args = parser.parse_args(argv)
@@ -295,7 +329,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return run(
             model_dir,
             stage=args.stage,
-            require_burst=args.require_burst,
+            burst_critical=args.burst_critical,
             ratio_max=args.burst_ttft_ratio_max,
             mean_ratio_max=args.burst_ttft_mean_ratio_max,
         )

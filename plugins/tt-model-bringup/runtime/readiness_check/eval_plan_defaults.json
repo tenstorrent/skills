@@ -1,0 +1,11 @@
+{
+  "note": "Planning defaults, not measurements. Replace questions, typical_answer_tokens and max_output_tokens with the model's release eval plan (TTI model spec) and the answer lengths stage 11 or the model card report. typical_answer_tokens is a mean, not the cap.",
+  "ci_cap_hours": {"job": 18, "nightly": 12},
+  "fit_fraction": 0.8,
+  "concurrency": 32,
+  "evals": [
+    {"name": "gpqa_diamond", "questions": 198, "repeats": 1, "typical_answer_tokens": 12000, "max_output_tokens": 32768},
+    {"name": "mmlu_pro_subset", "questions": 280, "repeats": 1, "typical_answer_tokens": 3000, "max_output_tokens": 16384},
+    {"name": "ifeval", "questions": 541, "repeats": 1, "typical_answer_tokens": 1500, "max_output_tokens": 8192}
+  ]
+}
