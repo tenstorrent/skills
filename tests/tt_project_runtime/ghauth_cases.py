@@ -463,6 +463,52 @@ def test_ci_wait_with_no_route_reads_public_api_and_the_alert_claims_no_public_p
     assert "not read" in alert and "public reads only" not in alert, alert
 
 
+def _push_url(argv: list, remote: str = "origin") -> str:
+    """Where `argv` (a `git ... push <remote> ...` line) pushes: its global options on
+    `git remote get-url --push`, which applies pushurl and pushInsteadOf as the push does."""
+    i = argv.index("push")
+    r = subprocess.run([*argv[:i], "remote", "get-url", "--push", remote], capture_output=True, text=True)
+    return r.stdout.strip()
+
+
+def test_push_over_ssh_survives_a_global_reverse_push_rewrite(env, monkeypatch):
+    """No https login here and a global url.https://github.com/.pushInsteadOf=git@github.com: rule (it
+    sends ssh pushes over https): an ssh-stored remote used to resolve to https, since pushInsteadOf
+    rules do not chain; push_argv now pins each GitHub remote's ssh form as its pushurl on the command
+    line, for an https-stored remote too, and leaves a logged-in host's push and every config file as
+    they were."""
+    from ttp import ghroute
+    _ssh, _gh, repo = _no_login_here(env, monkeypatch)
+    gitconfig = env["tmp"] / "gitconfig-reverse"
+    subprocess.run(["git", "config", "--file", str(gitconfig), "url.https://github.com/.pushInsteadOf",
+                    "git@github.com:"], check=True)
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(gitconfig))
+    git = lambda *a: subprocess.run(["git", "-C", str(repo), *a], check=True)
+    git("remote", "add", "ssh-stored", "git@github.com:acme/gadgets.git")
+    git("remote", "add", "pinned", "https://github.com/acme/pinned.git")
+    git("config", "remote.pinned.pushurl", "git@github.com:acme/pinned-push.git")
+    git("remote", "add", "elsewhere", "https://example.com/acme/other.git")
+    before_cfg = (gitconfig.read_text(), (repo / ".git" / "config").read_text())
+    old = lambda r: ["git", "-c", "url.git@github.com:.pushInsteadOf=https://github.com/", "-C", str(repo), "push", r, "main"]
+    assert _push_url(old("ssh-stored"), "ssh-stored") == "https://github.com/acme/gadgets.git", "the fault reproduces"
+    ssh = ghroute.push_argv(["git", "-C", str(repo), "push", "ssh-stored", "main"])
+    assert "remote.ssh-stored.pushurl=git@github.com:acme/gadgets.git" in ssh, ssh
+    assert _push_url(ssh, "ssh-stored") == "git@github.com:acme/gadgets.git"
+    https = ghroute.push_argv(["git", "-C", str(repo), "push", "origin", "main"])
+    assert _push_url(old("origin")) == "git@github.com:acme/widgets.git"
+    assert _push_url(https) == "git@github.com:acme/widgets.git"
+    # a remote with its own pushurl keeps it alone (no second push URL); a non-GitHub remote is untouched
+    assert not any("remote.pinned." in a or "remote.elsewhere." in a for a in https), https
+    assert _push_url(https, "pinned") == "git@github.com:acme/pinned-push.git"
+    assert _push_url(https, "elsewhere") == "https://example.com/acme/other.git"
+    assert "url.git@github.com:.pushInsteadOf=https://github.com/" in https, "a push naming a URL keeps the rule"
+    assert (gitconfig.read_text(), (repo / ".git" / "config").read_text()) == before_cfg, "a config file was written"
+    # a logged-in host pushes as it is
+    monkeypatch.setattr(ghroute, "_https_login", lambda repo: True)
+    argv = ["git", "-C", str(repo), "push", "ssh-stored", "main"]
+    assert ghroute.push_argv(argv) == argv
+
+
 def test_ask_gate_refuses_a_gh_login_ask_on_a_remote_host(env):
     """No GitHub login is kept on lab hosts: an ask or notify telling the user to log gh in there is
     refused, naming the route setting; one about the user's own machine, or another tool, is not."""

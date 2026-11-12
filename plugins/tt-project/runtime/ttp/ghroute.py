@@ -11,8 +11,9 @@ or token is kept. Nobody is ever asked to log gh in there.
   without a login (public); a write is held with HELD_RC, for its caller to retry once the route is
   back (held); other reads fail as before.
 - A push to an https GitHub remote with no https login here goes over its ssh form
-  (git@github.com:<owner>/<repo>.git) with the forwarded ssh agent: a `-c url...pushInsteadOf` on
-  the git command line (push_argv), never an edit of the stored remote.
+  (git@github.com:<owner>/<repo>.git) with the forwarded ssh agent: `-c remote.<name>.pushurl` for each
+  GitHub remote, and a `-c url...pushInsteadOf` for a URL, on the git command line (push_argv), never
+  an edit of the stored remote.
 - The ask and notify gates refuse a text telling the user to log gh in on a remote host (login_ask).
 """
 from __future__ import annotations
@@ -360,7 +361,40 @@ def push_argv(argv: list | tuple, cwd: str | None = None) -> list | tuple:
     repo = next((str(argv[i + 1]) for i, a in enumerate(argv[:-1]) if a == "-C"), cwd)
     if _https_login(repo):
         return argv
-    return [argv[0], "-c", "url.git@github.com:.pushInsteadOf=https://github.com/", *argv[1:]]
+    # A remote with no pushurl gets its ssh form as one on this command line: an explicit pushurl skips
+    # pushInsteadOf, so a global reverse rule (url.https://github.com/.pushInsteadOf=git@github.com:)
+    # cannot turn it back to https. The rule stays for a push naming a URL.
+    pins = [x for name, url in _github_remotes(repo) for x in ("-c", f"remote.{name}.pushurl={url}")]
+    return [argv[0], "-c", "url.git@github.com:.pushInsteadOf=https://github.com/", *pins, *argv[1:]]
+
+
+_GH_URL_RE = re.compile(r"^(?:https://(?:[^@/]+@)?github\.com/|ssh://git@github\.com/|git@github\.com:)"
+                        r"([^/\s]+/[^/\s]+)$")
+
+
+def _github_remotes(repo: str | None) -> list[tuple[str, str]]:
+    """(name, ssh form) of each remote at `repo` whose stored URL is a GitHub repo (https or ssh form)
+    and that has no pushurl of its own (git would add a second push URL beside it)."""
+    try:
+        r = subprocess.run(["git", *(["-C", repo] if repo else []), "config", "--get-regexp",
+                            r"^remote\..*\.(url|pushurl)$"], capture_output=True, text=True,
+                           timeout=10, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    urls, pushed = {}, set()
+    for line in r.stdout.splitlines():
+        key, _, val = line.partition(" ")
+        name, _, field = key[len("remote."):].rpartition(".")
+        if field == "pushurl":
+            pushed.add(name)
+        elif name not in urls:
+            urls[name] = val.strip()
+    out = []
+    for name, url in urls.items():
+        m = _GH_URL_RE.match(url)
+        if m and name not in pushed:
+            out.append((name, f"git@github.com:{m.group(1)}"))
+    return out
 
 
 def push_hint(err: str) -> str:
