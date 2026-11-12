@@ -14217,7 +14217,7 @@ def test_a_code_tasks_run_never_pushes_to_the_push_branch_while_code_tasks_may_p
             assert _ttp(*args) == 2, args
             assert ("delivery.code_tasks_may_push is off" if mode is False else "no independent review approved HEAD") \
                 in capsys.readouterr().err, args
-            monkeypatch.delenv(push.LAND_ENV, raising=False)   # cmd_push sets it in os.environ
+            monkeypatch.delenv(push.LAND_ENV, raising=False)   # cmd_push puts it back itself
     assert not (p.state / "pushes").exists() and _git_out(origin, "rev-parse", "proj") == shared
     p.set_config("delivery.code_tasks_may_push", False)
     # A raw `git push` in the run goes through the harness's bin/git, first on the run's PATH.
@@ -21798,7 +21798,7 @@ def test_land_needs_a_passed_review_of_exactly_head_where_delivery_wants_review(
         assert _ttp(*args) == 2, args
         err = capsys.readouterr().err
         assert "needs a passed review of this exact commit" in err and "delivery.review_before_pr or delivery.push_branch" in err, err
-        monkeypatch.delenv(push.LAND_ENV, raising=False)   # cmd_push sets it in os.environ
+        monkeypatch.delenv(push.LAND_ENV, raising=False)   # cmd_push puts it back itself
     assert not (p.state / "pushes").exists() and _git_out(origin, "rev-parse", "proj") == shared
     # A passed review records the head it accepted (daemon._mark_verified): that exact head may land.
     old = _git_out(repo, "rev-parse", "HEAD")
@@ -21829,7 +21829,7 @@ def test_land_needs_a_passed_review_of_exactly_head_where_delivery_wants_review(
     verified.record(p.db, tid, "review", head, review=review)
     monkeypatch.delenv(push.LAND_ENV)
     assert _ttp("push", "--land") == 0 and _git_out(origin, "rev-parse", "proj") == head
-    monkeypatch.delenv(push.LAND_ENV, raising=False)
+    assert push.LAND_ENV not in os.environ   # the flag never outlives its call: a later push in this process is plain
 
 
 def test_push_cancel_stops_the_tasks_own_running_push_and_lands_nothing(env, monkeypatch, capsys):

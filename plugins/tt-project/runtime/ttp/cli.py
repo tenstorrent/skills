@@ -3200,6 +3200,18 @@ def cmd_push(a) -> None:
     from . import push
     if a.result:
         sys.exit(push.result(Path(a.result), pushed_only=a.pushed))
+    kept = {k: os.environ.get(k) for k in (push.OWN_BRANCH_ENV, push.LAND_ENV)}
+    try:
+        _cmd_push(a, push)
+    finally:   # the flags reach this call and its detached child only, never a later call in this process
+        for k, v in kept.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def _cmd_push(a, push) -> None:
     from . import coordtools
     coord = coordtools.coordinator_run() and not (a.queue or a.stop or a.cancel or a.stop_batch or (a.free and not a.move_tag))
     if coord and (a.move_tag or a.own or a.own_branch or a.batch):
