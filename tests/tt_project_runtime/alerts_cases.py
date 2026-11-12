@@ -5481,9 +5481,9 @@ def test_ack_closes_an_alert_with_no_condition_key_by_the_id_status_shows(env, t
         alerts.ack(p.db, ask, "x", now + 3)
 
 
-def test_a_user_stage_machine_change_page_reaches_only_its_makers_chat(env):
-    """A machine-change page is claimed only by its target project's daemon; once the chain is used up, the
-    user page goes to the chat of the project that made the entry, never a co-tenant's on the same host."""
+def test_a_machine_change_left_past_its_chain_is_repaged_to_its_maker_never_a_chat(env):
+    """Once its chain is used up, an expired change goes back to the last project in it once a day as a
+    coordinator event (claimed only by that project's daemon); no chat on the host gets an alert."""
     from ttp import machine_ledger as ml
     from ttp import machines as mm
     from ttp.daemon import Daemon
@@ -5498,24 +5498,24 @@ def test_a_user_stage_machine_change_page_reaches_only_its_makers_chat(env):
     first = ml.route(t1, able=ok, claimer="proj-a")
     assert [x["target"] for x in first] == ["proj-a"]
     ml.delivered(first[0])
-    assert ml.route(now - 30, able=ok, claimer="proj-b") == [], "a user page of proj-a's entry"
+    assert ml.route(now - 30, able=ok, claimer="proj-b") == [], "proj-a's repeat"
     Daemon(b.base).route_machines(every_s=0)   # the co-tenant's own tick: nothing reaches its chat
-    assert not b.db.one("SELECT id FROM messages WHERE kind='alert' AND text LIKE 'A risky machine change%'")
     pages = ml.route(now - 30 + ml.CLAIM_S, able=ok, claimer="proj-a")
-    assert [x["target"] for x in pages] == [ml.USER]
+    assert [x["target"] for x in pages] == ["proj-a"] and pages[0]["fp"].endswith("/r1"), pages
+    assert pages[0]["severity"] == "high"   # risky and left a day
     assert Daemon(a.base)._machine_page(pages[0], now)
     ml.delivered(pages[0])
-    got = a.db.one("SELECT text FROM messages WHERE kind='alert' AND text LIKE 'A risky machine change%#1 %'")
-    assert got and "box-1" in got["text"], got
-    assert not b.db.one("SELECT id FROM messages WHERE kind='alert' AND text LIKE 'A risky machine change%'")
+    ev = a.db.q("SELECT fingerprint, severity FROM events WHERE kind='machine_change_overdue' ORDER BY id")
+    assert [e["fingerprint"] for e in ev][-1].endswith("/r1") and ev[-1]["severity"] == "high", ev
+    for proj in (a, b):
+        assert not proj.db.one("SELECT id FROM messages WHERE kind IN ('alert','ask') AND text LIKE '%machine change%'")
 
 
-def test_an_orphan_user_machine_page_reaches_no_unrelated_chat_and_shows_in_status(env):
-    """A user page whose maker, recovery owner and fallback are none of this host's projects goes only to a
-    project whose charter lists the machine; with none, it is logged once and listed in `ttp status`."""
+def test_a_machine_change_whose_projects_are_elsewhere_alerts_no_chat_here(env):
+    """An expired change whose maker, recovery owner and fallback are none of this host's projects keeps
+    being relayed to them, once a day at most; no chat here gets an alert, a listing project's neither."""
     from ttp import machine_ledger as ml
     from ttp import machines as mm
-    from ttp.cli import status_text
     from ttp.daemon import Daemon
     b, c = make(env, "proj-b"), _second_project(env, "proj-c")
     mm.add("box-1", tags="device")
@@ -5527,17 +5527,14 @@ def test_an_orphan_user_machine_page_reaches_no_unrelated_chat_and_shows_in_stat
         got = ml.route(now - (3 - i) * (ml.REPAGE_S + 60), able=ok, claimer="proj-b")
         assert [x["target"] for x in got] == [who]
         ml.delivered(got[0])
-    said: list[str] = []
-    assert ml.route(now - 60, able=ok, claimer="proj-b", lists=lambda a: False, log=said.append) == []
-    assert ml.route(now - 60 + ml.CLAIM_S, able=ok, claimer="proj-b", log=said.append) == []
-    assert len(said) == 1 and "proj-x, proj-y not registered on this host" in said[0], said
-    Daemon(b.base).route_machines(every_s=0)   # proj-b's charter does not list box-1
-    assert not b.db.one("SELECT id FROM messages WHERE kind='alert' AND text LIKE 'A risky machine change%'")
-    assert "undelivered machine page (no project here may deliver it" in status_text(b)
+    got = ml.route(now - 60, able=ok, claimer="proj-b")
+    assert [x["target"] for x in got] == ["proj-y"], "the last project again, not the user"
+    ml.delivered(got[0])
+    assert ml.route(now, able=ok, claimer="proj-b") == [], "at most once a day"
     c.set_config("machines.allowed", ["box-1"])
-    Daemon(c.base).route_machines(every_s=0)   # a project whose config lists the machine may deliver it
-    got = c.db.one("SELECT text FROM messages WHERE kind='alert' AND text LIKE 'A risky machine change%#1 %'")
-    assert got, "the listing project's chat gets it"
+    for proj in (b, c):
+        Daemon(proj.base).route_machines(every_s=0)
+        assert not proj.db.one("SELECT id FROM messages WHERE kind='alert' AND text LIKE '%machine change%'")
     assert ml.orphan_lines() == []
 
 

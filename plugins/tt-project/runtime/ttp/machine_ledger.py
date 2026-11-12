@@ -48,8 +48,10 @@ project's open entries whose task is over (task_lines). An overdue entry pages t
 when that project is gone or paused, GONE_OR_PAUSED), then the machine's owner, then its fallback, each after the
 one before cannot act for UNAVAILABLE_S or let REPAGE_S pass. A project's overdue entries reach its coordinator as
 one item (batches, batch_text: each entry's what, undo and age with the renew, close or undo choices), which it
-decides without the user's word. The user is paged only for a risky entry (change_risk) nobody renewed, closed or
-undid for USER_AFTER_S since its first page; a harmless one stays with the last project in its chain. While its machine is in a known outage, held machine-wide or has a resource paused by the user
+decides without the user's word. An entry is never paged to the user while a project is in its chain: the last
+project in it is paged again once a day while the entry stays open (a new fingerprint per repeat), high once a
+risky entry (change_risk) has been open USER_AFTER_S since its first page, and its coordinator asks the user
+itself only if it cannot decide. Only an entry no project could ever take reaches the user. While its machine is in a known outage, held machine-wide or has a resource paused by the user
 or for every project (change_quiet, quiet_reason's cross-project reasons), the project that made it still gets
 its first page, but nothing escalates past it; the page records the reason (`quiet`), and once it ends the
 steps resume from that moment. Unlike a condition's page, an overdue entry's page is normal: high only on a live serving machine
@@ -163,15 +165,15 @@ CLAIM_S = 120               # a pending page one daemon took and did not mark de
 UNAVAILABLE_S = 1800         # a target that cannot act this long is passed over
 REPAGE_S = 86400             # an item still open this long after its page is paged again, one step on
 RENEW_LEAD_S = 600           # an own entry this close to expiry may be renewed (Probes._renew)
-USER_AFTER_S = 86400         # an expired change reaches the user only once unhandled this long, and only when risky
+USER_AFTER_S = 86400         # a risky expired change still open this long after its first page is re-paged high
 
-# Risk rule for an expired change record (change_risk): only a risky one ever reaches the user, and only after its
-# projects left it USER_AFTER_S. Risky: its text or undo names a stopped or disabled service or recovery switch, a
+# Risk rule for an expired change record (change_risk): a risky one's daily re-page to its last project is high once
+# its projects left it USER_AFTER_S (it never goes to the user's chat). Risky: its text or undo names a stopped or disabled service or recovery switch, a
 # pause, a reservation or drain, firewall, network, ssh or credential matters, mounts, kernel or driver settings
 # (_RISKY_RE; a dotted unit name such as x.service counts), or its undo starts, enables, restarts or reloads a
 # service (_UNDO_RISKY_RE); a change on a live serving machine
 # (pagesev.serving_machine); and an unclassified change (neither list matches) on a machine whose recovery owner
-# or fallback is another project. Harmless, never paged to the user: a no-op undo, and test or scratch dirs, helper
+# or fallback is another project. Harmless, re-paged at its usual severity: a no-op undo, and test or scratch dirs, helper
 # scripts, soak runs and restarts, logs, caches, worktrees and ledger edits (_HARMLESS_RE) on a machine that
 # serves nothing. A risky word wins over a harmless one.
 _RISKY_RE = re.compile(
@@ -851,8 +853,8 @@ AUTO_CLOSE = "auto-close"   # closed_by of an entry route closed itself: f"{AUTO
 
 
 def change_risk(c: dict, m: dict | None = None) -> str:
-    """Why expired change `c` is risky enough to reach the user once unhandled USER_AFTER_S ("" when harmless:
-    it never does); the rule is above _RISKY_RE. `m`: its machines.json entry (read when None)."""
+    """Why expired change `c` is risky enough that its daily re-page turns high once unhandled USER_AFTER_S
+    ("" when harmless); the rule is above _RISKY_RE. `m`: its machines.json entry (read when None)."""
     if noop_undo(c.get("undo")):
         return ""
     m = (machines.load().get(c.get("alias")) or {}) if m is None else m
@@ -1701,30 +1703,46 @@ def route(now: float | None = None, able: Callable[[str], tuple[bool, str]] | No
             if page.pop("quiet", None) is not None and "stage" in page:
                 page.update(at=now)   # the steps resume from now, not from the page before the pause
                 page.pop("unable_since", None)
-            m_entry = machines.load().get(c["alias"]) or {}
-            risk = change_risk(c, m_entry)
-            target = _step(page, makers, now, able,
-                           to_user=lambda: bool(risk) and now - float(page["first"]) >= USER_AFTER_S)
+            if makers and "stage" in page and int(page["stage"]) >= len(makers):
+                # paged to the user by an older release: back to its last project, re-paged now
+                page.update(stage=len(makers) - 1, at=now - REPAGE_S)
+                if (page.get("pending") or {}).get("target") == USER:
+                    page.pop("pending")
+            # Never to the user while a project is in its chain: its coordinator decides (asking the user
+            # itself only if it cannot); the user hears of it only when no project could ever take it.
+            target = _step(page, makers, now, able, to_user=lambda: not makers)
+            repeat = int(page.get("repeat") or 0)
+            if target is None and makers and "stage" in page and int(page["stage"]) == len(makers) - 1 \
+                    and now - float(page["at"]) >= REPAGE_S:
+                # still open a day on: its last project hears again, at most once a day
+                repeat += 1
+                page.update(at=now, repeat=repeat)
+                target = makers[-1]
             gave_up = c.get("auto_undo_failed") or {}
             if target:
                 episode = float(c.get("page_from") or c["added"])
                 line = expired_line(c, now, late, gave_up)
                 if target == USER:
-                    from . import outagemsg
-                    text = (f"A risky machine change has had no answer for "
-                            f"{outagemsg.duration(now - float(page['first']))} ({risk}): {line} "
-                            f"Its projects ({', '.join(makers) or 'none'}) did not renew, close or undo it.")
+                    text = (f"An expired machine change has no project to decide it: {line} Renew, close or undo it, "
+                            f"or name a recovery owner (`ttp machines set {c['alias']} --owner <project>`).")
                 else:
-                    text = (f"Expired machine change ({late}): {line} {CHANGE_CHOICES} Decide it yourself: the user "
-                            f"needs to give no word for it.")
+                    text = (f"Expired machine change ({late}"
+                            + (f", still open after {repeat} daily reminder{'s' if repeat > 1 else ''}" if repeat else "")
+                            + f"): {line} {CHANGE_CHOICES} Decide it yourself: the user needs to give no word for it; "
+                            f"ask the user (ask_user) only if you cannot decide.")
                 _pending(page, target, "machine_change_overdue", f"machine-change:{c['id']}", c["alias"], episode,
                          text)
+                suffix = f"/r{repeat}" if repeat else ""
+                page["pending"]["id"] += suffix
                 page["pending"].update(line=line, by=c.get("by"), change=c["id"])
                 # Normal unless a live serving machine's change is past its end unconfirmed; one
-                # fingerprint per change and episode, so each project hears of it once (pagesev.py).
+                # fingerprint per change, episode and daily repeat, so each project hears of it once a day (pagesev.py).
+                m_entry = machines.load().get(c["alias"]) or {}
+                severity = pagesev.change_severity(c, now, pagesev.serving_machine(m_entry))
+                if repeat and now - float(page["first"]) >= USER_AFTER_S and change_risk(c, m_entry):
+                    severity = "high"   # a risky change its projects left a day: its coordinator hears it high
                 page["pending"].update(
-                    severity=pagesev.change_severity(c, now, pagesev.serving_machine(machines.load().get(c["alias"]))),
-                    fp=pagesev.change_fingerprint(f"machine-change:{c['id']}", episode))
+                    severity=severity, fp=pagesev.change_fingerprint(f"machine-change:{c['id']}", episode) + suffix)
             claim(page, makers)
         if changed:
             _write(LEDGER, ledger)

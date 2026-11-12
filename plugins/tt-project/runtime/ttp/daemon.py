@@ -3094,7 +3094,7 @@ class Daemon:
             said = text if outagemsg.ACTOR_RE.search(text) else f"{text} {outagemsg.ACTING} {outagemsg.TO_USER}."
             if page.get("kind") == "machine_condition":
                 self.alert(page["key"], f"Outage: {said}", severity="high")
-            elif page.get("kind") == "machine_change_overdue":   # a risky change unhandled a day: not an outage
+            elif page.get("kind") == "machine_change_overdue":   # a change no project can take: not an outage
                 self.alert(page.get("id") or page["key"], text, severity=severity)
             else:   # an outage task open past its due time
                 self.alert(page.get("id") or page["key"], f"Outage: {said}", severity=severity)

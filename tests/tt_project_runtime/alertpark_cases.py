@@ -245,6 +245,38 @@ def test_reclassify_leaves_real_asks_and_decisions_open(env):
     assert set(keep) <= left and login not in left
 
 
+def test_reclassify_closes_an_old_risky_machine_change_alert_but_keeps_the_coordinators_ask(env):
+    """An expired machine change goes to its project's coordinator (machine_ledger.route): an open
+    "A risky machine change" alert an older release raised closes on the re-check, raised again it is a
+    status line; the coordinator's own ask about the change still reaches the user, and a change no
+    project could take still alerts."""
+    from ttp import alerts
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp.daemon import Daemon
+    p = make(env)
+    mm.add("box-1", tags="device")
+    now = time.time()
+    cid = ml.add_change("box-1", "stopped the recovery watchdog", "systemctl start watchdog", "demo", expires="1h",
+                        now=now - 3 * 86400)["id"]
+    key = f"machine-change:{cid}"
+    old = _raw_alert(p, key, f"A risky machine change has had no answer for 1.0 d (it touches recovery): #{cid} on "
+                             "box-1 stopped the recovery watchdog. Its projects (demo) did not renew, close or undo it.",
+                     "high")
+    assert old in {m["id"] for m in alerts.needs_you(p.db, now)}
+    ask = p.db.post("out", f"Machine change #{cid} on box-1 stopped the recovery watchdog and its maker is gone: "
+                    "undo it (restart the watchdog) or keep it?", chat=None, kind="ask", severity="normal")
+    assert alerts.not_an_ask(p.db, key, "A risky machine change ...") == "machine-change-coordinator"
+    done = alerts.reclassify(p.db, now)
+    assert [(d["id"], d["why"]) for d in done] == [(old, "reclassified: machine-change-coordinator")]
+    left = {m["id"] for m in alerts.needs_you(p.db, time.time())}
+    assert ask in left and old not in left
+    Daemon(p.base).alert(key, f"A risky machine change has had no answer for 2.0 d: #{cid} on box-1", "high")
+    assert not [m for m in alerts.needs_you(p.db, time.time()) if "risky machine change" in m["text"]]
+    orphan = f"An expired machine change {alerts.MACHINE_CHANGE_ORPHAN}: #8 on box-1 ..."
+    assert alerts.not_an_ask(p.db, "machine-change:8@1#0", orphan) == ""
+
+
 def test_unset_gh_route_queues_gh_calls_to_the_workstation_while_logged_out(env, monkeypatch):
     from ttp import ghauth, ghqueue, ghroute
     make(env)

@@ -490,7 +490,11 @@ def known(db: DB, key: str | None, severity: str | None) -> dict | None:
 # before the rule. gh-no-login: lab hosts keep no GitHub login, gh calls go on delivery.gh_route
 # (ghroute); own-pause / handback-pause: a pause the user set, or one a hand-back or move set
 # (projpause, projmove); ranking-key: the optional Artificial Analysis key (rankfresh); chat-endpoint:
-# a chat endpoint's key, which its work never waits on (Daemon.logout_alert).
+# a chat endpoint's key, which its work never waits on (Daemon.logout_alert); machine-change-coordinator:
+# an expired machine change while a project is in its chain goes to that project's coordinator, re-paged
+# daily (machine_ledger.route), which asks the user itself only if it cannot decide; only a change no
+# project could take still alerts.
+MACHINE_CHANGE_ORPHAN = "has no project to decide it"   # machine_ledger.route's text for the one change alert kept
 RECLASSIFY_KV = "alerts_reclassified_at"
 RECLASSIFY_EVERY_S = 3600
 
@@ -505,6 +509,8 @@ def not_an_ask(db: DB, ref: str | None, text: str | None = "") -> str:
         return "ranking-key"
     if kind == "auth" and arg == "chat":
         return "chat-endpoint"
+    if kind == "machine-change" and MACHINE_CHANGE_ORPHAN not in (text or ""):
+        return "machine-change-coordinator"
     if kind == "paused":
         info = db.kv("pause_info") or {}
         info = info if isinstance(info, dict) else {}

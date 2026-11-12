@@ -521,10 +521,13 @@ coordinator with that evidence.
   whether from its own daemon or relayed by another project's. A project's expired changes reach its
   coordinator as one item listing each change's what, undo and age with the choices renew, close or
   undo, which it decides without the user's word; a gone or paused project's go to the machine's
-  recovery owner, then its fallback. The user is paged only for a risky change (one that stops,
-  disables or pauses a service or recovery, or touches networking, ssh, credentials, mounts, the
-  kernel or drivers, reservations, a live serving machine, or an unclassified change on a machine
-  other projects share; `machine_ledger.change_risk`) nobody renewed, closed or undid for 24 h.
+  recovery owner, then its fallback. An expired change never goes to the user's chat while a project
+  is in its chain: the last project in it hears of it again once a day while it stays open, high once
+  a risky change (one that stops, disables or pauses a service or recovery, or touches networking,
+  ssh, credentials, mounts, the kernel or drivers, reservations, a live serving machine, or an
+  unclassified change on a machine other projects share; `machine_ledger.change_risk`) has been left
+  24 h, and its coordinator asks the user only if it cannot decide. Only a change no project could
+  take alerts the user. An alert an older release raised for one is closed by the start-up re-check.
 - Untrusted text in the coordinator's digest (every event: hand-offs, notes from other projects, PR
   and CI text, watcher and tool output; a relayer's context and findings) and in a worker's context
   block (a relayer's context, earlier hand-offs, review findings, tried-ledger lines) is enclosed as

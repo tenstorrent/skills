@@ -480,16 +480,19 @@ def test_a_pause_after_the_owner_was_paged_stops_the_next_step_and_its_undeliver
     assert "pending" not in next(c for c in ml.changes() if c["id"] == cid)["page"]
 
 
-def test_an_overdue_change_on_an_unpaused_machine_escalates_to_the_user(env):
+def test_an_overdue_change_on_an_unpaused_machine_stays_with_its_chain_and_never_reaches_the_user(env):
+    """Maker, owner, fallback, then the fallback again once a day while it stays open; risky or not,
+    never the user."""
     p, ml = _outage_box(env)
     t0 = time.time()
     ml.add_change("box-a", "stopped the recovery watchdog", "systemctl start watchdog", "gamma", expires="1h", now=t0)
     due = t0 + 3601
-    got = [_change_pages(ml, due + k * ml.REPAGE_S) for k in range(4)]
-    assert got == [[("gamma", 0)], [("owner", 1)], [("beta", 2)], [(ml.USER, 3)]]   # risky: the user at the end
+    got = [_change_pages(ml, due + k * ml.REPAGE_S) for k in range(5)]
+    assert got == [[("gamma", 0)], [("owner", 1)], [("beta", 2)], [("beta", 2)], [("beta", 2)]]
+    assert _change_pages(ml, due + 4 * ml.REPAGE_S + 3600) == [], "at most once a day"
     ml.add_change("box-a", "a scratch dir for a repro", "rm -rf /tmp/scratch", "gamma", expires="1h", now=t0)
-    got = [_change_pages(ml, due + k * ml.REPAGE_S) for k in range(6)]
-    assert (ml.USER, 3) not in [x for g in got for x in g]   # harmless: never the user
+    got = [_change_pages(ml, due + k * ml.REPAGE_S) for k in range(5, 12)]
+    assert got and ml.USER not in [t for g in got for t, _ in g]
 
 
 def _expired(ml, n, by="alpha", what="soak test drop-in", undo="rm -f /tmp/soak.conf", at=None, alias="box-a"):
@@ -542,23 +545,56 @@ def test_a_harmless_expired_change_never_pages_the_user(env):
     assert seen and ml.USER not in [t for _, _, t, _ in seen]
 
 
-def test_a_risky_expired_change_unhandled_for_a_day_pages_the_user_once(env):
-    """(c) An entry that stopped a recovery service: after its projects let 24 h pass, the user once, as a
-    risky change (no outage wording); never before 24 h, and never again."""
+def test_a_risky_expired_change_unhandled_for_a_day_is_repaged_daily_to_its_last_project_never_the_user(env):
+    """(c) An entry that stopped a recovery service, its projects unable to act for days: its last project
+    is paged again once a day (a new fingerprint each time, high once left 24 h); never the user."""
     p, ml = _outage_box(env, "beta", **{"box-a": ("owner", "beta")})
     t0 = time.time()
     _expired(ml, 1, by="beta", what="stopped the recovery watchdog", undo="systemctl start watchdog", at=t0)
     assert ml.change_risk(ml.changes(open_only=False)[0], {})
     able = {"beta": (False, "its daemon is stopped"), "owner": (False, "its daemon is stopped")}
-    users = []
+    seen = []
     for h in range(0, 24 * 5):
         at = t0 + h * 3600
         for x in ml.route(at, able=lambda n: able.get(n, (False, "?")), healthy=lambda *a: [], quiet=_no_quiet):
             ml.delivered(x)
-            if x["target"] == ml.USER:
-                users.append((at, x["text"]))
-    assert len(users) == 1 and users[0][0] - t0 >= ml.USER_AFTER_S
-    assert "risky" in users[0][1] and "Outage" not in users[0][1] and "Acting now" not in users[0][1]
+            seen.append((at, x["target"], x["severity"], x["fp"], x["text"]))
+    assert ml.USER not in [t for _, t, *_ in seen]
+    repeats = [s for s in seen if "/r" in s[3]]
+    assert len(repeats) == 4 and {t for _, t, *_ in repeats} == {"owner"}, seen
+    gaps = [b[0] - a[0] for a, b in zip(seen, seen[1:])]
+    assert all(g >= ml.REPAGE_S for g in gaps[1:]), gaps
+    assert len({(s[1], s[3]) for s in seen}) == len(seen), "a new fingerprint per repeat"
+    assert all(s[2] == "high" for s in repeats) and "daily reminder" in repeats[0][4]
+    assert "ask the user" in repeats[0][4] and "Outage" not in repeats[0][4]
+
+
+def test_a_change_paged_to_the_user_by_an_older_release_goes_back_to_its_last_project(env):
+    """A ledger page left at the user stage (or a pending user page) moves back to the chain's last
+    project and is paged to it at once."""
+    p, ml = _outage_box(env, "beta", **{"box-a": ("owner", "beta")})
+    t0 = time.time()
+    cid = _expired(ml, 1, by="beta", what="stopped the recovery watchdog", undo="systemctl start watchdog", at=t0)[0]
+    with ml._locked():
+        doc = ml._read(ml.LEDGER, {})
+        c = next(x for x in doc["changes"] if x["id"] == cid)
+        c["page"] = {"first": t0 - 2 * 86400, "stage": 2, "at": t0 - 3600,
+                     "pending": {"target": ml.USER, "kind": "machine_change_overdue", "id": f"machine-change:{cid}@1#2",
+                                 "key": f"machine-change:{cid}", "alias": "box-a", "stage": 2, "text": "A risky..."}}
+        ml._write(ml.LEDGER, doc)
+    assert _change_pages(ml, t0) == [("owner", 1)]
+    assert _change_pages(ml, t0 + 3600) == []
+
+
+def test_a_noop_undo_change_still_closes_itself_and_pages_nobody(env):
+    """An expired entry whose undo is a no-op is closed by route itself, before any page."""
+    p, ml = _outage_box(env, "beta", **{"box-a": ("owner", "beta")})
+    t0 = time.time()
+    cid = _expired(ml, 1, by="beta", what="stopped the recovery watchdog", undo="none: it ends itself", at=t0)[0]
+    assert _change_pages(ml, t0) == []
+    c = next(x for x in ml.changes(open_only=False) if x["id"] == cid)
+    assert c.get("closed") and str(c.get("closed_by", "")).startswith(ml.AUTO_CLOSE), c
+    assert [_change_pages(ml, t0 + k * ml.REPAGE_S) for k in (1, 2, 3)] == [[], [], []]
 
 
 @pytest.mark.parametrize("what,undo,risky", [
