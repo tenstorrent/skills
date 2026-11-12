@@ -9,14 +9,18 @@ wait ends when its run starts. Hold causes:
 - budget_gate: the budget gate stopped new work, the dollar caps or the task budget;
 - resource: a busy or paused resource or device;
 - dispatch: nothing held it and a place was free: the time until dispatch started it;
-- other: a branch clash, the disk guard, a login, the network, optional work held;
+- logged_out: the provider was logged out (a login only the user can do);
+- daemon_gap: no ready check ran (the daemon stopped or restarted, the host asleep);
+- other: a branch clash, the disk guard, the network, optional work held;
 - unrecorded: a wait whose cause no record names.
 
 Going forward the daemon records it on the run row itself (runs.note "ready_wait": when it became
 ready and the seconds each cause held it, as the ready check (daemon.check_unstarted, every minute)
 saw it): no write of its own. Runs that started before that record get a reconstruction from the
 task's records (as unstarted.ready_since) and events: their cause is the one the last
-ready_not_started, queue_wait or dispatch_hold event of the wait names, else "unrecorded". A ready time
+ready_not_started, queue_wait or dispatch_hold event of the wait names, else "unrecorded"; the part of
+the wait inside a logout (a run that ended with status auth, until the next run that did not) is
+logged_out's. A ready time
 is raised to the task's latest requeue, unblock or block before the start (REQUEUE). Counted only
 (no_ready_time), with no recorded ready time: a resumed wait (a run after a `waiting` hand-off) with no
 requeue event, and a first run whose rebuilt ready time is more than FIRST_EVENT_S before the task's
@@ -30,10 +34,11 @@ import time
 
 from .db import dependency_ids
 
-CAUSES = ("project_cap", "machine_limit", "checks", "budget_gate", "resource", "dispatch", "other", "unrecorded")
+CAUSES = ("project_cap", "machine_limit", "checks", "budget_gate", "resource", "dispatch", "logged_out", "daemon_gap",
+          "other", "unrecorded")
 LABELS = {"project_cap": "project cap", "machine_limit": "machine-wide limit", "checks": "own checks",
           "budget_gate": "budget gate", "resource": "resource", "dispatch": "dispatch (free place)",
-          "other": "other hold", "unrecorded": "unrecorded"}
+          "logged_out": "logged out", "daemon_gap": "no ready check", "other": "other hold", "unrecorded": "unrecorded"}
 GAP_S = 180.0   # a gap between ready checks longer than this (daemon stopped, host asleep): no cause seen
 REQUEUE = ("task_requeued", "start_when_passed", "push_requeued", "hold_released", "task_blocked")
 FIRST_EVENT_S = 3600.0   # a rebuilt first-run ready time this long before the task's first event: unknown
@@ -73,7 +78,9 @@ def cause(why, held_by: str | None, gate, free: bool, held: bool = False, preche
         return "machine_limit" if str(held_by or "").startswith("the machine-wide worker limit") else "other"
     if why in ("resource", "device", "paused"):
         return "resource"
-    if why in ("logged_out", "net", "optional"):
+    if why == "logged_out":
+        return "logged_out"
+    if why in ("net", "optional"):
         return "other"
     return "checks"   # _own_checks_wait's words: its own checks or push run is queued or running
 
@@ -81,14 +88,14 @@ def cause(why, held_by: str | None, gate, free: bool, held: bool = False, preche
 def note(acc: dict, tid: int, c: str, now: float, since) -> None:
     """One ready check's sight of task `tid` held by cause `c`; `since` (a value or a callable) when it
     became ready, read only on its first sight. The time since the previous sight goes to that sight's cause;
-    a gap over GAP_S goes to "unrecorded"."""
+    a gap over GAP_S goes to "daemon_gap" (no check ran: the daemon stopped, the host asleep)."""
     e = acc.get(tid)
     if e is None:
         acc[tid] = {"since": float(since() if callable(since) else since), "first": now, "first_cause": c,
                     "last": now, "cause": c, "causes": {}}
         return
     gap = now - e["last"]
-    k = e["cause"] if gap <= GAP_S else "unrecorded"   # a longer gap: no check saw why it waited
+    k = e["cause"] if gap <= GAP_S else "daemon_gap"   # a longer gap: no check ran meanwhile
     if gap > 0:
         e["causes"][k] = e["causes"].get(k, 0.0) + gap
     e["last"], e["cause"] = now, c
@@ -103,8 +110,8 @@ def prune(acc: dict, ready: set) -> None:
 def take(acc: dict, tid: int, now: float, since, last_check: float | None, last_ready: set | None = None) -> dict:
     """The run note's "ready_wait" for task `tid` starting now: {"since", "causes"} (seconds, rounded).
     Without a sight of it, a ready check within GAP_S that looked (`last_ready`, its ready ids, not None)
-    and did not find it ready bounds its ready time and the wait is dispatch's; else the wait is
-    unrecorded (a reset check after a daemon start, settling or a gap evaluates nothing)."""
+    and did not find it ready bounds its ready time and the wait is dispatch's; with no ready check within
+    GAP_S (or none since a daemon start) it is daemon_gap's; else unrecorded."""
     e = acc.pop(tid, None)
     causes: dict[str, float] = {}
 
@@ -114,18 +121,19 @@ def take(acc: dict, tid: int, now: float, since, last_check: float | None, last_
     if e:
         start = e["since"]
         lead = e["first"] - start
-        add(e["first_cause"] if lead <= GAP_S else "unrecorded", lead)
+        add(e["first_cause"] if lead <= GAP_S else "daemon_gap", lead)
         for k, s in e["causes"].items():
             add(k, s)
         tail = now - e["last"]
-        add(e["cause"] if tail <= GAP_S else "unrecorded", tail)
+        add(e["cause"] if tail <= GAP_S else "daemon_gap", tail)
     else:
         start = float(since() if callable(since) else since)
         recent = last_check is not None and last_ready is not None and tid not in last_ready \
             and 0 <= now - last_check <= GAP_S
         if recent:
             start = max(start, last_check)
-        add("dispatch" if recent else "unrecorded", now - start)
+        no_check = last_check is None or last_ready is None or not 0 <= now - last_check <= GAP_S
+        add("dispatch" if recent else "daemon_gap" if no_check else "unrecorded", now - start)
     return {"since": round(start, 1), "causes": {k: round(v, 1) for k, v in causes.items()}}
 
 
@@ -197,7 +205,28 @@ def _rebuild(q, r: dict) -> tuple[float | None, dict]:
            "('ready_not_started','queue_wait','dispatch_hold') AND ts>=? AND ts<=? ORDER BY id DESC LIMIT 1",
            (r["task"], ready, started))
     c = (_event_cause(ev[0]["kind"], ev[0]["text"], ev[0]["data"]) if ev else None) or "unrecorded"
-    return ready, ({c: started - ready} if started > ready else {})
+    out = _logged_out(q, ready, started)
+    causes = {k: s for k, s in ((c, started - ready - out), ("logged_out", out)) if s > 0}
+    return ready, causes
+
+
+def _logged_out(q, lo: float, hi: float) -> float:
+    """Seconds of [lo, hi] inside a logout: from a run (any role) that ended with status auth to the
+    start of the next run that did not."""
+    if hi <= lo:
+        return 0.0
+    auth = q("SELECT ended FROM runs WHERE status='auth' AND ended>? AND ended<? ORDER BY ended", (lo - 30 * 86400, hi))
+    total, upto = 0.0, lo
+    for a in auth:
+        a0 = max(float(a["ended"]), upto)
+        if a0 >= hi:
+            break
+        nxt = q("SELECT MIN(started) s FROM runs WHERE status!='auth' AND started>?", (float(a["ended"]),))
+        a1 = min(float(nxt[0]["s"]) if nxt and nxt[0]["s"] is not None else hi, hi)
+        if a1 > a0:
+            total += a1 - a0
+            upto = a1
+    return total
 
 
 def _pct(xs: list[float]) -> dict:

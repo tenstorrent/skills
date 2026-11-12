@@ -5407,13 +5407,14 @@ def test_ready_wait_cause_maps_each_start_hold():
     assert rw.cause("held", "a branch clash", open_, True) == "other"
     assert rw.cause("device", None, open_, True) == rw.cause("resource", None, open_, True) == "resource"
     assert rw.cause("net", None, open_, True) == "other"
+    assert rw.cause("logged_out", None, open_, True) == "logged_out"   # a login only the user can do
     assert rw.cause("its own ttp checks run is queued", None, open_, True) == "checks"
     # A review held by its own pre-review checks: _start_hold answers "held" with the precheck words.
     assert rw.cause("held", "its pre-review checks run", open_, True, held=True, precheck=True) == "checks"
     assert rw.cause("held", "the disk guard", open_, True, held=True) == "other"
 
 
-def test_ready_wait_sightings_split_the_wait_by_cause_and_gaps_are_unrecorded():
+def test_ready_wait_sightings_split_the_wait_by_cause_and_gaps_are_daemon_gaps():
     from ttp import readywait as rw
     acc = {}
     rw.note(acc, 7, "project_cap", 1000.0, lambda: 940.0)   # ready at 940, first seen at 1000
@@ -5421,14 +5422,14 @@ def test_ready_wait_sightings_split_the_wait_by_cause_and_gaps_are_unrecorded():
     rw.note(acc, 7, "machine_limit", 1120.0, 0)
     rw.note(acc, 7, "dispatch", 1600.0, 0)                  # the host slept: 480 s no check saw
     w = rw.take(acc, 7, 1630.0, 0, 1600.0)
-    assert w == {"since": 940.0, "causes": {"project_cap": 180.0, "unrecorded": 480.0, "dispatch": 30.0}}
+    assert w == {"since": 940.0, "causes": {"project_cap": 180.0, "daemon_gap": 480.0, "dispatch": 30.0}}
     assert 7 not in acc
-    # Never seen ready: a check 40 s ago bounds the wait, which is dispatch's; no recent check: unrecorded.
+    # Never seen ready: a check 40 s ago bounds the wait, which is dispatch's; no recent check: daemon_gap.
     assert rw.take({}, 8, 2000.0, 1500.0, 1960.0, set()) == {"since": 1960.0, "causes": {"dispatch": 40.0}}
     # A reset check (daemon start, settling, a gap: no ready set) or one that saw it ready bounds nothing.
-    assert rw.take({}, 8, 2000.0, 1500.0, 1960.0, None) == {"since": 1500.0, "causes": {"unrecorded": 500.0}}
+    assert rw.take({}, 8, 2000.0, 1500.0, 1960.0, None) == {"since": 1500.0, "causes": {"daemon_gap": 500.0}}
     assert rw.take({}, 8, 2000.0, 1500.0, 1960.0, {8}) == {"since": 1500.0, "causes": {"unrecorded": 500.0}}
-    assert rw.take({}, 9, 2000.0, 1500.0, None) == {"since": 1500.0, "causes": {"unrecorded": 500.0}}
+    assert rw.take({}, 9, 2000.0, 1500.0, None) == {"since": 1500.0, "causes": {"daemon_gap": 500.0}}
     acc = {1: {}, 2: {}}
     rw.prune(acc, {2})
     assert list(acc) == [2]
@@ -5471,6 +5472,27 @@ def test_stats_ready_wait_reports_recorded_and_rebuilt_waits_by_cause(env, capsy
     assert got["demo"]["runs"] == 3 and "error" in got["nosuch"]
 
 
+def test_ready_wait_rebuild_names_the_part_of_a_wait_inside_a_logout(env):
+    from ttp import readywait as rw
+    p = make(env)
+    now = time.time()
+    ins = "INSERT INTO runs(task,role,provider,started,ended,status,note,boot_id) VALUES(?,?,?,?,?,?,?,?)"
+    ev = "INSERT INTO events(ts,source,kind,text,task) VALUES(?,?,?,?,?)"
+    # Ready 10000 s before its run; the provider logged out 8000 s before it and a login came back 1000 s before.
+    a = p.db.add_task("a", "s")
+    p.db.x("UPDATE tasks SET created=? WHERE id=?", (now - 20000, a))
+    p.db.x(ev, (now - 12000, "daemon", "task_requeued", "q", a))
+    o = p.db.add_task("other", "s")
+    p.db.x(ins, (o, "worker", "claude", now - 9100, now - 9000, "auth", None, "x"))
+    p.db.x(ins, (o, "worker", "claude", now - 3000, now - 2900, "done", None, "x"))
+    p.db.x(ins, (a, "worker", "claude", now - 2000, now - 1900, "done", None, "x"))
+    s = rw.report(p.db.q, now - 86400, now, p.state)
+    # Both waits: a's 6000 s of 10000, and the other task's retry after its logged-out run (all 6000 s).
+    lo = s["by_cause"]["logged_out"]
+    assert lo["n"] == 2 and abs(lo["total_s"] - 12000.0) < 1, s
+    assert abs(s["by_cause"]["unrecorded"]["total_s"] - 4000.0) < 1, s
+
+
 def test_ready_wait_rebuild_starts_a_first_run_at_its_requeue_and_skips_a_silent_import(env):
     from ttp import readywait as rw
     p = make(env)
@@ -5496,7 +5518,7 @@ def test_ready_wait_rebuild_starts_a_first_run_at_its_requeue_and_skips_a_silent
     assert rw.ready_since(p.db, p.db.task(a)) >= now - 2600 - 1
 
 
-def test_a_run_started_on_the_daemon_s_first_tick_records_an_unrecorded_not_a_dispatch_wait(env, monkeypatch):
+def test_a_run_started_on_the_daemon_s_first_tick_records_a_daemon_gap_not_a_dispatch_wait(env, monkeypatch):
     from ttp.daemon import Daemon
     p = make(env)
     monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps({"status": "done", "summary": "ok"}))
@@ -5505,4 +5527,4 @@ def test_a_run_started_on_the_daemon_s_first_tick_records_an_unrecorded_not_a_di
     d = Daemon(p.base)
     assert _run_until(d, p, lambda: p.db.one("SELECT id FROM runs WHERE task=?", (tid,)))
     rw = json.loads(p.db.one("SELECT note FROM runs WHERE task=?", (tid,))["note"])["ready_wait"]
-    assert "dispatch" not in rw["causes"] and rw["causes"].get("unrecorded", 0) >= 3500, rw
+    assert "dispatch" not in rw["causes"] and rw["causes"].get("daemon_gap", 0) >= 3500, rw
