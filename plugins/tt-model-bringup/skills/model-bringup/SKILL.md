@@ -157,6 +157,38 @@ Plugins execute in the runner process with its permissions; use only trusted plu
 The loader does not enforce callback timeouts or isolate plugin code.
 The [hook API](../../telemetry-hooks.md) contains no endpoint or upload implementation.
 
+## Optimization stop rule
+
+Optimization stages (2, 3, 5, 7, 10) stop on the first of these, not when every idea is exhausted:
+
+- the measured path is within 1.5x of its roofline (decode: bytes moved per step over DRAM
+  bandwidth; prefill: FLOPs over peak compute), stated with the calculation;
+- three candidates in a row each gained less than 3% end to end on the stage's primary metric;
+- the stage time box: 8 h of wall time on the stage, unless the operator set another.
+
+These are defaults the operator can tune. In the work log, list every candidate that was not
+tried and why, next to the before/after table and the rejected candidates with their evidence. The
+stop rule bounds effort only. It never relaxes PCC, context, quality or readiness gates. The
+FUNCTIONAL performance bar (1 user, 128 in / 128 out, at least 10% of theoretical) is a floor that
+must be met, not a target to stop at.
+
+## Default authorizations
+
+Each run may do these without asking the operator. Record each use in the stage work log.
+
+- Raise precision for a specific op or layer at stage 6 or later when a quality check needs it,
+  with the measured performance cost.
+- Make a minimal fix to shared tt-metal code (ops, CCL, shared modules) when the model needs it.
+  Put it in its own local commit whose subject starts with `Shared-code fix:`, add or extend a
+  test for it, and never push it. Changes to the TT vLLM plugin or vLLM still follow
+  [plugin changes](../vllm-integration/references/plugin-changes.md); this does not relax them.
+- Attribute performance to the roofline by interval or bounded estimates (for example "MoE 40–55%
+  of the step") when an exact per-op attribution is not available.
+- Keep thinking on for reasoning evals that the model card runs with thinking; reduce the sample
+  count to fit time, not the token cap.
+- Accept a known limitation when the original HF model shows the same behaviour under the
+  control in [`$qualitative-check`](../qualitative-check/SKILL.md) (HF control rule).
+
 ## Evidence gates
 
 Stages 6, 7, 9, 10 and 11 have sibling `.check.sh` scripts. Run from the target checkout with

@@ -16,7 +16,7 @@ Goal completion requirements:
 - Warmed single-chip baseline latency and multi-chip latency, speedup, and efficiency are reported.
 - tt-perf-report human-readable tables and CSV/provenance logs exist. Use them to check communication, DRAM, compute, CCL, and data movement before accepting the path.
 - Runtime fallback audit is clean, determinism or stress coverage matches the implementation risk, and watcher-clean evidence exists.
-- For MoE models, the completed path keeps gate-selected active-expert execution. Dense all-expert execution does not satisfy completion unless evidence proves it is faster during decode.
+- For MoE models, choose EP/TP/hybrid and the batched-decode path by the $multichip MoE decision rule, and keep gate-selected active-expert execution. Dense all-expert execution needs evidence it is faster in decode.
 - models/autoports/<model>/doc/multichip_decoder/README.md and work_log.md record commands, PCC, perf, mesh plan, limitations, and exact artifacts.
 - The decoder has a real multichip implementation that is correct, fits the full model's weights/KV-cache expectations, and is suitable as the full-model layer stack baseline.
 - $stage-review returns `clean-pass`; findings fixed/rereviewed. Local commit stage-owned touched-repo changes; never push; log SHAs.

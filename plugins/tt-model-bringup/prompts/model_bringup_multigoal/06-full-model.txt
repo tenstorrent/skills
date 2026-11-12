@@ -1,29 +1,30 @@
 /goal Use $full-model and $tt-device-usage for the HF_MODEL optimized multichip decoder in the current tt-metal checkout.
 
-As the user, I explicitly authorize you to use subagents when a selected skill requests or recommends them.
+Subagents are authorized when a selected skill requests or recommends them.
 
-This goal creates the full-model state for the repo-local TTNN autoport pipeline. Start from the completed optimized multichip decoder and work on models/autoports/<model>/tt/model.py and tt/generator.py; do not begin vLLM integration work in this goal.
+This creates full-model state for the repo-local TTNN autoport pipeline. Start from the completed optimized multichip decoder and work on models/autoports/<model>/tt/model.py and tt/generator.py; do not begin vLLM work.
 
 Goal completion requirements:
 - models/autoports/<model>/tt/model.py and tt/generator.py implement the full HF autoregressive path and standard Metal readiness generator contract.
-- The full model preserves the optimized multichip decoder strategy, dtype/fidelity/KV-cache/activation/CCL policy, paged-cache dtype split, rejection ledger, and inter-layer residual layout. Fallback to single-chip, replicated, host-side, or less optimized behavior is not acceptable.
-- Preserve the full-stack context contract. Recompute weight plus KV-cache DRAM capacity in doc/context_contract.json. Reduce advertised capability only for a hard physical limit, with evidence and the largest feasible value.
-- The model/generator accepts valid prompt lengths up to the supported context, including non-aligned lengths. If prefill chunks internally, the public generator owns padding, masking, cache fill, position handling, and output slicing.
+- The full model preserves the optimized multichip decoder strategy, dtype/fidelity/KV-cache/activation/CCL policy, paged-cache dtype split, rejection ledger, and inter-layer residual layout; no fallback to single-chip, replicated, host-side, or less optimized behavior.
+- Preserve the context contract: recompute weight plus KV-cache DRAM capacity in doc/context_contract.json; reduce advertised capability only for a hard physical limit, with evidence of the largest feasible value.
+- The generator accepts valid prompt lengths up to the supported context, including non-aligned ones. If prefill chunks internally, the public generator owns padding, masking, cache fill, position handling, and output slicing.
 - Expose serving-ready low-level prefill/decode with explicit cache/page-table/position/prompt-length/batch state, mixed prompts, fixed slots, and inactive rows where used.
 - doc/full_model/serving_contract.json maps each call, capability, and request feature that the pinned vllm-tt-plugin uses or tests to generator support. Missing rows are work for this stage.
-- Generate a fresh AIME24 HF-tokenizer chat-template reference, 100 tokens, unless metadata proves an exact match.
-- run_prefill_check and run_teacher_forcing report top-1/top-5/top-100 for prefill and decode. The expected bar is top-5 >= 98% and top-100 = 100%.
-- run_autoregressive produces HF and TT completions, and the outputs are read for coherence, repetition, wrong-language drift, and early divergence.
-- Before token-out sampling, compare both common samplers, choose the best fit, and record the rejected alternative. Write custom sampler code only if neither common path fits.
+- Generate an AIME24 HF-tokenizer chat-template reference, 100 tokens, with `--model-dir` (its cache reuses only exact matches).
+- run_prefill_check and run_teacher_forcing report top-1/top-5/top-100 for prefill and decode; bar: top-5 >= 98%, top-100 = 100%.
+- run_autoregressive HF and TT completions are read for coherence, repetition, wrong-language drift, and early divergence.
+- Compare both common samplers, choose the best fit, record the rejected one; write custom sampler code only if neither fits.
 - Decode satisfies the $full-model/$tt-enable-tracing split-sampling contract. Greedy decode stays on device with no host argmax, full-logits readback, untraced sampling, or Python token-feedback loop.
-- Greedy split-sampling comparison must be semantically greedy. If split greedy fails on shape/layout/tiling, fix that contract or leave the stage incomplete with a minimal repro.
+- Split greedy must be semantically greedy; if it fails on shape/layout/tiling, fix that contract or leave the stage incomplete with a minimal repro.
 - Resumed-prefill check passes and serving_contract.json records prefix caching per $full-model.
 - Trace evidence proves token feedback, position coherence, and changed/unchanged page-table handling with no per-token host rebuilds.
 - Top of README.md reports full-model TTFT and trace-verified batch-1 decode t/s/u, separating teacher-forcing and token-out decode when they differ.
 - Runtime fallback audit covers model/generator paths, cache ownership, host-logit boundaries, sampling, and reset behavior.
+- Before chasing a qualitative or eval failure, run the $qualitative-check HF control (matched seeds, blind); if HF does the same, record a known limitation and continue.
 - models/autoports/<model>/doc/full_model/README.md and work_log.md record commands, top-k accuracy, qualitative verdict, perf, limitations, and exact artifacts.
-- Canonical split sampling is required. If sampler ops dominate token-out decode, fix the LM-head/sampling contract before completing.
-- The generator supports an explicit host-sampling compatibility mode for tests that require host sampling, while the optimized measured token-out path remains on-device traced sampling.
+- If sampler ops dominate token-out decode, fix the LM-head/sampling contract before completing.
+- An explicit host-sampling compatibility mode exists for tests that need it; the measured token-out path stays on-device traced sampling.
 - $stage-review returns `clean-pass`; findings fixed/rereviewed. Local commit stage-owned touched-repo changes; never push; log SHAs.
 
 Unmet requirements, review findings, failed gates: work. Stop only after `$autofix` fails.

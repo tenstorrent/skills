@@ -45,6 +45,7 @@ try:
 except ImportError:
     tqdm = None
 
+from readiness_check.reference_cache import ReferenceCache, model_revision, prompt_hash, tokenizer_fingerprint
 from readiness_check.schema import Reference, ReferenceEntry, save_reference
 
 DEFAULT_K = 100
@@ -55,17 +56,19 @@ DEFAULT_AIME24_PROMPTS_FILE = (
     Path.cwd() / "models" / "demos" / "deepseek_v3" / "demo" / "aime_under_8k_prompts.json"
 )
 PROMPT_SOURCE_CHOICES = ("book", "aime24", "text", "file")
+# The book ships with the tt-metal checkout; models/tt_transformers was renamed to models/ttt_compat.
+BOOK_RELPATHS = (
+    "models/ttt_compat/tests/tale-of-two-cities.txt.bz2",
+    "models/tt_transformers/tests/tale-of-two-cities.txt.bz2",
+)
 
 
 def _load_book_text() -> str:
-    """Load the tale of two cities book text."""
-    # Use the book from tt_transformers tests
-    book_file = str(Path.cwd() / "models/tt_transformers/tests/tale-of-two-cities.txt.bz2")
-
-    if not os.path.exists(book_file):
-        raise FileNotFoundError(
-            f"Book text not found at {book_file}. " "Expected models/tt_transformers/tests/tale-of-two-cities.txt.bz2"
-        )
+    """Load the tale of two cities book text from the tt-metal checkout in the current directory."""
+    candidates = [str(Path.cwd() / relpath) for relpath in BOOK_RELPATHS]
+    book_file = next((path for path in candidates if os.path.exists(path)), None)
+    if book_file is None:
+        raise FileNotFoundError(f"Book text not found. Expected one of: {', '.join(candidates)}")
 
     with bz2.open(book_file, "rt", encoding="utf-8") as f:
         return f.read()
@@ -286,9 +289,15 @@ def generate_reference(
     prompt_file: Optional[Path] = None,
     aime24_prompts_file: Path = DEFAULT_AIME24_PROMPTS_FILE,
     aime24_prompt_index: int = 0,
+    model_dir: Optional[Path] = None,
 ) -> Path:
     """
     Generate a readiness reference file from book text or a prompt.
+
+    The result is cached on disk (see `readiness_check.reference_cache`) under
+    `$READINESS_REFERENCE_CACHE` or `<model_dir>/readiness/reference_cache/`.
+    A hit copies the cached file to `output_path` byte for byte and skips the
+    HF model entirely.
 
     Args:
         hf_model_id: HuggingFace model ID
@@ -304,6 +313,7 @@ def generate_reference(
         prompt_file: Prompt file when prompt_source="file"
         aime24_prompts_file: DeepSeek AIME24 prompts JSON when prompt_source="aime24"
         aime24_prompt_index: Zero-based prompt index in the AIME24 prompts JSON
+        model_dir: Autoport directory; enables the default reference cache location
 
     Returns:
         Path to saved reference file
@@ -324,8 +334,53 @@ def generate_reference(
 
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    print(f"Loading model {hf_model_id} on {device}...")
     tokenizer = AutoTokenizer.from_pretrained(hf_model_id, trust_remote_code=True)
+
+    # Resolve the prompt before loading the model so a cache hit skips the model.
+    book_text: Optional[str] = None
+    prompt_text: Optional[str] = None
+    if prompt_source == "book":
+        print("Loading book text...")
+        book_text = _load_book_text()
+        prompt_key = prompt_hash(book_text)
+    else:
+        prompt_text = _resolve_prompt_text(
+            prompt_source,
+            prompt=prompt,
+            prompt_file=prompt_file,
+            aime24_prompts_file=aime24_prompts_file,
+            aime24_prompt_index=aime24_prompt_index,
+        )
+        prompt_key = prompt_hash(prompt_text)
+
+    cache = ReferenceCache.for_model_dir(model_dir)
+    cache_key = None
+    if cache.enabled:
+        cache_key = ReferenceCache.make_key(
+            kind="refpt",
+            hf_model_id=hf_model_id,
+            revision=model_revision(hf_model_id),
+            tokenizer=tokenizer_fingerprint(hf_model_id, tokenizer),
+            prompt=prompt_key,
+            settings={
+                "prompt_source": prompt_source,
+                "chat_template": bool(chat_template) if prompt_source != "book" else False,
+                "prompt_len": int(prompt_len) if prompt_source == "book" else None,
+                "gen_len": int(gen_len),
+                "top_k": int(top_k),
+                "num_entries": int(num_entries),
+                "device": device.type,
+            },
+        )
+        if cache_key is None:
+            print("Reference cache: model revision unknown; computing without the cache.")
+        else:
+            hit = cache.get_file(cache_key, Path(output_path), ".refpt")
+            if hit is not None:
+                print(f"Reference cache hit ({cache.directory}); skipped the HF model.")
+                return hit
+
+    print(f"Loading model {hf_model_id} on {device}...")
     model = AutoModelForCausalLM.from_pretrained(hf_model_id, trust_remote_code=True).eval().to(device)
 
     # Get token IDs
@@ -337,9 +392,8 @@ def generate_reference(
     # Generate entries
     entries = []
     if prompt_source == "book":
-        # Load and tokenize book text
-        print("Loading book text...")
-        book_text = _load_book_text()
+        # Tokenize book text
+        assert book_text is not None
         print(f"Tokenizing book ({len(book_text)} characters)...")
         encoded_tokens = tokenizer.encode(book_text, add_special_tokens=True)
         print(f"Book tokenized to {len(encoded_tokens)} tokens")
@@ -373,13 +427,7 @@ def generate_reference(
             )
             entries.append(entry)
     else:
-        prompt_text = _resolve_prompt_text(
-            prompt_source,
-            prompt=prompt,
-            prompt_file=prompt_file,
-            aime24_prompts_file=aime24_prompts_file,
-            aime24_prompt_index=aime24_prompt_index,
-        )
+        assert prompt_text is not None
         prompt_tokens_list = _chat_or_plain_prompt_tokens(tokenizer, prompt_text, chat_template=chat_template)
         prompt_tokens = torch.tensor(prompt_tokens_list, dtype=torch.long)
         print(
@@ -417,7 +465,11 @@ def generate_reference(
         },
     )
 
-    return save_reference(reference, output_path)
+    path = save_reference(reference, output_path)
+    stored = cache.put_file(cache_key, path, ".refpt")
+    if stored is not None:
+        print(f"Reference cached at {stored}")
+    return path
 
 
 def _main() -> None:
@@ -467,6 +519,15 @@ def _main() -> None:
     )
     parser.add_argument("--output", type=Path, required=True, help="Path to output .refpt file.")
     parser.add_argument(
+        "--model-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Autoport directory. Enables the HF reference cache at <model-dir>/readiness/reference_cache/ "
+            "unless READINESS_REFERENCE_CACHE overrides it (set it to 'off' to disable)."
+        ),
+    )
+    parser.add_argument(
         "--top-k", type=int, default=DEFAULT_K, help=f"Top-K to capture per position (default {DEFAULT_K})."
     )
     parser.add_argument(
@@ -490,6 +551,7 @@ def _main() -> None:
         prompt_file=args.prompt_file,
         aime24_prompts_file=args.aime24_prompts_file,
         aime24_prompt_index=args.aime24_prompt_index,
+        model_dir=args.model_dir,
     )
     print(f"Reference saved to: {path}")
 

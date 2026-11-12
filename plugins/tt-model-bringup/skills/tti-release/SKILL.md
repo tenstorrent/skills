@@ -95,8 +95,8 @@ If optimized-vLLM is blocked only by a recoverable ARC/reset error, recover and 
 - The TTI model spec or runtime spec must point at the target `models/autoports/<model>` code path.
 - The launched server must import or otherwise use the target autoport vLLM implementation, usually `models/autoports/<model>/tt/generator_vllm.py`.
 - The serving max context must match `doc/context_contract.json`.
-- A built-in TTI model name such as `Llama-3.1-8B-Instruct` is not enough. Built-in model names commonly select stock `models/tt_transformers` implementations.
-- If the only available `tt-inference-server` path selects `models/tt_transformers`, `models/demos`, or another stock implementation, stop and fix the release integration. Do not benchmark the stock model as a substitute.
+- A built-in TTI model name such as `Llama-3.1-8B-Instruct` is not enough. Built-in model names commonly select stock `models/ttt_compat` (formerly tt_transformers) implementations.
+- If the only available `tt-inference-server` path selects `models/ttt_compat` (formerly tt_transformers), `models/demos`, or another stock implementation, stop and fix the release integration. Do not benchmark the stock model as a substitute.
 
 ## Checkout And Version Selection
 
@@ -317,7 +317,7 @@ Notes:
 - `--skip-system-sw-validation` is acceptable because `tt-smi` health is validated from the reservation container.
 - If the checkout supports `--tt-device` instead of `--device`, use the checkout's help output.
 - If the checkout does not support `--model-spec-json`, use the checkout's supported mechanism to point the workflow at the autoport spec. If no such mechanism exists, the stage is blocked on release integration; do not fall back to a built-in stock implementation.
-- If Docker is used as an explicit fallback, make sure the container can see the generated autoport code path. Mount, copy, or build from the current tt-metal checkout as needed. A Docker image that only contains stock `models/tt_transformers` cannot validate this stage.
+- If Docker is used as an explicit fallback, make sure the container can see the generated autoport code path. Mount, copy, or build from the current tt-metal checkout as needed. A Docker image that only contains stock `models/ttt_compat` (formerly tt_transformers) code cannot validate this stage.
 - If a Hugging Face cache location is already provided by the experiment, use it rather than re-downloading.
 
 Run long commands in `tmux` or another durable session. Tee stdout/stderr to a timestamped log under `WORK_ROOT`.
@@ -458,7 +458,7 @@ Done means:
 
 - `run.py --workflow release` exited `0`, or a terminal blocker is documented with exact evidence.
 - The copied run spec or release report data proves that the evaluated implementation path is the target `models/autoports/<model>` directory.
-- No copied final report or run spec identifies the evaluated implementation as stock `models/tt_transformers`, `models/demos`, or another packaged implementation for the same HF model.
+- No copied final report or run spec identifies the evaluated implementation as stock `models/ttt_compat` or tt_transformers, `models/demos`, or another packaged implementation for the same HF model.
 - The copied run spec, server launch, and report data preserve the supported context from `doc/context_contract.json`.
 - `$qualitative-check` evidence shows prompt-based release checks used the HF-declared prompt format, and `RUN_NOTES.md` records the tokenizer/chat-template decision plus the TTI/eval setting or rendered prompt evidence.
 - Valid non-aligned prompt lengths either pass, or the stage records the exact model bug and remains not ready.

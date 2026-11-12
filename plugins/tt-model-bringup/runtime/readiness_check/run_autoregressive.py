@@ -41,6 +41,7 @@ from readiness_check.contract import (
     Generator,
 )
 from readiness_check.build_kwargs import add_build_kwargs_args, parse_build_kwargs
+from readiness_check.reference_cache import ReferenceCache, model_revision, prompt_hash, tokenizer_fingerprint
 from readiness_check.mesh_device import (
     add_mesh_device_args,
     close_readiness_mesh_device,
@@ -114,6 +115,52 @@ def _hf_generate_greedy(
     return generated
 
 
+def _cached_hf_greedy(
+    *,
+    model_dir: Optional[Path],
+    hf_model_id: str,
+    tokenizer,
+    prompt_token_ids: List[int],
+    max_new_tokens: int,
+    device: torch.device,
+) -> List[int]:
+    """`_hf_generate_greedy` behind the on-disk reference cache."""
+    cache = ReferenceCache.for_model_dir(model_dir)
+    key = None
+    if cache.enabled:
+        key = ReferenceCache.make_key(
+            kind="hf_greedy",
+            hf_model_id=hf_model_id,
+            revision=model_revision(hf_model_id),
+            tokenizer=tokenizer_fingerprint(hf_model_id, tokenizer),
+            prompt=prompt_hash([int(t) for t in prompt_token_ids]),
+            settings={
+                "max_new_tokens": int(max_new_tokens),
+                "do_sample": False,
+                "num_beams": 1,
+                "device": device.type,
+            },
+        )
+        cached = cache.get_json(key)
+        if isinstance(cached, list):
+            print(f"HF reference from cache ({cache.directory}); skipped the HF model.")
+            return [int(t) for t in cached]
+        if key is None:
+            print("Reference cache: model revision unknown; computing without the cache.")
+
+    print(f"Running HF reference on {device}...")
+    tokens = _hf_generate_greedy(
+        hf_model_id=hf_model_id,
+        prompt_token_ids=prompt_token_ids,
+        max_new_tokens=max_new_tokens,
+        device=device,
+    )
+    stored = cache.put_json(key, [int(t) for t in tokens])
+    if stored is not None:
+        print(f"HF reference cached at {stored}")
+    return tokens
+
+
 def run_autoregressive(
     *,
     model_dir: Path,
@@ -141,10 +188,12 @@ def run_autoregressive(
     print(f"Prompt ({len(prompt_token_ids)} tokens):\n{prompt_text}\n")
 
     # 1. HF reference. Load, generate, free before touching the TT device.
+    #    Cached on disk by model, revision, tokenizer, prompt and settings.
     hf_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Running HF reference on {hf_device}...")
-    hf_tokens = _hf_generate_greedy(
+    hf_tokens = _cached_hf_greedy(
+        model_dir=model_dir,
         hf_model_id=hf_model_id,
+        tokenizer=tokenizer,
         prompt_token_ids=prompt_token_ids,
         max_new_tokens=max_new_tokens,
         device=hf_device,

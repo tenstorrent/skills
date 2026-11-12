@@ -48,7 +48,7 @@ Support logical sequence lengths, not only friendly aligned lengths. If the impl
 
 Implement correctness first. BF16, tile layout, and DRAM memory are fine while proving semantics. Move weight conversion, reshaping, dtype selection, `ttnn.as_tensor`, and cache construction into `from_state_dict` or setup helpers. Keep runtime prefill/decode free of hidden `torch`, `from_torch`, `to_torch`, or host fallback except explicit test boundaries.
 
-For MoE models, validate the real router/gate and active experts end-to-end. Component tests for gate or experts are useful diagnostics, but the decoder result should include the gate-selected expert path a real model run would use. For non-Galaxy bringup, use the GPT-OSS active-expert pattern as the default: router/top-k scores as a sparsity tensor, `ttnn.sparse_matmul` for gate/up/down projections, score weighting, and a model-appropriate reduce over experts. Do not start from Galaxy-only fused MoE paths unless you have direct evidence that the target hardware and ops support them.
+For MoE models, validate the real router/gate and active experts end-to-end. Component tests for gate or experts are useful diagnostics, but the decoder result should include the gate-selected expert path a real model run would use. A single-chip batch-1 baseline can use the GPT-OSS active-expert pattern: router/top-k scores as indices or a sparsity tensor, `ttnn.sparse_matmul` for gate/up/down projections, score weighting, and a model-appropriate reduce over experts. Compute router logits in fp32. For batched decode and the multi-chip layout, follow the decision rule in `$multichip` "MoE And Expert Replication".
 
 When PCC is low, debug it. Split the decoder into components, check HF parity, raise fidelity where useful, simplify the failing shape, and keep narrowing until the cause is understood. If a bug is tricky enough that ordinary narrowing stalls, use `$autofix`; it will run `$autodebug` if needed, then verify or refute each proposed bug before keeping any fix. If the cause is a tt-metal bug, make a reproducer or an on-branch workaround and record the evidence.
 
@@ -94,12 +94,12 @@ Use this reference while bringing up a TTNN decoder layer. It folds in relevant 
 
 ## Repo Paths Worth Reading
 
-- `models/common/modules/attention/attention_1d.py`: general config-first attention with prefill/decode split, paged KV cache, trace-friendly current-position tensors, Q/K norm hooks, and CCL integration.
-- `models/common/modules/mlp/mlp_1d.py`, `models/common/modules/rmsnorm/rmsnorm_1d.py`, and `models/common/modules/rope/rope_1d.py`: common patterns for decode-vs-prefill memory layout, on-device RoPE embedding, and local/distributed norm paths.
-- `models/common/modules/lazy_weight.py`: setup-time TTNN tensor conversion and deterministic cache-key pattern without runtime torch imports.
-- `models/tt_transformers/tt/decoder.py`: standard transformer block composition and residual order.
-- `models/tt_transformers/tt/generator.py` and `models/tt_transformers/tt/model.py`: production trace capture/replay, stable trace input tensors, decode preparation, and vLLM-facing contracts.
-- `models/tt_transformers/tt/generator_vllm.py`: paged KV-cache allocation, per-layer page-table routing, and hybrid attention contracts.
+- `tt-transformers:src/tt_transformers/modules/attention/attention_1d.py` (TTTv2 modules moved from tt-metal `models/common/modules` to [tenstorrent/tt-transformers](https://github.com/tenstorrent/tt-transformers)): general config-first attention with prefill/decode split, paged KV cache, trace-friendly current-position tensors, Q/K norm hooks, and CCL integration.
+- `tt-transformers:src/tt_transformers/modules/mlp/mlp_1d.py`, `tt-transformers:src/tt_transformers/modules/rmsnorm/rmsnorm_1d.py`, and `tt-transformers:src/tt_transformers/modules/rope/rope_1d.py`: common patterns for decode-vs-prefill memory layout, on-device RoPE embedding, and local/distributed norm paths.
+- `models/common/lazy_weight.py`: setup-time TTNN tensor conversion and deterministic cache-key pattern without runtime torch imports.
+- `models/ttt_compat/tt/decoder.py`: standard transformer block composition and residual order.
+- `models/ttt_compat/tt/generator.py` and `models/ttt_compat/tt/model.py`: production trace capture/replay, stable trace input tensors, decode preparation, and vLLM-facing contracts.
+- `models/ttt_compat/tt/generator_vllm.py`: paged KV-cache allocation, per-layer page-table routing, and hybrid attention contracts.
 - `models/demos/gpt_oss/tt/layer.py` and `models/demos/gpt_oss/tt/attention/`: model-specific standard attention with paged prefill/decode and MoE-adjacent tests.
 - `models/demos/gpt_oss/tt/experts/README.md`, `models/demos/gpt_oss/tt/experts/decode.py`, `models/demos/gpt_oss/tt/experts/prefill.py`, `models/demos/gpt_oss/tt/experts/weights.py`, `models/demos/gpt_oss/tt/experts/config.py`, and `models/demos/gpt_oss/tt/topk.py`: default MoE active-expert pattern using `ttnn.sparse_matmul`.
 - `models/demos/gemma4/tt/layer.py` and `models/demos/gemma4/tt/attention/`: strong examples for many norms, layer scales, sliding/full layer types, shared KV, and model-specific RoPE.
@@ -112,7 +112,7 @@ Use this reference while bringing up a TTNN decoder layer. It folds in relevant 
 - Transpose 2D PyTorch linear weights before `ttnn.linear` unless the local TTNN helper already does it.
 - Reshape norm weights so they broadcast over hidden width.
 - Derive Q/K/V head reshapes from config, including GQA/MQA KV expansion, before optimizing.
-- In `models/common` attention, Q/K weights may need HF-to-TTNN RoPE permutation handling such as `reverse_permute`; inspect the module contract and tests.
+- In the tt-transformers attention module, Q/K weights may need HF-to-TTNN RoPE permutation handling such as `reverse_permute`; inspect the module contract and tests.
 
 ## HF Reference And Synthetic Weights
 
@@ -228,7 +228,7 @@ When calculating latency from the report, prefer the filtered `tt-perf-report` C
 - Runtime prefill/decode should not call torch, `ttnn.from_torch`, or `ttnn.to_torch` except at explicit boundaries.
 - Setup-time conversion inside `from_state_dict`, input construction, final PCC comparison, and a named temporary prefill-to-decode boundary are allowed in the test harness.
 - Host fallback hidden in helpers is still fallback; inspect wrappers as well as the layer file.
-- `models/tt_transformers/tt/model.py` contains host-side last-token extraction patterns for batched prefill. Treat that as an existing production compromise, not as a pattern to copy silently.
+- `models/ttt_compat/tt/model.py` contains host-side last-token extraction patterns for batched prefill. Treat that as an existing production compromise, not as a pattern to copy silently.
 - Run watcher-enabled tests. A clean watcher run is part of done; a suspected false positive needs evidence.
 - Run TT hardware-facing commands one at a time: resets, `tt-smi`, import/open-device probes, Tracy/profile runs, and tests that touch the device.
 - If wheel-installed `ttnn` hits SFPI/JIT mismatches, prefer a source-built tt-metal environment whose headers and compiler match.

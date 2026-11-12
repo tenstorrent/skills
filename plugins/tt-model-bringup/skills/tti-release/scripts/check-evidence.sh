@@ -62,7 +62,7 @@ target_model_dir = sys.argv[2].replace("\\", "/").strip().strip("/")
 
 def normalize_path(value):
     text = str(value).replace("\\", "/").strip().strip("'\"")
-    for marker in ("models/autoports/", "models/tt_transformers", "models/demos/"):
+    for marker in ("models/autoports/", "models/ttt_compat", "models/tt_transformers", "models/demos/"):
         index = text.find(marker)
         if index >= 0:
             return text[index:].rstrip("/")
@@ -118,7 +118,7 @@ for json_path in json_paths:
                 autoport_hits.append(where)
             elif normalized.startswith("models/autoports/"):
                 wrong_autoport_hits.append(f"{where}={normalized}")
-            elif normalized in {"models/tt_transformers", "models/demos/tt_transformers"} or normalized.startswith("models/demos/"):
+            elif normalized in {"models/ttt_compat", "models/tt_transformers", "models/demos/tt_transformers"} or normalized.startswith("models/demos/"):
                 stock_hits.append(f"{where}={normalized}")
 
         if key in {"model_impl", "impl_name", "impl_id"} and text.strip().lower() in {
@@ -128,7 +128,7 @@ for json_path in json_paths:
             stock_hits.append(f"{where}={text.strip()}")
 
         if key == "code_link" and (
-            "models/tt_transformers" in text or "models/demos/" in text
+            "models/ttt_compat" in text or "models/tt_transformers" in text or "models/demos/" in text
         ):
             stock_hits.append(f"{where}={text.strip()}")
 
