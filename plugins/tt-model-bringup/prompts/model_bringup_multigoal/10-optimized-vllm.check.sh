@@ -2,7 +2,8 @@
 TT_MODEL_BRINGUP_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # Runner-side gate for the optimized-vLLM stage: serving optimization (async
 # decode, trace reuse, on-device sampling) must not have introduced stale-input
-# or sampler degeneracy into served outputs. Scoped to this run's model.
+# or sampler degeneracy into served outputs, and the eval-readiness probes for
+# the stage must pass. Scoped to this run's model.
 # Exit 0 pass, 1 advisory, 2 critical, 3 error.
 if [ -n "${MODEL_DIR:-}" ]; then
   scope_args=(--model-dir "$MODEL_DIR")
@@ -19,6 +20,23 @@ python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_context_contract.py" \
   --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}" \
   --stage optimized-vllm --require-contract || exit $?
 
+# Prefix caching stays required; the batched-prefill burst ratio is advisory (D5)
+# unless --burst-critical is passed. Batched-equals-solo evidence stays critical
+# when the serving contract enables batched prefill.
 python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_prefill_features.py" \
   --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}" \
   --stage optimized-vllm --require-burst
+prefill_rc=$?
+
+# Eval readiness: P4 long answers with 32 users + health, P5 long-context timing.
+python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_eval_readiness.py" \
+  --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}" --stage optimized-vllm
+eval_rc=$?
+
+# Worst code wins; 3 (checker error) wins over everything.
+worst=0
+for rc in "$prefill_rc" "$eval_rc"; do
+  if [ "$rc" -ge 3 ]; then exit 3; fi
+  if [ "$rc" -gt "$worst" ]; then worst=$rc; fi
+done
+exit "$worst"

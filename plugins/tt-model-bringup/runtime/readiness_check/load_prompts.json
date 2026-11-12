@@ -1,0 +1,133 @@
+{
+ "note": "Short original reasoning questions for the 32-user long-answer load (P4). Any order; reused round-robin when users exceed the list.",
+ "prompts": [
+  {
+   "id": "q00",
+   "prompt": "A train leaves at 9:40 and travels 210 km at 84 km/h. A second train leaves the same station at 10:05 on the same track at 105 km/h. Does the second train catch up before the first arrives? Show your reasoning."
+  },
+  {
+   "id": "q01",
+   "prompt": "How many positive integers below 1000 are divisible by 7 or 11 but not by both?"
+  },
+  {
+   "id": "q02",
+   "prompt": "Three boxes are labelled apples, oranges and mixed, and every label is wrong. You may draw one fruit from one box. Which box do you draw from, and how do you relabel all three?"
+  },
+  {
+   "id": "q03",
+   "prompt": "Find all real x such that x^4 - 5x^2 + 4 < 0."
+  },
+  {
+   "id": "q04",
+   "prompt": "A bag holds 5 red and 7 blue marbles. Two are drawn without replacement. What is the probability that they have different colours?"
+  },
+  {
+   "id": "q05",
+   "prompt": "Explain why the sum of the first n odd numbers is n squared, and prove it by induction."
+  },
+  {
+   "id": "q06",
+   "prompt": "A rectangle has perimeter 46 and diagonal 17. Find its area."
+  },
+  {
+   "id": "q07",
+   "prompt": "Which is larger, 2^100 or 3^63? Justify without a calculator."
+  },
+  {
+   "id": "q08",
+   "prompt": "A clock shows 3:15. What is the smaller angle between the hour and minute hands?"
+  },
+  {
+   "id": "q09",
+   "prompt": "In how many ways can 8 people sit at a round table if two particular people refuse to sit next to each other?"
+  },
+  {
+   "id": "q10",
+   "prompt": "A chemist needs 600 ml of 25% acid solution and has 10% and 40% stock. How much of each should be mixed?"
+  },
+  {
+   "id": "q11",
+   "prompt": "Prove that there are infinitely many primes of the form 4k + 3."
+  },
+  {
+   "id": "q12",
+   "prompt": "A ladder 10 m long slides down a wall. When its foot is 6 m from the wall it moves away at 0.5 m/s. How fast is the top sliding down?"
+  },
+  {
+   "id": "q13",
+   "prompt": "What is the remainder when 7^2026 is divided by 13?"
+  },
+  {
+   "id": "q14",
+   "prompt": "Five friends each shake hands with some of the others. Show that two of them shook the same number of hands."
+  },
+  {
+   "id": "q15",
+   "prompt": "A gas at 300 K and 2 atm is heated at constant volume to 450 K. What is its new pressure, and which law did you use?"
+  },
+  {
+   "id": "q16",
+   "prompt": "Find the number of trailing zeros in 125 factorial."
+  },
+  {
+   "id": "q17",
+   "prompt": "An investor puts 1000 into an account paying 6% a year compounded monthly. How long until the balance doubles? Reason step by step."
+  },
+  {
+   "id": "q18",
+   "prompt": "Two dice are rolled. Given that the sum is at least 9, what is the probability that at least one die shows a 6?"
+  },
+  {
+   "id": "q19",
+   "prompt": "A knight starts in a corner of a standard chessboard. What is the least number of moves to reach the opposite corner? Explain."
+  },
+  {
+   "id": "q20",
+   "prompt": "Solve the system: x + y + z = 6, 2x - y + z = 3, x + 2y - z = 2."
+  },
+  {
+   "id": "q21",
+   "prompt": "Why does ice float on water? Explain in terms of molecular structure and density."
+  },
+  {
+   "id": "q22",
+   "prompt": "A sequence starts 2, 5, 11, 23, 47. Find a formula for the n-th term and the 10th term."
+  },
+  {
+   "id": "q23",
+   "prompt": "How many diagonals does a convex 15-gon have, and how many intersection points do they form inside it at most?"
+  },
+  {
+   "id": "q24",
+   "prompt": "A cyclist rides uphill at 12 km/h and back down the same road at 30 km/h. What is the average speed for the round trip?"
+  },
+  {
+   "id": "q25",
+   "prompt": "Show that the product of any four consecutive integers is one less than a perfect square."
+  },
+  {
+   "id": "q26",
+   "prompt": "A population of bacteria doubles every 20 minutes. Starting from 50 cells, when does it first exceed one million?"
+  },
+  {
+   "id": "q27",
+   "prompt": "A fair coin is tossed until two heads appear in a row. What is the expected number of tosses?"
+  },
+  {
+   "id": "q28",
+   "prompt": "What is the derivative of x^x, and where does x^x reach its minimum for x > 0?"
+  },
+  {
+   "id": "q29",
+   "prompt": "A store raises a price by 20% and later cuts the new price by 20%. Is the final price higher or lower than the original, and by what percent?"
+  },
+  {
+   "id": "q30",
+   "prompt": "Four points are chosen on a circle. What is the probability that the quadrilateral they form contains the centre?"
+  },
+  {
+   "id": "q31",
+   "prompt": "Estimate how many piano tuners work in a city of three million people. State each assumption."
+  }
+ ]
+}
