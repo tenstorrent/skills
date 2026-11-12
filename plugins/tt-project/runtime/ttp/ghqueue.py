@@ -40,6 +40,7 @@ OUT_MAX = 4 << 20
 GH_TIMEOUT_S = 120
 REMOTE = 'PATH="$HOME/.local/bin:$PATH" ttp gh-queue'   # setup's default shim folder, off a non-login PATH
 _KEY = re.compile(r"[0-9a-f]{32}")
+_SHA = re.compile(r"[0-9a-f]{40}([0-9a-f]{24})?")
 _READS = {("pr", "view"), ("pr", "list"), ("pr", "checks"), ("issue", "view"), ("issue", "list")}
 _POSTS = {("pr", "comment"), ("issue", "comment"), ("pr", "create")}
 _API_FIELDS = {"-f", "-F", "--field", "--raw-field"}
@@ -51,6 +52,13 @@ _EDIT_FLAGS = {"--title": "--title", "-t": "--title", "--body": "--body", "-b": 
 _CLOSE_FLAGS = {"--comment": "--comment", "-c": "--comment", "--repo": "--repo", "-R": "--repo"}
 _REPLY_PATH = re.compile(r"/?repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pulls/[0-9]+/comments/[0-9]+/replies")
 _REPLY_FLAGS = {"-X": "method", "--method": "method", "-f": "field", "--raw-field": "field"}
+# A project's own task branches (worktree's ttp/t<id>-<topic>, harness and revert branches); only these may be
+# deleted, one plain ref each: no `..`, no %-encoding, no empty or dot-led segment, never main, master or default
+OWN_PREFIX = "ttp/"
+_DELETE_PATH = re.compile(r"/?repos/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/git/refs/heads/(.+)")
+_REF_SEG = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*")
+_DELETE_FLAGS = {"-X": "method", "--method": "method"}
+_PROTECTED = {"main", "master"}
 
 
 def _body(argv: list[str], stdin: bytes) -> str | None:
@@ -158,10 +166,61 @@ def own_draft(gh: str, argv: list[str]) -> str:
     return ""
 
 
+def _delete(argv: list[str]) -> str | None:
+    """None unless `gh api` names a branch ref under repos/<o>/<r>/git/refs/heads/; then why it is refused,
+    or "": exactly one `-X DELETE` of one of the project's own branches (OWN_PREFIX), nothing else."""
+    if not any(_DELETE_PATH.fullmatch(a) for a in argv[1:]):
+        return None
+    pos, opts, why = _parse(argv[1:], _DELETE_FLAGS)
+    if why:
+        return f"a branch delete: {why} (only -X DELETE and the ref's path)"
+    if len(pos) != 1 or [m.upper() for m in opts.get("method", [])] != ["DELETE"]:
+        return "a branch ref is only deleted, with one `-X DELETE` of one path (other writes to refs are refused)"
+    m = _DELETE_PATH.fullmatch(pos[0])
+    branch = m.group(3) if m else ""
+    if not m or {m.group(1), m.group(2)} & {".", ".."}:
+        return "a branch delete names one repo as repos/<owner>/<repo>"
+    if branch in _PROTECTED or not branch.startswith(OWN_PREFIX):
+        return f"a branch delete names only the project's own {OWN_PREFIX} branches, never `{branch}`"
+    if not all(_REF_SEG.fullmatch(seg) and not seg.endswith(".lock") for seg in branch.split("/")) or ".." in branch:
+        return "a branch delete names one plain branch (no `..`, %-encoding or empty segment)"
+    return ""
+
+
+def delete_target(argv: list[str]) -> tuple[str, str]:
+    """(owner/repo, branch) of an allowed branch delete."""
+    m = _DELETE_PATH.fullmatch(next(a for a in argv[1:] if _DELETE_PATH.fullmatch(a)))
+    return f"{m.group(1)}/{m.group(2)}", m.group(3)
+
+
+def own_branch(gh: str, argv: list[str]) -> tuple[str, str]:
+    """(why the workstation must not delete the branch `gh api -X DELETE` names, or "", its tip sha): read
+    just before the delete, so the answer records the tip and the branch can be restored; never the repo's
+    default branch."""
+    repo, branch = delete_target(argv)
+    try:
+        info = subprocess.run([gh, "api", f"repos/{repo}", "--jq", ".default_branch"], capture_output=True,
+                              timeout=GH_TIMEOUT_S)
+        ref = subprocess.run([gh, "api", f"repos/{repo}/git/ref/heads/{branch}", "--jq", ".object.sha"],
+                             capture_output=True, timeout=GH_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired):
+        return "could not read the repo's default branch or the branch's tip before deleting it", ""
+    default, tip = info.stdout.decode().strip(), ref.stdout.decode().strip()
+    if info.returncode or not default:
+        return "could not read the repo's default branch before deleting a branch", ""
+    if branch == default:
+        return f"`{branch}` is the repo's default branch and is never deleted", ""
+    if ref.returncode or not _SHA.fullmatch(tip):
+        return f"could not read `{branch}`'s tip before deleting it (is it there?)", ""
+    return "", tip
+
+
 def allowed(argv, stdin: bytes = b"") -> str:
     """Why the workstation must not run `gh argv`, or "": the allowlist, checked on both sides. `gh api`
     GET reads, pr view/list/checks, issue view/list, pr and issue comments, `pr create --draft`, a reply
-    to a PR review comment (`gh api -X POST .../pulls/<n>/comments/<id>/replies -f body=...`), `pr edit`
+    to a PR review comment (`gh api -X POST .../pulls/<n>/comments/<id>/replies -f body=...`), deleting one
+    of the project's own ttp/ branches (`gh api -X DELETE repos/<o>/<r>/git/refs/heads/ttp/...`; the
+    workstation also reads its tip first and refuses the default branch), `pr edit`
     of the title or body only and `pr close` (the workstation also checks the PR is its own draft), each
     post, body or comment ending with the AI-authorship tag; never `pr ready`, a merge, a reviewer, a
     label or anything else."""
@@ -171,6 +230,8 @@ def allowed(argv, stdin: bytes = b"") -> str:
         return f"`{bad}`: short options go one per word, values apart (so none hides a method, field or --web)"
     if argv[0] == "api":
         if (why := _reply(argv)) is not None:
+            return why
+        if (why := _delete(argv)) is not None:
             return why
         get = any(a.upper() == "--METHOD=GET" or (a in ("-X", "--method") and nxt.upper() == "GET")
                   for a, nxt in zip(argv, [*argv[1:], ""]))
@@ -230,14 +291,21 @@ def prune(d: Path, now: float | None = None) -> None:
 
 
 def _project(cwd: str | None) -> str:
-    if os.environ.get("TTP_PROJECT"):
-        return Path(os.environ["TTP_PROJECT"]).name   # a name, never this host's paths
+    """The project's registered name (`ttp list`), never this host's paths: every project's folder is
+    tt-project, so its name tells the workstation's log which project asked. Else its configured name, its
+    root folder's name, then the folder's."""
+    env = os.environ.get("TTP_PROJECT")
     try:
-        from .project import here
-        p = here(cwd)
-        return p.name if p else ""
+        from .project import Project, here, load_registry
+        p = Project(env) if env else here(cwd)
+        if p is None:
+            return ""
+        for name, e in (load_registry().get("projects") or {}).items():
+            if isinstance(e, dict) and e.get("dir") and Path(str(e["dir"])).resolve() == p.root:
+                return str(name)
+        return p.name
     except Exception:
-        return ""
+        return Path(env).name if env else ""
 
 
 def enqueue(args: list[str], input: bytes | None = None, cwd: str | None = None, home=None) -> int:
@@ -302,6 +370,16 @@ def take(home=None, now: float | None = None) -> list[dict]:
     return out
 
 
+DELETED = "deleted-branches.jsonl"   # each branch delete's tip, kept past prune, so a branch can be restored
+
+
+def _deleted(d: Path, row: dict) -> None:
+    with open(d / DELETED, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(row) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
 def put(results, home=None) -> int:
     """Store the workstation's answers to calls taken here; returns how many were stored."""
     d, n = outbox(home), 0
@@ -310,9 +388,17 @@ def put(results, home=None) -> int:
         if not isinstance(key, str) or not _KEY.fullmatch(key) or (v := _load(d / f"{key}.taken")) is None:
             continue
         rc = r.get("rc")
-        _write(d / f"{key}.done", {"rc": rc if isinstance(rc, int) else 1, "write": bool(v.get("write")),
-                                   "stdout": str(r.get("stdout") or "")[:OUT_MAX],
-                                   "stderr": str(r.get("stderr") or "")[:OUT_MAX], "at": time.time()})
+        done = {"rc": rc if isinstance(rc, int) else 1, "write": bool(v.get("write")),
+                "stdout": str(r.get("stdout") or "")[:OUT_MAX], "stderr": str(r.get("stderr") or "")[:OUT_MAX],
+                "at": time.time()}
+        tip = r.get("tip")
+        if isinstance(tip, str) and _SHA.fullmatch(tip) and isinstance(v.get("argv"), list) \
+                and _delete(v["argv"]) == "":
+            repo, branch = delete_target(v["argv"])
+            done.update(tip=tip, branch=branch)
+            _deleted(d, {"repo": repo, "branch": branch, "tip": tip, "rc": done["rc"], "project": v.get("project"),
+                         "task": v.get("task"), "at": done["at"]})
+        _write(d / f"{key}.done", done)
         (d / f"{key}.taken").unlink(missing_ok=True)
         n += 1
     return n
@@ -335,14 +421,24 @@ def answer(entry: dict, gh: str | None = None) -> dict | None:
     gh = gh or shutil.which("gh", path=os.environ.get("PATH", "") + ":/opt/homebrew/bin:/usr/local/bin") or "gh"
     if argv[:2] == ["pr", "close"] and (why := own_draft(gh, argv)):
         return {"key": key, "rc": 1, "stdout": "", "stderr": f"refused on the workstation: {why}"}
+    tip = ""
+    if argv[0] == "api" and _delete(argv) == "":
+        why, tip = own_branch(gh, argv)
+        if why:
+            return {"key": key, "rc": 1, "stdout": "", "stderr": f"refused on the workstation: {why}"}
     try:
         p = subprocess.run([gh, *argv], input=stdin, capture_output=True, timeout=GH_TIMEOUT_S)
     except subprocess.TimeoutExpired:
-        return {"key": key, "rc": 124, "stdout": "", "stderr": f"gh timed out after {GH_TIMEOUT_S}s on the workstation"}
+        out = {"key": key, "rc": 124, "stdout": "", "stderr": f"gh timed out after {GH_TIMEOUT_S}s on the workstation"}
     except OSError as e:
         return {"key": key, "rc": 127, "stdout": "", "stderr": f"gh could not run on the workstation: {e}"}
-    return {"key": key, "rc": p.returncode, "stdout": p.stdout.decode("utf-8", "replace"),
-            "stderr": p.stderr.decode("utf-8", "replace")}
+    else:
+        out = {"key": key, "rc": p.returncode, "stdout": p.stdout.decode("utf-8", "replace"),
+               "stderr": p.stderr.decode("utf-8", "replace")}
+    if tip:   # the tip read just before the delete, so the branch can be restored
+        out["tip"] = tip
+        out["stderr"] += f"\nbranch tip before the delete: {tip}\n"
+    return out
 
 
 def pull(box: str, gh: str | None = None) -> str:

@@ -741,6 +741,88 @@ def test_gh_workstation_allows_pr_upkeep_title_body_edits_review_replies_and_clo
     assert ghqueue.pull("lab-box", gh) == "lab-box: no gh calls queued"
 
 
+def test_gh_queue_entries_carry_the_registered_project_name_not_the_tt_project_folder(env, monkeypatch):
+    """Every project's folder is tt-project, so a queue entry names the project as `ttp list` shows it
+    (its registry entry), else its configured name or root folder; never a path."""
+    from ttp import ghqueue, project
+    monkeypatch.setattr(project, "HOME_DIR", env["tmp"] / "reghome")
+    (env["tmp"] / "reghome").mkdir()
+    a, b = env["tmp"] / "a" / "tt-project", env["tmp"] / "b" / "tt-project"
+    for d in (a, b):
+        d.mkdir(parents=True)
+    project.registry_path().write_text(json.dumps({"projects": {
+        "alpha": {"host": "h", "dir": str(a.parent)}, "beta": {"host": "h", "dir": str(b.parent)}}}))
+    monkeypatch.setenv("TTP_PROJECT", str(a))
+    assert ghqueue._project(None) == "alpha"
+    monkeypatch.setenv("TTP_PROJECT", str(b))
+    assert ghqueue._project(None) == "beta"
+    project.registry_path().write_text(json.dumps({"projects": {}}))
+    assert ghqueue._project(None) == "b"   # unregistered: its root folder, never `tt-project` for all
+
+
+def test_gh_workstation_deletes_only_the_projects_own_ttp_branch_and_records_its_tip(env, monkeypatch):
+    """One narrow write: `gh api -X DELETE repos/<o>/<r>/git/refs/heads/ttp/...`. Never main, master, the
+    repo's default branch, another prefix, a traversal or encoded slash, extra flags or fields, or another
+    method on refs. The workstation reads the default branch and the tip first; the box keeps the tip."""
+    from ttp import ghqueue, ghroute
+    cfg, repo, gh, ws_calls = _workstation(env, monkeypatch)
+    ref = "repos/acme/widgets/git/refs/heads/"
+    own = ref + "ttp/t12-faster-pulls"
+    for ok in (["api", "-X", "DELETE", own], ["api", "--method", "delete", "/" + own],
+               ["api", "--method=DELETE", own], ["api", "-X", "DELETE", ref + "ttp/harness-t3"]):
+        assert ghqueue.allowed(ok) == "", ok
+    for bad in (["api", "-X", "DELETE", ref + "main"], ["api", "-X", "DELETE", ref + "master"],
+                ["api", "-X", "DELETE", ref + "feature/x"], ["api", "-X", "DELETE", ref + "ttpx/y"],
+                ["api", "-X", "DELETE", ref + "ttp/../main"], ["api", "-X", "DELETE", ref + "ttp/a/../../main"],
+                ["api", "-X", "DELETE", ref + "ttp%2F..%2Fmain"], ["api", "-X", "DELETE", ref + "ttp/a%2Fb"],
+                ["api", "-X", "DELETE", ref + "ttp//a"], ["api", "-X", "DELETE", ref + "ttp/a/"],
+                ["api", "-X", "DELETE", ref + "ttp/a.lock"], ["api", "-X", "DELETE", ref + "ttp/.a"],
+                ["api", "-X", "DELETE", ref + "ttp/a@{1}"], ["api", "-X", "DELETE", ref + "ttp/a?x=1"],
+                ["api", "-X", "DELETE", ref + "ttp/"], ["api", "-X", "DELETE", own, own],
+                ["api", "-X", "DELETE", own, "-f", "sha=x"], ["api", "-X", "DELETE", own, "-F", "force=true"],
+                ["api", "-X", "DELETE", own, "-H", "X-HTTP-Method-Override: PATCH"],
+                ["api", "-X", "DELETE", own, "--input", "-"], ["api", "-X", "DELETE", "-X", "DELETE", own],
+                ["api", "-X", "POST", own], ["api", "-X", "PATCH", own, "-f", "sha=x"], ["api", own, "-f", "sha=x"],
+                ["api", "-XDELETE", own], ["api", "-X", "DELETE", "repos/acme/widgets/git/refs/tags/ttp/x"],
+                ["api", "-X", "DELETE", "repos/../../git/refs/heads/ttp/x"],
+                ["api", "-X", "DELETE", "repos/acme/widgets"], ["api", "-X", "DELETE", "repos/acme/widgets/pulls/3"]):
+        assert ghqueue.allowed(bad), bad
+
+    # the workstation reads the default branch and the tip just before; refuses the default or an unreadable tip
+    ws = ws_calls.parent
+    default, tipf = ws / "default", ws / "tip"
+    stub = ws / "gh-delete"
+    stub.write_text("#!/bin/sh\n"
+                    f'printf "%s\\n" "$*" >> "{ws_calls}"\n'
+                    f'case "$*" in "api repos/acme/widgets --jq .default_branch") cat "{default}";;\n'
+                    f'  "api repos/acme/widgets/git/ref/heads/"*) cat "{tipf}";; *) echo "ws: $*";; esac\n')
+    stub.chmod(0o755)
+    sha = "ab" * 20
+    delete = ["api", "-X", "DELETE", own]
+    for dflt, tip, refused in (("ttp/t12-faster-pulls", sha, "default branch"), ("main", "", "tip"),
+                               ("main", "not-a-sha", "tip"), ("main", sha, "")):
+        default.write_text(dflt + "\n")
+        tipf.write_text(tip + "\n")
+        got = ghqueue.answer({"key": "e" * 32, "argv": delete, "stdin": ""}, str(stub))
+        assert (refused in got["stderr"] and got["rc"] == 1 and "tip" not in got) if refused \
+            else (got["rc"] == 0 and got["tip"] == sha and sha in got["stderr"]), got
+    calls = ws_calls.read_text().splitlines()
+    assert sum(c.startswith("api -X DELETE") for c in calls) == 1, calls   # only once, after both reads
+    ws_calls.unlink()
+
+    # end to end: the box queues it once, the workstation answers with the tip, the box keeps it past prune
+    monkeypatch.setattr(ghqueue, "own_branch", lambda gh, argv: ("", sha))
+    assert ghroute.run("gh", delete, cfg=cfg, cwd=str(repo)) == ghroute.HELD_RC
+    assert ghqueue.pull("lab-box", gh) == "lab-box: answered 1 gh call(s)"
+    assert ghroute.run("gh", delete, cfg=cfg, cwd=str(repo)) == 0
+    rows = [json.loads(x) for x in (ghqueue.outbox() / ghqueue.DELETED).read_text().splitlines()]
+    assert [(r["repo"], r["branch"], r["tip"], r["task"]) for r in rows] == [
+        ("acme/widgets", "ttp/t12-faster-pulls", sha, "42")], rows
+    assert ghqueue.enqueue(["api", "-X", "DELETE", ref + "main"], cwd=str(repo)) == 1   # refused on the box too
+    # a forged answer carrying a tip for a call that is no branch delete records nothing
+    assert ghqueue.put([{"key": "f" * 32, "rc": 0, "tip": sha}]) == 0
+
+
 def test_bridge_gh_pull_is_a_per_box_switch():
     from ttp import bridge
     agents = {"a": {"agent": "env", "direct": [{"name": "h"}]}}
