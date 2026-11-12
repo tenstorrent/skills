@@ -37,6 +37,7 @@ import bz2
 import json
 import os
 import random
+import re
 import sys
 import threading
 import time
@@ -111,21 +112,44 @@ def insert_at(text: str, fact: str, depth: float) -> str:
     return text[:pos] + fact + text[pos:]
 
 
+LENGTH_TOLERANCE = 0.02
+
+
+def length_tolerance(target_tokens: int) -> int:
+    return int(max(64, LENGTH_TOLERANCE * target_tokens))
+
+
 def recall_prompt(book: str, target_tokens: int, depth: float, seed: int, count_tokens) -> tuple[str, str, int]:
-    """Prompt of about ``target_tokens`` chat tokens with the needle at ``depth``; returns (prompt, answer, tokens)."""
+    """Prompt of at most ``target_tokens`` chat tokens (within the tolerance below it) with the needle at
+    ``depth``; returns (prompt, answer, tokens). Never overshoots, so a clamped length fits max_model_len."""
     answer, fact, question = needle_for(seed)
     chars_per_token = 4.0
     prompt, tokens = "", 0
+    body_chars = 200
     for _ in range(4):
         body_chars = max(200, int((target_tokens - 64) * chars_per_token))
         prompt = insert_at(long_text(book, body_chars), fact, depth) + "\n\n" + question
         tokens = count_tokens(prompt)
         if tokens <= 0:
-            break
-        if abs(tokens - target_tokens) <= max(64, 0.02 * target_tokens):
+            return prompt, answer, tokens
+        if 0 <= target_tokens - tokens <= length_tolerance(target_tokens):
             break
         chars_per_token = len(prompt) / tokens
+    for _ in range(12):
+        if tokens <= target_tokens or body_chars <= 200:
+            break
+        body_chars = max(200, body_chars - int((tokens - target_tokens) * chars_per_token) - 16)
+        prompt = insert_at(long_text(book, body_chars), fact, depth) + "\n\n" + question
+        tokens = count_tokens(prompt)
     return prompt, answer, tokens
+
+
+CONTEXT_ERROR_RE = re.compile(r"context length|max_model_len|maximum model length|too long|exceeds|max_tokens", re.I)
+
+
+def is_context_length_error(error: Optional[str]) -> bool:
+    """HTTP 400 because the request does not fit the served context: a probe-setup error."""
+    return bool(error) and str(error).startswith("HTTP 400") and bool(CONTEXT_ERROR_RE.search(str(error)))
 
 
 def contains_answer(answer: str, *texts: str) -> bool:
@@ -147,13 +171,15 @@ def run_accuracy(args, server: str, model: str, max_len: Optional[int], log: sp.
     profile = sp.load_profile(args.profile, args.profiles_file)
     book = read_text(find_book(args.text_file, args.tt_metal))
     chat_kwargs = {"enable_thinking": bool(args.thinking)}
-    lengths = clamp_lengths(sp.parse_csv_ints(args.lengths or DEFAULT_ACCURACY_LENGTHS), max_len, args.max_tokens + 64)
+    # Reserve the answer budget, chat-template slack and the length tolerance.
+    reserve = args.max_tokens + 64 + (int(LENGTH_TOLERANCE * max_len) if max_len else 0)
+    lengths = clamp_lengths(sp.parse_csv_ints(args.lengths or DEFAULT_ACCURACY_LENGTHS), max_len, reserve)
     depths = sp.parse_csv_floats(args.depths)
 
     def count(prompt: str) -> int:
         return len(sp.tokenize(server, model, messages=[{"role": "user", "content": prompt}], chat_kwargs=chat_kwargs))
 
-    rows, checks = [], []
+    rows, checks, setup_errors = [], [], []
     chat_profile = {"chat": True, "thinking": bool(args.thinking), "request": {}}
     for length in lengths:
         results = []
@@ -164,12 +190,22 @@ def run_accuracy(args, server: str, model: str, max_len: Optional[int], log: sp.
             url, body = sp.build_request(server, model, chat_profile, content=prompt, max_tokens=args.max_tokens,
                                          overrides={"temperature": 0.0})
             rec = sp.stream_request(url, body, timeout=args.request_timeout)
+            setup = is_context_length_error(rec.get("error"))
+            if setup:
+                setup_errors.append(f"~{length} tok ({tokens}) depth {depth}: {rec['error'][:160]}")
             ok = not rec.get("error") and contains_answer(answer, rec.get("text"), rec.get("reasoning"))
             results.append({"length": length, "prompt_tokens": tokens, "depth": depth, "answer": answer, "pass": ok,
+                            "setup_error": setup,
                             "error": rec.get("error"), "finish_reason": rec.get("finish_reason"),
                             "output_tail": ((rec.get("text") or "") or (rec.get("reasoning") or ""))[-200:],
                             "ttft_ms": sp.r(sp.ttft_ms(rec), 1)})
         rows += results
+        measured = [r for r in results if not r["setup_error"]]
+        if not measured:
+            checks.append(check(f"recall_{length}", None,
+                                detail="not measured: every prompt was rejected as too long (see probe_setup)"))
+            continue
+        results = measured
         failed = [r for r in results if not r["pass"]]
         detail = (f"{len(failed)}/{len(results)} depths missed the needle at ~{length} tokens "
                   f"(e.g. depth {failed[0]['depth']}: {failed[0]['error'] or repr(failed[0]['output_tail'][-80:])}); "
@@ -177,6 +213,11 @@ def run_accuracy(args, server: str, model: str, max_len: Optional[int], log: sp.
                   if failed else f"needle recalled at all {len(results)} depths")
         checks.append(check(f"recall_{length}", not failed, value=len(results) - len(failed), threshold=len(results),
                             detail=detail))
+    if setup_errors:
+        checks.append(check(
+            "probe_setup", False, waivable=False, value=len(setup_errors), threshold=0,
+            detail=f"{len(setup_errors)} recall prompts rejected as too long for the served context (probe setup error, "
+            f"not a recall failure): {setup_errors[0]}; lower --lengths or check /tokenize against the served template"))
     mode = sp.sample_on_device_mode(log.text(0)) if log.available else None
     on_device = mode is not None and mode.lower() not in ("none", "off", "false", "host")
     checks.append(check(
@@ -190,10 +231,11 @@ def run_accuracy(args, server: str, model: str, max_len: Optional[int], log: sp.
     sp.write_jsonl(raw / "cases.jsonl", rows)
     lines = [f"lengths {lengths} depths {depths} max_model_len {max_len} thinking {bool(args.thinking)}",
              f"sample_on_device_mode {mode}; temperature 0",
-             *[f"~{r['length']} tok ({r['prompt_tokens']}) depth {r['depth']}: {'ok' if r['pass'] else 'MISS'}" for r in rows[:9]]]
+             *[f"~{r['length']} tok ({r['prompt_tokens']}) depth {r['depth']}: "
+               f"{'ok' if r['pass'] else 'SETUP' if r['setup_error'] else 'MISS'}" for r in rows[:9]]]
     return write_result(args.model_dir, ACCURACY_PROBE, checks, summary_lines=lines,
                         data={"model": model, "max_model_len": max_len, "sample_on_device_mode": mode,
-                              "cases": [{k: r[k] for k in ("length", "prompt_tokens", "depth", "pass")} for r in rows]},
+                              "cases": [{k: r[k] for k in ("length", "prompt_tokens", "depth", "pass", "setup_error")} for r in rows]},
                         output=args.output)
 
 

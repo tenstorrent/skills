@@ -34,7 +34,7 @@ class FakeVllm:
         self.cfg = dict(tpot_s=0.0005, host_factor=1.0, fail_every=0, leak_running=0, kv_leak=0.0,
                         capture_during_load=False, recall_ok=True, max_model_len=200000, cliff_at=None,
                         cliff_tpot_s=0.01, misaligned_slow=False, preempt_per_request=0, pool_tokens=10_000_000,
-                        sample_mode='all', mnbt=2048, log_line_during_load='')
+                        sample_mode='all', mnbt=2048, log_line_during_load='', context_error=False)
         self.cfg.update(cfg)
         self.active = 0
         self.requests = 0
@@ -115,6 +115,9 @@ class FakeVllm:
         try:
             if c['fail_every'] and index % c['fail_every'] == 0:
                 return handler._json(500, {'error': 'engine failure'})
+            if c['context_error'] and chat:
+                return handler._json(400, {'error': {'message': "This model's maximum context length is 1200 tokens. "
+                                                     'However, you requested 1300 tokens.'}})
             if chat:
                 prompt = ' '.join(m['content'] for m in body['messages'])
                 plen = len(prompt) // 4
@@ -384,8 +387,26 @@ def test_p5_accuracy_clamps_to_served_context(fake, tmp_path, book):
     model = tmp_path / 'model'
     assert p5.main(p5_args(server, model, 'accuracy', book, '--lengths', '8192,32768', '--depths', '0.5')) == 0
     data, checks = result(model, 'long_context_accuracy')
-    assert list(checks) == ['recall_624', 'served_on_device_sampling', 'context_coverage']
+    # 1200 - 512 answer tokens - 64 template slack - 2% length tolerance.
+    assert list(checks) == ['recall_600', 'served_on_device_sampling', 'context_coverage']
     assert checks['context_coverage']['status'] == 'skip'
+
+
+def test_p5_recall_prompt_never_overshoots_the_target(book):
+    text = p5.read_text(book)
+    for target in (400, 1600, 5000):
+        # A tokenizer with a large fixed overhead: the first estimate overshoots inside the old 2% tolerance.
+        _prompt, _answer, tokens = p5.recall_prompt(text, target, 0.5, 1, lambda p: len(p) // 4 + 50)
+        assert target - p5.length_tolerance(target) - 64 <= tokens <= target, (target, tokens)
+
+
+def test_p5_context_length_400_is_a_setup_error_not_a_recall_miss(fake, tmp_path, book):
+    server = fake(context_error=True)
+    model = tmp_path / 'model'
+    assert p5.main(p5_args(server, model, 'accuracy', book, '--lengths', '400', '--depths', '0.5')) == 2
+    _, checks = result(model, 'long_context_accuracy')
+    assert checks['recall_400']['status'] == 'skip'
+    assert checks['probe_setup']['status'] == 'fail' and 'not a recall failure' in checks['probe_setup']['detail']
 
 
 def test_p5_book_search_falls_back_to_the_older_path(tmp_path):
