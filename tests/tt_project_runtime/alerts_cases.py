@@ -5675,7 +5675,8 @@ def test_the_notifier_agent_runs_at_standard_priority_and_an_old_background_one_
     monkeypatch.setenv("HOME", str(tmp_path / "userhome"))
     monkeypatch.delenv("TTP_TEST_NO_NOTIFIER", raising=False)
     monkeypatch.setattr(notifier.sys, "platform", "darwin")
-    monkeypatch.setattr(notifier.subprocess, "run", lambda args, **kw: subprocess.CompletedProcess(args, 0, "", ""))
+    monkeypatch.setattr(notifier.subprocess, "run", lambda args, **kw: subprocess.CompletedProcess(
+        args, 113 if args[:2] == ["launchctl", "print"] else 0, "", ""))   # a bootout unloads it
     assert notifier.install() == "installed and started (launchd)"
     plist = notifier.agent_file()
     assert plistlib.loads(plist.read_bytes())["ProcessType"] == "Standard"

@@ -12514,12 +12514,15 @@ def cmd_setup(a) -> None:
     for ln in notifier.refresh(send_test=True, always=True):   # an installed notifier runs this code from now on
         print(ln)
     from . import bridge
-    for ln in bridge.refresh():   # installed bridge sessions run the current wrapper from now on
+    bridge_out, bridge_rc = bridge.refresh_checked()   # installed bridge sessions run the current wrapper from now on
+    for ln in bridge_out:
         print(ln)
     from .project import DEFAULT_CONFIG
     print("defaults for new projects:")
     for ln in new_project_defaults_lines():
         print("  " + ln)
+    if bridge_rc:
+        die("ttp setup: the access bridge is still down after its restart (above); the rest is set up", 1)
 
 
 def cmd_uninstall(a) -> None:
@@ -12789,7 +12792,8 @@ def cmd_upgrade(a) -> None:
     for ln in notifier.refresh(send_test=not a.auto):   # this machine's notifier on the installed code too
         print(ln)
     from . import bridge
-    for ln in bridge.refresh():   # and its bridge sessions
+    bridge_out, bridge_rc = bridge.refresh_checked()   # and its bridge sessions
+    for ln in bridge_out:
         print(ln)
     from . import codexmarket
     for ln in codexmarket.once():   # and Codex's copy of tt-project, once per release
@@ -12869,6 +12873,8 @@ def cmd_upgrade(a) -> None:
         raise
     finally:
         held.close()
+    if bridge_rc:
+        die(f"upgrade of {p.name} done, but the access bridge is still down after its restart (above)", 1)
 
 
 def _restart_daemon(p: Project):

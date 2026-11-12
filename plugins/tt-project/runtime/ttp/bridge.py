@@ -427,10 +427,10 @@ def start(box: str, agent: str, argv: list[str], platform: str | None = None) ->
     HOME_DIR.mkdir(parents=True, exist_ok=True)
     if platform == "darwin":
         durable_write(f, plistlib.dumps(launchd_plist(box, agent, argv)))
-        target = f"gui/{os.getuid()}/{label(box, agent)}"
-        _run(["launchctl", "bootout", target])   # a changed command takes effect
-        r = _run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(f)])
-        return "launchd agent started" if r.returncode == 0 else f"launchd refused it: {r.stderr.strip()[:200]}"
+        from .service import _reload   # bootout, then bootstrap retried past launchd's error 5 right after it
+        r = _reload(label(box, agent), f, lambda *a: _run(list(a)))
+        return ("launchd agent started" if r.returncode == 0
+                else f"launchd refused it: {(r.stderr or r.stdout).strip()[:200]}")
     durable_write(f, systemd_unit(box, agent, argv))
     _run(["systemctl", "--user", "daemon-reload"])
     r = _run(["systemctl", "--user", "enable", "--now", "--", f"{label(box, agent)}.service"])
@@ -532,9 +532,10 @@ def installed_argv(box: str, agent: str, platform: str | None = None) -> list[st
     return None
 
 
-def refresh(platform: str | None = None, path: Path | None = None) -> list[str]:
+def refresh(platform: str | None = None, path: Path | None = None, restarted: dict | None = None) -> list[str]:
     """After `ttp setup` or an upgrade: re-install the relay copy and restart each installed session
-    whose command changed. Nothing when no bridge is configured or installed here."""
+    whose command changed (into `restarted`: (box, agent) -> what the restart said). Nothing when no
+    bridge is configured or installed here."""
     if os.environ.get("TTP_TEST_NO_BRIDGE_REFRESH") or not (path or CONFIG).is_file():
         return []
     try:
@@ -550,8 +551,40 @@ def refresh(platform: str | None = None, path: Path | None = None) -> list[str]:
             argv = service_argv(cfg, box, an)
             install_relay()
             if have != argv:
-                out.append(f"bridge {box} {an}: service command changed; {start(box, an, argv, platform)}")
+                said = start(box, an, argv, platform)
+                if restarted is not None:
+                    restarted[(box, an)] = said
+                out.append(f"bridge {box} {an}: service command changed; {said}")
     return out
+
+
+CHECK_WAIT_S = 30   # a restarted session needs a few seconds to log in and forward its links
+
+
+def refresh_checked(platform: str | None = None, path: Path | None = None,
+                    wait_s: float | None = None) -> tuple[list[str], int]:
+    """refresh, then `ttp bridge status`'s check of each box whose session it restarted, retried while the
+    sessions connect (at most wait_s). rc 1, with the links still down and launchd's answer, when any is."""
+    restarted: dict = {}
+    out = refresh(platform, path, restarted)
+    if not restarted:
+        return out, 0
+    cfg = load(path)
+    boxes = sorted({box for box, _ in restarted})
+    deadline = time.time() + (CHECK_WAIT_S if wait_s is None else wait_s)
+    while True:
+        lines, rc = status(cfg, boxes, platform)
+        if rc == 0 or time.time() >= deadline:
+            break
+        time.sleep(3)
+    out += [f"bridge status: {ln}" for ln in lines]
+    if rc:
+        down = [f"{box} {an}" + (f" ({said})" if "refused" in said else "")
+                for (box, an), said in sorted(restarted.items())
+                if any(ln.startswith((f"{box} {an}: DOWN", f"{box}: ")) for ln in lines)]
+        out.append(f"bridge: still down after its restart: {'; '.join(down) or ', '.join(boxes)}; "
+                   f"`ttp bridge status` shows it, `ttp bridge setup <box>` restarts it")
+    return out, rc
 
 
 def probe_script(cfg: dict, box: str) -> str:

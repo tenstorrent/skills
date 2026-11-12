@@ -1026,9 +1026,10 @@ def install() -> str:
             "Label": LABEL, "ProgramArguments": argv, "WorkingDirectory": str(HOME_DIR),
             "EnvironmentVariables": env, "RunAtLoad": True, "KeepAlive": True,
             "ProcessType": "Standard", "StandardOutPath": str(LOG), "StandardErrorPath": str(LOG)}))
-        subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{LABEL}"], capture_output=True)
-        r = subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist)], capture_output=True, text=True)
-        return "installed and started (launchd)" if r.returncode == 0 else f"launchd failed: {r.stderr.strip()[:200]}"
+        from .service import _reload   # bootout, then bootstrap retried past launchd's error 5 right after it
+        r = _reload(LABEL, plist)
+        return ("installed and started (launchd)" if r.returncode == 0
+                else f"launchd failed: {(r.stderr or r.stdout).strip()[:200]}")
     unit_dir = hoststate.unit_dir()   # a test run's fake under its marker
     unit_dir.mkdir(parents=True, exist_ok=True)
     envs = "\n".join(f"Environment={k}={v}" for k, v in env.items())

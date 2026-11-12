@@ -112,7 +112,8 @@ def _start(name: str, platform: str) -> str:
     if platform == "darwin":
         target = f"gui/{os.getuid()}/{label(name)}"
         if _run("launchctl", "print", target).returncode != 0:   # not loaded yet
-            r = _run("launchctl", "bootstrap", f"gui/{os.getuid()}", str(f))
+            from .service import bootstrap   # retried past launchd's error 5 right after a bootout
+            r = bootstrap(label(name), f, _run)
             if r.returncode != 0:
                 return f"launchd refused it: {r.stderr.strip()[:200]}"
         _run("launchctl", "kickstart", target)   # starts it if it is not running; never a second copy

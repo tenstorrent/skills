@@ -1071,3 +1071,94 @@ def test_bridge_host_watch_skips_ssh_identityagent_keywords(env, tmp_path, monke
     bridgewatch.check(d, now, cfg)
     assert bridgewatch.check(d, now + 15 * 60 + 1, cfg) == ["bridge-agent:auto"]
     assert not p.db.q("SELECT id FROM alerts WHERE key LIKE '%none%' OR key LIKE '%SSH_AUTH%'")
+
+
+def _fake_launchctl(tmp_path, monkeypatch, fails):
+    """A `launchctl` on PATH (never the real one) answering like launchd: its first `fails` bootstraps (None:
+    all) fail with error 5 as right after a bootout; `print` shows a loaded job running. Returns its call log."""
+    bin_ = tmp_path / "fakebin"
+    bin_.mkdir()
+    log = tmp_path / "launchctl.calls"
+    (bin_ / "launchctl").write_text(f"""#!/bin/sh
+d={shlex.quote(str(tmp_path))}
+echo "$*" >> "$d/launchctl.calls"
+case "$1" in
+  bootout) rm -f "$d/loaded" ;;
+  bootstrap)
+    n=$(cat "$d/failed" 2>/dev/null || echo 0)
+    if [ {-1 if fails is None else fails} -lt 0 ] || [ "$n" -lt {0 if fails is None else fails} ]; then
+      echo $((n+1)) > "$d/failed"; echo "Bootstrap failed: 5: Input/output error" >&2; exit 5
+    fi
+    touch "$d/loaded" ;;
+  print) [ -e "$d/loaded" ] || exit 113; echo "	state = running" ;;
+esac
+exit 0
+""")
+    (bin_ / "launchctl").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_}:{os.environ['PATH']}")
+    from ttp import service
+    monkeypatch.setattr(service, "BOOTSTRAP_RETRY_S", 0)
+    return lambda: log.read_text().splitlines() if log.exists() else []
+
+
+def _restarting_bridge(tmp_path, monkeypatch):
+    """A bridge config with box-1's session installed at an older command (so a refresh restarts it) and a
+    box that answers the status probe with its link and port up. Returns the config path."""
+    import json
+    import plistlib
+    from ttp import bridge
+    monkeypatch.delenv("TTP_TEST_NO_BRIDGE_REFRESH", raising=False)
+    monkeypatch.setattr(bridge, "HOME_DIR", tmp_path)
+    monkeypatch.setattr(bridge, "RELAY", tmp_path / "bridge_relay.py")
+    conf = tmp_path / "bridge.json"
+    conf.write_text(json.dumps({"boxes": {"box-1": {"login": {}, "agents": {"auto": {"agent": "env", "forward": [
+        {"name": "build-a", "target": "build-a.example.com", "port": 2301}]}}}}}))
+    f = tmp_path / "Library" / "LaunchAgents" / f"{bridge.label('box-1', 'auto')}.plist"
+    f.parent.mkdir(parents=True)
+    f.write_bytes(plistlib.dumps(bridge.launchd_plist("box-1", "auto", ["ssh", "an-older-command"])))
+    monkeypatch.setattr(bridge, "_box", lambda box, script, *a, **k: subprocess.CompletedProcess(
+        [], 0, "block yes\nagent auto up 1\nport 2301 up\n", ""))
+    return conf
+
+
+def test_bridge_restart_retries_launchd_error_5_and_checks_the_links(tmp_path, monkeypatch):
+    # cells: bootstrap-retry
+    from ttp import bridge
+    calls = _fake_launchctl(tmp_path, monkeypatch, fails=1)
+    conf = _restarting_bridge(tmp_path, monkeypatch)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    out, rc = bridge.refresh_checked("darwin", conf, wait_s=0)
+    assert [c.split()[0] for c in calls() if not c.startswith("print")] == ["bootout", "bootstrap", "bootstrap"]
+    assert rc == 0 and out[0] == "bridge box-1 auto: service command changed; launchd agent started", out
+    assert out[1].startswith("bridge status: box-1 auto: OK (session running; agent link up, 1 key(s)"), out
+
+
+def test_upgrade_fails_naming_the_links_a_bridge_restart_left_down(env, tmp_path, monkeypatch):
+    # cells: upgrade-bridge-down
+    import contextlib
+    import io
+    from ttp import bridge, cli, service
+    p = make(env)
+    calls = _fake_launchctl(tmp_path, monkeypatch, fails=None)
+    conf = _restarting_bridge(tmp_path, monkeypatch)
+    real = bridge.refresh_checked
+
+    def checked():
+        with monkeypatch.context() as m:   # only the bridge's own files live in the test's HOME
+            m.setenv("HOME", str(tmp_path))
+            return real("darwin", conf, wait_s=0)
+    monkeypatch.setattr(bridge, "refresh_checked", checked)
+    monkeypatch.setattr(service, "restart", lambda p: "restarted")
+    monkeypatch.setattr(cli, "_upgrade", lambda *a, **k: None)   # the template merge is not under test
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", p.name])
+    assert e.value.code == 1, (out.getvalue(), err.getvalue())
+    assert [c for c in calls() if c.startswith("bootstrap")] and all(
+        c.split()[0] in ("bootout", "bootstrap", "print") for c in calls())
+    assert sum(c.startswith("bootstrap") for c in calls()) == service.BOOTSTRAP_TRIES
+    said = out.getvalue()
+    assert "bridge status: box-1 auto: DOWN (session stopped" in said, said
+    assert ("bridge: still down after its restart: box-1 auto (launchd refused it: Bootstrap failed: 5: "
+            "Input/output error)") in said, said
+    assert "the access bridge is still down after its restart" in err.getvalue()

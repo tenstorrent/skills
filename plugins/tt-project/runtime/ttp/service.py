@@ -444,45 +444,48 @@ def _target(label: str) -> tuple[str, str]:
     return f"{domain}/{label}", domain
 
 
-def launchd_loaded(label: str) -> bool:
+def launchd_loaded(label: str, run=None) -> bool:
     """launchd has job `label` loaded (`launchctl print` exits 0; 113 when it has no such job)."""
-    return _run("launchctl", "print", _target(label)[0]).returncode == 0
+    return (run or _run)("launchctl", "print", _target(label)[0]).returncode == 0
 
 
-def _wait_unloaded(label: str, wait_s: float = UNLOAD_WAIT_S) -> bool:
+def _wait_unloaded(label: str, wait_s: float = UNLOAD_WAIT_S, run=None) -> bool:
     """After a bootout: wait, at most wait_s, until launchd has removed the job; whether it did."""
     deadline = time.time() + wait_s
-    while launchd_loaded(label):
+    while launchd_loaded(label, run):
         if time.time() >= deadline:
             return False
         time.sleep(0.5)
     return True
 
 
-def bootstrap(label: str, plist: Path) -> subprocess.CompletedProcess:
+def bootstrap(label: str, plist: Path, run=None) -> subprocess.CompletedProcess:
     """Load agent `label` from its plist: bootstrap, retried a few times; a job launchd already has
-    loaded counts as success. A failure keeps launchctl's own output."""
+    loaded counts as success. A failure keeps launchctl's own output. The one way the runtime loads a
+    launchd agent (daemon, watchdog, bridge sessions, kept tunnels, notifier); `run` is the caller's
+    `_run(*argv)` (default this module's)."""
+    run = run or _run
     target, domain = _target(label)
     r = subprocess.CompletedProcess([], 1, "", "")
     for i in range(BOOTSTRAP_TRIES):
-        r = _run("launchctl", "bootstrap", domain, str(plist))
+        r = run("launchctl", "bootstrap", domain, str(plist))
         if r.returncode == 0:
             return r
-        if launchd_loaded(label):   # "service already loaded": loaded is what this wants
+        if launchd_loaded(label, run):   # "service already loaded": loaded is what this wants
             return subprocess.CompletedProcess(r.args, 0, r.stdout, r.stderr)
         if i + 1 < BOOTSTRAP_TRIES:
             time.sleep(BOOTSTRAP_RETRY_S * (i + 1))
     return r
 
 
-def _reload(label: str, plist: Path) -> subprocess.CompletedProcess:
+def _reload(label: str, plist: Path, run=None) -> subprocess.CompletedProcess:
     """bootout, wait for the label to unload, then bootstrap: how launchd takes a changed plist."""
     target, _ = _target(label)
-    _run("launchctl", "bootout", target)
-    if not _wait_unloaded(label):
+    (run or _run)("launchctl", "bootout", target)
+    if not _wait_unloaded(label, run=run):
         return subprocess.CompletedProcess([], 1, "", f"launchctl bootout {target}: still loaded {UNLOAD_WAIT_S}s "
                                                      f"later, so its bootstrap was not tried")
-    return bootstrap(label, plist)
+    return bootstrap(label, plist, run)
 
 
 def ensure_loaded(p: Project) -> str | None:
