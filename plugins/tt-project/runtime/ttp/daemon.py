@@ -1397,6 +1397,7 @@ class Daemon:
         self._start_rc: dict[int, tuple[int | str, float, str]] = {}   # a start_when's last not-yet or broken verdict
         self._premise_runs: dict[int, tuple] = {}   # task -> its running premise command: (Pending, started, cmd)
         self._premise_ok: dict[int, tuple[float, str]] = {}   # task -> when its premise command last exited 0, cmd
+        self._carry_seen: dict[int, str] = {}   # task -> the push-branch tip _landed_carries last judged it at
         self._checks_gone_at: dict[int, tuple[str, float]] = {}   # task -> probe on gone checks, first seen (checksgone)
         self._host_up: dict[str, tuple[bool, float]] = {}   # host a probe's 255 named -> ssh reached it, when
         self._down_n: dict[int, int] = {}   # task -> its probe's confirmed-down answers in a row (downwait.gap)
@@ -5197,7 +5198,12 @@ class Daemon:
 
     def _tend_premises(self) -> None:
         """_premise_cmds, then premise.tend: split, settle and clean up code tasks' premise checks (a
-        command that gave no verdict falls back to one in the same pass); never stops the caller."""
+        command that gave no verdict falls back to one in the same pass); never stops the caller. First,
+        _landed_carries closes rebase or carry tasks with nothing left to carry."""
+        try:
+            self._landed_carries(time.time())
+        except Exception:
+            log(self.p, "landed carries not checked: " + traceback.format_exc().replace("\n", " | ")[:1500])
         try:
             self._premise_cmds(time.time())
         except Exception:
@@ -5207,6 +5213,30 @@ class Daemon:
                 log(self.p, f"task {tid}: {what}")
         except Exception:
             log(self.p, "premise checks not tended: " + traceback.format_exc().replace("\n", " | ")[:1500])
+
+    def _landed_carries(self, now: float) -> None:
+        """premise.landed_carry, model-free: close each ready rebase or carry code task that never ran and
+        whose named commits are all on the push branch already, judged once per task and push-branch tip.
+        Off with config premise.landed_guard false."""
+        if (self.cfg.get("premise") or {}).get("landed_guard") is False:
+            return
+        db = self.p.db
+        todo = [t for t in db.ready_tasks() if not int(t["attempts"] or 0) and premise.carries(t)]
+        if not todo:
+            return
+        repo = self.p.root
+        ref = landed._push_ref(self.p, repo)
+        tip = landed._commit(repo, ref)
+        if not tip:
+            return
+        for t in todo:
+            if self._carry_seen.get(t["id"]) == tip or db.one(
+                    "SELECT 1 FROM runs WHERE task=? AND role!='coordinator' LIMIT 1", (t["id"],)):
+                continue
+            self._carry_seen[t["id"]] = tip
+            found = premise.landed_carry(repo, tip, premise.carries(t))
+            if found and premise.landed_close(db, t, found, ref, now):
+                log(self.p, f"task {t['id']}: every commit it names to carry is on {ref}, closed as not needed")
 
     def _premise_fresh(self, task: dict, now: float) -> bool:
         """Whether ready code task `task` may dispatch as far as its premise command goes: it has none

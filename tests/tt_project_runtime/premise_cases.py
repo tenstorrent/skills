@@ -512,3 +512,78 @@ def test_only_a_premise_cmd_line_runs_and_the_audit_estimates_what_premise_close
     assert (got["premise_closed"], got["premise_saved_usd"]) == (2, 6.0)
     assert "2 closed by a premise check before any code run (about $6.00 saved at the tier's median code run)" \
         in "\n".join(audit.lines(p.db, now))
+
+
+def _landed_carry_repo(tmp_path):
+    """A git repo whose main carries commit `a` of branch work under another id (a cherry-pick), not `b`:
+    (repo, a, b)."""
+    repo = tmp_path / "carry-repo"
+
+    def git(*a):
+        return subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                               *a], check=True, capture_output=True, text=True).stdout.strip()
+    repo.mkdir()
+    git("init", "-q", "-b", "main")
+    (repo / "base.txt").write_text("base\n")
+    git("add", "-A")
+    git("commit", "-qm", "base")
+    git("checkout", "-qb", "work")
+    shas = []
+    for name in ("a", "b"):
+        (repo / f"{name}.txt").write_text(name + "\n")
+        git("add", "-A")
+        git("commit", "-qm", f"add {name}")
+        shas.append(git("rev-parse", "HEAD"))
+    git("checkout", "-q", "main")
+    (repo / "other.txt").write_text("other\n")   # a new parent: the pick gets its own id
+    git("add", "-A")
+    git("commit", "-qm", "other")
+    git("cherry-pick", shas[0])
+    return repo, shas[0], shas[1]
+
+
+def test_a_carry_task_whose_named_commits_all_landed_closes_with_no_run_and_others_stay_queued(env, monkeypatch, tmp_path):
+    from ttp import landed, premise
+    p, d, runs = _floor_daemon(env, monkeypatch)
+    repo, a, b = _landed_carry_repo(tmp_path)
+    monkeypatch.setattr(d.p, "root", repo)
+    monkeypatch.setattr(landed, "_push_ref", lambda p, r: "refs/heads/main")
+    done = _code(p, spec=f"Goal: carry {a[:9]} onto the tip.", title=f"Rebase the fix ({a[:9]}) and land it")
+    open_ = _code(p, spec=f"Goal: carry {a[:9]} and {b[:9]}.", title="Rebase the pair and land it")
+    unread = _code(p, spec="Goal: carry deadbee17 onto the tip.", title="Cherry-pick the lost fix")
+    plain = _code(p, spec=f"Goal: build on {a[:9]}.", title="add the retry line")
+    ran = _code(p, spec=f"Goal: carry {a[:9]}.", title="Re-land the fix")
+    p.db.x("INSERT INTO runs(task,role,started,ended,status,cost_usd) VALUES(?,?,?,?,?,?)",
+           (ran, "worker", time.time() - 60, time.time(), "failed", 0.1))
+    d._landed_carries(time.time())
+    t = p.db.task(done)
+    res = json.loads(t["result"])
+    assert t["status"] == "done" and premise.LANDED in json.loads(t["labels"]) and res["outcome"] == "rejected"
+    assert res["premise_landed"]["ref"] == "refs/heads/main" and res["premise_landed"]["commits"]
+    assert "already on refs/heads/main" in res["summary"]
+    assert len(p.db.q("SELECT 1 FROM events WHERE kind='task_done' AND task=?", (done,))) == 1
+    assert not p.db.q("SELECT 1 FROM runs WHERE task=?", (done,)), "no worker started"
+    for tid in (open_, unread, plain, ran):
+        assert p.db.task(tid)["status"] == "queued", tid
+    # the off-switch keeps a landed carry queued
+    again = _code(p, spec=f"Goal: carry {a[:9]}.", title=f"Rebase {a[:9]} onto main")
+    monkeypatch.setitem(d.cfg, "premise", {**(d.cfg.get("premise") or {}), "landed_guard": False})
+    d._landed_carries(time.time())
+    assert p.db.task(again)["status"] == "queued"
+
+
+def test_the_no_change_audit_leaves_out_a_code_task_whose_landing_is_recorded(env):
+    from ttp import audit
+    p = _premise_project(env)
+    now = time.time()
+    tids = []
+    for title in ("landed by a detached push", "never landed"):
+        t = p.db.add_task(title, "s", kind="code")
+        p.db.update_task(t, status="done", spent_usd=1.0)
+        p.db.x("INSERT INTO runs(task,role,started,ended,status,cost_usd) VALUES(?,?,?,?,?,?)",
+               (t, "worker", now - 900, now - 800, "ok", 1.0))
+        tids.append(t)
+    p.db.x("INSERT INTO task_landings(marker, task, sha, target, ts) VALUES(?,?,?,?,?)",
+           ("m1", tids[0], "a" * 40, "origin/main", now - 700))
+    got = audit.no_change_code(p.db, now - 86400)
+    assert [r["id"] for r in got["rows"]] == [tids[1]] and got["n"] == 1

@@ -550,7 +550,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "tasks": {"daily_target": 0},
     # A code task's `premise_cmd:` (premise.py) runs model-free before each dispatch, killed after
     # cmd_timeout_s; an exit 0 lets the task dispatch for recheck_min minutes, then it runs again.
-    "premise": {"cmd_timeout_s": 60, "recheck_min": 30},
+    # landed_guard: a never-run rebase or carry code task whose named commits are all on the push
+    # branch closes as not needed without a run (false: off).
+    "premise": {"cmd_timeout_s": 60, "recheck_min": 30, "landed_guard": True},
     # Builtin watchers (prs, logfile): one run stops at deadline_s (capped at 1800), keeps what it read
     # and reports one error saying it was cut short; each gh call times out after gh_timeout_s, cut to
     # the time left. The prs watcher reads pr_workers PRs at once, each within pr_timeout_s, each PR once

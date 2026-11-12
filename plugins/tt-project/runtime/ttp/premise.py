@@ -44,6 +44,14 @@ timeout (`premise.cmd_timeout_s`, default 60), a command that cannot start or on
 today's path (the light question, or its own first step when urgent or already checked once).
 Projects map their own scripts onto 0 and 1 with a wrapper.
 
+Already landed (model-free, before the premise check): a ready rebase or carry code task (its title
+says rebase, carry, re-land or cherry-pick) that never ran, whose spec names commits of the project's
+repository, closes done as not needed without a run when every named commit that is not already an
+ancestor of the push-branch tip (an ancestor is context: a base or the tip) has an equivalent there
+(landed.on_branch: the same patch, or the same author, date and subject), and there is at least one
+such commit. Its label becomes `premise:landed`. A named commit that cannot be read, or one with no
+equivalent, lets the task run. Off-switch: config `premise.landed_guard` false (default on).
+
 A premise a check proved false (a "fails" that closes its code task) is remembered for REPEAT_DAYS:
 the coordinator's task_add refuses a new task whose `premise:` line repeats it (`repeat`: every
 commit it names is one the failed premise named, or the same words where it names none), naming the
@@ -74,6 +82,9 @@ VERDICTS = {"holds": "holds", "held": "holds", "true": "holds", "yes": "holds",
 CMD_LINE = re.compile(r"(?im)^[ \t]*(?:[-*][ \t]+)?premise_cmd:[ \t]*(\S.*?)[ \t]*$")
 CMD_FAILS = f"{LABEL}cmd:fails"        # a code task its premise command closed
 CMD_UNKNOWN = "premise-cmd:unknown"    # its premise command gave no verdict: today's path takes over
+LANDED = f"{LABEL}landed"            # a rebase or carry code task whose named commits had all landed
+CARRY = re.compile(r"\b(?:rebas|carr(?:y|ies)\b|re-?land|cherry-?pick)", re.I)
+SHA = re.compile(r"(?<![\w/.#:-])(?=[0-9]*[a-f])[0-9a-f]{7,40}(?![\w/-])")
 CMD_TIMEOUT_S = 60
 RECHECK_MIN = 30
 CITE = re.compile(r"[\w+-][\w./+-]*[./][\w+-]+:\d+")   # file:line, a path with a dot or a slash
@@ -149,25 +160,67 @@ def _event(db, t: dict, kind: str, severity: str, text: str, status: str, now: f
          (now, f"task:{t['id']}" if kind == "task_done" else "daemon", kind, severity, text[:1500], status, t["id"]))
 
 
-def cmd_false(db, task: dict, cmd: str, rc, tail: str, now: float | None = None) -> bool:
-    """Close queued code task `task` as not needed: its premise command exited 1. False when it is no
-    longer queued (another pass, a cancel or a start won)."""
+def _close(db, task: dict, words: str, extra: dict, label: str, now: float | None) -> bool:
+    """Close queued code task `task` done as not needed, without a run (outcome rejected, `words` as its
+    summary, `extra` in its result, `label` added), with its task_done event and chat reply. False when
+    it is no longer queued (another pass, a cancel or a start won)."""
     from . import pushq
     now = time.time() if now is None else now
-    tail = (tail or "").strip()[-600:]
-    words = (f"Not needed: its premise command exited {rc}, so the premise is false: `{cmd[:300]}`"
-             + (f". Its output: {tail}" if tail else ""))
-    result = {"status": "done", "outcome": "rejected", "summary": words[:1500],
-              "premise_cmd": {"cmd": cmd, "rc": rc, "tail": tail}}
+    result = {"status": "done", "outcome": "rejected", "summary": words[:1500], **extra}
     with db.tx():
         t = db.task(task["id"])
         if not t or t["status"] != "queued":
             return False
-        db.update_task(t["id"], status="done", blocked_reason=None, labels=[*_labels(t), CMD_FAILS],
+        db.update_task(t["id"], status="done", blocked_reason=None, labels=[*_labels(t), label],
                        result=dump_result(result))
         _event(db, t, "task_done", "normal", f"#{t['id']} {t['title']} → done, not run ({words})", "queued", now)
         pushq._reply(db, t, "done", result["summary"])
     return True
+
+
+def cmd_false(db, task: dict, cmd: str, rc, tail: str, now: float | None = None) -> bool:
+    """Close queued code task `task` as not needed: its premise command exited 1. False when it is no
+    longer queued (another pass, a cancel or a start won)."""
+    tail = (tail or "").strip()[-600:]
+    words = (f"Not needed: its premise command exited {rc}, so the premise is false: `{cmd[:300]}`"
+             + (f". Its output: {tail}" if tail else ""))
+    return _close(db, task, words, {"premise_cmd": {"cmd": cmd, "rc": rc, "tail": tail}}, CMD_FAILS, now)
+
+
+def carries(task: dict) -> list[str]:
+    """The commit-like words (7 to 40 hex digits, at least one a letter) the spec of rebase or carry
+    code task `task` names, at most 8, or [] for any other task."""
+    if task.get("kind") != "code" or not CARRY.search(task.get("title") or ""):
+        return []
+    return list(dict.fromkeys(SHA.findall(task.get("spec") or "")))[:8]
+
+
+def landed_carry(repo, tip: str, names: list[str]) -> list[tuple[str, str]]:
+    """[(named, full sha)] of the commits in `names` (carries) that are not ancestors of push-branch tip
+    `tip` yet all have an equivalent on it (landed.on_branch), or [] when none, any cannot be read, or
+    any has no equivalent: then the task runs."""
+    from . import landed
+    found = []
+    for name in names:
+        r = landed._git(repo, "rev-parse", "--verify", "--quiet", f"{name}^{{commit}}")
+        if r.returncode != 0 or not r.stdout.strip():
+            return []
+        sha = r.stdout.strip()
+        anc = landed._git(repo, "merge-base", "--is-ancestor", sha, tip).returncode
+        if anc == 0:
+            continue
+        if anc != 1 or not landed.on_branch(repo, sha, tip):
+            return []
+        found.append((name, sha))
+    return found
+
+
+def landed_close(db, task: dict, found: list[tuple[str, str]], ref: str, now: float | None = None) -> bool:
+    """Close never-run rebase or carry code task `task`: every commit it names to carry (`found`) is on
+    `ref` already."""
+    words = (f"Not needed: every commit it names to carry is already on {ref} under an equivalent commit "
+             f"({', '.join(n for n, _ in found)}), so there is nothing to carry. Checked without a run.")
+    return _close(db, task, words, {"premise_landed": {"ref": ref, "commits": [s for _, s in found]}}, LANDED, now)
 
 
 def cmd_unknown(db, task: dict, cmd: str, why: str, now: float | None = None) -> bool:

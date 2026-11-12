@@ -17,8 +17,8 @@ the project could have saved. Model-free; the review grades it.
   (settlehook.py, coordinator.settle_cmd) with their top reasons and its faults, and per wait the wait_stale
   turns skipped as unchanged since a turn that decided nothing on it (stalegate.py); blocker sweeps the model ran and those
   skipped model-free (sweepskip.py), with the saving;
-- code runs with no code change: code tasks done after a worker run with no review, PR or published
-  change, with their spend, and the code tasks a premise check (premise.py) closed before any run;
+- code runs with no code change: code tasks done after a worker run with no review, PR, published
+  change or recorded landing (a task that landed its own work with `ttp push`), with their spend, and the code tasks a premise check (premise.py) closed before any run;
 - spend per finished task: the workers' own, and the coordinator's day spread over them; $ per
   done task by kind and tier;
 - plan-billed providers (planuse.py): their dollars are virtual list price, shown apart with the points
@@ -59,7 +59,7 @@ import statistics
 import time
 from typing import Any
 
-from . import budget, chaincap, dailyspend, checkprestage, coordfix, coordmodel, correction, ends, gatejudge, gatetime, obligations, outscan, plainreply, planuse, quietgate, relay, replan, reviewstats, routinedefault, route, rulecite, schedule, settlehook, sharedchecks, stalegate, suitecost, sweepskip, timefmt, turngate, unblock, upstream
+from . import budget, chaincap, dailyspend, checkprestage, coordfix, coordmodel, correction, ends, gatejudge, gatetime, landed, obligations, outscan, plainreply, planuse, quietgate, relay, replan, reviewstats, routinedefault, route, rulecite, schedule, settlehook, sharedchecks, stalegate, suitecost, sweepskip, timefmt, turngate, unblock, upstream
 from .db import DB, continues_id, load_result
 from .project import Project
 
@@ -266,8 +266,9 @@ def context_gaps(db: DB, since: float) -> list[dict]:
 
 def no_change_code(db: DB, since: float) -> dict:
     """Code tasks done since `since` after a worker run that left nothing to review: no review covers
-    them (an `auto_review:<id>` label or a dependency) and their result names no PR or published
-    change. Most were premise checks run at the code tier. With the code tasks a premise check or
+    them (an `auto_review:<id>` label or a dependency), their result names no PR or published
+    change, and no landing is recorded for them (landed.recorded: a push queue landing, a detached
+    `ttp push` landing or a supersession, theirs or a carrier's). Most were premise checks run at the code tier. With the code tasks a premise check or
     premise command (premise.py) closed before any code run, and the $ that saved, estimated at the
     median spend of the window's done code tasks of the same tier that ran (any tier where it has none):
     {n, usd, rows, premise_closed, premise_saved_usd}."""
@@ -296,9 +297,11 @@ def no_change_code(db: DB, since: float) -> dict:
                     if v.isdigit():
                         covered.add(int(v))
     out = []
-    for t in rows:
+    left = [t for t in rows if t["id"] not in covered]
+    seen = landed.Rows(db, [t["id"] for t in left]) if left else None
+    for t in left:
         res = _note(t["result"])
-        if t["id"] in covered or res.get("pr") or res.get("published"):
+        if res.get("pr") or res.get("published") or landed.recorded(db, t["id"], rows=seen)[0]:
             continue
         out.append({"id": t["id"], "title": t["title"], "usd": float(t["spent_usd"] or 0)})
     return {"n": len(out), "usd": sum(t["usd"] for t in out), "rows": out,
