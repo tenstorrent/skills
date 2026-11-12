@@ -413,6 +413,7 @@ def _resource_line(task: dict) -> str:
 
 
 def _runner_line(cfg: dict) -> str:
+    from . import devq
     from .project import device_timeout_max
     ceiling = device_timeout_max(cfg)[0]
     out = (f"device job timeouts: at most {ceiling} s each (runner.device_timeout_max_s), whatever runs the "
@@ -422,7 +423,9 @@ def _runner_line(cfg: dict) -> str:
         return out
     names = ", ".join(f"{n} (on {(r or {}).get('host') or 'this machine'})" for n, r in sorted(runners.items()))
     return (f"device runners: {names}; queue every device job with `ttp devq submit`, never a detached "
-            "driver of your own\n") + out
+            "driver of your own; on a device-broker host each runs preemptable within the broker's "
+            f"{devq.BROKER_MAX_S} s cap (a job that calls `{devq.BROKER} run-bg` itself passes --preemptable "
+            f"-t {devq.BROKER_MAX_S} or less)\n") + out
 
 
 def _hostmap_line(cfg: dict) -> str:

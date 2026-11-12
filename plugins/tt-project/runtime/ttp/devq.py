@@ -9,6 +9,11 @@ takes the jobs one at a time in arrival order, each only after the health gate p
 done marker per job. A job a device drop or a host reboot killed is run again; once one config dropped
 max_drops times in a row its jobs are skipped and marked so, until `ttp devq clear`. A job whose output
 matches one of its wedge_patterns (a device hang signature) is stopped at once and marked wedged.
+On a host with the device broker (`tt-device-mcp` on PATH, or `broker: "on"`) each job goes through it
+as a preemptable broker job (`run-bg --preemptable -t <limit>`, at most BROKER_MAX_S), so a serving
+workload and our jobs step aside for each other. A job the broker preempted, or one that wrote the
+yield marker (setup-box preempt.py), is run again at once with TTP_DEVQ_PREEMPTS=<n>: no drop and no
+failure, up to max_preempts times; its done marker records the count.
 Every job carries a build stamp (build_stamp: the workdir's repo, branch, commit, dirty flag and the
 built artifact's size, time and hash), taken at submit and again at start, in its spec and done marker.
 
@@ -27,6 +32,8 @@ import hashlib
 import json
 import os
 import re
+import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -81,8 +88,17 @@ RUNNER_DEFAULTS = {
     # The built binary or library jobs load (relative to a job's workdir, or absolute; "" = none): its size,
     # time and hash go in each job's build stamp. A job's own artifact (`--artifact`) wins.
     "build_artifact": "",
+    # The device broker: "auto" (used where `tt-device-mcp` is on PATH), "on" or "off". Through it each
+    # job runs preemptable with a limit of at most BROKER_MAX_S (job_timeout_s, else that); the broker,
+    # not the runner, ends it, and only once another job waits past its limit.
+    "broker": "auto",
+    "max_preempts": 20,        # a job preempted (or that yielded) more often than this is failed
 }
-_CHOICES = {"script_lint": ("", "warn", "refuse"), "netfs_policy": ("warn", "refuse")}
+_CHOICES = {"script_lint": ("", "warn", "refuse"), "netfs_policy": ("warn", "refuse"),
+            "broker": ("auto", "on", "off")}
+BROKER = "tt-device-mcp"
+BROKER_MAX_S = 1500   # the broker's longest job limit: a longer run is split into shorter jobs
+PREEMPTED_RE = re.compile(r"finished: preempted\b")   # `tt-device-mcp wait`'s end line for a preempted job
 RUNNER_DOWN_RC = 3   # probe: the job is pending and no runner is alive (the daemon restarts it)
 START_WAIT_S = 120   # start: longest wait for a runner still starting up (a loaded host is slow, not broken)
 CANCEL = ".cancel"   # running/<job>.cancel: drop asked the runner to stop the job (its text: why)
@@ -490,8 +506,36 @@ def lint(cmd: str, cfg: dict, job: str = "", workdir: str = "", task: str = "") 
 
 # host side: everything below runs on the device host ------------------------------------------------
 def job_limit(spec: dict, cfg: dict) -> float:
-    """The job's time limit in seconds (0 = none): its timeout_s, else job_timeout_s, else the cap."""
-    return float(spec.get("timeout_s") or cfg["job_timeout_s"] or cfg["reservation_cap_s"] or 0)
+    """The job's time limit in seconds (0 = none): its timeout_s, else job_timeout_s, else the cap; through
+    the broker at most BROKER_MAX_S, which is also the limit of a job with none."""
+    limit = float(spec.get("timeout_s") or cfg["job_timeout_s"] or cfg["reservation_cap_s"] or 0)
+    return min(limit or BROKER_MAX_S, BROKER_MAX_S) if broker_on(cfg) else limit
+
+
+def broker_on(cfg: dict) -> bool:
+    """Whether this host's jobs go through the device broker (setting broker)."""
+    mode = cfg.get("broker", "auto")
+    return mode == "on" or (mode == "auto" and shutil.which(BROKER) is not None)
+
+
+def calls_broker(spec: dict) -> bool:
+    """Whether the job's command (or a script it calls) queues itself on the broker."""
+    return any(re.search(rf"\b{BROKER}\s+(run|run-bg)\b", code) for _, code in _job_texts(spec))
+
+
+def broker_call_problems(spec: dict) -> list:
+    """Why the job's own broker calls may block a serving workload too long: each must be --preemptable
+    with a -t of at most BROKER_MAX_S."""
+    out = []
+    for label, code in _job_texts(spec):
+        for m in re.finditer(rf"\b{BROKER}\s+(run|run-bg)\b[^\n;|&]*", code):
+            call = m.group(0)
+            t = re.search(r"(?:-t|--timeout)[ =](\d+)", call)
+            if "--preemptable" not in call:
+                out.append(f"{label}: `{call[:80]}` lacks --preemptable")
+            if not t or int(t.group(1)) > BROKER_MAX_S:
+                out.append(f"{label}: `{call[:80]}` needs -t {BROKER_MAX_S} or less")
+    return out
 
 
 def over_cap(spec: dict, cfg: dict) -> str:
@@ -1079,6 +1123,14 @@ def submit(d: Path, cfg: dict, spec: dict) -> int:
     if too_long:
         print(f"devq submit: refused: {too_long}", file=sys.stderr)
         return 2
+    if broker_on(settings(cfg)):
+        if float(spec.get("timeout_s") or 0) > BROKER_MAX_S:
+            print(f"devq submit: refused: --timeout {spec['timeout_s']} is above the device broker's limit of "
+                  f"{BROKER_MAX_S} s; split the run into shorter jobs", file=sys.stderr)
+            return 2
+        for w in broker_call_problems(spec) if calls_broker(spec) else []:
+            print(f"devq submit: warning: {w} (a job that is not preemptable blocks a serving workload)",
+                  file=sys.stderr)
     errors, warnings = guard(d, cfg, spec)
     for w in warnings:
         print(f"devq submit: warning: {w}", file=sys.stderr)
@@ -1142,6 +1194,29 @@ def unmask_devices(env: dict) -> dict:
         else:
             out.pop(k, None)
     return out
+
+
+def broker_wrap(cmd: str, env: dict, limit: int, idf: str) -> str:
+    """`cmd` as a preemptable broker job: queue it with `run-bg`, keep its id in `idf`, follow it with `wait`
+    (whose exit is the job's), and cancel it on the broker if this wrapper is stopped."""
+    inner = "export " + " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items()) + "; " + cmd
+    b = BROKER
+    return (f'out=$({b} run-bg --preemptable -t {limit} {shlex.quote(inner)} 2>&1); e=$?; printf "%s\\n" "$out"; '
+            f'[ $e = 0 ] || exit $e; id=$(printf "%s\\n" "$out" | sed -n "s/^Job \\([^ ]*\\) queued.*/\\1/p" | head -n 1); '
+            f'[ -n "$id" ] || {{ echo "devq: no job id in the broker\'s answer"; exit 1; }}; echo "$id" >{shlex.quote(idf)}; '
+            f'trap \'{b} kill "$id" >/dev/null 2>&1; exit 143\' TERM INT HUP; {b} wait "$id" & w=$!; wait $w')
+
+
+def broker_kill(cur: dict) -> None:
+    """Cancel the attempt's broker job, if it has one (killing its `wait` would leave it holding the device)."""
+    try:
+        bid = Path(cur["rc"]).with_name(Path(cur["rc"]).name[:-3] + ".broker").read_text().strip()
+    except (OSError, KeyError):
+        return
+    if cur.get("broker") and bid:
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            subprocess.run([BROKER, "kill", bid], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=30)
 
 
 def _env(**extra: str) -> dict:
@@ -1362,13 +1437,14 @@ class Runner:
                   "task": spec.get("task", ""), "config": spec.get("config", job),
                   "attempts": st.get("attempts", 0), "drops": st.get("drops", []),
                   "started": st.get("started"), "finished": _now(), "finished_utc": _utc(),
-                  "build": spec.get("build"), **extra}
+                  "build": spec.get("build"), "preempts": st.get("preempts", 0), **extra}
         changed = stamp_changes(spec.get("build"), st.get("build_at_start"))
         if changed:
             marker["build_changed"] = changed
         _write(self.d / "done" / f"{job}.json.t", json.dumps(marker, indent=1))
         (self.d / "running" / f"{job}.json").replace(self.d / "done" / f"{job}.spec.json")
         for leftover in [self.d / "running" / f"{job}.state.json", self.d / "running" / f"{job}{CANCEL}",
+                         self.d / "running" / f"{job}.yielded", *(self.d / "running").glob(f"{job}.*.broker"),
                          *(self.d / "running").glob(f"{job}.*.rc"),
                          *(self.d / "running").glob(f"{job}.*.lock")]:
             _rm(leftover)
@@ -1397,15 +1473,20 @@ class Runner:
         wrapper = ('o="$1" r="$2" c="$3" l="$4"; echo $$ >"$l"; /bin/sh -c "$c" >>"$o" 2>&1 </dev/null; e=$?; '
                    'echo $e >"$r.tmp"; mv "$r.tmp" "$r"')
         before = {k: st[k] for k in ("attempts", "log", "cur") if k in st}
+        env = {"TTP_DEVQ_JOB": job, "TTP_DEVQ_CONFIG": str(spec["config"]),
+               "TTP_DEVQ_TIMEOUT_S": str(int(self.limit(spec))), "TTP_DEVQ_PREEMPTS": str(st.get("preempts", 0)),
+               "TTP_DEVQ_YIELD_FILE": str((self.d / "running" / f"{job}.yielded").absolute())}
+        cmd, brokered = spec["cmd"], broker_on(self.cfg) and not calls_broker(spec)
+        if brokered:   # the broker passes on only its own env names: ours go in the command
+            cmd = broker_wrap(cmd, env, int(self.limit(spec)), str(self.d / "running" / f"{job}.{n}.broker"))
         st.update(attempts=n, log=str(logf), cur={"n": n, "pid": None, "rc": str(rcf), "lock": str(lockf),
-                                                  "log": str(logf), "started": _now()})
+                                                  "log": str(logf), "started": _now(), "broker": brokered})
         try:
             self.save(job, st)
-            p = subprocess.Popen(["/bin/sh", "-c", wrapper, "sh", str(logf), str(rcf), spec["cmd"], str(lockf)],
+            p = subprocess.Popen(["/bin/sh", "-c", wrapper, "sh", str(logf), str(rcf), cmd, str(lockf)],
                                  cwd=spec.get("workdir") or str(Path.home()), stdin=subprocess.DEVNULL,
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
-                                 env=_env(TTP_DEVQ_JOB=job, TTP_DEVQ_CONFIG=str(spec["config"]),
-                                           TTP_DEVQ_TIMEOUT_S=str(int(self.limit(spec)))))
+                                 env=_env(**env))
             self._keeper = keep_lock(lock, p.pid)
             if self._keeper is None:
                 _kill_group(p.pid)
@@ -1450,6 +1531,7 @@ class Runner:
             if self._keeper is not None:
                 self._keeper.poll()
             if self.cancelled(job) is not None and not rcf.exists():
+                broker_kill(cur)
                 pid = cur.get("pid") or _lock_pid(lockf)
                 if pid and not _free(lockf):
                     _kill_group(pid)
@@ -1468,6 +1550,7 @@ class Runner:
             if patterns:
                 seen, hit = scan_wedge(Path(cur["log"]), seen, patterns)
                 if hit:
+                    broker_kill(cur)
                     pid = cur.get("pid") or _lock_pid(lockf)
                     if pid:
                         _kill_group(pid)
@@ -1475,12 +1558,24 @@ class Runner:
                         child.poll()
                     cur["wedge"] = {"pattern": hit[0], "line": hit[1]}
                     return None, "wedged"
-            if limit and _now() - cur["started"] >= limit:
+            if limit and not cur.get("broker") and _now() - cur["started"] >= limit:   # the broker ends its own
                 pid = cur.get("pid") or _lock_pid(lockf)
                 if pid:
                     _kill_group(pid)
                 return 124, "timeout"
             time.sleep(self.cfg["poll_s"])
+
+    def preempted(self, job: str, st: dict) -> bool:
+        """Whether the attempt that just ended yielded the device: it wrote the yield marker, or the broker
+        preempted it (the end line `tt-device-mcp wait` logs)."""
+        if (self.d / "running" / f"{job}.yielded").exists():
+            return True
+        try:
+            with open(st["cur"]["log"], "rb") as f:
+                f.seek(max(0, os.path.getsize(st["cur"]["log"]) - 65536))
+                return bool(PREEMPTED_RE.search(f.read().decode(errors="replace")))
+        except OSError:
+            return False
 
     def cancelled(self, job: str) -> str | None:
         """The reason of a drop asked for this job (drop), else None."""
@@ -1553,6 +1648,17 @@ class Runner:
             if how == "cancelled":
                 self.finish(job, st, "cancelled", None, f"stopped: {self.cancelled(job) or 'its task ended'}")
                 return
+            if how == "" and self.preempted(job, st):   # rerun at once, ahead of the queue: no drop, no failure
+                with self.steady():
+                    st["preempts"] = st.get("preempts", 0) + 1
+                    _rm(self.d / "running" / f"{job}.yielded")
+                    st["cur"] = None
+                    self.save(job, st)
+                if st["preempts"] > int(self.cfg["max_preempts"] or 0):
+                    self.finish(job, st, "failed", rc, f"preempted {st['preempts']} times (max_preempts)")
+                    return
+                self.log(f"{job}: preempted ({st['preempts']} so far); running it again")
+                continue
             evidence = ""
             if how == "interrupted":
                 evidence = "the job is gone without an exit code (killed, or the host restarted)"

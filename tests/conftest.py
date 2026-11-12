@@ -115,6 +115,9 @@ _clear_worker_env()
 os.environ.setdefault("TTP_TX_GUARD", "1")
 os.environ.setdefault("TTP_ALLOW_VOLATILE_BASE", "1")   # the suite runs on tmpfs on purpose
 os.environ.setdefault("TTP_DEVICE_NODES", "")   # no host device node changes what a test sees; tests set their own
+# No test reaches a real device broker (devq runs its jobs through one found on PATH); tests put a fake first.
+os.environ["PATH"] = os.pathsep.join(d for d in os.environ.get("PATH", "").split(os.pathsep)
+                                     if not os.path.exists(os.path.join(d or ".", "tt-device-mcp")))
 
 
 def _git_global_config() -> None:
