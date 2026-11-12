@@ -102,10 +102,10 @@ def scored_run(run_id='gpqa10', phase='phase1', suite='r1_gpqa_diamond', solved=
     return {'id': run_id, 'phase': phase, 'suite': suite,
             'tasks': {'rule': 'stratified by domain, fixed list', 'names': [f'{suite}-{i}' for i in range(n)]},
             'config': {'pool_tokens': 400000, 'agents': 8, 'batch': 8, 'max_num_seqs': 8, 'sha': 'abc123',
-                       'network': 'per task allow_internet',
+                       'network': 'per task allow_internet', 'reasoning': {'thinking': True, 'effort': 'high'},
                        'limits': {**LIMITS, 'reference': dict(LIMITS), 'source': 'tt-inference-server eval config'}},
             'score': {'solved': solved, 'n': n, 'interval_95': [round(v, 1) for v in wilson(solved, n)]},
-            'reference': {'value': 84.3, 'source': 'model card'}, 'band_pass': True,
+            'reference': {'value': 84.3, 'source': 'model card', 'reasoning': 'thinking on'}, 'band_pass': True,
             'predicted_hours': 2.0, 'explained_hours': 1.8, 'measured_hours': 2.0, 'collected': True,
             'failures': failures}
 
@@ -160,12 +160,21 @@ def uncollect(run):
     run['collected'] = False
 
 
+def drop_reasoning(run):
+    del run['config']['reasoning']
+
+
+def cap_without_rerun(run):
+    run['failures'][0]['cause'] = 'cutoff_progressing'
+
+
 @pytest.mark.parametrize('fault, message', [
     (drop_failure_row, 'every failed task needs one'),
     (raise_agent_limit, 'above the harness reference'),
     (drop_reference, 'no reference value'),
-    (explain_badly, 'explain'),
     (uncollect, 'not collected'),
+    (drop_reasoning, 'reasoning setting'),
+    (cap_without_rerun, 'single-task rerun'),
 ])
 def test_quick_run_fault_is_critical(tmp_path, fault, message):
     run = scored_run()
@@ -174,13 +183,21 @@ def test_quick_run_fault_is_critical(tmp_path, fault, message):
     assert code == 2 and message in stderr
 
 
-@pytest.mark.parametrize('fault', [drop_reference, explain_badly, uncollect])
-def test_operator_decision_turns_a_failed_phase_into_an_advisory(tmp_path, fault):
+def test_operator_decision_covers_a_missing_reference(tmp_path):
     run = scored_run()
-    fault(run)
-    inputs = {'mode': 'quick', 'decisions': [{'accept': 'phase1', 'reason': 'operator: accept for rehearsal'}]}
-    code, stderr = goal12(tmp_path, runs=[run], phases={'phase1': {'run': 'gpqa10', 'pass': False}}, inputs=inputs)
+    drop_reference(run)
+    inputs = {'mode': 'quick', 'decisions': [{'accept': 'phase1', 'reason': 'operator: no reference yet'}]}
+    phases = {'phase1': {'run': 'gpqa10', 'pass': False, 'reason': 'no reference'}}
+    code, stderr = goal12(tmp_path, runs=[run], phases=phases, inputs=inputs)
     assert code == 1 and 'accepted by the operator' in stderr
+
+
+def test_uncollected_run_is_critical_even_with_a_decision(tmp_path):
+    run = scored_run()
+    uncollect(run)
+    inputs = {'mode': 'quick', 'decisions': [{'accept': 'phase1', 'reason': 'operator'}]}
+    phases = {'phase1': {'run': 'gpqa10', 'pass': False, 'reason': 'not collected'}}
+    assert goal12(tmp_path, runs=[run], phases=phases, inputs=inputs)[0] == 2
 
 
 def test_decision_does_not_excuse_a_rule_break(tmp_path):
@@ -190,11 +207,33 @@ def test_decision_does_not_excuse_a_rule_break(tmp_path):
     assert goal12(tmp_path, runs=[run], inputs=inputs)[0] == 2
 
 
-def test_score_outside_the_band_fails_the_phase(tmp_path):
-    run = scored_run(solved=4)
-    run['band_pass'] = False
-    code, stderr = goal12(tmp_path, runs=[run], phases={'phase1': {'run': 'gpqa10', 'pass': False}})
-    assert code == 2 and 'against reference 84.3' in stderr
+@pytest.mark.parametrize('solved, n, fault, message', [
+    (4, 10, None, 'against reference 84.3'),
+    (7, 10, explain_badly, 'explain'),
+    (5, 6, None, 'scored 6 of 10 tasks'),
+])
+def test_phase_not_passed_yet_is_advisory_with_a_reason(tmp_path, solved, n, fault, message):
+    run = scored_run(solved=solved, n=n)
+    low, high = wilson(solved, n)
+    run['band_pass'] = low <= 84.3 <= high or 100 * solved / n >= 84.3
+    if fault:
+        fault(run)
+    phases = {'phase1': {'run': 'gpqa10', 'pass': False, 'reason': 'phase time ended'}}
+    code, stderr = goal12(tmp_path, runs=[run], phases=phases)
+    assert code == 1 and message in stderr and 'not passed yet' in stderr
+    del phases['phase1']['reason']
+    code, stderr = goal12(tmp_path, runs=[run], phases=phases)
+    assert code == 2 and 'must say why' in stderr
+
+
+def test_limit_failure_with_settings_tried_passes(tmp_path):
+    run = scored_run()
+    run['failures'][0].update(cause='loop_cap', rerun={'solved': False, 'tried': [
+        {'reasoning': {'thinking': True, 'effort': 'high'}, 'result': 'loop to the cap again'},
+        {'reasoning': {'thinking': False}, 'result': 'wrong answer in 2,100 tokens'}]})
+    assert goal12(tmp_path, runs=[run]) == (0, '')
+    run['failures'][0]['rerun']['tried'] = [{'result': 'no setting recorded'}]
+    assert goal12(tmp_path, runs=[run])[0] == 2
 
 
 def test_recorded_pass_must_agree_with_the_gate(tmp_path):
@@ -240,7 +279,7 @@ def test_agentic_mode_needs_phase_2(tmp_path):
     assert code == 2 and 'phase2 has no scored run' in stderr
     runs = [scored_run(), scored_run('swe10', 'phase2', 'swe_bench_verified', solved=6)]
     for run in runs[1:]:
-        run['reference'] = {'value': 61.2, 'source': 'operator floor'}
+        run['reference'] = {'value': 61.2, 'source': 'operator floor', 'reasoning': 'unknown'}
     phases = {'phase1': {'run': 'gpqa10', 'pass': True}, 'phase2': {'run': 'swe10', 'pass': True}}
     assert goal12(tmp_path, runs=runs, phases=phases, inputs={'mode': 'agentic'}) == (0, '')
 
@@ -251,13 +290,25 @@ def test_extended_mode_needs_estimates_and_fitting_runs(tmp_path):
             scored_run('swe40', 'extended', 'swe_bench_verified', solved=24, n=40)]
     for run in runs:
         if run['suite'] == 'swe_bench_verified':
-            run['reference'] = {'value': 61.2, 'source': 'operator floor'}
+            run['reference'] = {'value': 61.2, 'source': 'operator floor', 'reasoning': 'unknown'}
     phases = {'phase1': {'run': 'gpqa10', 'pass': True}, 'phase2': {'run': 'swe10', 'pass': True}}
     estimates = {'estimates': {'r1_gpqa_diamond': 18.0, 'swe_bench_verified': 30.0}}
     assert goal12(tmp_path, runs=runs, phases=phases, inputs={'mode': 'extended'}, extra=estimates) == (0, '')
     runs[2]['predicted_hours'] = 14.0
     code, stderr = goal12(tmp_path, runs=runs, phases=phases, inputs={'mode': 'extended'}, extra=estimates)
     assert code == 2 and 'run_timeout_hours' in stderr
+
+
+def test_phase_1_not_passed_still_lets_phase_2_count_and_skips_extended(tmp_path):
+    runs = [scored_run(solved=4), scored_run('swe10', 'phase2', 'swe_bench_verified', solved=6)]
+    runs[0]['band_pass'] = False
+    runs[1]['reference'] = {'value': 61.2, 'source': 'operator floor', 'reasoning': 'unknown'}
+    phases = {'phase1': {'run': 'gpqa10', 'pass': False, 'reason': 'below band at hour 12'},
+              'phase2': {'run': 'swe10', 'pass': True, 'start_hour': 12}}
+    assert goal12(tmp_path, runs=runs, phases=phases, inputs={'mode': 'agentic'})[0] == 1
+    code, stderr = goal12(tmp_path, runs=runs, phases=phases, inputs={'mode': 'extended'},
+                          extra={'estimates': {'r1_gpqa_diamond': 18.0, 'swe_bench_verified': 30.0}})
+    assert code == 1 and 'starts after both phases pass' in stderr
 
 
 def test_existing_entry_skips_the_serving_evidence(tmp_path):

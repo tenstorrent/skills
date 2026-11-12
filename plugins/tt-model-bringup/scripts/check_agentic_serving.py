@@ -3,10 +3,11 @@
 
 Stages 06-10: missing evidence is critical; a measured shortfall with a recorded reason is advisory.
 Stage 11 (benchmark): serving_rates.json covers the batch x input-length grid and the release rows.
-Goal 12 (agentic-evals): the goal itself. Each phase of the mode passed (score within the band of
-its reference, wall time explained by the serving rates), the run was collected, every failed task
-has a cause, no list is voided, and limits are never above the harness reference. An operator
-decision in inputs.json turns a failed phase into an advisory.
+Goal 12 (agentic-evals): each phase of the mode has a collected run with its records and per-task
+analysis (every failed task has a cause; tasks cut off by a limit were rerun with the reasoning settings
+tried), no list is voided, and limits are never above the harness reference; those are critical. A
+phase not passed yet (score below the band, unexplained time, unfinished list) is advisory with its
+recorded reason, never critical for the score alone.
 Exit 0 pass, 1 advisory, 2 critical, 3 error.
 """
 from __future__ import annotations
@@ -32,6 +33,7 @@ DEFAULT_RUN_TIMEOUT_HOURS = 12
 DEFAULT_EXPLAIN_TOLERANCE = 0.25
 CAUSES = ("wrong", "loop_cap", "malformed_tool_call", "cutoff_progressing", "stalled", "infrastructure",
           "fetched_solution")
+LIMIT_CAUSES = ("loop_cap", "cutoff_progressing", "stalled")
 LIMITS = ("agent_timeout_s", "request_timeout_s", "output_cap_tokens")
 RATE_FIELDS = ("prefill_tok_s", "decode_tok_s_user", "ttft_s", "step_ms")
 LONG_CONTEXT_TOKENS = 28672
@@ -152,7 +154,7 @@ def accepted(inputs: dict, item: str) -> str | None:
 
 
 def unmet(problems: list, inputs: dict, item: str, message: str) -> None:
-    """A goal shortfall: critical unless the operator accepted it."""
+    """A missing record: critical unless the operator accepted it."""
     reason = accepted(inputs, item)
     problems.append((1, f"{message} (accepted by the operator: {reason})") if reason else (2, message))
 
@@ -206,10 +208,11 @@ def check_rates(model_dir: Path, evidence: dict, problems: list, full: bool) -> 
 
 def check_run(run: dict, inputs: dict, validated: list, collected: set, item: str, tasks: int,
               problems: list) -> bool:
-    """One scored run. Goal shortfalls go through `unmet`; rule breaks are always critical. True when it passes."""
+    """One scored run. Missing records, missing analysis and rule breaks are critical; a score or time short of
+    the pass rule is advisory (not passed yet). True when it passes."""
     name, ok = run.get("id", "?"), True
     if not (run.get("collected") is True and name in collected):
-        unmet(problems, inputs, item, f"run {name} was not collected by the runner (results.json and runs.json)")
+        problems.append((2, f"run {name} was not collected by the runner (results.json and runs.json)"))
         ok = False
     listed = (run.get("tasks") or {})
     if not listed.get("rule"):
@@ -220,7 +223,7 @@ def check_run(run: dict, inputs: dict, validated: list, collected: set, item: st
         problems.append((2, f"run {name} needs score.solved and score.n"))
         return False
     if n < tasks:
-        unmet(problems, inputs, item, f"run {name} scored {n} tasks; the phase needs {tasks}")
+        problems.append((1, f"run {name} scored {n} of {tasks} tasks; not passed yet"))
         ok = False
     interval = score.get("interval_95")
     low, high = wilson(solved, n)
@@ -235,6 +238,12 @@ def check_run(run: dict, inputs: dict, validated: list, collected: set, item: st
             problems.append((2, f"run {name}: failure row {row.get('task')!r} needs task, cause "
                                 f"({', '.join(CAUSES)}) and evidence"))
         rerun = row.get("rerun") or {}
+        tried = rerun.get("tried")
+        if row.get("cause") in LIMIT_CAUSES and not (
+                isinstance(tried, list) and tried
+                and all(isinstance(t, dict) and t.get("reasoning") and "result" in t for t in tried)):
+            problems.append((2, f"run {name}: {row.get('task')!r} hit a limit ({row.get('cause')}); it needs a "
+                                "single-task rerun with rerun.tried rows (reasoning setting, result)"))
         if rerun.get("counted"):
             counted += 1
             if row.get("cause") != "infrastructure":
@@ -243,17 +252,21 @@ def check_run(run: dict, inputs: dict, validated: list, collected: set, item: st
     if len({row.get("task") for row in failures}) != n - solved + counted:
         problems.append((2, f"run {name}: {n - solved + counted} first-attempt failures, "
                             f"{len(failures)} failure rows; every failed task needs one"))
+    if not (run.get("config") or {}).get("reasoning"):
+        problems.append((2, f"run {name} config needs its reasoning setting (thinking, effort)"))
     reference = run.get("reference") or {}
     if not (number(reference.get("value")) and reference.get("source")):
         unmet(problems, inputs, item, f"run {name} has no reference value and source; the phase cannot pass")
         return False
+    if "reasoning" not in reference:
+        problems.append((2, f"run {name} reference needs its own reasoning setting (or \"unknown\")"))
     percent, ref, band = 100 * solved / n, reference["value"], inputs.get("ok_band")
     band_pass = (percent >= ref - band) if number(band) else (low <= ref <= high or ref <= percent)
     if run.get("band_pass") is not band_pass:
         problems.append((2, f"run {name} band_pass is {run.get('band_pass')}; the gate computes {band_pass}"))
     if not band_pass:
-        unmet(problems, inputs, item, f"run {name} scored {percent:.1f}% against reference {ref} "
-                                      f"(interval {low:.1f}-{high:.1f})")
+        problems.append((1, f"run {name} scored {percent:.1f}% against reference {ref} "
+                            f"(interval {low:.1f}-{high:.1f}); not passed yet"))
         ok = False
     measured, explained = run.get("measured_hours"), run.get("explained_hours")
     tolerance = inputs.get("explain_tolerance", DEFAULT_EXPLAIN_TOLERANCE)
@@ -261,8 +274,8 @@ def check_run(run: dict, inputs: dict, validated: list, collected: set, item: st
         problems.append((2, f"run {name} needs measured_hours and explained_hours"))
         ok = False
     elif abs(measured - explained) / measured > tolerance:
-        unmet(problems, inputs, item, f"run {name} took {measured} h; tokens over the serving rates explain "
-                                      f"{explained} h (tolerance {tolerance:.0%})")
+        problems.append((1, f"run {name} took {measured} h; tokens over the serving rates explain "
+                            f"{explained} h (tolerance {tolerance:.0%}); not passed yet"))
         ok = False
     check_config(run, validated, problems)
     return ok
@@ -307,16 +320,22 @@ def check_evals(model_dir: Path, inputs: dict, evidence: dict, problems: list) -
     runs = {row.get("id"): row for row in results.get("runs") or [] if isinstance(row, dict)}
     phases = results.get("phases") or {}
     mode = inputs.get("mode", DEFAULT_MODE)
+    all_passed = True
     for phase in MODES.get(mode, ()):
         spec = inputs.get(phase) or {}
         tasks = spec.get("tasks", DEFAULT_TASKS)
         run = runs.get((phases.get(phase) or {}).get("run"))
         if not run or run.get("phase") != phase:
             unmet(problems, inputs, phase, f"{phase} has no scored run in results.json")
+            all_passed = False
             continue
         passed = check_run(run, inputs, validated, collected, phase, tasks, problems)
-        if (phases.get(phase) or {}).get("pass") is not passed:
-            problems.append((2, f"{phase} pass is {(phases.get(phase) or {}).get('pass')}; the gate computes {passed}"))
+        all_passed = all_passed and passed
+        record = phases.get(phase) or {}
+        if record.get("pass") is not passed:
+            problems.append((2, f"{phase} pass is {record.get('pass')}; the gate computes {passed}"))
+        elif not passed and not record.get("reason"):
+            problems.append((2, f"{phase} is not passed yet; results.json phases.{phase}.reason must say why"))
     for run in runs.values():
         if run.get("voided") or run.get("excluded"):
             problems.append((2, f"run {run.get('id')} is voided or excluded; void per task, never the list"))
@@ -329,12 +348,15 @@ def check_evals(model_dir: Path, inputs: dict, evidence: dict, problems: list) -
                 problems.append((2, f"estimates needs the projected full-suite hours for {suite}"))
             scored = [r for r in runs.values() if r.get("phase") == "extended" and r.get("suite") == suite]
             if not scored:
-                unmet(problems, inputs, item, f"extended has no scored run for {suite}")
+                if all_passed:
+                    unmet(problems, inputs, item, f"extended has no scored run for {suite}")
+                else:
+                    problems.append((1, f"extended has no run for {suite}; it starts after both phases pass"))
                 continue
             run = max(scored, key=lambda r: (r.get("score") or {}).get("n") or 0)
             if not (number(run.get("predicted_hours")) and run["predicted_hours"] <= limit):
-                unmet(problems, inputs, item, f"extended {suite} run {run.get('id')} was not admitted on a "
-                                              f"projection within run_timeout_hours {limit}")
+                problems.append((2, f"extended {suite} run {run.get('id')} was not admitted on a "
+                                    f"projection within run_timeout_hours {limit}"))
             check_run(run, inputs, validated, collected, item, 0, problems)
     if not (evals / "REPORT.md").is_file():
         problems.append((2, f"missing {evals / 'REPORT.md'}"))
