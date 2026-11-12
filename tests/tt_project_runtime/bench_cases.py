@@ -1027,3 +1027,109 @@ def test_model_suite_decisions_map_verb_records_and_faults_never_set_the_bar(env
     assert modelsuite.babysit("m", cs, boom)["bar"] is False
     assert modelsuite.babysit("m", cs, lambda m, q: "???")["bar"] is False
     assert modelsuite.babysit("m", cs, lambda m, q: "skip")["bar"] is True
+
+
+class _Busy:
+    """A fake opener: answers `script` in order (an int is that HTTP error, a str the model's answer)."""
+    def __init__(self, script, hint=None, body=b""):
+        self.script, self.hint, self.body, self.calls = list(script), hint, body, 0
+
+    def open(self, req, timeout=None):
+        import io
+        import urllib.error
+        self.calls += 1
+        got = self.script.pop(0) if len(self.script) > 1 else self.script[0]
+        if isinstance(got, int):
+            raise urllib.error.HTTPError(req.full_url, got, "busy", self.hint or {}, io.BytesIO(self.body))
+        raw = json.dumps({"choices": [{"message": {"content": got}}]}).encode()
+
+        class R(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+        return R(raw)
+
+
+def test_model_bench_post_retries_a_busy_answer_then_scores_and_a_model_still_busy_is_one_fault(env, tmp_path,
+                                                                                                monkeypatch):
+    import urllib.error
+    from ttp import modelbench
+    monkeypatch.setattr(modelbench, "home", lambda: tmp_path / "bench-home")
+    slept = []
+    # Retry-After header: waited, then the answer is scored
+    op = _Busy([429, "391"], hint={"Retry-After": "11"})
+    assert modelbench._post("http://e", "k", "m", "q", opener=op, sleep=slept.append) == "391"
+    assert op.calls == 2 and slept == [11.0]
+    # no header: the 'retry after N seconds' in the message, capped at RETRY_MAX_S; a 503 is busy too
+    op = _Busy([503, "ok"], body=b'{"error": "at capacity. Please retry after 45 seconds."}')
+    assert modelbench._post("http://e", "k", "m", "q", opener=op, sleep=slept.append) == "ok"
+    assert slept[-1] == modelbench.RETRY_MAX_S
+    # no hint at all: a short backoff; an HTTP date header is no number
+    op = _Busy([429, "ok"], hint={"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"})
+    modelbench._post("http://e", "k", "m", "q", opener=op, sleep=slept.append)
+    assert slept[-1] == 2.0
+    # any other error is never retried
+    op = _Busy([400])
+    with pytest.raises(urllib.error.HTTPError):
+        modelbench._post("http://e", "k", "m", "q", opener=op, sleep=slept.append)
+    assert op.calls == 1
+    # still busy after RETRIES retries: that cell is one fault (inconclusive, never weak); other cells score
+    ops = {}
+
+    def ask(m, prompt):
+        ops[prompt] = _Busy([429] if prompt == modelbench.CELLS[0][1] else ["nope"])
+        return modelbench._post("http://e", "k", m, prompt, opener=ops[prompt], sleep=lambda s: None)
+    r = modelbench.bench("m", ask)
+    assert r["faults"] == 1 and r["inconclusive"]
+    assert ops[modelbench.CELLS[0][1]].calls == modelbench.RETRIES + 1
+    log = (tmp_path / "bench-home" / "bench.log").read_text()
+    assert f"m: HTTP 429 busy, retry 1/{modelbench.RETRIES} in 11 s" in log and "HTTP 503 busy" in log
+
+
+def test_model_suite_takes_the_newest_complete_folder_pair_and_says_plainly_when_there_is_none(env, tmp_path,
+                                                                                               monkeypatch, capsys):
+    from ttp import bench, cli, modelbench, modelrank, modelsuite
+    d = tmp_path / "bench-home"
+    assert modelsuite.folders(d) is None, "no bench folder at all"
+
+    def prep(name):
+        b = d / name
+        b.mkdir(parents=True)
+        (b / "manifest.json").write_text('{"tasks": []}\n')
+        (b / "manifest.sha256").write_text(f"{bench._sha(b / 'manifest.json')}  manifest.json\n")
+        return b
+
+    def cells(name, b, made, pin=True):
+        c = d / name
+        c.mkdir(parents=True)
+        (c / "cells.json").write_text(json.dumps({"bench": str(b), "made": made, "cells": []}) + "\n")
+        (c / "cells.sha256").write_text(f"{bench._sha(c / 'cells.json') if pin else '0' * 64}  cells.json\n")
+        return c
+
+    old, new, edited = prep("prep-1"), prep("prep-2"), prep("prep-3")
+    cells("cells-1", old, 1.0)
+    want = cells("cells-2", new, 2.0)
+    cells("cells-3", new, 3.0, pin=False)            # half-written: its pin does not match
+    cells("cells-4", edited, 4.0)
+    (edited / "manifest.json").write_text('{"tasks": [1]}\n')   # its prep changed after the pin
+    cells("cells-5", d / "prep-gone", 5.0)           # its prep is gone
+    (d / "cells-6").mkdir()                          # no cells.json at all
+    assert modelsuite.folders(d) == (new, want)
+
+    p = make(env)
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.setattr(modelrank, "ranking", lambda cfg: ["m-a"])
+    seen = []
+    monkeypatch.setattr(modelsuite, "run", lambda *a, **kw: seen.append(kw) or [])
+    monkeypatch.setattr(modelbench, "home", lambda: d)
+    cli.main(["model-bench", "suite", "--dry-run", "--date", "2026-11-12"])
+    assert (seen[-1]["bench_dir"], seen[-1]["cells_dir"]) == (new, want)
+    assert f"replay cells from {new}" in capsys.readouterr().err
+    cli.main(["model-bench", "suite", "--dry-run", "--cells", str(want)])   # one given: the other is not guessed
+    assert (seen[-1]["bench_dir"], seen[-1]["cells_dir"]) == (None, want)
+    monkeypatch.setattr(modelbench, "home", lambda: tmp_path / "empty")
+    cli.main(["model-bench", "suite", "--dry-run"])
+    assert (seen[-1]["bench_dir"], seen[-1]["cells_dir"]) == (None, None)
+    assert "no complete `ttp bench prep` and `ttp bench cells` folder pair" in capsys.readouterr().err

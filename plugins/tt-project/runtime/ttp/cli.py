@@ -8900,11 +8900,18 @@ def _model_suite(p, a, now: float) -> None:
         served, ask = list(ids), (lambda m, q: modelbench._post(got.url, got.key, m, q))
     opts = {"timeout_s": a.timeout, "stall_s": min(900.0, a.timeout), "budget_usd": a.budget,
             "test_cmd": benchrun.TEST_CMD, "test_timeout_s": 900, "dry_run": a.dry_run, "harbor_tasks": a.harbor}
+    bench_dir = Path(a.bench).expanduser().resolve() if a.bench else None
+    cells_dir = Path(a.cells).expanduser().resolve() if a.cells else None
+    if not (a.bench or a.cells):   # the shared folders: the newest complete pair, or say plainly there is none
+        if pair := modelsuite.folders(modelbench.home()):
+            bench_dir, cells_dir = pair
+            print(f"model-bench suite: replay cells from {bench_dir}, injection cells from {cells_dir}", file=sys.stderr)
+        else:
+            print(f"model-bench suite: no complete `ttp bench prep` and `ttp bench cells` folder pair under "
+                  f"{modelbench.home()}: the replay and injection cells run 0 tasks (babysit only)", file=sys.stderr)
     try:
         rows = modelsuite.run(p.db, cfg, served, modelrank.parked_models(p.db), now, date=a.date or "",
-                              bench_dir=Path(a.bench).expanduser().resolve() if a.bench else None,
-                              cells_dir=Path(a.cells).expanduser().resolve() if a.cells else None,
-                              opts=opts, ask=ask)
+                              bench_dir=bench_dir, cells_dir=cells_dir, opts=opts, ask=ask)
     except (modelsuite.SuiteError, benchrun.BenchError) as e:
         die(f"model-bench suite: {e}")
     print(json.dumps([{k: v for k, v in r.items() if k != "cell_rows"} for r in rows], indent=1))
@@ -15449,7 +15456,8 @@ def main(argv: list[str] | None = None) -> None:
                                                          "(the owner's daily schedule; output in the bench log)")
     s.add_argument("--date", help="suite: the day whose seeded draw to run (YYYY-MM-DD; default today)")
     s.add_argument("--dry-run", action="store_true", help="suite: a fake agent and answerer, no spend")
-    s.add_argument("--bench", help="suite: a `ttp bench prep` folder for the replay cells")
+    s.add_argument("--bench", help="suite: a `ttp bench prep` folder for the replay cells (default, with no "
+                                   "--cells either: the newest complete prep and cells pair in the bench folder)")
     s.add_argument("--cells", help="suite: a `ttp bench cells` folder for the injection cells")
     s.add_argument("--timeout", type=float, default=1800.0, help="suite: seconds per agent cell (default 1800)")
     s.add_argument("--budget", type=float, default=2.0, help="suite: dollars per agent cell (default 2)")

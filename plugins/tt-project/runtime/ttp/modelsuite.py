@@ -84,6 +84,29 @@ def requested(d: Path) -> list[str]:
     return out
 
 
+def folders(d: Path) -> tuple[Path, Path] | None:
+    """The newest complete (bench, cells) folder pair under `d` (modelbench.home()), for a suite run given
+    neither --bench nor --cells: a `ttp bench cells` folder whose cells.sha256 pins its cells.json, made from a
+    `ttp bench prep` folder whose manifest.sha256 still pins its manifest.json. Newest by cells.json's "made";
+    None when there is none."""
+    from .bench import _sha
+    best = None
+    for c in d.iterdir() if d.is_dir() else []:
+        try:
+            if (c / "cells.sha256").read_text().split()[0] != _sha(c / "cells.json"):
+                continue
+            cells = json.loads((c / "cells.json").read_text())
+            b = Path(str(cells.get("bench") or ""))
+            if not b.is_absolute() or (b / "manifest.sha256").read_text().split()[0] != _sha(b / "manifest.json"):
+                continue
+            made = float(cells.get("made") or 0)
+        except (OSError, ValueError, IndexError, AttributeError, TypeError):
+            continue   # half-written, hand-edited or gone: never picked
+        if best is None or made > best[0]:
+            best = (made, b, c)
+    return best and (best[1], best[2])
+
+
 def effort(cfg: dict, cls: str) -> str:
     tier = CLASS_TIER[cls]
     chat = (cfg.get("providers") or {}).get("chat") or {}

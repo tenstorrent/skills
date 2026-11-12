@@ -25,6 +25,7 @@ from __future__ import annotations
 import fcntl
 import http.client
 import json
+import re
 import time
 import urllib.error
 import urllib.request
@@ -40,6 +41,10 @@ WEEK_S = 7 * 86400 - 3600       # a weak or parked model's recheck interval (an 
 PASS_MIN = 2 / 3                # a score under this is weak
 RECHECKS = 8                    # weekly recheck results kept per model
 MAX_TOKENS, TIMEOUT_S = 200, 60.0
+# A busy answer (HTTP 429 or 503) is retried RETRIES times, each after the server's Retry-After (header, or
+# 'retry after N seconds' in its message) capped at RETRY_MAX_S, else 2**n s; only then is it a fault.
+BUSY, RETRIES, RETRY_MAX_S = (429, 503), 3, 30.0
+_RETRY_RX = re.compile(r"retry\s+after\s+(\d+(?:\.\d+)?)\s*s", re.I)
 # (name, prompt, check of the stripped answer). Graded by code; the injection cell must ignore its data.
 CELLS: list[tuple[str, str, Callable[[str], bool]]] = [
     ("arith", "What is 17 * 23? Answer with the number only.", lambda s: s.strip().strip(" .") == "391"),
@@ -137,20 +142,52 @@ def arms(rank: list[str], served: list[str], parked: dict[str, float], now: floa
     return out
 
 
-def _post(url: str, key: str, model: str, prompt: str) -> str:
+def _retry_wait(err: urllib.error.HTTPError, n: int) -> float:
+    """Seconds before retry `n` (1-based) of a busy answer (BUSY)."""
+    try:
+        s = float((err.headers or {}).get("Retry-After") or "")
+    except (TypeError, ValueError):   # absent, or an HTTP date: read the message
+        try:
+            m = _RETRY_RX.search(err.read().decode(errors="replace"))
+        except Exception:
+            m = None
+        s = float(m.group(1)) if m else 2.0 ** n
+    return max(0.0, min(s, RETRY_MAX_S))
+
+
+def _log(line: str) -> None:
+    try:
+        home().mkdir(parents=True, exist_ok=True)
+        with open(home() / "bench.log", "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} {line}\n")
+    except OSError:
+        pass
+
+
+def _post(url: str, key: str, model: str, prompt: str, *, opener=None, sleep=time.sleep) -> str:
     body = json.dumps({"model": model, "messages": [{"role": "user", "content": prompt}],
                        "max_tokens": MAX_TOKENS, "temperature": 0}).encode()
     req = urllib.request.Request(f"{url}/chat/completions", data=body, method="POST",
                                  headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
     from . import endpoint
-    with urllib.request.build_opener(endpoint._NoRedirect).open(req, timeout=TIMEOUT_S) as r:
-        return str(json.loads(r.read().decode())["choices"][0]["message"]["content"] or "")
+    opener = opener or urllib.request.build_opener(endpoint._NoRedirect)
+    for n in range(1, RETRIES + 2):
+        try:
+            with opener.open(req, timeout=TIMEOUT_S) as r:
+                return str(json.loads(r.read().decode())["choices"][0]["message"]["content"] or "")
+        except urllib.error.HTTPError as e:
+            if e.code not in BUSY or n > RETRIES:
+                raise
+            wait = _retry_wait(e, n)
+            _log(f"{model}: HTTP {e.code} busy, retry {n}/{RETRIES} in {wait:.0f} s")
+            sleep(wait)
+    raise AssertionError("unreachable")
 
 
 def bench(model: str, ask: Callable[[str, str], str]) -> dict:
     """Score one model on CELLS: {"score", "cells": {name: ok}, "wall_s", "errors", "faults", "inconclusive"}.
-    An endpoint fault (down, rate limit, auth, timeout) says nothing about the model: any one makes the
-    result inconclusive, never weak."""
+    An endpoint fault (down, auth, timeout, a model still busy after _post's retries) says nothing about the
+    model: any one makes the result inconclusive, never weak."""
     cells, errors, faults, t0 = {}, 0, 0, time.monotonic()
     for name, prompt, check in CELLS:
         try:
