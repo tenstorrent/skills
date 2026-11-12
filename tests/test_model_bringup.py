@@ -229,6 +229,10 @@ def test_gates_fail_critical_for_malformed_serving_contract(installed, stage, fi
     (doc / 'full_model/logprobs.log').write_text('ok')
     path = doc / 'full_model/serving_contract.json'
     path.write_text(json.dumps(contract))
+    for probe in ('harness_requests', 'chat_conformance', 'long_context_accuracy'):
+        (doc / 'eval_readiness').mkdir(exist_ok=True)
+        (doc / f'eval_readiness/{probe}.json').write_text(json.dumps({
+            'probe': probe, 'schema_version': 1, 'checks': [{'id': 'a', 'status': 'pass', 'severity': 'critical'}]}))
     env['MODEL_DIR'] = str(model)
     gate = plugin / 'prompts/model_bringup_multigoal' / (stage + '.check.sh')
     result = run('bash', str(gate), cwd=target, env=env)

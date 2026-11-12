@@ -285,6 +285,17 @@ Mechanical degeneracy - doubled tokens, single-token collapse - is never a model
 
 If the tokenizer has no chat template, say so explicitly, treat the checkpoint as a base model, and judge the qualitative outputs against continuation-style expectations; do not let chat-style prompts produce poor text that masks serving bugs.
 
+## Eval-Readiness Probes
+
+Stage 9 must pass the request probes before it is done. They send what the eval harnesses send
+to the running server: [eval-readiness requests](references/eval-readiness-requests.md) covers
+P2 (`run_harness_requests`: harness sampling profiles accepted and decoded on the device) and P3
+(`run_chat_conformance`: chat, tools and thinking), with commands, the usual fix per failing check,
+and the 2 h time box. The load and long-context probes (P4, P5, including stage 9's
+`run_long_context --part accuracy`) are in the load reference, `eval-readiness-load.md` in this
+skill's `references/` folder. The gate is
+`scripts/check_eval_readiness.py --stage vllm`.
+
 ## Evidence To Leave
 
 Done means all of these are true and recorded:
