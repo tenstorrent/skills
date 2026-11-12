@@ -11112,13 +11112,17 @@ class Daemon:
 
     def check_gate_time(self, every_s: float = 600, now: float | None = None) -> None:
         """Model-free: once a day while the median of the project's last push check runs is over
-        checks.smoke_max_s, one `gate_slow` observation to its coordinator (gatetime.flag)."""
+        checks.smoke_max_s, one `gate_slow` observation to its coordinator (gatetime.flag); while the push
+        checks run only a marked pytest subset and nothing runs the rest after landing, one `checks_subset`
+        observation (gatetime.subset_flag)."""
         now = time.time() if now is None else now
         if now - getattr(self, "_gate_time_checked", 0.0) < every_s:
             return
         self._gate_time_checked = now
         from . import gatetime
         if text := gatetime.flag(self.p.db, self.p.state, self.cfg, self.p.state / "pushes", now):
+            log(self.p, text[:300])
+        if text := gatetime.subset_flag(self.p.db, self.cfg, now, self.p.name):
             log(self.p, text[:300])
 
     def check_checks_stall(self, every_s: float = 60, now: float | None = None, cpu=None) -> None:

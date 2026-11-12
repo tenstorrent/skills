@@ -3467,22 +3467,64 @@ def test_charter_forbidden_data_moves_into_config_once_and_charter_edits_change_
 
 
 def test_charter_branch_prose_words_are_no_shared_branches(env):
-    """"branch <word>" in charter prose ("the branch is ready", "branch tip") moves no shared branch:
-    only a name with a '/' or one that exists here or on origin. A list the harness wrote before that
-    check loses its prose words once; a list a user or coordinator set is never touched."""
+    """"branch <word>" in charter prose ("the branch is ready", "branch tip", "branch and/or") moves no
+    shared branch: only a name backticked in the charter or one that exists here or on origin, '/' or
+    not. A list the harness wrote before that check loses its prose words once; a list a user or
+    coordinator set is never touched."""
     from ttp import charterset, configwho
     p = make(env)
     p.charter_path.write_text(p.charter_path.read_text().replace(
-        "## Resources\n", "## Resources\nThe branch is ready; keep the branch tip green, with branch that.\n", 1))
-    assert charterset.migrate(p) == {}
-    assert not (p.raw_config().get("worktree") or {}).get("shared_branches")
+        "## Resources\n", "## Resources\nThe branch is ready; keep the branch tip green, with branch that. "
+        "Work on branch team/plain of org/repo; a branch can be per task, only the branch and/or a tag.\n"
+        "Shared: branch `team/work`.\n", 1))
+    assert charterset.migrate(p) == {"worktree.shared_branches": ["team/work"]}
     harness = {"by": "harness", "via": "charter settings moved to config"}
-    for who, want in ((harness, ["team/work"]), (configwho.by("user", via="cli"), ["team/work", "is", "tip"])):
-        p.set_config("worktree.shared_branches", ["team/work", "is", "tip"], by=who)
-        p.db.set_kv(charterset.DONE_KEY, {i: 1 for i in charterset.ITEMS if i != "branch_words"})
-        charterset.migrate(p)
-        assert p.raw_config()["worktree"]["shared_branches"] == want, who
-        assert charterset.migrate(p) == {}, "once only"
+    junk = ["team/work", "team/plain", "is", "can", "per", "only", "tip", "and/or"]
+    for who, want in ((harness, ["team/work"]), (configwho.by("user", via="cli"), junk)):
+        for left in ("branch_words", "branch_refs"):
+            p.set_config("worktree.shared_branches", junk, by=who)
+            p.db.set_kv(charterset.DONE_KEY, {i: 1 for i in charterset.ITEMS if i != left})
+            charterset.migrate(p)
+            assert p.raw_config()["worktree"]["shared_branches"] == want, (who, left)
+            assert charterset.migrate(p) == {}, "once only"
+
+
+def test_charter_machine_list_never_gets_a_refused_or_user_paused_machine(env):
+    """machines.allowed is user-only: the charter migration leaves out a machine the charter bars anywhere
+    (a Restriction, an exclusion) or a user pause holds, and raises one config_conflict event with the exact
+    `ttp config` command; a limit ("no special test cap on box-a") bars nothing. A list already set gets the
+    event once when the harness wrote it, is never changed, and a list the user set is not questioned."""
+    from ttp import charterset, configwho, coordinator
+    from ttp import machines as mm
+    for a in ("box-a", "box-b", "box-c", "box-d", "box-e"):
+        mm.add(a, tags="device")
+    p = make(env)
+    p.charter_path.write_text(p.charter_path.read_text().replace(
+        "## Resources\n", "## Resources\nMachines: box-a, box-b, box-c, box-d, box-e. No special test cap is "
+        "kept on box-a. The CLI is never installed on box-e.\n", 1)
+        + "\n## Restrictions\n- No test or check runs on box-b (serving users).\n")
+    coordinator.pause_resource(p, "box-c-device", True, reason="held", by="user")
+    coordinator.pause_resource(p, "box-d", True, reason="busy", by="coordinator")
+    wrote = charterset.migrate(p)
+    assert wrote["machines.allowed"] == ["box-a", "box-d", "box-e"]
+    ev = p.db.q("SELECT text,status FROM events WHERE kind=?", (charterset.CONFLICT_EVENT,))
+    assert len(ev) == 1 and ev[0]["status"] == "queued"
+    assert "box-b, box-c" in ev[0]["text"]
+    assert f"`ttp config {p.name} machines.allowed '[\"box-a\", \"box-b\", \"box-c\", \"box-d\", \"box-e\"]'`" in ev[0]["text"]
+    assert charterset.migrate(p) == {} and len(p.db.q("SELECT id FROM events WHERE kind=?", (charterset.CONFLICT_EVENT,))) == 1
+    # A list set before this check: flagged once with the command that drops them, never changed.
+    for who, events in (({"by": "harness", "via": "charter settings moved to config"}, 1),
+                        (configwho.by("user", via="cli"), 0)):
+        p.db.x("DELETE FROM events WHERE kind=?", (charterset.CONFLICT_EVENT,))
+        p.set_config("machines.allowed", ["box-a", "box-b", "box-c"], by=who)
+        p.db.set_kv(charterset.DONE_KEY, {i: 1 for i in charterset.ITEMS if i != "machine_conflicts"})
+        assert charterset.migrate(p) == {}
+        assert p.raw_config()["machines"]["allowed"] == ["box-a", "box-b", "box-c"]
+        ev = p.db.q("SELECT text FROM events WHERE kind=?", (charterset.CONFLICT_EVENT,))
+        assert len(ev) == events, who
+        if events:
+            assert f"`ttp config {p.name} machines.allowed '[\"box-a\"]'`" in ev[0]["text"]
+    assert "delivery.push_allowed" in charterset.USER_NEVER
 
 
 def test_project_machines_and_idle_capacity_skip_retired_machines(env):

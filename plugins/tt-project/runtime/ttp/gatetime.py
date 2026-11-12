@@ -20,6 +20,10 @@ never holding the queue.
 - Waits (waits_line()): how long full `ttp checks` runs waited to start (WAIT_LOG, record_wait(), from the run's
   arrival to its start here or on a spill host) and approval to landed (pushq.landing_times), median and p90
   over the last 24 h: the hours a slow landing spends queued, not testing.
+- Subset (subset_flag(), each daemon pass, model-free): while a delivery.push_checks pytest run selects only a
+  marked subset (`-m` or `-k`) and delivery.post_land_checks is empty, nothing ever runs the rest of the suite:
+  one `checks_subset` observation a day to the project's own coordinator names the fix (set post_land_checks to
+  the full suite). `checks.subset_flag` false turns it off.
 """
 from __future__ import annotations
 
@@ -45,6 +49,11 @@ AIM_S = 240.0
 EVENT = "gate_slow"
 SPEED_LABEL = "test_speed"   # the daemon's test speed-up task (speed_task), one open at a time
 SLOWEST = 10
+SUBSET_EVENT = "checks_subset"
+# A pytest run that selects a subset: `-m <expr>`, `-k <expr>` (or `-m<expr>`, `-k=<expr>`)
+# The selection argument itself, dropped to name the full suite: `-m expr`, `-k "a or b"`, `-m=expr`
+_SUBSET_ARG = re.compile(r"\s-[mk](?:[\s=]+|(?=\S))(?:\"[^\"]*\"|'[^']*'|\S+)")
+_SUBSET = re.compile(r"\bpytest\b.*?\s-([mk])(?:[\s=]|(?=\S))")
 # A pytest --durations line ("12.34s call     tests/x.py::test_y") or a test suite's own slowest-call line
 # ("ttp-suite:    61.20s tests/x.py::test_y", the plugin's test runner's)
 _DURATION = re.compile(r"^(?:ttp-suite:)?\s*(\d+(?:\.\d+)?)s\s+(?:(?:call|setup|teardown)\s+)?(\S+::\S+)", re.M)
@@ -224,6 +233,35 @@ def flag(db, state: Path | None, cfg: dict | None, log_dir: Path | None = None, 
             f"over the {_m(lim)} smoke limit (checks.smoke_max_s; aim {_m(AIM_S)}). " + named
             + split_advice() + (f" Queued test speed-up task #{tid} (priority 1)." if tid else
                                 " A test speed-up task is already open."))
+    db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
+         (now, "daemon", "observation", fp, "normal", text[:4000], "queued"))
+    return text
+
+
+def subset_checks(cfg: dict | None) -> list[str]:
+    """The delivery.push_checks commands that run only a marked pytest subset (`-m`/`-k`) while
+    delivery.post_land_checks is empty; [] otherwise."""
+    from . import push
+    d = (cfg or {}).get("delivery") or {}
+    if push.check_list(d.get("post_land_checks")):
+        return []
+    return [str(c) for c in push.check_list(d.get("push_checks")) if _SUBSET.search(str(c))]
+
+
+def subset_flag(db, cfg: dict | None, now: float | None = None, project: str = "<project>") -> str:
+    """Raise one `checks_subset` observation a day while the push checks run only a marked pytest subset and
+    nothing runs the rest after landing (subset_checks); returns its text ('' when none was raised)."""
+    now = time.time() if now is None else now
+    if ((cfg or {}).get("checks") or {}).get("subset_flag") is False or not (cmds := subset_checks(cfg)):
+        return ""
+    fp = f"{SUBSET_EVENT}:{time.strftime('%Y-%m-%d', time.gmtime(now))}"
+    if db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+        return ""
+    full = [c[:(m := re.search(r"\bpytest\b", c).end())] + _SUBSET_ARG.sub("", c[m:]) for c in cmds]
+    text = (f"Push checks run only a marked test subset ({'; '.join(cmds)}) and delivery.post_land_checks is "
+            f"empty, so the rest of the suite never runs. Fix: set post_land_checks to the full suite, e.g. "
+            f"`ttp config {project} delivery.post_land_checks '{json.dumps([{'run': c} for c in full])}'`. "
+            f"(checks.subset_flag false turns this notice off.)")
     db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
          (now, "daemon", "observation", fp, "normal", text[:4000], "queued"))
     return text

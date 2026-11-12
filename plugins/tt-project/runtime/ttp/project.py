@@ -914,6 +914,7 @@ def _known_keys(path: list[str]) -> set[str] | None:
                 "test_project_workers", "test_run_max", "test_run_min",
                 "done_holder_flag_s", "done_holder_grace_s", "stall_s", "push_load_wait_s",
                 "smoke_max_s",   # the landing check time limit (gatetime.max_s; default 300 s, 0: off)
+                "subset_flag",   # false: no daily notice that push checks run only a pytest subset (gatetime.subset_flag)
                 # the tests gate (gatejudge.settings): judge (default on), quarantine_days, judge_max_ids (failing
                 # ids it judges at most; default 10), judge_rerun_s, judge_busy_tries, judge_busy_wait_s.
                 "judge", "quarantine_days", "judge_max_ids", "judge_rerun_s", "judge_busy_tries", "judge_busy_wait_s",

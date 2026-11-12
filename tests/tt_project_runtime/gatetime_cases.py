@@ -361,3 +361,34 @@ def test_post_land_first_full_run_spills_and_its_reruns_bisect_and_revert_run_he
     said = []
     got = postland._spill(p, push.check_list(["true"])[0], pushed, said.append)
     assert got[0] is None and str(got[1]) == "true" and "the checks run here" in said[0]
+
+
+def test_push_checks_running_only_a_marked_subset_with_no_post_land_checks_raise_one_observation_a_day(env):
+    """Push checks that run a pytest `-m`/`-k` subset while delivery.post_land_checks is empty leave the rest of
+    the suite unrun: one model-free observation a day names the fix (the full suite as post_land_checks, as an
+    exact command); none once post_land_checks is set, for an unmarked run, or with checks.subset_flag false."""
+    from ttp import gatetime
+    from ttp.daemon import Daemon
+    p = make(env)
+    now = time.time()
+    smoke = {"run": "python3 -m pytest -q -m smoke tests/a.py tests/b.py", "if_exists": "tests/smoke.txt"}
+    cfg = {"delivery": {"push_checks": [smoke, "tool validate --strict"]}}
+    text = gatetime.subset_flag(p.db, cfg, now, p.name)
+    assert "delivery.post_land_checks is empty" in text
+    assert (f"`ttp config {p.name} delivery.post_land_checks "
+            "'[{\"run\": \"python3 -m pytest -q tests/a.py tests/b.py\"}]'`") in text
+    assert gatetime.subset_flag(p.db, cfg, now + 60, p.name) == "", "once a day"
+    assert gatetime.subset_flag(p.db, cfg, now + 86400, p.name)
+    assert len(p.db.q("SELECT id FROM events WHERE kind='observation' AND fingerprint LIKE 'checks_subset:%'")) == 2
+    later = now + 3 * 86400
+    k = {"delivery": {"push_checks": ["pytest -k 'fast or quick' tests"]}}
+    assert "pytest tests" in gatetime.subset_flag(p.db, k, later, p.name)
+    for quiet in ({"delivery": {**cfg["delivery"], "post_land_checks": ["python3 -m pytest -q tests"]}},
+                  {"delivery": {"push_checks": ["python3 -m pytest -q --maxfail=1 tests"]}},
+                  {**cfg, "checks": {"subset_flag": False}}):
+        assert gatetime.subset_flag(p.db, quiet, later + 86400, p.name) == "", quiet
+    d = Daemon(p.base)
+    d.cfg = {**d.cfg, **cfg}
+    d.check_gate_time(now=later + 2 * 86400)
+    assert p.db.one("SELECT id FROM events WHERE kind='observation' AND fingerprint=?",
+                    (f"checks_subset:{time.strftime('%Y-%m-%d', time.gmtime(later + 2 * 86400))}",))
