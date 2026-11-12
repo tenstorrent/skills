@@ -106,12 +106,12 @@ def run(p, repo: Path, commit: str, out_dir: Path | None = None) -> dict:
         if rec["rc"] == 0 and sha[:12] not in rec["version"]:
             rec["error"] = f"installed ttp --version does not name {sha[:12]}"
         rec["passed"] = rec["rc"] == 0 and not rec.get("error")
+    from . import project
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / RESULT).write_text(json.dumps(rec, indent=1) + "\n")
+    project.durable_write(out_dir / RESULT, json.dumps(rec, indent=1) + "\n")
     if p is not None:
         try:
-            with open(p.state / LOG, "a") as f:
-                f.write(json.dumps(rec) + "\n")
+            project.durable_append(p.state / LOG, json.dumps(rec) + "\n")
         except OSError:
             pass
     return rec

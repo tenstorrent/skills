@@ -9236,11 +9236,12 @@ def test_task_branches_start_from_the_working_branch_before_origin_head(env):
         p.set_config(key, "")
     assert worktree.base_ref(p) == default
     p.charter_path.write_text(p.charter_path.read_text() + "\nNever push to main. Each change is made on "
-                              "a work branch, then pushed to branch gone/away, then branch `team/work`.\n")
+                              "a work branch, then pushed to branch `gone/away`, then branch `team/work`; a "
+                              "branch and/or tag is no list entry.\n")
     assert worktree.base_ref(p) == default, "charter prose never picks the base"
     from ttp import charterset
     assert charterset.migrate(p) == {"delivery.base_ref": "origin/team/work",
-                                     "worktree.shared_branches": ["gone/away"]}, "the old reader's pick, once"
+                                     "worktree.shared_branches": ["gone/away"]}, "the old reader's pick, once, backticked names only"
     assert worktree.base_ref(p) == "origin/team/work" and worktree.resolve_base(p) == "origin/team/work"
     p.charter_path.write_text(p.charter_path.read_text().replace("team/work", "push/target"))
     assert charterset.migrate(p) == {} and worktree.base_ref(p) == "origin/team/work", "rewording moves nothing"
@@ -27571,6 +27572,8 @@ DURABLE_EXEMPT = {
     ("modelbench.py", 'with open(d / OWNER_LOCK, "a") as lk:'): "the bench owner lease's flock guard file, never written",
     ("untrusted.py", 'with open(path, "a") as f:'): "a run's untrusted-source marks in its own run dir, read when that run ends; a crash that loses one ends the run too; never project state",
     ("remotecheck.py", 'Path(scratch, "objects", "info", "alternates").write_text('): "points a scratch repository in a TemporaryDirectory at this one's objects for one bundle; it is gone when the bundle is sent, never project state",
+    ("installcheck.py", "dest.write_bytes(r.read())"): "the downloaded installer script in the install check's own folder, fetched again by each check; never state",
+    ("installcheck.py", 'with open(rec["log"], "wb") as log:'): "the installer's output log in the install check's own folder, rewritten by each check; the result it gives is written durably",
     ("streamguard.py", "with open(run_dir / WARN_FILE, \"a\") as f:"): "appends one fsync'd warning line per refused call that had already finished; a cut last line is skipped on read (take_warnings), a lost one costs only that warning",
 }
 
