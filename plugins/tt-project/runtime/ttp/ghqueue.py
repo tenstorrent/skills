@@ -45,6 +45,12 @@ _POSTS = {("pr", "comment"), ("issue", "comment"), ("pr", "create")}
 _API_FIELDS = {"-f", "-F", "--field", "--raw-field"}
 _BUNDLED = re.compile(r"-[A-Za-z]\S+")   # -XPOST, -cw, -bText: a bundle or an attached value
 _NEVER = {"--web", "-w", "--editor", "-e", "--delete-last"}   # opens a browser or editor there, or deletes
+# The only flags each of these upkeep calls may carry (every flag takes a value; anything else is refused)
+_EDIT_FLAGS = {"--title": "--title", "-t": "--title", "--body": "--body", "-b": "--body", "--body-file": "--body",
+               "-F": "--body", "--repo": "--repo", "-R": "--repo"}
+_CLOSE_FLAGS = {"--comment": "--comment", "-c": "--comment", "--repo": "--repo", "-R": "--repo"}
+_REPLY_PATH = re.compile(r"/?repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pulls/[0-9]+/comments/[0-9]+/replies")
+_REPLY_FLAGS = {"-X": "method", "--method": "method", "-f": "field", "--raw-field": "field"}
 
 
 def _body(argv: list[str], stdin: bytes) -> str | None:
@@ -58,15 +64,114 @@ def _body(argv: list[str], stdin: bytes) -> str | None:
     return body
 
 
+def _parse(rest: list[str], flags: dict) -> tuple[list[str], dict[str, list[str]], str]:
+    """(positionals, {canonical flag: values}, why refused) of `rest` against an allowlist of flags that
+    each take a value."""
+    pos, opts, i = [], {}, 0
+    while i < len(rest):
+        a = rest[i]
+        if not a.startswith("-") or a == "-":
+            pos.append(a)
+            i += 1
+            continue
+        name, eq, val = a.partition("=")
+        if name not in flags:
+            return pos, opts, f"`{name}` is not allowed here"
+        if not eq:
+            if i + 1 >= len(rest):
+                return pos, opts, f"`{name}` has no value"
+            val, i = rest[i + 1], i + 1
+        opts.setdefault(flags[name], []).append(val)
+        i += 1
+    if any(len(v) > 1 for v in opts.values()):
+        return pos, opts, "a flag is given twice"
+    return pos, opts, ""
+
+
+def _tagged(text: str | None) -> bool:
+    return text is not None and aitag.ends_with_tag(text, aitag.DEFAULT)
+
+
+def _upkeep(argv: list[str], stdin: bytes) -> str:
+    """Why `gh pr edit` (title and body only) or `gh pr close` (an optional comment) is refused, or ""."""
+    edit = argv[1] == "edit"
+    pos, opts, why = _parse(argv[2:], _EDIT_FLAGS if edit else _CLOSE_FLAGS)
+    if why:
+        return f"`gh pr {argv[1]}`: {why}" + (" (only --title, --body or --body-file -)" if edit else
+                                                " (only an optional --comment; never --delete-branch)")
+    if len(pos) != 1:
+        return f"`gh pr {argv[1]}` names exactly one PR"
+    if edit:
+        if not set(opts) & {"--title", "--body"}:
+            return "`gh pr edit` runs only to change the title or body"
+        body = opts.get("--body", [None])[0]
+        is_file = any(a.split("=", 1)[0] in ("--body-file", "-F") for a in argv[2:])
+        if is_file:
+            body = stdin.decode("utf-8", "replace") if body == "-" else None
+        if "--body" in opts and not _tagged(body):
+            return f"the PR body (--body or --body-file -) does not end with the AI-authorship tag {aitag.DEFAULT!r}"
+        return ""
+    if "--comment" in opts and not _tagged(opts["--comment"][0]):
+        return f"the close comment does not end with the AI-authorship tag {aitag.DEFAULT!r}"
+    return ""
+
+
+def _reply(argv: list[str]) -> str | None:
+    """None unless `gh api` posts to a PR review comment's replies; then why it is refused, or "": one
+    `-X POST` to exactly repos/<o>/<r>/pulls/<n>/comments/<id>/replies with one raw field, body, ending
+    with the AI tag."""
+    if not any(_REPLY_PATH.fullmatch(a) for a in argv[1:]):
+        return None
+    pos, opts, why = _parse(argv[1:], _REPLY_FLAGS)
+    if why:
+        return f"a review-comment reply: {why} (only -X POST and -f body=...)"
+    if len(pos) != 1 or [m.upper() for m in opts.get("method", [])] != ["POST"]:
+        return "a review-comment reply is one `-X POST` to one replies path"
+    field = opts.get("field", [""])[0]
+    if not field.startswith("body=") or not _tagged(field[5:]):
+        return f"a review-comment reply carries one field, body, ending with the AI-authorship tag {aitag.DEFAULT!r}"
+    return ""
+
+
+def own_draft(gh: str, argv: list[str]) -> str:
+    """Why the workstation must not close the PR `gh pr close argv` names, or "": only a draft its own gh
+    user opened, read just before the close."""
+    pos, opts, why = _parse(argv[2:], _CLOSE_FLAGS)
+    if why or len(pos) != 1:
+        return why or "no single PR named"
+    repo = [f"--repo={opts['--repo'][0]}"] if "--repo" in opts else []
+    try:
+        pr = subprocess.run([gh, "pr", "view", pos[0], *repo, "--json", "isDraft,author"], capture_output=True,
+                            timeout=GH_TIMEOUT_S)
+        me = subprocess.run([gh, "api", "user", "--jq", ".login"], capture_output=True, timeout=GH_TIMEOUT_S)
+        if pr.returncode or me.returncode:
+            return "could not read the PR or this gh user to check it is our own draft"
+        v = json.loads(pr.stdout)
+        login = me.stdout.decode().strip()
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return "could not read the PR or this gh user to check it is our own draft"
+    if not isinstance(v, dict) or v.get("isDraft") is not True:
+        return "`gh pr close` closes only a draft PR, and this one is not a draft"
+    author = v.get("author") if isinstance(v.get("author"), dict) else {}
+    if not login or str(author.get("login") or "").lower() != login.lower():
+        return "`gh pr close` closes only a draft this workstation's gh user opened, and this PR is someone else's"
+    return ""
+
+
 def allowed(argv, stdin: bytes = b"") -> str:
     """Why the workstation must not run `gh argv`, or "": the allowlist, checked on both sides. `gh api`
-    GET reads, pr view/list/checks, issue view/list, pr and issue comments and `pr create --draft`, each
-    post ending with the AI-authorship tag; never `pr ready`, a merge or anything else."""
+    GET reads, pr view/list/checks, issue view/list, pr and issue comments, `pr create --draft`, a reply
+    to a PR review comment (`gh api -X POST .../pulls/<n>/comments/<id>/replies -f body=...`), `pr edit`
+    of the title or body only and `pr close` (the workstation also checks the PR is its own draft), each
+    post, body or comment ending with the AI-authorship tag; never `pr ready`, a merge, a reviewer, a
+    label or anything else."""
     if not isinstance(argv, list) or not argv or not all(isinstance(a, str) and "\0" not in a for a in argv):
         return "not a list of plain arguments"
     if bad := next((a for a in argv if _BUNDLED.fullmatch(a)), None):
         return f"`{bad}`: short options go one per word, values apart (so none hides a method, field or --web)"
     if argv[0] == "api":
+        if (why := _reply(argv)) is not None:
+            return why
         get = any(a.upper() == "--METHOD=GET" or (a in ("-X", "--method") and nxt.upper() == "GET")
                   for a, nxt in zip(argv, [*argv[1:], ""]))
         names = [a.split("=", 1)[0] for a in argv if a.startswith("-")]
@@ -81,6 +186,8 @@ def allowed(argv, stdin: bytes = b"") -> str:
     pair = tuple(argv[:2])
     if pair in _READS:
         return ""
+    if pair in (("pr", "edit"), ("pr", "close")):
+        return _upkeep(argv, stdin)
     if pair not in _POSTS:
         return f"`gh {' '.join(argv[:2])}` is not on the workstation's allowlist"
     if pair == ("pr", "create") and not any(a in ("--draft", "-d") for a in argv):
@@ -226,6 +333,8 @@ def answer(entry: dict, gh: str | None = None) -> dict | None:
     if why := allowed(argv, stdin):
         return {"key": key, "rc": 1, "stdout": "", "stderr": f"refused on the workstation: {why}"}
     gh = gh or shutil.which("gh", path=os.environ.get("PATH", "") + ":/opt/homebrew/bin:/usr/local/bin") or "gh"
+    if argv[:2] == ["pr", "close"] and (why := own_draft(gh, argv)):
+        return {"key": key, "rc": 1, "stdout": "", "stderr": f"refused on the workstation: {why}"}
     try:
         p = subprocess.run([gh, *argv], input=stdin, capture_output=True, timeout=GH_TIMEOUT_S)
     except subprocess.TimeoutExpired:

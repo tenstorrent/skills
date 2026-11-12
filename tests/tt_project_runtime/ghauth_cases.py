@@ -616,6 +616,79 @@ def test_gh_workstation_runs_only_its_allowlist_and_never_resends_a_lost_write(e
     assert "it was not sent again" in json.loads((d / f"{key}.done").read_text())["stderr"]
 
 
+def test_gh_workstation_allows_pr_upkeep_title_body_edits_review_replies_and_closing_its_own_draft(env, monkeypatch):
+    """Draft-PR upkeep through the workstation: `pr edit` of the title or body only (a body ends with the
+    AI tag), a reply to a review comment (one POST to its replies path, one tagged body field) and `pr
+    close` of a draft the workstation's own gh user opened (read just before; never --delete-branch).
+    Every other edit flag, path, method or field is refused; nothing passes by missing a deny list."""
+    from ttp import ghqueue
+    cfg, repo, gh, ws_calls = _workstation(env, monkeypatch)
+    tag = ghqueue.aitag.DEFAULT
+    reply = "repos/acme/widgets/pulls/3/comments/991/replies"
+    for ok in (["pr", "edit", "3", "--title", "Faster pulls"], ["pr", "edit", "3", "--body", f"What.\n{tag}"],
+               ["pr", "edit", "3", "-t", "x", "-b", f"y\n{tag}", "-R", "acme/widgets"],
+               ["pr", "edit", "3", "--body=" + f"y\n{tag}", "--repo=acme/widgets"],
+               ["pr", "close", "3"], ["pr", "close", "3", "--comment", f"Superseded.\n{tag}", "-R", "acme/widgets"],
+               ["api", "-X", "POST", reply, "-f", f"body=Fixed in abc.\n{tag}"],
+               ["api", "--method", "post", "/" + reply, f"--raw-field=body=ok\n{tag}"]):
+        assert ghqueue.allowed(ok) == "", ok
+    assert ghqueue.allowed(["pr", "edit", "3", "--body-file", "-"], f"Body.\n{tag}\n".encode()) == ""
+    for bad in (["pr", "edit", "3", "--add-reviewer", "someone"], ["pr", "edit", "3", "--remove-reviewer", "x"],
+                ["pr", "edit", "3", "--base", "main"], ["pr", "edit", "3", "--add-label", "x"],
+                ["pr", "edit", "3", "--remove-label", "x"], ["pr", "edit", "3", "--add-assignee", "x"],
+                ["pr", "edit", "3", "--remove-assignee", "x"], ["pr", "edit", "3", "--add-project", "x"],
+                ["pr", "edit", "3", "--milestone", "x"], ["pr", "edit", "3", "--some-new-flag", "x"],
+                ["pr", "edit", "3", "--title", "x", "--add-reviewer", "x"], ["pr", "edit", "3"],
+                ["pr", "edit", "3", "--body", "no tag"], ["pr", "edit", "3", "--body-file", "/etc/passwd"],
+                ["pr", "edit", "3", "--body", f"x\n{tag}", "--body-file", "/etc/passwd"],
+                ["pr", "edit", "3", "4", "--title", "x"], ["pr", "edit", "3", "--title"],
+                ["pr", "close", "3", "--delete-branch"], ["pr", "close", "3", "-d"],
+                ["pr", "close", "3", "--comment", "no tag"], ["pr", "close"], ["pr", "reopen", "3"],
+                ["pr", "edit", "3", "--add-reviewer=x", "--title", "x"], ["pr", "ready", "3"],
+                ["api", "-X", "POST", reply, "-f", "body=no tag"], ["api", "-X", "PATCH", reply, "-f", f"body=x\n{tag}"],
+                ["api", "-X", "POST", reply, "-f", f"body=x\n{tag}", "-f", "in_reply_to=1"],
+                ["api", "-X", "POST", reply, "-F", f"body=x\n{tag}"], ["api", "-X", "POST", reply, "--input", "-"],
+                ["api", "-X", "POST", reply, "-f", f"body=x\n{tag}", "-H", "X-HTTP-Method-Override: DELETE"],
+                ["api", "-X", "POST", "repos/acme/widgets/pulls/3/comments", "-f", f"body=x\n{tag}"],
+                ["api", "-X", "POST", "repos/acme/widgets/pulls/3/reviews", "-f", f"body=x\n{tag}"],
+                ["api", "-X", "POST", "repos/acme/widgets/pulls/x/comments/1/replies", "-f", f"body=x\n{tag}"],
+                ["api", "-X", "POST", reply + "?x=1", "-f", f"body=x\n{tag}"],
+                ["api", "-X", "POST", reply, "graphql", "-f", f"body=x\n{tag}"],
+                ["api", "-XPOST", reply, "-f", f"body=x\n{tag}"], ["api", reply, "-f", f"body=x\n{tag}"]):
+        assert ghqueue.allowed(bad), bad
+
+    # pr close: the workstation reads the PR and its own login just before, and closes only its own draft
+    ws = ws_calls.parent
+    view = ws / "view.json"
+    stub = ws / "gh-close"
+    stub.write_text("#!/bin/sh\n"
+                    f'printf "%s\\n" "$*" >> "{ws_calls}"\n'
+                    f'case "$1 $2" in "pr view") cat "{view}";; "api user") echo me;; *) echo "ws: $*";; esac\n')
+    stub.chmod(0o755)
+    close = ["pr", "close", "3", "-R", "acme/widgets"]
+    for draft, login, refused in ((False, "me", "not a draft"), (True, "someone-else", "someone else's"),
+                                  (True, "ME", "")):
+        view.write_text(json.dumps({"isDraft": draft, "author": {"login": login}}))
+        got = ghqueue.answer({"key": "d" * 32, "argv": close, "stdin": ""}, str(stub))
+        assert (refused in got["stderr"] and got["rc"] == 1) if refused else (got["rc"] == 0 and not got["stderr"]), got
+    calls = ws_calls.read_text().splitlines()
+    assert sum(c.startswith("pr close") for c in calls) == 1, calls   # only its own draft was closed
+    assert "pr view 3 --repo=acme/widgets --json isDraft,author" in calls
+    ws_calls.unlink()
+
+    # the box queues each allowed upkeep call and gets the workstation's answer after one take/put round
+    from ttp import ghroute
+    calls = [["pr", "edit", "3", "--title", "Faster pulls"],
+             ["api", "-X", "POST", reply, "-f", f"body=Fixed.\n{tag}"]]
+    for c in calls:
+        assert ghroute.run("gh", c, cfg=cfg, cwd=str(repo)) == ghroute.HELD_RC
+    assert ghqueue.pull("lab-box", gh) == "lab-box: answered 2 gh call(s)"
+    for c in calls:
+        assert ghroute.run("gh", c, cfg=cfg, cwd=str(repo)) == 0
+    assert ghqueue.enqueue(["pr", "edit", "3", "--add-reviewer", "x"], cwd=str(repo)) == 1   # refused here too
+    assert ghqueue.pull("lab-box", gh) == "lab-box: no gh calls queued"
+
+
 def test_bridge_gh_pull_is_a_per_box_switch():
     from ttp import bridge
     agents = {"a": {"agent": "env", "direct": [{"name": "h"}]}}
