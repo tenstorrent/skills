@@ -3978,11 +3978,13 @@ Workers can read Slack links you paste, using your Slack connector if you have o
     agent failing twice in a row (within about a minute) ends the session, which reconnects after
     5 s, then 20 s and 60 s, and then leaves the restart to the supervisor. On the box, the daemon checks
     each link the bridge registered about once a minute (ssh's own `IdentityAgent none` and
-    `SSH_AUTH_SOCK` values are no link). One down for 2 minutes shows only a low status line in
-    the web app and status; still down after `bridge.agent_alert_grace_min` (default 15), the
-    user gets one low alert per outage, raised to normal past an hour. It names the agent and the
-    ssh aliases it serves and says the link to the user's workstation is down and reconnects by
-    itself once that workstation is awake and online. It clears when the agent answers again.
+    `SSH_AUTH_SOCK` values are no link). One that stops answering shows at once as a low status
+    line in the web app and status, never in a chat; still down after
+    `bridge.agent_alert_after_min` (default 60), the user gets one normal alert per outage. It
+    names the agent and the ssh aliases it serves and says the link to the user's workstation is
+    down and reconnects by itself once that workstation is awake and online. It clears once the
+    agent has answered for `bridge.agent_steady_min` (default 15); a drop before that continues the
+    same outage, with no new line or alert and its clock kept.
     The box never relinks a link itself.
   - The session's own login key must be allowed to forward an agent: an `authorized_keys` line with
     `restrict` and no `agent-forwarding` gives none (`doctor` says so). Name a key that may forward

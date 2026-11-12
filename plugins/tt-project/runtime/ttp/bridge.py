@@ -45,8 +45,9 @@ it fails with 'Permission denied (publickey)'. The box-side loop asks the agents
 30 s: a link whose agent does not answer while this session's does is relinked to this session's;
 this session's own agent failing twice in a row ends the session, and the wrapper reconnects
 (within about a minute of the agent dying, then bounded retries). The box's daemon checks each link
-the block names once a minute on its own (bridgewatch.py): a low status line past 2 minutes, one
-alert per outage past bridge.agent_alert_grace_min, naming the bridge's agent and hosts.
+the block names once a minute on its own (bridgewatch.py): a low status line at once, one normal
+alert per outage past bridge.agent_alert_after_min, naming the bridge's agent and hosts; a drop
+before the agent answered steadily for bridge.agent_steady_min continues the same outage.
 
 The config is JSON (`~/.config/tt-project/bridge.json`, or --config); see
 docs/access-bridge.example.json.

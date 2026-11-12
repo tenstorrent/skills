@@ -974,80 +974,136 @@ def test_bridge_dead_agent_reconnects_with_bounded_retries(tmp_path, monkeypatch
     assert "died again after each reconnect" in capfd.readouterr().err
 
 
-def test_bridge_host_watch_shows_a_status_line_then_alerts_after_the_grace_and_clears(env, tmp_path, monkeypatch):
-    # cells: host-status-line, host-alert-after-grace, host-escalate, host-clear, host-quiet
-    from ttp import alerts, bridge, bridgewatch
+def _bridge_watch_setup(env, tmp_path, monkeypatch, block=None):
+    """A daemon and an ssh config whose bridge block names one stub agent link (`auto`); the link is dead
+    while `<tmp>/auto.sock.dead` exists. Returns (project, daemon, config, eps(), chat())."""
+    from ttp import bridge
     from ttp.daemon import Daemon
     path, _socks = _bridge_stub_agents(tmp_path, "auto")
     monkeypatch.setenv("PATH", path)
     link = str(tmp_path / "auto.sock")
     cfg = tmp_path / "ssh-config"
-    cfg.write_text(f"Host other\n  IdentityAgent {tmp_path / 'elsewhere.sock'}\n\n{bridge.BEGIN}\n\n"
-                   f"Host build-a ba\n  HostName 127.0.0.1\n  IdentityAgent {link}\n\n"
-                   f"Host build-b\n  IdentityAgent {link}\n{bridge.END}\n")
-    assert bridgewatch.links(cfg.read_text()) == {link: ["build-a", "ba", "build-b"]}
+    cfg.write_text(block or f"{bridge.BEGIN}\nHost build-a\n  IdentityAgent {link}\n{bridge.END}\n")
     p = make(env)
     d = Daemon(p.base)
     key = "bridge-agent:auto"
-    now = time.time()
 
     def eps():
         return p.db.q("SELECT * FROM alerts WHERE key=? ORDER BY id", (key,))
 
     def chat():
-        return [m for m in p.db.q("SELECT * FROM messages WHERE ref=? AND kind='alert'", (key,))
+        return [m for m in p.db.q("SELECT * FROM messages WHERE ref=? AND direction='out'", (key,))
                 if m["channel"] == "chat"]
+    return p, d, cfg, eps, chat
 
+
+def test_bridge_host_watch_shows_a_status_line_at_once_then_alerts_after_an_hour_and_clears(env, tmp_path, monkeypatch):
+    # cells: host-status-line, host-alert-after-hour, host-clear-steady, host-quiet
+    from ttp import alerts, bridge, bridgewatch
+    link = str(tmp_path / "auto.sock")
+    block = (f"Host other\n  IdentityAgent {tmp_path / 'elsewhere.sock'}\n\n{bridge.BEGIN}\n\n"
+             f"Host build-a ba\n  HostName 127.0.0.1\n  IdentityAgent {link}\n\n"
+             f"Host build-b\n  IdentityAgent {link}\n{bridge.END}\n")
+    p, d, cfg, eps, chat = _bridge_watch_setup(env, tmp_path, monkeypatch, block)
+    assert bridgewatch.links(cfg.read_text()) == {link: ["build-a", "ba", "build-b"]}
+    key = "bridge-agent:auto"
+    now = time.time()
     assert bridgewatch.check(d, now, cfg) == [] and not p.db.q("SELECT id FROM alerts")   # answers: quiet
     (tmp_path / "auto.sock.dead").touch()
-    assert bridgewatch.check(d, now + 60, cfg) == [] and not eps()   # the first failed check: nothing yet
-    assert bridgewatch.check(d, now + 181, cfg) == []   # 2 min: a low status line, nobody alerted
+    assert bridgewatch.check(d, now + 60, cfg) == []   # the first failed check: a low status line at once
     assert len(eps()) == 1 and eps()[0]["severity"] == "low" and not chat()
-    assert alerts.holds(p.db, key, now + 181, now + 190)   # the line stays up while the link is down
-    assert bridgewatch.check(d, now + 600, cfg) == [] and not chat()   # inside the 15 min grace
-    assert bridgewatch.check(d, now + 60 + 15 * 60, cfg) == [key]   # past the grace: the user is told, low
+    assert alerts.holds(p.db, key, now + 60, now + 70)   # the line stays up while the link is down
+    for t in range(120, 3600, 60):   # down nearly an hour: the one line, no chat post
+        assert bridgewatch.check(d, now + t, cfg) == []
+    assert len(eps()) == 1 and not chat()
+    assert bridgewatch.check(d, now + 60 + 3600, cfg) == [key]   # down an hour: the user is told once, normal
     sent = chat()
-    assert len(sent) == 1 and sent[0]["severity"] == "low"
+    assert len(sent) == 1 and sent[0]["severity"] == "normal" and sent[0]["kind"] == "alert"
     t = sent[0]["text"]
     assert "auto agent" in t and "none" not in t and "build-a, ba, build-b" in t
     assert "workstation is down and reconnects by itself" in t
     assert "127.0.0.1" not in t and "VPN" not in t
-    assert bridgewatch.check(d, now + 1800, cfg) == [] and len(chat()) == 1   # once per outage
-    assert bridgewatch.check(d, now + 60 + 3600, cfg) == [key]   # down over an hour: normal
-    assert [m["severity"] for m in chat()] == ["low", "normal"]
+    assert bridgewatch.check(d, now + 5400, cfg) == [] and len(chat()) == 1   # once per outage
     (tmp_path / "auto.sock.dead").unlink()
-    assert bridgewatch.check(d, now + 3720, cfg) == []
+    assert bridgewatch.check(d, now + 5460, cfg) == []   # one good probe: not cleared yet
+    assert not any(e["cleared"] for e in eps()) and alerts.holds(p.db, key, now + 60, now + 5470)
+    for t in range(5520, 5460 + 15 * 60, 60):
+        bridgewatch.check(d, now + t, cfg)
+    assert not any(e["cleared"] for e in eps())
+    assert bridgewatch.check(d, now + 5460 + 15 * 60, cfg) == []   # answered steadily for 15 min: cleared
     assert all(e["cleared"] for e in eps())
-    assert not alerts.holds(p.db, key, now + 121, now + 3800)
+    assert not alerts.holds(p.db, key, now + 121, now + 6500)
+    assert not p.db.kv(bridgewatch.STATE_KEY, {})
+    assert len([m for m in chat() if m["kind"] == "alert"]) == 1
 
 
-def test_bridge_host_watch_grace_is_a_setting_and_a_quick_heal_never_alerts(env, tmp_path, monkeypatch):
-    # cells: host-grace-setting, host-quick-heal
-    from ttp import alerts, bridge, bridgewatch
-    from ttp.daemon import Daemon
-    path, _socks = _bridge_stub_agents(tmp_path, "auto")
-    monkeypatch.setenv("PATH", path)
-    link = str(tmp_path / "auto.sock")
-    cfg = tmp_path / "ssh-config"
-    cfg.write_text(f"{bridge.BEGIN}\nHost build-a\n  IdentityAgent {link}\n{bridge.END}\n")
-    p = make(env)
-    d = Daemon(p.base)
+def test_bridge_host_watch_a_ten_minute_flap_posts_nothing_to_the_chat(env, tmp_path, monkeypatch):
+    # cells: host-short-drop, host-flap-one-outage
+    from ttp import alerts, bridgewatch
+    p, d, cfg, eps, chat = _bridge_watch_setup(env, tmp_path, monkeypatch)
     key = "bridge-agent:auto"
     now = time.time()
-    (tmp_path / "auto.sock.dead").touch()
-    bridgewatch.check(d, now, cfg)
-    assert bridgewatch.check(d, now + 240, cfg) == []   # down 4 min, healed by the next check
-    (tmp_path / "auto.sock.dead").unlink()
-    assert bridgewatch.check(d, now + 300, cfg) == []
+    dead = tmp_path / "auto.sock.dead"
+    # The 11-12 pattern: down 4 min, back 5, down 1, back 3, down 2 min, then steady.
+    for start, end, down in [(0, 240, 1), (240, 540, 0), (540, 600, 1), (600, 780, 0), (780, 900, 1),
+                             (900, 1140, 0)]:
+        dead.touch() if down else dead.unlink(missing_ok=True)
+        for s in range(start, end, 60):
+            assert bridgewatch.check(d, now + s, cfg) == []
+    assert len(eps()) == 1 and not chat()   # one quiet line for the whole flap
+    st = p.db.kv(bridgewatch.STATE_KEY, {})
+    rec = next(iter(st.values()))
+    assert rec["since"] == now and rec["flaps"] == 2   # the clock was never reset
+    assert alerts.holds(p.db, key, now, now + 1000)
+    for s in range(1140, 900 + 15 * 60 + 60, 60):   # steady from 15:00 on: cleared quietly at 30:00
+        bridgewatch.check(d, now + s, cfg)
+    assert all(e["cleared"] for e in eps()) and not chat()
     assert not p.db.q("SELECT id FROM messages WHERE ref=? AND channel='chat'", (key,))
-    assert all(e["cleared"] for e in p.db.q("SELECT cleared FROM alerts WHERE key=?", (key,)))
-    d.cfg = {**d.cfg, "bridge": {"agent_alert_grace_min": 5}}
-    assert bridgewatch.grace_s(d.cfg) == 300 and bridgewatch.grace_s({}) == 15 * 60
-    assert bridgewatch.grace_s({"bridge": {"agent_alert_grace_min": "x"}}) == 15 * 60
+
+
+def test_bridge_host_watch_a_flapping_outage_alerts_once_by_its_first_drop(env, tmp_path, monkeypatch):
+    # cells: host-flap-keeps-clock, host-threshold-setting
+    from ttp import alerts, bridgewatch
+    p, d, cfg, eps, chat = _bridge_watch_setup(env, tmp_path, monkeypatch)
+    key = "bridge-agent:auto"
+    now = time.time()
+    dead = tmp_path / "auto.sock.dead"
+    # Down 10 min, back 10 min, down again: never down an hour straight, but one outage past an hour.
+    t = 0
+    while t <= 3600 + 60:
+        if (t // 600) % 2 == 0:
+            dead.touch()
+        else:
+            dead.unlink(missing_ok=True)
+        bridgewatch.check(d, now + t, cfg)
+        t += 60
+    assert [m["severity"] for m in chat() if m["kind"] == "alert"] == ["normal"]
+    assert "brief return" in chat()[0]["text"]
+    assert len(eps()) == 1
+    assert bridgewatch.after_s({}) == 3600 and bridgewatch.steady_s({}) == 15 * 60
+    assert bridgewatch.after_s({"bridge": {"agent_alert_after_min": "x"}}) == 3600
+    assert bridgewatch.after_s({"bridge": {"agent_alert_after_min": 0}}) == bridgewatch.FLOOR_S
+    d.cfg = {**d.cfg, "bridge": {"agent_alert_after_min": 5, "agent_steady_min": 3}}
+    dead.unlink(missing_ok=True)
+    for s in range(3720, 3720 + 4 * 60, 60):   # steady for 3 min (the setting): cleared
+        bridgewatch.check(d, now + s, cfg)
+    assert all(e["cleared"] for e in eps())
+    dead.touch()
+    bridgewatch.check(d, now + 4000, cfg)
+    assert bridgewatch.check(d, now + 4000 + 301, cfg) == [key]   # a new outage, past the 5 min set here
+    assert not alerts.holds(p.db, "bridge-agent:none", now, now + 5000)
+
+
+def test_bridge_host_watch_reads_an_older_state_record(env, tmp_path, monkeypatch):
+    # cells: host-old-record
+    from ttp import bridgewatch
+    p, d, cfg, eps, chat = _bridge_watch_setup(env, tmp_path, monkeypatch)
+    now = time.time()
+    link = str(tmp_path / "auto.sock")
+    p.db.set_kv(bridgewatch.STATE_KEY, {link: {"since": now - 7200, "stage": 3, "alerted": True}})
     (tmp_path / "auto.sock.dead").touch()
-    bridgewatch.check(d, now + 400, cfg)
-    assert bridgewatch.check(d, now + 701, cfg) == [key]   # past the 5 min grace set here
-    assert not alerts.holds(p.db, "bridge-agent:none", now, now + 800)
+    assert bridgewatch.check(d, now, cfg) == [] and not chat()   # told under the older stages: not again
+    assert p.db.kv(bridgewatch.STATE_KEY, {})[link]["stage"] == 2
 
 
 def test_bridge_host_watch_skips_ssh_identityagent_keywords(env, tmp_path, monkeypatch):
@@ -1069,7 +1125,7 @@ def test_bridge_host_watch_skips_ssh_identityagent_keywords(env, tmp_path, monke
     now = time.time()
     (tmp_path / "auto.sock.dead").touch()
     bridgewatch.check(d, now, cfg)
-    assert bridgewatch.check(d, now + 15 * 60 + 1, cfg) == ["bridge-agent:auto"]
+    assert bridgewatch.check(d, now + 3600 + 1, cfg) == ["bridge-agent:auto"]
     assert not p.db.q("SELECT id FROM alerts WHERE key LIKE '%none%' OR key LIKE '%SSH_AUTH%'")
 
 

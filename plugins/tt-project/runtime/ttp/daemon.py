@@ -4875,8 +4875,8 @@ class Daemon:
 
     def watch_bridge_agents(self) -> None:
         """Model-free, about once a minute: each agent link an access bridge registered in this account's
-        ssh config still answers; a low status line past 2 min, one alert per outage past
-        bridge.agent_alert_grace_min (normal past an hour), cleared on recovery (bridgewatch.py)."""
+        ssh config still answers; a low status line at once, one normal alert per outage past
+        bridge.agent_alert_after_min, cleared once it answers steadily (bridgewatch.py)."""
         from . import bridgewatch
         now = time.time()
         if now - getattr(self, "_bridge_watched", 0.0) < bridgewatch.EVERY_S or (
