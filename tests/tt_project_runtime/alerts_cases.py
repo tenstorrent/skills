@@ -2381,10 +2381,12 @@ def test_a_machine_outage_alert_holds_while_reported_and_clears_with_its_conditi
     d.alert("machine:box-a:held", "Outage: Machine box-a held.", severity="high")
     assert alerts.sweep(alpha.db, now + 60) == []
     assert [c["key"] for c in alerts.sweep(alpha.db, now + ml.CONDITION_GONE_S)] == ["machine:box-a:held"]
-    # An overdue change: holds while it is open and overdue, clears once it is closed.
+    # An overdue change no project can decide (the only change alert the user still gets): holds while it
+    # is open and overdue, clears once it is closed.
     c = ml.add_change("box-a", "drop-in", "rm it", "gamma", expires="1h", now=now - 7200)
     key = f"machine-change:{c['id']}"
-    d.alert(key, "Outage: Machine change overdue.", severity="high")
+    d.alert(key, f"Outage: An expired machine change {alerts.MACHINE_CHANGE_ORPHAN}: #{c['id']} on box-a.",
+            severity="high")
     assert alerts.sweep(alpha.db, late) == []
     ml.close_change(c["id"], "undone")
     assert [x["key"] for x in alerts.sweep(alpha.db, late)] == [key]
