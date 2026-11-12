@@ -13352,3 +13352,24 @@ def test_slot_status_lists_a_run_waiting_for_a_slot_with_what_holds_it(env, tmp_
     text = _slot_status(cli, capsys, False)
     assert "live check runs: 0 running here, 0 on spill hosts, 1 waiting" in text, text
     assert f"waiting: #{tid} run {rid} pid {os.getpid()}, held by the test slots of suite full (limit 2)" in text
+
+
+def test_a_spill_rerun_whose_remote_part_took_18_min_books_no_slot_wait_here(env, monkeypatch, tmp_path):
+    """#8533: a spilled run keeps its first arrival for its queue place; its remote part ran 18 min, then its
+    rerun here (cli sets WAIT_FROM_ENV) got the free local slot at once. The waits log, the host grant row
+    and the host pool report all book about 0 s, not the 18 min since its arrival."""
+    from ttp import checkcap, throughput
+    monkeypatch.setattr(checkcap, "grants_dir", lambda: tmp_path / "host")
+    state = tmp_path / "state"
+    state.mkdir()
+    now = time.time()
+    arrived, remote_end = now - 1200, now - 1200 + 18 * 60
+    monkeypatch.setenv(checkcap.WAIT_FROM_ENV, repr(remote_end))
+    checkcap.record_wait(state, "proj-spill", 2, arrived, remote_end + 0.2)
+    (rec,) = checkcap.wait_records(state, now)
+    assert rec["queued_at"] == round(arrived, 3), "its queue place stays its first arrival"
+    assert rec["granted_at"] - checkcap.wait_start(rec) < 1, rec
+    assert checkcap.waits(state, now) == [pytest.approx(0.2, abs=0.01)]
+    (row,) = checkcap.grant_records(now)
+    assert row["since"] == pytest.approx(arrived, abs=0.01) and row["waited_s"] < 1, row
+    assert throughput.host_shares(now=now)["projects"]["proj-spill"]["wait_s"] < 1

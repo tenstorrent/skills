@@ -162,7 +162,8 @@ def _hm(s: float) -> str:
 
 def _slot_waits(state: Path | None, now: float) -> list[float]:
     """The last 24 h's host checks slot waits of ordinary checks runs (checkcap's WAITS_LOG, slot "queue":
-    arrival to grant), the span queuewait's checks marks count; [] with none logged (WAIT_LOG then)."""
+    arrival, or a relaunch's or spill rerun's own wait start (checkcap.wait_start), to grant), the span
+    queuewait's checks marks count; [] with none logged (WAIT_LOG then)."""
     from . import checkcap
     if state is None:
         return []
@@ -170,7 +171,7 @@ def _slot_waits(state: Path | None, now: float) -> list[float]:
         recs = checkcap.wait_records(Path(state), now, DAY_S)
     except OSError:
         return []
-    return [max(0.0, r["granted_at"] - r["queued_at"]) for r in recs if r.get("slot", "queue") == "queue"]
+    return [max(0.0, r["granted_at"] - checkcap.wait_start(r)) for r in recs if r.get("slot", "queue") == "queue"]
 
 
 def waits_line(db, state: Path | None, now: float | None = None, landed: bool = True) -> str:

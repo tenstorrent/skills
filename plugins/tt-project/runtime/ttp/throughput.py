@@ -1279,7 +1279,7 @@ def host_shares(since_s: float = DAY, now: float | None = None) -> dict:
         x = projects.setdefault(str(r.get("project") or ""), {"grants": 0, "running": 0, "wait_s": 0.0,
                                                               "over_share_waits": 0, "over_share_by": []})
         x["grants"] += 1
-        x["wait_s"] += max(0.0, float(r["ts"]) - float(r["since"]))
+        x["wait_s"] += _grant_wait(r)
         if by := [str(b) for b in r.get("over_share") or () if isinstance(b, str)]:
             x["over_share_waits"] += 1
             x["over_share_by"] = sorted(set(x["over_share_by"]) | set(by))
@@ -1289,6 +1289,15 @@ def host_shares(since_s: float = DAY, now: float | None = None) -> dict:
         x["wait_s"] = round(x["wait_s"])
     k = len({locks.group_id(n) for n, c in run.items() if c} | waiting)
     return {"cap": cap, "share": locks.share_of(cap, k) if cap else None, "projects": projects}
+
+
+def _grant_wait(r: dict) -> float:
+    """A host grant row's slot wait: its "waited_s" (checkcap.record_grant, from wait_start: a relaunch's or
+    spill rerun's earlier run is no wait), else, for a row logged without it, arrival to grant."""
+    w = r.get("waited_s")
+    if isinstance(w, (int, float)) and not isinstance(w, bool) and w >= 0:
+        return float(w)
+    return max(0.0, float(r["ts"]) - float(r["since"]))
 
 
 def _dur(s: float) -> str:

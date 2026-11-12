@@ -1823,3 +1823,19 @@ def test_throughput_daily_task_count_shows_only_with_a_target_in_throughput_and_
     assert line in throughput.text(throughput.review(p, p.config(), now=now))
     assert line.split(";")[0] in coord.digest(p, {}, [], [])
     assert throughput.daily_target({"tasks": {"daily_target": "many"}}) == 0
+
+
+def test_host_checks_pool_counts_a_grant_rows_waited_s_and_an_old_rows_arrival_to_grant(env, monkeypatch, tmp_path):
+    """#8533: the host pool report counts a grant row's "waited_s" (record_grant: from wait_start, so a spill
+    rerun's or relaunch's earlier run is no wait), not its first arrival ("since") to grant; a row logged
+    before waited_s still counts since to ts."""
+    from ttp import checkcap, throughput
+    monkeypatch.setattr(checkcap, "grants_dir", lambda: tmp_path / "host")
+    (tmp_path / "host").mkdir()
+    now = time.time()
+    rows = [{"ts": now - 600, "project": "proj-a", "slot": "queue", "since": now - 600 - 1200, "waited_s": 1.4},
+            {"ts": now - 300, "project": "proj-b", "slot": "queue", "since": now - 300 - 900}]
+    (tmp_path / "host" / checkcap.GRANTS_LOG).write_text("".join(json.dumps(r) + "\n" for r in rows))
+    rep = throughput.host_shares(now=now)
+    assert rep["projects"]["proj-a"]["wait_s"] == 1, rep   # 1.4 s, the report's whole seconds; not 1200
+    assert rep["projects"]["proj-b"]["wait_s"] == 900, rep
