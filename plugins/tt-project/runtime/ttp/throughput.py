@@ -122,6 +122,7 @@ ROWS = 5000
 STALL_GAP_S = 1800   # no worker run started anywhere for this long: dispatch stalled, not a slot limit
 SERIAL_S = 10.0   # a checks grant this close to a run's end, one run at a time: a serialized queue
 SUSTAIN_S = 600.0   # how long in all a count of checks runs at once must hold to count as the cap then
+SLOT_ROUND_S = 0.001   # checkcap stores a slot record's times to the millisecond, run times are not
 # The settings apply() may change: each sizes how soon queued work starts and is accepted by config_set.
 # coordinator.review_stall_s stays only so `--undo` can restore an earlier change: plan() never proposes it.
 LEVERS = ("budget.max_parallel_workers", "review.sweep_after_s", "review.unreviewed_per_pass",
@@ -803,7 +804,8 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
             for a, b in slot_ran.get(t["id"], ()):   # its own earlier run inside a slot wait: no wait
                 segs = [x for w0, w1, h in segs for x in
                         ([(w0, w1, h)] if not h or b <= w0 or a >= w1 else
-                         [(w0, max(w0, a), h), (max(w0, a), min(w1, b), "ran"), (min(w1, b), w1, h)]) if x[1] > x[0]]
+                         [(w0, max(w0, a), h), (max(w0, a), min(w1, b), "ran"), (min(w1, b), w1, h)])
+                        if x[1] - x[0] > SLOT_ROUND_S]   # a sliver from the record's rounding is no wait
             for w0, w1, held_ck in segs:
                 if w1 <= t0:
                     continue

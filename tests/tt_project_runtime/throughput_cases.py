@@ -1234,16 +1234,18 @@ def test_throughput_charges_a_checks_wait_only_until_its_slot_grant(env, monkeyp
     assert (own["count"], own["median_s"]) == (1, wait_s - 900), own
 
 
-def test_a_relaunch_or_spill_rerun_waits_for_its_slot_only_from_its_wait_from(env, monkeypatch, tmp_path):
+@pytest.mark.parametrize("frac", [0.0004, 0.0006])
+def test_a_relaunch_or_spill_rerun_waits_for_its_slot_only_from_its_wait_from(env, monkeypatch, tmp_path, frac):
     """#8455: a relaunch or a rerun here after a spill host did not pass keeps its first arrival (ARRIVED_ENV)
     for its queue place, but its earlier run was no slot wait: record_wait stores WAIT_FROM_ENV as
     "wait_from", the waits log and throughput count the slot wait only from it, and the run before it is
-    own_job. A wait_from outside the wait is ignored."""
+    own_job. A wait_from outside the wait is ignored. #8472: the record's times are rounded to the
+    millisecond and the run's end is not; rounded up (`frac` 0.0006), the sliver between them is no wait."""
     from ttp import checkcap, throughput
     from ttp.daemon import Daemon
     monkeypatch.setattr(checkcap, "grants_dir", lambda: tmp_path / "host")
     p = make(env)
-    d, now = Daemon(p.base), time.time()
+    d, now = Daemon(p.base), int(time.time()) + frac
     w0, wait_s = now - 6 * 3600, 2 * 3600
     t = _tp_checks_requeue(p, d, monkeypatch, tmp_path, "spilled first", w0, wait_s)
     monkeypatch.setenv(checkcap.WAIT_FROM_ENV, repr(w0 + 3000))
