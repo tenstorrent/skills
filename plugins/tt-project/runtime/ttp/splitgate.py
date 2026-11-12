@@ -21,8 +21,8 @@ FIELD = "no_split"       # result.json: why the change cannot be split; the revi
 EVENT = "split_returned"
 # A split part's title, as kind-code.md asks for it: "code: part 2 of <topic>".
 PART_TITLE = re.compile(r"(?i)\bpart\s+\d+\s+of\b")
-ORDER = ("## Update\nSplit order, from the daemon after your last hand-off: your change is {lines} non-test "
-         "lines{against}, over chains.split_lines ({limit}), and changes that size fail review far more often. No review was "
+ORDER = ("## Update\nSplit order, from the daemon after your last hand-off: your change is {lines} non-test lines, "
+         "over chains.split_lines ({limit}), and changes that size fail review far more often. No review was "
          "queued. Before you reshape it, keep the whole change: `git branch {branch}-full {head}`. Then make this "
          "branch carry a first part that stands alone and passes the checks (at most about {limit} non-test "
          "lines), and hand it off `done` with one follow-up `code: part 2 of <topic>` whose `start_when` is "
@@ -71,43 +71,37 @@ def check(cfg: dict, task: dict, changes: dict | None, *results) -> tuple[str, i
 
 
 def send_back(db, cfg: dict, task: dict, lines: int, limit: int, head: str, attempts: int,
-              now: float | None = None, base: str = "") -> bool:
+              now: float | None = None) -> bool:
     """Re-queue finished code task `task` (done or review) with the split order, once: the same id, branch
     and worktree, its budget topped up, its attempts back to `attempts`, its last hand-off kept. An EVENT
-    records it; the order names `base`, what the size was measured against. False leaves the task as it was."""
+    records it. False leaves the task as it was."""
     now = time.time() if now is None else now
     if returned(task) or not task.get("branch"):
         return False
-    labels, topup = chaincap.budget_base(cfg, task)
-    order = ORDER.format(lines=lines, against=against(base), limit=limit, branch=task["branch"],
-                         head=head or task["branch"], short=(head or task["branch"])[:12], tid=task["id"])
+    labels, base = chaincap.budget_base(cfg, task)
+    order = ORDER.format(lines=lines, limit=limit, branch=task["branch"], head=head or task["branch"],
+                         short=(head or task["branch"])[:12], tid=task["id"])
     rows = db.conn.execute("UPDATE tasks SET status='queued', spec=?, labels=?, budget_usd=?, attempts=?, "
                            "not_before=NULL, blocked_reason=NULL, updated=? WHERE id=? AND status IN ('done','review')",
                            (f"{str(task.get('spec') or '').rstrip()}\n\n{order}",
                             json.dumps([*labels, f"{LABEL}{int(now)}"]),
-                            round(float(task.get("spent_usd") or 0) + topup, 2), int(attempts), now,
+                            round(float(task.get("spent_usd") or 0) + base, 2), int(attempts), now,
                             task["id"])).rowcount
     if not rows:
         return False
     db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
          (now, f"task:{task['id']}", EVENT, "low",
           f"#{task['id']} went back to its worker for a split: {lines} non-test lines over chains.split_lines ({limit})",
-          json.dumps({"lines": lines, "limit": limit, "head": head, "base": base}), "handled", task["id"]))
+          json.dumps({"lines": lines, "limit": limit, "head": head}), "handled", task["id"]))
     return True
 
 
-def against(base: str) -> str:
-    """' (measured against <base>)' naming the base a size was read from, '' when it is not known."""
-    return f" (measured against {base})" if base else ""
-
-
-def review_line(cfg: dict, task: dict, changes: dict | None, base: str = "") -> str:
-    """The review spec's line for a change over the limit that was not split, '' otherwise; `base` names
-    what `changes` were measured against."""
+def review_line(cfg: dict, task: dict, changes: dict | None) -> str:
+    """The review spec's line for a change over the limit that was not split, '' otherwise."""
     hit = check(cfg, task, changes, load_result(task.get("result")))
     if hit is None:
         return ""
     why, n, limit = hit
     why = "no reason recorded" if why == "return" else why
-    return (f"Size: {n} non-test lines{against(base)}, over chains.split_lines ({limit}), not split ({why}). "
-            f"Large changes fail review more often: read it in full.")
+    return (f"Size: {n} non-test lines, over chains.split_lines ({limit}), not split ({why}). Large changes "
+            f"fail review more often: read it in full.")
