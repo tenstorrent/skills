@@ -14,8 +14,11 @@ holding the queue. Each daemon pass (tend()):
 - The driver (drive()) runs each check in a clean checkout of that sha, by push._run_one (its check host
   and lock rules); its first full run goes to a spill host the project's settings allow (checkspill.spill_run,
   as the push batch's first runs do), else here. Failing pytest ids rerun once there, always here: those that
-  pass are flaky (quarantined, never reverted). Those failing again rerun at the range's start: failing there too, they were not this
-  landing's. The rest bisect over the entries' landed shas to the first that fails them: the guilty change.
+  pass are flaky (quarantined, never reverted). Those failing again that are already quarantined with an
+  open deflake task (gatejudge.owned) are that task's: a line naming the sha and the tests goes on its spec,
+  and no revert or fix task covers them (a quarantined test with no open owner counts as any other failure).
+  The rest rerun at the range's start: failing there too, they were not this landing's. The others bisect
+  over the entries' landed shas to the first that fails them: the guilty change.
 - Guilty: a revert of that entry's commits on the current tip (never a force push), checked to pass the
   failing ids, goes in as ttp/postland-revert-<sha>. The daemon approves it into the push queue (it lands
   with the next batch, after the smoke checks) and queues one code task to fix the change on its failing
@@ -228,19 +231,30 @@ def apply(p: Project, job: dict, got: dict) -> str:
     if out == "pass":
         return f"post-landing checks passed on {sha}"
     ids = " ".join(got.get("ids") or [])
+    owned = got.get("owned") or {}
+    named = " ".join(f"{i} (deflake #{t})" for i, t in sorted(owned.items()))
+    mine = f"; also failing, quarantined with an open deflake task (no revert, no fix task): {named}" if owned else ""
+    if owned:
+        from . import gatejudge
+        gatejudge.seen_again(db, owned, job["sha"])
+    if out == "owned":
+        _event(db, f"Post-landing checks on {sha}: failed only quarantined tests with an open deflake task, each "
+                   f"noted on its task (no revert, no fix task): {named}", kind=EVENT, queued=False)
+        return "owned"
     if out == "flaky":
         owners = " ".join(f"#{t}" for t in got.get("deflake") or [])
         _event(db, f"Post-landing checks on {sha}: failed, then passed on a rerun (flaky, quarantined, not "
-                   f"reverted): {ids}" + (f"; deflake task {owners}" if owners else ""), kind=EVENT, queued=False)
+                   f"reverted): {ids}" + (f"; deflake task {owners}" if owners else "") + mine, kind=EVENT, queued=False)
         return "flaky"
     if out != "guilty":   # not this landing's (pre_existing) is only recorded; the rest is the coordinator's
-        _event(db, f"Post-landing checks on {sha}: {out}: {got.get('why') or ''} {ids}".strip(),
+        _event(db, f"Post-landing checks on {sha}: {out}: {got.get('why') or ''} {ids}".strip() + mine,
                kind=EVENT if out == "pre_existing" else "observation", queued=out != "pre_existing")
         return str(out)
     e = got["entry"]
     who = f"#{e['task']} {e.get('branch') or '?'}" if e.get("task") else f"commit {e['sha'][:10]}"
     span = f"{str(e.get('base') or '')[:10]}..{e['sha'][:10]}"
     tail = (f"Its failing tests, the only ones to rerun: {ids}\nCommand: {got.get('cmd')}\n"
+            + (f"Also failing, quarantined and their deflake task's, not this task's: {named}\n" if owned else "") +
             f"Output tail:\n{str(got.get('tail') or '')[-2000:]}")
     if got.get("revert_head"):   # the revert first; the fix starts once it has landed, on top of it
         with db.tx():
@@ -262,7 +276,7 @@ def apply(p: Project, job: dict, got: dict) -> str:
             f"({span}). It is not reverted ({got.get('why')}): the change is still on {job['target']}; fix it "
             f"forward. {tail}"))
         text = f"Post-landing checks on {sha}: {who} fails {ids}; fix task #{fix}; not reverted: {got.get('why')}"
-    _event(db, text)
+    _event(db, text + mine)
     return "guilty"
 
 
@@ -329,6 +343,16 @@ class Busy(Exception):
 
 
 def _drive(p: Project, job: dict, checks: list, run) -> dict:
+    """_judge's result, with `owned` ({id: deflake task}) when quarantined tests with an open fix owner failed
+    again: those are their owner's, never reverted nor a fix task's (outcome 'owned' when nothing else failed)."""
+    owned: dict[str, int] = {}
+    out = _judge(p, job, checks, run, owned)
+    if owned:
+        out = {**out, "owned": owned} | ({"outcome": "owned"} if out.get("outcome") == "pass" else {})
+    return out
+
+
+def _judge(p: Project, job: dict, checks: list, run, owned: dict) -> dict:
     from . import gatejudge, sharedchecks
     sha, points = job["sha"], job["points"]
     flaky: list[str] = []
@@ -344,6 +368,9 @@ def _drive(p: Project, job: dict, checks: list, run) -> dict:
         if again is None:
             return {"outcome": "undecided", "why": "the rerun could not tell", "ids": ids, "cmd": str(cmd)}
         flaky += [i for i in ids if i not in again]
+        mine = gatejudge.owned(p.db, p.state, sorted(again), time.time())   # quarantined, their deflake task open
+        owned.update(mine)
+        again = set(again) - set(mine)
         if not again:
             continue
         ids = sorted(again)

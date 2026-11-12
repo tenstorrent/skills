@@ -379,6 +379,75 @@ def test_post_land_failure_that_passes_on_rerun_is_flaky_quarantined_and_never_r
     assert gatejudge.file_orphans(p) == [], "already owned: the daemon's sweep files nothing more"
 
 
+_PL_X = "tests/t.py::test_x"
+_PL_BAD = f"sh -c \"grep -qs bad pl*.txt && {{ {_PL_FAIL}; }}; {_PL_PASS}\""
+
+
+def _pl_owner(p, ids=(_PL_X,)):
+    """`ids` quarantined with their module's deflake task filed, as the tests gate leaves a flake; the task id."""
+    from ttp import gatejudge
+    now = time.time()
+    gatejudge.quarantine(p.state, list(ids), {"head": "0" * 12, "check": "the tests gate"}, now)
+    (tid,) = gatejudge.deflake(p.db, list(ids), {"head": "0" * 12}, now, p)
+    return tid
+
+
+def test_post_land_failure_only_of_quarantined_tests_with_an_open_owner_goes_on_its_spec_no_fix_no_revert(
+        env, tmp_path, monkeypatch):
+    from ttp import gatejudge, postland
+    p, g, pushed, _ = _pl_land(env, tmp_path, monkeypatch, _PL_BAD, n=3, bad_at=0)
+    tid = _pl_owner(p)
+    postland.tend(p, p.config())
+    assert postland.tend(p, p.config()) == "owned"
+    assert not p.db.q("SELECT id FROM tasks WHERE title LIKE 'Revert%' OR title LIKE 'Fix%'"), "no duplicate fix"
+    assert not p.db.q("SELECT id FROM push_queue WHERE status='approved'"), "nothing reverted"
+    assert p.db.kv(postland.KEY)["last"]["owned"] == {_PL_X: tid}
+    line = f"{gatejudge.SEEN_AGAIN} again at {pushed[:12]}: {_PL_X}"
+    spec = p.db.task(tid)["spec"]
+    assert spec.count(line) == 1, spec
+    postland.apply(p, p.db.kv(postland.KEY)["last"] | {"target": "up/main"}, p.db.kv(postland.KEY)["last"])
+    assert p.db.task(tid)["spec"].count(line) == 1, "one line per sha"
+    # The day's deflake task gathering another flake keeps the post-landing sighting on its rewritten spec.
+    gatejudge.deflake(p.db, ["tests/t.py::test_z"], {"head": "1" * 12}, time.time(), p)
+    spec = p.db.task(tid)["spec"]
+    assert "- tests/t.py::test_z" in spec and line in spec, spec
+    assert p.db.q("SELECT id FROM events WHERE text LIKE ? AND status='handled'", (f"%only quarantined%#{tid}%",))
+
+
+def test_post_land_mixed_failure_reverts_and_fixes_only_the_tests_not_quarantined(env, tmp_path, monkeypatch):
+    from ttp import gatejudge, postland
+    both = "printf 'FAILED tests/t.py::test_x - boom\\nFAILED tests/t.py::test_y - boom\\n= 2 failed in 0.1s =\\n'; exit 1"
+    check = f"sh -c \"grep -qs bad pl*.txt && {{ {both}; }}; {_PL_FAIL}\""   # test_x fails everywhere
+    p, g, pushed, entries = _pl_land(env, tmp_path, monkeypatch, check, n=3, bad_at=1)
+    tid = _pl_owner(p)
+    postland.tend(p, p.config())
+    assert postland.tend(p, p.config()) == "guilty"
+    last = p.db.kv(postland.KEY)["last"]
+    assert last["ids"] == ["tests/t.py::test_y"] and last["owned"] == {_PL_X: tid}
+    (fix,) = p.db.q("SELECT * FROM tasks WHERE title LIKE 'Fix #%'")
+    assert "ch1" in fix["title"] and "the only ones to rerun: tests/t.py::test_y\n" in fix["spec"], fix["spec"]
+    assert f"not this task's: {_PL_X} (deflake #{tid})" in fix["spec"]
+    (rev,) = p.db.q("SELECT * FROM push_queue WHERE status='approved'")
+    msg = g("log", "-1", "--format=%B", rev["head"])
+    assert "failing: tests/t.py::test_y" in msg and "test_x" not in msg, msg
+    assert g("diff", "--name-only", pushed, rev["head"]) == "pl1.txt"
+    assert f"again at {pushed[:12]}: {_PL_X}" in p.db.task(tid)["spec"]
+    assert _PL_X in gatejudge.active(p.state, time.time()), "still quarantined, never counted as passed"
+
+
+def test_post_land_failure_of_a_quarantined_test_whose_owner_finished_is_reverted_and_fixed(env, tmp_path, monkeypatch):
+    from ttp import postland
+    p, g, pushed, _ = _pl_land(env, tmp_path, monkeypatch, _PL_BAD, n=3, bad_at=0)
+    tid = _pl_owner(p)
+    p.db.update_task(tid, status="cancelled")
+    postland.tend(p, p.config())
+    assert postland.tend(p, p.config()) == "guilty", "no open owner: any other failure's path"
+    assert "owned" not in p.db.kv(postland.KEY)["last"]
+    assert len(p.db.q("SELECT id FROM tasks WHERE title LIKE 'Fix #%'")) == 1
+    assert len(p.db.q("SELECT id FROM push_queue WHERE status='approved'")) == 1
+    assert "again at" not in p.db.task(tid)["spec"]
+
+
 def test_post_land_first_full_run_spills_and_its_reruns_bisect_and_revert_run_here(env, tmp_path, monkeypatch):
     """The post-landing suite's first full run on the landed sha goes to a spill host (checkspill.spill_run, as
     the push batch's first runs do) and its claim is closed after it; every rerun of the failing tests (at the

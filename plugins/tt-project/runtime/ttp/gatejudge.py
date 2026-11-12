@@ -440,8 +440,9 @@ def deflake(db, ids: list[str], evidence: dict, now: float, where, budget_usd: f
             all_ids = have + new
             names = ", ".join(dict.fromkeys(_name(i) or i for i in all_ids))
             title, spec = f"Deflake {module}: {names}"[:200], deflake_spec(module, all_ids, day, evidence)
-            if key:
-                db.update_task(int(key), title=title, spec=spec)
+            if key:   # the post-landing sightings (seen_again) stay on the rewritten spec
+                kept = [ln for ln in (tasks[key]["spec"] or "").splitlines() if ln.startswith(SEEN_AGAIN)]
+                db.update_task(int(key), title=title, spec="\n".join([spec, *kept]))
             else:
                 key = str(db.add_task(title, spec, kind="code", tier="standard", priority=2, origin="daemon",
                                       budget_usd=budget_usd, not_before=_next_day(now, where)))
@@ -449,6 +450,40 @@ def deflake(db, ids: list[str], evidence: dict, now: float, where, budget_usd: f
             out.add(int(key))
         db.set_kv(DEFLAKE_KEY, recs)
     return sorted(out)
+
+
+SEEN_AGAIN = "Post-landing checks (delivery.post_land_checks) failed"   # an owner's spec line: see seen_again
+
+
+def owned(db, state: Path, ids, now: float | None = None) -> dict[str, int]:
+    """{id: task} for those of `ids` quarantined (not expired) and listed by a deflake task not finished: a
+    failure its fix owner already has, never a new fix task's. Model-free."""
+    from .db import TERMINAL_TASK_STATES
+    q = active(state, now)
+    want = [i for i in ids if i in q]
+    out: dict[str, int] = {}
+    for k, v in (db.kv_dict(DEFLAKE_KEY)[0].items() if want else ()):
+        hit = [i for i in want if k.isdigit() and isinstance(v, dict) and i in (v.get("ids") or []) and i not in out]
+        t = db.task(int(k)) if hit else None
+        if t and t["status"] not in TERMINAL_TASK_STATES:
+            out.update(dict.fromkeys(hit, int(k)))
+    return out
+
+
+def seen_again(db, owners: dict[str, int], sha: str) -> list[int]:
+    """Add one line naming `sha` and the tests to each owner task's spec (`owners`: {id: task}), once per sha.
+    The tasks changed, ascending."""
+    by: dict[int, list[str]] = {}
+    for i, tid in owners.items():
+        by.setdefault(int(tid), []).append(i)
+    out = []
+    for tid, ids in sorted(by.items()):
+        t = db.task(tid)
+        line = f"{SEEN_AGAIN} again at {sha[:12]}: {' '.join(sorted(ids))}"
+        if t and line not in (t["spec"] or ""):
+            db.update_task(tid, spec=f"{(t['spec'] or '').rstrip()}\n{line}")
+            out.append(tid)
+    return out
 
 
 def unfiled(db, q: dict) -> list[str]:
