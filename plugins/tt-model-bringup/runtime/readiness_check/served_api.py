@@ -10,6 +10,7 @@ test without ``requests`` or ``openai``.
 
 from __future__ import annotations
 
+import http.client
 import json
 import re
 import time
@@ -92,12 +93,16 @@ def stream_post(url: str, payload: dict, *, timeout: float = DEFAULT_TIMEOUT_S) 
                 if data == "[DONE]":
                     break
                 try:
-                    chunks.append((time.perf_counter() - started, json.loads(data)))
+                    chunk = json.loads(data)
                 except json.JSONDecodeError:
                     continue
+                if not isinstance(chunk, dict):
+                    return {"status": 0, "error": f"non-object SSE payload: {data[:120]}", "chunks": chunks}
+                chunks.append((time.perf_counter() - started, chunk))
     except urllib.error.HTTPError as exc:
         return {"status": exc.code, "error": error_text(_safe_json(exc.read())), "chunks": []}
-    except (urllib.error.URLError, OSError) as exc:
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+        # HTTPException covers IncompleteRead and RemoteDisconnected mid-stream.
         return {"status": 0, "error": f"{type(exc).__name__}: {exc}", "chunks": chunks}
     error = None
     for _, chunk in chunks:
@@ -118,9 +123,11 @@ def delta_text(chunk: dict) -> tuple[str, str]:
     """(content, reasoning) text carried by one streamed chunk, chat or completion."""
     content, reasoning = "", ""
     for choice in chunk.get("choices") or []:
+        if not isinstance(choice, dict):
+            continue
         if "text" in choice and isinstance(choice.get("text"), str):
             content += choice["text"]
-        delta = choice.get("delta") or {}
+        delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
         content += delta.get("content") or ""
         reasoning += delta.get("reasoning_content") or delta.get("reasoning") or ""
     return content, reasoning

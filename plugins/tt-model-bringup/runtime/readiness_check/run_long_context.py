@@ -168,7 +168,7 @@ def clamp_lengths(lengths: list[int], max_model_len: Optional[int], reserve: int
 
 
 def run_accuracy(args, server: str, model: str, max_len: Optional[int], log: sp.ServerLog) -> Path:
-    profile = sp.load_profile(args.profile, args.profiles_file)
+    sp.load_profile(args.profile, args.profiles_file, hf_model=args.hf_model or None, revision=args.revision)
     book = read_text(find_book(args.text_file, args.tt_metal))
     chat_kwargs = {"enable_thinking": bool(args.thinking)}
     # Reserve the answer budget, chat-template slack and the length tolerance.
@@ -185,12 +185,16 @@ def run_accuracy(args, server: str, model: str, max_len: Optional[int], log: sp.
         results = []
         for i, depth in enumerate(depths):
             seed = length * 31 + i
-            prompt, answer, tokens = recall_prompt(book, length, depth, seed, count)
-            sp.reset_prefix_cache(server)
-            url, body = sp.build_request(server, model, chat_profile, content=prompt, max_tokens=args.max_tokens,
-                                         overrides={"temperature": 0.0})
-            rec = sp.stream_request(url, body, timeout=args.request_timeout)
-            setup = is_context_length_error(rec.get("error"))
+            answer, tokens = needle_for(seed)[0], 0
+            try:
+                prompt, answer, tokens = recall_prompt(book, length, depth, seed, count)
+                sp.reset_prefix_cache(server)
+                url, body = sp.build_request(server, model, chat_profile, content=prompt, max_tokens=args.max_tokens,
+                                             overrides={"temperature": 0.0})
+                rec = sp.stream_request(url, body, timeout=args.request_timeout)
+                setup = is_context_length_error(rec.get("error"))
+            except (sp.ProbeError, OSError, ValueError) as exc:  # e.g. /tokenize failed: no measurement
+                rec, setup = {"error": f"probe error: {type(exc).__name__}: {exc}"[:300]}, True
             if setup:
                 setup_errors.append(f"~{length} tok ({tokens}) depth {depth}: {rec['error'][:160]}")
             ok = not rec.get("error") and contains_answer(answer, rec.get("text"), rec.get("reasoning"))
@@ -203,7 +207,7 @@ def run_accuracy(args, server: str, model: str, max_len: Optional[int], log: sp.
         measured = [r for r in results if not r["setup_error"]]
         if not measured:
             checks.append(check(f"recall_{length}", None,
-                                detail="not measured: every prompt was rejected as too long (see probe_setup)"))
+                                detail="not measured: every prompt hit a probe setup error (see probe_setup)"))
             continue
         results = measured
         failed = [r for r in results if not r["pass"]]
@@ -216,8 +220,9 @@ def run_accuracy(args, server: str, model: str, max_len: Optional[int], log: sp.
     if setup_errors:
         checks.append(check(
             "probe_setup", False, waivable=False, value=len(setup_errors), threshold=0,
-            detail=f"{len(setup_errors)} recall prompts rejected as too long for the served context (probe setup error, "
-            f"not a recall failure): {setup_errors[0]}; lower --lengths or check /tokenize against the served template"))
+            detail=f"{len(setup_errors)} recall prompts not measured: too long for the served context or a probe error "
+            f"(probe setup error, not a recall failure): {setup_errors[0]}; lower --lengths or check /tokenize "
+            "against the served template"))
     mode = sp.sample_on_device_mode(log.text(0)) if log.available else None
     on_device = mode is not None and mode.lower() not in ("none", "off", "false", "host")
     checks.append(check(
@@ -403,7 +408,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--text-file", type=Path, default=None, help="long natural text (.txt or .bz2)")
     p.add_argument("--tt-metal", type=Path, default=None, help="tt-metal checkout to find the readiness book in")
     p.add_argument("--profile", default="lm_eval_reasoning", help="accepted for symmetry with P4; accuracy runs at temperature 0")
-    p.add_argument("--profiles-file", type=Path, default=None)
+    p.add_argument("--profiles-file", type=Path, default=None,
+                   help="a copy of eval_request_profiles.json to use instead of the packaged one (do not edit the installed file)")
+    p.add_argument("--hf-model", default="", help="HF id or checkpoint dir; resolves the model_card profile")
+    p.add_argument("--revision", default=None)
     p.add_argument("--lengths", default="", help=f"accuracy default {DEFAULT_ACCURACY_LENGTHS}; timing default {DEFAULT_TIMING_LENGTHS}")
     p.add_argument("--depths", default="0.1,0.5,0.9")
     p.add_argument("--max-tokens", type=int, default=512, help="accuracy answer cap")

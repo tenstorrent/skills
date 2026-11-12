@@ -11,6 +11,7 @@ the fatal log markers match ``prefix_cache_check._parse_prometheus_counters`` an
 
 from __future__ import annotations
 
+import http.client
 import json
 import re
 import statistics
@@ -172,13 +173,20 @@ def stream_request(
                     chunk = json.loads(payload)
                 except json.JSONDecodeError:
                     continue
+                if not isinstance(chunk, dict):
+                    rec["error"] = f"non-object SSE payload: {payload[:120]}"
+                    break
                 if chunk.get("error"):
                     rec["error"] = str(chunk["error"])[:300]
                     break
                 if chunk.get("usage"):
                     rec["usage"] = chunk["usage"]
                 for choice in chunk.get("choices") or []:
+                    if not isinstance(choice, dict):
+                        continue
                     delta = choice.get("delta")
+                    if delta is not None and not isinstance(delta, dict):
+                        delta = {}
                     piece = choice.get("text") if delta is None else (delta.get("content") or "")
                     think = "" if delta is None else (delta.get("reasoning_content") or delta.get("reasoning") or "")
                     if piece or think:
@@ -191,7 +199,8 @@ def stream_request(
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")[:300] if exc.fp else ""
         rec["error"] = f"HTTP {exc.code}: {detail}"
-    except (urllib.error.URLError, OSError, ValueError) as exc:
+    except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
+        # HTTPException covers IncompleteRead and RemoteDisconnected mid-stream.
         if not rec["aborted"]:
             rec["error"] = f"{type(exc).__name__}: {exc}"[:300]
     rec["t_end"] = time.perf_counter()
@@ -261,20 +270,21 @@ def run_concurrent(bodies: list[tuple[str, dict]], **kwargs) -> list[dict]:
 # ---------------------------------------------------------------- request bodies
 
 
-def load_profile(name: str, path: Optional[Path] = None) -> dict:
-    """Read one profile from eval_request_profiles.json, else the built-in fallback."""
-    path = path or PROFILES_PATH
-    if path.is_file():
-        data = json.loads(path.read_text())
-        for profile in data.get("profiles") or []:
-            if profile.get("name") == name:
-                return profile
-        if name not in BUILTIN_PROFILES:
-            names = [p.get("name") for p in data.get("profiles") or []]
-            raise ProbeError(f"profile {name!r} not in {path}; known: {names}")
-    if name in BUILTIN_PROFILES:
-        return BUILTIN_PROFILES[name]
-    raise ProbeError(f"{path} is missing and {name!r} is not a built-in profile ({sorted(BUILTIN_PROFILES)})")
+def load_profile(name: str, path: Optional[Path] = None, *, hf_model: Optional[str] = None,
+                 revision: Optional[str] = None) -> dict:
+    """One profile, resolved by ``eval_request_profiles.get_profile`` (so ``model_card`` reads the
+    checkpoint's generation_config.json); the built-in fallback when the file lacks it."""
+    from readiness_check.eval_request_profiles import ProfileError, get_profile
+
+    try:
+        profile = get_profile(name, hf_model=hf_model, revision=revision, path=path)
+    except (ProfileError, OSError, ValueError) as exc:
+        if name in BUILTIN_PROFILES:
+            return BUILTIN_PROFILES[name]
+        raise ProbeError(f"{exc} (profiles file {path or PROFILES_PATH})") from exc
+    if profile.get("unresolved"):
+        raise ProbeError(f"profile {name!r} cannot be resolved: {profile['unresolved']} (pass --hf-model)")
+    return profile
 
 
 def profile_ignores_eos(profile: dict) -> bool:
@@ -296,7 +306,7 @@ def build_request(
     if profile.get("chat", True) and isinstance(content, str):
         body = {"model": model, "messages": [{"role": "user", "content": content}], "max_tokens": max_tokens, **params}
         kwargs = dict(body.get("chat_template_kwargs") or {})
-        if "thinking" in profile:
+        if profile.get("thinking") is not None:  # None: leave the template default alone
             kwargs.setdefault("enable_thinking", bool(profile["thinking"]))
         if kwargs:
             body["chat_template_kwargs"] = kwargs

@@ -483,7 +483,8 @@ def _send(ctx: Ctx, case: dict) -> tuple[int, Any]:
         c, r = delta_text(chunk)
         content, reasoning = content + c, reasoning + r
         for choice in chunk.get("choices") or []:
-            finish = choice.get("finish_reason") or finish
+            if isinstance(choice, dict):
+                finish = choice.get("finish_reason") or finish
     return 200, {"choices": [{"message": {"role": "assistant", "content": content, "reasoning_content": reasoning},
                               "finish_reason": finish}]}
 
@@ -609,14 +610,20 @@ def run(args: argparse.Namespace) -> int:
         if case is None:
             checks.append(check(cid, None, severity=severity, detail=skip_reason))
             continue
-        status, body = _send(ctx, case)
+        try:
+            status, body = _send(ctx, case)
+        except Exception as exc:  # noqa: BLE001 - one broken request must not lose the whole result
+            status, body = 0, {"error": {"message": f"probe error: {type(exc).__name__}: {exc}"}}
         raw["cases"][cid] = {"request": _truncate(case["payload"]), "status": status, "response": _truncate(body)}
         if status != 200:
             checks.append(check(cid, False, severity=severity, waivable=case_id not in NOT_WAIVABLE, detail=(
                 f"refused: HTTP {status}: {error_text(body, 200)}")))
             summary.append(f"{case_id} {label}: REFUSED {status}")
         else:
-            hard, soft = case["validate"](body)
+            try:
+                hard, soft = case["validate"](body)
+            except Exception as exc:  # noqa: BLE001 - malformed response shape is a finding
+                hard, soft = [f"response could not be validated: {type(exc).__name__}: {exc}"], []
             if optional:
                 soft, hard = hard + soft, []
             checks.append(check(cid, not hard, severity=severity, waivable=case_id not in NOT_WAIVABLE,

@@ -208,7 +208,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--model", default="", help="served model id; default: the first entry of /v1/models")
     p.add_argument("--server-log", type=Path, default=None, help="server log for trace captures and engine errors")
     p.add_argument("--profile", default="lm_eval_reasoning", help="profile name in eval_request_profiles.json (default: the lm-eval reasoning settings)")
-    p.add_argument("--profiles-file", type=Path, default=None)
+    p.add_argument("--profiles-file", type=Path, default=None,
+                   help="a copy of eval_request_profiles.json to use instead of the packaged one (do not edit the installed file)")
+    p.add_argument("--hf-model", default="", help="HF id or checkpoint dir; resolves the model_card profile")
+    p.add_argument("--revision", default=None)
     p.add_argument("--plain-profile", default="plain", help="reference profile for the host-sampling ratio")
     p.add_argument("--users", type=int, default=32)
     p.add_argument("--max-tokens", type=int, default=6000)
@@ -239,8 +242,8 @@ def run(args: argparse.Namespace) -> Path:
     server = args.server_url.rstrip("/")
     sp.check_health(server)
     model = args.model or sp.served_model(server)[0]
-    profile = sp.load_profile(args.profile, args.profiles_file)
-    plain = sp.load_profile(args.plain_profile, args.profiles_file)
+    profile = sp.load_profile(args.profile, args.profiles_file, hf_model=args.hf_model or None, revision=args.revision)
+    plain = sp.load_profile(args.plain_profile, args.profiles_file, hf_model=args.hf_model or None, revision=args.revision)
     prompts = load_prompts(args.prompts_file, args.users)
     ignore_eos = sp.profile_ignores_eos(profile)
     raw_dir = Path(args.model_dir) / RESULT_DIR / PROBE

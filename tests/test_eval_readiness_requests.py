@@ -315,3 +315,84 @@ def test_parse_server_settings_from_command_and_log():
     log = "non-default args: {'reasoning_parser': 'qwen3', 'enable_auto_tool_choice': True}"
     s = served_api.parse_server_settings(log)
     assert s["reasoning_parser"] == "qwen3" and s["enable_auto_tool_choice"] is True
+
+
+class BrokenStreamServer:
+    """Raw socket server: a chunked SSE stream cut mid-chunk (IncompleteRead), or a non-object SSE payload."""
+
+    def __init__(self, mode):
+        import socket
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(8)
+        self.url = f"http://127.0.0.1:{self.sock.getsockname()[1]}"
+        self.mode = mode
+        threading.Thread(target=self.serve, daemon=True).start()
+
+    def serve(self):
+        while True:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            with conn:
+                data = b""
+                while b"\r\n\r\n" not in data:
+                    data += conn.recv(65536)
+                head_raw, _, rest = data.partition(b"\r\n\r\n")
+                length = int([h.split(b":")[1] for h in head_raw.split(b"\r\n") if h.lower().startswith(b"content-length")][0])
+                while len(rest) < length:
+                    rest += conn.recv(65536)
+                head = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n"
+                if self.mode == "cut":
+                    line = b'data: {"choices": [{"index": 0, "delta": {"content": "a"}}]}\n\n'
+                    conn.sendall(head + b"%x\r\n" % len(line) + line + b"\r\n" + b"40\r\ndata: {")
+                else:
+                    line = b"data: [1, 2]\n\ndata: [DONE]\n\n"
+                    conn.sendall(head + b"%x\r\n" % len(line) + line + b"\r\n0\r\n\r\n")
+
+    def close(self):
+        self.sock.close()
+
+
+@pytest.mark.parametrize("mode, expected", [("cut", "IncompleteRead"), ("list", "non-object SSE payload")])
+def test_streams_report_incomplete_read_and_non_object_payloads(mode, expected):
+    from readiness_check import served_probe as sp
+    server = BrokenStreamServer(mode)
+    try:
+        rec = sp.stream_request(server.url + "/v1/chat/completions", {"messages": []}, timeout=10)
+        out = served_api.stream_post(server.url + "/v1/chat/completions", {"messages": []}, timeout=10)
+    finally:
+        server.close()
+    assert expected in rec["error"]
+    assert expected in out["error"]
+
+
+def test_p3_request_crash_writes_a_failing_result(model, monkeypatch):
+    model_dir, hf = model
+    server = FakeServer()
+
+    def boom(ctx, case):
+        raise ValueError("unexpected response shape")
+
+    monkeypatch.setattr(p3, "_send", boom)
+    try:
+        code = p3.main(p3_args(server, model_dir, hf, "--cases", "c01"))
+    finally:
+        server.close()
+    checks, _ = result(model_dir, "chat_conformance")
+    assert code == 2
+    assert "probe error: ValueError" in checks["c01_system_list_content"]["detail"]
+
+
+def test_served_probe_profiles_resolve_model_card_and_respect_thinking_none(model):
+    from readiness_check import served_probe as sp
+    _, hf = model
+    profile = sp.load_profile("model_card", hf_model=str(hf))
+    assert profile["request"]["temperature"] == GEN_DEFAULTS["temperature"]
+    with pytest.raises(sp.ProbeError, match="cannot be resolved"):
+        sp.load_profile("model_card")
+    _, body = sp.build_request("http://s", "m", sp.load_profile("plain"), content="q", max_tokens=5)
+    assert "chat_template_kwargs" not in body
+    _, body = sp.build_request("http://s", "m", sp.load_profile("lm_eval_reasoning"), content="q", max_tokens=5)
+    assert body["chat_template_kwargs"] == {"enable_thinking": True}

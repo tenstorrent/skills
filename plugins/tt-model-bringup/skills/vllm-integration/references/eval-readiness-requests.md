@@ -8,7 +8,9 @@ writer; the stage gate `scripts/check_eval_readiness.py --stage vllm` reads them
 ## Get it right the first time
 
 - Before the first serve, compare the request profiles in
-  `runtime/readiness_check/eval_request_profiles.json` with the adapter's `model_capabilities`:
+  `runtime/readiness_check/eval_request_profiles.json` with the adapter's `model_capabilities`
+  (the file ships with the plugin; do not edit the installed copy, copy it and pass
+  `--profiles-file <copy>` instead):
   every profile's `top_k` (and the checkpoint's `generation_config.json` `top_k`) should be
   at most `max_device_top_k`, and a seed must not force host sampling.
 - Serve with vLLM's reasoning parser and tool parser for the model family
@@ -55,8 +57,9 @@ Profiles (`eval_request_profiles.json`, each with its source):
 - `agentic`: Harbor terminus-2 settings: temperature 1.0, top_p 0.95, no seed, no top_k;
 - `plain`: greedy, no seed; the baseline for the ratio.
 
-Other probes (P4, P5) read a profile by name with
-`readiness_check.eval_request_profiles.get_profile(name, hf_model=...)`.
+Other probes (P4, P5) read a profile by name (`--profile`, default `lm_eval_reasoning`) with
+`readiness_check.eval_request_profiles.get_profile(name, hf_model=..., revision=...)`, so
+`model_card` resolves when `--hf-model` is passed.
 
 For each profile the probe sends one request with the exact fields, then runs `plain` and the
 profile back to back with the same number of concurrent streamed requests on the same server.

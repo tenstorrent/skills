@@ -56,11 +56,11 @@ Usual fixes:
 
 ```bash
 python -m readiness_check.run_long_answer_load --server-url http://localhost:8000 \
-  --model-dir models/autoports/<model> --server-log <server log> --profile <eval profile> \
-  --theoretical-tps <per-user roofline at 32 users> [--eval-plan <plan json>]
+  --model-dir models/autoports/<model> --server-log <server log> --hf-model <org/name> \
+  [--profile lm_eval_reasoning] [--profiles-file <your copy>] --theoretical-tps <per-user roofline at 32 users> [--eval-plan <plan json>]
 ```
 
-The profile comes from `runtime/readiness_check/eval_request_profiles.json` (the model's eval sampling, written at stage 9); without that file the probe uses a built-in default of temperature 0.6, top_p 0.95, top_k 20. Requests use the bundled reasoning questions (`load_prompts.json`) through the chat template with thinking on, up to 6,000 tokens each; `ignore_eos` is set only when the profile sets it.
+The default profile is `lm_eval_reasoning` (the lm-eval reasoning settings). Profiles come from `runtime/readiness_check/eval_request_profiles.json`, which ships with the plugin: do not edit the installed copy. To change or add a profile, copy the file into the model's `doc/eval_readiness/` and pass `--profiles-file <copy>`. Profiles resolve through `eval_request_profiles.get_profile`, so `--profile model_card` reads the checkpoint's `generation_config.json` (pass `--hf-model`; P5 takes the same flags). A profile with `thinking: null` leaves the chat template's thinking default alone. Requests use the bundled reasoning questions (`load_prompts.json`) through the chat template with thinking on, up to 6,000 tokens each; `ignore_eos` is set only when the profile sets it.
 
 The probe first runs a short burst with the eval profile and one with the plain profile (greedy, no seed), same users and length, back to back. The step-time ratio is median decode TPOT (eval) over median TPOT (plain), the same definition as P2. Then it runs the long load while polling `/metrics`, and records per-user and aggregate tok/s per 1,000-token answer bucket, running and waiting requests, peak KV usage and preemptions. Raw data goes to `doc/eval_readiness/long_answer_load/`.
 
