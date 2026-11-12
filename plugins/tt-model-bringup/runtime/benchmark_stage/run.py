@@ -61,7 +61,7 @@ def run(*, config_path, output):
     output.mkdir(parents=True, exist_ok=False)
     started = time.monotonic()
     (output / 'run_config.json').write_text(json.dumps(config, indent=2) + '\n')
-    source_manifest = Path(config['manifest'])
+    source_manifest = Path(config.get('manifest') or '/nonexistent')
     if source_manifest.is_file():
         frozen_manifest = output / 'manifest.json'
         frozen_manifest.write_bytes(source_manifest.read_bytes())

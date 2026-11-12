@@ -49,8 +49,9 @@ def check(model_dir, hf_model=''):
     elapsed = summary.get('elapsed_seconds')
     if summary.get('status') != 'completed' or not finite_number(elapsed) or not 0 < elapsed < min(config.get('budget_seconds', 3600), 3600):
         raise ValueError('benchmark stage did not complete within its budget and one hour')
-    manifest = read(evidence / 'run/manifest.json')
-    if digest({k: v for k, v in manifest.items() if k != 'manifest_sha256'}) != manifest['manifest_sha256']:
+    # Pipeline stage 11 runs no evals (they moved to goal 12): `tasks: []` skips the accuracy evidence.
+    manifest = read(evidence / 'run/manifest.json') if config.get('tasks') else {}
+    if manifest and digest({k: v for k, v in manifest.items() if k != 'manifest_sha256'}) != manifest['manifest_sha256']:
         raise ValueError('subset manifest checksum mismatch')
     accuracy = summary.get('accuracy', {})
     concurrencies = summary.get('concurrencies') or config.get('concurrencies', [1, 8, 16, 32])
@@ -66,7 +67,7 @@ def check(model_dir, hf_model=''):
     execution = config.get('accuracy_execution', 'sequential')
     if execution not in ('sequential', 'shared') or summary.get('accuracy_execution', 'sequential') != execution:
         raise ValueError('accuracy execution mode differs from run configuration')
-    if not accuracy or set(accuracy) != set(config['tasks']):
+    if set(accuracy) != set(config['tasks']) or (config['tasks'] and not accuracy):
         raise ValueError('missing required accuracy tasks')
     results = {}
     for task, result in accuracy.items():

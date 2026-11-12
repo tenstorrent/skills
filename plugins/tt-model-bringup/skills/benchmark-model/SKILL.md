@@ -13,9 +13,7 @@ Use upstream EleutherAI lm-evaluation-harness for accuracy and `vllm bench serve
 
 Read [the run contract](references/run-contract.md) for setup, profiles, commands and report inputs.
 
-Take the eval selection from `bringup/agentic_evals/inputs.json` when set, otherwise the goal-12 defaults, so this stage and goal 12 report the same suites. Do not pick a different set here. This harness is lm-evaluation-harness, so part of a selection may not be runnable: suites needing tool use or a terminal belong to goal 12's runner, and one fitting neither the harness nor the hour is recorded as not covered rather than swapped for another benchmark. Prefer published figures for the exact model; a missing reference does not prevent completing the stage.
-
-Keep this pass light: goal 12 re-measures the same suites on the tuned configuration at larger samples. The hour goes to performance and roofline, which nothing else produces.
+In the model-bringup pipeline, stage 11 is benchmarks only: set `tasks: []` in the run config, and goal 12 runs the evals. The accuracy steps below apply when this skill benchmarks a model on its own.
 
 Select the upstream prompt/scorer variant and the model's generation settings before running. A benchmark name alone does not identify a recipe. Use the model's native HF chat template exactly once, with structured chat messages, and record its tokenizer revision, thinking mode, generation parameters and answer parsing. Preserve normal benchmark prompt lengths, few-shot examples and EOS behavior. Allow sufficient output budget for the intended reasoning mode.
 
@@ -41,7 +39,17 @@ input and output lengths and concurrencies they use that this model supports, wi
 batches and context; drop the rest and add none they do not run. Write it to
 `doc/benchmark/release_benchmark_matrix.json` with the models it was taken from and, per row, an
 estimated time from the profiles measured above. Measure the rows the stage budget leaves room for
-and record their actual time; goal 12 measures the rest and runs the matrix in its release.
+on the eval route, and record each in `serving_rates.json` `release_rows` (see below).
+
+## Serving rates for goal 12
+
+In the pipeline, also measure each validated batch at input lengths 4096, `typical_context_tokens`,
+`working_set_tokens` and at least 28K (128 output tokens), writing a predicted rate before each row
+from stage 10's measurements or the roofline accounting. Write `doc/benchmark/serving_rates.json`:
+the server config, `validated_batches`, `rows` (per batch and `input_tokens`: `prefill_tok_s`,
+`decode_tok_s_user`, `ttft_s`, `step_ms`, `predicted`, and a `cause` for a row below its predicted
+range), `release_rows` with `route: "eval"`, and `release_source`. Goal 12 reads these rates and
+does not re-measure them; `check_agentic_serving.py --stage benchmark` gates the file.
 
 ## Diagnose slow benchmarks and evals
 
