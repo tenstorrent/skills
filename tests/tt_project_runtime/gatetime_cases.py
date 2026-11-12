@@ -232,6 +232,55 @@ def test_post_land_failure_is_bisected_to_its_entry_reverted_through_the_push_qu
                   "once it lands' AND status='queued'")
 
 
+def _pl_own(p, g, name, content, ts):
+    """A task's own `ttp push` onto up/main: one commit adding `name`, pushed, recorded in task_landings."""
+    (p.root / name).write_text(content); g("add", name); g("commit", "-qm", f"own {name}")
+    sha = g("rev-parse", "HEAD")
+    g("push", "-q", "up", "HEAD:refs/heads/main")
+    t = p.db.add_task(f"own {name}", kind="code", status="done")
+    p.db.x("UPDATE tasks SET branch=? WHERE id=?", (f"ttp/own-{name}", t))
+    p.db.x("INSERT INTO task_landings(marker,task,sha,target,ts) VALUES(?,?,?,?,?)",
+           (f"t{t}-own-{name}.json", t, sha, "up/main", ts))
+    return t, sha
+
+
+def test_post_land_checks_run_after_a_tasks_own_push_landing_and_only_once(env, tmp_path, monkeypatch):
+    from ttp import postland
+    p, g, pushed, _ = _pl_land(env, tmp_path, monkeypatch, f"sh -c \"grep -qs bad *.txt && {{ {_PL_FAIL}; }}; {_PL_PASS}\"")
+    p.set_config("delivery.push_branch", "up/main")
+    postland.tend(p, p.config()); postland.tend(p, p.config())
+    assert postland.tend(p, p.config()) == "", "the batch is checked"
+    t, own = _pl_own(p, g, "own.txt", "ok\n", time.time())
+    assert postland.tend(p, p.config()) == f"post-landing checks started on {own[:10]}"
+    job = p.db.kv(postland.KEY)["job"]
+    assert [(e["sha"], e["base"], e["task"]) for e in job["points"]] == [(own, pushed, t)], job["points"]
+    assert job["good"] == pushed
+    assert postland.tend(p, p.config()) == f"post-landing checks passed on {own[:10]}"
+    assert postland.tend(p, p.config()) == "", "an own landing already checked is not checked again"
+
+
+def test_post_land_orders_a_batch_and_an_own_push_by_branch_position_and_reverts_the_own_push(
+        env, tmp_path, monkeypatch):
+    from ttp import postland
+    p, g, pushed, entries = _pl_land(env, tmp_path, monkeypatch,
+                                     f"sh -c \"grep -qs bad *.txt && {{ {_PL_FAIL}; }}; {_PL_PASS}\"")
+    p.set_config("delivery.push_branch", "up/main")
+    p.db.set_kv(postland.KEY, {"since": 1})
+    # the own push sits after the batch on the branch but its marker ended before the batch did
+    t, own = _pl_own(p, g, "own.txt", "bad\n", time.time() - 100)
+    assert postland.tend(p, p.config()) == f"post-landing checks started on {own[:10]}"
+    job = p.db.kv(postland.KEY)["job"]
+    assert [e["sha"] for e in job["points"]] == [*entries, pushed, own], "by position on the branch, not by time"
+    assert job["points"][-1]["base"] == pushed and job["good"] == p._pl_tip
+    assert postland.tend(p, p.config()) == "guilty"
+    rev = p.db.q("SELECT * FROM tasks WHERE title LIKE 'Revert #%'")
+    assert len(rev) == 1, rev
+    row = p.db.one("SELECT * FROM push_queue WHERE task=?", (rev[0]["id"],))
+    assert g("rev-parse", f"{row['head']}^") == own and g("diff", "--name-only", own, row["head"]) == "own.txt"
+    fix = p.db.q("SELECT * FROM tasks WHERE title LIKE 'Fix #%'")
+    assert len(fix) == 1 and f"{pushed[:10]}..{own[:10]}" in fix[0]["spec"], fix
+
+
 def test_post_land_check_on_a_busy_test_lock_backs_off_and_still_checks_the_landing(env, tmp_path, monkeypatch):
     from ttp import postland
     n = tmp_path / "count"

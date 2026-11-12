@@ -5,9 +5,12 @@
 The push checks are the smoke suite that gates a landing; the slower tests run here, after it, never
 holding the queue. Each daemon pass (tend()):
 
-- With no run in flight and a batch pushed since the last one checked, it starts one detached driver
-  (`python -m ttp.postland <job>`, niced like the workers) on the newest pushed sha. Every batch landed
-  since the last check is in its range: their entries' landed shas, in order, after the tip before them.
+- With no run in flight and a landing since the last one checked (a push queue batch, an express landing
+  or a task's own `ttp push` to the push branch, task_landings), it starts one detached driver
+  (`python -m ttp.postland <job>`, niced like the workers) on the newest landed sha. Every landing since
+  the last check is in its range, by position on the branch: a batch's entries' landed shas after the tip
+  before them, and each own push as one point from the landing before it (its base..sha is what a revert
+  takes out).
 - The driver (drive()) runs each check in a clean checkout of that sha, by push._run_one (its check host
   and lock rules); its first full run goes to a spill host the project's settings allow (checkspill.spill_run,
   as the push batch's first runs do), else here. Failing pytest ids rerun once there, always here: those that
@@ -96,31 +99,53 @@ def tend(p: Project, cfg: dict, now: float | None = None) -> str:
         return apply(p, job, got)
     batches = db.q(f"SELECT * FROM push_batches WHERE outcome='pushed' AND finalized IS NOT NULL AND ended>?{only} "
                    "ORDER BY ended, started", (st.get("since") or 0,))
-    if not batches:
+    own = own_landings(p, st.get("since") or 0) if plc else []
+    if not batches and not own:
         return ""
     if not plc:
         batches = batches[:1]    # express landings only: one at a time, its own range
-    elif "since" not in st:
-        batches = batches[-1:]   # first run: this landing only, not the project's history
-    points = []
-    for b in batches:   # by position on the branch (a batch replays in priority order, not id order)
-        line = _git(p.root, "rev-list", "--reverse", "--first-parent",
-                    f"{b['tip']}..{b['pushed_sha']}" if b["tip"] else b["pushed_sha"]).stdout.split()
-        at = {c: i for i, c in enumerate(line)}
+    units = [("batch", b["pushed_sha"], b["ended"], b) for b in batches] + \
+        [("own", r["sha"], r["ts"] or 0, r) for r in own]
+    ended = max(u[2] for u in units)
+    line = _line(p.root, units) if own else []
+    if own:   # by position on the branch: a batch's ended is when it finished, not where it landed
+        at = {c: i for i, c in enumerate(reversed(line))}
+        units = sorted((u for u in units if u[1] in at), key=lambda u: at[u[1]])
+        if not units:
+            db.set_kv(KEY, {**st, "since": ended})   # none of them is on the branch any longer
+            return ""
+    if plc and "since" not in st:
+        units = units[-1:]   # first run: this landing only, not the project's history
+    points, prev = [], ""
+    for kind, sha, _, b in units:
+        if kind == "own":   # a task's own `ttp push`: one point, from the landing before it
+            t = db.task(int(b["task"])) or {}
+            points.append({"sha": sha, "base": prev or _before(p, line, sha), "row": None, "task": b["task"],
+                           "branch": t.get("branch") or ""})
+            prev = sha
+            continue
+        line_b = _git(p.root, "rev-list", "--reverse", "--first-parent",
+                      f"{b['tip']}..{b['pushed_sha']}" if b["tip"] else b["pushed_sha"]).stdout.split()
+        at_b = {c: i for i, c in enumerate(line_b)}
         rows = [r for r in db.q("SELECT id, task, branch, landed_sha FROM push_queue WHERE batch=? AND landed_sha "
-                                "IS NOT NULL AND status IN ('pushed','landed')", (b["id"],)) if r["landed_sha"] in at]
+                                "IS NOT NULL AND status IN ('pushed','landed')", (b["id"],)) if r["landed_sha"] in at_b]
         base = b["tip"] or ""
-        for r in sorted(rows, key=lambda r: at[r["landed_sha"]]):
+        for r in sorted(rows, key=lambda r: at_b[r["landed_sha"]]):
             points.append({"sha": r["landed_sha"], "base": base, "row": r["id"], "task": r["task"],
                            "branch": r["branch"]})
             base = r["landed_sha"]
         if b["pushed_sha"] != base:
             points.append({"sha": b["pushed_sha"], "base": base, "row": None})
+        prev = b["pushed_sha"]
+    kind, sha, _, last = units[-1]
+    name = Path(last["marker"]).stem if kind == "own" else last["id"]
     folder = p.state / FOLDER
     folder.mkdir(parents=True, exist_ok=True)
-    path = folder / f"{batches[-1]['id']}.json"
-    job = {"path": str(path), "batch": batches[-1]["id"], "sha": batches[-1]["pushed_sha"], "good": batches[0]["tip"] or "", "points": points,
-           "target": batches[-1]["target"], "ended": batches[-1]["ended"], "repo": str(p.root)}
+    path = folder / f"{name}.json"
+    good = (units[0][3]["tip"] or "") if units[0][0] == "batch" else points[0]["base"]
+    job = {"path": str(path), "batch": name, "sha": sha, "good": good,
+           "points": points, "target": last["target"], "ended": ended, "repo": str(p.root)}
+    batches = [u[3] for u in units if u[0] == "batch"]
     if any(express.is_express(b["id"]) for b in batches):
         full = push.check_list(push.repo_checks(d, p.root, p)[0])
         job["checks"] = [c.config() for c in full + plc]
@@ -128,6 +153,42 @@ def tend(p: Project, cfg: dict, now: float | None = None) -> str:
     job["pid"] = spawn(p, path)
     db.set_kv(KEY, {**st, "job": job, "since": st.get("since", 0)})
     return f"post-landing checks started on {job['sha'][:10]}"
+
+
+LINE = 2000   # commits of the push branch's first-parent line read back from its newest landing
+
+
+def own_landings(p: Project, since: float) -> list[dict]:
+    """Landings tasks made themselves on the push branch with `ttp push` (task_landings, recorded from their
+    detached push markers) since `since`, oldest first; [] when no push branch is set."""
+    from . import push
+    try:
+        name = "/".join(push.target(p, p.root))
+    except ValueError:
+        return []
+    return p.db.q("SELECT marker, task, sha, target, ts FROM task_landings WHERE ts>? AND target=? AND sha NOT IN "
+                  "(SELECT pushed_sha FROM push_batches WHERE pushed_sha IS NOT NULL) AND sha NOT IN "
+                  "(SELECT landed_sha FROM push_queue WHERE landed_sha IS NOT NULL) ORDER BY ts", (since, name))
+
+
+def _line(repo, units: list) -> list[str]:
+    """The push branch's first-parent line, newest first, from the newest of `units`' landed shas."""
+    head = units[0][1]
+    for u in units[1:]:
+        if u[1] != head and _git(repo, "merge-base", "--is-ancestor", head, u[1]).returncode == 0:
+            head = u[1]
+    return _git(repo, "rev-list", "--first-parent", f"--max-count={LINE}", head).stdout.split()
+
+
+def _before(p: Project, line: list[str], sha: str) -> str:
+    """The landing before `sha` on the branch (`line`, newest first): the nearest older commit that a batch, a
+    queued entry, a task's own push or the last post-land run landed or checked, else its parent."""
+    db = p.db
+    known = {r["s"] for r in db.q("SELECT sha s FROM task_landings UNION SELECT pushed_sha FROM push_batches "
+                                  "UNION SELECT tip FROM push_batches UNION SELECT landed_sha FROM push_queue")}
+    known.add(((db.kv(KEY, {}) or {}).get("last") or {}).get("sha"))
+    older = line[line.index(sha) + 1:] if sha in line else []
+    return next((c for c in older if c in known), older[0] if older else "")
 
 
 def retry(p: Project, job: dict, attempt: int) -> dict:
@@ -319,7 +380,7 @@ def revert(p: Project, repo: Path, job: dict, e: dict, cmd, ids: list[str], run)
         tip = push._fetch(repo, remote, branch)
     except Exception as ex:
         return {"why": f"could not read {job['target']}: {ex}"}
-    if not e.get("row"):
+    if not e.get("row") and not e.get("task"):   # a queue entry or a task's own push, never a batch's bump
         return {"why": "the first failing sha is the version bump, not an entry"}
     start = e.get("base") or ""
     if not start or start == e["sha"]:

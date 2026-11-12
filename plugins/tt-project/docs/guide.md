@@ -2167,7 +2167,8 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   uncommitted changes, else alerted; worktrees never start from such a HEAD.
 - Smoke before landing: `delivery.push_checks` gate every landing, so keep them under 10 min on
   their host (aim 5). Slower tests belong in `delivery.post_land_checks`, which run after landing:
-  the daemon runs them detached on each new pushed sha, without a model, the first full run on a spill
+  the daemon runs them detached on each new landed sha (a push queue batch, an express landing or a
+  task's own `ttp push` to the push branch, each a bisect point of its own), without a model, the first full run on a spill
   host the project's settings allow (`delivery.checks_spill_hosts`) when one is free, its reruns here. A failing test that passes on
   a rerun is flaky (quarantined, not reverted); one failing before the landing too is not its. A new
   failure is bisected over the landed changes to the guilty one, which is reverted forward on the
