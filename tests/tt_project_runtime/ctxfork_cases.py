@@ -479,6 +479,44 @@ def test_a_related_worker_task_resumes_a_recent_runs_session_one_lane_at_a_time_
     assert ctxfork.lane_source(p, d.cfg, sib) is None
 
 
+def test_a_task_s_next_run_resumes_its_own_warm_session_and_code_runs_keep_it_warm_an_hour(env, monkeypatch, tmp_path):
+    """User 11-12 (no amnesiac workers): a wake of a waiting task resumes its own last ok worker run's
+    session while that is still in the prompt cache (240 s after a 5m run, 55 min after a 1h one) instead of
+    a fresh prompt. Code tasks and tasks that waited before run at 1h unless budget.worker_cache_ttl is set."""
+    from ttp import cachettl, coordsession, ctxfork
+    p, d, cfg_dir, _run = _fork_daemon(env, monkeypatch, tmp_path)
+    coord = str(uuid.uuid4())
+    _fork_transcript(cfg_dir, p.base, coord)
+    p.db.set_kv(coordsession.KEY, {"id": coord, "provider": "claude", "context_tokens": 5000})
+    t = p.db.add_task("land the fix", "do it", kind="work", origin="coordinator")
+    s1 = str(uuid.uuid4())
+    _worker_session(cfg_dir, tmp_path / "wt-t", s1, "checks started; waiting")
+    r1 = _ok_run(p, t, s1, ended=time.time() - 60)
+    rid, argv, prompt, got, session = _start(p, d, t)
+    assert got["how"] == "resume" and got["run"] == r1 and "lane" not in got and "its own run" in got["why"], got
+    assert argv[argv.index("--resume") + 1] == session != s1
+    assert prompt.startswith(ctxfork.RESUME_HEAD) and "your own earlier run of this task" in prompt
+    cold = p.db.add_task("other", "x", kind="work", origin="coordinator")
+    s2 = str(uuid.uuid4())
+    _worker_session(cfg_dir, tmp_path / "wt-c", s2)
+    r2 = _ok_run(p, cold, s2, ended=time.time() - 900)
+    assert _start(p, d, cold)[3]["how"] == "fork", "a 5m run 15 min ago is cold"
+    p.db.x("UPDATE runs SET note=? WHERE id=?", (json.dumps({"session_id": s2, "cache_ttl": "1h"}), r2))
+    got = _start(p, d, cold)[3]
+    assert got["how"] == "resume" and got["run"] == r2, "a 1h run 15 min ago is still warm"
+    # the lifetime each run starts with
+    budget = {}
+    assert cachettl.worker_for_task(budget, "worker", {"kind": "code"})[0] == "1h"
+    assert cachettl.worker_for_task(budget, "worker", {"kind": "work", "result": None})[0] == "5m"
+    assert cachettl.worker_for_task(budget, "worker", {"kind": "work", "result": json.dumps({"waits": 2})})[0] == "1h"
+    assert cachettl.worker_for_task(budget, "reviewer", {"kind": "code"})[0] == "5m"
+    assert cachettl.worker_for_task({"worker_cache_ttl": "5m"}, "worker", {"kind": "code"}) == ("5m", "configured")
+    code = p.db.add_task("a change", "x", kind="code", origin="coordinator")
+    rid = _start(p, d, code)[0]
+    note = json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (rid,))["note"])
+    assert note["cache_ttl"] == "1h", note
+
+
 def test_a_review_fix_resumes_the_code_tasks_session_and_counts_its_hops(env, monkeypatch, tmp_path):
     """#7754 (b): a daemon fix resumes the session of the task it fixes; a later round's fix resumes the
     earlier fix's session, one hop deeper, while within review.hop_max (default 2)."""

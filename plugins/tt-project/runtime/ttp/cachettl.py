@@ -37,8 +37,8 @@ QUIET_GAP_MIN = 90       # a median gap over this, with nothing running or due, 
 # So they stay as they are: overall the due reasons were read about 88% of the time, the median one 73%.
 
 
-WORKER_TTLS = ("5m", "1h", "off")
-WORKER_DEFAULT = "5m"
+WORKER_TTLS = ("5m", "1h", "off", "auto")
+WORKER_DEFAULT = "5m"   # what "auto" picks for a run no later run is likely to resume (worker_for_task)
 # Workers and reviews stay at 5m, and set it: Claude Code (2.1.285) reads CLAUDE_CODE_PROMPT_CACHE_TTL
 # for the main conversation, and unset it picks 1h on a Claude subscription (5m on an API key); its
 # subagents take CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL, 5m unset. A run's lifetime is fixed when it
@@ -56,7 +56,38 @@ def worker_setting(budget: dict) -> str:
     default: a write at 1.25x input instead of 2x, and worker calls rarely sit 5 min apart), "1h", or
     "off" (no setting: the agent's own default). Unset, "" or an unknown value is the default."""
     v = str((budget or {}).get("worker_cache_ttl") or "").strip().lower()
-    return v if v in WORKER_TTLS else WORKER_DEFAULT
+    return v if v in WORKER_TTLS and v != "auto" else WORKER_DEFAULT
+
+
+RESUMED_WINDOW_S = 3300   # how long after a 1h run ends its session is still read from cache (5 min short of 1 h)
+WARM_WINDOW_S = 240       # the same for a 5m run
+
+
+def worker_for_task(budget: dict, role: str, task: dict | None) -> tuple[str, str]:
+    """(lifetime, why) of a worker or reviewer run. budget.worker_cache_ttl "5m", "1h" or "off": that. "auto" (the default) or unset: 1h for a
+    worker run whose task is likely to run again on this session (a code task, which waits on its checks,
+    review and landing, or any task that has waited before), so its next run resumes it from cache
+    (ctxfork.own_source) instead of writing a fresh prompt; 5m otherwise. A 1h write costs 2x input
+    instead of 1.25x, paid once; each warm resume then reads its history at 0.1x instead of writing it."""
+    raw = str((budget or {}).get("worker_cache_ttl") or "").strip().lower()
+    if raw in WORKER_TTLS and raw != "auto":
+        return raw, "configured"
+    if role == "worker" and task:
+        from .db import load_result
+        if task.get("kind") == "code":
+            return "1h", "a code task runs again after its checks and review"
+        try:
+            waited = int(load_result(task.get("result")).get("waits") or 0) > 0
+        except (TypeError, ValueError, AttributeError):
+            waited = False
+        if waited:
+            return "1h", "it waited before, so it runs again on this session"
+    return WORKER_DEFAULT, "default"
+
+
+def window_s(note: dict | None) -> float:
+    """How long after a run ended its session is still warm, by the lifetime its note records."""
+    return RESUMED_WINDOW_S if (note or {}).get("cache_ttl") == "1h" else WARM_WINDOW_S
 
 
 def worker_problems(budget: dict) -> list[str]:

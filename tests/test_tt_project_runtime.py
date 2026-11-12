@@ -5921,8 +5921,8 @@ def test_runs_but_the_coordinator_take_budget_worker_cache_ttl(env, monkeypatch)
                  ["message"]["content"] if "cache_control" in b] if (run / "input.jsonl").exists() else []
         return spec["env"].get("CLAUDE_CODE_PROMPT_CACHE_TTL"), marks
 
-    assert project.DEFAULT_CONFIG["budget"]["worker_cache_ttl"] == "5m"
-    assert start("worker")[0] == "5m" and start("reviewer")[0] == "5m", "the default is 5m"
+    assert project.DEFAULT_CONFIG["budget"]["worker_cache_ttl"] == "auto"
+    assert start("worker")[0] == "5m" and start("reviewer")[0] == "5m", "auto: 5m for a run no later run resumes"
     assert start("worker", system=head, context=context) == ("5m", ["5m"]), \
         "the mark must take the env's lifetime (a mismatch is an API 400)"
     coord_before = start("coordinator", read_only=True, cache_ttl="1h", system=head, context=context)
@@ -5939,9 +5939,9 @@ def test_runs_but_the_coordinator_take_budget_worker_cache_ttl(env, monkeypatch)
     assert codex_env == (None, []), "a provider without the switch gets no env"
     p.set_config("budget.worker_cache_ttl", "10m")
     assert start("worker")[0] == "5m", "an unknown value runs at the default"
-    assert any("budget.worker_cache_ttl: '10m' is not one of 5m, 1h, off" in m
+    assert any("budget.worker_cache_ttl: '10m' is not one of 5m, 1h, off, auto" in m
                for m in project.config_problems(json.loads(p.config_path.read_text()))), "it is reported"
-    for ok in ("5m", "1h", "off", "OFF", ""):
+    for ok in ("5m", "1h", "off", "OFF", "", "auto"):
         assert not [m for m in project.config_problems({"budget": {"worker_cache_ttl": ok}}) if "worker_cache_ttl" in m]
     for rid in rids:   # each run was told to STOP: let its runner end before the test does
         _wait_gone(p.db.one("SELECT pid FROM runs WHERE id=?", (rid,))["pid"], time.time() + 20)

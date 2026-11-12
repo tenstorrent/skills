@@ -193,6 +193,40 @@ def follow_source(p, task: int | None) -> dict | None:
 LANE_REL = ("waits on it", "same parent", "spawned this task", "same branch", "same resource")
 
 
+def own_source(p, cfg: dict, task: int | None, now: float | None = None) -> dict | None:
+    """A task's own last ok worker run, when its session is still warm (cachettl.window_s by the lifetime it
+    ran at): a wake of a waiting task (its probe passed, its job ended, its checks failed) resumes what that
+    run knew instead of starting over from a fresh prompt. A follow-up (continues:<id>) is follow_source's."""
+    from . import cachettl
+    now = time.time() if now is None else now
+    s = coordsession.settings(cfg)
+    if task is None or not s.get("worker_lane", True):
+        return None
+    t = p.db.task(task)
+    if not t or t["kind"] == "review":
+        return None
+    r = p.db.one("SELECT id, provider, model, ended, note, session_id FROM runs WHERE task=? AND role='worker' "
+                 "AND status='ok' AND ended IS NOT NULL ORDER BY id DESC LIMIT 1", (task,))
+    if not r:
+        return None
+    try:
+        note = json.loads(r["note"] or "{}")
+    except ValueError:
+        note = {}
+    sid = r["session_id"] or note.get("session_id")
+    if not sid or now - float(r["ended"] or 0) > cachettl.window_s(note):
+        return None
+    return {"run": r["id"], "task": task, "title": t["title"] or "", "session": str(sid),
+            "provider": r["provider"] or "", "model": r["model"] or "", "ended": float(r["ended"] or 0),
+            "own": True, "why": f"its own run {r['id']}, still warm"}
+
+
+def own_lead(src: dict, delta: str) -> str:
+    return (f"{RESUME_HEAD}\nEverything above is your own earlier run of this task (run {src['run']}), copied "
+            "for you. Carry on from where it stopped, using what it found; the task's current spec, why it woke "
+            "and any newer rules are below, and they win where they differ from that history.\n\n" + delta)
+
+
 def lane_source(p, cfg: dict, task: int | None, now: float | None = None) -> dict | None:
     """The related run a worker task with no follow-up source resumes: follow_source's dict plus "why" and
     "lane" (this run's depth in its lane), or None."""
@@ -200,6 +234,7 @@ def lane_source(p, cfg: dict, task: int | None, now: float | None = None) -> dic
     s = coordsession.settings(cfg)
     if task is None or not s.get("worker_lane", True):
         return None
+    from . import cachettl
     idle = coordsession._num(s.get("worker_lane_idle_s"), 240)
     cap = int(coordsession._num(s.get("worker_lane_max"), 4))
     t = p.db.task(task)
@@ -216,7 +251,7 @@ def lane_source(p, cfg: dict, task: int | None, now: float | None = None) -> dic
     res = {x for x in _list(t.get("labels")) if isinstance(x, str) and x.startswith("resource:")}
     rows = p.db.q("SELECT r.id, r.task, r.provider, r.model, r.ended, r.note, r.session_id FROM runs r "
                   "WHERE r.role='worker' AND r.status='ok' AND r.ended>=? AND r.task IS NOT NULL AND r.task!=? "
-                  "ORDER BY r.ended DESC LIMIT 30", (now - idle, task))
+                  "ORDER BY r.ended DESC LIMIT 30", (now - max(idle, cachettl.RESUMED_WINDOW_S), task))
     if not rows:
         return None
     taken = set()   # sources another lane run already carries on
@@ -237,7 +272,9 @@ def lane_source(p, cfg: dict, task: int | None, now: float | None = None) -> dic
             note = {}
         sid = r["session_id"] or note.get("session_id")
         o = p.db.task(r["task"])
-        if not sid or not o or o["kind"] == "review":
+        # warm: within worker_lane_idle_s of a 5m run, or the longer window of a run at 1h
+        warm = cachettl.RESUMED_WINDOW_S if note.get("cache_ttl") == "1h" else idle
+        if not sid or not o or o["kind"] == "review" or now - float(r["ended"] or 0) > warm:
             continue
         rank = (0 if o["id"] in deps else 1 if t.get("parent") and o.get("parent") == t["parent"]
                 else 2 if t.get("parent") == o["id"] else 3 if t.get("branch") and o.get("branch") == t["branch"]
@@ -345,7 +382,7 @@ def prepare(p, cfg: dict, prov, provider: str, cwd: str, env: dict | None, now: 
         why = f"no fork or resume: {missed}"[:400]   # a copy again would repeat it
     elif m == "fork":
         try:
-            src = follow_source(p, task) or lane_source(p, cfg, task, now)
+            src = follow_source(p, task) or own_source(p, cfg, task, now) or lane_source(p, cfg, task, now)
             gap = _resume_gap(src, prov, provider) or _cross_model(src, model) or _fork_rejected(p, task, "resume") \
                 or _hop_capped(p, cfg, src, task) if src else ""
             if src and not gap:
@@ -353,7 +390,7 @@ def prepare(p, cfg: dict, prov, provider: str, cwd: str, env: dict | None, now: 
                 gap = prov.start_from_session(src["provider"] or provider, src["session"], cwd, env, new)
                 if not gap:
                     lane = {"lane": src["lane"]} if src.get("lane") else {}
-                    lead = lane_lead if lane else resume_lead
+                    lead = lane_lead if lane else own_lead if src.get("own") else resume_lead
                     return {"how": "resume", "why": src.get("why") or f"run {src['run']}'s session {src['session'][:8]}",
                             "session": new, "run": src["run"], **lane,
                             "lead": lead(src, delta_block(p, cfg, src["ended"], now))}

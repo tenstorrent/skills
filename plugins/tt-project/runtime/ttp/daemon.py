@@ -3749,8 +3749,9 @@ class Daemon:
                 log(self.p, f"coordinator session {why}")
         cache_fp = None
         session_ttl_at = None   # a session wake's start, recorded with its lifetime once launched
+        worker_ttl_why = ""
         if role != "coordinator" and not cache_ttl:
-            cache_ttl = cachettl.worker_setting(self.cfg.get("budget") or {})
+            cache_ttl, worker_ttl_why = cachettl.worker_for_task(self.cfg.get("budget") or {}, role, task)
         if cache_ttl == cachettl.AUTO:
             warm_min = (self.cfg.get("coordinator") or {}).get("cache_warm_min", cachettl.WARM_MIN)
             if prov.cache_env("1h") and session_mode in ("new", "resume"):
@@ -3769,6 +3770,8 @@ class Daemon:
                 cache_ttl, ttl_why = "1h", "the agent sets its own cache lifetime"
         else:
             ttl_why = "configured"
+        if worker_ttl_why and cache_ttl in ("5m", "1h"):   # the window a later run can resume it in (ctxfork)
+            note = {**(note or {}), "cache_ttl": cache_ttl, "cache_ttl_why": worker_ttl_why}
         if role == "coordinator":
             # With the turn's usage, so a before/after comparison can tell the lifetimes apart.
             note = {**(note or {}), "turn": {**(note or {}).get("turn", {}),
