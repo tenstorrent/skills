@@ -882,7 +882,7 @@ def test_bridge_refresh_reinstalls_a_service_whose_command_changed(tmp_path, mon
 # A stub ssh-add answers by marker files next to the socket it is asked about: <sock>.dead (exit 2),
 # <sock>.fetch (exit 1, a failed exchange), <sock>.empty (exit 1, no keys). No real agent or key.
 
-_STUB_SSH_ADD = """#!/bin/sh
+_BRIDGE_STUB_SSH_ADD = """#!/bin/sh
 t=$SSH_AUTH_SOCK
 [ -L "$t" ] && t=$(readlink "$t")
 [ -e "$t.dead" ] && { echo "Could not open a connection to your authentication agent." >&2; exit 2; }
@@ -892,11 +892,11 @@ echo "256 SHA256:stub test (ED25519)"
 """
 
 
-def _stub_agents(tmp_path, *names):
+def _bridge_stub_agents(tmp_path, *names):
     """A stub ssh-add first on PATH, and a listening Unix socket per agent name."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
-    (bin_dir / "ssh-add").write_text(_STUB_SSH_ADD)
+    (bin_dir / "ssh-add").write_text(_BRIDGE_STUB_SSH_ADD)
     (bin_dir / "ssh-add").chmod(0o755)
     socks = []
     for n in names:
@@ -907,7 +907,7 @@ def _stub_agents(tmp_path, *names):
     return f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}", socks
 
 
-def _box_loop(tmp_path, monkeypatch, own, linked):
+def _bridge_box_loop(tmp_path, monkeypatch, own, linked):
     """The box side's stay-up loop with a link already pointing at `linked` (its first link step off)."""
     from ttp import bridge
     monkeypatch.setattr(bridge, "CHECK_S", 0.1)
@@ -917,13 +917,13 @@ def _box_loop(tmp_path, monkeypatch, own, linked):
     d.chmod(0o700)
     os.symlink(tmp_path / f"{linked}.sock", d / "auto.sock")
     remote = bridge.remote_command(_bridge_cfg(), "auto").replace("ln -sfn", "true", 1)
-    path, socks = _stub_agents(tmp_path, own, linked)
+    path, socks = _bridge_stub_agents(tmp_path, own, linked)
     proc = subprocess.Popen(["sh", "-c", remote], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             env={"HOME": str(home), "PATH": path, "SSH_AUTH_SOCK": str(tmp_path / f"{own}.sock")})
     return proc, d / "auto.sock", socks
 
 
-def _wait_for(cond, timeout=15.0):
+def _bridge_wait(cond, timeout=15.0):
     end = time.time() + timeout
     while time.time() < end:
         if cond():
@@ -936,9 +936,9 @@ def test_bridge_box_loop_relinks_a_dead_link_and_exits_when_its_own_agent_dies(t
     # cells: box-relink, box-own-dead
     from ttp import bridge
     (tmp_path / "old.sock.dead").touch()   # an earlier session's link whose agent died
-    proc, ln, _socks = _box_loop(tmp_path, monkeypatch, "mine", "old")
+    proc, ln, _socks = _bridge_box_loop(tmp_path, monkeypatch, "mine", "old")
     try:
-        assert _wait_for(lambda: os.readlink(ln) == str(tmp_path / "mine.sock"))
+        assert _bridge_wait(lambda: os.readlink(ln) == str(tmp_path / "mine.sock"))
         (tmp_path / "mine.sock.fetch").touch()   # exit 1 with a failed exchange is a dead agent too
         rc = proc.wait(timeout=15)
     finally:
@@ -950,7 +950,7 @@ def test_bridge_box_loop_relinks_a_dead_link_and_exits_when_its_own_agent_dies(t
 def test_bridge_box_loop_leaves_a_link_whose_agent_answers(tmp_path, monkeypatch):
     # cells: box-live-kept
     (tmp_path / "newer.sock.empty").touch()   # a newer session's live agent, holding no keys
-    proc, ln, _socks = _box_loop(tmp_path, monkeypatch, "mine", "newer")
+    proc, ln, _socks = _bridge_box_loop(tmp_path, monkeypatch, "mine", "newer")
     try:
         time.sleep(1.0)   # about ten checks
         assert proc.poll() is None and os.readlink(ln) == str(tmp_path / "newer.sock")
@@ -978,7 +978,7 @@ def test_bridge_host_watch_alerts_by_name_after_two_minutes_and_clears(env, tmp_
     # cells: host-alert, host-clear, host-quiet
     from ttp import alerts, bridge, bridgewatch
     from ttp.daemon import Daemon
-    path, _socks = _stub_agents(tmp_path, "auto")
+    path, _socks = _bridge_stub_agents(tmp_path, "auto")
     monkeypatch.setenv("PATH", path)
     link = str(tmp_path / "auto.sock")
     cfg = tmp_path / "ssh-config"
