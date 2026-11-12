@@ -491,6 +491,155 @@ def test_bridge_relay_exits_after_two_failed_relistens(monkeypatch, request):
     assert rc == bridge_relay.RELAY_LOST and not (d / "m" / "x.sock").exists()
 
 
+def test_bridge_relay_caps_its_carried_connections_and_takes_new_ones_once_they_end(monkeypatch, request, capfd):
+    # cells: cap-refuse, cap-reopen, cap-relay-wide, cap-one-log-per-burst
+    import socket
+    import threading
+    import time
+    from ttp import bridge_relay
+    d = _relay_dir(request)
+    monkeypatch.setattr(bridge_relay, "MAX_CARRIED", 2)
+    monkeypatch.setattr(bridge_relay, "ALL", bridge_relay.Gate(100))
+    release = threading.Event()
+
+    def hang(host, iface):   # an upstream that holds each carried connection until released
+        release.wait(10)
+        raise OSError("upstream down")
+
+    monkeypatch.setattr(bridge_relay, "bound_connect", hang)
+    path = str(d / "h.sock")
+    lst = bridge_relay.listen(path, "10.0.0.2", "vpn0")
+    request.addfinalizer(lambda: lst.close(unlink=True))
+
+    def connect():
+        c = socket.socket(socket.AF_UNIX)
+        c.settimeout(5)
+        c.connect(path)
+        return c
+
+    held = [connect(), connect()]
+    t0 = time.monotonic()
+    while lst.gate.n < 2 and time.monotonic() - t0 < 5:
+        time.sleep(0.01)
+    assert lst.gate.n == 2
+    over = [connect() for _ in range(3)]
+    for c in over:   # over the cap: closed at once, not left waiting for an upstream
+        assert c.recv(1) == b""
+    assert lst.gate.n == 2 and bridge_relay.ALL.n == 2 and lst.thread.is_alive()
+    assert capfd.readouterr().err.count("closing new ones until some end") == 1
+    release.set()
+    for c in held:
+        assert c.recv(1) == b""
+        c.close()
+    t0 = time.monotonic()
+    while lst.gate.n and time.monotonic() - t0 < 5:
+        time.sleep(0.01)
+    assert lst.gate.n == 0 and bridge_relay.ALL.n == 0
+    _relay_echo_upstream(monkeypatch, bridge_relay)
+    monkeypatch.setattr(bridge_relay, "DRAIN_S", 0.2)
+    assert _relay_roundtrip(path, b"again") == b"again"   # carried again once the earlier ones ended
+    t0 = time.monotonic()
+    while lst.gate.n and time.monotonic() - t0 < 5:
+        time.sleep(0.01)
+    monkeypatch.setattr(bridge_relay, "ALL", bridge_relay.Gate(0))   # the relay-wide cap refuses too
+    c = connect()
+    assert c.recv(1) == b"" and lst.gate.n == 0
+    c.close()
+    assert bridge_relay.fit_carried(256) == (256 - bridge_relay.FD_RESERVE) // 2
+    assert bridge_relay.fit_carried(1 << 20) == bridge_relay.MAX_CARRIED_ALL
+    assert bridge_relay.fit_carried(None) == bridge_relay.MAX_CARRIED_ALL   # unknown limit: left as it was
+
+
+def test_bridge_relay_upstream_connect_has_one_deadline_across_every_address(monkeypatch):
+    # cells: deadline-all-addresses, deadline-lookup, deadline-handle-closes
+    import socket
+    import threading
+    import time
+    from ttp import bridge_relay
+    tries = []
+
+    class Hangs:   # a connect into a dead route: it waits out whatever timeout it is given
+        def __init__(self, *a):
+            self.timeout = None
+
+        def setsockopt(self, *a):
+            pass
+
+        def settimeout(self, t):
+            self.timeout = t
+
+        def connect(self, addr):
+            tries.append(self.timeout)
+            time.sleep(self.timeout)
+            raise socket.timeout("timed out")
+
+        def close(self):
+            pass
+
+    addrs = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (f"10.0.0.{i}", 22)) for i in range(2, 6)]
+    monkeypatch.setattr(bridge_relay.socket, "getaddrinfo", lambda *a, **k: addrs)
+    monkeypatch.setattr(bridge_relay.socket, "socket", Hangs)
+    monkeypatch.setattr(bridge_relay.socket, "if_nametoindex", lambda n: 1, raising=False)
+    monkeypatch.setattr(bridge_relay, "CONNECT_DEADLINE_S", 0.4)
+    t0 = time.monotonic()
+    with pytest.raises(OSError):
+        bridge_relay.bound_connect("box", "vpn0")
+    took = time.monotonic() - t0
+    assert took < 0.7 and len(tries) < len(addrs), (took, tries)   # one deadline, not 0.4 s per address
+
+    stuck = threading.Event()
+    monkeypatch.setattr(bridge_relay.socket, "getaddrinfo", lambda *a, **k: (stuck.wait(5), addrs)[1])
+    t0 = time.monotonic()
+    with pytest.raises(OSError, match="lookup timed out"):
+        bridge_relay.bound_connect("box", "vpn0")
+    assert time.monotonic() - t0 < 0.7   # a lookup stuck on a dead network counts against it too
+    stuck.set()
+
+    closed = []
+
+    class Client:
+        def shutdown(self, how):
+            pass
+
+        def close(self):
+            closed.append(time.monotonic())
+
+    t0 = time.monotonic()
+    bridge_relay._handle(Client(), "box", "vpn0")
+    assert closed and closed[0] - t0 < 0.7   # the client side is closed within the deadline
+
+
+def test_bridge_relay_raises_its_open_file_limit_before_the_session_starts(monkeypatch, request):
+    # cells: nofile-before-ssh
+    import sys
+    from ttp import bridge_relay
+    d = _relay_dir(request)
+    order = []
+    monkeypatch.setattr(bridge_relay, "raise_nofile", lambda *a, **k: order.append("raise") or 1024)
+
+    def run(ssh, tag, dd, state):
+        order.append("ssh")
+        return 0
+
+    monkeypatch.setattr(bridge_relay, "run", run)
+    monkeypatch.setattr(bridge_relay, "ALL", bridge_relay.Gate(bridge_relay.MAX_CARRIED_ALL))
+    assert bridge_relay.main([str(d / "m"), "--", sys.executable, "-c", "pass"]) == 0
+    assert order == ["raise", "ssh"] and bridge_relay.ALL.cap == (1024 - bridge_relay.FD_RESERVE) // 2
+    if sys.platform == "win32":
+        return
+    import resource
+    import subprocess
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    want = soft - 1 if soft > 64 else soft
+    monkeypatch.undo()
+    resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
+    request.addfinalizer(lambda: resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard)))
+    got = bridge_relay.raise_nofile(want=soft)
+    out = subprocess.run([sys.executable, "-c", "import resource; print(resource.getrlimit(resource.RLIMIT_NOFILE)[0])"],
+                         capture_output=True, text=True, check=True).stdout
+    assert int(out) == got == soft   # a child spawned after the raise inherits the raised limit
+
+
 def test_bridge_relay_raises_its_open_file_limit_within_the_hard_limit():
     # cells: nofile-raise, nofile-hard-lower, nofile-unlimited, nofile-refused
     from ttp import bridge_relay

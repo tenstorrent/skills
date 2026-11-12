@@ -69,6 +69,10 @@ SUPERVISE_S = 30.0   # how often each listener is checked
 RELISTEN_TRIES = 2   # failed re-listens in a row before the relay exits for a restart
 RELAY_LOST = 6   # the exit when a listener cannot be restored
 NOFILE_WANT = 4096
+CONNECT_DEADLINE_S = 15.0   # one upstream connect, name lookup and every address together
+MAX_CARRIED = 64   # carried connections per listener; more are closed at once while these last
+MAX_CARRIED_ALL = 512   # in the whole relay, lowered to fit its open-file limit (fit_carried)
+FD_RESERVE = 64   # descriptors kept free for listeners, logs and the session
 
 
 def parse_spec(spec: str) -> tuple[str, str, str]:
@@ -79,10 +83,35 @@ def parse_spec(spec: str) -> tuple[str, str, str]:
     return name, host, iface
 
 
-def bound_connect(host: str, iface: str, port: int = 22, timeout: float = 15) -> socket.socket:
-    """A TCP connection to host:port leaving through iface."""
+def _resolve(host: str, port: int, timeout: float) -> list:
+    """getaddrinfo within timeout: a lookup stuck on a dead network is left to finish on its own."""
+    out: dict = {}
+
+    def look():
+        try:
+            out["addrs"] = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except OSError as e:
+            out["err"] = e
+
+    t = threading.Thread(target=look, daemon=True)
+    t.start()
+    t.join(max(0.0, timeout))
+    if "err" in out:
+        raise out["err"]
+    if "addrs" not in out:
+        raise TimeoutError(f"{host}: name lookup timed out")
+    return out["addrs"]
+
+
+def bound_connect(host: str, iface: str, port: int = 22, timeout: float | None = None) -> socket.socket:
+    """A TCP connection to host:port leaving through iface, all within one deadline (CONNECT_DEADLINE_S)."""
+    deadline = time.monotonic() + (CONNECT_DEADLINE_S if timeout is None else timeout)
     err: OSError = OSError(f"{host}: no address")
-    for fam, typ, proto, _, addr in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM):
+    for fam, typ, proto, _, addr in _resolve(host, port, deadline - time.monotonic()):
+        left = deadline - time.monotonic()
+        if left <= 0:
+            err = TimeoutError(f"{host}: connect timed out")
+            break
         s = socket.socket(fam, typ, proto)
         try:
             if sys.platform == "darwin":
@@ -93,7 +122,7 @@ def bound_connect(host: str, iface: str, port: int = 22, timeout: float = 15) ->
                     s.setsockopt(socket.IPPROTO_IP, IP_BOUND_IF, idx)
             else:
                 s.setsockopt(socket.SOL_SOCKET, SO_BINDTODEVICE, iface.encode())
-            s.settimeout(timeout)
+            s.settimeout(left)
             s.connect(addr)
             s.settimeout(None)
             keepalive(s)
@@ -180,6 +209,34 @@ def _handle(conn: socket.socket, host: str, iface: str) -> None:
         _close(up)
 
 
+class Gate:
+    """A count of carried connections with a cap."""
+
+    def __init__(self, cap: int):
+        self.cap, self.n, self.lock = cap, 0, threading.Lock()
+
+    def take(self) -> bool:
+        with self.lock:
+            if self.n >= self.cap:
+                return False
+            self.n += 1
+            return True
+
+    def give(self) -> None:
+        with self.lock:
+            self.n = max(0, self.n - 1)
+
+
+ALL = Gate(MAX_CARRIED_ALL)   # every listener's carried connections together
+
+
+def fit_carried(soft: int | None) -> int:
+    """Size the relay-wide cap to the open-file limit: two descriptors per carried connection, FD_RESERVE kept."""
+    if soft is not None and soft > 0:
+        ALL.cap = max(8, min(MAX_CARRIED_ALL, (soft - FD_RESERVE) // 2))
+    return ALL.cap
+
+
 def private_dir(d: str) -> bool:
     """Fail closed: the socket directory is a real directory of this account that only it can open."""
     try:
@@ -203,6 +260,8 @@ class Listener:
         self.ino = 0
         self.thread: threading.Thread | None = None
         self.closing = False
+        self.gate = Gate(MAX_CARRIED)
+        self.refusing = False
 
     def start(self) -> None:
         if os.path.lexists(self.path):
@@ -242,11 +301,36 @@ class Listener:
                 time.sleep(delay)
                 continue
             delay = 0.0
+            if not self.gate.take():
+                self._refuse(conn, f"{self.gate.n} connections open (cap {self.gate.cap})")
+                continue
+            if not ALL.take():
+                self.gate.give()
+                self._refuse(conn, f"{ALL.n} connections open in the relay (cap {ALL.cap})")
+                continue
+            self.refusing = False
             try:
-                threading.Thread(target=_handle, args=(conn, self.host, self.iface), daemon=True).start()
+                threading.Thread(target=self._carry, args=(conn,), daemon=True).start()
             except RuntimeError as e:   # no thread to carry it: refuse this one, keep listening
                 print(f"ttp bridge relay: {self.path}: {e}", file=sys.stderr, flush=True)
                 _close(conn)
+                self.gate.give()
+                ALL.give()
+
+    def _refuse(self, conn: socket.socket, why: str) -> None:
+        """Close a connection over a cap at once; one log line per burst."""
+        _close(conn)
+        if not self.refusing:
+            self.refusing = True
+            print(f"ttp bridge relay: {self.path}: {why}; closing new ones until some end",
+                  file=sys.stderr, flush=True)
+
+    def _carry(self, conn: socket.socket) -> None:
+        try:
+            _handle(conn, self.host, self.iface)
+        finally:
+            self.gate.give()
+            ALL.give()
 
     def problem(self) -> str:
         """Why this listener no longer takes connections, or ''."""
@@ -527,7 +611,7 @@ def main(argv: list[str], platform: str | None = None, awake_spawn=None) -> int:
         print(f"bridge_relay: {d} is not a private directory of this account (its own, 700, not a symlink)",
               file=sys.stderr)
         return 4
-    raise_nofile()
+    fit_carried(raise_nofile())   # before the session starts: its ssh inherits the raised limit
     listeners: list[Listener] = []   # kept referenced for the life of the relay
     for spec in specs:
         name, host, iface = parse_spec(spec)
