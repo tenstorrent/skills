@@ -91,12 +91,13 @@ from pathlib import Path
 from . import cachettl, spans
 
 KEY = "coord_session"
-DEFAULTS = {"compact_tokens": 0, "compact_growth_tokens": 100000, "context_window_tokens": 0,
+DEFAULTS = {"compact_tokens": 0, "compact_growth_tokens": 225000, "context_window_tokens": 0,
             "compact_margin_tokens": 40000, "compact_min_free": 0.3, "row_delta": True,
             # what a worker or reviewer run starts with (ctxfork.py); worker_fork_max_tokens 0: no cap;
             # worker_fork_other_model_tokens: the last turns a run on another model forks (0: disk block)
             "worker_context": "fork", "worker_fork_max_tokens": 0, "worker_fork_max_age_h": 12,
-            "worker_fork_other_model_tokens": 8000, "worker_chat_chars": 8000}
+            "worker_fork_other_model_tokens": 8000, "worker_chat_chars": 8000,
+            "worker_lane": True, "worker_lane_idle_s": 240, "worker_lane_max": 4}
 LEGACY = {"rollover_tokens": "compact_tokens", "rollover_growth_tokens": "compact_growth_tokens",
           "rollover_margin_tokens": "compact_margin_tokens"}   # read when a project has no compact_* value
 COMPACTIONS_KEPT = 50   # KEY's `compactions`: the newest kept

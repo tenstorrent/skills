@@ -5,6 +5,9 @@ from __future__ import annotations
 
 
 def _cs_cfg(**over):
+    # These cases measure against a 100k growth step (the default before 0.2.1172 raised it to 225k).
+    if not {"compact_growth_tokens", "rollover_growth_tokens"} & set(over):
+        over = {"compact_growth_tokens": 100000, **over}
     return {"coordinator": {"session": over}}
 
 
@@ -308,12 +311,13 @@ def test_coordsession_the_retired_mode_key_is_refused_and_absent_from_the_defaul
             cli.cmd_chat_settable("coordinator.session.mode", value)
         assert e.value.code == 1 and "refused" in capsys.readouterr().out, value
     p = make(env)
-    assert p.config()["coordinator"]["session"] == {"compact_tokens": 0, "compact_growth_tokens": 100000,
+    assert p.config()["coordinator"]["session"] == {"compact_tokens": 0, "compact_growth_tokens": 225000,
                                                    "context_window_tokens": 0, "compact_margin_tokens": 40000,
                                                    "compact_min_free": 0.3, "row_delta": True,
                                                    "worker_context": "fork", "worker_fork_max_tokens": 0,
                                                    "worker_fork_max_age_h": 12,
-                                                   "worker_fork_other_model_tokens": 8000, "worker_chat_chars": 8000}
+                                                   "worker_fork_other_model_tokens": 8000, "worker_chat_chars": 8000,
+                                                   "worker_lane": True, "worker_lane_idle_s": 240, "worker_lane_max": 4}
     assert not {"thread_warm_min", "thread_max_turns"} & set(p.config()["coordinator"])
     assert settable("coordinator.session.row_delta")(" Off ") is False and settable("coordinator.session.row_delta")(True)
     with pytest.raises(ValueError):
@@ -716,6 +720,7 @@ def _cs_session_project(env, monkeypatch):
     sessions = _sessions(env, monkeypatch)
     p.charter_path.write_text(_CS_CHARTER)
     p.set_config("coordinator.debounce_s", 0)
+    p.set_config("coordinator.session.compact_growth_tokens", 100000)   # the cases measure a 100k step
     p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)",
            (time.time(), "t", time.time()))
     d = Daemon(p.base)

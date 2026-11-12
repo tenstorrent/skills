@@ -182,6 +182,84 @@ def follow_source(p, task: int | None) -> dict | None:
     return None
 
 
+# Related-task resume ("lanes", user 11-12: no amnesiac workers). A worker task that continues none still
+# resumes a copy of the session of a related task's run that ended within worker_lane_idle_s, while its
+# prompt cache is still warm (workers write at 5m), so it starts with what that run learned instead of a
+# fresh ~90k-token prompt. Related, in order: the task waits on it (depends_on), they share a parent, it
+# spawned this one, they share a branch or a resource: label. Each resumed history is re-read on every
+# call, so after worker_lane_max tasks in a row (measured: the inherited history then costs more than a
+# fresh prompt) the next one starts fresh. A source already carried on by another lane run is left alone,
+# so each lane stays one line. Reviews never take a lane: a review stays independent.
+LANE_REL = ("waits on it", "same parent", "spawned this task", "same branch", "same resource")
+
+
+def lane_source(p, cfg: dict, task: int | None, now: float | None = None) -> dict | None:
+    """The related run a worker task with no follow-up source resumes: follow_source's dict plus "why" and
+    "lane" (this run's depth in its lane), or None."""
+    now = time.time() if now is None else now
+    s = coordsession.settings(cfg)
+    if task is None or not s.get("worker_lane", True):
+        return None
+    idle = coordsession._num(s.get("worker_lane_idle_s"), 240)
+    cap = int(coordsession._num(s.get("worker_lane_max"), 4))
+    t = p.db.task(task)
+    if not t or t["kind"] == "review" or idle <= 0 or cap <= 0:
+        return None
+
+    def _list(v) -> list:
+        try:
+            got = json.loads(v or "[]")
+        except (TypeError, ValueError):
+            return []
+        return got if isinstance(got, list) else []
+    deps = {int(x) for x in _list(t.get("depends_on")) if str(x).isdigit()}
+    res = {x for x in _list(t.get("labels")) if isinstance(x, str) and x.startswith("resource:")}
+    rows = p.db.q("SELECT r.id, r.task, r.provider, r.model, r.ended, r.note, r.session_id FROM runs r "
+                  "WHERE r.role='worker' AND r.status='ok' AND r.ended>=? AND r.task IS NOT NULL AND r.task!=? "
+                  "ORDER BY r.ended DESC LIMIT 30", (now - idle, task))
+    if not rows:
+        return None
+    taken = set()   # sources another lane run already carries on
+    for r in p.db.q("SELECT note FROM runs WHERE started>=? AND note LIKE '%\"lane\"%'", (now - 6 * 3600,)):
+        try:
+            got = json.loads(r["note"] or "{}").get(KEY)
+        except ValueError:
+            continue
+        if isinstance(got, dict) and got.get("lane") and got.get("run"):
+            taken.add(int(got["run"]))
+    best = None
+    for r in rows:
+        if r["id"] in taken:
+            continue
+        try:
+            note = json.loads(r["note"] or "{}")
+        except ValueError:
+            note = {}
+        sid = r["session_id"] or note.get("session_id")
+        o = p.db.task(r["task"])
+        if not sid or not o or o["kind"] == "review":
+            continue
+        rank = (0 if o["id"] in deps else 1 if t.get("parent") and o.get("parent") == t["parent"]
+                else 2 if t.get("parent") == o["id"] else 3 if t.get("branch") and o.get("branch") == t["branch"]
+                else 4 if res & {x for x in _list(o.get("labels")) if isinstance(x, str)} else None)
+        if rank is None or (best and best[0] <= rank):
+            continue
+        got = note.get(KEY) if isinstance(note.get(KEY), dict) else {}
+        depth = int(got.get("lane") or 0) + 1
+        if depth > cap:
+            continue
+        best = (rank, {"run": r["id"], "task": o["id"], "title": o["title"] or "", "session": str(sid),
+                       "provider": r["provider"] or "", "model": r["model"] or "", "ended": float(r["ended"] or 0),
+                       "lane": depth, "why": f"lane {depth} of {cap}: #{o['id']} {LANE_REL[rank]}"})
+    return best[1] if best else None
+
+
+def lane_lead(src: dict, delta: str) -> str:
+    return (f"{RESUME_HEAD}\nEverything above is the session of run {src['run']} (task #{src['task']}: "
+            f"{src['title'][:120]}), a related task this project finished minutes ago, copied for you so you "
+            "start with what it learned. That task is over: do not continue, redo or report on it. Your task is "
+            "the one below, with its own spec and rules; where they differ from that history, they win.\n\n" + delta)
+
 def forked(note: dict | None) -> bool:
     """A run note says the run started from a copy of a saved session: the coordinator's (fork) or an
     earlier run's (resume, with its source run)."""
@@ -267,16 +345,18 @@ def prepare(p, cfg: dict, prov, provider: str, cwd: str, env: dict | None, now: 
         why = f"no fork or resume: {missed}"[:400]   # a copy again would repeat it
     elif m == "fork":
         try:
-            src = follow_source(p, task)
+            src = follow_source(p, task) or lane_source(p, cfg, task, now)
             gap = _resume_gap(src, prov, provider) or _cross_model(src, model) or _fork_rejected(p, task, "resume") \
                 or _hop_capped(p, cfg, src, task) if src else ""
             if src and not gap:
                 new = str(uuid.uuid4())
                 gap = prov.start_from_session(src["provider"] or provider, src["session"], cwd, env, new)
                 if not gap:
-                    return {"how": "resume", "why": f"run {src['run']}'s session {src['session'][:8]}",
-                            "session": new, "run": src["run"],
-                            "lead": resume_lead(src, delta_block(p, cfg, src["ended"], now))}
+                    lane = {"lane": src["lane"]} if src.get("lane") else {}
+                    lead = lane_lead if lane else resume_lead
+                    return {"how": "resume", "why": src.get("why") or f"run {src['run']}'s session {src['session'][:8]}",
+                            "session": new, "run": src["run"], **lane,
+                            "lead": lead(src, delta_block(p, cfg, src["ended"], now))}
         except Exception as e:   # the coordinator fork, then the disk block, is always tried
             gap = f"resume failed: {type(e).__name__}: {e}"[:200]
         try:

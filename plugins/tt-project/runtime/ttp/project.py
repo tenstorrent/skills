@@ -379,12 +379,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # compacts in place if it must; worker_fork_max_tokens above 0 caps it; a run on another
                     # Claude model forks only about worker_fork_other_model_tokens of its last turns, 0: the
                     # disk block), else "disk" the ledger, its note and worker_chat_chars of chat; "off" neither.
-                    "session": {"compact_tokens": 0, "compact_growth_tokens": 100000,
+                    # worker_lane: a worker task that continues none resumes a related task's run that ended
+                    # within worker_lane_idle_s (ctxfork.lane_source), at most worker_lane_max in a row.
+                    "session": {"compact_tokens": 0, "compact_growth_tokens": 225000,
                                 "context_window_tokens": 0, "compact_margin_tokens": 40000, "compact_min_free": 0.3,
                                 "row_delta": True,
                                 "worker_context": "fork", "worker_fork_max_tokens": 0,
                                 "worker_fork_max_age_h": 12, "worker_fork_other_model_tokens": 8000,
-                                "worker_chat_chars": 8000},
+                                "worker_chat_chars": 8000, "worker_lane": True, "worker_lane_idle_s": 240,
+                                "worker_lane_max": 4},
                     "turn_budget_usd": 1.0,
                     # The most the daemon raises one turn's cap to, once, for a single item that went
                     # over turn_budget_usd alone (0: twice turn_budget_usd); never above the

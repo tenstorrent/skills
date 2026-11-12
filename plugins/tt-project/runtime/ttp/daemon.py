@@ -4008,7 +4008,7 @@ class Daemon:
                     got["lead"] = got["lead"] + "\n\n" + ctxfork.kept_system_lead(append_system)
                 if got.get("lead"):
                     prompt = got["lead"] + "\n\n" + prompt
-                note = {**(note or {}), ctxfork.KEY: {**{k: got[k] for k in ("how", "why", "session", "tokens", "tail", "run", "from", "role_gap")
+                note = {**(note or {}), ctxfork.KEY: {**{k: got[k] for k in ("how", "why", "session", "tokens", "tail", "run", "lane", "from", "role_gap")
                                                          if k in got}, **({"prefix": prefix_by} if prefix_by else {})}}
             elif task and role in ctxfork.ROLES:   # a lost run continued in its own session (_resumable)
                 note = {**(note or {}), ctxfork.KEY: {"how": "resume", "why": "continues its own session",

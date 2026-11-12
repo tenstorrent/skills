@@ -426,6 +426,59 @@ def _fix(p, prev, n):
                          labels=[f"continues:{prev}", f"review_fix:{review}"])
 
 
+def test_a_related_worker_task_resumes_a_recent_runs_session_one_lane_at_a_time_up_to_the_cap(
+        env, monkeypatch, tmp_path):
+    """User 11-12 (no amnesiac workers): a worker task that continues none resumes a copy of the session of
+    a related task's run that ended within worker_lane_idle_s (its cache still warm): one it waits on first.
+    Each source feeds one lane; past worker_lane_max in a row, a stale source, an unrelated task, a
+    review or worker_lane off start from the coordinator's fork as before."""
+    from ttp import coordsession, ctxfork
+    p, d, cfg_dir, _run = _fork_daemon(env, monkeypatch, tmp_path)
+    coord = str(uuid.uuid4())
+    _fork_transcript(cfg_dir, p.base, coord)
+    p.db.set_kv(coordsession.KEY, {"id": coord, "provider": "claude", "context_tokens": 5000})
+    a = p.db.add_task("measure f101", "do it", kind="work", origin="coordinator")
+    s_a = str(uuid.uuid4())
+    _worker_session(cfg_dir, tmp_path / "wt-a", s_a, "f101 measured")
+    r_a = _ok_run(p, a, s_a, ended=time.time() - 30)
+    b = p.db.add_task("act on f101's numbers", "then this", kind="work", origin="coordinator", depends_on=[a])
+    rid_b, argv, prompt, got, session = _start(p, d, b)
+    assert got["how"] == "resume" and got["run"] == r_a and got["lane"] == 1, got
+    assert "waits on it" in got["why"] and argv[argv.index("--resume") + 1] == session != s_a
+    assert prompt.startswith(ctxfork.RESUME_HEAD) and "a related task this project finished minutes ago" in prompt
+    assert prompt.rstrip().endswith("TASK PROMPT")
+    other = p.db.add_task("unrelated", "x", kind="work", origin="coordinator")
+    assert _start(p, d, other)[3]["how"] == "fork"
+    twin = p.db.add_task("also after f101", "x", kind="work", origin="coordinator", depends_on=[a])
+    assert _start(p, d, twin)[3]["how"] == "fork", "a source already carried on feeds one lane only"
+    review = p.db.add_task("Review #x", "review it", kind="review", origin="daemon", depends_on=[a])
+    assert "run" not in _start(p, d, review, "reviewer")[3], "a review never takes a lane"
+    # the lane's next task: depth 2; past worker_lane_max it starts fresh
+    s_b = str(uuid.uuid4())
+    _worker_session(cfg_dir, tmp_path / "wt-b", s_b, "acted")
+    p.db.x("UPDATE runs SET status='ok', ended=?, session_id=? WHERE id=?", (time.time() - 10, s_b, rid_b))
+    c = p.db.add_task("next step", "x", kind="work", origin="coordinator", depends_on=[b])
+    p.set_config("coordinator.session.worker_lane_max", 1)
+    d.cfg = p.config()
+    assert _start(p, d, c)[3]["how"] == "fork", "past worker_lane_max the lane starts fresh"
+    p.set_config("coordinator.session.worker_lane_max", 4)
+    d.cfg = p.config()
+    c2 = p.db.add_task("next step again", "x", kind="work", origin="coordinator", depends_on=[b])
+    got = _start(p, d, c2)[3]
+    assert got["how"] == "resume" and got["lane"] == 2, got
+    # a stale source (its cache is cold) and worker_lane off: no lane
+    old = p.db.add_task("old", "x", kind="work", origin="coordinator")
+    s_old = str(uuid.uuid4())
+    _worker_session(cfg_dir, tmp_path / "wt-old", s_old)
+    _ok_run(p, old, s_old, ended=time.time() - 900)
+    after_old = p.db.add_task("after old", "x", kind="work", origin="coordinator", depends_on=[old])
+    assert _start(p, d, after_old)[3]["how"] == "fork"
+    sib = p.db.add_task("sibling", "x", kind="work", origin="coordinator", parent=a)
+    p.set_config("coordinator.session.worker_lane", False)
+    d.cfg = p.config()
+    assert ctxfork.lane_source(p, d.cfg, sib) is None
+
+
 def test_a_review_fix_resumes_the_code_tasks_session_and_counts_its_hops(env, monkeypatch, tmp_path):
     """#7754 (b): a daemon fix resumes the session of the task it fixes; a later round's fix resumes the
     earlier fix's session, one hop deeper, while within review.hop_max (default 2)."""
