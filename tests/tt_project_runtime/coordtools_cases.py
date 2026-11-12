@@ -751,6 +751,28 @@ def test_deployed_help_a_one_key_config_read_and_plain_awk_count_as_reads():
     assert [c for c in LOOKUP_READS if not coordfix.reads_only(c)] == []
     assert [c for c in LOOKUP_CHANGES if coordfix.reads_only(c)] == []
 
+# macOS status reads the audit still flagged (0.2.1163), and the writing forms beside them.
+STATUS_READS = ["ps -o user=,lstart=,command= -p 123", "ps -ouser= -p 1", "pgrep -o worker", "pmset -g assertions",
+                "pmset -g", "scutil --nc status 'Some VPN'", "scutil --nc list",
+                "cd /x; ps -o user=,command= -p 123; pmset -g assertions | grep -E caffeinate; ttp bridge status | tail -6"]
+STATUS_CHANGES = ["pmset -a sleep 0", "pmset sleepnow", "pmset schedule wake '01/01/30 00:00:00'", "pmset",
+                  "pmset -g > out.txt", "scutil --nc stop 'Some VPN'", "scutil --nc start 'Some VPN'",
+                  "scutil --set HostName x", "scutil", "ps -o user= -p 1; rm -f x", 'python3 -c "print(1)"',
+                  "rm -f x", "launchctl bootout gui/501/x", "ttp upstream --ack abc", "curl -o out.txt u"]
+
+
+def test_ps_format_pmset_g_and_scutil_nc_status_count_as_reads():
+    """ps's -o is an output format, not a file it writes; `pmset -g` and `scutil --nc list|status` only
+    query. Other pmset and scutil forms, inline python (code it cannot prove read-only), a redirect and a
+    real output flag stay changes."""
+    from ttp import coordfix
+    from ttp.sidefx import classify_paths
+    assert [c for c in STATUS_READS if not coordfix.reads_only(c)] == []
+    assert [c for c in STATUS_CHANGES if coordfix.reads_only(c)] == []
+    assert classify_paths("ps -o user= -p 1", "/h", "/", "/") == {}
+    assert classify_paths("curl -o out.txt u", "/h", "/w", "/")["/w/out.txt"][0] == "write"
+
+
 def test_read_only_calls_are_logged_but_never_flagged_for_a_missing_why(env, tmp_path, monkeypatch):
     from ttp import coordfix, coordtools
     p = make(env)

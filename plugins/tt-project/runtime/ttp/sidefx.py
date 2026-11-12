@@ -403,6 +403,7 @@ READERS = {"cat", "head", "tail", "less", "more", "ls", "stat", "wc", "diff", "c
            "find", "test", "[", "jq", "sort", "uniq", "cut", "readlink", "realpath", "du", "tree"} | GREPS | PROGS
 INTERPS = {"python", "python3", "node", "perl", "ruby", "php"}
 OUTPUT_OPTS = {"-o", "--output", "--output-file", "--output-document", "--out"}
+NO_OUTPUT_OPTS = {"ps", "pgrep", "ss", "lsof"}   # their -o is a format or a plain flag, never a file written
 CODE_WRITE_RE = re.compile(r"""open\([^)]*['"][wax]|\.write(?:_text|_bytes)?\(|unlink|remove\(|rmtree|rename\(|"""
                            r"""replace\(|mkdir|chmod|writeFile|appendFile|copyfile|shutil\.(?:copy|move)""")
 
@@ -499,7 +500,7 @@ def classify_paths(cmd: str, home: str, cwd: str, run_dir: str, depth: int = 0) 
         while k < len(args):
             a = args[k]
             flag, _, val = a.partition("=")
-            if flag in OUTPUT_OPTS:
+            if flag in OUTPUT_OPTS and name not in NO_OUTPUT_OPTS:
                 put(val if val else args[k + 1] if k + 1 < len(args) else "", "write", f"{name} {flag}", True)
                 k += 1 if val else 2
                 continue

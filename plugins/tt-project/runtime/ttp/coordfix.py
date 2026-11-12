@@ -244,6 +244,10 @@ def _words_read(w: list[str], depth: int) -> bool:
     name, args = w[0].rsplit("/", 1)[-1], w[1:]
     if name in PLAIN_READS:
         return name != "env" or not args
+    if name == "pmset":   # `pmset -g ...` only queries; every other form changes power settings
+        return args[:1] == ["-g"]
+    if name == "scutil":   # `scutil --nc list|status SVC` only queries; start, stop and --set change
+        return args[:1] == ["--nc"] and args[1:2] in (["list"], ["status"])
     if name == "ss":   # socket listings; -K/--kill closes the sockets it lists
         return not any(a == "--kill" or re.fullmatch(r"-[a-zA-Z]*K[a-zA-Z]*", a) for a in args)
     if name in ("sort",):
