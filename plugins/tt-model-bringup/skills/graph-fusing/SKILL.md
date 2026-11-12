@@ -54,7 +54,8 @@ Find the op and its contract:
 - `tests/ttnn/**` — unit tests give the exact signature, valid shapes, dtypes, and layout constraints.
 
 Find idiomatic usage and existing hand-fused implementations in real models:
-- `models/common/modules/` — reusable, pre-tuned building blocks: `attention/`, `mlp/`, `lm_head/`, `rmsnorm/`, `moe/`, `rope/`, `sampling/`. Prefer these before hand-rolling a sequence.
+- `tt-transformers:src/tt_transformers/modules/` in [tenstorrent/tt-transformers](https://github.com/tenstorrent/tt-transformers) (moved out of tt-metal `models/common/modules`) — reusable, pre-tuned building blocks: `attention/`, `mlp/`, `lm_head/`, `rmsnorm/`, `rope/`, `sampling/`, `embedding/`. Prefer these before hand-rolling a sequence.
+- `models/common/moe/` — shared MoE decode and gate modules (`tt_moe_decode.py`, `tt_moe_gate.py`) with per-model configs.
 - `models/demos/gpt_oss/tt/` — MoE experts on `ttnn.sparse_matmul`, `topk.py`, attention, and CCL wiring.
 - `models/demos/deepseek_v3/tt/` and `models/demos/deepseek_v3_b1/micro_ops/` — MLA attention, MoE gate, LM head, plus a library of custom fused micro-ops (`create_q_heads`, `dram_streaming_matmul`, `deepseek_moe_gate`, fused CCL variants).
 - `models/tt_dit/` — DiT / video models (e.g. Wan): model wiring in `models/tt_dit/models/transformers/wan2_2/`, with shared DiT ops in `models/tt_dit/layers/` (`conv2d`, `conv3d`, `linear`, `normalization`, `feedforward`) and `models/tt_dit/blocks/` (`attention`, `transformer_block`).

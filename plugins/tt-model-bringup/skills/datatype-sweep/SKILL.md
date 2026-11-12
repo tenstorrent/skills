@@ -56,7 +56,7 @@ Start from the completed optimized full model. Run and record the current baseli
 - `run_prefill_check` and `run_teacher_forcing` top-1/top-5/top-100;
 - prefill TTFT and trace-verified teacher-forcing decode t/s/u from the readiness runner, generator metrics, or the model's benchmark harness;
 - the active dtype policy for weights, norms, residual stream, CCL activations, KV cache, logits, sampling, and MoE routing;
-- a teacher-forced natural-text reference beside the readiness reference: real next tokens from long non-repeating text (the readiness book `models/tt_transformers/tests/tale-of-two-cities.txt.bz2`, several hundred positions), scored per position against HF. The readiness reference is an HF-greedy continuation with large margins; a BFP4 MLP policy scored 0.92 to 0.97 top-1 there and 0.82 to 0.85 on 1468 natural-text positions, and the readiness reference alone would have selected it;
+- a teacher-forced natural-text reference beside the readiness reference: real next tokens from long non-repeating text (the readiness book `models/ttt_compat/tests/tale-of-two-cities.txt.bz2`, several hundred positions), scored per position against HF. The readiness reference is an HF-greedy continuation with large margins; a BFP4 MLP policy scored 0.92 to 0.97 top-1 there and 0.82 to 0.85 on 1468 natural-text positions, and the readiness reference alone would have selected it;
 - the baseline measured at least twice, serially, so the run-to-run spread is known before any candidate is ranked.
 
 If an existing reference has fewer than 100 generated tokens, regenerate the main readiness reference with 100 generated tokens unless a concrete model or memory limit prevents it.

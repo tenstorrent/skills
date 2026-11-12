@@ -68,7 +68,9 @@ DEFAULT_THRESHOLDS: Dict[str, float] = {
     "top1_min": 0.98,
     "control_min_window": 64,
 }
-BOOK_RELPATH = Path("models/tt_transformers/tests/tale-of-two-cities.txt.bz2")
+BOOK_RELPATH = Path("models/ttt_compat/tests/tale-of-two-cities.txt.bz2")
+# tt-metal checkouts before the models/tt_transformers -> models/ttt_compat rename.
+LEGACY_BOOK_RELPATH = Path("models/tt_transformers/tests/tale-of-two-cities.txt.bz2")
 CONTROL_NAMES: tuple[str, ...] = ("no_history", "fresh_suffix")
 STATUS_PASS = "pass"
 STATUS_FAIL = "fail"
@@ -277,7 +279,7 @@ def natural_tokens(tokenizer: Any, text: str, length: int) -> List[int]:
 
 def load_natural_text(text_file: Optional[Path], prompts_file: Path) -> str:
     """Long non-repeating text: an explicit file, else the readiness book in the target checkout, else the prompt file."""
-    candidates = [text_file] if text_file else [Path.cwd() / BOOK_RELPATH, prompts_file]
+    candidates = [text_file] if text_file else [Path.cwd() / BOOK_RELPATH, Path.cwd() / LEGACY_BOOK_RELPATH, prompts_file]
     for path in candidates:
         if path is None or not path.is_file():
             continue
@@ -344,7 +346,7 @@ def run_prefill_resume_check(
     record: Dict[str, Any] = {
         "model_dir": str(model_dir),
         "prompt_source": prompt_source,
-        "text_file": str(text_file) if text_file else (str(BOOK_RELPATH) if (Path.cwd() / BOOK_RELPATH).is_file() else str(prompts_file)),
+        "text_file": str(text_file) if text_file else (str(next((p for p in (BOOK_RELPATH, LEGACY_BOOK_RELPATH) if (Path.cwd() / p).is_file()), prompts_file))),
         "lengths": list(lengths),
         "block_sizes": list(block_sizes),
         "sliding_window": sliding_window,

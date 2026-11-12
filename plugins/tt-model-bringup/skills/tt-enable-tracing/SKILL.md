@@ -20,9 +20,9 @@ For the readiness harness, teacher-forcing decode must always use traced decode.
 Read only what helps the current task:
 
 - `tests/ttnn/tracy/test_trace_runs.py`: minimal trace capture/replay examples.
-- `models/tt_transformers/tt/generator.py`: canonical decode trace patterns, including host input preparation, persistent device inputs, replay refresh, and split sampling.
-- `models/common/sampling/generator.py` and `models/common/modules/sampling/sampling_1d.py`: common on-device sampling implementations to compare before choosing a token-out sampling path.
-- `models/tt_transformers/tt/model.py`: model-side `prepare_decode_inputs_host` and device-only `ttnn_decode_forward` split.
+- `models/ttt_compat/tt/generator.py`: canonical decode trace patterns, including host input preparation, persistent device inputs, replay refresh, and split sampling.
+- `models/common/sampling/generator.py` and `tt-transformers:src/tt_transformers/modules/sampling/sampling_1d.py`: common on-device sampling implementations to compare before choosing a token-out sampling path.
+- `models/ttt_compat/tt/model.py`: model-side `prepare_decode_inputs_host` and device-only `ttnn_decode_forward` split.
 - In the target tt-metal checkout, `tech_reports/AdvancedPerformanceOptimizationsForModels/TraceCorrectness.md` ([upstream guide](https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/AdvancedPerformanceOptimizationsForModels/TraceCorrectness.md)): trace correctness requirements and the trace allocation tracker. Read this before accepting a capture/replay path or exempting intentionally shared trace buffers. This guide and the tracker implementation belong to tt-metal, not the installed skill package.
 - `advanced_perf_optimizations.md`: deeper examples for TTNN trace capture/replay, multiple command queues, trace plus multi-CQ, and production benchmarking patterns. Search this file for the API or failure mode you are working on before loading it wholesale.
 
@@ -131,14 +131,14 @@ Build the hot loop so the steady-state step is trace replay plus the minimum cal
 After preparing all model and sampling variants under the warmup contract above, implement token-out traced decode with two cooperating traces:
 
 1. Capture the model decode trace up to sampler-ready logits.
-2. Capture the chosen common sampling implementation, or a correct generator-owned trace wrapper around it, for the active sampling mode. Before choosing, compare `models/common/sampling/` and `models/common/modules/sampling/sampling_1d.py` against the model's state, seed, topology, trace, and logprob requirements.
+2. Capture the chosen common sampling implementation, or a correct generator-owned trace wrapper around it, for the active sampling mode. Before choosing, compare `models/common/sampling/` and `tt-transformers:src/tt_transformers/modules/sampling/sampling_1d.py` against the model's state, seed, topology, trace, and logprob requirements.
 3. Pass `tt_out_tok=<persistent decode token input tensor>` when calling the sampler, so the sampled token is written directly into the tensor consumed by the next decode replay.
 4. Keep current-position/RoPE position state coherent with that token feedback by advancing it on device inside the trace when the model has a fixed-step decode loop. A completed trace does not use host-originated position refresh in the per-token loop.
 5. Refresh page-table trace inputs only when the page table changes, and test both unchanged and changed page-table cases. The unchanged-page-table case should perform no per-token page-table copies after setup.
 6. For greedy decode, keep the sampled token on device and benchmark the available on-device greedy strategies on the target mesh. Force-argmax is only a candidate. Do not select it by default.
 7. Read the chosen common sampler's trace lifetime before counting replays: a sampler that releases its sampling traces when its force-argmax state flips breaks the mode-switch lifetime rule, and explicit per-request seeds can take an eager path. Count traced sampling steps from the sampler's own traced condition, not from the generator's intent.
 
-The canonical pattern is in `models/tt_transformers/tt/generator.py`: capture decode once, bind the model to the same persistent trace inputs that replay refreshes, trace the chosen sampler path, and call sampling with `tt_out_tok` pointing at the decode token input. Untraced sampling hidden inside the model trace is not the canonical token-feedback path.
+The canonical pattern is in `models/ttt_compat/tt/generator.py`: capture decode once, bind the model to the same persistent trace inputs that replay refreshes, trace the chosen sampler path, and call sampling with `tt_out_tok` pointing at the decode token input. Untraced sampling hidden inside the model trace is not the canonical token-feedback path.
 
 The normal split-sampling path for greedy decode must be a semantically greedy path. Do not treat a slower generic sampled `top_k=32` or top-p-capable path as proof that split greedy is slow. If `top_k=1` split sampling fails because a gathered top-k tensor has a non-tile inner dimension, fix the sampler-ready shape by preserving or padding the top-k representation, or keep a minimal repro and leave the stage incomplete.
 

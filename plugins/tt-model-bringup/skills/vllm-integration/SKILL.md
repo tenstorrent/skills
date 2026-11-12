@@ -63,7 +63,7 @@ meets it.
 Read:
 
 - `tech_reports/LLMs/vLLM_integration.md`;
-- `models/tt_transformers/tt/generator_vllm.py`;
+- `models/ttt_compat/tt/generator_vllm.py`;
 - the model's existing `tt/generator.py` low-level `prefill_forward` and `decode_forward` methods.
 
 vLLM owns KV-cache allocation in serving mode. Preserve the generator's two cache ownership modes:
@@ -330,8 +330,8 @@ The README should lead with vLLM sampling status, qualitative verdict, primary s
 | vLLM server integration runner | `${TT_MODEL_BRINGUP_ROOT}/runtime/readiness_check/run_vllm_server.py` |
 | vLLM qualitative prompts | `${TT_MODEL_BRINGUP_ROOT}/runtime/readiness_check/vllm_prompts.txt` |
 | Generator contract | `${TT_MODEL_BRINGUP_ROOT}/runtime/readiness_check/contract.py` |
-| tt_transformers generator | `models/tt_transformers/tt/generator.py` |
-| Thin vLLM adapter | `models/tt_transformers/tt/generator_vllm.py` |
+| ttt_compat (tt_transformers) generator | `models/ttt_compat/tt/generator.py` |
+| Thin vLLM adapter | `models/ttt_compat/tt/generator_vllm.py` |
 | vLLM model registration | Standalone plugin registration; see [stack setup](references/serving-stack.md) |
 | Plugin model interface and capabilities | Pinned plugin checkout, currently `docs/MODEL_INTERFACE.md` and the documents it links |
 | Plugin and vLLM changes | [plugin changes](references/plugin-changes.md) |

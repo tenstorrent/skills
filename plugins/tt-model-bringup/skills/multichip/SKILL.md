@@ -15,7 +15,7 @@ Read and follow `tech_reports/LLMs/llms.md` particularly section 3.3 Multi-Devic
 
 Then carefully read your single-chip baseline code and any reports/documentation it comes with. Identify layer kinds, tested shapes, sequence limits, layouts, precision, cache behavior, trace behavior, and latency.
 
-Choose a strategy for the hardware. For 1D meshes up to 8 chips, start with 1D tensor parallelism. For Galaxy-class meshes, make a model-specific 2D plan. For dense models this may use 2D matmuls. For MoE models, make the routed decode pipeline part of the mesh plan: choose the routing representation, replicated or TP axis, expert mapping, sparse expert weight placement, score-weighted reduce path, and whether the model can afford expert replication across all layers. On non-Galaxy systems, prefer the GPT-OSS-style active-expert path built from `ttnn.sparse_matmul`; do not start from Galaxy-only fused MoE paths unless you have direct evidence that the target hardware and ops support them. If your single-chip code has already been optimized its program configs and shard specs will all be configured for the full weight/tensor sizes. Create a table before coding the final path that shows how each tensor, program config, and shard spec changes under your parallelism scheme. Most rows divide by the TP factor along a mesh dimension. Some rows need implicit or explicit padding.
+Choose a strategy for the hardware. For 1D meshes up to 8 chips, start with 1D tensor parallelism. For Galaxy-class meshes, make a model-specific 2D plan. For dense models this may use 2D matmuls. For MoE models, make the routed decode pipeline part of the mesh plan: choose the routing representation, replicated or TP axis, expert mapping, sparse expert weight placement, score-weighted reduce path, and whether the model can afford expert replication across all layers. Choose EP, TP or hybrid and the batched-decode path with the decision rule in "MoE And Expert Replication" below. If your single-chip code has already been optimized its program configs and shard specs will all be configured for the full weight/tensor sizes. Create a table before coding the final path that shows how each tensor, program config, and shard spec changes under your parallelism scheme. Most rows divide by the TP factor along a mesh dimension. Some rows need implicit or explicit padding.
 
 Recompute the context-length contract when moving to multiple chips. Tensor parallelism changes per-device KV-cache and weight memory. Update `models/autoports/<model>/doc/context_contract.json` with the target mesh, per-device KV-cache bytes, weight bytes, reserved trace/activation buffer estimate, and the largest supported context. Keep the HF-advertised context unless a hard physical device limit prevents it from fitting or running and evidence proves the largest feasible context. Convenience, runtime, profiling cost, or implementation bugs are not valid reasons to reduce advertised capability.
 
@@ -63,15 +63,15 @@ This reference is a compact map of tt-metal model code worth reading before addi
 
 ## Primary Style Recommendation
 
-Prefer the GPT-OSS structured approach and `models/common` TTTv2 modules:
+Prefer the GPT-OSS structured approach and the TTTv2 modules, which now live in [tenstorrent/tt-transformers](https://github.com/tenstorrent/tt-transformers) (moved out of tt-metal `models/common/modules`):
 
 - `models/demos/gpt_oss/config.py`: `ModeConfig`, `MeshConfig`, semantic mapper helpers such as `column_parallel`, `row_parallel`, `sequence_parallel`, and CCL helper methods.
 - `models/demos/gpt_oss/tt/ccl.py`: small generic `CCLManager` with ping-pong semaphores instead of model-specific CCL control flow.
 - `models/demos/gpt_oss/tests/test_factory.py`: target mesh setup, fabric config, and hardware-shape parametrization.
-- `models/common/modules/attention/attention_1d.py`: 1D attention with local heads, paged KV cache, optional fused all-gather plus WO matmul, and reduce-scatter output.
-- `models/common/modules/mlp/mlp_1d.py`: 1D MLP with W1/W3 output sharding, W2 input sharding, and reduce-scatter output.
-- `models/common/modules/rmsnorm/rmsnorm_1d.py` and `rmsnorm_2d.py`: reusable RMSNorm paths, including distributed stats.
-- `models/common/modules/tt_ccl.py`: common CCL semaphores, topology detection, and link-count helpers.
+- `tt-transformers:src/tt_transformers/modules/attention/attention_1d.py`: 1D attention with local heads, paged KV cache, optional fused all-gather plus WO matmul, and reduce-scatter output.
+- `tt-transformers:src/tt_transformers/modules/mlp/mlp_1d.py`: 1D MLP with W1/W3 output sharding, W2 input sharding, and reduce-scatter output.
+- `tt-transformers:src/tt_transformers/modules/rmsnorm/rmsnorm_1d.py` and `rmsnorm_2d.py`: reusable RMSNorm paths, including distributed stats.
+- `models/common/tt_ccl.py`: common CCL semaphores, topology detection, and link-count helpers.
 
 Use these as the first implementation references. If they do not fit the target model, write model-local code in the same structured style: config dataclasses, explicit mesh helpers, setup-time weight conversion, and straight-line runtime forwards.
 
@@ -130,41 +130,56 @@ The distributed RMSNorm primitive pair is:
 
 Use this when hidden activations are sharded across the normalized dimension and local RMSNorm would compute incorrect statistics. The reusable implementations to read are:
 
-- `models/common/modules/rmsnorm/rmsnorm_1d.py::_prefill_1d_distributed`
-- `models/common/modules/rmsnorm/rmsnorm_2d.py::decode_forward`
-- `models/common/modules/rmsnorm/rmsnorm_2d.py::prefill_forward`
+- `tt-transformers:src/tt_transformers/modules/rmsnorm/rmsnorm_1d.py` `_prefill_1d_distributed`
+- `tt-transformers:src/tt_transformers/modules/rmsnorm/rmsnorm_2d.py` `decode_forward`
+- `tt-transformers:src/tt_transformers/modules/rmsnorm/rmsnorm_2d.py` `prefill_forward`
 - `models/demos/deepseek_v3/tt/rms_norm/distributed_rms_norm.py::DistributedRMSNorm`
-- `models/tt_transformers/tt/ccl.py::tt_distributed_rmsnorm`
-- `models/tt_transformers/tt/ccl.py::tt_sharded_distributed_rmsnorm`
+- `models/ttt_compat/tt/ccl.py::tt_distributed_rmsnorm`
+- `models/ttt_compat/tt/ccl.py::tt_sharded_distributed_rmsnorm`
 
 Do not phrase distributed RMSNorm as always mandatory. Correct RMSNorm is mandatory. A faster replicated-activation stream plus local RMSNorm is acceptable if it preserves the decoder chain layout and improves measured performance.
 
 ## MoE And Expert Replication
 
-For TP up to 8 devices, the default is to run each active expert selected by the gate with tensor parallelism. Keep the gate-selected active-expert path from the single-chip baseline; do not run every expert densely as the final path unless there is no practical alternative.
+Keep the gate-selected active-expert path from the single-chip baseline. Do not run every expert densely as the final path unless measurement proves it faster.
 
-For routed MoE decode on non-Galaxy systems, use the GPT-OSS generic experts path as the first reference. The important pattern is router/top-k scores as a sparsity tensor, `ttnn.sparse_matmul` for gate/up/down active-expert projections, score weighting, `ttnn.sum` or the model-appropriate reduce over experts, and only then any required TP/EP collective. Read these files first:
+### Expert layout decision rule
 
-- `models/demos/gpt_oss/tt/experts/README.md`
-- `models/demos/gpt_oss/tt/experts/decode.py`
-- `models/demos/gpt_oss/tt/experts/prefill.py`
-- `models/demos/gpt_oss/tt/experts/weights.py`
-- `models/demos/gpt_oss/tt/experts/config.py`
-- `models/demos/gpt_oss/tt/topk.py`
-- `models/demos/gpt_oss/tests/unit/test_modules.py`
+Compute these from the HF config and write them in `mesh_plan.md`: expert count `E`, top-k `k`, expert intermediate `I`, TP width per chip `I/TP` in 32-wide tiles, and the decode batch `B` the server will run.
 
-Treat expert mapping, routing-weight layout, shared expert placement, sparse weight layout, DRAM/L1 memory configs, semaphores/preallocated buffers, and final residual layout as correctness contracts. A multi-chip MoE path is not done just because the gate and expert MLPs pass separately; validate the router -> sparse expert projection -> score weighting -> expert reduce -> TP/EP collective sequence.
+- Many narrow experts (`I/TP` below about 8 tiles, or `E >= 64`): keep whole experts per chip (expert parallel, EP). TP slices that narrow give few-core matmuls and poor DRAM streaming. Batch-1 load-balance arguments are not a reason to reject EP.
+- Few wide experts (Mixtral or GPT-OSS shapes): TP of each active expert is fine.
+- Hybrid is fine: EP for prefill plus indexed TP (`sparse_matmul` with per-token `indices`) at batch 1.
 
-For Galaxy 4x8 MoE only, GPT-OSS also has throughput-experts code worth reading:
+These thresholds are defaults. Record the computed values and the measured result if you depart from them.
 
-- `models/demos/gpt_oss/tt/experts_throughput/config.py`
-- `models/demos/gpt_oss/tt/experts_throughput/weights.py`
-- `models/demos/gpt_oss/tt/experts_throughput/decode.py`
-- `models/demos/gpt_oss/tt/experts_throughput/fused_decode.py`
+### Batched decode
 
-The interesting GPT-OSS strategy is to dispatch tokens to expert owners along one axis while using the other axis as replicated expert groups / TP groups for single-user throughput. Only accept this strategy if `memory_capacity_plan.json` proves enough DRAM for all model layers plus full KV cache on the target max sequence length, not just the current decoder layer.
+At `B > 1`, compute the expected union of selected experts per layer, `u = 1 - (1 - k/E)^B` (the fraction of all experts any row selects). When `u` exceeds about 25%, do not use a union-masked `sparse_matmul` over all experts: it computes every touched expert for every row and adds full `[E, B, H]` mask and weight ops. Route each token to its own experts instead:
 
-If expert replication does not fit, document the alternative: ordinary TP active experts, 2D TP, expert parallel without replication, or a hybrid. Record the rejected strategy and evidence.
+`ttnn.experimental.deepseek_prefill` dispatch -> `moe_fused_swiglu` -> combine -> `post_combine_reduce`
+
+These ops work on a 1x4 Blackhole mesh with a single-device dispatch group since tt-metal #60445. The same path serves prefill. Keep a separate indexed batch-1 path and trace when it is faster for a lone request.
+
+### Reference implementations (QB2, 1x4 Blackhole)
+
+- `models/demos/blackhole/qwen36/tt/moe/`: EP, `sparse_matmul` decode/prefill, `reduce_scatter` into the hidden-sharded residual.
+- `models/demos/gemma4_26b_a4b_qb2/tt/multichip_decoder.py`: hybrid EP prefill plus indexed TP decode.
+- `models/autoports/aleph_alpha_kolibri_1_bf16/tt/multichip_decoder.py`: EP weights, token-grouped dispatch / fused SwiGLU / combine for prefill and batched decode, indexed batch-1 path.
+- `models/demos/gpt_oss/tt/experts/` and `models/demos/gpt_oss/tt/topk.py`: TP active experts for few wide experts. `models/demos/gpt_oss/tt/experts_throughput/` is the Galaxy 4x8 variant; accept expert replication only if `memory_capacity_plan.json` proves DRAM for all layers plus full KV cache.
+
+Evidence: on Kolibri-1 (384 experts, top-6, I=512) moving from TP plus union-masked decode to EP plus grouped decode took 1 user on the 32-slot server from 114 to 57 ms per token; on K2-MoVA EP decode took a 32-user step from 62 to 41 ms.
+
+### Prefill chunk and router precision
+
+- Default the MoE prefill chunk to 2048 tokens and align the prefill buckets to it. Do not pad a 1024 chunk into a 2048 bucket.
+- Compute router logits in fp32; BF16 is fine after top-k. Do not chase bit-exact top-k tie order against Torch: accept top-1 flips that occur only on near-ties and record them.
+
+### Correctness and evidence
+
+Treat expert mapping, routing-weight layout, shared-expert placement, expert weight layout, memory configs, semaphores and preallocated buffers, and the final residual layout as correctness contracts. Validate the whole router -> expert compute -> score weighting -> expert reduce -> collective sequence, not the gate and experts separately.
+
+Stage 5 must report decode at batch 1 and at the largest batch the server will run, with realistic, diverse routing (real prompts, not the same token in every row), plus the MoE share of the decode step. Record the rejected layouts with their evidence.
 
 ## 2D Mesh Planning
 
