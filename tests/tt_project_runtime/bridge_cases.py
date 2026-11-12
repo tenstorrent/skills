@@ -276,6 +276,251 @@ def test_bridge_relay_carries_one_connection_and_exits_with_its_session(monkeypa
     assert rc == 7 and not (tmp_path / "d" / "x.sock").exists()
 
 
+
+def _relay_dir(request):
+    import shutil
+    import tempfile
+    # a short folder: macOS's per-user temp path makes a unix socket path too long
+    d = Path(tempfile.mkdtemp(prefix="br", dir="/tmp"))
+    request.addfinalizer(lambda: shutil.rmtree(d, ignore_errors=True))
+    return d
+
+
+def _relay_echo_upstream(monkeypatch, bridge_relay):
+    """bound_connect reaches a local echo server instead of a host; returns the upstream sockets it accepted."""
+    import socket
+    import threading
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(8)
+    port = srv.getsockname()[1]
+    ups = []
+
+    def serve():
+        while True:
+            try:
+                c, _ = srv.accept()
+            except OSError:
+                return
+            ups.append(c)
+
+            def echo(c=c):
+                try:
+                    while True:
+                        b = c.recv(64)
+                        if not b:
+                            return
+                        c.sendall(b)
+                except OSError:
+                    pass
+
+            threading.Thread(target=echo, daemon=True).start()
+
+    threading.Thread(target=serve, daemon=True).start()
+    monkeypatch.setattr(bridge_relay, "bound_connect",
+                        lambda host, iface: socket.create_connection(("127.0.0.1", port)))
+    return srv, ups
+
+
+def _relay_roundtrip(path, payload=b"ping"):
+    import socket
+    c = socket.socket(socket.AF_UNIX)
+    c.settimeout(5)
+    c.connect(path)
+    c.sendall(payload)
+    data = b""
+    while len(data) < len(payload):
+        chunk = c.recv(64)
+        if not chunk:
+            break
+        data += chunk
+    c.close()
+    return data
+
+
+def test_bridge_relay_keeps_accepting_after_running_out_of_descriptors(monkeypatch, request):
+    # cells: emfile-retry
+    import errno
+    import socket
+    from ttp import bridge_relay
+    d = _relay_dir(request)
+    _relay_echo_upstream(monkeypatch, bridge_relay)
+    monkeypatch.setattr(bridge_relay, "ACCEPT_BACKOFF_MAX_S", 0.05)
+    fails = {"n": 3}
+
+    class Starved(socket.socket):
+        def accept(self):
+            if fails["n"]:
+                fails["n"] -= 1
+                raise OSError(errno.EMFILE, "Too many open files")
+            return super().accept()
+
+    path = str(d / "h.sock")
+    lst = bridge_relay.listen(path, "10.0.0.2", "vpn0", sock=Starved)
+    request.addfinalizer(lambda: lst.close(unlink=True))
+    assert _relay_roundtrip(path, b"one") == b"one"
+    assert fails["n"] == 0 and lst.thread.is_alive() and lst.problem() == ""
+    assert _relay_roundtrip(path, b"two") == b"two"   # a later connection is carried too
+
+
+def test_bridge_relay_closes_both_sockets_when_the_upstream_goes_silent(monkeypatch, request):
+    # cells: bounded-close
+    import socket
+    import threading
+    import time
+    from ttp import bridge_relay
+    monkeypatch.setattr(bridge_relay, "DRAIN_S", 0.3)
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    request.addfinalizer(srv.close)
+    port = srv.getsockname()[1]
+    made = []
+
+    def connect(host, iface):
+        made.append(socket.create_connection(("127.0.0.1", port)))
+        return made[-1]
+
+    monkeypatch.setattr(bridge_relay, "bound_connect", connect)
+    a, b = socket.socketpair()
+    t = threading.Thread(target=bridge_relay._handle, args=(b, "10.0.0.2", "vpn0"), daemon=True)
+    t.start()
+    up, _ = srv.accept()   # a peer that takes the connection and never answers or closes
+    request.addfinalizer(up.close)
+    a.sendall(b"hello")
+    a.close()   # the client is done; the upstream stays silent
+    t.join(5)
+    assert not t.is_alive()   # without the bound it waits on the silent peer forever
+    assert b.fileno() == -1 and made[0].fileno() == -1   # both relay descriptors closed
+    up.settimeout(2)
+    got = b""
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 2:
+        try:
+            chunk = up.recv(64)
+        except OSError:
+            break
+        if not chunk:
+            break
+        got += chunk
+    assert got == b"hello"
+
+
+def test_bridge_relay_upstream_gets_keepalive():
+    # cells: keepalive
+    import socket
+    from ttp import bridge_relay
+    s = socket.socket()
+    try:
+        bridge_relay.keepalive(s)
+        assert s.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE)
+        if hasattr(socket, "TCP_KEEPIDLE"):
+            assert s.getsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE) == bridge_relay.KEEPALIVE[0]
+        if hasattr(socket, "TCP_KEEPCNT"):
+            assert s.getsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT) == bridge_relay.KEEPALIVE[2]
+    finally:
+        s.close()
+
+
+def test_bridge_relay_supervisor_relistens_a_lost_listener(monkeypatch, request):
+    # cells: relisten-file-gone, relisten-file-replaced, relisten-accept-ended
+    import socket
+    from ttp import bridge_relay
+    d = _relay_dir(request)
+    _relay_echo_upstream(monkeypatch, bridge_relay)
+    path = str(d / "h.sock")
+    lst = bridge_relay.listen(path, "10.0.0.2", "vpn0")
+    request.addfinalizer(lambda: lst.close(unlink=True))
+    fails = {}
+    assert bridge_relay.supervise_once([lst], fails) and lst.problem() == ""
+    os.unlink(path)   # the socket file is gone: forwards get "No such file"
+    assert lst.problem() == "its socket file is gone"
+    assert bridge_relay.supervise_once([lst], fails) and lst.problem() == ""
+    assert _relay_roundtrip(path) == b"ping"
+    os.unlink(path)   # replaced by another socket: forwards reach no relay
+    other = socket.socket(socket.AF_UNIX)
+    other.bind(path)
+    other.close()
+    assert lst.problem() == "its socket file was replaced"
+    assert bridge_relay.supervise_once([lst], fails) and lst.problem() == ""
+    assert _relay_roundtrip(path) == b"ping"
+    old = lst.thread
+    lst.srv.shutdown(socket.SHUT_RDWR)   # the accept loop ends on an error it does not retry
+    old.join(5)
+    assert not old.is_alive() and lst.problem() in ("its accept loop ended", "its socket is closed")
+    assert bridge_relay.supervise_once([lst], fails) and lst.problem() == "" and lst.thread is not old
+    assert _relay_roundtrip(path) == b"ping" and fails == {}
+
+
+def test_bridge_relay_exits_after_two_failed_relistens(monkeypatch, request):
+    # cells: relisten-gives-up, relay-lost-exit
+    import socket
+    import threading
+    from ttp import bridge_relay
+    d = _relay_dir(request)
+    path = str(d / "h.sock")
+    lst = bridge_relay.listen(path, "10.0.0.2", "vpn0")
+    request.addfinalizer(lambda: lst.close(unlink=True))
+
+    class NoBind(socket.socket):
+        def bind(self, addr):
+            raise OSError(98, "Address in use")
+
+    lst.sock = NoBind
+    os.unlink(path)
+    fails = {}
+    assert bridge_relay.supervise_once([lst], fails) and fails == {path: 1}
+    assert not bridge_relay.supervise_once([lst], fails)   # the second failure in a row gives up
+    lost = []
+    lst2 = bridge_relay.Listener(str(d / "g.sock"), "10.0.0.2", "vpn0", sock=NoBind)
+    monkeypatch.setattr(bridge_relay, "SUPERVISE_S", 0.01)
+    stop = threading.Event()
+    bridge_relay.supervise([lst2], stop, lambda: lost.append(1))
+    assert lost == [1]
+    # main: a listener that cannot be restored ends the session and exits RELAY_LOST for a restart
+    real = bridge_relay.listen
+
+    def listen(path, host, iface):
+        x = real(path, host, iface)
+        x.sock = NoBind
+        os.unlink(path)
+        return x
+
+    monkeypatch.setattr(bridge_relay, "listen", listen)
+    rc = bridge_relay.main([str(d / "m"), "x=10.0.0.3%vpn0", "--", sys.executable, "-c", "import time; time.sleep(30)"])
+    assert rc == bridge_relay.RELAY_LOST and not (d / "m" / "x.sock").exists()
+
+
+def test_bridge_relay_raises_its_open_file_limit_within_the_hard_limit():
+    # cells: nofile-raise, nofile-hard-lower, nofile-unlimited, nofile-refused
+    from ttp import bridge_relay
+
+    class RL:
+        RLIMIT_NOFILE, RLIM_INFINITY = 7, -1
+
+        def __init__(self, soft, hard, refuse=False):
+            self.lim, self.refuse, self.set = (soft, hard), refuse, []
+
+        def getrlimit(self, which):
+            return self.lim
+
+        def setrlimit(self, which, lim):
+            if self.refuse:
+                raise ValueError("not allowed")
+            self.set.append(lim)
+
+    rl = RL(256, 1 << 20)
+    assert bridge_relay.raise_nofile(rl=rl) == 4096 and rl.set == [(4096, 1 << 20)]
+    rl = RL(256, 1024)
+    assert bridge_relay.raise_nofile(rl=rl) == 1024 and rl.set == [(1024, 1024)]
+    rl = RL(1024, 1024)   # the hard limit is not above the soft one: nothing to raise
+    assert bridge_relay.raise_nofile(rl=rl) == 1024 and rl.set == []
+    rl = RL(256, RL.RLIM_INFINITY)
+    assert bridge_relay.raise_nofile(rl=rl) == 4096 and rl.set == [(4096, RL.RLIM_INFINITY)]
+    rl = RL(8192, 1 << 20)   # already higher: left alone
+    assert bridge_relay.raise_nofile(rl=rl) == 8192 and rl.set == []
+    assert bridge_relay.raise_nofile(rl=RL(256, 1024, refuse=True)) == 256   # refused: never fails
+
 # --- offline mode: short-lived certificates (`ttp bridge cert`, bridge_cert.py) ------------------
 # A stub ssh-keygen and ssh on PATH: no key is made, nothing is signed for real, no host is reached.
 # The stub "box" is a folder used as HOME by `sh -c <script>`; a stub certificate carries its

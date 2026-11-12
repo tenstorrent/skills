@@ -44,6 +44,7 @@ in a row, 30 s apart), the session reconnects after 5, 20, then 60 s; a fourth d
 """
 from __future__ import annotations
 
+import errno
 import os
 import re
 import secrets
@@ -59,6 +60,15 @@ import time
 IP_BOUND_IF = 25      # macOS <netinet/in.h>
 IPV6_BOUND_IF = 125   # macOS <netinet6/in6.h>
 SO_BINDTODEVICE = 25  # Linux <asm-generic/socket.h>
+TCP_KEEPALIVE_DARWIN = 0x10   # macOS <netinet/tcp.h>: the idle time before the first probe
+KEEPALIVE = (60, 15, 4)   # idle s, probe interval s, probes: a vanished peer is reset in about 2 min
+DRAIN_S = 30.0   # once one direction of a carried connection ends, the other gets this long
+ACCEPT_RETRY = {errno.EMFILE, errno.ENFILE, errno.ENOBUFS, errno.ENOMEM, errno.ECONNABORTED, errno.EINTR}
+ACCEPT_BACKOFF_MAX_S = 1.0
+SUPERVISE_S = 30.0   # how often each listener is checked
+RELISTEN_TRIES = 2   # failed re-listens in a row before the relay exits for a restart
+RELAY_LOST = 6   # the exit when a listener cannot be restored
+NOFILE_WANT = 4096
 
 
 def parse_spec(spec: str) -> tuple[str, str, str]:
@@ -86,11 +96,30 @@ def bound_connect(host: str, iface: str, port: int = 22, timeout: float = 15) ->
             s.settimeout(timeout)
             s.connect(addr)
             s.settimeout(None)
+            keepalive(s)
             return s
         except OSError as e:
             err = e
             s.close()
     raise err
+
+
+def keepalive(s: socket.socket, platform: str | None = None) -> None:
+    """Short TCP keepalive probes, each option only where the platform has it (never fails)."""
+    idle_opt = getattr(socket, "TCP_KEEPIDLE", None)
+    if idle_opt is None and (platform or sys.platform) == "darwin":
+        idle_opt = getattr(socket, "TCP_KEEPALIVE", TCP_KEEPALIVE_DARWIN)
+    idle, intvl, cnt = KEEPALIVE
+    for level, opt, val in ((socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+                            (socket.IPPROTO_TCP, idle_opt, idle),
+                            (socket.IPPROTO_TCP, getattr(socket, "TCP_KEEPINTVL", None), intvl),
+                            (socket.IPPROTO_TCP, getattr(socket, "TCP_KEEPCNT", None), cnt)):
+        if opt is None:
+            continue
+        try:
+            s.setsockopt(level, opt, val)
+        except OSError:
+            pass
 
 
 def _pump(src: socket.socket, dst: socket.socket) -> None:
@@ -109,19 +138,46 @@ def _pump(src: socket.socket, dst: socket.socket) -> None:
             pass
 
 
-def _handle(conn: socket.socket, host: str, iface: str) -> None:
-    try:
-        up = bound_connect(host, iface)
-    except OSError as e:
-        print(f"ttp bridge relay: {host} over {iface}: {e}", file=sys.stderr, flush=True)
-        conn.close()
+def _close(s: socket.socket | None) -> None:
+    """Shut down, then close: a shutdown also wakes a recv blocked on it in another thread."""
+    if s is None:
         return
-    t = threading.Thread(target=_pump, args=(up, conn), daemon=True)
-    t.start()
-    _pump(conn, up)
-    t.join()
-    conn.close()
-    up.close()
+    try:
+        s.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    try:
+        s.close()
+    except OSError:
+        pass
+
+
+def _handle(conn: socket.socket, host: str, iface: str) -> None:
+    up = None
+    try:
+        try:
+            up = bound_connect(host, iface)
+        except OSError as e:
+            print(f"ttp bridge relay: {host} over {iface}: {e}", file=sys.stderr, flush=True)
+            return
+        ended = threading.Event()
+
+        def pump(src: socket.socket, dst: socket.socket) -> None:
+            try:
+                _pump(src, dst)
+            finally:
+                ended.set()
+
+        ts = [threading.Thread(target=pump, args=pair, daemon=True) for pair in ((up, conn), (conn, up))]
+        for t in ts:
+            t.start()
+        ended.wait()
+        deadline = time.monotonic() + DRAIN_S
+        for t in ts:
+            t.join(max(0.0, deadline - time.monotonic()))
+    finally:
+        _close(conn)
+        _close(up)
 
 
 def private_dir(d: str) -> bool:
@@ -138,27 +194,140 @@ def private_dir(d: str) -> bool:
     return st.st_mode & 0o777 == 0o700
 
 
-def listen(path: str, host: str, iface: str) -> socket.socket:
-    if os.path.lexists(path):
-        os.unlink(path)
-    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    old = os.umask(0o177)
-    try:
-        srv.bind(path)
-    finally:
-        os.umask(old)
-    srv.listen(16)
+class Listener:
+    """One relay socket: <path> carried to host:22 over iface, kept listening (see supervise)."""
 
-    def accept() -> None:
+    def __init__(self, path: str, host: str, iface: str, sock=socket.socket):
+        self.path, self.host, self.iface, self.sock = path, host, iface, sock
+        self.srv: socket.socket | None = None
+        self.ino = 0
+        self.thread: threading.Thread | None = None
+        self.closing = False
+
+    def start(self) -> None:
+        if os.path.lexists(self.path):
+            os.unlink(self.path)
+        srv = self.sock(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            old = os.umask(0o177)
+            try:
+                srv.bind(self.path)
+            finally:
+                os.umask(old)
+            srv.listen(16)
+            self.ino = os.lstat(self.path).st_ino
+        except OSError:
+            srv.close()
+            raise
+        self.srv = srv
+        self.thread = threading.Thread(target=self._accept, args=(srv,), daemon=True)
+        self.thread.start()
+
+    def _accept(self, srv: socket.socket) -> None:
+        delay = 0.0
         while True:
             try:
                 conn, _ = srv.accept()
-            except OSError:
-                return
-            threading.Thread(target=_handle, args=(conn, host, iface), daemon=True).start()
+            except OSError as e:
+                if self.closing or srv is not self.srv or srv.fileno() == -1:
+                    return   # closed on purpose, or replaced by a re-listen
+                if e.errno not in ACCEPT_RETRY:
+                    print(f"ttp bridge relay: {self.path}: accept failed ({e}); re-listening",
+                          file=sys.stderr, flush=True)
+                    return   # the supervisor re-listens
+                if not delay:
+                    print(f"ttp bridge relay: {self.path}: accept failed ({e}); retrying",
+                          file=sys.stderr, flush=True)
+                delay = min(ACCEPT_BACKOFF_MAX_S, delay * 2 or 0.05)
+                time.sleep(delay)
+                continue
+            delay = 0.0
+            try:
+                threading.Thread(target=_handle, args=(conn, self.host, self.iface), daemon=True).start()
+            except RuntimeError as e:   # no thread to carry it: refuse this one, keep listening
+                print(f"ttp bridge relay: {self.path}: {e}", file=sys.stderr, flush=True)
+                _close(conn)
 
-    threading.Thread(target=accept, daemon=True).start()
-    return srv
+    def problem(self) -> str:
+        """Why this listener no longer takes connections, or ''."""
+        if self.srv is None or self.srv.fileno() == -1:
+            return "its socket is closed"
+        if self.thread is None or not self.thread.is_alive():
+            return "its accept loop ended"
+        try:
+            st = os.lstat(self.path)
+        except OSError:
+            return "its socket file is gone"
+        if not stat.S_ISSOCK(st.st_mode) or st.st_ino != self.ino:
+            return "its socket file was replaced"
+        return ""
+
+    def close(self, unlink: bool = False) -> None:
+        self.closing = unlink or self.closing
+        srv, self.srv = self.srv, None
+        _close(srv)
+        if unlink:
+            try:
+                if os.lstat(self.path).st_ino == self.ino:
+                    os.unlink(self.path)
+            except OSError:
+                pass
+
+
+def listen(path: str, host: str, iface: str, sock=socket.socket) -> Listener:
+    lst = Listener(path, host, iface, sock)
+    lst.start()
+    return lst
+
+
+def supervise_once(listeners: list[Listener], fails: dict) -> bool:
+    """Check each listener and re-listen a broken one; False once one failed RELISTEN_TRIES re-listens in a row."""
+    for lst in listeners:
+        why = lst.problem()
+        if not why:
+            fails.pop(lst.path, None)
+            continue
+        lst.close()
+        try:
+            lst.start()
+        except OSError as e:
+            fails[lst.path] = fails.get(lst.path, 0) + 1
+            print(f"ttp bridge relay: {lst.path}: {why}; re-listening failed ({e})", file=sys.stderr, flush=True)
+            if fails[lst.path] >= RELISTEN_TRIES:
+                return False
+            continue
+        fails.pop(lst.path, None)
+        print(f"ttp bridge relay: {lst.path}: {why}; listening again", file=sys.stderr, flush=True)
+    return True
+
+
+def supervise(listeners: list[Listener], stop: threading.Event, lost) -> None:
+    """Every SUPERVISE_S until stop: restore broken listeners; call lost() when one cannot be restored."""
+    fails: dict = {}
+    while not stop.wait(SUPERVISE_S):
+        if not supervise_once(listeners, fails):
+            print(f"ttp bridge relay: a listener could not be restored {RELISTEN_TRIES} times in a row; exiting "
+                  "(the service restarts the relay)", file=sys.stderr, flush=True)
+            lost()
+            return
+
+
+def raise_nofile(want: int = NOFILE_WANT, rl=None) -> int | None:
+    """Raise the soft open-file limit to min(hard, want); the soft limit after, None where unknown. Never fails."""
+    try:
+        if rl is None:
+            import resource as rl
+        soft, hard = rl.getrlimit(rl.RLIMIT_NOFILE)
+    except (ImportError, OSError, ValueError):
+        return None
+    target = want if hard == rl.RLIM_INFINITY else min(hard, want)
+    if soft != rl.RLIM_INFINITY and soft < target:
+        try:
+            rl.setrlimit(rl.RLIMIT_NOFILE, (target, hard))
+            return target
+        except (OSError, ValueError):
+            pass
+    return soft
 
 
 FORWARD_FAILED = "remote port forwarding failed"
@@ -292,6 +461,8 @@ def session(ssh: list[str], state: dict) -> tuple[int, bool]:
     """Run one session, passing its stderr through; (exit code, whether a forward failed)."""
     child = subprocess.Popen(ssh, stderr=subprocess.PIPE)
     state["child"] = child
+    if state["stop"]:
+        child.terminate()
     failed = False
     for raw in child.stderr:
         sys.stderr.buffer.write(raw)
@@ -356,13 +527,12 @@ def main(argv: list[str], platform: str | None = None, awake_spawn=None) -> int:
         print(f"bridge_relay: {d} is not a private directory of this account (its own, 700, not a symlink)",
               file=sys.stderr)
         return 4
-    paths = []
+    raise_nofile()
+    listeners: list[Listener] = []   # kept referenced for the life of the relay
     for spec in specs:
         name, host, iface = parse_spec(spec)
-        path = os.path.join(d, name + ".sock")
-        listen(path, host, iface)
-        paths.append(path)
-    state: dict = {"stop": False, "child": None}
+        listeners.append(listen(os.path.join(d, name + ".sock"), host, iface))
+    state: dict = {"stop": False, "child": None, "lost": False}
     awake = hold_awake(platform, awake_spawn) if keep else None
 
     def end(signum, _frame):
@@ -370,45 +540,58 @@ def main(argv: list[str], platform: str | None = None, awake_spawn=None) -> int:
         if state["child"] is not None:
             state["child"].terminate()
 
+    def lost():
+        state["lost"] = True
+        end(None, None)
+
     signal.signal(signal.SIGTERM, end)
     signal.signal(signal.SIGINT, end)
+    stop = threading.Event()
+    if listeners:
+        threading.Thread(target=supervise, args=(listeners, stop, lost), daemon=True).start()
     try:
-        if not tag:
-            state["child"] = subprocess.Popen(ssh)
-            return state["child"].wait()
-        prefix, ports, cleaned, dead = f"{computer_id(d)}/{tag}/", forward_ports(ssh), False, 0
-        while True:
-            t0 = time.monotonic()
-            rc, failed = session(tagged(ssh, prefix + secrets.token_hex(4)), state)
-            if time.monotonic() - t0 >= STEADY_S:
-                cleaned = False
-            if time.monotonic() - t0 >= AGENT_STEADY_S:
-                dead = 0
-            if rc == AGENT_DEAD and not state["stop"]:
-                if dead >= len(AGENT_RETRY_S):
-                    print("ttp bridge: the forwarded agent died again after each reconnect; exiting (the service "
-                          "restarts the session)", file=sys.stderr, flush=True)
-                    return rc
-                print(f"ttp bridge: the forwarded agent stopped answering; reconnecting in {AGENT_RETRY_S[dead]}s",
-                      file=sys.stderr, flush=True)
-                wait(AGENT_RETRY_S[dead], state)
-                dead += 1
-                continue
-            if state["stop"] or rc != 255 or not failed or not ports:
-                return rc
-            if cleaned:
-                print("ttp bridge: a reverse forward failed again right after the cleanup; exiting",
-                      file=sys.stderr, flush=True)
-                return rc
-            clean(ssh, prefix, ports)
-            cleaned = True
+        rc = run(ssh, tag, d, state)
+        return RELAY_LOST if state["lost"] else rc
     finally:
+        stop.set()
         release_awake(awake)
-        for p in paths:
-            try:
-                os.unlink(p)
-            except OSError:
-                pass
+        for lst in listeners:
+            lst.close(unlink=True)
+
+
+def run(ssh: list[str], tag: str, d: str, state: dict) -> int:
+    """The session (with --tag, its stale-session and dead-agent recovery) until it ends or is stopped."""
+    if not tag:
+        state["child"] = subprocess.Popen(ssh)
+        if state["stop"]:
+            state["child"].terminate()
+        return state["child"].wait()
+    prefix, ports, cleaned, dead = f"{computer_id(d)}/{tag}/", forward_ports(ssh), False, 0
+    while True:
+        t0 = time.monotonic()
+        rc, failed = session(tagged(ssh, prefix + secrets.token_hex(4)), state)
+        if time.monotonic() - t0 >= STEADY_S:
+            cleaned = False
+        if time.monotonic() - t0 >= AGENT_STEADY_S:
+            dead = 0
+        if rc == AGENT_DEAD and not state["stop"]:
+            if dead >= len(AGENT_RETRY_S):
+                print("ttp bridge: the forwarded agent died again after each reconnect; exiting (the service "
+                      "restarts the session)", file=sys.stderr, flush=True)
+                return rc
+            print(f"ttp bridge: the forwarded agent stopped answering; reconnecting in {AGENT_RETRY_S[dead]}s",
+                  file=sys.stderr, flush=True)
+            wait(AGENT_RETRY_S[dead], state)
+            dead += 1
+            continue
+        if state["stop"] or rc != 255 or not failed or not ports:
+            return rc
+        if cleaned:
+            print("ttp bridge: a reverse forward failed again right after the cleanup; exiting",
+                  file=sys.stderr, flush=True)
+            return rc
+        clean(ssh, prefix, ports)
+        cleaned = True
 
 
 if __name__ == "__main__":
