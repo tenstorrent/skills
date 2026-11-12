@@ -122,12 +122,19 @@ def test_pool_shard_time_before_its_first_file_is_a_test_pool_wait_not_run_time_
                                 env={**os.environ, "PYTHONPATH": str(RUNTIME), "TTP_HOME": str(tmp_path / "home"),
                                      checkwait.ENV: str(waits)})
         said = []
-        return push._timed_wait(proc, waits, name, said.append), "\n".join(said)
+        t0 = time.monotonic()
+        rc = push._timed_wait(proc, waits, name, said.append)
+        took[0] = time.monotonic() - t0
+        return rc, "\n".join(said)
 
+    took = [0.0]
     rc, said = check("under", 2, 30.0)
     assert rc == 0, said
     assert re.search(r"check waiting for a test-pool slot: \d+ s so far, not counted as run time", said), said
-    assert re.search(r"check waited [12] s for a test-pool slot, not counted as run time", said), said
+    # The wait is the shard's 2 s queue plus its process start, which a loaded host stretches: at least the
+    # queue, at most the whole call.
+    waited = re.search(r"check waited (\d+) s for a test-pool slot, not counted as run time", said)
+    assert waited and 1 <= int(waited[1]) <= took[0] + 1, (took, said)
     rc, said = check("past", 4, 2.0)
     assert rc == push.POOL_BUSY, said
     assert "check still waiting for a test-pool slot at its limit of 2 s and was ended, busy, not failed" in said

@@ -823,7 +823,13 @@ def test_listen_never_marks_an_alert_still_waiting_for_its_batch_read(env, monke
     alert = p.db.post("out", "disk nearly full", kind="alert")
     ppid = [os.getppid()]
     monkeypatch.setattr(cli.os, "getppid", lambda: ppid[0])
-    _fake_clock(cli, monkeypatch, on_nap=lambda n: ppid.__setitem__(0, -1))
+
+    def parent_gone(n):
+        # time.sleep is patched process-wide: a nap of another thread (a leaked probe starter) or of a busy-db
+        # retry before the loop's first pass must not end the listener before it marks anything read.
+        if sys._getframe(2).f_code.co_name == "_listen_loop":   # on_nap <- nap <- the caller of time.sleep
+            ppid[0] = -1
+    _fake_clock(cli, monkeypatch, on_nap=parent_gone)
     cli.main(["listen", "demo", "--chat", "c1", "--batch", "600", "--holder", "h/a"])
     assert "disk nearly full" not in capsys.readouterr().out
     assert p.db.one("SELECT last_read FROM chats WHERE id='c1'")["last_read"] == info < alert

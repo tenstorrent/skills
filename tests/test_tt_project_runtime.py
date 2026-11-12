@@ -36981,8 +36981,10 @@ def devq_dir(tmp_path, monkeypatch):
 
 
 def _devq(*args, timeout=None):
-    return subprocess.run([sys.executable, str(DEVQ), *[str(a) for a in args]], capture_output=True, text=True,
-                          timeout=timeout or _load_scaled(30))
+    # _run_to_end: a niced test on a busy host that gets the CPU back after the deadline never fails a
+    # devq command that already ended
+    return _run_to_end([sys.executable, str(DEVQ), *[str(a) for a in args]], text=True,
+                       timeout=timeout or _load_scaled(30))
 
 
 def _devq_submit(d, cfg, job, cmd, **spec):
@@ -37051,6 +37053,40 @@ def test_devq_a_job_runs_under_the_config_it_was_submitted_with(env, devq_dir, m
     finally:
         (d / "runner.pid").unlink()   # it holds this test's own pid, which the fixture would kill
     assert seen == [120]
+
+
+def test_devq_a_job_queued_as_the_runner_goes_idle_is_run_not_stranded(devq_dir, monkeypatch):
+    """A submit that queued a job just after the idle runner's last empty look, while it still held its
+    lock, found it alive and started none; the runner then exited and left the job queued. It lets its
+    lock go before its last look, so it runs the job (or the runner that submit started does)."""
+    from ttp import devq
+    d = devq_dir
+    devq._dirs(d)
+    devq._write(d / "config.json", json.dumps(devq.settings({**DEVQ_FAST, "idle_exit_s": 0})))
+    real_next, seen, alive = devq.Runner.next_job, [], []
+
+    def next_job(self):
+        job = real_next(self)
+        if not job and not seen:   # the submit lands right after this empty look
+            alive.append(devq.runner_alive(d))
+            (d / "queue" / f"{time.time_ns():020d}-late-1.json").write_text(
+                json.dumps({"id": "late-1", "cmd": "true", "config": "late-1"}))
+        return job
+
+    def run_job(self, job):
+        seen.append(job)
+        (d / "running" / f"{job}.json").unlink()
+
+    monkeypatch.setattr(devq.Runner, "next_job", next_job)
+    monkeypatch.setattr(devq.Runner, "run_job", run_job)
+    monkeypatch.setattr(devq.signal, "signal", lambda *a: None)
+    try:
+        assert devq.Runner(d).loop() == 0
+    finally:
+        (d / "runner.pid").unlink()   # it holds this test's own pid, which the fixture would kill
+    assert alive == [True], "the submit saw a live runner, so it started none"
+    assert seen == ["late-1"], (d / "runner.log").read_text()
+    assert not devq.runner_alive(d)
 
 
 def test_devq_runner_and_its_jobs_never_inherit_ttp_no_device(devq_dir, tmp_path):
@@ -37362,6 +37398,8 @@ def test_devq_submit_writes_the_runner_settings_before_it_queues_the_job(env, de
     def next_job():
         if jobs:
             devq._write(devq_dir / "config.json", json.dumps(devq.settings({"idle_exit_s": 0, "job_timeout_s": 120})))
+            for q in (devq_dir / "queue").glob("*.json"):   # dequeued, as the real runner's take is
+                q.unlink()
         return jobs.pop() if jobs else ""
     monkeypatch.setattr(runner, "next_job", next_job)
     monkeypatch.setattr(runner, "run_job", lambda job: seen.append((job, runner.limit({}))))
@@ -37375,9 +37413,12 @@ def test_devq_submit_writes_the_runner_settings_before_it_queues_the_job(env, de
 def test_devq_restart_requeues_a_job_a_reboot_killed_and_adopts_one_still_running(devq_dir, tmp_path):
     d, flag = devq_dir, tmp_path / "flag"
     # Reboot: runner and job both die. The probe wakes the task; start runs the job again as a drop.
-    _devq_submit(d, {}, "long-1", f"[ -e {flag} ] && exit 0; touch {tmp_path / 'started'}; sleep 60")
-    assert _wait_for_path(tmp_path / "started")
-    pid = _devq_job_pid(d, "long-1")
+    # The job runs until it is killed, never ending on its own however slow this test is; the waits end
+    # as soon as their file appears, their bounds only keep a hang from stalling the suite.
+    _devq_submit(d, {}, "long-1", f"[ -e {flag} ] && exit 0; touch {tmp_path / 'started'}; "
+                 f"while :; do {_nap()}; done")
+    assert _wait_for_path(tmp_path / "started", 300)
+    pid = _devq_job_pid(d, "long-1", 300)
     os.kill(int((d / "runner.pid").read_text()), signal.SIGKILL)
     os.killpg(pid, signal.SIGKILL)
     from ttp import devq
@@ -37391,8 +37432,8 @@ def test_devq_restart_requeues_a_job_a_reboot_killed_and_adopts_one_still_runnin
     # Only the runner dies: its successor waits for the job and takes its exit code, no drop.
     go = tmp_path / "go"
     _devq_submit(d, {}, "long-2", f"touch {tmp_path / 'started2'}; while [ ! -e {go} ]; do {_nap()}; done; exit 7")
-    assert _wait_for_path(tmp_path / "started2")
-    _devq_job_pid(d, "long-2")
+    assert _wait_for_path(tmp_path / "started2", 300)
+    _devq_job_pid(d, "long-2", 300)
     os.kill(int((d / "runner.pid").read_text()), signal.SIGKILL)
     assert _devq("start", d, json.dumps(DEVQ_FAST)).returncode == 0
     go.touch()

@@ -8714,7 +8714,7 @@ def test_ttp_checks_runs_a_subset_pytest_extra_when_its_push_check_does_not_run_
     monkeypatch.setattr(testpick, "narrow", narrowed)
     cli.main(["checks", "--fresh", "--", extra, extra])
     out = capsys.readouterr().out
-    assert ran() == 2 and "an earlier command after `--` is the same run" in out
+    assert ran() == 2 and "an earlier command after `--` is the same run" in out, out
 
 
 

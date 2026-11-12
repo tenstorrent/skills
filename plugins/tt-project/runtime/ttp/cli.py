@@ -3973,6 +3973,19 @@ def cmd_checks(a) -> None:
     unless a harness-tagged check applies to the head and ran or reused a recorded pass. With no
     harness-tagged check configured it runs the default harness plan (push.default_harness_checks). Its pass is recorded as such and never counts for a PR,
     an on_pass hand-off or `ttp push --own`; its failures open no check gap."""
+    from . import checkcap
+    # A preempted run's rerun (and a re-queue) passes its own state to itself in os.environ (RUN_ONLY_ENV,
+    # its arrival, its kept wait); none of it outlives the call, or a later call in this process would
+    # resume from another run's passed files or log its wait as cut.
+    own = [k for k in (*checkcap.RUN_ONLY_ENV, checkcap.ARRIVED_ENV, _WAIT_KEPT_ENV) if k not in os.environ]
+    try:
+        _cmd_checks(a)
+    finally:
+        for k in own:
+            os.environ.pop(k, None)
+
+
+def _cmd_checks(a) -> None:
     from . import addedtests, checkcap, checkdirs, checkprestage, cleantree, prguard, push, pushpass, slowtests
     from . import gatejudge
     from . import shorttmp

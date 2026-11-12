@@ -1631,8 +1631,25 @@ class Runner:
                 continue
             self.set_state("idle")
             if _now() - idle_since >= self.cfg["idle_exit_s"]:
-                self.log(f"idle {self.cfg['idle_exit_s']:.0f} s, exiting")
-                return 0
+                # A submit that queued a job after the look above, while this runner still held its lock,
+                # found it alive and started none. Let the lock go first, then look again: a job queued by
+                # then is this runner's to run (the lock taken back), unless the runner its submit
+                # started holds the lock already. Either this look or that submit's start sees the other.
+                lock.close()
+                if not _running(self.d) and not any((self.d / "queue").glob("*.json")):
+                    self.log(f"idle {self.cfg['idle_exit_s']:.0f} s, exiting")
+                    return 0
+                lock = open(self.d / "runner.lock", "a")
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    self.log(f"idle {self.cfg['idle_exit_s']:.0f} s, exiting: another runner took the queue")
+                    return 0
+                _write(self.d / "runner.pid", f"{os.getpid()}\n")
+                _write(self.d / CAN_CANCEL, f"{os.getpid()}\n")
+                self.log("a job came as this runner went idle: running on")
+                idle_since = _now()
+                continue
             time.sleep(self.cfg["poll_s"])
 
 

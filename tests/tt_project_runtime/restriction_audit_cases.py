@@ -803,7 +803,8 @@ def test_an_over_note_naming_a_landed_fix_dispatches_nothing(env):
         fix = p.db.add_task("update the soak tools", "edit bin/soak.sh", kind="harness")
         if setup:
             over = setup(p, over)
-        restriction_audit.restriction_tools(p, [(_POWER, "", over)], [])
+        # no wall-clock budget: past AUDIT_BUDGET_S on a loaded host landed_fix skips its git calls
+        restriction_audit.restriction_tools(p, [(_POWER, "", over)], [], budget_s=3600)
         return tasks()
 
     def done(p, over, kind="harness"):
@@ -825,8 +826,13 @@ def test_an_over_note_naming_a_landed_fix_dispatches_nothing(env):
         (p.root / "bin" / "soak.sh").write_text("#!/bin/sh\nexit 0\n")
         g("add", "bin/soak.sh")
         g("-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "soak tools updated", "--allow-empty")
+        # An abbreviation of only digits (about 1 in 110) or only letters is no sha to landed_fix (_OVER_SHA):
+        # amend until this commit's has both, so the case never depends on the sha git happened to make.
+        while not restriction_audit._OVER_SHA.fullmatch(sha := g("rev-parse", "--short=10", "HEAD").stdout.strip()):
+            g("-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--amend", "--allow-empty",
+              "-m", f"soak tools updated ({sha})")
         (p.root / "bin" / "soak.sh").write_text(tool[0][1])   # the scan still sees a citing line
-        return over.format(g("rev-parse", "--short=10", "HEAD").stdout.strip())
+        return over.format(sha)
 
     assert run("the soak ended; commit {} updated the tools", commit) == []
     assert len(run("the soak ended; commit 0badc0ffee1 updated the tools", commit)) == 1

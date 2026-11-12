@@ -148,6 +148,11 @@ def _on_alarm(signum, frame) -> None:
     if _s.depth:   # a commit or a git write: stop once it ends (release)
         _s.pending = True
         return
+    if frame is not None and frame.f_code in _HANDOFF:
+        # Between a child's spawn and its bounded wait (_HANDOFF): a stop here would leave the child, or
+        # its group, running with nothing to kill it whole. Stop a moment later, once the wait has it.
+        _arm(0.001)
+        return
     _s.fired = True
     raise StepBudgetSpent(_s.step)
 
@@ -239,6 +244,12 @@ def _wait(self, timeout=None):
 
 def _communicate(self, input=None, timeout=None):
     return _bounded(self, lambda t: _orig["communicate"](self, input, timeout=t), timeout)
+
+
+# The code a child passes through from its spawn to its bounded wait (run, call: Popen, __enter__, then
+# wait or communicate): a stop is put off while one of these is the frame running (_on_alarm).
+_HANDOFF = frozenset(c for c in (getattr(f, "__code__", None) for f in (
+    subprocess.run, subprocess.call, subprocess.Popen.__enter__, _init, _wait, _communicate, _bounded)) if c)
 
 
 def install() -> None:

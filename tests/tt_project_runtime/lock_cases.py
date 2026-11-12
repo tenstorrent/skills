@@ -1426,7 +1426,12 @@ def test_lock_probe_inside_a_real_sandbox_sees_a_live_keeper_outside_it_through_
         h = json.loads(pathlib.Path(held.name).read_text())
         assert h["via"] == "keeper" and h["pidns"] == locks._pid_ns()
         hold._write(rd, {"task": str(t), "run": "81", "state": "holding", "keeper": os.getpid(), "jobs": []})
+        # A live keeper beats every BEAT_EVERY_S for as long as it holds; this one beats once, so its beat
+        # is dated past the probe's whole deadline: a namespace setup that stalls longer than the beat's
+        # stale age (locks._BEAT_STALE_S, under NS_DEADLINE) still finds it fresh, as a real keeper's is.
         (rd / hold.BEAT).touch()
+        later = time.time() + NS_DEADLINE
+        os.utime(rd / hold.BEAT, (later, later))
 
         def inside():
             r = _run_to_end(ns + [sys.executable, str(TTP), "lock", "--probe", "--json", "build-a"],

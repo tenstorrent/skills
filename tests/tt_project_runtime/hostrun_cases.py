@@ -306,12 +306,14 @@ def test_host_run_refuses_an_over_cap_or_malformed_entry_and_names_it(env, monke
 
 
 def test_host_run_a_dict_entry_limit_above_600_s_is_honoured(env, monkeypatch, capfd):
-    # Scaled clock: the plain cap is cut to 1 s, the entry allows 3; a 2 s command passes only through
-    # the entry's own limit, and the same command as a plain entry times out at the cap.
+    # Scaled clock: the plain cap is cut to 1 s, the entry allows 120; a command that sleeps 2 s outlasts
+    # the cap, so it passes only through the entry's own limit, and the same command as a plain entry
+    # times out at the cap. The entry's limit is far above the command's time (only a hang guard): with
+    # 3 s, a slow interpreter start on a loaded host could eat the 1 s margin and time the passing run out.
     from ttp import hostrun
     monkeypatch.setattr(hostrun, "MAX_TIMEOUT_S", 1)
     cmd = [sys.executable, "-c", "import time; time.sleep(2); print('cycled')"]
-    p = _hostrun_setup(env, monkeypatch, [{"cmd": shlex.join(cmd), "timeout_s": 3}])
+    p = _hostrun_setup(env, monkeypatch, [{"cmd": shlex.join(cmd), "timeout_s": 120}])
     p.set_config("runner.host_command_timeout_s", 600)
     assert _hostrun_with_daemon(p, cmd, []) == 0
     assert "cycled" in capfd.readouterr().out
@@ -508,7 +510,9 @@ def test_fence_problem_reads_the_named_daemons_flag(env, monkeypatch, tmp_path):
     """`ttp doctor` reads the daemon's pid, not its own: a real fenced process is reported, a gone one not."""
     from ttp import hostrun, privlock
     p = _hostrun_setup(env, monkeypatch, ["/usr/bin/id -u"], unfenced=False)
-    child = subprocess.Popen(["sleep", "30"], preexec_fn=privlock.no_new_privs_preexec())
+    # lives until killed below: a stalled worker can outlast any fixed sleep, and a gone pid reads as unfenced
+    child = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"],
+                             preexec_fn=privlock.no_new_privs_preexec())
     try:
         assert privlock.fenced(child.pid) is True
         why = hostrun.fence_problem(p, child.pid)
