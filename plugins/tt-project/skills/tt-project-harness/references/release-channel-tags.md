@@ -4,7 +4,19 @@ A release channel is a tag that users install from and that a release cut moves 
 
 `delivery.channel_tags` lists the tags that may move (default: none). A project sets it with `ttp config <project> delivery.channel_tags '["<tag>"]'` or the coordinator's `config_set`. Creating a tag needs no force and is unchanged.
 
-A release cut task runs its candidate checks at the new commit with `ttp checks --release`, which never counts a pre-existing, flaky or quarantined failure as passed. Once they passed, it moves the tag with:
+A release cut task runs its candidate checks at the new commit with `ttp checks --release`, which never counts a pre-existing, flaky or quarantined failure as passed.
+
+A fresh one-line install check runs through ttp, never as the model's own `curl ... | sh`:
+
+```sh
+ttp install-check <commit>
+```
+
+ttp downloads the project's own `plugins/tt-project/install.sh` at exactly that commit, from the GitHub repository of the push remote (else `origin`). It runs it with `TT_PROJECT_REF=<commit>` in a fresh temporary HOME under the run folder and leaves the PATH profile alone. The check passes when the installer exits 0 and the installed `ttp --version` names the commit. The result (commit, exit code, installed version, URL, log path, time) goes to `install-check.json` in the run folder and to the project's `state/install_checks.jsonl`. Only one summary line is printed, never the installer's output. Exit 0 passed, 1 failed.
+
+A download the model runs itself (a `curl` or `wget` of a remote URL, a web page, a connector read) marks the run as reading untrusted input. A marked run may push only its own branches, never a tag, so its cut could not move the channel. The install check through ttp leaves the run unmarked; every other untrusted-input guard is unchanged.
+
+Once the candidate checks passed, the cut moves the tag with:
 
 ```sh
 ttp push --move-tag <tag> <commit>

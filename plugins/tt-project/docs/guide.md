@@ -3406,6 +3406,12 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   commit is on the remote push branch. A delete, a backward or sideways move, an unlisted tag, a
   missing or stale lease or several refs stay refused. Exit 0 moved (or already there), 2 refused,
   1 the push failed; each move is logged to `state/channel_tags.jsonl`. Creating a tag is unchanged.
+  A release cut runs its fresh one-line install check with `ttp install-check <commit>`: ttp
+  downloads the project's own installer at that commit from the push remote's GitHub repository (else
+  `origin`) and runs it in a fresh temporary HOME, model-free, recording pass or fail (commit, exit
+  code, installed version) in the run's `install-check.json` and `state/install_checks.jsonl`. The run
+  stays unmarked, so it may still move the tag; a `curl ... | sh` the model runs itself marks the run
+  as reading untrusted input, and a marked run pushes no tag.
   The coordinator may set `new_branch` and `never_force` true itself, `lease` only on the user's
   word.
 - `delivery.integration_branch` (`ttp/integration` when unset) is the one branch per repo that

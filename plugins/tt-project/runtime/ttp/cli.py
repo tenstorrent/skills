@@ -12406,6 +12406,13 @@ def shim_text(python: str, launcher: Path, pinned_ok: bool = True) -> str:
     return "\n".join(lines) + "\n"
 
 
+def cmd_install_check(a) -> None:
+    """`ttp install-check [<commit>]`: a release cut's fresh one-line install, run model-free by ttp so the
+    run that reads the result stays unmarked and may move its channel tag (installcheck.py)."""
+    from . import installcheck
+    installcheck.command(a)
+
+
 def cmd_setup(a) -> None:
     """Install this runtime as the user's stable `ttp` (plugin caches move on every update), and the plain
     `/tt-project` command for Claude Code (shortcut.py)."""
@@ -14447,7 +14454,7 @@ COMMAND_GROUPS = (
                   "memory", "obligation", "config", "pause", "resume", "drain", "alerts", "issues", "mute",
                   "quarantine", "machines", "runs", "logs", "doctor")),
     ("inside a run", ("note", "steer", "notify", "progress", "checks", "checks-shard", "checks-yield", "lock",
-                      "host-run", "detach", "devq", "push", "land", "express", "clip", "sandbox", "pool-wait", "pool-admit",
+                      "host-run", "detach", "devq", "push", "install-check", "land", "express", "clip", "sandbox", "pool-wait", "pool-admit",
                       "pool-shard", "skill", "killscan", "svcscan", "leftover-procs", "said", "hostcheck", "paths")),
     ("probes (retry_when, start_when)", ("landed", "alive", "eta", "ci", "ack-wait", "ssh-preflight", "broker-released",
                                          "deployed", "goal", "hours")),
@@ -14817,6 +14824,12 @@ def main(argv: list[str] | None = None) -> None:
                    help="harness: checks for the project's own harness; candidate: checks for a change "
                         "to deliver (needs --definition-commit)")
     s.set_defaults(fn=checkplan.command)
+
+    s = sub.add_parser("install-check", help="a release candidate's fresh one-line install, run by ttp itself in a "
+                                             "temporary HOME at a commit; records pass or fail (installcheck.py)")
+    s.add_argument("commit", nargs="?", default="HEAD", help="the candidate commit (default HEAD)")
+    s.add_argument("--out", help="folder for the result, log and temp HOME (default: the run folder, else a temp dir)")
+    s.set_defaults(fn=cmd_install_check)
 
     s = sub.add_parser("checks", help="run the local checks on HEAD and record the result")
     s.add_argument("--gap", metavar="SIG", help="read-only probe: exit 0 when a missing check's config changed")

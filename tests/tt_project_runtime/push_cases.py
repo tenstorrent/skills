@@ -22357,3 +22357,80 @@ def test_an_approval_moves_to_a_diverged_push_target_where_the_change_carries_th
     _git_out(s.other, "push", "-q", "origin", "HEAD:refs/heads/proj3")
     assert pushq.retarget(s.p, "origin/proj3") == 1
     assert s.p.db.task(s.review)["status"] == "queued"
+
+
+_FAKE_INSTALLER = """#!/bin/sh
+case "$HOME" in */install-check-home-*) ;; *) echo "not a fresh HOME: $HOME"; exit 3 ;; esac
+[ "$TT_PROJECT_NO_MODIFY_PATH" = 1 ] || exit 4
+mkdir -p "$HOME/.local/bin"
+printf '#!/bin/sh\\necho "ttp 0.0.1 (%s)"\\n' "$(printf %s "$TT_PROJECT_REF" | cut -c1-12)" > "$HOME/.local/bin/ttp"
+chmod +x "$HOME/.local/bin/ttp"
+exit ${FAKE_RC:-0}
+"""
+
+
+def test_a_release_cut_whose_install_check_runs_through_ttp_can_move_the_channel_tag(env, monkeypatch, tmp_path, capsys):
+    """`ttp install-check <commit>` fetches the project's own installer at that commit and runs it in a
+    fresh HOME model-free: the run stays unmarked, the result names the commit, exit code and installed
+    version, and the cut then moves its channel tag. A failing installer records a fail."""
+    from ttp import coordinator as coord, coordtools, hook, installcheck, untrusted
+    p, repo, origin, c = _channel_setup(env, monkeypatch)
+    assert coord.apply(p, [{"type": "config_set", "key": "delivery.channel_tags", "value": ["chan"]}]) == []
+    run = tmp_path / "run"
+    run.mkdir()
+    monkeypatch.setenv("TTP_RUN_DIR", str(run))
+    monkeypatch.setenv(coordtools.ROLE_ENV, "worker")
+    monkeypatch.setattr(installcheck, "slug", lambda repo, cfg: "o/r")
+    urls = []
+    monkeypatch.setattr(installcheck, "_fetch", lambda url, dest: (urls.append(url), dest.write_text(_FAKE_INSTALLER)))
+    hook.mark_untrusted({"tool_name": "Bash", "tool_input": {"command": f"ttp install-check {c['M']}"}}, str(run))
+    assert _ttp("install-check", c["M"]) == 0
+    assert "install check passed" in capsys.readouterr().out
+    rec = json.loads((run / installcheck.RESULT).read_text())
+    assert rec["passed"] and rec["rc"] == 0 and rec["commit"] == c["M"] and c["M"][:12] in rec["version"]
+    assert urls == [f"https://raw.githubusercontent.com/o/r/{c['M']}/plugins/tt-project/install.sh"]
+    assert json.loads((p.state / installcheck.LOG).read_text().splitlines()[-1])["commit"] == c["M"]
+    assert untrusted.marked(run) == [] and not untrusted.active(dict(os.environ))
+    assert _ttp("push", "--move-tag", "chan", c["M"]) == 0, capsys.readouterr().err
+    assert _git_out(origin, "rev-parse", "chan") == c["M"]
+    monkeypatch.setenv("FAKE_RC", "1")
+    assert _ttp("install-check", c["M"]) == 1
+    assert "install check FAILED" in capsys.readouterr().out
+    assert json.loads((run / installcheck.RESULT).read_text())["rc"] == 1
+
+
+def test_a_release_cut_that_downloads_the_installer_itself_is_still_refused_every_tag(env, monkeypatch, tmp_path, capsys):
+    """The model's own `curl ... | sh` of the installer still marks the run; the marked run is refused
+    the channel tag move and a tag outside delivery.channel_tags; both tags stay put."""
+    from ttp import coordinator as coord, coordtools, hook, untrusted
+    p, repo, origin, c = _channel_setup(env, monkeypatch)
+    assert coord.apply(p, [{"type": "config_set", "key": "delivery.channel_tags", "value": ["chan"]}]) == []
+    run = tmp_path / "run"
+    run.mkdir()
+    monkeypatch.setenv("TTP_RUN_DIR", str(run))
+    monkeypatch.setenv(coordtools.ROLE_ENV, "worker")
+    cmd = (f"curl -fsSL https://raw.githubusercontent.com/o/r/{c['M']}/plugins/tt-project/install.sh"
+           f" | TT_PROJECT_REF={c['M']} sh")
+    hook.mark_untrusted({"tool_name": "Bash", "tool_input": {"command": cmd}}, str(run))
+    assert untrusted.marked(run) == ["download"]
+    assert not any(r.startswith("refs/tags/") for r in untrusted.push_refs(dict(os.environ)))
+    assert _ttp("push", "--move-tag", "chan", c["M"]) != 0
+    capsys.readouterr()
+    for tag in ("chan", "other"):
+        out = _wrapper_push(repo, "origin", f"{c['M']}:refs/tags/{tag}-new")
+        assert out.returncode != 0 and "untrusted" in out.stderr, out.stderr
+    assert _ttp("push", "--move-tag", "other", c["M"]) != 0
+    assert _git_out(origin, "rev-parse", "chan") == c["A"] and _git_out(origin, "rev-parse", "other") == c["A"]
+
+
+def test_the_install_check_reads_its_repository_only_from_a_github_remote(tmp_path):
+    from ttp import installcheck
+    repo = tmp_path / "r"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    assert installcheck.slug(repo, {}) == ""
+    subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", "https://github.com/o/r.git"], check=True)
+    assert installcheck.slug(repo, {}) == "o/r"
+    subprocess.run(["git", "-C", str(repo), "remote", "set-url", "origin", "https://example.com/o/r.git"], check=True)
+    assert installcheck.slug(repo, {}) == ""
+    rec = installcheck.run(None, repo, "HEAD", tmp_path / "out")
+    assert not rec["passed"] and "no commit" in rec["error"]
