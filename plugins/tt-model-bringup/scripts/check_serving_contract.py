@@ -19,6 +19,32 @@ from typing import Any
 
 
 CONTRACT_PATH = Path("doc/full_model/serving_contract.json")
+
+
+MAX_LISTED_FINDINGS = 30
+
+
+def capped(lines: list[str], limit: int, name: str) -> list[str]:
+    """Return at most ``limit`` lines; park the full list in a file when cut.
+
+    Gate output is read into an agent's context, so a long list is cut to the
+    first ``limit`` entries plus a pointer to the full file.
+    """
+    if len(lines) <= limit:
+        return lines
+    import os
+    import tempfile
+
+    directory = Path(os.environ.get("MULTIGOAL_LOG_DIR") or tempfile.gettempdir())
+    stage = os.environ.get("MULTIGOAL_STAGE")
+    full = directory / (f"{stage}.{name}.full.txt" if stage else f"{name}.full.txt")
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        full.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        where = str(full)
+    except OSError:
+        where = "(could not write the full list)"
+    return [*lines[:limit], f"... {len(lines) - limit} more in {where}"]
 KINDS = {"call", "capability", "request_feature"}
 # Each status names the row fields that must be non-empty.
 STATUS_FIELDS = {
@@ -142,13 +168,16 @@ def main() -> int:
         return 2
 
     problems = check_contract(data, model_dir)
-    for problem in problems:
-        print(f"SERVING CONTRACT: {path}: {problem}", file=sys.stderr)
     if problems:
+        print(f"SERVING CONTRACT: {path}: {len(problems)} problem(s)", file=sys.stderr)
+        for line in capped([f"SERVING CONTRACT: {problem}" for problem in problems], MAX_LISTED_FINDINGS, "serving_contract_problems"):
+            print(line, file=sys.stderr)
         return 2
     advisories = missing_evidence(data, model_dir)
-    for advisory in advisories:
-        print(f"ADVISORY: SERVING CONTRACT: {path}: {advisory}", file=sys.stderr)
+    if advisories:
+        print(f"ADVISORY: SERVING CONTRACT: {path}: {len(advisories)} advisory finding(s)", file=sys.stderr)
+    for line in capped([f"ADVISORY: SERVING CONTRACT: {advisory}" for advisory in advisories], MAX_LISTED_FINDINGS, "serving_contract_advisories"):
+        print(line, file=sys.stderr)
     print(f"Serving contract OK for {model_dir}: {len(data['rows'])} rows, plugin {data['plugin']['commit'][:12]}.")
     return 1 if advisories else 0
 

@@ -346,6 +346,37 @@ class _Parser(argparse.ArgumentParser):
         raise SystemExit(3)
 
 
+# Printed output stays within about 40 lines: 8 measured lines plus 12
+# two-line findings and headers. Full lists go to --json or a side file.
+MAX_MEASURED_LINES = 8
+MAX_FINDINGS = 12
+
+
+def capped(lines: list[str], limit: int, name: str, full_list: str | None = None) -> list[str]:
+    """Return at most ``limit`` lines; park the full list in a file when cut.
+
+    Gate output is read into an agent's context, so a long list is cut to the
+    first ``limit`` entries plus a pointer to the full file.
+    """
+    if len(lines) <= limit:
+        return lines
+    if full_list:
+        return [*lines[:limit], f"... {len(lines) - limit} more in {full_list}"]
+    import os
+    import tempfile
+
+    directory = Path(os.environ.get("MULTIGOAL_LOG_DIR") or tempfile.gettempdir())
+    stage = os.environ.get("MULTIGOAL_STAGE")
+    full = directory / (f"{stage}.{name}.full.txt" if stage else f"{name}.full.txt")
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        full.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        where = str(full)
+    except OSError:
+        where = "(could not write the full list)"
+    return [*lines[:limit], f"... {len(lines) - limit} more in {where}"]
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _Parser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
@@ -452,17 +483,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     for path in meta_files:
         check_autoregressive_meta(report, path)
 
+    full_list = str(args.json) if args.json else None
+    measured_lines = []
     for m in report.measured:
         compact = {k: v for k, v in m.items() if k not in ("artifact", "label")}
-        print(f"measured: {m.get('label')} [{m.get('artifact')}] {compact}")
+        measured_lines.append(f"measured: {m.get('label')} [{m.get('artifact')}] {compact}")
+    for line in capped(measured_lines, MAX_MEASURED_LINES, "degenerate_output_measured", full_list):
+        print(line)
 
     if report.findings:
+        # Critical findings first, so a cut list still shows what blocks.
+        ordered = sorted(report.findings, key=lambda f: f.severity != "critical")
+        blocks = [
+            f"[{f.severity.upper()}] {f.metric}={f.value} (threshold {f.threshold}) {f.artifact} | {f.label}\n  {f.detail}"
+            for f in ordered
+        ]
         print(f"\n{len(report.findings)} finding(s):")
-        for f in report.findings:
-            print(f"\n[{f.severity.upper()}] {f.metric}={f.value} (threshold {f.threshold})")
-            print(f"  artifact: {f.artifact}")
-            print(f"  where:    {f.label}")
-            print(f"  {f.detail}")
+        for block in capped(blocks, MAX_FINDINGS, "degenerate_output_findings", full_list):
+            print(block)
     else:
         print("\nNo degenerate output detected.")
 
