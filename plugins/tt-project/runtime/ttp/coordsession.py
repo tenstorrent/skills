@@ -96,7 +96,7 @@ DEFAULTS = {"compact_tokens": 0, "compact_growth_tokens": 100000, "context_windo
             # what a worker or reviewer run starts with (ctxfork.py); worker_fork_max_tokens 0: no cap;
             # worker_fork_other_model_tokens: the last turns a run on another model forks (0: disk block)
             "worker_context": "fork", "worker_fork_max_tokens": 0, "worker_fork_max_age_h": 12,
-            "worker_fork_other_model_tokens": 8000, "worker_chat_chars": 30000}
+            "worker_fork_other_model_tokens": 8000, "worker_chat_chars": 8000}
 LEGACY = {"rollover_tokens": "compact_tokens", "rollover_growth_tokens": "compact_growth_tokens",
           "rollover_margin_tokens": "compact_margin_tokens"}   # read when a project has no compact_* value
 COMPACTIONS_KEPT = 50   # KEY's `compactions`: the newest kept
@@ -116,7 +116,7 @@ MEMORY_HEAD = ("## Memory changed since this session last saw it (a changed entr
 STANDING = "# STANDING"   # memory_view's key of the STANDING block (no memory entry's name starts with #)
 NOTE_CHARS = 16000        # a session_note's cap, about 4,000 tokens
 CHAT_EXCHANGES = 20       # the chat exchanges a new or compacted session's first message carries verbatim
-CHAT_CHARS = 60000        # their cap: the oldest whole exchanges go first, the newest always stays
+CHAT_CHARS = 20000        # their cap: the oldest whole exchanges go first, the newest always stays (each re-sent after every compaction)
 NOTE_DIR = "coord-session"
 HANDOFF_SUFFIX = ".handoff.md"
 PREFIX_FILE = "prefix.json"   # under NOTE_DIR, and each session wake's run dir: the prompt it ran with

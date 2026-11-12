@@ -4530,7 +4530,7 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   and the chat provider (which runs Claude Code) fork a Claude Code coordinator's session, Codex a Codex
   coordinator's rollout. The coordinator's own session is never written. Otherwise, and always on Cursor,
   the prompt leads with the coordinator's context on disk: the open order ledger, its latest session
-  note and the last chat exchanges (`worker_chat_chars`). `disk` skips the fork, `off` both. A follow-up
+  note and the last chat exchanges (`worker_chat_chars`, 8000 characters). `disk` skips the fork, `off` both. A follow-up
   (a task labelled `continues:<id>`: a continue hop, a daemon review fix, a rebase, a re-review) first
   resumes a copy of the session of its own last ok run, or before it has one, of the last ok run of the
   task it carries on, with the coordinator's context since that run (open orders, its latest note, the

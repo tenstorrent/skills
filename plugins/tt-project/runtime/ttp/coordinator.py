@@ -5940,6 +5940,38 @@ def memory_budget_check(p: Project) -> None:
         p.db.set_kv(MEMORY_PINNED_HALF_KEY, True)
     elif flagged and not heavy:
         p.db.set_kv(MEMORY_PINNED_HALF_KEY, False)
+    charter_budget_check(p)
+
+
+CHARTER_ALERT_KEY = "charter_over_budget"   # kv: the charter size the last over-budget event named (0: fits)
+CHARTER_MAX_CHARS = 40000   # coordinator.charter_max_chars; 0 turns the check off
+
+
+def charter_budget_check(p: Project) -> None:
+    """Tell the coordinator once when CHARTER.md outgrows coordinator.charter_max_chars: every coordinator
+    step re-reads the whole charter and every worker step its restrictions and goals, so its size is paid
+    on every model call. Again only after it grows a quarter past the size last named; re-arms once it fits."""
+    lim = int((p.config().get("coordinator") or {}).get("charter_max_chars", CHARTER_MAX_CHARS) or 0)
+    try:
+        size = len(p.charter_path.read_text(errors="replace"))
+    except OSError:
+        return
+    named = int(p.db.kv(CHARTER_ALERT_KEY, 0) or 0)
+    if lim <= 0 or size <= lim:
+        if named:
+            p.db.set_kv(CHARTER_ALERT_KEY, 0)
+        return
+    if named and size < named * 1.25:
+        return
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+           (time.time(), "daemon", "charter_over_budget", "normal",
+            f"The charter is {size} chars, over coordinator.charter_max_chars ({lim}). Every coordinator step "
+            f"re-reads all of it and every worker step its restrictions and goals, so its size is paid on every "
+            f"model call. Condense it with charter_update: merge duplicate and overlapping rules into one each, "
+            f"keep every rule's meaning and the user's quoted words, and move background, evidence, dates, "
+            f"history and finished goals out to notes or memory facts (CHARTER.history.md keeps the old text). "
+            f"Never drop or loosen a rule for space.", "queued"))
+    p.db.set_kv(CHARTER_ALERT_KEY, size)
 
 
 def _hours_or_none(a: dict, key: str) -> float | None:

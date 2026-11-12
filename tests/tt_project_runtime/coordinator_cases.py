@@ -20869,6 +20869,34 @@ def test_standing_worker_memory_past_its_room_is_pointed_to_and_alerts_once(env)
     assert len(alerts()) == 1 and not p.db.kv(coord.MEMORY_ALERT_KEY)
 
 
+
+def test_an_oversized_charter_is_named_once_until_it_grows_a_quarter_and_re_arms_when_it_fits(env):
+    """Every model call re-reads the charter, so one past coordinator.charter_max_chars raises one
+    charter_over_budget event; the same size again stays silent, a quarter more raises one more, and a
+    charter that fits again re-arms the check."""
+    p = make(env)
+    from ttp import coordinator as coord
+    p.set_config("coordinator.charter_max_chars", 1000)
+    alerts = lambda: p.db.q("SELECT text FROM events WHERE kind='charter_over_budget'")
+    base = p.charter_path.read_text()
+    p.charter_path.write_text(base + "x" * 2000)
+    coord.charter_budget_check(p)
+    coord.memory_budget_check(p)   # the daily memory check runs it too
+    assert len(alerts()) == 1 and "over coordinator.charter_max_chars (1000)" in alerts()[0]["text"], alerts()
+    p.charter_path.write_text(base + "x" * 2000 + "y" * (len(base) + 4000))
+    coord.charter_budget_check(p)
+    assert len(alerts()) == 2, alerts()
+    p.charter_path.write_text("short")
+    coord.charter_budget_check(p)
+    assert not p.db.kv(coord.CHARTER_ALERT_KEY)
+    p.charter_path.write_text(base + "x" * 2000)
+    coord.charter_budget_check(p)
+    assert len(alerts()) == 3, "a charter that fit and grew again is named again"
+    p.set_config("coordinator.charter_max_chars", 0)
+    p.charter_path.write_text(base + "x" * 9000)
+    coord.charter_budget_check(p)
+    assert len(alerts()) == 3, "0 turns the check off"
+
 ALWAYS_0 = ["test -e /tmp/fixed || true", "check-board; exit 0", "test -e x || :"]
 REAL_ENDS = ["test -e /tmp/fixed || exit 1", "test -e /tmp/fixed", "ttp lock --probe board | grep -q free"]
 
