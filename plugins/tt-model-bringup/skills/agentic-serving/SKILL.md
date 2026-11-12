@@ -219,7 +219,9 @@ In `doc/agentic_evals/`:
 - `results.json`: per run `phase`, `suite`, `tasks` (names, list rule), `config` (pool, agents, batch,
   limits and their source, network mode, `reasoning`, SHAs), `score` (`solved`, `n`, `interval_95`),
   `reference` (`value`, `source`, `reasoning`), `band_pass`, `predicted_hours`, `explained_hours`,
-  `measured_hours`, `collected`, and `failures` (one row per failed task, as Failure analysis says); plus
+  `measured_hours`, `collected`, and `failures`: one row per failed task with `task`, `cause` (`wrong`,
+  `loop_cap`, `malformed_tool_call`, `cutoff_progressing`, `stalled`, `infrastructure`, `fetched_solution`),
+  `evidence` and `rerun` (`tried`, `counted`); plus
   `phases`: per phase `run`, `start_hour`, `pass`, and `reason` when not passed.
 - `runs.json`: the runner's append-only run records.
 - `learned.json`: `best_config` per suite (the config, list size and hours of the best valid run),
