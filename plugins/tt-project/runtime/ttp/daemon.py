@@ -19407,8 +19407,14 @@ class Daemon:
         tag = spans.new_tag()   # this spec's delimiter: the worker's own text is enclosed with it as data
         lines += [f"Its spec: {coord.clip(task.get('spec'), AUTO_REVIEW_SPEC_CHARS)}",
                   f"Its hand-off: {spans.wrap(coord.clip(summary, AUTO_REVIEW_SUMMARY_CHARS), _handoff_of(task), tag)}"]
-        if not ext and not published and (size := splitgate.review_line(cfg, task, changes)):
-            lines.append(size)
+        if not ext and not published and branch and splitgate.check(cfg, task, changes):
+            based = ""
+            try:   # over the limit against the default base: read it again against the change's own base
+                changes, based = self._split_size(task, branch)
+            except Exception as e:
+                log(self.p, f"task {task['id']}: its size against its own base was not read: {e}")
+            if size := splitgate.review_line(cfg, task, changes, base=based):
+                lines.append(size)
         fups = load_result(task.get("result")).get("followups")
         fups = [coord.clip(f["title"], 120) for f in fups if isinstance(f, dict) and f.get("title")] \
             if isinstance(fups, list) else []
@@ -20395,7 +20401,7 @@ class Daemon:
             return ""
         db, key = self.p.db, str(task["id"])
         try:
-            changes = gitmemo.cached(("worktree.diff_lines", branch), lambda: worktree.diff_lines(self.p, [branch]))
+            changes, based = gitmemo.cached(("splitgate.size", branch), lambda: self._split_size(task, branch))
         except subprocess.TimeoutExpired as e:
             tries, _ = db.kv_dict(KV_SPLIT_UNREAD)
             n = int(tries.pop(key, 0) or 0) + 1
@@ -20428,15 +20434,23 @@ class Daemon:
                 return ""
             head, _ = self._branch_tip(branch)
             if not splitgate.send_back(self.p.db, self.cfg, self.p.db.task(task["id"]) or task, n, limit, head,
-                                       attempts):
+                                       attempts, base=based):
                 return ""
         except Exception:
             log(self.p, f"split check of #{task['id']}: " + traceback.format_exc().replace("\n", " | ")[:1000])
             return ""
-        log(self.p, f"task {task['id']}: {n} non-test lines over chains.split_lines ({limit}): back to its worker "
-                    f"once for a split")
-        return (f"Returned once to its worker for a split ({n} non-test lines, over chains.split_lines {limit}): "
+        log(self.p, f"task {task['id']}: {n} non-test lines{splitgate.against(based)} over chains.split_lines "
+                    f"({limit}): back to its worker once for a split")
+        return (f"Returned once to its worker for a split ({n} non-test lines{splitgate.against(based)}, over "
+                f"chains.split_lines {limit}): "
                 f"the same task, branch and worktree; no review yet. Its next hand-off is reviewed whatever its size.")
+
+    def _split_size(self, task: dict, branch: str) -> tuple[dict | None, str]:
+        """(lines changed per file, the base they were measured against) of task `task`'s change on `branch`
+        for the split check: against its own base (worktree.own_base), never the gap between another base
+        and the push branch."""
+        base, name = worktree.own_base(self.p, task, branch)
+        return worktree.diff_lines(self.p, [branch], base=base), name
 
     def _branch_tip(self, branch: str) -> tuple[str, str]:
         """(head, its subject) of `branch`, ('', '') when it is missing; read once within a gitmemo scope."""

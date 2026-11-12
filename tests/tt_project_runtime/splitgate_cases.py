@@ -116,3 +116,55 @@ def test_a_needs_review_hand_off_is_returned_for_a_split_only_when_a_review_woul
     t = p.db.task(tid)
     assert t["status"] == "queued" and splitgate.returned(t) and not reviews
     assert "do not list them again" in t["spec"]
+
+
+def _other_base(p, name="other", lines=900):
+    """Branch `name` off the repo's head carrying `lines` lines the push branch `work` lacks, standing as the
+    remote's default branch (origin/HEAD); `work` is the push branch at the repo's head."""
+    root = p.root
+    head = _git_out(root, "rev-parse", "HEAD").strip()
+    _git_out(root, "branch", "-f", "work", head)
+    _git_out(root, "checkout", "-qb", name)
+    (root / "vendored.py").write_text("".join(f"v {i}\n" for i in range(lines)))
+    _git_out(root, "add", "vendored.py")
+    _git_out(root, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "vendored")
+    _git_out(root, "checkout", "-q", head)
+    _git_out(root, "update-ref", f"refs/remotes/origin/{name}", name)
+    _git_out(root, "symbolic-ref", "refs/remotes/origin/HEAD", f"refs/remotes/origin/{name}")
+    p.set_config("delivery.push_branch", "work")
+
+
+def test_the_split_size_counts_only_the_changes_own_lines_from_its_own_base(env):
+    """A branch the worker based on another branch (the remote's default) is measured from that base, not
+    from the push branch: a small change there is reviewed at once, its huge gap to the push branch aside."""
+    from ttp import splitgate, worktree
+    p = make(env)
+    _other_base(p)
+    def rebase(path):
+        _git_out(path, "reset", "-q", "--hard", "other")
+    tid, branch, _, reviews = _finish_code(env, p, "small on other", {"small.py": 20}, edit=rebase)
+    t = p.db.task(tid)
+    assert worktree.diff_lines(p, [branch], base="work")["vendored.py"] == 900
+    assert worktree.own_base(p, t, branch) == ("origin/other", "origin/other")
+    assert t["status"] == "done" and not splitgate.returned(t) and len(reviews) == 1
+    assert "Size:" not in reviews[0]["spec"]
+
+
+def test_a_large_change_on_the_push_branch_still_goes_back_and_the_order_names_its_base(env):
+    """A branch on the push branch over the limit still goes back once; the order, the event and the hand-off
+    line name what the size was measured against, as does the size line of its next review."""
+    from ttp import splitgate
+    p = make(env)
+    _other_base(p)
+    tid, _, done, reviews = _finish_code(env, p, "big on work", {"big.py": 300})
+    t = p.db.task(tid)
+    assert t["status"] == "queued" and splitgate.returned(t) and not reviews
+    assert "300 non-test lines (measured against the commit its worktree started from, " in t["spec"]
+    assert "(measured against the commit its worktree started from, " in done["text"]
+    ev = p.db.one("SELECT data FROM events WHERE kind=? AND task=?", (splitgate.EVENT, tid))
+    assert json.loads(ev["data"])["base"].startswith("the commit its worktree started from")
+    _, _, reviews = _again(env, p, tid, {"status": "done", "summary": "still big"})
+    assert "Size: 310 non-test lines (measured against " in reviews[0]["spec"]
+    assert splitgate.against("") == "" and "Size: 101 non-test lines (measured against main)" in \
+        splitgate.review_line({"chains": {"split_lines": 100}}, {"id": 1, "kind": "code", "title": "t",
+                                                                   "labels": "[]"}, {"a.py": 101}, base="main")
