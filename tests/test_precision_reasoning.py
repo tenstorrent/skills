@@ -241,3 +241,70 @@ def test_sampling_params_object_is_built_from_the_generator_module():
         del sys.modules[ObjGen.__module__].SamplingParams
     assert len(texts) == 3
     assert [s.seed for s in seen] == [1000, 1001, 1002] and all(s.temperature == 0.8 for s in seen)
+
+
+def counting(calls):
+    def counting_build(**kw):
+        calls.append(kw)
+        return build(**kw)
+    return counting_build
+
+
+def test_selected_reference_needs_more_precise_evidence(tmp_path):
+    code = p1.run(args_for(tmp_path), build_generator=build, tokenizer=FakeTokenizer())
+    c = checks(result(tmp_path))["selected_within_noise"]
+    assert code == 2 and c["status"] == "fail" and c["severity"] == "critical"
+    assert "nothing more precise was scored" in c["detail"] and "HF slice off" in c["detail"]
+    # A higher-precision build that agrees with the reference vouches for it.
+    code = p1.run(args_for(tmp_path, "--higher-precision", "equal"), build_generator=build, tokenizer=FakeTokenizer())
+    c = checks(result(tmp_path))["selected_within_noise"]
+    assert code == 0 and c["status"] == "pass" and "higher-precision equal" in c["detail"]
+
+
+def test_selected_reference_fails_against_a_more_precise_build(tmp_path):
+    cand = tmp_path / "coarse.json"
+    cand.write_text(json.dumps({"coarse": {"quant": 0.5}, "fine": {}}))
+    argv = ["--model-dir", str(tmp_path), "--candidates", str(cand), "--num-texts", "8", "--max-new-tokens", "200",
+            "--min-answer-tokens", "100", "--decode-tokens", "0", "--sampling", '{"temperature": 1.0}',
+            "--hf-positions", "0", "--higher-precision", "fine"]
+    code = p1.run(p1.finalize_args(p1.build_parser().parse_args(argv)), build_generator=build, tokenizer=FakeTokenizer())
+    c = checks(result(tmp_path))["selected_within_noise"]
+    assert code == 2 and c["status"] == "fail" and "loses accuracy" in c["detail"]
+
+
+def test_selected_reference_passes_with_hf_slice(tmp_path):
+    lm = TinyLM()
+
+    class HF:
+        def __call__(self, input_ids):
+            return SimpleNamespace(logits=lm.logits(input_ids[0].tolist())[None])
+
+    args = args_for(tmp_path, "--hf-positions", "300", "--hf-model", "fake/hf")
+    code = p1.run(args, build_generator=build, tokenizer=FakeTokenizer(), hf_loader=lambda name: HF(), hf_fit=lambda name: None)
+    assert code == 0
+    assert "vs HF" in checks(result(tmp_path))["selected_within_noise"]["detail"]
+
+
+def test_score_cache_key_includes_model_code_and_no_cache_flag(tmp_path):
+    (tmp_path / "tt").mkdir()
+    (tmp_path / "tt/model.py").write_text("A = 1\n")
+    p1.run(args_for(tmp_path, "--selected", "equal"), build_generator=build, tokenizer=FakeTokenizer())
+    calls = []
+    p1.run(args_for(tmp_path, "--selected", "equal"), build_generator=counting(calls), tokenizer=FakeTokenizer())
+    assert not calls
+    (tmp_path / "tt/model.py").write_text("A = 2\n")
+    p1.run(args_for(tmp_path, "--selected", "equal"), build_generator=counting(calls), tokenizer=FakeTokenizer())
+    assert len(calls) == len(CANDIDATES)
+    calls.clear()
+    p1.run(args_for(tmp_path, "--selected", "equal", "--no-score-cache"), build_generator=counting(calls),
+           tokenizer=FakeTokenizer())
+    assert len(calls) == len(CANDIDATES)
+
+
+def test_score_cache_key_includes_precision_config_contents(tmp_path):
+    config = tmp_path / "cfg.json"
+    config.write_text('{"mlp": "bfp8"}')
+    assert p1.code_sha(tmp_path, {"precision_config": "cfg.json"}) != p1.code_sha(tmp_path, {})
+    before = p1.code_sha(tmp_path, {"precision_config": str(config)})
+    config.write_text('{"mlp": "bfp4"}')
+    assert p1.code_sha(tmp_path, {"precision_config": str(config)}) != before

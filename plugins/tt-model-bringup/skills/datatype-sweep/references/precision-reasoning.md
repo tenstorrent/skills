@@ -40,6 +40,18 @@ P1 measures exactly this, on the model's generator, before vLLM.
      --reference bfp8 --selected <selected id>
    ```
 
+   When the selected config is the reference itself (for example dense BFP8), the
+   reference compared with itself proves nothing. Then one of these is required:
+   - `--higher-precision <id>`: a more precise candidate (for example BF16 weights,
+     HiFi4) scored as comparison. It needs to fit only P1's text length, not the
+     full context. The reference must stay within the same ΔNLL and KL bounds of it.
+   - the HF slice (`--hf-model`, `--hf-positions` > 0) measured and within
+     `--hf-kl-max-x1000`.
+
+   If neither can run (HF too large for host RAM and no higher-precision build
+   fits the device), `selected_within_noise` fails critical with that reason; only a
+   limitations entry with the reason waives it (see "Memory fit first").
+
    - The first run generates about 30 answers (`--num-texts`, up to
      `--max-new-tokens 6144` each) with the reference config, from the bundled
      questions in `runtime/readiness_check/reasoning_prompts.json`, chat
@@ -56,8 +68,10 @@ P1 measures exactly this, on the model's generator, before vLLM.
      `{"prompt_token_ids": [...], "completion_token_ids": [...]}` or
      `{"messages": [...], "response": "<thinking and answer text>"}`.
    - Token ids are cached in `doc/eval_readiness/precision_reasoning/text.jsonl`
-     and each candidate's scores in `.../scores/<id>.pt`; reruns score only what
-     changed. Delete `text.jsonl` to regenerate the text.
+     and each candidate's scores in `.../scores/<id>.pt`, keyed by the text, the
+     build kwargs, a hash of `<model_dir>/tt/**/*.py` and the contents of any file
+     a kwarg names (the precision config). Reruns score only what changed;
+     `--no-score-cache` rescores everything. Delete `text.jsonl` to regenerate the text.
    - If building several generators in one process fails (device memory not
      released), run one candidate per process with `--only <id>`; the last run
      aggregates the cache.
@@ -92,7 +106,7 @@ skipped with the reason. This catches a loss the reference itself has.
 | Check | Severity | Passes when |
 |---|---|---|
 | `positions_scored` | critical, not waivable | ≥ 1,000 paired positions (`--min-positions`) |
-| `selected_within_noise` | critical, waivable | ΔNLL ≤ max(2·SE, 0.01 nats/token) and KL×1000 ≤ 15 |
+| `selected_within_noise` | critical, waivable | ΔNLL ≤ max(2·SE, 0.01 nats/token) and KL×1000 ≤ 15; when the selected config is the reference: the same bounds against `--higher-precision`, or the HF slice within its bound |
 | `decode_top1_within_noise` | advisory | decode Δtop-1 ≥ −max(2·SE, 0.01) |
 | `reference_vs_hf` | advisory | KL(reference ‖ HF)×1000 ≤ 15 |
 
@@ -130,6 +144,10 @@ limitation in `doc/eval_readiness/limitations.json`:
   "evidence": ["doc/eval_readiness/precision_reasoning.json", "doc/context_contract.json"],
   "original_model": "not_run", "fix_hours": 2.0}]}
 ```
+
+The same entry shape waives a selected reference that nothing more precise could
+check; put the reason (for example "HF weights 240 GiB do not fit in 180 GiB host RAM; no
+BF16 build fits the device") in `reason` and the P1 result as evidence.
 
 The gate accepts a `not_run` waiver only with `fix_hours` ≥ 2: spend the time box looking for a
 fitting higher-precision option (one group at BFP8, a smaller KV block budget) and record it. The

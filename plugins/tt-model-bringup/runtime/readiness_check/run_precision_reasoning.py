@@ -19,7 +19,10 @@ Steps:
    or a ``sampling_params`` object.
    The token ids are cached in ``doc/eval_readiness/precision_reasoning/text.jsonl``
    so every candidate scores the same tokens.
-2. Scoring. For each candidate (``--candidates``: id -> ``build_generator``
+2. Scoring. Scores are cached per candidate under ``scores/<id>.pt``, keyed by
+   the text, the build kwargs, a hash of ``<model_dir>/tt/**/*.py`` and the
+   contents of any file a kwarg names (the precision config);
+   ``--no-score-cache`` rescores everything. For each candidate (``--candidates``: id -> ``build_generator``
    kwargs), one ``prefill_logits`` call per text gives the logits at every
    answer position. Per position: NLL of the actual next token, argmax, and
    KL(reference || candidate) over the reference's top-``--topk`` tokens plus
@@ -38,6 +41,11 @@ Checks (``doc/eval_readiness/precision_reasoning.json``):
 - ``positions_scored`` (critical): at least ``--min-positions`` paired positions.
 - ``selected_within_noise`` (critical, waivable): the selected candidate's
   ΔNLL <= max(2·SE, ``--nll-floor``) and KL×1000 <= ``--kl-max-x1000``.
+  When the selected candidate is the reference, something more precise must
+  vouch for it: a ``--higher-precision`` candidate (the reference's ΔNLL
+  against it within the same bound) or a measured, passing HF slice. If
+  neither can run, the check fails with the reason and only a limitations
+  waiver accepts it.
 - ``decode_top1_within_noise`` (advisory): decode top-1 vs the text token is
   not lower than the reference's by more than max(2·SE, 0.01).
 - ``reference_vs_hf`` (advisory): KL(reference || HF)×1000 <= ``--hf-kl-max-x1000``.
@@ -521,6 +529,28 @@ def load_candidates(path: Path, max_candidates: int) -> Dict[str, dict]:
     return {str(k): v for k, v in data.items()}
 
 
+def code_sha(model_dir: Path, kwargs: dict) -> str:
+    """Hash of the model code and of any file a build kwarg names (precision configs)."""
+    h = hashlib.sha256()
+    tt_dir = Path(model_dir) / "tt"
+    for path in sorted(tt_dir.rglob("*.py")) if tt_dir.is_dir() else []:
+        h.update(str(path.relative_to(model_dir)).encode() + b"\0")
+        h.update(path.read_bytes() + b"\0")
+    for key in sorted(kwargs):
+        value = kwargs[key]
+        if not isinstance(value, str) or not value or len(value) > 4096:
+            continue
+        for base in (Path(model_dir), Path.cwd()):
+            candidate = Path(value) if Path(value).is_absolute() else base / value
+            try:
+                if candidate.is_file():
+                    h.update(f"{key}\0".encode() + candidate.read_bytes() + b"\0")
+                    break
+            except OSError:
+                continue
+    return h.hexdigest()[:16]
+
+
 def scores_path(model_dir: Path, cid: str) -> Path:
     return model_dir / SCORES_DIR / f"{cid}.pt"
 
@@ -532,13 +562,15 @@ def load_scores(model_dir: Path, cid: str, sha: str, kwargs: dict) -> Optional[l
     blob = torch.load(path, weights_only=False)
     if blob.get("text_sha") != sha or blob.get("build_kwargs") != kwargs:
         return None
+    if blob.get("code_sha") != code_sha(model_dir, kwargs):
+        return None
     return blob["texts"]
 
 
 def save_scores(model_dir: Path, cid: str, sha: str, kwargs: dict, rows: list) -> None:
     path = scores_path(model_dir, cid)
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"text_sha": sha, "build_kwargs": kwargs, "texts": rows}, path)
+    torch.save({"text_sha": sha, "build_kwargs": kwargs, "code_sha": code_sha(model_dir, kwargs), "texts": rows}, path)
 
 
 def _fmt(cid: str, s: Dict[str, Any], ok: bool) -> str:
@@ -562,7 +594,11 @@ def run(
     ids = list(candidates)
     ref_id = args.reference or ids[0]
     sel_id = args.selected or ref_id
-    for name, cid in (("--reference", ref_id), ("--selected", sel_id)):
+    hp_id = getattr(args, "higher_precision", "") or ""
+    named = [("--reference", ref_id), ("--selected", sel_id)] + ([("--higher-precision", hp_id)] if hp_id else [])
+    if hp_id == ref_id:
+        raise SystemExit("--higher-precision must differ from --reference")
+    for name, cid in named:
         if cid not in candidates:
             raise SystemExit(f"{name} {cid!r} is not in {args.candidates} ({', '.join(ids)})")
     template_kwargs = json.loads(args.chat_template_kwargs) if args.chat_template_kwargs else dict(DEFAULT_CHAT_TEMPLATE_KWARGS)
@@ -571,6 +607,8 @@ def run(
         if args.only not in candidates:
             raise SystemExit(f"--only {args.only!r} is not a candidate")
         order = [ref_id] if args.only == ref_id else [ref_id, args.only]
+        if hp_id and sel_id == ref_id and hp_id not in order:
+            order.append(hp_id)
 
     text_path = model_dir / TEXT_CACHE
     texts: List[dict] = []
@@ -585,7 +623,8 @@ def run(
 
     for cid in order:
         kwargs = candidates[cid]
-        cached = load_scores(model_dir, cid, sha, kwargs) if texts else None
+        use_cache = texts and not getattr(args, "no_score_cache", False)
+        cached = load_scores(model_dir, cid, sha, kwargs) if use_cache else None
         if cached is not None:
             scores[cid] = cached
             continue
@@ -661,9 +700,35 @@ def finish(args, model_dir, texts, sha, candidates, ref_id, sel_id, scores, erro
         detail=(f"{positions} answer positions scored" if ref else f"reference {ref_id} not scored: {errors.get(ref_id, 'no texts')}")
         + ("" if positions >= args.min_positions else "; generate more or longer texts (--num-texts, --max-new-tokens)"),
     ))
+    hf_stats = None
+    hf_skip = ""
+    if not args.hf_positions:
+        hf_skip = "HF slice off (--hf-positions 0)"
+        checks.append(check("reference_vs_hf", None, severity="advisory", detail=hf_skip))
+    elif ref is None or not args.hf_model:
+        hf_skip = "no --hf-model" if not args.hf_model else "reference not scored"
+        checks.append(check("reference_vs_hf", None, severity="advisory", detail=hf_skip))
+    else:
+        reason = hf_fit(args.hf_model)
+        if reason:
+            hf_skip = reason
+            checks.append(check("reference_vs_hf", None, severity="advisory", detail=reason))
+        else:
+            hf_rows = score_hf(hf_loader(args.hf_model), texts, args.hf_positions, ref)
+            # KL(ref || HF) on the reference's top-k; ΔNLL = HF - reference.
+            hf_stats = compare(ref[: len(hf_rows)], hf_rows)
+            ok = hf_stats.get("kl_x1000", 0.0) <= args.hf_kl_max_x1000
+            checks.append(check(
+                "reference_vs_hf", ok, severity="advisory", value=round(hf_stats.get("kl_x1000", 0.0), 2),
+                threshold=args.hf_kl_max_x1000,
+                detail=f"KL(reference||HF)×1000 {hf_stats.get('kl_x1000', 0.0):.1f}, top-1 agree {hf_stats['top1_agree']:.3f}, "
+                f"NLL HF-ref {hf_stats['dnll']:+.4f} over {hf_stats['positions']} positions"
+                + ("" if ok else "; the reference itself loses accuracy (approximate activations, fidelity, BFP weights)"),
+            ))
+            lines.append(f"HF vs {ref_id}: KLx1000={hf_stats.get('kl_x1000', 0.0):.1f} top1agree={hf_stats['top1_agree']:.3f}")
+
     if sel_id == ref_id:
-        checks.append(check("selected_within_noise", True if ref else False, value=0.0,
-                            detail=f"selected config is the reference {ref_id}"))
+        checks.append(reference_selected_check(args, ref_id, ref, per, hf_stats, hf_skip, errors))
     elif "dnll" in per.get(sel_id, {}):
         s = per[sel_id]
         checks.append(check(
@@ -692,30 +757,6 @@ def finish(args, model_dir, texts, sha, candidates, ref_id, sel_id, scores, erro
         ))
         lines.append(f"decode {sel_id}: top1 {dec['top1']:.3f} vs ref {dec['top1_ref']:.3f}, agree {dec['agree']:.3f}")
 
-    hf_stats = None
-    if not args.hf_positions:
-        checks.append(check("reference_vs_hf", None, severity="advisory", detail="HF slice off (--hf-positions 0)"))
-    elif ref is None or not args.hf_model:
-        checks.append(check("reference_vs_hf", None, severity="advisory",
-                            detail="no --hf-model" if not args.hf_model else "reference not scored"))
-    else:
-        reason = hf_fit(args.hf_model)
-        if reason:
-            checks.append(check("reference_vs_hf", None, severity="advisory", detail=reason))
-        else:
-            hf_rows = score_hf(hf_loader(args.hf_model), texts, args.hf_positions, ref)
-            # KL(ref || HF) on the reference's top-k; ΔNLL = HF - reference.
-            hf_stats = compare(ref[: len(hf_rows)], hf_rows)
-            ok = hf_stats.get("kl_x1000", 0.0) <= args.hf_kl_max_x1000
-            checks.append(check(
-                "reference_vs_hf", ok, severity="advisory", value=round(hf_stats.get("kl_x1000", 0.0), 2),
-                threshold=args.hf_kl_max_x1000,
-                detail=f"KL(reference||HF)×1000 {hf_stats.get('kl_x1000', 0.0):.1f}, top-1 agree {hf_stats['top1_agree']:.3f}, "
-                f"NLL HF-ref {hf_stats['dnll']:+.4f} over {hf_stats['positions']} positions"
-                + ("" if ok else "; the reference itself loses accuracy (approximate activations, fidelity, BFP weights)"),
-            ))
-            lines.append(f"HF vs {ref_id}: KLx1000={hf_stats.get('kl_x1000', 0.0):.1f} top1agree={hf_stats['top1_agree']:.3f}")
-
     data = {
         "reference": ref_id,
         "selected": sel_id,
@@ -731,6 +772,51 @@ def finish(args, model_dir, texts, sha, candidates, ref_id, sel_id, scores, erro
         data["hf"] = _compact(hf_stats)
     path = write_result(model_dir, PROBE, checks, summary_lines=lines, data=data)
     return print_summary(path)
+
+
+def reference_selected_check(args, ref_id, ref, per, hf_stats, hf_skip, errors):
+    """selected_within_noise when the selected candidate is the reference itself.
+
+    The reference compared with itself proves nothing, so a more precise
+    comparison must vouch for it: a --higher-precision candidate or the HF slice.
+    """
+    from readiness_check.eval_readiness_result import check
+
+    if ref is None:
+        return check("selected_within_noise", False, detail=f"reference {ref_id} not scored: {errors.get(ref_id, 'no texts')}")
+    hp_id = getattr(args, "higher_precision", "") or ""
+    hp = per.get(hp_id, {}) if hp_id else {}
+    if "dnll" in hp:
+        # ΔNLL = higher-precision - reference: the reference must not be worse.
+        se = hp["dnll_se"] if math.isfinite(hp["dnll_se"]) else 0.0
+        bound = max(2.0 * se, args.nll_floor)
+        kl = hp.get("kl_x1000")
+        ok = -hp["dnll"] <= bound and (kl is None or kl <= args.kl_max_x1000)
+        return check(
+            "selected_within_noise", ok, value=round(-hp["dnll"], 5), threshold=round(bound, 5),
+            detail=f"selected is the reference {ref_id}; vs higher-precision {hp_id}: reference NLL excess "
+            f"{-hp['dnll']:+.4f} (bound {bound:.4f})" + (f", KL×1000 {kl:.1f} (max {args.kl_max_x1000:g})" if kl is not None else "")
+            + ("" if ok else "; the selected reference loses accuracy against a more precise build"),
+        )
+    if hf_stats is not None:
+        kl = hf_stats.get("kl_x1000", 0.0)
+        ok = kl <= args.hf_kl_max_x1000
+        return check(
+            "selected_within_noise", ok, value=round(kl, 2), threshold=args.hf_kl_max_x1000,
+            detail=f"selected is the reference {ref_id}; vs HF: KL×1000 {kl:.1f} (max {args.hf_kl_max_x1000:g})"
+            + ("" if ok else "; fix the reference drift (see reference_vs_hf usual fixes)"),
+        )
+    why = []
+    if hp_id:
+        why.append(f"--higher-precision {hp_id} not scored: {hp.get('error', errors.get(hp_id, 'unknown'))}")
+    else:
+        why.append("no --higher-precision candidate")
+    why.append(f"HF slice not measured: {hf_skip or 'unknown'}")
+    return check(
+        "selected_within_noise", False,
+        detail=f"selected is the reference {ref_id} and nothing more precise was scored ({'; '.join(why)}); "
+        "score a higher-precision build or run the HF slice, or record a limitation with this reason",
+    )
 
 
 def _compact(d: Dict[str, Any]) -> Dict[str, Any]:
@@ -767,6 +853,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--candidates", type=Path, required=True, help="JSON: candidate id -> build_generator kwargs")
     p.add_argument("--reference", default="", help="highest-precision candidate that fits (default: first)")
     p.add_argument("--selected", default="", help="the candidate the sweep selected (default: the reference)")
+    p.add_argument("--higher-precision", default="",
+                   help="candidate more precise than the reference (need not fit full context); required evidence "
+                   "when --selected is the reference, unless the HF slice runs")
+    p.add_argument("--no-score-cache", action="store_true", help="ignore cached candidate scores and rescore")
     p.add_argument("--only", default="", help="score only this candidate (plus the reference if missing); others come from the cache")
     p.add_argument("--max-candidates", type=int, default=DEFAULT_MAX_CANDIDATES)
     p.add_argument("--num-texts", type=int, default=DEFAULT_NUM_TEXTS)
