@@ -31,8 +31,8 @@ target tt-metal checkout.
   identity, context contracts and real-weight coverage for each decoder-layer kind.
   Preserve stage goals, checker exit meanings and resume behavior when importing.
 - Use operator-selected paths and limit Docker cleanup to the recorded run container.
-- The benchmark runtime is in `runtime/benchmark_stage`; Stage 11 uses fixed lm-eval
-  subsets through native-chat vLLM and 4K-input performance at each configured batch.
+- The benchmark runtime is in `runtime/benchmark_stage`; in the pipeline Stage 11 runs no evals
+  (`tasks: []`) and measures performance at each configured batch plus the serving-rate grid.
 - The `agentic-serving` skill, `scripts/check_agentic_serving.py` and the Stage 12 goal are
   authored in this plugin.
 - The standalone TTI release workflow, handoff guidance and artifact checker are in
