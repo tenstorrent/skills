@@ -6867,7 +6867,8 @@ def _checks_judge(a, p: Project | None, c, rc: int, output: str, cwd: str, env: 
         out.write(f"ttp checks: {line}\n")
     if v["flaky"]:
         seen = {"head": head, "check": str(c), "host": v["host"], "task": os.environ.get("TTP_TASK") or ""}
-        new = gatejudge.quarantine(p.state, v["flaky"], seen, now, s["days"])
+        new = gatejudge.quarantine(p.state, [i for i in v["flaky"] if i not in gatejudge.before_fix(p, v["flaky"], head)],
+                                   seen, now, s["days"])
         if new:   # into the day's deflake task of each module, model-free: a feed line, no coordinator turn
             from . import budget as bud
             tasks = gatejudge.deflake(p.db, new, seen, now, p, bud.task_default_usd(cfg, "standard"))

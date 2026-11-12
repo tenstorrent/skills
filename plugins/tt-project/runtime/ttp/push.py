@@ -5093,7 +5093,8 @@ def _gate(cmd: Any, repo: Path, env: dict, say: Callable[[str], None], head: str
         say(f"never excused (delivery.push_hard_tests): {' '.join(hard)}")
     if v["flaky"] and s["on"]:
         seen = {"head": head, "check": str(cmd), "host": host_, "task": os.environ.get("TTP_TASK") or ""}
-        new = gatejudge.quarantine(p.state, v["flaky"], seen, now, s["days"])
+        new = gatejudge.quarantine(p.state, [i for i in v["flaky"] if i not in gatejudge.before_fix(p, v["flaky"], head)],
+                                   seen, now, s["days"])
         if new:   # into the day's deflake task of each module, model-free: a feed line, no coordinator turn
             tasks = gatejudge.deflake(p.db, new, seen, now, p, task_default_usd(cfg, "standard"))
             # pushq._event's row, written here: pushq imports push (and landed) at import time, and a

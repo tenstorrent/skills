@@ -2981,8 +2981,9 @@ class Batch:
             self.flaky.append({"ids": v["flaky"], "head": head, "cmd": str(cmd)})
             self.checks["flaky"] = True
         if v["flaky"] and s["on"]:
-            gatejudge.quarantine(self.p.state, v["flaky"], {"head": head, "check": str(cmd), "host": where,
-                                                            "batch": self.id}, now, s["days"])
+            gatejudge.quarantine(self.p.state, [i for i in v["flaky"] if i not in gatejudge.before_fix(self.p, v["flaky"], head)],
+                                 {"head": head, "check": str(cmd), "host": where,
+                                 "batch": self.id}, now, s["days"])
         if base and base == self.tip:
             # The leak scan blocks even when the tip fails it too; any other test the tip fails on its own
             # (another way than here, or here being the tip) is the tip's, not the batch's (_tip_excused).

@@ -470,6 +470,30 @@ def owned(db, state: Path, ids, now: float | None = None) -> dict[str, int]:
     return out
 
 
+def before_fix(p, ids, head: str) -> list[str]:
+    """Those of `ids` whose last deflake owner (DEFLAKE_KEY) is done and landed on the push branch while `head`
+    does not contain that landing: a flake seen before its fix, never quarantined again nor given a new
+    deflake task. Local refs only; any doubt (no head, unreadable) leaves an id out."""
+    if not head or not ids:
+        return []
+    from . import landed
+    repo, tip = _push_tip(p)
+    if not tip:
+        return []
+    last: dict[str, int] = {}
+    for k, v in sorted(((int(k), v) for k, v in p.db.kv_dict(DEFLAKE_KEY)[0].items() if k.isdigit()), key=lambda x: x[0]):
+        for i in (v.get("ids") or []) if isinstance(v, dict) else ():
+            if i in ids:
+                last[i] = k
+    out = []
+    for i, tid in last.items():
+        t = p.db.task(tid)
+        if t and t["status"] == "done" and landed.check(p, repo, tid=tid, fetch=False)[0] == 0 \
+                and landed.check(p, repo, tid=tid, onto=head, fetch=False)[0] != 0:
+            out.append(i)
+    return sorted(out)
+
+
 def seen_again(db, owners: dict[str, int], sha: str) -> list[int]:
     """Add one line naming `sha` and the tests to each owner task's spec (`owners`: {id: task}), once per sha.
     The tasks changed, ascending."""

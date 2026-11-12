@@ -448,6 +448,23 @@ def test_post_land_failure_of_a_quarantined_test_whose_owner_finished_is_reverte
     assert "again at" not in p.db.task(tid)["spec"]
 
 
+def test_flake_seen_at_a_head_before_its_landed_deflake_fix_is_not_quarantined_again(env, tmp_path, monkeypatch):
+    from ttp import gatejudge, landed
+    p, g, pushed, _ = _pl_land(env, tmp_path, monkeypatch, _PL_BAD, n=3, bad_at=0)
+    tid = _pl_owner(p)
+    gatejudge.lift(p.state, [_PL_X], "its fix landed")
+    p.db.update_task(tid, status="done")
+    contains = {"v": False}
+    monkeypatch.setattr(landed, "check", lambda *a, onto=None, **k: (0 if not onto or contains["v"] else 1, ""))
+    monkeypatch.setattr(gatejudge, "_push_tip", lambda p_: (Path(p.root), "tip"))
+    assert gatejudge.before_fix(p, [_PL_X, "tests/t.py::test_other"], "a" * 12) == [_PL_X], "head lacks the fix"
+    contains["v"] = True
+    assert gatejudge.before_fix(p, [_PL_X], "a" * 12) == [], "head has the fix: a real flake again"
+    contains["v"] = False
+    p.db.update_task(tid, status="queued")
+    assert gatejudge.before_fix(p, [_PL_X], "a" * 12) == [], "owner not landed"
+
+
 def test_post_land_first_full_run_spills_and_its_reruns_bisect_and_revert_run_here(env, tmp_path, monkeypatch):
     """The post-landing suite's first full run on the landed sha goes to a spill host (checkspill.spill_run, as
     the push batch's first runs do) and its claim is closed after it; every rerun of the failing tests (at the

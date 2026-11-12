@@ -396,10 +396,12 @@ def _judge(p: Project, job: dict, checks: list, run, owned: dict) -> dict:
         from .budget import task_default_usd
         cfg, now = p.config(), time.time()
         seen = {"head": sha, "check": "post_land_checks", "host": gatejudge.host()}
+        early = gatejudge.before_fix(p, flaky, sha)   # seen at a head without its deflake owner's landed fix
+        flaky = [i for i in flaky if i not in early]
         new = gatejudge.quarantine(p.state, flaky, seen, now, gatejudge.settings(cfg)["days"])
         # a fix owner like the tests gate's flakes get: the day's deflake task of each module
         tasks = gatejudge.deflake(p.db, new, seen, now, p, task_default_usd(cfg, "standard")) if new else []
-        return {"outcome": "flaky", "ids": flaky, "deflake": tasks}
+        return {"outcome": "flaky" if flaky else "pass", "ids": flaky, "deflake": tasks, "before_fix": early}
     return {"outcome": "pass"}
 
 
