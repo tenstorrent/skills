@@ -2234,10 +2234,12 @@ def test_a_worker_that_waited_on_the_batch_lock_times_its_call_from_its_start(en
             batch["lock"] = Lock()
     monkeypatch.setattr(watchers.PrCycle, "plan", planned)
 
-    def took(argv):
-        if any("pullRequest(number:" in x for x in argv):
+    def took(argv):   # the per-PR reads after it take no time: the two run at once in real time, but the
+        # shared fake clock adds their times one after the other, so one would seem to start late
+        if any("p0:pullRequest(number:" in x for x in argv):   # the batched query
             assert waiting.wait(10), "the other worker waits on the batch's lock"
-        return 15.0
+            return 15.0
+        return 0.0
     spans = _slow_gh(monkeypatch, gh, took)
     watchers.run_builtin(Daemon(p.base), "prs", {"deadline_s": 25, "gh_timeout_s": 20, "pr_workers": 2})
     assert waiting.is_set() and len(spans) >= 2, spans

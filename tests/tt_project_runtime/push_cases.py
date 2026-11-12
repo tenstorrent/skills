@@ -7236,13 +7236,12 @@ def test_own_push_refuses_another_tasks_branch_it_only_inherited(env, monkeypatc
     assert _ttp("push", "--own") == 2
     assert "only inherited" in capsys.readouterr().err
     assert _git_out(origin, "rev-parse", theirs) == shipped
-    # --own-branch publishes the task's own branch under its own name. cmd_push sets OWN_BRANCH_ENV in
-    # this process: registered unset first, so teardown unsets it rather than restoring its value.
+    # --own-branch publishes the task's own branch under its own name; cmd_push's flag never outlives the call.
     monkeypatch.delenv(push.OWN_BRANCH_ENV, raising=False)
     assert _ttp("push", "--own-branch") == 0, capsys.readouterr().err
     assert _git_out(origin, "rev-parse", own) == _git_out(repo, "rev-parse", "HEAD")
     assert _git_out(origin, "rev-parse", theirs) == shipped
-    monkeypatch.delenv(push.OWN_BRANCH_ENV)
+    assert push.OWN_BRANCH_ENV not in os.environ
     # A worktree on the other task's branch itself (it started there): refused too.
     task("Plan again", labels=[f"pr_branch:{theirs}"], on=theirs)
     with pytest.raises(ValueError, match="only inherited"):

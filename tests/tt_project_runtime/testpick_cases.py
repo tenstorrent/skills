@@ -547,7 +547,7 @@ def test_only_a_tasks_ttp_checks_narrows_so_every_push_batch_runs_the_full_suite
     from ttp import batch, cli
     import inspect
     assert inspect.getsource(batch).count("testpick.narrow(") == 1 and "testpick.narrow(" in inspect.getsource(batch.Batch._express_checks)
-    assert inspect.getsource(cli).count("testpick.narrow(") == 1 and "testpick.narrow(" in inspect.getsource(cli.cmd_checks)
+    assert inspect.getsource(cli).count("testpick.narrow(") == 1 and "testpick.narrow(" in inspect.getsource(cli._cmd_checks)
 
 
 def test_a_tasks_ttp_checks_runs_delivery_task_checks_while_the_push_train_keeps_the_push_checks(env, tmp_path,
