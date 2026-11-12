@@ -429,16 +429,18 @@ def quality_text(q: dict, hours: float) -> str:
 
 
 def code_quality(db, cfg: dict, since: float, until: float | None = None) -> dict:
-    """Code tasks on Sonnet (CODE_KEY) vs on Opus per kind in [since, until), each task by its last worker run
-    there and counted once its outcome is known: {kind: {"sonnet", "opus": {"tasks", "bad", "share"}, "gap",
-    "state"}}. Bad: the run or task failed, a needs_review hand-off, or its first review (auto_review:<id>)
-    asked for changes. "state": "off" (ALARM_MIN each, Sonnet worse by more than QUALITY_GAP), "full"
-    (CODE_FULL_MIN Sonnet tasks, ALARM_MIN Opus ones, within QUALITY_GAP) or "canary"."""
+    """Code tasks on Sonnet (CODE_KEY) vs on Opus per kind in [since, until), each task by its first worker run
+    there (the model it started on, so a failed try retried a tier up stays on the side that failed) and counted
+    once its outcome is known: {kind: {"sonnet", "opus": {"tasks", "bad", "share"}, "gap", "state"}}. Bad: that
+    run or the task failed, a retry raised its tier, a needs_review or failed hand-off, or its first review
+    (auto_review:<id>) asked for changes. "state": "off" (ALARM_MIN each, Sonnet worse by more than
+    QUALITY_GAP), "full" (CODE_FULL_MIN Sonnet tasks, ALARM_MIN Opus ones, within QUALITY_GAP) or "canary"."""
+    from .effort import RAISED
     until = time.time() if until is None else until
     last: dict = {}
     for r in db.q("SELECT task, provider, model, status, note FROM runs WHERE role='worker' AND task IS NOT NULL "
                   "AND started>=? AND started<? AND status!='running' ORDER BY started", (since, until)):
-        last[r["task"]] = dict(r)
+        last.setdefault(r["task"], dict(r))   # its first run
     tasks = {t["id"]: dict(t) for t in db.q(
         f"SELECT * FROM tasks WHERE kind='code' AND id IN ({','.join('?' * len(last))})", tuple(last))} if last else {}
     first: dict = {}
@@ -451,21 +453,22 @@ def code_quality(db, cfg: dict, since: float, until: float | None = None) -> dic
     out = {k: {m: {"tasks": 0, "bad": 0, "share": 0.0} for m in ("sonnet", "opus")} for k in CODE_KINDS}
     for tid, task in tasks.items():
         r = last[tid]
-        kind = code_kind(task, cfg)
-        if kind not in out:
-            continue
+        raised = task.get("tier_source") == "retry_tier_up"
+        if raised:   # judged at the tier it started at, not the one its retry raised it to
+            task = {**task, "tier": {"deep": "standard", "standard": "light"}.get(str(task.get("tier")), "")}
         cheap = cheap_run(_note(r), str(r["provider"] or ""))
         side = "sonnet" if (cheap or {}).get(CODE_KEY) else "opus" if not cheap and \
             "opus" in str(r["model"] or "") else None
-        if not side:
+        kind = cheap[CODE_KEY] if side == "sonnet" else code_kind(task, cfg)
+        if not side or kind not in out:
             continue
         try:
             got = json.loads(task.get("result") or "{}")
         except (TypeError, ValueError):
             got = {}
-        hand = got.get("status") if isinstance(got, dict) else None
-        bad = r["status"] == "failed" or task.get("status") == "failed" or hand in ("failed", "needs_review") \
-            or first.get(tid) == "failed"
+        got = got if isinstance(got, dict) else {}
+        bad = r["status"] == "failed" or task.get("status") == "failed" or raised or bool(got.get(RAISED)) \
+            or got.get("status") in ("failed", "needs_review") or first.get(tid) == "failed"
         if not bad and tid not in first:
             continue   # outcome not known yet: no review verdict
         out[kind][side]["tasks"] += 1

@@ -495,3 +495,54 @@ def test_code_quality_moves_a_kind_full_when_sonnet_matches_opus_and_back_to_opu
     assert len(ev) == 1 and "Code tasks (new)" in ev[0]["text"] and "route.code_sonnet" in ev[0]["text"]
     t = {"id": 1, "kind": "code", "tier": "standard", "title": "x", "labels": "[]"}
     assert runclass.core_cheap({}, t, "hard", "standard", "claude", None, None, d._code_state()) is None
+
+
+def test_code_quality_counts_a_task_retried_a_tier_up_as_bad_on_the_model_it_started_on(env):
+    from ttp import runclass
+    p = make(env)
+    now = time.time()
+    sonnet_note = json.dumps({runclass.CHEAP_KEY: {"provider": "claude", "model": "sonnet", "effort": "high",
+                                                   "class": "hard", runclass.CODE_KEY: "new"}})
+
+    def task(sonnet, escalated=False, review_bad=False, review=True):
+        t = p.db.add_task("t", "", kind="code", tier="standard", priority=3, budget_usd=1.0)
+        if escalated:   # its first run failed; the retry ran a tier up on Opus and passed
+            p.db.x("INSERT INTO runs(task,role,provider,model,started,status,cost_usd,note) VALUES(?,?,?,?,?,?,?,?)",
+                   (t, "worker", "claude", "sonnet" if sonnet else "claude-opus-5-5", now - 900, "failed", 0.1,
+                    sonnet_note if sonnet else None))
+            p.db.x("UPDATE tasks SET tier='deep', tier_source='retry_tier_up' WHERE id=?", (t,))
+        p.db.x("UPDATE tasks SET status='done', result=? WHERE id=?", (json.dumps({"status": "done"}), t))
+        if not escalated:
+            p.db.x("INSERT INTO runs(task,role,provider,model,started,status,cost_usd,note) VALUES(?,?,?,?,?,?,?,?)",
+                   (t, "worker", "claude", "sonnet" if sonnet else "claude-opus-5-5", now - 600, "ok", 0.1,
+                    sonnet_note if sonnet else None))
+        else:
+            p.db.x("INSERT INTO runs(task,role,provider,model,started,status,cost_usd) VALUES(?,?,?,?,?,?,?)",
+                   (t, "worker", "claude", "claude-opus-5-5", now - 600, "ok", 0.5))
+        if review:
+            r = p.db.add_task(f"Review #{t}", "", kind="review", tier="standard", priority=3, budget_usd=1.0)
+            p.db.x("UPDATE tasks SET status=?, labels=? WHERE id=?",
+                   ("failed" if review_bad else "done", json.dumps([f"auto_review:{t}"]), r))
+        return t
+
+    task(True, escalated=True)    # Sonnet failed, Opus retry passed review: one bad Sonnet task, no Opus one
+    task(False, escalated=True)   # same on Opus: one bad Opus task
+    task(True, escalated=True, review=False)   # bad without a verdict: still known
+    q = runclass.code_quality(p.db, {}, now - runclass.CODE_WINDOW_S, now)["new"]
+    assert (q["sonnet"]["tasks"], q["sonnet"]["bad"]) == (2, 2)
+    assert (q["opus"]["tasks"], q["opus"]["bad"]) == (1, 1)
+    # A light task raised to standard by a retry is no standard task: not counted on Opus.
+    t = p.db.add_task("t", "", kind="code", tier="standard", priority=3, budget_usd=1.0)
+    p.db.x("UPDATE tasks SET tier_source='retry_tier_up', status='done' WHERE id=?", (t,))
+    p.db.x("INSERT INTO runs(task,role,provider,model,started,status,cost_usd) VALUES(?,?,?,?,?,?,?)",
+           (t, "worker", "claude", "claude-opus-5-5", now - 600, "failed", 0.1))
+    assert runclass.code_quality(p.db, {}, now - runclass.CODE_WINDOW_S, now)["new"]["opus"]["tasks"] == 1
+    # Escalations alone take a kind off: Opus 1 bad of 6, Sonnet 1 clean review + 4 escalations of 5.
+    for i in range(5):
+        task(False)
+    task(True)
+    for i in range(2):
+        task(True, escalated=True)
+    q = runclass.code_quality(p.db, {}, now - runclass.CODE_WINDOW_S, now)["new"]
+    assert (q["sonnet"]["tasks"], q["sonnet"]["bad"], q["opus"]["tasks"], q["opus"]["bad"]) == (5, 4, 6, 1)
+    assert q["state"] == "off"
