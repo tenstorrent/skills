@@ -526,7 +526,7 @@ def not_an_ask(db: DB, ref: str | None, text: str | None = "") -> str:
 
 
 _GH_NO_LOGIN = re.compile(r"\bgh\b[^.\n]{0,60}\b(?:no login|not logged in(?:to)?|has no login|logged out)\b|"
-                          r"To get started with GitHub CLI, please run", re.I)
+                          r"To get started with GitHub CLI\b", re.I)
 
 
 def reclassify(db: DB, now: float | None = None) -> list[dict]:

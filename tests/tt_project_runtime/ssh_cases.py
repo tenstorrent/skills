@@ -730,6 +730,8 @@ def test_no_runtime_code_runs_ssh_keygen_or_ssh_add():
     import ttp
     root = Path(ttp.__file__).parent
     guards = {"credguard.py", "pathguard.py", "credwatch.py", "sidefx.py", "bridge_cert.py"}
-    call = _re.compile(r"""["']ssh-(?:keygen|add)["']\s*[,\]]|\bssh-keygen\s+-[tf]""")
+    # `ssh-add -l` only lists an agent's keys (bridgewatch.answers): it neither makes nor loads one.
+    call = _re.compile(r"""["']ssh-keygen["']\s*[,\]]|["']ssh-add["']\s*(?:\]|,(?!\s*["']-[lL]["']))"""
+                       r"""|\bssh-keygen\s+-[tf]""")
     hits = [f.name for f in root.rglob("*.py") if f.name not in guards and call.search(f.read_text())]
     assert hits == [], hits

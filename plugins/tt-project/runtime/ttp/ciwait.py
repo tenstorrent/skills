@@ -41,9 +41,10 @@ def _gh(args: list[str]) -> list | dict | None:
         return None
     if via:
         ghroute.seen(out.returncode, ghroute.route())
-    if out.returncode == ghroute.SSH_RC if via else (out.returncode and args[:1] == ["api"]
-                                                      and ghauth.auth_failed(out.returncode, out.stderr)):
-        # the route down, or unset with no login here: a public read, else no answer
+    if out.returncode in (ghroute.SSH_RC, ghroute.HELD_RC) if via else (
+            out.returncode and args[:1] == ["api"] and ghauth.auth_failed(out.returncode, out.stderr)):
+        # the route down, a read still queued for the workstation (unset with no login here), or no
+        # route and no login: a public read, else no answer
         got = ghroute.public(args) if args[:1] == ["api"] else None
         try:
             return json.loads(got[1]) if got else None
