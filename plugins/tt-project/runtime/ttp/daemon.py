@@ -38,6 +38,7 @@ from pathlib import Path
 
 from . import runtimeload   # first of its own: its LOADED_AT is when the daemon imported its code
 from . import batchrun
+from . import leadmode
 from . import coordprecheck
 from . import rejtally
 from . import untrusted
@@ -10143,7 +10144,7 @@ class Daemon:
             self._stall_ready = {}
             return
         core = self.cfg.get("core_provider", "claude")
-        ready = db.ready_tasks()
+        ready = self._lead_ready(db.ready_tasks())
         busy = {r["provider"]: r["n"] for r in db.q(
             "SELECT provider, COUNT(*) n FROM runs WHERE role!='coordinator' AND status='running' GROUP BY provider")}
         ctx = {"now": now, "paused": db.paused_resources(), "busy": busy, "committed": None,
@@ -10373,7 +10374,7 @@ class Daemon:
             return
         db = self.p.db
         due = self._owner_due()
-        hot = [t for t in db.ready_tasks() if t["id"] in due or urgent.is_urgent(t)]
+        hot = [t for t in self._lead_ready(db.ready_tasks()) if t["id"] in due or urgent.is_urgent(t)]
         gated = self._gated_urgent(now)
         core = self.cfg.get("core_provider", "claude")
         ctx = {"now": now, "paused": db.paused_resources(), "committed": None,
@@ -10622,7 +10623,7 @@ class Daemon:
         except Exception:   # a broken promise record never stops the ready check
             log(self.p, "announced_not_started check failed\n" + traceback.format_exc())
         core = self.cfg.get("core_provider", "claude")
-        ready = db.ready_tasks()
+        ready = self._lead_ready(db.ready_tasks())
         busy = {r["provider"]: r["n"] for r in db.q(
             "SELECT provider, COUNT(*) n FROM runs WHERE role!='coordinator' AND status='running' GROUP BY provider")}
         ctx = {"now": now, "paused": paused, "busy": busy, "committed": None, "owners": self._owner_due(),
@@ -11068,7 +11069,7 @@ class Daemon:
         held = {}
         if self._device_tasks_running() >= cap and running < loadcaps.workers(self.cfg) \
                 and self._resource_ready(sorted(dev)[0]):
-            held = {t["id"]: t for t in db.ready_tasks() if needs_device(t, self.cfg) and self._resources_free(t)}
+            held = {t["id"]: t for t in self._lead_ready(db.ready_tasks()) if needs_device(t, self.cfg) and self._resources_free(t)}
         seen = getattr(self, "_cap_waits", {})
         self._cap_waits = {tid: seen.get(tid, now) for tid in held}
         for tid, t in held.items():
@@ -11377,7 +11378,7 @@ class Daemon:
         if gate.level in ("orange", "red") or not gate.allow_new_work:
             return idle, 0
         free = max(gate.max_parallel - busy.get(core, 0), 0)
-        ready = db.ready_tasks()
+        ready = self._lead_ready(db.ready_tasks())
         ctx = {"now": now, "paused": paused, "busy": busy, "committed": None,
                "logged_out": {prov: self._logged_out(prov) for prov in {t["provider"] or core for t in ready}}}
         if any(self._start_hold(t, t["provider"] or core, ctx) is None for t in ready):
@@ -11896,6 +11897,14 @@ class Daemon:
         queued = db.q("SELECT id, ts, kind, severity, task, source, data FROM events WHERE status='queued' ORDER BY id")
         # A failed resume of the persistent session (coordsession.py) reruns its batch at once: no hold or gate.
         rerun = bool((db.kv(coordsession.KEY) or {}).get("rerun"))
+        # Lead mode (leadmode.py): tasks wait for the coordinator itself, so a turn starts soon after the
+        # last one ends, past the routine holds and gates; a turn that moved nothing backs it off.
+        lead = None
+        if leadmode.on(self.cfg):
+            try:
+                lead = leadmode.due(db, self.cfg, db.ready_tasks(), now)
+            except Exception:   # the lead wake only keeps the list moving: a failure leaves the other wakes
+                log(self.p, "lead wake check failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
         try:
             # The same unchanged cause as a just-rejected action is counted, not woken (rejcool.py).
             queued = rejcool.screen_queued(db, self.cfg, queued, now, user_spoke=bool(msgs))
@@ -11933,7 +11942,7 @@ class Daemon:
         # An event of a task a deadline hangs on (eventhold.hot) skips every hold below and the triage.
         hot = not msgs and not rerun and eventhold.hot(db, [e for e in evs if not pagesev.rides_along(e)], now)
         # So do plain hand-offs (_plain_done_held), up to coordinator.plain_done_hold_max_s.
-        held = [] if msgs or unsized[0] or rerun or hot or len(rides) == len(evs) else \
+        held = [] if msgs or unsized[0] or rerun or hot or lead or len(rides) == len(evs) else \
             self._plain_done_held(evs, now, unsized[1])
         # A slow tick step's report (pagesev.TICK_KINDS) never ages into a turn of its own.
         aging = [e for e in rides if e["kind"] not in pagesev.TICK_KINDS]
@@ -11941,6 +11950,8 @@ class Daemon:
                 not aging or now - min(e["ts"] for e in aging) < pagesev.RIDE_ALONG_MAX_S):
             if fire:
                 w, wake = {"due": "look"}, db.kv("idle_wake", {}) or {}
+            elif lead:
+                w, wake = {"due": "lead"}, db.kv("idle_wake", {}) or {}
             elif coord.rejection_due(db, now):
                 # A rejection no turn carried in coord.REJECTION_WAIT_S starts one, so none is dropped.
                 w, wake = {"due": coord.REJECTION_DUE}, db.kv("idle_wake", {}) or {}
@@ -11963,7 +11974,7 @@ class Daemon:
             own = [e for e in queued if not pagesev.rides_along(e)]   # ride-alongs neither hold nor start a turn
             # An overdue promise or order, or a failed claim, wakes the coordinator at once (mustact.py);
             # a must-act item that rides along (a host-held queue wait) holds like any other ride-along.
-            urgent = hot or any(e["kind"] in mustact.KINDS and not pagesev.rides_along(e) for e in evs)
+            urgent = hot or bool(lead) or any(e["kind"] in mustact.KINDS and not pagesev.rides_along(e) for e in evs)
             # Relayed messages with no order or question wait out the relay window, so a burst is one turn.
             if msgs and not rerun and not any(eventhold.immediate(e) for e in evs) and self._relay_hold(msgs, now):
                 return
@@ -11973,6 +11984,8 @@ class Daemon:
                 return
             if not msgs and not rerun and not urgent and self._event_hold(own, now):
                 return
+            if lead:
+                w = {"due": "lead"}
         if evs and not msgs and not rerun and settlehook.command(self.cfg):
             # The project's own hook settles routine events model-free (settlehook.py).
             own_n = len([e for e in evs if not pagesev.rides_along(e)])
@@ -11984,7 +11997,7 @@ class Daemon:
             if own_n and w is None and not [e for e in evs if not pagesev.rides_along(e)] and (
                     not evs or now - min(e["ts"] for e in evs) < pagesev.RIDE_ALONG_MAX_S):
                 return
-        if not msgs and not rerun and not fire:
+        if not msgs and not rerun and not fire and not lead:
             try:
                 # Every open task held by what no turn lifts, and nothing new since the last turn: a
                 # routine batch or wake is settled without a model run (quietgate.py).
@@ -12009,7 +12022,7 @@ class Daemon:
             except Exception:   # the gate only saves money: a failure runs the turn
                 log(self.p, "coordinator quiet gate failed: " + traceback.format_exc().replace("\n", " | ")[:1500])
         seen_now: dict = {}
-        if evs and not msgs and not rerun:
+        if evs and not msgs and not rerun and not lead:
             try:
                 # A batch a turn that decided nothing already met, against the same state, is settled
                 # without a model run (turngate.py). A batch with an effort trigger always runs; the
@@ -12051,7 +12064,7 @@ class Daemon:
         # none before its cool-down ends, then one turn takes everything queued meanwhile. A user message
         # or a must-act item wakes it at once; worker dispatch is not held by it.
         hold = (getattr(gate, "coord_hold", None) or {}) if gate else {}
-        if hold and not msgs and now < float(hold.get("until") or 0) \
+        if hold and not msgs and not lead and now < float(hold.get("until") or 0) \
                 and not any(e["kind"] in mustact.KINDS and not pagesev.rides_along(e) for e in evs):
             if getattr(self, "_coord_hold_logged", None) != hold.get("until"):
                 self._coord_hold_logged = hold.get("until")
@@ -12096,10 +12109,12 @@ class Daemon:
             seen_looks = [("looks", looks.digest(fire, lambda t: timefmt.short(t, self.p), now, quiet_looks))] \
                 if fire or quiet_looks else []
             parts += seen_looks
+            lead_part = [("lead", leadmode.digest(db, lead))] if lead else []
+            parts += lead_part
             prompt = "\n".join(text for _, text in parts)
             # A session wake may send only what changed.
             full = (([(mustact.SECTION, must)] if must else []) + coord.split_cached(whole)[1]
-                    + ([(slowcomplaint.SECTION, speed)] if speed else []) + seen_looks)
+                    + ([(slowcomplaint.SECTION, speed)] if speed else []) + seen_looks + lead_part)
             session_digest = {"parts": parts, "full": full, "seen": coordsession.fingerprint(baseline),
                               "shown": coordsession.fingerprint(shown)}
             head, context = coord.prompt_parts(self.p)
@@ -12129,6 +12144,8 @@ class Daemon:
             self._coordinator_failed(f"could not start: {type(e).__name__}: {e}"[:250])
             return
         db.set_kv("last_coordinator_turn", now)
+        if lead:
+            leadmode.started(db, lead, now)
         looks.settle(db, [x["id"] for x in fire], "woken", rid, now)
         quietgate.started(db)
         bursthold.started(db, evs, rid, now)
@@ -12262,7 +12279,7 @@ class Daemon:
         db = self.p.db
         paused = db.paused_resources()
         # A review held for the checks the daemon started on its head (_precheck_holds) fills no slot yet.
-        return sum(1 for t in db.ready_tasks() if not coord.task_resources(t) & paused.keys()
+        return sum(1 for t in self._lead_ready(db.ready_tasks()) if not coord.task_resources(t) & paused.keys()
                    and not (t["blocked_reason"] or "").startswith((PAUSED_NOTE, LOGGED_OUT_NOTE, NET_HELD_NOTE,
                                                                      BRANCH_HELD_NOTE))
                    and not self._precheck_holds(t, now))
@@ -12392,6 +12409,7 @@ class Daemon:
         self._release_topup_holds()   # an urgent or user-ordered task held on its spent budget goes back
         self._step_over("the ready-task read")
         ready = db.ready_tasks()   # read after _slot_reservations, which may have woken a reserving task
+        ready = self._lead_gate(ready)   # lead mode: the coordinator works the rest itself (leadmode.py)
         reached = set()     # tasks that got past the gates to the resource check
         paused = db.paused_resources()
         now, core = time.time(), self.cfg.get("core_provider", "claude")
@@ -18341,7 +18359,30 @@ class Daemon:
         """Whether any queued task could start now (dependencies done, resources free)."""
         dev_full = self._device_tasks_running() >= self._device_max_tasks()
         return any(self._resources_free(t) and not (dev_full and needs_device(t, self.cfg))
-                   for t in self.p.db.ready_tasks())
+                   for t in self._lead_ready(self.p.db.ready_tasks()))
+
+    def _lead_ready(self, ready: list[dict]) -> list[dict]:
+        """The ready tasks a worker may take: in lead mode (leadmode.py) the rest wait for the
+        coordinator, so no stall, idle or slot check counts them; all of them otherwise."""
+        return [t for t in ready if leadmode.worker_task(t)] if leadmode.on(self.cfg) else ready
+
+    def _lead_gate(self, ready: list[dict]) -> list[dict]:
+        """Dispatch's lead-mode gate: the ready tasks a worker may take. Each task held for the
+        coordinator says so in its blocked_reason (written only when it changes); a task a worker may
+        take again (a `worker:` line, lead mode off) loses that note."""
+        db, lead = self.p.db, leadmode.on(self.cfg)
+        out = []
+        for t in ready:
+            mine = lead and not leadmode.worker_task(t)
+            note = t["blocked_reason"] or ""
+            if mine and note != leadmode.HELD_NOTE and not note:
+                db.update_task(t["id"], blocked_reason=leadmode.HELD_NOTE)
+            elif not mine and note == leadmode.HELD_NOTE:
+                db.update_task(t["id"], blocked_reason=None)
+                t = dict(t, blocked_reason=None)
+            if not mine:
+                out.append(t)
+        return out
 
     def _size_review(self, task: dict) -> tuple[dict, dict | None]:
         """A review runs at the tier its diff needs, not the one it was queued with: the task at that

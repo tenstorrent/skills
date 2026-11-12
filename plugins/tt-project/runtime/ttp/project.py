@@ -238,6 +238,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # in 24 h or once a job's log stops growing (0: every such wait counts as before).
     # effort_skip_triggers: trigger labels (as recorded in the turn's note) that never count.
     "coordinator": {"tier": "light", "model": "", "model_tier": "deep", "effort": "",
+                    # Lead mode (leadmode.py): the session works the task list itself; workers take only
+                    # reviews, started work, queued code and `worker:` tasks (lead_base_gap_s,
+                    # lead_max_gap_s and lead_list_max tune its continue wakes).
+                    "lead": False,
                     "repeat_fails_24h": 2, "repeat_waits_24h": 8, "live_waits_max": 6,
                     "effort_skip_triggers": [],
                     "debounce_s": 15, "max_events_per_turn": 40,
@@ -726,7 +730,7 @@ EXTRA_KEYS = {
     # the status to the coordinator's note, for chats that take no status footers.
     # drift: thresholds of the running-run drift flags (drift.py; each 0: off): repeat_fail 3, loop 4,
     # outside_spec 3, quiet_s 900, pace 1.5, and raise_s 600 before a still-flagged run reaches the coordinator.
-    "coordinator": {"session", "status_footer", "agent_orders_as_user", "owner_identities", "max_review_tasks_per_day", "charter_approval_days", "approval_lookback_days", "reask_window_days", "blocker_sweep_h", "blocker_sweep_min_gap_h",
+    "coordinator": {"lead_base_gap_s", "lead_max_gap_s", "lead_list_max", "session", "status_footer", "agent_orders_as_user", "owner_identities", "max_review_tasks_per_day", "charter_approval_days", "approval_lookback_days", "reask_window_days", "blocker_sweep_h", "blocker_sweep_min_gap_h",
                     "blocker_sweep_recheck_skip_h", "review_backlog_h", "user_pause_marker", "promise_default_h", "mitigation_due_h", "course_check",
                     "progress_check", "probe_stall_dispose_h", "routine_defaults", "echo_paths", "drift",
                     "reply_terms", "reply_max_terms", "reply_soft_chars"},   # plain-reply check (plainreply.py)

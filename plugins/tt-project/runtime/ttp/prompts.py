@@ -120,6 +120,8 @@ def coordinator_features(p: Project) -> set[str]:
     except Exception:
         pass
     on.add("session")   # the persistent coordinator, always on: its self-improvement loop (selfimprove)
+    if (cfg.get("coordinator") or {}).get("lead"):
+        on.add("lead")   # lead mode (leadmode.py): the session works the task list itself
     return on
 
 
