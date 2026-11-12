@@ -1,0 +1,305 @@
+{
+ "note": "Original short reasoning questions written for the precision-on-reasoning probe (P1). Not benchmark items.",
+ "prompts": [
+  {
+   "id": "r01",
+   "topic": "math",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Find the number of ordered pairs of positive integers (a, b) with a*b = 2^6 * 3^4 * 5^2 such that gcd(a, b) is a perfect square. Think it through step by step and give the final answer at the end."
+    }
+   ]
+  },
+  {
+   "id": "r02",
+   "topic": "math",
+   "messages": [
+    {
+     "role": "user",
+     "content": "A sequence satisfies x_1 = 3 and x_{n+1} = x_n^2 - 2x_n + 2. Find the remainder when x_6 is divided by 1000. Think it through step by step and give the final answer at the end."
+    }
+   ]
+  },
+  {
+   "id": "r03",
+   "topic": "math",
+   "messages": [
+    {
+     "role": "user",
+     "content": "How many 7-digit strings over the digits 0-9 contain no two equal adjacent digits and start and end with the same digit? Think it through step by step and give the final answer at the end."
+    }
+   ]
+  },
+  {
+   "id": "r04",
+   "topic": "math",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Let P(x) be a monic cubic with roots r, s, t satisfying r+s+t = 6, rs+st+tr = 11, and rst = 6. Compute P(4) + (r^3 + s^3 + t^3). Think it through step by step and give the final answer at the end."
+    }
+   ]
+  },
+  {
+   "id": "r05",
+   "topic": "math",
+   "messages": [
+    {
+     "role": "user",
+     "content": "A point is chosen uniformly inside a unit square. What is the probability that its distance to the nearest side is less than its distance to the center? Give an exact expression. Think it through step by step and give the final answer at the end."
+    }
+   ]
+  },
+  {
+   "id": "r06",
+   "topic": "math",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Find the smallest positive integer n such that n! has exactly 50 trailing zeros in base 12, or prove none exists. Think it through step by step and give the final answer at the end."
+    }
+   ]
+  },
+  {
+   "id": "r07",
+   "topic": "math",
+   "messages": [
+    {
+     "role": "user",
+     "content": "In triangle ABC, AB = 13, BC = 14, CA = 15. Let D be the foot of the altitude from A and M the midpoint of BC. Find the area of triangle ADM times 7. Think it through step by step and give the final answer at the end."
+    }
+   ]
+  },
+  {
+   "id": "r08",
+   "topic": "math",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Count lattice paths from (0,0) to (8,8) using unit steps right and up that never touch the line y = x + 3. Think it through step by step and give the final answer at the end."
+    }
+   ]
+  },
+  {
+   "id": "r09",
+   "topic": "math",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Let S be the sum of all positive divisors d of 10^5 for which d + 10^5/d is divisible by 7. Find S mod 1000. Think it through step by step and give the final answer at the end."
+    }
+   ]
+  },
+  {
+   "id": "r10",
+   "topic": "math",
+   "messages": [
+    {
+     "role": "user",
+     "content": "A fair die is rolled until the running total is at least 12. What is the expected number of rolls? Give the answer as a fraction. Think it through step by step and give the final answer at the end."
+    }
+   ]
+  },
+  {
+   "id": "r11",
+   "topic": "math",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Find all real x with floor(x)^2 + 3 * {x} = 7, where {x} is the fractional part of x. Think it through step by step and give the final answer at the end."
+    }
+   ]
+  },
+  {
+   "id": "r12",
+   "topic": "math",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Ten people sit at a round table. In how many ways can five disjoint pairs of neighbours be chosen so that every person is in exactly one pair, and how does the answer change for twelve people? Think it through step by step and give the final answer at the end."
+    }
+   ]
+  },
+  {
+   "id": "r13",
+   "topic": "math",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Compute the number of integers 1 <= k <= 2000 for which k^2 + k + 41 is divisible by 43. Think it through step by step and give the final answer at the end."
+    }
+   ]
+  },
+  {
+   "id": "r14",
+   "topic": "math",
+   "messages": [
+    {
+     "role": "user",
+     "content": "A regular hexagon has side 2. A circle is tangent to three alternate sides extended. Find the circle's radius in simplest radical form. Think it through step by step and give the final answer at the end."
+    }
+   ]
+  },
+  {
+   "id": "r15",
+   "topic": "math",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Find the remainder when the sum of C(3k, k) for k = 0..20 is divided by 7, explaining the use of Lucas' theorem. Think it through step by step and give the final answer at the end."
+    }
+   ]
+  },
+  {
+   "id": "r16",
+   "topic": "physics",
+   "messages": [
+    {
+     "role": "user",
+     "content": "A satellite in a circular orbit at radius R fires a short tangential burn that raises its speed by 5 percent. Estimate the new apoapsis radius in units of R and explain each step. Think it through step by step and give the final answer at the end."
+    }
+   ]
+  },
+  {
+   "id": "r17",
+   "topic": "physics",
+   "messages": [
+    {
+     "role": "user",
+     "content": "A 2 kg block on a 30 degree incline with kinetic friction coefficient 0.2 is released from rest 3 m above the base. Find its speed at the base and the heat generated. Think it through step by step and give the final answer at the end."
+    }
+   ]
+  },
+  {
+   "id": "r18",
+   "topic": "physics",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Two identical capacitors, one charged to V and one uncharged, are connected through a resistor. What fraction of the initial energy is dissipated, and why is it independent of the resistance? Think it through step by step and give the final answer at the end."
+    }
+   ]
+  },
+  {
+   "id": "r19",
+   "topic": "physics",
+   "messages": [
+    {
+     "role": "user",
+     "content": "A spin-1/2 particle is prepared in the +x eigenstate and placed in a magnetic field along z. Derive the probability of measuring +x again after time t. Think it through step by step and give the final answer at the end."
+    }
+   ]
+  },
+  {
+   "id": "r20",
+   "topic": "physics",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Estimate the ratio of the de Broglie wavelength of a thermal neutron at 300 K to the lattice spacing of copper, and say whether diffraction is observable. Think it through step by step and give the final answer at the end."
+    }
+   ]
+  },
+  {
+   "id": "r21",
+   "topic": "physics",
+   "messages": [
+    {
+     "role": "user",
+     "content": "A monatomic ideal gas undergoes a cycle: isothermal expansion doubling the volume, isochoric cooling, then adiabatic compression back to the start. Is this cycle possible? Compute the efficiency if it is. Think it through step by step and give the final answer at the end."
+    }
+   ]
+  },
+  {
+   "id": "r22",
+   "topic": "physics",
+   "messages": [
+    {
+     "role": "user",
+     "content": "A thin lens of focal length 10 cm forms an image of an object moving toward it at 1 cm/s from 30 cm away. Find the image speed and direction at that instant. Think it through step by step and give the final answer at the end."
+    }
+   ]
+  },
+  {
+   "id": "r23",
+   "topic": "chemistry",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Predict the major product and stereochemistry when (R)-2-bromobutane reacts with sodium ethoxide in ethanol at high temperature, and compare with sodium azide in DMSO. Think it through step by step and give the final answer at the end."
+    }
+   ]
+  },
+  {
+   "id": "r24",
+   "topic": "chemistry",
+   "messages": [
+    {
+     "role": "user",
+     "content": "A buffer contains 0.10 M acetic acid and 0.15 M sodium acetate (pKa 4.76). Find the pH after adding 0.02 mol of HCl to 1.0 L, then explain the buffer capacity limit. Think it through step by step and give the final answer at the end."
+    }
+   ]
+  },
+  {
+   "id": "r25",
+   "topic": "chemistry",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Rank the acidity of phenol, 4-nitrophenol, 4-methoxyphenol and 2,4,6-trinitrophenol and justify the order with resonance and inductive arguments. Think it through step by step and give the final answer at the end."
+    }
+   ]
+  },
+  {
+   "id": "r26",
+   "topic": "chemistry",
+   "messages": [
+    {
+     "role": "user",
+     "content": "How many stereoisomers does 2,3,4-trihydroxypentanedioic acid have? Identify the meso forms and explain the pseudo-asymmetric centre. Think it through step by step and give the final answer at the end."
+    }
+   ]
+  },
+  {
+   "id": "r27",
+   "topic": "chemistry",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Using crystal field theory, predict the number of unpaired electrons and the magnetic moment of [Fe(CN)6]4- and [FeF6]4-, and explain the difference. Think it through step by step and give the final answer at the end."
+    }
+   ]
+  },
+  {
+   "id": "r28",
+   "topic": "biology",
+   "messages": [
+    {
+     "role": "user",
+     "content": "A recessive X-linked disorder affects 1 in 4,000 males. Estimate the carrier frequency in females and the probability that a carrier's son and daughter are both unaffected. Think it through step by step and give the final answer at the end."
+    }
+   ]
+  },
+  {
+   "id": "r29",
+   "topic": "biology",
+   "messages": [
+    {
+     "role": "user",
+     "content": "An enzyme follows Michaelis-Menten kinetics with Km = 2 mM. A competitive inhibitor at 5 uM with Ki = 1 uM is added. What substrate concentration restores half of Vmax? Think it through step by step and give the final answer at the end."
+    }
+   ]
+  },
+  {
+   "id": "r30",
+   "topic": "biology",
+   "messages": [
+    {
+     "role": "user",
+     "content": "In a dihybrid cross with two linked genes 20 cM apart in coupling phase, give the expected phenotype ratios in a test cross of 1,000 offspring and explain how you would detect interference with a third gene. Think it through step by step and give the final answer at the end."
+    }
+   ]
+  }
+ ]
+}
