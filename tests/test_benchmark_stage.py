@@ -240,6 +240,12 @@ def fake_roofline_command(argv):
     return True
 
 
+def write_contract(root, status):
+    path = root / 'doc/full_model/serving_contract.json'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({'rows': [{'item': 'supports_prefix_caching', 'kind': 'capability', 'status': status}]}))
+
+
 def valid_gate_fixture(tmp_path):
     from benchmark_stage.answers import task_statistics
     from benchmark_stage.plan import batch_plan, lone_user_profiles
@@ -260,6 +266,7 @@ def valid_gate_fixture(tmp_path):
     manifest['manifest_sha256'] = digest(manifest)
     write('run/manifest.json', manifest)
     write('identity.json', server_fixture(32))
+    write_contract(root, 'not_supported')
     config = dict(model='org/model', base_url='http://unused', tasks=tasks, batch_sizes=[1, 32],
                   output_tokens=128, generation={t: {'max_gen_toks': 4096} for t in tasks})
     write('run/run_config.json', config)
@@ -983,7 +990,7 @@ def test_roofline_percentage_is_a_result_not_an_acceptance_threshold(tmp_path):
     assert check(root) == evidence
 
 
-@pytest.mark.parametrize('value,ok', [(False, True), (True, True), (None, False), ('off', False)])
+@pytest.mark.parametrize('value,ok', [(False, True), (True, False), (None, False), ('off', False)])
 def test_prefix_caching_must_be_recorded_not_disabled(tmp_path, value, ok):
     """#42 requires prefix caching for evals; the gate needs a recorded bool, not False."""
     root, evidence = valid_gate_fixture(tmp_path)
@@ -1221,3 +1228,58 @@ def test_shared_accuracy_links_responses_at_any_concurrency(tmp_path, concurrenc
     assert cls(concurrency).generate_until(requests) == ['answer 0', 'answer 1']
     links = [json.loads((paths[g] / 'request_links.jsonl').read_text()) for g in ('g1', 'g2')]
     assert [(link['task'], link['doc_id'], link['response_id']) for link in links] == [('t1', 5, 'r0'), ('t2', 7, 'r1')]
+
+
+def test_answer_statistics_failure_fails_run_and_stats_repairs_it(tmp_path, monkeypatch):
+    from benchmark_stage import run as runner
+    source = tmp_path / 'manifest.json'
+    source.write_text(json.dumps({'manifest_sha256': 'fixture', 'groups': {}}))
+    config_path = tmp_path / 'config.json'
+    config_path.write_text(json.dumps(dict(model='org/model', base_url='http://unused', performance_server_command=['server-control'],
+        manifest=str(source), tasks=['t1'], roofline_command=['collector'], batch_sizes=[1, 32])))
+    monkeypatch.setattr(runner.time, 'monotonic', lambda: 0)
+    timed = []
+
+    def completed(argv, log, deadline):
+        if fake_server_command(argv) or fake_roofline_command(argv):
+            return
+        if 'evaluate' in argv:
+            out = Path(argv[argv.index('--output') + 1])
+            out.mkdir(parents=True)
+            (out / 'results.json').write_text(json.dumps({'results': {}, 'benchmark_stage': {'responses': 2}}))
+            return
+        timed.append(fake_bench(argv))
+    monkeypatch.setattr(runner, 'command', completed)
+
+    def broken(*args):
+        raise ValueError('scored samples missing filter')
+    monkeypatch.setattr(runner, 'task_statistics', broken)
+    with pytest.raises(RuntimeError, match='Answer statistics failed'):
+        runner.run(config_path=config_path, output=tmp_path / 'run')
+    summary = json.loads((tmp_path / 'run/summary.json').read_text())
+    assert summary['status'] == 'failed' and 'benchmark_stage stats' in summary['error']
+    assert set(summary['performance']) == {'1', '32'}  # timed rows still measured
+    count = len(timed)
+
+    monkeypatch.setattr(runner, 'task_statistics', lambda *args: {'extraction': {}, 'blank_at_cap': 0})
+    from benchmark_stage import report
+    monkeypatch.setattr(report, 'write_report', lambda output, config, summary: (Path(output) / 'REPORT.md').write_text(
+        f"Status: {summary['status']}.\n"))
+    summary = runner.recompute_statistics(tmp_path / 'run')
+    assert summary['status'] == 'completed' and 'error' not in summary and 'answer_statistics_errors' not in summary
+    assert len(timed) == count  # no new timed attempt
+    assert 'Status: completed.' in (tmp_path / 'run/REPORT.md').read_text()
+    assert json.loads((tmp_path / 'run/summary.json').read_text())['answer_statistics']['t1']['blank_at_cap'] == 0
+
+
+def test_accuracy_server_prefix_caching_matches_identity_and_contract(tmp_path):
+    root, evidence = valid_gate_fixture(tmp_path)
+    # The fixture's servers run with prefix caching off; a contract that supports it makes that critical.
+    write_contract(root, 'supported')
+    with pytest.raises(ValueError, match='declares prefix caching supported'):
+        check(root)
+    # An unreadable contract cannot decide it: advisory only.
+    (root / 'doc/full_model/serving_contract.json').unlink()
+    found = []
+    assert check(root, advisories=found) == evidence
+    assert any('supports_prefix_caching' in line for line in found)

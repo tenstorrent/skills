@@ -217,6 +217,12 @@ From the raw responses and scored samples, the runner writes per task, in
 | Answer tokens median / p90 / max | `usage.completion_tokens` | — |
 | Recommended output cap | p90 × 1.5, rounded up to a power-of-two K, never below the current cap | — |
 
+If the statistics cannot be computed for a task, the run still finishes its timed
+rows and then fails. Fix the cause and run
+`python -m benchmark_stage stats --output <run dir>`: it recomputes the
+statistics from the saved responses, without a new timed attempt, and marks the
+run completed when statistics were its only failure.
+
 The checker recomputes the statistics. Missing or stale statistics are critical
 (exit 2). Extraction below target or blank-at-cap above target is advisory
 (exit 1): the score stands, but it likely measures the protocol. Usual fixes:
@@ -279,7 +285,10 @@ configuration from that running process or its startup log. Do not fill this
 record from the requested values without checking the server.
 
 `prefix_caching` must be `true` or `false` as observed. Evals keep the Stage 9/10
-setting (#42 requires prefix caching where the model supports it). Performance
+setting (#42 requires prefix caching where the model supports it). The checker
+requires the accuracy server's setting to equal `identity.prefix_caching`, and to
+be on when `doc/full_model/serving_contract.json` declares `supports_prefix_caching`
+supported; when the contract cannot be read, that comparison is advisory. Performance
 rows use distinct prompts, so prefix caching does not shorten their prefill; a
 smaller-batch server may run with it off.
 

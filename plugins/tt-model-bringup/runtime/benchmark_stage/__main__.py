@@ -25,6 +25,8 @@ def main():
     run_parser.add_argument('--config', type=Path, required=True)
     run_parser.add_argument('--output', type=Path, required=True)
     run_parser.add_argument('--batch-sizes', help='comma-separated decode batch sizes; overrides batch_sizes in the config')
+    stats = commands.add_parser('stats', help='recompute answer statistics of a finished run; no new timed attempt')
+    stats.add_argument('--output', type=Path, required=True, help='the run directory')
     args = parser.parse_args()
     if args.command == 'prepare':
         from benchmark_stage.subsets import prepare as freeze
@@ -33,6 +35,12 @@ def main():
         if len(tasks) != len(counts) or len(set(tasks)) != len(tasks):
             parser.error('tasks and counts must have matching lengths and unique task names')
         print(json.dumps(freeze(tasks, dict(zip(tasks, counts)), args.output, args.reuse_manifest), indent=2))
+    elif args.command == 'stats':
+        from benchmark_stage.run import recompute_statistics
+        summary = recompute_statistics(args.output)
+        print(json.dumps({k: summary.get(k) for k in ('status', 'error', 'answer_statistics_errors') if k in summary}, indent=2))
+        if summary['status'] != 'completed':
+            raise SystemExit(1)
     elif args.command == 'run':
         from benchmark_stage.run import run
         sizes = [int(b) for b in args.batch_sizes.split(',')] if args.batch_sizes else None

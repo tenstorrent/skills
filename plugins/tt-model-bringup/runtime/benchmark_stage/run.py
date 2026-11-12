@@ -17,6 +17,58 @@ from benchmark_stage.roofline import load_roofline
 from benchmark_stage.subsets import digest
 
 
+STATS_FAILURE = 'Answer statistics failed'
+
+
+def answer_statistics_for(output, config, manifest, tasks):
+    """(statistics, errors) for each task, recomputed from the run's raw responses and scored samples."""
+    stats, errors = {}, {}
+    for task in tasks:
+        try:
+            stats[task] = task_statistics(output, config, manifest, task)
+        except (ValueError, KeyError, OSError) as exc:
+            errors[task] = f'{type(exc).__name__}: {exc}'
+    return stats, errors
+
+
+def write_report_tail(output, summary):
+    with (output / 'REPORT.md').open('a') as report:
+        if summary['status'] == 'failed':
+            report.write(f"\nFinal status: failed. {summary.get('error', 'Benchmark failed')}\n")
+        report.write(f"\nClient-clock wall time: {summary['client_seconds']:.1f} of {summary['client_budget_seconds']:.0f} seconds. "
+                     f"Server setup (launch, compile, warmup): {summary['setup_seconds']:.1f} of {summary['setup_budget_seconds']:.0f} seconds. "
+                     f"Total: {summary['elapsed_seconds']:.1f} seconds.\n")
+
+
+def recompute_statistics(output):
+    """``benchmark_stage stats``: recompute answer statistics of a finished run without a new timed attempt.
+
+    A run that failed only because its answer statistics failed becomes completed
+    once they compute; the report is rewritten from the updated summary.
+    """
+    from benchmark_stage.report import write_report
+    output = Path(output).resolve()
+    summary = json.loads((output / 'summary.json').read_text())
+    config = json.loads((output / 'run_config.json').read_text())
+    manifest = json.loads(Path(config['manifest']).read_text())
+    stats, errors = answer_statistics_for(output, config, manifest, config['tasks'])
+    summary['answer_statistics'] = stats
+    summary.pop('answer_statistics_errors', None)
+    if errors:
+        summary['answer_statistics_errors'] = errors
+    elif (summary.get('status') == 'failed' and str(summary.get('error', '')).startswith(f'RuntimeError: {STATS_FAILURE}')
+          and summary.get('client_seconds', float('inf')) < summary.get('client_budget_seconds', 0)
+          and summary.get('setup_seconds', float('inf')) < summary.get('setup_budget_seconds', 0)):
+        # Statistics were the only failure: the timed rows and budgets already passed.
+        summary['status'] = 'completed'
+        summary.pop('error', None)
+    write_report(output, config, summary)
+    summary.pop('report_error', None)  # the report was just rewritten
+    write_report_tail(output, summary)
+    (output / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
+    return summary
+
+
 def command(argv, log, deadline, *, terminate_grace_seconds=10):
     remaining = deadline - time.monotonic()
     if remaining <= 0:
@@ -194,10 +246,12 @@ def run(*, config_path, output, batch_sizes=None):
             for task in batch:
                 result = json.loads((output / task / 'results.json').read_text())
                 summary['accuracy'][task] = result['benchmark_stage']
-                try:
-                    summary['answer_statistics'][task] = task_statistics(output, config, manifest, task)
-                except (ValueError, KeyError, OSError) as exc:
-                    summary.setdefault('answer_statistics_errors', {})[task] = f'{type(exc).__name__}: {exc}'
+            stats, errors = answer_statistics_for(output, config, manifest, batch)
+            summary['answer_statistics'].update(stats)
+            if errors:
+                # The run fails on this; it still finishes the timed rows so that
+                # `benchmark_stage stats --output <run dir>` can repair it without a new attempt.
+                summary.setdefault('answer_statistics_errors', {}).update(errors)
         for concurrency in plan['measured_batch_sizes']:
             if concurrency == largest:
                 server = baseline_server
@@ -226,6 +280,9 @@ def run(*, config_path, output, batch_sizes=None):
                         row(raw, server, concurrency=1, requests=profile['requests'], input_tokens=profile['input_tokens']),
                         file=profile['file'] + '.json')
         load_roofline(output, required=tuple(str(c) for c in plan['measured_batch_sizes']))
+        if summary.get('answer_statistics_errors'):
+            raise RuntimeError(f"{STATS_FAILURE} for {sorted(summary['answer_statistics_errors'])}; fix the cause, then run "
+                               f"`python -m benchmark_stage stats --output {output}` (no new timed attempt)")
         summary['status'] = 'completed'
     except BaseException as exc:
         summary['status'] = 'failed'
@@ -252,12 +309,7 @@ def run(*, config_path, output, batch_sizes=None):
         report_path = output / 'REPORT.md'
         if summary['status'] == 'failed' and report_path.exists():
             report_path.write_text(report_path.read_text().replace('Status: completed.', 'Status: failed.', 1))
-        with (output / 'REPORT.md').open('a') as report:
-            if summary['status'] == 'failed':
-                report.write(f"\nFinal status: failed. {summary.get('error', 'Benchmark failed')}\n")
-            report.write(f"\nClient-clock wall time: {summary['client_seconds']:.1f} of {client_budget:.0f} seconds. "
-                         f"Server setup (launch, compile, warmup): {summary['setup_seconds']:.1f} of {setup_budget:.0f} seconds. "
-                         f"Total: {summary['elapsed_seconds']:.1f} seconds.\n")
+        write_report_tail(output, summary)
         (output / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
         signal.signal(signal.SIGTERM, previous_term)
     if summary['status'] != 'completed':

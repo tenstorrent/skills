@@ -12,6 +12,23 @@ from benchmark_stage.subsets import digest
 from benchmark_stage.responses import read_jsonl, scoring_response
 
 
+SERVING_CONTRACT = Path('doc/full_model/serving_contract.json')
+
+
+def declared_prefix_caching(model_dir):
+    """Status of the serving contract's supports_prefix_caching row, or None when it cannot be read."""
+    try:
+        contract = json.loads((Path(model_dir) / SERVING_CONTRACT).read_text())
+    except (OSError, ValueError):
+        return None
+    rows = contract.get('rows') if isinstance(contract, dict) else None
+    for row in rows if isinstance(rows, list) else []:
+        if isinstance(row, dict) and row.get('item') == 'supports_prefix_caching':
+            status = row.get('status')
+            return status if status in ('supported', 'not_supported', 'plugin_owned') else None
+    return None
+
+
 def read(path):
     if not path.is_file() or not path.stat().st_size:
         raise ValueError(f'missing benchmark evidence: {path}')
@@ -175,6 +192,16 @@ def check(model_dir, hf_model='', advisories=None):
     largest = servers[accuracy_concurrency]
     if summary.get('accuracy_prefix_caching') != largest['prefix_caching']:
         raise ValueError('summary disagrees with the accuracy server prefix-caching setting')
+    if largest['prefix_caching'] != identity['prefix_caching']:
+        raise ValueError(f"accuracy server prefix_caching={largest['prefix_caching']} differs from "
+                         f"identity.prefix_caching={identity['prefix_caching']}")
+    declared = declared_prefix_caching(root)
+    if declared == 'supported' and not largest['prefix_caching']:
+        raise ValueError('the serving contract declares prefix caching supported (stages 9/10), but the accuracy '
+                         'server ran with prefix_caching off; serve the evals with it on')
+    if declared is None:
+        advisories.append(f'cannot read supports_prefix_caching from {SERVING_CONTRACT}; the accuracy server '
+                          f"prefix_caching={largest['prefix_caching']} is not confirmed against the serving contract")
     lone = summary.get('lone_user', {})
     profiles = lone_user_profiles(accuracy_concurrency, largest['max_model_len'], osl,
                                   config.get('long_context_input_tokens', 32768))
