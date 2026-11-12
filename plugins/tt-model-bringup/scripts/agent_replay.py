@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Replay recorded agent histories against an OpenAI-compatible server (see the agentic-serving survey).
+"""Replay recorded agent histories against an OpenAI-compatible server (see the agentic-serving skill).
 
 Each history is one JSONL file per agent, one chat-completions request body per line, in the order
 the agent sent them. Every request is resent with max_tokens=1, so the run measures what serving
