@@ -212,6 +212,71 @@ def test_batch_members_whose_commits_landed_close_with_the_lead(env, monkeypatch
     assert batchrun.batch_of(p.db, lead["id"])["outcomes"] == {str(a["id"]): "done", str(b["id"]): "done"}
 
 
+def _settled_pair(p, monkeypatch):
+    """A lead and one member of a batch run on ttp/t-lead, both handed off done and settled; the daemon
+    whose reconcile_tasks judges their landing, with its review queueing recorded."""
+    from ttp import batchrun
+    from ttp.db import dump_result
+    d, _ = _batch_daemon(p, monkeypatch)
+    lead, m = _batch_tasks(p, 2)
+    batchrun.record(p.db, lead, [m], "ttp/t-lead", p.config())
+    p.db.update_task(m["id"], status="running", branch="ttp/t-lead")
+    p.db.update_task(lead["id"], status="done", branch="ttp/t-lead", result=dump_result(
+        {"status": "done", "members": [{"id": m["id"], "status": "done", "summary": "fixed it"}]}))
+    reviews = []
+    monkeypatch.setattr(d, "_auto_review", lambda t, summary, add=True: reviews.append((t["id"], summary)) or (999, True))
+    d.reconcile_tasks()
+    assert p.db.task(m["id"])["status"] == "done"
+    return d, lead, m, reviews
+
+
+def _push_row(p, task, head, landed_sha, branch="ttp/t-lead"):
+    now = time.time()
+    p.db.x("INSERT INTO push_queue(task, branch, head, target, status, landed_sha, created, updated) "
+           "VALUES(?,?,?,?,?,?,?,?)", (task, branch, head, "land", "landed", landed_sha, now, now))
+
+
+def test_batch_member_left_out_of_the_approved_head_is_not_landed_and_gets_its_review(env, monkeypatch):
+    # Task #8504: a review approved only the lead's commit of a two-member batch and the push queue landed
+    # it. The member shares the branch, but its own commit is not on the push branch: it is not landed
+    # (`ttp landed --task` and deadwait read landed.recorded), its record says so, and its review is queued.
+    from ttp import landed
+    from ttp.db import load_result
+    p = make(env)
+    d, lead, m, reviews = _settled_pair(p, monkeypatch)
+    assert landed.recorded(p.db, m["id"]) == ([], "")
+    tip = _land_member_commits(p, [lead["id"]])
+    review = p.db.add_task(f"Review #{lead['id']}: x", "Review it.", kind="review", origin="daemon")
+    _push_row(p, review, tip, tip)
+    d.reconcile_tasks()
+    res = load_result(p.db.task(m["id"])["result"])
+    assert "not landed" in res["left_out"]["why"] and "landed" not in res
+    assert landed.recorded(p.db, m["id"]) == ([], "")
+    assert reviews == [(m["id"], res["left_out"]["why"])]
+    ev = p.db.one("SELECT * FROM events WHERE kind='batch_member_left_out'")
+    assert ev["task"] == m["id"] and "review #999" in ev["text"]
+    d.reconcile_tasks()   # judged once
+    assert len(reviews) == 1
+    # Its own review lands it: that landing is its own.
+    own = p.db.add_task(f"Review #{m['id']}: x", "Review it.", kind="review", origin="daemon")
+    _push_row(p, own, "f" * 40, "e" * 40)
+    assert landed.recorded(p.db, m["id"])[0] == ["e" * 40]
+
+
+def test_batch_whose_head_lands_marks_every_member_landed(env, monkeypatch):
+    from ttp import landed
+    from ttp.db import load_result
+    p = make(env)
+    d, lead, m, reviews = _settled_pair(p, monkeypatch)
+    tip = _land_member_commits(p, [lead["id"], m["id"]])
+    review = p.db.add_task(f"Review #{lead['id']}: x", "Review it.", kind="review", origin="daemon")
+    _push_row(p, review, tip, tip)
+    d.reconcile_tasks()
+    res = load_result(p.db.task(m["id"])["result"])
+    assert res["landed"] == tip and "left_out" not in res and reviews == []
+    assert landed.recorded(p.db, m["id"]) == ([tip], "its own commit on the push branch")
+
+
 def test_batch_member_marked_failed_is_requeued_alone(env):
     # A member the hand-off marks failed goes back to the queue alone, even beside landed ones, and a
     # `members` list written as a string still counts.

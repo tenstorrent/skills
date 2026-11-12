@@ -5196,6 +5196,18 @@ class Daemon:
         db, now = self.p.db, time.time()
         for mid, st, why in batchrun.tend(self.p):   # a batch whose lead ended: each member settles alone
             log(self.p, f"task {mid}: batch member settled {st}: {why}")
+            if st == "left_out" and (m := db.task(mid)):   # the approved head left its commit out
+                try:
+                    got = self._auto_review(m, why)
+                except Exception as e:
+                    got = None
+                    log(self.p, f"task {mid}: review of a left-out batch member not queued: {e}")
+                # Handled when its review is queued (the coordinator sees it in its task list); else a turn decides it.
+                db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                     (time.time(), f"task:{mid}", "batch_member_left_out", "normal",
+                      (f"#{mid} {m['title']}: {why}" + (f" (review #{got[0]})" if got else
+                                                         "; no review could be queued: decide it"))[:6000],
+                      "handled" if got else "queued", mid))
         in_batch = batchrun.held(db)   # members of a live batch run: the lead's run is theirs
         for t in db.q("SELECT * FROM tasks WHERE status='running' AND NOT EXISTS "
                       "(SELECT 1 FROM runs WHERE runs.task=tasks.id AND runs.status='running')"):
@@ -19444,6 +19456,15 @@ class Daemon:
             lines.append("Its proposed follow-ups (the coordinator queues them separately; not part of this "
                          "change, so not a finding by themselves): "
                          + spans.wrap("; ".join(fups[:MAX_FOLLOWUPS]), f"follow-ups of #{task['id']}", tag))
+        if (rec := batchrun.members_of(db, task["id"], settled=True)) and rec.get("members"):
+            if rec["lead"] == task["id"]:
+                lines.append(f"Branch {branch} carries batch run {rec['id']}: this task and "
+                             + ", ".join(f"#{m}" for m in rec["members"]) + f". Approve head {head}, which covers "
+                             "every member's commit; to leave a member out, say in `members` why for that member. "
+                             "A worker's note naming one member's commit does not narrow the head.")
+            elif isinstance(load_result(task.get("result")).get("left_out"), dict):
+                lines.append(f"Batch run {rec['id']} landed without this task's own commit: review that commit "
+                             f"(`git log -E --grep '^Task: #{task['id']}([^0-9]|$)' {head}`) at head {head}.")
         # A split head whose hop stalls is reviewed on its own now (_release_split_reviews).
         own_split = chaincap.split_head(task)
         stall = chaincap.stalled_hop(db, task["id"]) if own_split else None

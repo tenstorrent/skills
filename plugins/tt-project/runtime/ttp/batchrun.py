@@ -17,7 +17,9 @@ The run's budget is the sum of the members' remaining budgets, capped at the dee
 cost is booked to each member pro rata to their budgets (book). Members wait as `running` with a
 blocked_reason naming the lead, which reconcile_tasks leaves alone (held). Once the lead leaves
 running, waiting and review (settle): with the lead done, a member whose outcome is done is done on
-the lead's branch, which the lead's one review and landing cover; a blocked one is blocked with its
+the lead's branch, which the lead's one review covers; it counts as landed only once the push queue
+lands that branch with its own commit on the push branch (landings), and a member the approved head
+left out gets a review of its own; a blocked one is blocked with its
 reason; a member whose own `Task: #<id>` commit is on the push branch (landed.trailer_sha) is done as
 landed whatever the hand-off says, unless it marks it failed or blocked; a failed or missing one goes
 back to the queue alone, on a branch of its own, and dispatch closes it instead of running it once its
@@ -52,12 +54,13 @@ def holds(lead: dict | None) -> bool:
     return lead["status"] == "queued" and str((load_result(lead.get("result")) or {}).get("status")) == "waiting"
 
 
-def landed_sha(p, tid: int, since: float | None = None) -> str:
-    """Task `tid`'s own `Task: #<id>` commit on the push branch (landed.trailer_sha), "" when none or
-    it cannot be read: never raises, so a git fault only leaves the member to the queue."""
+def landed_sha(p, tid: int, since: float | None = None, tip: str = "") -> str:
+    """Task `tid`'s own `Task: #<id>` commit on the push branch (landed.trailer_sha; from `tip` when
+    given), "" when none or it cannot be read: never raises, so a git fault only leaves the member to
+    the queue."""
     from . import landed
     try:
-        return landed.trailer_sha(p, tid, since)
+        return landed.trailer_sha(p, tid, since, tip)
     except Exception:
         return ""
 
@@ -366,16 +369,56 @@ def settle(p, lead_id: int) -> list[tuple[int, str, str]]:
     return out
 
 
+def landings(p, rec: dict) -> list[tuple[int, str, str]]:
+    """Judge each done member of settled batch `rec` once the push queue landed its shared branch since
+    the run started (the newest such landing): it landed only when its own `Task: #<id>` commit (or a
+    rebased copy with that trailer) is on the push branch, recorded as `landed` in its result, which
+    landed.recorded reads. A member the approved head left out is recorded `left_out` (not landed):
+    the daemon queues its own review (Daemon.reconcile_tasks). Each member is judged once. Returns
+    (member, "landed"|"left_out", why)."""
+    db, branch = p.db, rec.get("branch")
+    if not branch or not rec.get("started"):
+        return []
+    row = db.one("SELECT id, head, landed_sha, pushed_sha FROM push_queue WHERE branch=? AND status IN "
+                 "('pushed','landed') AND created>=? ORDER BY id DESC LIMIT 1", (branch, float(rec["started"])))
+    if not row:
+        return []
+    since, out = float(rec["started"]) - 3600, []
+    as_sha = str(row["landed_sha"] or row["pushed_sha"] or "")
+    for mid in rec.get("members", []):
+        m = db.task(mid)
+        res = load_result(m.get("result")) if m else None
+        if not m or m["status"] != "done" or not isinstance(res, dict) or res.get("landed") or res.get("left_out") \
+                or (res.get("batch") or {}).get("id") != rec["id"]:
+            continue
+        if sha := landed_sha(p, mid, since) or (landed_sha(p, mid, since, as_sha) if as_sha else ""):
+            res["landed"], st = sha, "landed"
+            why = f"its own commit {sha[:10]} landed with batch {rec['id']}'s branch {branch}"
+        else:
+            st = "left_out"
+            why = (f"not landed: batch {rec['id']}'s branch {branch} landed at {str(row['head'])[:10]}"
+                   f"{f' as {as_sha[:10]}' if as_sha else ''} without its own commit (the approved head left it "
+                   "out); its own review is queued")
+            res["left_out"] = {"head": row["head"], "push_row": row["id"], "why": why}
+        db.update_task(mid, result=dump_result(res))
+        out.append((mid, st, why))
+    return out
+
+
 def tend(p) -> list[tuple[int, str, str]]:
-    """settle() every batch whose lead no longer holds it (reconcile_tasks, each tick)."""
+    """settle() every batch whose lead no longer holds it, and judge the landing of each settled one
+    (landings) (reconcile_tasks, each tick)."""
     out, now = [], time.time()
     for rec in live(p.db, settled=True):
         if rec.get("settled"):
             if now - float(rec["settled"]) > KEEP_S:
                 p.db.x("DELETE FROM kv WHERE key=?", (KV + str(rec["lead"]),))
+            else:
+                out += landings(p, rec)
             continue
         if not holds(p.db.task(rec["lead"])):
             out += settle(p, rec["lead"])
+            out += landings(p, batch_of(p.db, rec["lead"]) or rec)
     return out
 
 
@@ -391,7 +434,8 @@ def prompt_block(p, lead: dict, members: list[dict], branch: str) -> str:
              "Hand off one outcome per task, the lead included, as `members` in result.json and in any "
              "`on_pass`: [{\"id\": <id>, \"status\": \"done\"|\"failed\"|\"blocked\", \"summary\": \"...\", "
              "\"reason\": \"why, if not done\", \"followups\": [...]}]. Your own `status` is the lead's. "
-             "One check run and one review cover the whole branch."]
+             "One check run and one review cover the whole branch: its head, every member's commit. A member "
+             "counts as landed only once its own commit is on the push branch."]
     for m in members:
         try:
             ctx = ctxblock.prompt_block(p, dict(m))

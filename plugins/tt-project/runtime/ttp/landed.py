@@ -28,7 +28,7 @@ import time
 from pathlib import Path
 
 from . import gitcache, gitmemo, repoid
-from .db import TERMINAL_TASK_STATES, dependency_ids, review_subject
+from .db import TERMINAL_TASK_STATES, dependency_ids, load_result, review_subject
 
 LANDED_PROBE = re.compile(r"\s*landed:\s*#?(\d+)\s*")
 ANCESTOR_PROBE = re.compile(r"\s*git\s+merge-base\s+--is-ancestor\s+([0-9a-f]{7,64})\s+([\w./@{}^~-]+)\s*")
@@ -365,8 +365,16 @@ def recorded(db, tid: int, carry: dict | None = None, rows: Rows | None = None) 
         """`src`, naming the successor it came through (not `tid` itself or a plain review of it)."""
         direct = i == tid or i not in carry or (carry[i][1] == tid and carry[i][2] == "review")
         return src if direct else f"{src} through #{i}"
+    # A batch member shares its lead's branch, but a landing of that branch is not its own: it landed
+    # only once its own commit is on the push branch (batchrun.landings records it as `landed`).
+    task = (rows.tasks.get(tid) if rows is not None else None) or db.task(tid) or {}
+    res = load_result(task.get("result"))
+    member = isinstance(res, dict) and isinstance(res.get("batch"), dict) and res["batch"].get("lead") != tid
+    if member and res.get("landed"):
+        return [str(res["landed"])], "its own commit on the push branch"
     pushed = _pushed(db) if rows is None else rows.pushed
-    hits = [r for r in pushed if (r["landed_sha"] or r["pushed_sha"]) and (r["task"] in carry or r["branch"] in branches)]
+    hits = [r for r in pushed if (r["landed_sha"] or r["pushed_sha"])
+            and (r["task"] in carry or (r["branch"] in branches and not member))]
     if hits:
         return [r["landed_sha"] or r["pushed_sha"] for r in hits], via("its push queue landing", hits[-1]["task"])
     landings = db.q("SELECT task, sha FROM task_landings ORDER BY marker") if rows is None else rows.landings
@@ -409,15 +417,16 @@ def task_shas(p, tid: int) -> tuple[list[str], str]:
     return [head], f"its branch {branch}"
 
 
-def trailer_sha(p, tid: int, since: float | None = None) -> str:
+def trailer_sha(p, tid: int, since: float | None = None, tip: str = "") -> str:
     """The newest commit on the push branch (local ref, no fetch) whose message carries task `tid`'s
     own `Task: #<id>` trailer and that no later commit there reverts ("This reverts commit <sha>"),
     committed after `since`; "" when none, or no push branch. A batch run commits each member with
-    that trailer, so this finds a member's landing that no hand-off or push record names."""
-    if not _has_push_branch(p):
+    that trailer, so this finds a member's landing that no hand-off or push record names. `tip`: look
+    from that commit (one the push queue landed) instead of the push branch's ref."""
+    if not tip and not _has_push_branch(p):
         return ""
     try:
-        tip = _commit(p.root, _push_ref(p, p.root))
+        tip = _commit(p.root, tip or _push_ref(p, p.root))
     except ValueError:
         return ""
     if not tip:
