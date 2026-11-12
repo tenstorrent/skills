@@ -191,6 +191,32 @@ def scan_caps(model_dir: Path, minimum_context: int) -> tuple[list[str], list[st
     return critical, advisory
 
 
+MAX_LISTED_FINDINGS = 30
+
+
+def capped(lines: list[str], limit: int, name: str) -> list[str]:
+    """Return at most ``limit`` lines; park the full list in a file when cut.
+
+    Gate output is read into an agent's context, so a long list is cut to the
+    first ``limit`` entries plus a pointer to the full file.
+    """
+    if len(lines) <= limit:
+        return lines
+    import os
+    import tempfile
+
+    directory = Path(os.environ.get("MULTIGOAL_LOG_DIR") or tempfile.gettempdir())
+    stage = os.environ.get("MULTIGOAL_STAGE")
+    full = directory / (f"{stage}.{name}.full.txt" if stage else f"{name}.full.txt")
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        full.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        where = str(full)
+    except OSError:
+        where = "(could not write the full list)"
+    return [*lines[:limit], f"... {len(lines) - limit} more in {where}"]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-dir", default="")
@@ -244,10 +270,12 @@ def main() -> int:
         return 2
 
     critical, advisory = scan_caps(model_dir, supported)
-    for finding in critical:
-        print(f"CONTEXT CAP: {finding}", file=sys.stderr)
-    for finding in advisory:
-        print(f"ADVISORY CONTEXT CAP: {finding}", file=sys.stderr)
+    lines = [f"CONTEXT CAP: {finding}" for finding in critical]
+    lines += [f"ADVISORY CONTEXT CAP: {finding}" for finding in advisory]
+    if len(lines) > MAX_LISTED_FINDINGS:
+        print(f"{len(critical)} critical and {len(advisory)} advisory context cap finding(s)", file=sys.stderr)
+    for line in capped(lines, MAX_LISTED_FINDINGS, "context_contract_caps"):
+        print(line, file=sys.stderr)
 
     if critical:
         return 2

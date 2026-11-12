@@ -25,6 +25,22 @@ Use this skill for the hardware-facing parts of model bringup. It covers only no
 - Before launching a bringup, keep the workspace, multigoal log directory, and `CODEX_HOME` on storage that survives reboot and, when applicable, container recreation. The runner defaults to `<repo>/bringup/artifacts/multigoal-runs/<timestamp>`; any `--log-dir` or `RUN_MULTIGOAL_LOG_DIR` override must also use persistent storage. Do not put resume state in `/tmp`: recovery needs both the manifest's stage/thread mapping and the Codex session state.
 - Preserve evidence before cleanup: work logs, README files, benchmark JSON, server logs, compact perf summaries, and exact failing commands. Do not delete `CODEX_HOME`, auth/config, completed stage artifacts, or the repo state.
 
+## Waiting And Output
+
+Every poll and every printed line is resent with the whole context on each later request. Wait in one call and read little.
+
+- Use `wait_for` instead of `sleep`/`tail` loops. It blocks until the condition is met, then prints one status line and a capped tail. Exit 0 = matched or exited 0, 1 = failed, 124 = timeout.
+  ```bash
+  W="$TT_MODEL_BRINGUP_ROOT/scripts/wait_for"
+  "$W" --cmd "timeout 5400 pytest ... " --file "$LOG" --timeout 5600 --tail 30   # run and wait
+  "$W" --pid "$PID" --file "$LOG" --fail-pattern 'Traceback|TT_FATAL' --timeout 3600
+  "$W" --file "$SERVER_LOG" --pattern 'Application startup complete' --fail-pattern 'Traceback' --timeout 1800
+  ```
+  Set `--timeout` from the job's expected time, not "forever". A `--cmd` still running at a pattern match keeps running (servers).
+- Read logs with `tail -n 40`, `grep -m 20` or `grep -c`, always with a line cap. Never `cat` a large log, a JSONL trace or a JSON result into context; extract the fields you need (`jq`/`python -c`) instead.
+- Use the gate and probe scripts' short output (status line plus ≤ 40 lines). Open their full logs only for the finding you are fixing.
+- Sub-agents report once, when done, with a short result and file paths. No progress pings; the parent waits for the result rather than polling.
+
 ## Reset And Health Checks
 
 Use bounded commands so a bad device state cannot consume the whole stage:

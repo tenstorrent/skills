@@ -62,6 +62,43 @@ devices, launch long tests, or mutate implementation files. If the review finds
 a problem that requires hardware or a server rerun to confirm, report the
 required follow-up as a finding; do not perform it inside the review.
 
+## When To Review And How Many Rounds
+
+Each review round re-reads the stage, so rounds are expensive. Keep them few
+and useful.
+
+- Call the reviewer only after every hard gate, check script and evidence run
+  for the stage has finished and its output is on disk. Never review while a
+  measurement, eval or gate is still running or still to be rerun; a review of
+  partial evidence is wasted and is repeated anyway.
+- Run formatters and linters, and do a quick self-check of docs and work-log
+  claims against the artifacts, before the final measurement and before the
+  review. Formatting, wording and docs-only issues are fixed by the stage owner
+  and are not a reason for another review round.
+- At most 3 review rounds per stage (the first review plus 2 follow-ups).
+  After round 3, only correctness or accuracy findings still block: wrong
+  output, wrong numbers, a broken or missing required gate, or an eval-visible
+  defect. Every other item (performance candidates, evidence-format requests,
+  docs, cleanup) becomes a hand-off note in the stage work log under
+  `Carried to next stage`, and the stage may complete.
+- A follow-up review is a new, fresh subagent with a diff-only brief: the
+  previous round's findings (verbatim), the files and artifacts changed since
+  that round, and the commands that produced new evidence. It checks whether
+  each finding is closed and whether the changes introduced a new problem; it
+  does not re-review the whole stage. Never keep a long-lived reviewer and
+  re-prompt it across rounds; that loses independence and grows its context.
+- Known limitation: when the same behaviour reproduces on the original (HF)
+  model under the same settings, with a matched control on disk, it is a known
+  limitation, not Required Work and not an owner decision. The reviewer records
+  it under Other Concerns and checks that it is listed in
+  `doc/eval_readiness/limitations.json` with `original_model: "same"` and an
+  evidence path. Do not escalate such findings to the owner.
+- Content judgements (degraded, repetitive, off-topic, wrong-language output)
+  need at least 10 blind matched samples per side (TT vs HF, same prompts,
+  sampling settings and seeds, labels hidden from the judge). Fewer samples are
+  noise: a 2/3 vs 0/3 split is not evidence. Fail only when TT is clearly worse
+  than HF on the matched set.
+
 ## Review Stance
 
 Tell the reviewer:
@@ -138,7 +175,7 @@ Return `more-work-needed` when evidence shows one of these:
   blocker is random/synthetic "representative semantics" PCC.
 - a dominant matmul geometry sweep mixes evidence across incompatible precision
   policies, for example measuring a smaller-core or residual-grid geometry only
-  under BFP8/HiFi while the final or mandatory policy is BFP4/LoFi. Geometry is
+  under BFP8/HiFi while the selected policy is BFP4/LoFi. Geometry is
   not rejected until the material geometry candidates have been measured under
   the same dtype/fidelity policy, or an exact op-contract blocker is recorded.
 - prompt-based quality evidence violates `$qualitative-check`, for example an
@@ -397,6 +434,22 @@ Review task:
    findings.
 ```
 
+Follow-up rounds (2 and 3) use a fresh subagent and a diff-only brief:
+
+```text
+Use $stage-review as an independent follow-up reviewer, round <2|3> of 3, for
+<stage number/name>, <hf model id>, evidence root <absolute path>.
+Same read-only rules as a first review. Do not re-review the whole stage.
+
+Previous findings (verbatim): <paste Required Work and Other Concerns>
+Changed since that round: <files, artifacts and commands, e.g. git diff --stat>
+New evidence: <paths>
+
+For each previous finding say closed / open with evidence. Then check only the
+changed files for new problems. In round 3, put any finding that is not a
+correctness or accuracy defect under Other Concerns as a hand-off note.
+```
+
 ## Verdict Format
 
 Require this output:
@@ -444,11 +497,12 @@ A performance candidate that was not measured is Other Concerns unless the goal
 names it. Record push state from the run plan (the supervisor pushes stage
 commits; the stage agent never does) instead of inferring it from the reflog.
 
-Closure after the allowed rereviews: a P2 raised after the second rereview
-carries to the next optimize stage with a work-log entry naming it, and the
-recorded verdict stays `more-work-needed`; a P2 that the stage then fixes with
-device evidence is recorded as fixed under that unchanged verdict, with the
-evidence path. The next stage's review checks that carried items were closed.
+Closure after the allowed rounds (3 per stage, see above): a finding raised in
+round 3 that is not a correctness or accuracy defect carries to the next stage
+with a work-log entry under `Carried to next stage`, and the recorded verdict
+stays `more-work-needed`; a carried item that the stage then fixes with device
+evidence is recorded as fixed under that unchanged verdict, with the evidence
+path. The next stage's review checks that carried items were closed.
 
 If the main agent could not obtain an independent review, report
 `not-independent` as a fallback status outside the reviewer verdict. Do not use
@@ -464,7 +518,9 @@ After the reviewer returns:
    `Required next step: human authorization` and its `proposed` record exists;
    name the record paths as the concrete blocker. Otherwise treat the findings
    as the next stage work item. Use the relevant debugging skill or `$autofix`
-   to resolve it, then rerun `$stage-review`.
+   to resolve it, rerun the affected gates, then start a fresh reviewer with
+   the diff-only follow-up brief. Stop after round 3 as described in
+   [When To Review](#when-to-review-and-how-many-rounds).
 3. If the verdict is `clean-pass`, record the review artifact or subagent final
    answer path in the stage work log.
 4. After `clean-pass`, create local checkpoint commits for stage-owned changes

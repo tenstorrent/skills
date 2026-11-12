@@ -10,7 +10,9 @@ import datetime as dt
 import json
 import os
 import pathlib
+import queue
 import re
+import shlex
 import subprocess
 import sys
 import threading
@@ -44,6 +46,47 @@ CHECK_PASS = 0
 CHECK_ADVISORY = 1
 CHECK_CRITICAL = 2
 
+# Stop classification for automatic recovery. A "transient" stop is an API or
+# transport fault (overloaded model, stream disconnect, HTTP 5xx) that says
+# nothing about the stage's work, so the runner resumes the same thread after a
+# backoff instead of leaving the goal blocked. A "usage" stop is an account
+# usage/budget limit with a reset time.
+TRANSIENT_ERROR_CODES = {
+    "serveroverloaded",
+    "internalservererror",
+    "responsestreamdisconnected",
+    "responsestreamconnectionfailed",
+    "responsetoomanyfailedattempts",
+    "httpconnectionfailed",
+    "streamdisconnected",
+}
+USAGE_ERROR_CODES = {"usagelimitexceeded", "budgetlimitexceeded", "usagelimitreached"}
+USAGE_GOAL_STATUSES = {"usageLimited", "budgetLimited"}
+TRANSIENT_MESSAGE_RE = re.compile(
+    r"at capacity|overloaded|stream disconnected|disconnected before completion|"
+    r"temporarily unavailable|service unavailable|bad gateway|gateway time-?out|"
+    r"internal server error|connection (?:reset|refused|closed)|\b50[0-9]\b|\b52[0-9]\b",
+    re.IGNORECASE,
+)
+USAGE_MESSAGE_RE = re.compile(r"usage limit|purchase more credits|spend(?:ing)? (?:cap|limit)", re.IGNORECASE)
+TRY_AGAIN_RE = re.compile(
+    r"try again at ([A-Z][a-z]{2})[a-z]* (\d{1,2})(?:st|nd|rd|th)?,? (\d{4}),? (\d{1,2}:\d{2}) ?([AP]M)",
+    re.IGNORECASE,
+)
+# Seconds to keep reading after a goal reaches a non-complete terminal status,
+# so the turn's own error (which explains *why*) is captured for classification.
+TERMINAL_DRAIN_SECONDS = 20.0
+RATE_LIMIT_READ_TIMEOUT = 30.0
+
+
+class ReadTimeout(Exception):
+    """No app-server message arrived before the requested timeout."""
+
+
+def _sleep(seconds: float) -> None:
+    # Indirection so tests can replace waiting without patching time.sleep.
+    time.sleep(seconds)
+
 
 JsonObject = dict[str, Any]
 
@@ -62,6 +105,7 @@ class StageState:
     status: str = "active"
     terminal_status: str | None = None
     active_turns: set[str] = field(default_factory=set)
+    seen_turns: set[str] = field(default_factory=set)
     last_turn_status: str | None = None
     last_turn_error: str | None = None
     ignore_stale_goal_objective: bool = False
@@ -86,6 +130,10 @@ class AppServerClient:
         self._write_lock = threading.Lock()
         self._stderr_tail: list[str] = []
         self._stderr_thread: threading.Thread | None = None
+        self._stdout_queue: queue.Queue[str | None] = queue.Queue()
+        self._stdout_thread: threading.Thread | None = None
+        self.latest_rate_limits: JsonObject | None = None
+        self.loaded_threads: set[str] = set()
 
     def __enter__(self) -> AppServerClient:
         args = [self.codex_bin]
@@ -104,6 +152,7 @@ class AppServerClient:
             bufsize=1,
         )
         self._start_stderr_drain_thread()
+        self._start_stdout_reader_thread()
         return self
 
     def __exit__(self, _exc_type: object, _exc: object, _tb: object) -> None:
@@ -127,6 +176,7 @@ class AppServerClient:
         params: JsonObject | None,
         log: Any,
         on_event: Callable[[JsonObject], None] | None = None,
+        timeout: float | None = None,
     ) -> JsonObject:
         request_id = str(uuid.uuid4())
         payload: JsonObject = {"id": request_id, "method": method}
@@ -134,8 +184,10 @@ class AppServerClient:
             payload["params"] = params
         self._send(payload, log)
 
+        deadline = None if timeout is None else time.monotonic() + timeout
         while True:
-            message = self._read(log)
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            message = self._read(log, timeout=remaining)
             if message.get("id") == request_id and "error" in message:
                 raise RuntimeError(f"{method} failed: {message['error']}")
             if message.get("id") == request_id:
@@ -149,9 +201,12 @@ class AppServerClient:
         self,
         log: Any,
         on_event: Callable[[JsonObject], None] | None = None,
+        timeout: float | None = None,
     ) -> JsonObject:
+        deadline = None if timeout is None else time.monotonic() + timeout
         while True:
-            message = self._read(log)
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            message = self._read(log, timeout=remaining)
             if "id" in message and "method" in message:
                 self._handle_server_request(message, log)
                 continue
@@ -191,11 +246,16 @@ class AppServerClient:
             self.proc.stdin.write(json.dumps(payload) + "\n")
             self.proc.stdin.flush()
 
-    def _read(self, log: Any) -> JsonObject:
+    def _read(self, log: Any, timeout: float | None = None) -> JsonObject:
         if self.proc is None or self.proc.stdout is None:
             raise RuntimeError("app-server process is not running")
-        line = self.proc.stdout.readline()
+        try:
+            line = self._stdout_queue.get(timeout=timeout)
+        except queue.Empty as exc:
+            raise ReadTimeout() from exc
         if not line:
+            # Keep end-of-stream visible to later reads.
+            self._stdout_queue.put(None)
             tail = "\n".join(self._stderr_tail[-40:])
             raise RuntimeError(f"app-server closed stdout; stderr tail:\n{tail}")
         try:
@@ -205,6 +265,10 @@ class AppServerClient:
         if not isinstance(message, dict):
             raise RuntimeError(f"Invalid app-server JSON payload: {message!r}")
         self._log(log, "recv", message)
+        if message.get("method") == "account/rateLimits/updated":
+            params = message.get("params")
+            if isinstance(params, dict) and isinstance(params.get("rateLimits"), dict):
+                self.latest_rate_limits = params["rateLimits"]
         return message
 
     def _log(self, log: Any, direction: str, payload: JsonObject) -> None:
@@ -228,6 +292,23 @@ class AppServerClient:
 
         self._stderr_thread = threading.Thread(target=drain, daemon=True)
         self._stderr_thread.start()
+
+    def _start_stdout_reader_thread(self) -> None:
+        # A reader thread lets callers wait for events with a timeout.
+        if self.proc is None or self.proc.stdout is None:
+            return
+        stdout = self.proc.stdout
+
+        def reader() -> None:
+            try:
+                for line in stdout:
+                    self._stdout_queue.put(line)
+            except (OSError, ValueError):
+                pass
+            self._stdout_queue.put(None)
+
+        self._stdout_thread = threading.Thread(target=reader, daemon=True)
+        self._stdout_thread.start()
 
 
 def parse_args() -> argparse.Namespace:
@@ -313,6 +394,90 @@ def parse_args() -> argparse.Namespace:
             "failure so a disabled guardrail cannot pass silently."
         ),
     )
+    parser.add_argument(
+        "--remediate-advisory",
+        action="store_true",
+        help=(
+            "Also start a remediation goal when a check exits 1 (advisory). "
+            "Default: advisory results are recorded and the pipeline continues."
+        ),
+    )
+    parser.add_argument(
+        "--remediation-thread",
+        choices=("same", "new"),
+        default="same",
+        help=(
+            "Where remediation runs. 'same' (default) continues the stage's own "
+            "thread with the check report as the next turn, so the agent keeps its "
+            "context; 'new' starts a fresh thread with a remediation goal."
+        ),
+    )
+    parser.add_argument(
+        "--message-file",
+        type=pathlib.Path,
+        help=(
+            "With --resume-stage: send this file's text as the resume turn in the "
+            "recorded thread instead of the generic continue message (owner steering)."
+        ),
+    )
+    parser.add_argument(
+        "--transient-retries",
+        type=int,
+        default=3,
+        help=(
+            "Automatic same-thread resumes after a transient API error "
+            "(model at capacity, stream disconnect, HTTP 5xx). Default: 3."
+        ),
+    )
+    parser.add_argument(
+        "--transient-backoff",
+        default="300,900,2700",
+        help="Comma-separated seconds to wait before each transient resume (last value repeats).",
+    )
+    parser.add_argument(
+        "--wait-on-usage-limit",
+        action="store_true",
+        help=(
+            "On usageLimited/budgetLimited, sleep until the reported reset time "
+            "and resume the same thread instead of stopping."
+        ),
+    )
+    parser.add_argument(
+        "--max-usage-wait-hours",
+        type=float,
+        default=168.0,
+        help="Upper bound on total usage-limit waiting per run (default: 168 h).",
+    )
+    parser.add_argument(
+        "--usage-poll-seconds",
+        type=int,
+        default=1800,
+        help="Retry interval when a usage limit reports no reset time (default: 1800 s).",
+    )
+    parser.add_argument(
+        "--min-headroom-pct",
+        type=float,
+        default=15.0,
+        help=(
+            "Before each stage, if the account rate-limit window reports less than this "
+            "percent remaining, pause until its reset instead of starting a stage that "
+            "would be cut mid-way. 0 disables. Skipped when rate limits are unavailable."
+        ),
+    )
+    parser.add_argument(
+        "--notify-cmd",
+        help=(
+            "Shell command run (fire and forget) when a stage stops blocked, turnFailed, "
+            "usage-limited, critical-fail or check-error, and when the run finishes. "
+            "Environment: STAGE, STATUS, LOG_DIR, MESSAGE."
+        ),
+    )
+    parser.add_argument(
+        "--notify-timeout",
+        type=int,
+        default=60,
+        help="Seconds before a --notify-cmd process is killed (default: 60).",
+    )
     parser.add_argument("--approval-policy", default="never")
     parser.add_argument("--sandbox", default="danger-full-access")
     parser.add_argument("--model")
@@ -331,7 +496,29 @@ def parse_args() -> argparse.Namespace:
         raise SystemExit("--resume-stage must be >= 1")
     if args.resume_stage is not None and args.log_dir is None:
         raise SystemExit("--resume-stage requires --log-dir pointing at the existing multigoal log directory")
+    if args.message_file is not None:
+        if args.resume_stage is None:
+            raise SystemExit("--message-file requires --resume-stage")
+        if not args.message_file.is_file():
+            raise SystemExit(f"--message-file not found: {args.message_file}")
+        if not args.message_file.read_text(encoding="utf-8").strip():
+            raise SystemExit(f"--message-file is empty: {args.message_file}")
+    if args.transient_retries < 0:
+        raise SystemExit("--transient-retries must be >= 0")
+    args.transient_backoff_seconds = parse_backoff(args.transient_backoff)
+    if args.min_headroom_pct < 0 or args.min_headroom_pct > 100:
+        raise SystemExit("--min-headroom-pct must be between 0 and 100")
     return args
+
+
+def parse_backoff(value: str) -> list[int]:
+    try:
+        delays = [int(item.strip()) for item in value.split(",") if item.strip()]
+    except ValueError as exc:
+        raise SystemExit(f"--transient-backoff expects comma-separated seconds, got: {value}") from exc
+    if not delays or any(delay < 0 for delay in delays):
+        raise SystemExit(f"--transient-backoff expects non-negative seconds, got: {value}")
+    return delays
 
 
 def timestamp() -> str:
@@ -560,12 +747,24 @@ def update_stage_state(state: StageState, message: JsonObject) -> None:
         turn = params.get("turn")
         if isinstance(turn, dict) and isinstance(turn.get("id"), str):
             state.active_turns.add(turn["id"])
+            state.seen_turns.add(turn["id"])
+            # An error from an earlier turn does not explain later stops.
+            state.last_turn_error = None
         return
 
     if method == "turn/completed":
         turn = params.get("turn")
         if isinstance(turn, dict):
             turn_id = turn.get("id")
+            if (
+                state.ignore_stale_goal_objective
+                and isinstance(turn_id, str)
+                and turn_id not in state.active_turns
+                and turn_id not in state.seen_turns
+            ):
+                # A resumed state can receive the completion of a turn from the
+                # previous attempt; it says nothing about this attempt.
+                return
             if isinstance(turn_id, str):
                 state.active_turns.discard(turn_id)
             status = turn.get("status")
@@ -575,6 +774,13 @@ def update_stage_state(state: StageState, message: JsonObject) -> None:
                     error = turn.get("error")
                     state.last_turn_error = json.dumps(error) if error is not None else "turn failed"
                     state.terminal_status = "turnFailed"
+        return
+
+    if method == "error":
+        # Non-retried turn errors explain a following failed turn or blocked goal.
+        error = params.get("error")
+        if error is not None and params.get("willRetry") is False:
+            state.last_turn_error = json.dumps(error)
         return
 
     if method == "thread/goal/updated":
@@ -619,7 +825,31 @@ def wait_for_stage_terminal(client: AppServerClient, log: Any, state: StageState
                 file=sys.stderr,
             )
             last_notice = now
-    return state.terminal_status
+    terminal = state.terminal_status
+    if terminal != "complete" and state.last_turn_error is None:
+        drain_turn_error(client, log, state)
+    return terminal
+
+
+def drain_turn_error(client: AppServerClient, log: Any, state: StageState) -> None:
+    """Read briefly past a non-complete goal status to capture the turn error.
+
+    The goal can flip to blocked before the turn/completed or error event that
+    explains it arrives. Without that error a server_overloaded stop looks like an
+    agent-declared blocker. The goal's terminal status is kept unchanged.
+    """
+    terminal = state.terminal_status
+    deadline = time.monotonic() + TERMINAL_DRAIN_SECONDS
+    try:
+        while state.active_turns:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            client.read_event(log, lambda msg: update_stage_state(state, msg), timeout=remaining)
+    except (ReadTimeout, TypeError):
+        # TypeError: a client without timeout support; keep the goal status.
+        pass
+    state.terminal_status = terminal
 
 
 def wait_for_turn_started(
@@ -707,7 +937,7 @@ def tracked_goal(function):
             return function(*positional, **keyword)
         kind = values["attempt_kind"]
         telemetry.safe_hook("begin_attempt", values["output_log"], kind, values.get("thread_id"))
-        if kind != "resume":
+        if "on_thread_started" in values:
             callback = values.get("on_thread_started")
             def started(thread_id):
                 telemetry.safe_hook("thread", thread_id)
@@ -755,6 +985,9 @@ def execute_goal(
         if not isinstance(thread, dict) or not isinstance(thread.get("id"), str):
             raise RuntimeError(f"thread/start did not return a thread id: {started!r}")
         thread_id = thread["id"]
+        loaded = getattr(client, "loaded_threads", None)
+        if isinstance(loaded, set):
+            loaded.add(thread_id)
         if on_thread_started is not None:
             on_thread_started(thread_id)
         state = StageState(thread_id=thread_id, objective=objective)
@@ -812,29 +1045,31 @@ def execute_resumed_goal(
     prompt_copy: pathlib.Path,
     *,
     attempt_kind: str = "resume",
+    message: str | None = None,
 ) -> tuple[str, str | None]:
     """Resume an existing stage thread and run one continuation turn.
 
+    ``message`` replaces the generic continue text (owner steering, automatic
+    recovery or a same-thread remediation report). A thread this app-server
+    process already runs is continued directly; otherwise it is loaded with
+    thread/resume first.
+
     Returns (terminal_status, last_turn_error).
     """
-    message = "\n".join(
-        [
-            "Continue this existing multigoal stage after the previous turn stopped before the stage was complete.",
-            "",
-            f"Original goal prompt copy: {prompt_copy}",
-            "",
-            "Keep working on the same goal and use the existing artifacts, logs, and code state.",
-            "Do not restart from scratch unless the current artifacts require it.",
-            "The multigoal runner will run this stage's check script after you mark the goal complete, then continue later stages.",
-            "When the original goal is genuinely complete, mark the goal complete. If it is impossible to proceed, mark it blocked with the concrete blocker.",
-        ]
-    )
+    if message is None:
+        message = default_resume_message(prompt_copy)
     input_items, _missing = input_items_for_resume(repo, message, objective)
     telemetry_input(args, input_items)
+    loaded = getattr(client, "loaded_threads", None)
+    already_loaded = isinstance(loaded, set) and thread_id in loaded
     with output_log.open("w", encoding="utf-8") as log:
-        resumed = client.request("thread/resume", thread_resume_params(args, repo, thread_id), log)
         state = StageState(thread_id=thread_id, objective=objective, ignore_stale_goal_objective=True)
-        state.active_turns.update(in_progress_turn_ids(resumed))
+        if not already_loaded:
+            resumed = client.request("thread/resume", thread_resume_params(args, repo, thread_id), log)
+            if isinstance(loaded, set):
+                loaded.add(thread_id)
+            state.active_turns.update(in_progress_turn_ids(resumed))
+            state.seen_turns.update(state.active_turns)
         if state.active_turns:
             active = client.request(
                 "thread/goal/set",
@@ -874,6 +1109,7 @@ def execute_resumed_goal(
         turn = turn_started.get("turn")
         if isinstance(turn, dict) and isinstance(turn.get("id"), str):
             turn_id = turn["id"]
+            state.seen_turns.add(turn_id)
             if turn.get("status") == "inProgress":
                 state.active_turns.add(turn_id)
             wait_for_turn_started(client, log, state, turn_id)
@@ -892,6 +1128,53 @@ def execute_resumed_goal(
 
         terminal = wait_for_stage_terminal(client, log, state)
         return terminal, state.last_turn_error
+
+
+def default_resume_message(prompt_copy: pathlib.Path) -> str:
+    return "\n".join(
+        [
+            "Continue this existing multigoal stage after the previous turn stopped before the stage was complete.",
+            "",
+            f"Original goal prompt copy: {prompt_copy}",
+            "",
+            "Keep working on the same goal and use the existing artifacts, logs, and code state.",
+            "Do not restart from scratch unless the current artifacts require it.",
+            "The multigoal runner will run this stage's check script after you mark the goal complete, then continue later stages.",
+            "When the original goal is genuinely complete, mark the goal complete. If it is impossible to proceed, mark it blocked with the concrete blocker.",
+        ]
+    )
+
+
+def steering_message(text: str, prompt_copy: pathlib.Path) -> str:
+    """Owner steering text, sent verbatim, plus a one-line pointer to the goal."""
+    return "\n".join(
+        [
+            text.strip(),
+            "",
+            f"(Owner message delivered by the multigoal runner. Original goal prompt copy: {prompt_copy}. "
+            "Mark the goal complete when its requirements are met; the runner then runs the stage check.)",
+        ]
+    )
+
+
+def recovery_message(kind: str, turn_error: str | None, prompt_copy: pathlib.Path) -> str:
+    reason = {
+        "transient": "a transient API error (not a problem with your work)",
+        "usage": "an account usage limit that has now reset",
+    }.get(kind, kind)
+    lines = [
+        f"The previous turn of this stage stopped because of {reason}.",
+    ]
+    if turn_error:
+        lines.append(f"Error: {turn_error[:300]}")
+    lines += [
+        "",
+        f"Original goal prompt copy: {prompt_copy}",
+        "Continue the same goal from the current artifacts, logs and code state. A command or device job",
+        "that was running when the turn stopped was probably killed: check its state, and rerun it if needed",
+        "(reset the device first if it was mid-run). When the goal is genuinely complete, mark it complete.",
+    ]
+    return "\n".join(lines)
 
 
 def find_check_script(prompt_path: pathlib.Path) -> pathlib.Path | None:
@@ -1000,6 +1283,296 @@ def append_status(log_dir: pathlib.Path, name: str, goal_status: str, check_stat
         telemetry.safe_hook("stage_result", goal_status, check_status)
 
 
+# ---------------------------------------------------------------------------
+# Notifications
+
+_NOTIFY_THREADS: list[threading.Thread] = []
+
+
+def notify(args: argparse.Namespace, stage: str, status: str, log_dir: pathlib.Path, message: str) -> threading.Thread | None:
+    """Run --notify-cmd in the background with STAGE/STATUS/LOG_DIR/MESSAGE set.
+
+    Fire and forget: failures and timeouts are reported on stderr and never
+    change the run's outcome.
+    """
+    command = getattr(args, "notify_cmd", None)
+    if not command:
+        return None
+    timeout = getattr(args, "notify_timeout", 60)
+    env = os.environ.copy()
+    env.update(STAGE=stage, STATUS=status, LOG_DIR=str(log_dir), MESSAGE=message[:4000])
+
+    def run() -> None:
+        try:
+            subprocess.run(
+                command,
+                shell=True,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            print(f"notify command timed out after {timeout}s", file=sys.stderr)
+        except Exception as exc:  # noqa: BLE001 - notification must never fail the run
+            print(f"notify command failed: {exc}", file=sys.stderr)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    _NOTIFY_THREADS.append(thread)
+    return thread
+
+
+def flush_notifications(timeout: float = 10.0) -> None:
+    """Give pending notify commands a moment to run before the runner exits."""
+    deadline = time.monotonic() + timeout
+    for thread in list(_NOTIFY_THREADS):
+        thread.join(max(0.0, deadline - time.monotonic()))
+
+
+# ---------------------------------------------------------------------------
+# Stop classification, rate limits and automatic recovery
+
+
+def parse_turn_error(turn_error: str | None) -> JsonObject:
+    if not turn_error:
+        return {}
+    try:
+        value = json.loads(turn_error)
+    except (TypeError, json.JSONDecodeError):
+        return {"message": str(turn_error)}
+    if isinstance(value, dict):
+        return value
+    return {"message": str(value)}
+
+
+def _normalized_code(value: str) -> str:
+    return re.sub(r"[^a-z]", "", value.lower())
+
+
+def error_details(turn_error: str | None) -> tuple[set[str], str, int | None]:
+    """Return (normalized codexErrorInfo codes, message text, HTTP status)."""
+    error = parse_turn_error(turn_error)
+    codes: set[str] = set()
+    http_status: int | None = None
+    info = error.get("codexErrorInfo", error.get("codex_error_info"))
+    if isinstance(info, str):
+        codes.add(_normalized_code(info))
+    elif isinstance(info, dict):
+        for key, detail in info.items():
+            codes.add(_normalized_code(str(key)))
+            if isinstance(detail, dict) and isinstance(detail.get("httpStatusCode"), int):
+                http_status = detail["httpStatusCode"]
+    parts = [error.get("message"), error.get("additionalDetails")]
+    message = " ".join(str(part) for part in parts if part)
+    return codes, message, http_status
+
+
+def classify_stop(terminal: str, turn_error: str | None) -> str:
+    """Classify a stage stop as complete, usage, transient or other."""
+    if terminal == "complete":
+        return "complete"
+    codes, message, http_status = error_details(turn_error)
+    if terminal in USAGE_GOAL_STATUSES or codes & USAGE_ERROR_CODES or USAGE_MESSAGE_RE.search(message):
+        return "usage"
+    if codes & TRANSIENT_ERROR_CODES:
+        return "transient"
+    if http_status is not None and http_status >= 500:
+        return "transient"
+    if message and TRANSIENT_MESSAGE_RE.search(message):
+        return "transient"
+    return "other"
+
+
+def read_rate_limits(client: Any, log_dir: pathlib.Path) -> JsonObject | None:
+    """Best-effort account rate-limit snapshot; None when unavailable."""
+    snapshot: JsonObject | None = None
+    try:
+        with (log_dir / "rate-limits.jsonl").open("a", encoding="utf-8") as log:
+            result = client.request("account/rateLimits/read", None, log, timeout=RATE_LIMIT_READ_TIMEOUT)
+        if isinstance(result.get("rateLimits"), dict):
+            snapshot = result["rateLimits"]
+    except Exception as exc:  # noqa: BLE001 - optional API; degrade gracefully
+        print(f"rate limits unavailable: {str(exc)[:200]}", file=sys.stderr)
+    if snapshot is None:
+        latest = getattr(client, "latest_rate_limits", None)
+        snapshot = latest if isinstance(latest, dict) else None
+    return snapshot
+
+
+def rate_limit_windows(snapshot: JsonObject | None) -> list[tuple[float, float | None]]:
+    """(usedPercent, resetsAt epoch seconds) for each reported window."""
+    windows: list[tuple[float, float | None]] = []
+    if not isinstance(snapshot, dict):
+        return windows
+    for key in ("primary", "secondary"):
+        window = snapshot.get(key)
+        if not isinstance(window, dict):
+            continue
+        used = window.get("usedPercent")
+        if not isinstance(used, (int, float)):
+            continue
+        reset = window.get("resetsAt")
+        windows.append((float(used), float(reset) if isinstance(reset, (int, float)) else None))
+    return windows
+
+
+def has_spendable_credits(snapshot: JsonObject | None) -> bool:
+    credits = snapshot.get("credits") if isinstance(snapshot, dict) else None
+    if not isinstance(credits, dict):
+        return False
+    if credits.get("unlimited"):
+        return True
+    try:
+        return bool(credits.get("hasCredits")) and float(credits.get("balance") or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def reset_from_message(message: str) -> float | None:
+    """Parse "try again at Oct 22nd, 2026 6:14 AM" (local time) to epoch seconds."""
+    match = TRY_AGAIN_RE.search(message or "")
+    if not match:
+        return None
+    month, day, year, clock, meridiem = match.groups()
+    try:
+        moment = dt.datetime.strptime(f"{month.title()} {day} {year} {clock} {meridiem.upper()}", "%b %d %Y %I:%M %p")
+    except ValueError:
+        return None
+    return moment.timestamp()
+
+
+def usage_reset_epoch(snapshot: JsonObject | None, turn_error: str | None) -> float | None:
+    exhausted = [reset for used, reset in rate_limit_windows(snapshot) if used >= 100 and reset]
+    if exhausted:
+        return max(exhausted)
+    _codes, message, _status = error_details(turn_error)
+    return reset_from_message(message)
+
+
+def format_epoch(epoch: float) -> str:
+    return dt.datetime.fromtimestamp(epoch, dt.timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
+
+
+def claim_usage_wait(args: argparse.Namespace, seconds: float) -> bool:
+    """Charge a wait against --max-usage-wait-hours; False when it would exceed it."""
+    waited = getattr(args, "_usage_waited", 0.0)
+    limit = getattr(args, "max_usage_wait_hours", 168.0) * 3600
+    if waited + seconds > limit:
+        return False
+    args._usage_waited = waited + seconds
+    return True
+
+
+def wait_for_headroom(client: Any, args: argparse.Namespace, log_dir: pathlib.Path, name: str) -> None:
+    """Pause between stages while the account has less than --min-headroom-pct left."""
+    minimum = getattr(args, "min_headroom_pct", 0.0)
+    if minimum <= 0:
+        return
+    while True:
+        snapshot = read_rate_limits(client, log_dir)
+        windows = rate_limit_windows(snapshot)
+        if not windows or has_spendable_credits(snapshot):
+            return
+        low = [(used, reset) for used, reset in windows if 100 - used < minimum]
+        if not low:
+            return
+        resets = [reset for _used, reset in low if reset]
+        remaining = 100 - max(used for used, _reset in low)
+        if not resets:
+            print(f"rate-limit headroom {remaining:.0f}% < {minimum:g}% but no reset time; starting {name}", file=sys.stderr)
+            return
+        reset = max(resets)
+        delay = max(60.0, reset - time.time() + 120)
+        if not claim_usage_wait(args, delay):
+            print(f"rate-limit headroom low but usage wait budget is spent; starting {name}", file=sys.stderr)
+            return
+        note = f"paused before start: {remaining:.0f}% rate-limit headroom < {minimum:g}%; waiting until {format_epoch(reset)}"
+        append_status(log_dir, name, "not-started", note)
+        print(note, file=sys.stderr)
+        notify(args, name, "headroom-wait", log_dir, note)
+        _sleep(delay)
+
+
+def recover_stop(
+    client: Any,
+    args: argparse.Namespace,
+    repo: pathlib.Path,
+    log_dir: pathlib.Path,
+    manifest: pathlib.Path,
+    *,
+    name: str,
+    key_prefix: str,
+    objective: str,
+    thread_id: str | None,
+    prompt_copy: pathlib.Path,
+    terminal: str,
+    turn_error: str | None,
+) -> tuple[str, str | None]:
+    """Resume the same thread after transient API errors and (opt-in) usage limits.
+
+    Returns the final (terminal_status, last_turn_error). A genuine agent
+    blocker ("other") is returned unchanged.
+    """
+    transient_used = 0
+    attempt = 0
+    while thread_id:
+        kind = classify_stop(terminal, turn_error)
+        if kind == "transient":
+            retries = getattr(args, "transient_retries", 0)
+            if transient_used >= retries:
+                append_status(log_dir, name, terminal, f"transient error: {retries} automatic resume(s) used")
+                break
+            delays = getattr(args, "transient_backoff_seconds", [300])
+            delay = float(delays[min(transient_used, len(delays) - 1)])
+            transient_used += 1
+            note = f"transient API error; resume {transient_used}/{retries} in {delay:.0f}s"
+        elif kind == "usage":
+            reset = usage_reset_epoch(read_rate_limits(client, log_dir), turn_error)
+            when = format_epoch(reset) if reset else "unknown"
+            if not getattr(args, "wait_on_usage_limit", False):
+                note = (
+                    f"usage limit; resets {when}. Resume with --resume-stage and the same --log-dir, "
+                    "or run with --wait-on-usage-limit"
+                )
+                append_status(log_dir, name, terminal, note)
+                break
+            delay = max(60.0, reset - time.time() + 120) if reset else float(getattr(args, "usage_poll_seconds", 1800))
+            if not claim_usage_wait(args, delay):
+                append_status(log_dir, name, terminal, f"usage limit; resets {when}; wait budget exhausted")
+                break
+            note = f"usage limit; waiting until {when if reset else format_epoch(time.time() + delay)} then resuming"
+            notify(args, name, "usage-wait", log_dir, note)
+        else:
+            break
+        append_status(log_dir, name, terminal, note)
+        print(note, file=sys.stderr)
+        _sleep(delay)
+        attempt += 1
+        output_log = log_dir / f"{name}.auto-resume-{attempt}.jsonl"
+        append_manifest(
+            manifest,
+            [
+                f"{key_prefix}_auto_resume_{attempt}_reason={kind}",
+                f"{key_prefix}_auto_resume_{attempt}_started_at_utc={timestamp()}",
+            ],
+        )
+        print(f"\n== Auto-resume {attempt} ({kind}): {name} ==\n+ log: {output_log}", file=sys.stderr)
+        terminal, turn_error = execute_resumed_goal(
+            client,
+            args,
+            repo,
+            objective,
+            thread_id,
+            output_log,
+            prompt_copy,
+            message=recovery_message(kind, turn_error, prompt_copy),
+        )
+        append_manifest(manifest, [f"{key_prefix}_auto_resume_{attempt}_terminal_status={terminal}"])
+    return terminal, turn_error
+
+
 def run_stage_checks(
     client: AppServerClient,
     args: argparse.Namespace,
@@ -1013,8 +1586,14 @@ def run_stage_checks(
     prompt_copy: pathlib.Path,
     replacements: list[tuple[str, str]],
     manifest_key_prefix: str | None = None,
+    thread_id: str | None = None,
 ) -> str:
-    """Run the stage's check script with remediation. Returns the check status string."""
+    """Run the stage's check script with remediation. Returns the check status string.
+
+    Exit 1 (advisory) is recorded without remediation unless
+    --remediate-advisory is set. With --remediation-thread same (default) and a
+    known stage thread, remediation is the next turn of that thread.
+    """
     manifest_key_prefix = manifest_key_prefix or f"stage_{index}"
     script = find_check_script(prompt_path)
     if script is None or args.no_checks:
@@ -1025,6 +1604,8 @@ def run_stage_checks(
     extra_env = replacement_env(replacements)
     extra_env["MULTIGOAL_LOG_DIR"] = str(log_dir)
     extra_env["MULTIGOAL_STAGE"] = name
+    remediate_advisory = getattr(args, "remediate_advisory", False)
+    same_thread = getattr(args, "remediation_thread", "new") == "same" and thread_id is not None
 
     code = -1
     for attempt in range(args.check_retries + 1):
@@ -1046,6 +1627,9 @@ def run_stage_checks(
         if code not in (CHECK_ADVISORY, CHECK_CRITICAL):
             append_manifest(manifest, [f"{manifest_key_prefix}_check=check-error(exit{code})"])
             return f"check-error(exit{code})"
+        if code == CHECK_ADVISORY and not remediate_advisory:
+            print("advisory check findings recorded; no remediation (--remediate-advisory to enable)", file=sys.stderr)
+            break
         if attempt >= args.check_retries:
             break
         objective = remediation_objective(
@@ -1055,24 +1639,54 @@ def run_stage_checks(
             prompt_copy=prompt_copy,
             exit_code=code,
         )
+        key = f"{manifest_key_prefix}_remediation_{attempt + 1}"
         remediation_log = log_dir / f"{name}.remediation-{attempt + 1}.jsonl"
-        print(f"\n== Stage {index} remediation {attempt + 1}: check failed (exit {code}) ==", file=sys.stderr)
+        mode = "same" if same_thread else "new"
+        print(f"\n== Stage {index} remediation {attempt + 1} ({mode} thread): check failed (exit {code}) ==", file=sys.stderr)
         print(f"+ log: {remediation_log}", file=sys.stderr)
-        terminal, _thread_id, turn_error = execute_goal(
+        append_manifest(manifest, [f"{key}_thread_mode={mode}"])
+        if same_thread:
+            assert thread_id is not None
+            append_manifest(manifest, [f"{key}_thread_id={thread_id}"])
+            stage_objective = objective_from_prompt(prompt)
+            terminal, turn_error = execute_resumed_goal(
+                client,
+                args,
+                repo,
+                stage_objective,
+                thread_id,
+                remediation_log,
+                prompt_copy,
+                attempt_kind="remediation",
+                message=objective,
+            )
+            remediation_thread: str | None = thread_id
+        else:
+            stage_objective = objective
+            terminal, remediation_thread, turn_error = execute_goal(
+                client,
+                args,
+                repo,
+                objective,
+                remediation_log,
+                attempt_kind="remediation",
+                on_thread_started=lambda tid: append_manifest(manifest, [f"{key}_thread_id={tid}"]),
+            )
+        terminal, turn_error = recover_stop(
             client,
             args,
             repo,
-            objective,
-            remediation_log,
-            attempt_kind="remediation",
-            on_thread_started=lambda tid: append_manifest(
-                manifest, [f"{manifest_key_prefix}_remediation_{attempt + 1}_thread_id={tid}"]
-            ),
-        )
-        append_manifest(
+            log_dir,
             manifest,
-            [f"{manifest_key_prefix}_remediation_{attempt + 1}_terminal_status={terminal}"],
+            name=f"{name}.remediation-{attempt + 1}",
+            key_prefix=key,
+            objective=stage_objective,
+            thread_id=remediation_thread,
+            prompt_copy=prompt_copy,
+            terminal=terminal,
+            turn_error=turn_error,
         )
+        append_manifest(manifest, [f"{key}_terminal_status={terminal}"])
         if terminal != "complete":
             detail = f": {turn_error}" if turn_error else ""
             print(f"remediation goal ended {terminal}{detail}", file=sys.stderr)
@@ -1081,6 +1695,102 @@ def run_stage_checks(
     status = "critical-fail" if code >= CHECK_CRITICAL else "advisory-fail"
     append_manifest(manifest, [f"{manifest_key_prefix}_check={status}"])
     return status
+
+
+def finish_stage(
+    client: AppServerClient,
+    args: argparse.Namespace,
+    repo: pathlib.Path,
+    log_dir: pathlib.Path,
+    manifest: pathlib.Path,
+    *,
+    index: int,
+    name: str,
+    label: str,
+    key_prefix: str,
+    prompt: str,
+    prompt_path: pathlib.Path,
+    prompt_copy: pathlib.Path,
+    replacements: list[tuple[str, str]],
+    objective: str,
+    thread_id: str | None,
+    terminal: str,
+    turn_error: str | None,
+) -> int:
+    """Recover, check and report one stage goal after its first terminal status."""
+    first_terminal = terminal
+    terminal, turn_error = recover_stop(
+        client,
+        args,
+        repo,
+        log_dir,
+        manifest,
+        name=name,
+        key_prefix=key_prefix,
+        objective=objective,
+        thread_id=thread_id,
+        prompt_copy=prompt_copy,
+        terminal=terminal,
+        turn_error=turn_error,
+    )
+    if terminal != first_terminal:
+        append_manifest(manifest, [f"{key_prefix}_terminal_status={terminal}"])
+    telemetry = getattr(args, "_telemetry", None)
+    if terminal == "turnFailed":
+        append_status(log_dir, name, terminal, "not-run", telemetry)
+        message = f"Stopping after {label} {index}: turn failed: {turn_error}"
+        print(message, file=sys.stderr)
+        notify(args, name, terminal, log_dir, message)
+        return 5
+    if terminal != "complete":
+        append_status(log_dir, name, terminal, "not-run", telemetry)
+        message = f"Stopping after {label} {index}: goal is {terminal}"
+        if turn_error:
+            message += f" ({turn_error[:300]})"
+        print(message, file=sys.stderr)
+        notify(args, name, terminal, log_dir, message)
+        return 3
+
+    check_status = run_stage_checks(
+        client,
+        args,
+        repo,
+        log_dir,
+        manifest,
+        index,
+        name,
+        prompt,
+        prompt_path,
+        prompt_copy,
+        replacements,
+        manifest_key_prefix=key_prefix,
+        thread_id=thread_id,
+    )
+    append_status(log_dir, name, terminal, check_status, telemetry)
+    if check_status == "critical-fail":
+        message = (
+            f"Stopping after {label} {index}: verification failed critically after "
+            f"{args.check_retries} remediation attempt(s). Artifacts are preserved; "
+            "later stages would build on a broken base."
+        )
+        print(message, file=sys.stderr)
+        notify(args, name, check_status, log_dir, message)
+        return 6
+    if check_status.startswith("check-error"):
+        message = (
+            f"{label} {index}: the verification check itself failed ({check_status}). "
+            "This is a runner/environment fault, not a model verdict."
+        )
+        notify(args, name, check_status, log_dir, message)
+        if args.check_error_policy == "stop":
+            print(
+                f"Stopping after {message} Fix the check or environment, then resume with "
+                f"--start-index {index} (the stage goal already completed, so rerun "
+                "from this stage only if its work needs re-verification).",
+                file=sys.stderr,
+            )
+            return 7
+    return 0
 
 
 def run_stage(
@@ -1130,7 +1840,7 @@ def run_stage(
         ],
     )
 
-    terminal, _thread_id, turn_error = execute_goal(
+    terminal, thread_id, turn_error = execute_goal(
         client,
         args,
         repo,
@@ -1140,48 +1850,25 @@ def run_stage(
     )
     append_manifest(manifest, [f"stage_{index}_terminal_status={terminal}"])
     print(f"stage_terminal_status={terminal}", file=sys.stderr)
-    if terminal == "turnFailed":
-        append_status(log_dir, name, terminal, "not-run", getattr(args, "_telemetry", None))
-        print(f"Stopping after stage {index}: turn failed: {turn_error}", file=sys.stderr)
-        return 5
-    if terminal != "complete":
-        append_status(log_dir, name, terminal, "not-run", getattr(args, "_telemetry", None))
-        print(f"Stopping after stage {index}: goal is {terminal}", file=sys.stderr)
-        return 3
-
-    check_status = run_stage_checks(
+    return finish_stage(
         client,
         args,
         repo,
         log_dir,
         manifest,
-        index,
-        name,
-        prompt,
-        prompt_path,
-        prompt_copy,
-        replacements,
+        index=index,
+        name=name,
+        label="stage",
+        key_prefix=f"stage_{index}",
+        prompt=prompt,
+        prompt_path=prompt_path,
+        prompt_copy=prompt_copy,
+        replacements=replacements,
+        objective=objective,
+        thread_id=thread_id,
+        terminal=terminal,
+        turn_error=turn_error,
     )
-    append_status(log_dir, name, terminal, check_status, getattr(args, "_telemetry", None))
-    if check_status == "critical-fail":
-        print(
-            f"Stopping after stage {index}: verification failed critically after "
-            f"{args.check_retries} remediation attempt(s). Artifacts are preserved; "
-            "later stages would build on a broken base.",
-            file=sys.stderr,
-        )
-        return 6
-    if check_status.startswith("check-error") and args.check_error_policy == "stop":
-        print(
-            f"Stopping after stage {index}: the verification check itself failed "
-            f"({check_status}). This is a runner/environment fault, not a model "
-            "verdict. Fix the check or environment, then resume with "
-            f"--start-index {index} (the stage goal already completed, so rerun "
-            "from this stage only if its work needs re-verification).",
-            file=sys.stderr,
-        )
-        return 7
-    return 0
 
 
 def run_resumed_stage(
@@ -1208,16 +1895,25 @@ def run_resumed_stage(
     resume_name = f"{name}.resume-{attempt}"
     output_log = log_dir / f"{resume_name}.jsonl"
 
+    message: str | None = None
+    manifest_lines = [
+        f"stage_{index}_resume_{attempt}_started_at_utc={timestamp()}",
+        f"stage_{index}_resume_{attempt}_thread_id={thread_id}",
+    ]
+    message_file = getattr(args, "message_file", None)
+    if message_file is not None:
+        text = message_file.read_text(encoding="utf-8")
+        copy = log_dir / f"{resume_name}.message.txt"
+        copy.write_text(text, encoding="utf-8")
+        message = steering_message(text, prompt_copy)
+        manifest_lines.append(f"stage_{index}_resume_{attempt}_message_file={copy}")
+
     print(f"\n== Resume stage {index}: {prompt_path} ==", file=sys.stderr)
     print(f"+ thread: {thread_id}", file=sys.stderr)
     print(f"+ log: {output_log}", file=sys.stderr)
-    append_manifest(
-        manifest,
-        [
-            f"stage_{index}_resume_{attempt}_started_at_utc={timestamp()}",
-            f"stage_{index}_resume_{attempt}_thread_id={thread_id}",
-        ],
-    )
+    if message is not None:
+        print(f"+ message: {message_file}", file=sys.stderr)
+    append_manifest(manifest, manifest_lines)
 
     terminal, turn_error = execute_resumed_goal(
         client,
@@ -1227,47 +1923,29 @@ def run_resumed_stage(
         thread_id,
         output_log,
         prompt_copy,
+        message=message,
     )
     append_manifest(manifest, [f"stage_{index}_resume_{attempt}_terminal_status={terminal}"])
     print(f"stage_resume_terminal_status={terminal}", file=sys.stderr)
-    if terminal == "turnFailed":
-        append_status(log_dir, resume_name, terminal, "not-run", getattr(args, "_telemetry", None))
-        print(f"Stopping after resumed stage {index}: turn failed: {turn_error}", file=sys.stderr)
-        return 5
-    if terminal != "complete":
-        append_status(log_dir, resume_name, terminal, "not-run", getattr(args, "_telemetry", None))
-        print(f"Stopping after resumed stage {index}: goal is {terminal}", file=sys.stderr)
-        return 3
-
-    check_status = run_stage_checks(
+    return finish_stage(
         client,
         args,
         repo,
         log_dir,
         manifest,
-        index,
-        resume_name,
-        prompt,
-        prompt_path,
-        prompt_copy,
-        replacements,
-        manifest_key_prefix=f"stage_{index}_resume_{attempt}",
+        index=index,
+        name=resume_name,
+        label="resumed stage",
+        key_prefix=f"stage_{index}_resume_{attempt}",
+        prompt=prompt,
+        prompt_path=prompt_path,
+        prompt_copy=prompt_copy,
+        replacements=replacements,
+        objective=objective,
+        thread_id=thread_id,
+        terminal=terminal,
+        turn_error=turn_error,
     )
-    append_status(log_dir, resume_name, terminal, check_status, getattr(args, "_telemetry", None))
-    if check_status == "critical-fail":
-        print(
-            f"Stopping after resumed stage {index}: verification failed critically after "
-            f"{args.check_retries} remediation attempt(s).",
-            file=sys.stderr,
-        )
-        return 6
-    if check_status.startswith("check-error") and args.check_error_policy == "stop":
-        print(
-            f"Stopping after resumed stage {index}: the verification check itself failed ({check_status}).",
-            file=sys.stderr,
-        )
-        return 7
-    return 0
 
 
 def main() -> int:
@@ -1368,6 +2046,7 @@ def main() -> int:
             for index, prompt_path in enumerate(args.prompt_files, start=args.start_index):
                 if args.resume_stage is not None and index < args.resume_stage:
                     continue
+                wait_for_headroom(client, args, log_dir, stage_name(index, prompt_path))
                 if telemetry is not None:
                     telemetry.safe_hook("begin_stage", index)
                 if args.resume_stage is not None and index == args.resume_stage:
@@ -1400,7 +2079,11 @@ def main() -> int:
                     return code
 
         run_status = "complete"
+    except Exception as exc:
+        notify(args, "run", "runner-error", log_dir, f"multigoal runner error: {str(exc)[:1000]}")
+        raise
     finally:
+        flush_notifications(min(10.0, float(getattr(args, "notify_timeout", 10))))
         if telemetry is not None:
             telemetry.safe_hook("end_stage", "interrupted")
             try:
@@ -1410,6 +2093,8 @@ def main() -> int:
 
     print(f"\nAll {len(args.prompt_files)} goals completed.", file=sys.stderr)
     print(f"Logs: {log_dir}", file=sys.stderr)
+    notify(args, "run", "complete", log_dir, f"All {len(args.prompt_files)} goals completed. Logs: {log_dir}")
+    flush_notifications(min(10.0, float(getattr(args, "notify_timeout", 10))))
     return 0
 
 
