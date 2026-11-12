@@ -1,18 +1,19 @@
 /goal Use $benchmark-model, $agentic-serving, and $tt-device-usage for HF_MODEL after optimized-vLLM in the current tt-metal checkout.
 
-As the user, I explicitly authorize you to use subagents when a selected skill requests or recommends them.
+Subagents are authorized when a selected skill requests or recommends them.
 
-Produce the final benchmark report for the person who launched this bringup. Use the working Stage 10 vLLM server, the generated autoport implementation and the selected precision policy.
+This goal measures the serving rates the agentic-evals stage reads. Use the working stage-10 vLLM server, or, when bringup/agentic_evals/inputs.json sets entry: existing, the server's tt-inference-server model spec. Benchmarks only; evals run in stage 12.
 
 Completion requirements:
-- Run the evals from bringup/agentic_evals/inputs.json when set, else the goal-12 defaults, on frozen common subsets at the largest batch in batch_sizes. Record any the harness or the hour cannot cover. Prefer published figures for this exact model; missing references do not block completion. Record actual samples/full population, task variants, document hashes, few-shot and scorer settings.
-- Apply the native HF chat template exactly once and the model's intended thinking/generation policy. Preserve benchmark inputs and doc/context_contract.json. Repair transport, template and scoring integration errors. Retain all questions, upstream scores, raw responses and stop/truncation counts.
-- Measure warmed vLLM performance with 4096 actual input tokens and 128 output tokens, one profile per supported decode batch size (batch_sizes, default 1, 8, 16, 32, minus any Stage 10 could not validate), each using the Stage 10 config for that batch with max-num-seqs and request concurrency set to it so the batch is filled rather than padded. Preserve precision, model, hardware and full context capacity. Record and validate each running server configuration; label server slots separately from concurrent requests in the report. Record the prefix-caching setting; use distinct prompts and complete every request. Report throughput, TTFT, TPOT, ITL, end-to-end latency and percentiles.
-- Prepare the required roofline collector before running accuracy. Collect full-phase host wall times and matching model/hardware work accounting for prefill FLOPs and decode DRAM bytes in every profile. Include host work, communication and gaps; use actual asynchronous completion boundaries without adding device synchronization or enabling the live device profiler. Collect each profile before its server is stopped. Missing accounting leaves the stage incomplete; no minimum roofline percentage or accuracy score is required.
-- Finish the client stage inside its budget of 30 minutes per configured batch size. The clock starts when benchmark_stage run is invoked, before the first server-selection hook, and runs through reporting. Include verification, inference, all server launches/reloads, compilation, warmups and phase collection performed by the runner. A launch needed by the first server selection counts too. Record setup completed before invocation separately, including the supplied server's configuration and prior startup time.
-- Report the target workload beside the measured profiles and name any gap.
-- Deliver doc/benchmark/run/REPORT.md with benchmark and performance tables first. Include published scores, deltas and reference links where available. Report protocol settings and truncations as facts; acceptance of the model's accuracy belongs to the bringup owner.
-- Save identity.json and RUN_NOTES.md in doc/benchmark/. Keep the generated manifest, configuration, summary and raw artifacts under run/. Prove the actual imported autoport module, full layers, model/tokenizer revisions, precision, hardware, source commits and launch configuration.
-- Run the evidence and context checks. Completion requires valid measurements and a report, with no accuracy verdict or score threshold. Commit stage-owned changes locally, never push, and log SHAs. Stop only owned processes and follow reservation ownership.
+- On the route stage 12 will use, measure warmed vLLM performance for a batch × input-length grid: every validated batch in batch_sizes (default 1, 8, 16, 32, minus any stage 10 could not validate), each with max-num-seqs and request concurrency set to the batch, at input lengths 4096, typical_context_tokens, working_set_tokens and at least 28K, 128 output tokens. Also measure every benchmark row the release spec lists for this model (from its tt-inference-server spec, or the closest model's for a new model; record which).
+- Every row completes. Use distinct prompts, record the prefix-caching setting, and preserve precision, model, hardware and doc/context_contract.json.
+- Write a predicted rate for each row before measuring it, from stage 10's measurements or the roofline accounting. A row slower than its predicted range has a recorded cause.
+- Collect full-phase host wall times with matching prefill FLOPs and decode DRAM bytes for each profile, at asynchronous completion boundaries, without adding device synchronization or the live device profiler.
+- Write doc/benchmark/serving_rates.json: the server config, validated_batches, and per batch and input length prefill_tok_s, decode_tok_s_user, ttft_s and step_ms, with the predicted value beside each.
+- doc/benchmark/run/REPORT.md leads with the grid and the release rows, then predictions against measurements and named gaps. Save identity.json proving the imported module (or model spec), revisions, precision, hardware, commits and launch configuration.
 
-Use $autofix for execution or integration failures. Preserve incomplete evidence and report any remaining failure explicitly.
+Limits: finish within benchmark_budget_hours from inputs.json (default 3). Main's benchmark client, unchanged.
+
+- Run the evidence and context checks. $stage-review returns `clean-pass`; findings fixed/rereviewed. Local commit stage-owned changes; never push; log SHAs. Stop only owned processes and follow reservation ownership.
+
+Unmet requirements, review findings, failed gates: work. Use $autofix for execution or integration failures. Stop only after `$autofix` fails.
