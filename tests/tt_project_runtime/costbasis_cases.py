@@ -4,23 +4,24 @@
 from __future__ import annotations
 
 
-def _basis_run(d, provider, lines, *, budget_usd=None, timeout_s=None, note=None):
+def _basis_run(d, provider, lines, *, budget_usd=None, timeout_s=None, note=None, env=None, started=None):
     """_finished_run, with a run.json carrying the run's budget and timeout (what _cut_off_cost reads)."""
     db = d.p.db
     tid = db.add_task("build", "", kind="work", tier="standard", priority=3, budget_usd=8.0, labels=[])
     db.update_task(tid, status="running")
     rid = db.x("INSERT INTO runs(task,role,provider,model,started,status,boot_id,note) "
                "VALUES(?,'worker',?,'opus',?,'running',?,?)",
-               (tid, provider, time.time() - 600, d.boot, json.dumps(note or {})))
+               (tid, provider, started or time.time() - 600, d.boot, json.dumps(note or {})))
     run_dir = d.p.runs / str(rid)
     run_dir.mkdir(parents=True)
     db.x("UPDATE runs SET dir=? WHERE id=?", (str(run_dir), rid))
     (run_dir / "output.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines))
     (run_dir / "stderr.log").write_text("")
-    if budget_usd is not None:
-        (run_dir / "run.json").write_text(json.dumps({"budget_usd": budget_usd, "timeout_s": timeout_s, "argv": []}))
+    if budget_usd is not None or env:
+        (run_dir / "run.json").write_text(json.dumps({"budget_usd": budget_usd, "timeout_s": timeout_s, "argv": [],
+                                                      **({"env": env} if env else {})}))
     d.finish_run(db.one("SELECT * FROM runs WHERE id=?", (rid,)),
-                 {"rc": 0, "started": time.time() - 600, "ended": time.time(), "stopped": None, "slept_s": 0})
+                 {"rc": 0, "started": started or time.time() - 600, "ended": time.time(), "stopped": None, "slept_s": 0})
     return db.one("SELECT * FROM runs WHERE id=?", (rid,))
 
 
@@ -584,3 +585,177 @@ def test_a_haiku_5_5_runs_list_cost_books_the_long_prompt_tier_on_its_total_prom
     assert _list_cost(run, under) == pytest.approx(round((50_000 * 0.1 + 50_000 * 0.01 + 2_000 * 0.5) / 1e6, 6))
     assert _list_cost(run, over) == pytest.approx(
         round(5 * (50_000 * 0.1 + 50_000 * 0.01 + 10 * 0.125 + 2_000 * 0.5) / 1e6, 6))
+
+
+# A resumed Codex run books its own tokens, not the session's running totals ----------------------------
+
+# Upstream note 856632d2c946f9db: run A then its resume B, the counters `codex exec resume` reported on
+# turn.completed, at $4 / $0.40 / $20 per million (input, cached, output).
+CODEX_A = (14_310_360, 11_157_504, 691_409)
+CODEX_B = (14_453_169, 11_157_504, 700_504)
+CODEX_PRICES = {"opus": [4.0, 0.4, 20.0]}
+
+
+def _codex_usd(inp, cached, out):
+    return ((inp - cached) * 4.0 + cached * 0.4 + out * 20.0) / 1e6
+
+
+def _codex_lines(sid, *turns, text="done"):
+    lines = [{"type": "thread.started", "thread_id": sid},
+             {"type": "item.completed", "item": {"type": "agent_message", "text": text}}]
+    for inp, cached, out in turns:
+        lines.append({"type": "turn.completed", "usage": {"input_tokens": inp, "cached_input_tokens": cached,
+                                                          "output_tokens": out}})
+    return lines
+
+
+def _codex_project(env):
+    p = make(env)
+    p.set_config("pricing", {"codex": CODEX_PRICES})
+    return p
+
+
+def _codex_prior_run(p, sid, note):
+    return p.db.x("INSERT INTO runs(role,provider,model,started,ended,status,session_id,note,cost_usd) "
+                  "VALUES('worker','codex','opus',?,?,'ok',?,?,1.0)",
+                  (time.time() - 3600, time.time() - 3000, sid, json.dumps(note)))
+
+
+def test_a_resumed_codex_run_books_what_the_thread_rose_by_since_its_last_run(env):
+    """The note's case: B resumed A's thread and reported the thread's running totals. Booked from A's
+    recorded terminal counters (basis "thread"): about $0.75, not $31.66; the report stays in the note and
+    B's own terminal counters are recorded for the next resume."""
+    from ttp.daemon import Daemon
+    p = _codex_project(env)
+    _codex_prior_run(p, "th-r", {"thread_totals": list(CODEX_A)})
+    run = _basis_run(Daemon(p.base), "codex", _codex_lines("th-r", CODEX_B), note={"resumes": {"session": "th-r"}})
+    own = tuple(b - a for a, b in zip(CODEX_A, CODEX_B))
+    assert run["cost_usd"] == pytest.approx(_codex_usd(*own)) == pytest.approx(0.753136), dict(run)
+    note = json.loads(run["note"])
+    assert note["own_basis"] == "thread" and note["thread_totals"] == list(CODEX_B), note
+    assert note["reported_turn_usd"] == pytest.approx(_codex_usd(*CODEX_B)) == pytest.approx(31.65569, abs=1e-3)
+    assert (run["input_tokens"], run["cache_read_tokens"], run["output_tokens"]) == (own[0] - own[1], own[1], own[2])
+    assert p.db.one("SELECT spent_usd FROM tasks WHERE id=?", (run["task"],))["spent_usd"] == pytest.approx(0.753136)
+
+
+def test_a_resumed_codex_run_books_its_rollouts_rise_before_any_record(env):
+    """No earlier run recorded the thread's counters: the session's rollout total before the run started is
+    the baseline (basis "rollout")."""
+    from ttp.daemon import Daemon
+    p = _codex_project(env)
+    home, started = env["tmp"] / "codex-home", time.time() - 600
+    _codex_rollout(home, "th-o", (started - 60, *CODEX_A), (started + 300, *CODEX_B))
+    run = _basis_run(Daemon(p.base), "codex", _codex_lines("th-o", CODEX_B), note={"resumes": {"session": "th-o"}},
+                     env={"CODEX_HOME": str(home)}, started=started)
+    assert run["cost_usd"] == pytest.approx(0.753136), dict(run)
+    assert json.loads(run["note"])["own_basis"] == "rollout"
+
+
+def test_a_new_codex_thread_is_booked_as_reported_and_records_its_counters(env):
+    from ttp.daemon import Daemon
+    p = _codex_project(env)
+    run = _basis_run(Daemon(p.base), "codex", _codex_lines("th-n", CODEX_A))
+    assert run["cost_usd"] == pytest.approx(_codex_usd(*CODEX_A)), dict(run)
+    note = json.loads(run["note"])
+    assert note["own_basis"] == "turns" and note["thread_totals"] == list(CODEX_A) and "reported_turn_usd" not in note
+
+
+def test_a_resumed_codex_run_with_several_turns_books_the_last_turns_rise(env):
+    from ttp.daemon import Daemon
+    p = _codex_project(env)
+    _codex_prior_run(p, "th-m", {"thread_totals": [1000, 0, 100]})
+    run = _basis_run(Daemon(p.base), "codex", _codex_lines("th-m", (1500, 0, 150), (2500, 0, 300)),
+                     note={"resumes": {"session": "th-m"}})
+    assert run["cost_usd"] == pytest.approx(_codex_usd(1500, 0, 200)), dict(run)
+    assert json.loads(run["note"])["thread_totals"] == [2500, 0, 300]
+
+
+def test_a_resumed_codex_run_with_no_baseline_or_reset_counters_keeps_its_report_unverified(env):
+    """No record and no rollout (a missing or rotated one), or counters below the record (they started over
+    after a compaction): nothing proves the run's own share, so it keeps the reported price, marked."""
+    from ttp.daemon import Daemon
+    p = _codex_project(env)
+    missing = _basis_run(Daemon(p.base), "codex", _codex_lines("th-x", CODEX_B), note={"resumes": {"session": "th-x"}})
+    assert missing["cost_usd"] == pytest.approx(_codex_usd(*CODEX_B))
+    assert json.loads(missing["note"])["own_basis"] == "unverified"
+    _codex_prior_run(p, "th-c", {"thread_totals": list(CODEX_A)})
+    reset = _basis_run(Daemon(p.base), "codex", _codex_lines("th-c", (500_000, 0, 10_000)),
+                       note={"resumes": {"session": "th-c"}})
+    assert reset["cost_usd"] == pytest.approx(_codex_usd(500_000, 0, 10_000))
+    assert json.loads(reset["note"])["own_basis"] == "unverified"
+    # another session's counters are never a baseline
+    _codex_prior_run(p, "th-other", {"thread_totals": list(CODEX_A)})
+    other = _basis_run(Daemon(p.base), "codex", _codex_lines("th-y", CODEX_B), note={"resumes": {"session": "th-y"}})
+    assert other["cost_usd"] == pytest.approx(_codex_usd(*CODEX_B))
+
+
+def test_a_resumed_codex_runs_sub_agents_still_count_in_its_cost(env):
+    from ttp.daemon import Daemon
+    p = _codex_project(env)
+    home, started = env["tmp"] / "codex-home", time.time() - 600
+    _codex_rollout(home, "th-s", (started - 60, *CODEX_A), (started + 300, *CODEX_B))
+    child = _codex_rollout(home, "kid-0199", (started + 100, 2000, 0, 100))
+    rows = child.read_text().splitlines()
+    meta = {"timestamp": "2026-11-01T10:00:00.000Z", "type": "session_meta",
+            "payload": {"id": "kid-0199", "source": {"subagent": {"thread_spawn": {"parent_thread_id": "th-s"}}}}}
+    child.write_text(json.dumps(meta) + "\n" + "\n".join(rows) + "\n")
+    run = _basis_run(Daemon(p.base), "codex", _codex_lines("th-s", CODEX_B), note={"resumes": {"session": "th-s"}},
+                     env={"CODEX_HOME": str(home)}, started=started)
+    assert run["cost_usd"] == pytest.approx(0.753136 + _codex_usd(2000, 0, 100)), dict(run)
+
+
+def test_a_cut_off_resumed_codex_run_is_priced_from_its_rollouts_rise(tmp_path):
+    """Interrupted mid-turn (no turn.completed): cut_off_cost and cost_so_far price the rollout's rise
+    since the run started, never the session's total; a finished resume's cost_so_far is its own share."""
+    from ttp.providers import get_provider
+    home, started = tmp_path / "codex", time.time() - 600
+    _codex_rollout(home, "th-i", (started - 60, *CODEX_A), (started + 300, *CODEX_B))
+    env = {"CODEX_HOME": str(home)}
+    out = tmp_path / "output.jsonl"
+    out.write_text(json.dumps({"type": "thread.started", "thread_id": "th-i"}) + "\n")
+    prov = get_provider("codex").use("opus", CODEX_PRICES)
+    assert prov.cut_off_cost(out, started, env) == pytest.approx(0.753136)
+    assert prov.cost_so_far(out, started, env) == pytest.approx(0.753136)
+    out.write_text("".join(json.dumps(x) + "\n" for x in _codex_lines("th-i", CODEX_B)))
+    assert get_provider("codex").use("opus", CODEX_PRICES).cost_so_far(out, started, env) == pytest.approx(0.753136)
+
+
+def test_codex_resumed_runs_booked_at_running_totals_are_rebooked_once_with_a_receipt(env):
+    """The one-time repair: a resumed run booked at $31.66 before own_usage is re-booked at its own share
+    from the earlier run's output (its last turn.completed), the old figure kept, the task's spend and the
+    ledger moved by the difference, a receipt written; a run with no provable baseline keeps its booking,
+    and a second pass changes nothing."""
+    from ttp.daemon import Daemon, CODEX_REBOOK_KEY
+    p = _codex_project(env)
+    d = Daemon(p.base)
+    tid = p.db.add_task("build", "", kind="work", tier="standard", priority=3, budget_usd=40.0, labels=[])
+    p.db.x("UPDATE tasks SET spent_usd=40 WHERE id=?", (tid,))
+
+    def old_run(sid, turns, cost, note):
+        rid = p.db.x("INSERT INTO runs(task,role,provider,model,started,ended,status,session_id,note,cost_usd) "
+                     "VALUES(?,'worker','codex','opus',?,?,'ok',?,?,?)",
+                     (tid, time.time() - 900, time.time() - 600, sid, json.dumps(note), cost))
+        run_dir = p.runs / str(rid)
+        run_dir.mkdir(parents=True)
+        (run_dir / "output.jsonl").write_text("".join(json.dumps(x) + "\n" for x in _codex_lines(sid, *turns)))
+        p.db.x("UPDATE runs SET dir=? WHERE id=?", (str(run_dir), rid))
+        return rid
+
+    a = old_run("th-h", [CODEX_A], _codex_usd(*CODEX_A), {})
+    b = old_run("th-h", [CODEX_B], _codex_usd(*CODEX_B), {"resumes": {"session": "th-h"}})
+    lone = old_run("th-l", [CODEX_B], _codex_usd(*CODEX_B), {"resumes": {"session": "th-l"}})
+    changed = d.rebook_codex_resumes()
+    assert [(i, round(x, 2), round(y, 3)) for i, x, y in changed] == [(b, 31.66, 0.753)], changed
+    row = p.db.one("SELECT cost_usd, note FROM runs WHERE id=?", (b,))
+    assert row["cost_usd"] == pytest.approx(0.753136)
+    assert json.loads(row["note"])["codex_rebooked"] == pytest.approx(31.65569, abs=1e-3)
+    for rid in (a, lone):
+        assert p.db.one("SELECT note FROM runs WHERE id=?", (rid,))["note"] in ("{}", json.dumps({"resumes": {"session": "th-l"}}))
+    assert p.db.one("SELECT spent_usd FROM tasks WHERE id=?", (tid,))["spent_usd"] == pytest.approx(40 - 31.65569 + 0.753136,
+                                                                                                    abs=1e-3)
+    receipts = list((p.state / "receipts").glob("codex-resume-rebook-*.json"))
+    got = json.loads(receipts[0].read_text())["runs"]
+    assert len(receipts) == 1 and [(x["run"], x["basis"], x["baseline"]) for x in got] == [(b, "thread", list(CODEX_A))]
+    assert (p.runs / str(b) / "output.jsonl").is_file()   # raw evidence kept
+    assert d.rebook_codex_resumes() is None and p.db.kv(CODEX_REBOOK_KEY)["runs"] == 1
+    assert Daemon(p.base).rebook_codex_resumes(dry_run=True) == []

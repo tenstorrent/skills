@@ -530,18 +530,52 @@ class Codex(Provider):
 
     def _tokens(self, output_path: Path) -> tuple[int, int, int, str]:
         inp = cached = out = 0
+        for t in self._turns(output_path):
+            inp, cached, out = inp + t[0], cached + t[1], out + t[2]
         last = ""
         for ev in self._events(output_path):
-            t = ev.get("type", "")
-            if t == "turn.completed":
-                u = ev.get("usage") or {}
-                inp += int(u.get("input_tokens") or 0)
-                cached += int(u.get("cached_input_tokens") or 0)
-                # output_tokens already includes reasoning; reasoning_output_tokens is a breakdown.
-                out += int(u.get("output_tokens") or 0)
-            elif t.startswith("item.") and (ev.get("item") or {}).get("type") == "agent_message":
+            if str(ev.get("type", "")).startswith("item.") and (ev.get("item") or {}).get("type") == "agent_message":
                 last = (ev.get("item") or {}).get("text") or last
         return inp, cached, out, last
+
+    def _turns(self, output_path: Path) -> list[tuple[int, int, int]]:
+        """Each turn.completed's (input, cached, output); output_tokens already includes reasoning
+        (reasoning_output_tokens is a breakdown)."""
+        return [tuple(int((ev.get("usage") or {}).get(k) or 0)
+                      for k in ("input_tokens", "cached_input_tokens", "output_tokens"))
+                for ev in self._events(output_path) if ev.get("type") == "turn.completed"]
+
+    def own_tokens(self, output_path, since=None, env=None, prior=None, resumed=False):
+        """(this run's own (input, cached, output), how it was found, the session's terminal counters).
+        `codex exec resume` reports the session's running totals on turn.completed, not the run's: a
+        resumed run booked them all at once (a run of about $0.75 booked at $31.66). Baselines, in order:
+        "rollout": the session's rollout total written before `since` (the run's start), the run then
+        priced at no less than the rollout's own rise; "thread": `prior`, the terminal counters the same
+        session's earlier run recorded. Either holds only when every counter the run reports is at or
+        above it and never falls from turn to turn; else (a counter reset after compaction, a rotated or
+        missing rollout and no record) a resumed run keeps its reported counters, "unverified".
+        A new session's turns are its own: summed as reported, "turns". Never another session's counters:
+        the rollout and `prior` are the run's own thread's."""
+        turns = self._turns(output_path)
+        summed = tuple(sum(t[i] for t in turns) for i in range(3)) if turns else (0, 0, 0)
+        rolled, _, base = self._read_rollout(Path(output_path), since, env, with_base=True)
+        ref, how = (tuple(base), "rollout") if base else (tuple(prior), "thread") if prior and len(prior) == 3 else (None, "")
+        if not turns:   # cut off before its turn completed: cut_off_cost prices its rollout's rise
+            return summed, "none", None
+        if ref is None:
+            return summed, ("unverified" if resumed else "turns"), (summed if len(turns) == 1 or not resumed else None)
+        rises = all(a >= b for a, b in zip(turns[0], ref)) and \
+            all(all(a >= b for a, b in zip(n, p)) for p, n in zip(turns, turns[1:]))
+        verified = rolled if how == "rollout" and rolled is not None else None
+        if rises:   # running totals: the run's own is what they rose by
+            own = tuple(a - b for a, b in zip(turns[-1], ref))
+            if verified is not None and self._price(*verified) > self._price(*own):
+                own = verified
+            return own, how, turns[-1]
+        if verified is not None:   # below the rollout's base: per-turn counts, checked against the rollout
+            return (verified if self._price(*verified) > self._price(*summed) else summed), "turns", \
+                tuple(a + b for a, b in zip(ref, summed))
+        return summed, "unverified", None
 
     def _reasoning(self, output_path: Path) -> int | None:
         """The reasoning share of the run's output tokens, or None when no turn reported one."""
@@ -564,14 +598,17 @@ class Codex(Provider):
         Read incrementally: the runner asks every few seconds while the rollout grows."""
         return self._read_rollout(output_path, since, env)[0]
 
-    def _read_rollout(self, output_path: Path, since: float | None = None, env: dict | None = None):
+    def _read_rollout(self, output_path: Path, since: float | None = None, env: dict | None = None,
+                      with_base: bool = False):
         """(`_rollout_tokens`, (stamp, rate_limits) of the newest token_count event carrying them),
-        read in one incremental pass."""
+        read in one incremental pass. `with_base` adds the session's total before `since` (None when the
+        rollout has none: a new session, or one rotated away), and then gives the tokens only while
+        every counter rose from it (else None: the counters started over)."""
         sid = next((str(ev.get("thread_id") or "") for ev in self._events(output_path)
                     if ev.get("type") == "thread.started"), "")
         paths = self.session_paths(sid, "", env)
         if not paths:
-            return None, None
+            return (None, None, None) if with_base else (None, None)
         seen = self.__dict__.setdefault("_rollouts", {})
         try:
             path = max(paths, key=lambda f: f.stat().st_mtime)
@@ -598,8 +635,11 @@ class Codex(Provider):
                     else:
                         last = tok
         except OSError:
-            return None, None
+            return (None, None, None) if with_base else (None, None)
         seen[(str(path), since)] = (offset, base, last, limits)
+        if with_base:
+            rose = last is not None and (not base or all(a >= b for a, b in zip(last, base)))
+            return (tuple(a - b for a, b in zip(last, base or (0, 0, 0))) if rose else None), limits, base
         if last is None:
             return None, limits
         return (tuple(max(a - b, 0) for a, b in zip(last, base)) if base else last), limits
@@ -679,8 +719,24 @@ class Codex(Provider):
         return self._price(*got) + self._price(*self._subagent_tokens(output_path, since, env)) if got else None
 
     def cost_so_far(self, output_path, since=None, env=None):
-        inp, cached, out, _ = self._tokens(output_path)
-        return max(self._price(inp, cached, out), self.cut_off_cost(output_path, since, env) or 0.0)
+        # The run's own tokens (own_tokens: a resumed session's running totals less its rollout base).
+        own = self.own_tokens(output_path, since, env)[0]
+        return max(self._price(*own), self.cut_off_cost(output_path, since, env) or 0.0)
+
+    def own_usage(self, usage, output_path, since=None, env=None, prior=None, resumed=False) -> None:
+        own, how, totals = self.own_tokens(output_path, since, env, prior, resumed)
+        usage.extra["own_basis"] = how
+        if totals is not None:
+            usage.extra["thread_totals"] = list(totals)   # the next resume's "thread" baseline
+        if how in ("rollout", "thread") or (how == "turns" and resumed):
+            reported = self._price(usage.input_tokens + usage.cache_read_tokens, usage.cache_read_tokens,
+                                   usage.output_tokens)
+            if abs(self._price(*own) - reported) > 1e-9:
+                usage.extra["reported_turn_usd"] = round(reported, 6)   # what the running totals priced
+            usage.input_tokens, usage.cache_read_tokens, usage.output_tokens = own[0] - own[1], own[1], own[2]
+            usage.cost_usd = self._price(*own)
+            if (usage.extra.get("thinking_tokens") or 0) > own[2]:
+                usage.extra.pop("thinking_tokens")   # the session's running reasoning count, not the run's
 
     def add_subagent_usage(self, usage, output_path, since=None, env=None) -> None:
         sub = self._subagent_tokens(output_path, since, env)

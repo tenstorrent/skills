@@ -433,6 +433,13 @@ class Provider:
         """Add to `usage` (parse's) what the run's sub-agents spent where the agent books them apart from
         the run's own stream (Codex: each in its own rollout). Default: nothing apart."""
 
+    def own_usage(self, usage: "RunUsage", output_path: Path, since: float | None = None,
+                  env: dict | None = None, prior: tuple | None = None, resumed: bool = False) -> None:
+        """Set `usage` (parse's) to the run's own tokens and cost where the agent reports a resumed
+        session's running totals (Codex), from a baseline it can prove: `prior` is the same session's
+        terminal counters an earlier run recorded (extra "thread_totals"). Default: parse's usage is
+        the run's own."""
+
     def coord_tools(self, argv: list[str], cwd: str, settings: dict, full: bool,
                     web: bool = True) -> tuple[list[str], dict]:
         """A session coordinator's tools on an agent without tool_hooks: `argv` changed to give them
