@@ -313,9 +313,11 @@ def code_sonnet(cfg: dict, task: dict | None, picked: dict | None = None, state:
     if not on or kind not in on["kinds"] or str((task or {}).get("effort") or ""):
         return None
     if kind == "review_fix":   # its review_fix label keeps it off other routes, not this one
-        if review_round(task) >= REVIEW_ROUND_MAX:
-            return None
-        task = {**task, "labels": [lb for lb in _labels(task) if not lb.startswith("review_fix")]}
+        if review_round(task) >= REVIEW_ROUND_MAX or any(lb.startswith("pr_fix:") for lb in _labels(task)):
+            return None   # a late round stays on Opus; so does a PR fix, which reads PR comments
+        # the daemon made it from a review of this project's own diff, which untrusted() trusts; an
+        # untrusted_input label the fixed work passed on still keeps it on Opus
+        task = {**task, "origin": "review", "labels": [lb for lb in _labels(task) if not lb.startswith("review_fix")]}
     if not routable(task, {"pick": picked or {}, KEY: "hard"}):   # urgent work stays on Opus
         return None
     mode = (state or {}).get(kind) or "canary"

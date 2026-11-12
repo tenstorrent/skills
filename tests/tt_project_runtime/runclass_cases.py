@@ -482,6 +482,15 @@ def test_review_fixes_take_the_code_sonnet_route_with_their_own_state_and_opus_k
         assert runclass.core_cheap({}, {**fix, **extra}, "hard", "standard", "claude", None, None, full) is None, extra
     assert runclass.core_cheap({}, fix, "hard", "standard", "claude", None, {"by": "retry"}, full) is None
     assert runclass.core_cheap({}, fix, "hard", "deep", "claude", None, None, full) is None
+    # The daemon makes every review fix (origin daemon) from a review of this project's own diff: routed.
+    # An untrusted_input label the fixed work passed on, or a PR fix (which reads PR comments), stays on Opus.
+    assert runclass.core_cheap({}, {**fix, "origin": "daemon"}, "hard", "standard", "claude", None, None,
+                               full)[runclass.CODE_KEY] == "review_fix"
+    for labels in ('["review_fix:9", "untrusted_input"]', '["review_fix:9", "pr_fix:40"]'):
+        assert runclass.core_cheap({}, {**fix, "origin": "daemon", "labels": labels}, "hard", "standard", "claude",
+                                   None, None, full) is None, labels
+    assert runclass.core_cheap({}, {**new, "origin": "daemon"}, "hard", "standard", "claude", None, None,
+                               {"new": "full"}) is None   # other daemon-made code work stays on Opus
     # The review_fix label still keeps it off the routine and chat routes.
     assert runclass.core_cheap({}, {**fix, "kind": "work"}, "routine", "standard", "claude") is None
     # Off-switches and a narrower kind list.
