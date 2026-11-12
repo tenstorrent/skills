@@ -5,11 +5,12 @@ structured settings, so rewording, reordering or deleting charter text changes n
 - `machines.allowed`: the machines the charter's Resources section names (machine_ledger.charter_machines
   over the live machine list), written only when the config authorizes none itself (`resources`,
   `shared_resources`, `machines.allowed`), since the old reader read the charter only then. It is a
-  user-only key, so it never gets a machine the charter refuses anywhere (a Restriction or exclusion:
-  machine_ledger._refused in any section) or that a user pause holds (conflicts): those are left out and
-  one `config_conflict` event lists them with the exact `ttp config` command that would add them. A list
-  already set gets the same event once (item "machine_conflicts") when the harness or an unknown setter
-  wrote it, and is never changed; a list the user set is not questioned. `delivery.push_allowed`, the
+  user-only key, so it never gets a machine whose machines-list record is retired or decommissioned
+  (machine_conflicts, structured facts only: no charter prose, #2116): those are left out and one
+  `config_conflict` event lists them with the exact `ttp config` command that would add them. A machine a
+  user pause holds is kept (the pause holds its work) and named as held in that event, never in a command.
+  A list already set gets the same event once (item "machine_conflicts") when the harness or an unknown
+  setter wrote it, and is never changed; a list the user set is not questioned. `delivery.push_allowed`, the
   other user-only key, is never written.
 - `delivery.base_ref`: the first charter branch (`branch <name>`) that exists here or on origin,
   written only when `delivery.base_ref` is unset and `delivery.push_branch` names no branch that
@@ -70,49 +71,35 @@ def _user_paused(p, alias: str) -> bool:
                for k, v in rows.items())
 
 
-def machine_conflicts(p, charter: str, names, known) -> list[str]:
-    """Of `names`, the machines the charter refuses somewhere (any section: a Restriction or an exclusion,
-    machine_ledger._refused) or that a user pause holds: never written to the user-only machines.allowed."""
-    from . import machine_ledger as ml
+def machine_conflicts(p, names, known) -> tuple[list[str], list[str]]:
+    """Of `names`, (refused, held) from structured facts alone, never charter prose (#2116): refused, the
+    machines whose list entry in `known` is retired or decommissioned (machines.retired); held, the others a
+    user pause holds, which is temporary and no reason to drop them."""
+    from . import machines
     names = [str(n) for n in names]
-    pat = {a: re.compile(rf"(?<![\w.-]){re.escape(a)}(?![\w-]|\.\w)") for a in names}
-    any_alias = re.compile("|".join(f"(?:{r.pattern})" for r in pat.values()) or r"(?!)")
-    clauses = [c for c in ml.RETIRED_CLAUSE_RE.split(charter or "") if c.strip()]
-    return [a for a in names if _user_paused(p, a)
-            or any(_bans(c, m.start(), m.end(), any_alias) for c in clauses for m in pat[a].finditer(c))]
+    known = known if isinstance(known, dict) else {}
+    refused = [a for a in names if a in known and machines.retired(known.get(a))]
+    return refused, [a for a in names if a not in refused and _user_paused(p, a)]
 
 
-# Words after a negation that make it a limit on how a machine is set up or capped, not a ban on using it
-# ("no special test cap on box-a", "the CLI is never installed on box-a").
-NOT_A_BAN = re.compile(r"\b(?:caps?|limits?|quotas?|install(?:ed|s)?|logged|log in|credentials?|copied)\b", re.I)
-
-
-def _bans(clause: str, start: int, end: int, alias_re) -> bool:
-    """Whether the sentence `clause` bars the alias at clause[start:end] (machine_ledger._refused, less limits)."""
-    from . import machine_ledger as ml
-    if not ml._refused(clause, start, end, alias_re):
-        return False
-    neg = None
-    for neg in ml.NEGATION_RE.finditer(clause[:start]):
-        pass
-    return not (neg and NOT_A_BAN.search(clause[neg.end():start]))
-
-
-def conflict_event(p, key: str, have: list, bad: list, wrote: bool) -> None:
-    """One `config_conflict` event: the entries of user-only `key` a charter Restriction, exclusion or user
-    pause contradicts, and the exact command that sets the list with them, for the user alone to run."""
+def conflict_event(p, key: str, have: list, bad: list, wrote: bool, held: list | None = None) -> None:
+    """One `config_conflict` event: the entries of user-only `key` whose machine records are retired or
+    decommissioned, and the exact command that sets the list with (wrote) or without them, for the user alone
+    to run. Machines a user pause holds (`held`) are named as held, never put in the command."""
     import json
     import time
     full = sorted({*map(str, have), *bad}) if wrote else list(have)
     clean = [a for a in have if a not in bad]
     if wrote:
-        text = (f"Moving the charter's machine list into {key}, the harness left out {', '.join(bad)}: the charter "
-                f"refuses them or a user pause holds them. {key} is now {json.dumps(clean)}. Only the user adds them, "
+        text = (f"Moving the charter's machine list into {key}, the harness left out {', '.join(bad)}: their machine "
+                f"records are retired or decommissioned. {key} is now {json.dumps(clean)}. Only the user adds them, "
                 f"if they meant to: `ttp config {p.name} {key} '{json.dumps(full)}'`.")
     else:
-        text = (f"{key} lists {', '.join(bad)}, which the charter refuses or a user pause holds. The harness changes "
-                f"no value of this user-only key; to drop them the user runs "
+        text = (f"{key} lists {', '.join(bad)}, whose machine records are retired or decommissioned. The harness "
+                f"changes no value of this user-only key; to drop them the user runs "
                 f"`ttp config {p.name} {key} '{json.dumps(clean)}'`.")
+    if held:
+        text += f" A user pause holds {', '.join(held)}: that is temporary and keeps them in the list."
     p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
            (time.time(), "daemon", CONFLICT_EVENT, f"{CONFLICT_EVENT}:{key}:{','.join(sorted(bad))}", "normal",
             text[:4000], "queued"))
@@ -157,9 +144,9 @@ def _branch_words(p, charter: str = "") -> list | None:
     return keep if keep != have else None
 
 
-def _flag_set_machines(p, charter: str) -> None:
+def _flag_set_machines(p) -> None:
     """Item "machine_conflicts": a machines.allowed the harness (or an unknown setter) wrote that lists a machine
-    the charter refuses or a user pause holds gets one conflict_event; the value is never changed."""
+    whose record is retired or decommissioned gets one conflict_event; the value is never changed."""
     from . import configwho
     from . import machines
     raw = p.raw_config()
@@ -168,8 +155,9 @@ def _flag_set_machines(p, charter: str) -> None:
         return
     if configwho.role(configwho.lookup(p.db, "machines.allowed", raw)) not in ("harness", "unknown"):
         return
-    if bad := machine_conflicts(p, charter, have, machines.load()):
-        conflict_event(p, "machines.allowed", have, bad, wrote=False)
+    bad, held = machine_conflicts(p, have, machines.load())
+    if bad:
+        conflict_event(p, "machines.allowed", have, bad, wrote=False, held=held)
 
 
 def plan(p, charter: str, known: dict) -> dict[str, object]:
@@ -222,18 +210,19 @@ def migrate(p, log=None, only: tuple[str, ...] = ITEMS) -> dict[str, object]:
             want.append(("worktree.shared_branches", keep, item))
             break
     if "machine_conflicts" in todo and "machines" in done:
-        _flag_set_machines(p, charter)
+        _flag_set_machines(p)
     if "forbidden" in todo and (pats := forbidden_merged(p, charter)) is not None:
         want.append(("memory.forbidden_patterns", pats, "forbidden"))
     wrote: dict[str, object] = {}
     for key, value, item in want:
         if item in todo and key == "machines.allowed":
-            if bad := machine_conflicts(p, charter, value, machines.load()):
+            bad, held = machine_conflicts(p, value, machines.load())
+            if bad:
                 value = [a for a in value if a not in bad]
-                conflict_event(p, key, value, bad, wrote=True)
+                conflict_event(p, key, value, bad, wrote=True, held=held)
                 if log:
-                    log(f"charter settings: {key} left out {', '.join(bad)} (charter refuses them or a user pause "
-                        "holds them); config_conflict event raised")
+                    log(f"charter settings: {key} left out {', '.join(bad)} (machine records retired or "
+                        "decommissioned); config_conflict event raised")
             if not value:
                 continue
         if item in todo and key not in USER_NEVER:

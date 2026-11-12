@@ -3489,11 +3489,13 @@ def test_charter_branch_prose_words_are_no_shared_branches(env):
             assert charterset.migrate(p) == {}, "once only"
 
 
-def test_charter_machine_list_never_gets_a_refused_or_user_paused_machine(env):
-    """machines.allowed is user-only: the charter migration leaves out a machine the charter bars anywhere
-    (a Restriction, an exclusion) or a user pause holds, and raises one config_conflict event with the exact
-    `ttp config` command; a limit ("no special test cap on box-a") bars nothing. A list already set gets the
-    event once when the harness wrote it, is never changed, and a list the user set is not questioned."""
+def test_charter_machine_conflicts_read_only_structured_machine_facts(env):
+    """machines.allowed is user-only, and its conflict check reads structured facts alone, never charter prose
+    (#2116): a goal or Restriction saying "never ... on box-b" bars nothing, so the migration keeps box-b and
+    raises no config_conflict event; a user pause is temporary and keeps its machine. A list already set gets
+    one event naming only machines whose records are retired or decommissioned, with the command that drops
+    them (a user-paused machine is named as held, never in the command), and is never changed; a list the
+    user set is not questioned."""
     from ttp import charterset, configwho, coordinator
     from ttp import machines as mm
     for a in ("box-a", "box-b", "box-c", "box-d", "box-e"):
@@ -3502,17 +3504,17 @@ def test_charter_machine_list_never_gets_a_refused_or_user_paused_machine(env):
     p.charter_path.write_text(p.charter_path.read_text().replace(
         "## Resources\n", "## Resources\nMachines: box-a, box-b, box-c, box-d, box-e. No special test cap is "
         "kept on box-a. The CLI is never installed on box-e.\n", 1)
-        + "\n## Restrictions\n- No test or check runs on box-b (serving users).\n")
+        + "\n## Goals\n- The suite must never become a host machine-check on box-b, box-d.\n"
+        + "\n## Restrictions\n- No test or check runs on box-b (serving users).\n"
+        + "- box-d and box-e serve live traffic: never disrupt it.\n")
     coordinator.pause_resource(p, "box-c-device", True, reason="held", by="user")
     coordinator.pause_resource(p, "box-d", True, reason="busy", by="coordinator")
     wrote = charterset.migrate(p)
-    assert wrote["machines.allowed"] == ["box-a", "box-d", "box-e"]
-    ev = p.db.q("SELECT text,status FROM events WHERE kind=?", (charterset.CONFLICT_EVENT,))
-    assert len(ev) == 1 and ev[0]["status"] == "queued"
-    assert "box-b, box-c" in ev[0]["text"]
-    assert f"`ttp config {p.name} machines.allowed '[\"box-a\", \"box-b\", \"box-c\", \"box-d\", \"box-e\"]'`" in ev[0]["text"]
-    assert charterset.migrate(p) == {} and len(p.db.q("SELECT id FROM events WHERE kind=?", (charterset.CONFLICT_EVENT,))) == 1
-    # A list set before this check: flagged once with the command that drops them, never changed.
+    assert wrote["machines.allowed"] == ["box-a", "box-b", "box-c", "box-d", "box-e"]
+    assert not p.db.q("SELECT id FROM events WHERE kind=?", (charterset.CONFLICT_EVENT,))
+    assert charterset.machine_conflicts(p, ["box-a", "box-b", "box-c"], mm.load()) == ([], ["box-c"])
+    # A list set before this check: only a retired or decommissioned record is flagged, once, never changed.
+    mm.add("box-b", tags="device,decommissioned")
     for who, events in (({"by": "harness", "via": "charter settings moved to config"}, 1),
                         (configwho.by("user", via="cli"), 0)):
         p.db.x("DELETE FROM events WHERE kind=?", (charterset.CONFLICT_EVENT,))
@@ -3523,7 +3525,14 @@ def test_charter_machine_list_never_gets_a_refused_or_user_paused_machine(env):
         ev = p.db.q("SELECT text FROM events WHERE kind=?", (charterset.CONFLICT_EVENT,))
         assert len(ev) == events, who
         if events:
-            assert f"`ttp config {p.name} machines.allowed '[\"box-a\"]'`" in ev[0]["text"]
+            assert f"`ttp config {p.name} machines.allowed '[\"box-a\", \"box-c\"]'`" in ev[0]["text"]
+            assert "lists box-b," in ev[0]["text"] and "A user pause holds box-c" in ev[0]["text"]
+    # Nothing retired: no event, whatever the charter's prose or a user pause says.
+    mm.add("box-b", tags="device")
+    p.db.x("DELETE FROM events WHERE kind=?", (charterset.CONFLICT_EVENT,))
+    p.set_config("machines.allowed", ["box-a", "box-b", "box-c"], by={"by": "harness", "via": "charter settings moved to config"})
+    p.db.set_kv(charterset.DONE_KEY, {i: 1 for i in charterset.ITEMS if i != "machine_conflicts"})
+    assert charterset.migrate(p) == {} and not p.db.q("SELECT id FROM events WHERE kind=?", (charterset.CONFLICT_EVENT,))
     assert "delivery.push_allowed" in charterset.USER_NEVER
 
 
