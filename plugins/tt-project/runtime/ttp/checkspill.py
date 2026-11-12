@@ -1783,10 +1783,12 @@ def env_event(db, off: str, cfg: dict) -> bool:
     try:
         if db.q("SELECT 1 FROM events WHERE fingerprint=? LIMIT 1", (fp,)):
             return False
+        from . import screen
+        text = (f"Spilled checks are failing at import: {why}. Check what last changed the checks config "
+                f"(checks.spill_wrap_cmd, the pinned checks env) and restore a working value.")
         db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
-             (time.time(), "daemon", "observation", fp, "high",
-              f"Spilled checks are failing at import: {why}. Check what last changed the checks config "
-              f"(checks.spill_wrap_cmd, the pinned checks env) and restore a working value.", "queued"))
+             (time.time(), "daemon", "observation", fp, "high", text,
+              "muted" if screen.count_muted(db, "daemon", text, "high") else "queued"))
     except (OSError, sqlite3.Error):   # an event is a courtesy: never a reason for the checks run to fail
         return False
     return True
@@ -1818,10 +1820,12 @@ def wrap_refused(p, host: str, why: str, what: str = "", cfg: dict | None = None
     fp = f"checkspill:wrap:{_env_key(cfg)}:{hashlib.sha1(why.encode()).hexdigest()[:8]}"
     try:
         if not p.db.q("SELECT 1 FROM events WHERE fingerprint=? LIMIT 1", (fp,)):
+            from . import screen
+            text = (f"Spilled checks never run: {said}. Check how checks.spill_wrap_cmd (or a check's own "
+                    "spill_wrap_cmd) finds its wrapper on those hosts and fix the setting or the hosts.")
             p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
-                   (time.time(), "daemon", "observation", fp, "high",
-                    f"Spilled checks never run: {said}. Check how checks.spill_wrap_cmd (or a check's own "
-                    "spill_wrap_cmd) finds its wrapper on those hosts and fix the setting or the hosts.", "queued"))
+                   (time.time(), "daemon", "observation", fp, "high", text,
+                    "muted" if screen.count_muted(p.db, "daemon", text, "high") else "queued"))
     except (OSError, sqlite3.Error, AttributeError):   # an event is a courtesy: never a reason for the run to fail
         pass
     return True
@@ -2184,8 +2188,11 @@ def _strikes(db) -> dict:
 
 
 def _event(db, now: float, fp: str, severity: str, text: str) -> None:
+    """A spill host observation (source checks): stored muted, and counted there, when an observation mute covers it."""
+    from . import screen
+    status = "muted" if screen.count_muted(db, "checks", text, severity, now) else "queued"
     db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
-         (now, "checks", "observation", fp, severity, text, "queued"))
+         (now, "checks", "observation", fp, severity, text, status))
 
 
 def strike_fail(p, host: str, head: str, sig: str, now: float | None = None) -> None:

@@ -101,7 +101,7 @@ PLAIN_READS = {"cat", "head", "tail", "less", "more", "ls", "stat", "wc", "diff"
                "test", "[", "jq", "uniq", "cut", "readlink", "realpath", "du", "tree", "grep", "egrep", "fgrep", "rg",
                "ag", "echo", "printf", "pwd", "date", "whoami", "id", "hostname", "uname", "which", "type", "true",
                "false", "df", "ps", "pgrep", "uptime", "free", "nproc", "basename", "dirname", "tr", "column", "nl",
-               "comm", "paste", "tac", "seq", "sleep", "cd", "xxd", "od", "strings", "env", "printenv", "lsof", "ss"}
+               "comm", "paste", "tac", "seq", "sleep", "cd", "xxd", "od", "strings", "env", "printenv", "lsof"}
 WRAPPERS = {"timeout": 1, "nice": 0, "time": 0, "nohup": 0, "command": 0, "stdbuf": 0, "env": 0}   # words they take
 GIT_READS = {"log", "show", "status", "diff", "rev-parse", "merge-base", "ls-remote", "fetch", "ls-files", "ls-tree",
              "cat-file", "blame", "describe", "shortlog", "rev-list", "for-each-ref", "name-rev", "show-ref", "grep",
@@ -111,7 +111,7 @@ GIT_READS = {"log", "show", "status", "diff", "rev-parse", "merge-base", "ls-rem
 TTP_READS = READ_COMMANDS + (("paths",), ("list",), ("show",), ("quarantine", "list"), ("memory", "--search"),
                              ("audit", "fixes"), ("checks", "--result"), ("lock", "--probe"), ("upstream", "--fixed"),
                              ("push", "--queue"), ("push", "--result"), ("--help",), ("-h",), ("help",),
-                             ("--version",), ("task", "*", "eta"), ("overview",), ("runs",), ("schedules", "*", "grace"))
+                             ("--version",), ("task", "*", "eta"), ("bridge", "status"), ("overview",), ("runs",), ("schedules", "*", "grace"))
 LAUNCHCTL_READS = {"print", "list", "print-disabled", "blame", "version", "help"}
 SYSTEMCTL_READS = {"status", "show", "list-units", "list-timers", "list-unit-files", "is-active", "is-enabled",
                    "is-failed", "cat", "list-dependencies", "list-sockets"}
@@ -244,6 +244,8 @@ def _words_read(w: list[str], depth: int) -> bool:
     name, args = w[0].rsplit("/", 1)[-1], w[1:]
     if name in PLAIN_READS:
         return name != "env" or not args
+    if name == "ss":   # socket listings; -K/--kill closes the sockets it lists
+        return not any(a == "--kill" or re.fullmatch(r"-[a-zA-Z]*K[a-zA-Z]*", a) for a in args)
     if name in ("sort",):
         return not any(a.startswith(("-o", "--output")) for a in args)
     if name == "sed":

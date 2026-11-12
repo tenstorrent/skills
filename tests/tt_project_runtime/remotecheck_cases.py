@@ -5981,3 +5981,23 @@ def test_a_host_that_cannot_make_the_checks_env_is_down_for_every_project_until_
     rc, said = _rc_run(tmp_path, repo, "true", host="check-host-b")
     assert rc == 0, said
     assert checkspill.down_why("check-host-b") == "" and not checkspill._down_file("check-host-b").exists()
+
+
+def test_spill_host_observations_honour_an_observation_mute(env, tmp_path, monkeypatch):
+    """A low spill-health line under a checks mute on 'Spill host' below normal is stored muted and counted
+    there; a normal one stays queued; with no mute nothing changes."""
+    from ttp import checkspill, screen, spillhealth
+    p = _health_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b", "down"])
+    cfg, now = p.config(), time.time()
+    status = lambda fp: p.db.q("SELECT status FROM events WHERE fingerprint=?", (fp,))[0]["status"]
+    checkspill._event(p.db, now, "spill-health:none", "low", "Spill host down failed its health check (ssh failed)")
+    assert status("spill-health:none") == "queued"
+    screen.mute(p.db, "checks", "Spill host", 4, below="normal", now=now)
+    monkeypatch.setattr(spillhealth, "tunnel", lambda h, why: True)   # a tunnel flap: low
+    spillhealth.probe(spillhealth.targets(cfg), now)
+    assert spillhealth.apply(p, cfg, now) == ["down"]
+    row = p.db.q("SELECT status, severity FROM events WHERE text LIKE 'Spill host down failed%' ORDER BY id DESC")[0]
+    assert (row["status"], row["severity"]) == ("muted", "low")
+    checkspill._event(p.db, now, "spill-health:normal", "normal", "Spill host down failed its health check (boom)")
+    assert status("spill-health:normal") == "queued"
+    assert [m["count"] for m in p.db.kv(screen.MUTES_KEY) if m["match"] == "Spill host"] == [1]

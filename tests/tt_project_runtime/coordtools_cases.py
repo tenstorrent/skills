@@ -732,13 +732,15 @@ CHANGING_CALLS = ["rm -rf build", "echo x > notes.md", "ttp note hi", "git commi
 LOOKUP_READS = ["ttp deployed 2>&1 | head -30", "ttp deployed 0.2.9 --json", "ttp audit --help 2>&1 | head",
                 "ttp push -h", "ttp config demo bridge.agent_alert_after_min", "ttp config demo budget",
                 "awk '$1>=\"a\"' f | grep -c x", "awk -F: '{print $1}' f", "awk -v n=3 'NR<n || /x/' f",
-                "gawk 'NF>2{n++} END{print n}' f"]
+                "gawk 'NF>2{n++} END{print n}' f", "ss -tn state established '( sport = :2222 )'",
+                "ss -tnoi state established", "lsof -iTCP:8080 -sTCP:LISTEN -n -P 2>/dev/null | head", "ttp bridge status"]
 LOOKUP_CHANGES = ["ttp deployed --after-push", "ttp config demo k 5", "ttp config demo k ''",
                   "ttp config bridge.agent_alert_after_min 60", "ttp config --account k", "ttp devq run -h",
                   "ttp note hi -h", "awk '{print > \"x\"}' f", "awk '{printf \"%s\", $1 >> \"x\"}' f",
                   "awk '{print | \"sh\"}' f", "awk '{\"date\" | getline d}' f", "awk 'BEGIN{system(\"rm x\")}'",
                   "gawk -i inplace '{print}' f", "awk -f prog.awk f", "awk --exec=x f", "awk",
-                  "python3 -c 'print(1)'", "sed -i s/a/b/ f"]
+                  "python3 -c 'print(1)'", "sed -i s/a/b/ f",
+                  "ss -K dst 192.0.2.1", "ss -tnK", "ss --kill state established", "ttp bridge stop"]
 
 
 def test_deployed_help_a_one_key_config_read_and_plain_awk_count_as_reads():
