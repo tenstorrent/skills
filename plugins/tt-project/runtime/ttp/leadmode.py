@@ -8,7 +8,8 @@ has to learn it again, report back, and wake the coordinator to read the report.
 
 Dispatch (worker_task): a worker run starts only for
 - a review (an independent review stays independent),
-- work a worker already started (attempts > 0, or a branch on record): its hand-off chain goes on,
+- work a worker already started (attempts, spend or a branch on record; a waiting hand-off has no
+  attempt): its hand-off chain goes on,
 - a task whose spec has a `worker:` line (the lead's own pick: a long unattended run, or parallel
   independent work),
 - a code task the coordinator itself queued: it lands through a worker's hand-off, its review and
@@ -56,7 +57,7 @@ def worker_task(task: dict) -> bool:
     """Whether dispatch may start a worker run for `task` in lead mode (module doc)."""
     if task.get("kind") == "review":
         return True
-    if int(task.get("attempts") or 0) > 0 or task.get("branch"):
+    if int(task.get("attempts") or 0) > 0 or task.get("branch") or float(task.get("spent_usd") or 0) > 0:
         return True
     if WORKER_LINE.search(task.get("spec") or ""):
         return True

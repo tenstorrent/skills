@@ -12,7 +12,7 @@ def test_lead_mode_leaves_work_for_the_coordinator_and_gives_workers_the_rest():
     w = lambda **k: leadmode.worker_task(_lead_task(**k))
     assert not w() and not w(kind="question") and not w(kind="plan") and not w(kind="harness")
     assert w(kind="review") and w(kind="code")
-    assert w(attempts=1) and w(branch="ttp/t1-x"), "work a worker began stays with workers"
+    assert w(attempts=1) and w(branch="ttp/t1-x") and w(spent_usd=0.4), "work a worker began stays with workers"
     assert w(spec="measure it\nworker: a 6 h soak nobody watches")
     # What the daemon queued on its own waits for the lead first, code too; its reviews do not.
     assert not w(kind="code", origin="daemon") and w(kind="review", origin="daemon")
