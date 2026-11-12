@@ -5,7 +5,7 @@ Subagents are authorized when a selected skill requests or recommends them.
 This goal shows the served model scores like its reference on agentic evals, at a speed the measured serving rates explain. Read bringup/agentic_evals/inputs.json for the mode (quick, agentic or extended; each includes the one before), suites, list sizes, references and limits; $agentic-serving gives the defaults. Run on this machine.
 
 Goal completion requirements:
-- Phase 1: GPQA Diamond, 10 tasks (or inputs phase1), on main's harness, in stage hours 0–12. It passes when the score is within ok_band of its reference and measured wall time is within explain_tolerance of tokens ÷ doc/benchmark/serving_rates.json rates plus measured time outside the server.
+- Phase 1: GPQA Diamond, 10 tasks (or inputs phase1), on main's harness, in stage hours 0–12. It passes when the score is within ok_band of its reference and measured wall time is within explain_tolerance of the run replayed on doc/benchmark/serving_rates.json rates (the skill's explained hours: per task, tokens ÷ rates plus measured time outside the server, tasks scheduled on the agents; the last task's end).
 - Phase 2 (agentic and extended modes): SWE-bench Verified, 10 tasks from the skill's fixed diverse list (or inputs phase2), same rule. It starts when phase 1 passes or at hour 12, whichever is first, and has the rest of the 24 h. Plan for these times from the start.
 - A phase not passed when its time ends is a result: keep and report its score, interval, reference and analysis as they are, "not passed yet" with the reason; never discard it or call it failing.
 - Every run uses the skill's server size.

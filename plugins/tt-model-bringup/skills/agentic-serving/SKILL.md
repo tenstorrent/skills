@@ -135,10 +135,12 @@ phase cannot pass: ask the operator. Record the source next to each score.
   (target run < 5 h).
 - **Phase 2 (`agentic`):** `phase2`, the fixed diverse SWE-bench list, same rule. It starts when phase 1
   passes or at stage hour 12, whichever comes first, and has the rest of the 24 h. Plan both from the start.
-- A phase **passes** when its score is within `ok_band` of the reference and its wall time is explained:
-  explained hours = Σ over model calls (uncached input ÷ prefill rate + output tokens ÷ decode rate per user,
-  both from `serving_rates.json` at the run's batch and length) + measured time outside the server, spread
-  over the agents. Measured wall within `explain_tolerance` of that passes; otherwise find the gap.
+- A phase **passes** when its score is within `ok_band` of the reference and its wall time is explained.
+  Explained hours replay the run on the rates: each model call takes uncached input ÷ prefill rate + output
+  tokens ÷ decode rate per user, from the `serving_rates.json` row at the batch covering the requests active
+  then and the call's final context (the next row up); each task adds its measured time outside the server;
+  tasks start on the agents in the observed order; the explained wall is when the last one ends (one long
+  task sets it). Measured wall within `explain_tolerance` of that passes; otherwise find the gap.
 - **A mode is done when all its phases pass**: release ready for that mode.
 - **Not passed yet:** a phase whose time ends below its band or with unexplained time is a result. Keep its
   score, interval, reference and per-task analysis as they are, record the reason, and move on; never
