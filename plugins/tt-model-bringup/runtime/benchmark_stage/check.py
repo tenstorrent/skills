@@ -215,8 +215,8 @@ def main():
     advisories = []
     try:
         evidence = check(args.model_dir, args.hf_model, advisories)
-    except (ValueError, KeyError, OSError) as exc:
-        print(f'CRITICAL {exc}')
+    except Exception as exc:  # any unreadable evidence is critical, never advisory
+        print(f'CRITICAL {type(exc).__name__}: {exc}' if not isinstance(exc, ValueError) else f'CRITICAL {exc}')
         raise SystemExit(2)
     for line in advisories[:30]:
         print(f'ADVISORY {line}')
