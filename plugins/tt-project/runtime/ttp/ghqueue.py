@@ -262,7 +262,7 @@ def enqueue(args: list[str], input: bytes | None = None, cwd: str | None = None,
         sys.stderr.write(str(got.get("stderr") or ""))
         if not got.get("write"):
             done.unlink(missing_ok=True)   # a read is answered once; the next one asks again
-        mark(True)
+        mark(True, via=WORKSTATION)
         return int(got.get("rc", 1)) if str(got.get("rc", 1)).lstrip("-").isdigit() else 1
     if not (d / f"{key}.q").exists() and not (d / f"{key}.taken").exists():
         _write(d / f"{key}.q", {"key": key, "argv": sent, "repo": repo, "project": _project(cwd),

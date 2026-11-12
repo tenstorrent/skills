@@ -152,10 +152,30 @@ def deferral_kind(t: dict) -> str | None:
     return kind_of({"text": text}) if USER_RE.search(text) else None
 
 
-def deferral_text(t: dict, kind: str) -> str:
+GH_RE = re.compile(r"\b(?:gh|github(?:\s+cli)?)\b", re.I)
+
+
+def gh_wait(t: dict) -> bool:
+    """Whether a task's user-only "sign-in" is a gh login: lab hosts keep none, so it is never asked."""
+    d = deferral(t)
+    return bool(GH_RE.search(" ".join(str(x) for x in (d.get("why"), d.get("when"), t.get("blocked_reason")) if x)))
+
+
+def gh_held(cfg: dict | None) -> str:
+    """What a task held on a gh call waits for: the workstation gh queue, the route, or no route."""
+    from . import ghroute
+    cfg = cfg or {}
+    if ghroute.known(cfg) == ghroute.WORKSTATION:
+        return "held for the workstation gh queue"
+    return f"held for {ghroute.SETTING}" if ghroute.route(cfg) else "held: no gh route"
+
+
+def deferral_text(t: dict, kind: str, cfg: dict | None = None) -> str:
     """The item's plain words: what the user does, where, and what starts afterwards."""
     d = deferral(t)
     what = " ".join(str(d.get("why") or t.get("blocked_reason") or "").split())[:300]
+    if kind == "sign-in" and gh_wait(t):
+        return f"#{t['id']} is {gh_held(cfg)}" + (f": {what}" if what else "") + "; it starts by itself."
     step = {"sign-in": "a sign-in", "device-code": "a device code", "credential": "a credential"}[kind]
     return (f"#{t['id']} waits on {step} only you can do" + (f": {what}" if what else "") + ". "
             f"Once a check sees it done, #{t['id']} {t['title'][:100]} starts by itself; nothing else is needed.")
@@ -167,6 +187,8 @@ def silent(db: DB, t: dict, kind: str, cfg: dict | None) -> str | None:
     another, logged-in provider may run its work (failover: no required pin, a target not logged out)."""
     if alerts.condition_acked(db, f"{KEY}:{t['id']}:{kind}"):
         return "acknowledged by the user"
+    if kind == "sign-in" and gh_wait(t):   # nobody logs gh in on this host
+        return gh_held(cfg)
     if kind != "sign-in" or not cfg:
         return None
     from . import failover

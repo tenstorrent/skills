@@ -2337,7 +2337,7 @@ class Daemon:
                      self.tick_prune_worktrees, self.prune_leftovers, self.branch_cap, self.land_harness_worktrees, self.backup_branches, self.replicate_state, self.check_local_only, self.check_disk,
                      self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends, self.check_move, self.track_outages,
                      self.check_integrity, self.heal_harness_git,
-                     self.sync_schedules, self.lint_charter, self.lint_worker_prompt, self.tend_holds, self.record_ttr, self.alert_long_pause,
+                     self.sync_schedules, self.lint_charter, self.lint_worker_prompt, self.tend_holds, self.record_ttr, self.alert_long_pause, self.reclassify_alerts,
                      self.check_linger, self.check_notifier, self.check_overseer, self.alert_slurm_paused, self.check_gh_auth, self.check_reach, self.check_spill_health, self.check_chats,
                      self.probe_mcp):
             if step in lease_off:
@@ -4947,16 +4947,16 @@ class Daemon:
                 when = timefmt.short(float(st.get("since") or time.time()), self.p)
                 db.post("out", ghroute.known_text(hostname(), when, mode), chat=None, channel=alerts.QUIET,
                         kind="info", severity="low")
-        elif st.get("ok") is False and not ghroute.works():
+        elif st.get("ok") is False and not ghroute.live(self.cfg):
             if not db.kv(ghauth.KV):
                 db.set_kv(ghauth.KV, {"since": st.get("since")})
             when = timefmt.short(float(st.get("since") or time.time()), self.p)
             self.alert(ghauth.KEY, ghauth.text(st, hostname(), when, self.cfg), severity="normal",
                        quiet=not ghauth.announce(str(self.p.base), st.get("since")))
         else:
-            if db.kv(ghauth.KV) and (st.get("ok") or ghroute.works()):
+            if db.kv(ghauth.KV) and (st.get("ok") or ghroute.live(self.cfg)):
                 db.x("DELETE FROM kv WHERE key=?", (ghauth.KV,))
-            if st.get("ok") is True or ghroute.works():
+            if st.get("ok") is True or ghroute.live(self.cfg):
                 ghauth.forget()
         if db.kv(ghauth.KNOWN_KV) and not (st.get("ok") is False and mode):
             db.x("DELETE FROM kv WHERE key=?", (ghauth.KNOWN_KV,))
@@ -9436,6 +9436,12 @@ class Daemon:
         The high alert is raised only when that task ends without fixing it (failed or cancelled, or
         done while the schedule still fails); it clears itself on the next run that does not fail."""
         db, name = self.p.db, s["name"]
+        if alerts.not_an_ask(db, f"schedule:{name}", status):   # gh has no login here: held, not broken
+            from . import ghroute
+            self.alert(f"schedule:{name}", f"Schedule {name} is held: gh has no login on this host and "
+                       f"{ghroute.SETTING} {ghroute.how(self.cfg)}; it runs again by itself once gh calls go "
+                       f"through.", "low", quiet=True)
+            return
         fixes = db.kv(self.SCHEDULE_FIXES_KEY, {}) or {}
         fix = fixes.get(name)
         why = ("it has no command to run; the coordinator sets one with schedule_set `command`"
@@ -11679,6 +11685,16 @@ class Daemon:
                 log(self.p, f"ask {aid} has held work past coordinator.ask_rethink_h: raised to the coordinator")
         except Exception:   # a failed check must not stop the tick
             log(self.p, "ask rethink failed: " + traceback.format_exc().replace("\n", " | ")[:1500])
+
+    def reclassify_alerts(self) -> None:
+        """Re-check every open "needs you" item under the current rules (alerts.reclassify): at daemon
+        start (an upgrade restarts it) and hourly, model-free. A stopped project is swept when it starts."""
+        now = time.time()
+        if getattr(self, "_reclassified", False) and not alerts.reclassify_due(self.p.db, now):
+            return
+        self._reclassified = True
+        for it in alerts.reclassify(self.p.db, now):
+            log(self.p, f"{it['kind']} #{it['id']} closed: {it['why']}")
 
     def check_self_blocking(self) -> None:
         """Raise work held for the user's word on a decision that is the coordinator's own
@@ -21107,6 +21123,8 @@ class Daemon:
         path, outagemsg.OUTAGE_KEYS) never goes out bare: it names who acts now."""
         now = time.time()
         db = self.p.db
+        if severity != "low" and alerts.not_an_ask(db, key, text):
+            severity, quiet = "low", True   # it asks the user for nothing they can or will do: a status line
         if outagemsg.outage_key(key) if outage is None else outage:
             text = outagemsg.ensure_actor(text)   # never a bare "nothing was changed" outage alert
         tracked = alerts.tracked("alert", severity, key)

@@ -106,6 +106,15 @@ project's daemon started after the alert). Other one-shot deploy and upgrade lin
 upgrade merge, a restored release, an upgrade recovered at start) are below high, so they appear
 only in the feed and never under "needs you".
 
+An alert asks the user only for what they can and will do. A gh login on the host
+(`gh-no-login`), the optional ranking key (`ranking-key`), a chat endpoint's key
+(`chat-endpoint`), a pause the user set (`own-pause`) and one a hand-back or move set
+(`handback-pause`) are raised as low status lines. At daemon start (an upgrade restarts it) and
+hourly, a model-free sweep re-checks every open "needs you" item under these rules and
+acknowledges any they would not raise to the feed, with the why `reclassified: <rule>`; the same
+unchanged condition is not raised again. A missing key stays a status line only until it is saved:
+saving one resumes its routing or ranking. A stopped project is swept when it next starts.
+
 Each project also runs an overseer (`ttp.overseer`, its own service with `Restart=always`) beside
 the daemon. It shares no process, lock or tick step with it: once a minute it reads the database
 read-only (a short busy timeout, never waiting on the daemon's writes) and the run folders, and
@@ -1015,13 +1024,18 @@ coordinator with that evidence.
   until a task names the device again.
 - gh logged out (model-free): one check per machine, shared by every project on it, runs `gh auth
   status` at most every 15 min while a project there uses gh (a PR to watch, or a schedule or
-  probe that calls gh or `ttp ci`). While it fails for the login and no `delivery.gh_route`
-  answers, one normal alert in the top section names the machine and the route setting (never a
-  login step: lab hosts keep no GitHub login). It is sent once per logout for the whole account,
-  however many projects see it (a marker under the tt-project home folder), the other projects
-  show it quietly, and it clears once gh works or a route answers. Where no gh login is the
-  expected state, set `delivery.gh_route` to `workstation` (gh actions are run by the user's
-  workstation) or `none`: then no alert is raised, only one quiet status line per logout. Shipped gh callers never read a logout as ok: pr-watch's run ends with an
+  probe that calls gh or `ttp ci`). No gh login is never a "needs you" item and no daemon text
+  asks anyone to sign gh in: while it fails for the login and a set ssh-alias `delivery.gh_route`
+  does not answer, one low status line names the machine and the route setting. With
+  `delivery.gh_route` unset, a host whose gh is logged out acts as `workstation`: its gh calls
+  go to the workstation queue. Set `none` to keep gh calls off every route; an explicit `none`,
+  `workstation` or ssh alias is kept as set, and only one quiet status line per logout is shown.
+  Only a real login here, or this project's own ssh route answering, clears it: the workstation
+  queue or another project's route answering, or a routed call failing for the login there, does
+  not, so a logout never flaps clear and back. It never reaches chat, however often it is raised.
+  A schedule failing only because gh has no login is shown as held, naming the route's state,
+  never as failed twice in a row; a task held on a gh call shows "held for the workstation gh
+  queue" (or "no gh route"), never a sign-in only the user can do. Shipped gh callers never read a logout as ok: pr-watch's run ends with an
   `error:` status, `ttp ci` exits 4 with a `broken:` line, and a gh call that failed its login asks
   for a recheck at once. A `start_when` probe that fails for gh's login (exit 4, or `not logged in`
   in its output) raises no broken-probe event of its own while the host check says logged out; the

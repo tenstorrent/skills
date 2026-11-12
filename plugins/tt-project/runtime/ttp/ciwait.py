@@ -40,7 +40,7 @@ def _gh(args: list[str]) -> list | dict | None:
     except (OSError, subprocess.SubprocessError):
         return None
     if via:
-        ghroute.seen(out.returncode)
+        ghroute.seen(out.returncode, ghroute.route())
     if out.returncode == ghroute.SSH_RC if via else (out.returncode and args[:1] == ["api"]
                                                       and ghauth.auth_failed(out.returncode, out.stderr)):
         # the route down, or unset with no login here: a public read, else no answer

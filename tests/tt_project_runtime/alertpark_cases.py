@@ -160,3 +160,129 @@ def test_a_missing_chat_key_is_a_status_line_and_a_saved_key_resumes_its_work_un
     assert d._no_room("chat", {"now": time.time(), "busy": {}}) != "auth"
     assert p.db.one("SELECT status FROM tasks WHERE id=?", (tid,))["status"] == "queued"
     assert not turns, "no coordinator turn was needed"
+
+
+
+# --- reclassify: an alert asks only for what the user can and will do (alerts.reclassify) ---
+
+def _raw_alert(p, key, text, severity="normal"):
+    """An alert as raised before the rule: posted straight, its episode open."""
+    if key.startswith("schedule:"):   # its schedule still fails
+        p.db.x("INSERT OR REPLACE INTO schedules(name, kind, every_s, enabled, last_status, payload) "
+               "VALUES(?, 'command', 3600, 1, ?, '{}')", (key.partition(":")[2], f"error: {text}"))
+    return p.db.post("out", text, chat=None, kind="alert", severity=severity, ref=key)
+
+
+def test_reclassify_closes_pre_rule_alerts_of_every_class_and_never_reraises_them(env, monkeypatch):
+    from ttp import alerts, ghauth, projpause
+    from ttp.daemon import Daemon
+    p = make(env)
+    now = time.time()
+    ghauth._write(None, {"ok": False, "since": now, "checked_at": now, "error": "not logged in"})
+    projpause.pause(p.db, "user", "away")
+    p.db.set_kv("paused", True)
+    since = int(projpause.current(p.db)["since"])
+    p.db.set_kv(alerts.BREAKER + "chat", {"open": True, "opened": now})
+    p.db.set_kv("gh_auth_down", True)
+    tid = _park_deferred(p, "watch the PR", "the user's gh sign-in (`gh auth login`) on this host", "gh auth status")
+    from ttp import userstep
+    p.db.set_kv(userstep.STEPS, {f"{tid}:sign-in": {"source": "deferral", "kind": "sign-in"}})
+    cases = {
+        "auth:chat": "chat logged out: save the endpoint's key",
+        "model-ranking-key": "No Artificial Analysis key: save one",
+        "gh-auth": "gh has no login on a lab host",
+        "schedule:pr-watch": "Schedule pr-watch failed twice in a row and does nothing until fixed: gh auth "
+                             "status: you are not logged into any GitHub hosts. Run gh auth login",
+        f"user-step:{tid}:sign-in": f"#{tid} waits on a sign-in only you can do: gh auth login on the lab host.",
+        f"paused:{since}": "Project demo has been paused by the user.",
+    }
+    ids = {k: _raw_alert(p, k, t, "high" if k.startswith(("schedule", "auth")) else "normal") for k, t in cases.items()}
+    assert {m["id"] for m in alerts.needs_you(p.db, now)} >= set(ids.values())
+    done = alerts.reclassify(p.db, now)
+    assert {d["id"] for d in done} == set(ids.values())
+    assert all(d["why"].startswith("reclassified: ") for d in done)
+    assert not ({m["id"] for m in alerts.needs_you(p.db, now)} & set(ids.values()))
+    feed = " ".join(m["text"] for m in p.db.q("SELECT text FROM messages WHERE kind IN ('info','resolved')"))
+    for rule in ("chat-endpoint", "ranking-key", "gh-no-login", "own-pause"):
+        assert f"reclassified: {rule}" in feed
+    # Raised again for the same condition: a quiet status line, never back under "needs you".
+    d = Daemon(p.base)
+    for k, t in cases.items():
+        d.alert(k, t, "high")
+    assert not ({m["id"] for m in alerts.needs_you(p.db, time.time())}
+                - set(m["id"] for m in alerts.needs_you(p.db, now)))
+    assert not [m for m in alerts.needs_you(p.db, time.time()) if m["text"] in cases.values()]
+
+
+def test_reclassify_closes_a_hand_back_pause_but_not_a_coordinator_pause(env):
+    from ttp import alerts, projpause
+    p = make(env)
+    projpause.pause(p.db, "project other", "handed back to the other copy")
+    p.db.set_kv("paused", True)
+    key = f"paused:{int(projpause.current(p.db)['since'])}"
+    mid = _raw_alert(p, key, "Project demo has been paused.")
+    assert alerts.not_an_ask(p.db, key) == "handback-pause"
+    assert [d["id"] for d in alerts.reclassify(p.db, time.time())] == [mid]
+    projpause.pause(p.db, "coordinator", "a disk check")
+    assert alerts.not_an_ask(p.db, "paused:3") == ""
+
+
+def test_reclassify_leaves_real_asks_and_decisions_open(env):
+    from ttp import alerts
+    p = make(env)
+    keep = [
+        p.db.post("out", "PR https://github.com/o/r/pull/1 is ready for review: take it out of draft?",
+                  chat=None, kind="ask", severity="high"),
+        p.db.post("out", "The deploy key only you hold has expired; save a new one.", chat=None, kind="ask",
+                  severity="high"),
+        p.db.post("out", "Keep the old cache or drop it?", chat=None, kind="ask", severity="normal"),
+        _raw_alert(p, "schedule:nightly", "Schedule nightly failed twice in a row: its build script is missing.",
+                   "high"),
+    ]
+    login = p.db.post("out", "Please run gh auth login on the lab host so PR checks work.", chat=None,
+                      kind="ask", severity="high")
+    done = alerts.reclassify(p.db, time.time())
+    assert [d["id"] for d in done] == [login]
+    left = {m["id"] for m in alerts.needs_you(p.db, time.time())}
+    assert set(keep) <= left and login not in left
+
+
+def test_unset_gh_route_queues_gh_calls_to_the_workstation_while_logged_out(env, monkeypatch):
+    from ttp import ghauth, ghqueue, ghroute
+    make(env)
+    now = time.time()
+    ghauth._write(None, {"ok": False, "since": now, "checked_at": now, "error": "not logged in"})
+    sent = []
+    monkeypatch.setattr(ghqueue, "enqueue", lambda args, input=None, cwd=None: sent.append(args) or 75)
+    assert ghroute.known({}) == ghroute.WORKSTATION
+    assert ghroute.run("gh", ["pr", "comment", "1", "-b", "x"], cfg={}) == 75 and sent
+    none = {"delivery": {"gh_route": "none"}}
+    sent.clear()
+    assert ghroute.known(none) == "none" and ghroute.route(none) == ""
+    assert ghroute.run("gh", ["pr", "comment", "1", "-b", "x"], cfg=none) == ghroute.HELD_RC and not sent
+    ghauth._write(None, {"ok": True, "checked_at": now + 1})
+    assert ghroute.known({}) == ""
+
+
+def test_a_task_deferred_on_a_gh_login_is_held_for_the_queue_not_a_sign_in(env):
+    from ttp import userstep
+    p = make(env)
+    tid = _park_deferred(p, "watch the PR", "the user's gh sign-in (`gh auth login`) on this host",
+                         "gh auth status")
+    t = p.db.task(tid)
+    cfg = {"delivery": {"gh_route": "workstation"}}
+    assert userstep.silent(p.db, t, "sign-in", cfg) == "held for the workstation gh queue"
+    assert "only you" not in userstep.deferral_text(t, "sign-in", cfg)
+    assert userstep.gh_held({"delivery": {"gh_route": "none"}}) == "held: no gh route"
+    assert not _needs(p, f"user-step:{tid}:sign-in")
+
+
+def test_a_schedule_failing_only_for_gh_login_is_a_held_status_line_not_a_fix_task(env):
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    d._schedule_broken({"name": "pr-watch"}, "error: exit 4: To get started with GitHub CLI, please run: gh auth login")
+    assert not p.db.one("SELECT id FROM tasks WHERE title LIKE '%pr-watch%'")
+    [m] = p.db.q("SELECT text, severity FROM messages WHERE kind='alert' AND ref='schedule:pr-watch'")
+    assert m["severity"] == "low" and "is held" in m["text"] and "delivery.gh_route" in m["text"]
+    assert not _needs(p, "schedule:pr-watch")

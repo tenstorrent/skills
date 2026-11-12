@@ -70,7 +70,9 @@ def problem(v) -> str:
 
 
 def _value(cfg: dict | None = None, cwd: str | None = None) -> str:
-    """The project's valid delivery.gh_route ("" when unset), from `cfg` or the project at `cwd`."""
+    """The project's valid delivery.gh_route, from `cfg` or the project at `cwd`. Unset, it is
+    WORKSTATION while this host's gh is known logged out (ghauth): its gh calls go to the workstation
+    queue; "" otherwise. An explicit "none" or ssh alias is kept as set."""
     if cfg is None:
         def find():
             from .project import here
@@ -81,6 +83,8 @@ def _value(cfg: dict | None = None, cwd: str | None = None) -> str:
                 return {}
         cfg = _cached(("cfg", cwd or os.getcwd(), os.environ.get("TTP_PROJECT")), 60, find)
     v = ((cfg or {}).get("delivery") or {}).get(KEY)
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return WORKSTATION if _logged_out() else ""
     return v.strip() if isinstance(v, str) and not problem(v) else ""
 
 
@@ -256,7 +260,7 @@ def run(real: str, args: list[str], input: bytes | None = None, cfg: dict | None
             print(f"gh (tt-project): held: {why}; it was not sent to {SETTING} (exit {HELD_RC}).", file=sys.stderr)
             return HELD_RC
         rc = subprocess.run(routed(sent, cfg, cwd), input=data, cwd=cwd).returncode
-        mark(rc != SSH_RC)
+        mark(_answered(rc), via=route(cfg, cwd))
         if rc != SSH_RC:
             return rc
     if why := held(args, cfg, cwd):
@@ -268,33 +272,50 @@ def run(real: str, args: list[str], input: bytes | None = None, cfg: dict | None
     return subprocess.run([real, *args], input=input, cwd=cwd).returncode
 
 
-def mark(ok: bool, home=None) -> None:
-    """Record the route's last answer, host-wide (STATE), for the gh-auth alert."""
+def _answered(rc: int) -> bool:
+    """A routed call's exit that shows the route working: not ssh's own failure, nor gh's want of a login there."""
+    from .ghauth import AUTH_RC
+    return rc not in (SSH_RC, AUTH_RC)
+
+
+def mark(ok: bool, home=None, via: str = "") -> None:
+    """Record the route's last answer, host-wide (STATE), for the gh-auth alert: `via` names the route
+    that answered (an ssh alias, or WORKSTATION for the queue), so it counts only for that route."""
     from . import ghauth
     try:
         from .project import write_json
         f = ghauth._home(home) / STATE
         f.parent.mkdir(parents=True, exist_ok=True)
-        write_json(f, {"ok": ok, "at": time.time()}, 0o600)
+        write_json(f, {"ok": ok, "at": time.time(), "via": via}, 0o600)
     except OSError:
         pass
 
 
-def seen(rc: int) -> None:
+def seen(rc: int, via: str = "") -> None:
     """A routed call's exit: ssh's own failure marks the route down; one still queued for the workstation
     (HELD_RC) says nothing yet (its answer marks it, ghqueue.enqueue)."""
     if rc != HELD_RC:
-        mark(rc != SSH_RC)
+        mark(_answered(rc), via=via)
 
 
-def works(home=None, within_s: float = 3600) -> bool:
-    """Whether a routed gh call succeeded here within `within_s` and none failed since."""
+def works(home=None, within_s: float = 3600, via: str | None = None) -> bool:
+    """Whether a routed gh call succeeded here within `within_s` and none failed since; with `via`, only
+    a call over that route counts (another project's route or the workstation queue answering is no
+    route of this project's working)."""
     from . import ghauth
     try:
         st = json.loads((ghauth._home(home) / STATE).read_text())
     except (OSError, ValueError):
         return False
-    return isinstance(st, dict) and st.get("ok") is True and time.time() - float(st.get("at") or 0) < within_s
+    return (isinstance(st, dict) and st.get("ok") is True and time.time() - float(st.get("at") or 0) < within_s
+            and (via is None or st.get("via") == via))
+
+
+def live(cfg: dict | None = None, cwd: str | None = None) -> bool:
+    """Whether this project's own ssh delivery.gh_route answered lately: the only thing besides a real
+    login here that clears its gh-auth condition."""
+    alias = route(cfg, cwd)
+    return bool(alias) and alias != WORKSTATION and works(via=alias)
 
 
 def quiet(error: str) -> str:

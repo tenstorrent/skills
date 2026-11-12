@@ -93,6 +93,8 @@ def test_a_gh_logout_raises_one_alert_per_host_that_names_the_users_step_and_cle
         x.db.x("INSERT INTO tasks(title,kind,status,pr_url,created) VALUES('t','code','waiting',?,?)",
                ("https://github.com/acme/widgets/pull/3", time.time()))
     dp, dq = Daemon(p.base), Daemon(q.base)
+    for d in (dp, dq):   # a route that is down: unset would be the workstation queue (user msg #2679)
+        d.cfg.setdefault("delivery", {})["gh_route"] = "gh-box"
 
     def tick(*ds):
         for d in ds:
@@ -103,10 +105,11 @@ def test_a_gh_logout_raises_one_alert_per_host_that_names_the_users_step_and_cle
 
     tick(dp, dq)
     assert _gh_calls(calls) == ["auth status"], "one check for the host"
-    sent = [m for m in p.db.unread_for_chat("c1", 0)]
+    assert p.db.unread_for_chat("c1", 0) == [], "no gh login here is never a chat item (user msg #2679)"
+    sent = p.db.q("SELECT text, severity, channel FROM messages WHERE ref=?", (ghauth.KEY,))
     assert len(sent) == 1 and "delivery.gh_route" in sent[0]["text"] and hostname() in sent[0]["text"], sent
     assert "auth login" not in sent[0]["text"] and "log in" not in sent[0]["text"], "a login step on a lab host"
-    assert p.db.one("SELECT severity FROM messages WHERE ref=?", (ghauth.KEY,))["severity"] == "normal"
+    assert sent[0]["severity"] == "low" and sent[0]["channel"] == alerts.QUIET, "a status line, not needs-you"
     assert q.db.unread_for_chat("c1", 0) == [], "the second project told the chat again"
     assert alerts.holds(p.db, ghauth.KEY, 0, time.time())
     assert not alerts.sweep(p.db), "cleared while still logged out"
@@ -176,6 +179,8 @@ def _two_gh_projects(env, monkeypatch):
         x.db.x("INSERT INTO tasks(title,kind,status,pr_url,created) VALUES('t','code','waiting',?,?)",
                ("https://github.com/acme/widgets/pull/3", time.time()))
     dp, dq = Daemon(p.base), Daemon(q.base)
+    for d in (dp, dq):   # a route that is down: unset would be the workstation queue (user msg #2679)
+        d.cfg.setdefault("delivery", {})["gh_route"] = "gh-box"
 
     def tick(*ds):
         for d in ds:
@@ -194,7 +199,7 @@ def test_a_gh_logout_is_one_alert_per_account_even_when_a_projects_episode_reope
     monkeypatch.setattr(alerts, "owner_alive", lambda owner: False)   # every claim looks stale
     p, q, dp, dq, answer, tick = _two_gh_projects(env, monkeypatch)
     tick(dp, dq)
-    assert len(p.db.unread_for_chat("c1", 0)) == 1
+    assert p.db.unread_for_chat("c1", 0) == [], "no gh login here is never a chat item"
     assert q.db.unread_for_chat("c1", 0) == [], "a second alert for the same logout"
     assert q.db.one("SELECT channel FROM messages WHERE ref=?", (ghauth.KEY,))["channel"] == alerts.QUIET
     q.db.x("UPDATE alerts SET cleared=? WHERE key=?", (time.time(), ghauth.KEY))   # q's episode clears
@@ -216,7 +221,7 @@ def test_a_gh_route_mode_makes_no_login_here_one_quiet_status_line_not_an_alert(
     monkeypatch.setattr(alerts, "owner_alive", lambda owner: True)
     p, q, dp, dq, _answer, tick = _two_gh_projects(env, monkeypatch)
     tick(dp)
-    assert len(p.db.unread_for_chat("c1", 0)) == 1 and p.db.kv(ghauth.KV), "unset: the alert"
+    assert p.db.unread_for_chat("c1", 0) == [] and p.db.kv(ghauth.KV), "a route that is down: a quiet condition"
     dp.cfg.setdefault("delivery", {})["gh_route"] = "workstation"
     dq.cfg.setdefault("delivery", {})["gh_route"] = "none"
     for _ in range(3):
@@ -386,7 +391,8 @@ def test_gh_route_runs_gh_on_the_route_when_this_host_has_no_login(env, monkeypa
     assert ghroute.works(), "a routed call that answered is the route working"
     via = ghroute.routed(["api", "repos/{owner}/{repo}/pulls"], cfg, str(repo))
     assert "repos/acme/widgets/pulls" in via[-1], via
-    assert ghroute.routed(["pr", "view", "3"], {"delivery": {}}, str(repo)) is None, "no route, nothing routed"
+    assert ghroute.routed(["pr", "view", "3"], {"delivery": {"gh_route": "none"}}, str(repo)) is None, "none: not routed"
+    assert "gh-queue" in ghroute.routed(["pr", "view", "3"], {"delivery": {}}, str(repo)), "unset: the workstation queue"
     assert ghroute.problem("gh-box") == "" and ghroute.problem("local") and ghroute.problem("a b")
 
 
@@ -396,7 +402,7 @@ def test_no_route_falls_back_read_only_and_holds_writes_with_no_login_step(env, 
     from ttp import ghauth, ghroute, watchers
     from ttp.daemon import Daemon
     ssh_calls, gh_calls, repo = _no_login_here(env, monkeypatch)
-    cfg = {"delivery": {}}
+    cfg = {"delivery": {"gh_route": "none"}}   # unset would be the workstation queue
     assert ghroute.wanted(["pr", "comment", "3", "-b", "x"], cfg, str(repo))
     assert ghroute.run("gh", ["pr", "comment", "3", "-b", "x"], cfg=cfg, cwd=str(repo)) == ghroute.HELD_RC
     held = capfd.readouterr()
@@ -907,3 +913,30 @@ def test_no_login_hint_while_gh_is_logged_out_and_a_private_repo_is_observed_onc
     status = watchers.watch_prs(d)
     assert status.startswith("error:") and "acme/hidden" in status and "gh auth login" not in status, status
     assert [k["key"] for _, k in seen] == ["pr:anon-unreadable:acme/hidden"], seen
+
+
+def test_a_gh_logout_is_not_cleared_by_another_routes_answer_and_a_re_raise_never_reaches_chat(env, monkeypatch):
+    """The flap (user msg #2688): a logout alert cleared for a minute because the host-wide route record
+    said ok (the workstation queue, or another project's route, answered), then raised again to chat.
+    Only a real login or this project's own live route clears it, and a re-raise stays a status line."""
+    from ttp import alerts, ghauth, ghroute
+    monkeypatch.setattr(alerts, "owner_alive", lambda owner: True)
+    p, q, dp, dq, answer, tick = _two_gh_projects(env, monkeypatch)
+    tick(dp)
+    assert p.db.kv(ghauth.KV)
+    ghroute.mark(True, via=ghroute.WORKSTATION)   # the workstation queue answered someone's call
+    tick(dp)
+    ghroute.mark(True, via="other-box")             # another route answered
+    tick(dp)
+    assert p.db.kv(ghauth.KV) and not alerts.sweep(p.db), "cleared by a route that is not this project's"
+    assert not p.db.q("SELECT id FROM messages WHERE text LIKE 'Cleared: gh works again%'")
+    ghroute.mark(False, via="gh-box")
+    assert not ghroute.live(dp.cfg)
+    ghroute.mark(True, via="gh-box")             # this project's own route answers: a real clear
+    assert ghroute.live(dp.cfg)
+    tick(dp)
+    assert not p.db.kv(ghauth.KV) and [e["key"] for e in alerts.sweep(p.db)] == [ghauth.KEY]
+    ghroute.mark(False, via="gh-box")
+    tick(dp)   # raised again: still never in chat
+    assert p.db.kv(ghauth.KV) and p.db.unread_for_chat("c1", 0) == []
+    assert not alerts.needs_you(p.db, time.time())

@@ -34,6 +34,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -478,6 +479,89 @@ def known(db: DB, key: str | None, severity: str | None) -> dict | None:
     if rec and SEVERITY_RANK.get(severity, 1) <= SEVERITY_RANK.get(rec.get("severity"), 1):
         return rec
     return None
+
+
+# An alert may ask the user only for what they can and will do. These conditions ask for nothing of the
+# kind: Daemon.alert posts them as a low status line, and reclassify acknowledges an open one raised
+# before the rule. gh-no-login: lab hosts keep no GitHub login, gh calls go on delivery.gh_route
+# (ghroute); own-pause / handback-pause: a pause the user set, or one a hand-back or move set
+# (projpause, projmove); ranking-key: the optional Artificial Analysis key (rankfresh); chat-endpoint:
+# a chat endpoint's key, which its work never waits on (Daemon.logout_alert).
+RECLASSIFY_KV = "alerts_reclassified_at"
+RECLASSIFY_EVERY_S = 3600
+
+
+def not_an_ask(db: DB, ref: str | None, text: str | None = "") -> str:
+    """The rule under which an alert on condition `ref` with `text` is not a "needs you" item, or ""."""
+    from .ghroute import _LOGIN_RE
+    kind, _, arg = str(ref or "").partition(":")
+    if kind == "gh-auth":
+        return "gh-no-login"
+    if kind == "model-ranking-key":
+        return "ranking-key"
+    if kind == "auth" and arg == "chat":
+        return "chat-endpoint"
+    if kind == "paused":
+        info = db.kv("pause_info") or {}
+        info = info if isinstance(info, dict) else {}
+        by, via, why = (str(info.get(k) or "") for k in ("by", "via", "reason"))
+        if by == "user":
+            return "own-pause"
+        if via == "ttp move" or by.startswith("project ") or re.search(r"hand(?:ed)?[- ]?back|\bmoved?\b", why, re.I):
+            return "handback-pause"
+        return ""
+    if kind in ("schedule", "user-step", "gh") and (_LOGIN_RE.search(text or "") or _GH_NO_LOGIN.search(text or "")):
+        return "gh-no-login"
+    return ""
+
+
+_GH_NO_LOGIN = re.compile(r"\bgh\b[^.\n]{0,60}\b(?:no login|not logged in(?:to)?|has no login|logged out)\b|"
+                          r"To get started with GitHub CLI, please run", re.I)
+
+
+def reclassify(db: DB, now: float | None = None) -> list[dict]:
+    """Close every open "needs you" item the current rules would not raise (not_an_ask; an ask telling
+    the user to log gh in on this host, ghroute.login_ask): an alert is acknowledged to the feed with
+    the why 'reclassified: <rule>' (a durable condition stays quiet while unchanged), an ask is marked
+    handled. Model-free; the daemon runs it at start, after an upgrade and hourly."""
+    from .ghroute import login_ask
+    now = time.time() if now is None else now
+    done = []
+    for m in needs_you(db, now, limit=500):
+        row = db.one("SELECT ref FROM messages WHERE id=?", (m["id"],)) or {}
+        if m["kind"] == "ask":
+            if not login_ask(m["text"]):
+                continue
+            why = "reclassified: gh-no-login"
+            with db.tx():
+                db.x("UPDATE messages SET handled=1 WHERE id=? AND kind='ask'", (m["id"],))
+                db.post("out", f"Closed ask #{m['id']} ({why}): nobody logs gh in on this host; gh calls go "
+                        f"on delivery.gh_route.", chat=None, kind="resolved", severity="low", ref=row.get("ref"))
+            done.append({"id": m["id"], "kind": "ask", "why": why})
+            continue
+        rule = not_an_ask(db, row.get("ref"), m["text"])
+        if not rule:
+            continue
+        why = f"reclassified: {rule}"
+        try:
+            ack(db, m["id"], why, now)
+        except ValueError:   # a live outage ack refuses: acknowledge its episode directly
+            with db.tx():
+                ep = episode(db, row["ref"], m["ts"]) if row.get("ref") else None
+                if not ep:
+                    continue
+                rec = {"why": why, "ts": now, "message": m["id"], "severity": ep["severity"]}
+                _keep_condition(db, ep["key"], rec)
+                db.set_kv(ACKS, {**(db.kv(ACKS, {}) or {}), str(ep["id"]): rec})
+                db.post("out", f"Acknowledged alert #{m['id']} ({ep['key']}): {why}.", chat=None, kind="info",
+                        severity="low", ref=ep["key"])
+        done.append({"id": m["id"], "kind": "alert", "why": why})
+    db.set_kv(RECLASSIFY_KV, now)
+    return done
+
+
+def reclassify_due(db: DB, now: float, every_s: float = RECLASSIFY_EVERY_S) -> bool:
+    return now - float(db.kv(RECLASSIFY_KV, 0) or 0) >= every_s
 
 
 def _outage(db: DB, key: str, now: float) -> bool:
