@@ -263,7 +263,7 @@ def test_selfblock_quiet_for_a_key_the_user_set(env, monkeypatch):
         monkeypatch.delenv(k, raising=False)
     cli.main(["config", p.name, "delivery.channel_tags", '["chan"]'])   # typed at a terminal: the user
     m = p.db.post("in", "two workers at a time", chat=None, kind="user")
-    coord.apply(p, [{"type": "config_set", "key": "budget.max_parallel_workers", "value": 3}],
+    coord.apply(p, [{"type": "config_set", "key": "budget.max_parallel_workers", "value": 3, "user_msg": m}],
                 user_turn=True, messages=[m])
     t = p.db.add_task("cut")
     p.db.update_task(t, status="blocked", blocked_reason="delivery.channel_tags and budget.max_parallel_workers are "
@@ -287,7 +287,7 @@ def test_config_setter_is_recorded_shown_and_survives_a_restart_and_an_upgrade_m
     assert configwho.role(configwho.get(p.db, "delivery.never_force")) == "unknown"
     coord.apply(p, [{"type": "config_set", "key": "delivery.channel_tags", "value": ["chan"]}])
     m = p.db.post("in", "two at a time", chat=None, kind="user")
-    coord.apply(p, [{"type": "config_set", "key": "budget.max_parallel_workers", "value": 2}],
+    coord.apply(p, [{"type": "config_set", "key": "budget.max_parallel_workers", "value": 2, "user_msg": m}],
                 user_turn=True, messages=[m])
     monkeypatch.setenv("TTP_RUN_ID", "77")
     monkeypatch.setenv("TTP_TASK_ID", "42")

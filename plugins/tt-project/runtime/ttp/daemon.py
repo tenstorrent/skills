@@ -4822,7 +4822,7 @@ class Daemon:
         from . import mcpgap
         if not (self.cfg["providers"].get("claude") or {}).get("worker_isolation"):
             return
-        mcpgap.raise_undecided(self.p.db, self.p.state, self.cfg, time.time())   # from the last answer
+        mcpgap.raise_undecided(self.p.db, self.p.state, self.cfg, time.time(), self.p.name)   # from the last answer
         if os.environ.get("TTP_TEST_NO_MCP_PROBE"):
             return   # the test switch: daemons under test never start the real `claude mcp list`
         if self._mcp_probe is not None and self._mcp_probe.is_alive():

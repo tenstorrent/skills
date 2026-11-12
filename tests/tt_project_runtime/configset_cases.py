@@ -524,3 +524,45 @@ def test_capword_wording_alone_never_grants_a_cap_only_the_setting_itself(env):
     why = capword.problem(p.db, "budget.weekly_usd", 800, old, now=now)
     assert why and f"message #{newer}" in why and "300" in why, why
     assert capword.problem(p.db, "budget.weekly_usd", 300, newer, now=now) is None
+
+
+def test_coordinator_config_set_in_a_user_turn_is_the_users_only_when_it_cites_their_word(env):
+    """A coordinator config_set in a turn that carries an unrelated user message is the coordinator's and
+    stays its to change. It is the user's (and locked against the coordinator) only when the action cites
+    the user's message (`user_msg`) or quotes their words (`quote`), or the key is one only their word sets."""
+    from ttp import configwho, coordinator as coord
+    p = make(env)
+
+    def said(text):
+        return p.db.x("INSERT INTO messages(ts, direction, kind, text) VALUES (?, 'in', 'user', ?)",
+                      (time.time(), text))
+
+    key = "providers.claude.mcp_withheld"
+    m = said("land the backlog first")   # nothing about the setting
+    assert coord.apply(p, [{"type": "config_set", "key": key, "value": ["a"]}], user_turn=True, messages=[m]) == []
+    assert configwho.role(configwho.get(p.db, key)) == "coordinator"
+    assert coord.apply(p, [{"type": "config_set", "key": key, "value": ["a", "b"]}]) == []   # still its own
+    assert p.raw_config()["providers"]["claude"]["mcp_withheld"] == ["a", "b"]
+    # A quote not in the user's message, or a user_msg from another turn, grants nothing.
+    for cite in ({"quote": "withhold the mail connector"}, {"user_msg": m + 99}, {"quote": "la"}):
+        assert coord.apply(p, [{"type": "config_set", "key": key, "value": ["a", "c"], **cite}],
+                           user_turn=True, messages=[m]) == [], cite
+        assert configwho.role(configwho.get(p.db, key)) == "coordinator", cite
+    # Cited: the user's, and the coordinator's later change is refused.
+    for key, cite in (("providers.claude.mcp_withheld", "user_msg"),
+                      ("providers.claude.mcp_servers", {"quote": "Keep  the MAIL connector out"})):
+        u = said("please keep the mail connector out of workers")
+        cite = {"user_msg": u} if cite == "user_msg" else cite
+        assert coord.apply(p, [{"type": "config_set", "key": key, "value": ["mail"], **cite}],
+                           user_turn=True, messages=[m, u]) == [], cite
+        rec = configwho.get(p.db, key)
+        assert rec["by"] == "user" and rec["msgs"] == [u], (cite, rec)
+        probs = coord.apply(p, [{"type": "config_set", "key": key, "value": ["mail", "x"]}])
+        assert probs and "a coordinator never changes a value the user set" in probs[0], probs
+        assert p.raw_config()["providers"]["claude"][key.rsplit(".", 1)[1]] == ["mail"]
+    # A key only the user's word sets, in their turn: theirs, with no cite needed.
+    w = said("weekly cap 300")
+    assert coord.apply(p, [{"type": "config_set", "key": "budget.weekly_usd", "value": 300}],
+                       user_turn=True, messages=[w]) == []
+    rec = configwho.get(p.db, "budget.weekly_usd")
+    assert rec["by"] == "user" and rec["msgs"] == [w], rec

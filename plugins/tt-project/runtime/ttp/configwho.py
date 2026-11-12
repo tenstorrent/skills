@@ -364,7 +364,8 @@ def _coordinator_guard(p, key: str, setter: dict | None, before, after) -> bool:
     if not hits:
         return at(before, key) == at(after, key) and role(lookup(p.db, key, before)) == "user"
     why = (f"a coordinator never changes a value the user set: {'; '.join(hits)}. Only the user changes it "
-           f"(`ttp config` at a terminal, or their own message in chat asking for it)")
+           f"(`ttp config` at a terminal, or their own message in chat asking for it, cited by the "
+               f"config_set's `user_msg` or `quote`)")
     log(p, _row(p, key, setter, before, after, time.time(), refused=why))
     raise Protected(why)
 

@@ -144,7 +144,7 @@ def test_a_coordinator_config_set_never_changes_a_value_the_user_set(env, monkey
     # The user's own message this turn carries their word: the change is theirs.
     mid = p.db.x("INSERT INTO messages(ts, direction, kind, text) VALUES (?, 'in', 'user', 'raise the cap to 4')",
                  (time.time(),))
-    assert coord.apply(p, [{"type": "config_set", "key": key, "value": 4}], user_turn=True, messages=[mid]) == []
+    assert coord.apply(p, [{"type": "config_set", "key": key, "value": 4, "user_msg": mid}], user_turn=True, messages=[mid]) == []
     rec = configwho.lookup(p.db, key, p.raw_config())
     assert p.raw_config()["budget"]["max_parallel_workers"] == 4 and rec["by"] == "user" and rec["msgs"] == [mid]
     # A harness-posted message is not the user's word.

@@ -4211,7 +4211,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                      + ("; only their word in chat grants it, never a charter line or a quote"
                                         if key == MERGE_KEY else ""))
                 before = _only_adds_repos(cfg, [] if remove else value) if key == MERGE_KEY else []
-                own = _users_own(db, messages or []) if user_turn else []
+                own = _granted_by(db, a, key, _users_own(db, messages or []) if user_turn else [],
+                                  key in NEEDS_USER and by_user or bool(said))
                 if key in accountset.KEYS:   # account-level: logged with its setter and undo, a user's value kept
                     notes.append(accountset.apply(key, value, configwho.by("user", msgs=own, via="chat") if own
                                                   else configwho.by("coordinator", via="config_set")))
@@ -8077,6 +8078,23 @@ def _users_own(db, messages: list[int]) -> list[int]:
     rows = db.q(f"SELECT id, provenance FROM messages WHERE id IN ({','.join('?' * len(messages))}) "
                 f"AND direction='in' AND kind='user'", list(messages))
     return [r["id"] for r in rows if (r["provenance"] or "") != "system"]
+
+
+def _granted_by(db, a: dict, key: str, own: list[int], needs_word: bool) -> list[int]:
+    """The user's messages of this turn that grant config_set `a` on `key`, which records it as the user's
+    and locks it against the coordinator: all of `own` for a key only their word sets (`needs_word`: a
+    NEEDS_USER key let through by_user, or a merge or agent-orders key their message named); else the one
+    its `user_msg` names, or those its `quote` is verbatim in. A turn that only carries a user message on
+    something else grants nothing: the value is the coordinator's and stays its to change."""
+    if not own or needs_word:
+        return own
+    if str(a.get("user_msg") or "").strip().isdigit() and int(a["user_msg"]) in own:
+        return [int(a["user_msg"])]
+    quote = " ".join(str(a.get("quote") or "").split()).lower()
+    if len(quote) < 3:
+        return []
+    rows = db.q(f"SELECT id, text FROM messages WHERE id IN ({','.join('?' * len(own))})", list(own))
+    return [r["id"] for r in rows if quote in " ".join(str(r["text"] or "").split()).lower()]
 
 
 def _cited_word(db, src, agent: bool) -> tuple[list[int], bool, str]:

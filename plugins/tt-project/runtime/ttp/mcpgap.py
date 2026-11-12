@@ -238,9 +238,11 @@ def line(state: Path, cfg: dict, verbose: bool = False) -> str:
 DECIDED_KV = "mcp_gap_raised"   # every name an mcp_gap event already named
 
 
-def raise_undecided(db, state: Path, cfg: dict, now: float) -> list[str]:
+def raise_undecided(db, state: Path, cfg: dict, now: float, name: str = "<project>") -> list[str]:
     """Queue one mcp_gap coordinator event naming the undecided servers and connectors no event named yet.
-    A name connected and decided leaves the record, so one undecided again later is raised again."""
+    A name connected and decided leaves the record, so one undecided again later is raised again. Where the
+    user set providers.claude.mcp_withheld or mcp_servers (configwho), the coordinator may not change it: the
+    event says the names are already out of isolated workers and gives the user's `ttp config` command."""
     entry = read(state)
     names = gap((cfg.get("providers") or {}).get("claude") or {}, entry)["undecided"]
     raised = db.kv(DECIDED_KV)
@@ -252,13 +254,25 @@ def raise_undecided(db, state: Path, cfg: dict, now: float) -> list[str]:
         if keep != raised:
             db.set_kv(DECIDED_KV, keep)
         return []
+    from . import configwho
+    claude = (cfg.get("providers") or {}).get("claude") or {}
+    owned = [k for k in ("mcp_withheld", "mcp_servers")
+             if configwho.role(configwho.get(db, f"providers.claude.{k}")) == "user"]
+    text = (f"MCP servers or claude.ai connectors connected on this host that isolated workers have no decision "
+            f"for: {', '.join(new)}. ")
+    if owned:   # the user's value: a coordinator config_set of it is refused, so never ask for one
+        withheld = [str(n) for n in claude.get("mcp_withheld") or []]
+        whole = json.dumps([*withheld, *(n for n in new if n not in withheld)])
+        text += (f"providers.claude.{' and '.join(owned)} {'is' if len(owned) == 1 else 'are'} the user's setting, "
+                 "so do not config_set it. Isolated workers run with --strict-mcp-config, so an undecided server or "
+                 "connector is already kept out of them: nothing leaks. To record the decision the user runs "
+                 f"`ttp config {name} providers.claude.mcp_withheld '{whole}'`.")
+    else:
+        text += ("Decide each one yourself, not an ask: config_set providers.claude.mcp_servers (gives it to workers) "
+                 "or providers.claude.mcp_withheld (keeps it out), each the whole list with the names already there. "
+                 "Withhold when unsure; listing a connector in mcp_servers keeps every other server out.")
     with db.tx():   # the event and the record of its names commit together
         db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
-             (now, "harness", "mcp_gap", f"mcp_gap:{'|'.join(sorted(new))}", "normal",
-              f"MCP servers or claude.ai connectors connected on this host that isolated workers have no decision "
-              f"for: {', '.join(new)}. Decide each one yourself, not an ask: config_set providers.claude.mcp_servers "
-              "(gives it to workers) or providers.claude.mcp_withheld (keeps it out), each the whole list with the names "
-              "already there. Withhold when unsure; listing a connector in mcp_servers keeps every other server out.",
-              "queued"))
+             (now, "harness", "mcp_gap", f"mcp_gap:{'|'.join(sorted(new))}", "normal", text, "queued"))
         db.set_kv(DECIDED_KV, [*keep, *new])
     return new

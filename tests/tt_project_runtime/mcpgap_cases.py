@@ -541,3 +541,27 @@ def test_mcp_gap_undecided_names_queue_one_coordinator_event_and_a_new_server_an
     assert len(events()) == 4 and "tickets" in events()[3] and "issues" not in events()[3]
     d.probe_mcp()
     assert len(events()) == 4
+
+
+def test_mcp_gap_event_never_asks_the_coordinator_to_set_a_key_the_user_set(env, tmp_path):
+    """mcp_gap tells the coordinator to decide with config_set only while mcp_withheld and mcp_servers are
+    not the user's; once the user set one, it says the names are already out of isolated workers
+    (--strict-mcp-config) and gives the user's exact `ttp config` command with the whole list."""
+    import time
+    from ttp import configwho, mcpgap
+    p = _isolated(env, mcp_servers=["search", "tickets"])
+    mcpgap.refresh(p.state, _listing(tmp_path), str(p.root))
+
+    def event():
+        return p.db.one("SELECT text FROM events WHERE kind='mcp_gap' ORDER BY id DESC LIMIT 1")["text"]
+
+    p.set_config("providers.claude.mcp_withheld", ["claude.ai Gmail"], by=configwho.by("coordinator"))
+    assert mcpgap.raise_undecided(p.db, p.state, p.config(), time.time(), p.name) == ["claude.ai Example Notes"]
+    assert "config_set providers.claude.mcp_servers" in event()
+    p.db.set_kv(mcpgap.DECIDED_KV, [])
+    p.set_config("providers.claude.mcp_withheld", ["claude.ai Gmail"], by=configwho.by("user", via="cli"))
+    assert mcpgap.raise_undecided(p.db, p.state, p.config(), time.time(), p.name) == ["claude.ai Example Notes"]
+    text = event()
+    assert "config_set providers" not in text and "--strict-mcp-config" in text and "the user's setting" in text, text
+    assert (f"`ttp config {p.name} providers.claude.mcp_withheld "
+            "'[\"claude.ai Gmail\", \"claude.ai Example Notes\"]'`") in text, text
