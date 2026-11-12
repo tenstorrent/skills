@@ -2694,6 +2694,137 @@ def test_setup_box_links_tt_buddy_instead_of_copying():
     assert "`device-runs.md`" in (SKILLS / "setup-box" / "SKILL.md").read_text(encoding="utf-8")
 
 
+PREEMPT_PY = SKILLS / "setup-box" / "scripts" / "preempt.py"
+_BROKER_STATUS = """RUNNING
+  ID            Owner     Runtime  Command
+  {run:<10}  * alice     3m       [PREEMPTABLE 20min] python3 serve.py
+
+QUEUED
+{queued}
+RECENT (last 1)
+  ab12cd34ef  done  pytest -q
+"""
+
+
+def _status(run="aaaa111122", queued=()):
+    rows = "  (none)\n" if not queued else "  #  ID            Owner  Command\n" + "".join(
+        f"  {n:<2} {jid:<10}  * bob  pytest -q\n" for n, jid in enumerate(queued, 1))
+    return _BROKER_STATUS.format(run=run, queued=rows)
+
+
+def _preempt():
+    sys.path.insert(0, str(PREEMPT_PY.parent))
+    try:
+        import preempt
+    finally:
+        sys.path.pop(0)
+    return preempt
+
+
+def _wait_for(path, proc, seconds=20):
+    import time
+    end = time.time() + seconds
+    while not path.exists():
+        assert proc.poll() is None, proc.communicate()
+        assert time.time() < end, f"{path} never appeared"
+        time.sleep(0.05)
+
+
+def test_preempt_reads_the_broker_queue_and_yields_only_past_the_limit_with_a_waiter():
+    preempt = _preempt()
+    assert preempt.MAX_LIMIT_S == 1500 and preempt.GRACE_S + preempt.KILL_GRACE_S == 70
+    assert preempt.queued_ids(_status()) == []
+    assert preempt.queued_ids("\x1b[1mQUEUED\x1b[0m\n  1  q1  * x  cmd\n") == ["q1"]
+    assert preempt.queued_ids(_status(queued=["bbbb222233", "cccc333344"])) == ["bbbb222233", "cccc333344"]
+    assert not preempt.others_waiting(status_text=_status())
+    assert not preempt.others_waiting("bbbb222233-full-id", _status(queued=["bbbb222233"]))   # only us
+    assert preempt.others_waiting("bbbb222233", _status(queued=["bbbb222233", "cccc333344"]))
+    assert preempt.others_waiting(status_text=_status(queued=["cccc333344"]))
+    busy = _status(queued=["cccc333344"])
+    assert not preempt.should_yield(1000.0, 600, status_text=busy, now=1500.0)
+    assert preempt.should_yield(1000.0, 600, status_text=busy, now=1600.0)
+    assert preempt.should_yield(1000.0, 600, margin_s=120, status_text=busy, now=1480.0)
+    assert not preempt.should_yield(1000.0, 600, status_text=_status(), now=9000.0)
+
+
+def test_preempt_marks_a_yield_and_reads_the_rerun_count(tmp_path, monkeypatch):
+    preempt = _preempt()
+    monkeypatch.setenv("TTP_DEVQ_YIELD_FILE", str(tmp_path / "y"))
+    assert preempt.mark_yielded() == tmp_path / "y" and (tmp_path / "y").read_text().strip().isdigit()
+    monkeypatch.setenv("TTP_DEVQ_PREEMPTS", "2")
+    assert preempt.preempts() == 2
+    monkeypatch.setenv("TTP_DEVQ_PREEMPTS", "x")
+    assert preempt.preempts() == 0
+
+
+def test_preempt_ends_a_job_cleanly_on_sigterm(tmp_path):
+    # The broker sends SIGTERM after the grace minute: cleanup runs (the device is closed) and the
+    # job exits 0, so the broker skips its device check instead of a SIGKILL and a reset.
+    import signal
+    import subprocess
+    ready, closed = tmp_path / "ready", tmp_path / "closed"
+    job = (f"import sys, time, pathlib; sys.path.insert(0, {str(PREEMPT_PY.parent)!r}); import preempt\n"
+           f"preempt.exit_on_sigterm(lambda: pathlib.Path({str(closed)!r}).write_text('ok'))\n"
+           f"pathlib.Path({str(ready)!r}).write_text('1')\n"
+           "time.sleep(60)\n")
+    proc = subprocess.Popen([sys.executable, "-c", job])
+    _wait_for(ready, proc)
+    proc.send_signal(signal.SIGTERM)
+    assert proc.wait(timeout=20) == 0 and closed.read_text() == "ok"
+
+
+def test_preempt_run_forwards_sigterm_to_its_child(tmp_path):
+    import signal
+    import subprocess
+    ready, seen = tmp_path / "ready", tmp_path / "seen"
+    child = ("import signal, sys, time, pathlib\n"
+             f"signal.signal(signal.SIGTERM, lambda *a: (pathlib.Path({str(seen)!r}).write_text('term'), sys.exit(0)))\n"
+             f"pathlib.Path({str(ready)!r}).write_text('1')\n"
+             "time.sleep(60)\n")
+    proc = subprocess.Popen([sys.executable, str(PREEMPT_PY), "run", "--", sys.executable, "-c", child])
+    _wait_for(ready, proc)
+    proc.send_signal(signal.SIGTERM)
+    assert proc.wait(timeout=20) == 0 and seen.read_text() == "term"
+    # A child that dies by the signal is reported as 128 + 15, never as a clean exit.
+    assert _preempt().run_child([sys.executable, "-c", "import os, signal; os.kill(os.getpid(), signal.SIGTERM)"]) == 143
+
+
+def test_preempt_as_a_pytest_plugin_ends_the_session_cleanly_on_sigterm(tmp_path):
+    import signal
+    import subprocess
+    ready, torn = tmp_path / "ready", tmp_path / "torn"
+    (tmp_path / "test_dev.py").write_text(
+        "import pathlib, time, pytest\n"
+        "@pytest.fixture\n"
+        "def device():\n"
+        "    yield 1\n"
+        f"    pathlib.Path({str(torn)!r}).write_text('closed')\n"
+        "def test_long(device):\n"
+        f"    pathlib.Path({str(ready)!r}).write_text('1')\n"
+        "    time.sleep(60)\n")
+    env = {**os.environ, "PYTHONPATH": str(PREEMPT_PY.parent)}
+    proc = subprocess.Popen([sys.executable, "-m", "pytest", "-q", "-p", "preempt", "-p", "no:cacheprovider",
+                             "--rootdir", str(tmp_path), str(tmp_path / "test_dev.py")],
+                            cwd=tmp_path, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    _wait_for(ready, proc)
+    proc.send_signal(signal.SIGTERM)
+    out = proc.communicate(timeout=30)[0].decode()
+    assert proc.returncode == 0, out
+    assert torn.read_text() == "closed" and "preempted" in out
+
+
+def test_device_docs_say_broker_jobs_are_preemptable_within_the_cap():
+    runs = (SKILLS / "setup-box" / "device-runs.md").read_text(encoding="utf-8")
+    for ref in ("## Broker jobs are preemptable", "--preemptable", "1500 s", "SIGTERM", "scripts/preempt.py",
+                "`&&` chain", "checkpoint", "TTP_DEVQ_PREEMPTS", "never `tt-device-mcp lock`"):
+        assert ref in runs, ref
+    worker = (PLUGIN / "template" / "prompts" / "worker.md").read_text(encoding="utf-8")
+    device = worker.split("<!-- ttp:if device -->", 1)[1].split("<!-- /ttp:if device -->", 1)[0]
+    assert "--preemptable" in device and "1500 s" in device and "`device-runs.md`" in device
+    devq = worker.split("<!-- ttp:if devq -->", 1)[1].split("<!-- /ttp:if devq -->", 1)[0]
+    assert "1500 s" in devq
+
+
 def test_setup_box_states_company_etiquette_without_personal_policy():
     # Company-wide practice only; a user's own limits belong in their charter (user msg #554).
     skill = (SKILLS / "setup-box" / "SKILL.md").read_text(encoding="utf-8")

@@ -36,8 +36,40 @@ ttp devq submit <runner> --id <task>-<what> --workdir <checkout on the box> \
 - `--artifact` names the built file the job loads (else the runner's `build_artifact`).
 - `--timeout` sizes the job's limit; the job sees it as `TTP_DEVQ_TIMEOUT_S`.
 - On a broker box the command itself calls the broker's job CLI, so jobs from other users and
-  projects stay serialized too.
+  projects stay serialized too, as a preemptable job (next section).
 - Hand off `waiting` with the `retry_when` it prints (`ttp devq probe <runner> <id>`).
+
+## Broker jobs are preemptable
+
+On a box with a tt-device-mcp broker, every job a task queues is preemptable, so it and a serving
+workload or another user's job each step aside for the other:
+
+```
+tt-device-mcp run-bg --preemptable -t <limit-s> -w <checkout on the box> -- <command>
+tt-device-mcp wait <job-id>        # exit 0 only when the job completed
+```
+
+- `-t` is the job's limit, at most 1500 s (the broker's hard ceiling). While no other job waits,
+  the job is never stopped for time. Once it is past `-t` with a job waiting, it has 60 s to end
+  itself, then its process tree gets SIGTERM and, 10 s later, SIGKILL. So no job, ours or another's,
+  holds the device more than its limit plus 70 s while someone waits.
+- End cleanly on SIGTERM: close the device and exit 0 (no device check, no reset); a SIGKILL means
+  a device reset and the full check. `scripts/preempt.py` does this: `exit_on_sigterm(cleanup)` in
+  a Python job, `python3 preempt.py run -- <program>` around a child (it forwards SIGTERM; never
+  `subprocess.run` with a timeout), `python3 -m pytest -p preempt` with the scripts folder on
+  `PYTHONPATH`. Copy it to the box with `box.py copy`.
+- The command reaches the real program by `exec` or an `&&` chain, never `...; prog`: a shell left
+  in between dies by the signal and the program never sees it.
+- Split work longer than the limit into chunks that each fit it, writing a checkpoint after each.
+  Better still, stop at a step boundary: `should_yield(started, limit_s)` is true once the job is
+  past its limit with another job queued; save the checkpoint, `mark_yielded()`, exit 0.
+- A job that ends `preempted` (`wait` prints `!! PREEMPTED`; `tt-device-mcp status -j <id>`) or
+  that yielded is resubmitted from its checkpoint, never rerun from the start. A `ttp devq` job
+  sees the number of reruns as `TTP_DEVQ_PREEMPTS`.
+- Behind another's preemptable job (`[PREEMPTABLE <x>min]` in `tt-device-mcp status`), queue and
+  wait: the wait is bounded by that job's limit plus 70 s. Do not route around it or cancel it.
+- Never hold the device idle: build and stage inputs before queueing, never `tt-device-mcp lock`
+  the device for a session, and `ttp lock` a device resource only around each device command.
 
 ## The build stamp
 

@@ -80,6 +80,8 @@
   only after `pytest --markers` shows the repo defines it.
 - On a machine tagged `device`, devices are hidden from direct opens (`TT_VISIBLE_DEVICES` is set
   empty). Never unset or override the masking variables. Who held one: `ttp machines activity <alias>`.
+- A broker job runs `--preemptable`, `-t` at most 1500 s, ends cleanly on SIGTERM, and resumes
+  from a checkpoint after a preempt (setup-box `device-runs.md`); never hold the device idle.
 <!-- /ttp:if device -->
 - Never release or re-create a machine reservation, or restart a shared service, unless your
   task says to.
@@ -248,7 +250,8 @@ No `result.json`, no credit.
   longer `--timeout`. It prints the `retry_when`; submit several jobs in order and wait on the last. On wake, `ttp devq status <runner> <id>` shows its marker. No marker and no runner
   alive: `ttp devq start <runner>` and hand off `waiting` again on the same probe.
   Keep every device timeout (the `--timeout`, your scripts' broker timeouts, each driver step)
-  within the task header's ceiling, which a devq job sees as `TTP_DEVQ_TIMEOUT_S`; split longer runs.
+  within the task header's ceiling (a broker's 1500 s at most), which a devq job sees as
+  `TTP_DEVQ_TIMEOUT_S`; split longer runs.
 <!-- /ttp:if devq -->
   A host reboot wakes a waiting task only when its `retry_when` checks local state a reboot ends (a
   local `detach --check`, `checks --result`, a pid, /tmp or run-dir files) or its detached job wrote
