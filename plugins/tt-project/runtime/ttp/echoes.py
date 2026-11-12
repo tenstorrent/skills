@@ -46,7 +46,13 @@ other places quoting the same words get no fix order from that retirement. A cha
 never retires a phrase a current sourced Restrictions item states (_states; sourced also by its structured
 record, restriction_source.recorded_items) or a memory entry written after it holds whole, that entry included:
 a rewording is no withdrawal. For both, a phrase that only cites user messages (_cite_only: an entry's
-citation header) is advisory while live memory or the charter still cites each of them (_msgs). A user
+citation header) is advisory while live memory or the charter still cites each of them (_msgs). A memory
+retirement likewise never retires a phrase a memory entry written after it holds whole, that entry included,
+even with no supersede record linking the two (a superseder keeping every phrase stores none): the newer
+entry restates the rule. Accepted gap, as for the charter: a new entry wrongly restating withdrawn words gets
+no fix order. And no retirement of any kind retires a phrase a user message newer than it holds whole and not
+negated (_repeated: the user's own verbatim words, relay.split, never a relayer's context or a harness post):
+the user said it again, so it is live. A user
 Correction keeps its fix orders, and so does a charter replacement on every other phrase. A supersede whose only user cite names
 messages older than the entry it retires (where a rule came from, such as a current item's source) is one
 coordinator entry replacing another: SUPERSEDED (coordinator._withdrawn `since`). One the coordinator dropped on its own is SUPERSEDED, never
@@ -728,6 +734,25 @@ def _cite_only(ph: str) -> bool:
     return bool(_msgs(ph)) and not _CITE_WORDS.sub("", ph).strip()
 
 
+def _said_after(p, since: float) -> list[tuple[int, float, str]]:
+    """(id, ts, flattened verbatim words) of the user's own chat messages (inbound, kind user, not posted by the
+    harness; relay.split: never a relayer's context) newer than epoch `since`, oldest first."""
+    from . import relay
+    try:
+        rows = p.db.q("SELECT id, ts, text, provenance FROM messages WHERE direction='in' AND kind='user' AND ts > ? "
+                      "ORDER BY ts, id", (since,))
+    except Exception:
+        return []
+    return [(int(r["id"]), float(r["ts"] or 0), _flat(relay.split(r.get("text") or "")[0]))
+            for r in rows if (r.get("provenance") or "") != "system"]
+
+
+def _repeated(said: list[tuple[int, float, str]], ph: str, at: float) -> int:
+    """The id of the first user message (`said`, _said_after) newer than `at` that holds phrase `ph` whole and
+    not negated ('never X' repeats no X), 0 when none: the user's newer word keeps it current."""
+    return next((mid for mid, ts, flat in said if ts > at and _hit({"negated": True}, flat, [ph])), 0)
+
+
 def records(p, now: float | None = None) -> list[dict]:
     """The live retirements (kept RETIRED_DAYS), each with its kind (see _kind; _unsourced)."""
     now = time.time() if now is None else now
@@ -766,6 +791,7 @@ def scan(p, now: float | None = None, historical: list[dict] | None = None,
     born = {e["name"]: _stamp_ts(e.get("created") or "") for e in p._memory_entries()}
     cited = _msgs(" ".join(live.values()) + " " + charter)   # messages live memory or the charter still cites
     about = _about_echoes(p, [key for key, *_ in where])
+    said = _said_after(p, min(r.get("at", 0) for r in recs))   # the user's words since the oldest retirement
     out, seen = [], set()
     for rec in sorted(recs, key=lambda r: -r.get("at", 0)):
         kept = _superseders(rec, recs, live)
@@ -790,7 +816,13 @@ def scan(p, now: float | None = None, historical: list[dict] | None = None,
         # A phrase that only cites user messages (a citation header) is current while live memory or the
         # charter still cites every one of them: the rule that came from them lives on in another wording.
         cites = {ph for ph in own if (mem or chart) and _cite_only(ph) and _msgs(ph) <= cited}
-        cur = set(stated_now) | cites | {ph for ph, keys in held.items() if keys}
+        # A memory entry written after the retirement that holds the phrase whole restates it (a supersede whose
+        # chain no record links, such as one keeping every phrase), and a user message newer than the
+        # retirement repeating it is the user's word that it still holds: neither is an echo, of any kind.
+        restated = {ph: name for ph in own if mem and ph not in stated_now
+                    for name in sorted(n for n, flat in later.items() if _hit({}, flat, [ph]))[:1]}
+        repeated = {ph: mid for ph in own if (mid := _repeated(said, ph, rec.get("at", 0)))}
+        cur = set(stated_now) | cites | {ph for ph, keys in held.items() if keys} | set(restated) | set(repeated)
         own.sort(key=lambda ph: ph in weak or ph in cur)   # a governing phrase first: a hit rests on it when it can
         skip = set(rec.get("skip") or ())
         mine = _own_decision(rec)
@@ -805,8 +837,11 @@ def scan(p, now: float | None = None, historical: list[dict] | None = None,
                     label += f":{_lineno(text, ph)}"
                 why = (f"still stated in {stated}: no action" if stated else
                        f"still stated by {stated_now[ph]}: no action" if ph in stated_now else
+                       f"repeated by user msg #{repeated[ph]} after it was retired: no action" if ph in repeated else
                        f"still stated by memory [{_holder(live, held[ph], rec, key)}]: no action"
                        if held.get(ph, set()) - {key} else
+                       f"restated by memory [{restated[ph]}], written after it was retired: no action"
+                       if ph in restated else
                        "it only cites user messages live memory or the charter still cites: no action"
                        if ph in cites else
                        "a task about the echo detector, quoting its matches: no action" if key in about else

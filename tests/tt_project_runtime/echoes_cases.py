@@ -699,6 +699,44 @@ def test_a_phrase_a_live_memory_entry_states_whole_is_advisory_never_a_fix_order
     assert {h["key"].split(":", 1)[1] for h in charter} >= {f"task:{both}:spec"}
 
 
+def test_a_retired_phrase_a_newer_user_message_or_a_later_live_entry_repeats_is_live_not_an_echo(env):
+    import time as _time
+    from ttp import echoes
+    p = make(env)
+    then = _time.time() - 1800
+    p.db.add_task("quotes", "Keep `drain-slow-lane` on and pass `spare-pool-b` checks.")
+
+    def hits(rec):
+        return {h["phrase"]: h for h in echoes.scan(p) if h["retirement"] == rec["id"]}
+
+    # A phrase really dropped: no live entry, no newer user message holds it. Still a fix order, even with an
+    # older message (from before the retirement) or a newer one that negates it.
+    _old_said(p, "Keep `drain-slow-lane` on.", age=3600)
+    _echo_said(p, "Never drain-slow-lane again.")
+    gone = echoes.record(p.db, "memory [fact-lanes] withdrawn", "Keep `drain-slow-lane` on.", now=then,
+                         found=["drain-slow-lane"])
+    # Only the user's own words count: a harness post of the same words does not.
+    p.db.x("INSERT INTO messages(ts,direction,kind,text,provenance) VALUES(?,'in','user',?,'system')",
+           (_time.time(), "keep drain-slow-lane on"))
+    assert hits(gone)["drain-slow-lane"]["class"] == "directive", hits(gone)
+    # The user repeats it after the retirement: live, whatever the retirement's kind.
+    mid = _echo_said(p, "Please keep drain-slow-lane on.")
+    h = hits(gone)["drain-slow-lane"]
+    assert h["class"] == "advisory" and h["why"] == f"repeated by user msg #{mid} after it was retired: no action", h
+    # A supersede no record links to the live entry (its superseder is gone or kept every phrase), with a newer
+    # live entry still holding the quote: the newer entry restates it, so neither copy is an echo.
+    sup = echoes.record(p.db, "memory [decision-pool] superseded by [decision-pool-2]",
+                        "Pass `spare-pool-b` checks (user msg #7).", now=then, found=["spare-pool-b"])
+    assert hits(sup)["spare-pool-b"]["class"] == "directive", hits(sup)
+    newer = p.add_memory("Pass `spare-pool-b` checks before each landing (user msg #7).", kind="decision")
+    got = {h["key"].split(":", 1)[1]: h for h in echoes.scan(p) if h["retirement"] == sup["id"]}
+    assert set(got) == {"task:1:spec", f"memory:{newer.stem}"}, got
+    assert {h["class"] for h in got.values()} == {"advisory"}, got
+    assert got["task:1:spec"]["why"] == f"still stated by memory [{newer.stem}]: no action", got
+    assert got[f"memory:{newer.stem}"]["why"] == (f"restated by memory [{newer.stem}], written after it was retired: "
+                                                  "no action"), got   # its own copy: newer than the retirement
+
+
 def test_a_supersede_citing_a_user_message_is_a_withdrawal_unless_every_cited_message_predates_the_entry(env):
     from ttp import coordinator as coord
     p = make(env)
