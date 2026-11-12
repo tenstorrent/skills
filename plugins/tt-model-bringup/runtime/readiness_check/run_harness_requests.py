@@ -82,8 +82,10 @@ ALWAYS_HOST_FIELDS = ("logit_bias", "allowed_token_ids", "bad_words")
 
 
 def _declared_capability(model_dir: Path, key: str) -> Optional[str]:
-    """Value of ``key`` in the adapter's model_capabilities, read as text from generator_vllm.py."""
-    for path in (model_dir / "tt" / "generator_vllm.py", model_dir / "vllm_metadata.json"):
+    """Value of ``key`` in the model's capabilities, read as text (generator_vllm.py first, then other tt/*.py)."""
+    tt = model_dir / "tt"
+    others = sorted(p for p in tt.glob("*.py") if p.name != "generator_vllm.py") if tt.is_dir() else []
+    for path in (tt / "generator_vllm.py", model_dir / "vllm_metadata.json", *others):
         text = read_text(path)
         match = re.search(rf"['\"]{key}['\"]\s*:\s*([\w.]+)", text)
         if match:
@@ -348,7 +350,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ratio-max", type=float, default=DEFAULT_RATIO_MAX)
     parser.add_argument("--output-tokens", type=int, default=DEFAULT_OUTPUT_TOKENS)
     parser.add_argument("--max-device-top-k", type=int, default=None,
-                        help="default: read model_capabilities max_device_top_k from tt/generator_vllm.py")
+                        help="default: read max_device_top_k from the model's tt/*.py (generator_vllm.py first)")
     parser.add_argument("--seeded-sampling-policy", choices=("auto", "host"), default=None,
                         help="default: read from the server log, else the plugin default auto")
     parser.add_argument("--timeout", type=float, default=1800.0)
