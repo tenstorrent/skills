@@ -1,35 +1,23 @@
 ---
 name: benchmark-model
-description: Report a text model's accuracy on fixed lm-eval subsets and 4K-input vLLM serving performance across the configured batch sizes. Use after optimized-vLLM for the final model-bringup report or to benchmark a supported model.
+description: Measure a text model's vLLM serving performance over the configured batch sizes and input lengths, with roofline accounting, and write the serving rates goal 12 reads (stage 11). Optionally score fixed lm-eval subsets when benchmarking a model on its own.
 ---
 
 # Benchmark a model through vLLM
 
-Follow [model-bringup startup](../model-bringup/SKILL.md#startup). Produce an end-of-bringup report with benchmark scores, published references where available, and serving performance. The person who launched the bringup judges whether the results are good enough.
+Follow [model-bringup startup](../model-bringup/SKILL.md#startup). Attach to the working Stage 10 server with its selected precision policy and measure it with `vllm bench serve`. In the pipeline, stage 11 is benchmarks only: the run config sets `tasks: []` and goal 12 runs the evals.
 
-Use upstream EleutherAI lm-evaluation-harness for accuracy and `vllm bench serve` for performance. Attach to the working Stage 10 server with its selected precision policy. The complete client stage must finish inside its budget: **30 minutes per configured batch size**, so the default four batches get two hours and a single pair keeps the original hour. Its clock starts when `benchmark_stage run` is invoked, before the first server-selection hook, and includes verification, inference, every server launch or reload it performs, compilation, warmups, phase collection, scoring and reporting. Record setup completed before invocation separately, including installation, downloads and the already-running server's startup.
-
-## Select and run benchmarks
-
-Read [the run contract](references/run-contract.md) for setup, profiles, commands and report inputs.
-
-In the model-bringup pipeline, stage 11 is benchmarks only: set `tasks: []` in the run config, and goal 12 runs the evals. The accuracy steps below apply when this skill benchmarks a model on its own.
-
-Select the upstream prompt/scorer variant and the model's generation settings before running. A benchmark name alone does not identify a recipe. Use the model's native HF chat template exactly once, with structured chat messages, and record its tokenizer revision, thinking mode, generation parameters and answer parsing. Preserve normal benchmark prompt lengths, few-shot examples and EOS behavior. Allow sufficient output budget for the intended reasoning mode.
-
-Reuse the packaged common question subsets. A new model does not require a new subset. Use `prepare --reuse-manifest` to select a different recipe over the same documents. For a new benchmark, freeze documents before observing scores; retain IDs, content hashes and population counts. Never select questions to improve agreement with a published score.
-
-Run accuracy once, at the largest configured batch size. Use the shared request pool when the selected tasks have identical generation settings. Check raw responses for template, transport and scoring integration errors and repair those errors. Keep upstream scores and all questions in the denominator, including token-limited answers. Report truncation counts and relevant protocol differences. Low scores are results to present, not a reason to block completion or keep optimizing the model.
+The pipeline stage finishes within `benchmark_budget_hours` from `bringup/agentic_evals/inputs.json` (default 3), from the first measurement through reporting, including every server launch, reload, compilation and warmup. The runner (`benchmark_stage run`) keeps its own `budget_seconds`, at most 30 minutes per configured batch. Record setup done before the clock separately, including installation, downloads and the supplied server's startup. Read [the run contract](references/run-contract.md) for setup, profiles, commands and report inputs.
 
 ## Measure performance
 
-Measure one serving profile per supported batch size — `batch_sizes` from `bringup/agentic_evals/inputs.json`, default 1, 8, 16, 32, minus any stage 10 could not validate — with **4096 input tokens** and **128 output tokens**. The run config's `concurrencies` is that list: request concurrency is set equal to the batch under test so the device batch is actually filled, which is the only way the profile measures that batch rather than a padded one. Set `--max-num-seqs` to the same value. Use the configuration optimized-vLLM validated for that batch; batch 1 stays the single-user regression row. Each profile must use its corresponding decode trace and cache configuration. Keep model, precision, hardware and full context capacity unchanged. Warm each server configuration, then measure repeated requests. Record the prefix-caching setting, use distinct prompts, request greedy decoding and ignore EOS for performance. Verify actual token counts.
+Measure every supported batch size — `batch_sizes` from `bringup/agentic_evals/inputs.json`, default 1, 8, 16, 32, minus any stage 10 could not validate — at input lengths **4096, `typical_context_tokens`, `working_set_tokens` and at least 28K**, each with **128 output tokens**. Write a predicted rate for each row before measuring it, from stage 10's measurements or the roofline accounting. The runner measures the 4096-token profiles with roofline accounting; measure the longer rows with the same client and the same server configuration per batch. The run config's `concurrencies` is that list: request concurrency is set equal to the batch under test so the device batch is actually filled, which is the only way the profile measures that batch rather than a padded one. Set `--max-num-seqs` to the same value. Use the configuration optimized-vLLM validated for that batch; batch 1 stays the single-user regression row. Each profile must use its corresponding decode trace and cache configuration. Keep model, precision, hardware and full context capacity unchanged. Warm each server configuration, then measure repeated requests. Record the prefix-caching setting, use distinct prompts, request greedy decoding and ignore EOS for performance. Verify actual token counts.
 
 Prepare full-phase accounting before starting the timed run. Use or implement the model's collector and configure the required `roofline_command` from the run contract. Enable lightweight host timing at the actual prefill/decode completion boundaries and derive work from the model's executed shapes, precision and parallelism. Do not enable the live device profiler or add synchronization that changes the serving path. The runner checks the collector on each running server and collects its evidence before switching profiles.
 
-The report labels the profile, concurrent requests and server slots separately. Headline performance includes TTFT, TPOT, per-user decode tokens/s, aggregate output tokens/s, prefill FLOP roofline percentage and decode DRAM bandwidth roofline percentage. **Both roofline estimates are required for every profile.** Their denominators cover complete elapsed phases, including host work and gaps, rather than matmul duration. If timing or work accounting is missing, preserve the measured results and repair the collection; the stage is incomplete. No minimum roofline percentage or accuracy score is required.
+The report labels the profile, concurrent requests and server slots separately. Headline performance includes TTFT, TPOT, per-user decode tokens/s, aggregate output tokens/s, prefill FLOP roofline percentage and decode DRAM bandwidth roofline percentage. **Both roofline estimates are required for every profile.** Their denominators cover complete elapsed phases, including host work and gaps, rather than matmul duration. If timing or work accounting is missing, preserve the measured results and repair the collection; the stage is incomplete. No minimum roofline percentage is required.
 
-Use the run contract's server-control hook to prepare and record the largest configured server before accuracy, then step down through the remaining batches. Switching and warmup count toward the stage budget. Preserve ITL, end-to-end latency, percentiles, request throughput, completion counts and wall time in the report details.
+Use the run contract's server-control hook to prepare and record the largest configured server first, then step down through the remaining batches. Switching and warmup count toward the stage budget. Preserve ITL, end-to-end latency, percentiles, request throughput, completion counts and wall time in the report details.
 
 ## Release benchmark matrix
 
@@ -38,18 +26,23 @@ already in tt-inference-server: same family or architecture, similar size, same 
 input and output lengths and concurrencies they use that this model supports, within its validated
 batches and context; drop the rest and add none they do not run. Write it to
 `doc/benchmark/release_benchmark_matrix.json` with the models it was taken from and, per row, an
-estimated time from the profiles measured above. Measure the rows the stage budget leaves room for
-on the eval route, and record each in `serving_rates.json` `release_rows` (see below).
+estimated time from the profiles measured above. Measure every row on the eval route and record
+each in `serving_rates.json` `release_rows`.
 
 ## Serving rates for goal 12
 
-In the pipeline, also measure each validated batch at input lengths 4096, `typical_context_tokens`,
-`working_set_tokens` and at least 28K (128 output tokens), writing a predicted rate before each row
-from stage 10's measurements or the roofline accounting. Write `doc/benchmark/serving_rates.json`:
+Write `doc/benchmark/serving_rates.json`:
 the server config, `validated_batches`, `rows` (per batch and `input_tokens`: `prefill_tok_s`,
 `decode_tok_s_user`, `ttft_s`, `step_ms`, `predicted`, and a `cause` for a row below its predicted
 range), `release_rows` with `route: "eval"`, and `release_source`. Goal 12 reads these rates and
 does not re-measure them; `check_agentic_serving.py --stage benchmark` gates the file.
+
+## Accuracy (standalone only)
+
+When this skill benchmarks a model outside the pipeline, it may also score fixed lm-eval subsets, as
+the run contract's accuracy section describes: the model's native chat template once, the packaged
+frozen subsets, accuracy once at the largest batch, every question in the denominator, truncations
+reported, and no accuracy verdict.
 
 ## Diagnose slow benchmarks and evals
 

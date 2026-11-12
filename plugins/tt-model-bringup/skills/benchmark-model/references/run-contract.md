@@ -2,7 +2,8 @@
 
 ## Client setup
 
-Use a client environment separate from the working TT server:
+Use a client environment separate from the working TT server. The lm-eval and nltk lines are
+needed only for standalone accuracy; the pipeline's stage 11 runs no evals.
 
 ```bash
 uv pip install --python "$EVAL_PYTHON" 'lm-eval[api,ifeval]==0.4.13' 'transformers<5'
@@ -23,12 +24,13 @@ installed, use a dedicated venv and the [vLLM installation instructions](https:/
 For a host without GPU build tools, the documented `VLLM_TARGET_DEVICE=empty`
 source installation skips accelerator binaries; this client sends HTTP requests
 and does not run the model. Pin the source to `v0.26.0` and verify the benchmark
-CLI starts before running accuracy. The runner uses `--random-range-ratio 0` and
+CLI starts before the run. The runner uses `--random-range-ratio 0` and
 validates each server-reported input/output token count.
 
-## Select questions and protocol
+## Accuracy tasks and protocol (standalone only)
 
-Choose tasks for the model's intended use and prefer published references for its
+In the pipeline, skip this section: the run config sets `"tasks": []` and omits `manifest`.
+Standalone, choose tasks for the model's intended use and prefer published references for its
 exact checkpoint. Missing reference figures are allowed. The packaged manifests
 under `runtime/benchmark_stage/profiles/` contain:
 
@@ -78,8 +80,23 @@ from the cache key. Use the packaged GPQA manifest or prepare one with this clie
 
 ## Run configuration
 
-This model-neutral example uses greedy, non-thinking generation. Set the budgets
-and sampling options for the model you are benchmarking:
+Pipeline stage 11 (no evals):
+
+```json
+{
+  "model": "organization/model",
+  "base_url": "http://127.0.0.1:8000",
+  "tasks": [],
+  "vllm_cli": "/operator-selected/client-env/bin/vllm",
+  "budget_seconds": 7200,
+  "performance_server_command": ["/client/bin/python", "/model/tools/benchmark_server.py"],
+  "roofline_command": ["/client/bin/python", "/model/tools/collect_roofline.py"],
+  "output_tokens": 128
+}
+```
+
+Standalone with accuracy, this model-neutral example uses greedy, non-thinking generation. Set the
+budgets and sampling options for the model you are benchmarking:
 
 ```json
 {
@@ -172,12 +189,17 @@ One row per configured batch size, default 1, 8, 16 and 32:
 | Single user | 1 | 1 | 4096 / 128 |
 | N users | N | N | 4096 / 128 |
 
+The runner measures these 4096-token rows. In the pipeline, measure the rest of the grid
+(`typical_context_tokens`, `working_set_tokens` and at least 28K input tokens, 128 output) with the
+same `vllm bench serve` client against the same server configuration per batch, and write every row
+to `serving_rates.json` as the skill describes.
+
 Use the optimized-vLLM configuration validated for each batch. Keep the
 same implementation, checkpoint, precision, hardware and full context capacity
 for every profile. Changing request concurrency alone does not select a smaller
 decode trace or cache configuration.
 
-The runner prepares the largest configured server before accuracy, retains it for
+The runner prepares the largest configured server first (and runs any accuracy tasks on it), retains it for
 that batch's performance profile, then steps down through the smaller batches.
 Configure `performance_server_command` as an argument array for a server-control
 script in the model checkout. The runner calls it once per batch, largest first:
@@ -209,8 +231,9 @@ with the bringup identity, including precision, hardware and context capacity.
 It also checks the configuration evidence hashes. Report columns show both
 concurrent requests and server slots.
 
-The clock starts on entry to `benchmark_stage run`, before the first
-server-selection hook, and runs through report generation. The stage attaches
+The runner's clock (`budget_seconds`, at most 30 minutes per batch) starts on entry to
+`benchmark_stage run`, before the first server-selection hook, and runs through report generation.
+The pipeline stage as a whole, including the longer grid rows, stays within `benchmark_budget_hours`. The stage attaches
 to the ready server from optimized-vLLM; record its earlier startup and environment
 setup separately. For a standalone benchmark, prepare the environment and initial
 server before invoking the runner and record that setup time separately.
@@ -263,7 +286,7 @@ Prepare an implementation-specific collector before the timed run:
    that all traffic between client process start and exit is measured traffic.
 3. Derive useful FLOPs and estimated DRAM bytes from these shapes and the actual
    model/precision policy. Retain the calculation and peak-rate sources. Validate
-   that the instrumentation can emit both phases before committing to the accuracy
+   that the instrumentation can emit both phases before the timed
    run. Missing instrumentation is setup work to complete, not a reason to omit
    the figures.
 
@@ -278,8 +301,8 @@ corresponding server is still running:
 <roofline_command> --run-dir <run> --concurrency <N> --action collect
 ```
 
-`check` runs immediately after server selection, before accuracy on the largest
-server and before warmup on each smaller one. Read `perf-bN-server.json`, verify
+`check` runs immediately after server selection, before any accuracy or warmup on
+that server. Read `perf-bN-server.json`, verify
 that the running server's timing instrumentation and the model/hardware accounting
 are ready, and fail with an actionable error if they are not. It must not silently
 enable a different precision, layer count or context capacity.
@@ -312,13 +335,14 @@ failure in `RUN_NOTES.md` and repair the collector before rerunning.
 ```text
 doc/benchmark/
   identity.json                 authored from the running server
+  serving_rates.json            the grid and release rows goal 12 reads (pipeline)
   RUN_NOTES.md                  commands, setup time, protocol details and limitations
   run/
-    REPORT.md                   generated final report: scores, references and performance
+    REPORT.md                   generated final report: performance (and scores when tasks run)
     run_config.json             frozen configuration
-    manifest.json               frozen subset, with full populations and content hashes
+    manifest.json               frozen subset (only when tasks run)
     summary.json                execution status, timing and normalized results
-    <task>/                     upstream results, scored samples and raw responses
+    <task>/                     upstream results and raw responses (only when tasks run)
     perf-b{1,32}*.json           raw performance measurements, warmups and server identities
     configuration-*.log          retained effective server configuration evidence
     roofline.json               required full-phase accounting for every profile

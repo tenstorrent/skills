@@ -269,6 +269,35 @@ def valid_gate_fixture(tmp_path):
     return root, evidence
 
 
+def test_pipeline_stage_without_eval_tasks_passes_on_performance_alone(tmp_path):
+    root, evidence = valid_gate_fixture(tmp_path)
+    config = json.loads((evidence / 'run/run_config.json').read_text())
+    summary = json.loads((evidence / 'run/summary.json').read_text())
+    config['tasks'], summary['accuracy'] = [], {}
+    (evidence / 'run/run_config.json').write_text(json.dumps(config))
+    (evidence / 'run/summary.json').write_text(json.dumps(summary))
+    (evidence / 'run/manifest.json').unlink()
+    assert check(root, 'org/model') == evidence
+    summary['accuracy'] = {'gsm8k_cot': {}}
+    (evidence / 'run/summary.json').write_text(json.dumps(summary))
+    with pytest.raises(ValueError, match='accuracy'):
+        check(root, 'org/model')
+
+
+def test_runner_budget_allows_thirty_minutes_per_batch(tmp_path):
+    root, evidence = valid_gate_fixture(tmp_path)
+    summary = json.loads((evidence / 'run/summary.json').read_text())
+    config = json.loads((evidence / 'run/run_config.json').read_text())
+    config['budget_seconds'], summary['elapsed_seconds'] = 3600, 3500
+    (evidence / 'run/run_config.json').write_text(json.dumps(config))
+    (evidence / 'run/summary.json').write_text(json.dumps(summary))
+    assert check(root, 'org/model') == evidence
+    summary['elapsed_seconds'] = 3700
+    (evidence / 'run/summary.json').write_text(json.dumps(summary))
+    with pytest.raises(ValueError, match='budget'):
+        check(root, 'org/model')
+
+
 @pytest.mark.parametrize('mutation', ['reference_metric', 'model', 'raw_perf', 'transcript', 'batch', 'layers', 'manifest', 'sample_ids', 'truncation'])
 def test_gate_connects_results_to_raw_evidence(tmp_path, mutation):
     root, evidence = valid_gate_fixture(tmp_path)

@@ -47,8 +47,10 @@ def check(model_dir, hf_model=''):
     if config.get('model') != identity['model']:
         raise ValueError('run model does not match evaluated implementation identity')
     elapsed = summary.get('elapsed_seconds')
-    if summary.get('status') != 'completed' or not finite_number(elapsed) or not 0 < elapsed < min(config.get('budget_seconds', 3600), 3600):
-        raise ValueError('benchmark stage did not complete within its budget and one hour')
+    # The runner's own cap: 30 minutes per configured batch (run.py).
+    cap = 1800.0 * len(summary.get('concurrencies') or config.get('concurrencies') or [1, 8, 16, 32])
+    if summary.get('status') != 'completed' or not finite_number(elapsed) or not 0 < elapsed < min(config.get('budget_seconds', cap), cap):
+        raise ValueError('benchmark stage did not complete within its budget (at most 30 minutes per batch)')
     # Pipeline stage 11 runs no evals (they moved to goal 12): `tasks: []` skips the accuracy evidence.
     manifest = read(evidence / 'run/manifest.json') if config.get('tasks') else {}
     if manifest and digest({k: v for k, v in manifest.items() if k != 'manifest_sha256'}) != manifest['manifest_sha256']:
