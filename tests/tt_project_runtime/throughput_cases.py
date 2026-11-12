@@ -1234,6 +1234,51 @@ def test_throughput_charges_a_checks_wait_only_until_its_slot_grant(env, monkeyp
     assert (own["count"], own["median_s"]) == (1, wait_s - 900), own
 
 
+def test_a_relaunch_or_spill_rerun_waits_for_its_slot_only_from_its_wait_from(env, monkeypatch, tmp_path):
+    """#8455: a relaunch or a rerun here after a spill host did not pass keeps its first arrival (ARRIVED_ENV)
+    for its queue place, but its earlier run was no slot wait: record_wait stores WAIT_FROM_ENV as
+    "wait_from", the waits log and throughput count the slot wait only from it, and the run before it is
+    own_job. A wait_from outside the wait is ignored."""
+    from ttp import checkcap, throughput
+    from ttp.daemon import Daemon
+    monkeypatch.setattr(checkcap, "grants_dir", lambda: tmp_path / "host")
+    p = make(env)
+    d, now = Daemon(p.base), time.time()
+    w0, wait_s = now - 6 * 3600, 2 * 3600
+    t = _tp_checks_requeue(p, d, monkeypatch, tmp_path, "spilled first", w0, wait_s)
+    monkeypatch.setenv(checkcap.WAIT_FROM_ENV, repr(w0 + 3000))
+    _tp_slot_wait(p, monkeypatch, t, w0, w0 + 3600)
+    monkeypatch.delenv(checkcap.WAIT_FROM_ENV)
+    (rec,) = checkcap.wait_records(Path(p.db.path).parent, now)
+    assert rec["wait_from"] == round(w0 + 3000, 3) and checkcap.wait_start(rec) == rec["wait_from"]
+    assert checkcap.waits(Path(p.db.path).parent, now) == [600.0]
+    rep = throughput.measure(p.db, p.config(), now=now, gates={})
+    ck, own = _tp_lane(rep, "checks_slots"), _tp_lane(rep, "own_job")
+    assert (ck["count"], ck["median_s"]) == (1, 600), ck
+    assert (own["count"], own["p90_s"]) == (2, 3600), own   # its spill run (3000 s), and after its grant
+    for wf in (w0 - 10, w0 + 9999, True):
+        assert checkcap.wait_start({**rec, "wait_from": wf}) == rec["queued_at"], wf
+
+
+def test_throughput_books_an_old_relaunch_records_first_run_as_own_job(env, monkeypatch, tmp_path):
+    """#8455: slot records written before wait_from: a relaunched run's record keeps its first arrival, so
+    it spans the first run's grant and the time that run ran until the daemon relaunched it. Throughput
+    counts its slot wait only from the task's checks_relaunched event after that earlier grant."""
+    from ttp import checkcap, throughput
+    from ttp.daemon import Daemon
+    monkeypatch.setattr(checkcap, "grants_dir", lambda: tmp_path / "host")
+    p = make(env)
+    d, now = Daemon(p.base), time.time()
+    w0, wait_s = now - 6 * 3600, 3 * 3600
+    t = _tp_checks_requeue(p, d, monkeypatch, tmp_path, "relaunched", w0, wait_s)
+    _tp_slot_wait(p, monkeypatch, t, w0, w0 + 300)          # the first run's grant
+    _tp_slot_wait(p, monkeypatch, t, w0, w0 + 2 * 3600)     # the relaunched run, same arrival
+    p.db.x("INSERT INTO events(ts, source, kind, fingerprint, severity, task, text) VALUES(?,?,?,?,?,?,?)",
+           (w0 + 1200, "daemon", "checks_relaunched", f"checks_relaunched:{t}:b:h", "low", t, "relaunched"))
+    ck = _tp_lane(throughput.measure(p.db, p.config(), now=now, gates={}), "checks_slots")
+    assert (ck["count"], ck["p90_s"]) == (2, 2 * 3600 - 1200), ck   # 300 s, then from the relaunch
+
+
 def _tp_host_scene(p, monkeypatch, tmp_path, d, now, at_cap=False, other_grant=False):
     """Two priority 1 checks waits of 999 s, each queued 900 s for a slot (checkcap's own waits log), behind
     one of the project's own checks runs under its cap of 3, or three runs at the cap (`at_cap`), its lane

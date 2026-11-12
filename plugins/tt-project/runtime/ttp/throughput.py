@@ -542,12 +542,34 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
     slot_cap: dict[tuple[int, float, float], int] = {}   # the cap in force a record stored at its grant
     slot_lane: dict[tuple[int, float, float], float] = {}   # when the record's run got its repository's lane
     slot_rec: dict[tuple[int, float, float], dict] = {}   # its lane_s, pool_s, cut_at and cut_by (record_wait)
+    # The time inside a record's [queued_at, granted_at) that was its own earlier run, no wait: a relaunch or
+    # spill rerun keeps its first arrival for its place in the queue, so its record starts at its wait_from
+    # (checkcap.wait_start); an older record without one, overlapping the same task's earlier grant (a reboot's
+    # relaunch), starts at that grant, or at the task's checks_relaunched event after it.
+    slot_ran: dict[int, list[tuple[float, float]]] = {}
+    relaunched: dict[int, list[float]] = {}
+    for e in db.q("SELECT ts, task FROM events WHERE kind='checks_relaunched' AND task IS NOT NULL AND ts>?",
+                  (t0 - DAY,)):
+        relaunched.setdefault(e["task"], []).append(float(e["ts"]))
     own_names, others = {cfg.get("name")}, []   # other projects' host slot grants (times), from the host log
     try:
         from . import checkcap
-        for r in checkcap.wait_records(Path(db.path).parent, now, now - t0 + DAY):
+        recs = checkcap.wait_records(Path(db.path).parent, now, now - t0 + DAY)
+        grants: dict[int, list[float]] = {}
+        for r in recs:
+            if isinstance(r.get("task"), int):
+                grants.setdefault(r["task"], []).append(r["granted_at"])
+        for r in recs:
             own_names.add(r.get("project"))
             if isinstance(r.get("task"), int):
+                q0, g1 = r["queued_at"], r["granted_at"]
+                q = checkcap.wait_start(r)
+                if q == q0 and (prior := max((g for g in grants[r["task"]] if q0 < g < g1), default=None)):
+                    q = max([prior, *(x for x in relaunched.get(r["task"], ()) if prior < x < g1)])
+                if q > q0:
+                    run0 = max((g for g in grants[r["task"]] if q0 < g < q), default=q0)
+                    slot_ran.setdefault(r["task"], []).append((run0, q))
+                r = {**r, "queued_at": q}
                 slot_log.setdefault(r["task"], []).append((r["queued_at"], r["granted_at"]))
                 if isinstance(r.get("cap"), int) and not isinstance(r["cap"], bool) and r["cap"] >= 0:
                     slot_cap[(r["task"], r["queued_at"], r["granted_at"])] = r["cap"]
@@ -777,10 +799,18 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
             cut = slot_granted(t["id"], s0, s1) if ck else None
             if cut is not None and s1 - cut <= (p1_s if prio <= 1 else other_s):
                 cut = None   # a short tail (its checks run, then its next run) is not worth a wait of its own
-            for w0, w1, held_ck in ([(s0, s1, ck)] if cut is None else [(s0, cut, True), (cut, s1, False)]):
+            segs = [(s0, s1, ck)] if cut is None else [(s0, cut, True), (cut, s1, False)]
+            for a, b in slot_ran.get(t["id"], ()):   # its own earlier run inside a slot wait: no wait
+                segs = [x for w0, w1, h in segs for x in
+                        ([(w0, w1, h)] if not h or b <= w0 or a >= w1 else
+                         [(w0, max(w0, a), h), (max(w0, a), min(w1, b), "ran"), (min(w1, b), w1, h)]) if x[1] > x[0]]
+            for w0, w1, held_ck in segs:
                 if w1 <= t0:
                     continue
-                if held_ck:
+                if held_ck == "ran":
+                    lane("own_job", None, None)["note"] = "the task's own detached job or checks ran: no limit"
+                    add(lanes["own_job"], w1 - w0, prio, w0, w1, None, queued)
+                elif held_ck:
                     # Which of the two checks limits held it: a checks_slot_wait event or checkcap record
                     # names the limit; a reason text alone means the legacy default, the project cap. A wait
                     # the host's gate held (ck_holder counts it) or one about to start charges neither.
@@ -1282,7 +1312,7 @@ def text(rep: dict) -> str:
                                                  if ln["p1_count"] else "")
                    + (f"; limit {ln['limit_key']}={ln['limit']}" if ln.get("limit_key")
                       else f"; held by {ln['held_text']}, not a project limit" if ln.get("held_text") else "; no limit")
-                   + (f"; over threshold at limit {ln['at_limit']}, with capacity idle {ln['idle']}"
+                   + (f"; waits over threshold: {ln['at_limit']} at the limit, {ln['idle']} with capacity idle"
                       if ln["at_limit"] or ln["idle"] or ln["lane"] == "worker_slots" else "")
                    + (f", serialized {ln['serialized']}" if ln.get("serialized") else "")
                    + (f", {ln['waiting_now']} waiting now" if ln["waiting_now"] else "") + extra)

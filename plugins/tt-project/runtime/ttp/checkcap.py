@@ -181,6 +181,11 @@ TELL_S = 300.0
 FOREGROUND_WAIT_S = 60.0
 # The arrival time a foreground run hands to its detached checks, so they keep its place in the queue.
 ARRIVED_ENV = "TTP_CHECKS_ARRIVED"
+# When a run that kept its ARRIVED_ENV place began waiting again after work that was no wait: a relaunch
+# after its first run was killed, a rerun here after a spill host did not pass. Its slot record stores it as
+# "wait_from" (record_wait), so the time its earlier run ran is never counted as a slot wait (wait_start).
+WAIT_FROM_ENV = "TTP_CHECKS_WAIT_FROM"
+WAIT_FROM: dict = {}   # "at": the WAIT_FROM_ENV value cli._checks_arrived took out of the environment
 # The runtime version a waiting detached `ttp checks` re-executed itself for (upgraded()): never again for it.
 REEXEC_ENV = "TTP_CHECKS_REEXEC"
 # The host-wide checks slot a re-executing `ttp checks` was granted and keeps: [fd, path] (keep_slot).
@@ -2607,7 +2612,8 @@ def record_wait(state: Path | None, project_name: str | None, priority: int | No
     since `queued_at` it waited for its own lanes over every bound and re-execution (a bounded wait gives its lane
     back and takes it again, so lane_at alone dates only the last one), of which `pool_s` the host's test pool held
     (testslots.pool_room refused a lane it could take past them): throughput books only lane_s - pool_s as own.
-    A preempted run's rerun (CUT_ENV) stores "cut_at" and "cut_by": its wait from its old grant was the asker's."""
+    A preempted run's rerun (CUT_ENV) stores "cut_at" and "cut_by": its wait from its old grant was the asker's.
+    A relaunch or spill rerun (WAIT_FROM_ENV) stores "wait_from": it waited only from then (wait_start)."""
     task, run = _task_run()
     task = task or ""
     rec = {"project": project_name, "task": int(task) if task.isdigit() else None,
@@ -2621,6 +2627,12 @@ def record_wait(state: Path | None, project_name: str | None, priority: int | No
         rec["lane_at"] = round(lane_at, 3)
     if over:
         rec["over_share"] = list(over)
+    try:   # a relaunch or spill rerun that kept its place: it waits only from here (WAIT_FROM_ENV)
+        wf = float(os.environ.get(WAIT_FROM_ENV) or WAIT_FROM.get("at") or "nan")
+        if queued_at < wf <= granted_at:
+            rec["wait_from"] = round(wf, 3)
+    except ValueError:
+        pass
     if lane_s is not None:
         rec["lane_s"] = round(max(0.0, lane_s), 3)
         rec["pool_s"] = round(min(max(0.0, pool_s or 0.0), rec["lane_s"]), 3)
@@ -2669,7 +2681,7 @@ def record_grant(rec: dict, owns: list[str] | tuple = ()) -> None:
     """Append the slot grant `rec` (record_wait's record) to the host-wide GRANTS_LOG. Never raises."""
     row = {"ts": rec["granted_at"], "project": rec["project"], "task": rec["task"], "run": rec["run"],
            "slot": rec["slot"], "priority": rec["priority"], "obligations": list(owns or ()),
-           "since": rec["queued_at"], "waited_s": round(max(0.0, rec["granted_at"] - rec["queued_at"]), 3)}
+           "since": rec["queued_at"], "waited_s": round(max(0.0, rec["granted_at"] - wait_start(rec)), 3)}
     if rec.get("over_share"):
         row["over_share"] = rec["over_share"]
     d = grants_dir()
@@ -2713,9 +2725,18 @@ def _records(d: Path, names: tuple, keys: tuple[str, str], now: float | None, wi
     return out
 
 
+def wait_start(rec: dict) -> float:
+    """When a slot record's wait began: its "wait_from" (a relaunch or spill rerun that kept its place in
+    the queue: its earlier run was no wait) when it lies inside [queued_at, granted_at], else queued_at."""
+    q, wf = float(rec["queued_at"]), rec.get("wait_from")
+    if isinstance(wf, (int, float)) and not isinstance(wf, bool) and q < wf <= float(rec["granted_at"]):
+        return float(wf)
+    return q
+
+
 def waits(state: Path, now: float | None = None, window_s: float = WAITS_WINDOW_S) -> list[float]:
     """The slot waits in seconds that `state`'s log holds for slots taken in the last `window_s`."""
-    return [max(0.0, r["granted_at"] - r["queued_at"]) for r in wait_records(state, now, window_s)]
+    return [max(0.0, r["granted_at"] - wait_start(r)) for r in wait_records(state, now, window_s)]
 
 
 def wait_stats(state: Path, now: float | None = None) -> dict | None:

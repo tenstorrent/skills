@@ -15875,8 +15875,8 @@ class Daemon:
                "PATH": f"{self.p.harness / 'bin'}:{venv_vars.get('PATH', bin_path)}", **usersite.env(self.cfg),
                **sshmux.env(self.cfg)}
         env = machines.mask_devices(env)   # as in the worker's run: no direct device opens
-        if arrived is not None:
-            env[checkcap.ARRIVED_ENV] = repr(arrived)
+        if arrived is not None:   # a relaunch keeps its place; its killed run was no wait (WAIT_FROM_ENV)
+            env[checkcap.ARRIVED_ENV], env[checkcap.WAIT_FROM_ENV] = repr(arrived), repr(time.time())
         level = nice_level(self.cfg.get("runner"))[0]
         argv = (["nice", "-n", str(level)] if level else []) + [sys.executable, "-m", "ttp", "checks", "--detach", "--no-prestage", *extra]
         try:

@@ -5018,6 +5018,7 @@ def cmd_checks(a) -> None:
                 out.flush()
                 print(f"ttp checks: {said}", flush=True)
                 os.environ[checkcap.ARRIVED_ENV] = str(arrived)
+                os.environ[checkcap.WAIT_FROM_ENV] = repr(time.time())   # its spill run was no slot wait
                 if wait_kept:
                     os.environ[_WAIT_KEPT_ENV] = wait_kept
                 os.environ[checkspill.OFF_ENV] = no_spill
@@ -5469,6 +5470,8 @@ def _checks_arrived() -> float:
     (checkcap.ARRIVED_ENV, taken out of the environment so no check command inherits it), else now."""
     from . import checkcap
     now = time.time()
+    # A relaunch's or spill rerun's own wait start goes with it, out of the check commands' environment
+    checkcap.WAIT_FROM["at"] = os.environ.pop(checkcap.WAIT_FROM_ENV, "")
     try:
         t = float(os.environ.pop(checkcap.ARRIVED_ENV, ""))
     except ValueError:
