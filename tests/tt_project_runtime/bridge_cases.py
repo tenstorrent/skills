@@ -861,7 +861,8 @@ def test_bridge_refresh_reinstalls_a_service_whose_command_changed(tmp_path, mon
     started = []
     monkeypatch.setattr(bridge, "start", lambda box, an, argv, platform=None: started.append(argv) or "restarted")
     cfg = bridge.load(conf)
-    new = bridge.service_argv(cfg, "box-1", "auto")
+    new = bridge.service_argv(cfg, "box-1", "auto", platform="darwin")
+    assert "--keep-awake" in new
     old = bridge.ssh_argv(cfg, "box-1", "auto")   # what an older release installed: the bare session
     f = bridge.service_file("box-1", "auto", "darwin")
     f.parent.mkdir(parents=True)
@@ -871,6 +872,12 @@ def test_bridge_refresh_reinstalls_a_service_whose_command_changed(tmp_path, mon
     f.write_bytes(plistlib.dumps(bridge.launchd_plist("box-1", "auto", new)))
     assert bridge.launchd_plist("box-1", "auto", new)["ProgramArguments"][2:4] == ["--tag", "box-1/auto"]
     assert bridge.refresh("darwin", conf) == [] and len(started) == 1   # unchanged: left running
+    nowake = [a for a in new if a != "--keep-awake"]   # a relay command from before the keep-awake flag
+    f.write_bytes(plistlib.dumps(bridge.launchd_plist("box-1", "auto", nowake)))
+    assert bridge.refresh("darwin", conf) == ["bridge box-1 auto: service command changed; restarted"]
+    assert started[-1] == new   # an upgrade rolls the flag out without a manual reinstall
+    started.clear()
+    f.write_bytes(plistlib.dumps(bridge.launchd_plist("box-1", "auto", new)))
     monkeypatch.setattr(hoststate, "unit_dir", lambda: tmp_path / "units")
     (tmp_path / "units").mkdir()
     unit = bridge.systemd_unit("box-1", "auto", new)
@@ -1321,3 +1328,97 @@ def test_bridge_status_says_could_not_check_when_the_probe_did_not_run(monkeypat
         lines, code = bridge.status(cfg, ["box-1"])
         assert code == 1 and lines[0].startswith(want), lines
         assert ("missing" in " ".join(lines)) == (out != "")
+
+
+class _FakeAwake:
+    """A fake Popen for the relay's sleep assertion: records argv, and whether it was ended."""
+    made: list = []
+
+    def __init__(self, argv, **kw):
+        self.argv, self.kw, self.ended = argv, kw, False
+        _FakeAwake.made.append(self)
+
+    def terminate(self):
+        self.ended = True
+
+    def wait(self, timeout=None):
+        return 0
+
+
+def _relay_run(tmp_path, args, platform, spawn=_FakeAwake):
+    import os
+    from ttp import bridge_relay
+    _FakeAwake.made = []
+    argv = _fake_relay_ssh(tmp_path / "s", ["ok"])
+    rc = bridge_relay.main([*args, str(tmp_path / "relay" / "box-a.auto"), "--", *argv],
+                           platform=platform, awake_spawn=spawn)
+    return rc, list(_FakeAwake.made), os.getpid()
+
+
+def test_bridge_relay_on_macos_holds_exactly_one_charger_only_assertion_and_ends_it(tmp_path):
+    # cells: keep-awake-darwin, keep-awake-argv, keep-awake-restart
+    rc, made, pid = _relay_run(tmp_path, ["--tag", "box-a/auto", "--keep-awake"], "darwin")
+    assert rc == 0 and len(made) == 1
+    assert made[0].argv == ["/usr/bin/caffeinate", "-s", "-w", str(pid)]
+    assert not {"-d", "-i", "-u", "-m"} & set(made[0].argv)
+    assert made[0].ended, "the assertion ends with the relay"
+    # a restart is a new relay process: the old one's assertion is already ended, so one is held at a time
+    rc2, made2, _ = _relay_run(tmp_path / "again", ["--tag", "box-a/auto", "--keep-awake"], "darwin")
+    assert rc2 == 0 and len(made2) == 1 and made2[0].ended
+
+
+def test_bridge_relay_spawns_no_assertion_when_off_or_not_on_macos(tmp_path):
+    # cells: keep-awake-off, keep-awake-other-platform
+    rc, made, _ = _relay_run(tmp_path / "a", ["--tag", "box-a/auto"], "darwin")   # the flag is absent: setting off
+    assert rc == 0 and made == []
+    for plat in ("linux", "win32"):
+        rc, made, _ = _relay_run(tmp_path / plat, ["--tag", "box-a/auto", "--keep-awake"], plat)
+        assert rc == 0 and made == []
+
+
+def test_bridge_relay_survives_a_missing_caffeinate(tmp_path, capfd):
+    # cells: keep-awake-missing
+    def boom(argv, **kw):
+        raise FileNotFoundError(2, "No such file or directory")
+    rc, made, _ = _relay_run(tmp_path, ["--keep-awake"], "darwin", spawn=boom)
+    assert rc == 0 and "could not keep the computer awake" in capfd.readouterr().err
+
+
+def test_bridge_keep_awake_setting_drives_the_service_command_and_the_status_line(tmp_path, monkeypatch):
+    # cells: keep-awake-setting, keep-awake-status
+    import pytest
+    from ttp import bridge
+    box = {"agents": {"auto": {"agent": "env", "forward": [
+        {"name": "build-a", "target": "build-a.example.com", "port": 2301, "user": "builder"}]}}}
+
+    def cfg(**top):
+        return bridge.parse({"boxes": {"box-1": box}, **top})
+    assert cfg()["keep_awake"] is True and cfg(keep_awake="off")["keep_awake"] is False
+    assert cfg(keep_awake=False)["keep_awake"] is False and cfg(keep_awake="ON")["keep_awake"] is True
+    with pytest.raises(bridge.BadConfig, match="keep_awake"):
+        cfg(keep_awake="sometimes")
+    assert "--keep-awake" in bridge.service_argv(cfg(), "box-1", "auto", platform="darwin")
+    assert "--keep-awake" not in bridge.service_argv(cfg(keep_awake="off"), "box-1", "auto", platform="darwin")
+    assert "--keep-awake" not in bridge.service_argv(cfg(), "box-1", "auto", platform="linux")
+    # the status line: not on macOS / off by setting / not held yet / held
+    assert bridge.keep_awake_line(cfg(), ["box-1"], "linux") == "keep-awake: not on macOS (nothing is held)"
+    assert bridge.keep_awake_line(cfg(keep_awake="off"), ["box-1"], "darwin").startswith("keep-awake: off by setting")
+    monkeypatch.setattr(bridge, "running", lambda *a, **k: True)
+    monkeypatch.setattr(bridge, "installed_argv", lambda *a, **k: ["py", "relay"])
+    assert "not held now" in bridge.keep_awake_line(cfg(), ["box-1"], "darwin")
+    monkeypatch.setattr(bridge, "installed_argv", lambda *a, **k: ["py", "relay", "--keep-awake"])
+    line = bridge.keep_awake_line(cfg(), ["box-1"], "darwin")
+    assert line == "keep-awake: held (charger power only; the display may sleep)"
+    # status() ends with that one line
+    import subprocess
+    monkeypatch.setattr(bridge, "_box", lambda *a, **k: subprocess.CompletedProcess(
+        [], 0, "block yes\nagent auto up 1\nport 2301 up\n", ""))
+    lines, _ = bridge.status(cfg(), ["box-1"], "darwin")
+    assert lines[-1] == line and sum(ln.startswith("keep-awake:") for ln in lines) == 1
+
+
+def test_daemon_keep_awake_never_holds_the_display_or_the_battery():
+    # cells: daemon-awake-pin
+    from ttp import awake
+    a = awake.argv(4242)
+    assert a[0] == "caffeinate" and not {"-d", "-u", "-m"} & set(a) and "-s" in a and a[-2:] == ["-w", "4242"]

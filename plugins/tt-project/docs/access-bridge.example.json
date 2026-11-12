@@ -1,5 +1,6 @@
 {
   "socket_dir": "~/.ssh/tt-agent",
+  "keep_awake": "on",
   "boxes": {
     "lab-box-1": {
       "login": {"agent": "~/path/to/agent-that-may-forward.sock", "identity": "~/.ssh/login-key.pub"},

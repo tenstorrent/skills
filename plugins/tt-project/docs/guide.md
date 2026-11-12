@@ -1917,7 +1917,9 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   `caffeinate -i -s`, tied to the daemon's process so it ends with it. A closed lid without an
   external display, or a sleep you ask for, still sleeps the machine; the harness never changes
   `pmset` settings. It lets go when the work ends, on battery, or with the key set back to `off`;
-  other platforms never hold one. `ttp status` and
+  other platforms never hold one. The rule for every hold: only while the charger is connected, and
+  never the display (no `caffeinate -d`, `-u` or `-m`). The access bridge's workstation side has its own
+  hold (see the bridge's keep-awake bullet). `ttp status` and
   the web app say when it is held, or why not while there is work, and say "the lid is closed: work
   pauses while the Mac sleeps" while a closed lid will sleep it.
 - Every ssh a project starts (probes, heal checks, checks-host runs, the daemon's own calls, and
@@ -3951,6 +3953,13 @@ Workers can read Slack links you paste, using your Slack connector if you have o
     the older entry's refusing proxy. A missing or failing check counts as held, so the check can
     keep a hold but never lift one.
   - A project on the box just runs `ssh <host>` or `git` over ssh as usual.
+  - On macOS the workstation stays awake while a bridge session runs, on charger power only and never
+    the display: the session's relay holds `/usr/bin/caffeinate -s -w <relay pid>` (system sleep
+    prevented only on AC power; no `-d`, `-i`, `-u` or `-m`), which ends with the session, so a restart
+    never leaves two. Set `"keep_awake": "off"` at the top of the bridge config to turn it off (default
+    `"on"`). `ttp bridge status` ends with one line: held (charger power only; the display may sleep), off
+    by setting, or not on macOS. Other platforms spawn nothing. `ttp setup` and the upgrade restart a
+    session whose command changed, so the hold needs no manual reinstall.
   - It fails closed. While the workstation sleeps or its session is down, the forwards are closed
     and the link dangles, so those logins fail. A run that needs them waits or hands off.
   - It carries ssh only. The GitHub API (`gh`: PRs, CI, comments) is not bridged; read that from

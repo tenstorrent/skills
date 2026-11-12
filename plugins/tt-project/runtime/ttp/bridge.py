@@ -51,6 +51,11 @@ the block names once a minute on its own (bridgewatch.py): a low status line at 
 alert per outage past bridge.agent_alert_after_min, naming the bridge's agent and hosts; a drop
 before the agent answered steadily for bridge.agent_steady_min continues the same outage.
 
+On macOS the workstation stays awake while a session runs, on charger power only and never the
+display: the relay holds `/usr/bin/caffeinate -s -w <its pid>` (see bridge_relay.py), which ends with
+it. The top-level setting `"keep_awake": "off"` turns it off (default "on"); `ttp bridge status` ends
+with one line saying held, off by setting or not on macOS. Other platforms spawn nothing.
+
 The config is JSON (`~/.config/tt-project/bridge.json`, or --config); see
 docs/access-bridge.example.json.
 """
@@ -103,8 +108,17 @@ def _port(v, what: str) -> int:
     return v
 
 
+def _keep_awake(v) -> bool:
+    """bridge.keep_awake: "on" (default) or "off" (true and false accepted)."""
+    word = {True: "on", False: "off"}.get(v, v) if isinstance(v, bool) else str(v).strip().lower()
+    if word not in ("on", "off"):
+        raise BadConfig(f"keep_awake {v!r}: \"on\" (default; on macOS the workstation stays awake on charger power, "
+                        "never the display) or \"off\"")
+    return word == "on"
+
+
 def parse(data: dict) -> dict:
-    """The checked config: {"socket_dir", "boxes": {box: {"login": {...}, "agents": {agent: {...}}}}}.
+    """The checked config: {"socket_dir", "keep_awake", "boxes": {box: {"login": {...}, "agents": {agent: {...}}}}}.
     Each agent: {"agent": "env" or a socket path on this computer, "forward": [host...], "direct": [host...]}.
     A forwarded host: {"name", "aliases", "target", "port", "adopt", "user", "host_key_alias", "interface"}
     ("interface": this computer reaches the target only bound to that interface; see bridge_relay); a direct
@@ -122,7 +136,7 @@ def parse(data: dict) -> dict:
     boxes = data.get("boxes")
     if not isinstance(boxes, dict) or not boxes:
         raise BadConfig("boxes: one entry per box (its ssh alias on this computer)")
-    out: dict = {"socket_dir": sock.rstrip("/"), "boxes": {}}
+    out: dict = {"socket_dir": sock.rstrip("/"), "boxes": {}, "keep_awake": _keep_awake(data.get("keep_awake", "on"))}
     for box, b in boxes.items():
         _name(box, "box")
         if not isinstance(b, dict):
@@ -287,14 +301,15 @@ def relay_dir(box: str, agent: str) -> Path:
 RELAY = HOME_DIR / "bridge_relay.py"
 
 
-def service_argv(cfg: dict, box: str, agent: str, ssh: str | None = None) -> list[str]:
+def service_argv(cfg: dict, box: str, agent: str, ssh: str | None = None, platform: str | None = None) -> list[str]:
     """What the service runs: the session inside the relay wrapper (a copy of bridge_relay.py, installed
-    by setup), which tags it, recovers from a stale session holding its ports, and relays the hosts
-    reached through one interface."""
+    by setup), which tags it, recovers from a stale session holding its ports, relays the hosts
+    reached through one interface and, on macOS unless `keep_awake` is off, holds the sleep assertion."""
     argv = ssh_argv(cfg, box, agent, ssh)
     bound = [h for h in cfg["boxes"][box]["agents"][agent]["forward"] if h["interface"] and not h["adopt"]]
     py = "/usr/bin/python3" if os.path.exists("/usr/bin/python3") else sys.executable
-    return [py, str(RELAY), "--tag", f"{box}/{agent}", str(relay_dir(box, agent)),
+    awake = ["--keep-awake"] if cfg.get("keep_awake", True) and (platform or sys.platform) == "darwin" else []
+    return [py, str(RELAY), "--tag", f"{box}/{agent}", *awake, str(relay_dir(box, agent)),
             *[f"{h['name']}={h['target']}%{h['interface']}" for h in bound], "--", *argv]
 
 
@@ -510,7 +525,7 @@ def setup(cfg: dict, boxes: list[str], platform: str | None = None) -> list[str]
     for box in boxes:
         out.append(f"{box}: {write_block(cfg, box)}")
         for an in cfg["boxes"][box]["agents"]:
-            argv = service_argv(cfg, box, an)
+            argv = service_argv(cfg, box, an, platform=platform)
             if argv[1:2] == [str(RELAY)]:
                 install_relay()
             out.append(f"{box} {an}: {start(box, an, argv, platform)}")
@@ -551,7 +566,7 @@ def refresh(platform: str | None = None, path: Path | None = None, restarted: di
             have = installed_argv(box, an, platform)
             if have is None:
                 continue
-            argv = service_argv(cfg, box, an)
+            argv = service_argv(cfg, box, an, platform=platform)
             install_relay()
             if have != argv:
                 said = start(box, an, argv, platform)
@@ -623,6 +638,20 @@ def parse_probe(text: str) -> dict:
     return out
 
 
+def keep_awake_line(cfg: dict, boxes: list[str], platform: str | None = None) -> str:
+    """The one keep-awake status line: held (charger only), off by setting, or not on macOS."""
+    if (platform or sys.platform) != "darwin":
+        return "keep-awake: not on macOS (nothing is held)"
+    if not cfg.get("keep_awake", True):
+        return "keep-awake: off by setting (bridge keep_awake: off)"
+    held = any("--keep-awake" in (installed_argv(box, an, platform) or []) and running(box, an, platform)
+               for box in boxes for an in cfg["boxes"][box]["agents"])
+    if held:
+        return "keep-awake: held (charger power only; the display may sleep)"
+    return ("keep-awake: on, held while a session runs (charger power only; the display may sleep); "
+            "not held now (`ttp bridge setup` installs the session)")
+
+
 def status(cfg: dict, boxes: list[str], platform: str | None = None, deep: bool = False) -> tuple[list[str], int]:
     """One line per box and agent; deep (doctor): also what each problem means. rc 1 when any is down."""
     lines, bad = [], 0
@@ -675,4 +704,5 @@ def status(cfg: dict, boxes: list[str], platform: str | None = None, deep: bool 
                     lines.append("  the link answers but the agent holds no keys: load the key into it on this computer")
                 for t in tail:
                     lines.append(f"  log: {t[:200]}")
+    lines.append(keep_awake_line(cfg, boxes, platform))
     return lines, 1 if bad else 0

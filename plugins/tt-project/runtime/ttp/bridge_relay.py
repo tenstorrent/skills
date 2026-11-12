@@ -7,7 +7,7 @@ is used through ssh's BindInterface, say). A reverse forward cannot bind its con
 session forwards such a host's box port to a unix socket here instead, and this relay connects
 each connection to that host's port 22 bound to the interface. Nothing else is carried.
 
-usage: bridge_relay.py [--tag <box>/<agent>] <socket dir> [<name>=<host>%<interface> ...] -- <ssh argv...>
+usage: bridge_relay.py [--tag <box>/<agent>] [--keep-awake] <socket dir> [<name>=<host>%<interface> ...] -- <ssh argv...>
 
 It listens on <socket dir>/<name>.sock (mode 600, the directory 700), runs the ssh session, and
 exits with it, removing its sockets: the relay lives exactly as long as the session. It exits 4
@@ -31,6 +31,12 @@ computer's records for the box and agent. The record is what finds a session ssh
 rebooted while the box still held its sessions. It never uses sudo and leaves untagged, interactive
 and other accounts' sessions alone. The session then starts again at once; a second forward failure
 in a row exits nonzero, so the service's own restart pacing applies.
+
+With --keep-awake (macOS only; the service passes it unless the bridge config says `"keep_awake":
+"off"`) it also holds `/usr/bin/caffeinate -s -w <its pid>` for as long as it runs: PreventSystemSleep,
+which macOS honours only on AC power, so the computer stays awake on the charger, nothing is held on
+battery and the display is never kept awake (no -d, -i, -u or -m). `-w` ends the assertion with the
+relay, and the relay ends it itself on exit, so a restart never leaves two. Any other platform spawns nothing.
 
 When the box-side loop finds this session's forwarded agent dead (exit 5: two failed `ssh-add -l`
 in a row, 30 s apart), the session reconnects after 5, 20, then 60 s; a fourth dead agent within
@@ -301,10 +307,45 @@ def wait(seconds: float, state: dict) -> None:
         time.sleep(min(1.0, end - time.monotonic()))
 
 
-def main(argv: list[str]) -> int:
-    tag = ""
-    if argv[:1] == ["--tag"] and len(argv) > 1:
-        tag, argv = argv[1], argv[2:]
+CAFFEINATE = "/usr/bin/caffeinate"
+
+
+def keep_awake_argv(pid: int) -> list[str]:
+    """-s only: PreventSystemSleep is honoured on AC power only, and never the display."""
+    return [CAFFEINATE, "-s", "-w", str(pid)]
+
+
+def hold_awake(platform: str | None = None, spawn=None, pid: int | None = None):
+    """Start the sleep assertion tied to this process (macOS only); the Popen, or None when nothing started."""
+    if (platform or sys.platform) != "darwin":
+        return None
+    try:
+        return (spawn or subprocess.Popen)(keep_awake_argv(pid or os.getpid()), stdin=subprocess.DEVNULL,
+                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as e:
+        print(f"bridge_relay: could not keep the computer awake: {e.strerror or e}", file=sys.stderr, flush=True)
+        return None
+
+
+def release_awake(proc) -> None:
+    if proc is None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def main(argv: list[str], platform: str | None = None, awake_spawn=None) -> int:
+    tag, keep = "", False
+    while argv[:1] in (["--tag"], ["--keep-awake"]):
+        if argv[0] == "--keep-awake":
+            keep, argv = True, argv[1:]
+        elif len(argv) > 1:
+            tag, argv = argv[1], argv[2:]
+        else:
+            break
     if "--" not in argv or len(argv) < 3:
         print(__doc__, file=sys.stderr)
         return 2
@@ -322,6 +363,7 @@ def main(argv: list[str]) -> int:
         listen(path, host, iface)
         paths.append(path)
     state: dict = {"stop": False, "child": None}
+    awake = hold_awake(platform, awake_spawn) if keep else None
 
     def end(signum, _frame):
         state["stop"] = True
@@ -361,6 +403,7 @@ def main(argv: list[str]) -> int:
             clean(ssh, prefix, ports)
             cleaned = True
     finally:
+        release_awake(awake)
         for p in paths:
             try:
                 os.unlink(p)
