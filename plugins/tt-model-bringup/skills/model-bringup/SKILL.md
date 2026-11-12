@@ -144,13 +144,17 @@ recorded thread and appends attempt logs. Do not restart earlier completed stage
 Unattended-run options (see `scripts/multigoal --help`):
 - transient API errors (model at capacity, stream disconnects, 5xx) resume the same thread with
   backoff (`--transient-retries`, `--transient-backoff`);
-- `--wait-on-usage-limit` waits for a usage-limit reset and resumes; the runner pauses between
-  stages when less than `--min-headroom-pct` of the limit is left;
+- `--wait-on-usage-limit` waits for a usage-limit reset and resumes (at most 3 resumes when no
+  reset time is known; a goal's own `budgetLimited` is never waited on);
+- before each stage the runner pauses at most 6 h when a fresh rate-limit read shows less than
+  `--min-headroom-pct` left in the primary window (the weekly window counts only with
+  `--wait-on-usage-limit`); a failed read never pauses;
 - `--notify-cmd` runs a command whenever a stage blocks, fails or the run finishes;
-- `--resume-stage N --message-file F` sends an owner decision as the resume turn;
+- `--resume-stage N --message-file F` sends an owner decision as the resume turn, after any
+  running turn in that thread finishes;
 - advisory check results (exit 1) are recorded without a remediation goal
-  (`--remediate-advisory` restores it); remediation reuses the stage thread
-  (`--remediation-thread new` restores a fresh thread).
+  (`--remediate-advisory` restores it); remediation runs in a new thread
+  (`--remediation-thread same` reuses the stage thread and falls back to a new one on error).
 
 Inside a stage, wait for long jobs with `scripts/wait_for` instead of sleep-and-poll loops; see
 `$tt-device-usage`.

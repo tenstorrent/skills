@@ -97,6 +97,12 @@ class FakeAppServer:
                     self._done(thread, turn, 'failed', OVERLOADED)]
         if outcome == 'stream503_failed':
             return [self._done(thread, turn, 'failed', STREAM_503)]
+        if outcome == 'budget':
+            return [self._goal_event(thread, 'budgetLimited'), self._done(thread, turn)]
+        if outcome == 'usage_no_reset':
+            error = {'message': 'You have hit your usage limit.', 'codexErrorInfo': 'usageLimitExceeded'}
+            return [self._goal_event(thread, 'usageLimited'), self._error(thread, turn, error),
+                    self._done(thread, turn, 'failed', error)]
         if outcome == 'usage':
             return [self._goal_event(thread, 'usageLimited'), self._error(thread, turn, USAGE),
                     self._done(thread, turn, 'failed', USAGE)]
@@ -190,7 +196,7 @@ def test_reset_time_from_error_message_and_rate_limits():
 def test_backoff_and_flag_validation(stage):
     args = stage['args']()
     assert (args.transient_retries, args.transient_backoff_seconds) == (3, [300, 900, 2700])
-    assert args.remediation_thread == 'same' and not args.remediate_advisory and args.min_headroom_pct == 15
+    assert args.remediation_thread == 'new' and not args.remediate_advisory and args.min_headroom_pct == 15
     with pytest.raises(SystemExit):
         stage['args']('--transient-backoff', '10,abc')
     with pytest.raises(SystemExit, match='requires --resume-stage'):
@@ -251,6 +257,20 @@ def test_usage_limit_waits_until_reset_and_resumes(stage):
     assert manifest(stage)['stage_3_auto_resume_1_reason'] == 'usage'
 
 
+def test_budget_limited_goal_is_not_waited_on(stage):
+    client = FakeAppServer(['budget'])
+    assert stage['run'](client, '--wait-on-usage-limit') == 3
+    assert stage['sleeps'] == []
+    assert 'goal token budget exhausted' in (stage['log_dir'] / 'STATUS.md').read_text()
+
+
+def test_usage_limit_without_reset_time_resumes_at_most_three_times(stage):
+    client = FakeAppServer(['usage_no_reset'] * 4)
+    assert stage['run'](client, '--wait-on-usage-limit') == 3
+    assert stage['sleeps'] == [1800] * 3
+    assert 'no known reset time; 3 polling resume(s) used' in (stage['log_dir'] / 'STATUS.md').read_text()
+
+
 def test_usage_wait_budget_is_bounded(stage):
     reset = time.time() + 10 * 3600
     client = FakeAppServer(['usage'], rate_limits=[{'primary': {'usedPercent': 100, 'resetsAt': reset}}])
@@ -266,7 +286,28 @@ def test_headroom_pause_between_stages(stage):
     args = stage['args']()
     runner.wait_for_headroom(client, args, stage['log_dir'], '04-next')
     assert len(stage['sleeps']) == 1 and 1000 < stage['sleeps'][0] < 1200
-    assert 'paused before start: 10% rate-limit headroom' in (stage['log_dir'] / 'STATUS.md').read_text()
+    assert 'paused before start: primary rate-limit window has 10% headroom' in (stage['log_dir'] / 'STATUS.md').read_text()
+
+
+def test_headroom_ignores_weekly_window_without_wait_flag_and_caps_pause(stage):
+    week = time.time() + 5 * 86400
+    limits = [{'primary': {'usedPercent': 10, 'resetsAt': time.time() + 3600},
+               'secondary': {'usedPercent': 95, 'resetsAt': week}}]
+    runner.wait_for_headroom(FakeAppServer([], rate_limits=limits), stage['args'](), stage['log_dir'], '04-next')
+    assert stage['sleeps'] == []
+    runner.wait_for_headroom(FakeAppServer([], rate_limits=limits), stage['args']('--wait-on-usage-limit'),
+                             stage['log_dir'], '04-next')
+    assert stage['sleeps'] == [6 * 3600]
+    assert 'capped at 6 h' in (stage['log_dir'] / 'STATUS.md').read_text()
+
+
+def test_headroom_ignores_stale_snapshot_and_past_resets(stage):
+    client = FakeAppServer([], rate_limits=[RuntimeError('read failed')])
+    client.latest_rate_limits = {'primary': {'usedPercent': 99, 'resetsAt': time.time() + 3600}}
+    runner.wait_for_headroom(client, stage['args'](), stage['log_dir'], '04-next')
+    expired = [{'primary': {'usedPercent': 99, 'resetsAt': time.time() - 60}}]
+    runner.wait_for_headroom(FakeAppServer([], rate_limits=expired), stage['args'](), stage['log_dir'], '04-next')
+    assert stage['sleeps'] == []
 
 
 @pytest.mark.parametrize('limits', [
@@ -319,10 +360,10 @@ def test_remediate_advisory_restores_old_behaviour(stage):
     assert manifest(stage)['stage_3_check'] == 'pass'
 
 
-def test_remediation_runs_in_the_same_thread_by_default(stage):
+def test_remediation_same_thread_is_opt_in(stage):
     write_check(stage, [2, 0])
     client = FakeAppServer(['complete', 'complete'])
-    assert stage['run'](client) == 0
+    assert stage['run'](client, '--remediation-thread', 'same') == 0
     assert client.methods().count('thread/start') == 1
     assert 'thread/resume' not in client.methods()
     assert 'Runner-side verification' in client.turn_texts()[1]
@@ -332,6 +373,63 @@ def test_remediation_runs_in_the_same_thread_by_default(stage):
     assert values['stage_3_remediation_1_thread_mode'] == 'same'
     assert values['stage_3_remediation_1_thread_id'] == 'thread-1'
     assert values['stage_3_check'] == 'pass'
+
+
+class RefusingReopen(FakeAppServer):
+    """Refuses to reopen a goal that is already complete."""
+
+    def request(self, method, params, log, on_event=None, timeout=None):
+        if method == 'thread/goal/set' and self.goals.get(params['threadId'], {}).get('status') == 'complete':
+            self.calls.append((method, params))
+            raise RuntimeError('thread/goal/set failed: goal is complete')
+        return super().request(method, params, log, on_event, timeout)
+
+    def read_event(self, log, on_event=None, timeout=None):
+        message = super().read_event(log, on_event, timeout)
+        if message['method'] == 'thread/goal/updated':
+            self.goals[message['params']['threadId']]['status'] = message['params']['goal']['status']
+        return message
+
+
+def test_same_thread_remediation_falls_back_to_new_thread(stage):
+    write_check(stage, [2, 0])
+    client = RefusingReopen(['complete', 'complete'])
+    assert stage['run'](client, '--remediation-thread', 'same') == 0
+    assert client.methods().count('thread/start') == 2
+    values = manifest(stage)
+    assert values['stage_3_remediation_1_thread_mode'] == 'new(fallback)'
+    assert values['stage_3_remediation_1_thread_id'] == 'thread-2'
+    assert values['stage_3_check'] == 'pass'
+
+
+def test_wait_for_turn_started_times_out(stage):
+    state = runner.StageState(thread_id='t', objective='o')
+    with pytest.raises(RuntimeError, match='did not start within 1s'):
+        runner.wait_for_turn_started(FakeAppServer([]), None, state, 'turn-x', timeout=1)
+
+
+class ResumeWithRunningTurn(FakeAppServer):
+    def request(self, method, params, log, on_event=None, timeout=None):
+        if method == 'thread/resume':
+            self.calls.append((method, params))
+            tid = params['threadId']
+            self.goals[tid] = {'objective': 'old', 'status': 'active'}
+            self.pending.append(self._done(tid, 'turn-old'))
+            return {'thread': {'id': tid, 'turns': [{'id': 'turn-old', 'status': 'inProgress'}]}}
+        return super().request(method, params, log, on_event, timeout)
+
+
+def test_message_file_waits_for_running_turn_then_sends(stage):
+    log_dir = stage['log_dir']
+    (log_dir / 'manifest.txt').write_text('stage_3_thread_id=thread-old\nstage_3_terminal_status=blocked\n')
+    steer = stage['tmp'] / 'steer.md'
+    steer.write_text('Owner decision: accept the limitation.\n')
+    args = stage['args']('--resume-stage', '3', '--message-file', str(steer))
+    client = ResumeWithRunningTurn(['complete'])
+    code = runner.run_resumed_stage(client, args, stage['tmp'], log_dir, log_dir / 'manifest.txt', 3,
+                                    stage['prompt'], [], runner.read_manifest(log_dir / 'manifest.txt'))
+    assert code == 0
+    assert client.turn_texts()[0].startswith('Owner decision: accept the limitation.')
 
 
 def test_remediation_thread_new_starts_a_fresh_goal(stage):

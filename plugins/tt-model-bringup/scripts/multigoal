@@ -77,6 +77,18 @@ TRY_AGAIN_RE = re.compile(
 # so the turn's own error (which explains *why*) is captured for classification.
 TERMINAL_DRAIN_SECONDS = 20.0
 RATE_LIMIT_READ_TIMEOUT = 30.0
+# Seconds to wait for turn/started after turn/start before giving up.
+TURN_START_TIMEOUT = 300.0
+# Seconds to wait for a thread's running turn(s) to finish before a new turn
+# (remediation report, owner message, recovery text) is sent into that thread.
+ACTIVE_TURN_DRAIN_SECONDS = 1800.0
+# One headroom pause before a stage never exceeds this.
+HEADROOM_MAX_PAUSE_SECONDS = 6 * 3600.0
+# Usage-limit resumes allowed when no reset time is known.
+MAX_UNKNOWN_RESET_RESUMES = 3
+# Turns still running when this process last stopped reading a thread, so a
+# later turn into the same live thread can wait for them first.
+LIVE_ACTIVE_TURNS: dict[str, set[str]] = {}
 
 
 class ReadTimeout(Exception):
@@ -405,11 +417,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--remediation-thread",
         choices=("same", "new"),
-        default="same",
+        default="new",
         help=(
-            "Where remediation runs. 'same' (default) continues the stage's own "
-            "thread with the check report as the next turn, so the agent keeps its "
-            "context; 'new' starts a fresh thread with a remediation goal."
+            "Where remediation runs. 'new' (default) starts a fresh thread with a "
+            "remediation goal. 'same' (opt-in) continues the stage's own thread with "
+            "the check report as the next turn so the agent keeps its context; it "
+            "falls back to a new thread if the stage thread cannot take a new turn."
         ),
     )
     parser.add_argument(
@@ -459,9 +472,11 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=15.0,
         help=(
-            "Before each stage, if the account rate-limit window reports less than this "
-            "percent remaining, pause until its reset instead of starting a stage that "
-            "would be cut mid-way. 0 disables. Skipped when rate limits are unavailable."
+            "Before each stage, if a fresh account/rateLimits/read reports less than this "
+            "percent left in the primary (short) window, pause until its reset (at most "
+            "6 h) instead of starting a stage that would be cut mid-way. The secondary "
+            "(weekly) window counts only with --wait-on-usage-limit. 0 disables. "
+            "Skipped when the read fails."
         ),
     )
     parser.add_argument(
@@ -857,11 +872,48 @@ def wait_for_turn_started(
     log: Any,
     state: StageState,
     turn_id: str,
+    timeout: float | None = None,
 ) -> None:
+    timeout = TURN_START_TIMEOUT if timeout is None else timeout
+    deadline = time.monotonic() + timeout
     while turn_id not in state.active_turns and state.terminal_status is None:
-        client.read_event(log, lambda msg: update_stage_state(state, msg))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(f"turn {turn_id} did not start within {timeout:.0f}s")
+        try:
+            client.read_event(log, lambda msg: update_stage_state(state, msg), timeout=remaining)
+        except ReadTimeout:
+            raise RuntimeError(f"turn {turn_id} did not start within {timeout:.0f}s") from None
     if state.terminal_status is not None:
         raise RuntimeError(f"stage reached terminal status {state.terminal_status} before turn {turn_id} started")
+
+
+def drain_active_turns(client: AppServerClient, log: Any, state: StageState, timeout: float) -> None:
+    """Wait until the thread's running turns finish. RuntimeError on timeout.
+
+    The goal status seen while draining belongs to the old turn, so the caller's
+    terminal status is reset afterwards.
+    """
+    deadline = time.monotonic() + timeout
+    while state.active_turns:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            client.read_event(log, lambda msg: update_stage_state(state, msg), timeout=remaining)
+        except ReadTimeout:
+            break
+    if state.active_turns:
+        raise RuntimeError(
+            f"thread {state.thread_id} still has running turn(s) {sorted(state.active_turns)} "
+            f"after {timeout:.0f}s; the new turn was NOT sent"
+        )
+    state.terminal_status = None
+    state.last_turn_error = None
+
+
+def remember_active_turns(state: StageState) -> None:
+    LIVE_ACTIVE_TURNS[state.thread_id] = set(state.active_turns)
 
 
 def write_manifest_header(
@@ -1031,6 +1083,7 @@ def execute_goal(
             raise RuntimeError(f"active goal was not set exactly: {goal!r}")
 
         terminal = wait_for_stage_terminal(client, log, state)
+        remember_active_turns(state)
         return terminal, thread_id, state.last_turn_error
 
 
@@ -1054,8 +1107,14 @@ def execute_resumed_goal(
     process already runs is continued directly; otherwise it is loaded with
     thread/resume first.
 
+    When ``message`` is given and the thread still has a running turn, the goal
+    is paused, the runner waits for that turn to finish (ACTIVE_TURN_DRAIN_SECONDS)
+    and then sends the message; on timeout it raises RuntimeError rather than
+    drop the message.
+
     Returns (terminal_status, last_turn_error).
     """
+    explicit_message = message is not None
     if message is None:
         message = default_resume_message(prompt_copy)
     input_items, _missing = input_items_for_resume(repo, message, objective)
@@ -1069,8 +1128,10 @@ def execute_resumed_goal(
             if isinstance(loaded, set):
                 loaded.add(thread_id)
             state.active_turns.update(in_progress_turn_ids(resumed))
-            state.seen_turns.update(state.active_turns)
-        if state.active_turns:
+        else:
+            state.active_turns.update(LIVE_ACTIVE_TURNS.get(thread_id, ()))
+        state.seen_turns.update(state.active_turns)
+        if state.active_turns and not explicit_message:
             active = client.request(
                 "thread/goal/set",
                 {"threadId": thread_id, "objective": objective, "status": "active"},
@@ -1083,6 +1144,7 @@ def execute_resumed_goal(
             state.status = "active"
             state.terminal_status = None
             terminal = wait_for_stage_terminal(client, log, state)
+            remember_active_turns(state)
             return terminal, state.last_turn_error
 
         paused = client.request(
@@ -1096,6 +1158,14 @@ def execute_resumed_goal(
             raise RuntimeError(f"paused resumed goal was not set exactly: {paused_goal!r}")
         state.status = "paused"
         state.terminal_status = None
+        if state.active_turns:
+            print(
+                f"WARNING: thread {thread_id} has a running turn; waiting up to "
+                f"{ACTIVE_TURN_DRAIN_SECONDS:.0f}s for it to finish before sending the message",
+                file=sys.stderr,
+            )
+            drain_active_turns(client, log, state, ACTIVE_TURN_DRAIN_SECONDS)
+            state.status = "paused"
 
         turn_payload = turn_params(args, repo)
         turn_payload["input"] = input_items
@@ -1127,6 +1197,7 @@ def execute_resumed_goal(
         state.terminal_status = None
 
         terminal = wait_for_stage_terminal(client, log, state)
+        remember_active_turns(state)
         return terminal, state.last_turn_error
 
 
@@ -1385,8 +1456,12 @@ def classify_stop(terminal: str, turn_error: str | None) -> str:
     return "other"
 
 
-def read_rate_limits(client: Any, log_dir: pathlib.Path) -> JsonObject | None:
-    """Best-effort account rate-limit snapshot; None when unavailable."""
+def read_rate_limits(client: Any, log_dir: pathlib.Path, *, fresh_only: bool = False) -> JsonObject | None:
+    """Best-effort account rate-limit snapshot; None when unavailable.
+
+    With ``fresh_only`` the last pushed (possibly stale) snapshot is not used
+    when the read fails.
+    """
     snapshot: JsonObject | None = None
     try:
         with (log_dir / "rate-limits.jsonl").open("a", encoding="utf-8") as log:
@@ -1395,18 +1470,20 @@ def read_rate_limits(client: Any, log_dir: pathlib.Path) -> JsonObject | None:
             snapshot = result["rateLimits"]
     except Exception as exc:  # noqa: BLE001 - optional API; degrade gracefully
         print(f"rate limits unavailable: {str(exc)[:200]}", file=sys.stderr)
-    if snapshot is None:
+    if snapshot is None and not fresh_only:
         latest = getattr(client, "latest_rate_limits", None)
         snapshot = latest if isinstance(latest, dict) else None
     return snapshot
 
 
-def rate_limit_windows(snapshot: JsonObject | None) -> list[tuple[float, float | None]]:
+def rate_limit_windows(
+    snapshot: JsonObject | None, keys: tuple[str, ...] = ("primary", "secondary")
+) -> list[tuple[float, float | None]]:
     """(usedPercent, resetsAt epoch seconds) for each reported window."""
     windows: list[tuple[float, float | None]] = []
     if not isinstance(snapshot, dict):
         return windows
-    for key in ("primary", "secondary"):
+    for key in keys:
         window = snapshot.get(key)
         if not isinstance(window, dict):
             continue
@@ -1444,7 +1521,8 @@ def reset_from_message(message: str) -> float | None:
 
 
 def usage_reset_epoch(snapshot: JsonObject | None, turn_error: str | None) -> float | None:
-    exhausted = [reset for used, reset in rate_limit_windows(snapshot) if used >= 100 and reset]
+    now = time.time()
+    exhausted = [reset for used, reset in rate_limit_windows(snapshot) if used >= 100 and reset and reset > now]
     if exhausted:
         return max(exhausted)
     _codes, message, _status = error_details(turn_error)
@@ -1466,33 +1544,47 @@ def claim_usage_wait(args: argparse.Namespace, seconds: float) -> bool:
 
 
 def wait_for_headroom(client: Any, args: argparse.Namespace, log_dir: pathlib.Path, name: str) -> None:
-    """Pause between stages while the account has less than --min-headroom-pct left."""
+    """Pause once before a stage while a rate-limit window has less than --min-headroom-pct left.
+
+    Only a fresh account/rateLimits/read counts; a failed read never pauses.
+    Only windows that reset in the future count. The primary (short) window is
+    checked; the secondary (weekly) one only with --wait-on-usage-limit. One
+    pause lasts at most HEADROOM_MAX_PAUSE_SECONDS; the stage starts afterwards.
+    """
     minimum = getattr(args, "min_headroom_pct", 0.0)
     if minimum <= 0:
         return
-    while True:
-        snapshot = read_rate_limits(client, log_dir)
-        windows = rate_limit_windows(snapshot)
-        if not windows or has_spendable_credits(snapshot):
-            return
-        low = [(used, reset) for used, reset in windows if 100 - used < minimum]
-        if not low:
-            return
-        resets = [reset for _used, reset in low if reset]
-        remaining = 100 - max(used for used, _reset in low)
-        if not resets:
-            print(f"rate-limit headroom {remaining:.0f}% < {minimum:g}% but no reset time; starting {name}", file=sys.stderr)
-            return
-        reset = max(resets)
-        delay = max(60.0, reset - time.time() + 120)
-        if not claim_usage_wait(args, delay):
-            print(f"rate-limit headroom low but usage wait budget is spent; starting {name}", file=sys.stderr)
-            return
-        note = f"paused before start: {remaining:.0f}% rate-limit headroom < {minimum:g}%; waiting until {format_epoch(reset)}"
-        append_status(log_dir, name, "not-started", note)
-        print(note, file=sys.stderr)
-        notify(args, name, "headroom-wait", log_dir, note)
-        _sleep(delay)
+    snapshot = read_rate_limits(client, log_dir, fresh_only=True)
+    if snapshot is None:
+        print(f"headroom check skipped: no fresh rate-limit read; starting {name}", file=sys.stderr)
+        return
+    if has_spendable_credits(snapshot):
+        return
+    keys = ("primary", "secondary") if getattr(args, "wait_on_usage_limit", False) else ("primary",)
+    now = time.time()
+    low = []
+    for key in keys:
+        for used, reset in rate_limit_windows(snapshot, (key,)):
+            if reset and reset > now and 100 - used < minimum:
+                low.append((reset, key, used))
+    if not low:
+        return
+    reset, key, used = max(low)
+    wanted = max(60.0, reset - now + 120)
+    delay = min(wanted, HEADROOM_MAX_PAUSE_SECONDS)
+    if not claim_usage_wait(args, delay):
+        print(f"rate-limit headroom low but usage wait budget is spent; starting {name}", file=sys.stderr)
+        return
+    capped = f" (capped at {HEADROOM_MAX_PAUSE_SECONDS / 3600:g} h; the stage starts afterwards)" if delay < wanted else ""
+    note = (
+        f"paused before start: {key} rate-limit window has {100 - used:.0f}% headroom < {minimum:g}% "
+        f"(resets {format_epoch(reset)}); pausing {delay / 3600:.1f} h{capped}"
+    )
+    append_status(log_dir, name, "not-started", note)
+    print(note, file=sys.stderr)
+    notify(args, name, "headroom-wait", log_dir, note)
+    _sleep(delay)
+    print(f"headroom pause over; starting {name}", file=sys.stderr)
 
 
 def recover_stop(
@@ -1516,6 +1608,7 @@ def recover_stop(
     blocker ("other") is returned unchanged.
     """
     transient_used = 0
+    unknown_reset_used = 0
     attempt = 0
     while thread_id:
         kind = classify_stop(terminal, turn_error)
@@ -1528,6 +1621,14 @@ def recover_stop(
             delay = float(delays[min(transient_used, len(delays) - 1)])
             transient_used += 1
             note = f"transient API error; resume {transient_used}/{retries} in {delay:.0f}s"
+        elif kind == "usage" and terminal == "budgetLimited":
+            # The goal's own token budget, not an account limit: waiting does not help.
+            append_status(
+                log_dir, name, terminal,
+                "goal token budget exhausted (budgetLimited); not waitable. Raise the budget and "
+                "resume with --resume-stage and the same --log-dir",
+            )
+            break
         elif kind == "usage":
             reset = usage_reset_epoch(read_rate_limits(client, log_dir), turn_error)
             when = format_epoch(reset) if reset else "unknown"
@@ -1538,7 +1639,17 @@ def recover_stop(
                 )
                 append_status(log_dir, name, terminal, note)
                 break
-            delay = max(60.0, reset - time.time() + 120) if reset else float(getattr(args, "usage_poll_seconds", 1800))
+            if reset:
+                delay = max(60.0, reset - time.time() + 120)
+            else:
+                if unknown_reset_used >= MAX_UNKNOWN_RESET_RESUMES:
+                    append_status(
+                        log_dir, name, terminal,
+                        f"usage limit with no known reset time; {MAX_UNKNOWN_RESET_RESUMES} polling resume(s) used",
+                    )
+                    break
+                unknown_reset_used += 1
+                delay = float(getattr(args, "usage_poll_seconds", 1800))
             if not claim_usage_wait(args, delay):
                 append_status(log_dir, name, terminal, f"usage limit; resets {when}; wait budget exhausted")
                 break
@@ -1591,8 +1702,9 @@ def run_stage_checks(
     """Run the stage's check script with remediation. Returns the check status string.
 
     Exit 1 (advisory) is recorded without remediation unless
-    --remediate-advisory is set. With --remediation-thread same (default) and a
-    known stage thread, remediation is the next turn of that thread.
+    --remediate-advisory is set. Remediation runs in a new thread by default; with
+    --remediation-thread same and a known stage thread it is the next turn of that
+    thread, falling back to a new thread when that thread cannot take the turn.
     """
     manifest_key_prefix = manifest_key_prefix or f"stage_{index}"
     script = find_check_script(prompt_path)
@@ -1645,23 +1757,30 @@ def run_stage_checks(
         print(f"\n== Stage {index} remediation {attempt + 1} ({mode} thread): check failed (exit {code}) ==", file=sys.stderr)
         print(f"+ log: {remediation_log}", file=sys.stderr)
         append_manifest(manifest, [f"{key}_thread_mode={mode}"])
+        fallback = False
         if same_thread:
             assert thread_id is not None
             append_manifest(manifest, [f"{key}_thread_id={thread_id}"])
             stage_objective = objective_from_prompt(prompt)
-            terminal, turn_error = execute_resumed_goal(
-                client,
-                args,
-                repo,
-                stage_objective,
-                thread_id,
-                remediation_log,
-                prompt_copy,
-                attempt_kind="remediation",
-                message=objective,
-            )
-            remediation_thread: str | None = thread_id
-        else:
+            try:
+                terminal, turn_error = execute_resumed_goal(
+                    client,
+                    args,
+                    repo,
+                    stage_objective,
+                    thread_id,
+                    remediation_log,
+                    prompt_copy,
+                    attempt_kind="remediation",
+                    message=objective,
+                )
+                remediation_thread: str | None = thread_id
+            except RuntimeError as exc:
+                print(f"same-thread remediation failed ({str(exc)[:300]}); falling back to a new thread", file=sys.stderr)
+                append_manifest(manifest, [f"{key}_thread_mode=new(fallback)"])
+                remediation_log = log_dir / f"{name}.remediation-{attempt + 1}-new.jsonl"
+                fallback = True
+        if not same_thread or fallback:
             stage_objective = objective
             terminal, remediation_thread, turn_error = execute_goal(
                 client,
