@@ -18,7 +18,7 @@ from benchmark_stage.responses import read_jsonl
 ANSWER = "identical answer\u2028same record\u2029same paragraph\u0085same value"
 
 
-@pytest.mark.parametrize('mutation', [None, 'nested_kwargs', 'duplicate', 'repeats', 'malformed_response'])
+@pytest.mark.parametrize('mutation', [None, 'nested_kwargs', 'duplicate_instance', 'repeats', 'malformed_response'])
 def test_shared_pool_preserves_request_identity_and_global_concurrency(tmp_path, monkeypatch, mutation):
     pytest.importorskip('lm_eval')
     from importlib.metadata import version
@@ -87,7 +87,7 @@ def test_shared_pool_preserves_request_identity_and_global_concurrency(tmp_path,
                 requests.append(Instance(request_type='generate_until', doc=docs[doc_id],
                     arguments=(prompt, copy.deepcopy(gen_kwargs)), idx=0, metadata=(name, position, 1)))
         if mutation == 'nested_kwargs': requests[-1].args[1]['chat_template_kwargs']['enable_thinking'] = False
-        elif mutation == 'duplicate': requests[-1].arguments = requests[0].arguments
+        elif mutation == 'duplicate_instance': requests[-1] = requests[-2]
         elif mutation == 'repeats': requests[-1].repeats = 2
         answers = model.generate_until(requests)
         assert len(answers) == 72
@@ -133,6 +133,7 @@ def test_shared_pool_preserves_request_identity_and_global_concurrency(tmp_path,
         for link, response in zip(links, raw):
             assert link['response_id'] == response['id'] == f'{name}:{link["doc_id"]:03}'
             assert link['request_sha256'] == hashes[link['doc_id']]
+            assert link['request_instance_sha256'] == digest([name, link['doc_id'], link['request_sha256']])
         metadata = result[name]['benchmark_stage']
         assert metadata['responses'] == metadata['expected_samples'] == 36
         assert metadata['empty_final_length_responses'] == int(name == 'alpha')
@@ -140,3 +141,74 @@ def test_shared_pool_preserves_request_identity_and_global_concurrency(tmp_path,
     assert any(x['choices'][0]['message']['content'] is None for x in read('responses.jsonl')) is False
     alpha_raw = read_jsonl(tmp_path / 'run/alpha/responses.jsonl')
     assert sum(x['choices'][0]['message']['content'] is None for x in alpha_raw) == 1
+
+
+def test_shared_pool_keeps_documents_with_identical_prompts(tmp_path, monkeypatch):
+    """TriviaQA rc.nocontext repeats questions across documents (56 pairs in the frozen subset).
+
+    Each frozen document is its own request instance: both are sent, linked and scored.
+    """
+    pytest.importorskip('lm_eval')
+    from lm_eval import evaluator, tasks
+    from lm_eval.api.instance import Instance
+    from lm_eval.models.api_models import JsonChatStr
+    docs = [{'prompt': f'q{i}'} for i in range(8)]
+    docs[5] = dict(docs[2])  # same question text, different document
+    selected = list(range(8))
+    manifest = {'harness_version': '0.4.13', 'groups': {'trivia': {'tasks': ['trivia'], 'sample_count': 8, 'population': 8}},
+                'tasks': {'trivia': {'indices': selected, 'population': 8, 'population_sha256': digest(docs),
+                                     'document_sha256': [digest(d) for d in docs]}}}
+    manifest['manifest_sha256'] = digest(manifest)
+    (tmp_path / 'manifest.json').write_text(json.dumps(manifest))
+    monkeypatch.setattr(tasks, 'get_task_dict', lambda specs: {'trivia': types.SimpleNamespace(eval_docs=docs)})
+    counter = {'n': 0}
+    lock = threading.Lock()
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args): pass
+        def do_POST(self):
+            payload = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+            label = payload['messages'][0]['content']
+            with lock:
+                counter['n'] += 1
+                rid = f'{label}#{counter["n"]}'
+            data = json.dumps({'id': rid, 'choices': [{'index': 0, 'message': {'content': f'answer {label}'},
+                               'finish_reason': 'stop'}], 'usage': {'completion_tokens': 3}}).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    def fake_evaluate(*, model, samples, gen_kwargs, **kwargs):
+        requests = [Instance(request_type='generate_until', doc=docs[i],
+                             arguments=(JsonChatStr(json.dumps([{'role': 'user', 'content': docs[i]['prompt']}])),
+                                        copy.deepcopy(gen_kwargs)), idx=0, metadata=('trivia', pos, 1))
+                    for pos, i in enumerate(samples['trivia'])]
+        answers = model.generate_until(requests)
+        rows = [dict(doc_id=samples['trivia'][r.doc_id], doc=r.doc, arguments=[r.args], resps=[[a]], filter='none',
+                     filtered_resps=[a]) for r, a in zip(requests, answers)]
+        return {'results': {'trivia': {'exact_match,none': 1.0}}, 'samples': {'trivia': rows}}
+    monkeypatch.setattr(evaluator, 'simple_evaluate', fake_evaluate)
+    try:
+        evaluate_groups(model='test/model', base_url=f'http://127.0.0.1:{server.server_port}', manifest_path=tmp_path / 'manifest.json',
+                        groups=['trivia'], output=tmp_path / 'run', generation={'max_gen_toks': 8, 'until': []}, concurrency=4)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+    root = tmp_path / 'run/trivia'
+    links, raw, scored = (read_jsonl(root / f) for f in ('request_links.jsonl', 'responses.jsonl', 'samples_trivia.jsonl'))
+    assert counter['n'] == len(links) == len(raw) == len(scored) == 8
+    assert sorted(x['doc_id'] for x in links) == selected
+    assert len({x['request_instance_sha256'] for x in links}) == 8
+    assert len({x['request_sha256'] for x in links}) == 7
+    by_doc = {x['doc_id']: x for x in links}
+    assert by_doc[2]['request_sha256'] == by_doc[5]['request_sha256']
+    content = {r['id']: r['choices'][0]['message']['content'] for r in raw}
+    for row in scored:
+        assert row['resps'] == [[content[by_doc[row['doc_id']]['response_id']]]]

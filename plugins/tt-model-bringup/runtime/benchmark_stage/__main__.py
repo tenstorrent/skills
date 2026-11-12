@@ -20,9 +20,11 @@ def main():
     evaluate.add_argument('--shared', action='store_true', help='evaluate comma-separated groups in one request pool')
     evaluate.add_argument('--output', type=Path, required=True)
     evaluate.add_argument('--generation', type=json.loads, default={})
+    evaluate.add_argument('--concurrency', type=int, default=32)
     run_parser = commands.add_parser('run')
     run_parser.add_argument('--config', type=Path, required=True)
     run_parser.add_argument('--output', type=Path, required=True)
+    run_parser.add_argument('--batch-sizes', help='comma-separated decode batch sizes; overrides batch_sizes in the config')
     args = parser.parse_args()
     if args.command == 'prepare':
         from benchmark_stage.subsets import prepare as freeze
@@ -33,11 +35,13 @@ def main():
         print(json.dumps(freeze(tasks, dict(zip(tasks, counts)), args.output, args.reuse_manifest), indent=2))
     elif args.command == 'run':
         from benchmark_stage.run import run
-        print(json.dumps(run(config_path=args.config, output=args.output), indent=2))
+        sizes = [int(b) for b in args.batch_sizes.split(',')] if args.batch_sizes else None
+        print(json.dumps(run(config_path=args.config, output=args.output, batch_sizes=sizes), indent=2))
     else:
         from benchmark_stage.evaluate import evaluate, evaluate_groups
         kwargs = dict(model=args.model, base_url=args.base_url, manifest_path=args.manifest,
-                      output=args.output, generation=args.generation)
+                      output=args.output, generation=args.generation,
+                      concurrency=args.concurrency)
         if args.shared:
             result = evaluate_groups(groups=args.task.split(','), **kwargs)
             print(json.dumps({k: v['benchmark_stage'] for k, v in result.items()}, indent=2))

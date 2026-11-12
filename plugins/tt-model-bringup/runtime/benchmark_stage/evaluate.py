@@ -11,12 +11,14 @@ from benchmark_stage.responses import read_jsonl, scoring_response
 from benchmark_stage.subsets import digest, flatten
 
 
-def evaluate(*, model, base_url, manifest_path, group, output, generation=None):
+def evaluate(*, model, base_url, manifest_path, group, output, generation=None, concurrency=32):
     return evaluate_groups(model=model, base_url=base_url, manifest_path=manifest_path,
-                           groups=[group], output=output, generation=generation, shared=False)[group]
+                           groups=[group], output=output, generation=generation, shared=False,
+                           concurrency=concurrency)[group]
 
 
-def evaluate_groups(*, model, base_url, manifest_path, groups, output, generation=None, shared=True):
+def evaluate_groups(*, model, base_url, manifest_path, groups, output, generation=None, shared=True,
+                    concurrency=32):
     from importlib.metadata import version
     from lm_eval import evaluator
     from lm_eval.models.openai_completions import LocalChatCompletion
@@ -67,17 +69,30 @@ def evaluate_groups(*, model, base_url, manifest_path, groups, output, generatio
                 # must match by value, not merely by the Collator's grouping hash.
                 if len({digest(req.args[1]) for req in requests}) != 1:
                     raise ValueError('shared accuracy requires identical effective generation kwargs')
+                # Identical prompts are legitimate (TriviaQA rc.nocontext repeats
+                # questions across documents). Identity is the frozen document
+                # instance; identical requests queue in order and each API call
+                # consumes one instance.
                 self.request_metadata = {}
+                instances = set()
                 for req in requests:
+                    if req.repeats != 1:
+                        raise ValueError('shared accuracy requires one repeat per frozen document')
                     group = membership[req.task_name]
                     key = digest([req.args[0], req.args[1]])
-                    if key in self.request_metadata or req.repeats != 1:
-                        raise ValueError('shared accuracy requires unique API requests and one repeat')
-                    self.request_metadata[key] = {
-                        'request_sha256': key, 'group': group, 'task': req.task_name,
-                        'doc_id': samples[req.task_name][req.doc_id],
-                    }
-            return super().generate_until(requests, **kwargs)
+                    doc_id = samples[req.task_name][req.doc_id]
+                    instance = digest([req.task_name, doc_id, key])
+                    if instance in instances:
+                        raise ValueError('shared accuracy requires unique frozen document instances')
+                    instances.add(instance)
+                    self.request_metadata.setdefault(key, []).append({
+                        'request_sha256': key, 'request_instance_sha256': instance,
+                        'group': group, 'task': req.task_name, 'doc_id': doc_id,
+                    })
+            outputs = super().generate_until(requests, **kwargs)
+            if shared and any(self.request_metadata.values()):
+                raise RuntimeError('unconsumed frozen document instances after the shared pass')
+            return outputs
 
         async def amodel_call(self, *args, cache_keys=None, **kwargs):
             token = None
@@ -85,7 +100,9 @@ def evaluate_groups(*, model, base_url, manifest_path, groups, output, generatio
                 if not cache_keys or len(cache_keys) != 1:
                     raise ValueError('shared accuracy requires one chat request per API call')
                 key = digest(cache_keys[0])
-                token = active_request.set(self.request_metadata[key])
+                if not self.request_metadata.get(key):
+                    raise RuntimeError('API request has no remaining frozen document instance')
+                token = active_request.set(self.request_metadata[key].pop(0))
             try:
                 return await super().amodel_call(*args, cache_keys=cache_keys, **kwargs)
             finally:
@@ -114,7 +131,7 @@ def evaluate_groups(*, model, base_url, manifest_path, groups, output, generatio
     # the complete stage's deadline, including queued and in-flight requests.
     request_timeout_seconds = 3600
     backend = RecordedChat(model=model, base_url=base_url.rstrip('/') + '/v1/chat/completions',
-                           num_concurrent=32, max_retries=0, timeout=request_timeout_seconds,
+                           num_concurrent=concurrency, max_retries=0, timeout=request_timeout_seconds,
                            tokenized_requests=False, tokenizer_backend=None, max_gen_toks=2048)
     started = time.time()
     result = evaluator.simple_evaluate(
@@ -148,7 +165,7 @@ def evaluate_groups(*, model, base_url, manifest_path, groups, output, generatio
                 projected[field] = {k: v for k, v in projected[field].items() if k in {*children, group}}
         projected['benchmark_stage'] = {
             'model': model, 'group': group, 'subset_sha256': expected_hash,
-            'concurrency': 32, 'elapsed_seconds': elapsed,
+            'concurrency': concurrency, 'elapsed_seconds': elapsed,
             'timing_scope': 'shared accuracy pass' if shared else 'single task group',
             'shared_groups': groups if shared else [],
             'request_timeout_seconds': request_timeout_seconds,
