@@ -85,7 +85,7 @@ Avoid hidden host fallback in a single prefill or decode pass. The final decode 
 
 The full-model stage owns sampling. A full model is complete only when token-out decode uses the canonical split-sampling contract:
 
-- Before designing the token-out path, read both common sampling implementations: `models/common/sampling/` and `models/common/modules/sampling/sampling_1d.py`. Compare their contracts against this model: state ownership, trace behavior, mesh/topology support, sampling-param/seed/logprob/penalty handling, `tt_out_tok` support, top-k/layout/padding expectations, and fit with the generator. Choose the implementation that best fits the model. Record the choice and the rejected alternative in the full-model docs. If neither common implementation fits, explain the exact missing contract before writing custom sampler code;
+- Before designing the token-out path, read both common sampling implementations: `models/common/sampling/` and `tt-transformers:src/tt_transformers/modules/sampling/sampling_1d.py`. Compare their contracts against this model: state ownership, trace behavior, mesh/topology support, sampling-param/seed/logprob/penalty handling, `tt_out_tok` support, top-k/layout/padding expectations, and fit with the generator. Choose the implementation that best fits the model. Record the choice and the rejected alternative in the full-model docs. If neither common implementation fits, explain the exact missing contract before writing custom sampler code;
 - the model decode trace produces sampler-ready logits without host logits readback;
 - the chosen sampling implementation is traced, or the generator owns a correct trace wrapper around it;
 - sampling receives `tt_out_tok` pointing at the persistent decode token input tensor, so the sampled token becomes the next decode input on device;
@@ -169,12 +169,13 @@ python -m readiness_check.generate \
   --chat-template \
   --gen-len 100 \
   --top-k 100 \
+  --model-dir <model_dir> \
   --output <model_dir>/readiness_aime24_chat.refpt
 ```
 
 Raw Tale-of-Two-Cities/book references can still be useful as extra stress coverage, but they should not be the main quality gate for an instruct model unless the model lacks a usable chat template. Use `$qualitative-check` for all prompt-based quality checks, prompt-format evidence, HF controls, and raw-completion versus chat-template classification.
 
-Generate the main reference fresh by default. Reuse a reference only when metadata under the current autoport directory proves the same HF model id and revision, tokenizer, prompt source, chat-template flag, generation length, top-k, and generation command. If any of that is missing or mismatched, regenerate the reference rather than carrying forward a possibly contaminated artifact.
+`--model-dir` turns on the HF reference cache in `<model_dir>/readiness/reference_cache/` (override with `READINESS_REFERENCE_CACHE`, `off` disables it). `run_autoregressive` uses the same cache for its HF greedy completion. The cache key is the HF model id and revision, tokenizer, prompt hash and generation settings, so a hit is safe to reuse; do not delete the cache to force a fresh run. Outside the cache, generate the main reference fresh by default. Reuse a reference only when metadata under the current autoport directory proves the same HF model id and revision, tokenizer, prompt source, chat-template flag, generation length, top-k, and generation command. If any of that is missing or mismatched, regenerate the reference rather than carrying forward a possibly contaminated artifact.
 
 Free-running comparison must be strong enough to catch feedback bugs; teacher forcing cannot see them by construction (it overrides the token-feedback path every step). Use several prompts and the longest feasible generation - at least 64-128 tokens when runtime allows - not a single short continuation. Then run:
 
