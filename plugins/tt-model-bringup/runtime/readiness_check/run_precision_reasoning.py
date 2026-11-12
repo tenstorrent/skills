@@ -537,7 +537,7 @@ def load_scores(model_dir: Path, cid: str, sha: str, kwargs: dict, against: Opti
     if not path.is_file():
         return None
     blob = torch.load(path, weights_only=False)
-    if blob.get("text_sha") != sha or blob.get("build_kwargs") != kwargs or blob.get("scored_against") != against:
+    if blob.get("text_sha") != sha or blob.get("build_kwargs") != kwargs or blob.get("scored_against", "unknown") != against:
         return None
     return blob["texts"]
 
