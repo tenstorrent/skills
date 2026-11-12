@@ -1202,8 +1202,10 @@ def broker_wrap(cmd: str, env: dict, limit: int, idf: str) -> str:
     inner = "export " + " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items()) + "; " + cmd
     b = BROKER
     return (f'out=$({b} run-bg --preemptable -t {limit} {shlex.quote(inner)} 2>&1); e=$?; printf "%s\\n" "$out"; '
-            f'[ $e = 0 ] || exit $e; id=$(printf "%s\\n" "$out" | sed -n "s/^Job \\([^ ]*\\) queued.*/\\1/p" | head -n 1); '
-            f'[ -n "$id" ] || {{ echo "devq: no job id in the broker\'s answer"; exit 1; }}; echo "$id" >{shlex.quote(idf)}; '
+            '[ $e = 0 ] || exit $e; '
+            'id=$(printf "%s\\n" "$out" | sed -n "s/^Job \\([^ ]*\\) queued.*/\\1/p" | head -n 1); '
+            '[ -n "$id" ] || { echo "devq: no job id in the broker\'s answer"; exit 1; }; '
+            f'echo "$id" >{shlex.quote(idf)}; '
             f'trap \'{b} kill "$id" >/dev/null 2>&1; exit 143\' TERM INT HUP; {b} wait "$id" & w=$!; wait $w')
 
 
