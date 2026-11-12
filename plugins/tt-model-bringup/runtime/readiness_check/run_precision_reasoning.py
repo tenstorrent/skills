@@ -40,7 +40,7 @@ Checks (``doc/eval_readiness/precision_reasoning.json``):
 
 - ``positions_scored`` (critical): at least ``--min-positions`` paired positions.
 - ``selected_within_noise`` (critical, waivable): the selected candidate's
-  ΔNLL <= max(2·SE, ``--nll-floor``) and KL×1000 <= ``--kl-max-x1000``.
+  ΔNLL <= max(2·SE, ``--nll-floor``) and, when ΔNLL > 0, KL×1000 <= ``--kl-max-x1000``.
   When the selected candidate is the reference, something more precise must
   vouch for it: a ``--higher-precision`` candidate (the reference's ΔNLL
   against it within the same bound) or a measured, passing HF slice. If
@@ -89,9 +89,14 @@ DEFAULT_MIN_POSITIONS = 1000
 # the floor is KL×1000 = 10. Evidence (Gemma-12B, KL×1000 vs HF on GPQA
 # traces): BFP4 default 74, no-BFP4 28, no-BFP4 + exact GELU 7.7; GPQA moved
 # 66.7 -> 69.4 -> 72.9.
-DEFAULT_NLL_FLOOR = 0.01
-DEFAULT_KL_MAX_X1000 = 15.0
-DEFAULT_HF_KL_MAX_X1000 = 15.0
+# Hardware calibration (Gemma-12B on QB2, 2026-11-12, 12 texts sampled by the
+# g1 reference, 65K positions): no-BFP4 a1 scored ΔNLL +0.0070±0.0011, KL×1000
+# 9.0 against g1 and cost about 3.5 GPQA points; BFP4 scored +0.0221±0.0021,
+# KL×1000 23.3. Against HF: a1 5.9, g1 1.7. KL on self-generated text is 3-5x
+# smaller than KL(HF || TT) on GPQA traces, so the defaults sit below a1.
+DEFAULT_NLL_FLOOR = 0.004
+DEFAULT_KL_MAX_X1000 = 5.0
+DEFAULT_HF_KL_MAX_X1000 = 4.0
 DEFAULT_HF_POSITIONS = 2048
 DEFAULT_DECODE_TOKENS = 256
 DEFAULT_DECODE_TEXTS = 4
@@ -381,7 +386,10 @@ def within_noise(stats: Dict[str, Any], *, nll_floor: float, kl_max_x1000: float
     bound = max(2.0 * se, nll_floor)
     ok_nll = stats["dnll"] <= bound
     kl = stats.get("kl_x1000")
-    ok_kl = kl is None or kl <= kl_max_x1000
+    # A candidate that predicts the text better than the reference is not worse,
+    # however far its distribution moved (e.g. an exact GELU against an
+    # approximated reference); the KL bound applies only when ΔNLL > 0.
+    ok_kl = kl is None or kl <= kl_max_x1000 or stats["dnll"] <= 0
     detail = (
         f"ΔNLL {stats['dnll']:+.4f}±{se:.4f} nats/token (bound {bound:.4f}), "
         + (f"KL×1000 {kl:.1f} (max {kl_max_x1000:g}), " if kl is not None else "")
@@ -485,7 +493,8 @@ def hf_fit_reason(hf_model: str) -> Optional[str]:
     """None when the HF model fits in host RAM, else why the HF slice is skipped."""
     need, have = hf_weight_bytes(hf_model), mem_available_bytes()
     if need is None:
-        return f"could not size the HF checkpoint {hf_model} locally; pass --hf-positions 0 or download it"
+        return (f"no local weight files for the HF checkpoint {hf_model} (its cached snapshot may hold only configs); "
+                "pass the checkpoint directory as --hf-model, download it, or pass --hf-positions 0")
     if have is None:
         return "could not read MemAvailable"
     if need * 1.2 + HF_HEADROOM_BYTES > have:
@@ -555,22 +564,30 @@ def scores_path(model_dir: Path, cid: str) -> Path:
     return model_dir / SCORES_DIR / f"{cid}.pt"
 
 
-def load_scores(model_dir: Path, cid: str, sha: str, kwargs: dict) -> Optional[list]:
+def load_scores(model_dir: Path, cid: str, sha: str, kwargs: dict, against: Optional[dict]) -> Optional[list]:
+    """Cached rows for ``cid`` when the text, its build kwargs and its role match.
+
+    ``against`` is None for the reference (rows hold its top-k) and
+    ``{"id", "kwargs"}`` of the reference for a candidate (rows hold KL against
+    it), so a run with a different ``--reference`` rescores instead of reusing
+    rows of the wrong kind.
+    """
     path = scores_path(model_dir, cid)
     if not path.is_file():
         return None
     blob = torch.load(path, weights_only=False)
-    if blob.get("text_sha") != sha or blob.get("build_kwargs") != kwargs:
+    if blob.get("text_sha") != sha or blob.get("build_kwargs") != kwargs or blob.get("scored_against", "unknown") != against:
         return None
     if blob.get("code_sha") != code_sha(model_dir, kwargs):
         return None
     return blob["texts"]
 
 
-def save_scores(model_dir: Path, cid: str, sha: str, kwargs: dict, rows: list) -> None:
+def save_scores(model_dir: Path, cid: str, sha: str, kwargs: dict, against: Optional[dict], rows: list) -> None:
     path = scores_path(model_dir, cid)
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"text_sha": sha, "build_kwargs": kwargs, "code_sha": code_sha(model_dir, kwargs), "texts": rows}, path)
+    torch.save({"text_sha": sha, "build_kwargs": kwargs, "code_sha": code_sha(model_dir, kwargs),
+                "scored_against": against, "texts": rows}, path)
 
 
 def _fmt(cid: str, s: Dict[str, Any], ok: bool) -> str:
@@ -623,8 +640,9 @@ def run(
 
     for cid in order:
         kwargs = candidates[cid]
+        against = None if cid == ref_id else {"id": ref_id, "kwargs": candidates[ref_id]}
         use_cache = texts and not getattr(args, "no_score_cache", False)
-        cached = load_scores(model_dir, cid, sha, kwargs) if use_cache else None
+        cached = load_scores(model_dir, cid, sha, kwargs, against) if use_cache else None
         if cached is not None:
             scores[cid] = cached
             continue
@@ -656,7 +674,7 @@ def run(
                 gen, texts, topk=args.topk, ref_scores=scores.get(ref_id) if cid != ref_id else None,
                 decode_tokens=args.decode_tokens, decode_texts=args.decode_texts,
             )
-            save_scores(model_dir, cid, sha, kwargs, rows)
+            save_scores(model_dir, cid, sha, kwargs, against, rows)
             scores[cid] = rows
         except SystemExit:
             raise

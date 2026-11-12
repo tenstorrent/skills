@@ -135,6 +135,27 @@ def test_bad_candidate_is_caught_and_equal_candidate_passes(tmp_path):
     assert gate.main(["--model-dir", str(tmp_path), "--stage", "datatype-sweep"]) == gate.EXIT_PASS
 
 
+def test_changing_the_reference_rescores_instead_of_reusing_rows_of_the_wrong_kind(tmp_path):
+    p1.run(args_for(tmp_path, "--selected", "bad"), build_generator=build, tokenizer=FakeTokenizer())
+    calls = []
+
+    def counting_build(**kw):
+        calls.append(kw)
+        return build(**kw)
+
+    # Same text, new reference: its cached rows were scored as a candidate (no top-k), so every
+    # candidate is rescored against it, and KL is measured against the new reference.
+    code = p1.run(args_for(tmp_path, "--reference", "equal", "--selected", "bad", "--hf-positions", "300",
+                           "--hf-model", "fake/hf"),
+                  build_generator=counting_build, tokenizer=FakeTokenizer(),
+                  hf_loader=lambda name: SimpleNamespace(), hf_fit=lambda name: "skip HF here")
+    body = result(tmp_path)
+    assert code == 2 and len(calls) == 3
+    assert body["data"]["reference"] == "equal"
+    assert body["data"]["candidates"]["ref"]["kl_x1000"] < 1.0
+    assert body["data"]["candidates"]["bad"]["within_noise"] is False
+
+
 def test_waiver_downgrades_required_to_fit_loss(tmp_path):
     p1.run(args_for(tmp_path, "--selected", "bad"), build_generator=build, tokenizer=FakeTokenizer())
     (tmp_path / "doc/eval_readiness/limitations.json").write_text(json.dumps({"items": [{
@@ -184,7 +205,12 @@ def test_within_noise_uses_two_se_or_floor():
     assert p1.within_noise({**base, "dnll": 0.004, "dnll_se": 0.001}, nll_floor=0.01, kl_max_x1000=15)[0]
     assert not p1.within_noise({**base, "dnll": 0.004, "dnll_se": 0.001}, nll_floor=0.0, kl_max_x1000=15)[0]
     assert p1.within_noise({**base, "dnll": 0.03, "dnll_se": 0.02}, nll_floor=0.01, kl_max_x1000=15)[0]
-    assert not p1.within_noise({**base, "dnll": 0.0, "dnll_se": 0.001, "kl_x1000": 40.0}, nll_floor=0.01, kl_max_x1000=15)[0]
+    assert not p1.within_noise({**base, "dnll": 0.001, "dnll_se": 0.001, "kl_x1000": 40.0}, nll_floor=0.01, kl_max_x1000=15)[0]
+    # better than the reference on its own text: the KL bound does not apply
+    assert p1.within_noise({**base, "dnll": -0.007, "dnll_se": 0.001, "kl_x1000": 8.9}, nll_floor=0.004, kl_max_x1000=5)[0]
+    # hardware calibration: a1 against g1 fails the defaults
+    assert not p1.within_noise({**base, "dnll": 0.0070, "dnll_se": 0.0011, "kl_x1000": 9.0},
+                               nll_floor=p1.DEFAULT_NLL_FLOOR, kl_max_x1000=p1.DEFAULT_KL_MAX_X1000)[0]
 
 
 def test_cluster_se_matches_independent_case_and_coarse_kl_is_lower_bound():

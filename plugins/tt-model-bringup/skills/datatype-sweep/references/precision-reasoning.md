@@ -69,9 +69,10 @@ P1 measures exactly this, on the model's generator, before vLLM.
      `{"messages": [...], "response": "<thinking and answer text>"}`.
    - Token ids are cached in `doc/eval_readiness/precision_reasoning/text.jsonl`
      and each candidate's scores in `.../scores/<id>.pt`, keyed by the text, the
-     build kwargs, a hash of `<model_dir>/tt/**/*.py` and the contents of any file
-     a kwarg names (the precision config). Reruns score only what changed;
-     `--no-score-cache` rescores everything. Delete `text.jsonl` to regenerate the text.
+     build kwargs, the `--reference` the candidate was scored against, a hash of
+     `<model_dir>/tt/**/*.py` and the contents of any file a kwarg names (the precision
+     config). Reruns score only what changed; `--no-score-cache` rescores everything.
+     Delete `text.jsonl` to regenerate the text.
    - If building several generators in one process fails (device memory not
      released), run one candidate per process with `--only <id>`; the last run
      aggregates the cache.
@@ -100,19 +101,24 @@ and fidelities.
 `--hf-positions 2048` scores the reference against the original HF model on the
 CPU (bf16) when the checkpoint fits in free host RAM; otherwise the check is
 skipped with the reason. This catches a loss the reference itself has.
+`--hf-model` may be a local checkpoint directory; pass the one the model loads
+when the hub cache's default snapshot holds only configs.
 
 ## Checks and defaults
 
 | Check | Severity | Passes when |
 |---|---|---|
 | `positions_scored` | critical, not waivable | ≥ 1,000 paired positions (`--min-positions`) |
-| `selected_within_noise` | critical, waivable | ΔNLL ≤ max(2·SE, 0.01 nats/token) and KL×1000 ≤ 15; when the selected config is the reference: the same bounds against `--higher-precision`, or the HF slice within its bound |
+| `selected_within_noise` | critical, waivable | ΔNLL ≤ max(2·SE, 0.004 nats/token) and, when ΔNLL > 0, KL×1000 ≤ 5; when the selected config is the reference: the same bounds against `--higher-precision`, or the HF slice within its bound |
 | `decode_top1_within_noise` | advisory | decode Δtop-1 ≥ −max(2·SE, 0.01) |
-| `reference_vs_hf` | advisory | KL(reference ‖ HF)×1000 ≤ 15 |
+| `reference_vs_hf` | advisory | KL(reference ‖ HF)×1000 ≤ 4 |
 
-The 0.01 floor (KL×1000 = 10) and the KL bound 15 sit between Gemma-12B's
-exact-GELU policy (7.7 against HF) and its no-BFP4 fast-GELU policy (28, about
-3.5 GPQA points). They are defaults; the owner can tune `--nll-floor`,
+The defaults come from a hardware run on Gemma-12B (QB2, 12 texts sampled by the
+exact-GELU g1 policy, 65K positions). Against g1, the no-BFP4 fast-GELU a1 policy
+scored ΔNLL +0.0070 ± 0.0011 and KL×1000 9.0, and it cost about 3.5 GPQA points;
+the BFP4 default scored +0.0221 and 23. Against HF, a1 scored 5.9 and g1 1.7. KL on
+text the reference sampled is 3 to 5 times smaller than KL(HF ‖ TT) on GPQA traces,
+so the bounds sit below a1. They are defaults; the owner can tune `--nll-floor`,
 `--kl-max-x1000` and `--hf-kl-max-x1000`. `data.candidates` in the result holds the
 verdict for every candidate, so the sweep can use P1 per weight group.
 
