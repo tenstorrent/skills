@@ -2,30 +2,29 @@
 
 Subagents are authorized when a selected skill requests or recommends them.
 
-Start from completed vLLM integration and the selected datatype-sweep config; optimize serving in place.
+Start from the completed vLLM integration and selected datatype-sweep config; optimize serving in place.
 
 Goal completion requirements:
 - The measured path is real vLLM TT plugin serving through models/autoports/<model>/tt/generator_vllm.py.
 - Plugin or vLLM changes meet the $vllm-integration plugin-change rules.
-- vLLM sampling tests, qualitative outputs, primary single-user benchmarks, and CI serving-burst benchmarks pass.
-- Warmed primary single-user TTFT, TPOT, ITL, aggregate throughput, and TPOT-derived decode t/s/u are measured before and after using the same run_vllm_server workload, generation mode, max-num-seqs, max-model-len, mesh, sampling mode, and TT config.
-- CI serving-burst metrics are measured before and after as capacity/nightly-parity evidence. Do not use CI burst as headline decode t/s/u.
-- Preserve the context contract. Do not lower `max_model_len`, benchmark context, or eval context below doc/context_contract.json except for a proven hard physical limit.
-- Preserve valid non-aligned prompt-length serving support while optimizing. Do not trade it away for an aligned-only faster path.
-- Repeat the mixed-shape trace reuse check from $vllm-integration after trace or scheduler changes. Include supported chunked-prefill paths and mixed-traffic latency. Do not substitute fixed-shape warmed benchmarks for this evidence.
-- Optimized vLLM decode is about as fast as optimized full-model traced decode for comparable work.
-- The adapter implements async decode: `decode_forward(..., read_from_device=False)` returns device tensors; deferred reads are minimal; `supports_async_decode` is true only when vLLM exercises it.
-- Serving decode reuses persistent trace inputs and calls ttnn.execute_trace(..., blocking=False). Any synchronization or host read happens after the async boundary and is limited to the plugin contract.
-- sample_on_device_mode=all keeps sampling on device. The measured path has no host greedy/top-1 argmax, full-logits readback, or eager sampling.
-- Serving reuses full-model greedy split sampling. Do not accept force-argmax or slow generic sampling; if sampler work dominates token-out decode, fix the generator LM-head/sampling contract, not the adapter.
-- Token, position, RoPE, page-table, cache, and sampler trace inputs are persistent device tensors. Refresh them only when scheduler state changes. Stale-input tests cover changed token/current-position and changed/unchanged page tables.
-- Do not collect Tracy, tt-perf-report, live-server device profiler, adapter profiler, or ReadDeviceProfiler here. Use benchmark JSON, sampling tests, stale-input checks, async evidence, and no-host-fallback evidence.
-- Runtime fallback and cleanup are clean: no unnecessary torch/from_torch/to_torch, tilize/untilize, reshard, blocking readback, standalone-cache assumption, or leftover vLLM/EngineCore process.
-- Batched prefill meets the $vllm-integration burst and single-user gates.
-- optimized_vllm README/work_log record commands, before/after single-user metrics, CI burst metrics, full-model comparison, trace/async decisions, rejected options, limitations, and artifacts.
-- Relevant $optimize checklist items are completed with evidence for the vLLM serving path.
-- Use $tt-enable-tracing for trace capture, nonblocking replay, async readback, stale inputs, or serving trace correctness.
-- README.md leads with primary single-user vLLM TTFT and decode t/s/u; CI serving-burst metrics are secondary. Workload shapes sit next to every number.
+- vLLM sampling tests, qualitative outputs, primary single-user and CI serving-burst benchmarks pass.
+- Warmed primary single-user TTFT, TPOT, ITL, throughput, and TPOT-derived t/s/u are measured before and after with the same run_vllm_server workload and server config (mode, max-num-seqs, max-model-len, mesh, sampling, TT config).
+- CI serving-burst metrics are measured before and after as capacity evidence, never as headline t/s/u.
+- Keep `max_model_len`, benchmark and eval context at doc/context_contract.json unless a hard physical limit is proven.
+- Keep valid non-aligned prompt-length serving; never trade it for an aligned-only faster path.
+- Repeat the mixed-shape trace reuse check from $vllm-integration after trace or scheduler changes, with supported chunked-prefill paths and mixed-traffic latency, not fixed-shape warmed benchmarks.
+- Optimized vLLM decode is about as fast as optimized full-model traced decode for like work.
+- Async decode: `decode_forward(..., read_from_device=False)` returns device tensors; deferred reads are minimal; `supports_async_decode` is true only when vLLM exercises it. Decode reuses persistent trace inputs with ttnn.execute_trace(..., blocking=False); sync or host reads only after the async boundary, per the plugin contract.
+- sample_on_device_mode=all keeps sampling on device with full-model greedy split sampling: no host argmax, full-logits readback, eager, force-argmax or slow generic sampling. If sampler work dominates decode, fix the generator LM-head/sampling contract, not the adapter.
+- Token, position, RoPE, page-table, cache, and sampler trace inputs are persistent device tensors refreshed only on scheduler-state changes; stale-input tests cover changed token/position and changed/unchanged page tables.
+- No Tracy, tt-perf-report, ReadDeviceProfiler, or live-server/adapter profiling here; use benchmark JSON, sampling, stale-input, async and no-host-fallback evidence.
+- Clean runtime fallback and cleanup: no unnecessary torch/from_torch/to_torch, tilize/untilize, reshard, blocking readback, standalone-cache assumption, or leftover vLLM/EngineCore process.
+- Eval readiness ($vllm-integration eval-readiness-load): sweep 3 max_num_batched_tokens values, serve the largest within the ITL bound; `run_long_context --part timing` and `run_long_answer_load` (32 users, eval profile) pass, or findings are in limitations.json.
+- Batched prefill is optional: record the burst ratio; adopt only with unchanged decode and trace retention and passing batched-equals-solo evidence.
+- optimized_vllm README/work_log record commands, before/after single-user and CI burst metrics, full-model comparison, eval forecast, trace/async decisions, rejected options, limitations, artifacts.
+- Relevant $optimize checklist items have serving-path evidence.
+- Use $tt-enable-tracing for trace capture, nonblocking replay, async readback, stale inputs and serving trace correctness.
+- README.md leads with primary single-user vLLM TTFT and decode t/s/u; CI burst metrics secondary; workload shapes next to every number.
 - $stage-review returns `clean-pass`; findings fixed/rereviewed. Local commit stage-owned touched-repo changes; never push; log SHAs.
 
 Unmet requirements, review findings, failed gates: work. Stop only after `$autofix` fails or a plugin change needs authorization.
