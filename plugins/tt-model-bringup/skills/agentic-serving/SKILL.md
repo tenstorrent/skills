@@ -104,7 +104,8 @@ rates explain. It runs on the local machine; no CI is needed.
 | `references` | per suite; see References |
 | `ok_band` | the reference lies inside the score's 95% interval, or the score is above it |
 | `explain_tolerance` | 0.25 (measured wall within ±25% of the explained time) |
-| `stage_budget_hours` | quick 12; agentic 24 (phase 1 up to 12, phase 2 the rest); extended +24 |
+| `stage_budget_hours` | quick 12; agentic 24 (phase 1 up to `phase1_hours`, phase 2 the rest); extended +24 |
+| `phase1_hours` | 12; lower it with a shorter `stage_budget_hours` so phase 2 still runs |
 | `run_timeout_hours` | 12 per run; extended lists target ≈ 10 h |
 | `usage_budget` | the Codex points this stage may use; the runner reads the account at start |
 | `network` | per task `allow_internet` (Terminal-Bench); SWE agent in main's `no-network` mode with `allow_agent_endpoint` |
@@ -131,10 +132,10 @@ phase cannot pass: ask the operator. Record the source next to each score.
 
 ### Phases
 
-- **Phase 1 (`quick`):** `phase1`, scored on main's harness on this machine, within stage hours 0–12
+- **Phase 1 (`quick`):** `phase1`, scored on main's harness on this machine, within stage hours 0 to `phase1_hours`
   (target run < 5 h).
 - **Phase 2 (`agentic`):** `phase2`, the fixed diverse SWE-bench list, same rule. It starts when phase 1
-  passes or at stage hour 12, whichever comes first, and has the rest of the 24 h. Plan both from the start.
+  passes or at `phase1_hours`, whichever comes first, and has the rest of the 24 h. Plan both from the start.
 - A phase **passes** when its score is within `ok_band` of the reference and its wall time is explained.
   Explained hours replay the run on the rates: each model call takes uncached input ÷ prefill rate + output
   tokens ÷ decode rate per user, from the `serving_rates.json` row at the batch covering the requests active
@@ -144,7 +145,7 @@ phase cannot pass: ask the operator. Record the source next to each score.
 - **A mode is done when all its phases pass**: release ready for that mode.
 - **Not passed yet:** a phase whose time ends below its band or with unexplained time is a result. Keep its
   score, interval, reference and per-task analysis as they are, record the reason, and move on; never
-  discard it or call it failing. If phase 2 started after hour 12, REPORT.md says so plainly: the setup or
+  discard it or call it failing. If phase 2 started after `phase1_hours`, REPORT.md says so plainly: the setup or
   the text was not tested right. Phase timing is reported, not gated.
 - **Extended (+24 h, after agentic passes):** estimate each full suite (198, 500, 89) from the phase runs'
   tokens per task, the rates and the measured tail; do speed work by the Measurement method; then run per
