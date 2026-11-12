@@ -11,6 +11,94 @@ from benchmark_stage.responses import read_jsonl, scoring_response
 from benchmark_stage.subsets import digest, flatten
 
 
+def recorded_chat_class(base, *, shared, groups, membership, samples, paths):
+    """lm-eval chat backend that records raw responses and, for a shared pass, links them to documents."""
+    active_request = ContextVar('benchmark_request', default=None)
+
+    class RecordedChat(base):
+        def generate_until(self, requests, **kwargs):
+            if shared:
+                # Upstream processes different generation-kwargs groups serially.
+                # Require one exact group before sending any request; nested dicts
+                # must match by value, not merely by the Collator's grouping hash.
+                if len({digest(req.args[1]) for req in requests}) != 1:
+                    raise ValueError('shared accuracy requires identical effective generation kwargs')
+                # Identical prompts are legitimate (TriviaQA rc.nocontext repeats
+                # questions across documents). Identity is the frozen document
+                # instance; identical requests queue in order and each API call
+                # consumes one instance.
+                self.request_metadata = {}
+                instances = set()
+                for req in requests:
+                    if req.repeats != 1:
+                        raise ValueError('shared accuracy requires one repeat per frozen document')
+                    group = membership[req.task_name]
+                    key = digest([req.args[0], req.args[1]])
+                    doc_id = samples[req.task_name][req.doc_id]
+                    instance = digest([req.task_name, doc_id, key])
+                    if instance in instances:
+                        raise ValueError('shared accuracy requires unique frozen document instances')
+                    instances.add(instance)
+                    self.request_metadata.setdefault(key, []).append({
+                        'request_sha256': key, 'request_instance_sha256': instance,
+                        'group': group, 'task': req.task_name, 'doc_id': doc_id,
+                    })
+            outputs = super().generate_until(requests, **kwargs)
+            if shared and any(self.request_metadata.values()):
+                raise RuntimeError('unconsumed frozen document instances after the shared pass')
+            return outputs
+
+        def _claim(self, key):
+            if not self.request_metadata.get(key):
+                raise RuntimeError('API request has no remaining frozen document instance')
+            return self.request_metadata[key].pop(0)
+
+        def model_call(self, messages, *, generate=True, gen_kwargs=None, **kwargs):
+            # Concurrency 1: upstream calls model_call synchronously and parses
+            # the generations after it returns, outside any request context.
+            if shared:
+                if not isinstance(messages, (list, tuple)) or len(messages) != 1:
+                    raise ValueError('shared accuracy requires one chat request per API call')
+                self.sync_request = self._claim(digest([messages[0], gen_kwargs]))
+            return super().model_call(messages, generate=generate, gen_kwargs=gen_kwargs, **kwargs)
+
+        async def amodel_call(self, *args, cache_keys=None, **kwargs):
+            token = None
+            if shared:
+                if not cache_keys or len(cache_keys) != 1:
+                    raise ValueError('shared accuracy requires one chat request per API call')
+                token = active_request.set(self._claim(digest(cache_keys[0])))
+            try:
+                return await super().amodel_call(*args, cache_keys=cache_keys, **kwargs)
+            finally:
+                if token is not None:
+                    active_request.reset(token)
+
+        def parse_generations(self, outputs, **kwargs):
+            rows = outputs if isinstance(outputs, list) else [outputs]
+            if shared:
+                metadata = active_request.get()
+                if metadata is None:
+                    metadata, self.sync_request = getattr(self, 'sync_request', None), None
+                if metadata is None:
+                    raise RuntimeError('API response has no frozen document instance')
+                group = metadata['group']
+            else:
+                group = groups[0]
+            with (paths[group] / 'responses.jsonl').open('a') as f:
+                for row in rows:
+                    f.write(json.dumps(row, ensure_ascii=False) + '\n')
+            if shared:
+                with (paths[group] / 'request_links.jsonl').open('a') as f:
+                    for row in rows:
+                        response_id = row.get('id') if isinstance(row, dict) else None
+                        f.write(json.dumps({**metadata, 'response_id': response_id}) + '\n')
+            normalized = [scoring_response(row)[0] for row in rows]
+            return super().parse_generations(normalized if isinstance(outputs, list) else normalized[0], **kwargs)
+
+    return RecordedChat
+
+
 def evaluate(*, model, base_url, manifest_path, group, output, generation=None, concurrency=32):
     return evaluate_groups(model=model, base_url=base_url, manifest_path=manifest_path,
                            groups=[group], output=output, generation=generation, shared=False,
@@ -59,73 +147,8 @@ def evaluate_groups(*, model, base_url, manifest_path, groups, output, generatio
     paths = {group: output / group if shared else output for group in groups}
     for path in paths.values():
         path.mkdir(parents=True, exist_ok=False)
-    active_request = ContextVar('benchmark_request', default=None)
-
-    class RecordedChat(LocalChatCompletion):
-        def generate_until(self, requests, **kwargs):
-            if shared:
-                # Upstream processes different generation-kwargs groups serially.
-                # Require one exact group before sending any request; nested dicts
-                # must match by value, not merely by the Collator's grouping hash.
-                if len({digest(req.args[1]) for req in requests}) != 1:
-                    raise ValueError('shared accuracy requires identical effective generation kwargs')
-                # Identical prompts are legitimate (TriviaQA rc.nocontext repeats
-                # questions across documents). Identity is the frozen document
-                # instance; identical requests queue in order and each API call
-                # consumes one instance.
-                self.request_metadata = {}
-                instances = set()
-                for req in requests:
-                    if req.repeats != 1:
-                        raise ValueError('shared accuracy requires one repeat per frozen document')
-                    group = membership[req.task_name]
-                    key = digest([req.args[0], req.args[1]])
-                    doc_id = samples[req.task_name][req.doc_id]
-                    instance = digest([req.task_name, doc_id, key])
-                    if instance in instances:
-                        raise ValueError('shared accuracy requires unique frozen document instances')
-                    instances.add(instance)
-                    self.request_metadata.setdefault(key, []).append({
-                        'request_sha256': key, 'request_instance_sha256': instance,
-                        'group': group, 'task': req.task_name, 'doc_id': doc_id,
-                    })
-            outputs = super().generate_until(requests, **kwargs)
-            if shared and any(self.request_metadata.values()):
-                raise RuntimeError('unconsumed frozen document instances after the shared pass')
-            return outputs
-
-        async def amodel_call(self, *args, cache_keys=None, **kwargs):
-            token = None
-            if shared:
-                if not cache_keys or len(cache_keys) != 1:
-                    raise ValueError('shared accuracy requires one chat request per API call')
-                key = digest(cache_keys[0])
-                if not self.request_metadata.get(key):
-                    raise RuntimeError('API request has no remaining frozen document instance')
-                token = active_request.set(self.request_metadata[key].pop(0))
-            try:
-                return await super().amodel_call(*args, cache_keys=cache_keys, **kwargs)
-            finally:
-                if token is not None:
-                    active_request.reset(token)
-
-        def parse_generations(self, outputs, **kwargs):
-            rows = outputs if isinstance(outputs, list) else [outputs]
-            if shared:
-                metadata = active_request.get()
-                group = metadata['group']
-            else:
-                group = groups[0]
-            with (paths[group] / 'responses.jsonl').open('a') as f:
-                for row in rows:
-                    f.write(json.dumps(row, ensure_ascii=False) + '\n')
-            if shared:
-                with (paths[group] / 'request_links.jsonl').open('a') as f:
-                    for row in rows:
-                        response_id = row.get('id') if isinstance(row, dict) else None
-                        f.write(json.dumps({**metadata, 'response_id': response_id}) + '\n')
-            normalized = [scoring_response(row)[0] for row in rows]
-            return super().parse_generations(normalized if isinstance(outputs, list) else normalized[0], **kwargs)
+    RecordedChat = recorded_chat_class(LocalChatCompletion, shared=shared, groups=groups,
+                                       membership=membership, samples=samples, paths=paths)
 
     # Long reasoning answers can exceed 15 minutes. The parent runner enforces
     # the complete stage's deadline, including queued and in-flight requests.

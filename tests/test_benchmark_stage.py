@@ -1168,3 +1168,56 @@ def test_clean_evidence_exits_zero(tmp_path):
     result = subprocess.run([sys.executable, '-m', 'benchmark_stage.check', '--model-dir', str(root), '--hf-model', 'org/model'],
                             capture_output=True, text=True, env=dict(os.environ, PYTHONPATH=str(RUNTIME)))
     assert result.returncode == 0, result.stdout
+
+
+def _fake_lm_eval_base():
+    """Mimics lm-eval TemplateAPI: concurrency 1 calls model_call then parse_generations; >1 uses amodel_call."""
+    import asyncio
+    import copy
+
+    class Base:
+        def __init__(self, concurrent):
+            self.concurrent = concurrent
+
+        def response(self, i):
+            return {'id': f'r{i}', 'choices': [{'index': 0, 'message': {'content': f'answer {i}'}, 'finish_reason': 'stop'}]}
+
+        def model_call(self, messages, *, generate=True, gen_kwargs=None, **kwargs):
+            return self.response(len(self.out))
+
+        async def amodel_call(self, *args, cache_keys=None, **kwargs):
+            return self.parse_generations(self.response(len(self.out)))
+
+        def parse_generations(self, outputs, **kwargs):
+            rows = outputs if isinstance(outputs, list) else [outputs]
+            return [row['choices'][0]['message']['content'] for row in rows]
+
+        def generate_until(self, requests, **kwargs):
+            self.out = []
+            for req in requests:
+                ctx, gen = req.args
+                if self.concurrent <= 1:
+                    raw = self.model_call((ctx,), generate=True, gen_kwargs=copy.deepcopy(gen))
+                    self.out += self.parse_generations(outputs=raw, contexts=(ctx,))
+                else:
+                    self.out += asyncio.run(self.amodel_call(cache_keys=[(ctx, gen)]))
+            return self.out
+
+    return Base
+
+
+@pytest.mark.parametrize('concurrency', [1, 4])
+def test_shared_accuracy_links_responses_at_any_concurrency(tmp_path, concurrency):
+    from types import SimpleNamespace
+    from benchmark_stage.evaluate import recorded_chat_class
+    paths = {'g1': tmp_path / 'g1', 'g2': tmp_path / 'g2'}
+    for path in paths.values():
+        path.mkdir()
+    gen = {'max_gen_toks': 16, 'until': []}
+    requests = [SimpleNamespace(args=('q0', gen), repeats=1, task_name='t1', doc_id=0),
+                SimpleNamespace(args=('q1', gen), repeats=1, task_name='t2', doc_id=0)]
+    cls = recorded_chat_class(_fake_lm_eval_base(), shared=True, groups=['g1', 'g2'],
+                              membership={'t1': 'g1', 't2': 'g2'}, samples={'t1': [5], 't2': [7]}, paths=paths)
+    assert cls(concurrency).generate_until(requests) == ['answer 0', 'answer 1']
+    links = [json.loads((paths[g] / 'request_links.jsonl').read_text()) for g in ('g1', 'g2')]
+    assert [(link['task'], link['doc_id'], link['response_id']) for link in links] == [('t1', 5, 'r0'), ('t2', 7, 'r1')]
