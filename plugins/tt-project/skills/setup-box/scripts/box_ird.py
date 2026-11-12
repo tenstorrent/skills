@@ -458,10 +458,16 @@ class Interrupted(Exception):
 @contextlib.contextmanager
 def interruptible():
     """SIGTERM and SIGHUP raise Interrupted (as Ctrl-C raises KeyboardInterrupt), so the reserve
-    can clean up whatever landed before it exits."""
+    can clean up whatever landed before it exits. The first signal starts that cleanup and later
+    ones are ignored: a TERM to the caller's process group reaches this process twice when GNU
+    timeout runs it (directly, then forwarded by timeout), and a repeat must not cut the cleanup off
+    before it has claimed what landed."""
     def raise_(signum, _frame):
+        for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(s, signal.SIG_IGN)
         raise Interrupted(signal.Signals(signum).name)
     old = {s: signal.signal(s, raise_) for s in (signal.SIGTERM, signal.SIGHUP)}
+    old[signal.SIGINT] = signal.getsignal(signal.SIGINT)
     try:
         yield
     finally:

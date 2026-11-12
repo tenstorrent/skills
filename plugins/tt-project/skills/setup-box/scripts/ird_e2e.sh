@@ -60,9 +60,16 @@ say() { printf '%s\n' "$*"; }
 note() { NOTES+=("$*"); say "$*"; }
 fail() { RESULT="FAIL at $STEP: $*"; exit 1; }
 # A hung ssh or box.py call ends at its limit (GNU timeout, kept in the run's process group so ^C and
-# the trap still reach it); without timeout (stock macOS) a call runs unbounded.
-if timeout --foreground 5 true 2>/dev/null; then lim() { timeout --foreground -k 10 "$@"; }; else lim() { shift; "$@"; }; fi
-box() { lim 900 python3 "$BOX_PY" --site "$SITE" "$@"; }
+# the trap still reach it); without timeout (stock macOS) a call runs unbounded. box.py gets no -k:
+# timeout arms its kill also when ^C or TERM reaches timeout itself, and that kill would cut off the
+# cleanup box.py then runs (claim and release what an interrupted reserve left, each ssh call bounded
+# by box.py's own timeout), leaving a reservation without this run's claim that the trap must skip.
+if timeout --foreground 5 true 2>/dev/null; then
+  lim() { timeout --foreground -k 10 "$@"; }; lim_box() { timeout --foreground "$@"; }
+else
+  lim() { shift; "$@"; }; lim_box() { shift; "$@"; }
+fi
+box() { lim_box 900 python3 "$BOX_PY" --site "$SITE" "$@"; }
 q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 SSH_CFG="$RUN_DIR/ssh_config"
 export TTP_SSH_CONFIG="$SSH_CFG"  # box.py runs its ssh with -F "$TTP_SSH_CONFIG"
