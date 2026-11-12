@@ -41,6 +41,21 @@ Every quality verdict needs a control rendered with the same prompt format:
 - If HF fails the same prompt in the same way, record that as a model/control behavior, not a TT serving bug.
 - If TT output is materially worse than the HF or previous-stage control, treat it as stage work: token feedback, cache/position handling, sampling, trace replay, dtype/fidelity, or adapter state are common causes.
 
+## HF Control Before Chasing A Failure
+
+Before debugging a qualitative or shared-suite failure (loops, greedy output that never reaches end-of-sequence, a failed sampled content check, a failed probe content check), run the original HF model the same way:
+
+1. Use the model card's sampling settings (temperature, top-p, top-k, thinking mode) for both HF and TT. Use the same prompts, chat template and token limits.
+2. Run at least 10 matched seeds per prompt on each side.
+3. Compare blind: score the outputs with the labels hidden (a script or a subagent that does not know which side is which), using the same rubric for both.
+4. Fix the failure rule before looking at results and record it, for example: "TT fails if its failure rate exceeds HF's by more than 20 percentage points over the matched seeds."
+
+If HF behaves the same way within that margin, the behaviour is a known limitation of the model, not a TT bug. Record it in the stage `work_log.md` with the prompts, seeds, both failure rates and the artifact paths. If a probe check is involved, also add an item to `doc/eval_readiness/limitations.json` with `original_model: "same"` and the evidence paths. Then continue with the stage.
+
+If TT is worse than HF by more than the margin, treat it as stage work (see Controls).
+
+Never use "greedy output must reach end-of-sequence" as a gate. Many models loop or run to the token cap under greedy decoding in HF too.
+
 ## Artifacts
 
 Leave small, inspectable artifacts under the stage evidence directory:
