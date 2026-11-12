@@ -179,12 +179,19 @@ def check_rates(model_dir: Path, evidence: dict, problems: list, full: bool) -> 
     workload = evidence.get("workload") or {}
     lengths = {4096, *(workload.get(key) for key in ("typical_context_tokens", "working_set_tokens")
                        if positive_int(workload.get(key)))}
+    # A row the budget left unmeasured, listed with a reason, is advisory: stage 12 reads what exists.
+    missing = {(row.get("batch"), row.get("input_tokens")) for row in rates.get("missing_rows") or []
+               if isinstance(row, dict) and row.get("reason")}
     for batch in validated:
         measured = {row.get("input_tokens") for row in rows if row.get("batch") == batch}
+        listed = {length for b, length in missing if b == batch}
         for length in sorted(lengths - measured):
-            problems.append((2, f"serving_rates.json batch {batch} lacks input length {length}"))
+            level = 1 if length in listed else 2
+            problems.append((level, f"serving_rates.json batch {batch} lacks input length {length}"))
         if not any(positive_int(length) and length >= LONG_CONTEXT_TOKENS for length in measured):
-            problems.append((2, f"serving_rates.json batch {batch} lacks a long-context row (>= {LONG_CONTEXT_TOKENS})"))
+            level = 1 if any(positive_int(n) and n >= LONG_CONTEXT_TOKENS for n in listed) else 2
+            problems.append((level, f"serving_rates.json batch {batch} lacks a long-context row "
+                                    f"(>= {LONG_CONTEXT_TOKENS})"))
     for row in rows:
         name = f"batch {row.get('batch')} input {row.get('input_tokens')}"
         predicted = row.get("predicted") or {}

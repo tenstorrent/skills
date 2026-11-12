@@ -346,6 +346,17 @@ def test_stage_11_needs_long_context_and_release_rows(tmp_path):
     assert code == 2 and 'eval route' in stderr
 
 
+def test_stage_11_row_left_by_the_budget_is_advisory_when_listed(tmp_path):
+    data = rates()
+    data['rows'] = [row for row in data['rows'] if not (row['batch'] == BATCHES[0] and row['input_tokens'] == 32768)]
+    assert benchmark(tmp_path, data)[0] == 2
+    data['missing_rows'] = [{'batch': BATCHES[0], 'input_tokens': 32768}]
+    assert benchmark(tmp_path, data)[0] == 2
+    data['missing_rows'][0]['reason'] = 'benchmark_budget_hours ended'
+    code, stderr = benchmark(tmp_path, data)
+    assert code == 1 and 'long-context' in stderr
+
+
 def test_stage_11_row_below_prediction_needs_a_cause(tmp_path):
     data = rates()
     data['rows'][0]['decode_tok_s_user'] = 10.0

@@ -6,13 +6,13 @@ This goal measures the serving rates the agentic-evals stage reads. Use the work
 
 Completion requirements:
 - On the route stage 12 will use, measure warmed vLLM performance for a batch × input-length grid: every validated batch in batch_sizes (default 1, 8, 16, 32, minus any stage 10 could not validate), each with max-num-seqs and request concurrency set to the batch, at input lengths 4096, typical_context_tokens, working_set_tokens and at least 28K, 128 output tokens. Also measure every benchmark row the release spec lists for this model (from its tt-inference-server spec, or the closest model's for a new model; record which).
-- Every row completes. Use distinct prompts, record the prefix-caching setting, and preserve precision, model, hardware and doc/context_contract.json.
+- Every row completes, or is listed in missing_rows when the budget ends. Use distinct prompts, record the prefix-caching setting, and preserve precision, model, hardware and doc/context_contract.json.
 - Write a predicted rate for each row before measuring it, from stage 10's measurements or the roofline accounting. A row slower than its predicted range has a recorded cause.
 - Collect full-phase host wall times with matching prefill FLOPs and decode DRAM bytes for each profile, at asynchronous completion boundaries, without adding device synchronization or the live device profiler.
 - Write doc/benchmark/serving_rates.json: the server config, validated_batches, and per batch and input length prefill_tok_s, decode_tok_s_user, ttft_s and step_ms, with the predicted value beside each.
 - doc/benchmark/run/REPORT.md leads with the grid and the release rows, then predictions against measurements and named gaps. Save identity.json proving the imported module (or model spec), revisions, precision, hardware, commits and launch configuration.
 
-Limits: finish within benchmark_budget_hours from inputs.json (default 3). Main's benchmark client, unchanged.
+Limits: finish within benchmark_budget_hours from inputs.json (default 3). When it ends, list each unmeasured row in serving_rates.json missing_rows (batch, input_tokens, reason) and complete; stage 12 reads what exists. Main's benchmark client, unchanged.
 
 - Run the evidence and context checks. $stage-review returns `clean-pass`; findings fixed/rereviewed. Local commit stage-owned changes; never push; log SHAs. Stop only owned processes and follow reservation ownership.
 

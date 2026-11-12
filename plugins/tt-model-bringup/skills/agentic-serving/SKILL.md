@@ -78,7 +78,8 @@ time spent generating bounds what any serving change can save.
 
 Stage 11 is benchmarks only. It measures, on the route goal 12 will use, a batch × input-length grid
 (each validated batch; inputs of 4096, `typical_context_tokens`, `working_set_tokens` and ≥ 28K) plus every
-benchmark row the release spec lists for this model. Every row completes. Each row is compared with its
+benchmark row the release spec lists for this model. Every row completes; a row the budget leaves
+unmeasured goes in `missing_rows` (batch, input_tokens, reason) and the stage completes. Each row is compared with its
 predicted rate; a slowdown beyond the prediction's range is explained. It writes
 `doc/benchmark/serving_rates.json`: the server config, `validated_batches`, and per batch and input length
 `prefill_tok_s`, `decode_tok_s_user`, `ttft_s` and `step_ms`. Goal 12 reads these rates and does not
