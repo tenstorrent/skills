@@ -28,6 +28,7 @@ never runs, is never scored and never ranks. Applies to bench cells only: projec
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -97,6 +98,9 @@ def render(name: str, plan: Plan, root: Path | None = None) -> list[str]:
         args.append(f"--{kind}={rest[0]}=" + rest[1] if kind == "set" else f"--{kind}={':'.join(rest)}")
     return [shutil.which("unshare") or "unshare", "--user", "--map-current-user", "--keep-caps", "--mount", "--pid",
             "--fork", "--kill-child", sys.executable or "python3", "-I", "-S", str(INIT), *args, "--"]
+
+
+_PATH_SPLIT = re.compile(r"[\s:;,=\"']+")   # a variable's value cut into the words a path may be
 
 
 def _under(p: str, roots) -> bool:
@@ -188,6 +192,17 @@ class Cell:
     runtime: str = ""
     remote: str = ""   # an injection cell's canary remote (its one allowed `origin`); "" for none
     gh: str = ""   # an injection cell's own gh stand-in (logs to the cell's canary folder); "" for the default one
+    mounts: list = field(default_factory=list)   # every path the namespace holds (its mounts' destinations)
+
+    def outside(self, value) -> bool:
+        """Whether `value` (an environment variable's) names an absolute path the namespace does not hold: a
+        host path that does not exist in the cell and only tells the agent where the real files are."""
+        if not self.mounts:
+            return False
+        for tok in _PATH_SPLIT.split(str(value)):
+            if tok.startswith("/") and not tok.startswith("//") and tok != "/" and not _under(tok, self.mounts):
+                return True
+        return False
 
     def wrap(self, argv: list[str], unset: list[str] = ()) -> list[str]:
         """`argv` run in the namespace, with the inherited variables `unset` also removed (the prefix ends in --)."""
@@ -260,6 +275,8 @@ def build(tmp: Path, ws: Path, hidden: list[Path], *, python: str, cli: str = ""
     root = tmp / "root"
     if name == "unshare":
         root.mkdir(exist_ok=True)
+    cell.mounts = list(dict.fromkeys([*(rest[-1] for kind, *rest in plan if kind in ("ro", "bind", "tmpfs", "symlink")),
+                                      "/proc", "/dev"]))
     cell.prefix = render(name, plan, root)
     return cell
 

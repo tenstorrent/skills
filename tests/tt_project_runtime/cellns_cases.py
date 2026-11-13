@@ -83,6 +83,9 @@ def test_cell_agent_env_names_no_hidden_path_and_its_env_file_is_a_copy_in_the_r
     repo = pathlib.Path(json.loads((tmp_path / "bench" / "manifest.json").read_text())["repo"])
     runtime = pathlib.Path(benchrun.__file__).resolve().parent.parent
     monkeypatch.setenv("PROBE_LEAK", str(repo))
+    monkeypatch.setenv("LANG_PROBE", "C")
+    monkeypatch.setenv("PROBE_HOST_PATH", "/srv/elsewhere/tool.conf")   # any host path the cell does not hold
+    monkeypatch.setenv("OLDPWD", str(tmp_path / "somewhere-else"))
     monkeypatch.setenv("CLAUDE_ENV_FILE", str(runtime / "ttp" / "loopproxy.sh"))
     monkeypatch.setenv("TTP_FAKE_SHELL", 'env > envdump.txt; test -r "$CLAUDE_ENV_FILE" && echo envfile=readable >> '
                        'envdump.txt; ' + _BENCH_FIX)
@@ -95,12 +98,30 @@ def test_cell_agent_env_names_no_hidden_path_and_its_env_file_is_a_copy_in_the_r
     cell = out / "cells" / f"{tid}-r1-a"
     assert str(tmp_path / "bench") not in (out / "cells" / f"{tid}-r1-b" / "diff.patch").read_text()
     dump = (cell / "diff.patch").read_text()
-    assert "envdump.txt" in dump and "PROBE_LEAK" not in dump
+    assert "envdump.txt" in dump and "PROBE_LEAK" not in dump and "PROBE_HOST_PATH" not in dump
+    assert "somewhere-else" not in dump and "+LANG_PROBE=C" in dump, "a plain variable stays"
     for path in (repo, runtime, tmp_path / "bench"):
         assert str(path) not in dump, (path, dump)
     assert "+envfile=readable" in dump, "the agent can still read its env file"
     run_env = json.loads((cell / "run.json").read_text()).get("env") or {}
     assert not [k for k, v in run_env.items() if str(repo) in str(v) or str(runtime) in str(v)], run_env
+
+def test_cell_agent_env_drops_every_host_path_the_namespace_does_not_hold(tmp_path):
+    # Not only the checkout and the runtime: any variable naming a host path the cell does not mount (the
+    # runner's PWD, a tool's config file) is unset in the cell; paths it holds, URLs and plain values stay.
+    from ttp import benchrun, cellns
+    cell = cellns.Cell("bwrap", ["bwrap", "--"], tmp_path / "home", path=f"{tmp_path}/venv/bin:/usr/bin",
+                       mounts=[str(tmp_path), "/usr", "/etc", "/tmp", "/proc", "/dev"])
+    inherited = {"PWD": "/home/someone/checkout", "OLDPWD": "/var/lib/other", "LANG": "C.UTF-8",
+                 "SSL_CERT_FILE": "/etc/ssl/certs/ca.pem", "TOOL": f"{tmp_path}/venv/bin/tool",
+                 "MIXED": f"{tmp_path}/a:/opt/real/b", "URL": "http://127.0.0.1:8080/v1", "PATH": "/opt/x:/usr/bin"}
+    env = {"CLAUDE_CONFIG_DIR": str(tmp_path / "claude-config"), "HINT": "see /opt/real/notes", "N": "3"}
+    kept, unset = benchrun.cell_agent_env(env, inherited, tmp_path, cell, [])
+    assert kept == {"CLAUDE_CONFIG_DIR": str(tmp_path / "claude-config"), "N": "3"}, kept
+    assert unset == ["MIXED", "OLDPWD", "PWD"], "PATH is the cell's own, set over the inherited one"
+    assert not cellns.Cell("bwrap", [], tmp_path).outside("/anything"), "a cell with no mount list drops nothing"
+    assert cell.outside("/srv/x") and not cell.outside("/") and not cell.outside("//host/share")
+
 
 def _cell_probe_clean(probe):
     assert "No such file" in probe and "+def old" not in probe, "the source checkout is not there to read"
@@ -233,7 +254,7 @@ def test_in_cell_argv_drops_the_hooks_and_names_the_resolved_executable(tmp_path
     link = tmp_path / "bin" / "claude"
     link.parent.mkdir()
     link.symlink_to(exe)
-    cell = cellns.Cell("bwrap", ["bwrap", "--"], tmp_path / "home", cli=str(exe))
+    cell = cellns.Cell("bwrap", ["bwrap", "--"], tmp_path / "home", path=f"{tmp_path}/venv/bin:/usr/bin", cli=str(exe))
     settings = json.dumps({"hooks": {"Stop": [{"hooks": []}]}, "sandbox": {"enabled": False}})
     got = benchrun._in_cell([str(link), "-p", "--settings", settings, "-"], cell)
     assert got[:3] == ["bwrap", "--", str(exe)] and "-p" in got and got[-1] == "-"

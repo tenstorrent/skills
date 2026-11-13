@@ -490,7 +490,9 @@ def _in_cell(argv: list[str], cell, unset: list[str] = ()) -> list[str]:
 def cell_agent_env(env: dict, inherited: dict, run: Path, cell, hidden: list[Path]) -> tuple[dict, list[str]]:
     """The variables `env` adds to a cell's agent, and the names of `inherited` (the runner's own environment) the
     namespace unsets, so no variable the agent can print names a hidden path or the runtime (paths that do not
-    exist in its namespace, and point at the answer's source). CLAUDE_ENV_FILE (loopproxy.sh, which lives in the
+    exist in its namespace, and point at the answer's source), nor any other host path the namespace does not
+    hold (the runner's PWD, OLDPWD, a tool's config file: absent in the cell, they only tell where the real
+    files are; cellns.Cell.outside). CLAUDE_ENV_FILE (loopproxy.sh, which lives in the
     runtime) names a copy in the cell's run folder instead, with nothing chained after it."""
     from . import loopproxy
     env = dict(env)
@@ -503,8 +505,8 @@ def cell_agent_env(env: dict, inherited: dict, run: Path, cell, hidden: list[Pat
              for f in _forms(p)]
     sets = cell.sets()
 
-    def names(v) -> bool:
-        return any(f in str(v) for f in forms)
+    def names(v) -> bool:   # a hidden path or the runtime, or any host path the namespace does not hold
+        return any(f in str(v) for f in forms) or cell.outside(v)
     kept = {k: v for k, v in env.items() if k in sets or not names(v)}
     return kept, sorted(k for k, v in inherited.items() if k not in kept and k not in sets and names(v))
 
