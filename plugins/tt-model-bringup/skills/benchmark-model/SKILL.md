@@ -37,6 +37,16 @@ the server config, `validated_batches`, `rows` (per batch and `input_tokens`: `p
 range), `release_rows` with `route: "eval"`, and `release_source`. Goal 12 reads these rates and
 does not re-measure them; `check_agentic_serving.py --stage benchmark` gates the file.
 
+## Anomaly check for goal 12
+
+A few long sampled generations (about 10 minutes of device time) catch a precision or stack defect before the
+evals. Through the served route, use generic open-ended reasoning prompts (no eval content, no model-specific
+scenario), the chat template with the model's default thinking mode, the sampling settings goal 12's harness
+sends, fixed seeds, and about the output length the evals expect. Run datatype-sweep's Anomalies detector (step 1)
+on each reply. Write `doc/benchmark/anomaly_check.json`: `replies` (per reply `prompt`, `seed`,
+`output_tokens`, `distinct_tail_chars`, `repeated_ngram`, `anomaly`) and `anomalies` (count). This stage does not
+fix anything; goal 12 reads the record.
+
 ## Accuracy (standalone only)
 
 When this skill benchmarks a model outside the pipeline, it may also score fixed lm-eval subsets, as

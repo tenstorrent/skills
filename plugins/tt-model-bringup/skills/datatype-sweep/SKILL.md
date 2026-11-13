@@ -133,7 +133,7 @@ If layer-level decode evidence, reduced token-out evidence, or a prior optimized
 
 A degenerate reply (stray or repeated tokens, collapse into a few characters, a token loop) is a precision
 or stack defect until shown otherwise, not a model answer. Goal 12 runs steps 1–5 on each anomaly and on a
-phase below its band, inside the phase's time; this stage runs step 6 as a guard.
+phase below its band, inside the phase's time.
 
 **Where precision comes from.** The served precision is the config this stage selected:
 `selected_precision_config.json` (this skill's Preferred Outputs; the model's default construction path or
@@ -162,9 +162,6 @@ budget each one). Record the file in the run's `config.precision`.
    config that passes; the next faster ones tried fail. A speed loss for accuracy is accepted.
 5. **Re-measure and rerun.** Restart the server on the chosen config, re-measure only the stage-11 rows the
    eval uses at its batch (into `serving_rates.json`, labelled with the config), then rerun the eval list.
-6. **Guard (this stage):** free-run long replies (a few thousand tokens) on a few agent-shaped prompts at
-   the selected config and at full precision, and check both with the step-1 detector. An anomaly the
-   full-precision run lacks rejects the config.
 
 Goal 12 records each attempt in `results.json` `anomalies`: `phase`, `tasks`, `test` (command), `prompt`
 (file), `seed`, `served` (`precision`, `result`), `full_precision` (`result`, `pass`), the HF/GPU result

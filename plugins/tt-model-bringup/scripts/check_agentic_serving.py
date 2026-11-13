@@ -2,7 +2,8 @@
 """Check agentic-serving evidence for one bringup stage (see the agentic-serving skill).
 
 Stages 06-10: missing evidence is critical; a measured shortfall with a recorded reason is advisory.
-Stage 11 (benchmark): serving_rates.json covers the batch x input-length grid and the release rows.
+Stage 11 (benchmark): serving_rates.json covers the batch x input-length grid and the release rows, and
+anomaly_check.json records the long-generation anomaly check (missing is critical, an anomaly advisory).
 Goal 12 (agentic-evals): each phase of the mode has a collected run with its records and per-task
 analysis (every failed task has a cause; a task cut off by a limit shows a loop or stall, or was rerun
 alone at a higher limit; each recorded rerun has its reasoning setting and result) and no list is voided; those are critical. A
@@ -27,6 +28,7 @@ from pathlib import Path
 EVIDENCE = Path("doc/agentic_serving.json")
 EVALS = Path("doc/agentic_evals")
 RATES = Path("doc/benchmark/serving_rates.json")
+ANOMALY_CHECK = Path("doc/benchmark/anomaly_check.json")
 INPUTS = Path("bringup/agentic_evals/inputs.json")
 MIN_HIT_FRACTION = 0.9
 MODES = {"quick": ("phase1",), "agentic": ("phase1", "phase2"), "extended": ("phase1", "phase2")}
@@ -209,6 +211,7 @@ def check_rates(model_dir: Path, evidence: dict, problems: list, full: bool) -> 
             low = predicted.get("decode_tok_s_user_low", predicted.get("decode_tok_s_user"))
             if row["decode_tok_s_user"] < low and not row.get("cause"):
                 problems.append((2, f"serving_rates.json {name} is below its predicted range with no recorded cause"))
+    check_anomaly_record(model_dir, problems)
     release = rates.get("release_rows")
     if not (isinstance(release, list) and release and rates.get("release_source")):
         problems.append((2, "serving_rates.json needs release_rows and release_source (the spec they came from)"))
@@ -217,6 +220,24 @@ def check_rates(model_dir: Path, evidence: dict, problems: list, full: bool) -> 
             if not (isinstance(row, dict) and row.get("route") == "eval" and number(row.get("decode_tok_s_user"))):
                 problems.append((2, f"release row {row} is not measured on the eval route"))
     return validated
+
+
+def check_anomaly_record(model_dir: Path, problems: list) -> None:
+    """Stage 11's early-warning record: it must exist (critical); an anomaly in it is advisory, stage 12 acts on it."""
+    path = model_dir / ANOMALY_CHECK
+    if not path.is_file():
+        problems.append((2, f"missing {path}; stage 11 records its long-generation anomaly check there"))
+        return
+    record = read(path, problems)
+    replies = [r for r in record.get("replies") or [] if isinstance(r, dict)]
+    if not replies or not all(r.get("prompt") and r.get("seed") is not None and isinstance(r.get("anomaly"), bool)
+                              for r in replies):
+        problems.append((2, "anomaly_check.json needs replies, each with prompt, seed and anomaly (true/false)"))
+        return
+    found = [r for r in replies if r["anomaly"]]
+    if found:
+        problems.append((1, f"anomaly_check.json: {len(found)} of {len(replies)} replies are anomalies; "
+                            "goal 12 starts the anomaly procedure early"))
 
 
 def check_run(run: dict, inputs: dict, validated: list, collected: set, item: str, tasks: int,

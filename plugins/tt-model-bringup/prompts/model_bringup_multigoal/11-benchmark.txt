@@ -9,6 +9,7 @@ Completion requirements:
 - Every row completes, or is listed in missing_rows when the budget ends. Record the prefix-caching setting; precision, model, hardware and doc/context_contract.json are unchanged.
 - Each row has a predicted rate written before it was measured; a row slower than its predicted range has a recorded cause.
 - Each profile has full-phase host wall times with matching prefill FLOPs and decode DRAM bytes, collected without changing the serving path.
+- A few long sampled generations through the served route, at the served model's own sampling defaults and about the output length the evals expect, are checked for anomalies; any anomaly is recorded for stage 12 (doc/benchmark/anomaly_check.json).
 - Write doc/benchmark/serving_rates.json: the server config, validated_batches, and per batch and input length prefill_tok_s, decode_tok_s_user, ttft_s and step_ms, with the predicted value beside each.
 - doc/benchmark/run/REPORT.md leads with the grid and the release rows, then predictions against measurements and named gaps. identity.json proves the imported module (or model spec), revisions, precision, hardware, commits and launch configuration.
 

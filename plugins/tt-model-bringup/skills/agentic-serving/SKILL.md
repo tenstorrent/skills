@@ -47,7 +47,7 @@ in stages 09 and 10:
 Stage 10 also records, without a pass bar, `prefill_by_length` (prefill rate at 4096,
 `typical_context_tokens` and `working_set_tokens`, and decode rate during a long prefill) and
 `host_contention` (decode at the largest batch on an idle host and with every host CPU busy).
-Stage 08 checks precision on long agent prefixes and free-running replies (datatype-sweep, Anomalies), not
+Stage 08 checks precision on long agent prefixes and teacher-forced and natural text (datatype-sweep), not
 only short top-k agreement.
 
 ## Measurement method
@@ -204,7 +204,8 @@ This is iteration on the phase's failing tasks inside its time, never growth of 
 2. A task that hit the agent or request limit or the output cap fails on it only if its trajectory loops
    (`loop_cap`) or stalls (`stalled`). One cut off while progressing is rerun alone at ≥ 2× that limit,
    within `run_timeout_hours`, until it finishes, loops or stalls; that result counts.
-3. Each anomaly, and a phase below its band, gets a fix attempt by $datatype-sweep's Anomalies section
+3. An anomaly recorded in stage 11's `doc/benchmark/anomaly_check.json` starts this procedure early; it is still
+   decided on the real eval replies. Each anomaly, and a phase below its band, gets a fix attempt by $datatype-sweep's Anomalies section
    (reproducible test on the model runner, full precision, bisect, re-measure, rerun), inside the phase's
    time, recorded in `anomalies`. A precision fix is the one allowed precision change; a speed loss is
    accepted.

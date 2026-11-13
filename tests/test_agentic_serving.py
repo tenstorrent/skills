@@ -444,10 +444,31 @@ def test_stage_12_needs_stage_11_rates(tmp_path):
     assert code == 2 and 'serving_rates.json' in stderr
 
 
-def benchmark(model, data):
+def anomaly_record(anomaly=False):
+    return {'replies': [{'prompt': 'p1.txt', 'seed': 1, 'output_tokens': 4000, 'distinct_tail_chars': 60,
+                         'repeated_ngram': False, 'anomaly': anomaly}], 'anomalies': int(anomaly)}
+
+
+def benchmark(model, data, record=anomaly_record()):
     (model / 'doc/benchmark').mkdir(parents=True, exist_ok=True)
     (model / 'doc/benchmark/serving_rates.json').write_text(json.dumps(data))
+    if record is not None:
+        (model / 'doc/benchmark/anomaly_check.json').write_text(json.dumps(record))
     return check(model, 'benchmark', evidence(), {})
+
+
+def test_stage_11_needs_the_anomaly_record(tmp_path):
+    code, stderr = benchmark(tmp_path, rates(), record=None)
+    assert code == 2 and 'anomaly_check.json' in stderr
+
+
+def test_stage_11_anomaly_record_without_replies_is_critical(tmp_path):
+    assert benchmark(tmp_path, rates(), record={'replies': []})[0] == 2
+
+
+def test_stage_11_anomaly_found_is_advisory(tmp_path):
+    code, stderr = benchmark(tmp_path, rates(), record=anomaly_record(True))
+    assert code == 1 and 'anomaly' in stderr
 
 
 def test_stage_11_grid_passes(tmp_path):
