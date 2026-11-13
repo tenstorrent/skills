@@ -5,8 +5,8 @@ Subagents are authorized when a selected skill requests or recommends them.
 This goal shows the served model scores like its reference on agentic evals, at a speed the measured serving rates explain. Read bringup/agentic_evals/inputs.json (mode, suites, list sizes, references, limits); $agentic-serving gives defaults. Run on this machine.
 
 Goal completion requirements:
-- Phase 1: GPQA Diamond, 10 tasks (or inputs phase1), on main's harness, in stage hours 0 to phase1_hours (12). It passes when the score is within ok_band of its reference and measured wall time is within explain_tolerance of the run replayed on doc/benchmark/serving_rates.json rates (skill's explained hours).
-- Phase 2 (agentic and extended modes): SWE-bench Verified, 10 tasks from the skill's fixed diverse list (or inputs phase2), same rule. It starts when phase 1 passes or at phase1_hours, whichever is first, and has the rest of the 24 h.
+- Phase 1: GPQA Diamond, 10 tasks, on main's harness, in stage hours 0 to phase1_hours (12). It passes when the score is within ok_band of its reference and measured wall time is within explain_tolerance of the run replayed on doc/benchmark/serving_rates.json rates (skill's explained hours).
+- Phase 2 (agentic and extended modes): SWE-bench Verified, 10 tasks from the skill's fixed diverse list, same rule. It starts once phase 1 has passed, or is analysed with its fix attempts recorded, and at the latest at phase1_hours; it has the rest of stage_budget_hours.
 - A phase not passed when its time ends is a result: keep and report its score, interval, reference and analysis, "not passed yet" with the reason; never discard it or call it failing.
 - Each run's KV pool and agent count are sized from the device memory measured free at launch, recorded with the run; a smaller pool needs a recorded reason.
 - Before any eval run, a request's body, token counts and finish reason are read back from the server's response log.
@@ -22,4 +22,4 @@ Limits:
 - doc/agentic_evals/REPORT.md leads with each phase passed or not passed yet (why), scores with intervals, settings and limits against the reference's, hours predicted against measured, and the analysis. If phase 2 started after phase1_hours, it says so plainly: the setup or this text was not tested right.
 - $stage-review returns `clean-pass`; findings fixed/rereviewed. Local commit stage-owned changes; never push; log SHAs.
 
-Missing records, missing analysis, uncollected runs, rule breaks, review findings, failed gates: work. A score below its band or an unexplained wall time is reported, not worked on past the phase's time. Ask the operator by marking the goal blocked with the question (e.g. no reference). Stop when each phase has passed or used its time and is recorded, analysed and reported, or after `$autofix` fails.
+Missing records, missing analysis, uncollected runs, rule breaks, review findings, failed gates: work. A score below its band or an unexplained wall time is reported, not worked on past the phase's time. Ask the operator by marking the goal blocked with the question. Stop when each phase has passed or used its time and is recorded, analysed and reported, or after `$autofix` fails.

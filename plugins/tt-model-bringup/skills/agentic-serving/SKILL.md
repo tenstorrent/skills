@@ -143,8 +143,11 @@ phase cannot pass: ask the operator. Record the source next to each score.
 
 - **Phase 1 (`quick`):** `phase1`, scored on main's harness on this machine, within stage hours 0 to `phase1_hours`
   (target run < 5 h).
-- **Phase 2 (`agentic`):** `phase2`, the fixed diverse SWE-bench list, same rule. It starts when phase 1
-  passes or at `phase1_hours`, whichever comes first, and has the rest of the 24 h. Plan both from the start.
+- **Phase 2 (`agentic`):** `phase2`, the fixed diverse SWE-bench list, same rule. It starts once phase 1
+  has passed, or has its list run, every failure analysed and its fix attempts recorded, and at the latest
+  at `phase1_hours`; it has the rest of `stage_budget_hours`. A phase that cannot pass early does not hold
+  the machine to the boundary (v4 Gemma finished GPQA analysis at hour 4.7 and SWE waited until hour 8).
+  Plan both from the start.
 - A phase **passes** when its score is within `ok_band` of the reference and its wall time is explained.
   Explained hours replay the run on the rates: each model call takes uncached input ÷ prefill rate + output
   tokens ÷ decode rate per user on the run's server batch with the requests then in flight, with rates
@@ -179,7 +182,10 @@ the gate is critical without one. Where this leaves a choice, take the fastest p
 per-task time at that batch's per-user rate, plus the tail). Agents never exceed `max_num_seqs`. Start
 from the best-known config in `learned.json` for this model or its closest model; a projection more than
 2× the best-known time for that list size is a config defect, not a size limit.
-Admit a run only when its projection from measured times fits `run_timeout_hours`.
+Phase lists always run: the phase's time bounds them, and a long first estimate is expected for a new
+model. Admit an extended list only when its projection from this run's measured per-task times fits
+`run_timeout_hours`. Record measured tokens and hours per task in `learned.json` (`task_times`) so the next
+model's estimates start from them.
 
 ### Settings
 
@@ -295,7 +301,8 @@ In `doc/agentic_evals/`:
 - `logging_check.json` (before the first run) and `current/<run>/digest/` (`summary.json`, `<task>.json`,
   `<task>.triage.json`).
 - `learned.json`: `best_config` per suite (the config, list size and hours of the best valid run),
-  `harness_facts` and `generic_fixes`, for the next model.
+  `task_times` (per suite and task: tokens and hours measured), `harness_facts` and `generic_fixes`, for the
+  next model.
 - `REPORT.md`: each phase passed or not passed yet (with the reason), scores with intervals, reasoning
   settings and limits against the references', hours predicted against measured, a late phase 2 start if any, the per-task
   analysis, then what remains.
