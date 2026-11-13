@@ -43,7 +43,7 @@ def test_batch_pick_leaves_out_resourced_deep_pinned_and_held(env):
     p = make(env)
     lead, ok = _batch_tasks(p, 2)
     deep = dict(ok, id=900, tier="deep")
-    dev = dict(ok, id=901, labels=json.dumps(["resource:box-device"]))
+    dev = dict(ok, id=901, labels=json.dumps(["resource:box-device"]))   # a resource the lead lacks
     user_deep = dict(ok, id=902, labels=json.dumps(["user_deep"]))
     pinned = dict(ok, id=903, model="other-model")
     own = dict(ok, id=904, branch="ttp/t904")
@@ -56,7 +56,7 @@ def test_batch_pick_leaves_out_resourced_deep_pinned_and_held(env):
     got = batchrun.pick(p, p.config(), lead, [deep, dev, user_deep, pinned, own, fix, work, other_repo,
                                               spent, running, urgent, ok])
     assert [t["id"] for t in got] == [ok["id"]]
-    # A resourced lead takes no batch.
+    # An exclusive lead takes no batch.
     assert batchrun.pick(p, p.config(), dict(lead, labels=json.dumps(["exclusive:box"])), [ok]) == []
     # A task whose files a running task on another branch changes stays out; on the lead's branch it may join.
     (p.root / "pkg").mkdir(exist_ok=True)
@@ -66,6 +66,32 @@ def test_batch_pick_leaves_out_resourced_deep_pinned_and_held(env):
     assert batchrun.pick(p, p.config(), lead, [near], inflight=[busy]) == []
     assert [t["id"] for t in batchrun.pick(p, p.config(), dict(lead, branch="ttp/t911"), [near],
                                            inflight=[busy])] == [910]
+
+
+def test_batch_pick_takes_members_whose_resources_the_lead_holds(env):
+    from ttp import batchrun
+    p = make(env)
+    lead, ok = _batch_tasks(p, 2)
+    lead = dict(lead, labels=json.dumps(["resource:box-a", "resource:box-b", "needs_device"]))
+    subset = dict(ok, id=930, labels=json.dumps(["resource:box-a", "needs_device"]))
+    bare = dict(ok, id=931)
+    more = dict(ok, id=932, labels=json.dumps(["resource:box-a", "resource:box-c"]))
+    excl = dict(ok, id=933, labels=json.dumps(["exclusive:box-a"]))
+    dev_only = dict(ok, id=934, labels=json.dumps(["needs_device"]))
+    got = batchrun.pick(p, p.config(), lead, [subset, bare, more, excl, dev_only])
+    assert {t["id"] for t in got} == {930, 931, 934}
+    # A lead without a device takes no member that needs one.
+    plain = dict(lead, labels=json.dumps(["resource:box-a"]))
+    assert {t["id"] for t in batchrun.pick(p, p.config(), plain, [subset, bare, dev_only])} == {931}
+
+
+def test_batch_prompt_runs_shared_steps_once(env):
+    from ttp import batchrun
+    p = make(env)
+    lead, *rest = _batch_tasks(p, 3)
+    block = batchrun.prompt_block(p, lead, rest, "ttp/t-lead")
+    assert "one focused test gate" in block and "one device smoke" in block
+    assert "send one request carrying every task's commits" in block and "never one request per task" in block
 
 
 def test_batch_pick_orders_related_priority_and_dependency(env):

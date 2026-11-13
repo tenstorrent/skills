@@ -4,11 +4,15 @@
 
 When dispatch starts a code task (the lead), it adds to the same run up to `dispatch.batch_max` other
 ready queued code tasks of the project's repo that are small (pick): light or standard tier, not
-exclusive, no device or machine resource, the lead's provider and model pins or none, not user_deep.
-Tasks naming files the lead's spec names come first (overlap.spec_paths), then by priority; a task
-whose files a running task on another branch holds is left out; a member that depends on another comes
-after it. The lead is whatever dispatch picked first (an urgent one leads): it never waits for a batch
-to fill. An urgent (priority 1) task never joins another's run: it starts in its own, in parallel. Off with `dispatch.batch` false.
+exclusive, the lead's provider and model pins or none, not user_deep. A member's device and machine
+resources must all be among the lead's (fits): the run works under the lead's resources, which the
+worker locks per command; an exclusive task neither joins nor leads a batch. Tasks naming files the
+lead's spec names come first (overlap.spec_paths), then by priority; a task whose files a running task
+on another branch holds is left out; a member that depends on another comes after it. The lead is
+whatever dispatch picked first (an urgent one leads): it never waits for a batch to fill. An urgent
+(priority 1) task never joins another's run: it starts in its own, in parallel. A batch runs its shared steps once, after every member's commit: one focused test
+gate, one device smoke and, where it delivers outside the push queue, one landing request (a PR or a
+push request) carrying every member's commits (prompt_block). Off with `dispatch.batch` false.
 
 The batch shares the lead's worktree and branch (each member's record carries it), and the worker
 prompt lists every member (prompt_block). The worker commits each member separately with a
@@ -123,9 +127,19 @@ def _repo(t: dict) -> str:
     return next((lb[7:] for lb in _labels(t) if lb.startswith("pr_fix:")), "")
 
 
-def _resourced(t: dict) -> bool:
-    return any(lb.split(":", 1)[0] in ("resource", "exclusive") or lb in ("needs_device", "exclusive")
-               for lb in _labels(t))
+def _exclusive(t: dict) -> bool:
+    return any(lb == "exclusive" or lb.startswith("exclusive:") for lb in _labels(t))
+
+
+def _resources(t: dict) -> set[str]:
+    """The device and machine resources `t` holds (`resource:`, `exclusive:`), plus `needs_device`."""
+    out = {lb.split(":", 1)[1] for lb in _labels(t) if lb.split(":", 1)[0] in ("resource", "exclusive")}
+    return out | ({"needs_device"} if "needs_device" in _labels(t) else set())
+
+
+def fits(lead: dict, t: dict) -> bool:
+    """`t` may run under `lead`'s resources: it is not exclusive and holds none the lead lacks."""
+    return not _exclusive(t) and _resources(t) <= _resources(lead)
 
 
 def own_branch(t: dict, recorded: bool = True) -> bool:
@@ -138,11 +152,12 @@ def own_branch(t: dict, recorded: bool = True) -> bool:
 
 
 def eligible(lead: dict, t: dict) -> bool:
-    """`t` may join `lead`'s batch: a queued small code task of its repo with the same pins or none."""
+    """`t` may join `lead`'s batch: a queued small code task of its repo with the same pins or none, run
+    under the lead's resources."""
     from .effort import USER_DEEP
     if t["id"] == lead["id"] or t.get("kind") != "code" or t.get("status") != "queued":
         return False
-    if t.get("tier") not in SMALL or _resourced(t) or USER_DEEP in _labels(t) or _repo(t) != _repo(lead):
+    if t.get("tier") not in SMALL or not fits(lead, t) or USER_DEEP in _labels(t) or _repo(t) != _repo(lead):
         return False
     if own_branch(t):
         return False
@@ -165,7 +180,7 @@ def pick(p, cfg: dict, lead: dict, ready: list[dict], inflight: list[dict] | Non
     """The members to add to `lead`'s run, in the order the worker takes them: related tasks (sharing
     a path the lead's spec names) first, then by priority and id; a member after any member it depends
     on. `inflight`: running tasks on other branches, whose spec paths keep a candidate out."""
-    if not enabled(cfg) or lead.get("kind") != "code" or _resourced(lead) or own_branch(lead, recorded=False):
+    if not enabled(cfg) or lead.get("kind") != "code" or _exclusive(lead) or own_branch(lead, recorded=False):
         return []
     n = batch_max(cfg)
     if n <= 0:
@@ -435,7 +450,13 @@ def prompt_block(p, lead: dict, members: list[dict], branch: str) -> str:
              "`on_pass`: [{\"id\": <id>, \"status\": \"done\"|\"failed\"|\"blocked\", \"summary\": \"...\", "
              "\"reason\": \"why, if not done\", \"followups\": [...]}]. Your own `status` is the lead's. "
              "One check run and one review cover the whole branch: its head, every member's commit. A member "
-             "counts as landed only once its own commit is on the push branch."]
+             "counts as landed only once its own commit is on the push branch.",
+             "",
+             "Shared steps run once for the whole batch, after every task's commits are in: one focused test "
+             "gate (the tests the tasks touch, together), one device smoke if any task needs a device, never "
+             "one per task. Where the batch delivers outside the push queue (a PR, or a push request through "
+             "a relay or workstation queue), send one request carrying every task's commits and list each "
+             "task's `Task: #<id>` in it, never one request per task."]
     for m in members:
         try:
             ctx = ctxblock.prompt_block(p, dict(m))

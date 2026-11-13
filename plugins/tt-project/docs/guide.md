@@ -1906,14 +1906,19 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
 - Batch runs: a worker that starts a code task also takes up to `dispatch.batch_max` (5) other small
   ready code tasks in the same run, on the same worktree and branch, so related small changes do not
   each need their own worker and branch. A task joins only when it is queued, of the same repo, light
-  or standard tier, not exclusive, holds no device or machine resource, has the lead's provider and
-  model pins or none, was not set to deep by the user, has no branch of its own and has budget left.
-  Tasks naming files the lead's spec names come first, then by priority; one whose files a task on
-  another branch is changing stays out; one that depends on another member comes after it. Whatever
-  dispatch picks first leads, so an urgent task never waits for a batch to fill, and an urgent task
-  never joins another's run: it starts in a worker of its own, in parallel. The worker commits
-  each task separately with a `Task: #<id>` trailer and hands off one outcome per task (`members` in
-  result.json); the batch's one review and one checks run cover the branch, its head with every
+  or standard tier, not exclusive, needs no device or machine resource the lead does not hold (the run
+  works under the lead's resources, locked per command), has the lead's provider and model pins or
+  none, was not set to deep by the user, has no branch of its own and has budget left. An exclusive
+  task neither joins nor leads a batch. Tasks naming files the lead's spec names come first, then by
+  priority; one whose files a task on another branch is changing stays out; one that depends on
+  another member comes after it. Whatever dispatch picks first leads, so an urgent task never waits
+  for a batch to fill, and an urgent task never joins another's run: it starts in a worker of its
+  own, in parallel. So a project landing many related device-bound changes lands them as a few
+  batches, not one by one. The worker commits each task separately with a `Task: #<id>`
+  trailer and hands off one outcome per task (`members` in result.json); shared steps run once for
+  the batch, after every member's commit: one focused test gate, one device smoke, and, where the
+  batch delivers outside the push queue (a PR or a push request), one request carrying every
+  member's commits. The batch's one review and one checks run cover the branch, its head with every
   member's commit. A member counts as landed only once its own commit is on the push branch: one the
   approved head left out stays not landed (`ttp landed` says so) and gets a review of its own. Once the lead ends, a
   member done in the run is done on the lead's branch, a blocked one is blocked with its reason, and
