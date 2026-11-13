@@ -253,7 +253,8 @@ def record(scores: dict[str, tuple[float, bool, str]], now: float, source: str) 
         return
     d = home()
     d.mkdir(parents=True, exist_ok=True)
-    with open(d / MODELS_LOCK, "a") as lk:   # a bench, a suite or its arms may book at once: none loses a model
+    # a bench, a suite or its arms may book at once: none loses a model
+    with open(d / MODELS_LOCK, "a") as lk:
         fcntl.flock(lk, fcntl.LOCK_EX)
         seen = models()
         for m, (score, weak, arm) in scores.items():
