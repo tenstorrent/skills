@@ -30,6 +30,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -327,29 +328,77 @@ def seal(dest: Path) -> str:
     return _out(dest, "rev-parse", "HEAD^{tree}")
 
 
+class PrepFault(RuntimeError):
+    """A validation run that ran none of the tests it selected (a broken test command or environment, not
+    the task): prep stops on it, naming the command, its exit code and its last output lines."""
+
+
+TAIL_LINES = 20     # output lines a PrepFault quotes
+
+
 def _passes(where: Path, tests: list[tuple[str, str]], rounds: int, cmd: str, timeout: float) -> dict[str, int]:
     """{path::name: rounds passed} of `tests` run `rounds` times by pytest `cmd` in `where`, through
-    the rerun plugin (spread off) in a process sandbox where the host has one (ttp sandbox)."""
+    the rerun plugin (spread off) in a process sandbox where the host has one (ttp sandbox). `cmd` runs
+    only the held-out tests' paths (_held_cmd), so a broken test module elsewhere in the tree is never
+    collected. The run's {"rc", "argv", "tail", "selected", "ran", "timed_out"} is kept on the result's
+    `run` attribute (a dict subclass) for validate."""
     from . import sandbox
     out = where.parent / f"{where.name}.jsonl"
+    log = where.parent / f"{where.name}.out"
     env = addedtests.env(tests, out, {**os.environ, "PWD": str(where)}, rounds)
     env[addedtests.ENV] = json.dumps({**json.loads(env[addedtests.ENV]), "spread": False})
+    argv = _held_cmd(cmd, [f"{p}::{n}" for p, n in tests])[0]
+    timed_out = False
     # own session: the test run is killed whole (its group) once past the timeout
-    proc = subprocess.Popen(sandbox.wrap(shlex.split(cmd), env=env), cwd=where, env=env, start_new_session=True,
-                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    try:
-        proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:   # counts as no pass: tally reads what the record holds
-        os.killpg(proc.pid, signal.SIGKILL)
-        proc.wait()
+    with open(log, "wb") as sink:
+        proc = subprocess.Popen(sandbox.wrap(argv, env=env), cwd=where, env=env, start_new_session=True,
+                                stdin=subprocess.DEVNULL, stdout=sink, stderr=subprocess.STDOUT)
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:   # counts as no pass: tally reads what the record holds
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+            timed_out = True
     t = addedtests.tally(out, tests, rounds)
-    return {f"{p}::{n}": t["passes"].get(f"{p}::{n}", 0) for p, n in tests}
+    res = _Passes({f"{p}::{n}": t["passes"].get(f"{p}::{n}", 0) for p, n in tests})
+    res.run = {"rc": proc.returncode, "argv": argv, "timed_out": timed_out, "selected": t["selected"],
+               "ran": sum(t["ran"].values()), "tail": _tail(log)}
+    return res
+
+
+class _Passes(dict):
+    run: dict = {}
+
+
+def _tail(path: Path, n: int = TAIL_LINES) -> list[str]:
+    try:
+        return path.read_text(errors="replace").splitlines()[-n:]
+    except OSError:
+        return []
+
+
+def _fault(run: dict, where: str) -> str:
+    """Why this validation run on `where` ran none of its selected tests through no fault of the task
+    ("" when it ran them): pytest ended in an error of its own (exit 2: interrupted, as by a collection
+    error; 3: internal error; 4: usage error; 5: nothing collected), or the rerun plugin selected or ran
+    none of them."""
+    rc = run["rc"]
+    if rc in (2, 3, 4, 5):
+        return f"pytest exited {rc} on the {where}"
+    if not run["selected"]:
+        return f"none of the held-out tests was collected on the {where} (exit {rc})"
+    if not run["ran"]:
+        return f"none of the held-out tests ran on the {where} (exit {rc})"
+    return ""
 
 
 def validate(repo: Path, base: str, head: str, tests: list[tuple[str, str]], files: list[str],
              cmd: str = TEST_CMD, timeout: float = TEST_TIMEOUT) -> tuple[list[tuple[str, str]], str]:
     """The `tests` that fail on `base` with the head's copy of the test `files` in place and pass
-    all ROUNDS runs on `head`, and why none do ("" when some do)."""
+    all ROUNDS runs on `head`, and why none do ("" when some do). Raises PrepFault when the head's run
+    ran none of them (_fault): the test command or the environment is broken, and every later task
+    would be excluded for it. The base may fail any way (its held-out tests may not even import there):
+    a broken command shows on the head's run, which runs the same command on the same paths."""
     with tempfile.TemporaryDirectory(prefix="ttp-bench-") as tmp:
         on_base, on_head = Path(tmp) / "base", Path(tmp) / "head"
         _archive(repo, base, on_base)
@@ -359,6 +408,11 @@ def validate(repo: Path, base: str, head: str, tests: list[tuple[str, str]], fil
             shutil.copyfile(on_head / path, on_base / path)
         fails = _passes(on_base, tests, 1, cmd, timeout)
         holds = _passes(on_head, tests, ROUNDS, cmd, timeout)
+    if holds.run["timed_out"]:
+        return [], f"its validation run on the head passed the {timeout:.0f} s timeout"
+    if why := _fault(holds.run, "head"):
+        raise PrepFault(f"bench prep: validation ran none of the held-out tests ({why}): "
+                        f"{shlex.join(holds.run['argv'])}\n" + "\n".join(holds.run["tail"]))
     keep = [t for t in tests if not fails[f"{t[0]}::{t[1]}"] and holds[f"{t[0]}::{t[1]}"] == ROUNDS]
     if keep:
         return keep, ""
@@ -393,10 +447,16 @@ def _reach(rows, pushed: list[dict]) -> set[int]:
     return seen
 
 
+def _stderr(line: str) -> None:
+    print(line, file=sys.stderr, flush=True)
+
+
 def prep(db, repo: Path, out: Path, since: float, limit: int = 0, test_cmd: str = TEST_CMD,
-         validated: bool = True) -> dict:
+         validated: bool = True, progress=_stderr) -> dict:
     """Write the bench to `out` (which must not exist yet) and return its manifest. `validated`:
-    keep only the fail-to-pass tests `test_cmd` finds (validate)."""
+    keep only the fail-to-pass tests `test_cmd` finds (validate); a validation run that runs none of
+    them raises PrepFault. `progress` gets one line per candidate (kept or excluded with why, its
+    seconds, the count kept so far and the total elapsed), so a long prep shows where it is."""
     from . import landed
     out.mkdir(parents=True)
     tasks = db.q("SELECT id, kind, title, spec, created FROM tasks WHERE status='done' AND kind IN ('code','work') "
@@ -406,10 +466,17 @@ def prep(db, repo: Path, out: Path, since: float, limit: int = 0, test_cmd: str 
                   "AND landed_sha IS NOT NULL AND landed_sha != '' ORDER BY id")
     reach = _reach(rows, pushed)
     kept, excluded = [], []
+    began = time.monotonic()
+
+    def say(t: dict, what: str, t0: float) -> None:
+        now = time.monotonic()
+        progress(f"bench prep: #{t['id']} {what} ({now - t0:.0f}s; {len(kept)} kept"
+                 f"{f' of {limit}' if limit else ''}, {len(excluded)} excluded, {now - began:.0f}s in)")
     with gitmemo.scope({}), concurrent.futures.ThreadPoolExecutor(BUILDERS) as pool:
         for t in tasks:
             if limit and len(kept) >= limit:
                 break
+            t0 = time.monotonic()
             mine = []
             if t["id"] in reach:
                 carry = landed.carriers(db, t["id"], rows)
@@ -430,9 +497,16 @@ def prep(db, repo: Path, out: Path, since: float, limit: int = 0, test_cmd: str 
             held = [x for x in _out(repo, "diff", "--no-renames", "--name-only", "--diff-filter=AM", base, head)
                     .splitlines() if _held(x)] if not why else []
             if not why and validated:
-                tests, why = validate(repo, base, head, tests, held, test_cmd)
+                try:
+                    tests, why = validate(repo, base, head, tests, held, test_cmd)
+                except PrepFault:   # no bench from a broken command: the folder it made goes
+                    say(t, "stopped: its validation ran none of its held-out tests", t0)
+                    pool.shutdown(wait=True)
+                    shutil.rmtree(out, ignore_errors=True)
+                    raise
             if why:
                 excluded.append({"task": t["id"], "why": why})
+                say(t, f"excluded: {why}", t0)
                 continue
             here = out / str(t["id"])
             tree = pool.submit(workspace, repo, base, here / "workspace")
@@ -446,6 +520,7 @@ def prep(db, repo: Path, out: Path, since: float, limit: int = 0, test_cmd: str 
                          "parent": int(parent[1]) if parent else None, "base": base, "head": head, "tree": tree,
                          "stratum": "small" if lines <= SMALL else "large", "changed_lines": lines,
                          "tests": [f"{p}::{n}" for p, n in tests], "heldout": sums})
+            say(t, f"kept, {len(tests)} test(s)", t0)
         for k in kept:
             k["tree"] = k["tree"].result()
     manifest = {"since": since, "made": time.time(), "repo": str(repo.resolve()), "validated": validated,

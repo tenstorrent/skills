@@ -237,6 +237,39 @@ def test_bench_prep_validates_fail_to_pass_tests_and_finds_landings_through_carr
     assert unchecked["tasks"][0]["tests"] == ["tests/test_mod.py::test_same", "tests/test_mod.py::test_new"]
 
 
+def test_bench_prep_validates_only_the_held_out_paths_and_stops_on_a_run_that_ran_none_of_them(env, tmp_path):
+    # A test module elsewhere in the tree that cannot import (a package the host lacks) stopped every
+    # whole-tree validation run at collection (pytest exit 2): no held-out test ran, and every task was
+    # excluded as if its tests did not fail-to-pass. Validation runs only the held-out paths, so it keeps the
+    # task; a run that still runs none of them (a usage error, nothing collected) stops prep with the
+    # command, its exit code and output, and removes the folder. One progress line per candidate.
+    from ttp import bench
+    p = make(env)
+    repo, git, commit, rev = _bench_repo(tmp_path)
+    commit({"other/test_needs_pkg.py": "import ttp_no_such_package_here\n\n\ndef test_x():\n    pass\n"}, "unrelated")
+    since = 1_000_000.0
+    tid = _bench_land(git, commit, rev, "keep", {"mod.py": "def old():\n    return 1\n\n\ndef new():\n    return 2\n",
+                                                  "tests/test_mod.py": "import mod\n\n\ndef test_old():\n    assert mod.old() == 1"
+                                                  "\n\n\ndef test_new():\n    assert mod.new() == 2\n"},
+                      p, "Add new() returning 2.", since + 1)
+    lines = []
+    m = bench.prep(p.db, repo, tmp_path / "bench", since, progress=lines.append)
+    assert [t["task"] for t in m["tasks"]] == [tid] and m["tasks"][0]["tests"] == ["tests/test_mod.py::test_new"], m
+    assert len(lines) == 1 and lines[0].startswith(f"bench prep: #{tid} kept, 1 test(s) (") and "1 kept" in lines[0], lines
+    assert subprocess.run([*bench.shlex.split(bench.TEST_CMD)], cwd=repo, capture_output=True).returncode == 2, \
+        "the whole-tree run this replaces stops at collection"
+    for cmd, rc, said in ((bench.TEST_CMD + " --ttp-no-such-flag", 4, "unrecognized arguments"),
+                          (bench.TEST_CMD + " -k ttp_matches_nothing", 5, "deselected")):
+        out, lines = tmp_path / f"bench-{rc}", []
+        with pytest.raises(bench.PrepFault) as e:
+            bench.prep(p.db, repo, out, since, test_cmd=cmd, progress=lines.append)
+        text = str(e.value)
+        assert f"pytest exited {rc} on the head" in text and cmd.split()[-1] in text and said in text, text
+        assert not out.exists(), "no half-made bench is left"
+        assert len(lines) == 1 and lines[0].startswith(
+            f"bench prep: #{tid} stopped: its validation ran none of its held-out tests ("), lines
+
+
 def test_bench_parses_a_test_file_piece_by_piece_like_a_whole_parse(tmp_path, monkeypatch):
     # Pieces split at unindented lines; one that splits a string, a bracket, a decorated def or an
     # if/else does not parse and joins the next. The result equals one parse of the whole file, a

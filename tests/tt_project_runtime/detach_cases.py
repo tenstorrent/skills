@@ -3523,3 +3523,58 @@ def test_detach_state_reads_a_bare_job_path_as_its_rc_and_an_rc_written_late_win
         return real(rc)
     monkeypatch.setattr(detach, "started", started_then_rc)
     assert detach.state(late) == ("ended", "3") and not detach.lost(late).exists()
+
+
+def _coord_wake_run(p, name, ended=None):
+    """A coordinator wake's run (no task, its own run dir); its id."""
+    d = p.runs / name
+    d.mkdir(parents=True, exist_ok=True)
+    p.db.x("INSERT INTO runs(task,role,provider,started,ended,status,dir) VALUES(?,?,?,?,?,?,?)",
+           (None, "coordinator", "fake", time.time(), ended, "running" if ended is None else "done", str(d)))
+    return p.db.one("SELECT id FROM runs WHERE dir=?", (str(d),))["id"]
+
+
+def test_a_coordinator_wake_lists_and_stops_a_job_an_earlier_wake_detached_and_a_task_run_cannot(env, tmp_path):
+    """Each wake of the persistent coordinator is a new run with no task: a job an earlier wake detached
+    had no owner that may stop it, and the kill guard refuses its pid. A later live coordinator run with a
+    `ttp audit why` lists it (`ttp detach --list`) and stops it by name; a task run, a coordinator run with
+    no audit why and an ended coordinator run's id cannot."""
+    from ttp import coordfix
+    p = make(env)
+    tid = p.db.add_task("other", "s", kind="work", tier="light", origin="user")
+    first = _coord_wake_run(p, "coord-1")
+    coord = lambda run, d: {"TTP_RUN_DIR": str(p.runs / d), "TTP_TASK": "", "TTP_TASK_ID": "", "TTP_RUN_ID": str(run),
+                            "TTP_PIDNS": "", "TTP_CGROUP": ""}
+    r = _ttp_run(p, "detach", "nap", "--", "sleep", "60", env=coord(first, "coord-1"))
+    assert r.returncode == 0, r.stderr
+    rc = (p.runs / "coord-1" / "nap.rc").resolve()
+    assert _wait_for_path(rc.with_suffix(".started"))
+    pgid = int(rc.with_suffix(".started").read_text().split()[0])
+    try:
+        p.db.x("UPDATE runs SET ended=?, status='done' WHERE id=?", (time.time(), first))
+        later = _coord_wake_run(p, "coord-2")
+        stale = _coord_wake_run(p, "coord-0", ended=time.time())
+        worker = _add_run(p, tid, "other-1")
+        r = _ttp_run(p, "detach", "--list", env=coord(later, "coord-2"))
+        assert r.returncode == 0 and f"run {first}  nap  running  pid {pgid}  {rc}" in r.stdout, r.stdout + r.stderr
+        r = _ttp_run(p, "detach", "--list", env=coord(stale, "coord-0"))
+        assert r.returncode == 2, "an ended coordinator run's id proves nothing"
+        r = _ttp_run(p, "detach", "--stop", str(rc), env=_as(tid, worker))
+        assert r.returncode == 3 and "no task of this project started" in r.stderr and os.getpgid(pgid) == pgid, r.stderr
+        r = _ttp_run(p, "detach", "--stop", str(rc), env={**_as(tid, worker), "TTP_RUN_ID": str(later)})
+        assert r.returncode == 3 and os.getpgid(pgid) == pgid, "a task run naming a coordinator run id is refused"
+        r = _ttp_run(p, "detach", "--stop", "nap", env=coord(later, "coord-2"))
+        assert r.returncode == 3 and os.getpgid(pgid) == pgid, "no `ttp audit why` in the caller's run: refused"
+        coordfix.declare(p.runs / "coord-0", "stale wake", "msg1", "none")
+        r = _ttp_run(p, "detach", "--stop", str(rc), env=coord(stale, "coord-0"))
+        assert r.returncode == 3 and os.getpgid(pgid) == pgid, "an ended coordinator run is refused"
+        coordfix.declare(p.runs / "coord-2", "its prep runs the wrong command", "msg2790", "rerun it")
+        r = _ttp_run(p, "detach", "--stop", "nap", env=coord(later, "coord-2"))
+        assert r.returncode == 0 and "stopped detached job nap" in r.stdout, r.stdout + r.stderr
+        lost = rc.with_suffix(".lost").read_text()
+        assert f"stopped by coordinator run {later}, a job it detached in an earlier wake, run {first}" in lost, lost
+        assert "its prep runs the wrong command; serves" in lost, lost
+        (ev,) = _stopped_events(p)
+        assert json.loads(ev["data"])["caller_run"] == later and ev["task"] is None
+    finally:
+        _end_group(pgid)

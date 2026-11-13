@@ -140,7 +140,8 @@ def refresh(d: Path, db, repo: Path, now: float | None = None, prep: Callable | 
     except Exception as e:
         for x in (b, c):
             shutil.rmtree(x, ignore_errors=True)
-        say(f"model-bench suite: building the folder pair failed ({type(e).__name__}: {str(e)[:300]}); "
+        text = str(e) if isinstance(e, bench.PrepFault) else str(e)[:300]   # its command and output tail
+        say(f"model-bench suite: building the folder pair failed ({type(e).__name__}: {text}); "
             + (f"kept the old pair {old[0].name} and {old[1].name}" if old else "no pair to keep"))
         return old
     for x in d.iterdir():

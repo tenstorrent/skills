@@ -1316,6 +1316,8 @@ def may_stop(p: Project, rc: Path, caller: str | None, caller_run: str | None = 
     from its run (TTP_RUN_ID, may be empty)."""
     from .coordinator import task_resources
     t = task_of(p, rc)
+    if t is None and (coord := coord_job_stop(p, rc, caller_run)) is not None:
+        return True, coord
     if t is None:
         return False, f"no task of this project started the job at {rc}"
     if t["status"] in STOPPABLE and (pre := precheck_task(p, Path(rc).parent)) is not None:
@@ -1444,6 +1446,51 @@ def coord_checks_stop(p: Project, rc: Path, t: dict, caller_run: str | None) -> 
         return None
     return (f"{COORD_STOP} (run {run['id']}) for waiting task #{t['id']}: {why['why'][:200]}; "
             f"serves {why.get('serves') or '?'}")
+
+
+def coord_run(p: Project, run: str | int | None, live: bool = False) -> dict | None:
+    """The coordinator run of this project with this id ({id, dir}), else None; `live`: only one that
+    has not ended (the caller's own wake)."""
+    if not (run and str(run).isdigit()):
+        return None
+    return p.db.one("SELECT id, dir FROM runs WHERE id=? AND role='coordinator'"
+                    + (" AND ended IS NULL" if live else ""), (int(run),))
+
+
+def coord_job_stop(p: Project, rc: Path, caller_run: str | None) -> str | None:
+    """Why the coordinator may stop this job, or None: a coordinator run of this project detached it
+    (each wake of the persistent coordinator is a new run, so a job an earlier wake started has no task
+    of its own), and TTP_RUN_ID names a live coordinator run of the same project whose folder holds a
+    `ttp audit why` (coordfix.intent). A task run never qualifies, whatever TTP_RUN_ID it sets."""
+    from . import coordfix
+    d = Path(rc).parent
+    job = p.db.one("SELECT id FROM runs WHERE dir IN (?,?) AND role='coordinator' ORDER BY id DESC LIMIT 1", (str(d), str(d.resolve())))
+    run = coord_run(p, caller_run, live=True)
+    if not job or not run or not run["dir"] or not (why := coordfix.intent(run["dir"])).get("why"):
+        return None
+    when = "its current wake" if job["id"] == run["id"] else f"an earlier wake, run {job['id']}"
+    return (f"stopped by coordinator run {run['id']}, a job it detached in {when}: {why['why'][:200]}; "
+            f"serves {why.get('serves') or '?'}")
+
+
+def coord_jobs(p: Project, now: float | None = None) -> list[tuple[int, dict]]:
+    """(run id, registry entry) of each `ttp detach` job this project's coordinator runs of the last
+    SWEEP_DAYS recorded, oldest run first (task_jobs for the coordinator, whose runs have no task)."""
+    now = time.time() if now is None else now
+    out = []
+    runs = Path(os.path.realpath(p.runs))
+    for row in p.db.q("SELECT id, dir FROM runs WHERE role='coordinator' AND dir IS NOT NULL "
+                      "AND COALESCE(started, 0)>? ORDER BY id", (now - SWEEP_DAYS * 86400,)):
+        d = Path(os.path.realpath(row["dir"]))
+        if d.parent != runs:
+            continue
+        try:
+            jobs = json.loads((d / detach.REGISTRY).read_text())
+        except (OSError, ValueError):
+            continue
+        out += [(row["id"], j) for j in (jobs if isinstance(jobs, list) else [])
+                if isinstance(j, dict) and j.get("rc") and Path(os.path.realpath(j["rc"])).parent == d]
+    return out
 
 
 def stop_why(why: str, given: str | None) -> str:

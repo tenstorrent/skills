@@ -9008,8 +9008,11 @@ def cmd_bench(a) -> None:
     cmd = a.test_cmd or bench.TEST_CMD
     if not a.no_validate and not addedtests.eligible(cmd):
         die(f"bench: --test-cmd {cmd!r} is not one plain pytest run")
-    m = bench.prep(p.db, Path(a.repo or p.root).resolve(), out, when.timestamp(), limit=a.limit,
-                   test_cmd=cmd, validated=not a.no_validate)
+    try:
+        m = bench.prep(p.db, Path(a.repo or p.root).resolve(), out, when.timestamp(), limit=a.limit,
+                       test_cmd=cmd, validated=not a.no_validate)
+    except bench.PrepFault as e:
+        die(str(e))
     print(f"ttp bench: {len(m['tasks'])} task(s) kept ({m['counts']['small']} small, {m['counts']['large']} large), "
           f"{len(m['excluded'])} excluded{'' if m['validated'] else ', tests not validated'}; "
           f"manifest {out / 'manifest.json'}")
@@ -9526,28 +9529,55 @@ def _caller_task():
     return None if task is None else (p, task)
 
 
-def _task_job(name: str) -> Path | None:
-    """The .rc of the calling task's job `name` from any of its runs (jobstop.task_job_named), else None."""
+def _caller_coord():
+    """The project of the calling coordinator run (TTP_PROJECT, and TTP_RUN_ID a live coordinator run the
+    project's db records: jobstop.coord_run), else None."""
     from . import jobstop
-    return jobstop.task_job_named(*me, name) if (me := _caller_task()) else None
+    base = os.environ.get("TTP_PROJECT")
+    if not base:
+        return None
+    try:
+        p = Project(base)
+        if not (p.state / "project.db").is_file():
+            return None
+        return p if jobstop.coord_run(p, os.environ.get("TTP_RUN_ID"), live=True) else None
+    except Exception:
+        return None
+
+
+def _task_job(name: str) -> Path | None:
+    """The .rc of the calling task's job `name` from any of its runs (jobstop.task_job_named); for the
+    coordinator, of any of its wakes' runs: the newest still running, else the newest. None when none."""
+    from . import jobstop
+    if me := _caller_task():
+        return jobstop.task_job_named(*me, name)
+    if p := _caller_coord():
+        named = [Path(j["rc"]) for _, j in jobstop.coord_jobs(p) if j.get("name") == name]
+        live = [rc for rc in named if jobstop.running(rc)]
+        return (live or named or [None])[-1]
+    return None
 
 
 def _detach_list() -> int:
-    """`ttp detach --list`: the calling task's `ttp detach` jobs across all its runs (jobstop.task_jobs), one
-    line each: run, name, state, pid and .rc. 2 outside a task run."""
+    """`ttp detach --list`: the calling task's `ttp detach` jobs across all its runs (jobstop.task_jobs), or in
+    a coordinator run those of every coordinator wake of the last SWEEP_DAYS (jobstop.coord_jobs), one line
+    each: run, name, state, pid and .rc. 2 outside a task or coordinator run."""
     from . import detach, jobstop
-    if not (me := _caller_task()):
-        print("ttp detach --list: only works inside a tt-project task run (TTP_PROJECT, TTP_TASK and TTP_RUN_ID set)",
-              file=sys.stderr)
+    me = _caller_task()
+    coord = None if me else _caller_coord()
+    if not me and not coord:
+        print("ttp detach --list: only works inside a tt-project task or coordinator run (TTP_PROJECT and "
+              "TTP_RUN_ID set, plus TTP_TASK in a task run)", file=sys.stderr)
         return 2
-    jobs = jobstop.task_jobs(*me)
+    jobs = jobstop.task_jobs(*me) if me else jobstop.coord_jobs(coord)
     for run, j in jobs:
         st, why = detach.state(Path(j["rc"]))
         print(f"run {run}  {j.get('name') or Path(j['rc']).stem}  {st}{f' ({why})' if why and st != 'running' else ''}"
               f"  pid {j.get('pid') or '-'}  {j['rc']}"
               + (f"  (taken over from task #{j['adopted_from']})" if j.get("adopted_from") else ""))
     if not jobs:
-        print(f"task #{me[1]} has no detached jobs in its runs of the last {jobstop.SWEEP_DAYS} days")
+        who = f"task #{me[1]}" if me else "the coordinator"
+        print(f"{who} has no detached jobs in its runs of the last {jobstop.SWEEP_DAYS} days")
     return 0
 
 

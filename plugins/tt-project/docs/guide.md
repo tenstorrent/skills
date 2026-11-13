@@ -1218,7 +1218,11 @@ branch. Every test file the change adds or changes is held out, and only the
 held-out tests are scanned. Then it validates each test the change adds: it runs them, with the
 head's test files in place, on a copy of the base (each must fail) and of the landed head (each must
 pass all 3 runs), inside `ttp sandbox`, and keeps only those fail-to-pass tests; a task with none is
-excluded with the reason. `--test-cmd` sets the pytest command (one plain pytest run, default
+excluded with the reason. The runs name only the held-out tests' paths (a test file by its name, a case
+file its top directory), so a broken test module elsewhere in the tree is never collected. A run on the
+head that runs none of them (pytest exit 2 to 5, or none collected or run) is a broken command or
+environment, not the task's fault: prep stops there, removes the folder and prints the command, its
+exit code and the output's last lines. It prints one progress line per candidate to stderr. `--test-cmd` sets the pytest command (one plain pytest run, default
 `python3 -m pytest -q -p no:cacheprovider`) and `--no-validate` skips this step. Each kept task gets
 `<id>/workspace`, the base commit's tracked files in a fresh repository with one commit and no
 remotes, tags or reflog, and `<id>/heldout`, the landed copy of its held-out test files; the manifest
@@ -2046,8 +2050,10 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   `ttp detach --stop <name|rc> [--why <reason>]` stops a job of an ended task, a job of the caller's own
   task (from any of its runs: a bare name not in this run is the newest of that name an earlier run of the
   task detached; `ttp detach --list` lists them; its .lost and stop event name the caller's task and run, the run that
-  started the job and the reason), or one holding a resource of the calling open priority-1 task;
-  anyone else is refused (exit 3). A stopped job is never relaunched at boot. Such a stop (also a spend
+  started the job and the reason), or one holding a resource of the calling open priority-1 task. The
+  persistent coordinator, each of whose wakes is a new run with no task, may stop a job any of its wakes
+  detached from a live coordinator run that holds a `ttp audit why`, and `ttp detach --list` there lists
+  the jobs of its wakes of the last 14 days; anyone else is refused (exit 3). A stopped job is never relaunched at boot. Such a stop (also a spend
   cap's, or the daemon's of an ended task's job) writes `<name>.rc` holding 137 (128 + SIGKILL) beside its
   `<name>.lost` unless the job wrote its own, so a reader of the .rc alone sees an ended job, not a dead
   one; `ttp detach --check` prints `stopped on purpose rc=137 (<why>)` and the closed record is `ended`
