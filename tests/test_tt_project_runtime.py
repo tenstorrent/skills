@@ -27438,6 +27438,9 @@ def test_durable_write_syncs_renames_and_keeps_the_mode(env, monkeypatch):
 # Every place the runtime writes a file directly, and why it need not survive a power cut. Anything
 # else goes through project.durable_write / durable_append / write_json.
 DURABLE_EXEMPT = {
+    ("cellns.py", '(home / ".gitconfig").write_text('): "the git identity file in a bench cell's scratch home inside its temporary folder, rebuilt for every cell; never project state",
+    ("cellns.py", "gh.write_text("): "the `gh` stand-in script in a bench cell's temporary folder, rebuilt for every cell; never project state",
+    ("cellns_init.py", 'open(path, "wb").close()'): "an empty mount-point file in the namespace's own tmpfs root, gone with the namespace; never state",
     ("bench.py", 'with open(log, "wb") as sink:'): "a validation run's pytest output in its temporary folder, read once for a fault's tail and removed with it",
     ("harborslice.py", 'f = open(d / f"{i}.lock", "w")'): "an empty flock file for one host trial slot; only the lock matters, nothing is written",
     ("tbcycle.py", 'f = open(path, "a")'): "an empty flock file (state or a model's runner lock); only the lock matters, nothing is written",
