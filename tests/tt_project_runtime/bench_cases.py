@@ -1601,6 +1601,26 @@ def test_model_suite_reaudit_rescores_an_isolated_flagged_cell_and_leaves_an_uni
     assert all(r["model"] != "m-void" for r in day)
 
 
+
+def test_model_suite_reaudit_run_twice_gives_the_same_scores_and_reports_nothing_overwritten(env, tmp_path,
+                                                                                           monkeypatch):
+    # A re-audit appends its corrected rows (`reaudit` true, a new `at`): a second re-audit of the day read
+    # those as the newest isolated rows, found them far from the cell's exit.json and voided every cell.
+    from ttp import modelsuite
+    d, out, tid, before = _reaudit_day(env, tmp_path, monkeypatch)
+    opts = {**_bench_opts(tmp_path), "dry_run": True}
+    first = modelsuite.reaudit("2026-11-10", tmp_path / "bench", opts, now=before["m-iso"]["at"] + 600)
+    second = modelsuite.reaudit("2026-11-10", tmp_path / "bench", opts, now=before["m-iso"]["at"] + 7200)
+    assert second["overwritten"] == [] and first["overwritten"] == []
+    keys = ("model", "outcome", "was", "passed")
+    assert [{k: c[k] for k in keys} for c in second["cells"]] == [{k: c[k] for k in keys} for c in first["cells"]] \
+        == [{"model": "m-iso", "outcome": "pass", "was": "flagged", "passed": True}]
+    strip = lambda r: {k: v for k, v in r.items() if k != "at"}
+    assert [strip(r) for r in second["models"]] == [strip(r) for r in first["models"]]
+    day = [json.loads(x) for x in (d / "2026-11-10.jsonl").read_text().splitlines()]
+    assert [(r["model"], r["pass_rate"], r.get("reaudit")) for r in day[-2:]] == [("m-iso", 1.0, True)] * 2
+
+
 def test_model_suite_reaudit_skips_a_cell_folder_a_later_run_wrote_over(env, tmp_path, monkeypatch):
     from ttp import modelsuite
     d, out, tid, before = _reaudit_day(env, tmp_path, monkeypatch)

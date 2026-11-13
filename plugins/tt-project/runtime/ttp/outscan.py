@@ -372,6 +372,7 @@ def gh_problem(args: list[str], stdin_text: str | None, real: str | None = None)
 LS_REMOTE_S = 120   # listing the refs of the remote a push goes to
 GIT_S = 60   # one local git read of the scan
 BRANCH_EXCLUDES_MAX = 2000   # remote branch tips a scan stops at; past it, only the updated refs' tips
+STOP_FETCH_S = 180   # fetching the remote tips a scan stops at that this repository lacks (commits and trees)
 
 
 # What a push sends, never a replace ref's stand-in (pack-objects ignores replace refs; git log would not)
@@ -489,9 +490,42 @@ def push_problem(lines: list[str], url: str, p=None) -> str | None:
         tips.append(obj)
     if not tips:
         return None
-    stops = _types(_stops(refs, lines))
+    want = _stops(refs, lines)
+    stops = _types(want)
+    lacking = sorted(want - set(stops))
+    err = _fetch_stops(url, lacking) if lacking else ""
+    if lacking and not err:
+        stops = _types(want)
+    if any(r == "HEAD" or r.startswith("refs/heads/") for r in refs) and \
+            not any(kind == "commit" for kind in stops.values()):
+        # Without one of the remote's commits to stop at, git log would read the whole history from the
+        # root (in a blobless partial clone fetching every blob one by one): refuse fast instead.
+        return ("git push refused: the leak scan has none of the remote's branch tips here"
+                + (f" (fetching {len(lacking)} of them failed: {err})" if err else "")
+                + ", so it would read the repository's whole history; nothing was sent. Fetch the remote "
+                  "(git fetch --filter=blob:none in a partial clone) and push again")
     revs = "".join(f"{t}\n" for t in tips) + "".join(f"^{h}\n" for h, kind in stops.items() if kind == "commit")
     return _log_problem(revs, hit)
+
+
+def _fetch_stops(url: str, shas: list[str]) -> str:
+    """Fetch the remote tips `shas` (ones the remote at `url` advertises now) that this repository lacks,
+    commits and trees only in a partial clone, so the scan can stop at them; '' once fetched, else why
+    not. Only what the remote advertises is fetched, so stopping at it never skips a commit it lacks."""
+    filt = ["--filter=blob:none"] if _git("config", "--get", "extensions.partialClone").stdout.strip() else []
+    try:
+        r = subprocess.run(["git", "-c", "fetch.negotiationAlgorithm=noop", "fetch", "--no-tags",
+                            "--no-write-fetch-head", "--recurse-submodules=no", *filt, url, *shas],
+                           capture_output=True, text=True, errors="replace", timeout=STOP_FETCH_S,
+                           stdin=subprocess.DEVNULL, env={**os.environ, **_LOOKUP_ENV})
+    except subprocess.TimeoutExpired:
+        return f"git fetch ran past {STOP_FETCH_S} s"
+    except OSError as e:
+        return f"git fetch could not start ({e})"
+    if r.returncode:
+        tail = (r.stderr.strip().splitlines() or [""])[-1][:200]
+        return f"git fetch exited {r.returncode}" + (f": {tail}" if tail else "")
+    return ""
 
 
 # How to rewrite without leaving a temp dir in the worktree: filter-branch keeps its scratch tree in

@@ -433,6 +433,70 @@ def test_git_push_scan_looks_up_only_the_remote_tips_it_stops_at_and_fails_close
     assert "could not read the types of the remote's 1 tips in time" in capsys.readouterr().err
 
 
+
+def test_git_push_scan_fetches_remote_tips_it_lacks_and_never_reads_the_whole_history(env, tmp_path, monkeypatch):
+    """A new branch (zero remote sha) on a remote with more branches than BRANCH_EXCLUDES_MAX stops only at
+    the remote's HEAD; when that tip moved since the last fetch, the scan had no stop left and read the
+    repository from its first commit (in a blobless clone, fetching every blob one by one). It now fetches
+    the advertised tips it lacks and stops at them; if that fails, it refuses fast and reads nothing; a push
+    to an empty remote still reads everything."""
+    from ttp import outscan
+    p, repo, push = _push_run(env, tmp_path, monkeypatch)
+    origin = tmp_path / "leak-origin.git"
+    plain = {k: v for k, v in os.environ.items() if k != "TTP_TASK"}
+    _commit(repo, "old.txt", f"{_OUT_SHAPE}\n")   # a leak the remote already has on main
+    subprocess.run(["git", "-C", str(repo), "push", "-q", "--no-verify", "origin", "main"], check=True,
+                   capture_output=True, env=plain)
+    other = tmp_path / "other"   # someone else moves main on; this repository never fetches it
+    subprocess.run(["git", "clone", "-q", str(origin), str(other)], check=True, capture_output=True, env=plain)
+    for k, v in (("user.name", "Test"), ("user.email", "test@example.com"), ("commit.gpgsign", "false")):
+        _git_out(other, "config", k, v)
+    _commit(other, "moved.txt", "clean\n")
+    subprocess.run(["git", "-C", str(other), "push", "-q", "--no-verify", "origin", "main"], check=True,
+                   capture_output=True, env=plain)
+    moved = _git_out(other, "rev-parse", "main")
+    _git_out(repo, "checkout", "-q", "-B", "work", "main")
+    _commit(repo, "new.txt", "clean\n")
+    work = _git_out(repo, "rev-parse", "work")
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(outscan, "BRANCH_EXCLUDES_MAX", 0)
+    assert subprocess.run(["git", "cat-file", "-e", moved], cwd=repo).returncode != 0, "the tip is missing here"
+    lines = [f"refs/heads/work {work} refs/heads/work {'0' * 40}"]
+    scanned, real_log = [], outscan._log_problem
+
+    def spy(revs, *a, **kw):
+        scanned.append(revs)
+        return real_log(revs, *a, **kw)
+    monkeypatch.setattr(outscan, "_log_problem", spy)
+    # (i) the missing HEAD tip is fetched and the scan stops at it: the leak main already has is not read again
+    assert outscan.push_problem(lines, str(origin), p) is None, scanned
+    assert scanned == [f"{work}\n^{moved}\n"], scanned
+    assert _git_out(repo, "cat-file", "-t", moved) == "commit"
+    assert _git_out(repo, "rev-parse", "--abbrev-ref", "HEAD") == "work", "no ref of this repository moved"
+    # (ii) a fetch that fails refuses fast, with nothing scanned and the fetch to run named
+    _commit(other, "again.txt", "clean\n")
+    subprocess.run(["git", "-C", str(other), "push", "-q", "--no-verify", "origin", "main"], check=True,
+                   capture_output=True, env=plain)
+    scanned[:], real_fetch = [], outscan._fetch_stops
+    monkeypatch.setattr(outscan, "_fetch_stops", lambda url, shas: "git fetch exited 128: fatal: no route")
+    why = outscan.push_problem(lines, str(origin), p)
+    assert why and why.startswith("git push refused") and "nothing was sent" in why, why
+    assert "fetching 1 of them failed: git fetch exited 128" in why and "git fetch" in why.split("; ")[-1], why
+    assert scanned == [], "no scan from the root"
+    # the real fetch reports a remote it cannot read
+    monkeypatch.setattr(outscan, "_fetch_stops", real_fetch)
+    again = _git_out(other, "rev-parse", "main")
+    assert outscan._fetch_stops(str(tmp_path / "gone.git"), [again]).startswith("git fetch exited ")
+    assert outscan.push_problem(lines, str(origin), p) is None and scanned == [f"{work}\n^{again}\n"], scanned
+    scanned[:] = []
+    # (iii) a push to an empty remote has nothing to stop at: it reads everything and finds the old leak
+    empty = tmp_path / "empty.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(empty)], check=True)
+    why = outscan.push_problem(lines, str(empty), p)
+    assert why and "GitHub token shape" in why and _OUT_SHAPE not in why, why
+    assert scanned == [f"{work}\n"], scanned
+
+
 def _wrapped_git(repo, tmp_path, *args):
     """`git <args>` in `repo` in a run, through the harness's git wrapper (as _push_run's push does)."""
     env = {**os.environ, "TTP_PYTHON": sys.executable, "TTP_RUN_DIR": str(tmp_path / "run")}

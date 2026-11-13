@@ -565,7 +565,8 @@ def _reaudit(date, out, bench_dir, opts, models, now, say) -> dict:
     want = set(models or [])
     latest: dict[tuple, dict] = {}   # the newest isolated replay row of each (model, task)
     for r in _rows(out / "results.jsonl"):
-        if r.get("kind") == "injection" or r.get("task") is None or not r.get("isolated") or \
+        # a re-audit's own rows are its output, never its input: a second --reaudit reads the run's rows again
+        if r.get("kind") == "injection" or r.get("task") is None or not r.get("isolated") or r.get("reaudit") or \
                 (want and r.get("model") not in want):
             continue
         latest[(r.get("model"), str(r["task"]))] = r
