@@ -113,7 +113,7 @@
       "destination": "scripts/check_context_contract.py",
       "blob": "53418ff24d91abd4552e64ff89885d756e411f62",
       "source_sha256": "b5a234f85e2d29603947eb36671b09f0442adbb4a219224baa7da16b7f2e8f09",
-      "packaged_sha256": "943138760111aede7596f57d2caf374b25049d5df795a9c098104128bffc7b6e"
+      "packaged_sha256": "9eb8eb8d1359a2d4d7eaecf255e6f86bf28e4cf406145496e7733504af4cd4de"
     },
     {
       "source": ".agents/scripts/multigoal",

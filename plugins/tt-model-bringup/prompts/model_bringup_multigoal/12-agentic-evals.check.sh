@@ -20,7 +20,7 @@ if [ -z "${MODEL_DIR:-}" ] && [ -z "${HF_MODEL:-}" ]; then
 fi
 "$PYTHON" "${TT_MODEL_BRINGUP_ROOT}/scripts/check_context_contract.py" \
   --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}" \
-  --stage agentic-evals --require-contract || rc=$?
+  --stage agentic-evals --require-contract --optional-for-existing || rc=$?
 rc=${rc:-0}
 [ "$rc" -ge 2 ] && exit "$rc"
 

@@ -13,7 +13,7 @@ fi
 export PYTHONPATH="$TT_MODEL_BRINGUP_ROOT/runtime${PYTHONPATH:+:$PYTHONPATH}"
 python3 -m benchmark_stage.check --model-dir "$model_dir" --hf-model "${HF_MODEL:-}" || exit 2
 python3 "$TT_MODEL_BRINGUP_ROOT/scripts/check_context_contract.py" \
-  --model-dir "$model_dir" --hf-model "${HF_MODEL:-}" --stage benchmark --require-contract || exit 2
+  --model-dir "$model_dir" --hf-model "${HF_MODEL:-}" --stage benchmark --require-contract --optional-for-existing || exit 2
 python3 "$TT_MODEL_BRINGUP_ROOT/scripts/check_agentic_serving.py" \
   --model-dir "$model_dir" --hf-model "${HF_MODEL:-}" --stage benchmark || rc=$?
 rc=${rc:-0}

@@ -790,3 +790,14 @@ def test_time_faster_than_explained_passes_with_a_note(tmp_path):
     run.update(measured_hours=3.96, explained_hours=11.70)
     code, stderr = goal12(tmp_path, runs=[run])
     assert code == 0 and 'NOTE' in stderr and 'pessimistic' in stderr
+
+
+def test_context_contract_is_optional_for_an_existing_model(tmp_path):
+    """entry: existing starts at stage 11; stages 06-10, which write the contract, never ran."""
+    script = PLUGIN / 'scripts/check_context_contract.py'
+    args = [sys.executable, str(script), '--model-dir', 'm', '--stage', 'benchmark', '--require-contract',
+            '--optional-for-existing']
+    assert subprocess.run(args, cwd=tmp_path, capture_output=True).returncode == 2
+    (tmp_path / 'bringup/agentic_evals').mkdir(parents=True)
+    (tmp_path / 'bringup/agentic_evals/inputs.json').write_text(json.dumps({'entry': 'existing'}))
+    assert subprocess.run(args, cwd=tmp_path, capture_output=True).returncode == 0

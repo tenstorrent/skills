@@ -75,6 +75,17 @@ def first_int(mapping: dict[str, Any], keys: tuple[str, ...]) -> int | None:
     return None
 
 
+def entry_is_existing(model_dir: Path) -> bool:
+    """bringup/agentic_evals/inputs.json (the checkout's, else the model dir's) sets entry: existing."""
+    for path in (Path("bringup/agentic_evals/inputs.json"), model_dir / "bringup/agentic_evals/inputs.json"):
+        if path.is_file():
+            try:
+                return json.loads(path.read_text()).get("entry") == "existing"
+            except (OSError, ValueError, AttributeError):
+                return False
+    return False
+
+
 def load_contract(model_dir: Path) -> tuple[dict[str, Any] | None, Path]:
     path = model_dir / CONTRACT_PATH
     if not path.is_file():
@@ -198,6 +209,9 @@ def main() -> int:
     parser.add_argument("--stage", default="")
     parser.add_argument("--require-contract", action="store_true")
     parser.add_argument("--strict-caps", action="store_true")
+    parser.add_argument("--optional-for-existing", action="store_true",
+                        help="a model entering at stage 11 (inputs.json entry: existing) never ran the stages that "
+                             "write the contract: a missing one passes")
     args = parser.parse_args()
 
     if args.model_dir:
@@ -209,6 +223,9 @@ def main() -> int:
         return 3
 
     contract, contract_path = load_contract(model_dir)
+    if contract is None and args.optional_for_existing and entry_is_existing(model_dir):
+        print(f"context contract: {contract_path} absent; entry existing starts at stage 11, so none is required")
+        return 0
     if contract is None:
         message = f"Missing context contract: {contract_path}"
         if args.require_contract:
