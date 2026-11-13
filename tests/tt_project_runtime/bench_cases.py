@@ -346,6 +346,29 @@ def _bench_built(env, tmp_path):
     return p, tid, m["tasks"][0]
 
 
+def test_bench_prep_drops_a_task_whose_tests_require_a_key_its_spec_does_not_state(env, tmp_path):
+    from ttp import bench
+    p = make(env)
+    repo, git, commit, rev = _bench_repo(tmp_path)
+    vague = _bench_land(git, commit, rev, "vague", {
+        "mod.py": "def old():\n    return 1\n\n\ndef limit(cfg):\n    return cfg.get('slot_cut_pct', 60)\n",
+        "tests/test_mod.py": "import mod\n\n\ndef test_old():\n    assert mod.old() == 1\n\n\n"
+                             "def test_limit():\n    assert mod.limit({'slot_cut_pct': 75}) == 75\n"},
+        p, "Add limit(cfg): make the 60% slot cut a config key.", 2_000_000.0)
+    stated = _bench_land(git, commit, rev, "stated", {
+        "mod.py": "def old():\n    return 1\n\n\ndef limit(cfg):\n    return cfg.get('slot_cut_pct', 60)\n\n\n"
+                  "def cap(cfg):\n    return cfg.get('slot_cap_pct', 90)\n",
+        "tests/test_mod.py": "import mod\n\n\ndef test_old():\n    assert mod.old() == 1\n\n\n"
+                             "def test_limit():\n    assert mod.limit({'slot_cut_pct': 75}) == 75\n\n\n"
+                             "def test_cap():\n    assert mod.cap({'slot_cap_pct': 80}) == 80\n"},
+        p, "Add cap(cfg) reading config key slot_cap_pct (default 90).", 2_000_100.0)
+    m = bench.prep(p.db, repo, tmp_path / "bench", 1_000_000.0)
+    assert [t["task"] for t in m["tasks"]] == [stated]
+    why = {e["task"]: e["why"] for e in m["excluded"]}[vague]
+    assert why == "its held-out tests require names or texts the change made up and the spec does not state: " \
+                  "'slot_cut_pct'", why
+
+
 _BENCH_FIX = ("printf 'def old():\\n    return 1\\n\\n\\ndef new():\\n    return 2\\n' > mod.py && "
               "git -c user.email=c@example.com -c user.name=c commit -qam fix")
 
