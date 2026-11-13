@@ -111,7 +111,7 @@ rates explain. It runs on the local machine; no CI is needed.
 | `run_timeout_hours` | 12 per run; extended lists target ≈ 10 h |
 | `usage_budget` | the Codex points this stage may use; the runner reads the account at start |
 | `network` | per task `allow_internet` (Terminal-Bench); SWE agent in main's `no-network` mode with `allow_agent_endpoint` |
-| `limits` | agent and request limits and output cap from the harness reference (never raised) |
+| `limits` | agent and request limits and output cap from the harness reference; runs start there |
 | `decisions` | operator answers to a blocked goal's question, e.g. a reference to use |
 
 Before stage 9 the operator proves the setup: Docker (or the harness's container runtime), gated dataset
@@ -168,15 +168,16 @@ from the best-known config in `learned.json` for this model or its closest model
 
 ### Settings
 
-- **Limits:** agent and request limits and the output cap are the harness reference values for this model
-  (or the closest model with a published reference). Never raise them; never rewrite release values. A task
-  cut off while still progressing is a failure with that cause; ask the operator once if it recurs.
+- **Limits:** runs start at the harness reference's agent and request limits and output cap for this model
+  (or the closest model with a published reference); never rewrite release values. No task fails on a limit
+  unless it loops or stalls (Failure analysis 2). Record per task the limits it finished under, and the
+  reference's limits beside the score.
 - **Network:** a task may use what it declares (`allow_internet`). A trajectory that fetched its own
   solution (the upstream fix, a later release, the resolving discussion) is a failure and stays in the
   denominator; report how many. Never void a list.
 - **Task resources** come from each task's definition, never a blanket value.
-- **Reasoning:** thinking on or off and the reasoning effort are chosen per suite by Failure analysis.
-  Record the setting with each run and the reference's own setting with the reference.
+- **Reasoning:** the list runs at the reference's setting (medium when unknown); Failure analysis probes
+  others. Record the setting with each run and the reference's own setting with the reference.
 - **Harness and route** are main's, unchanged. A real harness defect is fixed on a generic branch named for
   the defect and listed in `learned.json`.
 
@@ -194,14 +195,17 @@ This is iteration on the phase's failing tasks inside its time, never growth of 
 1. Every failed or timed-out task gets a row: cause (wrong answer or patch, loop to the cap, malformed tool
    call, cut off while progressing, stalled, infrastructure, fetched solution) and evidence (trajectory
    lines, tokens, time).
-2. Each task that hit the agent or request limit or the output cap is rerun on its own to tell `loop_cap`,
-   `cutoff_progressing` or `stalled`. On those tasks also try thinking on and off and each reasoning effort
-   the server offers; thinking on is not always better. Record each attempt in the row's `rerun.tried`
-   (setting, result, tokens, time).
-3. If another setting does better on those tasks, run the whole list with it as a new run; the phase takes
-   the run that scores best within its time.
-4. A single-task rerun changes the score only when the first failure was infrastructure (verifier setup,
-   image pull); otherwise it is reported beside the score.
+2. A task that hit the agent or request limit or the output cap fails on it only if its trajectory loops
+   (`loop_cap`) or stalls (`stalled`). One cut off while progressing is rerun alone at ≥ 2× that limit,
+   within `run_timeout_hours`, until it finishes, loops or stalls; that result counts.
+3. For tasks that hit a limit or looped, probe other settings (thinking on or off, the efforts the server
+   offers) in parallel on the running server; on SWE one cheaper setting only. One probe per task is enough.
+   Record each attempt in `rerun.tried` (setting, limits, result, tokens, time).
+4. Rerun the whole list at a new setting only if a probe changed an outcome or cut time a lot; the phase
+   takes the run that scores best within its time.
+5. Limit reruns and probes together take at most ~20% of the phase's time.
+6. Any other single-task rerun changes the score only when the first failure was infrastructure (verifier
+   setup, image pull); otherwise it is reported beside the score.
 
 Name what each cause would need to fix and whether it is the model, the serving stack or the harness.
 
@@ -224,13 +228,13 @@ In `doc/agentic_evals/`:
   `reference` (`value`, `source`, `reasoning`), `band_pass`, `predicted_hours`, `explained_hours`,
   `measured_hours`, `collected`, and `failures`: one row per failed task with `task`, `cause` (`wrong`,
   `loop_cap`, `malformed_tool_call`, `cutoff_progressing`, `stalled`, `infrastructure`, `fetched_solution`),
-  `evidence` and `rerun` (`tried`, `counted`); plus
+  `evidence` and `rerun` (`tried`: setting, `limits`, result; `counted`); plus
   `phases`: per phase `run`, `start_hour`, `pass`, and `reason` when not passed.
 - `runs.json`: the runner's append-only run records.
 - `learned.json`: `best_config` per suite (the config, list size and hours of the best valid run),
   `harness_facts` and `generic_fixes`, for the next model.
-- `REPORT.md`: each phase passed or not passed yet (with the reason), scores with intervals and reasoning
-  settings against references, hours predicted against measured, a late phase 2 start if any, the per-task
+- `REPORT.md`: each phase passed or not passed yet (with the reason), scores with intervals, reasoning
+  settings and limits against the references', hours predicted against measured, a late phase 2 start if any, the per-task
   analysis, then what remains.
 
 Update `workload` in `agentic_serving.json` with the measured values.
