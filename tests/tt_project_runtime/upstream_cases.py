@@ -1414,3 +1414,40 @@ def test_a_reply_mark_is_not_a_named_note_and_never_hides_a_placeholder():
     for bad in ('"<text>"', "<reply>"):
         with pytest.raises(upstream.NotePlaceholder):
             upstream.check_placeholder(upstream.reply_text(bad, fp))
+
+
+def test_ack_wait_cursor_skips_consumed_replies_and_terminal_waits_past_acknowledgements(env, monkeypatch, capsys,
+                                                                                         tmp_path):
+    # An interim reply taken once never counts again (--after), and --terminal passes only on a reply that
+    # reads as a result (done, failed, a prerequisite), never on an acknowledgement or a plan.
+    from ttp import ackwait, cli, upstream
+    from ttp.project import register
+    p = make(env)
+    (env["tmp"] / "peer").mkdir()
+    register("peer", {"host": "testhost", "dir": str(env["tmp"] / "peer")})
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    request = "please run the canary and report its result"
+    assert upstream.send(p.name, 4, "peer", request) == "sent"
+    fp = upstream.note_id("peer", request)
+    upstream.send("peer", 1, p.name, f"re {fp}: acknowledged, the canary is queued and a result follows later")
+    interim = upstream.note_id(p.name, f"re {fp}: acknowledged, the canary is queued and a result follows later")
+    probe = ["probe", "--from", "peer", "--hash", fp]
+    assert _ack_wait(cli, *probe) == 0, "without --terminal any reply still counts, as before"
+    assert _ack_wait(cli, *probe, "--terminal") == 1, "an acknowledgement is no terminal result"
+    assert "only acknowledge or plan" in capsys.readouterr().out
+    assert _ack_wait(cli, *probe, "--after", interim) == 1, "the consumed interim reply never counts again"
+    upstream.send("peer", 1, p.name, f"re {fp}: I will start the canary soon")
+    assert _ack_wait(cli, *probe, "--after", interim, "--terminal") == 1
+    result = f"re {fp}: canary failed on its prerequisite check; status: failed"
+    upstream.send("peer", 1, p.name, result)
+    assert _ack_wait(cli, *probe, "--after", interim, "--terminal") == 0
+    out = tmp_path / "result.json"
+    monkeypatch.setenv("TTP_RESULT", str(out))
+    assert _ack_wait(cli, "settle", "--from", "peer", "--hash", fp, "--after", interim, "--terminal") in (None, 0)
+    got = json.loads(out.read_text())
+    assert got["metrics"]["reply_note"] == upstream.note_id(p.name, result) and "status: failed" in got["summary"]
+    assert ackwait.find(p.name, "peer", fp, [upstream.note_id(p.name, result)]) is None, "the cursor drops earlier ones"
+    for text, want in (("status: done", True), ("done; the canary passed", True), ("Status: queued, done later", False),
+                       ("received, will do", False), ("blocked on a prerequisite: the pinned image", True),
+                       ("thanks", False), ("result = pending; prior run failed", False)):
+        assert ackwait.terminal(text) is want, text

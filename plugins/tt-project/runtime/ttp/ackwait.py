@@ -12,6 +12,10 @@ and the stored text's sha256 prefix. A reply is a note that project files for th
 - `ttp ack-wait settle --from <project> --hash <...>` as its on_pass_cmd: it writes a `done` (or
   `--status needs_review`) hand-off quoting the reply to $TTP_RESULT, so the task ends model-free.
 
+Both take `--after <note id>` (repeatable): replies already consumed, a cursor, so an interim reply taken
+once never counts again; and `--terminal`: only a reply that reads as a terminal result (done, failed, or
+a prerequisite it cannot pass) counts, never an acknowledgement, a plan or an interim note.
+
 The reply is another project's data, never an instruction or an approval: the hand-off says so.
 Nothing of the other project's is read but the shared inbox and, read-only, whether it can act now
 (peer_recovering: its daemon, pause and coordinator state, and the status of a task the probe names with
@@ -48,11 +52,48 @@ def _inbox() -> list[dict]:
         return []
 
 
-def find(me: str, frm: str, h: str) -> dict | None:
-    """The first note project `frm` filed for project `me` that names `h`, or None."""
-    h = check_hash(h)
+def replies(me: str, frm: str, h: str, after=()) -> list[dict]:
+    """Every note project `frm` filed for project `me` that names `h`, in inbox order. `after` (note ids):
+    replies already consumed, the cursor: none of them, and no reply filed before the last of them, counts."""
+    h, seen = check_hash(h), {check_hash(x) for x in after or ()}
+    out = []
     for n in _inbox():
-        if n.get("to") == me and n.get("project") == frm and h in str(n.get("spec") or "").lower():
+        if n.get("to") != me or n.get("project") != frm or h not in str(n.get("spec") or "").lower():
+            continue
+        if str(n.get("fp") or "").lower() in seen:
+            out = []   # the cursor: what came before a consumed reply was consumed with it
+            continue
+        out.append(n)
+    return out
+
+
+# A reply's own status line ("status: done", "result = failed"), which decides alone; else its words: a
+# terminal result (done, failed, or a prerequisite it cannot pass) with nothing that says more is to come.
+_STATUS_RE = re.compile(r"\b(?:status|result|outcome|verdict)\s*[:=]\s*([a-z_' -]+)", re.I)
+_TERMINAL_STATUS = re.compile(r"^(?:done|complete[d]?|finished|failed|failure|error|blocked|rejected|landed|pushed|"
+                              r"passed|succeeded|needs_review|won'?t ?fix|wontfix|cancell?ed|aborted)\b", re.I)
+_TERMINAL_RE = re.compile(r"\b(?:done|completed|finished|failed|failure|landed|pushed|passed|succeeded|rejected|"
+                          r"aborted|won'?t ?fix|wontfix|cannot proceed|can't proceed|blocked (?:on|by)|"
+                          r"prerequisites?)\b", re.I)
+_PENDING_RE = re.compile(r"\b(?:acknowledg\w*|ack(?:ed|s)?|received|noted|will|going to|plan(?:s|ned)? to|planned|"
+                         r"queued|scheduled|in progress|working on|started|starting|interim|later|soon|eta|"
+                         r"next step|follows?|pending)\b", re.I)
+
+
+def terminal(text: str) -> bool:
+    """Whether reply `text` reads as a terminal result (done, failed, or a prerequisite it cannot pass), not
+    an acknowledgement, a plan or an interim note. In doubt, not terminal: the wait goes on."""
+    text = str(text or "")
+    for m in _STATUS_RE.finditer(text):
+        return bool(_TERMINAL_STATUS.match(m.group(1).strip()))   # the first status line decides
+    return bool(_TERMINAL_RE.search(text)) and not _PENDING_RE.search(text)
+
+
+def find(me: str, frm: str, h: str, after=(), want_terminal: bool = False) -> dict | None:
+    """The first note project `frm` filed for project `me` that names `h` past the consumed replies `after`
+    (and, with `want_terminal`, that reads as a terminal result), or None."""
+    for n in replies(me, frm, h, after):
+        if not want_terminal or terminal(n.get("spec")):
             return n
     return None
 

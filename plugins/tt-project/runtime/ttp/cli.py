@@ -9164,7 +9164,9 @@ def cmd_ack_wait(a) -> None:
         print(f"ttp ack-wait: {a.frm!r} is not another project of this user's; `ttp list` shows them")
         sys.exit(ackwait.CANNOT)
     try:
-        n = ackwait.find(p.name, a.frm, a.hash)
+        after = a.after or []
+        n = ackwait.find(p.name, a.frm, a.hash, after, a.terminal)
+        early = [] if n or not a.terminal else ackwait.replies(p.name, a.frm, a.hash, after)
     except ValueError as e:
         print(f"ttp ack-wait: {e}")
         sys.exit(ackwait.CANNOT)
@@ -9172,7 +9174,9 @@ def cmd_ack_wait(a) -> None:
         print(f"ttp ack-wait: cannot read the inbox: {e}")
         sys.exit(ackwait.CANNOT)
     if not n:
-        print(f"no reply from {a.frm} naming {a.hash.strip().lower()} yet")
+        print(f"{len(early)} repl{'y' if len(early) == 1 else 'ies'} from {a.frm} naming {a.hash.strip().lower()} "
+              f"(latest note {early[-1].get('fp')}) only acknowledge or plan, no terminal result yet" if early else
+              f"no reply from {a.frm} naming {a.hash.strip().lower()} yet")
         sys.exit(ackwait.WAITING)
     if a.action == "probe":
         print(f"{a.frm} replied: note {n['fp']}")
@@ -15665,6 +15669,11 @@ def main(argv: list[str] | None = None) -> None:
                    help="probe: the replying project's task that must act before it can reply, or its declared "
                         "recovery task (repeatable). While one is 'blocked' there, the wait raises no wait_stale; "
                         "it re-arms once that task leaves 'blocked'. The probe's answer is unchanged")
+    s.add_argument("--after", action="append", metavar="NOTE",
+                   help="a reply already consumed (repeatable): it, and every reply filed before it, no longer count")
+    s.add_argument("--terminal", action="store_true",
+                   help="only a reply that reads as a terminal result counts (done, failed, or a prerequisite it "
+                        "cannot pass; a 'status: <word>' line decides), never an acknowledgement, plan or interim note")
     s.set_defaults(fn=cmd_ack_wait)
 
     s = sub.add_parser("detach", help="start a job that outlives the run; writes <name>.rc")
