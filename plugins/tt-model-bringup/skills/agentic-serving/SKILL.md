@@ -159,12 +159,16 @@ not small regressions; report the interval.
 
 ### Server size
 
-For each run, in order: size the pool from measured free DRAM; set agents = min(pool tokens ÷ the suite's
-measured working set per agent, task sandboxes the host can run, tasks in the list); serve on the smallest
-validated batch that holds them. Where this leaves a choice, take the fastest projected finish (waves ×
+For each run, in order: measure device memory free at launch (per device, before the KV pool is
+allocated; the smallest device) and size the pool from it; set agents = min(pool tokens ÷ the suite's
+working set per agent, task sandboxes the host can run, tasks in the list); serve on the smallest
+validated batch that holds them. Record `server_size` with the run (Outputs). A pool below half the
+measured free memory, or more agents than the pool holds at their working set, needs a recorded `reason`;
+the gate is critical without one. Where this leaves a choice, take the fastest projected finish (waves ×
 per-task time at that batch's per-user rate, plus the tail). Agents never exceed `max_num_seqs`. Start
 from the best-known config in `learned.json` for this model or its closest model; a projection more than
 2× the best-known time for that list size is a config defect, not a size limit.
+Admit a run only when its projection from measured times fits `run_timeout_hours`.
 
 ### Settings
 
@@ -176,8 +180,8 @@ from the best-known config in `learned.json` for this model or its closest model
   solution (the upstream fix, a later release, the resolving discussion) is a failure and stays in the
   denominator; report how many. Never void a list.
 - **Task resources** come from each task's definition, never a blanket value.
-- **Reasoning:** the list runs at the reference's setting (medium when unknown); Failure analysis probes
-  others. Record the setting with each run and the reference's own setting with the reference.
+- **Reasoning:** start at the reference's setting (medium when unknown); Failure analysis probes others.
+  Record the setting with each run and the reference's own setting with the reference.
 - **Harness and route** are main's, unchanged. A real harness defect is fixed on a generic branch named for
   the defect and listed in `learned.json`.
 
@@ -198,12 +202,12 @@ This is iteration on the phase's failing tasks inside its time, never growth of 
 2. A task that hit the agent or request limit or the output cap fails on it only if its trajectory loops
    (`loop_cap`) or stalls (`stalled`). One cut off while progressing is rerun alone at ≥ 2× that limit,
    within `run_timeout_hours`, until it finishes, loops or stalls; that result counts.
-3. For tasks that hit a limit or looped, probe other settings (thinking on or off, the efforts the server
-   offers) in parallel on the running server; on SWE one cheaper setting only. One probe per task is enough.
-   Record each attempt in `rerun.tried` (setting, limits, result, tokens, time).
-4. Rerun the whole list at a new setting only if a probe changed an outcome or cut time a lot; the phase
-   takes the run that scores best within its time.
-5. Limit reruns and probes together take at most ~20% of the phase's time.
+3. For tasks that looped or hit a limit, probe other settings (thinking on or off, the efforts the server
+   offers) on each task alone, in parallel where the server allows. One probe per task is enough. Record
+   each attempt in `rerun.tried` (setting, limits, result, tokens, time).
+4. Rerun the whole list at a new setting only if a probe solved a failed task, not for time alone; the
+   phase takes the run that scores best within its time.
+5. Limit reruns and probes together should take about 20% of the phase's time at most.
 6. Any other single-task rerun changes the score only when the first failure was infrastructure (verifier
    setup, image pull); otherwise it is reported beside the score.
 
@@ -223,8 +227,9 @@ before starting.
 
 In `doc/agentic_evals/`:
 
-- `results.json`: per run `phase`, `suite`, `tasks` (names, list rule), `config` (pool, agents, batch,
-  limits and their source, network mode, `reasoning`, SHAs), `score` (`solved`, `n`, `interval_95`),
+- `results.json`: per run `phase`, `suite`, `tasks` (names, list rule), `config` (`pool_tokens`, `agents`,
+  `batch`, `max_num_seqs`, `server_size` (`free_gb` per device measured at launch, `pool_gb` per device,
+  `working_set_tokens` per agent, `reason`), limits and their source, network mode, `reasoning`, SHAs), `score` (`solved`, `n`, `interval_95`),
   `reference` (`value`, `source`, `reasoning`), `band_pass`, `predicted_hours`, `explained_hours`,
   `measured_hours`, `collected`, and `failures`: one row per failed task with `task`, `cause` (`wrong`,
   `loop_cap`, `malformed_tool_call`, `cutoff_progressing`, `stalled`, `infrastructure`, `fetched_solution`),
