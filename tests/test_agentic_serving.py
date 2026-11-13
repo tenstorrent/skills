@@ -120,11 +120,33 @@ def wilson(solved, n, z=1.96):
     return 100 * (c - h), 100 * (c + h)
 
 
-def goal12(model, runs=None, phases=None, inputs=None, data=None, extra=None):
+def write_digest(model, run, flagged=(), unmapped=()):
+    """reply_digest.py output for `run`: one digest row per listed task, `flagged` tasks with a degenerate reply."""
+    folder = model / 'doc/agentic_evals/current' / run['id'] / 'digest'
+    folder.mkdir(parents=True, exist_ok=True)
+    names = list((run.get('tasks') or {}).get('names') or []) + [row['task'] for row in run.get('failures') or []]
+    tasks = {}
+    for name in dict.fromkeys(names):
+        tasks[name] = {'task': name, 'calls': 3, 'capped': int(name in flagged), 'flagged': int(name in flagged),
+                       'digest': f'{name}.json'}
+        (folder / f'{name}.json').write_text(json.dumps({'task': name, 'calls': []}))
+    (folder / 'summary.json').write_text(json.dumps({'run': run['id'], 'tasks': tasks, 'unmapped': {
+        'replies': len(unmapped), 'capped_or_flagged': [{'id': i, 'capped': True} for i in unmapped]}}))
+    return folder
+
+
+def goal12(model, runs=None, phases=None, inputs=None, data=None, extra=None, digests=True, logging=True):
     """Write a passing quick-mode goal-12 evidence set at `model` and run the gate; returns (code, stderr)."""
     runs = runs if runs is not None else [scored_run()]
     evals = model / 'doc/agentic_evals'
     evals.mkdir(parents=True, exist_ok=True)
+    if logging:
+        (evals / 'logging_check.json').write_text(json.dumps({'pass': True, 'id': 'chatcmpl-1', 'tokens': 12,
+                                                              'prompt_tokens': 20, 'finish': 'stop'}))
+    if digests:
+        for run in runs:
+            if not (evals / 'current' / run['id'] / 'digest/summary.json').is_file():
+                write_digest(model, run)
     (model / 'doc/benchmark').mkdir(parents=True, exist_ok=True)
     (model / 'doc/benchmark/serving_rates.json').write_text(json.dumps(rates()))
     results = {'runs': runs, 'phases': phases if phases is not None else {'phase1': {'run': 'gpqa10', 'pass': True}}}
@@ -623,3 +645,64 @@ def test_growing_contexts_without_prefix_caching_records_load_only(tmp_path):
     del data['serving']['growing_contexts']['late_hit_fraction']
     code, stderr = check(tmp_path, 'vllm', data)
     assert code == 1 and 'recurrent_state' in stderr and 'growing_contexts' not in stderr
+
+
+def test_logging_check_is_required_before_any_eval_run(tmp_path):
+    code, stderr = goal12(tmp_path, logging=False)
+    assert code == 2 and 'logging_check.json' in stderr
+    (tmp_path / 'doc/agentic_evals/logging_check.json').write_text(json.dumps({'pass': False, 'problems': ['no usage']}))
+    code, stderr = goal12(tmp_path, logging=False)
+    assert code == 2 and 'did not pass' in stderr
+
+
+def test_every_run_needs_a_reply_digest(tmp_path):
+    code, stderr = goal12(tmp_path, digests=False)
+    assert code == 2 and 'no reply digest' in stderr
+
+
+def test_failed_task_without_a_digest_row_is_critical(tmp_path):
+    run = scored_run()
+    folder = write_digest(tmp_path, run)
+    summary = json.loads((folder / 'summary.json').read_text())
+    del summary['tasks'][run['failures'][0]['task']]
+    (folder / 'summary.json').write_text(json.dumps(summary))
+    code, stderr = goal12(tmp_path, runs=[run])
+    assert code == 2 and 'has no reply digest row' in stderr
+
+
+def test_failed_task_with_no_mapped_calls_is_critical_unless_infrastructure(tmp_path):
+    run = scored_run()
+    folder = write_digest(tmp_path, run)
+    summary = json.loads((folder / 'summary.json').read_text())
+    summary['tasks'][run['failures'][0]['task']]['calls'] = 0
+    (folder / 'summary.json').write_text(json.dumps(summary))
+    code, stderr = goal12(tmp_path, runs=[run])
+    assert code == 2 and 'no model calls mapped' in stderr
+    run['failures'][0].update(cause='infrastructure', evidence='image pull failed')
+    assert goal12(tmp_path, runs=[run]) == (0, '')
+
+
+def test_capped_reply_mapped_to_no_task_is_critical_without_a_reason(tmp_path):
+    run = scored_run()
+    write_digest(tmp_path, run, unmapped=['chatcmpl-dropped'])
+    code, stderr = goal12(tmp_path, runs=[run])
+    assert code == 2 and 'map to no task' in stderr
+    run['unmapped_reason'] = 'replies of the stage-11 smoke run on the same server'
+    assert goal12(tmp_path, runs=[run]) == (0, '')
+
+
+def test_flagged_reply_needs_cause_anomaly_or_a_reason(tmp_path):
+    run = scored_run()
+    task = run['failures'][0]['task']
+    write_digest(tmp_path, run, flagged=[task])
+    code, stderr = goal12(tmp_path, runs=[run])
+    assert code == 2 and 'flagged (degenerate)' in stderr
+    run['flag_reasons'] = {task: 'triage: tail is a long base64 blob the task printed, not a token loop'}
+    assert goal12(tmp_path, runs=[run]) == (0, '')
+
+
+def test_flagged_reply_with_cause_anomaly_passes_the_digest_check(tmp_path):
+    run = anomaly_run()
+    write_digest(tmp_path, run, flagged=[run['failures'][0]['task']])
+    code, stderr = goal12(tmp_path, runs=[run], extra={'anomalies': [fix_attempt()]})
+    assert 'flagged' not in stderr and 'digest' not in stderr

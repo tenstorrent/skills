@@ -8,7 +8,9 @@ PYTHON="${PYTHON:-$(command -v python3 || command -v python)}"
 # launch (critical without a reason when the pool is below half of it); each degenerate reply (anomaly) and
 # phase below its band has an anomalies entry with a reproducible test and its full-precision result, and a
 # precision fix re-measures its rate rows and reruns the list at the fastest passing config tried (critical
-# otherwise). A phase not passed yet (score below its band, time the stage-11 rates do not explain) is advisory.
+# otherwise); the logging check before the first eval run passed, every run has a reply digest
+# (reply_digest.py) with a row for each failed task and no capped or flagged reply left unmapped, and a task
+# with a flagged reply has cause anomaly or a recorded reason (critical otherwise). A phase not passed yet (score below its band, time the stage-11 rates do not explain) is advisory.
 # Exit 0 pass, 1 advisory, 2 critical, 3 error.
 if [ -z "${MODEL_DIR:-}" ] && [ -z "${HF_MODEL:-}" ]; then
   echo "Neither MODEL_DIR nor HF_MODEL is set; cannot scope the check to the target model." >&2

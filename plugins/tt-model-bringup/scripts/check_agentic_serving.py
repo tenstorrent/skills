@@ -13,7 +13,10 @@ measured free at launch: a KV pool below POOL_FREE_FRACTION of it, or more agent
 their working set, is critical without a recorded reason. Each degenerate reply (cause `anomaly`) and each
 phase below its band needs an `anomalies` entry: a reproducible test with its served and full-precision
 results; a precision fix records the configs tried with speeds, picks the fastest passing one, re-measures
-its rate rows, and the phase's run uses it.
+its rate rows, and the phase's run uses it. Replies (scripts/reply_digest.py): the logging check before the first
+eval run passed (doc/agentic_evals/logging_check.json); every run has a reply digest; each failed task has a
+digest row and no capped or flagged reply is left unmapped; a task with a flagged (degenerate) reply has cause
+`anomaly` or a recorded reason (`flag_reasons`); all critical.
 Exit 0 pass, 1 advisory, 2 critical, 3 error.
 """
 from __future__ import annotations
@@ -30,6 +33,7 @@ EVALS = Path("doc/agentic_evals")
 RATES = Path("doc/benchmark/serving_rates.json")
 ANOMALY_CHECK = Path("doc/benchmark/anomaly_check.json")
 INPUTS = Path("bringup/agentic_evals/inputs.json")
+LOGGING_CHECK = EVALS / "logging_check.json"
 MIN_HIT_FRACTION = 0.9
 MODES = {"quick": ("phase1",), "agentic": ("phase1", "phase2"), "extended": ("phase1", "phase2")}
 DEFAULT_MODE = "agentic"
@@ -367,6 +371,54 @@ def check_anomalies(results: dict, runs: dict, phases: dict, inputs: dict, probl
                                                     "rerun the list at it and make that the phase's run")
 
 
+def check_logging(model_dir: Path, problems: list) -> None:
+    """The logging check before the first eval run: one short request's body, token counts and finish reason are in
+    the server's response log and reply_digest.py read them."""
+    path = model_dir / LOGGING_CHECK
+    if not path.is_file():
+        problems.append((2, f"missing {path}; before the first eval run send one short request through the served "
+                            "route and run reply_digest.py --check-log --record on the server log"))
+        return
+    record = read(path, problems)
+    if record.get("pass") is not True or not record.get("id"):
+        problems.append((2, f"{path}: the logging check did not pass ({record.get('problems')}); fix response logging "
+                            "before any eval run"))
+
+
+def check_digests(model_dir: Path, runs: dict, problems: list) -> None:
+    """Every run has a reply digest (reply_digest.py summary.json); each failed task has a digest row; no capped or
+    flagged reply is left without a task; a task with a flagged reply has cause `anomaly` or a recorded reason."""
+    for name, run in runs.items():
+        folder = model_dir / (run.get("digest") or EVALS / "current" / str(name) / "digest")
+        summary = folder / "summary.json"
+        if not summary.is_file():
+            problems.append((2, f"run {name} has no reply digest ({summary}); run reply_digest.py on its server log "
+                                "and per-call accounting"))
+            continue
+        data = read(summary, problems)
+        tasks = {str(k): v for k, v in (data.get("tasks") or {}).items() if isinstance(v, dict)}
+        unmapped = (data.get("unmapped") or {}).get("capped_or_flagged") or []
+        failures = {str(row.get("task")): row for row in run.get("failures") or [] if isinstance(row, dict)}
+        for task, row in failures.items():
+            digest = tasks.get(task)
+            if digest is None or not (folder / str(digest.get("digest", ""))).is_file():
+                problems.append((2, f"run {name}: failed task {task!r} has no reply digest row"))
+            elif not digest.get("calls") and row.get("cause") != "infrastructure":
+                problems.append((2, f"run {name}: failed task {task!r} has no model calls mapped in its digest; map its "
+                                    "replies through the per-call accounting"))
+        if unmapped and not run.get("unmapped_reason"):
+            problems.append((2, f"run {name}: {len(unmapped)} capped or flagged replies map to no task in the digest; "
+                                "map them (per-call accounting) or record unmapped_reason"))
+        reasons = run.get("flag_reasons") or {}
+        for task, digest in tasks.items():
+            if not digest.get("flagged"):
+                continue
+            row = failures.get(task) or {}
+            if row.get("cause") != "anomaly" and not (reasons.get(task) or row.get("flag_reason")):
+                problems.append((2, f"run {name}: task {task!r} has {digest['flagged']} flagged (degenerate) replies "
+                                    "but cause is not `anomaly`; record the anomaly or the reason (flag_reasons)"))
+
+
 def check_server_size(run: dict, problems: list) -> None:
     """The KV pool and agent count come from the device memory measured free at launch (per device)."""
     name, config = run.get("id", "?"), run.get("config") or {}
@@ -451,6 +503,8 @@ def check_evals(model_dir: Path, inputs: dict, evidence: dict, problems: list) -
         if run.get("voided") or run.get("excluded"):
             problems.append((2, f"run {run.get('id')} is voided or excluded; void per task, never the list"))
     check_anomalies(results, runs, phases, inputs, problems)
+    check_logging(model_dir, problems)
+    check_digests(model_dir, runs, problems)
     if mode == "extended":
         limit = inputs.get("run_timeout_hours", DEFAULT_RUN_TIMEOUT_HOURS)
         estimates = results.get("estimates") or {}
