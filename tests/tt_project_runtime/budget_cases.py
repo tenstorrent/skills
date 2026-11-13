@@ -2155,6 +2155,7 @@ def test_a_resume_a_logout_refuses_before_it_names_a_session_keeps_that_session_
     monkeypatch.setattr(Fake, "parse", refused)
     monkeypatch.setenv("TTP_FAKE_RESULT", "none")
     d.dispatch()
+    login.unlink()   # logged out at launch: the check passed before the run, the provider refuses it
     _finish_runs(p, d)
     cut = p.db.one("SELECT * FROM runs WHERE task=? ORDER BY id DESC LIMIT 1", (tid,))
     note = json.loads(cut["note"])
@@ -2164,6 +2165,7 @@ def test_a_resume_a_logout_refuses_before_it_names_a_session_keeps_that_session_
     assert got["session"] == "a1" and got["run"] == cut["id"] and got["cause"] == "auth", got
     monkeypatch.setattr(Fake, "parse", parse)
     monkeypatch.delenv("TTP_FAKE_RESULT")
+    login.write_text("")   # the user logs back in: the breaker's check passes and the session resumes
     d.open_breaker("fake", "401")
     p.db.update_task(tid, status="queued")
     p.db.set_kv("auth_breaker:fake", {**alerts.breaker(p.db, "fake"), "next_check": time.time() - 1})
