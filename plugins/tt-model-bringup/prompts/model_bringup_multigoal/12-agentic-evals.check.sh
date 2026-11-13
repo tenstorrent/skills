@@ -3,7 +3,7 @@ TT_MODEL_BRINGUP_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYTHON="${PYTHON:-$(command -v python3 || command -v python)}"
 # Runner-side gate for the agentic-evals stage: serving invariants still hold (autoport entry);
 # each phase of the mode has a collected run with its records and per-task analysis, no list is
-# voided, and a task cut off by a limit shows a loop or stall or was rerun alone at a higher limit
+# voided, and a task cut off by a limit shows a loop or stall or was rerun at a higher limit
 # (critical otherwise); each run's KV pool and agents are sized from the device memory measured free at
 # launch (critical without a reason when the pool is below half of it); each degenerate reply (anomaly) and
 # phase below its band has an anomalies entry with a reproducible test and its full-precision result, and a
