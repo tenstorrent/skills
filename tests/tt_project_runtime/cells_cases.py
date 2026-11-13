@@ -41,6 +41,42 @@ def test_the_cells_line_is_parsed_with_either_separator_and_compared_normalised(
 
 
 
+def test_a_cell_name_ending_a_sentence_matches_its_hand_off_cell_without_the_punctuation():
+    from ttp import cells
+    # A one-word cell that ends the spec's sentence is still that cell, in a list or dict hand-off.
+    spec = "Build the bundle.\ncells: report_card."
+    assert cells.requested(spec) == ["report_card"]
+    assert cells.check(spec, {"cells": {"report_card": {"valid": True, "entries": 30}}})["missing"] == []
+    assert cells.check(spec, {"cells": ["report_card"]})["missing"] == []
+    assert cells.check("cells: alpha, beta.", {"cells": ["alpha", "beta"]})["missing"] == []
+    assert cells.check("cells: alpha; beta!", {"cells": "alpha, beta?"})["missing"] == []
+    # Inside quotes or backticks too, and a hand-off key with a period matches the clean name.
+    assert cells.requested('cells: `alpha.`, "beta?"') == ["`alpha`", '"beta"']
+    assert cells.check("cells: alpha", {"cells": {"alpha.": 1}})["missing"] == []
+    # A device id ends in a digit and keeps its dots; it matches only itself.
+    assert cells.requested("cells: 81:00.0, 0000:82:00.0.") == ["81:00.0", "0000:82:00.0"]
+    assert cells.check("cells: 81:00.0", {"cells": ["81:00"]})["missing"] == ["81:00.0"]
+    assert cells.check("cells: 81:00.0", {"cells": ["81:00.0"]})["missing"] == []
+    # A still-missing cell is named without its period.
+    assert cells.prefix(cells.check("cells: alpha, beta.", {"cells": ["alpha"]})) == \
+        "partial: 1 of 2 cells (missing: beta). "
+    # A descriptive line stays refused.
+    assert cells.problem("cells: one row per chip with its cause.") is not None
+
+
+def test_a_done_whose_spec_cell_ends_with_a_period_is_not_partial_and_gets_no_hop(env):
+    p = make(env)
+    res = {"status": "done", "summary": "bundle built", "cells": {"report_card": {"valid": True, "entries": 30}}}
+    tid, done = _finish_cells(env, p, "Build the bundle.\ncells: report_card.", res, title="bundle")
+    assert load_result(p.db.task(tid)["result"])["summary"] == "bundle built"
+    assert "partial" not in done["text"]
+    assert not p.db.q("SELECT id FROM tasks WHERE parent=?", (tid,))
+    assert not p.db.q("SELECT id FROM events WHERE task=? AND kind='followup_proposed'", (tid,))
+    # A missing one hops under its clean name.
+    tid2, done2 = _finish_cells(env, p, "cells: report_card, ledger.", dict(res, summary="half"), title="bundle")
+    assert "missing: ledger)" in load_result(p.db.task(tid2)["result"])["summary"]
+
+
 def test_a_dict_cells_field_counts_valid_rows_and_normalises_keys():
     from ttp import cells
     rows = {" 150 w ": {"tok_s": 41.2}, "`200W`": {"tok_s": 40.1, "valid": True}, "250w": "ok", "300W": None}

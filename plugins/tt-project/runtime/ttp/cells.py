@@ -10,8 +10,9 @@ line ('one row per chip: unit, cause') is refused at spec time (problem()) and, 
 ignored (ignored()). A done hand-off lists the requested cells
 it finished with a valid result in its `cells` field, a list of names or a dict name -> row; a cell
 that ran without a valid result is not finished (a dict value that is None, False, empty, `valid:
-false` or a string starting `invalid`; a 0 is a measurement, so finished). Cells match case-insensitively, ignoring whitespace and surrounding quotes; cells beyond
-the requested ones are fine.
+false` or a string starting `invalid`; a 0 is a measurement, so finished). Cells match
+case-insensitively, ignoring whitespace, surrounding quotes and trailing sentence punctuation
+(`cells: a, b.` names `b`); cells beyond the requested ones are fine.
 
 A missing cell gets a `continue:` hop only when a hop could produce it (hop_cells): not one the
 hand-off marks unrunnable with a reason (`cells_unrunnable`: a dict cell -> why, or a list of
@@ -37,18 +38,22 @@ SPEC_CHARS = 4000   # the follow-up's copy of its parent's spec
 NAME_WORDS = 5      # a cell name's most words ('model A x 4 chips' is 5)
 NAME_CHARS = 40     # a cell name's most characters
 TOKEN_COLON = re.compile(r"[^\s:]+(?::[^\s:]+)+")   # a ':' only inside one token: 81:00.0, 0000:81:00.0
+END = ".!?,;"   # sentence punctuation a cell name never ends in: `cells: a, b.` names `b`
+TAIL = re.compile(r"[.!?,;]+(?=[`'\"]*$)")   # that punctuation at a name's end, inside closing quotes too
 
 
 def norm(cell) -> str:
-    """The form cells compare in: no whitespace, no surrounding quotes or backticks, case folded."""
-    return "".join(str(cell).split()).strip("`'\"").casefold()
+    """The form cells compare in: no whitespace, no surrounding quotes or backticks, no trailing
+    sentence punctuation (`cells: a, b.` names `b`), case folded."""
+    return "".join(str(cell).split()).strip("`'\"").rstrip(END).strip("`'\"").casefold()
 
 
 def split(text: str) -> list[str]:
-    """The cells of one `cells:` line's text, whitespace collapsed, in order, each once."""
+    """The cells of one `cells:` line's text, whitespace collapsed and trailing sentence punctuation
+    dropped (quotes kept), in order, each once."""
     out, seen = [], set()
     for part in SEP.split(text or ""):
-        cell = " ".join(part.split())
+        cell = TAIL.sub("", " ".join(part.split()))
         if norm(cell) and norm(cell) not in seen:
             seen.add(norm(cell))
             out.append(cell)
