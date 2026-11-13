@@ -131,3 +131,18 @@ def test_digest_results_off_switch_and_its_validator(env):
     assert check(" Off ") is False and check("on") is True
     with pytest.raises(ValueError):
         check("sometimes")
+
+
+def test_digest_results_show_a_lead_tasks_spec_result_line_over_its_hold_note(env):
+    """A task the coordinator finished itself before its `result:` line was stored as its summary shows
+    that line, not the lead hold note; a stored summary still wins."""
+    from ttp import digestresults as dr, leadmode
+    p = make(env)
+    tid = p.db.add_task("lead work", "do it\n\n## Update\nresult: measured 3 of 3", kind="work")
+    p.db.update_task(tid, status="done", blocked_reason=leadmode.HELD_NOTE)
+    clip = lambda s, n: s[:n]
+    got = dr._entry(p.db, p.db.task(tid), "tag", clip)
+    assert "measured 3 of 3" in got and leadmode.HELD_NOTE not in got
+    p.db.update_task(tid, result=json.dumps({"status": "done", "summary": "the stored summary"}))
+    got = dr._entry(p.db, p.db.task(tid), "tag", clip)
+    assert "the stored summary" in got and "measured 3 of 3" not in got

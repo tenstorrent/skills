@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .db import DB
+from . import leadmode
 from . import schedule as sched
 from . import timefmt
 
@@ -66,7 +67,7 @@ def record_off(db: DB, name: str, enabled: bool | None, by: str, user: bool, now
 
 def _task(db: DB, done: bool) -> dict | None:
     """The latest daily-review run task: the latest done one with a summary (its receipt), or the latest at all."""
-    rows = db.q("SELECT id, status, result, blocked_reason, created, updated FROM tasks WHERE origin='schedule' "
+    rows = db.q("SELECT id, status, result, spec, blocked_reason, created, updated FROM tasks WHERE origin='schedule' "
                 "AND labels=?" + (" AND status='done'" if done else "") + " ORDER BY id DESC LIMIT 20",
                 (json.dumps([NAME]),))
     if not done:
@@ -79,7 +80,9 @@ def _summary(t: dict) -> str:
         res = json.loads(t.get("result") or "{}")
     except (TypeError, ValueError):
         return ""
-    return str(res.get("summary") or "").strip() if isinstance(res, dict) else ""
+    said = str(res.get("summary") or "").strip() if isinstance(res, dict) else ""
+    # A run the coordinator finished itself (lead mode) before its `result:` line was kept as the summary.
+    return said or (leadmode.spec_result(t.get("spec")) if t.get("status") == "done" else "")
 
 
 def _ended(db: DB, t: dict) -> float:

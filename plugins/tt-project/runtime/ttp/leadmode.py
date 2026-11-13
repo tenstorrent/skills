@@ -36,6 +36,22 @@ WORKER_KINDS = ("code",)
 DEFAULTS = {"base_gap_s": 30, "max_gap_s": 1800, "list_max": 15}
 
 
+RESULT_LINE = re.compile(r"(?mi)^result:[ \t]*")
+RESULT_MAX = 4000                    # chars of a lead task's `result:` text kept as its result summary
+
+
+def spec_result(spec: str | None) -> str:
+    """The text of the last line of `spec` that starts with `result:` (prefix dropped), through the end
+    of the spec, capped at RESULT_MAX; "" when there is none. A lead task the coordinator finishes
+    itself ends its spec with that line: it is the task's result summary (coordinator.apply's
+    task_update, and the readers of a summary that predate it)."""
+    hits = list(RESULT_LINE.finditer(spec or ""))
+    if not hits:
+        return ""
+    text = (spec or "")[hits[-1].end():].strip()
+    return text if len(text) <= RESULT_MAX else text[:RESULT_MAX - 1].rstrip() + "…"
+
+
 def on(cfg: dict) -> bool:
     return bool((cfg.get("coordinator") or {}).get("lead"))
 

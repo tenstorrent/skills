@@ -305,3 +305,79 @@ def test_status_and_the_web_header_show_the_self_review_line(env):
     status_text = __import__("ttp.cli", fromlist=["x"]).status_text
     assert "self-review: last ran 3 h ago" in status_text(p, verbose=True), "a routine line: --verbose only"
     assert "self-review:" not in status_text(p)
+
+
+def _sr_lead_review(p, ago_h=1):
+    """A daily-review run task the coordinator works itself (lead mode): queued, held by the lead note."""
+    from ttp import leadmode
+    db = p.db
+    tid = db.add_task("[daily-review] review", "Assess progress.", origin="schedule", labels=["daily-review"])
+    db.x("UPDATE tasks SET blocked_reason=?, created=? WHERE id=?",
+         (leadmode.HELD_NOTE, time.time() - ago_h * H, tid))
+    return tid
+
+
+def test_a_lead_review_the_coordinator_marks_done_keeps_its_result_line_as_its_receipt(env, monkeypatch):
+    """The coordinator finishes a lead task with a spec whose last line starts `result:`: that text is
+    the task's result summary, so the daily review counts it as its receipt and queues no new run, and
+    the lead hold note goes."""
+    from ttp import coordinator as coord
+    from ttp import selfreview
+    p = make(env)
+    d = _sr_daemon(p)
+    _sr_receipt(p, 30)
+    tid = _sr_lead_review(p)
+    _sr_work(p)
+    said = "result: daily review done; needless asks: 0 of 2.\nImprovements:\n1. trim the digest"
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "status": "done",
+                            "spec": "progress: stats read.\n" + said}]) == []
+    t = p.db.task(tid)
+    assert t["status"] == "done" and t["blocked_reason"] is None
+    assert json.loads(t["result"])["summary"] == said[len("result: "):]
+    queued = []
+    monkeypatch.setattr(d, "_schedule_llm", lambda *a, **k: queued.append(a) or "queued")
+    _sr_check(d)
+    assert not queued and not _sr_events(p) and len(_sr_runs(p)) == 2
+    assert selfreview.assess(p.db, time.time(), d.cfg["created"])["state"] == "ok"
+
+
+def test_a_lead_review_done_before_the_fix_counts_through_its_spec_result_line(env, monkeypatch):
+    """A lead run finished before its `result:` line was stored (no summary in its result) still counts
+    as the receipt, read from its spec; a done run with neither stays no receipt."""
+    from ttp import selfreview
+    p = make(env)
+    d = _sr_daemon(p)
+    _sr_receipt(p, 30)
+    tid = _sr_lead_review(p, ago_h=2)
+    p.db.update_task(tid, status="done", spec="Assess.\n\n## Update\nresult: reviewed; needless asks: 0 of 1")
+    _sr_work(p)
+    queued = []
+    monkeypatch.setattr(d, "_schedule_llm", lambda *a, **k: queued.append(a) or "queued")
+    _sr_check(d)
+    assert not queued and not _sr_events(p)
+    assert selfreview._task(p.db, done=True)["id"] == tid
+    p.db.update_task(tid, spec="Assess.\n\n## Update\nprogress: only notes, no result line")
+    assert selfreview._task(p.db, done=True)["id"] != tid
+
+
+def test_a_worker_runs_result_stays_when_the_coordinator_closes_its_task(env):
+    """A task whose run wrote a summary keeps it: a `result:` line in the coordinator's update never
+    replaces it; a task without one gets the line, and a spec with none adds no summary."""
+    from ttp import coordinator as coord
+    p = make(env)
+    db = p.db
+    ran = db.add_task("worker task", "do it", status="blocked")
+    db.update_task(ran, result=json.dumps({"status": "done", "summary": "the run's own summary", "artifacts": ["a"]}))
+    assert coord.apply(p, [{"type": "task_update", "id": ran, "status": "done",
+                            "spec": "result: the coordinator's line"}]) == []
+    assert json.loads(db.task(ran)["result"]) == {"status": "done", "summary": "the run's own summary",
+                                                  "artifacts": ["a"]}
+    gone = db.add_task("not needed", "do it")
+    assert coord.apply(p, [{"type": "task_update", "id": gone, "status": "cancelled",
+                            "text": "superseded by another task"}]) == []
+    assert "summary" not in json.loads(db.task(gone)["result"] or "{}")
+    kept = db.add_task("lead work", "do it")
+    db.update_task(kept, result=json.dumps({"stale_wakes": 0}))
+    assert coord.apply(p, [{"type": "task_update", "id": kept, "status": "done",
+                            "spec": "result: measured it"}]) == []
+    assert json.loads(db.task(kept)["result"])["summary"] == "measured it"

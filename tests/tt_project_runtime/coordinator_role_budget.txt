@@ -73,3 +73,4 @@
 +135: when the user asked for speed, apply a worker's slot proposal at once; no spend cap rises without the user's word (note 90a59829)
 +10: the queue-time bullet's speed clause, measured after rebasing onto the tip (45632 against 45625; user msg #2010)
 +110: a running worker acks a mid-run update with a `ttp note "update: ..."`; unread after 5 min raises steer_unread (#6313)
++33: schedule_set's grace_min row (keyed lines at normal or above, could-not-run errors; e21249641, +47) and the larger-batches rewrite (7a8f0fb2a, +46) landed past the cap; measured 47648 against 47615 on e342ade66

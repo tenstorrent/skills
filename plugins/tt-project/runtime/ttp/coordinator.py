@@ -70,6 +70,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     hostcycle,
     jevuse,
     landed,
+    leadmode,
     loadcaps,
     machine_ledger,
     machines,
@@ -3512,6 +3513,16 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                             and (cp := waketier.plan(db, cfg, prev, prev["waiting_since"], over)):
                         new[waketier.PLAN] = cp
                     upd["result"] = dump_result(new)
+                if upd.get("status") in ("done", "cancelled"):
+                    # A task the coordinator finished itself (lead mode): the last `result:` line of its
+                    # spec is its result summary, read by the review receipt and the digest's results.
+                    # A run's own summary stays; the lead hold note goes once it has ended.
+                    prev = load_result(upd.get("result") or task["result"])
+                    said = leadmode.spec_result(upd.get("spec", task["spec"]))
+                    if said and not str(prev.get("summary") or "").strip():
+                        upd["result"] = dump_result({**prev, "summary": said})
+                    if task["blocked_reason"] == leadmode.HELD_NOTE and "blocked_reason" not in upd:
+                        upd["blocked_reason"] = None
                 if waits or upd.get("status", "blocked") != "blocked":
                     labels = upd.get("labels")
                     labels = json.loads(task["labels"] or "[]") if labels is None else labels

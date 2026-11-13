@@ -13,7 +13,7 @@ import hashlib
 import json
 import re
 
-from . import coordsession, spans
+from . import coordsession, leadmode, spans
 from .db import load_result, task_outcome
 
 KEY = "task_results"    # the coordinator.DIGEST_SEEN_KEY entry: {"session", "ids": {task id: hash}, "push"}
@@ -67,7 +67,7 @@ def _entry(db, t: dict, tag: str, clip) -> str:
     path = f"{run['dir']}/result.json" if run and run["dir"] else "(no run)"
     push = db.one("SELECT status, COALESCE(landed_sha, pushed_sha) AS sha FROM push_queue WHERE task=? "
                   "ORDER BY id DESC LIMIT 1", (t["id"],))
-    summary = clip(r.get("summary") or t.get("blocked_reason") or "", SUMMARY)
+    summary = clip(r.get("summary") or leadmode.spec_result(t.get("spec")) or t.get("blocked_reason") or "", SUMMARY)
     lines = [f"- #{t['id']} {task_outcome(t)}: {clip(t['title'], 90)}"]
     if summary:
         lines.append("  " + spans.wrap(summary, f"result of #{t['id']}", tag))
