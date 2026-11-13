@@ -255,10 +255,14 @@ Name what each cause would need to fix and whether it is the model, the serving 
 
 ### Runner, usage and sub-agents
 
-The multigoal runner, not the agent, waits on runs: a run registers its id and collect command in
-`runs.json`; the runner collects and scores it, appends its record (start, end, hours, conclusion) and wakes
-the agent, even if the agent has stopped. With nothing to decide, the agent ends its turn instead of
-polling. When the stage ends (and after each remediation round) the runner counts the stage's own Codex
+The multigoal runner starts and checks stages; it does not watch eval runs. Start every list run and
+rerun wave with `scripts/eval_runs.py start --model-dir <model> --id <run> -- <harness command>`: the run
+survives the tool call, and its command, log, pid and start go to `runs.json`. Wait with `eval_runs.py wait
+--model-dir <model> --minutes <n>`: it blocks without model calls and records end, hours, exit code and
+`conclusion`. Each look in a short turn resends the whole context (Gemma's v4 stage-12 thread sent 392M
+input tokens), and agent-built supervisors have crashed mid-run; use waits of tens of minutes, and do
+other analysis between them. Score the run from the harness output and mark it `collected` in
+`results.json`. When the stage ends (and after each remediation round) the runner counts the stage's own Codex
 tokens and hours from its CODEX_HOME and writes them to REPORT.md (`## Stage usage`) and
 `stage_usage.json`; leave both as written. Sub-agents run at low effort for profiling, log triage and
 tests; the coordinator decides. Sub-agents append findings to `learned.json` and read it before starting.
@@ -277,7 +281,7 @@ In `doc/agentic_evals/`:
   when needed (Triage); `digest` when not `current/<run>/digest`; `config.precision` (the
   precision config file served); `anomalies` (datatype-sweep, Anomalies); plus
   `phases`: per phase `run`, `start_hour`, `pass`, and `reason` when not passed.
-- `runs.json`: the runner's append-only run records.
+- `runs.json`: the run records `eval_runs.py` writes (one per list run or wave).
 - `logging_check.json` (before the first run) and `current/<run>/digest/` (`summary.json`, `<task>.json`,
   `<task>.triage.json`).
 - `learned.json`: `best_config` per suite (the config, list size and hours of the best valid run),

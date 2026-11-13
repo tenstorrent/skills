@@ -250,7 +250,8 @@ def check_run(run: dict, inputs: dict, validated: list, collected: set, item: st
     the pass rule is advisory (not passed yet). True when it passes."""
     name, ok = run.get("id", "?"), True
     if not (run.get("collected") is True and name in collected):
-        problems.append((2, f"run {name} was not collected by the runner (results.json and runs.json)"))
+        problems.append((2, f"run {name} was not collected: it needs collected true in results.json and a "
+                            "conclusion in runs.json (scripts/eval_runs.py wait records it)"))
         ok = False
     listed = (run.get("tasks") or {})
     if not listed.get("rule"):
@@ -478,7 +479,7 @@ def check_evals(model_dir: Path, inputs: dict, evidence: dict, problems: list) -
     results = read(evals / "results.json", problems)
     ledger = read(evals / "runs.json", problems) if (evals / "runs.json").is_file() else {}
     if not (evals / "runs.json").is_file():
-        problems.append((2, f"missing {evals / 'runs.json'}; the runner records every run it collected"))
+        problems.append((2, f"missing {evals / 'runs.json'}; scripts/eval_runs.py records every run"))
     collected = {row.get("id") for row in (ledger.get("runs") or []) if isinstance(row, dict) and row.get("conclusion")}
     runs = {row.get("id"): row for row in results.get("runs") or [] if isinstance(row, dict)}
     phases = results.get("phases") or {}
