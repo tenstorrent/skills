@@ -9,9 +9,10 @@ alone at a higher limit; each recorded rerun has its reasoning setting and resul
 phase not passed yet (score below the band, unexplained time, unfinished list) is advisory with its
 recorded reason, never critical for the score alone. Each run's server size comes from the device memory
 measured free at launch: a KV pool below POOL_FREE_FRACTION of it, or more agents than the pool holds at
-their working set, is critical without a recorded reason. A degenerate reply (cause `anomaly`) needs a
-reproducible-test record with its full-precision result; a precision fix records the configs tried and
-their speeds, picks the fastest passing one, and the phase's run uses it.
+their working set, is critical without a recorded reason. Each degenerate reply (cause `anomaly`) and each
+phase below its band needs an `anomalies` entry: a reproducible test with its served and full-precision
+results; a precision fix records the configs tried with speeds, picks the fastest passing one, re-measures
+its rate rows, and the phase's run uses it.
 Exit 0 pass, 1 advisory, 2 critical, 3 error.
 """
 from __future__ import annotations
@@ -298,37 +299,50 @@ def check_run(run: dict, inputs: dict, validated: list, collected: set, item: st
     return ok
 
 
-def check_repro(name: str, row: dict, problems: list) -> None:
-    """An anomaly row's reproducible test (datatype-sweep, Anomalies): served and full-precision results, the change;
-    a precision fix lists the configs tried with measured speeds and chooses the fastest that passes."""
-    repro = row.get("repro") if isinstance(row.get("repro"), dict) else {}
-    served, full = repro.get("served") or {}, repro.get("full_precision") or {}
-    if not (repro.get("test") and repro.get("prompt") and "seed" in repro and repro.get("changed")
-            and served.get("precision") and "result" in served and "result" in full
-            and isinstance(full.get("pass"), bool)):
-        problems.append((2, f"run {name}: anomaly {row.get('task')!r} needs repro: test, prompt, seed, served "
-                            "(precision, result), full_precision (result, pass) and changed"))
-        return
-    if "chosen" not in repro:
-        return
-    tried = [t for t in repro.get("configs_tried") or [] if isinstance(t, dict)]
-    if not tried or not all(t.get("config") and isinstance(t.get("pass"), bool) and number(t.get("decode_tok_s_user"))
-                            for t in tried):
-        problems.append((2, f"run {name}: anomaly {row.get('task')!r} precision fix needs configs_tried rows "
-                            "(config, pass, measured decode_tok_s_user)"))
-        return
-    passing = [t for t in tried if t["pass"]]
-    fastest = max(passing, key=lambda t: t["decode_tok_s_user"], default={})
-    if repro["chosen"] != fastest.get("config"):
-        problems.append((2, f"run {name}: anomaly {row.get('task')!r} chose {repro['chosen']!r}; the fastest passing "
-                            f"config tried is {fastest.get('config')!r}"))
-
-
-def chosen_precisions(runs: dict, phase: str) -> set:
-    """Configs chosen by precision fixes for anomalies in this phase's runs."""
-    return {(row.get("repro") or {}).get("chosen") for run in runs.values() if run.get("phase") == phase
-            for row in run.get("failures") or [] if isinstance(row, dict) and row.get("cause") == "anomaly"
-            and isinstance(row.get("repro"), dict) and row["repro"].get("chosen")}
+def check_anomalies(results: dict, runs: dict, phases: dict, inputs: dict, problems: list) -> None:
+    """results.json `anomalies` (datatype-sweep, Anomalies): each anomaly failure and each phase run below its band
+    has a fix attempt with a reproducible test and its served and full-precision results; a precision fix lists the
+    configs tried with measured speeds, chooses the fastest passing one, re-measures its rate rows, and the
+    phase's run uses it (config.precision)."""
+    entries = [e for e in results.get("anomalies") or [] if isinstance(e, dict)]
+    covered = {(e.get("phase"), task) for e in entries for task in e.get("tasks") or []}
+    for run in runs.values():
+        for row in run.get("failures") or []:
+            if isinstance(row, dict) and row.get("cause") == "anomaly" and (run.get("phase"), row.get("task")) not in covered:
+                problems.append((2, f"run {run.get('id')}: anomaly {row.get('task')!r} has no anomalies entry "
+                                    "(phase, tasks) with a reproducible test"))
+    for phase, record in phases.items():
+        run = runs.get((record or {}).get("run")) or {}
+        if run.get("band_pass") is False and not any(e.get("phase") == phase for e in entries):
+            unmet(problems, inputs, phase, f"{phase} is below its band with no anomalies entry (fix attempt)")
+    for entry in entries:
+        name = f"anomalies entry {entry.get('phase')} {entry.get('tasks')}"
+        served, full = entry.get("served") or {}, entry.get("full_precision") or {}
+        if not (entry.get("phase") and entry.get("tasks") and entry.get("test") and entry.get("prompt")
+                and "seed" in entry and entry.get("changed") and served.get("precision") and "result" in served
+                and "result" in full and isinstance(full.get("pass"), bool)):
+            problems.append((2, f"{name} needs phase, tasks, test, prompt, seed, served (precision, result), "
+                                "full_precision (result, pass) and changed"))
+            continue
+        if "chosen" not in entry:
+            continue
+        tried = [t for t in entry.get("configs_tried") or [] if isinstance(t, dict)]
+        if not tried or not all(t.get("config") and isinstance(t.get("pass"), bool)
+                                and number(t.get("decode_tok_s_user")) for t in tried):
+            problems.append((2, f"{name}: a precision fix needs configs_tried rows (config, pass, measured "
+                                "decode_tok_s_user)"))
+            continue
+        fastest = max((t for t in tried if t["pass"]), key=lambda t: t["decode_tok_s_user"], default={})
+        if entry["chosen"] != fastest.get("config"):
+            problems.append((2, f"{name} chose {entry['chosen']!r}; the fastest passing config tried is "
+                                f"{fastest.get('config')!r}"))
+        if not entry.get("remeasured_rows"):
+            problems.append((2, f"{name}: re-measure the stage-11 rows the eval uses at {entry['chosen']!r} "
+                                "(remeasured_rows)"))
+        run = runs.get((phases.get(entry["phase"]) or {}).get("run")) or {}
+        if (run.get("config") or {}).get("precision") != entry["chosen"]:
+            unmet(problems, inputs, entry["phase"], f"{entry['phase']}: a precision fix chose {entry['chosen']!r}; "
+                                                    "rerun the list at it and make that the phase's run")
 
 
 def check_server_size(run: dict, problems: list) -> None:
@@ -380,8 +394,8 @@ def check_config(run: dict, validated: list, problems: list) -> None:
                                     "for single-task reruns"))
             elif limits[key] < reference[key]:
                 problems.append((1, f"run {name}: {key} {limits[key]} is below the harness reference {reference[key]}"))
-    if not config.get("sha"):
-        problems.append((2, f"run {name} config needs the sha it ran"))
+    if not (config.get("sha") and config.get("precision")):
+        problems.append((2, f"run {name} config needs the sha it ran and its precision config"))
 
 
 def check_evals(model_dir: Path, inputs: dict, evidence: dict, problems: list) -> None:
@@ -405,10 +419,6 @@ def check_evals(model_dir: Path, inputs: dict, evidence: dict, problems: list) -
             all_passed = False
             continue
         passed = check_run(run, inputs, validated, collected, phase, tasks, problems)
-        chosen = chosen_precisions(runs, phase)
-        if chosen and (run.get("config") or {}).get("precision") not in chosen:
-            unmet(problems, inputs, phase, f"{phase}: a precision fix chose {sorted(chosen)}; rerun the list at it "
-                                           "(config.precision) and make that the phase's run")
         all_passed = all_passed and passed
         record = phases.get(phase) or {}
         if record.get("pass") is not passed:
@@ -416,11 +426,9 @@ def check_evals(model_dir: Path, inputs: dict, evidence: dict, problems: list) -
         elif not passed and not record.get("reason"):
             problems.append((2, f"{phase} is not passed yet; results.json phases.{phase}.reason must say why"))
     for run in runs.values():
-        for row in run.get("failures") or []:
-            if isinstance(row, dict) and row.get("cause") == "anomaly":
-                check_repro(run.get("id", "?"), row, problems)
         if run.get("voided") or run.get("excluded"):
             problems.append((2, f"run {run.get('id')} is voided or excluded; void per task, never the list"))
+    check_anomalies(results, runs, phases, inputs, problems)
     if mode == "extended":
         limit = inputs.get("run_timeout_hours", DEFAULT_RUN_TIMEOUT_HOURS)
         estimates = results.get("estimates") or {}

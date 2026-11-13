@@ -5,9 +5,10 @@ PYTHON="${PYTHON:-$(command -v python3 || command -v python)}"
 # each phase of the mode has a collected run with its records and per-task analysis, no list is
 # voided, and a task cut off by a limit shows a loop or stall or was rerun alone at a higher limit
 # (critical otherwise); each run's KV pool and agents are sized from the device memory measured free at
-# launch (critical without a reason when the pool is below half of it); a degenerate reply (anomaly) has a
-# reproducible test with its full-precision result, and a precision fix reruns the list at the fastest
-# passing config tried (critical otherwise). A phase not passed yet (score below its band, time the stage-11 rates do not explain) is advisory.
+# launch (critical without a reason when the pool is below half of it); each degenerate reply (anomaly) and
+# phase below its band has an anomalies entry with a reproducible test and its full-precision result, and a
+# precision fix re-measures its rate rows and reruns the list at the fastest passing config tried (critical
+# otherwise). A phase not passed yet (score below its band, time the stage-11 rates do not explain) is advisory.
 # Exit 0 pass, 1 advisory, 2 critical, 3 error.
 if [ -z "${MODEL_DIR:-}" ] && [ -z "${HF_MODEL:-}" ]; then
   echo "Neither MODEL_DIR nor HF_MODEL is set; cannot scope the check to the target model." >&2

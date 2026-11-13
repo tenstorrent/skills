@@ -132,31 +132,44 @@ If layer-level decode evidence, reduced token-out evidence, or a prior optimized
 ## Anomalies
 
 A degenerate reply (stray or repeated tokens, collapse into a few characters, a token loop) is a precision
-or stack defect until shown otherwise, not a model answer. Goal 12 fixes one with this procedure; this stage
-runs step 6 as a guard.
+or stack defect until shown otherwise, not a model answer. Goal 12 runs steps 1–5 on each anomaly and on a
+phase below its band, inside the phase's time; this stage runs step 6 as a guard.
+
+**Where precision comes from.** The served precision is the config this stage selected:
+`selected_precision_config.json` (this skill's Preferred Outputs; the model's default construction path or
+the build kwargs that load it). Its fields, this sweep's `sweep_results.json` and the model's precision
+plumbing (what `build_generator` accepts) list the options. A change is a new config file passed by
+`--build-kwargs-file` to the runners, or to the server with a restart (about 15–30 min for a large model;
+budget each one). Record the file in the run's `config.precision`.
 
 1. **Detect.** Per reply, count distinct characters and repeated n-grams in the tail (e.g. the last 4,096
-   characters). A tail of a few distinct characters, or one dominated by a repeated n-gram while the head is
-   not, is an anomaly. Goal 12 marks such failures `cause: anomaly`.
-2. **Reproduce.** Freeze one prompt (the failing context up to the first stray token) and a seed. Write a
-   test that runs in minutes: the probability of the correct next token at that point, or the anomaly rate
-   over N short continuations. Run it at the served precision.
-3. **Full precision on TT:** BF16 weights, HiFi4, BF16 activations, BF16 head. If it still fails, run the
-   same prompt on an HF/GPU reference: if the reference passes, bisect the stack bug by op PCC; if it fails
-   too, report it as model behaviour.
+   characters). A tail of a few distinct characters, or one a repeated n-gram dominates while the head does
+   not, is an anomaly. `runtime/readiness_check/check_degenerate_output.py` catches doubled tokens and
+   collapse in runner outputs.
+2. **Reproduce.** From the failed trajectory take the model call that degenerated: its rendered input plus
+   the reply up to the first stray token. Save it as a prompt file under `doc/agentic_evals/anomalies/` with
+   the seed and sampling settings. Stop the eval server and run it on the model runner, not the eval
+   harness, at batch 1: `python -m readiness_check.run_autoregressive --prompt-file <file>
+   --build-kwargs-file <config>` (free-running, with the HF continuation beside it), or a reference from
+   `readiness_check.generate --prompt-source file` scored by `run_teacher_forcing`. Measure the anomaly rate
+   over N short continuations, or the top-1 agreement and the probability of the correct next token at the
+   failure point. It must run in minutes; shorten the prefix while it still fails.
+3. **Full precision on TT:** BF16 weights, HiFi4, BF16 activations, BF16 head. It only has to fit for this
+   batch-1 test. If it still fails, run the prompt on the HF/GPU reference: if that passes, bisect the stack
+   bug by op PCC; if it fails too, report model behaviour.
 4. **Bisect to the fastest passing config** when full precision passes: by group (head, MLP gate/up, down,
-   attention, activations), then by layer range, measuring decode speed at each step. Choose the fastest
-   config that passes; the next faster ones tried fail.
-5. **Re-measure** the stage-11 `serving_rates.json` rows the eval uses at the chosen config, then rerun the
-   eval list on it.
-6. **Guard (this stage):** free-run long replies on a few agent-shaped prompts at the selected config and
-   at full precision, and check both with the step-1 detector. An anomaly the full-precision run lacks
-   rejects the config.
+   attention, activations), then by layer range, measuring decode t/s/u at each step. Choose the fastest
+   config that passes; the next faster ones tried fail. A speed loss for accuracy is accepted.
+5. **Re-measure and rerun.** Restart the server on the chosen config, re-measure only the stage-11 rows the
+   eval uses at its batch (into `serving_rates.json`, labelled with the config), then rerun the eval list.
+6. **Guard (this stage):** free-run long replies (a few thousand tokens) on a few agent-shaped prompts at
+   the selected config and at full precision, and check both with the step-1 detector. An anomaly the
+   full-precision run lacks rejects the config.
 
-Record in the failure row's `repro`: `test` (command), `prompt` (frozen prompt file), `seed`, `served`
-(`precision`, `result`), `full_precision` (`result`, `pass`), the HF/GPU result when step 3 needed it, and
-`changed` (what was changed, or why nothing). A precision fix adds `configs_tried` (`config`, `pass`,
-measured `decode_tok_s_user`) and `chosen`; the rerun's `config.precision` is `chosen`.
+Goal 12 records each attempt in `results.json` `anomalies`: `phase`, `tasks`, `test` (command), `prompt`
+(file), `seed`, `served` (`precision`, `result`), `full_precision` (`result`, `pass`), the HF/GPU result
+when step 3 needed it, `changed` (what changed, or why nothing), `hours`; a precision fix adds
+`configs_tried` (`config`, `pass`, measured `decode_tok_s_user`), `chosen` and `remeasured_rows`.
 
 ## Plots
 

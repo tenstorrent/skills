@@ -102,6 +102,7 @@ def scored_run(run_id='gpqa10', phase='phase1', suite='r1_gpqa_diamond', solved=
     return {'id': run_id, 'phase': phase, 'suite': suite,
             'tasks': {'rule': 'stratified by domain, fixed list', 'names': [f'{suite}-{i}' for i in range(n)]},
             'config': {'pool_tokens': 400000, 'agents': 8, 'batch': 8, 'max_num_seqs': 8, 'sha': 'abc123',
+                       'precision': 'tt/selected_precision_config.json',
                        'server_size': {'free_gb': 26.0, 'pool_gb': 20.0, 'working_set_tokens': 40000},
                        'network': 'per task allow_internet', 'reasoning': {'thinking': True, 'effort': 'high'},
                        'limits': {**LIMITS, 'reference': dict(LIMITS), 'source': 'tt-inference-server eval config'}},
@@ -219,10 +220,11 @@ def test_phase_not_passed_yet_is_advisory_with_a_reason(tmp_path, solved, n, fau
     if fault:
         fault(run)
     phases = {'phase1': {'run': 'gpqa10', 'pass': False, 'reason': 'phase time ended'}}
-    code, stderr = goal12(tmp_path, runs=[run], phases=phases)
+    extra = {'anomalies': [fix_attempt()]}
+    code, stderr = goal12(tmp_path, runs=[run], phases=phases, extra=extra)
     assert code == 1 and message in stderr and 'not passed yet' in stderr
     del phases['phase1']['reason']
-    code, stderr = goal12(tmp_path, runs=[run], phases=phases)
+    code, stderr = goal12(tmp_path, runs=[run], phases=phases, extra=extra)
     assert code == 2 and 'must say why' in stderr
 
 
@@ -333,29 +335,38 @@ def test_pool_at_half_of_free_memory_passes_and_agents_must_fit_it(tmp_path):
     assert code == 2 and '8 agents x 60000' in stderr
 
 
-def anomaly_run(run_id='gpqa10', precision='bfp4-lofi'):
+def anomaly_run(run_id='gpqa10'):
     """GPQA task 102: correct reasoning, then stray apostrophes and a 5-character stream to the cap."""
     run = scored_run(run_id)
-    run['config']['precision'] = precision
     run['failures'][0].update(cause='anomaly', evidence='from char 14,000: 5 distinct chars in the last 4,096')
     return run
 
 
-REPRO = {'test': 'tests/repro_gpqa102.py', 'prompt': 'repro/gpqa102_prefix.txt', 'seed': 0,
-         'served': {'precision': 'bfp4-lofi', 'result': '9/10 continuations degenerate'},
-         'full_precision': {'result': '0/10 degenerate', 'pass': True},
-         'changed': 'head and MLP down to BF8 HiFi2'}
+def fix_attempt(**extra):
+    return {'phase': 'phase1', 'tasks': ['r1_gpqa_diamond-0'], 'test': 'run_autoregressive --prompt-file ...',
+            'prompt': 'doc/agentic_evals/anomalies/gpqa102_prefix.txt', 'seed': 0,
+            'served': {'precision': 'tt/selected_precision_config.json', 'result': '9/10 continuations degenerate'},
+            'full_precision': {'result': '0/10 degenerate', 'pass': True},
+            'changed': 'head and MLP down to BF8 HiFi2', **extra}
 
 
 def test_anomaly_needs_a_reproducible_test_with_a_full_precision_result(tmp_path):
     run = anomaly_run()
     code, stderr = goal12(tmp_path, runs=[run])
-    assert code == 2 and 'needs repro' in stderr
-    run['failures'][0]['repro'] = {**REPRO, 'full_precision': {'result': 'not run'}}
-    code, stderr = goal12(tmp_path, runs=[run])
+    assert code == 2 and 'has no anomalies entry' in stderr
+    code, stderr = goal12(tmp_path, runs=[run], extra={'anomalies': [fix_attempt(full_precision={'result': 'not run'})]})
     assert code == 2 and 'full_precision (result, pass)' in stderr
-    run['failures'][0]['repro'] = dict(REPRO)
-    assert goal12(tmp_path, runs=[run]) == (0, '')
+    assert goal12(tmp_path, runs=[run], extra={'anomalies': [fix_attempt()]}) == (0, '')
+
+
+def test_phase_below_its_band_needs_a_fix_attempt(tmp_path):
+    run = scored_run(solved=4)
+    run['band_pass'] = False
+    phases = {'phase1': {'run': 'gpqa10', 'pass': False, 'reason': 'below band'}}
+    code, stderr = goal12(tmp_path, runs=[run], phases=phases)
+    assert code == 2 and 'no anomalies entry (fix attempt)' in stderr
+    code, stderr = goal12(tmp_path, runs=[run], phases=phases, extra={'anomalies': [fix_attempt()]})
+    assert code == 1 and 'not passed yet' in stderr
 
 
 def test_precision_fix_takes_the_fastest_passing_config_and_reruns_the_list(tmp_path):
@@ -363,19 +374,19 @@ def test_precision_fix_takes_the_fastest_passing_config_and_reruns_the_list(tmp_
     tried = [{'config': 'bf8-head', 'pass': False, 'decode_tok_s_user': 21.0},
              {'config': 'bf8-head-down', 'pass': True, 'decode_tok_s_user': 19.0},
              {'config': 'bf16-full', 'pass': True, 'decode_tok_s_user': 12.0}]
-    first['failures'][0]['repro'] = {**REPRO, 'configs_tried': tried, 'chosen': 'bf16-full'}
+    entry = fix_attempt(configs_tried=tried, chosen='bf16-full', remeasured_rows=[{'batch': 8, 'input_tokens': 20000}])
     rerun = scored_run(solved=8)
     rerun['config']['precision'] = 'bf8-head-down'
-    code, stderr = goal12(tmp_path, runs=[first, rerun])
+    code, stderr = goal12(tmp_path, runs=[first, rerun], extra={'anomalies': [entry]})
     assert code == 2 and "fastest passing config tried is 'bf8-head-down'" in stderr
-    first['failures'][0]['repro']['chosen'] = 'bf8-head-down'
-    assert goal12(tmp_path, runs=[first, rerun]) == (0, '')
-    first['failures'][0]['repro']['configs_tried'] = [{'config': 'bf8-head-down', 'pass': True}]
-    code, stderr = goal12(tmp_path, runs=[first, rerun])
-    assert code == 2 and 'measured decode_tok_s_user' in stderr
-    first['failures'][0]['repro']['configs_tried'] = tried
-    rerun['config']['precision'] = 'bfp4-lofi'
-    code, stderr = goal12(tmp_path, runs=[first, rerun])
+    entry['chosen'] = 'bf8-head-down'
+    assert goal12(tmp_path, runs=[first, rerun], extra={'anomalies': [entry]}) == (0, '')
+    for key, value, message in (('configs_tried', [{'config': 'bf8-head-down', 'pass': True}], 'measured decode'),
+                                ('remeasured_rows', [], 'remeasured_rows')):
+        code, stderr = goal12(tmp_path, runs=[first, rerun], extra={'anomalies': [{**entry, key: value}]})
+        assert code == 2 and message in stderr
+    rerun['config']['precision'] = 'tt/selected_precision_config.json'
+    code, stderr = goal12(tmp_path, runs=[first, rerun], extra={'anomalies': [entry]})
     assert code == 2 and 'rerun the list' in stderr
 
 
@@ -410,9 +421,10 @@ def test_phase_1_not_passed_still_lets_phase_2_count_and_skips_extended(tmp_path
     runs[1]['reference'] = {'value': 61.2, 'source': 'operator floor', 'reasoning': 'unknown'}
     phases = {'phase1': {'run': 'gpqa10', 'pass': False, 'reason': 'below band at hour 12'},
               'phase2': {'run': 'swe10', 'pass': True, 'start_hour': 12}}
-    assert goal12(tmp_path, runs=runs, phases=phases, inputs={'mode': 'agentic'})[0] == 1
+    extra = {'anomalies': [fix_attempt()]}
+    assert goal12(tmp_path, runs=runs, phases=phases, inputs={'mode': 'agentic'}, extra=extra)[0] == 1
     code, stderr = goal12(tmp_path, runs=runs, phases=phases, inputs={'mode': 'extended'},
-                          extra={'estimates': {'r1_gpqa_diamond': 18.0, 'swe_bench_verified': 30.0}})
+                          extra={**extra, 'estimates': {'r1_gpqa_diamond': 18.0, 'swe_bench_verified': 30.0}})
     assert code == 1 and 'starts after both phases pass' in stderr
 
 

@@ -204,9 +204,10 @@ This is iteration on the phase's failing tasks inside its time, never growth of 
 2. A task that hit the agent or request limit or the output cap fails on it only if its trajectory loops
    (`loop_cap`) or stalls (`stalled`). One cut off while progressing is rerun alone at ≥ 2× that limit,
    within `run_timeout_hours`, until it finishes, loops or stalls; that result counts.
-3. Each anomaly, and a phase below its band, gets a fix attempt by datatype-sweep's Anomalies procedure,
-   recorded in the row's `repro`. A precision fix is the one allowed precision change: re-measure the
-   stage-11 rows the eval uses at the chosen config and rerun the list on it; a speed loss is accepted.
+3. Each anomaly, and a phase below its band, gets a fix attempt by $datatype-sweep's Anomalies section
+   (reproducible test on the model runner, full precision, bisect, re-measure, rerun), inside the phase's
+   time, recorded in `anomalies`. A precision fix is the one allowed precision change; a speed loss is
+   accepted.
 4. Optional, once precision is ruled out: for tasks that looped or hit a limit, probe other settings
    (thinking on or off, the efforts the server offers) on each task alone, in parallel where the server
    allows; one probe per task. Record each attempt in `rerun.tried` (setting, limits, result, tokens, time).
@@ -238,8 +239,8 @@ In `doc/agentic_evals/`:
   `reference` (`value`, `source`, `reasoning`), `band_pass`, `predicted_hours`, `explained_hours`,
   `measured_hours`, `collected`, and `failures`: one row per failed task with `task`, `cause` (`wrong`,
   `anomaly`, `loop_cap`, `malformed_tool_call`, `cutoff_progressing`, `stalled`, `infrastructure`, `fetched_solution`),
-  `evidence`, `repro` for an anomaly (datatype-sweep, Anomalies) and `rerun` (`tried`: setting, `limits`,
-  result; `counted`); `config.precision` after a precision fix; plus
+  `evidence` and `rerun` (`tried`: setting, `limits`, result; `counted`); `config.precision` (the
+  precision config file served); `anomalies` (datatype-sweep, Anomalies); plus
   `phases`: per phase `run`, `start_hour`, `pass`, and `reason` when not passed.
 - `runs.json`: the runner's append-only run records.
 - `learned.json`: `best_config` per suite (the config, list size and hours of the best valid run),
