@@ -1353,11 +1353,14 @@ def test_a_done_hand_off_whose_continue_only_waits_is_refused(env):
 
 
 def test_split_lines_defaults_to_200_and_reads_0_when_off_or_unreadable(env):
-    """chains.split_lines, the code worker's split threshold, ships a generic default; off or junk reads 0."""
+    """chains.split_lines, the code worker's split threshold, ships off (user 11-12: do much more work per
+    task); set, it reads its value; junk reads 0."""
     from ttp.project import DEFAULT_CONFIG as DEFAULTS
     from ttp.prompts import split_lines
     p = make(env)
-    assert DEFAULTS["chains"]["split_lines"] == 200 and split_lines(p.config()) == 200
+    assert DEFAULTS["chains"]["split_lines"] == 0 and split_lines(p.config()) == 0
+    p.set_config("chains.split_lines", 200)
+    assert split_lines(p.config()) == 200
     for bad in (0, None, "x", -5, [1]):
         assert split_lines({"chains": {"split_lines": bad}}) == 0
     assert split_lines({}) == 0 and split_lines({"chains": None}) == 0
@@ -1370,6 +1373,7 @@ def test_a_code_worker_is_told_to_split_past_the_configured_line_count_into_sepa
     Off (0), the rule and its marker are gone; no worker gets an unfilled placeholder."""
     from ttp.prompts import SPLIT_MARK, _sections, worker_prompt
     p = make(env)
+    p.set_config("chains.split_lines", 200)   # opt-in since 11-12 (default off)
     tid = p.db.add_task("code: a big change", "do it", kind="code", origin="user")
     on = " ".join(worker_prompt(p, p.db.task(tid), str(p.root), None).split())
     assert "would pass about 200 non-test lines goes in parts" in on and SPLIT_MARK not in on

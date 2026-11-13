@@ -236,7 +236,7 @@ def lane_source(p, cfg: dict, task: int | None, now: float | None = None) -> dic
         return None
     from . import cachettl
     idle = coordsession._num(s.get("worker_lane_idle_s"), 240)
-    cap = int(coordsession._num(s.get("worker_lane_max"), 4))
+    cap = int(coordsession._num(s.get("worker_lane_max"), 8))
     t = p.db.task(task)
     if not t or t["kind"] == "review" or idle <= 0 or cap <= 0:
         return None

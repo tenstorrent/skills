@@ -6,11 +6,14 @@ When dispatch starts a code task (the lead), it adds to the same run up to `disp
 ready queued code tasks of the project's repo that are small (pick): light or standard tier, not
 exclusive, the lead's provider and model pins or none, not user_deep. A member's device and machine
 resources must all be among the lead's (fits): the run works under the lead's resources, which the
-worker locks per command; an exclusive task neither joins nor leads a batch. Tasks naming files the
-lead's spec names come first (overlap.spec_paths), then by priority; a task whose files a running task
-on another branch holds is left out; a member that depends on another comes after it. The lead is
-whatever dispatch picked first (an urgent one leads): it never waits for a batch to fill. An urgent
-(priority 1) task never joins another's run: it starts in its own, in parallel. A batch runs its shared steps once, after every member's commit: one focused test
+worker locks per command; an exclusive task neither joins nor leads a batch. Since user 11-12 ("do a
+lot more work per thread"): up to dispatch.batch_max 20, any tier up to the lead's (a deep lead takes
+deep and user-deep work), related or not, and queued tasks that wait only on the lead or other members
+(after them). Tasks naming files the lead's spec names come first (overlap.spec_paths), then by
+priority; a task whose files a running task on another branch holds is left out; a member that depends
+on another comes after it. The lead is whatever dispatch picked first (an urgent one leads): it never
+waits for a batch to fill. An urgent (priority 1) task joins only an urgent lead's run, never a lower
+one's. A batch runs its shared steps once, after every member's commit: one focused test
 gate, one device smoke and, where it delivers outside the push queue, one landing request (a PR or a
 push request) carrying every member's commits (prompt_block). Off with `dispatch.batch` false.
 
@@ -47,6 +50,12 @@ from .db import dump_result, load_result
 KV = "batchrun:"
 HOLDING = ("running", "waiting", "review")   # lead statuses that keep its members held
 SMALL = ("light", "standard")
+BATCH_MAX = 20   # dispatch.batch_max (user 11-12: "5 max makes no sense ... just do a lot more work per thread")
+TIER_RANK = {"light": 0, "standard": 1, "deep": 2}
+
+
+def _rank(t: dict) -> int:
+    return TIER_RANK.get(t.get("tier") or "standard", 1)
 NO_START = ("wait", "resume")
 KEEP_S = 14 * 86400   # a settled record stays readable (review and checks grouping) this long
 
@@ -126,9 +135,9 @@ def enabled(cfg: dict) -> bool:
 
 def batch_max(cfg: dict) -> int:
     try:
-        return max(int((cfg.get("dispatch") or {}).get("batch_max", 5)), 0)
+        return max(int((cfg.get("dispatch") or {}).get("batch_max", BATCH_MAX)), 0)
     except (TypeError, ValueError):
-        return 5
+        return BATCH_MAX
 
 
 def _labels(t: dict) -> list:
@@ -180,12 +189,15 @@ def eligible(lead: dict, t: dict) -> bool:
     from .effort import USER_DEEP
     if t["id"] == lead["id"] or t.get("kind") != "code" or t.get("status") != "queued":
         return False
-    if t.get("tier") not in SMALL or not fits(lead, t) or USER_DEEP in _labels(t) or _repo(t) != _repo(lead):
+    # Any tier up to the lead's (the run takes the lead's model and effort): a deep lead takes deep work too.
+    if _rank(t) > _rank(lead) or not fits(lead, t) or _repo(t) != _repo(lead):
+        return False
+    if USER_DEEP in _labels(t) and _rank(lead) < TIER_RANK["deep"]:
         return False
     if own_branch(t):
         return False
-    if (t.get("priority") or 3) <= 1:   # urgent work starts in a worker of its own, in parallel
-        return False
+    if (t.get("priority") or 3) <= 1 and (lead.get("priority") or 3) > 1:
+        return False   # urgent work never waits behind a lower lead; urgent siblings share one run (user 11-12)
     if t.get("budget_usd") and float(t.get("spent_usd") or 0) >= float(t["budget_usd"]):
         return False
     return all(not t.get(k) or t.get(k) == lead.get(k) for k in ("provider", "model"))
@@ -199,10 +211,13 @@ def _paths(p, t: dict) -> set[str]:
         return set()
 
 
-def pick(p, cfg: dict, lead: dict, ready: list[dict], inflight: list[dict] | None = None) -> list[dict]:
+def pick(p, cfg: dict, lead: dict, ready: list[dict], inflight: list[dict] | None = None,
+         waiting: dict[int, set] | None = None) -> list[dict]:
     """The members to add to `lead`'s run, in the order the worker takes them: related tasks (sharing
     a path the lead's spec names) first, then by priority and id; a member after any member it depends
-    on. `inflight`: running tasks on other branches, whose spec paths keep a candidate out."""
+    on. `inflight`: running tasks on other branches, whose spec paths keep a candidate out. `waiting`:
+    queued tasks in `ready` that still wait on other tasks (id -> the ids they wait on); one joins only
+    while everything it waits on is the lead or another member (it then runs after them)."""
     if not enabled(cfg) or lead.get("kind") != "code" or _exclusive(lead) or own_branch(lead, recorded=False):
         return []
     n = batch_max(cfg)
@@ -222,6 +237,13 @@ def pick(p, cfg: dict, lead: dict, ready: list[dict], inflight: list[dict] | Non
             continue
         cands.append((0 if ps & mine else 1, t.get("priority") or 3, t["id"], t))
     chosen = [c[3] for c in sorted(cands, key=lambda c: c[:3])][:n]
+    waiting = waiting or {}
+    while True:   # a waiting member whose prerequisite was left out (cap, held) leaves too
+        ids = {lead["id"]} | {m["id"] for m in chosen}
+        keep = [m for m in chosen if set(waiting.get(m["id"]) or ()) <= ids]
+        if len(keep) == len(chosen):
+            break
+        chosen = keep
     return order(chosen)
 
 
@@ -242,13 +264,20 @@ def order(members: list[dict]) -> list[dict]:
 
 
 def budget(cfg: dict, lead: dict, remaining: float, members: list[dict]) -> float:
-    """The run's budget: the lead's remaining plus each member's, capped at the deep tier's default."""
+    """The run's budget: the lead's remaining plus each member's, capped at three times the deep tier's
+    default (a big batch is many tasks' work in one run)."""
     from . import budget as bud
     total = max(remaining, 0.0)
     for m in members:
         b = m.get("budget_usd") or bud.task_default_usd(cfg, m.get("tier"))
         total += max(float(b) - float(m.get("spent_usd") or 0), 0.0)
-    return min(total, bud.task_default_usd(cfg, "deep"))
+    return min(total, 3 * bud.task_default_usd(cfg, "deep"))
+
+
+def timeout_s(cfg: dict, tier: str, members: int) -> float:
+    """A batch run's time limit: its tier's run_timeout_s, half again per member, at most four times it."""
+    base = float(((cfg.get("budget") or {}).get("run_timeout_s") or {}).get(tier, 3600))
+    return base * min(1 + members / 2, 4)
 
 
 def split_cost(total: float, budgets: dict[int, float]) -> dict[int, float]:

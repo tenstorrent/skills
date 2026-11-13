@@ -189,7 +189,8 @@ def digest_lines(db: DB, cfg: dict | None, now: float | None = None,
     for t in shown:
         lines.append(f"- costly: #{t['id']} '{t['title']}' ({t['status']}) spent ${t['usd']:.2f}, {t['x']:.1f}x the "
                      f"7-day median ${t['median']:.2f} per done {t['kind']} task | "
-                     + ("split it, lower its tier or stop it" if t["status"] not in TERMINAL_TASK_STATES
+                     + ("check it converges (not retrying the same step); if not, lower its tier or stop it"
+                        if t["status"] not in TERMINAL_TASK_STATES
                         else "find why (retries, scope, tier) before queuing more like it"))
         ident.append(f"spend:{t['id']}")
     if rest:

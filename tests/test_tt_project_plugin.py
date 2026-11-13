@@ -706,12 +706,12 @@ def test_code_workers_try_to_break_their_change_before_the_hand_off():
     for part in ("Before the hand-off, try to break it (tt-project-harness self-check.md)",
                  "tick each spec step", "a guard or parser: test 3+ bypasses",
                  "exit codes: an unexpected one, an interrupted run",
-                 "no unbounded wait or I/O in a db transaction", "100+ non-test lines: why not split",
+                 "no unbounded wait or I/O in a db transaction",
                  "Hand off a `self_check` line (also in `on_pass`): what you ticked and tried"):
         assert part in code, part
     ref = " ".join((SKILLS / "tt-project-harness" / "references" / "self-check.md").read_text(encoding="utf-8").split())
     for part in ("tick each one", "at least three bypass forms", "one exit code the code does not expect",
-                 "one interrupted run", "has a bound", "inside a database transaction", "past about 100 non-test lines",
+                 "one interrupted run", "has a bound", "inside a database transaction", "a large diff is fine",
                  "one `self_check` line", "`review_stats`"):
         assert part in ref, part
 

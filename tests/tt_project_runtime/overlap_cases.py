@@ -656,7 +656,7 @@ def test_a_continue_hop_drops_overlap_depends_on_onto_device_or_waiting_tasks(en
         p.db.update_task(t["id"], status="cancelled")
     # The coordinator's prompt states the exemption.
     rule = " ".join((RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text().split())
-    assert ("run side by side unless one needs the other's new file or symbol; never chain onto a device or "
+    assert ("fold this into it if queued, else `depends_on` it; never chain onto a device or "
             "machine task or one that waits.") in rule
     # A plain task_add (no hop) keeps the depends_on the coordinator gave, device task or not.
     assert coord.apply(p, [{"type": "task_add", "title": "on purpose", "kind": "code",

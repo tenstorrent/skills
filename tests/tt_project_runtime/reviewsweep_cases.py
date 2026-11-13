@@ -350,6 +350,7 @@ def test_a_timed_out_split_read_defers_the_review_and_the_next_tick_queues_it_sp
     from ttp import splitgate
     from ttp.daemon import Daemon, KV_REVIEW_UNREAD, KV_SPLIT_UNREAD, SPLIT_UNREAD_LINE
     p = make(env)
+    p.set_config("chains.split_lines", 200)   # opt-in since 11-12 (default off)
     _with_origin(env, clone=False)
     cut = {"n": 2}
     _cut_split_reads(monkeypatch, cut)
@@ -371,6 +372,7 @@ def test_a_split_read_that_keeps_timing_out_still_gets_its_review_after_the_boun
     review is queued unsplit and the log says the split gate could not judge it."""
     from ttp.daemon import Daemon, KV_REVIEW_UNREAD, KV_SPLIT_UNREAD, SPLIT_UNREAD_TRIES
     p = make(env)
+    p.set_config("chains.split_lines", 200)   # opt-in since 11-12 (default off)
     _with_origin(env, clone=False)
     _cut_split_reads(monkeypatch, {"n": None})
     tid, _, _, reviews = _finish_code(env, p, "always cut", {"big.py": 260})

@@ -389,7 +389,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
                                 "worker_context": "fork", "worker_fork_max_tokens": 0,
                                 "worker_fork_max_age_h": 12, "worker_fork_other_model_tokens": 8000,
                                 "worker_chat_chars": 8000, "worker_lane": True, "worker_lane_idle_s": 240,
-                                "worker_lane_max": 4},
+                                "worker_lane_max": 8},
                     "turn_budget_usd": 1.0,
                     # The most the daemon raises one turn's cap to, once, for a single item that went
                     # over turn_budget_usd alone (0: twice turn_budget_usd); never above the
@@ -484,7 +484,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # obligation owner's) continue and next-step follow-ups are queued at once under the same caps (urgentfup).
     # With requeue, a code task whose change is neither approved nor landed is re-queued for that hop
     # itself (chaincap.requeue: same id, worktree and branch) instead of a new task.
-    # split_lines (0 off): kind-code.md asks a worker whose change would pass about this many non-test
+    # split_lines (0 off, the default since user 11-12: do much more work per task): kind-code.md asks a
+    # worker whose change would pass about this many non-test
     # lines to hand it off in parts, each reviewed and landed on its own (prompts.split_lines); the daemon
     # sends a larger change back once for a split before its review (splitgate).
     # A task that ran max_task_runs times since its last explicit requeue, or whose last max_idle_runs
@@ -492,7 +493,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # blocked and the coordinator gets one run_cap event summing up its runs (runcap).
     "chains": {"max_hops": 8, "max_stalls": 2, "max_usd": 40.0, "auto": True, "urgent_followups": True,
                "fold_followups": True,
-               "requeue": True, "split_lines": 200, "max_task_runs": 4, "max_idle_runs": 2},
+               "requeue": True, "split_lines": 0, "max_task_runs": 4, "max_idle_runs": 2},
     # Each Jev use (e.g. "screen") is switched off once its net saving over window_days is not
     # positive, judged after min_calls calls or once its first call is a window old, or once idle_calls
     # calls in the window changed none of the rules' decisions; uses.<use> = "on" or "off" forces it
@@ -689,8 +690,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # limits past which a coordinator wake, a task's runs and a change's review rounds count as avoidable.
     # moved_at (epoch, no default): runs started after it count as a stand-in's after a project move.
     "waste": {"target_share": 0.10, "wake_usd": 1.0, "max_runs": 4, "review_rounds": 2, "fix_task": True},
-    # Batch runs (batchrun.py): a code task's run also takes up to batch_max small ready code tasks.
-    "dispatch": {"batch": True, "batch_max": 5},
+    # Batch runs (batchrun.py): a code task's run also takes up to batch_max ready code tasks of its repo
+    # (any tier up to its own) and the queued ones that wait only on those.
+    "dispatch": {"batch": True, "batch_max": 20},
 }
 
 

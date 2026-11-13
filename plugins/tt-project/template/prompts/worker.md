@@ -183,7 +183,7 @@ No `result.json`, no credit.
  "outcome": "if it applies: landed, kept, shelved or rejected",
  "tried": [{"title": "each lever tried", "outcome": "kept | shelved | rejected", "result": "number or bound reached"}],
  "context_gaps": ["what you needed that the spec and its context block lacked (a decision, the user's words, a finding)"],
- "followups": [{"title": "...", "spec": "self-contained next step"}]}
+ "followups": [{"title": "...", "spec": "self-contained next steps, one entry per repo"}]}
 ```
 
 - `done` only with evidence: tests run, numbers measured, files produced.
@@ -315,8 +315,8 @@ No `result.json`, no credit.
   stops it at the cap. Report its spend in the hand-off.
 <!-- /ttp:if wait -->
 - Galaxy reset: tt-smi -glx_reset, never tt-smi -r; rescan root ports, recount chips by BDF and tray; no reset where it cannot run; say so plainly.
-- Keep runs short: each call re-reads the whole context. When the work exceeds one run or you passed
-  the split line, finish the step, commit and hand off `done` with a `followups` entry titled
+- Finish the whole task, and related problems you find, in this run. Only if it cannot fit (time,
+  budget), commit and hand off `done` with a `followups` entry titled
   `continue: ...` (what is done, branch and head, what is left).
 <!-- ttp:if prs -->
   A review does not split this way: it finishes its verdict.

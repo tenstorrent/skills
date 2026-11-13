@@ -1920,18 +1920,19 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   changelogs, changesets, manifests, `__init__.py`), `hub_bytes` (tracked files larger than this,
   150000, touched by most changes, never count), `branch_days` (14) and `settled_days` (14). Folders and the files the
   check commands (`delivery.push_checks`) name never count either: specs cite those as the required suite.
-- Batch runs: a worker that starts a code task also takes up to `dispatch.batch_max` (5) other small
-  ready code tasks in the same run, on the same worktree and branch, so related small changes do not
-  each need their own worker and branch. A task joins only when it is queued, of the same repo, light
-  or standard tier, not exclusive, needs no device or machine resource the lead does not hold (the run
-  works under the lead's resources, locked per command), has the lead's provider and model pins or
-  none, was not set to deep by the user, has no branch of its own and has budget left. An exclusive
-  task neither joins nor leads a batch. Tasks naming files the lead's spec names come first, then by
-  priority; one whose files a task on another branch is changing stays out; one that depends on
-  another member comes after it. Whatever dispatch picks first leads, so an urgent task never waits
-  for a batch to fill, and an urgent task never joins another's run: it starts in a worker of its
-  own, in parallel. So a project landing many related device-bound changes lands them as a few
-  batches, not one by one. The worker commits each task separately, with no task number in its
+- Batch runs (on by default; the user's rule since 11-12: do much more work per run): a worker that
+  starts a code task also takes up to `dispatch.batch_max` (20) other ready code tasks in the same
+  run, on the same worktree and branch, related or not, so they share one worker, branch, review and
+  checks run. A task joins when it is queued, of the same repo, at most the lead's tier (a deep lead
+  takes deep and user-deep work too), not exclusive, needs no device or machine resource the lead does
+  not hold (the run works under the lead's resources, locked per command), has the lead's provider and
+  model pins or none, has no branch of its own and has budget left. An exclusive task neither joins nor
+  leads a batch. A queued task that waits only on the lead or on other members joins too, after them.
+  Tasks naming files the lead's spec names come first, then by priority; one whose files a task on
+  another branch is changing stays out. Whatever dispatch picks first leads, so an urgent task never
+  waits for a batch to fill; urgent tasks join an urgent lead's run, never a lower one's. So a project
+  landing many changes lands them as a few batches, not one by one. The worker commits each task
+  separately, with no task number in its
   messages (a public repository's squash-merge would carry one), and hands off one outcome per task
   with its commit ids (`members` in result.json; with none, the branch's commits when the batch
   settles); shared steps run once for
@@ -1943,11 +1944,12 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   approved head left out stays not landed (`ttp landed` says so) and gets a review of its own. Once the lead ends, a
   member done in the run is done on the lead's branch, a blocked one is blocked with its reason, and
   a failed one goes back to the queue alone. The run's budget is the sum of the members' remaining
-  budgets, capped at the deep tier's default, and its cost is split between them pro rata to their
+  budgets, capped at three times the deep tier's default, its time limit grows by half the tier's per
+  member (at most four times it), and its cost is split between them pro rata to their
   budgets, so each task's spend stays its own. `ttp status`, the web app and the coordinator show
   the run once, as `#<lead> (batch b<lead>: +#a, #b)`; each member's line says `in batch run
   b<lead> led by #<lead>`. Settings: `dispatch.batch` (on; `ttp config <name> dispatch.batch false`
-  turns it off) and `dispatch.batch_max` (5).
+  turns it off) and `dispatch.batch_max` (20).
 - tt-project never keeps a machine awake by default: `runner.prevent_idle_sleep` is `off`, and you
   keep your Mac awake yourself as needed. Set it to `on` (or `auto`, on for a Mac) with
   `ttp config <name> runner.prevent_idle_sleep on`; a value you set stays across upgrades. Then,

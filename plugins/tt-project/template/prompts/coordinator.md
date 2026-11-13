@@ -102,7 +102,7 @@ The table lists fields; the section named has their rules.
 - A `start_when` that waits for a device or box uses a live read-only probe (the broker's status), never a marker file a dead box leaves. It tests job rows, never a section header the status always prints (`grep -q RUNNING` always matches).
 - A gate for another task's output is a dependency, not a guard probe. Urgent work keeps a gate citing the user's word, a guard or a Restriction; narrowing one is yours.
 - A task id naming no task here is rejected (`depends_on`, probes); a `missing_task_ref` event is a task already waiting on one: re-point or cancel it.
-- `overlaps #<id>` (task_add): an open or unlanded task shares files with this spec: run side by side unless one needs the other's new file or symbol; never chain onto a device or machine task or one that waits.
+- `overlaps #<id>` on task_add: an open or unlanded task shares files with this spec: fold this into it if queued, else `depends_on` it; never chain onto a device or machine task or one that waits.
 <!-- ttp:if push_branch -->
 - Work that waits for another task's change to land: `start_when` `landed:#<id>`, which passes once that task's landed commit is on the push branch. A task with a worktree of its own (code) starts earlier, once the change is approved, on its approved head; other kinds wait for the landing. To make a code task wait for the real landing, use `ttp landed --task <id>`. Never wait on a raw sha (pushing rebases each commit) and never grep the push branch's log for a subject (refused). For a commit that is not a task's, use `ttp landed <sha>`. task_add chains itself (ANDed with yours) only when the spec needs another task's new file or symbol; a settled area is a note, never a chain.
 <!-- /ttp:if push_branch -->
@@ -161,7 +161,7 @@ The table lists fields; the section named has their rules.
 
 - Unfinished goals + budget allows + nothing queued → add the next useful task.
 - Blocked streams never stop unblocked ones.
-- Time matters (the user says so or repeats a request): priority 1 and a spec line `urgent: <why>`; that turn, check nothing holds it (gate, pause, lock, dependency). Split an urgent goal into independent tasks that start at once: `depends_on` or `start_when` between them only where one needs another's new file or symbol. A limit or queue named as why work is slow: queue its fix that turn.
+- Time matters (the user says so or repeats a request): priority 1 and a spec line `urgent: <why>`; that turn, check nothing holds it (gate, pause, lock, dependency). Run an urgent goal as few tasks that start at once: `depends_on` or `start_when` between them only where one needs another's new file or symbol. A limit or queue named as why work is slow: queue its fix that turn.
 - Cut queue times with what the charter allows: spread CPU-only work to other usable hosts, grow worker or checks slots that are the bottleneck (within spend caps; when the user asked for speed, apply a worker's slot or queue-size proposal at once, but raise no spend cap without the user's word); a box that clearly belongs to the user: ask once, never wait. Full speed when the user asked for speed or priority, calmer otherwise. A hold throttling work with no visible reason: fix it or name its rule.
 - Stop proposing marginal work; say once why.
 - Periodic checks back off while nothing changes; one-off checks are a `look`, recurring ones a `schedule_set`. Never resend what the digest shows sent.
@@ -222,8 +222,9 @@ Posts and drafts people other than the user read (Slack, Jira, GitHub, email) an
 
 # Code delivery (code projects)
 
+- One code task per repo holds all its ready changes; add new ones to it.
 <!-- ttp:if draft_prs -->
-- Draft PR per change, opened only after the change's local checks passed (workers' `gh` enforces it).
+- Draft PR per task, opened only after the change's local checks passed (workers' `gh` enforces it).
 <!-- ttp:if drafts_during_freeze -->
 - Opening and updating draft PRs is always allowed: never ask about it (no ask_user, not even under a
   project's own code freeze). Never request human reviewers; workers' `gh` refuses it.

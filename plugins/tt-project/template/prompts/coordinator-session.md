@@ -25,7 +25,7 @@ Builds, test suites, device runs and larger code changes still go to workers.
 <!-- /ttp:if !lead -->
 Workers and reviews start from a copy of this session where the agent can fork it, else from its
 record on disk (order ledger, your latest note, the chat): keep orders, decisions and findings
-there. Split independent work into tasks that run in parallel.
+there.
 `## Running workers` folds the runs unchanged since your last wake into one line; steer a flagged run
 (`task_update` `spec`) or restart it.
 
@@ -45,7 +45,7 @@ ready task waits for you in `## Lead work list`, and the daemon wakes you again 
 after each turn while that list has tasks: keep the project moving until the list is empty.
 
 - Each wake, after messages and must-act items: take the top of the list and finish it end to end
-  (investigate, run, measure, roll out, verify). Several small related tasks: do them in one turn.
+  (investigate, run, measure, roll out, verify), then the next: finish as many list items per turn as fit.
 - Done: `task_update` `status` `done` with a `spec` whose last line starts `result:` (what you did,
   evidence, commit or path). Not needed: `cancelled`, with why. Waiting on something outside: defer it
   (`start_when` probe or `start_after`), never leave it queued untouched.
@@ -54,7 +54,7 @@ after each turn while that list has tasks: keep the project moving until the lis
   that changes nothing on the list doubles the wait before the next one.
 - Code that must land: do the investigation yourself, then `task_add` one code task whose spec names
   the exact files, functions and change (and the test that proves it), so its worker writes and lands
-  it without re-exploring. Fold related small changes into one task.
+  it without re-exploring. Fold everything for that repo into one task.
 - A worker for anything else only when it pays: a run longer than a turn that needs nobody (a soak,
   a long build or sweep), or independent work in parallel while you do the top item. Mark it with a
   `worker: <why>` spec line. Use subagents inside your turn for parallel lookups.

@@ -8295,8 +8295,8 @@ class Daemon:
             elif waits > int(self.cfg["budget"].get("max_waits", 24)):
                 new, reason = "blocked", f"still waiting after {waits} tries: {what}"
             elif max_stale and stale >= max_stale:
-                new, reason = "blocked", (f"no progress after {stale} wakes waiting for {what}: needs a split or "
-                                          f"a re-plan (a probe that tells when the wait is over, or smaller steps)")
+                new, reason = "blocked", (f"no progress after {stale} wakes waiting for {what}: needs a "
+                                          f"re-plan (a probe that tells when the wait is over, or another route)")
             elif rebooted and not orderly and result.get("survives_reboot") is not True and (
                     n := self._reboot_losses(task["id"]) + wakes) >= int(
                     self.cfg["budget"].get("max_reboot_losses", 3)):
@@ -12973,7 +12973,8 @@ class Daemon:
                 run_id = self.start_run("worker" if task["kind"] != "review" else "reviewer", prompt, run_prov, tier, cwd,
                                         task=task, budget_usd=max(remaining, 0.5) if task["budget_usd"] or members
                                         else None,
-                                        timeout_s=(routed or {}).get("timeout_s"),
+                                        timeout_s=(routed or {}).get("timeout_s") or (
+                                            batchrun.timeout_s(self.cfg, tier, len(members)) if members else None),
                                         read_only=False, append_system=system, note=note,
                                         resume=lost["session"] if lost else None,
                                         min_effort=None if tierfloor.wake_keeps_effort(task, run_cls)
@@ -13112,11 +13113,22 @@ class Daemon:
         try:
             if lead["kind"] != "code" or not batchrun.enabled(self.cfg) or batchrun.members_of(db, lead["id"]):
                 return []
+            others = {k: v for k, v in live.items() if k != lead["id"]}
             cands = [t for t in ready if t["id"] not in taken and t["id"] != lead["id"]
                      and (cur := db.task(t["id"])) and cur["status"] == "queued"
-                     and not self._branch_clash(t, {k: v for k, v in live.items() if k != lead["id"]})]
+                     and not self._branch_clash(t, others)]
+            # Almost ready: queued code tasks that wait only on the lead or on other candidates join too,
+            # after what they wait on (user 11-12: batch everything that can be done together).
+            seen = {t["id"] for t in ready} | set(taken) | {lead["id"]}
+            rest = [dict(r) for r in db.q("SELECT * FROM tasks WHERE status='queued' AND kind='code'")
+                    if r["id"] not in seen]
+            unmet = db.unmet_dependencies(rest) if rest else {}
+            ids = {lead["id"]} | {t["id"] for t in cands}
+            waiting = {r["id"]: set(unmet[r["id"]]) for r in rest
+                       if unmet.get(r["id"]) and set(unmet[r["id"]]) <= ids and not self._branch_clash(r, others)}
+            cands += [r for r in rest if r["id"] in waiting]
             inflight = db.q("SELECT * FROM tasks WHERE status='running' AND kind='code'")
-            return batchrun.pick(self.p, self.cfg, lead, cands, inflight)
+            return batchrun.pick(self.p, self.cfg, lead, cands, inflight, waiting)
         except Exception:
             log(self.p, f"task {lead['id']}: batch pick failed\n" + traceback.format_exc())
             return []

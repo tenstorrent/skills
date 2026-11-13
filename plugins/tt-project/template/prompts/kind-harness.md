@@ -7,7 +7,7 @@
   you work, stage only the files you changed, by name: never `git add -A`, `git add .` or
   `git commit -a`, which sweep in another task's edits.
 - Improve how the project runs: cost, speed, reliability, less need for the user.
-- Change the smallest thing that removes the friction. Commit with a one-line reason.
+- Remove the cause of the friction fully, with every related fix in the same change. Commit with a one-line reason.
 - Your commit in the harness repo is the delivery: the daemon reads the harness from it. The
   harness has no remote, so do not `ttp push` or `ttp push --own` it, and never copy harness files
   into a code branch to publish them (`delivery.backup_remote` backs up code tasks' branches, not

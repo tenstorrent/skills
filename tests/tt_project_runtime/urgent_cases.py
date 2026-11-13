@@ -614,8 +614,8 @@ def test_the_coordinator_and_plan_prompts_split_an_urgent_goal_into_tasks_that_s
     allow a dependency between them only where one needs another's new file or symbol."""
     from ttp.prompts import coordinator_role
     role = " ".join(coordinator_role(make(env)).split())
-    assert ("Split an urgent goal into independent tasks that start at once: `depends_on` or `start_when` "
-            "between them only where one needs another's new file or symbol.") in role
+    assert ("Run an urgent goal as few tasks that start at once: `depends_on` or "
+            "`start_when` between them only where one needs another's new file or symbol.") in role
     plan = " ".join((RUNTIME.parent / "template" / "prompts" / "kind-plan.md").read_text().split())
     assert ("An urgent goal (priority 1 or an `urgent:` line): every task starts at once. No chain between its "
             "tasks unless one needs another's new file or symbol") in plan

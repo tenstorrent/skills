@@ -25,6 +25,7 @@ def test_an_oversized_code_change_goes_back_once_for_a_split_with_its_work_kept(
     over the limit is reviewed (no loop), and the review spec names the size."""
     from ttp import splitgate
     p = make(env)
+    p.set_config("chains.split_lines", 200)   # opt-in since 11-12 (default off)
     def before(tid, head):
         p.db.update_task(tid, spent_usd=2.0)
     tid, branch, done, reviews = _finish_code(env, p, "big", {"big.py": 260, "tests/test_big.py": 500},
@@ -64,6 +65,7 @@ def test_a_recorded_reason_an_urgent_task_or_a_split_part_passes_with_a_size_not
     are reviewed at once; the first two note the size and why it was not split."""
     from ttp import checksettle, splitgate
     p = make(env)
+    p.set_config("chains.split_lines", 200)   # opt-in since 11-12 (default off)
     tid, _, _, reviews = _finish_code(env, p, "reasoned", {"big.py": 300}, result={
         "status": "done", "summary": "one table rewrite", "no_split": "one schema change, all or nothing"})
     assert p.db.task(tid)["status"] == "done" and len(reviews) == 1
@@ -104,6 +106,7 @@ def test_a_needs_review_hand_off_is_returned_for_a_split_only_when_a_review_woul
     owner) gets a review at once, so it goes back for a split first."""
     from ttp import obligations, splitgate
     p = make(env)
+    p.set_config("chains.split_lines", 200)   # opt-in since 11-12 (default off)
     ask = {"status": "needs_review", "summary": "pick the schema", "question": "which schema?"}
     tid, _, done, reviews = _finish_code(env, p, "asks", {"big.py": 300}, result=ask)
     t = p.db.task(tid)
@@ -155,6 +158,7 @@ def test_a_large_change_on_the_push_branch_still_goes_back_and_the_order_names_i
     line name what the size was measured against, as does the size line of its next review."""
     from ttp import splitgate
     p = make(env)
+    p.set_config("chains.split_lines", 200)   # opt-in since 11-12 (default off)
     _other_base(p)
     tid, _, done, reviews = _finish_code(env, p, "big on work", {"big.py": 300})
     t = p.db.task(tid)

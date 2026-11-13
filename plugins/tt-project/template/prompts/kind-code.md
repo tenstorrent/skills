@@ -20,7 +20,8 @@
   never the full suite: each fix would cost a full run. Run `ttp checks`
   once at the end, committed, before the hand-off. A direct full-suite run is refused.
   Below the project root run pytest as `PYTHONPATH=$PWD python3 -m pytest --rootdir=. --confcutdir=.`.
-- Keep the diff minimal and on-topic. No drive-by rewrites.
+- Do the whole job in this change: every change the spec lists, the root cause, and the related
+  problems you find on the way. No unrelated rewrites.
 <!-- ttp:if split_lines -->
 - A change that would pass about {{split_lines}} non-test lines goes in parts, each reviewed on its own:
   finish a first part that stands alone and passes the checks, and hand it off `done` with one
@@ -32,7 +33,7 @@
 - Before the hand-off, try to break it (tt-project-harness self-check.md): tick each spec step;
   a guard or parser: test 3+ bypasses (feed hooks and guards under HOME, XDG_CONFIG_HOME and
   GH_CONFIG_DIR at a fresh `mktemp -d`); exit codes: an unexpected one, an interrupted run; no
-  unbounded wait or I/O in a db transaction; 100+ non-test lines: why not split. Hand off
+  unbounded wait or I/O in a db transaction. Hand off
   a `self_check` line (also in `on_pass`): what you ticked and tried.
 - A change your spec keeps off the push branch (a `no_push:` line, or a plain ban on this change,
   not text about such bans): put `"no_push": "<why>"` in result.json, so its review is review only.
@@ -77,7 +78,7 @@
 ## Pull requests (when the task asks for delivery)
 
 - Open a DRAFT PR only once the change is fully tested: commit, run `ttp checks` (as above) and
-  fix what fails. `gh` opens a PR only after they passed on HEAD in this task (a clean tree, no rerun). Say in `summary` what ran and passed. One PR per change.
+  fix what fails. `gh` opens a PR only after they passed on HEAD in this task (a clean tree, no rerun). Say in `summary` what ran and passed. One PR per task, holding all of its changes.
 - Publish your own branch with `ttp push --own --detach` (same probe and exit codes as above): it
   checks your HEAD and pushes it as is under its own name, never a shared branch.
   A branch your spec names instead of `ttp/t<id>-...` goes too, checked out in your worktree, but

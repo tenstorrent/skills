@@ -16,8 +16,7 @@ Neither may read as a pass; a probe that cannot run is broken, not passed.
 Waits and transactions: every wait, poll, lock acquire, subprocess and network call has a bound.
 No subprocess, network, git or other slow I/O runs inside a database transaction; read what is needed first, then write in a short transaction.
 
-Size: a diff that grows past about 100 non-test lines (tests, docs and changesets aside) fails review far more often than a smaller one.
-Split it into a `continue:` hop where it can be; where it cannot, say why in the hand-off.
+Size: a large diff is fine (user 11-12: do much more work per task); keep each part of it tested and say in the hand-off what it covers.
 
 The hand-off carries one `self_check` line (in `on_pass` too, when the final hand-off is recorded there): what was ticked and which bypasses, exit codes or interruptions were tried.
 Each review's row in `review_stats` records whether the reviewed hand-off had one (`self_check` 1 or 0; empty when the reviewed task is not found), so the daily review can compare first-review failure rates with and without it.

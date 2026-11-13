@@ -52,10 +52,29 @@ def test_batch_pick_leaves_out_resourced_deep_pinned_and_held(env):
     other_repo = dict(ok, id=907, labels=json.dumps(["pr_fix:org/other#3"]))
     spent = dict(ok, id=908, budget_usd=2.0, spent_usd=2.0)
     running = dict(ok, id=909, status="running")
-    urgent = dict(ok, id=912, priority=1)   # urgent work runs in a worker of its own, in parallel
+    urgent = dict(ok, id=912, priority=1)   # urgent work never waits behind a lower lead
     got = batchrun.pick(p, p.config(), lead, [deep, dev, user_deep, pinned, own, fix, work, other_repo,
                                               spent, running, urgent, ok])
     assert [t["id"] for t in got] == [ok["id"]]
+    # User 11-12: urgent siblings queued together share an urgent lead's run (one branch, review, checks).
+    urgent_lead = dict(lead, priority=1)
+    assert [t["id"] for t in batchrun.pick(p, p.config(), urgent_lead, [urgent, ok])] == [912, ok["id"]]
+    # A deep lead takes deep (and user_deep) work too; the default takes up to 20.
+    deep_lead = dict(lead, tier="deep")
+    assert {t["id"] for t in batchrun.pick(p, p.config(), deep_lead, [deep, user_deep, ok])} == {900, 902, ok["id"]}
+    many = [dict(ok, id=1000 + i) for i in range(25)]
+    assert len(batchrun.pick(p, p.config(), lead, many)) == 20
+    # Almost ready: one waiting only on the lead or another member joins after it; one waiting on
+    # anything else, or on a member the cap left out, does not.
+    after = dict(ok, id=1100, priority=3)
+    after2 = dict(ok, id=1101, priority=3)
+    stray = dict(ok, id=1102, priority=3)
+    got = batchrun.pick(p, p.config(), lead, [after, after2, stray, ok],
+                        waiting={1100: {lead["id"]}, 1101: {1100}, 1102: {4242}})
+    assert {t["id"] for t in got} == {1100, 1101, ok["id"]} and [t["id"] for t in got].index(1101) > [t["id"] for t in got].index(1100)
+    cfg = p.config()
+    cfg["dispatch"] = {"batch": True, "batch_max": 1}
+    assert [t["id"] for t in batchrun.pick(p, cfg, lead, [after2, ok], waiting={1101: {1100}})] == [ok["id"]]
     # An exclusive lead takes no batch.
     assert batchrun.pick(p, p.config(), dict(lead, labels=json.dumps(["exclusive:box"])), [ok]) == []
     # A task whose files a running task on another branch changes stays out; on the lead's branch it may join.
@@ -365,10 +384,13 @@ def test_batch_cost_split_pro_rata(env):
     assert p.db.task(b["id"])["spent_usd"] == pytest.approx(4.0)
     assert batchrun.batch_of(p.db, lead["id"])["spent"] == {str(lead["id"]): 4.0, str(a["id"]): 2.0,
                                                            str(b["id"]): 4.0}
-    # The run's budget: the members' remaining budgets added, capped at the deep tier's default.
+    # The run's budget: the members' remaining budgets added, capped at three times the deep tier's default.
     a = p.db.task(a["id"])
     assert batchrun.budget(p.config(), lead, 8.0, [a]) == pytest.approx(10.0)   # a spent 2 of 4
-    assert batchrun.budget(p.config(), lead, 8.0, [a, b, b, b]) == pytest.approx(25.0)
+    big = dict(b, budget_usd=40.0, spent_usd=0)
+    assert batchrun.budget(p.config(), lead, 8.0, [a, big]) == pytest.approx(50.0)
+    assert batchrun.budget(p.config(), lead, 8.0, [a, big, big]) == pytest.approx(75.0)
+    assert batchrun.timeout_s(p.config(), "standard", 2) == 7200 and batchrun.timeout_s(p.config(), "standard", 20) == 14400
 
 
 def test_batch_never_leads_or_takes_a_task_with_a_branch_of_its_own():

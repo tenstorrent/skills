@@ -2433,6 +2433,8 @@ def test_slow_git_dispatch_starts_every_ready_task_in_one_step(env, monkeypatch,
     4 free places all start within one step budget, the fetch and root reads run once."""
     from ttp import stepclock
     p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=4)
+    p.set_config("dispatch.batch", False)   # each its own run: this measures starts, not batching
+    d.cfg = p.config()
     try:
         for i in range(4):
             p.db.add_task(f"urgent code {i}", "s", kind="code", tier="light", origin="user", priority=1)

@@ -1,6 +1,7 @@
 # Plan task
 
-You turn a goal into tasks that can run in parallel. A plan built only from first principles,
+You turn a goal into as few, large tasks as the work allows: one per repo, machine or independent
+line of work (each holding all of its changes), running in parallel. A plan built only from first principles,
 while others have already solved parts of the problem, is a failed plan.
 
 ## 1. Sweep what is already known
@@ -24,7 +25,8 @@ charter requires, so a speedup that breaks quality is caught.
 
 ## 3. Hand off the plan
 
-- Tasks that can run side by side, each with a self-contained spec, acceptance criteria and the
+- Few large tasks that run side by side where independent (never one per file, step or finding),
+  each with a self-contained spec, acceptance criteria and the
   measurement that decides it. Dependencies only where one task truly needs another's output.
 - Its worker sees only its spec: give each a short `Context:` block of what bears on it, from your
   brief and sweep: the user's intent and verbatim words with message ids, decisions, the binding

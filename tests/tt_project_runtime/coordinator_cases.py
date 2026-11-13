@@ -1083,7 +1083,7 @@ def test_wakes_that_hand_back_the_same_wait_run_light_then_go_to_the_coordinator
     assert tiers == ["standard", "light", "light"], "after one unchanged wake no standard model runs"
     t = p.db.task(tid)
     assert t["status"] == "blocked" and t["attempts"] == 0
-    assert "no progress after 3 wakes" in t["blocked_reason"] and "split" in t["blocked_reason"]
+    assert "no progress after 3 wakes" in t["blocked_reason"] and "re-plan" in t["blocked_reason"]
     ev = p.db.one("SELECT severity, status FROM events WHERE task=? AND text LIKE '%→ blocked%'", (tid,))
     assert ev and ev["status"] == "queued", "the coordinator is told"
     assert not _run_until(d, p, lambda: len(runs()) > 3, timeout=1), "not woken again"
@@ -19758,7 +19758,7 @@ def test_course_check_flags_spend_far_above_the_projects_own_median(env):
     p.db.update_task(big, spent_usd=4.0)
     lines, ident = course.digest_lines(p.db, p.config())
     assert f"- costly: #{big} 'huge refactor' (queued) spent $4.00, 3.3x the 7-day median $1.20 per done code task" \
-        in lines[1] and "split it" in lines[1], lines
+        in lines[1] and "check it converges" in lines[1] and "split" not in lines[1], lines
     assert ident == f"spend:{big}"
     cheap = p.db.add_task("a review", "s", origin="user", kind="review")   # another kind has no median yet
     p.db.update_task(cheap, spent_usd=50.0)
