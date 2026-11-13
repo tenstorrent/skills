@@ -337,6 +337,32 @@ def test_post_land_busy_retry_never_reads_an_earlier_attempts_result_and_ends_un
     assert len(p.db.q("SELECT id FROM events WHERE text LIKE '%busy for 3 passes%'")) == 1
 
 
+
+def test_post_land_driver_that_died_without_a_result_is_rerun_on_the_same_range_then_reported(
+        env, tmp_path, monkeypatch):
+    # A reboot or kill takes the driver before it writes a result: the same landing (sha, range, points) runs
+    # again, up to DEAD_RETRIES times, and only then is it an error; `since` never moves past an unchecked range.
+    import json as _json
+    from ttp import postland
+    p, g, pushed, entries = _pl_land(env, tmp_path, monkeypatch, _PL_PASS)
+    spawned = []
+    monkeypatch.setattr(postland, "spawn", lambda p_, job: spawned.append(job) or 999999999)   # never alive
+    assert postland.tend(p, p.config()).startswith(f"post-landing checks started on {pushed[:10]}")
+    first, since = _json.loads(spawned[0].read_text()), p.db.kv(postland.KEY).get("since")
+    for n in range(1, postland.DEAD_RETRIES + 1):
+        out = postland.tend(p, p.config())
+        assert out == f"post-landing checks on {pushed[:10]}: the driver ended without a result, retried", out
+        again = _json.loads(spawned[n].read_text())
+        assert spawned[n] != spawned[n - 1] and (again["sha"], again["good"], again["points"]) == \
+            (first["sha"], first["good"], first["points"])
+        st = p.db.kv(postland.KEY)
+        assert st["dead"] == n and st["job"] and st.get("since") == since
+    postland.tend(p, p.config())
+    st = p.db.kv(postland.KEY)
+    assert st["last"]["outcome"] == "error" and "without a result" in st["last"]["why"] and st["job"] is None
+    assert st["dead"] == 0 and len(spawned) == postland.DEAD_RETRIES + 1
+    assert postland.tend(p, p.config()) == "", "reported once; the landing is settled"
+
 def test_post_land_busy_retry_on_the_first_run_keeps_that_landings_range(env, tmp_path, monkeypatch):
     import json as _json
     from ttp import postland

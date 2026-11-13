@@ -42,6 +42,7 @@ KEY = "post_land"
 FOLDER = "post-land"
 EVENT = "post_land"
 BUSY_PASSES = 3   # passes a landing waits on a busy test lock (each after gatejudge's backoff) before it is unattributed
+DEAD_RETRIES = 2  # reruns of a landing whose driver died without a result (a reboot, a kill) before it is an error
 
 
 def driver_argv(job: Path) -> list[str]:
@@ -90,7 +91,13 @@ def tend(p: Project, cfg: dict, now: float | None = None) -> str:
         elif _alive(job.get("pid")):
             return ""
         else:
-            got = {"outcome": "error", "why": "the driver ended without a result (a reboot, a kill or a crash)"}
+            dead = int(st.get("dead") or 0) + 1
+            if dead <= DEAD_RETRIES:   # its range was never checked: rerun this very job, never skip past it
+                again = retry(p, job, f"d{dead}")
+                db.set_kv(KEY, {**st, "job": again, "dead": dead})
+                return f"post-landing checks on {job['sha'][:10]}: the driver ended without a result, retried"
+            got = {"outcome": "error", "why": f"the driver ended without a result {dead} times (a reboot, a kill "
+                                              "or a crash)"}
         busy = int(st.get("busy") or 0) + 1 if got.get("outcome") == "busy" else 0
         if busy and busy < BUSY_PASSES:   # the test lock admitted nothing: rerun this very job (same range)
             again = retry(p, job, busy)
@@ -98,7 +105,8 @@ def tend(p: Project, cfg: dict, now: float | None = None) -> str:
             return f"post-landing checks on {job['sha'][:10]}: busy, retried"
         if busy:
             got = {"outcome": "unattributed", "why": f"the test lock stayed busy for {busy} passes"}
-        db.set_kv(KEY, {**st, "job": None, "busy": 0, "since": job["ended"], "last": {**got, "sha": job["sha"]}})
+        db.set_kv(KEY, {**st, "job": None, "busy": 0, "dead": 0, "since": job["ended"],
+                        "last": {**got, "sha": job["sha"]}})
         return apply(p, job, got)
     batches = db.q(f"SELECT * FROM push_batches WHERE outcome='pushed' AND finalized IS NOT NULL AND ended>?{only} "
                    "ORDER BY ended, started", (st.get("since") or 0,))
@@ -194,7 +202,7 @@ def _before(p: Project, line: list[str], sha: str) -> str:
     return next((c for c in older if c in known), older[0] if older else "")
 
 
-def retry(p: Project, job: dict, attempt: int) -> dict:
+def retry(p: Project, job: dict, attempt: int | str) -> dict:
     """The same job (its sha, range and points) again under its own attempt's file, so its result, log and
     driver never meet an earlier attempt's: the result the next pass reads is this attempt's own."""
     base = Path(job["path"])
