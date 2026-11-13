@@ -9024,6 +9024,20 @@ def cmd_bench(a) -> None:
             raise SystemExit(rc)
         return
     from . import bench
+    if a.action == "fair":   # read-only: each task's verdict in an existing prep folder
+        if not a.bench:
+            die("bench fair: --bench <dir> (a `ttp bench prep` folder) is required")
+        try:
+            rows = bench.fair(Path(a.bench).expanduser(), Path(a.repo).expanduser() if a.repo else None)
+        except (OSError, ValueError) as e:
+            die(f"bench fair: {e}")
+        for r in rows:
+            print(f"#{r['task']}: " + ("cannot tell: " + r["why"] if r["fair"] is None else "fair" if r["fair"] else
+                                      "unfair: the spec does not state " + ", ".join(repr(x) for x in r["unstated"])))
+        n = sum(r["fair"] is True for r in rows)
+        print(f"{n} of {len(rows)} fair, {sum(r['fair'] is False for r in rows)} unfair, "
+              f"{sum(r['fair'] is None for r in rows)} unknown")
+        return
     p = here() or die("bench: no project here (run it in a project or with TTP_PROJECT set)")
     if not a.out:
         die(f"bench {a.action}: --out is required")
@@ -15587,8 +15601,10 @@ def main(argv: list[str] | None = None) -> None:
                                       "that add tests, keeps the tests that fail on the base and pass on the head, "
                                       "builds a clean one-commit workspace at each base and holds out the landed "
                                       "test files, with a hash-pinned manifest")
-    s.add_argument("action", choices=["prep", "cells", "run", "blind"],
-                   help="prep: build the bench in --out; cells: seeded-bug and prompt-injection cells from the "
+    s.add_argument("action", choices=["prep", "cells", "run", "blind", "fair"],
+                   help="prep: build the bench in --out; fair: read-only, whether each task of the --bench folder "
+                        "is fair (its held-out tests require nothing the change made up that its spec does not "
+                        "state), naming what is unstated; cells: seeded-bug and prompt-injection cells from the "
                         "--bench folder's small tasks in --out, with a hash-pinned cells.json; run: the head-to-head of two or more arms on --bench, "
                         "results and the blind review's cells.json in --out; blind: the blind review "
                         "(`ttp bench blind prep <run folder> --out <dir>`, then review, score, reveal; "

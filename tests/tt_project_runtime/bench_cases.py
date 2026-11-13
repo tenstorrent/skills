@@ -179,6 +179,43 @@ def test_bench_unknown_symbols_counts_names_the_spec_gives_and_ignores_outside_m
     assert bench.unknown_symbols(repo, base, head, tests, "Add pkg/tool.py with run() and extra().") == []
 
 
+def test_bench_unstated_names_a_config_key_and_a_message_the_spec_never_gives(tmp_path, capsys):
+    # The real case: the spec asks to make the 60% cut a config key, the held-out test requires one key name
+    # and one error text the fix made up. A candidate could only guess them, so the task is not fair; once the
+    # spec states both it is. An assert's own message, a docstring and plain inputs are no requirement.
+    from ttp import bench, cli
+    repo, git, commit, rev = _bench_repo(tmp_path)
+    commit({"pkg/__init__.py": "", "pkg/budget.py": "def level(cfg, used):\n    # the yellow cut\n"
+            "    return 'yellow' if used >= 0.6 else 'green'\n"}, "budget")
+    base = rev()
+    head = commit({"pkg/budget.py": "def level(cfg, used):\n    cut = cfg.get('budget', {}).get('cap_yellow_pct', 60)\n"
+                   "    if not isinstance(cut, (int, float)) or cut <= 0:\n"
+                   "        raise ValueError(f'budget.cap_yellow_pct={cut!r} must be a number above 0')\n"
+                   "    # a plain input such as the green level below is not a message\n"
+                   "    return 'yellow' if used >= cut / 100 else 'green'\n",
+                   "tests/test_budget.py": "import pytest\nfrom pkg.budget import level\n\n\n"
+                   "def test_cut():\n    \"\"\"The yellow cut is a config key: the green level below stays.\"\"\"\n"
+                   "    assert level({'budget': {'cap_yellow_pct': 75}}, 0.7) == 'green', 'a 75% cut is not reached yet'\n"
+                   "    with pytest.raises(ValueError) as e:\n        level({'budget': {'cap_yellow_pct': 0}}, 0.1)\n"
+                   "    assert 'must be a number above 0' in str(e.value)\n"}, "key")
+    tests = [("tests/test_budget.py", "test_cut")]
+    vague = "Make the yellow-level cut (60%) a config key."
+    assert bench.unstated(repo, base, head, tests, vague) == ["cap_yellow_pct", "must be a number above 0"]
+    assert bench.unstated(repo, base, head, tests, "Add budget.cap_yellow_pct (default 60); a value not above 0 "
+                          "raises ValueError saying it must be a number above 0.") == []
+    bench_dir = tmp_path / "prepped"
+    bench_dir.mkdir()
+    (bench_dir / "manifest.json").write_text(json.dumps({"repo": str(repo), "tasks": [
+        {"task": 1, "base": base, "head": head, "spec": vague, "tests": ["tests/test_budget.py::test_cut"]},
+        {"task": 2, "base": "e" * 40, "head": head, "spec": vague, "tests": []}]}))
+    assert [(r["task"], r["fair"], r["unstated"]) for r in bench.fair(bench_dir)] == \
+        [(1, False, ["cap_yellow_pct", "must be a number above 0"]), (2, None, [])]
+    cli.main(["bench", "fair", "--bench", str(bench_dir)])
+    out = capsys.readouterr().out
+    assert "#1: unfair: the spec does not state 'cap_yellow_pct', 'must be a number above 0'" in out
+    assert "#2: cannot tell: its base or head commit is not in the repository" in out and "0 of 2 fair" in out
+
+
 def test_bench_unknown_symbols_follows_dotted_imports_and_reads_only_the_held_out_tests(tmp_path):
     from ttp import bench
     repo, git, commit, rev = _bench_repo(tmp_path)

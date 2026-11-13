@@ -219,10 +219,9 @@ def _tests_of(repo: Path):
     return tests_of
 
 
-def _uses(repo: Path, blob: str, names: frozenset[str]) -> tuple[list, set]:
-    """What the test functions `names` (qualnames) of a test file and its other code (imports,
-    helpers, fixtures; not its other tests) read: (imports as (module, name, alias), module None for
-    `import name`; attribute chains as (name, attr, ...))."""
+def _roots(repo: Path, blob: str, names: frozenset[str]) -> list:
+    """The top-level nodes of a test file that the test functions `names` (qualnames) run: those tests, its
+    imports, helpers and fixtures; never its other tests."""
     tree = _tree(repo, blob)
     funcs = (ast.FunctionDef, ast.AsyncFunctionDef)
 
@@ -234,8 +233,15 @@ def _uses(repo: Path, blob: str, names: frozenset[str]) -> tuple[list, set]:
             roots += [*node.decorator_list, *node.bases, *(m for m in node.body if not other(m, f"{node.name}."))]
         elif not other(node):
             roots.append(node)
+    return roots
+
+
+def _uses(repo: Path, blob: str, names: frozenset[str]) -> tuple[list, set]:
+    """What the test functions `names` (qualnames) of a test file and its other code (imports,
+    helpers, fixtures; not its other tests) read: (imports as (module, name, alias), module None for
+    `import name`; attribute chains as (name, attr, ...))."""
     imports, chains, inner = [], set(), set()
-    for node in (n for r in roots for n in ast.walk(r)):
+    for node in (n for r in _roots(repo, blob, names) for n in ast.walk(r)):
         if isinstance(node, ast.ImportFrom) and node.module:
             imports += [(node.module, a.name, a.asname) for a in node.names]
         elif isinstance(node, ast.Import):
@@ -308,6 +314,105 @@ def unknown_symbols(repo: Path, base: str, head: str, tests: list[tuple[str, str
         if not have and (attr or mod) not in words:
             out.append(f"{mod}.{attr}" if attr else mod)
     return out
+
+
+MESSAGE_MAX = 300   # characters of a test's string searched for message parts
+MESSAGE_MIN = 8   # characters of a string a test asserts before it counts as a message text the spec must state
+_KEY = re.compile(r"[A-Za-z_][\w-]*(?:\.[A-Za-z_][\w-]*)*")   # an identifier or a dotted config key
+_FLAG = re.compile(r"--?[A-Za-z][\w-]*")
+_LITERAL = re.compile(r"""(["'])((?:\\.|(?!\1).)*)\1""")   # a quoted string on one line, and its text
+_MESSAGE_PARTS = re.compile(r"\d+(?:\.\d+)?|\([^)]*\)|'[^']*'|\"[^\"]*\"|`[^`]*`")   # what a message fills in
+
+
+def _stated(item: str, spec: str, words: set[str]) -> bool:
+    low = spec.lower()
+    if " " in item:   # a message: the spec gives its text
+        return flat(item).lower() in flat(spec).lower()
+    parts = [x for x in re.split(r"[.]", item.lstrip("-")) if x]
+    return item.lower() in low or (parts and parts[-1] in words) or item.lstrip("-") in words
+
+
+def unstated(repo: Path, base: str, head: str, tests: list[tuple[str, str]], spec: str) -> list[str]:
+    """What the held-out `tests` ([(path, qualname)], with their files' other code, at `head`) require that the
+    change itself introduced and `spec` never states: a config key, an attribute, keyword, function or CLI flag
+    name, or a message text the tests assert. Each is new in the change's non-test files (in their added lines,
+    absent from their base versions), so a candidate could only guess it: the task is not fair. Sorted,
+    one entry per item."""
+    at_head, at_base = _blobs(repo, head), _blobs(repo, base)
+    changed = [x for x in _out(repo, "diff", "--no-renames", "--name-only", base, head).splitlines()
+               if x and not _held(x)]
+    before_words: set[str] = set()
+    before_text = []
+    for path in changed:
+        if path in at_base:
+            before_words |= _words(repo, at_base[path])
+            before_text.append(_blob(repo, at_base[path]).decode(errors="replace"))
+    lines = _changed(repo, base, head)[0] if changed else []
+    added = "\n".join(lines)
+    # the string literals of the added code lines (never a comment or a docstring): where output text lives
+    literals = "\n".join(m[1] for x in lines if not x.startswith(('#', '"""', "'''"))
+                         for m in _LITERAL.findall(x))
+    added_words = set(re.findall(r"[\w-]+", added))
+    before = "\n".join(before_text)
+    words = set(re.findall(r"[\w-]+", spec))
+    out: list[str] = []
+
+    def take(item: str, part: str = "") -> None:
+        if item not in out and not _stated(part or item, spec, words):
+            out.append(item)
+    for path in sorted({p for p, _ in tests}):
+        if path not in at_head:
+            continue
+        roots = _roots(repo, at_head[path], frozenset(n for p, n in tests if p == path))
+        # an assert's own failure message is for the reader, never output the change must produce
+        # (nor is a docstring or another bare string statement)
+        said = {id(m) for r in roots for a in ast.walk(r) if isinstance(a, ast.Assert) and a.msg
+                for m in ast.walk(a.msg)}
+        said |= {id(a.value) for r in roots for a in ast.walk(r)
+                 if isinstance(a, ast.Expr) and isinstance(a.value, ast.Constant)}
+        for node in (n for r in roots for n in ast.walk(r) if id(n) not in said):
+            names = []
+            if isinstance(node, ast.Attribute):
+                names.append(node.attr)
+            elif isinstance(node, ast.keyword) and node.arg:
+                names.append(node.arg)
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+                v = node.value
+                if _FLAG.fullmatch(v) or (_KEY.fullmatch(v) and ("_" in v or "." in v)):
+                    names.append(v)
+                else:   # a message, or its fixed parts where the change fills in numbers, names or quotes
+                    for part in _MESSAGE_PARTS.split(v[:MESSAGE_MAX]):
+                        # its longest start the change wrote (a plural or a name it fills in may follow)
+                        part = next((x for k in range(len(part.strip(" :;,.")), MESSAGE_MIN - 1, -1)
+                                     if " " in (x := part.strip(" :;,.")[:k]) and x in literals), "")
+                        if part and part not in before:
+                            take(v.strip(), part)
+                            break
+            for name in names:   # a name the change made up: new in its added lines, in no base version
+                bare = name.lstrip("-")
+                key = bare.split(".")[-1]
+                if len(key) >= 3 and key in added_words and key not in before_words and \
+                        (name in added or bare in added):
+                    take(name)
+    return sorted(out)
+
+
+def fair(bench_dir: Path, repo: Path | None = None) -> list[dict]:
+    """Read-only: each task of a `ttp bench prep` folder with its verdict, whether its held-out tests depend
+    only on what its spec states (unstated: [] when fair), or why it cannot tell (its commits are gone)."""
+    man = json.loads((Path(bench_dir) / "manifest.json").read_text())
+    repo = Path(repo or man.get("repo") or ".")
+    rows = []
+    for t in man.get("tasks", []):
+        tests = [tuple(x.split("::", 1)) for x in t.get("tests", []) if "::" in x]
+        if any(_git(repo, "cat-file", "-e", f"{x}^{{commit}}").returncode for x in (t["base"], t["head"])):
+            rows.append({"task": t["task"], "fair": None, "unstated": [],
+                         "why": "its base or head commit is not in the repository"})
+            continue
+        items = unknown_symbols(repo, t["base"], t["head"], tests, t.get("spec") or "")
+        items += [x for x in unstated(repo, t["base"], t["head"], tests, t.get("spec") or "") if x not in items]
+        rows.append({"task": t["task"], "fair": not items, "unstated": items})
+    return rows
 
 
 def _archive(repo: Path, rev: str, dest: Path) -> None:
@@ -523,6 +628,9 @@ def prep(db, repo: Path, out: Path, since: float, limit: int = 0, test_cmd: str 
                 why = f"its spec quotes {n} lines of the fix"
             if not why and (hidden := unknown_symbols(repo, base, head, tests, t["spec"])):
                 why = f"its held-out tests use symbols the base lacks and the spec does not name: {', '.join(hidden)}"
+            if not why and (hidden := unstated(repo, base, head, tests, t["spec"] or "")):
+                why = ("its held-out tests require names or texts the change made up and the spec does not state: "
+                       + ", ".join(repr(x) for x in hidden[:8]) + (" ..." if len(hidden) > 8 else ""))
             held = [x for x in _out(repo, "diff", "--no-renames", "--name-only", "--diff-filter=AM", base, head)
                     .splitlines() if _held(x)] if not why else []
             if not why and validated:
