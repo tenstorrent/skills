@@ -13,6 +13,9 @@ re-emits a ``token_count`` event with an unchanged ``total_token_usage`` (and th
 ``last_token_usage``) on rate-limit updates; such repeats are not new usage and are skipped.
 ``total_token_usage`` is never differenced across sessions. The window only gives wall hours.
 
+The runner also writes the device held/idle timeline (``device_timeline.py``); ``check``
+requires the timeline file and the device row.
+
 Exit codes of ``check``: 0 pass (or not yet written by the runner), 2 missing or malformed,
 3 usage error.
 """
@@ -37,6 +40,8 @@ ROW_LABELS = {
     "total": "total",
 }
 HEADING = "## Stage usage"
+DEVICE_KEYS = ("held_s", "held_other_s", "idle_s", "unknown_s")
+DEVICE_NOTE = "Held, not busy: an idle server counts as held."
 HOME_LINE = (
     "Counted by thread family (the stage's main thread, its sub-agents, and the remediation/review "
     "threads the runner started, with their sub-agents) from the Codex sessions in {home}; "
@@ -250,6 +255,27 @@ def usage_record(
     return record
 
 
+def _h(seconds: int) -> str:
+    return f"{seconds / 3600:.2f}"
+
+
+def device_line(device: dict[str, Any]) -> str:
+    ran = ", ".join(
+        part for part in (
+            f"ran on {device.get('host') or 'unknown host'}",
+            f"as uid {device['uid']}" if "uid" in device else "",
+            f"pid namespace {device['pidns']}" if device.get("pidns") else "",
+        ) if part
+    )
+    view = "complete" if device["complete"] else "incomplete (unreadable fds, a gap or a missing start)"
+    return (
+        f"Device ({device['timeline']}, checked every 15 s, {ran}; view {view}): "
+        f"held {_h(device['held_s'])} h, idle {_h(device['idle_s'])} h, unknown {_h(device['unknown_s'])} h, "
+        f"of {_h(device['wall_s'])} wall hours; held by other holders {_h(device['held_other_s'])} h "
+        f"(separate). {DEVICE_NOTE}"
+    )
+
+
 def _num(value: int) -> str:
     return f"{value:,}"
 
@@ -289,6 +315,8 @@ def render_section(record: dict[str, Any]) -> str:
         HOME_LINE.format(home=record["codex_home"], other=record["other_sessions"]),
         "",
     ]
+    if record.get("device"):
+        lines += [device_line(record["device"]), ""]
     return "\n".join(lines)
 
 
@@ -333,6 +361,18 @@ def _int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
+def validate_device(device: Any) -> list[str]:
+    if not isinstance(device, dict):
+        return ["stage_usage.json device (held/idle/unknown hours) is missing"]
+    errors = [f"stage_usage.json device.{key} must be an integer >= 0"
+              for key in (*DEVICE_KEYS, "wall_s") if not _int(device.get(key))]
+    if not isinstance(device.get("complete"), bool) or not isinstance(device.get("timeline"), str):
+        errors.append("stage_usage.json device.complete/timeline are missing")
+    if not errors and sum(device[key] for key in DEVICE_KEYS) != device["wall_s"]:
+        errors.append("stage_usage.json device held + other + idle + unknown != wall")
+    return errors
+
+
 def validate_record(record: Any) -> list[str]:
     errors: list[str] = []
     if not isinstance(record, dict):
@@ -349,6 +389,7 @@ def validate_record(record: Any) -> list[str]:
         errors.append("stage_usage.json other_sessions must be an integer >= 0")
     if not isinstance(record.get("remediation_rounds"), list):
         errors.append("stage_usage.json remediation_rounds must be a list")
+    errors += validate_device(record.get("device"))
     rows = record.get("rows")
     if not isinstance(rows, dict) or any(not isinstance(rows.get(key), dict) for key in ROW_KEYS):
         return errors + [f"stage_usage.json rows must have {', '.join(ROW_KEYS)}"]
@@ -408,6 +449,8 @@ def validate_section(text: str, record: dict[str, Any]) -> list[str]:
         errors.append(f"'{HEADING}' lacks the stage start/end, wall hours, status and rounds line")
     if HOME_LINE.format(home=record["codex_home"], other=record["other_sessions"]) not in joined:
         errors.append(f"'{HEADING}' lacks the 'Counted by thread family from the Codex sessions in <CODEX_HOME>' line")
+    if record.get("device") and device_line(record["device"]) not in joined:
+        errors.append(f"'{HEADING}' lacks the device held/idle/unknown row matching stage_usage.json")
     return errors
 
 
@@ -426,6 +469,8 @@ def check(model_dir: pathlib.Path, stem: str) -> tuple[int, list[str]]:
     errors = validate_record(record)
     if errors:
         return 2, errors
+    if not (model_dir / doc_dir / record["device"]["timeline"]).is_file():
+        return 2, [f"{model_dir / doc_dir / record['device']['timeline']} is missing (the runner writes it)"]
     report_path = model_dir / report
     if not report_path.is_file():
         return 2, [f"{report_path} is missing, so it has no '{HEADING}' section"]

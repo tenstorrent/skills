@@ -17,6 +17,8 @@ PLUGIN = REPO / 'plugins/tt-model-bringup'
 GATES = PLUGIN / 'prompts/model_bringup_multigoal'
 sys.path.insert(0, str(PLUGIN / 'scripts'))
 import stage_usage  # noqa: E402
+import device_timeline  # noqa: E402
+from test_device_timeline import FakeHost  # noqa: E402
 
 loader = importlib.machinery.SourceFileLoader('stage_usage_runner', str(PLUGIN / 'scripts/multigoal'))
 spec = importlib.util.spec_from_loader(loader.name, loader)
@@ -157,10 +159,13 @@ def test_runner_writes_section_and_json_commits_them_and_rewrites_after_remediat
     clock = iter(['2026-11-12T10:00:00Z', '2026-11-12T11:00:00Z', '2026-11-12T11:00:00Z',
                   '2026-11-12T11:30:00Z', END])
     monkeypatch.setattr(runner, 'iso_now', lambda: next(clock))
-    args = SimpleNamespace(_codex_home=home)
+    host = FakeHost(tmp_path)
+    host.process(200, 100, 'python3 server.py', devices=[0])
+    args = SimpleNamespace(_codex_home=home, _proc_root=host.proc, _dev_dir=host.dev)
     usage = runner.StageUsage(args, repo, manifest, 12, '12-agentic-evals', Path('12-agentic-evals.txt'), '',
                               [('MODEL_DIR', 'models/autoports/org_model')])
     usage.thread('main-1')
+    usage.start_timeline(fresh=True)
     usage.write('complete')
     first = json.loads((model / 'doc/agentic_evals/stage_usage.json').read_text())
     assert first['end_utc'] == '2026-11-12T11:00:00Z'
@@ -183,6 +188,11 @@ def test_runner_writes_section_and_json_commits_them_and_rewrites_after_remediat
     assert 'remediation rounds 1 (remediation 1 2026-11-12T11:00:00Z to 2026-11-12T11:30:00Z, complete)' in text
     assert f'from the Codex sessions in {home}; 3 other session(s) in that home are not counted' in text
     assert '| remediation/review rounds | 2 | 580 |' in text and '| main | 1 | 6,300 |' in text
+    usage.close()
+    device = record['device']
+    assert device['timeline'] == 'device_timeline.jsonl' and device['wall_s'] <= 2
+    assert sum(device[key] for key in stage_usage.DEVICE_KEYS) == device['wall_s']
+    assert 'wall hours; held by other holders' in text and 'an idle server counts as held' in text
     assert stage_usage.check(model, '12-agentic-evals') == (0, [])
 
     log_lines = subprocess.run(['git', 'log', '--format=%s'], cwd=repo, capture_output=True, text=True).stdout.split('\n')
@@ -190,6 +200,7 @@ def test_runner_writes_section_and_json_commits_them_and_rewrites_after_remediat
     committed = subprocess.run(['git', 'show', '--name-only', '--format=', 'HEAD'], cwd=repo,
                                capture_output=True, text=True).stdout.split()
     assert sorted(committed) == ['models/autoports/org_model/doc/agentic_evals/REPORT.md',
+                                 'models/autoports/org_model/doc/agentic_evals/device_timeline.jsonl',
                                  'models/autoports/org_model/doc/agentic_evals/stage_usage.json']
     staged = subprocess.run(['git', 'diff', '--cached', '--name-only'], cwd=repo, capture_output=True, text=True).stdout
     assert staged.split() == ['unrelated.txt']
@@ -199,7 +210,15 @@ def test_runner_writes_section_and_json_commits_them_and_rewrites_after_remediat
 def written(tmp_path, home, stage='12-agentic-evals'):
     repo, model, report = model_tree(tmp_path, stage_usage.STAGE_REPORTS[stage_usage.stage_key(stage)][0])
     paths = stage_usage.stage_paths(stage)
-    record = stage_usage.usage_record(stage=stage, home=home, start=stage_usage.parse_ts(START),
+    timeline = model / paths[1] / 'device_timeline.jsonl'
+    timeline.parent.mkdir(parents=True, exist_ok=True)
+    timeline.write_text('\n'.join(json.dumps(item) for item in [
+        {'t': 0, 'held': 0, 'of': 2, 'by': '', 'other': False, 'event': 'stage_start', 'host': 'h1', 'uid': 7,
+         'pidns': 'pid:[1]', 'interval': 15},
+        {'t': 3600, 'held': 1, 'of': 2, 'by': 'server', 'other': False},
+        {'t': 7200, 'held': 1, 'of': 2, 'by': 'x', 'other': True},
+        {'t': 7500, 'held': 0, 'of': 2, 'by': '', 'other': False, 'event': 'stage_end'}]) + '\n')
+    record = stage_usage.usage_record(stage=stage, device=device_timeline.summarize(timeline), home=home, start=stage_usage.parse_ts(START),
                                       end=stage_usage.parse_ts(END), terminal_status='complete', rounds=[],
                                       report=paths[0], main_thread_ids=['main-1'],
                                       round_thread_ids=['rem-1'])
@@ -227,6 +246,15 @@ def gate(model, stage, required=True):
     (lambda report, js: report.write_text(report.read_text().replace('Counted by', 'Taken by')),
      'Counted by thread family'),
     (lambda report, js: report.unlink(), 'REPORT.md is missing'),
+    (lambda report, js: (js.parent / 'device_timeline.jsonl').unlink(), 'device_timeline.jsonl is missing'),
+    (lambda report, js: js.write_text(json.dumps({k: v for k, v in json.loads(js.read_text()).items()
+                                                  if k != 'device'})), 'device (held/idle/unknown hours) is missing'),
+    (lambda report, js: report.write_text(''.join(line for line in report.read_text().splitlines(True)
+                                                  if not line.startswith('Device '))), 'device held/idle/unknown row'),
+    (lambda report, js: report.write_text(report.read_text().replace('held 1.00 h', 'held 1.01 h')),
+     'device held/idle/unknown row'),
+    (lambda report, js: js.write_text(json.dumps({**json.loads(js.read_text()), 'device': {
+        **json.loads(js.read_text())['device'], 'idle_s': 1}})), 'device held + other + idle + unknown != wall'),
 ])
 def test_missing_or_malformed_usage_is_critical(tmp_path, home, break_it, message):
     model, report, js = written(tmp_path, home)
@@ -237,6 +265,17 @@ def test_missing_or_malformed_usage_is_critical(tmp_path, home, break_it, messag
     assert message in result.stderr
     # An agent running the check itself mid-stage is not judged on the runner's record.
     assert gate(model, '12-agentic-evals', required=False).returncode == 0
+
+
+def test_device_row_is_exact_and_notes_held_not_busy(tmp_path, home):
+    _model, report, js = written(tmp_path, home)
+    device = json.loads(js.read_text())['device']
+    assert (device['held_s'], device['held_other_s'], device['idle_s'], device['unknown_s'], device['wall_s']) == (
+        3600, 300, 3600, 0, 7500)
+    assert device['complete'] is True and device['host'] == 'h1' and device['uid'] == 7
+    assert ('held 1.00 h, idle 1.00 h, unknown 0.00 h, of 2.08 wall hours; held by other holders 0.08 h '
+            '(separate). Held, not busy: an idle server counts as held.') in report.read_text()
+    assert 'ran on h1, as uid 7, pid namespace pid:[1]; view complete' in report.read_text()
 
 
 def test_no_thresholds_on_the_numbers(tmp_path):
