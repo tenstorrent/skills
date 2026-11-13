@@ -349,8 +349,8 @@ def _passes(where: Path, tests: list[tuple[str, str]], rounds: int, cmd: str, ti
     env[addedtests.ENV] = json.dumps({**json.loads(env[addedtests.ENV]), "spread": False})
     argv = _held_cmd(cmd, [f"{p}::{n}" for p, n in tests])[0]
     timed_out = False
-    # own session: the test run is killed whole (its group) once past the timeout
     with open(log, "wb") as sink:
+        # own session: the test run is killed whole (its group) once past the timeout
         proc = subprocess.Popen(sandbox.wrap(argv, env=env), cwd=where, env=env, start_new_session=True,
                                 stdin=subprocess.DEVNULL, stdout=sink, stderr=subprocess.STDOUT)
         try:
