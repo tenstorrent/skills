@@ -8889,6 +8889,7 @@ def _model_bench_argv(a) -> list[str]:
         return ["run", *(["--force"] if a.force else [])]
     return ["suite", *(["--date", a.date] if a.date else []), *(["--dry-run"] if a.dry_run else []),
             *(["--bench", a.bench] if a.bench else []), *(["--cells", a.cells] if a.cells else []),
+            *(["--models", a.models] if a.models else []), *(["--class", a.cls] if a.cls else []),
             "--timeout", str(a.timeout), "--budget", str(a.budget), "--harbor", str(a.harbor)]
 
 
@@ -8973,7 +8974,9 @@ def _model_suite(p, a, now: float) -> None:
         opts.update(terminalbench=settings(cfg), endpoint_url=got.url, endpoint_key=got.key)
     try:
         rows = modelsuite.run(p.db, cfg, served, modelrank.parked_models(p.db), now, date=a.date or "",
-                              bench_dir=bench_dir, cells_dir=cells_dir, opts=opts, ask=ask)
+                              bench_dir=bench_dir, cells_dir=cells_dir, opts=opts, ask=ask,
+                              models=[m.strip() for m in a.models.split(",") if m.strip()] if a.models else None,
+                              classes=(a.cls,) if a.cls else None)
     except (modelsuite.SuiteError, benchrun.BenchError) as e:
         die(f"model-bench suite: {e}")
     print(json.dumps([{k: v for k, v in r.items() if k != "cell_rows"} for r in rows], indent=1))
@@ -9077,7 +9080,7 @@ def _bench_run(p, a) -> None:
     for r in rows:
         print(f"task {r['task']} rep {r['rep']} {r['arm']}: {r['outcome']}, ${r.get('cost_usd', 0):.2f}, "
               f"{r.get('wall_s', 0):.0f} s" + (f" ({'; '.join(r.get('flagged') or r.get('why') or [])})"
-                                              if r['outcome'] in ("flagged", "isolation_failed") else ""))
+                                              if r['outcome'] in ("flagged", "isolation_failed", "error", "not_isolated") else ""))
     print(f"ttp bench run: {len(rows)} cell(s) run, seed {seed}; results {Path(a.out).expanduser().resolve() / 'results.jsonl'}")
 
 
@@ -15557,7 +15560,10 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--harbor", type=int, default=0, metavar="N",
                    help="suite: also run N Terminal-Bench 2.0 tasks per model through Harbor, installed in a "
                         "venv the run owns (default 0: off)")
-    s.add_argument("--models", help="terminalbench: only these served models (comma-separated)")
+    s.add_argument("--models", "--model", help="suite, terminalbench: only these served models (comma-separated); "
+                                               "the suite runs them side by side, one cell at a time per model")
+    s.add_argument("--class", dest="cls", choices=["standard", "babysit"],
+                   help="suite: only this class (replay and injection cells, or babysit calls), e.g. to re-score it")
     s.add_argument("--reference", action="store_true",
                    help="terminalbench: the one-time reference run of the fixed reference models over the full task "
                         "list, through the endpoint named by model_bench.terminalbench.reference.endpoint; booked "

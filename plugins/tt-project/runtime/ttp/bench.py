@@ -118,6 +118,30 @@ def quotes(spec: str, added: list[str]) -> int:
     return len({x for x in added if len(x) >= QUOTE_LEN and " ".join(x.split()) in body})
 
 
+WITHHELD = "[path withheld]"
+_PATH_TAIL = r"(?:/[^\s`'\"<>)\]},;:|&]*)?"   # what follows a path's folder: the rest of the path
+
+
+def scrub_spec(spec: str, roots=(), drop=(), home: Path | None = None) -> str:
+    """`spec` as a bench cell's agent may read it. A task's spec names absolute paths of the machine it was written
+    on; a cell has only its workspace, so a path under a source checkout in `roots` becomes relative to the
+    workspace (the checkout root itself `.`), and one under `drop` (the project's state and runs, the bench and
+    results folders, other worktrees) or the real home folder `home` (also written `~/...`), which a cell must not
+    follow, becomes WITHHELD."""
+    def alt(paths) -> str:
+        return "|".join(re.escape(p) for p in sorted({str(p).rstrip("/") for p in paths} - {"", "."}, key=len,
+                                                     reverse=True))
+    edge = r"(?<![\w./~-])"
+    if names := alt(drop):
+        spec = re.sub(edge + f"(?:{names})(?![\\w.-])" + _PATH_TAIL, WITHHELD, spec)
+    if names := alt(roots):
+        spec = re.sub(edge + f"(?:{names})/", "", spec)
+        spec = re.sub(edge + f"(?:{names})(?![\\w./-])", ".", spec)
+    if home:
+        spec = re.sub(edge + f"(?:{alt([home])})(?![\\w.-])" + _PATH_TAIL, WITHHELD, spec)
+    return re.sub(r"(?<![\w./~-])~/[^\s`'\"<>)\]},;:|&]*", WITHHELD, spec) if home else spec
+
+
 def _blobs(repo: Path, rev: str) -> dict[str, str]:
     """{path: blob id} of the files at `rev`."""
     def read() -> dict[str, str]:
@@ -515,7 +539,8 @@ def prep(db, repo: Path, out: Path, since: float, limit: int = 0, test_cmd: str 
                 dest = here / "heldout" / path
                 durable_write(dest, _blob(repo, _blobs(repo, head)[path]), sync=False)
                 sums[path] = _sha(dest)
-            kept.append({"task": t["id"], "kind": t["kind"], "title": t["title"], "spec": t["spec"],
+            kept.append({"task": t["id"], "kind": t["kind"], "title": t["title"],
+                         "spec": scrub_spec(t["spec"] or "", [repo, repo.resolve()]),
                          "created": t["created"],
                          "parent": int(parent[1]) if parent else None, "base": base, "head": head, "tree": tree,
                          "stratum": "small" if lines <= SMALL else "large", "changed_lines": lines,

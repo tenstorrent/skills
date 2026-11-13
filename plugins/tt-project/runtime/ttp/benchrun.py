@@ -38,7 +38,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import bench, cellenv, gitmemo
+from . import bench, cellenv, cellns, gitmemo
 from .project import durable_write, open_append
 
 PROMPT = ("You are working in the git repository in your current directory. Do the task below there: make "
@@ -47,6 +47,7 @@ PROMPT = ("You are working in the git repository in your current directory. Do t
           "$TTP_RUN_DIR/result.json.\n\n## Task\n\n{spec}\n")
 CHEAT = re.compile(r"\bgit\s+(fetch|clone|pull|ls-remote|remote\s+add)\b|\bgit\s+log\s+--all\b|\bgh\s+(api|repo|pr)\b")
 TEST_CMD = "python3 -m pytest -q -p no:cacheprovider"
+ISOLATE = True   # each cell's agent runs in a mount namespace (cellns.py); only tests turn this off (opts["isolate"])
 
 
 class BenchError(Exception):
@@ -404,16 +405,68 @@ def _clean_env() -> dict:
             if k != "PYTHONPATH" and (not k.startswith("TTP_") or k.startswith("TTP_FAKE_"))}
 
 
-def _boot(module: str) -> list[str]:
-    # `python -m <module>` with this runtime on sys.path for that process only, not in its env.
-    runtime = str(Path(__file__).resolve().parent.parent)
-    return [sys.executable, "-c", f"import runpy, sys; sys.path.insert(0, {runtime!r}); "
+def _boot(module: str, cell=None) -> list[str]:
+    # `python -m <module>` with this runtime on sys.path for that process only, not in its env. In a cell
+    # (cellns.py) the real runtime does not exist: the dry run's fake agent runs from the copy it was given.
+    runtime = (cell.runtime if cell is not None and cell.runtime else str(Path(__file__).resolve().parent.parent))
+    python = cell.python if cell is not None and cell.python else sys.executable
+    return [python, "-c", f"import runpy, sys; sys.path.insert(0, {runtime!r}); "
             f"runpy.run_module({module!r}, run_name='__main__', alter_sys=True)"]
+
+
+def _in_cell(argv: list[str], cell) -> list[str]:
+    """`argv` as the agent runs it in the cell's namespace: the project's hooks left out of its settings (their
+    commands live in the runtime, which the cell does not have; the namespace is the guard), its executable as
+    the resolved install the namespace holds, and the namespace's own prefix."""
+    argv = list(argv)
+    if "--settings" in argv[:-1]:
+        i = argv.index("--settings") + 1
+        try:
+            settings = json.loads(argv[i])
+            settings.pop("hooks", None)
+            argv[i] = json.dumps(settings)
+        except (ValueError, AttributeError):
+            pass
+    if cell.cli and argv and os.path.realpath(shutil.which(argv[0]) or argv[0]) == os.path.realpath(cell.cli):
+        argv[0] = cell.cli
+    return cell.wrap(argv)
+
+
+def isolate(tmp: Path, ws: Path, arm: dict, opts: dict, hidden: list[Path], repos: list):
+    """The cell's mount namespace (cellns.py) for `arm`'s agent and what its self-test found wrong: (cell, problems).
+    Raises cellns.Unavailable where no namespace can be built. The agent's config folders are the cell's own
+    (never the real ones), the real login files of a provider that has them are bound in read-only, the project's
+    hooks are not copied in, and a dry run's fake agent gets a copy of the runtime (the real one stays out)."""
+    from .providers import get_provider
+    provider = "fake" if opts.get("dry_run") else arm["provider"]
+    prov = get_provider(provider)
+    kind = "claude" if provider == "chat" else provider   # the chat provider runs Claude Code's CLI
+    conf, creds = {}, []
+    if kind in SCRATCH:
+        conf, _ = scratch_home(kind, tmp, False)
+        conf.pop("CLAUDE_SECURESTORAGE_CONFIG_DIR", None)
+        folder = Path(conf[SCRATCH[kind][0]])
+        (folder / "hooks.json").unlink(missing_ok=True)
+        if provider not in ("chat", "fake"):
+            creds = [(f, str(folder / Path(f).name)) for f in prov.credential_files()]
+    runtime, copy = Path(__file__).resolve().parent.parent, None
+    if provider == "fake":
+        copy = tmp / "fakert"
+        shutil.copytree(runtime / "ttp", copy / "ttp", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    python = str(tmp / "venv" / "bin" / "python")
+    cell = cellns.build(tmp, ws, hidden, python=python, cli="" if provider == "fake" else str(prov.binary() or ""),
+                        config=conf, creds=creds, path_dirs=[str(tmp / "venv" / "bin")])
+    cell.python, cell.runtime = python, str(copy) if copy else ""
+    return cell, cellns.selftest(cell, ws, [*cellns.real_paths(runtime, repos), *hidden])
 
 
 def run_cell(bench_dir: Path, out: Path, task: dict, cell: dict, arm: dict, opts: dict, cfg: dict) -> dict:
     """Run one cell, grade it and return its results row (also written under <out>/cells)."""
     row = {**cell, **arm, "dry_run": bool(opts.get("dry_run"))}
+    if opts.get("isolate", ISOLATE) and not cellns.backend():   # nothing to run it in: no work, no score
+        return {**row, "outcome": "not_isolated", "passed": False,
+                "why": ["not isolated: neither bwrap (bubblewrap) nor unshare (util-linux) can build a mount "
+                        "namespace here, so the cell is not run, scored or ranked"]}
     keep = out / "cells" / f"{task['task']}-r{cell['rep']}-{cell['arm']}"
     hidden = hidden_paths(bench_dir.resolve(), out.resolve(), [task.get("repo"), opts.get("repo")], opts.get("state"))
     tmp = Path(tempfile.mkdtemp(prefix="cell-"))
@@ -428,12 +481,26 @@ def run_cell(bench_dir: Path, out: Path, task: dict, cell: dict, arm: dict, opts
             cell_env = cellenv.env(cellenv.make(tmp / "venv", opts.get("cell_packages", cellenv.SEED)), _clean_env())
         except cellenv.Unavailable as e:
             return {**row, "outcome": "isolation_failed", "passed": False, "why": [str(e)[:500]]}
-        # No earlier transcripts within reach: the arm's CLI gets a config folder of the cell's own.
-        conf, logins = scratch_home(arm["provider"], tmp, not opts.get("dry_run")) \
-            if opts.get("scratch_home", True) else ({}, [])
-        own = session_dirs(ws, conf.get("CLAUDE_CONFIG_DIR"))
-        prov, wall, hung = launch(run, ws, PROMPT.format(spec=task["spec"]), arm, opts, cfg, hidden, cell_env, conf,
-                                  own)
+        spec, cell = task["spec"], None
+        if opts.get("isolate", ISOLATE):   # the agent runs in a namespace that holds only the cell (cellns.py)
+            repos = [r for r in (task.get("repo"), opts.get("repo")) if r]
+            try:
+                cell, problems = isolate(tmp, ws, arm, opts, hidden, repos)
+            except cellns.Unavailable as e:
+                return {**row, "outcome": "not_isolated", "passed": False, "why": [str(e)[:500]]}
+            if problems:
+                return {**row, "outcome": "error", "passed": False, "isolated": cell.backend,
+                        "why": [f"isolation self-test: {x}"[:300] for x in problems]}
+            roots = [Path(x).expanduser() for r in repos for x in (r, Path(r).resolve())]
+            spec = bench.scrub_spec(spec, roots, [h for h in hidden if h not in roots], Path.home())
+            row["isolated"] = cell.backend
+            conf, own = dict(cell.conf), session_dirs(ws, cell.conf.get("CLAUDE_CONFIG_DIR"))
+        else:   # No earlier transcripts within reach: the arm's CLI gets a config folder of the cell's own.
+            conf, logins = scratch_home(arm["provider"], tmp, not opts.get("dry_run")) \
+                if opts.get("scratch_home", True) else ({}, [])
+            own = session_dirs(ws, conf.get("CLAUDE_CONFIG_DIR"))
+        prov, wall, hung = launch(run, ws, PROMPT.format(spec=spec), arm, opts, cfg, hidden, cell_env, conf, own,
+                                  cell)
         row["wall_s"] = wall
         if hung:   # the supervisor itself hung: its watchdog ends the agent; what it spent so far still counts
             row.update(outcome="runner_timeout", passed=False)
@@ -452,10 +519,11 @@ def run_cell(bench_dir: Path, out: Path, task: dict, cell: dict, arm: dict, opts
 
 
 def launch(run: Path, ws: Path, prompt: str, arm: dict, opts: dict, cfg: dict, hidden: list[Path], cell_env: dict,
-           env: dict | None = None, own: list[Path] | None = None) -> tuple:
+           env: dict | None = None, own: list[Path] | None = None, cell=None) -> tuple:
     """Run the arm's agent on `prompt` in `ws` under the runner supervisor (run dir `run`, new), reads of
     `hidden` denied except the cell's own session folders `own` (default: session_dirs(ws)); `env` adds to
-    the agent's environment (PATH_PREPEND goes before its PATH). Returns
+    the agent's environment (PATH_PREPEND goes before its PATH); `cell` (cellns.Cell): the agent runs in its
+    mount namespace, the supervisor and the chat bridge stay outside. Returns
     (provider, wall_s, hung): hung when the supervisor itself outlived its timeout."""
     from . import billing, chatbridge
     from .providers import get_provider
@@ -468,7 +536,9 @@ def launch(run: Path, ws: Path, prompt: str, arm: dict, opts: dict, cfg: dict, h
                             budget_usd=opts["budget_usd"], read_only=False, schema=None, restrictions={},
                             denied_reads=denied_reads(hidden, own or session_dirs(ws)), web=False)
     if argv[:3] == [sys.executable, "-m", "ttp.providers.fake"]:   # the dry run's agent: no PYTHONPATH
-        argv = [*_boot("ttp.providers.fake"), *argv[3:]]
+        argv = [*_boot("ttp.providers.fake", cell), *argv[3:]]
+    if cell is not None:
+        argv = _in_cell(argv, cell)
     extra = dict(env or {})
     if pre := extra.pop("PATH_PREPEND", ""):
         extra["PATH"] = os.pathsep.join(p for p in (pre, penv.get("PATH") or cell_env.get("PATH", "")) if p)

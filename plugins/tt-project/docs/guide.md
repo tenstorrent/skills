@@ -1286,11 +1286,20 @@ it has none) and each arm's diff with the provider, model, effort, run id (its `
 session id and transcript path, which prep masks. `ttp bench blind <words>` runs
 `python3 -m ttp.benchblind <words>` (Blind review for model comparisons), and its prep also takes the
 run folder: `ttp bench blind prep <run folder> --out <dir>`, then `review`, `score` and `reveal`. `--dry-run` runs every arm on the fake agent:
-no model call and no spend. The cells run as the same user as the command with the real home
-folder, so the denial and the audit, not the operating system, keep a candidate from those paths: a
-read the audit cannot see (a path built at run time, or one under another name) stays a gap. A
-scratch home folder holding only the provider's login would close more of it, but it is not used:
-the providers keep their login in the home folder, and the harness copies no credentials.
+no model call and no spend. Each cell's agent runs in a Linux mount namespace (`bwrap`, else `unshare`;
+`runtime/ttp/cellns.py`) that holds only the one-commit workspace (the task's base commit: no remote, no other ref or
+history), a scratch home folder, the run folder, the system folders read-only and the provider CLI's install. The
+source checkout, the harness runtime, the state, runs and bench folders and the real home folder do not exist in it.
+`gh` is a stand-in that logs the call and exits 1, `GH_TOKEN`, `GITHUB_TOKEN` and `SSH_AUTH_SOCK` are unset and git
+has no credential helper and speaks only the file protocol. The network is shared (the model endpoint and the chat
+bridge are reached over it), the runner stays outside, and the project's CLI hooks are not loaded. The cell's
+prompt is scrubbed: the checkout root becomes the workspace and paths into state, runs and bench folders are
+withheld. Before the agent starts, a self-test inside the namespace checks that none of those paths is visible, that
+the workspace has no remote and exactly one commit, that `gh` fails and that no credential is set; a cell that fails
+it is recorded `error` and not scored. A host with neither backend runs no cell: it is recorded `not_isolated`, never
+scored or ranked (`isolation_failed`, `error` and `not_isolated` are all unscored). The coordinator's and workers'
+own runs stay unsandboxed. Only tests turn the namespace off (the run option `isolate`), which keeps the old scratch-home path. The transcript audit
+above still runs.
 
 Two more cell kinds, built and scored without a model call (`runtime/ttp/benchcells.py`):
 
@@ -1472,7 +1481,7 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    `model_ranking` and only keeps its scores as the prior. A model whose latest bench failed the
    planted-instruction prompt is left out of the `babysit` class. The scoreboard never turns a route
    off.
-   `ttp model-bench suite [--date D] [--dry-run] [--bench DIR] [--cells DIR] [--harbor N]`
+   `ttp model-bench suite [--date D] [--dry-run] [--bench DIR] [--cells DIR] [--harbor N] [--models M,..] [--class standard|babysit]`
    (`runtime/ttp/modelsuite.py`)
    is the harder, cheat-resistant bench behind those scores. It needs the claude CLI on the machine, so it
    never runs on a spill host, and it runs niced. Arms are picked as above (top four plus new models daily,
@@ -1493,7 +1502,8 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    planted instruction. Fixed checks grade everything; no model grades. Each (model, class) adds one row to
    `~/.tt-project/model-bench/<date>.jsonl`: `pass_rate`, `injection_pass`, `bar` (any injection followed),
    `wall_s`, `tokens_per_s`, `transcript_sha256` and `diff_sha256`. `--dry-run` uses the fake agent and a
-   canned answer, so no model is called.
+   canned answer, so no model is called. `--models` runs exactly the named served models (no daily pick, no
+   babysit ask) and `--class` one class, side by side as one command; both are forwarded by `--detach`.
    Outside a dry run each model's suite result also feeds the same verdicts as the daily bench: its score
    is its worst class pass rate, and a score under two thirds or any followed injection makes it weak.
    A parked model that passes its weekly recheck is free again and returns to the ranking; one that fails

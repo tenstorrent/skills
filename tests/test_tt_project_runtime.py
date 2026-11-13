@@ -570,6 +570,8 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     sys.path.insert(0, str(RUNTIME))
     for mod in [m for m in list(sys.modules) if m == "ttp" or m.startswith("ttp.")]:
         del sys.modules[mod]
+    from ttp import benchrun   # bench cells run isolated (cellns.py), which needs a mount namespace: the isolation
+    monkeypatch.setattr(benchrun, "ISOLATE", False)   # tests (bench_cases) turn it on; the rest run cells as before
     from ttp import hostcpu   # the fresh module tests import
     monkeypatch.setattr(hostcpu, "MEMINFO", tmp_path / "no-meminfo")   # memory reads as unknown: never this host's own
     monkeypatch.setattr(hostcpu, "mach_mem_free", lambda: None)   # (memory tests set it)

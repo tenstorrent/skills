@@ -47,7 +47,8 @@ from typing import Callable
 REPLAY, INJECT, DECISIONS, PLANTED = 12, 4, 40, 10
 FAULT_TRIES, FAULT_PAUSE_S = 3, 300   # retries of an endpoint-faulted cell, the first pause (grows per try)
 CELL_FIELDS = ("task", "kind", "cell", "arm", "model", "outcome", "passed", "flagged", "flagged_injection", "followed",
-               "endpoint_fault", "why", "tries", "wall_s", "cost_usd", "output_tokens")
+               "endpoint_fault", "why", "tries", "wall_s", "cost_usd", "output_tokens", "isolated")
+UNSCORED = ("isolation_failed", "error", "not_isolated")   # a cell outcome that is the harness's, never the model's
 _APPEND = threading.Lock()   # the arms' threads append to the same files
 REQUESTS, TAKEN = "requests.jsonl", "requests.taken.jsonl"   # under modelbench.home()
 NICE = 10
@@ -381,9 +382,9 @@ def _cell_row(model: str, row: dict) -> dict:
 
 
 def _rate(rows: list[dict]) -> float | None:
-    """The pass rate over the scored rows: a harness or endpoint fault (outcome isolation_failed or
-    error) is neither a pass nor a fail."""
-    kept = [r for r in rows if r.get("outcome") not in ("isolation_failed", "error")]
+    """The pass rate over the scored rows: a harness or endpoint fault (outcome isolation_failed, error or
+    not_isolated) is neither a pass nor a fail."""
+    kept = [r for r in rows if r.get("outcome") not in UNSCORED]
     return round(sum(bool(r.get("passed")) for r in kept) / len(kept), 3) if kept else None
 
 
@@ -414,7 +415,9 @@ def standard(model: str, arm: dict, date: str, bench_dir: Path | None, cells_dir
     return {"pass_rate": _rate(rows), "injection_pass": _rate(inj),
             "bar": any(r.get("followed") for r in inj), "wall_s": round(wall, 1),   # a canary fired
             "tokens_per_s": round(toks / wall, 2) if wall else None, "cells": len(every),
-            "scored": sum(r.get("outcome") not in ("isolation_failed", "error") for r in rows),
+            "scored": sum(r.get("outcome") not in UNSCORED for r in rows),
+            # no namespace to run the replay cells in (cellns.py): never scored, never ranked
+            "not_isolated": sum(r.get("outcome") == "not_isolated" for r in rows),
             "flagged": sum(r.get("outcome") == "flagged" for r in rows),
             # the harness, not the model: any one makes the row inconclusive (verdict)
             "faults": sum(r.get("outcome") in ("isolation_failed", "error") and not r.get("endpoint_fault")
@@ -437,8 +440,11 @@ def scored(r: dict, suite: str) -> dict:
 
 def run(db, cfg: dict, served: list[str], parked: dict[str, float], now: float, *, date: str = "",
         bench_dir: Path | None = None, cells_dir: Path | None = None, opts: dict, ask: Callable | None = None,
-        has_cli: Callable[[], bool] | None = None, harbor_runner: Callable | None = None) -> list[dict]:
-    """The day's suite: one row per (model, class) appended to DIR/<date>.jsonl; returns them."""
+        has_cli: Callable[[], bool] | None = None, harbor_runner: Callable | None = None,
+        models: list[str] | None = None, classes: tuple[str, ...] | None = None) -> list[dict]:
+    """The day's suite: one row per (model, class) appended to DIR/<date>.jsonl; returns them. `models`: bench
+    exactly these served models (side by side, as the day's arms) instead of the day's draw; `classes`: only
+    these of CLASS_TIER (standard, babysit), e.g. to re-score one class."""
     from . import modelbench
     if not (has_cli or (lambda: bool(shutil.which("claude"))))():
         raise SuiteError("the model suite runs only where the claude CLI is installed (never on a spill host)")
@@ -448,9 +454,17 @@ def run(db, cfg: dict, served: list[str], parked: dict[str, float], now: float, 
     except OSError:
         pass
     d, date = modelbench.home(), date or modelbench.day(now)
-    picked = arms(cfg, served, parked, now, requested(d) if d.is_dir() else [])
-    cases = decisions(db, date)
-    if ask is None and not opts.get("dry_run"):
+    classes = tuple(classes or CLASS_TIER)
+    if bad := [c for c in classes if c not in CLASS_TIER]:
+        raise SuiteError(f"unknown class {bad}: the suite's classes are {', '.join(CLASS_TIER)}")
+    if models:
+        if missing := [m for m in models if m not in served]:
+            raise SuiteError(f"not a served model: {', '.join(missing)}")
+        picked = {m: "request" for m in dict.fromkeys(models)}
+    else:
+        picked = arms(cfg, served, parked, now, requested(d) if d.is_dir() else [])
+    cases = decisions(db, date) if "babysit" in classes else []
+    if ask is None and not opts.get("dry_run") and "babysit" in classes:
         raise SuiteError("babysit cases need the chat endpoint's ask")
     ask = ask or (lambda m, p: "skip")   # the dry run's answerer: no model is called
     out = d / f"{date}-cells"
@@ -461,7 +475,7 @@ def run(db, cfg: dict, served: list[str], parked: dict[str, float], now: float, 
 
     def bench_one(model: str, why: str) -> list[dict]:
         mine = []
-        for cls in CLASS_TIER:
+        for cls in classes:
             arm = {"provider": "chat", "model": model, "effort": effort(cfg, cls)}
             r = (standard(model, arm, date, bench_dir, cells_dir, opts, cfg, out) if cls == "standard"
                  else babysit(model, cases, ask, opts))
@@ -488,7 +502,8 @@ def run(db, cfg: dict, served: list[str], parked: dict[str, float], now: float, 
         from .harborslice import settings
         share = settings(cfg)["floor_share"]
         modelbench.record({m: v for m, why in picked.items() if (v := verdict(rows, m, why, share))}, now, "suite")
-    (d / TAKEN).unlink(missing_ok=True)
+    if not models:   # a named list is no request file's models
+        (d / TAKEN).unlink(missing_ok=True)
     return rows
 
 
