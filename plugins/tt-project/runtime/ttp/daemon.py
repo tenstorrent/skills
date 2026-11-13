@@ -15914,9 +15914,9 @@ class Daemon:
     def _relaunch_unwatched_jobs(self, named: set[str], earlier: str | None) -> None:
         """Once per boot, after the task pass: start again, model-free, each `ttp detach --resumable` job
         the reboot cut short that no task's retry_when names, so _relaunch_jobs never saw it: one a
-        coordinator run started (a lead turn's bench or soak), or one of a task that is still open and
-        not deferred (a deferred task's start gate decides, as in the task pass; a done, failed or
-        cancelled task's job stays stopped). Skipped, each with its reason in daemon.log: a job that
+        coordinator run started (a lead turn's bench or soak), or one of a task that is still open but
+        not queued (blocked, say: a queued task's next run, wake or start gate decides, as in the task
+        pass, so no job runs twice; a done, failed or cancelled task's job stays stopped). Skipped, each with its reason in daemon.log: a job that
         ended (.rc), was stopped on purpose, was found lost on an earlier boot, was cut short on an
         older boot than the one this reboot ended, held a device or machine of its task at an abrupt
         reboot, is past budget.max_job_relaunches, or whose relaunch would reach budget.max_reboot_losses
@@ -15953,8 +15953,10 @@ class Daemon:
             if task and task["status"] in ("done", "failed", "cancelled", "superseded"):
                 skip(f"its task #{task['id']} is {task['status']}")
                 continue
-            if task and (why := self._no_relaunch(task["id"])) and task["status"] == "queued":
-                skip(f"its task #{task['id']} {why}")
+            if task and task["status"] == "queued":
+                # Its next run, its wake or its start gate decides (the task pass above), never both: a
+                # woken or dispatched run that starts the job again would run it twice.
+                skip(f"its task #{task['id']} is queued: {self._no_relaunch(task['id']) or 'its next run decides'}")
                 continue
             if self._lost_before_boot(rc):
                 skip("it was lost before this boot")

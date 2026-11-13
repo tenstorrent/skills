@@ -728,8 +728,9 @@ def test_a_relaunched_coordinator_job_reads_as_running_to_a_start_when_probe(env
 
 
 def test_a_reboot_leaves_stopped_capped_and_closed_tasks_unwatched_jobs_stopped(env, tmp_path):
-    # #8592: a job stopped on purpose, one past budget.max_job_relaunches and one of a done task stay
-    # stopped; a job of a task still open (not deferred, no retry_when naming it) is relaunched on it.
+    # #8592: a job stopped on purpose, one past budget.max_job_relaunches, one of a done task and one of a
+    # queued task (its next run or wake decides) stay stopped; a job of a blocked task, open but with no run
+    # coming that could start it again, is relaunched on it.
     from ttp import detach
     p = make(env)
     stopped, c1 = _unwatched_job(p, tmp_path, "stopped", "coordinator")
@@ -743,17 +744,19 @@ def test_a_reboot_leaves_stopped_capped_and_closed_tasks_unwatched_jobs_stopped(
     live = p.db.add_task("open", "s", kind="work", tier="light", origin="user")
     p.db.update_task(live, status="blocked")
     mine, c4 = _unwatched_job(p, tmp_path, "mine", live)
+    queued = p.db.add_task("queued", "s", kind="work", tier="light", origin="user")
+    later, c5 = _unwatched_job(p, tmp_path, "later", queued)
     _boot_daemon(p)
     assert _wait_for_path(mine) and c4.read_text().split() == ["run", "run"]
     (ev,) = _relaunch_events(p, mine)
     assert ev["task"] == live and ev["status"] == "handled", dict(ev)
     assert "relaunched it (1 of 3)" in (mine.parent / "progress.md").read_text()
-    for rc, c in ((stopped, c1), (capped, c2), (closed, c3)):
+    for rc, c in ((stopped, c1), (capped, c2), (closed, c3), (later, c5)):
         assert not rc.exists() and c.read_text().split() == ["run"], rc
         assert not _relaunch_events(p, rc), rc
     log = (p.logs / "daemon.log").read_text()
     assert "detached job capped" in log and "relaunched 3 times already (cap 3)" in log, log[-2000:]
-    assert f"its task #{done} is done" in log, log[-2000:]
+    assert f"its task #{done} is done" in log and f"its task #{queued} is queued" in log, log[-2000:]
 
 
 def test_a_reboot_leaves_a_job_cut_short_on_an_older_boot_to_its_owner(env, tmp_path):
