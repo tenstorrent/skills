@@ -103,3 +103,18 @@ def test_the_pip_selfcheck_cache_is_found_where_pip_keeps_it_on_each_platform(tm
     assert envfault._selfcheck_dir({"HOME": h}, "darwin") == tmp_path / "Library/Caches/pip/selfcheck"
     assert envfault._selfcheck_dir({"HOME": h, "XDG_CACHE_HOME": h + "/x"}, "darwin") == tmp_path / "x/pip/selfcheck"
     assert envfault._selfcheck_dir({"HOME": h, "PIP_CACHE_DIR": h + "/p"}, "darwin") == tmp_path / "p/selfcheck"
+
+
+def test_env_fault_observation_honours_an_observation_mute_on_its_signature(env):
+    # A check host that flaps raises a high `checks` observation per episode; a mute on that source and
+    # signature stores it muted and counts it there, so it never wakes the coordinator. Without one it queues.
+    from ttp import envfault, screen
+    p = make(env)
+    screen.mute(p.db, "checks", "env:check-host:box-a", 12, why="host flaps; recovery owned by its check")
+    assert envfault.record(p, {"sig": "env:check-host:box-a", "kind": "host", "host": "box-a", "cmd": "x"})
+    assert [r["status"] for r in p.db.q("SELECT status FROM events WHERE fingerprint LIKE 'env:check-host:box-a:%'")] \
+        == ["muted"]
+    assert [m["count"] for m in screen.mutes(p.db) if m["match"] == "env:check-host:box-a"] == [1]
+    assert envfault.record(p, {"sig": "env:check-host:box-b", "kind": "host", "host": "box-b", "cmd": "x"})
+    assert [r["status"] for r in p.db.q("SELECT status FROM events WHERE fingerprint LIKE 'env:check-host:box-b:%'")] \
+        == ["queued"]

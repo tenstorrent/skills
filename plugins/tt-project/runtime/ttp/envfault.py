@@ -480,11 +480,13 @@ def record(p, f: dict, task: str | None = None, queue: bool = False) -> bool:
                          (f"the check runner {f.get('runner')} cannot be found or imported{py}",
                           "Restore the runner on the host (reinstall it for that python, or point the checks "
                           "at a venv)"))
+            text = (f"Environment fault {sig}: {what} (first seen in {f.get('cmd')!r}). Check runs wait instead "
+                    "of failing and nothing is counted against any change; the push queue holds its batch. "
+                    f"{fix}.{why} Waiting tasks and the queue resume once `ttp checks --env-ok` passes.")
+            from . import screen   # an observation mute on source checks covers it: stored muted, counted there
+            status = "muted" if screen.count_muted(db, "checks", text, "high", now) else "queued"
             db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
-                 (now, "checks", "observation", fp, "high",
-                  f"Environment fault {sig}: {what} (first seen in {f.get('cmd')!r}). Check runs wait instead "
-                  "of failing and nothing is counted against any change; the push queue holds its batch. "
-                  f"{fix}.{why} Waiting tasks and the queue resume once `ttp checks --env-ok` passes.", "queued"))
+                 (now, "checks", "observation", fp, "high", text, status))
         return True
     except Exception:   # a note about the host never stops the caller from waiting
         return False
