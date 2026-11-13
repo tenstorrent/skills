@@ -158,3 +158,50 @@ def test_background_thread_logs_start_and_end_without_touching_devices(tmp_path)
     assert not tl.thread.is_alive()
     source = Path(dtl.__file__).read_text()
     assert 'tt-smi' not in source.replace('never calls tt-smi', '') and 'open(DEVICE' not in source
+
+
+def test_other_users_processes_are_hidden_not_unknown(tmp_path, monkeypatch):
+    """A non-root runner cannot read other users' fds (on a real host, hundreds of root processes): they are
+    counted as hidden and do not turn idle into unknown. Our own unreadable process still does."""
+    host = FakeHost(tmp_path)
+    host.process(600, 1, 'root daemon', unreadable=True)
+    me = os.getuid()
+    monkeypatch.setattr(dtl, '_owner', lambda proc, pid: me + 1 if pid == 600 else me)
+    seen = dtl.scan(host.proc, host.dev, RUNNER)
+    assert seen['held'] == 0 and seen['hidden'] == 1 and 'unreadable' not in seen
+    monkeypatch.setattr(dtl, '_owner', lambda proc, pid: me)
+    assert dtl.scan(host.proc, host.dev, RUNNER)['held'] is None
+
+
+def test_background_server_reparented_to_init_is_the_stages(tmp_path):
+    """An agent starts the server in the background; its shell exits and the server's parent becomes init.
+    Started after the stage began by the runner's user, it is still the stage's holder, not other."""
+    host = FakeHost(tmp_path)
+    tick = os.sysconf('SC_CLK_TCK')
+    (host.proc / 'stat').write_text('cpu 0 0 0\nbtime 1000\n')
+
+    def started(pid, at):
+        rest = ' '.join(['0'] * 17)                       # pgrp .. itrealvalue; starttime is index 19
+        (host.proc / str(pid) / 'stat').write_text(f'{pid} (srv) S 1 {rest} {int((at - 1000) * tick)} 0\n')
+
+    host.process(700, 1, 'vllm serve', devices=[0])
+    started(700, 2000)
+    assert dtl.scan(host.proc, host.dev, RUNNER, since=1500)['other'] is False
+    assert dtl.scan(host.proc, host.dev, RUNNER, since=2500)['other'] is True    # started before the stage
+    assert dtl.scan(host.proc, host.dev, RUNNER)['other'] is True               # no stage start known
+
+
+def test_report_row_says_how_many_processes_were_hidden():
+    import stage_usage
+    row = stage_usage.device_line({'timeline': dtl.TIMELINE, 'held_s': 3600, 'idle_s': 0, 'unknown_s': 0,
+                                   'held_other_s': 0, 'wall_s': 3600, 'complete': True, 'hidden': 919})
+    assert 'up to 919 processes of other users were not visible' in row
+
+
+def test_zombies_are_skipped(tmp_path):
+    """A zombie's fd dir is unreadable (EACCES) but it holds no files: neither unknown nor hidden."""
+    host = FakeHost(tmp_path)
+    host.process(800, 1, 'gh', unreadable=True)
+    (host.proc / '800' / 'stat').write_text('800 (gh) Z 1 0 0 0\n')
+    seen = dtl.scan(host.proc, host.dev, RUNNER)
+    assert seen['held'] == 0 and 'unreadable' not in seen and 'hidden' not in seen

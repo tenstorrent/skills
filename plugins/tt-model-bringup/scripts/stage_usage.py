@@ -268,6 +268,9 @@ def device_line(device: dict[str, Any]) -> str:
         ) if part
     )
     view = "complete" if device["complete"] else "incomplete (unreadable fds, a gap or a missing start)"
+    if device.get("hidden"):
+        view += (f"; up to {device['hidden']} processes of other users were not visible, and a device only "
+                 "they hold reads as idle")
     return (
         f"Device ({device['timeline']}, checked every 15 s, {ran}; view {view}): "
         f"held {_h(device['held_s'])} h, idle {_h(device['idle_s'])} h, unknown {_h(device['unknown_s'])} h, "

@@ -9,8 +9,15 @@ logged, one JSON line each, to ``<stage doc dir>/device_timeline.jsonl``::
      "by": "<cmdline of first holder>", "other": <true if no holder descends from the runner>}
 
 plus a line (with an ``event`` field) at stage start, at each record write / stage end and at
-runner (re)start. ``held`` is null (unknown, not free) when fds could not be read and no holder
-was seen; ``unreadable`` (optional) counts the processes whose fds could not be read. A
+runner (re)start. ``held`` is null (unknown, not free) when fds of the runner's own user could not be
+read and no holder was seen; ``unreadable`` (optional) counts those processes. Processes of other
+users are not readable without privileges and are not the stage's: they are counted in ``hidden``
+(optional) and do not make a look unknown, or a non-root runner would never see idle time. A device
+held only by a hidden process reads as idle; the report row says how many were hidden.
+
+A holder is the stage's (``other`` false) when it descends from the runner, or when it belongs to the
+runner's user and started after the stage began: a server an agent starts in the background is
+re-parented to init when its shell exits, and still counts as the stage's. A
 ``runner_start`` line carries ``prev_alive``, the last tick of the previous runner (a one-number
 file next to the timeline), so the time the runner was down counts as unknown.
 
@@ -35,12 +42,46 @@ ALIVE = "device_timeline.alive"
 BY_CHARS = 120
 
 
-def _ppid(proc: pathlib.Path, pid: int) -> int | None:
+def _stat_fields(proc: pathlib.Path, pid: int) -> list[str]:
+    """Fields of /proc/<pid>/stat after the command name: [state, ppid, ...]; starttime is index 19."""
     try:
         stat = (proc / str(pid) / "stat").read_text(errors="replace")
-        return int(stat[stat.rindex(")") + 2 :].split()[1])
-    except (OSError, ValueError, IndexError):
+        return stat[stat.rindex(")") + 2 :].split()
+    except (OSError, ValueError):
+        return []
+
+
+def _ppid(proc: pathlib.Path, pid: int) -> int | None:
+    try:
+        return int(_stat_fields(proc, pid)[1])
+    except (ValueError, IndexError):
         return None
+
+
+def _owner(proc: pathlib.Path, pid: int) -> int | None:
+    try:
+        return os.stat(proc / str(pid)).st_uid
+    except OSError:
+        return None
+
+
+def _boot_time(proc: pathlib.Path) -> float | None:
+    try:
+        for line in (proc / "stat").read_text().splitlines():
+            if line.startswith("btime "):
+                return float(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def started_at(proc: pathlib.Path, pid: int, boot: float | None) -> float | None:
+    """Unix start time of a process (stat starttime in clock ticks after boot), or None."""
+    try:
+        ticks = int(_stat_fields(proc, pid)[19])
+    except (ValueError, IndexError):
+        return None
+    return None if boot is None else boot + ticks / os.sysconf("SC_CLK_TCK")
 
 
 def descends_from(proc: pathlib.Path, pid: int, root: int) -> bool:
@@ -57,15 +98,17 @@ def descends_from(proc: pathlib.Path, pid: int, root: int) -> bool:
     return False
 
 
-def scan(proc: pathlib.Path, dev_dir: pathlib.Path, root_pid: int) -> dict[str, Any]:
-    """One look at the host: devices present, devices held, first holder, other, unreadable."""
+def scan(proc: pathlib.Path, dev_dir: pathlib.Path, root_pid: int, uid: int | None = None,
+         since: float | None = None) -> dict[str, Any]:
+    """One look at the host: devices present, devices held, first holder, other, unreadable, hidden."""
+    uid = os.getuid() if uid is None else uid
     try:
         present = sum(1 for _ in os.scandir(dev_dir))
     except OSError:
         present = 0
     held: set[str] = set()
     holders: list[int] = []
-    unreadable = 0
+    unreadable = hidden = 0
     try:
         pids = sorted(int(entry) for entry in os.listdir(proc) if entry.isdigit())
     except OSError:
@@ -75,8 +118,12 @@ def scan(proc: pathlib.Path, dev_dir: pathlib.Path, root_pid: int) -> dict[str, 
         try:
             names = os.listdir(fd_dir)
         except (PermissionError, OSError) as exc:
-            if not isinstance(exc, FileNotFoundError):
+            if isinstance(exc, FileNotFoundError) or (_stat_fields(proc, pid)[:1] or [""])[0] in ("Z", "X"):
+                continue  # gone, or a zombie (its fd dir is unreadable, and it holds no files)
+            if _owner(proc, pid) == uid:
                 unreadable += 1
+            else:
+                hidden += 1
             continue
         mine = False
         for name in names:
@@ -99,11 +146,17 @@ def scan(proc: pathlib.Path, dev_dir: pathlib.Path, root_pid: int) -> dict[str, 
         except OSError:
             raw = ""
         result["by"] = (raw.strip() or f"pid {holders[0]}")[:BY_CHARS]
-        result["other"] = not any(descends_from(proc, pid, root_pid) for pid in holders)
+        boot = _boot_time(proc) if since is not None else None
+        result["other"] = not any(
+            descends_from(proc, pid, root_pid)
+            or (since is not None and _owner(proc, pid) == uid and (started_at(proc, pid, boot) or 0) >= since)
+            for pid in holders)
     elif unreadable:
-        result["held"] = None  # something we could not read may hold a device: unknown, not free
+        result["held"] = None  # a process of ours we could not read may hold a device: unknown, not free
     if unreadable:
         result["unreadable"] = unreadable
+    if hidden:
+        result["hidden"] = hidden
     return result
 
 
@@ -127,6 +180,7 @@ class DeviceTimeline:
         self.root_pid = root_pid or os.getpid()
         self.proc, self.dev_dir, self.interval, self.clock = proc, dev_dir, interval, clock
         self.last: tuple | None = None
+        self.since: float | None = None
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
@@ -146,12 +200,14 @@ class DeviceTimeline:
         """Look once. Log when the state changed or when an event line is due."""
         with self.lock:
             now = int(self.clock())
-            seen = scan(self.proc, self.dev_dir, self.root_pid)
+            seen = scan(self.proc, self.dev_dir, self.root_pid, since=self.since)
+            # The hidden count changes with every process of other users; log it only with a state change.
             state = (seen["held"], seen["of"], seen["by"], seen["other"], seen.get("unreadable", 0))
             if event or state != self.last:
                 line: dict[str, Any] = {"t": now, **{k: seen[k] for k in ("held", "of", "by", "other")}}
-                if seen.get("unreadable"):
-                    line["unreadable"] = seen["unreadable"]
+                for key in ("unreadable", "hidden"):
+                    if seen.get(key):
+                        line[key] = seen[key]
                 if event:
                     line["event"] = event
                 line.update(extra)
@@ -162,7 +218,24 @@ class DeviceTimeline:
             except OSError:
                 pass
 
+    def _stage_start(self) -> float | None:
+        """The last stage_start time in the timeline (a resumed runner keeps the stage's start)."""
+        found = None
+        try:
+            with self.path.open(encoding="utf-8") as handle:
+                for raw in handle:
+                    try:
+                        line = json.loads(raw)
+                    except ValueError:
+                        continue
+                    if isinstance(line, dict) and line.get("event") == "stage_start":
+                        found = float(line["t"])
+        except (OSError, KeyError, TypeError, ValueError):
+            pass
+        return found
+
     def start(self) -> None:
+        self.since = float(int(self.clock())) if self.fresh else (self._stage_start() or float(int(self.clock())))
         if self.fresh:
             self.tick("stage_start", host=socket.gethostname(), uid=os.getuid(), runner_pid=self.root_pid,
                       pidns=_pidns(self.proc), interval=self.interval)
@@ -214,7 +287,7 @@ def summarize(path: pathlib.Path, end: int | None = None) -> dict[str, Any] | No
     prev: dict[str, Any] | None = None
     first_t = 0
     complete = True
-    devices = 0
+    devices = hidden = 0
 
     def add(state: dict[str, Any], seconds: int) -> None:
         nonlocal complete
@@ -241,7 +314,7 @@ def summarize(path: pathlib.Path, end: int | None = None) -> dict[str, Any] | No
                 continue
             if line.get("event") == "stage_start" or prev is None:
                 totals = {key: 0 for key in totals}
-                complete, devices, prev, first_t = True, 0, None, t
+                complete, devices, hidden, prev, first_t = True, 0, 0, None, t
                 where = {key: line[key] for key in ("host", "uid", "pidns") if key in line}
                 if line.get("event") != "stage_start":
                     complete = False  # the start of the stage was not seen
@@ -259,6 +332,7 @@ def summarize(path: pathlib.Path, end: int | None = None) -> dict[str, Any] | No
                 else:
                     add(prev, t - prev["t"])
             devices = max(devices, int(line.get("of") or 0))
+            hidden = max(hidden, int(line.get("hidden") or 0))
             prev = {"t": t, "held": line.get("held"), "other": bool(line.get("other")),
                     "unreadable": line.get("unreadable", 0)}
             if line.get("interval"):
@@ -267,7 +341,7 @@ def summarize(path: pathlib.Path, end: int | None = None) -> dict[str, Any] | No
         return None
     stop = prev["t"] if end is None else max(end, prev["t"])
     add(prev, stop - prev["t"])
-    return {**totals, "wall_s": stop - first_t, "devices": devices, "complete": complete,
+    return {**totals, "wall_s": stop - first_t, "devices": devices, "complete": complete, "hidden": hidden,
             "timeline": TIMELINE, **{k: v for k, v in where.items() if k != "interval"}}
 
 
