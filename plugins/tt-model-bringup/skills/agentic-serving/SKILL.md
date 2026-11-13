@@ -180,7 +180,7 @@ Admit a run only when its projection from measured times fits `run_timeout_hours
   solution (the upstream fix, a later release, the resolving discussion) is a failure and stays in the
   denominator; report how many. Never void a list.
 - **Task resources** come from each task's definition, never a blanket value.
-- **Reasoning:** start at the reference's setting (medium when unknown); Failure analysis may probe others.
+- **Reasoning:** start at the reference's setting (medium when unknown).
   Record the setting with each run and the reference's own setting with the reference.
 - **Harness and route** are main's, unchanged; only a precision fix (Failure analysis 3) changes precision. A real harness defect is fixed on a generic branch named for
   the defect and listed in `learned.json`.
@@ -201,21 +201,30 @@ This is iteration on the phase's failing tasks inside its time, never growth of 
    (trajectory lines, tokens, time). Run datatype-sweep's Anomalies detector on every reply first: a
    degenerate reply is `anomaly`, never `wrong` or `loop_cap` (that is an agent repeating coherent actions).
 2. A task that hit the agent or request limit or the output cap fails on it only if its trajectory loops
-   (`loop_cap`) or stalls (`stalled`). One cut off while progressing is rerun alone at ≥ 2× that limit,
+   (`loop_cap`) or stalls (`stalled`). One cut off while progressing is rerun at ≥ 2× that limit,
    within `run_timeout_hours`, until it finishes, loops or stalls; that result counts.
 3. An anomaly recorded in stage 11's `doc/benchmark/anomaly_check.json` starts this procedure early; it is still
    decided on the real eval replies. Each anomaly, and a phase below its band, gets a fix attempt by $datatype-sweep's Anomalies section
    (reproducible test on the model runner, full precision, bisect, re-measure, rerun), inside the phase's
    time, recorded in `anomalies`. A precision fix is the one allowed precision change; a speed loss is
    accepted.
-4. Optional, once precision is ruled out: for tasks that looped or hit a limit, probe other settings
-   (thinking on or off, the efforts the server offers) on each task alone, in parallel where the server
-   allows; one probe per task. Record each attempt in `rerun.tried` (setting, limits, result, tokens, time).
-   Rerun the whole list at a new setting only if a probe solved a failed task, not for time alone; the
-   phase takes the run that scores best within its time.
-5. Limit reruns and probes together should take about 20% of the phase's time at most.
+4. Possible, not required: one try at another reasoning setting (thinking on or off, an effort the server
+   offers) for a task that looped, in the same wave; the whole list is rerun at it only if it solved a failed
+   task, not for time alone; the phase takes the run that scores best within its time.
+5. Reruns should take about 20% of the phase's time at most.
 6. Any other single-task rerun changes the score only when the first failure was infrastructure (verifier
    setup, image pull); otherwise it is reported beside the score.
+
+How reruns run. A task here is one eval task (one SWE instance, one GPQA question). Failed tasks are rerun
+together as one harness run per setting (the list run's command with only the failed task IDs), all started
+at once on the server already running; each task is still its own harness agent and container and is
+analysed on its own. Concurrency is bounded by the server's agent slots and host memory for task containers.
+Request-level changes (output cap up to the server's max context, agent or request timeouts, seed, reasoning
+setting) share one wave; server-level changes (precision config, cap above max context, KV pool, batch)
+need a restart: a new wave. A task alone at batch 1 is only a control for a load question (timeout under
+load, preemption or KV eviction, batch-dependent numerics), after the wave reproduced the failure. Each run
+records implementation commit, precision config id and server settings in `runs.json`; scores at different
+configs are never mixed.
 
 Name what each cause would need to fix and whether it is the model, the serving stack or the harness.
 
