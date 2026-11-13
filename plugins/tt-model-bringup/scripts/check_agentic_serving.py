@@ -7,7 +7,9 @@ Goal 12 (agentic-evals): each phase of the mode has a collected run with its rec
 analysis (every failed task has a cause; a task cut off by a limit shows a loop or stall, or was rerun
 alone at a higher limit, and has a reasoning probe recorded) and no list is voided; those are critical. A
 phase not passed yet (score below the band, unexplained time, unfinished list) is advisory with its
-recorded reason, never critical for the score alone.
+recorded reason, never critical for the score alone. Each run's server size comes from the device memory
+measured free at launch: a KV pool below POOL_FREE_FRACTION of it, or more agents than the pool holds at
+their working set, is critical without a recorded reason.
 Exit 0 pass, 1 advisory, 2 critical, 3 error.
 """
 from __future__ import annotations
@@ -37,6 +39,7 @@ LIMIT_CAUSES = ("loop_cap", "cutoff_progressing", "stalled")
 LIMITS = ("agent_timeout_s", "request_timeout_s", "output_cap_tokens")
 RATE_FIELDS = ("prefill_tok_s", "decode_tok_s_user", "ttft_s", "step_ms")
 LONG_CONTEXT_TOKENS = 28672
+POOL_FREE_FRACTION = 0.5
 LEARNED = ("best_config", "harness_facts", "generic_fixes")
 
 
@@ -290,7 +293,26 @@ def check_run(run: dict, inputs: dict, validated: list, collected: set, item: st
                             f"{explained} h (tolerance {tolerance:.0%}); not passed yet"))
         ok = False
     check_config(run, validated, problems)
+    check_server_size(run, problems)
     return ok
+
+
+def check_server_size(run: dict, problems: list) -> None:
+    """The KV pool and agent count come from the device memory measured free at launch (per device)."""
+    name, config = run.get("id", "?"), run.get("config") or {}
+    size = config.get("server_size") or {}
+    free, pool, working = size.get("free_gb"), size.get("pool_gb"), size.get("working_set_tokens")
+    pool_tokens, agents = config.get("pool_tokens"), config.get("agents")
+    if not (number(free) and free > 0 and number(pool) and positive_int(working) and positive_int(pool_tokens)):
+        problems.append((2, f"run {name} config needs pool_tokens and server_size free_gb (measured at launch), "
+                            "pool_gb and working_set_tokens"))
+        return
+    if pool < POOL_FREE_FRACTION * free:
+        shortfall(problems, size.get("reason"), f"run {name}: KV pool {pool} GB is below "
+                  f"{POOL_FREE_FRACTION:.0%} of the {free} GB per device measured free at launch")
+    if positive_int(agents) and agents * working > pool_tokens:
+        shortfall(problems, size.get("reason"), f"run {name}: {agents} agents x {working} working-set tokens "
+                  f"exceed the {pool_tokens}-token pool")
 
 
 def higher_limit(tried: dict, limits: dict) -> bool:

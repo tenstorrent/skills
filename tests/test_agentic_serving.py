@@ -102,6 +102,7 @@ def scored_run(run_id='gpqa10', phase='phase1', suite='r1_gpqa_diamond', solved=
     return {'id': run_id, 'phase': phase, 'suite': suite,
             'tasks': {'rule': 'stratified by domain, fixed list', 'names': [f'{suite}-{i}' for i in range(n)]},
             'config': {'pool_tokens': 400000, 'agents': 8, 'batch': 8, 'max_num_seqs': 8, 'sha': 'abc123',
+                       'server_size': {'free_gb': 26.0, 'pool_gb': 20.0, 'working_set_tokens': 40000},
                        'network': 'per task allow_internet', 'reasoning': {'thinking': True, 'effort': 'high'},
                        'limits': {**LIMITS, 'reference': dict(LIMITS), 'source': 'tt-inference-server eval config'}},
             'score': {'solved': solved, 'n': n, 'interval_95': [round(v, 1) for v in wilson(solved, n)]},
@@ -292,6 +293,42 @@ def test_agents_above_max_num_seqs_and_batch_choice(tmp_path):
     assert code == 1 and 'smallest validated batch' in stderr
     run['config'].update(agents=16, batch=16)
     assert goal12(tmp_path, runs=[run])[0] == 2
+
+
+def test_server_size_must_be_recorded(tmp_path):
+    run = scored_run()
+    del run['config']['server_size']
+    code, stderr = goal12(tmp_path, runs=[run])
+    assert code == 2 and 'measured at launch' in stderr
+
+
+def qwen_quick_run():
+    """3 agents on a one-request pool with 26 GB free per device."""
+    run = scored_run()
+    run['config'].update(pool_tokens=32768, agents=3, batch=8)
+    run['config']['server_size'].update(pool_gb=1.5, working_set_tokens=32768)
+    return run
+
+
+def test_pool_far_below_free_memory_is_critical_without_a_reason(tmp_path):
+    run = qwen_quick_run()
+    code, stderr = goal12(tmp_path, runs=[run])
+    assert code == 2 and 'below 50% of the 26.0 GB' in stderr and 'exceed the 32768-token pool' in stderr
+    run['config']['server_size']['reason'] = 'measured: trace region needs the rest'
+    code, stderr = goal12(tmp_path, runs=[run])
+    assert code == 1 and 'trace region' in stderr
+
+
+def test_pool_at_half_of_free_memory_passes_and_agents_must_fit_it(tmp_path):
+    run = scored_run()
+    run['config']['server_size']['pool_gb'] = 13.0
+    assert goal12(tmp_path, runs=[run]) == (0, '')
+    run['config']['server_size']['pool_gb'] = 12.9
+    assert goal12(tmp_path, runs=[run])[0] == 2
+    run = scored_run()
+    run['config']['server_size']['working_set_tokens'] = 60000
+    code, stderr = goal12(tmp_path, runs=[run])
+    assert code == 2 and '8 agents x 60000' in stderr
 
 
 def test_agentic_mode_needs_phase_2(tmp_path):
