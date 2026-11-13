@@ -1,23 +1,24 @@
-/goal Use $agentic-serving and $tt-device-usage for HF_MODEL after the benchmark stage in the current tt-metal checkout.
+/goal Use $agentic-serving, $datatype-sweep and $tt-device-usage for HF_MODEL after the benchmark stage in the current tt-metal checkout.
 
 Subagents are authorized when a selected skill requests or recommends them.
 
-This goal shows the served model scores like its reference on agentic evals, at a speed the measured serving rates explain. Read bringup/agentic_evals/inputs.json for the mode (quick, agentic or extended; each includes the one before), suites, list sizes, references and limits; $agentic-serving gives the defaults. Run on this machine.
+This goal shows the served model scores like its reference on agentic evals, at a speed the measured serving rates explain. Read bringup/agentic_evals/inputs.json for the mode (quick, agentic or extended), suites, list sizes, references and limits; $agentic-serving gives the defaults. Run on this machine.
 
 Goal completion requirements:
 - Phase 1: GPQA Diamond, 10 tasks (or inputs phase1), on main's harness, in stage hours 0 to phase1_hours (12). It passes when the score is within ok_band of its reference and measured wall time is within explain_tolerance of the run replayed on doc/benchmark/serving_rates.json rates (the skill's explained hours).
 - Phase 2 (agentic and extended modes): SWE-bench Verified, 10 tasks from the skill's fixed diverse list (or inputs phase2), same rule. It starts when phase 1 passes or at phase1_hours, whichever is first, and has the rest of the 24 h.
 - A phase not passed when its time ends is a result: keep and report its score, interval, reference and analysis as they are, "not passed yet" with the reason; never discard it or call it failing.
 - Each run's KV pool and agent count are sized from the device memory measured free at launch, recorded with the run; a smaller pool needs a recorded reason.
-- Per-task analysis, inside the phase's time: every failed task has a cause and evidence. No task fails on the output cap or a time limit unless its trajectory shows a loop or stall; a task cut off while progressing is rerun alone with a higher limit and that result counts. A rerun changes the score only for infrastructure failures or a limit-cut task that then finishes. A fetched solution is a failure; declared network use is allowed. No list is voided.
+- Per-task analysis, inside the phase's time: every failed task has a cause and evidence. A reply that degenerates (stray or repeated tokens, collapse into a few characters, loops) is an anomaly, not a model answer. No task fails on the output cap or a time limit unless its trajectory shows a loop or stall; a task cut off while progressing is rerun alone with a higher limit and that result counts. A rerun changes the score only for infrastructure failures or a limit-cut task that then finishes. A fetched solution is a failure; declared network use is allowed. No list is voided.
+- Every anomaly, and every phase below its band, has proof of an attempt to fix it: a short reproducible test, its result at the served precision and at full TT precision, and what was changed. When a precision change fixes it, the list is rerun at the fastest configuration that passes the test, with the configurations tried and their measured speeds recorded; a speed loss for accuracy is accepted.
 - Extended mode, after both phases pass: full-suite estimates, then per suite in extended_suites a list run projected within run_timeout_hours, same rules. Lists grow only here.
-- doc/agentic_evals/results.json and learned.json as the skill's Outputs say, including per phase start hour, pass and reason.
+- doc/agentic_evals/results.json and learned.json as the skill's Outputs say.
 
 Limits:
-- stage_budget_hours: quick 12 (phase 1 only), agentic 24 (phase 1 up to phase1_hours, default 12; phase 2 the rest), extended +24. run_timeout_hours (12) and the Codex usage budget from inputs.json.
-- Runs start at the harness reference's agent and request limits and output cap. Main's harness and route, unchanged. Stage 11's rates are read, not re-measured.
+- stage_budget_hours: quick 12 (phase 1 only), agentic 24 (phase 1 up to phase1_hours; phase 2 the rest), extended +24. run_timeout_hours (12) and the Codex usage budget from inputs.json.
+- Runs start at the harness reference's agent and request limits and output cap. Main's harness and route, unchanged; stage 11's rates are read, not re-measured; except a precision change made this way, whose rate rows are re-measured.
 
 - doc/agentic_evals/REPORT.md leads with each phase passed or not passed yet (why), scores with intervals, settings and limits against the reference's, hours predicted against measured, and the analysis. If phase 2 started after phase1_hours, it says so plainly: the setup or this text was not tested right.
 - $stage-review returns `clean-pass`; findings fixed/rereviewed. Local commit stage-owned changes; never push; log SHAs.
 
-Missing records, missing analysis, uncollected runs, rule breaks, review findings, failed gates: work. A score below its band or an unexplained wall time is reported, not worked on past the phase's time. Ask the operator by marking the goal blocked with the question (e.g. no reference); their answer goes in inputs.json decisions. Stop when each phase has passed or used its time and is recorded, analysed and reported, or after `$autofix` fails.
+Missing records, missing analysis, uncollected runs, rule breaks, review findings, failed gates: work. A score below its band or an unexplained wall time is reported, not worked on past the phase's time. Ask the operator by marking the goal blocked with the question (e.g. no reference). Stop when each phase has passed or used its time and is recorded, analysed and reported, or after `$autofix` fails.
