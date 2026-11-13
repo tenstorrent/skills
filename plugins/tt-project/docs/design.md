@@ -418,6 +418,10 @@ What each supported CLI offers, with doc links: [providers.md](providers.md).
   checks all run on other hosts (`delivery.checks_host`, a check's own `host`) or are light, and checks
   that may all spill while spill hosts are set: those wait for a spill host and take no checks slot here
   until the announcement clears.
+  The daemon's heartbeat records an announcement it sees. When the host then goes down abruptly within
+  2 h of that heartbeat, the next boot counts the reboot as a planned host cycle by the device broker:
+  a task whose run or detached job held a `ttp lock` resource then is requeued, not blocked as a
+  possible cause, and the cut-short runs count as no reboot loss.
 - Reboot causes (initiator.py). After a reboot the daemon reads the previous boot's journal (as this
   user, else `sudo -n` where allowed, else 'unreadable' with why): who or what started the shutdown and
   any kernel panic, out-of-memory kill, machine check or lockup before it. The boot record, the reboot

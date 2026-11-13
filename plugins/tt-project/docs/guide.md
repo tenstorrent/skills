@@ -70,10 +70,13 @@ sent. A failure to read replies is reported on stderr and never stops the messag
   A task lost to `budget.max_reboot_losses` abrupt reboots is blocked, as it may cause them. So is,
   at once, a task whose run or detached job held a `ttp lock` resource of this host (a device, a
   machine; not a push lock) when the host went down abruptly: the coordinator requeues it once the
-  attempt is known not to be implicated. A
+  attempt is known not to be implicated. A resource named after another machine on the machines list
+  (`<alias>`, `<alias>-...`, or a lease of it such as `probe:<alias>`) is used over ssh and does not
+  count. A
   detached job cut by a planned host cycle (`ttp drain <name> --reboot "<why>"`, or another project's
-  `state/host-cycle/<id>/record.json` on the same host, or a `ttp machines change add <this host>
-  --power-cycle-at <t>` intent) does not count. Such a reboot is reported once as planned, at low
+  `state/host-cycle/<id>/record.json` on the same host, a `ttp machines change add <this host>
+  --power-cycle-at <t>` intent, or a power cycle the host's device broker announced at the daemon's
+  last heartbeat before the reboot) does not count. Such a reboot is reported once as planned, at low
   severity, naming what planned it; only abrupt, unplanned reboots count toward the "host looks
   unstable" warning.
   When the coordinator rescopes a running task, the change reaches the worker mid-run.

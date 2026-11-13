@@ -596,7 +596,7 @@ def test_a_run_lost_to_an_abrupt_reboot_while_its_task_held_a_device_is_not_retr
         assert t["status"] == "queued" and t["attempts"] == 0 and tid in [x["id"] for x in p.db.ready_tasks()], dict(t)
 
 
-@pytest.mark.parametrize("case", ["orderly", "planned", "other machine", "other boot"])
+@pytest.mark.parametrize("case", ["orderly", "planned", "other machine", "other machine's lease", "other boot"])
 def test_a_hold_at_a_reboot_the_task_did_not_cause_keeps_the_retry(env, tmp_path, monkeypatch, case):
     p = make(env)
     from ttp import machines as mm
@@ -607,6 +607,9 @@ def test_a_hold_at_a_reboot_the_task_did_not_cause_keeps_the_retry(env, tmp_path
     if case == "other machine":
         mm.add("farbox")
         res = "farbox-device"   # held over ssh: a job there cannot reset this host
+    if case == "other machine's lease":
+        mm.add("farbox")
+        res = "probe:farbox"    # a lease of that machine, as a rollout driver takes one
     if case == "planned":
         monkeypatch.setattr(d, "_planned_cycle", lambda boot: {"reason": "firmware", "path": "x"})
     _abrupt_reboot_held(p, d, [f"{res}: task #{tid} (run 1) since 10:02 PDT"],
@@ -627,6 +630,60 @@ def test_a_lock_named_after_this_host_still_counts(env, tmp_path):
     _abrupt_reboot_held(p, d, [f"{hostname()}-device: task #{tid} (run 1) since 10:02 PDT"])
     _lost_to_reboot(p, d, tmp_path, tid)
     assert p.db.task(tid)["status"] == "blocked"
+
+
+def test_a_resource_names_another_machine_only_by_its_alias_or_a_prefixed_lease_of_it():
+    from ttp.daemon import _names_machine
+    others = ["farbox", "rack-2"]
+    for res in ("farbox", "farbox-device", "probe:farbox", "probe:farbox-device", "a:b:farbox", "lease:rack-2"):
+        assert _names_machine(res, others), res
+    for res in ("board", "farboxes", "fleet-rollout", "probe:board", "farbox:probe", "probe:", ":", "rack", ""):
+        assert not _names_machine(res, others), res
+    assert not _names_machine("probe:farbox", []) and not _names_machine("farbox", [""])
+
+
+@pytest.mark.parametrize("case", ["notice", "no notice", "notice long before"])
+def test_an_abrupt_reboot_the_device_broker_announced_relaunches_the_task_that_held_a_device(
+        env, tmp_path, monkeypatch, case):
+    """The heartbeat records the broker's power-cycle notice (cyclenotice.py); the next boot reads a
+    reboot that followed it as planned, so the run it cut short is requeued, not blocked. No notice, or
+    one seen only long before the reboot, keeps the abrupt path, which blocks a device holder."""
+    from ttp import hostcycle
+    from ttp.daemon import Daemon
+    p = make(env)
+    tid = p.db.add_task("flash the board", "s", kind="work", tier="light", origin="user")
+    notice = Path(os.environ["TTP_TEST_CYCLE_NOTICES"].split(os.pathsep)[0])
+    if case != "no notice":
+        notice.write_text(json.dumps({"state": "requested", "fault_class": "tray_drop", "reason": "tray 2 dropped",
+                                      "updated_at": time.time()}))
+    _boot_as(monkeypatch, "an-earlier-boot")
+    before = Daemon(p.base)
+    before._beat()
+    hb = p.state / "heartbeat"
+    rec = json.loads(hb.read_text())
+    assert (rec.get("cycle_notice") or {}).get("state") == (None if case == "no notice" else "requested"), rec
+    # The task's lock at the last heartbeat (the cycle ended it), then the reboot.
+    hb.write_text(json.dumps({**rec, "held": [f"board: task #{tid} (run 1) since 10:02 PDT"]}))
+    booted = time.time() - 60
+    last = booted - (hostcycle.WINDOW_S + 600 if case == "notice long before" else 120)
+    os.utime(hb, (last, last))
+    if notice.exists():
+        notice.unlink()   # gone with the cycle
+    _boot_as(monkeypatch, "boot-b", booted)
+    d = Daemon(p.base)
+    prev = p.db.kv("boot_prev")
+    assert prev["prev_boot"] == "an-earlier-boot" and prev["shutdown"] == "abrupt", prev
+    assert ("cycle_notice" in prev) is (case != "no notice"), prev
+    _lost_to_reboot(p, d, tmp_path, tid)
+    t = p.db.task(tid)
+    assert t["attempts"] == 0, dict(t)
+    if case == "notice":
+        assert t["status"] == "queued" and tid in [x["id"] for x in p.db.ready_tasks()], dict(t)
+        cycle = d._planned_cycle("an-earlier-boot")
+        assert "device broker" in cycle["planner"] and "tray 2 dropped" in cycle["reason"], cycle
+    else:
+        assert t["status"] == "blocked" and "held board" in t["blocked_reason"], dict(t)
+        assert d._planned_cycle("an-earlier-boot") is None
 
 
 @pytest.mark.parametrize("survives", [False, True])

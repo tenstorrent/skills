@@ -318,6 +318,7 @@ from .providers.jev import Jev, JevOutOfFunds, Pause as JevPause
 from .prompts import RUN_DIR_MARK
 
 TICK_S = 3.0
+NOTICE_EVERY_S = 10.0   # how often the heartbeat reads the device broker's power-cycle notice (Daemon._cycle_notice)
 # With no run, push or startable task the wait between ticks doubles each tick up to this (_between_ticks):
 # an idle daemon ticks, and starts its steps' git, ps and probe processes, a few times a minute, not 20.
 # At most Slack's default poll (notify.slack_poll_s), so an idle project still reads Slack as often.
@@ -1438,6 +1439,8 @@ class Daemon:
         self._boot_woken = False
         self._cycles: dict[str, dict | None] = {}   # earlier boot -> its planned host cycle record
         self._held: list[str] | None = None   # lock holders the heartbeat file last recorded
+        self._notice: dict | None = None      # the broker's cycle notice the heartbeat file last recorded
+        self._notice_at = 0.0                 # when _cycle_notice last read it
         self._notify: str | None = None   # systemd's socket for the watchdog ping, when it runs us
         self._tick_wall, self._tick_mono = time.time(), time.monotonic()
         self._awake = runner.AwakeClock()   # the daemon's own awake time: a hung run's stale lease counts in it
@@ -1919,6 +1922,8 @@ class Daemon:
                    "initiator": initiator.find(self.p, prev, self.boot_at, last)}
             if by:
                 rec["orderly_by"] = by
+            if isinstance(hb.get("cycle_notice"), dict):   # a cycle the device broker announced (_notice_cycle)
+                rec["cycle_notice"] = hb["cycle_notice"]
             db.set_kv("boot_prev", rec)
         except Exception:
             log(self.p, "boot record: " + traceback.format_exc().replace("\n", " | ")[:1000])
@@ -1948,11 +1953,12 @@ class Daemon:
         file (identity.mark_tick), which `_progress()` never touches."""
         hb = self.p.state / "heartbeat"
         held = shared.held(self.p, self.cfg)
-        if not self._healthy or held != self._held:
+        notice = self._cycle_notice()
+        if not self._healthy or held != self._held or notice != self._notice:
             durable_write(hb, json.dumps({"pid": os.getpid(), "host": hostname(), "started": self._started,
                                           "boot": self.boot, "held": held, "takes": ["restart_requests", "apply_requests", landff.TAKES],
-                                          "receipt": self.identity}))
-            self._held = held
+                                          "receipt": self.identity, **({"cycle_notice": notice} if notice else {})}))
+            self._held, self._notice = held, notice
         else:
             os.utime(hb, None)
         identity.mark_tick(self.p.state, self.identity, first=not self._healthy)
@@ -1968,6 +1974,24 @@ class Daemon:
                 service.check_deferred(self.p, "new daemon")   # a deferred restart: this daemon ticks
             except Exception:
                 log(self.p, "deferred restart check error: " + traceback.format_exc().replace("\n", " | ")[:2000])
+
+    def _cycle_notice(self) -> dict | None:
+        """The power cycle of this host a device broker announces now (cyclenotice.project_held: its notice
+        file or a heal check's announcement), as the heartbeat records it: {path, state, reason, earliest},
+        or None. The next boot reads it to tell an announced cycle from a reboot a task may have caused.
+        Read at most every NOTICE_EVERY_S (the heal checks' state is a few queries); the last read between."""
+        from . import cyclenotice
+        now = time.time()
+        if 0 <= now - self._notice_at < NOTICE_EVERY_S:
+            return self._notice
+        self._notice_at = now
+        try:
+            h = cyclenotice.project_held(self.p, self.cfg)
+        except Exception:   # an unreadable notice records nothing; the tick goes on
+            return None
+        if not h or h.get("malformed"):
+            return None
+        return {k: (str(h.get(k))[:200] if h.get(k) is not None else None) for k in ("path", "state", "reason", "earliest")}
 
     def _record_harness_head(self) -> None:
         """kv harness_good: the harness commit this daemon ticks on. git runs in a session of its own,
@@ -16397,15 +16421,16 @@ class Daemon:
     def _planned_cycle(self, boot: str) -> dict | None:
         """The record of a planned host cycle that ended boot `boot`, if any: a host-cycle record
         (hostcycle.planned), or, for the boot just before this one, a power-cycle intent for this host
-        in the machine change ledger (_ledger_cycle). {reason, path, planner (what planned it)}; read once
-        per boot."""
+        in the machine change ledger (_ledger_cycle) or a power cycle the device broker announced at the
+        last heartbeat before the reboot (_notice_cycle). {reason, path, planner (what planned it)}; read
+        once per boot."""
         from . import hostcycle
         if boot not in self._cycles:
             try:
                 rec = hostcycle.planned(self.p, boot, self.boot_at)
                 self._cycles[boot] = {**rec, "planner": f"host-cycle record {rec.get('id') or Path(rec['path']).parent.name}"
                                                        + (f" by {rec['by']}" if rec.get("by") else "")} if rec \
-                    else self._ledger_cycle(boot)
+                    else self._ledger_cycle(boot) or self._notice_cycle(boot)
             except Exception:
                 log(self.p, "host-cycle records: " + traceback.format_exc().replace("\n", " | ")[:1000])
                 self._cycles[boot] = None
@@ -16427,6 +16452,24 @@ class Daemon:
                 who = f"machine change #{c.get('id')}" + (f" by {c['by']}" if c.get("by") else "")
                 return {"reason": str(c.get("what") or ""), "path": who, "planner": who, "project": self.p.name}
         return None
+
+    def _notice_cycle(self, boot: str) -> dict | None:
+        """A power cycle of this host the device broker announced (cyclenotice.py) that explains the reboot
+        ending boot `boot`: only the boot just before this one, when its last heartbeat recorded the notice
+        and this boot came within hostcycle.WINDOW_S of that heartbeat. The broker cycles the host after a
+        chip or tray fault and waits for no one: no task's doing."""
+        from . import hostcycle
+        prev = self.p.db.kv("boot_prev") or {}
+        n = prev.get("cycle_notice")
+        last = prev.get("last_heartbeat")
+        if not (isinstance(n, dict) and prev.get("prev_boot") == boot and self._this_boot(prev.get("boot"))):
+            return None
+        if self.boot_at and isinstance(last, (int, float)) and self.boot_at - last > hostcycle.WINDOW_S:
+            return None   # the daemon went quiet long before the reboot: the notice says nothing about it
+        why = f"the device broker announced a power cycle of this host ({n.get('state') or 'announced'}: " \
+              f"{n.get('reason') or 'no reason given'})"
+        where = str(n.get("path") or "its power-cycle notice")
+        return {"reason": why, "path": where, "planner": f"the device broker ({where})", "project": self.p.name}
 
     def _other_projects(self) -> list[str]:
         """The names of this user's other projects (the registry), longest first; [] when unreadable."""
@@ -16513,8 +16556,8 @@ class Daemon:
         """The resources task tid held (its run or a detached job of its own, through `ttp lock`) at
         the last heartbeat before the reboot that ended boot `boot`, when that reboot was abrupt and
         unplanned; [] otherwise (an orderly shutdown or a planned host cycle was not the task's doing).
-        A resource named after another machine on the machines list (`<alias>` or `<alias>-...`) is
-        used over ssh: this host's reboot did not come from it."""
+        A resource named after another machine on the machines list (`<alias>` or `<alias>-...`, also
+        after a prefix: `probe:<alias>`) is used over ssh: this host's reboot did not come from it."""
         prev = self.p.db.kv("boot_prev") or {}
         if not boot or not self._this_boot(prev.get("boot")) or prev.get("prev_boot") != boot \
                 or prev.get("shutdown") == "orderly":
@@ -16527,7 +16570,7 @@ class Daemon:
             except Exception:   # an unreadable list must not hide a hold
                 known, me = {}, ""
             others = [a for a in known if a != me]
-            held = [x for x in held if not any(x == a or x.startswith(a + "-") for a in others)]
+            held = [x for x in held if not _names_machine(x, others)]
         return held if held and not self._planned_cycle(boot) else []
 
     def _reboot_losses(self, tid: int, key: str = "lost_to_reboot") -> int:
@@ -22987,6 +23030,13 @@ def held_by_task(held, tid: int, project: str) -> list[str]:
         if hold.task_of(holder.rsplit(" since ", 1)[0], project) == int(tid) and res not in out:
             out.append(res)
     return out
+
+
+def _names_machine(res: str, aliases: list[str]) -> bool:
+    """Whether resource `res` is named after one of `aliases`: `<alias>`, `<alias>-...`, or either after a
+    `<prefix>:` (a lease of that machine, such as `probe:<alias>`)."""
+    names = [res, *(res.split(":", i + 1)[-1] for i in range(res.count(":")))]
+    return any(n == a or n.startswith(a + "-") for n in names for a in aliases if a)
 
 
 def held_at_reboot_reason(held: list[str]) -> str:
