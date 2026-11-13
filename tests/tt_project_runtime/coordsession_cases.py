@@ -2933,6 +2933,7 @@ def test_coordsession_chat_task_end_and_timer_wakes_each_resume_the_same_session
 
     def timer():   # nothing pending: the idle wake comes coordinator.idle_wake_s after the last turn
         p.db.x("UPDATE tasks SET status='done'")   # the fake agent's chat replies queue tasks
+        p.set_config("coordinator.quiet_held", False)   # else an unchanged idle wake with no open task is settled
         p.db.set_kv("last_coordinator_turn", time.time() - 7200)
         p.db.set_kv("idle_wake", {})
 

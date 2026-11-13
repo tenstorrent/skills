@@ -829,8 +829,9 @@ def test_speed_complaint_on_the_turn_start_runs_the_review_applies_and_queues_p1
     prompt = calls[-1][0]
     assert f"Speed complaint: measured throughput review (speed complaint #{mid}" in prompt
     assert "worker_slots SLOW" in prompt and "Changed #" in prompt and "budget.max_parallel_workers" in prompt
-    # The slow landed_chain lane has no setting: reported, no follow-up task.
-    assert "landed_chain SLOW" in prompt and "Not changed: landed_chain (no setting)" in prompt
+    # The landed_chain wait could not start (it waits for another task to land): reported as blocked, never
+    # judged slow, and no follow-up task.
+    assert "- landed_chain (blocked: could not start):" in prompt and "landed_chain SLOW" not in prompt
     assert not p.db.q("SELECT * FROM tasks WHERE title LIKE 'throughput: %'")
     # A slow resource lane has a setting a person or task may change: one p1 follow-up.
     p.set_config("resources", {"boxA": 1})
@@ -857,7 +858,7 @@ def test_speed_complaint_on_the_turn_start_runs_the_review_applies_and_queues_p1
     monkeypatch.setattr(time, "time", lambda: later + 1200)
     d.maybe_coordinate()
     assert f"Not reopened (unchanged evidence since a closed follow-up): resource:boxA (#{fu[0]['id']})" in calls[-1][0]
-    assert "- landed_chain SLOW: 1 wait(s)" in calls[-1][0] and "Not changed: landed_chain" in calls[-1][0]
+    assert "- landed_chain (blocked: could not start): 1 wait(s)" in calls[-1][0]
     assert len(p.db.q("SELECT * FROM tasks WHERE title LIKE 'throughput: %'")) == 1
     # A plain message adds no section.
     p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
