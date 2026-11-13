@@ -392,7 +392,6 @@ def validate_record(record: Any) -> list[str]:
         errors.append("stage_usage.json other_sessions must be an integer >= 0")
     if not isinstance(record.get("remediation_rounds"), list):
         errors.append("stage_usage.json remediation_rounds must be a list")
-    errors += validate_device(record.get("device"))
     rows = record.get("rows")
     if not isinstance(rows, dict) or any(not isinstance(rows.get(key), dict) for key in ROW_KEYS):
         return errors + [f"stage_usage.json rows must have {', '.join(ROW_KEYS)}"]
@@ -472,13 +471,17 @@ def check(model_dir: pathlib.Path, stem: str) -> tuple[int, list[str]]:
     errors = validate_record(record)
     if errors:
         return 2, errors
-    if not (model_dir / doc_dir / record["device"]["timeline"]).is_file():
-        return 2, [f"{model_dir / doc_dir / record['device']['timeline']} is missing (the runner writes it)"]
+    # The device row is the runner's own measurement, which the stage cannot fix: its problems are advisory.
+    device = validate_device(record.get("device"))
+    if not device and not (model_dir / doc_dir / record["device"]["timeline"]).is_file():
+        device.append(f"{model_dir / doc_dir / record['device']['timeline']} is missing (the runner writes it)")
     report_path = model_dir / report
     if not report_path.is_file():
         return 2, [f"{report_path} is missing, so it has no '{HEADING}' section"]
-    errors = validate_section(report_path.read_text(encoding="utf-8", errors="replace"), record)
-    return (2 if errors else 0), errors
+    found = validate_section(report_path.read_text(encoding="utf-8", errors="replace"), record)
+    errors = [e for e in found if "device held/idle" not in e]
+    device += [e for e in found if "device held/idle" in e]
+    return (2 if errors else 1 if device else 0), errors + device
 
 
 def main(argv: list[str] | None = None) -> int:

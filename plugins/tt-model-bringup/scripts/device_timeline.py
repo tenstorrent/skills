@@ -341,7 +341,13 @@ def summarize(path: pathlib.Path, end: int | None = None) -> dict[str, Any] | No
         return None
     stop = prev["t"] if end is None else max(end, prev["t"])
     add(prev, stop - prev["t"])
-    return {**totals, "wall_s": stop - first_t, "devices": devices, "complete": complete, "hidden": hidden,
+    # Wall is the sum of the partitioned intervals, so held + other + idle + unknown == wall always holds, even
+    # when the clock stepped back or two runners appended out of order (those spans are dropped and flagged).
+    span = stop - first_t
+    wall = sum(totals.values())
+    if wall != span:
+        complete = False
+    return {**totals, "wall_s": wall, "span_s": span, "devices": devices, "complete": complete, "hidden": hidden,
             "timeline": TIMELINE, **{k: v for k, v in where.items() if k != "interval"}}
 
 

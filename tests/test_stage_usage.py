@@ -257,11 +257,12 @@ def gate(model, stage, required=True):
         **json.loads(js.read_text())['device'], 'idle_s': 1}})), 'device held + other + idle + unknown != wall'),
 ])
 def test_missing_or_malformed_usage_is_critical(tmp_path, home, break_it, message):
+    """Critical, except the device row: the runner's own measurement the stage cannot fix is advisory."""
     model, report, js = written(tmp_path, home)
     assert gate(model, '12-agentic-evals').returncode == 0
     break_it(report, js)
     result = gate(model, '12-agentic-evals')
-    assert result.returncode == 2, result.stderr
+    assert result.returncode == (1 if 'device' in message else 2), result.stderr
     assert message in result.stderr
     # An agent running the check itself mid-stage is not judged on the runner's record.
     assert gate(model, '12-agentic-evals', required=False).returncode == 0
@@ -330,3 +331,17 @@ def test_a_record_the_runner_could_not_write_is_reported_not_critical(tmp_path):
     result = subprocess.run([sys.executable, str(PLUGIN / 'scripts/stage_usage.py'), 'check', '--model-dir',
                              str(tmp_path), '--stage', '12-agentic-evals'], env=env, capture_output=True, text=True)
     assert result.returncode == 1 and 'disk full' in result.stderr
+
+
+def test_a_clock_step_back_keeps_the_partition_exact(tmp_path):
+    """Wall is the sum of the intervals: a backward clock step or out-of-order lines cannot break held+idle+unknown."""
+    timeline = tmp_path / 'device_timeline.jsonl'
+    timeline.write_text('\n'.join(json.dumps(item) for item in [
+        {'t': 1000, 'held': 1, 'of': 1, 'by': 's', 'other': False, 'event': 'stage_start', 'interval': 15},
+        {'t': 1600, 'held': 0, 'of': 1, 'by': '', 'other': False},
+        {'t': 1300, 'held': 1, 'of': 1, 'by': 's', 'other': False},              # clock stepped back
+        {'t': 2000, 'held': 0, 'of': 1, 'by': '', 'other': False, 'event': 'stage_end'}]) + '\n')
+    summary = device_timeline.summarize(timeline)
+    parts = summary['held_s'] + summary['held_other_s'] + summary['idle_s'] + summary['unknown_s']
+    assert parts == summary['wall_s'] and summary['complete'] is False and summary['span_s'] == 1000
+    assert stage_usage.validate_device(summary) == []
