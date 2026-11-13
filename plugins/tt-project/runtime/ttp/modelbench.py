@@ -32,6 +32,8 @@ import urllib.request
 from pathlib import Path
 from typing import Callable
 
+from . import babysit
+
 DIR, LOCK, OWNER, MODELS = "model-bench", "bench.lock", "owner.json", "models.json"   # under project.HOME_DIR
 OWNER_LOCK = "owner.lock"       # every change to OWNER is made under it (owner_update)
 NOKEY = "model-bench-nokey"     # the alert key of a skip for want of a working key (reported once)
@@ -40,7 +42,7 @@ DAILY = 4                       # top served ranked models benched every day
 WEEK_S = 7 * 86400 - 3600       # a weak or parked model's recheck interval (an hour's slack keeps it on its weekday)
 PASS_MIN = 2 / 3                # a score under this is weak
 RECHECKS = 8                    # weekly recheck results kept per model
-MAX_TOKENS, TIMEOUT_S = 200, 60.0
+MAX_TOKENS, TIMEOUT_S = babysit.MAX_TOKENS, 60.0   # the limit production sends: a cut-off cell measures the cap
 # A busy answer (HTTP 429 or 503) is retried RETRIES times, each after the server's Retry-After (header, or
 # 'retry after N seconds' in its message) capped at RETRY_MAX_S, else 2**n s; only then is it a fault.
 BUSY, RETRIES, RETRY_MAX_S = (429, 503), 3, 30.0

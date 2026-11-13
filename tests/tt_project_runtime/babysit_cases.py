@@ -445,3 +445,61 @@ def test_a_babysit_call_every_candidate_failed_asks_the_next_ranked_served_model
     with pytest.raises(babysit.Unavailable):   # no served list known: unchanged
         babysit.ask(cfg, "s", "Is there work?", post=post, db=p.db, served=None)
     assert seen == ["example-org/small-model"]
+
+
+def _bs_cut(s, messages, timeout):
+    """A reasoning model that spent the whole token limit thinking: empty content, finish_reason length."""
+    return {"choices": [{"message": {"content": ""}, "finish_reason": "length"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 1024}}
+
+
+def test_a_cut_off_babysit_answer_asks_the_next_model_before_falling_back(env):
+    from ttp import babysit, route
+    babysit._REFUSED.clear()
+    seen = []
+
+    def post(s, messages, timeout):
+        seen.append(s["model"])
+        return (_bs_cut if s["model"] == "example-org/thinker" else _bs_reply("skip"))(s, messages, timeout)
+    p, cfg, b, lines = _bs_gate(env, post, _BsJev(), babysit_cfg={"model": "example-org/thinker"})
+    task, prev = _bs_wait_task(p)
+    from ttp import waitgate
+    d = waitgate._ask_jev(p.db, cfg, waitgate.settings(cfg), b, task, prev, None, None, 100.0)
+    assert seen == ["example-org/thinker", "example-org/small-model"] and not lines
+    assert d is not None and not d.wake and d.extra["model"] == "example-org/small-model"
+    rows = [(r["source"], r["account"]) for r in p.db.q("SELECT source, account FROM ledger WHERE source LIKE 'babysit%'")]
+    assert rows == [("babysit:wake_gate", "example-org/small-model")]
+    seen.clear()   # the listed models all cut off: the ranked stand-in answers
+    cfg["providers"]["chat"]["model_ranking"] = ["example-org/best"]
+    route.write_served(p.state, "chat", True, "HTTP 200", ["example-org/best"], time.time())
+    cut_all = lambda s, m, t: (seen.append(s["model"]), (_bs_cut if s["model"] != "example-org/best" else _bs_reply("skip"))(s, m, t))[1]
+    d = babysit.ask(cfg, "s", "Is there work?", post=cut_all, served=b._served())
+    assert d["model"] == "example-org/best" and seen == ["example-org/thinker", "example-org/small-model", "example-org/best"]
+
+
+def test_every_model_cut_off_is_an_unparsed_fallback_naming_the_cut(env):
+    from ttp import babysit, route
+    babysit._REFUSED.clear()
+    p, cfg, b, lines = _bs_gate(env, _bs_cut, _BsJev(), babysit_cfg={"model": "example-org/thinker"})
+    cfg["providers"]["chat"]["model_ranking"] = ["example-org/best"]
+    route.write_served(p.state, "chat", True, "HTTP 200", ["example-org/best"], time.time())
+    with pytest.raises(babysit.Unparsed, match=r"cut off at \d+ tokens \(finish_reason length\)") as e:
+        babysit.ask(cfg, "s", "Is there work?", post=_bs_cut, served=b._served())
+    assert "example-org/thinker, example-org/small-model, example-org/best" in str(e.value)
+    assert b.decision("s", "Is there work?", purpose="wake_gate") is None
+    assert len(lines) == 1 and "failed (" in lines[0] and "answer cut off at" in lines[0]
+    assert time.time() >= b.pause.until   # no cool-down: the next decision asks the chat provider again
+    assert p.db.one("SELECT COUNT(*) n FROM ledger WHERE source = 'babysit_fallback:wake_gate'")["n"] == 1
+
+    def mixed(s, messages, timeout):   # a cut-off, then a real fault: Unavailable (the cool-down applies)
+        if s["model"] == "example-org/thinker":
+            return _bs_cut(s, messages, timeout)
+        raise babysit.Unavailable("HTTP 503: busy")
+    with pytest.raises(babysit.Unavailable) as e:
+        babysit.ask(cfg, "s", "Is there work?", post=mixed, served=None)
+    assert not isinstance(e.value, babysit.Unparsed) and "HTTP 503" in str(e.value)
+
+
+def test_the_token_limit_leaves_reasoning_models_room_and_the_bench_sends_the_same(env):
+    from ttp import babysit, modelbench
+    assert babysit.MAX_TOKENS >= 512 and modelbench.MAX_TOKENS == babysit.MAX_TOKENS
