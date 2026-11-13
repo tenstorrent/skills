@@ -478,6 +478,14 @@ def _run_wrapper_dir(d: str) -> bool:
         return False
 
 
+# What push.check_env hands a check, and so this suite when it runs as a push or post-landing check:
+# the scratch HOME's file list (scratchhome.FILES_ENV), which makes a nested check reuse the outer
+# check's scratch HOME, the pinned checks env's lock (runnerenv.LOCK_ENV), shipped to a remote check,
+# and what the check gates. Tests that need one set it themselves.
+CHECK_RUNNER_ENV = ("TTP_CHECKS_HOME_FILES", "TTP_CHECKS_PYTHON_LOCK", "TTP_CHECKS_PYTHON_ENV",
+                    "TTP_PUSH_MODE", "TTP_PUSH_TIP", "TTP_PUSH_BRANCH")
+
+
 @pytest.fixture()
 def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     home = tmp_path / "home"
@@ -530,6 +538,7 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
                 "TTP_NO_USER_POST",   # a light-tier or chat-routed run's mark (workernotify.ENV)
                 "TTP_ROLE", "TTP_COORD_FULL_TOOLS",   # the run's role: a coordinator's makes the git wrapper refuse every push
                 "TTP_CHECKS_NO_SPILL", "TTP_SPILL_HOST", "TTP_SPILL_MACHINE",   # the outer checks run's spill state (checkspill.OFF_ENV)
+                *CHECK_RUNNER_ENV,   # what push.check_env gives the suite when it runs as a push or post-landing check
                 "CMAKE_BUILD_PARALLEL_LEVEL"):
         monkeypatch.delenv(var, raising=False)
     # What a re-executing `ttp checks` hands its next process (cli._checks_reexec, a rerun) is set straight in
@@ -39088,7 +39097,10 @@ def test_checks_isolate_run_local_tmpdir_from_enclosing_git_and_project(env, tmp
     # The child pytest's own bytecode and cache in the checkout are not temp files, nor is the run
     # folder (the durable record, e.g. slowest-tests.json): allow both, so a checkout or suite tmp
     # under /tmp audits exactly what one elsewhere does.
-    monkeypatch.setenv("TTP_TEST_ALLOW_ROOT", os.pathsep.join([str(nested_tmp), str(RUNTIME.parents[2]), str(run)]))
+    # Nor is the project's state (the checks' resume record, cli.CHECKS_RESUME_DIR): a suite whose temp root is
+    # /tmp (a post-landing check's) puts this test's project there too.
+    monkeypatch.setenv("TTP_TEST_ALLOW_ROOT", os.pathsep.join([str(nested_tmp), str(RUNTIME.parents[2]), str(run),
+                                                               str(p.state)]))
     monkeypatch.setenv("TTP_TEST_FORBID_LOG", str(audit_log))
     monkeypatch.setenv("TTP_TEST_SHORT_TMP_ROOT", str(nested_tmp))   # the child suite's own short-dir folder
     for var in ("TMPDIR", "TMP", "TEMP"):

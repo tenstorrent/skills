@@ -78,7 +78,10 @@ def _rc_run(tmp_path, repo, cmd, host="box1", env=None, wait=True, commit="", li
     (exit code, output); with wait=False the Popen."""
     from ttp import remotecheck
     bin_, remote = _rc_fake_ssh(tmp_path)
-    penv = {**os.environ, "PATH": f"{bin_}{os.pathsep}{os.environ['PATH']}", "FAKE_REMOTE_TMP": str(remote), **fake}
+    # Not the variables of a check running this suite (CHECK_RUNNER_ENV): its scratch HOME's file list would
+    # move a remote check into a scratch HOME of its own; a test that wants one passes it in `fake`.
+    base = {k: v for k, v in os.environ.items() if k not in CHECK_RUNNER_ENV}
+    penv = {**base, "PATH": f"{bin_}{os.pathsep}{os.environ['PATH']}", "FAKE_REMOTE_TMP": str(remote), **fake}
     proc = subprocess.Popen(remotecheck.argv(cmd, host, env, commit, literal=literal), cwd=repo, env=penv,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     if not wait:

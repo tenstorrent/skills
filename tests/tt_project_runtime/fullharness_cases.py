@@ -23,6 +23,19 @@ def _full_harness_run(env, monkeypatch, tmp_path, role="worker"):
     return run, home
 
 
+def _review_temp_outside(monkeypatch, tmp_path, home):
+    """A review may write in the temp folders (hook._scratch_roots); a suite whose temp root is one of them
+    (/tmp, as a post-landing check's is) puts the test's repository under `home` there too. The review gets
+    a temp folder of its own, and a temp root holding `home` is left out, so the write rules read as on any host."""
+    from ttp import hook
+    scratch = tmp_path / "tmp"
+    scratch.mkdir(exist_ok=True)
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
+    real_roots = hook._scratch_roots
+    inside = lambda path, root: (os.path.realpath(path) + os.sep).startswith(os.path.realpath(root).rstrip(os.sep) + os.sep)
+    monkeypatch.setattr(hook, "_scratch_roots", lambda: [r for r in real_roots() if not (r and inside(home, r))])
+
+
 def test_tools_that_step_outside_the_harness_are_refused_by_the_hook(env, monkeypatch, tmp_path):
     from ttp import hook
     _full_harness_run(env, monkeypatch, tmp_path)
@@ -228,6 +241,7 @@ def test_a_codex_reviews_apply_patch_writes_only_in_its_run_folder_or_while_reso
     from ttp.providers import codex
     assert re.fullmatch(codex.PRE_TOOL_MATCHER, "apply_patch"), "Codex routes apply_patch through the hook"
     run, home = _full_harness_run(env, monkeypatch, tmp_path, role="reviewer")
+    _review_temp_outside(monkeypatch, tmp_path, home)
     repo = home / "proj"
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
     call = lambda inp: _hook_reason({"tool_name": "apply_patch", "tool_input": inp, "cwd": str(repo)})
@@ -246,6 +260,7 @@ def test_a_codex_reviews_apply_patch_writes_only_in_its_run_folder_or_while_reso
 def test_cursor_tool_calls_meet_the_search_scope_and_review_write_rules(env, monkeypatch, tmp_path):
     from ttp import cursorhook
     run, home = _full_harness_run(env, monkeypatch, tmp_path, role="reviewer")
+    _review_temp_outside(monkeypatch, tmp_path, home)
     repo = home / "proj"
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
     deny = lambda tool, inp: ((cursorhook.translate("preToolUse", {"tool_name": tool, "tool_input": inp,

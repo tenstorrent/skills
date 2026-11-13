@@ -234,17 +234,22 @@ def test_a_slot_holder_with_its_own_lifetime_locks_is_reaped_but_one_holding_a_t
 
 
 def test_ttp_checks_reap_logs_each_stop_to_the_project_log_but_a_dry_run_does_not(env, monkeypatch, capsys):
-    from ttp import cli, leftoverchecks
+    from ttp import cli, leftoverchecks, orphanchecks
     p = make(env)
     monkeypatch.setattr(cli, "here", lambda: p)
     monkeypatch.setattr(leftoverchecks, "reap", lambda p, dry_run=False: [{"text": f"reap line dry={dry_run}"}])
+    # Never this host's own leftover test trees (another suite's would print, and the second call stop them),
+    # nor the check hosts'.
+    monkeypatch.setattr(leftoverchecks, "test_orphans", lambda p, dry_run=False: [{"text": f"orphan line dry={dry_run}"}])
+    monkeypatch.setattr(orphanchecks, "reap_report", lambda cfg, dry_run=False: [f"host line dry={dry_run}"])
     for args in (["checks", "--reap", "--dry-run"], ["checks", "--reap"]):
         with pytest.raises(SystemExit) as e:
             cli.main(args)
         assert e.value.code == 0
-    assert capsys.readouterr().out.splitlines() == ["reap line dry=True", "reap line dry=False"]
+    assert capsys.readouterr().out.splitlines() == [f"{k} line dry={d}" for d in (True, False)
+                                                    for k in ("reap", "orphan", "host")]
     text = (p.logs / "daemon.log").read_text() if (p.logs / "daemon.log").exists() else ""
-    assert "reap line dry=False" in text and "dry=True" not in text
+    assert all(f"{k} line dry=False" in text for k in ("reap", "orphan", "host")) and "dry=True" not in text
 
 
 class _LcClock:
