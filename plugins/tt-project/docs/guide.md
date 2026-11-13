@@ -1931,12 +1931,15 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   another member comes after it. Whatever dispatch picks first leads, so an urgent task never waits
   for a batch to fill, and an urgent task never joins another's run: it starts in a worker of its
   own, in parallel. So a project landing many related device-bound changes lands them as a few
-  batches, not one by one. The worker commits each task separately with a `Task: #<id>`
-  trailer and hands off one outcome per task (`members` in result.json); shared steps run once for
+  batches, not one by one. The worker commits each task separately, with no task number in its
+  messages (a public repository's squash-merge would carry one), and hands off one outcome per task
+  with its commit ids (`members` in result.json; with none, the branch's commits when the batch
+  settles); shared steps run once for
   the batch, after every member's commit: one focused test gate, one device smoke, and, where the
   batch delivers outside the push queue (a PR or a push request), one request carrying every
   member's commits. The batch's one review and one checks run cover the branch, its head with every
-  member's commit. A member counts as landed only once its own commit is on the push branch: one the
+  member's commit. A member counts as landed only once its own commits are on the push branch, as
+  themselves or rebased copies (a trailer commit of an older run counts too): one the
   approved head left out stays not landed (`ttp landed` says so) and gets a review of its own. Once the lead ends, a
   member done in the run is done on the lead's branch, a blocked one is blocked with its reason, and
   a failed one goes back to the queue alone. The run's budget is the sum of the members' remaining

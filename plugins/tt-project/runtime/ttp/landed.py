@@ -417,11 +417,31 @@ def task_shas(p, tid: int) -> tuple[list[str], str]:
     return [head], f"its branch {branch}"
 
 
+def commits_sha(p, shas: list[str], tip: str = "") -> str:
+    """The push branch commit (local ref, no fetch; `tip` when given) that carries every commit of `shas`
+    (on_branch: an ancestor, or an equivalent there such as a rebased copy) when none of them is reverted
+    there ("This reverts commit <sha>"); "" when one is missing, none is given or git cannot read them. A
+    batch run's hand-off lists each member's own commits, so this finds a member's landing with no trailer
+    in its message."""
+    if not shas or not tip and not _has_push_branch(p):
+        return ""
+    try:
+        tip = _commit(p.root, tip or _push_ref(p, p.root))
+        full = [_commit(p.root, s) for s in shas]
+    except ValueError:
+        return ""
+    if not tip or not all(full):
+        return ""
+    reverts = _git(p.root, "log", "--format=%B", "--grep=This reverts commit", tip).stdout
+    gone = set(re.findall(r"This reverts commit ([0-9a-f]{40,64})", reverts))
+    return tip if not gone & set(full) and all(on_branch(p.root, s, tip) for s in full) else ""
+
+
 def trailer_sha(p, tid: int, since: float | None = None, tip: str = "") -> str:
     """The newest commit on the push branch (local ref, no fetch) whose message carries task `tid`'s
     own `Task: #<id>` trailer and that no later commit there reverts ("This reverts commit <sha>"),
-    committed after `since`; "" when none, or no push branch. A batch run commits each member with
-    that trailer, so this finds a member's landing that no hand-off or push record names. `tip`: look
+    committed after `since`; "" when none, or no push branch. Batch runs before commits_sha committed each
+    member with that trailer, so this finds such a member's landing that no hand-off names. `tip`: look
     from that commit (one the push queue landed) instead of the push branch's ref."""
     if not tip and not _has_push_branch(p):
         return ""

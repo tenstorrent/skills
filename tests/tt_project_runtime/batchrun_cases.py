@@ -123,7 +123,7 @@ def test_batch_run_shares_one_worktree_and_branch(env, monkeypatch):
     (args, kw), = lead_runs   # the urgent task leads, and its batch is one run
     assert kw["note"]["batch"] == {"id": f"b{urgent}", "members": mates}
     assert f"## Batch run b{urgent}" in args[1] and all(f"### Task #{m}:" in args[1] for m in mates)
-    assert "Task: #" in args[1]
+    assert "Task: #" not in args[1] and "\"commits\"" in args[1]   # no task number in commit messages (note f13bad0cfa7b8a9c)
     assert kw["budget_usd"] == pytest.approx(16.0)   # 8 + 4 + 4, under the deep cap
     assert all(k["task"]["id"] not in mates for _, k in started)   # no second run for a member
     for m in mates:
@@ -384,3 +384,56 @@ def test_batch_never_leads_or_takes_a_task_with_a_branch_of_its_own():
     assert batchrun.own_branch(dict(plain, spec="pr_branch: feat/x"), recorded=False)
     for lb in ("pr_branch:feat/x", "pr_fix:acme/widgets#7", "continues:5"):
         assert batchrun.own_branch(dict(plain, labels=f'["{lb}"]'), recorded=False), lb
+
+
+def test_batch_members_land_by_their_own_commits_or_rebased_copies_with_no_trailer(env, monkeypatch, tmp_path):
+    """Upstream note f13bad0cfa7b8a9c: a public repo's squash-merge carried the `Task: #<id>` trailer to main.
+    Members commit with no task number; a member lands once the commits its hand-off names (else, as read when
+    it settles, the branch's commits) are on the push branch, as themselves or rebased copies."""
+    from ttp import batchrun, landed
+    from ttp.db import dump_result, load_result
+    p = make(env)
+    d, _ = _batch_daemon(p, monkeypatch)
+    root = str(p.root)
+    git = lambda *a, cwd=root: subprocess.run(["git", "-C", cwd, *a], capture_output=True, text=True,
+                                              check=True).stdout.strip()
+    p.set_config("delivery.push_branch", "land")
+    git("branch", "land", "HEAD")
+    wt = str(tmp_path / "wt")
+    git("worktree", "add", "-q", "-b", "ttp/t-lead", wt, "HEAD")
+    shas = []
+    for name in ("a", "b"):
+        (Path(wt) / f"{name}.txt").write_text(f"{name}\n")
+        git("add", f"{name}.txt", cwd=wt)
+        git("-c", "user.name=w", "-c", "user.email=w@example.com", "commit", "-qm", f"fix {name}", cwd=wt)
+        shas.append(git("rev-parse", "HEAD", cwd=wt))
+    lead, a, b = _batch_tasks(p, 3)
+    batchrun.record(p.db, lead, [a, b], "ttp/t-lead", p.config())
+    for m in (a, b):
+        p.db.update_task(m["id"], status="running", branch="ttp/t-lead")
+    p.db.update_task(lead["id"], status="done", branch="ttp/t-lead", result=dump_result(
+        {"status": "done", "members": [{"id": a["id"], "status": "done", "commits": [shas[0][:12]], "summary": "a"},
+                                       {"id": b["id"], "status": "done", "summary": "b"}]}))
+    reviews = []
+    monkeypatch.setattr(d, "_auto_review", lambda t, summary, add=True: reviews.append(t["id"]) or (999, True))
+    d.reconcile_tasks()
+    assert load_result(p.db.task(a["id"])["result"])["commits"] == [shas[0][:12]]
+    assert sorted(load_result(p.db.task(b["id"])["result"])["commits"]) == sorted(shas)   # read from the branch
+    # The push branch moved on, then took a rebased copy of a's commit only.
+    land = str(tmp_path / "land")
+    git("worktree", "add", "-q", land, "land")
+    (Path(land) / "other.txt").write_text("o\n")
+    git("add", "other.txt", cwd=land)
+    git("-c", "user.name=o", "-c", "user.email=o@example.com", "commit", "-qm", "other work", cwd=land)
+    git("-c", "user.name=r", "-c", "user.email=r@example.com", "cherry-pick", shas[0], cwd=land)
+    tip = git("rev-parse", "HEAD", cwd=land)
+    assert "Task: #" not in git("log", "--format=%B", "-3", tip)
+    review = p.db.add_task(f"Review #{lead['id']}: x", "Review it.", kind="review", origin="daemon")
+    _push_row(p, review, tip, tip)
+    d.reconcile_tasks()
+    ra, rb = (load_result(p.db.task(m["id"])["result"]) for m in (a, b))
+    assert ra["landed"] == tip and landed.recorded(p.db, a["id"])[0] == [tip]
+    assert "left_out" in rb and "landed" not in rb and reviews == [b["id"]]
+    assert batchrun.landed_sha(p, b["id"], commits=shas) == ""
+    git("-c", "user.name=r", "-c", "user.email=r@example.com", "cherry-pick", shas[1], cwd=land)
+    assert batchrun.landed_sha(p, b["id"], commits=shas) == git("rev-parse", "HEAD", cwd=land)

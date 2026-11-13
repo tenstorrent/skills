@@ -19736,8 +19736,11 @@ class Daemon:
                              "every member's commit; to leave a member out, say in `members` why for that member. "
                              "A worker's note naming one member's commit does not narrow the head.")
             elif isinstance(load_result(task.get("result")).get("left_out"), dict):
-                lines.append(f"Batch run {rec['id']} landed without this task's own commit: review that commit "
-                             f"(`git log -E --grep '^Task: #{task['id']}([^0-9]|$)' {head}`) at head {head}.")
+                own = batchrun._shas(load_result(task.get("result")).get("commits"))
+                lines.append(f"Batch run {rec['id']} landed without this task's own commit: review "
+                             + (f"its commits {' '.join(s[:12] for s in own[:20])}" if own else
+                                f"that commit (`git log -E --grep '^Task: #{task['id']}([^0-9]|$)' {head}`)")
+                             + f" at head {head}.")
         # A split head whose hop stalls is reviewed on its own now (_release_split_reviews).
         own_split = chaincap.split_head(task)
         stall = chaincap.stalled_hop(db, task["id"]) if own_split else None

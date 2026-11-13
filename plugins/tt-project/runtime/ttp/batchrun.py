@@ -15,8 +15,9 @@ gate, one device smoke and, where it delivers outside the push queue, one landin
 push request) carrying every member's commits (prompt_block). Off with `dispatch.batch` false.
 
 The batch shares the lead's worktree and branch (each member's record carries it), and the worker
-prompt lists every member (prompt_block). The worker commits each member separately with a
-`Task: #<id>` trailer and hands off one outcome per member (`members` in result.json and on_pass).
+prompt lists every member (prompt_block). The worker commits each member separately, no task number in
+its messages (a public repo's squash-merge would carry it), and hands off one outcome per member with its
+commit ids (`members` in result.json and on_pass; with none, the branch's commits when it settles).
 The run's budget is the sum of the members' remaining budgets, capped at the deep tier's default; its
 cost is booked to each member pro rata to their budgets (book). Members wait as `running` with a
 blocked_reason naming the lead, which reconcile_tasks leaves alone (held). Once the lead leaves
@@ -24,7 +25,8 @@ running, waiting and review (settle): with the lead done, a member whose outcome
 the lead's branch, which the lead's one review covers; it counts as landed only once the push queue
 lands that branch with its own commit on the push branch (landings), and a member the approved head
 left out gets a review of its own; a blocked one is blocked with its
-reason; a member whose own `Task: #<id>` commit is on the push branch (landed.trailer_sha) is done as
+reason; a member whose own commits are on the push branch (landed.commits_sha; a `Task: #<id>` trailer
+commit from an older run, landed.trailer_sha) is done as
 landed whatever the hand-off says, unless it marks it failed or blocked; a failed or missing one goes
 back to the queue alone, on a branch of its own, and dispatch closes it instead of running it once its
 commit has landed since (close_landed). A lead asleep on its own wait (a waiting hand-off, stored as
@@ -36,6 +38,7 @@ git only to read the push branch's log.
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 
@@ -58,15 +61,35 @@ def holds(lead: dict | None) -> bool:
     return lead["status"] == "queued" and str((load_result(lead.get("result")) or {}).get("status")) == "waiting"
 
 
-def landed_sha(p, tid: int, since: float | None = None, tip: str = "") -> str:
-    """Task `tid`'s own `Task: #<id>` commit on the push branch (landed.trailer_sha; from `tip` when
-    given), "" when none or it cannot be read: never raises, so a git fault only leaves the member to
-    the queue."""
+def landed_sha(p, tid: int, since: float | None = None, tip: str = "", commits: list[str] | None = None) -> str:
+    """The push branch commit (from `tip` when given) carrying member `tid`'s own `commits` (landed.commits_sha:
+    each there or a rebased copy); with none, its `Task: #<id>` trailer commit, as batch runs before that
+    commit made them (landed.trailer_sha); "" when none or it cannot be read: never raises, so a git fault only
+    leaves the member to the queue."""
     from . import landed
     try:
-        return landed.trailer_sha(p, tid, since, tip)
+        return landed.commits_sha(p, commits, tip) if commits else landed.trailer_sha(p, tid, since, tip)
     except Exception:
         return ""
+
+
+def _shas(v) -> list[str]:
+    """A hand-off's `commits` for a member: commit ids, from a list or one string."""
+    words = v.split() if isinstance(v, str) else v if isinstance(v, list) else []
+    return [w for w in (str(x).strip() for x in words) if re.fullmatch(r"[0-9a-f]{7,64}", w)]
+
+
+def _branch_commits(p, branch: str | None) -> list[str]:
+    """The commits on `branch` not on the push branch (local refs): a member's own commits when its hand-off
+    names none, read when the batch settles (a superset: they land together or it counts as left out)."""
+    from . import landed
+    try:
+        if not branch or not landed._has_push_branch(p):
+            return []
+        r = landed._git(p.root, "rev-list", "--no-merges", f"{landed._push_ref(p, p.root)}..{branch}")
+        return r.stdout.split()[:200] if r.returncode == 0 else []
+    except Exception:
+        return []
 
 
 def close_landed(p, task: dict) -> str:
@@ -76,7 +99,7 @@ def close_landed(p, task: dict) -> str:
     res = load_result(task.get("result"))
     if not isinstance(res, dict) or res.get("status") != "requeued" or not isinstance(res.get("batch"), dict):
         return ""
-    if not (sha := landed_sha(p, task["id"], task.get("created"))):
+    if not (sha := landed_sha(p, task["id"], task.get("created"), commits=_shas(res.get("commits")))):
         return ""
     why = f"its commit {sha[:10]} from batch run {res['batch'].get('id')} is on the push branch: closed as landed, not run again"
     p.db.update_task(task["id"], status="done", blocked_reason=None,
@@ -356,12 +379,15 @@ def settle(p, lead_id: int) -> list[tuple[int, str, str]]:
         o = got.get(mid) or {}
         st = str(o.get("status") or "")
         info = {"id": rec["id"], "lead": lead_id, "members": rec.get("members", [])}
-        sha = "" if (done_ok and st == "done") or st in ("failed", "blocked") else landed_sha(p, mid, since)
+        own = _shas(o.get("commits"))
+        sha = "" if (done_ok and st == "done") or st in ("failed", "blocked") else landed_sha(p, mid, since, commits=own)
+        mine = {"commits": own or (_branch_commits(p, rec.get("branch")) if done_ok and st == "done" else [])}
+        mine = mine if mine["commits"] else {}
         if (done_ok and st == "done") or sha:
             why = (f"its commit {sha[:10]} is on the push branch: closed as landed" if sha and st != "done" else
                    str(o.get("summary") or f"done in batch run of #{lead_id}"))
             db.update_task(mid, status="done", branch=rec.get("branch"), blocked_reason=None,
-                           result=dump_result({"status": "done", "summary": why, "batch": info,
+                           result=dump_result({"status": "done", "summary": why, "batch": info, **mine,
                                                **({"landed": sha} if sha else {}),
                                                **({"followups": o["followups"]} if o.get("followups") else {})}))
             st = "done"
@@ -377,7 +403,8 @@ def settle(p, lead_id: int) -> list[tuple[int, str, str]]:
             why += f" ({'marked failed' if st == 'failed' else 'its commit is not on the push branch'}): requeued alone"
             st = "queued"
             db.update_task(mid, status="queued", branch=None, blocked_reason=None,
-                           result=dump_result({"status": "requeued", "summary": why, "batch": info}))
+                           result=dump_result({"status": "requeued", "summary": why, "batch": info,
+                                               **({"commits": own} if own else {})}))
         out.append((mid, st, why))
     db.set_kv(KV + str(lead_id), {**rec, "settled": time.time(), "outcomes": {str(m): s for m, s, _ in out},
                                   "why": {str(m): w for m, _, w in out}})
@@ -386,8 +413,9 @@ def settle(p, lead_id: int) -> list[tuple[int, str, str]]:
 
 def landings(p, rec: dict) -> list[tuple[int, str, str]]:
     """Judge each done member of settled batch `rec` once the push queue landed its shared branch since
-    the run started (the newest such landing): it landed only when its own `Task: #<id>` commit (or a
-    rebased copy with that trailer) is on the push branch, recorded as `landed` in its result, which
+    the run started (the newest such landing): it landed only when its own commits (its result's `commits`,
+    each there or a rebased copy; else a `Task: #<id>` trailer commit) are on the push branch, recorded as
+    `landed` in its result, which
     landed.recorded reads. A member the approved head left out is recorded `left_out` (not landed):
     the daemon queues its own review (Daemon.reconcile_tasks). Each member is judged once. Returns
     (member, "landed"|"left_out", why)."""
@@ -406,7 +434,8 @@ def landings(p, rec: dict) -> list[tuple[int, str, str]]:
         if not m or m["status"] != "done" or not isinstance(res, dict) or res.get("landed") or res.get("left_out") \
                 or (res.get("batch") or {}).get("id") != rec["id"]:
             continue
-        if sha := landed_sha(p, mid, since) or (landed_sha(p, mid, since, as_sha) if as_sha else ""):
+        own = _shas(res.get("commits"))
+        if sha := landed_sha(p, mid, since, commits=own) or (landed_sha(p, mid, since, as_sha, own) if as_sha else ""):
             res["landed"], st = sha, "landed"
             why = f"its own commit {sha[:10]} landed with batch {rec['id']}'s branch {branch}"
         else:
@@ -443,11 +472,12 @@ def prompt_block(p, lead: dict, members: list[dict], branch: str) -> str:
     ids = ", ".join(f"#{m['id']}" for m in members)
     lines = ["", "", f"## Batch run b{lead['id']}: you also do {ids}",
              f"This run takes task #{lead['id']} (above) and the {len(members)} small code task(s) below, in "
-             f"this order, in this worktree on branch `{branch}`. Commit each task separately, with a "
-             "`Task: #<id>` trailer line in its commit message (the lead's too). A task you cannot finish "
+             f"this order, in this worktree on branch `{branch}`. Commit each task separately (no task "
+             "numbers needed in commit messages) and list its commit ids. A task you cannot finish "
              "never fails the others: keep its commits off the branch (or revert them forward) and report it. "
              "Hand off one outcome per task, the lead included, as `members` in result.json and in any "
-             "`on_pass`: [{\"id\": <id>, \"status\": \"done\"|\"failed\"|\"blocked\", \"summary\": \"...\", "
+             "`on_pass`: [{\"id\": <id>, \"status\": \"done\"|\"failed\"|\"blocked\", \"commits\": [\"<sha>\"], "
+             "\"summary\": \"...\", "
              "\"reason\": \"why, if not done\", \"followups\": [...]}]. Your own `status` is the lead's. "
              "One check run and one review cover the whole branch: its head, every member's commit. A member "
              "counts as landed only once its own commit is on the push branch.",
@@ -456,7 +486,7 @@ def prompt_block(p, lead: dict, members: list[dict], branch: str) -> str:
              "gate (the tests the tasks touch, together), one device smoke if any task needs a device, never "
              "one per task. Where the batch delivers outside the push queue (a PR, or a push request through "
              "a relay or workstation queue), send one request carrying every task's commits and list each "
-             "task's `Task: #<id>` in it, never one request per task."]
+             "task's title in it, never one request per task."]
     for m in members:
         try:
             ctx = ctxblock.prompt_block(p, dict(m))
