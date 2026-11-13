@@ -47,7 +47,9 @@ or replace acceptance criteria with a review plugin's criteria.
    hardware. Resolve model directory as `models/autoports/<lowercase HF ID with non-alphanumeric
    characters replaced by underscores>`. Do not acquire hardware just because a plugin was installed.
    Record any serving-plugin interface change that the operator authorizes for this run.
-5. Keep the checkout, `CODEX_HOME`, runner logs and artifacts on persistent storage. Runtime model
+5. Keep the checkout, `CODEX_HOME`, runner logs and artifacts on persistent storage. Give each model ×
+   pipeline-version run its own fresh `CODEX_HOME` (copy only auth and config into it): the runner counts
+   a stage's tokens from that home's sessions and records how many sessions it held at launch. Runtime model
    changes belong in the target checkout; workflow fixes belong in this plugin. Changes to the
    TT vLLM plugin or vLLM follow [plugin changes](../vllm-integration/references/plugin-changes.md).
    Record exact commands, commits, hardware identity and evidence. Keep weights, credentials and

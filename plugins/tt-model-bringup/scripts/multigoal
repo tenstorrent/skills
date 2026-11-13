@@ -1494,6 +1494,12 @@ def main() -> int:
     codex_bin = (args.codex_bin or "codex") if args.dry_run else resolve_codex_bin(args.codex_bin)
     if args.resume_stage is None:
         write_manifest_header(manifest, repo, home, codex_bin, args, replacements, model_dir)
+        # One fresh CODEX_HOME per model x pipeline-version run keeps its sessions and tokens its own.
+        prior = sum(1 for _ in (home / "sessions").rglob("rollout-*.jsonl")) if (home / "sessions").is_dir() else 0
+        append_manifest(manifest, [f"codex_home_prior_sessions={prior}"])
+        if prior:
+            print(f"note: CODEX_HOME {home} already holds {prior} sessions; use a fresh home per model and "
+                  "pipeline version (a later stage of the same run may reuse it)", file=sys.stderr)
     elif model_dir and not manifest_values.get("model_dir"):
         append_manifest(manifest, [f"model_dir={model_dir}"])
 
