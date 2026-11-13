@@ -14,9 +14,12 @@ their working set, is critical without a recorded reason. Each degenerate reply 
 phase below its band needs an `anomalies` entry: a reproducible test with its served and full-precision
 results; a precision fix records the configs tried with speeds, picks the fastest passing one, re-measures
 its rate rows, and the phase's run uses it. Replies (scripts/reply_digest.py): the logging check before the first
-eval run passed (doc/agentic_evals/logging_check.json); every run has a reply digest; each failed task has a
-digest row and no capped or flagged reply is left unmapped; a task with a flagged (degenerate) reply has cause
-`anomaly` or a recorded reason (`flag_reasons`); all critical.
+eval run passed (doc/agentic_evals/logging_check.json); every scored phase run has a reply digest; each failed
+task has a digest row; a failed task with a flagged (degenerate) reply has cause `anomaly` or a recorded reason
+(`flag_reasons`); all critical. Advisory, because they are records the gate recomputes or signals rather than
+missing work: interval rounding, band_pass and phase pass that differ from the gate's, unmapped replies, flagged
+replies on solved tasks, digests of runs that are no phase run, the fastest-config choice, agents above
+max_num_seqs, stage-11 rows below their prediction. A crash exits 2, never Python's 1.
 Exit 0 pass, 1 advisory, 2 critical, 3 error.
 """
 from __future__ import annotations
@@ -216,7 +219,7 @@ def check_rates(model_dir: Path, evidence: dict, problems: list, full: bool) -> 
         else:
             low = predicted.get("decode_tok_s_user_low", predicted.get("decode_tok_s_user"))
             if row["decode_tok_s_user"] < low and not row.get("cause"):
-                problems.append((2, f"serving_rates.json {name} is below its predicted range with no recorded cause"))
+                problems.append((1, f"serving_rates.json {name} is below its predicted range with no recorded cause"))
     check_anomaly_record(model_dir, problems)
     release = rates.get("release_rows")
     if not (isinstance(release, list) and release and rates.get("release_source")):
@@ -270,7 +273,7 @@ def check_run(run: dict, inputs: dict, validated: list, collected: set, item: st
     low, high = wilson(solved, n)
     if not (isinstance(interval, list) and len(interval) == 2 and all(number(v) for v in interval)
             and abs(interval[0] - low) <= 1 and abs(interval[1] - high) <= 1):
-        problems.append((2, f"run {name} interval_95 {interval} is not the Wilson interval "
+        problems.append((1, f"run {name} interval_95 {interval} is not the Wilson interval "
                             f"[{low:.1f}, {high:.1f}] for {solved}/{n}"))
     failures = [row for row in run.get("failures") or [] if isinstance(row, dict)]
     limits = (run.get("config") or {}).get("limits") or {}
@@ -308,8 +311,9 @@ def check_run(run: dict, inputs: dict, validated: list, collected: set, item: st
         problems.append((2, f"run {name} reference needs its own reasoning setting (or \"unknown\")"))
     percent, ref, band = 100 * solved / n, reference["value"], inputs.get("ok_band")
     band_pass = (percent >= ref - band) if number(band) else (low <= ref <= high or ref <= percent)
+    run["_band_pass"] = band_pass  # the gate's own value; check_anomalies uses it
     if run.get("band_pass") is not band_pass:
-        problems.append((2, f"run {name} band_pass is {run.get('band_pass')}; the gate computes {band_pass}"))
+        problems.append((1, f"run {name} band_pass is {run.get('band_pass')}; the gate computes {band_pass}"))
     if not band_pass:
         problems.append((1, f"run {name} scored {percent:.1f}% against reference {ref} "
                             f"(interval {low:.1f}-{high:.1f}); not passed yet"))
@@ -349,7 +353,7 @@ def check_anomalies(results: dict, runs: dict, phases: dict, inputs: dict, probl
                                     "(phase, tasks) with a reproducible test"))
     for phase, record in phases.items():
         run = runs.get((record or {}).get("run")) or {}
-        if run.get("band_pass") is False and not any(e.get("phase") == phase for e in entries):
+        if run.get("_band_pass", run.get("band_pass")) is False and not any(e.get("phase") == phase for e in entries):
             unmet(problems, inputs, phase, f"{phase} is below its band with no anomalies entry (fix attempt)")
     for entry in entries:
         name = f"anomalies entry {entry.get('phase')} {entry.get('tasks')}"
@@ -370,7 +374,7 @@ def check_anomalies(results: dict, runs: dict, phases: dict, inputs: dict, probl
             continue
         fastest = max((t for t in tried if t["pass"]), key=lambda t: t["decode_tok_s_user"], default={})
         if entry["chosen"] != fastest.get("config"):
-            problems.append((2, f"{name} chose {entry['chosen']!r}; the fastest passing config tried is "
+            problems.append((1, f"{name} chose {entry['chosen']!r}; the fastest passing config tried is "
                                 f"{fastest.get('config')!r}"))
         if not entry.get("remeasured_rows"):
             problems.append((2, f"{name}: re-measure the stage-11 rows the eval uses at {entry['chosen']!r} "
@@ -395,15 +399,16 @@ def check_logging(model_dir: Path, problems: list) -> None:
                             "before any eval run"))
 
 
-def check_digests(model_dir: Path, runs: dict, problems: list) -> None:
-    """Every run has a reply digest (reply_digest.py summary.json); each failed task has a digest row; no capped or
-    flagged reply is left without a task; a task with a flagged reply has cause `anomaly` or a recorded reason."""
+def check_digests(model_dir: Path, runs: dict, scored: set, problems: list) -> None:
+    """Every scored phase run has a reply digest (reply_digest.py summary.json; other runs: advisory); each failed task
+    has a digest row; a failed task with a flagged reply has cause `anomaly` or a recorded reason. A flagged reply on a
+    solved task, or capped or flagged replies mapped to no task, are reported (advisory)."""
     for name, run in runs.items():
         folder = model_dir / (run.get("digest") or EVALS / "current" / str(name) / "digest")
         summary = folder / "summary.json"
         if not summary.is_file():
-            problems.append((2, f"run {name} has no reply digest ({summary}); run reply_digest.py on its server log "
-                                "and per-call accounting"))
+            problems.append((2 if name in scored else 1, f"run {name} has no reply digest ({summary}); run "
+                                "reply_digest.py on its server log and per-call accounting"))
             continue
         data = read(summary, problems)
         tasks = {str(k): v for k, v in (data.get("tasks") or {}).items() if isinstance(v, dict)}
@@ -417,14 +422,18 @@ def check_digests(model_dir: Path, runs: dict, problems: list) -> None:
                 problems.append((2, f"run {name}: failed task {task!r} has no model calls mapped in its digest; map its "
                                     "replies through the per-call accounting"))
         if unmapped and not run.get("unmapped_reason"):
-            problems.append((2, f"run {name}: {len(unmapped)} capped or flagged replies map to no task in the digest; "
+            problems.append((1, f"run {name}: {len(unmapped)} capped or flagged replies map to no task in the digest; "
                                 "map them (per-call accounting) or record unmapped_reason"))
         reasons = run.get("flag_reasons") or {}
         for task, digest in tasks.items():
             if not digest.get("flagged"):
                 continue
-            row = failures.get(task) or {}
-            if row.get("cause") != "anomaly" and not (reasons.get(task) or row.get("flag_reason")):
+            row = failures.get(task)
+            if row is None:  # solved despite a degenerate reply: still a precision signal, not a missing record
+                if not reasons.get(task):
+                    problems.append((1, f"run {name}: solved task {task!r} has {digest['flagged']} flagged (degenerate) "
+                                        "replies; an anomaly signal for the precision check"))
+            elif row.get("cause") != "anomaly" and not (reasons.get(task) or row.get("flag_reason")):
                 problems.append((2, f"run {name}: task {task!r} has {digest['flagged']} flagged (degenerate) replies "
                                     "but cause is not `anomaly`; record the anomaly or the reason (flag_reasons)"))
 
@@ -460,7 +469,7 @@ def check_config(run: dict, validated: list, problems: list) -> None:
         problems.append((2, f"run {name} config needs agents, batch and max_num_seqs"))
     else:
         if agents > seqs:
-            problems.append((2, f"run {name}: {agents} agents against max_num_seqs {seqs}; the rest queue"))
+            problems.append((1, f"run {name}: {agents} agents against max_num_seqs {seqs}; the rest queue"))
         expected = min((b for b in validated if b >= agents), default=max(validated, default=batch))
         if batch != expected and not config.get("batch_reason"):
             problems.append((1, f"run {name}: {agents} agents on batch {batch}; the smallest validated batch "
@@ -510,15 +519,15 @@ def check_evals(model_dir: Path, inputs: dict, evidence: dict, problems: list) -
         all_passed = all_passed and passed
         record = phases.get(phase) or {}
         if record.get("pass") is not passed:
-            problems.append((2, f"{phase} pass is {record.get('pass')}; the gate computes {passed}"))
-        elif not passed and not record.get("reason"):
+            problems.append((1, f"{phase} pass is {record.get('pass')}; the gate computes {passed}"))
+        if record.get("pass") is False and not record.get("reason"):
             problems.append((2, f"{phase} is not passed yet; results.json phases.{phase}.reason must say why"))
     for run in runs.values():
         if run.get("voided") or run.get("excluded"):
             problems.append((2, f"run {run.get('id')} is voided or excluded; void per task, never the list"))
     check_anomalies(results, runs, phases, inputs, problems)
     check_logging(model_dir, problems)
-    check_digests(model_dir, runs, problems)
+    check_digests(model_dir, runs, {(record or {}).get("run") for record in phases.values()}, problems)
     if mode == "extended":
         limit = inputs.get("run_timeout_hours", DEFAULT_RUN_TIMEOUT_HOURS)
         estimates = results.get("estimates") or {}
@@ -574,4 +583,15 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except SystemExit:
+        raise
+    except Exception as exc:  # noqa: BLE001 - a crash must not read as advisory (Python's exit 1) and hide criticals
+        # Critical, not 3: most crashes come from a malformed record the stage can fix in remediation; a checker
+        # defect then still ends the stage critical instead of passing.
+        import traceback
+        traceback.print_exc()
+        print(f"CRITICAL: the checker crashed ({type(exc).__name__}: {exc}); a record is malformed (traceback above) "
+              "or the checker has a defect", file=sys.stderr)
+        raise SystemExit(2)

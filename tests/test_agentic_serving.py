@@ -303,11 +303,11 @@ def test_recorded_pass_must_agree_with_the_gate(tmp_path):
     assert code == 2 and 'band_pass is True' in stderr
 
 
-def test_interval_must_be_wilson(tmp_path):
+def test_interval_not_wilson_is_advisory(tmp_path):
     run = scored_run()
     run['score']['interval_95'] = [55.0, 85.0]
     code, stderr = goal12(tmp_path, runs=[run])
-    assert code == 2 and 'Wilson' in stderr
+    assert code == 1 and 'Wilson' in stderr
 
 
 def test_a_voided_list_is_critical(tmp_path):
@@ -534,7 +534,7 @@ def test_stage_11_row_left_by_the_budget_is_advisory_when_listed(tmp_path):
 def test_stage_11_row_below_prediction_needs_a_cause(tmp_path):
     data = rates()
     data['rows'][0]['decode_tok_s_user'] = 10.0
-    assert benchmark(tmp_path, data)[0] == 2
+    assert benchmark(tmp_path, data)[0] == 1
     data['rows'][0]['cause'] = 'host contention during the long prefill'
     assert benchmark(tmp_path, data) == (0, '')
 
@@ -682,11 +682,11 @@ def test_failed_task_with_no_mapped_calls_is_critical_unless_infrastructure(tmp_
     assert goal12(tmp_path, runs=[run]) == (0, '')
 
 
-def test_capped_reply_mapped_to_no_task_is_critical_without_a_reason(tmp_path):
+def test_capped_reply_mapped_to_no_task_is_advisory_without_a_reason(tmp_path):
     run = scored_run()
     write_digest(tmp_path, run, unmapped=['chatcmpl-dropped'])
     code, stderr = goal12(tmp_path, runs=[run])
-    assert code == 2 and 'map to no task' in stderr
+    assert code == 1 and 'map to no task' in stderr
     run['unmapped_reason'] = 'replies of the stage-11 smoke run on the same server'
     assert goal12(tmp_path, runs=[run]) == (0, '')
 
@@ -749,3 +749,36 @@ def test_a_limit_the_suite_does_not_have_may_be_absent(tmp_path):
     assert goal12(tmp_path, runs=[run]) == (0, '')
     del limits['reference']['request_timeout_s']                            # recorded on one side only
     assert goal12(tmp_path, runs=[run])[0] == 2
+
+
+def test_recomputed_marks_and_queueing_are_advisory(tmp_path):
+    run = scored_run()
+    run['band_pass'] = False                                   # the gate computes True
+    run['config']['max_num_seqs'] = 4                          # 8 agents: the rest queue
+    code, stderr = goal12(tmp_path, runs=[run])
+    assert code == 1 and 'gate computes True' in stderr and 'queue' in stderr
+
+
+def test_flagged_reply_on_a_solved_task_is_advisory(tmp_path):
+    run = scored_run()
+    solved = run['tasks']['names'][-1]
+    write_digest(tmp_path, run, flagged=[solved])
+    code, stderr = goal12(tmp_path, runs=[run])
+    assert code == 1 and 'solved task' in stderr
+
+
+def test_digest_of_a_run_that_is_no_phase_run_is_advisory(tmp_path):
+    extra = scored_run(run_id='gpqa10-thinking-off')
+    runs = [scored_run(), extra]
+    goal12(tmp_path, runs=runs)
+    import shutil
+    shutil.rmtree(tmp_path / 'doc/agentic_evals/current/gpqa10-thinking-off')
+    code, stderr = goal12(tmp_path, runs=runs, digests=False)
+    assert code == 1 and 'gpqa10-thinking-off has no reply digest' in stderr
+
+
+def test_a_checker_crash_is_critical_not_advisory(tmp_path):
+    goal12(tmp_path)
+    (tmp_path / 'doc/agentic_evals/results.json').write_text(json.dumps({'runs': [scored_run()], 'phases': {'phase1': 'gpqa10'}}))
+    code, stderr = check(tmp_path, 'agentic-evals', evidence(), {'mode': 'quick'})
+    assert code == 2 and 'checker crashed' in stderr
