@@ -499,6 +499,8 @@ USER_SETTABLE = {
     "checks.spill_beside_device": lambda v: checkspill.beside_of(v),
     # Strikes in a row (spilled runs failing where the head passes elsewhere) that quarantine a spill host.
     "checks.spill_quarantine_after": lambda v: checkspill.quarantine_after_of(v),
+    # At most this many of the project's checks on one spill host at once (a suite that serializes per host).
+    "checks.spill_runs_per_host": lambda v: checkspill.runs_per_host_of(v),
     # Each check run in a throwaway HOME (scratchhome; default true), and the files copied into it.
     "checks.scratch_home": lambda v: scratchhome.settings({"checks": {"scratch_home": v}})[0],
     "checks.home_files": lambda v: scratchhome.settings({"checks": {"home_files": v}})[1],

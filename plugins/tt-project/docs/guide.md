@@ -2233,7 +2233,8 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   failing tests alone. `ttp status` and the daily
   review show the landing check time (median and p90, last 24 h and last 10 runs); over
   `checks.smoke_max_s` (default 600 s) the project's coordinator gets one observation a day naming the
-  slowest tests (push-checks reference, "Smoke before landing"). `ttp status` also shows the waits:
+  slowest tests (push-checks reference, "Smoke before landing"). The time judged is each run less the waits
+  the harness recorded in it (`ttp lock` waits, a checks slot taken mid-run). `ttp status` also shows the waits:
   checks wait to start and approval to landed (median and p90, last 24 h).
 - Short path (`ttp express <task|head> --why "<why>"`): a small urgent change lands alone, now,
   instead of waiting for the next push queue batch. It is allowed, without a model, only when an
@@ -2675,6 +2676,9 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   or here, and its log says so beside the hung test's stack; one such hang after a host fault still moves on once.
   A run whose failures the tests gate (below) proved new on that spill host, the base passing them there, fails
   at once instead: the host is ruled out, so a rerun would only fail again while holding a slot.
+  A host already running one of the project's own checks ranks after the spill hosts running none;
+  `checks.spill_runs_per_host` (a whole number from 1; unset: no limit) keeps a host at that many of
+  the project's checks at once, for a suite that serializes per host.
   A host whose own environment keeps failing runs is quarantined, per project and model-free: a spilled failure
   (never a host fault, exit 75, nor a timeout) is a strike against its host once the same commit then passes
   elsewhere (here or on another spill host); a pass there resets its strikes. After `checks.spill_quarantine_after`

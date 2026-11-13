@@ -1882,6 +1882,8 @@ def pick(p, cfg: dict, tell, what: str = "", off: str = "", why_here: str = "") 
     # most free slots less this machine's claims not yet running there (_inflight), then the most test
     # workers it would get there (workers_why); ties keep the spread order above.
     probed = _probe_all([(host, beside) for _, _, host, why, _, _, beside in gated if not why])
+    per = runs_per_host(cfg)
+    own = lambda host: sum(1 for r in mine if r.get("host") == host and r.get("project") == p.name)   # noqa: E731
     cands = []
     for i, (alias, machine, host, why, usable, dev, beside) in enumerate(gated):
         free, note, size, lim = 0, "", (0, ""), limits(cfg, alias)
@@ -1889,6 +1891,8 @@ def pick(p, cfg: dict, tell, what: str = "", off: str = "", why_here: str = "") 
             free, why, note = probed[host]
             if not why and "max_runs" in lim and (free := min(free, lim["max_runs"] - _ours(host))) <= 0:
                 why = f"its max_runs {lim['max_runs']} of this machine's checks run there already"
+            if not why and per and (n := own(host)) >= per:
+                why = f"{n} of this project's checks run there already (checks.spill_runs_per_host {per})"
             if why.startswith(DEVICE_WHY):
                 _note_skip(host, why, p.name)
             if note.startswith(DEVICE_WHY):
@@ -1898,8 +1902,10 @@ def pick(p, cfg: dict, tell, what: str = "", off: str = "", why_here: str = "") 
         dev = dev[len(DEVICE_WHY):] if dev.startswith(DEVICE_WHY) else dev
         cands.append((alias, machine, host, why, usable, dev, free, note, size, i))
     first = [c for c in cands if not c[3]]
-    # The hosts that cannot take it go first, only to be told as skipped; then the free ones, most free first.
-    order = [c for c in cands if c[3]] + sorted(first, key=lambda c: (-(c[6] - _inflight(c[2])), -c[8][0], c[9]))
+    # The hosts that cannot take it go first, only to be told as skipped; then the free ones: those running none
+    # of this project's checks (a suite may serialize per host), then the most free.
+    order = [c for c in cands if c[3]] + sorted(first, key=lambda c: (own(c[2]) > 0, -(c[6] - _inflight(c[2])),
+                                                                      -c[8][0], c[9]))
     for alias, machine, host, why, usable, dev, free, note, size, _ in order:
         if not why and (got := _claim(host, free, {**rec, "host": host,
                                                    **({"beside": dev[:300]} if dev else {})})) is not None:
@@ -2156,6 +2162,32 @@ KNOWN_GOOD_RETRY_S = 3600   # a known-good run that failed there starts again af
 CONFIG_WINDOW_S = 3600   # one failure on CONFIG_FAULT_HOSTS hosts within this, no spilled pass between: a config fault
 CONFIG_FAULT_HOSTS = 2
 FAILS_KEPT = 100
+
+
+RUNS_KEY = "spill_runs_per_host"   # checks.spill_runs_per_host: this project's checks one spill host takes at once
+
+
+def runs_per_host_of(v: Any) -> int:
+    """checks.spill_runs_per_host as set: a whole number from 1, else ValueError."""
+    why = "checks.spill_runs_per_host is a whole number of runs, 1 or more"
+    try:
+        n = int(str(v).strip())
+    except ValueError:
+        raise ValueError(why) from None
+    if n < 1 or isinstance(v, bool) or isinstance(v, float) and v != n:
+        raise ValueError(why)
+    return n
+
+
+def runs_per_host(cfg: dict | None) -> int:
+    """checks.spill_runs_per_host: at most this many of the project's checks run on one spill host at once (a
+    suite that serializes per host waits there otherwise); unset or malformed: 0, no limit."""
+    checks = (cfg or {}).get("checks")
+    v = checks.get(RUNS_KEY) if isinstance(checks, dict) else None
+    try:
+        return runs_per_host_of(v) if v is not None else 0
+    except ValueError:
+        return 0
 
 
 def quarantine_after_of(v: Any) -> int:

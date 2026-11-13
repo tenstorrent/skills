@@ -916,6 +916,8 @@ def _known_keys(path: list[str]) -> set[str] | None:
         # spill_wrap_cmd: the wrapper a check runs behind on a spill host (push.spill_wrap_of; default "", none).
         # spill_beside_device: spill hosts a device job keeps no spill off (checkspill.beside_device; default none).
         # spill_quarantine_after: strikes in a row that quarantine a spill host (checkspill.strike_settle; default 3).
+        # spill_runs_per_host: the project's checks one spill host takes at once (checkspill.runs_per_host; default
+        # none: no limit).
         # cpu_quota, busy_cpu_quota, busy_probe, busy_probe_s, cpu_cgroup: the CPU-quota group checks run in (cpuquota).
         # python_lock: the pinned requirements file the checks' Python env is built from, relative to the
         # checkout (runnerenv.lock_of; default "", the plugin's own lock of pytest and pytest-xdist).
@@ -925,7 +927,7 @@ def _known_keys(path: list[str]) -> set[str] | None:
         # scratch_home: each check run gets a throwaway HOME (scratchhome; default true); home_files: the
         # non-secret files under HOME copied into it (scratchhome.settings; default [".gitconfig"]).
         return {"refuse_sudo", "nice", "python_lock", "scratch_home", "home_files", "ionice", "wall_cap_s", "wrap_cmd", "wrap_lane", "wrap_needs_device", "spill_wrap_cmd",
-                "spill_beside_device", "spill_pre_cmd", "spill_quarantine_after", "fallback_lane", "no_device_cmds", "slots", "light_cmds", "max_wait_s", "wait_event_s",
+                "spill_beside_device", "spill_pre_cmd", "spill_quarantine_after", "spill_runs_per_host", "fallback_lane", "no_device_cmds", "slots", "light_cmds", "max_wait_s", "wait_event_s",
                 "wait_escalate_s", "wait_hang_factor", "priority_age_s", "test_project_max", "test_project_slots",
                 "test_project_workers", "test_run_max", "test_run_min",
                 "done_holder_flag_s", "done_holder_grace_s", "stall_s", "push_load_wait_s",

@@ -190,7 +190,7 @@ def _checks(p: Project, wt: Path, new: str, base: str, say: Callable[[str], None
                 if rc != BUSY:
                     say(f"check failed on {new[:10]}: {cmd}{push.where(cmd)}; not landing")
                 return rc
-    push.record_check_s(p, time.time() - started)
+    push.record_check_s(p, time.time() - started, push.gatetime.lock_waits(env.get("TTP_RUN_DIR"), started))
     return 0
 
 

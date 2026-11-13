@@ -2649,14 +2649,20 @@ class Batch:
         suite_out: list[str] = []
         claims: list = []   # spill host claims (_spill), closed with the slot
         run = [(c2, eid, parts) for c2, (_, eid, parts) in zip(self._spill([c for c, _, _ in run], head, claims), run)]
-        slot, held = self._no_slot(), [False]   # the host-wide slot, taken only for what runs here
+        slot, held, waited = self._no_slot(), [False], [0.0]   # the host-wide slot, taken only for what runs here
 
         def here(slot):   # `slot`, or the host-wide slot once a check (or a spilled one's reruns) runs here
             if held[0]:
                 return slot
             slot.close()
-            held[0] = True
-            return self._slot(head)
+            held[0], t0 = True, time.time()
+            try:
+                return self._slot(head)
+            finally:
+                waited[0] += time.time() - t0   # its wait is no check time (gatetime.record)
+
+        def waits():
+            return waited[0] + gatetime.lock_waits(env.get("TTP_RUN_DIR"), started)
         light = checklane.light_patterns(self.p.config())
 
         def own(cmd, slot):   # a check on its own host or a light one here (`claude plugin validate`) takes no
@@ -2706,7 +2712,7 @@ class Batch:
                         self._passed(cmd)
                         continue
                     if not reused:   # a failing run held the landing as long as a passing one: gatetime flags both
-                        gatetime.record(self.p.state, time.time() - started)
+                        gatetime.record(self.p.state, time.time() - started, wait_s=waits())
                     self.unrun[tail] = [str(_here(c)) for c, _, _ in run[n + 1:]]
                     return cmd, tail
                 self._passed(cmd)
@@ -2719,7 +2725,7 @@ class Batch:
             for claim in claims:
                 claim.close()
             self._spent(started, cpu0)
-        push.record_check_s(self.p, time.time() - started)
+        push.record_check_s(self.p, time.time() - started, waits())
         for line in slowtests.lines(slow) if slow else []:
             say(line)
         try:

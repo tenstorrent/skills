@@ -2160,7 +2160,7 @@ def test_every_checks_key_the_runtime_reads_is_an_account_key_and_settable(env):
     # and its checks' throwaway HOME (scratchhome)
     # and its own notice that its push checks run only a pytest subset (gatetime.subset_flag)
     read -= {"wrap_cmd", "spill_wrap_cmd", "wrap_lane", "fallback_lane", "spill_beside_device", "python_lock",
-             "spill_quarantine_after", "refuse_sudo", "scratch_home", "home_files", "subset_flag"}
+             "spill_quarantine_after", "spill_runs_per_host", "refuse_sudo", "scratch_home", "home_files", "subset_flag"}
     # a chat-only alias of checks.slots (coordinator.ALIASES), not a key the runtime reads
     read -= {"suite_concurrency"}
     assert "wrap_cmd" in project._known_keys(["checks"])

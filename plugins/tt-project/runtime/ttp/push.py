@@ -3751,11 +3751,12 @@ def last_check_s(p: Project) -> float | None:
     return float(v) if ok else None
 
 
-def record_check_s(p: Project, seconds: float) -> None:
-    """Runs between passing checks and the push, so a failed write is logged and never stops it."""
+def record_check_s(p: Project, seconds: float, wait_s: float = 0.0) -> None:
+    """Runs between passing checks and the push, so a failed write is logged and never stops it. `wait_s`: the
+    waits inside it (gatetime.record)."""
     try:
         write_json(p.state / TIMINGS, {"last_s": round(seconds, 1), "at": time.time()})
-        gatetime.record(p.state, seconds)
+        gatetime.record(p.state, seconds, wait_s=wait_s)
     except OSError as e:
         print(f"ttp push: could not record the check time in {p.state / TIMINGS}: {e}", file=sys.stderr)
 
@@ -4359,7 +4360,7 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
                         say(f"check failed on {head[:10]}: {cmd}{where(cmd)}; not pushing")
                     return rc
         if todo and timed and not excused:
-            timed(time.time() - started)
+            timed(time.time() - started, gatetime.lock_waits(env.get("TTP_RUN_DIR"), started))
         if _git(repo, "rev-parse", "HEAD").stdout.strip() != head:
             say(f"HEAD moved off {head[:10]} during the checks; not pushing")
             return REFUSED
@@ -4696,7 +4697,7 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
                         say(f"check failed on {head[:10]}: {cmd}{where(cmd)}; not pushing")
                     return rc
         if run and not carried and timed and not excused:
-            timed(time.time() - started)
+            timed(time.time() - started, gatetime.lock_waits(env.get("TTP_RUN_DIR"), started))
         # A check the tests gate excused did not pass: no later round carries it.
         passes = {str(cmd): (tip, head) for cmd in todo if str(cmd) not in excused}
         steps.go("push", check=True)
@@ -5252,14 +5253,14 @@ def _run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None
         lease, start = rebase is not None, worktree.rebase_start(repo, rebase["id"]) if rebase else ""
         start_ref = f"{worktree.REBASE_START_REF}{rebase['id']}" if rebase else ""
         rc = publish(repo, remote, branch, checks, hold=lambda: take(p, remote, branch, wait_s),
-                     timed=lambda s: record_check_s(p, s), base=base,
+                     timed=lambda s, w=0.0: record_check_s(p, s, w), base=base,
                      ff_only=own_ff_only(branch) and not lease, lease=lease, start=start, start_ref=start_ref,
                      recorded=recorded or recorded_checks(os.environ.get("TTP_RUN_DIR")), check_run_dir=output,
                      reuse=lambda tree, cmds, envs, parts: _own_pass(p, tree, cmds, envs, parts), host=d.get("checks_host") or "",
                      never_force=never_force_on(p.config()), cfg=p.config(), p=p)
     else:
         rc = push(repo, remote, branch, checks, rounds, hold=lambda: take(p, remote, branch, wait_s),
-                  version_bump=version_bump, timed=lambda s: record_check_s(p, s),
+                  version_bump=version_bump, timed=lambda s, w=0.0: record_check_s(p, s, w),
                   exclude=exclude_list(d.get("push_exclude_paths")), allow=allow_protected(d), check_run_dir=output,
                   guard=version_guard(d), landed=landed_heads(p.db))
         if rc == 0 and last_pushed and (also := fast_forward_list(d.get("fast_forward_also"))):

@@ -8,7 +8,10 @@ never holding the queue.
 
 - Record: each passing push check run's wall time is one row of LOG under the project's state (record(),
   from push.record_check_s), the newest KEEP rows kept; so is each failing run of a batch (batch.py), since
-  it held the landing as long: a slow suite that keeps failing is flagged too.
+  it held the landing as long: a slow suite that keeps failing is flagged too. A row keeps the waits the harness
+  recorded inside the run (`ttp lock` waits of its checks, a checks slot taken mid-run) apart, and the time
+  measured below is the run less them: a run slow only from waiting queues no speed-up task. A check script that
+  serializes per host takes its lock through `ttp lock` (or the project sets checks.spill_runs_per_host).
 - Measure (stats()): median and p90 over the last 24 h and over the last LAST_N runs. `ttp status` and the
   daily review show it (status_line()).
 - Flag (flag(), each daemon pass, model-free): once the median of the last LAST_N runs is over
@@ -60,8 +63,10 @@ _SUBSET = re.compile(r"\bpytest\b.*?\s-([mk])(?:[\s=]|(?=\S))")
 _DURATION = re.compile(r"^(?:ttp-suite:)?\s*(\d+(?:\.\d+)?)s\s+(?:(?:call|setup|teardown)\s+)?(\S+::\S+)", re.M)
 
 
-def record(state: Path | None, seconds: float, now: float | None = None, log: str = LOG) -> None:
-    """Keep one push check run's wall time (or, in WAIT_LOG, one wait); a failed write only loses a sample."""
+def record(state: Path | None, seconds: float, now: float | None = None, log: str = LOG, wait_s: float = 0.0) -> None:
+    """Keep one push check run's wall time (or, in WAIT_LOG, one wait); a failed write only loses a sample.
+    `wait_s`: the waits the harness recorded inside it (lock_waits, a checks slot taken mid-run), which _rows
+    takes off: a run slow only from waiting is no slow suite."""
     if state is None or seconds is None or seconds < 0 or not seconds and log == LOG:
         return
     path = Path(state) / log
@@ -70,9 +75,30 @@ def record(state: Path | None, seconds: float, now: float | None = None, log: st
             lines = path.read_text().splitlines()
             if len(lines) > KEEP:
                 durable_write(path, "".join(f"{x}\n" for x in lines[-KEEP:]))
-        durable_append(path, json.dumps({"ts": time.time() if now is None else now, "s": round(seconds, 1)}) + "\n")
+        row = {"ts": time.time() if now is None else now, "s": round(seconds, 1)}
+        if wait_s and wait_s > 0:
+            row["wait"] = round(min(wait_s, seconds), 1)
+        durable_append(path, json.dumps(row) + "\n")
     except OSError:
         pass
+
+
+def lock_waits(run_dir: str | Path | None, start: float, end: float | None = None) -> float:
+    """Seconds of `ttp lock` waits recorded in `run_dir` (the checks' TTP_RUN_DIR) between `start` and `end`
+    (default now), overlapping waits counted once; 0 when none or unreadable."""
+    from . import locks
+    end = time.time() if end is None else end
+    try:
+        spans = sorted((max(a, start), min(end if b is None else b, end)) for a, b in locks.wait_spans(Path(run_dir))) \
+            if run_dir else []
+    except (OSError, TypeError, ValueError):
+        return 0.0
+    total, reach = 0.0, start
+    for a, b in spans:
+        if b > max(a, reach):
+            total += b - max(a, reach)
+            reach = b
+    return total
 
 
 def record_wait(state: Path | None, seconds: float, now: float | None = None) -> None:
@@ -89,7 +115,7 @@ def _rows(state: Path | None, log: str = LOG) -> list[tuple[float, float]]:
     for line in lines:
         try:
             r = json.loads(line)
-            ts, s = float(r["ts"]), float(r["s"])
+            ts, s = float(r["ts"]), max(0.0, float(r["s"]) - float(r.get("wait") or 0))
         except (ValueError, KeyError, TypeError):
             continue
         if s > 0 or s == 0 and log != LOG:

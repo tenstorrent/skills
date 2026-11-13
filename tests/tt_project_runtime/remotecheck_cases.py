@@ -6001,3 +6001,36 @@ def test_spill_host_observations_honour_an_observation_mute(env, tmp_path, monke
     checkspill._event(p.db, now, "spill-health:normal", "normal", "Spill host down failed its health check (boom)")
     assert status("spill-health:normal") == "queued"
     assert [m["count"] for m in p.db.kv(screen.MUTES_KEY) if m["match"] == "Spill host"] == [1]
+
+
+def test_a_second_run_of_a_project_spills_to_a_host_free_of_its_checks_and_spill_runs_per_host_caps_one(
+        env, tmp_path, monkeypatch):
+    """Upstream note f04d7469ee4f9032: a project's suite may serialize per host, so a second run went to the
+    host already running its check (the freer one) and waited there while another sat idle. A host free of
+    the project's checks now ranks first; checks.spill_runs_per_host 1 also keeps a host at one of its runs."""
+    from ttp import checkspill, coordinator
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"])
+    free = {"check-host-a": 8, "check-host-b": 2}
+    monkeypatch.setattr(checkspill, "_probe_all", lambda items: {h: (free[h], "", "") for h, _ in items})
+    monkeypatch.setattr(checkspill, "_inflight", lambda host: 0)
+    told: list[str] = []
+    first = checkspill.pick(p, p.config(), told.append, "pytest -q")
+    try:
+        assert first is not None and first.host == "check-host-a", told
+        second = checkspill.pick(p, p.config(), told.append, "pytest -q")
+        assert second is not None and second.host == "check-host-b", told
+        second.close()
+        p.set_config("checks.spill_runs_per_host", 1)
+        free["check-host-b"] = 0   # b full: a would take a second run without the limit
+        assert checkspill.pick(p, p.config(), told.append, "pytest -q") is None
+        assert "1 of this project's checks run there already (checks.spill_runs_per_host 1)" in told[-1], told
+    finally:
+        first.close()
+    again = checkspill.pick(p, p.config(), told.append, "pytest -q")
+    assert again is not None and again.host == "check-host-a"
+    again.close()
+    assert checkspill.runs_per_host({}) == 0 and checkspill.runs_per_host({"checks": {"spill_runs_per_host": "x"}}) == 0
+    for bad in (0, -1, "two", True, 1.5):
+        with pytest.raises(ValueError):
+            coordinator.USER_SETTABLE["checks.spill_runs_per_host"](bad)
+    assert coordinator.USER_SETTABLE["checks.spill_runs_per_host"]("2") == 2

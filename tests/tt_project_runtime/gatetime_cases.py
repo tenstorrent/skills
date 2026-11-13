@@ -550,3 +550,27 @@ def test_checks_to_start_counts_the_host_slot_wait_the_queue_wait_marks_count(en
         for slot, s in rows))
     line = gatetime.waits_line(p.db, p.state, now, landed=False)
     assert line == "waits (24 h): checks to start median 40 min, p90 50 min (3 runs)", line
+
+
+def test_a_push_check_slow_only_from_waiting_queues_no_speed_up_task(env, tmp_path):
+    """Upstream note f04d7469ee4f9032: a speed-up task was queued for a check that waited 600 s on a lock and
+    tested for 206 s. The waits the harness records inside a run (`ttp lock` in its run dir, a slot taken
+    mid-run) come off its time before the smoke limit is judged; a run slow from its tests is still flagged."""
+    from ttp import gatetime, locks, push
+    p = make(env)
+    now = time.time()
+    run = tmp_path / "checks-run"
+    run.mkdir()
+    locks.record_wait(run, "lock:suite", now - 900, now - 300)   # 600 s waiting for a lock
+    locks.record_wait(run, "lock:other", now - 800, now - 700)   # overlaps it: counted once
+    locks.record_wait(run, "lock:before", now - 2000, now - 1900)   # before the run: not its wait
+    assert abs(gatetime.lock_waits(run, now - 1000, now) - 600) < 1
+    assert gatetime.lock_waits(None, now - 1000) == 0 and gatetime.lock_waits(tmp_path / "none", now - 1000) == 0
+    for i in range(10):
+        gatetime.record(p.state, 810 + i, now=now - 100 + i, wait_s=600)
+    assert gatetime.stats(p.state, now)["last"]["median_s"] < 300
+    assert gatetime.flag(p.db, p.state, {}, None, now) == ""
+    assert not p.db.q("SELECT id FROM tasks WHERE labels LIKE '%\"test_speed\"%'")
+    for i in range(10):
+        push.record_check_s(p, 700 + i, wait_s=30)   # slow from its tests: flagged
+    assert "Queued test speed-up task" in gatetime.flag(p.db, p.state, {}, None, time.time())
