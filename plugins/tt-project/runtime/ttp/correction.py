@@ -15,7 +15,9 @@ while something says the project is stuck (`open_stall`: a stall event or a Cour
 correction still without a class fix is not one, or it would flag every later message, and neither is
 Resource trouble, a machine fault rather than a miss). A relayer's own findings (kind 'finding') and a
 relay re-send (`resends`: the same words delivered twice within RESEND_S, or relayed again with
-context) are never flagged: neither is the user saying something again. The digest tags the message
+context) are never flagged: neither is the user saying something again. A routine report (`report`:
+a push acknowledgment or another status line naming a commit) asks for nothing and is never a repeat,
+however alike two of them are. The digest tags the message
 `[likely correction: <why>]`. After the turn (`settle`), each flagged message is recorded with its
 class fix: a `harness` task (or one titled `upstream: ...`) the turn added, or the turn's `summary`
 naming `correction #<id>` with its reason. A repeated request (`request`: 'I told you', 'N times',
@@ -113,6 +115,13 @@ REJECTS = ("that's wrong", "that is wrong", "is wrong", "was wrong", "not true",
            "incorrect", "that's not", "that is not", "you said", "you claimed", "you reported", "you wrote",
            "but you", "no, ", "nope", "actually,")
 QUOTE_WORDS = 3
+# A routine report (`report`): every line only states what happened, machine-shaped, and names a commit:
+# a push acknowledgment ('pushed <sha> to <branch> (fast-forward of <sha>; ...)', 'ttp push: not
+# pushed ...') or another status line. Two of them share their shape, not a request, so neither is a
+# repeat; a line asking or rejecting something ('please', '?', REJECTS) is no report.
+_SHA = re.compile(r"\b(?=[0-9a-f]*[0-9])(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b")
+_STATUS = re.compile(r"^\W*(?:[\w.-]+(?:\s+[\w.-]+)?:\s*)?(?:not\s+)?(?:[a-z-]+ed|ok|done|up[- ]to[- ]date)\b")
+_ASKS = re.compile(r"[?!]|\b(?:please|pls|must|should|need|needs|why|stop|don't|do not|never|always|make sure)\b")
 _QUOTED = re.compile(r'"([^"\n]{8,300})"|“([^”\n]{8,300})”')
 REFUSE_S = 7 * 86400   # a second 'none' for the same class this soon is refused
 CLASS_ANCHORS = ("#", "key:", "msg#")   # the anchors specific enough to name a correction's class
@@ -230,10 +239,11 @@ def _near(a: frozenset, b: frozenset) -> bool:
 def repeats(db: DB, msgs: list[dict], now: float | None = None) -> dict[int, tuple[int, str]]:
     """{message id: (first id, sentence)} for the inbound messages in `msgs` with a sentence an earlier
     inbound message of the last REPEAT_S already had (or an anchored instruction of any length one
-    already gave): the first message that said it, and the sentence as first said."""
+    already gave): the first message that said it, and the sentence as first said. A routine report
+    (`report`: a push acknowledgment, a status line naming a commit) asks for nothing and never repeats."""
     now = time.time() if now is None else now
     new = sorted((m for m in msgs if m.get("direction", "in") == "in" and m.get("kind", "user") != "finding"
-                  and (m.get("text") or "").strip()), key=lambda m: int(m["id"]))
+                  and (m.get("text") or "").strip() and not report(m.get("text"))), key=lambda m: int(m["id"]))
     if not new:
         return {}
     rows = db.q("SELECT id, ts, text, chat FROM messages WHERE direction='in' AND kind!='finding' AND ts>=? AND id<? "
@@ -281,6 +291,13 @@ def repeats(db: DB, msgs: list[dict], now: float | None = None) -> dict[int, tup
                 out[mid] = (hit[0], hit[3])
                 break
     return out
+
+
+def report(text: str) -> bool:
+    """Whether `text` is only a routine report (_STATUS lines naming a commit), never a request."""
+    lines = [x for x in str(text or "").lower().replace("’", "'").splitlines() if x.strip()]
+    return bool(lines) and all(_SHA.search(x) and _STATUS.match(x) and not _ASKS.search(x)
+                               and not any(r in x for r in REJECTS) for x in lines)
 
 
 def _same(text: str) -> str:

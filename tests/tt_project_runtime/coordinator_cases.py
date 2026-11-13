@@ -20128,6 +20128,33 @@ def test_short_outbound_and_week_old_sentences_never_count_as_repeats(env):
     assert correction.flag(p.db, p.config(), _rows(p, out)) == {}
 
 
+def test_routine_push_acknowledgments_are_never_repeats_but_a_repeated_request_still_is(env):
+    """[note 080239ea0a3e724a]: two push acknowledgments differing only in their shas share a shape,
+    not a request, so neither is tagged a repeat; a repeated request ('please fix X', then 'fix X
+    already') still is, and so is an order naming a commit or a report line that also asks."""
+    from ttp import correction
+    p = make(env)
+    _said(p, "pushed 3f9c2ab1d to example/branch (fast-forward of 9e81c0d4a; 2 commits, checks passed)", days=1)
+    _said(p, "ttp push: pushed 1a2b3c4d5e to example/branch", days=1)
+    acks = [_said(p, "pushed 7d41e0b2c to example/branch (fast-forward of 3f9c2ab1d; 1 commit, checks passed)"),
+            _said(p, "ttp push: pushed 0f1e2d3c4b to example/branch")]
+    assert correction.flag(p.db, p.config(), _rows(p, *acks)) == {}
+    assert correction.report("pushed 7d41e0b2c to example/branch (fast-forward of 3f9c2ab1d)")
+    assert correction.report("ttp push: not pushed 7d41e0b2c to example/branch (exit 4)\nlanded 3f9c2ab1d")
+    for text in ("revert 7d41e0b2c on example/branch now", "pushed 7d41e0b2c to example/branch? why",
+                 "pushed 7d41e0b2c to example/branch, please check it", "pushed the docs to example/branch",
+                 "pushed 7d41e0b2c to example/branch\nnow fix the release notes", "1234567 tests passed"):
+        assert not correction.report(text), text
+    # A repeated request is still tagged with its first message.
+    first = _said(p, "Please fix the broken release notes page on the docs site.", days=1)
+    again = _said(p, "Fix the broken release notes page on the docs site already!")
+    assert correction.flag(p.db, p.config(), _rows(p, again)) == {again: f"repeats #{first}"}
+    # An order naming a commit is no report: its repeat is tagged.
+    order = _said(p, "Revert 7d41e0b2c on example/branch and rerun the full suite.", days=1)
+    redo = _said(p, "revert 7d41e0b2c on example/branch and rerun the full suite")
+    assert correction.flag(p.db, p.config(), _rows(p, redo)) == {redo: f"repeats #{order}"}
+
+
 def test_a_near_duplicate_instruction_flags_but_one_sharing_three_words_does_not(env):
     from ttp import correction
     p = make(env)
