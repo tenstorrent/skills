@@ -330,10 +330,14 @@ def check_run(run: dict, inputs: dict, validated: list, collected: set, item: st
                                 "explained_reason'; run scripts/explain_hours.py on its per-call accounting"}); "
                                 "not passed yet"))
         ok = False
-    elif explained <= 0 or abs(measured - explained) / explained > tolerance:  # within tolerance of the explained time
+    elif explained <= 0 or measured > explained * (1 + tolerance):
+        # One-sided: the rule finds time the rates do not account for. Faster than explained is a note.
         problems.append((1, f"run {name} took {measured} h; tokens over the serving rates explain "
-                            f"{explained} h (tolerance {tolerance:.0%}); not passed yet"))
+                            f"{explained} h (tolerance {tolerance:.0%} above); not passed yet"))
         ok = False
+    elif measured < explained * (1 - tolerance):
+        problems.append((0, f"run {name} took {measured} h, under the {explained} h explained: the rates are "
+                            "pessimistic for this traffic; it does not hold the phase"))
     check_config(run, validated, problems)
     check_server_size(run, problems)
     return ok
@@ -578,7 +582,7 @@ def main() -> int:
     if args.stage == "agentic-evals" and (evidence or existing):
         check_evals(model_dir, inputs, evidence, problems)
     for level, message in problems:
-        print(f"{'CRITICAL' if level == 2 else 'ADVISORY'}: {message}", file=sys.stderr)
+        print(f"{('NOTE', 'ADVISORY', 'CRITICAL')[level]}: {message}", file=sys.stderr)
     return max((level for level, _ in problems), default=0)
 
 

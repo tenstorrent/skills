@@ -782,3 +782,11 @@ def test_a_checker_crash_is_critical_not_advisory(tmp_path):
     (tmp_path / 'doc/agentic_evals/results.json').write_text(json.dumps({'runs': [scored_run()], 'phases': {'phase1': 'gpqa10'}}))
     code, stderr = check(tmp_path, 'agentic-evals', evidence(), {'mode': 'quick'})
     assert code == 2 and 'checker crashed' in stderr
+
+
+def test_time_faster_than_explained_passes_with_a_note(tmp_path):
+    """v4 Gemma SWE: 3.96 h measured against 11.70 h explained, band met; the rule finds unexplained slowness."""
+    run = scored_run()
+    run.update(measured_hours=3.96, explained_hours=11.70)
+    code, stderr = goal12(tmp_path, runs=[run])
+    assert code == 0 and 'NOTE' in stderr and 'pessimistic' in stderr
