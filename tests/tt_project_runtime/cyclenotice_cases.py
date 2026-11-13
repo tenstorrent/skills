@@ -551,11 +551,17 @@ def test_while_a_probe_announces_a_cycle_no_push_batch_checks_or_detached_job_st
     assert len(said) == 1 and "no new batch starts" in said[0] and "chip 7 lost" in said[0], said
     monkeypatch.setenv("TTP_PROJECT", str(s.p.base))
     monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path))
+    repo = tmp_path / "work"   # checks are refused once their list is known: in a committed checkout
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-q",
+                    "--allow-empty", "-m", "a"], check=True)
+    monkeypatch.chdir(repo)
     for argv in (["detach", "job", "--", "true"], ["checks", "--", "true"]):
         with pytest.raises(SystemExit) as e:
             cli.main(argv)
         err = capsys.readouterr().err
         assert e.value.code == 75 and "power cycle of this host is pending" in err and "retry_when" in err, err
+        assert "ttp detach --resumable" in err and "ttp detach --remote" in err, "the ways around it are named"
     assert not (tmp_path / "job.rc").exists() and not (tmp_path / "job.log").exists()
     _cycle_probe(s.p, "next: nothing scheduled\n")
     assert pushq.schedule(s.p, log=said.append), "the batch starts once the announcement clears"
@@ -563,3 +569,90 @@ def test_while_a_probe_announces_a_cycle_no_push_batch_checks_or_detached_job_st
     (env["tmp"] / "go").write_text("")   # the stub batch waits for its release file: let it end before teardown
     for child in list(pushq._children.values()):
         child.wait(timeout=30)
+
+
+def test_a_resumable_detached_job_starts_while_a_cycle_is_announced_and_a_plain_one_still_waits(env, monkeypatch):
+    # Note 46355c6a511ad7ea: the daemon relaunches a --resumable job a reboot cut short, so an announced cycle of
+    # this host holds it not; a plain local job is still refused (75) and told both ways around it.
+    p = make(env)
+    _notice(env, monkeypatch)
+    run_dir = p.runs / "cycle-detach"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    e = {"TTP_RUN_DIR": str(run_dir)}
+    r = _ttp_run(p, "detach", "plain", "--", "true", env=e, timeout=HANG_S)
+    assert r.returncode == 75 and "power cycle of this host is pending" in r.stderr, r.stderr
+    assert "ttp detach --resumable" in r.stderr and "ttp detach --remote" in r.stderr and "retry_when" in r.stderr
+    assert not (run_dir / "plain.rc").exists() and not (run_dir / "plain.log").exists()
+    for args in (["--resumable", "first"], ["second", "--resumable"]):   # the option before or after the name
+        name = args[0] if args[0] != "--resumable" else args[1]
+        r = _ttp_run(p, "detach", *args, "--", "true", env=e, timeout=HANG_S)
+        assert r.returncode == 0, r.stderr
+        assert "starting it anyway" in r.stderr and "relaunches it after the reboot" in r.stderr, r.stderr
+        assert r.stderr.count("power cycle of this host is pending") == 1
+        rc = run_dir / f"{name}.rc"
+        assert _wait_for_path(rc, HANG_S) and _job_lock_free(rc.resolve(), 30) and rc.read_text().strip() == "0"
+
+
+def _cycle_checks_repo(env, tmp_path, monkeypatch):
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    _notice(env, monkeypatch)
+    started = []
+    from ttp import cli
+    monkeypatch.setattr(cli, "_checks_detach", lambda *a, **k: started.append(a[3]))
+    return p, run, started
+
+
+def test_ttp_checks_while_a_cycle_is_announced_refuses_only_heavy_checks_that_would_run_here(env, tmp_path,
+                                                                                            monkeypatch, capsys):
+    from ttp import checkspill, cli
+    p, run, started = _cycle_checks_repo(env, tmp_path, monkeypatch)
+    with pytest.raises(SystemExit) as e:   # a heavy check here, nowhere else to go
+        cli.main(["checks", "--detach", "--", "true"])
+    err = capsys.readouterr().err
+    assert e.value.code == 75 and "power cycle of this host is pending" in err and not started, err
+    assert "ttp detach --resumable" in err and "ttp detach --remote" in err
+    p.set_config(f"delivery.{checkspill.KEY}", ["spillbox"])   # it may spill: it goes ahead and waits for one
+    cli.main(["checks", "--detach", "--", "true"])
+    err = capsys.readouterr().err
+    assert len(started) == 1 and "going ahead on a spill host" in err, err
+    monkeypatch.setenv(checkspill.OFF_ENV, "1")   # a rerun kept off every spill host runs here: refused
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--detach", "--", "true"])
+    assert e.value.code == 75 and len(started) == 1
+    monkeypatch.delenv(checkspill.OFF_ENV)
+    p.set_config("delivery.push_checks", [{"run": "true", "spill": False}])
+    with pytest.raises(SystemExit) as e:   # "spill": false keeps a check here: refused
+        cli.main(["checks", "--detach"])
+    assert e.value.code == 75 and len(started) == 1 and "power cycle" in capsys.readouterr().err
+    p.set_config("delivery.push_checks", None)
+    p.set_config(f"delivery.{checkspill.KEY}", None)
+    capsys.readouterr()
+    cli.main(["checks", "--detach", "--", "git diff --check"])   # light checks only (seconds): they go ahead
+    err = capsys.readouterr().err
+    assert len(started) == 2 and "only light checks here" in err, err
+
+
+def test_a_run_that_may_spill_takes_no_slot_here_while_a_cycle_is_announced(env, tmp_path, monkeypatch):
+    # _checks_slot: with the notice, a run that may spill tries the spill hosts and waits for one, never taking
+    # a checks slot here; once the notice clears it queues here as before.
+    import io
+    from ttp import checkcap, checkspill, cli, push
+    p = make(env)
+    p.set_config(f"delivery.{checkspill.KEY}", ["spillbox"])
+    path = _notice(env, monkeypatch)
+    picks, takes = [], []
+    claim = types.SimpleNamespace(host="spillbox", close=lambda: None)
+    monkeypatch.setattr(checkspill, "pick", lambda *a, **k: picks.append(a[4] if len(a) > 4 else "")
+                        or (claim if len(picks) > 1 else None))
+    monkeypatch.setattr(checkspill, "after_s", lambda cfg: 0.0)
+    monkeypatch.setattr(cli, "_checks_slot_take", lambda *a, **k: takes.append(1) or checkcap.Slot())
+    cmds = push.check_list(["true"])
+    out = io.StringIO()
+    slot = cli._checks_slot(p, tmp_path, out, "a" * 40, detached=True, cmds=cmds, top=str(p.root), spill=True)
+    assert slot.spill is claim and not takes and len(picks) == 2, (picks, takes)
+    assert "waiting for a spill host, not running here" in out.getvalue(), out.getvalue()
+    path.unlink()
+    monkeypatch.setattr(checkspill, "first", lambda cfg: False)
+    slot = cli._checks_slot(p, tmp_path, io.StringIO(), "a" * 40, detached=True, cmds=cmds, top=str(p.root),
+                            spill=True)
+    assert takes == [1] and slot.spill is None, "no notice: it queues here as before"

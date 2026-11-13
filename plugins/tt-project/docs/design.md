@@ -411,8 +411,13 @@ What each supported CLI offers, with doc links: [providers.md](providers.md).
   A broker's health probe or status command can announce the cycle too: while a heal check that
   watches this host printed a line matching `upgrade.cycle_patterns` (regexes; generic defaults such as
   'next: power cycle'; `[]` turns it off) in its last run within 15 min (`upgrade.cycle_checks` picks the
-  checks), the same hold applies. While either holds, the push queue also starts no new batch and
-  `ttp checks` and `ttp detach` start nothing (exit 75); each clears once the announcement does.
+  checks), the same hold applies. While either holds, the push queue also starts no new batch, and
+  `ttp checks` and `ttp detach` start no long job on this machine (exit 75, naming the ways below); each
+  clears once the announcement does. What a reboot here cannot hurt still starts: `ttp detach --resumable`
+  (with a warning; the daemon relaunches it after the reboot), `ttp detach --remote`, `ttp checks` whose
+  checks all run on other hosts (`delivery.checks_host`, a check's own `host`) or are light, and checks
+  that may all spill while spill hosts are set: those wait for a spill host and take no checks slot here
+  until the announcement clears.
 - Reboot causes (initiator.py). After a reboot the daemon reads the previous boot's journal (as this
   user, else `sudo -n` where allowed, else 'unreadable' with why): who or what started the shutdown and
   any kernel panic, out-of-memory kill, machine check or lockup before it. The boot record, the reboot

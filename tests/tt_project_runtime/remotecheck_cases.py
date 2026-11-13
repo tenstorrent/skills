@@ -357,6 +357,38 @@ def test_ttp_checks_on_a_check_host_names_it_and_waits_when_it_cannot_reach_it(e
     assert len(log.read_text().splitlines()) == 1, "the unreachable host ran nothing"
 
 
+def test_ttp_checks_on_a_check_host_run_while_a_power_cycle_of_this_host_is_announced(env, tmp_path, monkeypatch,
+                                                                                      capsys):
+    """Note 46355c6a511ad7ea: checks that all run on delivery.checks_host are not refused (75) by an announced
+    power cycle of this machine; the same checks run here are."""
+    from ttp import checkspill, cli, remoteload
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    bin_, remote = _rc_fake_ssh(tmp_path)
+    monkeypatch.setenv("PATH", f"{bin_}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_REMOTE_TMP", str(remote))
+    monkeypatch.setattr(remoteload, "reading", lambda h, **k: (1.0, 64))   # the fake host has room, whatever
+    monkeypatch.setattr(checkspill, "admit_pinned", lambda *a, **k: [])       # this machine's own load reads
+    notice = tmp_path / "power-cycle-pending.json"   # a fake notice: never the broker's real one
+    monkeypatch.setenv("TTP_TEST_CYCLE_NOTICES", str(notice))
+    notice.write_text(json.dumps({"state": "possible", "reason": "chip 3 dropped off the bus", "updated_at": time.time(),
+                                  "earliest_cycle_at": time.time() + 90}))
+    log = tmp_path / "where.log"
+    cmd = f"pwd >> {log}"
+    p.set_config("delivery.push_checks", [cmd])
+    p.set_config("delivery.checks_host", "box1")
+    cli.main(["checks", "--fresh"])
+    err = capsys.readouterr().err
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and rec["hosts"] == {cmd: "box1"}, rec
+    assert "power cycle of this host is pending" in err and "going ahead: only checks on other hosts" in err, err
+    p.set_config("delivery.checks_host", None)
+    (run / "checks.json").unlink()
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--fresh"])
+    assert e.value.code == 75 and not (run / "checks.json").exists()
+    assert len(log.read_text().splitlines()) == 1, "the run refused here ran nothing"
+
+
 def test_ttp_push_runs_its_checks_on_the_check_host_and_waits_when_ssh_fails(env, monkeypatch):
     from ttp import envfault, push
     log = env["tmp"] / "where.log"

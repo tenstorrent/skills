@@ -4074,7 +4074,6 @@ def _cmd_checks(a) -> None:
         print(f"ttp checks: not started, {hostcycle.hold_line(cyc, p)}. Commit and hand off `waiting` with a "
               "`retry_when` that exits 0 once this host is back, and run them after the cycle", file=sys.stderr)
         sys.exit(75)
-    _cycle_notice_busy("ttp checks", p)
     purpose = getattr(a, "purpose", None) or "candidate"
     if a.full and purpose == "candidate" and not getattr(a, "release", False):
         from . import testpick   # a release run (the release cut's required suite) always runs in full
@@ -4242,6 +4241,7 @@ def _cmd_checks(a) -> None:
         print(f"ttp checks: {what} in this worktree are not checked: the checks run on a clean checkout of "
               f"commit {head[:12]}")
     tree = subprocess.run([*git, "rev-parse", "HEAD^{tree}"], capture_output=True, text=True).stdout.strip()
+    _cycle_notice_checks(p, cmds, cfg)   # an announced cycle of this host holds only heavy checks run here
     if a.detach:
         try:
             checkdirs.writable(run_dir)
@@ -5989,6 +5989,24 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     while True:
         limit = max(0.0, checkcap.FOREGROUND_WAIT_S - (time.time() - start)) if foreground and p else None
         spill_cfg = p.config() if spill_to else {}
+        # While a power cycle of this host is announced (_cycle_notice_checks let the run in for this), a run
+        # that may spill takes no place here: it tries the spill hosts and waits for one, holding nothing here.
+        if spill_to and checkspill.hosts(spill_cfg) and (cyc := _cycle_notice(p)):
+            from . import cyclenotice
+            if (claim := checkspill.pick(p, spill_cfg, lambda line: line in told or (told.add(line), tell(line)),
+                                         what, spill_off, "a power cycle of this host is announced")) is not None:
+                slot = checkcap.Slot()
+                slot.spill = claim
+                return slot
+            line = (f"{cyclenotice.line(cyc, p)}: waiting for a spill host, not running here; it takes a place "
+                    "here once the cycle is no longer announced")
+            if line not in told:
+                told.add(line)
+                tell(line)
+            if not _spill_wait(run_dir, out, checkspill.after_s(spill_cfg), waiting, moved, yielder,
+                               start if foreground and p else None):
+                return None
+            continue
         # Spill first (checkspill.first), and while this host's disk is saturated by writes (diskgate, which
         # holds new local runs): the spill hosts are tried before any place here; after it, each bound below
         # tries them again, so a run held here by the load guard or a cap still goes to a host with room.
@@ -9360,7 +9378,14 @@ def cmd_detach(a) -> None:
             "(name: letters, digits, . _ -)")
     if not run_dir:
         die("ttp detach only works inside a tt-project run")
-    _cycle_notice_busy("ttp detach", Project(os.environ["TTP_PROJECT"]) if os.environ.get("TTP_PROJECT") else None)
+    detach_p = Project(os.environ["TTP_PROJECT"]) if os.environ.get("TTP_PROJECT") else None
+    if getattr(a, "resumable", False):   # the daemon relaunches it after a reboot: an announced cycle holds it not
+        if cyc := _cycle_notice(detach_p):
+            from . import cyclenotice
+            print(f"ttp detach: {cyclenotice.line(cyc, detach_p)}; starting it anyway: it is --resumable, so the "
+                  "daemon relaunches it after the reboot", file=sys.stderr)
+    else:
+        _cycle_notice_busy("ttp detach", detach_p)
     rd = Path(run_dir).resolve()
     rc, logf = rd / f"{a.name}.rc", rd / f"{a.name}.log"
     if any(f.exists() for f in (rc, logf, detach.queued(rc), detach.lost(rc))):
@@ -12671,19 +12696,57 @@ def cmd_uninstall(a) -> None:
         print(f"  {ln}")
 
 
-def _cycle_notice_busy(what: str, p: Project | None) -> None:
-    """Exit 75 when a power cycle of this host is announced (cyclenotice.project_held): a long job started
-    now would be cut by it. Hand off `waiting` on a time check; it starts once the announcement clears."""
+def _cycle_notice(p: Project | None) -> dict | None:
+    """The announced power cycle of this host (cyclenotice.project_held), or None; an unreadable one holds nothing."""
     from . import cyclenotice
     try:
-        h = cyclenotice.project_held(p) if p is not None and p.exists() else None
+        return cyclenotice.project_held(p) if p is not None and p.exists() else None
     except Exception:
-        return
+        return None
+
+
+def _cycle_notice_busy(what: str, p: Project | None, h: dict | None = None) -> None:
+    """Exit 75 when a power cycle of this host is announced (cyclenotice.project_held; `h` when the caller read
+    it): a long job started here now would be cut by it. The message names the ways that a reboot here cannot
+    hurt: a resumable detached job (the daemon relaunches it after the reboot) or one started on another host;
+    else hand off `waiting` on a time check and start it once the announcement clears."""
+    from . import cyclenotice
+    h = h or _cycle_notice(p)
     if h:
-        print(f"{what}: not started, {cyclenotice.line(h, p)}. Commit and hand off `waiting` with retry_when "
-              f"'test \"$(date +%s)\" -ge {int(time.time()) + 600}' and start it once the cycle is over",
-              file=sys.stderr)
+        print(f"{what}: not started, {cyclenotice.line(h, p)}. A job a reboot here cannot hurt may start now: "
+              "`ttp detach --resumable <name> -- <command...>` (the daemon relaunches it after the reboot) or "
+              "`ttp detach --remote <ssh alias> <name> -- <command...>` (it runs on that host). Else commit and "
+              f"hand off `waiting` with retry_when 'test \"$(date +%s)\" -ge {int(time.time()) + 600}' and start "
+              "it once the cycle is over", file=sys.stderr)
         sys.exit(cyclenotice.BUSY)
+
+
+def _cycle_notice_checks(p: Project | None, cmds: list, cfg: dict) -> None:
+    """`ttp checks` while a power cycle of this host is announced: refused (exit 75, _cycle_notice_busy) only
+    when a heavy check would run on this machine. Checks that run on another host (push.remote_host:
+    delivery.checks_host or their own `host`), and light ones here (checklane, seconds long), go ahead. So do
+    heavy local ones that may all spill while spill hosts are set: they wait for a spill host and never take a
+    slot here while the notice holds (_checks_slot). A reboot here still ends this run's driver; a detached run
+    is started again after it (Daemon._relaunch_checks)."""
+    h = _cycle_notice(p)
+    if not h:
+        return
+    from . import checklane, checkspill, cyclenotice, push
+    pats = checklane.light_patterns(cfg)
+    here = [c for c in cmds if not push.remote_host(c) and not checklane.is_light(str(c), pats)]
+    why = cyclenotice.line(h, p)
+    if not here:
+        kinds = [k for k, on in (("checks on other hosts", any(push.remote_host(c) for c in cmds)),
+                                 ("light checks here", any(not push.remote_host(c) for c in cmds))) if on]
+        print(f"ttp checks: {why}; going ahead: only {' and '.join(kinds)}, so nothing long runs on this "
+              "machine", file=sys.stderr)
+        return
+    if checkspill.hosts(cfg) and not checkspill.all_off(os.environ.get(checkspill.OFF_ENV, "")) \
+            and all(checkspill.check_spills(c, cfg) for c in here):
+        print(f"ttp checks: {why}; going ahead on a spill host: they wait for one and take no checks slot "
+              "here while the cycle is announced", file=sys.stderr)
+        return
+    _cycle_notice_busy("ttp checks", p, h)
 
 
 def cyclenotice_paths(p: Project) -> list[str]:
