@@ -27427,6 +27427,8 @@ def test_durable_write_syncs_renames_and_keeps_the_mode(env, monkeypatch):
 # Every place the runtime writes a file directly, and why it need not survive a power cut. Anything
 # else goes through project.durable_write / durable_append / write_json.
 DURABLE_EXEMPT = {
+    ("harborslice.py", 'f = open(d / f"{i}.lock", "w")'): "an empty flock file for one host trial slot; only the lock matters, nothing is written",
+    ("tbcycle.py", 'f = open(path, "a")'): "an empty flock file (state or a model's runner lock); only the lock matters, nothing is written",
     ("bridge_relay.py", 'with os.fdopen(fd, "w") as f:'): "the relay is standard library only (the service runs a copy); its random computer id is written to a temp file and renamed, and a lost one is only made again",
     ("bridge_relay.py", 'os.replace(path + ".tmp", path)'): "the rename of that computer id's temp file; a lost id is only made again",
     ("bridge_cert.py", 'f.write_text(pub.strip() + "\\n")'): "a key line for ssh-keygen -l in a TemporaryDirectory removed right after; nothing is kept",
