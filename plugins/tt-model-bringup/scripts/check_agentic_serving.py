@@ -325,10 +325,9 @@ def check_run(run: dict, inputs: dict, validated: list, collected: set, item: st
         ok = False
     elif not number(explained):
         # Phase timing is reported, not gated: a run whose calls could not be priced says why.
-        level = 1 if run.get("explained_reason") else 2
-        problems.append((level, f"run {name} has no explained_hours ({run.get('explained_reason') or 'and no '
-                                "explained_reason'; run scripts/explain_hours.py on its per-call accounting"}); "
-                                "not passed yet"))
+        reason = run.get("explained_reason")
+        why = reason or "and no explained_reason; run scripts/explain_hours.py on its per-call accounting"
+        problems.append((1 if reason else 2, f"run {name} has no explained_hours ({why}); not passed yet"))
         ok = False
     elif explained <= 0 or measured > explained * (1 + tolerance):
         # One-sided: the rule finds time the rates do not account for. Faster than explained is a note.
