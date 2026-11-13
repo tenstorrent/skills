@@ -9833,10 +9833,11 @@ class Daemon:
         paged = dict(self.p.db.kv(PAGED_KEY + s["name"]) or {})
         reported: set[str] = set()
         filed = 0
-        # grace_min: a keyed line is held until its key has been reported that long (watchgrace).
+        # grace_min: a keyed line at normal or above, and an error line, is held until its key (one for
+        # all error lines) has been reported that long (watchgrace).
         grace, now = watchgrace.grace_s(payload), time.time()
         graced = dict(self.p.db.kv(watchgrace.KV + s["name"]) or {}) if grace else {}
-        seen, held = set(), 0
+        seen, held, held_errs, lines, main_errs = set(), 0, 0, 0, 0
         for obs in _observations(text):
             body = obs.get("text", "")
             # Its own failure lines ("error": true) are errors, not reports. "error": "side" is a side
@@ -9847,8 +9848,17 @@ class Daemon:
             kind = scr.ERROR if error else receipt
             # A JSON line with "whole": true is one observation: never split at '; '.
             whole = obs.get("whole") is True
-            gkey = obs["key"].strip() if grace and not error and isinstance(obs.get("key"), str) else ""
-            if gkey and (obs.get("cleared") is True
+            lines += 1
+            main_errs += error and not side
+            gkey = (watchgrace.ERROR_KEY if grace and error and not failed
+                    else obs["key"].strip() if grace and not error and isinstance(obs.get("key"), str)
+                    and watchgrace.holds(obs.get("severity")) else "")
+            if gkey == watchgrace.ERROR_KEY:   # the check could not run: a retry inside its grace
+                seen.add(gkey)
+                if watchgrace.step(graced, gkey, now, grace, "normal")[0] == watchgrace.HOLD:
+                    held_errs += 1
+                    continue
+            elif gkey and (obs.get("cleared") is True
                          or any(c for _s, _c, c in scr.watcher_conditions(source, body, whole=True) or ())):
                 graced.pop(gkey, None)   # a clear always goes through, and ends the key's clock
             elif gkey:
@@ -9881,7 +9891,9 @@ class Daemon:
             sides += side
         if ok:   # a line no longer reported is over: its recurrence pages again
             paged = {k: v for k, v in paged.items() if k in reported}
-            graced = watchgrace.forget(graced, seen)   # and a key no longer reported counts its grace afresh
+            # and a key no longer reported counts its grace afresh, unless the check could not run
+            if not (main_errs and main_errs == lines):
+                graced = watchgrace.forget(graced, seen)
         if grace and graced != (self.p.db.kv(watchgrace.KV + s["name"]) or {}):
             self.p.db.set_kv(watchgrace.KV + s["name"], graced)
         if paged != (self.p.db.kv(PAGED_KEY + s["name"]) or {}):
@@ -9895,8 +9907,11 @@ class Daemon:
             return f"error: watcher command failed rc={out.returncode}: {output_tail(out.stderr, 240) or '(no stderr)'}"
         if errs and errs + sides == n:
             return f"error ({n} lines: check could not run)"
+        if held_errs and not n and not held:   # not a failed run: the schedule's failure count waits
+            return f"retrying ({held_errs} lines: check could not run, inside its grace)"
         extra = (f", {errs} errors" if errs else "") + (f", {sides} side errors" if sides else "")
         extra += f", {held} held in their grace" if held else ""
+        extra += f", {held_errs} could-not-run lines held in their grace" if held_errs else ""
         return f"ok ({n - errs - sides} observations{extra})"
 
     def _page_target(self, name: str, obs: dict) -> str | None:
