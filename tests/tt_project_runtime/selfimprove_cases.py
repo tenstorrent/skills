@@ -250,3 +250,55 @@ def test_selfimprove_claude_counts_each_tool_call_once(env, tmp_path):
              {"type": "result", "subtype": "success", "total_cost_usd": 0.1, "result": "ok", "usage": {}}]
     out.write_text("".join(json.dumps(x) + "\n" for x in lines))
     assert get_provider("claude").parse(out).extra["tool_calls"] == 3
+
+
+def test_selfimprove_a_task_bound_change_is_measured_only_with_its_applied_receipt(env, monkeypatch):
+    from ttp import coordinator as coord, selfimprove, tried
+    from ttp.coordinator import settable
+    _si_home(env, monkeypatch)
+    p = make(env)
+    now = time.time()
+    for h in (40, 30, 20):
+        _si_wake(p, now - h * 3600, cost_usd=1.0)
+    for h in (10, 20, 30, 60, 70, 80):   # after: a higher cost, so an applied change is reverted
+        _si_wake(p, now + h * 3600, cost_usd=3.0)
+    landed = {}   # task id -> (commit, still pending): the fake harness/landing lookup
+    monkeypatch.setattr(selfimprove, "_commit", lambda p, task: landed.get(task["id"], ("", False)))
+    base = {"kind": "script", "name": "scripts/poll.sh", "text": "poll less", "metric": "cost_usd",
+            "evidence": "costly wakes", "key": "cost", "command": "git revert HEAD", "files": ["scripts/poll.sh"]}
+    due = now + 2 * 86400
+    noop, real, slow = (p.db.add_task(f"make change {n}", "spec", kind="harness", origin="coordinator")
+                        for n in ("a", "b", "c"))
+    for tid in (noop, real, slow):
+        selfimprove.add(p, base, due, settable=settable, now=now, task=tid)
+    with pytest.raises(ValueError):   # only the harness or code task that makes it
+        selfimprove.add(p, base, due, settable=settable, now=now, task=99999)
+    p.db.update_task(noop, status="done")   # a diagnosis only: no commit
+    p.db.update_task(real, status="done")
+    landed[real] = ("abc1234", False)
+    # slow stays running: pending
+    lines = selfimprove.review(p, now + 3 * 86400)
+    assert lines[0] == f"s1: not applied (its task #{noop} ended with no source change): not measured, nothing to revert"
+    assert len(lines) == 1, "the applied one is measured over its own span from its receipt on; the pending one waits"
+    st = {r["id"]: r for r in selfimprove.items(p.db)}
+    assert st["s1"]["status"] == "not_applied" and "after" not in st["s1"]
+    assert st["s2"]["applied"]["commit"] == "abc1234" and st["s2"]["status"] == "open"
+    assert st["s3"]["status"] == "open" and "applied" not in st["s3"]
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE title LIKE 'revert self-change%'")["n"] == 0
+    landed[real] = ("fff9999", False)   # a later lookup never replaces the receipt
+    lines = selfimprove.review(p, now + 6 * 86400)
+    assert len(lines) == 1 and lines[0].startswith("s2 cost_usd 1.0 -> 3.0") and "revert task #" in lines[0], lines
+    st = {r["id"]: r for r in selfimprove.items(p.db)}
+    assert st["s2"]["status"] == "reverted" and st["s2"]["applied"]["commit"] == "abc1234"
+    revert = p.db.one("SELECT * FROM tasks WHERE title LIKE 'revert self-change s2%'")
+    assert "abc1234" in revert["spec"] and "git revert HEAD" in revert["spec"]
+    assert st["s3"]["status"] == "open" and selfimprove.review(p, now + 9 * 86400) == [], "still pending: left alone"
+    ledger = {e["id"] for e in tried.entries(p.db, now=now + 6 * 86400 + 5)}
+    assert "s2" in ledger and "s1" not in ledger, "a change never applied makes no cost-effect claim"
+    # The coordinator binds a code self-change to the batch's one harness or code task_add.
+    probs = coord.apply(p, [{"type": "task_add", "title": "shorten the poll script", "spec": "edit scripts/poll.sh",
+                             "kind": "harness", "tier": "standard", "priority": 2},
+                            {"type": "self_change", **base, "text": "poll even less"}])
+    assert not probs, probs
+    made = p.db.one("SELECT id FROM tasks WHERE title = 'shorten the poll script'")["id"]
+    assert selfimprove.items(p.db)[-1]["task"] == made

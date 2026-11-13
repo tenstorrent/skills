@@ -26,7 +26,14 @@ only general fixes go upstream to tt-project). Model-free throughout:
   prompt, script or code change by a harness task (its review and required checks apply). A revert that
   fails stays open (retried at the next review) and is raised to the coordinator once. Kept or reverted,
   it is a Tried ledger entry (tried.entries). A kept one marked `generic`, or whose miss class another project on this machine
-  recorded too (MISSES), goes upstream with its numbers."""
+  recorded too (MISSES), goes upstream with its numbers.
+- A prompt, script or code change bound to the task that makes it (TASK_UNDO; `id`, or the batch's one
+  harness or code task_add) is measured or reverted only with its applied-change receipt, written once
+  and never changed: {commit, undo, at} once that task ends done with its commit merged (harness) or
+  landed (code). Until then it is pending: neither measured nor reverted. A task that ends with no
+  source change (a no-op, a diagnosis only, failed or cancelled), or none landed PENDING_DAYS after it
+  ended, settles it "not_applied": no cost-effect claim, no Tried entry, no revert task. It is measured
+  over the same span from its receipt on, against the baseline taken when it was recorded."""
 from __future__ import annotations
 
 import json
@@ -43,6 +50,9 @@ LOCAL_KINDS = ("prompt", "memory", "charter_note", "schedule", "config", "script
 ACTION_UNDO = ("memory", "config")             # reverted here by the coordinator's own gated action
 COORD_UNDO = ("charter_note", "schedule")      # the coordinator reverts it (no CLI edits either)
 UNDO_FORM = {"config": "ttp config <project> <key> <value>", "memory": "ttp memory --forget <name>"}
+TASK_UNDO = ("prompt", "script", "code")       # made and reverted by a harness or code task
+TASK_KINDS = ("harness", "code")               # the task kinds that make a TASK_UNDO change
+PENDING_DAYS = 14                              # a done task's change still unlanded this long: not applied
 REVERT_KIND = "observation"                    # a revert for the coordinator: rides with its next turn
 MEMORY_SLACK_S = 3600                          # a memory entry created this long before the record is its own
 MIN_CHECK_S = 12 * 3600
@@ -204,8 +214,10 @@ def _upstream(name: str, title: str, spec: str) -> int:
                                          "spec": spec}])
 
 
-def add(p, a: dict, check_at: float | None, settable=None, now: float | None = None) -> str:
-    """The `self_change` action: file a general fix upstream, or record a local one (module doc)."""
+def add(p, a: dict, check_at: float | None, settable=None, now: float | None = None,
+        task: int | None = None) -> str:
+    """The `self_change` action: file a general fix upstream, or record a local one (module doc). `task`:
+    the task making a TASK_UNDO change, which gates its measurement on that task's receipt."""
     now = time.time() if now is None else now
     kind, target = str(a.get("kind") or "").strip(), str(a.get("name") or "").strip()
     change, miss = " ".join(str(a.get("text") or "").split()), " ".join(str(a.get("evidence") or "").split())
@@ -224,11 +236,17 @@ def add(p, a: dict, check_at: float | None, settable=None, now: float | None = N
     guard(kind, target, undo, settable, p.name)
     if check_at is None or check_at - now < MIN_CHECK_S:
         raise ValueError(f"start_after (when to measure it) must be at least {MIN_CHECK_S // 3600} h out")
+    if task is not None and kind in TASK_UNDO:
+        row = p.db.task(int(task))
+        if not row or row.get("kind") not in TASK_KINDS:
+            raise ValueError(f"id #{task}: give the {' or '.join(TASK_KINDS)} task that makes this change")
+    else:
+        task = None
     before = wakes(p.db, now - (check_at - now), now)
     rec = {"ts": now, "kind": kind, "target": target, "change": change[:300], "miss": miss[:600], "cls": cls,
            "metric": metric, "baseline": mean(before, metric), "n_before": len(before), "check_at": check_at,
            "undo": undo[:500], "files": [str(f) for f in files][:10], "generic": bool(a.get("generic")),
-           "status": "open"}
+           "status": "open", **({"task": int(task)} if task is not None else {})}
     with p.db.tx():
         st = _load(p.db)
         rec["id"] = f"s{st['next']}"
@@ -239,7 +257,43 @@ def add(p, a: dict, check_at: float | None, settable=None, now: float | None = N
         _note_miss(p.name, cls, now)
     except OSError:   # the cross-project count only; the record stands
         pass
-    return f"self-change {rec['id']} recorded: {metric} baseline {rec['baseline']} over {len(before)} wakes"
+    return f"self-change {rec['id']} recorded: {metric} baseline {rec['baseline']} over {len(before)} wakes" + \
+        (f"; measured once task #{task} lands its commit" if task is not None else "")
+
+
+def _commit(p, task: dict) -> tuple[str, bool]:
+    """(the commit task `task` applied, still pending): a harness task's handed-off commit once merged
+    in the harness checkout, a code task's landed commit; ("", True) while it may still land."""
+    if task["kind"] == "harness":
+        from . import harnesstree
+        sha = harnesstree.merged_commit(p, task)
+        return sha, not sha and harnesstree.unmerged(p, task["id"]) != 0
+    from . import landed
+    shas, _ = landed.recorded(p.db, task["id"])
+    if shas:
+        return shas[-1], False
+    return "", bool(landed.task_shas(p, task["id"])[0])   # done with commits on its branch: not landed yet
+
+
+def _receipt(p, rec: dict, now: float) -> tuple[str, dict]:
+    """A bound change's state (module doc): ("applied", receipt), ("pending", {}) or ("not_applied",
+    {"why"}). A receipt already written is returned as it is."""
+    if rec.get("applied"):
+        return "applied", rec["applied"]
+    task = p.db.task(int(rec["task"]))
+    if not task:
+        return "not_applied", {"why": f"its task #{rec['task']} is gone"}
+    if task["status"] in ("failed", "cancelled"):
+        return "not_applied", {"why": f"its task #{task['id']} {task['status']} with no change applied"}
+    if task["status"] != "done":
+        return "pending", {}
+    sha, pending = _commit(p, task)
+    if sha:
+        return "applied", {"commit": sha, "undo": rec["undo"], "at": now, "task": task["id"]}
+    if pending and now - float(task.get("updated") or now) < PENDING_DAYS * 86400:
+        return "pending", {}
+    return "not_applied", {"why": f"its task #{task['id']} ended with no source change" +
+                           (f" landed in {PENDING_DAYS} days" if pending else "")}
 
 
 def _ask_coordinator(p, rec: dict, text: str, now: float) -> int | None:
@@ -281,9 +335,11 @@ def _revert(p, rec: dict, now: float) -> tuple[str, str]:
                               f"{'charter_update' if rec['kind'] == 'charter_note' else 'schedule_set'} that "
                               f"restores it: {rec['undo']}\nThe change was: {rec['change']}", now)
         return "reverted", f"asked the coordinator to revert it (event #{ev})"
+    applied = rec.get("applied") or {}
     tid = p.db.add_task(f"revert self-change {rec['id']}: {rec['change'][:80]}",
                         f"Revert self-change {rec['id']} ({rec['kind']} {rec['target']}): it did not lower "
-                        f"{rec['metric']}. Undo: {rec['undo']}\nThe change was: {rec['change']}",
+                        f"{rec['metric']}. Undo: {rec['undo']}\nThe change was: {rec['change']}" +
+                        (f"\nApplied as commit {applied['commit']} by task #{applied['task']}." if applied else ""),
                         kind="harness", origin="daemon", priority=2)
     return "reverted", f"revert task #{tid}"
 
@@ -292,8 +348,23 @@ def review(p, now: float | None = None) -> list[str]:
     """Measure each self-change due by now; keep it or revert it (module doc). One line per change."""
     now = time.time() if now is None else now
     out = []
-    for rec in [r for r in items(p.db) if r.get("status") == "open" and float(r["check_at"]) <= now]:
-        after = wakes(p.db, float(rec["ts"]), float(rec["check_at"]))
+    for rec in [r for r in items(p.db) if r.get("status") == "open"]:
+        start, end = float(rec["ts"]), float(rec["check_at"])
+        if rec.get("task") is not None:   # measured or reverted only with its receipt (module doc)
+            state, got = _receipt(p, rec, now)
+            if state == "pending":
+                continue
+            if state == "not_applied":
+                _update(p, rec["id"], {"status": "not_applied", "measured": now, "why": got["why"]})
+                out.append(f"{rec['id']}: not applied ({got['why']}): not measured, nothing to revert")
+                continue
+            if not rec.get("applied"):
+                _update(p, rec["id"], {"applied": got})
+            start = max(start, float(got["at"]))
+            end = max(end, start + float(rec["check_at"]) - float(rec["ts"]))
+        if end > now:
+            continue
+        after = wakes(p.db, start, end)
         val, base = mean(after, rec["metric"]), rec.get("baseline")
         helped = val is not None and base is not None and val < base
         upd = {"measured": now, "after": val, "n_after": len(after)}
@@ -315,14 +386,19 @@ def review(p, now: float | None = None) -> list[str]:
                                  f"{rec['metric']}, and its revert failed: {how}. Revert it with its own action "
                                  f"(undo: {rec['undo']}); the daily review retries it meanwhile.", now)
                 how = f"revert failed, still open: {how}"
-        with p.db.tx():   # the record may have moved meanwhile: update it by id
-            st = _load(p.db)
-            for r in st["items"]:
-                if r.get("id") == rec["id"]:
-                    r.update(upd)
-            p.db.set_kv(KEY, st)
+        _update(p, rec["id"], upd)
         out.append(f"{rec['id']} {rec['metric']} {base} -> {val} ({len(after)} wakes): {how}")
     return out
+
+
+def _update(p, rid: str, upd: dict) -> None:
+    """Update record `rid` by id (it may have moved meanwhile); a written receipt is never replaced."""
+    with p.db.tx():
+        st = _load(p.db)
+        for r in st["items"]:
+            if r.get("id") == rid:
+                r.update({k: v for k, v in upd.items() if not (k == "applied" and r.get("applied"))})
+        p.db.set_kv(KEY, st)
 
 
 def tried_entries(db, since: float, where=None) -> list[dict]:

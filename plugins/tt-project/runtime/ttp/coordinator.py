@@ -4357,8 +4357,13 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
             elif t == "sweep":
                 sweep.record(db, a, parse_start_after(a.get("start_after") or "now", tz=timefmt.home(p)), where=p)
             elif t == "self_change":
+                bound = a.get("id") if isinstance(a.get("id"), int) and not isinstance(a.get("id"), bool) else None
+                if bound is None and str(a.get("kind") or "").strip() in selfimprove.TASK_UNDO:
+                    makers = [tid for tid in new_tasks.values()   # the batch's one task that makes it
+                              if (db.task(tid) or {}).get("kind") in selfimprove.TASK_KINDS]
+                    bound = makers[0] if len(makers) == 1 else None
                 notes.append(selfimprove.add(p, a, parse_start_after(a.get("start_after") or selfimprove.DEFAULT_CHECK,
-                                                                     tz=timefmt.home(p)), settable=settable))
+                                                                     tz=timefmt.home(p)), settable=settable, task=bound))
             elif t == "look":
                 from . import looks
                 if a.get("enabled") is False:   # clears every pending look: back to the idle wake
