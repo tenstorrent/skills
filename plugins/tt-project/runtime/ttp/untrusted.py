@@ -633,18 +633,26 @@ def _mark_subst(cmd: str) -> tuple[str, list[str]] | None:
 def _mark_fed(words: list[str], named: bool) -> bool:
     """Whether a command that runs code or turns its input into words (MARK_RUNNER_RE, `.`, MARK_FEEDS)
     may get the mark's name: in its own words or redirects, from an earlier command of its pipeline that
-    names it, or from a heredoc or here-string when the line names it (`named`)."""
-    seg, seen, mention, here, target = [], False, False, False, False
+    names it, or from a heredoc or here-string when the line names it (`named`). An input redirect,
+    here-string or heredoc that gives the name (`< <(ls .../<mark>)`, `<<< ".../<mark>"`) may feed a
+    compound command (a loop's `done`, `}`, `)`) whose body the split here cannot see: then any such
+    command anywhere in the line counts."""
+    seg, seen, mention, here, target, fed, coded, given = [], False, False, False, False, False, False, False
     for w in words + [";"]:
         if target:
             target, mention = False, mention or RUN_MARK in w
+            fed = fed or given and RUN_MARK in w
         elif w and set(w) <= set("&<>") and set(w) & set("<>"):
-            target, here = True, here or w.startswith("<<")
+            heredoc = w.startswith("<<") and not w.startswith("<<<")
+            target, here, given = True, here or w.startswith("<<"), "<" in w and not heredoc
+            fed = fed or heredoc and named
         elif w and set(w) <= set(";&|()<>"):
             m = mention or any(RUN_MARK in x for x in seg)
             run = [x for x in seg if x not in ("{", "}", "!", "if", "then", "else", "elif", "do", "while", "until")]
             code = any(MARK_RUNNER_RE.fullmatch(os.path.basename(x)) for x in (seg[1:] if _mark_awk_read(run) else seg))
-            if (code or run[:1] == ["."] or run[:1] and run[0] in MARK_FEEDS) and (m or seen or here and named):
+            code = code or run[:1] == ["."] or bool(run[:1]) and run[0] in MARK_FEEDS
+            coded = coded or code
+            if code and (m or seen or here and named) or coded and fed:
                 return True
             seen = (seen or m) if w in ("|", "|&") else False
             seg, mention, here = [], False, False

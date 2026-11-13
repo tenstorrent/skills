@@ -643,7 +643,11 @@ def test_a_read_through_a_loop_variable_or_glob_or_prose_naming_the_mark_passes(
     f"cat /dev/null > $(echo {_M})", f"for d in $(ls); do rm $d/{_M}; done", f"ttp note `{_M}`",
     f"grep -l x state/runs/*/{_M} | python3 -c 'import os,sys; [os.remove(l.strip()) for l in sys.stdin]'",
     f"echo $(echo $(echo $(echo $(echo $(echo {_M})))))", f"cat {_M} | sh", f"tee $(echo $d)/{_M} < /dev/null",
-    f"x=$(ls $d/{_M}); rm $x", f"rm \"$(dirname $0)/{_M}\""])
+    f"x=$(ls $d/{_M}); rm $x", f"rm \"$(dirname $0)/{_M}\"",
+    # review #8557: a redirect on a compound command's closing word feeds the read loop inside it
+    f"while read f; do rm \"$f\"; done < <(ls $TTP_RUN_DIR/{_M})", f"{{ read f; rm \"$f\"; }} < <(ls $TTP_RUN_DIR/{_M})",
+    f"while read f; do cat \"$f\"; done < <(ls state/runs/*/{_M})", f"while read f; do rm \"$f\"; done <<< \"$TTP_RUN_DIR/{_M}\"",
+    f"(read f; rm \"$f\") < $TTP_RUN_DIR/{_M}", f"while read f; do rm \"$f\"; done <<EOF\n$TTP_RUN_DIR/{_M}\nEOF"])
 def test_a_write_through_a_substitution_pipe_or_read_loop_is_still_refused(env, tmp_path, monkeypatch, cmd):
     """A substitution whose text names the mark yields its name to the outer command; a pipe or
     here-string into code or a read loop, and deep nesting, still count as a write."""
