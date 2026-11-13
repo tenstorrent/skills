@@ -1484,7 +1484,8 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    prep validated them (a test in a case file runs where its aggregator collects it), and a transcript or
    diff naming a held-out or hidden path fails the cell. The arms run side by side, one cell at a time per
    model. A cell the endpoint ended (an HTTP 429 or another endpoint fault the chat bridge records) is
-   retried up to three more times after a growing pause, from five minutes; if it still faults it counts as
+   retried up to three more times after a growing pause, from five minutes (once a cell faults through every
+   retry, that model's later cells get one try until one gets through); if it still faults it counts as
    neither a pass nor a fail, and a model with more faulted than scored cells gets no verdict. Each cell's
    row (outcome, cheat-audit flags, fault, tries, wall time, cost) goes to
    `~/.tt-project/model-bench/<date>-cells/results.jsonl` as it ends. For the `babysit` class it replays 40 recorded
