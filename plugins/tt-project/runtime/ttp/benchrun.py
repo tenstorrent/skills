@@ -683,6 +683,8 @@ def _finish(row: dict, bench_dir: Path, task: dict, ws: Path, run: Path, keep: P
     transcript = (run / "output.jsonl").read_bytes() if (run / "output.jsonl").exists() else b""
     ended, handoff = _read_json(run / "exit.json"), _read_json(run / "result.json")
     ended = ended if isinstance(ended, dict) else {}
+    if isinstance(ended.get("ended"), (int, float)):   # the agent's own end: names this run's kept exit.json
+        row["cell_ended"] = ended["ended"]
     row.update(exit={k: ended[k] for k in ("rc", "stopped", "refused") if ended.get(k) is not None},
                handoff=handoff if handoff == "invalid" else str((handoff or {}).get("status") or "none"),
                transcript_sha256=_sha(transcript))

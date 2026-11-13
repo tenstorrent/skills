@@ -49,7 +49,7 @@ from typing import Callable
 REPLAY, INJECT, DECISIONS, PLANTED = 12, 4, 40, 10
 FAULT_TRIES, FAULT_PAUSE_S = 3, 300   # retries of an endpoint-faulted cell, the first pause (grows per try)
 CELL_FIELDS = ("task", "kind", "cell", "arm", "model", "outcome", "passed", "flagged", "flagged_injection", "followed",
-               "endpoint_fault", "why", "tries", "wall_s", "cost_usd", "output_tokens", "isolated")
+               "endpoint_fault", "why", "tries", "wall_s", "cost_usd", "output_tokens", "isolated", "cell_ended")
 UNSCORED = ("isolation_failed", "error", "not_isolated")   # a cell outcome that is the harness's, never the model's
 _APPEND = threading.Lock()   # the arms' threads append to the same files
 REQUESTS, TAKEN = "requests.jsonl", "requests.taken.jsonl"   # under modelbench.home()
@@ -513,7 +513,27 @@ def _replay_counts(rows: list[dict]) -> dict:
 
 
 LOCK = ".suite.lock"   # in a day's cells folder: held by the one suite run or re-audit writing it
-SAME_RUN_S = 30.0       # a cell row's `at` and its kept exit.json's `ended` are this close when one run wrote both
+SAME_RUN_S = 30.0       # clock slack between a cell row and its kept exit.json when one run wrote both
+GRADE_SLACK_S = 300.0   # past the test timeout: the audit, diff and copies between the agent's end and the row
+
+
+def same_run(r: dict, info, opts: dict | None = None) -> bool:
+    """Whether the kept exit.json `info` of a cell folder is the one row `r`'s run wrote. A row that records its
+    agent's end (`cell_ended`) must name it; an older row's `at` comes after the agent ended by the held-out
+    tests' grading (up to the test timeout), so the agent's end lies in that window before `at` and, where both
+    are known, its own run time matches the row's `wall_s`. A later run's folder ends after `at`."""
+    if not isinstance(info, dict) or not isinstance(ended := info.get("ended"), (int, float)) or \
+            not isinstance(at := r.get("at"), (int, float)):
+        return False
+    if isinstance(r.get("cell_ended"), (int, float)):
+        return abs(r["cell_ended"] - ended) <= 1.0
+    grade = float((opts or {}).get("test_timeout_s") or 900) + GRADE_SLACK_S
+    if not (at - grade - SAME_RUN_S <= ended <= at + SAME_RUN_S):
+        return False
+    started, wall = info.get("started"), r.get("wall_s")
+    if isinstance(started, (int, float)) and isinstance(wall, (int, float)):
+        return abs((ended - started) - wall) <= SAME_RUN_S
+    return True
 
 
 @contextlib.contextmanager
@@ -546,8 +566,8 @@ def reaudit(date: str, bench_dir: Path, opts: dict, models: list[str] | None = N
     (`reaudit` true, `was` its old outcome) goes to <date>-cells/results.jsonl, then each model's standard class
     row to <date>.jsonl with its replay pass rate over its isolated cells only (the injection fields kept from
     its last row) and its verdict to modelbench.record. A cell that did not run isolated stays void: never
-    re-scored, never in a rate. A row whose cell folder a later run wrote over (its exit.json gone, or `ended`
-    more than SAME_RUN_S from the row's `at`) is `overwritten`: listed, never re-audited, left out of the score.
+    re-scored, never in a rate. A row whose cell folder another run wrote over (its exit.json gone, or not the
+    one this row's run wrote: same_run) is `overwritten`: listed, never re-audited, left out of the score.
     Returns {"cells": [...], "models": [...], "overwritten": [...]}."""
     from . import modelbench
     now = time.time() if now is None else now
@@ -573,10 +593,7 @@ def _reaudit(date, out, bench_dir, opts, models, now, say) -> dict:
     cells, by_model, overwritten = [], {}, []
     for (model, tid), r in latest.items():
         keep, task = out / "cells" / f"{tid}-r1-{r.get('arm')}", tasks.get(tid)
-        ended = benchrun._read_json(keep / "exit.json")
-        ended = ended.get("ended") if isinstance(ended, dict) else None
-        if not isinstance(ended, (int, float)) or not isinstance(r.get("at"), (int, float)) or \
-                abs(r["at"] - ended) > SAME_RUN_S:
+        if not same_run(r, benchrun._read_json(keep / "exit.json"), opts):
             overwritten.append({"model": model, "task": r.get("task"), "outcome": r.get("outcome")})
             say(f"{model} task {tid}: overwritten (its cell folder is not this row's run), not re-audited")
             continue

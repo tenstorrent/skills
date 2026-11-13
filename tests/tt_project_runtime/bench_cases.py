@@ -1634,6 +1634,33 @@ def test_model_suite_reaudit_skips_a_cell_folder_a_later_run_wrote_over(env, tmp
     assert not (keep / "tests.reaudit.log").exists()
 
 
+def test_model_suite_reaudit_counts_a_cell_graded_long_after_its_agent_ended(env, tmp_path, monkeypatch):
+    # A cell row is written after the held-out tests ran, so its `at` follows the agent's end (exit.json `ended`)
+    # by the grading time: a minute or more on a large suite. That was read as another run's folder and the
+    # cell left out of the score. A row now names its agent's end (`cell_ended`); an older row is matched by
+    # the grading window and its own run time.
+    from ttp import modelsuite
+    d, out, tid, before = _reaudit_day(env, tmp_path, monkeypatch)
+    keep = out / "cells" / f"{tid}-r1-{before['m-iso']['arm']}"
+    info = json.loads((keep / "exit.json").read_text())
+    row = before["m-iso"]
+    assert row.get("cell_ended") == info["ended"], "a new cell row names its agent's end"
+    started, ended = row["at"] - 565, row["at"] - 60   # 505 s of agent, then 60 s of grading
+    (keep / "exit.json").write_text(json.dumps({**info, "started": started, "ended": ended}))
+    old = {k: v for k, v in row.items() if k != "cell_ended"}
+    old["wall_s"] = 505.4
+    (out / "results.jsonl").write_text("".join(json.dumps(r) + "\n" for r in (old, before["m-void"])))
+    opts = {**_bench_opts(tmp_path), "dry_run": True}
+    got = modelsuite.reaudit("2026-11-10", tmp_path / "bench", opts)
+    assert got["overwritten"] == [] and [c["outcome"] for c in got["cells"]] == ["pass"], got
+    assert modelsuite.same_run({**old, "wall_s": 200.0}, {"started": started, "ended": ended}) is False, \
+        "another run of the same folder took another time"
+    assert modelsuite.same_run(old, {"started": started - 5000, "ended": ended - 5000}) is False, "an earlier run"
+    assert modelsuite.same_run(old, {"started": started + 3600, "ended": ended + 3600}) is False, "a later run"
+    assert modelsuite.same_run({**old, "cell_ended": ended + 40}, {"started": started, "ended": ended}) is False
+    assert modelsuite.same_run(old, None) is False and modelsuite.same_run({}, {"ended": ended}) is False
+
+
 def test_model_suite_run_refuses_while_another_run_holds_the_day_folder(env, tmp_path, monkeypatch):
     from ttp import modelsuite
     p = make(env)
