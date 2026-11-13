@@ -23,7 +23,7 @@
     {
       "name": "tt-model-bringup",
       "source": "./plugins/tt-model-bringup",
-      "description": "Staged TTNN model bring-up with vLLM TT plugin serving; requires tt-autodebug. Codex runs add optional telemetry when tenstorrent/ar-dashboard is accessible."
+      "description": "Category-aware TTNN bring-up for text, computer-vision, and multimodal models; text supports vLLM serving and vision supports functional-first single-chip profiles. Requires tt-autodebug."
     },
     {
       "name": "tt-debug-tools",

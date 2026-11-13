@@ -1,0 +1,17 @@
+/goal Add task-specific serving for MODEL_NAME without using vLLM.
+
+As the user, I explicitly authorize subagents when a selected skill requires them.
+
+Use MODEL_CONTRACT and the accepted implementation. This stage applies only when serving is `task-api`. Do not inspect forbidden read roots.
+
+Scope every Git command and file inventory to MODEL_DIR or an authorized upstream path. Never run repository-wide `git status`, `git diff`, `rg`, `find` or equivalent discovery.
+
+Completion requirements:
+- Define request and response schemas from model inputs and outputs.
+- Keep preprocessing and postprocessing boundaries explicit.
+- Preserve state reset and request isolation.
+- Test malformed inputs, batching and repeated requests.
+- Measure endpoint latency separately from device latency.
+- Do not claim OpenAI or vLLM compatibility.
+- Run $stage-review; fix findings; obtain `clean-pass`.
+- Commit stage-owned changes locally; never push.

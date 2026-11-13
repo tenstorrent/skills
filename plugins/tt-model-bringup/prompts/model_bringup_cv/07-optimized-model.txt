@@ -1,0 +1,17 @@
+/goal Use $optimize and $tt-device-usage to optimize MODEL_NAME without changing its model contract.
+
+As the user, I explicitly authorize subagents when a selected skill requires them.
+
+Use MODEL_CONTRACT and the accepted fused baseline. Preserve raw outputs, state semantics and task metrics. Do not inspect forbidden read roots.
+
+Scope every Git command and file inventory to MODEL_DIR or an authorized upstream path. Never run repository-wide `git status`, `git diff`, `rg`, `find` or equivalent discovery.
+
+Completion requirements:
+- Measure warmed full-model latency before changes.
+- Optimize layouts, sharding, kernels and precision deliberately.
+- Keep only measured improvements passing correctness gates.
+- Rerun task metrics and runtime fallback audit.
+- Record final dtype, fidelity and program configurations.
+- Record reproducible before-and-after performance evidence.
+- Run $stage-review; fix findings; obtain `clean-pass`.
+- Commit stage-owned changes locally; never push.
