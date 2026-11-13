@@ -346,6 +346,7 @@ def launch(p, model: str, reference: bool = False) -> None:
     rt = str(Path(__file__).resolve().parent.parent)
     env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, [rt, os.environ.get("PYTHONPATH")]))}
     with open(folder() / f"{(REF + '-') * reference}{slug(model)}.log", "ab") as out:
+        # own session: the paced benchmark runner outlives the daemon tick that starts it
         subprocess.Popen([sys.executable, "-m", "ttp", "model-bench", "terminalbench", *(["--reference"] * reference),
                           "--runner", model],
                          cwd=p.root, env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
