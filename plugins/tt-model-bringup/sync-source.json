@@ -127,7 +127,7 @@
       "destination": "skills/datatype-sweep/SKILL.md",
       "blob": "457749253d5a2a220e7545c02f4e433cc984af12",
       "source_sha256": "25b874a7b6cf277e4e11d28c06c84056790b4ff61064defb24216ec1844d5764",
-      "packaged_sha256": "7d3e4b21d21a75d69d2ed2c23363e7f99e990f6610e00196439bf372ace4dbc0"
+      "packaged_sha256": "fef323433ee06f5991e08b939fa327fecd8467d4a2d7abf4421abaad9ee6f786"
     },
     {
       "source": ".agents/skills/datatype-sweep/agents/openai.yaml",
