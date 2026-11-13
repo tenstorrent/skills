@@ -81,8 +81,16 @@ to its first run, or to now for one still queued:
   testslots.project_max_from: the account's, its environment variable, the host's per-project worker
   ceiling or pool, or the project's own)), own_job (its own detached job or checks,
   or a retry_when on its own driver: no limit), the resource rule above only with a dispatch hold recorded
-  in the wait, a deferral or provider hold, else retry_wait (its own retry
-  condition, then a slot, not told apart: no limit, never counted against worker slots).
+  in the wait, a deferral or provider hold, else retry_wait: its own retry condition until the daemon's
+  ready check saw it ready (the next run's runs.note ready_wait "since", readywait.take; for a task still
+  queued, its passed retry timer), and the rest a worker_slots wait judged like any other. With no ready
+  record the two are not told apart: the whole wait stays retry_wait, counted as capacity unknown and never
+  against worker slots.
+
+Each lane has a `kind` (wait_kind): blocked (dependency, deferral, landed_chain, provider_gate, hold,
+retry_wait: the task could not start), execution (own_job: its own detached job or checks ran) or eligible
+(queue time while it could start). Only an eligible lane is ever slow or judged against capacity: blocked and
+execution time are reported with their label, never read as idle capacity.
 
 A lane is slow when the 90th percentile of its waits is over the threshold: P1_WAIT_S for priority 1
 tasks, else the longer of WAIT_S and the median worker run (a wait shorter than one run is normal
@@ -135,6 +143,29 @@ LEVERS = ("budget.max_parallel_workers", "review.sweep_after_s", "review.unrevie
 FORBIDDEN = re.compile(r"usd|spend|cap\b|_cap|gate|lock|hold|pause|restrict|review\.auto|before_push|reserve"
                        r"|credit|provider|budget\.(?!max_parallel_workers$)", re.I)
 FLOORS = {"review.sweep_after_s": 300, "delivery.push_batch_s": 60}
+
+
+# What a lane's waits are (each lane's "kind"): time the task could not start (blocked: a dependency, a
+# deferral or landed chain, a provider hold, a pause, its own retry condition), time it ran its own detached job
+# or checks (execution), or queue time while it could start (eligible). Only eligible time is judged against
+# capacity: a blocked or execution lane is reported with its label, never slow, never a sign of idle capacity.
+BLOCKED_LANES = frozenset({"dependency", "deferral", "landed_chain", "provider_gate", "hold", "retry_wait"})
+EXECUTION_LANES = frozenset({"own_job"})
+
+
+def wait_kind(lane: str) -> str:
+    """"blocked", "execution" or "eligible" (BLOCKED_LANES, EXECUTION_LANES)."""
+    return "blocked" if lane in BLOCKED_LANES else "execution" if lane in EXECUTION_LANES else "eligible"
+
+
+def _ready_since(run: dict | None) -> float | None:
+    """When the task of `run` became ready to start, as the daemon's ready check recorded it on the run
+    (its note's "ready_wait" "since", readywait.take), or None where no such record exists."""
+    try:
+        rw = (json.loads((run or {}).get("note") or "{}") or {}).get("ready_wait")
+        return float(rw["since"]) if isinstance(rw, dict) and rw.get("since") is not None else None
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return None
 
 
 def safe(key: str) -> bool:
@@ -434,10 +465,9 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
     lanes: dict[str, dict] = {}
 
     def lane(name: str, limit_key: str | None, limit) -> dict:
-        return lanes.setdefault(name, {"lane": name, "limit_key": limit_key, "limit": limit, "waits": [],
-                                       "p1": [], "at_limit": 0, "idle": 0, "unknown": 0, "serialized": 0,
-                                       "waiting_now": 0,
-                                       "measured": True})
+        return lanes.setdefault(name, {"lane": name, "kind": wait_kind(name), "limit_key": limit_key, "limit": limit,
+                                       "waits": [], "p1": [], "at_limit": 0, "idle": 0, "unknown": 0,
+                                       "serialized": 0, "waiting_now": 0, "measured": True})
 
     def add(ln: dict, w: float, prio: int, start: float, end: float, limit: int | None, queued: bool,
             known: bool = True) -> None:
@@ -838,13 +868,17 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
             nxt = next((float(r["started"]) for r in trs if float(r["started"]) > w0), None)
             if nxt is None or (k + 1 < len(evs) and float(evs[k + 1]["ts"]) < nxt):
                 continue   # the current wait below, or a later hand-off before the same run
-            spans_w.append((w0, nxt, _wait_for(t, e), False, _self_wait(e)))
+            ran = next(r for r in trs if float(r["started"]) > w0)
+            spans_w.append((w0, nxt, _wait_for(t, e), False, _self_wait(e), _ready_since(ran)))
         lr = last_run.get(t["id"])
         if lr and not lr["live"] and lr["ended"] and t["status"] in ("queued", "blocked", "waiting"):
-            # Its hand-off is the last event after its last run started, when there is one.
+            # Its hand-off is the last event after its last run started, when there is one. Still queued with
+            # its retry timer passed after the run (a probe that passed sets it to then): ready since that timer.
             mine = bool(evs and trs and float(evs[-1]["ts"]) >= float(trs[-1]["started"]) and _self_wait(evs[-1]))
-            spans_w.append((float(lr["ended"]), now, why, True, mine))
-        for s0, s1, reason, queued, selfw in spans_w:
+            nb = float(t.get("not_before") or 0)
+            ready_now = nb if t["status"] == "queued" and float(lr["ended"]) < nb <= now else None
+            spans_w.append((float(lr["ended"]), now, why, True, mine, ready_now))
+        for s0, s1, reason, queued, selfw, ready in spans_w:
             if s1 <= t0 or s1 < s0:
                 continue
             key = slot_held(t["id"], s0, s1)
@@ -886,9 +920,22 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
                     lane("own_job", None, None)["note"] = "the task's own detached job or checks ran: no limit"
                     add(lanes["own_job"], w1 - w0, prio, w0, w1, None, queued)
                 elif not by_rule(t, d if queued else {}, reason, w0, w1, prio, queued):
-                    lane("retry_wait", None, None)["note"] = ("its own retry condition, then a slot, not told apart: "
-                                                             "never counted against worker slots")
-                    add(lanes["retry_wait"], w1 - w0, prio, w0, w1, None, queued)
+                    # Its own retry condition until the ready check saw it ready (the next run's ready_wait,
+                    # or the timer of a task still queued), then a slot: only that queue time is judged
+                    # against the worker slots. With no ready record the two are not told apart, and none of
+                    # it counts against capacity.
+                    rl = lane("retry_wait", None, None)
+                    rl["note"] = ("its own retry condition (blocked) until it was ready, then a worker slot (eligible); "
+                                  "a wait with no ready record is not split and never counted against worker slots")
+                    cut = min(max(ready, w0), w1) if ready is not None else None
+                    if cut is None:
+                        rl["unknown"] += 1
+                    if (cut if cut is not None else w1) > w0:
+                        add(rl, (cut if cut is not None else w1) - w0, prio, w0, cut if cut is not None else w1, None,
+                            queued and cut is None)
+                    if cut is not None and w1 > cut:
+                        add(lane("worker_slots", "budget.max_parallel_workers", workers), w1 - cut, prio, cut, w1,
+                            workers, queued, known)
     # Reviews: a code task's last run ending to its review queued (sweep) and started (stall). A wait the
     # checks held is measured but judges neither limit (the swept and free lists plan() reads).
     sweep_s = float(_cfg(cfg, "review.sweep_after_s", 1800) or 0)
@@ -1060,7 +1107,8 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
                 ln.update({f"{k}_count": len(v), f"{k}_p90_s": round(_pct(v, 0.9))})
         ln.update(count=len(w), median_s=round(_pct(w, 0.5)), p90_s=round(_pct(w, 0.9)),
                   p1_count=len(p1), p1_p90_s=round(_pct(p1, 0.9)))
-        ln["slow"] = bool(ln["measured"] and ((p1 and _pct(p1, 0.9) > p1_s) or (w and _pct(w, 0.9) > other_s)))
+        ln["slow"] = bool(ln["measured"] and ln["kind"] == "eligible"
+                          and ((p1 and _pct(p1, 0.9) > p1_s) or (w and _pct(w, 0.9) > other_s)))
         if ln["lane"] == "worker_slots":
             ln["peak"] = peak
             if gate and int(gate.get("max_parallel") or workers) < workers:
@@ -1378,7 +1426,10 @@ def text(rep: dict) -> str:
         extra = "".join(f", {k} {ln[k]}" for k in ("peak", "gate_max", "backlog", "stalled") if ln.get(k) is not None) \
             + (f", {ln['raised']} at the limit before " + (f"raise #{ln['raised_by']['id']}"
                if ln["raised_by"].get("id") is not None else "a config raise") if ln.get("raised") else "")
-        out.append(f"- {ln['lane']}{' SLOW' if ln['slow'] else ''}: {ln['count']} wait(s), median {_dur(ln['median_s'])}, "
+        kind = {"blocked": " (blocked: could not start)", "execution": " (its own job ran)"}.get(ln.get("kind"), "")
+        if ln.get("kind") == "blocked" and ln.get("unknown"):
+            kind = f" (blocked; {ln['unknown']} with no ready record: capacity unknown)"
+        out.append(f"- {ln['lane']}{kind}{' SLOW' if ln['slow'] else ''}: {ln['count']} wait(s), median {_dur(ln['median_s'])}, "
                    f"p90 {_dur(ln['p90_s'])}" + (f" (priority 1: {ln['p1_count']}, p90 {_dur(ln['p1_p90_s'])})"
                                                  if ln["p1_count"] else "")
                    + (f"; limit {ln['limit_key']}={ln['limit']}" if ln.get("limit_key")

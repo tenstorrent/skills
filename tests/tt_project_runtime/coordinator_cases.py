@@ -17936,6 +17936,29 @@ def test_quiet_gate_settles_idle_wakes_but_never_unblock_or_sweep_kinds(env):
     assert not quiet([ev]), "a turn that started and never finished left nothing to match"
 
 
+def test_quiet_gate_settles_an_unchanged_idle_wake_with_no_open_task(env):
+    """A project with no open task at all is as quiet as one whose tasks are all held: its unchanged idle
+    wake or routine batch is settled model-free, within the same daily max age; a new task, a running one or
+    a changed state still runs."""
+    p = make(env)
+    from ttp import quietgate
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    p.db.x("UPDATE tasks SET status='done' WHERE status NOT IN ('done', 'cancelled', 'failed')")
+    now = time.time()
+    fp = quietgate.fingerprint(p.db, {}, "wake")
+    quietgate.left(p.db, fp, 1, now - 60)
+    ev = {"id": 1, "kind": "idle_capacity", "severity": "normal", "source": "daemon"}
+    assert quietgate.all_held(p.db, {}, now), "no open task: nothing a turn could start"
+    assert quietgate.quiet(p.db, {}, [], [], lambda: [], "idle", fp, now)
+    assert quietgate.quiet(p.db, {}, [ev], [], lambda: [], None, fp, now)
+    assert not quietgate.quiet(p.db, {}, [], [], lambda: [], "idle", fp, now + 2 * 86400), "the daily turn still runs"
+    t = p.db.add_task("new work", "s", origin="user")
+    assert not quietgate.all_held(p.db, {}, now), "a task that can start keeps the turn"
+    assert not quietgate.quiet(p.db, {}, [], [], lambda: [], "idle", quietgate.fingerprint(p.db, {}, "wake"), now)
+    p.db.update_task(t, status="running")
+    assert not quietgate.all_held(p.db, {}, now)
+
+
 def test_quiet_idle_wake_skips_back_off_over_days_and_never_overflow(env, monkeypatch):
     """A quiet idle-wake skip is a wake of its own: the next one waits the backed-off interval from it,
     not from the last turn, so skips stay a few per day; a stale last turn still runs; a large stored

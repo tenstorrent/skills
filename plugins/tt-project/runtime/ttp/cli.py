@@ -8888,6 +8888,7 @@ def _model_bench_argv(a) -> list[str]:
     if a.action != "suite":
         return ["run", *(["--force"] if a.force else [])]
     return ["suite", *(["--date", a.date] if a.date else []), *(["--dry-run"] if a.dry_run else []),
+            *(["--reaudit"] if getattr(a, "reaudit", False) else []),
             *(["--bench", a.bench] if a.bench else []), *(["--cells", a.cells] if a.cells else []),
             *(["--models", a.models] if a.models else []), *(["--class", a.cls] if a.cls else []),
             "--timeout", str(a.timeout), "--budget", str(a.budget), "--harbor", str(a.harbor)]
@@ -8947,6 +8948,20 @@ def _model_suite(p, a, now: float) -> None:
     """`ttp model-bench suite`: the daily cheat-resistant benchmark (modelsuite.py)."""
     from . import benchrun, endpoint, modelbench, modelrank, modelsuite
     cfg, ask = p.config(), None
+    if getattr(a, "reaudit", False):   # model-free: no endpoint, no agent
+        bench_dir = Path(a.bench).expanduser().resolve() if a.bench else \
+            (modelsuite.folders(modelbench.home()) or (None,))[0]
+        if not bench_dir:
+            die(f"model-bench suite --reaudit: no `ttp bench prep` folder under {modelbench.home()}; name one with --bench")
+        opts = {"test_cmd": benchrun.TEST_CMD, "test_timeout_s": 900, "dry_run": a.dry_run}
+        try:
+            got = modelsuite.reaudit(a.date or modelbench.day(now), bench_dir, opts,
+                                     [m.strip() for m in a.models.split(",") if m.strip()] if a.models else None, now,
+                                     say=lambda m: print(m, file=sys.stderr))
+        except (modelsuite.SuiteError, benchrun.BenchError) as e:
+            die(f"model-bench suite --reaudit: {e}")
+        print(json.dumps(got, indent=1))
+        return
     if a.dry_run:   # a fake agent and answerer, no spend; the ranking stands in for the served list
         served = modelrank.ranking(cfg) or die("model-bench suite --dry-run: set providers.chat.model_ranking")
     else:
@@ -15552,6 +15567,10 @@ def main(argv: list[str] | None = None) -> None:
                                                          "(the owner's daily schedule; output in the bench log)")
     s.add_argument("--date", help="suite: the day whose seeded draw to run (YYYY-MM-DD; default today)")
     s.add_argument("--dry-run", action="store_true", help="suite: a fake agent and answerer, no spend")
+    s.add_argument("--reaudit", action="store_true",
+                   help="suite: no model call: audit the day's recorded isolated replay cells again from their kept "
+                        "transcript and diff, grade those the audit had stopped, and rewrite the day's standard "
+                        "class rows (cells that did not run isolated stay void)")
     s.add_argument("--bench", help="suite: a `ttp bench prep` folder for the replay cells (default, with no "
                                    "--cells either: the newest complete prep and cells pair in the bench folder)")
     s.add_argument("--cells", help="suite: a `ttp bench cells` folder for the injection cells")

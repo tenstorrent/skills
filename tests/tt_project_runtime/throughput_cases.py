@@ -977,15 +977,16 @@ def test_throughput_a_wait_inside_a_pause_is_a_hold_with_no_limit_and_opens_no_t
                       now - 4 * 3600 + 60, "resource:boxC")
     rep = throughput.measure(p.db, p.config(), now=now, gates={})
     hold = _tp_lane(rep, "hold")
-    assert (hold["count"], hold["limit"], hold["limit_key"]) == (2, None, None) and hold["slow"]
+    assert (hold["count"], hold["limit"], hold["limit_key"], hold["kind"]) == (2, None, None, "blocked")
+    assert not hold["slow"], "time a pause held on purpose is blocked, never slow or idle capacity"
     assert not any(ln["lane"] in ("resource:boxA", "resource:boxB") and ln["count"] for ln in rep["lanes"])
     assert _tp_lane(rep, "resource:boxC")["count"] == 1
     _, kept = throughput.plan(p.db, p.config(), rep)
-    assert {k["lane"] for k in kept} >= {"hold", "resource:boxC"}
+    assert {k["lane"] for k in kept} >= {"resource:boxC"} and "hold" not in {k["lane"] for k in kept}
     made = slowcomplaint._followups(p.db, {**rep, "kept": kept}, [1])
     opened = p.db.task(made["opened"])
     assert "resource:boxC" in opened["title"] and "lane hold " not in opened["spec"] and made["listed"] is None
-    assert "hold SLOW" in throughput.text({**rep, "kept": kept})
+    assert "- hold (blocked: could not start):" in throughput.text({**rep, "kept": kept})
 
 
 def test_throughput_a_self_wait_or_its_own_job_is_own_job_not_its_resource(env, tmp_path, monkeypatch):
@@ -1883,3 +1884,48 @@ def test_host_checks_pool_counts_a_grant_rows_waited_s_and_an_old_rows_arrival_t
     rep = throughput.host_shares(now=now)
     assert rep["projects"]["proj-a"]["wait_s"] == 1, rep   # 1.4 s, the report's whole seconds; not 1200
     assert rep["projects"]["proj-b"]["wait_s"] == 900, rep
+
+
+def test_throughput_labels_waits_blocked_eligible_or_execution_and_judges_only_eligible_time(env):
+    """Each lane says what its waits were: blocked (a deferral, its own retry condition), execution (its own
+    detached job) or eligible queue time. A retry wait counts against the worker slots only from when the
+    daemon's ready check saw the task ready (the next run's ready_wait note); without that record it is not
+    split and its capacity is unknown. Blocked and execution lanes are never slow, so a long deferral or retry
+    condition is never read as idle-capacity waste."""
+    from ttp import throughput
+    p = make(env)
+    now = time.time()
+    p.set_config("budget.max_parallel_workers", 2)
+
+    def requeued(title, nxt, ready=None, kind="external"):
+        t = _tp_task(p, title, now - 23 * 3600)
+        _tp_run(p, t, now - 23 * 3600, now - 22 * 3600)
+        p.db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
+               (now - 22 * 3600 + 1, f"task:{t}", "task_waiting", "low", f"#{t} {title}: CI on the branch",
+                json.dumps({"wait": kind, "why": "hand-off", "for": "ci on the branch"}), "handled", t))
+        note = {"ready_wait": {"since": ready, "causes": {"dispatch": nxt - ready}}} if ready else {}
+        p.db.x("INSERT INTO runs(task, role, started, ended, status, note) VALUES(?,?,?,?,?,?)",
+               (t, "worker", nxt, nxt + 600, "ok", json.dumps(note)))
+        p.db.x("UPDATE tasks SET status='done' WHERE id=?", (t,))
+        return t
+
+    requeued("ready late", now - 3600, ready=now - 3600 - 2400)   # 20 h waiting on CI, then 40 min ready
+    requeued("no ready record", now - 3600)                       # 21 h, not told apart
+    requeued("own job", now - 3600, kind="self")
+    _tp_task(p, "deferred", now - 10 * 3600, labels=["start_when:test -e /nonexistent/x",
+                                                     f"deferred_since:{now - 10 * 3600}"])
+    rep = throughput.measure(p.db, p.config(), now=now, gates={})
+    rw, w = _tp_lane(rep, "retry_wait"), _tp_lane(rep, "worker_slots")
+    assert (rw["kind"], rw["slow"], rw["unknown"], rw["count"]) == ("blocked", False, 1, 2), rw
+    assert max(rw["p90_s"], rw["median_s"]) >= 20 * 3600 - 5, "the condition's own time stays blocked"
+    assert (w["kind"], w["p90_s"]) == ("eligible", 2400), \
+        "only the 40 min it was ready counts against the slots"
+    assert (_tp_lane(rep, "own_job")["kind"], _tp_lane(rep, "own_job")["slow"]) == ("execution", False)
+    dl = _tp_lane(rep, "deferral")
+    assert (dl["kind"], dl["slow"], dl["waiting_now"]) == ("blocked", False, 1)
+    assert not [ln["lane"] for ln in rep["lanes"] if ln["slow"] and ln["kind"] != "eligible"]
+    _, kept = throughput.plan(p.db, p.config(), rep)
+    assert not {k["lane"] for k in kept} & {"retry_wait", "own_job", "deferral"}, "no blocked or execution lane is judged"
+    txt = throughput.text({**rep, "kept": kept})
+    assert "- retry_wait (blocked; 1 with no ready record: capacity unknown):" in txt
+    assert "- own_job (its own job ran):" in txt and "- deferral (blocked: could not start):" in txt

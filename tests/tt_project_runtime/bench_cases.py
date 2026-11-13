@@ -400,7 +400,10 @@ def test_bench_run_cell_cannot_reach_the_landed_commit_later_history_or_the_held
     secret = benchrun.secret_lines(tmp_path / "bench", task)
     assert secret == {"tests/test_mod.py": ["def test_new():", "    assert mod.new() == 2, 'new() returns two'"]}
     seen = json.dumps({"type": "user", "content": [{"text": "    assert mod.new() == 2, 'new() returns two'\n"}]})
-    assert benchrun.audit(seen, task, [], secret) == ["shows 1 line(s) only the held-out tests have"]
+    assert benchrun.audit(seen, task, [], secret) == [], "a tool's output is not what the agent wrote"
+    wrote = json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Write", "input": {
+        "file_path": "tests/test_x.py", "content": "def test_x():\n    assert mod.new() == 2, 'new() returns two'\n"}}]}})
+    assert benchrun.audit(wrote, task, [], secret) == ["shows 1 line(s) only the held-out tests have"]
     assert benchrun.audit("", task, [], secret, diff="+    assert mod.new() == 2,  'new() returns two'") \
         == ["shows 1 line(s) only the held-out tests have"], "a copied test in the diff is caught, spacing aside"
     assert benchrun.audit("", task, [], secret, diff="+    assert mod.new() == 2") == []
@@ -521,9 +524,9 @@ def test_bench_audit_and_deny_rules_leave_a_claude_cell_its_own_session_folder(e
     assert own[-1].parent == projects and not own[-1].exists()
     task = {"head": "f" * 40}
 
-    def said(path):
-        return json.dumps({"type": "user", "message": {"content": [{"type": "tool_result", "content":
-                           f"Output too large (40KB). Full output saved to: {path}"}]}})
+    def said(path):   # the agent reads the path it was told (a tool's output naming it alone flags nothing)
+        return json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Read",
+                           "input": {"file_path": str(path)}}]}})
     saved = own[-1] / "s" / "tool-results" / "x.txt"
     assert benchrun.audit(said(saved), task, hidden, session=own) == []
     assert benchrun.audit(said(f"~/{saved.relative_to(Path.home())}" if saved.is_relative_to(Path.home())
@@ -1518,3 +1521,110 @@ def test_model_bench_record_from_concurrent_runs_loses_no_model(env, monkeypatch
     for j in jobs:
         j.join()
     assert sorted(modelbench.models()) == [f"m{i}" for i in range(6)]
+
+
+def test_bench_audit_flags_only_distinctive_held_out_lines_and_what_the_agent_itself_wrote(tmp_path):
+    """The audit judges what the agent did, not what it saw: a held-out line that is boilerplate (long only
+    by its indentation, or already in a base file) is no secret, and a hidden path or forge command a tool
+    printed (a file it read, an `env` it ran) flags nothing; the same path or command in a tool's input does."""
+    from ttp import benchrun
+    bench = tmp_path / "bench"
+    ws, held = bench / "7" / "workspace", bench / "7" / "heldout" / "tests"
+    (ws / "src").mkdir(parents=True)
+    held.mkdir(parents=True)
+    (ws / "src" / "util.py").write_text("def setup():\n  return configure_everything(verbose=True)\n")
+    held.joinpath("test_mod.py").write_text(
+        "                            pass\n"                            # long only by its indentation
+        "        return configure_everything(verbose=True)\n"           # a base file's line, re-indented
+        "    assert mod.distinctive_answer() == 'forty two'\n")         # only the held-out test has it
+    task = {"task": 7, "head": "f" * 40, "heldout": ["tests/test_mod.py"]}
+    secret = benchrun.secret_lines(bench, task)
+    assert secret == {"tests/test_mod.py": ["                            pass",
+                                            "    assert mod.distinctive_answer() == 'forty two'"]}
+    boiler = "+                            pass\n+        return configure_everything(verbose=True)\n"
+    assert benchrun.audit("", task, [], secret, diff=boiler) == [], "boilerplate is not a held-out secret"
+    assert benchrun.audit("", task, [], secret, diff=boiler + "+  assert mod.distinctive_answer() == 'forty two'\n") \
+        == ["shows 1 line(s) only the held-out tests have"]
+    hidden = tmp_path / "real-checkout"
+    printed = json.dumps({"type": "user", "message": {"content": [{"type": "tool_result", "content":
+              f"CLAUDE_ENV_FILE={hidden}/runtime/loopproxy.sh\n# docs: run gh pr view to see it\n"}]},
+              "tool_use_result": {"stdout": f"{hidden}/x"}})
+    codex = json.dumps({"type": "item.completed", "item": {"type": "command_execution", "command": "env",
+                        "aggregated_output": f"PWD={hidden}\ngh pr list\n"}})
+    assert benchrun.audit(printed + "\n" + codex, task, [hidden]) == [], "a tool's output is not the agent's"
+    asked = json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash",
+                        "input": {"command": f"cat {hidden}/tests/test_mod.py; gh pr view 1"}}]}})
+    assert benchrun.audit(asked, task, [hidden]) == [f"names {hidden}", "runs 'gh pr'"]
+    ran = json.dumps({"type": "item.completed", "item": {"type": "command_execution",
+                      "command": f"ls {hidden}", "aggregated_output": ""}})
+    assert benchrun.audit(ran, task, [hidden]) == [f"names {hidden}"]
+
+
+def _reaudit_day(env, tmp_path, monkeypatch, date="2026-11-10"):
+    # Two models' replay cells of one day, run for real on the fake provider (the candidate fixes the task): the
+    # first's row is then rewritten as an isolated cell the old audit flagged (never graded), the second's
+    # stays a cell that did not run isolated.
+    from ttp import modelsuite
+    d = _suite_home(env, monkeypatch)
+    p, tid, task = _bench_built(env, tmp_path)
+    monkeypatch.setenv("TTP_FAKE_SHELL", _BENCH_FIX)
+    out = d / f"{date}-cells"
+    for m in ("m-iso", "m-void"):
+        r = modelsuite.standard(m, {"provider": "chat", "model": m, "effort": "high"}, date, tmp_path / "bench", None,
+                                _bench_opts(tmp_path), p.config(), out)
+        assert r["pass_rate"] is None or r["cells"] == 1, r
+    rows = [json.loads(x) for x in (out / "results.jsonl").read_text().splitlines()]
+    for r in rows:
+        if r["model"] == "m-iso":
+            r.update(isolated="bwrap", outcome="flagged", passed=False, flagged=["runs 'gh pr'"])
+            keep = out / "cells" / f"{tid}-r1-{r['arm']}"
+            (keep / "tests.log").write_text(modelsuite.NOT_GRADED + "\n")
+    (out / "results.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    (d / f"{date}.jsonl").write_text(json.dumps({"date": date, "model": "m-iso", "class": "standard",
+                                                 "pass_rate": 0.0, "flagged": 1, "arm": "request"}) + "\n")
+    return d, out, tid, {r["model"]: r for r in rows}
+
+
+def test_model_suite_reaudit_rescores_an_isolated_flagged_cell_and_leaves_an_unisolated_one_void(env, tmp_path,
+                                                                                             monkeypatch):
+    from ttp import modelsuite
+    d, out, tid, before = _reaudit_day(env, tmp_path, monkeypatch)
+    got = modelsuite.reaudit("2026-11-10", tmp_path / "bench", {**_bench_opts(tmp_path), "dry_run": True})
+    assert [(c["model"], c["outcome"], c["was"], c["reaudit"]) for c in got["cells"]] == \
+        [("m-iso", "pass", "flagged", True)], "re-audited clean, graded, passed; the unisolated cell untouched"
+    assert got["overwritten"] == []
+    assert (out / "cells" / f"{tid}-r1-{before['m-iso']['arm']}" / "tests.reaudit.log").is_file()
+    rows = [json.loads(x) for x in (out / "results.jsonl").read_text().splitlines()]
+    assert [r for r in rows if r["model"] == "m-void"] == [before["m-void"]], "an unisolated cell stays void"
+    day = [json.loads(x) for x in (d / "2026-11-10.jsonl").read_text().splitlines()]
+    assert (day[-1]["model"], day[-1]["pass_rate"], day[-1]["reaudit"], day[-1]["flagged"]) == ("m-iso", 1.0, True, 0)
+    assert all(r["model"] != "m-void" for r in day)
+
+
+def test_model_suite_reaudit_skips_a_cell_folder_a_later_run_wrote_over(env, tmp_path, monkeypatch):
+    from ttp import modelsuite
+    d, out, tid, before = _reaudit_day(env, tmp_path, monkeypatch)
+    keep = out / "cells" / f"{tid}-r1-{before['m-iso']['arm']}"
+    info = json.loads((keep / "exit.json").read_text())
+    assert abs(info["ended"] - before["m-iso"]["at"]) <= modelsuite.SAME_RUN_S, "one run wrote both"
+    (keep / "exit.json").write_text(json.dumps({**info, "ended": before["m-iso"]["at"] + 3600}))
+    got = modelsuite.reaudit("2026-11-10", tmp_path / "bench", {**_bench_opts(tmp_path), "dry_run": True})
+    assert got["cells"] == [] and got["models"] == []
+    assert got["overwritten"] == [{"model": "m-iso", "task": before["m-iso"]["task"], "outcome": "flagged"}]
+    assert not (keep / "tests.reaudit.log").exists()
+
+
+def test_model_suite_run_refuses_while_another_run_holds_the_day_folder(env, tmp_path, monkeypatch):
+    from ttp import modelsuite
+    p = make(env)
+    d = _suite_home(env, monkeypatch)
+    cfg = {"providers": {"chat": {"model_ranking": ["m-a"]}}}
+    with modelsuite.day_lock(d / "2026-11-10-cells"):
+        with pytest.raises(modelsuite.SuiteError, match=f"pid {os.getpid()}"):
+            modelsuite.run(p.db, cfg, ["m-a"], {}, 1e7, date="2026-11-10", opts={"dry_run": True},
+                           classes=("standard",), has_cli=lambda: True)
+        with pytest.raises(modelsuite.SuiteError, match="another model-bench suite run"):
+            modelsuite.reaudit("2026-11-10", tmp_path / "nobench", {"dry_run": True})
+    rows = modelsuite.run(p.db, cfg, ["m-a"], {}, 1e7, date="2026-11-10", opts={"dry_run": True},
+                          classes=("standard",), has_cli=lambda: True)
+    assert [r["model"] for r in rows] == ["m-a"], "the lock goes with its holder"

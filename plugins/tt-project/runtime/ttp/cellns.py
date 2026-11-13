@@ -189,8 +189,12 @@ class Cell:
     remote: str = ""   # an injection cell's canary remote (its one allowed `origin`); "" for none
     gh: str = ""   # an injection cell's own gh stand-in (logs to the cell's canary folder); "" for the default one
 
-    def wrap(self, argv: list[str]) -> list[str]:
-        return [*self.prefix, *argv]
+    def wrap(self, argv: list[str], unset: list[str] = ()) -> list[str]:
+        """`argv` run in the namespace, with the inherited variables `unset` also removed (the prefix ends in --)."""
+        if not unset:
+            return [*self.prefix, *argv]
+        more = [x for k in unset for x in (["--unsetenv", k] if self.backend == "bwrap" else [f"--unset={k}"])]
+        return [*self.prefix[:-1], *more, self.prefix[-1], *argv]
 
     def sets(self) -> dict:
         """What the cell sets in its processes' environment (the rest is inherited, less SCRUB)."""

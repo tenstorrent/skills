@@ -31,12 +31,14 @@ runs where the claude CLI is missing (spill hosts hold none) and runs at nice NI
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
 import random
 import re
 import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -451,6 +453,181 @@ def standard(model: str, arm: dict, date: str, bench_dir: Path | None, cells_dir
             "cell_rows": every}
 
 
+NOT_GRADED = "not graded: flagged by the cheat audit"   # benchrun._finish's tests.log of a flagged cell
+
+
+def _rows(path: Path) -> list[dict]:
+    # The JSON rows of a results file, a line torn by a crash skipped.
+    out = []
+    for line in path.read_text(errors="replace").splitlines() if path.is_file() else ():
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict):
+            out.append(row)
+    return out
+
+
+def _session_conf(run_json: dict) -> str | None:
+    # The cell's own Claude config folder, as its run set it (in the env, or inside the namespace's prefix).
+    if (v := (run_json.get("env") or {}).get("CLAUDE_CONFIG_DIR")):
+        return v
+    argv = [str(x) for x in run_json.get("argv") or []]
+    for i, x in enumerate(argv):
+        if x == "--setenv" and argv[i + 1:i + 2] == ["CLAUDE_CONFIG_DIR"] and i + 2 < len(argv):
+            return argv[i + 2]
+        if x.startswith("--set=CLAUDE_CONFIG_DIR="):
+            return x.split("=", 2)[2]
+    return None
+
+
+def _regrade(bench_dir: Path, task: dict, patch: str, opts: dict) -> tuple[bool | None, str]:
+    """The held-out grade (benchrun.grade) of a recorded candidate: its kept diff applied to a fresh copy of the
+    base workspace, graded in a fresh venv. (None, why) when the diff does not apply: unscored, never a fail."""
+    from . import benchrun, cellenv
+    tmp = Path(tempfile.mkdtemp(prefix="reaudit-"))
+    try:
+        ws = tmp / "work"
+        shutil.copytree(bench_dir / str(task["task"]) / "workspace", ws, symlinks=True)
+        if patch.strip():
+            (tmp / "diff.patch").write_text(patch)
+            r = subprocess.run(["git", "-C", str(ws), "apply", "--whitespace=nowarn", str(tmp / "diff.patch")],
+                               capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+            if r.returncode:
+                return None, f"the kept diff does not apply to the base workspace: {(r.stderr or r.stdout)[-300:]}"
+        venv = cellenv.make(tmp / "grade-venv", opts.get("cell_packages", cellenv.SEED))
+        return benchrun.grade(ws, bench_dir, task, opts.get("test_cmd") or benchrun.TEST_CMD,
+                              float(opts.get("test_timeout_s") or 900), cellenv.env(venv, benchrun._clean_env()))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _replay_counts(rows: list[dict]) -> dict:
+    # The standard class row's replay fields (standard()) over one model's cells.
+    return {"pass_rate": _rate(rows), "scored": sum(r.get("outcome") not in UNSCORED for r in rows),
+            "not_isolated": sum(r.get("outcome") == "not_isolated" for r in rows),
+            "flagged": sum(r.get("outcome") == "flagged" for r in rows),
+            "faults": sum(r.get("outcome") in ("isolation_failed", "error") and not r.get("endpoint_fault")
+                          for r in rows),
+            "endpoint_faults": sum(bool(r.get("endpoint_fault")) for r in rows)}
+
+
+LOCK = ".suite.lock"   # in a day's cells folder: held by the one suite run or re-audit writing it
+SAME_RUN_S = 30.0       # a cell row's `at` and its kept exit.json's `ended` are this close when one run wrote both
+
+
+@contextlib.contextmanager
+def day_lock(out: Path):
+    """Hold the day's cells folder `out` alone for one suite run or re-audit: two runs writing the same
+    results.jsonl and cells/<task>-r1-<model>/ folders at once would mix their transcripts. A second one
+    refuses at start (SuiteError naming the holder's pid); the lock goes with the process, so a crash leaves none."""
+    import fcntl
+    out.mkdir(parents=True, exist_ok=True)
+    fd = os.open(out / LOCK, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            holder = os.pread(fd, 64, 0).decode(errors="replace").strip() or "unknown"
+            raise SuiteError(f"another model-bench suite run (pid {holder}) is writing {out.name}; wait for it to "
+                             f"end, or run this one under another --date") from None
+        os.ftruncate(fd, 0)
+        os.pwrite(fd, str(os.getpid()).encode(), 0)
+        yield
+    finally:
+        os.close(fd)
+
+
+def reaudit(date: str, bench_dir: Path, opts: dict, models: list[str] | None = None, now: float | None = None,
+            say: Callable[[str], None] = lambda m: None) -> dict:
+    """`ttp model-bench suite --reaudit`, model-free: the day's recorded replay cells that ran isolated
+    (`isolated` set) audited again (benchrun.audit) from what each kept (output.jsonl, diff.patch, run.json),
+    and graded on the held-out tests (_regrade) where the audit had stopped the grade. Each one's corrected row
+    (`reaudit` true, `was` its old outcome) goes to <date>-cells/results.jsonl, then each model's standard class
+    row to <date>.jsonl with its replay pass rate over its isolated cells only (the injection fields kept from
+    its last row) and its verdict to modelbench.record. A cell that did not run isolated stays void: never
+    re-scored, never in a rate. A row whose cell folder a later run wrote over (its exit.json gone, or `ended`
+    more than SAME_RUN_S from the row's `at`) is `overwritten`: listed, never re-audited, left out of the score.
+    Returns {"cells": [...], "models": [...], "overwritten": [...]}."""
+    from . import modelbench
+    now = time.time() if now is None else now
+    out = modelbench.home() / f"{date}-cells"
+    with day_lock(out):
+        return _reaudit(date, out, bench_dir, opts, models, now, say)
+
+
+def _reaudit(date, out, bench_dir, opts, models, now, say) -> dict:
+    from . import benchrun, modelbench
+    from .project import durable_write
+    d = modelbench.home()
+    man = benchrun.verified(bench_dir)
+    tasks = {str(t["task"]): {**t, "repo": man.get("repo")} for t in man["tasks"]}
+    want = set(models or [])
+    latest: dict[tuple, dict] = {}   # the newest isolated replay row of each (model, task)
+    for r in _rows(out / "results.jsonl"):
+        if r.get("kind") == "injection" or r.get("task") is None or not r.get("isolated") or \
+                (want and r.get("model") not in want):
+            continue
+        latest[(r.get("model"), str(r["task"]))] = r
+    cells, by_model, overwritten = [], {}, []
+    for (model, tid), r in latest.items():
+        keep, task = out / "cells" / f"{tid}-r1-{r.get('arm')}", tasks.get(tid)
+        ended = benchrun._read_json(keep / "exit.json")
+        ended = ended.get("ended") if isinstance(ended, dict) else None
+        if not isinstance(ended, (int, float)) or not isinstance(r.get("at"), (int, float)) or \
+                abs(r["at"] - ended) > SAME_RUN_S:
+            overwritten.append({"model": model, "task": r.get("task"), "outcome": r.get("outcome")})
+            say(f"{model} task {tid}: overwritten (its cell folder is not this row's run), not re-audited")
+            continue
+        fixed = dict(r)
+        if r.get("outcome") in ("pass", "fail", "flagged") and task and (keep / "output.jsonl").is_file():
+            run_json = benchrun._read_json(keep / "run.json")
+            run_json = run_json if isinstance(run_json, dict) else {}
+            ws = Path(str(run_json.get("cwd") or "/nonexistent/work"))
+            hidden = benchrun.hidden_paths(bench_dir.resolve(), out.resolve(), [task.get("repo"), opts.get("repo")],
+                                           opts.get("state"))
+            diff = (keep / "diff.patch").read_text(errors="replace") if (keep / "diff.patch").is_file() else ""
+            flags = benchrun.audit((keep / "output.jsonl").read_text(errors="replace"), task, hidden,
+                                   benchrun.secret_lines(bench_dir, task), diff,
+                                   benchrun.session_dirs(ws, _session_conf(run_json)))
+            log = (keep / "tests.log").read_text(errors="replace") if (keep / "tests.log").is_file() else ""
+            if flags:
+                fixed.update(outcome="flagged", passed=False)
+            elif r.get("outcome") == "flagged" or log.startswith(NOT_GRADED):
+                passed, tail = _regrade(bench_dir, task, diff, opts)
+                durable_write(keep / "tests.reaudit.log", tail)
+                fixed.update(outcome="error" if passed is None else "pass" if passed else "fail", passed=bool(passed))
+                if passed is None:
+                    fixed["why"] = [tail[:300]]
+            fixed.update(flagged=flags)
+        elif r.get("outcome") in ("pass", "fail", "flagged"):
+            fixed.update(outcome="error", passed=False,
+                         why=["re-audit: the cell's kept transcript or its task in the bench folder is gone"])
+        fixed.update(reaudit=True, was=r.get("outcome"), at=now)
+        _append(out / "results.jsonl", fixed)
+        say(f"{model} task {tid}: {r.get('outcome')} -> {fixed['outcome']}" +
+            (f" ({'; '.join(fixed['flagged'])})" if fixed.get("flagged") else ""))
+        cells.append(fixed)
+        by_model.setdefault(model, []).append(fixed)
+    day = _rows(d / f"{date}.jsonl")
+    rows = []
+    for model, mine in by_model.items():
+        last = {r.get("class"): r for r in day if r.get("model") == model}
+        prev = last.get("standard") or {}
+        row = {**{k: v for k, v in prev.items() if k != "cell_rows"}, "date": date, "model": model,
+               "class": "standard", "at": now, "reaudit": True, **_replay_counts(mine)}
+        row.update(scored(row, SUITE))
+        _append(d / f"{date}.jsonl", row)
+        rows.append(row)
+        if not opts.get("dry_run") and not row.get("dry_run"):   # with the day's other class rows, Terminal-Bench aside
+            got = verdict([row, *(r for c, r in last.items() if c in CLASS_TIER and c != "standard")], model,
+                          row.get("arm") or "request")
+            if got:
+                modelbench.record({model: got}, now, "suite")
+    return {"cells": cells, "models": rows, "overwritten": overwritten}
+
+
 def scored(r: dict, suite: str) -> dict:
     """The fields modelscore.bench reads from a row: `score` (its pass rate), `inject_ok` (no injection
     followed; only when injection cells were scored, so an untested model is never cleared) and `suite`
@@ -491,6 +668,13 @@ def run(db, cfg: dict, served: list[str], parked: dict[str, float], now: float, 
         raise SuiteError("babysit cases need the chat endpoint's ask")
     ask = ask or (lambda m, p: "skip")   # the dry run's answerer: no model is called
     out = d / f"{date}-cells"
+    with day_lock(out):
+        return _run(d, date, out, cfg, picked, cases, ask, classes, bench_dir, cells_dir, opts, now, models,
+                    harbor_runner)
+
+
+def _run(d, date, out, cfg, picked, cases, ask, classes, bench_dir, cells_dir, opts, now, models, harbor_runner):
+    from . import modelbench
     n_tb = int(opts.get("harbor_tasks") or 0) if not opts.get("dry_run") else 0   # off by default
     if n_tb > 0 and picked:   # its venv is built once, before the arms share it
         from . import harborslice

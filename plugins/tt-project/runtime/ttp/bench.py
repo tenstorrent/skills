@@ -112,10 +112,15 @@ def _changed(repo: Path, base: str, head: str) -> tuple[list[str], int]:
     return [x[1:].strip() for x in diff if x.startswith("+") and not x.startswith("+++")], lines
 
 
+def flat(line: str) -> str:
+    """`line` with its whitespace collapsed: indentation and spacing never make a line quotable."""
+    return " ".join(line.split())
+
+
 def quotes(spec: str, added: list[str]) -> int:
-    """How many distinct added non-test lines of QUOTE_LEN characters or more `spec` quotes."""
-    body = " ".join(spec.split())
-    return len({x for x in added if len(x) >= QUOTE_LEN and " ".join(x.split()) in body})
+    """How many distinct added non-test lines of QUOTE_LEN characters or more (whitespace collapsed) `spec` quotes."""
+    body = flat(spec)
+    return len({f for x in added if len(f := flat(x)) >= QUOTE_LEN and f in body})
 
 
 WITHHELD = "[path withheld]"

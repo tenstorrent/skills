@@ -1,4 +1,5 @@
 """Skip a routine coordinator turn while every open task is held and nothing new arrived (quiet: all held).
+A project with no open task at all counts as all held: its idle wakes are settled the same way.
 
 Every open task is held when each one is queued, waiting or blocked and held by something no turn can
 lift: a user pause (userpause.probe_of: its only hold is a probe of a user marker file), a deferral (a
@@ -80,7 +81,7 @@ def hold(task: dict, paused: dict, cfg: dict, now: float) -> str | None:
 def all_held(db, cfg: dict, now: float) -> bool:
     tasks = db.q(f"SELECT * FROM tasks WHERE status NOT IN ({','.join('?' * len(CLOSED))})", CLOSED)
     paused = db.paused_resources()
-    return bool(tasks) and all(hold(t, paused, cfg, now) for t in tasks)
+    return all(hold(t, paused, cfg, now) for t in tasks)   # no open task at all: nothing a turn could start either
 
 
 def fingerprint(db, cfg: dict, wake_fp: str, pause=None, ledger=None) -> str:

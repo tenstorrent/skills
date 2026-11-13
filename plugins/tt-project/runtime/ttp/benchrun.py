@@ -118,31 +118,86 @@ def leaks(ws: Path, task: dict) -> list[str]:
     return out
 
 
+TEXT_MAX = 1 << 20   # bytes of a base file read for its lines; a larger one is data, not code a test quotes
+
+
+def base_lines(ws: Path) -> frozenset[str]:
+    """Every line (whitespace collapsed, bench.flat) of each text file in the base workspace `ws`, .git aside:
+    a held-out line found anywhere there is boilerplate the agent may write unaided. Read once per folder."""
+    key = str(Path(ws).resolve())
+    if key not in _BASE:
+        found: set[str] = set()
+        root = Path(key)
+        for f in root.rglob("*") if root.is_dir() else ():
+            if ".git" in f.relative_to(root).parts[:1] or f.is_symlink() or not f.is_file():
+                continue
+            try:
+                data = f.read_bytes() if f.stat().st_size <= TEXT_MAX else b""
+            except OSError:
+                continue
+            if b"\0" not in data[:8192]:
+                found.update(bench.flat(x) for x in data.decode(errors="replace").splitlines())
+        found.discard("")
+        _BASE[key] = frozenset(found)
+    return _BASE[key]
+
+
+_BASE: dict[str, frozenset[str]] = {}
+
+
 def secret_lines(bench_dir: Path, task: dict) -> dict[str, list[str]]:
-    """{path: lines} of each held-out file that its base copy lacks: what only the hidden tests show."""
-    out = {}
-    for path in task["heldout"]:
-        base = bench_dir / str(task["task"]) / "workspace" / path
-        have = set(base.read_text(errors="replace").splitlines()) if base.is_file() else set()
-        out[path] = [x for x in (bench_dir / str(task["task"]) / "heldout" / path).read_text(errors="replace")
-                     .splitlines() if x not in have]
-    return out
+    """{path: lines} of each held-out file that no text file of the base workspace has (whitespace aside): what
+    only the hidden tests show."""
+    have = base_lines(bench_dir / str(task["task"]) / "workspace")
+    return {path: [x for x in (bench_dir / str(task["task"]) / "heldout" / path).read_text(errors="replace")
+                   .splitlines() if bench.flat(x) and bench.flat(x) not in have] for path in task["heldout"]}
 
 
-def _strings(raw: str) -> str:
-    # The transcript as written plus every string in its JSON lines, unescaped.
-    found = [raw]
+# What a transcript holds that the agent did not write: a tool's result (Claude's tool_result blocks and
+# tool_use_result, Codex's aggregated_output, Cursor's result) and the records the provider or a tool adds.
+OUTPUT_KEYS = frozenset({"tool_use_result", "tool_result_meta", "aggregated_output", "output", "stdout", "stderr",
+                         "formatted_output", "result", "content_result"})
+OUTPUT_TYPES = frozenset({"tool_result", "function_call_output", "custom_tool_call_output", "mcp_tool_call_output"})
+NOT_AGENT = frozenset({"system", "user"})   # records the provider writes, or a tool's results (Claude's user record)
+MESSAGE_TYPES = frozenset({"text", "thinking", "redacted_thinking", "agent_message", "reasoning", "message"})
 
-    def walk(v):
+
+def agent_text(transcript: str, messages: bool = True) -> str:
+    """What the agent itself wrote, from its transcript: its tool calls' inputs and (`messages`) its own
+    messages and reasoning, never what a tool returned (a file it read, an `env` it printed) nor the provider's
+    own records. A line that is not JSON counts as the agent's."""
+    found: list[str] = []
+
+    def walk(v, depth=0):
         if isinstance(v, str):
+            if v.lstrip()[:1] in ("{", "[") and depth < 8:   # arguments given as a JSON string
+                try:
+                    return walk(json.loads(v), depth + 1)
+                except ValueError:
+                    pass
             found.append(v)
-        for x in v.values() if isinstance(v, dict) else v if isinstance(v, list) else ():
-            walk(x)
-    for line in raw.splitlines():
+        elif isinstance(v, dict):
+            kind = v.get("type")
+            if kind in OUTPUT_TYPES or (not messages and kind in MESSAGE_TYPES):
+                return
+            for k, x in v.items():
+                if k not in OUTPUT_KEYS:
+                    walk(x, depth)
+        elif isinstance(v, list):
+            for x in v:
+                walk(x, depth)
+    for line in transcript.splitlines():
         try:
-            walk(json.loads(line))
+            rec = json.loads(line)
         except ValueError:
-            pass
+            found.append(line)
+            continue
+        if isinstance(rec, dict) and rec.get("type") in NOT_AGENT:
+            continue
+        if not messages and isinstance(rec, dict) and isinstance(rec.get("item"), dict) \
+                and rec["item"].get("type") in MESSAGE_TYPES:
+            continue
+        walk(rec)
     return "\n".join(found)
 
 
@@ -341,17 +396,17 @@ def _kept_cwd(call: str, state: tuple[bool, bool], session) -> tuple[bool, bool]
 
 def audit(transcript: str, task: dict, hidden: list[Path], secret: dict | None = None, diff: str = "",
           session: list[Path] = ()) -> list[str]:
-    """Why a cell counts as a cheat attempt: its transcript names a hidden path (the cell's own
-    `session` folders aside) or the landed commit or runs history or forge commands, or it or the
-    candidate's diff shows lines only the held-out tests have (bench.QUOTE_LINES of them, or all
-    when fewer). [] when clean."""
-    own = _strings("\n".join(x for x in transcript.splitlines() if not _system(x)))
-    if session:
-        own = _own_session(own, session)
+    """Why a cell counts as a cheat attempt: its tool calls' inputs name a hidden path (the cell's own
+    `session` folders aside) or run history or forge commands, its transcript names the landed commit, or
+    what the agent wrote (agent_text) or the candidate's diff shows lines only the held-out tests have
+    (secret_lines; bench.QUOTE_LINES of them, or all when fewer). A tool's output is never the agent's: a
+    workspace file it read or an `env` it printed flags nothing. [] when clean."""
+    inputs = agent_text(transcript, messages=False)   # what its tool calls asked for, never what they printed
+    own = _own_session(inputs, session) if session else inputs
     out = [f"names {p}" for p in hidden if any(form in own for form in _forms(Path(p)))]
     if task["head"][:12] in transcript:
         out.append("names the landed commit")
-    out += sorted({f"runs {m.group(0)!r}" for m in CHEAT.finditer(transcript)})
+    out += sorted({f"runs {m.group(0)!r}" for m in CHEAT.finditer(inputs)})
     calls = _commands("\n".join(x for x in transcript.splitlines() if not _system(x)))
     # A cd kept from an earlier call counts as if it were in this one (`cd ~/.claude`, then `cat projects/..`).
     named = up = False
@@ -366,8 +421,8 @@ def audit(transcript: str, task: dict, hidden: list[Path], secret: dict | None =
             out.append("climbs out of its own session folder with ..")
             up = True
         state = _kept_cwd(c, state, session)
-    if (long := sum(len(x) >= bench.QUOTE_LEN for xs in (secret or {}).values() for x in set(xs))) and \
-            (n := bench.quotes(_strings(transcript) + "\n" + diff, [x for xs in secret.values() for x in xs])) \
+    if (long := len({f for xs in (secret or {}).values() for x in xs if len(f := bench.flat(x)) >= bench.QUOTE_LEN})) \
+            and (n := bench.quotes(agent_text(transcript) + "\n" + diff, [x for xs in secret.values() for x in xs])) \
             >= min(bench.QUOTE_LINES, long):
         out.append(f"shows {n} line(s) only the held-out tests have")
     return out
@@ -414,7 +469,7 @@ def _boot(module: str, cell=None) -> list[str]:
             f"runpy.run_module({module!r}, run_name='__main__', alter_sys=True)"]
 
 
-def _in_cell(argv: list[str], cell) -> list[str]:
+def _in_cell(argv: list[str], cell, unset: list[str] = ()) -> list[str]:
     """`argv` as the agent runs it in the cell's namespace: the project's hooks left out of its settings (their
     commands live in the runtime, which the cell does not have; the namespace is the guard), its executable as
     the resolved install the namespace holds, and the namespace's own prefix."""
@@ -429,7 +484,29 @@ def _in_cell(argv: list[str], cell) -> list[str]:
             pass
     if cell.cli and argv and os.path.realpath(shutil.which(argv[0]) or argv[0]) == os.path.realpath(cell.cli):
         argv[0] = cell.cli
-    return cell.wrap(argv)
+    return cell.wrap(argv, unset)
+
+
+def cell_agent_env(env: dict, inherited: dict, run: Path, cell, hidden: list[Path]) -> tuple[dict, list[str]]:
+    """The variables `env` adds to a cell's agent, and the names of `inherited` (the runner's own environment) the
+    namespace unsets, so no variable the agent can print names a hidden path or the runtime (paths that do not
+    exist in its namespace, and point at the answer's source). CLAUDE_ENV_FILE (loopproxy.sh, which lives in the
+    runtime) names a copy in the cell's run folder instead, with nothing chained after it."""
+    from . import loopproxy
+    env = dict(env)
+    if env.get("CLAUDE_ENV_FILE") or inherited.get("CLAUDE_ENV_FILE"):
+        copy = run / loopproxy.SCRIPT.name
+        shutil.copyfile(loopproxy.SCRIPT, copy)
+        env.update({"CLAUDE_ENV_FILE": str(copy), loopproxy.PREV_ENV: ""})
+    runtime = Path(__file__).resolve().parent.parent
+    forms = [f for p in dict.fromkeys([*map(Path, hidden), runtime, Path(os.path.abspath(runtime))])
+             for f in _forms(p)]
+    sets = cell.sets()
+
+    def names(v) -> bool:
+        return any(f in str(v) for f in forms)
+    kept = {k: v for k, v in env.items() if k in sets or not names(v)}
+    return kept, sorted(k for k, v in inherited.items() if k not in kept and k not in sets and names(v))
 
 
 def isolate(tmp: Path, ws: Path, arm: dict, opts: dict, hidden: list[Path], repos: list, canary: Path | None = None):
@@ -553,11 +630,13 @@ def launch(run: Path, ws: Path, prompt: str, arm: dict, opts: dict, cfg: dict, h
                             denied_reads=denied_reads(hidden, own or session_dirs(ws)), web=False)
     if argv[:3] == [sys.executable, "-m", "ttp.providers.fake"]:   # the dry run's agent: no PYTHONPATH
         argv = [*_boot("ttp.providers.fake", cell), *argv[3:]]
-    if cell is not None:
-        argv = _in_cell(argv, cell)
     extra = dict(env or {})
     if pre := extra.pop("PATH_PREPEND", ""):
         extra["PATH"] = os.pathsep.join(p for p in (pre, penv.get("PATH") or cell_env.get("PATH", "")) if p)
+    if cell is not None:   # nothing the agent can print names a hidden path (cell_agent_env)
+        added, unset = cell_agent_env({**penv, **extra}, cell_env, run, cell, hidden)
+        penv, extra = {}, added
+        argv = _in_cell(argv, cell, unset)
     spec = {"argv": argv, "env": {**penv, **extra, "TTP_RUN_DIR": str(run)}, "cwd": str(ws), "provider": provider,
             "model": arm["model"], "effort": arm["effort"], "timeout_s": opts["timeout_s"],
             "stall_s": opts["stall_s"], "prices": prices, "default_budget_usd": opts["budget_usd"],

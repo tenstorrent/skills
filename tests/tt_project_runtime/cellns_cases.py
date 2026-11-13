@@ -69,6 +69,39 @@ def test_cell_agent_sees_no_source_checkout_runtime_remote_or_gh(env, tmp_path, 
         _cell_probe_clean(probe)
 
 
+
+@pytest.mark.parametrize("backend", ["bwrap", "unshare"])
+def test_cell_agent_env_names_no_hidden_path_and_its_env_file_is_a_copy_in_the_run(env, tmp_path, monkeypatch,
+                                                                                  backend):
+    # An `env` in the cell prints nothing that points at the checkout, the runtime or the bench folder: a
+    # variable holding one is dropped and the Claude env file is a copy in the cell's own run folder.
+    from ttp import benchrun
+    _namespace(backend)
+    monkeypatch.setattr(benchrun, "ISOLATE", True)
+    monkeypatch.setenv("TTP_CELL_BACKEND", backend)
+    p, tid, task = _bench_built(env, tmp_path)
+    repo = pathlib.Path(json.loads((tmp_path / "bench" / "manifest.json").read_text())["repo"])
+    runtime = pathlib.Path(benchrun.__file__).resolve().parent.parent
+    monkeypatch.setenv("PROBE_LEAK", str(repo))
+    monkeypatch.setenv("CLAUDE_ENV_FILE", str(runtime / "ttp" / "loopproxy.sh"))
+    monkeypatch.setenv("TTP_FAKE_SHELL", 'env > envdump.txt; test -r "$CLAUDE_ENV_FILE" && echo envfile=readable >> '
+                       'envdump.txt; ' + _BENCH_FIX)
+    out = tmp_path / "iso-env"
+    arms = {"a": {"provider": "claude", "model": "m-one", "effort": "medium"},
+            "b": {"provider": "chat", "model": "m-two", "effort": "high"}}
+    rows = benchrun.run(tmp_path / "bench", out, arms, 1, 1,
+                        _bench_opts(tmp_path, repo=repo, state=p.state, isolate=True), p.config())
+    assert all(r["isolated"] == backend and r.get("why") is None for r in rows), rows
+    cell = out / "cells" / f"{tid}-r1-a"
+    assert str(tmp_path / "bench") not in (out / "cells" / f"{tid}-r1-b" / "diff.patch").read_text()
+    dump = (cell / "diff.patch").read_text()
+    assert "envdump.txt" in dump and "PROBE_LEAK" not in dump
+    for path in (repo, runtime, tmp_path / "bench"):
+        assert str(path) not in dump, (path, dump)
+    assert "+envfile=readable" in dump, "the agent can still read its env file"
+    run_env = json.loads((cell / "run.json").read_text()).get("env") or {}
+    assert not [k for k, v in run_env.items() if str(repo) in str(v) or str(runtime) in str(v)], run_env
+
 def _cell_probe_clean(probe):
     assert "No such file" in probe and "+def old" not in probe, "the source checkout is not there to read"
     assert probe.count("No such file") >= 3, "nor the runtime, nor the real home folder"
