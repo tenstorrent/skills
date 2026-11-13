@@ -801,3 +801,17 @@ def test_context_contract_is_optional_for_an_existing_model(tmp_path):
     (tmp_path / 'bringup/agentic_evals').mkdir(parents=True)
     (tmp_path / 'bringup/agentic_evals/inputs.json').write_text(json.dumps({'entry': 'existing'}))
     assert subprocess.run(args, cwd=tmp_path, capture_output=True).returncode == 0
+
+
+@pytest.mark.parametrize('gate', ['11-benchmark', '12-agentic-evals'])
+def test_a_gate_script_that_does_not_parse_is_an_error_not_advisory(tmp_path, gate):
+    """A SyntaxError exits 1, which a gate reads as advisory; the gate parses its scripts first and exits 3."""
+    import shutil
+    copy = tmp_path / 'plugin'
+    shutil.copytree(PLUGIN, copy, ignore=shutil.ignore_patterns('__pycache__'))
+    script = copy / 'scripts/check_agentic_serving.py'
+    script.write_text(script.read_text() + '\ndef broken(:\n')
+    result = subprocess.run(['bash', str(copy / f'prompts/model_bringup_multigoal/{gate}.check.sh')],
+                            env={**__import__('os').environ, 'MODEL_DIR': str(tmp_path / 'm')},
+                            cwd=tmp_path, capture_output=True, text=True)
+    assert result.returncode == 3 and 'do not parse' in result.stderr

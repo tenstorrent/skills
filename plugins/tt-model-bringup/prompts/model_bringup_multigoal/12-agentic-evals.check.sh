@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 TT_MODEL_BRINGUP_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYTHON="${PYTHON:-$(command -v python3 || command -v python)}"
+# A gate script that does not parse under this interpreter would exit 1 and read as advisory: error out instead.
+"$PYTHON" -c 'import ast, sys
+for p in sys.argv[1:]: ast.parse(open(p).read(), p)' "$TT_MODEL_BRINGUP_ROOT"/scripts/*.py "$TT_MODEL_BRINGUP_ROOT"/runtime/*/*.py || { echo "gate scripts do not parse under $PYTHON" >&2; exit 3; }
 # Runner-side gate for the agentic-evals stage: serving invariants still hold (autoport entry);
 # each phase of the mode has a collected run with its records and per-task analysis, no list is
 # voided, and a task cut off by a limit shows a loop or stall or was rerun at a higher limit
