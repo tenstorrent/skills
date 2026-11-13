@@ -134,3 +134,10 @@ def test_logging_check(tmp_path):
     assert not saved['pass'] and len(saved['problems']) == 2
     log.write_text('INFO request logging only\n')
     assert run('--check-log', '--log', log).returncode == 1
+
+
+def test_a_hex_record_cut_off_mid_write_is_skipped_not_a_crash():
+    """A server restart can leave a truncated (odd-length) hex record in the log; the digest must still be written."""
+    good = json.dumps({'message': 'plain'}).encode().hex()
+    lines = [f'x TTNATIVEHEX1 {good}', 'x TTNATIVEHEX1 7b2', f'y TTNATIVEHEX2 {"0" * 64} 0 2 10 abc']
+    assert list(reply_digest.framed(lines)) == ['plain', '']

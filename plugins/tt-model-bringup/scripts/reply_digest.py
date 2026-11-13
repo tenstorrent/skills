@@ -54,8 +54,11 @@ def framed(lines):
         match = re.search(r"TTNATIVEHEX2 ([0-9a-f]{64}) (\d+) (\d+) (\d+) ([0-9a-f]+)", line)
         if match:
             digest, index, count, size, encoded = match.groups()
+            part = unhex(encoded)
+            if part is None:  # a record cut off mid-write (server restart): its checksum can never match
+                continue
             state = frames.setdefault(digest, {"count": int(count), "size": int(size), "parts": {}})
-            state["parts"][int(index)] = bytes.fromhex(encoded)
+            state["parts"][int(index)] = part
             if len(state["parts"]) == state["count"]:
                 payload = b"".join(state["parts"].get(i, b"") for i in range(state["count"]))
                 del frames[digest]
@@ -63,7 +66,19 @@ def framed(lines):
                     yield message_of(payload)
             continue
         match = re.search(r"TTNATIVEHEX1 ([0-9a-f]+)", line)
-        yield message_of(bytes.fromhex(match[1])) if match else line
+        if match:
+            payload = unhex(match[1])
+            yield message_of(payload) if payload is not None else ""
+        else:
+            yield line
+
+
+def unhex(encoded: str) -> bytes | None:
+    """Hex payload, or None for a truncated (odd-length) record."""
+    try:
+        return bytes.fromhex(encoded)
+    except ValueError:
+        return None
 
 
 def message_of(payload: bytes) -> str:
