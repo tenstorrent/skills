@@ -1436,14 +1436,14 @@ def test_ack_wait_cursor_skips_consumed_replies_and_terminal_waits_past_acknowle
     assert _ack_wait(cli, *probe, "--terminal") == 1, "an acknowledgement is no terminal result"
     assert "only acknowledge or plan" in capsys.readouterr().out
     assert _ack_wait(cli, *probe, "--after", interim) == 1, "the consumed interim reply never counts again"
-    upstream.send("peer", 1, p.name, f"re {fp}: I will start the canary soon")
+    assert upstream.send("peer", 2, p.name, f"re {fp}: I will start the canary soon") == "sent"
     assert _ack_wait(cli, *probe, "--after", interim, "--terminal") == 1
     result = f"re {fp}: canary failed on its prerequisite check; status: failed"
-    upstream.send("peer", 1, p.name, result)
+    assert upstream.send("peer", 3, p.name, result) == "sent"
     assert _ack_wait(cli, *probe, "--after", interim, "--terminal") == 0
     out = tmp_path / "result.json"
     monkeypatch.setenv("TTP_RESULT", str(out))
-    assert _ack_wait(cli, "settle", "--from", "peer", "--hash", fp, "--after", interim, "--terminal") in (None, 0)
+    cli.main(["ack-wait", "settle", "--from", "peer", "--hash", fp, "--after", interim, "--terminal"])
     got = json.loads(out.read_text())
     assert got["metrics"]["reply_note"] == upstream.note_id(p.name, result) and "status: failed" in got["summary"]
     assert ackwait.find(p.name, "peer", fp, [upstream.note_id(p.name, result)]) is None, "the cursor drops earlier ones"
