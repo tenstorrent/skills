@@ -45,7 +45,7 @@ def _bench_land(git, commit, rev, name: str, files: dict, p, spec: str, created:
 
 
 def test_bench_prep_keeps_replayable_tasks_with_a_clean_base_workspace_and_excludes_the_rest(env, tmp_path):
-    from ttp import bench
+    from ttp import bench, benchrun
     p = make(env)
     repo, git, commit, rev = _bench_repo(tmp_path)
     new = ("import mod\n\n\ndef test_old():\n    assert mod.old() == 1\n\n\ndef test_new():\n"
@@ -85,7 +85,11 @@ def test_bench_prep_keeps_replayable_tasks_with_a_clean_base_workspace_and_exclu
     ws = out / str(keep) / "workspace"
     wgit = ["git", "-C", str(ws)]
     run = lambda *a: subprocess.run([*wgit, *a], capture_output=True, text=True).stdout.split()
-    assert run("rev-list", "--all", "--count") == ["1"] and run("remote") == [] and run("tag") == []
+    # The base's own history up to it (the user's spec), one ref, nothing of the landed change or later.
+    assert run("rev-parse", "HEAD") == [t["base"]] and run("rev-list", "--all") == subprocess.run([*git, "rev-list", t["base"]], capture_output=True, text=True).stdout.split()
+    assert run("for-each-ref", "--format=%(refname)") == ["refs/heads/main"] and run("remote") == [] and run("tag") == []
+    assert subprocess.run([*wgit, "cat-file", "-e", f"{t['head']}^{{commit}}"], capture_output=True).returncode != 0
+    assert benchrun.unreachable(ws) == 0 and benchrun.leaks(ws, {**t, "repo": str(repo)}) == []
     assert not (ws / ".git" / "logs").exists() and run("status", "--porcelain") == []
     assert t["tree"] == run("rev-parse", "HEAD^{tree}")[0] == rev(f"{t['base']}^{{tree}}")
     assert "new" not in (ws / "mod.py").read_text() and "test_new" not in (ws / "tests" / "test_mod.py").read_text()
@@ -434,7 +438,7 @@ def test_bench_run_cell_cannot_reach_the_landed_commit_later_history_or_the_held
     assert [(r["outcome"], r["flagged"], r["passed"]) for r in rows] == [("flagged", ["runs 'git log --all'"], False)] * 2
     for r in rows:
         found = (out / "cells" / f"{tid}-r1-{r['arm']}" / "diff.patch").read_text()
-        assert "found.txt" in found and task["head"] not in found and task["base"] not in found
+        assert "found.txt" in found and task["head"] not in found and f"+{task['base']}" in found, "history up to the base"
         assert "test_new" not in found and str(tmp_path / "bench") not in found and str(out) not in found
         assert json.loads((out / "cells" / f"{tid}-r1-{r['arm']}" / "run.json").read_text())["argv"]
     # Each way a workspace could leak is caught before a cell runs.
@@ -451,7 +455,11 @@ def test_bench_run_cell_cannot_reach_the_landed_commit_later_history_or_the_held
     assert "copy.py holds a held-out test file" in found and "out links outside the workspace" in found
     subprocess.run([*g, "fetch", "-q", "origin", "main"], check=True)
     found = benchrun.leaks(ws, task)
-    assert "more than one commit" in found and f"commit {task['head'][:12]}" in found
+    assert f"commit {task['head'][:12]}" in found and "objects HEAD does not reach" not in found   # fetched refs reach them
+    subprocess.run([*g, "remote", "remove", "origin"], check=True)
+    subprocess.run([*g, "tag", "-d", "t"], check=True)
+    found = benchrun.leaks(ws, task)
+    assert f"commit {task['head'][:12]}" in found and any(f.endswith("objects HEAD does not reach") for f in found), found
     # The transcript audit flags a candidate that names a hidden path, the landed commit or runs history commands.
     flags = benchrun.audit(f"cat {tmp_path / 'bench'}/x; git show {task['head']}; git fetch origin; gh api x",
                            task, [tmp_path / "bench"])

@@ -34,7 +34,7 @@ def _any_namespace():
 
 
 _CELL_PROBE = ('{ cat "$PROBE_SRC/mod.py" 2>&1; cat "$PROBE_RT/ttp/__init__.py" 2>&1; echo "remote=[$(git remote)]"; '
-          'echo "commits=$(git rev-list --all --count)"; echo "refs=$(git for-each-ref | wc -l)"; gh api repos/x 2>&1; '
+          'echo "head=$(git rev-parse HEAD)"; echo "unreached=$(( $(git cat-file --batch-all-objects --batch-check | wc -l) - $(git rev-list --objects --all | wc -l) ))"; echo "refs=$(git for-each-ref | wc -l)"; gh api repos/x 2>&1; '
           'echo "gh_rc=$?"; git fetch origin 2>&1; git clone "$PROBE_SRC" cl 2>&1; ls "$PROBE_HOME" 2>&1; '
           'echo "home=$HOME"; echo "token=[$GH_TOKEN$GITHUB_TOKEN$SSH_AUTH_SOCK]"; } > probe.txt 2>&1; ')
 
@@ -66,7 +66,7 @@ def test_cell_agent_sees_no_source_checkout_runtime_remote_or_gh(env, tmp_path, 
     assert len(rows) == 2 and all(r["isolated"] == backend and r.get("why") is None for r in rows), rows
     for arm in arms:
         probe = (out / "cells" / f"{tid}-r1-{arm}" / "diff.patch").read_text()
-        _cell_probe_clean(probe)
+        _cell_probe_clean(probe, task["base"])
 
 
 
@@ -123,10 +123,10 @@ def test_cell_agent_env_drops_every_host_path_the_namespace_does_not_hold(tmp_pa
     assert cell.outside("/srv/x") and not cell.outside("/") and not cell.outside("//host/share")
 
 
-def _cell_probe_clean(probe):
+def _cell_probe_clean(probe, base):
     assert "No such file" in probe and "+def old" not in probe, "the source checkout is not there to read"
     assert probe.count("No such file") >= 3, "nor the runtime, nor the real home folder"
-    assert "remote=[]" in probe and "commits=1" in probe and "refs=1" in probe
+    assert "remote=[]" in probe and "unreached=0" in probe and "refs=1" in probe and f"head={base}" in probe
     assert "gh_rc=1" in probe and "GitHub is not available" in probe, "gh is a stand-in that fails"
     assert "token=[]" in probe and "SECRET-KEY" not in probe and "id_x" not in probe
     assert f"home={pathlib.Path.home()}" not in probe, "HOME is the cell's own"
@@ -145,13 +145,18 @@ def test_cell_self_test_names_what_is_visible_a_remote_or_a_second_commit(env, t
     subprocess.run([*git, "add", "-A"], check=True)
     subprocess.run([*git, "commit", "-qm", "base"], check=True)
     cell = cellns.build(ws.parent, ws, [], python=sys.executable, name=backend)
-    assert cellns.selftest(cell, ws, [tmp_path / "nowhere"]) == [], "a clean one-commit workspace passes"
+    assert cellns.selftest(cell, ws, [tmp_path / "nowhere"]) == [], "a clean workspace at its base passes"
     assert any("visible inside the cell: /usr" in x for x in cellns.selftest(cell, ws, [pathlib.Path("/usr")]))
     subprocess.run([*git, "remote", "add", "origin", str(tmp_path / "elsewhere")], check=True)
     (ws / "a").write_text("2")
     subprocess.run([*git, "commit", "-qam", "second"], check=True)
-    got = cellns.selftest(cell, ws, [])
-    assert any("remote is not empty" in x for x in got) and any("not 1" in x for x in got), got
+    rev = lambda r: subprocess.run([*git, "rev-parse", r], capture_output=True, text=True).stdout.strip()
+    second = rev("HEAD")
+    subprocess.run([*git, "update-ref", "refs/heads/main", rev("HEAD~1")], check=True)   # back at the base
+    subprocess.run([*git, "tag", "t"], check=True)
+    got = cellns.selftest(cell, ws, [], gone=[second])
+    assert any("remote is not empty" in x for x in got) and any("not only refs/heads/main" in x for x in got), got
+    assert any(f"landed commit {second}" in x for x in got) and any("HEAD reaches" in x for x in got), got
 
 
 @pytest.mark.parametrize("backend", ["bwrap", "unshare"])

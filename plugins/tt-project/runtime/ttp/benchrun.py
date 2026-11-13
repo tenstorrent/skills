@@ -91,6 +91,17 @@ def schedule(tasks: list[int], arms: list[str], reps: int, seed: int) -> list[di
     return cells
 
 
+def unreachable(ws: Path) -> int:
+    """How many objects the repository at `ws` stores that no ref reaches (a later commit's, say); its own
+    store only, whatever object folders the caller's environment adds."""
+    env = {k: v for k, v in os.environ.items() if k not in ("GIT_DIR", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES")}
+
+    def count(*a):
+        return len(set(bench._git(ws, *a, env=env).stdout.split()))
+    return count("cat-file", "--batch-all-objects", "--batch-check=%(objectname)") - count(
+        "rev-list", "--objects", "--no-object-names", "--all")
+
+
 def leaks(ws: Path, task: dict) -> list[str]:
     """What in a cell's workspace could show the candidate the landed change; [] when nothing."""
     def git(*a):
@@ -100,10 +111,13 @@ def leaks(ws: Path, task: dict) -> list[str]:
         out.append("a remote")
     if (refs := git("for-each-ref", "--format=%(refname)").stdout.split()) != ["refs/heads/main"]:
         out.append(f"refs {refs}")
-    if git("rev-list", "--all", "--count").stdout.strip() != "1":
-        out.append("more than one commit")
-    out += [f"commit {sha[:12]}" for sha in (task["base"], task["head"])
-            if git("cat-file", "-e", f"{sha}^{{commit}}").returncode == 0]
+    head = git("rev-parse", "HEAD").stdout.strip()
+    if head != task["base"] and git("rev-list", "--count", "HEAD").stdout.strip() != "1":
+        out.append(f"HEAD {head[:12]} is not the base")   # a sealed (one-commit) copy of the base is fine too
+    if git("cat-file", "-e", f"{task['head']}^{{commit}}").returncode == 0:
+        out.append(f"commit {task['head'][:12]}")
+    if n := unreachable(ws):
+        out.append(f"{n} objects HEAD does not reach")
     if git("rev-parse", "HEAD^{tree}").stdout.strip() != task["tree"]:
         out.append("a tree other than the base's")
     out += [f".git/{p}" for p in ("logs", "objects/info/alternates", "shallow", "FETCH_HEAD") if (ws / ".git" / p).exists()]
@@ -511,7 +525,8 @@ def cell_agent_env(env: dict, inherited: dict, run: Path, cell, hidden: list[Pat
     return kept, sorted(k for k, v in inherited.items() if k not in kept and k not in sets and names(v))
 
 
-def isolate(tmp: Path, ws: Path, arm: dict, opts: dict, hidden: list[Path], repos: list, canary: Path | None = None):
+def isolate(tmp: Path, ws: Path, arm: dict, opts: dict, hidden: list[Path], repos: list, canary: Path | None = None,
+            gone: list[str] = ()):
     """The cell's mount namespace (cellns.py) for `arm`'s agent and what its self-test found wrong: (cell, problems).
     Raises cellns.Unavailable where no namespace can be built. The agent's config folders are the cell's own
     (never the real ones), the real login files of a provider that has them are bound in read-only, the project's
@@ -552,7 +567,7 @@ def isolate(tmp: Path, ws: Path, arm: dict, opts: dict, hidden: list[Path], repo
     cell = cellns.build(tmp, ws, hidden, python=python, cli="" if provider == "fake" else str(prov.binary() or ""),
                         config=conf, creds=creds, **{"path_dirs": [str(tmp / "venv" / "bin")], **extra})
     cell.python, cell.runtime = python, str(copy) if copy else ""
-    return cell, cellns.selftest(cell, ws, absent)
+    return cell, cellns.selftest(cell, ws, absent, gone=gone)
 
 
 def run_cell(bench_dir: Path, out: Path, task: dict, cell: dict, arm: dict, opts: dict, cfg: dict) -> dict:
@@ -580,7 +595,7 @@ def run_cell(bench_dir: Path, out: Path, task: dict, cell: dict, arm: dict, opts
         if opts.get("isolate", ISOLATE):   # the agent runs in a namespace that holds only the cell (cellns.py)
             repos = [r for r in (task.get("repo"), opts.get("repo")) if r]
             try:
-                cell, problems = isolate(tmp, ws, arm, opts, hidden, repos)
+                cell, problems = isolate(tmp, ws, arm, opts, hidden, repos, gone=[task["head"]])
             except cellns.Unavailable as e:
                 return {**row, "outcome": "not_isolated", "passed": False, "why": [str(e)[:500]]}
             if problems:

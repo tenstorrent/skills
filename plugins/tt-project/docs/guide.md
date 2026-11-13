@@ -1224,8 +1224,8 @@ head that runs none of them (pytest exit 2 to 5, or none collected or run) is a 
 environment, not the task's fault: prep stops there, removes the folder and prints the command, its
 exit code and the output's last lines. It prints one progress line per candidate to stderr. `--test-cmd` sets the pytest command (one plain pytest run, default
 `python3 -m pytest -q -p no:cacheprovider`) and `--no-validate` skips this step. Each kept task gets
-`<id>/workspace`, the base commit's tracked files in a fresh repository with one commit and no
-remotes, tags or reflog, and `<id>/heldout`, the landed copy of its held-out test files; the manifest
+`<id>/workspace`, a fresh repository whose one ref is the base commit, with its history up to the
+base and no object of a later commit, and no remotes, tags or reflog, and `<id>/heldout`, the landed copy of its held-out test files; the manifest
 records its spec, base, landed commit, stratum (small up to 150 changed non-test lines, else large),
 its graded tests and each held-out file's sha256, plus `validated`, the test command and rounds, and
 `manifest.sha256` pins the manifest. The bench names no model.
@@ -1238,8 +1238,8 @@ back to back in an order drawn from `--seed` (random when unset; recorded in `pl
 gets a fresh copy of the base workspace in a new temporary folder, the same prompt (the spec under a
 fixed preamble) and the same limits, enforced by the daemon's own run supervisor: `bench.timeout_s`,
 `bench.stall_s` and `bench.budget_usd` (where the provider caps dollars). Before a run the workspace
-must hold one commit on one branch with no remote, reflog or alternates, neither the base nor the
-landed commit and no held-out test content. The agent's reads are denied, and its transcript is
+have the base (or a one-commit copy of its tree) as HEAD on one branch, with no remote, reflog or
+alternates, no object HEAD does not reach, not the landed commit and no held-out test content. The agent's reads are denied, and its transcript is
 audited for, the bench and results folders, the source repository (recorded by `prep`, or `--repo`,
 default the project root) with its git dir and every worktree, the project's state folder, and the
 providers' plugin caches and saved transcripts (`~/.claude/plugins`, `~/.claude/projects`, and
@@ -1287,15 +1287,16 @@ session id and transcript path, which prep masks. `ttp bench blind <words>` runs
 `python3 -m ttp.benchblind <words>` (Blind review for model comparisons), and its prep also takes the
 run folder: `ttp bench blind prep <run folder> --out <dir>`, then `review`, `score` and `reveal`. `--dry-run` runs every arm on the fake agent:
 no model call and no spend. Each cell's agent runs in a Linux mount namespace (`bwrap`, else `unshare`;
-`runtime/ttp/cellns.py`) that holds only the one-commit workspace (the task's base commit: no remote, no other ref or
-history), a scratch home folder, the run folder, the system folders read-only and the provider CLI's install. The
+`runtime/ttp/cellns.py`) that holds only the workspace (the task's base commit and its history up to it: no remote, no other ref,
+nothing later), a scratch home folder, the run folder, the system folders read-only and the provider CLI's install. The
 source checkout, the harness runtime, the state, runs and bench folders and the real home folder do not exist in it.
 `gh` is a stand-in that logs the call and exits 1, `GH_TOKEN`, `GITHUB_TOKEN` and `SSH_AUTH_SOCK` are unset and git
 has no credential helper and speaks only the file protocol. The network is shared (the model endpoint and the chat
 bridge are reached over it), the runner stays outside, and the project's CLI hooks are not loaded. The cell's
 prompt is scrubbed: the checkout root becomes the workspace and paths into state, runs and bench folders are
 withheld. Before the agent starts, a self-test inside the namespace checks that none of those paths is visible, that
-the workspace has no remote and exactly one commit, that `gh` fails and that no credential is set; a cell that fails
+the workspace has no remote, its HEAD is the base on its one ref, the landed commit and every object HEAD
+does not reach are absent, that `gh` fails and that no credential is set; a cell that fails
 it is recorded `error` and not scored. A host with neither backend runs no cell: it is recorded `not_isolated`, never
 scored or ranked (`isolation_failed`, `error` and `not_isolated` are all unscored). The coordinator's and workers'
 own runs stay unsandboxed. Only tests turn the namespace off (the run option `isolate`), which keeps the old scratch-home path. The transcript audit

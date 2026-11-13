@@ -13,8 +13,8 @@ head's test files in place and passes ROUNDS of ROUNDS runs on the head: only th
 tests are kept. A task whose spec says its branch starts from another task's branch (PARENT) replays
 from that parent's recorded head (the spec's, else the parent's latest push queue head) up to its own
 branch head; it is excluded when the repository lacks that head or it is not under the branch head,
-since a workspace at the push branch base would lack the parent's work. Each kept task gets <out>/<id>/workspace, `git archive` of the base in a fresh
-repository with one commit and no remotes, tags or reflog, and <out>/<id>/heldout, the head's copy
+since a workspace at the push branch base would lack the parent's work. Each kept task gets <out>/<id>/workspace, a fresh repository whose
+one ref is the base commit, with its history up to the base and nothing later (no remotes, tags or reflog), and <out>/<id>/heldout, the head's copy
 of each test file the change adds or changes. manifest.json names them with their sha256;
 manifest.sha256 pins it. The bench names no model: what it compares is the runner's choice."""
 from __future__ import annotations
@@ -422,29 +422,24 @@ def _archive(repo: Path, rev: str, dest: Path) -> None:
 
 
 def workspace(repo: Path, base: str, dest: Path) -> str:
-    """A fresh repository at `dest` holding `base`'s tracked files in one commit, with no remotes,
-    tags, reflog or other history; returns its tree id (equal to `base`'s tree). A submodule's
-    commit is not copied."""
-    tree = _out(repo, "rev-parse", f"{base}^{{tree}}")
-    objs = [tree] + [x.split()[2] for x in _out(repo, "ls-tree", "-r", "-t", tree).splitlines()
-                     if x.split()[1] in ("blob", "tree")]
+    """A fresh repository at `dest` whose one ref, refs/heads/main, is the commit `base` itself, holding its
+    history up to and including it and nothing after it: no remotes, tags, reflog, other refs or object of
+    a later commit. Returns its tree id (`base`'s tree). A submodule's commit is not copied."""
+    commit = _out(repo, "rev-parse", f"{base}^{{commit}}")
     dest.mkdir(parents=True)
-    git = ["git", "-C", str(dest), "-c", "user.name=bench", "-c", "user.email=bench@localhost",
-           "-c", "core.logAllRefUpdates=false", "-c", "commit.gpgsign=false"]
+    git = ["git", "-C", str(dest), "-c", "core.logAllRefUpdates=false"]
     subprocess.run(["git", "init", "-q", "-b", "main", str(dest)], check=True, capture_output=True)
-    # One pack of the tree's objects, not a loose object per file (git add): far less disk I/O.
-    pack = subprocess.Popen(["git", "-C", str(repo), "pack-objects", "-q", "--stdout"], stdin=subprocess.PIPE,
-                            stdout=subprocess.PIPE)
+    # One pack of every object reachable from the base (its history, not what came after it).
+    pack = subprocess.Popen(["git", "-C", str(repo), "pack-objects", "-q", "--revs", "--stdout"],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE)
     index = subprocess.Popen([*git, "index-pack", "--stdin"], stdin=pack.stdout, stdout=subprocess.DEVNULL)
     pack.stdout.close()
-    pack.communicate("\n".join(objs).encode() + b"\n")
+    pack.communicate(commit.encode() + b"\n")
     if pack.returncode or index.wait():
         raise subprocess.CalledProcessError(pack.returncode or index.returncode, "git pack-objects | index-pack")
-    subprocess.run([*git, "read-tree", tree], check=True, capture_output=True)
-    subprocess.run([*git, "checkout-index", "-a", "-f"], check=True, capture_output=True)
-    commit = subprocess.run([*git, "commit-tree", "-m", "base", tree], check=True, capture_output=True, text=True,
-                            env={**os.environ, **_EPOCH}).stdout.strip()
     subprocess.run([*git, "update-ref", "refs/heads/main", commit], check=True, capture_output=True)
+    subprocess.run([*git, "read-tree", commit], check=True, capture_output=True)
+    subprocess.run([*git, "checkout-index", "-a", "-f"], check=True, capture_output=True)
     shutil.rmtree(dest / ".git" / "logs", ignore_errors=True)
     return _out(dest, "rev-parse", "HEAD^{tree}")
 

@@ -7,8 +7,8 @@ A deny list ("hidden paths", benchrun.hidden_paths) is not isolation: an agent t
 not told about, or runs `git fetch`, `git clone` or `gh`, can still find the landed answer. Here the agent
 starts in a namespace built from nothing (bubblewrap where installed, else util-linux `unshare` with
 cellns_init.py) that holds only:
-- the cell's own folder: the workspace (a one-commit git repo of the task's base tree, no remote, no other
-  ref, no reflog, no alternates), the run folder, a scratch HOME and config folders, the cell's venv;
+- the cell's own folder: the workspace (a git repo whose one ref is the task's base commit, with its history up to the base and
+  nothing later, no remote, no reflog, no alternates), the run folder, a scratch HOME and config folders, the cell's venv;
 - read-only system folders (/usr, /etc and the usual /bin, /lib links) and the provider CLI's own install;
 - a private /proc, a minimal /dev and an empty /tmp.
 The source repository and its worktrees, the harness runtime, the project's state, the bench, prep, results
@@ -65,7 +65,14 @@ if [ -n "$EXPECT_REMOTE" ]; then
 else
   [ -z "$r" ] || fail "git remote is not empty: $r"
 fi
-n=$(git rev-list --all --count 2>&1); [ "$n" = 1 ] || fail "git rev-list --all --count is '$n', not 1"
+h=$(git rev-parse HEAD 2>&1); [ "$h" = "$EXPECT_HEAD" ] || fail "HEAD is '$h', not the workspace's base"
+r=$(echo $(git for-each-ref --format='%(refname)' 2>&1)); [ "$r" = refs/heads/main ] || fail "git refs are '$r', not only refs/heads/main"
+for c in $EXPECT_GONE; do
+  if git cat-file -e "$c^{commit}" 2>/dev/null; then fail "the landed commit $c is in the workspace"; fi
+done
+a=$(git cat-file --batch-all-objects --batch-check='%(objectname)' 2>&1 | sort -u | wc -l)
+o=$(git rev-list --objects --no-object-names --all 2>&1 | sort -u | wc -l)
+[ "$a" = "$o" ] || fail "the workspace stores $a objects, HEAD reaches $o"
 if [ -n "$EXPECT_GH" ]; then
   g=$(command -v gh 2>&1); [ "$g" = "$EXPECT_GH" ] || fail "gh is '$g', not the cell's stand-in"
 elif gh auth status >/dev/null 2>&1; then fail "gh succeeds"; fi
@@ -281,13 +288,17 @@ def build(tmp: Path, ws: Path, hidden: list[Path], *, python: str, cli: str = ""
     return cell
 
 
-def selftest(cell: Cell, ws: Path, absent: list[Path], timeout_s: float = 60) -> list[str]:
-    """What is wrong with `cell`, checked from inside it: a path of `absent` that exists there, a remote,
-    more than one commit (an injection cell's one remote is its canary `origin`: any other remote or url is
-    wrong), a `gh` that works (an injection cell's is its own stand-in), a forge credential or the real HOME
+def selftest(cell: Cell, ws: Path, absent: list[Path], timeout_s: float = 60, gone: list[str] = ()) -> list[str]:
+    """What is wrong with `cell`, checked from inside it: a path of `absent` that exists there, a remote (an
+    injection cell's one remote is its canary `origin`: any other remote or url is wrong), a HEAD other than
+    the workspace's as read outside, a ref but refs/heads/main, a commit of `gone` (the landed change) or an
+    object HEAD does not reach (a later commit's), a `gh` that works (an injection cell's is its own stand-in), a forge credential or the real HOME
     in the environment. []
     when the cell is as isolated as it should be."""
-    env = {**os.environ, "EXPECT_HOME": str(cell.home), "EXPECT_REMOTE": cell.remote, "EXPECT_GH": cell.gh}
+    head = subprocess.run(["git", "-C", str(ws), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    env = {**{k: v for k, v in os.environ.items() if k not in ("GIT_DIR", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES")},
+           "EXPECT_HOME": str(cell.home), "EXPECT_REMOTE": cell.remote, "EXPECT_GH": cell.gh,
+           "EXPECT_HEAD": head or "(none)", "EXPECT_GONE": " ".join(gone)}
     try:
         r = subprocess.run(cell.wrap(["sh", "-c", SELFTEST, "sh", *map(str, absent)]), capture_output=True, text=True,
                            timeout=timeout_s, stdin=subprocess.DEVNULL, env=env, cwd=str(ws))
