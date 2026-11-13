@@ -13,4 +13,11 @@ else
   exit 3
 fi
 "$PYTHON" "${TT_MODEL_BRINGUP_ROOT}/runtime/readiness_check/check_degenerate_output.py" \
-  "${scope_args[@]}" --missing-artifacts critical --scope autoregressive
+  "${scope_args[@]}" --missing-artifacts critical --scope autoregressive || rc=$?
+rc=${rc:-0}
+[ "$rc" -ge 2 ] && exit "$rc"
+
+# Stage usage: the runner writes `## Stage usage` and stage_usage.json before this check (2 if missing or malformed).
+"$PYTHON" "${TT_MODEL_BRINGUP_ROOT}/scripts/stage_usage.py" check --model-dir "${MODEL_DIR:-}" --stage 07-optimized-full-model || usage=$?
+[ "${usage:-0}" -gt "$rc" ] && rc=$usage
+exit "$rc"

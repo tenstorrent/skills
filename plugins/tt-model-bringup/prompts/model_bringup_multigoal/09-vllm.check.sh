@@ -34,4 +34,7 @@ python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_prefill_features.py" \
 python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_agentic_serving.py" \
   --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}" --stage vllm || serving=$?
 [ "${serving:-0}" -gt "$rc" ] && rc=$serving
+# Stage usage: the runner writes `## Stage usage` and stage_usage.json before this check (2 if missing or malformed).
+"$PYTHON" "${TT_MODEL_BRINGUP_ROOT}/scripts/stage_usage.py" check --model-dir "${MODEL_DIR:-}" --stage 09-vllm || usage=$?
+[ "${usage:-0}" -gt "$rc" ] && rc=$usage
 exit "$rc"

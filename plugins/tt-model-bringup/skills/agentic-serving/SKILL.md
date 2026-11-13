@@ -224,9 +224,10 @@ Name what each cause would need to fix and whether it is the model, the serving 
 The multigoal runner, not the agent, waits on runs: a run registers its id and collect command in
 `runs.json`; the runner collects and scores it, appends its record (start, end, hours, conclusion) and wakes
 the agent, even if the agent has stopped. With nothing to decide, the agent ends its turn instead of
-polling. Sub-agents run at low effort for profiling,
-log triage and tests; the coordinator decides. Sub-agents append findings to `learned.json` and read it
-before starting.
+polling. When the stage ends (and after each remediation round) the runner counts the stage's own Codex
+tokens and hours from its CODEX_HOME and writes them to REPORT.md (`## Stage usage`) and
+`stage_usage.json`; leave both as written. Sub-agents run at low effort for profiling, log triage and
+tests; the coordinator decides. Sub-agents append findings to `learned.json` and read it before starting.
 
 ### Outputs
 
