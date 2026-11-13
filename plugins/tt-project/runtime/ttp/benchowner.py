@@ -11,7 +11,9 @@ Older than model_bench.poke_after_h: one poke per episode, which the owner's dae
 its bench schedule now, with one feed line in both projects. Older than take_over_after_h, or the owner
 not eligible: the next eligible project after it by name takes the lease, with one low alert naming
 both. Other projects' databases and settings are only read. The owner keeps the command schedule
-SCHEDULE (`ttp model-bench run --detach`, daily at bench_at home time); every other project's is off.
+SCHEDULE (`ttp model-bench run --detach`, daily at bench_at home time) and SUITE_SCHEDULE (`ttp
+model-bench suite --detach`, an hour later, which first rebuilds its bench folders when stale); every
+other project's are off.
 """
 from __future__ import annotations
 
@@ -20,6 +22,8 @@ from pathlib import Path
 
 SCHEDULE = "model-bench"
 COMMAND = "ttp model-bench run --detach"
+SUITE_SCHEDULE = "model-suite"
+SUITE_COMMAND = "ttp model-bench suite --detach"
 LIVE_S = 900                       # a daemon heartbeat younger than this is a live daemon
 SEEN = "model-bench-owner-seen"    # kv: the poke this project's daemon handled last
 
@@ -98,25 +102,41 @@ def check(me: str, cfg: dict, now: float, names: list[str] | None = None) -> dic
     return got
 
 
+def _later(at: str, hours: int = 1) -> str:
+    try:
+        h, m = (int(x) for x in at.split(":"))
+    except ValueError:
+        h, m = 2, 0
+    return f"{(h + hours) % 24:02d}:{m:02d}"
+
+
 def ensure(p, db, owner: bool, at: str) -> str:
-    """The owner keeps SCHEDULE on, daily at `at`; any other project keeps it off. Returns what changed."""
+    """The owner keeps SCHEDULE on, daily at `at`, and SUITE_SCHEDULE an hour later; any other project
+    keeps both off. Returns what changed."""
     from . import schedule as sched, timefmt
-    row = db.one("SELECT enabled, at, payload FROM schedules WHERE name=?", (SCHEDULE,))
-    if not owner and not (row and row["enabled"]):
-        return ""
-    if owner and row and row["enabled"] and row["at"] == at and json.loads(row["payload"] or "{}").get("command") == COMMAND:
+    want = [(SCHEDULE, COMMAND, at, "the machine's shared daily chat model bench (this project owns it)"),
+            (SUITE_SCHEDULE, SUITE_COMMAND, _later(at),
+             "the machine's shared daily model suite, bench folders kept fresh (this project owns it)")]
+    todo = []
+    for name, cmd, when, desc in want:
+        row = db.one("SELECT enabled, at, payload FROM schedules WHERE name=?", (name,))
+        if not owner and not (row and row["enabled"]):
+            continue
+        if owner and row and row["enabled"] and row["at"] == when \
+                and json.loads(row["payload"] or "{}").get("command") == cmd:
+            continue
+        todo.append((name, cmd, when, desc))
+    if not todo:
         return ""
     sched.before_change(p)
-    if owner:
-        sched.upsert(db, SCHEDULE, "command", "1d", at, True, None,
-                     "the machine's shared daily chat model bench (this project owns it)",
-                     {"command": COMMAND}, timefmt.home(p))
-    else:
-        sched.set_enabled(db, SCHEDULE, False, home=timefmt.home(p))
+    for name, cmd, when, desc in todo:
+        if owner:
+            sched.upsert(db, name, "command", "1d", when, True, None, desc, {"command": cmd}, timefmt.home(p))
+        else:
+            sched.set_enabled(db, name, False, home=timefmt.home(p))
     did = "on" if owner else "off"
     try:
-        sched.write_file(p, f"schedule {SCHEDULE}: {did} (model bench owner)")
-    except Exception:   # the database holds it; the file catches up on the next change
+        sched.write_file(p, f"schedule {', '.join(t[0] for t in todo)}: {did} (model bench owner)")
+    except Exception:
         pass
     return did
-

@@ -8903,7 +8903,9 @@ def _model_suite(p, a, now: float) -> None:
     bench_dir = Path(a.bench).expanduser().resolve() if a.bench else None
     cells_dir = Path(a.cells).expanduser().resolve() if a.cells else None
     if not (a.bench or a.cells):   # the shared folders: the newest complete pair, or say plainly there is none
-        if pair := modelsuite.folders(modelbench.home()):
+        pair = modelsuite.folders(modelbench.home()) if a.dry_run else modelsuite.refresh(
+            modelbench.home(), p.db, Path(p.root).resolve(), now, say=lambda m: print(m, file=sys.stderr))
+        if pair:
             bench_dir, cells_dir = pair
             print(f"model-bench suite: replay cells from {bench_dir}, injection cells from {cells_dir}", file=sys.stderr)
         else:

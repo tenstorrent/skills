@@ -1225,3 +1225,103 @@ def test_model_suite_takes_the_newest_complete_folder_pair_and_says_plainly_when
     cli.main(["model-bench", "suite", "--dry-run"])
     assert (seen[-1]["bench_dir"], seen[-1]["cells_dir"]) == (None, None)
     assert "no complete `ttp bench prep` and `ttp bench cells` folder pair" in capsys.readouterr().err
+
+
+def test_the_bench_owner_keeps_a_daily_model_suite_schedule_an_hour_after_the_bench_and_others_keep_it_off(env):
+    from ttp import benchowner
+    p = make(env)
+    assert benchowner.ensure(p, p.db, False, "23:30") == "", "not the owner: nothing to turn off"
+    assert not p.db.q("SELECT 1 FROM schedules WHERE name IN (?, ?)", (benchowner.SCHEDULE, benchowner.SUITE_SCHEDULE))
+    assert benchowner.ensure(p, p.db, True, "23:30") == "on"
+    rows = {r["name"]: r for r in p.db.q("SELECT name, kind, at, enabled, payload FROM schedules")}
+    suite = rows[benchowner.SUITE_SCHEDULE]
+    assert (suite["kind"], suite["at"], suite["enabled"]) == ("command", "00:30", 1), "bench_at + 1 h, wrapped"
+    assert json.loads(suite["payload"])["command"] == "ttp model-bench suite --detach"
+    assert rows[benchowner.SCHEDULE]["at"] == "23:30"
+    assert benchowner.ensure(p, p.db, True, "23:30") == "", "already right: nothing changes"
+    assert benchowner.ensure(p, p.db, False, "23:30") == "off"
+    on = {r["name"]: r["enabled"] for r in p.db.q("SELECT name, enabled FROM schedules WHERE name LIKE 'model-%'")}
+    assert on == {benchowner.SCHEDULE: 0, benchowner.SUITE_SCHEDULE: 0}, "the lease lost: both off"
+
+
+def test_model_suite_rebuilds_a_missing_or_stale_folder_pair_keeping_the_old_until_the_new_is_complete(env, tmp_path):
+    from ttp import bench, modelsuite
+    d, calls, log = tmp_path / "bench-home", [], []
+    day = 86400.0
+
+    def prep(db, repo, out, since, limit=0):
+        calls.append(("prep", out.name, since, limit))
+        out.mkdir()
+        (out / "manifest.json").write_text('{"tasks": []}\n')
+        (out / "manifest.sha256").write_text(f"{bench._sha(out / 'manifest.json')}  manifest.json\n")
+
+    def cells(b, out, repo=None, made=None):
+        calls.append(("cells", out.name))
+        out.mkdir()
+        (out / "cells.json").write_text(json.dumps({"bench": str(b), "made": made or now, "cells": []}) + "\n")
+        (out / "cells.sha256").write_text(f"{bench._sha(out / 'cells.json')}  cells.json\n")
+
+    def boom(*a, **kw):
+        raise ValueError("no small tasks")
+
+    now = 100 * day
+    first = modelsuite.refresh(d, None, tmp_path, now, prep=prep, cells=cells, say=log.append)
+    assert first and first[0].name.startswith("prep-") and first[1].name.startswith("cells-")
+    assert calls[0][2:] == (now - 14 * day, 12) and [c[0] for c in calls] == ["prep", "cells"]
+    assert "no complete folder pair" in log[0]
+    calls.clear()
+    now += 6 * day
+    assert modelsuite.refresh(d, None, tmp_path, now, prep=prep, cells=cells, say=log.append) == first
+    assert not calls, "under 7 days old: kept as is"
+    now += 2 * day
+    keep = d / "notes"
+    keep.mkdir()
+    assert modelsuite.refresh(d, None, tmp_path, now, prep=boom, cells=cells, say=log.append) == first
+    assert "failed (ValueError: no small tasks); kept the old pair" in log[-1]
+    assert sorted(x.name for x in d.iterdir()) == sorted([first[0].name, first[1].name, "notes"]), "partial build gone"
+    assert modelsuite.refresh(d, None, tmp_path, now, prep=prep, cells=boom, say=log.append) == first
+    assert first[0].is_dir() and first[1].is_dir()
+    second = modelsuite.refresh(d, None, tmp_path, now, prep=prep, cells=cells, say=log.append)
+    assert second != first and modelsuite.folders(d) == second
+    assert sorted(x.name for x in d.iterdir()) == sorted([second[0].name, second[1].name, "notes"]), \
+        "the older pair pruned once the new one is complete; other folders left alone"
+
+
+def test_model_suite_pools_babysit_cases_across_projects_read_only_and_skips_an_unreadable_db(env, tmp_path):
+    from ttp import modelsuite, waitgate
+
+    def seed(x, tag, n):
+        for i in range(n):
+            run = tmp_path / f"{tag}-run{i}"
+            run.mkdir()
+            (run / "progress.md").write_text(f"{tag} waiting on job {i}\n")
+            x("INSERT INTO runs(task, role, status, started, dir) VALUES(?, 'worker', 'done', ?, ?)",
+              (700 + i, 100.0, str(run)))
+            x("INSERT INTO jev_calls(ts, use, ref, decision, outcome) VALUES(?, ?, ?, ?, ?)",
+              (200.0, waitgate.USE, f"task:{700 + i}", json.dumps({"task": 700 + i, "skip": True}), "right"))
+
+    def other(tag, n):   # another project's database: only the two tables read
+        path = tmp_path / f"{tag}.db"
+        conn = sqlite3.connect(path)
+        conn.executescript("CREATE TABLE runs(task, role, status, started, dir);"
+                           "CREATE TABLE jev_calls(id INTEGER PRIMARY KEY, ts, use, ref, decision, outcome);")
+        seed(lambda q, args: conn.execute(q, args), tag, n)
+        conn.commit()
+        conn.close()
+        return path
+
+    here = make(env)
+    here.db.x("INSERT INTO tasks(id, title, spec, kind, status) VALUES(700, 't', 's', 'work', 'waiting')")
+    seed(here.db.x, "here", 1)
+    a, b = other("pa", 2), other("pb", 1)
+    bad = tmp_path / "bad.db"
+    bad.write_text("not a database")
+    before = {x: x.stat().st_mtime_ns for x in (a, b)}
+    others = [("pa", a), ("broken", bad), ("gone", tmp_path / "gone.db"), ("pb", b)]
+    cases = modelsuite.decisions(here.db, "2026-11-12", others=others)
+    real = sorted(str(c["id"]) for c in cases if not c["planted"])
+    assert len(real) == 4 and sum(":" not in i for i in real) == 1
+    assert {i.split(":")[0] for i in real if ":" in i} == {"pa", "pb"}, "an unreadable database is skipped"
+    assert {c["state"].split()[0] for c in cases} == {"here", "pa", "pb"}
+    assert modelsuite.decisions(here.db, "2026-11-12", others=list(reversed(others))) == cases, "same draw any order"
+    assert {x: x.stat().st_mtime_ns for x in before} == before, "other projects' databases are only read"

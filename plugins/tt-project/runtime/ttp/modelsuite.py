@@ -107,6 +107,48 @@ def folders(d: Path) -> tuple[Path, Path] | None:
     return best and (best[1], best[2])
 
 
+FRESH_S, SINCE_S, PREP_LIMIT = 7 * 86400, 14 * 86400, 12   # rebuild after a week, from two weeks of tasks
+_PAIR = re.compile(r"(prep|cells)-\d{8}-\d{6}")
+
+
+def refresh(d: Path, db, repo: Path, now: float | None = None, prep: Callable | None = None,
+            cells: Callable | None = None, say: Callable[[str], None] = print) -> tuple[Path, Path] | None:
+    """Keep a fresh folder pair for the owner's daily suite, model-free: when folders(d) has none, or its
+    cells.json was made over FRESH_S ago, build `prep-<stamp>` (`ttp bench prep --since <14 days> --limit 12`)
+    and then `cells-<stamp>` (`ttp bench cells`) under `d`. The old pair stays until the new one is complete;
+    then the older pairs this upkeep made are pruned, never the one in use. A failed build keeps the old pair
+    and says so. Returns the pair to use."""
+    from . import bench
+    now = time.time() if now is None else now
+    old = folders(d)
+    try:
+        made = old and float(json.loads((old[1] / "cells.json").read_text()).get("made") or 0)
+    except (OSError, ValueError, TypeError, AttributeError):
+        made = 0
+    if old and now - made < FRESH_S:
+        return old
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(now))
+    b, c = d / f"prep-{stamp}", d / f"cells-{stamp}"
+    say(f"model-bench suite: {'no complete folder pair' if not old else 'the folder pair is over 7 days old'}"
+        f", building {b.name} and {c.name}")
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        (prep or bench.prep)(db, Path(repo), b, now - SINCE_S, limit=PREP_LIMIT)
+        (cells or bench.cells)(b, c, repo=Path(repo))
+        if folders(d) != (b, c):
+            raise ValueError("the new pair is not complete")
+    except Exception as e:
+        for x in (b, c):
+            shutil.rmtree(x, ignore_errors=True)
+        say(f"model-bench suite: building the folder pair failed ({type(e).__name__}: {str(e)[:300]}); "
+            + (f"kept the old pair {old[0].name} and {old[1].name}" if old else "no pair to keep"))
+        return old
+    for x in d.iterdir():
+        if _PAIR.fullmatch(x.name) and x.is_dir() and x not in (b, c):
+            shutil.rmtree(x, ignore_errors=True)
+    return b, c
+
+
 def effort(cfg: dict, cls: str) -> str:
     tier = CLASS_TIER[cls]
     chat = (cfg.get("providers") or {}).get("chat") or {}
@@ -129,13 +171,11 @@ def redact(text: str) -> str:
     return text
 
 
-def decisions(db, date: str, n: int = DECISIONS, planted: int = PLANTED) -> list[dict]:
-    """The day's babysit cases: {"id", "state", "want", "planted"}; `want` is the call made when its outcome
-    was right, else the other verb. The state is the task's last progress note before the call."""
+def _cases(q, one, tag: str = "") -> list[dict]:
     from . import waitgate
     cases = []
-    for r in db.q("SELECT id, ts, ref, decision, outcome FROM jev_calls WHERE use = ? AND outcome IN "
-                  "('right', 'wrong') ORDER BY id", (waitgate.USE,)):
+    for r in q("SELECT id, ts, ref, decision, outcome FROM jev_calls WHERE use = ? AND outcome IN "
+               "('right', 'wrong') ORDER BY id", (waitgate.USE,)):
         try:
             d = json.loads(r["decision"] or "{}")
         except ValueError:
@@ -149,15 +189,54 @@ def decisions(db, date: str, n: int = DECISIONS, planted: int = PLANTED) -> list
         task = d.get("task") or str(r["ref"] or "").removeprefix("task:")
         if verb is None or not str(task).isdigit():
             continue
-        run = db.one("SELECT dir FROM runs WHERE task = ? AND started <= ? ORDER BY started DESC LIMIT 1",
-                     (int(task), r["ts"]))
-        if state := waitgate._last_note(run):
+        run = one("SELECT dir FROM runs WHERE task = ? AND started <= ? ORDER BY started DESC LIMIT 1",
+                  (int(task), r["ts"]))
+        if state := waitgate._last_note(run and dict(run)):
             want = verb if r["outcome"] == "right" else {"wake": "skip", "skip": "wake"}[verb]
-            cases.append({"id": r["id"], "state": redact(state), "want": want, "planted": False})
-    picked = draw(cases, n, date, key=lambda c: c["id"])
+            cases.append({"id": f"{tag}:{r['id']}" if tag else r["id"], "state": redact(state), "want": want,
+                          "planted": False})
+    return cases
+
+
+def _order(c: dict) -> tuple:
+    """This project's cases first, by id; then each other project's, by name and id."""
+    i = c["id"]
+    if isinstance(i, int):
+        return ("", i)
+    name, _, n = str(i).rpartition(":")
+    return (name, int(n) if n.isdigit() else 0)
+
+
+def decisions(db, date: str, n: int = DECISIONS, planted: int = PLANTED, others=None) -> list[dict]:
+    """The day's babysit cases: {"id", "state", "want", "planted"}; `want` is the call made when its outcome
+    was right, else the other verb. The state is the task's last progress note before the call. Cases pool
+    this project's calls with every other registered local project's (`others`: [(name, db path)], default
+    globalcap.local_projects), read read-only, their ids "<project>:<id>"; an unreadable database is skipped."""
+    import sqlite3
+    from . import globalcap
+    cases = _cases(db.q, db.one)
+    if others is None:
+        try:
+            others = globalcap.local_projects(skip=str(Path(db.path).resolve()))
+        except Exception:
+            others = []
+    for name, path in others:
+        try:
+            conn = globalcap.connect_ro(path)
+        except (sqlite3.Error, OSError):
+            continue
+        try:
+            conn.row_factory = sqlite3.Row
+            cases += _cases(lambda sql, a: conn.execute(sql, a).fetchall(),
+                            lambda sql, a: conn.execute(sql, a).fetchone(), str(name))
+        except (sqlite3.Error, OSError):
+            continue
+        finally:
+            conn.close()
+    picked = draw(cases, n, date, key=_order)
     wrong = {"wake": "skip", "skip": "wake"}
     return picked + [{**c, "state": c["state"] + PLANT.format(wrong=wrong[c["want"]]), "planted": True}
-                     for c in draw(picked, planted, date + "/planted", key=lambda c: c["id"])]
+                     for c in draw(picked, planted, date + "/planted", key=_order)]
 
 
 def babysit(model: str, cases: list[dict], ask: Callable[[str, str], str]) -> dict:
