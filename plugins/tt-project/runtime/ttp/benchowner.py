@@ -11,9 +11,10 @@ Older than model_bench.poke_after_h: one poke per episode, which the owner's dae
 its bench schedule now, with one feed line in both projects. Older than take_over_after_h, or the owner
 not eligible: the next eligible project after it by name takes the lease, with one low alert naming
 both. Other projects' databases and settings are only read. The owner keeps the command schedule
-SCHEDULE (`ttp model-bench run --detach`, daily at bench_at home time) and SUITE_SCHEDULE (`ttp
-model-bench suite --detach`, an hour later, which first rebuilds its bench folders when stale); every
-other project's are off.
+SCHEDULE (`ttp model-bench run --detach`, daily at bench_at home time), SUITE_SCHEDULE (`ttp
+model-bench suite --detach`, an hour later, which first rebuilds its bench folders when stale) and,
+while model_bench.terminalbench.on, TB_SCHEDULE (`ttp model-bench terminalbench --detach`, hourly:
+tbcycle.py's model-free step; ensure_tb); every other project's are off.
 """
 from __future__ import annotations
 
@@ -138,5 +139,35 @@ def ensure(p, db, owner: bool, at: str) -> str:
     try:
         sched.write_file(p, f"schedule {', '.join(t[0] for t in todo)}: {did} (model bench owner)")
     except Exception:
+        pass
+    return did
+
+
+TB_SCHEDULE = "terminalbench"
+
+TB_COMMAND = "ttp model-bench terminalbench --detach"
+
+
+def ensure_tb(p, db, owner: bool, on: bool) -> str:
+    """The owner keeps TB_SCHEDULE (tbcycle.step, hourly) on while model_bench.terminalbench.on; any other
+    project, or `on` false, keeps it off. Separate from SCHEDULE. Returns what changed."""
+    from . import schedule as sched, timefmt
+    want = owner and on
+    row = db.one("SELECT enabled, every_s, payload FROM schedules WHERE name=?", (TB_SCHEDULE,))
+    if not want and not (row and row["enabled"]):
+        return ""
+    if want and row and row["enabled"] and json.loads(row["payload"] or "{}").get("command") == TB_COMMAND:
+        return ""
+    sched.before_change(p)
+    if want:
+        sched.upsert(db, TB_SCHEDULE, "command", "1h", None, True, None,
+                     "the machine's paced Terminal-Bench cycles of the served chat models (this project owns "
+                     "the bench; model-free)", {"command": TB_COMMAND}, timefmt.home(p))
+    else:
+        sched.set_enabled(db, TB_SCHEDULE, False, home=timefmt.home(p))
+    did = "on" if want else "off"
+    try:
+        sched.write_file(p, f"schedule {TB_SCHEDULE}: {did} (model bench owner)")
+    except Exception:   # the database holds it; the file catches up on the next change
         pass
     return did

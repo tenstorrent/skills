@@ -1507,6 +1507,13 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    local Terminal-Bench folder to run its full task set, the shipped public 20-task subset first; a
    registry name runs only that subset, and a tasks file overrides both. Each model runs one trial at a
    time. The adapter is tested with fakes only.
+   `ttp model-bench terminalbench [--detach] [--models M,..]` is the paced daily run, model-free and
+   calling no Claude model: the bench owner's hourly `terminalbench` command schedule (on while
+   `model_bench.terminalbench.on`) books each complete cycle as a `terminalbench` row (with effort and
+   agent) and starts one detached runner per served model that is due. A runner runs its cycle's next
+   unrun task, one trial per model at once, spread over `cycle_h` (default 24), and resumes after a
+   restart. A model keeps its last complete score until its next cycle completes. A newly served model
+   waits `new_model_h` (default 3) after it first appears, then runs at the same pace.
    Endpoint faults (down, rate limit, auth) park nothing. With no ranked model served, or the whole endpoint
    cooling down, runs start on the core provider as before. Only `chat` has a served list: Claude
    Code, Codex and Cursor models are not ranked (provider failover covers a provider that cannot start

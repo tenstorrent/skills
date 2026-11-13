@@ -4821,10 +4821,10 @@ class Daemon:
 
     def run_model_bench(self) -> None:
         """The machine's shared daily model bench (benchowner.py), model-free, hourly: check the owner
-        lease (take it over or poke its owner when stale), keep this project's bench schedule on only
-        while it owns the lease, run it now on a poke, and report the owner's newest bench once: a
+        lease (take it over or poke its owner when stale), keep this project's bench and Terminal-Bench
+        schedules on only while it owns the lease, run it now on a poke, and report the owner's newest bench once: a
         keyless skip is one low alert per outage, a bench one log line."""
-        from . import benchowner, modelbench, rankfresh, schednow
+        from . import benchowner, harborslice, modelbench, rankfresh, schednow
         if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get("TTP_TEST_MODEL_BENCH"):
             return   # daemons under test never bench, unless a test asks
         now, db = time.time(), self.p.db
@@ -4845,6 +4845,7 @@ class Daemon:
         owner = lease.get("project") == me
         try:
             benchowner.ensure(self.p, db, owner, benchowner.settings(cfg)["at"])
+            benchowner.ensure_tb(self.p, db, owner, harborslice.settings(cfg)["on"])
         except ValueError as e:   # a broken schedules file: the next check tries again
             log(self.p, f"model bench: schedule not changed: {e}")
         seen = db.kv(benchowner.SEEN, {}) or {}

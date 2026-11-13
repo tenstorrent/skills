@@ -8858,7 +8858,7 @@ def cmd_model_bench(a) -> None:
         return
     p = here() or die("model-bench: no project here (run it in a project or with TTP_PROJECT set)")
     if a.detach:   # the owner's daily command schedule: the bench outlives the schedule's time limit
-        log = modelbench.home() / ("suite.log" if a.action == "suite" else "bench.log")
+        log = modelbench.home() / {"suite": "suite.log", "terminalbench": "terminalbench.log"}.get(a.action, "bench.log")
         log.parent.mkdir(parents=True, exist_ok=True)
         rt = str(Path(__file__).resolve().parent.parent)
         env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, [rt, os.environ.get("PYTHONPATH")]))}
@@ -8867,22 +8867,49 @@ def cmd_model_bench(a) -> None:
             child = subprocess.Popen([sys.executable, "-m", "ttp", "model-bench", *_model_bench_argv(a)],
                                      cwd=p.root, env=env, stdin=subprocess.DEVNULL, stdout=out,
                                      stderr=subprocess.STDOUT, start_new_session=True)
-        print(f"model {'suite' if a.action == 'suite' else 'bench'} started (pid {child.pid}; log {log})", file=sys.stderr)
+        print(f"model {a.action if a.action != 'run' else 'bench'} started (pid {child.pid}; log {log})", file=sys.stderr)
         return
     now = _t.time()
     if a.action == "suite":
         return _model_suite(p, a, now)
+    if a.action == "terminalbench":
+        return _terminalbench(p, a, now)
     out = modelbench.run(p.name, p.config(), modelrank.parked_models(p.db), now, force=a.force)
     print(json.dumps(out, indent=1))
 
 
 def _model_bench_argv(a) -> list[str]:
-    """The detached child's `ttp model-bench` arguments: the same action (run or suite) and its options."""
+    """The detached child's `ttp model-bench` arguments: the same action (run, suite or terminalbench) and its options."""
+    if a.action == "terminalbench":
+        return ["terminalbench", *(["--models", a.models] if a.models else [])]
     if a.action != "suite":
         return ["run", *(["--force"] if a.force else [])]
     return ["suite", *(["--date", a.date] if a.date else []), *(["--dry-run"] if a.dry_run else []),
             *(["--bench", a.bench] if a.bench else []), *(["--cells", a.cells] if a.cells else []),
             "--timeout", str(a.timeout), "--budget", str(a.budget), "--harbor", str(a.harbor)]
+
+
+def _terminalbench(p, a, now: float) -> None:
+    """`ttp model-bench terminalbench`: the model-free step, or (--runner) one model's paced runner (tbcycle.py)."""
+    from . import endpoint, harborslice, tbcycle
+    cfg = p.config()
+    if not tbcycle.settings(cfg)["on"]:
+        die("model-bench terminalbench: off (model_bench.terminalbench.on is false)")
+    alias = str(((cfg.get("providers") or {}).get("chat") or {}).get("endpoint") or "")
+    got = endpoint.credentials(alias) if alias else None
+    ok, msg, ids = endpoint.list_models(got.url, got.key) if got else (False, "no key saved", None)
+    if not ok or not ids:
+        die(f"model-bench terminalbench: no working key for chat endpoint {alias or '(none)'}: {msg}")
+    if a.runner:   # the endpoint reaches harbor's environment only, never argv
+        venv, why = harborslice.install(tbcycle.folder() / "harbor")
+        if not venv:
+            die(f"model-bench terminalbench: {why}")
+        print(json.dumps({"model": a.runner, "trials": tbcycle.runner(
+            cfg, a.runner, harborslice.child_env(venv, got.url, got.key))}))
+        return
+    want = {m.strip() for m in (a.models or "").split(",") if m.strip()}
+    served = [m for m in ids if not want or m in want]
+    print(json.dumps(tbcycle.step(cfg, served, now, lambda m: tbcycle.launch(p, m)), indent=1))
 
 
 def _model_suite(p, a, now: float) -> None:
@@ -15450,11 +15477,12 @@ def main(argv: list[str] | None = None) -> None:
                                             "models once per host and day (a second run does nothing; the "
                                             "owner project's schedule runs it daily), `show` prints the owner, latest result and "
                                             "per-model scores")
-    s.add_argument("action", choices=["run", "show", "scores", "suite"],
+    s.add_argument("action", choices=["run", "show", "scores", "suite", "terminalbench"],
                    help="run: bench the served models (once per host and day); show: print the owner, latest "
                         "result and per-model scores; scores: the model scoreboard's per-class rankings; suite: "
                         "the cheat-resistant daily benchmark (replay, injection and babysit cells, one row per "
-                        "model and class in model-bench/<date>.jsonl)")
+                        "model and class in model-bench/<date>.jsonl); terminalbench: model-free, book complete "
+                        "Terminal-Bench cycles and start a paced runner per served model that is due (tbcycle.py)")
     s.add_argument("--force", action="store_true", help="run: bench again though today's result exists")
     s.add_argument("--json", action="store_true", help="scores: print the board as JSON")
     s.add_argument("--detach", action="store_true", help="run, suite: start it in the background and return "
@@ -15469,6 +15497,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--harbor", type=int, default=0, metavar="N",
                    help="suite: also run N Terminal-Bench 2.0 tasks per model through Harbor, installed in a "
                         "venv the run owns (default 0: off)")
+    s.add_argument("--models", help="terminalbench: only these served models (comma-separated)")
+    s.add_argument("--runner", metavar="MODEL", help=argparse.SUPPRESS)   # one model's paced runner (tbcycle.launch)
     s.set_defaults(fn=cmd_model_bench)
 
     s = sub.add_parser("ack-wait", help="wait model-free for another project's reply to a `ttp note --to`: probe "
