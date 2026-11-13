@@ -6,7 +6,7 @@ Stage 11 (benchmark): serving_rates.json covers the batch x input-length grid an
 anomaly_check.json records the long-generation anomaly check (missing is critical, an anomaly advisory).
 Goal 12 (agentic-evals): each phase of the mode has a collected run with its records and per-task
 analysis (every failed task has a cause; a task cut off by a limit shows a loop or stall, or was rerun
-alone at a higher limit; each recorded rerun has its reasoning setting and result) and no list is voided; those are critical. A
+at a higher limit; each recorded rerun try has the limits or setting changed and a result) and no list is voided; those are critical. A
 phase not passed yet (score below the band, unexplained time, unfinished list) is advisory with its
 recorded reason, never critical for the score alone. Each run's server size comes from the device memory
 measured free at launch: a KV pool below POOL_FREE_FRACTION of it, or more agents than the pool holds at
@@ -276,11 +276,12 @@ def check_run(run: dict, inputs: dict, validated: list, collected: set, item: st
         tried = rerun.get("tried")
         tried = tried if isinstance(tried, list) else []
         raised = any(isinstance(t, dict) and higher_limit(t.get("limits"), limits) for t in tried)
-        if not all(isinstance(t, dict) and t.get("reasoning") and "result" in t for t in tried):
-            problems.append((2, f"run {name}: {row.get('task')!r} rerun.tried rows need a reasoning setting and "
-                                "a result"))
+        if not all(isinstance(t, dict) and (t.get("limits") or t.get("setting") or t.get("reasoning"))
+                   and "result" in t for t in tried):
+            problems.append((2, f"run {name}: {row.get('task')!r} rerun.tried rows need the limits or setting "
+                                "changed and a result"))
         if row.get("cause") == "cutoff_progressing" and not raised:
-            problems.append((2, f"run {name}: {row.get('task')!r} was cut off while progressing; rerun it alone "
+            problems.append((2, f"run {name}: {row.get('task')!r} was cut off while progressing; rerun it "
                                 "at a higher limit (rerun.tried limits) until it finishes, loops or stalls"))
         if rerun.get("counted"):
             counted += 1

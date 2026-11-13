@@ -234,10 +234,24 @@ def test_limit_failure_with_settings_tried_passes(tmp_path):
         {'reasoning': {'thinking': True, 'effort': 'high'}, 'result': 'loop to the cap again'},
         {'reasoning': {'thinking': False}, 'result': 'wrong answer in 2,100 tokens'}]})
     assert goal12(tmp_path, runs=[run]) == (0, '')
+    run['failures'][0]['rerun']['tried'] = [{'limits': {**LIMITS, 'seed': 2}, 'result': 'loop again'}]
+    assert goal12(tmp_path, runs=[run]) == (0, ''), 'a tried row needs no reasoning setting'
     run['failures'][0]['rerun']['tried'] = [{'result': 'no setting recorded'}]
     assert goal12(tmp_path, runs=[run])[0] == 2
     del run['failures'][0]['rerun']
     assert goal12(tmp_path, runs=[run]) == (0, ''), 'reasoning probes are optional'
+
+
+def test_wave_of_five_tasks_recorded_as_one_run_passes(tmp_path):
+    run = scored_run(solved=5)
+    wave = {'setting': 'output cap 2x', 'result': 'wave of 5 tasks, one harness run, 2 solved'}
+    for row in run['failures']:
+        row.update(cause='loop_cap', rerun={'tried': [wave]})
+    assert len(run['failures']) == 5
+    run['band_pass'] = False
+    phases = {'phase1': {'run': 'gpqa10', 'pass': False, 'reason': 'phase time ended'}}
+    code, stderr = goal12(tmp_path, runs=[run], phases=phases, extra={'anomalies': [fix_attempt()]})
+    assert code == 1 and 'CRITICAL' not in stderr
 
 
 def test_list_run_above_the_reference_limits_is_advisory(tmp_path):
