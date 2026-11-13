@@ -15,7 +15,7 @@ Goal completion requirements:
 - doc/agentic_evals/results.json and learned.json as the skill's Outputs say.
 
 Limits:
-- stage_budget_hours: quick 12 (phase 1 only), agentic 24 (phase 1 up to phase1_hours; phase 2 the rest), extended +24. run_timeout_hours (12) and the Codex usage budget from inputs.json.
+- stage_budget_hours: quick 12 (phase 1 only), agentic 24 (phase 1 up to phase1_hours; phase 2 the rest), extended +24. run_timeout_hours (12) from inputs.json.
 - Runs start at the harness reference's agent and request limits and output cap. Main's harness and route, unchanged; stage 11's rates are read, not re-measured; except a precision change made this way, whose rate rows are re-measured.
 
 - doc/agentic_evals/REPORT.md leads with each phase passed or not passed yet (why), scores with intervals, settings and limits against the reference's, hours predicted against measured, and the analysis. If phase 2 started after phase1_hours, it says so plainly: the setup or this text was not tested right.

@@ -110,13 +110,12 @@ rates explain. It runs on the local machine; no CI is needed.
 | `stage_budget_hours` | quick 12; agentic 24 (phase 1 up to `phase1_hours`, phase 2 the rest); extended +24 |
 | `phase1_hours` | 12; lower it with a shorter `stage_budget_hours` so phase 2 still runs |
 | `run_timeout_hours` | 12 per run; extended lists target ≈ 10 h |
-| `usage_budget` | the Codex points this stage may use; the runner reads the account at start |
 | `network` | per task `allow_internet` (Terminal-Bench); SWE agent in main's `no-network` mode with `allow_agent_endpoint` |
 | `limits` | agent and request limits and output cap from the harness reference; runs start there |
 | `decisions` | operator answers to a blocked goal's question, e.g. a reference to use |
 
 Before stage 9 the operator proves the setup: Docker (or the harness's container runtime), gated dataset
-credentials, host RAM and disk for task containers, and the usage budget. A mode or machine change
+credentials, and host RAM and disk for task containers. A mode or machine change
 mid-run repeats stage 10's agent-load checks.
 
 ### Entry paths
@@ -225,8 +224,7 @@ Name what each cause would need to fix and whether it is the model, the serving 
 The multigoal runner, not the agent, waits on runs: a run registers its id and collect command in
 `runs.json`; the runner collects and scores it, appends its record (start, end, hours, conclusion) and wakes
 the agent, even if the agent has stopped. With nothing to decide, the agent ends its turn instead of
-polling. The runner tracks Codex usage against `usage_budget` and, when the projection says the budget ends
-first, tells the agent to finish the current phase's report. Sub-agents run at low effort for profiling,
+polling. Sub-agents run at low effort for profiling,
 log triage and tests; the coordinator decides. Sub-agents append findings to `learned.json` and read it
 before starting.
 
