@@ -220,6 +220,24 @@ def test_bench_unstated_names_a_config_key_and_a_message_the_spec_never_gives(tm
     assert "#2: cannot tell: its base or head commit is not in the repository" in out and "0 of 2 fair" in out
 
 
+
+def test_bench_unstated_names_a_message_whose_filled_in_part_leads(tmp_path):
+    # The change writes f"{name} is paused: ..." (and a %-format with a leading hole); the test asserts the
+    # filled-in text. No prefix of it is in the change, yet the fixed part is wording the spec never gives.
+    from ttp import bench
+    repo, git, commit, rev = _bench_repo(tmp_path)
+    base = commit({"pkg/__init__.py": "", "pkg/lane.py": "def why(name):\n    return ''\n"}, "lane")
+    head = commit({"pkg/lane.py": "def why(name):\n    return f\"{name.split(':', 1)[1]} is paused: its lane is not raised\"\n\n\n"
+                   "def gone(n):\n    return '%d jobs were never started' % n\n\n\ndef tag(x):\n    return f'{x}-{x}'\n",
+                   "tests/test_lane.py": "from pkg.lane import why, gone, tag\n\n\ndef test_why():\n"
+                   "    assert why('res:boxA') == 'boxA is paused: its lane is not raised'\n"
+                   "    assert gone(3) == '3 jobs were never started'\n    assert tag('ab') == 'ab-ab'\n"}, "why")
+    tests = [("tests/test_lane.py", "test_why")]
+    assert bench.unstated(repo, base, head, tests, "Say why a paused lane is held.") == \
+        ["3 jobs were never started", "boxA is paused: its lane is not raised"]
+    assert bench.unstated(repo, base, head, tests, "The reason reads '<box> is paused: its lane is not raised'; "
+                          "the count reads '<n> jobs were never started'.") == []
+
 def test_bench_unknown_symbols_follows_dotted_imports_and_reads_only_the_held_out_tests(tmp_path):
     from ttp import bench
     repo, git, commit, rev = _bench_repo(tmp_path)

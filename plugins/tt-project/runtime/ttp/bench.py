@@ -321,6 +321,7 @@ MESSAGE_MIN = 8   # characters of a string a test asserts before it counts as a 
 _KEY = re.compile(r"[A-Za-z_][\w-]*(?:\.[A-Za-z_][\w-]*)*")   # an identifier or a dotted config key
 _FLAG = re.compile(r"--?[A-Za-z][\w-]*")
 _LITERAL = re.compile(r"""(["'])((?:\\.|(?!\1).)*)\1""")   # a quoted string on one line, and its text
+_HOLE = re.compile(r"\{[^{}]*\}|%[-+ #0]*\d*(?:\.\d+)?[sdrif]")   # an f-string or format placeholder, a %-format
 _MESSAGE_PARTS = re.compile(r"\d+(?:\.\d+)?|\([^)]*\)|'[^']*'|\"[^\"]*\"|`[^`]*`")   # what a message fills in
 
 
@@ -352,6 +353,13 @@ def unstated(repo: Path, base: str, head: str, tests: list[tuple[str, str]], spe
     # the string literals of the added code lines (never a comment or a docstring): where output text lives
     literals = "\n".join(m[1] for x in lines if not x.startswith(('#', '"""', "'''"))
                          for m in _LITERAL.findall(x))
+    # each added literal with a placeholder as a pattern (a hole matches any text) and its longest fixed part:
+    # a message whose filled-in part leads ("{name} is paused") has no fixed start to match by prefix
+    templates = []
+    for lit in literals.splitlines():
+        fixed = [x.strip(" :;,.") for x in _HOLE.split(lit)]
+        if len(fixed) > 1 and (best := max(fixed, key=len)) and len(best) >= MESSAGE_MIN and " " in best:
+            templates.append((re.compile(".+?".join(re.escape(x) for x in _HOLE.split(lit))), best))
     added_words = set(re.findall(r"[\w-]+", added))
     before = "\n".join(before_text)
     words = set(re.findall(r"[\w-]+", spec))
@@ -388,6 +396,10 @@ def unstated(repo: Path, base: str, head: str, tests: list[tuple[str, str]], spe
                         if part and part not in before:
                             take(v.strip(), part)
                             break
+                    else:
+                        part = next((b for t, b in templates if t.search(v[:MESSAGE_MAX]) and b not in before), "")
+                        if part:
+                            take(v.strip(), part)
             for name in names:   # a name the change made up: new in its added lines, in no base version
                 bare = name.lstrip("-")
                 key = bare.split(".")[-1]
