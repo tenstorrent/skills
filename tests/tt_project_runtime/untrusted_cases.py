@@ -621,3 +621,31 @@ def test_a_command_only_mentioning_the_untrusted_input_mark_passes(env, tmp_path
     (workers' runs were refused for one)."""
     _untrusted_run(env, tmp_path, monkeypatch, [])
     assert _why(tmp_path, "Bash", {"command": cmd}) == "", cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    f"for d in state/runs/*; do grep -h . $d/{_M}; done",
+    f"for d in $(ls -dt state/runs/* | head -40); do grep -h . $d/{_M} 2>/dev/null; done | sort | uniq -c",
+    f"for d in state/runs/*; do if cat $d/{_M} >/dev/null 2>&1; then echo $d; fi; done",
+    f"for d in state/runs/*; do if [ -s \"$d/{_M}\" ]; then cat \"$d/{_M}\"; fi; done",
+    f"cd /tmp && ttp audit why \"keep the {_M} label off pushing tasks\" --serves task1 --undo none && python3 -m pytest -q",
+    f"ttp audit why \"the `{_M}` label stays\" --serves task1 --undo none",
+    f"python3 tools/report.py; wc -l state/runs/*/{_M}", f"head -3 \"$(ls -d state/runs/* | tail -1)/{_M}\""])
+def test_a_read_through_a_loop_variable_or_glob_or_prose_naming_the_mark_passes(env, tmp_path, monkeypatch, cmd):
+    """Reads through a loop variable, a glob or a substitution's output, and the name in a quoted prose
+    argument, pass; code elsewhere on the line that gets no mention of it does not count (note abf64501dae99ecf)."""
+    _untrusted_run(env, tmp_path, monkeypatch, [])
+    assert _why(tmp_path, "Bash", {"command": cmd}) == "", cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    f"ls $d/{_M} | while read f; do rm \"$f\"; done", f"bash <<< \"rm $d/{_M}\"", f"rm $(echo $d/{_M})",
+    f"cat /dev/null > $(echo {_M})", f"for d in $(ls); do rm $d/{_M}; done", f"ttp note `{_M}`",
+    f"grep -l x state/runs/*/{_M} | python3 -c 'import os,sys; [os.remove(l.strip()) for l in sys.stdin]'",
+    f"echo $(echo $(echo $(echo $(echo $(echo {_M})))))", f"cat {_M} | sh", f"tee $(echo $d)/{_M} < /dev/null",
+    f"x=$(ls $d/{_M}); rm $x", f"rm \"$(dirname $0)/{_M}\""])
+def test_a_write_through_a_substitution_pipe_or_read_loop_is_still_refused(env, tmp_path, monkeypatch, cmd):
+    """A substitution whose text names the mark yields its name to the outer command; a pipe or
+    here-string into code or a read loop, and deep nesting, still count as a write."""
+    _untrusted_run(env, tmp_path, monkeypatch, [])
+    assert "leave it as it is" in _why(tmp_path, "Bash", {"command": cmd}), cmd

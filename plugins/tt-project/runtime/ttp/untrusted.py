@@ -30,8 +30,8 @@ set TTP_UNTRUSTED_INPUT=1 (a benchmark cell without a project). Then, model-free
   So are environment dumps (a bare printenv, env, export or set, or printenv naming a credential-like
   variable), which print tokens.
 Every task run, marked or not, is refused a Bash command that may change, move or delete the run's
-RUN_MARK file (its name only in quoted text, a read, a cp's source or a heredoc written to another
-file passes) and an edit of that file (mark_refusal):
+RUN_MARK file (its name only in quoted text, a read, also through a variable, glob or substitution, a
+cp's source or a heredoc written to another file passes) and an edit of that file (mark_refusal):
 removing it would lift these guards for the rest of the run and keep the
 daemon from labelling the task. A glob (`rm $TTP_RUN_DIR/*`) still gets around it.
 Not covered: a path or command built at run time inside a script or inline code (except git and gh,
@@ -484,7 +484,9 @@ def bash_refusal(segments: list[list[str]], raw: list[list[str]], cwd: str) -> s
     return None
 
 
-MARK_WHY = "this run's untrusted-input file records the untrusted text it read; leave it as it is"
+MARK_WHY = ("this run's untrusted-input file records the untrusted text it read; leave it as it is (a read "
+            "with cat, grep, head or wc passes, also through a loop variable or glob, when no code or read loop "
+            "gets its name)")
 
 
 # Commands that only read or print their arguments: naming RUN_MARK to one has no effect on the file.
@@ -570,32 +572,123 @@ def _unsingle(cmd: str) -> str:
     return "".join(out)
 
 
-def _mark_bash(cmd: str) -> bool:
+MARK_FEEDS = frozenset(("read", "mapfile", "readarray", "xargs", "parallel"))   # turn their input into words or commands
+MARK_SUBST_DEPTH = 4   # nested substitutions read; deeper ones count as a write
+
+
+def _mark_close(cmd: str, i: int, end: str) -> int:
+    """The index of the `end` (")" or a backtick) closing a substitution whose text starts at `i`, or -1."""
+    q, depth = "", 1
+    while i < len(cmd):
+        c = cmd[i]
+        if q == "'":
+            q = "" if c == "'" else q
+        elif c == "\\":
+            i += 1
+        elif c == '"' and end == ")":
+            q = "" if q == '"' else '"'
+        elif c == "'" and not q and end == ")":
+            q = "'"
+        elif not q and end == ")" and c in "()":
+            depth += 1 if c == "(" else -1
+            if not depth:
+                return i
+        elif c == end and end == "`":
+            return i
+        i += 1
+    return -1
+
+
+def _mark_subst(cmd: str) -> tuple[str, list[str]] | None:
+    """`cmd` with each outermost command or process substitution (`$(..)`, backticks, `<(..)`, `>(..)`)
+    replaced by one word: the bare mark name when its text names RUN_MARK (its output may be the mark's
+    path), else `_`; and the substitutions' texts. None when one is not closed."""
+    out, inner, q, i = [], [], "", 0
+    while i < len(cmd):
+        c = cmd[i]
+        if q == "'":
+            q = "" if c == "'" else q
+        elif c == "\\":
+            out.append(cmd[i:i + 2])
+            i += 2
+            continue
+        elif c == '"':
+            q = "" if q == '"' else '"'
+        elif c == "'" and not q:
+            q = "'"
+        elif cmd.startswith("$(", i) or c == "`" or (not q and cmd.startswith(("<(", ">("), i)):
+            start = i + (1 if c == "`" else 2)
+            end = _mark_close(cmd, start, "`" if c == "`" else ")")
+            if end < 0:
+                return None
+            inner.append(cmd[start:end])
+            out.append(RUN_MARK if RUN_MARK in inner[-1] else "_")
+            i = end + 1
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out), inner
+
+
+def _mark_fed(words: list[str], named: bool) -> bool:
+    """Whether a command that runs code or turns its input into words (MARK_RUNNER_RE, `.`, MARK_FEEDS)
+    may get the mark's name: in its own words or redirects, from an earlier command of its pipeline that
+    names it, or from a heredoc or here-string when the line names it (`named`)."""
+    seg, seen, mention, here, target = [], False, False, False, False
+    for w in words + [";"]:
+        if target:
+            target, mention = False, mention or RUN_MARK in w
+        elif w and set(w) <= set("&<>") and set(w) & set("<>"):
+            target, here = True, here or w.startswith("<<")
+        elif w and set(w) <= set(";&|()<>"):
+            m = mention or any(RUN_MARK in x for x in seg)
+            run = [x for x in seg if x not in ("{", "}", "!", "if", "then", "else", "elif", "do", "while", "until")]
+            code = any(MARK_RUNNER_RE.fullmatch(os.path.basename(x)) for x in (seg[1:] if _mark_awk_read(run) else seg))
+            if (code or run[:1] == ["."] or run[:1] and run[0] in MARK_FEEDS) and (m or seen or here and named):
+                return True
+            seen = (seen or m) if w in ("|", "|&") else False
+            seg, mention, here = [], False, False
+        else:
+            seg.append(w)
+    return False
+
+
+def _mark_bash(cmd: str, depth: int = 0) -> bool:
     """Whether a Bash command may create, change, move or delete RUN_MARK. A mention only in a quoted
     prose argument (a note's text), as an argument of a command that only reads (a grep pattern, a
-    cat, a cp, rsync, tar or zip source, an awk program that only prints) or in a heredoc written to
-    another file has no effect; a redirect into it, a path to it given to any other command, or any mention in a command that runs code (or with a
-    substitution whose effect the words do not show) counts. A heredoc's body lines are read as
-    commands, so one naming the mark as a bare word or path counts."""
+    cat, a cp, rsync, tar or zip source, an awk program that only prints), through a shell variable or
+    glob path given to such a read, or in a heredoc written to another file has no effect; a redirect
+    into it, a path to it given to any other command, or a mention that reaches a command that runs code
+    or turns its input into words (_mark_fed) counts. A substitution is read as its own command, and
+    its output as the mark's name when its text names it; next to a heredoc any substitution counts. A
+    heredoc's body lines are read as commands, so one naming the mark as a bare word or path counts."""
     if RUN_MARK not in cmd:
         return False
     from .hook import _quoting, _segments, _strip_prefix
     live = "".join(c for c, (inert, _) in zip(cmd, _quoting(cmd)) if not inert)
-    if "`" in _unsingle(cmd) or "$(" in _unsingle(cmd) or "<(" in live or ">(" in live:
-        return True   # a substitution (it runs inside double quotes too, and in a heredoc's body) or process substitution
+    if re.search(r"(?<!<)<<(?!<)", live) and ("`" in _unsingle(cmd) or "$(" in _unsingle(cmd) or "<(" in live
+                                               or ">(" in live):
+        return True   # a substitution in a heredoc's body runs too, where the quoting read here may be off
+    got = _mark_subst(cmd)
+    if got is None or (got[1] and depth >= MARK_SUBST_DEPTH):
+        return True
+    cmd, inner = got
+    if any(t.strip() != RUN_MARK and _mark_bash(t, depth + 1) for t in inner):
+        return True   # (a bare `name` substitution runs a command found on PATH, never the run folder's file)
     try:
         import shlex
-        lex = shlex.shlex(cmd, posix=True, punctuation_chars=";&|()<>")
+        flags = _quoting(cmd)
+        lex = shlex.shlex(re.sub("\n", lambda m: "\n" if flags[m.start()][0] else ";\n;", cmd), posix=True,
+                          punctuation_chars=";&|()<>")
         lex.whitespace_split = True
         words = list(lex)
     except ValueError:
         return True
     if any(">" in w and set(w) <= set("&<>|") and RUN_MARK in n for w, n in zip(words, words[1:])):
         return True   # a redirect into it
+    if _mark_fed(words, RUN_MARK in cmd):
+        return True   # code, or a command run from piped input, that may get its name
     segs = _segments(cmd, strip=False)
-    if any(MARK_RUNNER_RE.fullmatch(os.path.basename(w)) for seg in segs
-           for w in (seg[1:] if _mark_awk_read(seg) else seg)) or any(seg[0] == "." for seg in segs):
-        return True   # code, or a command run from piped input, anywhere in the line
     for seg in segs:
         if not any(RUN_MARK in w for w in seg):
             continue
