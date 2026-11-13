@@ -331,6 +331,52 @@ def test_pool_at_half_of_free_memory_passes_and_agents_must_fit_it(tmp_path):
     assert code == 2 and '8 agents x 60000' in stderr
 
 
+def anomaly_run(run_id='gpqa10', precision='bfp4-lofi'):
+    """GPQA task 102: correct reasoning, then stray apostrophes and a 5-character stream to the cap."""
+    run = scored_run(run_id)
+    run['config']['precision'] = precision
+    run['failures'][0].update(cause='anomaly', evidence='from char 14,000: 5 distinct chars in the last 4,096')
+    return run
+
+
+REPRO = {'test': 'tests/repro_gpqa102.py', 'prompt': 'repro/gpqa102_prefix.txt', 'seed': 0,
+         'served': {'precision': 'bfp4-lofi', 'result': '9/10 continuations degenerate'},
+         'full_precision': {'result': '0/10 degenerate', 'pass': True},
+         'changed': 'head and MLP down to BF8 HiFi2'}
+
+
+def test_anomaly_needs_a_reproducible_test_with_a_full_precision_result(tmp_path):
+    run = anomaly_run()
+    code, stderr = goal12(tmp_path, runs=[run])
+    assert code == 2 and 'needs repro' in stderr
+    run['failures'][0]['repro'] = {**REPRO, 'full_precision': {'result': 'not run'}}
+    code, stderr = goal12(tmp_path, runs=[run])
+    assert code == 2 and 'full_precision (result, pass)' in stderr
+    run['failures'][0]['repro'] = dict(REPRO)
+    assert goal12(tmp_path, runs=[run]) == (0, '')
+
+
+def test_precision_fix_takes_the_fastest_passing_config_and_reruns_the_list(tmp_path):
+    first = anomaly_run('gpqa10-bfp4')
+    tried = [{'config': 'bf8-head', 'pass': False, 'decode_tok_s_user': 21.0},
+             {'config': 'bf8-head-down', 'pass': True, 'decode_tok_s_user': 19.0},
+             {'config': 'bf16-full', 'pass': True, 'decode_tok_s_user': 12.0}]
+    first['failures'][0]['repro'] = {**REPRO, 'configs_tried': tried, 'chosen': 'bf16-full'}
+    rerun = scored_run(solved=8)
+    rerun['config']['precision'] = 'bf8-head-down'
+    code, stderr = goal12(tmp_path, runs=[first, rerun])
+    assert code == 2 and "fastest passing config tried is 'bf8-head-down'" in stderr
+    first['failures'][0]['repro']['chosen'] = 'bf8-head-down'
+    assert goal12(tmp_path, runs=[first, rerun]) == (0, '')
+    first['failures'][0]['repro']['configs_tried'] = [{'config': 'bf8-head-down', 'pass': True}]
+    code, stderr = goal12(tmp_path, runs=[first, rerun])
+    assert code == 2 and 'measured decode_tok_s_user' in stderr
+    first['failures'][0]['repro']['configs_tried'] = tried
+    rerun['config']['precision'] = 'bfp4-lofi'
+    code, stderr = goal12(tmp_path, runs=[first, rerun])
+    assert code == 2 and 'rerun the list' in stderr
+
+
 def test_agentic_mode_needs_phase_2(tmp_path):
     code, stderr = goal12(tmp_path, inputs={'mode': 'agentic'})
     assert code == 2 and 'phase2 has no scored run' in stderr
