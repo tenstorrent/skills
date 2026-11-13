@@ -17,7 +17,8 @@ Per arm and date it runs:
 Each draw is seeded by the date (seed), so a day's cells are the same on every rerun. No model grades
 anything. The arms run side by side, one thread each, each running one cell at a time (no model gets
 more than one suite cell at once). A cell whose agent an endpoint fault ended (a 429, an outage;
-benchrun.endpoint_fault) is retried FAULT_TRIES more times after a growing pause, then kept as a fault:
+benchrun.endpoint_fault) is retried FAULT_TRIES more times after a growing pause (once an arm's cell faults
+through every retry, its later cells get one try until one gets through), then kept as a fault:
 it never counts in a pass rate, and a model with more faulted than scored cells is inconclusive. Each
 cell's row (outcome, flags, fault, wall time, cost) is appended to DIR/<date>-cells/results.jsonl as it
 ends, and one row per (model, class) to DIR/<date>.jsonl (both fsynced, appends serialized). Outside a dry
@@ -255,7 +256,7 @@ def babysit(model: str, cases: list[dict], ask: Callable[[str, str], str], opts:
     """Ask `model` each case's wake/skip question; graded by code. An ask the endpoint fails (OSError) is
     retried like a faulted cell (_tried), then left out of the pass rates."""
     from . import waitgate
-    ok, t0, faulted = [], time.monotonic(), []
+    ok, t0, faulted, down = [], time.monotonic(), [], {}
     wrong = {"wake": "skip", "skip": "wake"}
     followed = False
 
@@ -265,7 +266,7 @@ def babysit(model: str, cases: list[dict], ask: Callable[[str, str], str], opts:
         except OSError as e:
             return {"endpoint_fault": type(e).__name__}
     for c in cases:
-        r = _tried(lambda c=c: one(c), opts or {})
+        r = _tried(lambda c=c: one(c), opts or {}, down)
         faulted.append(bool(r.get("endpoint_fault")))
         got = r.get("got", "")
         word = re.sub(r"[^a-z]", "", got.split()[0] if got.split() else "")
@@ -351,13 +352,21 @@ def _append(path: Path, row: dict) -> None:
         os.fsync(f.fileno())
 
 
-def _tried(cell: Callable[[], dict], opts: dict) -> dict:
+def _tried(cell: Callable[[], dict], opts: dict, down: dict | None = None) -> dict:
     """cell()'s row, rerun while an endpoint fault ended it (opts fault_tries more times, after a pause of
-    fault_pause_s that grows per try): the last row, with its `tries`."""
-    tries, pause = int(opts.get("fault_tries", FAULT_TRIES)), float(opts.get("fault_pause_s", FAULT_PAUSE_S))
+    fault_pause_s that grows per try): the last row, with its `tries`. `down` (one per arm) marks an
+    endpoint that faulted through every retry: later cells are tried once until one gets through, so an
+    outage costs one try per cell, not hours of pauses."""
+    down = {} if down is None else down
+    tries = 0 if down.get("down") else int(opts.get("fault_tries", FAULT_TRIES))
+    pause = float(opts.get("fault_pause_s", FAULT_PAUSE_S))
     for i in range(tries + 1):
         row = cell()
-        if not row.get("endpoint_fault") or i == tries:
+        if not row.get("endpoint_fault"):
+            down["down"] = False
+            return {**row, "tries": i + 1}
+        if i == tries:
+            down["down"] = True
             return {**row, "tries": i + 1}
         _pause(pause * (i + 1))
     return row
@@ -383,10 +392,10 @@ def standard(model: str, arm: dict, date: str, bench_dir: Path | None, cells_dir
     """The standard class row of one arm: replay pass rate and injection pass (module doc), each cell's
     row appended to <out>/results.jsonl as it ends."""
     from . import benchrun
-    rows, slug = [], re.sub(r"[^A-Za-z0-9_.-]", "-", model)
+    rows, slug, down = [], re.sub(r"[^A-Za-z0-9_.-]", "-", model), {}
 
     def one(cell: Callable[[], dict]) -> dict:
-        row = _tried(cell, opts)
+        row = _tried(cell, opts, down)
         _append(out / "results.jsonl", _cell_row(model, row))
         return row
     if bench_dir:

@@ -1133,7 +1133,7 @@ def test_terminalbench_ranks_first_and_decides_the_verdict(env, monkeypatch):
     assert modelsuite.verdict(day, "m-b", "daily", floor_share=0.3) == (0.2, False, "daily"), "the floor is a setting"
 
 
-def test_model_suite_decisions_map_verb_records_and_faults_never_set_the_bar(env, tmp_path):
+def test_model_suite_decisions_map_verb_records_and_faults_never_set_the_bar(env, tmp_path, monkeypatch):
     from ttp import modelsuite, waitgate
     p = make(env)
     run = tmp_path / "r"
@@ -1149,9 +1149,21 @@ def test_model_suite_decisions_map_verb_records_and_faults_never_set_the_bar(env
 
     def boom(m, q):
         raise OSError("down")
-    down = modelsuite.babysit("m", cs, boom, {"fault_pause_s": 0})
+    asked = []
+    monkeypatch.setattr(modelsuite, "_pause", lambda s: None)
+    down = modelsuite.babysit("m", cs, lambda m, q: asked.append(q) or boom(m, q), {"fault_tries": 2})
     assert down["bar"] is False and down["pass_rate"] is None and down["endpoint_faults"] == 1, \
         "an ask the endpoint fails is retried, then neither a pass nor a fail"
+    assert len(asked) == 3 + 1, "once one ask faults through its retries, the next is asked once"
+    flaky = iter([OSError("busy"), "wake", "wake"])
+
+    def busy_once(m, q):
+        got = next(flaky)
+        if isinstance(got, OSError):
+            raise got
+        return got
+    got = modelsuite.babysit("m", cs, busy_once, {"fault_tries": 2})
+    assert got["pass_rate"] == 1.0 and got["endpoint_faults"] == 0, "a retried ask that gets through is scored"
     assert modelsuite.babysit("m", cs, lambda m, q: "???")["bar"] is False
     assert modelsuite.babysit("m", cs, lambda m, q: "skip")["bar"] is True
 
@@ -1432,6 +1444,12 @@ def test_model_suite_retries_an_endpoint_faulted_cell_and_never_scores_one(env, 
     assert down["pass_rate"] is None and down["scored"] == 0 and down["endpoint_faults"] == 1 and down["faults"] == 0
     assert json.loads((tmp_path / "o2" / "results.jsonl").read_text())["endpoint_fault"] == "rate_limit"
     assert modelsuite.verdict([{"model": "m", "class": "standard", **down}], "m", "daily") is None
+    down_state, ran = {}, []
+    fault = lambda: ran.append(1) or {"endpoint_fault": "rate_limit"}
+    assert modelsuite._tried(fault, {"fault_tries": 2}, down_state)["tries"] == 3 and down_state == {"down": True}
+    assert modelsuite._tried(fault, {"fault_tries": 2}, down_state)["tries"] == 1, "a down endpoint: one try per cell"
+    assert modelsuite._tried(lambda: {"outcome": "pass"}, {"fault_tries": 2}, down_state)["tries"] == 1
+    assert down_state == {"down": False} and len(ran) == 4
     # A model whose cells are mostly faulted is inconclusive, never weak; a few faults leave the rest scored.
     row = {"model": "m", "class": "standard", "faults": 0, "bar": False}
     assert modelsuite.verdict([{**row, "pass_rate": 0.0, "scored": 2, "endpoint_faults": 10}], "m", "daily") is None
