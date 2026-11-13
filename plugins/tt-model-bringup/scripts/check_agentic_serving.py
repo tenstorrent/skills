@@ -188,7 +188,9 @@ def check_rates(model_dir: Path, evidence: dict, problems: list, full: bool) -> 
             problems.append((2, f"serving_rates.json has no rate row for batch {batch}"))
     if not full:
         return validated
-    workload = evidence.get("workload") or {}
+    # The lengths stage 11 measured for: recorded in serving_rates.json, since goal 12 later rewrites the live
+    # workload in agentic_serving.json and stage 11's own gate must not change verdict after it.
+    workload = rates.get("workload") if isinstance(rates.get("workload"), dict) else evidence.get("workload") or {}
     lengths = {4096, *(workload.get(key) for key in ("typical_context_tokens", "working_set_tokens")
                        if positive_int(workload.get(key)))}
     # A row the budget left unmeasured, listed with a reason, is advisory: stage 12 reads what exists.
@@ -314,10 +316,17 @@ def check_run(run: dict, inputs: dict, validated: list, collected: set, item: st
         ok = False
     measured, explained = run.get("measured_hours"), run.get("explained_hours")
     tolerance = inputs.get("explain_tolerance", DEFAULT_EXPLAIN_TOLERANCE)
-    if not (number(measured) and measured > 0 and number(explained)):
-        problems.append((2, f"run {name} needs measured_hours and explained_hours"))
+    if not (number(measured) and measured > 0):
+        problems.append((2, f"run {name} needs measured_hours"))
         ok = False
-    elif abs(measured - explained) / measured > tolerance:
+    elif not number(explained):
+        # Phase timing is reported, not gated: a run whose calls could not be priced says why.
+        level = 1 if run.get("explained_reason") else 2
+        problems.append((level, f"run {name} has no explained_hours ({run.get('explained_reason') or 'and no '
+                                "explained_reason'; run scripts/explain_hours.py on its per-call accounting"}); "
+                                "not passed yet"))
+        ok = False
+    elif explained <= 0 or abs(measured - explained) / explained > tolerance:  # within tolerance of the explained time
         problems.append((1, f"run {name} took {measured} h; tokens over the serving rates explain "
                             f"{explained} h (tolerance {tolerance:.0%}); not passed yet"))
         ok = False

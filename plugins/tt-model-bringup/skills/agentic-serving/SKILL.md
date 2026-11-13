@@ -79,11 +79,17 @@ time spent generating bounds what any serving change can save.
 
 Stage 11 is benchmarks only. It measures, on the route goal 12 will use and with the sampling settings
 its harness sends, a batch × input-length grid
-(each validated batch; inputs of 4096, `typical_context_tokens`, `working_set_tokens` and ≥ 28K) plus every
-benchmark row the release spec lists for this model. Every row completes; a row the budget leaves
+(each validated batch, and above batch 1 also at request concurrency 1; inputs of 4096,
+`typical_context_tokens`, `working_set_tokens`, ≥ 28K, and the longest context the evals reach: their prompt
+plus output cap, at most the served max context, where the pool holds the batch) plus every benchmark row
+the release spec lists for this model. Goal 12 interpolates between lengths and concurrencies and
+extrapolates past the longest length, so a row at the top of the range removes the largest error (the v4
+Gemma grid stopped at 32K while GPQA calls reached 127K, and its full-batch B32 rows priced a server with a
+few requests in flight far below its real speed). Every row completes; a row the budget leaves
 unmeasured goes in `missing_rows` (batch, input_tokens, reason) and the stage completes. Each row is compared with its
 predicted rate; a slowdown beyond the prediction's range is explained. It writes
-`doc/benchmark/serving_rates.json`: the server config, `validated_batches`, and per batch and input length
+`doc/benchmark/serving_rates.json`: the server config, `validated_batches`, the `workload` lengths the grid
+used, and per batch, concurrency and input length
 `prefill_tok_s`, `decode_tok_s_user`, `ttft_s` and `step_ms`. Goal 12 reads these rates and does not
 re-measure them, except the rows it uses after a precision fix (Failure analysis 3).
 
@@ -141,10 +147,14 @@ phase cannot pass: ask the operator. Record the source next to each score.
   passes or at `phase1_hours`, whichever comes first, and has the rest of the 24 h. Plan both from the start.
 - A phase **passes** when its score is within `ok_band` of the reference and its wall time is explained.
   Explained hours replay the run on the rates: each model call takes uncached input ÷ prefill rate + output
-  tokens ÷ decode rate per user, from the `serving_rates.json` row at the batch covering the requests active
-  then and the call's final context (the next row up); each task adds its measured time outside the server;
-  tasks start on the agents in the observed order; the explained wall is when the last one ends (one long
-  task sets it). Measured wall within `explain_tolerance` of that passes; otherwise find the gap.
+  tokens ÷ decode rate per user on the run's server batch with the requests then in flight, with rates
+  interpolated between the measured concurrencies and input lengths (extrapolated past the longest, and
+  then labelled approximate); each
+  task adds its measured time outside the server; tasks start on the agents in the observed order; the
+  explained wall is when the last one ends (one long task sets it). `scripts/explain_hours.py --rates
+  doc/benchmark/serving_rates.json --calls <calls.json> --server-batch <max-num-seqs>` computes it from the
+  per-call accounting; record its output with the run. Measured wall within `explain_tolerance` of that passes; otherwise find the gap. A
+  run whose calls cannot be priced at all records `explained_reason` instead; that is reported, not blocking.
 - **A mode is done when all its phases pass**: release ready for that mode.
 - **Not passed yet:** a phase whose time ends below its band or with unexplained time is a result. Keep its
   score, interval, reference and per-task analysis as they are, record the reason, and move on; never
@@ -275,7 +285,7 @@ In `doc/agentic_evals/`:
   `batch`, `max_num_seqs`, `server_size` (`free_gb` per device measured at launch, `pool_gb` per device,
   `working_set_tokens` per agent, `reason`), limits and their source, network mode, `reasoning`, SHAs), `score` (`solved`, `n`, `interval_95`),
   `reference` (`value`, `source`, `reasoning`), `band_pass`, `predicted_hours`, `explained_hours`,
-  `measured_hours`, `collected`, and `failures`: one row per failed task with `task`, `cause` (`wrong`,
+  `measured_hours`, `explained_reason` when there is no number, `collected`, and `failures`: one row per failed task with `task`, `cause` (`wrong`,
   `anomaly`, `loop_cap`, `malformed_tool_call`, `cutoff_progressing`, `stalled`, `infrastructure`, `fetched_solution`),
   `evidence` and `rerun` (`tried`: setting, `limits`, result; `counted`); `flag_reasons` and `unmapped_reason`
   when needed (Triage); `digest` when not `current/<run>/digest`; `config.precision` (the

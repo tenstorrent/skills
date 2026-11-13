@@ -706,3 +706,37 @@ def test_flagged_reply_with_cause_anomaly_passes_the_digest_check(tmp_path):
     write_digest(tmp_path, run, flagged=[run['failures'][0]['task']])
     code, stderr = goal12(tmp_path, runs=[run], extra={'anomalies': [fix_attempt()]})
     assert 'flagged' not in stderr and 'digest' not in stderr
+
+
+def test_unexplained_time_with_a_reason_is_advisory_and_without_one_critical(tmp_path):
+    run = scored_run()
+    del run['explained_hours']
+    code, stderr = goal12(tmp_path, runs=[run], phases={'phase1': {'run': 'gpqa10', 'pass': False,
+                                                                     'reason': 'time not explained'}})
+    assert code == 2 and 'explain_hours.py' in stderr
+    run['explained_reason'] = 'per-call accounting lost: response logging was off'
+    code, stderr = goal12(tmp_path, runs=[run], phases={'phase1': {'run': 'gpqa10', 'pass': False,
+                                                                     'reason': 'time not explained'}})
+    assert code == 1 and 'response logging was off' in stderr
+
+
+def test_explain_tolerance_is_relative_to_the_explained_time(tmp_path):
+    run = scored_run()
+    run.update(measured_hours=1.0, explained_hours=1.3)       # 23% of the explained time, 30% of the measured
+    assert goal12(tmp_path, runs=[run]) == (0, '')
+    run.update(measured_hours=1.0, explained_hours=0.78)      # 28% of the explained time, 22% of the measured
+    code, stderr = goal12(tmp_path, runs=[run], phases={'phase1': {'run': 'gpqa10', 'pass': False,
+                                                                     'reason': 'time 28% off'}})
+    assert code == 1 and 'not passed yet' in stderr
+
+
+def test_stage_11_gate_reads_the_lengths_it_recorded_not_the_live_workload(tmp_path):
+    """Goal 12 rewrites the live workload; stage 11's verdict must not change after it."""
+    data = rates()
+    data['workload'] = {'typical_context_tokens': 20000, 'working_set_tokens': 32768}
+    (tmp_path / 'doc/benchmark').mkdir(parents=True, exist_ok=True)
+    (tmp_path / 'doc/benchmark/anomaly_check.json').write_text(json.dumps(anomaly_record()))
+    (tmp_path / 'doc/benchmark/serving_rates.json').write_text(json.dumps(data))
+    moved = evidence()
+    moved['workload']['working_set_tokens'] = 35809           # what goal 12 measured later
+    assert check(tmp_path, 'benchmark', moved, {}) == (0, '')

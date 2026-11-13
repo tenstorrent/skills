@@ -190,7 +190,8 @@ One row per configured batch size, default 1, 8, 16 and 32:
 | N users | N | N | 4096 / 128 |
 
 The runner measures these 4096-token rows. In the pipeline, measure the rest of the grid
-(`typical_context_tokens`, `working_set_tokens` and at least 28K input tokens, 128 output) with the
+(`typical_context_tokens`, `working_set_tokens`, at least 28K and the longest context the evals reach,
+128 output; above batch 1 also at concurrency 1) with the
 same `vllm bench serve` client against the same server configuration per batch, and write every row
 to `serving_rates.json` as the skill describes.
 
