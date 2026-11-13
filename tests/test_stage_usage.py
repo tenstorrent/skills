@@ -314,7 +314,7 @@ def test_every_stage_has_a_report_and_every_check_gates_usage():
 
 def test_runner_gates_usage_only_on_its_own_check_runs():
     source = (PLUGIN / 'scripts/multigoal').read_text()
-    assert 'extra_env["MULTIGOAL_STAGE_USAGE"] = "1"' in source
+    assert 'extra_env["MULTIGOAL_STAGE_USAGE"] = f"unwritten: {usage.unwritten}" if usage.unwritten else "1"' in source
     assert 'usage_budget' not in source and 'rateLimits' not in source and 'used_percent' not in source
 
 
@@ -322,3 +322,11 @@ def test_usage_budget_is_gone():
     for path in PLUGIN.rglob('*'):
         if path.is_file() and path.suffix in {'.md', '.txt', '.sh', '.py', '.json'} and '__pycache__' not in path.parts:
             assert 'usage_budget' not in path.read_text(errors='replace'), path
+
+
+def test_a_record_the_runner_could_not_write_is_reported_not_critical(tmp_path):
+    """The stage's agent cannot fix the runner's own write: advisory, so the pipeline does not stop on it."""
+    env = {**os.environ, 'MULTIGOAL_STAGE_USAGE': 'unwritten: OSError: disk full'}
+    result = subprocess.run([sys.executable, str(PLUGIN / 'scripts/stage_usage.py'), 'check', '--model-dir',
+                             str(tmp_path), '--stage', '12-agentic-evals'], env=env, capture_output=True, text=True)
+    assert result.returncode == 1 and 'disk full' in result.stderr

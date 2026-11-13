@@ -521,6 +521,10 @@ def main(argv: list[str] | None = None) -> int:
     if not os.environ.get("MULTIGOAL_STAGE_USAGE"):
         print("stage usage: not checked (written and gated by the multigoal runner)")
         return 0
+    if os.environ["MULTIGOAL_STAGE_USAGE"].startswith("unwritten"):
+        print(f"stage usage: the runner could not write the record ({os.environ['MULTIGOAL_STAGE_USAGE']}); "
+              "reported, not gated: the stage cannot fix the runner", file=sys.stderr)
+        return 1
     if not args.model_dir:
         print("stage usage: MODEL_DIR is required", file=sys.stderr)
         return 3

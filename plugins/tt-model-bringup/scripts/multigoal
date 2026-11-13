@@ -935,6 +935,7 @@ class StageUsage:
         self.round_thread_ids: list[str] = []
         self.timeline: device_timeline.DeviceTimeline | None = None
         self.rounds: list[JsonObject] = []
+        self.unwritten: str | None = None  # why the last write failed; the check then reports, not blocks
         if start is None:
             append_manifest(manifest, [f"stage_{index}_started_at_utc={self.start}"])
 
@@ -972,7 +973,8 @@ class StageUsage:
     def write(self, terminal: str) -> None:
         key = f"stage_{self.index}_usage"
         if self.home is None or self.model_dir is None or self.paths is None:
-            append_manifest(self.manifest, [f"{key}=skipped(no codex home, MODEL_DIR or report)"])
+            self.unwritten = "no codex home, MODEL_DIR or report"
+            append_manifest(self.manifest, [f"{key}=skipped({self.unwritten})"])
             return
         try:
             start = stage_usage.parse_ts(self.start)
@@ -999,8 +1001,10 @@ class StageUsage:
                 written.append(self.timeline.path)
             commit = commit_paths(self.repo, written, f"{self.name}: stage usage ({terminal})")
             append_manifest(self.manifest, [f"{key}={written[0]}", f"{key}_commit={commit}"])
-        except Exception as exc:  # noqa: BLE001 - the stage check gates the missing record
+            self.unwritten = None
+        except Exception as exc:  # noqa: BLE001 - the stage check reports the missing record
             print(f"stage usage not written: {exc}", file=sys.stderr)
+            self.unwritten = f"{type(exc).__name__}: {exc}"[:200]
             append_manifest(self.manifest, [f"{key}=failed({type(exc).__name__})"])
 
 
@@ -1154,12 +1158,13 @@ def run_stage_checks(
     extra_env = replacement_env(replacements)
     extra_env["MULTIGOAL_LOG_DIR"] = str(log_dir)
     extra_env["MULTIGOAL_STAGE"] = name
-    if usage is not None:
-        # The usage record is written before every check: gate it.
-        extra_env["MULTIGOAL_STAGE_USAGE"] = "1"
 
     code = -1
     for attempt in range(args.check_retries + 1):
+        if usage is not None:
+            # The usage record is written before every check: gate it. If this runner's own write failed, the
+            # stage's agent cannot fix that: the check reports it (advisory) instead of stopping the pipeline.
+            extra_env["MULTIGOAL_STAGE_USAGE"] = f"unwritten: {usage.unwritten}" if usage.unwritten else "1"
         check_log = log_dir / f"{name}.check-{attempt + 1}.log"
         code = run_check_script(script, repo, extra_env, check_log)
         if getattr(args, "_telemetry", None) is not None:
