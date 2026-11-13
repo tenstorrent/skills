@@ -760,6 +760,8 @@ NET_HOLDS_KEY = "net_holds"   # Daemon.hold_offline's holds: provider -> {host, 
 REACH_EVERY_S = 30      # while a provider is held offline, how often its API host is resolved again
 REACH_TIMEOUT_S = 5
 NET_HOLD_MAX_S = 900    # a held provider still lets one run try this often: a lookup that keeps failing never holds forever
+REFUSED_BACKOFF_S = 30  # after a transient refusal (a gateway challenge), new runs on its provider wait this, doubling per repeat
+AUTH_CONFIRM_MAX = 3    # auth text a passing login check contradicts this many times in a row opens the breaker anyway
 PROXY_ENV = ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")   # set: the host resolves nothing itself
 LOCAL_ONLY_EVERY_S = 3600   # how often done code tasks' branches are checked against the remotes
 LOCAL_ONLY_DAYS = 14        # done code tasks finished this recently are checked (flagged ones until cleared)
@@ -1447,6 +1449,8 @@ class Daemon:
         # new runs start on it (net_held). Kept in kv NET_HOLDS_KEY too, so a restart, and the overseer's
         # wake of a coordinator turn (a Daemon of its own), hold it until the host resolves.
         self._net_holds: dict[str, dict] = self._saved_net_holds()
+        # provider -> its runs that ended in a row on a transient refusal (hold_refused): the backoff's step.
+        self._refusals: dict[str, int] = {}
         self._sched_sig: tuple[int, int] | None = None   # harness/schedules.json (mtime, size) last checked
         self._sched_read = 0.0   # monotonic time it was last read
         self._sched_problem: str | None = None   # what was wrong with it, last logged
@@ -3443,12 +3447,55 @@ class Daemon:
         self._save_net_holds()
         log(self.p, f"{prov}: {why}; no new runs start on it until {host} resolves")
 
+    def hold_refused(self, prov: str, why: str) -> float:
+        """New runs on `prov` wait out a backoff after a transient refusal on the way to its API (a
+        gateway's challenge page): REFUSED_BACKOFF_S, doubling with each such end in a row, at most
+        NET_HOLD_MAX_S; a run that reaches the API resets it. Kept in memory only (never NET_HOLDS_KEY):
+        a restart tries again at once. Returns the wait."""
+        n = self._refusals[prov] = self._refusals.get(prov, 0) + 1
+        wait = min(REFUSED_BACKOFF_S * 2 ** (n - 1), NET_HOLD_MAX_S)
+        mono = time.monotonic()
+        self._net_holds[prov] = {"host": "", "since": mono, "checked": None, "checking": False,
+                                 "up": False, "probe": None, "until": mono + wait}
+        log(self.p, f"{prov}: {why}; new runs on it wait {wait:.0f} s, then try again")
+        return wait
+
+    def _login_says_in(self, prov: str) -> bool:
+        """Whether `prov`'s CLI says, model-free (login_state), that it is logged in, so one run's auth
+        text is a transient fault, not a logout. Not while its breaker is open, not when that check
+        proved nothing before (a refusal right after it passed: open_breaker's distrust), and not after
+        AUTH_CONFIRM_MAX transient refusals in a row: then the breaker opens and check_logins takes over."""
+        if self._refusals.get(prov, 0) >= AUTH_CONFIRM_MAX:
+            return False
+        db = self.p.db
+        prev = db.kv(alerts.BREAKER + prov) or {}
+        if prev.get("open") or (prev.get("closed_why") == LOGIN_CHECK_PASSED and
+                                not alerts.login_proven(db, prov, float(prev.get("closed") or 0))):
+            return False
+        return self._login_state(prov) is True
+
+    def _login_state(self, prov: str) -> bool | None:
+        """`prov`'s model-free login check (login_state): True, False, or None (no such check, or it failed)."""
+        try:
+            agent = get_provider(prov)
+            agent.entry = dict((self.cfg.get("providers") or {}).get(prov) or {})
+            return agent.login_state(self.cfg)
+        except Exception:
+            log(self.p, f"{prov}: login check failed\n" + traceback.format_exc())
+            return None
+
     def net_held(self, prov: str) -> bool:
         """Whether new runs on `prov` wait for its API host to resolve. The lookup runs in a thread of
         its own, at most every REACH_EVERY_S, so a tick never waits on DNS. A hold that lasts
-        NET_HOLD_MAX_S lets one run try anyway (_net_may_probe); how it ends re-arms or ends it."""
+        NET_HOLD_MAX_S lets one run try anyway (_net_may_probe); how it ends re-arms or ends it. A
+        backoff hold (hold_refused) ends at its time, with no lookup."""
         h = self._net_holds.get(prov)
         if not h:
+            return False
+        if h.get("until") is not None:
+            if time.monotonic() < h["until"]:
+                return True
+            self._end_net_hold(prov, "its backoff after a refusal on the way to its API ended")
             return False
         now = time.monotonic()
         if not h["up"] and not h["checking"] and (h["checked"] is None or now - h["checked"] >= REACH_EVERY_S):
@@ -3497,7 +3544,7 @@ class Daemon:
         now, mono = time.time(), time.monotonic()
         try:
             self.p.db.set_kv(NET_HOLDS_KEY, {prov: {"host": h["host"], "at": now - (mono - h["since"])}
-                                             for prov, h in self._net_holds.items()} or None)
+                                             for prov, h in self._net_holds.items() if h.get("host")} or None)
         except Exception:   # the hold still stands in memory
             log(self.p, "net hold not saved\n" + traceback.format_exc())
 
@@ -6665,6 +6712,14 @@ class Daemon:
             self._outside_writes(r, run_dir)
         if status == "timeout" and handed_off:
             cut_off, status = status, "ok"   # it handed off before the clock ran out: the work is done, not wasted
+        if usage.auth_failed and not slept_auth and not exit_info.get("launch_auth") and not handed_off \
+                and self._login_says_in(r["provider"]):
+            # One run's auth text while its CLI's own model-free check says logged in: a transient fault
+            # (a gateway, a token refresh that raced), retried with backoff, never the breaker.
+            log(p, f"run {r['id']}: auth text but {r['provider']}'s login check passes: retried, not logged out")
+            usage.auth_failed, usage.challenged = False, True
+        elif usage.challenged and not handed_off and self._login_state(r["provider"]) is False:
+            usage.auth_failed, usage.challenged = True, False   # behind the challenge, its CLI is logged out
         if usage.limited:
             status = "limit"
         if usage.auth_failed and not slept_auth:
@@ -6687,10 +6742,18 @@ class Daemon:
         if fell and status not in ("limit", "auth"):
             status = "fallback"   # the endpoint or the routed run failed: no attempt, the same tier on the core provider
         net_lost = status in SLEEP_CUT and bool(NET_LOST_RE.search(usage.error or ""))
+        # A gateway's challenge page (or auth text its login check contradicts, above): the network path
+        # refused it, not the account. Lost to the network like an unreachable API, with a backoff.
+        refused_net = usage.challenged and not net_lost and status in SLEEP_CUT and not handed_off
         if net_lost:
             self.hold_offline(r["provider"], f"run {r['id']} could not reach its API")
-        elif r["provider"] in self._net_holds and (status == "ok" or _has_tokens(usage)):
-            self._end_net_hold(r["provider"], f"run {r['id']} reached its API")
+        elif refused_net:
+            self.hold_refused(r["provider"], f"run {r['id']} was refused on the way to its API "
+                                             f"({(usage.error or 'a gateway challenge')[:120]})")
+        elif status == "ok" or _has_tokens(usage):
+            self._refusals.pop(r["provider"], None)
+            if r["provider"] in self._net_holds:
+                self._end_net_hold(r["provider"], f"run {r['id']} reached its API")
         note = json.loads(r["note"] or "{}")
         swapped = ""   # the stand-in a mid-run swap finished on: runs.model, never the asked-for model's run
         if mid := (exit_info.get("bridge") or {}).get("mid_run"):
@@ -6801,9 +6864,10 @@ class Daemon:
                         shutdown=self._shutdown(r["boot_id"]))
         elif status in bud.WASTED and handed_off:
             note["not_waste"] = "handoff"
-        elif net_lost:
-            # The API host did not resolve: the network went away under the run, not the task.
-            note.update(not_waste="network", lost_to_network=True)
+        elif net_lost or refused_net:
+            # The API host did not resolve, or a gateway refused the way to it: the network failed the
+            # run, not the task.
+            note.update(not_waste="network", lost_to_network=True, **({"refused_net": True} if refused_net else {}))
             if slept:
                 note["slept_s"] = exit_info.get("slept_s")   # most of its time asleep, not stuck
             status = "lost"

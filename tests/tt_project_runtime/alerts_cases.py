@@ -5886,3 +5886,110 @@ def test_alerts_ack_quiets_a_logout_until_its_state_changes(env, monkeypatch):
         d._logout_round = 0.0
         d.remind_logouts()
     assert len(p.db.unread_for_chat("c1", 0)) == sent, "an acknowledged logout was reminded"
+
+
+CHALLENGE_403 = "Failed to authenticate. API Error: 403 Attention Required! | Cloudflare"
+
+
+def _claude_out(tmp_path, text, typed=True):
+    out = tmp_path / "o.jsonl"
+    out.write_text("\n".join(json.dumps(x) for x in [
+        {"type": "assistant", **({"error": "authentication_failed"} if typed else {}),
+         "message": {"content": [{"type": "text", "text": text}]}},
+        {"type": "result", "subtype": "success", "is_error": True, "total_cost_usd": 0, "result": text, "usage": {}},
+    ]) + "\n")
+    return out
+
+
+def test_a_gateway_challenge_page_is_a_network_fault_on_every_provider_and_a_real_auth_error_is_not(env, tmp_path):
+    from ttp.providers import get_provider
+    from ttp.providers.base import auth_error, challenged
+    # The exact text a CDN challenge produced, typed by the CLI as an auth failure: not a logout.
+    u = get_provider("claude").parse(_claude_out(tmp_path, CHALLENGE_403))
+    assert u.challenged and not u.auth_failed and not u.limited and not u.request_error
+    for text in ("API Error: 403 <!DOCTYPE html><html><head><title>Just a moment...</title>",
+                 "Failed to authenticate (403, cf-mitigated: challenge)"):
+        assert challenged(text) and not auth_error(text)
+        u = get_provider("claude").parse(_claude_out(tmp_path, text, typed=False))
+        assert u.challenged and not u.auth_failed, text
+    # Real auth failures stay auth: an expired OAuth session, a 401 authentication_error, an invalid key.
+    for text in ("Failed to authenticate: OAuth session expired and could not be refreshed",
+                 'API Error: 401 {"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}',
+                 "Invalid API key · Please run /login"):
+        assert auth_error(text) and not challenged(text), text
+        u = get_provider("claude").parse(_claude_out(tmp_path, text))
+        assert u.auth_failed and not u.challenged, text
+    # Codex and Cursor read their stderr the same way (Provider parity).
+    err = tmp_path / "err.log"
+    for name in ("codex", "cursor"):
+        empty = tmp_path / f"{name}.jsonl"
+        empty.write_text("")
+        err.write_text(CHALLENGE_403 + "\n")
+        u = get_provider(name).parse(empty, err)
+        assert u.challenged and not u.auth_failed, name
+        err.write_text("Error: Authentication required. Please run 'agent login' first.\n")
+        u = get_provider(name).parse(empty, err)
+        assert u.auth_failed and not u.challenged, name
+
+
+def test_the_chat_bridge_maps_an_upstream_challenge_page_to_a_retryable_error_not_auth():
+    from ttp.chatbridge import error_for, fault_of
+    from ttp.providers.base import AUTH_RE
+    page = "<!DOCTYPE html><html><head><title>Attention Required! | Cloudflare</title></head></html>"
+    code, body = error_for(403, page)
+    assert code == 529 and body["error"]["type"] == "overloaded_error" and fault_of(403, page) == "error"
+    assert error_for(403, "forbidden")[0] == 401 and fault_of(403, "forbidden") == "auth"
+    assert not AUTH_RE.search(f"API Error: {code} {json.dumps(body)}")
+
+
+def test_a_challenged_run_is_lost_to_the_network_with_a_backoff_and_opens_no_breaker(env, monkeypatch):
+    from ttp import alerts
+    p, run, task, _, _ = _cli_run(env, monkeypatch, "cursor", "", stderr=CHALLENGE_403 + "\n", rc=1)
+    from ttp.daemon import REFUSED_BACKOFF_S, Daemon
+    assert run["status"] == "lost" and json.loads(run["note"])["refused_net"], run["status"]
+    assert alerts.breaker(p.db, "cursor") is None, "a challenge page opened the auth breaker"
+    assert not p.db.q("SELECT key FROM alerts WHERE key LIKE 'auth:%'"), "the user was told it is logged out"
+    assert p.db.task(task["id"])["attempts"] == 0
+    # The backoff: doubling per refusal in a row, capped, ended by its time or a run that gets through.
+    d = Daemon(p.base)
+    assert d.hold_refused("fake", "x") == REFUSED_BACKOFF_S and d.hold_refused("fake", "x") == 2 * REFUSED_BACKOFF_S
+    assert d.net_held("fake") and "fake" not in (p.db.kv("net_holds") or {}), "a backoff is never kept on disk"
+    for _ in range(10):
+        d.hold_refused("fake", "x")
+    assert d._net_holds["fake"]["until"] - d._net_holds["fake"]["since"] <= 900
+    d._net_holds["fake"]["until"] = 0
+    assert not d.net_held("fake") and "fake" not in d._net_holds
+
+
+
+def test_a_challenge_page_whose_cli_says_logged_out_is_a_logout(env, monkeypatch):
+    from ttp import alerts
+    from ttp.providers import get_provider
+    monkeypatch.setattr(type(get_provider("cursor")), "login_check", lambda self: False)
+    p, run, _, _, _ = _cli_run(env, monkeypatch, "cursor", "", stderr=CHALLENGE_403 + "\n", rc=1)
+    assert run["status"] == "auth" and alerts.breaker(p.db, "cursor"), run["status"]
+
+
+def test_auth_text_while_the_login_check_passes_opens_no_breaker_until_it_repeats(env, monkeypatch):
+    from ttp import alerts
+    from ttp.providers import get_provider
+    err = "Error: Authentication required. Please run 'agent login' first, or set CURSOR_API_KEY.\n"
+    monkeypatch.setattr(type(get_provider("cursor")), "login_check", lambda self: True)
+    p, run, task, _, _ = _cli_run(env, monkeypatch, "cursor", "", stderr=err, rc=1)
+    from ttp.daemon import AUTH_CONFIRM_MAX, Daemon
+    assert run["status"] == "lost" and alerts.breaker(p.db, "cursor") is None, run["status"]
+    # Repeats in a row: the check is not trusted past AUTH_CONFIRM_MAX, and the breaker opens.
+    d = Daemon(p.base)
+    assert d._login_says_in("cursor")
+    d._refusals["cursor"] = AUTH_CONFIRM_MAX
+    assert not d._login_says_in("cursor")
+    # A login check that says logged out, or none, leaves the breaker path as it was.
+    d._refusals.clear()
+    monkeypatch.setattr(type(get_provider("cursor")), "login_check", lambda self: False)
+    assert not d._login_says_in("cursor")
+    monkeypatch.setattr(type(get_provider("cursor")), "login_check", lambda self: None)
+    assert not d._login_says_in("cursor")
+    # An open breaker, or one a passed check closed before a refusal came back (distrust), is not overruled.
+    monkeypatch.setattr(type(get_provider("cursor")), "login_check", lambda self: True)
+    d.open_breaker("cursor", "401")
+    assert not d._login_says_in("cursor")

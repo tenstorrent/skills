@@ -58,6 +58,7 @@ import urllib.request
 import uuid
 
 from . import endpoint, redact
+from .providers.base import challenged
 
 UPSTREAM_TIMEOUT_S = 600
 MODEL_CHECK_TIMEOUT_S = 10   # the /models check a bare 404 gets (_model_listed)
@@ -420,7 +421,10 @@ def error_for(status: int, detail: str = "") -> tuple[int, dict]:
     if long:
         return 400, {"type": "error", "error": {"type": "invalid_request_error", "message":
                      f"{long} (the upstream model's context window, HTTP {status})" + (f": {detail}" if detail else "")}}
-    if status in (401, 403):
+    if status == 403 and challenged(detail):
+        # A gateway's challenge page is the network path, not the key: retryable, never a logout.
+        kind, code, msg = "overloaded_error", 529, "a gateway in front of the upstream endpoint answered with a challenge page"
+    elif status in (401, 403):
         kind, code, msg = "authentication_error", 401, "invalid api key: the upstream endpoint refused it"
     elif status == 402:
         # As a 429: Claude Code reads a 403 as a failed login, which would hold the provider as logged out.
@@ -451,7 +455,9 @@ def fault_of(status: int, detail: str = "") -> str:
     """The endpoint fault an upstream answer is, for per-tier routing's fallback (route.py): down (no
     answer or timed out), model_missing (a 404 whose wording names the model), error (5xx, any other
     404), rate_limit (429, 402 or rate-limit wording) or auth (401/403); '' for an answer about the
-    request itself."""
+    request itself. A 403 that is a gateway's challenge page (challenged) is an error, not auth."""
+    if status == 403 and challenged(detail):
+        return "error"
     if status in (401, 403):
         return "auth"
     if status in (402, 429) or RATE_WORDS.search(detail or ""):

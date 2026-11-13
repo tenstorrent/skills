@@ -22,6 +22,25 @@ EXTRA_BIN_DIRS = ["~/.local/bin", "~/.npm-global/bin", "~/bin", "/opt/homebrew/b
 AUTH_RE = re.compile(r"(authentication_failed|failed to authenticate|authentication required|oauth (session|token) (expired|invalid)|"
                      r"not logged in|please (run )?/?login|invalid api key|unauthorized|(status|http|error)[ :=]*401\b)", re.I)
 
+# A gateway's bot challenge or HTML error page in front of the API (a CDN's "Attention Required" or
+# "Just a moment" page, its cf-mitigated header): the network path refused the request, not the
+# account. It is a transient network fault, retried with backoff, never a logout, even after the
+# CLI's own "Failed to authenticate" prefix (auth_error).
+CHALLENGE_RE = re.compile(r"(attention required|cloudflare|cf-mitigated|cf-ray|just a moment|"
+                          r"<!doctype html|<html[\s>]|<title>)", re.I)
+
+
+def challenged(text: str) -> bool:
+    """Whether `text` (a failed run's error or stderr) is a gateway challenge or HTML error page."""
+    return bool(text and CHALLENGE_RE.search(text))
+
+
+def auth_error(text: str) -> bool:
+    """Whether `text` reports a real auth failure (a 401, an expired OAuth session, an invalid key, not
+    logged in): AUTH_RE, and no gateway challenge (challenged), which is a network fault instead."""
+    return bool(text and AUTH_RE.search(text) and not challenged(text))
+
+
 LIMIT_RE = re.compile(r"(usage limit|limit reached|rate limit|quota exceeded|out of credits|"
                       r"insufficient (credits|balance|funds)|spend(ing)? limit)", re.I)
 # The limits only the user can lift (funds or a spend control on the account), unlike a usage or
@@ -213,6 +232,7 @@ class RunUsage:
     actions_text: str = ""           # the newest main-agent text holding an {"actions": [...]} object
     answer: dict | None = None       # a whole final answer the run's budget end kept from being applied
     auth_failed: bool = False        # the provider is logged out or its credentials are invalid
+    challenged: bool = False         # a gateway challenge or HTML error page refused it: a network fault (challenged())
     limited: bool = False            # the provider refused for quota/limit reasons
     limit_note: str = ""
     error: str = ""

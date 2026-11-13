@@ -57,7 +57,7 @@ from pathlib import Path
 
 from . import register
 from .claude import STOP_HOOK_TIMEOUT_S   # the same allowance for the hand-off checks at a stop
-from .base import (AUTH_RE, LIMIT_RE, MAX_ARG_BYTES, Provider, RunUsage, cli_output, price_row, request_rejected,
+from .base import (LIMIT_RE, MAX_ARG_BYTES, Provider, RunUsage, auth_error, challenged, cli_output, price_row, request_rejected,
                    status_check, stderr_tail, strict_schema, drop_nulls, head80, input_hash, isolated_module_argv, jsonl_from,
                    CMD_MAX)
 
@@ -847,12 +847,15 @@ class Codex(Provider):
             # the daemon may apply it (Daemon._finish_coordinator). A cut-off message never parses.
             u.answer = u.structured
         blob = u.error + " " + err
-        if AUTH_RE.search(blob) and not u.output_tokens:
+        if challenged(blob) and not u.output_tokens:
+            u.challenged = True   # a gateway's challenge page, even under an auth prefix: a network fault
+        elif auth_error(blob) and not u.output_tokens:
             u.auth_failed = True
         elif LIMIT_RE.search(blob):
             u.limited, u.limit_note = True, LIMIT_RE.search(blob).group(0)
         # Only the failed turn's own error event, on a run that wrote nothing: never stderr alone.
-        if errors and request_rejected(u.error) and not (u.cost_usd or u.output_tokens or u.auth_failed or u.limited):
+        if errors and request_rejected(u.error) and not (u.cost_usd or u.output_tokens or u.auth_failed or u.limited
+                                                  or u.challenged):
             u.request_error = True
         return u
 

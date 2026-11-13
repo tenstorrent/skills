@@ -50,7 +50,7 @@ from typing import NamedTuple
 from . import register
 from ..budget import Window
 from .. import fencefree
-from .base import (AUTH_RE, LIMIT_RE, MAX_ARG_BYTES, MAX_CACHE_BREAKPOINTS, Provider, RunUsage, cap_cache_breakpoints,
+from .base import (LIMIT_RE, auth_error, challenged, MAX_ARG_BYTES, MAX_CACHE_BREAKPOINTS, Provider, RunUsage, cap_cache_breakpoints,
                    cli_output, find_binary, last_json_object, request_rejected, status_check, strict_schema,
                    drop_nulls, head80, input_hash, isolated_module_argv, jsonl_from, CMD_MAX)
 
@@ -637,22 +637,32 @@ class Claude(Provider):
             u.extra["cache_telemetry"]["first_cache_read"] = prompts[0][0].get("cache_read_input_tokens", 0)
             # The last call's prompt and answer: the session's real size (coordsession.context_tokens).
             u.extra["cache_telemetry"]["last_context"] = prompts[-1][1] + prompts[-1][0].get("output_tokens", 0)
-        for ev in self._events(output_path):
-            if ev.get("type") == "assistant" and ev.get("error") == "authentication_failed":
-                u.auth_failed = True
         stderr = ""
         if stderr_path and Path(stderr_path).exists():
             stderr = Path(stderr_path).read_text(errors="replace")[-2000:]
         # Not final_text: a killed worker's last message may just be discussing a 401 or a rate limit.
         blob = u.error + " " + stderr
-        if not u.cost_usd and AUTH_RE.search(blob):
+        for ev in self._events(output_path):
+            if ev.get("type") == "assistant" and ev.get("error") == "authentication_failed":
+                # The CLI types a gateway's challenge page as an auth failure too ("Failed to
+                # authenticate. API Error: 403 Attention Required!"): its own text tells them apart.
+                said = " ".join(str(c.get("text") or "") for c in (ev.get("message") or {}).get("content") or []
+                                if isinstance(c, dict))
+                if challenged(said + " " + blob):
+                    u.challenged = True
+                else:
+                    u.auth_failed = True
+        if not u.cost_usd and challenged(blob) and not u.auth_failed:
+            u.challenged = True
+        elif not u.cost_usd and auth_error(blob):
             u.auth_failed = True
         hit = LIMIT_RE.search(blob)
-        if (rejected or hit) and (u.error or not u.cost_usd) and not u.auth_failed:
+        if (rejected or hit) and (u.error or not u.cost_usd) and not (u.auth_failed or u.challenged):
             u.limited, u.limit_note = True, rejected or hit.group(0)
         # Only a run that failed and spent nothing: a priced run's error was not the request.
         cause = next((t for t in typed if request_rejected(t)), "")
-        if cause and (u.error or not saw_result) and not (u.cost_usd or u.output_tokens or u.auth_failed or u.limited):
+        if cause and (u.error or not saw_result) and not (u.cost_usd or u.output_tokens or u.auth_failed or u.limited
+                                                           or u.challenged):
             u.request_error, u.error = True, cause[:400]
         return u
 
