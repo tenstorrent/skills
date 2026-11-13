@@ -129,6 +129,35 @@ Teacher-forcing is the selection metric, not necessarily the serving headline. A
 
 If layer-level decode evidence, reduced token-out evidence, or a prior optimized full-model token-out artifact points to a different fastest passing policy than teacher-forcing does, resolve the conflict before selecting. Run the same token-out benchmark for the baseline and the top conflicting candidate through the normal construction path. If token-out cannot run because the generator or trace-feedback path fails, treat that as a bug to fix or a recorded blocker; do not silently use teacher-forcing throughput as the serving-policy answer.
 
+## Anomalies
+
+A degenerate reply (stray or repeated tokens, collapse into a few characters, a token loop) is a precision
+or stack defect until shown otherwise, not a model answer. Goal 12 fixes one with this procedure; this stage
+runs step 6 as a guard.
+
+1. **Detect.** Per reply, count distinct characters and repeated n-grams in the tail (e.g. the last 4,096
+   characters). A tail of a few distinct characters, or one dominated by a repeated n-gram while the head is
+   not, is an anomaly. Goal 12 marks such failures `cause: anomaly`.
+2. **Reproduce.** Freeze one prompt (the failing context up to the first stray token) and a seed. Write a
+   test that runs in minutes: the probability of the correct next token at that point, or the anomaly rate
+   over N short continuations. Run it at the served precision.
+3. **Full precision on TT:** BF16 weights, HiFi4, BF16 activations, BF16 head. If it still fails, run the
+   same prompt on an HF/GPU reference: if the reference passes, bisect the stack bug by op PCC; if it fails
+   too, report it as model behaviour.
+4. **Bisect to the fastest passing config** when full precision passes: by group (head, MLP gate/up, down,
+   attention, activations), then by layer range, measuring decode speed at each step. Choose the fastest
+   config that passes; the next faster ones tried fail.
+5. **Re-measure** the stage-11 `serving_rates.json` rows the eval uses at the chosen config, then rerun the
+   eval list on it.
+6. **Guard (this stage):** free-run long replies on a few agent-shaped prompts at the selected config and
+   at full precision, and check both with the step-1 detector. An anomaly the full-precision run lacks
+   rejects the config.
+
+Record in the failure row's `repro`: `test` (command), `prompt` (frozen prompt file), `seed`, `served`
+(`precision`, `result`), `full_precision` (`result`, `pass`), the HF/GPU result when step 3 needed it, and
+`changed` (what was changed, or why nothing). A precision fix adds `configs_tried` (`config`, `pass`,
+measured `decode_tok_s_user`) and `chosen`; the rerun's `config.precision` is `chosen`.
+
 ## Plots
 
 Use matplotlib/pyplot to generate two elegant, delightful Pareto charts:
@@ -158,7 +187,7 @@ Pass a candidate's precision config to the readiness runners through `--build-kw
 
 ## Final Selection
 
-Select the fastest config that satisfies the acceptance bar on every reference, also checking agent-shaped long prefixes, free-running replies and the memory ledger as [`agentic-serving`](../agentic-serving/SKILL.md) describes. Higher precision chosen for those reasons is a valid selection. Measurement noise is the spread between the repeated serial baseline runs recorded in the baseline section; a candidate counts as a gain only when it beats the baseline by more than that spread, and two configs inside it are a tie, where the simpler and safer one wins.
+Select the fastest config that satisfies the acceptance bar on every reference, also checking agent-shaped long prefixes and the memory ledger as [`agentic-serving`](../agentic-serving/SKILL.md) describes, and free-running replies by the Anomalies guard. Higher precision chosen for those reasons is a valid selection. Measurement noise is the spread between the repeated serial baseline runs recorded in the baseline section; a candidate counts as a gain only when it beats the baseline by more than that spread, and two configs inside it are a tie, where the simpler and safer one wins.
 
 Before finishing:
 

@@ -5,7 +5,7 @@ Stages 06-10: missing evidence is critical; a measured shortfall with a recorded
 Stage 11 (benchmark): serving_rates.json covers the batch x input-length grid and the release rows.
 Goal 12 (agentic-evals): each phase of the mode has a collected run with its records and per-task
 analysis (every failed task has a cause; a task cut off by a limit shows a loop or stall, or was rerun
-alone at a higher limit, and has a reasoning probe recorded) and no list is voided; those are critical. A
+alone at a higher limit; each recorded rerun has its reasoning setting and result) and no list is voided; those are critical. A
 phase not passed yet (score below the band, unexplained time, unfinished list) is advisory with its
 recorded reason, never critical for the score alone. Each run's server size comes from the device memory
 measured free at launch: a KV pool below POOL_FREE_FRACTION of it, or more agents than the pool holds at
@@ -254,10 +254,9 @@ def check_run(run: dict, inputs: dict, validated: list, collected: set, item: st
         tried = rerun.get("tried")
         tried = tried if isinstance(tried, list) else []
         raised = any(isinstance(t, dict) and higher_limit(t.get("limits"), limits) for t in tried)
-        if row.get("cause") in LIMIT_CAUSES and not (
-                tried and all(isinstance(t, dict) and t.get("reasoning") and "result" in t for t in tried)):
-            problems.append((2, f"run {name}: {row.get('task')!r} hit a limit ({row.get('cause')}); it needs a "
-                                "single-task rerun with rerun.tried rows (reasoning setting, result)"))
+        if not all(isinstance(t, dict) and t.get("reasoning") and "result" in t for t in tried):
+            problems.append((2, f"run {name}: {row.get('task')!r} rerun.tried rows need a reasoning setting and "
+                                "a result"))
         if row.get("cause") == "cutoff_progressing" and not raised:
             problems.append((2, f"run {name}: {row.get('task')!r} was cut off while progressing; rerun it alone "
                                 "at a higher limit (rerun.tried limits) until it finishes, loops or stalls"))

@@ -47,7 +47,8 @@ in stages 09 and 10:
 Stage 10 also records, without a pass bar, `prefill_by_length` (prefill rate at 4096,
 `typical_context_tokens` and `working_set_tokens`, and decode rate during a long prefill) and
 `host_contention` (decode at the largest batch on an idle host and with every host CPU busy).
-Stage 08 checks precision on long agent prefixes and free-running replies, not only short top-k agreement.
+Stage 08 checks precision on long agent prefixes and free-running replies (datatype-sweep, Anomalies), not
+only short top-k agreement.
 
 ## Measurement method
 
@@ -84,7 +85,7 @@ unmeasured goes in `missing_rows` (batch, input_tokens, reason) and the stage co
 predicted rate; a slowdown beyond the prediction's range is explained. It writes
 `doc/benchmark/serving_rates.json`: the server config, `validated_batches`, and per batch and input length
 `prefill_tok_s`, `decode_tok_s_user`, `ttft_s` and `step_ms`. Goal 12 reads these rates and does not
-re-measure them.
+re-measure them, except the rows it uses after a precision fix (Failure analysis 3).
 
 ## Goal 12: agentic evals
 
@@ -180,9 +181,9 @@ Admit a run only when its projection from measured times fits `run_timeout_hours
   solution (the upstream fix, a later release, the resolving discussion) is a failure and stays in the
   denominator; report how many. Never void a list.
 - **Task resources** come from each task's definition, never a blanket value.
-- **Reasoning:** start at the reference's setting (medium when unknown); Failure analysis probes others.
+- **Reasoning:** start at the reference's setting (medium when unknown); Failure analysis may probe others.
   Record the setting with each run and the reference's own setting with the reference.
-- **Harness and route** are main's, unchanged. A real harness defect is fixed on a generic branch named for
+- **Harness and route** are main's, unchanged; only a precision fix (Failure analysis 3) changes precision. A real harness defect is fixed on a generic branch named for
   the defect and listed in `learned.json`.
 
 ### Task lists
@@ -196,16 +197,20 @@ each list and its rule in `results.json` before any score on it.
 
 This is iteration on the phase's failing tasks inside its time, never growth of the list.
 
-1. Every failed or timed-out task gets a row: cause (wrong answer or patch, loop to the cap, malformed tool
-   call, cut off while progressing, stalled, infrastructure, fetched solution) and evidence (trajectory
-   lines, tokens, time).
+1. Every failed or timed-out task gets a row: cause (wrong answer or patch, anomaly, loop to the cap,
+   malformed tool call, cut off while progressing, stalled, infrastructure, fetched solution) and evidence
+   (trajectory lines, tokens, time). Run datatype-sweep's Anomalies detector on every reply first: a
+   degenerate reply is `anomaly`, never `wrong` or `loop_cap` (that is an agent repeating coherent actions).
 2. A task that hit the agent or request limit or the output cap fails on it only if its trajectory loops
    (`loop_cap`) or stalls (`stalled`). One cut off while progressing is rerun alone at ≥ 2× that limit,
    within `run_timeout_hours`, until it finishes, loops or stalls; that result counts.
-3. For tasks that looped or hit a limit, probe other settings (thinking on or off, the efforts the server
-   offers) on each task alone, in parallel where the server allows. One probe per task is enough. Record
-   each attempt in `rerun.tried` (setting, limits, result, tokens, time).
-4. Rerun the whole list at a new setting only if a probe solved a failed task, not for time alone; the
+3. Each anomaly, and a phase below its band, gets a fix attempt by datatype-sweep's Anomalies procedure,
+   recorded in the row's `repro`. A precision fix is the one allowed precision change: re-measure the
+   stage-11 rows the eval uses at the chosen config and rerun the list on it; a speed loss is accepted.
+4. Optional, once precision is ruled out: for tasks that looped or hit a limit, probe other settings
+   (thinking on or off, the efforts the server offers) on each task alone, in parallel where the server
+   allows; one probe per task. Record each attempt in `rerun.tried` (setting, limits, result, tokens, time).
+   Rerun the whole list at a new setting only if a probe solved a failed task, not for time alone; the
    phase takes the run that scores best within its time.
 5. Limit reruns and probes together should take about 20% of the phase's time at most.
 6. Any other single-task rerun changes the score only when the first failure was infrastructure (verifier
@@ -232,8 +237,9 @@ In `doc/agentic_evals/`:
   `working_set_tokens` per agent, `reason`), limits and their source, network mode, `reasoning`, SHAs), `score` (`solved`, `n`, `interval_95`),
   `reference` (`value`, `source`, `reasoning`), `band_pass`, `predicted_hours`, `explained_hours`,
   `measured_hours`, `collected`, and `failures`: one row per failed task with `task`, `cause` (`wrong`,
-  `loop_cap`, `malformed_tool_call`, `cutoff_progressing`, `stalled`, `infrastructure`, `fetched_solution`),
-  `evidence` and `rerun` (`tried`: setting, `limits`, result; `counted`); plus
+  `anomaly`, `loop_cap`, `malformed_tool_call`, `cutoff_progressing`, `stalled`, `infrastructure`, `fetched_solution`),
+  `evidence`, `repro` for an anomaly (datatype-sweep, Anomalies) and `rerun` (`tried`: setting, `limits`,
+  result; `counted`); `config.precision` after a precision fix; plus
   `phases`: per phase `run`, `start_hour`, `pass`, and `reason` when not passed.
 - `runs.json`: the runner's append-only run records.
 - `learned.json`: `best_config` per suite (the config, list size and hours of the best valid run),

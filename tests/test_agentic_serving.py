@@ -174,7 +174,7 @@ def cap_without_rerun(run):
     (drop_reference, 'no reference value'),
     (uncollect, 'not collected'),
     (drop_reasoning, 'reasoning setting'),
-    (cap_without_rerun, 'single-task rerun'),
+    (cap_without_rerun, 'at a higher limit'),
 ])
 def test_quick_run_fault_is_critical(tmp_path, fault, message):
     run = scored_run()
@@ -234,6 +234,8 @@ def test_limit_failure_with_settings_tried_passes(tmp_path):
     assert goal12(tmp_path, runs=[run]) == (0, '')
     run['failures'][0]['rerun']['tried'] = [{'result': 'no setting recorded'}]
     assert goal12(tmp_path, runs=[run])[0] == 2
+    del run['failures'][0]['rerun']
+    assert goal12(tmp_path, runs=[run]) == (0, ''), 'reasoning probes are optional'
 
 
 def test_list_run_above_the_reference_limits_is_advisory(tmp_path):
