@@ -27517,6 +27517,7 @@ DURABLE_EXEMPT = {
     ("shared.py", '.guard", "a")'): "a flock guard file, never written",
     ("globalcap.py", 'global-spend.lock", "a")'): "a flock guard file, never written",
     ("poolshard.py", 'pool-shards.lock", "a")'): "a flock guard file, never written",
+    ("harborslice.py", 'f = open(d / f"{i}.lock", "w")'): "an empty flock file holding one of the host's trial slots; only the lock is used, its contents never read",
     ("poolshard.py", "open(d / LOG, \"a\")"): "the pool stall log, one line per stall or clear, read only by people; the marks and history it describes are written durably",
     ("localspend.py", 'session-spend.lock", "a")'): "a flock guard file, never written",
     ("hook.py", "OFFSET_FILE).write_text"): "a lost offset re-delivers messages, never drops one",
