@@ -17,6 +17,11 @@ chat bridge stay reachable; the runner and the bridge run outside), but `gh` is 
 fails, forge tokens, the ssh agent and git credential helpers are unset, and git speaks only to local paths.
 The project's CLI hooks are not loaded in a cell (their commands live in the runtime): the namespace is the guard.
 
+An injection cell (benchcells.injection_cell) keeps the same namespace and adds only what its canaries need, at the
+same paths: its stand-in tools, its canary folder, its bare canary remote (one `origin`) and its inputs; its
+decoy credential lives in the cell's scratch HOME. The source checkout, the project's folders and the real home
+stay out of it, as for a replay cell.
+
 selftest() runs inside the same namespace before the agent starts and returns what is wrong; a cell that fails
 it is never run or scored. Without a working backend, backend() is None and a cell is "not isolated": it
 never runs, is never scored and never ranks. Applies to bench cells only: project workers stay as they are."""
@@ -52,9 +57,17 @@ fail() { echo "FAIL: $*"; }
 for p in "$@"; do
   if [ -e "$p" ] || [ -L "$p" ]; then fail "visible inside the cell: $p"; fi
 done
-r=$(git remote 2>&1); [ -z "$r" ] || fail "git remote is not empty: $r"
+r=$(echo $(git remote 2>&1))   # one line, whatever it lists
+if [ -n "$EXPECT_REMOTE" ]; then
+  [ "$r" = origin ] || fail "git remote is '$r', not only origin"
+  u=$(git remote get-url origin 2>&1); [ "$u" = "$EXPECT_REMOTE" ] || fail "origin is '$u', not the cell's canary remote"
+else
+  [ -z "$r" ] || fail "git remote is not empty: $r"
+fi
 n=$(git rev-list --all --count 2>&1); [ "$n" = 1 ] || fail "git rev-list --all --count is '$n', not 1"
-if gh auth status >/dev/null 2>&1; then fail "gh succeeds"; fi
+if [ -n "$EXPECT_GH" ]; then
+  g=$(command -v gh 2>&1); [ "$g" = "$EXPECT_GH" ] || fail "gh is '$g', not the cell's stand-in"
+elif gh auth status >/dev/null 2>&1; then fail "gh succeeds"; fi
 [ -z "$GH_TOKEN$GITHUB_TOKEN$SSH_AUTH_SOCK$GIT_ASKPASS" ] || fail "a forge or ssh credential is in the environment"
 [ "$HOME" = "$EXPECT_HOME" ] || fail "HOME is '$HOME', not the cell's"
 echo SELFTEST-END
@@ -173,6 +186,8 @@ class Cell:
     cli: str = ""   # the provider's executable as the cell finds it (its resolved install)
     python: str = ""   # the cell venv's interpreter and, for a dry run, the runtime copy its fake agent imports
     runtime: str = ""
+    remote: str = ""   # an injection cell's canary remote (its one allowed `origin`); "" for none
+    gh: str = ""   # an injection cell's own gh stand-in (logs to the cell's canary folder); "" for the default one
 
     def wrap(self, argv: list[str]) -> list[str]:
         return [*self.prefix, *argv]
@@ -190,12 +205,17 @@ class Cell:
 
 def build(tmp: Path, ws: Path, hidden: list[Path], *, python: str, cli: str = "", config: dict | None = None,
           creds: list[tuple[str, str]] = (), runtime_copy: Path | None = None, name: str | None = None,
-          path_dirs: list[str] = ()) -> Cell:
+          path_dirs: list[str] = (), standins: dict[str, Path] | None = None, binds: list[tuple[str, str]] = (),
+          remote: str = "") -> Cell:
     """The namespace for one cell whose folder is `tmp` (holding `ws`, run, venv, config folders).
     `python`: the interpreter its venv uses; `cli`: the provider's executable; `config`: provider config
     variables (their folders are in `tmp`); `creds`: real login files (path, where in the cell) bound
     read-only; `runtime_copy`: a copy of the runtime a dry run's fake agent imports (never the real one);
-    `path_dirs`: folders of `tmp` the cell's PATH starts with. Raises Unavailable without a backend."""
+    `path_dirs`: folders of `tmp` the cell's PATH starts with. An injection cell also gives `standins` (tool
+    name -> its stand-in script, which then replaces the default `gh` one, also over a system copy), `binds`
+    (("ro"|"bind", path): folders bound at the same path: its stand-ins' folder, the canary folder its
+    stand-ins and hooks write to, its bare canary remote and inputs) and `remote` (that remote's path, the
+    one `origin` the self-test accepts). Raises Unavailable without a backend."""
     name = name or backend()
     if not name:
         raise Unavailable("not isolated: neither bwrap (bubblewrap) nor unshare (util-linux) can build a mount "
@@ -206,8 +226,10 @@ def build(tmp: Path, ws: Path, hidden: list[Path], *, python: str, cli: str = ""
     (tmp / "bin").mkdir(exist_ok=True)
     (home / ".gitconfig").write_text(GITCONFIG)
     gh = tmp / "bin" / "gh"
-    gh.write_text(GH_STANDIN)
-    gh.chmod(0o755)
+    if not standins:
+        gh.write_text(GH_STANDIN)
+        gh.chmod(0o755)
+    covers = dict(standins) if standins else {"gh": gh}
     avoid = [Path(h) for h in hidden]
     ro: list[Path] = []
     for exe in (python, cli):
@@ -218,11 +240,13 @@ def build(tmp: Path, ws: Path, hidden: list[Path], *, python: str, cli: str = ""
     plan += [("ro", str(p), str(p)) for p in dict.fromkeys(ro) if not _under(str(p), SYSTEM)]
     plan.append(("bind", str(tmp), str(tmp)))
     plan += [("ro", str(real), str(to)) for real, to in creds if os.path.isfile(real)]   # after its folder's mount
+    plan += [(mode, str(p), str(p)) for mode, p in binds]
     for d in dict.fromkeys(os.path.realpath(x) for x in [*os.environ.get("PATH", "").split(os.pathsep),
                                                         "/usr/local/bin", "/usr/bin", "/bin"] if x):
-        if _under(d, SYSTEM) and os.path.isfile(os.path.join(d, "gh")):   # a system gh: the stand-in covers it
-            plan.append(("ro", str(gh), os.path.join(d, "gh")))
-    cell = Cell(name, [], home, conf=dict(config or {}))
+        for tool, standin in covers.items():
+            if _under(d, SYSTEM) and os.path.isfile(os.path.join(d, tool)):   # a system copy: the stand-in covers it
+                plan.append(("ro", str(standin), os.path.join(d, tool)))
+    cell = Cell(name, [], home, conf=dict(config or {}), remote=remote, gh=str((standins or {}).get("gh", "")))
     found = shutil.which(cli) or cli if cli else ""
     real = os.path.realpath(found) if found else ""
     cell.cli = real if real and not _under(real, SYSTEM) else found
@@ -238,9 +262,11 @@ def build(tmp: Path, ws: Path, hidden: list[Path], *, python: str, cli: str = ""
 
 def selftest(cell: Cell, ws: Path, absent: list[Path], timeout_s: float = 60) -> list[str]:
     """What is wrong with `cell`, checked from inside it: a path of `absent` that exists there, a remote,
-    more than one commit, a `gh` that works, a forge credential or the real HOME in the environment. []
+    more than one commit (an injection cell's one remote is its canary `origin`: any other remote or url is
+    wrong), a `gh` that works (an injection cell's is its own stand-in), a forge credential or the real HOME
+    in the environment. []
     when the cell is as isolated as it should be."""
-    env = {**os.environ, "EXPECT_HOME": str(cell.home)}
+    env = {**os.environ, "EXPECT_HOME": str(cell.home), "EXPECT_REMOTE": cell.remote, "EXPECT_GH": cell.gh}
     try:
         r = subprocess.run(cell.wrap(["sh", "-c", SELFTEST, "sh", *map(str, absent)]), capture_output=True, text=True,
                            timeout=timeout_s, stdin=subprocess.DEVNULL, env=env, cwd=str(ws))

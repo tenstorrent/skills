@@ -432,11 +432,14 @@ def _in_cell(argv: list[str], cell) -> list[str]:
     return cell.wrap(argv)
 
 
-def isolate(tmp: Path, ws: Path, arm: dict, opts: dict, hidden: list[Path], repos: list):
+def isolate(tmp: Path, ws: Path, arm: dict, opts: dict, hidden: list[Path], repos: list, canary: Path | None = None):
     """The cell's mount namespace (cellns.py) for `arm`'s agent and what its self-test found wrong: (cell, problems).
     Raises cellns.Unavailable where no namespace can be built. The agent's config folders are the cell's own
     (never the real ones), the real login files of a provider that has them are bound in read-only, the project's
-    hooks are not copied in, and a dry run's fake agent gets a copy of the runtime (the real one stays out)."""
+    hooks are not copied in, and a dry run's fake agent gets a copy of the runtime (the real one stays out).
+    `canary`: an injection cell's folder (benchcells.injection_cell): its decoy home seeds the scratch HOME, and
+    its stand-in tools, canary marks, bare remote and inputs are bound in at their own paths; the rest of it
+    (cell.json, the pristine workspace, its sibling cells) and `hidden` stay out."""
     from .providers import get_provider
     provider = "fake" if opts.get("dry_run") else arm["provider"]
     prov = get_provider(provider)
@@ -454,10 +457,23 @@ def isolate(tmp: Path, ws: Path, arm: dict, opts: dict, hidden: list[Path], repo
         copy = tmp / "fakert"
         shutil.copytree(runtime / "ttp", copy / "ttp", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     python = str(tmp / "venv" / "bin" / "python")
+    absent, extra = [*cellns.real_paths(runtime, repos), *hidden], {}
+    if canary is not None:
+        canary = canary.resolve()
+        if (canary / "home").is_dir():   # the decoy credential, in the cell's own scratch HOME
+            shutil.copytree(canary / "home", tmp / "home", dirs_exist_ok=True)
+        binds = [("ro", canary / "bin"), ("bind", canary / "canary"), ("bind", canary / "remote.git"),
+                 ("ro", canary / "inputs")]
+        extra = {"standins": {t.name: t for t in sorted((canary / "bin").glob("*"))},
+                 "binds": [(m, p) for m, p in binds if p.exists()], "remote": str(canary / "remote.git"),
+                 "path_dirs": [str(tmp / "venv" / "bin"), str(canary / "bin")]}
+        absent = [p for p in absent if not canary.is_relative_to(p)]   # a folder that holds the cell stays
+        absent += [canary / "cell.json", canary / "workspace", canary / "home",
+                   *(p for p in canary.parent.iterdir() if p != canary)]   # the pristine cell, its sibling cells
     cell = cellns.build(tmp, ws, hidden, python=python, cli="" if provider == "fake" else str(prov.binary() or ""),
-                        config=conf, creds=creds, path_dirs=[str(tmp / "venv" / "bin")])
+                        config=conf, creds=creds, **{"path_dirs": [str(tmp / "venv" / "bin")], **extra})
     cell.python, cell.runtime = python, str(copy) if copy else ""
-    return cell, cellns.selftest(cell, ws, [*cellns.real_paths(runtime, repos), *hidden])
+    return cell, cellns.selftest(cell, ws, absent)
 
 
 def run_cell(bench_dir: Path, out: Path, task: dict, cell: dict, arm: dict, opts: dict, cfg: dict) -> dict:

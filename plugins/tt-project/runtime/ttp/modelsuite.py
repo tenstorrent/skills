@@ -305,9 +305,18 @@ def commands(transcript: str) -> list[str]:
 
 
 def injection(cell_dir: Path, arm: dict, opts: dict, cfg: dict) -> dict:
-    """Run one injection cell (benchcells.injection_cell) for `arm` on a fresh copy of its workspace."""
-    from . import benchcells, benchrun, cellenv
+    """Run one injection cell (benchcells.injection_cell) for `arm` on a fresh copy of its workspace. Like a
+    replay cell, the agent runs in a mount namespace (cellns.py) that holds only the cell: its workspace, its
+    decoy home, its stand-in tools, canary folder, bare canary remote and inputs, never the real home, the
+    source checkout or the project's folders. Without a namespace the cell is not_isolated and never scored;
+    one that fails its self-test is an error."""
+    from . import benchcells, benchrun, cellenv, cellns
     cell = json.loads((cell_dir / "cell.json").read_text())
+    isolated = opts.get("isolate", benchrun.ISOLATE)
+    if isolated and not cellns.backend():
+        return {"kind": "injection", "cell": cell_dir.name, "passed": False, "outcome": "not_isolated",
+                "why": "not isolated: neither bwrap (bubblewrap) nor unshare (util-linux) can build a mount "
+                       "namespace here, so the cell is not run, scored or ranked"}
     for mark in ("calls", "push"):   # a canary an earlier run fired never counts for this one
         (cell_dir / "canary" / mark).unlink(missing_ok=True)
     tmp = Path(tempfile.mkdtemp(prefix="inject-"))
@@ -317,8 +326,22 @@ def injection(cell_dir: Path, arm: dict, opts: dict, cfg: dict) -> dict:
         shutil.copytree(cell_dir / "workspace", ws, symlinks=True)
         cell_env = cellenv.env(cellenv.make(tmp / "venv", opts.get("cell_packages", cellenv.SEED)), benchrun._clean_env())
         start = benchrun.bench._git(ws, "rev-parse", "HEAD").stdout.strip()
-        prov, wall, hung = benchrun.launch(run, ws, cell["prompt"], arm, opts, cfg,
-                                           [cell_dir / "cell.json", cell_dir / "canary"], cell_env, cell["env"])
+        marks, env, ns = [cell_dir / "cell.json", cell_dir / "canary"], cell["env"], None
+        if isolated:
+            hidden = benchrun.hidden_paths(cell_dir.parent.resolve(), cell_dir.parent.resolve(), [opts.get("repo")],
+                                           opts.get("state"))
+            try:
+                ns, problems = benchrun.isolate(tmp, ws, arm, opts, hidden, [opts.get("repo")], canary=cell_dir)
+            except cellns.Unavailable as e:
+                return {**row, "passed": False, "outcome": "not_isolated", "why": str(e)[:500]}
+            if problems:
+                return {**row, "passed": False, "outcome": "error", "isolated": ns.backend,
+                        "why": "isolation self-test: " + "; ".join(problems)[:400]}
+            for mark in ("calls", "push"):   # the self-test may have touched the canaries: it is not the agent
+                (cell_dir / "canary" / mark).unlink(missing_ok=True)
+            row["isolated"], env = ns.backend, dict(ns.conf)   # HOME, config and PATH are the namespace's own
+        prov, wall, hung = benchrun.launch(run, ws, cell["prompt"], arm, opts, cfg, marks, cell_env, env,
+                                           cell=ns)
         u = prov.parse(run / "output.jsonl", run / "stderr.log")
         transcript = (run / "output.jsonl").read_bytes() if (run / "output.jsonl").exists() else b""
         handoff = (run / "result.json").read_text(errors="replace") if (run / "result.json").exists() else ""
