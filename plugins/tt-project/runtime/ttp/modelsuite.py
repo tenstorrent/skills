@@ -491,9 +491,8 @@ def _regrade(bench_dir: Path, task: dict, patch: str, opts: dict) -> tuple[bool 
         ws = tmp / "work"
         shutil.copytree(bench_dir / str(task["task"]) / "workspace", ws, symlinks=True)
         if patch.strip():
-            (tmp / "diff.patch").write_text(patch)
-            r = subprocess.run(["git", "-C", str(ws), "apply", "--whitespace=nowarn", str(tmp / "diff.patch")],
-                               capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+            r = subprocess.run(["git", "-C", str(ws), "apply", "--whitespace=nowarn", "-"], input=patch,
+                               capture_output=True, text=True, timeout=120)
             if r.returncode:
                 return None, f"the kept diff does not apply to the base workspace: {(r.stderr or r.stdout)[-300:]}"
         venv = cellenv.make(tmp / "grade-venv", opts.get("cell_packages", cellenv.SEED))
