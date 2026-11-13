@@ -545,7 +545,7 @@ class Codex(Provider):
                       for k in ("input_tokens", "cached_input_tokens", "output_tokens"))
                 for ev in self._events(output_path) if ev.get("type") == "turn.completed"]
 
-    def own_tokens(self, output_path, since=None, env=None, prior=None, resumed=False):
+    def own_tokens(self, output_path, since=None, env=None, prior=None, resumed=False, until=None):
         """(this run's own (input, cached, output), how it was found, the session's terminal counters).
         `codex exec resume` reports the session's running totals on turn.completed, not the run's: a
         resumed run booked them all at once (a run of about $0.75 booked at $31.66). Baselines, in order:
@@ -555,10 +555,12 @@ class Codex(Provider):
         above it and never falls from turn to turn; else (a counter reset after compaction, a rotated or
         missing rollout and no record) a resumed run keeps its reported counters, "unverified".
         A new session's turns are its own: summed as reported, "turns". Never another session's counters:
-        the rollout and `prior` are the run's own thread's."""
+        the rollout and `prior` are the run's own thread's. `until` (the run's end, for a run read back after
+        later wakes resumed the same session) ignores rollout totals written after it: the rollout keeps
+        growing, and its newest total would book the later wakes' tokens to this run."""
         turns = self._turns(output_path)
         summed = tuple(sum(t[i] for t in turns) for i in range(3)) if turns else (0, 0, 0)
-        rolled, _, base = self._read_rollout(Path(output_path), since, env, with_base=True)
+        rolled, _, base = self._read_rollout(Path(output_path), since, env, with_base=True, until=until)
         ref, how = (tuple(base), "rollout") if base else (tuple(prior), "thread") if prior and len(prior) == 3 else (None, "")
         if not turns:   # cut off before its turn completed: cut_off_cost prices its rollout's rise
             return summed, "none", None
@@ -591,19 +593,21 @@ class Codex(Provider):
         return ((inp - cached) * pin + cached * pcached + out * pout) / 1e6
 
     def _rollout_tokens(self, output_path: Path, since: float | None = None,
-                        env: dict | None = None) -> tuple[int, int, int] | None:
+                        env: dict | None = None, until: float | None = None) -> tuple[int, int, int] | None:
         """(input, cached, output) tokens this run spent so far, from the newest
         event_msg/token_count `total_token_usage` in its session's rollout. That total covers the
         whole session, so a resumed run subtracts the last total written before `since` (its start).
-        Read incrementally: the runner asks every few seconds while the rollout grows."""
-        return self._read_rollout(output_path, since, env)[0]
+        Read incrementally: the runner asks every few seconds while the rollout grows. `until` drops totals
+        written after it (own_tokens)."""
+        return self._read_rollout(output_path, since, env, until=until)[0]
 
     def _read_rollout(self, output_path: Path, since: float | None = None, env: dict | None = None,
-                      with_base: bool = False):
+                      with_base: bool = False, until: float | None = None):
         """(`_rollout_tokens`, (stamp, rate_limits) of the newest token_count event carrying them),
         read in one incremental pass. `with_base` adds the session's total before `since` (None when the
         rollout has none: a new session, or one rotated away), and then gives the tokens only while
-        every counter rose from it (else None: the counters started over)."""
+        every counter rose from it (else None: the counters started over). Totals stamped after `until`
+        (or unreadable, with `until` set) are not the run's: skipped."""
         sid = next((str(ev.get("thread_id") or "") for ev in self._events(output_path)
                     if ev.get("type") == "thread.started"), "")
         paths = self.session_paths(sid, "", env)
@@ -612,7 +616,7 @@ class Codex(Provider):
         seen = self.__dict__.setdefault("_rollouts", {})
         try:
             path = max(paths, key=lambda f: f.stat().st_mtime)
-            offset, base, last, limits = seen.get((str(path), since), (0, None, None, None))
+            offset, base, last, limits = seen.get((str(path), since, until), (0, None, None, None))
             with open(path, "rb") as f:
                 f.seek(offset)
                 for raw in f:
@@ -623,6 +627,8 @@ class Codex(Provider):
                         continue
                     try:
                         rec = json.loads(raw)
+                        if until is not None and _stamp(rec.get("timestamp")) > until:
+                            continue   # a later wake's, on the same session
                         if isinstance(rec["payload"].get("rate_limits"), dict):   # also on an event with no info
                             limits = (_stamp(rec.get("timestamp")), rec["payload"]["rate_limits"])
                         total = rec["payload"]["info"]["total_token_usage"]
@@ -636,7 +642,7 @@ class Codex(Provider):
                         last = tok
         except OSError:
             return (None, None, None) if with_base else (None, None)
-        seen[(str(path), since)] = (offset, base, last, limits)
+        seen[(str(path), since, until)] = (offset, base, last, limits)
         if with_base:
             rose = last is not None and (not base or all(a >= b for a, b in zip(last, base)))
             return (tuple(a - b for a, b in zip(last, base or (0, 0, 0))) if rose else None), limits, base
@@ -747,11 +753,12 @@ class Codex(Provider):
             usage.cost_usd += self._price(*sub)
             usage.extra["subagent_tokens"] = list(sub)
 
-    def _subagent_tokens(self, output_path, since=None, env=None) -> tuple[int, int, int]:
+    def _subagent_tokens(self, output_path, since=None, env=None, until=None) -> tuple[int, int, int]:
         """(input, cached, output) tokens of the sub-agents the run's thread spawned (the multi_agent
         feature), at any depth: `turn.completed` counts only the run's own thread, and each sub-agent
         writes its own rollout whose session_meta names its parent_thread_id. Each one's newest
-        total_token_usage, less its last total before `since` (a sub-agent a resumed run continues).
+        total_token_usage up to `until` (the run's end, when given), less its last total before `since`
+        (a sub-agent a resumed run continues).
         Read from the parent rollout's day folder and the next (a sub-agent started past midnight UTC);
         priced at the run's model. The layout is not in the official docs: if it moves, this finds none."""
         sid = next((str(ev.get("thread_id") or "") for ev in self._events(Path(output_path))
@@ -798,7 +805,7 @@ class Codex(Provider):
                     grew = True
         total = [0, 0, 0]
         for child in mine - {sid}:
-            got = _rollout_total(parent_of[child][1], since)
+            got = _rollout_total(parent_of[child][1], since, until)
             total = [a + b for a, b in zip(total, got)]
         return tuple(total)
 
@@ -920,8 +927,9 @@ class Codex(Provider):
         return {"model": str(res.get("model") or ""), "effort": str(res.get("reasoningEffort") or "")}
 
 
-def _rollout_total(path: Path, since: float | None) -> tuple[int, int, int]:
-    """A rollout's newest (input, cached, output) total_token_usage, less its last total before `since`."""
+def _rollout_total(path: Path, since: float | None, until: float | None = None) -> tuple[int, int, int]:
+    """A rollout's newest (input, cached, output) total_token_usage up to `until` (later and unreadable
+    stamps skipped), less its last total before `since`."""
     base, last = (0, 0, 0), (0, 0, 0)
     try:
         with open(path, "rb") as f:
@@ -934,7 +942,10 @@ def _rollout_total(path: Path, since: float | None) -> tuple[int, int, int]:
                     tok = tuple(int(total.get(k) or 0) for k in ("input_tokens", "cached_input_tokens", "output_tokens"))
                 except (ValueError, TypeError, KeyError, AttributeError):
                     continue
-                if since is not None and _stamp(rec.get("timestamp")) < since:
+                at = _stamp(rec.get("timestamp"))
+                if until is not None and at > until:
+                    continue
+                if since is not None and at < since:
                     base = tok
                 else:
                     last = tok

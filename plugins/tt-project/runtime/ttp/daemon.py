@@ -743,6 +743,7 @@ SESSION_REBOOK_KEY = "session_total_rebook"   # Daemon.rebook_session_totals ran
 SESSION_REBOOK_DAYS = 7   # its window: runs that ended this many days back or less
 CODEX_REBOOK_KEY = "codex_resume_rebook"   # Daemon.rebook_codex_resumes ran (once per project)
 CODEX_REBOOK_DAYS = 30   # its window: Codex runs that ended this many days back or less
+CODEX_INTERVAL_KEY = "codex_resume_rebook_interval"   # Daemon.rebook_codex_intervals ran (once per project)
 CALLS_REBOOK_KEY = "per_call_rebook"   # Daemon.rebook_per_call ran (once per project)
 CALLS_REBOOK_DAYS = 7   # its window: Claude runs that ended this many days back or less
 CALLS_REBOOK_PROGRESS_KEY = "per_call_rebook_progress"   # its place while it runs in slices (window, cursor, sums)
@@ -1655,6 +1656,14 @@ class Daemon:
                             + ", ".join(f"run {i} ${a:.2f}->${b:.2f}" for i, a, b in changed[:40]) + ")")
         except Exception:   # a spend correction must never keep the daemon from starting
             log(self.p, "Codex resume re-book error: " + traceback.format_exc().replace("\n", " | ")[:2000])
+        try:   # those re-booked before the re-book read only up to each run's end, once
+            changed = self.rebook_codex_intervals()
+            if changed is not None:
+                log(self.p, f"re-booked {len(changed)} Codex run(s) charged a later wake's usage: "
+                            f"${sum(c[1] for c in changed):.2f} booked -> ${sum(c[2] for c in changed):.2f} ("
+                            + ", ".join(f"run {i} ${a:.2f}->${b:.2f}" for i, a, b in changed[:40]) + ")")
+        except Exception:   # a spend correction must never keep the daemon from starting
+            log(self.p, "Codex interval re-book error: " + traceback.format_exc().replace("\n", " | ")[:2000])
         # The per-call re-book of the last 7 days runs as a tick step in slices (rebook_per_call_step), never
         # here: read whole at start it held a busy project's start for tens of seconds.
         try:   # push batch files left `running` by a batch whose row is final (pushq.close_strays)
@@ -6095,7 +6104,8 @@ class Daemon:
         session. Re-book each, oldest first, at its own tokens (codex.own_tokens), only where a baseline
         proves them: the session's rollout total before the run started, else the terminal counters of the
         same session's run just before it (its note thread_totals, else its output's last turn.completed).
-        Only ever lowers a booking; a run with no provable baseline keeps it. Each row changed keeps its old
+        Read only up to the run's end (_codex_until): the rollout keeps growing as later wakes resume the
+        session, and their totals are not this run's. Only ever lowers a booking; a run with no provable baseline keeps it. Each row changed keeps its old
         figure (note codex_rebooked) and its task's spend and the ledger move by the difference (a negative
         row at the run's end); raw outputs and rollouts are only read. A JSON receipt of each change
         (run, before, after, basis, baseline) is written to state/receipts/. With `dry_run` nothing is
@@ -6127,17 +6137,19 @@ class Daemon:
             out = run_dir / "output.jsonl"
             if not out.is_file():
                 continue
+            until = self._codex_until(r)
             own, how, _ = prov.own_tokens(out, float(r["started"] or 0) or None, env if isinstance(env, dict) else {},
-                                          prior, True)
+                                          prior, True, until)
             if how not in ("rollout", "thread"):
                 continue
-            sub = prov._subagent_tokens(out, float(r["started"] or 0) or None, env if isinstance(env, dict) else {})
+            sub = prov._subagent_tokens(out, float(r["started"] or 0) or None, env if isinstance(env, dict) else {},
+                                        until)
             before, after = float(r["cost_usd"]), prov._price(*own) + prov._price(*sub)
             if after >= before - 1e-6:
                 continue
             changed.append((r["id"], before, after))
             receipt.append({"run": r["id"], "task": r["task"], "session": r["session_id"], "before_usd": round(before, 6),
-                            "after_usd": round(after, 6), "basis": how,
+                            "after_usd": round(after, 6), "basis": how, "until": until,
                             "baseline": list(prior) if how == "thread" and prior else None,
                             "own_tokens": list(own), "subagent_tokens": list(sub)})
             if dry_run:
@@ -6158,6 +6170,85 @@ class Daemon:
             db.set_kv(CODEX_REBOOK_KEY, {"at": time.time(), "runs": len(changed),
                                          "usd_before": round(sum(c[1] for c in changed), 6),
                                          "usd_after": round(sum(c[2] for c in changed), 6)})
+        return changed
+
+    def _codex_until(self, r: dict) -> float | None:
+        """The end of Codex run `r`'s own share of its session's rollout: its end, or the next run on the
+        same session's start if earlier (or if `r` has no end); None when neither is known."""
+        ends = [float(r["ended"] or 0)]
+        for row in self.p.db.q("SELECT MIN(started) AS s FROM runs WHERE provider='codex' AND session_id=? AND id>?",
+                               (r["session_id"], r["id"])):
+            ends.append(float(row["s"] or 0))
+        ends = [e for e in ends if e > 0]
+        return min(ends) if ends else None
+
+    def rebook_codex_intervals(self, dry_run: bool = False) -> list[tuple[int, float, float]] | None:
+        """Once per project (kv CODEX_INTERVAL_KEY, apart from CODEX_REBOOK_KEY): Codex runs rebook_codex_resumes
+        re-booked (note codex_rebooked) before it read only up to each run's end. It read the newest total of
+        a rollout later wakes of the same session kept growing, so a run read back after them was booked
+        their tokens too. Re-price each at its own interval (_codex_until), its sub-agents included, never
+        above its first booking (codex_rebooked) and only ever lower than now; a row whose interval proves no
+        baseline keeps its booking. Each row changed keeps the booking it corrects (note codex_interval_fixed)
+        and its task's spend and the ledger move by the difference (a negative row at the run's end); raw
+        outputs and rollouts are only read. A JSON receipt (run, task, session, before, after, until, tokens)
+        goes to state/receipts/codex-interval-rebook-<ts>.json. With `dry_run` nothing is written and the kv
+        is not read. Returns (run id, booked before, booked after) of each row changed, or None when it
+        already ran."""
+        db = self.p.db
+        if not dry_run and db.kv(CODEX_INTERVAL_KEY):
+            return None
+        pricing = (self.cfg.get("pricing") or {}).get("codex")
+        changed, receipt = [], []
+        for r in db.q("SELECT * FROM runs WHERE provider='codex' AND session_id IS NOT NULL AND status!='running' "
+                      "AND note LIKE '%codex_rebooked%' ORDER BY id"):
+            note = json.loads(r["note"] or "{}")
+            if "codex_rebooked" not in note or "codex_interval_fixed" in note:
+                continue
+            run_dir = self._run_dir(r)
+            out = run_dir / "output.jsonl"
+            if not out.is_file():
+                continue
+            prov = get_provider("codex").use(r["model"] or "", pricing)
+            prior = None
+            for row in db.q("SELECT id, dir, note FROM runs WHERE provider='codex' AND session_id=? AND id<? "
+                            "ORDER BY id DESC LIMIT 1", (r["session_id"], r["id"])):
+                prior = self._codex_terminal(row, prov)
+            try:
+                env = json.loads((run_dir / "run.json").read_text()).get("env")
+            except (OSError, ValueError, AttributeError):
+                env = None
+            env = env if isinstance(env, dict) else {}
+            since, until = float(r["started"] or 0) or None, self._codex_until(r)
+            own, how, _ = prov.own_tokens(out, since, env, prior, True, until)
+            if how not in ("rollout", "thread"):
+                continue
+            sub = prov._subagent_tokens(out, since, env, until)
+            before = float(r["cost_usd"] or 0)
+            after = min(prov._price(*own) + prov._price(*sub), float(note["codex_rebooked"] or 0))
+            if after >= before - 1e-6:
+                continue
+            changed.append((r["id"], before, after))
+            receipt.append({"run": r["id"], "task": r["task"], "session": r["session_id"], "before_usd": round(before, 6),
+                            "after_usd": round(after, 6), "first_booked_usd": note["codex_rebooked"], "basis": how,
+                            "until": until, "own_tokens": list(own), "subagent_tokens": list(sub)})
+            if dry_run:
+                continue
+            note.update(codex_interval_fixed=before, own_basis=how)
+            db.x("UPDATE runs SET cost_usd=?, input_tokens=?, cache_read_tokens=?, output_tokens=?, note=? WHERE id=?",
+                 (after, own[0] - own[1] + sub[0] - sub[1], own[1] + sub[1], own[2] + sub[2], json.dumps(note), r["id"]))
+            if r["task"]:
+                db.x("UPDATE tasks SET spent_usd=MAX(COALESCE(spent_usd,0)-?,0) WHERE id=?", (before - after, r["task"]))
+            db.spend(r["provider"], -(before - after), self._source_for(r), account=r["account"] or "",
+                     estimated=True, ts=float(r["ended"] or r["started"] or time.time()))
+        if not dry_run:
+            if receipt:
+                folder = self.p.state / "receipts"
+                folder.mkdir(parents=True, exist_ok=True)
+                durable_write(folder / f"codex-interval-rebook-{int(time.time())}.json",
+                              json.dumps({"at": time.time(), "runs": receipt}, indent=1) + "\n")
+            db.set_kv(CODEX_INTERVAL_KEY, {"at": time.time(), "runs": len(changed),
+                                           "usd_before": round(sum(c[1] for c in changed), 6),
+                                           "usd_after": round(sum(c[2] for c in changed), 6)})
         return changed
 
     def _codex_terminal(self, r: dict, prov) -> tuple | None:

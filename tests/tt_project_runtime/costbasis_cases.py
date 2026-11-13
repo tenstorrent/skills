@@ -704,6 +704,144 @@ def test_a_resumed_codex_runs_sub_agents_still_count_in_its_cost(env):
     assert run["cost_usd"] == pytest.approx(0.753136 + _codex_usd(2000, 0, 100)), dict(run)
 
 
+CODEX_C = (14_600_000, 11_300_000, 712_000)   # a third wake's terminal counters on the same session
+
+
+def _codex_wakes(env, sid, *wakes, home=None, task=None):
+    """Codex runs on one session, oldest first: each (started, ended, turns, cost, note), with run.json's
+    CODEX_HOME and output.jsonl in the run's folder."""
+    p = env["p"]
+    ids = []
+    for started, ended, turns, cost, note in wakes:
+        rid = p.db.x("INSERT INTO runs(task,role,provider,model,started,ended,status,session_id,note,cost_usd) "
+                     "VALUES(?,'worker','codex','opus',?,?,'ok',?,?,?)",
+                     (task, started, ended, sid, json.dumps(note), cost))
+        run_dir = p.runs / str(rid)
+        run_dir.mkdir(parents=True)
+        (run_dir / "output.jsonl").write_text("".join(json.dumps(x) + "\n" for x in _codex_lines(sid, *turns)))
+        (run_dir / "run.json").write_text(json.dumps({"env": {"CODEX_HOME": str(home)}}))
+        p.db.x("UPDATE runs SET dir=? WHERE id=?", (str(run_dir), rid))
+        ids.append(rid)
+    return ids
+
+
+def _rise(a, b):
+    return tuple(y - x for x, y in zip(a, b))
+
+
+def test_a_codex_run_read_back_after_a_later_wake_keeps_its_own_charge(env):
+    """Two completed wakes on one growing rollout: the first, read again after the second wrote its totals,
+    is still priced at its own interval's rise, never the rollout's newest total (the reported case: $3.93
+    booked for a $0.75 run, the excess the later wake's)."""
+    from ttp.daemon import Daemon
+    from ttp.providers import get_provider
+    p = env["p"] = _codex_project(env)
+    home, t = env["tmp"] / "codex-home", time.time() - 7200
+    roll = _codex_rollout(home, "th-w", (t - 60, *CODEX_A), (t + 300, *CODEX_B))
+    out = env["tmp"] / "w1.jsonl"
+    out.write_text("".join(json.dumps(x) + "\n" for x in _codex_lines("th-w", CODEX_B)))
+    first = get_provider("codex").use("opus", CODEX_PRICES).own_tokens(out, t, {"CODEX_HOME": str(home)}, None, True,
+                                                                      t + 600)
+    _codex_rollout(home, "th-w", (t + 1300, *CODEX_C))   # the second wake, resumed at t+1000
+    prov = get_provider("codex").use("opus", CODEX_PRICES)
+    again = prov.own_tokens(out, t, {"CODEX_HOME": str(home)}, None, True, t + 600)
+    assert first == again == (_rise(CODEX_A, CODEX_B), "rollout", CODEX_B), (first, again)
+    assert prov.own_tokens(out, t, {"CODEX_HOME": str(home)}, None, True)[0] == _rise(CODEX_A, CODEX_C), \
+        "unbounded, the newest total is read: what the bound is for"
+    # The one-time re-book reads each run up to its own end, sub-agents included.
+    kid = _codex_rollout(home, "kid-w", (t + 100, 2000, 0, 100), (t + 1200, 9000, 0, 900))
+    meta = {"timestamp": "2026-11-01T10:00:00.000Z", "type": "session_meta",
+            "payload": {"id": "kid-w", "source": {"subagent": {"thread_spawn": {"parent_thread_id": "th-w"}}}}}
+    kid.write_text(json.dumps(meta) + "\n" + kid.read_text())
+    tid = p.db.add_task("build", "", kind="work", tier="standard", priority=3, budget_usd=90.0, labels=[])
+    w1, w2 = _codex_wakes(env, "th-w", (t, t + 600, [CODEX_B], _codex_usd(*CODEX_B), {"resumes": {"session": "th-w"}}),
+                          (t + 1000, t + 1500, [CODEX_C], _codex_usd(*CODEX_C), {"resumes": {"session": "th-w"}}),
+                          home=home, task=tid)
+    Daemon(p.base).rebook_codex_resumes()
+    cost = {r["id"]: r["cost_usd"] for r in p.db.q("SELECT id, cost_usd FROM runs WHERE id IN (?,?)", (w1, w2))}
+    assert cost[w1] == pytest.approx(_codex_usd(*_rise(CODEX_A, CODEX_B)) + _codex_usd(2000, 0, 100)), cost
+    assert cost[w2] == pytest.approx(_codex_usd(*_rise(CODEX_B, CODEX_C)) + _codex_usd(7000, 0, 800)), cost
+    assert roll.is_file() and kid.is_file()
+
+
+def test_codex_runs_rebooked_with_a_later_wakes_usage_are_corrected_once_with_a_receipt(env):
+    """A run the first re-book charged up to the rollout's newest total (the later wake's usage too) is
+    re-priced once at its own interval, even with that re-book's latch set: the booking it corrects kept in
+    the note, the task's spend and the ledger moved by the difference, a receipt naming each row's old and
+    new charge. A row already right is left alone, and a second pass changes nothing."""
+    from ttp.daemon import Daemon, CODEX_REBOOK_KEY, CODEX_INTERVAL_KEY
+    p = env["p"] = _codex_project(env)
+    home, t = env["tmp"] / "codex-home", time.time() - 7200
+    _codex_rollout(home, "th-x", (t - 60, *CODEX_A), (t + 300, *CODEX_B), (t + 1300, *CODEX_C))
+    tid = p.db.add_task("build", "", kind="work", tier="standard", priority=3, budget_usd=90.0, labels=[])
+    wrong, right = _codex_usd(*_rise(CODEX_A, CODEX_C)), _codex_usd(*_rise(CODEX_B, CODEX_C))
+    p.db.x("UPDATE tasks SET spent_usd=? WHERE id=?", (wrong + right, tid))
+    w1, w2 = _codex_wakes(env, "th-x",
+                          (t, t + 600, [CODEX_B], wrong, {"codex_rebooked": _codex_usd(*CODEX_B), "own_basis": "rollout"}),
+                          (t + 1000, t + 1500, [CODEX_C], right, {"codex_rebooked": _codex_usd(*CODEX_C), "own_basis": "rollout"}),
+                          home=home, task=tid)
+    p.db.set_kv(CODEX_REBOOK_KEY, {"at": time.time(), "runs": 2})
+    d = Daemon(p.base)
+    own = _codex_usd(*_rise(CODEX_A, CODEX_B))
+    assert [(i, round(a, 4), round(b, 4)) for i, a, b in d.rebook_codex_intervals(dry_run=True)] == \
+        [(w1, round(wrong, 4), round(own, 4))]
+    changed = d.rebook_codex_intervals()
+    assert [(i, round(a, 4), round(b, 4)) for i, a, b in changed] == [(w1, round(wrong, 4), round(own, 4))], changed
+    row = p.db.one("SELECT cost_usd, note FROM runs WHERE id=?", (w1,))
+    assert row["cost_usd"] == pytest.approx(own)
+    note = json.loads(row["note"])
+    assert note["codex_interval_fixed"] == pytest.approx(wrong) and note["codex_rebooked"] == pytest.approx(_codex_usd(*CODEX_B))
+    assert p.db.one("SELECT cost_usd FROM runs WHERE id=?", (w2,))["cost_usd"] == pytest.approx(right)
+    assert p.db.one("SELECT spent_usd FROM tasks WHERE id=?", (tid,))["spent_usd"] == pytest.approx(own + right)
+    receipts = list((p.state / "receipts").glob("codex-interval-rebook-*.json"))
+    got = json.loads(receipts[0].read_text())["runs"]
+    assert len(receipts) == 1 and [(x["run"], x["task"], x["before_usd"], x["after_usd"], x["until"]) for x in got] == \
+        [(w1, tid, round(wrong, 6), round(own, 6), pytest.approx(t + 600))], got
+    assert d.rebook_codex_intervals() is None and p.db.kv(CODEX_INTERVAL_KEY)["runs"] == 1
+    assert Daemon(p.base).rebook_codex_intervals(dry_run=True) == []
+
+
+def test_a_codex_run_whose_counters_reset_keeps_its_booking_though_a_later_wake_rose_past_its_base(env):
+    """Compaction reset the session's counters inside the run: its own share is unprovable and it keeps its
+    booking. A later wake's totals, back above the old base, must not make it look proven."""
+    from ttp.daemon import Daemon
+    p = env["p"] = _codex_project(env)
+    home, t = env["tmp"] / "codex-home", time.time() - 7200
+    reset = (900_000, 500_000, 40_000)
+    _codex_rollout(home, "th-c", (t - 60, *CODEX_A), (t + 300, *reset), (t + 1300, *CODEX_C))
+    booked = _codex_usd(*reset)
+    w1, _ = _codex_wakes(env, "th-c", (t, t + 600, [reset], booked, {"resumes": {"session": "th-c"}}),
+                         (t + 1000, t + 1500, [CODEX_C], _codex_usd(*CODEX_C), {"resumes": {"session": "th-c"}}),
+                         home=home)
+    changed = Daemon(p.base).rebook_codex_resumes()
+    assert w1 not in [c[0] for c in changed], changed
+    assert p.db.one("SELECT cost_usd FROM runs WHERE id=?", (w1,))["cost_usd"] == pytest.approx(booked)
+
+
+def test_a_codex_run_with_a_rotated_rollout_is_rebooked_from_the_earlier_runs_counters(env):
+    """No rollout total before the run (rotated away, or missing): its share comes from the same session's
+    earlier run's terminal counters, and the later wake's totals in the new rollout never count."""
+    from ttp.daemon import Daemon
+    p = env["p"] = _codex_project(env)
+    home, t = env["tmp"] / "codex-home", time.time() - 7200
+    _codex_rollout(home, "th-o", (t + 300, *CODEX_B), (t + 1300, *CODEX_C))   # nothing before t
+    w0, w1, w2 = _codex_wakes(env, "th-o", (t - 900, t - 700, [CODEX_A], _codex_usd(*CODEX_A), {}),
+                              (t, t + 600, [CODEX_B], _codex_usd(*CODEX_B), {"resumes": {"session": "th-o"}}),
+                              (t + 1000, t + 1500, [CODEX_C], _codex_usd(*CODEX_C), {"resumes": {"session": "th-o"}}),
+                              home=home)
+    Daemon(p.base).rebook_codex_resumes()
+    cost = {r["id"]: (r["cost_usd"], json.loads(r["note"]).get("own_basis"))
+            for r in p.db.q("SELECT id, cost_usd, note FROM runs WHERE id IN (?,?)", (w1, w2))}
+    assert cost[w1] == (pytest.approx(_codex_usd(*_rise(CODEX_A, CODEX_B))), "thread"), cost
+    assert cost[w2] == (pytest.approx(_codex_usd(*_rise(CODEX_B, CODEX_C))), "rollout"), cost
+    for f in (home / "sessions").rglob("*.jsonl"):   # missing altogether: the earlier run's counters still prove it
+        f.unlink()
+    out = p.runs / str(w1) / "output.jsonl"
+    from ttp.providers import get_provider
+    assert get_provider("codex").use("opus", CODEX_PRICES).own_tokens(out, t, {"CODEX_HOME": str(home)}, CODEX_A,
+                                                                      True, t + 600)[:2] == (_rise(CODEX_A, CODEX_B), "thread")
+
+
 def test_a_cut_off_resumed_codex_run_is_priced_from_its_rollouts_rise(tmp_path):
     """Interrupted mid-turn (no turn.completed): cut_off_cost and cost_so_far price the rollout's rise
     since the run started, never the session's total; a finished resume's cost_so_far is its own share."""
