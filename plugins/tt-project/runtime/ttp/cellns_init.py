@@ -129,6 +129,7 @@ def main(argv: list) -> int:
     forward = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
     signal.pthread_sigmask(signal.SIG_BLOCK, forward)
     try:
+        # own session: the namespace's init passes signals on to the agent's whole group and ends with the namespace
         pid = os.posix_spawnp(cmd[0], cmd, env, setsid=True, setsigmask=(), setsigdef=RESET)
     except OSError as e:
         print(f"cellns_init: {cmd[0]}: {e.strerror}", file=sys.stderr)
