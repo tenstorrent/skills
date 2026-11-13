@@ -23,6 +23,7 @@ from typing import Any, Callable
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from environment import ROOT, DEPENDENCY_SKILLS, dependency_root, environment
 from telemetry_hooks import load_telemetry
+import stage_usage
 
 
 MAX_GOAL_OBJECTIVE_CHARS = 4_000
@@ -894,6 +895,100 @@ def execute_resumed_goal(
         return terminal, state.last_turn_error
 
 
+def iso_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class StageUsage:
+    """Tokens and time of one stage, counted from this run's CODEX_HOME rollouts.
+
+    Written into the stage's main report (``## Stage usage``) and
+    ``<stage doc dir>/stage_usage.json`` when the stage ends and again after each
+    remediation round, then committed locally. Failures are reported, never fatal:
+    the stage check gates a missing or malformed record.
+    """
+
+    def __init__(
+        self,
+        args: argparse.Namespace,
+        repo: pathlib.Path,
+        manifest: pathlib.Path,
+        index: int,
+        name: str,
+        prompt_path: pathlib.Path,
+        prompt: str,
+        replacements: list[tuple[str, str]],
+        start: str | None = None,
+    ) -> None:
+        self.repo = repo
+        self.manifest = manifest
+        self.index = index
+        self.name = name
+        self.home: pathlib.Path | None = getattr(args, "_codex_home", None)
+        model_dir = replacement_value(replacements, "MODEL_DIR")
+        self.model_dir = (repo / model_dir) if model_dir else None
+        self.paths = stage_usage.stage_paths(prompt_path.stem, prompt)
+        self.start = start or iso_now()
+        self.thread_ids: list[str] = []
+        self.rounds: list[JsonObject] = []
+        if start is None:
+            append_manifest(manifest, [f"stage_{index}_started_at_utc={self.start}"])
+
+    def thread(self, thread_id: str) -> None:
+        self.thread_ids.append(thread_id)
+
+    def begin_round(self, kind: str) -> None:
+        self.rounds.append({"kind": kind, "round": len(self.rounds) + 1, "start_utc": iso_now()})
+
+    def end_round(self, terminal: str) -> None:
+        if self.rounds:
+            self.rounds[-1].update(end_utc=iso_now(), terminal_status=terminal)
+
+    def write(self, terminal: str) -> None:
+        key = f"stage_{self.index}_usage"
+        if self.home is None or self.model_dir is None or self.paths is None:
+            append_manifest(self.manifest, [f"{key}=skipped(no codex home, MODEL_DIR or report)"])
+            return
+        try:
+            start = stage_usage.parse_ts(self.start)
+            end = stage_usage.parse_ts(iso_now())
+            report, doc_dir = self.paths
+            record = stage_usage.usage_record(
+                stage=self.name,
+                home=self.home,
+                start=start,
+                end=end,
+                terminal_status=terminal,
+                rounds=[dict(item) for item in self.rounds],
+                report=report,
+                main_thread_ids=self.thread_ids,
+            )
+            written = stage_usage.write_usage(self.model_dir, report, doc_dir, record)
+            commit = commit_paths(self.repo, written, f"{self.name}: stage usage ({terminal})")
+            append_manifest(self.manifest, [f"{key}={written[0]}", f"{key}_commit={commit}"])
+        except Exception as exc:  # noqa: BLE001 - the stage check gates the missing record
+            print(f"stage usage not written: {exc}", file=sys.stderr)
+            append_manifest(self.manifest, [f"{key}=failed({type(exc).__name__})"])
+
+
+def commit_paths(repo: pathlib.Path, paths: list[pathlib.Path], message: str) -> str:
+    """Commit only these paths locally. Returns the new HEAD, or why nothing was committed."""
+    rel = [os.path.relpath(path.resolve(), repo.resolve()) for path in paths]
+    added = subprocess.run(["git", "add", "--", *rel], cwd=repo, capture_output=True, text=True)
+    if added.returncode != 0:
+        return f"not-committed(git add: {added.stderr.strip()[:200]})"
+    done = subprocess.run(
+        ["git", "commit", "-q", "--no-verify", "-m", message, "--", *rel],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
+    if done.returncode != 0:
+        return f"not-committed({(done.stdout + done.stderr).strip()[:200]})"
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+    return head.stdout.strip()
+
+
 def find_check_script(prompt_path: pathlib.Path) -> pathlib.Path | None:
     candidate = prompt_path.with_name(prompt_path.stem + ".check.sh")
     return candidate if candidate.exists() else None
@@ -1013,6 +1108,7 @@ def run_stage_checks(
     prompt_copy: pathlib.Path,
     replacements: list[tuple[str, str]],
     manifest_key_prefix: str | None = None,
+    usage: StageUsage | None = None,
 ) -> str:
     """Run the stage's check script with remediation. Returns the check status string."""
     manifest_key_prefix = manifest_key_prefix or f"stage_{index}"
@@ -1025,6 +1121,9 @@ def run_stage_checks(
     extra_env = replacement_env(replacements)
     extra_env["MULTIGOAL_LOG_DIR"] = str(log_dir)
     extra_env["MULTIGOAL_STAGE"] = name
+    if usage is not None:
+        # The usage record is written before every check: gate it.
+        extra_env["MULTIGOAL_STAGE_USAGE"] = "1"
 
     code = -1
     for attempt in range(args.check_retries + 1):
@@ -1058,17 +1157,32 @@ def run_stage_checks(
         remediation_log = log_dir / f"{name}.remediation-{attempt + 1}.jsonl"
         print(f"\n== Stage {index} remediation {attempt + 1}: check failed (exit {code}) ==", file=sys.stderr)
         print(f"+ log: {remediation_log}", file=sys.stderr)
-        terminal, _thread_id, turn_error = execute_goal(
-            client,
-            args,
-            repo,
-            objective,
-            remediation_log,
-            attempt_kind="remediation",
-            on_thread_started=lambda tid: append_manifest(
-                manifest, [f"{manifest_key_prefix}_remediation_{attempt + 1}_thread_id={tid}"]
-            ),
-        )
+
+        def remediation_started(tid: str, attempt: int = attempt) -> None:
+            append_manifest(manifest, [f"{manifest_key_prefix}_remediation_{attempt + 1}_thread_id={tid}"])
+            if usage is not None:
+                usage.thread(tid)
+
+        if usage is not None:
+            usage.begin_round("remediation")
+        try:
+            terminal, _thread_id, turn_error = execute_goal(
+                client,
+                args,
+                repo,
+                objective,
+                remediation_log,
+                attempt_kind="remediation",
+                on_thread_started=remediation_started,
+            )
+        except BaseException:
+            if usage is not None:
+                usage.end_round("interrupted")
+                usage.write("interrupted")
+            raise
+        if usage is not None:
+            usage.end_round(terminal)
+            usage.write(terminal)
         append_manifest(
             manifest,
             [f"{manifest_key_prefix}_remediation_{attempt + 1}_terminal_status={terminal}"],
@@ -1130,15 +1244,26 @@ def run_stage(
         ],
     )
 
-    terminal, _thread_id, turn_error = execute_goal(
-        client,
-        args,
-        repo,
-        objective,
-        output_log,
-        on_thread_started=lambda tid: append_manifest(manifest, [f"stage_{index}_thread_id={tid}"]),
-    )
+    usage = StageUsage(args, repo, manifest, index, name, prompt_path, prompt, replacements)
+
+    def thread_started(tid: str) -> None:
+        append_manifest(manifest, [f"stage_{index}_thread_id={tid}"])
+        usage.thread(tid)
+
+    try:
+        terminal, _thread_id, turn_error = execute_goal(
+            client,
+            args,
+            repo,
+            objective,
+            output_log,
+            on_thread_started=thread_started,
+        )
+    except BaseException:
+        usage.write("interrupted")
+        raise
     append_manifest(manifest, [f"stage_{index}_terminal_status={terminal}"])
+    usage.write(terminal)
     print(f"stage_terminal_status={terminal}", file=sys.stderr)
     if terminal == "turnFailed":
         append_status(log_dir, name, terminal, "not-run", getattr(args, "_telemetry", None))
@@ -1161,6 +1286,7 @@ def run_stage(
         prompt_path,
         prompt_copy,
         replacements,
+        usage=usage,
     )
     append_status(log_dir, name, terminal, check_status, getattr(args, "_telemetry", None))
     if check_status == "critical-fail":
@@ -1219,16 +1345,33 @@ def run_resumed_stage(
         ],
     )
 
-    terminal, turn_error = execute_resumed_goal(
-        client,
-        args,
-        repo,
-        objective,
-        thread_id,
-        output_log,
-        prompt_copy,
+    # The stage window runs from the stage's first start (when recorded) through this resume.
+    usage = StageUsage(
+        args, repo, manifest, index, name, prompt_path, prompt, replacements,
+        start=manifest_values.get(f"stage_{index}_started_at_utc") or iso_now(),
     )
+    usage.thread(thread_id)
+    for key, value in manifest_values.items():
+        if key.startswith(f"stage_{index}_") and "_remediation_" in key and key.endswith("_thread_id"):
+            usage.thread(value)
+    usage.begin_round("resume")
+    try:
+        terminal, turn_error = execute_resumed_goal(
+            client,
+            args,
+            repo,
+            objective,
+            thread_id,
+            output_log,
+            prompt_copy,
+        )
+    except BaseException:
+        usage.end_round("interrupted")
+        usage.write("interrupted")
+        raise
+    usage.end_round(terminal)
     append_manifest(manifest, [f"stage_{index}_resume_{attempt}_terminal_status={terminal}"])
+    usage.write(terminal)
     print(f"stage_resume_terminal_status={terminal}", file=sys.stderr)
     if terminal == "turnFailed":
         append_status(log_dir, resume_name, terminal, "not-run", getattr(args, "_telemetry", None))
@@ -1252,6 +1395,7 @@ def run_resumed_stage(
         prompt_copy,
         replacements,
         manifest_key_prefix=f"stage_{index}_resume_{attempt}",
+        usage=usage,
     )
     append_status(log_dir, resume_name, terminal, check_status, getattr(args, "_telemetry", None))
     if check_status == "critical-fail":
@@ -1276,6 +1420,7 @@ def main() -> int:
     env = os.environ.copy()
     env.update(environment(dependency_root(), env))
     home = codex_home(env, args.codex_home)
+    args._codex_home = home
     default_log_root = pathlib.Path(
         os.environ.get(
             "RUN_MULTIGOAL_LOG_DIR",
