@@ -133,7 +133,12 @@ If layer-level decode evidence, reduced token-out evidence, or a prior optimized
 
 A degenerate reply (stray or repeated tokens, collapse into a few characters, a token loop) is a precision
 or stack defect until shown otherwise, not a model answer. Goal 12 runs steps 1–5 on each anomaly and on a
-phase below its band, inside the phase's time.
+phase below its band, inside the phase's time. A phase below its band with no degenerate reply has nothing
+to reproduce in step 2; its attempt is a precision check on its failed tasks: for each, the decisive call
+(GPQA: the answer; SWE: the call whose action first went wrong), teacher-forced at served and at full
+precision (top-1 agreement over the reply, probability of the chosen and of the correct continuation). Full
+precision that agrees with served rules precision out: record it with `changed` saying so; one entry for
+the phase covers its failed tasks. A disagreement goes on to step 4.
 
 **Where precision comes from.** The served precision is the config this stage selected:
 `selected_precision_config.json` (this skill's Preferred Outputs; the model's default construction path or
