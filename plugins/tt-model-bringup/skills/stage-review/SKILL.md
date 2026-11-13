@@ -122,7 +122,8 @@ Return `more-work-needed` when evidence shows one of these:
   page-table handling, or model output correctness;
 - a release or serving stage has failed accuracy, API conformance, benchmark
   target, or missing/incomparable metric rows that are only disclosed, not
-  fixed or supported by a row-specific current issue waiver;
+  fixed or supported by a row-specific current issue waiver (stage 11 grid rows
+  its budget left, listed in `missing_rows` with a reason, are allowed);
 - a text LLM release has failed `meta_ifeval` or `meta_gpqa_cot` without a
   current linked issue proving the correct canonical implementation fails the
   same eval in the same way;

@@ -327,7 +327,8 @@ Each phase also records `timing_scope: "full_phase_wall_time"`, `timing_method`,
 and accounting artifact), and `evidence_sha256` (SHA-256 of that file's bytes).
 Rates use FLOP/s or bytes/s, not TFLOP/s or GB/s. The report computes percentages
 and links the inputs. Missing profiles, missing phases, collection failures and
-invalid evidence prevent completion. The failed-run report preserves scores and
+invalid evidence prevent completion, except pipeline grid rows the budget left, listed in
+`missing_rows` with a reason. The failed-run report preserves scores and
 serving measurements and shows unavailable percentages as —; record the specific
 failure in `RUN_NOTES.md` and repair the collector before rerunning.
 

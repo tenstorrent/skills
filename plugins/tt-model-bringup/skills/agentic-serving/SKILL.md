@@ -61,8 +61,9 @@ Every optimisation measurement (stages 07–10 and goal 12's speed work):
   An arm that has decided its question is stopped;
 - goes cheapest first: arithmetic on data already held, a CPU test, a per-chip op or layer benchmark, a
   short replay, and only then a serving arm or a scored run;
-- judges speed on replayed real agent trajectories at the agent counts goal 12 uses, beside one fixed
-  synthetic suite (short, context ≥ 28K, 1/4/8/32 users). A gain that does not show on replay is not adopted;
+- judges speed on replayed agent trajectories at the agent counts goal 12 uses (recorded histories when
+  they exist; before any goal-12 run, stage 10's growing-context traffic), beside one fixed synthetic suite
+  (short, context ≥ 28K, 1/4/8/32 users). A gain that does not show on replay is not adopted;
 - gates a change meant to be lossless on identical greedy and seeded outputs over a fixed prompt panel
   (feature on vs off, cache on vs off); a numerics change reports PCC against the reference;
 - checks the loaded config (dtype, export, flags, versions) against what the measurement claims before

@@ -93,8 +93,8 @@ single-chip is then the target topology, not a fallback, and the later stages sa
 `tt-device-usage`, `tt-enable-tracing`, `qualitative-check`, `stage-review` and `agentic-serving`
 provide shared requirements. AutoDebug/AutoTriage/AutoFix come from the explicit dependency. Implementation
 stages 1–10 require independent review with `clean-pass`; findings require repairs and rereview.
-The final benchmark stage produces results for the bringup owner and checks measurement
-completeness without an accuracy acceptance review. Preserve original goal
+The benchmark stage (11) measures serving rates and checks measurement completeness without an
+accuracy acceptance review; goal 12 then runs the agentic evals on those rates. Preserve original goal
 criteria, local commit boundaries and the prohibition on pushing stage changes automatically.
 
 ### Validate changed paths
