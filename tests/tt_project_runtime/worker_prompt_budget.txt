@@ -52,3 +52,4 @@ system +101: a failed try inside a route's grace is a retry, not a finding (comm
 every +72: a running worker acks a mid-run update with a `ttp note "update: ..."` (#6313)
 every +217: a broker device job runs --preemptable within the 1500 s cap, ends cleanly on SIGTERM and resumes from a checkpoint (user msg #2786)
 every +80: a reply wait can skip replies already taken and wait past an acknowledgement or plan (ack-wait --after, --terminal)
+code +80: a reply wait can skip replies already taken and wait past an acknowledgement or plan (ack-wait --after, --terminal)
