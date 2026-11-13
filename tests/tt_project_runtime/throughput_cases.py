@@ -105,13 +105,25 @@ def test_throughput_judges_worker_waits_against_the_slot_limit_in_force_then_not
     monkeypatch.setattr(throughput, "cpu_free", lambda: (True, ""))
     monkeypatch.setattr(throughput.os, "cpu_count", lambda: 64)
     p.set_config("budget.max_parallel_workers", 4)
-    # No record of the raise: judged against 4, the waits look like idle capacity (the old reading).
-    w = _tp_lane(throughput.measure(p.db, p.config(), now=now, gates={}), "worker_slots")
+    # A raise outside throughput (`ttp config`, in the config-change log) is the limit then too.
+    rep = throughput.measure(p.db, p.config(), now=now, gates={})
+    w = _tp_lane(rep, "worker_slots")
+    assert (w["at_limit"], w["idle"], w.get("raised")) == (0, 0, 3), w
+    assert w["raised_by"].get("config") and "3 at the limit before a config raise" in throughput.text(
+        {**rep, "changes": [], "kept": []})
+    # A log whose last value is not the cap now (a hand edit, time unknown): capacity unknown, never idle.
+    stale = [{"ts": now - 9 * 3600, "key": "budget.max_parallel_workers", "old": 1, "new": 2, "by": "user"}]
+    rep = throughput.measure(p.db, p.config(), now=now, gates={}, hist=stale)
+    w = _tp_lane(rep, "worker_slots")
+    assert (w["at_limit"], w["idle"], w["unknown"]) == (0, 0, 3), w
+    assert "3 with capacity unknown" in throughput.text({**rep, "changes": [], "kept": []})
+    # No change on record at all: judged against 4, the waits look like idle capacity.
+    w = _tp_lane(throughput.measure(p.db, p.config(), now=now, gates={}, hist=[]), "worker_slots")
     assert (w["at_limit"], w["idle"], w.get("raised")) == (0, 3, None)
     # A raise recorded before the waits began changes nothing; one after them is the limit then.
     for ts, want in ((now - 9 * 3600, (0, 3, None)), (now - 60, (0, 0, 3))):
         p.db.set_kv(throughput.KV, [{"id": 1, "ts": ts, "key": "budget.max_parallel_workers", "old": 2, "new": 4}])
-        rep = throughput.measure(p.db, p.config(), now=now, gates={})
+        rep = throughput.measure(p.db, p.config(), now=now, gates={}, hist=[])
         w = _tp_lane(rep, "worker_slots")
         assert (w["at_limit"], w["idle"], w.get("raised")) == want, (ts, w)
     assert w["raised_by"]["id"] == 1 and "3 at the limit before raise #1" in throughput.text(
@@ -124,8 +136,40 @@ def test_throughput_judges_worker_waits_against_the_slot_limit_in_force_then_not
     p.set_config("budget.max_parallel_workers", 2)
     p.db.set_kv(throughput.KV, [{"id": 1, "ts": now - 10 * 3600, "key": "budget.max_parallel_workers", "old": 2,
                                  "new": 4, "undone": now - 9 * 3600}])
-    w = _tp_lane(throughput.measure(p.db, p.config(), now=now, gates={}), "worker_slots")
+    w = _tp_lane(throughput.measure(p.db, p.config(), now=now, gates={}, hist=[]), "worker_slots")
     assert (w["at_limit"], w["idle"], w.get("raised")) == (3, 0, None)
+
+
+def test_throughput_reports_no_idle_breach_after_an_outside_cap_raise_with_held_work(env, monkeypatch):
+    """Upstream note 926f5ac63a60f859: the worker cap raised from 1 to 4 by a config edit (not by
+    throughput), one worker busy throughout, and tasks that were held, not eligible (one blocked, one
+    labelled with a resource dispatch recorded no hold for): no idle-capacity breach, no raise proposed,
+    and no cap changed."""
+    from ttp import throughput
+    p = make(env)
+    monkeypatch.setattr(throughput, "cpu_free", lambda: (True, ""))
+    monkeypatch.setattr(throughput.os, "cpu_count", lambda: 64)
+    p.set_config("budget.max_parallel_workers", 1)
+    p.set_config("budget.max_parallel_workers", 4)   # logged in the config-change log at about now
+    now = time.time() + 1
+    _tp_run(p, _tp_task(p, "busy", now - 3 * 3600), now - 3 * 3600, None)
+    for i in range(2):   # short finished runs: the wait threshold is sized from the median run
+        q = _tp_task(p, f"quick {i}", now - 8 * 3600 + i * 900)
+        _tp_run(p, q, now - 8 * 3600 + i * 900, now - 8 * 3600 + i * 900 + 600)
+        p.db.x("UPDATE tasks SET status='done' WHERE id=?", (q,))
+    blocked = _tp_task(p, "held for review", now - 2 * 3600)
+    p.db.x("UPDATE tasks SET status='blocked', blocked_reason='waits on review' WHERE id=?", (blocked,))
+    _tp_task(p, "needs dev", now - 2 * 3600, labels=["resource:dev"])
+    rep = throughput.measure(p.db, p.config(), now=now, gates={})
+    w = _tp_lane(rep, "worker_slots")
+    assert w["idle"] == 0 and w["at_limit"] == 0 and w["unknown"] + (w.get("raised") or 0) == 2, w
+    # Under the cap now (4) alone, with no history, neither held task counts as idle capacity either.
+    w0 = _tp_lane(throughput.measure(p.db, p.config(), now=now, gates={}, hist=[]), "worker_slots")
+    assert (w0["idle"], w0["unknown"]) == (0, 2)
+    changes, kept = throughput.plan(p.db, p.config(), rep)
+    assert not [c for c in changes if c["key"] == "budget.max_parallel_workers"], changes
+    assert not any("idle" in k["why"] for k in kept if k["lane"] == "worker_slots"), kept
+    assert p.config()["budget"]["max_parallel_workers"] == 4
 
 
 def test_throughput_apply_raises_only_at_limit_with_headroom_bounded_by_load_and_undoes(env, monkeypatch):

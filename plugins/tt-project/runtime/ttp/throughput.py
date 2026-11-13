@@ -9,7 +9,11 @@ to its first run, or to now for one still queued:
 - worker_slots: no resource, deferral, dependency or provider hold. Limit budget.max_parallel_workers,
   or the provider gate's lower max_parallel (a spend gate: reported, never changed). A wait over its
   threshold counts at the limit (all slots ran), idle (a slot was free), or raised (all slots then in
-  force ran, before a recorded raise); an idle one at least half inside a dispatch stall (no worker run
+  force ran, before a raise: throughput's own or one in the config-change log, configwho.LOG); the cap
+  in force is read per wait from both records, and a wait after the last logged change whose value is
+  no longer the cap (an edit outside both records, time unknown) counts as unknown, never idle. So does
+  the wait of a task with no record that it could start: one blocked now, or one with a resource label
+  dispatch recorded no hold for (no hold or eligibility history). An idle one at least half inside a dispatch stall (no worker run
   started for STALL_GAP_S) also counts as stalled. A task's wait ends at its first run ever, not its first
   run in the window: a re-run of an old task (a requeued review) is no creation-to-start wait.
 - dependency: a dependency was not done during the wait (DB.unmet_dependencies' rule). Reported, no
@@ -214,18 +218,33 @@ def _stalled(starts: list[float], t0: float, t1: float) -> float:
     return sum(max(0.0, min(b, t1) - max(a, t0)) for a, b in zip(pts, pts[1:]) if b - a >= STALL_GAP_S)
 
 
-def _limit_then(db: DB, key: str, cur: int, t0: float, t1: float) -> tuple[int, dict | None]:
-    """(the lowest value `key` had during [t0, t1], the throughput change that raised it from there), from
-    this module's own change records (KV): a wait before a raise is judged against the limit then in force.
-    (cur, None) when no recorded change touches the span."""
+def _int(v) -> int | None:
+    return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+
+def _limit_then(db: DB, key: str, cur: int, t0: float, t1: float,
+                hist: list | None = None) -> tuple[int | None, dict | None]:
+    """(the lowest value `key` had during [t0, t1], the change that raised it from there), from this
+    module's own change records (KV) and the config-change log's rows (`hist`, configwho.history: a
+    `ttp config` or chat edit): a wait before a raise is judged against the limit then in force.
+    (cur, None) when no recorded change touches the span; (None, None) when the span reaches past the
+    last recorded change and that change's value is not `cur`: the cap was changed outside both
+    records at a time not known, so the limit then is unknown."""
     evs = []
     for c in db.kv(KV) or []:
-        if isinstance(c, dict) and c.get("key") == key and isinstance(c.get("old"), int) \
-                and isinstance(c.get("new"), int):
+        if isinstance(c, dict) and c.get("key") == key and _int(c.get("old")) is not None \
+                and _int(c.get("new")) is not None:
             evs.append((float(c.get("ts") or 0), c["new"], c["old"], c))
             if c.get("undone"):
                 evs.append((float(c["undone"]), c["old"], c["new"], None))
+    for r in hist or []:
+        if isinstance(r, dict) and r.get("key") == key and not r.get("refused") \
+                and _int(r.get("old")) is not None and _int(r.get("new")) is not None and r["old"] != r["new"]:
+            evs.append((float(r.get("ts") or 0), r["new"], r["old"], {"config": True, "ts": r.get("ts"),
+                        "old": r["old"], "new": r["new"], "by": r.get("by")}))
     evs.sort(key=lambda e: e[0])
+    if evs and evs[-1][1] != cur and t1 > evs[-1][0]:
+        return None, None
     # The value at t0: the last event's value at or before it, else the first event's prior value.
     val = next((e[1] for e in reversed(evs) if e[0] <= t0), evs[0][2] if evs else cur)
     low, by = val, None
@@ -368,11 +387,33 @@ def host_held(text: str) -> bool:
     return slot_limit(text) == HOST_CORES or bool(held) and all("not running yet (waiting for " in h for h in held)
 
 
-def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, gates: dict | None = None) -> dict:
-    """The waits per lane over the last `since_s` seconds (module doc)."""
+def _config_hist(db: DB, since: float) -> list[dict]:
+    """The config-change log's rows from `since` (configwho.LOG, beside the project's database)."""
+    from . import configwho
+    try:
+        lines = (Path(db.path).parent / configwho.LOG).read_text().splitlines()
+    except (OSError, TypeError, AttributeError):
+        return []
+    out = []
+    for line in lines:
+        try:
+            r = json.loads(line)
+            if isinstance(r, dict) and float(r.get("ts") or 0) >= since:
+                out.append(r)
+        except (ValueError, TypeError):
+            continue
+    return out
+
+
+def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, gates: dict | None = None,
+            hist: list | None = None) -> dict:
+    """The waits per lane over the last `since_s` seconds (module doc). `hist`: the config-change log's
+    rows (configwho.history); None reads them beside `db`."""
     from . import locks, shared
     now = time.time() if now is None else now
     t0 = now - since_s
+    if hist is None:
+        hist = _config_hist(db, t0 - 7 * DAY)
     runs = db.q("SELECT task, started, ended, status, note FROM runs WHERE role!='coordinator' AND started IS NOT NULL "
                 "AND (ended IS NULL OR ended>?) ORDER BY started DESC LIMIT ?", (t0 - DAY, ROWS))
     spans = [(float(r["started"]), float(r["ended"] or now)) for r in runs]
@@ -394,22 +435,29 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
 
     def lane(name: str, limit_key: str | None, limit) -> dict:
         return lanes.setdefault(name, {"lane": name, "limit_key": limit_key, "limit": limit, "waits": [],
-                                       "p1": [], "at_limit": 0, "idle": 0, "serialized": 0, "waiting_now": 0,
+                                       "p1": [], "at_limit": 0, "idle": 0, "unknown": 0, "serialized": 0,
+                                       "waiting_now": 0,
                                        "measured": True})
 
-    def add(ln: dict, w: float, prio: int, start: float, end: float, limit: int | None, queued: bool) -> None:
+    def add(ln: dict, w: float, prio: int, start: float, end: float, limit: int | None, queued: bool,
+            known: bool = True) -> None:
         ln["waits"].append(w)
         if prio <= 1:
             ln["p1"].append(w)
         ln["waiting_now"] += queued
         if limit and w > (p1_s if prio <= 1 else other_s):
-            then, by = _limit_then(db, ln["limit_key"], limit, start, end) if ln["limit_key"] else (limit, None)
+            then, by = _limit_then(db, ln["limit_key"], limit, start, end, hist) if ln["limit_key"] else (limit, None)
             peak = _peak(spans, start, end)
-            if peak < limit and by and peak >= then:
+            if then is None or (not known and peak < limit):
+                # The cap then in force, or whether the task could start at all, is not on record: no
+                # idle-capacity finding rests on it.
+                ln["unknown"] += 1
+            elif peak < limit and by and peak >= then:
                 # Every slot of a lower limit then in force was busy: a wait the raise since then is for,
                 # neither at the current limit nor idle capacity.
                 ln["raised"] = ln.get("raised", 0) + 1
-                ln["raised_by"] = {"id": by.get("id"), "old": by.get("old"), "new": by.get("new"), "ts": by.get("ts")}
+                ln["raised_by"] = {"id": by.get("id"), "old": by.get("old"), "new": by.get("new"), "ts": by.get("ts"),
+                                   **({"config": True} if by.get("config") else {})}
             else:
                 ln["at_limit" if peak >= limit else "idle"] += 1
                 if peak < limit and _stalled(starts, start, end) * 2 >= end - start:
@@ -758,6 +806,10 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
                 gd = {**d, "when": str(v.get("when") or "start_when"), "since": v.get("since")}
         prio = int(t["priority"] or 3)
         why = (t.get("blocked_reason") or "").lower()
+        # Whether a slot alone kept it from starting is on record: not for a task blocked now, nor for one
+        # whose resource label dispatch recorded no hold for (by_rule fell through).
+        known = not (start is None and t["status"] == "blocked") and not any(
+            isinstance(lb, str) and lb.split(":", 1)[0] in ("resource", "exclusive") and ":" in lb for lb in _labels(t))
         if (start is not None or (t["status"] in ("queued", "blocked") and t["id"] not in last_run)) \
                 and not (start is not None and start < t0):
             base = max(float(t["created"] or now), float(d.get("after") or 0), float(t.get("not_before") or 0))
@@ -771,11 +823,11 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
                 if end > max(gate_end, ready):   # from the gate's passing to its start: a slot wait
                     w0 = max(gate_end, ready)
                     add(lane("worker_slots", "budget.max_parallel_workers", workers), end - w0, prio, w0,
-                        end, workers, queued)
+                        end, workers, queued, known)
             elif not by_rule(t, d, why, max([base, *[x for x in dones if x is not None]]), end, prio, queued):
                 ready = max([base, *[x for x in dones if x is not None]])
                 add(lane("worker_slots", "budget.max_parallel_workers", workers), max(0.0, end - ready), prio, ready,
-                    end, workers, queued)
+                    end, workers, queued, known)
         # Re-queue waits: from each task_waiting event (a waiting hand-off) to the task's next run, and
         # the current one from the last run's end to now while the task still waits.
         trs = by_task.get(t["id"], [])
@@ -1099,7 +1151,8 @@ def plan(db: DB, cfg: dict, report: dict) -> tuple[list[dict], list[dict]]:
             elif not ln["at_limit"] and (ln.get("raised") or ln["idle"]):
                 # Idle waits outnumbering the ones a raise was for lead: they name the real cause.
                 rb, idle = ln.get("raised_by") or {}, ln["idle"]
-                raised = (f"{ln['raised']} wait(s) met all {rb.get('old')} slots before throughput #{rb.get('id')} "
+                who = f"throughput #{rb.get('id')}" if rb.get("id") is not None else "a config change"
+                raised = (f"{ln['raised']} wait(s) met all {rb.get('old')} slots before {who} "
                           f"raised {key} to {rb.get('new')}; none met the {cur} now" if ln.get("raised") else "")
                 stalled = (f"; {ln['stalled']} of them while no run started for {STALL_GAP_S // 60}+ min (a "
                            "stopped daemon, a stalled dispatch tick or a spend gate)" if ln.get("stalled") else "")
@@ -1108,6 +1161,12 @@ def plan(db: DB, cfg: dict, report: dict) -> tuple[list[dict], list[dict]]:
                        else f"{raised}: the raise is in force, measure again once the window runs under it"
                        + (f"; {idle} wait(s) found slots idle" if idle else ""))
                 kept.append({"lane": name, "key": key, "why": why})
+            elif not ln["at_limit"]:
+                # No wait over threshold met every slot (none, or each one's cap or eligibility unknown):
+                # nothing shows the slot count held work back.
+                kept.append({"lane": name, "key": key, "why": "no wait over threshold met every slot"
+                             + (f" ({ln['unknown']} with the cap then in force or the task's eligibility not on "
+                                "record)" if ln.get("unknown") else "") + ": the slot count is not shown to be the cause"})
             elif not (cpu := cpu_free())[0]:
                 kept.append({"lane": name, "key": key, "why": cpu[1]})
             else:
@@ -1317,13 +1376,15 @@ def text(rep: dict) -> str:
         if not ln["count"]:
             continue
         extra = "".join(f", {k} {ln[k]}" for k in ("peak", "gate_max", "backlog", "stalled") if ln.get(k) is not None) \
-            + (f", {ln['raised']} at the limit before raise #{ln['raised_by']['id']}" if ln.get("raised") else "")
+            + (f", {ln['raised']} at the limit before " + (f"raise #{ln['raised_by']['id']}"
+               if ln["raised_by"].get("id") is not None else "a config raise") if ln.get("raised") else "")
         out.append(f"- {ln['lane']}{' SLOW' if ln['slow'] else ''}: {ln['count']} wait(s), median {_dur(ln['median_s'])}, "
                    f"p90 {_dur(ln['p90_s'])}" + (f" (priority 1: {ln['p1_count']}, p90 {_dur(ln['p1_p90_s'])})"
                                                  if ln["p1_count"] else "")
                    + (f"; limit {ln['limit_key']}={ln['limit']}" if ln.get("limit_key")
                       else f"; held by {ln['held_text']}, not a project limit" if ln.get("held_text") else "; no limit")
                    + (f"; waits over threshold: {ln['at_limit']} at the limit, {ln['idle']} with capacity idle"
+                      + (f", {ln['unknown']} with capacity unknown" if ln.get("unknown") else "")
                       if ln["at_limit"] or ln["idle"] or ln["lane"] == "worker_slots" else "")
                    + (f", serialized {ln['serialized']}" if ln.get("serialized") else "")
                    + (f", {ln['waiting_now']} waiting now" if ln["waiting_now"] else "") + extra)
