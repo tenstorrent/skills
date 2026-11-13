@@ -483,11 +483,11 @@ def test_every_model_cut_off_is_an_unparsed_fallback_naming_the_cut(env):
     p, cfg, b, lines = _bs_gate(env, _bs_cut, _BsJev(), babysit_cfg={"model": "example-org/thinker"})
     cfg["providers"]["chat"]["model_ranking"] = ["example-org/best"]
     route.write_served(p.state, "chat", True, "HTTP 200", ["example-org/best"], time.time())
-    with pytest.raises(babysit.Unparsed, match=r"cut off at \d+ tokens \(finish_reason length\)") as e:
+    with pytest.raises(babysit.Unparsed, match=r"cut off by the server's token limit \(finish_reason length\)") as e:
         babysit.ask(cfg, "s", "Is there work?", post=_bs_cut, served=b._served())
     assert "example-org/thinker, example-org/small-model, example-org/best" in str(e.value)
     assert b.decision("s", "Is there work?", purpose="wake_gate") is None
-    assert len(lines) == 1 and "failed (" in lines[0] and "answer cut off at" in lines[0]
+    assert len(lines) == 1 and "failed (" in lines[0] and "answer cut off by the server's token limit" in lines[0]
     assert time.time() >= b.pause.until   # no cool-down: the next decision asks the chat provider again
     assert p.db.one("SELECT COUNT(*) n FROM ledger WHERE source = 'babysit_fallback:wake_gate'")["n"] == 1
 
@@ -500,6 +500,33 @@ def test_every_model_cut_off_is_an_unparsed_fallback_naming_the_cut(env):
     assert not isinstance(e.value, babysit.Unparsed) and "HTTP 503" in str(e.value)
 
 
-def test_the_token_limit_leaves_reasoning_models_room_and_the_bench_sends_the_same(env):
-    from ttp import babysit, modelbench
-    assert babysit.MAX_TOKENS >= 512 and modelbench.MAX_TOKENS == babysit.MAX_TOKENS
+def test_console_calls_send_no_token_cap_and_the_bridge_sends_only_the_users(env, monkeypatch):
+    # User msg #2809: no output-token cap on console calls; they are bounded by time.
+    import io
+    import urllib.request
+    from ttp import babysit, chatbridge, modelbench
+    sent = []
+
+    class Op:
+        def open(self, req, timeout=None):
+            sent.append((json.loads(req.data.decode()), timeout))
+            raw = json.dumps({"choices": [{"message": {"content": "skip"}, "finish_reason": "stop"}]}).encode()
+
+            class R(io.BytesIO):
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    return False
+            return R(raw)
+    monkeypatch.setattr(babysit.endpoint, "credentials", lambda alias: ("k", "https://api.example.com/v1"))
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *a: Op())
+    babysit._post({"alias": "cloud", "base_url": "", "model": "m"}, [{"role": "user", "content": "q"}], 20.0)
+    assert modelbench._post("http://e", "k", "m", "q", opener=Op(), sleep=lambda s: None) == "skip"
+    assert len(sent) == 2 and all("max_tokens" not in body for body, _ in sent), sent
+    assert [t for _, t in sent] == [20.0, modelbench.TIMEOUT_S] and babysit.TIMEOUT_S == 20.0
+    assert not hasattr(babysit, "MAX_TOKENS") and not hasattr(modelbench, "MAX_TOKENS")
+    # The bridge drops the client's max_tokens; only a cap the user set is sent.
+    assert "max_tokens" not in chatbridge.to_chat({"max_tokens": 32000, "messages": []}, "m")
+    assert chatbridge.to_chat({"max_tokens": 32000, "messages": []}, "m", cap=8192)["max_tokens"] == 8192
+    assert chatbridge.to_chat({"messages": []}, "m", cap=8192)["max_tokens"] == 8192

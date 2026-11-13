@@ -123,9 +123,9 @@ def test_chatbridge_maps_a_messages_request_to_chat_completions():
     assert m[3] == {"role": "tool", "tool_call_id": "call_a", "content": "a.py"}
     assert m[4] == {"role": "tool", "tool_call_id": "call_b", "content": "Error: boom"}
     assert m[5] == {"role": "user", "content": "go on"}
-    # The cap only lowers: a smaller request keeps its own, no cap keeps the request's.
-    assert chatbridge.to_chat({"max_tokens": 100, "messages": []}, "m", cap=4096)["max_tokens"] == 100
-    assert chatbridge.to_chat({"max_tokens": 9000, "messages": []}, "m")["max_tokens"] == 9000
+    # Only the user's cap is sent: the client's own max_tokens is dropped, with or without one (user msg #2809).
+    assert chatbridge.to_chat({"max_tokens": 100, "messages": []}, "m", cap=4096)["max_tokens"] == 4096
+    assert "max_tokens" not in chatbridge.to_chat({"max_tokens": 9000, "messages": []}, "m")
     assert chatbridge.to_chat({"tools": body["tools"], "tool_choice": {"type": "tool", "name": "Bash"},
                                "messages": []}, "m")["tool_choice"] == {"type": "function", "function": {"name": "Bash"}}
 
@@ -354,7 +354,7 @@ def test_runner_runs_a_chat_agent_through_its_bridge_and_stops_it_at_the_end(env
     got = json.loads(seen.read_text())
     assert got["reply"]["content"] == [{"type": "text", "text": "pong"}]
     assert got["url"].startswith("http://127.0.0.1:") and _port_closed(got["url"])
-    assert up.seen[0]["auth"] == f"Bearer {_CB_KEY}" and up.seen[0]["body"]["max_tokens"] == 10
+    assert up.seen[0]["auth"] == f"Bearer {_CB_KEY}" and up.seen[0]["body"]["max_tokens"] == 64   # the user's cap, not the client's 10
     # The key is in no run file, not in the agent's environment or argv, not in run.json.
     assert _CB_KEY not in json.dumps(got["env"]) and _CB_KEY not in json.dumps(got["argv"])
     for f in run_dir.rglob("*"):

@@ -15,7 +15,8 @@ local process can spend the key through the port.
 
 Mapping: system text, user and assistant text, tool definitions and choice, tool_use and
 tool_result blocks (parallel calls matched by id), stop reasons and usage. Reasoning (thinking
-blocks out, reasoning_content in) is dropped; max_tokens is capped from the provider entry.
+blocks out, reasoning_content in) is dropped. The client's own max_tokens is dropped too: only a cap
+the user set (providers.chat max_tokens, or a tier's) is sent, else none; calls are bounded by time.
 Upstream errors come back as Messages errors the runner already classifies: 401/403 as an
 authentication error (the auth gate), 402 as a funds limit, 429 as a rate limit, 503/529 as
 overloaded and other 5xx as a retryable api_error. A prompt past the model's context window comes
@@ -183,7 +184,7 @@ def config_problems(raw: dict) -> list[str]:
             endpoint.base_url(str(entry["base_url"]))
         except ValueError as e:
             out.append(f"providers.chat.base_url: {e}")
-    for key, unset in (("max_tokens", "no cap"), ("context_window", "Claude Code's own")):
+    for key, unset in (("max_tokens", "none sent: the client's own is dropped"), ("context_window", "Claude Code's own")):
         caps = [entry.get(key), *((t or {}).get(key) for t in (entry.get("tiers") or {}).values()
                                   if isinstance(t, dict))]
         if any(c is not None and (isinstance(c, bool) or not isinstance(c, int) or c < 0) for c in caps):
@@ -223,7 +224,8 @@ def _image_part(b: dict) -> dict | None:
 
 
 def to_chat(body: dict, model: str, cap: int = 0) -> dict:
-    """A Chat Completions request for a Messages request, sent to `model` with max_tokens at most `cap`."""
+    """A Chat Completions request for a Messages request, sent to `model`. Only `cap`, the user's own
+    max_tokens setting, is sent: the client's max_tokens is dropped, so a reasoning model is never cut off."""
     msgs: list[dict] = []
     system = _text(body.get("system") or "")
     if system:
@@ -258,9 +260,8 @@ def to_chat(body: dict, model: str, cap: int = 0) -> dict:
             only_text = all(p["type"] == "text" for p in parts)
             msgs.append({"role": "user", "content": "\n".join(p["text"] for p in parts) if only_text else parts})
     req: dict = {"model": model, "messages": msgs}
-    want = int(body.get("max_tokens") or 0)
-    if want or cap:
-        req["max_tokens"] = min(want, cap) if want and cap else (want or cap)
+    if cap:
+        req["max_tokens"] = int(cap)
     tools = [{"type": "function", "function": {"name": t["name"], "description": t.get("description") or "",
                                                "parameters": t["input_schema"]}}
              for t in body.get("tools") or [] if isinstance(t, dict) and t.get("input_schema")]

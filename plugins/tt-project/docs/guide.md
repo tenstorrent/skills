@@ -1334,14 +1334,16 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
 2. Configure the provider (placeholders shown):
 
    ```json
-   "providers": {"chat": {"endpoint": "<alias>", "base_url": "<base url>", "max_tokens": 8192,
+   "providers": {"chat": {"endpoint": "<alias>", "base_url": "<base url>",
                           "tiers": {"light": {"model": "<model id>"},
-                                    "standard": {"model": "<model id>", "max_tokens": 16384,
-                                                 "context_window": 131072}}}}
+                                    "standard": {"model": "<model id>", "context_window": 131072}}}}
    ```
 
-   `base_url` must match the URL saved with the key: the key goes nowhere else. `max_tokens`
-   caps each call's output (per tier or for the provider; 0 or unset: the request's own).
+   `base_url` must match the URL saved with the key: the key goes nowhere else. Console calls
+   carry no output-token cap and are bounded by time: the wake pre-screen and the model bench send no
+   `max_tokens`, and the bridge drops the one Claude Code sends, so a reasoning model is never cut
+   off mid-thought. `max_tokens` (per tier or for the provider) is sent only if you set it; 0 or
+   unset sends none.
    `context_window` (per tier or for the provider) is the model's window in tokens: workers compact
    within it (`CLAUDE_CODE_AUTO_COMPACT_WINDOW`) instead of Claude Code's 200k default for model
    names it does not know (Claude Code reads values under 100000 as 100000). Set or not, a
@@ -1417,7 +1419,9 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    is set once at start, so a smaller stand-in window relies on the bridge's "prompt is too long"
    answer to compact. A required pin never swaps mid-run, and with no stand-in served the error goes
    back as before (`model_missing`). A babysit decision every candidate failed asks the next ranked
-   served model once before it falls back. A served model ranked above a route's own model
+   served model once before it falls back. An empty answer the server cut off (finish_reason
+   `length`) counts as failed: the next listed model and the stand-in are asked, and if every one
+   was cut off the fallback line says so, with no cool-down. A served model ranked above a route's own model
    (tier, rule or run class; never a task's pin) is tried at once: light starts run it until 3 of its
    runs end without a fallback, then every tier does. A run on it that fails on the model itself
    (malformed answer, timeout, no hand-off) during those runs, or such faults in over a fifth of 8 or

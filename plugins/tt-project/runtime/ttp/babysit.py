@@ -47,7 +47,6 @@ KEY = "babysit"
 TIMEOUT_S = 20.0
 COOL_S = 120.0
 REFUSED_S = 3600.0   # a model the endpoint answered 404 for is not asked again for this long
-MAX_TOKENS = 1024   # reasoning models think before answering (GLM-5.3: 210-260 tokens on a one-line decision)
 REASON_MAX = 200
 _WAKE_RE = re.compile(r"wake\s+(coordinator|#?\d+)\s+(" + "|".join(TIER_ORDER) + r")", re.I)
 _SKIP_RE = re.compile(r"skip(?:\s+(\d{1,4})\s*m)?", re.I)
@@ -162,8 +161,9 @@ def _post(s: dict, messages: list, timeout: float) -> dict:
         raise Unavailable(f"no key saved for endpoint {s['alias']!r}")
     key, saved = got
     url = endpoint.base_url(s["base_url"] or saved) + "/chat/completions"
-    body = json.dumps({"model": s["model"], "messages": messages, "max_tokens": MAX_TOKENS,
-                       "temperature": 0}).encode()   # no tools: the reply is text, parsed, never run
+    # No max_tokens: a reasoning model thinks before it answers and a cap only cuts it off; the call is
+    # bounded by its timeout. No tools: the reply is text, parsed, never run.
+    body = json.dumps({"model": s["model"], "messages": messages, "temperature": 0}).encode()
     req = urllib.request.Request(url, data=body, method="POST", headers={
         "Authorization": f"Bearer {key}", "Content-Type": "application/json"})
     opener = urllib.request.build_opener(endpoint._NoRedirect)
@@ -199,7 +199,7 @@ def ask(cfg: dict, state: str, question: str, target: str = "coordinator", post=
         purpose: str = "babysit", served: list[str] | None = None) -> dict:
     """One decision from the chat provider (parse's dict, plus "model"). Raises Unavailable when it
     cannot answer, after one try on the ranked stand-in (standin) the `served` ids name; an answer
-    cut off at MAX_TOKENS asks the next candidate too, and Unparsed when every one was cut off.
+    the server cut off (finish_reason length) asks the next candidate too, and Unparsed when every one was cut off.
     `post(settings, messages, timeout)` replaces the HTTP call (tests)."""
     s = settings(cfg)
     if s is None:
@@ -227,9 +227,9 @@ def ask(cfg: dict, state: str, question: str, target: str = "coordinator", post=
             _REFUSED[(s["alias"], model)] = now + REFUSED_S   # not served: try the next candidate
             err = f"model {model} refused: {e}"
             continue
-        if _cut_off(data):   # still thinking at the limit: the next candidate may answer
+        if _cut_off(data):   # still thinking at the server's limit: the next candidate may answer
             cut.append(model)
-            err = f"{', '.join(cut)}: answer cut off at {MAX_TOKENS} tokens (finish_reason length)"
+            err = f"{', '.join(cut)}: answer cut off by the server's token limit (finish_reason length)"
             continue
         s, answered = {**s, "model": model}, True
         break
@@ -242,12 +242,12 @@ def ask(cfg: dict, state: str, question: str, target: str = "coordinator", post=
             raise Unavailable(f"{err}; ranked stand-in {alt}: {e}") from None
         if _cut_off(data):
             cut.append(alt)
-            err = f"{', '.join(cut)}: answer cut off at {MAX_TOKENS} tokens (finish_reason length)"
+            err = f"{', '.join(cut)}: answer cut off by the server's token limit (finish_reason length)"
         else:
             s, answered = {**s, "model": alt}, True
     if not answered:
         if cut and not fault:   # the endpoint answered, only too long: no cool-down
-            raise Unparsed(f"{', '.join(cut)}: answer cut off at {MAX_TOKENS} tokens (finish_reason length)")
+            raise Unparsed(f"{', '.join(cut)}: answer cut off by the server's token limit (finish_reason length)")
         raise Unavailable(err)
     try:
         text = data["choices"][0]["message"]["content"]
