@@ -4,14 +4,14 @@
 The multigoal runner writes it (``## Stage usage`` in the stage's main report plus
 ``<stage doc dir>/stage_usage.json``); the stage check scripts validate it with ``check``.
 
-Counting rule: every session under ``<CODEX_HOME>/sessions/**/rollout-*.jsonl`` with a
-``token_count`` event whose timestamp is inside [start, end] is included (main thread,
-sub-agents at any depth, any other thread in that home), selected by event timestamps, not
-file names or mtimes. Each session contributes the sum of ``last_token_usage`` of its events
-inside the window. Codex re-emits a ``token_count`` event with an unchanged
-``total_token_usage`` (and the previous ``last_token_usage``) on rate-limit updates; such
-repeats are not new usage and are skipped. ``total_token_usage`` is never differenced across
-sessions.
+Counting rule (thread families, not time): a stage's tokens are its main thread (the one the
+runner started for it), all its sub-agents at any depth (``session_meta`` parent thread ids),
+and the remediation/review threads the runner starts for that stage with their sub-agents.
+Every event of those threads counts. Other sessions in the same CODEX_HOME are only counted
+(not summed). Each session contributes the sum of ``last_token_usage`` of its events. Codex
+re-emits a ``token_count`` event with an unchanged ``total_token_usage`` (and the previous
+``last_token_usage``) on rate-limit updates; such repeats are not new usage and are skipped.
+``total_token_usage`` is never differenced across sessions. The window only gives wall hours.
 
 Exit codes of ``check``: 0 pass (or not yet written by the runner), 2 missing or malformed,
 3 usage error.
@@ -28,19 +28,20 @@ import re
 import sys
 from typing import Any, Iterable
 
-RUNNER_ORIGINATOR = "tt-metal-multigoal"
 FIELDS = ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens")
-ROW_KEYS = ("main_thread", "sub_agents", "other_threads", "total")
+ROW_KEYS = ("main_thread", "sub_agents", "rounds", "total")
 ROW_LABELS = {
-    "main_thread": "main thread",
+    "main_thread": "main",
     "sub_agents": "sub-agents",
-    "other_threads": "other threads",
+    "rounds": "remediation/review rounds",
     "total": "total",
 }
 HEADING = "## Stage usage"
 HOME_LINE = (
-    "Counted from the Codex sessions in {home} during the stage window; other homes on the "
-    "same account are not included."
+    "Counted by thread family (the stage's main thread, its sub-agents, and the remediation/review "
+    "threads the runner started, with their sub-agents) from the Codex sessions in {home}; "
+    "{other} other session(s) in that home are not counted; other homes on the same account "
+    "are not included."
 )
 # Stage key (prompt stem without its "NN-" prefix) -> the stage's main report, relative to
 # the model directory, and its doc directory (where stage_usage.json goes).
@@ -108,14 +109,13 @@ def _usage(info: Any, key: str) -> dict[str, int] | None:
     return {name: int(info[key].get(name) or 0) for name in FIELDS}
 
 
-def session_usage(path: pathlib.Path, start: dt.datetime, end: dt.datetime) -> dict[str, Any] | None:
-    """Usage of one rollout file inside [start, end], or None when it has no event there."""
+def session_usage(path: pathlib.Path) -> dict[str, Any]:
+    """Thread id, parent thread id and summed usage of one rollout file."""
     meta: dict[str, Any] | None = None
     model: str | None = None
     previous_total: dict[str, int] | None = None
     sums = {name: 0 for name in FIELDS}
     models: set[str] = set()
-    events = 0
     with path.open(encoding="utf-8", errors="replace") as handle:
         for line in handle:
             try:
@@ -141,54 +141,72 @@ def session_usage(path: pathlib.Path, start: dt.datetime, end: dt.datetime) -> d
                 repeat = total is not None and total == previous_total
                 if total is not None:
                     previous_total = total
-                stamp = parse_ts(record.get("timestamp"))
-                if repeat or stamp is None or not start <= stamp <= end:
+                if repeat:
                     continue
-                events += 1
                 for name in FIELDS:
                     sums[name] += last[name]
                 if model:
                     models.add(model)
-    if not events:
-        return None
     meta = meta or {}
-    source = meta.get("source")
-    subagent = isinstance(source, dict) and "subagent" in source
     return {
         "thread_id": meta.get("id"),
-        "originator": meta.get("originator"),
-        "subagent": subagent,
-        "events": events,
+        "parent_id": parent_thread_id(meta),
         "models": sorted(models),
         **sums,
     }
 
 
+def parent_thread_id(meta: dict[str, Any]) -> str | None:
+    """Parent thread of a sub-agent session: source.subagent.thread_spawn, else parent_thread_id."""
+    source = meta.get("source")
+    if isinstance(source, dict) and isinstance(source.get("subagent"), dict):
+        spawn = source["subagent"].get("thread_spawn")
+        if isinstance(spawn, dict) and spawn.get("parent_thread_id"):
+            return str(spawn["parent_thread_id"])
+        return str(meta["parent_thread_id"]) if meta.get("parent_thread_id") else None
+    return None
+
+
 def compute_usage(
     home: pathlib.Path,
-    start: dt.datetime,
-    end: dt.datetime,
     main_thread_ids: Iterable[str] = (),
-) -> dict[str, dict[str, Any]]:
-    """Rows main_thread / sub_agents / other_threads / total for the window.
+    round_thread_ids: Iterable[str] = (),
+) -> tuple[dict[str, dict[str, Any]], int]:
+    """Rows main_thread / sub_agents / rounds / total and the count of other sessions.
 
-    Main thread: the threads the runner started for the stage (``main_thread_ids``); when
-    none are given, any non-sub-agent thread the runner originated. Sub-agents: session_meta
-    ``source.subagent`` at any depth. Other threads: everything else in that home.
+    Main: the stage's main thread(s) the runner started. Sub-agents: descendants of those,
+    at any depth. Rounds: the remediation/review threads the runner started for the stage and
+    their sub-agents. Sessions outside these families are counted, not summed.
     """
-    ids = {str(item) for item in main_thread_ids if item}
+    main_ids = {str(item) for item in main_thread_ids if item}
+    round_ids = {str(item) for item in round_thread_ids if item}
+    sessions = [session_usage(path) for path in sorted((home / "sessions").glob("**/rollout-*.jsonl"))]
+    by_id = {item["thread_id"]: item for item in sessions if item["thread_id"]}
+
+    def row_of(session: dict[str, Any]) -> str | None:
+        if session["thread_id"] in main_ids:
+            return "main_thread"
+        if session["thread_id"] in round_ids:
+            return "rounds"
+        seen = {session["thread_id"]}
+        parent = session["parent_id"]
+        while parent and parent not in seen:  # any depth; a cycle ends the walk
+            if parent in main_ids:
+                return "sub_agents"
+            if parent in round_ids:
+                return "rounds"
+            seen.add(parent)
+            parent = by_id[parent]["parent_id"] if parent in by_id else None
+        return None
+
     rows = {key: empty_row() for key in ROW_KEYS}
     models: dict[str, set[str]] = {key: set() for key in ROW_KEYS}
-    for path in sorted((home / "sessions").glob("**/rollout-*.jsonl")):
-        session = session_usage(path, start, end)
-        if session is None:
+    other = 0
+    for session in sessions:
+        key = row_of(session)
+        if key is None:
+            other += 1
             continue
-        if session["subagent"]:
-            key = "sub_agents"
-        elif session["thread_id"] in ids or (not ids and session["originator"] == RUNNER_ORIGINATOR):
-            key = "main_thread"
-        else:
-            key = "other_threads"
         for target in (key, "total"):
             rows[target]["sessions"] += 1
             for name in FIELDS:
@@ -197,7 +215,7 @@ def compute_usage(
     for key, row in rows.items():
         row["uncached_input_tokens"] = row["input_tokens"] - row["cached_input_tokens"]
         row["models"] = sorted(models[key])
-    return rows
+    return rows, other
 
 
 def usage_record(
@@ -210,9 +228,12 @@ def usage_record(
     rounds: list[dict[str, Any]],
     report: str,
     main_thread_ids: Iterable[str] = (),
+    round_thread_ids: Iterable[str] = (),
+    device: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
-        "schema": 1,
+    rows, other = compute_usage(home, main_thread_ids, round_thread_ids)
+    record: dict[str, Any] = {
+        "schema": 2,
         "stage": stage,
         "codex_home": str(home),
         "start_utc": fmt_ts(start),
@@ -221,8 +242,12 @@ def usage_record(
         "terminal_status": terminal_status,
         "remediation_rounds": rounds,
         "report": report,
-        "rows": compute_usage(home, start, end, main_thread_ids),
+        "rows": rows,
+        "other_sessions": other,
     }
+    if device is not None:
+        record["device"] = device
+    return record
 
 
 def _num(value: int) -> str:
@@ -246,7 +271,7 @@ def render_section(record: dict[str, Any]) -> str:
     for key in ROW_KEYS:
         row = record["rows"][key]
         label = ROW_LABELS[key]
-        if key in ("sub_agents", "other_threads"):
+        if key == "sub_agents":
             label = f"{label} ({row['sessions']})"
         lines.append(
             f"| {label} | {row['sessions']} | {_num(row['input_tokens'])} | "
@@ -261,7 +286,7 @@ def render_section(record: dict[str, Any]) -> str:
         + (f" ({listed})" if listed else "")
         + ".",
         "",
-        HOME_LINE.format(home=record["codex_home"]),
+        HOME_LINE.format(home=record["codex_home"], other=record["other_sessions"]),
         "",
     ]
     return "\n".join(lines)
@@ -320,6 +345,8 @@ def validate_record(record: Any) -> list[str]:
         errors.append("stage_usage.json start_utc/end_utc must be UTC timestamps with end >= start")
     if not isinstance(record.get("wall_hours"), (int, float)) or record.get("wall_hours", -1) < 0:
         errors.append("stage_usage.json wall_hours must be a number >= 0")
+    if not _int(record.get("other_sessions")):
+        errors.append("stage_usage.json other_sessions must be an integer >= 0")
     if not isinstance(record.get("remediation_rounds"), list):
         errors.append("stage_usage.json remediation_rounds must be a list")
     rows = record.get("rows")
@@ -379,8 +406,8 @@ def validate_section(text: str, record: dict[str, Any]) -> list[str]:
     if not re.search(r"^Stage \S+ to \S+ \(UTC\), [\d.]+ wall hours, terminal status \S+, remediation rounds \d+",
                      joined, re.M):
         errors.append(f"'{HEADING}' lacks the stage start/end, wall hours, status and rounds line")
-    if HOME_LINE.format(home=record["codex_home"]) not in joined:
-        errors.append(f"'{HEADING}' lacks the 'Counted from the Codex sessions in <CODEX_HOME>' line")
+    if HOME_LINE.format(home=record["codex_home"], other=record["other_sessions"]) not in joined:
+        errors.append(f"'{HEADING}' lacks the 'Counted by thread family from the Codex sessions in <CODEX_HOME>' line")
     return errors
 
 
@@ -414,6 +441,7 @@ def main(argv: list[str] | None = None) -> int:
     gate.add_argument("--stage", required=True, help="prompt stem, e.g. 12-agentic-evals")
     show = sub.add_parser("compute", help="print the section for a CODEX_HOME and window")
     show.add_argument("--codex-home", type=pathlib.Path, required=True)
+    show.add_argument("--round-thread-id", action="append", default=[])
     show.add_argument("--start", required=True)
     show.add_argument("--end", required=True)
     show.add_argument("--stage", default="stage")
@@ -435,7 +463,8 @@ def main(argv: list[str] | None = None) -> int:
                            "end_utc": round_end, "terminal_status": status})
         record = usage_record(stage=args.stage, home=args.codex_home, start=start, end=end,
                               terminal_status=args.terminal_status, rounds=rounds, report="",
-                              main_thread_ids=args.main_thread_id)
+                              main_thread_ids=args.main_thread_id,
+                              round_thread_ids=args.round_thread_id)
         print(json.dumps(record, indent=2) if args.json else render_section(record))
         return 0
 
