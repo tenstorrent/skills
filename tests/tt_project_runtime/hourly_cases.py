@@ -265,8 +265,9 @@ def test_the_tests_row_shows_no_total_spend_and_labels_the_model_spend_of_check_
     run(other, now - 900, 100.0, "timer")           # spend unrelated to checks: in no test figure
     rows = trainstats.checkwait(p.db, now - 86400, now)
     assert [(w["reason"], w["usd"]) for w in rows] == [("timer", 0.5), ("checks_failed", 1.25)]
-    day = trainstats.report(p.db, p.runs, "UTC", days=1, now=now)["days"][-1]
-    assert (day["checkwait_wakes"], day["checkwait_usd"]) == (2, 1.75)
+    # Sum the report's days, as the hourly row does: a UTC midnight between the two wakes splits them.
+    days = trainstats.report(p.db, p.runs, "UTC", days=1, now=now)["days"]
+    assert (sum(d["checkwait_wakes"] for d in days), sum(d["checkwait_usd"] for d in days)) == (2, 1.75)
     row = next(r for r in hourly.rows(p, now) if r.startswith("Tests in 24 h"))
     assert row.startswith("Tests in 24 h (CPU work, no model spend): 0 check runs, 0.0 CPU-h; 0 landed"), row
     assert ("Model spend of runs woken while waiting on their checks: 2 wakes, $1.75: "
