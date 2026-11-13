@@ -170,7 +170,6 @@ def cap_without_rerun(run):
 
 @pytest.mark.parametrize('fault, message', [
     (drop_failure_row, 'every failed task needs one'),
-    (raise_agent_limit, 'above the harness reference'),
     (drop_reference, 'no reference value'),
     (uncollect, 'not collected'),
     (drop_reasoning, 'reasoning setting'),
@@ -202,7 +201,7 @@ def test_uncollected_run_is_critical_even_with_a_decision(tmp_path):
 
 def test_decision_does_not_excuse_a_rule_break(tmp_path):
     run = scored_run()
-    raise_agent_limit(run)
+    cap_without_rerun(run)
     inputs = {'mode': 'quick', 'decisions': [{'accept': 'phase1', 'reason': 'operator'}]}
     assert goal12(tmp_path, runs=[run], inputs=inputs)[0] == 2
 
@@ -236,6 +235,27 @@ def test_limit_failure_with_settings_tried_passes(tmp_path):
     assert goal12(tmp_path, runs=[run])[0] == 2
 
 
+def test_list_run_above_the_reference_limits_is_advisory(tmp_path):
+    run = scored_run()
+    raise_agent_limit(run)
+    code, stderr = goal12(tmp_path, runs=[run])
+    assert code == 1 and 'single-task reruns' in stderr
+
+
+def test_cutoff_while_progressing_needs_a_higher_limit_rerun(tmp_path):
+    run = scored_run()
+    probe = {'reasoning': {'thinking': False}, 'result': 'cut off at the cap again, still progressing',
+             'limits': dict(LIMITS)}
+    run['failures'][0].update(cause='cutoff_progressing', rerun={'tried': [probe]})
+    code, stderr = goal12(tmp_path, runs=[run])
+    assert code == 2 and 'higher limit' in stderr
+    raised = {'reasoning': {'thinking': True, 'effort': 'high'}, 'result': 'solved',
+              'limits': {**LIMITS, 'output_cap_tokens': 2 * LIMITS['output_cap_tokens']}}
+    run['failures'][0]['rerun'] = {'tried': [probe, raised], 'counted': True}
+    run['score'] = {'solved': 8, 'n': 10, 'interval_95': [round(v, 1) for v in wilson(8, 10)]}
+    assert goal12(tmp_path, runs=[run]) == (0, '')
+
+
 def test_recorded_pass_must_agree_with_the_gate(tmp_path):
     run = scored_run(solved=4)
     code, stderr = goal12(tmp_path, runs=[run])
@@ -256,11 +276,11 @@ def test_a_voided_list_is_critical(tmp_path):
     assert code == 2 and 'never the list' in stderr
 
 
-def test_rerun_counts_only_for_infrastructure(tmp_path):
+def test_rerun_counts_only_for_infrastructure_or_a_higher_limit(tmp_path):
     run = scored_run(solved=8)
     run['failures'].append({'task': 'x', 'cause': 'wrong', 'evidence': 'e', 'rerun': {'solved': True, 'counted': True}})
     code, stderr = goal12(tmp_path, runs=[run])
-    assert code == 2 and 'not infrastructure' in stderr
+    assert code == 2 and 'neither infrastructure' in stderr
     run['failures'][-1]['cause'] = 'infrastructure'
     assert goal12(tmp_path, runs=[run]) == (0, '')
 

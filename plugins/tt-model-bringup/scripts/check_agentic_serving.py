@@ -4,8 +4,8 @@
 Stages 06-10: missing evidence is critical; a measured shortfall with a recorded reason is advisory.
 Stage 11 (benchmark): serving_rates.json covers the batch x input-length grid and the release rows.
 Goal 12 (agentic-evals): each phase of the mode has a collected run with its records and per-task
-analysis (every failed task has a cause; tasks cut off by a limit were rerun with the reasoning settings
-tried), no list is voided, and limits are never above the harness reference; those are critical. A
+analysis (every failed task has a cause; a task cut off by a limit shows a loop or stall, or was rerun
+alone at a higher limit, and has a reasoning probe recorded) and no list is voided; those are critical. A
 phase not passed yet (score below the band, unexplained time, unfinished list) is advisory with its
 recorded reason, never critical for the score alone.
 Exit 0 pass, 1 advisory, 2 critical, 3 error.
@@ -239,6 +239,7 @@ def check_run(run: dict, inputs: dict, validated: list, collected: set, item: st
         problems.append((2, f"run {name} interval_95 {interval} is not the Wilson interval "
                             f"[{low:.1f}, {high:.1f}] for {solved}/{n}"))
     failures = [row for row in run.get("failures") or [] if isinstance(row, dict)]
+    limits = (run.get("config") or {}).get("limits") or {}
     counted = 0
     for row in failures:
         if row.get("cause") not in CAUSES or not row.get("evidence") or not row.get("task"):
@@ -246,16 +247,20 @@ def check_run(run: dict, inputs: dict, validated: list, collected: set, item: st
                                 f"({', '.join(CAUSES)}) and evidence"))
         rerun = row.get("rerun") or {}
         tried = rerun.get("tried")
+        tried = tried if isinstance(tried, list) else []
+        raised = any(isinstance(t, dict) and higher_limit(t.get("limits"), limits) for t in tried)
         if row.get("cause") in LIMIT_CAUSES and not (
-                isinstance(tried, list) and tried
-                and all(isinstance(t, dict) and t.get("reasoning") and "result" in t for t in tried)):
+                tried and all(isinstance(t, dict) and t.get("reasoning") and "result" in t for t in tried)):
             problems.append((2, f"run {name}: {row.get('task')!r} hit a limit ({row.get('cause')}); it needs a "
                                 "single-task rerun with rerun.tried rows (reasoning setting, result)"))
+        if row.get("cause") == "cutoff_progressing" and not raised:
+            problems.append((2, f"run {name}: {row.get('task')!r} was cut off while progressing; rerun it alone "
+                                "at a higher limit (rerun.tried limits) until it finishes, loops or stalls"))
         if rerun.get("counted"):
             counted += 1
-            if row.get("cause") != "infrastructure":
+            if not (row.get("cause") == "infrastructure" or (row.get("cause") in LIMIT_CAUSES and raised)):
                 problems.append((2, f"run {name}: rerun of {row.get('task')!r} changed the score but its first "
-                                    "failure was not infrastructure"))
+                                    "failure was neither infrastructure nor a limit rerun at a higher limit"))
     if len({row.get("task") for row in failures}) != n - solved + counted:
         problems.append((2, f"run {name}: {n - solved + counted} first-attempt failures, "
                             f"{len(failures)} failure rows; every failed task needs one"))
@@ -288,6 +293,12 @@ def check_run(run: dict, inputs: dict, validated: list, collected: set, item: st
     return ok
 
 
+def higher_limit(tried: dict, limits: dict) -> bool:
+    """True when a rerun's limits raise at least one of the run's limits."""
+    return isinstance(tried, dict) and any(
+        number(tried.get(key)) and number(limits.get(key)) and tried[key] > limits[key] for key in LIMITS)
+
+
 def check_config(run: dict, validated: list, problems: list) -> None:
     name, config = run.get("id", "?"), run.get("config") or {}
     agents, batch, seqs = config.get("agents"), config.get("batch"), config.get("max_num_seqs")
@@ -308,8 +319,9 @@ def check_config(run: dict, validated: list, problems: list) -> None:
     else:
         for key in LIMITS:
             if limits[key] > reference[key]:
-                problems.append((2, f"run {name}: {key} {limits[key]} is above the harness reference "
-                                    f"{reference[key]}; limits are never raised"))
+                problems.append((1, f"run {name}: {key} {limits[key]} is above the harness reference "
+                                    f"{reference[key]}; list runs start at the reference, higher limits are "
+                                    "for single-task reruns"))
             elif limits[key] < reference[key]:
                 problems.append((1, f"run {name}: {key} {limits[key]} is below the harness reference {reference[key]}"))
     if not config.get("sha"):
