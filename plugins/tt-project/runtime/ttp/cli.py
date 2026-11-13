@@ -8842,19 +8842,21 @@ def cmd_express(a) -> None:
 def cmd_model_bench(a) -> None:
     """`ttp model-bench run|show`: the host's shared daily chat model bench (modelbench.py)."""
     import time as _t
-    from . import modelbench, modelrank
+    from . import modelbench, modelrank, tbcycle
     if a.action == "scores":   # this project's live rows now, with every other project's kept ones
         from . import modelscore
         p = here()
         if p:
             modelscore.record(p.name, modelscore.live_rows(p, _t.time()), _t.time())
         got = modelscore.build(modelrank.served(p.state, _t.time()) if p else None)
-        print(json.dumps(got, indent=1) if a.json else modelscore.text(got))
+        print(json.dumps({**got, "terminalbench_reference": tbcycle.reference_view()}, indent=1) if a.json
+              else modelscore.text(got))
         return
     if a.action == "show":
         print(json.dumps({"owner": json.loads((modelbench.home() / modelbench.OWNER).read_text())
                           if (modelbench.home() / modelbench.OWNER).exists() else {},
-                          "latest": modelbench.latest(), "models": modelbench.models()}, indent=1))
+                          "latest": modelbench.latest(), "models": modelbench.models(),
+                          "terminalbench_reference": tbcycle.reference_view()}, indent=1))
         return
     p = here() or die("model-bench: no project here (run it in a project or with TTP_PROJECT set)")
     if a.detach:   # the owner's daily command schedule: the bench outlives the schedule's time limit
@@ -8881,7 +8883,8 @@ def cmd_model_bench(a) -> None:
 def _model_bench_argv(a) -> list[str]:
     """The detached child's `ttp model-bench` arguments: the same action (run, suite or terminalbench) and its options."""
     if a.action == "terminalbench":
-        return ["terminalbench", *(["--models", a.models] if a.models else [])]
+        return ["terminalbench", *(["--reference"] if getattr(a, "reference", False) else []),
+                *(["--models", a.models] if a.models else [])]
     if a.action != "suite":
         return ["run", *(["--force"] if a.force else [])]
     return ["suite", *(["--date", a.date] if a.date else []), *(["--dry-run"] if a.dry_run else []),
@@ -8895,7 +8898,9 @@ def _terminalbench(p, a, now: float) -> None:
     cfg = p.config()
     if not tbcycle.settings(cfg)["on"]:
         die("model-bench terminalbench: off (model_bench.terminalbench.on is false)")
-    alias = str(((cfg.get("providers") or {}).get("chat") or {}).get("endpoint") or "")
+    if getattr(a, "reference", False):
+        return _terminalbench_reference(p, a, cfg)
+    alias =str(((cfg.get("providers") or {}).get("chat") or {}).get("endpoint") or "")
     got = endpoint.credentials(alias) if alias else None
     ok, msg, ids = endpoint.list_models(got.url, got.key) if got else (False, "no key saved", None)
     if not ok or not ids:
@@ -8909,7 +8914,32 @@ def _terminalbench(p, a, now: float) -> None:
         return
     want = {m.strip() for m in (a.models or "").split(",") if m.strip()}
     served = [m for m in ids if not want or m in want]
-    print(json.dumps(tbcycle.step(cfg, served, now, lambda m: tbcycle.launch(p, m)), indent=1))
+    print(json.dumps({**tbcycle.step(cfg, served, now, lambda m: tbcycle.launch(p, m)),
+                      "reference": tbcycle.reference_view()}, indent=1))
+
+
+def _terminalbench_reference(p, a, cfg: dict) -> None:
+    """`ttp model-bench terminalbench --reference`: the one-time reference run, by hand only (tbcycle.py).
+    No saved endpoint: one plain line, nothing started."""
+    from . import endpoint, harborslice, tbcycle
+    alias = tbcycle.settings(cfg)["reference"]["endpoint"]
+    got = endpoint.credentials(alias) if alias else None
+    if not got:
+        die("model-bench terminalbench --reference: no reference endpoint saved; save an Anthropic-capable one with "
+            "`ttp secret endpoint <alias> --url <base url>`, then `ttp config <project> "
+            "model_bench.terminalbench.reference.endpoint <alias>`")
+    if a.runner:   # the endpoint reaches harbor's environment only, never argv
+        venv, why = harborslice.install(tbcycle.folder() / "harbor")
+        if not venv:
+            die(f"model-bench terminalbench --reference: {why}")
+        print(json.dumps({"model": a.runner, "reference": True, "trials": tbcycle.ref_runner(
+            cfg, a.runner, harborslice.child_env(venv, got.url, got.key))}))
+        return
+    ok, msg, ids = endpoint.list_models(got.url, got.key)   # a model list read, no tokens
+    if not ok:
+        die(f"model-bench terminalbench --reference: endpoint {alias}: {msg}")
+    print(json.dumps(tbcycle.ref_start(cfg, list(ids) if ids else None,
+                                       lambda m: tbcycle.launch(p, m, reference=True)), indent=1))
 
 
 def _model_suite(p, a, now: float) -> None:
@@ -15498,6 +15528,10 @@ def main(argv: list[str] | None = None) -> None:
                    help="suite: also run N Terminal-Bench 2.0 tasks per model through Harbor, installed in a "
                         "venv the run owns (default 0: off)")
     s.add_argument("--models", help="terminalbench: only these served models (comma-separated)")
+    s.add_argument("--reference", action="store_true",
+                   help="terminalbench: the one-time reference run of the fixed reference models over the full task "
+                        "list, through the endpoint named by model_bench.terminalbench.reference.endpoint; booked "
+                        "once, never on the schedule")
     s.add_argument("--runner", metavar="MODEL", help=argparse.SUPPRESS)   # one model's paced runner (tbcycle.launch)
     s.set_defaults(fn=cmd_model_bench)
 

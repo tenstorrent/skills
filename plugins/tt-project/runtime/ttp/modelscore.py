@@ -337,4 +337,5 @@ def text(got: dict) -> str:
                          f"  tok/s {r['tok_s'] if r['tok_s'] is not None else '-'}")
     if got["barred"]:
         lines.append(f"barred from babysit and untrusted_input (failed the injection cell): {', '.join(got['barred'])}")
-    return "\n".join(lines)
+    from .tbcycle import reference_lines   # beside the ranking, never in it
+    return "\n".join(lines + reference_lines())

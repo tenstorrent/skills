@@ -20,6 +20,15 @@ keeps its last complete score until its next cycle completes. Verdicts follow mo
 each model's latest complete row, booked through modelbench.record (source "terminalbench"). State:
 <modelbench.home()>/terminalbench/state.json; trials under terminalbench/cycles/<n>/<model>/<task>.
 Settings: model_bench.terminalbench {cycle_h, new_model_h} beside harborslice.settings.
+
+Reference (`ttp model-bench terminalbench --reference`): a one-time run of fixed reference models (setting
+reference.models, default REF_MODELS) at reference.effort (default medium) over the full task list, through
+the Anthropic-capable endpoint saved under the alias reference.endpoint (no default) whose URL and key reach
+only the child's environment. Started by hand only: step() and the schedule never start it. Each model runs
+its tasks one at a time (ref_runner, resumable) and books one row in terminalbench/reference.jsonl once; a
+booked model never runs again. Those rows stay out of the ranking (modelscore.bench never reads them) and
+are shown beside it marked as reference (reference_view); with none booked, the SUBSET_REFERENCE rows of the
+DEFAULT_TASKS subset are shown, marked as such.
 """
 from __future__ import annotations
 
@@ -33,6 +42,11 @@ from pathlib import Path
 from typing import Callable
 
 DIR, STATE, CYCLE_H, NEW_MODEL_H = "terminalbench", "state.json", 24.0, 3.0
+REF, REF_FILE, REF_MODELS, REF_EFFORT = "reference", "reference.jsonl", ("claude-opus-5-5", "claude-sonnet-5-5"), "medium"
+# Shown until a reference run is booked: an earlier run of the DEFAULT_TASKS subset (Terminus 2, 900 s per task).
+SUBSET_REFERENCE = ({"model": "Opus 5.5", "effort": "low", "passed": 14, "trials": 20},
+                    {"model": "Sonnet 5.5", "effort": "low", "passed": 14, "trials": 20})
+SUBSET_NOTE = "20-task subset (2026-10-27, low effort, 900 s per task)"
 
 
 def settings(cfg: dict) -> dict:
@@ -43,8 +57,14 @@ def settings(cfg: dict) -> dict:
     def hours(k, d):
         v = s.get(k, d)
         return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0 else d
+    r = s.get(REF) if isinstance(s.get(REF), dict) else {}
+    ms = r.get("models")
+    eff = str(r.get("effort") or REF_EFFORT)
+    ref = {"endpoint": str(r.get("endpoint") or ""),
+           "models": [str(m) for m in ms if str(m).strip()] if isinstance(ms, list) else list(REF_MODELS),
+           "effort": eff if eff.isalpha() else REF_EFFORT}   # it goes into the harbor command line
     return {**harborslice.settings(cfg), "cycle_h": max(hours("cycle_h", CYCLE_H), 1.0),
-            "new_model_h": hours("new_model_h", NEW_MODEL_H)}
+            "new_model_h": hours("new_model_h", NEW_MODEL_H), REF: ref}
 
 
 def folder() -> Path:
@@ -81,18 +101,23 @@ def _locked(path: Path):
 def results(cyc: dict, model: str) -> dict[str, dict]:
     """{task: result} of `model`'s cycle `cyc`, from its <model>.jsonl (later lines win)."""
     from .harborslice import slug
-    out: dict[str, dict] = {}
+    return _rows(folder() / "cycles" / str(cyc["n"]) / f"{slug(model)}.jsonl", cyc["tasks"])
+
+
+def _rows(path: Path, tasks: list[str] | None = None) -> dict[str, dict]:
+    """{task: result} of a results file (later lines win); `tasks` None: the dict rows themselves, by line."""
+    out: dict = {}
     try:
-        lines = (folder() / "cycles" / str(cyc["n"]) / f"{slug(model)}.jsonl").read_text().splitlines()
+        lines = path.read_text().splitlines()
     except OSError:
         return out
-    for ln in lines:
+    for i, ln in enumerate(lines):
         try:
             r = json.loads(ln)
         except ValueError:
             continue
-        if isinstance(r, dict) and r.get("task") in cyc["tasks"]:
-            out[r["task"]] = r
+        if isinstance(r, dict) and (tasks is None or r.get("task") in tasks):
+            out[i if tasks is None else r["task"]] = r
     return out
 
 
@@ -225,13 +250,103 @@ def _pace(model: str, n: int, at: float) -> None:
         lock.close()
 
 
-def launch(p, model: str) -> None:
-    """Start `model`'s runner detached (its own session), logging to terminalbench/<model>.log."""
+def reference() -> list[dict]:
+    """The booked reference rows, one per model (the first booked; module doc)."""
+    out: dict[str, dict] = {}
+    for r in _rows(folder() / REF_FILE).values():
+        if isinstance(r.get("model"), str):
+            out.setdefault(r["model"], r)
+    return list(out.values())
+
+
+def reference_view() -> dict:
+    """{"source": "reference" or "subset", "note", "rows"}: what the ranking shows beside it (module doc)."""
+    rows = reference()
+    if rows:
+        return {"source": REF, "note": "fixed reference, run once, not ranked", "rows": rows}
+    return {"source": "subset", "note": f"no reference run booked; the {SUBSET_NOTE}",
+            "rows": [{**r, "pass_rate": round(r["passed"] / r["trials"], 3)} for r in SUBSET_REFERENCE]}
+
+
+def reference_lines() -> list[str]:
+    v = reference_view()
+    out = [f"Terminal-Bench reference ({v['note']}):"]
+    for r in v["rows"]:
+        extra = f", agent {r.get('agent')}, {r.get('date')}, median {r.get('median_min')} min" if v["source"] == REF else ""
+        out.append(f"  {r['model']} (effort {r.get('effort')}): {r.get('passed')}/{r.get('trials')} passed{extra}")
+    return out
+
+
+def ref_start(cfg: dict, served: list[str] | None, launch: Callable[[str], None]) -> dict:
+    """Start a reference runner per reference model not booked, not running and served by the endpoint
+    (`served` None: unknown, all)."""
+    from .harborslice import slug
+    booked = {r["model"] for r in reference()}
+    got: dict[str, list] = {"launched": [], "booked": [], "running": [], "not_served": []}
+    for m in settings(cfg)[REF]["models"]:
+        if m in booked:
+            got["booked"].append(m)
+        elif served is not None and m not in served:
+            got["not_served"].append(m)
+        elif (held := _locked(folder() / REF / f"{slug(m)}.lock")) is None:
+            got["running"].append(m)
+        else:
+            held.close()
+            launch(m)
+            got["launched"].append(m)
+    return got
+
+
+def ref_command(effort: str) -> str:
+    """The harbor command with the reference effort in the agent's call arguments."""
+    from .harborslice import COMMAND
+    return COMMAND.replace('{{"num_retries":8}}', '{{"num_retries":8,"extra_body":{{"reasoning_effort":"%s"}}}}' % effort)
+
+
+def ref_runner(cfg: dict, model: str, env: dict, *, trial: Callable | None = None, clock: Callable = time.time) -> int:
+    """Run `model`'s reference tasks one at a time (resuming), then book its row once; returns trials run.
+    A booked model runs nothing (module doc)."""
+    from . import harborslice, modelbench, modelsuite
+    from .project import durable_write
+    if any(r["model"] == model for r in reference()):
+        return 0
+    d, sl = folder() / REF, harborslice.slug(model)
+    held = _locked(d / f"{sl}.lock")
+    if held is None:
+        return 0   # its reference runner is already running
+    s, home, ran = settings(cfg), modelbench.home(), 0
+    try:
+        meta = json.loads((d / f"{sl}.json").read_text())
+    except (OSError, ValueError):
+        meta = {"started": clock(), "tasks": harborslice.tasks(home, s), "effort": s[REF]["effort"]}
+        durable_write(d / f"{sl}.json", json.dumps(meta))
+    cmd = ref_command(meta["effort"])
+    trial = trial or (lambda m, t, root: harborslice.trial(m, t, root, env, s, command=cmd, home=home))
+    try:
+        done = _rows(d / f"{sl}.jsonl", meta["tasks"])
+        for t in meta["tasks"]:
+            if t not in done:
+                done[t] = {"task": t, "at": clock(), **trial(model, t, d / "trials")}
+                modelsuite._append(d / f"{sl}.jsonl", done[t])
+                ran += 1
+        sc = harborslice.score([done[t] for t in meta["tasks"]])
+        modelsuite._append(folder() / REF_FILE, {
+            "date": modelbench.day(clock()), "model": model, "suite": "terminalbench", "reference": True,
+            "effort": meta["effort"], "agent": s["agent"], "dataset": s["dataset"], "started": meta["started"],
+            "tasks": len(meta["tasks"]), "at": clock(), **sc, "score": sc["pass_rate"]})
+        return ran
+    finally:
+        held.close()
+
+
+def launch(p, model: str, reference: bool = False) -> None:
+    """Start `model`'s runner (or reference runner) detached (its own session), logging to terminalbench/<model>.log."""
     from .harborslice import slug
     folder().mkdir(parents=True, exist_ok=True)
     rt = str(Path(__file__).resolve().parent.parent)
     env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, [rt, os.environ.get("PYTHONPATH")]))}
-    with open(folder() / f"{slug(model)}.log", "ab") as out:
-        subprocess.Popen([sys.executable, "-m", "ttp", "model-bench", "terminalbench", "--runner", model],
+    with open(folder() / f"{(REF + '-') * reference}{slug(model)}.log", "ab") as out:
+        subprocess.Popen([sys.executable, "-m", "ttp", "model-bench", "terminalbench", *(["--reference"] * reference),
+                          "--runner", model],
                          cwd=p.root, env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
                          start_new_session=True)

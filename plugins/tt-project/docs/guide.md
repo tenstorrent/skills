@@ -1514,6 +1514,16 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    unrun task, one trial per model at once, spread over `cycle_h` (default 24), and resumes after a
    restart. A model keeps its last complete score until its next cycle completes. A newly served model
    waits `new_model_h` (default 3) after it first appears, then runs at the same pace.
+   `ttp model-bench terminalbench --reference` is the one-time reference, started by hand only, never
+   by the schedule or the cycle: one detached, model-free runner per reference model
+   (`model_bench.terminalbench.reference.models`, default Opus 5.5 and Sonnet 5.5) at
+   `reference.effort` (default medium) over the full task list, through the Anthropic-capable endpoint
+   saved under the alias `reference.endpoint` (no default; its URL and key go only into the runner's
+   environment). It resumes after a restart and books one reference row per model (date, model,
+   effort, agent) once; a booked model never runs again. Reference rows are not ranked: `ttp model-bench
+   scores` and `show` list them beside the ranking, marked as reference, or, with none booked, an
+   earlier 20-task subset result marked as such. With no endpoint saved, `--reference` prints one line
+   naming the endpoint step and starts nothing.
    Endpoint faults (down, rate limit, auth) park nothing. With no ranked model served, or the whole endpoint
    cooling down, runs start on the core provider as before. Only `chat` has a served list: Claude
    Code, Codex and Cursor models are not ranked (provider failover covers a provider that cannot start
