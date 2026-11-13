@@ -23,15 +23,15 @@ fi
 rc=${rc:-0}
 [ "$rc" -ge 2 ] && exit "$rc"
 
-python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_serving_contract.py" \
+"$PYTHON" "${TT_MODEL_BRINGUP_ROOT}/scripts/check_serving_contract.py" \
   --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}" --require-contract || contract=$?
 [ "${contract:-0}" -ge 2 ] && exit "$contract"
 [ "${contract:-0}" -gt "$rc" ] && rc=$contract
 
-python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_prefill_features.py" \
+"$PYTHON" "${TT_MODEL_BRINGUP_ROOT}/scripts/check_prefill_features.py" \
   --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}" --stage vllm || exit $?
 
-python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_agentic_serving.py" \
+"$PYTHON" "${TT_MODEL_BRINGUP_ROOT}/scripts/check_agentic_serving.py" \
   --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}" --stage vllm || serving=$?
 [ "${serving:-0}" -gt "$rc" ] && rc=$serving
 # Stage usage: the runner writes `## Stage usage` and stage_usage.json before this check (2 if missing or malformed).
