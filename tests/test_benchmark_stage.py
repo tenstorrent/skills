@@ -84,6 +84,13 @@ def test_subject_macro_rejects_membership_drift_in_report(tmp_path, children):
         write_report(tmp_path, config, {'status': 'failed'})
 
 
+def test_report_without_accuracy_tasks_needs_no_manifest(tmp_path):
+    """Benchmarks-only stage 11 has no accuracy tasks and no frozen manifest; the report must still be written."""
+    from benchmark_stage.report import write_report
+    write_report(tmp_path, {'model': 'test', 'tasks': []}, {'status': 'failed'})
+    assert (tmp_path / 'REPORT.md').read_text().startswith('# Benchmark: test')
+
+
 def test_subset_is_content_stable_and_prefix_expands():
     docs = [{'question': f'q{i}'} for i in range(100)]
     small = indices('math', docs, 12)

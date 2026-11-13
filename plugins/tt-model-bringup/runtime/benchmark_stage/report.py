@@ -13,9 +13,12 @@ def cell(value):
 
 def write_report(output, config, summary):
     output = Path(output)
-    if set(config.get('references', {})) - set(config['tasks']) or set(config.get('metrics', {})) - set(config['tasks']):
+    tasks = config.get('tasks') or []
+    if set(config.get('references', {})) - set(tasks) or set(config.get('metrics', {})) - set(tasks):
         raise ValueError('report metrics/references name a task that was not run')
-    manifest = json.loads(Path(config['manifest']).read_text())
+    # Stage 11 is benchmarks only: no accuracy tasks, hence no frozen manifest (v4 crashed here: KeyError 'manifest').
+    manifest = (json.loads(Path(config['manifest']).read_text()) if config.get('manifest')
+                else {'groups': {}, 'manifest_sha256': 'none (no accuracy tasks)'})
     roofline_error = None
     try:
         measured = sorted(summary.get('concurrencies') or [1, 8, 16, 32], reverse=True)
@@ -32,7 +35,7 @@ def write_report(output, config, summary):
              '| Benchmark | Samples / full | Metric | Subset % | Published full % | Difference pp | Source |',
              '|---|---:|---|---:|---:|---:|---|']
     notes = []
-    for task in config['tasks']:
+    for task in tasks:
         result_path = output / task / 'results.json'
         if not result_path.exists():
             continue
