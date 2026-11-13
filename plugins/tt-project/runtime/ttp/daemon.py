@@ -15814,6 +15814,7 @@ class Daemon:
         earlier = (db.kv("boot_prev") or {}).get("prev_boot")
         cycle = self._planned_cycle(earlier) if earlier and self._this_boot((db.kv("boot_prev") or {}).get("boot")) \
             else None
+        named = self._jobs_named_by_tasks()   # before the task pass may block a task or change its hand-off
         for t in db.q("SELECT * FROM tasks WHERE status='queued' AND not_before IS NOT NULL"):
             prev = load_result(t["result"])
             if prev.get("status") != "waiting":
@@ -15883,6 +15884,127 @@ class Daemon:
             db.update_task(t["id"], not_before=None, result=dump_result(
                 {**prev, **woke, "reboot": reboot, "reboot_wakes": wakes}))
             log(self.p, f"task {t['id']} waited from before the reboot; due now")
+        self._relaunch_unwatched_jobs(named, earlier)
+
+    def _jobs_named_by_tasks(self) -> set[str]:
+        """The .rc paths of local detached jobs an open task's retry_when names (rebootwait.local_jobs): the
+        task path (_relaunch_jobs, or the task's wake) decides those, never _relaunch_unwatched_jobs."""
+        out: set[str] = set()
+        for t in self.p.db.q("SELECT result FROM tasks WHERE status NOT IN ('done','failed','cancelled','superseded')"):
+            probe = str(load_result(t["result"]).get("retry_when") or "")
+            for rc in rebootwait.local_jobs(probe) if probe else []:
+                out.update((str(rc), str(Path(rc).resolve())))
+        return out
+
+    def _job_owner(self, rc: Path) -> tuple[str, dict | None]:
+        """Who started detached job rc, read from the run whose folder holds it: ("coordinator", None) for
+        a coordinator run, ("task", task) for a task's run, ("", None) for a folder no run of this
+        project owns."""
+        folder = rc.parent
+        names = {str(folder), str(folder.resolve())}
+        row = self.p.db.one(f"SELECT task, role FROM runs WHERE dir IN ({','.join('?' * len(names))}) "
+                            "ORDER BY id DESC LIMIT 1", tuple(names))
+        if not row:
+            return "", None
+        if row["role"] == "coordinator":
+            return "coordinator", None
+        t = self.p.db.task(row["task"]) if row["task"] else None
+        return ("task", dict(t)) if t else ("", None)
+
+    def _relaunch_unwatched_jobs(self, named: set[str], earlier: str | None) -> None:
+        """Once per boot, after the task pass: start again, model-free, each `ttp detach --resumable` job
+        the reboot cut short that no task's retry_when names, so _relaunch_jobs never saw it: one a
+        coordinator run started (a lead turn's bench or soak), or one of a task that is still open and
+        not deferred (a deferred task's start gate decides, as in the task pass; a done, failed or
+        cancelled task's job stays stopped). Skipped, each with its reason in daemon.log: a job that
+        ended (.rc), was stopped on purpose, was found lost on an earlier boot, was cut short on an
+        older boot than the one this reboot ended, held a device or machine of its task at an abrupt
+        reboot, is past budget.max_job_relaunches, or whose relaunch would reach budget.max_reboot_losses
+        (the coordinator's own jobs counted per job). Each relaunch writes a job_relaunched event: on its
+        task (handled, as _relaunch_jobs writes it), or new for a coordinator job, so the coordinator's
+        digest says what came back."""
+        if not self.p.runs.is_dir():
+            return
+        cap = int(self.cfg["budget"].get("max_job_relaunches", detach.RELAUNCH_CAP))
+        limit = int(self.cfg["budget"].get("max_reboot_losses", 3))
+        rec = self.p.db.kv("boot_prev") or {}
+        before = rec.get("prev_boot") if self._this_boot(rec.get("boot")) else None   # the boot this reboot ended
+        nice = nice_level(self.cfg.get("runner"))[0]
+        db = self.p.db
+        for res in sorted(self.p.runs.glob("*/*.resume.json")):
+            rc = res.with_name(res.name[:-len(".resume.json")] + ".rc")
+            if rc.exists() or str(rc) in named or str(rc.resolve()) in named:
+                continue
+            m = detach.read_resume(rc)
+            if m is None or m.get("stopped"):
+                continue
+            again = self._this_boot(m.get("boot")) and bool(m.get("relaunches"))
+            if again and detach.relaunch_started(rc):
+                continue   # relaunched on this boot already (a daemon restart within it)
+            if self._this_boot(m.get("boot")) and not again:
+                continue   # started on this boot: not cut short by the reboot
+            who, task = self._job_owner(rc)
+
+            def skip(why: str) -> None:
+                log(self.p, f"detached job {rc.stem} ({rc.parent}) not relaunched: {why}")
+            if not who:
+                skip("no run of this project owns its folder")
+                continue
+            if task and task["status"] in ("done", "failed", "cancelled", "superseded"):
+                skip(f"its task #{task['id']} is {task['status']}")
+                continue
+            if task and (why := self._no_relaunch(task["id"])) and task["status"] == "queued":
+                skip(f"its task #{task['id']} {why}")
+                continue
+            if self._lost_before_boot(rc):
+                skip("it was lost before this boot")
+                continue
+            cut_boot = m.get("cut_boot") if again else m.get("boot")
+            if before and not again and cut_boot != before:
+                skip("it was cut short on an older boot than the one this reboot ended")
+                continue
+            if task and (held := self._held_at_reboot(task["id"], earlier)):
+                skip(f"its task #{task['id']} held {', '.join(held)} when the host went down")
+                continue
+            n = int(m.get("relaunches") or 0) - (1 if again else 0)
+            if n >= cap:
+                why = f"it was relaunched {n} times already (cap {cap})"
+                skip(why)
+                _task_note(rc.parent, f"the reboot cut short detached job {rc.stem}; not relaunched: {why}")
+                continue
+            loss = self._abrupt_cut(cut_boot)
+            tid = task["id"] if task else None
+            key = str(tid) if tid else "coord"
+            if loss and not again:
+                if tid:
+                    k = self._reboot_losses(tid) + _reboot_wakes(task) + self._job_relaunch_boots(tid)
+                else:
+                    k = len({r["fingerprint"].split(":")[2] for r in db.q(
+                        "SELECT fingerprint FROM events WHERE kind='job_relaunched' AND task IS NULL "
+                        "AND fingerprint LIKE ?", (f"job_relaunched:coord:%:loss:{rc}",))})
+                if k + 1 >= limit:
+                    why = (f"with {k} earlier reboot losses this one reaches budget.max_reboot_losses ({limit}); "
+                           "it may be what takes the host down")
+                    skip(why)
+                    _task_note(rc.parent, f"the reboot cut short detached job {rc.stem}; not relaunched: {why}")
+                    continue
+            why, _pid = detach.relaunch(rc, self.boot, nice)
+            if why:
+                skip(why)
+                _task_note(rc.parent, f"the reboot cut short detached job {rc.stem}; not relaunched: {why}")
+                continue
+            fp = f"job_relaunched:{key}:{self.boot}:{'loss' if loss else 'free'}:{rc}"
+            if db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+                continue
+            at = timefmt.long(self.boot_at, self.p) if self.boot_at else "boot"
+            text = (f"the host reboot at {at} cut short detached job {rc.stem}; relaunched it "
+                    f"({n + 1} of {cap}), no model run")
+            _task_note(rc.parent, text)
+            label = f"#{tid} {task['title']}" if tid else f"coordinator job in {rc.parent}"
+            db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
+                 (time.time(), "daemon", "job_relaunched", fp, "low", f"{label}: {text}",
+                  "handled" if tid else "new", tid))
+            log(self.p, f"{label}: {text} ({rc})")
 
     def _relaunch_prechecks(self) -> None:
         """Review prechecks (_precheck) the reboot killed start again in their folder on the same head,

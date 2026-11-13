@@ -655,3 +655,113 @@ def test_a_review_precheck_that_died_on_this_boot_restarts_once_while_its_review
     d.relaunch_dead_checks()
     assert starts == [(out, f"precheck-{out.name}", info["arrived"])], starts
     assert len(p.db.q("SELECT id FROM events WHERE kind='checks_crash_relaunched'")) == 1
+
+
+def _unwatched_job(p, tmp_path, name, owner, script="true"):
+    """A `ttp detach --resumable` job that ran on an earlier boot from a run folder of `owner` ("coordinator",
+    or a task id), cut short by the reboot (no .rc), that no task's retry_when names; the boot record says
+    this boot followed the job's. Returns (rc, counter file)."""
+    run_dir = p.runs / f"unwatched-{name}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    counter = tmp_path / f"runs-{name}"
+    r = _ttp_run(p, "detach", "--resumable", name, "--", "sh", "-c", f"echo run >>{counter}; {script}",
+                 env={"TTP_RUN_DIR": str(run_dir)}, timeout=HANG_S)
+    assert r.returncode == 0, r.stderr
+    rc = (run_dir / f"{name}.rc").resolve()
+    assert _wait_for_path(rc, HANG_S) and _job_lock_free(rc, 30)
+    rc.unlink()
+    from ttp import detach
+    m = json.loads(detach.resume_file(rc).read_text())
+    detach.resume_file(rc).write_text(json.dumps({**m, "boot": "an-earlier-boot"}))
+    coord = owner == "coordinator"
+    p.db.x("INSERT INTO runs(task,role,provider,started,ended,status,dir,boot_id) VALUES(?,?,?,?,?,?,?,?)",
+           (None if coord else owner, "coordinator" if coord else "worker", "fake", time.time() - 1800,
+            time.time() - 900, "ok", str(rc.parent), "an-earlier-boot"))
+    p.db.set_kv("boot_prev", {"boot": "a-later-boot", "prev_boot": "an-earlier-boot", "shutdown": "orderly"})
+    return rc, counter
+
+
+def _relaunch_events(p, rc):
+    return p.db.q("SELECT * FROM events WHERE kind='job_relaunched' AND fingerprint LIKE ?", (f"%:{rc}",))
+
+
+def test_a_reboot_relaunches_a_coordinator_runs_resumable_job_no_task_waits_on(env, tmp_path):
+    # #8592: a lead turn's `ttp detach --resumable` job lives in the coordinator's run folder and no task's
+    # retry_when names it: the boot pass starts it again, model-free, once, and tells the coordinator.
+    from ttp import detach
+    p = make(env)
+    rc, counter = _unwatched_job(p, tmp_path, "bench", "coordinator")
+    _boot_daemon(p)
+    assert _wait_for_path(rc) and rc.read_text().strip() == "0"
+    assert counter.read_text().split() == ["run", "run"]
+    (ev,) = _relaunch_events(p, rc)
+    assert ev["task"] is None and ev["status"] == "new" and ev["severity"] == "low", dict(ev)
+    assert "coordinator job" in ev["text"] and "relaunched it (1 of 3), no model run" in ev["text"], ev["text"]
+    m = detach.read_resume(rc)
+    assert m["relaunches"] == 1 and m["boot"] == "a-later-boot" and m["cut_boot"] == "an-earlier-boot"
+    # A daemon restart on the same boot starts nothing more.
+    rc.unlink()
+    _boot_daemon(p)
+    assert len(_relaunch_events(p, rc)) == 1 and counter.read_text().split() == ["run", "run"]
+
+
+def test_a_relaunched_coordinator_job_reads_as_running_to_a_start_when_probe(env, tmp_path):
+    # #8592 (4): the boot pass runs before any start_when or claim probe, so `ttp detach --check` on the
+    # job's .rc reads it running (1) on the new boot, never lost (4), and a gate waiting on its end holds.
+    from ttp import detach
+    p = make(env)
+    gate = tmp_path / "first-run-only"
+    gate.write_text("")
+    rc, counter = _unwatched_job(p, tmp_path, "soak", "coordinator", f"test -e {gate} || sleep 30")
+    gate.unlink()
+    d, pid = _boot_daemon(p), 0
+    try:
+        deadline = time.monotonic() + HANG_S
+        while not (pid := detach.running_pid(rc, d._this_boot)) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert pid, "the job was not relaunched"
+        r = _ttp_run(p, "detach", "--check", str(rc), timeout=HANG_S)
+        assert r.returncode == 1, (r.returncode, r.stdout, r.stderr)
+    finally:
+        if pid:
+            detach.stop(rc, pid, "test over")
+
+
+def test_a_reboot_leaves_stopped_capped_and_closed_tasks_unwatched_jobs_stopped(env, tmp_path):
+    # #8592: a job stopped on purpose, one past budget.max_job_relaunches and one of a done task stay
+    # stopped; a job of a task still open (not deferred, no retry_when naming it) is relaunched on it.
+    from ttp import detach
+    p = make(env)
+    stopped, c1 = _unwatched_job(p, tmp_path, "stopped", "coordinator")
+    detach.mark_stopped(stopped, "stopped by the test")
+    capped, c2 = _unwatched_job(p, tmp_path, "capped", "coordinator")
+    m = detach.read_resume(capped)
+    detach.resume_file(capped).write_text(json.dumps({**m, "relaunches": detach.RELAUNCH_CAP}))
+    done = p.db.add_task("done", "s", kind="work", tier="light", origin="user")
+    p.db.update_task(done, status="done")
+    closed, c3 = _unwatched_job(p, tmp_path, "closed", done)
+    live = p.db.add_task("open", "s", kind="work", tier="light", origin="user")
+    p.db.update_task(live, status="blocked")
+    mine, c4 = _unwatched_job(p, tmp_path, "mine", live)
+    _boot_daemon(p)
+    assert _wait_for_path(mine) and c4.read_text().split() == ["run", "run"]
+    (ev,) = _relaunch_events(p, mine)
+    assert ev["task"] == live and ev["status"] == "handled", dict(ev)
+    assert "relaunched it (1 of 3)" in (mine.parent / "progress.md").read_text()
+    for rc, c in ((stopped, c1), (capped, c2), (closed, c3)):
+        assert not rc.exists() and c.read_text().split() == ["run"], rc
+        assert not _relaunch_events(p, rc), rc
+    log = (p.logs / "daemon.log").read_text()
+    assert "detached job capped" in log and "relaunched 3 times already (cap 3)" in log, log[-2000:]
+    assert f"its task #{done} is done" in log, log[-2000:]
+
+
+def test_a_reboot_leaves_a_job_cut_short_on_an_older_boot_to_its_owner(env, tmp_path):
+    # #8592: only a job the reboot that ended the last boot cut short is relaunched; one with no .rc from
+    # an older boot (it died some other way, nobody looked) stays stopped.
+    p = make(env)
+    rc, counter = _unwatched_job(p, tmp_path, "old", "coordinator")
+    p.db.set_kv("boot_prev", {"boot": "a-later-boot", "prev_boot": "the-boot-before", "shutdown": "orderly"})
+    _boot_daemon(p)
+    assert not rc.exists() and counter.read_text().split() == ["run"] and not _relaunch_events(p, rc)
+    assert "cut short on an older boot" in (p.logs / "daemon.log").read_text()
