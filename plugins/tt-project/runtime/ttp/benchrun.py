@@ -14,7 +14,7 @@ commit, one branch, no remote, reflog or alternates, neither the base nor the la
 held-out test content (leaks); the bench and results folders, the source repository with its git dir
 and worktrees, the project's state folder and the providers' plugin caches and saved transcripts
 (hidden_paths) are denied to the agent's reads. After it, the transcript is audited for those paths,
-the landed commit and history or forge commands (audit): a flagged cell fails. Then the held-out files are copied in and the held-out
+the landed commit and history or forge commands (audit): a flagged cell fails (it is still graded, and `heldout_passed` keeps the grade). Then the held-out files are copied in and the held-out
 tests run (the grade). The agent and the grade each run in a fresh venv in the cell's folder (cellenv:
 the user site off, pip refused outside a venv), so no cell installs into or imports from ~/.local
 and nothing the agent installed runs the held-out tests. Each cell appends one row to <out>/results.jsonl: cost, tokens, wall time,
@@ -42,9 +42,17 @@ from . import bench, cellenv, cellns, gitmemo
 from .project import durable_write, open_append
 
 PROMPT = ("You are working in the git repository in your current directory. Do the task below there: make "
-          "the change, commit it, and run the tests it affects. When you are done, write "
+          "the change, commit it, and run the tests it affects. You have {limit_min} minutes in all. Run only "
+          "focused tests: the test files for the code you changed (`python3 -m pytest -q <test file>`), or "
+          "`python3 -m pytest -q <test file> -k <name>` for the tests of the functions you touched. The repository's "
+          "whole suite may take longer than your time; run it only if you know it fits. When you are done, write "
           '{{"status": "done", "summary": "<what you changed>"}} (or "failed" with why) to '
           "$TTP_RUN_DIR/result.json.\n\n## Task\n\n{spec}\n")
+
+
+def prompt(spec: str, opts: dict) -> str:
+    """The cell agent's prompt: the task's spec, its time limit and a focused test command."""
+    return PROMPT.format(spec=spec, limit_min=max(1, int(float(opts.get("timeout_s") or 1800) // 60)))
 CHEAT = re.compile(r"\bgit\s+(fetch|clone|pull|ls-remote|remote\s+add)\b|\bgit\s+log\s+--all\b|\bgh\s+(api|repo|pr)\b")
 TEST_CMD = "python3 -m pytest -q -p no:cacheprovider"
 ISOLATE = True   # each cell's agent runs in a mount namespace (cellns.py); only tests turn this off (opts["isolate"])
@@ -609,13 +617,14 @@ def run_cell(bench_dir: Path, out: Path, task: dict, cell: dict, arm: dict, opts
             conf, logins = scratch_home(arm["provider"], tmp, not opts.get("dry_run")) \
                 if opts.get("scratch_home", True) else ({}, [])
             own = session_dirs(ws, conf.get("CLAUDE_CONFIG_DIR"))
-        prov, wall, hung = launch(run, ws, PROMPT.format(spec=spec), arm, opts, cfg, hidden, cell_env, conf, own,
+        prov, wall, hung = launch(run, ws, prompt(spec, opts), arm, opts, cfg, hidden, cell_env, conf, own,
                                   cell)
         row["wall_s"] = wall
         if hung:   # the supervisor itself hung: its watchdog ends the agent; what it spent so far still counts
             row.update(outcome="runner_timeout", passed=False)
             try:
-                row["cost_usd"] = prov.parse(run / "output.jsonl", run / "stderr.log").cost_usd
+                row["cost_usd"], row["cost_estimated"] = cell_cost(prov.parse(run / "output.jsonl",
+                                                                             run / "stderr.log"), arm)
             except Exception:
                 pass
             return row
@@ -672,6 +681,24 @@ def launch(run: Path, ws: Path, prompt: str, arm: dict, opts: dict, cfg: dict, h
     return prov, round(time.time() - began, 1), False
 
 
+def cell_cost(u, arm: dict) -> tuple[float, bool]:
+    """(USD, estimated) for a cell's agent. A Claude run cut off before its result line (its limit, a kill)
+    reports no cost but its stream shows the tokens: price those at list price (localspend), estimated,
+    so a cell that spent tokens never records 0."""
+    tokens = u.input_tokens or u.output_tokens or u.cache_read_tokens or u.cache_write_tokens
+    if u.cost_usd or not tokens or arm.get("provider") != "claude":
+        return u.cost_usd, bool(u.estimated)
+    from . import localspend
+    try:
+        usd, _unknown = localspend.price(str(arm.get("model") or u.extra.get("model") or ""), {
+            "input_tokens": u.input_tokens, "output_tokens": u.output_tokens,
+            "cache_read_input_tokens": u.cache_read_tokens,
+            "cache_creation_input_tokens": u.cache_write_tokens}, overrides=localspend.overrides())
+    except Exception:
+        return u.cost_usd, bool(u.estimated)
+    return round(float(usd), 6), True
+
+
 def _read_json(path: Path):
     # A file the candidate or its run wrote: None when missing, "invalid" when not a JSON object.
     if not path.exists():
@@ -695,7 +722,8 @@ def _finish(row: dict, bench_dir: Path, task: dict, ws: Path, run: Path, keep: P
             hidden: list[Path], own: list[Path] | None = None) -> dict:
     """Audit and grade a cell whose agent has run, filling `row` as it goes (its cost first)."""
     u = prov.parse(run / "output.jsonl", run / "stderr.log")
-    row.update(cost_usd=u.cost_usd, cost_estimated=u.estimated, input_tokens=u.input_tokens,
+    cost, estimated = cell_cost(u, row)
+    row.update(cost_usd=cost, cost_estimated=estimated, input_tokens=u.input_tokens,
                output_tokens=u.output_tokens, cache_read_tokens=u.cache_read_tokens, session_id=u.session_id)
     transcript = (run / "output.jsonl").read_bytes() if (run / "output.jsonl").exists() else b""
     ended, handoff = _read_json(run / "exit.json"), _read_json(run / "result.json")
@@ -710,13 +738,18 @@ def _finish(row: dict, bench_dir: Path, task: dict, ws: Path, run: Path, keep: P
     row["diff_sha256"] = _sha(diff)
     flags = audit(transcript.decode(errors="replace"), task, hidden,
                   secret_lines(bench_dir, task), diff.decode(errors="replace"), own or session_dirs(ws))
+    # Graded even when flagged, so a reader sees both: a flagged cell still scores as a flag (passed False),
+    # and `heldout_passed` keeps what the held-out tests said. A fresh venv: nothing the agent installed
+    # into its own runs them.
+    venv = cellenv.make(run.parent / "grade-venv", opts.get("cell_packages", cellenv.SEED))
+    held, log_tail = grade(ws, bench_dir, task, opts["test_cmd"], opts["test_timeout_s"],
+                           cellenv.env(venv, _clean_env()))
     if flags:
-        passed, log_tail = False, "not graded: flagged by the cheat audit"
-    else:   # a fresh venv: nothing the agent installed into its own runs the held-out tests
-        venv = cellenv.make(run.parent / "grade-venv", opts.get("cell_packages", cellenv.SEED))
-        passed, log_tail = grade(ws, bench_dir, task, opts["test_cmd"], opts["test_timeout_s"],
-                                 cellenv.env(venv, _clean_env()))
-    row.update(passed=passed, flagged=flags, outcome="flagged" if flags else "pass" if passed else "fail")
+        log_tail = "flagged by the cheat audit; the held-out tests " + ("passed" if held else "failed") \
+            + " (not scored as a pass)\n" + log_tail
+    passed = held and not flags
+    row.update(passed=passed, heldout_passed=held, flagged=flags,
+               outcome="flagged" if flags else "pass" if passed else "fail")
     if row["outcome"] == "fail" and (fault := endpoint_fault(ended)):
         # the endpoint failed the agent (a 429, an outage), not the model: never scored, retried by the suite
         row.update(outcome="error", endpoint_fault=fault)

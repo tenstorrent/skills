@@ -1761,3 +1761,50 @@ def test_model_suite_run_refuses_while_another_run_holds_the_day_folder(env, tmp
     rows = modelsuite.run(p.db, cfg, ["m-a"], {}, 1e7, date="2026-11-10", opts={"dry_run": True},
                           classes=("standard",), has_cli=lambda: True)
     assert [r["model"] for r in rows] == ["m-a"], "the lock goes with its holder"
+
+
+def test_bench_flagged_cell_is_still_graded_and_the_prompt_names_a_focused_test_command(env, tmp_path, monkeypatch):
+    from ttp import benchrun
+    p, tid, task = _bench_built(env, tmp_path)
+    # A correct fix, plus a history hunt the audit flags: the row keeps both the flag and the grade.
+    monkeypatch.setenv("TTP_FAKE_SHELL", "git log --all >/dev/null; " + _BENCH_FIX)
+    arms = {"a": {"provider": "claude", "model": "", "effort": ""}, "b": {"provider": "claude", "model": "", "effort": ""}}
+    out = tmp_path / "h2h"
+    for r in benchrun.run(tmp_path / "bench", out, arms, 1, 1, _bench_opts(tmp_path), p.config()):
+        assert r["outcome"] == "flagged" and r["passed"] is False and r["heldout_passed"] is True, r
+    log = (out / "cells" / f"{tid}-r1-a" / "tests.log").read_text()
+    assert log.startswith("flagged by the cheat audit; the held-out tests passed")
+    # Unflagged cells carry the same field.
+    monkeypatch.setenv("TTP_FAKE_SHELL", "true")
+    real, prompts = benchrun.launch, []
+    monkeypatch.setattr(benchrun, "launch", lambda run, ws, text, *a, **k: prompts.append(text) or real(run, ws, text, *a, **k))
+    for r in benchrun.run(tmp_path / "bench", tmp_path / "h2h-2", arms, 1, 1, _bench_opts(tmp_path), p.config()):
+        assert r["outcome"] == "fail" and r["heldout_passed"] is False and r["passed"] is False
+    # The agent is told its time and a focused test command, never to run the whole suite, and no held-out name.
+    argv = prompts[0]
+    assert len(prompts) == 2 and "You have 2 minutes in all" in argv and "python3 -m pytest -q <test file> -k <name>" in argv
+    assert "test_new" not in argv
+    assert "30 minutes" in benchrun.prompt("spec", {"timeout_s": 1800})
+
+
+def test_bench_cell_cut_off_before_its_result_line_is_priced_from_its_tokens(env, monkeypatch):
+    from ttp import benchrun, localspend
+    from ttp.providers.base import RunUsage
+    seen = {}
+
+    def price(model, usage, overrides=None, rows=None):
+        seen.update(model=model, usage=usage)
+        return 1.25, False
+    monkeypatch.setattr(localspend, "price", price)
+    monkeypatch.setattr(localspend, "overrides", lambda: {})
+    cut = RunUsage(input_tokens=10, output_tokens=2000, cache_read_tokens=50000, cache_write_tokens=300, estimated=True)
+    assert benchrun.cell_cost(cut, {"provider": "claude", "model": "m-one"}) == (1.25, True)
+    assert seen["model"] == "m-one" and seen["usage"]["output_tokens"] == 2000
+    assert seen["usage"]["cache_read_input_tokens"] == 50000
+    # A reported cost stands; no tokens, or another provider (priced elsewhere), keeps what was parsed.
+    assert benchrun.cell_cost(RunUsage(cost_usd=0.5, output_tokens=9), {"provider": "claude"}) == (0.5, False)
+    assert benchrun.cell_cost(RunUsage(), {"provider": "claude"}) == (0.0, False)
+    assert benchrun.cell_cost(RunUsage(output_tokens=9), {"provider": "chat"}) == (0.0, False)
+    # A pricing failure never breaks the cell.
+    monkeypatch.setattr(localspend, "price", lambda *a, **k: 1 / 0)
+    assert benchrun.cell_cost(cut, {"provider": "claude", "model": "m"}) == (0.0, True)
