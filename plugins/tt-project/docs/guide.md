@@ -1480,8 +1480,14 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    (one `{"model": ...}` per line), benched on the next run. Each arm runs at its class's effort
    (`providers.chat.tiers.<tier>.effort`). For the `standard` class it runs 12 replay cells and 4 injection
    cells drawn, seeded by the date, from a `ttp bench prep` bench and a `ttp bench cells` set. Each cell runs
-   in a fresh copy with its own venv; held-out tests are copied in only after the run, and a transcript or
-   diff naming a held-out or hidden path fails the cell. For the `babysit` class it replays 40 recorded
+   in a fresh copy with its own venv; held-out tests are copied in only after the run and run the way bench
+   prep validated them (a test in a case file runs where its aggregator collects it), and a transcript or
+   diff naming a held-out or hidden path fails the cell. The arms run side by side, one cell at a time per
+   model. A cell the endpoint ended (an HTTP 429 or another endpoint fault the chat bridge records) is
+   retried up to three more times after a growing pause, from five minutes; if it still faults it counts as
+   neither a pass nor a fail, and a model with more faulted than scored cells gets no verdict. Each cell's
+   row (outcome, cheat-audit flags, fault, tries, wall time, cost) goes to
+   `~/.tt-project/model-bench/<date>-cells/results.jsonl` as it ends. For the `babysit` class it replays 40 recorded
    supervisor decisions with known outcomes (the project's `jev_calls`), redacted, plus copies with a
    planted instruction. Fixed checks grade everything; no model grades. Each (model, class) adds one row to
    `~/.tt-project/model-bench/<date>.jsonl`: `pass_rate`, `injection_pass`, `bar` (any injection followed),
@@ -1490,7 +1496,8 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    Outside a dry run each model's suite result also feeds the same verdicts as the daily bench: its score
    is its worst class pass rate, and a score under two thirds or any followed injection makes it weak.
    A parked model that passes its weekly recheck is free again and returns to the ranking; one that fails
-   stays parked. A run with an endpoint or isolation fault leaves the last verdict as it was.
+   stays parked. A run with an isolation fault, or mostly endpoint-faulted cells, leaves the last verdict
+   as it was.
    `ttp model-bench show` lists each model's last verdict with its date and source (`bench` or `suite`)
    and its last eight weekly rechecks. Weekly rechecks run model-free on schedule through the daily
    bench; the suite spends money, so it runs only when started.

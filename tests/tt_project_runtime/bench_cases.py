@@ -1149,7 +1149,9 @@ def test_model_suite_decisions_map_verb_records_and_faults_never_set_the_bar(env
 
     def boom(m, q):
         raise OSError("down")
-    assert modelsuite.babysit("m", cs, boom)["bar"] is False
+    down = modelsuite.babysit("m", cs, boom, {"fault_pause_s": 0})
+    assert down["bar"] is False and down["pass_rate"] is None and down["endpoint_faults"] == 1, \
+        "an ask the endpoint fails is retried, then neither a pass nor a fail"
     assert modelsuite.babysit("m", cs, lambda m, q: "???")["bar"] is False
     assert modelsuite.babysit("m", cs, lambda m, q: "skip")["bar"] is True
 
@@ -1358,3 +1360,143 @@ def test_model_suite_pools_babysit_cases_across_projects_read_only_and_skips_an_
     assert {c["state"].split()[0] for c in cases} == {"here", "pa", "pb"}
     assert modelsuite.decisions(here.db, "2026-11-12", others=list(reversed(others))) == cases, "same draw any order"
     assert {x: x.stat().st_mtime_ns for x in before} == before, "other projects' databases are only read"
+
+
+def test_bench_grade_runs_a_held_out_case_file_test_where_its_aggregator_collects_it(tmp_path):
+    # A case file is not collectable alone (it uses the aggregator's `pytest`): grading must run its test
+    # through the aggregator and the select plugin, as bench validation does, and fail only on the assertion.
+    from ttp import benchrun
+    ws, bench_dir = tmp_path / "ws", tmp_path / "bench"
+    (ws / "tests" / "cases").mkdir(parents=True)
+    (ws / "mod.py").write_text("def new():\n    return 1\n")
+    (ws / "tests" / "test_agg.py").write_text(
+        "import pytest\nfrom pathlib import Path\n_p = Path(__file__).parent / 'cases' / 'x_cases.py'\n"
+        "exec(compile(_p.read_text(), str(_p), 'exec'))\n\n\ndef test_other():\n    assert False\n")
+    held = bench_dir / "7" / "heldout" / "tests" / "cases" / "x_cases.py"
+    held.parent.mkdir(parents=True)
+    held.write_text("import mod\n\n\n@pytest.mark.parametrize('n', [2])\ndef test_new(n):\n"
+                    "    assert mod.new() == n, 'new() returns two'\n")
+    task = {"task": 7, "heldout": ["tests/cases/x_cases.py"], "tests": ["tests/cases/x_cases.py::test_new"]}
+    cmd = "python3 -m pytest -q -p no:cacheprovider"   # the suite's command: one plain pytest run
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}   # the grading venv's env: no PYTHONPATH
+    passed, log = benchrun.grade(ws, bench_dir, task, cmd, 120, env)
+    assert not passed and "new() returns two" in log and "NameError" not in log, log
+    assert "1 failed" in log and "test_other" not in log, "only the held-out test runs, not the aggregator's own"
+    (ws / "mod.py").write_text("def new():\n    return 2   # fixed\n")   # another size: no stale bytecode
+    passed, log = benchrun.grade(ws, bench_dir, task, cmd, 120, env)
+    assert passed and "1 passed" in log, log
+    passed, log = benchrun.grade(ws, bench_dir, task, cmd, 120)   # no env: this process's, as before
+    assert passed, log
+
+
+def _endpoint_down(monkeypatch, faults: int):
+    # A fake endpoint: the first `faults` agent runs end on an HTTP 429 (exit.json as the chat bridge writes
+    # it), the rest run normally. Returns the list of launches, True for each faulted one.
+    from ttp import benchrun
+    real, calls = benchrun.launch, []
+
+    def launch(run, *a, **k):
+        got = real(run, *a, **k)
+        calls.append(len(calls) < faults)
+        if calls[-1]:
+            ended = json.loads((run / "exit.json").read_text())
+            (run / "exit.json").write_text(json.dumps({**ended, "rc": 1, "bridge": {"last_fault": "rate_limit"}}))
+        return got
+    monkeypatch.setattr(benchrun, "launch", launch)
+    return calls
+
+
+def test_model_suite_retries_an_endpoint_faulted_cell_and_never_scores_one(env, tmp_path, monkeypatch):
+    from ttp import benchrun, modelsuite
+    p, tid, task = _bench_built(env, tmp_path)
+    arm = {"provider": "chat", "model": "org/m-one", "effort": "high"}
+    monkeypatch.setenv("TTP_FAKE_SHELL", _BENCH_FIX)
+    monkeypatch.setattr(modelsuite, "_pause", lambda s: pauses.append(s))
+    pauses, calls = [], _endpoint_down(monkeypatch, 1)
+    # The first try hits a 429 (graded a fail on the fake agent's undone work); the retry passes.
+    monkeypatch.setenv("TTP_FAKE_SHELL", f"if [ -e {tmp_path / 'tried'} ]; then {_BENCH_FIX}; else touch {tmp_path / 'tried'}; fi")
+    ok = modelsuite.standard("org/m-one", arm, "2026-11-10", tmp_path / "bench", None,
+                             _bench_opts(tmp_path, fault_pause_s=5), p.config(), tmp_path / "o1")
+    assert calls == [True, False] and pauses == [5]
+    assert ok["pass_rate"] == 1.0 and ok["endpoint_faults"] == 0 and ok["cell_rows"][0]["tries"] == 2
+    cells = [json.loads(x) for x in (tmp_path / "o1" / "results.jsonl").read_text().splitlines()]
+    assert [(c["task"], c["model"], c["outcome"], c["tries"]) for c in cells] == [(tid, "org/m-one", "pass", 2)]
+    # Every try faults: kept as an error naming the fault, never a fail; the pause grows per try.
+    pauses[:], calls = [], _endpoint_down(monkeypatch, 99)
+    monkeypatch.setenv("TTP_FAKE_SHELL", "true")
+    down = modelsuite.standard("org/m-one", arm, "2026-11-10", tmp_path / "bench", None,
+                               _bench_opts(tmp_path, fault_pause_s=5, fault_tries=2), p.config(), tmp_path / "o2")
+    assert len(calls) == 3 and pauses == [5, 10]
+    c = down["cell_rows"][0]
+    assert (c["outcome"], c["passed"], c["endpoint_fault"]) == ("error", False, "rate_limit")
+    assert down["pass_rate"] is None and down["scored"] == 0 and down["endpoint_faults"] == 1 and down["faults"] == 0
+    assert json.loads((tmp_path / "o2" / "results.jsonl").read_text())["endpoint_fault"] == "rate_limit"
+    assert modelsuite.verdict([{"model": "m", "class": "standard", **down}], "m", "daily") is None
+    # A model whose cells are mostly faulted is inconclusive, never weak; a few faults leave the rest scored.
+    row = {"model": "m", "class": "standard", "faults": 0, "bar": False}
+    assert modelsuite.verdict([{**row, "pass_rate": 0.0, "scored": 2, "endpoint_faults": 10}], "m", "daily") is None
+    assert modelsuite.verdict([{**row, "pass_rate": 0.0, "scored": 10, "endpoint_faults": 2}], "m", "daily")[1] is True
+    # A cell the timeout stopped, or one that passed, is the model's whatever the bridge saw.
+    assert benchrun.endpoint_fault({"rc": 1, "stopped": "timeout", "bridge": {"last_fault": "rate_limit"}}) == ""
+    assert benchrun.endpoint_fault({"rc": 0, "bridge": {"last_fault": "rate_limit"}}) == ""
+    assert benchrun.endpoint_fault({"rc": 1, "bridge": {"last_fault": ""}}) == ""
+    # An injection cell the endpoint stopped followed nothing because it did nothing: not a pass.
+    calls = _endpoint_down(monkeypatch, 99)
+    inj = modelsuite.standard("m", arm, "2026-11-10", None, _suite_cells(tmp_path),
+                              _bench_opts(tmp_path, fault_tries=0), {}, tmp_path / "o3")
+    assert inj["injection_pass"] is None and inj["injection_faults"] == 2 and inj["bar"] is False
+    # A head-to-head rerun runs the cells an endpoint fault ended again rather than skip them.
+    arms = {"a1": {"provider": "chat", "model": "m-one", "effort": "high"},
+            "a2": {"provider": "chat", "model": "m-two", "effort": "high"}}
+    _endpoint_down(monkeypatch, 99)
+    first = benchrun.run(tmp_path / "bench", tmp_path / "h2h", arms, 1, 7, _bench_opts(tmp_path), p.config())
+    assert [r["outcome"] for r in first] == ["error", "error"]
+    _endpoint_down(monkeypatch, 0)
+    monkeypatch.setenv("TTP_FAKE_SHELL", _BENCH_FIX)
+    again = benchrun.run(tmp_path / "bench", tmp_path / "h2h", arms, 1, 7, _bench_opts(tmp_path), p.config())
+    assert [r["outcome"] for r in again] == ["pass", "pass"]
+
+
+def test_model_suite_runs_its_arms_side_by_side_and_books_every_verdict(env, monkeypatch):
+    import threading
+    from ttp import modelbench, modelsuite
+    p = make(env)
+    d = _suite_home(env, monkeypatch)
+    monkeypatch.setattr(modelsuite, "decisions", lambda db, date: [])
+    meet, busy, most = threading.Barrier(2, timeout=30), {}, []
+
+    def standard(model, arm, *a, **k):
+        busy[model] = busy.get(model, 0) + 1
+        most.append(busy[model])
+        meet.wait()   # both arms in a cell at once, or this breaks: sequential arms never meet
+        busy[model] -= 1
+        return {"pass_rate": 0.9 if model == "m-a" else 0.1, "injection_pass": None, "bar": False, "faults": 0,
+                "cell_rows": [{"task": 1}]}
+    monkeypatch.setattr(modelsuite, "standard", standard)
+    monkeypatch.setattr(modelsuite, "babysit", lambda *a, **k: {"pass_rate": 1.0, "injection_pass": None, "bar": False})
+    cfg = {"providers": {"chat": {"model_ranking": ["m-a", "m-b"]}}}
+    rows = modelsuite.run(p.db, cfg, ["m-a", "m-b"], {}, 1e7, date="2026-11-10", opts={},
+                          ask=lambda m, q: "skip", has_cli=lambda: True)
+    assert [(r["model"], r["class"]) for r in rows] == [("m-a", "standard"), ("m-a", "babysit"),
+                                                         ("m-b", "standard"), ("m-b", "babysit")]
+    assert max(most) == 1, "no model has more than one suite cell at once"
+    lines = [json.loads(x) for x in (d / "2026-11-10.jsonl").read_text().splitlines()]
+    assert sorted((r["model"], r["class"]) for r in lines) == sorted((r["model"], r["class"]) for r in rows)
+    got = modelbench.models()
+    assert got["m-a"]["weak"] is False and got["m-b"]["weak"] is True
+
+
+def test_model_bench_record_from_concurrent_runs_loses_no_model(env, monkeypatch):
+    import threading
+    import time as _t
+    from ttp import modelbench
+    _suite_home(env, monkeypatch)
+    real = modelbench.models
+    monkeypatch.setattr(modelbench, "models", lambda: (got := real(), _t.sleep(0.05))[0])   # a slow read
+    jobs = [threading.Thread(target=modelbench.record, args=({f"m{i}": (0.9, False, "daily")}, 1e7, "suite"))
+            for i in range(6)]
+    for j in jobs:
+        j.start()
+    for j in jobs:
+        j.join()
+    assert sorted(modelbench.models()) == [f"m{i}" for i in range(6)]

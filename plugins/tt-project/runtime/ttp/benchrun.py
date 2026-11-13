@@ -31,7 +31,6 @@ import json
 import os
 import random
 import re
-import shlex
 import shutil
 import subprocess
 import sys
@@ -376,15 +375,21 @@ def audit(transcript: str, task: dict, hidden: list[Path], secret: dict | None =
 def grade(ws: Path, bench_dir: Path, task: dict, test_cmd: str, timeout_s: float,
           env: dict | None = None) -> tuple[bool, str]:
     """Copy the held-out files over the candidate's and run the held-out tests with `env` (the cell's
-    grading venv): (passed, log tail)."""
+    grading venv): (passed, log tail). They run as bench validation runs them (bench._held_cmd with the
+    select plugin), so a case file's test runs where its aggregator collects it, never on its own."""
+    from . import benchcells
     for path in task["heldout"]:
         dest = ws / path
         if dest.is_symlink() or dest.is_dir():
             return False, f"{path} is not a regular file in the workspace"
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(bench_dir / str(task["task"]) / "heldout" / path, dest)
+    argv, select = bench._held_cmd(test_cmd, list(task["tests"]))
+    if select:
+        base = dict(os.environ if env is None else env)
+        env = {**base, **benchcells.select_env(select, base)}
     try:
-        r = subprocess.run([*shlex.split(test_cmd), *task["tests"]], cwd=ws, capture_output=True, text=True,
+        r = subprocess.run(argv, cwd=ws, capture_output=True, text=True,
                            timeout=timeout_s, stdin=subprocess.DEVNULL, env=env)
     except subprocess.TimeoutExpired:
         return False, f"the held-out tests ran past {timeout_s:.0f} s"
@@ -496,6 +501,14 @@ def _read_json(path: Path):
     return data if isinstance(data, dict) else "invalid"
 
 
+def endpoint_fault(ended: dict) -> str:
+    """The endpoint fault (the chat bridge's last_fault, e.g. "rate_limit" for an HTTP 429) an agent
+    exited non-zero on, per its exit.json `ended`, or "": a cell the timeout stopped is the model's."""
+    if not isinstance(ended, dict) or ended.get("rc") in (0, None) or ended.get("stopped"):
+        return ""
+    return str((ended.get("bridge") or {}).get("last_fault") or "")
+
+
 def _finish(row: dict, bench_dir: Path, task: dict, ws: Path, run: Path, keep: Path, start: str, prov, opts: dict,
             hidden: list[Path], own: list[Path] | None = None) -> dict:
     """Audit and grade a cell whose agent has run, filling `row` as it goes (its cost first)."""
@@ -520,6 +533,9 @@ def _finish(row: dict, bench_dir: Path, task: dict, ws: Path, run: Path, keep: P
         passed, log_tail = grade(ws, bench_dir, task, opts["test_cmd"], opts["test_timeout_s"],
                                  cellenv.env(venv, _clean_env()))
     row.update(passed=passed, flagged=flags, outcome="flagged" if flags else "pass" if passed else "fail")
+    if row["outcome"] == "fail" and (fault := endpoint_fault(ended)):
+        # the endpoint failed the agent (a 429, an outage), not the model: never scored, retried by the suite
+        row.update(outcome="error", endpoint_fault=fault)
     keep.mkdir(parents=True, exist_ok=True)
     for name in ("output.jsonl", "exit.json", "result.json", "run.json", "runner.log", "stderr.log"):
         if (run / name).exists():
@@ -594,7 +610,8 @@ def run(bench_dir: Path, out: Path, arms: dict, reps: int, seed: int, opts: dict
     for line in (out / "results.jsonl").read_text().splitlines() if (out / "results.jsonl").exists() else []:
         try:
             r = json.loads(line)
-            done.add((r["task"], r["rep"], r["arm"]))
+            if not r.get("endpoint_fault"):   # a cell the endpoint failed runs again
+                done.add((r["task"], r["rep"], r["arm"]))
         except (ValueError, KeyError, TypeError):
             continue   # a line torn by a crash: its cell runs again
     added = []

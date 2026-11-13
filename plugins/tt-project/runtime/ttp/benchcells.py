@@ -65,13 +65,15 @@ def _copy(src: Path, dest: Path) -> None:
     shutil.copytree(src, dest, symlinks=True, ignore=shutil.ignore_patterns(".git"))
 
 
-def select_env(select: list[str]) -> dict[str, str]:
+def select_env(select: list[str], base: dict | None = None) -> dict[str, str]:
     """The environment that has a plain pytest run collect only `select` ("path::name") through the
-    ttp_pytest_select plugin of the plugin running now. Added at run time, never stored in a cell: a
-    cell names no host path, so it still scores once the folder that built it is gone."""
+    ttp_pytest_select plugin of the plugin running now, laid over `base` (default this process's env).
+    Added at run time, never stored in a cell: a cell names no host path, so it still scores once the
+    folder that built it is gone."""
     from . import pushpass
-    pp = os.pathsep.join(filter(None, (str(pushpass.PLUGIN_DIR), os.environ.get("PYTHONPATH", ""))))
-    opts = " ".join(filter(None, (os.environ.get("PYTEST_ADDOPTS", ""), f"-p {pushpass.SELECT_PLUGIN}")))
+    base = os.environ if base is None else base
+    pp = os.pathsep.join(filter(None, (str(pushpass.PLUGIN_DIR), base.get("PYTHONPATH", ""))))
+    opts = " ".join(filter(None, (base.get("PYTEST_ADDOPTS", ""), f"-p {pushpass.SELECT_PLUGIN}")))
     return {"PYTHONPATH": pp, "PYTEST_ADDOPTS": opts, "TTP_PYTEST_SELECT_FILES": "\n".join(select)}
 
 

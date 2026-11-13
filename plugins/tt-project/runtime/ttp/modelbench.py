@@ -34,6 +34,7 @@ from typing import Callable
 
 DIR, LOCK, OWNER, MODELS = "model-bench", "bench.lock", "owner.json", "models.json"   # under project.HOME_DIR
 OWNER_LOCK = "owner.lock"       # every change to OWNER is made under it (owner_update)
+MODELS_LOCK = "models.lock"     # every change to MODELS is made under it (record)
 NOKEY = "model-bench-nokey"     # the alert key of a skip for want of a working key (reported once)
 BENCH_HOUR = 2                  # local hour from which today's bench is due
 DAILY = 4                       # top served ranked models benched every day
@@ -248,13 +249,19 @@ def record(scores: dict[str, tuple[float, bool, str]], now: float, source: str) 
     """Book each model's conclusive score {model: (score, weak, arm)} from `source` ("bench" or "suite") in
     MODELS: its last verdict ({"at", "date", "score", "weak", "source"}), which modelrank.parked reads, and
     for a weekly arm one more {"date", "score", "weak", "source"} in its RECHECKS last rechecks."""
-    seen = models()
-    for m, (score, weak, arm) in scores.items():
-        prev = seen.get(m) or {}
-        rec = {"date": day(now), "score": score, "weak": bool(weak), "source": source}
-        rechecks = list(prev.get("rechecks") or []) + ([rec] if arm == "weekly" else [])
-        seen[m] = {**rec, "at": now, **({"rechecks": rechecks[-RECHECKS:]} if rechecks else {})}
-    _write(home() / MODELS, seen)
+    if not scores:
+        return
+    d = home()
+    d.mkdir(parents=True, exist_ok=True)
+    with open(d / MODELS_LOCK, "a") as lk:   # a bench, a suite or its arms may book at once: none loses a model
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        seen = models()
+        for m, (score, weak, arm) in scores.items():
+            prev = seen.get(m) or {}
+            rec = {"date": day(now), "score": score, "weak": bool(weak), "source": source}
+            rechecks = list(prev.get("rechecks") or []) + ([rec] if arm == "weekly" else [])
+            seen[m] = {**rec, "at": now, **({"rechecks": rechecks[-RECHECKS:]} if rechecks else {})}
+        _write(d / MODELS, seen)
 
 
 def verdict(model: str, since: float, now: float) -> str:
