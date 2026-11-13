@@ -113,6 +113,7 @@ rates explain. It runs on the local machine; no CI is needed.
 | `network` | per task `allow_internet` (Terminal-Bench); SWE agent in main's `no-network` mode with `allow_agent_endpoint` |
 | `limits` | agent and request limits and output cap from the harness reference; runs start there |
 | `decisions` | operator answers to a blocked goal's question, e.g. a reference to use |
+| `triage_model` | the model for reply-triage sub-agents (Failure analysis); default the cheapest one the Codex install offers |
 
 Before stage 9 the operator proves the setup: Docker (or the harness's container runtime), gated dataset
 credentials, and host RAM and disk for task containers. A mode or machine change
@@ -198,11 +199,11 @@ This is iteration on the phase's failing tasks inside its time, never growth of 
 
 1. Every failed or timed-out task gets a row: cause (wrong answer or patch, anomaly, loop to the cap,
    malformed tool call, cut off while progressing, stalled, infrastructure, fetched solution) and evidence
-   (trajectory lines, tokens, time). Run datatype-sweep's Anomalies detector on every reply first: a
-   degenerate reply is `anomaly`, never `wrong` or `loop_cap` (that is an agent repeating coherent actions).
+   (trajectory lines, tokens, time), from the triage below. A degenerate reply is `anomaly`, never `wrong`
+   or `loop_cap` (that is an agent repeating coherent actions).
 2. A task that hit the agent or request limit or the output cap fails on it only if its trajectory loops
-   (`loop_cap`) or stalls (`stalled`). One cut off while progressing is rerun at ≥ 2× that limit,
-   within `run_timeout_hours`, until it finishes, loops or stalls; that result counts.
+   (`loop_cap`) or stalls (`stalled`), proven as the triage below says. One cut off while progressing is
+   rerun at ≥ 2× that limit, within `run_timeout_hours`, until it finishes, loops or stalls; that result counts.
 3. An anomaly recorded in stage 11's `doc/benchmark/anomaly_check.json` starts this procedure early; it is still
    decided on the real eval replies. Each anomaly, and a phase below its band, gets a fix attempt by $datatype-sweep's Anomalies section
    (reproducible test on the model runner, full precision, bisect, re-measure, rerun), inside the phase's
@@ -214,6 +215,30 @@ This is iteration on the phase's failing tasks inside its time, never growth of 
 5. Reruns should take about 20% of the phase's time at most.
 6. Any other single-task rerun changes the score only when the first failure was infrastructure (verifier
    setup, image pull); otherwise it is reported beside the score.
+
+Triage: script, then sub-agent, then the coordinator.
+
+- **Script** (measures, never judges). As each run or wave finishes, `scripts/reply_digest.py --log <server
+  log> --accounting <the run's per-call accounting> --out doc/agentic_evals/current/<run>/digest` reads the
+  model's own replies from the server's response log (harness files lose them: lm_eval keeps only the final
+  answer, mini-swe-agent drops capped replies) and writes per task one line per model call (tokens, finish,
+  tail compression and distinct characters, action, repeats) plus the tail of each flagged or capped reply.
+  `flag` marks a degenerate tail (thresholds in the script). Every capped or flagged reply must map to a task.
+- **Sub-agent** per failed, capped or flagged task, started as that task finishes, in parallel while the list
+  runs: fresh, no prior context, low effort, model `triage_model`; input the task statement and its digest.
+  It returns JSON `{task, verdict, first_bad_call, evidence, confidence}`, verdict one of `progressing`,
+  `looping_actions`, `repeating_tokens`, `anomaly`, `stalled`, `coherent_but_wrong`, `infra`, with evidence as
+  call ranges or quotes; save it as `digest/<task>.triage.json`.
+- **Coordinator** (this agent) decides causes, reruns and the anomaly procedure. A `flag` is anomaly evidence by
+  itself (cause `anomaly`, or a reason in the run's `flag_reasons`). For a task that hit a limit, only
+  `looping_actions`, `repeating_tokens`, `stalled` or `anomaly` with high confidence and cited calls proves it
+  did not just need more room; otherwise rerun it at a higher limit.
+
+Before the first eval run (stage 11's end or stage 12's start), send one short request through the served
+route and run `reply_digest.py --check-log --log <server log> --id <its id> --record
+doc/agentic_evals/logging_check.json`: the log must hold its body, token counts and finish reason. If it fails,
+fix response logging (a flag set to `1` where the server parses `true` once cost a run three hours) before any
+eval run.
 
 How reruns run. A task here is one eval task (one SWE instance, one GPQA question). Failed tasks are rerun
 together as one harness run per setting (the list run's command with only the failed task IDs), all started
@@ -248,10 +273,13 @@ In `doc/agentic_evals/`:
   `reference` (`value`, `source`, `reasoning`), `band_pass`, `predicted_hours`, `explained_hours`,
   `measured_hours`, `collected`, and `failures`: one row per failed task with `task`, `cause` (`wrong`,
   `anomaly`, `loop_cap`, `malformed_tool_call`, `cutoff_progressing`, `stalled`, `infrastructure`, `fetched_solution`),
-  `evidence` and `rerun` (`tried`: setting, `limits`, result; `counted`); `config.precision` (the
+  `evidence` and `rerun` (`tried`: setting, `limits`, result; `counted`); `flag_reasons` and `unmapped_reason`
+  when needed (Triage); `digest` when not `current/<run>/digest`; `config.precision` (the
   precision config file served); `anomalies` (datatype-sweep, Anomalies); plus
   `phases`: per phase `run`, `start_hour`, `pass`, and `reason` when not passed.
 - `runs.json`: the runner's append-only run records.
+- `logging_check.json` (before the first run) and `current/<run>/digest/` (`summary.json`, `<task>.json`,
+  `<task>.triage.json`).
 - `learned.json`: `best_config` per suite (the config, list size and hours of the best valid run),
   `harness_facts` and `generic_fixes`, for the next model.
 - `REPORT.md`: each phase passed or not passed yet (with the reason), scores with intervals, reasoning

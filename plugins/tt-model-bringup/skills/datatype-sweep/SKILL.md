@@ -142,10 +142,11 @@ plumbing (what `build_generator` accepts) list the options. A change is a new co
 `--build-kwargs-file` to the runners, or to the server with a restart (about 15–30 min for a large model;
 budget each one). Record the file in the run's `config.precision`.
 
-1. **Detect.** Per reply, count distinct characters and repeated n-grams in the tail (e.g. the last 4,096
-   characters). A tail of a few distinct characters, or one a repeated n-gram dominates while the head does
-   not, is an anomaly. `runtime/readiness_check/check_degenerate_output.py` catches doubled tokens and
-   collapse in runner outputs.
+1. **Detect.** On eval replies, agentic-serving's `scripts/reply_digest.py` reads every reply from the
+   server's response log and flags a degenerate tail (zlib ratio or distinct characters of the last 4,096
+   characters); a flag is an anomaly. A failed or capped task it does not flag goes to a triage sub-agent, and
+   the coordinator decides (agentic-serving, Failure analysis). `runtime/readiness_check/check_degenerate_output.py`
+   catches doubled tokens and collapse in runner outputs.
 2. **Reproduce.** From the failed trajectory take the model call that degenerated: its rendered input plus
    the reply up to the first stray token. Save it as a prompt file under `doc/agentic_evals/anomalies/` with
    the seed and sampling settings. Stop the eval server and run it on the model runner, not the eval
