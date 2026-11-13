@@ -467,11 +467,15 @@ def check_config(run: dict, validated: list, problems: list) -> None:
                                 f"that holds them is {expected}"))
     limits = config.get("limits") or {}
     reference = limits.get("reference") or {}
-    if not limits.get("source") or not all(number(limits.get(k)) and number(reference.get(k)) for k in LIMITS):
-        problems.append((2, f"run {name} config.limits needs {', '.join(LIMITS)}, their harness reference values "
-                            "and the source"))
+    # A limit the harness does not have for this suite (GPQA through lm_eval has no agent timeout) is absent from
+    # both; one recorded on only one side, or no output cap, is a missing record.
+    present = [k for k in LIMITS if k in limits or k in reference]
+    if not limits.get("source") or "output_cap_tokens" not in present or not all(
+            number(limits.get(k)) and number(reference.get(k)) for k in present):
+        problems.append((2, f"run {name} config.limits needs the output cap and each harness limit that applies "
+                            f"({', '.join(LIMITS)}), with their harness reference values and the source"))
     else:
-        for key in LIMITS:
+        for key in present:
             if limits[key] > reference[key]:
                 problems.append((1, f"run {name}: {key} {limits[key]} is above the harness reference "
                                     f"{reference[key]}; list runs start at the reference, higher limits are "

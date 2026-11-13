@@ -740,3 +740,12 @@ def test_stage_11_gate_reads_the_lengths_it_recorded_not_the_live_workload(tmp_p
     moved = evidence()
     moved['workload']['working_set_tokens'] = 35809           # what goal 12 measured later
     assert check(tmp_path, 'benchmark', moved, {}) == (0, '')
+
+
+def test_a_limit_the_suite_does_not_have_may_be_absent(tmp_path):
+    run = scored_run()
+    limits = run['config']['limits']
+    del limits['agent_timeout_s'], limits['reference']['agent_timeout_s']   # lm_eval GPQA: no agent loop
+    assert goal12(tmp_path, runs=[run]) == (0, '')
+    del limits['reference']['request_timeout_s']                            # recorded on one side only
+    assert goal12(tmp_path, runs=[run])[0] == 2
