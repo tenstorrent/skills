@@ -1,0 +1,5 @@
+---
+"tt-project": patch
+---
+
+`tt-project`: batch runs no longer ask workers for a task-number trailer in commit messages (a public repository's squash-merge carried it to main): each member hands off its own commit ids, and it counts as landed once those commits, or rebased copies, are on the push branch; with none listed, the branch's commits when the batch settles; trailer commits of older runs still count. The checks spill picker ranks hosts running none of the project's own checks first, and `checks.spill_runs_per_host` caps how many of the project's checks one spill host takes at once. The landing check time judged against `checks.smoke_max_s` leaves out the waits the harness recorded inside the run (`ttp lock` waits, a checks slot taken mid-run), so a run slow only from waiting queues no speed-up task. The run-mark guard lets reads through loop variables, globs and substitutions, and the file's name in prose, pass; code or a read loop that gets the name still counts as a write, and the refusal says how to read the file.
