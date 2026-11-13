@@ -23,6 +23,12 @@ removal included, so a list edited on that machine is never overwritten by an ol
 (`ttp machines add|set|remove`) copies it in the background, never waiting for a host that is down;
 hosts whose machine has an open known outage or the `decommissioned` tag are skipped.
 
+A tag note (`ttp machines tag-note <tag> "<text>"`) is one note for every machine with that tag: what holds
+for all machines of one kind, written once. The coordinator's Machines section shows each note of a tag
+some listed machine has, and a worker whose task names such a machine in its resources sees it too. Tag
+notes live in the same file, travel with `push` and merge tag by tag like machines (the newest change
+wins; a removed note is kept as an empty one so the removal travels too).
+
 An alias is also the machine's ssh route. `ttp machines add` (a new alias, or a changed host name)
 first asks `ssh -G <alias>`, which only reads the ssh config and never connects (route_problem): an
 alias that no Host entry maps to a HostName, ProxyJump or ProxyCommand, and that does not resolve as a
@@ -47,6 +53,7 @@ from .devq import DEVICE_MASK, MASK_RECORD, unmask_devices  # noqa: F401  (re-ex
 ALIAS_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@+-]{0,79}")   # an alias is also a resource name
 TAG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+-]{0,39}")
 NOTE_CHARS = 200
+TAG_NOTE_CHARS = 1500       # a tag note is longer than a machine note, and refused past this
 DIGEST_MACHINES = 20        # machines the digest lists at most
 TROUBLE_AT = 2              # failures in 24 h that put a resource in trouble
 WAITS_AT = 6                # or this many waits on it (it may be down, not busy)
@@ -78,11 +85,93 @@ def load() -> dict[str, dict]:
     return {k: v for k, v in _part(_doc(), "machines").items() if isinstance(v, dict)}
 
 
-def _save(machines: dict[str, dict], removed: dict[str, float]) -> None:
-    """`removed` keeps when each alias was removed, so copies elsewhere learn of the removal."""
+def _save(machines: dict[str, dict], removed: dict[str, float], notes: dict[str, dict] | None = None) -> None:
+    """`removed` keeps when each alias was removed, so copies elsewhere learn of the removal. `notes`: the
+    tag notes (None: keep the ones on file)."""
+    notes = _part(_doc(), TAG_NOTES) if notes is None else notes
     project.HOME_DIR.mkdir(parents=True, exist_ok=True)
-    project.write_json(path(), {"machines": machines, **({"removed": removed} if removed else {})})
+    project.write_json(path(), {"machines": machines, **({"removed": removed} if removed else {}),
+                                **({TAG_NOTES: notes} if notes else {})})
     os.chmod(path(), 0o600)
+
+
+TAG_NOTES = "tag_notes"     # in machines.json: {tag: {"note": str, "updated": ts, "note_until"?: ts}}
+
+
+def tag_notes(include_removed: bool = False) -> dict[str, dict]:
+    """The tag notes on file; an empty note (a removal kept so it travels) only with `include_removed`."""
+    return {t: v for t, v in _part(_doc(), TAG_NOTES).items()
+            if isinstance(v, dict) and (include_removed or str(v.get("note") or "").strip())}
+
+
+def set_tag_note(tag: str, text: str | None, until: str | None = None, where=None) -> dict:
+    """`ttp machines tag-note <tag> <text>`: one note for every machine tagged `tag` ("" removes it).
+    Whitespace runs become one space; a note over TAG_NOTE_CHARS, or one holding a key or a stored
+    secret, is refused (ValueError). `until` as for a machine note. Returns the saved entry."""
+    tag = (tag or "").strip().lower()
+    if not TAG_RE.fullmatch(tag):
+        raise ValueError(f"not a tag: {tag!r}")
+    note = " ".join(str(text or "").split())
+    if len(note) > TAG_NOTE_CHARS:
+        raise ValueError(f"a tag note holds at most {TAG_NOTE_CHARS} characters; this one has {len(note)}: "
+                         "keep only what holds for every machine with the tag")
+    from . import redact
+    if note and redact.scrub(note) != note:
+        raise ValueError("the note looks like it holds a key or a stored secret: tag notes are read by every "
+                         "project's coordinator and workers, so leave it out")
+    now = time.time()
+    entry: dict[str, Any] = {"note": note, "updated": now}
+    if note and until:
+        from .ends import parse_expires
+        entry["note_until"] = parse_expires(until, now, what="until", where=where)
+    doc = _doc()
+    notes = dict(_part(doc, TAG_NOTES))
+    notes[tag] = entry
+    _save(load(), dict(_part(doc, "removed")), notes)
+    return entry
+
+
+def tag_note_line(tag: str, n: dict, now: float | None = None) -> str:
+    """One tag note as the coordinator and `ttp machines list` show it."""
+    end = n.get("note_until")
+    when = ""
+    if isinstance(end, (int, float)):
+        when = (f" (ended {_day(end)}: may no longer hold)" if end <= (time.time() if now is None else now)
+                else f" (until {_day(end)})")
+    return f"every machine tagged {tag}: {n.get('note')}{when}"
+
+
+def _live_notes(now: float | None = None) -> dict[str, dict]:
+    """The tag notes whose `until`, if any, has not passed."""
+    now = time.time() if now is None else now
+    return {t: n for t, n in tag_notes().items()
+            if not (isinstance(n.get("note_until"), (int, float)) and n["note_until"] <= now)}
+
+
+def _tags_of(m: dict) -> list[str]:
+    try:
+        return tag_list(m.get("tags"))
+    except ValueError:
+        return []
+
+
+def task_tag_notes(resources: list[str], known: dict[str, dict] | None = None,
+                   now: float | None = None) -> list[str]:
+    """The tag notes for the machines a task names in its resources (an alias, or a resource the machine
+    shares with all projects), one line per tag with the machines it covers; [] when none applies."""
+    notes = _live_notes(now)
+    if not notes or not resources:
+        return []
+    known = load() if known is None else known
+    named = {r.strip() for r in resources if r and r.strip()}
+    hits: dict[str, list[str]] = {}
+    for alias, m in sorted(known.items()):
+        shared = m.get("shared") if isinstance(m.get("shared"), list) else []
+        if alias in named or named & set(shared):
+            for t in _tags_of(m):
+                if t in notes:
+                    hits.setdefault(t, []).append(alias)
+    return [f"- {', '.join(aliases)}: {tag_note_line(t, notes[t], now)}" for t, aliases in sorted(hits.items())]
 
 
 def tag_list(v: Any) -> list[str]:
@@ -253,7 +342,14 @@ def merge(mine: dict, theirs: dict) -> dict:
             machines[alias] = best[3]
         elif best:
             removed[alias] = best[0]
-    return {"machines": machines, **({"removed": removed} if removed else {})}
+    notes = {}
+    mine_n, their_n = _part(mine, TAG_NOTES), _part(theirs, TAG_NOTES)
+    for tag in set(mine_n) | set(their_n):   # tag by tag, the newest change wins (an empty note: a removal)
+        cands = [(_when(n.get("updated")), rank, n) for rank, n in ((1, mine_n.get(tag)), (0, their_n.get(tag)))
+                 if isinstance(n, dict)]
+        if cands:
+            notes[tag] = max(cands, key=lambda c: c[:2])[2]
+    return {"machines": machines, **({"removed": removed} if removed else {}), **({TAG_NOTES: notes} if notes else {})}
 
 
 SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15"]
@@ -453,7 +549,7 @@ def push(host: str, tries: int = 3) -> str:
 
 def _push(host: str, tries: int) -> str:
     mine = _doc()
-    if not _part(mine, "machines") and not _part(mine, "removed"):
+    if not _part(mine, "machines") and not _part(mine, "removed") and not _part(mine, TAG_NOTES):
         return "no machines list to copy"
     for _ in range(tries):
         r = _ssh([*PUSH_SSH, host, f"cat {REMOTE} 2>/dev/null || true"], capture_output=True)
@@ -847,6 +943,9 @@ def list_lines() -> list[str]:
     if machines:
         lines.append("## Machines (the user's list; use only those the charter's Resources allows; "
                      "a task on one names its alias in `resources`)")
+        notes, have = _live_notes(), {t for m in machines.values() for t in _tags_of(m)}
+        for t in sorted(set(notes) & have):   # once per tag, above the machines carrying it
+            lines.append(f"- {tag_note_line(t, notes[t])}")
         for alias in sorted(machines)[:DIGEST_MACHINES]:
             lines.append(f"- {line(alias, machines[alias])}")
         if len(machines) > DIGEST_MACHINES:

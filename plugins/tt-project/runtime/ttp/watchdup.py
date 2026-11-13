@@ -19,8 +19,11 @@ of digits counted as one number. So 'hold:3' and 'hold:4' (or 'retry 1' and 'ret
 while 'outage ended', 'drop-in', 'recovered' and '<watcher>:<box>:reboot' next to '<watcher>:<box>:fsm'
 are distinct. A keyed issue counts once each time it opens: when it is new and each time it reopens
 after a close (the reopen churn of one key), so a condition that keeps clearing and coming back warns
-too. Distinct episodes of one key count too: an issue superseded by a new episode and its successor are
-two issues of the key, each counted once, and the supersede itself is not a reopen. The warning lists the keys it counted (the first STORED_KEYS are kept), so a reader can tell
+too. A new episode of one key (screen._supersede) counts only when the episode before it was still open
+when it came, i.e. the watcher starts a new episode on every run while the condition never clears: a
+new episode after the previous one closed (cleared, or closed after a quiet run) is a distinct real
+occurrence, as references/watchers.md asks watchers to report, and is not churn. The supersede itself is
+not a reopen. The warning lists the keys it counted (the first STORED_KEYS are kept), so a reader can tell
 duplicates from distinct conditions."""
 from __future__ import annotations
 
@@ -35,8 +38,10 @@ WINDOW_S = 86400.0
 DEFAULT = 3
 KEY = "watcher_same_subject"   # kv: "<source>\n<subject>" -> {source, subject, n, at, kind, keys}
 FIX = 'give its JSON lines a stable "key" (or "whole": true), see references/watchers.md in the tt-project-harness skill'
-KEYED_FIX = 'give each condition one stable "key", not one per value or episode, see references/watchers.md in the tt-project-harness skill'
-CHURN_FIX = ('it keeps closing and reopening: report the condition on every run while it holds, see '
+KEYED_FIX = ('give each condition one stable "key", not one per value or occurrence (a new occurrence of one '
+             'condition is a new "episode" of its key), see references/watchers.md in the tt-project-harness skill')
+CHURN_FIX = ('it keeps closing and reopening, or starts a new "episode" on every run: report the condition on '
+             'every run while it holds and start a new episode only once it cleared and came back, see '
              'references/watchers.md in the tt-project-harness skill')
 NO_KEY = ""                    # the kind of every issue opened under no key
 SHOWN_KEYS = 6
@@ -77,10 +82,10 @@ def groups(db: DB, source: str, now: float, window_s: float = WINDOW_S) -> list[
         keyed_since = float(db.meta(WATCH_KEY_SINCE) or 0)
     except ValueError:
         keyed_since = 0.0
-    for r in db.q("SELECT COALESCE(subject,'') AS subject, COALESCE(watch_key,'') AS k, first_seen, reopens "
-                  "FROM issues WHERE source=? AND (first_seen>? OR COALESCE(opened,0)>?) ORDER BY first_seen, id",
-                  (source, since, since)):
-        opens = int(float(r["first_seen"] or 0) > since)
+    for r in db.q("SELECT id, COALESCE(subject,'') AS subject, COALESCE(watch_key,'') AS k, first_seen, reopens, "
+                  "episode FROM issues WHERE source=? AND (first_seen>? OR COALESCE(opened,0)>?) "
+                  "ORDER BY first_seen, id", (source, since, since)):
+        opens = int(float(r["first_seen"] or 0) > since and not _real_episode(db, source, r))
         if r["k"]:
             opens += sum(1 for t in reopen_times(r["reopens"]) if t > since)
         elif float(r["first_seen"] or 0) < keyed_since:
@@ -88,6 +93,19 @@ def groups(db: DB, source: str, now: float, window_s: float = WINDOW_S) -> list[
         if opens:
             out.setdefault((r["subject"], key_kind(r["k"], r["subject"])), []).extend([r["k"]] * opens)
     return [(subject, kind, keys) for (subject, kind), keys in out.items()]
+
+
+def _real_episode(db: DB, source: str, r) -> bool:
+    """Whether keyed issue `r` is a new episode that came after the key's previous episode closed (a real
+    new occurrence, never churn): the issue before it under the key was closed before this one opened. A
+    supersede closes a still-open issue at the very time its successor opens (screen._supersede), and
+    keeps an earlier close time."""
+    if not r["k"] or not r["episode"]:
+        return False
+    prev = db.one("SELECT episode, closed FROM issues WHERE source=? AND watch_key=? AND id<? "
+                  "ORDER BY id DESC LIMIT 1", (source, r["k"], r["id"]))
+    return bool(prev and prev["episode"] and prev["closed"] is not None
+                and float(prev["closed"]) < float(r["first_seen"] or 0))
 
 
 def reopen_times(raw) -> list[float]:

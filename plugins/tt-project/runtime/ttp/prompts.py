@@ -412,6 +412,18 @@ def _resource_line(task: dict) -> str:
     return out
 
 
+def _tag_note_lines(task: dict) -> str:
+    """The user's tag notes (machines.task_tag_notes) for the machines this task names in its resources."""
+    from . import machines
+    try:
+        labels = json.loads(task["labels"] or "[]") if task["labels"] else []
+        names = [lb.split(":", 1)[1] for lb in labels if lb.split(":", 1)[0] in ("resource", "exclusive", "read")]
+        got = machines.task_tag_notes(names)
+    except Exception:   # an unreadable machines list never stops a prompt
+        return ""
+    return ("machine notes (the user's, for every machine with the tag):\n" + "\n".join(got) + "\n") if got else ""
+
+
 def _runner_line(cfg: dict) -> str:
     from . import devq
     from .project import device_timeout_max
@@ -991,6 +1003,7 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
         + f"run dir: {RUN_DIR_MARK} ($TTP_RUN_DIR): the hand-off goes only to its result.json, never to a run "
         "dir named in earlier context\n"
         + _resource_line(task)
+        + _tag_note_lines(task)
         + _runner_line(cfg)
         + _hostmap_line(cfg)
         + f"project root: {p.root}\n"

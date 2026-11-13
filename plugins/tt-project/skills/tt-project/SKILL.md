@@ -106,6 +106,7 @@ description: "Start, connect to, and talk with a long-running tt-project: a loca
 | stop device work on one machine for every project | `ttp pause <name> --machine <alias> --reason "..." --until 2d` / `ttp resume <name> --machine <alias>` |
 | get or set up a device box, work on it over ssh | the `tt-project:setup-box` skill |
 | record their machines (shared by all projects) | `ttp machines add <alias> --tags device,...` / `ttp machines list`; say in the charter which ones the project may use. Projects on other machines (`--host`) get a merged copy on add/remove, `ttp upgrade` and `ttp machines push` |
+| note what holds for every machine of one kind (shared by all projects) | `ttp machines tag-note <tag> "<text>"` (at most 1500 characters, no secrets; `""` removes it, `--until` ends it): every coordinator sees it in its Machines section, and a worker whose task names such a machine in `resources` sees it too; copied with the machines list |
 | change caps | tell the coordinator, or `ttp config <name> budget.daily_usd 150` |
 | read a schedule | `ttp schedules <name> show <schedule>` (or `list`): read-only, writes nothing |
 | run a command schedule now | `ttp schedules <name> run <schedule>`: the daemon runs it as a timed run (records last_run), also for a sandboxed worker; prints its output, exits with its code |
