@@ -141,10 +141,10 @@ def test_watchgrace_passes_low_keyed_lines_through_and_still_holds_a_normal_faul
     assert wg.holds("normal") and wg.holds("high") and wg.holds(None) and wg.holds("bogus")
 
 
-_CANT = json.dumps({"text": "ssh to the relay timed out: check could not run", "error": True})
+_GRACE_CANT = json.dumps({"text": "ssh to the relay timed out: check could not run", "error": True})
 
 
-def _ran(p, d, status):
+def _grace_ran(p, d, status):
     """Record one run of schedule `rt` as the daemon does, and return the fix tasks it queued."""
     if not p.db.one("SELECT name FROM schedules WHERE name='rt'"):
         p.db.x("INSERT INTO schedules(name, kind, every_s, enabled, payload) VALUES(?,?,?,?,?)",
@@ -159,19 +159,19 @@ def test_watchgrace_could_not_run_lines_inside_the_grace_are_a_retry_and_a_good_
     out["stdout"] = _DOWN
     run()   # a keyed fault's clock starts
     first = p.db.kv("watch_grace:rt")["relay-route"]["first"]
-    out["stdout"] = _CANT
+    out["stdout"] = _GRACE_CANT
     for _ in range(3):   # 0, 4 and 8 min: three could-not-run runs, all inside the 10 min grace
         status = run()
         assert status == "retrying (1 lines: check could not run, inside its grace)", status
-        assert not sched.failing(status) and _ran(p, d, status) == []
+        assert not sched.failing(status) and _grace_ran(p, d, status) == []
         clock["t"] += 4 * 60
     assert _raised(p) == [] and p.db.q("SELECT id FROM issues") == []
     # the check could not run: the keyed fault's clock is kept, not restarted
     assert p.db.kv("watch_grace:rt")["relay-route"]["first"] == first
     out["stdout"] = ""   # it ran again and found nothing: both clocks end
-    assert run() == "ok (0 observations)" and _ran(p, d, "ok (0 observations)") == []
+    assert run() == "ok (0 observations)" and _grace_ran(p, d, "ok (0 observations)") == []
     assert not p.db.kv("watch_grace:rt")
-    out["stdout"] = _CANT
+    out["stdout"] = _GRACE_CANT
     clock["t"] += 60
     assert run().startswith("retrying")   # the next outage counts its grace afresh
     out["stdout"] = json.dumps({"text": "relay: in sync", "severity": "low", "key": "relay-sync"})
@@ -183,15 +183,15 @@ def test_watchgrace_could_not_run_lines_past_the_grace_fail_the_schedule_once(en
     from ttp import cli
     from ttp import schedule as sched
     p, d, clock, out, run = _grace_watcher(env, monkeypatch)
-    out["stdout"] = _CANT
+    out["stdout"] = _GRACE_CANT
     statuses = []
     for _ in range(6):   # every 5 min for 25 min
         statuses.append(run())
-        _ran(p, d, statuses[-1])
+        _grace_ran(p, d, statuses[-1])
         clock["t"] += 5 * 60
     assert [sched.failing(x) for x in statuses] == [False, False, True, True, True, True], statuses
     assert statuses[2] == "error (1 lines: check could not run)"
-    assert len(_ran(p, d, statuses[-1])) == 1   # one fix task for the stint, not one per run
+    assert len(_grace_ran(p, d, statuses[-1])) == 1   # one fix task for the stint, not one per run
     assert "(check could not run): down for" in _cli_out(cli, p, "rt")
 
 
@@ -203,5 +203,5 @@ def test_watchgrace_never_holds_a_crashed_command_or_errors_without_a_grace(env,
     assert run().startswith("error: watcher command failed rc=2")   # the script, not the route
     p2, d2, clock2, out2, run2 = _grace_watcher(env, monkeypatch, grace_min=0)
     monkeypatch.setattr(dm.schedrun, "run_group",
-                        lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, _CANT, ""))
+                        lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, _GRACE_CANT, ""))
     assert run2() == "error (1 lines: check could not run)"   # no grace_min: as before
