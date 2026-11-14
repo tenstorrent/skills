@@ -23,6 +23,7 @@ MAX_TASKS = 6          # tasks named in one text that get a line
 TITLE_CHARS = 70
 WHAT_CHARS = 100
 LINE_CHARS = 360
+FACTS_MARK = " [facts at send time from "   # note_suffix's block; a reader strips it from the sender's own words
 # `#<id>` as a task reference; the word before it (or before the first number of its run, as in
 # `ledger #1, #2 and #3`) says when it is another kind of number. A word not known either way is
 # probably a noun naming something else: its line reads `task #<id> (if meant)`.
@@ -175,7 +176,7 @@ def note_suffix(p, text: str, limit: int) -> str:
     except Exception:
         return text
     while got:
-        out = f"{text} [facts at send time from {p.name}'s records: {' | '.join(got)}]"
+        out = f"{text}{FACTS_MARK}{p.name}'s records: {' | '.join(got)}]"
         if len(out) <= limit:
             return out
         got.pop()

@@ -1451,3 +1451,16 @@ def test_ack_wait_cursor_skips_consumed_replies_and_terminal_waits_past_acknowle
                        ("received, will do", False), ("blocked on a prerequisite: the pinned image", True),
                        ("thanks", False), ("result = pending; prior run failed", False)):
         assert ackwait.terminal(text) is want, text
+    # The sender's records ride along as a [facts at send time ...] block: only its own words decide.
+    facts = " [facts at send time from peer's records: #12 'canary' status: done, landed 1a2b3c4 | #13 failed]"
+    assert ackwait.terminal("re abc: queued, a result follows later" + facts) is False
+    assert ackwait.terminal("re abc: canary done; status: done" + facts) is True
+    assert ackwait.terminal("re abc: status: failed, the image is gone" + facts) is True
+    final = f"re {fp}: the canary passed on the rerun; status: done{facts}"
+    later = f"re {fp}: acknowledged, rerunning the canary now{facts}"
+    assert upstream.send("peer", 5, p.name, later) == "sent"
+    after = [interim, upstream.note_id(p.name, result)]
+    after_args = [x for a in after for x in ("--after", a)]
+    assert _ack_wait(cli, *probe, *after_args, "--terminal") == 1, "an interim reply with facts still waits"
+    assert upstream.send("peer", 6, p.name, final) == "sent"
+    assert _ack_wait(cli, *probe, *after_args, "--terminal") == 0, "a final reply with facts is terminal"

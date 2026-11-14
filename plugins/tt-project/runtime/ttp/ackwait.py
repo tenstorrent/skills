@@ -83,7 +83,9 @@ _PENDING_RE = re.compile(r"\b(?:acknowledg\w*|ack(?:ed|s)?|received|noted|will|g
 def terminal(text: str) -> bool:
     """Whether reply `text` reads as a terminal result (done, failed, or a prerequisite it cannot pass), not
     an acknowledgement, a plan or an interim note. In doubt, not terminal: the wait goes on."""
-    text = str(text or "")
+    from .taskfacts import FACTS_MARK
+    # the sender's own words only: the appended task records ("status: done" of a task it names) are no verdict
+    text = str(text or "").split(FACTS_MARK, 1)[0]
     for m in _STATUS_RE.finditer(text):
         return bool(_TERMINAL_STATUS.match(m.group(1).strip()))   # the first status line decides
     return bool(_TERMINAL_RE.search(text)) and not _PENDING_RE.search(text)
