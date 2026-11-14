@@ -1025,8 +1025,9 @@ def test_throughput_a_self_wait_or_its_own_job_is_own_job_not_its_resource(env, 
     data = {r["task"]: json.loads(r["data"]) for r in p.db.q("SELECT task, data FROM events WHERE kind='task_waiting'")}
     assert data[ids["self"]]["wait"] == "self" and data[ids["job"]]["live"]["key"].startswith("job:")
     assert data[ids["lock"]]["wait"] == "external"
-    # Only the "lock" wait has the dispatcher's hold record; "unheld" names the same box but has none.
-    _tp_dispatch_hold(p, monkeypatch, ids["lock"], time.time(), "resource:boxA")
+    # Only the "lock" wait has the dispatcher's hold record, from the start of its wait (its resource's lane
+    # starts at the first hold, upstream note 570e5f1abd959df5); "unheld" names the same box but has none.
+    _tp_dispatch_hold(p, monkeypatch, ids["lock"], now - 2 * 3600 - 300 + 1, "resource:boxA")
     rep = throughput.measure(p.db, p.config(), now=time.time() + 1, gates={})
     assert _tp_lane(rep, "own_job")["count"] == 4
     box = _tp_lane(rep, "resource:boxA")
@@ -1930,3 +1931,46 @@ def test_throughput_labels_waits_blocked_eligible_or_execution_and_judges_only_e
     txt = throughput.text({**rep, "kept": kept})
     assert "- retry_wait (blocked; 1 with no ready record: capacity unknown):" in txt
     assert "- own_job (its own job ran):" in txt and "- deferral (blocked: could not start):" in txt
+
+
+def test_throughput_a_closed_requeue_wait_charges_a_resource_only_from_its_gate_and_first_hold(env, monkeypatch):
+    """A re-queue wait that a start_when gate held, then one hold dispatch on its resource just before it ran:
+    only the tail from that hold is the resource's; the part before the gate passed is the deferral's
+    (upstream note 570e5f1abd959df5: one hold charged the whole span to the resource)."""
+    from ttp import db as dbm, throughput
+    p = make(env)
+    now = time.time()
+    p.set_config("resources", {"boxA": 1})
+    monkeypatch.setattr(throughput, "cpu_free", lambda: (True, ""))
+    t = _tp_task(p, "on boxA", now - 10 * 3600, labels=["resource:boxA"])
+    ended = now - 9 * 3600
+    p.db.x("INSERT INTO runs(task, role, started, ended, status, note) VALUES(?,?,?,?,?,?)",
+           (t, "worker", now - 10 * 3600, ended, "ok", json.dumps({"spec_sha": "x", "pick": {}})))
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
+           (ended + 1, f"task:{t}", "task_waiting", "low", f"#{t} on boxA: its probe",
+            json.dumps({"wait": "external", "why": "hand-off", "for": "its probe"}), "handled", t))
+    dbm.record_start_passed(p.db, p.db.task(t), {"when": "test -e ready", "since": ended + 1}, now - 1000)
+    _tp_dispatch_hold(p, monkeypatch, t, now - 900, "resource:boxA")
+    _tp_run(p, t, now - 600, now - 300)
+    p.db.x("UPDATE tasks SET status='done' WHERE id=?", (t,))
+    rep = throughput.measure(p.db, p.config(), now=now, gates={})
+    box = _tp_lane(rep, "resource:boxA")
+    assert box["count"] == 1 and box["median_s"] == 300, box
+    assert _tp_lane(rep, "retry_wait")["count"] == 1   # the 100 s from the gate to its first hold
+    dfr = _tp_lane(rep, "deferral")
+    assert dfr["count"] == 1 and abs(dfr["median_s"] - (now - 1000 - (ended + 1))) <= 1, dfr
+    # The same wait with its first hold long before the gate passed is still the gate's until it passed.
+    t2 = _tp_task(p, "on boxA again", now - 10 * 3600, labels=["resource:boxA"])
+    p.db.x("INSERT INTO runs(task, role, started, ended, status, note) VALUES(?,?,?,?,?,?)",
+           (t2, "worker", now - 10 * 3600, ended, "ok", json.dumps({"spec_sha": "x", "pick": {}})))
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
+           (ended + 1, f"task:{t2}", "task_waiting", "low", f"#{t2} on boxA again: its probe",
+            json.dumps({"wait": "external", "why": "hand-off", "for": "its probe"}), "handled", t2))
+    _tp_dispatch_hold(p, monkeypatch, t2, ended + 60, "resource:boxA")
+    dbm.record_start_passed(p.db, p.db.task(t2), {"when": "test -e ready", "since": ended + 1}, now - 1000)
+    _tp_run(p, t2, now - 600, now - 300)
+    p.db.x("UPDATE tasks SET status='done' WHERE id=?", (t2,))
+    rep = throughput.measure(p.db, p.config(), now=now, gates={})
+    box = _tp_lane(rep, "resource:boxA")
+    assert box["count"] == 2 and 300 <= box["median_s"] <= box["p90_s"] <= 400, box
+    assert _tp_lane(rep, "deferral")["count"] == 2

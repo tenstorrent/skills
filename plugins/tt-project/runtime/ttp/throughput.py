@@ -436,6 +436,11 @@ def _config_hist(db: DB, since: float) -> list[dict]:
     return out
 
 
+
+# A resource wait's first hold record (or ready check) this soon after the wait could start is the
+# dispatcher's first pass over it: the whole wait is the resource's, no retry_wait sliver before it.
+HOLD_GRACE_S = 60.0
+
 def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, gates: dict | None = None,
             hist: list | None = None) -> dict:
     """The waits per lane over the last `since_s` seconds (module doc). `hist`: the config-change log's
@@ -528,8 +533,12 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
         # Started anyway (approved past it): done by its last run before the start.
         return None if start is None else max([e for e in last_end.get(dep, []) if e <= start], default=start)
 
-    def by_rule(t: dict, d: dict, why: str, w0: float, end: float, prio: int, queued: bool) -> bool:
-        """Add a wait held by a deferral, provider hold or resource label; False when none applies."""
+    def by_rule(t: dict, d: dict, why: str, w0: float, end: float, prio: int, queued: bool,
+                ready: float | None = None) -> bool:
+        """Add a wait held by a deferral, provider hold or resource label; False when none applies. A
+        resource's wait starts at the latest of its first hold dispatch in the wait, the last start_when
+        gate that passed in it and `ready` (the task's ready record): before that the gate held it (deferral)
+        or its own retry condition did (retry_wait), never the resource."""
         res = sorted({lb.split(":", 1)[1] for lb in _labels(t) if isinstance(lb, str) and ":" in lb
                       and lb.split(":", 1)[0] in ("resource", "exclusive")})
         when = str(d.get("when") or "")
@@ -551,15 +560,33 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
             res = [r for r in res if r in named or locks.canonical(cfg, r) in named]
             if not res:
                 return False
+            names = {*res, *(locks.canonical(cfg, r) for r in res)}
+            hold0 = min((ts for ts, h in res_held.get(t["id"], ()) if w0 <= ts <= end and h in names), default=w0)
+            gate = max((ts for ts, _ in passed.get(t["id"], ()) if w0 < ts <= end), default=None)
+            g0 = max(w0, gate or w0)
+            r0 = min(end, max(hold0, g0, ready if ready is not None else w0))
+            if r0 - g0 <= HOLD_GRACE_S:   # held from its first dispatch pass on: the resource's from the start
+                r0 = g0
+            if gate is not None:
+                add(lane("deferral", None, None), gate - w0, prio, w0, gate, None, False)
+            if r0 > g0:
+                add(_retry_lane(), r0 - g0, prio, g0, r0, None, False)
+            held = _covered([h for r in res for h in holds.get(r, ())], r0, end) if end > r0 else 0.0
             for r in res:
                 lim = shared.own_slots(cfg, r)
                 ln = lane(("device:" if r in devices else "resource:") + r, None if r in devices else f"resources.{r}", lim)
                 ln["note"] = ("a device lock is one slot; its box's headroom is not measurable here" if r in devices
                               else "a resource's slots size a shared machine; its headroom is not measurable here")
-                add(ln, span - held, prio, w0, end, None, queued)
+                add(ln, max(0.0, end - r0 - held), prio, r0, end, None, queued)
         else:
             return False
         return True
+
+    def _retry_lane() -> dict:
+        rl = lane("retry_wait", None, None)
+        rl["note"] = ("its own retry condition (blocked) until it was ready, then a worker slot (eligible); "
+                      "a wait with no ready record is not split and never counted against worker slots")
+        return rl
 
     # Deliberate holds per resource: the pauses in force and the ended ones (module doc).
     holds: dict[str, list[tuple[float, float]]] = {}
@@ -919,14 +946,12 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
                 elif selfw or "detach" in reason or "ttp checks" in reason or "own job" in reason:
                     lane("own_job", None, None)["note"] = "the task's own detached job or checks ran: no limit"
                     add(lanes["own_job"], w1 - w0, prio, w0, w1, None, queued)
-                elif not by_rule(t, d if queued else {}, reason, w0, w1, prio, queued):
+                elif not by_rule(t, d if queued else {}, reason, w0, w1, prio, queued, ready):
                     # Its own retry condition until the ready check saw it ready (the next run's ready_wait,
                     # or the timer of a task still queued), then a slot: only that queue time is judged
                     # against the worker slots. With no ready record the two are not told apart, and none of
                     # it counts against capacity.
-                    rl = lane("retry_wait", None, None)
-                    rl["note"] = ("its own retry condition (blocked) until it was ready, then a worker slot (eligible); "
-                                  "a wait with no ready record is not split and never counted against worker slots")
+                    rl = _retry_lane()
                     cut = min(max(ready, w0), w1) if ready is not None else None
                     if cut is None:
                         rl["unknown"] += 1
