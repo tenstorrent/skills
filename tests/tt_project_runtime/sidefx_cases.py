@@ -376,3 +376,21 @@ def test_outside_writes_stays_high_for_a_credential_path_whatever_its_class(env,
     assert len(ev) == 1 and ev[0]["severity"] == "high", [dict(e) for e in ev]
     assert json.loads(ev[0]["data"])["classes"] == {key: "mentioned only"}
     assert "mentioned only: argument to python3" in ev[0]["text"], ev[0]["text"]
+
+
+def test_outside_writes_record_names_the_scan_that_saw_a_write_no_guard_refused(tmp_path, scratch_home):
+    """A tee into a scratch folder runs (no hook blocks writes outside protected paths): its record names
+    the run-end scan as the guard that saw it, not an empty guard; a refused call keeps its guard's words."""
+    from ttp import sidefx
+    wt, rd, o = tmp_path / "wt", tmp_path / "run", tmp_path / "scratch"
+    wt.mkdir(), rd.mkdir()
+    lines = _claude_calls(("Bash", {"command": f"echo hi | tee {o}/q.txt"}), ("Bash", {"command": f"rm {o}/r"})) + [
+        {"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "t0", "content": "hi", "is_error": False},
+            {"type": "tool_result", "tool_use_id": "t1", "is_error": True,
+             "content": [{"type": "text", "text": "PreToolUse:Bash hook error: [guard]: refused"}]}]}}]
+    (rd / "output.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines))
+    got = {f["path"].rsplit("/", 1)[1]: f for f in sidefx.scan(rd, str(wt))}
+    assert got["q.txt"]["status"] == "completed" and got["q.txt"]["guard"] == sidefx.SEEN_BY, got
+    assert got["r"]["status"] == "refused" and "PreToolUse:Bash hook error" in got["r"]["guard"], got
+    assert "stopped by" not in sidefx._names([got["q.txt"]])

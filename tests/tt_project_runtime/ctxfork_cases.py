@@ -75,7 +75,10 @@ def test_a_worker_run_forks_the_coordinator_session_and_never_writes_into_it(env
         assert got["how"] == "fork", got
         assert got["tokens"] == 50000 and got["session"] == session != sid
         assert argv[argv.index("--resume") + 1] == session and "--session-id" not in argv
-        assert prompt.startswith(ctxfork.FORK_HEAD) and prompt.rstrip().endswith("TASK PROMPT")
+        # The hand-off rule comes last, after the task (a fork ended with an {"actions"} answer and no
+        # result.json, note 3ffd887187e94de1).
+        assert prompt.startswith(ctxfork.FORK_HEAD) and prompt.rstrip().endswith(ctxfork.HANDOFF_TAIL)
+        assert prompt.index("TASK PROMPT") < prompt.index(ctxfork.HANDOFF_TAIL)
         copy = cfg_dir / "projects" / re.sub(r"[^a-zA-Z0-9]", "-", str(p.root)) / f"{session}.jsonl"
         rows = [json.loads(x) for x in copy.read_text().splitlines()]
         # It ends at the last whole answer, the StructuredOutput call: the bookkeeping rows after it, the
@@ -89,6 +92,7 @@ def test_a_worker_run_forks_the_coordinator_session_and_never_writes_into_it(env
     # A lost run continuing its own session gets neither a fork nor the disk block.
     argv, prompt, got, session = run(resume=str(uuid.uuid4()))
     assert got["how"] == "resume" and not prompt.startswith(ctxfork.FORK_HEAD) and ctxfork.DISK_HEAD not in prompt
+    assert ctxfork.HANDOFF_TAIL not in prompt
 
 
 def test_the_shipped_default_forks_a_coordinator_session_of_any_size(env, monkeypatch, tmp_path):
@@ -1420,3 +1424,18 @@ def test_a_run_that_did_no_work_under_the_coordinators_role_is_not_retried_the_s
     from ttp.providers import get_provider
     got = ctxfork.prepare(p, d.cfg, get_provider("claude"), "claude", str(p.root), None, task=tid)
     assert got["how"] == "disk" and "coordinator's role" in got["why"], got
+
+    # The retry gets the hand-off rule last, saying why; a second role miss of a fork is not retried again.
+    assert ctxfork.role_misses(p, tid) == 1 and "result.json" in ctxfork.handoff_tail(ctxfork._role_missed(p, tid))
+    assert ctxfork.handoff_tail("x").startswith("Your task's last run ended under the coordinator's role (x)")
+    p.db.update_task(tid, status="running")
+    rid = p.db.x("INSERT INTO runs(task, role, provider, started, ended, status, note) VALUES(?,?,?,?,?,?,?)",
+                 (tid, "worker", "claude", time.time() - 60, time.time(), "ok",
+                  json.dumps({ctxfork.KEY: {"how": "fork", "session": "s2"}, "role_miss": "x"})))
+    run_dir = tmp_path / f"run-{tid}-2"
+    run_dir.mkdir()
+    Daemon(p.base)._finish_worker({"id": rid, "task": tid, "role": "worker",
+                                   "note": json.dumps({ctxfork.KEY: {"how": "fork", "session": "s2"}})},
+                                  RunUsage(cost_usd=0.5, final_text='{"actions": []}'), "ok", run_dir)
+    t = p.db.task(tid)
+    assert t["status"] == "failed" and "not retried again" in t["result"], (t["status"], t["result"])

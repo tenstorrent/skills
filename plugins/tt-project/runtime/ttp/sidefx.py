@@ -29,6 +29,9 @@ import shlex
 from pathlib import Path
 
 FILE = "outside.json"
+# The `guard` of a call no guard refused: the hooks block only protected and credential paths (pathguard,
+# hook.py), so a write elsewhere, such as a tee into /tmp, runs, and this run-end scan is what records it.
+SEEN_BY = "recorded by the run-end scan; no guard blocks writes outside protected paths"
 KIND = "outside_writes"
 MAX_PATHS = 15   # named in the prompt block and the event; the rest are counted
 # Under the home: config and credential folders and files (a path there makes the event high)
@@ -581,7 +584,8 @@ def _classes(it: dict, home: str, cwd: str, rd: str) -> dict[str, tuple[str, str
 def scan(run_dir: Path, cwd: str, home: str | None = None) -> list[dict]:
     """The run's calls that touched paths outside `cwd` and `run_dir`: [{"tool", "path", "class", "why",
     "status", "exit", "guard"}], each path once, in call order, from its strongest call that a guard did
-    not refuse (class and why: classify_paths(); status, exit and guard: items())."""
+    not refuse (class and why: classify_paths(); status, exit and guard: items(); a call no guard refused
+    names SEEN_BY as its guard)."""
     home = os.path.normpath(home or os.path.expanduser("~"))
     rd = str(run_dir)
     roots = [os.path.realpath(x) for x in (cwd, rd) if x] + [os.path.normpath(x) for x in (cwd, rd) if x]
@@ -592,6 +596,8 @@ def scan(run_dir: Path, cwd: str, home: str | None = None) -> list[dict]:
                 continue
             f = {"tool": it["tool"], "path": p, "class": cls, "why": why,
                  **{k: it[k] for k in ("status", "exit", "guard")}}
+            if f["status"] != "refused":
+                f["guard"] = SEEN_BY   # no hook blocks a write outside the protected paths: say who saw it
             old = found.get(p)
             if old is None or ((old["status"] == "refused", -STRENGTH[old["class"]])
                                > (f["status"] == "refused", -STRENGTH[cls])):

@@ -355,6 +355,20 @@ def role_miss(final_text: str, handoff: dict | None) -> str:
     return ""
 
 
+HANDOFF_TAIL = ("Last, before your final answer: write your hand-off to $TTP_RUN_DIR/result.json as your rules "
+                "say. Only once it is written, end with an empty actions object, {\"actions\": []}. That object "
+                "is no hand-off: a run that ends with it and no result.json did no work as far as the project "
+                "knows.")
+
+
+def handoff_tail(missed: str = "") -> str:
+    """What goes after a forked run's prompt, and after the prompt of a retry of a run that ended under the
+    coordinator's role (`missed`: role_miss's reason for that run), so the hand-off rule is the last thing
+    the run reads: the copied coordinator history ends in {"actions"} answers, which a fork imitated with
+    no result.json written (role_miss)."""
+    return (f"Your task's last run ended under the coordinator's role ({missed}). " if missed else "") + HANDOFF_TAIL
+
+
 def _role_missed(p, task: int | None) -> str:
     """Why the task's last worker or reviewer run says copying a session into it gives the coordinator's
     role ("" when it does not, role_miss)."""
@@ -363,6 +377,20 @@ def _role_missed(p, task: int | None) -> str:
     r = p.db.one("SELECT id, note FROM runs WHERE task=? AND role!='coordinator' ORDER BY id DESC LIMIT 1", (task,))
     miss = json.loads((r or {}).get("note") or "{}").get("role_miss") if r else ""
     return f"run {r['id']} ran under the coordinator's role: {miss}"[:300] if miss else ""
+
+
+def role_misses(p, task: int, before: int | None = None) -> int:
+    """How many of the task's worker or reviewer runs (before run `before`) ended under the coordinator's
+    role (role_miss): the daemon retries a fork's role miss once, with handoff_tail saying why."""
+    rows = p.db.q("SELECT note FROM runs WHERE task=? AND role!='coordinator'" + (" AND id<?" if before else ""),
+                  (task, before) if before else (task,))
+    n = 0
+    for r in rows:
+        try:
+            n += bool(json.loads(r.get("note") or "{}").get("role_miss"))
+        except (ValueError, AttributeError):
+            pass
+    return n
 
 
 def prepare(p, cfg: dict, prov, provider: str, cwd: str, env: dict | None, now: float | None = None,
