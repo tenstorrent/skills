@@ -5945,7 +5945,7 @@ def test_the_chat_bridge_maps_an_upstream_challenge_page_to_a_retryable_error_no
 def test_a_challenged_run_is_lost_to_the_network_with_a_backoff_and_opens_no_breaker(env, monkeypatch):
     from ttp import alerts
     p, run, task, _, _ = _cli_run(env, monkeypatch, "cursor", "", stderr=CHALLENGE_403 + "\n", rc=1)
-    from ttp.daemon import REFUSED_BACKOFF_S, Daemon
+    from ttp.daemon import NET_HOLD_MAX_S, REFUSED_BACKOFF_S, Daemon
     assert run["status"] == "lost" and json.loads(run["note"])["refused_net"], run["status"]
     assert alerts.breaker(p.db, "cursor") is None, "a challenge page opened the auth breaker"
     assert not p.db.q("SELECT key FROM alerts WHERE key LIKE 'auth:%'"), "the user was told it is logged out"
@@ -5954,9 +5954,11 @@ def test_a_challenged_run_is_lost_to_the_network_with_a_backoff_and_opens_no_bre
     d = Daemon(p.base)
     assert d.hold_refused("fake", "x") == REFUSED_BACKOFF_S and d.hold_refused("fake", "x") == 2 * REFUSED_BACKOFF_S
     assert d.net_held("fake") and "fake" not in (p.db.kv("net_holds") or {}), "a backoff is never kept on disk"
-    for _ in range(10):
+    for _ in range(9):
         d.hold_refused("fake", "x")
-    assert d._net_holds["fake"]["until"] - d._net_holds["fake"]["since"] <= 900
+    # The cap, compared exactly: until - since in floats is off by an ulp once the monotonic clock is large.
+    assert d.hold_refused("fake", "x") == NET_HOLD_MAX_S == 900
+    assert d._net_holds["fake"]["until"] == d._net_holds["fake"]["since"] + NET_HOLD_MAX_S
     d._net_holds["fake"]["until"] = 0
     assert not d.net_held("fake") and "fake" not in d._net_holds
 

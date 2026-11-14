@@ -54,6 +54,8 @@ if [ -n "$FAKE_SSH_DENY" ]; then
     fi;;
   esac
 fi
+# FAKE_SSH_LOADAVG=<file>: the host's /proc/loadavg, so a probe reads the fake host's load, not this machine's.
+[ -n "$FAKE_SSH_LOADAVG" ] && set -- "$(printf '%s' "$1" | sed "s#/proc/loadavg#$FAKE_SSH_LOADAVG#g")"
 # FAKE_SSH_SLOW=<host>: the tree copy to that host never ends (a stalled link).
 [ "$host" = "${FAKE_SSH_SLOW:-@none@}" ] && case "$1" in *"tar -xf -"*) exec sleep 5;; esac
 case "$1" in *"${FAKE_SSH_FAIL:-@none@}"*) echo "ssh: connection to $host lost" >&2; exit 255;; esac
@@ -447,6 +449,10 @@ def test_ttp_checks_on_a_check_host_names_it_and_waits_when_it_cannot_reach_it(e
     bin_, remote = _rc_fake_ssh(tmp_path)
     monkeypatch.setenv("PATH", f"{bin_}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("FAKE_REMOTE_TMP", str(remote))
+    # The fake ssh runs on this machine, so the probe of "box1" read this machine's load: under a busy suite
+    # the pinned-host admission waited out its bound and the run detached. The fake host has a load of its own.
+    (loadavg := tmp_path / "loadavg").write_text("0.50 0.40 0.30 1/100 1\n")
+    monkeypatch.setenv("FAKE_SSH_LOADAVG", str(loadavg))
     log = tmp_path / "where.log"
     cmd = f"pwd >> {log}"
     p.set_config("delivery.push_checks", [cmd])
