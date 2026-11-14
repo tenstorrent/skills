@@ -159,6 +159,7 @@ def take_update(run_dir: Path) -> str:
 RESULT_FILE = "result.json"
 CHECKED_FILE = "result.checked"   # the size and mtime of the result.json version last checked
 STOP_BLOCKS_FILE = "stop.blocks"  # how many times the Stop hook refused to end this run
+STOP_JOBS_FILE = "stop.jobs"      # the live jobs a done hand-off left unnamed, as last told to the worker
 # Set to 1 by the daemon for a task's worker or reviewer run, which must end with a hand-off.
 HANDOFF_GUARD_ENV = "TTP_HANDOFF_GUARD"
 MAX_STOP_BLOCKS = 2
@@ -225,6 +226,31 @@ def handoff_warning(path: Path) -> str | None:
             f"changed code, name it in {RESULT_FILE}: `\"{extchange.FIELD}\": {{\"repo\": ..., \"branch\": ..., "
             f"\"head\": ...}}`, or top-level `\"branch\"` + `\"head\"` (a 7-40 digit sha; optional `\"repo\"`). "
             f"A branch or sha named only in the summary is not read")
+
+
+def live_job_warning(run_dir: Path) -> tuple[str | None, Callable[[], None] | None]:
+    """Before a `done` hand-off is taken: the live detached jobs of this run it does not name
+    (jobstop.names_job), which the daemon stops once it is done, with how to keep or stop each; and a
+    callback recording that this set was told, so the same set is told once. (None, None) when none."""
+    from . import jobstop
+    try:
+        data = json.loads((run_dir / RESULT_FILE).read_text())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None, None
+    if not isinstance(data, dict) or data.get("status") != "done":
+        return None, None
+    left = sorted(str(rc) for rc in jobstop._live_jobs(run_dir) if not jobstop.names_job(data, rc))
+    try:
+        if not left or (run_dir / STOP_JOBS_FILE).read_text() == "\n".join(left):
+            return None, None
+    except OSError:
+        pass
+    jobs = "; ".join(f"{Path(rc).stem} ({Path(rc).parent.name}/{Path(rc).stem})" for rc in left)
+    return (f"tt-project: your hand-off is `done` while {len(left)} detached job(s) of this run still run and "
+            f"no retry_when, on_pass_cmd or next_step names them: {jobs[:800]}. Once a done hand-off is taken "
+            f"the daemon stops each such job. To keep one, hand off `waiting` with a retry_when naming "
+            f"<run>/<name> (or name it in next_step); to end one, `ttp detach --stop <name> --why ...`. If they "
+            f"may be stopped, stop again as you are."), lambda: (run_dir / STOP_JOBS_FILE).write_text("\n".join(left))
 
 
 def _result_change(run_dir: Path) -> tuple[str | None, Callable[[], None] | None]:
@@ -373,7 +399,8 @@ def post_tool_use(payload: dict) -> tuple[dict | None, Callable[[], None] | None
 
 def stop(payload: dict) -> tuple[dict | None, Callable[[], None] | None]:
     """Refuse to end a task run with no valid hand-off, at most MAX_STOP_BLOCKS times; or one whose
-    hand-off fails one of the project's hand-off checks, within its send-back cap (handoffcheck.at_stop)."""
+    hand-off fails one of the project's hand-off checks, within its send-back cap (handoffcheck.at_stop);
+    or, once per set of jobs, a `done` one leaving live detached jobs unnamed (live_job_warning)."""
     run_dir = os.environ.get("TTP_RUN_DIR")
     if (not run_dir or os.environ.get(HANDOFF_GUARD_ENV) != "1" or not os.environ.get("TTP_TASK")
             or payload.get("agent_id")):
@@ -386,7 +413,13 @@ def stop(payload: dict) -> tuple[dict | None, Callable[[], None] | None]:
             why = handoffcheck.at_stop(rd)   # its own count bounds it, also when stop_hook_active is set
         except Exception:   # a broken check or hook never holds the run: the daemon's check is the gate
             why = None
-        return ({"decision": "block", "reason": why} if why else None), None
+        if why:
+            return {"decision": "block", "reason": why}, None
+        try:
+            why, told = live_job_warning(rd)   # told once per set of unnamed jobs: a second stop is taken
+        except Exception:   # never holds the run: the daemon keeps a job the hand-off mentions (jobstop)
+            why, told = None, None
+        return ({"decision": "block", "reason": why} if why else None), told
     if payload.get("stop_hook_active"):
         return None, None
     try:

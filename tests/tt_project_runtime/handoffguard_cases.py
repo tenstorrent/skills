@@ -84,6 +84,30 @@ def test_stop_with_no_or_an_invalid_hand_off_is_refused_once_with_the_reason(mon
     assert _hook_call(monkeypatch, "Stop", {}) is None
 
 
+def test_a_done_stop_leaving_live_jobs_unnamed_is_told_once_which_will_be_stopped(monkeypatch, tmp_path):
+    """Before a done hand-off is taken, the worker learns which of its live detached jobs the daemon will
+    stop and how to keep (name it in retry_when or next_step) or stop each; a second stop is taken."""
+    from ttp import jobstop
+    run_dir = _guard_run(monkeypatch, tmp_path)
+    jobs = [run_dir / "open_std.rc", run_dir / "build.rc"]
+    monkeypatch.setattr(jobstop, "_live_jobs", lambda d: jobs if pathlib.Path(d) == run_dir else [])
+    _write_result(run_dir, json.dumps({"status": "done", "summary": "x", "next_step": f"read {run_dir.name}/build"}))
+    out = _hook_call(monkeypatch, "Stop", {"stop_hook_active": False})
+    assert out["decision"] == "block" and "1 detached job(s)" in out["reason"]
+    assert f"open_std ({run_dir.name}/open_std)" in out["reason"] and "build (" not in out["reason"]
+    assert "ttp detach --stop" in out["reason"] and "retry_when" in out["reason"] and "\n" not in out["reason"]
+    assert _hook_call(monkeypatch, "Stop", {"stop_hook_active": True}) is None, "the same jobs are told once"
+    # Naming it, or a hand-off that is not done, ends the run untold; a new unnamed job is told again.
+    for res in ({"status": "done", "summary": "x", "retry_when": f"ttp detach --check {run_dir}/open_std",
+                 "next_step": f"read {run_dir.name}/build"}, {"status": "waiting", "summary": "x", "retry_when": "true"}):
+        (run_dir / "stop.jobs").unlink(missing_ok=True)
+        _write_result(run_dir, json.dumps(res))
+        assert _hook_call(monkeypatch, "Stop", {}) is None, res
+    jobs.append(run_dir / "soak.rc")
+    _write_result(run_dir, json.dumps({"status": "done", "summary": "x"}))
+    assert _hook_call(monkeypatch, "Stop", {})["decision"] == "block"
+
+
 def test_stop_hook_active_or_a_third_stop_lets_the_run_end(monkeypatch, tmp_path):
     run_dir = _guard_run(monkeypatch, tmp_path)
     assert _hook_call(monkeypatch, "Stop", {"stop_hook_active": True}) is None

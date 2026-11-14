@@ -1116,6 +1116,26 @@ def names_job(result: dict, rc: Path) -> bool:
     return re.search(rf"(?<![\w.-])(?:{'|'.join(names)})", text) is not None
 
 
+MENTION_FIELDS = ("message", "summary", "followups")   # a done hand-off's prose that may mention a job it meant to keep
+KEPT_EVENT = "done_job_kept"
+
+
+def mentions_job(result: dict, rc: Path) -> str | None:
+    """The text around the first mention of this job's name (`<name>` or `<name>.rc`, a whole word) in a
+    hand-off's message, summary or followups, else None. names_job is what keeps a job; this only
+    catches one the worker meant to keep but named only in prose (it is kept, and the coordinator told)."""
+    rc = Path(rc)
+    if rc.suffix != ".rc" or not rc.stem:
+        return None
+    pat = re.compile(rf"(?<![\w.-]){re.escape(rc.stem)}(?![\w-])")
+    for k in MENTION_FIELDS:
+        v = result.get(k)
+        text = v if isinstance(v, str) else json.dumps(v) if v else ""
+        if m := pat.search(text):
+            return f"{k}: " + text[max(0, m.start() - 100):m.end() + 100].strip()
+    return None
+
+
 def waited_on(p: Project, rc: Path) -> int | None:
     """An open task whose hand-off names this job (names_job), else None."""
     rc = Path(rc)
@@ -1280,7 +1300,10 @@ def sweep(p: Project, now: float | None = None) -> list[dict]:
 
 def _sweep_handed_off(p: Project, now: float) -> list[dict]:
     """Stop the live jobs, across all its runs, of a task that handed off done: all but those its own
-    hand-off names or an open task waits on. A task in any other state keeps them all."""
+    hand-off names or an open task waits on. A task in any other state keeps them all. A job its done
+    hand-off mentions only in its message, summary or followups (mentions_job) is kept too, and one
+    queued event per job tells the coordinator to wait on it or stop it: a hand-off never silently loses
+    a job it meant to keep."""
     out = []
     marks = ",".join("?" * len(HANDED_OFF))
     rows = p.db.q(f"SELECT r.dir, t.id, t.status, t.result FROM runs r JOIN tasks t ON t.id=r.task "
@@ -1299,9 +1322,26 @@ def _sweep_handed_off(p: Project, now: float) -> list[dict]:
         for rc in jobs:
             if rc in kept or waited_on(p, rc) is not None:
                 continue
+            if said := mentions_job(result, rc):
+                _kept_mentioned(p, tid, rc, said)
+                continue
             if r := end(p, rc, f"task #{tid} handed off {status}", tid, "jobstop.sweep_handed_off"):
                 out.append(r)
     return out
+
+
+def _kept_mentioned(p: Project, tid: int, rc: Path, said: str) -> None:
+    """One queued event per job: task tid handed off done while this job ran, naming it only in prose."""
+    fp = f"{KEPT_EVENT}:{rc}"
+    if p.db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+        return
+    text = (f"task #{tid} handed off done while its detached job {rc.stem} still runs ({rc}). Its hand-off "
+            f"mentions the job but names it in no retry_when or next_step, so it was kept, not stopped: wait "
+            f"on it (a task whose retry_when names {rc.parent.name}/{rc.stem}) or stop it with "
+            f"`ttp detach --stop {rc} --why ...`. The hand-off's {said[:400]}")
+    data = {"task": tid, "rc": str(rc), "mention": said[:400]}
+    p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?,?)",
+           (time.time(), f"task:{tid}", KEPT_EVENT, fp, "normal", text, json.dumps(data), "queued", tid))
 
 
 # `ttp detach --stop` ----------------------------------------------------------------------------

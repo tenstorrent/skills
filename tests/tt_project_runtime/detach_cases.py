@@ -1198,6 +1198,49 @@ def test_handed_off_8_a_cancelled_or_done_tasks_jobs_are_still_reaped(env, tmp_p
             _end_group(pgid)
 
 
+def test_handed_off_9_a_job_a_done_hand_off_mentions_only_in_prose_is_kept_and_the_coordinator_told(env, tmp_path):
+    """Regression: a done hand-off whose followups named its live job while its retry_when and next_step did
+    not lost the job to the sweep. A job its message, summary or followups mention is kept, with one queued
+    event naming the task, the .rc and the text; a job it never mentions is still stopped."""
+    from ttp import jobstop, locks as lk
+    p = make(env)
+    broker = _stub_broker(tmp_path)
+    tid = p.db.add_task("done", "s", kind="work", tier="light", origin="user")
+    rc, pgid = _locked_job(p, tid, broker, name="open_std2", status="done")
+    rc2, pgid2 = _locked_job(p, tid, broker, name="loop2", status="done", lock="builddir2")
+    try:
+        p.db.update_task(tid, result=json.dumps({
+            "status": "done", "summary": "measured; the standard run goes on", "retry_when": "ttp checks --result x",
+            "next_step": "report the numbers",
+            "followups": [{"title": "read the open_std2 result", "spec": "read open_std2.rc when it ends"}]}))
+        (r,) = jobstop.sweep(p)
+        assert r["pgid"] == pgid2 and lk.any_free([lk.job_lock(rc2)])
+        _no_signal_and_alive_beside(p, pgid, rc)
+        (e,) = p.db.q("SELECT * FROM events WHERE kind=?", (jobstop.KEPT_EVENT,))
+        assert e["status"] == "queued" and e["task"] == tid and str(rc) in e["text"] and f"#{tid}" in e["text"]
+        assert "followups:" in e["text"] and "open_std2" in json.loads(e["data"])["mention"]
+        assert jobstop.sweep(p) == [] and len(p.db.q("SELECT id FROM events WHERE kind=?", (jobstop.KEPT_EVENT,))) == 1
+        # Prose naming a longer name, or only the run's folder, is no mention.
+        for text in ("open_std20 is done", "open_std2x", "x.open_std2", "stop-1"):
+            assert jobstop.mentions_job({"summary": text}, rc) is None, text
+        for res in ({"message": "kept open_std2 running"}, {"summary": "see open_std2.rc"},
+                    {"followups": [{"spec": "wait for open_std2."}]}):
+            assert jobstop.mentions_job(res, rc), res
+    finally:
+        _end_group(pgid)
+        _end_group(pgid2)
+
+
+def _no_signal_and_alive_beside(p, pgid, rc):
+    """This job got no signal and still holds its lock (another job may have been stopped)."""
+    from ttp import jobstop, locks as lk
+    assert not any(str(rc) in json.dumps(e) for e in _signal_rows(p))
+    alive = jobstop.members(pgid)
+    assert alive and all(pathlib.Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "T"
+                         for pid in alive)
+    assert not lk.any_free([lk.job_lock(rc)]) and not rc.with_suffix(".lost").exists()
+
+
 def test_a_restart_mid_stop_finishes_it_on_the_next_pass(env, tmp_path):
     from ttp import jobstop, locks as lk
     p = make(env)

@@ -9,8 +9,9 @@ own push, candidates), and its landed change adds or changes tests (addedtests.a
 the commit before its landed commits on the push branch (landing: matched to its branch head, kept
 under pushq.LANDED_REF, else walked back to the earlier landing). Candidates are scanned newest first. Excluded, with the reason: a spec that quotes the fix (QUOTE_LINES
 added lines verbatim), held-out tests that use a repository symbol the base lacks and the spec does
-not name, and (unless validation is off) a task none of whose added tests fails on the base with the
-head's test files in place and passes ROUNDS of ROUNDS runs on the head: only those fail-to-pass
+not name, held-out tests that require a name or text the change made up and the spec does not state
+(unstated: a message, or a phrase of a doc, prompt or template the change wrote), and (unless validation
+is off) a task none of whose added tests fails on the base with the head's test files in place and passes ROUNDS of ROUNDS runs on the head: only those fail-to-pass
 tests are kept. A task whose spec says its branch starts from another task's branch (PARENT) replays
 from that parent's recorded head (the spec's, else the parent's latest push queue head) up to its own
 branch head; it is excluded when the repository lacks that head or it is not under the branch head,
@@ -383,7 +384,11 @@ def unstated(repo: Path, base: str, head: str, tests: list[tuple[str, str]], spe
     """What the held-out `tests` ([(path, qualname)], with their files' other code, at `head`) require that the
     change itself introduced and `spec` never states: a config key, an attribute, keyword, function or CLI flag
     name, or a message text the tests assert. Each is new in the change's non-test files (in their added lines,
-    absent from their base versions), so a candidate could only guess it: the task is not fair. A name the
+    absent from their base versions), so a candidate could only guess it: the task is not fair. A text counts
+    as new when a code line's string literal, or the added lines of a doc, prompt or template file (any changed
+    file but Python, read as one run with whitespace collapsed, so a phrase wrapped across lines counts), hold
+    it: a test asserting a page's exact wording the spec never gives is unfair too. Only a text of MESSAGE_MIN
+    or more characters with a space in it counts, so test boilerplate never trips it. A name the
     change defines (a private helper too) counts wherever the tests' code or texts name it: called, read as an
     attribute, patched or looked up by a string, or named in a docstring or message. Sorted, one entry per item."""
     at_head, at_base = _blobs(repo, head), _blobs(repo, base)
@@ -400,6 +405,12 @@ def unstated(repo: Path, base: str, head: str, tests: list[tuple[str, str]], spe
     # the string literals of the added code lines (never a comment or a docstring): where output text lives
     literals = "\n".join(m[1] for x in lines if not x.startswith(('#', '"""', "'''"))
                          for m in _LITERAL.findall(x))
+    # a prose file's added lines (docs, prompts, templates) are all text the change wrote: one flat run, so a
+    # phrase a test asserts on the whitespace-collapsed page matches across a wrapped line
+    prose = [x for x in changed if not x.endswith(".py")]
+    if prose:
+        diff = _out(repo, "diff", "--no-renames", "-U0", base, head, "--", *prose).splitlines()
+        literals += "\n" + flat(" ".join(x[1:] for x in diff if x.startswith("+") and not x.startswith("+++")))
     # each added literal with a placeholder as a pattern (a hole matches any text) and its longest fixed part:
     # a message whose filled-in part leads ("{name} is paused") has no fixed start to match by prefix
     templates = []
@@ -411,7 +422,7 @@ def unstated(repo: Path, base: str, head: str, tests: list[tuple[str, str]], spe
     # the names the change defines in its non-test code (private ones too) that no base version of its files has
     made = {x for path in changed if path.endswith(".py") and path in at_head
             for x in _defines(repo, at_head[path]) if x not in before_words}
-    before = "\n".join(before_text)
+    before = flat("\n".join(before_text))
     words = set(re.findall(r"[\w-]+", spec))
     out: list[str] = []
 
@@ -455,11 +466,11 @@ def unstated(repo: Path, base: str, head: str, tests: list[tuple[str, str]], spe
                         # its longest start the change wrote (a plural or a name it fills in may follow)
                         part = next((x for k in range(len(part.strip(" :;,.")), MESSAGE_MIN - 1, -1)
                                      if " " in (x := part.strip(" :;,.")[:k]) and x in literals), "")
-                        if part and part not in before:
+                        if part and flat(part) not in before:
                             take(v.strip(), part)
                             break
                     else:
-                        part = next((b for t, b in templates if t.search(v[:MESSAGE_MAX]) and b not in before), "")
+                        part = next((b for t, b in templates if t.search(v[:MESSAGE_MAX]) and flat(b) not in before), "")
                         if part:
                             take(v.strip(), part)
             for name in names:   # a name the change made up: new in its added lines, in no base version

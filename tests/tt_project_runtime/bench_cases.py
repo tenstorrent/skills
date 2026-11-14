@@ -269,6 +269,30 @@ def test_bench_unstated_names_a_config_key_and_a_message_the_spec_never_gives(tm
 
 
 
+def test_bench_unstated_names_a_doc_phrase_the_test_asserts_and_the_spec_never_gives(tmp_path):
+    # The real case: a docs change adds a reference page, and its held-out test asserts exact phrases of the page
+    # (read whitespace-collapsed, so a phrase may wrap across lines). A candidate writing the page from a spec
+    # that never gives that wording could only guess it: unfair. A spec that states it verbatim is fair, a phrase
+    # the base page already had is no finding, and short or one-word strings (test boilerplate) never count.
+    from ttp import bench
+    repo, git, commit, rev = _bench_repo(tmp_path)
+    commit({"docs/index.md": "# Boards\n\nEach board has its own page.\n"}, "docs")
+    base = rev()
+    head = commit({"docs/index.md": "# Boards\n\nEach board has its own page.\n\n- [Galaxy](galaxy.md)\n",
+                   "docs/galaxy.md": "# Galaxy\n\nIt has 32 chips. One chip runs at x8\nand the others at x1.\n",
+                   "tests/test_docs.py": "import pathlib\n\n\ndef test_galaxy_page():\n"
+                   "    page = ' '.join(pathlib.Path('docs/galaxy.md').read_text().split())\n"
+                   "    index = pathlib.Path('docs/index.md').read_text()\n"
+                   "    assert 'One chip runs at x8 and the others at x1' in page\n"
+                   "    assert 'Each board has its own page' in index and 'Galaxy' in page and 'x1' in page\n"
+                   "    assert 'utf-8' and 'galaxy.md' in index\n"}, "page")
+    tests = [("tests/test_docs.py", "test_galaxy_page")]
+    vague = "Add a Galaxy reference page and link it from the index."
+    assert bench.unstated(repo, base, head, tests, vague) == ["One chip runs at x8 and the others at x1"]
+    assert bench.unstated(repo, base, head, tests, "Add docs/galaxy.md saying it has 32 chips; state that "
+                          "One chip runs at x8 and the others at x1. Link it from the index.") == []
+
+
 def test_bench_unstated_names_a_private_helper_the_change_made_up_in_every_form_the_tests_use(tmp_path):
     # The real case: the spec asks for a cache, the fix adds private helpers and the held-out tests reach them by
     # name (imported, called on the module or an object, patched by a string, read by getattr, named in a
