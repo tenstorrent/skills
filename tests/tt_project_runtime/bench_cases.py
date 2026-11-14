@@ -2104,3 +2104,109 @@ def test_bench_cell_prompt_offers_xdist_only_when_the_cells_venv_has_it_and_seed
     if importlib.util.find_spec("xdist"):
         venv = cellenv.make(tmp_path / "venv")   # the default seed
         assert benchrun.grade_workers(cellenv.env(venv, {"PATH": "/usr/bin:/bin"})) >= 1
+
+
+def _suite_source(tmp_path, name: str, landed: int, now: float):
+    """A fake project for the daily suite's draw: (name, db, repo) whose db records `landed` done code tasks
+    with a landed push (and one done task with none)."""
+    from ttp import db as dbm
+    root = tmp_path / name
+    (root / "tt-project" / "state").mkdir(parents=True)
+    d = dbm.DB(root / "tt-project" / "state" / "project.db")
+    for i in range(landed + 1):
+        tid = d.x("INSERT INTO tasks(created, updated, title, kind, status) VALUES(?,?,?,?,?)",
+                  (now - 86400, now - 86400, f"t{i}", "code", "done"))
+        if i < landed:
+            d.x("INSERT INTO push_queue(task, branch, head, target, status, created, updated, landed_sha) "
+                "VALUES(?,?,?,?,?,?,?,?)", (tid, f"b{i}", "a" * 40, "main", "landed", now, now, "b" * 40))
+    return name, d, root
+
+
+def _suite_fakes(monkeypatch, now: float):
+    """prep and cells stand-ins: prep keeps one fair task per landed task of its source's db."""
+    from ttp import bench, modelsuite
+    calls = []
+
+    def prep(db, repo, b, since, limit):
+        calls.append(("prep", Path(repo).name))
+        n = modelsuite.landed_count(db, since)
+        b.mkdir(parents=True)
+        (b / "manifest.json").write_text(json.dumps({"repo": str(repo), "tasks": [{"task": i} for i in range(n)]}))
+        (b / "manifest.sha256").write_text(hashlib.sha256((b / "manifest.json").read_bytes()).hexdigest() + "\n")
+
+    def cells(b, c, repo):
+        calls.append(("cells", Path(repo).name))
+        if not json.loads((b / "manifest.json").read_text())["tasks"]:
+            raise ValueError(f"{b} keeps no small task to build cells from")
+        c.mkdir(parents=True)
+        (c / "cells.json").write_text(json.dumps({"bench": str(b), "made": now, "cells": []}))
+        (c / "cells.sha256").write_text(hashlib.sha256((c / "cells.json").read_bytes()).hexdigest() + "\n")
+    monkeypatch.setattr(bench, "fair", lambda b: [{"task": t["task"], "fair": True}
+                                                  for t in json.loads((b / "manifest.json").read_text())["tasks"]])
+    return prep, cells, calls
+
+
+def test_model_suite_draw_falls_back_to_another_project_when_the_owner_records_no_landed_task(tmp_path, monkeypatch):
+    """The owner records no landed commit: the daily pair is built from the project here with the most landed
+    tasks, with that project's repo, never kept stale with only a log line."""
+    from ttp import modelsuite
+    now = 1_800_000_000.0
+    prep, cells, calls = _suite_fakes(monkeypatch, now)
+    owner = _suite_source(tmp_path, "owner", 0, now)
+    few, busy = _suite_source(tmp_path, "few", 3, now), _suite_source(tmp_path, "busy", 14, now)
+    faults, said = [], []
+    pair = modelsuite.refresh(tmp_path / "suite", owner[1], owner[2], now, prep=prep, cells=cells, say=said.append,
+                              others=lambda: [few, busy], owner="owner", fault=faults.append)
+    assert pair and modelsuite.folders(tmp_path / "suite") == pair
+    assert calls == [("prep", "busy"), ("cells", "busy")], calls   # the most landed first; the owner has none
+    assert json.loads((pair[0] / "manifest.json").read_text())["repo"] == str(busy[2])
+    assert not faults and any("built " + pair[0].name + " from busy" in s for s in said), said
+    assert not [x for x in (tmp_path / "suite").iterdir() if x.name.startswith(".")], "no scratch folder left"
+    # model_bench.sources names the projects to draw from, in order (the owner only if named).
+    calls.clear()
+    pair = modelsuite.refresh(tmp_path / "suite2", owner[1], owner[2], now, prep=prep, cells=cells, say=said.append,
+                              others=lambda: [few, busy], names=["few"], owner="owner")
+    assert pair and calls[-1] == ("cells", "few") and set(calls[:-1]) == {("prep", "few")}, calls   # widened, 3 < 12
+
+
+def test_model_suite_draw_with_no_landed_task_anywhere_raises_an_observation_and_notes_the_reference_project(
+        env, tmp_path, monkeypatch):
+    from ttp import cli, globalcap, modelsuite, upstream
+    now = 1_800_000_000.0
+    prep, cells, calls = _suite_fakes(monkeypatch, now)
+    owner, other = _suite_source(tmp_path, "owner", 0, now), _suite_source(tmp_path, "other", 0, now)
+    faults = []
+    assert modelsuite.refresh(tmp_path / "suite", owner[1], owner[2], now, prep=prep, cells=cells, say=lambda s: None,
+                              others=lambda: [other], owner="owner", fault=faults.append) is None
+    assert len(faults) == 1 and "building today's task pair failed" in faults[0] and "no pair to keep" in faults[0]
+    assert not calls, "a project with no landed task is never drawn from"
+    # The CLI's fault: a normal observation in the owner, and a daemon note to the project naming the reference.
+    p = make(env)
+    ref = tmp_path / "ref" / "tt-project"
+    (ref / "harness").mkdir(parents=True)
+    (ref / "harness" / "project.json").write_text(json.dumps({"model_bench": {"reference": [
+        {"provider": "claude", "model": "m-ref", "effort": "medium"}]}}))
+    (tmp_path / "plain" / "tt-project" / "harness").mkdir(parents=True)
+    (tmp_path / "plain" / "tt-project" / "harness" / "project.json").write_text("{}")
+    monkeypatch.setattr(globalcap, "local_projects", lambda skip=None: [
+        ("ref", ref / "state" / "project.db"), ("plain", tmp_path / "plain" / "tt-project" / "state" / "project.db")])
+    sent = []
+    monkeypatch.setattr(upstream, "send", lambda *a, **kw: sent.append((a, kw)) or "sent")
+    cli._bench_pair_fault(p, faults[0], now)
+    cli._bench_pair_fault(p, faults[0], now)   # the same day: one observation
+    rows = p.db.q("SELECT severity, text FROM events WHERE kind = 'observation' AND source = 'model-bench'")
+    assert [r["severity"] for r in rows] == ["normal"] and "task pair failed" in rows[0]["text"]
+    assert [x[0][2] for x in sent] == ["ref", "ref"] and sent[0][1]["sender"] == "daemon"
+
+
+def test_model_suite_draw_keeps_the_owners_own_tasks_when_it_has_enough(tmp_path, monkeypatch):
+    from ttp import modelsuite
+    now = 1_800_000_000.0
+    prep, cells, calls = _suite_fakes(monkeypatch, now)
+    owner, busy = _suite_source(tmp_path, "owner", 12, now), _suite_source(tmp_path, "busy", 30, now)
+    asked = []
+    pair = modelsuite.refresh(tmp_path / "suite", owner[1], owner[2], now, prep=prep, cells=cells, say=lambda s: None,
+                              others=lambda: asked.append(1) or [busy], owner="owner")
+    assert pair and calls == [("prep", "owner"), ("cells", "owner")], calls
+    assert not asked, "the other projects are not even read"
+    assert json.loads((pair[0] / "manifest.json").read_text())["repo"] == str(owner[2])

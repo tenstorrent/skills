@@ -1498,7 +1498,12 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    weak or parked ones weekly), plus any model named in `~/.tt-project/model-bench/requests.jsonl`
    (one `{"model": ...}` per line), benched on the next run. Each arm runs at its class's effort
    (`providers.chat.tiers.<tier>.effort`). For the `standard` class it runs 12 replay cells and 4 injection
-   cells drawn, seeded by the date, from a `ttp bench prep` bench and a `ttp bench cells` set. Each cell runs
+   cells drawn, seeded by the date, from a `ttp bench prep` bench and a `ttp bench cells` set. The daily pair is
+   built from the owner project's own landed tasks; when they give fewer than 12 fair tasks, the draw also tries
+   the other projects on the machine that record landed tasks, most landed first, each with its own repo
+   (`model_bench.sources`, a list of project names, overrides that order; their databases are only read).
+   A build that fails keeps the old pair and raises one normal observation a day in the owner project, plus a
+   note to each project whose config sets `model_bench.reference`. Each cell runs
    in a fresh copy with its own venv; held-out tests are copied in only after the run and run the way bench
    prep validated them (a test in a case file runs where its aggregator collects it), and a transcript or
    diff naming a held-out or hidden path fails the cell. The arms run side by side, one cell at a time per

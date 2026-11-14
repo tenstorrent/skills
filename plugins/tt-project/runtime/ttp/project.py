@@ -671,7 +671,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # The machine's shared daily chat model bench (benchowner.py): one project owns it and runs it at
     # bench_at home time; poke_after_h without a result pokes the owner once, take_over_after_h hands it
     # to the next project by name. opt_out: this project never owns it.
-    "model_bench": {"opt_out": False, "poke_after_h": 48, "take_over_after_h": 72, "bench_at": "02:00"},
+    "model_bench": {"opt_out": False, "poke_after_h": 48, "take_over_after_h": 72, "bench_at": "02:00",
+                    "sources": []},
     # Once a day the daemon archives (to memory/archive/, one harness commit, one low feed line) the
     # decision and fact entries, never standing ones, that every prompt has left out for at least
     # archive_hidden_days days (0 = off). `ttp memory <name> --search <words>` still finds them.

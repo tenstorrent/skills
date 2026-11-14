@@ -8964,6 +8964,35 @@ def _terminalbench_reference(p, a, cfg: dict) -> None:
                                        lambda m: tbcycle.launch(p, m, reference=True)), indent=1))
 
 
+def _bench_sources(p) -> list[tuple]:
+    """(name, read-only db, repo root) of this machine's other projects, for the daily suite's task draw
+    (modelsuite.refresh): their databases are only read."""
+    import contextlib
+    from . import globalcap, overseer
+    out = []
+    for name, db in globalcap.local_projects(skip=str(Path(p.db.path).resolve())):
+        with contextlib.suppress(Exception):   # unreadable: left out of this draw
+            out.append((name, overseer._ro_db(db), db.parent.parent.parent))
+    return out
+
+
+def _bench_pair_fault(p, text: str, now: float) -> None:
+    """A failed build of the daily suite's task pair: a normal observation here (the owner), and a daemon note
+    to each other project on this machine whose config names bench reference models (model_bench.reference)."""
+    import contextlib
+    from . import globalcap, project as projectm, upstream
+    fp = f"model-bench-pair:{time.strftime('%Y-%m-%d', time.localtime(now))}"
+    if not p.db.one("SELECT 1 FROM events WHERE fingerprint = ? AND kind = 'observation'", (fp,)):
+        p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
+               (now, "model-bench", "observation", fp, "normal", text, "queued"))
+    for name, db in globalcap.local_projects(skip=str(Path(p.db.path).resolve())):
+        with contextlib.suppress(Exception):
+            raw = json.loads((db.parent.parent / "harness" / "project.json").read_text())
+            mb = projectm.layered(raw if isinstance(raw, dict) else {}).get("model_bench") or {}
+            if name != p.name and isinstance(mb, dict) and mb.get("reference"):
+                upstream.send(p.name, None, name, text, severity="normal", now=now, sender="daemon")
+
+
 def _model_suite(p, a, now: float) -> None:
     """`ttp model-bench suite`: the daily cheat-resistant benchmark (modelsuite.py)."""
     from . import benchrun, endpoint, modelbench, modelrank, modelsuite
@@ -8996,8 +9025,12 @@ def _model_suite(p, a, now: float) -> None:
     bench_dir = Path(a.bench).expanduser().resolve() if a.bench else None
     cells_dir = Path(a.cells).expanduser().resolve() if a.cells else None
     if not (a.bench or a.cells):   # the shared folders: the newest complete pair, or say plainly there is none
+        mb = cfg.get("model_bench") if isinstance(cfg.get("model_bench"), dict) else {}
+        names = [str(n) for n in mb.get("sources") or [] if str(n).strip()] if isinstance(mb.get("sources"), list) else []
         pair = modelsuite.folders(modelbench.home()) if a.dry_run else modelsuite.refresh(
-            modelbench.home(), p.db, Path(p.root).resolve(), now, say=lambda m: print(m, file=sys.stderr))
+            modelbench.home(), p.db, Path(p.root).resolve(), now, say=lambda m: print(m, file=sys.stderr),
+            others=lambda: _bench_sources(p), names=names or None, owner=p.name,
+            fault=lambda text: _bench_pair_fault(p, text, now))
         if pair:
             bench_dir, cells_dir = pair
             print(f"model-bench suite: replay cells from {bench_dir}, injection cells from {cells_dir}", file=sys.stderr)

@@ -129,14 +129,49 @@ THIN_S = 86400                                        # a pair too thin to draw 
 _PAIR = re.compile(r"(prep|cells)-\d{8}-\d{6}")
 
 
+def landed_count(db, since: float) -> int | None:
+    """About how many done code or work tasks created since `since` a landed push reaches (the push queue's
+    pushed or landed row with its landed commit, on the task or on a review or fix that carries its change):
+    the tasks bench.prep can replay, found the way it finds them (bench._reach). Read-only; None when the
+    database cannot tell."""
+    from . import bench, landed
+    try:
+        ids = [r["id"] for r in db.q("SELECT id FROM tasks WHERE status='done' AND kind IN ('code','work') "
+                                     "AND created >= ?", (since,))]
+        pushed = db.q("SELECT task, branch FROM push_queue WHERE status IN ('pushed','landed') "
+                      "AND landed_sha IS NOT NULL AND landed_sha != ''")
+        return len(set(ids) & bench._reach(landed.Rows(db, ids), pushed)) if ids and pushed else 0
+    except Exception:   # no, an older or a locked database
+        return None
+
+
+def sources(own: tuple, others: list[tuple], since: float, names: list[str] | None = None) -> list[tuple]:
+    """The (name, db, repo) projects the daily draw builds from, in order. By default the owner first (unless
+    it surely records no landed task since `since`), then the other projects that record one, the most landed
+    first (ties by name); one with none is left out, since every task there would be excluded. `names`
+    (model_bench.sources) replaces that order: those projects as named, the owner only if named."""
+    every = [own] + [o for o in others if o[0] != own[0]]
+    if names:
+        by = {o[0]: o for o in every}
+        return [by[n] for n in dict.fromkeys(str(n) for n in names) if n in by]
+    rest = [(o, landed_count(o[1], since)) for o in every[1:]]
+    return [own][:landed_count(own[1], since) != 0] + [o for o, _ in sorted((x for x in rest if x[1]),
+                                                                            key=lambda x: (-x[1], x[0][0]))]
+
+
 def refresh(d: Path, db, repo: Path, now: float | None = None, prep: Callable | None = None,
-            cells: Callable | None = None, say: Callable[[str], None] = print) -> tuple[Path, Path] | None:
+            cells: Callable | None = None, say: Callable[[str], None] = print,
+            others: Callable[[], list[tuple]] | None = None, names: list[str] | None = None,
+            owner: str = "owner", fault: Callable[[str], None] | None = None) -> tuple[Path, Path] | None:
     """Keep a fresh folder pair for the owner's daily suite, model-free: when folders(d) has none, or its
     cells.json was made over FRESH_S ago, or over THIN_S ago and fewer than PREP_LIMIT of its tasks still pass
     bench.fair (a tightened filter drops tasks from a pair already built), build `prep-<stamp>` (`ttp bench prep --since <14 days> --limit 12`)
-    and then `cells-<stamp>` (`ttp bench cells`) under `d`. The old pair stays until the new one is complete;
-    then the older pairs this upkeep made are pruned, never the one in use. A failed build keeps the old pair
-    and says so. Returns the pair to use."""
+    and then `cells-<stamp>` (`ttp bench cells`) under `d`. The tasks come from the owner's records and repo
+    (`db`, `repo`, named `owner`); when it gives fewer than PREP_LIMIT fair tasks, also from `others()`, the
+    (name, db, repo) of the other projects here (sources(): the most landed first, or `names` in order), each
+    with its own repo, and the source with the most fair tasks is used. The old pair stays until the new one is
+    complete; then the older pairs this upkeep made are pruned, never the one in use. A failed build keeps the
+    old pair, says so and calls `fault` with why (an observation, never only a log line). Returns the pair to use."""
     from . import bench
     now = time.time() if now is None else now
     old = folders(d)
@@ -156,33 +191,77 @@ def refresh(d: Path, db, repo: Path, now: float | None = None, prep: Callable | 
             return old
     stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(now))
     b, c = d / f"prep-{stamp}", d / f"cells-{stamp}"
+    best = d / f".{b.name}.best"   # the source with the most fair tasks so far, while the next is tried
     why = ("no complete folder pair" if not old else f"fewer than {PREP_LIMIT} of {old[0].name}'s tasks are fair"
            if thin else "the folder pair is over 7 days old")
     say(f"model-bench suite: {why}"
         f", building {b.name} and {c.name}")
+    tried: list[str] = []
+    since_all = now - WIDEN_MAX_S
+
+    def queue():   # lazily: the other projects are read only when the owner falls short
+        if names:
+            yield from sources((owner, db, Path(repo)), (others or list)(), since_all, names)
+            return
+        yield from sources((owner, db, Path(repo)), [], since_all)
+        if others is not None:
+            yield from (o for o in sources((owner, db, Path(repo)), others(), since_all) if o[0] != owner)
     try:
         d.mkdir(parents=True, exist_ok=True)
-        # Draw past landed tasks until at least PREP_LIMIT fair ones remain: unfair tasks are never
-        # scored, so a bench of fewer would thin the day's cells. The lookback window widens (older
-        # landed tasks) up to WIDEN_MAX_S when the fold holds too few.
-        limit = PREP_LIMIT
-        since, window = now - SINCE_S, SINCE_S
-        for _ in range(4):   # 14d, then 28d, then 56d, then 60d at most
+        kept, faults = None, []   # (fair count, source) of `best`; why each source failed
+        for src in queue():
+            if tried == [owner] and not names:
+                say(f"model-bench suite: {owner} gives {kept[0] if kept else 0} fair task(s), fewer than "
+                    f"{PREP_LIMIT}: drawing from the other projects here too")
+            tried.append(src[0])
+            # Draw past landed tasks until at least PREP_LIMIT fair ones remain: unfair tasks are never
+            # scored, so a bench of fewer would thin the day's cells. The lookback window widens (older
+            # landed tasks) up to WIDEN_MAX_S when the fold holds too few.
+            limit = PREP_LIMIT
+            since, window = now - SINCE_S, SINCE_S
+            n = 0
+            try:
+                for _ in range(4):   # 14d, then 28d, then 56d, then 60d at most
+                    shutil.rmtree(b, ignore_errors=True)
+                    (prep or bench.prep)(src[1], Path(src[2]), b, since, limit=limit)
+                    n = sum(1 for r in bench.fair(b) if r["fair"] is not False)
+                    if n >= PREP_LIMIT or window >= WIDEN_MAX_S:
+                        break
+                    window, limit = min(2 * window, WIDEN_MAX_S), limit + PREP_LIMIT
+                    since = now - window
+            except Exception as e:   # this source cannot be drawn from: say so, try the next
+                text = str(e) if isinstance(e, bench.PrepFault) else str(e)[:300]
+                faults.append((e, f"{src[0]}: {type(e).__name__}: {text}"))
+                say(f"model-bench suite: drawing from {src[0]} failed ({type(e).__name__}: {text})")
+                n = 0
+            if n > (kept[0] if kept else 0):
+                shutil.rmtree(best, ignore_errors=True)
+                os.replace(b, best)
+                kept = (n, src)
             shutil.rmtree(b, ignore_errors=True)
-            (prep or bench.prep)(db, Path(repo), b, since, limit=limit)
-            if sum(1 for r in bench.fair(b) if r["fair"] is not False) >= PREP_LIMIT or window >= WIDEN_MAX_S:
-                break
-            window, limit = min(2 * window, WIDEN_MAX_S), limit + PREP_LIMIT
-            since = now - window
-        (cells or bench.cells)(b, c, repo=Path(repo))
+            if kept and kept[0] >= PREP_LIMIT:
+                break   # before the generator reads the next source
+        if not kept and len(tried) == 1 and faults:
+            raise faults[0][0]   # one source only: its own fault, as it was
+        if not kept:
+            raise ValueError("".join(f"{x[1]}; " for x in faults) + "no project here gives a fair landed task to "
+                             "build cells from (tried: " + (", ".join(tried) or "none") + ")")
+        os.replace(best, b)
+        if kept[1][0] != owner:
+            say(f"model-bench suite: built {b.name} from {kept[1][0]} ({kept[0]} fair task(s))")
+        (cells or bench.cells)(b, c, repo=Path(kept[1][2]))
         if folders(d) != (b, c):
             raise ValueError("the new pair is not complete")
     except Exception as e:
-        for x in (b, c):
+        for x in (b, c, best):
             shutil.rmtree(x, ignore_errors=True)
         text = str(e) if isinstance(e, bench.PrepFault) else str(e)[:300]   # its command and output tail
-        say(f"model-bench suite: building the folder pair failed ({type(e).__name__}: {text}); "
-            + (f"kept the old pair {old[0].name} and {old[1].name}" if old else "no pair to keep"))
+        kept_old = f"kept the old pair {old[0].name} and {old[1].name}" if old else "no pair to keep"
+        say(f"model-bench suite: building the folder pair failed ({type(e).__name__}: {text}); {kept_old}")
+        if fault:
+            with contextlib.suppress(Exception):   # the signal never breaks the run
+                fault(f"model-bench suite: building today's task pair failed ({type(e).__name__}: {text[:300]}); "
+                      f"{kept_old}. Tried: {', '.join(tried) or 'no project with landed tasks'}.")
         return old
     for x in d.iterdir():
         if _PAIR.fullmatch(x.name) and x.is_dir() and x not in (b, c):
