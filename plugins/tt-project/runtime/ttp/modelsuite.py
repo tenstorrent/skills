@@ -125,13 +125,15 @@ def folders(d: Path) -> tuple[Path, Path] | None:
 
 FRESH_S, SINCE_S, PREP_LIMIT = 7 * 86400, 14 * 86400, 12   # rebuild after a week, from two weeks of tasks
 WIDEN_MAX_S = 60 * 86400                              # the fair-task draw's widest lookback
+THIN_S = 86400                                        # a pair too thin to draw from is rebuilt at most daily
 _PAIR = re.compile(r"(prep|cells)-\d{8}-\d{6}")
 
 
 def refresh(d: Path, db, repo: Path, now: float | None = None, prep: Callable | None = None,
             cells: Callable | None = None, say: Callable[[str], None] = print) -> tuple[Path, Path] | None:
     """Keep a fresh folder pair for the owner's daily suite, model-free: when folders(d) has none, or its
-    cells.json was made over FRESH_S ago, build `prep-<stamp>` (`ttp bench prep --since <14 days> --limit 12`)
+    cells.json was made over FRESH_S ago, or over THIN_S ago and fewer than PREP_LIMIT of its tasks still pass
+    bench.fair (a tightened filter drops tasks from a pair already built), build `prep-<stamp>` (`ttp bench prep --since <14 days> --limit 12`)
     and then `cells-<stamp>` (`ttp bench cells`) under `d`. The old pair stays until the new one is complete;
     then the older pairs this upkeep made are pruned, never the one in use. A failed build keeps the old pair
     and says so. Returns the pair to use."""
@@ -142,11 +144,21 @@ def refresh(d: Path, db, repo: Path, now: float | None = None, prep: Callable | 
         made = old and float(json.loads((old[1] / "cells.json").read_text()).get("made") or 0)
     except (OSError, ValueError, TypeError, AttributeError):
         made = 0
+    thin = False
     if old and now - made < FRESH_S:
-        return old
+        if now - made < THIN_S:
+            return old
+        try:
+            thin = sum(1 for r in bench.fair(old[0]) if r["fair"] is not False) < PREP_LIMIT
+        except (OSError, ValueError, KeyError):
+            thin = True
+        if not thin:
+            return old
     stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(now))
     b, c = d / f"prep-{stamp}", d / f"cells-{stamp}"
-    say(f"model-bench suite: {'no complete folder pair' if not old else 'the folder pair is over 7 days old'}"
+    why = ("no complete folder pair" if not old else f"fewer than {PREP_LIMIT} of {old[0].name}'s tasks are fair"
+           if thin else "the folder pair is over 7 days old")
+    say(f"model-bench suite: {why}"
         f", building {b.name} and {c.name}")
     try:
         d.mkdir(parents=True, exist_ok=True)

@@ -2014,6 +2014,52 @@ def test_model_suite_refresh_widens_the_draw_until_enough_tasks_are_fair_and_sto
     assert modelsuite.WIDEN_MAX_S == 60 * 86400
 
 
+def test_model_suite_refresh_rebuilds_a_pair_a_tightened_filter_left_thin_at_most_daily(tmp_path, monkeypatch):
+    """user msg #2914: a pair built under an older fair filter keeps only the tasks bench.fair still passes;
+    under PREP_LIMIT of them, a pair over THIN_S old is rebuilt before its week is up; a fresh one is kept
+    (no rebuild per run), and a pair with enough fair tasks stays until it is FRESH_S old."""
+    import hashlib
+    from ttp import bench, modelsuite
+    built = []
+
+    def prep(db, repo, b, since, limit):
+        built.append(b.name)
+        b.mkdir(parents=True)
+        (b / "manifest.json").write_text(json.dumps({"tasks": [{"task": i} for i in range(limit)]}))
+        (b / "manifest.sha256").write_text(hashlib.sha256((b / "manifest.json").read_bytes()).hexdigest() + "\n")
+
+    def cells(b, c, repo):
+        c.mkdir(parents=True)
+        (c / "cells.json").write_text(json.dumps({"bench": str(b), "made": made[0], "cells": []}))
+        (c / "cells.sha256").write_text(hashlib.sha256((c / "cells.json").read_bytes()).hexdigest() + "\n")
+
+    fair_now = {"n": 12}
+    monkeypatch.setattr(bench, "fair", lambda b: [{"task": i, "fair": i < fair_now["n"]} for i in range(12)])
+    d, said = tmp_path / "suite", []
+    made = [1_800_000_000.0]
+    first = modelsuite.refresh(d, None, tmp_path, now=made[0], prep=prep, cells=cells, say=said.append)
+    assert first and len(built) == 1
+
+    fair_now["n"] = 5   # the filter tightened: 7 of the pair's 12 tasks are now unfair
+    t = made[0] + modelsuite.THIN_S - 60
+    assert modelsuite.refresh(d, None, tmp_path, now=t, prep=prep, cells=cells, say=said.append) == first
+    assert len(built) == 1   # under a day old: kept, never rebuilt on every run
+
+    t, made[0] = made[0] + modelsuite.THIN_S + 60, made[0] + modelsuite.THIN_S + 60
+    fair_now["n"] = 5
+    monkeypatch.setattr(bench, "fair", lambda b: [{"task": i, "fair": i < (5 if b == first[0] else 12)}
+                                                  for i in range(12)])
+    second = modelsuite.refresh(d, None, tmp_path, now=t, prep=prep, cells=cells, say=said.append)
+    assert second and second != first and len(built) == 2
+    assert "fewer than 12 of " + first[0].name + "'s tasks are fair" in said[-1]
+    assert not first[0].exists()   # the thin pair is pruned once the new one is complete
+
+    # Enough fair tasks: the pair stays until its week is up.
+    later = t + 3 * 86400
+    assert modelsuite.refresh(d, None, tmp_path, now=later, prep=prep, cells=cells, say=said.append) == second
+    assert len(built) == 2
+
+
 def test_model_suite_standard_draws_only_fair_tasks_and_lists_each_dropped_one_with_its_reason(tmp_path, monkeypatch):
     """standard() runs cells only for tasks whose fair verdict is not False (unknown still runs) and its
     row's task_draw names every dropped task with why."""
