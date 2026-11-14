@@ -112,7 +112,7 @@ def test_cell_agent_env_drops_every_host_path_the_namespace_does_not_hold(tmp_pa
     from ttp import benchrun, cellns
     cell = cellns.Cell("bwrap", ["bwrap", "--"], tmp_path / "home", path=f"{tmp_path}/venv/bin:/usr/bin",
                        mounts=[str(tmp_path), "/usr", "/etc", "/tmp", "/proc", "/dev"])
-    inherited = {"PWD": "/home/someone/checkout", "OLDPWD": "/var/lib/other", "LANG": "C.UTF-8",
+    inherited = {"PWD": "/srv/runner/checkout", "OLDPWD": "/var/lib/other", "LANG": "C.UTF-8",
                  "SSL_CERT_FILE": "/etc/ssl/certs/ca.pem", "TOOL": f"{tmp_path}/venv/bin/tool",
                  "MIXED": f"{tmp_path}/a:/opt/real/b", "URL": "http://127.0.0.1:8080/v1", "PATH": "/opt/x:/usr/bin"}
     env = {"CLAUDE_CONFIG_DIR": str(tmp_path / "claude-config"), "HINT": "see /opt/real/notes", "N": "3"}
