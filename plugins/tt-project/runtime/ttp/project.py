@@ -379,6 +379,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # context reaches its first prompt (or its size after the last compaction) plus
                     # compact_growth_tokens, and never so soon that it would free under compact_min_free
                     # of it, at most context_window_tokens (0: by model) less compact_margin_tokens
+                    # and, while most wakes resume cold, under a context whose cold rewrite costs
+                    # waste.wake_usd (wakecost.cold_cap)
                     # (compact_tokens above 0: a fixed size instead);
                     # row_delta false sends each changed digest section whole (else keyed lists go by row).
                     # worker_context: what a worker or reviewer run starts with (ctxfork.py): "fork" a copy of

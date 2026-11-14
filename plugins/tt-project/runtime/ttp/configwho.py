@@ -206,11 +206,17 @@ class Protected(ValueError):
     """An automated setter would change a value the user or a coordinator set."""
 
 
+def _secret(key: str, value) -> bool:
+    """A secret-looking key (SECRET_KEY) holding a value that can be a secret: a number, a flag or
+    nothing is not one (coordinator.session.compact_tokens is a size, not a token)."""
+    return bool(SECRET_KEY.search(key)) and not isinstance(value, (bool, int, float, dict, type(None)))
+
+
 def shown(key: str, value):
     """`value` as the log keeps it: secrets redacted, a long value cut to a string."""
     if isinstance(value, dict):
-        value = {k: "<redacted>" if SECRET_KEY.search(str(k)) else shown(f"{key}.{k}", v) for k, v in value.items()}
-    if SECRET_KEY.search(key.rsplit(".", 1)[-1]) and not isinstance(value, dict):
+        value = {k: "<redacted>" if _secret(str(k), v) else shown(f"{key}.{k}", v) for k, v in value.items()}
+    if _secret(key.rsplit(".", 1)[-1], value):
         return "<redacted>"
     if isinstance(value, str) and SECRET_VALUE.search(value):
         return SECRET_VALUE.sub("<redacted>", value)

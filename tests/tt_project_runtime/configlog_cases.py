@@ -195,6 +195,13 @@ def test_config_log_redacts_secret_keys_and_values():
         == "curl -H 'Authorization: <redacted>'"
     assert configwho.shown("x", "a" * 2000).endswith("...(cut)")
     assert "redacted or cut" in configwho.undo_cmd("demo", "notify.slack_token", fake)
+    # A secret-looking key holding a number, a flag or nothing is no secret: shown as it is.
+    assert configwho.shown("coordinator.session.compact_tokens", 150000) == 150000
+    assert configwho.shown("coordinator.session", {"compact_tokens": 0, "api_key": "k"}) \
+        == {"compact_tokens": 0, "api_key": "<redacted>"}
+    assert configwho.shown("x.use_token", True) is True
+    assert configwho.undo_cmd("demo", "coordinator.session.compact_tokens", 150000) \
+        == "ttp config demo coordinator.session.compact_tokens 150000"
 
 
 def test_config_breakage_watch_raises_one_event_naming_the_change_and_its_undo(env, monkeypatch):

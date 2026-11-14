@@ -7331,6 +7331,8 @@ class Daemon:
         try:
             cur = wakecost.current_row(r, usage, session, self.p.runs)
             state, text = wakecost.check(self.cfg, self.p.db, self.p.runs, state, cur)
+            state = wakecost.cold_cap(self.cfg, self.p.db, self.p.runs, state, cur, r.get("provider") or "",
+                                      str(r.get("model") or ""))
         except Exception:   # bookkeeping: the next wake checks again
             log(self.p, "coordinator wake-cost check failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
             return state

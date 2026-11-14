@@ -553,10 +553,13 @@ coordinator with that evidence.
   rejected a resume. A full context never starts a new session: the session compacts in place and
   keeps its id. The context is the last model call's prompt and answer; the compaction point is the
   session's first prompt (or its size after its last compaction, the larger) plus
-  `compact_growth_tokens` (100000), and never so soon that a compaction would free under
+  `compact_growth_tokens` (225000), and never so soon that a compaction would free under
   `compact_min_free` (0.3) of the context, judged by the size the last one left; at most the model's
   context window (`context_window_tokens`; 0 reads it from a `[1m]` model id, else no cap) less
   `compact_margin_tokens` (40000), which always forces one.
+  While most of the last 5 resumed wakes were cold (their gap outlived the prompt cache, so each one
+  rewrote the whole context), the default point is also kept under the context whose cold rewrite costs
+  `waste.wake_usd` at the project's own measured rate, never under what a compaction frees.
   `compact_tokens` above 0 (default 0) sets a fixed point instead. The older `rollover_tokens`,
   `rollover_growth_tokens` and `rollover_margin_tokens` names are still read for a project that sets
   no `compact_*` value. A resumed wake that fails is recorded as an event

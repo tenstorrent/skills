@@ -3476,6 +3476,37 @@ def test_wakecost_shrink_compacts_the_same_session_in_place_once():
     assert cs.decide(_cs_cfg(), got, "k1", "m", "high", lambda s: True, 0) == ("resume", "continued")
 
 
+def test_wakecost_cold_resumes_cap_the_default_compaction_point_at_a_wake_usd_rewrite(env):
+    """A quiet project whose wakes resume cold (gaps over the cache life) rewrites its whole context each
+    wake. Once most recent resumed wakes are cold, the default compaction point stays under the context
+    whose cold write costs waste.wake_usd at the project's measured rate, so the same session compacts in
+    place; never under what a compaction frees. A warm project, a fixed compact_tokens or wake_usd 0: no cap."""
+    from ttp import coordsession as cs, wakecost
+    p = make(env)
+    cfg = p.config()
+    cfg["waste"]["wake_usd"] = 1.5
+    cold = lambda: _cstat_run(p, time.time(), 1.875, session="resume", fc=150000, write=150000)
+    warm = lambda: _cstat_run(p, time.time(), 0.1625, session="resume", fc=150000, read=150000, write=1000)
+    cold(), cold()
+    assert "cold_cap_tokens" not in wakecost.cold_cap(cfg, p.db, p.runs, {"id": "s1"}, None, "claude")
+    cold(), cold(), warm()   # 4 of 5 cold; $1e-5 per weighted token, 1.25 per cache-write token
+    st = wakecost.cold_cap(cfg, p.db, p.runs, {"id": "s1"}, None, "claude")
+    assert st["cold_cap_tokens"] == 120000   # $1.50 / $12.50 per million cache-write tokens
+    big = _cs_state(context_tokens=130000, base_tokens=60000, cold_cap_tokens=st["cold_cap_tokens"])
+    assert cs.limit(_cs_cfg(compact_growth_tokens=225000), big) == 120000
+    assert cs.limit(_cs_cfg(compact_growth_tokens=225000), {**big, "cold_cap_tokens": 0}) == 285000
+    assert cs.decide(_cs_cfg(compact_growth_tokens=225000), big, "k1", "m", "high", lambda s: True, 0) \
+        == ("resume", "compact")   # in place: the same session, never a new one
+    after = {**big, "compact_floor": 110000}   # a compaction must free compact_min_free: no compaction loop
+    assert cs.limit(_cs_cfg(compact_growth_tokens=225000), after) == int(110000 / 0.7)
+    assert cs.limit(_cs_cfg(compact_tokens=200000), big) == 200000   # the user's fixed point wins
+    assert "cold_cap_tokens" not in wakecost.cold_cap({**cfg, "waste": {"wake_usd": 0}}, p.db, p.runs, st, None,
+                                                      "claude")
+    for _ in range(5):
+        warm()
+    assert "cold_cap_tokens" not in wakecost.cold_cap(cfg, p.db, p.runs, st, None, "claude")
+
+
 def test_wakecost_lean_digest_repeats_no_section_whose_only_change_is_an_age():
     """While over the alarm ("lean"), a section that changed only in its ages counts as unchanged: one line
     names it. Otherwise it goes whole, and a real change always does."""

@@ -7,7 +7,13 @@ calls), and the session shrinks itself: an in-place compaction is requested (coo
 once, again only after a whole further window still over) and, while the episode lasts, the digest
 sends sections whose only change is an age as unchanged (coordsession "lean"). Never a new or
 stateless session. The episode ends, and both clear, once the median is back at or under the
-threshold."""
+threshold.
+
+Separately (cold_cap), a quiet project whose wake gaps outlive the prompt cache resumes its session cold:
+each such wake rewrites the whole context at the cache-write price. When at least COLD_RATE of the last
+WINDOW resumed wakes were cold, the session state carries "cold_cap_tokens", the context size whose cold
+rewrite costs waste.wake_usd at this project's measured rate, and the default compaction point
+(coordsession.limit) stays under it, so the session compacts in place before its cold wakes get dear."""
 from __future__ import annotations
 
 import json
@@ -21,6 +27,9 @@ DEFAULT_USD = 1.0
 TOOLS_HIGH = 10          # median tool calls at which they lead the cause: each call re-reads the context
 DIGEST_SHARE = 0.25      # the digest's share of the context at which it leads the cause
 CHARS_PER_TOKEN = 4
+COLD_SHARE = 0.5         # a resumed wake whose cache writes are at least this share of its context resumed cold
+COLD_RATE = 0.5          # the share of cold resumed wakes at which the compaction point is capped
+COLD_MIN_WAKES = 3       # resumed wakes in the window needed to judge the rate
 
 
 def threshold(cfg: dict) -> float:
@@ -74,7 +83,8 @@ def _row(r, s: dict, runs_dir) -> dict:
     total = sum(int(r[k] or 0) for k in ("input_tokens", "cache_read_tokens", "cache_write_tokens"))
     context = coordstats._first_context(r) or total // (tools + 1)
     return {"id": r["id"], "usd": float(r["cost_usd"] or 0), "context": int(context),
-            "digest": int(s.get("sent_chars") or 0) // CHARS_PER_TOKEN, "tools": int(tools)}
+            "digest": int(s.get("sent_chars") or 0) // CHARS_PER_TOKEN, "tools": int(tools),
+            "mode": s.get("mode"), "write": int(r["cache_write_tokens"] or 0)}
 
 
 def current_row(r: dict, usage, session: dict, runs_dir) -> dict:
@@ -136,3 +146,40 @@ def check(cfg: dict, db, runs_dir, session_state: dict, current: dict | None = N
             st["shrink"] = True
     db.set_kv(KEY, ep)
     return st, text
+
+
+def wake_usd(cfg: dict) -> float:
+    """waste.wake_usd: the cost of one wake counted as waste above it; 0 when off."""
+    try:
+        return max(float(((cfg or {}).get("waste") or {}).get("wake_usd", 1.0) or 0), 0.0)
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def cold_rate(window: list[dict]) -> float | None:
+    """The share of the window's resumed wakes that resumed cold (cache writes at least COLD_SHARE of
+    their context); None with fewer than COLD_MIN_WAKES resumed wakes."""
+    resumed = [w for w in window if w.get("mode") == "resume" and w.get("context")]
+    if len(resumed) < COLD_MIN_WAKES:
+        return None
+    return sum(1 for w in resumed if w.get("write", 0) >= COLD_SHARE * w["context"]) / len(resumed)
+
+
+def cold_cap(cfg: dict, db, runs_dir, session_state: dict, current: dict | None, provider: str,
+             model: str = "") -> dict:
+    """The session state with "cold_cap_tokens" set to the context size whose cold rewrite costs
+    waste.wake_usd, while at least COLD_RATE of the last WINDOW resumed wakes were cold; cleared
+    otherwise (a warm project, waste.wake_usd 0, or no price known). coordsession.limit reads it."""
+    st = dict(session_state or {})
+    usd = wake_usd(cfg)
+    rate = cold_rate(wakes(db, runs_dir, current)) if usd > 0 else None
+    if rate is None or rate < COLD_RATE:
+        st.pop("cold_cap_tokens", None)
+        return st
+    from .budget import estimate_cost
+    per_mtok = estimate_cost(db, cfg, provider, model or "", {"cache_write": 1_000_000})
+    if per_mtok <= 0:
+        st.pop("cold_cap_tokens", None)
+        return st
+    st["cold_cap_tokens"] = int(usd / per_mtok * 1_000_000)
+    return st

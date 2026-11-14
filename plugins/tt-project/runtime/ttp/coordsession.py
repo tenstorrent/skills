@@ -336,7 +336,8 @@ def shrink_due(state) -> bool:
 def limit(cfg: dict, state, model: str = "") -> float:
     """The context size at which the session compacts in place: compact_tokens when above 0, else the
     session's first prompt (base_tokens) or its size after its last compaction (compact_floor), the
-    larger, plus compact_growth_tokens, and at least compact_floor / (1 - compact_min_free), at most the
+    larger, plus compact_growth_tokens, at most cold_cap_tokens while the session resumes cold
+    (wakecost.cold_cap; never under what a compaction frees, shrink_due's sizes), and at least compact_floor / (1 - compact_min_free), at most the
     context window (context_window_tokens; 0: LONG_WINDOW for a "[1m]" model, else unknown) less
     compact_margin_tokens."""
     st = state if isinstance(state, dict) else {}
@@ -353,6 +354,8 @@ def _limit(cfg: dict, st: dict, model: str) -> float:
     floor = _num(st.get("compact_floor"), 0)
     out = max(_num(st.get("base_tokens"), 0), floor) \
         + _num(s.get("compact_growth_tokens"), DEFAULTS["compact_growth_tokens"])
+    if cold := _num(st.get("cold_cap_tokens"), 0):   # quiet project resuming cold (wakecost.cold_cap): stay
+        out = min(out, max(cold, floor + SHRINK_MIN_TOKENS, SHRINK_MIN_CONTEXT))   # under a waste.wake_usd rewrite
     # A compaction is expected to come back to about the size the last one left (compact_floor): one
     # sooner would free under compact_min_free of the context, so it waits. The window cap below still
     # forces one.
