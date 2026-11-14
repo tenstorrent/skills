@@ -6418,7 +6418,7 @@ def _on_object(ao: set[str], bo: set[str]) -> bool:
     return bool(shared - _KINDS or shared and not (ao - _KINDS and bo - _KINDS))
 
 
-def _overlaps(a: str, b: str, strict: bool = False) -> bool:
+def _overlaps(a: str, b: str, strict: bool = False, old: str = "") -> bool:
     """Whether two rules are about the same thing: the same action or object, never generic words
     alone. Words of a condition clause name no object ("once CI passes" says when, not what to).
     For the guard: they share an object word (_on_object) and name no two different actions
@@ -6430,16 +6430,50 @@ def _overlaps(a: str, b: str, strict: bool = False) -> bool:
     (`strict`, a pair stays in the digest until settled by key): they name the same action
     (_same_action), and they share an object word the same way, or one names no object (a rule on
     the action alone, "Pushing is fine once CI passes", covers every object). A source cite
-    ("(user msg #N)", restriction_source) names nothing."""
+    ("(user msg #N)", restriction_source) names nothing. `old`, the item a quoted edit `b` replaces: only
+    what the edit adds counts (_edit_overlaps), since words the old item held overlapped before. A
+    sentence that bans nothing compares only with what the old item did not ban: "Never push to main"
+    rewritten as "Pushing to main is allowed" adds a permit for words the old item held."""
     a, b = restriction_source.bare(a), restriction_source.bare(b)
     aa, ao = _target(a, conditions=False)
     ba, bo = _target(b, conditions=False)
+    if old:
+        old = restriction_source.bare(old)
+        if not _BAN_RE.search(b):
+            old = " ".join(x for x in _sentences([old]) if not _BAN_RE.search(x))
+    if old:
+        return _edit_overlaps(a, (aa, ao), (ba, bo), _target(old, conditions=False), strict)
     on_object = _on_object(ao, bo)
     if strict:
         return _same_action(aa, ba) and (not ao or not bo or on_object)
     wider = "write" in aa and ba & _WRITES or "write" in ba and aa & _WRITES
     return (on_object and (not aa or not ba or _same_action(aa, ba))
             or bool(aa & ba - {_ANY, "write"}) or bool(wider) and not (ao and bo))
+
+
+def _edit_overlaps(a: str, at: tuple[set[str], set[str]], bt: tuple[set[str], set[str]],
+                   ot: tuple[set[str], set[str]], strict: bool) -> bool:
+    """_overlaps of rule `a` (its _target `at`) and a sentence of a quoted edit (`bt`), whose old item's
+    _target is `ot`. Words the old item held say nothing new: "test", "hold" or "record" shared with an
+    unrelated item overlapped it before the edit as much as after. So they overlap when the sentence takes
+    the same action `a` bans everywhere (it names no object beyond a kind of target) or on a thing `a`
+    names (_scope_names: a host, a file), whatever the old item said, or when what the edit adds does:
+    an object word it adds is one `a` is about, under no different action, or an action it adds is one
+    `a` takes (on `a`'s object, `strict`)."""
+    (aa, ao), (ba, bo), (oa, oo) = at, bt, ot
+    na, no = ba - oa, bo - oo
+    same = _same_action(aa, ba) if strict else bool(aa & ba - {_ANY, "write"})
+    if same and not ao - _KINDS or _same_action(aa, ba) and ao & bo & _scope_names(a):
+        return True
+    if no and _on_object(ao, no) and (_same_action(aa, ba) if strict else not aa or not ba or _same_action(aa, ba)):
+        return True
+    if not na:
+        return False
+    if strict:
+        return _same_action(aa, na) and (not ao or not bo or _on_object(ao, bo))
+    wider = "write" in aa and na & _WRITES or "write" in na and aa & _WRITES
+    return (_on_object(ao, bo) and _same_action(aa, na) or bool(aa & na - {_ANY, "write"})
+            or bool(wider) and not (ao and bo))
 
 
 def _restriction_items(charter: str) -> list[tuple[str, str, int]]:
@@ -6558,7 +6592,8 @@ def _append_conflicts(charter: str, section: str, text: str, quote: str = "",
     if lifts_only:
         new = [x for x in new if _may_lift(x)]
     out: list[tuple[str, str]] = []
-    hit = (lambda item, s: _lifts_item(item, s, strict)) if lifts_only else _overlaps
+    hit = ((lambda item, s: _lifts_item(item, s, strict, quote)) if lifts_only
+           else (lambda item, s: _overlaps(item, s, old=quote)))
     for item, sec, _ in _restriction_items(charter):
         if ((item, sec) not in out and not (gone and _loose(item) in gone)
                 and not _OWN_EXCEPTION_RE.search(item) and any(hit(item, s) for s in new)):
@@ -6595,13 +6630,14 @@ def _may_lift(sentence: str) -> bool:
     return bool(_PERMIT_RE.search(sentence) or _LOOSEN_RE.search(sentence))
 
 
-def _lifts_item(item: str, sentence: str, strict: bool = False) -> bool:
+def _lifts_item(item: str, sentence: str, strict: bool = False, old: str = "") -> bool:
     """Whether a sentence that may lift something (_may_lift) is about what a Restrictions item bans:
     the item bans (_BAN_RE) and the two are about the same action or object (_overlaps; `strict`: the
     same action on the same object, as for text that says it loosens no restriction). A generic verb
     ("use", "touch") names no action there: it would match every ban, so a goal saying "any view set
-    may be reordered and cached results used" would lift "Code lands on the work branch"."""
-    return bool(_BAN_RE.search(item)) and _overlaps(item, sentence, strict=strict)
+    may be reordered and cached results used" would lift "Code lands on the work branch". `old`: the item
+    a quoted edit replaces (_overlaps)."""
+    return bool(_BAN_RE.search(item)) and _overlaps(item, sentence, strict=strict, old=old)
 
 
 def _companion_clause(quote: str, text: str) -> str:
@@ -6801,22 +6837,23 @@ def _orders_banned(charter: str, section: str, text: str, quote: str = "",
     for item, sec, _ in _restriction_items(charter):
         if (item, sec) in out or (gone and _loose(item) in gone) or _OWN_EXCEPTION_RE.search(item):
             continue
-        if any(_RELEASED_RE.search(s) and _overlaps(item, s)
+        if any(_RELEASED_RE.search(s) and _overlaps(item, s, old=quote)
                or _OWN_BAN_RE.search(item) and not _OWN_BAN_RE.search(s)
-               and _same_target(item, _undelivered(s, item, delivered)) for s in new):
+               and _same_target(item, _undelivered(s, item, delivered), quote) for s in new):
             out.append((item, sec))
     return out
 
 
-def _same_target(item: str, sentence: str) -> bool:
+def _same_target(item: str, sentence: str, old: str = "") -> bool:
     """Whether a sentence takes the action of a ban `item` on its object: _overlaps strict, or, when
     neither names an action it knows ("power cycle", "reflash"), every object word of the item but the
     names it lists (_scope_names) is in the sentence, with one of those names if it lists any: a ban on
-    a list of hosts bans each one, so "Reflash host-d" meets "Do not reflash host-b, host-c or host-d"."""
-    if _overlaps(item, sentence, strict=True):
+    a list of hosts bans each one, so "Reflash host-d" meets "Do not reflash host-b, host-c or host-d".
+    `old`: the item a quoted edit replaces; a sentence adding no word to it takes no new target."""
+    if _overlaps(item, sentence, strict=True, old=old):
         return True
     (ia, io), (sa, so) = (_target(restriction_source.bare(x), conditions=False) for x in (item, sentence))
-    if ia or sa or not io:
+    if ia or sa or not io or old and not so - _target(restriction_source.bare(old), conditions=False)[1]:
         return False
     names = _scope_names(item) & io
     return io - names <= so and (not names or bool(names & so))
@@ -6826,8 +6863,8 @@ def _conflict_reason(item: str, text: str, quote: str = "") -> str:
     """One line on why `text` conflicts with a Restrictions sentence `item`: what the item bans that a
     sentence of the text may permit, or what both rule on (their shared action and object words)."""
     news = _quoted_news(quote, _sentences(text.splitlines())) or [text]
-    lift = next((x for x in news if _may_lift(x) and _lifts_item(item, x)), "")
-    s = lift or next((x for x in news if _overlaps(item, x)), news[0])
+    lift = next((x for x in news if _may_lift(x) and _lifts_item(item, x, old=quote)), "")
+    s = lift or next((x for x in news if _overlaps(item, x, old=quote)), news[0])
     (ia, io), (sa, so) = (_target(restriction_source.bare(x), conditions=False) for x in (item, s))
     shared = ", ".join(sorted((ia & sa | io & so) - {_ANY})[:4])
     what = f" ({shared})" if shared else ""
@@ -6901,6 +6938,20 @@ def _ordered_work(charter: str, text: str, names: set[str], unsaid: list[str], s
     return ""
 
 
+def _bans_in_scope(other: str, text: str, names: set[str]) -> bool:
+    """Whether Restrictions item `other` bans what exception `text` permits on a name of its scope `names`:
+    it names one of them and bans any action there ("never touch"), the exception's own action, or, when
+    neither names a known action, the same thing beyond names and kinds of target. Sharing a name alone is
+    no contradiction: "No device tests on node-7 outside the lock" keeps its ban beside an exception that
+    lets workers power cycle node-7, and workers obey both."""
+    if not _scope_names(other) & names:
+        return False
+    (oa, oo), (ta, to) = (_target(restriction_source.bare(x), conditions=False) for x in (other, text))
+    if _ANY in oa or oa and ta and _same_action(oa, ta):
+        return True
+    return not oa and not ta and bool((oo & to) - names - _KINDS)
+
+
 def _scoped_exception(charter: str, section: str, text: str, clause: str, sourced: str,
                       end: dict | None, said: str = "", accepted: dict | None = None) -> tuple[str, str]:
     """Check a Restrictions charter_update sent with `excepts` (the clause of a standing Restrictions
@@ -6909,8 +6960,8 @@ def _scoped_exception(charter: str, section: str, text: str, clause: str, source
     `source` cite to a user message, or relayer-ordered with agent mode on), else `sourced` is the
     reason it is not; the text may permit what the clause bans; it names a scope the clause does not
     (_scope_names: hosts, resources, actions, a time window, or an end) and no general word
-    (_GENERAL_RE); and no other standing ban it may lift names a thing in that scope (an exception
-    wider than a ban another item keeps); every name of that scope is in the user's words `said`, or it is
+    (_GENERAL_RE); and no other standing ban it may lift bans the same action on a thing in that
+    scope (_bans_in_scope: an exception wider than a ban another item keeps; a shared name alone is not); every name of that scope is in the user's words `said`, or it is
     ordered work with no new risk class (_ordered_work). `accepted`, when given, receives its scope.
     Other bans it may lift that name none of its scope hold
     alongside (the note lists them). The stored text names the clause and its precedence
@@ -6947,7 +6998,7 @@ def _scoped_exception(charter: str, section: str, text: str, clause: str, source
                          f"exception covers only what they named, {why}")
     wider = [(s, sc, sorted(_scope_names(s) & names)) for s, sc in _append_conflicts(charter, section, text,
                                                                                   lifts_only=True)
-             if s != item and _scope_names(s) & names]
+             if s != item and _bans_in_scope(s, text, names)]
     if wider:
         raise ValueError(head + "it is wider than a ban another item keeps: " + "; ".join(
             f"\"{clip(restriction_source.bare(s).strip(), 200)}\" (section {sc!r}): it still bans "
@@ -8443,14 +8494,14 @@ def _use_charter_approval(p: Project, rid: str, key: str | None) -> None:
 # with it: a test fails when the source of CHARTER_GUARD_FUNCS no longer has CHARTER_GUARD_PIN's
 # sha256. A user's change that failed under an older guard for another reason than the guard
 # (reraise_charter_changes) is then raised at once.
-CHARTER_GUARD_VERSION = 21
+CHARTER_GUARD_VERSION = 22
 CHARTER_GUARD_FUNCS = ("_reject_contradicting_append", "_append_conflicts", "_overlaps", "_on_object", "_quote_hits",
                        "_item_quote_hits", "_items", "_norm", "_may_lift", "_lifts_item", "_companion_clause",
                        "_ref_ids", "_companion_exception", "_changed_sentences", "_quoted_news",
                        "_charter_approval", "_ask_charter_approval", "_conflict_reason", "_scope_names",
                        "_scoped_exception", "_excepted_item", "_orders_banned",
-                       "_same_target", "_delivery_names", "_undelivered")
-CHARTER_GUARD_PIN = (21, "5819648beb285c562e722ffb1e3ff8199208e292a222cc1d863131e59f79faf9")
+                       "_same_target", "_delivery_names", "_undelivered", "_edit_overlaps", "_bans_in_scope")
+CHARTER_GUARD_PIN = (22, "43e8b0af354d3822638537d94f92b6c9bc745c14bc8baad584e3c093452fefd9")
 CHARTER_RERAISE_KEY = "charter_reraise"   # kv: {"version", "ts"} of the last re-raise pass
 
 
