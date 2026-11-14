@@ -348,6 +348,28 @@ def test_a_partial_whose_missing_cells_no_hop_can_produce_gets_no_hop_and_a_reco
     assert done["status"] == "queued"   # the coordinator sees the reason
 
 
+def test_a_continue_hop_whose_every_missing_cell_is_unrunnable_or_rejected_queues_no_further_hop(env):
+    # A `continue:` hop that ran nothing new: its one missing cell belongs to work it must not duplicate.
+    # Neither the unrunnable reason nor a tried rejection of that cell may make the done path hop again.
+    p = make(env)
+    spec = "Finish the re-measure.\ncells: measure-after"
+    first = p.db.add_task("re-measure", spec, kind="work")
+    p.db.update_task(first, status="done")
+    for extra in ({"cells_unrunnable": {"measure-after": "owned by a later task that runs it once the change lands"},
+                   "tried": [{"title": "run measure-after in this hop", "outcome": "rejected",
+                              "result": "duplicate of the later task"}]},
+                  {"tried": [{"title": "measure-after", "outcome": "rejected", "result": "duplicate of the later task"}]}):
+        res = {"status": "done", "summary": "ran nothing new", "cells": {"ref-cache": "done"}, **extra}
+        tid, done = _finish_cells(env, p, spec, res, kind="work", title="continue: missing cells of re-measure",
+                                  parent=first)
+        got = load_result(p.db.task(tid)["result"])
+        assert got["summary"].startswith("partial: 0 of 1 cells (missing: measure-after)."), got["summary"]
+        assert _hop_cells_of(p, tid) is None and got["followups"] == [], extra
+        assert not p.db.q("SELECT id FROM tasks WHERE parent=?", (tid,))
+        assert len(got["cells_no_hop"]) == 1 and got["cells_no_hop"][0].startswith("measure-after: ")
+        assert "No continue hop for missing cells" in done["text"]
+
+
 def test_a_mixed_partial_hops_only_for_its_runnable_unowned_cells(env):
     p = make(env)
     p.db.add_task("work: run model-c", "Run it.\ncells: model-c lo", kind="work")
