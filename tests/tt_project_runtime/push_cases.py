@@ -20936,7 +20936,7 @@ def test_ttp_stats_landing_shows_runs_cpu_hours_and_dollars_per_landed_change(en
         _pq_row(p, rid, now, status="pushed", batch=f"b{i}", age=3600 + mins * 60)
     for scope, cpu, cost in ((["c: targeted: 1 case files"], 360.0, 1.5), (["c: full: --full"], 3240.0, 2.5),
                              (None, None, 1.0)):
-        p.db.x("INSERT INTO runs(task, role, started, ended, cost_usd) VALUES(?,?,?,?,?)",
+        run = p.db.x("INSERT INTO runs(task, role, started, ended, cost_usd) VALUES(?,?,?,?,?)",
                      (rid, "worker", now - 1800, now - 1700, cost))
         if scope is not None:
             (p.runs / str(run)).mkdir(parents=True, exist_ok=True)
