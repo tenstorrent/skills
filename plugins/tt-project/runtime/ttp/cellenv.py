@@ -23,7 +23,9 @@ import sys
 from importlib import metadata
 from pathlib import Path
 
-SEED = ("pytest",)
+# pytest-xdist rides along where the host interpreter has it (_copy skips a missing one), so the cell's
+# agent and its grade can run tests in parallel (benchrun.grade_workers) without a package index.
+SEED = ("pytest", "pytest-xdist")
 # PYTEST_ADDOPTS and PYTEST_PLUGINS: a cell's pytest runs as on its own, never with the options or
 # plugins (and their import paths) of a pytest that started the run.
 DROP = ("PIP_USER", "PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV", "PYTEST_ADDOPTS", "PYTEST_PLUGINS")

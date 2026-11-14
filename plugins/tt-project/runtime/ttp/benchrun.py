@@ -46,16 +46,21 @@ PROMPT = ("You are working in the git repository in your current directory. Do t
           "hang guard, so plan for far less. Run only focused tests: the test files for the code you changed "
           "(`python3 -m pytest -q <test file>`), or `python3 -m pytest -q <test file> -k <name>` for the tests "
           "of the functions you touched. The repository's whole suite may take longer than your time; run it "
-          "only if you know it fits. pytest-xdist is installed: append `-n <N>` (N up to half this machine's "
-          "cores) to run the tests in parallel. When you are done, write "
+          "only if you know it fits.{xdist} When you are done, write "
           '{{"status": "done", "summary": "<what you changed>"}} (or "failed" with why) to '
           "$TTP_RUN_DIR/result.json.\n\n## Task\n\n{spec}\n")
 
 
-def prompt(spec: str, opts: dict) -> str:
-    """The cell agent's prompt: the task's spec, its time limit and a focused test command."""
-    cores = max(1, (os.cpu_count() or 2) // 2)
-    return PROMPT.format(spec=spec, limit_min=max(1, int(float(opts.get("timeout_s") or 1800) // 60)), N=cores)
+XDIST_LINE = (" pytest-xdist is installed: append `-n {n}` (or fewer) to a pytest command to run its tests in "
+              "parallel.")
+
+
+def prompt(spec: str, opts: dict, xdist_n: int = 0) -> str:
+    """The cell agent's prompt: the task's spec, its time limit and a focused test command. The parallel
+    test line appears only when the cell's venv imports pytest-xdist (`xdist_n`, its grant), never as a
+    claim the agent's pytest would refuse."""
+    return PROMPT.format(spec=spec, limit_min=max(1, int(float(opts.get("timeout_s") or 1800) // 60)),
+                         xdist=XDIST_LINE.format(n=xdist_n) if xdist_n else "")
 CHEAT = re.compile(r"\bgit\s+(fetch|clone|pull|ls-remote|remote\s+add)\b|\bgit\s+log\s+--all\b|\bgh\s+(api|repo|pr)\b")
 TEST_CMD = "python3 -m pytest -q -p no:cacheprovider"
 ISOLATE = True   # each cell's agent runs in a mount namespace (cellns.py); only tests turn this off (opts["isolate"])
@@ -459,7 +464,7 @@ def grade_workers(env: dict) -> int:
     than its free ones), else 0 (no xdist: plain serial pytest)."""
     from . import checkcap, testslots
     py = str(Path(env["VIRTUAL_ENV"]) / "bin" / "python") if env.get("VIRTUAL_ENV") \
-        else (env.get("PATH").split(os.pathsep) or ["python3"])[0] + "/python"
+        else shutil.which("python3", path=env.get("PATH") or os.defpath) or "python3"
     try:
         has = subprocess.run([py, "-c", testslots.XDIST_PROBE], capture_output=True, env=env,
                               timeout=30, stdin=subprocess.DEVNULL).returncode == 0
@@ -644,7 +649,7 @@ def run_cell(bench_dir: Path, out: Path, task: dict, cell: dict, arm: dict, opts
             conf, logins = scratch_home(arm["provider"], tmp, not opts.get("dry_run")) \
                 if opts.get("scratch_home", True) else ({}, [])
             own = session_dirs(ws, conf.get("CLAUDE_CONFIG_DIR"))
-        prov, wall, hung = launch(run, ws, prompt(spec, opts), arm, opts, cfg, hidden, cell_env, conf, own,
+        prov, wall, hung = launch(run, ws, prompt(spec, opts, grade_workers(cell_env)), arm, opts, cfg, hidden, cell_env, conf, own,
                                   cell)
         row["wall_s"] = wall
         if hung:   # the supervisor itself hung: its watchdog ends the agent; what it spent so far still counts
@@ -841,8 +846,9 @@ def _finish(row: dict, bench_dir: Path, task: dict, ws: Path, run: Path, keep: P
     diff = gitmemo.run(["git", "-C", str(ws), "diff", "--cached", start], capture_output=True, timeout=None).stdout
     row["diff_sha256"] = _sha(diff)
     if ended.get("stopped") in ("timeout", "stalled"):
-        # The wall-time hang guard ended the agent: the guard, not the model, cut the cell short; never
-        # scored as a model fail.
+        # The wall-time hang guard ended the agent (user msg #2898: the limit is only a hang guard). The
+        # cell still grades what the agent committed, so it scores as the held-out tests say; the row
+        # names the guard so a reader sees the cell was cut short.
         row["hang_guard"] = ended["stopped"]
     flags = audit(transcript.decode(errors="replace"), task, hidden,
                   secret_lines(bench_dir, task), diff.decode(errors="replace"), own or session_dirs(ws))

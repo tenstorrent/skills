@@ -50,7 +50,7 @@ REPLAY, INJECT, DECISIONS, PLANTED = 12, 4, 40, 10
 FAULT_TRIES, FAULT_PAUSE_S = 3, 300   # retries of an endpoint-faulted cell, the first pause (grows per try)
 CELL_FIELDS = ("task", "kind", "cell", "arm", "model", "outcome", "passed", "flagged", "flagged_injection", "followed",
                "endpoint_fault", "why", "tries", "wall_s", "cost_usd", "cost_estimated", "cost_basis", "output_tokens",
-               "stream_output_tokens", "isolated", "cell_ended")
+               "stream_output_tokens", "isolated", "cell_ended", "hang_guard", "heldout_passed")
 UNSCORED = ("isolation_failed", "error", "not_isolated")   # a cell outcome that is the harness's, never the model's
 _APPEND = threading.Lock()   # the arms' threads append to the same files
 REQUESTS, TAKEN = "requests.jsonl", "requests.taken.jsonl"   # under modelbench.home()
@@ -155,7 +155,7 @@ def refresh(d: Path, db, repo: Path, now: float | None = None, prep: Callable | 
         # landed tasks) up to WIDEN_MAX_S when the fold holds too few.
         limit = PREP_LIMIT
         since, window = now - SINCE_S, SINCE_S
-        for _ in range(3):   # 14d, then 30d, then 60d at most
+        for _ in range(4):   # 14d, then 28d, then 56d, then 60d at most
             shutil.rmtree(b, ignore_errors=True)
             (prep or bench.prep)(db, Path(repo), b, since, limit=limit)
             if sum(1 for r in bench.fair(b) if r["fair"] is not False) >= PREP_LIMIT or window >= WIDEN_MAX_S:

@@ -1938,3 +1938,78 @@ def test_bench_grade_runs_the_held_out_tests_in_parallel_where_xdist_is_availabl
     assert held, log
     cellenv.make(tmp_path / "venv2", ("pytest",))   # a venv without xdist: serial
     assert benchrun.grade_workers(cellenv.env(tmp_path / "venv2", {"PATH": "/usr/bin:/bin"})) == 0
+
+
+def test_model_suite_refresh_widens_the_draw_until_enough_tasks_are_fair_and_stops_at_its_widest(tmp_path, monkeypatch):
+    """user msg #2898 item 1: the daily prep draws past landed tasks until at least PREP_LIMIT are fair
+    (unfair ones are dropped, never counted); the lookback doubles from 14 days and stops at WIDEN_MAX_S."""
+    import hashlib
+    from ttp import bench, modelsuite
+    now, calls = 1_800_000_000.0, []
+
+    def prep(db, repo, b, since, limit):
+        calls.append((round((now - since) / 86400), limit))
+        b.mkdir(parents=True)
+        (b / "manifest.json").write_text(json.dumps({"tasks": [{"task": i} for i in range(limit)]}))
+        (b / "manifest.sha256").write_text(hashlib.sha256((b / "manifest.json").read_bytes()).hexdigest() + "\n")
+
+    def cells(b, c, repo):
+        c.mkdir(parents=True)
+        (c / "cells.json").write_text(json.dumps({"bench": str(b), "made": now, "cells": []}))
+        (c / "cells.sha256").write_text(hashlib.sha256((c / "cells.json").read_bytes()).hexdigest() + "\n")
+
+    fair_per_window = {14: 4, 28: 8, 56: 13}   # fair tasks each lookback finds
+    monkeypatch.setattr(bench, "fair", lambda b: [{"task": i, "fair": i < fair_per_window[calls[-1][0]]}
+                                                  for i in range(calls[-1][1])])
+    pair = modelsuite.refresh(tmp_path / "suite", None, tmp_path, now=now, prep=prep, cells=cells, say=lambda s: None)
+    assert pair and pair[0].name.startswith("prep-")
+    assert calls == [(14, 12), (28, 24), (56, 36)], calls   # stops once 13 >= 12 are fair
+
+    # Never enough fair tasks: it widens to WIDEN_MAX_S (60 d) and stops there, keeping what it found.
+    calls.clear()
+    fair_per_window.update({14: 0, 28: 0, 56: 0, 60: 2})
+    pair = modelsuite.refresh(tmp_path / "suite2", None, tmp_path, now=now, prep=prep, cells=cells, say=lambda s: None)
+    assert pair and calls == [(14, 12), (28, 24), (56, 36), (60, 48)], calls
+    assert modelsuite.WIDEN_MAX_S == 60 * 86400
+
+
+def test_model_suite_standard_draws_only_fair_tasks_and_lists_each_dropped_one_with_its_reason(tmp_path, monkeypatch):
+    """standard() runs cells only for tasks whose fair verdict is not False (unknown still runs) and its
+    row's task_draw names every dropped task with why."""
+    from ttp import bench, benchrun, modelsuite
+    man = {"repo": str(tmp_path), "tasks": [{"task": t} for t in (1, 2, 3, 4)]}
+    monkeypatch.setattr(benchrun, "verified", lambda d: man)
+    monkeypatch.setattr(bench, "fair", lambda d: [
+        {"task": 1, "fair": True, "unstated": []},
+        {"task": 2, "fair": False, "unstated": ["budget.cap_yellow_pct"]},
+        {"task": 3, "fair": None, "why": "its commits are gone"},
+        {"task": 4, "fair": False, "unstated": [], "why": "held-out tests assert a text the spec never gives"}])
+    ran = []
+    monkeypatch.setattr(benchrun, "run_cell", lambda bd, out, task, cell, arm, opts, cfg:
+                        ran.append(task["task"]) or {"task": task["task"], "outcome": "pass", "passed": True,
+                                                     "hang_guard": "timeout", "heldout_passed": True})
+    out = tmp_path / "out"
+    out.mkdir()
+    row = modelsuite.standard("m", {"provider": "fake"}, "2026-11-14", tmp_path, None, {}, {}, out)
+    assert sorted(ran) == [1, 3]
+    d = row["task_draw"]
+    assert (d["tasks_drawn"], d["tasks_fair"]) == (4, 2)
+    assert d["dropped"] == [{"task": 2, "why": "its spec does not state 'budget.cap_yellow_pct'"},
+                            {"task": 4, "why": "held-out tests assert a text the spec never gives"}]
+    # The suite's cell rows keep the hang guard and the held-out verdict.
+    rows = [json.loads(x) for x in (out / "results.jsonl").read_text().splitlines()]
+    assert all(r.get("hang_guard") == "timeout" and r.get("heldout_passed") is True for r in rows), rows
+
+
+def test_bench_cell_prompt_offers_xdist_only_when_the_cells_venv_has_it_and_seed_carries_it(tmp_path):
+    """The agent is told to run pytest -n only when its venv imports pytest-xdist; the default cell seed
+    carries pytest-xdist where the host interpreter has it, so the grade runs parallel by default."""
+    import importlib.util
+    from ttp import benchrun, cellenv
+    assert "xdist" not in benchrun.prompt("spec", {"timeout_s": 1800})
+    assert "-n 4" in benchrun.prompt("spec", {"timeout_s": 1800}, 4)
+    assert "pytest-xdist" in cellenv.SEED
+    assert benchrun.grade_workers({}) >= 0   # no PATH in the environment: no crash
+    if importlib.util.find_spec("xdist"):
+        venv = cellenv.make(tmp_path / "venv")   # the default seed
+        assert benchrun.grade_workers(cellenv.env(venv, {"PATH": "/usr/bin:/bin"})) >= 1
