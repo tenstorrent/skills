@@ -24,17 +24,28 @@ def _sw_proc(root, forks, procs, load="2.0", mem_kb=64 * 2**20):
 
 def _sw_blink(root, env, per_listing):
     """A sleep for Watch's pid burst: each call adds per_listing new processes of run env in group 500
-    to the fake /proc (they are gone once _sw_proc rewrites it)."""
+    to the fake /proc (they are gone once _sw_proc rewrites it). Its .clock is the matching test clock
+    (pass it as Watch's clock): it moves only by the sleeps, so a loaded host listing the fake /proc
+    slowly never stretches the burst window and lowers the measured rate."""
     calls = []
+    now = [0.0]
 
     def blink(_s):
         calls.append(1)
+        now[0] += _s
         for i in range(per_listing):
             d = root / str(700000 + 1000 * len(calls) + i)
             d.mkdir()
             (d / "stat").write_text(f"{d.name} (x) S 500 500 0 0 0 0 0 0 0 0 1 0 0 0 20 0 1 0 9 0 256\n")
             (d / "environ").write_bytes(b"\0".join(f"{a}={b}".encode() for a, b in env.items()) + b"\0")
+    blink.clock = lambda: now[0]
     return blink
+
+
+def _sw_burst(root, env, per_listing):
+    """Watch's sleep and clock for a fake pid burst (see _sw_blink)."""
+    blink = _sw_blink(root, env, per_listing)
+    return {"sleep": blink, "clock": blink.clock}
 
 
 def _sw_world(tmp_path, n_own, n_other=None):
@@ -62,7 +73,7 @@ def test_selfwatch_stops_its_own_runaway_run_after_the_window_and_leaves_other_p
     base, procs = _sw_world(tmp_path, 3)
     _sw_proc(root, 1000, procs)
     mine = {"TTP_PROJECT": str(base), "TTP_RUN_ID": "7", "TTP_TASK_ID": "42"}
-    w = selfwatch.Watch(base, proc=root, daemon_pid=100, cores=64, sleep=_sw_blink(root, mine, 100))
+    w = selfwatch.Watch(base, proc=root, daemon_pid=100, cores=64, **_sw_burst(root, mine, 100))
     first = w.step(s, 0.0)
     assert first["sampled"] and first["runaway"] == [] and first["host"]["forks_s"] is None, "no rate before two samples"
     assert first["tree"]["procs"] == 2 + 5 and first["tree"]["runs"] == 1, first["tree"]   # daemon 2 + run 7 (500, 951 and 3)
@@ -207,7 +218,7 @@ def test_selfwatch_stops_its_own_storm_of_short_lived_processes_at_the_default_l
     base, world = _sw_world(tmp_path, 0, 0)
     mine = {"TTP_PROJECT": str(base), "TTP_RUN_ID": "7", "TTP_TASK_ID": "42"}
     _sw_proc(root, 0, world)
-    w = selfwatch.Watch(base, proc=root, daemon_pid=100, cores=64, sleep=_sw_blink(root, mine, 50))
+    w = selfwatch.Watch(base, proc=root, daemon_pid=100, cores=64, **_sw_burst(root, mine, 50))
     w.step(s, 0.0)
     for k in range(1, 4):
         _sw_proc(root, k * 30000, {**world, **{100000 * k + i: (500, 500, 1, mine) for i in range(2000)}})
@@ -217,7 +228,7 @@ def test_selfwatch_stops_its_own_storm_of_short_lived_processes_at_the_default_l
     assert [r["run"] for r in snap["runaway"]] == ["7"] and snap["runaway"][0]["spawn_s"] == 1000.0
 
     # Only 5 of its new processes are left at each sample; 50 more appear in each of the burst's listings.
-    w2 = selfwatch.Watch(base, proc=root, daemon_pid=100, cores=64, sleep=_sw_blink(root, mine, 50))
+    w2 = selfwatch.Watch(base, proc=root, daemon_pid=100, cores=64, **_sw_burst(root, mine, 50))
     _sw_proc(root, 0, world)
     w2.step(s, 0.0)
     _sw_proc(root, 30000, {**world, **{900000 + i: (500, 500, 1, mine) for i in range(5)}})

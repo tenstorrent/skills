@@ -118,8 +118,8 @@ class Watch:
     limit for the whole window (each once per episode)."""
 
     def __init__(self, base, proc: Path = PROC, daemon_pid: int | None = None, cores: int | None = None,
-                 sleep: Callable[[float], None] = time.sleep):
-        self.base, self.proc, self.sleep = Path(base), Path(proc), sleep
+                 sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic):
+        self.base, self.proc, self.sleep, self.clock = Path(base), Path(proc), sleep, clock
         self.daemon_pid = daemon_pid or os.getpid()
         self.cores = cores or os.cpu_count() or 1
         self.env: dict[tuple[int, int], tuple] = {}     # (pid, start) -> (owned, run, task)
@@ -160,7 +160,7 @@ class Watch:
         seen: dict[int, tuple] = dict(procs)
         counts: dict = {}
         extra: dict = {}
-        t0 = time.monotonic()
+        t0 = self.clock()
         for _ in range(BURST_N):
             self.sleep(BURST_S / BURST_N)
             try:
@@ -174,7 +174,7 @@ class Watch:
                 counts[seen[pid][1]] = counts.get(seen[pid][1], 0) + 1
                 extra[(pid, st[2])] = st[3]
         # The sleeps alone take BURST_S; more only when listing took longer (never a shorter window).
-        return counts, max(BURST_S, time.monotonic() - t0), extra
+        return counts, max(BURST_S, self.clock() - t0), extra
 
     def step(self, s: dict, now: float | None = None) -> dict:
         now = time.time() if now is None else now

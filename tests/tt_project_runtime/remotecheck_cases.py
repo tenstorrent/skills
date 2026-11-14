@@ -54,8 +54,11 @@ if [ -n "$FAKE_SSH_DENY" ]; then
     fi;;
   esac
 fi
-# FAKE_SSH_LOADAVG=<file>: the host's /proc/loadavg, so a probe reads the fake host's load, not this machine's.
-[ -n "$FAKE_SSH_LOADAVG" ] && set -- "$(printf '%s' "$1" | sed "s#/proc/loadavg#$FAKE_SSH_LOADAVG#g")"
+# FAKE_SSH_LOADAVG=<file>: the host's /proc/loadavg, so a probe reads the fake host's load, not this machine's
+# (default: idle.loadavg beside this script, an idle host); its /proc/stat is always idle.stat there (one fixed
+# reading: remoteload sees no CPU window and never holds a run), so a busy test machine never holds a check.
+d=$(dirname "$0")
+set -- "$(printf '%s' "$1" | sed -e "s#/proc/loadavg#${FAKE_SSH_LOADAVG:-$d/idle.loadavg}#g" -e "s#/proc/stat#$d/idle.stat#g")"
 # FAKE_SSH_SLOW=<host>: the tree copy to that host never ends (a stalled link).
 [ "$host" = "${FAKE_SSH_SLOW:-@none@}" ] && case "$1" in *"tar -xf -"*) exec sleep 5;; esac
 case "$1" in *"${FAKE_SSH_FAIL:-@none@}"*) echo "ssh: connection to $host lost" >&2; exit 255;; esac
@@ -72,6 +75,9 @@ def _rc_fake_ssh(tmp_path):
     ssh = bin_ / "ssh"
     ssh.write_text(_RC_FAKE_SSH)
     ssh.chmod(0o755)
+    (bin_ / "idle.loadavg").write_text("0.00 0.00 0.00 1/100 1\n")
+    (bin_ / "idle.stat").write_text("cpu  100 0 100 10000 0 0 0 0 0 0\ncpu0 100 0 100 10000 0 0 0 0 0 0\n"
+                                    "procs_running 1\n")
     return bin_, remote
 
 
