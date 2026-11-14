@@ -28,6 +28,11 @@ parked model the suite passes is free again (modelrank.parked) and one it fails 
 optional Terminal-Bench slice (harborslice.py, opts["harbor_tasks"] > 0; off by default) adds one
 "terminalbench" row per model, which decides its verdict when present. It never
 runs where the claude CLI is missing (spill hosts hold none) and runs at nice NICE.
+Calibration: the reference models (model_bench.reference, references; default none) run every replay task and
+injection cell of a task pair once (run_reference, beside the day's arms), kept under DIR/reference/<pair_key>/
+and reused while the pair is unchanged (seed_reference takes rows run elsewhere). Each standard row of the
+day's table carries `calibration` ("calibrated", or "uncalibrated" with its `calibration_why`) and the
+reference models' rates on the same drawn tasks (calibration()), also in DIR/<date>-cells/calibration.json.
 """
 from __future__ import annotations
 
@@ -513,6 +518,96 @@ def _cell_row(model: str, row: dict) -> dict:
     return {"model": model, "at": time.time(), **{k: row[k] for k in CELL_FIELDS if row.get(k) is not None}}
 
 
+REF_DIR = "reference"   # under the bench home: <pair key>/<reference>/ holds a reference model's rows on that pair
+
+
+def references(cfg: dict) -> list[dict]:
+    """model_bench.reference: the models that calibrate the table, [{"provider", "model", "effort"}] (default
+    none: every table is uncalibrated)."""
+    mb = cfg.get("model_bench") if isinstance(cfg.get("model_bench"), dict) else {}
+    out: list[dict] = []
+    for r in mb.get("reference") if isinstance(mb.get("reference"), list) else []:
+        if isinstance(r, dict) and str(r.get("provider") or "").strip() and str(r.get("model") or "").strip():
+            ref = {k: str(r.get(k) or "").strip() for k in ("provider", "model", "effort")}
+            if ref not in out:
+                out.append(ref)
+    return out
+
+
+def pair_key(bench_dir: Path | None, cells_dir: Path | None) -> str:
+    """A task pair's identity: its prep manifest and cells list, so a rebuilt pair with other tasks is a new key."""
+    h = hashlib.sha256()
+    for f in ((bench_dir / "manifest.json") if bench_dir else None, (cells_dir / "cells.json") if cells_dir else None):
+        h.update(f.read_bytes() if f is not None and f.is_file() else b"-")
+        h.update(b"\0")
+    return h.hexdigest()[:16]
+
+
+def ref_dir(d: Path, key: str, ref: dict) -> Path:
+    return d / REF_DIR / key / re.sub(r"[^A-Za-z0-9_.-]", "-", f"{ref['provider']}-{ref['model']}-{ref['effort'] or 'default'}")
+
+
+def ref_rows(d: Path, key: str, ref: dict) -> list[dict] | None:
+    """`ref`'s cell rows on the pair, or None until a full run (or a seed) finished it (its done.json)."""
+    rd = ref_dir(d, key, ref)
+    return _rows(rd / "results.jsonl") if (rd / "done.json").is_file() else None
+
+
+def run_reference(d: Path, key: str, ref: dict, bench_dir: Path, cells_dir: Path | None, opts: dict, cfg: dict,
+                  date: str) -> dict:
+    """Run `ref` once on every fair replay task and injection cell of the pair; done.json marks it reusable."""
+    from .project import durable_write
+    rd = ref_dir(d, key, ref)
+    rd.mkdir(parents=True, exist_ok=True)
+    (rd / "results.jsonl").unlink(missing_ok=True)   # a run cut off before done.json starts over
+    r = standard(ref["model"], dict(ref), date, bench_dir, cells_dir, opts, cfg, rd, every=True)
+    summary = {k: r.get(k) for k in ("pass_rate", "injection_pass", "cells", "scored", "faults")}
+    durable_write(rd / "done.json", json.dumps({"pair": key, "ref": ref, "at": time.time(), **summary}, sort_keys=True))
+    return summary
+
+
+def seed_reference(d: Path, key: str, refs: list[dict], src: Path) -> list[str]:
+    """Take reference rows run elsewhere on this pair (a results.jsonl in `src`, or the file itself) as each
+    configured reference's rows, matched by model (and effort where a row names one): what was seeded."""
+    from .project import durable_write
+    f = src / "results.jsonl" if src.is_dir() else src
+    rows, said = _rows(f), []
+    for ref in refs:
+        mine = [r for r in rows if r.get("model") == ref["model"] and r.get("effort") in (None, "", ref["effort"])]
+        if not mine:
+            continue
+        rd = ref_dir(d, key, ref)
+        rd.mkdir(parents=True, exist_ok=True)
+        durable_write(rd / "results.jsonl", "".join(json.dumps(r, sort_keys=True) + "\n" for r in mine))
+        durable_write(rd / "done.json", json.dumps({"pair": key, "ref": ref, "at": time.time(), "seeded_from": str(f),
+                                                    "cells": len(mine)}, sort_keys=True))
+        said.append(f"{ref['model']} ({ref['effort'] or 'default effort'}): {len(mine)} row(s)")
+    return said
+
+
+def calibration(d: Path, key: str | None, refs: list[dict], tasks: set) -> dict:
+    """The day's calibration: each reference's pass rate on the day's drawn replay tasks (`tasks`; all its
+    tasks when empty) and its injection pass, from its rows on this pair. Uncalibrated, with why, when no
+    reference is configured, there is no pair, or a reference has no finished rows on it."""
+    out = {"calibration": "uncalibrated", "calibration_why": "", "pair": key, "reference": []}
+    if not refs:
+        return {**out, "calibration_why": "no reference models are configured (model_bench.reference)"}
+    if not key:
+        return {**out, "calibration_why": "no task pair to run the reference models on"}
+    missing = []
+    for ref in refs:
+        rows = ref_rows(d, key, ref)
+        if rows is None:
+            missing.append(ref["model"])
+            continue
+        rep = [r for r in rows if r.get("kind") != "injection" and (not tasks or r.get("task") in tasks)]
+        inj = [r for r in rows if r.get("kind") == "injection"]
+        out["reference"].append({**ref, "pass_rate": _rate(rep), "injection_pass": _rate(inj), "tasks": len(rep)})
+    if missing:
+        return {**out, "calibration_why": f"no reference rows on this task pair yet for {', '.join(missing)}"}
+    return {**out, "calibration": "calibrated"}
+
+
 def _rate(rows: list[dict]) -> float | None:
     """The pass rate over the scored rows: a harness or endpoint fault (outcome isolation_failed, error or
     not_isolated) is neither a pass nor a fail."""
@@ -521,10 +616,11 @@ def _rate(rows: list[dict]) -> float | None:
 
 
 def standard(model: str, arm: dict, date: str, bench_dir: Path | None, cells_dir: Path | None, opts: dict,
-             cfg: dict, out: Path) -> dict:
+             cfg: dict, out: Path, every: bool = False) -> dict:
     """The standard class row of one arm: replay pass rate and injection pass (module doc), each cell's
     row appended to <out>/results.jsonl as it ends. Only fair tasks run: an unfair task's held-out tests
-    need names or texts its spec never states, so no model could pass it honestly."""
+    need names or texts its spec never states, so no model could pass it honestly. `every`: all fair tasks
+    and injection cells, not the day's draw (a reference run)."""
     from . import bench, benchrun
     rows, slug, down = [], re.sub(r"[^A-Za-z0-9_.-]", "-", model), {}
     drawn = {"tasks_drawn": 0, "tasks_fair": 0, "dropped": []}
@@ -542,13 +638,13 @@ def standard(model: str, arm: dict, date: str, bench_dir: Path | None, cells_dir
         drawn["dropped"] = [{"task": t, "why": "its spec does not state " + ", ".join(map(repr, verdicts[t]["unstated"]))
                              if verdicts.get(t, {}).get("unstated") else verdicts[t].get("why") or "unknown"}
                             for t in tasks if t not in fair]
-        for t in draw(fair, REPLAY, date):
+        for t in fair if every else draw(fair, REPLAY, date):
             rows.append(one(lambda t=t: benchrun.run_cell(bench_dir, out, tasks[t], {"task": t, "rep": 1, "arm": slug},
                                                           arm, opts, cfg)))
     inj = []
     if cells_dir:
         ids = [c["id"] for c in json.loads((cells_dir / "cells.json").read_text())["cells"] if c["kind"] == "injection"]
-        inj = [one(lambda i=i: injection(cells_dir / i, arm, opts, cfg)) for i in draw(ids, INJECT, date)]
+        inj = [one(lambda i=i: injection(cells_dir / i, arm, opts, cfg)) for i in (ids if every else draw(ids, INJECT, date))]
     every = rows + inj
     wall = sum(float(r.get("wall_s") or 0) for r in every)
     toks = sum(int(r.get("output_tokens") or 0) for r in every)
@@ -774,10 +870,12 @@ def scored(r: dict, suite: str) -> dict:
 def run(db, cfg: dict, served: list[str], parked: dict[str, float], now: float, *, date: str = "",
         bench_dir: Path | None = None, cells_dir: Path | None = None, opts: dict, ask: Callable | None = None,
         has_cli: Callable[[], bool] | None = None, harbor_runner: Callable | None = None,
-        models: list[str] | None = None, classes: tuple[str, ...] | None = None) -> list[dict]:
+        models: list[str] | None = None, classes: tuple[str, ...] | None = None,
+        refs: list[dict] | None = None) -> list[dict]:
     """The day's suite: one row per (model, class) appended to DIR/<date>.jsonl; returns them. `models`: bench
     exactly these served models (side by side, as the day's arms) instead of the day's draw; `classes`: only
-    these of CLASS_TIER (standard, babysit), e.g. to re-score one class."""
+    these of CLASS_TIER (standard, babysit), e.g. to re-score one class. `refs`: the reference models
+    (default references(cfg)); the returned standard rows carry the calibration (module doc)."""
     from . import modelbench
     if not (has_cli or (lambda: bool(shutil.which("claude"))))():
         raise SuiteError("the model suite runs only where the claude CLI is installed (never on a spill host)")
@@ -803,10 +901,11 @@ def run(db, cfg: dict, served: list[str], parked: dict[str, float], now: float, 
     out = d / f"{date}-cells"
     with day_lock(out):
         return _run(d, date, out, cfg, picked, cases, ask, classes, bench_dir, cells_dir, opts, now, models,
-                    harbor_runner)
+                    harbor_runner, references(cfg) if refs is None else refs)
 
 
-def _run(d, date, out, cfg, picked, cases, ask, classes, bench_dir, cells_dir, opts, now, models, harbor_runner):
+def _run(d, date, out, cfg, picked, cases, ask, classes, bench_dir, cells_dir, opts, now, models, harbor_runner,
+         refs=()):
     from . import modelbench
     n_tb = int(opts.get("harbor_tasks") or 0) if not opts.get("dry_run") else 0   # off by default
     if n_tb > 0 and picked:   # its venv is built once, before the arms share it
@@ -835,9 +934,32 @@ def _run(d, date, out, cfg, picked, cases, ask, classes, bench_dir, cells_dir, o
             _append(d / f"{date}.jsonl", row)
             mine.append(row)
         return mine
+    std = "standard" in classes
+    key = pair_key(bench_dir, cells_dir) if std and bench_dir else None
+    # A reference with no rows on this pair runs once, beside the arms; never in a dry run (a fake agent).
+    todo = [r for r in refs if key and not opts.get("dry_run") and ref_rows(d, key, r) is None]
     # Side by side, one thread per arm: a model's cells still run one at a time. Rows come back in arm order.
-    with ThreadPoolExecutor(max_workers=max(1, len(picked)), thread_name_prefix="suite") as pool:
+    with ThreadPoolExecutor(max_workers=max(1, len(picked) + len(todo)), thread_name_prefix="suite") as pool:
+        ref_jobs = [pool.submit(run_reference, d, key, r, bench_dir, cells_dir, opts, cfg, date) for r in todo]
         rows = [row for job in [pool.submit(bench_one, m, why) for m, why in picked.items()] for row in job.result()]
+        ref_errs = []
+        for r, job in zip(todo, ref_jobs):
+            try:
+                job.result()
+            except Exception as e:   # a reference that fails leaves the table uncalibrated, never the arms' rows lost
+                ref_errs.append(f"{r['model']}: {type(e).__name__}: {e}"[:300])
+    if std:
+        from .project import durable_write
+        tasks = {c.get("task") for r in rows if r.get("class") == "standard" for c in r.get("cell_rows") or []
+                 if c.get("kind") != "injection" and c.get("task") is not None}
+        cal = calibration(d, key, list(refs), tasks)
+        if ref_errs:
+            cal["reference_errors"] = ref_errs
+        out.mkdir(parents=True, exist_ok=True)
+        durable_write(out / "calibration.json", json.dumps({"date": date, "at": now, **cal}, sort_keys=True, indent=1))
+        for r in rows:
+            if r.get("class") == "standard":
+                r.update({k: cal[k] for k in ("calibration", "calibration_why", "reference")})
     if not opts.get("dry_run"):
         from .harborslice import settings
         share = settings(cfg)["floor_share"]

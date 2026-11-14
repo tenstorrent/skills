@@ -1503,7 +1503,13 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    the other projects on the machine that record landed tasks, most landed first, each with its own repo
    (`model_bench.sources`, a list of project names, overrides that order; their databases are only read).
    A build that fails keeps the old pair and raises one normal observation a day in the owner project, plus a
-   note to each project whose config sets `model_bench.reference`. Each cell runs
+   note to each project whose config sets `model_bench.reference`. That key lists the reference models
+   (`[{"provider", "model", "effort"}]`, default none). Each runs every replay and injection cell of a pair
+   once, beside the day's arms, and its rows are reused while the pair is unchanged. Each `standard` row then
+   carries `calibration` (`calibrated`, or `uncalibrated` with `calibration_why` when no reference is set or
+   one has no rows on the pair) and the references' rates on the same drawn tasks, also written to
+   `<date>-cells/calibration.json`. `ttp model-bench suite --reference-from DIR` takes reference rows run
+   elsewhere on the current pair (a `results.jsonl`) without a model call. Each cell runs
    in a fresh copy with its own venv; held-out tests are copied in only after the run and run the way bench
    prep validated them (a test in a case file runs where its aggregator collects it), and a transcript or
    diff naming a held-out or hidden path fails the cell. The arms run side by side, one cell at a time per

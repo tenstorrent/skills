@@ -2210,3 +2210,102 @@ def test_model_suite_draw_keeps_the_owners_own_tasks_when_it_has_enough(tmp_path
     assert pair and calls == [("prep", "owner"), ("cells", "owner")], calls
     assert not asked, "the other projects are not even read"
     assert json.loads((pair[0] / "manifest.json").read_text())["repo"] == str(owner[2])
+
+
+def _ref_fakes(env, monkeypatch, tag="1"):
+    """A bench home, a task pair and a fake `standard`: each call books its model and whether it ran every
+    task (a reference run), and appends one replay and one injection row per call to <out>/results.jsonl."""
+    from ttp import modelsuite
+    d = _suite_home(env, monkeypatch)
+    b = d / "prep-1"
+    b.mkdir(exist_ok=True)
+    (b / "manifest.json").write_text(json.dumps({"tasks": [tag]}) + "\n")
+    monkeypatch.setattr(modelsuite, "decisions", lambda db, date: [])
+    calls = []
+
+    def standard(model, arm, date, bench_dir, cells_dir, opts, cfg, out, every=False):
+        calls.append((model, every))
+        good = model == "ref-a"
+        rows = [{"task": 7, "passed": good, "outcome": "pass" if good else "fail"},
+                {"task": "inj-1", "kind": "injection", "passed": True, "outcome": "pass"}]
+        out.mkdir(parents=True, exist_ok=True)
+        for r in rows:
+            modelsuite._append(out / "results.jsonl", modelsuite._cell_row(model, r))
+        return {"pass_rate": 1.0 if good else 0.0, "injection_pass": 1.0, "bar": False, "faults": 0, "cells": 2,
+                "cell_rows": rows}
+    monkeypatch.setattr(modelsuite, "standard", standard)
+    return d, b, calls
+
+
+REFS = [{"provider": "claude", "model": "ref-a", "effort": "medium"}]
+
+
+def test_model_suite_runs_the_reference_once_per_task_pair_and_reuses_it_while_the_pair_is_unchanged(env, monkeypatch):
+    from ttp import modelsuite
+    p = make(env)
+    d, b, calls = _ref_fakes(env, monkeypatch)
+    cfg = {"providers": {"chat": {"model_ranking": ["m-a"]}}, "model_bench": {"reference": REFS}}
+
+    def day(date):
+        return modelsuite.run(p.db, cfg, ["m-a"], {}, 1e7, date=date, bench_dir=b, opts={}, models=["m-a"],
+                              classes=("standard",), has_cli=lambda: True)
+    rows = day("2026-11-14")
+    assert sorted(calls) == [("m-a", False), ("ref-a", True)], "the reference runs every task, beside the arm"
+    assert rows[0]["calibration"] == "calibrated"
+    assert rows[0]["reference"][0]["model"] == "ref-a" and rows[0]["reference"][0]["pass_rate"] == 1.0
+    key = modelsuite.pair_key(b, None)
+    assert (modelsuite.ref_dir(d, key, REFS[0]) / "done.json").is_file()
+    assert json.loads((d / "2026-11-14-cells" / "calibration.json").read_text())["calibration"] == "calibrated"
+
+    calls.clear()
+    rows = day("2026-11-15")
+    assert calls == [("m-a", False)], "same pair: the reference's rows are reused, not rerun"
+    assert rows[0]["calibration"] == "calibrated"
+
+    calls.clear()
+    (b / "manifest.json").write_text(json.dumps({"tasks": ["2"]}) + "\n")   # a new pair
+    day("2026-11-16")
+    assert sorted(calls) == [("m-a", False), ("ref-a", True)], "a changed task pair reruns the reference"
+
+
+def test_model_suite_without_reference_rows_is_marked_uncalibrated_and_a_dry_run_never_runs_one(env, monkeypatch):
+    from ttp import modelsuite
+    p = make(env)
+    d, b, calls = _ref_fakes(env, monkeypatch)
+    base = {"providers": {"chat": {"model_ranking": ["m-a"]}}}
+    rows = modelsuite.run(p.db, base, ["m-a"], {}, 1e7, date="2026-11-14", bench_dir=b, opts={}, models=["m-a"],
+                          classes=("standard",), has_cli=lambda: True)
+    assert rows[0]["calibration"] == "uncalibrated" and "model_bench.reference" in rows[0]["calibration_why"]
+    assert calls == [("m-a", False)]
+
+    calls.clear()
+    rows = modelsuite.run(p.db, {**base, "model_bench": {"reference": REFS}}, ["m-a"], {}, 1e7, date="2026-11-15",
+                          bench_dir=b, opts={"dry_run": True}, models=["m-a"], classes=("standard",),
+                          has_cli=lambda: True)
+    assert calls == [("m-a", False)], "a dry run (a fake agent) never runs the reference models"
+    assert rows[0]["calibration"] == "uncalibrated" and "ref-a" in rows[0]["calibration_why"]
+
+
+def test_model_suite_reference_rows_run_elsewhere_are_seeded_and_calibrate_the_next_run(env, monkeypatch, capsys,
+                                                                                         tmp_path):
+    from ttp import cli, modelbench, modelsuite
+    p = make(env)
+    d, b, calls = _ref_fakes(env, monkeypatch)
+    monkeypatch.setattr(modelbench, "home", lambda: d)
+    hj = p.base / "harness" / "project.json"
+    cfg = json.loads(hj.read_text()) if hj.is_file() else {}
+    hj.write_text(json.dumps({**cfg, "model_bench": {**(cfg.get("model_bench") or {}), "reference": REFS}}))
+    src = tmp_path / "ref-run"
+    src.mkdir()
+    (src / "results.jsonl").write_text("".join(json.dumps(r) + "\n" for r in [
+        {"model": "ref-a", "task": 7, "passed": True, "outcome": "pass"},
+        {"model": "other", "task": 7, "passed": False, "outcome": "fail"}]))
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    cli.main(["model-bench", "suite", "--reference-from", str(src), "--bench", str(b)])
+    assert "ref-a (medium): 1 row(s)" in capsys.readouterr().out
+    key = modelsuite.pair_key(b, None)
+    assert [r["model"] for r in modelsuite.ref_rows(d, key, REFS[0])] == ["ref-a"], "only the configured model's rows"
+    rows = modelsuite.run(p.db, {"model_bench": {"reference": REFS}}, ["m-a"], {}, 1e7, date="2026-11-14",
+                          bench_dir=b, opts={}, models=["m-a"], classes=("standard",), has_cli=lambda: True)
+    assert calls == [("m-a", False)], "seeded: the reference does not run again"
+    assert rows[0]["calibration"] == "calibrated" and rows[0]["reference"][0]["tasks"] == 1

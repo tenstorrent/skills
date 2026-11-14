@@ -8909,6 +8909,7 @@ def _model_bench_argv(a) -> list[str]:
         return ["run", *(["--force"] if a.force else [])]
     return ["suite", *(["--date", a.date] if a.date else []), *(["--dry-run"] if a.dry_run else []),
             *(["--reaudit"] if getattr(a, "reaudit", False) else []),
+            *(["--reference-from", a.reference_from] if getattr(a, "reference_from", None) else []),
             *(["--bench", a.bench] if a.bench else []), *(["--cells", a.cells] if a.cells else []),
             *(["--models", a.models] if a.models else []), *(["--class", a.cls] if a.cls else []),
             "--timeout", str(a.timeout), "--budget", str(a.budget), "--harbor", str(a.harbor)]
@@ -8980,17 +8981,28 @@ def _bench_pair_fault(p, text: str, now: float) -> None:
     """A failed build of the daily suite's task pair: a normal observation here (the owner), and a daemon note
     to each other project on this machine whose config names bench reference models (model_bench.reference)."""
     import contextlib
-    from . import globalcap, project as projectm, upstream
+    from . import upstream
     fp = f"model-bench-pair:{time.strftime('%Y-%m-%d', time.localtime(now))}"
     if not p.db.one("SELECT 1 FROM events WHERE fingerprint = ? AND kind = 'observation'", (fp,)):
         p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
                (now, "model-bench", "observation", fp, "normal", text, "queued"))
+    for name, _refs in _bench_ref_projects(p):
+        with contextlib.suppress(Exception):
+            upstream.send(p.name, None, name, text, severity="normal", now=now, sender="daemon")
+
+
+def _bench_ref_projects(p) -> list[tuple[str, list[dict]]]:
+    """The other projects on this machine whose config names bench reference models (model_bench.reference),
+    by name, with those models; their configs are only read."""
+    import contextlib
+    from . import globalcap, modelsuite, project as projectm
+    out = []
     for name, db in globalcap.local_projects(skip=str(Path(p.db.path).resolve())):
         with contextlib.suppress(Exception):
             raw = json.loads((db.parent.parent / "harness" / "project.json").read_text())
-            mb = projectm.layered(raw if isinstance(raw, dict) else {}).get("model_bench") or {}
-            if name != p.name and isinstance(mb, dict) and mb.get("reference"):
-                upstream.send(p.name, None, name, text, severity="normal", now=now, sender="daemon")
+            if name != p.name and (refs := modelsuite.references(projectm.layered(raw if isinstance(raw, dict) else {}))):
+                out.append((name, refs))
+    return sorted(out)
 
 
 def _model_suite(p, a, now: float) -> None:
@@ -9010,6 +9022,21 @@ def _model_suite(p, a, now: float) -> None:
         except (modelsuite.SuiteError, benchrun.BenchError) as e:
             die(f"model-bench suite --reaudit: {e}")
         print(json.dumps(got, indent=1))
+        return
+    # The reference models: this project's model_bench.reference, else the first other project's here that sets it.
+    refs = modelsuite.references(cfg) or next((r for _n, r in _bench_ref_projects(p)), [])
+    if getattr(a, "reference_from", None):   # model-free: take reference rows run elsewhere on the current pair
+        pair = (Path(a.bench).expanduser().resolve(), Path(a.cells).expanduser().resolve() if a.cells else None) \
+            if a.bench else modelsuite.folders(modelbench.home())
+        if not pair:
+            die(f"model-bench suite --reference-from: no task pair under {modelbench.home()}; name one with --bench")
+        if not refs:
+            die("model-bench suite --reference-from: no reference models are configured (model_bench.reference)")
+        key = modelsuite.pair_key(*pair)
+        said = modelsuite.seed_reference(modelbench.home(), key, refs, Path(a.reference_from).expanduser().resolve())
+        if not said:
+            die(f"model-bench suite --reference-from: no rows of {', '.join(r['model'] for r in refs)} in {a.reference_from}")
+        print(f"model-bench suite: reference rows for pair {key} ({pair[0].name}): " + "; ".join(said))
         return
     if a.dry_run:   # a fake agent and answerer, no spend; the ranking stands in for the served list
         served = modelrank.ranking(cfg) or die("model-bench suite --dry-run: set providers.chat.model_ranking")
@@ -9044,9 +9071,12 @@ def _model_suite(p, a, now: float) -> None:
         rows = modelsuite.run(p.db, cfg, served, modelrank.parked_models(p.db), now, date=a.date or "",
                               bench_dir=bench_dir, cells_dir=cells_dir, opts=opts, ask=ask,
                               models=[m.strip() for m in a.models.split(",") if m.strip()] if a.models else None,
-                              classes=(a.cls,) if a.cls else None)
+                              classes=(a.cls,) if a.cls else None, refs=refs)
     except (modelsuite.SuiteError, benchrun.BenchError) as e:
         die(f"model-bench suite: {e}")
+    if cal := next((r for r in rows if r.get("calibration")), None):
+        print(f"model-bench suite: {cal['calibration']}" + (f": {cal['calibration_why']}" if cal.get("calibration_why") else ""),
+              file=sys.stderr)
     print(json.dumps([{k: v for k, v in r.items() if k != "cell_rows"} for r in rows], indent=1))
 
 
@@ -15737,6 +15767,9 @@ def main(argv: list[str] | None = None) -> None:
                                                          "(the owner's daily schedule; output in the bench log)")
     s.add_argument("--date", help="suite: the day whose seeded draw to run (YYYY-MM-DD; default today)")
     s.add_argument("--dry-run", action="store_true", help="suite: a fake agent and answerer, no spend")
+    s.add_argument("--reference-from", metavar="DIR",
+                   help="suite: no model call: take the reference models' (model_bench.reference) rows run elsewhere "
+                        "on the current task pair (DIR/results.jsonl) as their rows on it, reused until the pair changes")
     s.add_argument("--reaudit", action="store_true",
                    help="suite: no model call: audit the day's recorded isolated replay cells again from their kept "
                         "transcript and diff, grade those the audit had stopped, and rewrite the day's standard "
