@@ -132,7 +132,8 @@ def test_class_target_pins_and_kept_core_tasks_stay_on_core():
     # Untrusted input (and the rest of route.KEEP_CORE) stays on core until its guards are live.
     assert runclass.target(cfg, {**t, "labels": '["untrusted_input"]'}, "standard", "status_report") is None
     assert runclass.target(cfg, {**t, "origin": "daemon"}, "standard", "status_report") is None
-    assert runclass.target(cfg, {**t, "origin": "daemon", "kind": "review"}, "standard", "review_small")
+    rv = {"route": {"classes": {"review_small": "chat"}}}
+    assert runclass.target({**cfg, **rv}, {**t, "origin": "daemon", "kind": "review"}, "standard", "review_small")
     off = {"providers": {"chat": {**_RC_CHAT, "tiers": {"light": {"model": "m", "route": False}}}}}
     assert runclass.target(off, t, "light", "light") is None             # the user turned the tier off
     assert runclass.target(off, t, "standard", "status_report")["model"] == "m"
@@ -362,16 +363,17 @@ def test_an_urgent_task_takes_its_class_cheap_route_in_every_cheap_class_and_har
     cfg = _rc_cfg()
     t = {"kind": "question", "tier": "standard", "title": "why", "spec": "s"}
     urgent = [{**t, "priority": 1}, {**t, "spec": "urgent: yes\nwhy"}]
+    routed = {**cfg, "route": {"classes": {"review_small": "chat"}}}   # reviews reach chat only by route.classes
     for cls in ("wake_decision", "screening", "worker_wake", "status_report", "rebase", "review_small"):
         for u in urgent:
             assert route.kept_core(u, urgency=False) is False, (cls, u)
             assert runclass.routable(u, {runclass.KEY: cls}), (cls, u)
-            assert runclass.target(cfg, u, "light", cls) is not None, (cls, u)
+            assert runclass.target(routed, u, "light", cls) is not None, (cls, u)
     # The decision (2026-11-08 23:55 PST) names those six: an urgent light-tier first run starts on core.
     for u in urgent:
         assert runclass.target(cfg, u, "light", "light") is None and not runclass.routable(u, {runclass.KEY: "light"})
         assert runclass.target(cfg, {**t, "tier": "light"}, "light", "light") is not None   # not urgent: routed
-    for cls in ("wake_decision", "screening", "worker_wake", "status_report", "rebase", "review_small"):
+    for cls in ("wake_decision", "screening", "worker_wake", "status_report", "rebase"):
         c = runclass.core_cheap({}, urgent[0], cls, "standard", "claude")
         assert c and c["effort"] == "low" and c["model"] in ("haiku", "sonnet"), cls
     # Urgency still keeps a non-cheap class (hard work, the coordinator) and an escalation on core.
@@ -633,3 +635,21 @@ def test_code_quality_counts_a_task_retried_a_tier_up_as_bad_on_the_model_it_sta
     q = runclass.code_quality(p.db, {}, now - runclass.CODE_WINDOW_S, now)["new"]
     assert (q["sonnet"]["tasks"], q["sonnet"]["bad"], q["opus"]["tasks"], q["opus"]["bad"]) == (5, 4, 6, 1)
     assert q["state"] == "off"
+
+
+def test_reviews_run_on_their_tiers_core_model_unless_the_user_routes_them():
+    """A review (review_small too) judges work: by default it is neither routed to the chat provider nor
+    put on the cheap core fallback, so it runs on its tier's core model; route.classes may still route it."""
+    from ttp import runclass
+    cfg = _rc_cfg()
+    assert "review_small" not in runclass.CHAT and "review_small" not in runclass.CORE_CHEAP
+    assert runclass.routes(cfg)["review_small"] == "core" and runclass.routes(cfg)["status_report"] == "chat"
+    r = {"kind": "review", "tier": "standard", "title": "Review #1: x", "labels": "[]"}
+    assert runclass.target(cfg, r, "standard", "review_small") is None
+    assert runclass.core_cheap({}, r, "review_small", "standard", "claude") is None
+    assert runclass.core_cheap({"route": {"core_cheap": {"review_small": {"model": "haiku"}}}},
+                               r, "review_small", "standard", "claude") is None
+    assert runclass.core_cheap({}, r, "status_report", "standard", "claude")["model"] == "sonnet"
+    user = {**cfg, "route": {"classes": {"review_small": "chat"}}}
+    assert runclass.routes(user)["review_small"] == "chat"
+    assert runclass.target(user, r, "standard", "review_small")["rule"] == "class:review_small"

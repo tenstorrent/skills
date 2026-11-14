@@ -13,8 +13,8 @@ without one is classified the same way at read time from its note.
 
 Routing: `route.classes` {class: "chat" | "core"} (account-level, then the project's value over it)
 over DEFAULT: when the chat provider has a model (chat_model), every class in CHAT goes to chat and
-coordinator and hard stay on core; the coordinator never moves, whatever the map says. A task's own
-provider or model pin wins (route.eligible); a task the rule list keeps on core (route.kept_core: needs_deep,
+coordinator, review_small, routine and hard stay on core (a review judges work: its tier's core model); the
+coordinator never moves, whatever the map says. A task's own provider or model pin wins (route.eligible); a task the rule list keeps on core (route.kept_core: needs_deep,
 user_deep, review_fix, untrusted_input) stays on core; urgency is no such reason here (it orders the run and
 nothing else: an urgent task's cheap-class run takes the class's cheap route), and so does a task the daemon made
 from outside input (untrusted) until the untrusted-input hook guards are live. The model is the run tier's chat
@@ -68,10 +68,12 @@ import time
 KEY = "run_class"
 CLASSES = ("coordinator", "wake_decision", "screening", "worker_wake", "status_report", "rebase",
            "review_small", "light", "routine", "hard")
-CHAT = ("wake_decision", "screening", "worker_wake", "status_report", "rebase", "review_small", "light")
+# Reviews (review_small too) judge work, so they run on their tier's core model by default: neither the chat
+# provider nor the cheap core fallback; a user's route.classes may still send review_small to chat.
+CHAT = ("wake_decision", "screening", "worker_wake", "status_report", "rebase", "light")
 # The cheap classes an urgent task does not lift to core (urgency sets order only, decision 2026-11-08 23:55
 # PST); a light-tier first run is not one of them: an urgent one starts on core.
-ORDER_ONLY = tuple(c for c in CHAT if c != "light")
+ORDER_ONLY = (*(c for c in CHAT if c != "light"), "review_small")
 DECISION_USES = ("wake_gate", "wake_tier", "babysit")
 SCREEN_USES = ("screen",)
 SMALL_LINES = 300
@@ -89,8 +91,7 @@ CORE_CHEAP = {"wake_decision": {"model": "haiku", "effort": "low"},
               "screening": {"model": "haiku", "effort": "low"},
               "worker_wake": {"model": "sonnet", "effort": "low"},
               "status_report": {"model": "sonnet", "effort": "low"},
-              "rebase": {"model": "sonnet", "effort": "low"},
-              "review_small": {"model": "sonnet", "effort": "low"}}
+              "rebase": {"model": "sonnet", "effort": "low"}}
 # Routine's model, on by default (`route.core_cheap.routine` false or route.classes.routine "core" turns it off).
 ROUTINE_MODEL = {"model": "sonnet", "effort": "high"}
 CORE_CHEAP[ROUTINE] = dict(ROUTINE_MODEL)
