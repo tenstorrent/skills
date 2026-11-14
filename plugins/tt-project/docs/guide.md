@@ -2569,6 +2569,11 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   progress every 30 s (`TTP_REMOTE_PROGRESS_S`); one past its limit (`TTP_REMOTE_COPY_LIMIT_S`, default
   540 s) or with nothing moving for 300 s (`TTP_REMOTE_COPY_STALL_S`) is the host's fault: the check waits
   or runs elsewhere, never failing the change.
+  A remote check's first login that fails (ssh exit 255 or a timeout) is tried once more after 20 s on a
+  connection of its own before its host is an environment fault, so one dropped link or a forwarded agent
+  that did not answer for a moment fails nothing; a second failure is the fault at once, naming ssh's own
+  words, and an access bridge's agent when the host signs through one. A spill host's fault, whose check
+  runs on another host or here instead, is a normal observation that says nothing waits on it.
   Checks that run on another host (a check's own `"host"`, `delivery.checks_host` or a spill host), with at most
   light checks here, use none of this host's CPU: push checks and `ttp checks` take no host-wide checks slot or
   test slots here and never wait for this host's guard. They wait instead while their host's runnable demand,

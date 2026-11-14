@@ -41,6 +41,19 @@ if [ -n "$FAKE_SSH_MUX" ]; then
     fi;;
   esac
 fi
+# FAKE_SSH_DENY=<file> holding a count (or "always"): the first login (a script making the temp dir) is refused
+# a key while the count lasts, as when a forwarded agent does not answer; <file>.log gets "shared" or "direct".
+if [ -n "$FAKE_SSH_DENY" ]; then
+  case "$1" in *mktemp*)
+    case "$all" in *ControlPath=none*) echo direct >> "$FAKE_SSH_DENY.log";; *) echo shared >> "$FAKE_SSH_DENY.log";; esac
+    left=$(cat "$FAKE_SSH_DENY")
+    if [ "$left" = always ] || [ "$left" -gt 0 ]; then
+      [ "$left" = always ] || echo $((left - 1)) > "$FAKE_SSH_DENY"
+      echo "user@$host: Permission denied (publickey)." >&2
+      exit 255
+    fi;;
+  esac
+fi
 # FAKE_SSH_SLOW=<host>: the tree copy to that host never ends (a stalled link).
 [ "$host" = "${FAKE_SSH_SLOW:-@none@}" ] && case "$1" in *"tar -xf -"*) exec sleep 5;; esac
 case "$1" in *"${FAKE_SSH_FAIL:-@none@}"*) echo "ssh: connection to $host lost" >&2; exit 255;; esac
@@ -214,6 +227,109 @@ def test_a_remote_check_tries_again_on_its_own_connection_when_the_shared_one_re
         assert remotecheck.SIG not in said, said
         assert Path(f"{mux}.log").read_text().split() == ["shared", "direct"], on
         assert _rc_left(tmp_path) == []
+
+
+def test_a_first_login_that_fails_once_is_tried_again_on_its_own_connection_and_the_check_counts(tmp_path):
+    """One refused key at the first login (a forwarded agent that did not answer for a moment) is no fault:
+    after LINK_RETRY_S the login goes again on a connection of its own, and the check runs and counts."""
+    from ttp import remotecheck
+    repo = _rc_repo(tmp_path)
+    deny = tmp_path / "deny"
+    deny.write_text("1")
+    rc, said = _rc_run(tmp_path, repo, "echo ran-here; exit 3", FAKE_SSH_DENY=str(deny))
+    assert rc == 3 and "ran-here" in said, said
+    assert "trying once more in 0 s on a connection of its own" in said and "Permission denied" in said, said
+    assert remotecheck.SIG not in said, said
+    assert Path(f"{deny}.log").read_text().split() == ["shared", "direct"]
+    assert _rc_left(tmp_path) == []
+
+
+def test_a_first_login_that_fails_twice_is_the_hosts_fault_naming_why_after_the_wait(tmp_path):
+    """Refused on both tries: the environment fault at once after the one wait (never a third try or a silent
+    wait), naming ssh's own words; push.remote_fault keeps that reason on the fault and its record."""
+    from ttp import push, remotecheck
+    repo = _rc_repo(tmp_path)
+    deny = tmp_path / "deny"
+    deny.write_text("always")
+    t0 = time.monotonic()
+    rc, said = _rc_run(tmp_path, repo, "echo ran-here", FAKE_SSH_DENY=str(deny), TTP_REMOTE_LINK_RETRY_S="0.4")
+    assert time.monotonic() - t0 >= 0.4, "the wait before the second try"
+    assert rc == remotecheck.FAULT_RC and "ran-here" not in said, said
+    assert f"{remotecheck.SIG}box1: cannot make a temporary directory there (ssh exit 255: " in said, said
+    assert "Permission denied (publickey).), also when tried again" in said, said
+    assert Path(f"{deny}.log").read_text().split() == ["shared", "direct"]
+
+    class Cmd(str):
+        host = "box1"
+    f = push.remote_fault(Cmd("pytest -q"), remotecheck.FAULT_RC, repo, said)
+    assert "Permission denied (publickey)" in f["why"] and "This is the host" not in f["why"], f
+    assert remotecheck.said_why("no fault line here", "box1") == ""
+    assert remotecheck.said_why(said, "box2") == "", "another host's line is not this one's"
+
+
+def test_reachable_tries_a_failed_login_once_more_only_when_asked_and_a_hint_names_a_bridge_agent(
+        tmp_path, monkeypatch):
+    """reachable(retry=True) (envfault.precheck, before a check) tries a failed login or a timeout once more
+    on a connection of its own; plain reachable (an open fault looked at again) does not. A refused key on
+    a host whose login signs through an access bridge's agent names that agent and whether it answers."""
+    from types import SimpleNamespace
+    from ttp import bridge, remotecheck
+    calls, plan = [], []
+
+    def run(argv, **k):
+        calls.append(argv)
+        step = plan.pop(0)
+        if step == "timeout":
+            raise subprocess.TimeoutExpired(argv, 1)
+        return SimpleNamespace(returncode=step, stdout="", stderr="u@box1: Permission denied (publickey).")
+    monkeypatch.setattr(remotecheck.subprocess, "run", run)
+    for first in (255, "timeout"):
+        calls.clear()
+        plan[:] = [first, 0]
+        assert remotecheck.reachable("box1", retry=True) == "", first
+        assert len(calls) == 2 and "ControlPath=none" in calls[1] and "ControlPath=none" not in calls[0], calls
+    calls.clear()
+    plan[:] = [255, 0]
+    assert "Permission denied" in remotecheck.reachable("box1") and len(calls) == 1
+    plan[:] = [255, 255]
+    assert "Permission denied" in remotecheck.reachable("box1", retry=True)
+    plan[:] = ["timeout", "timeout"]
+    assert "timed out after" in remotecheck.reachable("box1", retry=True)
+    plan[:] = [1, 0]
+    assert "lacks git or tar" in remotecheck.reachable("box1", retry=True), "a host that answered is not retried"
+    cfg = tmp_path / "ssh_config"
+    cfg.write_text(f"{bridge.BEGIN}\nHost box1 box2\n  IdentityAgent {tmp_path}/links/work.sock\n{bridge.END}\n"
+                   "Host other\n  IdentityAgent /elsewhere.sock\n")
+    err = "u@box1: Permission denied (publickey)."
+    down = remotecheck.agent_hint("box1", err, cfg, probe=lambda p: False)
+    assert "'work'" in down and "does not answer now" in down and "not the host" in down, down
+    assert "answers again now" in remotecheck.agent_hint("box2", err, cfg, probe=lambda p: True)
+    assert remotecheck.agent_hint("other", err, cfg, probe=lambda p: False) == "", "not a bridge block's host"
+    assert remotecheck.agent_hint("box1", "Connection refused", cfg, probe=lambda p: False) == ""
+    assert remotecheck.agent_hint("box1", err, tmp_path / "missing", probe=lambda p: False) == ""
+
+
+def test_a_spill_hosts_fault_says_its_check_ran_elsewhere_and_a_fault_clears_once_a_login_works(env, tmp_path,
+                                                                                                monkeypatch):
+    """A spill host's fault (its check ran on another host or here) is a normal observation saying nothing
+    waits, never 'the push queue holds its batch'; a fault the queue found stays high. An open host fault
+    closes on the first look whose login works."""
+    from ttp import envfault, remotecheck
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    f = remotecheck.fault("box1", "pytest -q", str(repo), "ssh exit 255: Permission denied (publickey).")
+    assert envfault.record(p, f, "7", spilled=True)
+    ev = p.db.q("SELECT severity, text FROM events WHERE kind='observation' ORDER BY id DESC LIMIT 1")[0]
+    assert ev["severity"] == "normal" and "ran on another host or here instead" in ev["text"], dict(ev)
+    assert "push queue holds" not in ev["text"] and "Permission denied (publickey)" in ev["text"], ev["text"]
+    g = remotecheck.fault("box2", "pytest -q", str(repo))
+    assert envfault.record(p, g, queue=True, spilled=True)
+    ev = p.db.q("SELECT severity, text FROM events WHERE kind='observation' ORDER BY id DESC LIMIT 1")[0]
+    assert ev["severity"] == "high" and "push queue holds its batch" in ev["text"], dict(ev)
+    looks = []
+    monkeypatch.setattr(remotecheck, "paused", lambda host, where=None: "")
+    monkeypatch.setattr(remotecheck, "reachable", lambda host, retry=False: looks.append(retry) or "")
+    assert envfault.recheck(p) == {} and envfault.open_faults(p) == {}
+    assert looks == [False, False], "a recheck never waits for a second try"
 
 
 def test_a_remote_check_whose_shared_ssh_connection_refuses_every_try_is_a_fault_naming_the_refusal(

@@ -459,7 +459,7 @@ def remote_fault(c: Any, rc: int | None, cwd: str | Path, said: str = "") -> dic
     clears only once a test copy works (remotecheck.staging_ok), not once ssh answers."""
     if rc != remotecheck.FAULT_RC or not (h := remote_host(c)):
         return None
-    f = remotecheck.fault(h, str(c), str(cwd))
+    f = remotecheck.fault(h, str(c), str(cwd), remotecheck.said_why(said, h))
     if f"{remotecheck.SIG}{h}: {remotecheck.STAGE_TIMED_OUT}" in said:
         f.update(why=f"{remotecheck.STAGE_TIMED_OUT} after {remotecheck.SETUP_TIMEOUT_S} s", staging=True)
     return f
@@ -5011,7 +5011,7 @@ def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None], seen: 
         if base := os.environ.get("TTP_PROJECT"):
             p = Project(base)
             p = p if p.exists() else None
-        envfault.record(p, fault, os.environ.get("TTP_TASK"))
+        envfault.record(p, fault, os.environ.get("TTP_TASK"), spilled=spilled)
         say(envfault.line(fault) if spilled else
             f"{envfault.line(fault)}; not pushing. Hand off `waiting`; retry_when: {envfault.retry_when(p, fault)}")
         return BUSY

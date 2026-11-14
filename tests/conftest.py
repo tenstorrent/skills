@@ -433,6 +433,7 @@ def _temp_home(tmp_path_factory, monkeypatch):
     home = tempfile.mkdtemp(prefix="home-", dir=root)
     _point_home(home, monkeypatch.setenv, lambda var: monkeypatch.delenv(var, raising=False))
     monkeypatch.setenv("TTP_TEST_NO_TAILSCALE", "1")   # unreachable-host messages never ask this host's Tailscale (tailnet.py)
+    monkeypatch.setenv("TTP_REMOTE_LINK_RETRY_S", "0")   # a failed first login is tried again at once (remotecheck.login)
     if os.environ.get("GIT_CONFIG_GLOBAL"):   # a `git config --global` of its own: tests never share one
         own = Path(home, ".gitconfig")   # a copy, not an include: see _git_global_config
         own.write_bytes(_session_git_config(os.environ["GIT_CONFIG_GLOBAL"]))

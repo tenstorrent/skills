@@ -18,7 +18,8 @@ its command there too (_run_script). The temporary directory is always removed.
 
 ssh failing (an unreachable host, a refused key, a dropped connection) or a host that cannot take
 the tree is an environment fault, not the change's (ssh's shared connection refusing one more session
-first tries the check again from the start on a connection of its own, MUX_BACKOFF_S), and so is a host that is paused (paused: this
+first tries the check again from the start on a connection of its own, MUX_BACKOFF_S; a first login that fails
+is tried once more after LINK_RETRY_S on a connection of its own), and so is a host that is paused (paused: this
 project's, a shared or another project's pause; nothing reaches it over ssh): this exits FAULT_RC, which the callers
 (`ttp checks`, `ttp push`, the push queue) treat as envfault does a missing runner. A command's own
 exit FAULT_RC is reported as 1, so it never reads as a fault. A check spilled with a remote wrapper
@@ -88,6 +89,12 @@ DIRECT = ["-o", "ControlMaster=no", "-o", "ControlPath=none"]
 # tried again from the start on a connection of its own after each wait here, then it is a fault.
 MUX_REFUSED = "Session open refused by peer"
 MUX_BACKOFF_S = (2, 5)
+# A first login that fails (ssh exit 255 or a timeout) is tried once more after this many seconds on a
+# connection of its own before the host is an environment fault: a link that dropped once, a forwarded agent
+# that did not answer for a moment (an access bridge relinks its agent within about 30 s) or a host still
+# booting is not yet the host's fault. A second failure is the fault at once. LINK_RETRY_ENV: another wait (tests).
+LINK_RETRY_S = 20
+LINK_RETRY_ENV = "TTP_REMOTE_LINK_RETRY_S"
 # Under the checks' silence limit (checkwall.SILENT_S, 600 s): a copy that stalls is the host's fault
 # (another host or here takes the check), never a silent "hang" blamed on the change.
 SETUP_TIMEOUT_S = 540
@@ -171,24 +178,72 @@ def paused(host: str, where: str | Path | None = None) -> str:
     return f"paused by {who}{f': {reason}' if reason else ''}"
 
 
-def reachable(host: str) -> str:
-    """"" when ssh reaches `host` and it has git and tar (what a remote check needs), else why not."""
+def _last(err: str) -> str:
+    return (err.strip().splitlines() or ["exit 255"])[-1][:200]
+
+
+def login(host: str, script: str, direct: bool = False, retry: bool = True) -> tuple[Any, str]:
+    """`script` run on `host` as a first login: (its CompletedProcess, "") or (None, why) when ssh timed out.
+    With `retry`, a login that failed (exit 255 that is not a shared connection's refusal or a locked agent
+    here, or a timeout) is tried once more after LINK_RETRY_S on a connection of its own (LINK_RETRY_S),
+    and said so; the second try's outcome is the answer. OSError (no ssh) propagates."""
+    said, last = "", None
+    for again in (False, True):
+        if again:
+            if not retry:
+                break
+            wait = max(0.0, _knob(LINK_RETRY_ENV, LINK_RETRY_S))
+            _say(f"ssh to {host} failed ({said}): trying once more in {wait:g} s on a connection of its own")
+            time.sleep(wait)
+        try:
+            r = subprocess.run(_ssh(host, script, direct or again), stdin=subprocess.DEVNULL, capture_output=True,
+                               text=True, timeout=PROBE_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            said, last = f"ssh timed out after {PROBE_TIMEOUT_S} s", None
+            if sshagent.password_manager():
+                return None, f"{said}: {sshagent.WHY}"
+            continue
+        if r.returncode != 255 or _refused(r.stderr) or sshagent.locked(r.stderr):
+            return r, ""
+        said, last = f"exit 255: {_last(r.stderr)}", r
+    return (last, "") if last is not None else (None, said)
+
+
+def agent_hint(host: str, err: str, config: Path | None = None, probe=None) -> str:
+    """When ssh to `host` was refused a key (`err`) and its login signs through an access bridge's forwarded
+    agent (bridgewatch.links in `config`, default this account's ssh config): a note naming that agent and
+    whether it answers now, else "". The host is then most likely fine: the workstation's bridge was down."""
+    if "Permission denied" not in (err or ""):
+        return ""
+    from . import bridgewatch
     try:
-        r = subprocess.run(_ssh(host, "command -v git >/dev/null && command -v tar >/dev/null"),
-                           stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=PROBE_TIMEOUT_S)
-    except subprocess.TimeoutExpired:
-        if sshagent.password_manager():
-            return f"ssh to {host} timed out after {PROBE_TIMEOUT_S} s: {sshagent.WHY}"
-        return f"ssh to {host} timed out after {PROBE_TIMEOUT_S} s" + tailnet.suffix()
+        found = bridgewatch.links((config or bridgewatch.config_path()).read_text(errors="replace"))
+    except (OSError, ValueError):
+        return ""
+    for path, hosts in found.items():
+        if host in hosts:
+            up = (probe or bridgewatch.answers)(path)
+            return (f"; its login signs through the access bridge's forwarded agent {bridgewatch.name(path)!r}, "
+                    + ("which answers again now" if up else "which does not answer now")
+                    + ": the workstation's bridge was down, not the host; it reconnects by itself")
+    return ""
+
+
+def reachable(host: str, retry: bool = False) -> str:
+    """"" when ssh reaches `host` and it has git and tar (what a remote check needs), else why not. `retry`:
+    a failed login is tried once more (login) before it is the answer."""
+    try:
+        r, why = login(host, "command -v git >/dev/null && command -v tar >/dev/null", retry=retry)
     except OSError as e:
         return f"cannot run ssh: {e}"
+    if r is None:
+        return f"ssh to {host} {why.removeprefix('ssh ')}" + ("" if sshagent.WHY in why else tailnet.suffix())
     if r.returncode == 0:
         return ""
     if r.returncode == 255 and sshagent.locked(r.stderr):
         return f"ssh to {host} failed: {sshagent.WHY}"
     if r.returncode == 255:
-        return (f"ssh cannot reach {host}: {(r.stderr.strip().splitlines() or ['exit 255'])[-1][:200]}"
-                + tailnet.suffix())
+        return f"ssh cannot reach {host}: {_last(r.stderr)}" + agent_hint(host, r.stderr) + tailnet.suffix()
     return f"{host} lacks git or tar"
 
 
@@ -215,6 +270,17 @@ def fault(host: str, cmd: str, cwd: str, why: str = "") -> dict:
     """The envfault record of a check host that cannot run checks."""
     return {"kind": "host", "host": host, "runner": host, "sig": SIG + host, "cmd": cmd, "cwd": cwd,
             **({"why": why} if why else {})}
+
+
+def said_why(text: str, host: str) -> str:
+    """The reason of the last environment fault of `host` a remote check's output `text` names (_fault's
+    line), so the fault and its observation say why (a refused key, a timeout), or ""."""
+    why = ""
+    for line in (text or "")[-65536:].splitlines():
+        _, sep, rest = line.partition(f"environment fault {SIG}{host}: ")
+        if sep:
+            why = re.split(r"\. (?:This is the host|Not the host)", rest, maxsplit=1)[0].strip()[:400]
+    return why
 
 
 _TOLD: dict = {}   # what this run has said once (its priority line)
@@ -852,12 +918,10 @@ def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, s
             return _fault(host, f"{UPLOADS_PER_HOST} tree copies to it from this machine were still running "
                                 f"after {UPLOAD_WAIT_S} s"), ""
         key = mirror_key(top, head)
-        try:
-            made = subprocess.run(_ssh(host, f"{mktemp_cmd()} && {{ {_mirror_probe(key)}; }}", direct),
-                                  stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=PROBE_TIMEOUT_S)
-        except subprocess.TimeoutExpired:
-            return _fault(host, f"ssh timed out after {PROBE_TIMEOUT_S} s"
-                          + (f": {sshagent.WHY}" if sshagent.password_manager() else "")), ""
+        # The first login: one that fails goes once more on a connection of its own (login, LINK_RETRY_S).
+        made, why = login(host, f"{mktemp_cmd()} && {{ {_mirror_probe(key)}; }}", direct)
+        if made is None:
+            return _fault(host, why + ("" if sshagent.WHY in why else ", also when tried again")), ""
         lines = made.stdout.strip().splitlines()
         tmp = lines[0].strip() if lines else ""
         if made.returncode != 0 or not _TMP.fullmatch(tmp):
@@ -868,6 +932,8 @@ def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, s
                 return FAULT_RC, why
             if made.returncode == 255 and sshagent.locked(made.stderr):
                 why = f"ssh failed: {sshagent.WHY}"
+            elif made.returncode == 255:
+                why += ", also when tried again" + agent_hint(host, made.stderr)
             return _fault(host, why), ""
         mirror = next((ln[len(MIRROR_MARK):] for ln in lines if ln.startswith(MIRROR_MARK)), "")
         bases = [ln[len(BASE_MARK):] for ln in lines if ln.startswith(BASE_MARK)]

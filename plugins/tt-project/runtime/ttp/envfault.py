@@ -236,13 +236,15 @@ def missing_program(cmd: str, top: str | Path, env: dict | None = None, host: st
     return prog if r.returncode == 3 else ""
 
 
-def probe(r: dict, env: dict | None = None) -> dict | None:
+def probe(r: dict, env: dict | None = None, retry: bool = False) -> dict | None:
     """The fault of one runner (runners()), or None when it is there. A probe that cannot tell (a
-    timeout, an interpreter that crashes) is no fault: the check runs and says what it says."""
+    timeout, an interpreter that crashes) is no fault: the check runs and says what it says. `retry`: a
+    host whose login fails is tried once more first (remotecheck.login), as before a check, never when
+    an open fault is looked at again (recheck: it closes on the first login that works)."""
     if r.get("kind") == "host":
         from . import remotecheck
         host = str(r.get("host") or "")
-        why = (remotecheck.paused(host, r.get("cwd") or None) or remotecheck.reachable(host)
+        why = (remotecheck.paused(host, r.get("cwd") or None) or remotecheck.reachable(host, retry=retry)
                or (remotecheck.staging_ok(host) if r.get("staging") else ""))
         return {**r, "why": why} if why else None
     path = str(r.get("path") or os.defpath)
@@ -280,7 +282,7 @@ def precheck(cmds: list, top: str | Path, env: dict | None = None) -> dict | Non
         if host := push.remote_host(c):
             if host not in seen:
                 seen.add(host)
-                if f := probe(remotecheck.fault(host, str(c), str(top)), env):
+                if f := probe(remotecheck.fault(host, str(c), str(top)), env, retry=True):
                     return f
             continue
         for r in runners(str(c), top, env):
@@ -437,11 +439,13 @@ def cause(p, now: float | None = None, env: dict | None = None) -> str:
         return f" Likely cause: not read ({type(e).__name__})."
 
 
-def record(p, f: dict, task: str | None = None, queue: bool = False) -> bool:
+def record(p, f: dict, task: str | None = None, queue: bool = False, spilled: bool = False) -> bool:
     """Keep the fault open in the project's state, and raise one coordinator observation the first
     time its signature is seen in this episode. True when this call raised it. Never raises.
     `queue`: the push queue's batch found it, so the queue holds on it (held); a fault a task found
-    in its own checkout never holds the queue, and does not replace how the queue's is probed."""
+    in its own checkout never holds the queue, and does not replace how the queue's is probed.
+    `spilled`: a spill host's fault whose check runs on another host or here instead (push._run_or_here):
+    nothing waits on it, so its observation says so at normal severity, never that runs or the queue wait."""
     if p is None:
         return False
     try:
@@ -480,13 +484,18 @@ def record(p, f: dict, task: str | None = None, queue: bool = False) -> bool:
                          (f"the check runner {f.get('runner')} cannot be found or imported{py}",
                           "Restore the runner on the host (reinstall it for that python, or point the checks "
                           "at a venv)"))
-            text = (f"Environment fault {sig}: {what} (first seen in {f.get('cmd')!r}). Check runs wait instead "
-                    "of failing and nothing is counted against any change; the push queue holds its batch. "
-                    f"{fix}.{why} Waiting tasks and the queue resume once `ttp checks --env-ok` passes.")
+            text = (f"Environment fault {sig}: {what} (first seen in {f.get('cmd')!r}). "
+                    + ("The check ran on another host or here instead, so nothing waits on it and nothing is "
+                       f"counted against any change. {fix}.{why} The host takes spilled checks again once its "
+                       "login works." if spilled and not queue else
+                       "Check runs wait instead of failing and nothing is counted against any change; the push "
+                       f"queue holds its batch. {fix}.{why} Waiting tasks and the queue resume once "
+                       "`ttp checks --env-ok` passes."))
             from . import screen   # an observation mute on source checks covers it: stored muted, counted there
-            status = "muted" if screen.count_muted(db, "checks", text, "high", now) else "queued"
+            status = ("muted" if screen.count_muted(db, "checks", text, "normal" if spilled and not queue else "high", now)
+                      else "queued")
             db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
-                 (now, "checks", "observation", fp, "high", text, status))
+                 (now, "checks", "observation", fp, "normal" if spilled and not queue else "high", text, status))
         return True
     except Exception:   # a note about the host never stops the caller from waiting
         return False

@@ -36,6 +36,11 @@ EVERY_S = 60.0
 DEAD_TEXT = ("error fetching identities", "communication with agent failed")
 
 
+def config_path() -> Path:
+    """This account's ssh config, where a bridge writes its marked block."""
+    return Path.home() / ".ssh" / "config"
+
+
 def links(text: str) -> dict[str, list[str]]:
     """The agent links the bridge's marked block names, each with the hosts that sign through it."""
     out: dict[str, list[str]] = {}
@@ -116,7 +121,7 @@ def check(host, now: float | None = None, config: Path | None = None, probe=answ
     now = time.time() if now is None else now
     db = host.p.db
     try:
-        found = links((config or Path.home() / ".ssh" / "config").read_text(errors="replace"))
+        found = links((config or config_path()).read_text(errors="replace"))
     except OSError:
         found = {}
     st = dict(db.kv(STATE_KEY, {}) or {})
