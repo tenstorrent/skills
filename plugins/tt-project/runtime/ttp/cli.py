@@ -7013,7 +7013,9 @@ def _sudo_report(watch, proc, group: bool, kw: dict) -> None:
                 out.flush()
             except (OSError, ValueError):
                 pass
-        sudowatch.observe(lines, f"{os.environ.get('TTP_RUN_ID') or os.getpid()}:{watch.started}")
+        # The check's own folder names the project: a test's check in a temp folder queues nothing on the
+        # project the test runs from
+        sudowatch.observe(lines, f"{os.environ.get('TTP_RUN_ID') or os.getpid()}:{watch.started}", kw.get("cwd"))
     finally:
         watch.close()
 

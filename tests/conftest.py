@@ -303,6 +303,40 @@ def _host_guard():
     return hs
 
 
+SUDO_FENCE_ENV = "TTP_TEST_SUDO_FENCE"   # the folder of the session's sudo fence (its calls.log beside it)
+SUDO_FENCE_RC = 126
+
+
+def _sudo_fence() -> str:
+    """No test, and no process a test starts, reaches the account's real sudo, whatever this host lets
+    the suite's user do: a stub sudo goes first on PATH that records its arguments and refuses (exit 126).
+    The sudo watch's wrapper (sudowatch) and the host-state sudo stand-in (hostshim) both pass a call on
+    to the first sudo on PATH that is not one of theirs: this one. An outer run's wrapper folder leaves
+    PATH (its log and setting were cleared above), and TTP_REFUSE_SUDO is 1 for every test: a test of the
+    record-and-pass-through path sets 0 itself and puts its own stub first. Calling /usr/bin/sudo by its
+    absolute path, or after resetting PATH, is not fenced (as sudowatch says of its wrapper)."""
+    import atexit
+    import shutil
+    import tempfile
+    root = tempfile.mkdtemp(prefix="ttp-test-sudo-")
+    fence = os.path.join(root, "sudo-fence")
+    os.mkdir(fence)
+    log = os.path.join(root, "calls.log")
+    with open(os.path.join(fence, "sudo"), "w") as f:
+        f.write("#!/bin/sh\n"
+                f"printf '%s\\n' \"$*\" >> {shlex.quote(log)} 2>/dev/null\n"
+                "echo \"sudo: refused: the tt-project test suite never runs the real sudo (tests/conftest.py)\" >&2\n"
+                f"exit {SUDO_FENCE_RC}\n")
+    os.chmod(os.path.join(fence, "sudo"), 0o755)
+    keep = [d for d in os.environ.get("PATH", "").split(os.pathsep) if os.path.basename(d) != "ttp-sudowatch"]
+    os.environ["PATH"] = os.pathsep.join([fence, *keep])
+    os.environ[SUDO_FENCE_ENV] = fence
+    os.environ["TTP_REFUSE_SUDO"] = "1"
+    atexit.register(shutil.rmtree, root, True)
+    return fence
+
+
+_SUDO_FENCE = _sudo_fence()
 _HOSTSTATE = _host_guard()
 os.environ.setdefault("TTP_NO_HAIKU", "1")   # no test asks Claude Haiku for a decision (cheapdecide)
 
@@ -372,6 +406,20 @@ def folder_diff(before: dict, after: dict) -> list[tuple[str, str]]:
 def folder_changes(before: dict, after: dict) -> list[str]:
     """One line per created, removed or changed file between two folder_marks."""
     return [f"  {p}: {how}" for p, how in folder_diff(before, after)]
+
+
+@pytest.fixture(autouse=True)
+def _sudo_fenced():
+    """Each test starts with sudo refused and the session's sudo fence on PATH (_sudo_fence), whatever an
+    earlier test left: `ttp checks` and the daemon write their project's checks.refuse_sudo into this
+    process's environment, which a test project's default would otherwise turn off for every later test."""
+    os.environ["TTP_REFUSE_SUDO"] = "1"
+    os.environ.pop("TTP_SUDO_LOG", None)
+    path = [d for d in os.environ.get("PATH", "").split(os.pathsep) if os.path.basename(d) != "ttp-sudowatch"]
+    if _SUDO_FENCE and _SUDO_FENCE not in path:
+        path.insert(0, _SUDO_FENCE)
+    os.environ["PATH"] = os.pathsep.join(path)
+    yield
 
 
 @pytest.fixture(autouse=True)

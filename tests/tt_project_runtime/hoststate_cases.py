@@ -161,6 +161,7 @@ def test_sudo_running_a_host_write_under_ttp_checks_is_refused_and_reported_and_
     (real / "sudo").write_text(f"#!/bin/sh\necho \"$*\" >> {shlex.quote(str(seen))}\n")
     (real / "sudo").chmod(0o755)
     monkeypatch.setenv("PATH", f"{real}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("TTP_REFUSE_SUDO", "0")   # the record-and-pass-through path, to this test's stub
     env = push.check_env("checks", run_dir=str(tmp_path / "run"))
     refused = ["sudo -n systemctl enable evil.service", "sudo -n -u root -- env A=1 reboot",
                "sudo -nE crontab -", "sudo install -m 644 x /etc/systemd/system/evil.service",
@@ -182,6 +183,41 @@ def test_sudo_running_a_host_write_under_ttp_checks_is_refused_and_reported_and_
     assert not leaked_tmp_processes(tmp_path), "no stand-in or sudo outlives the check"
 
 
+SUDO_WRITES = ["sudo -n systemctl enable evil.service", "sudo -n -u root -- env A=1 reboot",
+               "sudo -nE crontab -", "sudo install -m 644 x /etc/systemd/system/evil.service",
+               "sudo sh -c 'true && systemctl --user daemon-reload'", "sudo -n timeout 5 shutdown -h now",
+               "sudo /usr/sbin/poweroff", "sudo sudo -n halt", "sudo env -i PATH=/x systemctl enable x"]
+
+
+@pytest.mark.parametrize("refuse", ["0", "1"])
+def test_no_host_write_through_sudo_reaches_a_recording_real_sudo_in_either_mode(tmp_path, monkeypatch, refuse,
+                                                                                 leaked_tmp_processes):
+    # The wrapper records (0) or refuses (1); either way the "real" sudo, a recorder here, never sees a
+    # host write, and the session's own fence (tests/conftest.py) never sees one either
+    from ttp import push, sudowatch
+    _fake_host(tmp_path, monkeypatch)
+    real, seen = tmp_path / "realsudo", tmp_path / "sudo-ran"
+    real.mkdir()
+    (real / "sudo").write_text(f"#!/bin/sh\necho \"$*\" >> {shlex.quote(str(seen))}\n")
+    (real / "sudo").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{real}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("TTP_REFUSE_SUDO", refuse)
+    fence_log = pathlib.Path(os.environ["TTP_TEST_SUDO_FENCE"]).parent / "calls.log"
+    fenced = fence_log.read_text() if fence_log.exists() else ""
+    env = push.check_env("checks", run_dir=str(tmp_path / "run"))
+    script = "; ".join(f"{c} < /dev/null; echo \"rc=$?\"" for c in SUDO_WRITES)
+    log = tmp_path / "checks.log"
+    with open(log, "w") as out:
+        rc = _run_check_ended(["sh", "-c", script], cwd=tmp_path, stdout=out, stderr=subprocess.STDOUT, env=env)
+    text = log.read_text()
+    assert rc == 0, text
+    assert not seen.exists(), seen.read_text()
+    assert (fence_log.read_text() if fence_log.exists() else "") == fenced
+    want = f"rc={sudowatch.REFUSED_RC}" if refuse == "1" else "rc=1"
+    assert text.count(want) == len(SUDO_WRITES), text
+    assert not leaked_tmp_processes(tmp_path)
+
+
 def test_a_hung_sudo_check_times_out_and_leaves_no_stand_in_or_sudo_running(tmp_path, monkeypatch,
                                                                             leaked_tmp_processes):
     # A read sudo passes on that never ends (the real sudo spinning): the check ends at its timeout with
@@ -193,6 +229,7 @@ def test_a_hung_sudo_check_times_out_and_leaves_no_stand_in_or_sudo_running(tmp_
     (real / "sudo").write_text("#!/bin/sh\nwhile :; do :; done\n")
     (real / "sudo").chmod(0o755)
     monkeypatch.setenv("PATH", f"{real}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("TTP_REFUSE_SUDO", "0")   # passed on to the spinning stub, not refused
     env = push.check_env("checks", run_dir=str(tmp_path / "run"))
     with open(tmp_path / "checks.log", "w") as out, pytest.raises(subprocess.TimeoutExpired):
         _run_check_ended(["sh", "-c", "sudo -n true"], timeout=2, cwd=tmp_path, stdout=out,

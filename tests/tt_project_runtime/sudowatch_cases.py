@@ -3,7 +3,8 @@
 
 
 def _sudo_path(tmp_path, stub: bool = True) -> tuple[str, pathlib.Path]:
-    """A scratch PATH: a stub sudo (it writes its arguments to calls.txt and exits 3) and links to the
+    """A scratch PATH: a stub sudo (it writes its arguments to calls.txt, its pid, which is the wrapper's
+    since the wrapper execs it, to pids.txt, and exits 3) and links to the
     few tools the wrapper uses. No directory on it holds a real sudo."""
     tools, stub_dir = tmp_path / "tools", tmp_path / "stub"
     tools.mkdir(parents=True)
@@ -12,7 +13,8 @@ def _sudo_path(tmp_path, stub: bool = True) -> tuple[str, pathlib.Path]:
         (tools / name).symlink_to(shutil.which(name))
     if stub:
         s = stub_dir / "sudo"
-        s.write_text(f"#!/bin/sh\necho \"$*\" >> {shlex.quote(str(tmp_path / 'calls.txt'))}\nexit 3\n")
+        s.write_text(f"#!/bin/sh\necho \"$*\" >> {shlex.quote(str(tmp_path / 'calls.txt'))}\n"
+                     f"echo $$ >> {shlex.quote(str(tmp_path / 'pids.txt'))}\nexit 3\n")
         s.chmod(0o755)
     return os.pathsep.join([str(stub_dir), str(tools)]), tmp_path / "calls.txt"
 
@@ -88,20 +90,10 @@ def test_sudowatch_nested_wrappers_skip_each_other_and_no_sudo_is_127(tmp_path):
         w.close()
 
 
-def test_sudowatch_command_name_skips_sudo_options_and_assignments():
-    from ttp.sudowatch import command_name
-    assert command_name("-n ipmitool sdr elist") == "ipmitool"
-    assert command_name("-u root -E FOO=1 /usr/bin/ipmitool raw 0x06") == "ipmitool"
-    assert command_name("-nu root timeout 5 ipmitool") == "timeout"
-    assert command_name("-uroot -n ls") == "ls"
-    assert command_name("--user=root -- ls -l") == "ls"
-    assert command_name("--user root --preserve-env ls") == "ls"
-    assert command_name("-n") == "" and command_name("") == ""
-
-
 def test_sudowatch_leftovers_are_live_root_processes_started_through_sudo_only():
-    """An orphaned root child (reparented away from sudo) is found by its command's name; a root child
-    still under the recorded sudo by its ancestry; one in the check's session by it. Older root processes,
+    """A root child still under the recorded sudo is found by its ancestry; one in the check's session by
+    it. A root process with no link to the check is never listed, even one named like the command sudo
+    ran or started during the check (a host agent's uploader, another user's job): older root processes,
     the user's own processes and unrelated root ones are not listed. Calls without leftovers say only the
     calls; no calls say nothing."""
     from ttp import sudowatch
@@ -111,17 +103,22 @@ def test_sudowatch_leftovers_are_live_root_processes_started_through_sudo_only()
     def proc(pid, ppid, uid, name, start=t0 + 5, sid=1, cmd=None):
         return {"pid": pid, "ppid": ppid, "sid": sid, "start": start, "uids": [uid, uid], "name": name,
                 "cmd": cmd or f"/usr/bin/{name} x"}
-    procs = [proc(600, 900, 0, "ipmitool"),                 # orphan: name
+    calls.append({"ts": "1002", "pid": 510, "run": "", "how": "ran", "args": "sh -c 'true && systemctl --user daemon-reload'"})
+    procs = [proc(600, 900, 0, "ipmitool"),                 # same name, no link: not the check's
              proc(601, 500, 0, "helper"),                   # under the sudo: ancestry
              proc(602, 1, 0, "other", sid=4242),            # in the check's session
              proc(603, 900, 0, "ipmitool", start=t0 - 60),  # older than the suite
              proc(604, 900, 1000, "ipmitool"),              # the user's own
-             proc(605, 1, 0, "cron")]                       # unrelated root
+             proc(605, 1, 0, "cron"),                       # unrelated root
+             proc(606, 1, 0, "bash", cmd="/bin/bash -c set -eo pipefail; zstd -8 --stdout stats"),  # a host agent's job
+             proc(607, 606, 0, "sh", cmd="sh -c mkdir /jail"),   # its child, named like a sudo call's command
+             proc(608, 700, 0, "deep"), proc(700, 601, 0, "mid")]   # two levels under the sudo: ancestry
     left = sudowatch.leftovers(calls, t0, (4242,), procs)
-    assert [p["pid"] for p in left] == [600, 601, 602]
+    assert sorted(p["pid"] for p in left) == [601, 602, 608, 700]
     lines = sudowatch.report_lines(calls, t0, (4242,), "the check", procs)
-    assert "3 root processes started through sudo in the check" in lines[1] and "only root can end them" in lines[1]
-    assert "pid 600 /usr/bin/ipmitool x" in lines[1] and "checks.refuse_sudo" in lines[2]
+    assert "4 root processes started through sudo in the check" in lines[1] and "only root can end them" in lines[1]
+    assert "pid 601 /usr/bin/helper x" in lines[1] and "checks.refuse_sudo" in lines[2]
+    assert "zstd" not in lines[1] and "ipmitool" not in lines[1] and "mkdir" not in lines[1]
     assert sudowatch.report_lines(calls, t0, (), "the check", procs=[]) == lines[:1]
     assert sudowatch.report_lines([], t0, procs=procs) == []
     refused = [{**calls[0], "how": "refused"}]
@@ -144,12 +141,12 @@ def test_sudowatch_observation_is_queued_once_per_suite(monkeypatch):
 
         def exists(self):
             return True
-    monkeypatch.setattr(project, "here", lambda: P())
+    monkeypatch.setattr(project, "here", lambda start=None: P())
     lines = ["sudo: the check called sudo 1 time: sudo x", "sudo: 1 root process started ... only root can end it", "z"]
     assert sudowatch.observe(lines, "k") and sudowatch.observe(lines, "k")
     assert len(rows) == 1 and rows[0][2:5] == ("observation", "sudowatch:k", "normal")
     assert not sudowatch.observe(lines[:1], "k2") and len(rows) == 1   # calls alone: no observation
-    monkeypatch.setattr(project, "here", lambda: None)
+    monkeypatch.setattr(project, "here", lambda start=None: None)
     assert not sudowatch.observe(lines, "k3")
 
 
@@ -162,10 +159,14 @@ def test_a_check_gets_the_sudo_wrapper_and_its_report_never_fails_it(tmp_path, m
     monkeypatch.setenv("PATH", os.pathsep.join(d for d in os.environ.get("PATH", "").split(os.pathsep)
                                                if os.path.basename(d) != sudowatch.DIR_NAME))
     path, calls = _sudo_path(tmp_path)
+    # A root child of the recorded sudo (the stub's pid is the wrapper's), and an unrelated root process
+    # with the same name started meanwhile: only the first is the check's
     monkeypatch.setattr(sudowatch, "processes", lambda: [
-        {"pid": 4321, "ppid": 1, "sid": 1, "start": time.time() + 30, "uids": [0, 0], "name": "ipmitool",
-         "cmd": "ipmitool sdr elist"}])
-    monkeypatch.setattr(sudowatch, "observe", lambda lines, key: seen.append(lines) or True)
+        {"pid": 4321, "ppid": int((tmp_path / "pids.txt").read_text().split()[0]), "sid": 1,
+         "start": time.time() + 30, "uids": [0, 0], "name": "ipmitool", "cmd": "ipmitool sdr elist"},
+        {"pid": 4322, "ppid": 1, "sid": 1, "start": time.time() + 30, "uids": [0, 0], "name": "ipmitool",
+         "cmd": "ipmitool sel list"}])
+    monkeypatch.setattr(sudowatch, "observe", lambda lines, key, start=None: seen.append((lines, start)) or True)
     monkeypatch.setitem(cli._CHECK_STOP, "stopped", None)
     seen = []
     log = tmp_path / "check.log"
@@ -175,8 +176,9 @@ def test_a_check_gets_the_sudo_wrapper_and_its_report_never_fails_it(tmp_path, m
     text = log.read_text()
     assert rc == 0 and calls.read_text() == "-n ipmitool sdr elist\n"
     assert "ttp checks: sudo: the check called sudo 1 time" in text
-    assert "pid 4321 ipmitool sdr elist" in text and "only root can end it" in text
+    assert "pid 4321 ipmitool sdr elist" in text and "only root can end it" in text and "4322" not in text
     assert len(seen) == 1 and "ttp-sudowatch" not in os.environ.get("PATH", "")
+    assert seen[0][1] == tmp_path, "the report goes to the project of the check's own folder"
     calls.unlink()
     with open(log, "w") as out:
         rc = cli._run_check(["sh", "-c", "sudo -n ipmitool sdr elist"], True, cwd=tmp_path, stdout=out,
@@ -190,7 +192,7 @@ def test_ttp_sandbox_reports_the_commands_sudo_on_stderr_and_keeps_its_exit_code
     monkeypatch.setattr(sandbox, "wrap", lambda argv, *a, **k: list(argv))
     monkeypatch.setattr(sandbox, "notice", lambda *a: "")
     monkeypatch.setattr(sudowatch, "processes", lambda: [])
-    monkeypatch.setattr(sudowatch, "observe", lambda lines, key: False)
+    monkeypatch.setattr(sudowatch, "observe", lambda lines, key, start=None: False)
     monkeypatch.setenv("PATH", path)
     monkeypatch.setenv("TTP_REFUSE_SUDO", "0")
     # Under `timeout`: a wrapper and a sudo stand-in that run each other would hang here, not fail.
@@ -253,3 +255,51 @@ def test_hoststate_and_hostshim_name_the_sudo_wrapper_folder_as_sudowatch_does()
     from ttp import hostshim, hoststate, sudowatch
     assert hoststate.SUDO_WRAPPER_DIR == sudowatch.DIR_NAME
     assert f'"{sudowatch.DIR_NAME}"' in pathlib.Path(hostshim.__file__).read_text()
+
+
+def test_the_suite_never_reaches_the_real_sudo_a_fence_answers_every_call_by_name(tmp_path):
+    """tests/conftest.py: every test runs with sudo refused, no outer run's wrapper or log on PATH, and a
+    recording stub that refuses first on PATH, so a call by name, straight or passed on by the wrapper and
+    the host-state sudo stand-in, ends at the fence and never at the account's real sudo."""
+    from ttp import push, sudowatch
+    fence = pathlib.Path(os.environ["TTP_TEST_SUDO_FENCE"])
+    fence_log = fence.parent / "calls.log"
+    assert os.environ.get("TTP_REFUSE_SUDO") == "1" and not os.environ.get(sudowatch.ENV_LOG)
+    assert not any(os.path.basename(d) == sudowatch.DIR_NAME for d in os.environ["PATH"].split(os.pathsep))
+    # The first sudo on PATH that is not a host-state stand-in (hostshim passes calls on to it) is the fence
+    first = next(d for d in os.environ["PATH"].split(os.pathsep)
+                 if d and os.access(os.path.join(d, "sudo"), os.X_OK) and not os.path.exists(os.path.join(d, ".ttp-shims")))
+    assert first == str(fence)
+    mark = f"fence-probe-{tmp_path.name}"
+    # Straight, through the host-state stand-in, and through the wrapper in record mode then the stand-in
+    r = subprocess.run(["sudo", "-n", "true", mark + "-a"], capture_output=True, text=True, timeout=30)
+    assert r.returncode == 126 and "never runs the real sudo" in r.stderr, r.stderr
+    w = sudowatch.Watch(push.check_env("checks", run_dir=str(tmp_path)), refuse=False)
+    try:
+        r = subprocess.run(["sudo", "-n", "true", mark + "-b"], env=w.env, capture_output=True, text=True, timeout=30)
+        assert r.returncode == 126 and "never runs the real sudo" in r.stderr, r.stderr
+        assert [c["how"] for c in w.calls()] == ["ran"]   # recorded, passed on, stopped at the fence
+    finally:
+        w.close()
+    said = fence_log.read_text().splitlines()
+    assert f"-n true {mark}-a" in said and f"-n true {mark}-b" in said
+
+
+def test_a_check_inside_a_suite_logs_its_sudo_only_to_its_own_watch_never_the_outer_one(tmp_path, monkeypatch):
+    """A check run inside a watched suite (a harness test under `ttp checks`, `ttp sandbox` under it) gets a
+    wrapper and log of its own: the outer run's log stays empty, and the outer wrapper leaves its PATH."""
+    from ttp import cli, sudowatch
+    path, calls = _sudo_path(tmp_path)
+    outer = sudowatch.Watch({"PATH": path, "TTP_RUN_ID": "outer"}, refuse=False)
+    monkeypatch.setattr(sudowatch, "observe", lambda lines, key, start=None: False)
+    monkeypatch.setitem(cli._CHECK_STOP, "stopped", None)
+    try:
+        with open(tmp_path / "check.log", "w") as out:
+            rc = cli._run_check(["sh", "-c", "echo \"$PATH\" > path.txt; sudo -n crontab -l; true"], True,
+                                cwd=tmp_path, stdout=out, stderr=subprocess.STDOUT, env=dict(outer.env))
+        assert rc == 0 and calls.read_text() == "-n crontab -l\n"
+        assert outer.calls() == [], "the outer run's log is never written by the inner check"
+        assert str(outer.dir) not in (tmp_path / "path.txt").read_text()
+        assert "ttp checks: sudo: the check called sudo 1 time" in (tmp_path / "check.log").read_text()
+    finally:
+        outer.close()

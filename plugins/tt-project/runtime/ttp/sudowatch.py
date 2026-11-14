@@ -15,10 +15,14 @@ project; the report never fails a check or a head.
 it exits 126 with a message naming the key and never calls the real sudo. The daemon passes the setting
 to its runs as TTP_REFUSE_SUDO; `ttp checks` also reads it from project.json.
 
-A root process counts as started through the wrapper when it started after the suite did and its pid
-or an ancestor's is a recorded sudo, it is in the check's own session, or its name is that of a command
-run through sudo (orphans keep only that link, so a same-named root process started meanwhile by
-someone else is listed too). A PATH wrapper is no fence: a suite that calls /usr/bin/sudo by its
+A root process counts as started through the wrapper only when it started after the suite did and it
+is linked to the suite itself: its pid or an ancestor's is a recorded sudo (the wrapper's pid, which the
+sudo it execs keeps), or it is in the check's own session. A root process that merely started during
+the suite (a host agent, another user's job) is never listed, even with the same command name as a
+sudo call. Accepted gap: a root child whose sudo was itself killed and that left the check's session
+(sudo's use_pty gives the command a session of its own) has no link left and is not listed. The report
+goes to the project of the check's own folder, never one found from the caller's working folder: a
+test running a check in a temp folder queues nothing on the project it is run from. A PATH wrapper is no fence: a suite that calls /usr/bin/sudo by its
 absolute path, or after resetting PATH (`env -i`, `command -p`), bypasses it, and that call is neither
 recorded nor refused."""
 from __future__ import annotations
@@ -35,11 +39,6 @@ ENV_LOG = "TTP_SUDO_LOG"
 DIR_NAME = "ttp-sudowatch"   # a PATH entry with this name is a wrapper: the wrapper skips it looking for sudo
 REFUSED_RC = 126
 PROC = Path("/proc")
-# sudo's options that take a value (short letters; long names in either `--name value` or `--name=value`).
-_SHORT_ARG = set("CDghpRrTtUu")
-_LONG_ARG = {"--close-from", "--chdir", "--group", "--host", "--prompt", "--chroot", "--role", "--type",
-             "--command-timeout", "--other-user", "--user"}
-
 WRAPPER = r"""#!/bin/sh
 # tt-project sudo wrapper for test suites (sudowatch.py): records each call, then runs the real sudo.
 log="${TTP_SUDO_LOG:-}"
@@ -125,28 +124,6 @@ class Watch:
         shutil.rmtree(self.dir, ignore_errors=True)
 
 
-def command_name(args: str) -> str:
-    """The command sudo runs, by its base name, from sudo's arguments (options and VAR=value skipped)."""
-    words, i = args.split(), 0
-    while i < len(words):
-        w = words[i]
-        if w == "--":
-            i += 1
-            break
-        if w.startswith("--"):
-            i += 2 if (w in _LONG_ARG and "=" not in w) else 1
-            continue
-        if w.startswith("-") and len(w) > 1:
-            j = next((k for k, c in enumerate(w[1:], 1) if c in _SHORT_ARG), None)
-            i += 2 if j is not None and j == len(w) - 1 else 1
-            continue
-        if "=" in w and not w.startswith("/"):
-            i += 1
-            continue
-        break
-    return os.path.basename(words[i]) if i < len(words) else ""
-
-
 def _boot() -> float:
     for ln in (PROC / "stat").read_text().splitlines():
         if ln.startswith("btime "):
@@ -189,7 +166,6 @@ def leftovers(calls: list[dict], started: float, sids: tuple = (), procs: list[d
     procs = processes() if procs is None else procs
     parent = {p["pid"]: p["ppid"] for p in procs}
     sudo_pids = {c["pid"] for c in ran}
-    names = {n for c in ran if (n := command_name(c["args"]))}
     out = []
     for p in procs:
         if 0 not in p["uids"] or p["start"] < started - 1:
@@ -198,8 +174,7 @@ def leftovers(calls: list[dict], started: float, sids: tuple = (), procs: list[d
         while pid > 1 and pid not in seen and pid not in sudo_pids:
             seen.add(pid)
             pid = parent.get(pid, 0)
-        argv0 = os.path.basename(p["cmd"].split()[0]) if p["cmd"] and not p["cmd"].startswith("[") else ""
-        if pid in sudo_pids or p["sid"] in sids or argv0 in names or p["name"] in {n[:15] for n in names}:
+        if pid in sudo_pids or p["sid"] in sids:   # never by name alone: an unrelated root job is not the suite's
             out.append(p)
     return out
 
@@ -224,14 +199,15 @@ def report_lines(calls: list[dict], started: float, sids: tuple = (), what: str 
     return lines
 
 
-def observe(lines: list[str], key: str) -> bool:
-    """Queue the leftover report as one observation for the project here (deduplicated by `key`);
-    False when there is no project or its database cannot be written (a read-only sandbox)."""
+def observe(lines: list[str], key: str, start: str | Path | None = None) -> bool:
+    """Queue the leftover report as one observation for the project of `start` (the check's own folder;
+    default this process's: project.here), deduplicated by `key`; False when there is no project or its
+    database cannot be written (a read-only sandbox)."""
     if not any("root process" in ln for ln in lines):
         return False
     try:
         from .project import here
-        p = here()
+        p = here(start)
         if not (p and p.exists()):
             return False
         fp = f"sudowatch:{key}"
