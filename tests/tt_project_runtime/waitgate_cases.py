@@ -816,6 +816,25 @@ def test_the_wake_gate_judges_a_planned_check_by_its_plan(env, tmp_path, by, wak
     lk.close()
 
 
+def test_a_planned_check_soon_after_an_event_wake_is_judged_by_its_plan_not_the_cached_wake(env, tmp_path):
+    """[note 7b004a104c6a05bd] An under-use wake the daemon could not start yet is cached as the same wake;
+    a planned check (plan_by plain) on the same wait due within max_backoff_s is a new decision: its
+    running job is no turn. The same under-use wake re-gated is still the cached one."""
+    p = make(env)
+    rc, lk = _running_job(tmp_path)
+    tid = _gate_task(p, tmp_path, f"ttp detach --check {rc}")
+    _gate_set(p, tid, woke="its detached job under-uses what it asked for: 1 of 8 cores", wake_reason="underuse")
+    first = _gate_decide(p, tid)
+    assert first.wake and first.by == "event", first
+    again = _gate_decide(p, tid)
+    assert again.wake and again.extra.get("repeat"), again
+    _gate_set(p, tid, woke="its planned interim check (1 of 2): ...", wake_reason="plan_check", plan_by="plain",
+              plan_tier="light")
+    d = _gate_decide(p, tid)
+    assert not d.wake and not d.extra.get("repeat"), d
+    lk.close()
+
+
 class _NoKeyJev(_GateJev):
     def enabled(self):
         return False

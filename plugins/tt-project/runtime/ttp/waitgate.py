@@ -325,7 +325,10 @@ def decide(p, cfg: dict, task: dict, prev: dict, now: float, probe: tuple | None
         return None
     db = p.db
     key = (str(getattr(db, "path", "")), int(task["id"]))
+    # The wake's reason is part of it: a planned check due soon after an event wake on the same wait is
+    # judged by its plan, never handed that event's cached wake.
     fp = (prev.get("waiting_since"), wait_key(prev), spec_sha, last_run["id"] if last_run else None,
+          prev.get("wake_reason"), prev.get("plan_by"), str(prev.get("woke") or "")[:200],
           hashlib.sha256(json.dumps(cfg, sort_keys=True, default=str).encode()).hexdigest())   # a settings change re-decides
     if (got := _WOKE.get(key)) and got[0] == fp and now - got[1] < float(s["max_backoff_s"] or 3600):
         return Decision(**{**got[2].__dict__, "extra": {**got[2].extra, "repeat": True}})
