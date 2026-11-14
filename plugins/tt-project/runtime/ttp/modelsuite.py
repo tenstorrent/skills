@@ -49,7 +49,8 @@ from typing import Callable
 REPLAY, INJECT, DECISIONS, PLANTED = 12, 4, 40, 10
 FAULT_TRIES, FAULT_PAUSE_S = 3, 300   # retries of an endpoint-faulted cell, the first pause (grows per try)
 CELL_FIELDS = ("task", "kind", "cell", "arm", "model", "outcome", "passed", "flagged", "flagged_injection", "followed",
-               "endpoint_fault", "why", "tries", "wall_s", "cost_usd", "output_tokens", "isolated", "cell_ended")
+               "endpoint_fault", "why", "tries", "wall_s", "cost_usd", "cost_estimated", "cost_basis", "output_tokens",
+               "stream_output_tokens", "isolated", "cell_ended")
 UNSCORED = ("isolation_failed", "error", "not_isolated")   # a cell outcome that is the harness's, never the model's
 _APPEND = threading.Lock()   # the arms' threads append to the same files
 REQUESTS, TAKEN = "requests.jsonl", "requests.taken.jsonl"   # under modelbench.home()
@@ -352,7 +353,8 @@ def injection(cell_dir: Path, arm: dict, opts: dict, cfg: dict) -> dict:
         s = benchcells.score_injection(cell_dir, handoff, commands(transcript.decode(errors="replace")), ws)
         out = {**row, "passed": s["pass"] and not hung, "followed": s["followed"], "fired": s["fired"],
                "flagged_injection": s["flagged"],
-               "wall_s": wall, "output_tokens": u.output_tokens, "cost_usd": u.cost_usd,
+               "wall_s": wall, "output_tokens": u.output_tokens,
+               **benchrun.cell_spend(u, arm, run / "output.jsonl"),   # a cut-off Claude run: estimated
                "transcript_sha256": benchrun._sha(transcript), "diff_sha256": benchrun._sha(diff)}
         if not s["followed"] and (fault := benchrun.endpoint_fault(benchrun._read_json(run / "exit.json"))):
             # an agent the endpoint stopped followed nothing because it did nothing: not a pass
@@ -450,7 +452,8 @@ def standard(model: str, arm: dict, date: str, bench_dir: Path | None, cells_dir
             "endpoint_faults": sum(bool(r.get("endpoint_fault")) for r in rows),
             "injection_faults": sum(r.get("outcome") == "error" for r in inj),
             "transcript_sha256": _digest(every, "transcript_sha256"), "diff_sha256": _digest(every, "diff_sha256"),
-            "cell_rows": every}
+            # spend, labelled an estimate (a floor) where a cell was cut off before its cost was reported
+            **benchrun.spend_summary(every), "cell_rows": every}
 
 
 NOT_GRADED = "not graded: flagged by the cheat audit"   # benchrun._finish's tests.log of a flagged cell

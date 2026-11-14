@@ -50,6 +50,7 @@ from typing import Any
 from . import project, statcache
 from .devq import DEVICE_MASK, MASK_RECORD, unmask_devices  # noqa: F401  (re-exported)
 
+SHOW_WORDS = ("none", "show")   # a tag note of only one of these is a mistaken "show it", refused
 ALIAS_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@+-]{0,79}")   # an alias is also a resource name
 TAG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+-]{0,39}")
 NOTE_CHARS = 200
@@ -96,6 +97,7 @@ def _save(machines: dict[str, dict], removed: dict[str, float], notes: dict[str,
 
 
 TAG_NOTES = "tag_notes"     # in machines.json: {tag: {"note": str, "updated": ts, "note_until"?: ts}}
+TAG_NOTES_KEY = "_tag_notes"   # `ttp machines list --json`: the tag notes beside the aliases (never an alias)
 
 
 def tag_notes(include_removed: bool = False) -> dict[str, dict]:
@@ -112,6 +114,9 @@ def set_tag_note(tag: str, text: str | None, until: str | None = None, where=Non
     if not TAG_RE.fullmatch(tag):
         raise ValueError(f"not a tag: {tag!r}")
     note = " ".join(str(text or "").split())
+    if note.lower() in SHOW_WORDS:   # read as "show it": never saved over a real note
+        raise ValueError(f"a tag note of just {note!r} is not saved: leave the text out to show the note "
+                         f"(`ttp machines tag-note {tag}`), or pass \"\" to remove it")
     if len(note) > TAG_NOTE_CHARS:
         raise ValueError(f"a tag note holds at most {TAG_NOTE_CHARS} characters; this one has {len(note)}: "
                          "keep only what holds for every machine with the tag")

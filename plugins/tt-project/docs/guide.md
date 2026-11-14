@@ -1279,7 +1279,13 @@ installed runs the held-out tests. Each venv sees the OS's packages and gets a c
 installed pytest and what it requires. A cell whose agent venv cannot be built runs no agent and is
 recorded `isolation_failed`. Each cell appends a row to
 `results.jsonl` (cost, tokens, wall time, hand-off status, pass or fail, flags, and the sha256 of its
-transcript and diff) and keeps its transcript, diff and test log under `cells/`; a rerun into the same
+transcript and diff) and keeps its transcript, diff and test log under `cells/`. A Claude cell cut off
+before its result line reports no cost, and its stream counts each message's output as it starts: it
+is priced at list price from its tokens, output at the larger of that count and its written content
+(text, visible thinking, tool inputs) at 4 characters a token, marked `cost_estimated` with a
+`cost_basis` saying it is a floor. The model-bench suite's row sums the spend and adds a `cost_note`
+when any cell is estimated, which also says when estimated rows priced before this rule (no
+`cost_basis`) sit beside newer ones, as they are not comparable. A rerun into the same
 folder skips recorded cells and refuses a different plan. A cell whose hand-off is not a JSON
 object is still graded (hand-off `invalid`); any other fault after its agent ran records the cell
 as `error` with its cost and wall time, so the bench moves on and a rerun does not pay for it again. Each run

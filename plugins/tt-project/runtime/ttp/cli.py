@@ -11261,9 +11261,9 @@ def cmd_machines(a) -> None:
                 print(f"copying the machines list to {', '.join(hosts)} in the background (results: {log}; "
                       f"`ttp machines push` copies in the foreground)")
     else:
-        known = mm.load()
-        if a.json:
-            print(json.dumps(known, indent=2, sort_keys=True))
+        known, notes = mm.load(), mm.tag_notes()
+        if a.json:   # "_tag_notes" can never be an alias (machines.ALIAS_RE starts with a letter or digit)
+            print(json.dumps({**known, **({mm.TAG_NOTES_KEY: notes} if notes else {})}, indent=2, sort_keys=True))
             return
         if not known:
             print("no machines yet: ttp machines add <alias> --tags device,... [--note TEXT]")
@@ -11273,8 +11273,9 @@ def cmd_machines(a) -> None:
             print(mm.line(alias, known[alias]))
             if alias in holds:
                 print("  " + fleethold.line(holds[alias]))
-        for tag, n in sorted(mm.tag_notes().items()):
-            print(mm.tag_note_line(tag, n))
+        carried = {t for m in known.values() for t in mm._tags_of(m)}
+        for tag, n in sorted(notes.items()):   # a note for a tag no machine has yet still shows
+            print(mm.tag_note_line(tag, n) + ("" if tag in carried else " (no listed machine has this tag)"))
 
 
 def _machine_activity(a) -> None:
@@ -16032,13 +16033,14 @@ def main(argv: list[str] | None = None) -> None:
     m.add_argument("--fallback", help="the project that takes over when the owner cannot act (\"\" = none)")
     m.add_argument("--no-ssh-check", dest="no_ssh_check", action="store_true",
                    help="save a new alias even when `ssh -G` finds no route to it (a machine never reached by ssh)")
-    m = ms.add_parser("list", help="list your machines")
-    m.add_argument("--json", action="store_true", help="print JSON")
+    m = ms.add_parser("list", help="list your machines and the tag notes")
+    m.add_argument("--json", action="store_true", help="print JSON: alias to machine, plus the tag notes under "
+                                                       "\"_tag_notes\" when there are any")
     m = ms.add_parser("tag-note", help="one note for every machine with a tag, shown to every project's coordinator "
                                        "and to workers on those machines")
     m.add_argument("tag", help="the tag (e.g. device)")
-    m.add_argument("text", nargs="?", help="the note, at most 1500 characters, no secrets (\"\" removes it; "
-                                           "none: show it)")
+    m.add_argument("text", nargs="?", help="the note, at most 1500 characters, no secrets; leave it out to show "
+                                           "the note, \"\" removes it (a note of just none or show is refused)")
     m.add_argument("--until", help="when the note stops being true (a delay such as 3d, or an ISO time, home zone "
                                    "unless it names one)")
     m = ms.add_parser("status", help="per machine: the projects using it, its recovery owner, pauses, open changes, "

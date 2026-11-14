@@ -112,3 +112,53 @@ def test_watcher_real_episodes_of_one_stable_key_are_not_churn(env, monkeypatch)
     for n in range(1, 6):
         run("perval", {"text": f"box-a: queue {n} deep", "severity": "high", "key": f"queue:{n}"})
     assert watchdup.counts(p.db, "watcher:perval", time.time()) == [("box-a", 5)]
+
+
+def test_machines_list_shows_tag_notes_with_no_machines_and_in_json(env, capsys):
+    import json
+    from ttp import machines as mm
+    from ttp.cli import main
+    main(["machines", "tag-note", "kindy", "a note before any machine has the tag"])
+    capsys.readouterr()
+    main(["machines", "list"])
+    out = capsys.readouterr().out
+    assert "every machine tagged kindy: a note before any machine has the tag (no listed machine has this tag)" in out
+    main(["machines", "list", "--json"])
+    doc = json.loads(capsys.readouterr().out)
+    assert doc == {mm.TAG_NOTES_KEY: {"kindy": mm.tag_notes()["kindy"]}}
+    assert not mm.ALIAS_RE.fullmatch(mm.TAG_NOTES_KEY)   # never mistaken for a machine
+    main(["machines", "add", "box-y", "--tags", "kindy", "--no-ssh-check"])
+    capsys.readouterr()
+    main(["machines", "list"])
+    out = capsys.readouterr().out
+    assert "every machine tagged kindy: a note before any machine has the tag\n" in out
+    main(["machines", "list", "--json"])
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["box-y"]["tags"] == ["kindy"] and doc[mm.TAG_NOTES_KEY]["kindy"]["note"].startswith("a note before")
+    # No tag notes: the JSON is the machines alone, as before.
+    main(["machines", "tag-note", "kindy", ""])
+    capsys.readouterr()
+    main(["machines", "list", "--json"])
+    assert list(json.loads(capsys.readouterr().out)) == ["box-y"]
+
+
+def test_a_tag_note_of_none_or_show_never_overwrites_a_note(env, capsys):
+    import pytest
+    from ttp import machines as mm
+    from ttp.cli import main
+    main(["machines", "tag-note", "kindz", "the real note"])
+    for word in ("none", "None", " NONE ", "show"):
+        with pytest.raises(SystemExit):
+            main(["machines", "tag-note", "kindz", word])
+        assert "leave the text out to show the note" in capsys.readouterr().err
+        assert mm.tag_notes()["kindz"]["note"] == "the real note"
+    capsys.readouterr()
+    main(["machines", "tag-note", "kindz"])   # no text: shows it, changes nothing
+    assert capsys.readouterr().out.strip() == "every machine tagged kindz: the real note"
+    assert mm.tag_notes()["kindz"]["note"] == "the real note"
+    # A note that only mentions the word is a note; the help says how to show one.
+    main(["machines", "tag-note", "kindz", "none of these boxes has a fan"])
+    assert mm.tag_notes()["kindz"]["note"] == "none of these boxes has a fan"
+    with pytest.raises(SystemExit):
+        main(["machines", "tag-note", "--help"])
+    assert "leave it out to show the note" in " ".join(capsys.readouterr().out.split())

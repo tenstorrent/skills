@@ -1808,3 +1808,65 @@ def test_bench_cell_cut_off_before_its_result_line_is_priced_from_its_tokens(env
     # A pricing failure never breaks the cell.
     monkeypatch.setattr(localspend, "price", lambda *a, **k: 1 / 0)
     assert benchrun.cell_cost(cut, {"provider": "claude", "model": "m"}) == (0.0, True)
+
+
+def _claude_stream(path, result: bool) -> None:
+    # A made-up Claude stream: two messages whose usage reads 3 output tokens each (counted as they start),
+    # streamed one block per event, the first block repeated; a result line only when `result`.
+    import json
+    usage = {"input_tokens": 5, "output_tokens": 3, "cache_read_input_tokens": 1000, "cache_creation_input_tokens": 50}
+    events = [{"type": "system", "subtype": "init", "session_id": "s1", "model": "m-one"}]
+    for ident, blocks in (("msg-1", [{"type": "text", "text": "x" * 4000},
+                                     {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "y" * 2000}}]),
+                          ("msg-2", [{"type": "thinking", "thinking": "z" * 400}, {"type": "text", "text": "w" * 1600}])):
+        for b in [blocks[0], *blocks]:
+            events.append({"type": "assistant", "message": {"id": ident, "usage": usage, "content": [b]}})
+    if result:
+        events.append({"type": "result", "subtype": "success", "total_cost_usd": 0.42, "result": "done",
+                       "usage": {**usage, "output_tokens": 2100}})
+    path.write_text("".join(json.dumps(e) + "\n" for e in events))
+
+
+def test_bench_cut_off_claude_cell_prices_output_from_its_content_and_says_it_is_an_estimate(env, monkeypatch, tmp_path):
+    from ttp import benchrun, localspend, modelsuite
+    from ttp.providers import get_provider
+    seen = []
+
+    def price(model, usage, overrides=None, rows=None):
+        seen.append(dict(usage))
+        return usage["output_tokens"] / 1000, False
+    monkeypatch.setattr(localspend, "price", price)
+    monkeypatch.setattr(localspend, "overrides", lambda: {})
+    arm = {"provider": "claude", "model": "m-one"}
+    cut = tmp_path / "cut.jsonl"
+    _claude_stream(cut, result=False)
+    u = get_provider("claude").parse(cut)
+    assert u.estimated and u.output_tokens == 6   # the stream's own count: a few tokens per message
+    chars = 4000 + len('{"command": "' + "y" * 2000 + '"}') + 400 + 1600   # each block once
+    assert benchrun.stream_output_chars(cut) == chars
+    got = benchrun.cell_spend(u, arm, cut)
+    want = -(-chars // benchrun.CHARS_PER_TOKEN)
+    assert got["output_tokens"] == want > u.output_tokens and got["stream_output_tokens"] == 6
+    assert got["cost_estimated"] is True and got["cost_basis"] == benchrun.CONTENT_BASIS and "floor" in got["cost_basis"]
+    assert got["cost_usd"] == round(want / 1000, 6) > benchrun.cell_cost(u, arm)[0]   # the raw sum alone: less
+    assert seen[0]["cache_read_input_tokens"] == 2000 and seen[0]["input_tokens"] == 10
+    # A run with its result line is priced as it reported, exactly as before: no estimate, no basis.
+    whole = tmp_path / "whole.jsonl"
+    _claude_stream(whole, result=True)
+    u = get_provider("claude").parse(whole)
+    assert benchrun.cell_spend(u, arm, whole) == {"cost_usd": 0.42, "cost_estimated": False}
+    assert benchrun.cell_cost(u, arm, whole) == (0.42, False)
+    # Content shorter than the stream's count: the stream's count stands, still a floor.
+    assert benchrun.cell_spend(get_provider("claude").parse(cut), arm, tmp_path / "missing.jsonl")["cost_basis"] \
+        == benchrun.STREAM_BASIS
+    # The suite's cell rows keep the basis, and its report says the spend is an estimate.
+    row = modelsuite._cell_row("m-one", {"task": "t", **benchrun.cell_spend(get_provider("claude").parse(cut), arm, cut)})
+    assert row["cost_basis"] == benchrun.CONTENT_BASIS and row["stream_output_tokens"] == 6
+    summary = benchrun.spend_summary([row, {"cost_usd": 0.42, "cost_estimated": False}])
+    assert summary["estimated_cells"] == 1 and summary["cost_note"].startswith("estimate: 1 of 2 cells")
+    assert "not comparable" not in summary["cost_note"]
+    assert "cost_note" not in benchrun.spend_summary([{"cost_usd": 0.42, "cost_estimated": False}])
+    # An estimated row priced before this change (no basis) beside a new one: the report says they differ.
+    old = {"cost_usd": 0.1, "cost_estimated": True}
+    assert "not comparable" in benchrun.spend_summary([row, old])["cost_note"]
+    assert "under-counts" in benchrun.spend_summary([old])["cost_note"]

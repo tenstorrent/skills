@@ -623,8 +623,8 @@ def run_cell(bench_dir: Path, out: Path, task: dict, cell: dict, arm: dict, opts
         if hung:   # the supervisor itself hung: its watchdog ends the agent; what it spent so far still counts
             row.update(outcome="runner_timeout", passed=False)
             try:
-                row["cost_usd"], row["cost_estimated"] = cell_cost(prov.parse(run / "output.jsonl",
-                                                                             run / "stderr.log"), arm)
+                row.update(cell_spend(prov.parse(run / "output.jsonl", run / "stderr.log"), arm,
+                                      run / "output.jsonl"))
             except Exception:
                 pass
             return row
@@ -681,22 +681,99 @@ def launch(run: Path, ws: Path, prompt: str, arm: dict, opts: dict, cfg: dict, h
     return prov, round(time.time() - began, 1), False
 
 
-def cell_cost(u, arm: dict) -> tuple[float, bool]:
-    """(USD, estimated) for a cell's agent. A Claude run cut off before its result line (its limit, a kill)
-    reports no cost but its stream shows the tokens: price those at list price (localspend), estimated,
-    so a cell that spent tokens never records 0."""
+CHARS_PER_TOKEN = 4   # content chars per output token, on the high side: an estimate from it stays a floor
+# A cut-off Claude row's cost_basis; rows priced before it (stream tokens only) are not comparable (spend_summary).
+STREAM_BASIS = "stream tokens, no result line (a floor)"
+CONTENT_BASIS = "estimate: stream tokens, output from content length (a floor)"
+PROVIDER_BASIS = "estimate: the provider's own"
+
+
+def stream_output_chars(path: Path) -> int:
+    """The characters a Claude stream's assistant messages wrote (text, visible thinking, tool inputs),
+    each block once (a streamed message repeats its blocks), subagents' included: what its output
+    tokens at least cover. 0 when the file is missing or unreadable."""
+    seen, total = set(), 0
+    try:
+        with open(path, errors="replace") as f:
+            for line in f:
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(ev, dict) or ev.get("type") != "assistant":
+                    continue
+                msg = ev.get("message") if isinstance(ev.get("message"), dict) else {}
+                for block in msg.get("content") or []:
+                    if not isinstance(block, dict):
+                        continue
+                    kind = block.get("type")
+                    body = block.get("text") if kind == "text" else block.get("thinking") if kind == "thinking" \
+                        else json.dumps(block.get("input"), sort_keys=True) if kind == "tool_use" else None
+                    if not isinstance(body, str) or not body:
+                        continue
+                    key = (str(msg.get("id") or ""), kind, hashlib.sha256(body.encode(errors="replace")).hexdigest())
+                    if key not in seen:
+                        seen.add(key)
+                        total += len(body)
+    except OSError:
+        return 0
+    return total
+
+
+def cell_spend(u, arm: dict, output: Path | None = None) -> dict:
+    """A cell's spend fields: cost_usd, cost_estimated and, for an estimate, cost_basis and output_tokens.
+    A Claude run cut off before its result line (its limit, a kill) reports no cost, and its stream's
+    per-message usage under-counts output (each message's usage is read as it starts): price its tokens
+    at list price (localspend), output at the larger of the stream's count and its content length
+    (`output`, the stream file) over CHARS_PER_TOKEN, estimated, so a cell that spent tokens never
+    records 0 or a few hundred tokens. A run with a result line is priced as it reported."""
     tokens = u.input_tokens or u.output_tokens or u.cache_read_tokens or u.cache_write_tokens
+    out = {"cost_usd": u.cost_usd, "cost_estimated": bool(u.estimated)}
+    if u.estimated:   # every estimated row names its basis: one without was priced before (spend_summary)
+        out["cost_basis"] = PROVIDER_BASIS
     if u.cost_usd or not tokens or arm.get("provider") != "claude":
-        return u.cost_usd, bool(u.estimated)
+        return out
     from . import localspend
+    written = -(-stream_output_chars(output) // CHARS_PER_TOKEN) if output else 0
+    output_tokens = max(int(u.output_tokens or 0), written)
     try:
         usd, _unknown = localspend.price(str(arm.get("model") or u.extra.get("model") or ""), {
-            "input_tokens": u.input_tokens, "output_tokens": u.output_tokens,
+            "input_tokens": u.input_tokens, "output_tokens": output_tokens,
             "cache_read_input_tokens": u.cache_read_tokens,
             "cache_creation_input_tokens": u.cache_write_tokens}, overrides=localspend.overrides())
     except Exception:
-        return u.cost_usd, bool(u.estimated)
-    return round(float(usd), 6), True
+        return out
+    out.update(cost_usd=round(float(usd), 6), cost_estimated=True,
+               cost_basis=CONTENT_BASIS if output_tokens > (u.output_tokens or 0) else STREAM_BASIS)
+    if output_tokens > (u.output_tokens or 0):
+        out.update(output_tokens=output_tokens, stream_output_tokens=int(u.output_tokens or 0))
+    return out
+
+
+def cell_cost(u, arm: dict, output: Path | None = None) -> tuple[float, bool]:
+    """(USD, estimated) for a cell's agent: cell_spend's cost_usd and cost_estimated."""
+    got = cell_spend(u, arm, output)
+    return got["cost_usd"], got["cost_estimated"]
+
+
+def spend_summary(rows: list[dict]) -> dict:
+    """The rows' spend for a report: cost_usd (their sum), estimated_cells and, when any is estimated,
+    a note saying the sum is an estimate (a floor). Estimated rows without a cost_basis were priced
+    from the stream's output count alone (before content-length pricing): the note says those and
+    later rows are not comparable."""
+    usd = round(sum(float(r.get("cost_usd") or 0) for r in rows), 4)
+    est = [r for r in rows if r.get("cost_estimated")]
+    got = {"cost_usd": usd, "estimated_cells": len(est)}
+    if est:
+        old = sum(not r.get("cost_basis") for r in est)
+        got["cost_note"] = (f"estimate: {len(est)} of {len(rows)} cells' spend is estimated (no cost reported, "
+                            f"e.g. a run cut off before its result line), so ${usd} is an estimate, likely a floor")
+        if old and old < len(est):
+            got["cost_note"] += (f"; {old} estimated cell(s) were priced from the stream's output count alone, "
+                                 f"the rest from content length too: not comparable")
+        elif old:
+            got["cost_note"] += "; priced from the stream's output count alone, which under-counts output"
+    return got
 
 
 def _read_json(path: Path):
@@ -722,9 +799,9 @@ def _finish(row: dict, bench_dir: Path, task: dict, ws: Path, run: Path, keep: P
             hidden: list[Path], own: list[Path] | None = None) -> dict:
     """Audit and grade a cell whose agent has run, filling `row` as it goes (its cost first)."""
     u = prov.parse(run / "output.jsonl", run / "stderr.log")
-    cost, estimated = cell_cost(u, row)
-    row.update(cost_usd=cost, cost_estimated=estimated, input_tokens=u.input_tokens,
-               output_tokens=u.output_tokens, cache_read_tokens=u.cache_read_tokens, session_id=u.session_id)
+    row.update(input_tokens=u.input_tokens, output_tokens=u.output_tokens, cache_read_tokens=u.cache_read_tokens,
+               session_id=u.session_id)
+    row.update(cell_spend(u, row, run / "output.jsonl"))
     transcript = (run / "output.jsonl").read_bytes() if (run / "output.jsonl").exists() else b""
     ended, handoff = _read_json(run / "exit.json"), _read_json(run / "result.json")
     ended = ended if isinstance(ended, dict) else {}
