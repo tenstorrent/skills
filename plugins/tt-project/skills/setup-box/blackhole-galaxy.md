@@ -28,9 +28,9 @@ There is no CC or bus bar per tray or slot: one of each serves the whole box. Sa
   (4 at x8 and 28 at x1 per box). Rev A/B boxes run Gen4, Rev C Gen5.
 - Path: CPU root port (MB module) -> MB trace -> retimer on the PDB -> the CC (that tray's PCIe
   ExaMAX connector) -> chip.
-- The retimers are part of the PDB and are replaced only with it. Repair steps never name a
-  "retimer cable" or a separate retimer part. A PCIe cable between the MB module and the PDB is
-  not confirmed, so never name one either.
+- The retimers (firmware 2.13.27 and 2.13.28 seen in the field) are part of the PDB and are
+  replaced only with it. Repair steps never name a "retimer cable" or a separate retimer part.
+  A PCIe cable between the MB module and the PDB is not confirmed, so never name one either.
 - Known Gen5 issue: an extra AC coupling capacitor on the MB's CPU TX -> retimer RX trace can wedge
   Gen5 links after a reset; Gen4 does not reproduce it. The fix is an MB rework, so Gen5 link drops
   right after a reset point at the MB module, not at the tray or the CC.
