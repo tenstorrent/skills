@@ -37,6 +37,8 @@ General device recovery is tt-buddy's (`skills/run/recovery.md`); this page adds
 - Resets and single-host power cycles never affect other hosts: no gate, snapshot or serving-down
   check on neighbouring hosts. Only a quad serving a quad-wide workload goes down and up as a quad.
 - For the BMC power cycle use op 0x3 only: op 0x0 also resets the PCIe retimers carrying NVMe.
+- Name parts only as `blackhole-galaxy.md` describes them: one CC, one MB module and one PDB per
+  box; the chips' PCIe retimers sit on the PDB and are replaced only with it.
 - BMC access is reads only, unless these rules call for the single-host power cycle (op 0x3).
   The vendor `agera2-app` tool is never run.
 - Tray temperature readings right after a power loss are junk: count only readings taken at least

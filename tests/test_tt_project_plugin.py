@@ -7691,6 +7691,40 @@ def test_setup_box_states_the_true_galaxy_reset_practice():
         assert "`recovery.md`" in text and "before and after" in text and "tt-smi -glx_reset" in text, linker
 
 
+def test_setup_box_blackhole_galaxy_page_states_the_parts_and_paths_and_is_linked():
+    """The Galaxy hardware basics live once in the plugin (user msg #2894): parts, the per-chip PCIe
+    path with the retimers on the PDB, and the power path through the PDB's DC-DC modules. Device and
+    recovery guidance point to the page."""
+    box = SKILLS / "setup-box"
+    page = " ".join((box / "blackhole-galaxy.md").read_text(encoding="utf-8").split())
+    for part in ("Tray (UBB): 4 per box", "1 cable cartridge (CC)", "1 motherboard (MB) module", "1 PDB", "4 PSUs",
+                 "1 set of two bus bars", "no CC or bus bar per tray or slot",
+                 "one chip runs at x8 and seven at x1",
+                 "CPU root port (MB module) -> MB trace -> retimer on the PDB -> the CC",
+                 "replaced only with it", "MB rework",
+                 "3 for tray-to-tray Ethernet, 1 for PCIe", "No power goes through the CC",
+                 "54V-to-12V DC-DC modules", "the PDB's 54-to-12 V DC-DC modules (power bricks)",
+                 "-> 12 V over the bus bars"):
+        assert part in page, part
+    # Corrected claims stay out: no x16 link per tray, no retimer on the MB module or the CC, and a
+    # 'retimer cable' or 'head node' appears only where the page says not to name it.
+    assert "x16" not in page
+    assert not re.search(r"retimers? (?:is |are |sits? )?on the (?:MB|CC|motherboard)", page)
+    for term in ("retimer cable", "head node", "Linking board"):
+        for m in re.finditer(re.escape(term), page):
+            sentence = page[page.rfind(". ", 0, m.start()) + 1:page.find(". ", m.end())]
+            assert re.search(r"\bnever\b|\bnot\b", sentence), (term, sentence)
+    links = {
+        box / "SKILL.md": "`blackhole-galaxy.md`",
+        box / "recovery.md": "`blackhole-galaxy.md`",
+        SKILLS / "tt-project-harness" / "SKILL.md": "setup-box `blackhole-galaxy.md`",
+    }
+    for path, ref in links.items():
+        assert ref in path.read_text(encoding="utf-8"), path
+    worker = (PLUGIN / "template" / "prompts" / "worker.md").read_text(encoding="utf-8")
+    device = worker[worker.index("<!-- ttp:if device -->"):worker.index("<!-- /ttp:if device -->")]
+    assert "setup-box `blackhole-galaxy.md`" in device
+
 def test_worker_prompt_and_harness_skill_state_the_glx_reset_only_practice():
     """Workers and harness authors read the true reset practice where they read their rules (user msg
     #1171): `tt-smi -glx_reset`, and `tt-smi -r` or `sudo -n true` only in a sentence saying never."""

@@ -82,6 +82,7 @@
   empty). Never unset or override the masking variables. Who held one: `ttp machines activity <alias>`.
 - A broker job runs `--preemptable`, `-t` at most 1500 s, ends cleanly on SIGTERM, and resumes
   from a checkpoint after a preempt (setup-box `device-runs.md`); never hold the device idle.
+- Before naming a Galaxy part in a diagnosis or repair step, read setup-box `blackhole-galaxy.md`.
 <!-- /ttp:if device -->
 - Never release or re-create a machine reservation, or restart a shared service, unless your
   task says to.
