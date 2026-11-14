@@ -566,3 +566,21 @@ def test_coordinator_config_set_in_a_user_turn_is_the_users_only_when_it_cites_t
                        user_turn=True, messages=[w]) == []
     rec = configwho.get(p.db, "budget.weekly_usd")
     assert rec["by"] == "user" and rec["msgs"] == [w], rec
+
+
+def test_config_accepts_waiting_check_plan_whole_and_by_field_and_waketier_reads_it(env, capsys):
+    """[note c4e5fa1c6f72199b] waketier.plan_settings reads waiting.check_plan, so `ttp config` takes it
+    (a whole object or one field); its defaults equal waketier.PLAN_DEFAULTS."""
+    from ttp import cli, waketier
+    from ttp.project import DEFAULT_CONFIG
+    assert DEFAULT_CONFIG["waiting"]["check_plan"] == waketier.PLAN_DEFAULTS
+    p = make(env)
+    assert waketier.plan_settings(p.config())["enabled"] is True
+    cli.main(["config", "demo", "waiting.check_plan", '{"enabled": false}'])
+    assert waketier.plan_settings(p.config())["enabled"] is False
+    cli.main(["config", "demo", "waiting.check_plan", ""])
+    cli.main(["config", "demo", "waiting.check_plan.interim_share", "0.3"])
+    cli.main(["config", "demo", "waiting.check_plan.enabled", "false"])
+    s = waketier.plan_settings(p.config())
+    assert (s["enabled"], s["interim_share"], s["by"]) == (False, 0.3, "jev")
+    assert "unknown" not in capsys.readouterr().out.lower()

@@ -190,6 +190,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 # (one job_underuse event per job and repeat_s; the next check comes within check_cap_s)
                 "job_use": {"sample_s": 60, "window_s": 900, "under_frac": 0.25, "check_cap_s": 1800,
                             "repeat_s": 21600},
+                # planned checks of a wait whose end is measured (waketier.PLAN_DEFAULTS, kept equal): an
+                # interim check at interim_share of it (interim_min_s..interim_max_s) and one at its end, at
+                # tier, judged by jev, plain or model; min_samples past waits before an end is measured
+                "check_plan": {"enabled": True, "interim_share": 0.15, "interim_min_s": 120.0,
+                               "interim_max_s": 900.0, "tier": "light", "by": "jev", "min_samples": 3},
                 # `ttp progress report` (progress.py): stall_after refusals, stalls or failures in a row
                 # with no result, the last within window_s, are a stalled driver (one observation)
                 "progress": {"stall_after": 5, "window_s": 86400}},
