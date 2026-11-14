@@ -415,16 +415,20 @@ def _marker_target(p, m: dict) -> tuple:
 
 def _marker_local(p, c: dict, state: str, why: str) -> tuple[str, str]:
     """A marker claim the remote check left UNKNOWN or UNVERIFIABLE, confirmed when its commit is an
-    ancestor of the target's local tracking ref (a later commit on the branch is fine). Local refs
-    only, never a fetch; a MISSING the remote answered stands."""
-    if state not in (UNKNOWN, UNVERIFIABLE):
-        return state, why
+    ancestor of the target's local tracking ref (a later commit on the branch is fine). A MISSING is
+    confirmed only when another remote-tracking ref holds the commit (not the claimed branch's own).
+    Local refs only, never a fetch."""
     try:
         m = _read_marker(p, c["marker"])
         if m.get("status") in ("queued", "running"):
             return state, why
         sha = str((m.get("sha") if m.get("status") == "pushed" else m.get("head")) or "")
         repo, to = _marker_target(p, m)
+        if state not in (UNKNOWN, UNVERIFIABLE):
+            # A push that ended without landing its head, which another route put on a remote ref anyway.
+            if state == MISSING and (held := _on_remote_ref(repo, sha, _own_tracking(p, c))):
+                return CONFIRMED, f"{sha[:12]} is on {held[len('refs/remotes/'):]} ({why})"
+            return state, why
         if not sha or not to or not to[1].startswith("refs/heads/"):
             return state, why
         tracking = f"refs/remotes/{to[0]}/{to[1][len('refs/heads/'):]}"
@@ -561,6 +565,34 @@ def _contains(repo, sha: str, branch: str) -> bool:
     return bool(full) and _git(repo, "merge-base", "--is-ancestor", full, f"refs/heads/{branch}").returncode == 0
 
 
+def _on_remote_ref(repo, sha: str, skip: tuple = ()) -> str:
+    """The first remote-tracking ref (local read, no fetch) that holds `sha` by ancestry, "" when none.
+    `skip`: tracking refs left out (the claimed ref's own, which a pruned remote branch may leave stale)."""
+    full = _commit(repo, sha) if sha else ""
+    if not full:
+        return ""
+    out = _git(repo, "for-each-ref", "--contains", full, "--format=%(refname)", "refs/remotes")
+    if out.returncode != 0:
+        return ""
+    return next((r for r in out.stdout.split() if r not in skip and not r.endswith("/HEAD")), "")
+
+
+def _own_tracking(p, c: dict) -> tuple:
+    """The tracking ref of the branch a claim names, which the remote check just found without the commit."""
+    try:
+        if c.get("marker"):
+            m = _read_marker(p, c["marker"])
+            repo, to = _marker_target(p, m)
+            remote, ref = to or ("", "")
+        else:
+            remote, ref = c.get("remote") or "", c.get("ref") or ""
+        if remote and ref.startswith("refs/heads/"):
+            return (f"refs/remotes/{remote}/{ref[len('refs/heads/'):]}",)
+    except Exception:
+        pass
+    return ()
+
+
 def _reattribute(p, t, c: dict, state: str, why: str, claimed: dict, tips: dict) -> tuple[str, str]:
     """A claim the remote check did not confirm, decided again as `ttp landed` does: CONFIRMED when the
     commit (or one recorded as superseding the task) is on the push branch by ancestry, SHARED when
@@ -581,6 +613,8 @@ def _reattribute(p, t, c: dict, state: str, why: str, claimed: dict, tips: dict)
             full = _commit(repo, s)
             if tip and full and landed.on_branch(repo, full, tip):
                 return CONFIRMED, f"{s[:12]} is on the push branch"
+        if held := _on_remote_ref(repo, c["sha"], _own_tracking(p, c)):
+            return CONFIRMED, f"{c['sha'][:12]} is on {held[len('refs/remotes/'):]}"
         others = [o for o in claimed.get(c["sha"][:12], []) if o["id"] != t["id"]]
         if others and not (t["branch"] and _contains(repo, c["sha"], t["branch"])):
             owner = next((o for o in others if o["branch"] and _contains(repo, c["sha"], o["branch"])), None)
