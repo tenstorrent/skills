@@ -7717,7 +7717,7 @@ def test_setup_box_blackhole_galaxy_page_states_the_parts_and_paths_and_is_linke
     links = {
         box / "SKILL.md": "`blackhole-galaxy.md`",
         box / "recovery.md": "`blackhole-galaxy.md`",
-        SKILLS / "tt-project-harness" / "SKILL.md": "setup-box `blackhole-galaxy.md`",
+        SKILLS / "tt-project-harness" / "SKILL.md": "Blackhole Galaxy reference page (blackhole-galaxy.md)",
     }
     for path, ref in links.items():
         assert ref in path.read_text(encoding="utf-8"), path

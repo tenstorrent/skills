@@ -316,7 +316,7 @@ Company-wide practice; the long form is in the `tt-project:setup-box` skill's re
   tenant on that box does (setup-box recovery reference).
 - After a tray power drop, try glx_reset first, then the single-host BMC power cycle with op 0x3
   only (op 0x0 also resets the PCIe retimers carrying NVMe). Tray temperatures read right after a
-  power loss are junk. Parts, PCIe and power paths: setup-box `blackhole-galaxy.md`.
+  power loss are junk. Parts, PCIe and power paths: the setup-box skill's Blackhole Galaxy reference page (blackhole-galaxy.md).
 
 ## Rebooting the harness's own host
 
