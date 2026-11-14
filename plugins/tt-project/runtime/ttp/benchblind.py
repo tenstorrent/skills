@@ -216,12 +216,21 @@ def prompt(item: dict) -> str:
             f"Answer as JSON: {{\"scores\": {{...}}, \"notes\": \"one short paragraph\"}}.")
 
 
-def provider_ask(provider: str, model: str, effort: str, budget_usd: float, cfg: dict | None = None):
+def provider_ask(provider: str, model: str, effort: str, budget_usd: float, cfg: dict | None = None,
+                 spend: dict | None = None, bridge_env: dict | None = None):
     """A decision-only run on the named provider (no tools, schema-checked answer) per prompt. A
     chat provider's reviewer runs through the chat bridge this wrapper starts, like a chat run's
-    own agent: the CLI asks Anthropic otherwise, and the open model's id never reaches it."""
+    own agent: the CLI asks Anthropic otherwise, and the open model's id never reaches it. `spend`:
+    a dict the caller owns, filled per call with the reviewer's measured cost (calls, cost_usd,
+    cost_estimated) so a suite can report its review spend."""
     from .providers import get_provider
     prov = get_provider(provider).use(model)
+
+    def note(u) -> None:
+        if spend is not None:
+            spend["calls"] = spend.get("calls", 0) + 1
+            spend["cost_usd"] = round(spend.get("cost_usd", 0.0) + float(u.cost_usd or 0), 4)
+            spend["cost_estimated"] = bool(u.estimated) or bool(spend.get("cost_estimated"))
 
     def ask(text: str) -> dict:
         with tempfile.TemporaryDirectory() as tmp:
@@ -230,7 +239,9 @@ def provider_ask(provider: str, model: str, effort: str, budget_usd: float, cfg:
             argv = prov.read_only_args(argv)   # decision-only: unsandboxed, as the daemon's
             out = Path(tmp) / "output.jsonl"
             if provider == "chat":
-                with _bridge(cfg, model, effort) as bridge:
+                # A chat reviewer runs through the chat bridge: either one the caller holds open for
+                # the whole review (bridge_env, its env dict), or one started per ask here.
+                with (_constant(bridge_env) if bridge_env is not None else _bridge(cfg, model, effort)) as bridge:
                     r = subprocess.run(argv, input=text.encode(), stdout=subprocess.PIPE,
                                        stderr=subprocess.DEVNULL, cwd=tmp,
                                        env={**os.environ, **env, **bridge}, timeout=1800)
@@ -240,6 +251,7 @@ def provider_ask(provider: str, model: str, effort: str, budget_usd: float, cfg:
                                    env={**os.environ, **env}, timeout=1800)
             durable_write(out, r.stdout, sync=False)
             u = prov.parse(out)
+            note(u)
         if not u.structured:
             raise Refused(f"no scored answer ({u.error or 'empty'})")
         return u.structured
@@ -301,6 +313,11 @@ def _closing(br):
         yield br.env()
     finally:
         br.stop()
+
+
+@contextmanager
+def _constant(env: dict):
+    yield env
 
 
 def review(d: Path, ask) -> list[str]:

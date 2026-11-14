@@ -531,6 +531,29 @@ def references(cfg: dict) -> list[dict]:
     return out
 
 
+def blind_reviewers(cfg: dict) -> list[dict]:
+    """The blind reviewers of a suite's cells: `bench.blind_reviewers`, a list of {provider, model,
+    effort}; the first is the main reviewer, whose grade decides "would land" for the suite's rows — the
+    rest are extra reviewers, reported beside it and never gating. Order stays the config's order. The
+    shipped default is the claude CLI's default reviewer at high effort (a strong reviewer the CLI's
+    config already names); a project sets its own list to add an extra reviewer or change the main one."""
+    bc = cfg.get("bench") if isinstance(cfg.get("bench"), dict) else {}
+    revs = bc.get("blind_reviewers")
+    out: list[dict] = []
+    for r in revs if isinstance(revs, list) else (DEFAULT_BLIND_REVIEWERS if revs is None else []):
+        # a config row names its model; the shipped default leaves it to the provider's own default
+        if isinstance(r, dict) and str(r.get("provider") or "").strip():
+            rev = {k: str(r.get(k) or "").strip() for k in ("provider", "model", "effort")}
+            if rev not in out:
+                out.append(rev)
+    return out
+
+
+DEFAULT_BLIND_REVIEWERS = [{"provider": "claude", "model": "", "effort": "high"}]
+   # the claude CLI's default model at high effort: a strong reviewer every install has. A project
+   # sets bench.blind_reviewers to name its own reviewers (and add extras from another family).
+
+
 def pair_key(bench_dir: Path | None, cells_dir: Path | None) -> str:
     """A task pair's identity: its prep manifest and cells list, so a rebuilt pair with other tasks is a new key."""
     h = hashlib.sha256()
@@ -663,6 +686,61 @@ def standard(model: str, arm: dict, date: str, bench_dir: Path | None, cells_dir
 
 
 NOT_GRADED = "not graded: flagged by the cheat audit"   # benchrun._finish's tests.log of a flagged cell
+
+
+def _blind_max() -> int:
+    from . import benchblind
+    return sum(m for _, m, _ in benchblind.RUBRIC)
+
+
+def blind_grade(revs: list[dict], cells: list[dict], ask_budget_usd: float = 2.0) -> dict:
+    """Blind-grade one model's `cells` ({task, criteria, diff}) with every reviewer in `revs`: each
+    reviewer scores the anonymised diffs of one batch on the fixed rubric (benchblind), and the MAIN
+    reviewer (revs[0]) alone decides `would_land` (its mean score at least 2/3 of the rubric's max).
+    Every later reviewer is an extra: its verdict is reported (mean, and pass at the same bar) but
+    never gates — an extra's pass never overrides the main reviewer's fail."""
+    from . import benchblind
+    out = {"would_land": None, "blind_score": None, "reviewers": [], "extras": []}
+    if not revs or not cells:
+        return out
+    for i, rev in enumerate(revs):
+        d = Path(tempfile.mkdtemp(prefix="blind-")) / "batch"
+        try:
+            benchblind.prep([{"task": str(c["task"]), "criteria": str(c.get("criteria") or ""),
+                               "arms": {"cell": {"diff": str(c.get("diff") or "")}}} for c in cells], d)
+            spend: dict = {}
+            benchblind.review(d, benchblind.provider_ask(rev["provider"], rev["model"], rev["effort"],
+                                                         ask_budget_usd, spend=spend))
+            revealed = benchblind.reveal(d)
+            totals = [s["total"] for s in revealed["scores"].values()]
+            row = {"reviewer": rev["model"], "mean": round(sum(totals) / len(totals), 2) if totals else None,
+                   "pass": bool(totals) and sum(totals) / len(totals) >= 2 * _blind_max() / 3,
+                   **spend}
+            (out["reviewers"] if i == 0 else out["extras"]).append(row)
+            if i == 0:
+                out["would_land"], out["blind_score"] = row["pass"], row["mean"]
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+    return out
+
+
+def blind_cells_of_rows(rows: list[dict], out: Path, bench_dir: Path | None, tasks: dict) -> list[dict]:
+    """The scored standard-class cell rows as blind-review inputs: one {task, criteria, diff} per
+    scored row, its cell's kept diff and its task's acceptance criteria (benchrun.criteria of its
+    spec; the whole spec when it has no acceptance section)."""
+    from . import benchrun
+    cells, seen = [], set()
+    for r in rows:
+        if r.get("kind") == "injection" or r.get("outcome") in UNSCORED or r.get("task") is None:
+            continue
+        keep = out / "cells" / f"{r.get('task')}-r{r.get('rep', 1)}-{r.get('arm')}"
+        if keep.name in seen or not keep.is_dir():
+            continue
+        seen.add(keep.name)
+        spec = str((tasks.get(str(r["task"])) or {}).get("spec") or "")
+        diff = (keep / "diff.patch").read_text(errors="replace") if (keep / "diff.patch").is_file() else ""
+        cells.append({"task": str(r["task"]), "criteria": benchrun.criteria(spec), "diff": diff})
+    return cells
 
 
 def _rows(path: Path) -> list[dict]:
@@ -909,6 +987,8 @@ def _run(d, date, out, cfg, picked, cases, ask, classes, bench_dir, cells_dir, o
         from . import harborslice
         harborslice.install(out / "harbor", *([harbor_runner] if harbor_runner else []))
 
+    revs, spec_tasks = blind_reviewers(cfg), {}
+
     def bench_one(model: str, why: str) -> list[dict]:
         mine = []
         for cls in classes:
@@ -920,6 +1000,9 @@ def _run(d, date, out, cfg, picked, cases, ask, classes, bench_dir, cells_dir, o
                    **scored(r, SUITE)}
             for k in ("transcript_sha256", "diff_sha256", "tokens_per_s"):
                 row.setdefault(k, None)
+            if cls == "standard" and revs and not opts.get("dry_run"):
+                row["blind"] = blind_grade(revs, blind_cells_of_rows(r.get("cell_rows") or [], out,
+                                                                    bench_dir, _spec_tasks()))
             _append(d / f"{date}.jsonl", row)
             mine.append({**row, "cell_rows": r.get("cell_rows", [])})
         if n_tb > 0:
@@ -932,6 +1015,17 @@ def _run(d, date, out, cfg, picked, cases, ask, classes, bench_dir, cells_dir, o
             mine.append(row)
         return mine
     std = "standard" in classes
+
+    def _spec_tasks() -> dict:
+        from . import benchrun
+        nonlocal spec_tasks
+        if bench_dir and not spec_tasks:
+            try:
+                spec_tasks = {t["task"]: t for t in benchrun.verified(bench_dir)["tasks"]}
+            except Exception:
+                spec_tasks = {}
+        return spec_tasks
+
     key = pair_key(bench_dir, cells_dir) if std and bench_dir else None
     # A reference with no rows on this pair runs once, beside the arms; never in a dry run (a fake agent).
     todo = [r for r in refs if key and not opts.get("dry_run") and ref_rows(d, key, r) is None]
@@ -957,6 +1051,25 @@ def _run(d, date, out, cfg, picked, cases, ask, classes, bench_dir, cells_dir, o
         for r in rows:
             if r.get("class") == "standard":
                 r.update({k: cal[k] for k in ("calibration", "calibration_why", "reference")})
+
+    revs_agree = None
+    if revs:
+        # The reviewers' agreement: each extra reviewer's pass/fail verdict against the main
+        # reviewer's, over the day's graded models. An extra never changes the main grade.
+        agree = {r["model"]: [0, 0] for r in revs[1:]}
+        for r in rows:
+            b = r.get("blind")
+            if not b:
+                continue
+            main = (b.get("reviewers") or [{}])[0]
+            for ex in b.get("extras") or []:
+                a = agree.setdefault(ex["reviewer"], [0, 0])
+                a[0] += 1
+                a[1] += int(bool(ex.get("pass")) == bool(main.get("pass")))
+        revs_agree = {m: round(agreed / total, 3) for m, (total, agreed) in agree.items() if total}
+    for r in rows:
+        if r.get("blind") is not None and revs_agree is not None:
+            r["blind"]["agreement"] = revs_agree
     if not opts.get("dry_run"):
         from .harborslice import settings
         share = settings(cfg)["floor_share"]
@@ -984,5 +1097,12 @@ def verdict(rows: list[dict], model: str, arm: str, floor_share: float | None = 
     rates = [r["pass_rate"] for r in mine if r.get("pass_rate") is not None]
     if not rates or any(r.get("faults") or (r.get("endpoint_faults") or 0) > (r.get("scored") or 0) for r in mine):
         return None   # a harness fault, or more cells the endpoint failed than scored: inconclusive, never weak
+    # The main reviewer's blind grade decides when the day graded the cells by blind review: its mean
+    # score share (0-1) is the score and would_land the weak flag's, whatever any extra reviewer says.
+    blind = [(r.get("blind") or {}).get("blind_score") for r in mine if (r.get("blind") or {}).get("blind_score")
+             is not None]
+    if blind:
+        return (min(blind) / _blind_max(), any(r.get("bar") for r in mine) or
+                not all((r.get("blind") or {}).get("would_land") for r in mine if r.get("blind")), arm)
     score = min(rates)
     return score, score < PASS_MIN or any(r.get("bar") for r in mine), arm

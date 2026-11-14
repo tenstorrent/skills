@@ -293,3 +293,60 @@ def test_benchblind_reviewer_on_the_chat_provider_runs_through_the_chat_bridge(e
     assert seen["stopped"] is True, "the bridge stops when the ask ends"
     assert seen["model"] == "zai/other-9" and seen["effort"] == "high"
     assert seen["argv"][1] == "-p" or "claude" in seen["argv"][0], seen["argv"]
+
+
+def test_an_extra_reviewer_pass_never_overrides_the_main_reviewer_fail(tmp_path, monkeypatch):
+    # Part 4: the MAIN reviewer (the first of bench.blind_reviewers) decides would-land; an extra
+    # reviewer's pass is reported but never changes the grade, whatever it scores.
+    from ttp import benchblind, modelsuite
+    revs = [{"provider": "claude", "model": "main-r", "effort": "high"},
+            {"provider": "chat", "model": "extra-r", "effort": "high"}]
+    totals = iter([4, 12])   # the main reviewer fails the cells, the extra passes them
+
+    def ask_scorer(provider, model, effort, budget_usd, cfg=None, spend=None):
+        def ask(_text):
+            total = next(totals)   # 4 = criteria alone (a fail), 12 = every rubric max (a pass)
+            if spend is not None:
+                spend.update(calls=1, cost_usd=0.25, cost_estimated=False)
+            rest = {"criteria": 4, "correctness": 0, "tests": 0, "scope": 0} if total == 4 else \
+                   {"criteria": 4, "correctness": 4, "tests": 2, "scope": 2}
+            return {"scores": rest, "notes": "x"}
+            # total <= 4 by the rubric's own max: the main reviewer's 4/12 fails, the extra's 12/12 passes
+        return ask
+
+    monkeypatch.setattr(benchblind, "provider_ask", ask_scorer)
+    got = modelsuite.blind_grade(revs, [{"task": "501", "criteria": "c", "diff": "+ fix"}])
+    assert got["would_land"] is False and got["blind_score"] == 4.0
+    assert [r["pass"] for r in got["extras"]] == [True], "the extra's pass is reported"
+    assert got["reviewers"][0]["pass"] is False and got["extras"][0]["mean"] == 12.0
+    # the verdict books the main reviewer's grade: weak, whatever the extra says
+    row = {"model": "m", "class": "standard", "pass_rate": 1.0, "bar": False, "blind": got}
+    assert modelsuite.verdict([row], "m", "daily") == (4 / 12, True, "daily")
+
+
+def test_model_suite_blind_grade_is_the_main_column_of_the_day(env, tmp_path, monkeypatch):
+    # Part 4: the suite blind-grades each standard row through benchblind with the configured reviewers
+    # (bench.blind_reviewers; the first is the main reviewer), reports review spend, and an extra
+    # reviewer's verdict rides along as a report-only column.
+    from ttp import modelsuite
+    p = make(env)
+    _suite_home(env, monkeypatch)
+    seen = []
+
+    def standard(model, arm, date, bench_dir, cells_dir, opts, cfg, out, every=False):
+        seen.append(model)
+        return {"pass_rate": 1.0, "injection_pass": None, "bar": False, "cell_rows": [
+            {"task": 7, "rep": 1, "arm": "org--m-one", "kind": "replay", "outcome": "pass", "passed": True}]}
+    monkeypatch.setattr(modelsuite, "standard", standard)
+    monkeypatch.setattr(modelsuite, "blind_cells_of_rows", lambda rows, out, bench_dir, tasks: rows and
+                        [{"task": "7", "criteria": "Add new() returning 2.", "diff": "+    return 2"}])
+    from ttp import benchblind
+    monkeypatch.setattr(modelsuite, "blind_grade", lambda revs, cells: seen.append(("grade", revs)) or
+                        {"would_land": True, "blind_score": 10.0, "reviewers": [{"reviewer": "main-r", "pass": True,
+                         "mean": 10.0, "calls": 1, "cost_usd": 0.1, "cost_estimated": False}], "extras": []})
+    cfg = {"providers": {"chat": {"model_ranking": ["m-a"]}},
+           "bench": {"blind_reviewers": [{"provider": "claude", "model": "main-r", "effort": "high"}]}}
+    rows = modelsuite.run(p.db, cfg, ["m-a"], {}, 1e7, date="2026-11-14", opts={}, has_cli=lambda: True,
+                          models=["m-a"], classes=("standard",))
+    assert seen == ["m-a", ("grade", [{"provider": "claude", "model": "main-r", "effort": "high"}])], seen
+    assert rows[0]["blind"]["would_land"] is True and rows[0]["blind"]["blind_score"] == 10.0

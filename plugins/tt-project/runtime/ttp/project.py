@@ -669,7 +669,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # `ttp bench run` (benchrun.py): arms {name: {provider, model, effort}} (none shipped) and the
     # limits every cell gets alike.
     "bench": {"arms": {}, "reps": 1, "timeout_s": 3600, "stall_s": 900, "budget_usd": 8.0, "test_timeout_s": 900,
-              "scratch_home": True},
+              "scratch_home": True,
+              # The model-bench suite's blind reviewers: the first entry is the main reviewer whose
+              # grade decides "would land"; the rest are extras, reported but never gating.
+              "blind_reviewers": None},
     # The machine's shared daily chat model bench (benchowner.py): one project owns it and runs it at
     # bench_at home time; poke_after_h without a result pokes the owner once, take_over_after_h hands it
     # to the next project by name. opt_out: this project never owns it.

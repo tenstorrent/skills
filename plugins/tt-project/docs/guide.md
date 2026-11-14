@@ -1147,7 +1147,10 @@ The arms of each task take letters in an order shuffled from the seed, and the i
 too. The seed and labels go to `<dir>/seal.json` (mode 0600), pinned by its sha256 in
 `<dir>/batch.json`. `review <dir> [--provider P --model M --effort E]` runs one decision-only,
 schema-checked call per unscored item on that provider, with only the criteria and the anonymised
-diff, on a fixed rubric (criteria 0-4, correctness 0-4, tests 0-2, scope 0-2). `score <dir> <item>
+diff, on a fixed rubric (criteria 0-4, correctness 0-4, tests 0-2, scope 0-2). A chat-provider
+reviewer runs through the chat bridge the wrapper starts from the project's `providers.chat`
+settings (`review --config <project-or-path>` names the project); its CLI then reaches the open
+model, never Anthropic. `score <dir> <item>
 '<json>'` records a score by hand. `reveal <dir>` needs every item scored. It checks the seal and
 that the labels reproduce from the seed, then writes the labels, seed and per-arm totals into
 batch.json, so the scores can be audited. After that the batch takes no more scores.
@@ -1515,7 +1518,13 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    once, beside the day's arms, and its rows are reused while the pair is unchanged. Each `standard` row then
    carries `calibration` (`calibrated`, or `uncalibrated` with `calibration_why` when no reference is set or
    one has no rows on the pair) and the references' rates on the same drawn tasks, also written to
-   `<date>-cells/calibration.json`. `ttp model-bench suite --reference-from DIR` takes reference rows run
+   `<date>-cells/calibration.json`, plus `blind`, the day's blind review of its cells: the anonymised
+   diffs scored on the fixed rubric by `bench.blind_reviewers` — its first entry is the main reviewer
+   whose grade decides the row's "would land" (a mean rubric score of at least 2/3 of the max), the
+   rest are extra reviewers, reported with their verdict, spend and agreement rate but never gating
+   (an extra reviewer's pass never overrides the main reviewer's fail). The shipped default is the
+   claude CLI's default model at high effort as the main reviewer; a project sets
+   `bench.blind_reviewers` to name its own. `ttp model-bench suite --reference-from DIR` takes reference rows run
    elsewhere on the current pair (a `results.jsonl`) without a model call. Each cell runs
    in a fresh copy with its own venv; held-out tests are copied in only after the run and run the way bench
    prep validated them (a test in a case file runs where its aggregator collects it), and a transcript or
