@@ -422,7 +422,8 @@ def link_fix(p, tid: int, target: str, repo: str | None = None) -> str:
     if not task:
         raise ValueError(f"no task #{tid}")
     if task.get("status") != "cancelled":
-        raise ValueError(f"not recorded: task #{tid} is {task.get('status')}, not cancelled")
+        raise ValueError(f"not recorded: task #{tid} is {task.get('status')}, not cancelled (re-point a "
+                         f"correction's fix with `ttp task <project> relink-fix <correction> <task> --why ...`)")
     t = target.strip()
     m = re.fullmatch(r"(?:([\w.-]+)?#|task:)?(\d{1,6})", t)
     if m and (t[0] == "#" or "#" in t or t.startswith("task:") or len(t) < 7):
@@ -464,6 +465,37 @@ def fixed_by(db: DB, tid: int) -> str:
         return r["sha"]
     fix = db.task(int(r["fix_task"])) if r["fix_task"] is not None else None
     return f"#{r['fix_task']}" if fix and fix.get("status") == "done" else ""
+
+
+def relink(p, mid: int, target: str, why: str, now: float | None = None) -> str:
+    """Re-point correction `mid`'s fix to task `target` ('#<id>', '<id>' or '<project>#<id>' of this
+    project), whatever the status of the old or new fix task: a fix linked by mistake, or one a later
+    task replaced. The change and its reason are kept on the record (`relinked`). ValueError for an
+    unknown correction or task, another project's task, the same fix, or no reason."""
+    why = " ".join(str(why or "").split())
+    if not why:
+        raise ValueError("not recorded: say why the fix changes (--why)")
+    t = str(target or "").strip()
+    m = re.fullmatch(r"(?:([\w.-]+)?#|task:)?(\d{1,6})", t)
+    if not m:
+        raise ValueError(f"not recorded: {t!r} is not a task id ('#<id>')")
+    if m.group(1) and m.group(1) != p.name:
+        raise ValueError(f"not recorded: {t} is a task of project {m.group(1)}, not {p.name}")
+    fid = int(m.group(2))
+    if not p.db.task(fid):
+        raise ValueError(f"not recorded: no task #{fid} in project {p.name}")
+    recs = _records(p.db)
+    rec = next((r for r in recs if str(r.get("msg")) == str(int(mid))), None)
+    if rec is None:
+        raise ValueError(f"not recorded: no correction #{int(mid)}")
+    old = str(rec.get("fix") or "")
+    if old == f"#{fid}":
+        raise ValueError(f"not recorded: correction #{int(mid)}'s fix is already #{fid}")
+    rec["fix"] = f"#{fid}"
+    rec.setdefault("relinked", []).append({"from": old, "to": f"#{fid}", "why": why[:300],
+                                           "ts": time.time() if now is None else float(now)})
+    p.db.set_kv(KEY, recs)
+    return f"correction #{int(mid)}: fix {old or '(none)'} -> #{fid} ({why[:300]})"
 
 
 def open_stall(db: DB, cfg: dict | None, now: float | None = None) -> str:

@@ -5,8 +5,11 @@ The Course check keeps two model-free lines on those fixes (runtime/ttp/coursech
 
 ## Recurring mistake
 
-`recurring mistake` fires when a later correction has the class of an earlier one that got a fix task: the fix did not hold.
+`recurring mistake` fires when a later correction has the class of an earlier one that got a fix task, said after that fix landed: the fix did not hold.
+The landing time comes from the push records (a push queue landing of the fix or a task carrying it on, a detached push, a recorded supersession); a harness, work or question task lands when it is done.
+A correction said before the fix landed, or while it has not landed, does not count.
 Find why it missed this case and fix that in a task the same turn.
+A correction linked to the wrong fix task, done or not, is re-pointed with `ttp task <name> relink-fix <correction msg id> '#<task>' --why "<why>"`; the new task must exist in this project, and the change and its reason stay on the correction (`relinked`).
 When the fix task was cancelled because another task or commit re-landed the work, record that one: `ttp task <name> superseded <cancelled id> '#<done task>'`, or `ttp task <name> superseded <cancelled id> <sha>` for a commit in the harness, the project root or `--repo`.
 The line stops while that task stays done (or the commit exists).
 Open, failed or cancelled fix tasks, another project's task and unknown commits are refused.

@@ -8933,9 +8933,16 @@ def _terminalbench(p, a, now: float) -> None:
         venv, why = harborslice.install(tbcycle.folder() / "harbor")
         if not venv:
             die(f"model-bench terminalbench: {why}")
+        env = harborslice.child_env(venv, got.url, got.key)
+        extra, why = harborslice.compose(tbcycle.folder() / "harbor", tbcycle.settings(cfg), env)
+        if extra is None:
+            die(f"model-bench terminalbench: {why}")
         print(json.dumps({"model": a.runner, "trials": tbcycle.runner(
-            cfg, a.runner, harborslice.child_env(venv, got.url, got.key))}))
+            cfg, a.runner, {**env, **extra})}))
         return
+    extra, why = harborslice.compose(tbcycle.folder() / "harbor", tbcycle.settings(cfg))
+    if extra is None:   # checked before any runner starts: no trial without compose
+        die(f"model-bench terminalbench: {why}")
     want = {m.strip() for m in (a.models or "").split(",") if m.strip()}
     served = [m for m in ids if not want or m in want]
     print(json.dumps({**tbcycle.step(cfg, served, now, lambda m: tbcycle.launch(p, m)),
@@ -8956,8 +8963,12 @@ def _terminalbench_reference(p, a, cfg: dict) -> None:
         venv, why = harborslice.install(tbcycle.folder() / "harbor")
         if not venv:
             die(f"model-bench terminalbench --reference: {why}")
+        env = harborslice.child_env(venv, got.url, got.key)
+        extra, why = harborslice.compose(tbcycle.folder() / "harbor", tbcycle.settings(cfg), env)
+        if extra is None:
+            die(f"model-bench terminalbench --reference: {why}")
         print(json.dumps({"model": a.runner, "reference": True, "trials": tbcycle.ref_runner(
-            cfg, a.runner, harborslice.child_env(venv, got.url, got.key))}))
+            cfg, a.runner, {**env, **extra})}))
         return
     ok, msg, ids = endpoint.list_models(got.url, got.key)   # a model list read, no tokens
     if not ok:
@@ -10439,8 +10450,8 @@ def list_tasks(p, a) -> tuple[list[dict], int, int | None]:
 
 def cmd_task(a) -> None:
     p = need(a.name, sys.argv[1:])
-    if a.action != "add" and a.start_when is not None or a.action not in ("add", "rejudge", "set-when", "adopt-branch") and a.why is not None:
-        die("--start-when and --why go with add (--why also with set-when, rejudge and adopt-branch); for a queued task use set-when")
+    if a.action != "add" and a.start_when is not None or a.action not in ("add", "rejudge", "set-when", "adopt-branch", "relink-fix") and a.why is not None:
+        die("--start-when and --why go with add (--why also with set-when, rejudge, adopt-branch and relink-fix); for a queued task use set-when")
     if a.action != "rejudge" and a.dry_run:
         die("--dry-run goes with rejudge")
     if a.action not in ("add", "set-when") and a.start_after is not None:
@@ -10585,6 +10596,14 @@ def cmd_task(a) -> None:
                 print(link_fix(p, int(a.title), a.probe.strip(), a.repo))
             else:
                 print(record_superseded(p, int(a.title), a.probe.strip(), a.ref, a.repo))
+        except ValueError as e:
+            die(str(e))
+    elif a.action == "relink-fix":
+        from .correction import relink
+        if not a.title.strip().lstrip("#").isdigit() or not (a.probe or "").strip():
+            die(f'relink-fix needs a correction id and its fix task: ttp task {p.name} relink-fix <correction> <task> --why "<why>"')
+        try:
+            print(relink(p, int(a.title.strip().lstrip("#")), a.probe.strip(), a.why or ""))
         except ValueError as e:
             die(str(e))
     elif a.action == "abandon":
@@ -15960,13 +15979,13 @@ def main(argv: list[str] | None = None) -> None:
                                     "it is then closed as done; a failed review whose findings are fixed, with --by-review <passed re-review> "
                                     "or a commit on the push branch or --ref, is recorded superseded, its verdict kept); abandon records that a done code task's "
                                     "work will never land (its branch is kept), so local-only, push-audit and landed "
-                                    "checks leave it out; adopt-branch binds a task to a reviewed branch its saved work is on (checked: no running user, clean, its saved head or built on its lineage, not another open task's; no checkout, delete or rename); rejudge reruns the daemon's hand-off checks on a done or "
+                                    "checks leave it out; relink-fix re-points a correction's fix to another task of this project, done or not, with --why (kept on the correction); adopt-branch binds a task to a reviewed branch its saved work is on (checked: no running user, clean, its saved head or built on its lineage, not another open task's; no checkout, delete or rename); rejudge reruns the daemon's hand-off checks on a done or "
                                     "failed task's stored hand-off and corrects a wrong partial mark")
     s.add_argument("name", help="the project")
     s.add_argument("action", choices=["add", "list", "show", "cancel", "requeue", "restart", "set-when", "superseded",
-                                          "abandon", "adopt-branch", "rejudge"],
+                                          "abandon", "adopt-branch", "rejudge", "relink-fix"],
                    help="what to do")
-    s.add_argument("title", nargs="?", default="", help="add: the title; show/cancel/requeue/restart/set-when/superseded/abandon/adopt-branch/rejudge: the task id")
+    s.add_argument("title", nargs="?", default="", help="add: the title; show/cancel/requeue/restart/set-when/superseded/abandon/adopt-branch/rejudge: the task id; relink-fix: the correction (its message id)")
     s.add_argument("probe", nargs="?", help="restart: why, with the new instructions (a running task stops at a "
                    "safe point, after any `ttp lock` it holds, and is queued again with its work kept and no attempt "
                    "spent; budget.restart_max per budget.restart_window_h); "
@@ -15974,7 +15993,7 @@ def main(argv: list[str] | None = None) -> None:
                    "superseded: the commit on the push branch that carries the task's work (for a harness task: "
                    "the commit merged into the harness; for a cancelled correction-class fix task: the done task '#<id>' "
                    "or commit that fixed the class instead; for a failed review: a commit on the push branch or --ref that "
-                   "fixes its findings, optional with --by-review); abandon: why its work will never land; adopt-branch: the branch")
+                   "fixes its findings, optional with --by-review); abandon: why its work will never land; adopt-branch: the branch; relink-fix: the task that fixes the correction now")
     s.add_argument("--ref", help="superseded: the ref that holds the commit (default: the push branch; in a "
                    "second repository the task worked in, any of its branches); for a task with no branch on record, "
                    "required: the branch of a second repository that holds its work, or a ref the commit is on; a commit already on that "
@@ -16006,7 +16025,7 @@ def main(argv: list[str] | None = None) -> None:
                    "one) before which it does not start; set-when: now or \"\" clears it")
     s.add_argument("--why", help="add: plain words for --start-when, shown instead of the probe; add, set-when: "
                    "the standing rule, user msg # or dependency a deferral follows (a coordinator's uncited one is "
-                   "flagged); rejudge, adopt-branch: the reason logged with the change")
+                   "flagged); rejudge, adopt-branch: the reason logged with the change; relink-fix: why the fix changes (required, kept on the correction)")
     s.add_argument("--dry-run", action="store_true", help="rejudge: show what would change, write nothing")
     s.add_argument("--on-pass-cmd", help="set-when: a waiting task's model-free completion command, run once its "
                    "retry_when passes (\"\" clears it); without a probe its retry_when stays; an "

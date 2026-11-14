@@ -391,6 +391,34 @@ def recorded(db, tid: int, carry: dict | None = None, rows: Rows | None = None) 
     return [], ""
 
 
+def landed_at(db, tid: int) -> float | None:
+    """When task `tid`'s change first landed, from the push records `recorded` judges by (a push queue
+    landing of it or a task carrying it on, a detached push, a recorded supersession); None while none
+    exists. A task of a kind that is not pushed (harness, work, question) lands when it is done."""
+    task = db.task(int(tid))
+    if not task:
+        return None
+    carry = carriers(db, int(tid))
+    res = load_result(task.get("result"))
+    member = isinstance(res, dict) and isinstance(res.get("batch"), dict) and res["batch"].get("lead") != tid
+    branches = {v[0] for v in carry.values() if v[0]} if not member else set()
+    marks = ",".join("?" * len(carry))
+    times = []
+    try:
+        times += [r["updated"] for r in db.q(
+            f"SELECT updated FROM push_queue WHERE status IN ('pushed','landed') AND "
+            f"(landed_sha IS NOT NULL OR pushed_sha IS NOT NULL) AND (task IN ({marks}) OR branch IN "
+            f"(SELECT value FROM json_each(?)))", (*carry, json.dumps(sorted(branches))))]
+    except Exception:
+        pass   # a database without the push queue
+    for table in ("task_landings", "task_superseded"):
+        times += [r["ts"] for r in db.q(f"SELECT ts FROM {table} WHERE task IN ({marks})", list(carry))]
+    if not times and task.get("status") == "done" and (task.get("kind") != "code" or (member and res.get("landed"))):
+        times.append(task.get("updated"))
+    times = [float(t) for t in times if t]
+    return min(times) if times else None
+
+
 def task_shas(p, tid: int) -> tuple[list[str], str]:
     """The commits that carry task `tid` to the branch, and where they come from: the landed commits
     the push queue recorded for it or a task that carries it on (carriers: a review of it, a fix, a

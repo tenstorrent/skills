@@ -179,3 +179,75 @@ def test_terminalbench_reference_without_a_saved_endpoint_says_so_and_starts_not
             assert len(err.splitlines()) == 1 and "ttp secret endpoint" in err
         shutil.rmtree(d.parent)
     assert started == [] and not tbcycle.folder().exists(), "nothing started, nothing written"
+
+
+def _fake_docker(tmp, ok=False):
+    """A fake docker on PATH: `docker compose version` exits 0 only when DOCKER_CONFIG/cli-plugins holds an
+    executable docker-compose (or ok)."""
+    b = tmp / "bin"
+    b.mkdir(parents=True, exist_ok=True)
+    d = b / "docker"
+    d.write_text("#!/bin/sh\n" + ("exit 0\n" if ok else
+                 '[ "$1" = compose ] && [ -x "${DOCKER_CONFIG:-/nonexistent}/cli-plugins/docker-compose" ] '
+                 "&& exit 0\nexit 1\n"))
+    d.chmod(0o755)
+    return str(d)
+
+
+def test_terminalbench_compose_is_found_in_a_plugin_folder_or_the_setting_else_one_message(tmp_path, monkeypatch):
+    from ttp import harborslice
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(harborslice, "PLUGIN_DIRS", (str(tmp_path / "sys-plugins"),))
+    root = tmp_path / "bench"
+    env = {"PATH": os.environ.get("PATH", "")}
+    st = {"compose": ""}
+    assert harborslice.compose(root, st, env, which=lambda n: None)[0] is None, "no docker: stops"
+    docker = _fake_docker(tmp_path / "ok", ok=True)
+    assert harborslice.compose(root, st, env, which=lambda n: docker) == ({}, ""), "docker's own lookup works"
+    docker = _fake_docker(tmp_path)
+    extra, why = harborslice.compose(root, st, env, which=lambda n: docker)
+    assert extra is None and why.startswith("docker compose is missing") and "model_bench.terminalbench.compose" in why
+    assert str(tmp_path / "sys-plugins") in why and not root.exists(), "names where it looked; writes nothing"
+    plug = tmp_path / "elsewhere" / "docker-compose"
+    plug.parent.mkdir()
+    plug.write_text("#!/bin/sh\nexit 0\n")
+    plug.chmod(0o755)
+    for setting in (str(plug), str(plug.parent)):   # the plugin file, or a folder holding it
+        extra, why = harborslice.compose(root, {"compose": setting}, env, which=lambda n: docker)
+        own = root / "docker-config"
+        assert extra == {"DOCKER_CONFIG": str(own)} and why == ""
+        link = own / "cli-plugins" / "docker-compose"
+        assert link.is_symlink() and link.resolve() == plug.resolve()
+        assert sorted(p.name for p in own.rglob("*")) == ["cli-plugins", "docker-compose"], "only the link"
+    shutil.rmtree(root)
+    sysdir = tmp_path / "sys-plugins"
+    sysdir.mkdir()
+    (sysdir / "docker-compose").symlink_to(plug)
+    extra, _ = harborslice.compose(root, st, env, which=lambda n: docker)
+    assert extra and (root / "docker-config" / "cli-plugins" / "docker-compose").resolve() == plug.resolve()
+    assert harborslice.settings({"model_bench": {"terminalbench": {"compose": "/x"}}})["compose"] == "/x"
+
+
+def test_terminalbench_step_without_compose_stops_before_any_trial_with_one_message(env, monkeypatch, capsys):
+    import argparse as ap
+    import types
+    from ttp import cli, endpoint, harborslice, tbcycle
+    started = []
+    monkeypatch.setenv("HOME", str(env["tmp"] / "home"))
+    monkeypatch.setattr(harborslice, "PLUGIN_DIRS", ())
+    monkeypatch.setattr(tbcycle, "launch", lambda *x, **k: started.append(x))
+    monkeypatch.setattr(tbcycle, "step", lambda *x, **k: started.append("step") or {})
+    monkeypatch.setattr(endpoint, "list_models", lambda *x: (True, "", ["m-a"]))
+    monkeypatch.setattr(endpoint, "credentials", lambda alias: types.SimpleNamespace(url="u", key="k"))
+    docker = _fake_docker(env["tmp"])
+    monkeypatch.setattr(harborslice.shutil, "which", lambda n: docker if n == "docker" else None)
+    monkeypatch.delenv("DOCKER_CONFIG", raising=False)
+    d, cfg, clock, sleeps, sleep = _tb_setup(env, monkeypatch)
+    cfg["providers"] = {"chat": {"endpoint": "gw"}}
+    p = types.SimpleNamespace(config=lambda: cfg)
+    a = ap.Namespace(action="terminalbench", models=None, runner=None, reference=False)
+    with pytest.raises(SystemExit):
+        cli._terminalbench(p, a, clock["t"])
+    err = capsys.readouterr().err.strip()
+    assert len(err.splitlines()) == 1 and "docker compose is missing" in err
+    assert started == [], "no step, no runner launched"

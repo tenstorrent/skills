@@ -243,6 +243,8 @@ def _cc_cancelled_fix(p, now):
     from ttp import correction
     first = p.db.add_task("harness: catch the missed case", "s", kind="harness", origin="coordinator")
     p.db.x("UPDATE tasks SET status='cancelled', created=?, updated=? WHERE id=?", (now - 7100, now - 7000, first))
+    p.db.x("INSERT INTO task_landings(marker, task, sha, target, ts) VALUES(?,?,?,?,?)",
+           (f"t{first}-x.json", first, "a" * 40, "origin/main", now - 7000))   # it landed before it was cancelled
     p.db.set_kv(correction.KEY, [
         {"msg": 10, "ts": now - 7200, "why": "phrase", "class": ["#42"], "fix": f"#{first}", "shown": True},
         {"msg": 20, "ts": now - 60, "why": "phrase", "class": ["#42"], "fix": "", "shown": False}])
@@ -485,8 +487,8 @@ def test_a_number_only_class_credits_a_task_only_for_its_subject_or_message_neve
 
 
 def test_recurring_counts_a_correction_only_when_said_after_the_prior_fix_and_not_already_fixed(env):
-    """Correction B of the class of A, whose fix task is T: no recurring line while B's message was said
-    before T was created, or before T finished once T is closed (the record ts does not count); none once a
+    """Correction B of the class of A, whose fix task is T: no recurring line while T has not landed, or
+    B's message was said before T landed (a harness task: once done; the record ts does not count); none once a
     harness or upstream: task added since B cites it ('msg #<B>'); a cancelled, older or near-id citation
     keeps the line."""
     from ttp import correction
@@ -505,9 +507,9 @@ def test_recurring_counts_a_correction_only_when_said_after_the_prior_fix_and_no
         return [x for x in _cc(p, now)[0] if "recurring mistake" in x]
     assert line() == []   # said before T was created
     p.db.x("UPDATE messages SET ts=? WHERE id=?", (now - 4000, b))
-    assert len(line()) == 1   # T still open, said after it was created
+    assert line() == []   # T still open: not landed, so no sign it did not hold
     p.db.x("UPDATE tasks SET status='done', updated=? WHERE id=?", (now - 3000, t))
-    assert line() == []   # said before T finished
+    assert line() == []   # said before T landed
     p.db.x("UPDATE messages SET ts=? WHERE id=?", (now - 120, b))
     assert len(line()) == 1 and f"correction #{b} repeats the class (#42) of correction #{a}" in line()[0]
     for title, spec, created, status in (("harness: widgets case", f"from msg #{b}", now - 200, "done"),
@@ -551,3 +553,59 @@ def test_a_correction_sharing_only_the_projects_common_words_with_a_task_credits
         return bool(got[0])
     assert credit("harness: widgets plugin draft watch list", "for each device") is False
     assert credit("harness: catch lost profiler trace files", "in the widgets plugin")
+
+
+def test_recurring_skips_a_correction_said_before_the_prior_code_fix_landed(env):
+    """A code fix lands when the push records say so: B said before the landing, or while the fix is
+    done but not landed, is no recurring mistake; B said after it is. A push queue landing counts too."""
+    from ttp import correction
+    p = make(env)
+    now = time.time()
+    t = p.db.add_task("code: catch the widgets case", "s", kind="code", origin="coordinator")
+    p.db.x("UPDATE tasks SET status='done', created=?, updated=? WHERE id=?", (now - 9000, now - 8000, t))
+    a = _cc_msg(p, "in", "user", "You missed the widgets case", now - 9500)
+    b = _cc_msg(p, "in", "user", "You missed the widgets case again", now - 5000)
+    p.db.set_kv(correction.KEY, [
+        {"msg": a, "ts": now - 9400, "why": "phrase", "class": ["#42"], "fix": f"#{t}", "shown": True},
+        {"msg": b, "ts": now - 60, "why": "phrase", "class": ["#42"], "fix": "reason", "shown": True}])
+
+    def line():
+        return [x for x in _cc(p, now)[0] if "recurring mistake" in x]
+    assert line() == []   # done but never landed
+    p.db.x("INSERT INTO task_landings(marker, task, sha, target, ts) VALUES(?,?,?,?,?)",
+           (f"t{t}-1.json", t, "b" * 40, "origin/main", now - 4000))
+    assert line() == []   # B was said before it landed
+    p.db.x("UPDATE messages SET ts=? WHERE id=?", (now - 3000, b))
+    assert len(line()) == 1 and f"whose fix #{t}" in line()[0]   # said after the landing
+    p.db.x("DELETE FROM task_landings")
+    assert line() == []
+    p.db.x("INSERT INTO push_queue(task, branch, head, target, status, created, updated, landed_sha) "
+           "VALUES(?,?,?,?,?,?,?,?)", (t, "ttp/x", "c" * 40, "origin/main", "landed", now - 3500, now - 3500, "c" * 40))
+    assert len(line()) == 1   # the push queue landed it at now - 3500
+
+
+def test_relink_fix_repoints_a_corrections_fix_to_any_task_with_its_reason(env, capsys):
+    """`ttp task <p> relink-fix <correction> <task> --why`: a done, mislinked fix moves to the real fix
+    task, done or open; the change and reason stay on the record. No reason, an unknown correction or
+    task, another project's task or the same fix is refused and changes nothing."""
+    from ttp import correction
+    p = make(env)
+    now = time.time()
+    wrong = p.db.add_task("work: an unrelated probe", "s", kind="work", origin="coordinator")
+    real = p.db.add_task("harness: the real class fix", "s", kind="harness", origin="coordinator")
+    p.db.x("UPDATE tasks SET status='done' WHERE id=?", (wrong,))
+    p.db.set_kv(correction.KEY, [{"msg": 10, "ts": now - 600, "why": "phrase", "class": ["#42"],
+                                  "fix": f"#{wrong}", "shown": True}])
+    for args in (["10", f"#{real}"], ["10", f"#{real}", "--why", "  "], ["99", f"#{real}", "--why", "x"],
+                 ["10", "#9999", "--why", "x"], ["10", f"other#{real}", "--why", "x"],
+                 ["10", f"#{wrong}", "--why", "x"], ["10", "--why", "x"]):
+        assert _cc_task(p, "relink-fix", *args) not in (0, None), args
+    assert correction._records(p.db)[0]["fix"] == f"#{wrong}"
+    capsys.readouterr()
+    assert _cc_task(p, "relink-fix", "10", f"#{real}", "--why", "linked to the probe by mistake") == 0
+    assert f"#{wrong} -> #{real}" in capsys.readouterr().out
+    rec = correction._records(p.db)[0]
+    assert rec["fix"] == f"#{real}" and rec["relinked"][0]["from"] == f"#{wrong}"
+    assert rec["relinked"][0]["why"] == "linked to the probe by mistake"
+    assert _cc_task(p, "relink-fix", "#10", str(wrong), "--why", "back again") == 0   # an open or done task
+    assert [r["to"] for r in correction._records(p.db)[0]["relinked"]] == [f"#{real}", f"#{wrong}"]

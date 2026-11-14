@@ -1565,7 +1565,11 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    bench and the public index. It decides the verdict: under `floor_share` of the best served model's
    rate parks the model, a pass frees it, and endpoint faults leave it inconclusive. Settings live under
    `model_bench.terminalbench` (`on`, `tasks_file`, `agent`, `limit_s` default 900, `concurrency` 0 =
-   free cores / 4, `floor_share` default 0.5, `dataset` default `terminal-bench@2.0`). Point `dataset` at a
+   free cores / 4, `floor_share` default 0.5, `dataset` default `terminal-bench@2.0`, `compose`: the docker
+   compose plugin's path or folder). Harbor needs `docker compose`: when docker's own lookup lacks it, the
+   run links a compose plugin from `compose` or docker's usual `cli-plugins` folders into a docker config
+   folder of its own (only the link, nothing installed or copied); with none, it stops before any trial
+   with one message naming what is missing. Point `dataset` at a
    local Terminal-Bench folder to run its full task set, the shipped public 20-task subset first; a
    registry name runs only that subset, and a tasks file overrides both. Each model runs one trial at a
    time. The adapter is tested with fakes only.

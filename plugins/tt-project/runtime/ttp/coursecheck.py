@@ -249,12 +249,13 @@ def recurring(db: DB, at: float) -> list[dict]:
 
 
 def _after_fix(db: DB, fix: str, ts: float) -> bool:
-    """Whether a message said at `ts` came after fix task `fix` ('#<id>') finished (its last update once
-    closed), or while it is open, after it was created: an earlier one is no sign the fix did not hold."""
-    task = db.task(int(fix[1:])) if fix[1:].isdigit() else None
-    if not task:
+    """Whether a message said at `ts` came after fix task `fix` ('#<id>') landed (landed.landed_at, from
+    the push records): one said before it landed, or while it has not landed, is no sign it did not hold."""
+    from . import landed
+    if not fix[1:].isdigit() or not db.task(int(fix[1:])):
         return True
-    return ts > float((task["updated"] if task["status"] in TERMINAL_TASK_STATES else task["created"]) or 0)
+    at = landed.landed_at(db, int(fix[1:]))
+    return at is not None and ts > at
 
 
 def _cited_fix(db: DB, mid: int, since: float) -> bool:

@@ -18,7 +18,9 @@ Task names: <modelbench.home()>/harbor-tasks.txt (setting tasks_file), one per l
 none there: the full set of a local dataset folder (setting dataset, each task a folder with task.toml),
 the DEFAULT_TASKS subset first so a partial cycle still compares with earlier subset runs; a registry
 dataset name (no folder): the DEFAULT_TASKS subset only. Settings: model_bench.terminalbench {on, tasks_file, agent, limit_s, concurrency,
-floor_share, dataset} (settings). The older suite slice (`ttp model-bench suite --harbor N`) uses the same
+floor_share, dataset, compose} (settings). Before any trial, compose() makes sure `docker compose` runs, linking
+a compose plugin found in docker's usual cli-plugins folders or the setting compose into a docker config folder
+the bench owns; none: the run stops with one message naming what is missing. The older suite slice (`ttp model-bench suite --harbor N`) uses the same
 trial runner. Harbor is installed only into a venv the run owns, never with `pip install --user`: built on a
 python3.x on PATH of at least MIN_PY (Harbor needs 3.12), else with `uv venv --python 3.12` (uv's interpreters
 and cache under the bench folder, never ~/.local), then that venv's pip under cellenv.env. A failed install
@@ -45,6 +47,11 @@ DATASET, AGENT, LIMIT_S, FLOOR_SHARE = "terminal-bench@2.0", "terminus-2", 900, 
 COMMAND = ("harbor run -y -q --dataset {dataset} -a {agent} -m openai/{model} -o {jobs} --job-name {name} -n 1 "
            "-i {task} --ak 'llm_call_kwargs={{\"num_retries\":8}}'")
 RESUME = "harbor job resume -p {job}"
+# Where docker looks for CLI plugins (compose is docker-compose there): the user's folder under the home, then
+# the system's usual ones.
+USER_PLUGIN_DIR = "." + "docker/cli-plugins"
+PLUGIN_DIRS = ("/usr/local/lib/docker/cli-plugins", "/usr/local/libexec/docker/cli-plugins",
+               "/usr/lib/docker/cli-plugins", "/usr/libexec/docker/cli-plugins")
 # Harbor needs Python 3.12+; RECIPE names this install route, so a failure marker of an older one is stale.
 MIN_PY, RECIPE, INSTALL_RETRY_S = (3, 12), "venv-py3.12+", 6 * 3600
 INSTALL_TIMEOUT_S, TASK_TIMEOUT_S, RETRY_S, CORES_PER_TRIAL, MAX_SLOTS, MAX_RATE_WAITS = 900, 3600, 60, 4, 8, 24
@@ -69,7 +76,7 @@ def settings(cfg: dict) -> dict:
     return {"on": s.get("on", True) is not False, "tasks_file": str(s.get("tasks_file") or TASKS),
             "agent": str(s.get("agent") or AGENT), "limit_s": num("limit_s", LIMIT_S, 60),
             "concurrency": int(num("concurrency", 0, 0)), "floor_share": num("floor_share", FLOOR_SHARE, 0),
-            "dataset": str(s.get("dataset") or DATASET)}
+            "dataset": str(s.get("dataset") or DATASET), "compose": str(s.get("compose") or "")}
 
 
 def tasks(home: Path, st: dict) -> list[str]:
@@ -305,6 +312,41 @@ def score(got: list[dict]) -> dict:
     passed = sum(g["reward"] > 0 for g in done)
     return {"passed": passed, "trials": len(done), "pass_rate": round(passed / len(done), 3) if done else None,
             "median_min": round(statistics.median(mins), 1) if mins else None, "faults": len(got) - len(done)}
+
+
+def compose(root: Path, st: dict, env: dict | None = None, runner: Callable = _run,
+            which: Callable | None = None) -> tuple[dict | None, str]:
+    """({extra env}, '') once `docker compose` runs, else (None, why naming what is missing). Harbor starts
+    each task's container with it. Docker's own lookup first; else a compose plugin from the setting compose
+    (the plugin file, or a folder holding docker-compose) or docker's usual cli-plugins folders
+    (PLUGIN_DIRS, the user's own first), linked into a docker config folder the bench owns
+    (root/docker-config) and named by DOCKER_CONFIG. Nothing is installed or copied: only the plugin link
+    is there, so no docker settings or credentials move."""
+    env = dict(os.environ if env is None else env)
+    docker = (which or shutil.which)("docker")
+    if not docker:
+        return None, "docker is missing: no docker on PATH, so no Terminal-Bench trial can start"
+    if runner([docker, "compose", "version"], env, 60)[0] == 0:
+        return {}, ""
+    own = root / "docker-config"
+    link = own / "cli-plugins" / "docker-compose"
+    tried = [Path(st["compose"]).expanduser()] if st.get("compose") else []
+    tried += [Path(env["DOCKER_CONFIG"]) / "cli-plugins"] if env.get("DOCKER_CONFIG") else []
+    tried += [Path.home() / USER_PLUGIN_DIR, *map(Path, PLUGIN_DIRS)]
+    for c in tried:
+        f = c / "docker-compose" if c.is_dir() else c
+        if not (f.is_file() and os.access(f, os.X_OK)) or f.parent.resolve() == link.parent.resolve():
+            continue
+        link.parent.mkdir(parents=True, exist_ok=True)
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        link.symlink_to(f.resolve())
+        extra = {"DOCKER_CONFIG": str(own)}
+        if runner([docker, "compose", "version"], {**env, **extra}, 60)[0] == 0:
+            return extra, ""
+    return None, ("docker compose is missing: `docker compose version` fails and no working docker-compose plugin "
+                  "is in " + ", ".join(str(c) for c in tried) + "; put the compose plugin in one of those folders "
+                  "or set model_bench.terminalbench.compose to its path")
 
 
 def child_env(venv: Path, url: str = "", key: str = "") -> dict:
