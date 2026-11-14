@@ -1421,10 +1421,14 @@ def test_the_bench_owner_keeps_a_daily_model_suite_schedule_an_hour_after_the_be
     assert on == {benchowner.SCHEDULE: 0, benchowner.SUITE_SCHEDULE: 0}, "the lease lost: both off"
 
 
-def test_model_suite_rebuilds_a_missing_or_stale_folder_pair_keeping_the_old_until_the_new_is_complete(env, tmp_path):
+def test_model_suite_rebuilds_a_missing_or_stale_folder_pair_keeping_the_old_until_the_new_is_complete(env, tmp_path,
+                                                                                                       monkeypatch):
     from ttp import bench, modelsuite
     d, calls, log = tmp_path / "bench-home", [], []
     day = 86400.0
+    # Every pair here holds enough fair tasks: this case is about age and failed builds; a pair the fair
+    # filter left thin is the case test_model_suite_refresh_rebuilds_a_pair_a_tightened_filter_left_thin_at_most_daily.
+    monkeypatch.setattr(bench, "fair", lambda b: [{"task": i, "fair": True} for i in range(modelsuite.PREP_LIMIT)])
 
     def prep(db, repo, out, since, limit=0):
         calls.append(("prep", out.name, since, limit))
