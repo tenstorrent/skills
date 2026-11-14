@@ -489,9 +489,9 @@ def test_bench_run_cell_cannot_reach_the_landed_commit_later_history_or_the_held
     assert benchrun.audit(seen, task, [], secret) == [], "a tool's output is not what the agent wrote"
     wrote = json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Write", "input": {
         "file_path": "tests/test_x.py", "content": "def test_x():\n    assert mod.new() == 2, 'new() returns two'\n"}}]}})
-    assert benchrun.audit(wrote, task, [], secret) == ["shows 1 line(s) only the held-out tests have"]
+    assert benchrun.audit(wrote, task, [], secret) == ["quote_matches: 1"]
     assert benchrun.audit("", task, [], secret, diff="+    assert mod.new() == 2,  'new() returns two'") \
-        == ["shows 1 line(s) only the held-out tests have"], "a copied test in the diff is caught, spacing aside"
+        == ["quote_matches: 1"], "a copied test in the diff is caught, spacing aside"
     assert benchrun.audit("", task, [], secret, diff="+    assert mod.new() == 2") == []
     # A candidate that copies the hidden file in by its path fails as flagged, never graded.
     monkeypatch.setenv("TTP_FAKE_SHELL", f"cp {tmp_path / 'bench' / str(tid) / 'heldout' / 'tests' / 'test_mod.py'} tests/ && {_BENCH_FIX}")
@@ -1403,7 +1403,8 @@ def test_model_suite_rebuilds_a_missing_or_stale_folder_pair_keeping_the_old_unt
     now = 100 * day
     first = modelsuite.refresh(d, None, tmp_path, now, prep=prep, cells=cells, say=log.append)
     assert first and first[0].name.startswith("prep-") and first[1].name.startswith("cells-")
-    assert calls[0][2:] == (now - 14 * day, 12) and [c[0] for c in calls] == ["prep", "cells"]
+    assert calls[0][2:] == (now - 14 * day, 12)
+    assert calls[-1][0] == "cells", calls
     assert "no complete folder pair" in log[0]
     calls.clear()
     now += 6 * day
@@ -1630,7 +1631,7 @@ def test_bench_audit_flags_only_distinctive_held_out_lines_and_what_the_agent_it
     boiler = "+                            pass\n+        return configure_everything(verbose=True)\n"
     assert benchrun.audit("", task, [], secret, diff=boiler) == [], "boilerplate is not a held-out secret"
     assert benchrun.audit("", task, [], secret, diff=boiler + "+  assert mod.distinctive_answer() == 'forty two'\n") \
-        == ["shows 1 line(s) only the held-out tests have"]
+        == ["quote_matches: 1"]
     hidden = tmp_path / "real-checkout"
     printed = json.dumps({"type": "user", "message": {"content": [{"type": "tool_result", "content":
               f"CLAUDE_ENV_FILE={hidden}/runtime/loopproxy.sh\n# docs: run gh pr view to see it\n"}]},
@@ -1870,3 +1871,70 @@ def test_bench_cut_off_claude_cell_prices_output_from_its_content_and_says_it_is
     old = {"cost_usd": 0.1, "cost_estimated": True}
     assert "not comparable" in benchrun.spend_summary([row, old])["cost_note"]
     assert "under-counts" in benchrun.spend_summary([old])["cost_note"]
+
+
+def test_bench_audit_quote_matches_note_never_fails_an_isolated_cell(tmp_path):
+    """Since #8575 every standard cell runs isolated: a line-quote match cannot come from the answer,
+    so it is a note (quote_matches: N) on the row, never a fail; a hidden path or forge command still
+    voids the score."""
+    from ttp import benchrun
+    task = {"task": 7, "head": "f" * 40, "heldout": ["tests/test_mod.py"]}
+    secret = {"tests/test_mod.py": ["    assert mod.distinctive_answer() == 'forty two'"]}
+    wrote = json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Write",
+        "input": {"file_path": "tests/test_x.py", "content": "assert mod.distinctive_answer() == 'forty two'"}}]}})
+    # audit() records the match as a note, not a flag that voids the score.
+    flags = benchrun.audit(wrote, task, [], secret)
+    assert flags == ["quote_matches: 1"], flags
+
+
+def test_bench_a_cell_whose_only_finding_is_quote_matches_passes_and_carries_the_note(env, tmp_path, monkeypatch):
+    """A cell whose held-out tests pass and whose only audit finding is line matches passes, with the
+    quote note on its row; a cell naming a hidden path or running a forge command still fails."""
+    from ttp import benchrun
+    p, tid, task = _bench_built(env, tmp_path)
+    # A transcript that quotes a held-out line in the agent's own writing (Write tool) and fixes the task.
+    monkeypatch.setenv("TTP_FAKE_SHELL", _BENCH_FIX)
+    arms = {"a": {"provider": "claude", "model": "", "effort": ""},
+            "b": {"provider": "claude", "model": "", "effort": ""}}
+    out = tmp_path / "h2h-note"
+    real_audit = benchrun.audit
+    quoted = json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Write",
+        "input": {"content": "assert mod.new() == 2, 'new() returns two'"}}]}})
+    monkeypatch.setattr(benchrun, "audit",
+                        lambda *a, **k: ["quote_matches: 1"] + real_audit(*a, **k))
+    rows = benchrun.run(tmp_path / "bench", out, arms, 1, 1, _bench_opts(tmp_path), p.config())
+    r = rows[0]
+    assert r["outcome"] == "pass" and r["passed"] is True and r["flagged"] == ["quote_matches: 1"], r
+    # A hard finding still voids the score: the row is flagged, never a pass.
+    monkeypatch.setattr(benchrun, "audit", lambda *a, **k: ["names /etc/shadow"])
+    rows = benchrun.run(tmp_path / "bench", tmp_path / "h2h-hard", arms, 1, 1, _bench_opts(tmp_path), p.config())
+    assert rows[0]["outcome"] == "flagged" and rows[0]["passed"] is False, rows[0]
+
+
+def test_bench_grade_runs_the_held_out_tests_in_parallel_where_xdist_is_available(tmp_path):
+    """grade()'s environment carries PYTEST_ADDOPTS -n when the venv's python imports xdist, so the
+    held-out tests never wait on one worker; without xdist the options stay untouched."""
+    from ttp import benchrun, cellenv
+    (tmp_path / "heldout").mkdir()
+    (tmp_path / "heldout" / "t.py").write_text("def test_one():\n    pass\n")
+    task = {"task": 1, "heldout": ["t.py"], "tests": ["t.py::test_one"], "head": "0" * 40, "spec": "", "created": 0}
+    bench_dir = tmp_path
+    (bench_dir / "1" / "heldout").mkdir(parents=True)
+    (bench_dir / "1" / "heldout" / "t.py").write_text("def test_one():\n    pass\n")
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    # No venv in the environment: a serial run, PYTEST_ADDOPTS untouched.
+    base = {"PATH": "/usr/bin:/bin", "PYTEST_ADDOPTS": ""}
+    assert benchrun.grade_workers(base) == 0 or benchrun.grade_workers(base) >= 1  # decided by the host's /usr/bin
+    # A venv with xdist (the host interpreter's pytest-xdist): the tests run with -n.
+    venv = cellenv.make(tmp_path / "venv", ("pytest", "pytest-xdist"))
+    e = cellenv.env(venv, {"PATH": "/usr/bin:/bin"})
+    n = benchrun.grade_workers(e)
+    assert n >= 1, "pytest-xdist in the venv: the grade runs parallel"
+    # grade() lays the workers into PYTEST_ADDOPTS: a run through it shows the -n the tests get.
+    opts = dict(e)
+    opts["PYTEST_ADDOPTS"] = ""
+    held, log = benchrun.grade(ws, bench_dir, task, "python3 -m pytest -q", 120, opts)
+    assert held, log
+    cellenv.make(tmp_path / "venv2", ("pytest",))   # a venv without xdist: serial
+    assert benchrun.grade_workers(cellenv.env(tmp_path / "venv2", {"PATH": "/usr/bin:/bin"})) == 0

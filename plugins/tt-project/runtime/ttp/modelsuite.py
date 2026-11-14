@@ -124,6 +124,7 @@ def folders(d: Path) -> tuple[Path, Path] | None:
 
 
 FRESH_S, SINCE_S, PREP_LIMIT = 7 * 86400, 14 * 86400, 12   # rebuild after a week, from two weeks of tasks
+WIDEN_MAX_S = 60 * 86400                              # the fair-task draw's widest lookback
 _PAIR = re.compile(r"(prep|cells)-\d{8}-\d{6}")
 
 
@@ -149,7 +150,18 @@ def refresh(d: Path, db, repo: Path, now: float | None = None, prep: Callable | 
         f", building {b.name} and {c.name}")
     try:
         d.mkdir(parents=True, exist_ok=True)
-        (prep or bench.prep)(db, Path(repo), b, now - SINCE_S, limit=PREP_LIMIT)
+        # Draw past landed tasks until at least PREP_LIMIT fair ones remain: unfair tasks are never
+        # scored, so a bench of fewer would thin the day's cells. The lookback window widens (older
+        # landed tasks) up to WIDEN_MAX_S when the fold holds too few.
+        limit = PREP_LIMIT
+        since, window = now - SINCE_S, SINCE_S
+        for _ in range(3):   # 14d, then 30d, then 60d at most
+            shutil.rmtree(b, ignore_errors=True)
+            (prep or bench.prep)(db, Path(repo), b, since, limit=limit)
+            if sum(1 for r in bench.fair(b) if r["fair"] is not False) >= PREP_LIMIT or window >= WIDEN_MAX_S:
+                break
+            window, limit = min(2 * window, WIDEN_MAX_S), limit + PREP_LIMIT
+            since = now - window
         (cells or bench.cells)(b, c, repo=Path(repo))
         if folders(d) != (b, c):
             raise ValueError("the new pair is not complete")
@@ -418,9 +430,11 @@ def _rate(rows: list[dict]) -> float | None:
 def standard(model: str, arm: dict, date: str, bench_dir: Path | None, cells_dir: Path | None, opts: dict,
              cfg: dict, out: Path) -> dict:
     """The standard class row of one arm: replay pass rate and injection pass (module doc), each cell's
-    row appended to <out>/results.jsonl as it ends."""
-    from . import benchrun
+    row appended to <out>/results.jsonl as it ends. Only fair tasks run: an unfair task's held-out tests
+    need names or texts its spec never states, so no model could pass it honestly."""
+    from . import bench, benchrun
     rows, slug, down = [], re.sub(r"[^A-Za-z0-9_.-]", "-", model), {}
+    drawn = {"tasks_drawn": 0, "tasks_fair": 0, "dropped": []}
 
     def one(cell: Callable[[], dict]) -> dict:
         row = _tried(cell, opts, down)
@@ -429,7 +443,13 @@ def standard(model: str, arm: dict, date: str, bench_dir: Path | None, cells_dir
     if bench_dir:
         man = benchrun.verified(bench_dir)
         tasks = {t["task"]: {**t, "repo": man.get("repo")} for t in man["tasks"]}
-        for t in draw(list(tasks), REPLAY, date):
+        verdicts = {r["task"]: r for r in bench.fair(bench_dir)}
+        fair = [t for t in tasks if verdicts.get(t, {}).get("fair") is not False]   # unknown fairness still runs
+        drawn.update(tasks_drawn=len(tasks), tasks_fair=len(fair))
+        drawn["dropped"] = [{"task": t, "why": "its spec does not state " + ", ".join(map(repr, verdicts[t]["unstated"]))
+                             if verdicts.get(t, {}).get("unstated") else verdicts[t].get("why") or "unknown"}
+                            for t in tasks if t not in fair]
+        for t in draw(fair, REPLAY, date):
             rows.append(one(lambda t=t: benchrun.run_cell(bench_dir, out, tasks[t], {"task": t, "rep": 1, "arm": slug},
                                                           arm, opts, cfg)))
     inj = []
@@ -453,7 +473,7 @@ def standard(model: str, arm: dict, date: str, bench_dir: Path | None, cells_dir
             "injection_faults": sum(r.get("outcome") == "error" for r in inj),
             "transcript_sha256": _digest(every, "transcript_sha256"), "diff_sha256": _digest(every, "diff_sha256"),
             # spend, labelled an estimate (a floor) where a cell was cut off before its cost was reported
-            **benchrun.spend_summary(every), "cell_rows": every}
+            **benchrun.spend_summary(every), "task_draw": drawn, "cell_rows": every}
 
 
 NOT_GRADED = "not graded: flagged by the cheat audit"   # benchrun._finish's tests.log of a flagged cell
@@ -612,7 +632,7 @@ def _reaudit(date, out, bench_dir, opts, models, now, say) -> dict:
                                    benchrun.secret_lines(bench_dir, task), diff,
                                    benchrun.session_dirs(ws, _session_conf(run_json)))
             log = (keep / "tests.log").read_text(errors="replace") if (keep / "tests.log").is_file() else ""
-            if flags:
+            if flags and [f for f in flags if not f.startswith("quote_matches: ")]:
                 fixed.update(outcome="flagged", passed=False)
             elif r.get("outcome") == "flagged" or log.startswith(NOT_GRADED):
                 passed, tail = _regrade(bench_dir, task, diff, opts)

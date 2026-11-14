@@ -15675,7 +15675,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--bench", help="suite: a `ttp bench prep` folder for the replay cells (default, with no "
                                    "--cells either: the newest complete prep and cells pair in the bench folder)")
     s.add_argument("--cells", help="suite: a `ttp bench cells` folder for the injection cells")
-    s.add_argument("--timeout", type=float, default=1800.0, help="suite: seconds per agent cell (default 1800)")
+    s.add_argument("--timeout", type=float, default=3600.0,
+                   help="suite: hang guard per agent cell, well above a normal cell (default 3600)")
     s.add_argument("--budget", type=float, default=2.0, help="suite: dollars per agent cell (default 2)")
     s.add_argument("--harbor", type=int, default=0, metavar="N",
                    help="suite: also run N Terminal-Bench 2.0 tasks per model through Harbor, installed in a "

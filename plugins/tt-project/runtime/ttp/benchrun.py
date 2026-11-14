@@ -42,17 +42,20 @@ from . import bench, cellenv, cellns, gitmemo
 from .project import durable_write, open_append
 
 PROMPT = ("You are working in the git repository in your current directory. Do the task below there: make "
-          "the change, commit it, and run the tests it affects. You have {limit_min} minutes in all. Run only "
-          "focused tests: the test files for the code you changed (`python3 -m pytest -q <test file>`), or "
-          "`python3 -m pytest -q <test file> -k <name>` for the tests of the functions you touched. The repository's "
-          "whole suite may take longer than your time; run it only if you know it fits. When you are done, write "
+          "the change, commit it, and run the tests it affects. You have {limit_min} minutes in all; that is a "
+          "hang guard, so plan for far less. Run only focused tests: the test files for the code you changed "
+          "(`python3 -m pytest -q <test file>`), or `python3 -m pytest -q <test file> -k <name>` for the tests "
+          "of the functions you touched. The repository's whole suite may take longer than your time; run it "
+          "only if you know it fits. pytest-xdist is installed: append `-n <N>` (N up to half this machine's "
+          "cores) to run the tests in parallel. When you are done, write "
           '{{"status": "done", "summary": "<what you changed>"}} (or "failed" with why) to '
           "$TTP_RUN_DIR/result.json.\n\n## Task\n\n{spec}\n")
 
 
 def prompt(spec: str, opts: dict) -> str:
     """The cell agent's prompt: the task's spec, its time limit and a focused test command."""
-    return PROMPT.format(spec=spec, limit_min=max(1, int(float(opts.get("timeout_s") or 1800) // 60)))
+    cores = max(1, (os.cpu_count() or 2) // 2)
+    return PROMPT.format(spec=spec, limit_min=max(1, int(float(opts.get("timeout_s") or 1800) // 60)), N=cores)
 CHEAT = re.compile(r"\bgit\s+(fetch|clone|pull|ls-remote|remote\s+add)\b|\bgit\s+log\s+--all\b|\bgh\s+(api|repo|pr)\b")
 TEST_CMD = "python3 -m pytest -q -p no:cacheprovider"
 ISOLATE = True   # each cell's agent runs in a mount namespace (cellns.py); only tests turn this off (opts["isolate"])
@@ -446,15 +449,33 @@ def audit(transcript: str, task: dict, hidden: list[Path], secret: dict | None =
     if (long := len({f for xs in (secret or {}).values() for x in xs if len(f := bench.flat(x)) >= bench.QUOTE_LEN})) \
             and (n := bench.quotes(agent_text(transcript) + "\n" + diff, [x for xs in secret.values() for x in xs])) \
             >= min(bench.QUOTE_LINES, long):
-        out.append(f"shows {n} line(s) only the held-out tests have")
+        out.append(f"quote_matches: {n}")
     return out
+
+
+def grade_workers(env: dict) -> int:
+    """How many xdist workers the grade's held-out tests run with: the environment's python imports
+    pytest-xdist and the parallel grant the host allows (a quarter of its cores, at least 1, never more
+    than its free ones), else 0 (no xdist: plain serial pytest)."""
+    from . import checkcap, testslots
+    py = str(Path(env["VIRTUAL_ENV"]) / "bin" / "python") if env.get("VIRTUAL_ENV") \
+        else (env.get("PATH").split(os.pathsep) or ["python3"])[0] + "/python"
+    try:
+        has = subprocess.run([py, "-c", testslots.XDIST_PROBE], capture_output=True, env=env,
+                              timeout=30, stdin=subprocess.DEVNULL).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    if not has:
+        return 0
+    return max(1, checkcap.cores() // 4)
 
 
 def grade(ws: Path, bench_dir: Path, task: dict, test_cmd: str, timeout_s: float,
           env: dict | None = None) -> tuple[bool, str]:
     """Copy the held-out files over the candidate's and run the held-out tests with `env` (the cell's
     grading venv): (passed, log tail). They run as bench validation runs them (bench._held_cmd with the
-    select plugin), so a case file's test runs where its aggregator collects it, never on its own."""
+    select plugin), so a case file's test runs where its aggregator collects it, never on its own. The
+    tests run in parallel (`-n`) where the venv holds pytest-xdist and the host has room for it."""
     from . import benchcells
     for path in task["heldout"]:
         dest = ws / path
@@ -466,6 +487,12 @@ def grade(ws: Path, bench_dir: Path, task: dict, test_cmd: str, timeout_s: float
     if select:
         base = dict(os.environ if env is None else env)
         env = {**base, **benchcells.select_env(select, base)}
+    env = env or dict(os.environ)
+    env.setdefault("PYTEST_ADDOPTS", "")
+    if xdist_n := grade_workers(env):
+        # The held-out tests run in parallel (pytest-xdist from the cell's venv): a cell never needs the
+        # full serial suite, and the grade never waits on one worker.
+        env["PYTEST_ADDOPTS"] = (env["PYTEST_ADDOPTS"] + " " if env["PYTEST_ADDOPTS"] else "") + f"-n {xdist_n}"
     try:
         r = subprocess.run(argv, cwd=ws, capture_output=True, text=True,
                            timeout=timeout_s, stdin=subprocess.DEVNULL, env=env)
@@ -813,20 +840,27 @@ def _finish(row: dict, bench_dir: Path, task: dict, ws: Path, run: Path, keep: P
     bench._git(ws, "add", "-A")
     diff = gitmemo.run(["git", "-C", str(ws), "diff", "--cached", start], capture_output=True, timeout=None).stdout
     row["diff_sha256"] = _sha(diff)
+    if ended.get("stopped") in ("timeout", "stalled"):
+        # The wall-time hang guard ended the agent: the guard, not the model, cut the cell short; never
+        # scored as a model fail.
+        row["hang_guard"] = ended["stopped"]
     flags = audit(transcript.decode(errors="replace"), task, hidden,
                   secret_lines(bench_dir, task), diff.decode(errors="replace"), own or session_dirs(ws))
     # Graded even when flagged, so a reader sees both: a flagged cell still scores as a flag (passed False),
     # and `heldout_passed` keeps what the held-out tests said. A fresh venv: nothing the agent installed
-    # into its own runs them.
+    # into its own runs them. A quote-match flag is a note, not a fail: an isolated standard cell's line
+    # matches cannot come from the answer (isolation denies the held-out files and the landed history),
+    # so they never void the score; only hard evidence does.
     venv = cellenv.make(run.parent / "grade-venv", opts.get("cell_packages", cellenv.SEED))
     held, log_tail = grade(ws, bench_dir, task, opts["test_cmd"], opts["test_timeout_s"],
                            cellenv.env(venv, _clean_env()))
-    if flags:
+    hard = [f for f in flags if not f.startswith("quote_matches: ")]
+    if hard:
         log_tail = "flagged by the cheat audit; the held-out tests " + ("passed" if held else "failed") \
             + " (not scored as a pass)\n" + log_tail
-    passed = held and not flags
+    passed = held and not hard
     row.update(passed=passed, heldout_passed=held, flagged=flags,
-               outcome="flagged" if flags else "pass" if passed else "fail")
+               outcome="flagged" if hard else "pass" if passed else "fail")
     if row["outcome"] == "fail" and (fault := endpoint_fault(ended)):
         # the endpoint failed the agent (a 429, an outage), not the model: never scored, retried by the suite
         row.update(outcome="error", endpoint_fault=fault)
