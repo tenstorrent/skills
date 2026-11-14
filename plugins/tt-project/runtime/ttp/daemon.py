@@ -13483,9 +13483,11 @@ class Daemon:
 
     def _floor_need(self, task: dict, wake: str | None, prev: dict) -> dict | None:
         """The floor ({tier, effort}, tierfloor.target) this start of a conclusion run must reach, or None.
-        A stale wake (the same wait handed back) or a light wake its hand-off asked for (tierfloor.poll_wake)
-        only checks it, so it needs none."""
-        if wake and (bud.stale_wakes(prev) or tierfloor.poll_wake(prev)) and not prev.get("escalated_wake"):
+        A stale wake (the same wait handed back), a light wake its hand-off asked for (tierfloor.poll_wake),
+        a planned check (waketier.due; budget.wake_tier keeps its plan_tier) or an under-use wake (a look at
+        a running job) only checks it, so it needs none: the floor is for the run that writes the conclusion."""
+        if wake and (bud.stale_wakes(prev) or tierfloor.poll_wake(prev)
+                     or waketier.reason(prev) in ("plan_check", "underuse")) and not prev.get("escalated_wake"):
             return None
         try:
             return tierfloor.target(self.p.db, self.cfg, task)

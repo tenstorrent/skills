@@ -308,6 +308,33 @@ def test_a_conclusion_tasks_poll_wake_keeps_the_light_tier_its_hand_off_asked_fo
     assert wake(waits) == [("standard", "high", "standard")], "a spec change is new work at the task's own tier"
 
 
+def test_a_conclusion_tasks_planned_check_and_under_use_wake_keep_their_own_tier(env, monkeypatch):
+    """[note 98e99ab850200894] A planned check (wake_reason plan_check; budget.wake_tier keeps its plan_tier)
+    and an under-use wake only look at the wait, so the conclusion floor lifts neither, even when the
+    hand-off asked for standard. The same hand-off woken for a failed check, or escalated, keeps the floor."""
+    from ttp import waketier
+    from ttp.daemon import SPEC_SEEN_KEY
+    from ttp.prompts import spec_digest
+    p, d, started = _floor_daemon(env, monkeypatch)
+    t = p.db.add_task("Measure the fix", "Run the benchmark.\nconclusion: did the fix help?", kind="work",
+                      tier="standard", origin="coordinator", provider="claude", budget_usd=8.0)
+    waits = {"status": "waiting", "summary": "benchmark runs", "retry_when": "test -e /nonexistent/done",
+             "waiting_for": "the benchmark", "wake_tier": "standard", SPEC_SEEN_KEY: spec_digest(p.db.task(t))}
+
+    def wake(result):
+        p.db.update_task(t, status="queued", result=json.dumps(result), not_before=None)
+        started.clear()
+        d.dispatch()
+        return [(a[3], k["min_effort"], k["note"]["wake"]["tier"]) for a, k in started]
+
+    plan = {**waits, waketier.KEY: "plan_check", waketier.PLAN_TIER: "light", "woke": "a planned check"}
+    assert wake(plan) == [("light", None, "light")], "a planned check keeps its plan tier"
+    under = {**waits, waketier.KEY: "underuse", "woke": "its detached job under-uses what it asked for"}
+    assert wake(under) == [("standard", None, "standard")], "an under-use wake gets no floor effort"
+    assert wake({**waits, waketier.KEY: "checks_failed", "woke": "checks failed"}) == [("standard", "high", "standard")]
+    assert wake({**under, "escalated_wake": True}) == [("standard", "high", "standard")]
+
+
 def test_tier_floor_lifts_device_and_verdict_runs_and_leaves_mechanical_ones(env, monkeypatch):
     from ttp import machines, tierfloor
     monkeypatch.setattr(machines, "load", lambda: {"box1": {"tags": []}})
