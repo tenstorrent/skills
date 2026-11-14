@@ -4254,6 +4254,16 @@ def test_a_pushed_batch_closes_the_review_done_without_any_model_run(env, monkey
     assert not [e for e in evs if e["status"] == "queued"], "a pushed review woke the coordinator"
     assert subprocess.run(["git", "-C", str(s.repo), "show-ref", "--verify", "--quiet", "refs/ttp/push/1"]).returncode, \
         "the pin of a pushed row of a finished task stays"
+    kept = lambda: subprocess.run(["git", "-C", str(s.repo), "rev-parse", "-q", "--verify", f"{pushq.LANDED_REF}1"],  # noqa: E731
+                                  capture_output=True, text=True).stdout.strip()
+    assert kept() == s.head, "a landed head stays readable under its own ref once its pin goes (bench prep)"
+    subprocess.run(["git", "-C", str(s.repo), "gc", "-q", "--prune=now"], check=True)
+    assert kept() == s.head, "gc keeps it"
+    pushq.prune_refs(s.p)
+    assert kept() == s.head, "a recent landing is kept"
+    s.p.db.x("UPDATE push_queue SET updated=?", (time.time() - pushq.LANDED_DAYS * 86400 - 60,))
+    pushq.prune_refs(s.p)
+    assert kept() == "", f"it goes {pushq.LANDED_DAYS} days after its row settled"
     sm = pushq.summary(s.p)
     assert sm["live"] is None and sm["approved"] == [] and sm["deaths"] == 0
     assert [(b["id"], b["outcome"], b["pushed_sha"], b["version"], b["after_push"]) for b in sm["last"]] == [

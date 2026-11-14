@@ -4,9 +4,10 @@
 compare models, build a clean workspace at each one's base commit and hold out its tests.
 
 A task qualifies when it is a done code or work task created on or after `since` (the later of the
-compared models' release dates, so neither saw the change), landed through one push queue row, and
-its landed change adds or changes tests (addedtests.added). Its base is the commit before its
-landed commits on the push branch. Excluded, with the reason: a spec that quotes the fix (QUOTE_LINES
+compared models' release dates, so neither saw the change), landed once (one push queue row or its
+own push, candidates), and its landed change adds or changes tests (addedtests.added). Its base is
+the commit before its landed commits on the push branch (landing: matched to its branch head, kept
+under pushq.LANDED_REF, else walked back to the earlier landing). Candidates are scanned newest first. Excluded, with the reason: a spec that quotes the fix (QUOTE_LINES
 added lines verbatim), held-out tests that use a repository symbol the base lacks and the spec does
 not name, and (unless validation is off) a task none of whose added tests fails on the base with the
 head's test files in place and passes ROUNDS of ROUNDS runs on the head: only those fail-to-pass
@@ -45,6 +46,7 @@ ROUNDS = 3         # runs on the head each kept test must pass
 TEST_CMD = "python3 -m pytest -q -p no:cacheprovider"
 TEST_TIMEOUT = 900  # seconds one validation run may take
 BUILDERS = 4        # workspaces built at once, beside the scan
+WALK = 60           # first-parent commits before a landed commit searched for where its change starts
 PARENT = re.compile(r"This task's branch starts from #(\d+)'s branch(?: \S+ \(head ([0-9a-f]{7,40})\))?")
 _EPOCH = {"GIT_AUTHOR_DATE": "2000-01-01T00:00:00+0000", "GIT_COMMITTER_DATE": "2000-01-01T00:00:00+0000"}
 
@@ -61,22 +63,45 @@ def _out(repo, *args: str) -> str:
     return gitmemo.cached(("bench", str(repo), *args), read)
 
 
-def landing(repo: Path, rows: list[dict]) -> tuple[str, str, str]:
-    """(base, head, "") of a change the push queue landed in `rows` (its rows with a landed commit),
-    or ("", "", why) when the range on the push branch is not clear."""
+def landing(repo: Path, rows: list[dict], stops: frozenset = frozenset(),
+            shared: frozenset = frozenset()) -> tuple[str, str, str]:
+    """(base, head, "") of a change the push queue or a code task's own push landed in `rows` (its
+    rows with a landed commit), or ("", "", why) when the range on the push branch is not clear. A
+    change rebased on landing whose branch head is still in the repository is matched commit for
+    commit. One whose head is gone, or that landed as a fast-forward, starts after the nearest
+    first-parent ancestor of its landed commit that is in `stops` (every earlier landed commit and
+    push branch tip) or carries the version-bump trailer, within WALK commits; a trailing bump commit
+    stays in the range. A landed commit in `shared` (other changes landed in it too) is excluded."""
     if len(rows) != 1:
         return "", "", f"landed in {len(rows)} pushes" if rows else "no landed commit recorded"
     land, head = rows[0]["landed_sha"], rows[0]["head"] or ""
+    if not _out(repo, "rev-parse", "--verify", "-q", f"{land}^{{commit}}"):
+        return "", "", "its landed commit is not in the repository"
     fork = _out(repo, "merge-base", head, land) if head else ""
-    if not fork or not _out(repo, "rev-parse", "--verify", "-q", f"{land}^{{commit}}"):
-        return "", "", "its landed commit or branch head is not in the repository"
-    if fork == _out(repo, "rev-parse", head):
-        return "", "", "it landed as a fast-forward, so where its commits start is unknown"
+    if not fork or fork == _out(repo, "rev-parse", head):
+        if land in shared:
+            return "", "", "it landed in one commit with other changes, so where its commits start is unknown"
+        base = _start(repo, land, stops)
+        if not base or _out(repo, "rev-list", "--count", "--merges", f"{base}..{land}") != "0":
+            return "", "", f"no earlier landing within {WALK} commits before its landed commit"
+        return base, land, ""
     n = int(_out(repo, "rev-list", "--count", "--no-merges", f"{fork}..{head}") or 0)
     base = _out(repo, "rev-parse", "--verify", "-q", f"{land}~{n}") if n else ""
     same = base and _out(repo, "rev-list", "--count", "--merges", f"{base}..{land}") == "0" and (
         _out(repo, "diff", "--name-only", fork, head) == _out(repo, "diff", "--name-only", base, land))
     return (base, land, "") if same else ("", "", "its landed commits do not match its branch")
+
+
+def _start(repo: Path, land: str, stops: frozenset) -> str:
+    """The nearest first-parent ancestor of `land` (within WALK) that is in `stops` or a version-bump
+    commit: the push branch just before the change's own commits; "" when none is."""
+    from .push import BUMP_TRAILER
+    log = _out(repo, "log", "--first-parent", f"--max-count={WALK}", "--format=%x00%H%n%B", f"{land}^")
+    for entry in log.split("\0")[1:]:
+        sha, _, body = entry.partition("\n")
+        if sha in stops or any(ln.startswith(f"{BUMP_TRAILER}:") for ln in body.splitlines()):
+            return sha
+    return ""
 
 
 def from_parent(db, repo: Path, parent: int, recorded: str, head: str) -> tuple[str, str, str]:
@@ -625,6 +650,41 @@ def _reach(rows, pushed: list[dict]) -> set[int]:
     return seen
 
 
+def candidates(db, since: float):
+    """(tasks, rows, pushed, reach, stops, shared) prep scans: the done code and work tasks created on
+    or after `since`, newest first (a limited prep keeps the latest ones); landed.Rows of them; every
+    landing ({task, branch, head, landed_sha}: push queue rows, the commit a row's batch pushed when
+    it recorded no own landed commit, and code tasks' own pushes, landed.record_push); the tasks a
+    landing may reach (_reach); every landed commit and push branch tip before a push (landing's
+    stops); and the landed commits more than one change landed in."""
+    from . import landed
+    tasks = db.q("SELECT id, kind, title, spec, created FROM tasks WHERE status='done' AND kind IN ('code','work') "
+                 "AND created >= ? ORDER BY id DESC", (since,))
+    rows = landed.Rows(db, [t["id"] for t in tasks])
+    pushed = db.q("SELECT task, branch, head, COALESCE(NULLIF(landed_sha, ''), pushed_sha) AS landed_sha FROM push_queue "
+                  "WHERE status IN ('pushed','landed') AND COALESCE(NULLIF(landed_sha, ''), pushed_sha, '') != '' ORDER BY id")
+    seen = {r["landed_sha"] for r in pushed}
+    pushed += [{"task": r["task"], "branch": "", "head": "", "landed_sha": r["sha"]} for r in rows.landings
+               if r["sha"] not in seen]
+    by: dict[str, set] = {}
+    for r in pushed:
+        by.setdefault(r["landed_sha"], set()).add(r["branch"] or r["task"])
+    tips = {r["tip"] for r in db.q("SELECT tip FROM push_batches WHERE tip IS NOT NULL AND tip != ''")}
+    return (tasks, rows, pushed, _reach(rows, pushed), frozenset(by) | frozenset(tips),
+            frozenset(sha for sha, who in by.items() if len(who) > 1))
+
+
+def landed_rows(db, tid: int, rows, pushed: list[dict], reach: set[int]) -> list[dict]:
+    """The landings of task `tid` among `pushed` (candidates): those of a task or branch that carries
+    its change on (landed.carriers)."""
+    from . import landed
+    if tid not in reach:
+        return []
+    carry = landed.carriers(db, tid, rows)
+    branches = {v[0] for v in carry.values() if v[0]}
+    return [r for r in pushed if r["task"] in carry or (r["branch"] and r["branch"] in branches)]
+
+
 def _stderr(line: str) -> None:
     print(line, file=sys.stderr, flush=True)
 
@@ -635,14 +695,8 @@ def prep(db, repo: Path, out: Path, since: float, limit: int = 0, test_cmd: str 
     keep only the fail-to-pass tests `test_cmd` finds (validate); a validation run that runs none of
     them raises PrepFault. `progress` gets one line per candidate (kept or excluded with why, its
     seconds, the count kept so far and the total elapsed), so a long prep shows where it is."""
-    from . import landed
     out.mkdir(parents=True)
-    tasks = db.q("SELECT id, kind, title, spec, created FROM tasks WHERE status='done' AND kind IN ('code','work') "
-                 "AND created >= ? ORDER BY id", (since,))
-    rows = landed.Rows(db, [t["id"] for t in tasks])
-    pushed = db.q("SELECT task, branch, head, landed_sha FROM push_queue WHERE status IN ('pushed','landed') "
-                  "AND landed_sha IS NOT NULL AND landed_sha != '' ORDER BY id")
-    reach = _reach(rows, pushed)
+    tasks, rows, pushed, reach, stops, shared = candidates(db, since)
     kept, excluded = [], []
     began = time.monotonic()
 
@@ -655,15 +709,10 @@ def prep(db, repo: Path, out: Path, since: float, limit: int = 0, test_cmd: str 
             if limit and len(kept) >= limit:
                 break
             t0 = time.monotonic()
-            mine = []
-            if t["id"] in reach:
-                carry = landed.carriers(db, t["id"], rows)
-                branches = {v[0] for v in carry.values() if v[0]}
-                mine = [r for r in pushed if r["task"] in carry or r["branch"] in branches]
-            base, head, why = landing(repo, mine)
+            base, head, why = landing(repo, mine := landed_rows(db, t["id"], rows, pushed, reach), stops, shared)
             parent = PARENT.search(t["spec"] or "")
             if not why and parent:
-                base, head, why = from_parent(db, repo, int(parent[1]), parent[2] or "", mine[0]["head"])
+                base, head, why = from_parent(db, repo, int(parent[1]), parent[2] or "", mine[0]["head"] or head)
             tests = addedtests.added(repo, base, head, _tests_of(repo)) if base else []
             if not why and not tests:
                 why = "its landed change adds or changes no test"

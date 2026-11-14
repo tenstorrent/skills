@@ -159,16 +159,64 @@ def test_bench_landing_refuses_a_range_that_does_not_match_its_branch(tmp_path):
     land = commit({"a.py": "a = 1\n", "b.py": "b = 1\n"}, "squashed")   # one commit for the branch's two
     assert bench.landing(repo, [{"head": head, "landed_sha": land}]) == ("", "", "its landed commits do not match its branch")
     assert bench.landing(repo, [{"head": head, "landed_sha": "f" * 40}])[2] == (
-        "its landed commit or branch head is not in the repository")
+        "its landed commit is not in the repository")
     assert bench.landing(repo, [])[2] == "no landed commit recorded"
     subprocess.run([*git, "reset", "-q", "--hard", "HEAD~1"], check=True)
     subprocess.run([*git, "merge", "-q", "--ff-only", "two"], check=True)
     assert bench.landing(repo, [{"head": head, "landed_sha": rev()}])[2] == (
-        "it landed as a fast-forward, so where its commits start is unknown")
+        f"no earlier landing within {bench.WALK} commits before its landed commit"), "a fast-forward with no stop"
+    assert bench.landing(repo, [{"head": head, "landed_sha": rev()}], frozenset({rev("v1")})) == (
+        rev("v1"), rev(), ""), "a fast-forward starts after the earlier landing"
     subprocess.run([*git, "reset", "-q", "--hard", "HEAD~2"], check=True)
     commit({"c.txt": "c\n"}, "unrelated")
     subprocess.run([*git, "cherry-pick", "two~1", "two"], check=True, capture_output=True)
     assert bench.landing(repo, [{"head": head, "landed_sha": rev()}]) == (rev("HEAD~2"), rev(), "")
+
+
+def test_bench_prep_rebuilds_a_landing_whose_head_is_gone_or_fast_forwarded_from_the_earlier_landing(env, tmp_path):
+    # A pruned work branch (head gone), a fast-forward and a code task's own push (task_landings) start after
+    # the nearest earlier landing or version-bump commit on the push branch, the trailing bump kept; one
+    # commit two changes landed in together is excluded with its reason.
+    from ttp import bench
+    p = make(env)
+    repo, git, commit, rev = _bench_repo(tmp_path)
+    since = 1_000_000.0
+
+    def task(name: str, created: float, **row) -> int:
+        tid = p.db.add_task(name, f"Add {name}.", kind="code")
+        p.db.x("UPDATE tasks SET status='done', created=?, branch=? WHERE id=?", (created, name, tid))
+        if row:
+            p.db.x("INSERT INTO push_queue(task, branch, head, target, status, landed_sha, created, updated) "
+                   "VALUES(?,?,?,?,?,?,?,?)", (tid, name, row["head"], "main", "landed", row["land"], created, created))
+        return tid
+    test = lambda n: {f"tests/test_{n}.py": f"def test_{n}():\n    pass\n"}  # noqa: E731
+    early = _bench_land(git, commit, rev, "early", test("early"), p, "Early.", since + 1)
+    stop = rev()
+    commit({"gone.py": "g = 1\n"}, "gone 1")
+    commit(test("gone"), "gone 2")
+    bump = commit({"VERSION": "0.1.1\n"}, "0.1.1\n\nTtp-Version-Bump: 0.1.1")
+    gone = task("gone", since + 2, head="e" * 40, land=bump)
+    subprocess.run([*git, "checkout", "-q", "-b", "ff", "main"], check=True)
+    ff_head = commit(test("ff"), "ff")
+    subprocess.run([*git, "checkout", "-q", "main"], check=True)
+    subprocess.run([*git, "merge", "-q", "--ff-only", "ff"], check=True)
+    ff = task("ff", since + 3, head=ff_head, land=ff_head)
+    both = commit({**test("one"), **test("two")}, "one and two")
+    one, two = task("one", since + 4, head="d" * 40, land=both), task("two", since + 5, head="c" * 40, land=both)
+    own_land = commit(test("own"), "own")
+    own = task("own", since + 6)
+    p.db.x("INSERT INTO task_landings(marker, task, sha, target, ts) VALUES(?,?,?,?,?)",
+           ("own.json", own, own_land, "main", since + 6))
+    m = bench.prep(p.db, repo, tmp_path / "bench", since, validated=False)
+    kept = {t["task"]: (t["base"], t["head"], t["tests"]) for t in m["tasks"]}
+    assert [t["task"] for t in m["tasks"]] == [own, ff, gone, early], "newest first"
+    assert kept[gone] == (stop, bump, ["tests/test_gone.py::test_gone"]), "from the earlier landing to its bump"
+    assert kept[ff] == (bump, ff_head, ["tests/test_ff.py::test_ff"]), "a fast-forward starts after the bump"
+    assert kept[own] == (both, own_land, ["tests/test_own.py::test_own"]), "a code task's own push"
+    why = {e["task"]: e["why"] for e in m["excluded"]}
+    assert why[one] == why[two] == "it landed in one commit with other changes, so where its commits start is unknown"
+    lim = bench.prep(p.db, repo, tmp_path / "limited", since, validated=False, limit=1)
+    assert [t["task"] for t in lim["tasks"]] == [own], "a limited prep keeps the latest"
 
 
 def test_bench_unknown_symbols_counts_names_the_spec_gives_and_ignores_outside_modules(tmp_path):
@@ -321,9 +369,9 @@ def test_bench_prep_validates_fail_to_pass_tests_and_finds_landings_through_carr
     p.db.x("UPDATE tasks SET status='done', labels=? WHERE id=?", (json.dumps([f"auto_review:{via}"]), review))
     out = tmp_path / "bench"
     m = bench.prep(p.db, repo, out, since)
-    assert [t["task"] for t in m["tasks"]] == [mixed, via]
+    assert [t["task"] for t in m["tasks"]] == [via, mixed], "newest first"
     assert m["validated"] is True and m["rounds"] == bench.ROUNDS == 3 and m["test_cmd"] == bench.TEST_CMD
-    t = m["tasks"][0]
+    t = m["tasks"][1]
     assert t["tests"] == ["tests/test_mod.py::test_new"], "a test that passes on the base is dropped"
     assert sorted(t["heldout"]) == ["tests/data.txt", "tests/test_mod.py"], "every test file the change touches"
     assert (out / str(mixed) / "heldout" / "tests" / "data.txt").read_text() == "x\n"
@@ -332,9 +380,9 @@ def test_bench_prep_validates_fail_to_pass_tests_and_finds_landings_through_carr
     assert why[passes] == "its held-out tests pass on the base: tests/test_more.py::test_more"
     assert why[broken] == "none of its held-out tests fails on the base and passes 3 of 3 runs on the head"
     unchecked = bench.prep(p.db, repo, tmp_path / "unchecked", since, validated=False)
-    assert [t["task"] for t in unchecked["tasks"]] == [mixed, passes, broken, via]
+    assert [t["task"] for t in unchecked["tasks"]] == [via, broken, passes, mixed]
     assert unchecked["validated"] is False and "test_cmd" not in unchecked
-    assert unchecked["tasks"][0]["tests"] == ["tests/test_mod.py::test_same", "tests/test_mod.py::test_new"]
+    assert unchecked["tasks"][3]["tests"] == ["tests/test_mod.py::test_same", "tests/test_mod.py::test_new"]
 
 
 def test_bench_prep_validates_only_the_held_out_paths_and_stops_on_a_run_that_ran_none_of_them(env, tmp_path):

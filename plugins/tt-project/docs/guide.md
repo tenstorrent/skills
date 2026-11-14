@@ -1212,12 +1212,16 @@ hand-off already reaches the coordinator, so a relay would add a paid run for no
 `ttp bench prep --since <date> --out <dir>` builds, without a model call, the task set a later run
 uses to compare two models or efforts on this project's own work. `--since` is the later of the
 compared models' release dates, so neither saw the changes. It keeps done code and work tasks created
-since then whose change landed through one push queue row and adds or changes tests; their landed
-tests are held out as graders. It excludes, with the reason, a task whose spec quotes 3 or more lines
-of the fix, whose held-out tests use a repository symbol the base lacks and the spec does not name
-(`from m import x`, `import a.b` and attribute chains on either), or whose landing range on the push
-branch is unclear (a fast-forward, a squash, several pushes); a review or fix task that pushed the
-change counts as its landing. A task whose spec says its branch starts from another task's branch (a
+since then whose change landed once (a push queue row or the task's own `ttp push`) and adds or
+changes tests, newest first; their landed tests are held out as graders. A change rebased on landing
+whose branch head is still there is matched commit for commit; the push queue keeps each landed head
+under `refs/ttp/landed/<row>` for 90 days so a pruned branch still matches. One whose head is gone, or
+that landed as a fast-forward, starts after the nearest earlier landed commit, push branch tip or
+version-bump commit within 60 first-parent commits. It excludes, with the reason, a task whose spec
+quotes 3 or more lines of the fix, whose held-out tests use a repository symbol the base lacks and the
+spec does not name (`from m import x`, `import a.b` and attribute chains on either), or whose landing
+range on the push branch is unclear (a squash, several pushes, one commit shared with other changes);
+a review or fix task that pushed the change counts as its landing. A task whose spec says its branch starts from another task's branch (a
 review fix) is replayed from that parent's recorded head to its own branch head, so its workspace has
 the parent's work; it is excluded when the repository lacks that head or the head is not under its
 branch. Every test file the change adds or changes is held out, and only the

@@ -75,6 +75,8 @@ from .project import (
 from .worktree import FORK_POINT_REF, fix_branches, named_refs
 
 REF_PREFIX = "refs/ttp/push/"   # + row id: pins the approved commit until its row is settled
+LANDED_REF = "refs/ttp/landed/"   # + row id: a landed row's head, kept once its pin goes so a replay can rebuild its range
+LANDED_DAYS = 90                  # how long a landed head stays kept after its row settled
 KV = "push_queue"               # kv: {"backoff_until", "deaths", "bad_tip": {"tip", "fails", "tried", "at", ...}, "tips_told"}
 CYCLE_SAID_KEY = "push_queue_cycle_said"   # kv: the announced power cycle a held batch start was logged for
 DEFAULT_BATCH_S = 300           # delivery.push_batch_s: the oldest approval waits at most this long for running reviews
@@ -3254,18 +3256,33 @@ def finalize(p: Project, cfg: dict | None = None, alert: Callable = lambda *a, *
 def prune_refs(p: Project) -> int:
     """Delete the pin of each row that is pushed, landed, cancelled or otherwise settled once its
     task is finished, and pins without a row (an approval that rolled back). A conflict, check
-    failure or refusal keeps its pin while its task is open. Model-free resolutions' pins go with
-    their finished reviews."""
+    failure or refusal keeps its pin while its task is open. A pushed or landed row's head is kept
+    under LANDED_REF for LANDED_DAYS first, so a replay (bench prep) can still rebuild where its
+    change started after its branch is gone. Model-free resolutions' pins go with their finished
+    reviews."""
     db = p.db
     if not db.one("SELECT id FROM push_queue LIMIT 1"):
         return 0
     refs = _git(p, "for-each-ref", "--format=%(refname)", REF_PREFIX)
-    gone = 0
+    gone, cut = 0, time.time() - LANDED_DAYS * 86400
     for ref in refs.stdout.split() if refs.returncode == 0 else []:
         tail = ref[len(REF_PREFIX):]
-        row = db.one("SELECT q.status, t.status AS task_status FROM push_queue q LEFT JOIN tasks t ON t.id=q.task "
+        row = db.one("SELECT q.status, q.updated, t.status AS task_status FROM push_queue q LEFT JOIN tasks t ON t.id=q.task "
                      "WHERE q.id=?", (int(tail),)) if tail.isdigit() else None
         if row and (row["status"] in ("approved", "batched") or row["task_status"] not in (*TERMINAL_TASK_STATES, None)):
+            continue
+        # a landed head moves to its own ref first (git gc keeps every ref), so it stays readable
+        if row and row["status"] in ("pushed", "landed") and (row["updated"] or 0) > cut and _git(
+                p, "update-ref", LANDED_REF + tail, ref).returncode != 0:
+            continue
+        if _git(p, "update-ref", "-d", ref).returncode == 0:
+            gone += 1
+    # a kept landed head goes LANDED_DAYS after its row settled, or with its row
+    refs = _git(p, "for-each-ref", "--format=%(refname)", LANDED_REF)
+    for ref in refs.stdout.split() if refs.returncode == 0 else []:
+        tail = ref[len(LANDED_REF):]
+        row = db.one("SELECT updated FROM push_queue WHERE id=?", (int(tail),)) if tail.isdigit() else None
+        if row and (row["updated"] or 0) > cut:
             continue
         if _git(p, "update-ref", "-d", ref).returncode == 0:
             gone += 1

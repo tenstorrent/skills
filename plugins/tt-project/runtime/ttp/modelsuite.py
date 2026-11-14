@@ -136,16 +136,13 @@ _PAIR = re.compile(r"(prep|cells)-\d{8}-\d{6}")
 
 def landed_count(db, since: float) -> int | None:
     """About how many done code or work tasks created since `since` a landed push reaches (the push queue's
-    pushed or landed row with its landed commit, on the task or on a review or fix that carries its change):
-    the tasks bench.prep can replay, found the way it finds them (bench._reach). Read-only; None when the
-    database cannot tell."""
-    from . import bench, landed
+    pushed or landed row with its landed commit, or a code task's own push, on the task or on a review or fix
+    that carries its change): the tasks bench.prep can replay, found the way it finds them (bench.candidates).
+    Read-only; None when the database cannot tell."""
+    from . import bench
     try:
-        ids = [r["id"] for r in db.q("SELECT id FROM tasks WHERE status='done' AND kind IN ('code','work') "
-                                     "AND created >= ?", (since,))]
-        pushed = db.q("SELECT task, branch FROM push_queue WHERE status IN ('pushed','landed') "
-                      "AND landed_sha IS NOT NULL AND landed_sha != ''")
-        return len(set(ids) & bench._reach(landed.Rows(db, ids), pushed)) if ids and pushed else 0
+        tasks, _, pushed, reach, *_ = bench.candidates(db, since)
+        return len({t["id"] for t in tasks} & reach) if tasks and pushed else 0
     except Exception:   # no, an older or a locked database
         return None
 
