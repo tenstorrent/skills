@@ -517,8 +517,17 @@ def test_the_daily_audit_counts_user_orders_unstarted_past_30_minutes_over_7_day
     order(9 * day, 7200)          # the week before: late
     order(10 * day, 60)           # the week before: in time
     order(20 * day, None)         # out of both windows
+    # Orders a reply, a memory or charter change settled (closed, no owner, no run) need no task: left out.
+    for age in (1 * day, 4 * day, 8 * day):
+        m = p.db.post("in", "what is the status?", chat="c1")
+        p.db.x("UPDATE messages SET ts=? WHERE id=?", (now - age, m))
+        oid = ob.add_order(p, "answer the status question", m, [], action_class="read", now=now - age).split()[1]
+        ob.close_promise(p.db, oid, "reply #9 answered it", by="coordinator", now=now - age + 60)
+    m = p.db.post("in", "fix it", chat="c1")   # an open order with no owner still counts: unstarted
+    p.db.x("UPDATE messages SET ts=? WHERE id=?", (now - 2 * day, m))
+    ob.add_order(p, "fix it", m, [], action_class="change", now=now - 2 * day)
     line = ob.order_audit_line(p.db, now)
-    assert line == "user orders unstarted past 30 min: 2 of 3 in the last 7 days (1 of 2 in the 7 days before)", line
+    assert line == "user orders unstarted past 30 min: 3 of 4 in the last 7 days (1 of 2 in the 7 days before)", line
     assert line in "\n".join(audit.lines(p.db, now))
 
 

@@ -2070,11 +2070,19 @@ def order_messages(db) -> set[int]:
     return out
 
 
+def _needed_no_task(o: dict) -> bool:
+    """Whether order `o` closed without a task: closed or dropped, no run of it started, no owner ever."""
+    return not _open(o) and o["promise"].get("started") is None and not _owner_ids(o)
+
+
 def order_starts(db, since: float, until: float, now: float | None = None) -> tuple[int, int]:
     """(orders whose message came between `since` and `until`, those whose first owner run started more
-    than ORDER_START_S after the message or not at all by `now`)."""
+    than ORDER_START_S after the message or not at all by `now`). An order that needed no task is left
+    out: one closed or dropped with no run started and no owner task ever (a reply, a memory or charter
+    change settled it), so the count matches the late orders the coordinator is told about."""
     now = time.time() if now is None else now
-    orders = {int(o["promise"]["order"]): o["promise"] for o in items(db) if (o.get("promise") or {}).get("order") is not None}
+    orders = {int(o["promise"]["order"]): o["promise"] for o in items(db)
+              if (o.get("promise") or {}).get("order") is not None and not _needed_no_task(o)}
     if not orders:
         return 0, 0
     ids = list(orders)
