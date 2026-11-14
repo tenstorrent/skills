@@ -216,8 +216,10 @@ def prompt(item: dict) -> str:
             f"Answer as JSON: {{\"scores\": {{...}}, \"notes\": \"one short paragraph\"}}.")
 
 
-def provider_ask(provider: str, model: str, effort: str, budget_usd: float):
-    """A decision-only run on the named provider (no tools, schema-checked answer) per prompt."""
+def provider_ask(provider: str, model: str, effort: str, budget_usd: float, cfg: dict | None = None):
+    """A decision-only run on the named provider (no tools, schema-checked answer) per prompt. A
+    chat provider's reviewer runs through the chat bridge this wrapper starts, like a chat run's
+    own agent: the CLI asks Anthropic otherwise, and the open model's id never reaches it."""
     from .providers import get_provider
     prov = get_provider(provider).use(model)
 
@@ -227,14 +229,78 @@ def provider_ask(provider: str, model: str, effort: str, budget_usd: float):
                                    read_only=True, schema=SCHEMA, restrictions={})
             argv = prov.read_only_args(argv)   # decision-only: unsandboxed, as the daemon's
             out = Path(tmp) / "output.jsonl"
-            r = subprocess.run(argv, input=text.encode(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                               cwd=tmp, env={**os.environ, **env}, timeout=1800)
+            if provider == "chat":
+                with _bridge(cfg, model, effort) as bridge:
+                    r = subprocess.run(argv, input=text.encode(), stdout=subprocess.PIPE,
+                                       stderr=subprocess.DEVNULL, cwd=tmp,
+                                       env={**os.environ, **env, **bridge}, timeout=1800)
+            else:
+                r = subprocess.run(argv, input=text.encode(), stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL, cwd=tmp,
+                                   env={**os.environ, **env}, timeout=1800)
             durable_write(out, r.stdout, sync=False)
             u = prov.parse(out)
         if not u.structured:
             raise Refused(f"no scored answer ({u.error or 'empty'})")
         return u.structured
     return ask
+
+
+def sub_parser_review(sub):
+    """The review subparser: a chat reviewer needs the project's settings, so the CLI's
+    `bench blind review --config <project>` passes them through the words after the first two."""
+    s = sub.add_parser("review")
+    s.add_argument("dir")
+    s.add_argument("--provider", default="claude")
+    s.add_argument("--model", default="")
+    s.add_argument("--effort", default="")
+    s.add_argument("--budget-usd", type=float, default=2.0)
+    s.add_argument("--config", default="")
+    return s
+
+
+def _review_cfg(argv: list[str]) -> dict:
+    """The project config named by `--config <project-or-path>`, else {} (an Anthropic reviewer
+    needs none). A name resolves through the project registry; a path is the project itself."""
+    for i, w in enumerate(argv):
+        if w == "--config" and i + 1 < len(argv):
+            from .project import Project, here, load_registry
+            given = argv[i + 1]
+            base = None
+            for candidate in (given, str(Path(given).resolve())):
+                prj = Project(candidate)
+                if prj.exists():
+                    base = prj
+                    break
+            if base is None:
+                for name, row in ((load_registry() or {}).get("projects") or {}).items():
+                    if name == given or str(row.get("path", "")) == given:
+                        base = Project(row["path"])
+                        break
+            if base is None and (found := here(given)):
+                base = found
+            if base is None or not base.exists():
+                raise Refused(f"--config {given!r} names no project")
+            return base.config()
+    return {}
+
+
+def _bridge(cfg: dict, model: str, effort: str):
+    """The chat bridge env for an open-model reviewer: one Bridge for the whole review, from the
+    project's providers.chat settings, with the run's env (ANTHROPIC_BASE_URL and its token) laid
+    over the CLI's own. No settings (a null config): Bridge.from_settings refuses with the reason."""
+    from .chatbridge import Bridge, settings
+    br = Bridge.from_settings(settings(cfg or {}, "review", model, effort))
+    br.start()
+    return _closing(br)
+
+
+@contextmanager
+def _closing(br):
+    try:
+        yield br.env()
+    finally:
+        br.stop()
 
 
 def review(d: Path, ask) -> list[str]:
@@ -256,12 +322,7 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("cells")
     s.add_argument("--out", required=True)
     s.add_argument("--seed", type=int)
-    s = sub.add_parser("review")
-    s.add_argument("dir")
-    s.add_argument("--provider", default="claude")
-    s.add_argument("--model", default="")
-    s.add_argument("--effort", default="")
-    s.add_argument("--budget-usd", type=float, default=2.0)
+    s = sub_parser_review(sub)
     s = sub.add_parser("score")
     s.add_argument("dir")
     s.add_argument("item")
@@ -275,7 +336,7 @@ def main(argv: list[str] | None = None) -> int:
             b = prep(json.loads(src.read_text())["cells"], Path(a.out), a.seed)
             print(f"benchblind: {len(b['items'])} item(s) sealed in {a.out}")
         elif a.cmd == "review":
-            got = review(Path(a.dir), provider_ask(a.provider, a.model, a.effort, a.budget_usd))
+            got = review(Path(a.dir), provider_ask(a.provider, a.model, a.effort, a.budget_usd, _review_cfg(argv)))
             print(f"benchblind: scored {len(got)} item(s)")
         elif a.cmd == "score":
             print(json.dumps(score(Path(a.dir), a.item, json.loads(a.json))))

@@ -216,3 +216,80 @@ def test_bench_blind_scores_a_head_to_head_run_folder_blind_end_to_end(env, tmp_
         with pytest.raises(SystemExit) as e:   # a missing folder is an error line, not a traceback
             cli.main(["bench", "blind", *argv])
         assert e.value.code == 2 and "benchblind: " in capsys.readouterr().err
+
+
+def test_benchblind_reviewer_on_the_chat_provider_runs_through_the_chat_bridge(env, tmp_path, monkeypatch):
+    # Part 3: an open-model reviewer's CLI never asks Anthropic. provider_ask("chat", ...) starts a
+    # bridge from the project's providers.chat settings and lays its env over the reviewer call's,
+    # the same way a chat run's own agent gets it; the bridge stops when the ask ends.
+    from ttp import benchblind, chatbridge
+    seen = {}
+    started = []
+
+    class FakeBridge:
+        def __init__(self, s):
+            started.append(s)
+        def start(self):
+            return self
+        def env(self):
+            return {"ANTHROPIC_BASE_URL": "http://127.0.0.1:9", "ANTHROPIC_AUTH_TOKEN": "tok",
+                    "ANTHROPIC_API_KEY": ""}
+        def stop(self):
+            seen["stopped"] = True
+
+    def from_settings(s, **kw):
+        seen["settings"] = s
+        return FakeBridge(s)
+
+    monkeypatch.setattr(chatbridge.Bridge, "from_settings", classmethod(lambda cls, s, **kw: from_settings(s)))
+    monkeypatch.setattr(chatbridge, "settings", lambda cfg, tier, model, effort, **kw:
+                        seen.update(tier=tier, model=model, effort=effort) or {})
+
+    def run(argv, **kw):
+        seen["argv"] = list(argv)
+        seen["env"] = dict(kw["env"])
+        return subprocess.CompletedProcess(argv, 0, b'{"scores": {"criteria": 4, "correctness": 4, '
+                                               b'"tests": 2, "scope": 2}, "notes": "ok"}', b"")
+
+    monkeypatch.setattr(benchblind.subprocess, "run", run)
+    from ttp.providers.base import RunUsage
+    monkeypatch.setattr(benchblind, "durable_write", lambda *a, **k: None)
+
+    def parse(out, err=None):
+        u = RunUsage()
+        u.structured = {"scores": {"criteria": 4, "correctness": 4, "tests": 2, "scope": 2}, "notes": "ok"}
+        return u
+
+    # the chat provider is the Claude provider on the chat settings; its parse needs a real
+    # transcript, so drive provider_ask with the provider patched to the fake one but keep the
+    # chat-branch: patch get_provider to hand back a stand-in that records build() args.
+    import ttp.providers as providers
+    real_get = providers.get_provider
+
+    class StandIn:
+        name = "chat"
+        def __init__(self):
+            self.built = []
+        def use(self, model, *a, **k):
+            return self
+        def build(self, **kw):
+            self.built.append(kw)
+            return ["claude", "-p", "--output-format", "stream-json"], {}
+        def read_only_args(self, argv):
+            return argv
+        def parse(self, out, err=None):
+            u = RunUsage()
+            u.structured = {"scores": {"criteria": 4, "correctness": 4, "tests": 2, "scope": 2}, "notes": "ok"}
+            return u
+
+    standin = StandIn()
+    monkeypatch.setattr(providers, "get_provider", lambda name: standin)
+    ask = benchblind.provider_ask("chat", "zai/other-9", "high", 1.0, {"providers": {"chat": {}}})
+    got = ask("score this")
+    assert got["scores"]["criteria"] == 4
+    assert seen["env"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:9", "the bridge env is laid over the call's"
+    assert seen["env"]["ANTHROPIC_AUTH_TOKEN"] == "tok"
+    assert seen["env"].get("ANTHROPIC_API_KEY") == ""
+    assert seen["stopped"] is True, "the bridge stops when the ask ends"
+    assert seen["model"] == "zai/other-9" and seen["effort"] == "high"
+    assert seen["argv"][1] == "-p" or "claude" in seen["argv"][0], seen["argv"]

@@ -1329,7 +1329,8 @@ def _bench_blind_argv(argv: list[str]) -> list[str]:
     reading it as an option of `ttp bench`)."""
     if argv[:2] != ["bench", "blind"]:
         return argv
-    return [*argv[:2], *(f"--blind-word=:{w}" for w in argv[2:])]
+    words = argv[2:]
+    return [*argv[:2], *(f"--blind-word=:{w}" for w in words)]
 
 
 def _bridge_argv(argv: list[str]) -> list[str]:
