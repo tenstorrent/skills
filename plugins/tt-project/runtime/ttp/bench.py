@@ -183,7 +183,7 @@ def _piece(src: bytes) -> list | None:
         return None
 
 
-@functools.lru_cache(maxsize=4)   # a task's file versions: base and head of one or two files
+@functools.lru_cache(maxsize=8)   # a task's file versions: base and head of its test files, head of its changed code
 def _tree(repo: Path, blob: str) -> ast.Module | None:
     """`blob` parsed piece by piece, each top-level piece cached by its text: a new version of a
     large test file parses only the pieces it changed (one parse of a 2 MB file takes about 1 s)."""
@@ -234,6 +234,27 @@ def _roots(repo: Path, blob: str, names: frozenset[str]) -> list:
         elif not other(node):
             roots.append(node)
     return roots
+
+
+@functools.lru_cache(maxsize=64)
+def _defines(repo: Path, blob: str) -> frozenset[str]:
+    """The names a Python file defines: its functions and classes at any depth, its module and class level
+    variables, and the attributes it assigns (`self.x = ...`)."""
+    tree = _tree(repo, blob)
+    out: set[str] = set()
+    tops = [*(tree.body if tree else []),
+            *(m for n in (tree.body if tree else []) if isinstance(n, ast.ClassDef) for m in n.body)]
+    for node in tops:
+        targets = node.targets if isinstance(node, ast.Assign) else \
+            [node.target] if isinstance(node, (ast.AnnAssign, ast.AugAssign)) else []
+        out |= {t.id for x in targets for t in ast.walk(x) if isinstance(t, ast.Name)}
+    for node in ast.walk(tree) if tree else []:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            out.add(node.name)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            out |= {t.attr for x in (node.targets if isinstance(node, ast.Assign) else [node.target])
+                    for t in ast.walk(x) if isinstance(t, ast.Attribute)}
+    return frozenset(out)
 
 
 def _uses(repo: Path, blob: str, names: frozenset[str]) -> tuple[list, set]:
@@ -337,8 +358,9 @@ def unstated(repo: Path, base: str, head: str, tests: list[tuple[str, str]], spe
     """What the held-out `tests` ([(path, qualname)], with their files' other code, at `head`) require that the
     change itself introduced and `spec` never states: a config key, an attribute, keyword, function or CLI flag
     name, or a message text the tests assert. Each is new in the change's non-test files (in their added lines,
-    absent from their base versions), so a candidate could only guess it: the task is not fair. Sorted,
-    one entry per item."""
+    absent from their base versions), so a candidate could only guess it: the task is not fair. A name the
+    change defines (a private helper too) counts wherever the tests' code or texts name it: called, read as an
+    attribute, patched or looked up by a string, or named in a docstring or message. Sorted, one entry per item."""
     at_head, at_base = _blobs(repo, head), _blobs(repo, base)
     changed = [x for x in _out(repo, "diff", "--no-renames", "--name-only", base, head).splitlines()
                if x and not _held(x)]
@@ -361,6 +383,9 @@ def unstated(repo: Path, base: str, head: str, tests: list[tuple[str, str]], spe
         if len(fixed) > 1 and (best := max(fixed, key=len)) and len(best) >= MESSAGE_MIN and " " in best:
             templates.append((re.compile(".+?".join(re.escape(x) for x in _HOLE.split(lit))), best))
     added_words = set(re.findall(r"[\w-]+", added))
+    # the names the change defines in its non-test code (private ones too) that no base version of its files has
+    made = {x for path in changed if path.endswith(".py") and path in at_head
+            for x in _defines(repo, at_head[path]) if x not in before_words}
     before = "\n".join(before_text)
     words = set(re.findall(r"[\w-]+", spec))
     out: list[str] = []
@@ -378,12 +403,24 @@ def unstated(repo: Path, base: str, head: str, tests: list[tuple[str, str]], spe
                 for m in ast.walk(a.msg)}
         said |= {id(a.value) for r in roots for a in ast.walk(r)
                  if isinstance(a, ast.Expr) and isinstance(a.value, ast.Constant)}
+        # a name the change defined, in any of the tests' texts (a docstring, a message, a patch target such as
+        # "mod._name" or getattr's "name"): the tests were written against that hidden definition
+        for node in (n for r in roots for n in ast.walk(r)):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                for name in re.findall(r"[A-Za-z_]\w{2,}", node.value):
+                    if name in made:
+                        take(name)
         for node in (n for r in roots for n in ast.walk(r) if id(n) not in said):
             names = []
             if isinstance(node, ast.Attribute):
                 names.append(node.attr)
             elif isinstance(node, ast.keyword) and node.arg:
                 names.append(node.arg)
+            # a private name the change defined, imported (`from mod import _helper`) or used bare (`_helper()`);
+            # a public one imported is unknown_symbols' finding
+            elif isinstance(node, (ast.alias, ast.Name)) and \
+                    (name := node.name if isinstance(node, ast.alias) else node.id).startswith("_") and name in made:
+                names.append(name)
             elif isinstance(node, ast.Constant) and isinstance(node.value, str):
                 v = node.value
                 if _FLAG.fullmatch(v) or (_KEY.fullmatch(v) and ("_" in v or "." in v)):

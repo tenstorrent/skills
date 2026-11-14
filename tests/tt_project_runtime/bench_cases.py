@@ -221,6 +221,47 @@ def test_bench_unstated_names_a_config_key_and_a_message_the_spec_never_gives(tm
 
 
 
+def test_bench_unstated_names_a_private_helper_the_change_made_up_in_every_form_the_tests_use(tmp_path):
+    # The real case: the spec asks for a cache, the fix adds private helpers and the held-out tests reach them by
+    # name (imported, called on the module or an object, patched by a string, read by getattr, named in a
+    # docstring). A candidate could not know those names, so the task is unfair until the spec states them.
+    # A name the base already has, a word of an assert's message the change did not define, and a spec that
+    # names the helpers are no finding.
+    from ttp import bench
+    repo, git, commit, rev = _bench_repo(tmp_path)
+    base = commit({"pkg/__init__.py": "", "pkg/store.py": "def _old_rows(db):\n    return []\n\n\n"
+                   "def total(db):\n    return len(_old_rows(db))\n"}, "store")
+    head = commit({"pkg/store.py": "def _old_rows(db):\n    return []\n\n\n_cache = {}\n\n\n"
+                   "def _fresh_rows(db):\n    return _cache.setdefault(db, _old_rows(db))\n\n\n"
+                   "class Reader:\n    def __init__(self):\n        self._seen = 0\n\n"
+                   "    def _bump(self):\n        self._seen += 1\n\n\n"
+                   "def total(db):\n    return len(_fresh_rows(db))\n",
+                   "tests/test_import.py": "from pkg.store import _fresh_rows\n\n\n"
+                   "def test_import():\n    assert _fresh_rows('a') == []\n",
+                   "tests/test_store.py": "import pkg.store as store\n\n\n"
+                   "def test_module_call():\n    assert store._fresh_rows('b') == []\n\n\n"
+                   "def test_method():\n    r = store.Reader()\n    r._bump()\n    assert r._seen == 1\n\n\n"
+                   "def test_patch(monkeypatch):\n    monkeypatch.setattr('pkg.store._fresh_rows', lambda db: [1])\n"
+                   "    assert store.total('c') == 1\n\n\n"
+                   "def test_getattr():\n    assert getattr(store, '_cache') is not None\n\n\n"
+                   "def test_doc():\n    \"\"\"Counts go through the store's private row cache (_fresh_rows).\"\"\"\n"
+                   "    assert store.total('d') == 0, 'total reads _old_rows once'\n\n\n"
+                   "def test_base_only():\n    assert store._old_rows('e') == []\n"}, "cache")
+    t = lambda *names: [("tests/test_store.py", n) for n in names]
+    spec = "Cache the rows total() reads, once per database."
+    assert bench.unstated(repo, base, head, [("tests/test_import.py", "test_import")], spec) == ["_fresh_rows"], \
+        "imported and called"
+    assert bench.unstated(repo, base, head, t("test_module_call"), spec) == ["_fresh_rows"], "a module attribute"
+    assert bench.unstated(repo, base, head, t("test_method"), spec) == ["Reader", "_bump", "_seen"], "a method and an attribute"
+    assert bench.unstated(repo, base, head, t("test_patch"), spec) == ["_fresh_rows"], "patched by a string"
+    assert bench.unstated(repo, base, head, t("test_getattr"), spec) == ["_cache"], "read by getattr"
+    assert bench.unstated(repo, base, head, t("test_doc"), spec) == ["_fresh_rows"], "named only in a docstring"
+    assert bench.unstated(repo, base, head, t("test_base_only"), spec) == [], "the base has it"
+    assert bench.unstated(repo, base, head, t("test_method", "test_getattr", "test_doc"),
+                          spec + " Keep them in _cache through _fresh_rows(db); Reader._bump() counts reads in "
+                          "Reader._seen.") == []
+
+
 def test_bench_unstated_names_a_message_whose_filled_in_part_leads(tmp_path):
     # The change writes f"{name} is paused: ..." (and a %-format with a leading hole); the test asserts the
     # filled-in text. No prefix of it is in the change, yet the fixed part is wording the spec never gives.
