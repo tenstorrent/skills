@@ -303,9 +303,9 @@ No `result.json`, no credit.
   longest timeout.
 <!-- /ttp:if wait -->
 - Anything still running when you stop dies with you unless detached: `ttp detach <name> -- <cmd>`
-  writes `<name>.log` and `.rc` in your run folder and prints the `retry_when`. A `done` hand-off
-  stops each live job its `retry_when` or `next_step` does not name: name one to keep, else `ttp detach --stop` it.
+  writes `<name>.log` and `.rc` in your run folder and prints the `retry_when`.
 <!-- ttp:if wait -->
+  `done` stops each live job its `retry_when` or `next_step` does not name.
   Add `--cores N` / `--devices N` when the command does not show them; `--lock <resource>`
   (repeatable) holds those locks, all or nothing, for the job's life. Use `ttp detach`, not
   `setsid`; `setsid nohup` is only for remote Linux hosts over ssh.
