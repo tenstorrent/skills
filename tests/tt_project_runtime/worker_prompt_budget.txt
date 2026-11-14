@@ -53,3 +53,4 @@ every +72: a running worker acks a mid-run update with a `ttp note "update: ..."
 every +217: a broker device job runs --preemptable within the 1500 s cap, ends cleanly on SIGTERM and resumes from a checkpoint (user msg #2786)
 every +110: a reply wait can skip replies already taken and wait past an acknowledgement or plan (ack-wait --after, --terminal)
 code +80: a reply wait can skip replies already taken and wait past an acknowledgement or plan (ack-wait --after, --terminal)
+every +92: device work names Galaxy parts as the setup-box hardware reference does (user msg #2894)
