@@ -640,6 +640,7 @@ def supervise(run_dir: Path) -> int:
                 launch_auth = bool(getattr(e, "auth", False))   # no usable key: the auth gate's (daemon)
                 raise OSError(f"chat bridge: {e}") from None
             env.update(bridge.env())
+            env["TTP_RUN_PROXY_PORT"] = bridge.url.rsplit(":", 1)[-1]   # runguard.py: the run's own proxy
             from .chatbridge import SWAP_FILE   # live views show 'B (stand-in for A)' while the run goes on
             bridge.on_swap = lambda e: durable_write(run_dir / SWAP_FILE, json.dumps(e))
         # The stream guard reads the hook's marker before the agent starts: it could write one itself.

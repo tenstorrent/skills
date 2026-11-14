@@ -4641,6 +4641,22 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   that job's `.rc`. A file a worker or project writes (an owner or pgid file under the project's state)
   is never proof: a project whose own scripts start long-running jobs starts them through `ttp detach`
   to get this record, and `ttp detach --list` shows a task's jobs across its runs.
+- The worker hook's run guard keeps a run's own model credentials and proxy inside the run, on every
+  provider (Cursor and Codex without hooks reach it through the stream guard); it is always on. It
+  refuses a Bash call that gives the run's credential variables (`ANTHROPIC_AUTH_TOKEN`,
+  `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_OAUTH_TOKEN`) or the token's value to a
+  container or another agent (`docker`/`podman`/`nerdctl`/`apptainer`/`singularity`/`docker compose`
+  `-e`/`--env`, harbor `--ae`/`--agent-env`, whether as `$VAR` or the bare name) or writes them to an
+  env file; and one that opens a listener on a non-loopback address forwarding to the run's own proxy
+  port (socat `*-LISTEN:` without a loopback `bind=`, `ssh -L/-R` with an open bind, `nc -l`, inline
+  python/node/perl/ruby) or opens that port in the firewall (`iptables`, `nft`, `ufw`, `firewall-cmd`;
+  a DROP, REJECT or delete rule passes). The message names the safe route: `ttp secret env <name> --
+  <command>` for a stored secret. A literal value (`-e FOO=bar`), `sudo`, `docker`, loopback-only
+  forwarders and every other firewall rule pass: it is no sudo block and no sandbox. The runner sets
+  `TTP_RUN_PROXY_PORT` for the chat provider's proxy; a loopback `*_BASE_URL` in the run's environment
+  names the port on any provider. Gaps, accepted: a script file a command runs, an env file another call
+  wrote, a listener and its target in separate calls, `docker run --network host`. See
+  `runtime/ttp/runguard.py`.
 - No installs into the shared user site (`guards.user_site`, `auto` by default; `on` also holds it on a
   host of one project): on a host whose `ttp list` shows more than one project, every project imports the
   same `~/.local`, so one `pip install --user` changes every project's packages. There every worker,
