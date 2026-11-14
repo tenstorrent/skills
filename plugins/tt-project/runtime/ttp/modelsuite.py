@@ -192,6 +192,8 @@ def refresh(d: Path, db, repo: Path, now: float | None = None, prep: Callable | 
     stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(now))
     b, c = d / f"prep-{stamp}", d / f"cells-{stamp}"
     best = d / f".{b.name}.best"   # the source with the most fair tasks so far, while the next is tried
+    for x in d.glob(".prep-*.best"):   # one a crashed build left
+        shutil.rmtree(x, ignore_errors=True)
     why = ("no complete folder pair" if not old else f"fewer than {PREP_LIMIT} of {old[0].name}'s tasks are fair"
            if thin else "the folder pair is over 7 days old")
     say(f"model-bench suite: {why}"
