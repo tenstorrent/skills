@@ -80,12 +80,21 @@ _PENDING_RE = re.compile(r"\b(?:acknowledg\w*|ack(?:ed|s)?|received|noted|will|g
                          r"next step|follows?|pending)\b", re.I)
 
 
+_FACTS_RE = re.compile(r"\s*\[facts at send time from ", re.I)
+
+
+def own_words(text) -> str:
+    """Reply `text` without the [facts at send time ...] block the sender's harness appends (taskfacts.FACTS_MARK),
+    whatever whitespace a transport left before it."""
+    return _FACTS_RE.split(str(text or ""), 1)[0]
+
+
 def terminal(text: str) -> bool:
     """Whether reply `text` reads as a terminal result (done, failed, or a prerequisite it cannot pass), not
     an acknowledgement, a plan or an interim note. In doubt, not terminal: the wait goes on."""
-    from .taskfacts import FACTS_MARK
-    # the sender's own words only: the appended task records ("status: done" of a task it names) are no verdict
-    text = str(text or "").split(FACTS_MARK, 1)[0]
+    # the sender's own words only: the appended task records ("status: done" of a task it names, "queued",
+    # "work") are no verdict and no sign more is to come
+    text = own_words(text)
     for m in _STATUS_RE.finditer(text):
         return bool(_TERMINAL_STATUS.match(m.group(1).strip()))   # the first status line decides
     return bool(_TERMINAL_RE.search(text)) and not _PENDING_RE.search(text)

@@ -1464,3 +1464,21 @@ def test_ack_wait_cursor_skips_consumed_replies_and_terminal_waits_past_acknowle
     assert _ack_wait(cli, *probe, *after_args, "--terminal") == 1, "an interim reply with facts still waits"
     assert upstream.send("peer", 6, p.name, final) == "sent"
     assert _ack_wait(cli, *probe, *after_args, "--terminal") == 0, "a final reply with facts is terminal"
+
+
+def test_ack_wait_terminal_ignores_pending_words_in_appended_facts():
+    """A terminal disposition with no status line of its own stays terminal when the appended peer-task records
+    carry pending words (queued, work, started); an explicit interim note stays interim with or without them."""
+    from ttp import ackwait, taskfacts
+    facts = (f"{taskfacts.FACTS_MARK}owner's records: #159 'repair' work task, queued, cancelled | "
+             "#165 code task, started; next step pending]")
+    terminal = "re 3c59: the shipped release fixes it; the repair landed and the behaviour check passed"
+    interim = "re 3c59: acknowledged, the repair is queued and a result follows later"
+    for sep in ("", "\n", "  "):          # whatever whitespace a transport left before the block
+        block = sep + facts.lstrip() if sep else facts
+        assert ackwait.terminal(terminal + block) is True, repr(sep)
+        assert ackwait.terminal(interim + block) is False, repr(sep)
+    assert ackwait.terminal(terminal) is True and ackwait.terminal(interim) is False
+    # the facts block's own status words decide nothing either way
+    assert ackwait.terminal("re 3c59: still working on it" + facts.replace("queued", "status: done")) is False
+    assert ackwait.own_words(terminal + facts) == terminal
