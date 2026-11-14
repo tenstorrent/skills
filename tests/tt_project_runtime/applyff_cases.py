@@ -561,3 +561,84 @@ def test_apply_with_take_over_from_fences_a_blocked_holder_then_lands_the_merge(
     assert "takes it over" in capsys.readouterr().out
     assert p.db.task(tid)["status"] == "cancelled" and release.fenced(p, tid)
     assert _git_out(p.harness, "rev-parse", "HEAD") == merged and restarts == [1]
+
+
+def test_apply_with_the_checkout_on_a_task_branch_moves_main_and_returns_the_checkout_to_main(
+        env, monkeypatch, tmp_path, capsys):
+    """Before: with the live checkout left on a harness task's branch, --apply fast-forwarded that branch,
+    printed 'harness main is now <sha>' and main never moved. Now main itself moves, the clean checkout is
+    put back on main first, and the task branch is kept as it was."""
+    from ttp import cli
+    p, merged, base, restarts = _apply_ready(env, monkeypatch, tmp_path)
+    h = p.harness
+    _hgit(h, "checkout", "-q", "-b", "ttp/harness-t1")
+    cli.main(["upgrade", "demo", "--apply", merged])
+    assert _git_out(h, "rev-parse", "refs/heads/main") == merged
+    assert _git_out(h, "symbolic-ref", "--short", "HEAD") == "main" and _clean(h)
+    assert _git_out(h, "rev-parse", "refs/heads/ttp/harness-t1") == base     # kept, not moved or deleted
+    out = capsys.readouterr().out
+    assert "on ttp/harness-t1, not main: checked out main first" in out
+    assert f"harness main is now {merged[:12]}" in out
+
+
+def test_apply_with_uncommitted_changes_on_a_task_branch_refuses_and_changes_nothing(
+        env, monkeypatch, tmp_path, capsys):
+    """A dirty checkout on a task branch cannot go back to main without taking its changes along: --apply
+    exits 1 naming the branch, and main, the branch, the checkout and its edit stay as they were."""
+    from ttp import cli
+    p, merged, base, restarts = _apply_ready(env, monkeypatch, tmp_path)
+    h = p.harness
+    _hgit(h, "checkout", "-q", "-b", "ttp/harness-t1")
+    edit = p.charter_path.read_text() + "\nan edit nobody committed\n"
+    p.charter_path.write_text(edit)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo", "--apply", merged])
+    err = capsys.readouterr().err
+    assert e.value.code == 1, err
+    assert "on ttp/harness-t1, not main" in err and "Nothing was changed" in err and "uncommitted" in err
+    assert _git_out(h, "rev-parse", "refs/heads/main") == base
+    assert _git_out(h, "rev-parse", "refs/heads/ttp/harness-t1") == base
+    assert _git_out(h, "symbolic-ref", "--short", "HEAD") == "ttp/harness-t1"
+    assert p.charter_path.read_text() == edit and not restarts
+
+
+def test_the_fast_forward_never_moves_a_branch_other_than_main(env, monkeypatch, tmp_path):
+    """The fast-forward step itself (also the daemon's, for a sandboxed --apply) refuses when the checkout
+    is off main, so no route can report main moved while another branch took the commit."""
+    from ttp import applyff, release
+    p, merged, base, restarts = _apply_ready(env, monkeypatch, tmp_path)
+    h = p.harness
+    _hgit(h, "checkout", "-q", "-b", "ttp/t7-side")
+    why = applyff.fast_forward(h, merged, release.GUARD_ENV)
+    assert "on ttp/t7-side, not main" in why, why
+    assert _git_out(h, "rev-parse", "refs/heads/main") == base
+    assert _git_out(h, "rev-parse", "refs/heads/ttp/t7-side") == base
+    _hgit(h, "checkout", "-q", "--detach")
+    assert "a detached HEAD" in applyff.fast_forward(h, merged, release.GUARD_ENV)
+    assert _git_out(h, "rev-parse", "refs/heads/main") == base
+
+
+def test_a_plain_upgrade_puts_a_clean_checkout_back_on_main_and_holds_on_a_dirty_one(env, monkeypatch, tmp_path,
+                                                                                    capsys):
+    """`ttp upgrade` (host-side or the daemon's) reads and merges into main: from a clean checkout on a task
+    branch it checks out main first; a dirty one stops it with nothing changed (75 for the daemon's run)."""
+    from ttp import cli, service
+    p = make(env)
+    monkeypatch.setattr(service, "restart", lambda p: "restarted")
+    _install_template(env, {"kind-harness.md": "# Harness task, the next release\n"})
+    h = p.harness
+    _hgit(h, "checkout", "-q", "-b", "ttp/harness-t3")
+    p.charter_path.write_text(p.charter_path.read_text() + "\nuncommitted\n")
+    head = _git_out(h, "rev-parse", "HEAD")
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo"])
+    assert e.value.code == 1 and "on ttp/harness-t3, not main" in capsys.readouterr().err
+    assert _git_out(h, "symbolic-ref", "--short", "HEAD") == "ttp/harness-t3"
+    assert _git_out(h, "rev-parse", "HEAD") == head
+    _hgit(h, "checkout", "-q", "--", p.charter_path.relative_to(h).as_posix())
+    try:
+        cli.main(["upgrade", "demo"])
+    except SystemExit as e:
+        assert e.code in (0, None, 75, 76), e.code
+    assert _git_out(h, "symbolic-ref", "--short", "HEAD") == "main"
+    assert _git_out(h, "rev-parse", "refs/heads/ttp/harness-t3") == head

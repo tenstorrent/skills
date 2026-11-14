@@ -774,3 +774,75 @@ def test_a_deleted_or_symlinked_checkout_copy_of_a_file_the_merge_changes_stops_
     _commit_in_harness_tree(own, "prompts/more.md", "m\n", "b: more")
     assert harnesstree.land(p, b) == "conflict" and shared.is_symlink()
     assert _hgit(p.harness, "rev-parse", "HEAD").strip() == head
+
+
+def _ht_off_main_events(p):
+    from ttp import harnesstree
+    return p.db.q("SELECT * FROM events WHERE kind=?", (harnesstree.OFF_MAIN,))
+
+
+def test_the_daemon_puts_a_clean_checkout_left_on_an_ended_tasks_branch_back_on_main_at_start(env):
+    """Before: a checkout left on ttp/harness-t<id> stayed there for good: landings refused ('busy') and an
+    upgrade's --apply moved that branch instead of main. The daemon's first pass now checks out main again,
+    keeping the branch and its commit."""
+    from ttp.daemon import Daemon
+    p = make(env)
+    a = _harness_task(p, "a")
+    p.db.update_task(a, status="done")
+    stray = _ht_park_checkout_on(p, f"ttp/harness-t{a}")
+    Daemon(p.base).land_harness_worktrees()
+    assert _hgit(p.harness, "symbolic-ref", "--short", "HEAD").strip() == "main"
+    assert _hgit(p.harness, "rev-parse", f"refs/heads/ttp/harness-t{a}").strip() == stray
+    assert not (p.harness / "prompts" / "parked.md").exists()
+    assert not _ht_off_main_events(p)
+    assert "back on its main line" in (p.logs / "daemon.log").read_text()
+
+
+def test_the_daemon_returns_the_checkout_to_main_once_its_harness_task_ends_not_before(env):
+    from ttp.daemon import Daemon
+    p = make(env)
+    a = _harness_task(p, "a")
+    d = Daemon(p.base)
+    d.land_harness_worktrees()              # the first pass: on main, nothing to do
+    _ht_park_checkout_on(p, f"ttp/t{a}-tune-prompts")
+    d.land_harness_worktrees()              # no harness task ended since: not looked at
+    assert _hgit(p.harness, "symbolic-ref", "--short", "HEAD").strip() == f"ttp/t{a}-tune-prompts"
+    b = _harness_task(p, "b")
+    p.db.update_task(b, status="failed")    # another task ended, but the branch's own task is still open
+    d.land_harness_worktrees()
+    assert _hgit(p.harness, "symbolic-ref", "--short", "HEAD").strip() == f"ttp/t{a}-tune-prompts"
+    p.db.update_task(a, status="cancelled")
+    d.land_harness_worktrees()
+    assert _hgit(p.harness, "symbolic-ref", "--short", "HEAD").strip() == "main"
+
+
+def test_a_dirty_checkout_on_an_ended_tasks_branch_is_left_as_it_is_and_raised_once(env):
+    from ttp.daemon import Daemon
+    p = make(env)
+    a = _harness_task(p, "a")
+    p.db.update_task(a, status="done")
+    stray = _ht_park_checkout_on(p, f"ttp/harness-t{a}")
+    edit = (p.harness / "prompts" / "parked.md").read_text() + "more, uncommitted\n"
+    (p.harness / "prompts" / "parked.md").write_text(edit)
+    d = Daemon(p.base)
+    d.land_harness_worktrees()
+    p.db.update_task(_harness_task(p, "b"), status="done")
+    d.land_harness_worktrees()              # checked again after b ended: the same state is not raised twice
+    assert _hgit(p.harness, "symbolic-ref", "--short", "HEAD").strip() == f"ttp/harness-t{a}"
+    assert _hgit(p.harness, "rev-parse", "HEAD").strip() == stray
+    assert (p.harness / "prompts" / "parked.md").read_text() == edit
+    ev = _ht_off_main_events(p)
+    assert len(ev) == 1 and f"ttp/harness-t{a}" in ev[0]["text"] and "uncommitted" in ev[0]["text"]
+    assert ev[0]["task"] == a
+
+
+def test_the_checkout_stays_off_main_while_another_harness_run_works_in_it(env):
+    from ttp import harnesstree
+    p = make(env)
+    a, b = _harness_task(p, "a"), _harness_task(p, "b")
+    p.db.update_task(a, status="done")
+    _harness_run(p, b)                      # b has no worktree of its own: it works in the checkout
+    _ht_park_checkout_on(p, f"ttp/harness-t{a}")
+    assert harnesstree.return_checkout(p) == "busy"
+    assert _hgit(p.harness, "symbolic-ref", "--short", "HEAD").strip() == f"ttp/harness-t{a}"
+    assert not _ht_off_main_events(p)

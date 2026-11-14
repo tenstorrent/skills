@@ -85,9 +85,8 @@ def on_branch(cwd: Path) -> str:
 def main_branch(p: Project) -> str:
     """The harness repo's main line, which a new task branch starts from: `main` (or `master`) when it
     has one, else the checkout's own branch unless that is a harness task's branch; "" when none."""
-    for b in ("main", "master"):
-        if _git(p.harness, "rev-parse", "--verify", "-q", f"refs/heads/{b}").returncode == 0:
-            return b
+    if b := main_line(p.harness):
+        return b
     here = on_branch(p.harness)
     return "" if TASK_BRANCH_RE.fullmatch(here) else here
 
@@ -472,6 +471,112 @@ def handoff_landing(p: Project, task: dict) -> tuple[str, str]:
         return "lands", (f"{', '.join(found)} on branch {b}, which fast-forwards the harness HEAD: the daemon "
                          f"merges it when the run ends")
     return "merged", f"{', '.join(found)} in the harness HEAD"
+
+
+CHECKOUT_TASK_RE = re.compile(r"ttp/(?:harness-)?t(\d+)(?:-.*)?")   # a task's branch the checkout may be left on
+OFF_MAIN = "harness_checkout_off_main"          # event: the checkout sits on an ended task's branch, not movable
+OFF_MAIN_KEY = "harness_checkout_off_main_seen"  # kv: [branch, head, why] last reported (one event each)
+_IN_PROGRESS = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply")
+
+
+def main_line(h: Path) -> str:
+    """The harness repo's main line by name only: `main`, else `master`, else "" (no such branch)."""
+    for b in ("main", "master"):
+        if _git(h, "rev-parse", "--verify", "-q", f"refs/heads/{b}").returncode == 0:
+            return b
+    return ""
+
+
+def tracked_changes(h: Path) -> list[str]:
+    """Paths with uncommitted changes to tracked files (staged or not) in checkout `h`; untracked files
+    do not count: a checkout never removes them, and git refuses one that would overwrite them."""
+    r = _git(h, "status", "--porcelain", "--untracked-files=no")
+    if r.returncode != 0:
+        return ["(git status failed)"]
+    return [ln[3:] for ln in r.stdout.splitlines() if ln.strip()]
+
+
+def _in_progress(h: Path) -> str:
+    for name in _IN_PROGRESS:
+        r = _git(h, "rev-parse", "--git-path", name)
+        q = Path(r.stdout.strip())
+        if r.returncode == 0 and (q if q.is_absolute() else h / q).exists():
+            return name
+    return ""
+
+
+def to_main(p: Project, task: int | str | None = None, env: dict | None = None) -> tuple[str, str, str]:
+    """Put the harness checkout back on its main line (main_line) when it sits on another branch or a
+    detached HEAD. Returns (outcome, branch it was on, why): outcome "" (already on main, not a repo, or
+    the repo has no main line), "moved", or, with nothing changed, "dirty" (uncommitted tracked changes),
+    "busy" (a merge, rebase or cherry-pick in progress, or another harness task's run (not `task`) works
+    in the checkout) or "refused" (git refused the checkout). It never discards a change and never deletes
+    the branch it leaves: that branch's commits stay where they are, for land and the stranded check."""
+    h = p.harness
+    if not _is_repo(p):
+        return "", "", ""
+    main = main_line(h)
+    here = on_branch(h)
+    if not main or here == main:
+        return "", here, ""
+    where = here or "a detached HEAD"
+    if (step := _in_progress(h)):
+        return "busy", here, f"{step} is set in {h} (an unfinished git operation)"
+    if checkout_busy(p, int(task) if str(task or "").isdigit() else 0):
+        return "busy", here, f"another harness task's run works in {h}"
+    if (changed := tracked_changes(h)):
+        shown = ", ".join(changed[:5]) + (f" and {len(changed) - 5} more" if len(changed) > 5 else "")
+        return "dirty", here, f"{h} is on {where} with uncommitted changes ({shown})"
+    with tree_writes(h):
+        r = gitmemo.run(["git", "-C", str(h), *git_fsync_args(), "checkout", "-q", main], capture_output=True,
+                        text=True, timeout=120, env=env)
+    if r.returncode != 0 or on_branch(h) != main:
+        return "refused", here, (f"`git checkout {main}` in {h} failed: "
+                                 + ((r.stderr or r.stdout).strip()[-400:] or f"exit {r.returncode}"))
+    return "moved", here, ""
+
+
+def return_checkout(p: Project) -> str:
+    """The daemon's side, when a harness task ended and once at its start: a checkout left on a task's
+    branch (ttp/harness-t<id> or ttp/t<id>-<slug>) whose task ended or is gone goes back to the main line
+    (to_main), so landings and later tasks work on main again. One whose task is still open stays (its
+    next run may work there). One that cannot move (uncommitted changes, a git refusal) is left exactly as
+    it is and raised once per branch head and reason (OFF_MAIN). Returns to_main's outcome, or "open"."""
+    from .db import TERMINAL_TASK_STATES
+    if not _is_repo(p):
+        return ""
+    here = on_branch(p.harness)
+    m = CHECKOUT_TASK_RE.fullmatch(here)
+    if not m:
+        if p.db.kv(OFF_MAIN_KEY):
+            p.db.set_kv(OFF_MAIN_KEY, None)
+        return ""
+    task = p.db.task(int(m.group(1)))
+    if task and task["status"] not in TERMINAL_TASK_STATES:
+        return "open"
+    before = _git(p.harness, "rev-parse", "HEAD").stdout.strip()
+    got, _, why = to_main(p)
+    if got == "moved":
+        p.db.set_kv(OFF_MAIN_KEY, None)
+        changed = _git(p.harness, "diff", "--name-only", before, "HEAD").stdout.split()
+        if any(f.startswith("runtime/") for f in changed):
+            from . import service
+            durable_write(p.state / service.RESTART_REQUEST,
+                          json.dumps({"at": time.time(), "pid": os.getpid(),
+                                      "why": f"the harness checkout went back from {here} to its main line"}))
+    elif got in ("dirty", "refused"):
+        seen = [here, before, got]
+        if p.db.kv(OFF_MAIN_KEY) != seen:
+            with p.db.tx():
+                p.db.set_kv(OFF_MAIN_KEY, seen)
+                p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                       (time.time(), "harness", OFF_MAIN, "normal",
+                        f"The harness checkout {p.harness} is left on branch {here} of ended task "
+                        f"#{m.group(1)}, not its main line, and was not moved back: {why}. Nothing was changed. "
+                        f"Harness landings wait meanwhile. A harness task should commit or put back those "
+                        f"changes (on {here}, or move them to main), then `git checkout {main_line(p.harness)}`.",
+                        "queued", int(m.group(1)) if task else None))
+    return got
 
 
 def landing_merge(h: Path) -> bool:

@@ -21634,15 +21634,19 @@ class Daemon:
         the harness moved. It holds the upgrade lock meanwhile and waits while `ttp upgrade` holds it:
         either one's merge in the live checkout would leave MERGE_HEAD in the way of the other. Done harness
         tasks whose commits sit outside the harness HEAD and outside a worktree of their own are landed or
-        raised too (_land_stranded_harness)."""
+        raised too (_land_stranded_harness). First, once at start and after a harness task ended, a checkout
+        left on an ended task's branch goes back to main (_return_harness_checkout)."""
         stranded = self._stranded_harness_tasks()
-        if not ((self.p.state / harnesstree.DIR).is_dir() or stranded):
+        due = self._harness_checkout_due()
+        if not ((self.p.state / harnesstree.DIR).is_dir() or stranded or due):
             return
         held = locks.try_take([release.upgrade_lock(self.p)], f"daemon (pid {os.getpid()}): landing harness worktrees",
                               "harness worktree landing")
         if held is None:    # an upgrade runs: the next tick lands them
             return
         try:
+            if due is not None:
+                self._return_harness_checkout(due)
             running = {int(r["task"]) for r in self.p.db.q("SELECT task FROM runs WHERE status='running' "
                                                             "AND task IS NOT NULL")}
             for tid, got in harnesstree.sweep(self.p, running).items():
@@ -21653,6 +21657,31 @@ class Daemon:
             log(self.p, "harness worktree landing error: " + traceback.format_exc().replace("\n", " | ")[:2000])
         finally:
             held.close()
+
+    def _harness_checkout_due(self) -> float | None:
+        """When the harness checkout's branch is to be checked (_return_harness_checkout): the time this
+        check began, on the daemon's first pass and once a harness task ended since the last finished
+        check; else None. One indexed read a tick."""
+        now, last = time.time(), getattr(self, "_checkout_checked", None)
+        if last is None:
+            return now
+        ended = self.p.db.one("SELECT id FROM tasks WHERE kind='harness' AND status IN ('done','failed','cancelled') "
+                              "AND updated>=? LIMIT 1", (last,))
+        return now if ended else None
+
+    def _return_harness_checkout(self, began: float) -> None:
+        """Put a harness checkout left on an ended task's branch back on main (harnesstree.return_checkout).
+        Checked again next tick while another harness run works in it ("busy"); else done until the next
+        harness task ends."""
+        try:
+            got = harnesstree.return_checkout(self.p)
+        except Exception:   # never in the way of the landing that follows
+            log(self.p, "harness checkout branch check error: " + traceback.format_exc().replace("\n", " | ")[:1500])
+            got = ""
+        if got == "moved":
+            log(self.p, "harness checkout was on an ended task's branch: back on its main line")
+        if got != "busy":
+            self._checkout_checked = began
 
     def _stranded_harness_tasks(self) -> list[dict]:
         """Done harness tasks that ended within HARNESS_STRANDED_WINDOW_S and are not settled yet

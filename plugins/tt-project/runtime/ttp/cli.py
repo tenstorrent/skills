@@ -13155,6 +13155,7 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
     ident = ["-c", "user.name=tt-project", "-c", "user.email=tt-project@localhost"]
     _ensure_git_ident(h)        # harness tasks commit here with plain `git commit`
     _refuse_unfinished_merge(p, auto)
+    _harness_to_main(p, "upgrade not applied", f"ttp upgrade {p.name}", auto=auto)
     emptied = _emptied(h, None, "HEAD")
     if emptied:      # a crash cut these short: they are damage, not local edits to commit and keep
         with tree_writes(h):
@@ -13812,7 +13813,8 @@ def _moved_template(h: Path, base: str) -> str:
     """Why main may not take the checked merge ("" = it may): since `base` someone else changed the
     template's files on it, or merged upstream into it. Only charter, memory and config commits of the
     daemon may land meanwhile; the merge then keeps them. Anything else would be overwritten."""
-    head = _git(h, "rev-parse", "HEAD")
+    from .harnesstree import main_line
+    head = _git(h, "rev-parse", f"refs/heads/{main_line(h)}" if main_line(h) else "HEAD")   # main, not the checkout's branch
     if head == base:
         return ""
     if subprocess.run(["git", "-C", str(h), "merge-base", "--is-ancestor", base, head]).returncode != 0:
@@ -13837,11 +13839,13 @@ def _apply_upgrade(p: Project, commit: str) -> None:
     merged = r.stdout.strip()
     if subprocess.run(["git", "-C", str(h), "merge-base", "--is-ancestor", "upstream", merged]).returncode != 0:
         die(f"--apply refused: {commit} does not contain the current template (upstream); merge it again", 1)
-    if subprocess.run(["git", "-C", str(h), "merge-base", "--is-ancestor", "HEAD", merged]).returncode != 0:
+    main = _harness_to_main(p, "--apply refused", f"ttp upgrade {p.name} --apply {commit}",
+                            env={**os.environ, release.GUARD_ENV: "1"})
+    if subprocess.run(["git", "-C", str(h), "merge-base", "--is-ancestor", main, merged]).returncode != 0:
         die(f"--apply refused: main moved and {commit} does not contain it; nothing was changed. In the "
             f"worktree: `git merge main`, check again, commit, then rerun with the new commit.", 1)
     from . import applyff
-    base = _git(h, "rev-parse", "HEAD")
+    base = _git(h, "rev-parse", main)
     if (dirty := applyff.foreign_edits(h, base, merged)):
         # Another harness task (or a hand edit) left these uncommitted in the live checkout: git would refuse
         # the fast-forward. Busy, not failed: nothing was changed and a rerun once they are committed applies.
@@ -13873,6 +13877,9 @@ def _apply_upgrade(p: Project, commit: str) -> None:
         die(f"--apply: could not fast-forward main to {commit}: {why}. Main is still "
             f"{_git(h, 'rev-parse', 'HEAD')[:12]} and nothing was restarted; rerun "
             f"`ttp upgrade {p.name} --apply {commit}`", 1)
+    if (now := _git(h, "rev-parse", main)) != merged:     # never claim main moved on another branch's word
+        die(f"--apply: git reported success but {main} is {now[:12]}, not {commit}; nothing was restarted. "
+            f"The checkout is on {_checkout_branch(h)}: rerun `ttp upgrade {p.name} --apply {commit}`", 1)
     sync_all()
     upjournal.step(p, "merged")
     release.clear_stuck(p)
@@ -13880,6 +13887,33 @@ def _apply_upgrade(p: Project, commit: str) -> None:
     from . import service
     upjournal.step(p, "restarting")
     _exit_for_restart(service.restart_running(p))
+
+
+def _checkout_branch(h: Path) -> str:
+    from .harnesstree import on_branch
+    return on_branch(h) or "a detached HEAD"
+
+
+def _harness_to_main(p: Project, refused: str, rerun: str, env: dict | None = None, auto: bool = False) -> str:
+    """Make sure the live harness checkout is on its main line before an upgrade reads or moves main: a
+    checkout left on a task's branch with no uncommitted tracked changes is checked out on main first
+    (harnesstree.to_main); else it stops (exit 1; 75 when `auto`, which the daemon retries) with nothing
+    changed. Returns main's ref ("HEAD" in a repo with no main or master branch)."""
+    from . import harnesstree, release
+    h = p.harness
+    main = harnesstree.main_line(h)
+    got, here, why = harnesstree.to_main(p, os.environ.get("TTP_TASK"), env=env)
+    if got == "moved":
+        print(f"the harness checkout was on {here or 'a detached HEAD'}, not {main}: checked out {main} first "
+              f"(branch {here or 'HEAD'} kept as it was)")
+    elif got:
+        msg = (f"{refused}: the harness checkout {h} is on {here or 'a detached HEAD'}, not {main}, and was not "
+               f"moved: {why}. Nothing was changed; {main} is still {_git(h, 'rev-parse', main)[:12]}. Commit "
+               f"or put back those changes, `git -C {shlex.quote(str(h))} checkout {main}`, then rerun `{rerun}`.")
+        if auto:
+            release.finish(p, "held", why=msg[:300])
+        die(msg, UPGRADE_BUSY if auto else 1)
+    return f"refs/heads/{main}" if main else "HEAD"
 
 
 UPGRADE_BUSY = 75       # `ttp upgrade` deferred or refused: nothing was changed (EX_TEMPFAIL, as for `ttp lock`)

@@ -92,6 +92,10 @@ def fast_forward(h: Path, merged: str, guard_env: str) -> str:
     touched that matched main before it is put back to main's version, so the tree is as it was: a local
     edit made before the merge is kept."""
     from .upjournal import _differs, _put_back, _touched
+    from .harnesstree import main_line, on_branch
+    main = main_line(h)
+    if main and (here := on_branch(h)) != main:   # merge --ff-only moves the checked-out branch, not main
+        return f"the harness checkout is on {here or 'a detached HEAD'}, not {main}; {main} was not moved"
     base = _git(h, "rev-parse", "HEAD").stdout.strip()
     if not base:
         return "could not read main's commit"
@@ -110,6 +114,11 @@ def fast_forward(h: Path, merged: str, guard_env: str) -> str:
     except OSError as e:
         return f"{why}; putting its files back failed too ({e})"
     return why + (f"; put back {len(put)} file(s) it had written" if put else "")
+
+
+def _main_ref(h: Path) -> str:
+    from .harnesstree import main_line
+    return f"refs/heads/{m}" if (m := main_line(h)) else "HEAD"
 
 
 def request(p, merged: str, task: str, wait_s: float = APPLY_WAIT_S) -> tuple[str, str]:
@@ -240,7 +249,7 @@ def take(p) -> bool:
         why = "the running upgrade's journal does not name this merge"
     elif _git(h, "merge-base", "--is-ancestor", "upstream", merged).returncode != 0:
         why = f"{merged[:12]} does not contain the current template (upstream)"
-    elif _git(h, "merge-base", "--is-ancestor", "HEAD", merged).returncode != 0:
+    elif _git(h, "merge-base", "--is-ancestor", _main_ref(h), merged).returncode != 0:
         why = f"main moved and {merged[:12]} does not contain it"
     else:
         why = fast_forward(h, merged, release.GUARD_ENV)
