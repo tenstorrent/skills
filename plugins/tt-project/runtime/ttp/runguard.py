@@ -8,11 +8,14 @@ proxy with the token is served by the run's own model, and a container or anothe
 as the run. hook.py refuses, on every provider and for every task (model-free, always on), a Bash call that:
 - hands the run's credential variables (CRED_VARS) or the token's value to a container or another agent:
   docker, podman, nerdctl, apptainer, singularity, docker-compose or harbor naming `$VAR`, `${VAR}` or the
-  bare name (`-e VAR`, `--ae VAR`, which pass the current value) or the token's value, or an env file
-  (`.env`, `*.env`, `env-file` ...) written with one. A literal value (`-e VAR=x`) is no credential;
+  bare name (`-e VAR`, `-eVAR`, `--ae VAR`, which pass the current value) or the token's value, or an env file
+  (`.env`, `*.env`, `env-file` ...) written with one, or a whole-environment dump (`env`, `printenv`,
+  `export -p`, `set`, `declare -x/-p`) written to a file or process substitution in the same command that runs a
+  container tool with `--env-file`. A literal value (`-e VAR=x`, `-eVAR=x`) is no credential;
 - opens a listener on a non-loopback address (no `bind=` at all counts: it listens on every address) that
   forwards to the run's proxy port: socat `*-LISTEN:` with a non-loopback or missing `bind=`, `ssh -L/-R` (and
-  autossh, `-o LocalForward/RemoteForward=`) with a non-loopback bind, `nc`/`ncat -l` without a loopback bind,
+  autossh, `-o LocalForward/RemoteForward=`) with a non-loopback bind or with the bind widened (`-g`,
+  `-o GatewayPorts=yes|clientspecified`; `GatewayPorts=no` is fine), `nc`/`ncat -l` without a loopback bind,
   or inline code of python, node, perl or ruby binding a non-loopback address beside the port;
 - opens the firewall for that port (iptables, ip6tables, nft, ufw or firewall-cmd naming it, but a DROP or
   REJECT rule or a delete).
@@ -21,8 +24,11 @@ The messages name the safe route, `ttp secret env <name> -- <command>` for a sto
 
 The proxy port comes from the runner (TTP_RUN_PROXY_PORT, set where it starts the bridge) and, for any
 provider, from a loopback `*_BASE_URL` in the run's environment. Known gaps, accepted: a script file a command
-runs is not read; a `--env-file` another call wrote; a listener and its target in separate calls; `docker run
---network host`. A command that cannot be parsed passes.
+runs is not read; a `--env-file` or env dump another call wrote (only the same command is judged); a listener and
+its target in separate calls (or a forward whose port comes from a variable or is built at run time); `docker run
+--network host`; obfuscated or encoded forms (base64, a value or name assembled in pieces, `eval`); a credential
+read from a file or `/proc/<pid>/environ` and passed on; a token handed over by a means that names neither a
+credential variable nor its value (stdin, a mounted file). A command that cannot be parsed passes.
 """
 from __future__ import annotations
 
@@ -42,6 +48,13 @@ LOOPBACK_RE = re.compile(r"^(?:localhost|127(?:\.\d{1,3}){3}|::1|\[::1\]|ip6-loc
 # A file an env is written to
 ENV_FILE_RE = re.compile(r"(?:>>?|\btee(?:\s+-a)?)\s*[\"']?(?:[^\s;&|\"']*/)?"
                          r"(?:\.env[\w.-]*|[\w.-]*\.env|[\w.-]*[_-]env|env[._-]?file[\w.-]*|env\.list)[\"']?(?=[\s;&|]|$)", re.I)
+
+# A dump of the whole environment (env, printenv, export -p, set, declare -x/-p) written to a file or a pipe
+# into tee, or inside a process or command substitution
+ENV_DUMP_RE = re.compile(r"(?<![\w./$-])(?:env|printenv|export\s+-p|set|declare\s+-[xp])\s*(?:>>?|\|\s*tee\b|\))")
+# ssh options that widen a forward's bind: -g, -o GatewayPorts=yes|clientspecified
+SSH_GATEWAY_RE = re.compile(r"(?i)GatewayPorts[ =]+\"?(?:yes|clientspecified)\b")
+SSH_G_FLAG_RE = re.compile(r"^-[46AaCfGKkMNnqsTtVvXxYy]*g[46AaCfGKkMNnqsTtVvXxYy]*$")
 
 CRED_WHY = ("a run must not hand its own model credentials ({names}) to a container or another agent: "
             "whoever holds the token acts as this run. Give a command a stored secret with "
@@ -142,9 +155,10 @@ def proxy_refusal(cmd: str, segments: list[list[str]], port_set: set[str]) -> st
             if tool in NC_TOOLS and _nc_exposes(argv):
                 return why
             if tool in ("ssh", "autossh"):
+                widened = bool(SSH_GATEWAY_RE.search(text)) or any(SSH_G_FLAG_RE.match(w) for w in argv[1:])
                 for spec in _ssh_forwards(argv):
                     fwd = _forward_bind(spec)
-                    if fwd and fwd[1] == port and fwd[0] is not None and _open_bind(fwd[0]):
+                    if fwd and fwd[1] == port and (widened or fwd[0] is not None and _open_bind(fwd[0])):
                         return why
             if tool in FIREWALL_TOOLS and _has_port(text, port):
                 if re.search(r"(?:^|\s)(?:-D|--delete)\b|-j\s+(?:DROP|REJECT)\b|\b(?:deny|reject|drop|delete)\b", text):
@@ -164,13 +178,15 @@ def cred_refusal(cmd: str, segments: list[list[str]], env: dict) -> str | None:
     token = token if len(token) >= 8 else ""
     named = "|".join(names)
     expand = re.compile(rf"\$\{{?(?:{named})(?![\w])") if names else None
-    bare = re.compile(rf"^(?:-[\w-]*=)?(?:{named})$") if names else None
+    bare = re.compile(rf"^(?:-[\w-]*=|-e)?(?:{named})$") if names else None
     hit = [argv for argv in segments if argv and any(_base(w) in CONTAINER_TOOLS for w in argv)]
     if hit:
         if expand and expand.search(cmd) or token and token in cmd:
             return CRED_WHY.format(names=", ".join(names))
         if bare and not re.search(r"\bttp\s+secret\s+env\b", cmd) and any(bare.match(w) for argv in hit for w in argv[1:]):
             return CRED_WHY.format(names=", ".join(names))
+    if hit and ENV_DUMP_RE.search(cmd) and any(re.match(r"--env-file(?:=|$)", w) for argv in hit for w in argv[1:]):
+        return CRED_WHY.format(names=", ".join(names))
     if ENV_FILE_RE.search(cmd):
         if expand and expand.search(cmd) or token and token in cmd \
                 or named and re.search(rf"(?<![\w$]){'(?:' + named + ')'}(?![\w=])", cmd):
