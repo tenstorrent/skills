@@ -1551,9 +1551,12 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    bench; the suite spends money, so it runs only when started.
    `--harbor N` (off by default) adds a Terminal-Bench 2.0 slice: N task names drawn by the date from
    `~/.tt-project/model-bench/harbor-tasks.txt` (one per line) run per model through Harbor, which is
-   installed only into a venv in that day's cells folder (`python3 -m venv`, then that venv's pip, never
-   `pip install --user`). If the install fails, for example because outbound access is blocked, the
-   slice is skipped with the reason and no other route is tried. The slice runs Harbor's `terminus-2`
+   installed only into a venv in that day's cells folder, never `pip install --user`. Harbor needs
+   Python 3.12 or newer: the venv is built on such a `python3.x` on PATH, else with
+   `uv venv --python 3.12` (uv's interpreters and cache stay under the bench folder, never `~/.local`),
+   then that venv's pip installs Harbor. If the install fails, for example because outbound access is
+   blocked or no Python 3.12 can be found, the slice is skipped with the reason; the install is tried
+   again after 6 hours, or at once when the install route changes. The slice runs Harbor's `terminus-2`
    agent against the `chat` endpoint (its URL and key only in the child's environment), one trial per
    task, each (model, task) its own Harbor job that resumes after a restart; HTTP 429 answers are waited
    out and never scored, and a setup error reruns once, then counts as a fault. A host-wide trial cap is

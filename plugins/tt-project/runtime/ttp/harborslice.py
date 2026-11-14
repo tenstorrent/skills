@@ -19,8 +19,10 @@ none there: the full set of a local dataset folder (setting dataset, each task a
 the DEFAULT_TASKS subset first so a partial cycle still compares with earlier subset runs; a registry
 dataset name (no folder): the DEFAULT_TASKS subset only. Settings: model_bench.terminalbench {on, tasks_file, agent, limit_s, concurrency,
 floor_share, dataset} (settings). The older suite slice (`ttp model-bench suite --harbor N`) uses the same
-trial runner. Harbor is installed only into a venv the run owns (`python3 -m venv`, then that venv's pip
-under cellenv.env), never with `pip install --user`; a failed install skips the run with its reason.
+trial runner. Harbor is installed only into a venv the run owns, never with `pip install --user`: built on a
+python3.x on PATH of at least MIN_PY (Harbor needs 3.12), else with `uv venv --python 3.12` (uv's interpreters
+and cache under the bench folder, never ~/.local), then that venv's pip under cellenv.env. A failed install
+skips the run with its reason and is retried after INSTALL_RETRY_S or once the install route changes.
 Tested with fakes only; parsing follows Harbor's trial result.json (verifier_result, exception_info).
 """
 from __future__ import annotations
@@ -43,6 +45,8 @@ DATASET, AGENT, LIMIT_S, FLOOR_SHARE = "terminal-bench@2.0", "terminus-2", 900, 
 COMMAND = ("harbor run -y -q --dataset {dataset} -a {agent} -m openai/{model} -o {jobs} --job-name {name} -n 1 "
            "-i {task} --ak 'llm_call_kwargs={{\"num_retries\":8}}'")
 RESUME = "harbor job resume -p {job}"
+# Harbor needs Python 3.12+; RECIPE names this install route, so a failure marker of an older one is stale.
+MIN_PY, RECIPE, INSTALL_RETRY_S = (3, 12), "venv-py3.12+", 6 * 3600
 INSTALL_TIMEOUT_S, TASK_TIMEOUT_S, RETRY_S, CORES_PER_TRIAL, MAX_SLOTS, MAX_RATE_WAITS = 900, 3600, 60, 4, 8, 24
 # A public 20-task subset of Terminal-Bench 2.0: run first in each cycle; alone without a local dataset folder.
 DEFAULT_TASKS = ("adaptive-rejection-sampler", "code-from-image", "count-dataset-tokens", "custom-memory-heap-crash",
@@ -114,26 +118,77 @@ def _run(cmd: list[str], env: dict, timeout: float) -> tuple[int, str]:
     return r.returncode, (r.stderr or r.stdout or "")[-500:]
 
 
-def install(root: Path, runner: Callable = _run) -> tuple[Path | None, str]:
-    """(the venv holding PACKAGE, '') or (None, why). Builds root/venv once; a failure is never retried."""
+def _version(py: str) -> tuple[int, int] | None:
+    """`py`'s (major, minor), None when it does not run."""
+    try:
+        r = subprocess.run([py, "-c", "import sys; print('%d.%d' % sys.version_info[:2])"],
+                           capture_output=True, text=True, timeout=30)
+        return tuple(int(x) for x in r.stdout.split(".")) if r.returncode == 0 else None   # type: ignore[return-value]
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+def interpreter(which: Callable = shutil.which, version: Callable = _version) -> str | None:
+    """A python3 on PATH new enough for Harbor (MIN_PY), newest name first; None when there is none."""
+    seen = set()
+    for py in (sys.executable, *(which(f"python3.{n}") for n in range(20, MIN_PY[1] - 1, -1)), which("python3")):
+        if py and py not in seen:
+            seen.add(py)
+            v = version(py)
+            if v and v >= MIN_PY:
+                return py
+    return None
+
+
+def uv(which: Callable = shutil.which) -> str | None:
+    """uv on PATH or in its own installer's usual folders (a daemon's PATH may lack them)."""
+    home = Path.home()
+    return which("uv") or next((str(p) for p in (home / ".local" / "bin" / "uv", home / ".cargo" / "bin" / "uv")
+                                if p.is_file() and os.access(p, os.X_OK)), None)
+
+
+def install(root: Path, runner: Callable = _run, which: Callable = shutil.which,
+            version: Callable = _version) -> tuple[Path | None, str]:
+    """(the venv holding PACKAGE, '') or (None, why). Builds root/venv on a python3 on PATH of at least MIN_PY,
+    else with `uv venv --python MIN_PY` (uv's interpreters and cache under root, never ~/.local), else fails
+    naming the version needed. A failed install is not retried for INSTALL_RETRY_S; a failure marker of an
+    earlier recipe (or older) is stale and tried again."""
     from . import cellenv
     from .project import durable_write
-    venv = root / "venv"
+    venv, failed = root / "venv", root / "install-failed"
     if (venv / ".installed").exists():
         return venv, ""
-    if (root / "install-failed").exists():
-        return None, (root / "install-failed").read_text()
+    try:
+        mark = json.loads(failed.read_text())
+        if mark.get("recipe") == RECIPE and time.time() - float(mark.get("ts") or 0) < INSTALL_RETRY_S:
+            return None, str(mark.get("why") or "harbor install failed")
+    except (OSError, ValueError, AttributeError, TypeError):
+        pass
+    failed.unlink(missing_ok=True)
+
+    def fail(why: str) -> tuple[None, str]:
+        root.mkdir(parents=True, exist_ok=True)
+        durable_write(failed, json.dumps({"recipe": RECIPE, "ts": time.time(), "why": why}))
+        return None, why
+    need = "%d.%d" % MIN_PY
     env = cellenv.env(venv, dict(os.environ))
-    for cmd in ([sys.executable, "-m", "venv", str(venv)],
-                [str(venv / "bin" / "python"), "-m", "pip", "install", "--quiet", PACKAGE]):
+    py = interpreter(which, version)
+    if py:
+        make = [py, "-m", "venv", str(venv)]
+    elif u := uv(which):
+        make = [u, "venv", "--seed", "--python", need, str(venv)]
+        env = {**env, "UV_PYTHON_INSTALL_DIR": str(root / "uv-python"), "UV_CACHE_DIR": str(root / "uv-cache")}
+    else:
+        return fail(f"harbor needs Python {need} or newer: no python3.x of at least {need} on PATH and no uv "
+                    f"to fetch one (install a python{need}, or uv, for this user)")
+    if venv.exists():   # a venv of a failed try, maybe on an older Python: rebuilt from scratch
+        shutil.rmtree(venv)
+    for cmd in (make, [str(venv / "bin" / "python"), "-m", "pip", "install", "--quiet", PACKAGE]):
         rc, out = runner(cmd, env, INSTALL_TIMEOUT_S)
         if rc:
-            why = f"harbor install failed (no other route is tried): {out.strip()[-300:]}"
-            root.mkdir(parents=True, exist_ok=True)
-            durable_write(root / "install-failed", why)
-            return None, why
+            return fail(f"harbor install failed ({Path(cmd[0]).name} {cmd[1]}): {out.strip()[-300:]}")
     venv.mkdir(parents=True, exist_ok=True)
-    durable_write(venv / ".installed", "")
+    durable_write(venv / ".installed", RECIPE)
     return venv, ""
 
 

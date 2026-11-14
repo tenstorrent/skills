@@ -1190,6 +1190,7 @@ def test_model_suite_harbor_slice_is_off_by_default_and_installs_only_into_its_o
     from ttp import cli, harborslice, modelsuite
     p = make(env)
     d = _suite_home(env, monkeypatch)
+    monkeypatch.setattr(harborslice, "interpreter", lambda *a, **k: "/opt/fake/bin/python3.12")
     monkeypatch.setattr(modelsuite, "decisions", lambda db, date: [{"id": "c", "state": "s", "want": "skip", "planted": False}])
     (d / harborslice.TASKS).write_text("task-a\ntask-b\ntask-c\n")
     calls = []
@@ -1222,10 +1223,61 @@ def test_model_suite_harbor_slice_is_off_by_default_and_installs_only_into_its_o
     assert [c for c, e in calls if "pip" in c] == [], "an installed venv is reused"
 
 
+def test_harbor_install_builds_its_venv_on_a_new_enough_python_else_uv_and_retries_a_stale_failure(tmp_path, monkeypatch):
+    """Harbor needs Python 3.12+: the venv is built on a python3.x on PATH of at least that, else by uv with its
+    interpreters and cache under the bench folder (never ~/.local), else the install fails naming the version.
+    A failure marker of the older recipe (plain text) or past INSTALL_RETRY_S never stops the next try."""
+    from ttp import harborslice
+    root, calls = tmp_path / "harbor", []
+    vers = {"/usr/bin/python3": (3, 10), "/usr/bin/python3.12": (3, 12), "/usr/bin/python3.11": (3, 11)}
+    path = {"python3": "/usr/bin/python3", "python3.11": "/usr/bin/python3.11", "uv": "/opt/uv/bin/uv"}
+    monkeypatch.setattr(harborslice.sys, "executable", "/usr/bin/python3")
+    which = lambda n: path.get(n)
+    version = lambda py: vers.get(py)
+
+    def runner(cmd, env, timeout):
+        calls.append((cmd, env))
+        return 0, ""
+    root.mkdir()
+    (root / "install-failed").write_text("harbor install failed (no other route is tried): No matching distribution")
+    (root / "venv" / "bin").mkdir(parents=True)   # the old venv on Python 3.10 a failed try left
+    (root / "venv" / "bin" / "python3.10").write_text("")
+    assert harborslice.interpreter(which, version) is None, "3.10 and 3.11 are too old"
+    venv, why = harborslice.install(root, runner, which, version)
+    assert venv == root / "venv" and why == "" and not (root / "install-failed").exists(), "the stale marker is retried"
+    (mk, mk_env), (pip, pip_env) = calls
+    assert mk == ["/opt/uv/bin/uv", "venv", "--seed", "--python", "3.12", str(root / "venv")]
+    assert mk_env["UV_PYTHON_INSTALL_DIR"] == str(root / "uv-python") and mk_env["UV_CACHE_DIR"] == str(root / "uv-cache")
+    assert pip[:4] == [str(root / "venv" / "bin" / "python"), "-m", "pip", "install"] and "--user" not in pip
+    assert pip_env["PIP_REQUIRE_VIRTUALENV"] == "1" and pip_env["PYTHONNOUSERSITE"] == "1" and "PIP_USER" not in pip_env
+    assert not (root / "venv" / "bin" / "python3.10").exists(), "the old venv was rebuilt, not reused"
+    # A python3.12 on PATH is used as is, no uv.
+    path["python3.12"] = "/usr/bin/python3.12"
+    calls.clear()
+    other = tmp_path / "other"
+    assert harborslice.install(other, runner, which, version)[0] == other / "venv"
+    assert calls[0][0] == ["/usr/bin/python3.12", "-m", "venv", str(other / "venv")]
+    assert "UV_PYTHON_INSTALL_DIR" not in calls[0][1]
+    # Neither: a clear failure naming the version needed, kept for INSTALL_RETRY_S, then tried again.
+    del path["python3.12"], path["uv"]
+    monkeypatch.setattr(harborslice, "uv", lambda which=None: None)
+    third = tmp_path / "third"
+    calls.clear()
+    venv, why = harborslice.install(third, runner, which, version)
+    assert venv is None and "Python 3.12 or newer" in why and calls == []
+    assert harborslice.install(third, runner, which, version) == (None, why)
+    mark = json.loads((third / "install-failed").read_text())
+    (third / "install-failed").write_text(json.dumps({**mark, "ts": mark["ts"] - harborslice.INSTALL_RETRY_S - 1}))
+    path["python3.13"], vers["/usr/bin/python3.13"] = "/usr/bin/python3.13", (3, 13)
+    assert harborslice.install(third, runner, which, version) == (third / "venv", "")
+    assert calls[0][0][0] == "/usr/bin/python3.13"
+
+
 def test_harbor_slice_failed_install_skips_it_without_another_route(env, tmp_path, monkeypatch):
     from ttp import harborslice
     d = _suite_home(env, monkeypatch)
     (d / harborslice.TASKS).write_text("task-a\n")
+    monkeypatch.setattr(harborslice, "interpreter", lambda *a, **k: "/opt/fake/bin/python3.12")
     calls = []
 
     def runner(cmd, env, timeout):
@@ -1235,7 +1287,7 @@ def test_harbor_slice_failed_install_skips_it_without_another_route(env, tmp_pat
     assert r["pass_rate"] is None and "harbor install failed" in r["skipped"] and "connection refused" in r["skipped"]
     assert len(calls) == 2 and not any(c[0] == "harbor" for c in calls)
     assert harborslice.row("m-a", "2026-11-10", 2, d, tmp_path / "cells", {}, runner)["skipped"] == r["skipped"]
-    assert len(calls) == 2, "a failed install is never retried"
+    assert len(calls) == 2, "a failed install is not retried at once"
     (d / harborslice.TASKS).unlink()
     assert harborslice.tasks(d, harborslice.settings({})) == list(harborslice.DEFAULT_TASKS), "no names: the public subset"
     ds = tmp_path / "tb2"
