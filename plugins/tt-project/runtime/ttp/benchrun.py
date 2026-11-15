@@ -39,7 +39,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import bench, cellenv, cellns, gitmemo
+from . import bench, cellenv, cellnet, cellns, gitmemo
 from .project import durable_write, open_append
 
 PROMPT = ("You are working in the git repository in your current directory. Do the task below there: make "
@@ -744,10 +744,86 @@ def isolate(tmp: Path, ws: Path, arm: dict, opts: dict, hidden: list[Path], repo
         extra["binds"] = [*extra.get("binds", []), ("ro", deny)]
         extra["path_dirs"] = [*(extra.get("path_dirs") or [str(tmp / "venv" / "bin")]), str(deny)]
     cli = inst["bin"] if inst else "" if provider == "fake" else str(prov.binary() or "")
-    cell = cellns.build(tmp, ws, hidden, python=python, cli=cli,
+    # An arm whose own CLI calls its provider's API (not a bridge: the chat provider's CLI and every harness arm
+    # call the run's bridge, which makes the model call outside the cell) reaches it through the proxy, which
+    # allows that provider's API domains only; every other cell has no network but its bridge.
+    domains = cellnet.API_DOMAINS.get(provider, ()) if not inst and provider != "chat" and not opts.get("dry_run") else ()
+    cell = cellns.build(tmp, ws, hidden, python=python, cli=cli, proxy_domains=domains,
                         config=conf, creds=creds, **{"path_dirs": [str(tmp / "venv" / "bin")], **extra})
     cell.python, cell.runtime = python, str(copy) if copy else ""
     return cell, cellns.selftest(cell, ws, absent, gone=gone)
+
+
+REACH_CODE = ("import socket, sys\n"
+              "for t in sys.argv[1:]:\n"
+              "    h, _, p = t.rpartition(':')\n"
+              "    try:\n"
+              "        socket.create_connection((h, int(p)), timeout=3).close()\n"
+              "        print('REACH', t, 'reachable')\n"
+              "    except OSError:\n"
+              "        print('REACH', t, 'unreachable')\n")
+
+
+def _reach_targets(targets: list) -> list[str]:
+    out = []
+    for t in targets:
+        host, _, port = str(t).rpartition(":")
+        if not host or not port.isdigit() or not 0 < int(port) < 65536 or not re.fullmatch(r"[0-9A-Za-z.:\[\]_-]+", host):
+            raise BenchError(f"reach: {t!r} is not HOST:PORT")
+        out.append(f"{host.strip('[]')}:{port}")
+    return out
+
+
+def reach_probe(targets: list) -> tuple[list[tuple[str, str, str]], list[str]]:
+    """Each host:port of `targets` tried by a TCP connect from inside real cells built exactly as the bench, the daily
+    bench, replay and the device shadow build theirs (isolate: its own network namespace; one cell per provider shape
+    and the shadow's read-only one): ([(cell, target, "reachable" | "unreachable")], problems). `problems` is what
+    kept a cell from being built, failing its self-test or answering: a probe with a problem proves nothing."""
+    from . import deviceshadow
+    targets, rows, problems = _reach_targets(targets), [], []
+    shapes = [("bench-chat", {"provider": "chat", "model": "m", "effort": "high"}, {}),
+              ("bench-claude", {"provider": "claude", "model": "m", "effort": "high"}, {}),
+              ("shadow", {"provider": "chat", "model": "m", "effort": "high"}, {"shadow": True})]
+    tmp = Path(tempfile.mkdtemp(prefix="reach-"))
+    try:
+        for name, arm, extra in shapes:
+            root = tmp / name
+            ws = root / "work"
+            ws.mkdir(parents=True)
+            for args in (["init", "-q", "-b", "main"], ["-c", "user.name=reach", "-c", "user.email=reach@localhost",
+                                                         "commit", "-q", "--allow-empty", "-m", "start"]):
+                subprocess.run(["git", "-C", str(ws), *args], capture_output=True, timeout=60, check=True)
+            venv = cellenv.make(root / "venv", seed=())
+            opts: dict = {}
+            if extra.get("shadow"):
+                (root / "ro").mkdir()
+                opts = {"ro_binds": [str(root / "ro")], "deny_tools": str(deviceshadow.deny_tools(root / "deny"))}
+            cell = None
+            try:
+                cell, bad = isolate(root, ws, arm, opts, [], [])
+                if bad:
+                    problems.append(f"{name}: isolation self-test: " + "; ".join(bad)[:300])
+                    continue
+                r = subprocess.run(cell.wrap([str(venv / "bin" / "python"), "-I", "-c", REACH_CODE, *targets]),
+                                   cwd=str(ws), capture_output=True, text=True, timeout=60 + 4 * len(targets),
+                                   env={**cellenv.env(venv, _clean_env()), **cell.sets()}, stdin=subprocess.DEVNULL)
+                got = {t: v for line in r.stdout.splitlines() if line.startswith("REACH ")
+                       for _, t, v in [line.split(" ", 2)]}
+                if set(got) != set(targets):
+                    problems.append(f"{name}: the probe did not answer (exit {r.returncode}): "
+                                    f"{(r.stderr or r.stdout).strip()[-200:]}")
+                    continue
+                rows += [(name, t, got[t]) for t in targets]
+            except cellns.Unavailable as e:
+                problems.append(f"{name}: no cell: {e}"[:300])
+            except (OSError, subprocess.SubprocessError, cellenv.Unavailable) as e:
+                problems.append(f"{name}: {type(e).__name__}: {e}"[:300])
+            finally:
+                if cell is not None:
+                    cell.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return rows, problems
 
 
 def run_cell(bench_dir: Path, out: Path, task: dict, cell: dict, arm: dict, opts: dict, cfg: dict) -> dict:
@@ -760,7 +836,7 @@ def run_cell(bench_dir: Path, out: Path, task: dict, cell: dict, arm: dict, opts
     keep = out / "cells" / f"{task['task']}-r{cell['rep']}-{cell['arm']}"
     hidden = hidden_paths(bench_dir.resolve(), out.resolve(), [task.get("repo"), opts.get("repo")], opts.get("state"))
     tmp = Path(tempfile.mkdtemp(prefix="cell-"))
-    logins = []
+    logins, cell = [], None
     try:
         ws, run = tmp / "work", tmp / "run"
         shutil.copytree(bench_dir / str(task["task"]) / "workspace", ws, symlinks=True)
@@ -771,7 +847,7 @@ def run_cell(bench_dir: Path, out: Path, task: dict, cell: dict, arm: dict, opts
             cell_env = cellenv.env(cellenv.make(tmp / "venv", opts.get("cell_packages", cellenv.SEED)), _clean_env())
         except cellenv.Unavailable as e:
             return {**row, "outcome": "isolation_failed", "passed": False, "why": [str(e)[:500]]}
-        spec, cell = task["spec"], None
+        spec = task["spec"]
         if opts.get("isolate", ISOLATE):   # the agent runs in a namespace that holds only the cell (cellns.py)
             repos = [r for r in (task.get("repo"), opts.get("repo")) if r]
             try:
@@ -806,6 +882,8 @@ def run_cell(bench_dir: Path, out: Path, task: dict, cell: dict, arm: dict, opts
             return {**row, "outcome": "error", "passed": False, "why": [f"{type(e).__name__}: {e}"[:500]]}
     finally:
         restore_logins(logins)
+        if cell is not None:
+            cell.close()
         shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -847,12 +925,15 @@ def launch(run: Path, ws: Path, prompt: str, arm: dict, opts: dict, cfg: dict, h
             "stall_s": opts["stall_s"], "prices": prices, "default_budget_usd": opts["budget_usd"],
             "budget_usd": None if prov.caps_budget and not (inst and provider == "claude") else opts["budget_usd"],
             "nice": 0,
+            **({"cell_net": {"bridge_sock": str(cell.sock("bridge"))}} if cell is not None else {}),
             **({"bridge": {"kind": "claude-cli", "model": arm["model"], "effort": arm["effort"],
                            "budget_usd": opts["budget_usd"]}} if inst and provider == "claude" else
                {"bridge": chatbridge.settings(cfg, "standard", arm["model"], arm["effort"])}
                if provider == "chat" else {}), **({"openai_env": True} if inst else {})}
     durable_write(run / "run.json", json.dumps(spec, indent=1))
     began = time.time()
+    proxy = cellnet.connect_proxy(cell.sock("proxy"), cell.proxy_domains) if cell is not None and cell.proxy_domains \
+        else None
     try:
         with open(run / "runner.log", "wb") as log:
             subprocess.run([*_boot("ttp.runner"), str(run)], cwd=str(run), env=cell_env,
@@ -860,6 +941,9 @@ def launch(run: Path, ws: Path, prompt: str, arm: dict, opts: dict, cfg: dict, h
                            timeout=opts["timeout_s"] + 300)
     except subprocess.TimeoutExpired:
         return prov, round(time.time() - began, 1), True
+    finally:
+        if proxy is not None:
+            proxy.stop()
     return prov, round(time.time() - began, 1), False
 
 

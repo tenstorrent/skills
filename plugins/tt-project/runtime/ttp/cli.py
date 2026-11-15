@@ -1327,7 +1327,7 @@ def _bench_blind_argv(argv: list[str]) -> list[str]:
     """`ttp bench blind <words...>`: the words are benchblind's own (prep, review, score, reveal and
     their options), so each rides as given in a hidden --blind-word=:<word> (the ':' keeps argparse from
     reading it as an option of `ttp bench`)."""
-    if argv[:2] != ["bench", "blind"]:
+    if argv[:2] not in (["bench", "blind"], ["bench", "reach"]):
         return argv
     words = argv[2:]
     return [*argv[:2], *(f"--blind-word=:{w}" for w in words)]
@@ -9161,6 +9161,31 @@ def _model_suite(p, a, now: float) -> None:
     print(json.dumps([{k: v for k, v in r.items() if k != "cell_rows"} for r in rows], indent=1))
 
 
+def _bench_reach(targets: list[str]) -> int:
+    """`ttp bench reach HOST:PORT ...`: a TCP connect to each target from inside cells built as the bench, the
+    daily bench, replay and the device shadow build theirs; exit 0 only when every target is unreachable from all."""
+    from . import benchrun
+    if not targets or targets[0] in ("-h", "--help"):
+        print("usage: ttp bench reach HOST:PORT [HOST:PORT ...]\n"
+              "Tries each target from inside real bench cells (own network namespace) and prints reachable or "
+              "unreachable per cell and target. Exit 0 only if every target is unreachable from every cell; "
+              "1 if one is reachable or a cell could not be built or answer; 2 for a bad target.")
+        return 0 if targets else 2
+    try:
+        rows, problems = benchrun.reach_probe(targets)
+    except benchrun.BenchError as e:
+        print(f"bench reach: {e}", file=sys.stderr)
+        return 2
+    for cell, target, verdict in rows:
+        print(f"{cell}: {target} {verdict}")
+    for p in problems:
+        print(f"problem: {p}", file=sys.stderr)
+    bad = [r for r in rows if r[2] != "unreachable"]
+    print("all unreachable from every cell" if rows and not bad and not problems
+          else f"{len(bad)} reachable, {len(problems)} problems: not proven")
+    return 0 if rows and not bad and not problems else 1
+
+
 def cmd_bench(a) -> None:
     """`ttp bench prep --since <date> --out <dir>`: pick the landed tasks a model comparison can
     replay, with clean base workspaces and held-out tests, model-free (bench.py)."""
@@ -9169,6 +9194,8 @@ def cmd_bench(a) -> None:
         if rc := benchblind.main([w[1:] for w in a.blind_word or []]):
             raise SystemExit(rc)
         return
+    if a.action == "reach":   # needs no project: a probe of the cell's own network
+        raise SystemExit(_bench_reach([w[1:] for w in a.blind_word or []]))
     from . import bench
     if a.action == "fair":   # read-only: each task's verdict in an existing prep folder
         if not a.bench:
@@ -15930,7 +15957,7 @@ def main(argv: list[str] | None = None) -> None:
                                       "that add tests, keeps the tests that fail on the base and pass on the head, "
                                       "builds a clean one-commit workspace at each base and holds out the landed "
                                       "test files, with a hash-pinned manifest")
-    s.add_argument("action", choices=["prep", "cells", "run", "blind", "fair", "daily", "replay"],
+    s.add_argument("action", choices=["prep", "cells", "run", "blind", "fair", "daily", "replay", "reach"],
                    help="daily: the day's landed code tasks of every project on this host through Sonnet, Opus and "
                         "an open model, blind-reviewed, into the running table (starts in the background); replay: "
                         "the offline replay of finished device and analysis tasks as sealed questions "
@@ -15940,7 +15967,8 @@ def main(argv: list[str] | None = None) -> None:
                         "--bench folder's small tasks in --out, with a hash-pinned cells.json; run: the head-to-head of two or more arms on --bench, "
                         "results and the blind review's cells.json in --out; blind: the blind review "
                         "(`ttp bench blind prep <run folder> --out <dir>`, then review, score, reveal; "
-                        "`ttp bench blind --help`)")
+                        "`ttp bench blind --help`); reach: `ttp bench reach HOST:PORT ...` tries a TCP connect to "
+                        "each target from inside real bench cells and exits 0 only if all are unreachable")
     s.add_argument("--blind-word", action="append", help=argparse.SUPPRESS)
     s.add_argument("--since", help="keep tasks created on or after this date (YYYY-MM-DD): the "
                                                   "later of the compared models' release dates")

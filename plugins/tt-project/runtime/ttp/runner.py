@@ -628,7 +628,7 @@ def supervise(run_dir: Path) -> int:
     err = open(run_dir / "stderr.log", "wb")
     nice = int(spec.get("nice") or 0)
     preexec, _ = _agent_preexec(nice)
-    bridge, launch_auth, pumps = None, False, []
+    bridge, launch_auth, pumps, netfwd = None, False, [], None
     try:
         if spec.get("bridge"):
             # The chat provider's loopback bridge: a thread of this process, so it ends with the run
@@ -645,6 +645,12 @@ def supervise(run_dir: Path) -> int:
             if spec.get("openai_env"):   # an OpenAI-compatible agent (a bench harness arm) uses the /v1 relay
                 env.update(bridge.openai_env())
             env["TTP_RUN_PROXY_PORT"] = bridge.url.rsplit(":", 1)[-1]   # runguard.py: the run's own proxy
+            if spec.get("cell_net"):   # the agent's cell has a network of its own: the bridge reaches it by a socket
+                from .cellnet import forward
+                try:
+                    netfwd = forward(spec["cell_net"]["bridge_sock"], "127.0.0.1", int(env["TTP_RUN_PROXY_PORT"]))
+                except OSError as e:
+                    raise OSError(f"the cell's bridge socket: {e}") from None
             from .chatbridge import SWAP_FILE   # live views show 'B (stand-in for A)' while the run goes on
             bridge.on_swap = lambda e: durable_write(run_dir / SWAP_FILE, json.dumps(e))
         # The stream guard reads the hook's marker before the agent starts: it could write one itself.
@@ -674,6 +680,8 @@ def supervise(run_dir: Path) -> int:
         # argv repeats, booked as a launch failure.
         if bridge is not None:
             bridge.stop()
+        if netfwd is not None:
+            netfwd.stop()
         for pump in pumps:
             os.close(pump.fd)
         for f in (prompt, out, err):
@@ -844,6 +852,8 @@ def supervise(run_dir: Path) -> int:
             print(f"runner: could not check the run's system prompt: {e}", flush=True)
     if bridge is not None:
         bridge.stop()
+    if netfwd is not None:
+        netfwd.stop()
     if guard is not None:   # a normal end: the watchdog leaves the group alone
         try:
             os.write(guard, b"done")

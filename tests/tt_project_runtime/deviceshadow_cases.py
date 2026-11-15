@@ -240,3 +240,74 @@ def test_device_shadow_runner_is_a_hidden_command():
     assert callable(cli.cmd_device_shadow)
     src = pathlib.Path(cli.__file__).read_text()
     assert '"device-shadow"' in src and "argparse.SUPPRESS" in src
+
+
+def test_device_shadow_cell_command_cannot_reach_a_host_listener(env, tmp_path):
+    # A shadow arm's cell has an empty network of its own: a service listening on the host's loopback is
+    # unreachable from a command in it by a raw socket and by urllib; the model calls are made outside.
+    import os
+    import subprocess
+    import sys
+    from ttp import benchrun, cellenv, deviceshadow
+    _any_namespace()
+    p = make(env)
+    tmp = tmp_path / "t"
+    ro, ws = tmp / "ro", tmp / "work"
+    (ro / "code").mkdir(parents=True)
+    ws.mkdir()
+    for args in (["init", "-q", "-b", "main"], ["-c", "user.name=a", "-c", "user.email=a@b", "commit", "-q",
+                                                "--allow-empty", "-m", "s"]):
+        subprocess.run(["git", "-C", str(ws), *args], check=True, capture_output=True)
+    cellenv.make(tmp / "venv", seed=())
+    opts = {"dry_run": True, "ro_binds": [str(ro)], "deny_tools": str(deviceshadow.deny_tools(tmp / "deny"))}
+    hidden = [pathlib.Path(p.root).resolve(), pathlib.Path(p.state).resolve()]
+    arm = {"provider": "claude", "model": "sonnet", "effort": "high", "harness": "mini-swe-agent"}
+    cell, problems = benchrun.isolate(tmp, ws, arm, opts, hidden, [str(p.root)])
+    assert problems == [], problems
+    host = _HostListener()
+    try:
+        script = tmp / "reach.py"
+        script.write_text(_REACH)
+        r = subprocess.run(cell.wrap([sys.executable, "-I", str(script), f"127.0.0.1:{host.port}"]), cwd=str(ws),
+                           capture_output=True, text=True, timeout=60, env={**os.environ, **cell.sets()})
+        assert r.stdout.strip() == "socket=unreachable urllib=unreachable", (r.stdout, r.stderr)
+    finally:
+        host.close()
+
+
+def test_device_shadow_claude_arm_on_mini_swe_agent_is_allowed_and_records_how_it_was_called(env, monkeypatch):
+    # A shadow arm {provider claude, model sonnet, effort high, harness mini-swe-agent} is kept as written (no
+    # chat-only check refuses it) and its run records the call its runner wrote to exit.json as `called`.
+    import pathlib
+    from ttp import benchrun, cellenv, deviceshadow
+    p = make(env)
+    cfg = _shadow_cfg(p)
+    cfg["route"]["device_ab_shadow"]["arms"][1]["harness"] = "mini-swe-agent"
+    s = deviceshadow.settings(cfg)
+    assert s["arms"]["sonnet-h"] == {"provider": "claude", "model": "sonnet", "effort": "high",
+                                     "harness": "mini-swe-agent"}
+    benchrun.check_harness("sonnet-h", s["arms"]["sonnet-h"])
+    tid = _dab_task(p)
+    p.config = lambda: cfg
+
+    class Cell:
+        conf = {}
+
+        def close(self):
+            pass
+    seen = {}
+
+    def launch(run_dir, ws, body, arm, opts, cfg_, hidden, cell_env, conf, logins, cell):
+        seen["arm"] = arm
+        pathlib.Path(run_dir).mkdir(parents=True, exist_ok=True)
+        (pathlib.Path(run_dir) / "exit.json").write_text(_json.dumps({"called": "claude 9.9 --system-prompt <prompt>"}))
+        (pathlib.Path(ws) / "handoff.md").write_text("## Commands\n`cat log` - read\n## Conclusion\nok")
+        return "claude", 1.0, False
+    monkeypatch.setattr(benchrun, "harness_ready", lambda kind, version="", root=None: {"dir": "x"})
+    monkeypatch.setattr(benchrun, "isolate", lambda *a, **k: (Cell(), []))
+    monkeypatch.setattr(benchrun, "launch", launch)
+    monkeypatch.setattr(cellenv, "make", lambda *a, **k: pathlib.Path("/nonexistent-venv"))
+    monkeypatch.setattr(cellenv, "env", lambda *a, **k: {})
+    got = deviceshadow.run(p, tid, "sonnet-h")
+    assert got["status"] == "done" and got["called"] == "claude 9.9 --system-prompt <prompt>", got
+    assert seen["arm"]["provider"] == "claude" and seen["arm"]["harness"] == "mini-swe-agent"

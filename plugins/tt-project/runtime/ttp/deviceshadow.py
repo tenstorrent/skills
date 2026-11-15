@@ -21,9 +21,10 @@ its scratch folder is the only writable path; ssh, scp, rsync, ttp, sudo, gh, cu
 refusing stand-ins that also cover the system copies; no credential, forge token or ssh agent is in its
 environment. It holds no lock and names no resource, takes no task row and no label the A/B counts, so it is in
 none of the A/B's counts or stop rules, and its failure never reaches the live task.
-Limits, recorded on each run: the namespace shares the host's network (the chat bridge listens on the host and
-the model needs it; the stand-ins refuse the usual clients but a script in the cell could still open a socket);
-logs that exist only on a remote box are out of reach.
+The cell has a network namespace of its own, empty but for loopback: nothing the host listens on is reachable
+from it, whatever client a script uses. The model calls are made outside it (the chat bridge, the claude CLI) and
+reach the agent through a socket in the cell's folder (cellnet.py).
+Limits, recorded on each run: logs that exist only on a remote box are out of reach.
 
 After the live task ends one blind review per shadow (the A/B's masked-review pattern, Opus high, and with a
 `second_reviewer` one more by it, same masked inputs and rubric) scores how well the plan and conclusion agree
@@ -57,8 +58,8 @@ STATE_TASKS, STATE_EVENTS, STATE_RUNS, STATE_LOGS, LOG_TAIL = 150, 400, 60, 30, 
 DENIED = ("ssh", "scp", "sftp", "ssh-add", "rsync", "ttp", "sudo", "su", "doas", "gh", "curl", "wget", "nc", "ncat",
           "netcat", "socat", "telnet", "ftp", "docker", "podman", "kubectl", "systemctl", "reboot", "shutdown",
           "poweroff", "ipmitool", "tt-smi", "tt-flash", "tt-topology", "tt-burnin", "tt-triage", "tt-metal-run")
-LIMITS = ("the namespace shares the host's network (the chat bridge needs it); the usual clients are refused but "
-          "a script could open a socket", "logs that exist only on a remote box are out of reach")
+LIMITS = ("the cell has a network namespace of its own (loopback only): the model calls are made outside it and "
+          "reach it by a socket", "logs that exist only on a remote box are out of reach")
 SECRET = re.compile(
     r"(?is)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----"
     r"|\b(?:ghp|gho|ghs|ghu|github_pat|glpat|xox[abprs]|sk|AKIA|AIza)[-_A-Za-z0-9]{12,}"
@@ -265,7 +266,7 @@ def run(p, task_id: int, arm_name: str) -> dict:
         return record(p.db, task_id, arm_name, status="error", ended=time.time(), error="off, no such arm or task")
     a = s["arms"][arm_name]
     tmp = Path(tempfile.mkdtemp(prefix="shadow-"))
-    status, err, spend, handoff, called = "error", "", {}, "", ""
+    status, err, spend, handoff, called, cell = "error", "", {}, "", "", None
     try:
         ro, ws = tmp / "ro", tmp / "work"
         paths = {str(Path(p.root).resolve()): str(ro / "code"), str(Path(p.state).resolve()): str(ro / "state"),
@@ -308,6 +309,8 @@ def run(p, task_id: int, arm_name: str) -> dict:
     except Exception as e:   # the shadow never reaches the live task: it is recorded and ends
         err = f"{type(e).__name__}: {e}"[:400]
     finally:
+        if cell is not None:
+            cell.close()
         shutil.rmtree(tmp, ignore_errors=True)
     ended = time.time()
     return record(p.db, task_id, arm_name, status=status, ended=ended, minutes=round((ended - began) / 60, 1),

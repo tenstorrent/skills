@@ -7,10 +7,14 @@ Arguments, before `--`: `--root=<dir>` (an existing folder: the new root is a tm
 plan, one word each: `--ro=<src>:<dst>`, `--bind=<src>:<dst>` (a folder or a file), `--tmpfs=<dst>`,
 `--symlink=<target>:<dst>`, `--set=<name>=<value>`, `--unset=<name>`, `--chdir=<dir>`. /proc (the PID
 namespace's own) and a minimal /dev (null, zero, full, random, urandom, tty and /dev/shm) are always made.
-After the mounts it chroots into the new root and drops every capability, so nothing in the cell can mount."""
+The network namespace is the caller's (`unshare --net`): it holds only a loopback, brought up here before the
+capabilities go. After the mounts it chroots into the new root and drops every capability, so nothing in the cell can mount."""
 import ctypes
+import fcntl
 import os
 import signal
+import socket
+import struct
 import sys
 
 RESET = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT, signal.SIGPIPE)
@@ -27,6 +31,14 @@ def mount(src, dst, fstype, flags, data=None):
                    data.encode() if data else None)
     if r != 0:
         raise OSError(ctypes.get_errno(), f"mount {src or fstype} on {dst}: {os.strerror(ctypes.get_errno())}")
+
+
+def loopback_up() -> None:
+    """Bring `lo` up in the cell's own network namespace (the kernel makes it down); needs CAP_NET_ADMIN in it."""
+    SIOCGIFFLAGS, SIOCSIFFLAGS, IFF_UP = 0x8913, 0x8914, 1
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        flags = struct.unpack("16sH14x", fcntl.ioctl(s, SIOCGIFFLAGS, struct.pack("16sH14x", b"lo", 0)))[1]
+        fcntl.ioctl(s, SIOCSIFFLAGS, struct.pack("16sH14x", b"lo", flags | IFF_UP))
 
 
 def make_target(path: str, folder: bool) -> None:
@@ -117,6 +129,7 @@ def main(argv: list) -> int:
         print("cellns_init: no root or no command", file=sys.stderr)
         return 2
     try:
+        loopback_up()
         build(root, plan)
         os.chroot(root)
         os.chdir(chdir)

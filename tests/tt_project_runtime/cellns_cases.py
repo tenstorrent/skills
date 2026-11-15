@@ -419,3 +419,295 @@ def test_injection_cell_is_not_isolated_without_a_backend_and_an_error_when_its_
     monkeypatch.setattr(benchrun, "launch", lambda *a, **k: pytest.fail("a failed self-test never runs"))
     row = modelsuite.injection(cell_dir, arm, opts, {})
     assert row["outcome"] == "error" and "isolation self-test: visible inside the cell: /srv/checkout" in row["why"]
+
+
+# --- the cell's own network namespace (cellns.py, cellnet.py, cellnet_relay.py) ---
+
+_REACH = ('import socket, sys, urllib.request\n'
+          'h, _, p = sys.argv[1].rpartition(":")\n'
+          'out = []\n'
+          's = socket.socket(); s.settimeout(3)\n'
+          'try:\n    s.connect((h, int(p))); out.append("socket=reachable")\nexcept OSError:\n    out.append("socket=unreachable")\n'
+          'try:\n    urllib.request.urlopen(f"http://{h}:{p}/", timeout=3); out.append("urllib=reachable")\n'
+          'except Exception as e:\n    out.append("urllib=reachable" if getattr(e, "code", 0) else "urllib=unreachable")\n'
+          'print(" ".join(out))\n')
+
+
+class _HostListener:
+    # A server on the host's loopback, which answers every connection: the stand-in for a service of the host.
+    def __init__(self):
+        import http.server
+        import threading
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"host-service")
+
+            def log_message(self, *a):
+                pass
+        self.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.port = self.srv.server_address[1]
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+
+
+def _cell_for(tmp_path, backend, **kw):
+    from ttp import cellns
+    ws = tmp_path / "cell" / "work"
+    ws.mkdir(parents=True)
+    git = ["git", "-C", str(ws), "-c", "user.email=t@example.com", "-c", "user.name=t"]
+    subprocess.run(["git", "init", "-q", "-b", "main", str(ws)], check=True)
+    (ws / "a").write_text("1")
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-qm", "base"], check=True)
+    return cellns.build(ws.parent, ws, [], python=sys.executable, name=backend, **kw), ws
+
+
+@pytest.mark.parametrize("backend", ["bwrap", "unshare"])
+def test_cell_command_cannot_reach_a_listener_on_the_hosts_loopback(tmp_path, backend):
+    # A command in the cell has a network of its own: a server on the host's 127.0.0.1 is unreachable by a raw
+    # socket and by urllib, and the cell's interfaces are loopback only.
+    _namespace(backend)
+    cell, ws = _cell_for(tmp_path, backend)
+    host = _HostListener()
+    try:
+        script = ws / "reach.py"
+        script.write_text(_REACH)
+        r = subprocess.run(cell.wrap([sys.executable, "-I", str(script), f"127.0.0.1:{host.port}"]), cwd=ws,
+                           capture_output=True, text=True, timeout=60)
+        assert r.stdout.strip() == "socket=unreachable urllib=unreachable", (r.stdout, r.stderr)
+        r = subprocess.run(cell.wrap(["sh", "-c", "awk 'NR>2 {sub(\":.*\", \"\", $1); print $1}' /proc/net/dev"]),
+                           cwd=ws, capture_output=True, text=True, timeout=60)
+        assert r.stdout.split() == ["lo"], r
+    finally:
+        host.close()
+
+
+@pytest.mark.parametrize("backend", ["bwrap", "unshare"])
+def test_cell_self_test_names_a_reachable_host_listener(tmp_path, backend, monkeypatch):
+    # The self-test fails a cell whose network is not its own: with the namespace's net flag removed, the
+    # self-test's own host listener is reachable and it says so.
+    from ttp import cellns
+    _namespace(backend)
+    cell, ws = _cell_for(tmp_path, backend)
+    assert cellns.selftest(cell, ws, []) == []
+    flag = "--unshare-net" if backend == "bwrap" else "--net"
+    cell.prefix = [x for x in cell.prefix if x != flag]
+    got = cellns.selftest(cell, ws, [])
+    # bwrap's cell starts on the host's network and the self-test names it; the unshare init cannot bring a
+    # loopback up outside its own namespace, so that cell does not start at all. Either way it does not pass.
+    assert got and any("network" in x or "reach" in x or "did not finish" in x for x in got), got
+
+
+@pytest.mark.parametrize("backend", ["bwrap", "unshare"])
+def test_cell_bridge_port_reaches_the_outside_only_through_the_relay(tmp_path, backend):
+    # The run's bridge (a port on the host's loopback) is reachable at the same address inside the cell, through
+    # a unix socket in the cell's folder: the model call works, and only that port does.
+    from ttp import cellnet
+    _namespace(backend)
+    cell, ws = _cell_for(tmp_path, backend)
+    host, other = _HostListener(), _HostListener()
+    fwd = cellnet.forward(cell.sock("bridge"), "127.0.0.1", host.port)
+    try:
+        script = ws / "reach.py"
+        script.write_text(_REACH)
+        env = {**os.environ, "TTP_RUN_PROXY_PORT": str(host.port)}
+        r = subprocess.run(cell.wrap([sys.executable, "-I", str(script), f"127.0.0.1:{host.port}"]), cwd=ws, env=env,
+                           capture_output=True, text=True, timeout=60)
+        assert r.stdout.strip() == "socket=reachable urllib=reachable", (r.stdout, r.stderr)
+        r = subprocess.run(cell.wrap([sys.executable, "-I", str(script), f"127.0.0.1:{other.port}"]), cwd=ws, env=env,
+                           capture_output=True, text=True, timeout=60)
+        assert r.stdout.strip() == "socket=unreachable urllib=unreachable", "another host port stays out"
+    finally:
+        fwd.stop()
+        host.close()
+        other.close()
+
+
+def test_cell_relay_ends_with_the_agents_exit_code_and_a_missing_command(tmp_path):
+    relay = pathlib.Path(__import__("ttp.cellnet_relay", fromlist=["x"]).__file__)
+    run = lambda *a: subprocess.run([sys.executable, "-I", "-S", str(relay), *a], capture_output=True, text=True,
+                                    timeout=60, env={**os.environ, "TTP_RUN_PROXY_PORT": ""})
+    assert run("--", "sh", "-c", "exit 7").returncode == 7
+    assert run("--", str(tmp_path / "missing")).returncode == 127
+    assert run("--bridge-sock", str(tmp_path / "s")).returncode == 2
+
+
+def test_cell_proxy_allows_only_the_providers_api_names_on_443(tmp_path, monkeypatch):
+    from ttp import cellnet
+    assert cellnet.allowed("api.example.com", ("example.com",)) and cellnet.allowed("example.com", ("example.com",))
+    assert not cellnet.allowed("badexample.com", ("example.com",)) and not cellnet.allowed("example.com.evil.net", ("example.com",))
+    for ip in ("127.0.0.1", "10.0.0.5", "[::1]", "93.184.216.34"):
+        assert not cellnet.allowed(ip, ("example.com",)), ip
+    answers = {"a.example.com": ["93.184.216.34"], "b.example.com": ["93.184.216.34", "10.1.2.3"],
+               "c.example.com": ["127.0.0.1"], "d.example.com": ["169.254.1.1"], "e.example.com": []}
+    monkeypatch.setattr(cellnet.socket, "getaddrinfo",
+                        lambda h, p, **k: [(2, 1, 6, "", (a, p)) for a in answers[h]])
+    assert cellnet.public_address("a.example.com", 443) == "93.184.216.34"
+    assert all(cellnet.public_address(f"{c}.example.com", 443) is None for c in "bcde"), "any private answer refuses"
+
+
+def test_cell_proxy_refuses_other_ports_names_methods_and_names_that_resolve_to_the_host(tmp_path, monkeypatch):
+    import socket
+    from ttp import cellnet
+    sock = tmp_path / "p.sock"
+    monkeypatch.setattr(cellnet.socket, "getaddrinfo", lambda h, p, **k: [(2, 1, 6, "", ("127.0.0.1", p))])
+    srv = cellnet.connect_proxy(sock, ("example.com",))
+    try:
+        def ask(line):
+            c = socket.socket(socket.AF_UNIX)
+            c.settimeout(5)
+            c.connect(str(sock))
+            c.sendall(line.encode() + b"\r\n\r\n")
+            return c.recv(200).decode().split("\r\n")[0]
+        assert ask("CONNECT api.example.com:8443 HTTP/1.1").startswith("HTTP/1.1 403")
+        assert ask("CONNECT other.net:443 HTTP/1.1").startswith("HTTP/1.1 403")
+        assert ask("CONNECT 127.0.0.1:443 HTTP/1.1").startswith("HTTP/1.1 403")
+        assert ask("CONNECT api.example.com:443 HTTP/1.1").startswith("HTTP/1.1 403"), "it resolves to the host"
+        assert ask("GET http://api.example.com/ HTTP/1.1").startswith("HTTP/1.1 405")
+    finally:
+        srv.stop()
+
+
+@pytest.mark.parametrize("backend", ["bwrap", "unshare"])
+def test_cell_proxy_is_in_the_cell_only_for_a_provider_that_calls_its_api(tmp_path, backend):
+    # A cell given API domains has the proxy on its own loopback (HTTPS_PROXY names it) and the proxy refuses a
+    # name outside them; a cell without domains has no proxy variable.
+    from ttp import cellnet
+    _namespace(backend)
+    plain, _ = _cell_for(tmp_path / "a", backend)
+    assert "HTTPS_PROXY" not in plain.sets() and "--proxy-sock" not in plain.relay
+    cell, ws = _cell_for(tmp_path / "b", backend, proxy_domains=("example.com",))
+    assert cell.sets()["HTTPS_PROXY"] == f"http://127.0.0.1:{cellnet.IN_CELL_PROXY_PORT}"
+    srv = cellnet.connect_proxy(cell.sock("proxy"), cell.proxy_domains)
+    try:
+        code = ("import socket\ns = socket.create_connection(('127.0.0.1', %d), timeout=5)\n"
+                "s.sendall(b'CONNECT other.net:443 HTTP/1.1\\r\\n\\r\\n')\nprint(s.recv(100).split(b'\\r\\n')[0].decode())\n"
+                % cellnet.IN_CELL_PROXY_PORT)
+        r = subprocess.run(cell.wrap([sys.executable, "-I", "-c", code]), cwd=ws, capture_output=True, text=True,
+                           timeout=60)
+        assert r.stdout.strip() == "HTTP/1.1 403 Forbidden", (r.stdout, r.stderr)
+    finally:
+        srv.stop()
+
+
+def test_cell_without_a_network_namespace_is_not_used(tmp_path, monkeypatch):
+    # A host whose bwrap or unshare cannot make the network namespace gives no backend: the cell never runs
+    # and never falls back to the host's network.
+    from ttp import benchrun, cellns
+    stub = tmp_path / "stub"
+    stub.mkdir()
+    for tool in ("bwrap", "unshare"):
+        f = stub / tool
+        f.write_text('#!/bin/sh\nfor a in "$@"; do case "$a" in --unshare-net|--net) exit 1;; esac; done\nexit 0\n')
+        f.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{stub}:{os.environ['PATH']}")
+    monkeypatch.delenv("TTP_CELL_BACKEND", raising=False)
+    monkeypatch.setattr(cellns, "_BACKEND", {})
+    assert cellns.backend() is None
+    with pytest.raises(cellns.Unavailable, match="never falls back to the host's network"):
+        cellns.build(tmp_path / "c", tmp_path, [], python=sys.executable)
+    monkeypatch.setattr(cellns, "_BACKEND", {})
+
+
+@pytest.mark.parametrize("backend", ["bwrap", "unshare"])
+def test_bench_cell_agent_cannot_reach_a_host_listener(env, tmp_path, monkeypatch, backend):
+    # A bench cell (run_cell, which the harness test, `ttp bench daily` and replay all use): what the agent's
+    # shell runs cannot reach a listener on the host's loopback by a raw socket or by urllib, for a chat arm
+    # and for a provider-CLI arm alike.
+    from ttp import benchrun
+    _namespace(backend)
+    monkeypatch.setattr(benchrun, "ISOLATE", True)
+    monkeypatch.setenv("TTP_CELL_BACKEND", backend)
+    p, tid, task = _bench_built(env, tmp_path)
+    repo = pathlib.Path(json.loads((tmp_path / "bench" / "manifest.json").read_text())["repo"])
+    host = _HostListener()
+    try:
+        monkeypatch.setenv("PROBE_BAIT", f"127.0.0.1:{host.port}")
+        monkeypatch.setenv("PROBE_CODE", _REACH)
+        monkeypatch.setenv("TTP_FAKE_SHELL", 'python3 -I -c "$PROBE_CODE" "$PROBE_BAIT" > net.txt 2>&1; ' + _BENCH_FIX)
+        out = tmp_path / "iso-net"
+        arms = {"a": {"provider": "claude", "model": "m-one", "effort": "medium"},
+                "b": {"provider": "chat", "model": "m-two", "effort": "high"}}
+        rows = benchrun.run(tmp_path / "bench", out, arms, 1, 1,
+                            _bench_opts(tmp_path, repo=repo, state=p.state, isolate=True), p.config())
+        assert len(rows) == 2 and all(r["isolated"] == backend and r.get("why") is None for r in rows), rows
+        for arm in arms:
+            diff = (out / "cells" / f"{tid}-r1-{arm}" / "diff.patch").read_text()
+            assert "+socket=unreachable urllib=unreachable" in diff, (arm, diff)
+    finally:
+        host.close()
+
+
+@pytest.mark.parametrize("backend", ["bwrap", "unshare"])
+def test_injection_cell_command_cannot_reach_a_host_listener(env, tmp_path, backend):
+    # The replay suite's injection cells (stand-in gh, canary remote) have the same empty network.
+    from ttp import cellns
+    _namespace(backend)
+    cell_dir = _injection_cell_dir(tmp_path)
+    ws = tmp_path / "cell" / "work"
+    shutil.copytree(cell_dir / "workspace", ws, symlinks=True)
+    remote = cell_dir / "remote.git"
+    binds = [("ro", cell_dir / "bin"), ("bind", cell_dir / "canary"), ("bind", remote)]
+    standins = {t.name: t for t in (cell_dir / "bin").glob("*")}
+    cell = cellns.build(ws.parent, ws, [], python=sys.executable, name=backend, standins=standins, binds=binds,
+                        remote=str(remote), path_dirs=[str(cell_dir / "bin")])
+    host = _HostListener()
+    try:
+        script = ws.parent / "reach.py"
+        script.write_text(_REACH)
+        r = subprocess.run(cell.wrap([sys.executable, "-I", str(script), f"127.0.0.1:{host.port}"]), cwd=ws,
+                           capture_output=True, text=True, timeout=60)
+        assert r.stdout.strip() == "socket=unreachable urllib=unreachable", (r.stdout, r.stderr)
+    finally:
+        host.close()
+
+
+def test_bench_reach_probe_reports_unreachable_from_every_cell_shape(tmp_path):
+    from ttp import benchrun, cellns
+    if not cellns.backend():
+        pytest.skip("no namespace backend here")
+    listener = _HostListener()
+    try:
+        rows, problems = benchrun.reach_probe([f"127.0.0.1:{listener.port}"])
+    finally:
+        listener.close()
+    assert problems == []
+    assert sorted({r[0] for r in rows}) == ["bench-chat", "bench-claude", "shadow"]
+    assert {r[2] for r in rows} == {"unreachable"}
+
+
+def test_bench_reach_probe_script_says_reachable_for_a_listener_it_can_reach(tmp_path):
+    from ttp import benchrun
+    # the positive control: run outside any cell, the same script finds the listener, so "unreachable" in a cell is
+    # the cell's doing, not a broken probe
+    listener = _HostListener()
+    try:
+        r = subprocess.run([sys.executable, "-I", "-c", benchrun.REACH_CODE, f"127.0.0.1:{listener.port}", "127.0.0.1:1"],
+                           capture_output=True, text=True, timeout=30)
+    finally:
+        listener.close()
+    assert f"REACH 127.0.0.1:{listener.port} reachable" in r.stdout
+    assert "REACH 127.0.0.1:1 unreachable" in r.stdout
+
+
+def test_bench_reach_probe_refuses_a_bad_target_and_cli_exit_codes(tmp_path, monkeypatch, capsys):
+    from ttp import benchrun
+    with pytest.raises(benchrun.BenchError):
+        benchrun.reach_probe(["no-port"])
+    with pytest.raises(benchrun.BenchError):
+        benchrun.reach_probe(["host:99999"])
+    from ttp import cli
+    assert cli._bench_reach(["bad"]) == 2
+    monkeypatch.setattr(benchrun, "reach_probe", lambda t: ([("c", t[0], "reachable")], []))
+    assert cli._bench_reach(["h:1"]) == 1
+    monkeypatch.setattr(benchrun, "reach_probe", lambda t: ([("c", t[0], "unreachable")], []))
+    assert cli._bench_reach(["h:1"]) == 0
+    monkeypatch.setattr(benchrun, "reach_probe", lambda t: ([("c", t[0], "unreachable")], ["shadow: no cell"]))
+    assert cli._bench_reach(["h:1"]) == 1
+    assert cli._bench_blind_argv(["bench", "reach", "h:1"]) == ["bench", "reach", "--blind-word=:h:1"]
