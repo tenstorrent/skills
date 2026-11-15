@@ -596,6 +596,7 @@ def detach(argv: list[str], day: str, project_root: Path, root: Path | None = No
     env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parent.parent) + os.pathsep
            + os.environ.get("PYTHONPATH", "")}
     with open(log, "ab") as lf:
+        # own session: the bench run outlives the caller that started it and is not stopped with it
         subprocess.Popen([sys.executable, "-m", "ttp", "bench", command, "--here", *argv], cwd=project_root, env=env,
                          stdin=subprocess.DEVNULL, stdout=lf, stderr=subprocess.STDOUT, start_new_session=True)
     return True, log

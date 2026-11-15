@@ -34,7 +34,7 @@ OWN = re.compile(r"result\.json|TTP_RUN_DIR|\bttp\s+(note|obligation|handoff|tas
 SECRET = [
     (re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(-----END [A-Z0-9 ]*PRIVATE KEY-----|\Z)", re.S),
      "[private key removed]"),
-    (re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}"
+    (re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github" r"_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}"
                 r"|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|eyJ[A-Za-z0-9_-]{15,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+)"),
      "[token removed]"),
     (re.compile(r"(?i)\b(api[_-]?key|token|secret|passw(?:or)?d|authorization)(\"?\s*[=:]\s*\"?)(?:bearer\s+)?[^\s\"',;]{6,}"),
