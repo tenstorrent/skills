@@ -36,6 +36,7 @@ LANDED_MIN = 3       # requirements and correctness each at least this, on the 0
 PARALLEL = 3         # tasks run at once
 ARMS = ("sonnet=claude:sonnet:high", "opus=claude:opus:high")
 GLM_ARM = "glm=chat:zai-org/GLM-5.3:max"
+GLM_HARNESS = "mini-swe-agent"   # the open-model arm's default agent: the winner of the harness A/B (bridge: 'claude')
 REVIEWER = ("claude", "opus", "high")
 LOOKBACK_DAYS = 21   # a task created this long before the day may still land on it
 TZ = "America/Los_Angeles"
@@ -496,8 +497,11 @@ def write_table(root: Path | None = None) -> dict:
 
 # -- the day
 
-def parse_arms(extra: list[str] | None, glm_harness: str = "") -> dict:
-    texts = list(extra) if extra else [*ARMS, GLM_ARM + (f":{glm_harness}" if glm_harness else "")]
+def parse_arms(extra: list[str] | None, glm_harness: str | None = None) -> dict:
+    """The arms by name. The open-model arm runs on `glm_harness` (None: GLM_HARNESS; "" or "claude": the Claude
+    Code bridge; opencode, mini-swe-agent); `extra` (--arm texts) replaces the whole list."""
+    harness = GLM_HARNESS if glm_harness is None else (glm_harness or "claude")
+    texts = list(extra) if extra else [*ARMS, f"{GLM_ARM}:{harness}"]
     return dict(benchrun.parse_arm(x) for x in texts)
 
 

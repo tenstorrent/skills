@@ -1388,7 +1388,9 @@ state. Each task runs with each arm under the cell isolation and limit above. A 
 blind review (the main grade; arm hidden) scores requirements and correctness at 3 or more; a
 time-limit stop is a fail. `--cap-usd` bounds Claude spend (arm runs plus reviews) from a running
 total: at the cap no task is added and the skipped ones are recorded; when more tasks fit than the
-budget, a random sample spreads across projects. GLM spend is reported apart. Under
+budget, a random sample spreads across projects. GLM spend is reported apart. The open-model arm runs on mini-swe-agent (the harness A/B's winner) unless
+`--glm-harness` or `bench.daily.glm_harness` names another (`claude` is the bridge, `opencode`); `--arm` replaces the
+whole arm list, and the table names each arm's harness. Under
 `~/.tt-project/model-bench/daily/` each run leaves its day's json and a `table.md`, recomputed from
 every day: per project and per model, N, landed k/N, mean requirements and correctness, dollars and
 minutes per task and time-limit stops, plus what it did not cover.

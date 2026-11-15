@@ -9213,7 +9213,7 @@ def _bench_daily(p, a) -> None:
     try:
         day, start, end = benchdaily.window(a.day, tz=tz)
         arms = benchdaily.parse_arms(a.arm or conf.get("arms"), a.glm_harness if a.glm_harness is not None
-                                     else conf.get("glm_harness", ""))
+                                     else conf.get("glm_harness"))
     except (ValueError, KeyError, OSError, benchrun.BenchError) as e:
         die(f"bench daily: {e}")
     cap = a.cap_usd if a.cap_usd is not None else float(conf.get("cap_usd", benchdaily.CAP_USD))
@@ -9255,7 +9255,7 @@ def _bench_replay(p, a) -> None:
     conf = (p.config().get("bench") or {}).get("daily") or {}
     try:
         arms = benchdaily.parse_arms(a.arm or conf.get("arms"), a.glm_harness if a.glm_harness is not None
-                                     else conf.get("glm_harness", ""))
+                                     else conf.get("glm_harness"))
     except (ValueError, KeyError, OSError, benchrun.BenchError) as e:
         die(f"bench replay: {e}")
     cap = a.cap_usd if a.cap_usd is not None else float(benchreplay.CAP_USD)
@@ -15945,8 +15945,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--tz", help="daily: the zone the day is read in (default: bench.daily.tz, else the built-in one)")
     s.add_argument("--cap-usd", type=float, help="daily: the day's Claude spend cap, arm runs plus reviews "
                    "(default: bench.daily.cap_usd, else 40)")
-    s.add_argument("--glm-harness", help="daily: the harness the open-model arm runs on ('' = the claude bridge, "
-                   "opencode, mini-swe-agent; default: bench.daily.glm_harness)")
+    s.add_argument("--glm-harness", help="daily, replay: the harness the open-model arm runs on (claude = the Claude Code "
+                   "bridge, opencode, mini-swe-agent; default: bench.daily.glm_harness, else mini-swe-agent)")
     s.add_argument("--parallel", type=int, default=0, help="daily, replay: tasks run at once (default 3)")
     s.add_argument("--cell-budget", type=float, default=0, help="daily, replay: dollar budget per arm run")
     s.add_argument("--max-lines", type=int, default=0, help="daily: drop landed changes over this many non-test lines")

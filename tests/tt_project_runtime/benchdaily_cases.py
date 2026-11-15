@@ -44,6 +44,18 @@ def test_daily_pick_keeps_the_days_landed_code_tasks_from_their_real_base_and_dr
     assert benchdaily.landed_in_window(ro, since + 100_000, since + 200_000) == 0
 
 
+def test_daily_glm_arm_runs_on_mini_swe_agent_by_default_and_the_harness_is_configurable():
+    from ttp import benchdaily
+    arms = benchdaily.parse_arms(None)
+    assert arms["glm"]["harness"] == "mini-swe-agent"
+    assert [a for a in arms if a != "glm"] == [a for a in benchdaily.parse_arms(None, "claude") if a != "glm"]
+    assert benchdaily.parse_arms(None, "opencode")["glm"]["harness"] == "opencode"
+    assert benchdaily.parse_arms(None, "claude")["glm"].get("harness") in ("claude", "", None)
+    assert benchdaily.parse_arms(None, "")["glm"].get("harness") in ("claude", "", None)
+    only = benchdaily.parse_arms(["x=chat:m:high"])
+    assert list(only) == ["x"]
+
+
 def test_daily_window_defaults_to_yesterday_in_the_home_zone_and_a_cap_cuts_a_fair_sample():
     from ttp import benchdaily
     day, start, end = benchdaily.window(None, now=1_700_000_000.0)    # 2023-11-14 14:13 PST
