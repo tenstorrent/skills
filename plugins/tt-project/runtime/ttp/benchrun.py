@@ -1112,8 +1112,8 @@ def run(bench_dir: Path, out: Path, arms: dict, reps: int, seed: int, opts: dict
         limit: int = 0, only: list[int] | None = None) -> list[dict]:
     """Run every cell of the plan not yet in <out>/results.jsonl; returns the rows this call added.
     `only`: just these bench tasks."""
-    if len(arms) < 2:
-        raise BenchError("a head-to-head needs at least two arms")
+    if not arms:
+        raise BenchError("a run needs at least one arm (--arm name=provider:model:effort)")
     if bad := [a for a in arms if not re.fullmatch(r"[A-Za-z0-9_.-]+", a)]:
         raise BenchError(f"arm names take letters, digits, '.', '_' and '-' only: {bad}")
     for name, arm in arms.items():

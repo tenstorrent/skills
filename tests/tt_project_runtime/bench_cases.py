@@ -653,7 +653,7 @@ def test_bench_run_arms_parse_and_need_two(tmp_path):
     assert len({tuple(c["arm"] for c in s[i:i + 2]) for i in range(0, len(s), 2)}) == 2, "both orders occur"
 
 
-def test_bench_run_cli_dry_run_takes_arms_from_the_command_line_and_refuses_one_arm(env, tmp_path, monkeypatch, capsys):
+def test_bench_run_cli_dry_run_takes_arms_from_the_command_line_and_runs_one_arm_but_refuses_none(env, tmp_path, monkeypatch, capsys):
     from ttp import cli
     p, tid, task = _bench_built(env, tmp_path)
     monkeypatch.setenv("TTP_PROJECT", str(p.base))   # the test's project, never the one around the checkout
@@ -666,7 +666,10 @@ def test_bench_run_cli_dry_run_takes_arms_from_the_command_line_and_refuses_one_
     assert "2 cell(s) run, seed 3" in text
     with pytest.raises(SystemExit) as e:
         cli.main([*base, "--out", str(tmp_path / "o2")])
-    assert e.value.code not in (0, None) and "at least two arms" in capsys.readouterr().err
+    assert e.value.code not in (0, None) and "at least one arm" in capsys.readouterr().err
+    cli.main([*base, "--out", str(tmp_path / "o3"), "--arm", "solo=chat:m2:max"])   # one model alone, no head-to-head
+    text = capsys.readouterr().out
+    assert f"task {tid} rep 1 solo: pass" in text and "1 cell(s) run, seed 3" in text
 
 
 def test_bench_run_cell_that_reads_the_source_repo_or_provider_caches_is_flagged_and_gets_no_runtime_path(env, tmp_path, monkeypatch):
