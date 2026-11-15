@@ -75,6 +75,18 @@ def test_claude_cli_render_keeps_the_system_prompt_byte_for_byte_and_round_trips
     assert json.loads(calls[0]["function"]["arguments"]) == {"command": 'echo "<b>x</b>"'}
     text, calls = claudebridge.parse_reply('<tool_call name="other">\nx\n</tool_call>', [_CB_BASH_TOOL])
     assert calls == [] and "other" in text
+    # a reply in the XML call form the model is trained on (no tool_call block) is read as its calls, in order;
+    # an unknown tool stays text, and a reply that has our blocks is not read twice
+    text, calls = claudebridge.parse_reply(
+        'Now.\n\n<invoke name="bash">\n<parameter name="command">cd x && ls</parameter>\n</invoke>\n'
+        '<invoke name="bash">\n<parameter name="command">pwd</parameter>\n</invoke>', [_CB_BASH_TOOL])
+    assert text == "Now." and [json.loads(c["function"]["arguments"]) for c in calls] == [{"command": "cd x && ls"}, {"command": "pwd"}]
+    assert [c["id"] for c in calls] == ["call_1", "call_2"]
+    text, calls = claudebridge.parse_reply('<invoke name="other">\n<parameter name="a">b</parameter>\n</invoke>', [_CB_BASH_TOOL])
+    assert calls == [] and "other" in text
+    _, calls = claudebridge.parse_reply('<tool_call name="bash">\nls\n</tool_call>\n'
+                                        '<invoke name="bash"><parameter name="command">pwd</parameter></invoke>', [_CB_BASH_TOOL])
+    assert [json.loads(c["function"]["arguments"]) for c in calls] == [{"command": "ls"}]
 
 
 def test_claude_cli_render_blocks_only_grow_so_each_call_reuses_the_previous_calls_prompt_cache():

@@ -167,6 +167,9 @@ def _unwrap(body: str, single: str) -> str:
 
 _BLOCK = re.compile(r'<tool_call(?P<attrs>[^>]*)>\n?(?P<body>.*?)\n?</tool_call>', re.DOTALL)
 _NAME = re.compile(r'name="([^"]*)"')
+# The XML call form the CLI's models are trained on: <invoke name="x"><parameter name="p">v</parameter></invoke>
+_INVOKE = re.compile(r'<invoke\s+name="(?P<name>[^"]*)"\s*>(?P<body>.*?)</invoke>', re.DOTALL)
+_PARAM = re.compile(r'<parameter\s+name="([^"]*)"\s*>(.*?)</parameter>', re.DOTALL)
 
 
 def parse_reply(text: str, tools: list[dict]) -> tuple[str, list[dict]]:
@@ -174,6 +177,24 @@ def parse_reply(text: str, tools: list[dict]) -> tuple[str, list[dict]]:
     is left as text for the agent to meet (its format error), never dropped."""
     singles = {(t.get("function") or {}).get("name"): _single_string(t.get("function") or {}) for t in tools or ()}
     calls, n = [], 0
+
+    def take_invoke(m: re.Match) -> str:
+        nonlocal n
+        name = m.group("name")
+        if name not in singles:
+            return m.group(0)
+        params = {k: v.strip("\n") for k, v in _PARAM.findall(m.group("body"))}
+        single = singles[name]
+        if single:
+            if single not in params and len(params) != 1:
+                return m.group(0)
+            args = {single: params.get(single, next(iter(params.values()), ""))}
+        else:
+            args = params
+        n += 1
+        calls.append({"id": f"call_{n}", "type": "function",
+                      "function": {"name": name, "arguments": json.dumps(args)}})
+        return ""
 
     def take(m: re.Match) -> str:
         nonlocal n
@@ -194,6 +215,8 @@ def parse_reply(text: str, tools: list[dict]) -> tuple[str, list[dict]]:
                       "function": {"name": name, "arguments": json.dumps(args)}})
         return ""
     rest = _BLOCK.sub(take, text.strip()).strip()
+    if not calls:   # no block in our format: the model fell back to the XML form it was trained on
+        rest = _INVOKE.sub(take_invoke, rest).strip()
     return rest, calls
 
 
