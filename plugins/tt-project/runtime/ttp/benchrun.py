@@ -83,7 +83,7 @@ def prompt(spec: str, opts: dict, xdist_n: int = 0) -> str:
     claim the agent's pytest would refuse. Spec lines that need the live system are marked (mark_live)
     and the agent is told to skip them."""
     marked = mark_live(spec)
-    return PROMPT.format(spec=marked, limit_min=max(1, int(float(opts.get("timeout_s") or 1800) // 60)),
+    return (opts.get("prompt") or PROMPT).format(spec=marked, limit_min=max(1, int(float(opts.get("timeout_s") or 1800) // 60)),
                          xdist=(XDIST_LINE.format(n=xdist_n) if xdist_n else "")
                          + (LIVE_LINE if NOT_CHECKABLE in marked else ""))
 CHEAT = re.compile(r"\bgit\s+(fetch|clone|pull|ls-remote|remote\s+add)\b|\bgit\s+log\s+--all\b|\bgh\s+(api|repo|pr)\b")
@@ -1018,17 +1018,23 @@ def _finish(row: dict, bench_dir: Path, task: dict, ws: Path, run: Path, keep: P
     # into its own runs them. A quote-match flag is a note, not a fail: an isolated standard cell's line
     # matches cannot come from the answer (isolation denies the held-out files and the landed history),
     # so they never void the score; only hard evidence does.
-    venv = cellenv.make(run.parent / "grade-venv", opts.get("cell_packages", cellenv.SEED))
-    held, log_tail = grade(ws, bench_dir, task, opts["test_cmd"], opts["test_timeout_s"],
-                           cellenv.env(venv, _clean_env()))
     hard = [f for f in flags if not f.startswith("quote_matches: ")]
-    if hard:
-        log_tail = "flagged by the cheat audit; the held-out tests " + ("passed" if held else "failed") \
-            + " (not scored as a pass)\n" + log_tail
-    passed = held and not hard
-    row.update(passed=passed, heldout_passed=held, flagged=flags,
-               outcome="flagged" if hard else "pass" if passed else "fail")
-    if row["outcome"] == "fail" and (fault := endpoint_fault(ended)):
+    if not task["tests"]:
+        # A task with no held-out tests (the daily bench's, and the offline replay's questions): nothing to
+        # run. The cell is "done" (the agent ran to its end) or "flagged"; the blind review is the grade.
+        log_tail = "no held-out tests: graded by the blind review\n"
+        row.update(passed=None, heldout_passed=None, flagged=flags, outcome="flagged" if hard else "done")
+    else:
+        venv = cellenv.make(run.parent / "grade-venv", opts.get("cell_packages", cellenv.SEED))
+        held, log_tail = grade(ws, bench_dir, task, opts["test_cmd"], opts["test_timeout_s"],
+                               cellenv.env(venv, _clean_env()))
+        if hard:
+            log_tail = "flagged by the cheat audit; the held-out tests " + ("passed" if held else "failed") \
+                + " (not scored as a pass)\n" + log_tail
+        passed = held and not hard
+        row.update(passed=passed, heldout_passed=held, flagged=flags,
+                   outcome="flagged" if hard else "pass" if passed else "fail")
+    if row["outcome"] in ("fail", "done") and (fault := endpoint_fault(ended)):
         # the endpoint failed the agent (a 429, an outage), not the model: never scored, retried by the suite
         row.update(outcome="error", endpoint_fault=fault)
         if ((ended.get("bridge") or {}).get("busy") or {}).get("gave_up"):

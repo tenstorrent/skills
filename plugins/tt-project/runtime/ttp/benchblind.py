@@ -42,10 +42,24 @@ RUBRIC = (   # (name, max, what earns it): fixed, so scores of every batch compa
     ("tests", 2, "tests cover the change and would fail without it"),
     ("scope", 2, "minimal and on-topic, readable, matches the surrounding code"),
 )
-SCHEMA = {"type": "object", "required": ["scores", "notes"], "properties": {
-    "scores": {"type": "object", "required": [n for n, _, _ in RUBRIC],
-               "properties": {n: {"type": "integer", "minimum": 0, "maximum": m} for n, m, _ in RUBRIC}},
-    "notes": {"type": "string"}}}
+ANSWER_RUBRIC = (   # an answer reviewed against what the project later established (the offline replay)
+    ("answered", 5, "answers what the question asked, directly and completely"),
+    ("supported", 5, "each conclusion follows from the evidence the question gave"),
+    ("agrees", 5, "agrees with the established answer: same cause or verdict, no contradicting claim"),
+)
+
+
+def schema_for(rubric=RUBRIC) -> dict:
+    """The reviewer's answer schema for a rubric of (name, max, what) rows (the default rubric's, else a batch's own);
+    scores start at the rubric's floor: 0, or 1 for the answer rubric's 1-5 scale."""
+    low = 1 if tuple(map(tuple, rubric)) == ANSWER_RUBRIC else 0
+    return {"type": "object", "required": ["scores", "notes"], "properties": {
+        "scores": {"type": "object", "required": [r[0] for r in rubric],
+                   "properties": {r[0]: {"type": "integer", "minimum": low, "maximum": r[1]} for r in rubric}},
+        "notes": {"type": "string"}}}
+
+
+SCHEMA = schema_for()
 MASK = "[x]"
 _GENERIC = [   # (pattern, replacement): run metadata a diff or its commit can carry
     (r"(?im)^(from [0-9a-f]{7,40}\b|from:|date:|subject:|commit [0-9a-f]{7,40}\b|author:|authordate:"
@@ -117,7 +131,9 @@ def _sha(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
 
-def prep(cells: list[dict], out: Path, seed: int | None = None) -> dict:
+def prep(cells: list[dict], out: Path, seed: int | None = None, rubric=RUBRIC) -> dict:
+    """Seal a batch. `rubric`: the rows (name, max, what) its reviewer scores; a cell's `reference` (the
+    established answer, which names no arm) goes to the reviewer with its item."""
     if out.exists():
         raise Refused(f"{out} exists; name a new folder")
     seen: set = set()
@@ -135,12 +151,13 @@ def prep(cells: list[dict], out: Path, seed: int | None = None) -> dict:
         if bad:
             raise Refused(f"item {it['id']} still shows {len(bad)} arm token(s) after anonymising")
         items.append({"id": it["id"], "task": it["task"], "criteria": str(c.get("criteria") or ""),
+                      **({"reference": str(c["reference"])} if c.get("reference") else {}),
                       "diff": diff, "sha256": _sha(diff.encode())})
     seal = json.dumps({"seed": seed, "labels": {it["id"]: it["label"] for it in order}},
                       sort_keys=True)
     out.mkdir(parents=True)
     durable_write(out / "seal.json", seal, mode=0o600)
-    batch = {"phase": "scoring", "rubric": [list(r) for r in RUBRIC], "seal_sha256": _sha(seal.encode()),
+    batch = {"phase": "scoring", "rubric": [list(r) for r in rubric], "seal_sha256": _sha(seal.encode()),
              "items": items, "scores": {}}
     durable_write(out / "batch.json", json.dumps(batch, indent=1))
     return batch
@@ -156,20 +173,21 @@ def _locked(d: Path):
         os.close(fd)
 
 
-def _check(got: dict) -> dict:
+def _check(got: dict, rubric=RUBRIC) -> dict:
     s = got.get("scores") if isinstance(got, dict) else None
-    if not isinstance(s, dict) or set(s) != {n for n, _, _ in RUBRIC}:
-        raise Refused(f"scores must name exactly {[n for n, _, _ in RUBRIC]}")
-    for n, m, _ in RUBRIC:
-        if not isinstance(s[n], int) or isinstance(s[n], bool) or not 0 <= s[n] <= m:
-            raise Refused(f"{n} must be an integer 0..{m}")
+    if not isinstance(s, dict) or set(s) != {r[0] for r in rubric}:
+        raise Refused(f"scores must name exactly {[r[0] for r in rubric]}")
+    low = 1 if tuple(map(tuple, rubric)) == ANSWER_RUBRIC else 0
+    for n, m, *_ in rubric:
+        if not isinstance(s[n], int) or isinstance(s[n], bool) or not low <= s[n] <= m:
+            raise Refused(f"{n} must be an integer {low}..{m}")
     return {"scores": dict(s), "total": sum(s.values()), "notes": str(got.get("notes") or "")[:2000]}
 
 
 def score(d: Path, item: str, got: dict) -> dict:
     """Record one item's score; refused once revealed, for an unknown item or a second score."""
-    rec = _check(got)
     with _locked(d) as b:
+        rec = _check(got, b.get("rubric") or RUBRIC)
         if b["phase"] != "scoring":
             raise Refused("labels are revealed: the batch takes no more scores")
         if item not in {i["id"] for i in b["items"]}:
@@ -208,11 +226,20 @@ def reveal(d: Path) -> dict:
     return b
 
 
-def prompt(item: dict) -> str:
+def prompt(item: dict, rubric=RUBRIC) -> str:
     """The reviewer's prompt for one item. Criteria marked not checkable (benchrun.mark_live: they need
-    the live system the sealed replay lacks) are named as not to be scored."""
+    the live system the sealed replay lacks) are named as not to be scored. An item with a `reference`
+    (the established answer) is an answer reviewed against it."""
     from .benchrun import NOT_CHECKABLE
-    rubric = "\n".join(f"- {n} (0-{m}): {what}" for n, m, what in RUBRIC)
+    if item.get("reference"):
+        scale = "\n".join(f"- {r[0]} (1-{r[1]}): {r[2]}" for r in rubric)
+        return (f"Score this answer to a question. You see only the answer; who or what wrote it is hidden and "
+                f"does not matter. 5 is best, 1 worst. The established answer is what the project later "
+                f"found out for certain; the answer under review did not see it.\n\nRubric (integers):\n{scale}"
+                f"\n\nQuestion:\n{item['criteria']}\n\nEstablished answer:\n{item['reference']}\n\n"
+                f"Answer under review:\n```\n{item['diff']}\n```\n\n"
+                f"Answer as JSON: {{\"scores\": {{...}}, \"notes\": \"one short paragraph\"}}.")
+    rubric = "\n".join(f"- {r[0]} (0-{r[1]}): {r[2]}" for r in rubric)
     skip = (f" Criteria marked {NOT_CHECKABLE} need the live system, which the replay that made this change "
             f"lacked: do not score them, and do not count them as missed; score the rest."
             if NOT_CHECKABLE in item["criteria"] else "")
@@ -223,7 +250,7 @@ def prompt(item: dict) -> str:
 
 
 def provider_ask(provider: str, model: str, effort: str, budget_usd: float, cfg: dict | None = None,
-                 spend: dict | None = None, bridge_env: dict | None = None):
+                 spend: dict | None = None, bridge_env: dict | None = None, schema: dict | None = None):
     """A decision-only run on the named provider (no tools, schema-checked answer) per prompt. A
     chat provider's reviewer runs through the chat bridge this wrapper starts, like a chat run's
     own agent: the CLI asks Anthropic otherwise, and the open model's id never reaches it. `spend`:
@@ -241,7 +268,7 @@ def provider_ask(provider: str, model: str, effort: str, budget_usd: float, cfg:
     def ask(text: str) -> dict:
         with tempfile.TemporaryDirectory() as tmp:
             argv, env = prov.build(role="review", model=model, effort=effort, cwd=tmp, budget_usd=budget_usd,
-                                   read_only=True, schema=SCHEMA, restrictions={})
+                                   read_only=True, schema=schema or SCHEMA, restrictions={})
             argv = prov.read_only_args(argv)   # decision-only: unsandboxed, as the daemon's
             out = Path(tmp) / "output.jsonl"
             if provider == "chat":
@@ -333,7 +360,7 @@ def review(d: Path, ask) -> list[str]:
     done = []
     for it in b["items"]:
         if it["id"] not in b["scores"]:
-            score(d, it["id"], ask(prompt(it)))
+            score(d, it["id"], ask(prompt(it, b.get("rubric") or RUBRIC)))
             done.append(it["id"])
     return done
 
@@ -360,7 +387,9 @@ def main(argv: list[str] | None = None) -> int:
             b = prep(json.loads(src.read_text())["cells"], Path(a.out), a.seed)
             print(f"benchblind: {len(b['items'])} item(s) sealed in {a.out}")
         elif a.cmd == "review":
-            got = review(Path(a.dir), provider_ask(a.provider, a.model, a.effort, a.budget_usd, _review_cfg(argv)))
+            rub = json.loads((Path(a.dir) / "batch.json").read_text()).get("rubric") or RUBRIC
+            got = review(Path(a.dir), provider_ask(a.provider, a.model, a.effort, a.budget_usd, _review_cfg(argv),
+                                                    schema=schema_for(rub)))
             print(f"benchblind: scored {len(got)} item(s)")
         elif a.cmd == "score":
             print(json.dumps(score(Path(a.dir), a.item, json.loads(a.json))))

@@ -1377,6 +1377,31 @@ its own `manifest.sha256`. A plain pytest command runs only the held-out tests t
 calling shell. A cell stores the plain test command and the held-out ids, never a host path: the select
 plugin is added from the plugin that scores it, so a cell outlives the worktree that built it.
 
+`ttp bench daily [--day YYYY-MM-DD] [--cap-usd N] [--arm <spec>]... [--glm-harness <h>]` runs the replay
+bench on one day's work from every project `ttp list` shows on this host (default: yesterday in the
+home zone). It detaches its long run and returns at once, so a command schedule can run it; `--here`
+runs it in this shell, one run per day. It reads each project's own records read-only, keeps the
+landed code tasks of the day, drops tasks that need a device (listed with why) and starts each from
+its real base commit. A project's repository is cloned into a bench-owned folder under
+`~/.tt-project/model-bench/`; nothing is added to, fetched in or written to the project's own repo or
+state. Each task runs with each arm under the cell isolation and limit above. A cell lands when a
+blind review (the main grade; arm hidden) scores requirements and correctness at 3 or more; a
+time-limit stop is a fail. `--cap-usd` bounds Claude spend (arm runs plus reviews) from a running
+total: at the cap no task is added and the skipped ones are recorded; when more tasks fit than the
+budget, a random sample spreads across projects. GLM spend is reported apart. Under
+`~/.tt-project/model-bench/daily/` each run leaves its day's json and a `table.md`, recomputed from
+every day: per project and per model, N, landed k/N, mean requirements and correctness, dollars and
+minutes per task and time-limit stops, plus what it did not cover.
+
+`ttp bench replay [--set established.json] [--cap-usd N] [--only <key>]...` is the offline one-off for
+finished device and analysis tasks. The set file holds, per task, its class (`device` or `analysis`)
+and the answer the project later established, written before any arm runs. Each task becomes a sealed
+question: its spec and recorded evidence (secrets redacted, long results cut), without the task's own
+hand-off or answer and anything dated after it; the cell has no network, device or other records.
+A blind review scores each arm's answer 1-5 on answering what was asked, support from the evidence and
+agreement with the established answer. The report is a per-arm table split by class, with dollars and
+minutes. It detaches like `daily`.
+
 ### OpenAI-compatible endpoints (the `chat` provider)
 
 The `chat` provider runs Claude Code workers against any endpoint that speaks the OpenAI Chat

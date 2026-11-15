@@ -27438,6 +27438,10 @@ def test_durable_write_syncs_renames_and_keeps_the_mode(env, monkeypatch):
 # Every place the runtime writes a file directly, and why it need not survive a power cut. Anything
 # else goes through project.durable_write / durable_append / write_json.
 DURABLE_EXEMPT = {
+    ("benchdaily.py", 'with open(log, "ab") as lf:'): "the detached daily run's stdout log under the bench folder; a cut log costs only the log",
+    ("benchreplay.py", '(dest / "evidence" / name).write_text'): "a sealed question's evidence file, rebuilt from the project's records by the next run; never state",
+    ("benchreplay.py", '(dest / "evidence" / "INDEX.md").write_text'): "a sealed question's evidence index, rebuilt with the evidence; never state",
+    ("benchreplay.py", '(dest / "QUESTION.md").write_text'): "a sealed question's text, rebuilt from the project's records by the next run; never state",
     ("benchrun.py", 'open(folder / "install.log", "ab")'): "the npm or pip output of a bench harness install, appended as it runs; a diagnostic log beside the install, never state",
     ("cellns.py", '(home / ".gitconfig").write_text('): "the git identity file in a bench cell's scratch home inside its temporary folder, rebuilt for every cell; never project state",
     ("cellns.py", "gh.write_text("): "the `gh` stand-in script in a bench cell's temporary folder, rebuilt for every cell; never project state",

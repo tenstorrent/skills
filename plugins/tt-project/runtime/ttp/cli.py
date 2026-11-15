@@ -9169,6 +9169,10 @@ def cmd_bench(a) -> None:
               f"{sum(r['fair'] is None for r in rows)} unknown")
         return
     p = here() or die("bench: no project here (run it in a project or with TTP_PROJECT set)")
+    if a.action == "daily":
+        return _bench_daily(p, a)
+    if a.action == "replay":
+        return _bench_replay(p, a)
     if not a.out:
         die(f"bench {a.action}: --out is required")
     if a.action == "run":
@@ -9196,6 +9200,90 @@ def cmd_bench(a) -> None:
     print(f"ttp bench: {len(m['tasks'])} task(s) kept ({m['counts']['small']} small, {m['counts']['large']} large), "
           f"{len(m['excluded'])} excluded{'' if m['validated'] else ', tests not validated'}; "
           f"manifest {out / 'manifest.json'}")
+
+
+def _bench_daily(p, a) -> None:
+    """`ttp bench daily [--day YYYY-MM-DD] [--cap-usd N]`: the day's landed code tasks from every project on
+    this host through Sonnet, Opus and an open model, blind-reviewed, into the running table (benchdaily.py).
+    It starts the run in the background and returns at once, so a command schedule can run it; `--here`
+    runs it in this shell."""
+    from . import benchdaily, benchrun
+    conf = (p.config().get("bench") or {}).get("daily") or {}
+    tz = a.tz or conf.get("tz") or benchdaily.TZ
+    try:
+        day, start, end = benchdaily.window(a.day, tz=tz)
+        arms = benchdaily.parse_arms(a.arm or conf.get("arms"), a.glm_harness if a.glm_harness is not None
+                                     else conf.get("glm_harness", ""))
+    except (ValueError, KeyError, OSError, benchrun.BenchError) as e:
+        die(f"bench daily: {e}")
+    cap = a.cap_usd if a.cap_usd is not None else float(conf.get("cap_usd", benchdaily.CAP_USD))
+    if not a.here:
+        argv = ["--day", day, "--tz", tz, "--cap-usd", str(cap)] + [x for arm in (a.arm or []) for x in ("--arm", arm)]
+        argv += ["--glm-harness", a.glm_harness] if a.glm_harness is not None else []
+        argv += ["--parallel", str(a.parallel)] if a.parallel else []
+        argv += ["--cell-budget", str(a.cell_budget)] if a.cell_budget else []
+        argv += ["--max-lines", str(a.max_lines)] if a.max_lines else []
+        argv += [x for name in (a.only_project or []) for x in ("--only-project", name)]
+        started, log = benchdaily.detach(argv, day, p.root)
+        print(f"ttp bench daily: {day} " + ("started in the background" if started else "already running")
+              + f"; log {log}; table {benchdaily.home() / 'table.md'}", file=sys.stderr)
+        return
+    held = benchdaily.lock(day)
+    if held is None:
+        die(f"bench daily: a run for {day} is already running on this host")
+    opts = {k: v for k, v in (("budget_usd", a.cell_budget or conf.get("cell_budget_usd")),
+                              ("timeout_s", conf.get("timeout_s"))) if v}
+    try:
+        rec = benchdaily.run_day(day, start, end, arms, p.config(), cap=cap,
+                                 parallel=a.parallel or int(conf.get("parallel", benchdaily.PARALLEL)),
+                                 seed=a.seed, only=a.only_project or conf.get("only_projects"), opts=opts,
+                                 repos=conf.get("repos"))
+    except (OSError, ValueError, RuntimeError) as e:
+        die(f"bench daily: {e}")
+    sp = rec["spend"]
+    print(f"ttp bench daily: {day}: {len(rec['cells'])} cell(s) scored, {len(rec['skipped'])} skipped, "
+          f"{len(rec['dropped'])} dropped; Claude ${sp['claude_usd']:.2f} (cap ${cap:.0f}), GLM ${sp['glm_usd']:.2f}; "
+          f"table {benchdaily.home() / 'table.md'}")
+
+
+def _bench_replay(p, a) -> None:
+    """`ttp bench replay [--set established.json] [--cap-usd N]`: finished device and analysis tasks as sealed
+    questions (the task's spec and its recorded evidence, nothing it answered or that came after) through the
+    arms, blind-reviewed against the answers the project later established (benchreplay.py). It starts the
+    run in the background and returns at once; `--here` runs it in this shell."""
+    from . import benchdaily, benchreplay, benchrun
+    conf = (p.config().get("bench") or {}).get("daily") or {}
+    try:
+        arms = benchdaily.parse_arms(a.arm or conf.get("arms"), a.glm_harness if a.glm_harness is not None
+                                     else conf.get("glm_harness", ""))
+    except (ValueError, KeyError, OSError, benchrun.BenchError) as e:
+        die(f"bench replay: {e}")
+    cap = a.cap_usd if a.cap_usd is not None else float(benchreplay.CAP_USD)
+    if not a.here:
+        argv = ["--cap-usd", str(cap)] + [x for arm in (a.arm or []) for x in ("--arm", arm)]
+        argv += ["--glm-harness", a.glm_harness] if a.glm_harness is not None else []
+        argv += ["--parallel", str(a.parallel)] if a.parallel else []
+        argv += ["--cell-budget", str(a.cell_budget)] if a.cell_budget else []
+        argv += ["--set", a.set] if a.set else []
+        argv += [x for k in (a.only or []) for x in ("--only", k)]
+        started, log = benchdaily.detach(argv, "replay", p.root, command="replay")
+        print("ttp bench replay: " + ("started in the background" if started else "already running")
+              + f"; log {log}; table {benchreplay.home() / 'table.md'}", file=sys.stderr)
+        return
+    held = benchdaily.lock("replay")
+    if held is None:
+        die("bench replay: a run is already running on this host")
+    opts = {k: v for k, v in (("budget_usd", a.cell_budget), ("timeout_s", a.timeout)) if v}
+    try:
+        rec = benchreplay.run_replay(arms, p.config(), cap=cap, parallel=a.parallel or benchdaily.PARALLEL,
+                                     established=Path(a.set).expanduser() if a.set else None, only=a.only, opts=opts,
+                                     seed=a.seed)
+    except (OSError, ValueError, RuntimeError, benchrun.BenchError) as e:
+        die(f"bench replay: {e}")
+    sp = rec["spend"]
+    print(f"ttp bench replay: {len(rec['cells'])} answer(s) scored, {len(rec['faults'])} not built, "
+          f"{len(rec['skipped'])} not run; Claude ${sp['claude_usd']:.2f} (cap ${cap:.0f}), GLM ${sp['glm_usd']:.2f}; "
+          f"table {benchreplay.home() / 'table.md'}")
 
 
 def _bench_cells(a) -> None:
@@ -15817,8 +15905,11 @@ def main(argv: list[str] | None = None) -> None:
                                       "that add tests, keeps the tests that fail on the base and pass on the head, "
                                       "builds a clean one-commit workspace at each base and holds out the landed "
                                       "test files, with a hash-pinned manifest")
-    s.add_argument("action", choices=["prep", "cells", "run", "blind", "fair"],
-                   help="prep: build the bench in --out; fair: read-only, whether each task of the --bench folder "
+    s.add_argument("action", choices=["prep", "cells", "run", "blind", "fair", "daily", "replay"],
+                   help="daily: the day's landed code tasks of every project on this host through Sonnet, Opus and "
+                        "an open model, blind-reviewed, into the running table (starts in the background); replay: "
+                        "the offline replay of finished device and analysis tasks as sealed questions "
+                        "(`ttp bench replay --help`); prep: build the bench in --out; fair: read-only, whether each task of the --bench folder "
                         "is fair (its held-out tests require nothing the change made up that its spec does not "
                         "state), naming what is unstated; cells: seeded-bug and prompt-injection cells from the "
                         "--bench folder's small tasks in --out, with a hash-pinned cells.json; run: the head-to-head of two or more arms on --bench, "
@@ -15850,6 +15941,19 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--no-validate", action="store_true", help="prep: skip validation: keep every added test unrun "
                                                                "(a count, or a host that cannot run the tests)")
     s.add_argument("--dry-run", action="store_true", help="run: every arm on the fake agent, no model call")
+    s.add_argument("--day", help="daily: the landed day to bench (YYYY-MM-DD in --tz; default: yesterday)")
+    s.add_argument("--tz", help="daily: the zone the day is read in (default: bench.daily.tz, else the built-in one)")
+    s.add_argument("--cap-usd", type=float, help="daily: the day's Claude spend cap, arm runs plus reviews "
+                   "(default: bench.daily.cap_usd, else 40)")
+    s.add_argument("--glm-harness", help="daily: the harness the open-model arm runs on ('' = the claude bridge, "
+                   "opencode, mini-swe-agent; default: bench.daily.glm_harness)")
+    s.add_argument("--parallel", type=int, default=0, help="daily, replay: tasks run at once (default 3)")
+    s.add_argument("--cell-budget", type=float, default=0, help="daily, replay: dollar budget per arm run")
+    s.add_argument("--max-lines", type=int, default=0, help="daily: drop landed changes over this many non-test lines")
+    s.add_argument("--only-project", action="append", help="daily: only this project, repeatable (default: all here)")
+    s.add_argument("--set", help="replay: the established-answers file (default: <bench home>/../replay/established.json)")
+    s.add_argument("--only", action="append", help="replay: only this question key (project:id) or class "
+                   "(device, analysis), repeatable")
     s.set_defaults(fn=cmd_bench)
 
     s = sub.add_parser("model-bench", help="the host's shared daily chat model bench: `run` benches the served "
