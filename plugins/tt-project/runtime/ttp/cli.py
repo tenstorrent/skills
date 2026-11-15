@@ -9451,12 +9451,17 @@ def cmd_ack_wait(a) -> None:
         after = a.after or []
         n = ackwait.find(p.name, a.frm, a.hash, after, a.terminal)
         early = [] if n or not a.terminal else ackwait.replies(p.name, a.frm, a.hash, after)
+        got, of = (0, 0) if n or not a.terminal else ackwait.partial(p.name, a.frm, a.hash, after)
     except ValueError as e:
         print(f"ttp ack-wait: {e}")
         sys.exit(ackwait.CANNOT)
     except OSError as e:
         print(f"ttp ack-wait: cannot read the inbox: {e}")
         sys.exit(ackwait.CANNOT)
+    if not n and got:
+        print(f"a reply from {a.frm} naming {a.hash.strip().lower()} in {of} parts has {got} in so far; "
+              f"waiting for the rest")
+        sys.exit(ackwait.WAITING)
     if not n:
         print(f"{len(early)} repl{'y' if len(early) == 1 else 'ies'} from {a.frm} naming {a.hash.strip().lower()} "
               f"(latest note {early[-1].get('fp')}) only acknowledge or plan, no terminal result yet" if early else

@@ -1484,6 +1484,69 @@ def test_ack_wait_terminal_ignores_pending_words_in_appended_facts():
     assert ackwait.own_words(terminal + facts) == terminal
 
 
+def test_ack_wait_terminal_reads_a_multi_part_reply_as_one_and_still_waits_past_a_multi_part_plan(env, monkeypatch,
+                                                                                                  capsys, tmp_path):
+    """A terminal answer sent as `[k/N]` parts counts once every part is in, read as one: a finished task in the
+    sender's records backs it, so evidence words ("started", "queued") in a part do not hold the wait. A plan or an
+    acknowledgement sent in parts still waits, even beside a done task. A later part joins its packet by the
+    sender's task and N without naming the note; a part from another sender task does not."""
+    from ttp import ackwait, cli, taskfacts, upstream
+    from ttp.project import register
+    p = make(env)
+    (env["tmp"] / "peer").mkdir()
+    register("peer", {"host": "testhost", "dir": str(env["tmp"] / "peer")})
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    request = "please send the evidence packet for the four cells"
+    assert upstream.send(p.name, 4, "peer", request) == "sent"
+    fp = upstream.note_id("peer", request)
+    probe = ["probe", "--from", "peer", "--hash", fp, "--terminal"]
+
+    def facts(*lines):
+        return f"{taskfacts.FACTS_MARK}peer's records: " + " | ".join(lines) + "]"
+
+    def send(task, text):
+        assert upstream.send("peer", task, p.name, text) == "sent"
+        return upstream.note_id(p.name, text)
+
+    send(7, f"[reply to note {fp}] [1/2] Acknowledged; the plan is to rerun the four cells."
+            + facts("#3 Earlier report (work, done)"))
+    send(7, "[2/2] Next step: the packet follows once the reruns finish.")
+    assert _ack_wait(cli, *probe) == 1, "a plan in parts is no terminal result, a done task beside it or not"
+    assert "only acknowledge or plan" in capsys.readouterr().out
+    parts = [f"[reply to note {fp}] [1/3] Evidence packet for the four cells, from saved records only."
+             + facts("#21 Report check (work, done)"),
+             "[2/3] Each cell: job started 09:10 and done 09:40, 0 errors.",
+             "[3/3] Missing: decoded duration, absent in all four cells; closing it needs new runs (owned by #22)."
+             + facts("#22 Rerun cells (work, queued)")]
+    assert not any(ackwait.terminal(t) for t in parts), "no part alone reads as terminal"
+    ids = [send(8, parts[0])]
+    assert _ack_wait(cli, *probe) == 1, "one part of three waits"
+    assert "in 3 parts has 1 in so far" in capsys.readouterr().out
+    ids.append(send(8, parts[1]))
+    send(9, "[3/3] Unrelated: the nightly sweep has no new cells.")
+    assert _ack_wait(cli, *probe) == 1, "a part from another sender task completes nothing"
+    ids.append(send(8, parts[2]))
+    assert _ack_wait(cli, *probe) == 0, "the complete packet, backed by a done task, is terminal"
+    out = tmp_path / "result.json"
+    monkeypatch.setenv("TTP_RESULT", str(out))
+    cli.main(["ack-wait", "settle", "--from", "peer", "--hash", fp, "--terminal"])
+    got = json.loads(out.read_text())
+    assert got["metrics"]["reply_note"] == ids[-1] and got["metrics"]["reply_parts"] == ids
+    assert "[1/3] Evidence packet" in got["summary"] and "[3/3] Missing" in got["summary"]
+    assert ackwait.find(p.name, "peer", fp, [ids[-1]], True) is None, "the cursor consumes the whole packet"
+    # unbacked, a packet needs terminal words and no pending ones, as a single note does
+    assert ackwait.packet_terminal(["[1/2] The canary ran.", "[2/2] It passed on both hosts."]) is True
+    assert ackwait.packet_terminal(["[1/2] The canary started.", "[2/2] Half the cells passed."]) is False
+    assert ackwait.packet_terminal(["[1/2] status: queued", "[2/2] passed" + facts("#5 x (work, done)")]) is False
+    assert ackwait.packet_terminal(["[1/2] Queued the reruns.", "[2/2] Started cell 1." + facts("#5 x (work, done)")]) \
+        is False, "pending words alone wait beside a done task"
+    assert ackwait.packet_terminal(["[1/2] The canary started.", "[2/2] It passed." + facts("#5 x (work, done)")]) is True
+    for text, want in (("[2/3] x", (2, 3)), ("(1/2) x", (1, 2)), ("Part 2 of 3: x", (2, 3)), ("part 1/2 x", (1, 2)),
+                       ("3/4 cells passed", None), ("[1/1] x", None), ("[4/3] x", None),
+                       (f"[reply to note {fp}] [1/3] x", (1, 3))):
+        assert ackwait.part(text) == want, text
+
+
 def test_a_note_this_machine_only_sends_on_is_kept_handled_and_an_addressed_one_wakes(env, monkeypatch):
     """A note addressed to the project that names another machine (`at`) is only sent on from here: kept
     as a handled event (no coordinator wake) and still forwarded. One addressed to it with no `at` wakes
