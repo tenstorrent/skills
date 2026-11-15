@@ -22,9 +22,12 @@ provider (route.eligible keeps them on core); the A/B only acts on the Claude co
 Flip: a stable hash of (seed, project, task id) picks the arm, recorded on the task as device_ab:<arm> before
 its first run and kept on every later run. A tier-up retry runs on the control arm and is marked on its run.
 
-Stop: a device incident (a hang, reset, recovery, power cycle or hold named in an event that names the task or
-one of its resources) during a test-arm run or within INCIDENT_AFTER_S after it stops the test arm at once
-(STOP_KV): its open tasks run on the control arm, new tasks are excluded, and the daemon raises one high event to
+Stop: a real device incident (an event of an incident kind, or a watcher observation naming a hang, reset,
+recovery, power cycle or hold, that carries the run's task id or names a device resource the run held; never a
+coordinator action, audit, flag or note) during a test-arm run or within INCIDENT_AFTER_S after it stops the
+test arm at once
+(STOP_KV; each tick re-tests a recorded stop against this rule and lifts one that no longer qualifies, with a
+device_ab event): its open tasks run on the control arm, new tasks are excluded, and the daemon raises one high event to
 the project's coordinator.
 
 Review: each finished A/B task gets one masked review task (Opus at high effort, REVIEW_LABEL) that scores
@@ -48,6 +51,11 @@ STOP_KV = "device_ab_stop"              # {"ts", "arm", "task", "event", "why"}:
 KINDS = ("work", "question", "code")
 DEFAULT_ARMS = {"sonnet": {"model": "sonnet", "effort": "high"}, "opus": {"model": "opus", "effort": "high"}}
 INCIDENT_AFTER_S = 1800.0
+# Event kinds of real device or machine incidents (the harness's own): never coordinator actions, audit,
+# course-check, flag, digest, note or chat events.
+INCIDENT_KINDS = frozenset({"machine_condition", "machine_condition_held", "machine_outage_overdue", "machine_reach",
+                            "resource_trouble", "heal_failed"})
+INCIDENT_KIND = re.compile(r"^(?:device|broker)_(?:hang|hung|fault|reset|timeout|incident|down|error|failed|power\w*)$")
 INCIDENT = re.compile(r"(?i)\b(hang|hangs|hung|reset|resets|recover(?:y|ed|ing|ies)?|power[- ]?cycl\w*|hold)\b")
 REVIEW_MODEL = {"model": "opus", "effort": "high"}
 SCORE_KEYS = ("answered", "supported")
@@ -267,9 +275,41 @@ def _note(run: dict) -> dict:
         return {}
 
 
+def device_names(task: dict, cfg: dict | None) -> list[str]:
+    """The task's resource names that are devices: a `*-device` lock, a configured device lock or a machine
+    tagged `device`. A resource every task names (a project host with no device tag) is not one."""
+    from . import effort, locks, machines
+    names = [n for n in effort._resource_names(task) if n]
+    out = [n for n in names if n.endswith("-device")]
+    try:
+        out += [n for n in names if n in locks.device_locks(cfg or {})]
+        known = machines.load()
+        out += [n for n in names if "device" in machines.tag_list((known.get(n) or {}).get("tags"))]
+    except Exception:   # an unreadable machines list names no device
+        pass
+    return sorted(set(out))
+
+
+def incident_event(e: dict, run_task: Any, names: list[str]) -> bool:
+    """Whether event `e` is a real device or machine incident of a run of task `run_task` that held the device
+    resources `names`: an event of an incident kind (never a coordinator action, audit, flag, digest, note or
+    chat event, and never a daemon-written observation), a watcher observation naming a hang, reset, recovery,
+    power cycle or hold, and tied to the run's own device: it carries the run's task id, or names a device
+    resource the run held. A host name every task mentions is not enough, and a run with no device resource is
+    tied only by its task id."""
+    kind, text = str(e.get("kind") or ""), str(e.get("text") or "")
+    if not (kind in INCIDENT_KINDS or INCIDENT_KIND.match(kind) or (
+            kind == "observation" and str(e.get("source") or "").startswith("watcher:") and INCIDENT.search(text))):
+        return False
+    if e.get("task") is not None and run_task is not None and int(e["task"]) == int(run_task):
+        return True
+    hay = text + " " + str(e.get("data") or "")
+    return any(n in hay for n in names)
+
+
 def find_incident(db, cfg: dict, s: dict, since: float, now: float) -> dict | None:
-    """A device incident on a test-arm run that started after `since`: {"task", "run", "event", "text"}, else None."""
-    from . import effort
+    """A device incident on a test-arm run that started after `since`: {"task", "run", "event", "text"}, else None.
+    Only real incident events tied to the run's own device count (incident_event)."""
     runs = db.q("SELECT id, task, started, ended, note FROM runs WHERE started>=? AND note LIKE ? ORDER BY id",
                 (since, f'%"{KEY}"%'))
     for r in runs:
@@ -277,16 +317,35 @@ def find_incident(db, cfg: dict, s: dict, since: float, now: float) -> dict | No
         if ab.get("ran") != s["test"]:
             continue
         task = db.task(int(r["task"])) if r.get("task") else None
-        names = [n for n in effort._resource_names(task or {}) if n]
+        names = device_names(task or {}, cfg)
         until = (float(r["ended"]) if r.get("ended") else now) + INCIDENT_AFTER_S
-        for e in db.q("SELECT id, kind, text, task FROM events WHERE ts>=? AND ts<=? AND kind NOT LIKE 'device_ab%'",
-                      (float(r["started"] or 0), until)):
-            text = str(e.get("text") or "")
-            if not INCIDENT.search(text):
-                continue
-            if e.get("task") == r["task"] or f"#{r['task']}" in text or any(n in text for n in names):
-                return {"task": r["task"], "run": r["id"], "event": e["id"], "text": text[:300]}
+        for e in db.q("SELECT id, source, kind, text, data, task FROM events WHERE ts>=? AND ts<=? "
+                      "AND kind NOT LIKE 'device_ab%'", (float(r["started"] or 0), until)):
+            if incident_event(e, r["task"], names):
+                return {"task": r["task"], "run": r["id"], "event": e["id"], "text": str(e.get("text") or "")[:300]}
     return None
+
+
+def recheck_stop(db, cfg: dict, s: dict, stop: dict, now: float) -> str:
+    """Re-test a recorded stop against the current rule. When its event no longer qualifies, lift the stop, log a
+    device_ab event saying why and return that text; "" when the stop stands (or cannot be re-read)."""
+    try:
+        e = db.q("SELECT id, source, kind, text, data, task FROM events WHERE id=?", (int(stop["event"]),))
+        run = db.q("SELECT id, task FROM runs WHERE id=?", (int(stop["run"]),))
+    except (KeyError, TypeError, ValueError):
+        return ""
+    if not e or not run:
+        return ""
+    task = db.task(int(run[0]["task"])) if run[0].get("task") else None
+    if incident_event(e[0], run[0]["task"], device_names(task or {}, cfg)):
+        return ""
+    why = (f"Device A/B: lifted the {stop.get('arm') or s['test']} arm's stop (task #{stop.get('task')}, event "
+           f"{stop.get('event')}, kind {e[0].get('kind')}): it is not a device incident tied to the run's own "
+           "device, so it must not stop the test.")
+    db.set_kv(STOP_KV, {})
+    db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+         (now, "daemon", "device_ab", "low", why, "handled"))
+    return why
 
 
 def review_spec(task: dict, run_dir: str) -> str:
@@ -333,11 +392,13 @@ def tick(db, cfg: dict, now: float | None = None) -> dict:
         return {}
     now = float(now if now is not None else time.time())
     st = start(db, s, now)
-    new_stop = None
+    new_stop = lifted = None
+    if stop := stopped(db):
+        lifted = recheck_stop(db, cfg, s, stop, now) or None
     if not stopped(db) and (hit := find_incident(db, cfg, s, st["ts"], now)):
         new_stop = {"ts": now, "arm": s["test"], **hit}
         db.set_kv(STOP_KV, new_stop)
-    return {"stop": new_stop, "reviews": queue_reviews(db, s, st["ts"])}
+    return {"stop": new_stop, "lifted": lifted, "reviews": queue_reviews(db, s, st["ts"])}
 
 
 def stop_text(stop: dict) -> str:

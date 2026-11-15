@@ -2606,6 +2606,8 @@ class Daemon:
                                 (now, "daemon", "device_ab_stop", "high", deviceab.stop_text(got["stop"])[:1000],
                                  "queued"))
                     log(self.p, "device A/B: test arm stopped after a device incident")
+                if got.get("lifted"):
+                    log(self.p, "device A/B: " + str(got["lifted"])[:200])
             except Exception as e:   # never holds the loop
                 log(self.p, f"device A/B tick failed: {type(e).__name__}: {e}"[:300])
         # A configured route (the code route, the device A/B) taking under half its share: one event per route a day.

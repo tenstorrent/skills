@@ -243,7 +243,7 @@ def test_device_ab_stops_the_test_arm_on_a_device_incident_with_one_high_alert_a
     assert deviceab.tick(p.db, cfg, 2800.0)["reviews"] == []   # once per task
     # A reset within INCIDENT_AFTER_S of the Sonnet-arm run, naming its resource: the test arm stops, once.
     p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
-           (2900.0, "watcher:box", "obs", "high", "box1-device: chip reset after a hang", "queued"))
+           (2900.0, "watcher:box", "observation", "high", "box1-device: chip reset after a hang", "queued"))
     got = deviceab.tick(p.db, cfg, 3000.0)
     assert got["stop"]["task"] == son and got["stop"]["arm"] == "sonnet"
     assert "box1-device" in deviceab.stop_text(got["stop"])
@@ -295,3 +295,94 @@ def test_device_ab_dispatch_runs_the_recorded_arm_model_at_its_effort(env, monke
     from ttp import runclass
     cheap = runclass.cheap_run(note, "claude")
     assert (cheap["model"], cheap["effort"]) == (arm, "high")   # the default arms: sonnet and opus at high
+
+
+def _dab_sonnet_run(p, cfg, labels, started=2000.0, ended=2600.0):
+    """A finished Sonnet-arm run of a fresh task with `labels`; returns (task id, run id)."""
+    import json
+    from ttp import deviceab
+    s = deviceab.settings(cfg)
+    deviceab.start(p.db, s, 1000.0)
+    while True:
+        tid = _dab_task(p, labels=labels)
+        if deviceab.arm_of(s, p.name, tid) == "sonnet":
+            break
+    note = deviceab.assign(p.db, cfg, p.name, p.db.task(tid), "claude", now=started)
+    rid = p.db.x("INSERT INTO runs(task, role, provider, model, effort, started, ended, status, cost_usd, note) "
+                 "VALUES(?,?,?,?,?,?,?,?,?,?)", (tid, "worker", "claude", "sonnet", "high", started, ended, "done",
+                                                1.0, json.dumps({deviceab.KEY: note[deviceab.KEY]})))
+    return tid, p.db.q("SELECT id FROM runs WHERE task=?", (tid,))[0]["id"]
+
+
+def _dab_event(p, kind, text, source="coordinator", ts=2300.0, task=None, data=""):
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
+           (ts, source, kind, "high", text, data, "queued", task))
+    return p.db.q("SELECT max(id) AS i FROM events")[0]["i"]
+
+
+def test_device_ab_a_coordinator_action_naming_the_host_is_not_a_device_incident(env):
+    from ttp import deviceab
+    p = make(env)
+    cfg = _dab_cfg(p)
+    tid, _ = _dab_sonnet_run(p, cfg, ["resource:hostx", "needs_device"])   # no device resource: only a host name
+    # The false stop: a coordinator action note with "hold" and the host name, in the run's window.
+    for kind, source in (("action", "coordinator"), ("audit", "coordinator"), ("course_check", "daemon"),
+                         ("flag", "daemon"), ("digest", "daemon"), ("note", "worker"), ("chat", "user"),
+                         ("observation", "daemon")):
+        _dab_event(p, kind, f"hold-type action Rollout hostx: kernel cache filled after deploy task_add #{tid} cites msg",
+                   source=source)
+    got = deviceab.tick(p.db, cfg, 2700.0)
+    assert got["stop"] is None and not deviceab.stopped(p.db)
+    # Even a real incident kind about the host alone does not stop a run that held no device resource ...
+    _dab_event(p, "machine_condition", "hostx: reset after a hang")
+    assert deviceab.tick(p.db, cfg, 2800.0)["stop"] is None
+    # ... unless it carries the run's own task id.
+    _dab_event(p, "resource_trouble", "hostx: a hang", task=tid)
+    assert deviceab.tick(p.db, cfg, 2900.0)["stop"]["task"] == tid
+
+
+def test_device_ab_a_real_device_hang_on_the_runs_device_resource_stops_the_test_arm(env):
+    from ttp import deviceab
+    p = make(env)
+    cfg = _dab_cfg(p)
+    tid, rid = _dab_sonnet_run(p, cfg, ["resource:box1-device", "needs_device"])
+    _dab_event(p, "machine_condition", "box2-device: chip hang")   # another task's device: not this run's
+    assert deviceab.tick(p.db, cfg, 2700.0)["stop"] is None
+    eid = _dab_event(p, "machine_condition", "box1-device: chip hung, reset needed")
+    got = deviceab.tick(p.db, cfg, 2800.0)
+    assert got["stop"]["task"] == tid and got["stop"]["run"] == rid and got["stop"]["event"] == eid
+
+
+def test_device_ab_a_device_incident_kind_naming_the_resource_only_in_its_data_stops_the_test_arm(env):
+    from ttp import deviceab
+    p = make(env)
+    cfg = _dab_cfg(p)
+    tid, _ = _dab_sonnet_run(p, cfg, ["resource:box1-device", "needs_device"])
+    _dab_event(p, "device_hang", "chip stuck", data='{"resource": "box1-device"}')
+    assert deviceab.tick(p.db, cfg, 2700.0)["stop"]["task"] == tid
+
+
+def test_device_ab_the_next_tick_lifts_a_false_stop_and_keeps_a_real_one(env):
+    from ttp import deviceab
+    p = make(env)
+    cfg = _dab_cfg(p)
+    tid, rid = _dab_sonnet_run(p, cfg, ["resource:hostx", "needs_device"])
+    false = _dab_event(p, "action", "hold-type action Rollout hostx: kernel cache filled")
+    p.db.set_kv(deviceab.STOP_KV, {"ts": 2700.0, "arm": "sonnet", "task": tid, "run": rid, "event": false,
+                                   "text": "hold-type action Rollout hostx"})
+    got = deviceab.tick(p.db, cfg, 3000.0)
+    assert got["lifted"] and "lifted" in got["lifted"] and not deviceab.stopped(p.db)
+    ev = p.db.q("SELECT kind, severity, text FROM events WHERE kind='device_ab'")
+    assert len(ev) == 1 and ev[0]["severity"] == "low" and "not a device incident" in ev[0]["text"]
+    assert deviceab.tick(p.db, cfg, 3100.0)["lifted"] is None   # nothing more to lift
+
+
+def test_device_ab_a_real_stop_survives_the_next_ticks_recheck(env):
+    from ttp import deviceab
+    p = make(env)
+    cfg = _dab_cfg(p)
+    _dab_sonnet_run(p, cfg, ["resource:box1-device", "needs_device"])
+    real = _dab_event(p, "machine_condition", "box1-device: chip hang")
+    assert deviceab.tick(p.db, cfg, 2700.0)["stop"]["event"] == real
+    got = deviceab.tick(p.db, cfg, 2800.0)
+    assert got["lifted"] is None and deviceab.stopped(p.db)["event"] == real
