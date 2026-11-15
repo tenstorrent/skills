@@ -312,14 +312,14 @@ def test_detach_mirror_probe_reads_the_verdict_before_the_tail(env, tmp_path, mo
 
 def test_a_relative_rc_never_leaves_a_lost_marker_in_the_callers_checkout(env, tmp_path, monkeypatch):
     """A probe run from a checkout names a path no job wrote, relative to its cwd: it still reads as gone
-    (4), but no <name>.lost lands in that checkout, from the CLI or from detach.state."""
+    (2, no job recorded there), and no <name>.lost lands in that checkout, from the CLI or from detach.state."""
     from ttp import detach
     p = make(env)
     checkout = tmp_path / "checkout"
     checkout.mkdir()
     r = subprocess.run([sys.executable, str(TTP), "detach", "--check", "job.rc"], cwd=checkout,
                        capture_output=True, text=True, env=dict(os.environ, TTP_PROJECT=str(p.root)))
-    assert r.returncode == 4 and "gone" in r.stdout, (r.stdout, r.stderr)
+    assert r.returncode == 2 and "no job recorded at" in r.stdout, (r.stdout, r.stderr)
     monkeypatch.chdir(checkout)
     assert detach.state("job.rc")[0] == "lost"
     assert detach._mark_lost_first("other.rc", "x") == "x"
@@ -3621,3 +3621,46 @@ def test_a_coordinator_wake_lists_and_stops_a_job_an_earlier_wake_detached_and_a
         assert json.loads(ev["data"])["caller_run"] == later and ev["task"] is None
     finally:
         _end_group(pgid)
+
+
+def _job_entry(run_dir, name, **extra):
+    """A detached.json entry as `ttp detach` writes one, for a job whose process is long gone."""
+    dead = subprocess.Popen(["true"])
+    dead.wait()
+    run_dir.mkdir(parents=True, exist_ok=True)
+    rc = run_dir / f"{name}.rc"
+    (run_dir / "detached.json").write_text(json.dumps([{
+        "name": name, "rc": str(rc), "log": str(rc.with_suffix(".log")), "pid": dead.pid,
+        "started": time.time(), "status": "running", **extra}]))
+    return rc
+
+
+def test_detach_check_of_a_path_no_job_was_recorded_at_says_so_and_marks_nothing_lost(env):
+    """A probe naming a wrong path is not a lost job: it exits 2 with 'no job recorded at <path>' and
+    leaves no .lost marker, while a real job that never started still reads as gone (4)."""
+    from ttp import detach
+    p = make(env)
+    rd = p.runs / "9001"
+    rd.mkdir(parents=True)
+    r = _ttp_run(p, "detach", "--check", str(rd / "nojob.rc"), env={"TTP_RUN_DIR": str(rd)})
+    assert r.returncode == 2 and f"no job recorded at {rd / 'nojob.rc'}" in r.stdout, (r.stdout, r.stderr)
+    assert not list(rd.glob("*.lost")), "a wrong path left a .lost marker"
+    rc = _job_entry(p.runs / "9002", "never")
+    r = _ttp_run(p, "detach", "--check", str(rc))
+    assert r.returncode == detach.FAILED_RC and "gone without an exit code" in r.stdout, (r.stdout, r.stderr)
+
+
+def test_detach_check_finds_a_bare_job_name_in_this_run_then_in_the_run_folders(env):
+    """`ttp detach --check build` (no slash) reads build.rc in $TTP_RUN_DIR first, else the newest job of
+    that name a run folder's detached.json records; never <cwd>/build.rc, which no job wrote."""
+    p = make(env)
+    rc = _job_entry(p.runs / "9011", "build")
+    rc.write_text("0\n")
+    other = p.runs / "9012"
+    other.mkdir(parents=True)
+    for run_dir in (rc.parent, other):
+        r = _ttp_run(p, "detach", "--check", "build", env={"TTP_RUN_DIR": str(run_dir)})
+        assert r.returncode == 0 and "build: job finished rc=0" in r.stdout, (run_dir, r.stdout, r.stderr)
+    r = _ttp_run(p, "detach", "--check", "nosuchjob", env={"TTP_RUN_DIR": str(other)})
+    assert r.returncode == 2 and "no job recorded at" in r.stdout, (r.stdout, r.stderr)
+    assert not list(p.runs.glob("*/*.lost")) and not list(p.root.glob("*.lost"))
