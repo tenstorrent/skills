@@ -88,22 +88,45 @@ def test_routine_quality_alarm_fires_when_routine_goes_wrong_ten_points_more_oft
         p.db.x("UPDATE tasks SET status=?, result=? WHERE id=?", (status, json.dumps({"status": result_status}), t))
         p.db.x("INSERT INTO runs(task,role,provider,model,started,status,cost_usd,note) VALUES(?,?,?,?,?,?,?,?)",
                (t, "worker", "claude", "sonnet" if note else "opus", now - 600, "ok", 0.1, note))
-    for i in range(6):   # hard: 1 of 6 needs review
-        task("code", "done", "needs_review" if i == 0 else "done", None)
-    for i in range(6):   # routine: 2 of 6 (33% vs 17%: 16 points) go wrong
-        task("work", "failed" if i < 2 else "done", "failed" if i < 2 else "done", cheap)
+    for i in range(20):   # hard: 2 of 20 need review
+        task("code", "done", "needs_review" if i < 2 else "done", None)
+    for i in range(20):   # routine: 8 of 20 (40% vs 10%: 30 points, p<0.05) go wrong
+        task("work", "failed" if i < 8 else "done", "failed" if i < 8 else "done", cheap)
     q = runclass.routine_quality(p.db, {}, now - 86400, now)
-    assert (q["routine"]["bad"], q["routine"]["tasks"], q["hard"]["bad"], q["hard"]["tasks"]) == (2, 6, 1, 6)
+    assert (q["routine"]["bad"], q["routine"]["tasks"], q["hard"]["bad"], q["hard"]["tasks"]) == (8, 20, 2, 20)
+    assert q["p"] < runclass.ALARM_P
     assert q["alarm"] and "route.classes.routine" in runclass.quality_text(q, 24)
+    assert "p=" in runclass.quality_text(q, 24)
     d = Daemon(p.base)
     d.watch_run_classes()
     d._run_class_checked = 0.0
     d.watch_run_classes()   # once per window
     assert p.db.one("SELECT COUNT(*) n FROM events WHERE kind='run_class_quality'")["n"] == 1
     # Within 10 points: quiet.
-    p.db.x("UPDATE tasks SET status='done', result=? WHERE status='failed' AND id=(SELECT MAX(id) FROM tasks "
-           "WHERE status='failed')", (json.dumps({"status": "done"}),))
+    for _ in range(6):
+        p.db.x("UPDATE tasks SET status='done', result=? WHERE status='failed' AND id=(SELECT MAX(id) FROM tasks "
+               "WHERE status='failed')", (json.dumps({"status": "done"}),))
     assert not runclass.routine_quality(p.db, {}, now - 86400, now)["alarm"]
+
+
+def test_routine_quality_alarm_needs_a_significant_difference_not_a_few_bad_runs(env):
+    from ttp import runclass
+    p = make(env)
+    now = time.time()
+    cheap = json.dumps({runclass.CHEAP_KEY: {"provider": "claude", "model": "sonnet", "effort": "high",
+                                             "class": "routine", "why": "routine work"}})
+
+    def task(kind, bad, note):
+        t = p.db.add_task("t", "", kind=kind, tier="standard", priority=3, budget_usd=1.0)
+        p.db.x("UPDATE tasks SET status=?, result=? WHERE id=?",
+               ("failed" if bad else "done", json.dumps({"status": "failed" if bad else "done"}), t))
+        p.db.x("INSERT INTO runs(task,role,provider,model,started,status,cost_usd,note) VALUES(?,?,?,?,?,?,?,?)",
+               (t, "worker", "claude", "sonnet" if note else "opus", now - 600, "ok", 0.1, note))
+    for i in range(6):   # hard: 1 of 6; routine: 2 of 6 (16 points, but p~0.47): quiet
+        task("code", i == 0, None)
+        task("work", i < 2, cheap)
+    q = runclass.routine_quality(p.db, {}, now - 86400, now)
+    assert (q["routine"]["bad"], q["hard"]["bad"]) == (2, 1) and q["p"] > 0.4 and not q["alarm"]
 
 
 def test_class_routes_default_to_chat_only_with_a_chat_model_and_never_move_the_coordinator():
@@ -533,11 +556,11 @@ def test_review_fix_quality_has_its_own_alarm_judged_by_the_first_run_and_its_fi
     v = q["review_fix"]
     assert (v["sonnet"]["tasks"], v["sonnet"]["bad"], v["opus"]["tasks"], v["opus"]["bad"]) == (30, 6, 10, 2)
     assert v["state"] == "full" and q["new"]["state"] == q["continue"]["state"] == "canary"
-    for _ in range(6):   # six Sonnet fixes fail and pass only on an Opus retry a tier up: 12/36 (33%) vs 20%
+    for _ in range(12):   # twelve Sonnet fixes fail and pass only on an Opus retry a tier up: 18/42 (43%) vs 20%
         task(True, False, escalated=True)
     v = runclass.code_quality(p.db, {}, now - runclass.CODE_WINDOW_S, now)["review_fix"]
-    assert (v["sonnet"]["tasks"], v["sonnet"]["bad"], v["opus"]["tasks"]) == (36, 12, 10)
-    assert v["state"] == "off"
+    assert (v["sonnet"]["tasks"], v["sonnet"]["bad"], v["opus"]["tasks"]) == (42, 18, 10)
+    assert v["p"] < runclass.ALARM_P and v["state"] == "off"
     assert "Code tasks (review_fix)" in runclass.code_quality_text("review_fix", v, 168)
 
 
@@ -584,6 +607,75 @@ def test_code_quality_moves_a_kind_full_when_sonnet_matches_opus_and_back_to_opu
     assert len(ev) == 1 and "Code tasks (new)" in ev[0]["text"] and "route.code_sonnet" in ev[0]["text"]
     t = {"id": 1, "kind": "code", "tier": "standard", "title": "x", "labels": "[]"}
     assert runclass.core_cheap({}, t, "hard", "standard", "claude", None, None, d._code_state()) is None
+
+
+def test_worse_p_is_the_one_sided_binomial_tail_against_the_smoothed_opus_share():
+    from ttp import runclass
+    assert abs(runclass.worse_p(2, 5, 76, 283) - 0.41) < 0.01
+    assert runclass.worse_p(5, 5, 76, 283) < 0.002
+    assert runclass.worse_p(0, 5, 0, 5) == runclass.worse_p(1, 0, 0, 0) == 1.0
+    assert runclass.worse_p(1, 5, 0, 5) > 0.5          # one miss against a clean small Opus sample: not significant
+    assert runclass.alarm_p({}) == runclass.ALARM_P == 0.05
+    assert runclass.alarm_p({"route": {"code_sonnet": {"alarm_p": 0.01}}}) == 0.01
+    for bad in (True, "x", -1, 2, None):
+        assert runclass.alarm_p({"route": {"code_sonnet": {"alarm_p": bad}}}) == runclass.ALARM_P, bad
+
+
+def test_code_quality_needs_a_significant_difference_to_move_a_kind_off_and_recovers(env):
+    from ttp import runclass
+    from ttp.daemon import Daemon
+    p = make(env)
+    now = time.time()
+    note = json.dumps({runclass.CHEAP_KEY: {"provider": "claude", "model": "sonnet", "effort": "high",
+                                            "class": "hard", runclass.CODE_KEY: "new"}})
+    sonnet_ids = []
+
+    def task(sonnet, bad):
+        t = p.db.add_task("t", "", kind="code", tier="standard", priority=3, budget_usd=1.0)
+        p.db.x("UPDATE tasks SET status='done', result=?, labels='[]' WHERE id=?", (json.dumps({"status": "done"}), t))
+        p.db.x("INSERT INTO runs(task,role,provider,model,started,status,cost_usd,note) VALUES(?,?,?,?,?,?,?,?)",
+               (t, "worker", "claude", "sonnet" if sonnet else "claude-opus-5-5", now - 600, "ok", 0.1,
+                note if sonnet else None))
+        r = p.db.add_task(f"Review #{t}", "", kind="review", tier="standard", priority=3, budget_usd=1.0)
+        p.db.x("UPDATE tasks SET status=?, labels=? WHERE id=?",
+               ("failed" if bad else "done", json.dumps([f"auto_review:{t}"]), r))
+        if sonnet:
+            sonnet_ids.append((t, r))
+    for i in range(283):   # Opus: 76 of 283 had changes asked (27%)
+        task(False, i < 76)
+    for i in range(5):     # Sonnet: 2 of 5 (40%): 13 points worse, but p~0.41: stays a canary
+        task(True, i < 2)
+    v = runclass.code_quality(p.db, {}, now - runclass.CODE_WINDOW_S, now)["new"]
+    assert (v["sonnet"]["bad"], v["sonnet"]["tasks"], v["opus"]["bad"], v["opus"]["tasks"]) == (2, 5, 76, 283)
+    assert abs(v["p"] - 0.41) < 0.01 and v["state"] == "canary"
+    # A kind latched off by an older rule recovers at the next hourly recompute.
+    p.db.set_kv(runclass.CODE_STATE_KV, json.dumps({"new": "off", "continue": "canary", "review_fix": "canary"}))
+    d = Daemon(p.base)
+    d._run_class_checked = d._code_quality_checked = 0.0
+    d.watch_run_classes()
+    assert d._code_state()["new"] == "canary"
+    assert p.db.one("SELECT COUNT(*) n FROM events WHERE kind='run_class_quality'")["n"] == 0
+    # 5 of 5 bad (p~0.0014): off, told once with the counts, p and how to turn it back on.
+    for t, r in sonnet_ids[2:]:
+        p.db.x("UPDATE tasks SET status='failed' WHERE id=?", (r,))
+    v = runclass.code_quality(p.db, {}, now - runclass.CODE_WINDOW_S, now)["new"]
+    assert v["sonnet"]["bad"] == 5 and v["p"] < 0.002 and v["state"] == "off"
+    # alarm_p 0: never off.
+    assert runclass.code_quality(p.db, {"route": {"code_sonnet": {"alarm_p": 0}}}, now - runclass.CODE_WINDOW_S,
+                                 now)["new"]["state"] == "canary"
+    d._run_class_checked = d._code_quality_checked = 0.0
+    d.watch_run_classes()
+    assert d._code_state()["new"] == "off"
+    ev = p.db.q("SELECT text FROM events WHERE kind='run_class_quality'")
+    assert len(ev) == 1
+    for s in ("Code tasks (new)", "5/5", "76/283", "p=0.0014", '"alarm_p": 0', "route.code_sonnet` false"):
+        assert s in ev[0]["text"], s
+    # The sample stops being significant (3 of the 5 pass after all): back on at the next hourly check.
+    for t, r in sonnet_ids[2:]:
+        p.db.x("UPDATE tasks SET status='done' WHERE id=?", (r,))
+    d._run_class_checked = d._code_quality_checked = 0.0
+    d.watch_run_classes()
+    assert d._code_state()["new"] == "canary"
 
 
 def test_code_quality_counts_a_task_retried_a_tier_up_as_bad_on_the_model_it_started_on(env):

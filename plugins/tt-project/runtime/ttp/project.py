@@ -714,7 +714,7 @@ META_KEYS = {"name", "id", "host", "root", "created", "tt_project_version", "pri
              "home_timezone", "home_timezone_from"}
 EXTRA_KEYS = {
     "waste": {"moved_at"},
-    # route: run-class routing (runclass.py). code_sonnet: {"share", "kinds", "guard", "guard_pts"} or false, the code
+    # route: run-class routing (runclass.py). code_sonnet: {"share", "kinds", "guard", "guard_pts", "alarm_p"} or false, the code
     # route and its daily guard (runclass.guard_run); core_cheap: {class: {"model", "effort"} | false} or false. Both
     # are account keys too (ACCOUNT_KEYS): the account's value first, the project's own over it. classes,
     # review_small_lines, review_medium_lines: the run classes' map and review sizes; host_max: host-wide (HOST_WIDE_KEYS).

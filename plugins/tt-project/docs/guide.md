@@ -1180,7 +1180,10 @@ yields to the A/B while that is on.
 Standard code tasks take Sonnet at high effort by kind (`route.code_sonnet`; a canary share of 0.2 by
 default, `share 1` for all). Set it for every project with `ttp config --account route.code_sonnet
 '{"share": 1.0}'` or for one with `ttp config <name> route.code_sonnet ...`: the project's value layers
-over the account's. A daily guard compares the last 24 h of code tasks with the prior 7 days: first-review
+over the account's. Every hour the last 7 days of each kind are compared: a kind goes back to Opus only when
+Sonnet fails its first review more than 10 points more often than Opus, on at least 5 tasks each, and a
+one-sided exact binomial test puts the gap below `route.code_sonnet.alarm_p` (default 0.05; 0 never moves it).
+It returns to Sonnet at the next hourly check once the gap stops being significant. A daily guard compares the last 24 h of code tasks with the prior 7 days: first-review
 fail rate, rework hops per landed change and $ per landed code task. With at least 5 reviewed tasks and a
 fail-rate rise of more than `route.code_sonnet.guard_pts` points (default 5), it moves every code kind back
 to Opus, holds it there until someone changes `route.code_sonnet`, and sends the coordinator one alert with

@@ -38,14 +38,18 @@ needs_deep, urgent and review_fix tasks, tier-up retries and pinned runs (provid
 On by default (ROUTINE_MODEL; `route.core_cheap.routine` {"model", "effort"} picks another); off with
 `route.classes.routine` "core" or `route.core_cheap.routine` false, when routine runs keep their tier's model. Quality alarm
 (routine_quality): when routine's failed and needs_review share over QUALITY_WINDOW_S beats hard's by more
-than QUALITY_GAP, with ALARM_MIN runs in each, the daemon raises one run_class_quality event per window.
+than QUALITY_GAP, with ALARM_MIN runs in each, and the difference is significant (worse_p below ALARM_P), the
+daemon raises one run_class_quality event per window.
 
 Code on Sonnet (CODE_KEY): standard-tier code tasks of a CODE_KINDS kind ("new"; "continue": one that
 continues another task; "review_fix": one that fixes a failed review, review_fix:<id>) run on Sonnet at high effort (CODE_MODEL) on the Claude core provider when their
 kind's quality allows it (code_quality, by the daemon each hour into the kv CODE_STATE_KV): "full" once Sonnet
 had CODE_FULL_MIN tasks with a known outcome over CODE_WINDOW_S and its bad share (failed, needs_review, or its
 first review asked for changes) is within QUALITY_GAP of Opus's; "off" once it is worse by more, with
-ALARM_MIN tasks each (the daemon raises one run_class_quality event when a kind moves back to Opus); else
+ALARM_MIN tasks each, and the difference is significant: worse_p (a one-sided exact binomial test of Sonnet's bad
+count against Opus's smoothed bad share) below ALARM_P (`route.code_sonnet.alarm_p`; 0 never moves a kind off), so a
+few bad tasks never move a kind (the daemon raises one run_class_quality event when a kind moves back to Opus; the
+next hourly recompute brings it back once the difference is no longer significant); else
 "canary": a stable CODE_CANARY share of its tasks (by task id; `route.code_sonnet.share`). Each kind has its
 own state and alarm. Review fixes take this route though route.kept_core keeps them off every other one, except
 a fix after REVIEW_ROUND_MAX failed reviews where the round is known (review_round). Urgent, needs_deep,
@@ -74,6 +78,7 @@ outage, never as a repeating alarm.
 from __future__ import annotations
 
 import json
+import math
 import re
 import time
 
@@ -95,6 +100,7 @@ ROUTINE_KINDS = ("work", "question", "harness")
 QUALITY_GAP = 0.10
 QUALITY_WINDOW_S = 86400.0
 ALARM_MIN = 5
+ALARM_P = 0.05     # a quality alarm needs the bad-share difference significant at this level (worse_p)
 CHEAP_KEY = "core_cheap"
 # Claude models for cheap classes on the core provider while no tt model serves them: decisions and
 # screening on Haiku, work that writes or judges code on Sonnet; all at low effort. Light runs keep the
@@ -369,6 +375,24 @@ def alarm_text(q: dict, hours: float) -> str:
             f"Last fallback: {q['last_error'] or 'none recorded'}.")
 
 
+def worse_p(bad: int, tasks: int, base_bad: int, base_tasks: int) -> float:
+    """One-sided exact binomial test: the chance of `bad` or more bad out of `tasks` at the baseline's bad
+    share. The baseline share is smoothed by one good and one bad task ((base_bad + 1) / (base_tasks + 2)), so a
+    clean small baseline never makes one bad task significant. Pure Python; 1.0 with no tasks."""
+    if tasks <= 0 or bad <= 0:
+        return 1.0
+    p0 = (max(base_bad, 0) + 1) / (max(base_tasks, 0) + 2)
+    return min(1.0, sum(math.comb(tasks, i) * p0 ** i * (1 - p0) ** (tasks - i) for i in range(bad, tasks + 1)))
+
+
+def alarm_p(cfg: dict | None) -> float:
+    """The significance level the code route's quality alarm needs (`route.code_sonnet.alarm_p`, 0..1; 0 never
+    moves a kind off), else ALARM_P."""
+    got = ((cfg or {}).get("route") or {}).get("code_sonnet")
+    got = got.get("alarm_p") if isinstance(got, dict) else None
+    return float(got) if isinstance(got, (int, float)) and not isinstance(got, bool) and 0 <= got <= 1 else ALARM_P
+
+
 def untrusted(task: dict) -> bool:
     """A task whose run may read untrusted text with tools: labelled untrusted_input, or one the daemon
     made from outside input (PR comments, CI, alerts, notes), a review of this project's own diff
@@ -427,8 +451,8 @@ def routine_quality(db, cfg: dict, since: float, until: float | None = None) -> 
     """Routine vs hard outcomes in [since, until), per task by its last worker run there: {"routine", "hard":
     {"tasks", "bad", "share"}, "gap", "alarm"}. Routine counts runs that took the routine cheap model; hard,
     runs of class hard on their tier's model. Bad: the run failed, or the task ended failed or with a
-    needs_review hand-off. `alarm`: ALARM_MIN tasks in each and routine's bad share above hard's by more
-    than QUALITY_GAP."""
+    needs_review hand-off. `alarm`: ALARM_MIN tasks in each, routine's bad share above hard's by more
+    than QUALITY_GAP, and that significant (`p`, worse_p, below ALARM_P)."""
     until = time.time() if until is None else until
     last: dict = {}
     for r in db.q("SELECT task, role, provider, status, note FROM runs WHERE role='worker' AND task IS NOT NULL "
@@ -455,15 +479,17 @@ def routine_quality(db, cfg: dict, since: float, until: float | None = None) -> 
     for v in out.values():
         v["share"] = round(v["bad"] / v["tasks"], 3) if v["tasks"] else 0.0
     gap = round(out[ROUTINE]["share"] - out["hard"]["share"], 3)
-    return {**out, "gap": gap, "alarm": min(out[ROUTINE]["tasks"], out["hard"]["tasks"]) >= ALARM_MIN
-            and gap > QUALITY_GAP}
+    p = worse_p(out[ROUTINE]["bad"], out[ROUTINE]["tasks"], out["hard"]["bad"], out["hard"]["tasks"])
+    return {**out, "gap": gap, "p": round(p, 4), "alarm": min(out[ROUTINE]["tasks"], out["hard"]["tasks"]) >= ALARM_MIN
+            and gap > QUALITY_GAP and p < ALARM_P}
 
 
 def quality_text(q: dict, hours: float) -> str:
     r, h = q[ROUTINE], q["hard"]
     return (f"Routine runs (Sonnet, high effort) went wrong more often than hard ones (Opus) in the last {hours:g} h: "
             f"{r['bad']}/{r['tasks']} tasks failed or needs_review ({r['share']:.0%}) vs {h['bad']}/{h['tasks']} "
-            f"({h['share']:.0%}). Check them; `route.classes.routine` \"core\" moves routine work back to Opus.")
+            f"({h['share']:.0%}; p={q.get('p', 1.0):.3g}, one-sided exact binomial). Check them; "
+            f"`route.classes.routine` \"core\" moves routine work back to Opus.")
 
 
 def code_quality(db, cfg: dict, since: float, until: float | None = None) -> dict:
@@ -471,10 +497,13 @@ def code_quality(db, cfg: dict, since: float, until: float | None = None) -> dic
     there (the model it started on, so a failed try retried a tier up stays on the side that failed) and counted
     once its outcome is known: {kind: {"sonnet", "opus": {"tasks", "bad", "share"}, "gap", "state"}}. Bad: that
     run or the task failed, a retry raised its tier, a needs_review or failed hand-off, or its first review
-    (auto_review:<id>) asked for changes. "state": "off" (ALARM_MIN each, Sonnet worse by more than
-    QUALITY_GAP), "full" (CODE_FULL_MIN Sonnet tasks, ALARM_MIN Opus ones, within QUALITY_GAP) or "canary"."""
+    (auto_review:<id>) asked for changes. "p": worse_p of Sonnet's bad count against Opus's share. "state": "off"
+    (ALARM_MIN each, Sonnet worse by more than QUALITY_GAP and p below alarm_p(cfg)), "full" (CODE_FULL_MIN Sonnet
+    tasks, ALARM_MIN Opus ones, within QUALITY_GAP) or "canary". Recomputed from the window alone, so a kind is
+    "off" only while its window's difference stays significant."""
     from .effort import RAISED
     until = time.time() if until is None else until
+    level = alarm_p(cfg)
     last: dict = {}
     for r in db.q("SELECT task, provider, model, status, note FROM runs WHERE role='worker' AND task IS NOT NULL "
                   "AND started>=? AND started<? AND status!='running' ORDER BY started", (since, until)):
@@ -515,8 +544,11 @@ def code_quality(db, cfg: dict, since: float, until: float | None = None) -> dic
         for m in ("sonnet", "opus"):
             v[m]["share"] = round(v[m]["bad"] / v[m]["tasks"], 3) if v[m]["tasks"] else 0.0
         v["gap"] = round(v["sonnet"]["share"] - v["opus"]["share"], 3)
+        p = worse_p(v["sonnet"]["bad"], v["sonnet"]["tasks"], v["opus"]["bad"], v["opus"]["tasks"])
+        v["p"] = round(p, 4)
         enough = v["opus"]["tasks"] >= ALARM_MIN
-        v["state"] = "off" if enough and v["sonnet"]["tasks"] >= ALARM_MIN and v["gap"] > QUALITY_GAP else \
+        v["state"] = "off" if enough and v["sonnet"]["tasks"] >= ALARM_MIN and v["gap"] > QUALITY_GAP \
+            and p < level else \
             "full" if enough and v["sonnet"]["tasks"] >= CODE_FULL_MIN else "canary"
     return out
 
@@ -525,8 +557,10 @@ def code_quality_text(kind: str, v: dict, hours: float) -> str:
     s, o = v["sonnet"], v["opus"]
     return (f"Code tasks ({kind}) on Sonnet went wrong more often than on Opus in the last {hours:g} h: "
             f"{s['bad']}/{s['tasks']} failed, needs_review or changes asked at first review ({s['share']:.0%}) vs "
-            f"{o['bad']}/{o['tasks']} ({o['share']:.0%}). New {kind} code tasks run on Opus again; "
-            f"`route.code_sonnet` false turns the Sonnet route off.")
+            f"{o['bad']}/{o['tasks']} ({o['share']:.0%}); p={v.get('p', 1.0):.3g} (one-sided exact binomial, "
+            f"significant). New {kind} code tasks run on Opus again; they go back to Sonnet by themselves once the "
+            f"difference stops being significant, or at the next hourly check with \"alarm_p\": 0 added to "
+            f"`route.code_sonnet`; `route.code_sonnet` false turns the Sonnet route off.")
 
 
 def guard_settings(cfg: dict) -> dict | None:
