@@ -768,9 +768,14 @@ def test_a_long_once_listen_blocks_in_one_call_and_returns_at_the_first_reply_or
 
 
 def _fake_clock(cli, monkeypatch, step=2.0, on_nap=None):
-    real_time, clock, naps = time.time, [0.0], []
+    # time.sleep is patched process-wide: only this test's own thread moves the clock, so a sleep in any
+    # other thread (a pytest plugin, a leftover helper) neither skips the test's waits nor counts as a nap
+    real_time, real_sleep, clock, naps = time.time, time.sleep, [0.0], []
+    owner = threading.get_ident()
 
     def nap(s):
+        if threading.get_ident() != owner:
+            return real_sleep(s)
         naps.append(s)
         clock[0] += step
         if on_nap:

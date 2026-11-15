@@ -72,12 +72,18 @@ def _rc_fake_ssh(tmp_path):
     bin_, remote = tmp_path / "fakessh", tmp_path / "remote"
     bin_.mkdir(exist_ok=True)
     remote.mkdir(exist_ok=True)
-    ssh = bin_ / "ssh"
-    ssh.write_text(_RC_FAKE_SSH)
-    ssh.chmod(0o755)
-    (bin_ / "idle.loadavg").write_text("0.00 0.00 0.00 1/100 1\n")
-    (bin_ / "idle.stat").write_text("cpu  100 0 100 10000 0 0 0 0 0 0\ncpu0 100 0 100 10000 0 0 0 0 0 0\n"
-                                    "procs_running 1\n")
+    # each file is replaced whole, never rewritten in place: a second call while a check runs must not leave
+    # the fake ssh half written (or missing) for a run that execs it right then
+    for name, text, mode in (("ssh", _RC_FAKE_SSH, 0o755), ("idle.loadavg", "0.00 0.00 0.00 1/100 1\n", 0o644),
+                             ("idle.stat", "cpu  100 0 100 10000 0 0 0 0 0 0\ncpu0 100 0 100 10000 0 0 0 0 0 0\n"
+                                           "procs_running 1\n", 0o644)):
+        f = bin_ / name
+        if f.is_file() and f.read_text() == text:
+            continue
+        tmp = bin_ / f".{name}.{os.getpid()}.{threading.get_ident()}"
+        tmp.write_text(text)
+        tmp.chmod(mode)
+        os.replace(tmp, f)
     return bin_, remote
 
 
@@ -1114,10 +1120,28 @@ def test_the_same_check_hanging_on_two_spill_hosts_fails_the_run_and_a_host_faul
     p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, hosts, charter=hosts)
     p.set_config("delivery.checks_remote_only", False)
     monkeypatch.setattr(checkwall, "POLL_S", 0.1)
+    # A test clock for the silence limit: it stands still until a command reaches its hang (the `hung` mark),
+    # then moves 3 s a look, so a slow copy or start on a loaded machine is never taken for a hang, and a
+    # real hang is one within a few looks. Each check command's wait clears the mark for the next.
+    hung, skew = tmp_path / "hung", [0.0]
+
+    def test_clock():
+        if hung.exists():
+            skew[0] += 3.0
+        return skew[0]
+    real_wait = checkwall.wait
+
+    def wait(*args, **kw):
+        try:
+            return real_wait(*args, **kw)
+        finally:
+            hung.unlink(missing_ok=True)
+    monkeypatch.setattr(checkwall, "clock", test_clock)
+    monkeypatch.setattr(checkwall, "wait", wait)
     monkeypatch.setenv("TTP_TASK", "8416")
     log = tmp_path / "where.log"
-    p.set_config("delivery.push_checks", [{"run": f'pwd >> {log}; case "$PWD" in */ttp-check.*) sleep 30;; esac',
-                                           "silent_s": 2}])
+    p.set_config("delivery.push_checks", [{"run": f'pwd >> {log}; case "$PWD" in */ttp-check.*) touch {hung}; '
+                                                  f'sleep 30;; esac', "silent_s": 2}])
     lane = _spill_lane(p, repo)
     threading.Timer(_load_scaled(90), lane.close).start()   # bounded: a run that never fails here frees it
     try:
@@ -1146,7 +1170,7 @@ def test_the_same_check_hanging_on_two_spill_hosts_fails_the_run_and_a_host_faul
     log.write_text("")
     seen = len((run / "checks.log").read_text())
     p.set_config("delivery.push_checks", [{"run": f"pwd >> {log}; echo x >> {count}; "
-                                                  f'test "$(wc -l < {count})" -gt 1 || sleep 30',
+                                                  f'test "$(wc -l < {count})" -gt 1 || {{ touch {hung}; sleep 30; }}',
                                            "host": "local", "spill": True, "spill_wrap_cmd": "./refuse-once.sh",
                                            "silent_s": 2}])
     lane = _spill_lane(p, repo)
