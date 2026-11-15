@@ -206,6 +206,25 @@ def test_superseded_accepts_the_tasks_own_head_when_it_is_on_the_given_ref_but_n
     assert landed.superseded(p.db, [tid])[tid] == [(own, own)]
 
 
+def test_superseded_refuses_the_tasks_own_head_without_a_ref_even_when_its_own_tracking_ref_holds_it(
+        env, monkeypatch, capsys):
+    """Without --ref, in a repository other than the root, the only holder may be the branch's own
+    remote-tracking ref: that proves no landing, so the own head still predates the work."""
+    from ttp import cli
+    p, repo, other, tid, path, branch, head = _landed_setup(env, monkeypatch)
+    _commit(path, "more.txt", "a\n")
+    own = _git_out(path, "rev-parse", "HEAD")
+    _git_out(other, "fetch", "-q", str(path), f"{branch}:refs/heads/{branch}")
+    _git_out(other, "push", "-q", "origin", branch)
+    _git_out(other, "fetch", "-q", "origin")
+    assert f"origin/{branch}" in _git_out(other, "branch", "-r", "--contains", own).split()
+    with pytest.raises(SystemExit) as e:
+        cli.main(["task", p.name, "superseded", str(tid), own, "--repo", str(other)])
+    assert e.value.code not in (0, None)
+    assert "predates the work" in capsys.readouterr().err
+    assert p.db.q("SELECT * FROM task_superseded") == []
+
+
 def test_superseded_refuses_the_tasks_own_head_when_the_ref_does_not_hold_it(env, monkeypatch, capsys):
     from ttp import cli
     p, repo, other, tid, path, branch, head = _landed_setup(env, monkeypatch)
@@ -12969,8 +12988,9 @@ def test_the_push_audit_decides_landed_by_ancestry_not_by_the_ref_or_subject_nam
 
 
 def _own_branch_setup(env, monkeypatch, on_remote: str | None):
-    """A task whose head is on a remote-tracking ref other than the push branch (`on_remote`, or on none
-    when None); the task's own branch was never pushed. Returns (p, repo, head)."""
+    """A task whose head is on the remote branch `on_remote` ("proj" is the push branch; None: on no
+    remote branch); the task's own branch `work` was never pushed unless `on_remote` names it.
+    Returns (p, repo, head)."""
     p, repo, origin, _ = _push_setup(env, monkeypatch, ["true"])
     _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/proj")
     _git_out(repo, "checkout", "-q", "-b", "work")
@@ -12982,13 +13002,69 @@ def _own_branch_setup(env, monkeypatch, on_remote: str | None):
     return p, repo, head
 
 
-def test_the_push_audit_counts_a_head_on_a_remote_tracking_ref_as_landed(env, monkeypatch):
+def test_the_push_audit_counts_a_claimed_head_on_the_push_branch_as_landed(env, monkeypatch):
     from ttp import pushclaim
-    p, repo, head = _own_branch_setup(env, monkeypatch, "elsewhere")
-    assert _git_out(repo, "branch", "-r", "--contains", head).split() == ["origin/elsewhere"]
-    _audit_done(p, "landed another way", f"pushed {head[:10]} to origin/work")
+    p, repo, head = _own_branch_setup(env, monkeypatch, "proj")
+    assert _git_out(repo, "branch", "-r", "--contains", head).split() == ["origin/proj"]
+    tid = _audit_done(p, "landed another way", f"pushed {head[:10]} to origin/work")
     a = pushclaim.audit(p)
     assert a["gaps"] == [] and a["counts"]["missing"] == 0 and a["counts"]["confirmed"] == 1, a
+    assert a["landed"] == [tid]
+
+
+def test_the_push_audit_never_takes_another_remote_branch_as_landing_proof(env, monkeypatch):
+    """A summary claiming the push branch whose head sits only on the task's own remote work branch
+    (or any other non-push ref) stays missing and is not landed: no ask closes as 'its work landed'."""
+    from ttp import pushclaim
+    p, repo, head = _own_branch_setup(env, monkeypatch, "work")
+    for other in ("elsewhere", "pr-123"):
+        _git_out(repo, "push", "-q", "origin", f"{head}:refs/heads/{other}")
+    _git_out(repo, "fetch", "-q", "origin")
+    tid = _audit_done(p, "claims the push branch", f"pushed {head[:10]} to origin/proj")
+    a = pushclaim.audit(p)
+    assert [(g["task"], g["state"]) for g in a["gaps"]] == [(tid, "missing")], a
+    assert a["landed"] == []
+
+
+def _audit_marker(p, tmp_path, head, repo, status, exit_code, branch, title="push"):
+    tid = p.db.add_task(title, "s", kind="code", origin="user", branch="work")
+    p.db.x("INSERT INTO runs(task,role,provider,started,ended,status,dir) VALUES(?,?,?,?,?,?,?)",
+           (tid, "worker", "fake", time.time() - 60, time.time() - 30, "ok", str(tmp_path)))
+    rid = p.db.q("SELECT id FROM runs WHERE task=?", (tid,))[0]["id"]
+    marker = p.state / "pushes" / f"t{tid}-x.json"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps({"id": f"t{tid}-x", "run": rid, "status": status, "exit": exit_code,
+                                  "head": head, "repo": str(repo), "remote": "origin", "branch": branch,
+                                  "target": f"origin/{branch}", "reason": "stopped"}))
+    p.db.update_task(tid, status="done", result=json.dumps({"status": "done", "summary": "done"}))
+    return tid
+
+
+def test_the_push_audit_keeps_a_failed_push_branch_push_missing_when_the_head_is_only_on_a_work_branch(
+        env, monkeypatch, tmp_path):
+    from ttp import pushclaim
+    p, repo, head = _own_branch_setup(env, monkeypatch, "work")
+    tid = _audit_marker(p, tmp_path, head, repo, "failed", 1, "proj")
+    a = pushclaim.audit(p)
+    assert [(g["task"], g["state"]) for g in a["gaps"]] == [(tid, "missing")], a
+    assert a["landed"] == []
+
+
+def test_the_push_audit_counts_a_cancelled_push_landed_through_a_recorded_superseding_commit(
+        env, monkeypatch, tmp_path):
+    """The head itself is on no push-branch commit, but a commit recorded as superseding the task is."""
+    from ttp import pushclaim
+    p, repo, head = _own_branch_setup(env, monkeypatch, None)
+    _git_out(repo, "checkout", "-q", "-b", "carrier", "origin/proj")
+    _commit(repo, "carried.txt", "the work, reshaped\n")
+    carrier = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/proj")
+    _git_out(repo, "fetch", "-q", "origin")
+    tid = _audit_marker(p, tmp_path, head, repo, "cancelled", 143, "work")
+    assert [g["state"] for g in pushclaim.audit(p)["gaps"]] == ["missing"]
+    p.db.x("INSERT INTO task_superseded(task, head, sha, ts) VALUES(?,?,?,?)", (tid, head, carrier, time.time()))
+    a = pushclaim.audit(p)
+    assert a["gaps"] == [] and a["landed"] == [tid], a
 
 
 def test_the_push_audit_still_reports_a_head_on_no_remote_ref(env, monkeypatch):
@@ -13010,23 +13086,15 @@ def test_the_push_audit_ignores_the_claimed_branch_s_own_stale_tracking_ref(env,
     assert [(g["task"], g["state"]) for g in a["gaps"]] == [(tid, "missing")], a
 
 
-@pytest.mark.parametrize("landed,expect", [("elsewhere", []), (None, ["missing"])])
+@pytest.mark.parametrize("landed,expect", [("proj", []), ("elsewhere", ["missing"]), (None, ["missing"])])
 def test_the_push_audit_counts_a_cancelled_own_push_whose_head_landed_by_another_route(
         env, monkeypatch, tmp_path, landed, expect):
     from ttp import pushclaim
     p, repo, head = _own_branch_setup(env, monkeypatch, landed)
-    tid = p.db.add_task("cancelled push", "s", kind="code", origin="user", branch="work")
-    p.db.x("INSERT INTO runs(task,role,provider,started,ended,status,dir) VALUES(?,?,?,?,?,?,?)",
-           (tid, "worker", "fake", time.time() - 60, time.time() - 30, "ok", str(tmp_path)))
-    rid = p.db.q("SELECT id FROM runs WHERE task=?", (tid,))[0]["id"]
-    marker = p.state / "pushes" / f"t{tid}-x.json"
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    marker.write_text(json.dumps({"id": f"t{tid}-x", "run": rid, "status": "cancelled", "exit": 143,
-                                  "head": head, "repo": str(repo), "remote": "origin", "branch": "work",
-                                  "target": "origin/work", "reason": "stopped on purpose"}))
-    p.db.update_task(tid, status="done", result=json.dumps({"status": "done", "summary": "done"}))
+    tid = _audit_marker(p, tmp_path, head, repo, "cancelled", 143, "work", "cancelled push")
     a = pushclaim.audit(p)
     assert [g["state"] for g in a["gaps"]] == expect, a
+    assert a["landed"] == ([] if expect else [tid])
 
 
 def test_the_push_audit_skips_tasks_with_no_branch_and_no_queue_claims(env, monkeypatch):

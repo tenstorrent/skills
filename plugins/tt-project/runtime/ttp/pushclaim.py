@@ -413,10 +413,11 @@ def _marker_target(p, m: dict) -> tuple:
     return repo, to
 
 
-def _marker_local(p, c: dict, state: str, why: str) -> tuple[str, str]:
+def _marker_local(p, c: dict, state: str, why: str, task: int = 0, tips: dict | None = None) -> tuple[str, str]:
     """A marker claim the remote check left UNKNOWN or UNVERIFIABLE, confirmed when its commit is an
     ancestor of the target's local tracking ref (a later commit on the branch is fine). A MISSING is
-    confirmed only when another remote-tracking ref holds the commit (not the claimed branch's own).
+    confirmed only when the project's push branch holds the commit, or a commit recorded as
+    superseding `task` (its push was cancelled and the work landed another way); no other ref counts.
     Local refs only, never a fetch."""
     try:
         m = _read_marker(p, c["marker"])
@@ -426,8 +427,8 @@ def _marker_local(p, c: dict, state: str, why: str) -> tuple[str, str]:
         repo, to = _marker_target(p, m)
         if state not in (UNKNOWN, UNVERIFIABLE):
             # A push that ended without landing its head, which another route put on a remote ref anyway.
-            if state == MISSING and (held := _on_remote_ref(repo, sha, _own_tracking(p, c))):
-                return CONFIRMED, f"{sha[:12]} is on {held[len('refs/remotes/'):]} ({why})"
+            if state == MISSING and sha and repo and (on := _on_push_branch(p, task, Path(repo), [sha], tips)):
+                return CONFIRMED, f"{on} ({why})"
             return state, why
         if not sha or not to or not to[1].startswith("refs/heads/"):
             return state, why
@@ -565,32 +566,22 @@ def _contains(repo, sha: str, branch: str) -> bool:
     return bool(full) and _git(repo, "merge-base", "--is-ancestor", full, f"refs/heads/{branch}").returncode == 0
 
 
-def _on_remote_ref(repo, sha: str, skip: tuple = ()) -> str:
-    """The first remote-tracking ref (local read, no fetch) that holds `sha` by ancestry, "" when none.
-    `skip`: tracking refs left out (the claimed ref's own, which a pruned remote branch may leave stale)."""
-    full = _commit(repo, sha) if sha else ""
-    if not full:
-        return ""
-    out = _git(repo, "for-each-ref", "--contains", full, "--format=%(refname)", "refs/remotes")
-    if out.returncode != 0:
-        return ""
-    return next((r for r in out.stdout.split() if r not in skip and not r.endswith("/HEAD")), "")
-
-
-def _own_tracking(p, c: dict) -> tuple:
-    """The tracking ref of the branch a claim names, which the remote check just found without the commit."""
-    try:
-        if c.get("marker"):
-            m = _read_marker(p, c["marker"])
-            repo, to = _marker_target(p, m)
-            remote, ref = to or ("", "")
-        else:
-            remote, ref = c.get("remote") or "", c.get("ref") or ""
-        if remote and ref.startswith("refs/heads/"):
-            return (f"refs/remotes/{remote}/{ref[len('refs/heads/'):]}",)
-    except Exception:
-        pass
-    return ()
+def _on_push_branch(p, task: int, repo: Path, shas: list, tips: dict | None = None) -> str:
+    """"<sha> is on the push branch" when the project's push branch (its local tracking ref, read as
+    `ttp landed` reads it, never fetched) holds one of `shas` or a commit recorded as superseding
+    `task`; "" otherwise. `tips` caches the tip per repo for one audit."""
+    from . import landed
+    tips = {} if tips is None else tips
+    if repo not in tips:
+        tips[repo] = landed._tip(repo, landed._push_ref(p, repo), fetch=False)[0]
+    tip = tips[repo]
+    if task:
+        shas = list(shas) + [r["sha"] for r in p.db.q("SELECT sha FROM task_superseded WHERE task=?", (task,))]
+    for s in shas:
+        full = _commit(repo, s)
+        if tip and full and landed.on_branch(repo, full, tip):
+            return f"{s[:12]} is on the push branch"
+    return ""
 
 
 def _reattribute(p, t, c: dict, state: str, why: str, claimed: dict, tips: dict) -> tuple[str, str]:
@@ -602,19 +593,10 @@ def _reattribute(p, t, c: dict, state: str, why: str, claimed: dict, tips: dict)
     from its tracking ref as the remote checks (within the tick's Budget) or an earlier fetch left it.
     Accepted gap: a commit the local ref has not seen yet stays unconfirmed until an audit after
     the next fetch."""
-    from . import landed
     repo = Path(c.get("repo") or p.root)
     try:
-        if repo not in tips:
-            tips[repo] = landed._tip(repo, landed._push_ref(p, repo), fetch=False)[0]
-        tip = tips[repo]
-        shas = [c["sha"]] + [r["sha"] for r in p.db.q("SELECT sha FROM task_superseded WHERE task=?", (t["id"],))]
-        for s in shas:
-            full = _commit(repo, s)
-            if tip and full and landed.on_branch(repo, full, tip):
-                return CONFIRMED, f"{s[:12]} is on the push branch"
-        if held := _on_remote_ref(repo, c["sha"], _own_tracking(p, c)):
-            return CONFIRMED, f"{c['sha'][:12]} is on {held[len('refs/remotes/'):]}"
+        if on := _on_push_branch(p, t["id"], repo, [c["sha"]], tips):
+            return CONFIRMED, on
         others = [o for o in claimed.get(c["sha"][:12], []) if o["id"] != t["id"]]
         if others and not (t["branch"] and _contains(repo, c["sha"], t["branch"])):
             owner = next((o for o in others if o["branch"] and _contains(repo, c["sha"], o["branch"])), None)
@@ -681,7 +663,7 @@ def audit(p, days: float = AUDIT_DAYS, now: float | None = None, max_refs: int =
             if state != CONFIRMED and not over and c.get("sha") and not c.get("marker"):
                 state, why = _reattribute(p, t, c, state, why, claimed, tips)
             elif state != CONFIRMED and not over and c.get("marker"):
-                state, why = _marker_local(p, c, state, why)
+                state, why = _marker_local(p, c, state, why, t["id"], tips)
             if state in (SHARED, UNVERIFIABLE):   # counted apart, only when there are any
                 counts[state] = counts.get(state, 0) + 1
             else:

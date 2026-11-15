@@ -659,9 +659,10 @@ def _record_work(p, task: dict, sha: str, ref: str | None, repo: str | None) -> 
             raise ValueError(f"not recorded: {full[:10]} is on no branch of {repo} but {branch}; "
                              "name the ref that holds it with --ref")
         tip, words = full, f"{full[:10]} is on {holders[0]} in {repo}"
-    # The task's own head, already on the target (its own push was cancelled and the work landed another
-    # way), is the work itself; any older commit of the branch still predates it.
-    own_head = full == head
+    # The task's own head, already on the --ref target (its own push was cancelled and the work landed
+    # another way), is the work itself; any older commit of the branch still predates it. Without --ref
+    # the holders above may be only the branch's own tracking ref, which proves no landing.
+    own_head = bool(ref) and full == head
     if not own_head and _git(repo, "merge-base", "--is-ancestor", full, head).returncode == 0:
         raise ValueError(f"not recorded: {full[:10]} is already in branch {branch}, so it predates the work")
     base = _git(repo, "merge-base", head, tip).stdout.strip() if tip else ""
