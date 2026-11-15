@@ -37,6 +37,7 @@ import uuid
 from pathlib import Path
 
 from . import runtimeload   # first of its own: its LOADED_AT is when the daemon imported its code
+from . import deviceab
 from . import batchrun
 from . import leadmode
 from . import coordprecheck
@@ -2595,6 +2596,18 @@ class Daemon:
                 self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
                             (now, "daemon", "code_route_guard", "high", runclass.guard_text(row)[:1000], "queued"))
                 log(self.p, "code-route guard tripped: every code kind runs on Opus until route.code_sonnet changes")
+        # route.device_ab: the test arm's incident stop (one high event) and the masked reviews.
+        if now - getattr(self, "_device_ab_checked", 0.0) >= 300:
+            self._device_ab_checked = now
+            try:
+                got = deviceab.tick(self.p.db, self.cfg, now)
+                if got.get("stop"):
+                    self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                                (now, "daemon", "device_ab_stop", "high", deviceab.stop_text(got["stop"])[:1000],
+                                 "queued"))
+                    log(self.p, "device A/B: test arm stopped after a device incident")
+            except Exception as e:   # never holds the loop
+                log(self.p, f"device A/B tick failed: {type(e).__name__}: {e}"[:300])
         # Cheap classes on Claude with none on a tt model: told once per outage, never as a repeating alarm.
         down = runclass.tt_unavailable(s)
         told = self.p.db.kv("tt_unavailable_told", "") or ""
@@ -13062,6 +13075,12 @@ class Daemon:
                 # A cheap class on the Claude core provider (no tt model serves it): a cheap Claude model.
                 cheap = None if dp else runclass.core_cheap(self.cfg, task, run_cls, tier, run_prov, routed, picked,
                                                             self._code_state())
+                try:   # route.device_ab: a device task's arm (recorded on it before its first run) wins
+                    if dab := deviceab.assign(db, self.cfg, self.p.name, task, run_prov, run_cls, picked):
+                        cheap = {k: v for k, v in dab.items() if k != deviceab.KEY}
+                        note[deviceab.KEY] = dab[deviceab.KEY]
+                except Exception as e:   # the A/B must never hold a task back
+                    log(self.p, f"task {task['id']}: device A/B not assigned: {e}"[:300])
                 if cheap:
                     note[runclass.CHEAP_KEY] = cheap
                 try:   # a routed model pick runs its option's effort: no A/B arm; nor does a cheap core run

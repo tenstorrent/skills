@@ -1186,6 +1186,19 @@ fail-rate rise of more than `route.code_sonnet.guard_pts` points (default 5), it
 to Opus, holds it there until someone changes `route.code_sonnet`, and sends the coordinator one alert with
 the numbers. `route.code_sonnet.guard false` turns it off; `ttp stats <name> --code-guard` shows the rows.
 
+A device A/B compares two Claude models on device tasks; it is off by default. `route.device_ab` (a project
+and account key, the project's value over the account's) takes `{"projects": [...], "arms": {"sonnet":
+{"model": "sonnet", "effort": "high"}, "opus": {"model": "opus", "effort": "high"}}, "share": 0.5, "days": 3,
+"max_tasks": 60, "seed": 1}`; the first arm is the test arm. From the first time the daemon sees the setting,
+each new work, question or code task in a listed project that uses a device (a `needs_device` label, a device
+lock or a machine in its resources) gets an arm from a stable hash of the seed, project and task id, recorded on
+the task before its first run and kept on later runs. Urgent, pinned, deep, plan and review tasks and tier-up
+retries stay out and are counted; a tier-up retry of an A/B task runs on the second arm, marked. It ends after
+`days` or `max_tasks`. A device incident (a hang, reset, recovery, power cycle or hold) during a test-arm run or
+within 30 minutes after it stops the test arm at once, with one high alert to the coordinator. Each finished A/B
+task gets one masked review at Opus high (answered what was asked, conclusions supported by logs, 0-4 each).
+`ttp stats <name> --device-ab [--json]` reports per arm and kind; `--all` or `--projects a,b` reads every project.
+
 Light is for mechanical work only: file reads and copies, small scripted edits, polling, test
 reruns. A conclusion run, whose output is a conclusion the user reads, never starts below the
 conclusion floor, `coordinator.conclusion_floor` (default `standard/high`: the standard tier at

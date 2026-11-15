@@ -2112,6 +2112,8 @@ def cmd_stats(a) -> None:
     from . import budget as bud
     if getattr(a, "ready_wait", False) and (a.all or a.projects):
         return _stats_ready_wait_all(a)
+    if getattr(a, "device_ab", False) and (a.all or a.projects):
+        return _stats_device_ab_all(a)
     p = need(a.name, sys.argv[1:]) if a.name else here()
     if not p:
         die("no tt-project project here; name one: `ttp stats <name>`")
@@ -2181,6 +2183,11 @@ def cmd_stats(a) -> None:
         s = runclass.by_class(p.db, p.config(), since, _stats_time(a.until, tz, "--until"))
         print(json.dumps(s, indent=1) if a.json else runclass.text(s))
         return
+    if getattr(a, "device_ab", False):
+        from . import deviceab
+        r = deviceab.report(p.db.q, lambda k: p.db.kv(k, ""), p.config())
+        print(json.dumps(r, indent=1) if a.json else deviceab.report_text(r, p.name))
+        return
     if getattr(a, "code_guard", False):
         from . import runclass
         s = runclass.guard_report(p.db, p.config(), max(1, int(a.days or 7)))
@@ -2206,6 +2213,47 @@ def cmd_stats(a) -> None:
         return
     s = bud.reread_stats(p.db, a.days, top=a.top, since=since, until=until)
     print(json.dumps(s, indent=1) if a.json else bud.reread_text(s, tz if since or until else None))
+
+
+def _stats_device_ab_all(a) -> None:
+    """`ttp stats --device-ab --all` (or --projects a,b): the device A/B of every project on this machine, each
+    read only from its own state folder (a read-only db connection)."""
+    import sqlite3
+    from . import deviceab
+    from . import globalcap as gcap
+    from . import project as project_mod
+    reg = load_registry().get("projects") or {}
+    names = [n.strip() for n in a.projects.split(",") if n.strip()] if a.projects else sorted(reg)
+    out: dict = {}
+    for name in names:
+        e = reg.get(name)
+        if not isinstance(e, dict) or not e.get("dir"):
+            out[name] = {"error": "not registered on this machine"}
+            continue
+        proj = project_mod.Project(str(e["dir"]))
+        try:
+            cfg = proj.config()
+            conn = gcap.connect_ro(proj.state / "project.db", timeout=5)
+        except (sqlite3.Error, OSError, ValueError) as err:
+            out[name] = {"error": str(err)}
+            continue
+        conn.row_factory = sqlite3.Row
+        q = lambda sql, args=(): [dict(r) for r in conn.execute(sql, tuple(args))]   # noqa: E731
+
+        def kv(key: str, q=q) -> str:
+            got = q("SELECT value FROM kv WHERE key=?", (key,))
+            return str(got[0]["value"] or "") if got else ""
+        try:
+            out[name] = deviceab.report(q, kv, cfg)
+        except sqlite3.Error as err:
+            out[name] = {"error": str(err)}
+        finally:
+            conn.close()
+    if a.json:
+        print(json.dumps(out, indent=1))
+        return
+    print("\n".join(f"{n}: {r['error']}" if "error" in r else deviceab.report_text(r, n) for n, r in out.items())
+          or "no projects")
 
 
 def _stats_ready_wait_all(a) -> None:
@@ -15306,14 +15354,18 @@ def main(argv: list[str] | None = None) -> None:
                    help="how long ready tasks waited for their run to start instead: median, p90, max, by hold "
                         "cause (project cap, machine-wide limit, own checks, budget gate, resource, dispatch with a "
                         "free place), and the host checks slot waits (readywait.py; --since/--until, else --days)")
-    s.add_argument("--all", action="store_true", help="with --ready-wait: every project on this machine, read only")
-    s.add_argument("--projects", help="with --ready-wait: these projects (comma-separated), read only")
+    s.add_argument("--all", action="store_true", help="with --ready-wait or --device-ab: every project on this machine, read only")
+    s.add_argument("--projects", help="with --ready-wait or --device-ab: these projects (comma-separated), read only")
     s.add_argument("--babysit", action="store_true",
                    help="the chat watcher instead: decisions it settled and fallbacks, per purpose, model and hour "
                         "(read-only; --since/--until, else the last --days)")
     s.add_argument("--by-class", action="store_true",
                    help="runs per run class per model per hour with real cost instead (runclass.py); "
                         "--since 1h or 24h (the default) or a time")
+    s.add_argument("--device-ab", action="store_true",
+                   help="the device A/B (route.device_ab, deviceab.py) instead: per arm and kind (device work, "
+                        "device code) tasks, done, failed, retried, follow-up fixes, incidents, blind scores, $ and "
+                        "minutes per task, and the excluded count; with --all or --projects: every project, read only")
     s.add_argument("--code-guard", action="store_true",
                    help="the daily code-route guard instead (runclass.guard_run): per day, code tasks' review-fail "
                         "rate, rework hops and $ per landed code task against the prior 7 days, and whether a trip "

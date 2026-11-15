@@ -718,7 +718,7 @@ EXTRA_KEYS = {
     # route and its daily guard (runclass.guard_run); core_cheap: {class: {"model", "effort"} | false} or false. Both
     # are account keys too (ACCOUNT_KEYS): the account's value first, the project's own over it. classes,
     # review_small_lines, review_medium_lines: the run classes' map and review sizes; host_max: host-wide (HOST_WIDE_KEYS).
-    "route": {"code_sonnet", "core_cheap", "classes", "review_small_lines", "review_medium_lines", "host_max"},
+    "route": {"code_sonnet", "core_cheap", "device_ab", "classes", "review_small_lines", "review_medium_lines", "host_max"},
     "budget": {"max_waits", "hourly_floor_usd", "estimate_weights", "hourly_waste_usd", "hourly_waste_runs",
                "hourly_coordinator_turns", "hourly_coordinator_repeats", "max_pace_hold_s",
                "cap_yellow_pct"},   # max_pace_hold_s: deprecated and ignored; accepted so old configs stay quiet
@@ -3254,7 +3254,7 @@ CPU_GROUP_KEYS = {"cpu_quota", "busy_cpu_quota", "busy_probe", "busy_probe_s", "
 # project's own project.json, so the projects on a machine agree unless one overrides a key.
 ACCOUNT_KEYS = {"budget": {"global_daily_usd", "daily_target_usd", "day_start", "timezone", "push_spend_to"}, "pricing": {"claude", "codex"},
                 "guards": {"protected_paths"},   # paths no run on the host writes (pathguard)
-                "route": {"host_max", "classes", "review_small_lines", "review_medium_lines", "code_sonnet", "core_cheap"},   # route.host_limit; run-class routing (runclass.py)
+                "route": {"host_max", "classes", "review_small_lines", "review_medium_lines", "code_sonnet", "core_cheap", "device_ab"},   # route.host_limit; run-class routing (runclass.py); route.device_ab (deviceab.py)
                 "checks": {"host_max", "bare_slots", "idle_hold_s", "load_extra", "live_cores", "nice", "ionice", "priority_turns", "urgent_slots", "preempt_after_s", "test_pool", "test_run_max",
                            "test_run_min", "test_project_max", "test_project_slots", "test_project_workers", "load_guard", "load_sustain_s", "build_pool", "build_run_max", "build_project_max", "wall_cap_s",
                            "slots", "light_cmds", "max_wait_s", "wait_event_s", "priority_age_s",
