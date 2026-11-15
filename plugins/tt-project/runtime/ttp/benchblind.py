@@ -2,13 +2,16 @@
 shuffled with a recorded seed, a reviewer scores each against the task's acceptance criteria on a
 fixed rubric, and the arm labels are revealed only once every score of the batch is recorded.
 
-    python3 -m ttp.benchblind prep <cells.json | `ttp bench run` folder> --out <dir> [--seed N]
+    python3 -m ttp.benchblind prep <cells.json | `ttp bench run` folder>... --out <dir> [--seed N]
     (or `ttp bench blind <the same words>`)
     python3 -m ttp.benchblind review <dir> [--provider claude] [--model M] [--effort E] [--budget-usd 2]
     python3 -m ttp.benchblind score <dir> <item> '<{"scores": {...}, "notes": "..."}>'
     python3 -m ttp.benchblind reveal <dir>
+    python3 -m ttp.benchblind regrade <dir> --out <dir2>     (same masked items, seal and rubric, no scores: a second reviewer)
+    python3 -m ttp.benchblind compare <dir> <dir2>           (two revealed batches: per-arm scores under both, ranking change)
 
-cells.json: {"cells": [{"task": "<id>", "criteria": "<acceptance criteria>", "arms": {"<label>":
+prep with several folders merges their cells per task into one batch (each arm label is unique across them), so
+arms from different runs are graded together blind. cells.json: {"cells": [{"task": "<id>", "criteria": "<acceptance criteria>", "arms": {"<label>":
 {"diff": "<unified diff>", "<any metadata: model, provider, effort, run_id, transcript, wall_s>": ...}}}]}
 
 Anonymising drops commit headers, trailers and blob ids, masks model and provider names, effort
@@ -131,6 +134,24 @@ def _sha(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
 
+def merge_cells(lists: list[list[dict]]) -> list[dict]:
+    """One cell list from several runs: cells of one task join their arms (criteria and reference from the first
+    that has them); an arm label named twice for one task is refused, so rename an arm before merging."""
+    by_task: dict = {}
+    for cells in lists:
+        for c in cells:
+            t = str(c["task"])
+            got = by_task.setdefault(t, {**c, "arms": {}})
+            for k in ("criteria", "reference"):
+                if not got.get(k) and c.get(k):
+                    got[k] = c[k]
+            for label, arm in c["arms"].items():
+                if label in got["arms"]:
+                    raise Refused(f"arm {label!r} of task {t} is in two of the folders; rename one")
+                got["arms"][label] = arm
+    return list(by_task.values())
+
+
 def prep(cells: list[dict], out: Path, seed: int | None = None, rubric=RUBRIC) -> dict:
     """Seal a batch. `rubric`: the rows (name, max, what) its reviewer scores; a cell's `reference` (the
     established answer, which names no arm) goes to the reviewer with its item."""
@@ -224,6 +245,58 @@ def reveal(d: Path) -> dict:
         b.update(phase="revealed", seed=seal["seed"], labels=seal["labels"], arms=arms)
         durable_write(d / "batch.json", json.dumps(b, indent=1))
     return b
+
+
+def regrade(src: Path, out: Path) -> dict:
+    """A second, independent grading of the same batch: `out` gets src's masked items, rubric and seal (so the
+    labels and shuffle are the same) with no scores, for another reviewer to score and reveal. Refused for a
+    folder that exists or a seal that does not match its pin."""
+    if out.exists():
+        raise Refused(f"{out} exists; name a new folder")
+    b = json.loads((src / "batch.json").read_text())
+    raw = (src / "seal.json").read_bytes()
+    if _sha(raw) != b["seal_sha256"]:
+        raise Refused("seal.json does not match its pinned sha256")
+    out.mkdir(parents=True)
+    durable_write(out / "seal.json", raw, mode=0o600)
+    nb = {"phase": "scoring", "rubric": b["rubric"], "seal_sha256": b["seal_sha256"], "items": b["items"], "scores": {}}
+    durable_write(out / "batch.json", json.dumps(nb, indent=1))
+    return nb
+
+
+def landed_by_score(rubric, scores: dict) -> bool:
+    """The score-only verdict: criteria and correctness at 3 or more of 4 (an answer: agrees at 4 or more of 5)."""
+    if tuple(map(tuple, rubric)) == ANSWER_RUBRIC:
+        return int(scores.get("agrees", 0)) >= 4
+    return int(scores.get("criteria", 0)) >= 3 and int(scores.get("correctness", 0)) >= 3
+
+
+def compare(a: Path, b: Path) -> dict:
+    """Two revealed gradings of one batch: per arm the items, mean total and landed count under each, the
+    ranking (by mean total, ties by landed) under each, and whether the order of the arms changed."""
+    ba, bb = (json.loads((d / "batch.json").read_text()) for d in (a, b))
+    for x in (ba, bb):
+        if x["phase"] != "revealed":
+            raise Refused("both batches must be revealed")
+    if ba["labels"] != bb["labels"] or [i["sha256"] for i in ba["items"]] != [i["sha256"] for i in bb["items"]]:
+        raise Refused("the two batches are not the same items and seal")
+    rub = ba.get("rubric") or RUBRIC
+    arms: dict = {}
+    for i in ba["items"]:
+        arm = ba["labels"][i["id"]]
+        r = arms.setdefault(arm, {"items": 0, "total_a": 0, "total_b": 0, "landed_a": 0, "landed_b": 0})
+        r["items"] += 1
+        for k, x in (("a", ba), ("b", bb)):
+            sc = x["scores"][i["id"]]
+            r[f"total_{k}"] += sc["total"]
+            r[f"landed_{k}"] += landed_by_score(rub, sc["scores"])
+    for r in arms.values():
+        r["mean_a"], r["mean_b"] = (round(r[f"total_{k}"] / r["items"], 2) for k in ("a", "b"))
+
+    def rank(k: str) -> list[str]:
+        return sorted(arms, key=lambda n: (-arms[n][f"mean_{k}"], -arms[n][f"landed_{k}"], n))
+    ra, rb = rank("a"), rank("b")
+    return {"arms": arms, "rank_a": ra, "rank_b": rb, "ranking_changed": ra != rb}
 
 
 def prompt(item: dict, rubric=RUBRIC) -> str:
@@ -370,7 +443,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python3 -m ttp.benchblind", description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("prep")
-    s.add_argument("cells")
+    s.add_argument("cells", nargs="+")
     s.add_argument("--out", required=True)
     s.add_argument("--seed", type=int)
     s = sub_parser_review(sub)
@@ -380,17 +453,28 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("json")
     s = sub.add_parser("reveal")
     s.add_argument("dir")
+    s = sub.add_parser("regrade")
+    s.add_argument("dir")
+    s.add_argument("--out", required=True)
+    s = sub.add_parser("compare")
+    s.add_argument("dir")
+    s.add_argument("dir2")
     a = ap.parse_args(argv)
     try:
         if a.cmd == "prep":
-            src = Path(a.cells) / "cells.json" if Path(a.cells).is_dir() else Path(a.cells)   # a `ttp bench run` folder
-            b = prep(json.loads(src.read_text())["cells"], Path(a.out), a.seed)
+            srcs = [Path(c) / "cells.json" if Path(c).is_dir() else Path(c) for c in a.cells]   # `ttp bench run` folders
+            b = prep(merge_cells([json.loads(x.read_text())["cells"] for x in srcs]), Path(a.out), a.seed)
             print(f"benchblind: {len(b['items'])} item(s) sealed in {a.out}")
         elif a.cmd == "review":
             rub = json.loads((Path(a.dir) / "batch.json").read_text()).get("rubric") or RUBRIC
             got = review(Path(a.dir), provider_ask(a.provider, a.model, a.effort, a.budget_usd, _review_cfg(argv),
                                                     schema=schema_for(rub)))
             print(f"benchblind: scored {len(got)} item(s)")
+        elif a.cmd == "regrade":
+            b = regrade(Path(a.dir), Path(a.out))
+            print(f"benchblind: {len(b['items'])} item(s) copied unscored to {a.out}")
+        elif a.cmd == "compare":
+            print(json.dumps(compare(Path(a.dir), Path(a.dir2)), indent=1))
         elif a.cmd == "score":
             print(json.dumps(score(Path(a.dir), a.item, json.loads(a.json))))
         else:

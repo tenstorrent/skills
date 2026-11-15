@@ -479,14 +479,22 @@ def test_replay_run_end_to_end_in_a_dry_run_builds_reviews_blind_and_writes_the_
         return {"scores": {"answered": 4, "supported": 3, "agrees": 5}, "notes": "ok"}
     monkeypatch.setenv("TTP_FAKE_SHELL", "printf 'The answer.\\n' > ANSWER.md && git add -A && git commit -qm a")
     root = tmp_path / "replay"
-    rec = benchreplay.run_replay(arms, p.config(), cap=10.0, parallel=2, root=root, established=est, ask=ask,
+    seen2 = []
+    def ask2(prompt):
+        seen2.append(prompt)
+        return {"scores": {"answered": 5, "supported": 5, "agrees": 2}, "notes": "second"}
+    rec = benchreplay.run_replay(arms, p.config(), cap=10.0, parallel=2, root=root, established=est, ask=ask, ask2=ask2,
                                  opts={"dry_run": True}, progress=lambda s: None, projects=proj, seed=1)
     assert len(rec["cells"]) == 4 and rec["faults"] == [] and rec["skipped"] == []
+    assert len(seen2) == 4 and sorted(seen2) == sorted(prompts), "the second grader sees the same masked prompts"
+    assert rec["second_grader"]["agree_4plus"] == {"a": 0, "b": 0} and all(c["second_agrees"] == 2 for c in rec["cells"])
+    assert set(rec["second_grader"]["compare"]["rank_b"]) == {"a", "b"}
     assert len(prompts) == 4, "each arm's answer is reviewed on its own, without its name"
     assert all("truth device" in x or "truth analysis" in x for x in prompts), "the reviewer sees the established answer"
     assert not any(m in x for x in prompts for m in ("m1", "m2")), "the reviewer is never told the arm's model"
     md = (root / "table.md").read_text()
     assert "## device" in md and "## analysis" in md and "## all" in md and "Spend: Claude $0.00" in md
+    assert "## Second grader" in md
     assert rec["arms"]["a"]["all"]["n"] == 2 and rec["arms"]["a"]["all"]["agree_4plus"] == 2
     assert json.loads((root / "replay.json").read_text())["spend"]["glm_usd"] == 0
     again = benchreplay.run_replay(arms, p.config(), cap=10.0, parallel=2, root=root, established=est, ask=ask,

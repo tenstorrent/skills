@@ -1139,7 +1139,7 @@ def test_every_ttp_flag_and_argument_has_help():
             if isinstance(a, argparse._SubParsersAction):
                 named = {id(a.choices[c.dest]) for c in a._choices_actions if c.help}   # aliases share a parser
                 missing.extend(f"{path} {n} (command)" for n, sp in a.choices.items()
-                               if id(sp) not in named and n != "daemon")
+                               if id(sp) not in named and n not in ("daemon", "device-shadow"))
                 for n, sp in a.choices.items():
                     walk(sp, f"{path} {n}")
     walk(ap, "ttp")

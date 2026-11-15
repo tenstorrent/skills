@@ -413,12 +413,67 @@ def landed(score: dict, row: dict) -> bool:
     return int(s.get("criteria", 0)) >= LANDED_MIN and int(s.get("correctness", 0)) >= LANDED_MIN
 
 
+def second_reviewer(cfg: dict | None) -> dict | None:
+    """The second blind grader (`bench.second_reviewer`: model, effort (default max), provider (default chat)),
+    another model family than the first; None when unset. It grades every bench table's batch (the daily bench, the
+    replay) again with the same masked items and rubric."""
+    got = ((cfg or {}).get("bench") or {}).get("second_reviewer")
+    if not isinstance(got, dict) or not isinstance(got.get("model"), str) or not got["model"].strip():
+        return None
+    return {"model": got["model"].strip(), "effort": str(got.get("effort") or "max"),
+            "provider": str(got.get("provider") or "chat")}
+
+
+def second_grade(out: Path, cfg: dict, ask2=None, rubric=benchblind.RUBRIC) -> dict | None:
+    """Regrade the revealed batch in <out>/blind with the second reviewer into <out>/blind2 (resumable); returns
+    {"reviewer", "scored": {item: (task, arm, score)}, "unscored", "compare", "review": spend} or None when there
+    is none (no reviewer configured and no `ask2`, or no revealed batch). `ask2`: a reviewer callable for tests."""
+    rv = second_reviewer(cfg)
+    blind, blind2 = out / "blind", out / "blind2"
+    if (rv is None and ask2 is None) or not (blind / "batch.json").exists():
+        return None
+    if json.loads((blind / "batch.json").read_text())["phase"] != "revealed":
+        return None
+    spend: dict = {}
+    if not blind2.exists():
+        benchblind.regrade(blind, blind2)
+    if ask2 is None:
+        ask2 = benchblind.provider_ask(rv["provider"], rv["model"], rv["effort"], REVIEW_USD, cfg, spend,
+                                       schema=benchblind.schema_for(rubric))
+    b = json.loads((blind2 / "batch.json").read_text())
+    unscored = []
+    for it in b["items"]:
+        if it["id"] in b["scores"]:
+            continue
+        try:
+            benchblind.score(blind2, it["id"], ask2(benchblind.prompt(it, b.get("rubric") or benchblind.RUBRIC)))
+        except (benchblind.Refused, OSError, ValueError, subprocess.SubprocessError) as e:
+            unscored.append({"item": it["id"], "why": str(e)[:200]})
+    b = json.loads((blind2 / "batch.json").read_text())
+    if len(b["scores"]) != len(b["items"]):
+        return {"reviewer": rv, "scored": {}, "unscored": unscored, "compare": None, "review": spend}
+    if b["phase"] == "scoring":
+        b = benchblind.reveal(blind2)
+    labels = json.loads((blind2 / "seal.json").read_text())["labels"]
+    by_item = {it["id"]: it["task"] for it in b["items"]}
+    prior = 0.0
+    try:
+        prior = float(json.loads((out / "review2.json").read_text()).get("cost_usd") or 0)
+    except (OSError, ValueError):
+        pass
+    durable_write(out / "review2.json", json.dumps({"cost_usd": round(prior + float(spend.get("cost_usd", 0)), 4),
+                                                   "calls": spend.get("calls", 0)}))
+    return {"reviewer": rv, "scored": {i: (by_item[i], labels[i], s) for i, s in b["scores"].items()},
+            "unscored": unscored, "compare": benchblind.compare(blind, blind2), "review": spend}
+
+
 def blind_review(out: Path, tasks: dict, arms: dict, cfg: dict, ask=None, seed: int | None = None,
-                 build=None, rubric=benchblind.RUBRIC) -> dict:
+                 build=None, rubric=benchblind.RUBRIC, ask2=None) -> dict:
     """Seal the finished cells, have the Opus reviewer score each blind, and return {item: (task, arm, score)}
     once revealed; an item the reviewer could not score stays out of the table. `ask`: a reviewer
     callable for tests. `build(out, tasks, arms)` and `rubric`: another kind of cell and its rubric (the
-    offline replay's answers); the default builds the diff cells."""
+    offline replay's answers); the default builds the diff cells. With a second reviewer (`bench.second_reviewer`,
+    or `ask2`) the revealed batch is graded again, and the result's "second" holds that grading."""
     blind = out / "blind"
     spend: dict = {}
     if not blind.exists():
@@ -450,8 +505,11 @@ def blind_review(out: Path, tasks: dict, arms: dict, cfg: dict, ask=None, seed: 
         pass
     seal = json.loads((blind / "seal.json").read_text())["labels"]   # the review is over: the labels may be read
     by_item = {it["id"]: it["task"] for it in b["items"]}
-    return {"scored": {i: (by_item[i], seal[i], s) for i, s in b["scores"].items()}, "unscored": unscored,
-            "review": spend}
+    got = {"scored": {i: (by_item[i], seal[i], s) for i, s in b["scores"].items()}, "unscored": unscored,
+           "review": spend}
+    if b["phase"] == "revealed" and (sec := second_grade(out, cfg, ask2, rubric)):
+        got["second"] = sec
+    return got
 
 
 def day_record(day: str, tasks: dict, arms: dict, out: Path, graded: dict, skipped: list, dropped: list) -> dict:
@@ -471,9 +529,19 @@ def day_record(day: str, tasks: dict, arms: dict, out: Path, graded: dict, skipp
                       "minutes": round(float(r.get("wall_s") or 0) / 60, 2),
                       "stopped": bool(r.get("hang_guard")) or r.get("outcome") in ("timeout", "stalled"),
                       "outcome": r.get("outcome", "")})
+    sec = graded.get("second")
+    if sec:
+        two = {(t, a): sc for t, a, sc in sec["scored"].values()}
+        for c in cells:
+            sc = (two.get((c["task"], c["arm"])) or {}).get("scores")
+            if sc:
+                c["second_criteria"], c["second_correctness"] = int(sc["criteria"]), int(sc["correctness"])
+                c["second_landed"] = landed({"scores": sc}, rows.get((c["task"], 0, c["arm"])) or {})
     claude_cells = sum(c["cost_usd"] for c in cells if c["claude"])
     return {"day": day, "cells": cells, "skipped": skipped, "dropped": dropped,
             "unscored": graded.get("unscored", []),
+            **({"second_grader": {"reviewer": sec["reviewer"], "compare": sec["compare"],
+                                  "unscored": sec["unscored"]}} if sec else {}),
             "spend": {"claude_usd": round(claude_cells + review_spent(out), 4),
                       "claude_arms_usd": round(claude_cells, 4), "review_usd": round(review_spent(out), 4),
                       "glm_usd": round(sum(c["cost_usd"] for c in cells if not c["claude"]), 4)}}
@@ -484,7 +552,7 @@ def day_record(day: str, tasks: dict, arms: dict, out: Path, graded: dict, skipp
 def cumulative(root: Path | None = None) -> dict:
     """The running table from every day's record under `root`/days: per project and arm, and per arm overall."""
     root = root or home()
-    cells, gaps = [], []
+    cells, gaps, seconds = [], [], []
     days = sorted((root / "days").glob("*.json")) if (root / "days").exists() else []
     for p in days:
         try:
@@ -492,6 +560,9 @@ def cumulative(root: Path | None = None) -> dict:
         except (OSError, ValueError):
             continue
         cells += rec.get("cells") or []
+        if (cmp := (rec.get("second_grader") or {}).get("compare")):
+            seconds.append({"day": p.stem, "ranking_changed": cmp["ranking_changed"], "rank_a": cmp["rank_a"],
+                            "rank_b": cmp["rank_b"]})
         if rec.get("faults") or rec.get("skipped"):
             gaps.append({"day": p.stem, "faults": rec.get("faults") or [], "skipped": len(rec.get("skipped") or [])})
 
@@ -502,7 +573,11 @@ def cumulative(root: Path | None = None) -> dict:
                 "correctness": round(sum(r["correctness"] for r in rows) / n, 2),
                 "usd_per_task": round(sum(r["cost_usd"] for r in rows) / n, 2),
                 "min_per_task": round(sum(r["minutes"] for r in rows) / n, 1),
-                "stops": sum(1 for r in rows if r["stopped"])} if n else {}
+                "stops": sum(1 for r in rows if r["stopped"]),
+                **({"second_n": len(two), "second_landed": sum(1 for r in two if r["second_landed"]),
+                    "second_criteria": round(sum(r["second_criteria"] for r in two) / len(two), 2),
+                    "second_correctness": round(sum(r["second_correctness"] for r in two) / len(two), 2)}
+                   if (two := [r for r in rows if "second_landed" in r]) else {})} if n else {}
     by, per = {}, {}
     for c in cells:
         by.setdefault((c["project"], c["model"]), []).append(c)
@@ -510,28 +585,39 @@ def cumulative(root: Path | None = None) -> dict:
     return {"days": [p.stem for p in days],
             "projects": {proj: {m: agg(rs) for (pr, m), rs in sorted(by.items()) if pr == proj}
                          for proj in sorted({c["project"] for c in cells})},
-            "models": {m: agg(rs) for m, rs in sorted(per.items())}, "gaps": gaps}
+            "models": {m: agg(rs) for m, rs in sorted(per.items())}, "gaps": gaps,
+            **({"second_days": seconds} if seconds else {})}
 
 
-def _row(label: str, a: dict) -> str:
+def _row(label: str, a: dict, second: bool = False) -> str:
+    tail = (f" {a['second_landed']}/{a['second_n']} ({a['second_criteria']}/{a['second_correctness']}) |"
+            if a.get("second_n") else " |") if second else ""
     return (f"| {label} | {a['n']} | {a['landed']}/{a['n']} | {a['criteria']} | {a['correctness']} | "
-            f"${a['usd_per_task']} | {a['min_per_task']} | {a['stops']} |")
+            f"${a['usd_per_task']} | {a['min_per_task']} | {a['stops']} |{tail}")
 
 
-HEAD = ("| {} | N | landed | requirements (0-4) | correctness (0-4) | $ per task | minutes per task | 60-min stops |\n"
-        "|---|---|---|---|---|---|---|---|")
+HEAD = ("| {} | N | landed | requirements (0-4) | correctness (0-4) | $ per task | minutes per task | 60-min stops |{}\n"
+        "|---|---|---|---|---|---|---|---|{}")
 
 
 def table_md(cum: dict) -> str:
-    """The cumulative table as markdown: per model overall, then per project."""
+    """The cumulative table as markdown: per model overall, then per project. A second grader's cells add a
+    column: landed of those it graded (mean requirements/correctness)."""
+    two = any(a.get("second_n") for a in cum["models"].values())
+    head = HEAD.format("model", " second grader: landed (req/corr) |" if two else "", "---|" if two else "")
     lines = [f"# Daily model bench: cumulative ({len(cum['days'])} day(s): {', '.join(cum['days']) or 'none'})", "",
              "Landed = requirements and correctness each at least 3 of 4 by the blind Opus review; a 60-minute stop is "
              "a fail. $ per task is each arm's own spend (an open model's is GLM spend, not Claude spend).", "",
-             "## Per model", "", HEAD.format("model")]
-    lines += [_row(m, a) for m, a in cum["models"].items()]
+             "## Per model", "", head]
+    lines += [_row(m, a, two) for m, a in cum["models"].items()]
     for proj, ms in cum["projects"].items():
-        lines += ["", f"## {proj}", "", HEAD.format("model")]
-        lines += [_row(m, a) for m, a in ms.items()]
+        lines += ["", f"## {proj}", "", head]
+        lines += [_row(m, a, two) for m, a in ms.items()]
+    if cum.get("second_days"):
+        lines += ["", "## Second grader", "", "The same masked batch graded again by a second model; the ranking is by mean "
+                  "total, best first:"]
+        lines += [f"- {d['day']}: ranking {'changed' if d['ranking_changed'] else 'unchanged'} "
+                  f"({' > '.join(d['rank_a'])}; second: {' > '.join(d['rank_b'])})" for d in cum["second_days"]]
     if cum.get("gaps"):
         lines += ["", "## Not covered", "", "A project whose landings the bench could not read, and tasks the cap left out:"]
         for g in cum["gaps"]:
@@ -560,7 +646,7 @@ def parse_arms(extra: list[str] | None, glm_harness: str | None = None) -> dict:
 
 def run_day(day: str, start: float, end: float, arms: dict, cfg: dict, cap: float = CAP_USD, parallel: int = PARALLEL,
             seed: int | None = None, skip: str | None = None, root: Path | None = None, only: list[str] | None = None,
-            opts: dict | None = None, ask=None, progress=None, repos: dict | None = None) -> dict:
+            opts: dict | None = None, ask=None, progress=None, repos: dict | None = None, ask2=None) -> dict:
     """The whole day: pick across projects, build, run under the cap, review, write the day's record and the
     cumulative table. Resumable: picked.json, results.jsonl and the blind folder under <root>/<day> are reused."""
     say = progress or (lambda s: print(s, file=sys.stderr, flush=True))
@@ -613,7 +699,7 @@ def run_day(day: str, start: float, end: float, arms: dict, cfg: dict, cap: floa
             "test_cmd": benchrun.TEST_CMD, "test_timeout_s": 900, "dry_run": False, "scratch_home": True,
             "review_mean": prior_review_mean(root, day), **(opts or {})}
     done = run_cells(day, tasks, arms, out, bench_dir, opts, cfg, cap, parallel, order, say)
-    graded = blind_review(out, tasks, arms, cfg, ask)
+    graded = blind_review(out, tasks, arms, cfg, ask, ask2=ask2)
     skipped = picked.get("skipped", []) + done["skipped"]
     rec = day_record(day, tasks, arms, out, graded, skipped, picked["dropped"])
     rec["faults"] = picked.get("faults", [])

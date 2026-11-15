@@ -1438,6 +1438,14 @@ whole arm list, and the table names each arm's harness. Under
 every day: per project and per model, N, landed k/N, mean requirements and correctness, dollars and
 minutes per task and time-limit stops, plus what it did not cover.
 
+Second grader: with `bench.second_reviewer` (`{"provider": "chat", "model": ..., "effort": "max"}`; provider and
+effort default to `chat` and `max`) every bench table (the daily bench, the replay, a head-to-head run) grades its
+revealed blind batch a second time with that model on the same masked items and rubric (`blind2/` beside `blind/`)
+and shows landed and the mean under both graders and whether the ranking of the arms changed. Standalone:
+`ttp bench blind regrade <batch> --out <new batch>` copies a batch's masked items and seal with no scores,
+`ttp bench blind compare <batch> <batch2>` compares two revealed gradings, and `ttp bench blind prep <cells>...`
+joins the cells of several run folders into one batch (an arm label may appear in one folder only).
+
 `ttp bench replay [--set established.json] [--cap-usd N] [--only <key>]...` is the offline one-off for
 finished device and analysis tasks. The set file holds, per task, its class (`device` or `analysis`)
 and the answer the project later established, written before any arm runs. Each task becomes a sealed

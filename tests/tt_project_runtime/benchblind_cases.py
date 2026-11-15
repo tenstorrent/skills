@@ -388,3 +388,128 @@ def test_bench_criteria_marks_items_that_need_the_live_system_and_the_arm_and_re
     item = {"criteria": benchrun.criteria(spec), "diff": "+x"}
     assert "do not score them" in benchblind.prompt(item)
     assert "do not score them" not in benchblind.prompt({"criteria": "Acceptance:\n- a works", "diff": "+x"})
+
+
+def _score_all(benchblind, d, by_arm_scores, seed_labels):
+    """Score every item of batch `d` by the arm behind it (labels read from the seal, as a test may)."""
+    b = json.loads((d / "batch.json").read_text())
+    for it in b["items"]:
+        crit, corr = by_arm_scores[seed_labels[it["id"]]]
+        benchblind.score(d, it["id"], {"scores": {"criteria": crit, "correctness": corr, "tests": 1, "scope": 1}, "notes": ""})
+    return benchblind.reveal(d)
+
+
+def test_benchblind_merge_cells_joins_arms_of_one_task_and_refuses_a_label_named_twice(tmp_path):
+    from ttp import benchblind
+    base = _blind_cells()[:2]
+    other = [{"task": c["task"], "criteria": "", "arms": {"extra": {**c["arms"]["glm-top"]}}} for c in base]
+    merged = benchblind.merge_cells([base, other])
+    assert [m["task"] for m in merged] == [c["task"] for c in base]
+    assert all(set(m["arms"]) == {"opus-medium", "glm-top", "extra"} and m["criteria"].startswith("criteria") for m in merged)
+    with pytest.raises(benchblind.Refused, match="rename"):
+        benchblind.merge_cells([base, base])
+    b = benchblind.prep(merged, tmp_path / "m", seed=2)
+    assert len(b["items"]) == 6
+    p1, p2 = tmp_path / "a.json", tmp_path / "b.json"
+    p1.write_text(json.dumps({"cells": base}))
+    p2.write_text(json.dumps({"cells": other}))
+    assert benchblind.main(["prep", str(p1), str(p2), "--out", str(tmp_path / "cli")]) == 0
+    assert len(json.loads((tmp_path / "cli" / "batch.json").read_text())["items"]) == 6
+
+
+def test_benchblind_regrade_scores_the_same_masked_items_again_and_compare_reports_the_ranking(tmp_path):
+    from ttp import benchblind
+    cells = _blind_cells()[:4]
+    first = tmp_path / "one"
+    benchblind.prep(cells, first, seed=7)
+    labels = json.loads((first / "seal.json").read_text())["labels"]
+    _score_all(benchblind, first, {"opus-medium": (4, 4), "glm-top": (2, 2)}, labels)
+    second = tmp_path / "two"
+    nb = benchblind.regrade(first, second)
+    assert nb["phase"] == "scoring" and nb["scores"] == {}
+    one = json.loads((first / "batch.json").read_text())
+    assert [i["diff"] for i in nb["items"]] == [i["diff"] for i in one["items"]] and (second / "seal.json").read_bytes() == (first / "seal.json").read_bytes()
+    with pytest.raises(benchblind.Refused, match="exists"):
+        benchblind.regrade(first, second)
+    with pytest.raises(benchblind.Refused, match="revealed"):
+        benchblind.compare(first, second)
+    _score_all(benchblind, second, {"opus-medium": (4, 3), "glm-top": (3, 3)}, labels)
+    cmp = benchblind.compare(first, second)
+    assert cmp["rank_a"] == ["opus-medium", "glm-top"] and cmp["rank_b"] == ["opus-medium", "glm-top"] and not cmp["ranking_changed"]
+    assert cmp["arms"]["glm-top"] == {"items": 4, "total_a": 24, "total_b": 32, "landed_a": 0, "landed_b": 4, "mean_a": 6.0, "mean_b": 8.0}
+    third = tmp_path / "three"
+    benchblind.regrade(first, third)
+    _score_all(benchblind, third, {"opus-medium": (2, 2), "glm-top": (4, 4)}, labels)
+    cmp = benchblind.compare(first, third)
+    assert cmp["ranking_changed"] and cmp["rank_b"] == ["glm-top", "opus-medium"]
+    capture = tmp_path / "other"
+    benchblind.prep(cells, capture, seed=8)
+    _score_all(benchblind, capture, {"opus-medium": (4, 4), "glm-top": (4, 4)}, json.loads((capture / "seal.json").read_text())["labels"])
+    with pytest.raises(benchblind.Refused, match="same items"):
+        benchblind.compare(first, capture)
+    seal = (first / "seal.json").read_text()
+    (first / "seal.json").write_text(seal.replace('"seed": 7', '"seed": 9'))
+    with pytest.raises(benchblind.Refused, match="sha256"):
+        benchblind.regrade(first, tmp_path / "four")
+    (first / "seal.json").write_text(seal)
+    out = tmp_path / "cli-two"
+    assert benchblind.main(["regrade", str(first), "--out", str(out)]) == 0 and (out / "batch.json").exists()
+    _score_all(benchblind, out, {"opus-medium": (4, 4), "glm-top": (2, 2)}, labels)
+    assert benchblind.main(["compare", str(first), str(out)]) == 0
+    assert benchblind.main(["compare", str(first), str(tmp_path / "nothing")]) == 2
+
+
+def test_daily_second_grader_regrades_the_same_batch_and_the_day_record_and_table_carry_both_grades(tmp_path):
+    from ttp import benchdaily
+    cells = _blind_cells()[:3]
+    for c in cells:   # the chat arm's patch differs once masked, so a fake reviewer can tell the two apart
+        c["arms"]["glm-top"]["diff"] = c["arms"]["glm-top"]["diff"].replace("return cursor.fetchone()", "return cursor.fetchall()")
+    arms = {"opus-medium": {"provider": "claude", "model": "m1", "effort": "high"},
+            "glm-top": {"provider": "chat", "model": "m2", "effort": "max"}}
+    seen: dict = {"one": [], "two": []}
+
+    def asker(name, scores):
+        def ask(prompt):
+            seen[name].append(prompt)
+            who = "glm-top" if "fetchall" in prompt else "opus-medium"
+            return {"scores": scores(who), "notes": ""}
+        return ask
+    # the first reviewer prefers opus-medium; the second flips it
+    first = asker("one", lambda w: {"criteria": 4, "correctness": 4, "tests": 1, "scope": 1} if w == "opus-medium"
+                  else {"criteria": 2, "correctness": 2, "tests": 1, "scope": 1})
+    second = asker("two", lambda w: {"criteria": 2, "correctness": 3, "tests": 1, "scope": 1} if w == "opus-medium"
+                   else {"criteria": 4, "correctness": 4, "tests": 1, "scope": 1})
+    out = tmp_path / "out"
+    out.mkdir()
+    got = benchdaily.blind_review(out, {str(c["task"]): {"project": "A", "source_task": 1} for c in cells}, arms, {}, ask=first, seed=3,
+                                  build=lambda o, t, a: {"cells": cells}, ask2=second)
+    assert len(got["scored"]) == 6 and "second" in got
+    sec = got["second"]
+    assert len(sec["scored"]) == 6 and sec["unscored"] == [] and (out / "blind2" / "batch.json").exists()
+    assert len(seen["one"]) == len(seen["two"]) == 6
+    assert sorted(i["diff"] for i in json.loads((out / "blind" / "batch.json").read_text())["items"]) == \
+        sorted(i["diff"] for i in json.loads((out / "blind2" / "batch.json").read_text())["items"]), "same masked inputs"
+    assert sec["compare"]["arms"].keys() == {"opus-medium", "glm-top"}
+    again = benchdaily.second_grade(out, {}, lambda p: pytest.fail("a graded batch is not graded twice"))
+    assert len(again["scored"]) == 6
+    rec = benchdaily.day_record("2026-11-14", {str(c["task"]): {"project": "A", "source_task": 1} for c in cells}, arms, out, got, [], [])
+    by = {(c["task"], c["arm"]): c for c in rec["cells"]}
+    assert all("second_landed" in c for c in rec["cells"]) and rec["second_grader"]["compare"] == sec["compare"]
+    assert not any(c["second_landed"] for c in rec["cells"] if c["arm"] == "opus-medium")
+    assert all(c["second_landed"] for c in rec["cells"] if c["arm"] == "glm-top") and by
+    assert sec["compare"]["ranking_changed"] and sec["compare"]["rank_b"][0] == "glm-top"
+    root = tmp_path / "daily"
+    (root / "days").mkdir(parents=True)
+    (root / "days" / "2026-11-14.json").write_text(json.dumps(rec))
+    cum = benchdaily.write_table(root)
+    assert cum["models"]["claude:m1:high"]["second_n"] == 3 and cum["models"]["claude:m1:high"]["second_landed"] == 0
+    md = (root / "table.md").read_text()
+    assert "second grader" in md and "## Second grader" in md and "changed" in md
+    # without a second reviewer the day and its table carry no second column
+    out2 = tmp_path / "out2"
+    out2.mkdir()
+    plain = benchdaily.blind_review(out2, {str(c["task"]): {"project": "A"} for c in cells}, arms, {}, ask=first, seed=3,
+                                    build=lambda o, t, a: {"cells": cells})
+    assert "second" not in plain and not (out2 / "blind2").exists()
+    assert benchdaily.second_reviewer({"bench": {"second_reviewer": {"model": "x"}}}) == {"model": "x", "effort": "max", "provider": "chat"}
+    assert benchdaily.second_reviewer({}) is None and benchdaily.second_reviewer({"bench": {"second_reviewer": {"effort": "max"}}}) is None

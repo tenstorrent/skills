@@ -15528,7 +15528,7 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--json", action="store_true", help="print JSON")
     s.set_defaults(fn=cmd_stats)
 
-    s = sub.add_parser("device-shadow", help=argparse.SUPPRESS)   # the daemon's detached read only shadow run
+    s = sub.add_parser("device-shadow")   # the daemon's detached read only shadow run; no help, so --help does not list it
     s.add_argument("task", type=int, help="the live task id")
     s.add_argument("arm", help="the shadow arm name")
     s.set_defaults(fn=cmd_device_shadow)
@@ -15966,8 +15966,8 @@ def main(argv: list[str] | None = None) -> None:
                         "state), naming what is unstated; cells: seeded-bug and prompt-injection cells from the "
                         "--bench folder's small tasks in --out, with a hash-pinned cells.json; run: the head-to-head of two or more arms on --bench, "
                         "results and the blind review's cells.json in --out; blind: the blind review "
-                        "(`ttp bench blind prep <run folder> --out <dir>`, then review, score, reveal; "
-                        "`ttp bench blind --help`); reach: `ttp bench reach HOST:PORT ...` tries a TCP connect to "
+                        "(`ttp bench blind prep <run folder>... --out <dir>`, then review, score, reveal; regrade and compare "
+                        "for a second grader; `ttp bench blind --help`); reach: `ttp bench reach HOST:PORT ...` tries a TCP connect to "
                         "each target from inside real bench cells and exits 0 only if all are unreachable")
     s.add_argument("--blind-word", action="append", help=argparse.SUPPRESS)
     s.add_argument("--since", help="keep tasks created on or after this date (YYYY-MM-DD): the "

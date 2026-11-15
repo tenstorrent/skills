@@ -328,9 +328,18 @@ def table(out: Path, tasks: dict, arms: dict, graded: dict, faults: list, skippe
         return {"n": n, "answered": mean("answered"), "supported": mean("supported"), "agrees": mean("agrees"),
                 "agree_4plus": sum(1 for c in rs if c["agrees"] >= 4), "usd_per_task": mean("cost_usd"),
                 "min_per_task": round(sum(c["minutes"] for c in rs) / n, 1), "stops": sum(c["stopped"] for c in rs)}
+    sec = graded.get("second")
+    if sec:
+        two = {(t, a): sc["scores"] for t, a, sc in sec["scored"].values()}
+        for c in cells:
+            if (c["task"], c["arm"]) in two:
+                c["second_agrees"] = int(two[(c["task"], c["arm"])]["agrees"])
     spend = benchdaily.review_spent(out)
     claude = sum(c["cost_usd"] for c in cells if c["claude"])
     return {"cells": cells,
+            **({"second_grader": {"reviewer": sec["reviewer"], "compare": sec["compare"], "unscored": sec["unscored"],
+                                  "agree_4plus": {a: sum(1 for c in cells if c["arm"] == a and c.get("second_agrees", 0) >= 4)
+                                                  for a in sorted(arms)}}} if sec else {}),
             "arms": {a: {cls: agg([c for c in cells if c["arm"] == a and c["class"] == cls]) for cls in (*CLASSES, "all")
                          if cls == "all" or any(c["class"] == cls for c in cells)} | {
                 "all": agg([c for c in cells if c["arm"] == a])} for a in sorted(arms)},
@@ -358,6 +367,14 @@ def table_md(rec: dict, names: dict[str, str]) -> str:
             lines.append(f"| {names.get(a, a)} | {v['n']} | {v['answered']} | {v['supported']} | {v['agrees']} | "
                          f"{v['agree_4plus']}/{v['n']} | ${v['usd_per_task']} | {v['min_per_task']} | {v['stops']} |")
         lines.append("")
+    if sg := rec.get("second_grader"):
+        cmp = sg.get("compare") or {}
+        lines += ["## Second grader", "",
+                  "The same masked answers graded again by a second model with the same rubric. Agrees 4+ per arm: "
+                  + ", ".join(f"{names.get(a, a)} {n}" for a, n in sg["agree_4plus"].items())
+                  + (f". Ranking {'changed' if cmp.get('ranking_changed') else 'unchanged'}: "
+                     f"{' > '.join(names.get(a, a) for a in cmp.get('rank_a', []))}; second grader: "
+                     f"{' > '.join(names.get(a, a) for a in cmp.get('rank_b', []))}." if cmp else "."), ""]
     sp = rec["spend"]
     lines += [f"Spend: Claude ${sp['claude_usd']:.2f} (arms ${sp['claude_arms_usd']:.2f}, reviews ${sp['review_usd']:.2f}); "
               f"GLM ${sp['glm_usd']:.2f}."]
@@ -369,7 +386,7 @@ def table_md(rec: dict, names: dict[str, str]) -> str:
 
 def run_replay(arms: dict, cfg: dict, cap: float = CAP_USD, parallel: int = benchdaily.PARALLEL, root: Path | None = None,
                established: Path | None = None, only: list[str] | None = None, opts: dict | None = None, ask=None,
-               progress=None, projects: dict | None = None, seed: int | None = None) -> dict:
+               progress=None, projects: dict | None = None, seed: int | None = None, ask2=None) -> dict:
     """Build the questions, run every arm under the Claude cap, review blind, write <root>/table.md and
     replay.json. Resumable: built questions, results.jsonl and the blind folder are reused."""
     say = progress or (lambda s: print(s, file=sys.stderr, flush=True))
@@ -391,7 +408,7 @@ def run_replay(arms: dict, cfg: dict, cap: float = CAP_USD, parallel: int = benc
              "test_cmd": benchrun.TEST_CMD, "test_timeout_s": 900, "dry_run": False, "scratch_home": True, **(opts or {})}
     done = benchdaily.run_cells("replay", tasks, arms, out, bench_dir, ropts, cfg, cap, parallel, order, say)
     graded = benchdaily.blind_review(out, tasks, arms, cfg, ask, seed, build=answer_cells(by_id),
-                                     rubric=benchblind.ANSWER_RUBRIC)
+                                     rubric=benchblind.ANSWER_RUBRIC, ask2=ask2)
     rec = table(out, tasks, arms, graded, faults, done["skipped"])
     rec["arms_def"] = {k: {f: v.get(f, "") for f in ("provider", "model", "effort", "harness")} for k, v in arms.items()}
     rec["evidence"] = {t: {"n": tasks[t]["n_evidence"], **tasks[t]["evidence"]} for t in tasks}
