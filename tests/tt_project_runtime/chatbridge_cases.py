@@ -4063,3 +4063,31 @@ def test_chatbridge_capacity_waits_are_configurable_and_reach_the_bench_row(env)
     ended = {"rc": 1, "bridge": {"last_fault": "rate_limit", "busy": {"waits": 4, "waited_s": 90.0, "gave_up": 1}}}
     assert benchrun.endpoint_fault(ended) == "rate_limit"
 
+
+
+def test_chatbridge_relays_openai_calls_with_their_own_tools_and_counts_usage(mock_chat):
+    # An OpenAI-native agent (a bench harness arm): its call goes upstream as asked, on the run's model and
+    # effort fields, under the run token (never the key); streamed or not, its usage is counted for the run.
+    from ttp.chatbridge import Bridge
+    tool = {"type": "function", "function": {"name": "bash", "parameters": {"type": "object"}}}
+    up = mock_chat((200, {"choices": [{"message": {"role": "assistant", "tool_calls": [
+        {"id": "c1", "type": "function", "function": {"name": "bash", "arguments": '{"command": "ls"}'}}]},
+        "finish_reason": "tool_calls"}], "usage": {"prompt_tokens": 50, "completion_tokens": 7}}),
+        (200, [{"choices": [{"index": 0, "delta": {"content": "done"}}]},
+               {"choices": [], "usage": {"prompt_tokens": 80, "completion_tokens": 3,
+                                         "prompt_tokens_details": {"cached_tokens": 40}}}]))
+    with Bridge(up.url, _CB_KEY, "up-model", effort="max", fields={"reasoning_effort": "high"}) as b:
+        status, text = _post(b, {"model": "whatever", "tools": [tool], "reasoning_effort": "low",
+                                 "messages": [{"role": "user", "content": "hi"}]}, path="/v1/chat/completions")
+        assert status == 200 and json.loads(text)["choices"][0]["message"]["tool_calls"][0]["id"] == "c1"
+        status, text = _post(b, {"model": "whatever", "stream": True, "messages": [{"role": "user", "content": "x"}]},
+                             path="/v1/chat/completions")
+        assert status == 200 and '"done"' in text and "[DONE]" in text
+        assert _post(b, {"messages": []}, token="wrong", path="/v1/chat/completions")[0] == 401
+        stats = b.stats()
+    first, second = up.seen[0]["body"], up.seen[1]["body"]
+    assert first["model"] == second["model"] == "up-model" and first["tools"] == [tool]
+    assert first["reasoning_effort"] == "high" and up.seen[0]["auth"] == f"Bearer {_CB_KEY}"
+    assert second["stream_options"] == {"include_usage": True}
+    assert stats["usage"] == {"calls": 2, "input_tokens": 90, "output_tokens": 10, "cache_read_input_tokens": 40}
+    assert _CB_KEY not in json.dumps(stats)

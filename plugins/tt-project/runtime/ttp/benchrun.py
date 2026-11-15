@@ -31,6 +31,7 @@ import json
 import os
 import random
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -112,12 +113,110 @@ def verified(bench_dir: Path) -> dict:
 
 
 def parse_arm(text: str) -> tuple[str, dict]:
-    """`name=provider:model:effort` (model and effort may be empty) as (name, arm)."""
+    """`name=provider:model:effort[:harness[@version]]` (model and effort may be empty) as (name, arm). The
+    harness is the agent the arm runs (HARNESSES): `claude` (the default, the provider's own CLI), or
+    `opencode` or `mini-swe-agent` on the chat provider's OpenAI-compatible endpoint."""
     name, sep, rest = text.partition("=")
     parts = rest.split(":")
-    if not sep or not name or len(parts) != 3 or not parts[0]:
-        raise BenchError(f"--arm {text!r}: write it as name=provider:model:effort")
-    return name, {"provider": parts[0], "model": parts[1], "effort": parts[2]}
+    if not sep or not name or len(parts) not in (3, 4) or not parts[0]:
+        raise BenchError(f"--arm {text!r}: write it as name=provider:model:effort[:harness[@version]]")
+    arm = {"provider": parts[0], "model": parts[1], "effort": parts[2]}
+    if len(parts) == 4 and parts[3] not in ("", "claude"):
+        kind, _, version = parts[3].partition("@")
+        arm["harness"] = kind
+        if version:
+            arm["harness_version"] = version
+    check_harness(name, arm)
+    return name, arm
+
+
+# Agents a bench arm may run instead of the provider's own CLI: each installs into a folder the bench owns
+# (HARNESS_DIR/<kind>-<version>, never ~/.local or a global prefix) and talks to the chat provider's
+# OpenAI-compatible endpoint through the run's bridge (its /v1 relay: native tool calls, no translation).
+HARNESSES = {"opencode": {"npm": "opencode-ai", "bin": "node_modules/.bin/opencode"},
+             "mini-swe-agent": {"pypi": "mini-swe-agent", "bin": "venv/bin/mini"}}
+HARNESS_DIR = Path.home() / ".tt-project" / "model-bench" / "harness"
+# How an arm's effort reaches the model in each harness: the bridge sets the chat provider's effort fields
+# (providers.chat effort_fields) on every call, over whatever the harness itself sends.
+EFFORT_NOTE = {"claude": "Claude Code's effort; the bridge sets the chat provider's effort fields",
+               "opencode": "no --variant; the bridge sets the chat provider's effort fields on each call",
+               "mini-swe-agent": "no effort flag; the bridge sets the chat provider's effort fields on each call"}
+
+
+def check_harness(name: str, arm: dict) -> None:
+    kind = arm.get("harness") or "claude"
+    if kind != "claude" and kind not in HARNESSES:
+        raise BenchError(f"arm {name}: harness {kind!r} is not one of claude, {', '.join(HARNESSES)}")
+    if kind != "claude" and arm.get("provider") != "chat":
+        raise BenchError(f"arm {name}: the {kind} harness runs on the chat provider only")
+
+
+def latest_version(kind: str) -> str:
+    """The current release of harness `kind`, from its package index."""
+    spec = HARNESSES[kind]
+    if "npm" in spec:
+        got = subprocess.run(["npm", "view", spec["npm"], "version"], capture_output=True, text=True, timeout=120)
+        version = got.stdout.strip()
+    else:
+        import urllib.request
+        with urllib.request.urlopen(f"https://pypi.org/pypi/{spec['pypi']}/json", timeout=60) as r:
+            version = str(json.loads(r.read())["info"]["version"])
+    if not re.fullmatch(r"[0-9][0-9A-Za-z.+-]*", version or ""):
+        raise BenchError(f"could not resolve the current {kind} version: {version!r}")
+    return version
+
+
+def harness_ready(kind: str, version: str = "", root: Path | None = None) -> dict:
+    """Harness `kind` at `version` (default: the current release), installed under `root` (HARNESS_DIR)
+    once: {kind, version, dir, bin}. The folder's harness.json marks a finished install."""
+    spec, root = HARNESSES[kind], Path(root or HARNESS_DIR)
+    version = version or latest_version(kind)
+    folder = root / f"{kind}-{version}"
+    marker = folder / "harness.json"
+    if not marker.exists():
+        folder.mkdir(parents=True, exist_ok=True)
+        if "npm" in spec:
+            steps = [["npm", "install", "--prefix", str(folder), "--no-fund", "--no-audit",
+                      f"{spec['npm']}@{version}"]]
+        else:
+            steps = [[sys.executable, "-m", "venv", str(folder / "venv")],
+                     [str(folder / "venv" / "bin" / "python"), "-I", "-m", "pip", "install", "-q",
+                      f"{spec['pypi']}=={version}"]]
+        with open(folder / "install.log", "ab") as log:
+            for argv in steps:
+                if subprocess.run(argv, cwd=str(folder), stdout=log, stderr=subprocess.STDOUT,
+                                  timeout=1800).returncode:
+                    raise BenchError(f"installing {kind} {version} failed: see {folder / 'install.log'}")
+        if not (folder / spec["bin"]).exists():
+            raise BenchError(f"installing {kind} {version} left no {spec['bin']}")
+        durable_write(marker, json.dumps({"kind": kind, "version": version, "bin": spec["bin"]}) + "\n")
+    got = json.loads(marker.read_text())
+    return {"kind": kind, "version": got["version"], "dir": str(folder), "bin": str(folder / got["bin"])}
+
+
+def harness_files(run: Path, arm: dict, inst: dict) -> list[str]:
+    """Write the harness arm's launch script (and config) into `run`; returns its argv. The prompt comes on
+    stdin; the agent's trajectory (mini-swe-agent) goes to run/trajectory.json."""
+    kind, model = arm["harness"], arm["model"]
+    q = shlex.quote
+    if kind == "opencode":
+        conf = {"$schema": "https://opencode.ai/config.json", "autoupdate": False, "share": "disabled",
+                "model": f"bench/{model}", "permission": {"edit": "allow", "bash": "allow", "webfetch": "deny"},
+                "provider": {"bench": {"npm": "@ai-sdk/openai-compatible", "name": "bench",
+                                       "options": {"baseURL": "{env:OPENAI_BASE_URL}", "apiKey": "{env:OPENAI_API_KEY}"},
+                                       "models": {model: {"name": model}}}}}
+        durable_write(run / "opencode.json", json.dumps(conf, indent=1) + "\n")
+        body = (f"export OPENCODE_CONFIG={q(str(run / 'opencode.json'))} OPENCODE_DISABLE_AUTOUPDATE=1\n"
+                f"exec {q(inst['bin'])} run --format json --auto -m {q('bench/' + model)} \"$(cat)\"\n")
+    else:
+        durable_write(run / "mini.yaml", "agent:\n  mode: yolo\n  cost_limit: 0\n"
+                      "model:\n  cost_tracking: ignore_errors\n  model_kwargs:\n    drop_params: true\n")
+        body = ("export MSWEA_CONFIGURED=true MSWEA_SILENT_STARTUP=1 MSWEA_COST_TRACKING=ignore_errors "
+                f"MSWEA_GLOBAL_CONFIG_DIR={q(str(run / 'mswea'))}\n"
+                f"exec {q(inst['bin'])} -y --exit-immediately -l 0 -m {q('openai/' + model)} -c mini.yaml "
+                f"-c {q(str(run / 'mini.yaml'))} -o {q(str(run / 'trajectory.json'))} -t \"$(cat)\"\n")
+    durable_write(run / "harness.sh", "#!/bin/sh\n" + body)
+    return ["/bin/sh", str(run / "harness.sh")]
 
 
 def schedule(tasks: list[int], arms: list[str], reps: int, seed: int) -> list[dict]:
@@ -602,7 +701,9 @@ def isolate(tmp: Path, ws: Path, arm: dict, opts: dict, hidden: list[Path], repo
     provider = "fake" if opts.get("dry_run") else arm["provider"]
     prov = get_provider(provider)
     kind = "claude" if provider == "chat" else provider   # the chat provider runs Claude Code's CLI
-    conf, creds = {}, []
+    conf, creds, inst = {}, [], arm.get("harness_install") if not opts.get("dry_run") else None
+    if inst:   # a harness arm: its own agent, read-only from its install folder; no Claude config
+        kind = ""
     if kind in SCRATCH:
         conf, _ = scratch_home(kind, tmp, False)
         conf.pop("CLAUDE_SECURESTORAGE_CONFIG_DIR", None)
@@ -628,7 +729,10 @@ def isolate(tmp: Path, ws: Path, arm: dict, opts: dict, hidden: list[Path], repo
         absent = [p for p in absent if not canary.is_relative_to(p)]   # a folder that holds the cell stays
         absent += [canary / "cell.json", canary / "workspace", canary / "home",
                    *(p for p in canary.parent.iterdir() if p != canary)]   # the pristine cell, its sibling cells
-    cell = cellns.build(tmp, ws, hidden, python=python, cli="" if provider == "fake" else str(prov.binary() or ""),
+    if inst:
+        extra["binds"] = [*extra.get("binds", []), ("ro", Path(inst["dir"]))]
+    cli = inst["bin"] if inst else "" if provider == "fake" else str(prov.binary() or "")
+    cell = cellns.build(tmp, ws, hidden, python=python, cli=cli,
                         config=conf, creds=creds, **{"path_dirs": [str(tmp / "venv" / "bin")], **extra})
     cell.python, cell.runtime = python, str(copy) if copy else ""
     return cell, cellns.selftest(cell, ws, absent, gone=gone)
@@ -707,9 +811,13 @@ def launch(run: Path, ws: Path, prompt: str, arm: dict, opts: dict, cfg: dict, h
     provider = "fake" if opts.get("dry_run") else arm["provider"]
     prices = (cfg.get("pricing") or {}).get(provider) or {}
     prov = get_provider(provider).use(arm["model"], prices, billing.declared(cfg, provider))
-    argv, penv = prov.build(role="worker", model=arm["model"], effort=arm["effort"], cwd=str(ws),
-                            budget_usd=opts["budget_usd"], read_only=False, schema=None, restrictions={},
-                            denied_reads=denied_reads(hidden, own or session_dirs(ws)), web=False)
+    inst = arm.get("harness_install") if provider == "chat" else None
+    if inst:   # a harness arm: its own agent on the bridge's OpenAI-compatible relay (harness_files)
+        argv, penv = harness_files(run, arm, inst), {}
+    else:
+        argv, penv = prov.build(role="worker", model=arm["model"], effort=arm["effort"], cwd=str(ws),
+                                budget_usd=opts["budget_usd"], read_only=False, schema=None, restrictions={},
+                                denied_reads=denied_reads(hidden, own or session_dirs(ws)), web=False)
     if argv[:3] == [sys.executable, "-m", "ttp.providers.fake"]:   # the dry run's agent: no PYTHONPATH
         argv = [*_boot("ttp.providers.fake", cell), *argv[3:]]
     extra = dict(env or {})
@@ -724,7 +832,7 @@ def launch(run: Path, ws: Path, prompt: str, arm: dict, opts: dict, cfg: dict, h
             "stall_s": opts["stall_s"], "prices": prices, "default_budget_usd": opts["budget_usd"],
             "budget_usd": None if prov.caps_budget else opts["budget_usd"], "nice": 0,
             **({"bridge": chatbridge.settings(cfg, "standard", arm["model"], arm["effort"])}
-               if provider == "chat" else {})}
+               if provider == "chat" else {}), **({"openai_env": True} if inst else {})}
     durable_write(run / "run.json", json.dumps(spec, indent=1))
     began = time.time()
     try:
@@ -806,6 +914,31 @@ def cell_spend(u, arm: dict, output: Path | None = None) -> dict:
     return out
 
 
+HARNESS_BASIS = "estimate: the bridge's token counts"
+
+
+def harness_spend(prov, usage: dict) -> dict:
+    """A harness arm's tokens and spend from the bridge's usage counts, at the chat provider's price row
+    (or list price, localspend), always marked estimated."""
+    fin, fout, fread = (int(usage.get(k) or 0) for k in ("input_tokens", "output_tokens", "cache_read_input_tokens"))
+    out = {"input_tokens": max(fin - fread, 0), "output_tokens": fout, "cache_read_tokens": fread,
+           "model_calls": int(usage.get("calls") or 0), "cost_estimated": True, "cost_basis": HARNESS_BASIS}
+    row = prov.price() if hasattr(prov, "price") else None
+    if row:
+        pin, pcached, pout = row
+        out["cost_usd"] = round((out["input_tokens"] * pin + fread * pcached + fout * pout) / 1e6, 6)
+    else:
+        from . import localspend
+        try:
+            usd, _ = localspend.price(str(getattr(prov, "model", "") or ""), {
+                "input_tokens": out["input_tokens"], "output_tokens": fout, "cache_read_input_tokens": fread,
+                "cache_creation_input_tokens": 0}, overrides=localspend.overrides())
+            out["cost_usd"] = round(float(usd), 6)
+        except Exception:
+            out["cost_usd"] = 0.0
+    return out
+
+
 def cell_cost(u, arm: dict, output: Path | None = None) -> tuple[float, bool]:
     """(USD, estimated) for a cell's agent: cell_spend's cost_usd and cost_estimated."""
     got = cell_spend(u, arm, output)
@@ -861,6 +994,10 @@ def _finish(row: dict, bench_dir: Path, task: dict, ws: Path, run: Path, keep: P
     transcript = (run / "output.jsonl").read_bytes() if (run / "output.jsonl").exists() else b""
     ended, handoff = _read_json(run / "exit.json"), _read_json(run / "result.json")
     ended = ended if isinstance(ended, dict) else {}
+    if row.get("harness"):   # its own output format: the tokens are the bridge's counts, priced here
+        row.update(harness_spend(prov, (ended.get("bridge") or {}).get("usage") or {}))
+        if (run / "trajectory.json").exists():   # mini-swe-agent's messages: the transcript the audit reads
+            transcript += b"\n" + (run / "trajectory.json").read_bytes()
     if isinstance(ended.get("ended"), (int, float)):   # the agent's own end: names this run's kept exit.json
         row["cell_ended"] = ended["ended"]
     row.update(exit={k: ended[k] for k in ("rc", "stopped", "refused") if ended.get(k) is not None},
@@ -897,7 +1034,8 @@ def _finish(row: dict, bench_dir: Path, task: dict, ws: Path, run: Path, keep: P
         if ((ended.get("bridge") or {}).get("busy") or {}).get("gave_up"):
             row["capacity_stop"] = True   # the bridge waited out the model's 429s as far as allowed
     keep.mkdir(parents=True, exist_ok=True)
-    for name in ("output.jsonl", "exit.json", "result.json", "run.json", "runner.log", "stderr.log"):
+    for name in ("output.jsonl", "exit.json", "result.json", "run.json", "runner.log", "stderr.log",
+                 "trajectory.json", "opencode.json", "mini.yaml", "harness.sh"):
         if (run / name).exists():
             shutil.copyfile(run / name, keep / name)
     durable_write(keep / "diff.patch", diff.decode(errors="replace"))
@@ -947,16 +1085,32 @@ def blind_cells(out: Path, tasks: dict, arms: dict, cells: list[dict]) -> dict:
     return {"cells": got}
 
 
+def resolve_harness(arm: dict, opts: dict) -> dict:
+    """A harness arm with its install resolved: the version (recorded in plan.json) and how effort maps."""
+    kind = arm.get("harness")
+    if not kind or opts.get("dry_run"):
+        return arm
+    inst = harness_ready(kind, arm.get("harness_version", ""), opts.get("harness_dir"))
+    return {**arm, "harness_version": inst["version"], "harness_install": inst, "effort_mapping": EFFORT_NOTE[kind]}
+
+
 def run(bench_dir: Path, out: Path, arms: dict, reps: int, seed: int, opts: dict, cfg: dict,
-        limit: int = 0) -> list[dict]:
-    """Run every cell of the plan not yet in <out>/results.jsonl; returns the rows this call added."""
+        limit: int = 0, only: list[int] | None = None) -> list[dict]:
+    """Run every cell of the plan not yet in <out>/results.jsonl; returns the rows this call added.
+    `only`: just these bench tasks."""
     if len(arms) < 2:
         raise BenchError("a head-to-head needs at least two arms")
     if bad := [a for a in arms if not re.fullmatch(r"[A-Za-z0-9_.-]+", a)]:
         raise BenchError(f"arm names take letters, digits, '.', '_' and '-' only: {bad}")
+    for name, arm in arms.items():
+        check_harness(name, arm)
     man = verified(bench_dir)
+    arms = {name: resolve_harness(arm, opts) for name, arm in arms.items()}
     # The source repository the bench was cut from (recorded by `ttp bench prep`) goes with each task.
-    tasks = {t["task"]: {**t, "repo": man.get("repo")} for t in man["tasks"][:limit or None]}
+    picked = [t for t in man["tasks"] if not only or t["task"] in only]
+    if only and (missing := sorted(set(only) - {t["task"] for t in picked})):
+        raise BenchError(f"tasks not in this bench: {missing}")
+    tasks = {t["task"]: {**t, "repo": man.get("repo")} for t in picked[:limit or None]}
     plan = {"bench": str(bench_dir.resolve()), "manifest_sha256": (bench_dir / "manifest.sha256").read_text().split()[0],
             "arms": arms, "reps": reps, "seed": seed, "cells": schedule(list(tasks), list(arms), reps, seed),
             "limits": {k: opts[k] for k in ("timeout_s", "stall_s", "budget_usd", "test_cmd", "test_timeout_s")},

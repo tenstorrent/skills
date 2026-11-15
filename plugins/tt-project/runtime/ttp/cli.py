@@ -9190,7 +9190,8 @@ def _bench_run(p, a) -> None:
     from . import benchrun
     cfg = p.config()
     conf = cfg.get("bench") or {}
-    arms = {k: {"provider": v.get("provider", ""), "model": v.get("model", ""), "effort": v.get("effort", "")}
+    arms = {k: {"provider": v.get("provider", ""), "model": v.get("model", ""), "effort": v.get("effort", ""),
+                **{f: v[f] for f in ("harness", "harness_version") if v.get(f) and v.get(f) != "claude"}}
             for k, v in (conf.get("arms") or {}).items()}
     try:
         if a.arm:
@@ -9203,7 +9204,7 @@ def _bench_run(p, a) -> None:
                 "test_timeout_s": conf.get("test_timeout_s", 900), "dry_run": a.dry_run,
                 "scratch_home": conf.get("scratch_home", True), "repo": Path(a.repo or p.root).expanduser().resolve(), "state": p.state}
         rows = benchrun.run(Path(a.bench).expanduser().resolve(), Path(a.out).expanduser().resolve(), arms,
-                            a.reps or conf.get("reps", 1), seed, opts, cfg, limit=a.limit)
+                            a.reps or conf.get("reps", 1), seed, opts, cfg, limit=a.limit, only=a.task)
     except (benchrun.BenchError, OSError, ValueError) as e:
         die(f"bench run: {e}")
     for r in rows:
@@ -15784,7 +15785,9 @@ def main(argv: list[str] | None = None) -> None:
                    "default a worker run's build goes in one `ttp detach --cores` job)")
     s.add_argument("--seeded", type=int, default=0, help="cells: build at most this many seeded-bug cells "
                                                          "(default: one per small task whose tests catch a mutation)")
-    s.add_argument("--arm", action="append", help="run: name=provider:model:effort, repeatable (default: bench.arms)")
+    s.add_argument("--arm", action="append", help="run: name=provider:model:effort[:harness[@version]], repeatable "
+                   "(default: bench.arms); harness: claude (default), opencode or mini-swe-agent (chat provider only)")
+    s.add_argument("--task", type=int, action="append", help="run: only this bench task, repeatable (default: all)")
     s.add_argument("--reps", type=int, default=0, help="run: repeats per task and arm (default: bench.reps, 1)")
     s.add_argument("--seed", type=int, help="run: the arm-order seed (default: a random one, recorded)")
     s.add_argument("--timeout", type=float, default=0, help="run: wall-clock limit per cell in s (default: bench.timeout_s)")

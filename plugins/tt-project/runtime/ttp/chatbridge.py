@@ -582,6 +582,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 "type": "authentication_error", "message": "invalid api key for the local bridge"}})
         if path == "/v1/messages/count_tokens":
             return self._reply(200, {"input_tokens": estimate_tokens(body)})
+        if path == "/v1/chat/completions":   # an OpenAI-native agent (a bench harness arm): passed through
+            return self.bridge.relay(self, body)
         if path != "/v1/messages":
             return self.do_GET()
         self.bridge.forward(self, body)
@@ -610,6 +612,8 @@ class Bridge:
         self._errs, self._left, self._swap_lock = 0, set(), threading.Lock()   # 5xx/no-answer run; models left
         self.busy_retries = BUSY_RETRIES if busy_retries is None else int(busy_retries)
         self.busy_wait_s = BUSY_WAIT_S if busy_wait_s is None else float(busy_wait_s)
+        # Passed-through OpenAI calls' usage (relay): their agents report none Claude-style, so the bridge counts.
+        self.usage = {"calls": 0, "input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0}
         self.busy = {"waits": 0, "waited_s": 0.0, "gave_up": 0}   # capacity waits (busy_wait), for stats()
         self._sleep = time.sleep
         self.server: http.server.ThreadingHTTPServer | None = None
@@ -652,6 +656,10 @@ class Bridge:
                 "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
                 # Claude Code takes 200k for a model it does not know: compact within the tier's window.
                 **({"CLAUDE_CODE_AUTO_COMPACT_WINDOW": str(self.context_window)} if self.context_window else {})}
+
+    def openai_env(self) -> dict[str, str]:
+        """What an OpenAI-compatible agent (a bench harness arm) gets: the bridge's /v1 relay and the run token."""
+        return {"OPENAI_BASE_URL": self.url + "/v1", "OPENAI_API_BASE": self.url + "/v1", "OPENAI_API_KEY": self.token}
 
     def start(self) -> "Bridge":
         handler = type("Handler", (_Handler,), {"bridge": self})
@@ -775,7 +783,8 @@ class Bridge:
                    if self.fields else {}),
                 **({"mid_run": [dict(m) for m in self.mid_run], "model": self.model} if self.mid_run else {}),
                 **({"busy": {**self.busy, "waited_s": round(self.busy["waited_s"], 1)}} if self.busy["waits"]
-                   or self.busy["gave_up"] else {})}
+                   or self.busy["gave_up"] else {}),
+                **({"usage": dict(self.usage)} if self.usage["calls"] else {})}
 
     def _open(self, req: dict):
         r = urllib.request.Request(f"{self.base_url}/chat/completions", data=json.dumps(req).encode(), headers={
@@ -797,14 +806,16 @@ class Bridge:
             self.busy["waited_s"] += wait
         return wait
 
-    def forward(self, h: _Handler, body: dict) -> None:
+    def _send(self, h: _Handler, make) -> tuple | None:
+        """The upstream answer to the call `make(model)` builds, after capacity waits, a rejected effort
+        field's retry and swaps: (response, request sent), or None once an error was answered to `h`."""
         tries, waited = 0, 0.0   # this call's capacity waits (busy_wait)
         while True:
             with self._swap_lock:   # one model and its own fields: a swap in another call changes all three
                 used, fields, rejected = self.model, dict(self.fields), self.rejected
             if self._errs >= SWAP_ERRORS and self._swapped(used):   # e.g. a stream that broke 3 times
                 continue
-            req = to_chat(body, used, self.max_tokens)
+            req = make(used)
             try:
                 try:
                     resp = self._open(with_fields(req, {} if rejected else fields))
@@ -839,13 +850,79 @@ class Bridge:
                     continue
                 if wait is not None:   # waited out as far as allowed: a capacity stop, not the model's
                     detail = f"the model stayed at capacity after {tries} retries over {waited:.0f} s: {detail}"
-                return h._reply(*error_for(e.code, self._scrub(detail)))
+                h._reply(*error_for(e.code, self._scrub(detail)))
+                return None
             except (urllib.error.URLError, OSError) as e:
                 self._fault(0)
                 if self._swapped(used):
                     continue
-                return h._reply(*error_for(0, self._scrub(str(getattr(e, "reason", e)))))
-            break
+                h._reply(*error_for(0, self._scrub(str(getattr(e, "reason", e)))))
+                return None
+            return resp, req
+
+    def relay(self, h: _Handler, body: dict) -> None:
+        """An OpenAI chat-completions call passed through as asked (its own tools and messages), on the
+        run's model and effort fields, with the same waits, swaps and fault records as forward; its usage
+        is counted (self.usage), a stream asking the endpoint to report it."""
+        def make(used: str) -> dict:
+            req = {**body, "model": used}
+            if req.get("stream"):
+                req["stream_options"] = {**(req.get("stream_options") or {}), "include_usage": True}
+            return req
+        got = self._send(h, make)
+        if got is None:
+            return
+        resp, req = got
+        with resp:
+            if not req.get("stream"):
+                try:
+                    data = json.loads(resp.read())
+                except ValueError:
+                    return h._reply(*self._malformed("the upstream answer is not JSON"))
+                if data.get("error"):
+                    return h._reply(*self._fault_reply(_chunk_error(data, self._scrub), data))
+                self._ok()
+                self._count(data.get("usage"))
+                return h._reply(200, data)
+            h.send_response(200)
+            h.send_header("Content-Type", "text/event-stream")
+            h.send_header("Cache-Control", "no-cache")
+            h.send_header("Transfer-Encoding", "chunked")
+            h.end_headers()
+            usage = None
+            try:
+                for raw in resp:
+                    line = raw.decode("utf-8", "replace").strip()
+                    if line.startswith("data:") and line[5:].strip() not in ("", "[DONE]"):
+                        try:
+                            usage = (json.loads(line[5:]) or {}).get("usage") or usage
+                        except (ValueError, AttributeError):
+                            pass
+                    if line:
+                        data = (line + "\n\n").encode()
+                        h.wfile.write(b"%x\r\n%s\r\n" % (len(data), data))
+                        h.wfile.flush()
+                h.wfile.write(b"0\r\n\r\n")
+                h.wfile.flush()
+                self._ok()
+            except OSError:
+                self._fault(0)
+            self._count(usage)
+
+    def _count(self, u) -> None:
+        if not isinstance(u, dict):
+            return
+        got = usage_of(u)
+        with self._swap_lock:
+            self.usage["calls"] += 1
+            for k in ("input_tokens", "output_tokens", "cache_read_input_tokens"):
+                self.usage[k] += int(got.get(k) or 0)
+
+    def forward(self, h: _Handler, body: dict) -> None:
+        got = self._send(h, lambda used: to_chat(body, used, self.max_tokens))
+        if got is None:
+            return
+        resp, req = got
         with resp:
             if not req.get("stream"):
                 try:

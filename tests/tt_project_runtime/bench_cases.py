@@ -2453,3 +2453,76 @@ def test_model_suite_reference_rows_run_elsewhere_are_seeded_and_calibrate_the_n
                           bench_dir=b, opts={}, models=["m-a"], classes=("standard",), has_cli=lambda: True)
     assert calls == [("m-a", False)], "seeded: the reference does not run again"
     assert rows[0]["calibration"] == "calibrated" and rows[0]["reference"][0]["tasks"] == 1
+
+
+def test_bench_run_arm_harness_types_parse_install_once_into_the_bench_folder_and_launch_their_own_agent(
+        env, tmp_path, monkeypatch):
+    # A bench arm's harness: claude (the provider's CLI, the default), opencode or mini-swe-agent (the chat
+    # provider's OpenAI-compatible endpoint through the run's bridge). Each installs into a folder the bench
+    # owns, at a resolved version, once; the launch runs it with the prompt on stdin.
+    from ttp import benchrun, chatbridge
+    assert benchrun.parse_arm("oc=chat:org/m:max:opencode") == \
+        ("oc", {"provider": "chat", "model": "org/m", "effort": "max", "harness": "opencode"})
+    assert benchrun.parse_arm("mini=chat:org/m:max:mini-swe-agent@2.4.6")[1] == \
+        {"provider": "chat", "model": "org/m", "effort": "max", "harness": "mini-swe-agent", "harness_version": "2.4.6"}
+    assert benchrun.parse_arm("cb=chat:org/m:max:claude") == ("cb", {"provider": "chat", "model": "org/m", "effort": "max"})
+    for bad in ("x=chat:m:e:aider", "x=claude:m:e:opencode"):
+        with pytest.raises(benchrun.BenchError):
+            benchrun.parse_arm(bad)
+    # Install: npm into the bench's own prefix (a fake npm here), at the version the index names.
+    bin_dir = tmp_path / "fakebin"
+    bin_dir.mkdir()
+    (bin_dir / "npm").write_text(
+        "#!/bin/sh\nif [ \"$1\" = view ]; then echo 9.8.7; exit 0; fi\n"
+        "echo \"$@\" >> \"$(dirname \"$0\")/npm.log\"\nmkdir -p \"$3/node_modules/.bin\"\n"
+        "printf '#!/bin/sh\\nprintf \"%%s\\\\n\" \"$@\" > \"$TTP_RUN_DIR/argv.txt\"\\n"
+        "cat \"$OPENCODE_CONFIG\" > \"$TTP_RUN_DIR/seen-config.json\"\\nenv > \"$TTP_RUN_DIR/env.txt\"\\n' "
+        "> \"$3/node_modules/.bin/opencode\"\nchmod +x \"$3/node_modules/.bin/opencode\"\n")
+    (bin_dir / "npm").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    root = tmp_path / "harness"
+    inst = benchrun.harness_ready("opencode", root=root)
+    assert inst["version"] == "9.8.7" and inst["dir"] == str(root / "opencode-9.8.7")
+    assert inst["bin"] == str(root / "opencode-9.8.7" / "node_modules" / ".bin" / "opencode")
+    assert benchrun.harness_ready("opencode", "9.8.7", root) == inst
+    assert (bin_dir / "npm.log").read_text().count("install") == 1, "installed once, then reused"
+    assert "--prefix" in (bin_dir / "npm.log").read_text(), "never a global prefix"
+    # A finished install elsewhere is found by its marker; its version is recorded with the arm.
+    mini = root / "mini-swe-agent-2.4.6"
+    (mini / "venv" / "bin").mkdir(parents=True)
+    (mini / "venv" / "bin" / "mini").write_text("#!/bin/sh\n")
+    (mini / "harness.json").write_text(json.dumps({"kind": "mini-swe-agent", "version": "2.4.6", "bin": "venv/bin/mini"}))
+    arm = benchrun.resolve_harness({"provider": "chat", "model": "org/m", "effort": "max", "harness": "mini-swe-agent",
+                                    "harness_version": "2.4.6"}, {"harness_dir": root})
+    assert arm["harness_version"] == "2.4.6" and arm["harness_install"]["bin"] == str(mini / "venv" / "bin" / "mini")
+    assert "bridge" in arm["effort_mapping"]
+    # Launch: the harness's own agent, the prompt on stdin, its config naming only env placeholders, the
+    # run asking the runner for the bridge's OpenAI env (no bridge here: no key in the test).
+    monkeypatch.setattr(chatbridge, "settings", lambda *a, **k: {})
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    oc = {"provider": "chat", "model": "org/m", "effort": "max", "harness": "opencode", "harness_install": inst}
+    run = tmp_path / "run"
+    benchrun.launch(run, ws, "Do the thing.", oc, _bench_opts(tmp_path, dry_run=False), {}, [], dict(os.environ))
+    spec = json.loads((run / "run.json").read_text())
+    assert spec["openai_env"] is True and spec["argv"] == ["/bin/sh", str(run / "harness.sh")]
+    argv = (run / "argv.txt").read_text().splitlines()
+    assert argv == ["run", "--format", "json", "--auto", "-m", "bench/org/m", "Do the thing."], argv
+    conf = json.loads((run / "seen-config.json").read_text())
+    assert conf["provider"]["bench"]["options"] == {"baseURL": "{env:OPENAI_BASE_URL}", "apiKey": "{env:OPENAI_API_KEY}"}
+    assert conf["autoupdate"] is False and conf["share"] == "disabled"
+    script = (run / "harness.sh").read_text()
+    mini_arm = {**arm, "model": "org/m"}
+    benchrun.harness_files(tmp_path, mini_arm, mini_arm["harness_install"])
+    line = (tmp_path / "harness.sh").read_text()
+    assert "-m openai/org/m" in line and "-o " + str(tmp_path / "trajectory.json") in line and "-y" in line
+    assert "cost_limit: 0" in (tmp_path / "mini.yaml").read_text() and "~/.local" not in script + line
+    # Spend: the bridge's token counts, priced at the provider's row, always an estimate.
+
+    class Prov:
+        def price(self):
+            return (1.0, 0.1, 2.0)
+    got = benchrun.harness_spend(Prov(), {"calls": 3, "input_tokens": 1_000_000, "output_tokens": 500_000,
+                                          "cache_read_input_tokens": 400_000})
+    assert got == {"input_tokens": 600_000, "output_tokens": 500_000, "cache_read_tokens": 400_000, "model_calls": 3,
+                   "cost_estimated": True, "cost_basis": benchrun.HARNESS_BASIS, "cost_usd": 1.64}
