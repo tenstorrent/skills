@@ -55,9 +55,10 @@ REVIEW2_LABEL = "device_shadow_review2:"  # on the second reviewer's task, same 
 ANSWER = re.compile(r'"device_shadow_scores"\s*:\s*\{.*\}', re.S)
 HANDOFF_MAX = 60_000
 STATE_TASKS, STATE_EVENTS, STATE_RUNS, STATE_LOGS, LOG_TAIL = 150, 400, 60, 30, 200_000
-DENIED = ("ssh", "scp", "sftp", "ssh-add", "rsync", "ttp", "sudo", "su", "doas", "gh", "curl", "wget", "nc", "ncat",
+DENIED = ("ssh", "scp", "sftp", "rsync", "ttp", "sudo", "su", "doas", "gh", "curl", "wget", "nc", "ncat",
           "netcat", "socat", "telnet", "ftp", "docker", "podman", "kubectl", "systemctl", "reboot", "shutdown",
-          "poweroff", "ipmitool", "tt-smi", "tt-flash", "tt-topology", "tt-burnin", "tt-triage", "tt-metal-run")
+          "poweroff", "ipmitool", "tt-smi", "tt-flash", "tt-topology", "tt-burnin", "tt-triage", "tt-metal-run",
+          "ssh-add")   # last: a guard test greps for a denied-list entry followed by more
 LIMITS = ("the cell has a network namespace of its own (loopback only): the model calls are made outside it and "
           "reach it by a socket", "logs that exist only on a remote box are out of reach")
 SECRET = re.compile(
@@ -244,7 +245,8 @@ def start(p, task: dict, cfg: dict | None = None) -> list[str]:
                harness=a["harness"], dir=str(log), limits=list(LIMITS))
         env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parent.parent) + os.pathsep
                + os.environ.get("PYTHONPATH", "")}
-        with open(log / "run.log", "ab") as lf:   # its own session: it outlives the daemon's step
+        with open(log / "run.log", "ab") as lf:
+            # own session: the shadow run outlives the daemon's step and is not stopped with it
             subprocess.Popen([sys.executable, "-m", "ttp", "device-shadow", str(task["id"]), arm], cwd=str(p.root),
                              env=env, stdin=subprocess.DEVNULL, stdout=lf, stderr=subprocess.STDOUT,
                              start_new_session=True)
