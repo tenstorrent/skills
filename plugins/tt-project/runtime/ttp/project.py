@@ -714,6 +714,11 @@ META_KEYS = {"name", "id", "host", "root", "created", "tt_project_version", "pri
              "home_timezone", "home_timezone_from"}
 EXTRA_KEYS = {
     "waste": {"moved_at"},
+    # route: run-class routing (runclass.py). code_sonnet: {"share", "kinds", "guard", "guard_pts"} or false, the code
+    # route and its daily guard (runclass.guard_run); core_cheap: {class: {"model", "effort"} | false} or false. Both
+    # are account keys too (ACCOUNT_KEYS): the account's value first, the project's own over it. classes,
+    # review_small_lines, review_medium_lines: the run classes' map and review sizes; host_max: host-wide (HOST_WIDE_KEYS).
+    "route": {"code_sonnet", "core_cheap", "classes", "review_small_lines", "review_medium_lines", "host_max"},
     "budget": {"max_waits", "hourly_floor_usd", "estimate_weights", "hourly_waste_usd", "hourly_waste_runs",
                "hourly_coordinator_turns", "hourly_coordinator_repeats", "max_pace_hold_s",
                "cap_yellow_pct"},   # max_pace_hold_s: deprecated and ignored; accepted so old configs stay quiet
@@ -908,7 +913,7 @@ def write_dirs(root: Path, guard: Path, value: Any) -> tuple[list[str], list[str
 def _known_keys(path: list[str]) -> set[str] | None:
     """The keys allowed at `path` in project.json, or None when anything goes there."""
     if not path:
-        return set(DEFAULT_CONFIG) | META_KEYS | {"checks"}
+        return set(DEFAULT_CONFIG) | META_KEYS | {"checks"} | set(EXTRA_KEYS)
     if path[0] in OPEN_SECTIONS or path[0] in META_KEYS:
         return None
     if path[0] == "providers":
@@ -954,8 +959,8 @@ def _known_keys(path: list[str]) -> set[str] | None:
                 # ids it judges at most; default 10), judge_rerun_s, judge_busy_tries, judge_busy_wait_s.
                 "judge", "quarantine_days", "judge_max_ids", "judge_rerun_s", "judge_busy_tries", "judge_busy_wait_s",
                 *CPU_GROUP_KEYS}
-    if len(path) == 1 and isinstance(DEFAULT_CONFIG.get(path[0]), dict):
-        return set(DEFAULT_CONFIG[path[0]]) | EXTRA_KEYS.get(path[0], set())
+    if len(path) == 1 and (isinstance(DEFAULT_CONFIG.get(path[0]), dict) or path[0] in EXTRA_KEYS):
+        return set(DEFAULT_CONFIG.get(path[0]) or {}) | EXTRA_KEYS.get(path[0], set())
     return None
 
 
@@ -3249,7 +3254,7 @@ CPU_GROUP_KEYS = {"cpu_quota", "busy_cpu_quota", "busy_probe", "busy_probe_s", "
 # project's own project.json, so the projects on a machine agree unless one overrides a key.
 ACCOUNT_KEYS = {"budget": {"global_daily_usd", "daily_target_usd", "day_start", "timezone", "push_spend_to"}, "pricing": {"claude", "codex"},
                 "guards": {"protected_paths"},   # paths no run on the host writes (pathguard)
-                "route": {"host_max", "classes", "review_small_lines", "review_medium_lines"},   # route.host_limit; run-class routing (runclass.py)
+                "route": {"host_max", "classes", "review_small_lines", "review_medium_lines", "code_sonnet", "core_cheap"},   # route.host_limit; run-class routing (runclass.py)
                 "checks": {"host_max", "bare_slots", "idle_hold_s", "load_extra", "live_cores", "nice", "ionice", "priority_turns", "urgent_slots", "preempt_after_s", "test_pool", "test_run_max",
                            "test_run_min", "test_project_max", "test_project_slots", "test_project_workers", "load_guard", "load_sustain_s", "build_pool", "build_run_max", "build_project_max", "wall_cap_s",
                            "slots", "light_cmds", "max_wait_s", "wait_event_s", "priority_age_s",

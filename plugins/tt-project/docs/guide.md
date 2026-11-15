@@ -1177,6 +1177,15 @@ spec instead (once per lineage; the tier's effort when Jev is off or does not an
 in the run note and in Jev's call log, which records the task's outcome. It is off by default and
 yields to the A/B while that is on.
 
+Standard code tasks take Sonnet at high effort by kind (`route.code_sonnet`; a canary share of 0.2 by
+default, `share 1` for all). Set it for every project with `ttp config --account route.code_sonnet
+'{"share": 1.0}'` or for one with `ttp config <name> route.code_sonnet ...`: the project's value layers
+over the account's. A daily guard compares the last 24 h of code tasks with the prior 7 days: first-review
+fail rate, rework hops per landed change and $ per landed code task. With at least 5 reviewed tasks and a
+fail-rate rise of more than `route.code_sonnet.guard_pts` points (default 5), it moves every code kind back
+to Opus, holds it there until someone changes `route.code_sonnet`, and sends the coordinator one alert with
+the numbers. `route.code_sonnet.guard false` turns it off; `ttp stats <name> --code-guard` shows the rows.
+
 Light is for mechanical work only: file reads and copies, small scripted edits, polling, test
 reruns. A conclusion run, whose output is a conclusion the user reads, never starts below the
 conclusion floor, `coordinator.conclusion_floor` (default `standard/high`: the standard tier at

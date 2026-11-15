@@ -209,9 +209,15 @@ def reveal(d: Path) -> dict:
 
 
 def prompt(item: dict) -> str:
+    """The reviewer's prompt for one item. Criteria marked not checkable (benchrun.mark_live: they need
+    the live system the sealed replay lacks) are named as not to be scored."""
+    from .benchrun import NOT_CHECKABLE
     rubric = "\n".join(f"- {n} (0-{m}): {what}" for n, m, what in RUBRIC)
+    skip = (f" Criteria marked {NOT_CHECKABLE} need the live system, which the replay that made this change "
+            f"lacked: do not score them, and do not count them as missed; score the rest."
+            if NOT_CHECKABLE in item["criteria"] else "")
     return (f"Score this change against its task's acceptance criteria. You see only the change; who or "
-            f"what wrote it is hidden and does not matter.\n\nRubric (integers):\n{rubric}\n\n"
+            f"what wrote it is hidden and does not matter.{skip}\n\nRubric (integers):\n{rubric}\n\n"
             f"Acceptance criteria:\n{item['criteria']}\n\nChange:\n```diff\n{item['diff']}\n```\n\n"
             f"Answer as JSON: {{\"scores\": {{...}}, \"notes\": \"one short paragraph\"}}.")
 

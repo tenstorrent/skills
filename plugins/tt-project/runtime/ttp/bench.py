@@ -12,8 +12,10 @@ added lines verbatim), held-out tests that use a repository symbol the base lack
 not name, held-out tests that require a name or text the change made up and the spec does not state
 (unstated: a message, or a phrase of a doc, prompt or template the change wrote), and (unless validation
 is off) a task none of whose added tests fails on the base with the head's test files in place and passes ROUNDS of ROUNDS runs on the head: only those fail-to-pass
-tests are kept. A task whose spec says its branch starts from another task's branch (PARENT) replays
-from that parent's recorded head (the spec's, else the parent's latest push queue head) up to its own
+tests are kept. A task whose spec says its branch starts from another task's branch (PARENT), or that
+continues another task (its `continues:` label: it starts from that task's branch head), replays
+from that parent's recorded head (the spec's, else the parent's latest push queue head, shared-branch
+hand-off or branch head) up to its own
 branch head; it is excluded when the repository lacks that head or it is not under the branch head,
 since a workspace at the push branch base would lack the parent's work. Each kept task gets <out>/<id>/workspace, a fresh repository whose
 one ref is the base commit, with its history up to the base and nothing later (no remotes, tags or reflog), and <out>/<id>/heldout, the head's copy
@@ -105,18 +107,35 @@ def _start(repo: Path, land: str, stops: frozenset) -> str:
     return ""
 
 
+def parent_of(task) -> tuple[int, str] | None:
+    """(parent, recorded head or "") of a task whose branch starts from another task's branch: the
+    spec's PARENT line (a review fix's, with the head, or a PR fix's), else the task its `continues:`
+    label names (a continuation starts from that task's branch head: the worker prompt says so, not
+    the spec); None for a task that starts from the push branch."""
+    from .db import continues_id
+    t = dict(task)
+    if m := PARENT.search(t.get("spec") or ""):
+        return int(m[1]), m[2] or ""
+    c = continues_id({"labels": t.get("labels") or "[]"})
+    return (c, "") if c is not None else None
+
+
 def from_parent(db, repo: Path, parent: int, recorded: str, head: str) -> tuple[str, str, str]:
     """(base, head, "") of a task whose branch starts from task `parent`'s branch: base is the parent's
-    `recorded` head (else its latest push queue head under `head`, the task's branch head) when the
-    repository has it under `head`; else ("", "", why)."""
+    `recorded` head (else its latest push queue head, the head it handed off to a shared branch, or its
+    branch's head, under `head`, the task's branch head, and not `head` itself) when the repository has
+    it under `head`; else ("", "", why)."""
+    from .integrate import MEMBER_HEAD_REF
     heads = [recorded] if recorded else [r["head"] for r in db.q(
         "SELECT head FROM push_queue WHERE task=? AND head IS NOT NULL AND head != '' ORDER BY id DESC", (parent,))]
+    refs = [] if recorded else [f"{MEMBER_HEAD_REF}{parent}"] + [
+        f"refs/heads/{r['branch']}" for r in db.q("SELECT branch FROM tasks WHERE id=?", (parent,)) if r["branch"]]
     tip = _out(repo, "rev-parse", "--verify", "-q", f"{head}^{{commit}}") if head else ""
-    shas = [s for h in heads if (s := _out(repo, "rev-parse", "--verify", "-q", f"{h}^{{commit}}"))]
+    shas = [s for h in heads + refs if (s := _out(repo, "rev-parse", "--verify", "-q", f"{h}^{{commit}}")) and s != tip]
     for sha in shas:
         if tip and _git(repo, "merge-base", "--is-ancestor", sha, tip).returncode == 0:
             return sha, tip, ""
-    what = ("not recorded" if not heads else "not in the repository" if not shas else
+    what = ("not recorded" if not heads and not shas else "not in the repository" if not shas else
             "not under its branch head")
     return "", "", f"its branch starts from #{parent}'s branch, whose head is {what}"
 
@@ -669,7 +688,7 @@ def candidates(db, since: float):
     landing may reach (_reach); every landed commit and push branch tip before a push (landing's
     stops); and the landed commits more than one change landed in."""
     from . import landed
-    tasks = db.q("SELECT id, kind, title, spec, created FROM tasks WHERE status='done' AND kind IN ('code','work') "
+    tasks = db.q("SELECT id, kind, title, spec, labels, created FROM tasks WHERE status='done' AND kind IN ('code','work') "
                  "AND created >= ? ORDER BY id DESC", (since,))
     rows = landed.Rows(db, [t["id"] for t in tasks])
     pushed = db.q("SELECT task, branch, head, COALESCE(NULLIF(landed_sha, ''), pushed_sha) AS landed_sha FROM push_queue "
@@ -721,9 +740,9 @@ def prep(db, repo: Path, out: Path, since: float, limit: int = 0, test_cmd: str 
                 break
             t0 = time.monotonic()
             base, head, why = landing(repo, mine := landed_rows(db, t["id"], rows, pushed, reach), stops, shared)
-            parent = PARENT.search(t["spec"] or "")
+            parent = parent_of(t)
             if not why and parent:
-                base, head, why = from_parent(db, repo, int(parent[1]), parent[2] or "", mine[0]["head"] or head)
+                base, head, why = from_parent(db, repo, parent[0], parent[1], mine[0]["head"] or head)
             tests = addedtests.added(repo, base, head, _tests_of(repo)) if base else []
             if not why and not tests:
                 why = "its landed change adds or changes no test"
@@ -759,7 +778,7 @@ def prep(db, repo: Path, out: Path, since: float, limit: int = 0, test_cmd: str 
             kept.append({"task": t["id"], "kind": t["kind"], "title": t["title"],
                          "spec": scrub_spec(t["spec"] or "", [repo, repo.resolve()]),
                          "created": t["created"],
-                         "parent": int(parent[1]) if parent else None, "base": base, "head": head, "tree": tree,
+                         "parent": parent[0] if parent else None, "base": base, "head": head, "tree": tree,
                          "stratum": "small" if lines <= SMALL else "large", "changed_lines": lines,
                          "tests": [f"{p}::{n}" for p, n in tests], "heldout": sums})
             say(t, f"kept, {len(tests)} test(s)", t0)

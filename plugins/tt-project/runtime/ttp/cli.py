@@ -2181,6 +2181,11 @@ def cmd_stats(a) -> None:
         s = runclass.by_class(p.db, p.config(), since, _stats_time(a.until, tz, "--until"))
         print(json.dumps(s, indent=1) if a.json else runclass.text(s))
         return
+    if getattr(a, "code_guard", False):
+        from . import runclass
+        s = runclass.guard_report(p.db, p.config(), max(1, int(a.days or 7)))
+        print(json.dumps(s, indent=1) if a.json else runclass.guard_report_text(s, p.name, timefmt.zone(p)))
+        return
     if a.tools:
         s = bud.tool_output_stats(p.db, p.runs, a.days)
         print(json.dumps(s, indent=1) if a.json else bud.tool_output_text(s))
@@ -15308,6 +15313,10 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--by-class", action="store_true",
                    help="runs per run class per model per hour with real cost instead (runclass.py); "
                         "--since 1h or 24h (the default) or a time")
+    s.add_argument("--code-guard", action="store_true",
+                   help="the daily code-route guard instead (runclass.guard_run): per day, code tasks' review-fail "
+                        "rate, rework hops and $ per landed code task against the prior 7 days, and whether a trip "
+                        "holds code on Opus (the last --days rows)")
     s.add_argument("--rejections", action="store_true",
                    help="coordinator action refusals per reason class instead (rejtally.py): caught by the "
                         "in-turn dry run and refused after the turn, over --days")

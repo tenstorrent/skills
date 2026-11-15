@@ -50,7 +50,19 @@ ALARM_MIN tasks each (the daemon raises one run_class_quality event when a kind 
 own state and alarm. Review fixes take this route though route.kept_core keeps them off every other one, except
 a fix after REVIEW_ROUND_MAX failed reviews where the round is known (review_round). Urgent, needs_deep,
 user_deep, pinned (provider, model or effort), tier-up retries, deep, plan and device runs stay on Opus. Off with `route.code_sonnet` false or `route.core_cheap` false;
-`route.code_sonnet.kinds` narrows the kinds.
+`route.code_sonnet.kinds` narrows the kinds. Both `route.code_sonnet` and `route.core_cheap` are project and
+account keys (`ttp config <project> route.code_sonnet '{"share": 1.0}'`, `ttp config --account ...`): the
+account's value first, the project's own over it. The shipped share stays CODE_CANARY.
+
+Daily guard (guard_run, by the daemon next to the hourly code_quality): once a day while the code route is on,
+the code tasks finished in the last day against the prior GUARD_PRIOR_DAYS days (guard_day): (a) review-fail
+rate, the share of reviewed ones whose first review (auto_review:<id>) failed or asked for changes; (b) rework
+hops (review fixes and continuations) per landed change; (c) $ per landed change, its hops' spend included. Each
+day's row is kept in the kv GUARD_DAYS_KV (`ttp stats --code-guard`). It trips when the day has ALARM_MIN reviewed
+code tasks and its review-fail rate beats the prior days' (which had at least one) by more than
+`route.code_sonnet.guard_pts` points (GUARD_PTS): every code kind goes back to Opus (guard_held, over the hourly
+state) until a person changes `route.code_sonnet`, and the daemon raises one high-severity event with the
+numbers. `route.code_sonnet.guard` false turns the guard off.
 
 Report: by_class counts runs per class per model per hour with their real cost (`ttp stats --by-class`),
 and the share of runs whose class routes to chat. Alarm: quiet_classes names a class meant for cheap
@@ -105,6 +117,13 @@ CODE_CANARY = 0.2
 CODE_FULL_MIN = 30
 CODE_WINDOW_S = 7 * 86400.0
 CODE_STATE_KV = "code_sonnet_state"
+GUARD_KV = "code_sonnet_guard"        # the guard's trip: {"ts", "setting", "row"}; holds every code kind on Opus
+GUARD_DAYS_KV = "code_sonnet_guard_days"   # the guard's daily rows, newest last (GUARD_KEEP of them)
+GUARD_PTS = 5.0                       # `route.code_sonnet.guard_pts`: the review-fail rise in points that trips it
+GUARD_DAY_S = 86400.0
+GUARD_PRIOR_DAYS = 7
+GUARD_EVERY_S = 23 * 3600.0           # once a day, a little early so the hourly loop's drift never skips a day
+GUARD_KEEP = 90
 REPORT = re.compile(r"(?i)\b(status|report|measure(?:d|ment|s)?|count|stats|summar(?:y|ise|ize)|digest|brief)\b")
 
 
@@ -508,6 +527,141 @@ def code_quality_text(kind: str, v: dict, hours: float) -> str:
             f"{s['bad']}/{s['tasks']} failed, needs_review or changes asked at first review ({s['share']:.0%}) vs "
             f"{o['bad']}/{o['tasks']} ({o['share']:.0%}). New {kind} code tasks run on Opus again; "
             f"`route.code_sonnet` false turns the Sonnet route off.")
+
+
+def guard_settings(cfg: dict) -> dict | None:
+    """{"pts"} for the daily code-route guard, or None when it is off (the code route off, or
+    `route.code_sonnet.guard` false)."""
+    if not code_settings(cfg):
+        return None
+    got = (cfg.get("route") or {}).get("code_sonnet")
+    got = got if isinstance(got, dict) else {}
+    if got.get("guard") is False:
+        return None
+    pts = got.get("guard_pts")
+    pts = float(pts) if isinstance(pts, (int, float)) and not isinstance(pts, bool) and pts >= 0 else GUARD_PTS
+    return {"pts": pts}
+
+
+def setting_mark(cfg: dict) -> str:
+    """The effective `route.code_sonnet` value as a stable string: a trip holds while it is unchanged."""
+    return json.dumps((cfg.get("route") or {}).get("code_sonnet"), sort_keys=True, default=str)
+
+
+def guard_held(db, cfg: dict) -> bool:
+    """Whether a guard trip holds every code kind on Opus: one is recorded and `route.code_sonnet` is
+    unchanged since (a person's change ends it)."""
+    got = db.kv(GUARD_KV)
+    return isinstance(got, dict) and bool(got.get("ts")) and got.get("setting") == setting_mark(cfg)
+
+
+def guard_day(db, since: float, until: float) -> dict:
+    """Code tasks finished (done or failed) in [since, until): {"tasks", "reviewed", "review_fails", "fail_rate",
+    "landed", "hops", "hops_per_landed", "usd", "usd_per_landed"}. Reviewed: a first review (the lowest
+    auto_review:<id> review, done or failed) has its verdict; failed means it asked for changes. Landed changes
+    are the lineages (chaincap.chain, root first) of these tasks whose root landed (landed.recorded, which
+    follows the hops that carry it on); hops are a lineage's review fixes and continuations, its $ every hop's
+    spend."""
+    from . import chaincap, landed
+    tasks = [dict(t) for t in db.q("SELECT * FROM tasks WHERE kind='code' AND status IN ('done','failed') "
+                                   "AND updated>=? AND updated<? ORDER BY id", (since, until))]
+    ids = {t["id"] for t in tasks}
+    first: dict = {}
+    if ids:
+        for r in db.q("SELECT id, status, labels FROM tasks WHERE kind='review' AND status IN ('done','failed') "
+                      "AND labels LIKE '%auto_review:%' ORDER BY id"):
+            for lb in _labels(dict(r)):
+                if lb.startswith("auto_review:") and lb[12:].isdigit() and int(lb[12:]) in ids:
+                    first.setdefault(int(lb[12:]), r["status"])
+    lines: dict = {}
+    for t in tasks:
+        ch = chaincap.chain(db, t["id"]) or [t]
+        root = ch[0]["id"]
+        if len(ch) >= len(lines.get(root) or []):
+            lines[root] = ch
+    landed_lines = [ch for root, ch in lines.items() if landed.recorded(db, root)[0]]
+    hops = sum(len(ch) - 1 for ch in landed_lines)
+    usd = sum(chaincap.spend(ch) for ch in landed_lines)
+    fails = sum(1 for v in first.values() if v == "failed")
+    n = len(landed_lines)
+    return {"tasks": len(tasks), "reviewed": len(first), "review_fails": fails,
+            "fail_rate": round(fails / len(first), 4) if first else None,
+            "landed": n, "hops": hops, "hops_per_landed": round(hops / n, 2) if n else None,
+            "usd": round(usd, 2), "usd_per_landed": round(usd / n, 2) if n else None}
+
+
+def guard_check(db, cfg: dict, now: float | None = None) -> dict:
+    """The guard's row for the day ending at `now`: {"ts", "day", "prior", "pts", "rise_pts", "tripped"}."""
+    now = time.time() if now is None else now
+    pts = (guard_settings(cfg) or {}).get("pts", GUARD_PTS)
+    day = guard_day(db, now - GUARD_DAY_S, now)
+    prior = guard_day(db, now - (1 + GUARD_PRIOR_DAYS) * GUARD_DAY_S, now - GUARD_DAY_S)
+    rise = round((day["fail_rate"] - prior["fail_rate"]) * 100, 1) \
+        if day["fail_rate"] is not None and prior["fail_rate"] is not None else None
+    tripped = day["reviewed"] >= ALARM_MIN and rise is not None and rise > pts
+    return {"ts": now, "day": day, "prior": prior, "pts": pts, "rise_pts": rise, "tripped": tripped}
+
+
+def guard_run(db, cfg: dict, now: float | None = None) -> dict | None:
+    """The daemon's daily guard: None when it is off or ran under GUARD_EVERY_S ago; else today's row, kept in
+    GUARD_DAYS_KV. A trip while none holds records GUARD_KV with the current `route.code_sonnet` and comes back
+    with "new_trip" true: the caller raises the one alert."""
+    now = time.time() if now is None else now
+    if not guard_settings(cfg):
+        return None
+    rows = db.kv(GUARD_DAYS_KV)
+    rows = [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+    if rows and now - float(rows[-1].get("ts") or 0) < GUARD_EVERY_S:
+        return None
+    row = guard_check(db, cfg, now)
+    row["held"] = guard_held(db, cfg)
+    db.set_kv(GUARD_DAYS_KV, (rows + [row])[-GUARD_KEEP:])
+    if row["tripped"] and not row["held"]:
+        db.set_kv(GUARD_KV, {"ts": now, "setting": setting_mark(cfg), "row": row})
+        return {**row, "new_trip": True}
+    return row
+
+
+def guard_line(row: dict) -> str:
+    def f(v, fmt):
+        return "n/a" if v is None else format(v, fmt)
+    d, p = row["day"], row["prior"]
+    return (f"review fails {d['review_fails']}/{d['reviewed']} ({f(d['fail_rate'], '.0%')}) vs prior "
+            f"{GUARD_PRIOR_DAYS} days {p['review_fails']}/{p['reviewed']} ({f(p['fail_rate'], '.0%')}), "
+            f"rise {f(row['rise_pts'], 'g')} pts (limit {row['pts']:g}); rework hops per landed change "
+            f"{f(d['hops_per_landed'], 'g')} vs {f(p['hops_per_landed'], 'g')}; $ per landed code task "
+            f"{f(d['usd_per_landed'], '.2f')} vs {f(p['usd_per_landed'], '.2f')} ({d['landed']} vs {p['landed']} landed)")
+
+
+def guard_text(row: dict) -> str:
+    """The trip's alert."""
+    return (f"Code-route guard tripped: code tasks' review-fail rate rose more than {row['pts']:g} points over the "
+            f"prior {GUARD_PRIOR_DAYS} days. {guard_line(row)}. Every code kind runs on Opus again and stays there "
+            f"until `route.code_sonnet` is changed (`ttp stats --code-guard` shows the daily numbers).")
+
+
+def guard_report(db, cfg: dict, days: int = 14) -> dict:
+    """`ttp stats --code-guard`: the guard's settings, its hold and its last `days` daily rows."""
+    rows = db.kv(GUARD_DAYS_KV)
+    rows = [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+    trip = db.kv(GUARD_KV)
+    return {"guard": guard_settings(cfg), "share": (code_settings(cfg) or {}).get("share"),
+            "held": guard_held(db, cfg), "trip": trip if isinstance(trip, dict) else None,
+            "rows": rows[-max(1, days):]}
+
+
+def guard_report_text(s: dict, name: str, tz=None) -> str:
+    from datetime import datetime
+    head = (f"{name}: code-route guard " + (f"on (trips above {s['guard']['pts']:g} points)" if s["guard"] else "off")
+            + (f", Sonnet share {s['share']:g}" if s["share"] is not None else ", code route off")
+            + ("; HOLDING every code kind on Opus until route.code_sonnet changes" if s["held"] else ""))
+    out = [head]
+    for r in s["rows"]:
+        when = datetime.fromtimestamp(float(r.get("ts") or 0), tz).strftime("%Y-%m-%d %H:%M %Z").strip()
+        out.append(f"  {when}: {guard_line(r)}" + (" TRIPPED" if r.get("tripped") else ""))
+    if not s["rows"]:
+        out.append("  no daily rows yet")
+    return "\n".join(out)
 
 
 def decider(decision) -> str:

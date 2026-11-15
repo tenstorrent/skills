@@ -362,3 +362,29 @@ def test_benchblind_module_form_reads_its_own_argv(env, tmp_path):
     assert got.returncode == 0 and "scored 0 item(s)" in got.stdout and "TypeError" not in got.stderr, got.stderr
     got = run("review", str(tmp_path / "missing"))
     assert got.returncode == 2 and "TypeError" not in got.stderr and "benchblind:" in got.stderr, got.stderr
+
+
+def test_bench_criteria_marks_items_that_need_the_live_system_and_the_arm_and_reviewer_skip_them():
+    # 8533-like: a before/after from the live grants log cannot be met in a sealed replay; plain
+    # items stay as they are and are scored.
+    from ttp import benchblind, benchrun
+    spec = ("Goal: count grants.\nAcceptance:\n- `ttp stats --grants` prints one row per day.\n"
+            "- Tests cover the empty and the busy day.\n"
+            "- Report before/after numbers from the live grants log.\n- Land it with `ttp push --detach`.\n"
+            "- Upgrade every project on the host and read its state db.\nReturn: the commit")
+    mark = benchrun.NOT_CHECKABLE
+    got = benchrun.criteria(spec).splitlines()
+    assert got[0] == "Acceptance:" and len(got) == 6
+    assert [mark in x for x in got[1:]] == [False, False, True, True, True]
+    assert benchrun.criteria("Goal: x\nAcceptance:\n- a works\n- b: too\nReturn: the commit") == \
+        "Acceptance:\n- a works\n- b: too", "plain items are left alone"
+    for plain in ("Add a pushback counter to the queue.", "The deployment doc names the flag.",
+                  "Tests for the new setting."):
+        assert mark not in benchrun.mark_live(plain), plain
+    assert benchrun.mark_live(benchrun.mark_live("Live logs show it.")).count(mark) == 1
+    arm = benchrun.prompt(spec, {})
+    assert f"before/after numbers from the live grants log. {mark}" in arm and "skip them" in arm
+    assert "skip them" not in benchrun.prompt("Add new() returning 2.", {})
+    item = {"criteria": benchrun.criteria(spec), "diff": "+x"}
+    assert "do not score them" in benchblind.prompt(item)
+    assert "do not score them" not in benchblind.prompt({"criteria": "Acceptance:\n- a works", "diff": "+x"})

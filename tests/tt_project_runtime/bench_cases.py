@@ -134,9 +134,13 @@ def test_bench_prep_replays_a_task_built_on_a_parent_branch_from_the_parent_head
     pr_fix = kid_task(f"This task's branch starts from #{pid}'s branch head. Fix feat() on the PR.")
     missing = kid_task(on.replace(par[:12], "0123456789ab"))
     off = kid_task(on.replace(par[:12], unrelated[:12]))
+    # A task that continues the parent's unlanded branch says so only by its label (the worker prompt,
+    # not the spec, says it starts from that branch's head): it too replays from the parent's head.
+    cont = kid_task("Finish feat(): make it return 5.")
+    p.db.x("UPDATE tasks SET labels=? WHERE id=?", (json.dumps([f"continues:{pid}"]), cont))
     m = bench.prep(p.db, repo, tmp_path / "bench", since)
     kept = {t["task"]: t for t in m["tasks"]}
-    assert sorted(kept) == [recorded, pr_fix], m["excluded"]
+    assert sorted(kept) == [recorded, pr_fix, cont], m["excluded"]
     for t in kept.values():
         assert (t["base"], t["head"], t["parent"]) == (par, kid, pid), "replayed from the parent's head"
         assert t["tests"] == ["tests/test_mod.py::test_feat"]
@@ -145,8 +149,24 @@ def test_bench_prep_replays_a_task_built_on_a_parent_branch_from_the_parent_head
     assert why[missing] == f"its branch starts from #{pid}'s branch, whose head is not in the repository"
     assert why[off] == f"its branch starts from #{pid}'s branch, whose head is not under its branch head"
     p.db.x("DELETE FROM push_queue WHERE task=?", (pid,))
+    assert bench.from_parent(p.db, repo, pid, "", kid) == (par, kid, ""), "no push queue head: its branch's head"
+    subprocess.run([*git, "branch", "-D", "par"], check=True, capture_output=True)
     assert bench.from_parent(p.db, repo, pid, "", kid) == (
         "", "", f"its branch starts from #{pid}'s branch, whose head is not recorded")
+
+
+def test_bench_parent_of_reads_the_review_fix_and_pr_fix_spec_forms_and_the_continues_label():
+    # 8558-like: a continuation's spec names no parent branch; its label does. The review fix form
+    # carries the parent's head; the PR fix form and a continuation leave it to the parent's records.
+    from ttp import bench
+    fix = ("Fix the review findings.\nThis task's branch starts from #8556's branch "
+           "ttp/t8556-code-tt-buddy-upstream-batch-batch-landi (head 7dca0f4bc71b): build on it.")
+    assert bench.parent_of({"spec": fix, "labels": "[]"}) == (8556, "7dca0f4bc71b")
+    assert bench.parent_of({"spec": "This task's branch starts from #41's branch head. Fix it."}) == (41, "")
+    assert bench.parent_of({"spec": "Finish the change.", "labels": json.dumps(["continues:8557", "x"])}) == (8557, "")
+    assert bench.parent_of({"spec": fix, "labels": json.dumps(["continues:9"])}) == (8556, "7dca0f4bc71b")
+    assert bench.parent_of({"spec": "Add feat().", "labels": json.dumps(["follows:3"])}) is None
+    assert bench.parent_of({"spec": None}) is None
 
 
 def test_bench_landing_refuses_a_range_that_does_not_match_its_branch(tmp_path):

@@ -55,12 +55,36 @@ XDIST_LINE = (" pytest-xdist is installed: append `-n {n}` (or fewer) to a pytes
               "parallel.")
 
 
+# An acceptance item the sealed replay cannot meet: it needs the live system (live logs or runs, the
+# state db, deployed hosts or other machines, other projects, push, landing or deploy, before/after
+# numbers). mark_live tags each such line with NOT_CHECKABLE so the arm and the reviewer skip it.
+LIVE = re.compile(r"(?i)\blive\b|\bproject\.db\b|\bstate (?:db|database)\b|\bttp (?:push|express|setup|upgrade)\b"
+                  r"|\bdeploy(?:ed|s|ing)?\b|\b(?:other|remote|every|each|all) (?:machines?|hosts?|boxes|projects?)\b"
+                  r"|\bon (?:the |a )?(?:hosts?|machines?|boxes?)\b|\bbefore[/ ]and[/ ]after\b|\bbefore/after\b"
+                  r"|\bland(?:s|ed|ing)? (?:it|the change|on)\b|\bpush(?:es|ed)? (?:it|the change) to\b")
+NOT_CHECKABLE = "[not checkable in the replay: needs the live system]"
+
+
+def mark_live(text: str) -> str:
+    """`text` with each line LIVE matches (an acceptance item that needs the live system) ending in
+    NOT_CHECKABLE; other lines unchanged."""
+    return "\n".join(f"{x} {NOT_CHECKABLE}" if LIVE.search(x) and NOT_CHECKABLE not in x else x
+                     for x in text.splitlines())
+
+
+LIVE_LINE = (" Lines of the task marked " + NOT_CHECKABLE + " need the live system, which this repository "
+             "copy lacks: skip them, and do not fake their results.")
+
+
 def prompt(spec: str, opts: dict, xdist_n: int = 0) -> str:
     """The cell agent's prompt: the task's spec, its time limit and a focused test command. The parallel
     test line appears only when the cell's venv imports pytest-xdist (`xdist_n`, its grant), never as a
-    claim the agent's pytest would refuse."""
-    return PROMPT.format(spec=spec, limit_min=max(1, int(float(opts.get("timeout_s") or 1800) // 60)),
-                         xdist=XDIST_LINE.format(n=xdist_n) if xdist_n else "")
+    claim the agent's pytest would refuse. Spec lines that need the live system are marked (mark_live)
+    and the agent is told to skip them."""
+    marked = mark_live(spec)
+    return PROMPT.format(spec=marked, limit_min=max(1, int(float(opts.get("timeout_s") or 1800) // 60)),
+                         xdist=(XDIST_LINE.format(n=xdist_n) if xdist_n else "")
+                         + (LIVE_LINE if NOT_CHECKABLE in marked else ""))
 CHEAT = re.compile(r"\bgit\s+(fetch|clone|pull|ls-remote|remote\s+add)\b|\bgit\s+log\s+--all\b|\bgh\s+(api|repo|pr)\b")
 TEST_CMD = "python3 -m pytest -q -p no:cacheprovider"
 ISOLATE = True   # each cell's agent runs in a mount namespace (cellns.py); only tests turn this off (opts["isolate"])
@@ -883,14 +907,15 @@ def _finish(row: dict, bench_dir: Path, task: dict, ws: Path, run: Path, keep: P
 
 def criteria(spec: str) -> str:
     """The spec's acceptance section (from a line starting 'Acceptance' to the next 'Word:' heading),
-    else the whole spec: what the blind reviewer scores each arm's diff against."""
+    else the whole spec: what the blind reviewer scores each arm's diff against. Items that need the
+    live system end in NOT_CHECKABLE (mark_live): the reviewer does not score them."""
     lines = spec.splitlines()
     start = next((i for i, x in enumerate(lines) if re.match(r"(?i)\s*(#+\s*)?acceptance\b", x)), None)
     if start is None:
-        return spec.strip()
+        return mark_live(spec.strip())
     end = next((i for i in range(start + 1, len(lines))
                 if re.match(r"\s*(#+\s*)?[A-Z][\w ()#,'-]{0,40}:(\s|$)", lines[i])), len(lines))
-    return "\n".join(lines[start:end]).strip()
+    return mark_live("\n".join(lines[start:end]).strip())
 
 
 def blind_cells(out: Path, tasks: dict, arms: dict, cells: list[dict]) -> dict:

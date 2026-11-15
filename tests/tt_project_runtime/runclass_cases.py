@@ -653,3 +653,109 @@ def test_reviews_run_on_their_tiers_core_model_unless_the_user_routes_them():
     user = {**cfg, "route": {"classes": {"review_small": "chat"}}}
     assert runclass.routes(user)["review_small"] == "chat"
     assert runclass.target(user, r, "standard", "review_small")["rule"] == "class:review_small"
+
+
+def test_code_sonnet_and_core_cheap_are_project_and_account_keys_the_project_value_layers_over(env):
+    from ttp import cli, runclass
+    from ttp.project import layered, unknown_key_hint
+    p = make(env)
+    for k in ("route.code_sonnet", "route.core_cheap", "route.code_sonnet.share", "route.code_sonnet.guard_pts"):
+        assert unknown_key_hint(k) is None, k
+    assert unknown_key_hint("route.nope") is not None
+    assert cli.main(["config", "--account", "route.code_sonnet", '{"share": 1.0, "guard_pts": 8}']) in (None, 0)
+    assert cli.main(["config", "--account", "route.core_cheap", "true"]) in (None, 0)
+    cfg = p.config()
+    assert cfg["route"]["code_sonnet"] == {"share": 1.0, "guard_pts": 8} and cfg["route"]["core_cheap"] is True
+    # The project's value layers over the account's: its keys win, the account's others stay.
+    assert cli.main(["config", p.name, "route.code_sonnet", '{"guard_pts": 3}']) in (None, 0)
+    cfg = p.config()
+    assert cfg["route"]["code_sonnet"] == {"share": 1.0, "guard_pts": 3}
+    assert runclass.guard_settings(cfg) == {"pts": 3.0}
+    assert layered({"route": {"code_sonnet": False}})["route"]["code_sonnet"] is False
+    # Share 1: every code task takes Sonnet; a review is no code kind and is never routed.
+    for i in range(1, 30):
+        t = {"id": i, "kind": "code", "tier": "standard", "title": "x", "labels": "[]"}
+        assert runclass.code_sonnet(cfg, t)["model"] == runclass.CODE_MODEL["model"]
+    assert runclass.code_sonnet(cfg, {"id": 1, "kind": "review", "tier": "standard", "title": "x",
+                                      "labels": "[]"}) is None
+
+
+def _guard_tasks(p, now, n, fails, ago=3600.0, landed=0, spent=1.0):
+    """`n` finished code tasks `ago` seconds before `now`, the first `fails` with a failed first review and the
+    first `landed` recorded as landed; each spent `spent`."""
+    out = []
+    for i in range(n):
+        t = p.db.add_task("t", "", kind="code", tier="standard", priority=3, budget_usd=5.0)
+        p.db.x("UPDATE tasks SET status='done', spent_usd=?, updated=? WHERE id=?", (spent, now - ago, t))
+        r = p.db.add_task(f"Review #{t}", "", kind="review", tier="standard", priority=3, budget_usd=1.0)
+        p.db.x("UPDATE tasks SET status=?, labels=? WHERE id=?",
+               ("failed" if i < fails else "done", json.dumps([f"auto_review:{t}"]), r))
+        if i < landed:
+            p.db.x("INSERT INTO task_landings(marker,task,sha,target,ts) VALUES(?,?,?,?,?)",
+                   (f"m{t}", t, f"{t:040x}", "branch", now - ago))
+        out.append(t)
+    return out
+
+
+def test_code_route_guard_compares_today_with_the_prior_week_and_needs_five_reviewed_and_a_rise_over_its_points(env):
+    from ttp import runclass
+    p = make(env)
+    now = time.time()
+    _guard_tasks(p, now, 10, 1, ago=3 * 86400, landed=4, spent=2.0)   # prior week: 10% fail, $2 per landed
+    _guard_tasks(p, now, 4, 2, landed=2, spent=1.0)                    # today: 4 reviewed only
+    cfg = {"route": {"code_sonnet": {"share": 1.0}}}
+    row = runclass.guard_check(p.db, cfg, now)
+    assert (row["prior"]["reviewed"], row["prior"]["review_fails"], row["prior"]["usd_per_landed"]) == (10, 1, 2.0)
+    assert (row["day"]["reviewed"], row["day"]["landed"], row["day"]["hops_per_landed"]) == (4, 2, 0.0)
+    assert row["rise_pts"] == 40.0 and not row["tripped"]   # under ALARM_MIN reviewed: no trip
+    _guard_tasks(p, now, 1, 0)   # 5 reviewed, 2 failed (40%): 30 points over 10%
+    row = runclass.guard_check(p.db, cfg, now)
+    assert row["day"]["reviewed"] == runclass.ALARM_MIN and row["rise_pts"] == 30.0 and row["tripped"]
+    assert not runclass.guard_check(p.db, {"route": {"code_sonnet": {"guard_pts": 30}}}, now)["tripped"]
+    assert "rise 30 pts (limit 5)" in runclass.guard_line(row)
+    # Off: `route.code_sonnet.guard` false, or the code route itself off.
+    for off in ({"code_sonnet": {"guard": False}}, {"code_sonnet": False}, {"core_cheap": False}):
+        assert runclass.guard_settings({"route": off}) is None
+        assert runclass.guard_run(p.db, {"route": off}, now) is None
+    assert p.db.kv(runclass.GUARD_DAYS_KV) is None
+
+
+def test_code_route_guard_trip_holds_code_on_opus_until_the_setting_changes_and_tells_the_coordinator_once(env, capsys):
+    from ttp import cli, runclass
+    from ttp.daemon import Daemon
+    p = make(env)
+    now = time.time()
+    p.set_config("route.code_sonnet", {"share": 1.0})
+    _guard_tasks(p, now, 10, 0, ago=2 * 86400, landed=10)
+    _guard_tasks(p, now, 6, 3, landed=3)   # 50% today against 0%
+    p.db.set_kv(runclass.CODE_STATE_KV, json.dumps({"new": "full"}))
+    d = Daemon(p.base)
+    d.watch_run_classes()
+    assert d._code_state() == {k: "off" for k in runclass.CODE_KINDS}
+    t = {"id": 1, "kind": "code", "tier": "standard", "title": "x", "labels": "[]"}
+    assert runclass.core_cheap(d.cfg, t, "hard", "standard", "claude", None, None, d._code_state()) is None
+    ev = p.db.q("SELECT severity, text FROM events WHERE kind='code_route_guard'")
+    assert len(ev) == 1 and ev[0]["severity"] == "high" and "3/6 (50%)" in ev[0]["text"] \
+        and "route.code_sonnet" in ev[0]["text"]
+    # The hourly loop never flips it back, and the daily row is not redone within the day.
+    d._run_class_checked = d._code_quality_checked = d._code_guard_checked = 0.0
+    d.watch_run_classes()
+    assert d._code_state()["new"] == "off"
+    assert runclass.guard_run(p.db, d.cfg, now + 3600) is None
+    assert len(p.db.kv(runclass.GUARD_DAYS_KV)) == 1
+    # A day later still tripped: held, recorded, no second alert.
+    row = runclass.guard_run(p.db, d.cfg, now + 86400)
+    assert row["held"] and not row.get("new_trip")
+    assert p.db.one("SELECT COUNT(*) n FROM events WHERE kind='code_route_guard'")["n"] == 1
+    assert cli.main(["stats", "demo", "--code-guard"]) in (None, 0)
+    out = capsys.readouterr().out
+    assert "HOLDING every code kind on Opus" in out and "TRIPPED" in out
+    assert cli.main(["stats", "demo", "--code-guard", "--json"]) in (None, 0)
+    s = json.loads(capsys.readouterr().out)
+    assert s["held"] and len(s["rows"]) == 2 and s["guard"] == {"pts": 5.0}
+    # A person changes route.code_sonnet: the hold ends and the hourly states rule again.
+    p.set_config("route.code_sonnet", {"share": 0.5})
+    d._load_config()
+    assert not runclass.guard_held(p.db, d.cfg)
+    p.db.set_kv(runclass.CODE_STATE_KV, json.dumps({"new": "full"}))
+    assert d._code_state()["new"] == "full"

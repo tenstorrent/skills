@@ -2538,7 +2538,10 @@ class Daemon:
                        f"(`ttp stats --effort-ab`).", severity="low", every_s=0)
 
     def _code_state(self) -> dict:
-        """runclass.CODE_STATE_KV: {code kind: "full" | "canary" | "off"}; {} (all canary) when unset or bad."""
+        """runclass.CODE_STATE_KV: {code kind: "full" | "canary" | "off"}; {} (all canary) when unset or bad. A
+        daily guard trip (runclass.guard_held) holds every kind off until `route.code_sonnet` changes."""
+        if runclass.guard_held(self.p.db, self.cfg):
+            return {k: "off" for k in runclass.CODE_KINDS}
         try:
             got = json.loads(self.p.db.kv(runclass.CODE_STATE_KV, "") or "{}")
         except (TypeError, ValueError):
@@ -2584,6 +2587,14 @@ class Daemon:
                     self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
                                 (now, "daemon", "run_class_quality", "normal",
                                  runclass.code_quality_text(k, v, runclass.CODE_WINDOW_S / 3600)[:500], "queued"))
+        # The daily code-route guard: today against the prior week; a trip holds code on Opus and is told once.
+        if now - getattr(self, "_code_guard_checked", 0.0) >= 3600:
+            self._code_guard_checked = now
+            row = runclass.guard_run(self.p.db, self.cfg, now)
+            if row and row.get("new_trip"):
+                self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                            (now, "daemon", "code_route_guard", "high", runclass.guard_text(row)[:1000], "queued"))
+                log(self.p, "code-route guard tripped: every code kind runs on Opus until route.code_sonnet changes")
         # Cheap classes on Claude with none on a tt model: told once per outage, never as a repeating alarm.
         down = runclass.tt_unavailable(s)
         told = self.p.db.kv("tt_unavailable_told", "") or ""
