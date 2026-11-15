@@ -350,3 +350,15 @@ def test_model_suite_blind_grade_is_the_main_column_of_the_day(env, tmp_path, mo
                           models=["m-a"], classes=("standard",))
     assert seen == ["m-a", ("grade", [{"provider": "claude", "model": "main-r", "effort": "high"}])], seen
     assert rows[0]["blind"]["would_land"] is True and rows[0]["blind"]["blind_score"] == 10.0
+
+
+def test_benchblind_module_form_reads_its_own_argv(env, tmp_path):
+    # `python3 -m ttp.benchblind review ...` runs main() with argv None: it reads sys.argv itself, so
+    # _review_cfg never gets None (a TypeError before). A batch with nothing left to score asks no model.
+    (tmp_path / "batch.json").write_text(json.dumps({"items": [], "scores": {}}))
+    run = lambda *w: subprocess.run([sys.executable, "-m", "ttp.benchblind", *w], capture_output=True, text=True,
+                                    timeout=60, env={**os.environ, "PYTHONPATH": str(RUNTIME)})
+    got = run("review", str(tmp_path), "--provider", "claude", "--model", "example/model")
+    assert got.returncode == 0 and "scored 0 item(s)" in got.stdout and "TypeError" not in got.stderr, got.stderr
+    got = run("review", str(tmp_path / "missing"))
+    assert got.returncode == 2 and "TypeError" not in got.stderr and "benchblind:" in got.stderr, got.stderr

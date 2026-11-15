@@ -870,6 +870,8 @@ def _finish(row: dict, bench_dir: Path, task: dict, ws: Path, run: Path, keep: P
     if row["outcome"] == "fail" and (fault := endpoint_fault(ended)):
         # the endpoint failed the agent (a 429, an outage), not the model: never scored, retried by the suite
         row.update(outcome="error", endpoint_fault=fault)
+        if ((ended.get("bridge") or {}).get("busy") or {}).get("gave_up"):
+            row["capacity_stop"] = True   # the bridge waited out the model's 429s as far as allowed
     keep.mkdir(parents=True, exist_ok=True)
     for name in ("output.jsonl", "exit.json", "result.json", "run.json", "runner.log", "stderr.log"):
         if (run / name).exists():

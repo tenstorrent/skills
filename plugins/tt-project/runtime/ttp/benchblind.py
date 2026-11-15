@@ -333,6 +333,7 @@ def review(d: Path, ask) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv   # the module form: _review_cfg reads it too
     ap = argparse.ArgumentParser(prog="python3 -m ttp.benchblind", description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("prep")
