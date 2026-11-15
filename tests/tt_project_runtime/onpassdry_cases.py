@@ -198,8 +198,9 @@ def test_under_a_dry_run_ttp_note_notify_and_push_do_nothing_and_lock_is_refused
     assert [x.returncode for x in got] == [0, 0, 0, 0, 0, 75, 75, 75, 75, 75], \
         [(x.returncode, x.stderr) for x in got]
     assert not flag.exists() and not list(run_dir.glob("job*"))
-    # Reading a probe is no side effect: `detach --check` still answers (4: the job is not there).
-    assert _ttp_run(p, "detach", "--check", str(tmp_path / "none.rc"), env=e).returncode == 4
+    # Reading a probe is no side effect: `detach --check` still answers (2: no job recorded there), no .lost.
+    assert _ttp_run(p, "detach", "--check", str(tmp_path / "none.rc"), env=e).returncode == 2
+    assert not (tmp_path / "none.lost").exists()
     assert all("dry run" in x.stderr for x in got)
     assert not (run_dir / "progress.md").exists()
     assert not p.db.q("SELECT id FROM events WHERE kind LIKE 'notif%'")
