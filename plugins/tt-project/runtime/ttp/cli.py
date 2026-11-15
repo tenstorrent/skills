@@ -15502,8 +15502,8 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_stats)
 
     s = sub.add_parser("device-shadow", help=argparse.SUPPRESS)   # the daemon's detached read only shadow run
-    s.add_argument("task", type=int)
-    s.add_argument("arm")
+    s.add_argument("task", type=int, help="the live task id")
+    s.add_argument("arm", help="the shadow arm name")
     s.set_defaults(fn=cmd_device_shadow)
 
     s = sub.add_parser("audit", help="the daily review's self-efficiency audit: asks, wasted runs, idle wakes, "
