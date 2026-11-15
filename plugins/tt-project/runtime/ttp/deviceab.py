@@ -303,20 +303,32 @@ def device_names(task: dict, cfg: dict | None) -> list[str]:
     return sorted(set(out))
 
 
+WATCHER = re.compile(r"(?i)(device|machine|broker|hardware|power|chip|board|box|health)")
+TASK_REF = re.compile(r"#(\d+)")
+
+
 def incident_event(e: dict, run_task: Any, names: list[str]) -> bool:
     """Whether event `e` is a real device or machine incident of a run of task `run_task` that held the device
-    resources `names`: an event of an incident kind (never a coordinator action, audit, flag, digest, note or
-    chat event, and never a daemon-written observation), a watcher observation naming a hang, reset, recovery,
-    power cycle or hold, and tied to the run's own device: it carries the run's task id, or names a device
-    resource the run held. A host name every task mentions is not enough, and a run with no device resource is
-    tied only by its task id."""
+    resources `names`. Two shapes count, never a coordinator action, audit, flag, digest, note or chat event and
+    never a daemon-written observation:
+    - an event of an incident kind, carrying the run's task id or naming a device resource the run held;
+    - an observation from a device or machine watcher naming a hang, reset, recovery, power cycle or hold, that
+      names a device resource the run held (its task id alone is not enough) and does not cite another task.
+    A host name every task mentions is not enough, and a run with no device resource is tied only by its task id
+    on an incident-kind event. A notice about another task (a deferral, a retest, a review) is never one."""
     kind, text = str(e.get("kind") or ""), str(e.get("text") or "")
-    if not (kind in INCIDENT_KINDS or INCIDENT_KIND.match(kind) or (
-            kind == "observation" and str(e.get("source") or "").startswith("watcher:") and INCIDENT.search(text))):
-        return False
-    if e.get("task") is not None and run_task is not None and int(e["task"]) == int(run_task):
-        return True
     hay = text + " " + str(e.get("data") or "")
+    if kind in INCIDENT_KINDS or INCIDENT_KIND.match(kind):
+        if e.get("task") is not None and run_task is not None and int(e["task"]) == int(run_task):
+            return True
+        return any(n in hay for n in names)
+    if not (kind == "observation" and INCIDENT.search(text)):
+        return False
+    source = str(e.get("source") or "")
+    if not (source.startswith("watcher:") and WATCHER.search(source[len("watcher:"):])):
+        return False
+    if any(run_task is None or int(m) != int(run_task) for m in TASK_REF.findall(text)):
+        return False
     return any(n in hay for n in names)
 
 

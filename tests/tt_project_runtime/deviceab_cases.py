@@ -386,3 +386,36 @@ def test_device_ab_a_real_stop_survives_the_next_ticks_recheck(env):
     assert deviceab.tick(p.db, cfg, 2700.0)["stop"]["event"] == real
     got = deviceab.tick(p.db, cfg, 2800.0)
     assert got["lifted"] is None and deviceab.stopped(p.db)["event"] == real
+
+
+def test_device_ab_a_deferral_notice_about_another_task_is_not_a_device_incident(env):
+    from ttp import deviceab
+    p = make(env)
+    cfg = _dab_cfg(p)
+    tid, rid = _dab_sonnet_run(p, cfg, ["resource:box1-device", "needs_device"])
+    text = ('task #9999 defers our work to another team: "Review #9998: retest on box1-device once the encoder '
+            'fixes the hang after a shape release". Nobody here owns the fix. Queue our own fix now')
+    # The live false stop: a self-blocking notice naming another task and the run's device in passing.
+    for source in ("watcher:self-blocking", "watcher:course", "coordinator"):
+        _dab_event(p, "observation", text, source=source, task=tid)
+    _dab_event(p, "self_blocking", text, source="daemon", task=tid)
+    # A device watcher's observation that cites another task is not this run's incident either.
+    _dab_event(p, "observation", text, source="watcher:device-health")
+    assert deviceab.tick(p.db, cfg, 2700.0)["stop"] is None and not deviceab.stopped(p.db)
+    # A device watcher naming a hang on the run's own device, citing no other task, still stops the arm.
+    real = _dab_event(p, "observation", "box1-device: chip hang, reset needed", source="watcher:device-health")
+    assert deviceab.tick(p.db, cfg, 2800.0)["stop"]["event"] == real
+
+
+def test_device_ab_the_next_tick_lifts_a_recorded_deferral_notice_stop(env):
+    from ttp import deviceab
+    p = make(env)
+    cfg = _dab_cfg(p)
+    tid, rid = _dab_sonnet_run(p, cfg, ["resource:box1-device", "needs_device"])
+    eid = _dab_event(p, "observation",
+                     'task #9999 defers our work to another team: "retest on box1-device after the hang fix"',
+                     source="watcher:self-blocking", task=tid)
+    p.db.set_kv(deviceab.STOP_KV, {"ts": 2700.0, "arm": "sonnet", "task": tid, "run": rid, "event": eid,
+                                   "text": "task #9999 defers our work"})
+    got = deviceab.tick(p.db, cfg, 3000.0)
+    assert got["lifted"] and not deviceab.stopped(p.db)
