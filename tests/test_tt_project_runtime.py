@@ -27438,6 +27438,7 @@ def test_durable_write_syncs_renames_and_keeps_the_mode(env, monkeypatch):
 # Every place the runtime writes a file directly, and why it need not survive a power cut. Anything
 # else goes through project.durable_write / durable_append / write_json.
 DURABLE_EXEMPT = {
+    ("benchrun.py", 'open(folder / "install.log", "ab")'): "the npm or pip output of a bench harness install, appended as it runs; a diagnostic log beside the install, never state",
     ("cellns.py", '(home / ".gitconfig").write_text('): "the git identity file in a bench cell's scratch home inside its temporary folder, rebuilt for every cell; never project state",
     ("cellns.py", "gh.write_text("): "the `gh` stand-in script in a bench cell's temporary folder, rebuilt for every cell; never project state",
     ("cellns_init.py", 'open(path, "wb").close()'): "an empty mount-point file in the namespace's own tmpfs root, gone with the namespace; never state",
