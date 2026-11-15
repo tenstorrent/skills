@@ -644,8 +644,8 @@ def test_bench_run_arms_parse_and_need_two(tmp_path):
     for bad in ("x", "x=claude", "=claude::", "x=:m:e", "x=a:b:c:d"):
         with pytest.raises(benchrun.BenchError):
             benchrun.parse_arm(bad)
-    with pytest.raises(benchrun.BenchError, match="two arms"):
-        benchrun.run(tmp_path, tmp_path / "o", {"a": {}}, 1, 1, {}, {})
+    with pytest.raises(benchrun.BenchError, match="at least one arm"):
+        benchrun.run(tmp_path, tmp_path / "o", {}, 1, 1, {}, {})
     with pytest.raises(benchrun.BenchError, match="arm names"):
         benchrun.run(tmp_path, tmp_path / "o", {"a": {}, "../b": {}}, 1, 1, {}, {})
     s = benchrun.schedule([1, 2], ["a", "b"], 3, 5)
