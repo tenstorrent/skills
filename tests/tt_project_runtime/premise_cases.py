@@ -533,6 +533,12 @@ def _landed_carry_repo(tmp_path):
         (repo / f"{name}.txt").write_text(name + "\n")
         git("add", "-A")
         git("commit", "-qm", f"add {name}")
+        # A spec names a commit by 9 hex digits, read as one only with a letter among them (premise.SHA):
+        # reword until the prefix has one, so a random all-digit id cannot drop it from the carry.
+        for n in range(1, 64):
+            if any(c in "abcdef" for c in git("rev-parse", "HEAD")[:9]):
+                break
+            git("commit", "-q", "--amend", "-m", f"add {name} ({n})")
         shas.append(git("rev-parse", "HEAD"))
     git("checkout", "-q", "main")
     (repo / "other.txt").write_text("other\n")   # a new parent: the pick gets its own id

@@ -649,7 +649,8 @@ def test_the_login_check_backs_off_and_closes_the_breaker_and_its_alert(env, mon
         b = alerts.breaker(p.db, "fake")
         p.db.set_kv("auth_breaker:fake", {**b, "next_check": time.time() - 1})
         d.sweep_alerts()
-        gaps.append(round(alerts.breaker(p.db, "fake")["next_check"] - time.time()))
+        b = alerts.breaker(p.db, "fake")   # the step from the check's own clock, not from a later wall read
+        gaps.append(round(b["next_check"] - b["last_check"]))
     assert gaps == [s for s in AUTH_CHECK_S[1:]] + [AUTH_CHECK_S[-1]] * 2, gaps
     assert len(checks) == len(AUTH_CHECK_S) + 1 and attention(p.db, time.time())
     login.write_text("")
@@ -695,7 +696,7 @@ def test_a_login_back_on_another_account_holds_one_check_then_starts_and_says_so
         return
     b = alerts.breaker(p.db, "fake")
     assert b and b["account_hold"] and d._logged_out("fake"), "another account started at once"
-    assert round(b["next_check"] - time.time()) == AUTH_CHECK_S[0] and not events() and not cleared()
+    assert round(b["next_check"] - b["last_check"]) == AUTH_CHECK_S[0] and not events() and not cleared()
     d.sweep_alerts()
     assert alerts.breaker(p.db, "fake"), "the hold ended before its check was due"
     p.db.set_kv("auth_breaker:fake", {**alerts.breaker(p.db, "fake"), "next_check": time.time() - 1})
