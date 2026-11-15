@@ -403,7 +403,7 @@ def _next_day(now: float, where) -> float:
     return datetime(day.year, day.month, day.day, tzinfo=tz).timestamp()
 
 
-def deflake_spec(module: str, ids: list[str], day: str, evidence: dict, tid=None) -> str:
+def deflake_spec(module: str, ids: list[str], day: str, evidence: dict) -> str:
     return "\n".join([
         f"Make these tests of {module} deterministic. Each failed, then passed on a rerun at the same head at "
         f"the tests gate, so it is quarantined (excused there until its fix lands):",
@@ -414,10 +414,7 @@ def deflake_spec(module: str, ids: list[str], day: str, evidence: dict, tid=None
         "the hand-off.",
         "Do not lift the quarantine and queue no lift task: once this task's change lands on the push branch, "
         "the daemon lifts these tests itself, model-free.",
-        f"Collected by the tests gate: tests of {module} quarantined on {day} join this task until it starts.",
-        # Run by the daemon before each dispatch: exit 1 (no test left in the quarantine, or a landed fix
-        # resolves each) closes the task as not needed before a worker spends on it.
-        *([premise_line(tid)] if tid is not None else [])])
+        f"Collected by the tests gate: tests of {module} quarantined on {day} join this task until it starts."])
 
 
 def deflake(db, ids: list[str], evidence: dict, now: float, where, budget_usd: float | None = None) -> list[int]:
@@ -442,14 +439,13 @@ def deflake(db, ids: list[str], evidence: dict, now: float, where, budget_usd: f
             have = list(recs[key]["ids"]) if key else []
             all_ids = have + new
             names = ", ".join(dict.fromkeys(_name(i) or i for i in all_ids))
-            title, spec = f"Deflake {module}: {names}"[:200], deflake_spec(module, all_ids, day, evidence, key)
+            title, spec = f"Deflake {module}: {names}"[:200], deflake_spec(module, all_ids, day, evidence)
             if key:   # the post-landing sightings (seen_again) stay on the rewritten spec
                 kept = [ln for ln in (tasks[key]["spec"] or "").splitlines() if ln.startswith(SEEN_AGAIN)]
                 db.update_task(int(key), title=title, spec="\n".join([spec, *kept]))
             else:
                 key = str(db.add_task(title, spec, kind="code", tier="standard", priority=2, origin="daemon",
                                       budget_usd=budget_usd, not_before=_next_day(now, where)))
-                db.update_task(int(key), spec=f"{spec}\n{premise_line(key)}")   # its id is known only now
             recs[key] = {"day": day, "module": module, "ids": all_ids, "ts": now}
             out.add(int(key))
         db.set_kv(DEFLAKE_KEY, recs)
@@ -538,6 +534,7 @@ def file_orphans(p, now: float | None = None, budget_usd: float | None = None) -
 def lift_due(p, now: float | None = None) -> list[dict]:
     """The daemon's sweep: lift each active entry whose fix landed (see the module docstring). Local refs
     only, never a fetch. The lifts made: [{id, why, commit}]."""
+    from . import landed
     now = time.time() if now is None else now
     q = active(p.state, now)
     if not q:
@@ -545,49 +542,18 @@ def lift_due(p, now: float | None = None) -> list[dict]:
     repo, tip = _push_tip(p)
     out = []
     for i, e in sorted(q.items()):
-        why = fix_landed(p, repo, i, e)
-        if why and lift(p.state, [i], why, tip, now=now):
-            out.append({"id": i, "why": why, "commit": tip})
+        heads = [str(x.get("head") or "") for x in e.get("evidence") or [] if isinstance(x, dict)]
+        why = commit = ""
+        for tid in fix_tasks(p.db, i, e):
+            rc, words = landed.check(p, repo, tid=tid, fetch=False)
+            # A fix already in the head that last flaked did not fix it.
+            if rc == 0 and not (heads[-1:] and heads[-1] and landed.check(p, repo, tid=tid, onto=heads[-1],
+                                                                          fetch=False)[0] == 0):
+                why, commit = f"its fix #{tid} landed ({words})", tip
+                break
+        if why and lift(p.state, [i], why, commit, now=now):
+            out.append({"id": i, "why": why, "commit": commit})
     return out
-
-
-def fix_landed(p, repo: Path, test_id: str, entry: dict) -> str:
-    """Why quarantined `test_id` is fixed (its fix task landed on the push branch, and not already in the head
-    it last flaked at, which that fix so did not fix), or "". Local refs only."""
-    from . import landed
-    heads = [str(x.get("head") or "") for x in entry.get("evidence") or [] if isinstance(x, dict)]
-    for tid in fix_tasks(p.db, test_id, entry):
-        rc, words = landed.check(p, repo, tid=tid, fetch=False)
-        if rc == 0 and not (heads[-1:] and heads[-1] and landed.check(p, repo, tid=tid, onto=heads[-1],
-                                                                      fetch=False)[0] == 0):
-            return f"its fix #{tid} landed ({words})"
-    return ""
-
-
-def deflake_due(p, tid: int, now: float | None = None) -> tuple[int, str]:
-    """A deflake task's premise (`ttp quarantine still <task>`, its premise_cmd line): (0, why) while one of
-    the tests its record lists (DEFLAKE_KEY) is still quarantined with no landed fix; (1, why) once none is,
-    so the daemon closes it before a worker spends on it; (2, why) with no record of it. Read-only: lifts
-    nothing (the daemon's sweep, lift_due, does)."""
-    now = time.time() if now is None else now
-    rec = p.db.kv_dict(DEFLAKE_KEY)[0].get(str(tid))
-    ids = [i for i in (rec.get("ids") or []) if isinstance(i, str)] if isinstance(rec, dict) else []
-    if not ids:
-        return 2, f"task {tid} is no deflake task (no record lists its tests)"
-    q = active(p.state, now)
-    left = [i for i in ids if i in q]
-    if not left:
-        return 1, "none of its tests is quarantined any more: " + ", ".join(ids)
-    repo, _ = _push_tip(p)
-    open_ = [i for i in left if not fix_landed(p, repo, i, q[i])]
-    if not open_:
-        return 1, "a landed fix already resolves each of its quarantined tests: " + ", ".join(left)
-    return 0, "still quarantined with no landed fix: " + ", ".join(open_)
-
-
-def premise_line(tid) -> str:
-    """The premise_cmd line of deflake task `tid` (premise.py runs it before each dispatch)."""
-    return f"premise_cmd: ttp quarantine still {tid}"
 
 
 def _saved(state: Path, where: str, base: str, ids: list[str], now: float) -> dict[str, dict]:

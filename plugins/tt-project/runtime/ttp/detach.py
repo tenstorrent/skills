@@ -1280,38 +1280,6 @@ def job_rc(rc) -> Path:
     return rc if rc.suffix == ".rc" or rc.is_dir() else rc.with_name(rc.name + ".rc")
 
 
-def resolve_check(arg: str, env=None) -> Path:
-    """What `ttp detach --check <arg>` reads. A path with a / is as given. A bare name (`build` or
-    `build.rc`) is that path when something records a job there, else the job of that name in this run
-    ($TTP_RUN_DIR), else the newest job of that name a run folder's detached.json records; failing all,
-    the name as given (which then reads as no job recorded)."""
-    if "/" in arg or recorded(Path(arg)):
-        return Path(arg)
-    env = os.environ if env is None else env
-    name = arg[:-3] if arg.endswith(".rc") else arg
-    roots = []
-    if run_dir := env.get("TTP_RUN_DIR"):
-        if recorded(here := Path(run_dir) / f"{name}.rc"):
-            return here
-        roots.append(Path(run_dir).parent)
-    if env.get("TTP_PROJECT"):
-        try:
-            roots.append(Project(Path(env["TTP_PROJECT"])).runs)
-        except Exception:   # not a project folder: only the run's own folder was there to read
-            pass
-    best, when = None, -1.0
-    for reg in {r for root in roots if root.is_dir() for r in root.glob("*/" + REGISTRY)}:
-        try:
-            jobs = json.loads(reg.read_text())
-        except (OSError, ValueError):
-            continue
-        for j in jobs if isinstance(jobs, list) else []:
-            if (isinstance(j, dict) and isinstance(j.get("rc"), str)
-                    and name in (j.get("name"), Path(j["rc"]).stem) and float(j.get("started") or 0) > when):
-                best, when = Path(j["rc"]), float(j.get("started") or 0)
-    return best or Path(arg)
-
-
 def _entry(rc: Path) -> dict:
     try:
         jobs = json.loads((rc.parent / "detached.json").read_text())

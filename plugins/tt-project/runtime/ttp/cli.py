@@ -9222,20 +9222,12 @@ def cmd_landed(a) -> None:
 
 def cmd_quarantine(a) -> None:
     """`ttp quarantine list`: the tests the gate quarantined as flaky and the lifts of the last day.
-    `ttp quarantine lift <test id> --why <text>`: drop one, logged as the daemon's lifts are (gatejudge).
-    `ttp quarantine still <task id>`: a deflake task's read-only premise (gatejudge.deflake_due): exit 0
-    while one of its tests is still quarantined with no landed fix, 1 once none is, 2 for no deflake task."""
+    `ttp quarantine lift <test id> --why <text>`: drop one, logged as the daemon's lifts are (gatejudge)."""
     from . import gatejudge
     p = here()
     if not p:
         die("ttp quarantine: no project here (run it in a project or with TTP_PROJECT set)")
     now = time.time()
-    if a.action == "still":
-        if not (a.test_id or "").isdigit():
-            die("ttp quarantine still: give the deflake task's id", 2)
-        rc, why = gatejudge.deflake_due(p, int(a.test_id), now)
-        print(f"task {a.test_id}: {why}")
-        sys.exit(rc)
     if a.action == "lift":
         if not a.test_id or not (a.why or "").strip():
             die("ttp quarantine lift: give the test id and --why <text>")
@@ -9354,9 +9346,7 @@ def cmd_detach(a) -> None:
     Output goes to $TTP_RUN_DIR/<name>.log and the exit code to $TTP_RUN_DIR/<name>.rc once it
     ends. Hand off `waiting` with the retry_when it prints, `ttp detach --check <rc path>`: it exits 0
     once the job wrote exit code 0, 4 (detach.FAILED_RC) once it wrote another one or its process is
-    gone without one (a kill, a reboot: it says why, see detach.state), 2 for a path no job was ever
-    recorded at (a wrong path: no .lost marker is written; a bare name is looked up in this run, then
-    in the run folders' detached.json, detach.resolve_check), else 1. On 4 the daemon runs
+    gone without one (a kill, a reboot: it says why, see detach.state), else 1. On 4 the daemon runs
     the hand-off's on_pass_cmd model-free to decide, or wakes the task with the job's exit code. With
     `--rows <file> --after <n>` it exits 0 also once that file has more than n lines, and 0 (never 4)
     once a job ended or is gone, else 1: one probe that wakes on a new result row, the end or a dead
@@ -9450,17 +9440,13 @@ def cmd_detach(a) -> None:
         _detach_remote(a, _own_ttp())
         return
     if a.check is not None:
-        ended, failed, one_ended, unknown = True, False, False, False
-        for rc in map(detach.resolve_check, a.check):
+        ended, failed, one_ended = True, False, False
+        for rc in map(Path, a.check):
             rec = detach.recorded(rc)
             ser = None if rec else detach.series(rc)   # a series driver's own dir, read by its pid and EXIT
             if ser is None and rows is not None and not rec:   # no driver to read: only a new row wakes it
                 ended = False
                 print(f"{rc.stem}: no detached job recorded at {rc}; waking only on a new row in {rows}")
-                continue
-            if ser is None and not rec:   # a wrong path, not a lost job: no .lost marker, its own exit
-                unknown = True
-                print(f"{rc.stem}: no job recorded at {rc}")
                 continue
             st, why = ser or detach.state(rc)
             if st == "ended":
@@ -9477,7 +9463,7 @@ def cmd_detach(a) -> None:
             one_ended = one_ended or st in ("ended", "lost")
         if rows is not None:
             sys.exit(_rows_verdict(_count_rows(Path(rows)), rows, after or 0, one_ended))
-        sys.exit(2 if unknown else 1 if not ended else detach.FAILED_RC if failed else 0)
+        sys.exit(1 if not ended else detach.FAILED_RC if failed else 0)
     cmd = list(a.command or [])
     if cmd and cmd[0] == "--":
         cmd = cmd[1:]
@@ -15743,11 +15729,8 @@ def main(argv: list[str] | None = None) -> None:
 
     s = sub.add_parser("quarantine", help="list the tests the tests gate quarantined as flaky (and the last day's "
                                           "lifts), or lift one by hand with --why (logged)")
-    s.add_argument("action", choices=["list", "lift", "still"],
-                   help="list the quarantine, lift one test from it, or (still) exit 0 while a deflake task's "
-                   "tests are still quarantined with no landed fix, 1 once not (its premise_cmd)")
-    s.add_argument("test_id", nargs="?", help="lift: the pytest id, as `ttp quarantine list` shows it; "
-                   "still: the deflake task's id")
+    s.add_argument("action", choices=["list", "lift"], help="list the quarantine, or lift one test from it")
+    s.add_argument("test_id", nargs="?", help="lift: the pytest id, as `ttp quarantine list` shows it")
     s.add_argument("--why", help="lift: why it may go (a fix landed, the test was removed, ...)")
     s.set_defaults(fn=cmd_quarantine)
 
@@ -15853,8 +15836,7 @@ def main(argv: list[str] | None = None) -> None:
     s = sub.add_parser("detach", help="start a job that outlives the run; writes <name>.rc")
     s.add_argument("--check", nargs="*", metavar="RC",
                    help="exit 0 once every job of these .rc paths ended with exit 0, 4 once all ended or are "
-                   "gone but one failed or left no exit code, 2 if no job was ever recorded at one, else 1 "
-                   "(for retry_when; a bare name is looked up in this run, then in the run folders)")
+                   "gone but one failed or left no exit code, else 1 (for retry_when)")
     s.add_argument("--remote", metavar="HOST",
                    help="start the job on this ssh host with setsid nohup; it survives this run and a reboot here. It "
                    "records that host's boot id, so a driver gone without an exit code reads as died with the "

@@ -11,7 +11,7 @@ _CB_KEY = "sk-upstream-placeholder-9f8e7d6c5b4a"
 
 class _MockChat:
     """A Chat Completions endpoint on loopback: records each request, answers from `replies`
-    (status, JSON body[, headers]) or `(200, [chunks])` for a stream."""
+    (status, JSON body) or `(200, [chunks])` for a stream."""
 
     def __init__(self, replies):
         self.replies, self.seen = list(replies), []
@@ -34,7 +34,7 @@ class _MockChat:
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 mock.seen.append({"path": self.path, "auth": self.headers.get("Authorization"), "body": body})
-                status, reply, *hdrs = mock.replies.pop(0) if mock.replies else (200, {"choices": []})
+                status, reply = mock.replies.pop(0) if mock.replies else (200, {"choices": []})
                 if isinstance(reply, list):
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream")
@@ -48,8 +48,6 @@ class _MockChat:
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(data)))
-                for k, v in (hdrs[0] if hdrs else {}).items():
-                    self.send_header(k, v)
                 self.end_headers()
                 self.wfile.write(data)
 
@@ -214,7 +212,7 @@ def test_chatbridge_maps_upstream_errors_to_messages_errors_the_runner_classifie
     from ttp.chatbridge import Bridge
     from ttp.providers.base import AUTH_RE, FUNDS_RE, LIMIT_RE, request_rejected
     up = mock_chat((status, {"error": {"message": f"bad things for key {_CB_KEY}"}}))
-    with Bridge(up.url, _CB_KEY, "up-model", busy_retries=0) as b:
+    with Bridge(up.url, _CB_KEY, "up-model") as b:
         got, text = _post(b, {"max_tokens": 50, "messages": [{"role": "user", "content": "hi"}]})
     body = json.loads(text)
     assert got == code and body["type"] == "error" and body["error"]["type"] == kind
@@ -2321,7 +2319,7 @@ def test_chatbridge_records_endpoint_fault_kinds_without_their_text(mock_chat):
     hi = {"max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]}
     up = mock_chat((500, {"error": {"message": f"boom {_CB_KEY}"}}), (429, {"error": {"message": "slow"}}),
                    (200, {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}))
-    with Bridge(up.url, _CB_KEY, "m", busy_retries=0) as b:
+    with Bridge(up.url, _CB_KEY, "m") as b:
         _post(b, hi)
         assert b.stats()["last_fault"] == "error"
         _post(b, hi)
@@ -3991,75 +3989,3 @@ def test_the_bench_owners_daemon_keeps_a_daily_command_schedule_and_runs_it_on_a
     d._bench_tried = 0.0
     d.run_model_bench()
     assert row()["enabled"] == 0
-
-
-_HI = {"max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]}
-_OK = (200, {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]})
-
-
-@pytest.mark.parametrize("busy,want", [
-    ((429, {"error": {"message": "at capacity"}}, {"Retry-After": "7"}), 7.0),   # the header first
-    ((429, {"error": {"message": "The model example/model is currently at capacity. Please retry after 14 seconds."}}), 14.0),
-    ((503, {"error": {"message": "busy, retry after 3 s"}}), 3.0),   # a 503 that names its wait
-    ((429, {"error": {"message": "slow down"}}), 2.0),   # no hint: a short backoff
-])
-def test_chatbridge_waits_out_a_model_at_capacity_honoring_retry_after(mock_chat, busy, want):
-    from ttp.chatbridge import Bridge
-    up = mock_chat(busy, _OK)
-    with Bridge(up.url, _CB_KEY, "example/model") as b:
-        slept = []
-        b._sleep = slept.append
-        code, text = _post(b, _HI)
-        st = b.stats()
-    assert code == 200 and json.loads(text)["content"] == [{"type": "text", "text": "ok"}], text
-    assert slept == [want] and len([r for r in up.seen if r["path"].endswith("/chat/completions")]) == 2
-    assert st["last_fault"] == "" and st["busy"] == {"waits": 1, "waited_s": want, "gave_up": 0}
-
-
-def test_chatbridge_gives_up_on_a_model_at_capacity_past_its_caps_as_a_capacity_stop(mock_chat):
-    from ttp.chatbridge import Bridge
-    from ttp.providers.base import LIMIT_RE
-    full = (429, {"error": {"message": "currently at capacity, retry after 20 seconds"}})
-    up = mock_chat(*[full] * 6, _OK)
-    with Bridge(up.url, _CB_KEY, "example/model", busy_retries=3, busy_wait_s=600) as b:
-        slept = []
-        b._sleep = slept.append
-        code, text = _post(b, _HI)
-        st = b.stats()
-    # Three retries, then the 429 goes to the agent: still a rate limit to the runner, named as a capacity stop.
-    assert slept == [20.0] * 3 and len(up.seen) == 4 and code == 429, (slept, code)
-    msg = json.loads(text)["error"]["message"]
-    assert "stayed at capacity after 3 retries over 60 s" in msg and LIMIT_RE.search(f"API Error: 429 {text}")
-    assert st["last_fault"] == "rate_limit" and st["busy"] == {"waits": 3, "waited_s": 60.0, "gave_up": 1}
-    # The total wait caps it too, and a wait that would pass it is not started; waiting never helps some 429s.
-    up = mock_chat((429, {"error": {"message": "full"}}, {"Retry-After": "50"}), _OK,
-                   (429, {"error": {"message": "Request too large: too many tokens per minute"}}), _OK)
-    with Bridge(up.url, _CB_KEY, "example/model", busy_wait_s=30) as b:
-        b._sleep = slept.append
-        assert _post(b, _HI)[0] == 429 and b.stats()["busy"]["gave_up"] == 1
-        assert _post(b, _HI)[0] == 200, "the next call goes out"
-        assert _post(b, _HI)[0] == 429 and b.stats()["busy"]["gave_up"] == 1, "a request too large is not waited on"
-    assert slept == [20.0] * 3
-
-
-def test_chatbridge_capacity_waits_are_configurable_and_reach_the_bench_row(env):
-    from ttp import benchrun, chatbridge, project
-    cfg = {"providers": {"chat": {"endpoint": "cloud", "busy_retries": 2, "busy_wait_s": 45,
-                                  "tiers": {"standard": {"model": "example/model"}}}}}
-    got = chatbridge.settings(cfg, "standard", "example/model")
-    assert (got["busy_retries"], got["busy_wait_s"]) == (2, 45)
-    assert "busy_retries" not in chatbridge.settings({"providers": {"chat": {"endpoint": "cloud"}}}, "standard", "m")
-    b = chatbridge.Bridge("http://127.0.0.1:9/v1", _CB_KEY, "m", **{k: got[k] for k in ("busy_retries", "busy_wait_s")})
-    assert (b.busy_retries, b.busy_wait_s) == (2, 45.0)
-    d = chatbridge.Bridge("http://127.0.0.1:9/v1", _CB_KEY, "m")
-    assert (d.busy_retries, d.busy_wait_s) == (chatbridge.BUSY_RETRIES, chatbridge.BUSY_WAIT_S) and "busy" not in d.stats()
-    assert project.unknown_key_hint("providers.chat.busy_retries") is None
-    assert chatbridge.config_problems(cfg) == []
-    bad = chatbridge.config_problems({"providers": {"chat": {"endpoint": "cloud", "busy_retries": 1.5, "busy_wait_s": -1}}})
-    assert len(bad) == 2 and all("busy_" in p for p in bad), bad
-    assert chatbridge.busy_wait(429, {"Retry-After": "999"}, "", 1) == chatbridge.BUSY_WAIT_MAX_S
-    assert chatbridge.busy_wait(503, {}, "upstream down", 1) is None and chatbridge.busy_wait(500, {}, "retry after 3 s", 1) is None
-    # A cell the bridge gave up on is a capacity stop: an endpoint fault the suite reruns, never the model's fail.
-    ended = {"rc": 1, "bridge": {"last_fault": "rate_limit", "busy": {"waits": 4, "waited_s": 90.0, "gave_up": 1}}}
-    assert benchrun.endpoint_fault(ended) == "rate_limit"
-

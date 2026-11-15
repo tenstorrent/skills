@@ -118,8 +118,7 @@ _WRITES = re.compile(
     r"\b(?:rm|mv|cp|dd|chmod|chown|truncate|install|mkdir|touch|ln)\b(?![.-])|\bsed\s+(?:-\w*\s+)*-i|"
     r"\bgit(?:\s+-[Cc]\s+\S+|\s+--?[\w-]+(?:=\S+)?)*\s+(?:push|commit|reset|checkout|switch|merge|rebase|pull|"
     r"fetch|tag|stash|clean|am|apply|cherry-pick|branch\s+-[dDmM]|worktree\s+(?:add|remove|prune)|update-ref|gc)"
-    r"(?![\w-])|\bttp\s+(?!landed\b|task\s+\S+\s+(?:show|list)\b|lock\s+--probe\b|checks\s+--result\b|"
-    r"quarantine\s+(?:still|list)\b)\w")
+    r"(?![\w-])|\bttp\s+(?!landed\b|task\s+\S+\s+(?:show|list)\b|lock\s+--probe\b|checks\s+--result\b)\w")
 
 
 def guard(cmd: str) -> str:

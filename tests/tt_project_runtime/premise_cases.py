@@ -587,30 +587,3 @@ def test_the_no_change_audit_leaves_out_a_code_task_whose_landing_is_recorded(en
            ("m1", tids[0], "a" * 40, "origin/main", now - 700))
     got = audit.no_change_code(p.db, now - 86400)
     assert [r["id"] for r in got["rows"]] == [tids[1]] and got["n"] == 1
-
-
-@pytest.mark.parametrize("left", [True, False])
-def test_a_deflake_task_ends_before_dispatch_once_its_test_left_the_quarantine(env, monkeypatch, tmp_path, left):
-    """Each deflake task the tests gate files carries a read-only premise_cmd (`ttp quarantine still <id>`):
-    once none of its tests is quarantined any more (lifted, or its fix landed) the daemon closes it as not
-    needed before a worker spends on it; while one still is, it dispatches."""
-    from ttp import gatejudge, premise
-    p, d, runs, _ = _cmd_daemon(env, monkeypatch, tmp_path, "true")
-    p.db.update_task(_, status="cancelled")
-    test_id, now = "tests/test_m.py::test_a", time.time()
-    gatejudge.quarantine(p.state, [test_id], {"head": "e" * 40, "check": "pytest"}, now - 600, 7)
-    (cid,) = gatejudge.deflake(p.db, [test_id], {"head": "e" * 40}, now - 300, p)
-    cmd = premise.command(p.db.task(cid)["spec"])
-    assert cmd == f"ttp quarantine still {cid}" and premise.guard(cmd) == "" and premise.runs_cmd(p.db.task(cid))
-    p.db.update_task(cid, not_before=None)
-    if left:
-        assert gatejudge.lift(p.state, [test_id], "its fix landed", now=now)
-    d.dispatch()
-    _premise_ran(d, cid)
-    d.dispatch()
-    t = p.db.task(cid)
-    if left:
-        assert runs == [] and t["status"] == "done" and premise.CMD_FAILS in json.loads(t["labels"]), t["status"]
-        assert "none of its tests is quarantined" in json.loads(t["result"])["premise_cmd"]["tail"]
-    else:
-        assert [k["task"]["id"] for _, k in runs] == [cid], "still quarantined: it dispatches"

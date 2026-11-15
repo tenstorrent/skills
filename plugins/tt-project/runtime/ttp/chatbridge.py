@@ -45,7 +45,6 @@ low alert per swap. No stand-in served (or the lists unknown): the error goes ba
 """
 from __future__ import annotations
 
-import email.utils
 import hmac
 import http.server
 import json
@@ -80,13 +79,6 @@ REJECT_STATUSES = (400, 422)
 REFUSAL_CODES = ("model_not_found", "unrecognized_model")   # error codes that refuse the run's model
 SWAP_FILE = "stand-in.json"   # in the run dir: {asked, ran} once a mid-run swap ran a stand-in (live views)
 SWAP_ERRORS = 3   # 5xx or no-answer calls in a row that swap a model the served lists no longer name
-# A model at capacity (HTTP 429, or a 503 that says when to come back): the bridge waits and sends the call
-# again, honoring Retry-After (its header, else a "retry after N seconds" in the body, else 2, 4, 8 ... s),
-# at most BUSY_RETRIES times and BUSY_WAIT_S seconds in all per call (providers.chat.busy_retries and
-# busy_wait_s), each wait at most BUSY_WAIT_MAX_S. Past that the 429 goes to the agent as a capacity stop.
-BUSY_RETRIES, BUSY_WAIT_S, BUSY_WAIT_MAX_S = 4, 180.0, 60.0
-RETRY_AFTER_RE = re.compile(r"retry\s+(?:after|in)\s+(\d+(?:\.\d+)?)\s*s", re.I)
-NEVER_FITS_RE = re.compile(r"request too large|insufficient.{0,20}(?:credit|quota|balance)", re.I)   # waiting cannot help
 
 
 class BridgeError(Exception):
@@ -107,7 +99,6 @@ def settings(cfg: dict, tier: str, model: str, effort: str = "", standins=(), se
     its own effort fields and context window."""
     entry = ((cfg or {}).get("providers") or {}).get("chat") or {}
     row = (entry.get("tiers") or {}).get(tier) or {}
-    busy = {k: entry[k] for k in ("busy_retries", "busy_wait_s") if _count_ok(entry.get(k))}
     cap = row.get("max_tokens") or entry.get("max_tokens") or 0
     window = window_of(entry, model, row)
     fields = effort_fields(entry, model, effort)
@@ -116,35 +107,7 @@ def settings(cfg: dict, tier: str, model: str, effort: str = "", standins=(), se
     return {"endpoint": str(entry.get("endpoint") or ""), "base_url": str(entry.get("base_url") or ""),
             "model": model, "max_tokens": int(cap or 0), **({"context_window": int(window)} if window else {}),
             **({"effort": effort, "fields": fields} if fields else {}),
-            **({"effort": effort, "standins": alts, "served": [str(d) for d in served]} if alts and served else {}),
-            **busy}
-
-
-def _count_ok(v) -> bool:
-    return isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0
-
-
-def busy_wait(status: int, headers, detail: str, n: int) -> float | None:
-    """How long to wait before sending call `n` (1, 2, ...) again after an upstream at capacity, or None
-    when the answer is not one to wait out: a 429 (unless the body says waiting cannot help), or a 503
-    that names its wait. Retry-After (seconds or an HTTP date) first, then the body's "retry after N
-    seconds", else 2**n s; never over BUSY_WAIT_MAX_S."""
-    if status not in (429, 503) or NEVER_FITS_RE.search(detail or ""):
-        return None
-    hint, got = (headers.get("Retry-After") if headers is not None else None), None
-    if hint:
-        try:
-            got = float(str(hint).strip())
-        except ValueError:
-            try:
-                got = email.utils.parsedate_to_datetime(str(hint)).timestamp() - time.time()
-            except (TypeError, ValueError, OverflowError):
-                got = None
-    if got is None and (m := RETRY_AFTER_RE.search(detail or "")):
-        got = float(m.group(1))
-    if got is None and status == 503:
-        return None   # a plain 503 is an outage: the mid-run swap handles those
-    return min(max(got if got is not None else 2.0 ** n, 0.0), BUSY_WAIT_MAX_S)
+            **({"effort": effort, "standins": alts, "served": [str(d) for d in served]} if alts and served else {})}
 
 
 def window_of(entry: dict, model: str, row: dict | None = None) -> int:
@@ -222,10 +185,6 @@ def config_problems(raw: dict) -> list[str]:
             endpoint.base_url(str(entry["base_url"]))
         except ValueError as e:
             out.append(f"providers.chat.base_url: {e}")
-    for key in ("busy_retries", "busy_wait_s"):
-        if entry.get(key) is not None and not (_count_ok(entry[key]) and (key == "busy_wait_s" or isinstance(entry[key], int))):
-            out.append(f"providers.chat.{key}: give a whole number {'of retries' if key == 'busy_retries' else 'of seconds'} "
-                       f"(0 = no wait); the default ({BUSY_RETRIES if key == 'busy_retries' else int(BUSY_WAIT_S)}) applies")
     for key, unset in (("max_tokens", "none sent: the client's own is dropped"), ("context_window", "Claude Code's own")):
         caps = [entry.get(key), *((t or {}).get(key) for t in (entry.get("tiers") or {}).values()
                                   if isinstance(t, dict))]
@@ -593,8 +552,7 @@ class Bridge:
 
     def __init__(self, base_url: str, key: str, model: str, max_tokens: int = 0,
                  timeout: float = UPSTREAM_TIMEOUT_S, context_window: int = 0, effort: str = "",
-                 fields: dict | None = None, standins: list | None = None, served: list | None = None,
-                 busy_retries: int | None = None, busy_wait_s: float | None = None):
+                 fields: dict | None = None, standins: list | None = None, served: list | None = None):
         self.base_url, self._key, self.model = endpoint.base_url(base_url), key, model
         self.max_tokens, self.timeout = int(max_tokens or 0), timeout
         self.context_window = int(context_window or 0)
@@ -608,10 +566,6 @@ class Bridge:
         self.mid_run: list[dict] = []   # each swap: {from, to, at, why}
         self.on_swap = None   # called with {asked, ran} after each swap (the runner's live SWAP_FILE)
         self._errs, self._left, self._swap_lock = 0, set(), threading.Lock()   # 5xx/no-answer run; models left
-        self.busy_retries = BUSY_RETRIES if busy_retries is None else int(busy_retries)
-        self.busy_wait_s = BUSY_WAIT_S if busy_wait_s is None else float(busy_wait_s)
-        self.busy = {"waits": 0, "waited_s": 0.0, "gave_up": 0}   # capacity waits (busy_wait), for stats()
-        self._sleep = time.sleep
         self.server: http.server.ThreadingHTTPServer | None = None
         self.thread: threading.Thread | None = None
 
@@ -639,8 +593,7 @@ class Bridge:
         return cls(url or saved, key, s["model"], s.get("max_tokens") or 0,
                    **{"context_window": s.get("context_window") or 0, "effort": s.get("effort") or "",
                       "fields": s.get("fields") or {}, "standins": s.get("standins") or [],
-                      "served": s.get("served") or [],
-                      **{k: s[k] for k in ("busy_retries", "busy_wait_s") if _count_ok(s.get(k))}, **kw})
+                      "served": s.get("served") or [], **kw})
 
     @property
     def url(self) -> str:
@@ -773,9 +726,7 @@ class Bridge:
                 **({"upstream": dict(self.upstream)} if self.upstream else {}),
                 **({"effort": self.effort, "fields": dict(self.fields), "rejected": self.rejected}
                    if self.fields else {}),
-                **({"mid_run": [dict(m) for m in self.mid_run], "model": self.model} if self.mid_run else {}),
-                **({"busy": {**self.busy, "waited_s": round(self.busy["waited_s"], 1)}} if self.busy["waits"]
-                   or self.busy["gave_up"] else {})}
+                **({"mid_run": [dict(m) for m in self.mid_run], "model": self.model} if self.mid_run else {})}
 
     def _open(self, req: dict):
         r = urllib.request.Request(f"{self.base_url}/chat/completions", data=json.dumps(req).encode(), headers={
@@ -783,22 +734,7 @@ class Bridge:
             "Accept": "text/event-stream" if req.get("stream") else "application/json"})
         return urllib.request.build_opener(endpoint._NoRedirect).open(r, timeout=self.timeout)
 
-    def _busy_wait(self, e: urllib.error.HTTPError, detail: str, tries: int, waited: float) -> float | None:
-        """The wait before this call goes out again after a capacity answer, None to pass the answer
-        on, or -1.0 once past the call's retries or wait budget (given up: a capacity stop)."""
-        wait = busy_wait(e.code, e.headers, detail, tries + 1)
-        if wait is None or self.busy_retries <= 0 or self.busy_wait_s <= 0:   # 0: no waits (the answer as it came)
-            return None
-        with self._swap_lock:
-            if tries >= self.busy_retries or waited + wait > self.busy_wait_s:
-                self.busy["gave_up"] += 1
-                return -1.0
-            self.busy["waits"] += 1
-            self.busy["waited_s"] += wait
-        return wait
-
     def forward(self, h: _Handler, body: dict) -> None:
-        tries, waited = 0, 0.0   # this call's capacity waits (busy_wait)
         while True:
             with self._swap_lock:   # one model and its own fields: a swap in another call changes all three
                 used, fields, rejected = self.model, dict(self.fields), self.rejected
@@ -829,16 +765,9 @@ class Bridge:
                         detail = e.read(2000).decode("utf-8", "replace")
                     except Exception:
                         detail = ""
-                wait = self._busy_wait(e, detail, tries, waited)
-                if wait is not None and wait >= 0:
-                    tries, waited = tries + 1, waited + wait
-                    self._sleep(wait)
-                    continue
                 self._fault(e.code, detail)
                 if self._swapped(used):
                     continue
-                if wait is not None:   # waited out as far as allowed: a capacity stop, not the model's
-                    detail = f"the model stayed at capacity after {tries} retries over {waited:.0f} s: {detail}"
                 return h._reply(*error_for(e.code, self._scrub(detail)))
             except (urllib.error.URLError, OSError) as e:
                 self._fault(0)

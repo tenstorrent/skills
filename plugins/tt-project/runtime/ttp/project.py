@@ -863,9 +863,6 @@ PROVIDER_KEYS = {"billing", "tiers", "plugin_dirs", "worker_isolation", "write_f
                  # demotion detector's thresholds (modeldemote.DEFAULTS).
                  "endpoint", "base_url", "max_tokens", "context_window", "route_cooldown_s", "effort_fields",
                  "route_wait_s", "routes", "model_ranking", "models_every_s", "demote",
-                 # busy_retries, busy_wait_s: how often and how long in all a call to a model at capacity
-                 # (HTTP 429) is waited out and sent again (chatbridge.busy_wait).
-                 "busy_retries", "busy_wait_s",
                  # providers.chat only: the rules-first model pick (modelpick.py); its keys (enabled, min_p,
                  # options) are checked by modelpick.config_problems.
                  "dispatch"}
