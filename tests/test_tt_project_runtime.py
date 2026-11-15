@@ -27438,6 +27438,14 @@ def test_durable_write_syncs_renames_and_keeps_the_mode(env, monkeypatch):
 # Every place the runtime writes a file directly, and why it need not survive a power cut. Anything
 # else goes through project.durable_write / durable_append / write_json.
 DURABLE_EXEMPT = {
+    ("deviceshadow.py", 'f.write_text(f"#!/bin/sh'): "the refusing stand-in for a device tool in a shadow cell's temporary folder, rebuilt for every cell; never state",
+    ("deviceshadow.py", 'target.write_bytes(f.read())'): "a file copied into a shadow run's temporary copy of the project's records, rebuilt for every run; never state",
+    ("deviceshadow.py", 'path.write_text("".join(scrub(json.dumps(r, default=str), paths)'): "a scrubbed row dump in a shadow run's temporary copy, rebuilt for every run; never state",
+    ("deviceshadow.py", '(dest / "runs" / str(r["id"]) / "result.json").write_text(scrub(text, paths))'): "a scrubbed result in a shadow run's temporary copy, rebuilt for every run; never state",
+    ("deviceshadow.py", '(dest / "logs" / f.name).write_text(scrub('): "a scrubbed log in a shadow run's temporary copy, rebuilt for every run; never state",
+    ("deviceshadow.py", 'with open(log / "run.log", "ab") as lf:'): "a shadow run's stdout log in its own folder; a cut log costs only the log",
+    ("deviceshadow.py", '(out / "handoff.md").write_text(handoff)'): "a shadow arm's report file in the shadow output folder, rewritten by the next run; the run record is the state",
+    ("deviceshadow.py", '(out / "trajectory.json").write_text(scrub('): "a shadow arm's scrubbed trajectory copy in the shadow output folder, rewritten by the next run; never state",
     ("benchdaily.py", 'with open(log, "ab") as lf:'): "the detached daily run's stdout log under the bench folder; a cut log costs only the log",
     ("benchreplay.py", '(dest / "evidence" / name).write_text'): "a sealed question's evidence file, rebuilt from the project's records by the next run; never state",
     ("benchreplay.py", '(dest / "evidence" / "INDEX.md").write_text'): "a sealed question's evidence index, rebuilt with the evidence; never state",
