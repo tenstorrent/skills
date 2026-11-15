@@ -43,6 +43,8 @@ The targets are the user-level setting `upstream.forward_to` (settings.json, `tt
 --forward-to`), else the machines of this user's remote projects: notes addressed to a project go
 only to the machine that runs it, the rest only to a machine with a project reading the inbox there.
 Received notes (with `via`) are never sent on again, and stay untrusted data like any other note.
+A project here keeps a note it only sends on, or a general one another machine's reader gets, as a
+handled event (`_pass_through`): no coordinator wakes for a copy; forwarding is unchanged.
 The same exchange closes forwarded notes: each answer carries back the resolutions of the notes the
 target received from the sender, and the sender's acks of them go out with its notes (see
 `_resolved_for` below), so a project whose machine cannot be reached still sees its notes resolved.
@@ -732,6 +734,7 @@ def _file(p: project.Project, sources, offsets: dict, known: set, seen: list, no
     from .coordinator import EVENT_CHARS_BY_KIND
     cap = EVENT_CHARS_BY_KIND["upstream_note"]
     routes: dict = {}
+    shared: list = []         # (forward targets, forwarded_reader()), read once for _pass_through
     for src, raw, size in sources:
         start = int(offsets.get(src, 0))
         if size < start:      # the inbox was cut or replaced: read it again; fingerprints skip the old notes
@@ -744,8 +747,9 @@ def _file(p: project.Project, sources, offsets: dict, known: set, seen: list, no
             if (to or only_to) and (to != p.name or src not in (LOCAL, LOCAL_TO)):
                 continue      # addressed to another project (or not addressed): not this project's to read
             esc = f"{n['fp']}:{n.get('severity')}" if to and n.get("escalated") else ""
+            passing = _pass_through(p, n, src, shared)
             if n["fp"] in known:
-                if esc and esc not in known:
+                if esc and esc not in known and not passing:   # a passing note's escalation is sent on too
                     known.add(esc)
                     seen.append(esc)
                     head = f"escalated to {n.get('severity')} (a note this project already has, sent again): "
@@ -758,6 +762,12 @@ def _file(p: project.Project, sources, offsets: dict, known: set, seen: list, no
             seen.extend([n["fp"]] + ([esc] if esc else []))
             if not to and (n.get("project"), n.get("host")) == me:
                 continue      # this project's own notes reached its coordinator with the hand-off
+            if passing:      # only sent on from here, or a copy another project's reader gets: wakes no one here
+                text = f"kept handled, {passing}: " + _event(n, cap)[1]
+                p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status) VALUES(?,?,?,?,?,?,?,?)",
+                       (now, "upstream", "upstream_note", None, "low", text[:cap], _note_data(n), "handled"))
+                added += 1
+                continue
             if to and n.get("from") == "worker" and (_close_confirmation(p, n, now) or _settle_close_report(p, n, now)):
                 added += 1
                 continue
@@ -773,9 +783,9 @@ def _file(p: project.Project, sources, offsets: dict, known: set, seen: list, no
                 if page_fp else []
             new = [fp for fp in fps if not p.db.one("SELECT id FROM events WHERE fingerprint=?", (fp,))]
             had = bool(page_fp) and not new
-            p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
+            p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status) VALUES(?,?,?,?,?,?,?,?)",
                    (now, "upstream", "upstream_note", None if had else ((new[0] if new else page_fp) or None),
-                    "low" if had else sev, text[:cap], "handled" if had else "queued"))
+                    "low" if had else sev, text[:cap], _note_data(n), "handled" if had else "queued"))
             for fp in new[1:]:
                 p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
                        (now, "upstream", "upstream_note", fp, "low", f"in the note {n.get('fp')}", "handled"))
@@ -793,6 +803,31 @@ def _file(p: project.Project, sources, offsets: dict, known: set, seen: list, no
         kept = {**(p.db.kv(KV_ROUTES) or {}), **routes}
         p.db.set_kv(KV_ROUTES, dict(list(kept.items())[-ROUTES_KEPT:]))
     return added
+
+
+def _pass_through(p: project.Project, n: dict, src: str, shared: list) -> str:
+    """Where this machine sends note `n` on when `p` only holds a copy of it, in words for its handled
+    event; "" when the note is `p`'s to read. Only a note of this machine's own (no `via`, no `back`) the
+    forwarder sends on: one addressed to `p` that names another machine (`at`, a forward target), or a
+    general one while this machine's general notes go to a machine where another project reads the
+    user's inbox (forwarded_reader). A note received here, or addressed to `p` with no `at`, is `p`'s.
+    `shared` caches (forward targets, forwarded_reader()) for one read of the inbox."""
+    if src not in (LOCAL, LOCAL_TO) or n.get("via") or n.get("back") or n.get("host") != project.hostname():
+        return ""
+    if not shared:
+        shared.extend([set(lookup_targets()), forwarded_reader()])
+    targets, fwd = shared
+    if n.get("to"):
+        at = str(n.get("at") or "")
+        return f"sent on to {at}, where {n['to']} runs" if at and at in targets else ""
+    return (f"a copy: sent on to {fwd[0]}, where project {fwd[1]} reads the user's upstream inbox"
+            if fwd and fwd[1] != p.name else "")
+
+
+def _note_data(n: dict) -> str:
+    """An upstream_note event's data: who sent the note and to whom (digest_line names them)."""
+    return json.dumps({"note": n.get("fp"), "from": n.get("project") or "", "host": n.get("host") or "",
+                       "via": n.get("via") or "", "to": n.get("to") or "", "by": n.get("from") or ""})
 
 
 # Replying to a received note (`ttp note --reply <fp>`, `ttp note --to <project>@<machine>`) ------------
@@ -1112,8 +1147,35 @@ def reader(now: float | None = None) -> dict | None:
     return r
 
 
-def digest_line(p: project.Project, cfg: dict) -> str:
-    """Tells the coordinator, on a turn with upstream notes, whether to pass them on to the user."""
+def digest_line(p: project.Project, cfg: dict, events=()) -> str:
+    """Tells the coordinator, on a turn with upstream notes, whether to pass them on to the user, and
+    who sent each of this turn's notes (`events`) to whom."""
+    return _whose_line(p, cfg) + _sent_to(p, events)
+
+
+NOTES_NAMED = 6   # this turn's notes digest_line names, sender and addressee
+
+
+def _sent_to(p: project.Project, events) -> str:
+    named = []
+    for e in events:
+        try:
+            d = json.loads(e["data"] or "{}") if e["kind"] == "upstream_note" else None
+        except (KeyError, IndexError, TypeError, ValueError):
+            d = None
+        if isinstance(d, dict) and d.get("note"):
+            to = d.get("to") or ""
+            named.append(f"{d['note']} from {'the daemon' if d.get('by') == 'daemon' else 'a worker'} of "
+                         f"{d.get('from') or '?'} on {d.get('host') or '?'}"
+                         + (f" (sent on from {d['via']})" if d.get("via") else "")
+                         + (" to this project" if to == p.name else f" to {to}" if to else " to the upstream inbox (general)"))
+    if not named:
+        return ""
+    more = len(named) - NOTES_NAMED
+    return " This turn's notes: " + "; ".join(named[:NOTES_NAMED]) + (f"; {more} more" if more > 0 else "") + "."
+
+
+def _whose_line(p: project.Project, cfg: dict) -> str:
     if (cfg.get("upstream") or {}).get("ingest"):
         return ("## Upstream notes: this project reads the user's upstream inbox; `upstream_note` events are "
                 "notes from the user's projects. Do not pass them on to the user.")

@@ -1482,3 +1482,51 @@ def test_ack_wait_terminal_ignores_pending_words_in_appended_facts():
     # the facts block's own status words decide nothing either way
     assert ackwait.terminal("re 3c59: still working on it" + facts.replace("queued", "status: done")) is False
     assert ackwait.own_words(terminal + facts) == terminal
+
+
+def test_a_note_this_machine_only_sends_on_is_kept_handled_and_an_addressed_one_wakes(env, monkeypatch):
+    """A note addressed to the project that names another machine (`at`) is only sent on from here: kept
+    as a handled event (no coordinator wake) and still forwarded. One addressed to it with no `at` wakes
+    it, and the digest line says who sent it to whom."""
+    from ttp import upstream
+    p = make(env)
+    fake = _fake_forward_ssh(env, monkeypatch)
+    upstream.set_forward_to(["farbox"])
+    assert upstream.send("alpha", 3, p.name, "a lesson for the far copy", at="farbox") == "sent"
+    assert upstream.send("alpha", 4, p.name, "a lesson for this project") == "sent"
+    passing, mine = _upstream_inbox(env)
+    assert upstream.ingest(p, {}) == 2
+    rows = p.db.q("SELECT status, severity, text, data FROM events WHERE kind='upstream_note' ORDER BY id")
+    assert [r["status"] for r in rows] == ["handled", "queued"]
+    assert rows[0]["text"].startswith(f"kept handled, sent on to farbox, where {p.name} runs: ")
+    assert f"[note {mine['fp']}]" in rows[1]["text"]
+    upstream.forward(time.time())
+    assert [x["fp"] for x in _remote_inbox(fake, "farbox")] == [passing["fp"]], "still forwarded"
+    queued = p.db.q("SELECT kind, data FROM events WHERE status='queued'")
+    line = upstream.digest_line(p, {}, queued)
+    assert f"{mine['fp']} from a worker of alpha on {upstream.project.hostname()} to this project" in line
+    assert passing["fp"] not in line
+
+
+def test_a_general_note_another_machines_reader_gets_is_a_handled_copy_for_a_reader_here(env, monkeypatch):
+    """A project reading this machine's inbox (`upstream.ingest`) while this machine's general notes go
+    to a machine where another project reads the inbox keeps its own machine's notes as handled copies;
+    one received from elsewhere (`via`) is its own to read and wakes it."""
+    from ttp import upstream
+    p = make(env)
+    cfg = {"upstream": {"ingest": True}}
+    now = time.time()
+    upstream.project.write_json(upstream.forward_path(),
+                                {"targets": {"farbox": {"reader": "beta", "last_ok": now, "probed": now}}})
+    upstream.append("alpha", 3, [{"title": "upstream: a lesson", "spec": "s"}])
+    got = {**_pushed_note(None, "another lesson", host="laptop"), "title": "upstream: another",
+           "fp": upstream.fingerprint("upstream: another", "another lesson")}
+    got.pop("to")
+    ack, rc = upstream.receive((json.dumps(got) + "\n").encode(), "laptop")
+    assert (rc, ack["accepted"]) == (0, 1)
+    assert upstream.ingest(p, cfg, now) == 2
+    rows = p.db.q("SELECT kind, status, text, data FROM events WHERE kind='upstream_note' ORDER BY id")
+    assert [r["status"] for r in rows] == ["handled", "queued"]
+    assert "a copy: sent on to farbox, where project beta reads the user's upstream inbox" in rows[0]["text"]
+    line = upstream.digest_line(p, cfg, [rows[1]])
+    assert "from a worker of alpha on laptop (sent on from laptop) to the upstream inbox (general)" in line

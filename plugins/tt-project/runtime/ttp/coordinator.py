@@ -1776,7 +1776,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     lines = []
     if any(e["kind"] == "upstream_note" or e["kind"] in ("followup_proposed", "task_notes")
            and "upstream:" in e["text"].lower() for e in events):
-        lines.append(upstream.digest_line(p, p.config()))
+        lines.append(upstream.digest_line(p, p.config(), events))
     section("upstream", lines)
     lines = ["\n# NEW EVENTS"]
     if msg_ids:
