@@ -1188,19 +1188,31 @@ fail rate, rework hops per landed change and $ per landed code task. With at lea
 fail-rate rise of more than `route.code_sonnet.guard_pts` points (default 5), it moves every code kind back
 to Opus, holds it there until someone changes `route.code_sonnet`, and sends the coordinator one alert with
 the numbers. `route.code_sonnet.guard false` turns it off; `ttp stats <name> --code-guard` shows the rows.
+Urgency and a model or effort the daemon or Jev picks never keep code on Opus; only a user's pin (the task's
+provider, model or effort), outside input (`untrusted_input`), deep asks, tier-up retries, review rounds at
+the cap, PR fixes and device runs (a `needs_device` label, a device lock or a machine in its resources, never
+words in the spec) do. Each code run's note records the decision and its reason; `ttp stats <name>
+--code-routes [--json]` shows the last 24 h's code runs per model and per reason. Once a day at most, the
+daemon raises a normal `route_share_low` event when the code route, or a device A/B's test arm, took under half
+its configured share over at least 10 runs, naming the top reasons.
 
 A device A/B compares two Claude models on device tasks; it is off by default. `route.device_ab` (a project
 and account key, the project's value over the account's) takes `{"projects": [...], "arms": {"sonnet":
 {"model": "sonnet", "effort": "high"}, "opus": {"model": "opus", "effort": "high"}}, "share": 0.5, "days": 3,
-"max_tasks": 60, "seed": 1}`; the first arm is the test arm. From the first time the daemon sees the setting,
+"max_tasks": 60, "seed": 1}`; `"test"` names the test arm (default: `sonnet` with the default arms, else the
+first arm). `"start"` (an ISO time or epoch) re-arms the window: a new value starts a fresh window from that
+time and lifts a stop. From the first time the daemon sees the setting,
 each new work, question or code task in a listed project that uses a device (a `needs_device` label, a device
-lock or a machine in its resources) gets an arm from a stable hash of the seed, project and task id, recorded on
-the task before its first run and kept on later runs. Urgent, pinned, deep, plan and review tasks and tier-up
-retries stay out and are counted; a tier-up retry of an A/B task runs on the second arm, marked. It ends after
+lock or a machine in its resources), urgent ones included, gets an arm from a stable hash of the seed, project
+and task id, recorded on the task before its first run and kept on later runs. Pinned, deep, plan and review
+tasks and live-outage work (an `outage:` spec line, a resource with an open machine outage or condition, or a
+high outage alert naming the task) stay out and are counted; a tier-up retry of an A/B task runs on the control
+arm, marked. It ends after
 `days` or `max_tasks`. A device incident (a hang, reset, recovery, power cycle or hold) during a test-arm run or
 within 30 minutes after it stops the test arm at once, with one high alert to the coordinator. Each finished A/B
 task gets one masked review at Opus high (answered what was asked, conclusions supported by logs, 0-4 each).
-`ttp stats <name> --device-ab [--json]` reports per arm and kind; `--all` or `--projects a,b` reads every project.
+`ttp stats <name> --device-ab [--json]` reports eligible tasks, flipped per arm, excluded per reason and results
+per arm and kind (device work and device code apart); `--all` or `--projects a,b` reads every project.
 
 Light is for mechanical work only: file reads and copies, small scripted edits, polling, test
 reruns. A conclusion run, whose output is a conclusion the user reads, never starts below the

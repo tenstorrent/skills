@@ -2608,6 +2608,10 @@ class Daemon:
                     log(self.p, "device A/B: test arm stopped after a device incident")
             except Exception as e:   # never holds the loop
                 log(self.p, f"device A/B tick failed: {type(e).__name__}: {e}"[:300])
+        # A configured route (the code route, the device A/B) taking under half its share: one event per route a day.
+        if now - getattr(self, "_route_share_checked", 0.0) >= 3600:
+            self._route_share_checked = now
+            self.route_share_alarms(now)
         # Cheap classes on Claude with none on a tt model: told once per outage, never as a repeating alarm.
         down = runclass.tt_unavailable(s)
         told = self.p.db.kv("tt_unavailable_told", "") or ""
@@ -2617,6 +2621,32 @@ class Daemon:
         elif told and not down and any(runclass.on_chat(m) for ms in s["classes"].values() for m in ms):
             self.p.db.set_kv("tt_unavailable_told", "")   # a tt model served again: the next outage is told
             log(self.p, "run classes: a tt model serves cheap classes again")
+
+    def route_share_alarms(self, now: float | None = None) -> list[str]:
+        """Model-free (runclass.share_alarms): a configured route under half its share over at least
+        runclass.SHARE_MIN runs raises one normal event per route per day, naming the top reasons. Reads only."""
+        now = time.time() if now is None else now
+        try:
+            told = json.loads(self.p.db.kv(runclass.SHARE_KV, "") or "{}")
+        except (TypeError, ValueError):
+            told = {}
+        told = told if isinstance(told, dict) else {}
+        raised = []
+        try:
+            alarms = runclass.share_alarms(self.p.db, self.cfg, now)
+        except Exception as e:   # never holds the loop
+            log(self.p, f"route share check failed: {type(e).__name__}: {e}"[:300])
+            return raised
+        for a in alarms:
+            if now - float(told.get(a["route"]) or 0) < runclass.SHARE_WINDOW_S:
+                continue
+            told[a["route"]] = now
+            self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                        (now, "daemon", "route_share_low", "normal", a["text"][:1000], "queued"))
+            raised.append(a["route"])
+        if raised:
+            self.p.db.set_kv(runclass.SHARE_KV, json.dumps(told))
+        return raised
 
     def trip_model_routing(self, every_s: float = 3600) -> None:
         """The model-pick tripwire (modeltrip.check): a stratum whose routed tasks go wrong more often than
@@ -13073,14 +13103,23 @@ class Daemon:
                     to = route.target(self.cfg, tier)
                     note[untrusted.KEY] = {"set": True, **({"kept_core": f"{to[0]}:{to[1]}"} if to else {})}
                 # A cheap class on the Claude core provider (no tt model serves it): a cheap Claude model.
-                cheap = None if dp else runclass.core_cheap(self.cfg, task, run_cls, tier, run_prov, routed, picked,
-                                                            self._code_state())
+                # The code route (runclass.code_route) applies whatever a model pick chose; other classes keep it.
+                code_state = self._code_state()
+                cheap = None if dp and run_cls != "hard" else runclass.core_cheap(
+                    self.cfg, task, run_cls, tier, run_prov, routed, picked, code_state)
+                dab = None
                 try:   # route.device_ab: a device task's arm (recorded on it before its first run) wins
                     if dab := deviceab.assign(db, self.cfg, self.p.name, task, run_prov, run_cls, picked):
                         cheap = {k: v for k, v in dab.items() if k != deviceab.KEY}
                         note[deviceab.KEY] = dab[deviceab.KEY]
                 except Exception as e:   # the A/B must never hold a task back
                     log(self.p, f"task {task['id']}: device A/B not assigned: {e}"[:300])
+                try:   # a code run's note says whether it took Sonnet, else why it stayed (ttp stats --code-guard)
+                    if cr := runclass.code_decision(self.cfg, task, run_cls, tier, run_prov, picked, code_state,
+                                                    cheap, dab):
+                        note[runclass.CODE_ROUTE_KEY] = cr
+                except Exception as e:
+                    log(self.p, f"task {task['id']}: code route note failed: {e}"[:300])
                 if cheap:
                     note[runclass.CHEAP_KEY] = cheap
                 try:   # a routed model pick runs its option's effort: no A/B arm; nor does a cheap core run

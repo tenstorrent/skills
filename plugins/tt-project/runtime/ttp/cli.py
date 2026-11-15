@@ -2188,6 +2188,11 @@ def cmd_stats(a) -> None:
         r = deviceab.report(p.db.q, lambda k: p.db.kv(k, ""), p.config())
         print(json.dumps(r, indent=1) if a.json else deviceab.report_text(r, p.name))
         return
+    if getattr(a, "code_routes", False):
+        from . import runclass
+        s = runclass.code_routes(p.db, time.time() - 86400)
+        print(json.dumps(s, indent=1) if a.json else runclass.code_routes_text(s, p.name))
+        return
     if getattr(a, "code_guard", False):
         from . import runclass
         s = runclass.guard_report(p.db, p.config(), max(1, int(a.days or 7)))
@@ -15454,6 +15459,9 @@ def main(argv: list[str] | None = None) -> None:
                    help="the device A/B (route.device_ab, deviceab.py) instead: per arm and kind (device work, "
                         "device code) tasks, done, failed, retried, follow-up fixes, incidents, blind scores, $ and "
                         "minutes per task, and the excluded count; with --all or --projects: every project, read only")
+    s.add_argument("--code-routes", action="store_true",
+                   help="the code route instead (runclass.code_routes): the last 24 h's code worker runs per model "
+                        "and per decision each run's note records (Sonnet, or why it stayed on Opus)")
     s.add_argument("--code-guard", action="store_true",
                    help="the daily code-route guard instead (runclass.guard_run): per day, code tasks' review-fail "
                         "rate, rework hops and $ per landed code task against the prior 7 days, and whether a trip "

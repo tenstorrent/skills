@@ -437,7 +437,7 @@ def test_wake_keeps_effort_is_only_a_code_task_worker_wake_with_no_chat_reply():
     assert tierfloor.wake_keeps_effort({**code, "reply_chat": "c1"}, "worker_wake") is False
 
 
-def test_code_tasks_take_sonnet_by_kind_canary_then_full_and_opus_keeps_pins_and_urgent_work():
+def test_code_tasks_take_sonnet_by_kind_canary_then_full_and_opus_keeps_pins_and_device_runs():
     from ttp import runclass
     t = {"id": 7, "kind": "code", "tier": "standard", "title": "add a flag", "labels": "[]"}
     assert runclass.classify(t) == "hard"   # accounting unchanged: the route is a cheap model, not a class
@@ -461,11 +461,14 @@ def test_code_tasks_take_sonnet_by_kind_canary_then_full_and_opus_keeps_pins_and
     assert runclass.core_cheap({}, {**t, "id": tid}, "hard", "standard", "claude", None, None, {"new": "off"}) is None
     cont = {**t, "id": tid, "labels": '["continues:5"]'}
     assert runclass.core_cheap({}, cont, "hard", "standard", "claude", None, None, {"new": "off"})[runclass.CODE_KEY] == "continue"
-    # Opus keeps urgent, needs_deep, pins, tier-up retries, other tiers and device work.
-    for extra in ({"spec": "urgent: the user is waiting"}, {"labels": '["needs_deep"]'},
-                  {"model": "opus"}, {"provider": "claude"}, {"effort": "xhigh"},
-                  {"spec": "run it on the device (tt-smi reset)"}):
+    # Opus keeps needs_deep, pins, tier-up retries, other tiers and device runs (by resource, not by words).
+    for extra in ({"labels": '["needs_deep"]'}, {"model": "opus"}, {"provider": "claude"}, {"effort": "xhigh"},
+                  {"labels": '["needs_device"]'}, {"labels": '["resource:box1-device"]'}):
         assert runclass.core_cheap({}, {**t, **extra}, "hard", "standard", "claude", None, None, full) is None, extra
+    # Urgent code and a spec that only talks about devices take the route.
+    for extra in ({"spec": "urgent: the user is waiting", "priority": 1},
+                  {"spec": "run it on the device (tt-smi reset)"}, {"spec": "No device run in this task."}):
+        assert runclass.core_cheap({}, {**t, **extra}, "hard", "standard", "claude", None, None, full), extra
     assert runclass.core_cheap({}, t, "hard", "standard", "claude", None, {"by": "retry"}, full) is None
     assert runclass.core_cheap({}, t, "hard", "deep", "claude", None, None, full) is None
     assert runclass.core_cheap({}, t, "hard", "standard", "codex", None, None, full) is None
@@ -500,9 +503,11 @@ def test_review_fixes_take_the_code_sonnet_route_with_their_own_state_and_opus_k
     for labels in ('["continues:5", "review_fix:9", "review_round:2"]', '["review_fix:9", "review_fix:11"]'):
         assert runclass.review_round({**fix, "labels": labels}) == 2
         assert runclass.core_cheap({}, {**fix, "labels": labels}, "hard", "standard", "claude", None, None, full) is None
-    # Opus keeps urgent, needs_deep, user_deep, pins, tier-up retries, deep and device fixes.
-    for extra in ({"spec": "urgent: the user is waiting"}, {"model": "opus"}, {"provider": "claude"},
-                  {"effort": "xhigh"}, {"spec": "run it on the device (tt-smi reset)"},
+    # Opus keeps needs_deep, user_deep, pins, tier-up retries, deep and device fixes; urgent fixes take it.
+    assert runclass.core_cheap({}, {**fix, "spec": "urgent: the user is waiting"}, "hard", "standard", "claude",
+                               None, None, full)[runclass.CODE_KEY] == "review_fix"
+    for extra in ({"model": "opus"}, {"provider": "claude"}, {"effort": "xhigh"},
+                  {"labels": '["review_fix:9", "needs_device"]'},
                   {"labels": '["review_fix:9", "needs_deep"]'}, {"labels": '["review_fix:9", "user_deep"]'}):
         assert runclass.core_cheap({}, {**fix, **extra}, "hard", "standard", "claude", None, None, full) is None, extra
     assert runclass.core_cheap({}, fix, "hard", "standard", "claude", None, {"by": "retry"}, full) is None
@@ -851,3 +856,95 @@ def test_code_route_guard_trip_holds_code_on_opus_until_the_setting_changes_and_
     assert not runclass.guard_held(p.db, d.cfg)
     p.db.set_kv(runclass.CODE_STATE_KV, json.dumps({"new": "full"}))
     assert d._code_state()["new"] == "full"
+
+
+def test_code_route_takes_jev_picked_and_urgent_code_and_opus_keeps_only_user_pins_and_outside_input():
+    from ttp import runclass
+    t = {"id": 7, "kind": "code", "tier": "standard", "title": "add a flag", "labels": "[]", "spec": "add it"}
+    full = {"new": "full"}
+    jev = {"by": "jev", "pick": "claude:opus:high", "p": 0.8}
+
+    def cheap(task, picked=None):
+        return runclass.core_cheap({}, task, "hard", "standard", "claude", None, picked, full)
+
+    # A Jev pick is not a pin, and urgency never keeps code on Opus.
+    assert cheap(t, jev)["model"] == "sonnet"
+    assert cheap({**t, "priority": 1, "spec": "urgent: the user is waiting"}, jev)["model"] == "sonnet"
+    assert runclass.code_route({}, {**t, "priority": 1, "labels": '["urgent"]'}, jev, full)[1] == ""
+    # Only a user's pin of provider, model or effort keeps it, and outside input does too.
+    for k, v in (("provider", "claude"), ("model", "opus"), ("effort", "high")):
+        assert cheap({**t, k: v}, jev) is None
+        assert runclass.code_route({}, {**t, k: v}, jev, full) == (None, "user_pin")
+    assert runclass.code_route({}, {**t, "labels": '["untrusted_input"]'}, jev, full) == (None, "untrusted_input")
+    assert runclass.code_route({}, {**t, "labels": '["needs_device"]'}, jev, full) == (None, "device_run")
+    fix = {**t, "labels": '["review_fix:9", "pr_fix:9"]'}
+    assert runclass.code_route({}, fix, None, {"review_fix": "full"}) == (None, "pr_fix")
+    late = {**t, "labels": json.dumps(["review_fix:9", f"{runclass.ROUND_LABEL}{runclass.REVIEW_ROUND_MAX}"])}
+    assert runclass.code_route({}, late, None, {"review_fix": "full"}) == (None, "review_round")
+
+
+def test_code_decision_is_what_the_run_note_records_with_the_reason():
+    from ttp import runclass
+    t = {"id": 7, "kind": "code", "tier": "standard", "labels": "[]", "spec": "add it"}
+    full = {"new": "full"}
+    note = runclass.core_cheap({}, t, "hard", "standard", "claude", None, None, full)
+    assert runclass.code_decision({}, t, "hard", "standard", "claude", None, full, note) == {"to": "sonnet",
+                                                                                          "kind": "new"}
+    assert runclass.code_decision({}, {**t, "model": "opus"}, "hard", "standard", "claude", None, full) == {
+        "to": "opus", "why": "user_pin"}
+    assert runclass.code_decision({}, {**t, "labels": '["untrusted_input"]'}, "hard", "standard", "claude",
+                                  None, full)["why"] == "untrusted_input"
+    assert runclass.code_decision({}, t, "hard", "standard", "codex", None, full) == {"to": "codex",
+                                                                                     "why": "provider"}
+    assert runclass.code_decision({}, t, "hard", "standard", "claude", None, full, {"model": "sonnet"},
+                                  {"arm": "sonnet"})["why"] == "device_ab"
+    assert runclass.code_decision({}, {**t, "kind": "work"}, "hard", "standard", "claude") is None
+
+
+def test_route_share_alarm_fires_once_a_day_on_a_low_code_share_and_not_on_a_normal_one(env):
+    from ttp import runclass
+    from ttp.daemon import Daemon
+    p = make(env)
+    now = time.time()
+
+    def runs(n, to, why=None):
+        for _ in range(n):
+            t = p.db.add_task("t", "", kind="code", tier="standard", priority=3, budget_usd=1.0)
+            cr = {"to": to} if to == "sonnet" else {"to": to, "why": why}
+            p.db.x("INSERT INTO runs(task,role,provider,model,started,status,cost_usd,note) VALUES(?,?,?,?,?,?,?,?)",
+                   (t, "worker", "claude", "sonnet" if to == "sonnet" else "claude-opus-5-5", now - 600, "ok", 0.1,
+                    json.dumps({runclass.CODE_ROUTE_KEY: cr})))
+
+    cfg = {"route": {"code_sonnet": {"share": 0.6}}}
+    # Normal: 4 of 10 the route should take (CODE_KEEP reasons do not count) is over half of 60%.
+    runs(4, "sonnet")
+    runs(6, "opus", "canary_share")
+    runs(5, "opus", "untrusted_input")
+    s = runclass.code_routes(p.db, now - 86400, now + 1)
+    assert (s["runs"], s["base"], s["base_sonnet"], s["why"]["untrusted_input"]) == (15, 10, 4, 5)
+    assert runclass.share_alarms(p.db, cfg, now + 1) == []
+    # Low: 4 of 20 is under half of 60%; the alarm names the top reasons, not the kept ones.
+    runs(10, "opus", "quality_hold")
+    got = runclass.share_alarms(p.db, cfg, now + 1)
+    assert [a["route"] for a in got] == ["code_sonnet"] and got[0]["n"] == 20
+    assert "quality_hold 10" in got[0]["text"] and "canary_share 6" in got[0]["text"]
+    assert "untrusted_input" not in got[0]["text"].split("Top reasons:")[1]
+    # Runs from before the decision was recorded never count toward the share.
+    for _ in range(30):
+        t = p.db.add_task("t", "", kind="code", tier="standard", priority=3, budget_usd=1.0)
+        p.db.x("INSERT INTO runs(task,role,provider,model,started,status,cost_usd) VALUES(?,?,?,?,?,?,?)",
+               (t, "worker", "claude", "claude-opus-5-5", now - 600, "ok", 0.1))
+    s2 = runclass.code_routes(p.db, now - 86400, now + 1)
+    assert (s2["why"]["unrecorded"], s2["base"]) == (30, 20)
+    # Off it never fires.
+    assert runclass.share_alarms(p.db, {"route": {"code_sonnet": False}}, now + 1) == []
+    # The daemon raises one normal event per route per day.
+    d = Daemon(p.base)
+    d.cfg = {**d.cfg, **cfg}
+    assert d.route_share_alarms(now + 1) == ["code_sonnet"]
+    assert d.route_share_alarms(now + 2) == []
+    ev = p.db.q("SELECT severity, source FROM events WHERE kind='route_share_low'")
+    assert [(e["severity"], e["source"]) for e in ev] == [("normal", "daemon")]
+    assert d.route_share_alarms(now + 1 + runclass.SHARE_WINDOW_S) == []   # runs aged out of the window
+    # The stats flag prints the per-model and per-reason counts.
+    assert "quality_hold 10" in runclass.code_routes_text(runclass.code_routes(p.db, now - 86400, now + 1))

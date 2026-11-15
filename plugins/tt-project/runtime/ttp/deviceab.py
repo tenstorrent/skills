@@ -3,14 +3,20 @@
 Setting (a project and an account key; the project's own value wins):
   {"projects": [...], "arms": {"sonnet": {"model": "sonnet", "effort": "high"},
                                "opus": {"model": "opus", "effort": "high"}},
-   "share": 0.5, "days": 3, "max_tasks": 60, "seed": N}
-The first arm listed is the test arm (it gets `share` of the tasks); the second is the control arm.
+   "share": 0.5, "days": 3, "max_tasks": 60, "seed": N, "test": "sonnet", "start": "<ISO time or epoch>"}
+The test arm (it gets `share` of the tasks and stops on an incident) is `test`; without it, "sonnet" when the arms
+are the default names (a stored setting may list its keys sorted), else the first arm listed. The other is the
+control arm. `start` re-arms the A/B: a new value starts a new window there (days and max_tasks count from it)
+and lifts an old stop; without it the window starts when the daemon first sees the setting.
 
 Scope: tasks created after the A/B's start (START_KV, recorded the first time the daemon sees the setting) in a
 listed project, of kind work, question or code, that use a device (tierfloor.device_run: a needs_device label,
-a device lock or a device machine in resources). Excluded and counted (a device_ab_excluded:<why> label): urgent,
-pinned (provider, model or effort), deep or user_deep, plan, review, a first run that is a tier-up retry, and
-tasks after the end (`days` or `max_tasks`) or after the test arm stopped. Device tasks never run on the chat
+a device lock or a device machine in resources). Urgent device tasks take part. Excluded and counted (a
+device_ab_excluded:<why> label): pinned (provider, model or effort, or a deep tier or user_deep: the user's pin),
+live-outage work (outage_work: an `outage:` spec line or outage task label, a resource machine with an open
+outage or machine condition when it is first seen, or a high outage event naming the task), plan, review, and
+tasks after the end (`days` or `max_tasks`) or after the test arm stopped. A first run that is a tier-up retry
+keeps its arm and runs on the control arm. Device tasks never run on the chat
 provider (route.eligible keeps them on core); the A/B only acts on the Claude core provider.
 
 Flip: a stable hash of (seed, project, task id) picks the arm, recorded on the task as device_ab:<arm> before
@@ -74,10 +80,31 @@ def settings(cfg: dict) -> dict | None:
     seed = got.get("seed")
     seed = int(seed) if isinstance(seed, int) and not isinstance(seed, bool) else 0
     names = list(arms)
-    sig = hashlib.sha256(json.dumps([sorted(p.lower() for p in projects), arms, seed]).encode()).hexdigest()[:12]
-    return {"projects": projects, "arms": arms, "test": names[0], "control": names[1],
+    test = str(got.get("test") or "")
+    test = test if test in arms else "sonnet" if set(arms) == set(DEFAULT_ARMS) else names[0]
+    begin = start_ts(got.get("start"))
+    parts = [sorted(p.lower() for p in projects), arms, seed]
+    if got.get("test") in arms or begin is not None:   # only set keys re-arm: an older setting keeps its start
+        parts.append({"test": test, "start": begin})
+    sig = hashlib.sha256(json.dumps(parts).encode()).hexdigest()[:12]
+    return {"projects": projects, "arms": arms, "test": test, "control": next(n for n in names if n != test),
+            "start": begin,
             "share": _num(got.get("share"), 0, 1, 0.5), "days": _num(got.get("days"), 0.01, 365, 3.0),
             "max_tasks": int(_num(got.get("max_tasks"), 1, 100000, 60)), "seed": seed, "sig": sig}
+
+
+def start_ts(v: Any) -> float | None:
+    """`start` as an epoch: a number, or an ISO time with its offset (none: UTC); None when unset or bad."""
+    if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
+        return float(v)
+    if isinstance(v, str) and v.strip():
+        from datetime import datetime, timezone
+        try:
+            d = datetime.fromisoformat(v.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return (d if d.tzinfo else d.replace(tzinfo=timezone.utc)).timestamp()
+    return None
 
 
 def _obj(v: Any) -> dict:
@@ -100,7 +127,8 @@ def start(db, s: dict, now: float | None = None) -> dict:
     got = _kv(db, START_KV)
     if got.get("sig") == s["sig"] and isinstance(got.get("ts"), (int, float)):
         return got
-    got = {"ts": float(now if now is not None else time.time()), "sig": s["sig"]}
+    got = {"ts": float(s["start"] if s.get("start") is not None else now if now is not None else time.time()),
+           "sig": s["sig"]}
     db.set_kv(START_KV, got)
     db.set_kv(STOP_KV, {})
     return got
@@ -120,9 +148,38 @@ def device(task: dict, cfg: dict | None) -> bool:
     return tierfloor.device_run(task, cfg)
 
 
-def exclusion(task: dict, picked: dict | None = None) -> str:
-    """Why an in-scope device task stays out of the A/B ("" when it may take part)."""
-    from . import urgent
+OUTAGE_LINE = re.compile(r"(?im)^\s*outage\s*:")
+
+
+def outage_work(db, task: dict) -> bool:
+    """Live-outage work, model-free: an `outage:` spec line or an outage task's label (outagetask.LABEL); a
+    resource machine with an open known outage or machine condition (machine_ledger); or a high-severity
+    outage event (kind or key naming an outage, outagemsg.OUTAGE_KEYS) whose text names the task (#<id>)."""
+    from . import effort
+    if OUTAGE_LINE.search(str(task.get("spec") or "")) or any(lb.startswith("outage:") for lb in _labels(task)):
+        return True
+    names = set(effort._resource_names(task))
+    if names:
+        try:
+            from . import machine_ledger
+            if names & (set(machine_ledger.outages()) | set(machine_ledger.conditions())):
+                return True
+        except Exception:   # an unreadable ledger never marks work as outage work
+            pass
+    if db is not None and task.get("id") is not None:
+        from .outagemsg import OUTAGE_KEYS
+        tag = re.compile(rf"#{int(task['id'])}\b")
+        for e in db.q("SELECT kind, fingerprint, text FROM events WHERE severity IN ('high','critical') AND ts>=? "
+                      "AND (kind LIKE '%outage%' OR " + " OR ".join("fingerprint LIKE ?" for _ in OUTAGE_KEYS) + ")",
+                      (float(task.get("created") or 0) - 86400, *(f"{k}%" for k in OUTAGE_KEYS))):
+            if tag.search(str(e.get("text") or "")):
+                return True
+    return False
+
+
+def exclusion(task: dict, picked: dict | None = None, db=None) -> str:
+    """Why an in-scope device task stays out of the A/B ("" when it may take part): a user's pin or live-outage
+    work. Urgency never excludes it; a tier-up retry keeps its arm and runs on the control arm."""
     kind = str(task.get("kind") or "work")
     if kind in ("plan", "review"):
         return kind
@@ -134,10 +191,8 @@ def exclusion(task: dict, picked: dict | None = None) -> str:
         return "deep"
     if any(str(task.get(k) or "") for k in ("provider", "model", "effort")):
         return "pin"
-    if urgent.is_urgent(task):
-        return "urgent"
-    if (picked or {}).get("by") == "retry":
-        return "retry"
+    if outage_work(db, task):
+        return "outage"
     return ""
 
 
@@ -177,7 +232,7 @@ def assign(db, cfg: dict, project: str, task: dict, provider: str, cls: str = "h
         st = start(db, s, now)
         if float(task.get("created") or 0) < st["ts"]:
             return None
-        why = exclusion(task, picked)
+        why = exclusion(task, picked, db)
         if not why and now - st["ts"] > s["days"] * 86400:
             why = "ended"
         if not why and enrolled(db, st["ts"]) >= s["max_tasks"]:
@@ -308,6 +363,35 @@ def _scores(result: str | None) -> dict | None:
     return {k: float(v) for k, v in vals.items()}
 
 
+KEPT_OUT = ("pin", "deep", "outage", "plan", "review", "kind", "ended", "full", "test_arm_stopped")
+
+
+def share_check(db, cfg: dict, now: float | None = None) -> dict | None:
+    """The A/B's fill for the daemon's share alarm (runclass.share_alarms): device tasks since its start, less
+    those KEPT_OUT by design, and how many went to the test arm: {"share", "test", "test_n", "n", "got", "why":
+    {exclusion: n}}; None when it is off, not started, stopped or over its days."""
+    s = settings(cfg)
+    st = _kv(db, START_KV)
+    since = float(st.get("ts") or 0)
+    now = time.time() if now is None else now
+    if not s or not since or st.get("sig") != s["sig"] or stopped(db) or now - since > s["days"] * 86400:
+        return None
+    n = test_n = 0
+    why: dict = {}
+    for t in db.q("SELECT labels FROM tasks WHERE created>=? AND labels LIKE ?", (since, '%"device_ab%')):
+        labels = _labels(t)
+        ex = next((lb[len(EXCLUDED):] for lb in labels if lb.startswith(EXCLUDED)), "")
+        arm = next((lb[len(LABEL):] for lb in labels if lb.startswith(LABEL)), "")
+        if ex:
+            why[ex] = why.get(ex, 0) + 1
+        if (ex and ex in KEPT_OUT) or not (ex or arm):
+            continue
+        n += 1
+        test_n += arm == s["test"]
+    return {"share": s["share"], "test": s["test"], "test_n": test_n, "n": n,
+            "got": round(test_n / n, 3) if n else 0.0, "why": why}
+
+
 def report(q: Callable[..., list[dict]], kv: Callable[[str], Any], cfg: dict | None = None) -> dict:
     """Per arm and kind (device work, device code): tasks, done, failed, retried, follow-up fixes, incidents,
     blind scores, $ and wall minutes per task; the excluded count by reason. `q(sql, args)` reads the project's
@@ -315,7 +399,8 @@ def report(q: Callable[..., list[dict]], kv: Callable[[str], Any], cfg: dict | N
     st, stop = _obj(kv(START_KV)), _obj(kv(STOP_KV))
     since = float(st.get("ts") or 0)
     s = settings(cfg or {}) if cfg else None
-    out: dict = {"on": bool(s), "start": st.get("ts"), "stopped": stop or None, "arms": {}, "excluded": {}}
+    out: dict = {"on": bool(s), "start": st.get("ts"), "stopped": stop or None, "test": (s or {}).get("test"),
+                 "arms": {}, "excluded": {}}
     if s:
         out.update(days=s["days"], max_tasks=s["max_tasks"], share=s["share"], test=s["test"], control=s["control"],
                    models={k: f"{v['model']}:{v['effort']}" for k, v in s["arms"].items()})
@@ -370,6 +455,8 @@ def report(q: Callable[..., list[dict]], kv: Callable[[str], Any], cfg: dict | N
             a["answered"] = round(a["answered"] / m, 2) if m else None
             a["supported"] = round(a["supported"] / m, 2) if m else None
     out["excluded_total"] = sum(out["excluded"].values())
+    out["flipped"] = {arm: sum(a["tasks"] for a in kinds.values()) for arm, kinds in out["arms"].items()}
+    out["eligible"] = sum(out["flipped"].values())
     return out
 
 
@@ -377,6 +464,8 @@ def report_text(r: dict, name: str = "") -> str:
     head = f"Device A/B{f' ({name})' if name else ''}: " + ("on" if r.get("on") else "off")
     if r.get("models"):
         head += ", " + ", ".join(f"{k} = {v}" for k, v in r["models"].items())
+        if r.get("test"):
+            head += f"; test arm {r['test']}"
     lines = [head]
     if r.get("stopped"):
         lines.append(f"  test arm stopped after an incident on task #{r['stopped'].get('task')}")
@@ -389,5 +478,7 @@ def report_text(r: dict, name: str = "") -> str:
                          f"retried {a['retried']}, fixes {a['fixes']}, incidents {a['incidents']}, "
                          f"answered/supported {sc}, ${a['usd_per_task']}/task, {a['minutes_per_task']} min/task")
     ex = ", ".join(f"{k} {v}" for k, v in sorted(r["excluded"].items())) or "none"
+    flip = ", ".join(f"{k} {v}" for k, v in sorted((r.get("flipped") or {}).items())) or "none"
+    lines.append(f"  eligible: {r.get('eligible', 0)} (flipped: {flip})")
     lines.append(f"  excluded: {r.get('excluded_total', 0)} ({ex})")
     return "\n".join(lines)

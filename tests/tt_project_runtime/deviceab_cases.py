@@ -73,25 +73,30 @@ def test_device_ab_flips_a_stable_arm_before_the_first_run_and_keeps_it_on_every
     assert deviceab.assign(p.db, {**cfg, "core_provider": "codex"}, p.name, t, "claude", now=2000.0) is None
 
 
-def test_device_ab_excludes_and_counts_urgent_pinned_deep_plan_review_and_retry_tasks_and_ends(env):
+def test_device_ab_excludes_and_counts_pinned_deep_plan_review_tasks_and_ends(env):
     from ttp import deviceab
     p = make(env)
-    cfg = _dab_cfg(p, max_tasks=3, days=1)
+    cfg = _dab_cfg(p, max_tasks=4, days=1)
     deviceab.start(p.db, deviceab.settings(cfg), 1000.0)
-    cases = {"urgent": dict(priority=1), "pin": dict(model="opus"), "deep": dict(tier="deep"),
-             "plan": dict(kind="plan"), "review": dict(kind="review")}
+    cases = {"pin": dict(model="opus"), "deep": dict(tier="deep"), "plan": dict(kind="plan"),
+             "review": dict(kind="review")}
     for why, kw in cases.items():
         kind = kw.pop("kind", "work")
         tid = p.db.add_task(f"t {why}", "Run it.", kind=kind, tier=kw.pop("tier", "standard"), origin="coordinator",
-                            priority=kw.pop("priority", 3), labels=["needs_device"], **kw)
+                            priority=3, labels=["needs_device"], **kw)
         assert deviceab.assign(p.db, cfg, p.name, p.db.task(tid), "claude", now=2000.0) is None
         assert f"device_ab_excluded:{why}" in p.db.task(tid)["labels"], why
+    for pin in (dict(provider="claude"), dict(effort="max")):
+        tid = p.db.add_task("t pin", "Run it.", kind="work", tier="standard", origin="coordinator", priority=3,
+                            labels=["needs_device"], **pin)
+        assert deviceab.assign(p.db, cfg, p.name, p.db.task(tid), "claude", now=2000.0) is None
     ud = _dab_task(p, labels=("needs_device", "user_deep"))
     assert deviceab.assign(p.db, cfg, p.name, p.db.task(ud), "claude", now=2000.0) is None
+    # A tier-up retry's first run keeps its arm and runs on the control arm: never excluded.
     rt = _dab_task(p)
-    assert deviceab.assign(p.db, cfg, p.name, p.db.task(rt), "claude", picked={"by": "retry"}, now=2000.0) is None
-    assert "device_ab_excluded:retry" in p.db.task(rt)["labels"]
-    # max_tasks: three enrol, the fourth is excluded as full; after `days` new tasks are excluded as ended.
+    got = deviceab.assign(p.db, cfg, p.name, p.db.task(rt), "claude", picked={"by": "retry"}, now=2000.0)
+    assert got[deviceab.KEY]["ran"] == "opus" and got[deviceab.KEY]["retry"] and got["model"] == "opus"
+    # max_tasks: four enrol (the retry included), the fifth is excluded as full; after `days` as ended.
     for _ in range(3):
         assert deviceab.assign(p.db, cfg, p.name, p.db.task(_dab_task(p)), "claude", now=2000.0)
     full = _dab_task(p)
@@ -100,8 +105,112 @@ def test_device_ab_excludes_and_counts_urgent_pinned_deep_plan_review_and_retry_
     late = _dab_task(p)
     assert deviceab.assign(p.db, _dab_cfg(p, days=1), p.name, p.db.task(late), "claude", now=1000.0 + 2 * 86400) is None
     r = deviceab.report(p.db.q, lambda k: p.db.kv(k, ""), cfg)
-    assert r["excluded"] == {"urgent": 1, "pin": 1, "deep": 2, "plan": 1, "review": 1, "retry": 1, "full": 1,
-                             "ended": 1} and r["excluded_total"] == 9
+    assert r["excluded"] == {"pin": 3, "deep": 2, "plan": 1, "review": 1, "full": 1, "ended": 1}
+    assert r["excluded_total"] == 9 and r["eligible"] == 4 and sum(r["flipped"].values()) == 4
+    assert "eligible: 4 (flipped: " in deviceab.report_text(r)
+
+
+def test_device_ab_flips_urgent_device_tasks(env):
+    from ttp import deviceab
+    p = make(env)
+    cfg = _dab_cfg(p)
+    deviceab.start(p.db, deviceab.settings(cfg), 1000.0)
+    arms = set()
+    for _ in range(12):
+        tid = p.db.add_task("Fix the box's hang", "urgent: the user asked today.\nRun it.", kind="work",
+                            tier="standard", origin="coordinator", priority=1, labels=["needs_device"])
+        got = deviceab.assign(p.db, cfg, p.name, p.db.task(tid), "claude", now=2000.0)
+        assert got and not any(lb.startswith(deviceab.EXCLUDED) for lb in deviceab._labels(p.db.task(tid)))
+        arms.add(got[deviceab.KEY]["arm"])
+    assert arms == {"sonnet", "opus"}
+
+
+def test_device_ab_excludes_live_outage_work(env, monkeypatch):
+    from ttp import deviceab, machine_ledger
+    p = make(env)
+    cfg = _dab_cfg(p)
+    deviceab.start(p.db, deviceab.settings(cfg), 1000.0)
+    # 1) an `outage:` spec line; 2) an outage task's label.
+    a = p.db.add_task("Bring the box back", "outage: box1 lost its chips\nRun it.", kind="work", tier="standard",
+                      origin="coordinator", priority=1, labels=["needs_device"])
+    b = _dab_task(p, labels=("needs_device", "outage:box1:down@1000"))
+    # 3) a resource machine with an open outage or machine condition when the task is first seen.
+    monkeypatch.setattr(machine_ledger, "outages", lambda now=None, doc=None: {"box2": {"why": "repair"}})
+    monkeypatch.setattr(machine_ledger, "conditions", lambda: {"box3": {"condition": "unreachable"}})
+    c = _dab_task(p, labels=("needs_device", "resource:box2"))
+    d = _dab_task(p, labels=("needs_device", "resource:box3"))
+    # 4) a high outage event naming the task.
+    e = _dab_task(p)
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,fingerprint,status) VALUES(?,?,?,?,?,?,?)",
+           (p.db.task(e)["created"], "coordinator", "alert", "high", f"box1 is down; task #{e} restores it",
+            "outage:box1", "queued"))
+    for tid in (a, b, c, d, e):
+        assert deviceab.assign(p.db, cfg, p.name, p.db.task(tid), "claude", now=2000.0) is None
+        assert "device_ab_excluded:outage" in p.db.task(tid)["labels"], tid
+    # A normal event naming a task, or a spec only mentioning an outage, is not outage work.
+    f = p.db.add_task("Soak the box", "Run it; the last outage is over.", kind="work", tier="standard",
+                      origin="coordinator", priority=3, labels=["needs_device"])
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,fingerprint,status) VALUES(?,?,?,?,?,?,?)",
+           (p.db.task(f)["created"], "watcher:box", "obs", "normal", f"outage over; #{f} may run", "outage:box1",
+            "queued"))
+    assert deviceab.assign(p.db, cfg, p.name, p.db.task(f), "claude", now=2000.0)
+    assert deviceab.report(p.db.q, lambda k: p.db.kv(k, ""), cfg)["excluded"] == {"outage": 5}
+
+
+def test_device_ab_test_arm_is_sonnet_for_sorted_default_arms_or_the_named_one(env):
+    from ttp import deviceab
+    arms = {"opus": {"model": "opus", "effort": "high"}, "sonnet": {"model": "sonnet", "effort": "high"}}
+    s = deviceab.settings({"route": {"device_ab": {"projects": ["x"], "arms": arms}}})
+    assert (s["test"], s["control"]) == ("sonnet", "opus")
+    s2 = deviceab.settings({"route": {"device_ab": {"projects": ["x"], "arms": arms, "test": "opus"}}})
+    assert (s2["test"], s2["control"]) == ("opus", "sonnet")
+    other = {"a": {"model": "m1"}, "b": {"model": "m2"}}
+    assert deviceab.settings({"route": {"device_ab": {"projects": ["x"], "arms": other}}})["test"] == "a"
+
+
+def test_device_ab_start_re_arms_the_window_and_lifts_a_stop(env):
+    from ttp import deviceab
+    p = make(env)
+    cfg = _dab_cfg(p, days=1)
+    s = deviceab.settings(cfg)
+    assert deviceab.start(p.db, s, 1000.0)["ts"] == 1000.0
+    # The same setting keeps its start; a deploy that only adds the defaults does not re-arm it.
+    assert deviceab.start(p.db, deviceab.settings(cfg), 5000.0)["ts"] == 1000.0
+    p.db.set_kv(deviceab.STOP_KV, '{"ts": 1500, "arm": "sonnet", "task": 1}')
+    late = _dab_task(p)
+    assert deviceab.assign(p.db, cfg, p.name, p.db.task(late), "claude", now=1000.0 + 2 * 86400) is None
+    # A new `start` (ISO with offset, or epoch) re-arms: its time is the window's start and the stop is lifted.
+    re = _dab_cfg(p, days=1, start="2026-11-15T10:00:00-08:00")
+    s2 = deviceab.settings(re)
+    assert s2["start"] == 1794765600.0 and s2["sig"] != s["sig"]
+    got = deviceab.start(p.db, s2, 1794766000.0)
+    assert got["ts"] == 1794765600.0 and deviceab.stopped(p.db) == {}
+    p.db.x("UPDATE tasks SET created=? WHERE id=?", (1794765700.0, late))
+    fresh = p.db.task(_dab_task(p))
+    p.db.x("UPDATE tasks SET created=? WHERE id=?", (1794765700.0, fresh["id"]))
+    assert deviceab.assign(p.db, re, p.name, p.db.task(fresh["id"]), "claude", now=1794766000.0)
+    assert deviceab.start_ts(1794765600) == 1794765600.0 and deviceab.start_ts("soon") is None
+
+
+def test_device_ab_share_alarm_fires_when_the_test_arm_gets_under_half_its_share(env):
+    import json
+    from ttp import deviceab, runclass
+    p = make(env)
+    cfg = _dab_cfg(p)
+    now = 5000.0
+    deviceab.start(p.db, deviceab.settings(cfg), 1000.0)
+    for i in range(12):   # an exclusion reason the A/B does not keep out by design: counts against the share
+        p.db.add_task(f"t{i}", "Run it.", kind="work", tier="standard", origin="coordinator", priority=3,
+                      labels=["needs_device", "device_ab_excluded:something_new" if i < 10 else "device_ab:opus"])
+    got = [a for a in runclass.share_alarms(p.db, cfg, now) if a["route"] == "device_ab"]
+    assert got and got[0]["n"] == 12 and "something_new 10" in got[0]["text"]
+    # Pins and outages are kept out by design: no alarm on a normal fill.
+    p.db.x("UPDATE tasks SET labels=? WHERE labels LIKE ?", (json.dumps(["needs_device", "device_ab_excluded:pin"]),
+                                                            "%something_new%"))
+    for i in range(10):
+        p.db.add_task(f"u{i}", "Run it.", kind="work", tier="standard", origin="coordinator", priority=3,
+                      labels=["needs_device", f"device_ab:{'sonnet' if i % 2 else 'opus'}"])
+    assert not [a for a in runclass.share_alarms(p.db, cfg, now) if a["route"] == "device_ab"]
 
 
 def test_device_ab_stops_the_test_arm_on_a_device_incident_with_one_high_alert_and_queues_masked_reviews(env):

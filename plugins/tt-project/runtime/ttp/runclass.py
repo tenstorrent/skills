@@ -52,8 +52,11 @@ few bad tasks never move a kind (the daemon raises one run_class_quality event w
 next hourly recompute brings it back once the difference is no longer significant); else
 "canary": a stable CODE_CANARY share of its tasks (by task id; `route.code_sonnet.share`). Each kind has its
 own state and alarm. Review fixes take this route though route.kept_core keeps them off every other one, except
-a fix after REVIEW_ROUND_MAX failed reviews where the round is known (review_round). Urgent, needs_deep,
-user_deep, pinned (provider, model or effort), tier-up retries, deep, plan and device runs stay on Opus. Off with `route.code_sonnet` false or `route.core_cheap` false;
+a fix after REVIEW_ROUND_MAX failed reviews where the round is known (review_round). Urgent code takes it too
+(no Jev pick or daemon-set effort keeps a run off it); needs_deep, user_deep, untrusted_input, pinned (provider,
+model or effort: the user's pin), tier-up retries, PR fixes, plan and device runs (tierfloor.device_run, not
+device words in the spec) stay on Opus. Each code run's note records the decision (CODE_ROUTE_KEY,
+code_decision). Off with `route.code_sonnet` false or `route.core_cheap` false;
 `route.code_sonnet.kinds` narrows the kinds. Both `route.code_sonnet` and `route.core_cheap` are project and
 account keys (`ttp config <project> route.code_sonnet '{"share": 1.0}'`, `ttp config --account ...`): the
 account's value first, the project's own over it. The shipped share stays CODE_CANARY.
@@ -123,6 +126,16 @@ CODE_CANARY = 0.2
 CODE_FULL_MIN = 30
 CODE_WINDOW_S = 7 * 86400.0
 CODE_STATE_KV = "code_sonnet_state"
+CODE_ROUTE_KEY = "code_route"    # a code run's note: {"to", "why"} (code_decision)
+# Why a code run stays on Opus (code_route): the stats and the share alarm count these.
+CODE_STAY = ("tier", "device_run", "route_off", "kind_off", "user_pin", "review_round", "pr_fix", "untrusted_input",
+             "deep", "retry", "quality_hold", "canary_share", "provider", "core_provider", "device_ab")
+# Stays the route keeps by design (the user's pin, untrusted text, device runs, late review rounds, PR fixes, the
+# device A/B): the share alarm leaves them out of its base, so it counts only runs the route should have taken.
+CODE_KEEP = ("user_pin", "untrusted_input", "device_run", "device_ab", "review_round", "pr_fix")
+SHARE_MIN = 10                     # the share alarm needs this many runs in its window
+SHARE_WINDOW_S = 86400.0
+SHARE_KV = "route_share_alarm"     # {route: ts of its last event}: one event per route per day
 GUARD_KV = "code_sonnet_guard"        # the guard's trip: {"ts", "setting", "row"}; holds every code kind on Opus
 GUARD_DAYS_KV = "code_sonnet_guard_days"   # the guard's daily rows, newest last (GUARD_KEEP of them)
 GUARD_PTS = 5.0                       # `route.code_sonnet.guard_pts`: the review-fail rise in points that trips it
@@ -289,11 +302,13 @@ def core_cheap(cfg: dict, task: dict | None, cls: str, tier: str, provider: str,
 
 def code_kind(task: dict | None, cfg: dict | None = None) -> str:
     """A standard-tier code task's kind for the Sonnet route: "review_fix", "continue" or "new"; "" for
-    anything else (other kinds, other tiers, device work)."""
+    anything else (other kinds, other tiers, device work). Device work is a device run (tierfloor.device_run:
+    a needs_device label, a device lock or machine in its resources), never device words in its spec: code
+    specs name devices in passing ("no device jobs", restated rules, the code under change)."""
     if not task or task.get("kind") != "code" or str(task.get("tier") or "standard") != "standard":
         return ""
     from . import tierfloor
-    if tierfloor.device_run(task, cfg) or tierfloor.DEVICE_SPEC.search(str(task.get("spec") or "")):
+    if tierfloor.device_run(task, cfg):
         return ""
     labels = _labels(task)
     if any(lb.startswith("review_fix") for lb in labels):
@@ -334,23 +349,77 @@ def canary(task_id, share: float) -> bool:
 def code_sonnet(cfg: dict, task: dict | None, picked: dict | None = None, state: dict | None = None) -> dict | None:
     """The cheap note for a code run that takes CODE_MODEL, else None (Opus): see the module docstring.
     `state`: {kind: "full" | "canary" | "off"} (the daemon's CODE_STATE_KV; a kind missing is canary)."""
+    return code_route(cfg, task, picked, state)[0]
+
+
+def code_route(cfg: dict, task: dict | None, picked: dict | None = None,
+               state: dict | None = None) -> tuple[dict | None, str]:
+    """(the cheap note, "") for a code run that takes CODE_MODEL, else (None, why it stays on Opus: a
+    CODE_STAY reason). Urgency never keeps code on Opus (user-ordered urgent code runs on Sonnet too); only
+    a user's pin (the task's provider, model or effort), outside input, deep asks, tier-up retries, late
+    review rounds, PR fixes, device runs and the quality state do. An effort the daemon or Jev picks for the
+    run (`picked`) is never a pin."""
+    task = task or {}
+    if task.get("kind") != "code":
+        return None, "not_code"
+    if str(task.get("tier") or "standard") != "standard":
+        return None, "tier"
     kind = code_kind(task, cfg)
+    if not kind:
+        return None, "device_run"
     on = code_settings(cfg)
-    if not on or kind not in on["kinds"] or str((task or {}).get("effort") or ""):
-        return None
+    if not on:
+        return None, "route_off"
+    if kind not in on["kinds"]:
+        return None, "kind_off"
+    if any(str(task.get(k) or "") for k in ("provider", "model", "effort")):
+        return None, "user_pin"
     if kind == "review_fix":   # its review_fix label keeps it off other routes, not this one
-        if review_round(task) >= REVIEW_ROUND_MAX or any(lb.startswith("pr_fix:") for lb in _labels(task)):
-            return None   # a late round stays on Opus; so does a PR fix, which reads PR comments
+        if review_round(task) >= REVIEW_ROUND_MAX:
+            return None, "review_round"   # a late round stays on Opus
+        if any(lb.startswith("pr_fix:") for lb in _labels(task)):
+            return None, "pr_fix"   # a PR fix reads PR comments
         # the daemon made it from a review of this project's own diff, which untrusted() trusts; an
         # untrusted_input label the fixed work passed on still keeps it on Opus
         task = {**task, "origin": "review", "labels": [lb for lb in _labels(task) if not lb.startswith("review_fix")]}
-    if not routable(task, {"pick": picked or {}, KEY: "hard"}):   # urgent work stays on Opus
-        return None
+    from . import effort
+    from .route import _has
+    if _has(_labels(task), ("untrusted_input",)) or untrusted(task):
+        return None, "untrusted_input"
+    if _has(_labels(task), ("needs_deep", "user_deep")) or effort.wants_deep(task.get("result")):
+        return None, "deep"
+    if (picked or {}).get("by") == "retry":
+        return None, "retry"
     mode = (state or {}).get(kind) or "canary"
-    if mode == "off" or (mode != "full" and not canary(task.get("id"), on["share"])):
+    if mode == "off":
+        return None, "quality_hold"
+    if mode != "full" and not canary(task.get("id"), on["share"]):
+        return None, "canary_share"
+    return ({"provider": CHEAP_PROVIDER, **CODE_MODEL, "class": "hard", CODE_KEY: kind,
+             "why": f"code {kind} on Sonnet ({'within quality of Opus' if mode == 'full' else 'canary'})"}, "")
+
+
+def code_decision(cfg: dict, task: dict | None, cls: str, tier: str, provider: str, picked: dict | None = None,
+                  state: dict | None = None, cheap: dict | None = None, device_ab: dict | None = None) -> dict | None:
+    """What a code-kind worker run's note records under CODE_ROUTE_KEY: {"to": "sonnet"} when it takes
+    CODE_MODEL, else {"to": "opus" (or the provider it runs on), "why": a CODE_STAY reason}; None for a run of
+    another kind. `cheap` is the cheap note the daemon set (core_cheap), `device_ab` the device A/B arm."""
+    if not task or task.get("kind") != "code":
         return None
-    return {"provider": CHEAP_PROVIDER, **CODE_MODEL, "class": "hard", CODE_KEY: kind,
-            "why": f"code {kind} on Sonnet ({'within quality of Opus' if mode == 'full' else 'canary'})"}
+    if device_ab:
+        return {"to": str((cheap or {}).get("model") or "opus"), "why": "device_ab"}
+    if cheap and cheap.get(CODE_KEY):
+        return {"to": "sonnet", "kind": cheap[CODE_KEY]}
+    if provider != CHEAP_PROVIDER:
+        return {"to": provider, "why": "provider"}
+    if cls != "hard":
+        return {"to": "opus" if not cheap else str(cheap.get("model") or "opus"), "why": f"run_class:{cls}"}
+    if tier != "standard" and str(task.get("tier") or "standard") == "standard":
+        return {"to": "opus", "why": "tier"}
+    why = code_route(cfg, task, picked, state)[1]
+    if why == "" and (cfg.get("core_provider") or "claude") != CHEAP_PROVIDER:
+        why = "core_provider"
+    return {"to": "opus", "why": why or "unknown"}
 
 
 def cheap_run(note: dict | None, provider: str) -> dict | None:
@@ -696,6 +765,76 @@ def guard_report_text(s: dict, name: str, tz=None) -> str:
     if not s["rows"]:
         out.append("  no daily rows yet")
     return "\n".join(out)
+
+
+def code_routes(db, since: float, until: float | None = None) -> dict:
+    """Code worker runs in [since, until) per model and per code-route decision (the run note's CODE_ROUTE_KEY;
+    "unrecorded" for runs from before it): {"runs", "models": {model: n}, "sonnet", "why": {why: n}, "base"
+    (runs with a recorded decision the route should take: all but CODE_KEEP), "base_sonnet"}."""
+    until = time.time() if until is None else until
+    out: dict = {"runs": 0, "models": {}, "sonnet": 0, "why": {}, "base": 0, "base_sonnet": 0}
+    for r in db.q("SELECT r.model, r.note FROM runs r JOIN tasks t ON t.id=r.task WHERE r.role='worker' AND "
+                  "t.kind='code' AND r.started>=? AND r.started<?", (since, until)):
+        note = _note(r)
+        cr = note.get(CODE_ROUTE_KEY)
+        cr = cr if isinstance(cr, dict) else {}
+        c = note.get(CHEAP_KEY)
+        model = str(r.get("model") or "?")
+        on = cr.get("to") == "sonnet" or (not cr and isinstance(c, dict) and bool(c.get(CODE_KEY)))
+        why = "sonnet" if on else str(cr.get("why") or "unrecorded")
+        out["runs"] += 1
+        out["models"][model] = out["models"].get(model, 0) + 1
+        out["sonnet"] += on
+        out["why"][why] = out["why"].get(why, 0) + 1
+        if why not in (*CODE_KEEP, "unrecorded"):   # a run from before the decision was recorded never counts
+            out["base"] += 1
+            out["base_sonnet"] += on
+    return out
+
+
+def code_routes_text(s: dict, name: str = "", hours: float = 24) -> str:
+    out = [f"{name + ': ' if name else ''}code worker runs, last {hours:g} h: {s['runs']}, "
+           f"{s['sonnet']} on the Sonnet code route"]
+    out.append("  per model: " + (", ".join(f"{k} {v}" for k, v in sorted(s["models"].items())) or "none"))
+    out.append("  per decision: " + (", ".join(f"{k} {v}" for k, v in sorted(
+        s["why"].items(), key=lambda kv: -kv[1])) or "none"))
+    out.append(f"  the route should take {s['base']} of them (all recorded but {', '.join(CODE_KEEP)}); "
+               f"it took {s['base_sonnet']}")
+    return "\n".join(out)
+
+
+def top_reasons(why: dict, skip: tuple = (), n: int = 3) -> str:
+    got = sorted(((k, v) for k, v in why.items() if k not in skip), key=lambda kv: (-kv[1], kv[0]))[:n]
+    return ", ".join(f"{k} {v}" for k, v in got) or "none recorded"
+
+
+def share_alarms(db, cfg: dict, now: float | None = None) -> list[dict]:
+    """Model-free: each configured route (the code route, route.code_sonnet; the device A/B, route.device_ab)
+    that took under half its configured share of at least SHARE_MIN runs or tasks in the last SHARE_WINDOW_S:
+    [{"route", "share", "got", "n", "text"}], naming the top reasons it was not taken."""
+    now = time.time() if now is None else now
+    out = []
+    cs = code_settings(cfg)
+    if cs and cs["share"] > 0:
+        s = code_routes(db, now - SHARE_WINDOW_S, now)
+        n = s["base"]
+        if n >= SHARE_MIN and s["base_sonnet"] / n < cs["share"] / 2:
+            got = s["base_sonnet"] / n
+            out.append({"route": "code_sonnet", "share": cs["share"], "got": round(got, 3), "n": n, "text": (
+                f"The Sonnet code route took {s['base_sonnet']} of {n} code runs it should take in the last "
+                f"{SHARE_WINDOW_S / 3600:g} h ({got:.0%}; configured share {cs['share']:.0%}). Top reasons: "
+                f"{top_reasons(s['why'], ('sonnet', *CODE_KEEP))}. Details: ttp stats --code-routes.")})
+    try:
+        from . import deviceab
+        d = deviceab.share_check(db, cfg, now)
+    except Exception:   # an unreadable A/B never stops the code route's check
+        d = None
+    if d and d["n"] >= SHARE_MIN and d["got"] < d["share"] / 2:
+        out.append({"route": "device_ab", **d, "text": (
+            f"The device A/B flipped {d['test_n']} of {d['n']} device tasks to its test arm ({d['test']}) since "
+            f"it started ({d['got']:.0%}; configured share {d['share']:.0%}). Top reasons: "
+            f"{top_reasons(d['why'])}. Details: ttp stats --device-ab.")})
+    return out
 
 
 def decider(decision) -> str:
