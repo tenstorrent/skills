@@ -8767,7 +8767,7 @@ class Daemon:
                 reply_text = text
             else:
                 chatdigest.handoff(db, self.cfg, task, new, msgparts.cut(
-                    text, f"task #{task['id']}'s hand-off (`ttp task {self.p.name} show {task['id']}`)"))
+                    text, f"task #{task['id']}'s hand-off (`ttp task {self.p.name} show {task['id']}`)"), p=self.p)
         sev = "high" if new == "blocked" else "normal"
         fups = result.get("followups") if isinstance(result, dict) else None
         fups = [f for f in fups if isinstance(f, dict) and f.get("title")] if isinstance(fups, list) else []
@@ -20986,7 +20986,7 @@ class Daemon:
         from . import chatdigest
         if not ahead:
             chatdigest.handoff(db, self.cfg, task, "done", msgparts.cut(
-                text, f"task #{task['id']}'s hand-off (`ttp task {self.p.name} show {task['id']}`)"))
+                text, f"task #{task['id']}'s hand-off (`ttp task {self.p.name} show {task['id']}`)"), p=self.p)
             return
         row = db.task(task["id"]) or task
         stored = load_result(row.get("result"))

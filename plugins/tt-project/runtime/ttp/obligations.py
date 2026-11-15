@@ -1241,9 +1241,10 @@ _DELIVER = (r"(?:report|deliver|share|confirm|follow up|come back|get back|circl
             r"update you|ping you|reply|write (?:it |this |that )?up|send (?:you|it over|back|an update|word)|"
             r"post (?:it|them|an update|updates|the results?|back|here)|have (?:it|them|the|a|an|your|that|this)\b"
             r"[^.;!?]{0,80}?\bready)\b")
-# "I'll post each result here", "we'll open a PR": a send verb, a few words, then the object it delivers
-_SEND = (r"(?:post|send|open|share)\s+(?:[\w'’/#()-]+\s+){0,6}?"
-         r"(?:here|results?|table|PR|pull request|numbers|link)\b")
+# "I'll post each result here", "we'll open a PR", "I'll post its column and how often it agrees with X
+# here", "I will post the finished rows": a send verb, a few words, then the object it delivers
+_SEND = (r"(?:post|send|open|share)\s+(?:[\w'’/#()-]+\s+){0,10}?"
+         r"(?:here|results?|tables?|columns?|rows?|PR|pull request|numbers|figures|scores|findings|link)\b")
 # "... and it goes up as the draft PR": a delivery the sender owns, told in the third person (not "if it goes up")
 _GOES_UP = (r"(?<!\bif\s)(?<!\bwhen\s)(?<!\bwhether\s)(?<!\bunless\s)"
             r"\b(?:it|the fix|the change)\s+goes\s+up\s+as\s+(?:a|the)\s+(?:draft\s+)?(?:PR|pull request)\b")
@@ -1426,7 +1427,7 @@ def _named_owner(db, chat: str, text: str) -> int | None:
 
 def record_promises(p, sent: list[tuple[int, str | None, str]], tasks: dict[int, str | None],
                     obligations: list[str] = (), now: float | None = None, explicit=(),
-                    plans: dict[str, str] | None = None) -> list[str]:
+                    plans: dict[str, str] | None = None, by_task: int | None = None) -> list[str]:
     """Record the commitments in this batch's sent messages (message id, chat, text). `tasks`: the batch's
     tasks by id with their reply_chat; one replying to a promise's chat owns it, unless it was cancelled or
     the promise's words name others of them (#id): those own it. Only the sender's own words count (authored:
@@ -1436,7 +1437,8 @@ def record_promises(p, sent: list[tuple[int, str | None, str]], tasks: dict[int,
     any other promise no batch task owns is attached to the one open task its text names in that chat
     (_named_owner). Every promise is recorded. `plans`: {obligation id: plan change} of this batch
     (replan.batch_plans); a new time for a promise past its due with none is flagged (replan.flag_reply).
-    Returns a note per promise."""
+    `by_task`: the task whose posted done hand-off made them (chatdigest.handoff), kept as the promise's
+    `by_task` so a later task replying there adopts it (adopt). Returns a note per promise."""
     now = time.time() if now is None else now
     sent = [(mid, chat, authored(text)) for mid, chat, text in sent]
     found = [(mid, _chat(chat), said) for mid, chat, text in sent if (said := commitments(text))]
@@ -1494,7 +1496,7 @@ def record_promises(p, sent: list[tuple[int, str | None, str]], tasks: dict[int,
                                 "receipt": None, "dropped": None, "episode": 0, "raised": None, "covered": [],
                                 "promise": {"chat": chat, "message": mid, "due": due if due else now + hours * 3600,
                                             "timed": due is not None, "tasks": owners, "obligations": links,
-                                            "raised": None}}
+                                            "raised": None, **({"by_task": int(by_task)} if by_task else {})}}
             if named is not None:
                 _auto_attach(p, st["items"][oid], named, mid, now)
             notes.append(f"promise {oid} recorded from message #{mid}: due {timefmt.long(st['items'][oid]['promise']['due'], p)}"
@@ -1502,6 +1504,43 @@ def record_promises(p, sent: list[tuple[int, str | None, str]], tasks: dict[int,
                          + (f" (attached: the reply names it and it replies to chat {chat})" if named is not None else "")
                          + (f", linked to {', '.join(links)}" if links else ""))
         p.db.set_kv(KV, st)
+    return notes
+
+
+def adopt(p, tasks: dict[int, str | None], now: float | None = None) -> list[str]:
+    """Give each open promise a done hand-off posted in a chat (`by_task`: "I will post the finished rows")
+    that no open task owns to the tasks this batch added replying to that chat (`tasks`: id -> reply_chat),
+    so their result is owed there and posts whole (chatdigest.owed). The coordinator's own promises keep
+    the owners its batch gave them. Returns a note per promise adopted."""
+    now = time.time() if now is None else now
+    chats = {}
+    for t, c in tasks.items():
+        if c is not None:
+            chats.setdefault(_chat(c), []).append(int(t))
+    if not chats:
+        return []
+    ids = sorted({t for ts in chats.values() for t in ts})
+    live = {r["id"] for r in p.db.q(f"SELECT id FROM tasks WHERE status NOT IN ({','.join('?' * len(CLOSED))}) "
+                                    f"AND id IN ({','.join('?' * len(ids))})", [*CLOSED, *ids])}
+    notes = []
+    with p.db.tx():
+        st = _load(p.db)
+        for o in st["items"].values():
+            pr = o.get("promise")
+            if (not pr or not _open(o) or not pr.get("by_task") or pr.get("order") is not None or pr.get("claim")
+                    or not (mine := [t for t in chats.get(pr["chat"], []) if t in live])):
+                continue
+            had = [int(t) for t in pr["tasks"]] + [int(t) for t in o["owners"]]
+            if had and p.db.one(f"SELECT 1 FROM tasks WHERE status NOT IN ({','.join('?' * len(CLOSED))}) AND id IN "
+                                f"({','.join('?' * len(had))}) LIMIT 1", [*CLOSED, *had]):
+                continue
+            pr["tasks"] = sorted(set(pr["tasks"]) | set(mine))
+            o.setdefault("history", []).append({"at": now, "event": "adopted", "tasks": mine,
+                                                "why": f"no open task owned it; they reply to chat {pr['chat']}"})
+            notes.append(f"promise {o['id']} in chat {pr['chat']}: owned by #{', #'.join(map(str, mine))}, "
+                         f"new tasks replying there (no open task owned it)")
+        if notes:
+            p.db.set_kv(KV, st)
     return notes
 
 

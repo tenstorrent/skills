@@ -4467,6 +4467,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
         notes += obligations.record_promises(p, sent, batch_tasks, batch_obls, explicit=explicit, plans=plans)
     except Exception as e:
         notes.append(f"promise not recorded: {type(e).__name__}: {str(e)[:200]}")
+    try:   # a promise no open task owns goes to the tasks this batch added replying to its chat
+        added = set(new_tasks.values())
+        notes += obligations.adopt(p, {t: c for t, c in batch_tasks.items() if t in added})
+    except Exception as e:
+        notes.append(f"promise not adopted: {type(e).__name__}: {str(e)[:200]}")
     try:   # a reply already went out: tracking its claims never undoes or rejects it
         notes += obligations.record_claims(p, claimed, new_tasks)
     except Exception as e:

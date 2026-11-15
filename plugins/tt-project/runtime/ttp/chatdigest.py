@@ -26,8 +26,10 @@ message delivers only what the reply's own `delivers` named (obligations.deliver
 user's. `coordinator.chat_dedupe` false turns the twin check off.
 
 Daemon hand-offs (handoff): a finished task's hand-off or shipped notice to its reply chat goes at once only
-when it delivers an open obligation the task owns in that chat (owed), or reports a failure or block the user
-must act on (needs_user). Any other is held as one short line per task (why HANDOFF) and folded into the
+when it delivers an obligation the task owns in that chat (owed: open, or closed by this task's own receipt),
+or reports a failure or block the user must act on (needs_user). A done hand-off posted at once that commits
+to more ("I will post the finished rows") records that promise in its chat (obligations.record_promises), and a
+reply_chat task the coordinator adds there later owns it (obligations.adopt), so its result posts whole too. Any other is held as one short line per task (why HANDOFF) and folded into the
 chat's next status post under its status gap: the hourly table folds the main chat's lines (hourly.post) and
 status_flush posts the rest; the digest's own flush keeps the same gap. With the digest off, each goes at once.
 Every daemon path that posts kind info or reply to a chat goes through status_wait, hold or checked (a guard
@@ -336,13 +338,16 @@ def flush(p, cfg: dict | None, now: float | None = None) -> list[int]:
 
 
 def owed(db, tid: int, chat: str | None) -> list[str]:
-    """The open obligations task `tid` owns that are owed in `chat`: an order or promise made there (or to
-    every chat), or a plain obligation, which names no chat."""
+    """The obligations task `tid` owns that are owed in `chat`: an order or promise made there (or to every
+    chat), or a plain obligation, which names no chat. Open ones, and one this task's own run closed with its
+    receipt: its hand-off is the deliverable."""
     from . import obligations
     here = obligations._chat(chat)
     out = []
     for o in obligations.items(db):
-        if not obligations._open(o) or int(tid) not in obligations._owner_ids(o):
+        if o.get("dropped") or int(tid) not in obligations._owner_ids(o):
+            continue
+        if not obligations._open(o) and (o.get("receipt") or {}).get("task") != int(tid):
             continue
         where = (o.get("promise") or {}).get("chat")
         if where is None or here == "all" or obligations._chat(where) in ("all", here):
@@ -358,10 +363,11 @@ def _line(task: dict, new: str, text: str) -> str:
     return f"#{task['id']} {' '.join(str(task.get('title') or '').split())[:60]}: {new}" + (f": {first}" if first else "")
 
 
-def handoff(db, cfg: dict | None, task: dict, new: str, text: str, now: float | None = None) -> list[int]:
+def handoff(db, cfg: dict | None, task: dict, new: str, text: str, now: float | None = None, p=None) -> list[int]:
     """Post the daemon's hand-off `text` of `task` (ended `new`) to its reply chat at once when the user needs
     it now (owed, needs_user) or the chat has no status gap; else hold one short line of it for the chat's
-    next status post (module doc). The message ids posted ([] when held). Any fault posts it at once."""
+    next status post (module doc). The message ids posted ([] when held). Any fault posts it at once. With the
+    project `p`, a done hand-off posted at once records the promises its text makes in the chat."""
     from . import msgparts
     chat = None if task.get("reply_chat") in (None, "", "all") else task["reply_chat"]
     try:
@@ -375,7 +381,14 @@ def handoff(db, cfg: dict | None, task: dict, new: str, text: str, now: float | 
             return []
     except Exception:   # a hand-off is never lost to this filter
         pass
-    return msgparts.post(db, text, chat=chat, kind="reply", severity="normal")
+    ids = msgparts.post(db, text, chat=chat, kind="reply", severity="normal")
+    if p is not None and new == "done" and ids:
+        from . import obligations
+        try:   # the user read it, so what it promises is owed there; recording it never undoes the post
+            obligations.record_promises(p, [(ids[0], chat, text)], {}, now=now, by_task=int(task["id"]))
+        except Exception:
+            pass
+    return ids
 
 
 def take_handoffs(db, chat: str | None) -> list[str]:

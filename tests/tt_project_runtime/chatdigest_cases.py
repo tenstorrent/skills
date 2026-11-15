@@ -423,3 +423,131 @@ def test_every_daemon_chat_post_of_kind_info_or_reply_keeps_the_chat_pace():
                     bad.append(f"{f.name}:{call.lineno} in {fn.name}")
     assert found, "the scan found no posting call: the guard is broken"
     assert not bad, f"chat posts that skip the chat's status pace: {bad}"
+
+
+# #8657: a reply_chat task whose result the coordinator promised in its chat, or that owns the user's order
+# there, finished done (normally and model-free through its on_pass_cmd) and was held as one status line.
+_CD_TABLE = "| model | passed |\n|---|---|\n| GLM-5.3 | 9/12 |\n| Opus 5.5 | 11/12 |"
+_CD_PROMISE = ("That pass is queued now. I'll post its column and how often it agrees with Opus here when it "
+               "finishes.")
+
+
+def _cd_promised_task(p, chat="c1"):
+    """The coordinator's batch: a reply promising the result in `chat`, and the task that makes it."""
+    from ttp import coordinator as coord
+    coord.apply(p, [{"type": "reply", "chat": chat, "text": _CD_PROMISE},
+                    {"type": "task_add", "title": "score the open model's column", "spec": "score it", "kind": "work",
+                     "tier": "light", "priority": 2, "reply_chat": chat}], turn=1)
+    return p.db.one("SELECT id FROM tasks WHERE reply_chat=? ORDER BY id DESC LIMIT 1", (chat,))["id"]
+
+
+def test_the_promise_detector_reads_the_column_and_rows_promises():
+    from ttp import obligations
+    assert obligations.commitments(_CD_PROMISE)
+    assert obligations.commitments("The host is slow, so I will post the finished rows when they end.")
+    assert not obligations.commitments("I will tighten the filter next.")
+    assert not obligations.commitments("If you want, I'll post the rows.")
+
+
+def test_a_promised_result_posts_whole_at_once_from_a_normal_finish(env, monkeypatch):
+    from ttp import chatdigest
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage as Usage
+    monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
+    p = make(env)
+    tid = _cd_promised_task(p)
+    chatdigest.mark_status(p.db, "c1", time.time() - 60)   # inside the chat's status gap
+    p.db.update_task(tid, status="running")
+    run_dir = env["tmp"] / f"run-cd-{tid}"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps({"status": "done", "summary": "scored", "message": _CD_TABLE}))
+    d = Daemon(p.base)
+    with d.p.db.tx():
+        d._finish_worker({"task": tid}, Usage(cost_usd=0.1), "ok", run_dir)
+    assert p.db.task(tid)["status"] == "done"
+    assert _cd_out(p)[-1] == _CD_TABLE, _cd_out(p)
+    assert not (p.db.kv(chatdigest.KV) or {}).get("held", {}).get("c1")
+
+
+def test_a_promised_result_posts_whole_at_once_from_a_model_free_on_pass_finish(env, monkeypatch):
+    from ttp import chatdigest
+    from ttp.daemon import Daemon
+    monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
+    p = make(env)
+    _sessions(env, monkeypatch, "s1")
+    tid = _cd_promised_task(p)
+    d = Daemon(p.base)
+    cmd = ("""printf '%s' '""" + json.dumps({"status": "done", "summary": "scored", "message": _CD_TABLE})
+           + """' > "$TTP_RESULT\"""")
+    monkeypatch.setenv("TTP_FAKE_SESSION", "s1")
+    monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps({
+        "status": "waiting", "summary": "scoring runs", "waiting_for": "its job", "retry_when": "true",
+        "retry_after_s": 600, "on_pass_cmd": cmd}))
+    d.dispatch()
+    _finish_runs(p, d)
+    assert p.db.task(tid)["status"] == "queued", dict(p.db.task(tid))
+    chatdigest.mark_status(p.db, "c1", time.time() - 60)
+    assert d._start_on_pass(p.db.task(tid), time.time()) is True
+    assert _until_true(lambda: d._poll_on_pass(time.time()) or tid not in d._on_pass)
+    assert p.db.task(tid)["status"] == "done", dict(p.db.task(tid))
+    assert _cd_out(p)[-1] == _CD_TABLE, _cd_out(p)
+
+
+def test_an_order_owned_by_a_reply_chat_task_posts_its_result_whole(env, monkeypatch):
+    """Owned open, or closed by the task's own receipt before it hands off: either way it posts whole."""
+    from ttp import chatdigest, obligations, pushq
+    monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
+    p = make(env)
+    now = time.time()
+    chatdigest.mark_status(p.db, "c1", now - 60)
+    for receipt in (False, True):
+        mid = p.db.post("in", "post the new table with the same columns", chat="c1")
+        t = _cd_task(p, "the new table", chat="c1")
+        oid = obligations.add_order(p, "post the new table", mid, [t["id"]], due=now + 7200,
+                                    action_class="change", now=now).split()[1]
+        if receipt:   # the run's own `ttp obligation receipt` as a required owner
+            obligations.attach(p, oid, [t["id"]], now=now)
+            obligations.record(p, oid, "receipt", "table in the hand-off", t["id"], now=now + 1)
+            assert not obligations._open(obligations.get(p.db, oid))
+        pushq._reply(p.db, t, "done", _CD_TABLE + f" ({receipt})")
+        assert _cd_out(p)[-1] == _CD_TABLE + f" ({receipt})", _cd_out(p)
+
+
+def test_a_promise_in_a_posted_hand_off_goes_to_the_next_task_replying_there(env, monkeypatch):
+    """#8608 posted 'I will post the finished rows when they end.'; #8639, added later to finish them,
+    owned nothing, so its table was held. The posted promise is recorded and the new task owns it."""
+    from ttp import chatdigest, coordinator as coord, obligations
+    monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
+    p = make(env)
+    first = _cd_task(p, "the reference rows", chat="c1")
+    mid = p.db.post("in", "post the new table with the same columns", chat="c1")
+    obligations.add_order(p, "post the new table", mid, [first["id"]], due=time.time() + 7200, action_class="change")
+    posted = chatdigest.handoff(p.db, p.config(), first, "done",
+                                "Rows so far. The open models are slow; I will post the finished rows when they end.",
+                                p=p)
+    assert posted
+    owed = [o for o in obligations.items(p.db) if obligations._open(o) and (o.get("promise") or {}).get("chat") == "c1"
+            and (o.get("promise") or {}).get("order") is None]
+    assert owed and not owed[0]["promise"]["tasks"]
+    coord.apply(p, [{"type": "task_add", "title": "finish the open-model rows", "spec": "finish them",
+                     "kind": "work", "tier": "light", "priority": 2, "reply_chat": "c1"}], turn=2)
+    tid = p.db.one("SELECT id FROM tasks WHERE reply_chat='c1' ORDER BY id DESC LIMIT 1")["id"]
+    assert chatdigest.owed(p.db, tid, "c1") == [owed[0]["id"]]
+    chatdigest.mark_status(p.db, "c1", time.time() - 60)
+    assert chatdigest.handoff(p.db, p.config(), dict(p.db.task(tid)), "done", _CD_TABLE)
+    assert _cd_out(p)[-1] == _CD_TABLE
+
+
+def test_a_reply_chat_hand_off_owing_nothing_is_still_one_held_line(env, monkeypatch):
+    from ttp import chatdigest, coordinator as coord, pushq
+    monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
+    p = make(env)
+    coord.apply(p, [{"type": "reply", "chat": "c1", "text": "Queued for a worker."},
+                    {"type": "task_add", "title": "tidy the docs", "spec": "tidy", "kind": "work", "tier": "light",
+                     "priority": 3, "reply_chat": "c1"}], turn=1)
+    t = dict(p.db.one("SELECT * FROM tasks WHERE reply_chat='c1' ORDER BY id DESC LIMIT 1"))
+    chatdigest.mark_status(p.db, "c1", time.time() - 60)
+    before = _cd_out(p)
+    pushq._reply(p.db, t, "done", "Docs tidied. Two pages merged.")
+    assert _cd_out(p) == before
+    assert [i["task"] for i in p.db.kv(chatdigest.KV)["held"]["c1"] if i["why"] == chatdigest.HANDOFF] == [t["id"]]
