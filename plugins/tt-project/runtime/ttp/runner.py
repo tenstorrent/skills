@@ -634,6 +634,8 @@ def supervise(run_dir: Path) -> int:
             # The chat provider's loopback bridge: a thread of this process, so it ends with the run
             # however the run ends. The agent gets its URL and a per-run token, never the endpoint's key.
             from .chatbridge import Bridge, BridgeError
+            if spec["bridge"].get("kind") == "claude-cli":   # a bench arm's Claude models: the logged-in CLI
+                from .claudebridge import ClaudeCliBridge as Bridge
             try:
                 bridge = Bridge.from_settings(spec["bridge"]).start()
             except (BridgeError, ValueError, OSError) as e:
@@ -777,7 +779,8 @@ def supervise(run_dir: Path) -> int:
             if budget is not None and now - st["budget"] >= BUDGET_EVERY_S:
                 st["budget"] = now
                 try:
-                    so_far = prov.cost_so_far(out_path, since=started, env=env)
+                    so_far = (bridge.cost_so_far() if hasattr(bridge, "cost_so_far")   # claudebridge: the CLI's own figures
+                              else prov.cost_so_far(out_path, since=started, env=env))
                 except Exception:
                     so_far = None
                 if so_far is not None and so_far > float(budget):

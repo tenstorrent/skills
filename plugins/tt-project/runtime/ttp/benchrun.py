@@ -138,6 +138,10 @@ HARNESSES = {"opencode": {"npm": "opencode-ai", "bin": "node_modules/.bin/openco
 HARNESS_DIR = Path.home() / ".tt-project" / "model-bench" / "harness"
 # How an arm's effort reaches the model in each harness: the bridge sets the chat provider's effort fields
 # (providers.chat effort_fields) on every call, over whatever the harness itself sends.
+# Providers a harness arm may use: the chat provider's endpoint for every harness, and the logged-in Claude
+# CLI for mini-swe-agent (claudebridge: the CLI in print mode as the model, never an API key).
+HARNESS_PROVIDERS = {"mini-swe-agent": ("chat", "claude")}
+CLAUDE_EFFORT_NOTE = "no effort flag; the bridge passes --effort to the claude CLI on each call"
 EFFORT_NOTE = {"claude": "Claude Code's effort; the bridge sets the chat provider's effort fields",
                "opencode": "no --variant; the bridge sets the chat provider's effort fields on each call",
                "mini-swe-agent": "no effort flag; the bridge sets the chat provider's effort fields on each call"}
@@ -147,8 +151,9 @@ def check_harness(name: str, arm: dict) -> None:
     kind = arm.get("harness") or "claude"
     if kind != "claude" and kind not in HARNESSES:
         raise BenchError(f"arm {name}: harness {kind!r} is not one of claude, {', '.join(HARNESSES)}")
-    if kind != "claude" and arm.get("provider") != "chat":
-        raise BenchError(f"arm {name}: the {kind} harness runs on the chat provider only")
+    if kind != "claude" and arm.get("provider") not in HARNESS_PROVIDERS.get(kind, ("chat",)):
+        raise BenchError(f"arm {name}: the {kind} harness runs on the {' or '.join(HARNESS_PROVIDERS.get(kind, ('chat',)))} "
+                         "provider only")
 
 
 def latest_version(kind: str) -> str:
@@ -818,7 +823,7 @@ def launch(run: Path, ws: Path, prompt: str, arm: dict, opts: dict, cfg: dict, h
     provider = "fake" if opts.get("dry_run") else arm["provider"]
     prices = (cfg.get("pricing") or {}).get(provider) or {}
     prov = get_provider(provider).use(arm["model"], prices, billing.declared(cfg, provider))
-    inst = arm.get("harness_install") if provider == "chat" else None
+    inst = arm.get("harness_install") if provider in ("chat", "claude") else None
     if inst:   # a harness arm: its own agent on the bridge's OpenAI-compatible relay (harness_files)
         argv, penv = harness_files(run, arm, inst), {}
     else:
@@ -834,11 +839,17 @@ def launch(run: Path, ws: Path, prompt: str, arm: dict, opts: dict, cfg: dict, h
         added, unset = cell_agent_env({**penv, **extra}, cell_env, run, cell, hidden)
         penv, extra = {}, added
         argv = _in_cell(argv, cell, unset)
-    spec = {"argv": argv, "env": {**penv, **extra, "TTP_RUN_DIR": str(run)}, "cwd": str(ws), "provider": provider,
+    # A harness arm's agent is not the provider's CLI: the runner treats it as the chat provider's (its output is
+    # not a Claude stream), whichever model the bridge calls.
+    spec = {"argv": argv, "env": {**penv, **extra, "TTP_RUN_DIR": str(run)}, "cwd": str(ws),
+            "provider": "chat" if inst else provider,
             "model": arm["model"], "effort": arm["effort"], "timeout_s": opts["timeout_s"],
             "stall_s": opts["stall_s"], "prices": prices, "default_budget_usd": opts["budget_usd"],
-            "budget_usd": None if prov.caps_budget else opts["budget_usd"], "nice": 0,
-            **({"bridge": chatbridge.settings(cfg, "standard", arm["model"], arm["effort"])}
+            "budget_usd": None if prov.caps_budget and not (inst and provider == "claude") else opts["budget_usd"],
+            "nice": 0,
+            **({"bridge": {"kind": "claude-cli", "model": arm["model"], "effort": arm["effort"],
+                           "budget_usd": opts["budget_usd"]}} if inst and provider == "claude" else
+               {"bridge": chatbridge.settings(cfg, "standard", arm["model"], arm["effort"])}
                if provider == "chat" else {}), **({"openai_env": True} if inst else {})}
     durable_write(run / "run.json", json.dumps(spec, indent=1))
     began = time.time()
@@ -922,6 +933,7 @@ def cell_spend(u, arm: dict, output: Path | None = None) -> dict:
 
 
 HARNESS_BASIS = "estimate: the bridge's token counts"
+CLI_COST_SOURCE = "the claude CLI's total_cost_usd per call, summed by the bridge"
 
 
 def harness_spend(prov, usage: dict) -> dict:
@@ -932,7 +944,12 @@ def harness_spend(prov, usage: dict) -> dict:
     out = {"input_tokens": fin, "output_tokens": fout, "cache_read_tokens": fread,
            "model_calls": int(usage.get("calls") or 0), "cost_estimated": True, "cost_basis": HARNESS_BASIS}
     row = prov.price() if hasattr(prov, "price") else None
-    if row:
+    if "cost_usd" in usage:   # the claude CLI's own per-call cost (claudebridge): reported, not estimated
+        out.update(cache_write_tokens=int(usage.get("cache_write_tokens") or 0), cost_estimated=False,
+                   cost_usd=round(float(usage["cost_usd"] or 0.0), 6))
+        out.pop("cost_basis")
+        out["cost_source"] = CLI_COST_SOURCE
+    elif row:
         pin, pcached, pout = row
         out["cost_usd"] = round((out["input_tokens"] * pin + fread * pcached + fout * pout) / 1e6, 6)
     else:
@@ -1105,7 +1122,7 @@ def resolve_harness(arm: dict, opts: dict) -> dict:
     if not kind or opts.get("dry_run"):
         return arm
     inst = harness_ready(kind, arm.get("harness_version", ""), opts.get("harness_dir"))
-    return {**arm, "harness_version": inst["version"], "harness_install": inst, "effort_mapping": EFFORT_NOTE[kind]}
+    return {**arm, "harness_version": inst["version"], "harness_install": inst, "effort_mapping": CLAUDE_EFFORT_NOTE if arm.get("provider") == "claude" else EFFORT_NOTE[kind]}
 
 
 def run(bench_dir: Path, out: Path, arms: dict, reps: int, seed: int, opts: dict, cfg: dict,
