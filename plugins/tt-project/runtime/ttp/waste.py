@@ -14,7 +14,13 @@ its own runs. Each run that ended in the window counts once, in the first bucket
   over_runs      a task's runs past its `waste.max_runs`th
   costly_wake    the part of a coordinator wake over `waste.wake_usd`
 
-The total is every run's booking in the window; the share is avoidable over total."""
+The total is every run's booking in the window; the share is avoidable over total.
+
+Superseded work a later task kept is still counted there, gross, and also shown apart as retained: a
+cancelled task another task `continues` (its branch, packets or evidence carry on), work re-landed as
+another commit (task_superseded) or a correction class a later fix closed (task_class_fix). Retained
+spend is neither saved nor a loss to fix: the fix bucket is picked on spend less retained. The ledger
+only reads; it never closes a task, an obligation or a promise."""
 from __future__ import annotations
 
 import json
@@ -77,13 +83,18 @@ def _task_sets(db, cfg: dict) -> dict[str, set[int]]:
         "superseded": {i for i, t in tasks.items() if t["status"] == "cancelled"} | gone,
         "failed_task": {i for i, t in tasks.items() if t["status"] == "failed"},
         "done": {i for i, t in tasks.items() if t["status"] == "done"},
-        "duplicate": set(), "rereview": set(), "review_rounds": set()}
+        "duplicate": set(), "rereview": set(), "review_rounds": set(), "retained": set()}
+    kept = {r["task"] for r in db.q("SELECT task FROM task_superseded UNION "
+                                    "SELECT task FROM task_class_fix WHERE fix_task IS NOT NULL OR sha != ''")}
     seen: dict[str, float] = {}
     heads: set[str] = set()
     reviews: dict[int, list[str]] = {}
     for i in sorted(tasks):
         t = tasks[i]
         labels = _labels(t["labels"])
+        prior = _num(labels, "continues:")
+        if prior in out["superseded"] and t["status"] not in ("cancelled", "failed") and i not in gone:
+            kept.add(prior)   # a successor carries its work on
         if t["origin"] != "schedule" and t["kind"] != "review" and _num(labels, "continues:") is None:
             key, at = _norm(t["title"]), float(t["created"] or 0)
             if key and key in seen and at - seen[key] <= DUP_WINDOW_S:
@@ -104,11 +115,13 @@ def _task_sets(db, cfg: dict) -> dict[str, set[int]]:
             depth, cur = depth + 1, reviews[prev]
         if limit and depth > limit:
             out["review_rounds"].add(i)
+    out["retained"] = kept & out["superseded"]
     return out
 
 
 def report(db, since: float, now: float, cfg: dict | None = None) -> dict:
-    """{total, avoidable, share, buckets: {name: {usd, runs, tasks}}} for runs that ended in [since, now)."""
+    """{total, avoidable, retained, share, buckets: {name: {usd, runs, tasks, retained_usd, retained_tasks}}}
+    for runs that ended in [since, now)."""
     cfg = settings(cfg)
     runs = db.q("SELECT id, task, role, started, ended, status, note, cost_usd FROM runs "
                 "WHERE ended IS NOT NULL AND ended >= ? AND ended < ? ORDER BY id", (since, now))
@@ -124,7 +137,7 @@ def report(db, since: float, now: float, cfg: dict | None = None) -> dict:
                       "ORDER BY started, id", part):
             count[r["task"]] = rank[r["id"]] = count.get(r["task"], 0) + 1
     wake = float(cfg.get("wake_usd") or 0)
-    buckets = {b: {"usd": 0.0, "runs": 0, "tasks": {}} for b in BUCKETS}
+    buckets = {b: {"usd": 0.0, "runs": 0, "tasks": {}, "retained_usd": 0.0, "retained_tasks": {}} for b in BUCKETS}
     total = 0.0
     for r in runs:
         cost, task = float(r["cost_usd"] or 0), r["task"]
@@ -155,10 +168,15 @@ def report(db, since: float, now: float, cfg: dict | None = None) -> dict:
             b["runs"] += 1
             if task is not None:
                 b["tasks"][task] = b["tasks"].get(task, 0.0) + usd
+            if got == "superseded" and task in sets["retained"]:
+                b["retained_usd"] += usd
+                b["retained_tasks"][task] = b["retained_tasks"].get(task, 0.0) + usd
     for b in buckets.values():
-        b["tasks"] = [t for t, _ in sorted(b["tasks"].items(), key=lambda x: -x[1])]
+        for k in ("tasks", "retained_tasks"):
+            b[k] = [t for t, _ in sorted(b[k].items(), key=lambda x: -x[1])]
     avoidable = sum(b["usd"] for b in buckets.values())
-    return {"total": total, "avoidable": avoidable, "share": avoidable / total if total else 0.0,
+    return {"total": total, "avoidable": avoidable, "retained": sum(b["retained_usd"] for b in buckets.values()),
+            "share": avoidable / total if total else 0.0,
             "target": float(cfg.get("target_share") or 0), "buckets": buckets}
 
 
@@ -171,7 +189,10 @@ def lines(rep: dict) -> list[str]:
             continue
         share = b["usd"] / rep["total"] if rep["total"] else 0.0
         top = ", ".join(f"#{t}" for t in b["tasks"][:5])
-        out.append(f"{LABELS[name]}: ${b['usd']:.2f} ({share:.0%}), {b['runs']} run(s)" + (f"; {top}" if top else ""))
+        kept = ", ".join(f"#{t}" for t in b["retained_tasks"][:5])
+        out.append(f"{LABELS[name]}: ${b['usd']:.2f} ({share:.0%}), {b['runs']} run(s)" + (f"; {top}" if top else "")
+                   + (f"; ${b['retained_usd']:.2f} of it kept by a successor's work ({kept}), not saved"
+                      if b["retained_usd"] > 0 else ""))
     return out
 
 
@@ -184,6 +205,7 @@ def line(project: str, rep: dict) -> str:
     top = fix_bucket(rep, any_share=True)
     return (f"{project}: avoidable ${rep['avoidable']:.2f} of ${rep['total']:.2f} ({rep['share']:.0%})"
             + (f", most in {LABELS[top]}" if top else "")
+            + (f", ${rep['retained']:.2f} of it kept by successors" if rep.get("retained", 0) > 0 else "")
             + (f"; over the {rep['target']:.0%} target" if over(rep) else ""))
 
 
@@ -191,5 +213,6 @@ def fix_bucket(rep: dict, any_share: bool = False) -> str:
     """The largest bucket, when the avoidable share is over target (or always, with any_share)."""
     if not (any_share or over(rep)):
         return ""
-    best = max(BUCKETS, key=lambda n: rep["buckets"][n]["usd"])
-    return best if rep["buckets"][best]["usd"] > 0 else ""
+    net = {n: rep["buckets"][n]["usd"] - rep["buckets"][n].get("retained_usd", 0.0) for n in BUCKETS}
+    best = max(BUCKETS, key=lambda n: net[n])
+    return best if net[best] > 0 else ""

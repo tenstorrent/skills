@@ -84,6 +84,45 @@ def test_waste_ledger_counts_each_run_once_in_its_first_bucket(env):
     assert rep["buckets"]["over_runs"]["runs"] == 2                  # `many` ran before the move: still its own
 
 
+def test_waste_ledger_keeps_gross_cancelled_spend_and_shows_what_a_successor_kept_apart(env):
+    """[note e12db02988af9727] A cancelled task whose successor `continues` it keeps its full spend in the
+    superseded bucket, and the part the successor kept is shown apart, never as saved; the fix bucket is
+    picked on spend less retained, and the ledger changes no task."""
+    from ttp import waste
+    p = make(env)
+    now = 1_000_000.0
+    old = _waste_task(p, "integration run", status="cancelled")
+    for c in (3.0, 2.5, 2.0):
+        _waste_run(p, old, c, now)
+    _waste_task(p, "integration run, continued", status="running", labels=[f"continues:{old}"])
+    dropped = _waste_task(p, "dropped idea", status="cancelled")
+    _waste_run(p, dropped, 1.0, now)
+    lost = _waste_task(p, "a second try", status="cancelled")
+    _waste_run(p, lost, 0.5, now)
+    _waste_task(p, "a second try, again", status="cancelled", labels=[f"continues:{lost}"])   # gone too: not kept
+    broken = _waste_task(p, "broken idea", status="failed")
+    _waste_run(p, broken, 4.0, now)
+    good = _waste_task(p, "fine work")
+    _waste_run(p, good, 10.0, now)
+    before = p.db.q("SELECT id, status, labels FROM tasks ORDER BY id")
+    rep = waste.report(p.db, now - 86400, now, p.config())
+    b = rep["buckets"]["superseded"]
+    assert round(b["usd"], 2) == 9.0 and b["runs"] == 5                  # gross: nothing dropped
+    assert round(b["retained_usd"], 2) == 7.5 and b["retained_tasks"] == [old]
+    assert round(rep["avoidable"], 2) == 13.0 and round(rep["retained"], 2) == 7.5
+    assert waste.fix_bucket(rep) == "failed_task"                         # $4 failed beats $1.50 net cancelled
+    line = next(x for x in waste.lines(rep) if x.startswith("cancelled or superseded work"))
+    assert line.startswith("cancelled or superseded work: $9.00 (")
+    assert f"$7.50 of it kept by a successor's work (#{old}), not saved" in line
+    assert "$7.50 of it kept by successors" in waste.line("demo", rep)
+    assert [dict(r) for r in p.db.q("SELECT id, status, labels FROM tasks ORDER BY id")] == [dict(r) for r in before]
+    # Nothing kept: no retained figure anywhere.
+    p.db.x("UPDATE tasks SET labels='[]'")
+    rep = waste.report(p.db, now - 86400, now, p.config())
+    assert rep["retained"] == 0 and "kept" not in " ".join(waste.lines(rep)) + waste.line("demo", rep)
+    assert waste.fix_bucket(rep) == "superseded"
+
+
 def test_waste_ledger_under_target_queues_no_fix_and_the_cli_prints_buckets(env, capsys):
     from ttp import cli, waste
     p = make(env)

@@ -10,7 +10,9 @@ passed, or another wake path made it due). In this order:
    timer or "probe passed" (failed checks, a broken probe, a reboot, a resumed resource, ...), a spec
    that changed since the last turn, a probe whose exit or output changed since the gate's last skip,
    a probe that answered anything but "not yet" (its pass or failed job keeps its model-free path),
-   and the cap (`max_skips` skips in a row, or `max_skip_h` hours since the last real turn).
+   and the cap (`max_skips` skips in a row, or `max_skip_h` hours since the last real turn). A
+   planned check (`waiting.check_plan`) is never capped: past the cap it still takes its plan's rule,
+   so an unchanged "not yet" starts no turn.
 2. Model-free rules re-defer what is mechanically still pending: a local detached job (`ttp detach
    --check`) still running with no exit code, a lock (`ttp lock --probe`) still held by a live
    holder, `ttp checks --result` / `ttp push --result` still pending, and a probe that passed with the
@@ -349,6 +351,10 @@ def decide(p, cfg: dict, task: dict, prev: dict, now: float, probe: tuple | None
     capped = f"{len(skips)} skip(s), {(now - ended) / 3600:.1f} h since its last turn"
     matchwait = bool(probe and probe[0] in _not_yet() and probematch.verdict(prev, probe[1] if match_out is None else match_out) == "wait")
     hard = now - ended >= max(float(s["cap_hard_h"]), float(s["max_skip_h"])) * 3600
+    # The cap is the gate's own re-ask of a wait it keeps skipping. A planned check is no event, so a
+    # due one past the cap still takes its plan's rule (an unchanged "not yet" sleeps); its probe's
+    # pass, failure or changed answer wakes it below as before. [note e12db02988af9727]
+    cap = over and not planby
     try:
         held = None if prev.get("escalated_wake") or woke else checks_hold(cfg, prev.get("retry_when"), now, probe)
     except Exception:   # a rule that cannot tell holds nothing
@@ -370,11 +376,11 @@ def decide(p, cfg: dict, task: dict, prev: dict, now: float, probe: tuple | None
         d = Decision(True, "event", "its spec changed since the last turn")
     elif gate.get("seen") and seen and gate["seen"] != seen and not matchwait:
         d = Decision(True, "event", "its probe's answer changed since the gate's last skip")
-    elif over and now - ended >= max(float(s["cap_hard_h"]), float(s["max_skip_h"])) * 3600:
+    elif cap and hard:
         d = Decision(True, "cap", f"{capped}: the hard ceiling (cap_hard_h)")
-    elif over and (woke == "probe passed" or probe and probe[0] != "timeout" and probe[0] not in _not_yet()):
+    elif cap and (woke == "probe passed" or probe and probe[0] != "timeout" and probe[0] not in _not_yet()):
         d = Decision(True, "cap", capped)   # its probe answered: its model-free path, never a watcher skip
-    elif over:   # the cap re-asks the watcher, which may skip with a next look; no answer wakes as before
+    elif cap:   # the cap re-asks the watcher, which may skip with a next look; no answer wakes as before
         got = _ask_jev(db, cfg, s, jev, task, prev, probe, last_run, now)
         if got is None or got.by == "fallback" or got.extra.get("pending") and gate.get("pending"):
             d = Decision(True, "cap", capped + (f"; {got.reason}" if got and got.by == "fallback" else ""))

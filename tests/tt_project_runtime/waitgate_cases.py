@@ -879,6 +879,32 @@ def test_a_planned_check_no_rule_or_jev_judged_sleeps_and_brings_no_cap_closer(e
     assert _gate_decide(p, tid, jev=None).by == "cap"
 
 
+@pytest.mark.parametrize("by", ["plain", "jev"])
+@pytest.mark.parametrize("ended_h, skips", [(5.0, 0), (30.0, 0), (1.0, 6)])
+def test_a_planned_check_past_the_cap_on_an_unchanged_not_yet_probe_starts_no_turn(env, tmp_path, by, ended_h, skips):
+    """[note e12db02988af9727] A planned (late) check due past the gate's cap (max_skip_h since the last
+    turn, max_skips or the hard ceiling) on a probe still saying "not yet" with the answer the gate last
+    saw is no event: with no Jev verdict it sleeps, never the cap's paid wake. A changed answer, a pass
+    or a failure still wakes it, and a due wake with no plan still takes the cap."""
+    from ttp import waitgate
+    p = make(env)
+    tid = _gate_task(p, tmp_path, "ttp ack-wait probe --from peer --hash abc --terminal", ended_ago=ended_h * 3600)
+    seen = waitgate.evidence(1, "pending: no terminal reply yet")
+    _gate_set(p, tid, wake_gate={"log": [1] * skips, "plan_skips": 0, "seen": seen})
+    plan = dict(woke="its planned late check (3 of 3): ...", wake_reason="plan_check", plan_by=by, plan_tier="light")
+    _gate_set(p, tid, **plan)
+    d = _gate_decide(p, tid, jev=None, probe=(1, "pending: no terminal reply yet"))
+    assert not d.wake and d.by == "rule", d
+    assert d.delay_s >= 60, d
+    # the other side: a new answer, a pass or a failure wakes it
+    assert _gate_decide(p, tid, jev=None, probe=(1, "pending: 1 reply, not terminal")).wake
+    assert _gate_decide(p, tid, jev=None, probe=(0, "terminal reply")).wake
+    assert _gate_decide(p, tid, jev=None, probe=(4, "job failed")).wake
+    # no plan: the cap is the gate's own and still wakes
+    _gate_set(p, tid, woke="", wake_reason="", plan_by=None, plan_tier=None)
+    assert _gate_decide(p, tid, jev=None, probe=(1, "pending: no terminal reply yet")).by == "cap"
+
+
 def test_the_coordinator_sets_and_clears_a_tasks_check_plan(env, tmp_path):
     p = make(env)
     from ttp import coordinator as coord, waketier as wt
