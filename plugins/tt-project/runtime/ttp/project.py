@@ -497,10 +497,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # sends a larger change back once for a split before its review (splitgate).
     # A task that ran max_task_runs times since its last explicit requeue, or whose last max_idle_runs
     # runs spent money with no hand-off and no commit, is not started again (0 turns one off): it is
-    # blocked and the coordinator gets one run_cap event summing up its runs (runcap).
+    # blocked and the coordinator gets one run_cap event summing up its runs (runcap). A run that handed off
+    # waiting on its own checks or job counts toward max_self_waits instead of max_task_runs.
     "chains": {"max_hops": 8, "max_stalls": 2, "max_usd": 40.0, "auto": True, "urgent_followups": True,
                "fold_followups": True,
-               "requeue": True, "split_lines": 0, "max_task_runs": 4, "max_idle_runs": 2},
+               "requeue": True, "split_lines": 0, "max_task_runs": 4, "max_idle_runs": 2, "max_self_waits": 12},
     # Each Jev use (e.g. "screen") is switched off once its net saving over window_days is not
     # positive, judged after min_calls calls or once its first call is a window old, or once idle_calls
     # calls in the window changed none of the rules' decisions; uses.<use> = "on" or "off" forces it

@@ -2870,6 +2870,53 @@ def test_a_task_whose_last_runs_spent_money_with_no_progress_is_blocked(env):
     assert "last 2 runs spent $1.00 with no hand-off" in why and p.db.task(tid)["status"] == "blocked"
 
 
+SELF_WAIT = {"status": "waiting", "wait_kind": "self", "summary": "suite detached",
+             "retry_when": "ttp checks --result /tmp/run/checks"}
+
+
+def test_waits_on_a_tasks_own_checks_or_jobs_do_not_count_toward_its_run_cap(env):
+    """Upstream note be59ae01d50edb6f: a task waiting on its own suite or batch job handed off `waiting`
+    (wait_kind self) each time its gate woke it, and the run cap blocked it mid-gate. A self-wait is a step
+    of one try: 3 of them and 1 real try stay under chains.max_task_runs 4; the summary still lists them."""
+    from ttp import runcap
+    p = make(env)
+    tid = p.db.add_task("gated", "s", kind="code", tier="standard", origin="user")
+    _ended_runs(p, tid, 1, handoff={"status": "failed", "summary": "first try"})
+    _ended_runs(p, tid, 2, cost=0.1, handoff=SELF_WAIT)
+    _ended_runs(p, tid, 1, cost=0.1, handoff=dict(SELF_WAIT, wait_kind="", retry_when=(
+        "ttp detach --check /tmp/run/suite")))   # classified self by its own probe
+    assert runcap.check(p, p.config(), p.db.task(tid)) == ""
+    assert p.db.task(tid)["status"] != "blocked"
+
+
+def test_real_tries_and_external_waits_still_reach_the_run_cap_and_self_waits_have_their_own(env):
+    """Only waits on the task's own progress are left out: 4 real tries, or 4 waits on something outside
+    the task (a lock, another task's landing), still block it; a loop of self-waits stops at
+    chains.max_self_waits (0 turns that off), and the idle rule still sees the runs around them."""
+    from ttp import dispatchguard, runcap
+    p = make(env)
+    tries = p.db.add_task("tries", "s", kind="work", tier="light", origin="user")
+    _ended_runs(p, tries, 4, cost=0.1, handoff={"status": "failed", "summary": "same error"})
+    assert "ran 4 times" in runcap.check(p, p.config(), p.db.task(tries))
+    ext = p.db.add_task("external", "s", kind="work", tier="light", origin="user")
+    _ended_runs(p, ext, 2, cost=0.1, handoff={"status": "waiting", "retry_when": "ttp lock --probe box"})
+    _ended_runs(p, ext, 2, cost=0.1, handoff=dict(SELF_WAIT, wait_kind="external", retry_when="landed:#12"))
+    assert "max_task_runs 4" in runcap.check(p, p.config(), p.db.task(ext))
+    loop = p.db.add_task("recheck loop", "s", kind="work", tier="light", origin="user")
+    _ended_runs(p, loop, 11, cost=0.1, handoff=SELF_WAIT)
+    assert runcap.check(p, p.config(), p.db.task(loop)) == ""
+    _ended_runs(p, loop, 1, cost=0.1, handoff=SELF_WAIT)
+    assert "chains.max_self_waits 12" in runcap.check(p, p.config(), p.db.task(loop))
+    time.sleep(0.01)
+    dispatchguard.record_requeue(p.db, loop, "blocked", "coordinator")
+    p.db.update_task(loop, status="queued")
+    time.sleep(0.01)
+    _ended_runs(p, loop, 1, cost=0.1, handoff=SELF_WAIT)
+    _ended_runs(p, loop, 2, cost=0.5)   # two idle runs after a self-wait: the idle rule holds
+    p.set_config("chains.max_self_waits", 0)
+    assert "chains.max_idle_runs 2" in runcap.check(p, p.config(), p.db.task(loop))
+
+
 @pytest.mark.parametrize("at", ["before_spawn", "after_record"])
 def test_a_step_stop_in_a_worker_start_never_leaves_its_task_running_with_no_run(
         env, monkeypatch, tmp_path, reap_tmp_processes, at):

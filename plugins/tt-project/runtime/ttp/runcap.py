@@ -6,6 +6,10 @@ A task whose runs since its last explicit requeue (dispatchguard.EXPLICIT_SOURCE
 user or a chain continue; never the daemon's or push queue's own requeues) reach `chains.max_task_runs`
 (4), or whose last `chains.max_idle_runs` (2) runs each spent money with no progress, is not started again. Daemon retries (a tier up after a failure, a lost or
 stalled run, a waiting wake, a restart) all count; runs that never reached the model (FREE) do not.
+A run that handed off `waiting` on its own progress (unblock.classify_wait 'self': its detached checks, a
+batch or Slurm job, a planned window) is a step of one try, not a retry: it counts toward
+`chains.max_self_waits` (12) instead, so a task mid-gate is not blocked while a fix-and-recheck loop still
+ends; the idle rule and the task's budget bound it too.
 Progress is a hand-off of done or waiting, or a commit made inside the run (chaincap.code_commits).
 The task is blocked, and the coordinator gets one RUN_CAP_EVENT per requeue with a model-free summary:
 each run's tier, end, spend and what it handed off, and the last error. The coordinator decides (a new
@@ -18,7 +22,7 @@ import json
 import time
 from pathlib import Path
 
-from . import chaincap, routinedefault
+from . import chaincap, routinedefault, unblock
 from .db import load_result
 from .dispatchguard import EXPLICIT_SOURCES, REQUEUED
 
@@ -29,15 +33,15 @@ PROGRESS = ("done", "waiting")
 LINE_CHARS = 160
 
 
-def limits(cfg: dict) -> tuple[int, int]:
+def limits(cfg: dict) -> tuple[int, int, int]:
     c = cfg.get("chains") or {}
     out = []
-    for k in ("max_task_runs", "max_idle_runs"):
+    for k in ("max_task_runs", "max_idle_runs", "max_self_waits"):
         try:
             out.append(max(0, int(c.get(k, chaincap.DEFAULTS[k]))))
         except (TypeError, ValueError):
             out.append(chaincap.DEFAULTS[k])
-    return out[0], out[1]
+    return out[0], out[1], out[2]
 
 
 def runs(db, task_id: int) -> tuple[list[dict], int]:
@@ -58,6 +62,12 @@ def handoff(run: dict) -> dict:
         return {}
 
 
+def self_wait(run: dict) -> bool:
+    """Whether `run` handed off `waiting` on the task's own progress (its checks, job or window)."""
+    h = handoff(run)
+    return h.get("status") == "waiting" and unblock.classify_wait(h)[0] == "self"
+
+
 def idle(p, task: dict, run: dict) -> bool:
     """Whether `run` spent money and made no progress: no done or waiting hand-off, no commit inside it."""
     if not float(run.get("cost_usd") or 0) or handoff(run).get("status") in PROGRESS:
@@ -72,9 +82,16 @@ def idle(p, task: dict, run: dict) -> bool:
 
 
 def why(p, cfg: dict, task: dict, rows: list[dict]) -> str:
-    most, nidle = limits(cfg)
-    if most and len(rows) >= most:
-        return f"it already ran {len(rows)} times since its last explicit requeue (chains.max_task_runs {most})"
+    most, nidle, nself = limits(cfg)
+    waits = sum(1 for r in rows if self_wait(r))
+    tries = len(rows) - waits
+    if most and tries >= most:
+        also = f", not counting {waits} waits on its own checks or jobs" if waits else ""
+        return (f"it already ran {tries} times since its last explicit requeue{also} "
+                f"(chains.max_task_runs {most})")
+    if nself and waits >= nself:
+        return (f"it handed off {waits} waits on its own checks or jobs since its last explicit requeue "
+                f"(chains.max_self_waits {nself})")
     tail = rows[-nidle:] if nidle else []
     if tail and len(tail) == nidle and all(idle(p, task, r) for r in tail):
         return (f"its last {nidle} runs spent ${sum(float(r['cost_usd'] or 0) for r in tail):.2f} with no hand-off "

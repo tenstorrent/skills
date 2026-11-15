@@ -85,7 +85,7 @@ HARD = ("max_hops", "max_usd")   # caps no `reason` lifts (spend safety); max_st
 REASON_HINT = ("add a `reason` field to the task_add that names what changed, in these words: new evidence, "
                f"a different approach or a narrower scope (at least {MIN_REASON} characters); it then passes in the same action")
 DEFAULTS = {"max_hops": 8, "max_stalls": 2, "max_usd": 40.0, "auto": True, "requeue": True,
-            "max_task_runs": 4, "max_idle_runs": 2}   # the last two: per task, at dispatch (runcap)
+            "max_task_runs": 4, "max_idle_runs": 2, "max_self_waits": 12}   # last three: per task, at dispatch (runcap)
 CAP_EVENT = "continue_cap"
 OVERRIDE_EVENT = "continue_cap_override"
 AUTO_EVENT = "continue_auto"
