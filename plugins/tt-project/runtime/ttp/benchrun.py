@@ -731,6 +731,13 @@ def isolate(tmp: Path, ws: Path, arm: dict, opts: dict, hidden: list[Path], repo
                    *(p for p in canary.parent.iterdir() if p != canary)]   # the pristine cell, its sibling cells
     if inst:
         extra["binds"] = [*extra.get("binds", []), ("ro", Path(inst["dir"]))]
+    if opts.get("ro_binds"):   # folders of the cell bound read-only over its writable one (a read-only snapshot)
+        extra["binds"] = [*extra.get("binds", []), *(("ro", Path(x)) for x in opts["ro_binds"])]
+    if opts.get("deny_tools"):   # a folder of refusing stand-ins: each covers its tool, also a system copy
+        deny = Path(opts["deny_tools"])
+        extra["standins"] = {**extra.get("standins", {}), **{t.name: t for t in sorted(deny.glob("*"))}}
+        extra["binds"] = [*extra.get("binds", []), ("ro", deny)]
+        extra["path_dirs"] = [*(extra.get("path_dirs") or [str(tmp / "venv" / "bin")]), str(deny)]
     cli = inst["bin"] if inst else "" if provider == "fake" else str(prov.binary() or "")
     cell = cellns.build(tmp, ws, hidden, python=python, cli=cli,
                         config=conf, creds=creds, **{"path_dirs": [str(tmp / "venv" / "bin")], **extra})

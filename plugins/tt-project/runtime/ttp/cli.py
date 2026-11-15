@@ -2107,6 +2107,17 @@ def cmd_status(a) -> None:
     upstream.maybe_fallback()   # the daemon cannot reach a forward target: send its notes from this shell
 
 
+def cmd_device_shadow(a) -> None:
+    """`ttp device-shadow <task> <arm>` (hidden; the daemon starts it detached): one read only shadow run
+    of a device A/B task (deviceshadow.py). It never raises into anything: the outcome is its kv record."""
+    from . import deviceshadow
+    p = here()
+    if p is None:
+        die("device-shadow: not in a project")
+    rec = deviceshadow.run(p, int(a.task), a.arm)
+    print(f"device shadow of #{a.task} ({a.arm}): {rec.get('status')} {rec.get('error') or ''}".strip())
+
+
 def cmd_stats(a) -> None:
     """Context re-read (cache-read) tokens per run and per $, by role, kind, tier and effort."""
     from . import budget as bud
@@ -15458,7 +15469,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--device-ab", action="store_true",
                    help="the device A/B (route.device_ab, deviceab.py) instead: per arm and kind (device work, "
                         "device code) tasks, done, failed, retried, follow-up fixes, incidents, blind scores, $ and "
-                        "minutes per task, and the excluded count; with --all or --projects: every project, read only")
+                        "minutes per task, and the excluded count, then the shadow arms (route.device_ab_shadow, deviceshadow.py) side by "
+                        "side with both reviewers' scores; with --all or --projects: every project, read only")
     s.add_argument("--code-routes", action="store_true",
                    help="the code route instead (runclass.code_routes): the last 24 h's code worker runs per model "
                         "and per decision each run's note records (Sonnet, or why it stayed on Opus)")
@@ -15488,6 +15500,11 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--tier", help="with --runs: only this tier's runs (implies --runs)")
     s.add_argument("--json", action="store_true", help="print JSON")
     s.set_defaults(fn=cmd_stats)
+
+    s = sub.add_parser("device-shadow", help=argparse.SUPPRESS)   # the daemon's detached read only shadow run
+    s.add_argument("task", type=int)
+    s.add_argument("arm")
+    s.set_defaults(fn=cmd_device_shadow)
 
     s = sub.add_parser("audit", help="the daily review's self-efficiency audit: asks, wasted runs, idle wakes, "
                                      "$ per outcome, review loops, stuck work and overrides held past their end")

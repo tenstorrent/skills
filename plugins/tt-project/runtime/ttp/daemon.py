@@ -38,6 +38,7 @@ from pathlib import Path
 
 from . import runtimeload   # first of its own: its LOADED_AT is when the daemon imported its code
 from . import deviceab
+from . import deviceshadow
 from . import batchrun
 from . import leadmode
 from . import coordprecheck
@@ -2608,6 +2609,7 @@ class Daemon:
                     log(self.p, "device A/B: test arm stopped after a device incident")
                 if got.get("lifted"):
                     log(self.p, "device A/B: " + str(got["lifted"])[:200])
+                deviceshadow.queue_reviews(self.p.db, second=deviceab.second_reviewer(self.cfg))
             except Exception as e:   # never holds the loop
                 log(self.p, f"device A/B tick failed: {type(e).__name__}: {e}"[:300])
         # A configured route (the code route, the device A/B) taking under half its share: one event per route a day.
@@ -13164,6 +13166,11 @@ class Daemon:
                                         resume=lost["session"] if lost else None,
                                         min_effort=None if tierfloor.wake_keeps_effort(task, run_cls)
                                         else (need or {}).get("effort") or None)
+                if dab:   # route.device_ab_shadow: read only shadow runs of this task, off by default; never hold it
+                    try:
+                        deviceshadow.start(self.p, task, self.cfg)
+                    except Exception as e:
+                        log(self.p, f"task {task['id']}: device shadow not started: {type(e).__name__}: {e}"[:300])
                 if woke_probe:   # its start_when pass is now in the run's note
                     db.x("DELETE FROM kv WHERE key=?", (probewake.KV_PREFIX + str(task["id"]),))
                 if lease:   # the lease now names the run's supervisor in place of the daemon

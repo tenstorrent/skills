@@ -46,6 +46,7 @@ KEY = "device_ab"
 LABEL = "device_ab:"                    # device_ab:<arm>, on the task before its first run
 EXCLUDED = "device_ab_excluded:"        # device_ab_excluded:<why>, counted in the report
 REVIEW_LABEL = "device_ab_review:"      # on the masked review task: device_ab_review:<task id>
+REVIEW2_LABEL = "device_ab_review2:"    # on the second reviewer's task (another model family): device_ab_review2:<task id>
 START_KV = "device_ab_start"            # {"ts", "sig"}
 STOP_KV = "device_ab_stop"              # {"ts", "arm", "task", "event", "why"}: the test arm is stopped
 KINDS = ("work", "question", "code")
@@ -60,6 +61,18 @@ INCIDENT = re.compile(r"(?i)\b(hang|hangs|hung|reset|resets|recover(?:y|ed|ing|i
 REVIEW_MODEL = {"model": "opus", "effort": "high"}
 SCORE_KEYS = ("answered", "supported")
 ANSWER = re.compile(r'"device_ab_scores"\s*:\s*\{[^{}]*\}')
+
+
+def second_reviewer(cfg: dict | None) -> dict | None:
+    """The second blind reviewer (`route.device_ab_shadow.second_reviewer`: model, effort, provider (default
+    chat)), another model family than the first; None when unset. It applies to the live A/B's reviews and the
+    shadow's, with the same masked inputs and rubric."""
+    got = (((cfg or {}).get("route") or {}).get("device_ab_shadow") or {})
+    got = got.get("second_reviewer") if isinstance(got, dict) else None
+    if not isinstance(got, dict) or not isinstance(got.get("model"), str) or not got["model"].strip():
+        return None
+    return {"model": got["model"].strip(), "effort": str(got.get("effort") or "max"),
+            "provider": str(got.get("provider") or "chat")}
 
 
 def _labels(task: dict) -> list[str]:
@@ -366,21 +379,24 @@ def review_spec(task: dict, run_dir: str) -> str:
     ])
 
 
-def queue_reviews(db, s: dict, since: float, limit: int = 10) -> list[int]:
-    """One masked review per finished A/B task that has none yet; returns the new task ids."""
+def queue_reviews(db, s: dict, since: float, limit: int = 10, second: dict | None = None) -> list[int]:
+    """One masked review per finished A/B task that has none yet, and with a `second` reviewer one more by it
+    (same inputs, same rubric); returns the new task ids."""
     done = db.q("SELECT * FROM tasks WHERE created>=? AND labels LIKE ? AND status IN ('done','failed') "
                 "ORDER BY id", (since, f'%"{LABEL}%'))
-    have = {lb for r in db.q("SELECT labels FROM tasks WHERE labels LIKE ?", (f'%"{REVIEW_LABEL}%',))
-            for lb in _labels(r) if lb.startswith(REVIEW_LABEL)}
+    have = {lb for r in db.q("SELECT labels FROM tasks WHERE labels LIKE ? OR labels LIKE ?",
+                             (f'%"{REVIEW_LABEL}%', f'%"{REVIEW2_LABEL}%')) for lb in _labels(r)}
+    reviewers = [(REVIEW_LABEL, REVIEW_MODEL, None)] + ([(REVIEW2_LABEL, second, second["provider"])] if second else [])
     out = []
     for t in done:
-        if f"{REVIEW_LABEL}{t['id']}" in have or len(out) >= limit:
-            continue
         run = db.q("SELECT dir FROM runs WHERE task=? ORDER BY id DESC LIMIT 1", (t["id"],))
-        out.append(db.add_task(f"Device A/B review of #{t['id']}", review_spec(t, (run[0]["dir"] if run else "") or ""),
-                               kind="question", tier="standard", priority=4, origin="daemon",
-                               model=REVIEW_MODEL["model"], effort=REVIEW_MODEL["effort"],
-                               labels=[f"{REVIEW_LABEL}{t['id']}"]))
+        for label, who, prov in reviewers:
+            if f"{label}{t['id']}" in have or len(out) >= limit:
+                continue
+            out.append(db.add_task(f"Device A/B review of #{t['id']}" + (" (second reviewer)" if prov else ""),
+                                   review_spec(t, (run[0]["dir"] if run else "") or ""), kind="question",
+                                   tier="standard", priority=4, origin="daemon", model=who["model"],
+                                   effort=who["effort"], provider=prov, labels=[f"{label}{t['id']}"]))
     return out
 
 
@@ -398,7 +414,7 @@ def tick(db, cfg: dict, now: float | None = None) -> dict:
     if not stopped(db) and (hit := find_incident(db, cfg, s, st["ts"], now)):
         new_stop = {"ts": now, "arm": s["test"], **hit}
         db.set_kv(STOP_KV, new_stop)
-    return {"stop": new_stop, "lifted": lifted, "reviews": queue_reviews(db, s, st["ts"])}
+    return {"stop": new_stop, "lifted": lifted, "reviews": queue_reviews(db, s, st["ts"], second=second_reviewer(cfg))}
 
 
 def stop_text(stop: dict) -> str:
@@ -465,15 +481,20 @@ def report(q: Callable[..., list[dict]], kv: Callable[[str], Any], cfg: dict | N
     if s:
         out.update(days=s["days"], max_tasks=s["max_tasks"], share=s["share"], test=s["test"], control=s["control"],
                    models={k: f"{v['model']}:{v['effort']}" for k, v in s["arms"].items()})
+    from . import deviceshadow   # read only shadow arms: their own section, never in the counts
+    out["shadow"] = deviceshadow.report(q)
     if not since:
         return out
     tasks = q("SELECT id, kind, status, labels FROM tasks WHERE created>=? AND labels LIKE ?",
               (since, '%"device_ab%'))
     reviews: dict[int, dict] = {}
-    for r in q("SELECT labels, result, status FROM tasks WHERE labels LIKE ?", (f'%"{REVIEW_LABEL}%',)):
+    reviews2: dict[int, dict] = {}
+    for r in q("SELECT labels, result, status FROM tasks WHERE labels LIKE ? OR labels LIKE ?",
+               (f'%"{REVIEW_LABEL}%', f'%"{REVIEW2_LABEL}%')):
         for lb in _labels(r):
-            if lb.startswith(REVIEW_LABEL) and lb[len(REVIEW_LABEL):].isdigit() and (sc := _scores(r.get("result"))):
-                reviews[int(lb[len(REVIEW_LABEL):])] = sc
+            for label, into in ((REVIEW_LABEL, reviews), (REVIEW2_LABEL, reviews2)):
+                if lb.startswith(label) and lb[len(label):].isdigit() and (sc := _scores(r.get("result"))):
+                    into[int(lb[len(label):])] = sc
     fixes: dict[int, int] = {}
     for r in q("SELECT labels FROM tasks WHERE created>=? AND (labels LIKE '%\"continues:%' OR labels LIKE "
                "'%\"review_fix:%')", (since,)):
@@ -493,7 +514,8 @@ def report(q: Callable[..., list[dict]], kv: Callable[[str], Any], cfg: dict | N
         kind = "device code" if t["kind"] == "code" else "device work"
         a = out["arms"].setdefault(arm, {}).setdefault(kind, {
             "tasks": 0, "done": 0, "failed": 0, "retried": 0, "fixes": 0, "incidents": 0, "scored": 0,
-            "answered": 0.0, "supported": 0.0, "usd": 0.0, "minutes": 0.0})
+            "answered": 0.0, "supported": 0.0, "scored2": 0, "answered2": 0.0, "supported2": 0.0, "usd": 0.0,
+            "minutes": 0.0})
         a["tasks"] += 1
         a["done"] += t["status"] == "done"
         a["failed"] += t["status"] == "failed"
@@ -508,13 +530,19 @@ def report(q: Callable[..., list[dict]], kv: Callable[[str], Any], cfg: dict | N
             a["scored"] += 1
             a["answered"] += sc["answered"]
             a["supported"] += sc["supported"]
+        if sc := reviews2.get(int(t["id"])):
+            a["scored2"] += 1
+            a["answered2"] += sc["answered"]
+            a["supported2"] += sc["supported"]
     for kinds in out["arms"].values():
         for a in kinds.values():
-            n, m = a["tasks"], a["scored"]
+            n, m, m2 = a["tasks"], a["scored"], a["scored2"]
             a["usd_per_task"] = round(a.pop("usd") / n, 2) if n else None
             a["minutes_per_task"] = round(a.pop("minutes") / n, 1) if n else None
             a["answered"] = round(a["answered"] / m, 2) if m else None
             a["supported"] = round(a["supported"] / m, 2) if m else None
+            a["answered2"] = round(a["answered2"] / m2, 2) if m2 else None
+            a["supported2"] = round(a["supported2"] / m2, 2) if m2 else None
     out["excluded_total"] = sum(out["excluded"].values())
     out["flipped"] = {arm: sum(a["tasks"] for a in kinds.values()) for arm, kinds in out["arms"].items()}
     out["eligible"] = sum(out["flipped"].values())
@@ -530,16 +558,19 @@ def report_text(r: dict, name: str = "") -> str:
     lines = [head]
     if r.get("stopped"):
         lines.append(f"  test arm stopped after an incident on task #{r['stopped'].get('task')}")
+    from . import deviceshadow
     if not r.get("start"):
-        return "\n".join([*lines, "  not started"])
+        return "\n".join([*lines, "  not started", *deviceshadow.report_text(r.get("shadow"))])
     for arm, kinds in sorted(r["arms"].items()):
         for kind, a in sorted(kinds.items()):
             sc = "-" if a["answered"] is None else f"{a['answered']}/{a['supported']} (n={a['scored']})"
+            sc2 = "" if a.get("scored2") is None or not a["scored2"] else \
+                f", second reviewer {a['answered2']}/{a['supported2']} (n={a['scored2']})"
             lines.append(f"  {arm:8} {kind:12} tasks {a['tasks']}, done {a['done']}, failed {a['failed']}, "
                          f"retried {a['retried']}, fixes {a['fixes']}, incidents {a['incidents']}, "
-                         f"answered/supported {sc}, ${a['usd_per_task']}/task, {a['minutes_per_task']} min/task")
+                         f"answered/supported {sc}{sc2}, ${a['usd_per_task']}/task, {a['minutes_per_task']} min/task")
     ex = ", ".join(f"{k} {v}" for k, v in sorted(r["excluded"].items())) or "none"
     flip = ", ".join(f"{k} {v}" for k, v in sorted((r.get("flipped") or {}).items())) or "none"
     lines.append(f"  eligible: {r.get('eligible', 0)} (flipped: {flip})")
     lines.append(f"  excluded: {r.get('excluded_total', 0)} ({ex})")
-    return "\n".join(lines)
+    return "\n".join([*lines, *deviceshadow.report_text(r.get("shadow"))])

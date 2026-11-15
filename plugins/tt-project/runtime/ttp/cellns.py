@@ -271,7 +271,10 @@ def build(tmp: Path, ws: Path, hidden: list[Path], *, python: str, cli: str = ""
                                                         "/usr/local/bin", "/usr/bin", "/bin"] if x):
         for tool, standin in covers.items():
             if _under(d, SYSTEM) and os.path.isfile(os.path.join(d, tool)):   # a system copy: the stand-in covers it
-                plan.append(("ro", str(standin), os.path.join(d, tool)))
+                # A link (an alternatives symlink) cannot be a mount point: cover the file it leads to.
+                dest = os.path.realpath(os.path.join(d, tool))
+                if _under(dest, SYSTEM) and ("ro", str(standin), dest) not in plan:
+                    plan.append(("ro", str(standin), dest))
     cell = Cell(name, [], home, conf=dict(config or {}), remote=remote, gh=str((standins or {}).get("gh", "")))
     found = shutil.which(cli) or cli if cli else ""
     real = os.path.realpath(found) if found else ""
