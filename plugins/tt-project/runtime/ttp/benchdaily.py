@@ -30,6 +30,10 @@ from .project import durable_write, open_append
 CAP_USD = 40.0       # Claude spend a day (arm runs plus reviews)
 CELL_USD = 5.0       # most one arm run may spend (the run's own budget stop)
 REVIEW_USD = 2.0     # most one blind review call may spend
+FLOOR_USD = 1.0      # least a measured reservation holds for one task's arm runs
+REVIEW_FLOOR_USD = 0.25  # least a measured reservation holds for one task's review
+MEASURED_AFTER = 2   # tasks finished before reservations follow measured spend (until then the worst case)
+MEASURED_X = 2.0     # a measured reservation is this many times the running mean
 MAX_LINES = 800      # changed non-test lines at most: a larger change does not fit one 60-minute cell
 LIMIT_S = 3600       # a cell's time limit; reaching it is a fail
 LANDED_MIN = 3       # requirements and correctness each at least this, on the 0-4 scale, count as landed
@@ -110,16 +114,19 @@ def mirror(proj: dict, base: Path | None = None, source: Path | None = None) -> 
 # -- pick
 
 def landed_at(db, repo: Path | None, rows: list[dict]) -> float | None:
-    """When a task's one landing happened: its push queue row's update time, else its landed commit's time
-    (None when that needs a repository and there is none yet)."""
-    sha = rows[0]["landed_sha"]
-    got = db.q("SELECT MAX(updated) AS t FROM push_queue WHERE COALESCE(NULLIF(landed_sha, ''), pushed_sha)=?", (sha,))
-    if got and got[0]["t"]:
-        return float(got[0]["t"])
-    if repo is None:
-        return None
-    t = bench._out(repo, "log", "-1", "--format=%ct", sha)
-    return float(t) if t else 0.0
+    """When a task's landing finished: the latest of its landings' push queue row update times, else its
+    landed commit's time (None when that needs a repository and there is none yet)."""
+    times = []
+    for sha in dict.fromkeys(r["landed_sha"] for r in rows):
+        got = db.q("SELECT MAX(updated) AS t FROM push_queue WHERE COALESCE(NULLIF(landed_sha, ''), pushed_sha)=?", (sha,))
+        if got and got[0]["t"]:
+            times.append(float(got[0]["t"]))
+        elif repo is None:
+            return None
+        else:
+            t = bench._out(repo, "log", "-1", "--format=%ct", sha)
+            times.append(float(t) if t else 0.0)
+    return max(times)
 
 
 def landed_in_window(db, start: float, end: float, lookback_days: int = LOOKBACK_DAYS) -> int:
@@ -133,7 +140,7 @@ def landed_in_window(db, start: float, end: float, lookback_days: int = LOOKBACK
             if t["kind"] != "code":
                 continue
             mine = bench.landed_rows(db, t["id"], rows, pushed, reach)
-            if mine and (len(mine) != 1 or (at := landed_at(db, None, mine)) is None or start <= at < end):
+            if mine and ((at := landed_at(db, None, mine)) is None or start <= at < end):
                 n += 1
     return n
 
@@ -158,12 +165,12 @@ def pick(db, repo: Path, start: float, end: float, max_lines: int = MAX_LINES,
             mine = bench.landed_rows(db, t["id"], rows, pushed, reach)
             if not mine:
                 continue    # not landed (or not by a push this bench can read): not a candidate at all
-            if len(mine) == 1 and not (start <= (landed_at(db, repo, mine) or 0) < end):
+            if not (start <= (landed_at(db, repo, mine) or 0) < end):
                 continue    # landed on another day
             if is_device(t):
                 dropped.append({"task": t["id"], "why": "needs a device"})
                 continue
-            base, head, why = bench.landing(repo, mine, stops, shared)
+            base, head, why = bench.own_range(repo, mine, stops, shared)
             parent = bench.parent_of(t)
             if not why and parent:
                 base, head, why = bench.from_parent(db, repo, parent[0], parent[1], mine[0]["head"] or head)
@@ -199,13 +206,31 @@ def sample(by_project: dict[str, list[dict]], seed: int) -> list[dict]:
 # -- spend
 
 class Ledger:
-    """Claude spend counted from a running total. A task is admitted only while spent + the worst the tasks in
-    flight and the reviews still to run may spend + this task's worst fits the cap, so the cap holds even
-    when every run spends its whole budget."""
+    """Claude spend counted from a running total. A task is admitted only while spent + what the tasks in
+    flight and the reviews still to run may spend + this task's reservation fits the cap. A reservation is the
+    worst case (every run spends its whole budget) until MEASURED_AFTER tasks have finished; then it is
+    MEASURED_X times the mean actual spend of the finished ones (at least the floor, at most the worst case),
+    so the cap buys the tasks it can really pay for. Actual spend still never passes the cap: a run's own
+    budget stop bounds each cell."""
 
-    def __init__(self, cap: float, spent: float = 0.0):
+    def __init__(self, cap: float, spent: float = 0.0, review_mean: float | None = None):
         self.cap, self.spent, self.flight, self.reviews = cap, spent, 0.0, 0.0
+        self.review_mean = review_mean    # a measured review spend per task (an earlier day's), or None
+        self.finished: list[float] = []   # actual arm spend of each task finished in this run
         self.lock = threading.Lock()
+
+    def reservation(self, worst: float, review: float) -> tuple[float, float, str]:
+        """(arms, review, rule) this task would reserve now."""
+        with self.lock:
+            if len(self.finished) >= MEASURED_AFTER:
+                mean = sum(self.finished) / len(self.finished)
+                arms = min(worst, max(FLOOR_USD, MEASURED_X * mean))
+                rule = f"measured: {MEASURED_X:g} x ${mean:.2f} mean of {len(self.finished)} finished"
+            else:
+                arms, rule = worst, "worst case: fewer than %d tasks finished" % MEASURED_AFTER
+            if self.review_mean is not None:
+                review = min(review, max(REVIEW_FLOOR_USD, MEASURED_X * self.review_mean))
+            return arms, review, rule
 
     def admit(self, worst: float, review: float) -> bool:
         with self.lock:
@@ -219,6 +244,7 @@ class Ledger:
         with self.lock:
             self.flight = max(0.0, self.flight - worst)
             self.spent += actual
+            self.finished.append(actual)
 
     def reviewed(self, reserved: float, actual: float) -> None:
         with self.lock:
@@ -299,17 +325,19 @@ def run_cells(day: str, tasks: dict[str, dict], arms: dict, out: Path, bench_dir
     rows = read_rows(out / "results.jsonl")
     spent = sum(float(r.get("cost_usd") or 0) for r in rows.values() if is_claude(arms.get(r["arm"], {})))
     spent += review_spent(out)
-    ledger = Ledger(cap, spent)
+    ledger = Ledger(cap, spent, opts.get("review_mean"))
     n_claude = sum(is_claude(a) for a in arms.values())
     worst, review = n_claude * opts.get("budget_usd", CELL_USD), opts.get("review_usd", REVIEW_USD)
     lock = threading.Lock()
-    ran, skipped = [], []
+    ran, skipped, admitted = [], [], []
     todo = [t for t in (order or list(tasks)) if t in tasks]
     full = lambda t: all((t, 0, a) in rows and not rows[(t, 0, a)].get("endpoint_fault") for a in arms)
     ran += [t for t in todo if full(t)]
     todo = [t for t in todo if not full(t)]
+    ledger.finished += [sum(float(rows[(t, 0, a)].get("cost_usd") or 0) for a in arms if is_claude(arms[a]))
+                        for t in ran]   # a resumed run's finished tasks count toward the measured mean
     if ran and not (out / "review.json").exists():
-        ledger.reviews += review * len(ran)   # a resumed run's finished cells are not reviewed yet: their reviews still spend
+        ledger.reviews += ledger.reservation(worst, review)[1] * len(ran)   # a resumed run's finished cells are not reviewed yet: their reviews still spend
     pending: dict = {}
     with concurrent.futures.ThreadPoolExecutor(max(1, parallel)) as pool:
         def finish(f):
@@ -323,23 +351,48 @@ def run_cells(day: str, tasks: dict[str, dict], arms: dict, out: Path, bench_dir
             ran.append(tid)
             say(f"{tid}: done; Claude spend ${ledger.total():.2f} of ${cap:.2f}")
         for tid in todo:
-            while not ledger.admit(worst, review):
+            while len(pending) >= parallel:   # a free slot first: a finished task's spend is then in the mean
+                done, _ = concurrent.futures.wait(list(pending), return_when=concurrent.futures.FIRST_COMPLETED)
+                for f in done:
+                    finish(f)
+            while True:
+                hold, rev, rule = ledger.reservation(worst, review)
+                if ledger.admit(hold, rev):
+                    ok = True
+                    break
                 if not pending:
-                    skipped.append({"task": tid, "why": f"the ${cap:.0f} Claude cap leaves no room for another task"})
+                    ok = False
+                    skipped.append({"task": tid, "why": f"the ${cap:.0f} Claude cap leaves no room for another task "
+                                                        f"(it would reserve ${hold + rev:.2f}; {rule})"})
                     break
                 done, _ = concurrent.futures.wait(list(pending), return_when=concurrent.futures.FIRST_COMPLETED)
                 for f in done:
                     finish(f)
-            else:
-                if len(pending) >= parallel:
-                    done, _ = concurrent.futures.wait(list(pending), return_when=concurrent.futures.FIRST_COMPLETED)
-                    for f in done:
-                        finish(f)
-                f = pool.submit(run_task, out, bench_dir, tasks[tid], arms, opts, cfg, ledger, lock)
-                pending[f] = (tid, worst)
+            if not ok:
+                continue
+            admitted.append({"task": tid, "reserved_usd": round(hold + rev, 4), "rule": rule})
+            say(f"{tid}: admitted, reserves ${hold + rev:.2f} ({rule})")
+            f = pool.submit(run_task, out, bench_dir, tasks[tid], arms, opts, cfg, ledger, lock)
+            pending[f] = (tid, hold)
         for f in list(pending):
             finish(f)
-    return {"ran": ran, "skipped": skipped, "claude_usd": ledger.total(), "reserved_reviews": ledger.reviews}
+    return {"ran": ran, "skipped": skipped, "admitted": admitted, "claude_usd": ledger.total(), "reserved_reviews": ledger.reviews}
+
+
+def prior_review_mean(root: Path, before: str | None = None) -> float | None:
+    """Review spend per reviewed task in the most recent earlier day's record under <root>/days, or None."""
+    for p in sorted((root / "days").glob("*.json"), reverse=True) if (root / "days").is_dir() else []:
+        if before and p.stem >= before:
+            continue
+        try:
+            rec = json.loads(p.read_text())
+            tasks = {c["task"] for c in rec.get("cells") or []}
+            usd = float((rec.get("spend") or {}).get("review_usd") or 0)
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        if tasks and usd > 0:
+            return round(usd / len(tasks), 4)
+    return None
 
 
 def review_spent(out: Path) -> float:
@@ -558,12 +611,13 @@ def run_day(day: str, start: float, end: float, arms: dict, cfg: dict, cap: floa
     order = [f"{slug(k['project'])}-{k['task']}" for k in picked["order"]]
     opts = {"timeout_s": LIMIT_S, "stall_s": 900, "budget_usd": CELL_USD, "review_usd": REVIEW_USD,
             "test_cmd": benchrun.TEST_CMD, "test_timeout_s": 900, "dry_run": False, "scratch_home": True,
-            **(opts or {})}
+            "review_mean": prior_review_mean(root, day), **(opts or {})}
     done = run_cells(day, tasks, arms, out, bench_dir, opts, cfg, cap, parallel, order, say)
     graded = blind_review(out, tasks, arms, cfg, ask)
     skipped = picked.get("skipped", []) + done["skipped"]
     rec = day_record(day, tasks, arms, out, graded, skipped, picked["dropped"])
     rec["faults"] = picked.get("faults", [])
+    rec["admitted"] = done["admitted"]   # which reservation rule admitted each task
     rec["arms"] = {k: {f: v.get(f, "") for f in ("provider", "model", "effort", "harness")} for k, v in arms.items()}
     durable_write(root / "days" / f"{day}.json", json.dumps(rec, indent=1) + "\n")
     write_table(root)

@@ -1402,7 +1402,13 @@ its real base commit. A project's repository is cloned into a bench-owned folder
 state. Each task runs with each arm under the cell isolation and limit above. A cell lands when a
 blind review (the main grade; arm hidden) scores requirements and correctness at 3 or more; a
 time-limit stop is a fail. `--cap-usd` bounds Claude spend (arm runs plus reviews) from a running
-total: at the cap no task is added and the skipped ones are recorded; when more tasks fit than the
+total: a task reserves the worst case until 2 tasks have finished, then twice the mean actual Claude
+spend of the finished ones (at least a small floor), so the cap buys the tasks it can pay for; actual
+spend never passes the cap (a run's own budget stop bounds each cell, and admission counts spent plus
+the reservations of tasks still running). The day's record lists each admitted task with its reservation and the
+rule that admitted it, and each skipped one with why. A task that landed in several pushes is kept with
+only its own commits (its base is the parent of its first own commit; batch-mates' changes never enter
+its diff) and is dropped only when those commits cannot be identified, with that reason. When more tasks fit than the
 budget, a random sample spreads across projects. GLM spend is reported apart. The open-model arm runs on mini-swe-agent (the harness A/B's winner) unless
 `--glm-harness` or `bench.daily.glm_harness` names another (`claude` is the bridge, `opencode`); `--arm` replaces the
 whole arm list, and the table names each arm's harness. Under

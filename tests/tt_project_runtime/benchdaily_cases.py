@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 
 
@@ -42,6 +43,70 @@ def test_daily_pick_keeps_the_days_landed_code_tasks_from_their_real_base_and_dr
     assert [k["task"] for k in kept2] == [ids["late"]], "each task is picked on the day it landed"
     assert benchdaily.landed_in_window(ro, since, since + 1000) == 2, "the records alone say two landed (a device one too)"
     assert benchdaily.landed_in_window(ro, since + 100_000, since + 200_000) == 0
+
+
+def _two_push_task(git, commit, rev, p, repo, name, when, keep_head=True):
+    # A task whose two commits (a.py, then b.py) landed in two pushes on main with another task's landed
+    # change between them; returns (task id, the two landed shas, the mate's landed sha).
+    run = lambda *a: subprocess.run([*git, *a], check=True, capture_output=True)
+    run("checkout", "-q", "-b", name, "main")
+    c1 = commit({f"{name}_a.py": "def a():\n    return 1\n"}, f"{name} a")
+    c2 = commit({f"{name}_b.py": "def b():\n    return 2\n"}, f"{name} b")
+    run("checkout", "-q", "main")
+    run("cherry-pick", c1)
+    land1 = rev()
+    mate = commit({f"mate_{name}.py": "def m():\n    return 3\n"}, f"mate {name}")
+    run("cherry-pick", c2)
+    land2 = rev()
+    tid = p.db.add_task(name, f"Add {name} a and b.", kind="code")
+    p.db.x("UPDATE tasks SET status='done', created=?, branch=? WHERE id=?", (when, name, tid))
+    for head, land in ((c1, land1), (c2, land2)):
+        p.db.x("INSERT INTO push_queue(task, branch, head, target, status, landed_sha, created, updated) "
+               "VALUES(?,?,?,?,?,?,?,?)", (tid, name, head if keep_head else "0" * 40, "main", "landed", land, when, when))
+    mt = p.db.add_task(f"mate {name}", "Mate.", kind="code")
+    p.db.x("UPDATE tasks SET status='done', created=?, branch=? WHERE id=?", (when, f"mate{name}", mt))
+    p.db.x("INSERT INTO push_queue(task, branch, head, target, status, landed_sha, created, updated) "
+           "VALUES(?,?,?,?,?,?,?,?)", (mt, f"mate{name}", "0" * 40, "main", "landed", mate, when, when))
+    return tid, (land1, land2), mate
+
+
+def test_daily_pick_keeps_a_task_landed_in_two_pushes_with_only_its_own_commits(env, tmp_path):
+    from ttp import benchdaily
+    p = make(env)
+    repo, git, commit, rev = _bench_repo(tmp_path)
+    since = 1_000_000.0
+    # The branch is still in the repository: base is the parent of its first own commit, head its last.
+    tid, lands, mate = _two_push_task(git, commit, rev, p, repo, "kept", since + 10)
+    # Its branch head is gone: the two pushes' own ranges are applied onto one base.
+    tid2, lands2, mate2 = _two_push_task(git, commit, rev, p, repo, "gone", since + 20, keep_head=False)
+    ro = benchdaily.open_ro(p.db.path)
+    kept, dropped = benchdaily.pick(ro, repo, since, since + 1000)
+    got = {k["task"]: k for k in kept}
+    assert tid in got and tid2 in got, (sorted(got), dropped)
+    for t, name in ((tid, "kept"), (tid2, "gone")):
+        files = subprocess.run(["git", "-C", str(repo), "diff", "--name-only", got[t]["base"], got[t]["head"]],
+                               capture_output=True, text=True).stdout.split()
+        assert sorted(files) == [f"{name}_a.py", f"{name}_b.py"], "only its own commits, never the other task's"
+    first = subprocess.run(["git", "-C", str(repo), "rev-parse", got[tid]["head"] + "~2"], capture_output=True,
+                           text=True).stdout.strip()
+    assert got[tid]["base"] == first, "the base is the parent of its first own commit"
+    assert not any(d["why"].startswith("landed in") for d in dropped)
+    assert not dropped, dropped
+    assert benchdaily.landed_in_window(ro, since, since + 1000) == 4
+
+
+def test_daily_pick_drops_a_task_landed_in_two_pushes_only_when_its_own_commits_cannot_be_found(env, tmp_path):
+    from ttp import benchdaily
+    p = make(env)
+    repo, git, commit, rev = _bench_repo(tmp_path)
+    since = 1_000_000.0
+    tid, lands, mate = _two_push_task(git, commit, rev, p, repo, "lost", since + 10, keep_head=False)
+    p.db.x("UPDATE push_queue SET landed_sha=? WHERE task=? AND landed_sha=?", ("f" * 40, tid, lands[1]))
+    ro = benchdaily.open_ro(p.db.path)
+    kept, dropped = benchdaily.pick(ro, repo, since, since + 1000)
+    why = {d["task"]: d["why"] for d in dropped}
+    assert tid not in {k["task"] for k in kept}
+    assert "own commits" in why[tid] and "cannot be identified" in why[tid], why[tid]
 
 
 def test_daily_glm_arm_runs_on_mini_swe_agent_by_default_and_the_harness_is_configurable():
@@ -106,6 +171,86 @@ def test_daily_run_cells_stops_adding_tasks_at_the_cap_and_records_the_skipped_o
     again = benchdaily.run_cells("2026-11-14", tasks, arms, out, tmp_path / "b", {"budget_usd": 1.0, "review_usd": 0.5},
                                  {}, cap=4.5, parallel=1)
     assert again["ran"] == ["t0", "t1", "t2"] and seen == ["t0", "t1", "t2"], "a rerun keeps the cells it has"
+
+
+def _spend_tasks(benchdaily, monkeypatch, spends, ran):
+    """run_task stand-in: task i spends spends[i] on its Claude arm (and 5.0 on the GLM arm), no model call."""
+    def fake_run_task(out, bench_dir, task, arms_, opts, cfg, ledger, lock):
+        ran.append(task["task"])
+        rows = [{"task": task["task"], "rep": 0, "arm": a,
+                 "cost_usd": spends[len(ran) - 1] if a == "son" else 5.0} for a in arms_]
+        for r in rows:
+            benchdaily.append_row(out / "results.jsonl", r, lock)
+        return rows
+    monkeypatch.setattr(benchdaily, "run_task", fake_run_task)
+
+
+_DD_ARMS = {"son": {"provider": "claude", "model": "m", "effort": "high"},
+            "glm": {"provider": "chat", "model": "g", "effort": "max"}}
+
+
+def test_daily_ledger_reserves_the_worst_case_until_two_tasks_finish_then_twice_the_mean_actual_spend():
+    from ttp import benchdaily
+    led = benchdaily.Ledger(40.0)
+    assert led.reservation(10.0, 2.0) == (10.0, 2.0, led.reservation(10.0, 2.0)[2])
+    assert led.reservation(10.0, 2.0)[2].startswith("worst case")
+    led.done(10.0, 3.0)
+    assert led.reservation(10.0, 2.0)[0] == 10.0, "one finished task is too few to measure from"
+    led.done(10.0, 4.0)
+    arms, review, rule = led.reservation(10.0, 2.0)
+    assert arms == 7.0 and review == 2.0 and rule.startswith("measured") and "2 finished" in rule
+    led.done(10.0, 40.0)
+    assert led.reservation(10.0, 2.0)[0] == 10.0, "a reservation never passes the worst case"
+    cheap = benchdaily.Ledger(40.0)
+    cheap.done(10.0, 0.1)
+    cheap.done(10.0, 0.1)
+    assert cheap.reservation(10.0, 2.0)[0] == benchdaily.FLOOR_USD, "and never falls under the floor"
+    assert benchdaily.Ledger(40.0, review_mean=0.3).reservation(10.0, 2.0)[1] == 0.6
+    assert benchdaily.Ledger(40.0, review_mean=0.01).reservation(10.0, 2.0)[1] == benchdaily.REVIEW_FLOOR_USD
+
+
+def test_daily_run_cells_admits_more_tasks_once_the_mean_is_measured_and_keeps_the_cap(env, tmp_path, monkeypatch):
+    from ttp import benchdaily
+    ran = []
+    _spend_tasks(benchdaily, monkeypatch, [1.0] * 40, ran)
+    tasks = {f"t{i}": {"task": f"t{i}"} for i in range(30)}
+    opts = {"budget_usd": 5.0, "review_usd": 1.0}      # the worst case is 6.0 a task
+    res = benchdaily.run_cells("2026-11-14", tasks, _DD_ARMS, tmp_path / "out", tmp_path / "b", opts, {},
+                               cap=20.0, parallel=1)
+    assert len(res["ran"]) > 3, "the worst case alone would admit 3 tasks of 6.0 in 20"
+    assert [a["rule"][:8] for a in res["admitted"][:2]] == ["worst ca", "worst ca"]
+    assert all(a["rule"].startswith("measured") and a["reserved_usd"] == 3.0 for a in res["admitted"][2:])
+    assert res["claude_usd"] <= 20.0
+    assert all("cap" in s["why"] and "reserve" in s["why"] for s in res["skipped"])
+    assert len(res["ran"]) + len(res["skipped"]) == 30
+
+
+def test_daily_run_cells_a_high_spend_first_task_raises_the_reservation_and_total_never_passes_the_cap(env, tmp_path, monkeypatch):
+    from ttp import benchdaily
+    ran = []
+    _spend_tasks(benchdaily, monkeypatch, [4.0, 4.0] + [4.0] * 40, ran)
+    tasks = {f"t{i}": {"task": f"t{i}"} for i in range(30)}
+    opts = {"budget_usd": 5.0, "review_usd": 1.0}
+    res = benchdaily.run_cells("2026-11-14", tasks, _DD_ARMS, tmp_path / "out", tmp_path / "b", opts, {},
+                               cap=30.0, parallel=1)
+    measured = [a for a in res["admitted"] if a["rule"].startswith("measured")]
+    assert measured and all(a["reserved_usd"] == 5.0 + 1.0 for a in measured), "2 x 4.0 hits the worst case 5.0"
+    assert len(res["ran"]) == 5, "each task spends 4.0 and holds 1.0 for its review: a sixth would reserve 6.0 past 30"
+    assert res["claude_usd"] <= 30.0 and res["skipped"]
+
+
+def test_daily_prior_review_mean_reads_the_latest_earlier_day(tmp_path):
+    from ttp import benchdaily
+    days = tmp_path / "days"
+    days.mkdir()
+    (days / "2026-11-12.json").write_text(json.dumps({"cells": [{"task": "a"}, {"task": "a"}, {"task": "b"}],
+                                                      "spend": {"review_usd": 1.0}}))
+    (days / "2026-11-13.json").write_text(json.dumps({"cells": [{"task": "a"}, {"task": "b"}],
+                                                      "spend": {"review_usd": 0.5}}))
+    assert benchdaily.prior_review_mean(tmp_path) == 0.25
+    assert benchdaily.prior_review_mean(tmp_path, "2026-11-13") == 0.5
+    assert benchdaily.prior_review_mean(tmp_path, "2026-11-12") is None
+    assert benchdaily.prior_review_mean(tmp_path / "none") is None
 
 
 def _dd_tree_state(root):

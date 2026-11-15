@@ -95,6 +95,60 @@ def landing(repo: Path, rows: list[dict], stops: frozenset = frozenset(),
     return (base, land, "") if same else ("", "", "its landed commits do not match its branch")
 
 
+def own_range(repo: Path, rows: list[dict], stops: frozenset = frozenset(),
+              shared: frozenset = frozenset()) -> tuple[str, str, str]:
+    """(base, head, "") of a change that landed in one or more pushes, built from the task's own commits
+    only, so batch-mates landed in the same pushes never enter its diff; else ("", "", why) when its own
+    commits cannot be identified. Rows landing the same commit count once; one landing is `landing`'s.
+    With several pushes, the base is the parent of the first own commit and the head the branch head
+    when the repository still has it (its commits are the task's own; every file it changes must be one
+    the pushes landed); else the pushes' own ranges (`landing` of each) are applied in landing order onto
+    the first one's base as one synthetic commit, and a range that does not apply drops the task."""
+    uniq = list({r["landed_sha"]: r for r in rows}.values())
+    if len(uniq) < 2:
+        return landing(repo, uniq, stops, shared)
+    if missing := [r for r in uniq if not _out(repo, "rev-parse", "--verify", "-q", f"{r['landed_sha']}^{{commit}}")]:
+        return "", "", f"its own commits cannot be identified: the push landing {missing[0]['landed_sha'][:10]} is not in the repository"
+    uniq.sort(key=lambda r: int(_out(repo, "rev-list", "--count", r["landed_sha"]) or 0))
+    first, last = uniq[0]["landed_sha"], uniq[-1]["landed_sha"]
+    tip = next((t for r in reversed(uniq) if (h := r.get("head")) and
+                (t := _out(repo, "rev-parse", "--verify", "-q", f"{h}^{{commit}}"))), "")
+    if tip:
+        fork = _out(repo, "merge-base", tip, f"{first}^")
+        if fork and fork != tip and _out(repo, "rev-list", "--count", "--merges", f"{fork}..{tip}") == "0":
+            landed = set(_out(repo, "diff", "--name-only", f"{first}^", last).splitlines())
+            if set(_out(repo, "diff", "--name-only", fork, tip).splitlines()) <= landed:
+                return fork, tip, ""
+    parts = []
+    for r in uniq:
+        base, land, why = landing(repo, [r], stops, shared)
+        if why:
+            return "", "", f"its own commits in the push landing {r['landed_sha'][:10]} cannot be identified: {why}"
+        parts.append((base, land))
+    return _compose(repo, parts)
+
+
+def _compose(repo: Path, parts: list[tuple[str, str]]) -> tuple[str, str, str]:
+    """(base, synthetic head, "") applying each (base, landed) range of `parts` in order onto the first
+    one's base, in a scratch index; ("", "", why) when one does not apply."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = {**os.environ, "GIT_INDEX_FILE": str(Path(tmp) / "index")}
+        run = lambda *a, **kw: subprocess.run(["git", "-C", str(repo), *a], capture_output=True, env=env, **kw)
+        if run("read-tree", parts[0][0]).returncode:
+            return "", "", "its first own commit's parent cannot be read"
+        for base, land in parts:
+            patch = run("diff", "--binary", "--no-renames", base, land).stdout
+            if patch and run("apply", "--cached", "--3way", input=patch).returncode:
+                return "", "", "its own commits in separate pushes do not apply together"
+        tree = run("write-tree", text=True).stdout.strip()
+        ident = {**env, "GIT_AUTHOR_NAME": "bench", "GIT_AUTHOR_EMAIL": "bench@localhost",
+                 "GIT_COMMITTER_NAME": "bench", "GIT_COMMITTER_EMAIL": "bench@localhost"}
+        r = subprocess.run(["git", "-C", str(repo), "commit-tree", tree, "-p", parts[0][0], "-m", "own commits"],
+                           capture_output=True, text=True, env=ident)
+    return (parts[0][0], r.stdout.strip(), "") if r.returncode == 0 and r.stdout.strip() else (
+        "", "", "its own commits could not be combined")
+
+
 def _start(repo: Path, land: str, stops: frozenset) -> str:
     """The nearest first-parent ancestor of `land` (within WALK) that is in `stops` or a version-bump
     commit: the push branch just before the change's own commits; "" when none is."""
