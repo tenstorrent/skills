@@ -2517,12 +2517,13 @@ def test_bench_run_arm_harness_types_parse_install_once_into_the_bench_folder_an
     line = (tmp_path / "harness.sh").read_text()
     assert "-m openai/org/m" in line and "-o " + str(tmp_path / "trajectory.json") in line and "-y" in line
     assert "cost_limit: 0" in (tmp_path / "mini.yaml").read_text() and "~/.local" not in script + line
-    # Spend: the bridge's token counts, priced at the provider's row, always an estimate.
+    # Spend: the bridge's token counts (input already without the cached share), priced at the
+    # provider's row, always an estimate.
 
     class Prov:
         def price(self):
             return (1.0, 0.1, 2.0)
     got = benchrun.harness_spend(Prov(), {"calls": 3, "input_tokens": 1_000_000, "output_tokens": 500_000,
                                           "cache_read_input_tokens": 400_000})
-    assert got == {"input_tokens": 600_000, "output_tokens": 500_000, "cache_read_tokens": 400_000, "model_calls": 3,
-                   "cost_estimated": True, "cost_basis": benchrun.HARNESS_BASIS, "cost_usd": 1.64}
+    assert got == {"input_tokens": 1_000_000, "output_tokens": 500_000, "cache_read_tokens": 400_000, "model_calls": 3,
+                   "cost_estimated": True, "cost_basis": benchrun.HARNESS_BASIS, "cost_usd": 2.04}

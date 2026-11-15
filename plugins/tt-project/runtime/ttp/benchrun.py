@@ -921,7 +921,8 @@ def harness_spend(prov, usage: dict) -> dict:
     """A harness arm's tokens and spend from the bridge's usage counts, at the chat provider's price row
     (or list price, localspend), always marked estimated."""
     fin, fout, fread = (int(usage.get(k) or 0) for k in ("input_tokens", "output_tokens", "cache_read_input_tokens"))
-    out = {"input_tokens": max(fin - fread, 0), "output_tokens": fout, "cache_read_tokens": fread,
+    # chatbridge.usage_of already counts input_tokens without the cached share: never subtract it twice
+    out = {"input_tokens": fin, "output_tokens": fout, "cache_read_tokens": fread,
            "model_calls": int(usage.get("calls") or 0), "cost_estimated": True, "cost_basis": HARNESS_BASIS}
     row = prov.price() if hasattr(prov, "price") else None
     if row:
