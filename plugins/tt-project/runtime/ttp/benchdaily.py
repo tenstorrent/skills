@@ -118,9 +118,7 @@ def mirror(proj: dict, base: Path | None = None, source: Path | None = None) -> 
         info = dest / "objects" / "info"
         info.mkdir(parents=True, exist_ok=True)
         if not (info / "alternates").exists() or (info / "alternates").read_text().strip() != objects:
-            tmp = info / "alternates.tmp"
-            tmp.write_text(objects + "\n")
-            os.replace(tmp, info / "alternates")
+            durable_write(info / "alternates", objects + "\n")
         have = {l.split(" ", 1)[1]: l.split(" ", 1)[0] for l in _git(dest, "for-each-ref", "--format=%(objectname) %(refname)",
                                                                      "refs/heads").splitlines()}
         cmds = [f"delete {ref}\n" for ref in have if ref not in heads]
