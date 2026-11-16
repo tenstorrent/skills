@@ -122,6 +122,25 @@ def test_a_packet_masks_model_ids_that_appear_as_dict_keys(env, tmp_path):
     assert len(keys) == 2 and len(set(keys)) == 2
 
 
+def test_each_packet_numbers_its_masked_keys_from_one_and_names_an_equal_key_alike(env, tmp_path):
+    """Masked key names are numbered per packet: two packets built back to back both start at
+    [model:1], whatever was masked before, and the same model id gets the same name across a packet's
+    files."""
+    from pathlib import Path
+    from ttp import blindreview
+    p = make(env)
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "result.json").write_text(_json.dumps({"usage": {"glm-5.3": {"in": 1}, "opus": {"in": 2}}}))
+    (run / "output.jsonl").write_text(_json.dumps({"usage": {"opus": {"in": 3}}}) + "\n")
+    blindreview.mask({"usage": {"gemini-x": 1}})   # masking elsewhere first moves no packet's numbering
+    for key in ("ab-1", "ab-2"):
+        got = Path(blindreview.packet(p.state, key, str(run), None))
+        usage = _json.loads((got / "result.json").read_text())["usage"]
+        assert list(usage) == ["[model:1]", "[model:2]"], key
+        assert list(_json.loads((got / "output.jsonl").read_text())["usage"]) == ["[model:2]"], key
+
+
 def test_device_reviews_are_flagged_blind_and_point_at_the_masked_copy_not_the_run_folder(env, tmp_path):
     from ttp import blindreview, deviceab
     p = make(env)

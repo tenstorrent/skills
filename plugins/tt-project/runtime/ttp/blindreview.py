@@ -12,7 +12,6 @@ transcript name the model). Device shadow reviews name the arm by an opaque code
 maps back (`arm_of`)."""
 from __future__ import annotations
 
-import itertools
 import json
 import os
 import re
@@ -50,8 +49,8 @@ MASK = "[model]"
 PACKET_MAX = 2_000_000   # bytes per file in a packet
 
 # The arm words a masked dict key carries: a usage map keyed by a model id must not keep that id as its key.
-# Each masked key keeps its kind (model:), so two different keys never collide.
-_KEY_N = itertools.count(1)
+# Each masked key keeps its kind (model:), so two different keys never collide; the numbering is per
+# packet (or per top-level mask() call), so a packet's names never depend on what was masked before it.
 
 
 def scrub(text) -> str:
@@ -63,25 +62,29 @@ def _arm_label(lb: str) -> bool:
     return lb.startswith(ARM_LABELS)
 
 
-def _mask_key(k) -> str:
+def _mask_key(k, names: dict) -> str:
     """A dict key whose text carries arm words keeps its kind but not its identity: the key is
-    replaced by a stable masked name, so two different model ids never collide into one key."""
+    replaced by a masked name numbered per kind in `names` (one packet's), so two different model ids
+    never collide into one key and the same id gets the same name throughout the packet."""
     k = str(k)
     if WORDS.search(k) or any(t in k.lower() for t in ("provider:", "effort:")):
-        n = _KEY_N.__next__()
-        kind = "model" if WORDS.search(k) else "value"
-        return f"[{kind}:{n}]"
+        if k not in names:
+            kind = "model" if WORDS.search(k) else "value"
+            names[k] = f"[{kind}:{sum(v.startswith(f'[{kind}:') for v in names.values()) + 1}]"
+        return names[k]
     return k
 
 
-def mask(v, key: str = ""):
-    """A JSON-like value with arm fields dropped, arm labels dropped and model names masked in its strings."""
+def mask(v, key: str = "", names: dict | None = None):
+    """A JSON-like value with arm fields dropped, arm labels dropped and model names masked in its strings.
+    `names`: the masked key names given so far in this packet (a new numbering when None)."""
+    names = {} if names is None else names
     if isinstance(v, dict):
         out = {}
         for k, x in v.items():
             if str(k) in MASK_KEYS:
                 continue
-            nk = _mask_key(k)
+            nk = _mask_key(k, names)
             if k == "labels" and isinstance(x, str):   # the task row keeps labels as a JSON string
                 try:
                     x = json.dumps([lb for lb in json.loads(x or "[]") if not _arm_label(str(lb))])
@@ -91,16 +94,16 @@ def mask(v, key: str = ""):
                 continue
             if k == "result" and isinstance(x, str):   # a stored hand-off: masked as JSON where it parses
                 try:
-                    out[nk] = json.dumps(mask(json.loads(x)))
+                    out[nk] = json.dumps(mask(json.loads(x), names=names))
                 except ValueError:
                     out[nk] = scrub(x)
                 continue
-            out[nk] = mask(x, str(k))
+            out[nk] = mask(x, str(k), names)
         return out
     if isinstance(v, list):
         if key == "labels":
             v = [lb for lb in v if not _arm_label(str(lb))]
-        return [mask(x) for x in v]
+        return [mask(x, names=names) for x in v]
     if isinstance(v, str):
         return scrub(v)
     return v
@@ -175,11 +178,11 @@ def arm_of(q, code: str) -> str:
     return v.partition(":")[2] if isinstance(v, str) else code
 
 
-def _jsonl(raw: str) -> str:
-    out = []
+def _jsonl(raw: str, names: dict | None = None) -> str:
+    out, names = [], {} if names is None else names
     for line in raw.splitlines():
         try:
-            out.append(json.dumps(mask(json.loads(line))))
+            out.append(json.dumps(mask(json.loads(line), names=names)))
         except ValueError:
             out.append(scrub(line))
     return "\n".join(out) + ("\n" if out else "")
@@ -199,6 +202,7 @@ def packet(state: str | Path, key: str, run_dir: str | Path | None, handoff: str
         return ""
     dst = Path(state) / "blind" / re.sub(r"[^\w.-]", "_", key)
     dst.mkdir(parents=True, exist_ok=True)
+    names: dict = {}   # one key numbering for the whole packet
     for name in ("result.json", "progress.md", "output.jsonl"):
         f = src / name if src else None
         if not (f and f.is_file()):
@@ -206,11 +210,11 @@ def packet(state: str | Path, key: str, run_dir: str | Path | None, handoff: str
         raw = f.read_bytes()[:PACKET_MAX].decode(errors="replace")
         if name == "result.json":
             try:
-                text = json.dumps(mask(json.loads(raw)), indent=2)
+                text = json.dumps(mask(json.loads(raw), names=names), indent=2)
             except ValueError:
                 text = scrub(raw)
         elif name.endswith(".jsonl"):
-            text = _jsonl(raw)
+            text = _jsonl(raw, names)
         else:
             text = scrub(raw)
         _write(dst / name, text)
