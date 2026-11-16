@@ -14,12 +14,13 @@ its own runs. Each run that ended in the window counts once, in the first bucket
   over_runs      a task's runs past its `waste.max_runs`th
   costly_wake    the part of a coordinator wake over `waste.wake_usd`
 
-The total is every run's booking in the window; the share is avoidable over total.
+The total is every run's booking in the window; the share is avoidable less retained, over total.
 
 Superseded work a later task kept is still counted there, gross, and also shown apart as retained: a
 cancelled task another task `continues` (its branch, packets or evidence carry on), work re-landed as
 another commit (task_superseded) or a correction class a later fix closed (task_class_fix). Retained
-spend is neither saved nor a loss to fix: the fix bucket is picked on spend less retained. The ledger
+spend is neither saved nor a loss to fix: the share, the target check and the fix bucket all use spend less
+retained. The ledger
 only reads; it never closes a task, an obligation or a promise."""
 from __future__ import annotations
 
@@ -175,8 +176,9 @@ def report(db, since: float, now: float, cfg: dict | None = None) -> dict:
         for k in ("tasks", "retained_tasks"):
             b[k] = [t for t, _ in sorted(b[k].items(), key=lambda x: -x[1])]
     avoidable = sum(b["usd"] for b in buckets.values())
-    return {"total": total, "avoidable": avoidable, "retained": sum(b["retained_usd"] for b in buckets.values()),
-            "share": avoidable / total if total else 0.0,
+    retained = sum(b["retained_usd"] for b in buckets.values())
+    return {"total": total, "avoidable": avoidable, "retained": retained,
+            "share": max(avoidable - retained, 0.0) / total if total else 0.0,
             "target": float(cfg.get("target_share") or 0), "buckets": buckets}
 
 
@@ -201,11 +203,14 @@ def over(rep: dict) -> bool:
 
 
 def line(project: str, rep: dict) -> str:
-    """The one short daily line for the user's chat."""
+    """The one short daily line for the user's chat: the gross avoidable figure, the part successors kept
+    apart, and the share net of it."""
     top = fix_bucket(rep, any_share=True)
-    return (f"{project}: avoidable ${rep['avoidable']:.2f} of ${rep['total']:.2f} ({rep['share']:.0%})"
+    kept = rep.get("retained", 0) > 0
+    return (f"{project}: avoidable ${rep['avoidable']:.2f} of ${rep['total']:.2f}"
+            + (f", ${rep['retained']:.2f} of it kept by successors" if kept else "")
+            + f" ({'net ' if kept else ''}{rep['share']:.0%})"
             + (f", most in {LABELS[top]}" if top else "")
-            + (f", ${rep['retained']:.2f} of it kept by successors" if rep.get("retained", 0) > 0 else "")
             + (f"; over the {rep['target']:.0%} target" if over(rep) else ""))
 
 

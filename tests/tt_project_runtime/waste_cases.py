@@ -123,6 +123,33 @@ def test_waste_ledger_keeps_gross_cancelled_spend_and_shows_what_a_successor_kep
     assert waste.fix_bucket(rep) == "superseded"
 
 
+def test_waste_share_and_target_check_use_avoidable_spend_less_what_successors_kept(env):
+    """Spend a successor kept is not a loss: the share and over() use avoidable less retained, so kept work
+    alone never puts a project over target; the daily line still shows the gross figure and the kept one."""
+    from ttp import waste
+    p = make(env)
+    now = 1_000_000.0
+    old = _waste_task(p, "integration run", status="cancelled")
+    _waste_run(p, old, 4.0, now)
+    _waste_task(p, "integration run, continued", status="running", labels=[f"continues:{old}"])
+    good = _waste_task(p, "fine work")
+    _waste_run(p, good, 16.0, now)
+    rep = waste.report(p.db, now - 86400, now, p.config())
+    assert round(rep["avoidable"], 2) == 4.0 and round(rep["retained"], 2) == 4.0   # gross 20%, over 10%
+    assert rep["share"] == 0 and not waste.over(rep) and waste.fix_bucket(rep) == ""
+    head = waste.line("demo", rep)
+    assert head.startswith("demo: avoidable $4.00 of $20.00, $4.00 of it kept by successors (net 0%)"), head
+    assert "target" not in head
+    # Net spend past the target still counts: $4 kept, $3 lost of $23 is 13% net.
+    lost = _waste_task(p, "broken idea", status="failed")
+    _waste_run(p, lost, 3.0, now)
+    rep = waste.report(p.db, now - 86400, now, p.config())
+    assert round(rep["share"], 3) == round(3 / 23, 3) and waste.over(rep)
+    head = waste.line("demo", rep)
+    assert "avoidable $7.00 of $23.00, $4.00 of it kept by successors (net 13%)" in head
+    assert "over the 10% target" in head
+
+
 def test_waste_ledger_under_target_queues_no_fix_and_the_cli_prints_buckets(env, capsys):
     from ttp import cli, waste
     p = make(env)
