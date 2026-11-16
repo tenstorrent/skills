@@ -1395,7 +1395,9 @@ so Claude and an open model see the same agent and the same system prompt text. 
 copied or printed, no API key) and the variables of an enclosing Claude Code session dropped. `--system-prompt` replaces
 Claude Code's prompt, never appends; no CLAUDE.md, skills, plugins, MCP servers, hooks, memory or built-in tools load. The
 agent's tool schema is rendered in the user turn (an open model gets it through its chat template) and the reply's
-`<tool_call>` blocks become the agent's tool calls. What the CLI still adds is listed with each table: its few built-in
+`<tool_call>` blocks become the agent's tool calls. A print-mode call cannot stop at a command, so a reply with several runs
+only the first (as an open model's native tool call ends the turn at the first), drops the rest and counts them in the exit
+record's `usage.dropped_tool_calls`. What the CLI still adds is listed with each table: its few built-in
 environment and safety lines, and the built-in plugin names its init event lists. Each cell records the CLI version, the
 argv with the prompt text left out, and the spend from the CLI's own usage; a result table states how Claude was called.
 

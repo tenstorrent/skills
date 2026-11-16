@@ -169,3 +169,62 @@ def test_bench_claude_arm_on_mini_swe_agent_parses_prices_from_the_cli_and_enfor
                                         "cache_read_input_tokens": 300, "cache_write_tokens": 40, "cost_usd": 0.1234567})
     assert out["cost_usd"] == 0.123457 and out["cost_estimated"] is False and out["cache_write_tokens"] == 40
     assert "cost_basis" not in out and "claude CLI" in out["cost_source"]
+
+
+def _cb_ask(b, tools=None):
+    req = urllib.request.Request(b.url + "/v1/chat/completions", data=json.dumps({
+        "model": "x", "tools": tools or [_CB_BASH_TOOL], "messages": [
+            {"role": "system", "content": _CB_SYS}, {"role": "user", "content": "go"}]}).encode(),
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {b.token}"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read())
+
+
+def test_claude_cli_bridge_keeps_only_the_first_command_of_a_reply_and_counts_the_drop(tmp_path, monkeypatch, capsys):
+    """The CLI has no tools, so it cannot stop at a command: a reply with three commands runs the first and drops two
+    (as a native tool call ends the turn at the first), counted in the exit record's usage and the response."""
+    from ttp import claudebridge
+    reply = ('Probing.\n<tool_call name="bash">\necho one\n</tool_call>\n'
+             '<tool_call name="bash">\necho two\n</tool_call>\n<tool_call name="bash">\necho three\n</tool_call>')
+    fake, _ = _cb_fake_claude(tmp_path, reply)
+    monkeypatch.setenv("PATH", f"{fake}:{os.environ['PATH']}")
+    b = claudebridge.ClaudeCliBridge.from_settings({"model": "claude-opus-5-5", "effort": "high"}).start()
+    try:
+        got = _cb_ask(b)
+        stats = b.stats()
+    finally:
+        b.stop()
+    msg = got["choices"][0]["message"]
+    assert [json.loads(c["function"]["arguments"]) for c in msg["tool_calls"]] == [{"command": "echo one"}]
+    assert got["choices"][0]["finish_reason"] == "tool_calls" and got["ttp_dropped_tool_calls"] == 2
+    assert "echo two" not in json.dumps(got) and "echo three" not in json.dumps(got)
+    assert stats["usage"]["dropped_tool_calls"] == 2 and stats["usage"]["calls"] == 1
+    assert "dropped 2 more" in capsys.readouterr().err
+
+
+def test_claude_cli_bridge_leaves_a_one_command_or_command_free_reply_unchanged(tmp_path, monkeypatch):
+    from ttp import claudebridge
+    for reply, ncalls in (('<tool_call name="bash">\nls\n</tool_call>', 1), ("All done, no command.", 0)):
+        fake, _ = _cb_fake_claude(tmp_path, reply)
+        monkeypatch.setenv("PATH", f"{fake}:{os.environ['PATH']}")
+        b = claudebridge.ClaudeCliBridge.from_settings({"model": "claude-opus-5-5"}).start()
+        try:
+            got = _cb_ask(b)
+            stats = b.stats()
+        finally:
+            b.stop()
+        assert len(got["choices"][0]["message"].get("tool_calls") or []) == ncalls
+        assert "ttp_dropped_tool_calls" not in got and stats["usage"]["dropped_tool_calls"] == 0
+
+
+def test_bench_second_reviewer_is_a_known_config_key_the_daily_bench_reads(env):
+    """`ttp config bench.second_reviewer '{...}'` was refused as an unknown key although benchdaily reads it."""
+    from ttp import benchdaily
+    from ttp.project import DEFAULT_CONFIG, unknown_key_hint
+    assert "second_reviewer" in DEFAULT_CONFIG["bench"]
+    assert unknown_key_hint("bench.second_reviewer") is None and unknown_key_hint("bench.second_reviewer.model") is None
+    assert unknown_key_hint("bench.second_reviwer")   # a typo is still refused
+    p = make(env)
+    assert benchdaily.second_reviewer(p.config()) is None   # unset: no second grader
+    p.set_config("bench.second_reviewer", {"provider": "chat", "model": "some-model", "effort": "max"})
+    assert benchdaily.second_reviewer(p.config()) == {"model": "some-model", "effort": "max", "provider": "chat"}

@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -249,7 +250,7 @@ class ClaudeCliBridge(Bridge):
         super().__init__("http://127.0.0.1", "", model, effort=effort, timeout=timeout)
         self.retries, self.retry_wait_s = int(retries), float(retry_wait_s)
         self.usage = {"calls": 0, "input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0,
-                      "cache_write_tokens": 0, "cost_usd": 0.0}
+                      "cache_write_tokens": 0, "cost_usd": 0.0, "dropped_tool_calls": 0}
         self.cli_version = ""
         self.scratch = ""   # the empty working folder of every call
         self._lock = threading.Lock()
@@ -325,9 +326,17 @@ class ClaudeCliBridge(Bridge):
             msg = f"claude CLI {kind} fault" + (f": {(res or {}).get('result') or err}"[:300] if kind != "auth" else "")
             return h._reply(code, {"error": {"message": msg, "type": "api_error", "code": kind}})
         text, calls = parse_reply(str(res.get("result") or ""), tools)
+        # The CLI cannot stop at a command (no tools), so a long reply may hold many; the model never saw
+        # their output. Keep the first and drop the rest, as a native tool call ends the turn at the first.
+        dropped = max(0, len(calls) - 1)
+        calls = calls[:1]
+        if dropped:
+            print(f"claude bridge: kept the first command of the reply, dropped {dropped} more",
+                  file=sys.stderr, flush=True)
         got = result_usage(res)
         with self._lock:
             self.usage["calls"] += 1
+            self.usage["dropped_tool_calls"] += dropped
             for k, v in got.items():
                 self.usage[k] += v
             self.last_fault = ""
@@ -337,6 +346,7 @@ class ClaudeCliBridge(Bridge):
         total_in = got["input_tokens"] + got["cache_read_input_tokens"] + got["cache_write_tokens"]
         h._reply(200, {"id": f"chatcmpl-{int(time.time() * 1000)}", "object": "chat.completion",
                        "created": int(time.time()), "model": self.model,
+                       **({"ttp_dropped_tool_calls": dropped} if dropped else {}),
                        "choices": [{"index": 0, "message": msg,
                                     "finish_reason": "tool_calls" if calls else "stop"}],
                        "usage": {"prompt_tokens": total_in, "completion_tokens": got["output_tokens"],
