@@ -12,6 +12,7 @@ transcript name the model). Device shadow reviews name the arm by an opaque code
 maps back (`arm_of`)."""
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import re
@@ -48,6 +49,10 @@ WORDS = re.compile(rf"(?<![\w./-])(?:{_FAMILIES})(?![\w/])", re.I)
 MASK = "[model]"
 PACKET_MAX = 2_000_000   # bytes per file in a packet
 
+# The arm words a masked dict key carries: a usage map keyed by a model id must not keep that id as its key.
+# Each masked key keeps its kind (model:), so two different keys never collide.
+_KEY_N = itertools.count(1)
+
 
 def scrub(text) -> str:
     """`text` with every model id and family word masked."""
@@ -58,6 +63,17 @@ def _arm_label(lb: str) -> bool:
     return lb.startswith(ARM_LABELS)
 
 
+def _mask_key(k) -> str:
+    """A dict key whose text carries arm words keeps its kind but not its identity: the key is
+    replaced by a stable masked name, so two different model ids never collide into one key."""
+    k = str(k)
+    if WORDS.search(k) or any(t in k.lower() for t in ("provider:", "effort:")):
+        n = _KEY_N.__next__()
+        kind = "model" if WORDS.search(k) else "value"
+        return f"[{kind}:{n}]"
+    return k
+
+
 def mask(v, key: str = ""):
     """A JSON-like value with arm fields dropped, arm labels dropped and model names masked in its strings."""
     if isinstance(v, dict):
@@ -65,20 +81,21 @@ def mask(v, key: str = ""):
         for k, x in v.items():
             if str(k) in MASK_KEYS:
                 continue
+            nk = _mask_key(k)
             if k == "labels" and isinstance(x, str):   # the task row keeps labels as a JSON string
                 try:
                     x = json.dumps([lb for lb in json.loads(x or "[]") if not _arm_label(str(lb))])
                 except ValueError:
                     x = "[]"
-                out[k] = scrub(x)
+                out[nk] = scrub(x)
                 continue
             if k == "result" and isinstance(x, str):   # a stored hand-off: masked as JSON where it parses
                 try:
-                    out[k] = json.dumps(mask(json.loads(x)))
+                    out[nk] = json.dumps(mask(json.loads(x)))
                 except ValueError:
-                    out[k] = scrub(x)
+                    out[nk] = scrub(x)
                 continue
-            out[k] = mask(x, str(k))
+            out[nk] = mask(x, str(k))
         return out
     if isinstance(v, list):
         if key == "labels":

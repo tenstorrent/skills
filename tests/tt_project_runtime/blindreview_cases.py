@@ -102,6 +102,26 @@ def test_a_blind_review_starts_without_the_coordinator_context_and_reads_a_maske
     assert "/.claude/x" in text and "ok" in text   # paths and the work itself stay readable
 
 
+def test_a_packet_masks_model_ids_that_appear_as_dict_keys(env, tmp_path):
+    """A usage map keyed by a model id (the CLI result record's shape) keeps no id as its key:
+    the key is re-named (stably, so two models never collide) and the id appears nowhere in the packet."""
+    from ttp import blindreview
+    p = make(env)
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "result.json").write_text(_json.dumps({
+        "summary": "done", "provider": "zhipu", "effort": "max",
+        "usage": {"glm-5.3": {"input_tokens": 10}, "opus": {"input_tokens": 20}}}))
+    (run / "output.jsonl").write_text(_json.dumps({"type": "x", "usage": {"claude-sonnet-5-5": {"in": 1}}}) + "\n")
+    got = blindreview.packet(p.state, "ab-2", str(run), None)
+    text = "".join(f.read_text() for f in __import__("pathlib").Path(got).iterdir()).lower()
+    for bad in ("glm-5.3", "opus", "claude-sonnet", "zhipu", "anthropic", '"provider"'):
+        assert bad not in text, bad
+    # the two usage keys survive as distinct masked keys: no two models collapse into one
+    keys = _json.loads((__import__("pathlib").Path(got) / "result.json").read_text())["usage"]
+    assert len(keys) == 2 and len(set(keys)) == 2
+
+
 def test_device_reviews_are_flagged_blind_and_point_at_the_masked_copy_not_the_run_folder(env, tmp_path):
     from ttp import blindreview, deviceab
     p = make(env)
