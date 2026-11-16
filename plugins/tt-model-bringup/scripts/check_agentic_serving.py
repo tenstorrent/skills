@@ -52,7 +52,6 @@ LIMITS = ("agent_timeout_s", "request_timeout_s", "output_cap_tokens")
 RATE_FIELDS = ("prefill_tok_s", "decode_tok_s_user", "ttft_s", "step_ms")
 LONG_CONTEXT_TOKENS = 28672
 POOL_FREE_FRACTION = 0.5
-LEARNED = ("best_config", "harness_facts", "generic_fixes")
 
 
 def shortfall(problems: list, reason, message: str) -> None:
@@ -552,9 +551,6 @@ def check_evals(model_dir: Path, inputs: dict, evidence: dict, problems: list) -
             check_run(run, inputs, validated, collected, item, 0, problems)
     if not (evals / "REPORT.md").is_file():
         problems.append((2, f"missing {evals / 'REPORT.md'}"))
-    learned = read(evals / "learned.json", problems)
-    if learned and not all(isinstance(learned.get(key), (list, dict)) for key in LEARNED):
-        problems.append((2, f"learned.json needs {', '.join(LEARNED)}, empty when there is nothing"))
 
 
 def main() -> int:

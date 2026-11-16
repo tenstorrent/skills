@@ -154,7 +154,6 @@ def goal12(model, runs=None, phases=None, inputs=None, data=None, extra=None, di
     (evals / 'results.json').write_text(json.dumps(results))
     (evals / 'runs.json').write_text(json.dumps({'runs': [{'id': r['id'], 'conclusion': 'collected'} for r in runs
                                                           if r.get('collected')]}))
-    (evals / 'learned.json').write_text(json.dumps({'best_config': {}, 'harness_facts': [], 'generic_fixes': []}))
     (evals / 'REPORT.md').write_text('# Phases\n')
     return check(model, 'agentic-evals', data if data is not None else evidence(),
                  inputs if inputs is not None else {'mode': 'quick'})
@@ -815,3 +814,13 @@ def test_a_gate_script_that_does_not_parse_is_an_error_not_advisory(tmp_path, ga
                             env={**__import__('os').environ, 'MODEL_DIR': str(tmp_path / 'm')},
                             cwd=tmp_path, capture_output=True, text=True)
     assert result.returncode == 3 and 'do not parse' in result.stderr
+
+
+def test_no_stage_reads_an_earlier_run():
+    """Each run is independent: no skill, prompt or script of the plugin names a cross-run record."""
+    root = Path(__file__).resolve().parents[1] / 'plugins/tt-model-bringup'
+    for path in [*root.glob('skills/**/*.md'), *root.glob('prompts/**/*'), *root.glob('scripts/*')]:
+        if path.is_file():
+            text = path.read_text(errors='ignore')
+            for word in ('learned.json', 'best_config', 'task_times', 'best-known'):
+                assert word not in text, f'{path} mentions {word}'
