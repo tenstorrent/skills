@@ -22,4 +22,6 @@ detached and are waited on without model calls (`scripts/eval_runs.py`). The gat
 missing records or analysis and rule breaks, advisory for a phase not passed yet. The multigoal runner
 writes each stage's Codex tokens (by thread family) and device held/idle hours into its report.
 `scripts/agent_replay.py` replays recorded agent histories to test capacity and caching. Benchmark,
-multichip and serving-stack guidance gains slow-run diagnosis, a teardown rule and a no-mixed-runtimes rule.
+multichip and serving-stack guidance gains slow-run diagnosis, a teardown rule and a no-mixed-runtimes rule. Each
+goal-12 run is independent: it starts with an empty `doc/agentic_evals` and reads no earlier run's
+outputs.
