@@ -111,7 +111,20 @@ GIT_READS = {"log", "show", "status", "diff", "rev-parse", "merge-base", "ls-rem
 TTP_READS = READ_COMMANDS + (("paths",), ("list",), ("show",), ("quarantine", "list"), ("memory", "--search"),
                              ("audit", "fixes"), ("checks", "--result"), ("lock", "--probe"), ("upstream", "--fixed"),
                              ("push", "--queue"), ("push", "--result"), ("--help",), ("-h",), ("help",),
-                             ("--version",), ("task", "*", "eta"), ("bridge", "status"), ("overview",), ("runs",), ("schedules", "*", "grace"))
+                             ("--version",), ("task", "*", "eta"), ("bridge", "status"), ("overview",), ("runs",), ("schedules", "*", "grace"),
+                             ("schedules", "*", "show"), ("schedules", "*", "list"), ("obligation", "list"),
+                             ("task", "show"))   # the project may be left out: it is the one here
+SHELL_KEYWORDS = {"do", "then", "else", "elif", "if", "while", "until", "!", "{"}   # lead a command; `done`/`fi` end one
+PY_NAMES = re.compile(r"python(3(\.\d+)?)?")
+# python -c code that may write or run something else: any string literal that could be a write mode
+# ("w", "ab", "r+"; a false change is safe), a mode= or os.O_* write flag, subprocess, os calls that change files or
+# run commands, shutil, path methods that write, and anything that reaches code it cannot see
+PY_WRITES = re.compile(r"""['"][rbtU]*[wax+][rbt+]*['"]|\bmode\s*=|\bO_(WRONLY|RDWR|CREAT|APPEND|TRUNC)\b|\bsubprocess\b|\bshutil\b|\bos\s*\.\s*(open|system|popen|exec|spawn|"""
+                       r"""remove|unlink|rename|replace|rmdir|removedirs|mkdir|makedirs|chmod|chown|kill|killpg|truncate|"""
+                       r"""symlink|link|write|fork|utime|setxattr)|\.(unlink|rename|write_text|write_bytes|mkdir|rmdir|"""
+                       r"""touch|chmod|symlink_to|hardlink_to)\s*\(|\bfrom\s+(os|shutil|subprocess)\b|\b__import__\b|"""
+                       r"""\b(exec|eval|compile|getattr|globals|breakpoint)\s*\(|\b(importlib|ctypes|pty|socket|sqlite3|"""
+                       r"""urllib|http|requests|tempfile|pickle|signal|multiprocessing|threading|asyncio|ttp)\b""")
 LAUNCHCTL_READS = {"print", "list", "print-disabled", "blame", "version", "help"}
 SYSTEMCTL_READS = {"status", "show", "list-units", "list-timers", "list-unit-files", "is-active", "is-enabled",
                    "is-failed", "cat", "list-dependencies", "list-sockets"}
@@ -151,6 +164,61 @@ def _simple(cmd: str) -> list[list[str]] | None:
     return out + ([words] if words else [])
 
 
+def _substituted(cmd: str, depth: int) -> str | None:
+    """`cmd` with each `$( ... )` that only reads (reads_only, one level deeper) replaced by a plain word;
+    None when one may write, cannot be matched, or is arithmetic (`$((`)."""
+    out, i, quote = [], 0, ""
+    while i < len(cmd):
+        c = cmd[i]
+        if c == "\\" and quote != "'":
+            out.append(cmd[i:i + 2])
+            i += 2
+            continue
+        if c == "'" and quote != '"' or c == '"' and quote != "'":
+            quote = "" if quote == c else c
+        elif cmd.startswith("$(", i) and quote != "'":
+            if cmd.startswith("$((", i):
+                return None
+            level, j = 1, i + 2
+            while j < len(cmd) and level:
+                level += {"(": 1, ")": -1}.get(cmd[j], 0)
+                j += 1
+            if level or not reads_only(cmd[i + 2:j - 1], depth + 1):
+                return None
+            out.append("TTP_SUB")
+            i = j
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _unwrapped(simple: list[list[str]]) -> list[list[str]] | None:
+    """The simple commands inside `for`/`if`/`while` lines: each keyword that leads a command dropped, a
+    `for NAME [in WORDS]` header and a lone `done`, `fi` or `}` gone; None for a malformed `for`."""
+    out = []
+    for w in simple:
+        while w and w[0] in SHELL_KEYWORDS:
+            w = w[1:]
+        if not w or w in (["done"], ["fi"], ["}"]):
+            continue
+        if w[0] == "for":
+            if len(w) < 2 or not re.fullmatch(r"[A-Za-z_]\w*", w[1]) or len(w) > 2 and w[2] != "in":
+                return None
+            continue
+        out.append(w)
+    return out
+
+
+def _python_reads(args: list[str]) -> bool:
+    """`python3 [-I -S -E -B -s -u] -c CODE [args]` whose code opens nothing for writing and runs nothing
+    else (PY_WRITES); a script, a module or stdin counts as a change."""
+    k = 0
+    while k < len(args) and args[k] in ("-I", "-S", "-E", "-B", "-s", "-u", "-O", "-OO", "-q"):
+        k += 1
+    return k + 1 < len(args) and args[k] == "-c" and not PY_WRITES.search(args[k + 1])
+
+
 def _git_reads(args: list[str]) -> bool:
     while args and args[0].startswith("-"):
         args = args[2:] if args[0] in ("-C", "-c", "--git-dir", "--work-tree", "--namespace") else args[1:]
@@ -186,6 +254,11 @@ def _ttp_reads(args: list[str]) -> bool:
         return "--after-push" not in args   # that one records follow-ups and alerts
     if args[:1] == ["config"]:
         return _ttp_config_reads(args[1:])
+    if args[:1] == ["detach"]:   # listing or checking jobs; any other form starts or stops one
+        return args[1:2] in (["--list"], ["--check"]) and not any(a == "--" or a.startswith(("--stop", "--remote"))
+                                                                   for a in args[2:])
+    if args[:1] == ["schedules"] and len(args) == 2 and not args[1].startswith("-"):
+        return True   # `ttp schedules NAME`: the list
     return any(len(args) >= len(r) and all(w == a or w == "*" and not a.startswith("-") for w, a in zip(r, args)) for r in TTP_READS)
 
 
@@ -193,6 +266,8 @@ def _ttp_config_reads(args: list[str]) -> bool:
     """`ttp config NAME [KEY]` prints a value; a flag, a third word or `KEY VALUE` with the project left out
     (cmd_config reads a first word naming a config section as a key) may set one."""
     from .project import DEFAULT_CONFIG
+    if args[:1] == ["--chat-settable"]:   # whether a coordinator may set a key: prints, sets nothing
+        return 1 < len(args) <= 3
     if not args or len(args) > 2 or any(a.startswith("-") for a in args):
         return False
     return len(args) == 1 or args[0].split(".")[0] not in DEFAULT_CONFIG
@@ -263,6 +338,8 @@ def _words_read(w: list[str], depth: int) -> bool:
         return not any(a.startswith(("--rotate", "--vacuum", "--flush", "--sync", "--relinquish")) for a in args)
     if name == "git":
         return _git_reads(args)
+    if PY_NAMES.fullmatch(name):
+        return _python_reads(args)
     if name == "ttp":
         return _ttp_reads(args)
     if name == "launchctl":
@@ -277,12 +354,14 @@ def _words_read(w: list[str], depth: int) -> bool:
 
 def reads_only(cmd: str, depth: int = 0) -> bool:
     """True when every simple command in the shell command `cmd` only reads (the tables above; an ssh
-    command by what it runs remotely) and nothing is redirected into a file; False for anything this
-    cannot place, so an unknown command counts as a change."""
+    command by what it runs remotely; `python3 -c` by its code; the body of a for, if or while line and
+    each `$( )` alike) and nothing is redirected into a file; False for anything this cannot place, so an
+    unknown command counts as a change."""
     if depth > 2:
         return False
-    cmd = str(cmd or "")
-    simple = _simple(cmd)
+    cmd = _substituted(str(cmd or ""), depth)
+    simple = _simple(cmd) if cmd is not None else None
+    simple = _unwrapped(simple) if simple else None
     if not simple or not all(_words_read(w, depth) for w in simple):
         return False
     try:   # the outside-writes classifier as a second look (tee, -o, sed -i, inline code) at each local

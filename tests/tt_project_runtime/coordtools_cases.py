@@ -739,14 +739,14 @@ LOOKUP_CHANGES = ["ttp deployed --after-push", "ttp config demo k 5", "ttp confi
                   "ttp note hi -h", "awk '{print > \"x\"}' f", "awk '{printf \"%s\", $1 >> \"x\"}' f",
                   "awk '{print | \"sh\"}' f", "awk '{\"date\" | getline d}' f", "awk 'BEGIN{system(\"rm x\")}'",
                   "gawk -i inplace '{print}' f", "awk -f prog.awk f", "awk --exec=x f", "awk",
-                  "python3 -c 'print(1)'", "sed -i s/a/b/ f",
+                  "python3 -c \"open('x', 'w')\"", "sed -i s/a/b/ f",
                   "ss -K dst 192.0.2.1", "ss -tnK", "ss --kill state established", "ttp bridge stop"]
 
 
 def test_deployed_help_a_one_key_config_read_and_plain_awk_count_as_reads():
     """`ttp deployed` (not --after-push), `ttp CMD --help`, `ttp config NAME [KEY]` and awk whose inline
     program writes nowhere only read; a value, a left-out project with a value, a later -h a positional may
-    swallow, an awk redirect, pipe, system(), -f or -i, inline python and sed -i stay changes."""
+    swallow, an awk redirect, pipe, system(), -f or -i, inline python that writes and sed -i stay changes."""
     from ttp import coordfix
     assert [c for c in LOOKUP_READS if not coordfix.reads_only(c)] == []
     assert [c for c in LOOKUP_CHANGES if coordfix.reads_only(c)] == []
@@ -757,13 +757,13 @@ STATUS_READS = ["ps -o user=,lstart=,command= -p 123", "ps -ouser= -p 1", "pgrep
                 "cd /x; ps -o user=,command= -p 123; pmset -g assertions | grep -E caffeinate; ttp bridge status | tail -6"]
 STATUS_CHANGES = ["pmset -a sleep 0", "pmset sleepnow", "pmset schedule wake '01/01/30 00:00:00'", "pmset",
                   "pmset -g > out.txt", "scutil --nc stop 'Some VPN'", "scutil --nc start 'Some VPN'",
-                  "scutil --set HostName x", "scutil", "ps -o user= -p 1; rm -f x", 'python3 -c "print(1)"',
+                  "scutil --set HostName x", "scutil", "ps -o user= -p 1; rm -f x", 'python3 -c "import os; os.remove(1)"',
                   "rm -f x", "launchctl bootout gui/501/x", "ttp upstream --ack abc", "curl -o out.txt u"]
 
 
 def test_ps_format_pmset_g_and_scutil_nc_status_count_as_reads():
     """ps's -o is an output format, not a file it writes; `pmset -g` and `scutil --nc list|status` only
-    query. Other pmset and scutil forms, inline python (code it cannot prove read-only), a redirect and a
+    query. Other pmset and scutil forms, inline python that removes a file, a redirect and a
     real output flag stay changes."""
     from ttp import coordfix
     from ttp.sidefx import classify_paths
@@ -771,6 +771,41 @@ def test_ps_format_pmset_g_and_scutil_nc_status_count_as_reads():
     assert [c for c in STATUS_CHANGES if coordfix.reads_only(c)] == []
     assert classify_paths("ps -o user= -p 1", "/h", "/", "/") == {}
     assert classify_paths("curl -o out.txt u", "/h", "/w", "/")["/w/out.txt"][0] == "write"
+
+
+SHELL_READS = ["head -5 a.txt", "cat a b", "ls -la x", "grep -n foo f.py", "sed -n 1,20p f.py", "sort -u f",
+               "awk '{print $1}' f", "for f in a b; do head -3 $f; done", "for f in $(ls x); do cat $f; done",
+               "echo $(git log -1 --format=%H)", "if [ -f x ]; then cat x; else ls; fi", "[ -f x ] && cat x",
+               "test -f x || echo none", "git -C /r log -3", "git -C /r show HEAD", "git -C /r diff a b",
+               "git -C /r status", "git -C /r merge-base a b", "git -C /r fetch origin", "ttp task p show 12",
+               "ttp task show 12", "ttp schedules p show", "ttp schedules p", "ttp schedules p list",
+               "ttp config --chat-settable coordinator.x", "ttp config p coordinator.chat_digest_h",
+               "ttp detach --list", "ttp detach --check job1", "ttp obligation list", "ttp stats", "ttp deployed",
+               "ttp --version", "python3 -c 'import json; print(json.load(open(\"a.json\"))[\"k\"])'",
+               "python3 -I -c 'print(1)'", "cat a.txt | head -3 2>/dev/null"]
+SHELL_CHANGES = ["git worktree remove /w", "git -C /r worktree remove /w", "sed -i s/a/b/ f", "echo hi > f",
+                 "cat a > b", "for f in a b; do echo $f > out; done", "for f in a b; do rm $f; done",
+                 "echo $(rm x)", "echo $((1 + 2))", "echo `ls`", "for 1x in a; do ls; done",
+                 "python3 -c \"open('f','w').write('x')\"", "python3 -c \"open('f', mode='a')\"",
+                 "python3 -c 'import subprocess; subprocess.run([\"rm\",\"x\"])'",
+                 "python3 -c 'import os; os.remove(\"x\")'", "python3 -c 'import os; os.rename(\"a\",\"b\")'",
+                 "python3 -c 'import shutil; shutil.rmtree(\"x\")'", "python3 -c 'from os import unlink'",
+                 "python3 -c 'import pathlib; pathlib.Path(\"x\").unlink()'", "python3 -c '__import__(\"os\")'",
+                 "python3 x.py", "python3 -m http.server", "python3 -c", "ttp task update 12 --status done",
+                 "ttp task p update 12", "ttp config p coordinator.chat_digest_h 4", "ttp detach job -- sleep 1",
+                 "ttp detach --stop job1", "ttp detach --check --remote h job1", "ttp schedules p run x",
+                 "ttp obligation progress o1 done", "git -C /r push", "frobnicate x"]
+
+
+@pytest.mark.parametrize("cmd,reads", [(c, True) for c in SHELL_READS] + [(c, False) for c in SHELL_CHANGES])
+def test_shell_loops_substitutions_ttp_lookups_and_read_only_inline_python_count_as_reads(cmd, reads):
+    """Plain reads with no redirect into a file, for/if lines and $( ) over reads, `git -C DIR` reads, the
+    ttp lookups (task and schedule show, a key's chat-settable check, a one-key config read, detach
+    --list/--check, the obligation list) and `python3 -c` code that writes nothing and runs nothing count
+    as reads; a write anywhere in a loop or substitution, a ttp form that changes state and inline python
+    that writes, deletes, renames or runs a command stay changes, as does anything it cannot place."""
+    from ttp import coordfix
+    assert coordfix.reads_only(cmd) is reads
 
 
 def test_read_only_calls_are_logged_but_never_flagged_for_a_missing_why(env, tmp_path, monkeypatch):
