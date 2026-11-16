@@ -37,6 +37,7 @@ import uuid
 from pathlib import Path
 
 from . import runtimeload   # first of its own: its LOADED_AT is when the daemon imported its code
+from . import blindreview
 from . import deviceab
 from . import deviceshadow
 from . import batchrun
@@ -4313,6 +4314,7 @@ class Daemon:
             venv_vars = worktree.venv_env(venv, path) if venv else {}
             env = {**env, **venv_vars, **tmp_env, "TTP_RUN_DIR": str(run_dir), "TTP_PROJECT": str(self.p.base),
                    "TTP_RUN_ID": str(run_id), **task_env(task["id"] if task else ""), "PYTHONPATH": runtime_dir,
+                   **blindreview.env(task),   # a blind review's `ttp` masks the model (every provider)
                    **({"TTP_LEASE_EPOCH": str(self._lease.epoch)} if self._lease else {}),
                    "TTP_PYTHON": sys.executable,   # `ttp` runs under this, not the venv's python3
                    "TTP_SANDBOX_CHECKS": os.environ.get("TTP_SANDBOX_CHECKS", "0"),   # sandbox.opted_in

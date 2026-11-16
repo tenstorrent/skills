@@ -10682,12 +10682,14 @@ def cmd_task(a) -> None:
         rows, total, limit = list_tasks(p, a)
         if limit is not None and total > limit:   # never cut silently: a caller would miss older tasks
             print(f"showing newest {limit} of {total} tasks; use --all, --limit N or --status", file=sys.stderr)
+        from . import blindreview
+        title = blindreview.scrub if blindreview.caller_blind() else str   # a blind review sees no model names
         if a.json:
             print(json.dumps([{"id": t["id"], "status": task_outcome(t), "kind": t["kind"], "tier": t["tier"],
-                               "title": t["title"], **task_timing(t)} for t in rows], indent=2))
+                               "title": title(t["title"]), **task_timing(t)} for t in rows], indent=2))
             return
         for t in rows:
-            print(f"#{t['id']}\t{task_outcome(t)}\t{t['tier']}\t{t['title']}")
+            print(f"#{t['id']}\t{task_outcome(t)}\t{t['tier']}\t{title(t['title'])}")
     elif a.action == "show":
         if not a.title.strip().isdigit():
             die(f"show needs a task id, not {a.title!r}")
@@ -10700,10 +10702,13 @@ def cmd_task(a) -> None:
         sup = superseded_rows(p, t["id"])
         swept = sweep.task_view(p.db, t["id"])
         woke = probewake.latest(p.db, t["id"])   # the probe run its latest probe-woken run started on
+        from . import blindreview
+        # A blind review sees no model, provider, effort, spend or arm label, and no model names in the text.
+        blind = blindreview.mask if blindreview.caller_blind() else (lambda v: v)
         if a.json:
-            print(json.dumps({**t, **({"abandoned": {"why": gone[0], "ts": gone[1]}} if gone else {}),
+            print(json.dumps(blind({**t, **({"abandoned": {"why": gone[0], "ts": gone[1]}} if gone else {}),
                               **({probewake.KEY: {"run": woke[0], **woke[1]}} if woke else {}),
-                              **({"superseded": sup} if sup else {}), "blocker_sweep": swept}, indent=2, default=str))
+                              **({"superseded": sup} if sup else {}), "blocker_sweep": swept}), indent=2, default=str))
         else:
             lines = ([sup_line] if (sup_line := reviewsup.show_line(t, lambda ts: timefmt.long(ts, p))) else [])
             lines += [f"superseded by {r['sha'][:10]} ({'on' if r['on_push_branch'] else 'not on' if r['on_push_branch'] is False else 'cannot read'}"
@@ -10713,7 +10718,7 @@ def cmd_task(a) -> None:
             lines += sweep.task_lines(swept, p)
             if woke:
                 lines.append(f"run {woke[0]} " + probewake.show_line(woke[1], lambda ts: timefmt.long(ts, p)))
-            print(show_task(t) + ("\n\n" + "\n".join(lines) if lines else ""))
+            print(blind(show_task(blind(t)) + ("\n\n" + "\n".join(lines) if lines else "")))
     elif a.action == "cancel":
         from .runner import stop_runs
         if not a.title.strip().isdigit():
@@ -16723,6 +16728,7 @@ def main(argv: list[str] | None = None) -> None:
     a = ap.parse_args(_project_name_argv(sub, _say_finding_argv(_say_all_argv(_secret_value_argv(_secret_env_argv(_bench_blind_argv(_bridge_argv(
         sys.argv[1:] if argv is None else list(argv)))))))))
     dry_run_stub(a)
+    blind_gate(a)
     try:
         _recover_setup()     # a `ttp setup` a reboot cut short: finished or rolled back before anything else
     except Exception as e:
@@ -16732,6 +16738,16 @@ def main(argv: list[str] | None = None) -> None:
         a.fn(a)
     except SecretsUnreadable as e:   # a command that needs a secret: a clear message, not a traceback
         die(str(e))
+
+
+def blind_gate(a) -> None:
+    """A blind review (blindreview) runs only the commands that cannot show which model did the work."""
+    from . import blindreview
+    fn = getattr(getattr(a, "fn", None), "__name__", "")
+    if blindreview.caller_blind():
+        why = blindreview.refusal(fn, str(getattr(a, "action", "") or ""))
+        if why:
+            die(f"refused: {why}", 2)
 
 
 def dry_run_stub(a) -> None:

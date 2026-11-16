@@ -40,7 +40,10 @@ import hashlib
 import json
 import re
 import time
+from pathlib import Path
 from typing import Any, Callable
+
+from . import blindreview
 
 KEY = "device_ab"
 LABEL = "device_ab:"                    # device_ab:<arm>, on the task before its first run
@@ -381,10 +384,12 @@ def review_spec(task: dict, run_dir: str) -> str:
         "", "1. answered: did the result answer what the task asked, fully and directly? (0 none, 4 fully)",
         "2. supported: are its conclusions supported by the logs, commands and outputs it cites? Check the cited "
         "logs where you can read them. (0 unsupported, 4 every conclusion backed)",
-        "", f"Task title: {task.get('title')}", "Task spec:", str(task.get("spec") or "")[:6000], "",
+        "", f"Task title: {blindreview.scrub(task.get('title'))}", "Task spec:",
+        blindreview.scrub(str(task.get("spec") or "")[:6000]), "",
         f"Its final status: {task.get('status')}.",
-        f"Its hand-off (result.json) and logs: {run_dir or '(no run folder recorded)'}; the task's result in "
-        f"`ttp task show {task['id']}`.",
+        f"Its hand-off (result.json), progress and transcript, with model names masked: "
+        f"{run_dir or '(no run folder recorded)'}; the task's result in `ttp task show {task['id']}`. Read the "
+        "run only there: never its run folder or the project's state.",
         "", "Read only: change nothing, run no device or machine command.",
         'Return in result.json: "device_ab_scores": {"answered": <0-4>, "supported": <0-4>, "why": "<one line>"}.',
         "conclusion: the two scores with a one-line reason.",
@@ -405,10 +410,13 @@ def queue_reviews(db, s: dict, since: float, limit: int = 10, second: dict | Non
         for label, who, prov in reviewers:
             if f"{label}{t['id']}" in have or len(out) >= limit:
                 continue
+            # Blind: the label masks `ttp` for the reviewer; it reads a masked copy of the run, never its folder.
+            got = blindreview.packet(Path(db.path).parent, f"ab-{t['id']}", (run[0]["dir"] if run else "") or "")
             out.append(db.add_task(f"Device A/B review of #{t['id']}" + (" (second reviewer)" if prov else ""),
-                                   review_spec(t, (run[0]["dir"] if run else "") or ""), kind="question",
+                                   review_spec(t, got), kind="question",
                                    tier="standard", priority=4, origin="daemon", model=who["model"],
-                                   effort=who["effort"], provider=prov, labels=[f"{label}{t['id']}"]))
+                                   effort=who["effort"], provider=prov,
+                                   labels=[f"{label}{t['id']}", blindreview.BLIND_LABEL]))
     return out
 
 

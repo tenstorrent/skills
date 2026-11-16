@@ -404,6 +404,9 @@ def prepare(p, cfg: dict, prov, provider: str, cwd: str, env: dict | None, now: 
     m = mode(cfg)
     if m == "off":
         return {"how": "none", "why": "coordinator.session.worker_context off", "lead": ""}
+    if task and _blind(p, task):
+        # A blind review starts from its spec alone: the coordinator's context names the arms it scores.
+        return {"how": "none", "why": "blind review", "lead": ""}
     why = "coordinator.session.worker_context disk"
     gap = ""
     if m == "fork" and (missed := _role_missed(p, task)):
@@ -441,6 +444,14 @@ def prepare(p, cfg: dict, prov, provider: str, cwd: str, env: dict | None, now: 
         except Exception as e:   # the disk block is always safe
             why = f"fork failed: {type(e).__name__}: {e}"[:200]
     return on_disk(p, cfg, f"no resume: {gap}; {why}" if gap else why, now)
+
+
+def _blind(p, task: int) -> bool:
+    from . import blindreview
+    try:
+        return blindreview.is_blind_task(p.db.task(int(task)))
+    except Exception:
+        return False
 
 
 def on_disk(p, cfg: dict, why: str, now: float | None = None) -> dict:

@@ -94,10 +94,14 @@ def test_device_shadow_review_waits_for_the_live_task_and_then_asks_two_blind_re
     new = deviceshadow.queue_reviews(p.db, second=second)
     assert len(new) == 2, "a still running shadow has no review"
     first, sec = (p.db.task(i) for i in new)
-    assert f'device_shadow_review:{tid}:glm' in first["labels"] and f'device_shadow_review2:{tid}:glm' in sec["labels"]
+    # An opaque code names the arm in the label and title (blindreview), and the report maps it back.
+    from ttp import blindreview
+    code = blindreview.code_for(p.db, tid, "glm")
+    assert f'device_shadow_review:{tid}:{code}' in first["labels"] and f'device_shadow_review2:{tid}:{code}' in sec["labels"]
+    assert blindreview.arm_of(p.db.q, code) == "glm" and blindreview.BLIND_LABEL in first["labels"]
     assert sec["provider"] == "chat" and sec["model"] == "glm-x" and first["provider"] != "chat"
     for t in (first, sec):
-        low = t["spec"].lower()
+        low = (t["spec"] + t["title"]).lower()
         assert "glm" not in low and "sonnet" not in low and "device_shadow_scores" in t["spec"]
         assert "## Conclusion" in t["spec"]
     assert deviceshadow.queue_reviews(p.db, second=second) == [], "once per shadow and reviewer"

@@ -322,6 +322,11 @@ def prompt(item: dict, rubric=RUBRIC) -> str:
             f"Answer as JSON: {{\"scores\": {{...}}, \"notes\": \"one short paragraph\"}}.")
 
 
+# A grader that can run commands (an agent CLI without a no-exec mode) gets the blind flag: its `ttp` then
+# refuses every command that could show which model made an arm (blindreview).
+BLIND_ENV = {"TTP_BLIND": "1"}
+
+
 def provider_ask(provider: str, model: str, effort: str, budget_usd: float, cfg: dict | None = None,
                  spend: dict | None = None, bridge_env: dict | None = None, schema: dict | None = None):
     """A decision-only run on the named provider (no tools, schema-checked answer) per prompt. A
@@ -350,11 +355,11 @@ def provider_ask(provider: str, model: str, effort: str, budget_usd: float, cfg:
                 with (_constant(bridge_env) if bridge_env is not None else _bridge(cfg, model, effort)) as bridge:
                     r = subprocess.run(argv, input=text.encode(), stdout=subprocess.PIPE,
                                        stderr=subprocess.DEVNULL, cwd=tmp,
-                                       env={**os.environ, **env, **bridge}, timeout=1800)
+                                       env={**os.environ, **env, **bridge, **BLIND_ENV}, timeout=1800)
             else:
                 r = subprocess.run(argv, input=text.encode(), stdout=subprocess.PIPE,
                                    stderr=subprocess.DEVNULL, cwd=tmp,
-                                   env={**os.environ, **env}, timeout=1800)
+                                   env={**os.environ, **env, **BLIND_ENV}, timeout=1800)
             durable_write(out, r.stdout, sync=False)
             u = prov.parse(out)
             note(u)

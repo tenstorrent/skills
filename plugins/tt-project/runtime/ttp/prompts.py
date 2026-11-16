@@ -1025,7 +1025,9 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
         settled.prompt_block(p, dict(task)),
         taskfacts.prompt_block(p, dict(task)),
         overlap.prompt_block(p, dict(task))]
-    parts.append(ctxblock.prompt_block(p, dict(task), "\n".join(parts), _system_memory(p), tag))
+    from . import blindreview
+    if not blindreview.is_blind_task(dict(task)):   # a blind review's records would name the arms it scores
+        parts.append(ctxblock.prompt_block(p, dict(task), "\n".join(parts), _system_memory(p), tag))
     parts.append(restrictions_pointer(p))
     return "\n\n".join(x for x in parts if x.strip())
 
