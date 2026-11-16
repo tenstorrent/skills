@@ -151,33 +151,128 @@ def _commit(repo: Path, ref: str) -> str:
     return "" if r.returncode else r.stdout.strip()
 
 
-def code_pins(root: Path, ref: str = "HEAD", skip: tuple[Path, ...] = ()) -> list[list[str]]:
+REPO_DEPTH = 3                            # how deep repos are found under a project root that is not a repo
+SHA_RE = re.compile(r"\b(?=[0-9]*[a-f])[0-9a-f]{7,40}\b")   # a commit a spec names, never a plain number
+
+
+def _git_out(repo: Path, *args: str) -> tuple[int, str]:
+    try:
+        r = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=30,
+                           stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return 1, ""
+    return r.returncode, r.stdout.strip()
+
+
+# Folders no repo search enters: throwaway copies, caches and environments (any case, `tmp1` too).
+NO_REPO_DIRS = re.compile(r"^(tmp|temp|scratch|cache|node_modules|__pycache__|venv|site-packages)", re.I)
+
+
+def find_repos(root: Path, skip: tuple[Path, ...] = (), depth: int = REPO_DEPTH) -> list[str]:
+    """The git repos under `root` (itself not a repo), up to `depth` levels down, as paths relative to it,
+    shallowest first: checkouts (a `.git` folder) and bare repos alike, never a linked worktree (a `.git`
+    file: a view of a repo found on its own), anything inside a repo, a hidden or throwaway folder
+    (NO_REPO_DIRS) or one holding a `skip` path."""
+    root, skip = Path(root), tuple(Path(x).resolve() for x in skip)
+    out: list[str] = []
+
+    def walk(d: Path, level: int) -> None:
+        try:
+            kids = sorted(x for x in d.iterdir() if x.is_dir() and not x.is_symlink()
+                          and not x.name.startswith(".") and not NO_REPO_DIRS.match(x.name))
+        except OSError:
+            return
+        for kid in kids:
+            k = kid.resolve()
+            if any(k == x or k in x.parents for x in skip):
+                continue
+            if (kid / ".git").exists():
+                if (kid / ".git").is_dir():
+                    out.append(kid.relative_to(root).as_posix())
+            elif (kid / "HEAD").is_file() and (kid / "objects").is_dir() \
+                    and _git_out(kid, "rev-parse", "--is-bare-repository") == (0, "true"):
+                out.append(kid.relative_to(root).as_posix())
+            elif level < depth:
+                walk(kid, level + 1)
+    walk(root, 1)
+    return sorted(out, key=lambda r: (r.count("/"), r))
+
+
+def _named(task: dict) -> tuple[str, list[str]]:
+    """The branch a task builds on (its pr_branch line or recorded branch) and the commits its spec names."""
+    from . import worktree
+    text = str(task.get("spec") or "")
+    return worktree.carried_branch(task) or str(task.get("branch") or ""), SHA_RE.findall(text)[:12]
+
+
+def _mentions(text: str, name: str) -> bool:
+    """Whether `text` names `name` as a whole path or word (`a/b` is not named by `x/a/b-c`)."""
+    return re.search(rf"(?<![\w./-]){re.escape(name)}(?![\w-]|\.\w)", text) is not None
+
+
+def task_repo(root: Path, task: dict, repos: list[str]) -> str | None:
+    """Which of `repos` (relative to `root`) is a code task's own repo: the one holding its branch, else the one
+    whose path its spec names, else the one holding a commit its spec names, else the one whose folder name it
+    names, else the only one; None when none fits."""
+    text, (branch, shas) = str(task.get("spec") or ""), _named(task)
+    root = Path(root)
+    tests = (lambda r: bool(branch) and _git_out(root / r, "rev-parse", "--verify", "-q",
+                                                  f"refs/heads/{branch}")[0] == 0,
+             lambda r: _mentions(text, str((root / r).resolve())) or ("/" in r and _mentions(text, r)),
+             lambda r: any(_commit(root / r, x) for x in shas),
+             lambda r: _mentions(text, Path(r).name.removesuffix(".git")))
+    for test in tests:
+        if hit := [r for r in repos if test(r)]:
+            return hit[0]
+    return repos[0] if len(repos) == 1 else None
+
+
+def base_commit(repo: Path, task: dict, ref: str = "HEAD") -> str:
+    """The commit a code task's copy of `repo` is pinned at, the one the live task branched from: its recorded
+    fork point, else the head of the branch it builds on, else the oldest of the commits its spec names (the
+    one the others descend from), else `ref`, else HEAD."""
+    from . import worktree
+    if sha := worktree.fork_point(repo, int(task["id"])) if task.get("id") else "":
+        return sha
+    branch, shas = _named(task)
+    if branch and (sha := _commit(repo, f"refs/heads/{branch}")):
+        return sha
+    named = list(dict.fromkeys(x for x in (_commit(repo, n) for n in shas) if x))
+    for sha in named:
+        if all(_git_out(repo, "merge-base", "--is-ancestor", sha, o)[0] == 0 for o in named if o != sha):
+            return sha
+    return (named[0] if named else "") or _commit(repo, ref) or _commit(repo, "HEAD")
+
+
+def code_pins(root: Path, ref: str = "HEAD", skip: tuple[Path, ...] = (),
+              task: dict | None = None) -> list[list[str]]:
     """What a shadow's code copy holds, as [folder in the copy, commit] pairs, pinned once per task so every arm
     reads the same tree: the project repo at `ref` (HEAD when `ref` names no commit), or, when the project root is
-    not in a git repo, each git repo one level under it at its HEAD (hidden folders and those holding a `skip`
-    path, such as the harness folder, left out). Empty when there is no repo to copy."""
+    not in a git repo, each git repo up to REPO_DEPTH levels under it (bare mirrors included) at its HEAD (hidden
+    folders and those holding a `skip` path, such as the harness folder, left out). For a code `task` its own
+    repo is pinned at the commit it branched from (base_commit), wherever it sits, and its pair carries a third
+    item, "task": the copy must hold it. Empty when there is no repo to copy."""
     root = Path(root)
-    try:
-        inside = subprocess.run(["git", "-C", str(root), "rev-parse", "--is-inside-work-tree"], capture_output=True,
-                                text=True, timeout=30, stdin=subprocess.DEVNULL).stdout.strip() == "true"
-    except (OSError, subprocess.SubprocessError):
-        inside = False
+    code = bool(task) and task.get("kind") == "code"
+    inside = _git_out(root, "rev-parse", "--is-inside-work-tree") == (0, "true")
     if inside:
-        sha = _commit(root, ref) or _commit(root, "HEAD")
-        return [["", sha]] if sha else []
-    skip = tuple(Path(x).resolve() for x in skip)
+        sha = (base_commit(root, task, ref) if code else "") or _commit(root, ref) or _commit(root, "HEAD")
+        return ([["", sha, "task"]] if code else [["", sha]]) if sha else []
+    repos = find_repos(root, skip)
+    own = task_repo(root, task, repos) if code else None
     out = []
-    try:
-        kids = sorted(x for x in root.iterdir() if x.is_dir() and not x.name.startswith("."))
-    except OSError:
-        return []
-    for kid in kids:
-        k = kid.resolve()
-        if any(k == x or k in x.parents for x in skip) or not (kid / ".git").exists():
-            continue
-        if sha := _commit(kid, "HEAD"):
-            out.append([kid.name, sha])
+    for rel in repos:
+        if rel == own:
+            if sha := base_commit(root / rel, task, ref):
+                out.append([rel, sha, "task"])
+        elif sha := _commit(root / rel, "HEAD"):
+            out.append([rel, sha])
     return out
+
+
+def _task_pin(pins: list) -> str | None:
+    """The folder of the code task's own repo among `pins` ("" for the project repo), or None."""
+    return next((x[0] for x in pins or [] if len(x) > 2 and x[2] == "task"), None)
 
 
 def snapshot_code(root: Path, ref: str, dest: Path, cap_mb: float, pins: list | None = None) -> str:
@@ -186,10 +281,13 @@ def snapshot_code(root: Path, ref: str, dest: Path, cap_mb: float, pins: list | 
     dest.mkdir(parents=True, exist_ok=True)
     pins = code_pins(root, ref) if pins is None else pins
     if not pins:
-        return "no git repo at the project root or one level under it: no code copy"
+        return f"no git repo at the project root or up to {REPO_DEPTH} levels under it: no code copy"
     cap, used, files, notes = int(cap_mb * 1024 * 1024), 0, 0, []
-    for sub, sha in pins:
+    for i, (sub, sha, *_) in enumerate(sorted(pins, key=lambda x: len(x) < 3)):   # the task's own repo first
         where = f"{sub}/" if sub else "the project repo"
+        if used >= cap:
+            notes.append(f"{len(pins) - i} more repo(s) left out: the {cap_mb:g} MB code cap is used up")
+            break
         try:
             proc = subprocess.Popen(["git", "-C", str(Path(root) / sub), "archive", "--format=tar", sha],
                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
@@ -211,17 +309,32 @@ def snapshot_code(root: Path, ref: str, dest: Path, cap_mb: float, pins: list | 
     return "; ".join(notes)
 
 
-def copy_code(root: Path, ref: str, dest: Path, cap_mb: float, pins: list | None) -> tuple[bool, str]:
-    """snapshot_code, tried once more after COPY_RETRY_S when the copy holds no file (a fresh code_pins on the
-    retry when none were pinned); returns (whether it holds files, the note)."""
-    note = ""
+def _holds_files(d: Path) -> bool:
+    return d.is_dir() and any(f.is_file() for f in d.rglob("*"))
+
+
+def copy_code(root: Path, ref: str, dest: Path, cap_mb: float, pins: list | None, task: dict | None = None,
+              skip: tuple[Path, ...] = ()) -> tuple[bool, str]:
+    """snapshot_code, tried once more after COPY_RETRY_S when the copy holds no file or, for a code `task`,
+    lacks the task's own repo (code_pins afresh when none were pinned, or on the retry when the pins name no
+    repo of the task); returns (whether it holds files and the task's repo, the note)."""
+    code = bool(task) and task.get("kind") == "code"
+    note, cur = "", pins
     for attempt in range(2):
         if attempt:
             time.sleep(COPY_RETRY_S)
             shutil.rmtree(dest, ignore_errors=True)
-        note = snapshot_code(root, ref, dest, cap_mb, pins or None)
-        if dest.is_dir() and any(f.is_file() for f in dest.rglob("*")):
+        if not cur or (attempt and code and _task_pin(cur) is None):
+            cur = code_pins(root, ref, skip, task) if task else None
+        note = snapshot_code(root, ref, dest, cap_mb, cur or None)
+        own = _task_pin(cur or [])
+        if not _holds_files(dest):
+            continue
+        if not code or (own is not None and _holds_files(dest / own if own else dest)):
             return True, note
+        note = "; ".join(x for x in (note, "the copy lacks the code task's own repo ("
+                                     + ("not found under the project root" if own is None
+                                        else f"{own or 'the project repo'} was not copied") + ")") if x)
     return False, note
 
 
@@ -308,7 +421,7 @@ def start(p, task: dict, cfg: dict | None = None) -> list[str]:
         if pins is None:   # the code every arm copies, pinned once for the task (each arm's run retries a miss)
             try:
                 pins = code_pins(Path(p.root), (cfg.get("delivery") or {}).get("base_ref") or "HEAD",
-                                 (Path(p.state),))
+                                 (Path(p.state),), p.db.task(task["id"]) or task)
             except Exception:   # never into the dispatch
                 pins = []
         log = Path(p.state) / "device-shadow" / str(task["id"]) / arm
@@ -346,10 +459,12 @@ def run(p, task_id: int, arm_name: str) -> dict:
         paths = {str(Path(p.root).resolve()): str(ro / "code"), str(Path(p.state).resolve()): str(ro / "state"),
                  str(Path.home()): "~"}
         ok, note = copy_code(Path(p.root), (cfg.get("delivery") or {}).get("base_ref") or "HEAD", ro / "code",
-                             s["code_mb"], deviceab._kv(p.db, f"{KV_PREFIX}{task_id}:{arm_name}").get("code"))
-        if not ok:   # never run an arm on an empty copy: the skip and its reason are recorded and reported
+                             s["code_mb"], deviceab._kv(p.db, f"{KV_PREFIX}{task_id}:{arm_name}").get("code"),
+                             p.db.task(int(task_id)) or dict(task), (Path(p.state),))
+        if not ok:   # never run an arm on an empty copy or one without the code task's repo: a recorded skip
+            what = "lacks the code task's own repo" if "lacks the code task" in note else "is empty"
             return record(p.db, task_id, arm_name, status="skipped", ended=time.time(), minutes=0.0,
-                          error=f"no arm run: the code copy is empty after a retry ({note})"[:400])
+                          error=f"no arm run: the code copy {what} after a retry ({note})"[:400])
         snapshot_state(p, int(task_id), ro / "state", paths)
         ws.mkdir()
         for args in (["init", "-q", "-b", "main"], ["-c", "user.name=shadow", "-c", "user.email=shadow@localhost",
