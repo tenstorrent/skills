@@ -891,3 +891,84 @@ def test_each_wake_records_its_reason_and_stats_counts_wakes_and_dollars_by_reas
     assert day["spec_change"]["wakes"] == 2 and day["spec_change"]["usd"] == 1.0 and day["spec_change"]["rewaited"] == 1
     assert day["timer"]["wakes"] == 1 and day["spec_change"]["by"] == {"rule/standard": 2}
     assert "spec_change: 2 wakes, $1.00, 1 handed the wait back" in waketier.text(s)
+
+
+def _passed_under_a_new_spec(p, d, tid, runs, monkeypatch, settle_now):
+    """The wait's run after its probe passed under a changed spec: (its prompt, its note). `settle_now` makes
+    the probe pass; that run hands off done, as a worker settling the wait with the probe's answer does."""
+    from ttp import probewake
+    monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps({"status": "done", "summary": "settled with the probe's answer"}))
+    settle_now()
+    assert _run_until(d, p, lambda: runs() == 2), "the probe pass did not run the task"
+    for _ in range(4):
+        d.tick()
+        time.sleep(0.05)
+    assert runs() == 2, "a passed probe under a new spec took more than one run"
+    run = p.db.q("SELECT id, note FROM runs WHERE task=? ORDER BY id DESC LIMIT 1", (tid,))[0]
+    note = json.loads(run["note"] or "{}")
+    assert probewake.valid(note.get(probewake.KEY)), note
+    return (p.runs / str(run["id"]) / "prompt.md").read_text(), note
+
+
+def test_a_passed_reply_wait_with_a_context_only_spec_update_settles_in_one_run_with_the_reply(env, monkeypatch,
+                                                                                               tmp_path):
+    # Upstream note 288f2912a9762e90: the spec changed while a terminal reply wait slept. Its pass woke a
+    # spec_change run that did not say which reply satisfied the wait, so it handed back the same wait;
+    # settlement and another run followed. Now its one run gets the reply's id and the consumed cursor.
+    from ttp import push, upstream
+    from ttp.project import register
+    p = make(env)
+    (env["tmp"] / "peer").mkdir()
+    register("peer", {"host": "testhost", "dir": str(env["tmp"] / "peer")})
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    request = "please run the canary and report its result"
+    assert upstream.send(p.name, 4, "peer", request) == "sent"
+    fp = upstream.note_id("peer", request)
+    ack = f"re {fp}: acknowledged, the canary is queued and a result follows later"
+    upstream.send("peer", 1, p.name, ack)
+    interim = upstream.note_id(p.name, ack)
+    ttp = push._own_ttp(p)
+    wait = f"--from peer --hash {fp} --after {interim} --terminal"
+    d, tid, flag, runs, idle = _deferred_flow(p, monkeypatch, tmp_path, hand_off={
+        "retry_when": f"{ttp} ack-wait probe {wait}", "on_pass_cmd": f"{ttp} ack-wait settle {wait}"})
+    _edit_spec(p, tid, "also say which canary build answered", wake_now=False)
+    result = f"re {fp}: canary passed on build 42; status: done"
+    reply = upstream.note_id(p.name, result)
+    prompt, note = _passed_under_a_new_spec(p, d, tid, runs, monkeypatch, lambda: upstream.send("peer", 2, p.name, result))
+    assert f"replied: note {reply}" in note["woke_probe"]["out"], note["woke_probe"]
+    assert f"note {reply} satisfied it" in prompt and f"--after cursor): {interim}" in prompt, prompt
+    assert f"`--after {reply}`" in prompt and "also say which canary build answered" in prompt
+    assert note["wake"]["reason"] == "spec_change" and "on_pass_cmd, written for the old spec" in prompt
+    task = p.db.task(tid)
+    assert task["status"] == "done" and json.loads(task["result"])["summary"] == "settled with the probe's answer"
+
+
+def test_a_passed_probe_with_a_scope_change_runs_no_stale_on_pass_cmd_and_its_run_gets_both(env, monkeypatch,
+                                                                                            tmp_path):
+    p = make(env)
+    stale = tmp_path / "stale-on-pass-ran"
+    d, tid, flag, runs, idle = _deferred_flow(p, monkeypatch, tmp_path / "w", hand_off={
+        "on_pass_cmd": f"touch {stale}", "on_pass": {"status": "done", "summary": "the old report"}})
+    probe = f"test -e {tmp_path / 'w' / 'job-done'} && cat {tmp_path / 'w' / 'job-done'}"
+    res = json.loads(p.db.task(tid)["result"])
+    p.db.update_task(tid, result=json.dumps({**res, "retry_when": probe}))
+    _edit_spec(p, tid, "Scope change: drop the old report; compare the job's output with the baseline instead",
+               wake_now=False)
+    prompt, note = _passed_under_a_new_spec(p, d, tid, runs, monkeypatch, lambda: flag.write_text("job finished: build 42\n"))
+    assert not stale.exists(), "the on_pass_cmd written for the old scope ran"
+    assert note["woke_probe"]["rc"] == 0 and "job finished: build 42" in note["woke_probe"]["out"]
+    assert "job finished: build 42" in prompt and "compare the job's output with the baseline" in prompt
+    assert "were not run" in prompt and "the old report" not in json.loads(p.db.task(tid)["result"])["summary"]
+
+
+def test_reply_of_reads_an_ack_wait_probes_peer_cursor_and_satisfying_reply():
+    from ttp import probewake
+    rec = probewake.record("ttp ack-wait probe --from peer --hash 0123abcd --after aaaa1111 --after=bbbb2222 "
+                           "--terminal", 0, "peer replied: note fedcba9876543210\n", 1.0)
+    assert probewake.reply_of(rec) == {"frm": "peer", "hash": "0123abcd", "after": ["aaaa1111", "bbbb2222"],
+                                       "terminal": True, "reply": "fedcba9876543210"}
+    text = probewake.prompt_lines(rec)
+    assert "peer's terminal reply to note 0123abcd: note fedcba9876543210 satisfied it" in text
+    assert "--after cursor): aaaa1111, bbbb2222" in text and "`--after fedcba9876543210`" in text
+    assert probewake.reply_of(probewake.record("test -e /tmp/x", 0, "replied: note fedcba9876543210", 1.0)) is None
+    assert "satisfied" not in probewake.prompt_lines(probewake.record("test -e /tmp/x", 0, "ok", 1.0))

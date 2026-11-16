@@ -624,6 +624,10 @@ SPEC_WOKE_KEY, SPEC_HOLD_KEY, SPEC_WAKE_HOLD_S = "spec_woke", "spec_hold", 7200
 # light wake whose wait was over handed off the old work as done without the change.
 SPEC_WOKE = ("its spec changed: act on what the change adds (the spec's latest `## Update`) before you hand "
              "off; the last hand-off does not cover it")
+# ...and its wait is over: the one run settles the wait under the new spec, with the probe's answer.
+SPEC_PASS_WOKE = ("its wait is over (the probe's answer is below): its on_pass and on_pass_cmd, written for the "
+                  "old spec, were not run; settle the wait yourself under the new spec, using that answer, and "
+                  "hand back the same wait only if the change needs a newer answer")
 # A probe stall's re-check (sweep.dispose_probe_stalls, Daemon._probe_now) runs off the tick: at most this
 # many at once, and one no disposition pass asks for again within STALL_PROBE_KEEP_S is dropped.
 STALL_PROBES_AT_ONCE, STALL_PROBE_KEEP_S = 4, PROBE_TIMEOUT_S + PROBE_EVERY_S
@@ -17480,9 +17484,10 @@ class Daemon:
             self._wake_waiting(task, why, now, kind="checks_gone")
 
     def _wake_waiting(self, task: dict, why: str, now: float, extra: dict | None = None,
-                      kind: str = "other") -> None:
+                      kind: str = "other", probe: bool = False) -> None:
         """Make a waiting task due now and tell its next run why it woke; `kind` is its reason
-        (waketier.KINDS), kept in the hand-off for the tier pick and the run note."""
+        (waketier.KINDS), kept in the hand-off for the tier pick and the run note. `probe`: the probe's
+        answer woke it whatever `kind` says (a pass under a changed spec), so its run gets that record."""
         tid = task["id"]
         got = self._probe_rc.pop(tid, None)
         if got:
@@ -17490,7 +17495,7 @@ class Daemon:
         self._spec_deferred.discard(tid)
         prev = load_result(task["result"])
         prev.pop(probewake.KEY, None)   # an earlier wake's record never passes for this one's
-        if got and kind in probewake.KINDS:   # the probe run that woke it, for its worker (probewake)
+        if got and (probe or kind in probewake.KINDS):   # the probe run that woke it, for its worker (probewake)
             out = self._probe_out.get(tid)
             extra = {probewake.KEY: probewake.record(got[2], got[0], out[0] if out and out[2] == got[2] else "",
                                                      got[1]), **(extra or {})}
@@ -17662,9 +17667,12 @@ class Daemon:
         from .prompts import spec_digest
         seen, sha = load_result(task["result"]).get(SPEC_SEEN_KEY), spec_digest(task)
         if isinstance(seen, str) and seen != sha:
-            # Its spec changed since the hand-off: no on_pass (written before the change) is recorded.
-            self._wake_waiting(task, f"{why}, but {SPEC_WOKE}", now,
-                               extra={SPEC_SEEN_KEY: sha, "wake_tier": _own_tier(task), "escalated_wake": True}, kind="spec_change")
+            # Its spec changed since the hand-off: no on_pass or on_pass_cmd (written before the change) is
+            # recorded or run. One run settles both: it gets the probe's answer (probewake) with the change.
+            passed = why.startswith("probe passed")
+            self._wake_waiting(task, f"{why}, but {SPEC_WOKE}" + (f"; {SPEC_PASS_WOKE}" if passed else ""), now,
+                               extra={SPEC_SEEN_KEY: sha, "wake_tier": _own_tier(task), "escalated_wake": True},
+                               kind="spec_change", probe=passed)
             return
         if self._staged_pass(task, now, why):
             return
