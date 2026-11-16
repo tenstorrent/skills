@@ -367,9 +367,8 @@ def role_miss(final_text: str, handoff: dict | None) -> str:
 
 
 HANDOFF_TAIL = ("Last, before your final answer: write your hand-off to $TTP_RUN_DIR/result.json as your rules "
-                "say. Only once it is written, end with an empty actions object, {\"actions\": []}. That object "
-                "is no hand-off: a run that ends with it and no result.json did no work as far as the project "
-                "knows.")
+                "say. It is your own hand-off, never the coordinator's answer format: a run that ends "
+                "with a JSON actions object and no result.json did no work as far as the project knows.")
 
 
 def handoff_tail(missed: str = "") -> str:

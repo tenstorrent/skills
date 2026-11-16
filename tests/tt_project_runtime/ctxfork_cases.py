@@ -1485,3 +1485,38 @@ def test_a_forked_worker_that_compacts_uses_its_own_role_and_never_the_coordinat
     # A mid-run compaction of the forked session is the run's own, never the coordinator's session_note.
     out = json.loads((p.runs / str(rid) / "output.jsonl").read_text())
     assert out.get("subtype") == "compact_boundary" and out.get("summary") == "fake worker summary"
+
+
+def test_no_worker_or_reviewer_run_of_any_provider_gets_the_coordinators_answer_schema_or_tool(env, monkeypatch, tmp_path):
+    """Upstream note 3faa1c4e81d3e26b: no worker or reviewer path on any provider may give the run
+    the coordinator's StructuredOutput tool or its answer schema. start_run passes a schema only for
+    the coordinator role, and the shaped fork injects none: a worker's argv on every provider that
+    takes a schema flag carries no schema flag, and its prompt tells it to call no StructuredOutput."""
+    from ttp import coordsession, ctxfork
+    from ttp.daemon import Daemon
+    from ttp.providers import get_provider
+    p, d, cfg_dir, _run = _fork_daemon(env, monkeypatch, tmp_path)
+    sid = str(uuid.uuid4())
+    _fork_transcript(cfg_dir, p.base, sid)
+    p.db.set_kv(coordsession.KEY, {"id": sid, "provider": "claude", "context_tokens": 50000})
+    tid = p.db.add_task(f"t {uuid.uuid4().hex[:6]}", "do the one thing", kind="code", origin="user")
+    flags = ("--json-schema", "--output-schema")
+    for provider in ("claude", "codex", "fake"):   # the providers whose build() takes a schema flag
+        rid = d.start_run("worker", "TASK PROMPT", provider, "standard", str(p.root), task=p.db.task(tid),
+                          append_system="# WORKER RULES")
+        argv = json.loads((p.runs / str(rid) / "run.json").read_text())["argv"]
+        assert not [a for a in argv if any(a == f or a.startswith(f) for f in flags)], (provider, argv)
+        prompt = (p.runs / str(rid) / "prompt.md").read_text()
+        assert "StructuredOutput" not in prompt and '{"actions"' not in prompt, provider
+    # The coordinator alone gets the schema: its StructuredOutput tool never reaches a worker's tools.
+    got = get_provider("claude").build(role="coordinator", model="", effort="medium", cwd=str(p.root),
+                                       budget_usd=1, read_only=True, schema=coordsession.schema(),
+                                       restrictions={})[0]
+    assert "--json-schema" in got
+    worker = get_provider("claude").build(role="worker", model="", effort="medium", cwd=str(p.root),
+                                          budget_usd=1, read_only=False, schema=None, restrictions={})[0]
+    assert "--json-schema" not in worker and "StructuredOutput" not in json.dumps(worker)
+    assert ctxfork.handoff_tail() == ctxfork.HANDOFF_TAIL
+    # A forked run's prompt never carries an instruction to call StructuredOutput with an actions object.
+    for text in (ctxfork.fork_lead(), ctxfork.shared_lead("X"), ctxfork.HANDOFF_TAIL):
+        assert "StructuredOutput" not in text and '{"actions"' not in text, text[:60]
