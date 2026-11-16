@@ -136,6 +136,33 @@ def test_a_waiting_hand_offs_self_check_reaches_the_final_hand_off_and_metrics_s
         assert reviewstats.has_self_check(p.db, {"title": f"Review #{tid}: a change"}) == want, result
 
 
+def test_a_waiting_hand_offs_cells_reach_the_final_hand_off_so_the_completeness_check_reads_them():
+    """A waiting hand-off's `cells` and `cells_unrunnable` survive its on_pass becoming the final
+    hand-off (never over ones the on_pass lists), so the completeness check reads N of N, not 0 of N."""
+    from ttp import cells
+    from ttp.daemon import with_waiting_followups
+    spec = "Measure both.\ncells: a, b"
+    done = {"status": "done", "summary": "works"}
+    assert cells.prefix(cells.check(spec, done)).startswith(cells.UNREPORTED), "the fault: none listed"
+    for got in (["a", "b"], {"a": 1.5, "b": 0}, "a, b"):
+        waited = {"status": "waiting", "cells": got, "on_pass": done}
+        final = with_waiting_followups(done, waited)
+        assert final == {**done, "cells": got}
+        assert cells.check(spec, final) == {"requested": ["a", "b"], "missing": []}
+        assert cells.prefix(cells.check(spec, final)) == ""
+    why = {"b": "no device of that kind"}
+    waited = {"status": "waiting", "cells": ["a"], "cells_unrunnable": why, "self_check": "ticked"}
+    assert with_waiting_followups(done, waited) == {**done, "cells": ["a"], "cells_unrunnable": why,
+                                                    "self_check": "ticked"}
+    own = {**done, "cells": ["a"]}
+    assert with_waiting_followups(own, {**waited, "cells": ["a", "b"]})["cells"] == ["a"], "never overwritten"
+    for empty in ([], {}, " ", None):
+        assert with_waiting_followups({**done, "cells": empty}, waited)["cells"] == ["a"], empty
+        assert "cells" not in with_waiting_followups(done, {"status": "waiting", "cells": empty}), empty
+    assert with_waiting_followups(done, {"status": "waiting"}) == done, "absent in both"
+    assert with_waiting_followups(done, {"self_check": ["x"]}) == done, "a self_check stays a string"
+
+
 def test_each_review_row_records_whether_the_reviewed_hand_off_carried_a_self_check(env):
     from ttp import audit, reviewstats
     p = make(env)
