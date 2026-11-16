@@ -6,7 +6,7 @@ from __future__ import annotations
 import types
 
 
-def _dead_pid() -> int:
+def _ended_checks_pid() -> int:
     proc = subprocess.Popen(["true"])
     proc.wait()
     return proc.pid
@@ -30,7 +30,7 @@ def test_a_foreground_checks_marker_whose_process_died_reads_as_ended_incomplete
     run = tmp_path / "run-orchid"
     run.mkdir()
     monkeypatch.setenv("TTP_RUN_DIR", str(run))
-    (run / "checks.running").write_text(json.dumps({"since": time.time(), "pid": _dead_pid(), "started": "1"}))
+    (run / "checks.running").write_text(json.dumps({"since": time.time(), "pid": _ended_checks_pid(), "started": "1"}))
     code, out = _result(run, capsys)
     assert code == 0, out
     assert "incomplete" in out and "ttp checks --detach" in out, out
@@ -38,7 +38,7 @@ def test_a_foreground_checks_marker_whose_process_died_reads_as_ended_incomplete
     # Read again: the same answer, nothing rewritten.
     assert _result(run, capsys)[0] == 0
     # A marker of the old shape ({since, pid}) with a dead pid ends the same way.
-    (run / "checks.running").write_text(json.dumps({"since": time.time(), "pid": _dead_pid()}))
+    (run / "checks.running").write_text(json.dumps({"since": time.time(), "pid": _ended_checks_pid()}))
     code, out = _result(run, capsys)
     assert code == 0 and "incomplete" in out, out
 
@@ -98,7 +98,7 @@ def test_a_stopped_foreground_checks_run_records_killed_and_says_how_to_wait(tmp
     code, out = cli._checks_result(run), capsys.readouterr().out   # _cmd_checks is replaced here
     assert code == 0 and "incomplete" in out and "were stopped" in out, out
     # A marker another process wrote is never finish-marked by this one.
-    (run / "checks.running").write_text(json.dumps({"since": time.time(), "pid": _dead_pid()}))
+    (run / "checks.running").write_text(json.dumps({"since": time.time(), "pid": _ended_checks_pid()}))
     monkeypatch.setattr(cli, "_cmd_checks", lambda a: None)
     cli.cmd_checks(types.SimpleNamespace(result=None, own_group=False))
     assert "ended" not in _marker(run)
@@ -108,8 +108,8 @@ def test_an_older_foreground_marker_never_answers_for_newer_detached_checks(tmp_
     run = tmp_path / "run-wren"
     run.mkdir()
     monkeypatch.setenv("TTP_RUN_DIR", str(run))
-    (run / "checks.running").write_text(json.dumps({"since": time.time() - 600, "pid": _dead_pid()}))
-    (run / "checks.pid").write_text(json.dumps({"pid": _dead_pid(), "ts": time.time()}))
+    (run / "checks.running").write_text(json.dumps({"since": time.time() - 600, "pid": _ended_checks_pid()}))
+    (run / "checks.pid").write_text(json.dumps({"pid": _ended_checks_pid(), "ts": time.time()}))
     (run / "checks.rc").write_text("0\n")
     code, out = _result(run, capsys)
     assert code == 0 and "finished with exit code 0" in out and "incomplete" not in out, out
