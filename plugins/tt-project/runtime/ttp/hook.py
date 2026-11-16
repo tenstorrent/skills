@@ -2103,19 +2103,8 @@ def post_tool_use_failure(payload: dict) -> tuple[dict | None, Callable[[], None
                                    "additionalContext": "\n\n".join(parts)}}, delivered
 
 
-def session_start(payload: dict):
-    """After the agent compacted a task run's context (SessionStart, source "compact"), its role and task
-    again (rolerestore.py), so a summary written under a copied coordinator session does not make the
-    run act as the coordinator."""
-    run_dir = os.environ.get("TTP_RUN_DIR")
-    if payload.get("source") != "compact" or not run_dir:
-        return None, None
-    from . import rolerestore
-    return rolerestore.hook_output(Path(run_dir)), None
-
-
 HANDLERS = {"PostToolUse": post_tool_use, "PostToolUseFailure": post_tool_use_failure,
-            "PreToolUse": pre_tool_use, "SessionStart": session_start, "Stop": stop}
+            "PreToolUse": pre_tool_use, "Stop": stop}
 
 
 def _coord_pre_tool_use(payload: dict):

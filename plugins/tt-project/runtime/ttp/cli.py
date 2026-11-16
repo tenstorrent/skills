@@ -7317,8 +7317,7 @@ def _checks_detach(a, run_dir: Path, p: Project | None, top: str = "", head: str
     print("on_pass: if nothing is left after them but recording the result, add the final hand-off to the "
           "waiting one as \"on_pass\": {\"status\": \"done\", \"summary\": \"...\"} (or needs_review); a pass "
           "records it without a model run (a code task with no on_pass, next_step, PR or landing left: done with "
-          "its summary); the waiting hand-off's followups, self_check, cells and cells_unrunnable carry over "
-          "into it unless it lists its own")
+          "its summary)")
 
 
 def _checks_place(run_dir: Path, old: dict, env: dict) -> float:

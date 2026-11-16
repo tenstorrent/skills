@@ -680,18 +680,6 @@ class Codex(Provider):
             return None
         return {"first_context": first, "last_context": last, "compacted": compacted} if last or compacted else None
 
-    def compactions(self, output_path, env=None, since=None):
-        # `codex exec --json` shows no compaction: its rollout's "compacted" records do (session_context),
-        # counted from `since`, as a forked rollout also holds the copied session's.
-        started, _ = jsonl_from(Path(output_path), 0, (b'"thread.started"',))
-        sid = next((str(ev.get("thread_id") or "") for ev in started if ev.get("type") == "thread.started"), "")
-        paths = self.session_paths(sid, "", env)
-        if not paths:
-            return 0
-        rows, _ = jsonl_from(max(paths, key=lambda f: f.stat().st_mtime), 0, (b'"compacted"',))
-        return sum(1 for rec in rows if rec.get("type") == "compacted"
-                   and (since is None or _stamp(rec.get("timestamp")) >= since))
-
     def activity(self, output_path, offset=0):
         """`codex exec --json`: item.started is a call, item.completed its result (a command that
         exited non-zero or an item that failed is an error); an item only seen completed is both."""

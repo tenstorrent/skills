@@ -1030,9 +1030,6 @@ def hook_settings() -> dict:
                       # (HARNESS_TOOLS, the reviewer's write rule), and subagents' calls too.
                       "PreToolUse": [{"matcher": "*",
                                       "hooks": [{"type": "command", "command": f"{cmd} PreToolUse", "timeout": 20}]}],
-                      # After a compaction, the task run's role and task again (rolerestore.py).
-                      "SessionStart": [{"matcher": "compact",
-                                        "hooks": [{"type": "command", "command": f"{cmd} SessionStart", "timeout": 20}]}],
                       # Refuses to end a task run whose result.json is missing or no hand-off (twice at most),
                       # or fails a hand-off check (the checks get handoffcheck.STOP_BUDGET_S in all).
                       "Stop": [{"hooks": [{"type": "command", "command": f"{cmd} Stop",
