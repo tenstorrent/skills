@@ -1429,8 +1429,11 @@ home zone). It detaches its long run and returns at once, so a command schedule 
 runs it in this shell, one run per day. It reads each project's own records read-only, keeps the
 landed code tasks of the day, drops tasks that need a device (listed with why) and starts each from
 its real base commit. A project's repository is cloned into a bench-owned folder under
-`~/.tt-project/model-bench/`; nothing is added to, fetched in or written to the project's own repo or
-state. Each task runs with each arm under the cell isolation and limit above. A cell lands when a
+`~/.tt-project/model-bench/` that reads the project's objects in place through `objects/info/alternates`
+and keeps only a copy of its branch refs (no fetch of every ref, so a large repo is ready in seconds);
+nothing is added to, fetched in or written to the project's own repo or state. A project whose mirror
+cannot be prepared is left out of the day, and the invocation that started the run prints one
+observation for it (key `bench-daily-skip-<project>`) once the pick is done. Each task runs with each arm under the cell isolation and limit above. A cell lands when a
 blind review (the main grade; arm hidden) scores requirements and correctness at 3 or more; a
 time-limit stop is a fail. `--cap-usd` bounds Claude spend (arm runs plus reviews) from a running
 total: a task reserves the worst case until 2 tasks have finished, then twice the mean actual Claude

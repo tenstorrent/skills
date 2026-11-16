@@ -94,20 +94,42 @@ def repo_of(proj: dict, repos: dict | None = None) -> Path | None:
     return path if r.returncode == 0 and path.is_dir() else None
 
 
-def mirror(proj: dict, base: Path | None = None, source: Path | None = None) -> Path:
-    """A bench-owned mirror clone of the project's repository (made once, then refreshed by a fetch that runs
-    inside the mirror only): the source repository, its .git and its state are only read."""
-    dest = (base or home() / "mirrors") / slug(proj["name"])
-    git = ["git", "-C", str(dest)]
-    if dest.exists():
-        r = subprocess.run([*git, "fetch", "--prune", "--quiet", "origin"], capture_output=True, text=True, timeout=600)
-    else:
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        r = subprocess.run(["git", "clone", "--mirror", "--no-hardlinks", "--quiet", str(source or proj["root"]), str(dest)],
-                           capture_output=True, text=True, timeout=1800)
+def _git(repo: Path, *args: str, timeout: int = 120, inp: str | None = None) -> str:
+    r = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=timeout, input=inp)
     if r.returncode:
-        raise RuntimeError(f"{proj['name']}: mirror {'fetch' if dest.exists() else 'clone'} failed: "
-                           f"{(r.stderr or r.stdout).strip()[:300]}")
+        raise RuntimeError(f"git {args[0]} failed: {(r.stderr or r.stdout).strip()[:300]}")
+    return r.stdout
+
+
+def mirror(proj: dict, base: Path | None = None, source: Path | None = None) -> Path:
+    """A bench-owned bare mirror of the project's repository. It copies no objects: it reads the source's object
+    store in place through objects/info/alternates (read-only), and holds only a copy of the source's branch
+    refs, which the bench needs to find a task's branch. Made once, refreshed by rewriting those refs; every
+    write happens inside the mirror: the source repository, its .git and its state are only read."""
+    dest = (base or home() / "mirrors") / slug(proj["name"])
+    src = Path(source or proj["root"])
+    try:
+        objects = _git(src, "rev-parse", "--path-format=absolute", "--git-path", "objects").strip()
+        heads = dict(reversed(l.split(" ", 1)) for l in _git(src, "for-each-ref", "--format=%(objectname) %(refname)",
+                                                             "refs/heads").splitlines())
+        if not dest.exists():
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            _git(dest.parent, "init", "-q", "--bare", str(dest))
+        info = dest / "objects" / "info"
+        info.mkdir(parents=True, exist_ok=True)
+        if not (info / "alternates").exists() or (info / "alternates").read_text().strip() != objects:
+            tmp = info / "alternates.tmp"
+            tmp.write_text(objects + "\n")
+            os.replace(tmp, info / "alternates")
+        have = {l.split(" ", 1)[1]: l.split(" ", 1)[0] for l in _git(dest, "for-each-ref", "--format=%(objectname) %(refname)",
+                                                                     "refs/heads").splitlines()}
+        cmds = [f"delete {ref}\n" for ref in have if ref not in heads]
+        cmds += [f"update {ref} {sha}\n" for ref, sha in heads.items() if have.get(ref) != sha]
+        if cmds:
+            _git(dest, "update-ref", "--stdin", inp="".join(cmds))
+    except (RuntimeError, OSError, subprocess.SubprocessError) as e:
+        raise RuntimeError(f"{proj['name']}: mirror {'refresh' if dest.exists() else 'preparation'} failed: "
+                           f"{str(e).strip()[:300]}") from e
     return dest
 
 
@@ -708,6 +730,31 @@ def run_day(day: str, start: float, end: float, arms: dict, cfg: dict, cap: floa
     durable_write(root / "days" / f"{day}.json", json.dumps(rec, indent=1) + "\n")
     write_table(root)
     return rec
+
+
+PICK_WAIT_S = 150   # how long `ttp bench daily` waits for the pick stage (under a command schedule's time limit)
+
+
+def skip_lines(day: str, root: Path | None = None) -> list[str]:
+    """One schedule observation (a JSON line, severity normal, key bench-daily-skip-<project>) per project the day's
+    pick left out because its mirror or its records could not be prepared; [] while the pick has not finished."""
+    pfile = (root or home()) / "runs" / day / "picked.json"
+    try:
+        faults = json.loads(pfile.read_text()).get("faults") or []
+    except (OSError, ValueError, AttributeError):
+        return []
+    return [json.dumps({"text": f"bench daily: {f['project']} was left out of {day}'s bench: {f['why']}",
+                        "severity": "normal", "key": f"bench-daily-skip-{slug(f['project'])}"})
+            for f in faults if isinstance(f, dict) and f.get("project")]
+
+
+def wait_skips(day: str, root: Path | None = None, wait_s: float = PICK_WAIT_S, poll_s: float = 2.0) -> list[str]:
+    """`skip_lines` once the pick stage has written picked.json, waiting up to `wait_s` seconds for it."""
+    pfile = (root or home()) / "runs" / day / "picked.json"
+    end = time.monotonic() + wait_s
+    while not pfile.exists() and time.monotonic() < end:
+        time.sleep(min(poll_s, max(0.0, end - time.monotonic())))
+    return skip_lines(day, root)
 
 
 def lock(day: str, root: Path | None = None):

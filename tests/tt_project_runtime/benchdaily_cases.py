@@ -262,25 +262,102 @@ def _dd_tree_state(root):
     return out
 
 
-def test_daily_mirror_clones_and_fetches_inside_the_bench_folder_and_leaves_the_source_repository_alone(tmp_path):
+def _dd_git(repo, *args):
+    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, check=True).stdout.strip()
+
+
+def test_daily_mirror_borrows_the_sources_objects_and_copies_only_branch_refs_and_leaves_the_source_alone(tmp_path):
     from ttp import benchdaily
     repo, git, commit, rev = _bench_repo(tmp_path)
+    for i in range(60):    # a repository with many refs: the mirror never fetches them
+        subprocess.run([*git, "branch", f"side/{i}"], check=True)
+        subprocess.run([*git, "tag", f"t{i}"], check=True)
     before = _dd_tree_state(repo / ".git")
     proj = {"name": "Other Proj", "root": repo, "db": tmp_path / "x"}
     base = tmp_path / "mirrors"
     m = benchdaily.mirror(proj, base)
     assert m == base / "Other-Proj" and m.is_dir()
-    assert subprocess.run(["git", "-C", str(m), "rev-parse", "main"], capture_output=True, text=True).stdout.strip() == rev("main")
-    assert _dd_tree_state(repo / ".git") == before, "the clone only reads the source repository"
+    assert _dd_git(m, "rev-parse", "main") == rev("main")
+    assert len(_dd_git(m, "for-each-ref", "refs/heads").splitlines()) == 61
+    assert _dd_git(m, "for-each-ref", "refs/tags") == "", "tags are not copied"
+    assert (m / "objects" / "info" / "alternates").read_text().strip() == str(repo / ".git" / "objects")
+    assert _dd_git(m, "count-objects", "-v").count("count: 0") == 1 and not list((m / "objects" / "pack").glob("*.pack")), \
+        "no object is copied: the source's store is read in place"
+    assert _dd_tree_state(repo / ".git") == before, "preparing the mirror only reads the source repository"
     new = commit({"extra.txt": "x\n"}, "later")
+    subprocess.run([*git, "branch", "-D", "side/0"], check=True)
     before2 = _dd_tree_state(repo / ".git")
     assert benchdaily.mirror(proj, base) == m
-    assert subprocess.run(["git", "-C", str(m), "rev-parse", "main"], capture_output=True, text=True).stdout.strip() == new, \
-        "the refresh fetches the new commit into the mirror"
+    assert _dd_git(m, "rev-parse", "main") == new, "the refresh moves the branch to the new commit, which is readable"
+    assert _dd_git(m, "cat-file", "-t", new) == "commit"
+    assert subprocess.run(["git", "-C", str(m), "rev-parse", "-q", "--verify", "refs/heads/side/0"], capture_output=True).returncode, \
+        "a branch the source deleted is deleted from the mirror"
     assert _dd_tree_state(repo / ".git") == before2, "the refresh runs inside the mirror: the source's .git is untouched"
     assert subprocess.run([*git, "worktree", "list"], capture_output=True, text=True).stdout.count("\n") == 1, "no worktree was added"
     with pytest.raises(RuntimeError):
         benchdaily.mirror({"name": "gone", "root": tmp_path / "nope", "db": tmp_path / "x"}, base)
+
+
+def test_daily_mirror_an_earlier_full_clone_is_refreshed_without_fetching(tmp_path, monkeypatch):
+    from ttp import benchdaily
+    repo, git, commit, rev = _bench_repo(tmp_path)
+    proj = {"name": "P", "root": repo, "db": tmp_path / "x"}
+    old = tmp_path / "mirrors" / "P"
+    old.parent.mkdir()
+    subprocess.run(["git", "clone", "--mirror", "--no-hardlinks", "-q", str(repo), str(old)], check=True)
+    new = commit({"extra.txt": "x\n"}, "later")
+    real = subprocess.run
+    calls = []
+    def spy(cmd, *a, **kw):
+        calls.append(list(cmd))
+        return real(cmd, *a, **kw)
+    monkeypatch.setattr(benchdaily.subprocess, "run", spy)
+    assert benchdaily.mirror(proj, tmp_path / "mirrors") == old
+    assert not [c for c in calls if "fetch" in c or "clone" in c], "a refresh never fetches or clones"
+    assert _dd_git(old, "rev-parse", "main") == new and (old / "objects" / "info" / "alternates").exists()
+
+
+def _dd_run_day_stubs(monkeypatch, tmp_path, benchdaily, projs, mirror):
+    monkeypatch.setattr(benchdaily, "projects", lambda skip=None: projs)
+    monkeypatch.setattr(benchdaily, "open_ro", lambda path: None)
+    monkeypatch.setattr(benchdaily, "landed_in_window", lambda db, start, end: 1)
+    monkeypatch.setattr(benchdaily, "repo_of", lambda proj, repos=None: tmp_path)
+    monkeypatch.setattr(benchdaily, "mirror", mirror)
+    monkeypatch.setattr(benchdaily, "pick", lambda db, repo, start, end: ([{"task": 1, "base": "b", "head": "h"}], []))
+    monkeypatch.setattr(benchdaily, "build", lambda day, proj, kept, repo, bench_dir: {f"{proj['name']}-1": {}})
+    monkeypatch.setattr(benchdaily, "prior_review_mean", lambda root, day: None)
+    monkeypatch.setattr(benchdaily, "run_cells", lambda *a, **k: {"skipped": [], "admitted": {}})
+    monkeypatch.setattr(benchdaily, "blind_review", lambda *a, **k: {})
+    monkeypatch.setattr(benchdaily, "day_record", lambda *a, **k: {"spend": {}})
+    monkeypatch.setattr(benchdaily, "write_table", lambda root: None)
+
+
+def test_daily_a_failed_or_timed_out_mirror_leaves_that_project_out_with_a_skip_line_and_the_others_run(tmp_path, monkeypatch):
+    from ttp import benchdaily
+    projs = [{"name": n, "db": tmp_path / n / "db", "root": tmp_path / n} for n in ("Big One", "Fine")]
+    def mirror(proj, base=None, source=None):
+        if proj["name"] == "Big One":
+            raise RuntimeError("Big One: mirror preparation failed: timed out after 120 seconds")
+        return tmp_path
+    _dd_run_day_stubs(monkeypatch, tmp_path, benchdaily, projs, mirror)
+    rec = benchdaily.run_day("2026-11-15", 0, 1, {}, {}, root=tmp_path / "bench", progress=lambda s: None)
+    picked = json.loads((tmp_path / "bench" / "runs" / "2026-11-15" / "picked.json").read_text())
+    assert [k["project"] for k in picked["order"]] == ["Fine"], "the other project still runs"
+    assert [f["project"] for f in rec["faults"]] == ["Big One"]
+    lines = [json.loads(x) for x in benchdaily.skip_lines("2026-11-15", tmp_path / "bench")]
+    assert lines == [{"text": "bench daily: Big One was left out of 2026-11-15's bench: RuntimeError: Big One: mirror "
+                              "preparation failed: timed out after 120 seconds",
+                      "severity": "normal", "key": "bench-daily-skip-Big-One"}]
+    assert benchdaily.skip_lines("2026-11-14", tmp_path / "bench") == [], "no pick yet: no line"
+    assert benchdaily.wait_skips("2026-11-14", tmp_path / "bench", wait_s=0.1, poll_s=0.05) == []
+
+
+def test_daily_a_clean_pick_reports_no_skip_line(tmp_path, monkeypatch):
+    from ttp import benchdaily
+    projs = [{"name": "Fine", "db": tmp_path / "f" / "db", "root": tmp_path / "f"}]
+    _dd_run_day_stubs(monkeypatch, tmp_path, benchdaily, projs, lambda proj, base=None, source=None: tmp_path)
+    benchdaily.run_day("2026-11-15", 0, 1, {}, {}, root=tmp_path / "bench", progress=lambda s: None)
+    assert benchdaily.skip_lines("2026-11-15", tmp_path / "bench") == []
 
 
 def _dd_cell(project, arm, model, task, criteria, correctness, landed, cost, minutes, stopped=False, claude=True):

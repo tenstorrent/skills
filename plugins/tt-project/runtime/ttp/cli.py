@@ -9353,6 +9353,9 @@ def _bench_daily(p, a) -> None:
         started, log = benchdaily.detach(argv, day, p.root)
         print(f"ttp bench daily: {day} " + ("started in the background" if started else "already running")
               + f"; log {log}; table {benchdaily.home() / 'table.md'}", file=sys.stderr)
+        # a project the pick left out is reported as a schedule observation, once the pick stage is done
+        for line in benchdaily.wait_skips(day, wait_s=float(conf.get("pick_wait_s", benchdaily.PICK_WAIT_S))):
+            print(line)
         return
     held = benchdaily.lock(day)
     if held is None:
