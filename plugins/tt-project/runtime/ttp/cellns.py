@@ -181,11 +181,26 @@ def backend() -> str | None:
 
 def tool_binds(exe: str, avoid: list[Path]) -> list[Path]:
     """The folders (read-only) a provider CLI or interpreter `exe` needs beyond the system ones: its resolved
-    install (the file's folder, or a python's prefix) and its shebang interpreter's. A folder that holds a
+    install (the file's folder, or a python's prefix), the venv folders its link chain runs through and its shebang interpreter's. A folder that holds a
     hidden path, or is the real home folder or one of its parents, is narrowed to the file itself."""
     out: list[Path] = []
-    real0 = os.path.realpath(shutil.which(exe) or exe)
+    named = os.path.abspath(shutil.which(exe) or exe)
+    real0 = os.path.realpath(named)
     todo = [real0]
+    # A venv's interpreter is a link to the system one (or to another venv's) but is run by its own path: each
+    # venv folder along the link chain (its pyvenv.cfg beside bin/) must exist in the cell too, or the command
+    # is not found there.
+    hop, seen = named, set()
+    while hop not in seen and not _under(hop, SYSTEM):
+        seen.add(hop)
+        venv = Path(hop).parent.parent
+        if (Path(hop).parent.name == "bin" and (venv / "pyvenv.cfg").is_file() and venv != Path.home()
+                and venv not in Path.home().parents and not any(Path(a).is_relative_to(venv) for a in avoid)
+                and venv not in out):
+            out.append(venv)
+        if not os.path.islink(hop):
+            break
+        hop = os.path.abspath(os.path.join(os.path.dirname(hop), os.readlink(hop)))
     try:
         with open(real0, "rb") as f:
             head = f.read(200)

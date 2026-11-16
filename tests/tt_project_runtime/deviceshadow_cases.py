@@ -272,7 +272,7 @@ def test_device_shadow_cell_command_cannot_reach_a_host_listener(env, tmp_path):
     try:
         script = tmp / "reach.py"
         script.write_text(_REACH)
-        r = subprocess.run(cell.wrap([sys.executable, "-I", str(script), f"127.0.0.1:{host.port}"]), cwd=str(ws),
+        r = subprocess.run(cell.wrap([cell.python, "-I", str(script), f"127.0.0.1:{host.port}"]), cwd=str(ws),
                            capture_output=True, text=True, timeout=60, env={**os.environ, **cell.sets()})
         assert r.stdout.strip() == "socket=unreachable urllib=unreachable", (r.stdout, r.stderr)
     finally:

@@ -529,6 +529,38 @@ def test_cell_bridge_port_reaches_the_outside_only_through_the_relay(tmp_path, b
         other.close()
 
 
+@pytest.mark.parametrize("backend", ["bwrap", "unshare"])
+def test_cell_runs_a_venv_interpreter_by_its_own_path_and_keeps_the_network_empty(tmp_path, backend):
+    # An interpreter in a venv outside the system folders (the pinned checks env, a user's own venv) is a link to
+    # the system one but is run by its own path: that path exists in the cell, the bridge relay reaches the
+    # outside through it, and a host listener stays unreachable.
+    from ttp import cellnet, cellns
+    _namespace(backend)
+    venv = tmp_path / "venv"
+    subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(venv)], check=True, capture_output=True)
+    py = str(venv / "bin" / "python3")
+    ws = tmp_path / "cell" / "work"
+    ws.mkdir(parents=True)
+    cell = cellns.build(ws.parent, ws, [], python=py, name=backend)
+    host, other = _HostListener(), _HostListener()
+    fwd = cellnet.forward(cell.sock("bridge"), "127.0.0.1", host.port)
+    try:
+        r = subprocess.run(cell.wrap([py, "-I", "-c", "import sys; print(sys.prefix)"]), cwd=ws,
+                           capture_output=True, text=True, timeout=60)
+        assert r.stdout.strip() == str(venv), (r.stdout, r.stderr)
+        script = ws / "reach.py"
+        script.write_text(_REACH)
+        env = {**os.environ, "TTP_RUN_PROXY_PORT": str(host.port)}
+        for port, want in ((host.port, "reachable"), (other.port, "unreachable")):
+            r = subprocess.run(cell.wrap([py, "-I", str(script), f"127.0.0.1:{port}"]), cwd=ws, env=env,
+                               capture_output=True, text=True, timeout=60)
+            assert r.stdout.strip() == f"socket={want} urllib={want}", (port, r.stdout, r.stderr)
+    finally:
+        fwd.stop()
+        host.close()
+        other.close()
+
+
 def test_cell_relay_ends_with_the_agents_exit_code_and_a_missing_command(tmp_path):
     relay = pathlib.Path(__import__("ttp.cellnet_relay", fromlist=["x"]).__file__)
     run = lambda *a: subprocess.run([sys.executable, "-I", "-S", str(relay), *a], capture_output=True, text=True,
