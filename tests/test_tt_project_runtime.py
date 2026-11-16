@@ -27438,6 +27438,8 @@ def test_durable_write_syncs_renames_and_keeps_the_mode(env, monkeypatch):
 # Every place the runtime writes a file directly, and why it need not survive a power cut. Anything
 # else goes through project.durable_write / durable_append / write_json.
 DURABLE_EXEMPT = {
+    ("rolerestore.py", '(Path(run_dir) / ROLE_FILE).write_text('): "a run's role restatement in its own run folder, rewritten at every run start; a cut file only skips one restatement",
+    ("rolerestore.py", '(Path(run_dir) / RESTATED_FILE).write_text('): "a run's count of restatements already given, in its own run folder; a cut count only restates once more",
     ("deviceshadow.py", 'f.write_text(f"#!/bin/sh'): "the refusing stand-in for a device tool in a shadow cell's temporary folder, rebuilt for every cell; never state",
     ("deviceshadow.py", 'target.write_bytes(f.read())'): "a file copied into a shadow run's temporary copy of the project's records, rebuilt for every run; never state",
     ("deviceshadow.py", 'path.write_text("".join(scrub(json.dumps(r, default=str), paths)'): "a scrubbed row dump in a shadow run's temporary copy, rebuilt for every run; never state",
