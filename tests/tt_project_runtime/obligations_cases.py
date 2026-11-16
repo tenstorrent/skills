@@ -1130,3 +1130,42 @@ def test_a_worker_receipt_closes_the_obligation_once_the_other_owners_ended(env,
     assert "no longer owed" in ob.record(p, oid, "receipt", "built it", tid, now=now + 60)
     oid2 = ob.add(p, "another", [tid], now=now)
     assert "no longer owed" in ob.record(p, oid2, "receipt", "single owner", tid, now=now + 60)
+
+
+def test_a_refused_run_record_is_filed_and_noted_once_and_a_transient_failure_retries(env, monkeypatch):
+    """A run's record its task may not file (not an owner) is refused once: read again after its line
+    count is lost (a closed task's offset pruned, the task re-queued), it is not refused, logged or
+    noted again. A failure that may pass (the database busy) files nothing and the next pass files it."""
+    import sqlite3
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    oid = ob.add(p, "the urgent report", [tid], now=now)
+    other = ob.add(p, "another report", [], now=now)
+    run_dir = p.runs / "r-refused"
+    run_dir.mkdir(parents=True)
+    p.db.x("INSERT INTO runs(task,role,started,status,dir) VALUES(?,?,?,?,?)",
+           (tid, "worker", now, "running", str(run_dir)))
+    rid = str(p.db.q("SELECT id FROM runs WHERE dir=?", (str(run_dir),))[0]["id"])
+    (run_dir / ob.RUN_FILE).write_text(json.dumps({"ts": now + 60, "id": other, "kind": "progress",
+                                                   "evidence": "commit old"}) + "\n")
+    refused = ob.file_runs(p, now + 100)
+    assert len(refused) == 1 and "not a required owner" in refused[0]
+    st = ob._load(p.db)
+    st["runs"].pop(rid)   # its line count lost: the record is read again from line 0
+    p.db.set_kv(ob.KV, st)
+    assert ob.file_runs(p, now + 200) == [], "not refused or logged again"
+    assert (run_dir / "progress.md").read_text().count("obligation record refused") == 1
+    ob.append_run(run_dir, oid, "progress", "commit abc", str(tid))
+    real, calls = ob.record, []
+
+    def busy(*a, **kw):
+        calls.append(a)
+        if len(calls) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real(*a, **kw)
+    monkeypatch.setattr(ob, "record", busy)
+    assert ob.file_runs(p, now + 300) == []
+    assert ob.get(p.db, oid)["owners"][str(tid)]["evidence"] == [], "nothing filed while the database is busy"
+    assert ob.file_runs(p, now + 400) == []
+    assert [e["text"] for e in ob.get(p.db, oid)["owners"][str(tid)]["evidence"]] == ["commit abc"]
+    assert (run_dir / "progress.md").read_text().count("obligation record refused") == 1

@@ -93,16 +93,19 @@ coordinator's STATE shows each open task's open keys (open_keys_by_task), so it 
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import os
 import json
 import math
 import re
+import sqlite3
 import time
 from datetime import datetime
 from pathlib import Path
 
 KV = "obligations"            # kv: {"next": n, "items": {id: record}, "runs": {run id: lines filed}}
 RUN_FILE = "obligations.jsonl"
+REFUSED_FILE = "obligations.refused"   # in a run folder: a key per record refused for good (file_runs)
 CLOCK_S = 2 * 3600
 CHECK_EVERY_S = 300
 REOWN_LABEL = "reown:"        # + obligation id: the owner task the daemon started for it
@@ -570,9 +573,31 @@ def append_run(run_dir: Path, oid: str, kind: str, evidence: str, task: str, mil
                                                           "evidence": evidence, "task": task, "milestone": milestone}) + "\n")
 
 
+def _refused(run_dir: Path) -> set[str]:
+    try:
+        return set((Path(run_dir) / REFUSED_FILE).read_text(encoding="utf-8").split())
+    except OSError:
+        return set()
+
+
+def _refuse(run_dir: Path, key: str, why: str) -> None:
+    """Mark a run's record refused for good, with one note on the run's task saying so."""
+    from .project import durable_append
+    try:
+        durable_append(Path(run_dir) / REFUSED_FILE, key + "\n")
+        durable_append(Path(run_dir) / "progress.md", f"{time.strftime('%H:%M:%S')} daemon: obligation record "
+                                                      f"refused, not filed: {why}\n")
+    except OSError:
+        pass
+
+
 def file_runs(p, now: float | None = None) -> list[str]:
     """File the records runs wrote (RUN_FILE) that are not filed yet; returns a line per refused one.
-    A record counts for the run's own task only, at the time it was written (never in the future)."""
+    A record counts for the run's own task only, at the time it was written (never in the future).
+    A refusal for good (record() raising: not an owner, no such obligation, a malformed line) is
+    marked in the run's REFUSED_FILE, so it is returned and noted once, even when the run's line count
+    is read again from the start; a failure that may pass (the database busy, a file error) files
+    nothing from that line on, and the next pass retries it."""
     now = time.time() if now is None else now
     db = p.db
     seen = dict(_load(db)["runs"])
@@ -594,7 +619,12 @@ def file_runs(p, now: float | None = None) -> list[str]:
             continue
         done = int(seen.get(str(r["id"]), 0))
         old = legacy and str(r["id"]) not in seen and r["status"] != "running" and float(r["started"] or 0) < cutoff
-        for line in lines[done:]:
+        refused = _refused(r["dir"]) if done < len(lines) else set()
+        seen[str(r["id"])] = len(lines)
+        for n, line in enumerate(lines[done:], done):
+            key = f"{n}:{hashlib.sha1(line.encode()).hexdigest()[:16]}"
+            if key in refused:
+                continue
             try:
                 rec = json.loads(line)
                 if old and float(rec.get("ts") or 0) < float(r["started"] or 0) + RUN_FILES_DAYS * 86400:
@@ -603,7 +633,10 @@ def file_runs(p, now: float | None = None) -> list[str]:
                        now=min(float(rec.get("ts") or now), now), milestone=rec.get("milestone"))
             except (ValueError, KeyError, TypeError) as e:
                 out.append(f"run {r['id']}: {str(e)[:200]}")
-        seen[str(r["id"])] = len(lines)
+                _refuse(r["dir"], key, str(e)[:200])
+            except (sqlite3.Error, OSError):
+                seen[str(r["id"])] = n   # may pass next time: retried from this line
+                break
     # An offset is kept while it counts lines and the run is not gone: a run leaves the set when it ages
     # out and comes back when its task is re-queued, and must not be read again from line 0. It is
     # dropped once its task is closed and every obligation that task owns has its receipt or was dropped:
