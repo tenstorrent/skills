@@ -388,7 +388,8 @@ def review_spec(task: dict, run_dir: str) -> str:
         blindreview.scrub(str(task.get("spec") or "")[:6000]), "",
         f"Its final status: {task.get('status')}.",
         f"Its hand-off (result.json), progress and transcript, with model names masked: "
-        f"{run_dir or '(no run folder recorded)'}; the task's result in `ttp task show {task['id']}`. Read the "
+        f"{run_dir or '(no run folder recorded)'} (a task that ran more than once has one folder per run there, "
+        f"oldest first, listed in runs.md: read them all); the task's result in `ttp task show {task['id']}`. Read the "
         "run only there: never its run folder or the project's state.",
         "", "Read only: change nothing, run no device or machine command.",
         'Return in result.json: "device_ab_scores": {"answered": <0-4>, "supported": <0-4>, "why": "<one line>"}.',
@@ -406,12 +407,12 @@ def queue_reviews(db, s: dict, since: float, limit: int = 10, second: dict | Non
     reviewers = [(REVIEW_LABEL, REVIEW_MODEL, None)] + ([(REVIEW2_LABEL, second, second["provider"])] if second else [])
     out = []
     for t in done:
-        run = db.q("SELECT dir FROM runs WHERE task=? ORDER BY id DESC LIMIT 1", (t["id"],))
+        runs = blindreview.run_dirs(db, t["id"])   # every run of the task, oldest first, not only its last
         for label, who, prov in reviewers:
             if f"{label}{t['id']}" in have or len(out) >= limit:
                 continue
             # Blind: the label masks `ttp` for the reviewer; it reads a masked copy of the run, never its folder.
-            got = blindreview.packet(Path(db.path).parent, f"ab-{t['id']}", (run[0]["dir"] if run else "") or "")
+            got = blindreview.packet(Path(db.path).parent, f"ab-{t['id']}", runs)
             out.append(db.add_task(f"Device A/B review of #{t['id']}" + (" (second reviewer)" if prov else ""),
                                    review_spec(t, got), kind="question",
                                    tier="standard", priority=4, origin="daemon", model=who["model"],

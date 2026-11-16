@@ -193,3 +193,104 @@ def test_daemon_device_reviews_do_not_fill_the_coordinators_new_task_cap(env):
     p.db.add_task("Find why the widget soak stalls", "Look.", kind="question", origin="coordinator")
     assert len(coord.tasks_made(p.db, 0)) == 1
     assert len(coord.tasks_made(p.db, 0, review=True)) == 3
+
+
+def _blind_runs(p, tmp_path, tid, legs):
+    """One run folder per leg of task `tid`, recorded oldest first like the daemon does (made-up names)."""
+    from pathlib import Path
+    dirs = []
+    for i, (model, provider, lines) in enumerate(legs, 1):
+        d = Path(tmp_path) / "runs" / str(90110 + i)
+        d.mkdir(parents=True)
+        (d / "run.json").write_text(_json.dumps({"provider": provider, "model": model}))
+        (d / "result.json").write_text(_json.dumps({"status": "waiting" if i < len(legs) else "done",
+                                                    "summary": f"leg {i} hand-off by {model}", "model": model,
+                                                    "provider": provider, "run_id": 90110 + i}))
+        (d / "progress.md").write_text(f"leg {i} progress\n")
+        (d / "output.jsonl").write_text("".join(_json.dumps(x) + "\n" for x in lines))
+        p.db.x("INSERT INTO runs(task, role, provider, model, dir, started, status) VALUES(?,?,?,?,?,?,?)",
+               (tid, "worker", provider, model, str(d), float(i), "ok"))
+        dirs.append(d)
+    p.db.x("INSERT INTO runs(task, role, dir, started, status) VALUES(?,?,?,?,?)",
+           (tid, "coordinator", str(Path(tmp_path) / "coord"), 9.0, "ok"))   # never a coordinator run
+    return dirs
+
+
+def test_a_task_with_three_runs_yields_three_ordered_masked_segments(env, tmp_path):
+    """A blind packet holds every run of the task, oldest first, each named only by its order (run 1 of 3 ...):
+    a waiting hand-off and its resume, or several device legs, are all in front of the reviewer."""
+    from pathlib import Path
+    from ttp import blindreview
+    p = make(env)
+    tid = p.db.add_task("Soak the widget board", "Soak it.", kind="work")
+    legs = [("glm-5.3", "chat", [{"type": "text", "text": "leg 1 by GLM, session 90111"}]),
+            ("claude-opus-5-5", "claude", [{"type": "text", "text": "leg 2", "usage": {"opus": {"in": 1}}}]),
+            ("gpt-9", "codex", [{"type": "text", "text": "leg 3 final"}])]
+    dirs = _blind_runs(p, tmp_path, tid, legs)
+    assert blindreview.run_dirs(p.db, tid) == [str(d) for d in dirs]
+    got = Path(blindreview.packet(p.state, f"ab-{tid}", blindreview.run_dirs(p.db, tid)))
+    assert sorted(f.name for f in got.iterdir()) == ["run-1-of-3", "run-2-of-3", "run-3-of-3", "runs.md"]
+    for i in (1, 2, 3):
+        seg = got / f"run-{i}-of-3"
+        assert sorted(f.name for f in seg.iterdir()) == ["output.jsonl", "progress.md", "result.json"]
+        assert _json.loads((seg / "result.json").read_text())["summary"].startswith(f"leg {i} hand-off")
+        assert f"leg {i}" in (seg / "output.jsonl").read_text() and f"leg {i}" in (seg / "progress.md").read_text()
+    text = "".join(f.read_text() for f in got.rglob("*") if f.is_file()).lower()
+    for bad in ("glm", "opus", "claude-", "gpt", "codex", "zhipu", '"model"', '"provider"', "9011"):
+        assert bad not in text, bad
+    assert "run 1 of 3" in (got / "runs.md").read_text()
+
+
+def test_a_single_run_tasks_packet_is_unchanged(env, tmp_path):
+    """One run: its files sit in the packet itself as before (no run folders, no runs.md), the same bytes
+    whether the run is passed alone or as the task's run list."""
+    from pathlib import Path
+    from ttp import blindreview
+    p = make(env)
+    tid = p.db.add_task("Soak the widget board", "Soak it.", kind="work")
+    (d,) = _blind_runs(p, tmp_path, tid, [("glm-5.3", "chat", [{"type": "text", "text": "only leg"}])])
+    one = Path(blindreview.packet(p.state, "one", str(d), "plan"))
+    many = Path(blindreview.packet(p.state, "many", blindreview.run_dirs(p.db, tid), "plan"))
+    assert sorted(f.name for f in one.iterdir()) == ["output.jsonl", "plan.md", "progress.md", "result.json"]
+    assert {f.name: f.read_bytes() for f in one.iterdir()} == {f.name: f.read_bytes() for f in many.iterdir()}
+    assert blindreview.packet(p.state, "none", [], None) == ""
+
+
+def test_the_size_cap_trims_transcript_middles_and_keeps_every_hand_off_and_final_message(env, tmp_path,
+                                                                                        monkeypatch):
+    from pathlib import Path
+    from ttp import blindreview
+    p = make(env)
+    monkeypatch.setattr(blindreview, "PACKET_MAX", 6000)
+    tid = p.db.add_task("Soak the widget board", "Soak it.", kind="work")
+    filler = [{"type": "text", "text": f"step {k} " + "x" * 80} for k in range(60)]
+    legs = [("glm-5.3", "chat", [{"type": "text", "text": f"FIRST {i}"}] + filler
+             + [{"type": "result", "text": f"FINAL {i} " + "y" * (2500 if i == 2 else 50)}]) for i in (1, 2, 3)]
+    _blind_runs(p, tmp_path, tid, legs)
+    got = Path(blindreview.packet(p.state, f"ab-{tid}", blindreview.run_dirs(p.db, tid)))
+    total = 0
+    for i in (1, 2, 3):
+        seg = got / f"run-{i}-of-3"
+        lines = [_json.loads(x) for x in (seg / "output.jsonl").read_text().splitlines()]
+        assert lines[0]["text"] == f"FIRST {i}", "the head stays"
+        assert lines[-1]["text"].startswith(f"FINAL {i}"), "the final message stays whole"
+        assert len(lines[-1]["text"]) == len(legs[i - 1][2][-1]["text"])
+        assert any(x.get("type") == "trimmed" for x in lines), "the middle went"
+        assert _json.loads((seg / "result.json").read_text())["summary"] == f"leg {i} hand-off by [model]"
+        total += (seg / "output.jsonl").stat().st_size
+    assert total < 6000 + 3 * 400, total   # within the cap, give or take the trim notes and masking
+    assert "trimmed" in (got / "runs.md").read_text()
+
+
+def test_device_reviews_get_every_run_of_the_task(env, tmp_path):
+    """The A/B and shadow reviews build their packets from all of the task's runs, and their specs say so."""
+    from pathlib import Path
+    from ttp import blindreview, deviceab
+    p = make(env)
+    live, rid = _blind_pair(p)
+    p.db.x("DELETE FROM tasks WHERE id=?", (rid,))
+    _blind_runs(p, tmp_path, live, [("glm-x", "chat", [{"type": "text", "text": f"leg {i}"}]) for i in (1, 2)])
+    new = deviceab.queue_reviews(p.db, {"since": 0}, 0.0)
+    assert new and "runs.md" in p.db.task(new[0])["spec"]
+    got = Path(p.state) / "blind" / f"ab-{live}"
+    assert sorted(f.name for f in got.iterdir()) == ["run-1-of-2", "run-2-of-2", "runs.md"]

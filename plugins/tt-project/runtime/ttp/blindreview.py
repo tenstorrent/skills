@@ -46,7 +46,7 @@ _FAMILIES = (r"claude(?:-[a-z0-9.]+)*|opus|sonnet|haiku|fable|glm[-a-z0-9.]*|gpt
              r"chatglm|z\.ai")
 WORDS = re.compile(rf"(?<![\w./-])(?:{_FAMILIES})(?![\w/])", re.I)
 MASK = "[model]"
-PACKET_MAX = 2_000_000   # bytes per file in a packet
+PACKET_MAX = 2_000_000   # bytes per hand-off in a packet, and for all its runs' transcripts (or progress) together
 
 # The arm words a masked dict key carries: a usage map keyed by a model id must not keep that id as its key.
 # Each masked key keeps its kind (model:), so two different keys never collide; the numbering is per
@@ -193,31 +193,144 @@ def _write(path: Path, text: str) -> None:
     durable_write(path, text)
 
 
-def packet(state: str | Path, key: str, run_dir: str | Path | None, handoff: str | None = None) -> str:
-    """A masked copy of a reviewed run for a blind review, under <state>/blind/<key>/ (state: the folder of project.db): its result.json
-    and progress.md and its transcript (output.jsonl) with arm fields dropped and model names masked, never
-    run.json, prompts or logs. Returns the folder ("" when there is no run folder and no hand-off)."""
-    src = Path(run_dir) if run_dir else None
-    if not (src and src.is_dir()) and handoff is None:
+PACKET_FILES = ("result.json", "progress.md", "output.jsonl")
+HEAD_SHARE = 0.25   # of a trimmed file's share: its head; the rest keeps its tail (the final messages)
+
+
+def run_dirs(db, tid: int) -> list[str]:
+    """Every run folder of task `tid`, oldest first: a waiting hand-off and its resume, a compaction resume and
+    each device leg are runs of their own, and a blind reviewer sees them all (never a coordinator run)."""
+    runs = Path(db.path).parent / "runs"
+    out = []
+    for r in db.q("SELECT id, dir FROM runs WHERE task=? AND role!='coordinator' ORDER BY id", (int(tid),)):
+        d = Path(r["dir"] or runs / str(r["id"]))
+        if d.is_dir():
+            out.append(str(d))
+    return out
+
+
+def _shares(sizes: list[int], total: int) -> list[int]:
+    """Each file's byte share of `total`: a small file keeps all of it, the rest split what is left evenly."""
+    out, left = [0] * len(sizes), total
+    for k, i in enumerate(sorted(range(len(sizes)), key=lambda i: sizes[i])):
+        out[i] = min(sizes[i], left // (len(sizes) - k))
+        left -= out[i]
+    return out
+
+
+def _last_line(fh, size: int) -> int:
+    """Where the file's last line starts (a trailing newline ends it, it does not start an empty one)."""
+    end = size
+    if size:
+        fh.seek(size - 1)
+        end -= fh.read(1) == b"\n"
+    pos = end
+    while pos > 0:
+        n = min(65536, pos)
+        fh.seek(pos - n)
+        i = fh.read(n).rfind(b"\n")
+        if i >= 0:
+            return pos - n + i + 1
+        pos -= n
+    return 0
+
+
+def _read(f: Path, budget: int, mark) -> tuple[str, int]:
+    """f's text in about `budget` bytes, and the bytes it dropped. A longer file keeps its head and its tail, cut
+    at line breaks, with `mark(dropped)` between: the middle goes first and the last line (the final message) is
+    always whole, so a run's end is never what a cap cuts."""
+    size = f.stat().st_size
+    with f.open("rb") as fh:
+        if size <= budget:
+            return fh.read().decode(errors="replace"), 0
+        head = fh.read(int(budget * HEAD_SHARE))
+        head = head[:head.rfind(b"\n") + 1]
+        start = size - max(budget - len(head), 0)
+        if start > 0:
+            fh.seek(start - 1)
+            if fh.read(1) != b"\n":   # the tail starts on a whole line
+                rest = fh.read()
+                cut = rest.find(b"\n")
+                start = start + cut + 1 if cut >= 0 else size
+        start = min(start, _last_line(fh, size))
+        if start <= len(head):
+            fh.seek(0)
+            return fh.read().decode(errors="replace"), 0
+        fh.seek(start)
+        tail = fh.read()
+    dropped = start - len(head)
+    return head.decode(errors="replace") + mark(dropped) + tail.decode(errors="replace"), dropped
+
+
+def _jsonl_mark(n: int) -> str:
+    note = "the middle of this transcript was trimmed to keep the packet within its size cap"
+    return json.dumps({"type": "trimmed", "bytes": n, "note": note}) + "\n"
+
+
+def _text_mark(n: int) -> str:
+    return f"\n[... {n} bytes trimmed here to keep the packet within its size cap ...]\n"
+
+
+def packet(state: str | Path, key: str, run_dir, handoff: str | None = None) -> str:
+    """A masked copy of a reviewed task's runs for a blind review, under <state>/blind/<key>/ (state: the folder of
+    project.db): each run's result.json (its hand-off) and progress.md and its transcript (output.jsonl) with arm
+    fields dropped and model names masked, never run.json, prompts or logs. `run_dir` is one run folder or a list
+    of them, oldest first (run_dirs): one run's files sit in the packet itself; several runs' in run-<i>-of-<n>/
+    folders, named only by their order, with runs.md listing them. The transcripts share PACKET_MAX bytes (as do
+    the progress files): a longer one loses its middle, never its hand-off or its final messages. Returns the
+    folder ("" when there is no run folder and no hand-off)."""
+    dirs = [run_dir] if isinstance(run_dir, (str, Path)) or run_dir is None else list(run_dir)
+    srcs = [Path(d) for d in dirs if d and Path(d).is_dir()]
+    srcs = [d for d in srcs if any((d / n).is_file() for n in PACKET_FILES)] or srcs[-1:]
+    if not srcs and handoff is None:
         return ""
     dst = Path(state) / "blind" / re.sub(r"[^\w.-]", "_", key)
     dst.mkdir(parents=True, exist_ok=True)
-    names: dict = {}   # one key numbering for the whole packet
-    for name in ("result.json", "progress.md", "output.jsonl"):
-        f = src / name if src else None
-        if not (f and f.is_file()):
-            continue
-        raw = f.read_bytes()[:PACKET_MAX].decode(errors="replace")
-        if name == "result.json":
-            try:
-                text = json.dumps(mask(json.loads(raw), names=names), indent=2)
-            except ValueError:
+    names: dict = {}   # one key numbering for the whole packet, across its runs
+    n = len(srcs)
+    segs = [dst if n == 1 else dst / f"run-{i}-of-{n}" for i in range(1, n + 1)]
+    budget = {}
+    for name in ("progress.md", "output.jsonl"):
+        sizes, last = [], []   # each file's size and the size of its last line, which it always keeps
+        for f in (s / name for s in srcs):
+            size = f.stat().st_size if f.is_file() else 0
+            with (f.open("rb") if size else open(os.devnull, "rb")) as fh:
+                last.append(size - _last_line(fh, size))
+            sizes.append(size)
+        rest = _shares([a - b for a, b in zip(sizes, last)], max(PACKET_MAX - sum(last), 0))
+        budget[name] = [a + b for a, b in zip(last, rest)]
+    trimmed = []
+    for i, (src, seg) in enumerate(zip(srcs, segs)):
+        for name in PACKET_FILES:
+            f = src / name
+            if not f.is_file():
+                continue
+            if name == "result.json":   # the hand-off: whole, under the per-file cap as ever
+                raw = f.read_bytes()[:PACKET_MAX].decode(errors="replace")
+                try:
+                    text = json.dumps(mask(json.loads(raw), names=names), indent=2)
+                except ValueError:
+                    text = scrub(raw)
+            elif name.endswith(".jsonl"):
+                raw, cut = _read(f, budget[name][i], _jsonl_mark)
+                text = _jsonl(raw, names)
+                trimmed += [(i, name, cut)] if cut else []
+            else:
+                raw, cut = _read(f, budget[name][i], _text_mark)
                 text = scrub(raw)
-        elif name.endswith(".jsonl"):
-            text = _jsonl(raw, names)
-        else:
-            text = scrub(raw)
-        _write(dst / name, text)
+                trimmed += [(i, name, cut)] if cut else []
+            if seg != dst:
+                seg.mkdir(exist_ok=True)
+            _write(seg / name, text)
+    if n > 1:
+        lines = [f"This task ran {n} times (for example a hand-off that waited and its resume, a resume after its "
+                 "context was compacted, or one run per device leg). Read the runs in order: each folder holds that "
+                 "run's hand-off (result.json), progress (progress.md) and transcript (output.jsonl); the last run's "
+                 "hand-off is the task's final result.", ""]
+        for i, seg in enumerate(segs):
+            cuts = [f"{name}: {cut} bytes trimmed from its middle" for j, name, cut in trimmed if j == i]
+            lines.append(f"- run {i + 1} of {n}: {seg.name}/" + (f" ({'; '.join(cuts)})" if cuts else ""))
+        _write(dst / "runs.md", "\n".join(lines) + "\n")
     if handoff is not None:
         _write(dst / "plan.md", scrub(handoff))
     return str(dst)

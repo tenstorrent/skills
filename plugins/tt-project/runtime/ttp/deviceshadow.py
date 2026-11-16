@@ -346,7 +346,8 @@ def review_spec(task: dict, handoff: str, run_dir: str) -> str:
         f"Task title: {blindreview.scrub(task.get('title'))}", "Task spec:",
         blindreview.scrub(str(task.get("spec") or "")[:6000]), "",
         f"Its final status: {task.get('status')}. The real run's hand-off (result.json), progress and transcript, "
-        f"and the plan (plan.md), with model names masked: {run_dir or '(no run folder recorded)'}; its result in "
+        f"and the plan (plan.md), with model names masked: {run_dir or '(no run folder recorded)'} (a real run in "
+        "several legs has one folder per leg there, oldest first, listed in runs.md: read them all); its result in "
         f"`ttp task show {task['id']}`. Read the runs only there: never a run folder or the project's state.", "",
         "The plan (commands it would run, then its conclusion):", "---", handoff[:HANDOFF_MAX], "---", "",
         "Read only: change nothing, run no device or machine command.",
@@ -374,7 +375,7 @@ def queue_reviews(db, limit: int = 12, second: dict | None = None) -> list[int]:
             continue
         if not task:
             continue
-        run = db.q("SELECT dir FROM runs WHERE task=? ORDER BY id DESC LIMIT 1", (tid,))
+        runs = blindreview.run_dirs(db, tid)   # every leg of the real run, oldest first, not only its last
         for label, who, prov in reviewers:
             if f"{label}{tid}:{arm}" in have or len(out) >= limit:
                 continue
@@ -384,7 +385,7 @@ def queue_reviews(db, limit: int = 12, second: dict | None = None) -> list[int]:
             if f"{label}{tid}:{code}" in have:
                 continue
             got = blindreview.packet(Path(db.path).parent, f"shadow-{tid}-{code}",
-                                     (run[0]["dir"] if run else "") or "", handoff)
+                                     runs, handoff)
             out.append(db.add_task(f"Device shadow review of #{tid} ({code})" + (" (second reviewer)" if prov else ""),
                                    review_spec(task, blindreview.scrub(handoff), got), kind="question",
                                    tier="standard", priority=4, origin="daemon", model=who["model"],
