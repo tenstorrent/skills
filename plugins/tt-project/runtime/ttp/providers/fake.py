@@ -5,6 +5,8 @@
 Coordinator runs echo a scripted action list (TTP_FAKE_ACTIONS, JSON) or, by default, reply to
 every user message and queue one task per message. Worker runs write result.json and exit; with
 TTP_FAKE_SHELL set they first run it with sh in their working directory (it may write result.json).
+A compacting run of either role emits a compact_boundary with its summary (TTP_FAKE_COMPACT_AT set by
+compact_env, TTP_FAKE_CONTEXT the run's context size, TTP_FAKE_COMPACT_SUMMARY what it compacted into).
 With TTP_FAKE_SESSIONS set to a directory, each run saves a session transcript there, and
 `--resume <id>` continues one (or fails to start, like a real agent, when it is gone).
 """
@@ -122,6 +124,7 @@ def _main(role: str, args: list[str] | None = None) -> int:
         at, size = int(os.environ.get("TTP_FAKE_COMPACT_AT") or 0), int(os.environ.get("TTP_FAKE_CONTEXT") or 0)
         if at and size >= at:
             out.update({"subtype": "compact_boundary", "compact_metadata": {"trigger": "auto", "pre_tokens": size}})
+            out["summary"] = os.environ.get("TTP_FAKE_COMPACT_SUMMARY") or ""
         if os.environ.get("TTP_FAKE_SUMMARY"):   # the turn's own summary (a session keeps the last ones)
             out["summary"] = os.environ["TTP_FAKE_SUMMARY"]
     else:
@@ -138,6 +141,12 @@ def _main(role: str, args: list[str] | None = None) -> int:
         out = {"ok": True}
         if os.environ.get("TTP_FAKE_SHELL"):
             out["_shell"] = os.environ["TTP_FAKE_SHELL"]   # in the transcript, as a real agent's tool call is
+        # A compacting run of any role marks the boundary in its output like the coordinator does
+        # (a forked worker's session compacts in place too).
+        at, size = int(os.environ.get("TTP_FAKE_COMPACT_AT") or 0), int(os.environ.get("TTP_FAKE_CONTEXT") or 0)
+        if at and size >= at:
+            out.update({"subtype": "compact_boundary", "compact_metadata": {"trigger": "auto", "pre_tokens": size}})
+            out["summary"] = os.environ.get("TTP_FAKE_COMPACT_SUMMARY") or f"fake {role} summary"
     out["_cost"] = cost
     out["_session"] = session
     if os.environ.get("TTP_FAKE_MODEL"):   # the model the session reports (claude: its init event)

@@ -925,15 +925,15 @@ def test_forked_runs_send_the_coordinator_prefix_and_keep_their_own_text_after_i
     for argv, prompt, system, ctx in runs:
         assert ctx["how"] == "fork" and ctx["prefix"] == "coordinator", ctx
         assert system == "# Role\nYou coordinate."
-        assert argv[argv.index("--json-schema") + 1] == '{"type": "object"}'
+        assert "--json-schema" not in argv   # the run's answer schema is never the coordinator's
         got = json.loads(argv[argv.index("--settings") + 1])
         assert got["env"]["BASH_MAX_TIMEOUT_MS"] == "300000" and "TTP_COORD_FULL_TOOLS" not in got["env"]
         assert got["hooks"] != {"PreToolUse": []}   # the run keeps its own hooks
         lead, _, rest = prompt.partition("# WORKER RULES\nwrite result.json")
-        assert lead.startswith(ctxfork.FORK_HEAD) and "StructuredOutput" in lead and "TASK PROMPT" in rest
-    # Up to the per-run part, the two requests are the same: model, tools' settings, schema, system prompt.
+        assert lead.startswith(ctxfork.FORK_HEAD) and "TASK PROMPT" in rest
+    # Up to the per-run part, the two requests are the same: model, tools' settings, system prompt.
     shape = lambda a: ({k: v for k, v in json.loads(a[a.index("--settings") + 1]).items() if k != "hooks"},  # noqa: E731
-                       a[a.index("--model") + 1] if "--model" in a else "", a[a.index("--json-schema") + 1])
+                       a[a.index("--model") + 1] if "--model" in a else "")
     assert shape(runs[0][0]) == shape(runs[1][0]) and runs[0][2] == runs[1][2]
     assert runs[0][1].split("TASK PROMPT")[0] == runs[1][1].split("TASK PROMPT")[0]
     # Another model cannot read the coordinator's cache: the run keeps its own prefix and says why.
@@ -1076,7 +1076,7 @@ def test_a_fork_of_the_last_turns_sends_the_coordinators_prefix_on_its_own_model
     assert got is None and "model differs" in why
     out = [ctxfork.shape_argv(a, shape, other_model=True)[0] for a in runs]
     for a in out:
-        assert a[a.index("--model") + 1] == "sonnet" and a[a.index("--json-schema") + 1] == '{"type": "object"}'
+        assert a[a.index("--model") + 1] == "sonnet" and "--json-schema" not in a   # its answers are its own
         assert json.loads(a[a.index("--settings") + 1])["env"] == {"BASH_MAX_TIMEOUT_MS": "300000"} and a[-1] == "-"
     assert [x for x in out[0] if "hooks" not in x] == [x for x in out[1] if "hooks" not in x]
 
@@ -1439,3 +1439,49 @@ def test_a_run_that_did_no_work_under_the_coordinators_role_is_not_retried_the_s
                                   RunUsage(cost_usd=0.5, final_text='{"actions": []}'), "ok", run_dir)
     t = p.db.task(tid)
     assert t["status"] == "failed" and "not retried again" in t["result"], (t["status"], t["result"])
+
+
+def test_a_forked_worker_that_compacts_uses_its_own_role_and_never_the_coordinators_answer_shape(env, monkeypatch, tmp_path):
+    """Upstream note 8c27bc648ed1d864: a forked worker ran under the coordinator's compaction rules and
+    answer schema, so its auto-compact wrote a coordinator summary and its run ended with the
+    coordinator's StructuredOutput {"actions"} object. The fork never carries the coordinator's answer
+    schema or compaction instructions: the worker's lead names its own compaction rule, its argv carries
+    no --json-schema, and a mid-run compaction records the run's own role, not the coordinator's."""
+    from ttp import coordsession, ctxfork
+    p, d, cfg_dir, _run = _fork_daemon(env, monkeypatch, tmp_path, provider="fake")
+    monkeypatch.undo()   # the Popen stub of the helper is undone: this run's runner is a real process
+    sid = str(uuid.uuid4())
+    (cfg_dir / "projects").mkdir(parents=True, exist_ok=True)   # the fake reads transcripts from TTP_FAKE_SESSIONS
+    sessions = tmp_path / "fake-sessions"
+    sessions.mkdir()
+    monkeypatch.setenv("TTP_FAKE_SESSIONS", str(sessions))
+    # A saved coordinator transcript: the worker's run forks it (Fake.fork_session copies the file).
+    (sessions / f"{sid}.jsonl").write_text(json.dumps({"role": "coordinator", "prompt": "wake 1"}) + "\n")
+    p.db.set_kv(coordsession.KEY, {"id": sid, "provider": "fake", "context_tokens": 5000})
+    p.set_config("budget.compact_window_tokens", {"light": 100000, "standard": 150000, "deep": 200000})
+    # The fake worker's own summary of its context, as its agent compaction would write one.
+    monkeypatch.setenv("TTP_FAKE_AGENT_COMPACTS", "1")
+    monkeypatch.setenv("TTP_FAKE_CONTEXT", "200000")   # past the window: it compacts mid-run
+    monkeypatch.setenv("TTP_FAKE_COMPACT_SUMMARY", "fake worker summary")
+    tid = p.db.add_task(f"t {uuid.uuid4().hex[:6]}", "do the one thing", kind="code", origin="user")
+    rid = d.start_run("worker", f"TASK PROMPT {tid}", "fake", "standard", str(p.root), task=p.db.task(tid),
+                      append_system="# WORKER RULES\nwrite result.json")
+    # The start: a fork of the coordinator's transcript with no answer schema of the coordinator's.
+    spec = json.loads((p.runs / str(rid) / "run.json").read_text())
+    row = p.db.one("SELECT note, session_id FROM runs WHERE id=?", (rid,))
+    ctx = json.loads(row["note"] or "{}").get("coord_context") or {}
+    assert ctx["how"] == "fork" and ctx["session"] == row["session_id"] != sid
+    assert "--json-schema" not in spec["argv"] and "CompactBoundary" not in spec["argv"]
+    prompt = (p.runs / str(rid) / "prompt.md").read_text()
+    assert ctxfork.COMPACT_LEAD in prompt or ctxfork.COMPACT_LEAD[:40] in prompt
+    assert "StructuredOutput" not in prompt
+    assert (sessions / f"{row['session_id']}.jsonl").exists(), "the fork copied the transcript"
+    _finish_runs(p, d)   # reap it: the fork's runner is a real process here (no Proc stub on this path)
+    assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == "ok"
+    # Its hand-off is its own channel: result.json, read off disk; never the coordinator's answer shape.
+    result = json.loads((p.runs / str(rid) / "result.json").read_text())
+    assert result["status"] == "done" and p.db.task(tid)["status"] in ("done", "review")
+    assert not ctxfork.role_miss(json.dumps(result), None)
+    # A mid-run compaction of the forked session is the run's own, never the coordinator's session_note.
+    out = json.loads((p.runs / str(rid) / "output.jsonl").read_text())
+    assert out.get("subtype") == "compact_boundary" and out.get("summary") == "fake worker summary"

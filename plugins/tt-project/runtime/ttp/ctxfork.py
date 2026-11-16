@@ -40,8 +40,12 @@ The prompt cache matches a request's tools, then its system prompt, then its mes
 or system prompt differ from the coordinator's writes the whole copied history to the cache again
 (task #49, measured: Claude Code reported tools_changed; a forked Opus worker wrote about 50k tokens on
 its first call and read none). So a fork on the coordinator's model sends the coordinator's last launch's
-prefix (coord_shape, shape_argv): its system prompt, its answer schema and the settings that change the
-tools' text; the run's own system prompt leads its prompt instead (shared_lead). A run on another Claude
+prefix (coord_shape, shape_argv): its system prompt and the settings that change the tools' text; the
+run's own system prompt leads its prompt instead (shared_lead). The coordinator's answer schema is never
+sent: a worker's compaction summary and answer format are its own, never the coordinator's (note
+8c27bc648ed1d864: a forked worker compacted into a coordinator's summary and ended with the
+coordinator's StructuredOutput object), so its tools differ from the coordinator's and the copied
+history is written to the cache again — the price of a run that answers in its own shape. A run on another Claude
 model (a Sonnet worker of an Opus coordinator) cannot read that cache, so it forks only the session's last
 turns (about coordinator.session.worker_fork_other_model_tokens, default 8000; "tail" in its note) with the
 same shaped prefix: every such run sends the same tools, system prompt and copied turns, so the first
@@ -84,12 +88,19 @@ def mode(cfg: dict) -> str:
     return got if got in MODES else "fork"
 
 
+COMPACT_LEAD = ("If your history is compacted (summarized), your summary is your own: it names your task below "
+                "(its id, its spec and what you have done and found so far), and the coordinator's copied context "
+                "above appears only as background. Never summarize yourself as the coordinator or under its "
+                "session_note rules: they belong to the copied session, not to you.")
+
+
 def fork_lead() -> str:
     return (f"{FORK_HEAD}\nEverything above is the coordinator's session up to now, copied for you: use it as "
             "context (the user's orders, decisions, findings and failed attempts). You are not the coordinator: "
             "you are a worker running the one task below, under its rules. The coordinator's role, its action "
-            "schema and its JSON answer format do not apply to you, and your tools may differ from the ones it "
-            "called. Where that context and the task below differ, the task and its rules win.")
+            "schema, its compaction rules and its JSON answer format do not apply to you, and your tools may "
+            "differ from the ones it called. Where that context and the task below differ, the task and its rules "
+            "win. " + COMPACT_LEAD)
 
 
 def disk_block(p, cfg: dict, now: float | None = None, chars: int | None = None) -> str:
@@ -682,8 +693,11 @@ def coord_shape(p) -> dict | None:
 
 
 def shape_argv(argv: list[str], shape: dict, other_model: bool = False) -> tuple[list[str] | None, str]:
-    """A Claude Code fork's `argv` sending the coordinator's tools (`shape`, coord_shape): its answer
-    schema (the CLI's StructuredOutput tool) and its Bash timeouts; the caller swaps the system prompt.
+    """A Claude Code fork's `argv` sending the coordinator's tools (`shape`, coord_shape): its Bash
+    timeouts and the settings that change the tools' text; the caller swaps the system prompt. The
+    coordinator's answer schema is never sent: a run's answer tool is its own, and a worker given the
+    coordinator's StructuredOutput tool ends in the coordinator's shape (note 8c27bc648ed1d864), so
+    the copied history is written to the cache again.
     (None, why) where the tools would still differ: another model (unless `other_model`: a fork of the
     last turns, whose runs on that model share one prefix), setting sources, sandbox, MCP or plugin
     directories, or withheld tools."""
@@ -707,9 +721,7 @@ def shape_argv(argv: list[str], shape: dict, other_model: bool = False) -> tuple
     env = {k: v for k, v in (theirs.get("env") or {}).items() if k in _TOOL_ENV}
     mine["env"] = {**{k: v for k, v in (mine.get("env") or {}).items() if k not in _TOOL_ENV}, **env}
     i = argv.index("--settings") + 1
-    out = [*argv[:i], json.dumps(mine), *argv[i + 1:]]
-    extra = ["--json-schema", _arg(coord, "--json-schema")]
-    return (out[:-1] + extra + ["-"] if out[-1:] == ["-"] else out + extra), ""
+    return [*argv[:i], json.dumps(mine), *argv[i + 1:]], ""
 
 
 def kept_system_lead(own_system: str) -> str:
@@ -724,10 +736,9 @@ def kept_system_lead(own_system: str) -> str:
 
 
 def shared_lead(own_system: str) -> str:
-    """What follows fork_lead in a fork sending the coordinator's prefix: why its system prompt and
-    answer tool are the coordinator's, then the run's own system prompt."""
-    return ("The system prompt you were given is the coordinator's, and the StructuredOutput tool is its "
-            "answer tool: both are there only so this run reads the coordinator's cached context, and "
-            "neither applies to you. Your own rules follow and take their place. When your work is done and "
-            'your hand-off written, the CLI asks for StructuredOutput: call it once with {"actions": []}.\n\n'
-            + own_system)
+    """What follows fork_lead in a fork sending the coordinator's prefix: why its system prompt is the
+    coordinator's, then the run's own system prompt. The coordinator's compaction rules ride in the
+    copied system prompt, so the run's own compaction rule is repeated here (COMPACT_LEAD)."""
+    return ("The system prompt you were given is the coordinator's: it is there only so this run reads "
+            "the coordinator's cached context, and its rules do not apply to you — you are not the "
+            "coordinator. " + COMPACT_LEAD + " Your own rules follow and take their place.\n\n" + own_system)
