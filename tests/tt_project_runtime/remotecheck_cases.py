@@ -100,15 +100,20 @@ def _rc_repo(tmp_path, big=False):
     return repo
 
 
+def _rc_env(bin_, remote, **fake):
+    """The env a remotecheck run against the fake ssh gets. Not the variables of a check running this suite
+    (CHECK_RUNNER_ENV): its scratch HOME's file list would move a remote check into a scratch HOME of its own,
+    and its pinned env's lock would ship to the fake host; a test that wants one passes it in `fake`."""
+    base = {k: v for k, v in os.environ.items() if k not in CHECK_RUNNER_ENV}
+    return {**base, "PATH": f"{bin_}{os.pathsep}{os.environ['PATH']}", "FAKE_REMOTE_TMP": str(remote), **fake}
+
+
 def _rc_run(tmp_path, repo, cmd, host="box1", env=None, wait=True, commit="", literal=None, **fake):
     """remotecheck run as callers run it (push.check_argv's argv) in `repo` against the fake ssh:
     (exit code, output); with wait=False the Popen."""
     from ttp import remotecheck
     bin_, remote = _rc_fake_ssh(tmp_path)
-    # Not the variables of a check running this suite (CHECK_RUNNER_ENV): its scratch HOME's file list would
-    # move a remote check into a scratch HOME of its own; a test that wants one passes it in `fake`.
-    base = {k: v for k, v in os.environ.items() if k not in CHECK_RUNNER_ENV}
-    penv = {**base, "PATH": f"{bin_}{os.pathsep}{os.environ['PATH']}", "FAKE_REMOTE_TMP": str(remote), **fake}
+    penv = _rc_env(bin_, remote, **fake)
     proc = subprocess.Popen(remotecheck.argv(cmd, host, env, commit, literal=literal), cwd=repo, env=penv,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     if not wait:
@@ -2775,7 +2780,7 @@ def test_a_remote_wrapper_missing_on_the_host_is_a_fault_and_the_command_never_r
     subprocess.run([*git, "add", "-A"], check=True)
     subprocess.run([*git, "commit", "-qm", "w"], check=True)
     bin_, remote = _rc_fake_ssh(tmp_path)
-    penv = {**os.environ, "PATH": f"{bin_}{os.pathsep}{os.environ['PATH']}", "FAKE_REMOTE_TMP": str(remote)}
+    penv = _rc_env(bin_, remote)
     ran = tmp_path / "ran"
 
     def go(wrap):
@@ -2812,8 +2817,7 @@ def test_a_remote_wrapper_that_records_its_refusal_is_a_host_fault_and_a_plain_e
     ran = tmp_path / "ran"
 
     def go(cmd, refuse="", wrap=("./busy.sh",)):
-        penv = {**os.environ, "PATH": f"{bin_}{os.pathsep}{os.environ['PATH']}", "FAKE_REMOTE_TMP": str(remote),
-                "REFUSE": refuse}
+        penv = _rc_env(bin_, remote, REFUSE=refuse)
         r = subprocess.run(remotecheck.argv(cmd, "box1", {}, "", wrap), cwd=repo, env=penv, capture_output=True,
                            text=True, timeout=60)
         return r.returncode, r.stdout + r.stderr
@@ -3677,10 +3681,12 @@ def test_a_remote_check_ships_python_files_out_of_its_tree_and_exports_literals_
     cmd = (f"python3 -c 'import ttp_ship_probe as m; print(m.WORD)' > {seen}/mod; git status --porcelain > {seen}/status; "
            f"printf %s \"$PYTHONPATH\" > {seen}/pp; printf %s \"$SEL\" > {seen}/sel")
     bin_, remote = _rc_fake_ssh(tmp_path)
-    penv = {**os.environ, "PATH": f"{bin_}{os.pathsep}{os.environ['PATH']}", "FAKE_REMOTE_TMP": str(remote)}
+    penv = _rc_env(bin_, remote)
     odd = "^(?:a|b)$ `x` \"q\" 'z' $HOME\nline2"
     argv = remotecheck.argv(cmd, "box1", {"PYTHONPATH": "/own"}, py=(str(mod),), literal={"SEL": odd})
-    r = subprocess.run(argv, cwd=repo, env=penv, capture_output=True, text=True, timeout=60)
+    # HANG_S only catches a hang: the run is waited on until it exits, however loaded the host running the
+    # suite is (the check and its cleanup run behind nice 19 there)
+    r = subprocess.run(argv, cwd=repo, env=penv, capture_output=True, text=True, timeout=HANG_S)
     assert r.returncode == 0, r.stdout + r.stderr
     assert (seen / "mod").read_text().strip() == "shipped"
     assert (seen / "status").read_text() == "", "the shipped file is not in the tree the check sees"
@@ -3689,10 +3695,10 @@ def test_a_remote_check_ships_python_files_out_of_its_tree_and_exports_literals_
     assert (seen / "sel").read_text() == odd
     assert _rc_left(tmp_path) == []
     gone = remotecheck.argv("true", "box1", py=(str(tmp_path / "missing.py"),))
-    r = subprocess.run(gone, cwd=repo, env=penv, capture_output=True, text=True, timeout=60)
+    r = subprocess.run(gone, cwd=repo, env=penv, capture_output=True, text=True, timeout=HANG_S)
     assert r.returncode == 2 and "cannot read" in r.stdout + r.stderr
     bad = remotecheck.argv("true", "box1", literal={"1x": "v"})
-    assert subprocess.run(bad, cwd=repo, env=penv, capture_output=True, text=True, timeout=60).returncode == 2
+    assert subprocess.run(bad, cwd=repo, env=penv, capture_output=True, text=True, timeout=HANG_S).returncode == 2
 
 
 _GATE_PRE = "def test_ok():\n    pass\n\n\ndef test_pre():\n    assert False\n"
@@ -4232,7 +4238,7 @@ def test_a_spill_wrapper_that_puts_its_own_venv_first_never_hides_the_pinned_che
     wrap.write_text(f'#!/bin/sh\nPATH="{venv}:$PATH"; PYTHONNOUSERSITE=; export PATH PYTHONNOUSERSITE\nexec "$@"\n')
     wrap.chmod(0o755)
     bin_, remote = _rc_fake_ssh(tmp_path)
-    penv = {**os.environ, "PATH": f"{bin_}{os.pathsep}{os.environ['PATH']}", "FAKE_REMOTE_TMP": str(remote)}
+    penv = _rc_env(bin_, remote)
     for w in ((str(wrap),), (str(wrap), "env", "X=1")):
         r = subprocess.run(remotecheck.argv('echo "first=${PATH%%:*} nousersite=$PYTHONNOUSERSITE"', "box1", {}, "", w),
                            cwd=repo, env=penv, capture_output=True, text=True, timeout=120)
