@@ -41,7 +41,7 @@ in stages 09 and 10:
 - `hit_fraction_of_ceiling` (cached ÷ tokens a previous turn sent) at least 0.9 unless `pool_bound`.
 - `trace_captures_after_warmup` 0; no host work per step that scales with steps or pool size.
 - `growing_contexts`: `target_concurrency` interleaved conversations growing to `working_set_tokens`,
-  from recorded histories (`scripts/agent_replay.py`) when they exist. Record `preemptions`, prefilled
+  from histories this run recorded (`scripts/agent_replay.py`) when it has them. Record `preemptions`, prefilled
   against final context tokens, and `late_hit_fraction` over the last quarter of requests (≥ 0.9).
 
 Stage 10 also records, without a pass bar, `prefill_by_length` (prefill rate at 4096,
@@ -61,8 +61,8 @@ Every optimisation measurement (stages 07–10 and goal 12's speed work):
   An arm that has decided its question is stopped;
 - goes cheapest first: arithmetic on data already held, a CPU test, a per-chip op or layer benchmark, a
   short replay, and only then a serving arm or a scored run;
-- judges speed on replayed agent trajectories at the agent counts goal 12 uses (recorded histories when
-  they exist; before any goal-12 run, stage 10's growing-context traffic), beside one fixed synthetic suite
+- judges speed on replayed agent trajectories at the agent counts goal 12 uses (this run's own goal-12
+  histories once it has them; before that, stage 10's growing-context traffic), beside one fixed synthetic suite
   (short, context ≥ 28K, 1/4/8/32 users). A gain that does not show on replay is not adopted;
 - gates a change meant to be lossless on identical greedy and seeded outputs over a fixed prompt panel
   (feature on vs off, cache on vs off); a numerics change reports PCC against the reference;
@@ -97,7 +97,8 @@ re-measure them, except the rows it uses after a precision fix (Failure analysis
 ## Goal 12: agentic evals
 
 Goal 12 shows that the served model scores like its reference on agentic evals, at a speed the measured
-rates explain. It runs on the local machine; no CI is needed.
+rates explain. It runs on the local machine; no CI is needed. A run starts with an empty `doc/agentic_evals`
+and reads no earlier run's outputs.
 
 ### Inputs
 
@@ -181,13 +182,11 @@ working set per agent, task sandboxes the host can run, tasks in the list); serv
 validated batch that holds them. Record `server_size` with the run (Outputs). A pool below half the
 measured free memory, or more agents than the pool holds at their working set, needs a recorded `reason`;
 the gate is critical without one. Where this leaves a choice, take the fastest projected finish (waves ×
-per-task time at that batch's per-user rate, plus the tail). Agents never exceed `max_num_seqs`. Start
-from the best-known config in `learned.json` for this model or its closest model; a projection more than
-2× the best-known time for that list size is a config defect, not a size limit.
+per-task time at that batch's per-user rate, plus the tail). Agents never exceed `max_num_seqs`. Sizing
+and projections come only from this run's stage-11 rates and its measurements at launch.
 Phase lists always run: the phase's time bounds them, and a long first estimate is expected for a new
 model. Admit an extended list only when its projection from this run's measured per-task times fits
-`run_timeout_hours`. Record measured tokens and hours per task in `learned.json` (`task_times`) so the next
-model's estimates start from them.
+`run_timeout_hours`.
 
 ### Settings
 
@@ -202,7 +201,7 @@ model's estimates start from them.
 - **Reasoning:** start at the reference's setting (medium when unknown).
   Record the setting with each run and the reference's own setting with the reference.
 - **Harness and route** are main's, unchanged; only a precision fix (Failure analysis 3) changes precision. A real harness defect is fixed on a generic branch named for
-  the defect and listed in `learned.json`.
+  the defect and recorded in this run's `results.json` (`harness_fixes`) and REPORT.md.
 
 ### Task lists
 
@@ -283,7 +282,8 @@ other analysis between them. Score the run from the harness output and mark it `
 `results.json`. When the stage ends (and after each remediation round) the runner counts the stage's own Codex
 tokens and hours from its CODEX_HOME and writes them to REPORT.md (`## Stage usage`) and
 `stage_usage.json`; leave both as written. Sub-agents run at low effort for profiling, log triage and
-tests; the coordinator decides. Sub-agents append findings to `learned.json` and read it before starting.
+tests; the coordinator decides. Sub-agents share findings within the run through its own records
+(`results.json`, the digests and triage files); none reads an earlier run's outputs.
 
 ### Outputs
 
@@ -297,14 +297,12 @@ In `doc/agentic_evals/`:
   `anomaly`, `loop_cap`, `malformed_tool_call`, `cutoff_progressing`, `stalled`, `infrastructure`, `fetched_solution`),
   `evidence` and `rerun` (`tried`: setting, `limits`, result; `counted`); `flag_reasons` and `unmapped_reason`
   when needed (Triage); `digest` when not `current/<run>/digest`; `config.precision` (the
-  precision config file served); `anomalies` (datatype-sweep, Anomalies); plus
+  precision config file served); `anomalies` (datatype-sweep, Anomalies); `harness_fixes` (branch, defect);
+  plus
   `phases`: per phase `run`, `start_hour`, `pass`, and `reason` when not passed.
 - `runs.json`: the run records `eval_runs.py` writes (one per list run or wave).
 - `logging_check.json` (before the first run) and `current/<run>/digest/` (`summary.json`, `<task>.json`,
   `<task>.triage.json`).
-- `learned.json`: `best_config` per suite (the config, list size and hours of the best valid run),
-  `task_times` (per suite and task: tokens and hours measured), `harness_facts` and `generic_fixes`, for the
-  next model.
 - `REPORT.md`: each phase passed or not passed yet (with the reason), scores with intervals, reasoning
   settings and limits against the references', hours predicted against measured, a late phase 2 start if any, the per-task
   analysis, then what remains.

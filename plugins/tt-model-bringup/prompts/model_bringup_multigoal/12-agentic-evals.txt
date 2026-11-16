@@ -13,7 +13,7 @@ Goal completion requirements:
 - Per-task analysis, inside the phase's time: every failed task has a cause and evidence. A degenerate reply (stray or repeated tokens, collapse into a few characters, loops) is an anomaly, not a model answer. No task fails on the output cap or a time limit unless its trajectory shows a loop or stall; a task cut off while progressing is rerun with a higher limit and that result counts. A rerun changes the score only for infrastructure failures or a limit-cut task that then finishes. A fetched solution is a failure; declared network use is allowed. No list is voided.
 - Every anomaly, and every phase below its band, has proof of an attempt to fix it: a short reproducible test, its result at the served precision and at full TT precision, and what was changed. When a precision change fixes it, the list is rerun at the fastest configuration that passes the test, with the configurations tried and their measured speeds recorded; a speed loss for accuracy is accepted.
 - Extended mode, after both phases pass: full-suite estimates, then per suite in extended_suites a list run projected within run_timeout_hours, same rules. Lists grow only here.
-- doc/agentic_evals/results.json and learned.json as the skill's Outputs say.
+- doc/agentic_evals/results.json as the skill's Outputs say.
 
 Limits:
 - stage_budget_hours: quick 12 (phase 1 only), agentic 24 (phase 1 up to phase1_hours; phase 2 the rest), extended +24. run_timeout_hours (12) from inputs.json.
