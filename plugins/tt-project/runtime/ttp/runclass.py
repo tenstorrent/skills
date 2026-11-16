@@ -140,8 +140,22 @@ CODE_ROUTE_KEY = "code_route"    # a code run's note: {"to", "why"} (code_decisi
 CODE_STAY = ("tier", "device_run", "route_off", "kind_off", "user_pin", "review_round", "pr_fix", "untrusted_input",
              "deep", "retry", "quality_hold", "canary_share", "provider", "core_provider", "device_ab")
 # Stays the route keeps by design (the user's pin, untrusted text, device runs, late review rounds, PR fixes, the
-# device A/B): the share alarm leaves them out of its base, so it counts only runs the route should have taken.
-CODE_KEEP = ("user_pin", "untrusted_input", "device_run", "device_ab", "review_round", "pr_fix")
+# device A/B, a run on another provider): the share alarm leaves them out of its base, so it counts only runs the
+# route should have taken. A class-routed run (code_decision's "run_class:<cls>", e.g. a light chat run) is kept too.
+CODE_KEEP = ("user_pin", "untrusted_input", "device_run", "device_ab", "review_round", "pr_fix", "provider")
+
+
+def code_kept(why: str) -> bool:
+    """A code-route reason the share alarm leaves out of its base (CODE_KEEP, or a class-routed run)."""
+    return why in CODE_KEEP or why.startswith("run_class:")
+
+
+def _routed_elsewhere(why: dict) -> str:
+    """The provider and run_class:<cls> counts, reported on their own line: runs another provider or a lighter
+    run class took, which the Sonnet code route could never have taken."""
+    got = sorted(((k, v) for k, v in why.items() if k == "provider" or k.startswith("run_class:")),
+                 key=lambda kv: (-kv[1], kv[0]))
+    return ", ".join(f"{k} {v}" for k, v in got)
 SHARE_MIN = 10                     # the share alarm needs this many runs in its window
 SHARE_WINDOW_S = 86400.0
 SHARE_KV = "route_share_alarm"     # {route: ts of its last event}: one event per route per day
@@ -991,7 +1005,7 @@ def guard_report_text(s: dict, name: str, tz=None) -> str:
 def code_routes(db, since: float, until: float | None = None) -> dict:
     """Code worker runs in [since, until) per model and per code-route decision (the run note's CODE_ROUTE_KEY;
     "unrecorded" for runs from before it): {"runs", "models": {model: n}, "sonnet", "why": {why: n}, "base"
-    (runs with a recorded decision the route should take: all but CODE_KEEP), "base_sonnet"}."""
+    (runs with a recorded decision the route should take: all but code_kept ones), "base_sonnet"}."""
     until = time.time() if until is None else until
     out: dict = {"runs": 0, "models": {}, "sonnet": 0, "why": {}, "base": 0, "base_sonnet": 0}
     for r in db.q("SELECT r.model, r.note FROM runs r JOIN tasks t ON t.id=r.task WHERE r.role='worker' AND "
@@ -1007,7 +1021,7 @@ def code_routes(db, since: float, until: float | None = None) -> dict:
         out["models"][model] = out["models"].get(model, 0) + 1
         out["sonnet"] += on
         out["why"][why] = out["why"].get(why, 0) + 1
-        if why not in (*CODE_KEEP, "unrecorded"):   # a run from before the decision was recorded never counts
+        if why != "unrecorded" and not code_kept(why):   # a run from before the decision was recorded never counts
             out["base"] += 1
             out["base_sonnet"] += on
     return out
@@ -1019,8 +1033,10 @@ def code_routes_text(s: dict, name: str = "", hours: float = 24) -> str:
     out.append("  per model: " + (", ".join(f"{k} {v}" for k, v in sorted(s["models"].items())) or "none"))
     out.append("  per decision: " + (", ".join(f"{k} {v}" for k, v in sorted(
         s["why"].items(), key=lambda kv: -kv[1])) or "none"))
-    out.append(f"  the route should take {s['base']} of them (all recorded but {', '.join(CODE_KEEP)}); "
-               f"it took {s['base_sonnet']}")
+    if other := _routed_elsewhere(s["why"]):
+        out.append(f"  on another provider or run class (not counted): {other}")
+    out.append(f"  the route should take {s['base']} of them (all recorded but {', '.join(CODE_KEEP)}, "
+               f"run_class:<cls>); it took {s['base_sonnet']}")
     return "\n".join(out)
 
 
@@ -1041,10 +1057,13 @@ def share_alarms(db, cfg: dict, now: float | None = None) -> list[dict]:
         n = s["base"]
         if n >= SHARE_MIN and s["base_sonnet"] / n < cs["share"] / 2:
             got = s["base_sonnet"] / n
+            other = _routed_elsewhere(s["why"])
             out.append({"route": "code_sonnet", "share": cs["share"], "got": round(got, 3), "n": n, "text": (
                 f"The Sonnet code route took {s['base_sonnet']} of {n} code runs it should take in the last "
                 f"{SHARE_WINDOW_S / 3600:g} h ({got:.0%}; configured share {cs['share']:.0%}). Top reasons: "
-                f"{top_reasons(s['why'], ('sonnet', *CODE_KEEP))}. Details: ttp stats --code-routes.")})
+                f"{top_reasons({k: v for k, v in s['why'].items() if not code_kept(k)}, ('sonnet',))}."
+                + (f"\nNot counted (on another provider or run class): {other}." if other else "")
+                + " Details: ttp stats --code-routes.")})
     try:
         from . import deviceab
         d = deviceab.share_check(db, cfg, now)

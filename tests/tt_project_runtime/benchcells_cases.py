@@ -265,6 +265,10 @@ def test_bench_seeded_cell_stores_no_host_path_and_scores_with_the_plugin_dir_of
     # plugin's PYTHONPATH and -p come from the plugin running the score.
     from ttp import bench, benchcells, pushpass
     _bench_cells_home(tmp_path, monkeypatch)
+    # A suite run under the resume or select plugin hands its own PYTHONPATH (the real plugin dir) and
+    # selection to every child: cleared, so "the scorer's plugin dir is gone" below means it is gone.
+    for k in (*pushpass.CHECK_ENV_VARS, *(k for k in os.environ if k.startswith("TTP_PYTEST_"))):
+        monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("PYTEST_ADDOPTS", "-p no:randomly_builder_only")
     p, tid, blind, b = _bench_cells_bench(env, tmp_path)
     out = tmp_path / "cells"

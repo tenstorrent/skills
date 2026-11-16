@@ -1224,6 +1224,43 @@ def test_route_share_alarm_fires_once_a_day_on_a_low_code_share_and_not_on_a_nor
     assert "quality_hold 10" in runclass.code_routes_text(runclass.code_routes(p.db, now - 86400, now + 1))
 
 
+def test_class_routed_and_other_provider_code_runs_are_not_misses_of_the_code_share(env):
+    from ttp import runclass
+    p = make(env)
+    now = time.time()
+    cfg = {"route": {"code_sonnet": {"share": 0.6}}}
+
+    def run(cls, tier, provider, model, why=None, recorded=True):
+        t = p.db.add_task("t", "", kind="code", tier="standard", priority=3, budget_usd=1.0)
+        cr = runclass.code_decision({}, p.db.task(t), cls, tier, provider)
+        if why is not None:
+            cr = {"to": "opus", "why": why}
+        p.db.x("INSERT INTO runs(task,role,provider,model,started,status,cost_usd,note) VALUES(?,?,?,?,?,?,?,?)",
+               (t, "worker", provider, model, now - 600, "ok", 0.1,
+                json.dumps({runclass.CODE_ROUTE_KEY: cr}) if recorded else None))
+        return cr
+
+    # A light-tier chat run of a code task records run_class:light; a codex run records provider. Neither counts.
+    assert run("light", "light", "claude", "claude-haiku-5-5")["why"] == "run_class:light"
+    for _ in range(11):
+        run("light", "light", "claude", "claude-haiku-5-5")
+    for _ in range(4):
+        run("hard", "standard", "codex", "gpt")
+    s = runclass.code_routes(p.db, now - 86400, now + 1)
+    assert (s["runs"], s["base"], s["why"]["run_class:light"], s["why"]["provider"]) == (16, 0, 12, 4)
+    assert runclass.share_alarms(p.db, cfg, now + 1) == []
+    text = runclass.code_routes_text(s)
+    assert "on another provider or run class (not counted): run_class:light 12, provider 4" in text
+    # A substantive Opus code run with no recorded reason still counts against the share.
+    for _ in range(10):
+        run("hard", "standard", "claude", "claude-opus-5-5", why="unknown")
+    got = runclass.share_alarms(p.db, cfg, now + 1)
+    assert [a["route"] for a in got] == ["code_sonnet"] and got[0]["n"] == 10, got
+    top, rest = got[0]["text"].split("Top reasons:")[1].split("\n", 1)
+    assert "unknown 10" in top and "run_class" not in top and "provider" not in top
+    assert rest.startswith("Not counted (on another provider or run class): run_class:light 12, provider 4.")
+
+
 def test_a_worker_run_ends_with_the_head_its_task_branch_points_at_recorded(env, tmp_path, monkeypatch):
     from ttp.daemon import Daemon
     p = make(env)

@@ -3603,6 +3603,35 @@ def _load_scaled(seconds: float) -> float:
     return seconds * min(max(factor, 1.0), 8.0)
 
 
+def _proc_tree_runnable(pid) -> bool:
+    """True while a thread of pid or of a descendant is runnable or in disk wait (Linux /proc; else False)."""
+    return _proc_tree_runnable_below(pid, include_self=True)
+
+
+def _proc_tree_runnable_below(pid, include_self=False) -> bool:
+    """True while a thread of a descendant of pid (and of pid itself with include_self) is runnable or in
+    disk wait (Linux /proc; else False)."""
+    todo, seen = [pid], set()
+    while todo:
+        p = todo.pop()
+        if p in seen:
+            continue
+        seen.add(p)
+        try:
+            tids = os.listdir(f"/proc/{p}/task")
+        except OSError:
+            continue
+        for tid in tids:
+            try:
+                if (include_self or p != pid) and \
+                        open(f"/proc/{p}/task/{tid}/stat").read().rpartition(")")[2].split()[0] in ("R", "D"):
+                    return True
+                todo += [int(c) for c in open(f"/proc/{p}/task/{tid}/children").read().split()]
+            except (OSError, IndexError, ValueError):
+                continue
+    return False
+
+
 def _run_to_end(argv, timeout=30, **kw):
     """subprocess.run(argv, capture_output=True, timeout=timeout, **kw), but the deadline fails only a
     command still running. On a busy host this test process (a niced worker) may get the CPU back only
@@ -3610,8 +3639,11 @@ def _run_to_end(argv, timeout=30, **kw):
     once select returns and raises TimeoutExpired anyway. A command that ended is read to its end.
     The deadline counts only time in which this process ran: it waits in slices of at most 1 s, and a slice
     that took far longer was a stall (the whole host, or this process and the command frozen together),
-    which used none of the command's time, so it counts as one slice."""
-    left = timeout
+    which used none of the command's time, so it counts as one slice. Nor does a slice in which the command
+    (or a process it started) was runnable, waiting for a CPU: on an overloaded host even a refused command's
+    exit can take longer than the deadline, while a hung one sleeps. A command that keeps the CPU busy still
+    fails, at ten times the deadline."""
+    left, cap = timeout, time.monotonic() + 10 * timeout
     with subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kw) as proc:
         while True:
             last = time.monotonic()
@@ -3622,8 +3654,9 @@ def _run_to_end(argv, timeout=30, **kw):
                 if proc.poll() is not None:
                     out, err = proc.communicate(timeout=timeout)   # still bounded: something it left may hold its pipes
                     break
-                left -= min(time.monotonic() - last, 1.5)
-                if left <= 0:
+                if not _proc_tree_runnable(proc.pid):
+                    left -= min(time.monotonic() - last, 1.5)
+                if left <= 0 or time.monotonic() > cap:
                     proc.kill()
                     proc.wait()   # not communicate(): a descendant it left may hold its pipes open
                     raise
@@ -5320,14 +5353,28 @@ def test_web_app_writes_the_page_through_render_js():
     html = (web / "index.html").read_text()
     assert html.index('src="render.js"') < html.index('src="app.js"')
 
+def _run_queue_wait_s() -> float:
+    """Seconds this process's main thread has spent runnable but waiting for a CPU (Linux; else 0)."""
+    try:
+        return int(open("/proc/self/schedstat").read().split()[1]) / 1e9
+    except (OSError, IndexError, ValueError):
+        return 0.0
+
+
 def _run_until(d, p, cond, timeout=60):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+    """Tick the daemon until cond() holds. The timeout counts only time the work could use: not time this
+    process waited for a CPU, nor a slice in which a process it started (a fake run) was waiting for one,
+    so an overloaded host slows the loop down without failing it. Bounded at ten times the timeout."""
+    left, cap = timeout, time.monotonic() + 10 * timeout
+    while left > 0 and time.monotonic() < cap:
+        last, queued = time.monotonic(), _run_queue_wait_s()
         d.cfg = p.config()
         d.tick()
         if cond():
             return True
         time.sleep(0.05)
+        if not _proc_tree_runnable_below(os.getpid()):
+            left -= max(time.monotonic() - last - (_run_queue_wait_s() - queued), 0.0)
     return False
 
 

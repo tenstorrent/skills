@@ -69,7 +69,7 @@ def _drive(d, clock, starts, ticks=12):
         d.maybe_coordinate()
         run = getattr(d, "_settle_run", None)
         if run is not None:
-            assert run.wait(15), "the hook outlived its timeout"
+            assert run.wait(run._timeout + 15), "the hook outlived its timeout"
         clock[0] += 20
         if len(starts) > n:
             return True
@@ -261,7 +261,10 @@ def test_settlehook_rechecks_the_never_settle_list_on_its_answer(env, monkeypatc
 @pytest.mark.parametrize("mode", ["error", "sleep", "badjson", "noreason", "dict"])
 def test_settlehook_fails_open_with_one_low_observation(env, monkeypatch, tmp_path, mode):
     from ttp import settlehook
-    monkeypatch.setattr(settlehook, "TIMEOUT_S", 1.0)
+    # The hook records its input as soon as its interpreter is up; on a loaded host that took over the 1 s
+    # this once allowed, so the fault was a timeout and the record missing. Only the hanging hook needs to
+    # hit the timeout, and it gets room to start first; the others end at once. All stay under _drive's wait.
+    monkeypatch.setattr(settlehook, "TIMEOUT_S", 6.0 if mode == "sleep" else 12.0)
     p, d, clock, starts, turns = _sh_setup(env, monkeypatch, tmp_path, mode=mode)
     for round_ in range(2):
         clock[0] += 3600

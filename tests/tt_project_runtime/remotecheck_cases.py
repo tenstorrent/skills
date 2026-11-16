@@ -3229,7 +3229,9 @@ def test_overflow_jobs_dying_at_start_pause_it_with_one_alert_and_the_runs_stay_
     import threading
     from ttp import alerts, cli, project, slurmcheck
     from ttp.daemon import Daemon
-    p, repo, run, d, log, cmd = _slurm_overflow_setup(env, tmp_path, monkeypatch, ["down"])
+    # Each dead job leaves no exit code, so the run waits rc_grace_s for a late one before calling it a death:
+    # the 90 s default made three deaths over 4 min of fixed waits, past the per-test limit on a loaded host.
+    p, repo, run, d, log, cmd = _slurm_overflow_setup(env, tmp_path, monkeypatch, ["down"], rc_grace_s=1)
     monkeypatch.setenv("FAKE_SLURM_MODE", "startfail")
     sbatches = []
     for n in range(3):
@@ -4630,16 +4632,18 @@ def test_every_spill_host_busy_runs_the_push_check_here_ahead_of_the_projects_fu
     other = push.check_slot("abc", lambda s: None, priority="other-key", proj=p, repo=repo)   # another full suite
     said: list[str] = []
     try:
-        t0 = time.time()
         assert push.push(repo, "origin", "proj", checks, 1, say=said.append) == 0, said
-        took = time.time() - t0
     finally:
         other.close()
     text = "\n".join(said)
     where = log.read_text().splitlines()
     assert where and "/ttp-check." not in where[-1], (where, text)   # ran here
     assert "no spill host could take" in text and "landing checks go first" in text, text
-    assert "stayed full" not in text and "not pushing" not in text and took < 45, (took, text)
+    # Its slot came at once, not after the other suite or the 60 s bound: the grant's own wait says so (the
+    # whole push's wall time also counts the spill tries, which a loaded host stretches).
+    waited = [int(w) for w in re.findall(r"after (\d+) s waiting", text)]
+    assert waited and max(waited) < 30 and "waiting to start" not in text, text
+    assert "stayed full" not in text and "not pushing" not in text, text
     assert envfault.open_faults(p) == {}
 
 
