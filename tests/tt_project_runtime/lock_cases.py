@@ -1279,7 +1279,8 @@ def test_run_to_end_does_not_count_a_stall_of_the_host_against_a_running_command
     """A stall that freezes the test process and its command together (a busy host) passed the deadline
     while the command still ran, so it was killed though it had used none of its time. A clock that jumps
     an hour after its first read in a call (which sets the deadline) stands in for that; a command that
-    hangs still fails, also when every read is a stall."""
+    hangs still fails, also when every read is a stall. The command outlasts the first 1 s wait slice, so a
+    read after the jump always comes, never only when the host is slow."""
     reads = []
 
     def stalled():
@@ -1288,7 +1289,7 @@ def test_run_to_end_does_not_count_a_stall_of_the_host_against_a_running_command
 
     monkeypatch.setattr(subprocess, "_time", stalled)
     monkeypatch.setattr(time, "monotonic", stalled)
-    cmd = ["sh", "-c", "sleep 1; echo out; exit 75"]
+    cmd = ["sh", "-c", "sleep 2; echo out; exit 75"]
     with pytest.raises(subprocess.TimeoutExpired):   # what a fixed deadline does
         subprocess.run(cmd, capture_output=True, timeout=30)
     reads.clear()

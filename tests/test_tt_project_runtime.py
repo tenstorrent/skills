@@ -3642,8 +3642,9 @@ def _run_to_end(argv, timeout=30, **kw):
     which used none of the command's time, so it counts as one slice. Nor does a slice in which the command
     (or a process it started) was runnable, waiting for a CPU: on an overloaded host even a refused command's
     exit can take longer than the deadline, while a hung one sleeps. A command that keeps the CPU busy still
-    fails, at ten times the deadline."""
-    left, cap = timeout, time.monotonic() + 10 * timeout
+    fails, at ten times the deadline, counted in the same stall-capped slices (a stall after the first clock
+    read must not end it either)."""
+    left, cap = timeout, 10 * timeout
     with subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kw) as proc:
         while True:
             last = time.monotonic()
@@ -3654,9 +3655,11 @@ def _run_to_end(argv, timeout=30, **kw):
                 if proc.poll() is not None:
                     out, err = proc.communicate(timeout=timeout)   # still bounded: something it left may hold its pipes
                     break
+                spent = min(time.monotonic() - last, 1.5)
+                cap -= spent
                 if not _proc_tree_runnable(proc.pid):
-                    left -= min(time.monotonic() - last, 1.5)
-                if left <= 0 or time.monotonic() > cap:
+                    left -= spent
+                if left <= 0 or cap <= 0:
                     proc.kill()
                     proc.wait()   # not communicate(): a descendant it left may hold its pipes open
                     raise
