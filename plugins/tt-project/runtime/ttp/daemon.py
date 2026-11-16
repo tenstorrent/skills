@@ -2601,13 +2601,13 @@ class Daemon:
                     self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
                                 (now, "daemon", "run_class_quality", "normal",
                                  runclass.code_quality_text(k, v, runclass.CODE_WINDOW_S / 3600)[:500], "queued"))
-        # The daily code-route guard: today against the prior week; a trip holds code on Opus and is told once.
+        # The daily code-route guard: Sonnet high against Opus high by worker model; a trip holds code on Opus, told once.
         if now - getattr(self, "_code_guard_checked", 0.0) >= 3600:
             self._code_guard_checked = now
             row = runclass.guard_run(self.p.db, self.cfg, now)
             if row and row.get("new_trip"):
                 self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
-                            (now, "daemon", "code_route_guard", "high", runclass.guard_text(row)[:1000], "queued"))
+                            (now, "daemon", "code_route_guard", "high", runclass.guard_text(row)[:1500], "queued"))
                 log(self.p, "code-route guard tripped: every code kind runs on Opus until route.code_sonnet changes")
         # route.device_ab: the test arm's incident stop (one high event) and the masked reviews.
         if now - getattr(self, "_device_ab_checked", 0.0) >= 300:
@@ -3854,6 +3854,15 @@ class Daemon:
                 effort = lifted
                 if "effort" in pin:   # the runner checks the session runs the effort it starts with
                     pin["effort"] = lifted
+        if role != "coordinator" and task:
+            # Code on Sonnet always runs at high, by any route (a cheap wake class, a light tier, a Jev or A/B
+            # pick, a fallback, a pin): runclass.code_effort. The runner checks a pinned effort is the one run.
+            raised = runclass.code_effort(task, model, effort)
+            if raised != effort:
+                effort = raised
+                if "effort" in pin:
+                    pin["effort"] = raised
+                note = {**(note or {}), "effort_floor": {"model": model, "to": raised}}
         if role != "coordinator" and isinstance((note or {}).get(effortab.KEY), dict):
             note = {**note, effortab.KEY: effortab.ran(self.p.db, note[effortab.KEY], effort)}
         prices = (self.cfg.get("pricing") or {}).get(provider) or {}

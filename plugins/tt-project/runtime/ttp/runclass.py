@@ -62,13 +62,18 @@ account keys (`ttp config <project> route.code_sonnet '{"share": 1.0}'`, `ttp co
 account's value first, the project's own over it. The shipped share stays CODE_CANARY.
 
 Daily guard (guard_run, by the daemon next to the hourly code_quality): once a day while the code route is on,
-the code tasks finished in the last day against the prior GUARD_PRIOR_DAYS days (guard_day): (a) review-fail
-rate, the share of reviewed ones whose first review (auto_review:<id>) failed or asked for changes; (b) rework
-hops (review fixes and continuations) per landed change; (c) $ per landed change, its hops' spend included. Each
-day's row is kept in the kv GUARD_DAYS_KV (`ttp stats --code-guard`). It trips when the day has ALARM_MIN reviewed
-code tasks and its review-fail rate beats the prior days' (which had at least one) by more than
-`route.code_sonnet.guard_pts` points (GUARD_PTS): every code kind goes back to Opus (guard_held, over the hourly
-state) until a person changes `route.code_sonnet`, and the daemon raises one high-severity event with the
+the code tasks finished in the last day (guard_day). Each reviewed one is attributed to the model and effort of
+the code worker's last run before its first review (auto_review:<id>). It trips only on a same-window
+comparison: Sonnet at high effort against Opus at high effort, each with at least GUARD_MIN_REVIEWS first reviews
+that day, Sonnet's review-fail rate (failed or asked for changes) above Opus's by more than
+`route.code_sonnet.guard_pts` points (GUARD_PTS). Fewer on either side: "not enough reviews to compare", never
+a trip. Sonnet at any other effort, cheap-class (light) hops and reviews that trace to no worker run stay out of
+the comparison and are reported on their own line; the prior GUARD_PRIOR_DAYS days are context only. The row
+also has rework hops (review fixes and continuations) per landed change and $ per landed change by worker model
+and by role (code worker runs, reviews, review fixes and continuations, device A/B runs, benches and shadow
+cells, other). Each day's row is kept in the kv GUARD_DAYS_KV (`ttp stats --code-guard`). A trip sends every
+code kind back to Opus (guard_held, over the hourly state) until a person changes `route.code_sonnet`, and the
+daemon raises one high-severity event with the
 numbers. `route.code_sonnet.guard` false turns the guard off.
 
 Report: by_class counts runs per class per model per hour with their real cost (`ttp stats --by-class`),
@@ -122,6 +127,7 @@ CODE_KINDS = ("new", "continue", "review_fix")
 REVIEW_ROUND_MAX = 2   # a review fix after this many failed reviews of its change stays on Opus
 ROUND_LABEL = "review_round:"   # the daemon's fix task: review_round:<failed reviews of the stack so far>
 CODE_MODEL = {"model": "sonnet", "effort": "high"}
+CODE_EFFORT_MIN = "high"          # a code-kind run on Sonnet never runs below it (code_effort)
 CODE_CANARY = 0.2
 CODE_FULL_MIN = 30
 CODE_WINDOW_S = 7 * 86400.0
@@ -143,6 +149,13 @@ GUARD_DAY_S = 86400.0
 GUARD_PRIOR_DAYS = 7
 GUARD_EVERY_S = 23 * 3600.0           # once a day, a little early so the hourly loop's drift never skips a day
 GUARD_KEEP = 90
+GUARD_MIN_REVIEWS = 15                # first reviews each of Sonnet high and Opus high needs before the guard compares them
+GUARD_COMPARED = ("sonnet_high", "opus_high")
+GUARD_BUCKETS = (*GUARD_COMPARED, "sonnet_other", "light", "untraced", "other")
+GUARD_LABELS = {"sonnet_other": "Sonnet below high", "light": "light hops", "untraced": "untraced (no worker run)",
+                "other": "other models or efforts"}
+GUARD_ROLES = {"code_worker": "code worker runs", "reviews": "reviews", "rework": "review fixes and continuations",
+               "device_ab": "device A/B runs", "bench_shadow": "benches and shadow cells", "other": "other"}
 REPORT = re.compile(r"(?i)\b(status|report|measure(?:d|ment|s)?|count|stats|summar(?:y|ise|ize)|digest|brief)\b")
 
 
@@ -297,7 +310,19 @@ def core_cheap(cfg: dict, task: dict | None, cls: str, tier: str, provider: str,
     if not m:
         return None
     why = "routine work" if cls == ROUTINE else str((routed or {}).get("fallback") or "") if routed else "no chat model"
-    return {"provider": provider, "model": m["model"], "effort": m["effort"], "class": cls, "why": why or "no chat model"}
+    return {"provider": provider, "model": m["model"], "effort": code_effort(task, m["model"], m["effort"]),
+            "class": cls, "why": why or "no chat model"}
+
+
+def code_effort(task: dict | None, model: str | None, effort: str | None) -> str:
+    """The effort a run of `task` on `model` takes: a code-kind task's run on a Sonnet model never runs below
+    CODE_EFFORT_MIN (a wake, light-tier, rebase, status, fallback, Jev, continue or review-fix route
+    included), else `effort` as given. The cheap classes keep their low effort for every other kind."""
+    eff = (effort or "").strip().lower()
+    if not task or task.get("kind") != "code" or "sonnet" not in str(model or "").lower():
+        return effort or ""
+    from .tierfloor import _rank
+    return eff if _rank(eff) >= _rank(CODE_EFFORT_MIN) else CODE_EFFORT_MIN
 
 
 def code_kind(task: dict | None, cfg: dict | None = None) -> str:
@@ -658,24 +683,78 @@ def guard_held(db, cfg: dict) -> bool:
     return isinstance(got, dict) and bool(got.get("ts")) and got.get("setting") == setting_mark(cfg)
 
 
+def _family(model: str | None) -> str:
+    m = str(model or "").lower()
+    return "sonnet" if "sonnet" in m else "opus" if "opus" in m else "other"
+
+
+def _bucket(runs: list[dict], task: dict) -> str:
+    """Where a reviewed code task's first review counts: the model and effort of the code worker's last run
+    before it, as GUARD_BUCKETS name them. `runs`: the task's worker runs started before the review, newest
+    first. No run: untraced. Sonnet at another effort than high comes before the light-hop check, so a
+    wake run that took Sonnet low shows as Sonnet low."""
+    if not runs:
+        return "untraced"
+    last = runs[0]
+    fam, eff = _family(last.get("model")), str(last.get("effort") or "").strip().lower()
+    if fam == "sonnet" and eff != "high":
+        return "sonnet_other"
+    if classify(task, last) in CHAT:
+        return "light"
+    return {"sonnet": "sonnet_high", "opus": "opus_high"}[fam] if fam != "other" and eff == "high" else "other"
+
+
+def _split(tally: dict) -> dict:
+    n, f = tally["reviewed"], tally["review_fails"]
+    return {"reviewed": n, "review_fails": f, "fail_rate": round(f / n, 4) if n else None}
+
+
+def _per(d: dict, n: int) -> dict:
+    return {k: round(v / n, 2) for k, v in sorted(d.items())} if n else {}
+
+
 def guard_day(db, since: float, until: float) -> dict:
     """Code tasks finished (done or failed) in [since, until): {"tasks", "reviewed", "review_fails", "fail_rate",
-    "landed", "hops", "hops_per_landed", "usd", "usd_per_landed"}. Reviewed: a first review (the lowest
-    auto_review:<id> review, done or failed) has its verdict; failed means it asked for changes. Landed changes
-    are the lineages (chaincap.chain, root first) of these tasks whose root landed (landed.recorded, which
-    follows the hops that carry it on); hops are a lineage's review fixes and continuations, its $ every hop's
-    spend."""
+    "landed", "hops", "hops_per_landed", "usd", "usd_per_landed", "models", "excluded", "usd_by_role",
+    "usd_by_model"}. Reviewed: a first review (the lowest auto_review:<id> review, done or failed) has its
+    verdict; failed means it asked for changes. `models` counts those first reviews by the code worker's last
+    run before them (_bucket): sonnet_high and opus_high, the only ones the guard compares, each {"reviewed",
+    "review_fails", "fail_rate"}; `excluded` has the rest, never compared: sonnet_other (Sonnet at any effort
+    but high), light (the last run was a cheap-class hop), untraced (no worker run before the review) and
+    other (another model or effort). Landed changes are the lineages (chaincap.chain, root first) of these
+    tasks whose root landed (landed.recorded, which follows the hops that carry it on); hops are a lineage's
+    review fixes and continuations. Its $ is every run of its tasks and of the reviews, device A/B and shadow
+    tasks that name them, split `usd_by_role` (GUARD_ROLES) and `usd_by_model` (model:effort), both per landed
+    change."""
     from . import chaincap, landed
     tasks = [dict(t) for t in db.q("SELECT * FROM tasks WHERE kind='code' AND status IN ('done','failed') "
                                    "AND updated>=? AND updated<? ORDER BY id", (since, until))]
-    ids = {t["id"] for t in tasks}
+    by_id = {t["id"]: t for t in tasks}
     first: dict = {}
-    if ids:
-        for r in db.q("SELECT id, status, labels FROM tasks WHERE kind='review' AND status IN ('done','failed') "
-                      "AND labels LIKE '%auto_review:%' ORDER BY id"):
+    first_at: dict = {}
+    linked: dict = {}   # review-kind task id -> (the code task it names, its GUARD_ROLES role)
+    if by_id:
+        for r in db.q("SELECT id, status, labels, created FROM tasks WHERE kind='review' ORDER BY id"):
             for lb in _labels(dict(r)):
-                if lb.startswith("auto_review:") and lb[12:].isdigit() and int(lb[12:]) in ids:
-                    first.setdefault(int(lb[12:]), r["status"])
+                pre, _, rest = lb.partition(":")
+                num = rest.split(":")[0]
+                if not num.isdigit():
+                    continue
+                role = {"auto_review": "reviews", "device_ab_review": "device_ab", "device_ab_review2": "device_ab",
+                        "device_shadow_review": "bench_shadow", "device_shadow_review2": "bench_shadow"}.get(pre)
+                if role:
+                    linked.setdefault(r["id"], (int(num), role))
+                if pre == "auto_review" and int(num) in by_id and r["status"] in ("done", "failed") \
+                        and int(num) not in first:
+                    first[int(num)] = r["status"]
+                    first_at[int(num)] = float(r["created"] or "inf")
+    buckets = {b: {"reviewed": 0, "review_fails": 0} for b in GUARD_BUCKETS}
+    for tid, verdict in first.items():
+        runs = [dict(r) for r in db.q("SELECT model, effort, note FROM runs WHERE task=? AND role='worker' AND "
+                                      "started<? ORDER BY started DESC, id DESC", (tid, first_at[tid]))]
+        b = buckets[_bucket(runs, by_id[tid])]
+        b["reviewed"] += 1
+        b["review_fails"] += verdict == "failed"
     lines: dict = {}
     for t in tasks:
         ch = chaincap.chain(db, t["id"]) or [t]
@@ -683,26 +762,57 @@ def guard_day(db, since: float, until: float) -> dict:
         if len(ch) >= len(lines.get(root) or []):
             lines[root] = ch
     landed_lines = [ch for root, ch in lines.items() if landed.recorded(db, root)[0]]
+    role_usd: dict = {}
+    model_usd: dict = {}
+
+    def add(task_id, role, spent_usd, own_role=None):
+        runs = [dict(r) for r in db.q("SELECT role, model, effort, cost_usd FROM runs WHERE task=?", (task_id,))]
+        for r in runs or [{"role": own_role, "model": "", "effort": "", "cost_usd": spent_usd}]:
+            usd = float(r["cost_usd"] or 0)
+            r_role = role if own_role is None or r["role"] in (own_role, None) else "other"
+            role_usd[r_role] = role_usd.get(r_role, 0.0) + usd
+            key = f"{_family(r['model'])}:{str(r['effort'] or '').lower()}" if r["model"] else "unrecorded"
+            model_usd[key] = model_usd.get(key, 0.0) + usd
+
+    for ch in landed_lines:
+        ids = {t["id"] for t in ch}
+        for i, t in enumerate(ch):
+            ab = any(lb.startswith("device_ab:") for lb in _labels(t))
+            add(t["id"], "device_ab" if ab else "code_worker" if i == 0 else "rework", t.get("spent_usd"), "worker")
+        for rid, (tid, role) in linked.items():
+            if tid in ids:
+                t = db.task(rid) or {}
+                add(rid, role, t.get("spent_usd"))
+    usd = sum(role_usd.values())
     hops = sum(len(ch) - 1 for ch in landed_lines)
-    usd = sum(chaincap.spend(ch) for ch in landed_lines)
-    fails = sum(1 for v in first.values() if v == "failed")
     n = len(landed_lines)
-    return {"tasks": len(tasks), "reviewed": len(first), "review_fails": fails,
-            "fail_rate": round(fails / len(first), 4) if first else None,
+    reviewed = sum(b["reviewed"] for b in buckets.values())
+    fails = sum(b["review_fails"] for b in buckets.values())
+    return {"tasks": len(tasks), "reviewed": reviewed, "review_fails": fails,
+            "fail_rate": round(fails / reviewed, 4) if reviewed else None,
+            "models": {b: _split(buckets[b]) for b in GUARD_COMPARED},
+            "excluded": {b: _split(v) for b, v in buckets.items() if b not in GUARD_COMPARED},
             "landed": n, "hops": hops, "hops_per_landed": round(hops / n, 2) if n else None,
-            "usd": round(usd, 2), "usd_per_landed": round(usd / n, 2) if n else None}
+            "usd": round(usd, 2), "usd_per_landed": round(usd / n, 2) if n else None,
+            "usd_by_role": _per(role_usd, n), "usd_by_model": _per(model_usd, n)}
 
 
 def guard_check(db, cfg: dict, now: float | None = None) -> dict:
-    """The guard's row for the day ending at `now`: {"ts", "day", "prior", "pts", "rise_pts", "tripped"}."""
+    """The guard's row for the day ending at `now`: {"ts", "day", "prior", "pts", "min_reviews", "enough",
+    "gap_pts", "comparison", "tripped"}. It compares Sonnet high with Opus high over the same day (their first
+    reviews' fail rates, by the worker's model: guard_day) and trips when each has GUARD_MIN_REVIEWS of them and
+    Sonnet's rate is above Opus's by more than `pts` points. Fewer on either side: comparison says "not enough
+    reviews to compare" and it never trips. The prior days are context, never the comparator."""
     now = time.time() if now is None else now
     pts = (guard_settings(cfg) or {}).get("pts", GUARD_PTS)
     day = guard_day(db, now - GUARD_DAY_S, now)
     prior = guard_day(db, now - (1 + GUARD_PRIOR_DAYS) * GUARD_DAY_S, now - GUARD_DAY_S)
-    rise = round((day["fail_rate"] - prior["fail_rate"]) * 100, 1) \
-        if day["fail_rate"] is not None and prior["fail_rate"] is not None else None
-    tripped = day["reviewed"] >= ALARM_MIN and rise is not None and rise > pts
-    return {"ts": now, "day": day, "prior": prior, "pts": pts, "rise_pts": rise, "tripped": tripped}
+    s, o = day["models"]["sonnet_high"], day["models"]["opus_high"]
+    enough = min(s["reviewed"], o["reviewed"]) >= GUARD_MIN_REVIEWS
+    gap = round((s["fail_rate"] - o["fail_rate"]) * 100, 1) if enough else None
+    return {"ts": now, "day": day, "prior": prior, "pts": pts, "min_reviews": GUARD_MIN_REVIEWS, "enough": enough,
+            "gap_pts": gap, "comparison": "compared" if enough else "not enough reviews to compare",
+            "tripped": bool(enough and gap > pts)}
 
 
 def guard_run(db, cfg: dict, now: float | None = None) -> dict | None:
@@ -725,21 +835,56 @@ def guard_run(db, cfg: dict, now: float | None = None) -> dict | None:
     return row
 
 
+def _rate(v: dict | None) -> str:
+    v = v or {}
+    n = v.get("reviewed") or 0
+    return f"{v.get('review_fails') or 0}/{n} ({v['fail_rate']:.0%})" if n else "0/0 (n/a)"
+
+
+def _usd(d: dict | None) -> str:
+    return ", ".join(f"{k} {v:.2f}" for k, v in (d or {}).items() if v) or "n/a"
+
+
+def guard_lines(row: dict) -> list[str]:
+    """One guard row as short lines: the same-window Sonnet high / Opus high comparison, what it left out, the
+    prior days as context, rework hops and $ per landed code task by worker model and by role. A row kept by
+    an older guard (no `models`) shows its own review-fail numbers."""
+    d, p = row["day"], row.get("prior") or {}
+    if "models" not in d:
+        return [f"review fails {d['review_fails']}/{d['reviewed']} vs prior {p.get('review_fails')}/{p.get('reviewed')} "
+                f"(older guard: all models together, not compared by model)"]
+    m, x = d["models"], d.get("excluded") or {}
+    gap = row.get("gap_pts")
+    head = (f"Sonnet high review fails {_rate(m['sonnet_high'])} vs Opus high {_rate(m['opus_high'])}, gap "
+            f"{gap:g} pts (limit {row['pts']:g})" if row.get("enough") else
+            f"Sonnet high review fails {_rate(m['sonnet_high'])}, Opus high {_rate(m['opus_high'])}: "
+            f"not enough reviews to compare (needs {row.get('min_reviews', GUARD_MIN_REVIEWS)} on each side)")
+    out = [head]
+    out.append("left out of the comparison: " + ", ".join(
+        f"{label} {v['reviewed']} reviewed, {v['review_fails']} failed"
+        for label, v in ((GUARD_LABELS[k], x.get(k) or {"reviewed": 0, "review_fails": 0}) for k in x)))
+    pm = (p.get("models") or {})
+    if pm:
+        out.append(f"prior {GUARD_PRIOR_DAYS} days (context only): Sonnet high {_rate(pm.get('sonnet_high'))}, "
+                   f"Opus high {_rate(pm.get('opus_high'))}")
+    hops = d.get("hops_per_landed")
+    out.append(f"rework hops per landed change {'n/a' if hops is None else format(hops, 'g')}; $ per landed code task "
+               f"{'n/a' if d.get('usd_per_landed') is None else format(d['usd_per_landed'], '.2f')} "
+               f"({d['landed']} landed)")
+    out.append("$ per landed by worker model: " + _usd(d.get("usd_by_model")))
+    out.append("$ per landed by role: " + _usd({GUARD_ROLES.get(k, k): v for k, v in (d.get("usd_by_role") or {}).items()}))
+    return out
+
+
 def guard_line(row: dict) -> str:
-    def f(v, fmt):
-        return "n/a" if v is None else format(v, fmt)
-    d, p = row["day"], row["prior"]
-    return (f"review fails {d['review_fails']}/{d['reviewed']} ({f(d['fail_rate'], '.0%')}) vs prior "
-            f"{GUARD_PRIOR_DAYS} days {p['review_fails']}/{p['reviewed']} ({f(p['fail_rate'], '.0%')}), "
-            f"rise {f(row['rise_pts'], 'g')} pts (limit {row['pts']:g}); rework hops per landed change "
-            f"{f(d['hops_per_landed'], 'g')} vs {f(p['hops_per_landed'], 'g')}; $ per landed code task "
-            f"{f(d['usd_per_landed'], '.2f')} vs {f(p['usd_per_landed'], '.2f')} ({d['landed']} vs {p['landed']} landed)")
+    return "; ".join(guard_lines(row))
 
 
 def guard_text(row: dict) -> str:
     """The trip's alert."""
-    return (f"Code-route guard tripped: code tasks' review-fail rate rose more than {row['pts']:g} points over the "
-            f"prior {GUARD_PRIOR_DAYS} days. {guard_line(row)}. Every code kind runs on Opus again and stays there "
+    return (f"Code-route guard tripped: in the same day, Sonnet at high effort failed its first review more often than "
+            f"Opus at high effort by more than {row['pts']:g} points, with at least {row['min_reviews']} reviews each. "
+            f"{guard_line(row)}. Every code kind runs on Opus again and stays there "
             f"until `route.code_sonnet` is changed (`ttp stats --code-guard` shows the daily numbers).")
 
 
@@ -761,7 +906,9 @@ def guard_report_text(s: dict, name: str, tz=None) -> str:
     out = [head]
     for r in s["rows"]:
         when = datetime.fromtimestamp(float(r.get("ts") or 0), tz).strftime("%Y-%m-%d %H:%M %Z").strip()
-        out.append(f"  {when}: {guard_line(r)}" + (" TRIPPED" if r.get("tripped") else ""))
+        lines = guard_lines(r)
+        out.append(f"  {when}: {lines[0]}" + (" TRIPPED" if r.get("tripped") else ""))
+        out.extend(f"      {ln}" for ln in lines[1:])
     if not s["rows"]:
         out.append("  no daily rows yet")
     return "\n".join(out)

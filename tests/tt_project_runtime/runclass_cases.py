@@ -381,6 +381,73 @@ def test_a_cheap_class_run_starts_claude_on_its_cheap_model_at_its_effort_or_the
     assert argv("haiku", min_effort="high") == ("haiku", "high")
 
 
+def test_a_code_tasks_cheap_class_route_keeps_sonnet_at_high_and_other_kinds_keep_it_low():
+    """The cheap classes' Sonnet low is for non-code work: a code task's wake, status, rebase and routine
+    run takes the model at CODE_EFFORT_MIN (a light wake hop of a waiting code task ran Sonnet low)."""
+    from ttp import runclass
+    code = {"id": 3, "kind": "code", "tier": "standard", "title": "x", "labels": "[]", "spec": "s"}
+    other = {**code, "kind": "work"}
+    assert runclass.CODE_EFFORT_MIN == "high"
+    for cls in ("worker_wake", "status_report", "rebase", runclass.ROUTINE):
+        c = runclass.core_cheap({}, code, cls, "standard", "claude")
+        o = runclass.core_cheap({}, other, cls, "standard", "claude")
+        assert c and o and c["model"] == o["model"] == "sonnet", cls
+        assert c["effort"] == "high" and o["effort"] == ("high" if cls == runclass.ROUTINE else "low"), cls
+    for cls in ("wake_decision", "screening"):   # Haiku classes are not Sonnet: untouched
+        assert runclass.core_cheap({}, code, cls, "standard", "claude")["effort"] == "low", cls
+    for eff, want in (("minimal", "high"), ("low", "high"), ("medium", "high"), ("high", "high"),
+                      ("xhigh", "xhigh"), ("max", "max"), ("", "high")):
+        assert runclass.code_effort(code, "claude-sonnet-5-5", eff) == want, eff
+    assert runclass.code_effort(code, "opus", "low") == "low" and runclass.code_effort(other, "sonnet", "low") == "low"
+    assert runclass.code_effort(None, "sonnet", "low") == "low"
+
+
+def test_a_code_run_on_sonnet_starts_at_high_by_every_route_and_a_non_code_run_keeps_its_effort(env, monkeypatch):
+    """Cheap wake class, a routed model pick, a Jev or A/B effort arm, the tier's own mapping, a task pin
+    and a review fix or continuation: none starts a code task's Sonnet run below high."""
+    from ttp import effortab, route, runclass
+    from ttp.daemon import Daemon
+    from ttp.providers import claude as claude_provider
+
+    class Built(Exception):
+        pass
+    real = claude_provider.Claude.build
+
+    def build(self, **kw):   # the real command line; no agent process starts
+        raise Built(real(self, **kw)[0])
+    monkeypatch.setattr(claude_provider.Claude, "build", build)
+    p = make(env)
+    d = Daemon(p.base)
+
+    def argv(kind="code", note=None, title="x", labels=None, **fields):
+        t = p.db.add_task(title, "x", kind=kind, tier="standard", origin="coordinator", **fields)
+        if labels:
+            p.db.update_task(t, labels=json.dumps(labels))
+        with pytest.raises(Built) as got:
+            d.start_run("worker", "go", "claude", "standard", str(p.root), task=p.db.task(t), note=note)
+        a = list(got.value.args[0])
+        return a[a.index("--model") + 1], (a[a.index("--effort") + 1] if "--effort" in a else "")
+
+    low = {runclass.CHEAP_KEY: {"provider": "claude", "model": "sonnet", "effort": "low", "why": "no chat model"}}
+    assert argv(note=low) == ("sonnet", "high") and argv(kind="work", note=low) == ("sonnet", "low")
+    # A note whose cheap entry predates the floor (a restart reads the stored note) is lifted at the start.
+    assert argv(note={runclass.CHEAP_KEY: {**low[runclass.CHEAP_KEY], "class": "worker_wake"}}) == ("sonnet", "high")
+    # A routed model pick (route.KEY with model_pick) on core: Jev's or the A/B choice of Sonnet low.
+    pick = {route.KEY: {"to": "claude", "model_pick": True, "model": "sonnet", "pick_effort": "low"}}
+    assert argv(note=pick) == ("sonnet", "high") and argv(kind="question", note=pick) == ("sonnet", "low")
+    # An effort A/B arm or Jev's effort pick on a tier whose model is Sonnet.
+    p.set_config("providers.claude.tiers.standard", {"model": "sonnet", "effort": "medium"})
+    d._load_config()
+    assert argv() == ("sonnet", "high") and argv(kind="question") == ("sonnet", "medium")
+    arm = {effortab.KEY: {"effort": "low", "arm": "low"}}
+    assert argv(note=arm) == ("sonnet", "high") and argv(kind="question", note=arm) == ("sonnet", "low")
+    # A task pin (a review fix or continuation inherits one) and the continuation and review-fix titles.
+    assert argv(model="sonnet", effort="low") == ("sonnet", "high")
+    assert argv(title="continue: x", labels=["review_fix:9"], effort="low", model="sonnet") == ("sonnet", "high")
+    # Opus keeps whatever effort its route gave it.
+    assert argv(model="opus", effort="low") == ("opus", "low")
+
+
 def test_an_urgent_task_takes_its_class_cheap_route_in_every_cheap_class_and_hard_work_keeps_core():
     from ttp import route, runclass
     cfg = _rc_cfg()
@@ -777,13 +844,20 @@ def test_code_sonnet_and_core_cheap_are_project_and_account_keys_the_project_val
                                       "labels": "[]"}) is None
 
 
-def _guard_tasks(p, now, n, fails, ago=3600.0, landed=0, spent=1.0):
+def _guard_tasks(p, now, n, fails, ago=3600.0, landed=0, spent=1.0, model="opus", effort="high", note=None,
+                 cost=None):
     """`n` finished code tasks `ago` seconds before `now`, the first `fails` with a failed first review and the
-    first `landed` recorded as landed; each spent `spent`."""
+    first `landed` recorded as landed; each spent `spent`. Each has one worker run on `model` at `effort` (none
+    when `model` is None) before its review; `cost` is that run's $ (default `spent`), `note` its note."""
     out = []
     for i in range(n):
         t = p.db.add_task("t", "", kind="code", tier="standard", priority=3, budget_usd=5.0)
         p.db.x("UPDATE tasks SET status='done', spent_usd=?, updated=? WHERE id=?", (spent, now - ago, t))
+        if model:
+            p.db.x("INSERT INTO runs(task, role, provider, model, effort, started, ended, status, cost_usd, note) "
+                   "VALUES(?,?,?,?,?,?,?,?,?,?)", (t, "worker", "claude", model, effort, now - ago - 600,
+                                                    now - ago - 300, "done", spent if cost is None else cost,
+                                                    json.dumps(note or {})))
         r = p.db.add_task(f"Review #{t}", "", kind="review", tier="standard", priority=3, budget_usd=1.0)
         p.db.x("UPDATE tasks SET status=?, labels=? WHERE id=?",
                ("failed" if i < fails else "done", json.dumps([f"auto_review:{t}"]), r))
@@ -794,27 +868,106 @@ def _guard_tasks(p, now, n, fails, ago=3600.0, landed=0, spent=1.0):
     return out
 
 
-def test_code_route_guard_compares_today_with_the_prior_week_and_needs_five_reviewed_and_a_rise_over_its_points(env):
+_GUARD_CFG = {"route": {"code_sonnet": {"share": 1.0}}}
+
+
+def test_code_route_guard_compares_sonnet_high_with_opus_high_in_one_window_and_leaves_the_rest_out(env):
     from ttp import runclass
     p = make(env)
     now = time.time()
-    _guard_tasks(p, now, 10, 1, ago=3 * 86400, landed=4, spent=2.0)   # prior week: 10% fail, $2 per landed
-    _guard_tasks(p, now, 4, 2, landed=2, spent=1.0)                    # today: 4 reviewed only
-    cfg = {"route": {"code_sonnet": {"share": 1.0}}}
-    row = runclass.guard_check(p.db, cfg, now)
-    assert (row["prior"]["reviewed"], row["prior"]["review_fails"], row["prior"]["usd_per_landed"]) == (10, 1, 2.0)
-    assert (row["day"]["reviewed"], row["day"]["landed"], row["day"]["hops_per_landed"]) == (4, 2, 0.0)
-    assert row["rise_pts"] == 40.0 and not row["tripped"]   # under ALARM_MIN reviewed: no trip
-    _guard_tasks(p, now, 1, 0)   # 5 reviewed, 2 failed (40%): 30 points over 10%
-    row = runclass.guard_check(p.db, cfg, now)
-    assert row["day"]["reviewed"] == runclass.ALARM_MIN and row["rise_pts"] == 30.0 and row["tripped"]
+    _guard_tasks(p, now, 20, 3, model="sonnet")            # Sonnet high: 3 of 20 failed (15%)
+    _guard_tasks(p, now, 24, 3, model="opus")              # Opus high: 3 of 24 (13%)
+    _guard_tasks(p, now, 3, 2, model="sonnet", effort="low")   # Sonnet low: 2 of 3 failed
+    _guard_tasks(p, now, 4, 3, model=None)                 # reviews no worker run traces: 3 of 4 failed
+    row = runclass.guard_check(p.db, _GUARD_CFG, now)
+    m, x = row["day"]["models"], row["day"]["excluded"]
+    assert (m["sonnet_high"]["reviewed"], m["sonnet_high"]["review_fails"]) == (20, 3)
+    assert (m["opus_high"]["reviewed"], m["opus_high"]["review_fails"]) == (24, 3)
+    assert (x["sonnet_other"]["reviewed"], x["sonnet_other"]["review_fails"]) == (3, 2)
+    assert (x["untraced"]["reviewed"], x["untraced"]["review_fails"]) == (4, 3)
+    assert row["enough"] and row["gap_pts"] == 2.5 and not row["tripped"] and row["comparison"] == "compared"
+    assert (row["day"]["reviewed"], row["day"]["review_fails"]) == (51, 11)
+    line = runclass.guard_line(row)
+    assert "Sonnet high review fails 3/20 (15%) vs Opus high 3/24 (12%)" in line or "3/24 (13%)" in line
+    assert "Sonnet below high 3 reviewed, 2 failed" in line and "untraced (no worker run) 4 reviewed, 3 failed" in line
+    # The same numbers as one blended rate would have tripped it: 11/51 against a 13% base.
     assert not runclass.guard_check(p.db, {"route": {"code_sonnet": {"guard_pts": 30}}}, now)["tripped"]
-    assert "rise 30 pts (limit 5)" in runclass.guard_line(row)
+
+
+def test_code_route_guard_needs_fifteen_reviews_per_model_and_trips_only_on_a_real_gap(env):
+    from ttp import runclass
+    p = make(env)
+    now = time.time()
+    _guard_tasks(p, now, 14, 9, model="sonnet")   # 14 Sonnet high at 64%: too few to compare
+    _guard_tasks(p, now, 30, 0, model="opus")
+    row = runclass.guard_check(p.db, _GUARD_CFG, now)
+    assert not row["enough"] and not row["tripped"] and row["gap_pts"] is None
+    assert row["comparison"] == "not enough reviews to compare"
+    assert "not enough reviews to compare" in runclass.guard_line(row)
+    _guard_tasks(p, now, 1, 1, model="sonnet")    # 15 Sonnet high, 10 failed (67%) against 0%
+    row = runclass.guard_check(p.db, _GUARD_CFG, now)
+    assert row["enough"] and row["tripped"] and row["gap_pts"] == 66.7
+    assert not runclass.guard_check(p.db, {"route": {"code_sonnet": {"guard_pts": 70}}}, now)["tripped"]
+    assert "gap 66.7 pts (limit 5)" in runclass.guard_line(row)
+    # Too few Opus high ones: no trip either, whatever Sonnet's rate is.
+    p.db.x("UPDATE runs SET effort='medium' WHERE model='opus' AND id%2=0")
+    row = runclass.guard_check(p.db, _GUARD_CFG, now)
+    assert row["day"]["models"]["opus_high"]["reviewed"] == 15 and row["tripped"]
+    p.db.x("UPDATE runs SET effort='medium' WHERE model='opus'")
+    row = runclass.guard_check(p.db, _GUARD_CFG, now)
+    assert not row["enough"] and not row["tripped"] and row["day"]["excluded"]["other"]["reviewed"] == 30
     # Off: `route.code_sonnet.guard` false, or the code route itself off.
     for off in ({"code_sonnet": {"guard": False}}, {"code_sonnet": False}, {"core_cheap": False}):
         assert runclass.guard_settings({"route": off}) is None
         assert runclass.guard_run(p.db, {"route": off}, now) is None
     assert p.db.kv(runclass.GUARD_DAYS_KV) is None
+
+
+def test_code_route_guard_keeps_prior_days_as_context_and_counts_a_light_hop_apart(env):
+    from ttp import runclass
+    p = make(env)
+    now = time.time()
+    _guard_tasks(p, now, 20, 10, ago=3 * 86400, model="sonnet")   # a bad prior week: never the comparator
+    _guard_tasks(p, now, 20, 0, ago=3 * 86400, model="opus")
+    _guard_tasks(p, now, 2, 2, model="sonnet", effort="high", note={"wake": {"tier": "light"}})   # a light wake hop
+    _guard_tasks(p, now, 2, 0, model="opus", effort="high", note={"run_class": "light"})
+    row = runclass.guard_check(p.db, _GUARD_CFG, now)
+    assert row["day"]["excluded"]["light"] == {"reviewed": 4, "review_fails": 2, "fail_rate": 0.5}
+    assert row["day"]["models"]["sonnet_high"]["reviewed"] == 0 and not row["tripped"]
+    assert row["prior"]["models"]["sonnet_high"]["fail_rate"] == 0.5
+    assert "prior 7 days (context only): Sonnet high 10/20 (50%), Opus high 0/20 (0%)" in runclass.guard_line(row)
+
+
+def test_code_route_guard_splits_the_spend_per_landed_task_by_model_and_by_role(env):
+    from ttp import runclass
+    p = make(env)
+    now = time.time()
+    # Two landed lineages: a root on Opus plus a review-fix hop on Sonnet, and a lone Sonnet root; each has a review.
+    a = _guard_tasks(p, now, 1, 0, landed=1, spent=3.0, model="opus")[0]
+    fix = p.db.add_task("continue: fix", "", kind="code", tier="standard", priority=3, budget_usd=5.0)
+    p.db.x("UPDATE tasks SET status='done', updated=?, labels=?, parent=?, spent_usd=2 WHERE id=?",
+           (now - 3600, json.dumps([f"review_fix:{a}"]), a, fix))
+    p.db.x("INSERT INTO runs(task, role, provider, model, effort, started, ended, status, cost_usd) "
+           "VALUES(?,?,?,?,?,?,?,?,?)", (fix, "worker", "claude", "sonnet", "high", now - 1000, now - 900, "done", 2.0))
+    b = _guard_tasks(p, now, 1, 0, landed=1, spent=1.0, model="sonnet")[0]
+    for tid, cost in ((a, 1.0), (b, 0.5)):   # the reviews' own runs
+        rid = p.db.one("SELECT id FROM tasks WHERE kind='review' AND labels LIKE ?", (f'%auto_review:{tid}"%',))["id"]
+        p.db.x("INSERT INTO runs(task, role, provider, model, effort, started, ended, status, cost_usd) "
+               "VALUES(?,?,?,?,?,?,?,?,?)", (rid, "reviewer", "claude", "opus", "high", now - 100, now - 50, "done", cost))
+    ab = p.db.add_task("ab", "", kind="code", tier="standard", priority=3, budget_usd=5.0)
+    p.db.x("UPDATE tasks SET status='done', updated=?, labels=? WHERE id=?",
+           (now - 3600, json.dumps(["device_ab:sonnet"]), ab))
+    p.db.x("INSERT INTO task_landings(marker,task,sha,target,ts) VALUES(?,?,?,?,?)", ("mab", ab, "a" * 40, "branch", now))
+    p.db.x("INSERT INTO runs(task, role, provider, model, effort, started, ended, status, cost_usd) "
+           "VALUES(?,?,?,?,?,?,?,?,?)", (ab, "worker", "claude", "sonnet", "high", now - 1000, now - 900, "done", 3.0))
+    day = runclass.guard_check(p.db, _GUARD_CFG, now)["day"]
+    assert day["landed"] == 3 and day["hops"] == 1 and day["usd"] == 10.5 and day["usd_per_landed"] == 3.5
+    assert day["usd_by_role"] == {"code_worker": 1.33, "device_ab": 1.0, "reviews": 0.5, "rework": 0.67}
+    assert day["usd_by_model"] == {"opus:high": 1.5, "sonnet:high": 2.0}
+    line = runclass.guard_line(runclass.guard_check(p.db, _GUARD_CFG, now))
+    assert "by worker model: opus:high 1.50, sonnet:high 2.00" in line
+    assert "by role: code worker runs 1.33, reviews 0.50, review fixes and continuations 0.67, device A/B runs 1.00" in line \
+        or "review fixes and continuations 0.67" in line
 
 
 def test_code_route_guard_trip_holds_code_on_opus_until_the_setting_changes_and_tells_the_coordinator_once(env, capsys):
@@ -824,7 +977,8 @@ def test_code_route_guard_trip_holds_code_on_opus_until_the_setting_changes_and_
     now = time.time()
     p.set_config("route.code_sonnet", {"share": 1.0})
     _guard_tasks(p, now, 10, 0, ago=2 * 86400, landed=10)
-    _guard_tasks(p, now, 6, 3, landed=3)   # 50% today against 0%
+    _guard_tasks(p, now, 15, 8, landed=3, model="sonnet")   # Sonnet high 53% today ...
+    _guard_tasks(p, now, 15, 0, landed=3, model="opus")     # ... against Opus high 0%
     p.db.set_kv(runclass.CODE_STATE_KV, json.dumps({"new": "full"}))
     d = Daemon(p.base)
     d.watch_run_classes()
@@ -832,7 +986,7 @@ def test_code_route_guard_trip_holds_code_on_opus_until_the_setting_changes_and_
     t = {"id": 1, "kind": "code", "tier": "standard", "title": "x", "labels": "[]"}
     assert runclass.core_cheap(d.cfg, t, "hard", "standard", "claude", None, None, d._code_state()) is None
     ev = p.db.q("SELECT severity, text FROM events WHERE kind='code_route_guard'")
-    assert len(ev) == 1 and ev[0]["severity"] == "high" and "3/6 (50%)" in ev[0]["text"] \
+    assert len(ev) == 1 and ev[0]["severity"] == "high" and "8/15 (53%)" in ev[0]["text"] \
         and "route.code_sonnet" in ev[0]["text"]
     # The hourly loop never flips it back, and the daily row is not redone within the day.
     d._run_class_checked = d._code_quality_checked = d._code_guard_checked = 0.0

@@ -15595,9 +15595,10 @@ def main(argv: list[str] | None = None) -> None:
                    help="the code route instead (runclass.code_routes): the last 24 h's code worker runs per model "
                         "and per decision each run's note records (Sonnet, or why it stayed on Opus)")
     s.add_argument("--code-guard", action="store_true",
-                   help="the daily code-route guard instead (runclass.guard_run): per day, code tasks' review-fail "
-                        "rate, rework hops and $ per landed code task against the prior 7 days, and whether a trip "
-                        "holds code on Opus (the last --days rows)")
+                   help="the daily code-route guard instead (runclass.guard_run): per day, the first-review fail "
+                        "rate of Sonnet high against Opus high (by the code worker's model; at least 15 reviews "
+                        "each), what it left out, rework hops and $ per landed code task by worker model and by "
+                        "role, and whether a trip holds code on Opus (the last --days rows)")
     s.add_argument("--rejections", action="store_true",
                    help="coordinator action refusals per reason class instead (rejtally.py): caught by the "
                         "in-turn dry run and refused after the turn, over --days")

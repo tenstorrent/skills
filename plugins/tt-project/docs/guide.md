@@ -1183,11 +1183,17 @@ default, `share 1` for all). Set it for every project with `ttp config --account
 over the account's. Every hour the last 7 days of each kind are compared: a kind goes back to Opus only when
 Sonnet fails its first review more than 10 points more often than Opus, on at least 5 tasks each, and a
 one-sided exact binomial test puts the gap below `route.code_sonnet.alarm_p` (default 0.05; 0 never moves it).
-It returns to Sonnet at the next hourly check once the gap stops being significant. A daily guard compares the last 24 h of code tasks with the prior 7 days: first-review
-fail rate, rework hops per landed change and $ per landed code task. With at least 5 reviewed tasks and a
-fail-rate rise of more than `route.code_sonnet.guard_pts` points (default 5), it moves every code kind back
-to Opus, holds it there until someone changes `route.code_sonnet`, and sends the coordinator one alert with
-the numbers. `route.code_sonnet.guard false` turns it off; `ttp stats <name> --code-guard` shows the rows.
+It returns to Sonnet at the next hourly check once the gap stops being significant. A daily guard compares, over the last 24 h, the first-review fail rate of code tasks whose worker ran
+Sonnet at high effort with those whose worker ran Opus at high effort (the model of the code worker's last
+run before the review). It needs at least 15 reviews on each side, else it says "not enough reviews to compare"
+and never trips; Sonnet at another effort, light hops and reviews no worker run traces stay out of the
+comparison and are reported on their own line (count and fails), and the prior days are context only. A
+Sonnet high rate more than `route.code_sonnet.guard_pts` points (default 5) over Opus high's moves every code
+kind back to Opus, holds it there until someone changes `route.code_sonnet`, and sends the coordinator one
+alert with the numbers, rework hops per landed change and the $ per landed code task split by worker model and
+by role (code worker runs, reviews, review fixes and continuations, device A/B runs, benches, other). A code
+task's run on a Sonnet model never starts below high effort, whatever route started it (a wake, a light hop,
+a fallback, a Jev or A/B pick, a pin). `route.code_sonnet.guard false` turns it off; `ttp stats <name> --code-guard` shows the rows.
 Urgency and a model or effort the daemon or Jev picks never keep code on Opus; only a user's pin (the task's
 provider, model or effort), outside input (`untrusted_input`), deep asks, tier-up retries, review rounds at
 the cap, PR fixes and device runs (a `needs_device` label, a device lock or a machine in its resources, never
