@@ -692,9 +692,20 @@ def _family(model: str | None) -> str:
     return "sonnet" if "sonnet" in m else "opus" if "opus" in m else "other"
 
 
+def _hex_in(v) -> str:
+    """The commit id a hand-off value names, lowercase: the value itself, or the leading word of a line such as
+    `abc1234 fix the thing`; '' when it names none."""
+    w = str(v or "").strip().lower().split(None, 1)
+    return w[0] if w and _HEX.fullmatch(w[0]) else ""
+
+
 def _run_commit(run: dict) -> str:
-    """The commit the run's own hand-off (`result.json` in its run folder: `commit`, else `head`, else `sha`)
-    names, lowercase; '' when the folder or file is gone or names none."""
+    """The commit the run left, lowercase: the head its task branch pointed at as the run ended (`runs.head`,
+    recorded by the daemon), else what its own hand-off (`result.json` in its run folder) names: `commit`, `head`,
+    `sha` or `work_commit`, else the last of `commits` (a list of ids or lines led by one); '' when none."""
+    c = _hex_in(run.get("head"))
+    if c:
+        return c
     d = str(run.get("dir") or "")
     if not d:
         return ""
@@ -703,10 +714,15 @@ def _run_commit(run: dict) -> str:
             res = json.load(f)
     except (OSError, ValueError):
         return ""
-    for k in ("commit", "head", "sha"):
-        v = str(res.get(k) or "").strip().lower() if isinstance(res, dict) else ""
-        if _HEX.fullmatch(v):
-            return v
+    if not isinstance(res, dict):
+        return ""
+    for k in ("commit", "head", "sha", "work_commit"):
+        if c := _hex_in(res.get(k)):
+            return c
+    cs = res.get("commits")
+    for v in reversed(cs if isinstance(cs, list) else []):
+        if c := _hex_in(v):
+            return c
     return ""
 
 
@@ -793,7 +809,7 @@ def guard_day(db, since: float, until: float) -> dict:
     buckets = {b: {"reviewed": 0, "review_fails": 0} for b in GUARD_BUCKETS}
     how_n = {"head": 0, "costliest": 0}
     for tid, verdict in first.items():
-        runs = [dict(r) for r in db.q("SELECT id, model, effort, note, dir, started, cost_usd FROM runs WHERE task=? "
+        runs = [dict(r) for r in db.q("SELECT id, model, effort, note, dir, started, cost_usd, head FROM runs WHERE task=? "
                                       "AND role='worker' AND started<? ORDER BY started DESC, id DESC",
                                       (tid, first_at[tid]))]
         rs = db.one("SELECT head FROM review_stats WHERE task=?", (first_rid[tid],))

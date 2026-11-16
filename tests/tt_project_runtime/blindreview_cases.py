@@ -223,7 +223,7 @@ def test_a_task_with_three_runs_yields_three_ordered_masked_segments(env, tmp_pa
     from ttp import blindreview
     p = make(env)
     tid = p.db.add_task("Soak the widget board", "Soak it.", kind="work")
-    legs = [("glm-5.3", "chat", [{"type": "text", "text": "leg 1 by GLM, session 90111"}]),
+    legs = [("glm-5.3", "chat", [{"type": "text", "text": "leg 1 by GLM, session s1"}]),
             ("claude-opus-5-5", "claude", [{"type": "text", "text": "leg 2", "usage": {"opus": {"in": 1}}}]),
             ("gpt-9", "codex", [{"type": "text", "text": "leg 3 final"}])]
     dirs = _blind_runs(p, tmp_path, tid, legs)

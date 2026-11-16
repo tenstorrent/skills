@@ -26959,8 +26959,8 @@ def test_the_light_tier_runs_a_cheaper_model_that_pins_config_and_retries_move_o
     assert {t["model"] for t in tiers["cursor"].values()} == {"auto"}
     p = make(env)
 
-    def run(tier, **pin):
-        tid = p.db.add_task(f"t {tier} {pin}", "s", kind="code", tier="light", origin="user", **pin)
+    def run(tier, kind="work", **pin):
+        tid = p.db.add_task(f"t {tier} {kind} {pin}", "s", kind=kind, tier="light", origin="user", **pin)
         rid = Daemon(p.base).start_run("worker", "go", "claude", tier, str(p.root), task=p.db.task(tid))
         (p.runs / str(rid) / "STOP").touch()
         row = p.db.one("SELECT model, effort FROM runs WHERE id=?", (rid,))
@@ -26970,6 +26970,9 @@ def test_the_light_tier_runs_a_cheaper_model_that_pins_config_and_retries_move_o
 
     assert run("light") == ("sonnet", "low")
     assert run("light", model="opus") == ("opus", "low"), "a task's model pin lost to the tier default"
+    # Code on Sonnet always runs at high (#8693): the light tier's low effort never reaches a code task.
+    assert run("light", kind="code") == ("sonnet", "high")
+    assert run("light", kind="code", model="opus") == ("opus", "low"), "the floor lifts Sonnet only"
     # A failed light try is picked up a tier and so leaves the cheap model.
     t = p.db.add_task("Fix it", "x", kind="code", tier="light", origin="coordinator")
     p.db.update_task(t, attempts=1, result=json.dumps({"status": "failed", "summary": "no"}))

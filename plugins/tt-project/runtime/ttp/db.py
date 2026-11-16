@@ -112,7 +112,7 @@ CREATE TABLE IF NOT EXISTS runs (
   cost_usd REAL DEFAULT 0, cost_estimated INTEGER DEFAULT 0,
   input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0,
   cache_read_tokens INTEGER DEFAULT 0, cache_write_tokens INTEGER DEFAULT 0, note TEXT, session_id TEXT,
-  cost_basis TEXT);
+  cost_basis TEXT, head TEXT);
 CREATE INDEX IF NOT EXISTS runs_status ON runs(status);
 CREATE INDEX IF NOT EXISTS runs_ended ON runs(ended);
 
@@ -414,6 +414,7 @@ class DB:
         self._migrate_push_queue()
         self._migrate_ledger_account()
         self._migrate_run_session()
+        self._migrate_run_head()
         self._migrate_jev_changed()
         self._migrate_issue_lifecycle()
         self._migrate_push_landed()
@@ -533,6 +534,16 @@ class DB:
         with self.tx():
             if "session_id" not in {r["name"] for r in self.q("PRAGMA table_info(runs)")}:
                 self.x("ALTER TABLE runs ADD COLUMN session_id TEXT")
+
+    def _migrate_run_head(self) -> None:
+        # The commit a worker run's task branch pointed at when the run ended (the head it left), so a review
+        # of that commit traces to the run that made it (runclass._attribute) whatever its hand-off names.
+        # Older runs keep NULL; their hand-offs are still read.
+        if "head" in {r["name"] for r in self.q("PRAGMA table_info(runs)")}:
+            return
+        with self.tx():
+            if "head" not in {r["name"] for r in self.q("PRAGMA table_info(runs)")}:
+                self.x("ALTER TABLE runs ADD COLUMN head TEXT")
 
     def _migrate_jev_changed(self) -> None:
         # Whether a Jev call changed the rules' decision (jevuse.review). Older calls keep NULL: not known.

@@ -33,9 +33,9 @@ ALLOWED = {"cmd_note", "cmd_progress", "cmd_notify", "cmd_upstream", "cmd_task",
 TASK_ACTIONS = {"show", "list"}
 
 # Fields that name or hint at the arm: the model, provider and effort pins, the account, and spend (an open
-# model on a free plan shows as $0).
+# model on a free plan shows as $0) and the run's record id, which orders it against runs outside the packet.
 MASK_KEYS = {"model", "provider", "effort", "pin_verify", "account", "spent_usd", "budget_usd", "usd", "cost_usd",
-             "called", "models", "providers", "arm", "arms"}
+             "called", "models", "providers", "arm", "arms", "run_id", "run_dir"}
 ARM_LABELS = ("device_ab", "device_shadow", "model:", "provider:", "effort:", "pin:", "route:", "jev")
 
 # Model ids and family words. Word-bounded and case-insensitive; a path such as `.claude/` is left alone (the

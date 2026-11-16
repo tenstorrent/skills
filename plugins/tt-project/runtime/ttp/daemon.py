@@ -7046,16 +7046,22 @@ class Daemon:
         # Read before the transaction: it may read the provider's login files.
         read_as = (self._reading_account(r, usage.extra["windows"], bool(usage.extra.get("reinit")))
                    if usage.extra.get("windows") else r["account"] or "")
+        # The commit its task branch points at as the run ends, read before the transaction (a git call): the
+        # head this run left, which the code-route guard matches to the commit a review reviewed.
+        left_head = ""
+        if r["role"] == "worker" and r["task"] and (t_row := db.task(r["task"])):
+            left_head = self._branch_head(dict(t_row))
         # The run's end, its spend and what it did to its task commit together: a daemon stopped
         # half way leaves the run "running", and the next tick processes it again from disk.
         for rnd in self._finish_rounds(r["task"] or 0):
             with rnd:
                 db.x("UPDATE runs SET ended=?, status=?, exit_code=?, cost_usd=?, cost_estimated=?, cost_basis=?, "
                      "input_tokens=?, output_tokens=?, cache_read_tokens=?, cache_write_tokens=?, note=?, "
-                     "session_id=COALESCE(NULLIF(?,''), session_id), model=COALESCE(NULLIF(?,''), model) WHERE id=?",
+                     "session_id=COALESCE(NULLIF(?,''), session_id), model=COALESCE(NULLIF(?,''), model), "
+                     "head=COALESCE(NULLIF(?,''), head) WHERE id=?",
                      (ended, status, exit_info.get("rc"), usage.cost_usd,
                       int(usage.estimated), basis, usage.input_tokens, usage.output_tokens, usage.cache_read_tokens,
-                      usage.cache_write_tokens, json.dumps(note), usage.session_id or "", swapped, r["id"]))
+                      usage.cache_write_tokens, json.dumps(note), usage.session_id or "", swapped, left_head, r["id"]))
                 db.spend(r["provider"], usage.cost_usd, source, account=r["account"] or "", estimated=usage.estimated,
                          tokens_in=usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens,
                          tokens_out=usage.output_tokens, ts=ended)

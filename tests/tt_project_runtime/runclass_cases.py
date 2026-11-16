@@ -1040,6 +1040,40 @@ def test_code_route_guard_falls_back_to_the_costliest_run_when_no_commit_traces_
     assert day["attributed"] == {"head": 0, "costliest": 4}
 
 
+def test_a_runs_left_commit_is_its_recorded_head_else_any_commit_form_its_hand_off_names(env, tmp_path):
+    from ttp import runclass
+    c = "ab12cd34" * 5
+
+    def made(body):
+        d = tmp_path / f"rc-{len(list(tmp_path.iterdir()))}"
+        d.mkdir()
+        (d / "result.json").write_text(body if isinstance(body, str) else json.dumps(body))
+        return {"dir": str(d)}
+    assert runclass._run_commit({"head": c.upper(), "dir": None}) == c      # the head the daemon recorded
+    assert runclass._run_commit({**made({"commit": "f" * 40}), "head": c}) == c   # it beats the hand-off
+    assert runclass._run_commit({"head": "not hex", **made({"sha": c})}) == c
+    assert runclass._run_commit(made({"commits": ["1111111 first", "ab12cd34 second"]})) == "ab12cd34"
+    assert runclass._run_commit(made({"commit": f"{c[:9]} fix the thing"})) == c[:9]
+    assert runclass._run_commit(made({"work_commit": c})) == c
+    assert runclass._run_commit(made({"commits": "nothing", "commit": "no commit made"})) == ""
+    assert runclass._run_commit(made("[1, 2]")) == "" and runclass._run_commit(made("{broken")) == ""
+
+
+def test_the_guard_traces_a_review_by_the_head_a_run_recorded_when_its_hand_off_names_no_commit(env, tmp_path):
+    from ttp import runclass
+    p = make(env)
+    now = time.time()
+    head = "cd34ef56" * 5
+    t = _attrib_task(p, tmp_path, now, [("sonnet", "high", 0.5, 30, None, None), ("opus", "high", 4.0, 20, None, None)],
+                     head=head)
+    # The cheaper Sonnet run left the reviewed head; the later, dearer Opus run only polled it.
+    for model, h in (("sonnet", head), ("opus", head)):
+        p.db.x("UPDATE runs SET head=? WHERE task=? AND model=?", (h, t, model))
+    day = runclass.guard_check(p.db, _GUARD_CFG, now)["day"]
+    assert day["attributed"] == {"head": 1, "costliest": 0}
+    assert day["models"]["sonnet_high"]["reviewed"] == 1 and day["models"]["opus_high"]["reviewed"] == 0
+
+
 def test_code_route_guard_report_says_how_many_reviews_were_found_by_head_commit_and_by_costliest_run(env, tmp_path):
     from ttp import runclass
     p = make(env)
@@ -1188,3 +1222,23 @@ def test_route_share_alarm_fires_once_a_day_on_a_low_code_share_and_not_on_a_nor
     assert d.route_share_alarms(now + 1 + runclass.SHARE_WINDOW_S) == []   # runs aged out of the window
     # The stats flag prints the per-model and per-reason counts.
     assert "quality_hold 10" in runclass.code_routes_text(runclass.code_routes(p.db, now - 86400, now + 1))
+
+
+def test_a_worker_run_ends_with_the_head_its_task_branch_points_at_recorded(env, tmp_path, monkeypatch):
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    code = p.db.add_task("code", "s", kind="code", tier="standard", origin="user")
+    rev = p.db.add_task("Review", "s", kind="review", tier="standard", origin="user")
+    monkeypatch.setattr(d, "_branch_head", lambda t: "9a8b7c6d5e" if t["id"] == code else "")
+    ended = {}
+    for task, role in ((code, "worker"), (rev, "worker"), (code, "coordinator")):
+        p.db.update_task(task, status="running")
+        rid = p.db.x("INSERT INTO runs(task,role,provider,model,started,status) VALUES(?,?,'claude','',?,'running')",
+                     (task, role, time.time() - 60))
+        (p.runs / str(rid)).mkdir(parents=True)
+        d.finish_run(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)), {"rc": 0, "started": time.time() - 60,
+                                                                       "ended": time.time()})
+        ended[(task, role)] = p.db.one("SELECT head FROM runs WHERE id=?", (rid,))["head"]
+    assert ended[(code, "worker")] == "9a8b7c6d5e"
+    assert not ended[(rev, "worker")] and not ended[(code, "coordinator")]
