@@ -159,6 +159,11 @@ def _jsonl(raw: str) -> str:
     return "\n".join(out) + ("\n" if out else "")
 
 
+def _write(path: Path, text: str) -> None:
+    from .project import durable_write
+    durable_write(path, text)
+
+
 def packet(state: str | Path, key: str, run_dir: str | Path | None, handoff: str | None = None) -> str:
     """A masked copy of a reviewed run for a blind review, under <state>/blind/<key>/ (state: the folder of project.db): its result.json
     and progress.md and its transcript (output.jsonl) with arm fields dropped and model names masked, never
@@ -182,7 +187,7 @@ def packet(state: str | Path, key: str, run_dir: str | Path | None, handoff: str
             text = _jsonl(raw)
         else:
             text = scrub(raw)
-        (dst / name).write_text(text)
+        _write(dst / name, text)
     if handoff is not None:
-        (dst / "plan.md").write_text(scrub(handoff))
+        _write(dst / "plan.md", scrub(handoff))
     return str(dst)
