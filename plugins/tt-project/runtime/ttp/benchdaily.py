@@ -95,7 +95,7 @@ def repo_of(proj: dict, repos: dict | None = None) -> Path | None:
 
 
 def _git(repo: Path, *args: str, timeout: int = 120, inp: str | None = None) -> str:
-    r = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=timeout, input=inp)
+    r = gitmemo.run(["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=timeout, input=inp)
     if r.returncode:
         raise RuntimeError(f"git {args[0]} failed: {(r.stderr or r.stdout).strip()[:300]}")
     return r.stdout
