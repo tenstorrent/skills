@@ -116,14 +116,15 @@ TTP_READS = READ_COMMANDS + (("paths",), ("list",), ("show",), ("quarantine", "l
                              ("task", "show"))   # the project may be left out: it is the one here
 SHELL_KEYWORDS = {"do", "then", "else", "elif", "if", "while", "until", "!", "{"}   # lead a command; `done`/`fi` end one
 PY_NAMES = re.compile(r"python(3(\.\d+)?)?")
-# python -c code that may write or run something else: any string literal that could be a write mode
-# ("w", "ab", "r+"; a false change is safe), a mode= or os.O_* write flag, subprocess, os calls that change files or
-# run commands, shutil, path methods that write, and anything that reaches code it cannot see
-PY_WRITES = re.compile(r"""['"][rbtU]*[wax+][rbt+]*['"]|\bmode\s*=|\bO_(WRONLY|RDWR|CREAT|APPEND|TRUNC)\b|\bsubprocess\b|\bshutil\b|\bos\s*\.\s*(open|system|popen|exec|spawn|"""
+# python -c code that may write or run something else (besides an open() whose mode is not a plain read
+# literal, _py_writes): an os.O_* write flag, subprocess, os calls that change files or run commands,
+# shutil, path methods that write, and anything that reaches code or names it cannot see
+PY_WRITES = re.compile(r"""\bO_(WRONLY|RDWR|CREAT|APPEND|TRUNC)\b|\b(setattr|delattr|vars|locals|FileIO)\b|"""
+                       r"""\b__\w+__\b|\bmodules\b|\bsubprocess\b|\bshutil\b|\bos\s*\.\s*(open|system|popen|exec|spawn|"""
                        r"""remove|unlink|rename|replace|rmdir|removedirs|mkdir|makedirs|chmod|chown|kill|killpg|truncate|"""
                        r"""symlink|link|write|fork|utime|setxattr)|\.(unlink|rename|write_text|write_bytes|mkdir|rmdir|"""
                        r"""touch|chmod|symlink_to|hardlink_to)\s*\(|\bfrom\s+(os|shutil|subprocess)\b|\b__import__\b|"""
-                       r"""\b(exec|eval|compile|getattr|globals|breakpoint)\s*\(|\b(importlib|ctypes|pty|socket|sqlite3|"""
+                       r"""\b(exec|eval|compile|getattr|globals|breakpoint)\b|\b(importlib|ctypes|pty|socket|sqlite3|"""
                        r"""urllib|http|requests|tempfile|pickle|signal|multiprocessing|threading|asyncio|ttp)\b""")
 LAUNCHCTL_READS = {"print", "list", "print-disabled", "blame", "version", "help"}
 SYSTEMCTL_READS = {"status", "show", "list-units", "list-timers", "list-unit-files", "is-active", "is-enabled",
@@ -210,13 +211,40 @@ def _unwrapped(simple: list[list[str]]) -> list[list[str]] | None:
     return out
 
 
+def _py_writes(code: str) -> bool:
+    """True when python `code` may write or run something: it does not parse, imports a module under
+    another name, calls open() (or a .open()) with a mode that is not a plain read literal or uses open
+    other than by calling it, or matches
+    PY_WRITES."""
+    import ast
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError):
+        return True
+    called = {id(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
+    for n in ast.walk(tree):
+        if (isinstance(n, ast.Name) and n.id == "open" or isinstance(n, ast.Attribute) and n.attr == "open") \
+                and id(n) not in called:
+            return True   # open passed around or renamed: its mode cannot be read
+        if isinstance(n, (ast.Import, ast.ImportFrom)) and any(a.asname for a in n.names):
+            return True
+        if isinstance(n, ast.Call) and (isinstance(n.func, ast.Name) and n.func.id == "open"
+                                        or isinstance(n.func, ast.Attribute) and n.func.attr == "open"):
+            pos = 0 if isinstance(n.func, ast.Attribute) else 1   # Path(x).open(mode), open(x, mode)
+            mode = n.args[pos] if len(n.args) > pos else next((k.value for k in n.keywords if k.arg in ("mode", None)), None)
+            if mode is not None and not (isinstance(mode, ast.Constant) and isinstance(mode.value, str)
+                                         and set(mode.value) <= set("rbtU")):
+                return True
+    return bool(PY_WRITES.search(code))
+
+
 def _python_reads(args: list[str]) -> bool:
     """`python3 [-I -S -E -B -s -u] -c CODE [args]` whose code opens nothing for writing and runs nothing
-    else (PY_WRITES); a script, a module or stdin counts as a change."""
+    else (_py_writes); a script, a module or stdin counts as a change."""
     k = 0
     while k < len(args) and args[k] in ("-I", "-S", "-E", "-B", "-s", "-u", "-O", "-OO", "-q"):
         k += 1
-    return k + 1 < len(args) and args[k] == "-c" and not PY_WRITES.search(args[k + 1])
+    return k + 1 < len(args) and args[k] == "-c" and not _py_writes(args[k + 1])
 
 
 def _git_reads(args: list[str]) -> bool:

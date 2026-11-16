@@ -782,7 +782,8 @@ SHELL_READS = ["head -5 a.txt", "cat a b", "ls -la x", "grep -n foo f.py", "sed 
                "ttp config --chat-settable coordinator.x", "ttp config p coordinator.chat_digest_h",
                "ttp detach --list", "ttp detach --check job1", "ttp obligation list", "ttp stats", "ttp deployed",
                "ttp --version", "python3 -c 'import json; print(json.load(open(\"a.json\"))[\"k\"])'",
-               "python3 -I -c 'print(1)'", "cat a.txt | head -3 2>/dev/null"]
+               "python3 -I -c 'print(1)'", "python3 -c \"print(open('a', 'rb').read())\"",
+               "cat a.txt | head -3 2>/dev/null"]
 SHELL_CHANGES = ["git worktree remove /w", "git -C /r worktree remove /w", "sed -i s/a/b/ f", "echo hi > f",
                  "cat a > b", "for f in a b; do echo $f > out; done", "for f in a b; do rm $f; done",
                  "echo $(rm x)", "echo $((1 + 2))", "echo `ls`", "for 1x in a; do ls; done",
@@ -794,7 +795,12 @@ SHELL_CHANGES = ["git worktree remove /w", "git -C /r worktree remove /w", "sed 
                  "python3 x.py", "python3 -m http.server", "python3 -c", "ttp task update 12 --status done",
                  "ttp task p update 12", "ttp config p coordinator.chat_digest_h 4", "ttp detach job -- sleep 1",
                  "ttp detach --stop job1", "ttp detach --check --remote h job1", "ttp schedules p run x",
-                 "ttp obligation progress o1 done", "git -C /r push", "frobnicate x"]
+                 "ttp obligation progress o1 done", "git -C /r push", "frobnicate x",
+                 # ways around the inline python check: a renamed module or open, a computed mode, reflection
+                 "python3 -c 'import os as o; o.remove(\"f\")'", "python3 -c \"open('f', chr(119))\"",
+                 "python3 -c 'f = open; f(\"f\", \"w\")'", "python3 -c \"g = getattr\"",
+                 "python3 -c \"import sys; sys.modules['os'].remove('f')\"", "python3 -c \"print(\"",
+                 "diff <(rm x) y", "case x in a) rm y;; esac"]
 
 
 @pytest.mark.parametrize("cmd,reads", [(c, True) for c in SHELL_READS] + [(c, False) for c in SHELL_CHANGES])
