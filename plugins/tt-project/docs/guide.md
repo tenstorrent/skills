@@ -1184,8 +1184,9 @@ over the account's. Every hour the last 7 days of each kind are compared: a kind
 Sonnet fails its first review more than 10 points more often than Opus, on at least 5 tasks each, and a
 one-sided exact binomial test puts the gap below `route.code_sonnet.alarm_p` (default 0.05; 0 never moves it).
 It returns to Sonnet at the next hourly check once the gap stops being significant. A daily guard compares, over the last 24 h, the first-review fail rate of code tasks whose worker ran
-Sonnet at high effort with those whose worker ran Opus at high effort (the model of the code worker's last
-run before the review). It needs at least 15 reviews on each side, else it says "not enough reviews to compare"
+Sonnet at high effort with those whose worker ran Opus at high effort (the model of the worker run that made the
+reviewed head commit, else of the task's costliest worker run before the review; never a wake, poll or light hop
+while a real worker run exists; the row says how many reviews were found by head commit and how many by costliest run). It needs at least 15 reviews on each side, else it says "not enough reviews to compare"
 and never trips; Sonnet at another effort, light hops and reviews no worker run traces stay out of the
 comparison and are reported on their own line (count and fails), and the prior days are context only. A
 Sonnet high rate more than `route.code_sonnet.guard_pts` points (default 5) over Opus high's moves every code

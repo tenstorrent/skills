@@ -970,6 +970,92 @@ def test_code_route_guard_splits_the_spend_per_landed_task_by_model_and_by_role(
         or "review fixes and continuations 0.67" in line
 
 
+def _attrib_task(p, tmp, now, runs, head="", verdict="done", n=0):
+    """One finished code task with worker `runs` ((model, effort, cost, minutes before the review, note,
+    commit its result.json names)) and one first review reviewing `head` (review_stats.head); returns the id."""
+    t = p.db.add_task("t", "", kind="code", tier="standard", priority=3, budget_usd=5.0)
+    p.db.x("UPDATE tasks SET status='done', updated=? WHERE id=?", (now - 3600, t))
+    for i, (model, effort, cost, mins, note, commit) in enumerate(runs):
+        d = tmp / f"run-{t}-{i}-{n}"
+        d.mkdir()
+        if commit is not None:
+            (d / "result.json").write_text(json.dumps({"commit": commit}))
+        p.db.x("INSERT INTO runs(task, role, provider, model, effort, started, ended, status, cost_usd, note, dir) "
+               "VALUES(?,?,?,?,?,?,?,?,?,?,?)", (t, "worker", "claude", model, effort, now - 3600 - mins * 60,
+                                                  now - 3600 - mins * 60 + 30, "done", cost, json.dumps(note or {}),
+                                                  str(d)))
+    r = p.db.add_task(f"Review #{t}", "", kind="review", tier="standard", priority=3, budget_usd=1.0)
+    p.db.x("UPDATE tasks SET status=?, labels=? WHERE id=?", (verdict, json.dumps([f"auto_review:{t}"]), r))
+    if head:
+        p.db.x("INSERT INTO review_stats(task, ts, head) VALUES(?,?,?)", (r, now - 3000, head))
+    return t
+
+
+def test_code_route_guard_counts_a_review_under_the_run_that_made_the_reviewed_head_commit(env, tmp_path):
+    from ttp import runclass
+    p = make(env)
+    now = time.time()
+    head = "ab12cd34" * 5
+    poll = {"wake": {"tier": "light"}}
+    # Opus high made the head commit; a cheaper Sonnet high poll ran later, just before the review.
+    _attrib_task(p, tmp_path, now, [("opus", "high", 3.0, 30, None, head), ("sonnet", "high", 0.1, 2, poll, None)],
+                 head=head, verdict="failed")
+    # Same shape with an abbreviated commit on the review side (prefix match).
+    _attrib_task(p, tmp_path, now, [("opus", "high", 1.0, 30, None, head[:12]), ("sonnet", "high", 0.1, 2, None, None)],
+                 head=head)
+    # The commit-making run is the cheaper one: head beats the costliest run.
+    _attrib_task(p, tmp_path, now, [("sonnet", "high", 0.5, 30, None, head), ("opus", "high", 4.0, 20, None, "f" * 40)],
+                 head=head)
+    day = runclass.guard_check(p.db, _GUARD_CFG, now)["day"]
+    assert (day["models"]["opus_high"]["reviewed"], day["models"]["opus_high"]["review_fails"]) == (2, 1)
+    assert day["models"]["sonnet_high"]["reviewed"] == 1 and day["excluded"]["light"]["reviewed"] == 0
+    assert day["attributed"] == {"head": 3, "costliest": 0}
+
+
+def test_code_route_guard_falls_back_to_the_costliest_run_when_no_commit_traces_and_never_picks_a_poll(env, tmp_path, monkeypatch):
+    from ttp import runclass
+    p = make(env)
+    now = time.time()
+    poll = {"wake": {"tier": "light"}}
+    # No result.json commit, no review_stats head: the costliest real run (Opus), not the last one (a Sonnet high poll).
+    _attrib_task(p, tmp_path, now, [("opus", "high", 2.0, 30, None, None), ("sonnet", "high", 0.2, 2, None, None)])
+    # A head the reviewer saw that no run made (or a malformed one): costliest again.
+    _attrib_task(p, tmp_path, now, [("opus", "high", 2.0, 30, None, "1" * 40), ("sonnet", "high", 0.2, 2, None, "not hex")],
+                 head="2" * 40, n=1)
+    # A wake/poll run is never chosen while a real worker run exists, even when it cost the most and named the head.
+    _attrib_task(p, tmp_path, now, [("opus", "high", 0.5, 30, None, None), ("sonnet", "high", 9.0, 2, poll, "3" * 40)],
+                 head="3" * 40, n=2)
+    # A poll run is picked only when it is the only run: light, not a model bucket.
+    _attrib_task(p, tmp_path, now, [("sonnet", "high", 0.2, 2, poll, None)], n=3)
+    # No worker run at all: untraced.
+    _attrib_task(p, tmp_path, now, [], head="4" * 40, n=4)
+    # A run with no folder recorded never reads a result.json from the working directory.
+    p.db.x("UPDATE runs SET dir=NULL WHERE task=(SELECT MAX(task) FROM runs)")
+    (tmp_path / "result.json").write_text(json.dumps({"commit": "3" * 40}))
+    monkeypatch.chdir(tmp_path)
+    assert runclass._run_commit({"dir": None}) == "" and runclass._run_commit({}) == ""
+    day = runclass.guard_check(p.db, _GUARD_CFG, now)["day"]
+    assert day["models"]["opus_high"]["reviewed"] == 3 and day["models"]["sonnet_high"]["reviewed"] == 0
+    assert day["excluded"]["light"]["reviewed"] == 1 and day["excluded"]["untraced"]["reviewed"] == 1
+    assert day["attributed"] == {"head": 0, "costliest": 4}
+
+
+def test_code_route_guard_report_says_how_many_reviews_were_found_by_head_commit_and_by_costliest_run(env, tmp_path):
+    from ttp import runclass
+    p = make(env)
+    now = time.time()
+    head = "5" * 40
+    _attrib_task(p, tmp_path, now, [("opus", "high", 1.0, 30, None, head)], head=head)
+    _attrib_task(p, tmp_path, now, [("opus", "high", 1.0, 30, None, None)], n=1)
+    _attrib_task(p, tmp_path, now, [("sonnet", "high", 1.0, 30, None, None)], n=2)
+    line = runclass.guard_line(runclass.guard_check(p.db, _GUARD_CFG, now))
+    assert "worker run found by head commit for 1 reviews, by costliest run for 2" in line
+    # A row stored before this attribution existed has no counts and prints no such line.
+    row = runclass.guard_check(p.db, _GUARD_CFG, now)
+    row["day"].pop("attributed")
+    assert "found by head commit" not in runclass.guard_line(row)
+
+
 def test_code_route_guard_trip_holds_code_on_opus_until_the_setting_changes_and_tells_the_coordinator_once(env, capsys):
     from ttp import cli, runclass
     from ttp.daemon import Daemon

@@ -63,7 +63,9 @@ account's value first, the project's own over it. The shipped share stays CODE_C
 
 Daily guard (guard_run, by the daemon next to the hourly code_quality): once a day while the code route is on,
 the code tasks finished in the last day (guard_day). Each reviewed one is attributed to the model and effort of
-the code worker's last run before its first review (auto_review:<id>). It trips only on a same-window
+the code worker run that made the commit the first review (auto_review:<id>) reviewed (the run folder's
+result.json `commit` against review_stats.head), else the task's costliest worker run before it; a wake, poll or other
+light hop is never picked while another run exists. It trips only on a same-window
 comparison: Sonnet at high effort against Opus at high effort, each with at least GUARD_MIN_REVIEWS first reviews
 that day, Sonnet's review-fail rate (failed or asked for changes) above Opus's by more than
 `route.code_sonnet.guard_pts` points (GUARD_PTS). Fewer on either side: "not enough reviews to compare", never
@@ -87,6 +89,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import time
 
@@ -150,6 +153,7 @@ GUARD_PRIOR_DAYS = 7
 GUARD_EVERY_S = 23 * 3600.0           # once a day, a little early so the hourly loop's drift never skips a day
 GUARD_KEEP = 90
 GUARD_MIN_REVIEWS = 15                # first reviews each of Sonnet high and Opus high needs before the guard compares them
+_HEX = re.compile(r"[0-9a-f]{7,40}")      # a commit id, as a hand-off or the review records it
 GUARD_COMPARED = ("sonnet_high", "opus_high")
 GUARD_BUCKETS = (*GUARD_COMPARED, "sonnet_other", "light", "untraced", "other")
 GUARD_LABELS = {"sonnet_other": "Sonnet below high", "light": "light hops", "untraced": "untraced (no worker run)",
@@ -688,20 +692,56 @@ def _family(model: str | None) -> str:
     return "sonnet" if "sonnet" in m else "opus" if "opus" in m else "other"
 
 
-def _bucket(runs: list[dict], task: dict) -> str:
-    """Where a reviewed code task's first review counts: the model and effort of the code worker's last run
-    before it, as GUARD_BUCKETS name them. `runs`: the task's worker runs started before the review, newest
-    first. No run: untraced. Sonnet at another effort than high comes before the light-hop check, so a
-    wake run that took Sonnet low shows as Sonnet low."""
+def _run_commit(run: dict) -> str:
+    """The commit the run's own hand-off (`result.json` in its run folder: `commit`, else `head`, else `sha`)
+    names, lowercase; '' when the folder or file is gone or names none."""
+    d = str(run.get("dir") or "")
+    if not d:
+        return ""
+    try:
+        with open(os.path.join(d, "result.json"), encoding="utf-8") as f:
+            res = json.load(f)
+    except (OSError, ValueError):
+        return ""
+    for k in ("commit", "head", "sha"):
+        v = str(res.get(k) or "").strip().lower() if isinstance(res, dict) else ""
+        if _HEX.fullmatch(v):
+            return v
+    return ""
+
+
+def _attribute(runs: list[dict], task: dict, head: str = "") -> tuple[dict | None, str]:
+    """The worker run a first review counts under, and how it was found: (run, "head") the earliest run whose
+    hand-off names the commit the review reviewed (`head`, review_stats.head: a prefix of at least 7 hex chars
+    on either side matches); else (run, "costliest") the run with the highest cost; (None, "") for no run.
+    `runs`: the task's worker runs started before the review. Cheap-class runs (wake, poll and other light
+    hops: classify in CHAT) are never picked while any other run exists; they are chosen among only when
+    they are all there is."""
     if not runs:
-        return "untraced"
-    last = runs[0]
+        return None, ""
+    pool = [r for r in runs if classify(task, r) not in CHAT] or runs
+    head = (head or "").strip().lower()
+    if _HEX.fullmatch(head):
+        for r in sorted(pool, key=lambda r: (float(r.get("started") or 0), r.get("id") or 0)):
+            c = _run_commit(r)
+            if c and (c.startswith(head) or head.startswith(c)):
+                return r, "head"
+    return max(pool, key=lambda r: (float(r.get("cost_usd") or 0), float(r.get("started") or 0), r.get("id") or 0)), "costliest"
+
+
+def _bucket(runs: list[dict], task: dict, head: str = "") -> tuple[str, str]:
+    """(bucket, how) where a reviewed code task's first review counts: the model and effort of the code worker
+    run _attribute picks, as GUARD_BUCKETS name them; how is "head", "costliest" or "" (no run: untraced).
+    Sonnet at another effort than high comes before the light-hop check, so a Sonnet low run shows as such."""
+    last, how = _attribute(runs, task, head)
+    if last is None:
+        return "untraced", ""
     fam, eff = _family(last.get("model")), str(last.get("effort") or "").strip().lower()
     if fam == "sonnet" and eff != "high":
-        return "sonnet_other"
+        return "sonnet_other", how
     if classify(task, last) in CHAT:
-        return "light"
-    return {"sonnet": "sonnet_high", "opus": "opus_high"}[fam] if fam != "other" and eff == "high" else "other"
+        return "light", how
+    return ({"sonnet": "sonnet_high", "opus": "opus_high"}[fam] if fam != "other" and eff == "high" else "other"), how
 
 
 def _split(tally: dict) -> dict:
@@ -715,12 +755,12 @@ def _per(d: dict, n: int) -> dict:
 
 def guard_day(db, since: float, until: float) -> dict:
     """Code tasks finished (done or failed) in [since, until): {"tasks", "reviewed", "review_fails", "fail_rate",
-    "landed", "hops", "hops_per_landed", "usd", "usd_per_landed", "models", "excluded", "usd_by_role",
-    "usd_by_model"}. Reviewed: a first review (the lowest auto_review:<id> review, done or failed) has its
-    verdict; failed means it asked for changes. `models` counts those first reviews by the code worker's last
-    run before them (_bucket): sonnet_high and opus_high, the only ones the guard compares, each {"reviewed",
+    "landed", "hops", "hops_per_landed", "usd", "usd_per_landed", "models", "excluded", "attributed",
+    "usd_by_role", "usd_by_model"}. Reviewed: a first review (the lowest auto_review:<id> review, done or failed)
+    has its verdict; failed means it asked for changes. `models` counts those first reviews by the code worker
+    run that made the reviewed commit, else the costliest one (_bucket; `attributed` counts each way): sonnet_high and opus_high, the only ones the guard compares, each {"reviewed",
     "review_fails", "fail_rate"}; `excluded` has the rest, never compared: sonnet_other (Sonnet at any effort
-    but high), light (the last run was a cheap-class hop), untraced (no worker run before the review) and
+    but high), light (the chosen run was a cheap-class hop, the only run there was), untraced (no worker run before the review) and
     other (another model or effort). Landed changes are the lineages (chaincap.chain, root first) of these
     tasks whose root landed (landed.recorded, which follows the hops that carry it on); hops are a lineage's
     review fixes and continuations. Its $ is every run of its tasks and of the reviews, device A/B and shadow
@@ -732,6 +772,7 @@ def guard_day(db, since: float, until: float) -> dict:
     by_id = {t["id"]: t for t in tasks}
     first: dict = {}
     first_at: dict = {}
+    first_rid: dict = {}
     linked: dict = {}   # review-kind task id -> (the code task it names, its GUARD_ROLES role)
     if by_id:
         for r in db.q("SELECT id, status, labels, created FROM tasks WHERE kind='review' ORDER BY id"):
@@ -748,11 +789,23 @@ def guard_day(db, since: float, until: float) -> dict:
                         and int(num) not in first:
                     first[int(num)] = r["status"]
                     first_at[int(num)] = float(r["created"] or "inf")
+                    first_rid[int(num)] = r["id"]
     buckets = {b: {"reviewed": 0, "review_fails": 0} for b in GUARD_BUCKETS}
+    how_n = {"head": 0, "costliest": 0}
     for tid, verdict in first.items():
-        runs = [dict(r) for r in db.q("SELECT model, effort, note FROM runs WHERE task=? AND role='worker' AND "
-                                      "started<? ORDER BY started DESC, id DESC", (tid, first_at[tid]))]
-        b = buckets[_bucket(runs, by_id[tid])]
+        runs = [dict(r) for r in db.q("SELECT id, model, effort, note, dir, started, cost_usd FROM runs WHERE task=? "
+                                      "AND role='worker' AND started<? ORDER BY started DESC, id DESC",
+                                      (tid, first_at[tid]))]
+        rs = db.one("SELECT head FROM review_stats WHERE task=?", (first_rid[tid],))
+        reviewed_head = (rs["head"] if rs else "") or ""
+        if not reviewed_head:
+            q = db.one("SELECT head FROM push_queue WHERE task=? AND head IS NOT NULL AND head != '' "
+                       "ORDER BY id DESC LIMIT 1", (first_rid[tid],))
+            reviewed_head = (q["head"] if q else "") or ""
+        name, how = _bucket(runs, by_id[tid], reviewed_head)
+        b = buckets[name]
+        if how:
+            how_n[how] += 1
         b["reviewed"] += 1
         b["review_fails"] += verdict == "failed"
     lines: dict = {}
@@ -790,6 +843,7 @@ def guard_day(db, since: float, until: float) -> dict:
     fails = sum(b["review_fails"] for b in buckets.values())
     return {"tasks": len(tasks), "reviewed": reviewed, "review_fails": fails,
             "fail_rate": round(fails / reviewed, 4) if reviewed else None,
+            "attributed": how_n,
             "models": {b: _split(buckets[b]) for b in GUARD_COMPARED},
             "excluded": {b: _split(v) for b, v in buckets.items() if b not in GUARD_COMPARED},
             "landed": n, "hops": hops, "hops_per_landed": round(hops / n, 2) if n else None,
@@ -871,6 +925,10 @@ def guard_lines(row: dict) -> list[str]:
     out.append(f"rework hops per landed change {'n/a' if hops is None else format(hops, 'g')}; $ per landed code task "
                f"{'n/a' if d.get('usd_per_landed') is None else format(d['usd_per_landed'], '.2f')} "
                f"({d['landed']} landed)")
+    if d.get("attributed") is not None:
+        a = d["attributed"]
+        out.append(f"worker run found by head commit for {a.get('head', 0)} reviews, by costliest run for "
+                   f"{a.get('costliest', 0)}")
     out.append("$ per landed by worker model: " + _usd(d.get("usd_by_model")))
     out.append("$ per landed by role: " + _usd({GUARD_ROLES.get(k, k): v for k, v in (d.get("usd_by_role") or {}).items()}))
     return out
