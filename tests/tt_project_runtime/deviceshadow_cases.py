@@ -48,13 +48,14 @@ def test_device_shadow_starts_each_arm_once_with_no_lock_resource_or_ab_label(en
     cfg = _shadow_cfg(p)
     tid = _dab_task(p)
     task = p.db.task(tid)
-    calls = []
+    calls, real = [], subprocess.Popen
 
-    class Fake:
-        def __init__(self, argv, **kw):
-            calls.append((argv, kw))
+    def fake(argv, **kw):   # the arm runners are recorded, the git calls pinning the code run
+        if "device-shadow" not in argv:
+            return real(argv, **kw)
+        calls.append((argv, kw))
 
-    monkeypatch.setattr(subprocess, "Popen", Fake)
+    monkeypatch.setattr(subprocess, "Popen", fake)
     labels, locks = p.db.task(tid)["labels"], p.db.q("SELECT * FROM kv WHERE key LIKE '%lock%'")
     assert deviceshadow.start(p, task, cfg) == ["glm", "sonnet-h", "opus-h"]
     assert deviceshadow.start(p, task, cfg) == [], "once per task and arm"
@@ -315,3 +316,91 @@ def test_device_shadow_claude_arm_on_mini_swe_agent_is_allowed_and_records_how_i
     got = deviceshadow.run(p, tid, "sonnet-h")
     assert got["status"] == "done" and got["called"] == "claude 9.9 --system-prompt <prompt>", got
     assert seen["arm"]["provider"] == "claude" and seen["arm"]["harness"] == "mini-swe-agent"
+
+
+def _git_repo(path, text):
+    import subprocess
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "f.txt").write_text(text)
+    for args in (["init", "-q", "-b", "main"], ["add", "."], ["-c", "user.name=a", "-c", "user.email=a@b", "commit",
+                                                              "-q", "-m", text]):
+        subprocess.run(["git", "-C", str(path), *args], check=True, capture_output=True)
+    return subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"], check=True, capture_output=True,
+                          text=True).stdout.strip()
+
+
+def test_device_shadow_code_copy_holds_the_repo_files_at_the_tasks_pinned_sha_for_every_arm(env, tmp_path,
+                                                                                           monkeypatch):
+    import subprocess
+    from ttp import deviceshadow
+    # The project repo: pinned once, every arm's copy holds that commit's tree even after the repo moves on.
+    repo = tmp_path / "repo"
+    sha = _git_repo(repo, "v1")
+    pins = deviceshadow.code_pins(repo, "nope")
+    assert pins == [["", sha]]
+    _git_repo(repo, "v2")
+    for arm in ("glm", "sonnet-h", "opus-h"):
+        assert deviceshadow.snapshot_code(repo, "HEAD", tmp_path / arm, 5, pins) == ""
+        assert (tmp_path / arm / "f.txt").read_text() == "v1"
+    # A project root that is not a repo: each repo one level under it at its HEAD, never the harness folder,
+    # hidden folders or plain folders.
+    root = tmp_path / "ops"
+    a_sha = _git_repo(root / "tools", "tool")
+    _git_repo(root / "tt-project", "harness")
+    _git_repo(root / ".hidden", "hidden")
+    (root / "plain").mkdir()
+    (root / "tt-project" / "state").mkdir()
+    pins = deviceshadow.code_pins(root, "HEAD", (root / "tt-project" / "state",))
+    assert pins == [["tools", a_sha]]
+    assert deviceshadow.snapshot_code(root, "HEAD", tmp_path / "ops-code", 5, pins) == ""
+    assert (tmp_path / "ops-code" / "tools" / "f.txt").read_text() == "tool"
+    assert sorted(x.name for x in (tmp_path / "ops-code").iterdir()) == ["tools"]
+    # start() pins the code once and every arm's record carries the same pins.
+    p = make(env)
+    real = subprocess.Popen
+    monkeypatch.setattr(subprocess, "Popen", lambda argv, **k: None if "device-shadow" in argv else real(argv, **k))
+    tid = _dab_task(p)
+    assert len(deviceshadow.start(p, p.db.task(tid), _shadow_cfg(p))) == 3
+    got = {str(rec.get("code")) for rec in deviceshadow.shadows(p.db.q).values()}
+    assert len(got) == 1 and "None" not in got
+
+
+def test_device_shadow_empty_code_copy_is_retried_then_a_recorded_skip_not_a_run(env, monkeypatch, tmp_path):
+    from ttp import benchrun, deviceshadow
+    monkeypatch.setattr(deviceshadow, "COPY_RETRY_S", 0)
+    calls = []
+
+    def empty(root, ref, dest, cap_mb, pins=None):
+        calls.append(dest)
+        dest.mkdir(parents=True, exist_ok=True)
+        return "git archive of the project repo at abc failed; no code copy"
+    monkeypatch.setattr(deviceshadow, "snapshot_code", empty)
+
+    def launch(*a, **k):
+        raise AssertionError("an arm ran on an empty code copy")
+    monkeypatch.setattr(benchrun, "launch", launch)
+    monkeypatch.setattr(benchrun, "isolate", launch)
+    p = make(env)
+    cfg = _shadow_cfg(p)
+    p.config = lambda: cfg
+    tid = _dab_task(p)
+    got = deviceshadow.run(p, tid, "glm")
+    assert got["status"] == "skipped" and len(calls) == 2, got
+    assert "empty after a retry" in got["error"] and "git archive of the project repo" in got["error"]
+    p.db.x("UPDATE tasks SET status='done' WHERE id=?", (tid,))
+    assert deviceshadow.queue_reviews(p.db) == [], "a skip is never reviewed"
+    r = deviceshadow.report(p.db.q)
+    assert r["arms"]["glm"]["skipped"] == 1 and r["arms"]["glm"]["done"] == 0
+    text = "\n".join(deviceshadow.report_text(r))
+    assert "skipped 1" in text and f"skipped #{tid}: no arm run: the code copy is empty" in text
+    # A retry that finds the files runs on.
+    calls.clear()
+
+    def second_time(root, ref, dest, cap_mb, pins=None):
+        calls.append(dest)
+        dest.mkdir(parents=True, exist_ok=True)
+        if len(calls) == 2:
+            (dest / "f.txt").write_text("x")
+        return ""
+    monkeypatch.setattr(deviceshadow, "snapshot_code", second_time)
+    assert deviceshadow.copy_code(tmp_path, "HEAD", tmp_path / "code", 5, None) == (True, "") and len(calls) == 2

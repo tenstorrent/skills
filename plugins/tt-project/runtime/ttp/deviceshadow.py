@@ -11,9 +11,12 @@ Every arm gets the identical setup: the same sealed read-only copy, the same spe
 no ssh, lock, broker or resource, the same time limit and budget, the same blind review. For each device task
 the live device A/B takes in (deviceab.assign returned a note: either arm, its projects) one shadow run per arm
 starts at the live dispatch, once per task and arm (the kv record `device_shadow:<task id>:<arm>` is the mark).
-It gets the task's title and spec and a read-only copy of the code (git archive of the base ref) and of the
-project's state and logs as of dispatch, and writes a hand-off: the ordered commands it would run, each with its
-purpose, and its conclusion. Nothing of it goes to the live task or its worker.
+It gets the task's title and spec and a read-only copy of the code and of the project's state and logs as of
+dispatch. The code is git archive of commits pinned once at dispatch and recorded as `code`, so every arm reads
+the same tree: the base ref of the project repo, or, for a project root that is not a repo, each git repo one
+level under it at its HEAD. A copy that holds no file is tried once more; still empty, the arm does not run and
+its record says `skipped` with the reason, which the report shows. Each run writes a hand-off: the ordered
+commands it would run, each with its purpose, and its conclusion. Nothing of it goes to the live task or its worker.
 
 Read only by construction, not by prompt: the agent runs in the bench's mount namespace (cellns.py): the project,
 its state folder, the runtime and the real home are not there; the code and state copies are bound read-only;
@@ -55,6 +58,7 @@ REVIEW_LABEL = "device_shadow_review:"    # on the blind review task: device_sha
 REVIEW2_LABEL = "device_shadow_review2:"  # on the second reviewer's task, same form
 ANSWER = re.compile(r'"device_shadow_scores"\s*:\s*\{.*\}', re.S)
 HANDOFF_MAX = 60_000
+COPY_RETRY_S = 5                          # the wait before an empty code copy is tried again
 STATE_TASKS, STATE_EVENTS, STATE_RUNS, STATE_LOGS, LOG_TAIL = 150, 400, 60, 30, 200_000
 DENIED = ("ssh", "scp", "sftp", "rsync", "ttp", "sudo", "su", "doas", "gh", "curl", "wget", "nc", "ncat",
           "netcat", "socat", "telnet", "ftp", "docker", "podman", "kubectl", "systemctl", "reboot", "shutdown",
@@ -137,27 +141,88 @@ def _tar_into(data: bytes, dest: Path) -> int:
     return n
 
 
-def snapshot_code(root: Path, ref: str, dest: Path, cap_mb: float) -> str:
-    """A copy of the code at `ref` (git archive) in `dest`; "" when it was made, else why it was not."""
-    dest.mkdir(parents=True, exist_ok=True)
-    cap = int(cap_mb * 1024 * 1024)
+def _commit(repo: Path, ref: str) -> str:
+    """The commit `ref` names in `repo`, or ""."""
     try:
-        if subprocess.run(["git", "-C", str(root), "rev-parse", "--verify", "-q", f"{ref}^{{commit}}"],
-                          capture_output=True, timeout=30).returncode:
-            ref = "HEAD"
-        proc = subprocess.Popen(["git", "-C", str(root), "archive", "--format=tar", ref], stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
-        data = proc.stdout.read(cap + 1) if proc.stdout else b""
-        if len(data) > cap:
-            proc.kill()
-            proc.wait()
-            return f"the code is over {cap_mb:g} MB: no code copy"
-        if proc.wait() or not data:
-            return "git archive failed: no code copy"
-        _tar_into(data, dest)
-    except (OSError, subprocess.SubprocessError, tarfile.TarError) as e:
-        return f"no code copy: {type(e).__name__}"
-    return ""
+        r = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "-q", f"{ref}^{{commit}}"],
+                           capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return "" if r.returncode else r.stdout.strip()
+
+
+def code_pins(root: Path, ref: str = "HEAD", skip: tuple[Path, ...] = ()) -> list[list[str]]:
+    """What a shadow's code copy holds, as [folder in the copy, commit] pairs, pinned once per task so every arm
+    reads the same tree: the project repo at `ref` (HEAD when `ref` names no commit), or, when the project root is
+    not in a git repo, each git repo one level under it at its HEAD (hidden folders and those holding a `skip`
+    path, such as the harness folder, left out). Empty when there is no repo to copy."""
+    root = Path(root)
+    try:
+        inside = subprocess.run(["git", "-C", str(root), "rev-parse", "--is-inside-work-tree"], capture_output=True,
+                                text=True, timeout=30, stdin=subprocess.DEVNULL).stdout.strip() == "true"
+    except (OSError, subprocess.SubprocessError):
+        inside = False
+    if inside:
+        sha = _commit(root, ref) or _commit(root, "HEAD")
+        return [["", sha]] if sha else []
+    skip = tuple(Path(x).resolve() for x in skip)
+    out = []
+    try:
+        kids = sorted(x for x in root.iterdir() if x.is_dir() and not x.name.startswith("."))
+    except OSError:
+        return []
+    for kid in kids:
+        k = kid.resolve()
+        if any(k == x or k in x.parents for x in skip) or not (kid / ".git").exists():
+            continue
+        if sha := _commit(kid, "HEAD"):
+            out.append([kid.name, sha])
+    return out
+
+
+def snapshot_code(root: Path, ref: str, dest: Path, cap_mb: float, pins: list | None = None) -> str:
+    """Copy the code `pins` name (code_pins(root, ref) when None) into `dest` with git archive, within `cap_mb`;
+    returns a note on what was left out ("" when all of it was copied), ending "no code copy" when nothing was."""
+    dest.mkdir(parents=True, exist_ok=True)
+    pins = code_pins(root, ref) if pins is None else pins
+    if not pins:
+        return "no git repo at the project root or one level under it: no code copy"
+    cap, used, files, notes = int(cap_mb * 1024 * 1024), 0, 0, []
+    for sub, sha in pins:
+        where = f"{sub}/" if sub else "the project repo"
+        try:
+            proc = subprocess.Popen(["git", "-C", str(Path(root) / sub), "archive", "--format=tar", sha],
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+            data = proc.stdout.read(cap - used + 1) if proc.stdout else b""
+            if len(data) > cap - used:
+                proc.kill()
+                proc.wait()
+                notes.append(f"{where} is over the {cap_mb:g} MB code cap: left out")
+                continue
+            if proc.wait() or not data:
+                notes.append(f"git archive of {where} at {sha[:12]} failed")
+                continue
+            files += _tar_into(data, dest / sub if sub else dest)
+            used += len(data)
+        except (OSError, subprocess.SubprocessError, tarfile.TarError) as e:
+            notes.append(f"copying {where} failed: {type(e).__name__}")
+    if not files:
+        notes.append("no code copy")
+    return "; ".join(notes)
+
+
+def copy_code(root: Path, ref: str, dest: Path, cap_mb: float, pins: list | None) -> tuple[bool, str]:
+    """snapshot_code, tried once more after COPY_RETRY_S when the copy holds no file (a fresh code_pins on the
+    retry when none were pinned); returns (whether it holds files, the note)."""
+    note = ""
+    for attempt in range(2):
+        if attempt:
+            time.sleep(COPY_RETRY_S)
+            shutil.rmtree(dest, ignore_errors=True)
+        note = snapshot_code(root, ref, dest, cap_mb, pins or None)
+        if dest.is_dir() and any(f.is_file() for f in dest.rglob("*")):
+            return True, note
+    return False, note
 
 
 def _jsonl(path: Path, rows: list[dict], paths: dict[str, str]) -> None:
@@ -236,14 +301,20 @@ def start(p, task: dict, cfg: dict | None = None) -> list[str]:
     and arm. Never raises into the dispatch. Returns the arms started."""
     cfg = cfg if cfg is not None else p.config()
     s = settings(cfg)
-    started = []
+    started, pins = [], None
     for arm, a in (s or {}).get("arms", {}).items():
         if deviceab._kv(p.db, f"{KV_PREFIX}{task['id']}:{arm}"):
             continue
+        if pins is None:   # the code every arm copies, pinned once for the task (each arm's run retries a miss)
+            try:
+                pins = code_pins(Path(p.root), (cfg.get("delivery") or {}).get("base_ref") or "HEAD",
+                                 (Path(p.state),))
+            except Exception:   # never into the dispatch
+                pins = []
         log = Path(p.state) / "device-shadow" / str(task["id"]) / arm
         log.mkdir(parents=True, exist_ok=True)
         record(p.db, task["id"], arm, status="starting", started=time.time(), model=f"{a['model']}:{a['effort']}",
-               harness=a["harness"], dir=str(log), limits=list(LIMITS))
+               harness=a["harness"], dir=str(log), limits=list(LIMITS), code=pins)
         env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parent.parent) + os.pathsep
                + os.environ.get("PYTHONPATH", "")}
         with open(log / "run.log", "ab") as lf:
@@ -274,8 +345,11 @@ def run(p, task_id: int, arm_name: str) -> dict:
         ro, ws = tmp / "ro", tmp / "work"
         paths = {str(Path(p.root).resolve()): str(ro / "code"), str(Path(p.state).resolve()): str(ro / "state"),
                  str(Path.home()): "~"}
-        note = snapshot_code(Path(p.root), (cfg.get("delivery") or {}).get("base_ref") or "HEAD", ro / "code",
-                             s["code_mb"])
+        ok, note = copy_code(Path(p.root), (cfg.get("delivery") or {}).get("base_ref") or "HEAD", ro / "code",
+                             s["code_mb"], deviceab._kv(p.db, f"{KV_PREFIX}{task_id}:{arm_name}").get("code"))
+        if not ok:   # never run an arm on an empty copy: the skip and its reason are recorded and reported
+            return record(p.db, task_id, arm_name, status="skipped", ended=time.time(), minutes=0.0,
+                          error=f"no arm run: the code copy is empty after a retry ({note})"[:400])
         snapshot_state(p, int(task_id), ro / "state", paths)
         ws.mkdir()
         for args in (["init", "-q", "-b", "main"], ["-c", "user.name=shadow", "-c", "user.email=shadow@localhost",
@@ -422,7 +496,8 @@ def _rank(by_arm: dict[str, dict]) -> list[str]:
 
 
 def report(q: Callable[..., list[dict]]) -> dict | None:
-    """The shadow section of the A/B report, per arm: tasks shadowed, done, failed, reviewed, mean agreement
+    """The shadow section of the A/B report, per arm: tasks shadowed, done, failed, skipped (with each skip's task
+    and reason), reviewed, mean agreement
     (first reviewer, and the second when there is one), agreements of 4 or more, harmful steps (count and task
     ids), minutes and spend, how it was called; the review spend; each reviewer's ranking of the arms and whether
     they differ. None when no shadow has run."""
@@ -443,11 +518,14 @@ def report(q: Callable[..., list[dict]]) -> dict | None:
                         scores[which][(int(tid), arm)] = sc
     arms: dict[str, dict] = {}
     for (tid, arm), rec in recs.items():
-        a = arms.setdefault(arm, {"shadowed": 0, "done": 0, "failed": 0, "minutes": 0.0, "usd": 0.0, "called": "",
-                                  "model": rec.get("model") or ""})
+        a = arms.setdefault(arm, {"shadowed": 0, "done": 0, "failed": 0, "skipped": 0, "skips": [], "minutes": 0.0,
+                                  "usd": 0.0, "called": "", "model": rec.get("model") or ""})
         a["shadowed"] += 1
         a["done"] += rec.get("status") == "done"
         a["failed"] += rec.get("status") == "error"
+        if rec.get("status") == "skipped":
+            a["skipped"] += 1
+            a["skips"].append([tid, str(rec.get("error") or "")])
         a["minutes"] += float(rec.get("minutes") or 0)
         a["usd"] += float(rec.get("usd") or 0)
         a["called"] = a["called"] or str(rec.get("called") or "")
@@ -475,11 +553,13 @@ def report_text(r: dict | None) -> list[str]:
         ag = "-" if a["agreement"] is None else f"{a['agreement']}/5 (n={a['reviewed']})"
         ag2 = "" if a["agreement2"] is None else f", second reviewer {a['agreement2']}/5 (n={a['reviewed2']})"
         ids = ", ".join(f"#{t}" for t in a["harmful_tasks"]) or "none"
-        out.append(f"    {arm:14} {a['model']}: shadowed {a['shadowed']} (done {a['done']}, failed {a['failed']}), "
+        out.append(f"    {arm:14} {a['model']}: shadowed {a['shadowed']} (done {a['done']}, failed {a['failed']}, skipped {a['skipped']}), "
                    f"agreement {ag}{ag2}, agrees 4+ {a['agrees_4_plus']}, harmful steps {a['harmful_steps']} "
                    f"(tasks: {ids}), {a['minutes']} min, ${a['usd']}")
         if a["called"]:
             out.append(f"      called: {a['called']}")
+        for tid, why in a["skips"][-3:]:
+            out.append(f"      skipped #{tid}: {why}")
     if r["ranking_second"]:
         out.append(f"    ranking: {' > '.join(r['ranking'])}; second reviewer: {' > '.join(r['ranking_second'])}; "
                    + ("the ranking differs" if r["ranking_differs"] else "the same ranking"))
