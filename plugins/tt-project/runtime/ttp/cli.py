@@ -4048,11 +4048,23 @@ def cmd_checks(a) -> None:
     # its arrival, its kept wait); none of it outlives the call, or a later call in this process would
     # resume from another run's passed files or log its wait as cut.
     own = [k for k in (*checkcap.RUN_ONLY_ENV, checkcap.ARRIVED_ENV, _WAIT_KEPT_ENV) if k not in os.environ]
+    rc: int | str = "killed"   # however this call ends, the checks.running it wrote is finish-marked
     try:
         _cmd_checks(a)
+        rc = 0
+    except SystemExit as e:
+        stopped = isinstance(e, ChecksKilled) or (e.code and e.code == _CHECK_STOP.get("stopped"))
+        rc = "killed" if stopped else (e.code if isinstance(e.code, int) else 0 if e.code is None else 1)
+        if stopped and not getattr(a, "own_group", False) and os.environ.get("TTP_RUN_DIR") and not a.result:
+            print("ttp checks: stopped before they finished, so they say nothing: run `ttp checks --detach` "
+                  "and wait with `ttp checks --result <run dir>` (a foreground run ends with its tool call)",
+                  file=sys.stderr, flush=True)
+        raise
     finally:
         for k in own:
             os.environ.pop(k, None)
+        if (rd := os.environ.get("TTP_RUN_DIR")) and not a.result:
+            _checks_running_end(Path(rd), rc)
 
 
 def _cmd_checks(a) -> None:
@@ -4624,7 +4636,10 @@ def _cmd_checks(a) -> None:
             checkjoin.update(join_rec, phase=checkjoin.RUNNING, run_since=time.time())
         if todo and not hit and not handover:
             try:   # the checks run on a host now, past every queue (daemon.precheck_holds)
-                write_json(Path(run_dir) / CHECKS_RUNNING, {"since": time.time(), "pid": os.getpid()})
+                from .runner import boot_id, proc_start
+                write_json(Path(run_dir) / CHECKS_RUNNING, {
+                    "since": time.time(), "pid": os.getpid(), "started": proc_start(os.getpid()),
+                    "boot": boot_id(), "pidns": push.pid_ns(), "detached": bool(getattr(a, "own_group", False))})
             except OSError:
                 pass
         child_env = {"PWD": top, **venv_vars, **(slot.env() if slot else {})}
@@ -5525,7 +5540,10 @@ CHECKS_HANDOVER = ("every host-wide checks slot stayed busy, so they did not run
                    "detached instead, in the same place in the queue (exit 75): hand off waiting with the "
                    "retry_when above")
 CHECKS_SLOT_WAIT = "checks-slot.wait"   # in the run's directory while its checks wait for a host-wide slot
-CHECKS_RUNNING = "checks.running"   # in the run's directory once its checks run on a host ({since, pid})
+CHECKS_RUNNING = "checks.running"   # in the run's directory once its checks run on a host ({since, pid,
+#   started, boot, pidns, detached}); the process that wrote it adds {ended, rc} however it ends
+#   (_checks_running_end), and `ttp checks --result` reads one whose process is gone as ended incomplete.
+#   A wait names `ttp checks --result <run dir>`, never this file (a hand-off's retry_when doing so is refused).
 # The daemon's request that the run's checks stop waiting for a slot ({pid, started}): their task ended
 # (Daemon.reap_waiting_checks). Only a waiter with that pid and start time honours it, and only while it waits.
 CHECKS_SLOT_CANCEL = "checks-slot.cancel"
@@ -7595,12 +7613,76 @@ def _checks_release_excused(run_dir: Path) -> str:
     return ""
 
 
+def _checks_running_end(run_dir: Path, rc) -> None:
+    """Finish-mark `run_dir`'s checks.running ({ended, rc}) when this process wrote it and has not yet:
+    a waiting task's probe then reads the end, never a marker left behind. Kept, not removed: `since`
+    dates the run for ttp stats (throughput.precheck_hold)."""
+    path = run_dir / CHECKS_RUNNING
+    try:
+        info = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return
+    if not isinstance(info, dict) or info.get("pid") != os.getpid() or "ended" in info:
+        return
+    try:
+        write_json(path, {**info, "ended": time.time(), "rc": rc})
+    except OSError:
+        pass
+
+
+def _checks_foreground(run_dir: Path, info: dict) -> int | None:
+    """`ttp checks --result` for a foreground run's checks (checks.running written by a process other
+    than the detached checks recorded in `info`, and newer than them): 1 while that process still runs;
+    0 once it ended, with its exit code, or as ended incomplete when it died without saying so (its pid
+    gone or reused, an earlier boot), which it then records. None: no foreground run to read."""
+    try:
+        fg = json.loads((run_dir / CHECKS_RUNNING).read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(fg, dict) or not isinstance(fg.get("pid"), int) or fg.get("detached"):
+        return None
+    if info and (fg["pid"] == info.get("pid") or float(fg.get("since") or 0) < float(info.get("ts") or 0)):
+        return None   # the detached run's own marker, or one older than it: the detached record answers
+    try:
+        if (run_dir / CHECKS_RC).stat().st_mtime >= float(fg.get("since") or 0):
+            return None   # an exit code written since it started answers, with its details
+    except OSError:
+        pass
+    rerun = "they did not finish, so run `ttp checks --detach` and wait with `ttp checks --result <run dir>`"
+    if "ended" in fg:
+        if fg.get("rc") == 0:
+            print("ttp checks: the foreground checks finished with exit code 0")
+        elif fg.get("rc") == "killed":
+            print(f"ttp checks: incomplete: the foreground checks (pid {fg['pid']}) were stopped; {rerun}")
+        else:
+            print(f"ttp checks: the foreground checks finished with exit code {fg.get('rc')}")
+        return 0
+    if not _checks_old_boot(fg) and _checks_elsewhere(fg):
+        print(f"ttp checks: running in the foreground outside this sandbox (pid {fg['pid']}); running unless "
+              "the daemon's probe finds otherwise")
+        return 1
+    if not _checks_old_boot(fg) and (_checks_alive(fg) if fg.get("started") else _pid_alive(fg["pid"])):
+        print(f"ttp checks: running in the foreground (pid {fg['pid']})")
+        return 1
+    try:
+        write_json(run_dir / CHECKS_RUNNING, {**fg, "ended": time.time(), "rc": "killed"})
+    except OSError:
+        pass
+    print(f"ttp checks: incomplete: the foreground checks (pid {fg['pid']}) ended without a result "
+          f"(their process is gone); {rerun}")
+    return 0
+
+
 def _checks_result(run_dir: Path) -> int:
-    """`retry_when` probe of detached checks: 0 once checks.rc exists or the checks died without
-    writing it (it then writes `killed` there), 1 while they run."""
+    """`retry_when` probe of the run's checks, detached or foreground: 0 once checks.rc exists or the
+    checks died without writing it (it then writes `killed` there), or a foreground run ended
+    (_checks_foreground); 1 while they run."""
     rc_file = run_dir / CHECKS_RC
     from . import detach, envfault
     _checks_tmp_cleanup(run_dir)
+    if not detach.pending(rc_file) and not detach.lost(rc_file).exists() \
+            and (fg := _checks_foreground(run_dir, _read_checks_pid(run_dir))) is not None:
+        return fg
     if detach.pending(rc_file):
         print("ttp checks: queued for the daemon, which starts them outside the sandbox")
         return 1

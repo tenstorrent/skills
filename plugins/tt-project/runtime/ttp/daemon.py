@@ -459,6 +459,16 @@ def precheck_hold_s(state: Path, now: float | None = None) -> float:
     return min(PRECHECK_HOLD_S, statistics.median(runs)) if runs else PRECHECK_HOLD_S
 
 
+CHECKS_MARKER_RE = re.compile(r"checks[^\s/=;|&]{0,4}runn|CHECKS_RUNNING")
+
+
+def checks_marker_probe(probe: str) -> str:
+    """The checks-running marker a probe names directly (cli.CHECKS_RUNNING, a glob or quoting of it),
+    or "": a wait on it never ends once a killed run leaves it; `ttp checks --result` is the probe."""
+    m = CHECKS_MARKER_RE.search(probe or "")
+    return m.group(0) if m else ""
+
+
 def precheck_holds(state: Path, task: dict, now: float, db=None) -> bool:
     """Review `task` waits for the checks the daemon started on its head (Daemon._precheck) only while
     they run on a host (cli.CHECKS_RUNNING, written once they left every queue), never while they wait
@@ -8209,6 +8219,17 @@ class Daemon:
             db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                  (time.time(), f"task:{task['id']}", "handoff_probe_refused", "normal", text, "queued", task["id"]))
             log(self.p, f"task {task['id']} hand-off: retry_when {bad} refused: no shell command")
+        if rstatus == "waiting" and isinstance(result.get("retry_when"), str) \
+                and (named := checks_marker_probe(result["retry_when"])):
+            # The marker outlives a killed run (its process is gone, the file stays): the task would never wake.
+            refused = result["retry_when"][:200]
+            result = {**{k: v for k, v in result.items() if k != "retry_when"}, "retry_when_refused": refused}
+            db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                 (time.time(), f"task:{task['id']}", "handoff_probe_refused", "normal",
+                  f"#{task['id']} {task['title']}: its waiting hand-off's retry_when names the checks.running marker directly ({named!r}), which "
+                  f"a killed run leaves behind, so it was not stored; wait on `ttp checks --result <run dir>` "
+                  f"instead (detached or foreground checks); the task wakes at its retry timer", "queued", task["id"]))
+            log(self.p, f"task {task['id']} hand-off: retry_when refused: names {named}: {refused}")
         if rstatus == "waiting" and isinstance(result.get("on_pass_cmd"), str) and not result["on_pass_cmd"].strip():
             # An empty on_pass_cmd names none (as `ttp task set-when --on-pass-cmd ""` does): dropped, so a
             # passed probe records its on_pass (or wakes it), never stops on "on_pass_cmd is not a command".

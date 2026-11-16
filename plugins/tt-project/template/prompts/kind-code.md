@@ -13,7 +13,9 @@
   run `ttp checks --detach -- <cmds>`: its output and exit code go to the run dir, never
   the worktree. Hand off `waiting` with the `retry_when` it prints (`ttp checks --result <run dir>`)
   and no `wake_tier`; failed checks wake you;
-  that probe also wakes the task if the checks were killed. If only recording the result is
+  that probe also wakes the task if the checks were killed. A foreground `ttp checks` ends with its
+  tool call and then reports incomplete: wait only on `ttp checks --result <run dir>`, never on run-dir
+  files such as checks.running (refused). If only recording the result is
   left, put it in `on_pass` (`"on_pass": {"status": "done", "summary": "..."}`): a pass on the
   same head records it model-free. No `on_pass`, `next_step`, PR or landing left: a pass records `done`.
 - While you iterate, run only the tests your change affects (a file, `pytest -k`, `file::test`),
