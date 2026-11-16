@@ -38,6 +38,7 @@ from pathlib import Path
 
 from . import runtimeload   # first of its own: its LOADED_AT is when the daemon imported its code
 from . import blindreview
+from . import rolerestore
 from . import deviceab
 from . import deviceshadow
 from . import batchrun
@@ -4133,6 +4134,11 @@ class Daemon:
                                "in project.json.", severity="low", every_s=86400)
             # A continued session (see _resumable) gets the current system prompt again, below. Its
             # arguments go last: Codex takes them as a subcommand that must follow every option.
+            if resume and task and role in ctxfork.ROLES and \
+                    resume == str((self.p.db.kv(coordsession.KEY) or {}).get("id") or ""):
+                # A task run never attaches to the coordinator's live session: it starts from a copy.
+                log(self.p, f"task {task['id']}: not resuming the coordinator's own session; it starts from a copy")
+                resume = None
             resume_extra = prov.resume_args(resume) if resume else []
             argv = _before_stdin(argv, extra)
             if task and role in ctxfork.ROLES and not resume:   # the coordinator's context (ctxfork.py)
@@ -4315,6 +4321,8 @@ class Daemon:
                             prompt = append_system + "\n\n" + prompt
             argv = _before_stdin(argv, resume_extra)
             (run_dir / "prompt.md").write_text(prompt)
+            if task and role in ctxfork.ROLES:   # restated after each compaction (rolerestore.py)
+                rolerestore.write(run_dir, role, task, self.p.name)
             if stdin is not None:   # what the agent reads; prompt.md stays the readable digest
                 (run_dir / "input.jsonl").write_text(stdin)
             runtime_dir = str(Path(__file__).resolve().parent.parent)
@@ -5744,6 +5752,7 @@ class Daemon:
         data = runwatch.tick(self.p, now, write=False)
         try:
             drift.check(self.p, self.cfg, data, now)   # flags each run and takes one ladder step
+            rolerestore.check(self.p, data)   # a compacted run's role and task again, where no hook gave them
         finally:
             runwatch.write(self.p, data)
 

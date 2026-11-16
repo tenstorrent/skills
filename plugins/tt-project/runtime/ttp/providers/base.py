@@ -659,6 +659,14 @@ class Provider:
         to progress.md and git."""
         return [], offset
 
+    def compactions(self, output_path: Path, env: dict | None = None, since: float | None = None) -> int:
+        """How many times a running run's agent has compacted its context since it started (`since`, for
+        a saved session that also holds what it was copied from), as its stream shows it
+        (rolerestore.check): Claude Code's stream-json `compact_boundary` events (the chat provider runs
+        it, the fake provider writes the same). 0 for a stream that shows none."""
+        events, _ = jsonl_from(Path(output_path), 0, (b'"compact_boundary"',))
+        return sum(1 for ev in events if ev.get("type") == "system" and ev.get("subtype") == "compact_boundary")
+
     final_events: tuple[str, ...] = ()   # stream event types that end a run (its last turn's result)
 
     def stream_ended(self, output_path: Path) -> bool:
