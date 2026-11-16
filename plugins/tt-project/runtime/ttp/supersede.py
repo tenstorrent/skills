@@ -68,6 +68,7 @@ def _target(review: dict) -> tuple:
 
 def duplicate_of(db, task: dict) -> dict | None:
     """An earlier open task, or one done in the last DUP_DONE_DAYS, that `task` repeats."""
+    from . import blindreview
     from .coordinator import looks_same
     from .db import dependency_ids, review_subject
     from .release import UPGRADE_TASK_TITLE
@@ -83,6 +84,8 @@ def duplicate_of(db, task: dict) -> dict | None:
                   (task["id"], task["kind"], since)):
         if not (_norm(title) == _norm(o["title"]) or looks_same(title, spec, o["title"] or "", o["spec"] or "")):
             continue
+        if blindreview.review_slots(task) != blindreview.review_slots(o):
+            continue   # a daemon device review: its label names the slot (first or second reviewer) and subject
         if o["id"] in skip or task["id"] in dependency_ids(o) or task["id"] in _lineage(db, o):
             continue
         if finish and o["status"] == "done":   # it finished another merge; this one is still open

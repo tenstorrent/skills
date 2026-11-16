@@ -117,3 +117,40 @@ def test_device_reviews_are_flagged_blind_and_point_at_the_masked_copy_not_the_r
     for t in (p.db.task(i) for i in new):
         assert blindreview.BLIND_LABEL in t["labels"] and str(run) not in t["spec"]
         assert str(__import__("pathlib").Path(p.state) / "blind") in t["spec"]
+
+
+def test_a_second_reviewer_copy_is_not_held_as_a_duplicate_of_the_first_reviewer(env):
+    # upstream note 0d30b799dc7e85f8: the second reviewer's device review shares its title words with the
+    # first; its label names another reviewer slot, so dispatch lets it start. A real repeat is still held.
+    from ttp import supersede
+    p = make(env)
+    live = p.db.add_task("Calibrate the widget rig", "Run it.", kind="work", labels=["device_ab:arm-x"])
+    p.db.x("UPDATE tasks SET status='done' WHERE id=?", (live,))
+    kw = dict(kind="question", origin="daemon", priority=4)
+    first = p.db.add_task(f"Device A/B review of #{live}", "Score the run.", labels=[f"device_ab_review:{live}"], **kw)
+    second = p.db.add_task(f"Device A/B review of #{live} (second reviewer)", "Score the run.",
+                           labels=[f"device_ab_review2:{live}"], **kw)
+    s1 = p.db.add_task(f"Device shadow review of #{live} (s0a0a0a0a)", "Score the shadow.",
+                       labels=[f"device_shadow_review:{live}:s0a0a0a0a"], **kw)
+    s2 = p.db.add_task(f"Device shadow review of #{live} (s0a0a0a0a) (second reviewer)", "Score the shadow.",
+                       labels=[f"device_shadow_review2:{live}:s0a0a0a0a"], **kw)
+    assert supersede.duplicate_of(p.db, p.db.task(first)) is None
+    assert supersede.duplicate_of(p.db, p.db.task(second)) is None
+    assert supersede.duplicate_of(p.db, p.db.task(s2)) is None and supersede.dispatch_hold(p.db, p.db.task(s2)) == ""
+    again = p.db.add_task(f"Device A/B review of #{live} (second reviewer)", "Score the run.",
+                          labels=[f"device_ab_review2:{live}"], **kw)
+    assert supersede.duplicate_of(p.db, p.db.task(again))["id"] == second
+    assert s1
+
+
+def test_daemon_device_reviews_do_not_fill_the_coordinators_new_task_cap(env):
+    # upstream note 0d30b799dc7e85f8: they count under the separate review valve instead.
+    from ttp import coordinator as coord
+    p = make(env)
+    kw = dict(kind="question", origin="daemon", priority=4)
+    p.db.add_task("Device A/B review of #1", "Score.", labels=["device_ab_review:1", "blind_review"], **kw)
+    p.db.add_task("Device A/B review of #1 (second reviewer)", "Score.", labels=["device_ab_review2:1"], **kw)
+    p.db.add_task("Device shadow review of #1 (s1)", "Score.", labels=["device_shadow_review2:1:s1"], **kw)
+    p.db.add_task("Find why the widget soak stalls", "Look.", kind="question", origin="coordinator")
+    assert len(coord.tasks_made(p.db, 0)) == 1
+    assert len(coord.tasks_made(p.db, 0, review=True)) == 3

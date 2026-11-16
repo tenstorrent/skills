@@ -1967,10 +1967,14 @@ def tasks_made(db, since: float, review: bool = False) -> list[float]:
     """Creation times, oldest first, of the tasks that count toward max_new_tasks_per_day, or with
     `review` toward max_review_tasks_per_day. Reviews have their own, higher cap: they check work
     already done and are what lets it be delivered, but a runaway turn must still stop. Reviews the
-    daemon queued for finished code tasks count too."""
+    daemon queued for finished code tasks count too, and so do the device reviews it queues (first and second
+    reviewer, blindreview.DAEMON_REVIEW_PREFIXES), which are question tasks but never the coordinator's new work."""
+    from .blindreview import DAEMON_REVIEW_PREFIXES
+    dev = " OR ".join("COALESCE(labels,'') LIKE ?" for _ in DAEMON_REVIEW_PREFIXES)
     return [r["created"] for r in db.q("SELECT created FROM tasks WHERE origin IN ('coordinator','daemon') AND "
-                                       + ("kind='review'" if review else "kind!='review'")
-                                       + " AND created>? ORDER BY created", (since,))]
+                                       + (f"(kind='review' OR {dev})" if review else f"kind!='review' AND NOT ({dev})")
+                                       + " AND created>? ORDER BY created",
+                                       (*(f'%"{p}%' for p in DAEMON_REVIEW_PREFIXES), since))]
 
 
 def task_cap(cfg: dict, review: bool = False) -> int:

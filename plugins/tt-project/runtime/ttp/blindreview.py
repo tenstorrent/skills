@@ -19,6 +19,10 @@ import secrets
 from pathlib import Path
 
 BLIND_LABEL = "blind_review"
+# Labels of the reviews the daemon queues for device work (deviceab and deviceshadow: first and second
+# reviewer). Each names its reviewer slot and subject, so two of them differ when their labels do, whatever
+# their titles say (supersede.duplicate_of), and they are not the coordinator's new tasks (coordinator.tasks_made).
+DAEMON_REVIEW_PREFIXES = ("device_ab_review", "device_shadow_review")
 ENV = "TTP_BLIND"
 CODES_KV = "blind_review_codes"   # {code: "<tid>:<arm>"}
 
@@ -90,6 +94,11 @@ def _labels(raw) -> list[str]:
         return [str(x) for x in (json.loads(raw or "[]") if isinstance(raw, str) else raw or [])]
     except ValueError:
         return []
+
+
+def review_slots(task: dict | None) -> set[str]:
+    """The daemon review labels `task` carries (its reviewer slot and subject); empty for any other task."""
+    return {lb for lb in _labels((task or {}).get("labels")) if lb.startswith(DAEMON_REVIEW_PREFIXES)}
 
 
 def is_blind_task(task: dict | None) -> bool:
