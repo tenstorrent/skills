@@ -82,7 +82,8 @@ ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # A link that drops mid-check ends in exit 255 within about a minute, never hangs to the wall-time cap.
 # A keepalive every 5 s: a proxy in the path may cut a link idle for 15 s, as when a test suite prints
 # nothing for a while on a connection of its own (DIRECT, or ssh's own fallback when its shared one refuses).
-SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=5",
+# No agent forwarding: a check never signs on the host, so it holds no agent connection open.
+SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=5", "-o", "ForwardAgent=no",
        "-o", "ServerAliveCountMax=12"]
 # A connection of its own, never ssh's shared one (ControlMaster), whose sessions the host caps (MaxSessions).
 DIRECT = ["-o", "ControlMaster=no", "-o", "ControlPath=none"]

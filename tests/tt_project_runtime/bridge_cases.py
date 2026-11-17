@@ -836,12 +836,12 @@ def test_bridge_cert_expired_fails_closed(tmp_path, monkeypatch):
     # after that every login method is off for the host, so no other key is tried
     block = bridge.render_block(cfg, "box-1")
     k = "~/.config/tt-project/bridge-cert"
-    assert (f'Match originalhost build-a,ba !exec "{bridge_cert.agent_up(".ssh/tt-agent/auto.sock")}" '
+    assert (f'Match originalhost build-a,ba !exec "{bridge_cert.match_quote(bridge_cert.agent_up(".ssh/tt-agent/auto.sock"))}" '
             f'exec "sh {k}/valid"') in block
     assert f'!exec "sh {k}/valid quiet"' in block and "  PubkeyAuthentication no" in block
     assert f"  IdentityFile {k}/id_ed25519\n  CertificateFile {k}/id_ed25519-cert.pub" in block
     assert block.index("Match originalhost") < block.index("Host build-a")   # first match wins
-    assert "%" not in block.split("Host build-a")[0]                         # ssh would expand it
+    assert "%" not in block.split("Host build-a")[0].replace("%%", "")       # ssh would expand a lone %
     for bad in ("  IdentityFile ~/keys/other", "  CertificateFile ~/keys/other-cert.pub"):
         with pytest.raises(bridge.BadConfig):
             bridge.check_block(block.replace("Match all", bad + "\nMatch all"), bridge_cert.block_lines(cfg, "box-1")[1])
@@ -1402,6 +1402,7 @@ def test_bridge_cert_agent_probe_counts_a_hung_agent_as_down(tmp_path):
     env = dict(os.environ, PATH=path, HOME=str(tmp_path))
 
     def up():
+        (tmp_path / "a.sock.up").unlink(missing_ok=True)   # each state asks the agent (no cached answer)
         t0 = time.monotonic()
         rc = subprocess.run(["sh", "-c", probe], env=env, stdin=subprocess.DEVNULL, timeout=30).returncode
         return rc == 0, time.monotonic() - t0
@@ -1415,6 +1416,44 @@ def test_bridge_cert_agent_probe_counts_a_hung_agent_as_down(tmp_path):
     (tmp_path / "a.sock.hang").write_text("")
     ok, took = up()
     assert not ok and took < bridge_cert.PROBE_S + 3
+    for s in socks:
+        s.close()
+
+
+def test_bridge_cert_agent_probe_reuses_a_healthy_answer_briefly(tmp_path):
+    # cells: cert-probe-cache
+    # ssh runs the probe at every config parse (twice per bridged host, multiplexed clients too): a burst
+    # of 20 ssh calls asks the agent once, not 20 times; a down agent is never cached, a garbled or old
+    # cache entry is ignored, and the probe still has no double quotes, backslashes or percent signs.
+    import os
+    import subprocess
+    from ttp import bridge_cert
+    path, socks = _bridge_stub_agents(tmp_path, "a")
+    log = tmp_path / "asks"
+    real = tmp_path / "bin" / "ssh-add"
+    (tmp_path / "bin" / "ssh-add.real").write_text(real.read_text())
+    (tmp_path / "bin" / "ssh-add.real").chmod(0o755)
+    real.write_text(f'#!/bin/sh\necho x >> {log}\nexec {tmp_path}/bin/ssh-add.real "$@"\n')
+    probe = bridge_cert.agent_up("a.sock")
+    assert not any(c in probe for c in '"\\') and '%%' not in probe   # match_quote doubles % for ssh
+    env = dict(os.environ, PATH=path, HOME=str(tmp_path))
+
+    def up():
+        return subprocess.run(["sh", "-c", probe], env=env, stdin=subprocess.DEVNULL, timeout=30).returncode == 0
+
+    def asks():
+        return len(log.read_text().splitlines()) if log.exists() else 0
+    assert all(up() for _ in range(20))
+    assert asks() == 1 and (tmp_path / "a.sock.up").is_file()
+    (tmp_path / "a.sock.up").write_text("garbage\n")
+    assert up() and asks() == 2
+    (tmp_path / "a.sock.up").write_text("1\n")   # long expired
+    assert up() and asks() == 3
+    (tmp_path / "a.sock.up").unlink()
+    (tmp_path / "a.sock.dead").write_text("")
+    assert not up() and not up() and asks() == 5
+    assert not (tmp_path / "a.sock.up").exists()
+    assert not list(tmp_path.glob("a.sock.up.*"))
     for s in socks:
         s.close()
 

@@ -12,7 +12,8 @@ where the task's own limit is known (a local dataset's task.toml), else the task
 host-wide trial cap (slot) is sized to free cores (concurrency 0) or set; a set one is a floor, and more trials
 start while the host's gate passes (gate: CPU idle at least idle_min %, and on a remote engine 1-min load under
 load_share x its cores). A remote engine (DOCKER_HOST=ssh://<host>) runs only the task containers there: the
-agent loop and every model call stay on this host, and its slots are its own, gated on its own load. A trial the endpoint answered with
+agent loop and every model call stay on this host, and its slots are its own, gated on its own load; docker
+reaches it through one forwarded socket per host per process, not one ssh login per API call (engine_env). A trial the endpoint answered with
 HTTP 429 is waited out ("retry after N s", else RETRY_S) and rerun, never scored; a setup error (an
 exception before any verifier reward) reruns once, then counts as a fault, not a fail. A model's result
 (score) is {passed, trials, pass_rate, median_min, faults}, booked as suite "terminalbench".
@@ -32,18 +33,23 @@ Tested with fakes only; parsing follows Harbor's trial result.json (verifier_res
 """
 from __future__ import annotations
 
+import atexit
 import fcntl
 import json
 import os
 import re
 import shlex
 import shutil
+import socket
 import statistics
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Callable
+from urllib.parse import urlsplit
 
 TASKS, PACKAGE = "harbor-tasks.txt", "harbor"   # TASKS under modelbench.home()
 DATASET, AGENT, LIMIT_S, FLOOR_SHARE = "terminal-bench@2.0", "terminus-2", 900, 0.5
@@ -124,7 +130,7 @@ def docker_host(env: dict | None) -> str:
 
 def gauge(host: str = "", runner: Callable | None = None) -> tuple[int, float, float] | None:
     """(cores, 1-min load, CPU idle %) of this host or of ssh `host`, None when unread."""
-    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, GAUGE] if host else ["sh", "-c", GAUGE]
+    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ForwardAgent=no", host, GAUGE] if host else ["sh", "-c", GAUGE]
     try:
         out = (runner or (lambda c: subprocess.run(c, capture_output=True, text=True, timeout=60).stdout))(cmd)
         lines = [x.split() for x in out.strip().splitlines()]
@@ -171,9 +177,107 @@ def slot(home: Path, st: dict, sleep: Callable = time.sleep, env: dict | None = 
         sleep(30)
 
 
+# A remote engine through the docker CLI's own ssh://: one ssh process per docker API call, each a new login
+# (one ssh agent signing and connection per call), and a Harbor trial makes hundreds; the burst filled a
+# forwarded ssh agent and took its users' logins down. So the real runner (_run) talks to a remote engine
+# through one forwarded socket per host per process instead: `ssh -N -L <local socket>:REMOTE_SOCKET`, no
+# agent forwarding, no shared ControlMaster (its own connection, one login), ended with the process (atexit;
+# its stdin is a pipe from this process, so its shell ends it once this process is gone, whatever killed it;
+# both stay in the caller's process group, so a group kill ends them too). Used once `GET /_ping` answers
+# through it within FORWARD_UP_S; else the child keeps DOCKER_HOST=ssh:// as before (a rootless engine whose
+# socket is elsewhere, say). TTP_DOCKER_FORWARD=0 in the environment keeps ssh:// always.
+REMOTE_SOCKET, FORWARD_UP_S = "/var/run/docker.sock", 10
+_FORWARD_SH = 'ssh "$@" </dev/null & s=$!; read _ignored; kill $s 2>/dev/null; wait $s'
+_forwards: dict[str, tuple[subprocess.Popen, Path]] = {}
+_forward_lock = threading.Lock()
+
+
+def _ping(sock: Path, timeout: float = 5) -> bool:
+    """The engine's API answers `GET /_ping` with 200 on the Unix socket."""
+    try:
+        with socket.socket(socket.AF_UNIX) as c:
+            c.settimeout(timeout)
+            c.connect(str(sock))
+            c.sendall(b"GET /_ping HTTP/1.0\r\nHost: docker\r\n\r\n")
+            return c.recv(64).split(b"\r\n", 1)[0].split()[1:2] == [b"200"]
+    except (OSError, IndexError):
+        return False
+
+
+def forward_argv(spec: str, sock: Path, remote: str = REMOTE_SOCKET) -> list[str]:
+    """The ssh arguments of the forward to ssh://<spec> ([user@]host[:port], brackets for IPv6)."""
+    u = urlsplit("ssh://" + spec)
+    return ["-N", "-o", "ControlPath=none", "-o", "ForwardAgent=no", "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=3",
+            "-o", "ExitOnForwardFailure=yes", "-o", "StreamLocalBindUnlink=yes", "-L", f"{sock}:{remote}",
+            *(["-p", str(u.port)] if u.port else []), *(["-l", u.username] if u.username else []),
+            "--", u.hostname or spec]
+
+
+def _stop(spec: str) -> None:
+    proc, sock = _forwards.pop(spec)
+    try:
+        proc.stdin.close()   # its shell kills ssh and ends
+        proc.wait(5)
+    except (OSError, subprocess.TimeoutExpired):
+        proc.kill()
+        proc.wait()
+    shutil.rmtree(sock.parent, ignore_errors=True)
+
+
+def stop_forwards() -> None:
+    """End every engine forward this process started (also at exit)."""
+    with _forward_lock:
+        for spec in list(_forwards):
+            _stop(spec)
+
+
+atexit.register(stop_forwards)
+
+
+def forward(spec: str, up_s: float = FORWARD_UP_S, sleep: Callable = time.sleep) -> Path | None:
+    """The local socket of this process's forward to the engine on ssh://<spec>: the live one, else a new one
+    once its ping answers; None when it does not come up (module note above _run)."""
+    with _forward_lock:
+        if spec in _forwards:
+            if _forwards[spec][0].poll() is None and _ping(_forwards[spec][1]):
+                return _forwards[spec][1]
+            _stop(spec)
+        d = Path(tempfile.mkdtemp(prefix="ttp-dk-", dir="/tmp" if os.path.isdir("/tmp") else None))
+        sock = d / "docker.sock"   # short: a Unix socket path has about 100 bytes
+        try:
+            proc = subprocess.Popen(["sh", "-c", _FORWARD_SH, "sh", *forward_argv(spec, sock)], stdin=subprocess.PIPE,
+                                    stdout=subprocess.DEVNULL, stderr=open(d / "ssh.log", "wb"))
+        except OSError:
+            shutil.rmtree(d, ignore_errors=True)
+            return None
+        _forwards[spec] = (proc, sock)
+        end = time.monotonic() + up_s
+        while time.monotonic() < end:
+            if sock.exists() and _ping(sock):
+                return sock
+            if proc.poll() is not None:
+                break
+            sleep(0.2)
+        why = (d / "ssh.log").read_text(errors="replace").strip()[-200:]
+        _stop(spec)
+        print(f"harbor: no docker socket forward to {spec} ({why or 'no answer'}); docker's own ssh:// stays",
+              file=sys.stderr)
+        return None
+
+
+def engine_env(env: dict) -> dict:
+    """env with a remote engine's DOCKER_HOST=ssh:// pointed at this process's forwarded socket (above)."""
+    spec = docker_host(env)
+    if not spec or str(env.get("TTP_DOCKER_FORWARD", "")) == "0":
+        return env
+    sock = forward(spec)
+    return {**env, "DOCKER_HOST": f"unix://{sock}"} if sock else env
+
+
 def _run(cmd: list[str], env: dict, timeout: float) -> tuple[int, str]:
     try:
-        r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(cmd, env=engine_env(env), capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as e:
         return 1, f"{type(e).__name__}: {e}"
     return r.returncode, (r.stderr or r.stdout or "")[-500:]

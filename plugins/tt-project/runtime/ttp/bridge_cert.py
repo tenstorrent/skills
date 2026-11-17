@@ -118,7 +118,7 @@ def block_lines(cfg: dict, box: str) -> tuple[list[str], set[str]]:
     for h in c["boxes"][box]["hosts"]:
         names = ",".join([h["name"], *h["aliases"]])
         # the link is down when its agent does not answer (ssh-add exits 2 or hangs), not only when its socket is gone
-        down = f' !exec "{agent_up(link_path(cfg, bridged[h["name"]]))}"' if h["name"] in bridged else ""
+        down = f' !exec "{match_quote(agent_up(link_path(cfg, bridged[h["name"]])))}"' if h["name"] in bridged else ""
         lines += ["", f"Match originalhost {names}{down} exec \"sh {p['valid']}\"", f"  HostName {h['target']}",
                   "  Port 22", "  IdentityAgent none", "  IdentitiesOnly yes", f"  IdentityFile {p['key']}",
                   f"  CertificateFile {p['cert']}"]
@@ -134,15 +134,32 @@ def block_lines(cfg: dict, box: str) -> tuple[list[str], set[str]]:
 
 
 PROBE_S = 3   # an agent link that has not answered `ssh-add -l` by then counts as down
+PROBE_CACHE_S = 5   # a healthy answer is reused this long (ssh runs the probe in every Match block it parses)
 
 
 def agent_up(link: str) -> str:
     """A Match exec command: exit 0 while the agent behind `$HOME/<link>` answers (ssh-add -l exits 0 or 1).
     A hung agent is killed after PROBE_S and counts as down, so every ssh falls through to the next
     route instead of hanging with it. POSIX sh only (no `timeout`, which macOS lacks), whatever the
-    login shell; ssh waits for the probe's shell, not for the watchdog's leftover sleep."""
-    return (f"sh -c 'SSH_AUTH_SOCK=$HOME/{link} ssh-add -l >/dev/null 2>&1 & p=$!; "
-            f"(sleep {PROBE_S}; kill $p) >/dev/null 2>&1 & w=$!; wait $p; r=$?; kill $w 2>/dev/null; [ $r -lt 2 ]'")
+    login shell; ssh waits for the probe's shell, not for the watchdog's leftover sleep.
+    OpenSSH runs this probe at every config parse, twice per bridged host and for multiplexed clients
+    too, so a burst of ssh calls opened one agent connection each (the forwarded agent then refused
+    new ones and the bridge went down). A healthy answer is therefore kept for PROBE_CACHE_S in
+    `<link>.up` (an epoch beside the socket, in the bridge's private folder, written by rename);
+    a failed probe removes it, so a down agent is never cached and is asked again on the next ssh.
+    No double quotes or backslashes: the command sits inside Match exec's quotes (match_quote doubles
+    its percent signs, which ssh would expand there)."""
+    return (f"sh -c 'f=$HOME/{link}.up; n=$(date +%s); read t 2>/dev/null <$f && "
+            f"[ $t -gt $((n - {PROBE_CACHE_S})) ] 2>/dev/null && exit 0; "
+            f"SSH_AUTH_SOCK=$HOME/{link} ssh-add -l >/dev/null 2>&1 & p=$!; "
+            f"(sleep {PROBE_S}; kill $p) >/dev/null 2>&1 & w=$!; wait $p; r=$?; kill $w 2>/dev/null; "
+            f"if [ $r -lt 2 ]; then echo $n >$f.$$ 2>/dev/null && mv -f $f.$$ $f 2>/dev/null; exit 0; fi; "
+            f"rm -f $f; exit 1'")
+
+
+def match_quote(cmd: str) -> str:
+    """A command as a Match exec argument: ssh expands % tokens there, and `%%` is a literal %."""
+    return cmd.replace("%", "%%")
 
 
 def link_path(cfg: dict, agent: str) -> str:

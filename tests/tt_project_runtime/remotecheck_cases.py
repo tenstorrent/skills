@@ -1851,6 +1851,7 @@ def test_a_spill_run_past_the_wall_cap_or_on_a_stalled_link_runs_again_here(env,
     import threading
     from ttp import checkwall, cli, remotecheck
     assert "ServerAliveInterval=5" in remotecheck.SSH and "ServerAliveCountMax=12" in remotecheck.SSH
+    assert "ForwardAgent=no" in remotecheck.SSH   # a check never uses the agent: none forwarded
     p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
     monkeypatch.setenv("TTP_TASK", "4212")
     monkeypatch.setenv(checkwall.ENV, "3")

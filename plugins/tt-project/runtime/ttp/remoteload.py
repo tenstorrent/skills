@@ -32,7 +32,7 @@ TELL_MIN_S = 60.0   # the wait is told again at most this often
 LAG_S = 90.0   # a run started this recently may not show in its host's demand yet (_starts)
 SEP = "--ttp-sample--"
 SCRIPT = f"cat /proc/stat && sleep {SAMPLE_S} && echo {SEP} && cat /proc/stat"
-SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8"]
+SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ForwardAgent=no"]   # no agent use there
 
 _CACHE: dict = {}   # host: (monotonic time, (demand, cores) or None)
 

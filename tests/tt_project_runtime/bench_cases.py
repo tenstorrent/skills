@@ -2617,6 +2617,94 @@ def test_bench_run_arm_harness_types_parse_install_once_into_the_bench_folder_an
                    "cost_estimated": True, "cost_basis": benchrun.HARNESS_BASIS, "cost_usd": 2.04}
 
 
+_FAKE_FORWARD_SSH = """#!{py}
+# A fake `ssh -N -L <sock>:<remote> ... host`: logs its argv and pid, logs in once through $SSH_AUTH_SOCK (a
+# fake agent), then serves the engine's /_ping on <sock> until killed.
+import os, socket, sys
+a = sys.argv[1:]
+open(os.environ["FAKE_SSH_LOG"], "a").write(f"{{os.getpid()}} {{' '.join(a)}}\\n")
+if os.environ.get("FAKE_SSH_FAIL"):
+    print("ssh: connect to host box port 22: Connection refused", file=sys.stderr)
+    sys.exit(255)
+socket.socket(socket.AF_UNIX).connect(os.environ["SSH_AUTH_SOCK"])
+local = a[a.index("-L") + 1].rsplit(":", 1)[0]
+srv = socket.socket(socket.AF_UNIX)
+srv.bind(local)
+srv.listen(8)
+while True:
+    c, _ = srv.accept()
+    c.recv(256)
+    c.sendall(b"HTTP/1.0 200 OK\\r\\n\\r\\nOK")
+    c.close()
+"""
+
+
+def test_harbor_remote_engine_uses_one_forwarded_socket_per_host_and_ends_it(tmp_path, monkeypatch):
+    # cells: tb-docker-forward
+    # docker's own ssh:// opens one ssh login (one agent connection) per API call; the real runner instead
+    # starts one `ssh -N -L` forward per host per process (no agent forwarding, its own connection), and
+    # ends it with the run: agent connections stay at one for any number of docker calls and drop to zero
+    # live forwards after stop. A forward that does not come up keeps docker's ssh:// (the old route).
+    import os
+    import socket
+    import sys
+    import threading
+    import time
+    from ttp import harborslice
+    bin_dir, log = tmp_path / "bin", tmp_path / "ssh.log"
+    bin_dir.mkdir()
+    (bin_dir / "ssh").write_text(_FAKE_FORWARD_SSH.format(py=sys.executable))
+    (bin_dir / "ssh").chmod(0o755)
+    agent, logins = socket.socket(socket.AF_UNIX), []
+    agent.bind(str(tmp_path / "agent.sock"))
+    agent.listen(16)
+
+    def serve():
+        while True:
+            try:
+                logins.append(agent.accept()[0])
+            except OSError:
+                return
+    threading.Thread(target=serve, daemon=True).start()
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}")
+    monkeypatch.setenv("SSH_AUTH_SOCK", str(tmp_path / "agent.sock"))
+    monkeypatch.setenv("FAKE_SSH_LOG", str(log))
+    env = dict(os.environ, DOCKER_HOST="ssh://bench@box:2222")
+    try:
+        seen = [harborslice._run(["sh", "-c", "echo $DOCKER_HOST"], env, 30)[1].strip() for _ in range(6)]
+        starts = log.read_text().splitlines()
+        assert len(starts) == 1 and len(logins) == 1, "one forward, one login, for six docker calls"
+        pid, argv = int(starts[0].split()[0]), starts[0].split()[1:]
+        sock = harborslice._forwards["bench@box:2222"][1]
+        assert set(seen) == {f"unix://{sock}"} and len(str(sock)) < 100
+        assert "ForwardAgent=no" in argv and "ControlPath=none" in argv and argv[-2:] == ["--", "box"]
+        assert argv[argv.index("-p") + 1] == "2222" and argv[argv.index("-l") + 1] == "bench"
+        assert argv[argv.index("-L") + 1] == f"{sock}:{harborslice.REMOTE_SOCKET}"
+        harborslice.stop_forwards()
+        assert not harborslice._forwards and not sock.parent.exists()
+        for _ in range(50):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            raise AssertionError("the forward's ssh outlived stop_forwards")
+        # a host whose forward fails: docker keeps its own ssh:// route, and nothing is left behind
+        monkeypatch.setenv("FAKE_SSH_FAIL", "1")
+        assert harborslice._run(["sh", "-c", "echo $DOCKER_HOST"], dict(os.environ, DOCKER_HOST="ssh://box"), 30)[1] \
+            .strip() == "ssh://box"
+        assert not harborslice._forwards
+        # the off switch and a local engine start no ssh at all
+        n = len(log.read_text().splitlines())
+        harborslice._run(["true"], dict(os.environ, DOCKER_HOST="ssh://box", TTP_DOCKER_FORWARD="0"), 30)
+        harborslice._run(["true"], dict(os.environ, DOCKER_HOST="unix:///run/docker.sock"), 30)
+        assert len(log.read_text().splitlines()) == n
+    finally:
+        harborslice.stop_forwards()
+        agent.close()
+
+
 def test_harbor_trial_slots_keep_the_floor_grow_only_past_the_host_gate_and_count_a_remote_engine_apart(env):
     from ttp import harborslice
     out = {"": "64\n10.0 9.0 8.0 3/900 1\n 1 0 0 1 1 1 0 0 0 0 1 1 5 2 80 0 0\n",
