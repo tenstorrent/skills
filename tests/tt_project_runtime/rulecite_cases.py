@@ -207,10 +207,19 @@ def test_cli_holds_outside_this_projects_coordinator_run_are_not_checked(env, tm
         monkeypatch.setenv("TTP_ROLE", "coordinator")
     elif who == "other project":
         _rc_as_run(p, monkeypatch, "coordinator", project=tmp_path / "elsewhere")
-    cli.main(["task", "demo", "add", "later work", "--spec", "Do: x", "--start-after", "3h"])
-    cli.main(["task", "demo", "set-when", str(tid), "--start-after", "2h"])
+    if who == "other project":   # a run changes only its own project's tasks: the task writes are refused, nothing is checked
+        for argv in (["task", "demo", "add", "later work", "--spec", "Do: x", "--start-after", "3h"],
+                     ["task", "demo", "set-when", str(tid), "--start-after", "2h"]):
+            with pytest.raises(SystemExit):
+                cli.main(argv)
+        assert "of another project is refused" in capsys.readouterr().err
+        assert p.db.task(tid)["not_before"] is None
+    else:
+        cli.main(["task", "demo", "add", "later work", "--spec", "Do: x", "--start-after", "3h"])
+        cli.main(["task", "demo", "set-when", str(tid), "--start-after", "2h"])
     cli.main(["pause", "demo", "--resource", "board-d", "--reason", "pause it for now", "--until", "2h"])
     assert "uncited hold" not in capsys.readouterr().err
     assert p.db.q("SELECT id FROM events WHERE kind=?", (rulecite.HOLD_EVENT,)) == []
     assert rulecite._records(p.db) == [] and rulecite.metric(p)["holds"] == 0
-    assert p.db.task(tid)["not_before"] is not None   # the command itself works as before
+    if who != "other project":
+        assert p.db.task(tid)["not_before"] is not None   # the command itself works as before
