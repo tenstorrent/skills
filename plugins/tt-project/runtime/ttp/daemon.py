@@ -12583,6 +12583,12 @@ class Daemon:
         msgs = db.q("SELECT id, ts, chat, provenance, text, context FROM messages WHERE direction='in' AND handled=0 "
                     "ORDER BY id")
         queued = db.q("SELECT id, ts, kind, severity, task, source, data FROM events WHERE status='queued' ORDER BY id")
+        try:
+            # An urgent message goes first and skips the debounce and the relay window (msgurgent.py).
+            msgs, urgent_msgs = msgurgent.first(db, self.cfg, msgs)
+        except Exception:   # the ordering only speeds a reply: a failure runs the turn as before
+            log(self.p, "urgent message ordering failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
+            urgent_msgs = set()
         # A failed resume of the persistent session (coordsession.py) reruns its batch at once: no hold or gate.
         rerun = bool((db.kv(coordsession.KEY) or {}).get("rerun"))
         # Lead mode (leadmode.py): tasks wait for the coordinator itself, so a turn starts soon after the
@@ -12657,14 +12663,15 @@ class Daemon:
             newest = max([m["ts"] for m in msgs] + [e["ts"] for e in evs])
             oldest = min([m["ts"] for m in msgs] + [e["ts"] for e in evs])
             debounce = float(c.get("debounce_s", 15))
-            if now - newest < debounce and now - oldest < 4 * debounce:
+            if now - newest < debounce and now - oldest < 4 * debounce and not urgent_msgs:
                 return
             own = [e for e in queued if not pagesev.rides_along(e)]   # ride-alongs neither hold nor start a turn
             # An overdue promise or order, or a failed claim, wakes the coordinator at once (mustact.py);
             # a must-act item that rides along (a host-held queue wait) holds like any other ride-along.
             urgent = hot or bool(lead) or any(e["kind"] in mustact.KINDS and not pagesev.rides_along(e) for e in evs)
             # Relayed messages with no order or question wait out the relay window, so a burst is one turn.
-            if msgs and not rerun and not any(eventhold.immediate(e) for e in evs) and self._relay_hold(msgs, now):
+            if msgs and not rerun and not urgent_msgs and not any(eventhold.immediate(e) for e in evs) \
+                    and self._relay_hold(msgs, now):
                 return
             if not msgs and not rerun and not urgent and self._burst_hold(own, now):
                 return

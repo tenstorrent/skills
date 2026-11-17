@@ -225,3 +225,134 @@ def test_the_daemon_step_acks_and_reaches_a_running_coordinator_turn(env):
     assert len(_urg_outs(d.p, "urgent_ack")) == 1
     assert len(_urg_outs(d.p, "urgent_late")) == 1, "past its first-finding deadline on arrival of the scan"
     assert "first finding" in (run / "steer.md").read_text()
+
+
+def _urg_turn(p, tmp, provider="claude", started=None, messages=(), hooked=False):
+    """A running coordinator turn row with its own run dir (the marker file when `hooked`)."""
+    run = tmp / f"coord-run-{provider}-{len(list(tmp.glob('coord-run-*')))}"
+    run.mkdir()
+    if hooked:
+        (run / "steer.hooked").write_text("1")
+    p.db.x("INSERT INTO runs(task,role,provider,status,started,dir,note) VALUES(NULL,'coordinator',?,'running',?,?,?)",
+           (provider, started if started is not None else time.time(), str(run), json.dumps({"messages": list(messages)})))
+    return run
+
+
+def _urg_rec(p, mid, now, **kw):
+    from ttp import msgurgent
+    rec = msgurgent.records(p.db)[str(mid)]
+    rec.update(kw)
+    return rec
+
+
+def test_urgent_messages_are_read_first_by_the_coordinator_wake_and_the_digest(env):
+    from ttp import msgurgent, coordinator as coord
+    p = _urgent_project(env)
+    a = _urg_inbound(p, "status: all green")
+    b = _urg_inbound(p, "urgent: the live stream is down")
+    c = _urg_inbound(p, "ok thanks")
+    rows = p.db.q("SELECT * FROM messages WHERE direction='in' ORDER BY id")
+    ordered, ids = msgurgent.first(p.db, p.config(), rows)
+    assert [m["id"] for m in ordered] == [b, a, c] and ids == {b}
+    plain, none = msgurgent.first(p.db, p.config(), [r for r in rows if r["id"] != b])
+    assert [m["id"] for m in plain] == [a, c] and none == set()
+    parts = dict(coord.digest_parts(p, {}, [], [a, b, c])[0])
+    text = next(v for v in parts.values() if f"user message #{b}" in v)
+    assert text.index(f"user message #{b}") < text.index(f"user message #{a}")
+    assert "[URGENT:" in text.split(f"user message #{a}")[0] and "[URGENT:" not in text.split(f"user message #{a}")[1]
+    off = {**p.config(), "urgent_msg": {"enabled": False}}
+    assert msgurgent.first(p.db, off, rows)[1] == set()
+
+
+def test_urgent_message_skips_the_debounce_and_the_relay_window_but_a_status_message_does_not(env, monkeypatch):
+    p, d, clock, starts, _ = _wg_setup(env, monkeypatch)
+    _wg_msg(p, clock, "status: the train is green, 3 changes landed")
+    assert not _turn_within(d, clock, starts, 25), "a status message woke a turn inside the relay window"
+    _wg_msg(p, clock, "urgent: the live stream is down for a customer")
+    assert _turn_within(d, clock, starts, 10), "an urgent message waited on the debounce or relay window"
+    p, d, clock, starts, _ = _wg_setup(env, monkeypatch)
+    _wg_msg(p, clock, "urgent: the live stream is down for a customer", provenance="slack")
+    assert _turn_within(d, clock, starts, 4, step=1), "an urgent message waited out the 15 s debounce"
+
+
+def test_reach_a_hooked_running_turn_gets_the_urgent_update_and_is_cut_only_when_it_never_reads(env):
+    from ttp import hook, msgurgent
+    p = _urgent_project(env)
+    now = time.time()
+    mid = _urg_inbound(p, "urgent: the live stream is down", ts=now)
+    msgurgent.tick(p, p.config(), now=now + 1)
+    run = _urg_turn(p, env["tmp"], provider="claude", started=now - 600)
+    rec = _urg_rec(p, mid, now)
+    c = msgurgent.config(p.config())
+    assert msgurgent.reach(p, rec, c, now + 2) == "steer"
+    body = (run / "steer.md").read_text()
+    assert f"URGENT message #{mid}" in body and "ttp urgent-reply" in body and "live stream is down" in body
+    rec["reached"] = "steer"
+    assert msgurgent.reach(p, rec, c, now + 2 + c["read_s"] - 1) == "steer", "cut before read_s"
+    assert not (run / "STOP").exists()
+    # The hook reads it: the turn has the message, so nothing is cut however long it waits.
+    text, off = hook.unread_update(run)
+    hook.mark_seen(run, off)
+    assert msgurgent.reach(p, rec, c, now + 2 + c["read_s"] + 60) == "in_turn"
+    assert not (run / "STOP").exists()
+    # Unread past read_s (a long reasoning step with no tool call): the turn is cut and resumes later.
+    p.db.x("UPDATE runs SET status='ok'")
+    run2 = _urg_turn(p, env["tmp"], provider="claude", started=now - 600)
+    rec2 = _urg_rec(p, mid, now, reached=None)
+    assert msgurgent.reach(p, rec2, c, now + 10) == "steer"
+    rec2["reached"] = "steer"
+    assert msgurgent.reach(p, rec2, c, now + 10 + c["read_s"] + 1) == "cut"
+    assert (run2 / "STOP").exists() and "preempt" in (run2 / "STOP").read_text()
+
+
+def test_reach_an_unhooked_provider_turn_is_cut_after_cut_after_s_and_a_marker_makes_it_a_steer(env):
+    from ttp import msgurgent
+    p = _urgent_project(env)
+    now = time.time()
+    mid = _urg_inbound(p, "urgent: the live stream is down", ts=now)
+    msgurgent.tick(p, p.config(), now=now + 1)
+    c = msgurgent.config(p.config())
+    young = _urg_turn(p, env["tmp"], provider="cursor", started=now - 5)
+    rec = _urg_rec(p, mid, now)
+    assert msgurgent.reach(p, rec, c, now) is None, "a young turn that cannot read updates is retried, not cut"
+    assert not (young / "STOP").exists() and not (young / "steer.md").exists()
+    assert msgurgent.reach(p, rec, c, now + c["cut_after_s"] + 1) == "cut"
+    assert "preempt" in (young / "STOP").read_text()
+    assert msgurgent.reach(p, rec, c, now + c["cut_after_s"] + 2) == "next", "already ending: the next turn reads it"
+    p.db.x("UPDATE runs SET status='ok'")
+    marked = _urg_turn(p, env["tmp"], provider="cursor", started=now - 300, hooked=True)
+    assert msgurgent.reach(p, rec, c, now + 5) == "steer" and f"URGENT message #{mid}" in (marked / "steer.md").read_text()
+
+
+def test_reach_with_no_turn_running_or_the_message_in_the_turn_cuts_nothing(env):
+    from ttp import msgurgent
+    p = _urgent_project(env)
+    now = time.time()
+    mid = _urg_inbound(p, "urgent: the live stream is down", ts=now)
+    msgurgent.tick(p, p.config(), now=now + 1)
+    c = msgurgent.config(p.config())
+    rec = _urg_rec(p, mid, now)
+    assert msgurgent.reach(p, rec, c, now + 2) == "next"
+    run = _urg_turn(p, env["tmp"], provider="cursor", started=now - 600, messages=[mid])
+    assert msgurgent.reach(p, rec, c, now + 2) == "in_turn"
+    assert not (run / "STOP").exists() and not (run / "steer.md").exists()
+    p.db.x("UPDATE runs SET note=NULL")
+    p.db.x("UPDATE messages SET handled=1 WHERE id=?", (mid,))
+    assert msgurgent.reach(p, rec, c, now + 2) == "in_turn"
+    assert not (run / "STOP").exists()
+
+
+def test_tick_records_where_the_urgent_message_reached_and_logs_it_once(env):
+    from ttp import msgurgent
+    p = _urgent_project(env)
+    now = time.time()
+    mid = _urg_inbound(p, "urgent: the live stream is down", ts=now)
+    run = _urg_turn(p, env["tmp"], provider="claude", started=now - 600)
+    out = msgurgent.tick(p, p.config(), now=now + 1)
+    assert f"reach {mid} steer" in out
+    assert msgurgent.records(p.db)[str(mid)]["reached"] == "steer"
+    assert not any(o.startswith("reach") for o in msgurgent.tick(p, p.config(), now=now + 2))
+    assert (run / "steer.md").read_text().count(f"URGENT message #{mid}") == 1, "the update is appended once"
+    out = msgurgent.tick(p, p.config(), now=now + 1 + msgurgent.config(p.config())["read_s"] + 2)
+    assert f"reach {mid} cut" in out and (run / "STOP").exists()
+    assert not any(o.startswith("reach") for o in msgurgent.tick(p, p.config(), now=now + 200))

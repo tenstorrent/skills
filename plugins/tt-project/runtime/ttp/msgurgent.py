@@ -19,8 +19,11 @@ or turn it off). For each one the daemon, with no model call:
    miss (`second_s` later) notifies the user at high.
 
 A classifier false positive costs one ack and, if no reply follows, a late notice: nothing else changes.
-The coordinator's turn takes an urgent message ahead of the relay window, debounce and queue (see
-urgent_first), and a running turn gets it mid-run (deliver_running)."""
+The coordinator's turn takes an urgent message ahead of the relay window, debounce and queue (`first`),
+and a turn already running gets it mid-run (`reach`): as a steer update where the provider's hook hands
+updates over (read within `read_s`, else the turn is cut), else the turn is cut after `cut_after_s` and
+the next one, which starts past the batching holds, reads the urgent message first. Every provider ends
+with the message in a turn within seconds."""
 from __future__ import annotations
 
 import json
@@ -36,7 +39,7 @@ ACK_KIND, LATE_KIND = "urgent_ack", "urgent_late"
 EVENT_KIND = "urgent_msg_late"
 REPLY_KINDS = ("reply", "ask")   # an outbound message of these kinds answers the sender
 DEFAULTS = {"enabled": True, "ack_s": 60, "first_s": 300, "second_s": 300, "markers": [], "keep_h": 24,
-            "stale_s": 900}
+            "stale_s": 900, "cut_after_s": 30, "read_s": 90}
 DONE_STATES = ("done", "failed", "cancelled")
 
 _MARK_RE = re.compile(r"^\s*(?:\[urgent\]|urgent\s*[:!\-]|\*\*urgent\*\*)", re.I)
@@ -155,7 +158,7 @@ def scan(p, cfg: dict | None, now: float) -> list[dict]:
         rec = {"mid": m["id"], "chat": m["chat"], "ts": ts, "why": why, "tasks": _owners(db, m["text"] or ""),
                "ack_due": ts + float(c["ack_s"]), "find_due": ts + float(c["first_s"]),
                "second_due": ts + float(c["first_s"]) + float(c["second_s"]),
-               "acked": None, "late": None, "escalated": None, "closed": None}
+               "acked": None, "late": None, "escalated": None, "closed": None, "reached": None}
         recs[str(m["id"])] = rec
         new.append(rec)
     db.set_kv(CURSOR, cur)
@@ -191,6 +194,13 @@ def tick(p, cfg: dict | None, now: float | None = None, steer=None) -> list[str]
             rec["acked"] = now
             changed = True
             out.append(f"ack {key}")
+        if rec.get("reached") in (None, "steer"):
+            how = reach(p, rec, c, now)
+            if how != rec.get("reached"):
+                rec["reached"] = how
+                changed = True
+                if how:
+                    out.append(f"reach {key} {how}")
         if rec.get("late") is None and now >= rec["find_due"]:
             rec["late"] = now
             changed = True
@@ -248,3 +258,85 @@ def deliver_running(p, text: str, key: str) -> bool:
         return False
     _append_update(Path(r["dir"]) / "steer.md", text, key)
     return True
+
+
+# the turn: urgent first, and mid-run ---------------------------------------------------------------
+def first(db, cfg: dict | None, msgs: list) -> tuple[list, set]:
+    """`msgs` (unhandled inbound rows) with the urgent ones first, in their own order, and the set of
+    their ids: a record already open for it, or the classifier (the same conservative one the ack uses)."""
+    c = config(cfg)
+    if not c.get("enabled", True) or not msgs:
+        return list(msgs), set()
+    recs = records(db)
+    ids = set()
+    for m in msgs:
+        rec = recs.get(str(m["id"]))
+        if (rec and not rec.get("closed")) or (not rec and classify(cfg, m["text"], m["context"] or "")[0]):
+            ids.add(m["id"])
+    return sorted(msgs, key=lambda m: m["id"] not in ids), ids
+
+
+def _running(db):
+    return db.one("SELECT id, dir, provider, started, note FROM runs WHERE role='coordinator' AND "
+                  "status='running' ORDER BY id DESC LIMIT 1")
+
+
+def _in_turn(run, mid: int) -> bool:
+    try:
+        return mid in ((json.loads(run["note"] or "{}") or {}).get("messages") or [])
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
+def _hooked(run, run_dir: Path) -> bool:
+    """Whether this turn's update hook hands steer.md over after its tool calls (the provider's, or the
+    run's own marker: Codex and Cursor turns may run it)."""
+    from .hook import hooked
+    from .providers import get_provider
+    try:
+        return hooked(run_dir) or bool(getattr(get_provider(run["provider"]), "steer_hook", False))
+    except Exception:
+        return hooked(run_dir)
+
+
+def reach(p, rec: dict, c: dict, now: float) -> str | None:
+    """Get the urgent message to the coordinator now. Returns where it stands, kept in the record:
+    "next" (no turn runs: the next one starts past the holds), "in_turn" (the running turn already has it
+    or read the update), "steer" (an update is in the running turn's steer.md, not read yet), "cut" (the
+    turn was stopped to restart with it first: its messages and events stay queued; the session resumes),
+    None (a turn that cannot read updates is younger than `cut_after_s`: tried again next pass)."""
+    db = p.db
+    run = _running(db)
+    if not run or not run["dir"]:
+        return "next"
+    row = db.one("SELECT handled FROM messages WHERE id=?", (rec["mid"],))
+    if _in_turn(run, rec["mid"]) or (row and row["handled"]):   # a turn read it already
+        return "in_turn"
+    run_dir = Path(run["dir"])
+    if (run_dir / "STOP").exists():
+        return "next"   # already ending: the next turn reads it
+    if _hooked(run, run_dir):
+        if rec.get("reached") != "steer":
+            m = db.one("SELECT text, context FROM messages WHERE id=?", (rec["mid"],))
+            from .coordinator import _append_update
+            _append_update(run_dir / "steer.md", (
+                f"URGENT message #{rec['mid']} in chat {rec['chat'] or 'all'} arrived while you work ({rec['why']}): "
+                f"{(m['text'] if m else '')[:600]}\nPost the first finding in that chat now, with times "
+                f"(`ttp urgent-reply`), before anything else."), f"urgent-{rec['mid']}")
+            rec["steered"] = now
+            return "steer"
+        from .hook import unread_update
+        if not unread_update(run_dir)[0]:
+            return "in_turn"
+        if now - float(rec.get("steered") or now) < float(c["read_s"]):
+            return "steer"
+        return _cut(run_dir)   # no tool call to carry the update (a long reasoning step): restart with it first
+    if now - float(run["started"] or now) < float(c["cut_after_s"]):
+        return None
+    return _cut(run_dir)
+
+
+def _cut(run_dir: Path) -> str:
+    from . import runner
+    runner.request_stop(run_dir, "preempt")   # a resumable stop: nothing is marked failed, the batch stays queued
+    return "cut"

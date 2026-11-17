@@ -132,6 +132,7 @@ from . import (   # one name per line: two changes adding names merge without a 
 from . import untrusted
 from . import branchcap
 from . import urgent
+from . import msgurgent
 from . import waketier
 from . import replan
 from . import topup
@@ -1784,6 +1785,8 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     lines = ["\n# NEW EVENTS"]
     if msg_ids:
         rows = db.q(f"SELECT * FROM messages WHERE id IN ({','.join('?' * len(msg_ids))}) ORDER BY id", msg_ids)
+        rows, urgent_ids = msgurgent.first(db, p.config(), list(rows))   # an urgent message reads first
+        urgent_min = int(msgurgent.config(p.config())["first_s"] // 60)
         flagged = ({int(k): v for k, v in corrections.items()} if corrections is not None
                    else correction.flag(db, p.config(), rows, now))
         instead = unblock.not_answers(db, rows, _ask_question)
@@ -1804,6 +1807,9 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
                                                          "user's word for every other decision)")
             head = (f"- [user message #{m['id']} via {m['channel']}, provenance={prov}, can approve a PR: {ok}, "
                     f"chat={m['chat'] or '-'}]")
+            if m["id"] in urgent_ids:
+                head += (f" [URGENT: post the first finding in this chat within {urgent_min} min of receipt, with "
+                         f"times (`ttp urgent-reply`), before anything else]")
             if m["broadcast"]:   # `ttp say --all`: every project got these words; none relays them on
                 head += f" [{broadcast.label(m['broadcast'])}]"
             if m["id"] in flagged:
