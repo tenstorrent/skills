@@ -724,6 +724,26 @@ def test_a_reply_by_note_id_goes_to_a_forward_target_and_a_target_hands_back_rep
     assert (r["to"], r["at"]) == ("alpha", "farbox") and "back" not in r
 
 
+def test_only_a_project_that_reads_the_inbox_replies_to_a_general_note(env, monkeypatch, capsys):
+    """A general note (no `to`) is for the maintainers: `--reply` to it from a project with `upstream.ingest`
+    off is refused and files nothing, as a scratch project replaying a spec that quotes `[note <fp>]` would
+    otherwise answer the real sender; the project that reads the inbox still answers it."""
+    from ttp import cli, upstream
+    from ttp.project import register
+    p = make(env)
+    (env["tmp"] / "second").mkdir()
+    register("second", {"host": "testhost", "dir": str(env["tmp"] / "second")})
+    _note_run(env, monkeypatch, p)
+    upstream.append("second", 7, [{"title": "upstream: the retry default", "spec": "make it 5"}])
+    fp = upstream.fingerprint("upstream: the retry default", "make it 5")
+    assert _note(cli, "--reply", fp, "fixed in 0.3.2") == 2
+    assert f"not sent: no note {fp} from another project came to demo" in capsys.readouterr().err
+    assert len(_upstream_inbox(env)) == 1, "nothing filed"
+    p.set_config("upstream.ingest", True)
+    assert _note(cli, "--reply", fp, "fixed in 0.3.2") == 0
+    assert _upstream_inbox(env)[-1]["to"] == "second"
+
+
 def test_a_reply_or_peer_note_with_no_route_is_refused_never_dropped(env, monkeypatch, capsys):
     """No route: a non-zero exit saying it was not sent, and nothing filed. An unknown id, a sender that
     no longer runs here, a note read from another machine's inbox that came there from a third one, and

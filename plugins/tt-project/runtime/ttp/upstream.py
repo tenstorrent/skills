@@ -1041,6 +1041,10 @@ def received(p: project.Project, fp: str) -> dict | None:
     if not n or not n.get("project") or (n.get("to") and n["to"] != p.name) \
             or (not n.get("via") and n.get("project") == p.name):
         return None
+    if not n.get("to") and not (p.config().get("upstream") or {}).get("ingest"):
+        # A general note is the maintainers': only a project that reads the inbox answers it. A scratch
+        # project replaying a real task's spec once replied to the `[note <fp>]` that spec quoted.
+        return None
     return _route(n, LOCAL, float(n.get("ts") or 0))
 
 
