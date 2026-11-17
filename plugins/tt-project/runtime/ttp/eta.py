@@ -787,12 +787,12 @@ def state_lines(db, where, now: float | None = None, host=None, skip=()) -> list
     etaledger.refresh(db, where, now)
     est = _Est(db, now, core=core_of(where), delivery=delivery_of(where))
     given: list = []
-    out = ["## Expected finish (critical path, measured medians; quote these, never padded worst cases)"]
+    out = ["## Expected finish (critical path: likely = measured median p50, conservative = p90; quote these, never padded worst cases)"]
     # no estimate for one gate and reason: one line (titles in Open tasks); the gate ('after') is kept
     same: dict[tuple[str, str], list[tuple[dict, dict]]] = {}
     for t in hot[:10]:
         on = host(t) if host else ""
-        e = corrected(db, est.task(t['id']), now)
+        e = corrected(db, with_p90(est, est.task(t['id']), t['id']), now)
         given.append((f"t{t['id']}", etaledger.kind_of(db, e), e))
         why = str(e["why"] or "").removeprefix(f"#{t['id']} ")
         if why and not on:

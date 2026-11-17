@@ -77,6 +77,20 @@ def test_eta_conservative_time_is_the_p90_walk_and_never_before_the_likely_one(e
     assert e["end"] == pytest.approx(now + 700) and e["conservative"] == pytest.approx(now + 2 * 700)
 
 
+def test_eta_state_lines_give_urgent_tasks_the_p90_conservative_time(env):
+    from ttp import eta
+    p = make(env)
+    now = time.time()
+    _eh_runs(p, now, "work", [600] * 8 + [3000, 6000])      # p50 600, p90 3300: far from the 2x fallback
+    t = p.db.add_task("urgent next", "s", kind="work", priority=1)
+    lines = eta.state_lines(p.db, p, now)
+    assert "likely = measured median p50, conservative = p90" in lines[0]
+    e = eta.estimate(p.db, t, now)
+    assert e["conservative"] == pytest.approx(now + 100 + 3300)
+    assert lines[1] == f"- #{t} urgent next: {eta.field(e, p, now)}"
+    assert "conservative" in lines[1]
+
+
 def test_eta_conservative_keeps_the_ledgers_measured_multiple_when_it_is_larger(env):
     from ttp import eta, etaledger
     p = make(env)
