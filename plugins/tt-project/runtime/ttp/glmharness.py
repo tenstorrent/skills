@@ -49,7 +49,14 @@ def install(version: str = "", root: Path | None = None) -> dict:
     return benchrun.harness_ready(HARNESS, version or _installed(base), base)
 
 
-def files(run_dir: Path, inst: dict, model: str, runtime_dir: str) -> list[str]:
+def digest_on(cfg: dict) -> bool:
+    """`route.code_sonnet.glm.digest`: a command's long output reaches the model as a digest (glmenv.digest).
+    Off by default; the dry run's GLM arm turns it on."""
+    got = ((cfg.get("route") or {}).get("code_sonnet") or {}).get("glm")
+    return isinstance(got, dict) and got.get("digest") is True
+
+
+def files(run_dir: Path, inst: dict, model: str, runtime_dir: str, digest: bool = False) -> list[str]:
     """Write the launch script and the guarded config into `run_dir`; returns the argv. The prompt is read from
     stdin (the `-t` task), the trajectory goes to trajectory.json."""
     q = shlex.quote
@@ -61,6 +68,7 @@ def files(run_dir: Path, inst: dict, model: str, runtime_dir: str) -> list[str]:
     from .project import durable_write
     durable_write(run_dir / "mini.yaml", conf)
     body = ("export MSWEA_CONFIGURED=true MSWEA_SILENT_STARTUP=1 MSWEA_COST_TRACKING=ignore_errors "
+            + (f"{glmenv.DIGEST_ENV}=1 " if digest else "") +
             f"MSWEA_GLOBAL_CONFIG_DIR={q(str(run_dir / 'mswea'))} PYTHONPATH={q(runtime_dir)}\n"
             f"exec {q(inst['bin'])} -y --exit-immediately -l 0 -m {q('openai/' + model)} -c mini.yaml "
             f"-c {q(str(run_dir / 'mini.yaml'))} -o {q(str(run_dir / 'trajectory.json'))} -t \"$(cat)\"\n")
@@ -96,7 +104,7 @@ def apply(spec: dict, run_dir: Path, cfg: dict, runtime_dir: str, budget_usd=Non
     if lead and lead not in prompt:
         from .project import durable_write
         durable_write(run_dir / "prompt.md", lead + "\n\n" + prompt)
-    spec["argv"] = files(run_dir, inst, str(spec.get("model") or ""), runtime_dir)
+    spec["argv"] = files(run_dir, inst, str(spec.get("model") or ""), runtime_dir, digest_on(cfg))
     spec.pop("stdin", None)   # mini reads plain text, not Claude Code's stream-json
     spec["openai_env"] = True
     spec["harness"] = {"kind": HARNESS, "version": inst.get("version")}
@@ -112,6 +120,15 @@ def cost_so_far(bridge, prov) -> float | None:
     return float(benchrun.harness_spend(prov, usage)["cost_usd"]) if usage.get("calls") else None
 
 
+def context_per_call(usage: dict) -> int:
+    """The average context a call carried: prompt tokens (fresh and cached) over the bridge's call count. The
+    digest's measure (glmenv.digest): the same task with it on and off."""
+    calls = int(usage.get("calls") or 0)
+    if not calls:
+        return 0
+    return round((int(usage.get("input_tokens") or 0) + int(usage.get("cache_read_input_tokens") or 0)) / calls)
+
+
 def result_line(stats: dict | None, prov) -> str:
     """A Claude-stream `result` line carrying the bridge's usage, which the provider's parser reads as the run's
     tokens (a mini-swe-agent run streams none): '' when the bridge counted no call."""
@@ -124,7 +141,8 @@ def result_line(stats: dict | None, prov) -> str:
                        "total_cost_usd": got["cost_usd"],
                        "usage": {"input_tokens": got["input_tokens"], "output_tokens": got["output_tokens"],
                                  "cache_read_input_tokens": got["cache_read_tokens"],
-                                 "cache_creation_input_tokens": int(usage.get("cache_write_tokens") or 0)}}) + "\n"
+                                 "cache_creation_input_tokens": int(usage.get("cache_write_tokens") or 0)},
+                       "ttp_calls": int(usage["calls"]), "ttp_context_tokens_per_call": context_per_call(usage)}) + "\n"
 
 
 def write_result(out_path, stats: dict | None, prov) -> None:

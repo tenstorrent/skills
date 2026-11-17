@@ -13,10 +13,17 @@ no model call:
 
 `ttp push` stays the one way to publish: it runs the project's checks first and refuses a run that handed its
 task back (cli.glm_gate and `_cmd_push`). The module imports minisweagent only inside the mini process; refusal()
-needs nothing but the standard library, so the harness's tests run without it."""
+needs nothing but the standard library, so the harness's tests run without it.
+
+An optional digest (`route.code_sonnet.glm.digest`, off by default) keeps server context small: a command's output
+over DIGEST_BYTES reaches the model as its first lines, every failing line and its tail, and the whole output is
+saved in the run folder for the agent to open. It is about server capacity (a GLM call carries a long context),
+never about hiding a failure: every line that looks like one is kept."""
 from __future__ import annotations
 
 import os
+import re
+from pathlib import Path
 
 try:   # inside the mini process only
     from minisweagent.environments.local import LocalEnvironment
@@ -32,6 +39,15 @@ except ImportError:   # tests and the daemon: the refusal logic below needs neit
 from . import glmguard
 
 CLASS_PATH = "ttp.glmenv.GuardedEnvironment"
+DIGEST_ENV = "TTP_GLM_DIGEST"   # the harness script sets it to 1 when the digest is on
+DIGEST_BYTES = 8192   # output at or under this reaches the model whole
+DIGEST_HEAD, DIGEST_TAIL, DIGEST_TAIL_NO_HIT = 5, 40, 80   # lines kept besides the failing ones
+SAVE_DIR = "tool-output"
+# A line that looks like a failure: kept whole, whatever the output's size.
+FAILING = re.compile(
+    r"(?i)\b(?:fail(?:ed|ure|ures|s)?|errors?|exceptions?|traceback|assert(?:ion)?(?:error)?|panic(?:ked)?|fatal"
+    r"|not ok|denied|refused|timed? out|cannot|unable|undefined|segfault|abort(?:ed)?)\b"
+    r"|^E\s|^\s*[✗✘]|exit(?:ed)? (?:code|status) [1-9]|returned [1-9]")
 
 
 def refusal(command: str, cwd: str = "", run_dir: str = "", env=None) -> str | None:
@@ -52,6 +68,38 @@ def refusal(command: str, cwd: str = "", run_dir: str = "", env=None) -> str | N
     return None
 
 
+def digest(output: str, returncode, save_dir, limit: int = DIGEST_BYTES) -> str:
+    """`output` as the model sees it: whole when it is within `limit` bytes (or cannot be saved), else its first
+    lines, every failing line (with its line number) and its tail, the whole output saved under `save_dir`."""
+    if len(output.encode("utf-8", "replace")) <= limit or not save_dir:
+        return output
+    lines = output.splitlines()
+    try:
+        folder = Path(save_dir)
+        folder.mkdir(parents=True, exist_ok=True)
+        saved = folder / f"{len(list(folder.glob('*.txt'))) + 1:04d}.txt"
+        from .project import durable_write
+        durable_write(saved, output)
+    except OSError:
+        return output   # nothing saved, nothing hidden
+    bad = {i for i, ln in enumerate(lines) if FAILING.search(ln)}
+    tail = DIGEST_TAIL if bad or not returncode else DIGEST_TAIL_NO_HIT
+    keep = bad | set(range(min(DIGEST_HEAD, len(lines)))) | set(range(max(0, len(lines) - tail), len(lines)))
+    out, last = [], -1
+    for i in sorted(keep):
+        if i != last + 1:
+            out.append(f"[... {i - last - 1} lines omitted ...]")
+        out.append(f"{i + 1}: {lines[i]}" if i in bad else lines[i])
+        last = i
+    if last < len(lines) - 1:
+        out.append(f"[... {len(lines) - 1 - last} lines omitted ...]")
+    head = (f"[output digest: {len(lines)} lines, {len(output)} bytes; the first lines, all {len(bad)} failing lines "
+            f"(prefixed with their line number) and the last lines are shown; the whole output is in {saved}: "
+            f"open it with cat or sed -n]")
+    shown = "\n".join([head, *out])
+    return shown if len(shown) < len(output) else output
+
+
 class GuardedEnvironment(LocalEnvironment):
     """mini-swe-agent's local environment with the GLM arm's side-effect guard in front of each command."""
 
@@ -63,4 +111,7 @@ class GuardedEnvironment(LocalEnvironment):
             glmguard.hit(run_dir, why)   # the hand-back to Opus; the command is never run
             raise Submitted({"role": "exit", "content": f"refused by the guard: {why}",
                              "extra": {"exit_status": "GuardRefused", "submission": ""}})
-        return super().execute(action, cwd, timeout=timeout)
+        got = super().execute(action, cwd, timeout=timeout)
+        if os.environ.get(DIGEST_ENV) == "1" and run_dir and isinstance(got, dict) and isinstance(got.get("output"), str):
+            got = {**got, "output": digest(got["output"], got.get("returncode"), Path(run_dir) / SAVE_DIR)}
+        return got

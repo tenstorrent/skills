@@ -675,3 +675,83 @@ def test_the_daemon_bounces_a_glm_run_that_touched_a_policy_file_and_the_next_ru
     assert daemon.Daemon._policy_bounce(me, {"id": 1, "task": t["id"]}) == ""   # unreadable: review reads it
     (p.harness / policyfiles.FILE).unlink()
     assert daemon.Daemon._policy_bounce(me, {"id": 1, "task": t["id"]}) == ""
+
+
+# The tool-output digest of the mini-swe-agent GLM harness (glmenv.digest): server capacity, never a hidden failure.
+def _digest_output(n=600, fail_at=(137, 402)):
+    lines = [f"collecting item {i} ok" for i in range(n)]
+    for i in fail_at:
+        lines[i] = f"FAILED tests/test_x.py::test_{i} - AssertionError: {i}"
+    return "\n".join(lines) + "\n3 failed, 597 passed"
+
+
+def test_digest_keeps_every_failing_line_and_a_tail_and_saves_the_whole_output(tmp_path):
+    from ttp import glmenv
+    out = _digest_output()
+    assert len(out) > glmenv.DIGEST_BYTES
+    got = glmenv.digest(out, 1, tmp_path / glmenv.SAVE_DIR)
+    assert len(got) < len(out) / 3
+    assert "138: FAILED tests/test_x.py::test_137" in got and "403: FAILED tests/test_x.py::test_402" in got
+    assert "3 failed, 597 passed" in got and "collecting item 300 ok" not in got   # the tail stays, the middle goes
+    assert "lines omitted" in got
+    saved = sorted((tmp_path / glmenv.SAVE_DIR).glob("*.txt"))
+    assert [f.name for f in saved] == ["0001.txt"] and saved[0].read_text() == out and str(saved[0]) in got
+    glmenv.digest(out, 1, tmp_path / glmenv.SAVE_DIR)
+    assert (tmp_path / glmenv.SAVE_DIR / "0002.txt").is_file()
+
+
+def test_digest_leaves_short_output_alone_and_never_hides_when_it_cannot_save(tmp_path):
+    from ttp import glmenv
+    short = "ok\n" * 100
+    assert glmenv.digest(short, 0, tmp_path / "d") == short and not (tmp_path / "d").exists()
+    out = _digest_output()
+    assert glmenv.digest(out, 1, "") == out   # no run folder: whole
+    blocker = tmp_path / "file"
+    blocker.write_text("x")
+    assert glmenv.digest(out, 1, blocker / "sub") == out   # cannot be saved: whole
+    # every line that looks like a failure survives, in a big output of failures too
+    many = "\n".join(f"Traceback line {i}" if i % 2 else f"filler {i}" for i in range(2000))
+    got = glmenv.digest(many, 1, tmp_path / "e")
+    assert all(f"{i + 1}: Traceback line {i}" in got for i in range(1, 2000, 2)) or got == many
+
+
+def test_digest_is_off_unless_set_and_the_guarded_environment_applies_it_to_the_output(tmp_path, monkeypatch):
+    from ttp import glmenv, glmharness
+    assert not glmharness.digest_on({}) and not glmharness.digest_on(_ca_cfg())
+    assert glmharness.digest_on(_ca_cfg(glm={**_CA_GLM, "digest": True})) and not glmharness.digest_on(_ca_cfg(glm={**_CA_GLM, "digest": "yes"}))
+    wt, rd = _gg_run(tmp_path)
+    monkeypatch.setenv("TTP_RUN_DIR", str(rd))
+    big = _digest_output()
+
+    class Base:
+        def execute(self, action, cwd="", *, timeout=None):
+            return {"output": big, "returncode": 1}
+    if glmenv.LocalEnvironment is not object:
+        pytest.skip("minisweagent is importable here: its own environment class is the base")
+    env = type("Env", (glmenv.GuardedEnvironment, Base), {})()
+    monkeypatch.delenv(glmenv.DIGEST_ENV, raising=False)
+    assert env.execute({"command": "ls"}, str(wt))["output"] == big
+    monkeypatch.setenv(glmenv.DIGEST_ENV, "1")
+    got = env.execute({"command": "ls"}, str(wt))
+    assert got["returncode"] == 1 and len(got["output"]) < len(big) and "138: FAILED" in got["output"]
+    assert (rd / glmenv.SAVE_DIR / "0001.txt").read_text() == big
+
+
+def test_the_launch_script_sets_the_digest_flag_only_when_asked_and_a_result_line_carries_context_per_call(tmp_path):
+    import json
+    from ttp import glmenv, glmharness
+    inst = {"kind": "mini-swe-agent", "version": "2.4.6", "bin": "/opt/harness/bin/mini"}
+    glmharness.files(tmp_path, inst, "m", "/opt/rt")
+    assert glmenv.DIGEST_ENV not in (tmp_path / "harness.sh").read_text()
+    glmharness.files(tmp_path, inst, "m", "/opt/rt", digest=True)
+    assert f"{glmenv.DIGEST_ENV}=1" in (tmp_path / "harness.sh").read_text()
+    usage = {"calls": 4, "input_tokens": 100_000, "cache_read_input_tokens": 220_000, "output_tokens": 1000}
+    assert glmharness.context_per_call(usage) == 80_000 and glmharness.context_per_call({}) == 0
+
+    class Prov:
+        model = "m"
+
+        def price(self):
+            return (1.0, 0.1, 4.0)
+    line = json.loads(glmharness.result_line({"usage": usage}, Prov()))
+    assert line["ttp_calls"] == 4 and line["ttp_context_tokens_per_call"] == 80_000
