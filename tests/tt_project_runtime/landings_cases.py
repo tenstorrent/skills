@@ -89,7 +89,7 @@ def test_landings_push_batch_deaths_are_counted_by_cause(env):
     from ttp import landings
     p = make(env)
     now = time.time()
-    for text in ("daemon restarted after a reboot", "worker was killed", "host reboot", "no result"):
+    for text in ("daemon restarted after a reboot", "worker was killed", "host reboot", "ended before writing an outcome (a reboot, a kill or a crash)"):
         p.db.x("INSERT INTO events(ts, source, kind, text) VALUES(?,?,?,?)", (now - 100, "push", "push_batch_died", text))
     got = landings.push_batch_deaths(p.db, now - 86400)
     assert got["count"] == 4 and got["causes"] == {"reboot": 2, "kill": 1, "no outcome written": 1}

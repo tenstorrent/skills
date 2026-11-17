@@ -393,7 +393,7 @@ def push_batch_deaths(db, since: float) -> dict:
     causes: dict[str, int] = {}
     for r in rows:
         t = (r["text"] or "").lower()
-        c = ("reboot" if "reboot" in t else "kill" if "kill" in t else "crash" if "crash" in t
+        c = ("no outcome written" if "before writing an outcome" in t else "reboot" if "reboot" in t else "kill" if "kill" in t else "crash" if "crash" in t
              else "timeout" if "timed out" in t or "timeout" in t else "no outcome written")
         causes[c] = causes.get(c, 0) + 1
     return {"count": len(rows), "causes": dict(sorted(causes.items(), key=lambda x: -x[1]))}
