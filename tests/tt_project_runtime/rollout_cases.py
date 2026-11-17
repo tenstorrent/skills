@@ -105,14 +105,14 @@ def test_rollout_state_is_account_wide_and_touches_no_project_file(env, capsys):
         assert f"rollout.{key}" in project.ACCOUNT_USER_ONLY and key in project.ACCOUNT_KEYS["rollout"]
 
 
-H = 3600.0
+_RH = 3600.0
 
 
 def _ro_flag(flag, to, ago_h, kind="set"):
     """The flag set to `to` `ago_h` hours back: its account value and a ledger record with that time."""
     from ttp import project, rollout
     rollout._put("flags", flag, to)
-    rec = {"ts": time.time() - ago_h * H, "kind": kind, "flag": flag, "from": "off", "to": to, "reason": "t", "by": "user",
+    rec = {"ts": time.time() - ago_h * _RH, "kind": kind, "flag": flag, "from": "off", "to": to, "reason": "t", "by": "user",
            "snapshot": {}}
     project.durable_append(project.HOME_DIR / rollout.LEDGER, json.dumps(rec) + "\n")
 
@@ -120,13 +120,13 @@ def _ro_flag(flag, to, ago_h, kind="set"):
 def _ro_runs(p, n, failed, ago_h, status_fail="failed"):
     for i in range(n):
         p.db.x("INSERT INTO runs(task,role,status,started,ended) VALUES(1,'worker',?,?,?)",
-               (status_fail if i < failed else "done", time.time() - ago_h * H - 5, time.time() - ago_h * H))
+               (status_fail if i < failed else "done", time.time() - ago_h * _RH - 5, time.time() - ago_h * _RH))
 
 
 def _ro_landed(p, took_h, cost, ago_h):
     tid = p.db.add_task("t", "s", kind="code")
-    land = time.time() - ago_h * H
-    p.db.x("UPDATE tasks SET created=?, spent_usd=? WHERE id=?", (land - took_h * H, cost, tid))
+    land = time.time() - ago_h * _RH
+    p.db.x("UPDATE tasks SET created=?, spent_usd=? WHERE id=?", (land - took_h * _RH, cost, tid))
     p.db.x("INSERT INTO task_landings(marker, task, sha, target, ts) VALUES(?,?,?,?,?)", (f"m{tid}", tid, "a" * 40, "main", land))
 
 
@@ -134,7 +134,7 @@ def test_health_signals_fail_only_past_their_threshold_and_sample_minimum(env):
     from ttp import rollout_health as rh
     p = make(env)
     th, now = rh.thresholds({"thresholds": {"min_runs": 20}}), time.time() + 60
-    since = now - 24 * H
+    since = now - 24 * _RH
     _ro_runs(p, 40, 4, 100)                # baseline: 10% failed
     _ro_runs(p, 19, 19, 5)                 # too few runs to judge
     assert rh.signals(p.db, since, now, th)["failing"] == [] and not rh.signals(p.db, since, now, th)["enough"]
@@ -159,22 +159,22 @@ def test_health_flags_a_new_high_alert_a_forward_revert_and_a_stuck_task(env):
     from ttp import rollout_health as rh
     p = make(env)
     th, now = rh.thresholds(None), time.time() + 60
-    since = now - 24 * H
+    since = now - 24 * _RH
     ins = "INSERT INTO alerts(key, raised, severity, text) VALUES(?,?,?,'x')"
-    p.db.x(ins, ("push_not_landing", now - 100 * H, "high"))     # seen in the baseline: not new
-    p.db.x(ins, ("push_not_landing", now - 5 * H, "high"))
-    p.db.x(ins, ("push_queue_dying", now - 5 * H, "low"))        # not high
-    p.db.x(ins, ("some_other_key", now - 5 * H, "high"))         # not in the landing path
+    p.db.x(ins, ("push_not_landing", now - 100 * _RH, "high"))     # seen in the baseline: not new
+    p.db.x(ins, ("push_not_landing", now - 5 * _RH, "high"))
+    p.db.x(ins, ("push_queue_dying", now - 5 * _RH, "low"))        # not high
+    p.db.x(ins, ("some_other_key", now - 5 * _RH, "high"))         # not in the landing path
     assert rh.signals(p.db, since, now, th)["failing"] == []
-    p.db.x(ins, ("after_push_failed", now - 4 * H, "high"))
+    p.db.x(ins, ("after_push_failed", now - 4 * _RH, "high"))
     assert rh.signals(p.db, since, now, th)["failing"] == ["new high alert after_push_failed"]
     rid = p.db.add_task("Redo #7 alone: x", "s", kind="code", origin="daemon")
     assert any("1 forward revert" in s for s in rh.signals(p.db, since, now, th)["failing"])
     p.db.x("DELETE FROM tasks WHERE id=?", (rid,))
     tid = p.db.add_task("stuck", "s", kind="code")
-    p.db.x("UPDATE tasks SET status='running', updated=? WHERE id=?", (now - 3 * H, tid))
+    p.db.x("UPDATE tasks SET status='running', updated=? WHERE id=?", (now - 3 * _RH, tid))
     assert any(f"#{tid}" in s for s in rh.signals(p.db, since, now, th)["failing"])
-    p.db.x("INSERT INTO runs(task,role,status,started) VALUES(?,'worker','running',?)", (tid, now - 3 * H))
+    p.db.x("INSERT INTO runs(task,role,status,started) VALUES(?,'worker','running',?)", (tid, now - 3 * _RH))
     assert not any(f"#{tid}" in s for s in rh.signals(p.db, since, now, th)["failing"]), "a live run is not stuck"
 
 
@@ -270,7 +270,7 @@ def test_a_ring_with_no_samples_for_72_hours_stays_and_leaves_a_low_note(env):
 
 
 def _spend(p, usd, ago_h=1):
-    p.db.x("INSERT INTO ledger(ts,provider,source,usd) VALUES(?,?,?,?)", (time.time() - ago_h * H, "claude", "task:1", usd))
+    p.db.x("INSERT INTO ledger(ts,provider,source,usd) VALUES(?,?,?,?)", (time.time() - ago_h * _RH, "claude", "task:1", usd))
 
 
 def test_a_scratch_project_has_a_25_dollar_daily_cap_that_only_it_gets_and_that_can_be_raised_or_off(env):
