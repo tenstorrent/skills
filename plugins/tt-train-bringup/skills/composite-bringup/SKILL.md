@@ -82,6 +82,20 @@ required. Then run N training steps of the full model and compare the loss traje
 torch reference within a stated tolerance. Put the harness under `tt-train/tests/python/` so it runs
 as an ordinary test.
 
+### The real-weight end-to-end check
+
+The module harness compares random weights against a reference the same agent wrote, so a convention
+both sides get wrong the same way cancels: RoPE pair order and its weight permutation, head order in
+a packed projection, the halves of a packed SwiGLU. Otherwise only the loss trajectory catches
+those, and it is the phase's most expensive evidence.
+
+Run the cheap version first: the **real checkpoint**'s first two layers, embedding, final norm and
+LM head, on real token ids, against `AutoModelForCausalLM` at the pinned revision truncated to the
+same two layers, in fp64; compare logits by PCC and relative error at the harness's bars. Minutes,
+no hand-written reference, and it fails on every convention mistake above. Record it as its own row
+in `doc/composite/README.md`; the trajectory then tests the optimiser, data path and accumulation,
+not the architecture.
+
 ### Budget the reference before running it
 
 The torch reference is the most expensive artefact of this phase and the one most likely to consume
