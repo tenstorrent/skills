@@ -23,6 +23,11 @@ A light pick books as avoided the measured mean cost of a wake at its from-tier 
 jevuse.review keeps the use on while it pays. Each Jev call is settled when its run ends: a light pick
 whose run asked for more is wrong, and its avoided cost becomes minus the light run it added.
 
+Learned escalation (`direct`): when a light wake of a kind of task and wake reason escalated (asked to go
+on at a higher tier, KEY "asked") in more than `share` (half) of the last `last_n` such cases, the light
+wake only adds a turn: the wake runs at the task's own tier at once. `waiting.wake_escalation` holds
+`enabled` (the off-switch), `last_n`, `min_cases` and `share`; `escalation_stats` lists the rates.
+
 Check plans (PLAN in the hand-off): a waiting hand-off with a retry_when gets planned checks, so its
 model looks at the wait a known number of times, not on every timer. By default one interim check soon
 after the wait starts (did it start, does it run, no early errors) and one at its expected end, the
@@ -197,6 +202,77 @@ def settle(db: DB, note: dict, result: dict, now: float | None = None) -> None:
              (-(lo if lo is not None else _fallback(bud.TIER_ORDER[0])), int(got["call"])))
 
 
+ESCALATION_DEFAULTS = {"enabled": True, "last_n": 8, "min_cases": 4, "share": 0.5}
+
+
+def escalation_settings(cfg: dict) -> dict:
+    got = dict(ESCALATION_DEFAULTS)
+    raw = ((cfg or {}).get("waiting") or {}).get("wake_escalation")
+    if isinstance(raw, dict):
+        for k, dflt in ESCALATION_DEFAULTS.items():
+            v = raw.get(k, dflt)
+            try:
+                got[k] = bool(v) if k == "enabled" else (float(v) if k == "share" else max(1, int(v)))
+            except (TypeError, ValueError):
+                pass
+    return got
+
+
+def escalation_cases(db: DB, limit: int = 800) -> list[tuple[str, str, bool]]:
+    """The finished light wakes of waiting tasks, newest first, as (task kind, wake reason, escalated): a
+    light wake escalated when the task's next run was an escalated wake (it asked for more), and did not
+    when its next run was anything else. A light wake with no later run is not yet a case."""
+    import json as _json
+    rows = db.q("SELECT r.id, r.task, r.note, t.kind FROM runs r JOIN tasks t ON t.id=r.task "
+                "WHERE r.role!='coordinator' AND r.status!='running' ORDER BY r.id DESC LIMIT ?", (limit,))
+    after: dict = {}   # task -> the run that followed the one being walked (walking newest first)
+    cases = []
+    for r in rows:
+        try:
+            wake = (_json.loads(r["note"] or "{}") or {}).get("wake")
+        except (ValueError, TypeError, AttributeError):
+            wake = None
+        wake = wake if isinstance(wake, dict) else {}
+        nxt = after.get(r["task"])
+        if wake.get("tier") == bud.TIER_ORDER[0] and not wake.get("escalated") and nxt is not None:
+            cases.append((r["kind"], str(wake.get("reason") or "unrecorded"), bool(nxt)))
+        after[r["task"]] = bool(wake.get("escalated"))
+    return cases
+
+
+def escalation_stats(db: DB, cfg: dict | None = None) -> list[dict]:
+    """Per (task kind, wake reason): the light wakes counted, how many escalated and the share, over the
+    last `last_n` cases of each."""
+    s = escalation_settings(cfg or {})
+    seen: dict = {}
+    for kind, why, esc in escalation_cases(db):
+        got = seen.setdefault((kind, why), [])
+        if len(got) < s["last_n"]:
+            got.append(esc)
+    return [{"kind": k, "reason": w, "cases": len(v), "escalated": sum(v), "share": round(sum(v) / len(v), 2)}
+            for (k, w), v in sorted(seen.items())]
+
+
+def direct(db: DB, cfg: dict, task: dict, prev: dict) -> dict | None:
+    """For a wake that would run at light and whose kind and reason mostly escalate: {"tier": the task's
+    own tier, "kind", "reason", "cases", "escalated"}; else None (the wake keeps its tier). Wakes of a wait
+    already handed back unchanged, escalated wakes and tasks already at light never take it, and
+    `waiting.wake_escalation.enabled` false turns it off."""
+    s = escalation_settings(cfg)
+    own = task.get("tier") if task.get("tier") in bud.TIER_ORDER else "standard"
+    if not s["enabled"] or own == bud.TIER_ORDER[0] or not isinstance(prev, dict) or prev.get("escalated_wake"):
+        return None
+    if prev.get("status") != "waiting" or bud.stale_wakes(prev) or bud.wake_tier(own, prev, cfg) != bud.TIER_ORDER[0]:
+        return None
+    why = reason(prev)
+    if why in FIX:   # its wake already carries the tier the work needs
+        return None
+    got = [e for k, w, e in escalation_cases(db) if k == task.get("kind") and w == why][:int(s["last_n"])]
+    if len(got) < s["min_cases"] or sum(got) / len(got) <= s["share"]:
+        return None
+    return {"tier": own, "kind": task.get("kind"), "reason": why, "cases": len(got), "escalated": sum(got)}
+
+
 def stats(db: DB, tz: str, days: float = 7, now: float | None = None) -> dict:
     """Task wakes per home-zone day by reason: runs, $ and how many only handed the wait back."""
     import json as _json
@@ -224,7 +300,7 @@ def stats(db: DB, tz: str, days: float = 7, now: float | None = None) -> dict:
                 row["rewaited"] += 1
         except (OSError, TypeError, ValueError, AttributeError):
             pass
-    return {"days": days, "per_day": dict(sorted(out.items()))}
+    return {"days": days, "per_day": dict(sorted(out.items())), "escalation": escalation_stats(db)}
 
 
 def text(s: dict) -> str:
@@ -237,6 +313,8 @@ def text(s: dict) -> str:
             lines.append(f"  {why}: {v['wakes']} wakes, ${v['usd']:.2f}, {v['rewaited']} handed the wait back ({by})")
     if not s["per_day"]:
         lines.append("  no task wakes recorded")
+    for e in s.get("escalation") or []:
+        lines.append(f"light wakes that escalated, {e['kind']}/{e['reason']}: {e['escalated']}/{e['cases']} ({e['share']:.0%})")
     return "\n".join(lines)
 
 

@@ -4163,6 +4163,16 @@ Dispatch ranks the required owners of an open obligation first, then urgent task
 
 A run whose supervisor process is gone (its recorded start no longer matches) is lost at once, even when its last lease renewal is under 3 minutes old; before, the daemon waited for the lease to go stale first. The task is then requeued and started by the next dispatch pass. Dispatch itself runs every 3 to 20 seconds while a task could start, so an idle slot and a ready task meet within a minute.
 
+## A light wake that mostly escalates is skipped
+
+A light wake of a waiting task that finds work asks to go on at a higher tier, which costs a second
+turn. `waketier.direct` counts, per task kind and wake reason, the last `waiting.wake_escalation.last_n`
+(8) finished light wakes and how many were followed by an escalated wake. With `min_cases` (4) or more
+and more than `share` (0.5) of them escalated, such a wake runs at the task's own tier at once. Wakes
+of a wait handed back unchanged, escalated wakes and failure reasons never take it, and
+`waiting.wake_escalation.enabled` false turns it off. `ttp stats --wakes` lists each kind and reason's
+escalation rate. The daemon applies the pick where it sets a wake's tier.
+
 ## Where things live
 
 | Path | Holds |
