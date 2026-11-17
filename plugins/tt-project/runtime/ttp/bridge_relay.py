@@ -639,6 +639,7 @@ def session(ssh: list[str], state: dict) -> tuple[int, bool]:
     """Run one session, passing its stderr through; (exit code, whether a forward failed). ssh is ended
     with its group once its remote command ended (that command's exit code) or the local agent it
     forwards stopped answering (AGENT_DEAD), never left to exit by itself."""
+    # own session: ssh and what it spawns are ended whole (its group) by end_group(), never left behind
     child = subprocess.Popen(ssh, stderr=subprocess.PIPE, start_new_session=True)
     state["child"] = child
     sess: dict = {"failed": False, "end": None, "end_t": 0.0, "agent": ""}
@@ -763,6 +764,7 @@ def main(argv: list[str], platform: str | None = None, awake_spawn=None) -> int:
 def run(ssh: list[str], tag: str, d: str, state: dict) -> int:
     """The session (with --tag, its stale-session and dead-agent recovery) until it ends or is stopped."""
     if not tag:
+        # own session: ssh is ended whole (its group) by end_group() once stopped
         state["child"] = subprocess.Popen(ssh, start_new_session=True)
         if state["stop"]:
             end_group(state["child"])
