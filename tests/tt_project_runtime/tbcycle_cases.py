@@ -601,6 +601,7 @@ def test_terminalbench_reference_marks_a_trial_with_no_model_call_or_broken_call
     assert lines[0]["outcome"] == tbcycle.NOT_RUN and lines[0]["reward"] is None and lines[0]["heldout_reward"] == 1.0
     md = (tbcycle.ref_dir("nr") / "table.md").read_text()
     assert "| chat | 2 of 3 | 3 | 0 | 0 | 0 |" in md, "passed 2, scored 3, no server cut, no fault, none not run"
+    assert "| chat | 2 of 3 | 3 | 0 | 0 | 0 | 0 | 1 of 37 |" in md, "1 failed call of the 37 over every trial run"
 
 
 def test_terminalbench_not_run_covers_no_calls_and_server_broken_unsolved_trials_only():

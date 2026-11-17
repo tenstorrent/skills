@@ -618,7 +618,8 @@ def _verdict(r: dict, lines: list[dict]) -> str | None:
 
 def table(run: str, note: str = "") -> str:
     """The named run's markdown table (terminalbench/<run>/table.md): passed of the task count per model over
-    scored trials, cut-offs with a server-or-model verdict each, median server wait and tokens/s, the limit,
+    scored trials, cut-offs with a server-or-model verdict each, failed server calls (stream or parse errors
+    included) of all calls over every trial run, median server wait and tokens/s, the limit,
     Claude dollars, parity and how each model was called. Read from the trial rows, so it shows a run in progress."""
     from . import benchparity, harborslice, serverhealth
     d, metas = ref_dir(run), []
@@ -632,8 +633,8 @@ def table(run: str, note: str = "") -> str:
     booked = {r["model"] for r in reference(run)}
     out = [f"# Terminal-Bench run {run}", "",
            "| model | effort | route | passed | scored | not scored (server) | faults | not run | cut-offs "
-           "| median server wait s | median tokens/s | Claude $ | state |",
-           "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+           "| failed calls | median server wait s | median tokens/s | Claude $ | state |",
+           "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     cuts, pars = [], []
     for sl, m in metas:
         tasks, model = m["tasks"], m.get("model") or sl
@@ -647,16 +648,21 @@ def table(run: str, note: str = "") -> str:
                 cuts.append(f"- {model} / {t}: {v}")
         srv = [x.get("server") or {} for x in latest.values() if x.get("outcome") != serverhealth.OUTCOME]
         cost = sum(float(x.get("cost_usd") or 0) for x in all_lines)
+        calls = [(x.get("server") or {}) for x in all_lines]
+        failed = (f"{sum(int(c.get('failed_calls') or 0) for c in calls)} of "
+                  f"{sum(int(c.get('calls') or 0) for c in calls)}")
         par = {**(m.get("parity") or {}), "model": model, "effort": m.get("effort")}
         pars.append(par)
         out.append(f"| {model} | {m.get('effort')} | {m.get('route')} | {sc['passed']} of {len(tasks)} | {sc['trials']} "
-                   f"| {sc.get('server', 0)} | {sc['faults']} | {len(tasks) - len(latest)} | {n_cut} "
+                   f"| {sc.get('server', 0)} | {sc['faults']} | {len(tasks) - len(latest)} | {n_cut} | {failed} "
                    f"| {_med([x.get('wait_median_s') for x in srv])} | {_med([x.get('tps_median') for x in srv])} "
                    f"| {round(cost, 2) if m.get('route') == BRIDGE_ROUTE else '-'} "
                    f"| {'booked' if model in booked else 'running or owed reruns'} |")
     lims = sorted({str(p.get("limit_s")) for p in pars})
     out += ["", "Passed counts scored trials only; the denominator is the task count. Not run: no trial yet, or "
-            "one whose agent made no model call, or whose failed server calls broke it short of a pass. "
+            "one whose agent made no model call, whose failed server calls broke it short of a pass, or that harbor "
+            "broke before grading. Failed calls: server calls that failed (stream or parse errors included) of all "
+            "calls, over every trial run, reruns included. "
             f"Limit: {', '.join(lims) or '?'} "
             f"(seconds per task, or each task's own limit), counted as {pars[0].get('limit_counts') if pars else '?'}.", "",
             "## Cut-offs", ""] + (cuts or ["None."]) + [""]
