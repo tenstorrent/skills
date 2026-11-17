@@ -244,10 +244,155 @@ def test_terminalbench_step_without_compose_stops_before_any_trial_with_one_mess
     monkeypatch.delenv("DOCKER_CONFIG", raising=False)
     d, cfg, clock, sleeps, sleep = _tb_setup(env, monkeypatch)
     cfg["providers"] = {"chat": {"endpoint": "gw"}}
-    p = types.SimpleNamespace(config=lambda: cfg)
+    p = make(env)
+    p.config = lambda: cfg
     a = ap.Namespace(action="terminalbench", models=None, runner=None, reference=False)
     with pytest.raises(SystemExit):
         cli._terminalbench(p, a, clock["t"])
     err = capsys.readouterr().err.strip()
     assert len(err.splitlines()) == 1 and "docker compose is missing" in err
     assert started == [], "no step, no runner launched"
+    assert json.loads((tbcycle.folder() / tbcycle.PREFLIGHT_FILE).read_text())["fails"] == 1, "the failure is counted"
+
+
+def test_terminalbench_compose_binary_in_the_benchs_own_folder_needs_no_setting(tmp_path, monkeypatch):
+    from ttp import harborslice
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(harborslice, "PLUGIN_DIRS", ())
+    root = tmp_path / "bench"
+    docker = _fake_docker(tmp_path)
+    env = {"PATH": os.environ.get("PATH", "")}
+    assert harborslice.compose(root, {"compose": ""}, env, which=lambda n: docker)[0] is None
+    (root / "compose").mkdir(parents=True)
+    plug = root / "compose" / "docker-compose"
+    plug.write_text("#!/bin/sh\nexit 0\n")
+    plug.chmod(0o755)
+    extra, why = harborslice.compose(root, {"compose": ""}, env, which=lambda n: docker)
+    assert extra == {"DOCKER_CONFIG": str(root / "docker-config")} and why == ""
+    assert (root / "docker-config" / "cli-plugins" / "docker-compose").resolve() == plug.resolve()
+
+
+def test_terminalbench_settings_are_known_to_ttp_config_and_limit_zero_keeps_each_tasks_own_limit(env, tmp_path):
+    from ttp import cli, harborslice, project
+    for key in ("model_bench.terminalbench", "model_bench.terminalbench.compose", "model_bench.terminalbench.limit_s",
+                "model_bench.terminalbench.reference.bridge"):
+        assert project.unknown_key_hint(key) is None, key
+    assert project.unknown_key_hint("model_bench.terminalbenchx") is not None, "a typo is still caught"
+    p = make(env)
+    cli.main(["config", "demo", "model_bench.terminalbench.compose", "/opt/compose"])
+    assert p.raw_config()["model_bench"]["terminalbench"]["compose"] == "/opt/compose"
+    assert harborslice.settings({"model_bench": {"terminalbench": {"limit_s": 0}}})["limit_s"] == 0
+    assert harborslice.settings({"model_bench": {"terminalbench": {"limit_s": 5}}})["limit_s"] == harborslice.LIMIT_S
+    ds = tmp_path / "ds"
+    (ds / "t-a").mkdir(parents=True)
+    (ds / "t-a" / "task.toml").write_text("[agent]\ntimeout_sec = 1800.0\n")
+    st = {**harborslice.settings({"model_bench": {"terminalbench": {"limit_s": 0}}}), "dataset": str(ds)}
+    calls = []
+
+    def runner(cmd, e, timeout):
+        calls.append((cmd, timeout))
+        _fake_trial(cmd, 1.0)
+        return 0, ""
+    harborslice.trial("m", "t-a", tmp_path / "jobs", {}, st, runner, sleep=lambda s: None)
+    assert "--agent-timeout-multiplier" not in calls[0][0], "no multiplier: the task's own limit, the same for all"
+    assert calls[0][1] >= 1800 * 4, "the process ceiling follows the task's own limit"
+
+
+class _FakeBridge:
+    """The claude CLI bridge's surface (claudebridge.ClaudeCliBridge) with no process."""
+    made = []
+
+    def __init__(self, model, effort):
+        self.model, self.effort, self.state = model, effort, []
+        _FakeBridge.made.append(self)
+
+    def start(self):
+        self.state.append("start")
+        return self
+
+    def stop(self):
+        self.state.append("stop")
+
+    def openai_env(self):
+        return {"OPENAI_BASE_URL": "http://127.0.0.1:1/v1", "OPENAI_API_KEY": "run-token"}
+
+    def cost_so_far(self):
+        return 1.2345
+
+    def stats(self):
+        return {"claude_cli": {"version": "9.9 (Claude Code)"}}
+
+
+def test_terminalbench_reference_through_the_claude_bridge_has_no_endpoint_its_own_effort_and_books_cost(env, monkeypatch):
+    from ttp import harborslice, tbcycle
+    d, cfg, clock, sleeps, sleep = _tb_setup(env, monkeypatch, reference={
+        "models": ["claude-sonnet-5-5"], "bridge": ["claude-sonnet-5-5"], "efforts": {"claude-sonnet-5-5": "high"}})
+    seen = []
+
+    def fake_trial(model, task, root, e, st, runner=None, command=None, home=None, **k):
+        seen.append((task, e.get("OPENAI_BASE_URL"), e.get("OPENAI_API_KEY"), command))
+        return {"reward": 1.0, "min": 1.0, "error": None}
+    monkeypatch.setattr(harborslice, "trial", fake_trial)
+    _FakeBridge.made.clear()
+    assert tbcycle.ref_runner(cfg, "claude-sonnet-5-5", {"A": "b"}, clock=lambda: clock["t"], bridge=_FakeBridge) == 3
+    b = _FakeBridge.made[0]
+    assert (b.model, b.effort, b.state) == ("claude-sonnet-5-5", "high", ["start", "stop"]), "up for the run, then down"
+    assert {x[1:3] for x in seen} == {("http://127.0.0.1:1/v1", "run-token")}, "the agent reaches the bridge, no key"
+    assert all("reasoning_effort" not in x[3] for x in seen), "the CLI carries the effort, not the call arguments"
+    row = tbcycle.reference()[0]
+    assert row["route"] == "claude-cli" and row["effort"] == "high" and row["cost_usd"] == 1.2345
+    assert row["claude_cli"] == "9.9 (Claude Code)" and row["passed"] == 3
+    got = tbcycle.ref_start(cfg, ["something-else"], [].append)   # a bridge model needs no endpoint listing
+    assert got["not_served"] == []
+
+
+def test_terminalbench_reference_runs_parallel_tasks_and_wraps_endpoint_runners_in_the_chat_server_lock(env, monkeypatch):
+    import threading
+    import types
+    from ttp import tbcycle
+    d, cfg, clock, sleeps, sleep = _tb_setup(env, monkeypatch, tasks=[f"t{i}" for i in range(6)], reference={
+        "models": ["open-m", "claude-x"], "bridge": ["claude-x"], "parallel": 3, "endpoint": "gw"})
+    now, peak, gate = [0], [0], threading.Lock()
+
+    def trial(model, task, root):
+        with gate:
+            now[0] += 1
+            peak[0] = max(peak[0], now[0])
+        time.sleep(0.05)
+        with gate:
+            now[0] -= 1
+        return {"reward": 1.0, "min": 1.0, "error": None}
+    assert tbcycle.ref_runner(cfg, "open-m", {}, trial=trial, clock=lambda: clock["t"]) == 6
+    assert 1 < peak[0] <= 3, "reference.parallel tasks at once, never more"
+    assert len((tbcycle.folder() / "reference" / "open-m.jsonl").read_text().splitlines()) == 6, "one row each"
+    argv = []
+    monkeypatch.setattr(tbcycle.subprocess, "Popen", lambda a, **k: argv.append(a))
+    p = types.SimpleNamespace(root=env["tmp"], config=lambda: cfg)
+    tbcycle.launch(p, "open-m", reference=True)
+    tbcycle.launch(p, "claude-x", reference=True)
+    tbcycle.launch(p, "open-m")
+    assert argv[0][3:6] == ["lock", "chat-server", "--"] and argv[0][-3:] == ["--reference", "--runner", "open-m"]
+    assert "lock" not in argv[1] and "--reference" in argv[1], "the claude arm takes no chat-server lock"
+    assert "lock" not in argv[2], "the paced cycle is unchanged"
+    cfg["model_bench"]["terminalbench"]["reference"]["lock"] = ""
+    tbcycle.launch(p, "open-m", reference=True)
+    assert "lock" not in argv[3], "an empty lock setting wraps nothing"
+
+
+def test_terminalbench_preflight_raises_one_event_on_the_third_failure_in_a_row_and_a_pass_resets(env, monkeypatch):
+    from ttp import tbcycle
+    d, cfg, clock, sleeps, sleep = _tb_setup(env, monkeypatch)
+    p = make(env)
+    events = lambda: p.db.q("SELECT source, kind, severity, text FROM events WHERE source = 'model-bench'")
+    why = "docker compose is missing: no working plugin"
+    assert [tbcycle.preflight(p, why, clock["t"] + i) for i in (1, 2)] == [1, 2] and events() == []
+    assert tbcycle.preflight(p, why, clock["t"] + 3) == 3
+    ev = events()
+    assert len(ev) == 1 and ev[0]["kind"] == "observation" and why in ev[0]["text"] and "3 times in a row" in ev[0]["text"]
+    assert tbcycle.preflight(p, why, clock["t"] + 4) == 4 and len(events()) == 1, "one event per streak"
+    assert tbcycle.preflight(p, "", clock["t"] + 5) == 0, "a pass resets the count"
+    tbcycle.preflight(p, why, clock["t"] + 6)
+    tbcycle.preflight(p, why, clock["t"] + 7)
+    assert len(events()) == 1, "two failures after a pass raise nothing"
+    tbcycle.preflight(p, why, clock["t"] + 8)
+    assert len(events()) == 2, "a new streak of three raises its own event"
