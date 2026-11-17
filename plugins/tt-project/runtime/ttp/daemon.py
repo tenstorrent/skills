@@ -1319,6 +1319,7 @@ class Daemon:
         self._tick_began = 0.0   # when the running tick started, monotonic (0: between ticks)
         self._moved = 0.0        # when the running tick last made progress, monotonic
         self._push_budget: tuple[float, pushclaim.Budget] | None = None   # this tick's git time for push checks
+        self._audit_done: dict = {}    # the push audit's settled refs while a capped round goes on
         self._push_carry: dict[str, tuple[float, dict]] = {}   # push checks' remote answers kept for later ticks
         self._sched_runs: dict[str, schedrun.Run] = {}   # schedule name -> its run going on off the tick
         self._sched_swept = False   # process groups an earlier daemon's schedule runs left are killed
@@ -7801,13 +7802,17 @@ class Daemon:
         Skipped while the network is held; past the tick's Budget it resumes next tick from the answers so far."""
         db, now = self.p.db, time.time()
         last = db.kv(pushclaim.AUDIT_KV)
-        if isinstance(last, dict) and now - float(last.get("at") or 0) < pushclaim.AUDIT_EVERY_S:
-            return
+        if isinstance(last, dict):
+            if last.get("pending"):    # a capped round: its next slice follows soon, not in an hour
+                if now - float(last.get("tick") or 0) < pushclaim.PENDING_EVERY_S:
+                    return
+            elif now - float(last.get("at") or 0) < pushclaim.AUDIT_EVERY_S:
+                return
         cache = self._push_net("audit")
         if cache is None:
             return
         try:
-            a = pushclaim.audit(self.p, now=now, max_refs=4, cache=cache)
+            a = pushclaim.audit(self.p, now=now, max_refs=4, cache=cache, done=self._audit_done)
         except pushclaim.OutOfTime:
             self._push_keep("audit", cache)
             return
@@ -7815,6 +7820,10 @@ class Daemon:
             log(self.p, f"push audit failed: {type(e).__name__}: {e}")
             db.set_kv(pushclaim.AUDIT_KV, {**(last if isinstance(last, dict) else {}), "at": now})
             return
+        if a.get("pending"):
+            a["tick"] = now      # the round goes on: the settled refs stay in self._audit_done
+        else:
+            self._audit_done.clear()
         db.set_kv(pushclaim.AUDIT_KV, {**{k: v for k, v in a.items() if k != "landed"}, "gaps": a["gaps"][:50]})
         try:
             for aid in unblock.close_landed(db, a.get("landed") or [], now):

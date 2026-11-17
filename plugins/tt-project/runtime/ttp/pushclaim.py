@@ -53,6 +53,7 @@ NET_BUDGET_S = 30                # git network time (ls-remote, fetch) push chec
 CARRY_S = 120                    # how long an out-of-time tick's remote answers are reused by later ticks
 CARRIED = "carried"              # a cache's keys read on an earlier tick (a set)
 AUDIT_EVERY_S, AUDIT_DAYS, AUDIT_REFS = 3600, 2, 20
+PENDING_EVERY_S = 30             # between the slices of an audit round the per-tick ref cap cut short
 ON_PASS_DIR = "on_pass"          # daemon.ON_PASS_DIR
 
 # A short sha may have no digit (about 1 in 1,000 at 7 characters): a token counts only once it resolves
@@ -608,12 +609,15 @@ def _reattribute(p, t, c: dict, state: str, why: str, claimed: dict, tips: dict)
 
 
 def audit(p, days: float = AUDIT_DAYS, now: float | None = None, max_refs: int = AUDIT_REFS,
-          cache: dict | None = None) -> dict:
+          cache: dict | None = None, done: dict | None = None) -> dict:
     """Done tasks of the last `days` whose claimed pushes are not on the remote: {"counts": {state: n},
     "gaps": [{"task", "title", "state", "why"}], "tasks": n, "landed": [ids of the tasks that claim a
     push, every one confirmed]}. Read-only, apart from fetching the
-    remote's tracking refs. Past `max_refs` distinct refs the rest count as unknown. `cache`: the
-    remote's answers so far (with a Budget, an audit that ran out of time resumes from them)."""
+    remote's tracking refs. Past `max_refs` newly checked distinct refs the rest are pending: counted
+    unknown, with "pending": their number. `done`: the settled answers (ref -> (state, why)) of earlier
+    calls of one round, filled in as refs settle, so a capped audit resumes where the last one stopped and
+    converges to every ref checked without asking the remote about more than `max_refs` per call.
+    `cache`: the remote's answers so far (with a Budget, an audit that ran out of time resumes from them)."""
     from .db import NOT_ABANDONED_SQL, load_result
     now = time.time() if now is None else now
     db = p.db
@@ -623,7 +627,9 @@ def audit(p, days: float = AUDIT_DAYS, now: float | None = None, max_refs: int =
     counts = {CONFIRMED: 0, MISSING: 0, UNKNOWN: 0}
     gaps: list[dict] = []
     cache = {} if cache is None else cache
+    done = {} if done is None else done
     refs: set = set()
+    pending: set = set()
     tips: dict = {}                    # repo -> the push branch's local tip, read once
     claimed: dict[str, list] = {}      # sha -> the tasks claiming it (for a shared claim)
     todo, landed = [], []
@@ -654,16 +660,21 @@ def audit(p, days: float = AUDIT_DAYS, now: float | None = None, max_refs: int =
         all_ok = bool(cs)
         for c in cs:
             k = c.get("marker") or (c["remote"], c["ref"])
-            over = k not in refs and len(refs) >= max_refs
-            if over:
-                state, why = UNKNOWN, f"not checked: more than {max_refs} refs in one audit"
+            sha = c.get("sha") or ""
+            dk = (k, sha[:12], t["id"])    # per task: a shared claim reads differently for each
+            if dk in done:
+                state, why = done[dk]
+            elif k not in refs and len(refs) >= max_refs:
+                pending.add(k)
+                state, why = UNKNOWN, f"not checked yet: more than {max_refs} refs in one tick, resumed on the next"
             else:
                 refs.add(k)
                 _, state, why = check_all(p, [c], cache)[2][0]
-            if state != CONFIRMED and not over and c.get("sha") and not c.get("marker"):
-                state, why = _reattribute(p, t, c, state, why, claimed, tips)
-            elif state != CONFIRMED and not over and c.get("marker"):
-                state, why = _marker_local(p, c, state, why, t["id"], tips)
+                if state != CONFIRMED and c.get("sha") and not c.get("marker"):
+                    state, why = _reattribute(p, t, c, state, why, claimed, tips)
+                elif state != CONFIRMED and c.get("marker"):
+                    state, why = _marker_local(p, c, state, why, t["id"], tips)
+                done[dk] = (state, why)   # an unreadable one too: it settles this round, the next retries it
             if state in (SHARED, UNVERIFIABLE):   # counted apart, only when there are any
                 counts[state] = counts.get(state, 0) + 1
             else:
@@ -679,7 +690,10 @@ def audit(p, days: float = AUDIT_DAYS, now: float | None = None, max_refs: int =
             counts[MISSING] += 1
             gaps.append({"task": t["id"], "title": t["title"], "state": MISSING, "why": why, "sha": "",
                          "source": "on_pass"})
-    return {"at": now, "days": days, "tasks": len(rows), "counts": counts, "gaps": gaps, "landed": landed}
+    out = {"at": now, "days": days, "tasks": len(rows), "counts": counts, "gaps": gaps, "landed": landed}
+    if pending:
+        out["pending"] = len(pending)
+    return out
 
 
 def gap_key(g: dict) -> str:

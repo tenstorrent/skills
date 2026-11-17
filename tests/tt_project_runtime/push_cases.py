@@ -12987,6 +12987,31 @@ def test_the_push_audit_decides_landed_by_ancestry_not_by_the_ref_or_subject_nam
     assert a["counts"]["missing"] == 0 and a["gaps"] == [], a
 
 
+def test_a_capped_push_audit_resumes_its_unchecked_refs_and_converges_to_none_unknown(env, monkeypatch):
+    from ttp import pushclaim
+    p, repo, origin, _ = _push_setup(env, monkeypatch, ["true"])
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/proj")
+    head = _git_out(repo, "rev-parse", "HEAD")
+    for i in range(10):
+        _git_out(repo, "push", "-q", "origin", f"HEAD:refs/heads/r{i}")
+        _audit_done(p, f"t{i}", f"pushed {head[:10]} to origin/r{i}")
+    asked, real = [], pushclaim.check_all
+    monkeypatch.setattr(pushclaim, "check_all", lambda *a, **k: asked.append(a[1][0]["ref"]) or real(*a, **k))
+    done, seen = {}, []
+    for tick in range(5):
+        asked.clear()
+        a = pushclaim.audit(p, max_refs=4, done=done)
+        assert len(set(asked)) <= 4, asked          # never more remote asks per tick than the cap
+        seen.append((a["counts"]["unknown"], a.get("pending", 0)))
+        if not a.get("pending"):
+            break
+    assert seen == [(6, 6), (2, 2), (0, 0)], seen
+    assert a["counts"] == {"confirmed": 10, "missing": 0, "unknown": 0} and len(a["landed"]) == 10
+    # without a carried round the cap alone leaves the rest pending, never settled
+    b = pushclaim.audit(p, max_refs=4)
+    assert b["counts"]["unknown"] == 6 and b["pending"] == 6
+
+
 def _own_branch_setup(env, monkeypatch, on_remote: str | None):
     """A task whose head is on the remote branch `on_remote` ("proj" is the push branch; None: on no
     remote branch); the task's own branch `work` was never pushed unless `on_remote` names it.
