@@ -60,7 +60,7 @@ import time
 import traceback
 from pathlib import Path
 
-from . import loopproxy, poll_s, project
+from . import loopproxy, poll_s, project, serverhealth
 from .project import Project, durable_write, lower_priority
 
 LEASE_EVERY_S = 30
@@ -573,6 +573,11 @@ def supervise(run_dir: Path) -> int:
     argv, env_extra, cwd = spec["argv"], spec.get("env", {}), spec["cwd"]
     timeout_s, budget = float(spec.get("timeout_s", 3600)), spec.get("budget_usd")
     stall_s = float(spec.get("stall_s") or 0)
+    # agent_time (serverhealth): the limit counts the agent's own time, not the wait on the model server;
+    # a wall-clock ceiling keeps a hung server from holding the run.
+    agent_rule = bool(spec.get("agent_time"))
+    ceiling = serverhealth.ceiling_s(timeout_s, spec.get("ceiling_factor") or serverhealth.CEILING_FACTOR, spec.get("ceiling_s"))
+    lim = {"up": 0.0, "wait": 0.0}
     # The secret files go under the daemon's environment: a server's env never changes the worker's
     # PATH, PYTHONPATH, TTP_* or device mask.
     env = {**os.environ, **_env_files(spec), **env_extra}
@@ -645,6 +650,8 @@ def supervise(run_dir: Path) -> int:
             if spec.get("openai_env"):   # an OpenAI-compatible agent (a bench harness arm) uses the /v1 relay
                 env.update(bridge.openai_env())
             env["TTP_RUN_PROXY_PORT"] = bridge.url.rsplit(":", 1)[-1]   # runguard.py: the run's own proxy
+            srv = spec.get("server") or {}   # the model's normal speed (serverhealth.History), when known
+            bridge.calls.configure(srv.get("normal_tps") or 0, srv.get("factor") or serverhealth.FACTOR)
             if spec.get("cell_net"):   # the agent's cell has a network of its own: the bridge reaches it by a socket
                 from .cellnet import forward
                 try:
@@ -774,14 +781,19 @@ def supervise(run_dir: Path) -> int:
                 except OSError:   # the run dir is gone: stop_reason below ends the agent
                     pass
                 st["lease"] = now
-            if up > timeout_s + min(locks.waited(run_dir), timeout_s):
-                threading.Thread(target=stop, args=("timeout",), daemon=True).start()
+            credit = min(locks.waited(run_dir), timeout_s)
+            wait = bridge.server_wait_s() if agent_rule and bridge is not None else 0.0
+            lim["up"], lim["wait"] = up, wait
+            hit = serverhealth.limit_hit(up, wait, timeout_s, ceiling if agent_rule else 0.0, credit)
+            if hit:
+                threading.Thread(target=stop, args=(hit,), daemon=True).start()
             if stall_s:
                 # Stalled = no assistant message, tool result or progress note for stall_s of awake
                 # time, or for a pending tool call's own timeout (plus grace) when that is longer.
                 if progress.poll(up):
-                    st["active"] = up
-                if up - st["active"] > progress.limit(stall_s) or (
+                    st["active"], st["wait0"] = up, wait
+                # server wait since the last activity is not silence of the agent's
+                if (up - st["active"]) - max(wait - st.get("wait0", 0.0), 0.0) > progress.limit(stall_s) or (
                         waits_idle and progress.waited(up, stall_s) >= WAIT_SHARE * stall_s):
                     threading.Thread(target=stop, args=("stalled",), daemon=True).start()
             if budget is not None and now - st["budget"] >= BUDGET_EVERY_S:
@@ -896,6 +908,10 @@ def supervise(run_dir: Path) -> int:
             print(f"runner: credential files changed during the run: {changed}", flush=True)
     if bridge is not None:
         exit_info["bridge"] = bridge.stats()   # endpoint fault kinds for routing's fallback (route.py)
+    if agent_rule:   # which rule the limit ran under, and its figures
+        exit_info["limits"] = {"rule": serverhealth.RULE, "up_s": round(lim["up"], 1), "server_wait_s": round(lim["wait"], 1),
+                               "agent_s": round(serverhealth.agent_s(lim["up"], lim["wait"]), 1),
+                               "timeout_s": timeout_s, "ceiling_s": ceiling}
     _mask_run(run_dir, exit_info)   # before exit.json: the daemon reads the run's output and hand-off only after it
     _write_exit(run_dir, exit_info)
     return rc

@@ -309,9 +309,13 @@ class ClaudeCliBridge(Bridge):
         system, blocks = render(body.get("messages") or [], tools)
         res, kind, err = None, "error", ""
         for attempt in range(self.retries + 1):
+            timed = self.calls.begin()
             res, kind, err = self.call(system, blocks)
             if not kind:
+                # the CLI's own API time is the call's generation time (its start-up is ours, not the model's)
+                timed.end(result_usage(res)["output_tokens"], gen_s=float((res or {}).get("duration_api_ms") or 0) / 1000)
                 break
+            timed.end(0, "fault")
             with self._lock:
                 self.last_fault = kind
                 self.faults[kind] = self.faults.get(kind, 0) + 1
@@ -319,8 +323,16 @@ class ClaudeCliBridge(Bridge):
                     for k, v in result_usage(res).items():
                         self.usage[k] += v
             if kind != "capacity" or attempt == self.retries:
+                if kind == "capacity":
+                    with self._lock:
+                        self.busy["gave_up"] += 1   # a capacity stop, as the chat bridge counts one
                 break
-            time.sleep(self.retry_wait_s * (attempt + 1))
+            wait = self.retry_wait_s * (attempt + 1)
+            with self._lock:
+                self.busy["waits"] += 1
+                self.busy["waited_s"] += wait
+            self.calls.sleep_wait(wait)
+            time.sleep(wait)
         if kind:
             code = {"auth": 401, "capacity": 429}.get(kind, 502)
             msg = f"claude CLI {kind} fault" + (f": {(res or {}).get('result') or err}"[:300] if kind != "auth" else "")

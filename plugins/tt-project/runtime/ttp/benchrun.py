@@ -39,7 +39,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import bench, cellenv, cellnet, cellns, gitmemo
+from . import bench, cellenv, cellnet, cellns, gitmemo, serverhealth
 from .project import durable_write, open_append
 
 PROMPT = ("You are working in the git repository in your current directory. Do the task below there: make "
@@ -134,17 +134,22 @@ def parse_arm(text: str) -> tuple[str, dict]:
 # (HARNESS_DIR/<kind>-<version>, never ~/.local or a global prefix) and talks to the chat provider's
 # OpenAI-compatible endpoint through the run's bridge (its /v1 relay: native tool calls, no translation).
 HARNESSES = {"opencode": {"npm": "opencode-ai", "bin": "node_modules/.bin/opencode"},
-             "mini-swe-agent": {"pypi": "mini-swe-agent", "bin": "venv/bin/mini"}}
+             "mini-swe-agent": {"pypi": "mini-swe-agent", "bin": "venv/bin/mini"},
+             "codex": {"npm": "@openai/codex", "bin": "node_modules/.bin/codex"}}
+# Tools a harness arm needs beside its agent (installed the same way, never run as an arm): the proxy that turns
+# Codex's Responses API calls into the bridge's Chat Completions (codexproxy.py).
+TOOLS = {"litellm-proxy": {"pypi": "litellm[proxy]", "bin": "venv/bin/litellm"}}
 HARNESS_DIR = Path.home() / ".tt-project" / "model-bench" / "harness"
 # How an arm's effort reaches the model in each harness: the bridge sets the chat provider's effort fields
 # (providers.chat effort_fields) on every call, over whatever the harness itself sends.
 # Providers a harness arm may use: the chat provider's endpoint for every harness, and the logged-in Claude
 # CLI for mini-swe-agent (claudebridge: the CLI in print mode as the model, never an API key).
-HARNESS_PROVIDERS = {"mini-swe-agent": ("chat", "claude")}
+HARNESS_PROVIDERS = {"mini-swe-agent": ("chat", "claude"), "codex": ("chat", "claude")}
 CLAUDE_EFFORT_NOTE = "no effort flag; the bridge passes --effort to the claude CLI on each call"
 EFFORT_NOTE = {"claude": "Claude Code's effort; the bridge sets the chat provider's effort fields",
                "opencode": "no --variant; the bridge sets the chat provider's effort fields on each call",
-               "mini-swe-agent": "no effort flag; the bridge sets the chat provider's effort fields on each call"}
+               "mini-swe-agent": "no effort flag; the bridge sets the chat provider's effort fields on each call",
+               "codex": "the proxy hook drops Codex's own reasoning effort; the bridge sets the model's effort on each call"}
 
 
 def check_harness(name: str, arm: dict) -> None:
@@ -158,13 +163,13 @@ def check_harness(name: str, arm: dict) -> None:
 
 def latest_version(kind: str) -> str:
     """The current release of harness `kind`, from its package index."""
-    spec = HARNESSES[kind]
+    spec = HARNESSES.get(kind) or TOOLS[kind]
     if "npm" in spec:
         got = subprocess.run(["npm", "view", spec["npm"], "version"], capture_output=True, text=True, timeout=120)
         version = got.stdout.strip()
     else:
         import urllib.request
-        with urllib.request.urlopen(f"https://pypi.org/pypi/{spec['pypi']}/json", timeout=60) as r:
+        with urllib.request.urlopen(f"https://pypi.org/pypi/{spec['pypi'].split('[')[0]}/json", timeout=60) as r:
             version = str(json.loads(r.read())["info"]["version"])
     if not re.fullmatch(r"[0-9][0-9A-Za-z.+-]*", version or ""):
         raise BenchError(f"could not resolve the current {kind} version: {version!r}")
@@ -174,17 +179,22 @@ def latest_version(kind: str) -> str:
 def harness_ready(kind: str, version: str = "", root: Path | None = None) -> dict:
     """Harness `kind` at `version` (default: the current release), installed under `root` (HARNESS_DIR)
     once: {kind, version, dir, bin}. The folder's harness.json marks a finished install."""
-    spec, root = HARNESSES[kind], Path(root or HARNESS_DIR)
+    spec, root = HARNESSES.get(kind) or TOOLS[kind], Path(root or HARNESS_DIR)
     version = version or latest_version(kind)
     folder = root / f"{kind}-{version}"
     marker = folder / "harness.json"
     if not marker.exists():
         folder.mkdir(parents=True, exist_ok=True)
+        dl = folder / "download"   # the main package's own archive, kept to record its sha256
+        shutil.rmtree(dl, ignore_errors=True)
+        dl.mkdir()
         if "npm" in spec:
-            steps = [["npm", "install", "--prefix", str(folder), "--no-fund", "--no-audit",
-                      f"{spec['npm']}@{version}"]]
+            steps = [["npm", "pack", "--silent", "--pack-destination", str(dl), f"{spec['npm']}@{version}"],
+                     ["npm", "install", "--prefix", str(folder), "--no-fund", "--no-audit", f"{spec['npm']}@{version}"]]
         else:
             steps = [[sys.executable, "-m", "venv", str(folder / "venv")],
+                     [str(folder / "venv" / "bin" / "python"), "-I", "-m", "pip", "download", "-q", "--no-deps",
+                      "-d", str(dl), f"{spec['pypi'].split('[')[0]}=={version}"],
                      [str(folder / "venv" / "bin" / "python"), "-I", "-m", "pip", "install", "-q",
                       f"{spec['pypi']}=={version}"]]
         with open(folder / "install.log", "ab") as log:
@@ -194,9 +204,11 @@ def harness_ready(kind: str, version: str = "", root: Path | None = None) -> dic
                     raise BenchError(f"installing {kind} {version} failed: see {folder / 'install.log'}")
         if not (folder / spec["bin"]).exists():
             raise BenchError(f"installing {kind} {version} left no {spec['bin']}")
-        durable_write(marker, json.dumps({"kind": kind, "version": version, "bin": spec["bin"]}) + "\n")
+        sums = {f.name: _sha(f.read_bytes()) for f in sorted(dl.iterdir()) if f.is_file()}
+        durable_write(marker, json.dumps({"kind": kind, "version": version, "bin": spec["bin"], "sha256": sums}) + "\n")
     got = json.loads(marker.read_text())
-    return {"kind": kind, "version": got["version"], "dir": str(folder), "bin": str(folder / got["bin"])}
+    return {"kind": kind, "version": got["version"], "dir": str(folder), "bin": str(folder / got["bin"]),
+            "sha256": got.get("sha256") or {}}
 
 
 def harness_files(run: Path, arm: dict, inst: dict) -> list[str]:
@@ -887,6 +899,20 @@ def run_cell(bench_dir: Path, out: Path, task: dict, cell: dict, arm: dict, opts
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def agent_time(opts: dict) -> bool:
+    """Whether the cell limit counts the agent's own time (default), not wall time (`agent_time` false)."""
+    return bool(opts.get("agent_time", True))
+
+
+def server_factor(opts: dict) -> float:
+    return float(opts.get("server_factor") or serverhealth.FACTOR)
+
+
+def history(opts: dict) -> "serverhealth.History":
+    """The per-model record of healthy calls that defines each model's normal speed (`server_history`: a path)."""
+    return serverhealth.History(opts.get("server_history"), int(opts.get("server_window") or serverhealth.WINDOW))
+
+
 def launch(run: Path, ws: Path, prompt: str, arm: dict, opts: dict, cfg: dict, hidden: list[Path], cell_env: dict,
            env: dict | None = None, own: list[Path] | None = None, cell=None) -> tuple:
     """Run the arm's agent on `prompt` in `ws` under the runner supervisor (run dir `run`, new), reads of
@@ -930,6 +956,11 @@ def launch(run: Path, ws: Path, prompt: str, arm: dict, opts: dict, cfg: dict, h
                            "budget_usd": opts["budget_usd"]}} if inst and provider == "claude" else
                {"bridge": chatbridge.settings(cfg, "standard", arm["model"], arm["effort"])}
                if provider == "chat" else {}), **({"openai_env": True} if inst else {})}
+    if agent_time(opts):   # the limit counts the agent's own time, not the server's wait (serverhealth)
+        spec["agent_time"] = True
+        spec["ceiling_s"] = serverhealth.ceiling_s(opts["timeout_s"], opts.get("ceiling_factor") or serverhealth.CEILING_FACTOR)
+        if normal := history(opts).normal(arm["model"], int(opts.get("server_min_calls") or serverhealth.MIN_CALLS)):
+            spec["server"] = {"normal_tps": normal["tps"], "factor": server_factor(opts)}
     durable_write(run / "run.json", json.dumps(spec, indent=1))
     began = time.time()
     proxy = cellnet.connect_proxy(cell.sock("proxy"), cell.proxy_domains) if cell is not None and cell.proxy_domains \
@@ -938,7 +969,7 @@ def launch(run: Path, ws: Path, prompt: str, arm: dict, opts: dict, cfg: dict, h
         with open(run / "runner.log", "wb") as log:
             subprocess.run([*_boot("ttp.runner"), str(run)], cwd=str(run), env=cell_env,
                            stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                           timeout=opts["timeout_s"] + 300)
+                           timeout=(spec["ceiling_s"] if spec.get("agent_time") else opts["timeout_s"]) + 300)
     except subprocess.TimeoutExpired:
         return prov, round(time.time() - began, 1), True
     finally:
@@ -1148,6 +1179,7 @@ def _finish(row: dict, bench_dir: Path, task: dict, ws: Path, run: Path, keep: P
         row.update(outcome="error", endpoint_fault=fault)
         if ((ended.get("bridge") or {}).get("busy") or {}).get("gave_up"):
             row["capacity_stop"] = True   # the bridge waited out the model's 429s as far as allowed
+    server_status(row, ended, opts)
     keep.mkdir(parents=True, exist_ok=True)
     for name in ("output.jsonl", "exit.json", "result.json", "run.json", "runner.log", "stderr.log",
                  "trajectory.json", "opencode.json", "mini.yaml", "harness.sh"):
@@ -1156,6 +1188,31 @@ def _finish(row: dict, bench_dir: Path, task: dict, ws: Path, run: Path, keep: P
     durable_write(keep / "diff.patch", diff.decode(errors="replace"))
     durable_write(keep / "tests.log", log_tail)
     return row
+
+
+def server_status(row: dict, ended: dict, opts: dict) -> None:
+    """Record what the server did to a cell (the call summary, the limit rule it ran under) and mark it
+    `server` (not scored, never a fail, queued for a rerun) when it was cut by the limit, the ceiling or a
+    capacity refusal while its calls ran slower than the model's normal speed (serverhealth.classify). A
+    cell that passed stays a pass. The healthy cells' calls define each model's normal speed."""
+    bridge = ended.get("bridge") or {}
+    srv = bridge.get("server") or {}
+    row["limit_rule"] = (ended.get("limits") or {}).get("rule") or "wall_time"
+    if ended.get("limits"):
+        row["limits"] = ended["limits"]
+    if srv:
+        row["server"] = {k: v for k, v in srv.items() if k != "per_call"}
+    hist, factor = history(opts), server_factor(opts)
+    normal = hist.normal(row.get("model", ""), int(opts.get("server_min_calls") or serverhealth.MIN_CALLS))
+    if normal:
+        row["server_normal"] = normal
+    if row.get("outcome") in ("fail", "done", "error"):
+        why = serverhealth.classify(ended.get("stopped"), bridge, normal, factor)
+        if why:
+            serverhealth.mark(row, why)
+            return
+    if srv.get("per_call") and not serverhealth.slow(srv["per_call"], normal, factor):
+        hist.add(row.get("model", ""), srv["per_call"])
 
 
 def criteria(spec: str) -> str:
@@ -1182,6 +1239,7 @@ def blind_cells(out: Path, tasks: dict, arms: dict, cells: list[dict]) -> dict:
             rows[(r["task"], r["rep"], r["arm"])] = r
         except (ValueError, KeyError, TypeError):
             continue
+    rows = {k: r for k, r in rows.items() if r.get("outcome") != serverhealth.OUTCOME}   # not scored until rerun
     reps = sorted({c["rep"] for c in cells})
     got = []
     for tid, task in tasks.items():

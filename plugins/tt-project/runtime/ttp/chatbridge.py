@@ -58,7 +58,7 @@ import urllib.error
 import urllib.request
 import uuid
 
-from . import endpoint, redact
+from . import endpoint, redact, serverhealth
 from .providers.base import challenged
 
 UPSTREAM_TIMEOUT_S = 600
@@ -615,6 +615,7 @@ class Bridge:
         # Passed-through OpenAI calls' usage (relay): their agents report none Claude-style, so the bridge counts.
         self.usage = {"calls": 0, "input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0}
         self.busy = {"waits": 0, "waited_s": 0.0, "gave_up": 0}   # capacity waits (busy_wait), for stats()
+        self.calls = serverhealth.Calls()   # per call: server wait, output tokens, tokens/s (stats()["server"])
         self._sleep = time.sleep
         self.server: http.server.ThreadingHTTPServer | None = None
         self.thread: threading.Thread | None = None
@@ -784,7 +785,29 @@ class Bridge:
                 **({"mid_run": [dict(m) for m in self.mid_run], "model": self.model} if self.mid_run else {}),
                 **({"busy": {**self.busy, "waited_s": round(self.busy["waited_s"], 1)}} if self.busy["waits"]
                    or self.busy["gave_up"] else {}),
-                **({"usage": dict(self.usage)} if self.usage["calls"] else {})}
+                **({"usage": dict(self.usage)} if self.usage["calls"] else {}),
+                **({"server": self.calls.export()} if self.calls.rows else {})}
+
+    def server_wait_s(self) -> float:
+        """The time spent waiting on the server so far (in-flight calls included): the cell limit does not count it."""
+        return self.calls.wait_s()
+
+    def _timed_open(self, h, req: dict):
+        """_open, timed as one call of `h` (its first byte is marked when the stream's first line is read)."""
+        self._end_call(h, 0, "fault")   # an earlier attempt of the same request that failed
+        call = self.calls.begin()
+        try:
+            resp = self._open(req)
+        except BaseException:
+            call.end(0, "fault")
+            raise
+        h.ttp_call = call
+        return resp
+
+    def _end_call(self, h, out: int, status: str = "ok") -> None:
+        call, h.ttp_call = getattr(h, "ttp_call", None), None
+        if call is not None:
+            call.end(out, status)
 
     def _open(self, req: dict):
         r = urllib.request.Request(f"{self.base_url}/chat/completions", data=json.dumps(req).encode(), headers={
@@ -818,7 +841,7 @@ class Bridge:
             req = make(used)
             try:
                 try:
-                    resp = self._open(with_fields(req, {} if rejected else fields))
+                    resp = self._timed_open(h, with_fields(req, {} if rejected else fields))
                 except urllib.error.HTTPError as e:
                     if rejected or not fields:
                         raise
@@ -832,7 +855,7 @@ class Bridge:
                     with self._swap_lock:   # once, then the rest of the run goes without them (`used`'s only)
                         if self.model == used:
                             self.rejected = True
-                    resp = self._open(req)
+                    resp = self._timed_open(h, req)
             except urllib.error.HTTPError as e:
                 detail = getattr(e, "ttp_detail", None)
                 if detail is None:
@@ -843,6 +866,7 @@ class Bridge:
                 wait = self._busy_wait(e, detail, tries, waited)
                 if wait is not None and wait >= 0:
                     tries, waited = tries + 1, waited + wait
+                    self.calls.sleep_wait(wait)
                     self._sleep(wait)
                     continue
                 self._fault(e.code, detail)
@@ -878,22 +902,28 @@ class Bridge:
                 try:
                     data = json.loads(resp.read())
                 except ValueError:
+                    self._end_call(h, 0, "fault")
                     return h._reply(*self._malformed("the upstream answer is not JSON"))
                 if data.get("error"):
+                    self._end_call(h, 0, "fault")
                     return h._reply(*self._fault_reply(_chunk_error(data, self._scrub), data))
                 self._ok()
                 self._count(data.get("usage"))
+                self._end_call(h, usage_of(data.get("usage"))["output_tokens"])
                 return h._reply(200, data)
             h.send_response(200)
             h.send_header("Content-Type", "text/event-stream")
             h.send_header("Cache-Control", "no-cache")
             h.send_header("Transfer-Encoding", "chunked")
             h.end_headers()
-            usage = None
+            usage, seen, broke = None, 0, False
             try:
                 for raw in resp:
+                    if getattr(h, "ttp_call", None) is not None:
+                        h.ttp_call.byte()
                     line = raw.decode("utf-8", "replace").strip()
                     if line.startswith("data:") and line[5:].strip() not in ("", "[DONE]"):
+                        seen += len(line)
                         try:
                             usage = (json.loads(line[5:]) or {}).get("usage") or usage
                         except (ValueError, AttributeError):
@@ -907,7 +937,9 @@ class Bridge:
                 self._ok()
             except OSError:
                 self._fault(0)
+                broke = True
             self._count(usage)
+            self._end_call(h, usage_of(usage)["output_tokens"] or seen // 120, "fault" if broke else "ok")
 
     def _count(self, u) -> None:
         if not isinstance(u, dict):
@@ -928,10 +960,13 @@ class Bridge:
                 try:
                     data = json.loads(resp.read())
                 except ValueError:
+                    self._end_call(h, 0, "fault")
                     return h._reply(*self._malformed("the upstream answer is not JSON"))
                 if data.get("error"):
+                    self._end_call(h, 0, "fault")
                     return h._reply(*self._fault_reply(_chunk_error(data, self._scrub), data))
                 self._ok()
+                self._end_call(h, usage_of(data.get("usage"))["output_tokens"])
                 return h._reply(200, from_chat(data, body.get("model") or self.model))
             self._stream(h, resp, Stream(body.get("model") or self.model))
 
@@ -947,12 +982,15 @@ class Bridge:
                 h.wfile.write(b"%x\r\n%s\r\n" % (len(data), data))
                 h.wfile.flush()
 
-        errored = False
+        errored, seen = False, 0
         try:
             for raw in resp:
+                if getattr(h, "ttp_call", None) is not None:
+                    h.ttp_call.byte()
                 line = raw.decode("utf-8", "replace").strip()
                 if not line.startswith("data:"):
                     continue
+                seen += len(line)
                 payload = line[5:].strip()
                 if payload == "[DONE]":
                     break
@@ -977,9 +1015,11 @@ class Bridge:
             if not errored:
                 self._ok()
                 send(st.end())
+            self._end_call(h, usage_of(st.usage)["output_tokens"] or seen // 120, "fault" if errored else "ok")
             h.wfile.write(b"0\r\n\r\n")
             h.wfile.flush()
         except (OSError, socket.timeout) as e:
+            self._end_call(h, 0, "fault")
             self._fault(0)
             try:   # the upstream stream broke: say so in the stream, as the API does
                 send(_sse("error", error_for(0, self._scrub(str(e)))[1]))
