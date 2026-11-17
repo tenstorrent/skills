@@ -44,7 +44,13 @@ matmuls and attention) name the kernel that will actually be compiled: the progr
 kernel source files, including any fork a ttml path selects (a `_metal2` variant found on day 35 of
 the reference bring-up belonged on this line on day 1), the DEST sync mode (half sync caps
 fp32-accumulate throughput), the core grid on the model's shapes, and the expected fraction of the
-FPU peak. These three ops are the loop's first candidates; "ttnn matmul, exists" is not an entry.
+FPU peak. The core grid is two numbers, not one: the chip's compute grid (from the ladder's
+`HARDWARE_CAPACITY` line) and the cores the chosen program config actually launches at this op's
+shape, with their ratio. A config that fills 96 of 120 cores is a planned loss of a fifth of the
+chip, and it belongs in the loop's day-1 candidates with that number next to it, not in a cost
+model as an occupancy factor. Rounding inside a config generator is where those cores go (padding
+a per-core tile count up to an even number loses two rows of a ten-row grid), so read the
+generator's output at the model's real shapes, not its intent. These three ops are the loop's first candidates; "ttnn matmul, exists" is not an entry.
 When the layout of section 5 is multi-chip, list the per-rank shard shapes next to the full shapes;
 the composite harness and the loop's kernels work on the shard shapes.
 
@@ -109,7 +115,10 @@ the useful-work MFU numerator. Record the counting convention and derivation for
 
 For a distributed step count useful work over the global batch once: TP shards partition that work,
 while DP replicas process distinct samples. Derive the nominal denominator from the actual compute
-grid and participating chips at the documented precision/fidelity convention. Record these alongside
+grid and participating chips at the documented precision/fidelity convention. The denominator is
+the whole grid of every participating chip; occupancy below it is a result, never a smaller
+denominator. MFU against the cores a config happens to use hides the largest and cheapest win in
+the bring-up. Record these alongside
 batch, sequence, TP/DP and useful FLOPs; never copy a previous box's core count or multiply TP work
 by the chip count again. Cross-box comparisons report wall time and both denominators explicitly.
 
@@ -189,7 +198,8 @@ so the composite phase's layout choices already favour fewer bytes and fewer act
 `doc/plan.md` contains the hard-constraints block and the five artefacts with numbers, the exact
 reference commit and HF revision, the recipe, the chips and their firmware bundle. The roofline
 target is a single wall ms/step and MFU figure at the nominal peak with its derivation and the
-delivered-clock margin; the top three ops name their compiled kernel source and % of peak; the
+delivered-clock margin; the top three ops name their compiled kernel source, % of peak and the
+cores their program config launches against the chip's grid; the
 multi-chip fit decision is explicit; on an authorised box every allowed shape and layout is costed
 and the fastest that fits is chosen. The inventory selects reusable training paths, layouts and
 one-time constant preparation for the first baseline; the useful-FLOP derivation follows the
