@@ -272,6 +272,11 @@ def test_terminalbench_compose_binary_in_the_benchs_own_folder_needs_no_setting(
     extra, why = harborslice.compose(root, {"compose": ""}, env, which=lambda n: docker)
     assert extra == {"DOCKER_CONFIG": str(root / "docker-config")} and why == ""
     assert (root / "docker-config" / "cli-plugins" / "docker-compose").resolve() == plug.resolve()
+    from ttp import modelbench, tbcycle   # the CLI looks in the bench's own folder, not its harbor venv folder
+    monkeypatch.setattr(modelbench, "home", lambda: root.parent)
+    monkeypatch.setattr(tbcycle, "DIR", root.name)
+    monkeypatch.setattr(harborslice.shutil, "which", lambda n: docker)
+    assert tbcycle.compose({}, env) == ({"DOCKER_CONFIG": str(root / "docker-config")}, "")
 
 
 def test_terminalbench_settings_are_known_to_ttp_config_and_limit_zero_keeps_each_tasks_own_limit(env, tmp_path):

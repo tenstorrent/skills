@@ -132,6 +132,13 @@ def folder() -> Path:
     return modelbench.home() / DIR
 
 
+def compose(cfg: dict, env: dict | None = None) -> tuple[dict | None, str]:
+    """harborslice.compose from the bench's own folder: a compose binary in folder()/compose (a name kept out
+    of the run folders by RESERVED) needs no setting, and the docker config link lives beside it."""
+    from . import harborslice
+    return harborslice.compose(folder(), settings(cfg), env)
+
+
 def _load() -> dict:
     try:
         v = json.loads((folder() / STATE).read_text())

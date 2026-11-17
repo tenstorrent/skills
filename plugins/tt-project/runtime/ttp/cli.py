@@ -9136,13 +9136,13 @@ def _terminalbench(p, a, now: float) -> None:
         if not venv:
             fail(why)
         env = harborslice.child_env(venv, got.url, got.key)
-        extra, why = harborslice.compose(tbcycle.folder() / "harbor", tbcycle.settings(cfg), env)
+        extra, why = tbcycle.compose(cfg, env)
         if extra is None:
             fail(why)
         print(json.dumps({"model": a.runner, "trials": tbcycle.runner(
             cfg, a.runner, {**env, **extra})}))
         return
-    extra, why = harborslice.compose(tbcycle.folder() / "harbor", tbcycle.settings(cfg))
+    extra, why = tbcycle.compose(cfg)
     if extra is None:   # checked before any runner starts: no trial without compose
         fail(why)
     tbcycle.preflight(p, "", now)
@@ -9172,7 +9172,7 @@ def _terminalbench_reference(p, a, cfg: dict) -> None:
         if not venv:
             die(f"model-bench terminalbench --reference: {why}")
         env = harborslice.child_env(venv, *((got.url, got.key) if got and not bridged else ()))
-        extra, why = harborslice.compose(tbcycle.folder() / "harbor", tbcycle.settings(cfg), env)
+        extra, why = tbcycle.compose(cfg, env)
         if extra is None:
             die(f"model-bench terminalbench --reference: {why}")
         print(json.dumps({"model": a.runner, "reference": True, "trials": tbcycle.ref_runner(
