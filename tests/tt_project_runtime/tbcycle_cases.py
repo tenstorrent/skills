@@ -606,6 +606,12 @@ def test_terminalbench_reference_marks_a_trial_with_no_model_call_or_broken_call
     md = (tbcycle.ref_dir("nr") / "table.md").read_text()
     assert "| chat | 2 of 3 | 21%-94% | 3 | 0 | 0 | 0 |" in md, "passed 2 (95% interval 21-94%), scored 3, no server cut, no fault, none not run"
     assert "| chat | 2 of 3 | 21%-94% | 3 | 0 | 0 | 0 | 0 | 1 of 37 |" in md, "1 failed call of the 37 over every trial run"
+    meta = tbcycle.ref_dir("nr") / "open-m.json"
+    m = json.loads(meta.read_text())
+    m["parity"]["kind"] = "endpoint: an older wording, booked before a change"
+    meta.write_text(json.dumps(m))
+    assert tbcycle.KIND[tbcycle.CHAT_ROUTE] in tbcycle.table("nr") and "older wording" not in tbcycle.table("nr"), \
+        "a booked row prints the route's current wording"
 
 
 def test_terminalbench_not_run_covers_no_calls_and_server_broken_unsolved_trials_only():

@@ -653,6 +653,8 @@ def table(run: str, note: str = "") -> str:
                   f"{sum(int(c.get('calls') or 0) for c in calls)}")
         lo, hi = benchv2.wilson(sc["passed"], len(tasks))   # over the task count, as the passed column
         par = {**(m.get("parity") or {}), "model": model, "effort": m.get("effort")}
+        if par.get("route") in KIND:  # rows booked before a wording change print today's wording
+            par["kind"] = KIND[par["route"]]
         pars.append(par)
         out.append(f"| {model} | {m.get('effort')} | {m.get('route')} | {sc['passed']} of {len(tasks)} "
                    f"| {lo:.0%}-{hi:.0%} | {sc['trials']} "
