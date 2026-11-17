@@ -84,7 +84,8 @@ def tool_header(tools: list[dict]) -> str:
     """The user turn's opening: the agent's tools and how to call one. A tool with a single string
     parameter is called with that value as the block's raw body (no JSON escaping of a shell command)."""
     lines = ["You can call tools. To call one, write a block with its name and the argument(s) as shown, "
-             "after any text. You may write several blocks in one reply; each runs, and its result comes back.", ""]
+             "after any text. Write one block per reply and stop right after it: its result comes back in the next "
+             "turn. Further blocks in the same reply are discarded.", ""]
     for t in tools or ():
         fn = t.get("function") or {}
         props = (fn.get("parameters") or {}).get("properties") or {}
@@ -166,10 +167,10 @@ def _unwrap(body: str, single: str) -> str:
     return body
 
 
-_BLOCK = re.compile(r'<tool_call(?P<attrs>[^>]*)>\n?(?P<body>.*?)\n?</tool_call>', re.DOTALL)
+_BLOCK = re.compile(r'<tool_call(?P<attrs>[^>]*)>\n?(?P<body>.*?)\n?</(?:tool_call|invoke)>', re.DOTALL)
 _NAME = re.compile(r'name="([^"]*)"')
 # The XML call form the CLI's models are trained on: <invoke name="x"><parameter name="p">v</parameter></invoke>
-_INVOKE = re.compile(r'<invoke\s+name="(?P<name>[^"]*)"\s*>(?P<body>.*?)</invoke>', re.DOTALL)
+_INVOKE = re.compile(r'<invoke\s+name="(?P<name>[^"]*)"\s*>(?P<body>.*?)</(?:invoke|tool_call)>', re.DOTALL)
 _PARAM = re.compile(r'<parameter\s+name="([^"]*)"\s*>(.*?)</parameter>', re.DOTALL)
 
 
@@ -234,8 +235,7 @@ def parse_reply(text: str, tools: list[dict]) -> tuple[str, list[dict]]:
                       "function": {"name": name, "arguments": json.dumps(args)}})
         return ""
     rest = _BLOCK.sub(take, text.strip()).strip()
-    if not calls:   # no block in our format: the model fell back to the XML form it was trained on
-        rest = _INVOKE.sub(take_invoke, rest).strip()
+    rest = _INVOKE.sub(take_invoke, rest).strip()   # the XML form the model was trained on, alone or mixed in
     return rest, calls
 
 

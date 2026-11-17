@@ -485,3 +485,22 @@ def test_claudebridge_parse_reply_reads_the_xml_parameter_form_of_a_tool_with_se
     assert json.loads(calls[0]["function"]["arguments"]) == {"cmd": "ls -la", "wait_ms": 500, "tty": True}
     text, calls = claudebridge.parse_reply('<tool_call name="run">not json, no tags</tool_call>', tools)
     assert calls == [] and "not json" in text
+
+
+def test_claudebridge_parse_reply_takes_both_call_forms_of_one_reply_and_leaves_no_markup():
+    from ttp import claudebridge
+    tools = [{"type": "function", "function": {"name": "run", "parameters": {"type": "object", "properties": {
+        "cmd": {"type": "string"}, "dir": {"type": "string"}}}}}]
+    reply = ('Reading.\n<tool_call name="run">{"cmd": "ls"}</tool_call>\n'
+             '<invoke name="run"><parameter name="cmd">pwd</parameter><parameter name="dir">/x</parameter></invoke>')
+    text, calls = claudebridge.parse_reply(reply, tools)
+    assert text == "Reading." and [json.loads(c["function"]["arguments"]) for c in calls] == [
+        {"cmd": "ls"}, {"cmd": "pwd", "dir": "/x"}]
+
+
+def test_claudebridge_parse_reply_tolerates_a_mismatched_closing_tag():
+    from ttp import claudebridge
+    tools = [{"type": "function", "function": {"name": "run", "parameters": {"type": "object", "properties": {
+        "cmd": {"type": "string"}, "dir": {"type": "string"}}}}}]
+    text, calls = claudebridge.parse_reply('<tool_call name="run">\n<parameter name="cmd">ls</parameter>\n</invoke>', tools)
+    assert text == "" and json.loads(calls[0]["function"]["arguments"]) == {"cmd": "ls"}

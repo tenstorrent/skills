@@ -86,7 +86,7 @@ def test_claude_cli_render_keeps_the_system_prompt_byte_for_byte_and_round_trips
     assert calls == [] and "other" in text
     _, calls = claudebridge.parse_reply('<tool_call name="bash">\nls\n</tool_call>\n'
                                         '<invoke name="bash"><parameter name="command">pwd</parameter></invoke>', [_CB_BASH_TOOL])
-    assert [json.loads(c["function"]["arguments"]) for c in calls] == [{"command": "ls"}]
+    assert [json.loads(c["function"]["arguments"]) for c in calls] == [{"command": "ls"}, {"command": "pwd"}]   # the bridge keeps the first
 
 
 def test_claude_cli_render_blocks_only_grow_so_each_call_reuses_the_previous_calls_prompt_cache():
