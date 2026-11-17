@@ -245,4 +245,5 @@ def test_bench_second_reviewer_is_a_known_config_key_the_daily_bench_reads(env):
     p = make(env)
     assert benchdaily.second_reviewer(p.config()) is None   # unset: no second grader
     p.set_config("bench.second_reviewer", {"provider": "chat", "model": "some-model", "effort": "max"})
-    assert benchdaily.second_reviewer(p.config()) == {"model": "some-model", "effort": "max", "provider": "chat"}
+    # a grader never runs above high effort: a configured max is capped
+    assert benchdaily.second_reviewer(p.config()) == {"model": "some-model", "effort": "high", "provider": "chat"}

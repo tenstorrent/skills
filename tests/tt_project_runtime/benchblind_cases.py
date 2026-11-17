@@ -511,5 +511,5 @@ def test_daily_second_grader_regrades_the_same_batch_and_the_day_record_and_tabl
     plain = benchdaily.blind_review(out2, {str(c["task"]): {"project": "A"} for c in cells}, arms, {}, ask=first, seed=3,
                                     build=lambda o, t, a: {"cells": cells})
     assert "second" not in plain and not (out2 / "blind2").exists()
-    assert benchdaily.second_reviewer({"bench": {"second_reviewer": {"model": "x"}}}) == {"model": "x", "effort": "max", "provider": "chat"}
+    assert benchdaily.second_reviewer({"bench": {"second_reviewer": {"model": "x"}}}) == {"model": "x", "effort": "high", "provider": "chat"}
     assert benchdaily.second_reviewer({}) is None and benchdaily.second_reviewer({"bench": {"second_reviewer": {"effort": "max"}}}) is None
