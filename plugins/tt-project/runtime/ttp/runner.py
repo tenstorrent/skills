@@ -60,7 +60,7 @@ import time
 import traceback
 from pathlib import Path
 
-from . import glmguard, loopproxy, poll_s, project, serverhealth
+from . import glmguard, glmharness, loopproxy, poll_s, project, serverhealth
 from .project import Project, durable_write, lower_priority
 
 LEASE_EVERY_S = 30
@@ -811,6 +811,7 @@ def supervise(run_dir: Path) -> int:
                 st["budget"] = now
                 try:
                     so_far = (bridge.cost_so_far() if hasattr(bridge, "cost_so_far")   # claudebridge: the CLI's own figures
+                              else glmharness.cost_so_far(bridge, prov) if spec.get("harness")   # a mini run streams none
                               else prov.cost_so_far(out_path, since=started, env=env))
                 except Exception:
                     so_far = None
@@ -922,6 +923,10 @@ def supervise(run_dir: Path) -> int:
             exit_info["cred_marks"] = {p: [creds["marks"].get(p), after["marks"].get(p)] for p, _ in changed}
             print(f"runner: credential files changed during the run: {changed}", flush=True)
     if bridge is not None:
+        if spec.get("harness"):   # a mini-swe-agent run: its usage is the bridge's counts
+            from .providers import get_provider
+            glmharness.write_result(out_path, bridge.stats(),
+                                    get_provider(spec["provider"]).use(spec.get("model", ""), spec.get("prices")))
         exit_info["bridge"] = bridge.stats()   # endpoint fault kinds for routing's fallback (route.py)
     if agent_rule:   # which rule the limit ran under, and its figures
         exit_info["limits"] = {"rule": serverhealth.RULE, "up_s": round(lim["up"], 1), "server_wait_s": round(lim["wait"], 1),

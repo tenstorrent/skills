@@ -57,8 +57,8 @@ def test_code_arm_keeps_resources_conclusions_forces_pins_devices_and_judgment_o
     rv = p.db.task(p.db.add_task("Review #1: x", "", kind="review", tier="standard", priority=3, budget_usd=1.0))
     assert codearm.stays(p.db, cfg, rv, "standard") == "not_code"
     assert codearm.choose(p.db, cfg, rv, "standard") is None   # reviews and other judgment kinds never take it
-    assert codearm.stays(p.db, _ca_cfg(glm={**_CA_GLM, "harness": "mini-swe-agent"}), _ca_task(p),
-                         "standard") == "harness_unsupported"
+    assert codearm.stays(p.db, _ca_cfg(glm={**_CA_GLM, "harness": "codex"}), _ca_task(p),
+                         "standard") == "harness_unsupported"   # Codex joins once its command layer is guarded
 
 
 def test_code_arm_is_recorded_once_and_follow_ups_keep_their_lineage_arm(env):
@@ -418,3 +418,128 @@ def test_glm_guard_hit_is_read_as_a_bounce_by_push_and_the_runner_watches_for_it
     assert glmguard.hit_reason(rd) == "`ttp say` is not allowed"
     assert codearm.handed_back(rd).startswith("guard: ")   # ttp push refuses and the push queue skips its head
     assert "glmguard.hit_reason(run_dir)" in inspect.getsource(runner)
+
+
+# The arm's live harness (glmharness.py, glmenv.py): mini-swe-agent with the guard in its command layer.
+def test_the_shipped_guarded_harness_is_mini_swe_agent_and_claude_code_stays_dry_run_only():
+    from ttp import codearm, glmharness
+    assert codearm.HARNESSES == (glmharness.HARNESS,) == ("mini-swe-agent",)
+    live = _ca_cfg(glm={**_CA_GLM, "harness": "mini-swe-agent"})
+    assert codearm.refusal(live) == "" and codearm.settings(live)["harness"] == "mini-swe-agent"
+    assert codearm.harness(live) == "mini-swe-agent" and codearm.harness({}) == "claude-code"
+    why = codearm.refusal(_ca_cfg())   # claude-code with a live share
+    assert "claude-code" in why and "mini-swe-agent" in why and codearm.settings(_ca_cfg()) is None
+    assert "codex" in codearm.refusal(_ca_cfg(glm={**_CA_GLM, "harness": "codex"}))
+
+
+def test_glmenv_refuses_what_the_guard_refuses_and_a_secret_read_and_allows_ordinary_work(tmp_path):
+    from ttp import glmenv
+    wt, rd = _gg_run(tmp_path)
+    env_ = {"TTP_RUN_DIR": str(rd), **_GG_RUN_ENV}
+
+    def ask(cmd):
+        return glmenv.refusal(cmd, str(wt), str(rd), env_)
+    assert ask("python3 -m pytest -q tests && git status") is None
+    assert ask("ttp checks") is None
+    assert ask("ttp note --to other hi") and ask("git push origin HEAD") and ask("echo x > /etc/hosts-copy")
+    assert ask("cat " + "~/." + "ssh/" + "id_" + "rsa")   # a stored private key
+
+
+def test_the_guarded_environment_ends_a_run_on_a_refused_command_and_runs_the_rest(tmp_path, monkeypatch):
+    import json
+    from ttp import codearm, glmenv
+    wt, rd = _gg_run(tmp_path)
+    monkeypatch.setenv("TTP_RUN_DIR", str(rd))
+    monkeypatch.setenv("TTP_CODE_ARM_GUARD", "1")
+    ran: list = []
+
+    class Base:
+        def execute(self, action, cwd="", *, timeout=None):
+            ran.append(action["command"])
+            return {"output": "ok", "returncode": 0}
+    if glmenv.LocalEnvironment is not object:
+        pytest.skip("minisweagent is importable here: its own environment class is the base")
+    env = type("Env", (glmenv.GuardedEnvironment, Base), {})()   # the guard sits before the base in the MRO
+    assert env.execute({"command": "ls"}, str(wt))["returncode"] == 0 and ran == ["ls"]
+    with pytest.raises(glmenv.Submitted) as ei:
+        env.execute({"command": "ttp note --to other hi"}, str(wt))
+    assert ran == ["ls"]   # the refused command never ran
+    assert ei.value.messages[0]["extra"]["exit_status"] == "GuardRefused"
+    assert codearm.bounce_reason(json.loads((rd / "result.json").read_text())).startswith("guard: ")
+
+
+def test_glmharness_writes_a_guarded_mini_run_with_the_prompt_on_stdin_and_the_bridge_as_its_model(tmp_path):
+    from ttp import glmenv, glmharness
+    rd = tmp_path / "run"
+    rd.mkdir()
+    (rd / "prompt.md").write_text("do the task")
+    (rd / "system.md").write_text("You are a worker.")
+    spec = {"argv": ["claude"], "stdin": "{json}", "model": "example-org/code-model", "budget_usd": None}
+    inst = {"kind": "mini-swe-agent", "version": "2.4.6", "bin": "/opt/harness/bin/mini"}
+    got = glmharness.apply(spec, rd, {}, "/opt/rt", budget_usd=3.0, install_fn=lambda v: inst)
+    assert got == "" and spec["argv"][0] == "/bin/sh" and "stdin" not in spec
+    assert spec["openai_env"] is True and spec["budget_usd"] == 3.0
+    assert spec["harness"] == {"kind": "mini-swe-agent", "version": "2.4.6"}
+    prompt = (rd / "prompt.md").read_text()
+    assert prompt.startswith("You are a worker.") and "do the task" in prompt
+    conf = (rd / "mini.yaml").read_text()
+    assert glmenv.CLASS_PATH in conf and "timeout: 900" in conf
+    sh = (rd / "harness.sh").read_text()
+    assert "openai/example-org/code-model" in sh and "PYTHONPATH=/opt/rt" in sh and "/opt/harness/bin/mini" in sh
+
+
+def test_a_harness_that_cannot_be_installed_hands_the_task_back_to_opus_not_a_failed_attempt(tmp_path):
+    import json
+    from ttp import codearm, glmharness
+    rd = tmp_path / "run"
+    rd.mkdir()
+    (rd / "prompt.md").write_text("x")
+    spec = {"argv": ["claude"], "model": "m"}
+
+    def boom(v):
+        raise RuntimeError("pip is not available")
+    why = glmharness.apply(spec, rd, {}, "/opt/rt", install_fn=boom)
+    assert why.startswith("harness unavailable") and spec["argv"] == ["/bin/sh", "-c", "exit 0"]
+    got = json.loads((rd / "result.json").read_text())
+    assert codearm.bounce_reason(got).startswith("guard: harness unavailable")
+
+
+def test_a_mini_run_is_costed_from_the_bridge_with_cached_tokens_at_the_cache_read_rate():
+    import json
+    from ttp import glmharness
+
+    class Prov:
+        model = "example-org/code-model"
+
+        def price(self):
+            return (1.0, 0.1, 4.0)   # $/M: input, cached input, output
+
+    class Bridge:
+        def stats(self):
+            return {"usage": {"calls": 3, "input_tokens": 1_000_000, "output_tokens": 500_000,
+                              "cache_read_input_tokens": 2_000_000}}
+
+    class NoCalls:
+        def stats(self):
+            return {}
+    assert abs(glmharness.cost_so_far(Bridge(), Prov()) - (1.0 + 0.2 + 2.0)) < 1e-6   # cached at 0.1, not 1.0
+    line = json.loads(glmharness.result_line(Bridge().stats(), Prov()))
+    assert line["type"] == "result" and abs(line["total_cost_usd"] - 3.2) < 1e-6
+    assert line["usage"]["cache_read_input_tokens"] == 2_000_000 and line["usage"]["input_tokens"] == 1_000_000
+    assert glmharness.result_line({"usage": {}}, Prov()) == "" and glmharness.cost_so_far(NoCalls(), Prov()) is None
+
+
+def test_the_daemon_wires_the_live_harness_in_and_the_runner_costs_it():
+    import inspect
+    from ttp import daemon, runner
+    src = inspect.getsource(daemon)
+    assert "glmharness.apply(spec" in src and "codearm.harness(self.cfg) == glmharness.HARNESS" in src
+    rsrc = inspect.getsource(runner)
+    assert "glmharness.cost_so_far" in rsrc and "glmharness.write_result" in rsrc
+
+
+def test_config_and_doctor_say_why_a_live_share_on_claude_code_is_zero():
+    import inspect
+    from ttp import cli
+    assert "codearm.refusal(p.config())" in inspect.getsource(cli.cmd_config)
+    assert "codearm.refusal(p.config())" in inspect.getsource(cli.cmd_doctor)

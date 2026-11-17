@@ -41,6 +41,7 @@ from . import blindreview
 from . import rolerestore
 from . import codearm
 from . import glmguard
+from . import glmharness
 from . import deviceab
 from . import deviceshadow
 from . import batchrun
@@ -4475,6 +4476,11 @@ class Daemon:
                     **({"env_files": env_files} if env_files else {}),   # the runner adds them to env
                     # Workers and reviewers run niced, and all they start with them; the coordinator not.
                     "nice": nice_level(self.cfg.get("runner"))[0] if role != "coordinator" else 0}
+            if task and glmguard.env_for(note) and codearm.harness(self.cfg) == glmharness.HARNESS:
+                # The arm's live harness: mini-swe-agent, its command layer the side-effect guard. A harness that
+                # cannot be had ends the run as a hand-back to Opus (apply wrote it), never a failed attempt.
+                if why := glmharness.apply(spec, run_dir, self.cfg, runtime_dir, budget_usd=budget_usd):
+                    log(self.p, f"run {run_id}: code arm: {why}; handed back to Opus")
             durable_write(run_dir / "run.json", json.dumps(spec, indent=1))   # read again after a reboot
             if role == "coordinator":
                 self._coord_snapshot(run_dir, wake_guard=not prov.tool_hooks)

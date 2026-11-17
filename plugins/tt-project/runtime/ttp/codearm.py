@@ -52,8 +52,9 @@ CAP_KV = "code_arm_cap"             # {"cap", "ts", "why"}
 ARMS = ("glm", "sonnet", "claude")
 BOUNCE = "needs_opus"               # the route entry's fallback for a bounce (route.BOUNCE)
 # The harnesses a live worker run can take: only a harness whose command layer enforces the arm's side-effect
-# guard (glmguard). Claude Code's GLM runs are untested live and landed 0 of 8 in the benchmark, so it is not one.
-HARNESSES: tuple = ()
+# guard (glmguard): mini-swe-agent (glmharness, glmenv). Claude Code's GLM runs are untested live and landed 0 of 8 in the
+# benchmark, so it is not one; Codex joins once its command layer is guarded.
+HARNESSES: tuple = ("mini-swe-agent",)
 KNOWN_HARNESSES = ("claude-code", "mini-swe-agent", "codex")   # named in a setting; only HARNESSES run live
 REFUSED_KV = "code_arm_refused"     # {"mark", "why", "ts"}: the setting a live refusal was logged for
 FORCE = re.compile(r"(?mi)^\s*code_arm:\s*(claude|opus|sonnet)\b")
@@ -108,6 +109,13 @@ def settings(cfg: dict) -> dict | None:
             "cap": {"start": min(hi, max(lo, int(_num(c.get("start"), 1, 64, CAP["start"])))), "min": lo, "max": hi},
             "pts": _num(got.get("glm_guard_pts"), 0, 100, GUARD_PTS),
             "min_tasks": int(_num(got.get("glm_guard_min"), 1, 10000, GUARD_MIN))}
+
+
+def harness(cfg: dict) -> str:
+    """The harness the arm's live runs use (`route.code_sonnet.glm.harness`, default claude-code)."""
+    got = (cfg.get("route") or {}).get("code_sonnet")
+    arm = got.get("glm") if isinstance(got, dict) and isinstance(got.get("glm"), dict) else {}
+    return str(arm.get("harness") or "claude-code")
 
 
 def refusal(cfg: dict) -> str:

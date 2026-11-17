@@ -12974,6 +12974,10 @@ def cmd_config(a) -> None:
         from .project import weekly_below_daily
         if warn := weekly_below_daily(p.config().get("budget")):
             print(f"warning: {warn}", file=sys.stderr)
+    if a.key == "route" or a.key.startswith("route."):
+        from . import codearm
+        if why := codearm.refusal(p.config()):
+            print(f"warning: {why}", file=sys.stderr)
 
 
 def _config_remove(p, key: str, run) -> None:
@@ -15428,6 +15432,9 @@ def cmd_doctor(a) -> None:
     from . import localguard
     for line in localguard.report(p.config(), p.harness, p.config_status):
         print(line)
+    from . import codearm
+    if why := codearm.refusal(p.config()):
+        print(f"code arm: {why}")
     from .coordinator import dir_list
     for prov in all_providers():
         pcfg = p.config()["providers"].get(prov.name, {})
