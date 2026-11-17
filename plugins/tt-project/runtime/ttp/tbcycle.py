@@ -78,7 +78,7 @@ REF, REF_FILE, REF_MODELS, REF_EFFORT = "reference", "reference.jsonl", ("claude
 SUBSET_REFERENCE = ({"model": "Opus 5.5", "effort": "low", "passed": 14, "trials": 20},
                     {"model": "Sonnet 5.5", "effort": "low", "passed": 14, "trials": 20})
 LOCK, BRIDGE_ROUTE, CHAT_ROUTE, ENDPOINT_ROUTE = "chat-server", "claude-cli", "chat", "endpoint"
-KIND = {BRIDGE_ROUTE: "bridge: the logged-in claude CLI (claude -p) behind a loopback server, no API key",
+KIND = {BRIDGE_ROUTE: "bridge: the logged-in claude CLI (claude -p) through a loopback server, no API key",
         CHAT_ROUTE: "endpoint: the chat endpoint (providers.chat) through a loopback relay that times each call",
         ENDPOINT_ROUTE: "endpoint: the saved reference endpoint, called directly"}
 PROVIDER = {BRIDGE_ROUTE: "claude", CHAT_ROUTE: "chat", ENDPOINT_ROUTE: "endpoint"}
@@ -621,7 +621,7 @@ def table(run: str, note: str = "") -> str:
     scored trials, cut-offs with a server-or-model verdict each, failed server calls (stream or parse errors
     included) of all calls over every trial run, median server wait and tokens/s, the limit,
     Claude dollars, parity and how each model was called. Read from the trial rows, so it shows a run in progress."""
-    from . import benchparity, harborslice, serverhealth
+    from . import benchparity, benchv2, harborslice, serverhealth
     d, metas = ref_dir(run), []
     for f in sorted(d.glob("*.json")):
         try:
@@ -632,9 +632,9 @@ def table(run: str, note: str = "") -> str:
             metas.append((f.stem, m))
     booked = {r["model"] for r in reference(run)}
     out = [f"# Terminal-Bench run {run}", "",
-           "| model | effort | route | passed | scored | not scored (server) | faults | not run | cut-offs "
+           "| model | effort | route | passed | 95% interval | scored | not scored (server) | faults | not run | cut-offs "
            "| failed calls | median server wait s | median tokens/s | Claude $ | state |",
-           "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+           "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     cuts, pars = [], []
     for sl, m in metas:
         tasks, model = m["tasks"], m.get("model") or sl
@@ -651,9 +651,11 @@ def table(run: str, note: str = "") -> str:
         calls = [(x.get("server") or {}) for x in all_lines]
         failed = (f"{sum(int(c.get('failed_calls') or 0) for c in calls)} of "
                   f"{sum(int(c.get('calls') or 0) for c in calls)}")
+        lo, hi = benchv2.wilson(sc["passed"], len(tasks))   # over the task count, as the passed column
         par = {**(m.get("parity") or {}), "model": model, "effort": m.get("effort")}
         pars.append(par)
-        out.append(f"| {model} | {m.get('effort')} | {m.get('route')} | {sc['passed']} of {len(tasks)} | {sc['trials']} "
+        out.append(f"| {model} | {m.get('effort')} | {m.get('route')} | {sc['passed']} of {len(tasks)} "
+                   f"| {lo:.0%}-{hi:.0%} | {sc['trials']} "
                    f"| {sc.get('server', 0)} | {sc['faults']} | {len(tasks) - len(latest)} | {n_cut} | {failed} "
                    f"| {_med([x.get('wait_median_s') for x in srv])} | {_med([x.get('tps_median') for x in srv])} "
                    f"| {round(cost, 2) if m.get('route') == BRIDGE_ROUTE else '-'} "
@@ -662,7 +664,8 @@ def table(run: str, note: str = "") -> str:
     out += ["", "Passed counts scored trials only; the denominator is the task count. Not run: no trial yet, or "
             "one whose agent made no model call, whose failed server calls broke it short of a pass, or that harbor "
             "broke before grading. Failed calls: server calls that failed (stream or parse errors included) of all "
-            "calls, over every trial run, reruns included. "
+            "calls, over every trial run, reruns included. 95% interval: the Wilson interval of passed of the task count; "
+            "this is one run per model, so the bench cannot separate models whose intervals overlap. "
             f"Limit: {', '.join(lims) or '?'} "
             f"(seconds per task, or each task's own limit), counted as {pars[0].get('limit_counts') if pars else '?'}.", "",
             "## Cut-offs", ""] + (cuts or ["None."]) + [""]

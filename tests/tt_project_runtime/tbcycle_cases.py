@@ -473,6 +473,10 @@ def test_terminalbench_reference_chat_route_holds_out_a_slow_server_cut_reruns_i
     assert "open-m / t3: model: cut at the limit while the server ran at normal speed" in md
     assert "request no effort field (none in providers.chat.effort_fields)" in md, "how the effort reached the server"
     assert "## How each arm was called" in md and "older rows are not comparable" in md
+    # one run per model: each row gives its 95% interval and the table names no winner, so a model comparison
+    # in it passes the bench verdict rule (corrections #3064, #3111); no verdict word in the arm wording either
+    assert re.search(r"\| 2 of 3 \| \d+%-\d+% \|", md) and "cannot separate models whose intervals overlap" in md
+    assert not re.search(r"\bbehind\b", md)
 
 
 def test_terminalbench_reference_rejudges_a_cut_made_before_the_models_normal_speed_was_known(env, monkeypatch):
@@ -600,8 +604,8 @@ def test_terminalbench_reference_marks_a_trial_with_no_model_call_or_broken_call
     lines = [json.loads(x) for x in (tbcycle.ref_dir("nr") / "open-m.jsonl").read_text().splitlines()]
     assert lines[0]["outcome"] == tbcycle.NOT_RUN and lines[0]["reward"] is None and lines[0]["heldout_reward"] == 1.0
     md = (tbcycle.ref_dir("nr") / "table.md").read_text()
-    assert "| chat | 2 of 3 | 3 | 0 | 0 | 0 |" in md, "passed 2, scored 3, no server cut, no fault, none not run"
-    assert "| chat | 2 of 3 | 3 | 0 | 0 | 0 | 0 | 1 of 37 |" in md, "1 failed call of the 37 over every trial run"
+    assert "| chat | 2 of 3 | 21%-94% | 3 | 0 | 0 | 0 |" in md, "passed 2 (95% interval 21-94%), scored 3, no server cut, no fault, none not run"
+    assert "| chat | 2 of 3 | 21%-94% | 3 | 0 | 0 | 0 | 0 | 1 of 37 |" in md, "1 failed call of the 37 over every trial run"
 
 
 def test_terminalbench_not_run_covers_no_calls_and_server_broken_unsolved_trials_only():
