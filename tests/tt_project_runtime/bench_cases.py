@@ -1367,6 +1367,19 @@ def test_terminalbench_trial_runs_terminus2_with_the_key_in_env_only_and_resumes
     assert env_["OPENAI_API_KEY"] == "fake-key" and env_["OPENAI_BASE_URL"].endswith("/v1")
 
 
+def test_terminalbench_an_unreachable_docker_engine_stops_the_trial_without_a_row(tmp_path):
+    from ttp import harborslice
+    st = {**harborslice.settings({}), "concurrency": 1}
+    calls = []
+
+    def runner(cmd, e, t):
+        calls.append(cmd)
+        return 1, "Docker daemon is not running. Please start Docker and try again."
+    with pytest.raises(harborslice.EngineDown):
+        harborslice.trial("org/m-a", "t-a", tmp_path / "jobs", {}, st, runner, sleep=lambda s: None)
+    assert len(calls) == 1, "no rerun against an engine that is gone: nothing ran, so nothing is scored"
+
+
 def test_terminalbench_429_is_waited_out_and_a_setup_error_reruns_once(tmp_path):
     from ttp import harborslice
     st = {**harborslice.settings({}), "concurrency": 1}

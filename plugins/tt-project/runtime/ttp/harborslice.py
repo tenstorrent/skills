@@ -67,6 +67,14 @@ DEFAULT_TASKS = ("adaptive-rejection-sampler", "code-from-image", "count-dataset
 IDLE_MIN, LOAD_SHARE, GAUGE = 20.0, 0.85, "nproc; cat /proc/loadavg; vmstat 1 2 | tail -1"
 _RATE = re.compile(r"\b429\b|rate.?limit", re.I)
 _AFTER = re.compile(r"retry.?after\D{0,12}(\d+(?:\.\d+)?)", re.I)
+# harbor could not reach the docker engine (a remote engine's host went away, say): no trial can run there, so
+# trial() raises EngineDown instead of returning a row, and the runner stops without using up reruns or booking
+_ENGINE_DOWN = re.compile(r"docker daemon is not running|cannot connect to the docker daemon|error during connect",
+                          re.I)
+
+
+class EngineDown(RuntimeError):
+    """harbor could not reach the docker engine: nothing ran, so no row is written (the runner stops)."""
 
 
 def settings(cfg: dict) -> dict:
@@ -345,6 +353,8 @@ def trial(model: str, task: str, root: Path, env: dict, st: dict, runner: Callab
         finally:
             lock.close()
         if outcome(job) is None:   # harbor ended without finishing the job
+            if _ENGINE_DOWN.search(out):
+                raise EngineDown(f"docker engine unreachable for {task}: {out.strip()[-200:]}")
             if _RATE.search(out):
                 m = _AFTER.search(out)
                 sleep(min(float(m.group(1)) if m else RETRY_S, TASK_TIMEOUT_S))
