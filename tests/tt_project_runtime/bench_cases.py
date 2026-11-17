@@ -1363,6 +1363,14 @@ def test_terminalbench_trial_runs_terminus2_with_the_key_in_env_only_and_resumes
     harborslice.trial("org/m-a", "t-b", tmp_path / "jobs", env, st, lambda c, e, t: (calls.append(c), _fake_trial(
         ["-o", str(job.parent), "--job-name", "t-b"], 0.0))[0] or (0, ""), sleep=lambda s: None)
     assert calls[-1][3:] == ["harbor", "job", "resume", "-p", str(job)], "an unfinished job resumes after a restart"
+    job = _fake_trial(["-o", str(tmp_path / "jobs" / "org-m-a"), "--job-name", "t-a2"], finished=False)
+    (ds / "t-a2").mkdir()
+    (ds / "t-a2" / "task.toml").write_text("[agent]\ntimeout_sec = 1800.0\n")
+    waits = []
+    harborslice.trial("org/m-a", "t-a2", tmp_path / "jobs", env, {**st, "limit_s": 0}, lambda c, e, t: (
+        waits.append(t), _fake_trial(["-o", str(job.parent), "--job-name", "t-a2"], 0.0))[0] or (0, ""),
+        sleep=lambda s: None)
+    assert waits == [1800 * 4 + harborslice.TASK_TIMEOUT_S], "a resume with no bench limit keeps the task's own ceiling"
     env_ = harborslice.child_env(tmp_path / "venv", "http://endpoint.invalid/v1", "fake-key")
     assert env_["OPENAI_API_KEY"] == "fake-key" and env_["OPENAI_BASE_URL"].endswith("/v1")
 

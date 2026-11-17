@@ -335,6 +335,7 @@ def trial(model: str, task: str, root: Path, env: dict, st: dict, runner: Callab
                 return got
             reruns -= 1
             shutil.rmtree(job, ignore_errors=True)
+        lim = _task_limit(st["dataset"], task)   # also on a resume: the wall ceiling below reads it
         if (job / "config.json").exists():
             cmd = [w.format(job=job) for w in shlex.split(RESUME)]
         else:
@@ -344,7 +345,6 @@ def trial(model: str, task: str, root: Path, env: dict, st: dict, runner: Callab
             if Path(st["dataset"]).expanduser().is_dir():   # a local dataset folder: harbor takes it by --path
                 cmd = ["--path" if w == "--dataset" else str(Path(w).expanduser()) if w == st["dataset"] else w
                        for w in cmd]
-            lim = _task_limit(st["dataset"], task)
             if lim and st["limit_s"]:
                 cmd += ["--agent-timeout-multiplier", f"{st['limit_s'] / lim:.4g}"]
         lock = slot(home or root, st, sleep, env)
