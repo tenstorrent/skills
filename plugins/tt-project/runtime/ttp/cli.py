@@ -10885,6 +10885,12 @@ def list_tasks(p, a) -> tuple[list[dict], int, int | None]:
 
 def cmd_task(a) -> None:
     p = need(a.name, sys.argv[1:])
+    base = os.environ.get("TTP_PROJECT")
+    if base and os.environ.get("TTP_RUN_DIR") and a.action not in ("list", "show") and Project(base).base != p.base:
+        # A run reads other projects' tasks but changes only its own: a dry-run worker replaying a real
+        # task's spec once ran that spec's `ttp task <real project> superseded` against the real project.
+        die(f"ttp task {a.action} from a run of another project is refused: a run changes only its own "
+            f"project's tasks (ask that project with `ttp note --to {p.name}`)")
     if a.action != "add" and a.start_when is not None or a.action not in ("add", "rejudge", "set-when", "adopt-branch", "relink-fix") and a.why is not None:
         die("--start-when and --why go with add (--why also with set-when, rejudge, adopt-branch and relink-fix); for a queued task use set-when")
     if a.action != "rejudge" and a.dry_run:

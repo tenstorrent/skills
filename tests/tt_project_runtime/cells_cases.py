@@ -680,3 +680,30 @@ def test_rejudge_keeps_a_project_rule_mark_the_cells_still_earn_or_cannot_place(
     p.db.update_task(tid, status="done", result=json.dumps(own))
     code, out = _rejudge(p, capsys, tid)
     assert code == 0 and "nothing to change" in out, out
+
+
+def test_a_run_of_another_project_reads_tasks_here_but_never_changes_them(env, monkeypatch, capsys):
+    # A dry-run worker replaying a real task's spec once ran its `ttp task <real project> superseded` here.
+    from ttp import cli
+    p = make(env)
+    tid = p.db.add_task("landed elsewhere", "Goal: x.", origin="coordinator")
+    p.db.update_task(tid, status="done")
+
+    def task(*args):
+        try:
+            cli.main(["task", p.name, *map(str, args)])
+        except SystemExit as e:
+            return e.code, capsys.readouterr()
+        return 0, capsys.readouterr()
+
+    monkeypatch.setenv("TTP_RUN_DIR", str(env["tmp"] / "run"))
+    monkeypatch.setenv("TTP_PROJECT", str(env["tmp"] / "another-root"))
+    for args in (("superseded", tid, "#9"), ("cancel", tid), ("add", "sneaked in")):
+        code, out = task(*args)
+        assert code and "another project is refused" in out.out + out.err, (args, out)
+    assert p.db.task(tid)["status"] == "done" and len(p.db.q("SELECT id FROM tasks")) == 1
+    code, out = task("show", tid)
+    assert not code and "landed elsewhere" in out.out, out
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))   # its own project: unchanged
+    code, out = task("cancel", tid)
+    assert "another project is refused" not in out.out + out.err, out
