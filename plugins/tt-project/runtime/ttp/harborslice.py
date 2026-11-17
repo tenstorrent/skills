@@ -9,7 +9,10 @@ environment (OPENAI_BASE_URL, OPENAI_API_KEY), never its argv. One trial per tas
 own Harbor job under <root>/<model>/<task>, so a restart resumes it (`harbor job resume`) and a finished one
 is read, not rerun. The agent limit (limit_s, default LIMIT_S) becomes Harbor's agent timeout multiplier
 where the task's own limit is known (a local dataset's task.toml), else the task's own limit holds. A
-host-wide trial cap (slot) is sized to free cores (concurrency 0) or set. A trial the endpoint answered with
+host-wide trial cap (slot) is sized to free cores (concurrency 0) or set; a set one is a floor, and more trials
+start while the host's gate passes (gate: CPU idle at least idle_min %, and on a remote engine 1-min load under
+load_share x its cores). A remote engine (DOCKER_HOST=ssh://<host>) runs only the task containers there: the
+agent loop and every model call stay on this host, and its slots are its own, gated on its own load. A trial the endpoint answered with
 HTTP 429 is waited out ("retry after N s", else RETRY_S) and rerun, never scored; a setup error (an
 exception before any verifier reward) reruns once, then counts as a fault, not a fail. A model's result
 (score) is {passed, trials, pass_rate, median_min, faults}, booked as suite "terminalbench".
@@ -61,6 +64,7 @@ DEFAULT_TASKS = ("adaptive-rejection-sampler", "code-from-image", "count-dataset
                  "llm-inference-batching-scheduler", "model-extraction-relu-logits", "mteb-retrieve",
                  "password-recovery", "prove-plus-comm", "pytorch-model-cli", "pytorch-model-recovery",
                  "query-optimize", "rstan-to-pystan", "train-fasttext", "tune-mjcf")
+IDLE_MIN, LOAD_SHARE, GAUGE = 20.0, 0.85, "nproc; cat /proc/loadavg; vmstat 1 2 | tail -1"
 _RATE = re.compile(r"\b429\b|rate.?limit", re.I)
 _AFTER = re.compile(r"retry.?after\D{0,12}(\d+(?:\.\d+)?)", re.I)
 
@@ -77,7 +81,8 @@ def settings(cfg: dict) -> dict:
             "agent": str(s.get("agent") or AGENT),
             "limit_s": 0.0 if s.get("limit_s") == 0 and not isinstance(s.get("limit_s"), bool) else num("limit_s", LIMIT_S, 60),
             "concurrency": int(num("concurrency", 0, 0)), "floor_share": num("floor_share", FLOOR_SHARE, 0),
-            "dataset": str(s.get("dataset") or DATASET), "compose": str(s.get("compose") or "")}
+            "dataset": str(s.get("dataset") or DATASET), "compose": str(s.get("compose") or ""),
+            "idle_min": num("idle_min", IDLE_MIN, 0), "load_share": num("load_share", LOAD_SHARE, 0)}
 
 
 def tasks(home: Path, st: dict) -> list[str]:
@@ -103,18 +108,58 @@ def cap(st: dict) -> int:
     return max(1, min(MAX_SLOTS, int(free // CORES_PER_TRIAL)))
 
 
-def slot(home: Path, st: dict, sleep: Callable = time.sleep):
-    """Hold one of the host's trial slots (an flock'd file); returns its open file, closed to release."""
-    d = home / "tb-slots"
+def docker_host(env: dict | None) -> str:
+    """The ssh host of a remote engine (DOCKER_HOST=ssh://[user@]host[:port]), '' for the local one."""
+    v = str((env or {}).get("DOCKER_HOST") or "")
+    return v[len("ssh://"):] if v.startswith("ssh://") else ""
+
+
+def gauge(host: str = "", runner: Callable | None = None) -> tuple[int, float, float] | None:
+    """(cores, 1-min load, CPU idle %) of this host or of ssh `host`, None when unread."""
+    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, GAUGE] if host else ["sh", "-c", GAUGE]
+    try:
+        out = (runner or (lambda c: subprocess.run(c, capture_output=True, text=True, timeout=60).stdout))(cmd)
+        lines = [x.split() for x in out.strip().splitlines()]
+        return int(lines[0][0]), float(lines[1][0]), float(lines[2][14])
+    except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
+        return None
+
+
+def gate(st: dict, host: str = "", runner: Callable | None = None) -> int:
+    """Trials the host may start past the floor: 0 unless CPU idle >= idle_min (and, on a remote engine,
+    1-min load < load_share x cores), else its cores / CORES_PER_TRIAL."""
+    g = gauge(host, runner)
+    if g is None or g[2] < st.get("idle_min", IDLE_MIN):
+        return 0
+    if host and g[1] >= st.get("load_share", LOAD_SHARE) * g[0]:
+        return 0
+    return g[0] // CORES_PER_TRIAL
+
+
+def slot(home: Path, st: dict, sleep: Callable = time.sleep, env: dict | None = None,
+         runner: Callable | None = None):
+    """Hold one of the engine host's trial slots (an flock'd file); returns its open file, closed to release.
+    The floor (cap) always runs; a set concurrency grows while the host's gate passes (module doc)."""
+    host = docker_host(env)
+    d = home / (f"tb-slots-{slug(host)}" if host else "tb-slots")
     d.mkdir(parents=True, exist_ok=True)
-    while True:
-        for i in range(cap(st)):
+
+    def take(rng):
+        for i in rng:
             f = open(d / f"{i}.lock", "w")
             try:
                 fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 return f
             except OSError:
                 f.close()
+        return None
+    while True:
+        floor = cap(st)
+        got = take(range(floor))
+        if got is None and st.get("concurrency"):
+            got = take(range(floor, max(floor, gate(st, host, runner))))
+        if got is not None:
+            return got
         sleep(30)
 
 
@@ -294,7 +339,7 @@ def trial(model: str, task: str, root: Path, env: dict, st: dict, runner: Callab
             lim = _task_limit(st["dataset"], task)
             if lim and st["limit_s"]:
                 cmd += ["--agent-timeout-multiplier", f"{st['limit_s'] / lim:.4g}"]
-        lock = slot(home or root, st, sleep)
+        lock = slot(home or root, st, sleep, env)
         try:
             rc, out = runner(["nice", "-n", "10", *cmd], env, (st["limit_s"] or lim or LIMIT_S) * 4 + TASK_TIMEOUT_S)
         finally:

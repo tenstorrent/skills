@@ -2594,3 +2594,39 @@ def test_bench_run_arm_harness_types_parse_install_once_into_the_bench_folder_an
                                           "cache_read_input_tokens": 400_000})
     assert got == {"input_tokens": 1_000_000, "output_tokens": 500_000, "cache_read_tokens": 400_000, "model_calls": 3,
                    "cost_estimated": True, "cost_basis": benchrun.HARNESS_BASIS, "cost_usd": 2.04}
+
+
+def test_harbor_trial_slots_keep_the_floor_grow_only_past_the_host_gate_and_count_a_remote_engine_apart(env):
+    from ttp import harborslice
+    out = {"": "64\n10.0 9.0 8.0 3/900 1\n 1 0 0 1 1 1 0 0 0 0 1 1 5 2 80 0 0\n",
+           "box": "64\n60.0 50.0 40.0 3/900 1\n 1 0 0 1 1 1 0 0 0 0 1 1 5 2 90 0 0\n"}
+    seen = []
+
+    def runner(cmd):
+        seen.append(cmd)
+        return out["box" if cmd[0] == "ssh" else ""]
+    assert harborslice.docker_host({"DOCKER_HOST": "ssh://box"}) == "box"
+    assert harborslice.docker_host({"DOCKER_HOST": "unix:///run/docker.sock"}) == "" == harborslice.docker_host(None)
+    assert harborslice.gauge("", runner) == (64, 10.0, 80.0) and seen[-1][:2] == ["sh", "-c"]
+    assert harborslice.gauge("box", runner) == (64, 60.0, 90.0) and seen[-1][0] == "ssh" and "BatchMode=yes" in seen[-1]
+    assert harborslice.gauge("", lambda c: "garbage") is None
+    st = {"concurrency": 2, "idle_min": 20.0, "load_share": 0.85}
+    assert harborslice.gate(st, "", runner) == 16, "idle >= 20%: cores / 4; local load is never read"
+    assert harborslice.gate(st, "box", runner) == 0, "a remote engine also needs load < 0.85 x cores"
+    out["box"] = out["box"].replace("60.0 50.0", "6.0 50.0")
+    assert harborslice.gate(st, "box", runner) == 16
+    out[""] = out[""].replace(" 80 0 0", " 15 0 0")
+    assert harborslice.gate(st, "", runner) == 0, "idle under 20%: nothing past the floor"
+    home, naps = env["tmp"] / "slots", []
+    held = [harborslice.slot(home, st, naps.append, {}, runner) for _ in range(2)]
+    assert sorted(p.name for p in (home / "tb-slots").iterdir()) == ["0.lock", "1.lock"], "the floor of 2 runs"
+
+    def sleep(s):
+        naps.append(s)
+        out[""] = out[""].replace(" 15 0 0", " 80 0 0")   # the host frees up while the third waits
+    held.append(harborslice.slot(home, st, sleep, {}, runner))
+    assert naps == [30] and (home / "tb-slots" / "2.lock").exists(), "past the floor once the gate passes"
+    remote = harborslice.slot(home, st, naps.append, {"DOCKER_HOST": "ssh://box"}, runner)
+    assert (home / "tb-slots-box" / "0.lock").exists(), "a remote engine's slots are its own"
+    for f in held + [remote]:
+        f.close()

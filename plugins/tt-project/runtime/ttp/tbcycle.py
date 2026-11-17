@@ -72,6 +72,7 @@ from pathlib import Path
 from typing import Callable
 
 DIR, STATE, CYCLE_H, NEW_MODEL_H = "terminalbench", "state.json", 24.0, 3.0
+NOT_RUN = "not_run"   # a bridge or chat trial with no model call or broken by failed calls (not_run): rerun, shown as not run
 REF, REF_FILE, REF_MODELS, REF_EFFORT = "reference", "reference.jsonl", ("claude-opus-5-5", "claude-sonnet-5-5"), "medium"
 # Shown until a reference run is booked: an earlier run of the DEFAULT_TASKS subset (Terminus 2, 900 s per task).
 SUBSET_REFERENCE = ({"model": "Opus 5.5", "effort": "low", "passed": 14, "trials": 20},
@@ -486,6 +487,9 @@ def ref_runner(cfg: dict, model: str, env: dict, *, trial: Callable | None = Non
                         # cut before the model's normal speed was known: judged again once it is (rejudge)
                         r["server_calls"] = {k: st[k] for k in ("busy", "upstream", "last_fault") if k in st}
                         r["server_calls"]["server"] = {"per_call": (st.get("server") or {}).get("per_call") or []}
+                if r.get("outcome") != serverhealth.OUTCOME and (not (r.get("server") or {}).get("calls")
+                                                                 or not_run(r)):
+                    r.update(outcome=NOT_RUN, heldout_reward=r.get("reward"), reward=None)
             return r
 
         def rejudge() -> None:
@@ -508,19 +512,26 @@ def ref_runner(cfg: dict, model: str, env: dict, *, trial: Callable | None = Non
                 done[r["task"]] = r
                 modelsuite._append(d / f"{sl}.jsonl", r)
 
-        def one(t):
+        def one(t, n=0):
             if dead.is_set():
                 return   # a trial died: start no more
+            if n:   # a not-run trial again: its old job is not resumed
+                shutil.rmtree(d / "trials" / sl / harborslice.slug(t), ignore_errors=True)
             try:
-                keep(attempt(t))
+                keep(attempt(t, n))
             except BaseException:
                 dead.set()
                 raise
-        todo = [t for t in meta["tasks"] if t not in done]
-        with ThreadPoolExecutor(max_workers=max(1, min(s[REF]["parallel"], len(todo) or 1))) as pool:
-            for f in [pool.submit(one, t) for t in todo]:
-                f.result()
-        ran = len(todo)
+        ran = 0
+        while True:   # new trials, then not-run ones again (each up to reference.rounds times)
+            todo = [t for t in meta["tasks"] if t not in done or (not_run(done[t])
+                                                                   and int(done[t].get("rerun") or 0) < s[REF]["rounds"])]
+            if not todo:
+                break
+            with ThreadPoolExecutor(max_workers=max(1, min(s[REF]["parallel"], len(todo)))) as pool:
+                for f in [pool.submit(one, t, int(done[t].get("rerun") or 0) + 1 if t in done else 0) for t in todo]:
+                    f.result()
+            ran += len(todo)
         rejudge()
         while make is not None:   # the server's cut-offs: one at a time, each after a healthy probe
             left = [done[t] for t in meta["tasks"] if done[t].get("outcome") == serverhealth.OUTCOME
@@ -547,7 +558,7 @@ def ref_runner(cfg: dict, model: str, env: dict, *, trial: Callable | None = Non
             extra = {"cost_usd": round(spent, 4)} if via == BRIDGE_ROUTE else {}
             if info.get("cli"):
                 extra["claude_cli"] = info["cli"]
-        sc = harborslice.score([done[t] for t in meta["tasks"]])
+        sc = harborslice.score([done[t] for t in meta["tasks"] if not not_run(done[t])])
         modelsuite._append(ref_file(run), {
             "date": modelbench.day(clock()), "model": model, "suite": "terminalbench", "reference": True,
             "effort": meta["effort"], "agent": s["agent"], "dataset": s["dataset"], "started": meta["started"],
@@ -558,6 +569,16 @@ def ref_runner(cfg: dict, model: str, env: dict, *, trial: Callable | None = Non
         return ran
     finally:
         held.close()
+
+
+def not_run(r: dict) -> bool:
+    """A trial that is not a run (user's rule): its agent made no model call (marked NOT_RUN when it ended), or
+    failed calls broke it and it did not solve the task. Never scored, rerun up to reference.rounds times. A
+    model that made calls and did not solve the task failed, the same for every model; a pass stands."""
+    from . import serverhealth
+    srv = r.get("server") or {}
+    return r.get("outcome") == NOT_RUN or (r.get("outcome") != serverhealth.OUTCOME and bool(srv.get("failed_calls"))
+                                           and not (r.get("reward") or 0) > 0)
 
 
 def _med(xs: list) -> float | None:
@@ -611,7 +632,7 @@ def table(run: str, note: str = "") -> str:
     for sl, m in metas:
         tasks, model = m["tasks"], m.get("model") or sl
         all_lines = list(_rows(d / f"{sl}.jsonl").values())
-        latest = _rows(d / f"{sl}.jsonl", tasks)
+        latest = {t: r for t, r in _rows(d / f"{sl}.jsonl", tasks).items() if not not_run(r)}
         sc = harborslice.score(list(latest.values()))
         n_cut = 0
         for t in tasks:
@@ -628,7 +649,9 @@ def table(run: str, note: str = "") -> str:
                    f"| {round(cost, 2) if m.get('route') == BRIDGE_ROUTE else '-'} "
                    f"| {'booked' if model in booked else 'running or owed reruns'} |")
     lims = sorted({str(p.get("limit_s")) for p in pars})
-    out += ["", f"Passed counts scored trials only; the denominator is the task count. Limit: {', '.join(lims) or '?'} "
+    out += ["", "Passed counts scored trials only; the denominator is the task count. Not run: no trial yet, or "
+            "one whose agent made no model call, or whose failed server calls broke it short of a pass. "
+            f"Limit: {', '.join(lims) or '?'} "
             f"(seconds per task, or each task's own limit), counted as {pars[0].get('limit_counts') if pars else '?'}.", "",
             "## Cut-offs", ""] + (cuts or ["None."]) + [""]
     out += benchparity.section(pars, extra=("route", "request"))

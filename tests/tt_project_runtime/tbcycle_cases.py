@@ -327,7 +327,7 @@ class _FakeBridge:
         return 1.2345
 
     def stats(self):
-        return {"claude_cli": {"version": "9.9 (Claude Code)"}}
+        return {"claude_cli": {"version": "9.9 (Claude Code)"}, "server": {"calls": 2}}
 
 
 def test_terminalbench_reference_through_the_claude_bridge_has_no_endpoint_its_own_effort_and_books_cost(env, monkeypatch):
@@ -428,8 +428,11 @@ class _FakeChat:
         return {"OPENAI_BASE_URL": "http://127.0.0.1:2/v1", "OPENAI_API_KEY": "run-token"}
 
     def stats(self):
+        if not self.per_call:
+            return {}   # like chatbridge: no "server" block when the agent made no call
         return {"server": {"calls": len(self.per_call), "wait_median_s": self.per_call[0]["wait_s"],
-                           "tps_median": self.per_call[0]["tps"], "per_call": self.per_call}}
+                           "tps_median": self.per_call[0]["tps"], "per_call": self.per_call,
+                           **({"failed_calls": n} if (n := sum(c["st"] != "ok" for c in self.per_call)) else {})}}
 
 
 def test_terminalbench_reference_chat_route_holds_out_a_slow_server_cut_reruns_it_healthy_and_writes_the_table(
@@ -572,3 +575,40 @@ def test_every_scheduled_bench_cycle_raises_one_event_naming_its_cause_on_the_th
         with pytest.raises(SystemExit):   # its pre-flight already counted a die: not counted twice
             cli._bench_cycle(p, benchowner.TB_SCHEDULE, clock["t"] + 10, lambda: cli.die("off"), dies=False)
     assert json.loads((modelbench.home() / "streak-terminalbench.json").read_text())["fails"] == 3
+
+
+def test_terminalbench_reference_marks_a_trial_with_no_model_call_or_broken_calls_not_run_and_reruns_it(
+        env, monkeypatch):
+    from ttp import serverhealth, tbcycle
+    d, cfg, clock, sleeps, sleep = _tb_setup(env, monkeypatch, tasks=("t1", "t2", "t3"), limit_s=0, reference={
+        "models": ["open-m"], "chat": ["open-m"], "run": "nr", "parallel": 1, "rounds": 1})
+    serverhealth.History(tbcycle.folder() / tbcycle.HISTORY).add("open-m", _tb_calls(20, 50.0, 1.0))
+    broken = _tb_calls(12, 50.0, 1.0) + [{"st": "fail", "out": 0, "tps": None, "wait_s": 1.0}]
+    _FakeChat.made.clear()
+    _FakeChat.plan[:] = [[], broken, _tb_calls(12, 50.0, 1.0), _tb_calls(12, 50.0, 1.0)]
+    tries = []
+
+    def trial(model, task, root):
+        tries.append(task)
+        return {"reward": 0.0 if task == "t3" else 1.0, "min": 3.0, "error": None}
+    monkeypatch.setattr(serverhealth, "probe", lambda *a, **k: {"ok": True, "wait_s": 1.0, "tps": 50.0})
+    tbcycle.ref_runner(cfg, "open-m", {}, trial=trial, clock=lambda: clock["t"], chat=_FakeChat, sleep=sleep)
+    got = tbcycle._rows(tbcycle.ref_dir("nr") / "open-m.jsonl", ["t1", "t2", "t3"])
+    assert tries == ["t1", "t2", "t3", "t1"], "only the zero-call trial reruns; t2 passed despite a failed call"
+    assert got["t1"]["rerun"] == 1 and got["t1"]["reward"] == 1.0 and not tbcycle.not_run(got["t1"])
+    assert not tbcycle.not_run(got["t3"]), "a model that made calls and did not solve the task failed"
+    lines = [json.loads(x) for x in (tbcycle.ref_dir("nr") / "open-m.jsonl").read_text().splitlines()]
+    assert lines[0]["outcome"] == tbcycle.NOT_RUN and lines[0]["reward"] is None and lines[0]["heldout_reward"] == 1.0
+    md = (tbcycle.ref_dir("nr") / "table.md").read_text()
+    assert "| chat | 2 of 3 | 3 | 0 | 0 | 0 |" in md, "passed 2, scored 3, no server cut, no fault, none not run"
+
+
+def test_terminalbench_not_run_covers_no_calls_and_server_broken_unsolved_trials_only():
+    from ttp import tbcycle
+    assert tbcycle.not_run({"outcome": tbcycle.NOT_RUN})
+    assert tbcycle.not_run({"reward": 0.0, "server": {"calls": 9, "failed_calls": 2}}), "the server broke it"
+    assert not tbcycle.not_run({"reward": 1.0, "server": {"calls": 9, "failed_calls": 2}}), "a pass stands"
+    assert not tbcycle.not_run({"reward": 0.0, "server": {"calls": 9}}), "worked and failed: the model's fail"
+    assert not tbcycle.not_run({"outcome": "server", "reward": None, "server": {"failed_calls": 3}}), "a server cut"
+    md_rows = {"t1": {"task": "t1", "reward": 0.0, "server": {"calls": 4, "failed_calls": 1}}}
+    assert [t for t, r in md_rows.items() if tbcycle.not_run(r)] == ["t1"]
