@@ -99,6 +99,15 @@ def config_yaml(model: str, upstream_url: str) -> str:
         "  disable_spend_logs: true\n")
 
 
+def _die_with_parent() -> None:
+    """The proxy ends if the runner that started it dies (Linux parent-death signal)."""
+    try:
+        import ctypes
+        ctypes.CDLL(None).prctl(1, 15)
+    except (OSError, AttributeError):
+        pass
+
+
 def free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -119,7 +128,8 @@ def start(run: Path, install: dict, model: str, upstream_url: str, token: str, w
     log = open(run / "codexproxy.log", "wb")
     proc = subprocess.Popen([install["bin"], "--config", str(folder / "config.yaml"), "--host", "127.0.0.1",
                              "--port", str(port)], cwd=str(folder), env=env, stdout=log, stderr=subprocess.STDOUT,
-                            stdin=subprocess.DEVNULL, start_new_session=True)
+                            stdin=subprocess.DEVNULL, start_new_session=True,
+                            preexec_fn=_die_with_parent)
     log.close()
     end = time.time() + wait_s
     while time.time() < end:
@@ -150,11 +160,11 @@ def stop(proc) -> None:
             pass
 
 
-def codex_config(model: str, port: int, effort: str = "high") -> dict[str, str]:
+def codex_config(model: str, port: str | int, effort: str = "high") -> dict[str, str]:
     """The cell's CODEX_HOME files (name -> text): config.toml names the proxy as a model provider (Responses
     API, the run token as its key); `<profile>.config.toml` is the bench profile (Codex 0.169 profiles live in
     their own file): the model, approvals and Codex's own sandbox off (the cell is the sandbox), no web search,
-    no telemetry."""
+    no telemetry. `port` may be a shell reference (SCRIPT_PORT) that the launch script expands."""
     return {
         "config.toml": (
             f'[model_providers.{PROVIDER}]\n'
@@ -178,7 +188,14 @@ def argv(binary: str, model: str, workdir: str) -> list[str]:
             "--dangerously-bypass-approvals-and-sandbox", "--json", "-C", workdir, "-"]
 
 
+SCRIPT_PORT = "${TTP_RUN_PROXY_PORT}"   # the cell's relay port for the proxy, set by the runner
+
+
 def script(binary: str, model: str, workdir: str, codex_home: str) -> str:
-    """The arm's launch script body (harness.sh): CODEX_HOME in the cell's scratch, no login."""
-    return (f"export CODEX_HOME={shlex.quote(codex_home)} CODEX_DISABLE_TELEMETRY=1\n"
-            f"exec {' '.join(shlex.quote(a) for a in argv(binary, model, workdir))}\n")
+    """The arm's launch script body (harness.sh): CODEX_HOME in the cell's scratch, no login; its config is
+    written at launch, as the proxy's port is known only once the runner has started it."""
+    lines = [f"export CODEX_HOME={shlex.quote(codex_home)} CODEX_DISABLE_TELEMETRY=1", 'mkdir -p "$CODEX_HOME"']
+    for name, text in codex_config(model, SCRIPT_PORT).items():
+        lines.append(f'cat > "$CODEX_HOME/{name}" <<TTP_EOF\n{text}TTP_EOF')
+    lines.append(f"exec {' '.join(shlex.quote(a) for a in argv(binary, model, workdir))}")
+    return "\n".join(lines) + "\n"

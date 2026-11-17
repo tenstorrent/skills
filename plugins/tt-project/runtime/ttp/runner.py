@@ -633,7 +633,7 @@ def supervise(run_dir: Path) -> int:
     err = open(run_dir / "stderr.log", "wb")
     nice = int(spec.get("nice") or 0)
     preexec, _ = _agent_preexec(nice)
-    bridge, launch_auth, pumps, netfwd = None, False, [], None
+    bridge, launch_auth, pumps, netfwd, cproc = None, False, [], None, None
     try:
         if spec.get("bridge"):
             # The chat provider's loopback bridge: a thread of this process, so it ends with the run
@@ -650,6 +650,15 @@ def supervise(run_dir: Path) -> int:
             if spec.get("openai_env"):   # an OpenAI-compatible agent (a bench harness arm) uses the /v1 relay
                 env.update(bridge.openai_env())
             env["TTP_RUN_PROXY_PORT"] = bridge.url.rsplit(":", 1)[-1]   # runguard.py: the run's own proxy
+            if spec.get("codex_proxy"):   # a Codex arm: its Responses calls go through the proxy to the bridge
+                from . import codexproxy
+                try:
+                    cproc, cport = codexproxy.start(run_dir, spec["codex_proxy"], spec["model"], bridge.url + "/v1",
+                                                    bridge.token)
+                except OSError as e:
+                    raise OSError(f"codex proxy: {e}") from None
+                env["OPENAI_BASE_URL"] = env["OPENAI_API_BASE"] = f"http://127.0.0.1:{cport}/v1"
+                env["TTP_RUN_PROXY_PORT"] = str(cport)
             srv = spec.get("server") or {}   # the model's normal speed (serverhealth.History), when known
             bridge.calls.configure(srv.get("normal_tps") or 0, srv.get("factor") or serverhealth.FACTOR)
             if spec.get("cell_net"):   # the agent's cell has a network of its own: the bridge reaches it by a socket
@@ -685,6 +694,8 @@ def supervise(run_dir: Path) -> int:
         # The agent never started (E2BIG: an argument or the whole command line past the kernel's
         # limit; a missing binary; a chat bridge that could not start): a harness fault the same
         # argv repeats, booked as a launch failure.
+        if cproc is not None:
+            codexproxy.stop(cproc)
         if bridge is not None:
             bridge.stop()
         if netfwd is not None:
@@ -862,6 +873,8 @@ def supervise(run_dir: Path) -> int:
             inst["got"] = got or None
         except Exception as e:
             print(f"runner: could not check the run's system prompt: {e}", flush=True)
+    if cproc is not None:
+        codexproxy.stop(cproc)
     if bridge is not None:
         bridge.stop()
     if netfwd is not None:

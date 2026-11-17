@@ -26,6 +26,7 @@ model, effort, run and session id, transcript path). `dry_run` swaps every arm's
 for the fake agent: no model call, no spend."""
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -115,17 +116,25 @@ def verified(bench_dir: Path) -> dict:
 def parse_arm(text: str) -> tuple[str, dict]:
     """`name=provider:model:effort[:harness[@version]]` (model and effort may be empty) as (name, arm). The
     harness is the agent the arm runs (HARNESSES): `claude` (the default, the provider's own CLI), or
-    `opencode` or `mini-swe-agent` on the chat provider's OpenAI-compatible endpoint."""
+    `opencode`, `mini-swe-agent` or `codex` on the chat provider's OpenAI-compatible endpoint. A last field
+    `plan=provider~model~effort` makes the arm planner-then-executor: that model reads the task and the code
+    read-only and writes a plan (plan_step), then the arm's own model and harness carries it out."""
     name, sep, rest = text.partition("=")
     parts = rest.split(":")
+    plan = parts.pop()[len("plan="):] if len(parts) > 3 and parts[-1].startswith("plan=") else ""
     if not sep or not name or len(parts) not in (3, 4) or not parts[0]:
-        raise BenchError(f"--arm {text!r}: write it as name=provider:model:effort[:harness[@version]]")
+        raise BenchError(f"--arm {text!r}: write it as name=provider:model:effort[:harness[@version]][:plan=provider~model~effort]")
     arm = {"provider": parts[0], "model": parts[1], "effort": parts[2]}
     if len(parts) == 4 and parts[3] not in ("", "claude"):
         kind, _, version = parts[3].partition("@")
         arm["harness"] = kind
         if version:
             arm["harness_version"] = version
+    if plan:
+        bits = plan.split("~")
+        if len(bits) != 3 or not bits[0]:
+            raise BenchError(f"--arm {text!r}: the planner is plan=provider~model~effort")
+        arm["planner"] = {"provider": bits[0], "model": bits[1], "effort": bits[2]}
     check_harness(name, arm)
     return name, arm
 
@@ -159,6 +168,8 @@ def check_harness(name: str, arm: dict) -> None:
     if kind != "claude" and arm.get("provider") not in HARNESS_PROVIDERS.get(kind, ("chat",)):
         raise BenchError(f"arm {name}: the {kind} harness runs on the {' or '.join(HARNESS_PROVIDERS.get(kind, ('chat',)))} "
                          "provider only")
+    if (planner := arm.get("planner")) is not None and planner.get("provider") != "claude":
+        raise BenchError(f"arm {name}: the planner runs on the claude provider (read-only tools), not {planner.get('provider')!r}")
 
 
 def latest_version(kind: str) -> str:
@@ -211,7 +222,7 @@ def harness_ready(kind: str, version: str = "", root: Path | None = None) -> dic
             "sha256": got.get("sha256") or {}}
 
 
-def harness_files(run: Path, arm: dict, inst: dict) -> list[str]:
+def harness_files(run: Path, arm: dict, inst: dict, ws: Path | None = None) -> list[str]:
     """Write the harness arm's launch script (and config) into `run`; returns its argv. The prompt comes on
     stdin; the agent's trajectory (mini-swe-agent) goes to run/trajectory.json."""
     kind, model = arm["harness"], arm["model"]
@@ -225,6 +236,9 @@ def harness_files(run: Path, arm: dict, inst: dict) -> list[str]:
         durable_write(run / "opencode.json", json.dumps(conf, indent=1) + "\n")
         body = (f"export OPENCODE_CONFIG={q(str(run / 'opencode.json'))} OPENCODE_DISABLE_AUTOUPDATE=1\n"
                 f"exec {q(inst['bin'])} run --format json --auto -m {q('bench/' + model)} \"$(cat)\"\n")
+    elif kind == "codex":
+        from . import codexproxy
+        body = codexproxy.script(inst["bin"], model, str(ws or "."), str(run / "codex-home"))
     else:
         durable_write(run / "mini.yaml", "agent:\n  mode: yolo\n  cost_limit: 0\n"
                       "model:\n  cost_tracking: ignore_errors\n  model_kwargs:\n    drop_params: true\n")
@@ -877,8 +891,14 @@ def run_cell(bench_dir: Path, out: Path, task: dict, cell: dict, arm: dict, opts
             conf, logins = scratch_home(arm["provider"], tmp, not opts.get("dry_run")) \
                 if opts.get("scratch_home", True) else ({}, [])
             own = session_dirs(ws, conf.get("CLAUDE_CONFIG_DIR"))
-        prov, wall, hung = launch(run, ws, prompt(spec, opts, grade_workers(cell_env)), arm, opts, cfg, hidden, cell_env, conf, own,
-                                  cell)
+        text, copts = prompt(spec, opts, grade_workers(cell_env)), opts
+        if arm.get("planner"):   # planner-then-executor: the plan comes first, its time counts in the limit
+            plan, why = plan_step(tmp, ws, task, arm, opts, cfg, hidden, row, keep)
+            if not plan:
+                return {**row, "outcome": "error", "passed": False, "why": [why]}
+            text = f"{text}\n\n{PLAN_HEADER}\n\n{plan}"
+            copts = {**opts, "timeout_s": max(60, int(opts["timeout_s"] - row["planner_wall_s"]))}
+        prov, wall, hung = launch(run, ws, text, arm, copts, cfg, hidden, cell_env, conf, own, cell)
         row["wall_s"] = wall
         if hung:   # the supervisor itself hung: its watchdog ends the agent; what it spent so far still counts
             row.update(outcome="runner_timeout", passed=False)
@@ -899,6 +919,60 @@ def run_cell(bench_dir: Path, out: Path, task: dict, cell: dict, arm: dict, opts
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+PLAN_PROMPT = ("You are the planner for a coding task another engineer will carry out without asking you anything. "
+               "Read the task and the code (you can only read it: you cannot edit files or run commands, so do not "
+               "try). Write a step-by-step plan: the files to change, the change in each, the tests to run, and how to "
+               "check the work is done. Your last message is the plan, in plain text.\n\nThe task:\n\n{spec}\n")
+PLAN_HEADER = "A plan for this task, written by a planner who read the code (follow it, and check it against the code):"
+
+
+def plan_step(tmp: Path, ws: Path, task: dict, arm: dict, opts: dict, cfg: dict, hidden: list[Path], row: dict,
+              keep: Path) -> tuple[str, str]:
+    """The planner of a planner-then-executor arm: its model reads the task and the code, with its own cell built
+    as the executor's (own network namespace; only its provider's API domains reachable) and the code mounted
+    read-only, and tools that read only. Its last message is the plan: (plan, "") or ("", why). The row gets
+    `planner_wall_s` (counted in the cell limit), `planner_cost_usd`, `planner_tokens` and the plan's length; the
+    plan itself is kept next to the cell. The graders never see it (they see the final diff)."""
+    from . import billing
+    from .providers import get_provider
+    planner = {**arm["planner"]}
+    root = tmp / "planner"
+    pws, run = root / "work", root / "run"
+    root.mkdir()
+    shutil.copytree(ws, pws, symlinks=True)
+    cell = None
+    try:
+        cell_env = cellenv.env(cellenv.make(root / "venv", opts.get("cell_packages", cellenv.SEED)), _clean_env())
+        conf, own = {}, session_dirs(pws)
+        if opts.get("isolate", ISOLATE):
+            popts = {**opts, "ro_binds": [str(pws)]}
+            cell, problems = isolate(root, pws, planner, popts, hidden, [r for r in (task.get("repo"), opts.get("repo")) if r],
+                                     gone=[task["head"]])
+            if problems:
+                return "", "planner cell: " + "; ".join(problems)[:300]
+            conf, own = dict(cell.conf), session_dirs(pws, cell.conf.get("CLAUDE_CONFIG_DIR"))
+        spec = bench.scrub_spec(task["spec"], [], [], Path.home()) if cell is None else task["spec"]
+        prov, wall, hung = launch(run, pws, PLAN_PROMPT.format(spec=mark_live(spec)), planner, opts, cfg, hidden, cell_env,
+                                  conf, own, cell, read_only=True)
+        row["planner_wall_s"] = wall
+        usage = prov.parse(run / "output.jsonl", run / "stderr.log")
+        row.update(planner_cost_usd=round(float(usage.cost_usd or 0.0), 4),
+                   planner_tokens={"input": usage.input_tokens, "output": usage.output_tokens,
+                                   "cache_read": usage.cache_read_tokens, "cache_write": usage.cache_write_tokens})
+        keep.mkdir(parents=True, exist_ok=True)
+        plan = (usage.final_text or "").strip()
+        durable_write(keep / "plan.md", plan + "\n")
+        durable_write(keep / "planner-output.jsonl", (run / "output.jsonl").read_text(errors="replace")
+                      if (run / "output.jsonl").exists() else "")
+        row["plan_chars"] = len(plan)
+        if hung or not plan:
+            return "", f"the planner wrote no plan ({'its runner hung' if hung else usage.error or 'empty answer'})"[:300]
+        return plan, ""
+    finally:
+        if cell is not None:
+            cell.close()
+
+
 def agent_time(opts: dict) -> bool:
     """Whether the cell limit counts the agent's own time (default), not wall time (`agent_time` false)."""
     return bool(opts.get("agent_time", True))
@@ -914,7 +988,7 @@ def history(opts: dict) -> "serverhealth.History":
 
 
 def launch(run: Path, ws: Path, prompt: str, arm: dict, opts: dict, cfg: dict, hidden: list[Path], cell_env: dict,
-           env: dict | None = None, own: list[Path] | None = None, cell=None) -> tuple:
+           env: dict | None = None, own: list[Path] | None = None, cell=None, read_only: bool = False) -> tuple:
     """Run the arm's agent on `prompt` in `ws` under the runner supervisor (run dir `run`, new), reads of
     `hidden` denied except the cell's own session folders `own` (default: session_dirs(ws)); `env` adds to
     the agent's environment (PATH_PREPEND goes before its PATH); `cell` (cellns.Cell): the agent runs in its
@@ -929,10 +1003,10 @@ def launch(run: Path, ws: Path, prompt: str, arm: dict, opts: dict, cfg: dict, h
     prov = get_provider(provider).use(arm["model"], prices, billing.declared(cfg, provider))
     inst = arm.get("harness_install") if provider in ("chat", "claude") else None
     if inst:   # a harness arm: its own agent on the bridge's OpenAI-compatible relay (harness_files)
-        argv, penv = harness_files(run, arm, inst), {}
+        argv, penv = harness_files(run, arm, inst, ws), {}
     else:
         argv, penv = prov.build(role="worker", model=arm["model"], effort=arm["effort"], cwd=str(ws),
-                                budget_usd=opts["budget_usd"], read_only=False, schema=None, restrictions={},
+                                budget_usd=opts["budget_usd"], read_only=read_only, schema=None, restrictions={},
                                 denied_reads=denied_reads(hidden, own or session_dirs(ws)), web=False)
     if argv[:3] == [sys.executable, "-m", "ttp.providers.fake"]:   # the dry run's agent: no PYTHONPATH
         argv = [*_boot("ttp.providers.fake", cell), *argv[3:]]
@@ -955,7 +1029,8 @@ def launch(run: Path, ws: Path, prompt: str, arm: dict, opts: dict, cfg: dict, h
             **({"bridge": {"kind": "claude-cli", "model": arm["model"], "effort": arm["effort"],
                            "budget_usd": opts["budget_usd"]}} if inst and provider == "claude" else
                {"bridge": chatbridge.settings(cfg, "standard", arm["model"], arm["effort"])}
-               if provider == "chat" else {}), **({"openai_env": True} if inst else {})}
+               if provider == "chat" else {}), **({"openai_env": True} if inst else {}),
+            **({"codex_proxy": arm["proxy_install"]} if inst and arm.get("harness") == "codex" else {})}
     if agent_time(opts):   # the limit counts the agent's own time, not the server's wait (serverhealth)
         spec["agent_time"] = True
         spec["ceiling_s"] = serverhealth.ceiling_s(opts["timeout_s"], opts.get("ceiling_factor") or serverhealth.CEILING_FACTOR)
@@ -1138,6 +1213,8 @@ def _finish(row: dict, bench_dir: Path, task: dict, ws: Path, run: Path, keep: P
         row.update(harness_spend(prov, (ended.get("bridge") or {}).get("usage") or {}))
         if (run / "trajectory.json").exists():   # mini-swe-agent's messages: the transcript the audit reads
             transcript += b"\n" + (run / "trajectory.json").read_bytes()
+    if ((ended.get("bridge") or {}).get("usage") or {}).get("dropped_tool_calls") is not None:   # one tool call kept per reply
+        row["dropped_tool_calls"] = ended["bridge"]["usage"]["dropped_tool_calls"]
     if isinstance(ended.get("ended"), (int, float)):   # the agent's own end: names this run's kept exit.json
         row["cell_ended"] = ended["ended"]
     row.update(exit={k: ended[k] for k in ("rc", "stopped", "refused") if ended.get(k) is not None},
@@ -1182,9 +1259,12 @@ def _finish(row: dict, bench_dir: Path, task: dict, ws: Path, run: Path, keep: P
     server_status(row, ended, opts)
     keep.mkdir(parents=True, exist_ok=True)
     for name in ("output.jsonl", "exit.json", "result.json", "run.json", "runner.log", "stderr.log",
-                 "trajectory.json", "opencode.json", "mini.yaml", "harness.sh"):
+                 "trajectory.json", "opencode.json", "mini.yaml", "harness.sh", "codexproxy.log"):
         if (run / name).exists():
             shutil.copyfile(run / name, keep / name)
+    if (run / "codex-home").is_dir():   # the Codex arm's config files (its sessions are in output.jsonl)
+        for f in sorted((run / "codex-home").glob("*.toml")):
+            shutil.copyfile(f, keep / f"codex-{f.name}")
     durable_write(keep / "diff.patch", diff.decode(errors="replace"))
     durable_write(keep / "tests.log", log_tail)
     return row
@@ -1264,7 +1344,101 @@ def resolve_harness(arm: dict, opts: dict) -> dict:
     if not kind or opts.get("dry_run"):
         return arm
     inst = harness_ready(kind, arm.get("harness_version", ""), opts.get("harness_dir"))
-    return {**arm, "harness_version": inst["version"], "harness_install": inst, "effort_mapping": CLAUDE_EFFORT_NOTE if arm.get("provider") == "claude" else EFFORT_NOTE[kind]}
+    got = {**arm, "harness_version": inst["version"], "harness_install": inst, "effort_mapping": CLAUDE_EFFORT_NOTE if arm.get("provider") == "claude" else EFFORT_NOTE[kind]}
+    if kind == "codex":   # Codex speaks the Responses API: a LiteLLM proxy, outside the cell, turns it into Chat Completions
+        proxy = harness_ready("litellm-proxy", arm.get("proxy_version", ""), opts.get("harness_dir"))
+        got.update(proxy_version=proxy["version"], proxy_install=proxy)
+    return got
+
+
+PROBE_PROMPT = "Count from 1 to 120, separated by single spaces. Write only the numbers."
+
+
+def chat_probe(cfg: dict, model: str, effort: str = "", max_tokens: int = 200) -> dict:
+    """A short health probe of the chat endpoint for `model`: one streamed call through a bridge (so the call is
+    timed as a cell's calls are): {ok, wait_s, tps, out}. Never raises; a refusal or an outage is {ok: False}."""
+    import urllib.request
+    from . import chatbridge
+    try:
+        bridge = chatbridge.Bridge.from_settings(chatbridge.settings(cfg, "standard", model, effort))
+    except Exception as e:   # no key, no endpoint: the probe cannot tell, and says so
+        return {"ok": False, "why": f"{type(e).__name__}"}
+    try:
+        bridge.start()
+        req = urllib.request.Request(bridge.url + "/v1/chat/completions", method="POST", data=json.dumps({
+            "model": model, "stream": True, "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": PROBE_PROMPT}]}).encode(),
+            headers={"content-type": "application/json", "authorization": f"Bearer {bridge.token}"})
+        with urllib.request.urlopen(req, timeout=180) as r:
+            while r.read(4096):
+                pass
+    except Exception as e:
+        return {"ok": False, "why": f"{type(e).__name__}"}
+    finally:
+        bridge.stop()
+    rows = bridge.calls.export().get("per_call") or []
+    ok = [r for r in rows if r.get("st") == "ok"]
+    if not ok:
+        return {"ok": False, "why": "no answered call"}
+    last = ok[-1]
+    return {"ok": True, "wait_s": last["wait_s"], "tps": last["tps"], "out": last["out"]}
+
+
+def rerun_server(bench_dir: Path, out: Path, opts: dict, cfg: dict, probe=None, sleep=time.sleep,
+                 lock=None, only: list[tuple] | None = None) -> list[dict]:
+    """Rerun the cells of the plan in <out> that stopped on the server (serverhealth.queue), one at a time, each
+    only once a health probe shows its model at normal speed (serverhealth.wait_healthy; `probe(model, effort)`
+    defaults to chat_probe). `lock` (a context manager factory) wraps each run, so the endpoint's other users
+    take turns. A cell that stops on the server again stays queued (and shows `not scored (server)`); a cell
+    that ran to its end is graded as any cell: its new row replaces the old (results.jsonl: the last row of a
+    cell wins) and names it (`rerun_of`). Returns the rows added."""
+    plan = json.loads((out / "plan.json").read_text())
+    arms, man = plan["arms"], verified(bench_dir)
+    tasks = {t["task"]: {**t, "repo": man.get("repo")} for t in man["tasks"]}
+    rows = []
+    for line in (out / "results.jsonl").read_text().splitlines():
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            continue
+    added = []
+    for old in serverhealth.queue(rows):
+        key = (old["task"], old["rep"], old["arm"])
+        if only and key not in only:
+            continue
+        arm = arms[old["arm"]]
+        hist = history(opts)
+        normal = hist.normal(arm["model"], int(opts.get("server_min_calls") or serverhealth.MIN_CALLS))
+        if probe:
+            ask = lambda m=arm["model"], e=arm["effort"]: probe(m, e)
+        elif arm["provider"] == "chat":
+            ask = lambda m=arm["model"], e=arm["effort"]: chat_probe(cfg, m, e)
+        else:   # a Claude cell does not run on the chat server: nothing to wait for
+            ask = lambda: {"ok": True}
+        ok, last = serverhealth.wait_healthy(ask, normal, server_factor(opts), every_s=float(opts.get("probe_every_s") or 120),
+                                             max_s=float(opts.get("probe_max_s") or 3600), sleep=sleep)
+        if not ok:   # the server stayed slow: the cell stays queued, with the probe that said so
+            added.append({**old, "outcome": serverhealth.OUTCOME, "probe": last, "rerun_waited": True})
+            continue
+        cell = {"task": old["task"], "rep": old["rep"], "arm": old["arm"], "slot": old.get("slot", 0)}
+        kept = out / "cells" / f"{old['task']}-r{old['rep']}-{old['arm']}"
+        n = int(old.get("server_attempts") or 1)
+        if kept.exists():   # the stopped attempt's files stay beside the rerun's
+            kept.rename(kept.with_name(f"{kept.name}.server{n}"))
+        with (lock() if lock else contextlib.nullcontext()):
+            new = {**run_cell(bench_dir, out, tasks[old["task"]], cell, arm, opts, cfg), "seed": plan["seed"],
+                   "rerun_of": {"outcome": old.get("outcome"), "server_reason": old.get("server_reason"),
+                                "probe": last, "attempts": int(old.get("server_attempts") or 1) + 1}}
+        if new.get("outcome") == serverhealth.OUTCOME:
+            new["server_attempts"] = new["rerun_of"]["attempts"]
+        with open_append(out / "results.jsonl", "ab+") as f:
+            torn = f.seek(0, 2) > 0 and f.seek(-1, 2) >= 0 and f.read(1) != b"\n"
+            f.write((b"\n" if torn else b"") + json.dumps(new).encode() + b"\n")
+            f.flush()
+            os.fsync(f.fileno())
+        added.append(new)
+    durable_write(out / "cells.json", json.dumps(blind_cells(out, tasks, arms, plan["cells"]), indent=1) + "\n")
+    return added
 
 
 def run(bench_dir: Path, out: Path, arms: dict, reps: int, seed: int, opts: dict, cfg: dict,
