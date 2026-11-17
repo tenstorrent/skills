@@ -352,7 +352,7 @@ def test_glm_guard_keeps_a_hand_off_the_run_wrote_before_it_was_stopped(tmp_path
 
 
 @_pytest.mark.parametrize("cmd", [
-    "ttp note --to other 'hi'", "ttp ask 'ok?'", "ttp notify 'x'", "ttp ttproject note hi", "ttp other-project checks", "ttp task add t s",
+    "ttp note --to other 'hi'", "ttp ask 'ok?'", "ttp notify 'x'", "ttp some-project note hi", "ttp other-project checks", "ttp task add t s",
     "ttp upstream 'x'", "git push origin HEAD", "git -C . push --force", "gh pr comment 1 --body x",
     "gh issue create -t x", "gh api repos/o/r/issues -f title=x", "curl -X POST https://x.invalid -d a=b",
     "curl --data a=b https://x.invalid", "ssh host true", "mail -s x a@b", "sqlite3 $TTP_PROJECT/state/project.db 'x'",

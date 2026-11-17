@@ -27612,6 +27612,7 @@ DURABLE_EXEMPT = {
     ("daemon.py", '"input.jsonl"'): "a run's input, read at once; a reboot ends the run and its task is requeued",
     ("runner.py", '"child.pid"'): "names a process, which a reboot ends",
     ("runner.py", "open(out_path"): "the agent's output stream",
+    ("glmharness.py", "open(out_path"): "the agent's output stream: one synthetic result line appended at the run's end; a cut line only loses the run's token count",
     ("runner.py", "stderr.log"): "the agent's error stream",
     ("cli.py", "tmp.write_text(str(os.getpid()))"): "names a process, which a reboot ends",
     ("cli.py", "os.replace(tmp, lock)"): "names a process, which a reboot ends",

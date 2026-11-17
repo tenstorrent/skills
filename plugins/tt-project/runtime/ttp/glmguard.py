@@ -89,7 +89,7 @@ def hit(run_dir, why: str) -> None:
         res = d / "result.json"
         if res.exists() and not (d / KEPT).exists():
             try:
-                (d / KEPT).write_bytes(res.read_bytes())
+                durable_write(d / KEPT, res.read_bytes())
             except OSError:
                 pass
         durable_write(res, json.dumps({"status": "blocked", "needs_opus": f"guard: {why}",
