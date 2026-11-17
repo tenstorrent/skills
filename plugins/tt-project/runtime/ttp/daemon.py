@@ -10740,6 +10740,11 @@ class Daemon:
         if not cand:
             lk.first = {}
             return out
+        for pid in [x for x, c in cand.items() if self._leak_run_alive(c)]:
+            cand.pop(pid)   # its own run folder (a review's pre-checks too) still has live checks or a detached job
+        if not cand:
+            lk.first = {}
+            return out
         tasks = {c["task"] for c in cand.values()}
         live = {str(r["task"]) for r in db.q("SELECT task FROM runs WHERE status='running' AND task IS NOT NULL")}
         live |= {str(r["id"]) for r in db.q("SELECT id FROM tasks WHERE status='running'")}
@@ -10753,6 +10758,11 @@ class Daemon:
                     break
         waiting, due = lk.step(cand, w.procs, live, keep, now, s["leak_grace_s"])
         out["leaks"] = [{k: c[k] for k in ("pid", "task", "run", "since")} for c in waiting + due]
+        if not due:
+            return out
+        due, refused = self._leaks_ended_by_rules(due)
+        out["leaks_refused"] = refused
+        out["leaks"] = [x for x in out["leaks"] if x["pid"] not in {r["pid"] for r in refused}]
         if not due:
             return out
         if not s["act"]:
@@ -10777,6 +10787,36 @@ class Daemon:
         done = {r["pid"] for r in ended}
         out["leaks"] = [x for x in out["leaks"] if x["pid"] not in done]
         return out
+
+    def _leak_run_alive(self, c: dict) -> bool:
+        """Whether the run folder in candidate `c`'s own environment (TTP_RUN_DIR: a run's, a check
+        report's, a review's pre-checks folder) holds live detached checks or a live detached job."""
+        from . import cli, hold, leftoverstop
+        rd = (leftoverstop._read_env(c["pid"]) or {}).get("TTP_RUN_DIR")
+        if not rd:
+            return False
+        rd = Path(rd)
+        return bool(hold.live(hold.run_jobs(rd)) or cli._checks_alive(cli._read_checks_pid(rd)))
+
+    def _leaks_ended_by_rules(self, due: list) -> tuple[list, list]:
+        """(those of `due` the leftover-stop rules allow ending, [{pid, task, why}] for the rest): the same
+        per-process guards `ttp leftover-procs --stop` applies (leftoverstop.why_not: an attributable run
+        dir, no `ttp detach` job, no device or device lock open, never the caller, a worker or the
+        daemon). A refused process is never signalled; each is logged once."""
+        from . import leftoverstop
+        guarded = leftoverstop._guarded(self.p)
+        ok, refused = [], []
+        seen = self.__dict__.setdefault("_leak_refused_logged", set())
+        for c in due:
+            why = leftoverstop.why_not(self.p, int(c["task"]), c["pid"], guarded)
+            if why is None:
+                ok.append(c)
+                continue
+            refused.append({"pid": c["pid"], "task": c["task"], "why": why})
+            if (c["pid"], c["start"]) not in seen:
+                seen.add((c["pid"], c["start"]))
+                log(self.p, f"self-watch: leftover pid {c['pid']} of task #{c['task']} not ended: {why}")
+        return ok, refused
 
     def _slot_dirs(self) -> list:
         """The slot-lock folders the project's runs take locks in: its own, its shared resources' and the

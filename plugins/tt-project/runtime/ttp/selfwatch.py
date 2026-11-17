@@ -424,6 +424,9 @@ def line(snap: dict | None, now: float | None = None) -> str:
         out += (f"; {len(snap['leaks'])} leftover process(es) of ended tasks, ended after "
                 f"{snap.get('leak_grace_s', LEAK_GRACE_S):g} s: " + ", ".join(
                     f"pid {x['pid']} (task #{x['task']})" for x in snap["leaks"][:3]))
+    if snap.get("leaks_refused"):
+        out += "; left alone: " + ", ".join(
+            f"pid {x['pid']} (task #{x['task']}: {x['why']})" for x in snap["leaks_refused"][:2])
     for x in [e for e in snap.get("leaks_ended") or [] if now - float(e.get("ts", 0)) < 3600][-2:]:
         out += f"; ended leftover {leak_text(x)}"
     last = snap.get("stopped") or {}

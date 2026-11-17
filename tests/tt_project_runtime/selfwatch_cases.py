@@ -418,7 +418,7 @@ def test_selfwatch_leftovers_end_only_a_processes_of_an_ended_task_after_the_gra
 
 def test_the_daemon_ends_a_leftover_of_a_done_task_once_audits_it_and_spares_live_and_detached_ones(env, monkeypatch, tmp_path):
     import json as _json
-    from ttp import locks, selfaudit, selfwatch
+    from ttp import leftoverstop, locks, selfaudit, selfwatch
     from ttp.daemon import Daemon
     from ttp.web import state_payload
     p = make(env)
@@ -426,8 +426,10 @@ def test_the_daemon_ends_a_leftover_of_a_done_task_once_audits_it_and_spares_liv
     monkeypatch.setenv("TTP_SELFWATCH_LEAK_GRACE_S", "600")
     monkeypatch.setenv("TTP_SELFWATCH_LEAK_TERM_S", "0")
     root = tmp_path / "proc"
-    mine = lambda task, run: {"TTP_PROJECT": str(p.base), "TTP_RUN_ID": run, "TTP_TASK": task}
+    mine = lambda task, run, rd=None: {"TTP_PROJECT": str(p.base), "TTP_RUN_ID": run, "TTP_TASK": task,
+                                       "TTP_RUN_DIR": rd or str(tmp_path / ("run-" + run))}
     done_id = p.db.x("INSERT INTO tasks(title,spec,kind,status,priority,created,updated) VALUES('d','s','code','done',3,0,0)")
+    p.db.x("INSERT INTO runs(task,role,status,dir,started) VALUES(?,?,?,?,0)", (done_id, "worker", "done", str(tmp_path / "run-18352")))
     live_id = p.db.x("INSERT INTO tasks(title,spec,kind,status,priority,created,updated) VALUES('l','s','code','running',3,0,0)")
     job_id = p.db.x("INSERT INTO tasks(title,spec,kind,status,priority,created,updated) VALUES('j','s','code','done',3,0,0)")
     rd = tmp_path / "run-job"
@@ -442,6 +444,7 @@ def test_the_daemon_ends_a_leftover_of_a_done_task_once_audits_it_and_spares_liv
     sent = []
     monkeypatch.setattr(os, "kill", lambda t, sig: sent.append((t, sig)))
     monkeypatch.setattr(locks, "job_ended", lambda rc: False)
+    monkeypatch.setattr(leftoverstop, "PROC", root)
     d = Daemon(p.base)
     d._selfwatch = selfwatch.Watch(p.base, proc=root, daemon_pid=100, cores=64)
     d._selfaudit = selfaudit.Audit(p.base, "tt-project-x", crontab=lambda: [], units=lambda: [], ssh=lambda alias: None)
@@ -459,3 +462,95 @@ def test_the_daemon_ends_a_leftover_of_a_done_task_once_audits_it_and_spares_liv
     snap = p.db.kv(selfwatch.KV)
     assert snap["leaks"] == [] and [e["pid"] for e in snap["leaks_ended"]] == [3000]
     assert "ended leftover pid 3000" in state_payload(p, p.db)["selfwatch"]
+
+
+def _sw_leak_daemon_world(env, monkeypatch, tmp_path, build):
+    """A daemon with a fake /proc whose pid 3000 is a leftover of a done task. build(p, tmp_path, done_id) ->
+    (env of pid 3000, extra setup). Returns (daemon, sent signals, db handle p, the fake /proc root); the
+    leftover has already sat the whole grace."""
+    from ttp import leftoverstop, locks, selfaudit, selfwatch
+    from ttp.daemon import Daemon
+    p = make(env)
+    monkeypatch.setenv("TTP_SELFWATCH_EVERY_S", "30")
+    monkeypatch.setenv("TTP_SELFWATCH_LEAK_GRACE_S", "600")
+    monkeypatch.setenv("TTP_SELFWATCH_LEAK_TERM_S", "0")
+    root = tmp_path / "proc"
+    done_id = p.db.x("INSERT INTO tasks(title,spec,kind,status,priority,created,updated) VALUES('d','s','code','done',3,0,0)")
+    penv = {"TTP_PROJECT": str(p.base), "TTP_RUN_ID": "1", "TTP_TASK": str(done_id)} | build(p, tmp_path, done_id)
+    _sw_proc(root, 0, {100: (1, 100, 50, {"PATH": "/bin"}), 3000: (1, 3000, 9000, penv)})
+    sent = []
+    monkeypatch.setattr(os, "kill", lambda t, sig: sent.append((t, sig)))
+    monkeypatch.setattr(locks, "job_ended", lambda rc: False)
+    monkeypatch.setattr(leftoverstop, "PROC", root)
+    d = Daemon(p.base)
+    d._selfwatch = selfwatch.Watch(p.base, proc=root, daemon_pid=100, cores=64)
+    d._selfaudit = selfaudit.Audit(p.base, "tt-project-x", crontab=lambda: [], units=lambda: [], ssh=lambda alias: None)
+    d._selfleaks = selfwatch.Leaks(root)
+    return d, sent, p, root
+
+
+def _sw_leak_age(d, p):
+    from ttp import selfwatch
+    d.check_self_watch()
+    d._selfleaks.first = {k: 0.0 for k in d._selfleaks.first}
+    d._selfwatch_at = 0.0
+    d.check_self_watch()
+    return p.db.kv(selfwatch.KV)
+
+
+def test_the_daemon_never_ends_a_leftover_whose_own_precheck_folder_has_live_checks_waiting_for_a_slot(env, monkeypatch, tmp_path):
+    import json as _json
+    from ttp import cli
+    def build(p, tmp, done_id):
+        pre = p.state / "prechecks" / f"t{done_id}-abcdef012345"
+        pre.mkdir(parents=True)
+        (pre / "checks.pid").write_text(_json.dumps({"pid": 4242, "started": "s"}))
+        return {"TTP_RUN_DIR": str(pre)}
+    d, sent, p, _ = _sw_leak_daemon_world(env, monkeypatch, tmp_path, build)
+    monkeypatch.setattr(cli, "_checks_alive", lambda info: info.get("pid") == 4242)
+    snap = _sw_leak_age(d, p)
+    assert sent == [] and snap["leaks"] == [], (sent, snap)
+    monkeypatch.setattr(cli, "_checks_alive", lambda info: False)   # the checks are gone: now it is no live run
+    d._selfwatch_at = 0.0
+    snap = _sw_leak_age(d, p)
+    assert sent == [], "its run dir is no recorded run of the task: left alone with its reason"
+    assert [x["pid"] for x in snap["leaks_refused"]] == [3000] and "not attributable" in snap["leaks_refused"][0]["why"]
+
+
+def _recorded_run(p, tmp, done_id):
+    rd = tmp / "run-done"
+    p.db.x("INSERT INTO runs(task,role,status,dir,started) VALUES(?,?,?,?,0)", (done_id, "worker", "done", str(rd)))
+    return str(rd)
+
+
+def test_the_daemon_never_ends_a_leftover_holding_a_device_open(env, monkeypatch, tmp_path):
+    from ttp import leftoverstop
+    dev = tmp_path / "dev"
+    dev.mkdir()
+    (dev / "tenstorrent0").write_text("")
+    monkeypatch.setattr(leftoverstop, "DEVICE_PREFIX", str(dev / "tenstorrent"))
+    held = open(dev / "tenstorrent0")
+    try:
+        d, sent, p, root = _sw_leak_daemon_world(
+            env, monkeypatch, tmp_path, lambda p, t, i: {"TTP_RUN_DIR": _recorded_run(p, t, i)})
+        (root / "3000" / "fd").mkdir()
+        os.symlink(str(dev / "tenstorrent0"), root / "3000" / "fd" / "5")
+        snap = _sw_leak_age(d, p)
+    finally:
+        held.close()
+    assert sent == [] and [x["pid"] for x in snap["leaks_refused"]] == [3000], (sent, snap)
+    assert "device" in snap["leaks_refused"][0]["why"] and snap["leaks"] == []
+
+
+def test_the_daemon_never_ends_a_detached_job_leftover(env, monkeypatch, tmp_path):
+    d, sent, p, _ = _sw_leak_daemon_world(
+        env, monkeypatch, tmp_path, lambda p, t, i: {"TTP_RUN_DIR": _recorded_run(p, t, i), "TTP_DETACHED": "1"})
+    snap = _sw_leak_age(d, p)
+    assert sent == [] and "ttp detach" in snap["leaks_refused"][0]["why"], (sent, snap)
+
+
+def test_the_daemon_never_ends_a_leftover_whose_run_dir_is_not_a_recorded_run_of_its_task(env, monkeypatch, tmp_path):
+    d, sent, p, _ = _sw_leak_daemon_world(
+        env, monkeypatch, tmp_path, lambda p, t, i: {"TTP_RUN_DIR": str(t / "elsewhere")})
+    snap = _sw_leak_age(d, p)
+    assert sent == [] and "none of task" in snap["leaks_refused"][0]["why"], (sent, snap)
