@@ -108,7 +108,10 @@ def calls(output: Path):
             j = json.loads(line)
         except ValueError:
             continue
-        content = (j.get("message") or {}).get("content")
+        msg = j.get("message")
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
         if not isinstance(content, list):
             continue
         for b in content:
@@ -243,6 +246,23 @@ def build_pack(db, task: dict) -> dict:
             f"### $ {s['label']}\n\n```\n{s['text']}\n```\n" for s in snap))
     text = redact("\n".join(parts))
     head = str(task.get("head") or "")
+    if len(head) >= 9 and head[:9] in text:
+        # A snapshot item or a cited record that quotes the fix commit's sha (git log, a push log) leaks
+        # the answer's identity; the leak check drops that item instead of the task, so the pack keeps its
+        # context. A cited task or message is kept with only the sha masked.
+        bad = [i for i, s in enumerate(snap) if head[:9] in s["text"] or head[:9] in s["label"]]
+        if bad:
+            snap = [s for i, s in enumerate(snap) if i not in bad]
+        blocks = [re.sub(re.escape(head[:11]), "the fix commit's sha", b) for b in blocks]
+        parts = [f"# Context pack\n\n{INTRO}\n", "## Worker prompt (as dispatched)\n\n" + prompt]
+        if blocks:
+            parts.append("## Tasks and user messages the task cites\n\n" + "\n".join(blocks))
+        if findings:
+            parts.append("## Review findings to fix\n\n" + findings + "\n")
+        if snap:
+            parts.append("## What the original run read from live systems (recorded then)\n\n" + "\n".join(
+                f"### $ {s['label']}\n\n```\n{s['text']}\n```\n" for s in snap))
+        text = redact("\n".join(parts))
     if len(head) >= 9 and head[:9] in text:
         return {"class": INVALID, "why": "the pack names the fix commit", "text": "", "sha256": "",
                 "sources": {"run": run["id"]}}

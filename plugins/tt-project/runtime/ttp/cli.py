@@ -9415,7 +9415,8 @@ def _bench_daily(p, a) -> None:
                                      else conf.get("glm_harness"))
     except (ValueError, KeyError, OSError, benchrun.BenchError) as e:
         die(f"bench daily: {e}")
-    cap = a.cap_usd if a.cap_usd is not None else float(conf.get("cap_usd", benchdaily.CAP_USD))
+    cap = a.cap_usd if a.cap_usd is not None else float(conf.get("cap_usd", benchdaily.CAP_USD) or 0)
+    cells = {p: max(1, int((conf.get("cells") or {}).get(p) or 0)) for p in ("claude", "glm") if (conf.get("cells") or {}).get(p)}
     if a.rerun_stops:   # in this shell: it waits for a healthy server and runs one cell at a time
         held = benchdaily.lock(day)
         if held is None:
@@ -9456,7 +9457,7 @@ def _bench_daily(p, a) -> None:
                               ("timeout_s", conf.get("timeout_s"))) if v}
     try:
         rec = benchdaily.run_day(day, start, end, arms, p.config(), cap=cap,
-                                 parallel=a.parallel or int(conf.get("parallel", benchdaily.PARALLEL)),
+                                 parallel=a.parallel or cells or int(conf.get("parallel", benchdaily.PARALLEL)),
                                  seed=a.seed, only=a.only_project or conf.get("only_projects"), opts=opts,
                                  repos=conf.get("repos"))
     except (OSError, ValueError, RuntimeError) as e:
@@ -16206,7 +16207,7 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--day", help="daily: the landed day to bench (YYYY-MM-DD in --tz; default: yesterday)")
     s.add_argument("--tz", help="daily: the zone the day is read in (default: bench.daily.tz, else the built-in one)")
     s.add_argument("--cap-usd", type=float, help="daily: the day's Claude spend cap, arm runs plus reviews "
-                   "(default: bench.daily.cap_usd, else 40)")
+                   "(default: bench.daily.cap_usd, else no cap; 0 = no cap)")
     s.add_argument("--glm-harness", help="daily, replay: the harness the open-model arm runs on (claude = the Claude Code "
                    "bridge, opencode, mini-swe-agent; default: bench.daily.glm_harness, else mini-swe-agent)")
     s.add_argument("--parallel", type=int, default=0, help="daily, replay: tasks run at once (default 3)")

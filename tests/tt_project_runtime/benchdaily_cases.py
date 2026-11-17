@@ -239,6 +239,99 @@ def test_daily_run_cells_a_high_spend_first_task_raises_the_reservation_and_tota
     assert res["claude_usd"] <= 30.0 and res["skipped"]
 
 
+def test_daily_no_default_cap_a_zero_or_missing_cap_admits_every_task_and_the_guard_is_the_only_stop(env, tmp_path, monkeypatch):
+    from ttp import benchdaily
+    ran = []
+    _spend_tasks(benchdaily, monkeypatch, [1.0] * 20, ran)
+    tasks = {f"t{i}": {"task": f"t{i}"} for i in range(6)}
+    # cap 0 (the shipped default: no cap), no guard config: every task runs, nothing skipped
+    res = benchdaily.run_cells("2026-11-16", tasks, _DD_ARMS, tmp_path / "out", tmp_path / "b",
+                               {"budget_usd": 5.0, "review_usd": 1.0}, {}, cap=0.0, parallel=1)
+    assert res["ran"] == [f"t{i}" for i in range(6)] and res["skipped"] == [], "no default cap: all tasks run"
+    assert res["claude_usd"] == 6.0, "only Claude arm spend counts"
+    # a configured guard is the stop when there is no cap
+    ran2 = []
+    def fake2(out, bench_dir, task, arms_, opts, cfg, ledger, lock):
+        ran2.append(task["task"])
+        rows = [{"task": task["task"], "rep": 0, "arm": a, "cost_usd": spends2[len(ran2) - 1] if a == "son" else 5.0}
+                for a in arms_]
+        for r in rows:
+            benchdaily.append_row(out / "results.jsonl", r, lock)
+        return rows
+    spends2 = [4.0] * 20
+    monkeypatch.setattr(benchdaily, "run_task", fake2)
+    monkeypatch.setattr(benchdaily, "_run_task",
+                        lambda out, bd, t, arms, o, c, l, k, g: fake2(out, bd, t, arms, o, c, l, k))
+    tasks2 = {f"t{i}": {"task": f"t{i}"} for i in range(10)}
+    out2 = tmp_path / "out2"
+    cfg_guard = {"bench": {"daily": {"guard_usd": 12.0}}}
+    res2 = benchdaily.run_cells("2026-11-16", tasks2, _DD_ARMS, out2, tmp_path / "b2", {"budget_usd": 5.0, "review_usd": 1.0},
+                                cfg_guard, cap=0.0, parallel=1)
+    assert len(res2["ran"]) < 10 and res2["skipped"], "the guard stops a runaway run with no cap set"
+    # an ordered run is never stopped: the guard is off for it
+    res3 = benchdaily.run_cells("2026-11-16", tasks2, _DD_ARMS, tmp_path / "out3", tmp_path / "b3",
+                                 {"budget_usd": 5.0, "review_usd": 1.0}, cfg_guard, cap=0.0, parallel=1,
+                                 order=list(tasks2))
+    assert len(res3["ran"]) == 10 and res3["skipped"] == [], "an ordered run never stops for spend"
+
+
+def test_daily_guard_usd_is_configurable_and_off_for_ordered_runs():
+    from ttp import benchdaily
+    assert benchdaily.guard_usd({}) == benchdaily.GUARD_USD, "the default guard"
+    assert benchdaily.guard_usd({"bench": {"daily": {"guard_usd": 25}}}) == 25.0
+    assert benchdaily.guard_usd({"bench": {"daily": {"guard_usd": 0}}}) is None, "0 disables the guard"
+    assert benchdaily.guard_usd({}, True) is None, "an ordered run has no guard"
+    assert benchdaily.CAP_USD == 0.0, "the shipped default carries no daily cap"
+
+
+def test_daily_cells_limits_read_bench_cells_and_gate_chat_cells_separately_from_claude_ones():
+    from ttp import benchdaily
+    assert benchdaily.cells_limits({}) == {"claude": benchdaily.PARALLEL, "chat": benchdaily.PARALLEL}
+    assert benchdaily.cells_limits({"bench": {"cells": {"claude": 2, "glm": 5}}}) == {"claude": 2, "chat": 5}
+    assert benchdaily.cells_limits({"bench": {"cells": {"claude": 4}}})["claude"] == 4
+    # a GLM-only gate: a chat-only task set never waits on the claude semaphore
+    gates = {"claude": threading.Semaphore(1), "chat": threading.Semaphore(3)}
+    def gate(arms_of_task):
+        only_chat = arms_of_task and all(a.get("provider") == "chat" for a in arms_of_task.values())
+        return gates["chat" if only_chat else "claude"]
+    assert gate({"glm": {"provider": "chat"}}) is gates["chat"], "all-chat arms gate on chat"
+    assert gate({"son": {"provider": "claude"}, "glm": {"provider": "chat"}}) is gates["claude"], \
+        "a Claude arm present gates on claude"
+    assert gate({}) is gates["claude"], "no arms: the claude gate"
+
+
+def test_daily_run_cells_runs_chat_cells_under_their_own_gate_not_behind_claude_ones(env, tmp_path, monkeypatch):
+    from ttp import benchdaily
+    cfg = {"bench": {"cells": {"claude": 1, "glm": 2}}}    # Claude cells at once 1, GLM cells at once 2
+    def fake_run_task(out, bench_dir, task, arms_, opts, cfg_, ledger, lock):
+        rows = [{"task": task["task"], "rep": 0, "arm": a, "cost_usd": 0.1} for a in arms_]
+        for r in rows:
+            benchdaily.append_row(out / "results.jsonl", r, lock)
+        return rows
+    monkeypatch.setattr(benchdaily, "run_task", fake_run_task)
+    entered = []   # the gate _run_task is handed, by the arms' provider: its unused capacity says its limit
+    def spy_run_task(out, bench_dir, task, arms, opts, cfg_, ledger, lock, gate):
+        entered.append((tuple(sorted(a.get("provider") for a in arms.values())), gate._value))
+        return fake_run_task(out, bench_dir, task, arms, opts, cfg_, ledger, lock)
+    monkeypatch.setattr(benchdaily, "_run_task", spy_run_task)
+    def run(arms, name):
+        tasks = {f"{name}{i}": {"task": f"{name}{i}"} for i in range(3)}
+        return benchdaily.run_cells("2026-11-16", tasks, arms, tmp_path / f"out-{name}", tmp_path / f"b-{name}",
+                                    {"budget_usd": 5.0, "review_usd": 1.0}, cfg, cap=0.0)
+    r_claude = run({"son": {"provider": "claude"}}, "cla")
+    r_chat = run({"glm": {"provider": "chat"}}, "glm")
+    assert r_claude["skipped"] == [] and len(r_claude["ran"]) == 3 and r_chat["skipped"] == []
+    by_arms = {arms: v for arms, v in entered}
+    assert by_arms[("claude",)] == 1 and by_arms[("chat",)] == 2, \
+        f"a claude-only run is gated 1 at once, a chat-only one 2 (bench.cells): {entered}"
+    assert all(v in (1, 2) for _, v in entered), "a task never waits on the other provider's gate"
+    # mixed arms: a Claude arm present gates the task under the claude gate
+    r_mixed = benchdaily.run_cells("2026-11-16", {"m0": {"task": "m0"}}, _DD_ARMS, tmp_path / "out-mix",
+                                   tmp_path / "b-mix", {"budget_usd": 5.0, "review_usd": 1.0}, cfg, cap=0.0)
+    assert r_mixed["skipped"] == []
+    assert entered[6:] == [(("chat", "claude"), 1)], "a mixed task runs under the claude gate (limit 1)"
+
+
 def test_daily_prior_review_mean_reads_the_latest_earlier_day(tmp_path):
     from ttp import benchdaily
     days = tmp_path / "days"

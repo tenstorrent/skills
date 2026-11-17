@@ -27,7 +27,8 @@ from pathlib import Path
 from . import bench, benchblind, benchpack, benchrun, benchv2, blindreview, effort, gitmemo, serverhealth
 from .project import durable_write, open_append
 
-CAP_USD = 40.0       # Claude spend a day (arm runs plus reviews)
+CAP_USD = 0.0        # Claude spend a day (arm runs plus reviews); 0: no cap (the runaway guard is separate)
+GUARD_USD = 600.0    # the runaway guard: a stop far above any sensible day, so a runaway run is cut off
 CELL_USD = 5.0       # most one arm run may spend (the run's own budget stop)
 REVIEW_USD = 2.0     # most one blind review call may spend
 FLOOR_USD = 1.0      # least a measured reservation holds for one task's arm runs
@@ -227,14 +228,15 @@ def sample(by_project: dict[str, list[dict]], seed: int) -> list[dict]:
 
 class Ledger:
     """Claude spend counted from a running total. A task is admitted only while spent + what the tasks in
-    flight and the reviews still to run may spend + this task's reservation fits the cap. A reservation is the
-    worst case (every run spends its whole budget) until MEASURED_AFTER tasks have finished; then it is
-    MEASURED_X times the mean actual spend of the finished ones (at least the floor, at most the worst case),
-    so the cap buys the tasks it can really pay for. Actual spend still never passes the cap: a run's own
-    budget stop bounds each cell."""
+    flight and the reviews still to run may spend + this task's reservation fits the cap; a cap of 0 means
+    no cap: every task is admitted. A reservation is the worst case (every run spends its whole budget)
+    until MEASURED_AFTER tasks have finished; then it is MEASURED_X times the mean actual spend of the
+    finished ones (at least the floor, at most the worst case), so the cap buys the tasks it can really pay
+    for. Actual spend still never passes the cap: a run's own budget stop bounds each cell."""
 
     def __init__(self, cap: float, spent: float = 0.0, review_mean: float | None = None):
         self.cap, self.spent, self.flight, self.reviews = cap, spent, 0.0, 0.0
+        self.uncapped = not self.cap    # a missing or 0 cap: no task is left out for spend
         self.review_mean = review_mean    # a measured review spend per task (an earlier day's), or None
         self.finished: list[float] = []   # actual arm spend of each task finished in this run
         self.lock = threading.Lock()
@@ -254,7 +256,7 @@ class Ledger:
 
     def admit(self, worst: float, review: float) -> bool:
         with self.lock:
-            if self.spent + self.flight + self.reviews + worst + review > self.cap:
+            if not self.uncapped and self.spent + self.flight + self.reviews + worst + review > self.cap:
                 return False
             self.flight += worst
             self.reviews += review
@@ -278,6 +280,24 @@ class Ledger:
 
 def is_claude(arm: dict) -> bool:
     return arm.get("provider") == "claude"
+
+
+def cells_limits(cfg: dict) -> dict:
+    """How many cells run at once per provider: bench.cells.claude and bench.cells.glm (0 or missing: the
+    PARALLEL default, one number for every provider as before)."""
+    cells = (cfg.get("bench") or {}).get("cells") or {}
+    got = {"claude": int(cells.get("claude") or 0), "chat": int(cells.get("glm") or 0)}
+    return {p: max(1, n) if n else PARALLEL for p, n in got.items()}
+
+
+def guard_usd(cfg: dict, ordered_run: bool = False) -> float | None:
+    """The runaway guard's dollar stop, or None when it is off. It bounds a run whose spend runs away
+    (config bench.daily.guard_usd; 0 disables it). An ordered run (an explicit task order from the
+    coordinator or the user) never stops for it: its tasks were explicitly asked for."""
+    if ordered_run:
+        return None
+    cfg_guard = ((cfg.get("bench") or {}).get("daily") or {}).get("guard_usd", GUARD_USD)
+    return float(cfg_guard) if cfg_guard else None
 
 
 # -- run
@@ -322,7 +342,9 @@ def append_row(path: Path, row: dict, lock: threading.Lock) -> None:
 def run_task(out: Path, bench_dir: Path, task: dict, arms: dict, opts: dict, cfg: dict, ledger: Ledger,
              lock: threading.Lock) -> list[dict]:
     """The arms of one task, run one after the other (so a paired cell is never half run at the cap); each
-    row goes to results.jsonl as it ends. A cell that already has a row is not run again."""
+    row goes to results.jsonl as it ends. A cell that already has a row is not run again. A chat-provider
+    arm (GLM) runs without the exclusive chat-server lock the Claude arms take: its endpoint serves many
+    cells at once, so a lock would only serialize them against each other."""
     path = out / "results.jsonl"
     have = read_rows(path)
     added = []
@@ -339,18 +361,35 @@ def run_task(out: Path, bench_dir: Path, task: dict, arms: dict, opts: dict, cfg
     return added
 
 
+def _run_task(out: Path, bench_dir: Path, task: dict, arms: dict, opts: dict, cfg: dict, ledger: Ledger,
+              lock: threading.Lock, gate: threading.Semaphore) -> list[dict]:
+    """run_task under this provider's concurrency gate (a semaphore the caller owns). A test that monkey-
+    patches `run_task` keeps working: the patched function is picked up by name at call time."""
+    run = globals()["run_task"]
+    with gate:
+        return run(out, bench_dir, task, arms, opts, cfg, ledger, lock)
+
+
 def run_cells(day: str, tasks: dict[str, dict], arms: dict, out: Path, bench_dir: Path, opts: dict, cfg: dict,
-              cap: float, parallel: int = PARALLEL, order: list[str] | None = None, progress=None) -> dict:
-    """Run the tasks' cells under the Claude cap. Returns {"ran": [task ids], "skipped": [{task, why}]}."""
+              cap: float, parallel=None, order: list[str] | None = None, progress=None) -> dict:
+    """Run the tasks' cells. `parallel` is the number of tasks at once, a number or {provider: n} (bench.cells.*
+    config; default: one per provider as before). A chat-provider cell never takes the exclusive chat-server
+    lock. Returns {"ran": [task ids], "skipped": [{task, why}]}."""
     say = progress or (lambda s: None)
     out.mkdir(parents=True, exist_ok=True)
     rows = read_rows(out / "results.jsonl")
     spent = sum(float(r.get("cost_usd") or 0) for r in rows.values() if is_claude(arms.get(r["arm"], {})))
     spent += review_spent(out)
-    ledger = Ledger(cap, spent, opts.get("review_mean"))
+    # cap 0: no daily cap; the runaway guard (bench.daily.guard_usd, default GUARD_USD) is the stop instead,
+    # and it too is off for an ordered run (an explicit task order) — nothing then stops the run for spend.
+    ledger = Ledger(cap or guard_usd(cfg, bool(order)), spent, opts.get("review_mean"))
     n_claude = sum(is_claude(a) for a in arms.values())
     worst, review = n_claude * opts.get("budget_usd", CELL_USD), opts.get("review_usd", REVIEW_USD)
+    limits = cells_limits(cfg) if parallel is None else parallel   # {provider: n} or a plain number
+    limit = limits if isinstance(limits, dict) else {"claude": max(1, int(limits or PARALLEL)),
+                                                     "chat": max(1, int(limits or PARALLEL))}
     lock = threading.Lock()
+    at_once = max(1, int(parallel)) if isinstance(parallel, int) else sum(limit.values())
     ran, skipped, admitted = [], [], []
     todo = [t for t in (order or list(tasks)) if t in tasks]
     def full(t: str) -> bool:
@@ -365,7 +404,13 @@ def run_cells(day: str, tasks: dict[str, dict], arms: dict, out: Path, bench_dir
     if ran and not (out / "review.json").exists():
         ledger.reviews += ledger.reservation(worst, review)[1] * len(ran)   # a resumed run's finished cells are not reviewed yet: their reviews still spend
     pending: dict = {}
-    with concurrent.futures.ThreadPoolExecutor(max(1, parallel)) as pool:
+    gates: dict[str, threading.Semaphore] = {p: threading.Semaphore(max(1, n)) for p, n in limit.items()}
+    def gate(arms_of_task: dict) -> threading.Semaphore:
+        """A task's cells are gated by the provider that runs them: all-chat under the chat gate (GLM cells
+        never wait behind Claude ones), anything else (a Claude arm present) under the claude gate."""
+        only_chat = arms_of_task and all(a.get("provider") == "chat" for a in arms_of_task.values())
+        return gates.get("chat" if only_chat else "claude", gates["claude"])
+    with concurrent.futures.ThreadPoolExecutor(max(1, sum(limit.values()))) as pool:
         def finish(f):
             tid, w = pending.pop(f)
             try:
@@ -375,9 +420,10 @@ def run_cells(day: str, tasks: dict[str, dict], arms: dict, out: Path, bench_dir
                 got = []
             ledger.done(w, sum(float(r.get("cost_usd") or 0) for r in got if is_claude(arms[r["arm"]])))
             ran.append(tid)
-            say(f"{tid}: done; Claude spend ${ledger.total():.2f} of ${cap:.2f}")
+            say(f"{tid}: done; Claude spend ${ledger.total():.2f}"
+                + (f" of ${ledger.cap:.2f}" if ledger.cap else " (no cap)"))
         for tid in todo:
-            while len(pending) >= parallel:   # a free slot first: a finished task's spend is then in the mean
+            while len(pending) >= at_once:
                 done, _ = concurrent.futures.wait(list(pending), return_when=concurrent.futures.FIRST_COMPLETED)
                 for f in done:
                     finish(f)
@@ -388,7 +434,8 @@ def run_cells(day: str, tasks: dict[str, dict], arms: dict, out: Path, bench_dir
                     break
                 if not pending:
                     ok = False
-                    skipped.append({"task": tid, "why": f"the ${cap:.0f} Claude cap leaves no room for another task "
+                    stop = "the runaway guard" if cap <= 0 else f"the ${cap:.0f} Claude cap"
+                    skipped.append({"task": tid, "why": f"{stop} leaves no room for another task "
                                                         f"(it would reserve ${hold + rev:.2f}; {rule})"})
                     break
                 done, _ = concurrent.futures.wait(list(pending), return_when=concurrent.futures.FIRST_COMPLETED)
@@ -398,7 +445,7 @@ def run_cells(day: str, tasks: dict[str, dict], arms: dict, out: Path, bench_dir
                 continue
             admitted.append({"task": tid, "reserved_usd": round(hold + rev, 4), "rule": rule})
             say(f"{tid}: admitted, reserves ${hold + rev:.2f} ({rule})")
-            f = pool.submit(run_task, out, bench_dir, tasks[tid], arms, opts, cfg, ledger, lock)
+            f = pool.submit(_run_task, out, bench_dir, tasks[tid], arms, opts, cfg, ledger, lock, gate(arms))
             pending[f] = (tid, hold)
         for f in list(pending):
             finish(f)
@@ -656,6 +703,7 @@ def cumulative(root: Path | None = None) -> dict:
                 **({"flagged": f} if (f := sum(1 for r in rows if r.get("outcome") == "flagged")) else {}),
                 "criteria": round(sum(r["criteria"] for r in rows) / n, 2),
                 "correctness": round(sum(r["correctness"] for r in rows) / n, 2),
+                "usd": round(sum(r["cost_usd"] for r in rows), 2),
                 "usd_per_task": round(sum(r["cost_usd"] for r in rows) / n, 2),
                 "min_per_task": round(sum(r["minutes"] for r in rows) / n, 1),
                 "stops": sum(1 for r in rows if r["stopped"]),
@@ -708,11 +756,11 @@ def _row(label: str, a: dict, second: bool = False) -> str:
     tail = (f" {a['second_landed']}/{a['second_n']} ({a['second_criteria']}/{a['second_correctness']}) |"
             if a.get("second_n") else " |") if second else ""
     return (f"| {label} | {a['n']} | {a['landed']}/{a['n']} | {a['criteria']} | {a['correctness']} | "
-            f"${a['usd_per_task']} | {a['min_per_task']} | {a['stops']} |{tail}")
+            f"${a['usd']} | ${a['usd_per_task']} | {a['min_per_task']} | {a['stops']} |{tail}")
 
 
-HEAD = ("| {} | N | landed | requirements (0-4) | correctness (0-4) | $ per task | minutes per task | 60-min stops |{}\n"
-        "|---|---|---|---|---|---|---|---|{}")
+HEAD = ("| {} | N | landed | requirements (0-4) | correctness (0-4) | $ total | $ per task | minutes per task | 60-min stops |{}\n"
+        "|---|---|---|---|---|---|---|---|---|{}")
 
 
 def table_md(cum: dict) -> str:
@@ -810,7 +858,7 @@ def build_tasks(day: str, picked: dict, root: Path, bench_dir: Path, skip: str |
     return kept
 
 
-def run_day(day: str, start: float, end: float, arms: dict, cfg: dict, cap: float = CAP_USD, parallel: int = PARALLEL,
+def run_day(day: str, start: float, end: float, arms: dict, cfg: dict, cap: float = CAP_USD, parallel=None,
             seed: int | None = None, skip: str | None = None, root: Path | None = None, only: list[str] | None = None,
             opts: dict | None = None, ask=None, progress=None, repos: dict | None = None, ask2=None) -> dict:
     """The whole day: pick across projects, build, run under the cap, review, write the day's record and the
