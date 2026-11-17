@@ -29,19 +29,6 @@ its tasks one at a time (ref_runner, resumable) and books one row in terminalben
 booked model never runs again. Those rows stay out of the ranking (modelscore.bench never reads them) and
 are shown beside it marked as reference (reference_view); with none booked, the SUBSET_REFERENCE rows of the
 DEFAULT_TASKS subset are shown, marked as such.
-
-Reference routes (a same-conditions comparison): a model listed in reference.bridge is called through the
-logged-in claude CLI (claudebridge.ClaudeCliBridge, a loopback server in the runner's own process that the
-agent reaches as OPENAI_BASE_URL; no API key, no endpoint), at its effort (reference.efforts[model], else
-reference.effort); its row carries route "claude-cli", the CLI version and the dollars it reported. Every
-other model goes through the endpoint and its runner is wrapped in `ttp lock <reference.lock>` (default
-LOCK, "" for none), so one endpoint model runs at a time. reference.parallel (default 1) runs that many of a
-model's tasks at once. limit_s 0 (harborslice) gives every model its task's own limit.
-
-Pre-flight (preflight): a cycle that cannot start (no working endpoint key, no harbor venv, no docker
-compose) used to fail only in terminalbench.log. Each failure is counted in terminalbench/preflight.json and
-a pass resets it; the PREFLIGHT_FAILS-th failure in a row raises one observation event (source
-"model-bench", one per streak) naming the cause, so the owner fixes it the same day.
 """
 from __future__ import annotations
 
@@ -59,8 +46,6 @@ REF, REF_FILE, REF_MODELS, REF_EFFORT = "reference", "reference.jsonl", ("claude
 # Shown until a reference run is booked: an earlier run of the DEFAULT_TASKS subset (Terminus 2, 900 s per task).
 SUBSET_REFERENCE = ({"model": "Opus 5.5", "effort": "low", "passed": 14, "trials": 20},
                     {"model": "Sonnet 5.5", "effort": "low", "passed": 14, "trials": 20})
-LOCK, BRIDGE_ROUTE = "chat-server", "claude-cli"
-PREFLIGHT_FILE, PREFLIGHT_FAILS = "preflight.json", 3
 SUBSET_NOTE = "20-task subset (2026-10-27, low effort, 900 s per task)"
 
 
@@ -75,46 +60,11 @@ def settings(cfg: dict) -> dict:
     r = s.get(REF) if isinstance(s.get(REF), dict) else {}
     ms = r.get("models")
     eff = str(r.get("effort") or REF_EFFORT)
-    br, ef = r.get("bridge"), r.get("efforts")
-    par = r.get("parallel")
     ref = {"endpoint": str(r.get("endpoint") or ""),
            "models": [str(m) for m in ms if str(m).strip()] if isinstance(ms, list) else list(REF_MODELS),
-           "effort": eff if eff.isalpha() else REF_EFFORT,   # it goes into the harbor command line
-           "bridge": [str(m) for m in br if str(m).strip()] if isinstance(br, list) else [],
-           "efforts": {str(k): str(v) for k, v in ef.items() if str(v).isalpha()} if isinstance(ef, dict) else {},
-           "parallel": int(par) if isinstance(par, int) and not isinstance(par, bool) and par >= 1 else 1,
-           "lock": str(r["lock"]) if isinstance(r.get("lock"), str) else LOCK}
+           "effort": eff if eff.isalpha() else REF_EFFORT}   # it goes into the harbor command line
     return {**harborslice.settings(cfg), "cycle_h": max(hours("cycle_h", CYCLE_H), 1.0),
             "new_model_h": hours("new_model_h", NEW_MODEL_H), REF: ref}
-
-
-def preflight(p, cause: str = "", now: float | None = None) -> int:
-    """Count a cycle's pre-flight: a failure (`cause`, one line) adds one, a pass (empty cause) resets the count.
-    The PREFLIGHT_FAILS-th failure in a row queues one observation event naming the cause (one per streak).
-    Returns the streak length."""
-    from .project import durable_write
-    now = time.time() if now is None else now
-    f = folder() / PREFLIGHT_FILE
-    try:
-        st = json.loads(f.read_text())
-        st = st if isinstance(st, dict) else {}
-    except (OSError, ValueError):
-        st = {}
-    if not cause:
-        if st.get("fails"):
-            durable_write(f, json.dumps({"fails": 0}))
-        return 0
-    st = {"fails": int(st.get("fails") or 0) + 1, "since": st.get("since") or now, "cause": cause[:400]}
-    folder().mkdir(parents=True, exist_ok=True)
-    durable_write(f, json.dumps(st))
-    if st["fails"] >= PREFLIGHT_FAILS:
-        fp = f"terminalbench-preflight:{int(st['since'])}"
-        if not p.db.one("SELECT 1 FROM events WHERE fingerprint = ? AND kind = 'observation'", (fp,)):
-            p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
-                   (now, "model-bench", "observation", fp, "normal",
-                    f"Terminal-Bench cycles failed their pre-flight {st['fails']} times in a row, so no trial runs: "
-                    f"{st['cause']}", "queued"))
-    return st["fails"]
 
 
 def folder() -> Path:
@@ -336,7 +286,7 @@ def ref_start(cfg: dict, served: list[str] | None, launch: Callable[[str], None]
     for m in settings(cfg)[REF]["models"]:
         if m in booked:
             got["booked"].append(m)
-        elif served is not None and m not in served and m not in settings(cfg)[REF]["bridge"]:
+        elif served is not None and m not in served:
             got["not_served"].append(m)
         elif (held := _locked(folder() / REF / f"{slug(m)}.lock")) is None:
             got["running"].append(m)
@@ -353,17 +303,9 @@ def ref_command(effort: str) -> str:
     return COMMAND.replace('{{"num_retries":8}}', '{{"num_retries":8,"extra_body":{{"reasoning_effort":"%s"}}}}' % effort)
 
 
-def ref_effort(s: dict, model: str) -> str:
-    return s[REF]["efforts"].get(model) or s[REF]["effort"]
-
-
-def ref_runner(cfg: dict, model: str, env: dict, *, trial: Callable | None = None, clock: Callable = time.time,
-               bridge: Callable | None = None) -> int:
-    """Run `model`'s reference tasks (resuming), then book its row once; returns trials run. A booked model
-    runs nothing (module doc). A bridge model gets the claude CLI's loopback server (bridge(model, effort)
-    builds it) for the run; reference.parallel tasks run at once."""
-    from concurrent.futures import ThreadPoolExecutor
-    from threading import Event, Lock
+def ref_runner(cfg: dict, model: str, env: dict, *, trial: Callable | None = None, clock: Callable = time.time) -> int:
+    """Run `model`'s reference tasks one at a time (resuming), then book its row once; returns trials run.
+    A booked model runs nothing (module doc)."""
     from . import harborslice, modelbench, modelsuite
     from .project import durable_write
     if any(r["model"] == model for r in reference()):
@@ -373,54 +315,27 @@ def ref_runner(cfg: dict, model: str, env: dict, *, trial: Callable | None = Non
     if held is None:
         return 0   # its reference runner is already running
     s, home, ran = settings(cfg), modelbench.home(), 0
-    via = BRIDGE_ROUTE if model in s[REF]["bridge"] else "endpoint"
     try:
         meta = json.loads((d / f"{sl}.json").read_text())
     except (OSError, ValueError):
-        meta = {"started": clock(), "tasks": harborslice.tasks(home, s), "effort": ref_effort(s, model), "route": via}
+        meta = {"started": clock(), "tasks": harborslice.tasks(home, s), "effort": s[REF]["effort"]}
         durable_write(d / f"{sl}.json", json.dumps(meta))
-    srv, cost = None, 0.0
+    cmd = ref_command(meta["effort"])
+    trial = trial or (lambda m, t, root: harborslice.trial(m, t, root, env, s, command=cmd, home=home))
     try:
-        if via == BRIDGE_ROUTE:   # the logged-in CLI, no key: the agent's env points at the loopback server
-            from .claudebridge import ClaudeCliBridge
-            srv = (bridge or (lambda m, e: ClaudeCliBridge.from_settings({"model": m, "effort": e})))(
-                model, meta["effort"]).start()
-            env = {**env, **srv.openai_env()}
-        cmd = harborslice.COMMAND if via == BRIDGE_ROUTE else ref_command(meta["effort"])
-        trial = trial or (lambda m, t, root: harborslice.trial(m, t, root, env, s, command=cmd, home=home))
-        done, put = _rows(d / f"{sl}.jsonl", meta["tasks"]), Lock()
-
-        dead = Event()
-
-        def one(t):
-            if dead.is_set():
-                return   # a trial died: start no more
-            try:
-                r = {"task": t, "at": clock(), **trial(model, t, d / "trials")}
-            except BaseException:
-                dead.set()
-                raise
-            with put:
-                done[t] = r
-                modelsuite._append(d / f"{sl}.jsonl", r)
-        todo = [t for t in meta["tasks"] if t not in done]
-        with ThreadPoolExecutor(max_workers=max(1, min(s[REF]["parallel"], len(todo) or 1))) as pool:
-            for f in [pool.submit(one, t) for t in todo]:
-                f.result()
-        ran = len(todo)
-        extra = {}
-        if srv is not None:
-            cost = srv.cost_so_far()
-            extra = {"cost_usd": round(cost, 4), "claude_cli": srv.stats().get("claude_cli", {}).get("version", "")}
+        done = _rows(d / f"{sl}.jsonl", meta["tasks"])
+        for t in meta["tasks"]:
+            if t not in done:
+                done[t] = {"task": t, "at": clock(), **trial(model, t, d / "trials")}
+                modelsuite._append(d / f"{sl}.jsonl", done[t])
+                ran += 1
         sc = harborslice.score([done[t] for t in meta["tasks"]])
         modelsuite._append(folder() / REF_FILE, {
             "date": modelbench.day(clock()), "model": model, "suite": "terminalbench", "reference": True,
             "effort": meta["effort"], "agent": s["agent"], "dataset": s["dataset"], "started": meta["started"],
-            "route": via, "tasks": len(meta["tasks"]), "at": clock(), **extra, **sc, "score": sc["pass_rate"]})
+            "tasks": len(meta["tasks"]), "at": clock(), **sc, "score": sc["pass_rate"]})
         return ran
     finally:
-        if srv is not None:
-            srv.stop()
         held.close()
 
 
@@ -432,11 +347,7 @@ def launch(p, model: str, reference: bool = False) -> None:
     env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, [rt, os.environ.get("PYTHONPATH")]))}
     with open(folder() / f"{(REF + '-') * reference}{slug(model)}.log", "ab") as out:
         # own session: the paced benchmark runner outlives the daemon tick that starts it
-        argv = [sys.executable, "-m", "ttp", "model-bench", "terminalbench", *(["--reference"] * reference),
-                "--runner", model]
-        ref = settings(p.config())[REF]
-        if reference and ref["lock"] and model not in ref["bridge"]:   # one endpoint model at a time
-            argv = [sys.executable, "-m", "ttp", "lock", ref["lock"], "--", *argv]
-        subprocess.Popen(argv,
+        subprocess.Popen([sys.executable, "-m", "ttp", "model-bench", "terminalbench", *(["--reference"] * reference),
+                          "--runner", model],
                          cwd=p.root, env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
                          start_new_session=True)

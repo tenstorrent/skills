@@ -9076,30 +9076,25 @@ def _terminalbench(p, a, now: float) -> None:
         die("model-bench terminalbench: off (model_bench.terminalbench.on is false)")
     if getattr(a, "reference", False):
         return _terminalbench_reference(p, a, cfg)
-
-    def fail(why: str) -> None:   # counted: the third failure in a row raises an event (tbcycle.preflight)
-        tbcycle.preflight(p, why, now)
-        die(f"model-bench terminalbench: {why}")
     alias =str(((cfg.get("providers") or {}).get("chat") or {}).get("endpoint") or "")
     got = endpoint.credentials(alias) if alias else None
     ok, msg, ids = endpoint.list_models(got.url, got.key) if got else (False, "no key saved", None)
     if not ok or not ids:
-        fail(f"no working key for chat endpoint {alias or '(none)'}: {msg}")
+        die(f"model-bench terminalbench: no working key for chat endpoint {alias or '(none)'}: {msg}")
     if a.runner:   # the endpoint reaches harbor's environment only, never argv
         venv, why = harborslice.install(tbcycle.folder() / "harbor")
         if not venv:
-            fail(why)
+            die(f"model-bench terminalbench: {why}")
         env = harborslice.child_env(venv, got.url, got.key)
         extra, why = harborslice.compose(tbcycle.folder() / "harbor", tbcycle.settings(cfg), env)
         if extra is None:
-            fail(why)
+            die(f"model-bench terminalbench: {why}")
         print(json.dumps({"model": a.runner, "trials": tbcycle.runner(
             cfg, a.runner, {**env, **extra})}))
         return
     extra, why = harborslice.compose(tbcycle.folder() / "harbor", tbcycle.settings(cfg))
     if extra is None:   # checked before any runner starts: no trial without compose
-        fail(why)
-    tbcycle.preflight(p, "", now)
+        die(f"model-bench terminalbench: {why}")
     want = {m.strip() for m in (a.models or "").split(",") if m.strip()}
     served = [m for m in ids if not want or m in want]
     print(json.dumps({**tbcycle.step(cfg, served, now, lambda m: tbcycle.launch(p, m)),
@@ -9108,14 +9103,11 @@ def _terminalbench(p, a, now: float) -> None:
 
 def _terminalbench_reference(p, a, cfg: dict) -> None:
     """`ttp model-bench terminalbench --reference`: the one-time reference run, by hand only (tbcycle.py).
-    A model in reference.bridge goes through the claude CLI and needs no endpoint; any other needs the saved
-    one: none saved, one plain line, nothing started."""
+    No saved endpoint: one plain line, nothing started."""
     from . import endpoint, harborslice, tbcycle
-    ref = tbcycle.settings(cfg)["reference"]
-    alias = ref["endpoint"]
+    alias = tbcycle.settings(cfg)["reference"]["endpoint"]
     got = endpoint.credentials(alias) if alias else None
-    bridged = a.runner in ref["bridge"] if a.runner else all(m in ref["bridge"] for m in ref["models"])
-    if not got and not bridged:
+    if not got:
         die("model-bench terminalbench --reference: no reference endpoint saved; save an Anthropic-capable one with "
             "`ttp secret endpoint <alias> --url <base url>`, then `ttp config <project> "
             "model_bench.terminalbench.reference.endpoint <alias>`")
@@ -9123,18 +9115,16 @@ def _terminalbench_reference(p, a, cfg: dict) -> None:
         venv, why = harborslice.install(tbcycle.folder() / "harbor")
         if not venv:
             die(f"model-bench terminalbench --reference: {why}")
-        env = harborslice.child_env(venv, *((got.url, got.key) if got and not bridged else ()))
+        env = harborslice.child_env(venv, got.url, got.key)
         extra, why = harborslice.compose(tbcycle.folder() / "harbor", tbcycle.settings(cfg), env)
         if extra is None:
             die(f"model-bench terminalbench --reference: {why}")
         print(json.dumps({"model": a.runner, "reference": True, "trials": tbcycle.ref_runner(
             cfg, a.runner, {**env, **extra})}))
         return
-    ids = None
-    if got:
-        ok, msg, ids = endpoint.list_models(got.url, got.key)   # a model list read, no tokens
-        if not ok:
-            die(f"model-bench terminalbench --reference: endpoint {alias}: {msg}")
+    ok, msg, ids = endpoint.list_models(got.url, got.key)   # a model list read, no tokens
+    if not ok:
+        die(f"model-bench terminalbench --reference: endpoint {alias}: {msg}")
     print(json.dumps(tbcycle.ref_start(cfg, list(ids) if ids else None,
                                        lambda m: tbcycle.launch(p, m, reference=True)), indent=1))
 
