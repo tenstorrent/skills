@@ -43,13 +43,14 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from . import blindreview
+from . import blindreview, provallow
 
 KEY = "device_ab"
 LABEL = "device_ab:"                    # device_ab:<arm>, on the task before its first run
 EXCLUDED = "device_ab_excluded:"        # device_ab_excluded:<why>, counted in the report
 REVIEW_LABEL = "device_ab_review:"      # on the masked review task: device_ab_review:<task id>
 REVIEW2_LABEL = "device_ab_review2:"    # on the second reviewer's task (another model family): device_ab_review2:<task id>
+SKIP2_LABEL = "second_reviewer_skipped:"  # on the first reviewer's task when the second one's provider is not allowed
 START_KV = "device_ab_start"            # {"ts", "sig"}
 STOP_KV = "device_ab_stop"              # {"ts", "arm", "task", "event", "why"}: the test arm is stopped
 KINDS = ("work", "question", "code")
@@ -74,8 +75,23 @@ def second_reviewer(cfg: dict | None) -> dict | None:
     got = got.get("second_reviewer") if isinstance(got, dict) else None
     if not isinstance(got, dict) or not isinstance(got.get("model"), str) or not got["model"].strip():
         return None
-    return {"model": got["model"].strip(), "effort": blindreview.cap_effort(got.get("effort")),
-            "provider": str(got.get("provider") or "chat")}
+    out = {"model": got["model"].strip(), "effort": blindreview.cap_effort(got.get("effort")),
+           "provider": str(got.get("provider") or "chat")}
+    if not provallow.allows(cfg or {}, out["provider"]):
+        # A twin pinned outside providers_allowed could never start (and would raise ready_not_started per
+        # review): queue_reviews makes none and labels the first review with why. The pin never moves.
+        out["skip"] = f"its provider is not in {provallow.KEY}"  # no provider name: the label sits on a blind review
+    return out
+
+
+def reviewers(first: dict, label1: str, label2: str, second: dict | None) -> list[tuple[str, dict, str | None]]:
+    """(label, model, provider pin) per reviewer to queue: the first, and the second unless it is skipped."""
+    return [(label1, first, None)] + ([(label2, second, second["provider"])] if second and not second.get("skip") else [])
+
+
+def skip_labels(second: dict | None) -> list[str]:
+    """The first review's extra label recording why the second reviewer was not queued (none when it was)."""
+    return [f"{SKIP2_LABEL}{second['skip']}"] if second and second.get("skip") else []
 
 
 def _labels(task: dict) -> list[str]:
@@ -399,16 +415,17 @@ def review_spec(task: dict, run_dir: str) -> str:
 
 def queue_reviews(db, s: dict, since: float, limit: int = 10, second: dict | None = None) -> list[int]:
     """One masked review per finished A/B task that has none yet, and with a `second` reviewer one more by it
-    (same inputs, same rubric); returns the new task ids."""
+    (same inputs, same rubric); returns the new task ids. A second reviewer marked `skip` (its provider is not in
+    providers_allowed) gets no task; the first review's label says why."""
     done = db.q("SELECT * FROM tasks WHERE created>=? AND labels LIKE ? AND status IN ('done','failed') "
                 "ORDER BY id", (since, f'%"{LABEL}%'))
     have = {lb for r in db.q("SELECT labels FROM tasks WHERE labels LIKE ? OR labels LIKE ?",
                              (f'%"{REVIEW_LABEL}%', f'%"{REVIEW2_LABEL}%')) for lb in _labels(r)}
-    reviewers = [(REVIEW_LABEL, REVIEW_MODEL, None)] + ([(REVIEW2_LABEL, second, second["provider"])] if second else [])
+    queue = reviewers(REVIEW_MODEL, REVIEW_LABEL, REVIEW2_LABEL, second)
     out = []
     for t in done:
         runs = blindreview.run_dirs(db, t["id"])   # every run of the task, oldest first, not only its last
-        for label, who, prov in reviewers:
+        for label, who, prov in queue:
             if f"{label}{t['id']}" in have or len(out) >= limit:
                 continue
             # Blind: the label masks `ttp` for the reviewer; it reads a masked copy of the run, never its folder.
@@ -417,7 +434,8 @@ def queue_reviews(db, s: dict, since: float, limit: int = 10, second: dict | Non
                                    review_spec(t, got), kind="question",
                                    tier="standard", priority=4, origin="daemon", model=who["model"],
                                    effort=who["effort"], provider=prov,
-                                   labels=[f"{label}{t['id']}", blindreview.BLIND_LABEL]))
+                                   labels=[f"{label}{t['id']}", blindreview.BLIND_LABEL]
+                                   + (skip_labels(second) if label == REVIEW_LABEL else [])))
     return out
 
 

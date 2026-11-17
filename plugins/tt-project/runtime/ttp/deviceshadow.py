@@ -547,12 +547,11 @@ def review_spec(task: dict, handoff: str, run_dir: str) -> str:
 
 def queue_reviews(db, limit: int = 12, second: dict | None = None) -> list[int]:
     """One blind review per finished shadow whose live task is done or failed and that has none yet (and with a
-    `second` reviewer one more by it, same spec); returns the new task ids. A shadow still running, or without a
+    `second` reviewer one more by it, same spec, unless it is marked `skip`: deviceab.reviewers); returns the new task ids. A shadow still running, or without a
     hand-off, waits (or is never reviewed)."""
     have = {lb for r in db.q("SELECT labels FROM tasks WHERE labels LIKE ? OR labels LIKE ?",
                              (f'%"{REVIEW_LABEL}%', f'%"{REVIEW2_LABEL}%')) for lb in deviceab._labels(r)}
-    reviewers = [(REVIEW_LABEL, deviceab.REVIEW_MODEL, None)] + (
-        [(REVIEW2_LABEL, second, second["provider"])] if second else [])
+    reviewers = deviceab.reviewers(deviceab.REVIEW_MODEL, REVIEW_LABEL, REVIEW2_LABEL, second)
     out = []
     for (tid, arm), rec in sorted(shadows(db.q).items()):
         if rec.get("status") != "done" or not rec.get("handoff"):
@@ -579,7 +578,8 @@ def queue_reviews(db, limit: int = 12, second: dict | None = None) -> list[int]:
                                    review_spec(task, blindreview.scrub(handoff), got), kind="question",
                                    tier="standard", priority=4, origin="daemon", model=who["model"],
                                    effort=who["effort"], provider=prov,
-                                   labels=[f"{label}{tid}:{code}", blindreview.BLIND_LABEL]))
+                                   labels=[f"{label}{tid}:{code}", blindreview.BLIND_LABEL]
+                                   + (deviceab.skip_labels(second) if label == REVIEW_LABEL else [])))
     return out
 
 

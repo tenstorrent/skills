@@ -488,3 +488,48 @@ def test_device_shadow_copy_lacking_a_code_tasks_repo_is_retried_then_a_recorded
     assert "lacks the code task's own repo" in got["error"]
     text = "\n".join(deviceshadow.report_text(deviceshadow.report(p.db.q)))
     assert f"skipped #{tid}: no arm run: the code copy lacks the code task's own repo" in text
+
+
+def test_a_second_reviewer_whose_provider_is_not_allowed_gets_no_twin_and_the_first_review_says_why(env):
+    # upstream note 04acfea4503e3ff5: with providers_allowed leaving out the second reviewer's provider, its pinned
+    # twin could never start and raised ready_not_started per review. No twin; the first review records why.
+    from ttp import deviceab, deviceshadow
+    p = make(env)
+    cfg = _shadow_cfg(p)
+    assert deviceab.tick(p.db, {**cfg, "providers_allowed": ["claude"]}, 1.0)["reviews"] == []   # the A/B starts
+    allowed = deviceab.second_reviewer(cfg)
+    assert allowed["provider"] == "chat" and "skip" not in allowed, "unset providers_allowed: every provider"
+    assert "skip" not in deviceab.second_reviewer({**cfg, "providers_allowed": ["claude", "chat"]})
+    for listed in (["claude"], "claude", ["claude", "codex"]):
+        got = deviceab.second_reviewer({**cfg, "providers_allowed": listed})
+        assert got["provider"] == "chat" and got["skip"] == "its provider is not in providers_allowed", listed
+    # A second reviewer on the core provider is always allowed.
+    core = {**cfg, "providers_allowed": ["codex"], "route": {**cfg["route"], "device_ab_shadow": {
+        **cfg["route"]["device_ab_shadow"], "second_reviewer": {"model": "sonnet", "provider": "claude"}}}}
+    assert "skip" not in deviceab.second_reviewer(core)
+    skip = deviceab.second_reviewer({**cfg, "providers_allowed": ["claude"]})
+    # The live A/B's reviews.
+    tid = _dab_task(p, labels=("device_ab:glm", "needs_device"))
+    p.db.x("UPDATE tasks SET status='done' WHERE id=?", (tid,))
+    new = deviceab.queue_reviews(p.db, deviceab.settings(cfg), 0.0, second=skip)
+    assert len(new) == 1
+    first = p.db.task(new[0])
+    assert first["provider"] in (None, "") and "second_reviewer_skipped:its provider is not in providers_allowed" in first["labels"] and "chat" not in first["labels"]
+    assert deviceab.queue_reviews(p.db, deviceab.settings(cfg), 0.0, second=skip) == [], "no twin later either"
+    assert not p.db.q("SELECT id FROM tasks WHERE provider='chat'"), "no task pinned outside providers_allowed"
+    # Allowed again: the twin is queued as before, the first review is not repeated.
+    again = deviceab.queue_reviews(p.db, deviceab.settings(cfg), 0.0, second=allowed)
+    assert len(again) == 1 and p.db.task(again[0])["provider"] == "chat"
+    assert "second_reviewer_skipped" not in p.db.task(again[0])["labels"]
+    # The shadow's reviews.
+    _shadow_done(p, tid, "glm")
+    got = deviceshadow.queue_reviews(p.db, second=skip)
+    assert len(got) == 1 and "second_reviewer_skipped:" in p.db.task(got[0])["labels"]
+    assert deviceshadow.queue_reviews(p.db, second=skip) == []
+    both = deviceshadow.queue_reviews(p.db, second=allowed)
+    assert len(both) == 1 and p.db.task(both[0])["provider"] == "chat"
+    # The daemon's path: tick reads the config and queues no twin outside providers_allowed.
+    tid2 = _dab_task(p, labels=("device_ab:glm", "needs_device"))
+    p.db.x("UPDATE tasks SET status='done' WHERE id=?", (tid2,))
+    out = deviceab.tick(p.db, {**cfg, "providers_allowed": ["claude"]}, 2.0)
+    assert len(out["reviews"]) == 1 and all(p.db.task(i)["provider"] != "chat" for i in out["reviews"])
