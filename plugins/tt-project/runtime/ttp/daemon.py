@@ -13200,6 +13200,8 @@ class Daemon:
             ready = _rotate_walked(ready, set(walked), _owner_due(db), now)
         ramp = rampup.active(db, self.cfg, now) if ready else None
         batched: set[int] = set()   # tasks a batch run started this tick took along (batchrun.py)
+        scratch = rollout.scratch_state(db, self.p.name, self.cfg.get("rollout")) if ready else None
+        scratch_owners = _owner_due(db) if scratch else {}
         for i, task in enumerate(ready):
             if not self.lease_held():   # lapsed during this tick (a slow start or store): start nothing more
                 break
@@ -13228,6 +13230,11 @@ class Daemon:
             if why := runcap.check(self.p, self.cfg, task):   # looping: blocked, the coordinator decides
                 log(self.p, f"task {task['id']} not dispatched: {why}")
                 fate[task["id"]] = "other"
+                continue
+            if why := rollout.scratch_hold(scratch, task, scratch_owners):   # a soft cap; ordered work never waits
+                if task["blocked_reason"] != why[:500]:
+                    db.update_task(task["id"], blocked_reason=why[:500])
+                fate[task["id"]] = "hold"
                 continue
             # Before _start_hold, which may reserve the task's resource.
             if holds and self._setting_hold(task, holds, now):
@@ -13286,7 +13293,7 @@ class Daemon:
                 if note != held and (not note or note.startswith(NET_HELD_NOTE)):
                     db.update_task(task["id"], blocked_reason=held)
                 continue
-            if note.startswith((PAUSED_NOTE, LOGGED_OUT_NOTE, NET_HELD_NOTE, BRANCH_HELD_NOTE)):
+            if note.startswith((PAUSED_NOTE, LOGGED_OUT_NOTE, NET_HELD_NOTE, BRANCH_HELD_NOTE, rollout.SCRATCH_NOTE)):
                 db.update_task(task["id"], blocked_reason=None)
             gate = ctx["gate"]
             remaining, cost = self._start_cost(task)

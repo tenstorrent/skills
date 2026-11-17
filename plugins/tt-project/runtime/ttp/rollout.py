@@ -222,6 +222,30 @@ def set_ring(project: str, ring: str, by: str = "user") -> str:
     return f"{project}: ring {before} -> {ring_of(project)}"
 
 
+SCRATCH_CAP_USD = 25.0
+SCRATCH_NOTE = "held: scratch project's daily spend cap,"
+
+
+def scratch_state(db, name: str, own: dict | None = None, now: float | None = None) -> tuple[float, float] | None:
+    """(daily cap, spend in the last 24 h) for a ring-0 scratch project, else None. The cap is the project's own
+    `rollout.scratch_cap_usd` (the user's word), else the account's, else $25; 0 turns it off."""
+    cfg = settings()
+    if name not in ((cfg.get("rings") or {}).get("0") or []):
+        return None
+    cap = next((float(v) for v in ((own or {}).get("scratch_cap_usd"), cfg.get("scratch_cap_usd"))
+                if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0), SCRATCH_CAP_USD)
+    return (cap, db.spent_since((now or time.time()) - 86400)) if cap else None
+
+
+def scratch_hold(state: tuple[float, float] | None, task: dict, owners=()) -> str | None:
+    """Why a scratch project's task waits: it is past its daily cap. A soft cap: an urgent task or a user-ordered
+    one (urgent.user_ordered) never waits on it, and the project's dollar caps are untouched."""
+    from . import urgent
+    if not state or state[1] < state[0] or urgent.user_ordered(task, owners) or urgent.is_urgent(task):
+        return None
+    return f"{SCRATCH_NOTE} ${state[1]:.2f} of ${state[0]:g} used; it starts when the day's spend drops under it"
+
+
 def status() -> dict:
     cfg = settings()
     return {"rings": cfg.get("rings") or {}, "excluded": cfg.get("excluded") or [],

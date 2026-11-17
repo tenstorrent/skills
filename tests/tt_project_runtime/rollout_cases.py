@@ -267,3 +267,56 @@ def test_a_ring_with_no_samples_for_72_hours_stays_and_leaves_a_low_note(env):
     assert rollout.level("device_prewarm") == 1 and rollout.frozen("device_prewarm") is None
     note = p.db.one("SELECT text, severity FROM messages WHERE ref='rollout_thin:device_prewarm'")
     assert note["severity"] == "low" and "too few runs" in note["text"]
+
+
+def _spend(p, usd, ago_h=1):
+    p.db.x("INSERT INTO ledger(ts,provider,source,usd) VALUES(?,?,?,?)", (time.time() - ago_h * H, "claude", "task:1", usd))
+
+
+def test_a_scratch_project_has_a_25_dollar_daily_cap_that_only_it_gets_and_that_can_be_raised_or_off(env):
+    from ttp import rollout
+    p = make(env, "scratch1")
+    assert rollout.scratch_state(p.db, p.name) is None, "a project in no ring 0 list has no scratch cap"
+    rollout.set_ring(p.name, "0")
+    _spend(p, 10.0)
+    _spend(p, 99.0, ago_h=30)
+    assert rollout.scratch_state(p.db, p.name) == (25.0, 10.0), "the default; spend older than a day does not count"
+    assert rollout.scratch_state(p.db, p.name, {"scratch_cap_usd": 60})[0] == 60.0, "the project's own value wins"
+    from ttp.project import set_account_setting
+    set_account_setting("rollout.scratch_cap_usd", 40)
+    assert rollout.scratch_state(p.db, p.name)[0] == 40.0
+    assert rollout.scratch_state(p.db, p.name, {"scratch_cap_usd": 0}) is None, "0 turns the cap off"
+    rollout.set_ring(p.name, "1")
+    assert rollout.scratch_state(p.db, p.name) is None, "a ring 1 project is never capped"
+
+
+def test_the_scratch_cap_holds_only_routine_work_and_never_ordered_or_urgent_work():
+    from ttp import rollout
+    over, under = (25.0, 26.0), (25.0, 5.0)
+    plain = {"id": 7, "priority": 3, "spec": "do a thing", "reply_chat": None}
+    assert rollout.scratch_hold(None, plain) is None
+    assert rollout.scratch_hold(under, plain) is None
+    why = rollout.scratch_hold(over, plain)
+    assert why and why.startswith(rollout.SCRATCH_NOTE) and "$26.00 of $25" in why
+    assert rollout.scratch_hold(over, dict(plain, reply_chat="chat1")) is None, "answering the user's chat"
+    assert rollout.scratch_hold(over, plain, owners={7: 0}) is None, "an owner of an open order"
+    assert rollout.scratch_hold(over, dict(plain, priority=1)) is None, "urgent"
+    assert rollout.scratch_hold(over, dict(plain, spec="urgent: the user waits")) is None
+
+
+def test_dispatch_leaves_a_routine_task_queued_past_the_scratch_cap_and_starts_a_chat_task(env):
+    from ttp import rollout
+    from ttp.daemon import Daemon
+    p = make(env, "scratch2")
+    rollout.set_ring(p.name, "0")
+    _spend(p, 30.0)
+    routine = p.db.add_task("routine", "do a thing", kind="work", tier="light", priority=3)
+    d = Daemon(p.base)
+    started = []
+    d._start_hold = lambda task, provider, ctx, reserve=False: started.append(task["id"]) or "logged_out"
+    d._dispatch({})
+    assert routine not in started, "past $25 a day a routine task is not even offered a start"
+    assert p.db.task(routine)["blocked_reason"].startswith(rollout.SCRATCH_NOTE)
+    ordered = p.db.add_task("ordered", "answer", kind="work", tier="light", priority=3, reply_chat="chat1")
+    d._dispatch({})
+    assert ordered in started and routine not in started, "work the user ordered is never held by the cap"
