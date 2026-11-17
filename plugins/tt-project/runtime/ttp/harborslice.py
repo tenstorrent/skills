@@ -18,7 +18,7 @@ Task names: <modelbench.home()>/harbor-tasks.txt (setting tasks_file), one per l
 none there: the full set of a local dataset folder (setting dataset, each task a folder with task.toml),
 the DEFAULT_TASKS subset first so a partial cycle still compares with earlier subset runs; a registry
 dataset name (no folder): the DEFAULT_TASKS subset only. Settings: model_bench.terminalbench {on, tasks_file, agent, limit_s, concurrency,
-floor_share, dataset, compose} (settings). Before any trial, compose() makes sure `docker compose` runs, linking
+floor_share, dataset, compose} (settings; limit_s 0 keeps each task's own limit, the same for every model). Before any trial, compose() makes sure `docker compose` runs, linking
 a compose plugin found in docker's usual cli-plugins folders or the setting compose into a docker config folder
 the bench owns; none: the run stops with one message naming what is missing. The older suite slice (`ttp model-bench suite --harbor N`) uses the same
 trial runner. Harbor is installed only into a venv the run owns, never with `pip install --user`: built on a
@@ -74,7 +74,8 @@ def settings(cfg: dict) -> dict:
         v = s.get(k, d)
         return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= lo else float(d)
     return {"on": s.get("on", True) is not False, "tasks_file": str(s.get("tasks_file") or TASKS),
-            "agent": str(s.get("agent") or AGENT), "limit_s": num("limit_s", LIMIT_S, 60),
+            "agent": str(s.get("agent") or AGENT),
+            "limit_s": 0.0 if s.get("limit_s") == 0 and not isinstance(s.get("limit_s"), bool) else num("limit_s", LIMIT_S, 60),
             "concurrency": int(num("concurrency", 0, 0)), "floor_share": num("floor_share", FLOOR_SHARE, 0),
             "dataset": str(s.get("dataset") or DATASET), "compose": str(s.get("compose") or "")}
 
@@ -287,11 +288,12 @@ def trial(model: str, task: str, root: Path, env: dict, st: dict, runner: Callab
             job.parent.mkdir(parents=True, exist_ok=True)
             cmd = [w.format(model=model, task=task, jobs=job.parent, name=job.name, dataset=st["dataset"],
                             agent=st["agent"]) for w in shlex.split(command or COMMAND)]
-            if lim := _task_limit(st["dataset"], task):
+            lim = _task_limit(st["dataset"], task)
+            if lim and st["limit_s"]:
                 cmd += ["--agent-timeout-multiplier", f"{st['limit_s'] / lim:.4g}"]
         lock = slot(home or root, st, sleep)
         try:
-            rc, out = runner(["nice", "-n", "10", *cmd], env, st["limit_s"] * 4 + TASK_TIMEOUT_S)
+            rc, out = runner(["nice", "-n", "10", *cmd], env, (st["limit_s"] or lim or LIMIT_S) * 4 + TASK_TIMEOUT_S)
         finally:
             lock.close()
         if outcome(job) is None:   # harbor ended without finishing the job
@@ -331,6 +333,7 @@ def compose(root: Path, st: dict, env: dict | None = None, runner: Callable = _r
     own = root / "docker-config"
     link = own / "cli-plugins" / "docker-compose"
     tried = [Path(st["compose"]).expanduser()] if st.get("compose") else []
+    tried += [root / "compose"]   # the bench's own folder: a compose binary put there needs no setting
     tried += [Path(env["DOCKER_CONFIG"]) / "cli-plugins"] if env.get("DOCKER_CONFIG") else []
     tried += [Path.home() / USER_PLUGIN_DIR, *map(Path, PLUGIN_DIRS)]
     for c in tried:
