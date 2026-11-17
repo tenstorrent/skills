@@ -22,6 +22,8 @@ import re
 import threading
 from pathlib import Path
 
+from .project import durable_write
+
 CODE, LIVE_ONLY, INVALID = "code-bench", "live-only", "invalid"
 ORIGINAL = "original"
 ORIGINAL_ARM = {"provider": "original", "model": "landed-change", "effort": ""}
@@ -260,8 +262,8 @@ def attach(task: dict, db, bench_dir: Path) -> dict:
         info = build_pack(db, task)
         here.mkdir(parents=True, exist_ok=True)
         if info["text"]:
-            md.write_text(info["text"])
-        meta.write_text(json.dumps({k: v for k, v in info.items() if k != "text"}, indent=1) + "\n")
+            durable_write(md, info["text"])
+        durable_write(meta, json.dumps({k: v for k, v in info.items() if k != "text"}, indent=1) + "\n")
     out = {**task, "pack_class": info["class"], "pack_why": info.get("why", "")}
     if info["class"] == CODE:
         out["pack"] = {"path": str(md), "sha256": info["sha256"], "sources": info.get("sources", {})}
@@ -318,7 +320,7 @@ def add_original(out: Path, tasks: dict, lock: threading.Lock | None = None) -> 
         keep = out / "cells" / f"{tid}-r0-{ORIGINAL}"
         keep.mkdir(parents=True, exist_ok=True)
         diff = benchdaily._git(Path(t["repo"]), "diff", "--no-color", t["base"], t["head"])
-        (keep / "diff.patch").write_text(diff)
+        durable_write(keep / "diff.patch", diff)
         benchdaily.append_row(path, {"task": tid, "rep": 0, "arm": ORIGINAL, **ORIGINAL_ARM, "outcome": "done",
                                      "passed": True, "cost_usd": 0.0, "wall_s": 0, "session_id": ""}, lock)
         done.append(tid)
