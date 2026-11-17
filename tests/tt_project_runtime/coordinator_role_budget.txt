@@ -76,3 +76,4 @@
 +33: schedule_set's grace_min row (keyed lines at normal or above, could-not-run errors; e21249641, +47) and the larger-batches rewrite (7a8f0fb2a, +46) landed past the cap; measured 47648 against 47615 on e342ade66
 +170: a hand-off carries a failure's whole contract with an owner for an unknown runtime fault; a sweep outcome names its owner
 +365: the urgent-message and high-severity-note rules landed past the cap (0af95e16b, aa60cac21); measured 48183 against 47818 on a83cfcd17
++140: the ETA format a coordinator posts (basis, range, what would change it) and its over-estimate line (#8771)

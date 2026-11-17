@@ -10,14 +10,14 @@ import sys
 import time
 
 
-def _row(tid, deps=(), priority=3, spec=""):
+def _rank_row(tid, deps=(), priority=3, spec=""):
     import json
     return {"id": tid, "depends_on": json.dumps(list(deps)), "priority": priority, "spec": spec}
 
 
 def test_dependencies_of_an_owner_inherit_its_due_through_other_tasks():
     from ttp import rankinherit
-    rows = [_row(1, [2]), _row(2, [3]), _row(3), _row(4), _row(5, [3])]
+    rows = [_rank_row(1, [2]), _rank_row(2, [3]), _rank_row(3), _rank_row(4), _rank_row(5, [3])]
     got = rankinherit.extend(rows, {1: 100.0})
     assert got == {1: 100.0, 2: 100.0, 3: 100.0}   # 4 and 5 are not needed by an owner
     # The earliest due of several owners wins, whichever order they are walked in.
@@ -27,19 +27,19 @@ def test_dependencies_of_an_owner_inherit_its_due_through_other_tasks():
 
 def test_dependencies_of_an_urgent_task_rank_as_owners_with_no_due():
     from ttp import rankinherit
-    rows = [_row(1, [2], priority=1), _row(2, [3]), _row(3), _row(4, [3]), _row(5, [], spec="urgent: demo")]
+    rows = [_rank_row(1, [2], priority=1), _rank_row(2, [3]), _rank_row(3), _rank_row(4, [3]), _rank_row(5, [], spec="urgent: demo")]
     got = rankinherit.extend(rows, {})
     assert got == {2: math.inf, 3: math.inf}   # the urgent tasks keep their own lane (urgent.first)
     # An owner's own due is kept for what it needs, not widened by an urgent dependent later in the chain.
-    got = rankinherit.extend([_row(1, [2], priority=1), _row(2, [3]), _row(3)], {2: 40.0})
+    got = rankinherit.extend([_rank_row(1, [2], priority=1), _rank_row(2, [3]), _rank_row(3)], {2: 40.0})
     assert got[2] == 40.0 and got[3] == 40.0 and 1 not in got
 
 
 def test_inheritance_survives_cycles_bad_dependencies_and_tasks_that_are_not_open():
     from ttp import rankinherit
-    cyc = [_row(1, [2], priority=1), _row(2, [1])]
+    cyc = [_rank_row(1, [2], priority=1), _rank_row(2, [1])]
     assert rankinherit.extend(cyc, {}) == {2: math.inf, 1: math.inf}   # 1 is needed by 2, which urgent 1 needs
-    rows = [_row(1, [99, "x", None, 1], priority=1), {"id": 2, "depends_on": "not json", "priority": 3, "spec": ""},
+    rows = [_rank_row(1, [99, "x", None, 1], priority=1), {"id": 2, "depends_on": "not json", "priority": 3, "spec": ""},
             {"id": 3, "depends_on": None, "priority": 3, "spec": None}]
     assert rankinherit.extend(rows, {2: 5.0}) == {1: math.inf, 2: 5.0}   # 99 is not open: no entry for it; 1 needs itself
     assert rankinherit.extend([], {7: 1.0}) == {7: 1.0}   # an owner that is not open adds nothing

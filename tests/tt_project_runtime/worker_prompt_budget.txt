@@ -56,3 +56,5 @@ code +80: a reply wait can skip replies already taken and wait past an acknowled
 every +92: device work names Galaxy parts as the setup-box hardware reference does (user msg #2894)
 code +80: a `done` hand-off stops each live detached job its `retry_when` or `next_step` does not name
 every +80: a `done` hand-off stops each live detached job its `retry_when` or `next_step` does not name
+every +170: the devq fence says to queue device jobs at task start, that a runner's prewarm builds off the device, and that a broker call over 1500 s is refused (#8778)
+system +170: the devq fence says to queue device jobs at task start, that a runner's prewarm builds off the device, and that a broker call over 1500 s is refused (#8778)
