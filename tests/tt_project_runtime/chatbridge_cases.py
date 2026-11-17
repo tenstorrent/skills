@@ -4153,3 +4153,21 @@ def test_model_scores_read_the_project_on_a_connection_of_their_own_thread(env, 
     assert not d._scores_job.is_alive()
     assert not [t for t in logged if "not published" in t], logged
     assert recorded == [modelscore.live_rows(p, time.time())]
+
+
+def test_claude_codes_model_lookup_line_on_stderr_is_not_a_refused_model_when_the_run_worked(tmp_path):
+    """Claude Code prints '[claude-code:unrecognized_model]' on stderr for a model name it has no table entry
+    for, even while the bridge serves it and the run works (33 calls, then a cancel). Only a run that failed
+    with the refusal as its own error is model_missing: the stderr line alone never holds a tier or falls back."""
+    from ttp import route
+    from ttp.providers import get_provider
+    out, err = tmp_path / "output.jsonl", tmp_path / "stderr.log"
+    out.write_text(json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": "done",
+                               "total_cost_usd": 0.0, "usage": {"input_tokens": 9, "output_tokens": 5}}) + "\n")
+    err.write_text('[claude-code:unrecognized_model] {"model":"%s","query_source":"sdk"}\n' % _RT_MODEL)
+    got = get_provider("claude").parse(out, err)
+    assert not got.request_error and not got.error
+    for status in ("killed", "failed", "timeout"):
+        assert route.fell_back(status, {"bridge": {"last_fault": "", "usage": {"calls": 33}}}, got.error) == ""
+    refused = '[claude-code:unrecognized_model] {"model":"%s"}' % _RT_MODEL
+    assert route.fell_back("failed", {"bridge": {"last_fault": "error"}}, refused) == "model_missing"
