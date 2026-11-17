@@ -9911,6 +9911,7 @@ def cmd_progress(a) -> None:
     ap.add_argument("--holder", default=getattr(a, "holder", None) or "")
     ap.add_argument("--eta", default=getattr(a, "eta", None) or "")
     ap.add_argument("--eta-basis", default=getattr(a, "eta_basis", None) or "")
+    ap.add_argument("--expected-wait-s", type=float, default=None)
     a = ap.parse_intermixed_args(a.words or [])
     p = here()
     if not p:
@@ -9928,8 +9929,11 @@ def cmd_progress(a) -> None:
         if _epoch(a.eta) is None or not a.eta_basis.strip():
             print("ttp progress report: --eta is ignored for the expected finish without --eta-basis, or when it "
                   "is not epoch seconds or an ISO time with its offset", file=sys.stderr)
+    if a.expected_wait_s is not None and (not progress._wait_ok(a.expected_wait_s) or not a.eta_basis.strip()):
+        print("ttp progress report: --expected-wait-s is ignored unless it is above 0 (and at most 14 days) "
+              "and comes with --eta-basis", file=sys.stderr)
     rec = progress.record(a.kind, key, a.reason, resource=a.resource, holder=holder, eta=a.eta,
-                          eta_basis=a.eta_basis)
+                          eta_basis=a.eta_basis, expected_wait_s=a.expected_wait_s)
     try:
         progress.append(p.state, rec)
     except OSError as e:

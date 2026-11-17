@@ -85,6 +85,13 @@ def conservative_x(db, c: dict | None = None) -> float:
     return float(x) if isinstance(x, (int, float)) and x >= 1.0 else base
 
 
+def measured_x(db) -> bool:
+    """Whether the ledger holds a measured conservative multiple (not just the configured default)."""
+    got = db.kv(KEY) or {}
+    x = got.get("conservative_x") if isinstance(got, dict) else None
+    return isinstance(x, (int, float)) and x >= 1.0
+
+
 def factor(db, kind: str) -> float:
     """The correction of task kind `kind` (1.0: none, off or too few deliveries)."""
     got = db.kv(KEY) or {}
@@ -102,8 +109,18 @@ def shown(db, e: dict, now: float, kind: str = "") -> dict:
     f = factor(db, kind)
     raw = e["end"]
     end = now + f * (raw - now) if raw > now else raw
-    return {**e, "end": end, "raw_end": raw, "factor": f, "kind": kind,
-            "conservative": now + conservative_x(db) * (end - now) if end > now else end}
+    p90 = e.get("p90_end")
+    if end <= now:
+        cons = end
+    elif isinstance(p90, (int, float)) and p90 > raw:
+        # The history's own spread (every leg at its p90, scaled by the same correction); once the ledger
+        # has measured its 80th percentile of actual / shown, the larger of the two.
+        cons = now + f * (p90 - now)
+        if measured_x(db):
+            cons = max(cons, now + conservative_x(db) * (end - now))
+    else:
+        cons = now + conservative_x(db) * (end - now)
+    return {**e, "end": end, "raw_end": raw, "factor": f, "kind": kind, "conservative": max(cons, end)}
 
 
 def kind_of(db, e: dict) -> str:

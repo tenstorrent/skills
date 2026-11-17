@@ -942,6 +942,23 @@ coordinator with that evidence.
   reports since it began waiting wins. An `eta` without `eta_basis`, already past or with no offset is
   ignored. Waits on a time and on `landed:#<id>` keep their estimates, and so does a wait the daemon
   already woke (it waits only for a slot, lock or gate).
+  Instead of an `eta`, it may give `expected_wait_s` (seconds of wait left, above 0, at most 14 days;
+  from `waiting_since` in the hand-off, from the line's time in `ttp progress report ... --expected-wait-s
+  <n> --eta-basis "<how measured>"`): the finish is that long after, with the same rules; one already
+  past gives no finish.
+- ETA numbers from history (eta.py, etahist.py, `ttp eta`): the likely time is the p50 of this project's
+  last 14 days, the conservative time the p90, both by task kind and size, for run time, queue wait,
+  review, landing and push batches. Size is the spec length (short under 1500 characters, medium under
+  4000, long above): a task's run samples are those of its kind and size once there are 5, else its kind
+  and tier, else its kind. Review rounds are not counted on their own: a task that needed a second round
+  shows in the review leg's p90. Two bounded adjustments only make a time later, never earlier: the host's
+  load per core above 1 adds 25% per extra process to run legs (at most x1.5), and runnable queued
+  tasks beyond the running workers add their share to queue-wait legs (at most x2). `ttp eta` names the
+  adjustments it applied. The conservative time is the p90 walk scaled by the same per-kind correction
+  as the likely time, and, once the ledger has measured its own 80th percentile of actual over shown, never
+  less than that multiple of the time left (config `eta.conservative_x` before then). The model may move
+  a quoted time but says why. The metric stays the ledger's calibration: the share delivered by the
+  conservative time (target 80%) and the median actual over promised (0.7 to 1.3).
 - Task-to-task waits (model-free, lanewait.py): a queued task whose start_when is exactly
   `landed:#<id>` starts as soon as that change is approved or batched in the push queue, branching
   from its approved head instead of the base, when the task gets a worktree of its own (code, or a

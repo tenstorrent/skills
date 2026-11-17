@@ -69,11 +69,12 @@ import statistics
 import time
 from pathlib import Path
 
-from . import cells
+from . import cells, etahist
 
 WINDOW_S = 14 * 86400
 LONG_H = 2.0
 ROWS = 5000
+MAX_WAIT_S = 14 * 86400   # the longest `expected_wait_s` a hand-off or report may give
 CLOSED = ("done", "failed", "cancelled")
 PUSH_DONE = ("pushed", "landed")
 LANDED_ALL = re.compile(r"\s*ttp\s+landed\s+--task\s+#?\d+(?:\s*&&\s*ttp\s+landed\s+--task\s+#?\d+)*"
@@ -135,13 +136,14 @@ def history(db, now: float | None = None) -> dict:
     lock label and overall, review and landing times."""
     now = time.time() if now is None else now
     t0 = now - WINDOW_S
-    h = {"run": {}, "kind": {}, "cell": {}, "queue": {}, "wait": [], "review": [], "land": [], "batch": []}
-    for r in db.q("SELECT r.started s, r.ended e, t.kind k, t.tier tr FROM runs r JOIN tasks t ON t.id=r.task "
+    h = {"run": {}, "kind": {}, "size": {}, "cell": {}, "queue": {}, "wait": [], "review": [], "land": [], "batch": []}
+    for r in db.q("SELECT r.started s, r.ended e, t.kind k, t.tier tr, LENGTH(t.spec) n FROM runs r JOIN tasks t ON t.id=r.task "
                   "WHERE r.role!='coordinator' AND r.ended>? AND r.started IS NOT NULL AND r.ended>r.started "
                   "ORDER BY r.id DESC LIMIT ?", (t0, ROWS)):
         d = float(r["e"]) - float(r["s"])
         h["run"].setdefault((r["k"], r["tr"]), []).append(d)
         h["kind"].setdefault(r["k"], []).append(d)
+        h["size"].setdefault((r["k"], etahist.size_of(r["n"])), []).append(d)
     for r in db.q("SELECT t.kind k, t.spec spec, SUM(r.ended-r.started) d FROM runs r JOIN tasks t ON t.id=r.task "
                   "WHERE r.role!='coordinator' AND r.ended>? AND r.started IS NOT NULL AND r.ended>r.started "
                   "AND t.status='done' AND t.spec LIKE '%cells:%' GROUP BY t.id ORDER BY t.id DESC LIMIT ?",
@@ -208,20 +210,29 @@ def outside_wait(t: dict, now: float, reports=None) -> dict | None:
             or LANDED_PROBE.fullmatch(probe) or LANDED_ALL.fullmatch(probe)):
         return None
 
-    def measured(r: dict) -> float | None:
-        at = _epoch(r.get("eta")) if str(r.get("eta_basis") or "").strip() else None
-        return at if at is not None and now < at < float("inf") else None
-    at = measured(res)
     try:
         since = float(res.get("waiting_since"))
     except (TypeError, ValueError):
         since = None   # no start of this wait on record: an older wait's reports are never read
+
+    def measured(r: dict, base: float | None) -> float | None:
+        """The end the record gives: its `eta`, else `expected_wait_s` seconds from `base` (when the wait
+        or the report began: unknown means none), both only with an `eta_basis`, still ahead."""
+        if not str(r.get("eta_basis") or "").strip():
+            return None
+        at = _epoch(r.get("eta"))
+        w = r.get("expected_wait_s")
+        if at is None and base is not None and isinstance(w, (int, float)) and not isinstance(w, bool) \
+                and 0 < w <= MAX_WAIT_S:
+            at = base + float(w)
+        return at if at is not None and now < at < float("inf") else None
+    at = measured(res, since)
     if since is not None:
         mine = [(ts, r) for r in (reports() if callable(reports) else reports) or []
                 if str(r.get("task") or "") == str(t.get("id")) and (ts := _epoch(r.get("ts"))) is not None
                 and ts >= since]
         for _, r in sorted(mine, key=lambda x: x[0]):
-            at = measured(r) or at   # a later valid report wins; an invalid one keeps the last
+            at = measured(r, _epoch(r.get("ts"))) or at   # a later valid report wins; an invalid one keeps the last
     return {"at": at, "follows": bool(str(res.get("on_pass_cmd") or "").strip())}
 
 
@@ -240,10 +251,19 @@ def long_job(t: dict) -> list[str] | None:
     return None
 
 
+AUTO = object()
+
+
 class _Est:
     def __init__(self, db, now: float, hist: dict | None = None, core: str | None = None,
-                 delivery: dict | None = None):
-        self.db, self.now = db, now
+                 delivery: dict | None = None, q: float = 0.5, load=AUTO, depth=AUTO):
+        """`q`: the quantile of every measured leg (0.5, the median: the likely time; 0.9: the conservative
+        one). `load`: this host's load per core (AUTO: read it, None: no adjustment); `depth`: (queued,
+        running) workers (AUTO: counted from the database)."""
+        self.db, self.now, self.q = db, now, q
+        self.load = etahist.host_load() if load is AUTO else load
+        self._depth_in = depth
+        self._hi = None
         self.delivery = delivery or {}   # the project's delivery config: push_batch_max, push_age_s (_push_ahead)
         self.h = history(db, now) if hist is None else hist
         self.memo: dict[int, dict] = {}
@@ -253,6 +273,34 @@ class _Est:
         self._gates = None
         self._owners = None
         self._reports = None
+
+    def _m(self, xs: list[float]) -> float | None:
+        """The leg statistic of samples `xs`: their q-quantile (the median at q=0.5)."""
+        return etahist.pct(xs, self.q)
+
+    def _loadx(self) -> float:
+        return etahist.load_factor(self.load)
+
+    def _depthx(self) -> float:
+        """The queue-wait multiplier of the runnable queued tasks against the running workers (etahist)."""
+        if self._depth_in is AUTO:
+            try:
+                qd = self.db.one("SELECT COUNT(*) n FROM tasks WHERE status='queued' AND (depends_on IS NULL OR "
+                                 "depends_on IN ('[]','')) AND (not_before IS NULL OR not_before<=?)", (self.now,))["n"]
+                rn = self.db.one("SELECT COUNT(DISTINCT task) n FROM runs WHERE status='running' AND role!='coordinator'")["n"]
+            except Exception:
+                qd = rn = 0
+            self._depth_in = (qd, rn)
+        return etahist.depth_factor(*self._depth_in)
+
+    def p90(self, tid: int) -> float | None:
+        """The conservative end of task `tid`: the same walk with every leg at its 90th percentile (None
+        when it has no estimate)."""
+        if self._hi is None:
+            self._hi = _Est(self.db, self.now, self.h, self.core, self.delivery, etahist.P90, self.load,
+                            self._depth_in)
+        e = self._hi.task(int(tid))
+        return None if e["why"] or not e.get("end") else e["end"]
 
     def reports(self) -> list[dict]:
         """The project's `ttp progress report` lines (read once per estimate; none when unreadable)."""
@@ -295,12 +343,17 @@ class _Est:
         return self._none(tid, f"#{tid} is held by the spend cap until {clears}")
 
     def _run(self, t: dict) -> list[float]:
+        """The run samples of a task: its kind and size when there are etahist.MIN_SIZE of them, else its
+        kind and tier, else its kind."""
+        by_size = (self.h.get("size") or {}).get((t["kind"], etahist.size_of(t.get("spec") or "")))
+        if by_size and len(by_size) >= etahist.MIN_SIZE:
+            return by_size
         return self.h["run"].get((t["kind"], t["tier"])) or self.h["kind"].get(t["kind"]) or []
 
     def _left(self, xs: list[float], elapsed: float) -> tuple[float, bool]:
         """Median time left of the samples longer than `elapsed`; past all of them: 0, overrunning."""
         longer = [x - elapsed for x in xs if x > elapsed]
-        return (_med(longer), False) if longer else (0.0, True)
+        return (self._m(longer), False) if longer else (0.0, True)
 
     def task(self, tid: int, seen: tuple = ()) -> dict:
         """{"done": when it is done (its dependants may start), "end": when its work has landed, "path":
@@ -333,7 +386,7 @@ class _Est:
             return self._from(tid, e)
         legs, end = list(e["legs"]), e["end"]
         if self.h["land"]:
-            legs.append(("landing", _med(self.h["land"])))
+            legs.append(("landing", self._m(self.h["land"])))
             end += legs[-1][1]
         return {"done": self.now, "end": end, "path": [tid] + e["path"], "legs": legs, "why": None,
                 "overrun": e["overrun"]}
@@ -350,7 +403,7 @@ class _Est:
         if ahead is None:
             return None
         cap = int(pushq._num(d.get("push_batch_max"), pushq.DEFAULT_BATCH_MAX, int, 1))
-        med = _med(self.h["batch"])
+        med = self._m(self.h["batch"])
         live = self.db.one("SELECT started FROM push_batches WHERE after_finalized IS NULL ORDER BY started LIMIT 1")
         left = max(0.0, med - (self.now - float(live["started"]))) if live else 0.0
         return ahead, left + (ahead // cap + 1) * med
@@ -416,7 +469,7 @@ class _Est:
             left, over = self._left(self.h["land"], now - float(row["created"]))
             return {"done": now, "end": now + left, "path": [tid], "legs": [("landing", left)], "why": None,
                     "overrun": over}
-        legs, path, over = [], [tid], False
+        legs, path, over, notes = [], [tid], False, []
         start = now
         begin = None
         if st == "review":
@@ -428,7 +481,7 @@ class _Est:
                 if (rv := self._open_review(t)) and (hold := self._held(self.db.task(rv))):
                     if hold[0] is None:
                         return self._held_none(tid, hold[1])
-                    left, over = max(left, hold[0] - now + _med(self.h["review"])), False
+                    left, over = max(left, hold[0] - now + self._m(self.h["review"])), False
                 legs.append(("review", left))
             done = now + sum(x for _, x in legs)
         else:
@@ -464,10 +517,13 @@ class _Est:
                 if e["end"] > start:   # its own finish, review and landing: the probe passes then
                     start, path = e["end"], [tid] + e["path"]
             runs = self._run(t)
+            lx = self._loadx() if not (long_job(t) is not None) else 1.0   # a long job runs on its own host
+            if lx > 1.0:
+                notes.append(f"host load x{lx:.2f}")
             ow = outside_wait(t, now, self.reports) if st != "running" else None
             lj = long_job(t) if not ow else None
             if lj is not None:   # a bench or other long job: its cells at the measured per-cell time, never the kind's median
-                per = _med(self.h["cell"].get(t["kind"]) or [])
+                per = self._m(self.h["cell"].get(t["kind"]) or [])
                 if per is None or not lj:
                     return {**self._none(tid, f"no estimate yet: a long job with no per-cell time measured by "
                                               f"an earlier {t['kind']} run"), "path": path}
@@ -486,12 +542,12 @@ class _Est:
                             return {**self._held_none(tid, hold[1]), "path": path}
                         legs[-1] = ("outside work", max(legs[-1][1], hold[0] - start))
                     begin = start + legs[-1][1]
-                    legs.append(("run", _med(runs)))
+                    legs.append(("run", self._m(runs) * lx))
             elif st == "running":
                 r = self.db.one("SELECT started FROM runs WHERE task=? AND status='running' AND role!='coordinator' "
                                 "ORDER BY id DESC LIMIT 1", (tid,))
-                left, over = self._left(runs, now - float(r["started"])) if r and r["started"] else (_med(runs), False)
-                legs.append(("run", left))
+                left, over = self._left(runs, now - float(r["started"])) if r and r["started"] else (self._m(runs), False)
+                legs.append(("run", left * lx))
             else:
                 if st == "waiting" or t.get("not_before"):
                     start = max(start, float(t.get("not_before") or 0))
@@ -501,21 +557,34 @@ class _Est:
                     start = max(start, hold[0])
                 if st == "queued":
                     locks = _locks(t)
-                    waits = [w for lk in locks if (w := _med(self.h["queue"].get(lk, [])) ) is not None]
-                    wait = max(waits) if waits else _med(self.h["wait"])
+                    waits = [w for lk in locks if (w := self._m(self.h["queue"].get(lk, [])) ) is not None]
+                    wait = max(waits) if waits else self._m(self.h["wait"])
                     if wait is None:
                         return {**self._none(tid, "no measured queue wait yet"), "path": path}
-                    legs.append(("queue " + ",".join(locks) if waits else "queue", wait))
+                    dx = self._depthx()
+                    if dx > 1.0:
+                        notes.append(f"queue depth x{dx:.2f}")
+                    legs.append(("queue " + ",".join(locks) if waits else "queue", wait * dx))
                 begin = start + sum(x for _, x in legs)   # when a worker is expected to start it
-                legs.append(("run", _med(runs)))
+                legs.append(("run", self._m(runs) * lx))
             done = start + sum(x for _, x in legs)
             if code and self.h["review"]:
-                legs.append(("review", _med(self.h["review"])))
+                legs.append(("review", self._m(self.h["review"])))
         end = start + sum(x for _, x in legs)
         if code and self.h["land"]:
-            legs.append(("landing", _med(self.h["land"])))
+            legs.append(("landing", self._m(self.h["land"])))
             end += legs[-1][1]
-        return {"done": done, "end": end, "path": path, "legs": legs, "why": None, "overrun": over, "start": begin}
+        return {"done": done, "end": end, "path": path, "legs": legs, "why": None, "overrun": over, "start": begin,
+                "notes": notes}
+
+
+def with_p90(est: _Est, e: dict, *tids: int) -> dict:
+    """`e` with `p90_end`: the latest of the conservative (p90) ends of the tasks `tids` (the owners it
+    was the latest of), never before its own end; `e` as it is when it has no estimate or a p90 has none."""
+    if e.get("why") or not e.get("end"):
+        return e
+    ends = [est.p90(t) for t in tids]
+    return e if not ends or any(x is None for x in ends) else {**e, "p90_end": max(max(ends), e["end"])}
 
 
 def corrected(db, e: dict, now: float) -> dict:
@@ -531,7 +600,8 @@ def corrected(db, e: dict, now: float) -> dict:
 def estimate(db, tid: int, now: float | None = None, hist: dict | None = None, core: str | None = None,
              delivery: dict | None = None) -> dict:
     now = time.time() if now is None else now
-    return corrected(db, _Est(db, now, hist, core, delivery).task(int(tid)), now)
+    est = _Est(db, now, hist, core, delivery)
+    return corrected(db, with_p90(est, est.task(int(tid)), int(tid)), now)
 
 
 def core_of(where) -> str | None:
@@ -573,7 +643,7 @@ def obligation_estimate(db, o: dict, now: float | None = None, est: _Est | None 
             return e
         if worst is None or e["end"] > worst["end"]:
             worst = e
-    return corrected(db, worst, est.now)
+    return corrected(db, with_p90(est, worst, *ids), est.now)
 
 
 def _dur(s: float) -> str:
@@ -600,8 +670,11 @@ def field(e: dict, where, now: float | None = None) -> str:
 def text(e: dict, where, now: float | None = None) -> str:
     """field() with its legs, for `ttp eta`."""
     legs = ", ".join(f"{k} {_dur(v)}" for k, v in e["legs"])
+    notes = ", ".join(e.get("notes") or [])
     return field(e, where, now) + (f"; legs of #{e['path'][0]}: {legs}" if legs else "") + (
-        "; medians of this project's last 14 days, no padding" if not e["why"] else "")
+        f"; adjusted: {notes}" if notes else "") + (
+        "; likely = medians (p50) and conservative = p90 of this project's last 14 days, by kind and size"
+        if not e["why"] else "")
 
 
 def wake_at(e: dict) -> float | None:

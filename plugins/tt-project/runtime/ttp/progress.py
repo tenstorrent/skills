@@ -111,10 +111,12 @@ def _one_line(text: str, cap: int) -> str:
 
 
 def record(kind: str, key: str, reason: str, env: dict | None = None, now: float | None = None,
-           resource: str = "", holder: str = "", eta: str = "", eta_basis: str = "") -> dict:
+           resource: str = "", holder: str = "", eta: str = "", eta_basis: str = "",
+           expected_wait_s=None) -> dict:
     """The line a report writes, from the caller's environment; a refusal's resource and its holder
     (holder_text), and a measured finish (`eta`, `eta_basis`: eta.outside_wait reads them for the
-    reporting task) only when given."""
+    reporting task) only when given; so is `expected_wait_s`, seconds of wait left from this line (a number
+    above 0: eta.outside_wait counts it from the line's time, with an `eta_basis`)."""
     from .runner import boot_id
     env = os.environ if env is None else env
     job = env.get(JOB_ENV) or None
@@ -128,7 +130,13 @@ def record(kind: str, key: str, reason: str, env: dict | None = None, now: float
             **({"resource": _one_line(resource, 200)} if (resource or "").strip() else {}),
             **({"holder": _one_line(holder, REASON_MAX)} if (holder or "").strip() else {}),
             **({"eta": _one_line(eta, 64)} if str(eta or "").strip() else {}),
-            **({"eta_basis": _one_line(eta_basis, REASON_MAX)} if (eta_basis or "").strip() else {})}
+            **({"eta_basis": _one_line(eta_basis, REASON_MAX)} if (eta_basis or "").strip() else {}),
+            **({"expected_wait_s": float(expected_wait_s)} if _wait_ok(expected_wait_s) else {})}
+
+
+def _wait_ok(v) -> bool:
+    from .eta import MAX_WAIT_S
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and 0 < v <= MAX_WAIT_S
 
 
 def holder_text(p, resource: str) -> str:

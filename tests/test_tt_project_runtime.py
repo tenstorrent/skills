@@ -513,6 +513,7 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     monkeypatch.setenv("TTP_TEST_NO_MODELS_PROBE", "1")   # nor the routed endpoint's /models check (route.py)
     monkeypatch.setenv("TTP_TEST_NO_BRIDGE_REFRESH", "1")   # setup never restarts this account's own bridge sessions
     monkeypatch.setenv("TTP_TEST_NO_REFRESH", "1")    # upgrade never runs a real `ttp setup` of the checkout first
+    monkeypatch.setenv("TTP_ETA_LOAD", "off")   # ETAs read no live host load (eta_hist_cases passes its own)
     monkeypatch.setenv("TTP_SELFWATCH_EVERY_S", "0")   # daemons never scan the real /proc nor signal (selfwatch_cases turns it on)
     monkeypatch.setenv("TTP_TEST_NO_SELFAUDIT_READ", "1")   # nor read the real crontab, systemd units or held hosts (selfaudit.py)
     monkeypatch.setenv("TTP_TEST_NO_NOTIFIER", "1")   # setup, upgrade and status never restart or test the account's own notifier
