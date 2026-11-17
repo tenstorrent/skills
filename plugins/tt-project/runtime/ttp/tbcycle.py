@@ -574,11 +574,17 @@ def ref_runner(cfg: dict, model: str, env: dict, *, trial: Callable | None = Non
 def not_run(r: dict) -> bool:
     """A trial that is not a run (user's rule): its agent made no model call (marked NOT_RUN when it ended), or
     failed calls broke it and it did not solve the task. Never scored, rerun up to reference.rounds times. A
-    model that made calls and did not solve the task failed, the same for every model; a pass stands."""
+    model that made calls and did not solve the task failed, the same for every model; a pass stands. A trial the
+    harness broke before grading (harbor itself failed: a lost docker engine, say) has no grade, so it is not run
+    either, never a fail."""
     from . import serverhealth
     srv = r.get("server") or {}
-    return r.get("outcome") == NOT_RUN or (r.get("outcome") != serverhealth.OUTCOME and bool(srv.get("failed_calls"))
-                                           and not (r.get("reward") or 0) > 0)
+    if r.get("outcome") == NOT_RUN:
+        return True
+    if r.get("outcome") == serverhealth.OUTCOME:
+        return False
+    ungraded = r.get("reward") is None and str(r.get("error") or "").startswith("harbor rc ")
+    return ungraded or (bool(srv.get("failed_calls")) and not (r.get("reward") or 0) > 0)
 
 
 def _med(xs: list) -> float | None:

@@ -610,5 +610,9 @@ def test_terminalbench_not_run_covers_no_calls_and_server_broken_unsolved_trials
     assert not tbcycle.not_run({"reward": 1.0, "server": {"calls": 9, "failed_calls": 2}}), "a pass stands"
     assert not tbcycle.not_run({"reward": 0.0, "server": {"calls": 9}}), "worked and failed: the model's fail"
     assert not tbcycle.not_run({"outcome": "server", "reward": None, "server": {"failed_calls": 3}}), "a server cut"
+    lost = {"reward": None, "error": "harbor rc 1: Docker daemon is not running.", "server": {"calls": 18}}
+    assert tbcycle.not_run(lost), "harbor failed before grading: never graded, so not run, never a fail"
+    assert not tbcycle.not_run({**lost, "reward": 0.0}), "a graded trial with a harbor error stands"
+    assert not tbcycle.not_run({"reward": None, "error": "AgentTimeoutError", "server": {"calls": 9}})
     md_rows = {"t1": {"task": "t1", "reward": 0.0, "server": {"calls": 4, "failed_calls": 1}}}
     assert [t for t, r in md_rows.items() if tbcycle.not_run(r)] == ["t1"]
