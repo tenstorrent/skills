@@ -19,6 +19,8 @@ import threading
 import time
 from pathlib import Path
 
+from .project import durable_write
+
 FACTOR = 2.0            # slower than normal: tokens/s below normal / FACTOR, or server wait above normal * FACTOR
 WINDOW = 500            # healthy calls per model that define its normal speed
 MIN_CALLS = 10          # fewer healthy calls than this: no normal speed is known yet
@@ -198,9 +200,7 @@ class History:
         got = self._read()
         got[model] = (got.get(model, []) + keep)[-self.window:]
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_name(self.path.name + f".{threading.get_ident()}.tmp")
-        tmp.write_text(json.dumps(got))
-        tmp.replace(self.path)
+        durable_write(self.path, json.dumps(got))
         return len(keep)
 
     def normal(self, model: str, min_calls: int = MIN_CALLS) -> dict | None:

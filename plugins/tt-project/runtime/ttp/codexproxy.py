@@ -27,6 +27,8 @@ import time
 import urllib.request
 from pathlib import Path
 
+from .project import durable_write, open_append
+
 PROFILE = "bench"
 PROVIDER = "bench"
 EFFORTS = ("minimal", "low", "medium", "high")
@@ -119,13 +121,13 @@ def start(run: Path, install: dict, model: str, upstream_url: str, token: str, w
     run = Path(run)
     folder = run / "codexproxy"
     folder.mkdir(parents=True, exist_ok=True)
-    (folder / "hook.py").write_text(HOOK_SOURCE)
-    (folder / "config.yaml").write_text(config_yaml(model, upstream_url))
+    durable_write(folder / "hook.py", HOOK_SOURCE)
+    durable_write(folder / "config.yaml", config_yaml(model, upstream_url))
     port = free_port()
     env = {"PATH": os.environ.get("PATH", ""), "HOME": str(folder), "LITELLM_TELEMETRY": "False",
            "LITELLM_LOG": "ERROR", "PYTHONPATH": str(folder), "NO_PROXY": "127.0.0.1,localhost",
            "LITELLM_MODE": "PRODUCTION", TOKEN_ENV: token, "LITELLM_MASTER_KEY": token, "DISABLE_SCHEMA_UPDATE": "true", "USE_PRISMA_MIGRATE": "false"}
-    log = open(run / "codexproxy.log", "wb")
+    log = open_append(run / "codexproxy.log", "ab")
     proc = subprocess.Popen([install["bin"], "--config", str(folder / "config.yaml"), "--host", "127.0.0.1",
                              "--port", str(port)], cwd=str(folder), env=env, stdout=log, stderr=subprocess.STDOUT,
                             stdin=subprocess.DEVNULL, start_new_session=True,
