@@ -1841,6 +1841,28 @@ def test_bench_audit_flags_only_distinctive_held_out_lines_and_what_the_agent_it
     assert benchrun.audit(ran, task, [hidden]) == [f"names {hidden}"]
 
 
+def test_mini_trajectory_audit_reads_only_the_agents_own_calls(tmp_path):
+    """A mini-swe-agent cell is audited on its assistant tool calls: a `git ls-remote` or `git fetch` that a tool
+    printed (a file the agent read, the plain-text log, a wrapped log line) is not the agent's call and flags
+    nothing; the same command in a tool call does (t8715, user msg #3107)."""
+    from ttp import benchrun
+    task = {"task": 7, "head": "f" * 40, "heldout": []}
+    def traj(*msgs):
+        return json.dumps({"messages": [{"role": "system", "content": "git fetch origin"},
+                                        {"role": "user", "content": "task: never run gh api or git clone"},
+                                        *msgs]}, indent=2).encode()
+    def call(cmd):
+        return {"role": "assistant", "content": "I will look.", "tool_calls": [
+            {"function": {"name": "bash", "arguments": json.dumps({"command": cmd})}, "id": "1", "type": "function"}]}
+    read = {"role": "tool", "content": "docs: run git ls-remote origin, git fetch, gh api x, git log --all"}
+    clean = benchrun.agent_records(traj(call("cat docs.md"), read, {"role": "assistant", "content": "git fetch is banned"}))
+    assert benchrun.audit(clean.decode(), task, []) == [], "a tool reply, the prompt and prose flag nothing"
+    cheat = benchrun.agent_records(traj(call("git ls-remote origin && git fetch origin"), read))
+    flags = benchrun.audit(cheat.decode(), task, [])
+    assert "runs 'git ls-remote'" in flags and "runs 'git fetch'" in flags
+    assert benchrun.agent_records(b"not json") == b""
+
+
 def _reaudit_day(env, tmp_path, monkeypatch, date="2026-11-10"):
     # Two models' replay cells of one day, run for real on the fake provider (the candidate fixes the task): the
     # first's row is then rewritten as an isolated cell the old audit flagged (never graded), the second's

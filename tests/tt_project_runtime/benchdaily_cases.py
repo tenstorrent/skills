@@ -607,3 +607,23 @@ def test_daily_table_marks_arms_that_ran_other_tasks_or_another_limit_not_compar
     md = (root / "table.md").read_text()
     assert "- task_set differs" in md and "- limit_s differs (most rows: 3600): claude:s:high 1800/3600" in md
     assert "Not comparable: claude:s:high" in md
+
+
+def test_daily_a_cheat_flagged_cell_is_never_landed_and_is_listed_apart(tmp_path):
+    """A cell with outcome 'flagged' counts as not landed in the day's record and in the running table, even in a
+    day file written before landed() knew it, and the table lists it under its own heading (user msg #3107)."""
+    from ttp import benchdaily
+    assert not benchdaily.landed({"scores": {"criteria": 4, "correctness": 4}}, {"outcome": "flagged"})
+    assert benchdaily.landed({"scores": {"criteria": 4, "correctness": 4}}, {"outcome": "done"})
+    root = tmp_path / "daily"
+    (root / "days").mkdir(parents=True)
+    flagged = {**_dd_cell("A", "glm", "chat:g:max", 1, 4, 4, True, 2.0, 30, claude=False), "outcome": "flagged",
+               "flags": ["runs 'git fetch'"]}
+    (root / "days" / "2026-11-15.json").write_text(json.dumps({"day": "2026-11-15", "cells": [
+        flagged, _dd_cell("A", "glm", "chat:g:max", 2, 4, 4, True, 2.0, 30, claude=False)], "skipped": [], "dropped": []}))
+    cum = benchdaily.write_table(root)
+    g = cum["models"]["chat:g:max"]
+    assert (g["n"], g["landed"], g["flagged"]) == (2, 1, 1)
+    md = (root / "table.md").read_text()
+    assert "## Flagged by the cheat audit" in md and "A-1 glm: runs 'git fetch'" in md
+    assert "v1: cannot separate the models (user msg #3111)." in md

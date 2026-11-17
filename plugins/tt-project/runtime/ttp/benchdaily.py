@@ -432,8 +432,9 @@ def review_spent(out: Path) -> float:
 
 def landed(score: dict, row: dict) -> bool:
     """Landed: requirements and correctness both at least LANDED_MIN of 4; a run that hit the time limit
-    (or stalled) is a fail whatever its diff shows."""
-    if row.get("hang_guard") or row.get("outcome") in ("timeout", "stalled", "error", "runner_timeout"):
+    (or stalled) is a fail whatever its diff shows, and a cell the cheat audit flagged (a hard flag) never
+    lands, whatever the graders gave its diff."""
+    if row.get("hang_guard") or row.get("outcome") in ("timeout", "stalled", "error", "runner_timeout", "flagged"):
         return False
     s = score.get("scores") or {}
     return int(s.get("criteria", 0)) >= LANDED_MIN and int(s.get("correctness", 0)) >= LANDED_MIN
@@ -591,7 +592,9 @@ def day_record(day: str, tasks: dict, arms: dict, out: Path, graded: dict, skipp
                       "landed": landed(score, r), "cost_usd": float(r.get("cost_usd") or 0),
                       "minutes": round(float(r.get("wall_s") or 0) / 60, 2),
                       "stopped": bool(r.get("hang_guard")) or r.get("outcome") in ("timeout", "stalled"),
-                      "outcome": r.get("outcome", "")})
+                      "outcome": r.get("outcome", ""),
+                      **({"flags": [f for f in r["flagged"] if not f.startswith("quote_matches: ")]}
+                         if r.get("outcome") == "flagged" and r.get("flagged") else {})})
     regrades = graded.get("regrades") or {}
     reps_graded = {tid: [] for tid in tasks}
     for gi, items in regrades.items():
@@ -648,7 +651,9 @@ def cumulative(root: Path | None = None) -> dict:
 
     def agg(rows: list[dict]) -> dict:
         n = len(rows)
-        return {"n": n, "landed": sum(1 for r in rows if r["landed"]),
+        # a flagged cell is never landed, also in a day file written before landed() knew it
+        return {"n": n, "landed": sum(1 for r in rows if r["landed"] and r.get("outcome") != "flagged"),
+                **({"flagged": f} if (f := sum(1 for r in rows if r.get("outcome") == "flagged")) else {}),
                 "criteria": round(sum(r["criteria"] for r in rows) / n, 2),
                 "correctness": round(sum(r["correctness"] for r in rows) / n, 2),
                 "usd_per_task": round(sum(r["cost_usd"] for r in rows) / n, 2),
@@ -671,6 +676,9 @@ def cumulative(root: Path | None = None) -> dict:
             **({"original": orig} if orig["n"] else {}),
             **({"dropped_original": gone} if gone else {}),
             **({"not_code_bench": left} if left else {}),
+            **({"flagged": flagged} if (flagged := [
+                {"day": c["day"], "project": c["project"], "task": c["task"], "arm": c["arm"], "flags": c.get("flags") or []}
+                for c in cells if c.get("outcome") == "flagged"]) else {}),
             "parity": [parity_row(m, rs, limits) for m, rs in sorted(per.items())],
             **({"second_days": seconds} if seconds else {})}
 
@@ -712,6 +720,7 @@ def table_md(cum: dict) -> str:
     two = any(a.get("second_n") for a in cum["models"].values())
     head = HEAD.format("model", " second grader: landed (req/corr) |" if two else "", "---|" if two else "")
     lines = [f"# Daily model bench: cumulative ({len(cum['days'])} day(s): {', '.join(cum['days']) or 'none'})", "",
+             "v1: cannot separate the models (user msg #3111).", "",
              "Landed = requirements and correctness each at least 3 of 4 by the blind Opus review; a 60-minute stop is "
              "a fail. $ per task is each arm's own spend (an open model's is GLM spend, not Claude spend).", "",
              "## Per model", "", head]
@@ -740,6 +749,10 @@ def table_md(cum: dict) -> str:
                   "server is healthy:"]
         lines += [f"- {x['day']}: {x['project']} {x['task']} {x['arm']} ({x['model']}): {'; '.join(x.get('why') or [])}"
                   for x in cum["server"]]
+    if cum.get("flagged"):
+        lines += ["", "## Flagged by the cheat audit", "", "Cells whose own tool calls ran a history or forge command or "
+                  "named a hidden path. They are shown, graded, and never counted as landed:"]
+        lines += [f"- {x['day']}: {x['task']} {x['arm']}: {'; '.join(x['flags']) or 'flagged'}" for x in cum["flagged"]]
     if cum.get("reruns"):
         lines += ["", "## Server reruns", "", "Stops rechecked against the server rule, each rerun at normal server speed; "
                   "the cause says whether the server or the model stopped the first run:"]

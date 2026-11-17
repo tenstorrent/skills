@@ -385,6 +385,29 @@ def agent_text(transcript: str, messages: bool = True) -> str:
     return "\n".join(found)
 
 
+def agent_records(trajectory: bytes) -> bytes:
+    """A mini-swe-agent trajectory (its `messages` list) as one JSON record per line in the shape agent_text and
+    _commands read: each assistant message's reply as a `text` record and each tool call as a `tool_use` record
+    holding its arguments. A tool's reply (role tool), the task prompt (user) and the system prompt are left out:
+    they are what a tool returned or the harness wrote, never the agent's. b"" when it is not a trajectory."""
+    try:
+        msgs = json.loads(trajectory).get("messages") or []
+    except (ValueError, AttributeError):
+        return b""
+    out = []
+    for m in msgs:
+        if not isinstance(m, dict) or m.get("role") != "assistant":
+            continue
+        for key in ("content", "reasoning_content"):
+            if isinstance(m.get(key), str) and m[key]:
+                out.append({"type": "text" if key == "content" else "thinking", "text": m[key]})
+        for call in m.get("tool_calls") or []:
+            fn = call.get("function") if isinstance(call, dict) else None
+            if isinstance(fn, dict):
+                out.append({"type": "tool_use", "name": fn.get("name"), "input": fn.get("arguments")})
+    return "".join(json.dumps(r) + "\n" for r in out).encode()
+
+
 def _system(line: str) -> bool:
     # A provider's own system record (its init lists the installed plugins' paths): not the agent's.
     try:
@@ -1213,12 +1236,16 @@ def _finish(row: dict, bench_dir: Path, task: dict, ws: Path, run: Path, keep: P
                session_id=u.session_id)
     row.update(cell_spend(u, row, run / "output.jsonl"))
     transcript = (run / "output.jsonl").read_bytes() if (run / "output.jsonl").exists() else b""
+    audited = None
     ended, handoff = _read_json(run / "exit.json"), _read_json(run / "result.json")
     ended = ended if isinstance(ended, dict) else {}
     if row.get("harness"):   # its own output format: the tokens are the bridge's counts, priced here
         row.update(harness_spend(prov, (ended.get("bridge") or {}).get("usage") or {}))
         if (run / "trajectory.json").exists():   # mini-swe-agent's messages: the transcript the audit reads
             transcript += b"\n" + (run / "trajectory.json").read_bytes()
+            # the audit reads the agent's own calls only: the plain-text log and the tool replies in the
+            # trajectory hold what tools printed (a `git ls-remote` inside a file it read is not a call)
+            audited = agent_records((run / "trajectory.json").read_bytes())
     if ((ended.get("bridge") or {}).get("usage") or {}).get("dropped_tool_calls") is not None:   # one tool call kept per reply
         row["dropped_tool_calls"] = ended["bridge"]["usage"]["dropped_tool_calls"]
     if isinstance(ended.get("ended"), (int, float)):   # the agent's own end: names this run's kept exit.json
@@ -1234,7 +1261,7 @@ def _finish(row: dict, bench_dir: Path, task: dict, ws: Path, run: Path, keep: P
         # cell still grades what the agent committed, so it scores as the held-out tests say; the row
         # names the guard so a reader sees the cell was cut short.
         row["hang_guard"] = ended["stopped"]
-    flags = audit(transcript.decode(errors="replace"), task, hidden,
+    flags = audit((transcript if audited is None else audited).decode(errors="replace"), task, hidden,
                   secret_lines(bench_dir, task), diff.decode(errors="replace"), own or session_dirs(ws))
     # Graded even when flagged, so a reader sees both: a flagged cell still scores as a flag (passed False),
     # and `heldout_passed` keeps what the held-out tests said. A fresh venv: nothing the agent installed
