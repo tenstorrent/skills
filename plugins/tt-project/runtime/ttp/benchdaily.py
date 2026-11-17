@@ -635,8 +635,11 @@ def parity_row(key: str, cells: list[dict], limits: dict) -> dict:
     from . import benchparity
     prov, model, effort, *h = key.split(":") + [""] * 3
     lim = sorted({str(limits.get(c.get("day"))) for c in cells if limits.get(c.get("day")) is not None})
-    return {"arm": key, "model": model, "provider": prov, "effort": effort, "harness": h[0] or "claude (the provider's CLI)",
-            "agent": h[0] or "claude", "kind": "provider CLI" if not h[0] else "chat endpoint through the run's bridge",
+    cli = prov or "claude"   # an arm with no harness runs its provider's own CLI; the chat one calls the run's bridge
+    kind = ("chat endpoint through the run's bridge" if h[0] else
+            "the chat provider's CLI through the run's bridge" if cli == "chat" else "provider CLI")
+    return {"arm": key, "model": model, "provider": prov, "effort": effort, "harness": h[0] or f"{cli} (the provider's CLI)",
+            "agent": h[0] or cli, "kind": kind,
             "task_set": benchparity.task_set([f"{c.get('day')}/{c['task']}" for c in cells]), "tasks": len(cells),
             "limit_s": "/".join(lim) if lim else None, "limit_counts": "the cell's wall time (a stop is a fail)",
             "rerun_rule": RERUN_RULE}

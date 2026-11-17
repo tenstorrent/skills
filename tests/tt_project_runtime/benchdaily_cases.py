@@ -572,6 +572,13 @@ def test_replay_run_end_to_end_in_a_dry_run_builds_reviews_blind_and_writes_the_
     md = (root / "table.md").read_text()
     assert "## device" in md and "## analysis" in md and "## all" in md and "Spend: Claude $0.00" in md
     assert "## Second grader" in md
+    assert "All 2 rows ran under the same conditions" in md and "## How each arm was called" in md
+    assert "- m2 max: provider chat; kind the chat provider's CLI through the run's bridge; effort max; harness chat" in md, \
+        "each arm's line says how it was called, under its table name"
+    assert "- m1 high: provider claude; kind provider CLI; effort high; harness claude (the provider's CLI)" in md
+    assert {r["limit_s"] for r in rec["parity"]} == {str(benchreplay.LIMIT_S)}
+    odd = dict(rec, parity=[rec["parity"][0], dict(rec["parity"][1], task_set="other", tasks=1)])
+    assert "Not comparable: m2 max" in benchreplay.table_md(odd, {"a": "m1 high", "b": "m2 max"})
     assert rec["arms"]["a"]["all"]["n"] == 2 and rec["arms"]["a"]["all"]["agree_4plus"] == 2
     assert json.loads((root / "replay.json").read_text())["spend"]["glm_usd"] == 0
     again = benchreplay.run_replay(arms, p.config(), cap=10.0, parallel=2, root=root, established=est, ask=ask,

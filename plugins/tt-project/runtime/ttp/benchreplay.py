@@ -17,7 +17,7 @@ import shutil
 import sys
 from pathlib import Path
 
-from . import bench, benchblind, benchdaily, benchrun, gitmemo
+from . import bench, benchblind, benchdaily, benchparity, benchrun, gitmemo
 from .project import durable_write
 
 CAP_USD = 60.0          # Claude spend of the whole replay (arm runs plus reviews)
@@ -306,9 +306,10 @@ def answer_cells(entries: dict[str, dict]):
     return build_cells
 
 
-def table(out: Path, tasks: dict, arms: dict, graded: dict, faults: list, skipped: list) -> dict:
+def table(out: Path, tasks: dict, arms: dict, graded: dict, faults: list, skipped: list, limit_s: int | None = None) -> dict:
     """Per arm and class (device, analysis) and overall: N, mean 1-5 scores, share that agrees (4 or 5), $ and
-    minutes per question, hang-guard stops; plus spend by provider kind."""
+    minutes per question, hang-guard stops; plus spend by provider kind and each arm's parity row
+    (benchdaily.parity_row: its scored questions as the task set, the hang guard as the limit)."""
     rows = benchdaily.read_rows(out / "results.jsonl")
     cells = []
     for _, (tid, arm, score) in sorted(graded["scored"].items()):
@@ -346,7 +347,11 @@ def table(out: Path, tasks: dict, arms: dict, graded: dict, faults: list, skippe
             "spend": {"claude_arms_usd": round(claude, 4), "review_usd": round(spend, 4),
                       "claude_usd": round(claude + spend, 4),
                       "glm_usd": round(sum(c["cost_usd"] for c in cells if not c["claude"]), 4)},
-            "faults": faults, "skipped": skipped, "unscored": graded.get("unscored", [])}
+            "faults": faults, "skipped": skipped, "unscored": graded.get("unscored", []),
+            "parity": [benchdaily.parity_row(":".join([str(arms[a].get(f) or "") for f in ("provider", "model", "effort")]
+                                                      + ([arms[a]["harness"]] if arms[a].get("harness") else [])),
+                                             [{"day": "replay", "task": c["task"]} for c in cells if c["arm"] == a],
+                                             {"replay": limit_s} if limit_s else {}) | {"arm": a} for a in sorted(arms)]}
 
 
 HEAD_ROW = ("| arm | N | answered (1-5) | supported (1-5) | agrees (1-5) | agrees 4+ | $ per question | "
@@ -381,6 +386,9 @@ def table_md(rec: dict, names: dict[str, str]) -> str:
     for title, items in (("Not built", rec["faults"]), ("Not run", rec["skipped"]), ("Not scored", rec["unscored"])):
         if items:
             lines += ["", f"{title}:"] + [f"- {x.get('key') or x.get('task') or x.get('item')}: {x['why']}" for x in items]
+    if rec.get("parity"):
+        lines += [""] + benchparity.section([r | {"arm": names.get(r["arm"], r["arm"])} for r in rec["parity"]],
+                                            fields=benchdaily.PARITY_FIELDS)
     return "\n".join(lines) + "\n"
 
 
@@ -409,7 +417,7 @@ def run_replay(arms: dict, cfg: dict, cap: float = CAP_USD, parallel: int = benc
     done = benchdaily.run_cells("replay", tasks, arms, out, bench_dir, ropts, cfg, cap, parallel, order, say)
     graded = benchdaily.blind_review(out, tasks, arms, cfg, ask, seed, build=answer_cells(by_id),
                                      rubric=benchblind.ANSWER_RUBRIC, ask2=ask2)
-    rec = table(out, tasks, arms, graded, faults, done["skipped"])
+    rec = table(out, tasks, arms, graded, faults, done["skipped"], ropts["timeout_s"])
     rec["arms_def"] = {k: {f: v.get(f, "") for f in ("provider", "model", "effort", "harness")} for k, v in arms.items()}
     rec["evidence"] = {t: {"n": tasks[t]["n_evidence"], **tasks[t]["evidence"]} for t in tasks}
     names = {a: f"{v.get('model')} {v.get('effort')}" + (f" ({v['harness']})" if v.get("harness") else "")
