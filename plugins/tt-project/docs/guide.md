@@ -2845,7 +2845,9 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   checks start in task-priority order across them, and a priority-1 check whose lanes are held only by less urgent
   runs starts beside them in an extra lane while the load is under half the cores, never in a worktree that already
   runs checks. When `checks.test_project_max` is full of less urgent runs, that priority-1 check still starts at once
-  in an extra lane past the cap, one such lane per project at a time; it never stops a running check. A full
+  in an extra lane past the cap, one such lane per project at a time; it never stops a running check. Checks that all run on another host (a spilled run,
+  `push.remote_host`) take a checks lane only to count against `checks.test_project_max`: runs of different heads in
+  one repository go side by side up to that cap, never one at a time, and their waiting line names the cap. A full
   `ttp checks` run of an urgent or priority-1 task skips that wait: it takes the extra lane when it can, else a
   lane at once, and queues for a host-wide checks slot (where it preempts routine runs), never behind runs that
   only queue there, and still

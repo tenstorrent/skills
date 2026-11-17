@@ -1450,11 +1450,14 @@ def remote_lane(project_name: str | None, cap: int, tell: Callable[[str], None] 
     checks.test_project_max (checklane.fixed_cap; `cap`: its checklane.project_cap). Such checks take no
     checks slot or test slots of this machine, whose CPU they never use, but still count against the
     project's cap of running checks, so the cap also bounds how many of its suites one checks host runs at
-    once. The Grant (Grant() with no project), or None once `wait_s` passed; a reason from `stop()` ends
-    the wait with checkcap.Cancelled, as suite_hold's does."""
+    once. Only that cap bounds their lanes (suite_hold's `slots` is `cap`, never its default of one): runs
+    of different heads in one repository go side by side up to it. The Grant (Grant() with no project), or
+    None once `wait_s` passed; a reason from `stop()` ends the wait with checkcap.Cancelled, as
+    suite_hold's does."""
     t0 = time.time()
     if (g := suite_hold(project_name, tell, wait_s, stop=stop, who=who, priority=priority, since=since,
-                        repo=repo, what=what, cap=cap, cap_note=cap_note, pending=True)) is None:
+                        repo=repo, what=what, cap=cap, cap_note=cap_note, pending=True,
+                        slots=max(1, cap), slots_from="checks.test_project_max sets it")) is None:
         return None
     while not claim_running(g, project_name, lambda n: n + 1, cap):
         if stop and (why := stop()):
