@@ -9,10 +9,16 @@ host-timed TFLOP/s per chip, so the slowest chip's rate) and <out-prefix>_teleme
 tt_telemetry_summary.py and put the table or figure into the plan's hardware-ceiling section.
 
     python tt_clock_ladder.py <out-prefix> --sampler-python <luwen-python> [--seconds 20] [--m 16384 --k 5120 --n 1024]
+        [--shape 4x8] [--sampler-script <path to tt_telemetry_sampler.py>]
 
 Run from the model's python_env (ttnn importable, TT_METAL_HOME set) with the devices free. Set --m/--k/--n to the
 largest projection of the model so the full-grid phase matches the step's load; the defaults are a typical
 large projection. The ladder never runs a fidelity the recipe forbids: pass --fidelity only to match the recipe.
+Pass --shape to open the plan's mesh shape (with TT_MESH_GRAPH_DESC_PATH set to its descriptor); the default 1xN
+line is not how the box runs the model, and on a box whose descriptors do not include it, it does not open at all.
+Compilation and the first call of every load are warmed up before the sampler starts, so no phase pays for them
+and the sampler's lifetime does not have to cover the device open. HARDWARE_CAPACITY on stdout carries the
+compute grid and DRAM per chip: that grid, not an assumed core count, is the plan's MFU denominator.
 """
 import argparse
 import json
@@ -35,16 +41,31 @@ def main() -> None:
     p.add_argument("--n", type=int, default=1024)
     p.add_argument("--fidelity", default="HiFi4", choices=["HiFi4", "HiFi3", "HiFi2", "LoFi"])
     p.add_argument("--hz", type=float, default=20.0)
+    p.add_argument("--shape", help="mesh shape ROWSxCOLS, e.g. 4x8; default is a 1xN line over every chip")
+    p.add_argument("--sampler-script", help="path to tt_telemetry_sampler.py; default is this script's directory")
     a = p.parse_args()
 
-    here = os.path.dirname(os.path.abspath(__file__))
-    sampler = subprocess.Popen([a.sampler_python, os.path.join(here, "tt_telemetry_sampler.py"),
-                                a.out_prefix + "_telemetry.csv", str(3 * a.seconds + 90), str(a.hz)])
+    sampler_script = a.sampler_script or os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                      "tt_telemetry_sampler.py")
+    if not os.path.isfile(sampler_script):
+        sys.exit(f"sampler not found: {sampler_script}; pass --sampler-script")
     num = ttnn.get_num_devices()
-    device = ttnn.open_mesh_device(ttnn.MeshShape(1, num))
+    if a.shape:
+        rows, cols = (int(v) for v in a.shape.lower().split("x"))
+    else:
+        rows, cols = 1, num
+    device = ttnn.open_mesh_device(ttnn.MeshShape(rows, cols))
     grid = device.compute_with_storage_grid_size()
+    dram = ttnn.get_memory_view(device, ttnn.BufferType.DRAM)
+    print("HARDWARE_CAPACITY " + json.dumps({"grid_xy": [grid.x, grid.y], "cores": grid.x * grid.y,
+                                             "mesh": [rows, cols], "chips": num,
+                                             "dram_banks": dram.num_banks,
+                                             "dram_bytes_per_bank": dram.total_bytes_per_bank}), flush=True)
+    # Half DEST sync caps fp32-accumulate throughput, so a ladder without it measures a machine the
+    # model does not run on: match the recipe's compute config exactly.
     cfg = ttnn.WormholeComputeKernelConfig(math_fidelity=getattr(ttnn.MathFidelity, a.fidelity),
-                                           fp32_dest_acc_en=True, math_approx_mode=False, packer_l1_acc=True)
+                                           fp32_dest_acc_en=True, math_approx_mode=False, packer_l1_acc=True,
+                                           dst_full_sync_en=True)
 
     def dev(t):
         return ttnn.from_torch(t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device,
@@ -81,13 +102,23 @@ def main() -> None:
         phases[-1]["end"] = time.time()
         print(f"{name}: {phases[-1]['end'] - t0:.1f} s", flush=True)
 
+    # Compile and first-call cost belongs to no phase: warm every load, then start the sampler, so its
+    # lifetime covers the ladder itself and not an unpredictable device open.
+    for lhs, rhs, core_grid, _ in loads.values():
+        ttnn.deallocate(ttnn.matmul(lhs, rhs, transpose_b=True, compute_kernel_config=cfg, core_grid=core_grid))
+    ttnn.synchronize_device(device)
+    seconds_total = 3 * a.seconds + 60
+    sampler = subprocess.Popen([a.sampler_python, sampler_script,
+                                a.out_prefix + "_telemetry.csv", str(seconds_total), str(a.hz)])
     phase("idle", 8.0)
     for name, load in loads.items():
         phase(name, a.seconds, load)
         phase("pause", 6.0)
     phase("idle (end)", 4.0)
     json.dump({"phases": phases, "batches": batches, "shape": [M, K, N], "chips": num,
-               "grid": [grid.y, grid.x], "fidelity": a.fidelity}, open(a.out_prefix + ".json", "w"), indent=1)
+               "mesh": [rows, cols], "grid": [grid.y, grid.x], "cores": grid.x * grid.y,
+               "dst_full_sync_en": True, "fidelity": a.fidelity},
+              open(a.out_prefix + ".json", "w"), indent=1)
     ttnn.close_mesh_device(device)
     time.sleep(2)
     sampler.terminate()

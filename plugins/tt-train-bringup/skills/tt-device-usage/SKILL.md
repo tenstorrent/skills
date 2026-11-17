@@ -92,7 +92,11 @@ any of its chips while it runs.
   result row cites the settled clock and the critical chip.
 - On day 1 of a bring-up, `scripts/tt_clock_ladder.py` runs the characterisation (idle, a few-core
   matmul, a third of the grid, the full grid, on every chip at once, at the recipe's fidelity) with
-  the sampler attached; its table or figure goes into the plan's hardware-ceiling section. A clock
+  the sampler attached; its table or figure goes into the plan's hardware-ceiling section. Pass
+  `--shape ROWSxCOLS` with the plan's descriptor so the ladder loads the mesh the model will run on
+  rather than the default 1xN line, and `--sampler-script` if the script was copied out of the
+  installed plugin. Its `HARDWARE_CAPACITY` line carries the compute grid and DRAM per chip: that
+  grid is the plan's MFU denominator, never an assumed core count. A clock
   that drops when the load reaches the TDP limit means a power cap; its delivered clock is the
   plan's margin and the loop's variants are chosen by cooled wall ms, not cycles.
 - Cool-down protocol: one stated idle time before every MFU run, the same for every row. Same-clock

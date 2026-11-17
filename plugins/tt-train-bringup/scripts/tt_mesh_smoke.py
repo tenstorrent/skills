@@ -81,7 +81,10 @@ def run(shape: tuple[int, int], bandwidth_mib: float, iters: int) -> dict:
     import ttml
 
     rows, cols = shape
-    values = [[r * cols + c + 1 for c in range(cols)] for r in range(rows)]
+    # Signed, distinct and never zero: an all-positive fill makes a dropped, duplicated or
+    # wrongly-ordered contribution look like a plausible sum, so the smoke would pass it. Signs
+    # alternate by column, which keeps every row and column sum non-zero on any shape.
+    values = [[(r * cols + c + 1) * (1 if c % 2 == 0 else -1) for c in range(cols)] for r in range(rows)]
     report: dict = {"shape": f"{rows}x{cols}", "mgd": os.environ.get("TT_MESH_GRAPH_DESC_PATH"), "axes": {}}
 
     t0 = time.monotonic()
