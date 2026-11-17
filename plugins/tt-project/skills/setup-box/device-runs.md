@@ -61,6 +61,9 @@ tt-device-mcp wait <job-id>        # exit 0 only when the job completed
 - The command reaches the real program by `exec` or an `&&` chain, never `...; prog`: a shell left
   in between dies by the signal and the program never sees it.
 - Split work longer than the limit into chunks that each fit it, writing a checkpoint after each.
+  `ttp devq submit` enforces it: a `--timeout` above 1500 s, or a broker call in the command with a
+  numeric `-t` above it, is refused with this advice. Submit each next chunk as its own job once the
+  previous one is done, so the chunks queue behind others' jobs instead of holding the device.
   Better still, stop at a step boundary: `should_yield(started, limit_s)` is true once the job is
   past its limit with another job queued; save the checkpoint, `mark_yielded()`, exit 0.
 - A job that ends `preempted` (`wait` prints `!! PREEMPTED`; `tt-device-mcp status -j <id>`) or
@@ -70,6 +73,24 @@ tt-device-mcp wait <job-id>        # exit 0 only when the job completed
   wait: the wait is bounded by that job's limit plus 70 s. Do not route around it or cancel it.
 - Never hold the device idle: build and stage inputs before queueing, never `tt-device-mcp lock`
   the device for a session, and `ttp lock` a device resource only around each device command.
+
+## Prewarm: build off the device, before the claim
+
+A runner can run one command before each job's claim, on the box and off the device: compile,
+fetch weights or warm caches there, so the claim is spent running. Set it in the runner's config
+(`device.runners.<name>`):
+
+- `prewarm`: the command (run in the job's workdir; `TTP_DEVQ_JOB`, `TTP_DEVQ_CONFIG` and
+  `TTP_DEVQ_WORKDIR` name the job). It runs once per job: a rerun after a preemption or a drop
+  skips it, so make it safe to run again for the next job.
+- `prewarm_timeout_s` (default 1800): longer counts as a failed prewarm.
+- `prewarm_policy`: `warn` (default: log the failure and run the job) or `refuse` (fail the job
+  unstarted, so a job that needs the warm build never runs cold).
+- It must not claim the device: a command that calls `tt-device-mcp` other than `status` is refused
+  by `ttp config` and again by the runner. Queue the device step in the job itself.
+
+Queue the jobs at the start of the task, as soon as their inputs exist: the runner prewarms and
+starts them while you do the rest.
 
 ## The build stamp
 

@@ -4202,6 +4202,19 @@ estimate (its `cells:` times the median cell time, else the median run of its ki
 
 Settings under `overlap` (all default on): `auto_depend`, `early_deps`; `split_hours` (default 2, 0 = off).
 
+## Device runs: prewarm off the device, chunks that fit the broker
+
+A `ttp devq` runner can run a prewarm command (`device.runners.<name>.prewarm`) before each job's
+claim, on the box and off the device, so builds and cache warm-ups are not spent inside the claim. It
+runs once per job in the job's workdir, is cut off at `prewarm_timeout_s` (default 1800), and on a
+failure either logs it and runs the job (`prewarm_policy` `warn`, the default) or fails the job
+unstarted (`refuse`). A prewarm that calls the device broker other than `status` is refused in the
+config check and again by the runner. `ttp devq submit` also refuses a job whose own broker call
+asks for a `-t` above 1500 s, in any spelling (`-t 3000`, `-t3000`, `--timeout=3000`), with checkpoint
+advice: split the run into chunks that each write a checkpoint and queue each next chunk as its own
+job. Workers are told to queue device jobs at the start of the task. Needs no device: the tests use
+fake runners.
+
 ## Where things live
 
 | Path | Holds |

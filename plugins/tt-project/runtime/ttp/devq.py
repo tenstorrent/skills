@@ -93,9 +93,16 @@ RUNNER_DEFAULTS = {
     # not the runner, ends it, and only once another job waits past its limit.
     "broker": "auto",
     "max_preempts": 20,        # a job preempted (or that yielded) more often than this is failed
+    # A prewarm/build command run on the host before the job claims the device ("" = none): compile, fetch or
+    # warm caches here, so the claim is spent running. It runs in the job's workdir, once per job (a rerun
+    # after a preemption or drop skips it), and must not claim the device itself (config_problems refuses a
+    # broker call in it). TTP_DEVQ_JOB, TTP_DEVQ_CONFIG and TTP_DEVQ_WORKDIR name the job.
+    "prewarm": "",
+    "prewarm_timeout_s": 1800,  # longer than this counts as a failed prewarm
+    "prewarm_policy": "warn",  # on a failed prewarm: "warn" (log it, run the job) or "refuse" (fail it unstarted)
 }
 _CHOICES = {"script_lint": ("", "warn", "refuse"), "netfs_policy": ("warn", "refuse"),
-            "broker": ("auto", "on", "off")}
+            "broker": ("auto", "on", "off"), "prewarm_policy": ("warn", "refuse")}
 BROKER = "tt-device-mcp"
 BROKER_MAX_S = 1500   # the broker's longest job limit: a longer run is split into shorter jobs
 PREEMPTED_RE = re.compile(r"finished: preempted\b")   # `tt-device-mcp wait`'s end line for a preempted job
@@ -148,6 +155,23 @@ def config_problems(name: str, cfg) -> list:
         out.append(f"{where}.job_timeout_s: {default} is above reservation_cap_s {cap}")
     if isinstance(cfg.get("host"), str) and cfg["host"].startswith("-"):
         out.append(f"{where}.host: must not start with '-'")
+    if isinstance(cfg.get("prewarm"), str):
+        out += [f"{where}.prewarm: {x}" for x in prewarm_problems(cfg["prewarm"])]
+    return out
+
+
+# A prewarm command runs before the job claims the device, so it must not claim the device itself: any
+# mention of the broker's tool other than a read-only subcommand is refused (a guard against mistakes; a
+# command built to hide the name is not something a text check can stop).
+_BROKER_READONLY = re.compile(rf"{re.escape(BROKER)}[\"']?\s+[\"']?(?:status|--help|--version)\b")
+
+
+def prewarm_problems(cmd: str) -> list:
+    """Why the prewarm command may not run before the claim, one line each ([] when it may)."""
+    out = []
+    if BROKER in cmd and len(re.findall(re.escape(BROKER), cmd)) > len(_BROKER_READONLY.findall(cmd)):
+        out.append(f"it calls {BROKER}: a prewarm runs before the claim and must not hold the device "
+                   "(only `status` is allowed); put the device step in the job itself")
     return out
 
 
@@ -535,6 +559,30 @@ def broker_call_problems(spec: dict) -> list:
                 out.append(f"{label}: `{call[:80]}` lacks --preemptable")
             if not t or int(t.group(1)) > BROKER_MAX_S:
                 out.append(f"{label}: `{call[:80]}` needs -t {BROKER_MAX_S} or less")
+    return out
+
+
+def chunk_advice(limit: float = BROKER_MAX_S) -> str:
+    """How to run a longer job through the broker: in chunks that each fit its limit."""
+    return (f"split the run into shorter jobs of at most {limit:.0f} s each: have the job write a checkpoint "
+            "(or its progress) when a chunk ends and resume from it, and submit each next chunk as its own "
+            "job once the previous one is done")
+
+
+_TLIMIT = re.compile(r"(?:^|\s)(?:-t|--timeout)(?:[ =]\s*|(?=\d))[\"']?(\d+)(?![\w.])")
+
+
+def chunk_problems(spec: dict) -> list:
+    """The job's own broker calls whose -t is a number above BROKER_MAX_S (the broker would end them, or
+    hold a serving workload that long), one line each with the checkpoint advice. A -t that is not a plain
+    number (a variable) is for broker_call_problems to warn about."""
+    out = []
+    for label, code in _job_texts(spec):
+        for m in re.finditer(rf"\b{BROKER}\s+(run|run-bg)\b[^\n;|&]*", code):
+            for t in _TLIMIT.findall(m.group(0)):
+                if int(t) > BROKER_MAX_S:
+                    out.append(f"{label}: `{m.group(0)[:80]}` asks for -t {t}, above the broker's limit of "
+                               f"{BROKER_MAX_S} s; {chunk_advice()}")
     return out
 
 
@@ -1126,7 +1174,11 @@ def submit(d: Path, cfg: dict, spec: dict) -> int:
     if broker_on(settings(cfg)):
         if float(spec.get("timeout_s") or 0) > BROKER_MAX_S:
             print(f"devq submit: refused: --timeout {spec['timeout_s']} is above the device broker's limit of "
-                  f"{BROKER_MAX_S} s; split the run into shorter jobs", file=sys.stderr)
+                  f"{BROKER_MAX_S} s; {chunk_advice()}", file=sys.stderr)
+            return 2
+        too_big = chunk_problems(spec) if calls_broker(spec) else []
+        if too_big:
+            print("devq submit: refused: " + "; ".join(too_big), file=sys.stderr)
             return 2
         for w in broker_call_problems(spec) if calls_broker(spec) else []:
             print(f"devq submit: warning: {w} (a job that is not preemptable blocks a serving workload)",
@@ -1370,10 +1422,10 @@ class Runner:
     def set_state(self, msg: str) -> None:
         _write(self.d / "state", f"{_utc()} {msg}\n")
 
-    def sh(self, cmd: str, timeout: float, env: dict | None = None) -> tuple:
+    def sh(self, cmd: str, timeout: float, env: dict | None = None, cwd: str | None = None) -> tuple:
         """(exit code, last output line) of a shell command in its own group, killed at the timeout."""
         try:
-            p = subprocess.Popen(["/bin/sh", "-c", cmd], cwd=str(self.d), stdin=subprocess.DEVNULL,
+            p = subprocess.Popen(["/bin/sh", "-c", cmd], cwd=cwd or str(self.d), stdin=subprocess.DEVNULL,
                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                                  env=_env(**(env or {})), start_new_session=True)
         except OSError as e:
@@ -1415,6 +1467,29 @@ class Runner:
                 if self.cfg["health_wait_s"] and _now() - t0 >= self.cfg["health_wait_s"]:
                     return f"the health gate refused for {self.cfg['health_wait_s']:.0f} s ({why})"
             time.sleep(self.cfg["health_poll_s"])
+
+    def prewarm(self, job: str, spec: dict, st: dict) -> str:
+        """Run the host's prewarm command once for this job, off the device and before the claim: "" when it
+        passed, was skipped or only warned, else why the job is failed unstarted (prewarm_policy refuse)."""
+        cmd = str(self.cfg["prewarm"] or "").strip()
+        if not cmd or st.get("prewarmed"):
+            return ""
+        bad = prewarm_problems(cmd)
+        if bad:
+            return "not started: prewarm " + "; ".join(bad)
+        self.set_state(f"{job}: prewarm")
+        wd = spec.get("workdir") or ""
+        rc, out = self.sh(cmd, self.cfg["prewarm_timeout_s"] or 1800,
+                          {"TTP_DEVQ_JOB": job, "TTP_DEVQ_CONFIG": str(spec.get("config") or job),
+                           "TTP_DEVQ_WORKDIR": wd}, cwd=wd if wd and Path(wd).is_dir() else None)
+        with self.steady():
+            st["prewarmed"] = True
+            self.save(job, st)
+        if rc == 0:
+            return ""
+        why = f"prewarm exit {rc}" + (f": {out}" if out else "")
+        self.log(f"{job}: {why}")
+        return f"not started: {why}" if self.cfg["prewarm_policy"] == "refuse" else ""
 
     def no_outside_user(self, job: str) -> None:
         """Wait while an outside device user runs: it may start a device job of its own at any time."""
@@ -1627,6 +1702,10 @@ class Runner:
                     self.finish(job, st, "skipped", None,
                                 f"config {spec['config']} dropped {len(drops)} times in a row; "
                                 f"`ttp devq clear <runner> {spec['config']}` allows it again")
+                    return
+                why = self.prewarm(job, spec, st)
+                if why:
+                    self.finish(job, st, "failed", None, why)
                     return
                 self.no_outside_user(job)
                 why = self.healthy(need, job)

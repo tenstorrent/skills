@@ -259,8 +259,10 @@ No `result.json`, no credit.
 <!-- ttp:if devq -->
   A device job goes through a device runner your task header lists:
   `ttp devq submit <runner> --id <unique id> [--config <key>] [--timeout <s>] [--workdir <dir>] -- <command>`
-  (build and set up first: those are not device jobs). A runner with a reservation cap refuses a
-  longer `--timeout`. It prints the `retry_when`; submit several jobs in order and wait on the last. On wake, `ttp devq status <runner> <id>` shows its marker. No marker and no runner
+  (build and set up first: those are not device jobs). Queue the device jobs at the start of the task,
+  as soon as their inputs exist, never after the code work: a runner's own prewarm builds off the device
+  while the queue moves. A runner with a reservation cap refuses a longer `--timeout`, and a job whose
+  broker call asks for more than 1500 s is refused: split it and checkpoint. It prints the `retry_when`; submit several jobs in order and wait on the last. On wake, `ttp devq status <runner> <id>` shows its marker. No marker and no runner
   alive: `ttp devq start <runner>` and hand off `waiting` again on the same probe.
   Keep every device timeout (the `--timeout`, your scripts' broker timeouts, each driver step)
   within the task header's ceiling (a broker's 1500 s at most), which a devq job sees as

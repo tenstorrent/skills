@@ -46,7 +46,7 @@ def test_devq_on_a_broker_host_refuses_a_timeout_over_the_broker_cap_and_warns_o
     _fake_broker(tmp_path, monkeypatch)
     r = _devq("submit", devq_dir, json.dumps(DEVQ_FAST), json.dumps({"id": "long", "cmd": "true", "timeout_s": 1600}))
     assert r.returncode == 2 and "split the run into shorter jobs" in r.stderr, r.stderr
-    bad = _devq_submit(devq_dir, {}, "own1", "tt-device-mcp run-bg -t 3000 python3 x.py")
+    bad = _devq_submit(devq_dir, {}, "own1", "tt-device-mcp run-bg -t $LIMIT python3 x.py")
     assert "lacks --preemptable" in bad.stderr and "needs -t 1500 or less" in bad.stderr, bad.stderr
     good = _devq_submit(devq_dir, {}, "own2", "tt-device-mcp run-bg --preemptable -t 1200 python3 x.py")
     assert "preemptable" not in good.stderr, good.stderr
