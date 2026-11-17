@@ -49,6 +49,33 @@ commit; each is a numerics bug that a single-chip test never shows:
   total number of loss tokens, not a mean of per-rank means when ranks carry different token
   counts. With the gradient averaged over `dp` the update equals the single-replica one.
 
+## ttml traps that cost device time
+
+Each of these cost the reference bring-ups a device run and a debugging session; none of them is
+visible from the API's signature.
+
+- `ModuleBase::register_tensor` calls `set_requires_grad(true)` unconditionally, so a parameter
+  frozen before registration comes back trainable. Freeze immediately **after** registration and
+  assert the trainable count and that no frozen parameter has an initialised gradient.
+- `ttml.sync_gradients` iterates the parameters whose gradient is *initialised*, not those with
+  `requires_grad`. Pass the filtered trainable map explicitly; a stray frozen gradient would
+  otherwise be all-reduced in silence, and the freeze map's own check would not see it.
+- A replicated parameter under a sharded base (LoRA's A on a column-parallel projection) holds a
+  TP-partial gradient that nothing sums for you: `sync_gradients` deliberately excludes the `tp`
+  axis. Sum it in the module.
+- `ttnn.matmul` infers the result's tensor topology from the operands without accounting for
+  `transpose_a`, so a `dW` computed as `dY^T X` is labelled with `dY`'s shard dimension and gathers
+  on the wrong axis later. Restore the operand's topology on the result and let the gradient
+  harness confirm it; local values are correct, only the metadata is wrong, so only a gathered
+  comparison catches it.
+- A step that runs collectives on one axis and then on another can stall at the transition
+  (CCL semaphore pools carry no axis identity): the reference bring-up hung with most chips in a
+  DP reduce-scatter and the rest in the following all-gather. Complete the whole mesh before
+  changing the participant set, keep that synchronisation inside the step timing, and record it.
+- Host-side reads of a distributed tensor need a mesh composer or `Sharding.gather` with replica
+  verification; a raw `to_numpy` either fails or hands back one shard. Gathered shapes are checked
+  before any PCC number is accepted.
+
 ## Before accepting the first baseline
 
 Correctness-first includes removing avoidable work using existing capabilities. During implementation
