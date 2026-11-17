@@ -33,6 +33,10 @@ Hardware telemetry: `scripts/tt_telemetry_sampler.py` (pyluwen, 20 Hz per-chip c
 Entry point: [`skills/train-bringup/SKILL.md`](skills/train-bringup/SKILL.md). Requires
 `tt-autodebug` installed and enabled.
 
+Agents work only on non-`main` task branches and never modify local or remote `main` or write in
+its worktree. Apply [branch isolation](skills/train-bringup/SKILL.md#branch-isolation) before
+setup, dry runs and resumes; phase commits stay local and are never pushed.
+
 Also included, usable on its own without the phases above:
 
 - `tt-train-pr-review` — strict pre-merge review of tt-metal PRs that touch `tt-train/`: the

@@ -5,7 +5,7 @@ description: Use TT hardware safely during tt-metal training bring-up, tests, pr
 
 # TT Device Usage
 
-Before using this workflow, follow the dependency and environment setup in
+Before using this workflow, follow the branch isolation, dependency and environment setup in
 [the train-bringup entrypoint](../train-bringup/SKILL.md#startup).
 Resolve its package root from this installed skill's location; do not assume
 this plugin is copied into the target tt-metal checkout.
@@ -105,6 +105,9 @@ any of its chips while it runs.
 
 ## Repository Hygiene
 
+- Never touch local or remote `main` or write in a worktree checked out on `main`, including
+  build, test and profiler output. Follow the entrypoint's
+  [branch isolation](../train-bringup/SKILL.md#branch-isolation) before any such command.
 - Never `git add -u` or `git add -A` in a checkout with submodules: it stages a submodule pointer
   bump (the UMD submodule in the reference bring-up). Stage by path.
 - Every tracked evidence file stays under 500 KB (the pre-commit hook refuses larger): gzip CSVs,

@@ -10,6 +10,10 @@ This skill is distilled from the tt-train fused kernels and about 1,000 review c
 - **Scope.** It complements the generic `tenstorrent/skills` reviewers, which cover CB races, L1, precision and CCL (see `.github/workflows/tenstorrent-skills-reviewer.md`). This skill covers only what is specific to tt-train.
 - **Paths.** They are relative to `tt-train/sources/ttml/`. `#N` is a tt-metal PR you can read as precedent.
 - **Hardware.** tt-train is Blackhole-only, so never ask for Wormhole runs or argue from Wormhole limits.
+- **Branch safety.** Never touch local or remote `main` or write in its worktree. Follow
+  [branch isolation](../train-bringup/SKILL.md#branch-isolation) for review, baseline tests and
+  fixes, and pass it to every reviewer and skeptic. Inspect `main` through read-only Git
+  commands; run baseline tests on a separate non-`main` branch at the required commit.
 
 ## 1. Process
 

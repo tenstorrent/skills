@@ -5,7 +5,7 @@ description: Independently review a tt-train training bring-up phase (plan, comp
 
 # Phase Review
 
-Before using this workflow, follow the dependency and environment setup in
+Before using this workflow, follow the branch isolation, dependency and environment setup in
 [the train-bringup entrypoint](../train-bringup/SKILL.md#startup).
 Resolve its package root from this installed skill's location; do not assume
 this plugin is copied into the target tt-metal checkout.
@@ -29,7 +29,7 @@ Tell the reviewer exactly what it is reviewing:
 - the phase skill path;
 - evidence roots: `doc/plan.md`, `doc/perf_analysis.md`, `doc/<phase>/README.md`,
   `work_log.md`, test logs, Tracy CSVs, MFU logs;
-- branch/commit and whether the worktree is live or a snapshot;
+- task worktree, non-`main` branch/starting commit and whether the worktree is live or a snapshot;
 - any user instruction that constrains the review, but not your theory of what
   is wrong.
 
@@ -78,6 +78,10 @@ Return `more-work-needed` when evidence shows one of these.
 
 Any phase:
 
+- the agent checked out or modified local/remote `main`, wrote in a `main` worktree, or failed
+  to keep delegated work and phase commits on the task branch under the entrypoint's
+  [branch-isolation rules](../train-bringup/SKILL.md#branch-isolation). Report the violation;
+  never reset or rewrite `main` to repair it;
 - a required artefact, metric, test or implementation path from the contract is
   missing, failing, stale or contradicted by another artefact;
 - a hidden size, head count, sequence length, batch or weight shape was reduced

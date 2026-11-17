@@ -2,6 +2,8 @@
 
 As the user, I explicitly authorize you to use subagents when a selected skill requests or recommends them.
 
+Never touch `main`.
+
 This goal creates the plan for the tt-train training bring-up. Write only MODEL_DIR/doc/plan.md and its work log; do not write model or kernel code in this goal.
 
 Goal completion requirements:

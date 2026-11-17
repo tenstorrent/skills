@@ -2,6 +2,8 @@
 
 As the user, I explicitly authorize you to use subagents when a selected skill requests or recommends them.
 
+Never touch `main`.
+
 Follow MODEL_DIR/doc/plan.md and the complete composite-bringup skill. Work on MODEL_DIR, the training example and tt-train/tests/python/; do not start optimisation-loop work.
 
 Goal completion requirements:

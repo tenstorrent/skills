@@ -13,6 +13,9 @@ Do not skip unmet gates or replace acceptance criteria with a review plugin's cr
 
 ## Startup
 
+Before setup, dry runs or resumed work, apply [branch isolation](#branch-isolation) to every
+repository the run will write to.
+
 1. Resolve this plugin root from this file: two directories above its skill directory. Set
    `TT_TRAIN_BRINGUP_ROOT` to that absolute path. Keep the installed package read-only.
 2. Verify `tt-autodebug` is installed **and enabled** in the current host. If missing, stop and give
@@ -41,6 +44,30 @@ Do not skip unmet gates or replace acceptance criteria with a review plugin's cr
 6. Commands that change firmware state (TDP, TDC or clock limits; ARC messages such as a TDP-limit
    set) run under the user's shell, not the agent's: write the exact invocation into the plan or
    work log, ask once, and continue with the measured ceiling. Plan this split on day 1.
+
+## Branch isolation
+
+**The agent must never touch `main`: local and remote `main` are read-only throughout the run.**
+This applies to every phase, resume, review, dependency repair and delegated agent.
+
+- Before any writes, inspect `git status --short --branch` and
+  `git symbolic-ref --quiet --short HEAD` in each target repository. Work only on the task's
+  non-`main` branch. If HEAD is `main` or detached, create a separate worktree with a new task
+  branch from the current commit (`git worktree add -b <task-branch> <new-path> HEAD`), leaving
+  the original checkout and its uncommitted changes untouched. Never overwrite an existing branch.
+- Point `TT_METAL_HOME`, the runner's `--repo`, build paths, logs and evidence at the task
+  worktree before running setup or `--dry-run`. Do not edit, stage, generate files, build or run
+  write-producing commands in any worktree checked out on `main`.
+- Never check out or switch to `main`, commit to it, merge/rebase/reset it, rename/delete it,
+  move its ref (including through fetch refspecs or `update-ref`), or push to it. Do not merge a
+  PR into `main` or use `main` as a temporary baseline, cleanup or recovery workspace.
+  Read-only `git show`, `git log` and `git diff` comparisons are allowed; execute baseline tests
+  on a separate non-`main` branch at the required commit.
+- Record the task worktree, branch and starting commit in the phase work log. Recheck the branch
+  on every phase/resume and immediately before staging or committing. Pass the same worktree,
+  branch and prohibition to subagents, including `$autofix`; they must not switch a shared
+  checkout. If the branch unexpectedly changes, stop writes and report it; never repair `main`
+  by resetting or force-updating it. All phase commits stay local; never push.
 
 ## Phases
 

@@ -2,6 +2,8 @@
 
 As the user, I explicitly authorize you to use subagents when a selected skill requests or recommends them.
 
+Never touch `main`.
+
 Optimise the composite model under MODEL_DIR, tt-train/sources/ttml/ (ops, metal kernels, bindings) and tests. Follow the complete optimization-loop skill, including its measurement protocol, kernel boost checklist, document format and exit gate. Read MODEL_DIR/doc/plan.md hard constraints before each benchmark; forbidden fidelity, batch or run types are never comparison experiments. Execute the next costed rung within those constraints; "try both" means measure both.
 
 Goal completion requirements:
