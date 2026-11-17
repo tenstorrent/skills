@@ -12,6 +12,7 @@ WORKER_NOTIFY = "decisions, reviews, merges, funds, outages"
 # Every runtime call that posts kind='alert': (file, function) -> one (class, why) per call site, in
 # source order. A new site, or one more in a listed function, fails test_every_alert_post_site_is_classed.
 ALERT_SITES = {
+    ("msgurgent.py", "tick"): [("decisions", "an urgent message still unanswered a second deadline after its late notice: the user's own message went unanswered, once per message")],
     ("settinghold.py", "propose"): [("decisions", "one low proposal per setting state naming the setting, the blocked tasks and the change that unblocks them")],
     ("chartertemplate.py", "alert"): [("decisions", "a charter Restrictions item the user ordered was refused; once per item and cause, cleared when it lands")],
     ("coordinator.py", "apply"): [

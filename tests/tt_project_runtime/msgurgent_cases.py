@@ -10,14 +10,14 @@ def _urgent_project(env, tag="[authored by AI]"):
     return p
 
 
-def _inbound(p, text, chat="c1", ts=None, **kw):
+def _urg_inbound(p, text, chat="c1", ts=None, **kw):
     mid = p.db.post("in", text, chat=chat, provenance="cli-legacy", **kw)
     if ts is not None:
         p.db.x("UPDATE messages SET ts=? WHERE id=?", (ts, mid))
     return mid
 
 
-def _outs(p, kind=None):
+def _urg_outs(p, kind=None):
     rows = p.db.q("SELECT * FROM messages WHERE direction='out' ORDER BY id")
     return [r for r in rows if kind is None or r["kind"] == kind]
 
@@ -27,10 +27,10 @@ def test_an_urgent_message_is_acked_within_a_minute_naming_the_owner_and_the_fir
     p = _urgent_project(env)
     tid = p.db.add_task("stream fix", "s", kind="code", origin="user")
     now = time.time()
-    _inbound(p, f"urgent: the live stream is down, see #{tid}", ts=now)
+    _urg_inbound(p, f"urgent: the live stream is down, see #{tid}", ts=now)
     out = msgurgent.tick(p, p.config(), now=now + 5)
     assert out and out[0].startswith("ack")
-    ack = _outs(p, "urgent_ack")
+    ack = _urg_outs(p, "urgent_ack")
     assert len(ack) == 1 and ack[0]["chat"] == "c1"
     t = ack[0]["text"]
     assert "coordinator" in t and f"#{tid}" in t, t
@@ -39,20 +39,20 @@ def test_an_urgent_message_is_acked_within_a_minute_naming_the_owner_and_the_fir
     assert t.endswith("[authored by AI]"), t
     assert ack[0]["ts"] - now < 60
     assert msgurgent.tick(p, p.config(), now=now + 10) == [], "the ack is posted once"
-    assert len(_outs(p, "urgent_ack")) == 1
+    assert len(_urg_outs(p, "urgent_ack")) == 1
 
 
 def test_a_late_notice_fires_once_reaches_the_senders_chat_and_wakes_the_coordinator(env):
     from ttp import msgurgent, mustact
     p = _urgent_project(env)
     now = time.time()
-    mid = _inbound(p, "urgent: nothing works", ts=now)
+    mid = _urg_inbound(p, "urgent: nothing works", ts=now)
     seen = []
     msgurgent.tick(p, p.config(), now=now + 1, steer=lambda t, k: seen.append((t, k)))
-    assert not seen and not _outs(p, "urgent_late")
+    assert not seen and not _urg_outs(p, "urgent_late")
     out = msgurgent.tick(p, p.config(), now=now + 301, steer=lambda t, k: seen.append((t, k)))
     assert f"late {mid}" in out
-    late = _outs(p, "urgent_late")
+    late = _urg_outs(p, "urgent_late")
     assert len(late) == 1 and late[0]["chat"] == "c1" and late[0]["severity"] == "high"
     assert "next check" in late[0]["text"] and late[0]["text"].endswith("[authored by AI]")
     assert len(seen) == 1 and seen[0][1] == f"urgent-late-{mid}" and "first finding" in seen[0][0]
@@ -60,23 +60,23 @@ def test_a_late_notice_fires_once_reaches_the_senders_chat_and_wakes_the_coordin
     assert len(ev) == 1 and ev[0]["severity"] == "high"
     assert mustact.item(ev[0])["chat"] == "c1" and msgurgent.EVENT_KIND in mustact.KINDS
     assert msgurgent.tick(p, p.config(), now=now + 302, steer=lambda t, k: seen.append((t, k))) == []
-    assert len(_outs(p, "urgent_late")) == 1 and len(seen) == 1
+    assert len(_urg_outs(p, "urgent_late")) == 1 and len(seen) == 1
 
 
 def test_a_second_miss_notifies_the_user_at_high_once(env):
     from ttp import msgurgent
     p = _urgent_project(env)
     now = time.time()
-    mid = _inbound(p, "urgent: help", ts=now)
+    mid = _urg_inbound(p, "urgent: help", ts=now)
     msgurgent.tick(p, p.config(), now=now + 1)
     msgurgent.tick(p, p.config(), now=now + 301)
-    assert not _outs(p, "alert")
+    assert not _urg_outs(p, "alert")
     out = msgurgent.tick(p, p.config(), now=now + 601)
     assert f"escalated {mid}" in out
-    al = _outs(p, "alert")
+    al = _urg_outs(p, "alert")
     assert len(al) == 1 and al[0]["severity"] == "high" and al[0]["chat"] is None
     assert msgurgent.tick(p, p.config(), now=now + 900) == []
-    assert len(_outs(p, "alert")) == 1
+    assert len(_urg_outs(p, "alert")) == 1
 
 
 def test_the_deadlines_survive_a_daemon_restart_and_fire_once(env):
@@ -84,9 +84,9 @@ def test_the_deadlines_survive_a_daemon_restart_and_fire_once(env):
     from ttp.project import Project
     p = _urgent_project(env)
     now = time.time()
-    mid = _inbound(p, "urgent: the live stream is down", ts=now)
+    mid = _urg_inbound(p, "urgent: the live stream is down", ts=now)
     msgurgent.tick(p, p.config(), now=now + 2)
-    assert len(_outs(p, "urgent_ack")) == 1
+    assert len(_urg_outs(p, "urgent_ack")) == 1
     p2 = Project(p.base)
     p2.db.ai_tag = "[authored by AI]"
     rec = msgurgent.records(p2.db)[str(mid)]
@@ -95,15 +95,15 @@ def test_the_deadlines_survive_a_daemon_restart_and_fire_once(env):
     assert f"late {mid}" in msgurgent.tick(p2, p2.config(), now=now + 301)
     p3 = Project(p.base)
     assert msgurgent.tick(p3, p3.config(), now=now + 302) == [], "no second late notice after a restart"
-    assert len(_outs(p3, "urgent_ack")) == 1 and len(_outs(p3, "urgent_late")) == 1
+    assert len(_urg_outs(p3, "urgent_ack")) == 1 and len(_urg_outs(p3, "urgent_late")) == 1
 
 
 def test_the_coordinators_first_reply_closes_the_deadline(env):
     from ttp import msgurgent
     p = _urgent_project(env)
     now = time.time()
-    _inbound(p, "urgent: broken", ts=now)
-    _inbound(p, "urgent: also broken", chat="c2", ts=now)
+    _urg_inbound(p, "urgent: broken", ts=now)
+    _urg_inbound(p, "urgent: also broken", chat="c2", ts=now)
     msgurgent.tick(p, p.config(), now=now + 1)
     p.db.post("out", "digest line", chat="c1", kind="digest")
     p.db.post("out", "it is fixed", chat="c2", kind="reply")
@@ -111,7 +111,7 @@ def test_the_coordinators_first_reply_closes_the_deadline(env):
     assert [r["chat"] for r in msgurgent.open_for_chat(p.db, None)] == ["c1"], "only c2 was answered"
     p.db.post("out", "first finding", chat="c1", kind="reply")
     assert msgurgent.tick(p, p.config(), now=now + 900) == []
-    assert not msgurgent.pending(p.db) and len(_outs(p, "alert")) == 0
+    assert not msgurgent.pending(p.db) and len(_urg_outs(p, "alert")) == 0
 
 
 def test_a_non_urgent_message_behaves_as_before(env):
@@ -120,10 +120,10 @@ def test_a_non_urgent_message_behaves_as_before(env):
     now = time.time()
     for text in ("please add a docs page about caching", "this is not urgent, whenever you can",
                  "the build is failing for a branch nobody uses"):
-        _inbound(p, text, ts=now)
+        _urg_inbound(p, text, ts=now)
     assert msgurgent.tick(p, p.config(), now=now + 1) == []
     assert msgurgent.tick(p, p.config(), now=now + 400) == []
-    assert not _outs(p) and not msgurgent.records(p.db)
+    assert not _urg_outs(p) and not msgurgent.records(p.db)
     assert not p.db.q("SELECT 1 FROM events WHERE kind=?", (msgurgent.EVENT_KIND,))
 
 
@@ -131,12 +131,12 @@ def test_a_classifier_false_positive_gives_only_an_ack(env):
     from ttp import msgurgent
     p = _urgent_project(env)
     now = time.time()
-    _inbound(p, "the users page of the web app crashed in a test, I think", ts=now)
+    _urg_inbound(p, "the users page of the web app crashed in a test, I think", ts=now)
     msgurgent.tick(p, p.config(), now=now + 1)
-    assert len(_outs(p)) == 1 and _outs(p)[0]["kind"] == "urgent_ack"
+    assert len(_urg_outs(p)) == 1 and _urg_outs(p)[0]["kind"] == "urgent_ack"
     p.db.post("out", "looked: a test fixture, nothing live", chat="c1", kind="reply")
     assert msgurgent.tick(p, p.config(), now=now + 600) == []
-    assert [r["kind"] for r in _outs(p)] == ["urgent_ack", "reply"] and not msgurgent.pending(p.db)
+    assert [r["kind"] for r in _urg_outs(p)] == ["urgent_ack", "reply"] and not msgurgent.pending(p.db)
 
 
 @pytest.mark.parametrize("text,urgent", [
@@ -165,8 +165,8 @@ def test_a_backlog_older_than_the_stale_window_is_not_acked(env):
     from ttp import msgurgent
     p = _urgent_project(env)
     now = time.time()
-    _inbound(p, "urgent: old news", ts=now - 3600)
-    assert msgurgent.tick(p, p.config(), now=now) == [] and not _outs(p)
+    _urg_inbound(p, "urgent: old news", ts=now - 3600)
+    assert msgurgent.tick(p, p.config(), now=now) == [] and not _urg_outs(p)
 
 
 def test_ttp_say_urgent_marks_the_message(env, monkeypatch, capsys):
@@ -189,10 +189,10 @@ def test_urgent_reply_is_the_coordinators_and_needs_an_open_urgent_message(env, 
     with pytest.raises(SystemExit):
         cli.main(["urgent-reply", "c1", "finding"])   # nothing urgent is open
     now = time.time()
-    _inbound(p, "urgent: down", ts=now)
+    _urg_inbound(p, "urgent: down", ts=now)
     msgurgent.tick(p, p.config(), now=now + 1)
     cli.main(["urgent-reply", "c1", "Found it: the encoder died; restarting it now, next check 14:40 PST."])
-    assert [r["kind"] for r in _outs(p)][-1] == "reply"
+    assert [r["kind"] for r in _urg_outs(p)][-1] == "reply"
     assert msgurgent.tick(p, p.config(), now=now + 400) == [] and not msgurgent.pending(p.db)
 
 
@@ -200,7 +200,7 @@ def test_the_must_act_block_names_the_late_urgent_message(env):
     from ttp import msgurgent, mustact
     p = _urgent_project(env)
     now = time.time()
-    mid = _inbound(p, "urgent: down", ts=now)
+    mid = _urg_inbound(p, "urgent: down", ts=now)
     msgurgent.tick(p, p.config(), now=now + 1)
     msgurgent.tick(p, p.config(), now=now + 301)
     ids = [r["id"] for r in p.db.q("SELECT id FROM events WHERE kind=?", (msgurgent.EVENT_KIND,))]
@@ -218,10 +218,10 @@ def test_the_daemon_step_acks_and_reaches_a_running_coordinator_turn(env):
     d = dm.Daemon(p.base)
     d.p.db.ai_tag = "[authored by AI]"
     now = time.time()
-    _inbound(d.p, "urgent: the live stream is down", ts=now - 400)
+    _urg_inbound(d.p, "urgent: the live stream is down", ts=now - 400)
     p.db.set_kv("urgent_msg_cursor", 0)
     d.cfg = {**d.cfg, "urgent_msg": {"stale_s": 10_000}}
     d.watch_urgent_messages()
-    assert len(_outs(d.p, "urgent_ack")) == 1
-    assert len(_outs(d.p, "urgent_late")) == 1, "past its first-finding deadline on arrival of the scan"
+    assert len(_urg_outs(d.p, "urgent_ack")) == 1
+    assert len(_urg_outs(d.p, "urgent_late")) == 1, "past its first-finding deadline on arrival of the scan"
     assert "first finding" in (run / "steer.md").read_text()

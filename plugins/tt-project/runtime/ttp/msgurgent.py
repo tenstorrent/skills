@@ -128,10 +128,6 @@ def ack_text(p, rec: dict) -> str:
             f"here with the next check time.")
 
 
-def _post(db, text, **kw) -> int:
-    return db.post("out", text, **kw)
-
-
 def _tagged(db, text: str) -> str:
     tag = getattr(db, "ai_tag", "") or ""
     return f"{text} {tag}" if tag else text
@@ -191,7 +187,7 @@ def tick(p, cfg: dict | None, now: float | None = None, steer=None) -> list[str]
                 rec["acked"] = now   # answered before the ack: the answer is the ack
             continue
         if rec.get("acked") is None:
-            _post(db, ack_text(p, rec), chat=rec["chat"], kind=ACK_KIND, severity="normal", keep_tag=True)
+            db.post("out", ack_text(p, rec), chat=rec["chat"], kind="urgent_ack", severity="normal", keep_tag=True)
             rec["acked"] = now
             changed = True
             out.append(f"ack {key}")
@@ -204,7 +200,7 @@ def tick(p, cfg: dict | None, now: float | None = None, steer=None) -> list[str]
             rec["escalated"] = now
             changed = True
             out.append(f"escalated {key}")
-            _post(db, f"Urgent message #{rec['mid']} in chat {rec['chat'] or 'all'} still has no reply after "
+            db.post("out", f"Urgent message #{rec['mid']} in chat {rec['chat'] or 'all'} still has no reply after "
                       f"{int((now - rec['ts']) // 60)} min (received {timefmt.short(rec['ts'], p, now)}). The "
                       f"coordinator was woken for it at {timefmt.short(rec['late'], p, now)}.",
                   chat=None, kind="alert", severity="high")
@@ -215,10 +211,10 @@ def tick(p, cfg: dict | None, now: float | None = None, steer=None) -> list[str]
 
 def _late(p, db, rec: dict, c: dict, now: float, steer) -> None:
     nxt = now + float(c["second_s"])
-    _post(db, _tagged(db, f"Your urgent message from {timefmt.short(rec['ts'], p, now)} has no finding yet (due "
+    db.post("out", _tagged(db, f"Your urgent message from {timefmt.short(rec['ts'], p, now)} has no finding yet (due "
                           f"{timefmt.short(rec['find_due'], p, now)}). The coordinator has been woken for it; next "
                           f"check {timefmt.short(nxt, p, now)}."),
-          chat=rec["chat"], kind=LATE_KIND, severity="high", keep_tag=True)
+          chat=rec["chat"], kind="urgent_late", severity="high", keep_tag=True)
     text = (f"Urgent message #{rec['mid']} in chat {rec['chat'] or 'all'} got no finding by "
             f"{timefmt.short(rec['find_due'], p, now)} ({rec['why']}). Post the first finding in that chat now "
             f"(`ttp urgent-reply`, or a reply action), with times.")
