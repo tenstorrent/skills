@@ -1965,7 +1965,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
     except Exception:
         blk = {}
     for tid, r in rows.items():
-        if tid in blk:
+        if tid in blk and blk[tid]["waited_s"] >= 60 and blk[tid]["step"] != "queue":   # a plain queue wait is already in the row
             r["what"].append(landings.blocking_words(blk[tid]))
         lines.append(f"  #{tid} {'; '.join(r['what'])}: {r['title']}" + (f" — {'; '.join(r['why'])}" if r["why"] else ""))
         lines += r["extra"]
@@ -15382,7 +15382,7 @@ COMMAND_GROUPS = (
     ("admin", ("setup", "upgrade", "start", "stop", "restart", "adopt", "prune", "secret", "consent",
                "notifier", "schedules", "heal", "upstream", "lease", "replicate", "check-plan", "stats", "audit",
                "push-audit", "ttr", "selfchange", "spend-today", "throughput", "model-trip", "echoes", "course",
-               "uninstall", "bench", "model-bench", "model", "waste", "bridge", "gh-queue", "move")),
+               "uninstall", "bench", "model-bench", "model", "waste", "bridge", "gh-queue", "move", "landings")),
 )
 
 

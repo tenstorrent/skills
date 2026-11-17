@@ -755,7 +755,9 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
             from . import etaledger, landings
             out += landings.audit_lines(db, now)
             etaledger.refresh(db, p, now)
-            out.append(etaledger.line(etaledger.calibration(db, now, etaledger.cfg(p))))
+            cal = etaledger.calibration(db, now, etaledger.cfg(p))
+            if cal.get("count"):   # no delivered ETA yet is nothing to grade, not a line
+                out.append(etaledger.line(cal))
         except Exception:   # an unreadable record: the review goes on without these lines
             pass
     return out or [NOTHING]
