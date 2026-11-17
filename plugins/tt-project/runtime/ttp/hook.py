@@ -1376,7 +1376,10 @@ def pre_tool_use(payload: dict, stage: str = "before") -> tuple[dict | None, Non
 
 
 def _pre_tool_use(payload: dict) -> tuple[dict | None, None]:
-    from . import pathguard, untrusted
+    from . import glmguard, pathguard, untrusted
+    if glmguard.active() and (why := glmguard.tool_refusal(payload)):
+        glmguard.hit(os.environ.get("TTP_RUN_DIR"), why)   # the run ends as a hand-back to Opus (no model call)
+        return _deny(f"{why}; the run ends and its task goes back to Opus"), None
     if why := _provenance(untrusted.mark_refusal(str(payload.get("tool_name") or ""), payload.get("tool_input") or {})):
         return _deny(why), None   # the run's untrusted-input mark, marked or not
     if why := pathguard.refusal(payload):   # a write into a credential folder, on any tool

@@ -60,7 +60,7 @@ import time
 import traceback
 from pathlib import Path
 
-from . import loopproxy, poll_s, project, serverhealth
+from . import glmguard, loopproxy, poll_s, project, serverhealth
 from .project import Project, durable_write, lower_priority
 
 LEASE_EVERY_S = 30
@@ -829,6 +829,8 @@ def supervise(run_dir: Path) -> int:
             why = stop_reason(run_dir)
             if why:
                 threading.Thread(target=stop, args=(why,), daemon=True).start()
+            elif glmguard.hit_reason(run_dir):   # a run on the GLM arm tried a refused side effect: ended, bounced to Opus
+                threading.Thread(target=stop, args=("glm_guard",), daemon=True).start()
 
         errors = 0
         while child.poll() is None:

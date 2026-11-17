@@ -17337,6 +17337,7 @@ def main(argv: list[str] | None = None) -> None:
         sys.argv[1:] if argv is None else list(argv)))))))))
     dry_run_stub(a)
     blind_gate(a)
+    glm_gate(a)
     try:
         _recover_setup()     # a `ttp setup` a reboot cut short: finished or rolled back before anything else
     except Exception as e:
@@ -17356,6 +17357,20 @@ def blind_gate(a) -> None:
         why = blindreview.refusal(fn, str(getattr(a, "action", "") or ""))
         if why:
             die(f"refused: {why}", 2)
+
+
+def glm_gate(a) -> None:
+    """A run on the code arm's GLM side (glmguard) runs only the commands the guard allows; a refused one ends
+    the run as a hand-back to Opus (glmguard.hit), and exits 2."""
+    from . import glmguard
+    if not glmguard.active():
+        return
+    cmd = str(getattr(a, "cmd", "") or "")
+    action = str(getattr(a, "action", "") or getattr(a, "op", "") or "")
+    why = glmguard.cli_refusal(cmd, action)
+    if why:
+        glmguard.hit(os.environ.get("TTP_RUN_DIR"), why)
+        die(f"refused: {why}", 2)
 
 
 def dry_run_stub(a) -> None:

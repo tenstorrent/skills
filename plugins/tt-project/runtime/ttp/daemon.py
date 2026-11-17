@@ -40,6 +40,7 @@ from . import runtimeload   # first of its own: its LOADED_AT is when the daemon
 from . import blindreview
 from . import rolerestore
 from . import codearm
+from . import glmguard
 from . import deviceab
 from . import deviceshadow
 from . import batchrun
@@ -4374,6 +4375,8 @@ class Daemon:
                             prompt = append_system + "\n\n" + prompt
             argv = _before_stdin(argv, resume_extra)
             (run_dir / "prompt.md").write_text(prompt)
+            if glmguard.env_for(note):   # a run on the code arm's GLM side: guarded even where its variable is unset
+                glmguard.mark(run_dir)
             if task and role in ctxfork.ROLES:   # restated after each compaction (rolerestore.py)
                 rolerestore.write(run_dir, role, task, self.p.name)
             if stdin is not None:   # what the agent reads; prompt.md stays the readable digest
@@ -4386,6 +4389,7 @@ class Daemon:
             env = {**env, **venv_vars, **tmp_env, "TTP_RUN_DIR": str(run_dir), "TTP_PROJECT": str(self.p.base),
                    "TTP_RUN_ID": str(run_id), **task_env(task["id"] if task else ""), "PYTHONPATH": runtime_dir,
                    **blindreview.env(task),   # a blind review's `ttp` masks the model (every provider)
+                   **glmguard.env_for(note),  # a run on the code arm's GLM side runs under glmguard (every provider)
                    **({"TTP_LEASE_EPOCH": str(self._lease.epoch)} if self._lease else {}),
                    "TTP_PYTHON": sys.executable,   # `ttp` runs under this, not the venv's python3
                    "TTP_SANDBOX_CHECKS": os.environ.get("TTP_SANDBOX_CHECKS", "0"),   # sandbox.opted_in

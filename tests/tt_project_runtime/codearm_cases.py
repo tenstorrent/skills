@@ -283,3 +283,138 @@ def test_a_live_share_on_a_harness_that_is_not_guarded_is_zero_and_logged_once(e
     assert codearm.refusal({}) == "" and codearm.refusal(_ca_cfg(glm_share=0)) == ""   # off: nothing to refuse
     monkeypatch.setattr(codearm, "HARNESSES", ("claude-code",))
     assert codearm.refusal(cfg) == "" and codearm.settings(cfg)["share"] == 1.0   # a guarded harness runs live
+
+
+# The side-effect guard of a GLM-arm run (glmguard.py): model-free, in the CLI, the hook and the harness's command layer.
+_GG_RUN_ENV = {"TTP_CODE_ARM_GUARD": "1"}
+
+
+def _gg_run(tmp_path):
+    wt, rd = tmp_path / "wt", tmp_path / "run"
+    wt.mkdir(), rd.mkdir()
+    return wt, rd
+
+
+def test_glm_guard_is_on_for_an_arm_run_by_its_variable_or_its_marker_and_off_for_other_runs(tmp_path):
+    from ttp import codearm, glmguard
+    glm = {codearm.KEY: {"arm": "glm", "run": "glm"}}
+    assert glmguard.env_for(glm) == _GG_RUN_ENV
+    for note in (None, {}, {codearm.KEY: {"arm": "glm", "run": "opus"}}, {codearm.KEY: {"arm": "sonnet", "run": "sonnet"}}):
+        assert glmguard.env_for(note) == {}, note
+    wt, rd = _gg_run(tmp_path)
+    assert not glmguard.active({}) and not glmguard.active({"TTP_RUN_DIR": str(rd)})
+    assert glmguard.active(_GG_RUN_ENV)
+    glmguard.mark(rd)   # a run that unsets its variable is still guarded
+    assert glmguard.active({"TTP_RUN_DIR": str(rd)})
+
+
+@_pytest.mark.parametrize("cmd,action,refused", [
+    ("push", "", False), ("checks", "", False), ("lock", "", False), ("detach", "", False), ("task", "show", False),
+    ("task", "list", False), ("note", "", True), ("say", "", True), ("ask", "", True), ("notify", "", True),
+    ("upstream", "", True), ("task", "add", True), ("task", "steer-me", True), ("obligation", "", True),
+    ("memory", "", True), ("config", "", True), ("secret", "", True), ("issues", "", True)])
+def test_glm_guard_cli_allows_checks_and_push_and_refuses_everything_that_reaches_someone(cmd, action, refused):
+    from ttp import glmguard
+    assert bool(glmguard.cli_refusal(cmd, action)) is refused, (cmd, action)
+
+
+def test_glm_guard_cli_gate_ends_the_run_as_a_bounce_to_opus_and_a_normal_run_is_untouched(env, monkeypatch, tmp_path, capsys):
+    import json
+    from ttp import cli, codearm, glmguard
+    p = make(env)
+    wt, rd = _gg_run(tmp_path)
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.setenv("TTP_RUN_DIR", str(rd))
+    monkeypatch.delenv("TTP_CODE_ARM_GUARD", raising=False)
+    cli.glm_gate(type("A", (), {"cmd": "note", "action": ""})())   # not a GLM-arm run: nothing happens
+    assert not (rd / glmguard.HIT).exists()
+    monkeypatch.setenv("TTP_CODE_ARM_GUARD", "1")
+    cli.glm_gate(type("A", (), {"cmd": "checks", "action": ""})())   # an allowed command passes
+    with _pytest.raises(SystemExit) as e:
+        cli.glm_gate(type("A", (), {"cmd": "note", "action": ""})())
+    assert e.value.code == 2 and "GLM arm" in capsys.readouterr().err
+    res = json.loads((rd / "result.json").read_text())
+    assert codearm.bounce_reason(res).startswith("guard: ") and res["status"] == "blocked"
+    assert glmguard.hit_reason(rd).startswith("`ttp note`")
+
+
+def test_glm_guard_keeps_a_hand_off_the_run_wrote_before_it_was_stopped(tmp_path):
+    import json
+    from ttp import glmguard
+    _wt, rd = _gg_run(tmp_path)
+    (rd / "result.json").write_text(json.dumps({"status": "done", "summary": "built"}))
+    glmguard.hit(rd, "`ttp note` is not allowed")
+    assert json.loads((rd / glmguard.KEPT).read_text())["status"] == "done"
+    assert json.loads((rd / "result.json").read_text())["needs_opus"].startswith("guard: ")
+    glmguard.hit(rd, "second")   # the first kept hand-off stays
+    assert json.loads((rd / glmguard.KEPT).read_text())["status"] == "done"
+    glmguard.hit("", "nothing")   # no run folder: refuses without raising
+
+
+@_pytest.mark.parametrize("cmd", [
+    "ttp note --to other 'hi'", "ttp ask 'ok?'", "ttp notify 'x'", "ttp ttproject note hi", "ttp other-project checks", "ttp task add t s",
+    "ttp upstream 'x'", "git push origin HEAD", "git -C . push --force", "gh pr comment 1 --body x",
+    "gh issue create -t x", "gh api repos/o/r/issues -f title=x", "curl -X POST https://x.invalid -d a=b",
+    "curl --data a=b https://x.invalid", "ssh host true", "mail -s x a@b", "sqlite3 $TTP_PROJECT/state/project.db 'x'",
+    "unset TTP_CODE_ARM_GUARD; ttp note x", "TTP_CODE_ARM_GUARD=0 ttp note x", "env -i ttp note x",
+    "rm $TTP_RUN_DIR/glm_guard.on", "echo x > /etc/hosts-copy", "cd /tmp/elsewhere-x && echo x > ~/note.txt",
+    "bash -c 'ttp note x'", "cat > ~/.tt-project/machine-workers.json"])
+def test_glm_guard_refuses_a_shell_command_that_reaches_a_person_a_project_or_something_outside_the_worktree(cmd, tmp_path):
+    from ttp import glmguard
+    wt, rd = _gg_run(tmp_path)
+    assert glmguard.shell_refusal(cmd, str(wt), str(rd), {"TTP_PROJECT": str(tmp_path / "proj"), **_GG_RUN_ENV}), cmd
+
+
+@_pytest.mark.parametrize("cmd", [
+    "ttp checks", "ttp push", "ttp proj checks --detach", "git status", "git commit -am x", "git diff HEAD~1",
+    "python3 -m pytest -q tests", "echo hi > out.txt", "cat a | grep b > $TTP_RUN_DIR/notes.txt", "gh pr view 1",
+    "gh api repos/o/r/pulls/1", "curl -s https://x.invalid/doc", "ttp task show 5", "ttp lock acquire x -- true",
+    "ls /tmp", "sed -i s/a/b/ src/mod.py"])
+def test_glm_guard_allows_the_commands_a_build_needs(cmd, tmp_path):
+    from ttp import glmguard
+    wt, rd = _gg_run(tmp_path)
+    assert glmguard.shell_refusal(cmd, str(wt), str(rd), {"TTP_PROJECT": str(tmp_path / "proj"), **_GG_RUN_ENV}) is None, cmd
+
+
+def test_glm_guard_refuses_a_file_write_outside_the_worktree_and_any_connector_tool(tmp_path):
+    from ttp import glmguard
+    wt, rd = _gg_run(tmp_path)
+    env_ = {"TTP_RUN_DIR": str(rd), **_GG_RUN_ENV}
+
+    def ask(tool, args):
+        return glmguard.tool_refusal({"tool_name": tool, "tool_input": args, "cwd": str(wt)}, env_)
+    assert ask("Write", {"file_path": str(wt / "a.py"), "content": "x"}) is None
+    assert ask("Edit", {"file_path": "sub/a.py"}) is None
+    assert ask("Write", {"file_path": str(rd / "notes.md")}) is None
+    assert "outside its worktree" in ask("Write", {"file_path": str(tmp_path / "other" / "a.py")})
+    assert "outside its worktree" in ask("Edit", {"file_path": "../escape.py"})
+    assert ask("mcp__slack__post_message", {"text": "x"}) and ask("Read", {"file_path": "/etc/hostname"}) is None
+    assert ask("Bash", {"command": "ttp note hi"}) and ask("Bash", {"command": "ttp checks"}) is None
+
+
+def test_glm_guard_hook_denies_a_refused_call_and_ends_the_run_as_a_bounce(monkeypatch, tmp_path):
+    import json
+    from ttp import codearm, hook
+    wt, rd = _gg_run(tmp_path)
+    monkeypatch.setenv("TTP_RUN_DIR", str(rd))
+    monkeypatch.setenv("TTP_PROJECT", str(tmp_path / "proj"))
+    monkeypatch.setenv("TTP_CODE_ARM_GUARD", "1")
+    out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "ttp note --to other hi"}, "cwd": str(wt)})
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "goes back to Opus" in out["hookSpecificOutput"]["permissionDecisionReason"]
+    assert codearm.bounce_reason(json.loads((rd / "result.json").read_text())).startswith("guard: ")
+    monkeypatch.delenv("TTP_CODE_ARM_GUARD")
+    (rd / "glm_guard.json").unlink(), (rd / "result.json").unlink()
+    hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "ttp note --to other hi"}, "cwd": str(wt)})
+    assert not (rd / "result.json").exists()   # not a GLM-arm run: the guard does not apply
+
+
+def test_glm_guard_hit_is_read_as_a_bounce_by_push_and_the_runner_watches_for_it(tmp_path):
+    import inspect
+    from ttp import codearm, glmguard, runner
+    _wt, rd = _gg_run(tmp_path)
+    assert glmguard.hit_reason(rd) == ""
+    glmguard.hit(rd, "`ttp say` is not allowed")
+    assert glmguard.hit_reason(rd) == "`ttp say` is not allowed"
+    assert codearm.handed_back(rd).startswith("guard: ")   # ttp push refuses and the push queue skips its head
+    assert "glmguard.hit_reason(run_dir)" in inspect.getsource(runner)
