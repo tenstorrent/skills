@@ -16,6 +16,9 @@ model-free command schedule or pre-step writing files you read.
    (`gap_within_60m`); a fall of only the after->1h rate, or of the overall rate while the
    within-1h rate holds, is sparse turns outliving the 1 h cache, not a regression: no friction task.
 3. Quality: failures, retries, flaky areas, slop or duplication introduced, architecture drift.
+   Slop is measured: quote `ttp slop <project>` per subsystem (duplicates, globals, magic numbers,
+   long functions, comment noise) against its targets, and the last de-slop pass's task and numbers
+   when `deslop.enabled` is on; a subsystem over target with no refactor queued is a friction item.
    Count reviews that asked for changes (`changes_needed`) apart from failures: those reviews worked.
 4. Harness friction: where the user was needed, where the coordinator mis-planned, slow loops.
    Unblocking quality: if this spec ends with `Unblocking quality` lines, report them in one short

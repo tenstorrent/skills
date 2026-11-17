@@ -154,6 +154,7 @@ from .route import KEY as ROUTE_KEY, run_model as route_run_model   # start_run'
 from . import checkcap
 from . import conflictfix
 from . import correction
+from . import slop
 from . import slowcomplaint
 from . import credits
 from . import gatewake
@@ -20458,6 +20459,8 @@ class Daemon:
         if not published and not ext and (line := self._verified_review_line(task, full)):
             lines.append(line)
         lines.append(REVIEW_CHECK_LINE)
+        if not published and not ext and branch and full:
+            lines.append(self._slop_block(task, branch, full))
         lines.append("Test it with the task's own test selection (the exact test ids or `-k` expression its "
                      "spec, hand-off and `ttp checks` commands name), never a marker the repo may not define. "
                      "With `TTP_NO_DEVICE=1` open a device only through the device broker, `ttp devq` or "
@@ -20646,6 +20649,17 @@ class Daemon:
                 + extchange.fetch_line(ch))
         self.p.db.update_task(review["id"], spec=spec, labels=[*labels, extchange.HEAD_LABEL + ch["head"]])
         review["spec"] = spec
+
+    def _slop_block(self, task: dict, branch: str, full: str) -> str:
+        """The review spec's de-slop block (slop.py): the change's scan delta and the rule that fails a change
+        re-implementing an existing rule, adding diary comments or a replay-only test. Never fails the spec."""
+        try:
+            base, _ = worktree.own_base(self.p, task, branch)
+            return slop.review_block(self.p.root, base, full, self.cfg.get("deslop"),
+                                     str(self.p.state / "slop-cache.json"))
+        except Exception as e:
+            log(self.p, f"task {task['id']}: slop delta not read: {e}")
+            return slop.RULE
 
     def _verified_review_line(self, task: dict, full: str) -> str:
         """The review spec's line on the review marker the code task inherits (verified.py): review only

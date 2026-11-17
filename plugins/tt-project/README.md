@@ -39,6 +39,7 @@ Features:
 - The project self-improves periodically by assessing its own performance.
 - Safe(ish?). It doesn't merge PRs or talk to humans in your name. It leaves sensitive operations to you, unless you tell it otherwise.
 - Changes are reviewed by a review agent before they're pushed.
+- Reviews also fail slop: duplicate rules, incident-diary comments and tests that only replay one incident. `ttp slop <project>` measures it per subsystem without a model.
 - Each project has a Web UI dashboard that you can check to see progress, critical messages, token budget, etc.
 - It keeps going when you close your computer (if it's running on an always-on box), or even if you close the chat.
 - It never keeps your Mac awake by default for a project's own work: keep it awake yourself as needed, or tell the project to set `runner.prevent_idle_sleep` to `on`, so it holds the Mac awake (on AC power) while there is work. The one exception is a workstation running the access bridge: while its bridge service runs, it holds `caffeinate -s` (charger power only, never the display; nothing is held on battery), switched off with `"keep_awake": "off"` in the bridge config. Other platforms never hold anything.

@@ -22,7 +22,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-from . import gitlocks, statcache
+from . import gitlocks, slop, statcache
 from .db import DB
 
 FOLDER = "tt-project"                     # lives at the root of the user's project, ignored by it
@@ -727,6 +727,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Batch runs (batchrun.py): a code task's run also takes up to batch_max ready code tasks of its repo
     # (any tier up to its own) and the queued ones that wait only on those.
     "dispatch": {"batch": True, "batch_max": 20},
+    # The code scan (slop.py, `ttp slop`) and the periodic de-slop pass: the scan and the review rule it feeds
+    # are always on; `enabled` turns on the daily `deslop` schedule that queues one refactor task for the
+    # worst subsystem. subsystems: path prefixes (default: the top-level directories); thresholds: the targets
+    # a pass works toward; step_share: the share of an over-target number a pass cuts; gap_days: how long a
+    # refactored subsystem is left alone; exclude: path globs left out of the scan.
+    "deslop": copy.deepcopy(slop.DEFAULTS),
 }
 
 

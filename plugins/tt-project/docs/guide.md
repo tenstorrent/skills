@@ -908,6 +908,16 @@ coordinator with that evidence.
   unreachable hosts and code and review tasks are exempt. Each close registers one reopen watch:
   the same probe every 6 h for 14 days, off the tick; its first pass queues one `reopens:<id>`
   follow-up with the closed task's spec.
+- De-slop (slop.py, `ttp slop <project> [--paths <glob>] [--diff <base>..<head>] [--next] [--json]`), model-free:
+  per subsystem (a top-level directory of the code repo, or `deslop.subsystems`) it counts duplicate rules (same-name
+  functions in more than one place, near-duplicate bodies by normalized syntax tree), module-level mutable state, magic
+  numbers (timing literals apart), function length (max, p90, count over `deslop.max_function_lines`) and comment
+  noise (comment and docstring lines citing dates, `#1234` ids, ticket keys, host-like names or incident phrases).
+  Python is parsed; JavaScript, TypeScript, Go, Rust, Java, C, C++ and shell get line heuristics for comment noise,
+  magic numbers and same-name functions. Every daemon-written review of a local code change carries the diff's scan
+  delta and a rule that fails a change re-implementing a rule an existing function decides, adding an incident-diary
+  comment or docstring, or adding a test that only replays one incident; the code-worker prompt says the same, and
+  the daily review quotes the scan numbers. Scan flags are findings for the reviewer to judge, not verdicts.
 - Landing time breakdown (landings.py, `ttp landings [--days N] [--from <date>] [--top N] [--json]`),
   model-free from the task, run, event, push-queue and checks records. For each task that landed, the wall
   time from creation to landing is split by cause, each second counted once: queue before the first run,

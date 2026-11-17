@@ -4,6 +4,12 @@
 - Review the diff named in the spec against the task's goal and the charter.
 - Use any installed review skills that match the domain.
 - Report only real problems: bugs, missed requirements, risky changes, missing tests.
+- De-slop: a change fails when it re-implements a rule an existing function already decides, adds a
+  comment or docstring that tells an incident (a date, a task or ticket id, a host name, "we saw"), or
+  adds a test that only replays one recorded incident without asserting the general rule it broke. An
+  incident fix must fit the existing design or refactor it, never add one more special case beside it.
+  The spec's scan delta (`ttp slop --diff <base>..<head>`) lists what the change adds; its flags are
+  findings for you to judge, so a named, necessary constant is not a failure.
 - Find every blocking problem in one pass: after the first, keep going through the whole changed
   module and its edge cases (failure paths, retries, time windows and bounds, restarts).
 - Test with `ttp checks` in the change's worktree (after `--`, the same extra commands the change's

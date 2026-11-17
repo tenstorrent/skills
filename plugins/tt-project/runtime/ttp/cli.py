@@ -2439,6 +2439,37 @@ def cmd_waste(a) -> None:
     print("\n".join([waste.line(p.name, rep)] + [f"- {x}" for x in waste.lines(rep)]))
 
 
+def cmd_slop(a) -> None:
+    """Read-only, model-free code scan per subsystem (slop.py): duplicate rules, mutable globals, magic numbers,
+    function length, comment noise. `--diff base..head` shows what a change adds; `--next` the subsystem a de-slop
+    pass would refactor."""
+    from . import slop
+    p = need(a.name, sys.argv[1:]) if a.name else here()
+    if not p:
+        die("no tt-project project here; name one: `ttp slop <name>`")
+    cfg = p.config().get("deslop") or {}
+    cache = str(p.state / "slop-cache.json")
+    try:
+        if a.diff:
+            base, sep, head = a.diff.partition("..")
+            if not sep or not base or not head:
+                die("--diff: give base..head (two commits or branches)")
+            d = slop.delta(p.root, base, head, cfg, cache)
+            if a.json:
+                print(json.dumps(d, indent=1))
+                return
+            print("\n".join(slop.delta_lines(d, show=20) or ["the change adds none of what the scan counts"]))
+            return
+        rep = slop.scan(p.root, a.ref, cfg, a.paths or None, cache)
+    except RuntimeError as e:
+        die(f"slop: {e}")
+    if a.next:
+        pick = slop.choose(rep, cfg)
+        print(json.dumps({"subsystem": pick[0], "excess": pick[1]} if pick else {"subsystem": None}))
+        return
+    print(slop.dump(rep) if a.json else slop.text(rep, cfg))
+
+
 def cmd_course(a) -> None:
     """Read-only: the Course check's lines with every costly task listed (the digest shows COSTLY_SHOWN)."""
     from . import course
@@ -15536,7 +15567,7 @@ COMMAND_GROUPS = (
     ("admin", ("setup", "upgrade", "start", "stop", "restart", "adopt", "prune", "secret", "consent",
                "notifier", "schedules", "heal", "upstream", "lease", "replicate", "check-plan", "stats", "audit",
                "push-audit", "ttr", "selfchange", "spend-today", "throughput", "model-trip", "echoes", "course",
-               "uninstall", "bench", "model-bench", "model", "waste", "bridge", "gh-queue", "move", "landings")),
+               "uninstall", "bench", "model-bench", "model", "waste", "slop", "bridge", "gh-queue", "move", "landings")),
 )
 
 
@@ -16071,6 +16102,16 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--since", help="a delay back (24h, 2d) or an ISO time (default: 24h)")
     s.add_argument("--json", action="store_true", help="print JSON")
     s.set_defaults(fn=cmd_waste)
+
+    s = sub.add_parser("slop", help="read-only: code scan per subsystem (duplicate rules, mutable globals, magic "
+                                    "numbers, function length, comment noise); --diff base..head: what a change adds")
+    s.add_argument("name", nargs="?", help="the project (default: the one here)")
+    s.add_argument("--ref", help="a commit or branch to scan (default: the working tree)")
+    s.add_argument("--paths", nargs="+", metavar="GLOB", help="scan only files matching these globs")
+    s.add_argument("--diff", metavar="BASE..HEAD", help="the numbers a change adds, new duplicates and incident-style comments")
+    s.add_argument("--next", action="store_true", help="print the subsystem a de-slop pass would refactor (JSON)")
+    s.add_argument("--json", action="store_true", help="print JSON")
+    s.set_defaults(fn=cmd_slop)
 
     s = sub.add_parser("course", help="read-only: the Course check's own signs (failing, held, costly, idle "
                                       "turns) with every costly task listed; the digest shows at most 10 of those")
