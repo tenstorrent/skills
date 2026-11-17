@@ -1715,14 +1715,15 @@ def test_model_suite_retries_an_endpoint_faulted_cell_and_never_scores_one(env, 
     assert ok["pass_rate"] == 1.0 and ok["endpoint_faults"] == 0 and ok["cell_rows"][0]["tries"] == 2
     cells = [json.loads(x) for x in (tmp_path / "o1" / "results.jsonl").read_text().splitlines()]
     assert [(c["task"], c["model"], c["outcome"], c["tries"]) for c in cells] == [(tid, "org/m-one", "pass", 2)]
-    # Every try faults: kept as an error naming the fault, never a fail; the pause grows per try.
+    # Every try faults: kept as a server cell naming the fault, never a fail; the pause grows per try.
     pauses[:], calls = [], _endpoint_down(monkeypatch, 99)
     monkeypatch.setenv("TTP_FAKE_SHELL", "true")
     down = modelsuite.standard("org/m-one", arm, "2026-11-10", tmp_path / "bench", None,
                                _bench_opts(tmp_path, fault_pause_s=5, fault_tries=2), p.config(), tmp_path / "o2")
     assert len(calls) == 3 and pauses == [5, 10]
     c = down["cell_rows"][0]
-    assert (c["outcome"], c["passed"], c["endpoint_fault"]) == ("error", False, "rate_limit")
+    # a capacity refusal the endpoint kept giving is the server's (serverhealth): not scored, never a fail
+    assert (c["outcome"], c["passed"], c["endpoint_fault"]) == ("server", None, "rate_limit")
     assert down["pass_rate"] is None and down["scored"] == 0 and down["endpoint_faults"] == 1 and down["faults"] == 0
     assert json.loads((tmp_path / "o2" / "results.jsonl").read_text())["endpoint_fault"] == "rate_limit"
     assert modelsuite.verdict([{"model": "m", "class": "standard", **down}], "m", "daily") is None
@@ -1750,7 +1751,7 @@ def test_model_suite_retries_an_endpoint_faulted_cell_and_never_scores_one(env, 
             "a2": {"provider": "chat", "model": "m-two", "effort": "high"}}
     _endpoint_down(monkeypatch, 99)
     first = benchrun.run(tmp_path / "bench", tmp_path / "h2h", arms, 1, 7, _bench_opts(tmp_path), p.config())
-    assert [r["outcome"] for r in first] == ["error", "error"]
+    assert [r["outcome"] for r in first] == ["server", "server"]
     _endpoint_down(monkeypatch, 0)
     monkeypatch.setenv("TTP_FAKE_SHELL", _BENCH_FIX)
     again = benchrun.run(tmp_path / "bench", tmp_path / "h2h", arms, 1, 7, _bench_opts(tmp_path), p.config())

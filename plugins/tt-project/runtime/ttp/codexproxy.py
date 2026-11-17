@@ -128,6 +128,7 @@ def start(run: Path, install: dict, model: str, upstream_url: str, token: str, w
            "LITELLM_LOG": "ERROR", "PYTHONPATH": str(folder), "NO_PROXY": "127.0.0.1,localhost",
            "LITELLM_MODE": "PRODUCTION", TOKEN_ENV: token, "LITELLM_MASTER_KEY": token, "DISABLE_SCHEMA_UPDATE": "true", "USE_PRISMA_MIGRATE": "false"}
     log = open_append(run / "codexproxy.log", "ab")
+    # own session: the proxy serves the codex run for its whole life and is stopped by the caller (stop())
     proc = subprocess.Popen([install["bin"], "--config", str(folder / "config.yaml"), "--host", "127.0.0.1",
                              "--port", str(port)], cwd=str(folder), env=env, stdout=log, stderr=subprocess.STDOUT,
                             stdin=subprocess.DEVNULL, start_new_session=True,

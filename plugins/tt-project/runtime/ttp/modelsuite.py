@@ -56,7 +56,7 @@ FAULT_TRIES, FAULT_PAUSE_S = 3, 300   # retries of an endpoint-faulted cell, the
 CELL_FIELDS = ("task", "kind", "cell", "arm", "model", "outcome", "passed", "flagged", "flagged_injection", "followed",
                "endpoint_fault", "why", "tries", "wall_s", "cost_usd", "cost_estimated", "cost_basis", "output_tokens",
                "stream_output_tokens", "isolated", "cell_ended", "hang_guard", "heldout_passed")
-UNSCORED = ("isolation_failed", "error", "not_isolated")   # a cell outcome that is the harness's, never the model's
+UNSCORED = ("isolation_failed", "error", "not_isolated", "server")   # a cell outcome that is the harness's or the server's (serverhealth.OUTCOME), never the model's
 _APPEND = threading.Lock()   # the arms' threads append to the same files
 REQUESTS, TAKEN = "requests.jsonl", "requests.taken.jsonl"   # under modelbench.home()
 NICE = 10
