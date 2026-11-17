@@ -3671,15 +3671,34 @@ def _run_to_end(argv, timeout=30, **kw):
                     raise
     return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 
-def test_run_to_end_ends_the_whole_tree_of_a_command_that_times_out(tmp_path):
+def test_run_to_end_ends_the_whole_tree_of_a_command_that_times_out(tmp_path, monkeypatch):
     """A command that runs past its deadline is ended with everything it started: a process it left behind
     would run on after the test (a busy loop did, for hours)."""
-    pidfile = tmp_path / "child.pid"
+    pidfile, mod = tmp_path / "child.pid", sys.modules[__name__]
+    runnable = mod._proc_tree_runnable
+    # The deadline starts counting only once the shell has written its child's pid (an event, not wall
+    # time): on a loaded host the shell may not even reach the echo within one second of its own.
+    monkeypatch.setattr(mod, "_proc_tree_runnable", lambda pid: not _pid_written(pidfile) or runnable(pid))
     with pytest.raises(subprocess.TimeoutExpired):
-        _run_to_end(["sh", "-c", f"sleep 300 & echo $! > {pidfile}; wait"], timeout=1)
+        _run_to_end(["sh", "-c", f"sleep 300 & echo $! > {pidfile}.tmp && mv {pidfile}.tmp {pidfile}; wait"],
+                    timeout=1)
     child = int(pidfile.read_text())
-    assert _wait_for(lambda: not os.path.exists(f"/proc/{child}") or
-                     Path(f"/proc/{child}/stat").read_text().rpartition(")")[2].split()[0] == "Z", 10)
+    assert _wait_for(lambda: _proc_state(child) in (None, "Z"), 10)
+
+
+def _pid_written(path) -> bool:
+    try:
+        return bool(path.read_text().strip())
+    except OSError:
+        return False
+
+
+def _proc_state(pid):
+    """The state letter of pid from /proc, or None once it is gone (it may go between any two reads)."""
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rpartition(")")[2].split()[0]
+    except (OSError, IndexError):
+        return None
 
 
 def _wait_for(pred, timeout=30.0) -> bool:
