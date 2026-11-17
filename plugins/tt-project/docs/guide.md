@@ -1264,7 +1264,7 @@ its configured share over at least 10 runs, naming the top reasons.
 
 A second code arm (off by default) sends a share of new code tasks to a chat model instead of Sonnet,
 under `route.code_sonnet`: `{"glm_share": 0.5, "glm": {"provider": "chat", "model": "<chat model>", "effort":
-"max", "harness": "claude-code"}, "glm_seed": "", "glm_cap": {"start": 4, "min": 1, "max": 8},
+"max", "harness": "mini-swe-agent"}, "glm_seed": "", "glm_cap": {"start": 4, "min": 1, "max": 8},
 "glm_guard_pts": 10, "glm_guard_min": 15}`. It is off while `glm_share` is 0 or unset, `glm.model` is empty
 or the code route is off. Only a new standard-tier code task the Sonnet route could take, with no resource of
 any kind, no protected class (urgent, device, optimization or performance, conclusion), no `conclusion:` line,
@@ -1274,8 +1274,21 @@ arm: ...`, the run note's route entry carries `code_arm`), and a follow-up (cont
 lineage's arm. Reviews, plans, questions, verdicts, conclusions and coordinators never take it. A run on the
 arm that needs deep thinking or a person hands off `{"status": "blocked", "needs_opus": "<reason>"}` and pushes
 nothing: the daemon requeues the task on Opus with no attempt spent and no fault counted against the
-provider, and logs the reason. `claude-code` (Claude Code on the chat bridge) is the only live harness; any
-other keeps tasks on Claude. The daily review shows one line per arm (glm, sonnet, claude): first-try review
+provider, and logs the reason. `mini-swe-agent` is the only live harness: its command layer is a model-free
+guard that refuses a side effect outside the run's own hand-off (a `ttp` command outside the allowed set, a raw
+`git push`, a GitHub write, an HTTP post, ssh or mail, a state or database write, a write outside the worktree, a
+read of stored secrets) and ends the run as a hand-back to Opus. A live share on any other harness (Claude Code
+included) is treated as 0 and logged once per setting. A run that handed back cannot `ttp push`, and every run
+of a code task follows the arm recorded for it, light wakes included. `route.code_sonnet.glm.digest` (off by
+default) gives the model a command's output over about 8 KB as its first lines, every failing line and its tail,
+with the whole output saved in the run folder; it is for server capacity (a long context per call), and each
+run's result line reports the context tokens per call. Each project keeps a list of policy files, the code that
+decides what needs an audit record, review, approval, budget or push, in `harness/policy_files.txt` (one glob per
+line relative to the code repo root, `#` starts a comment, `**` crosses directories, a pattern without `/` matches
+that name at any depth; the plugin ships no list). Before the coin, a task whose title, spec or `Where:` line
+names a listed file or a policy term stays on Opus; after a run, a branch that changes a listed file is refused
+(its tip saved under `refs/ttp/policy-bounce/t<id>`) and the task goes to Opus. A project with no list cannot run
+the arm live. The daily review shows one line per arm (glm, sonnet, claude): first-try review
 fails, fix rounds and median time to land, bounces, reverts within 3 days, server waits and refusals, tokens
 in (uncached and cached apart) and out, and $. A model-free guard runs daily over the last 7 days: when the
 arm's landed-within-one-fix-round rate is more than `glm_guard_pts` points below Sonnet's (each with

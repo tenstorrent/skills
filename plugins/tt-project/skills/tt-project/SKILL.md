@@ -114,6 +114,7 @@ description: "Start, connect to, and talk with a long-running tt-project: a loca
 | restart after trouble | `ttp restart <name>`, then `ttp doctor <name>` |
 | stop for good | `ttp stop <name>` (removes the service; data stays; running workers finish) |
 | stop and end running work now | `ttp stop <name> --kill` (their tasks resume on the next start) |
+| take a project off this machine | `ttp remove <name>` (stops the daemon and workers, removes the service files, drops its rows from the machine-wide worker and alert records, unregisters it; files stay unless `--delete-files`; a run cannot remove its own project) |
 | logs | `ttp logs <name>` |
 
 More: `operate.md`.
