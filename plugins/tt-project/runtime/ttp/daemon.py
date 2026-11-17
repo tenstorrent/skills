@@ -7260,6 +7260,7 @@ class Daemon:
         db.set_kv("coordinator_failures", 0)
         default_chat = note.get("default_chat")
         applied: list = []
+        held: list = []   # replies the chat digest held: applied, yet they answer no order
         try:   # before the batch's transaction: a claim's probe never holds the write lock
             claimcheck.prerun(self.p, actions, self._probe_env())
         except Exception:
@@ -7269,7 +7270,7 @@ class Daemon:
             problems = coord.apply(self.p, actions, default_chat=default_chat,
                                    user_turn=coord.user_turn(db, note.get("messages") or []),
                                    turn=r.get("id"), messages=note.get("messages") or [], lean=self._lean_reap,
-                                   applied=applied, skip_actions=skip, on_action=on_action)
+                                   applied=applied, skip_actions=skip, on_action=on_action, held=held)
         except (Exception, gitmemo.GitMiss, StopRequested):
             # The live daemon left the apply (a round rolled back on a git miss, a stop, an error): no cut-off.
             # Only a reap the process died in leaves "on" set for the next reap to count.
@@ -7281,7 +7282,7 @@ class Daemon:
         problems = list(problems)
         try:   # each user message's order, or why it carries none: refused once (turnrules.order_gap)
             failed = set(range(len(actions))) - set(applied)
-            if gap := turnrules.order_gap(db, obligations.order_messages(db), actions, failed, ids):
+            if gap := turnrules.order_gap(db, obligations.order_messages(db), actions, failed, ids, held=held):
                 problems.append(gap)
         except Exception:   # bookkeeping: the turn is applied either way
             log(self.p, "order check failed: " + traceback.format_exc().replace("\n", " | ")[:1000])

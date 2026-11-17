@@ -2790,7 +2790,7 @@ def untrusted_update(task: dict, a: dict, upd: dict) -> str:
 def apply(p: Project, actions: list[dict], default_chat: str | None = None, user_turn: bool = False,
           turn: int | None = None, messages: list[int] | None = None, lean: bool = False,
           applied: list | None = None, skip_actions: frozenset | set = frozenset(),
-          on_action=None, deferred_tries: int = 0) -> list[str]:
+          on_action=None, deferred_tries: int = 0, held: list | None = None) -> list[str]:
     """Apply validated actions. Returns human-readable notes about rejected ones, fed back next turn.
     Notes on actions applied with a change (NOTES_KEY) reach the next digest as information only.
     `messages`: the user messages the daemon started this turn for (a charter change they approved
@@ -2883,6 +2883,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 a["text"], false = _claims_checked(p, a, notes)
                 if (text := chatdigest.checked(db, cfg, a["text"], a, chat, notes, twins=(dup := []))) is None:
                     twins += [(m, c, list(a.get("delivers") or []), authored) for m, c in dup]
+                    if not dup and held is not None:   # held for the digest: it answers no order (order_gap)
+                        held.append(i)
                     workernotify.handled(db, said)
                     continue
                 a["text"] = text

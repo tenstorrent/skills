@@ -18,7 +18,11 @@ The digest itself stays in the web app by default (recorded with no chat, on the
 
 Status pace: a status post (progress, counts, ETAs; never an answer to the user's question, an ask, an outage
 or a result: is_status) goes to a chat at most once per `coordinator.chat_status_gap_h` hours (default 1;
-`coordinator.chat_status_gap_chats` {chat: hours} per chat); a sooner one is held for the digest. The daemon's
+`coordinator.chat_status_gap_chats` {chat: hours} per chat); a sooner one is held for the digest. A reply
+whose `order` names the user's request for that content ('send an ETA and the plan', requested) is a
+requested result, never status: it goes at once. A held post never answers its order (it is not a sent
+message), and only a post that reached the chat starts its status gap; with notify.chat_status off the
+coordinator's note on a held post says the chat never got it, naming its order. The daemon's
 hourly table keeps the same gap. A post that nearly repeats what any other chat of the same user got in the
 last hour (twin: most words alike, or the same task and obligation ids) is not sent again; the earlier
 message delivers only what the reply's own `delivers` named (obligations.deliver_twins), never by topic.
@@ -72,6 +76,11 @@ _STATUS = re.compile(r"\b(?:status|backlog|queue[ds]?|eta|running|remaining|\d+\
                      r"queued|running|waiting|done))\b", re.I)
 _NOT_STATUS = re.compile(r"\?|\b(?:decid\w*|decision|chose|picked|override|fail(?:ed|s|ure)?|broken|"
                          r"need (?:you|your)|your (?:yes|word|answer|call|go)|ask \d+)\b", re.I)
+# A user message that asks for content: a question, or a request for an ETA, a plan, a number, a table, a result.
+_REQUEST = re.compile(r"\?|\b(?:send|give|tell|show|post|report|share|list|explain|summari[sz]e|what|when|where|"
+                      r"which|why|how|eta|plan|table|numbers?|figures?|results?|status|estimate)\b", re.I)
+REQUEST_S = 24 * 3600   # a reply's `order` names a request made at most this long ago
+ANSWER_S = 600   # parts of one requested answer: replies within this long of the first one sent after the request
 
 
 def asks_user(text: str) -> bool:
@@ -129,12 +138,40 @@ def status_gap_s(cfg: dict | None, chat: str | None = None) -> float:
         return STATUS_GAP_H * 3600.0
 
 
+def requested(db, a: dict, chat: str | None, now: float | None = None) -> int | None:
+    """The user message a reply answers when it was asked for: its `order` names an inbound user message
+    (a relayer's findings aside) in this chat, at most REQUEST_S old, that asks for content (_REQUEST: a
+    question, an ETA, a plan, a number, a table, a result), and no reply went to the chat after it, or
+    the first one did under ANSWER_S ago (a multi-part answer). None otherwise. A held post is no reply:
+    it is not in the messages table, so it never counts as having answered the order."""
+    try:
+        m = int(a.get("order"))
+    except (TypeError, ValueError):
+        return None
+    if a.get("type") not in (None, "reply"):
+        return None
+    now = time.time() if now is None else now
+    row = db.one("SELECT id, ts, chat, direction, kind, text FROM messages WHERE id=?", (m,))
+    if not row or row["direction"] != "in" or str(row["kind"] or "") == "finding" \
+            or now - float(row["ts"] or 0) > REQUEST_S or not _REQUEST.search(str(row["text"] or "")):
+        return None
+    if chat and chat != "all" and row["chat"] not in (None, "", chat):
+        return None
+    first = db.one("SELECT ts FROM messages WHERE direction='out' AND kind='reply' AND chat=? AND id>? "
+                   "ORDER BY id LIMIT 1", (row["chat"], m)) if row["chat"] else None
+    if first and now - float(first["ts"] or 0) > ANSWER_S:
+        return None
+    return m
+
+
 def _plain(db, text: str, a: dict, chat: str | None) -> str:
     """The post's body when it may be paced or deduplicated; '' for an outage, a high or critical post, an
-    ask to the user or an answer to the user's open question, which always go."""
+    ask to the user, an answer to the user's open question or a reply the user asked for (requested),
+    which always go."""
     body = str(text or "").split(FOOTER, 1)[0].strip()
     if (a.get("outage") is True or str(a.get("severity") or "").lower() in ("high", "critical")
-            or a.get("type") == "ask_user" or asks_user(body) or _OUTAGE.search(body) or _asked(db, chat)):
+            or a.get("type") == "ask_user" or asks_user(body) or _OUTAGE.search(body) or _asked(db, chat)
+            or requested(db, a, chat) is not None):
         return ""
     return body
 
@@ -207,7 +244,7 @@ def why_hold(db, text: str, a: dict, chat: str | None) -> str:
             or str(a.get("severity") or "").lower() in ("high", "critical")):
         return ""
     body = str(text or "").split(FOOTER, 1)[0].strip()
-    if not body or _MATTERS.search(body) or asks_user(body) or _asked(db, chat):
+    if not body or _MATTERS.search(body) or asks_user(body) or _asked(db, chat) or requested(db, a, chat) is not None:
         return ""
     from . import obligations   # a promise the user relies on is not routine: it goes now and is tracked
     if obligations.commitments(body):
@@ -250,6 +287,20 @@ def routine(p, chat: str | None, text: str, why: str, now: float | None = None, 
     return False
 
 
+def _unseen(cfg: dict | None, chat: str | None, a: dict) -> str:
+    """The note's tail for a held post the chat will never get: with notify.chat_status off the digest
+    reaches only the web app, so a held post's order stays unanswered in the chat."""
+    if to_chat(cfg, "status"):
+        return ""
+    try:
+        order = f" (order #{int(a.get('order'))} stays open)"
+    except (TypeError, ValueError):
+        order = ""
+    return (f". It was NOT delivered to chat {chat or 'all'}: held posts reach only the web app "
+            f"(notify.chat_status false), so the user has not seen it{order}; if they asked for it, resend it "
+            f"with `order` naming their message, or with `delivers` or `cites`")
+
+
 def checked(db, cfg: dict | None, text: str, a: dict, chat: str | None, notes: list,
             now: float | None = None, twins: list | None = None) -> str | None:
     """The text to post now, or None when the whole post was held for the digest or nearly repeats a post
@@ -277,14 +328,15 @@ def checked(db, cfg: dict | None, text: str, a: dict, chat: str | None, notes: l
             hold(db, chat, text, why, now)
             notes.append(f"chat digest: your {kind} to chat {chat or 'all'} was {why} only, so it waits for that "
                          f"chat's next digest (coordinator.chat_digest_h). Post to a chat only for results, "
-                         f"decisions, outages and asks")
+                         f"decisions, outages and asks" + _unseen(cfg, chat, a))
             return None
         if is_status(db, text, a, chat) and status_gap_s(cfg, chat):
             if (wait := status_wait(db, cfg, chat, now)) > 0:
                 hold(db, chat, text, "status gap", now)
                 notes.append(f"chat digest: your {kind} to chat {chat or 'all'} is a status, and that chat had one "
                              f"under {status_gap_s(cfg, chat) / 3600:g} h ago (coordinator.chat_status_gap_h), so "
-                             f"it waits for the chat's next digest; the next status may go in {wait / 60:.0f} min")
+                             f"it waits for the chat's next digest; the next status may go in {wait / 60:.0f} min"
+                             + _unseen(cfg, chat, a))
                 return None
             mark_status(db, chat, now)
         body, sep, footer = str(text).partition(FOOTER)
@@ -330,7 +382,7 @@ def flush(p, cfg: dict | None, now: float | None = None) -> list[int]:
                 out += msgparts.post(db, text.replace("\n", where_to + "\n", 1), chat=None, channel=alerts.QUIET,
                                      kind="info", severity="normal")
             held[chat], last[chat] = [], now
-            if gap:
+            if gap and to_chat(cfg, "status"):   # a web-app-only digest is no status post to the chat
                 st.setdefault("status", {})[chat] = now
             _count(st, chat, "digests")
         db.set_kv(KV, st)
@@ -427,7 +479,8 @@ def status_flush(p, cfg: dict | None, now: float | None = None) -> list[int]:
                 from . import alerts
                 out += msgparts.post(p.db, text, chat=None, channel=alerts.QUIET, kind="info", severity="low",
                                      ref=HANDOFF_REF)
-            mark_status(p.db, target, now)
+            if to_chat(cfg, "status"):   # a web-app-only post never starts the chat's status gap
+                mark_status(p.db, target, now)
             st = p.db.kv(KV) or {}
             _count(st, chat, "sent")
             p.db.set_kv(KV, st)

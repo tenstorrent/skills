@@ -551,3 +551,74 @@ def test_a_reply_chat_hand_off_owing_nothing_is_still_one_held_line(env, monkeyp
     pushq._reply(p.db, t, "done", "Docs tidied. Two pages merged.")
     assert _cd_out(p) == before
     assert [i["task"] for i in p.db.kv(chatdigest.KV)["held"]["c1"] if i["why"] == chatdigest.HANDOFF] == [t["id"]]
+
+
+def test_a_reply_the_user_asked_for_goes_at_once_after_a_status_and_a_late_repeat_waits(env, monkeypatch):
+    """cells: held_reply. Upstream note d12a28e292fd1e82: a reply whose `order` names the user's request for an
+    ETA and a plan (no '?') is a requested result, never status: the status gap a minute-old status post
+    started does not hold it. The same order on a status post past the answer window is status again
+    (correction #2617: status tables keep the hourly pace)."""
+    from ttp import chatdigest, coordinator as coord
+    monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
+    p = make(env)
+    first = "Backlog: 12 tasks open, 3 queued; #40 done."
+    coord.apply(p, [{"type": "reply", "chat": "c1", "text": first}], turn=1)
+    m = p.db.post("in", "Send an ETA and the plan in one line, then the per-box times once measured.", chat="c1")
+    eta = "ETA 15:40 PST: plan is the 3 boxes in parallel, 2 queued behind #12; per-box times once measured."
+    coord.apply(p, [{"type": "reply", "chat": "c1", "text": eta}], turn=2)   # no order: a status, held
+    assert _cd_out(p) == [first]
+    coord.apply(p, [{"type": "reply", "chat": "c1", "text": eta, "order": m, "no_order": "answered"}], turn=3)
+    assert _cd_out(p) == [first, eta]
+    assert chatdigest.requested(p.db, {"type": "reply", "order": m}, "c1") == m
+    assert chatdigest.requested(p.db, {"type": "reply", "order": m}, "c2") is None   # another chat's request
+    p.db.x("UPDATE messages SET ts=ts-? WHERE direction='out' AND chat='c1'", (chatdigest.ANSWER_S + 1,))
+    st = p.db.kv(chatdigest.KV)
+    st["status"]["c1"] = time.time() - 60
+    p.db.set_kv(chatdigest.KV, st)
+    later = "Backlog: 10 tasks open, 2 queued; #41 done."
+    coord.apply(p, [{"type": "reply", "chat": "c1", "text": later, "order": m}], turn=4)
+    assert _cd_out(p) == [first, eta]
+    assert [h["text"] for h in p.db.kv(chatdigest.KV)["held"]["c1"]][-1] == later
+    nonask = p.db.post("in", "fine, carry on", chat="c1")
+    assert chatdigest.requested(p.db, {"type": "reply", "order": nonask}, "c1") is None
+
+
+def test_a_held_reply_answers_no_order_and_its_note_says_the_chat_never_got_it(env, monkeypatch):
+    """cells: held_order, digest_line. A reply the status gap held never reached the chat: its `no_order`
+    covers nothing (order_gap refuses naming the message), and with notify.chat_status off the coordinator's
+    note on it says it went to the web app only, with the order id."""
+    from ttp import chatdigest, coordinator as coord, turnrules
+    monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
+    p = make(env)
+    coord.apply(p, [{"type": "reply", "chat": "c1", "text": "Backlog: 12 tasks open, 3 queued; #40 done."}], turn=1)
+    m = p.db.post("in", "fine, carry on", chat="c1")
+    actions = [{"type": "reply", "chat": "c1", "text": "Backlog: 11 tasks open, 4 queued; #41 done.",
+                "order": m, "no_order": "status read"}]
+    held: list = []
+    coord.apply(p, actions, turn=2, held=held)
+    assert held == [0] and len(_cd_out(p)) == 1
+    note = [n for n in p.db.kv(coord.NOTES_KEY, []) if "NOT delivered" in n][-1]
+    assert "web app" in note and f"order #{m}" in note
+    gap = turnrules.order_gap(p.db, set(), actions, set(), [m], held=held)
+    assert gap and gap.startswith(turnrules.PREFIX) and f"#{m}" in gap and "NOT delivered" in gap
+    p.db.set_kv(turnrules.NO_ORDER_REFUSED_KEY, [])
+    assert turnrules.order_gap(p.db, set(), actions, set(), [m]) is None   # sent: its no_order covers it
+    p.set_config("notify.chat_status", True)
+    assert chatdigest._unseen(p.config(), "c1", actions[0]) == ""
+
+
+def test_a_web_app_only_digest_does_not_start_the_chats_status_gap(env, monkeypatch):
+    """Upstream note d12a28e292fd1e82: a digest the chat never got (notify.chat_status off) leaves its status
+    gap alone; one posted to the chat starts it."""
+    from ttp import chatdigest
+    monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
+    p = make(env)
+    p.set_config("coordinator.chat_digest_h", 2)
+    t0 = 1_800_000_000.0
+    chatdigest.hold(p.db, "c1", "#12 is queued for a worker.", "progress", t0)
+    assert chatdigest.flush(p, p.config(), t0 + 2 * 3600)
+    assert chatdigest.status_wait(p.db, p.config(), "c1", t0 + 2 * 3600 + 1) == 0
+    p.set_config("notify.chat_status", True)
+    chatdigest.hold(p.db, "c1", "#13 is queued for a worker.", "progress", t0 + 2 * 3600)
+    assert chatdigest.flush(p, p.config(), t0 + 4 * 3600 + 1)
+    assert chatdigest.status_wait(p.db, p.config(), "c1", t0 + 4 * 3600 + 2) > 0

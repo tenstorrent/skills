@@ -27,18 +27,19 @@ def _int(v) -> int | None:
         return None
 
 
-def order_gap(db, covered: set[int], actions: list, failed: set[int], messages) -> str | None:
+def order_gap(db, covered: set[int], actions: list, failed: set[int], messages, held=()) -> str | None:
     """The refusal for the user messages of this turn (`messages`, a relayer's findings aside) with no
     order on the ledger (`covered`: obligations.order_messages after the turn) and no `no_order` on an
-    applied reply or noop; None when each has one, or each was refused once already."""
+    applied reply or noop; None when each has one, or each was refused once already. A reply the chat
+    digest held (`held`: action indexes) never reached the chat, so its `no_order` answers nothing."""
     ids = [m for m in (_int(x) for x in messages or []) if m is not None]
     if not ids:
         return None
     users = [r["id"] for r in db.q(f"SELECT id FROM messages WHERE id IN ({','.join('?' * len(ids))}) "
                                    "AND direction='in' AND kind!='finding' ORDER BY id", ids)]
-    covered = set(covered)
+    covered, held = set(covered), set(held or ())
     for i, a in enumerate(actions or []):
-        if not isinstance(a, dict) or i in failed or a.get("type") not in NO_ORDER_ACTIONS \
+        if not isinstance(a, dict) or i in failed or i in held or a.get("type") not in NO_ORDER_ACTIONS \
                 or not " ".join(str(a.get("no_order") or "").split()):
             continue
         if a.get("order") in (None, ""):
@@ -51,6 +52,15 @@ def order_gap(db, covered: set[int], actions: list, failed: set[int], messages) 
         return None
     db.set_kv(NO_ORDER_REFUSED_KEY, (refused + new)[-NO_ORDER_KEPT:])
     shown = ", ".join(f"#{m}" for m in new)
+    kept = sorted({m for i in held if i < len(actions or []) and isinstance(actions[i], dict)
+                   and (m := _int(actions[i].get("order"))) in new})
+    if kept:   # the reply naming it was held for the digest: the user has not got it
+        return (f"{PREFIX}user message {', '.join(f'#{m}' for m in kept)}: your reply answering it was held for "
+                f"the chat digest and NOT delivered to the chat, so it answers nothing yet: send what they asked "
+                f"for as a reply with `order` naming their message (a requested result goes at once), or record "
+                f"it as an `obligation` with `order`" + (f"; also {', '.join(f'#{m}' for m in new if m not in kept)}"
+                                                         f" has no order and no `no_order`" if len(kept) < len(new)
+                                                         else ""))
     return (f"{PREFIX}user message {shown} has no order and no `no_order`: record it (`obligation` with `order` "
             f"(its id), `text`, `owners`, `action_class`; `key` and `order` link an open obligation), or put "
             f"`no_order` with the reason (a question answered, thanks, a status read) on a reply or noop, "
