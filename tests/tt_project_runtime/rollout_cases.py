@@ -17,15 +17,15 @@ def test_a_flag_is_off_until_its_ring_is_reached_and_a_projects_own_setting_wins
     from ttp import rollout
     for who, ring in (("scratch1", "0"), ("canary", "1")):
         assert _roll(capsys, "ring", who, ring)[0] == 0
-    assert _roll(capsys, "ring", "trays", "exclude")[0] == 0
-    names = ("scratch1", "canary", "everyone", "trays")
+    assert _roll(capsys, "ring", "excl", "exclude")[0] == 0
+    names = ("scratch1", "canary", "everyone", "excl")
     assert not any(rollout.on("deslop", n) for n in names), "flags are off by default"
     for lv, want in (("0", {"scratch1"}), ("1", {"scratch1", "canary"}), ("2", {"scratch1", "canary", "everyone"})):
         assert _roll(capsys, "set", "deslop", lv)[0] == 0
         assert {n for n in names if rollout.on("deslop", n)} == want, "an excluded project never takes a flag"
     assert _roll(capsys, "set", "deslop", "off")[0] == 0
     own = {"deslop": {"enabled": False}}
-    assert rollout.on("deslop", "trays", own) and rollout.on("deslop", "everyone", own), "its own value wins"
+    assert rollout.on("deslop", "excl", own) and rollout.on("deslop", "everyone", own), "its own value wins"
     assert not rollout.on("deslop", "everyone", {"deslop": {}})
     assert not rollout.on("no_such_flag", "scratch1")
 
