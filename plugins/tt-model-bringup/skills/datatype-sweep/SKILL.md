@@ -68,7 +68,7 @@ Teacher-forcing decode performance is valid only when the measured path uses tra
 Use this coarse search first. It usually finds most of the available win with a small number of full-model runs.
 
 1. Evaluate the closest canonical performance and accuracy policies, if any.
-2. Try BFP8 KV cache as a yes/no switch. Any candidate that changes the KV-cache dtype must also pass the short-prefix case (about 32 cached tokens) and the batch-32 same-input per-user comparison at the full-model bar; a long-prompt layer PCC pass does not cover them (a BFP8 cache passed 1024-token layer PCC and failed 0.995 per user on a short prefix).
+2. Try BFP8 KV cache as a yes/no switch. Any candidate that changes the KV-cache dtype must also pass the short-prefix case (about 32 cached tokens) and the same-input per-user comparison at the largest batch in `batch_sizes` at the full-model bar; a long-prompt layer PCC pass does not cover them (a BFP8 cache passed 1024-token layer PCC and failed 0.995 per user on a short prefix).
 3. Try BFP8 CCL or residual-transfer activations as a yes/no switch.
 4. Try BFP4 for eligible MLP/expert matmul groups, excluding the first and last layer by default unless the canonical policy says otherwise.
 5. If full-model accuracy fails, restore the highest-risk groups first until top-1 and top-5 pass.
@@ -85,7 +85,7 @@ This order is a heuristic, not a law, with the typically most-sensitive parts of
 
 When backing out a failed BFP4 trial, restore to BFP8 first unless BFP8 itself is known to be the failing precision for that tensor group.
 
-For every material matmul group tested with BFP4 weights, include a LoFi compute-fidelity candidate for that same group. BFP4 with HiFi2 is allowed as a comparison or fallback, but it is not enough by itself. If a BFP4+LoFi candidate cannot be run, record the exact TTNN/runtime blocker and keep the stage open until the blocker is fixed or `$autofix` fails.
+For every material matmul group tested with BFP4 weights, include a LoFi compute-fidelity candidate for that same group. BFP4 with HiFi2 is allowed as a comparison or fallback, but it is not enough by itself. If a BFP4+LoFi candidate cannot be run, record the exact TTNN/runtime blocker and keep the stage open until the blocker is fixed or `$autofix` fails, unless BFP4 is already rejected for that group.
 
 Sweep compute fidelity even when dtype is unchanged. For dominant decode projection groups, include BFP8+LoFi and BFP8+HiFi2 candidates when both are legal. Do not assume HiFi2 is fastest for BFP8, and do not assume LoFi is safe without full-model top-1/top-5 evidence. Record dtype and fidelity together in each candidate id so later stages can construct the exact policy.
 
@@ -129,6 +129,51 @@ Teacher-forcing is the selection metric, not necessarily the serving headline. A
 
 If layer-level decode evidence, reduced token-out evidence, or a prior optimized full-model token-out artifact points to a different fastest passing policy than teacher-forcing does, resolve the conflict before selecting. Run the same token-out benchmark for the baseline and the top conflicting candidate through the normal construction path. If token-out cannot run because the generator or trace-feedback path fails, treat that as a bug to fix or a recorded blocker; do not silently use teacher-forcing throughput as the serving-policy answer.
 
+## Anomalies
+
+A degenerate reply (stray or repeated tokens, collapse into a few characters, a token loop) is a precision
+or stack defect until shown otherwise, not a model answer. Goal 12 runs steps 1–5 on each anomaly and on a
+phase below its band, inside the phase's time. A phase below its band with no degenerate reply has nothing
+to reproduce in step 2; its attempt is a precision check on its failed tasks: for each, the decisive call
+(GPQA: the answer; SWE: the call whose action first went wrong), teacher-forced at served and at full
+precision (top-1 agreement over the reply, probability of the chosen and of the correct continuation). Full
+precision that agrees with served rules precision out: record it with `changed` saying so; one entry for
+the phase covers its failed tasks. A disagreement goes on to step 4.
+
+**Where precision comes from.** The served precision is the config this stage selected:
+`selected_precision_config.json` (this skill's Preferred Outputs; the model's default construction path or
+the build kwargs that load it). Its fields, this sweep's `sweep_results.json` and the model's precision
+plumbing (what `build_generator` accepts) list the options. A change is a new config file passed by
+`--build-kwargs-file` to the runners, or to the server with a restart (about 15–30 min for a large model;
+budget each one). Record the file in the run's `config.precision`.
+
+1. **Detect.** On eval replies, agentic-serving's `scripts/reply_digest.py` reads every reply from the
+   server's response log and flags a degenerate tail (zlib ratio or distinct characters of the last 4,096
+   characters); a flag is an anomaly. A failed or capped task it does not flag goes to a triage sub-agent, and
+   the coordinator decides (agentic-serving, Failure analysis). `runtime/readiness_check/check_degenerate_output.py`
+   catches doubled tokens and collapse in runner outputs.
+2. **Reproduce.** From the failed trajectory take the model call that degenerated: its rendered input plus
+   the reply up to the first stray token. Save it as a prompt file under `doc/agentic_evals/anomalies/` with
+   the seed and sampling settings. Stop the eval server and run it on the model runner, not the eval
+   harness, at batch 1: `python -m readiness_check.run_autoregressive --prompt-file <file>
+   --build-kwargs-file <config>` (free-running, with the HF continuation beside it), or a reference from
+   `readiness_check.generate --prompt-source file` scored by `run_teacher_forcing`. Measure the anomaly rate
+   over N short continuations, or the top-1 agreement and the probability of the correct next token at the
+   failure point. It must run in minutes; shorten the prefix while it still fails.
+3. **Full precision on TT:** BF16 weights, HiFi4, BF16 activations, BF16 head. It only has to fit for this
+   batch-1 test. If it still fails, run the prompt on the HF/GPU reference: if that passes, bisect the stack
+   bug by op PCC; if it fails too, report model behaviour.
+4. **Bisect to the fastest passing config** when full precision passes: by group (head, MLP gate/up, down,
+   attention, activations), then by layer range, measuring decode t/s/u at each step. Choose the fastest
+   config that passes; the next faster ones tried fail. A speed loss for accuracy is accepted.
+5. **Re-measure and rerun.** Restart the server on the chosen config, re-measure only the stage-11 rows the
+   eval uses at its batch (into `serving_rates.json`, labelled with the config), then rerun the eval list.
+
+Goal 12 records each attempt in `results.json` `anomalies`: `phase`, `tasks`, `test` (command), `prompt`
+(file), `seed`, `served` (`precision`, `result`), `full_precision` (`result`, `pass`), the HF/GPU result
+when step 3 needed it, `changed` (what changed, or why nothing), `hours`; a precision fix adds
+`configs_tried` (`config`, `pass`, measured `decode_tok_s_user`), `chosen` and `remeasured_rows`.
+
 ## Plots
 
 Use matplotlib/pyplot to generate two elegant, delightful Pareto charts:
@@ -158,7 +203,7 @@ Pass a candidate's precision config to the readiness runners through `--build-kw
 
 ## Final Selection
 
-Select the fastest config that satisfies the acceptance bar on every reference. Measurement noise is the spread between the repeated serial baseline runs recorded in the baseline section; a candidate counts as a gain only when it beats the baseline by more than that spread, and two configs inside it are a tie, where the simpler and safer one wins.
+Select the fastest config that satisfies the acceptance bar on every reference, also checking agent-shaped long prefixes and the memory ledger as [`agentic-serving`](../agentic-serving/SKILL.md) describes, and free-running replies by the Anomalies guard. Higher precision chosen for those reasons is a valid selection. Measurement noise is the spread between the repeated serial baseline runs recorded in the baseline section; a candidate counts as a gain only when it beats the baseline by more than that spread, and two configs inside it are a tie, where the simpler and safer one wins.
 
 Before finishing:
 
