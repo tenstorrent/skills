@@ -406,7 +406,7 @@ def test_terminalbench_preflight_raises_one_event_on_the_third_failure_in_a_row_
     assert len(events()) == 2, "a new streak of three raises its own event"
 
 
-def _calls(n, tps, wait):
+def _tb_calls(n, tps, wait):
     return [{"st": "ok", "out": 400, "tps": tps, "wait_s": wait} for _ in range(n)]
 
 
@@ -415,7 +415,7 @@ class _FakeChat:
     made, plan = [], []
 
     def __init__(self, model):
-        self.model, self.per_call = model, (_FakeChat.plan.pop(0) if _FakeChat.plan else _calls(12, 50.0, 1.0))
+        self.model, self.per_call = model, (_FakeChat.plan.pop(0) if _FakeChat.plan else _tb_calls(12, 50.0, 1.0))
         _FakeChat.made.append(self)
 
     def start(self):
@@ -438,9 +438,9 @@ def test_terminalbench_reference_chat_route_holds_out_a_slow_server_cut_reruns_i
     d, cfg, clock, sleeps, sleep = _tb_setup(env, monkeypatch, tasks=("t1", "t2", "t3"), limit_s=0, reference={
         "models": ["open-m"], "chat": ["open-m"], "efforts": {"open-m": "max"}, "run": "r89", "parallel": 1,
         "note": "older rows are not comparable"})
-    serverhealth.History(tbcycle.folder() / tbcycle.HISTORY).add("open-m", _calls(20, 50.0, 1.0))
+    serverhealth.History(tbcycle.folder() / tbcycle.HISTORY).add("open-m", _tb_calls(20, 50.0, 1.0))
     _FakeChat.made.clear()
-    _FakeChat.plan[:] = [_calls(12, 50.0, 1.0), _calls(12, 5.0, 30.0), _calls(12, 50.0, 1.0), _calls(12, 50.0, 1.0)]
+    _FakeChat.plan[:] = [_tb_calls(12, 50.0, 1.0), _tb_calls(12, 5.0, 30.0), _tb_calls(12, 50.0, 1.0), _tb_calls(12, 50.0, 1.0)]
     tries = []
 
     def trial(model, task, root):
@@ -477,7 +477,7 @@ def test_terminalbench_reference_rejudges_a_cut_made_before_the_models_normal_sp
     d, cfg, clock, sleeps, sleep = _tb_setup(env, monkeypatch, tasks=("t1", "t2"), reference={
         "models": ["open-m"], "chat": ["open-m"], "parallel": 1, "rounds": 0})
     _FakeChat.made.clear()
-    _FakeChat.plan[:] = [_calls(3, 5.0, 30.0), _calls(12, 50.0, 1.0)]   # t1's slow calls come first: no normal yet
+    _FakeChat.plan[:] = [_tb_calls(3, 5.0, 30.0), _tb_calls(12, 50.0, 1.0)]   # t1's slow calls come first: no normal yet
 
     def trial(model, task, root):
         return {"reward": 0.0, "min": 15.0, "error": "AgentTimeoutError"} if task == "t1" else \
