@@ -11,3 +11,4 @@
 - bench: an unreachable docker engine stops the TB runner with no row written, so it never uses up reruns or books a model (t8716)
 - tests: exempt the bench fix round's scratch first-try patch from the durable-write check (t8716)
 - bench: the TB table shows failed server calls (stream or parse errors included) of all calls per model, and names harbor-broken trials as not run (t8716)
+- bench: a resumed TB trial reads its task's time limit too, so a resume with no bench limit no longer crashes (t8716)
