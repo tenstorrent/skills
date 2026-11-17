@@ -4188,6 +4188,20 @@ the review route), a tier (`light`, `standard`) or `{"tier", "provider", "model"
 never runs at max, and `eta.enabled` false turns the check off. The sweep runs in the coordinator's apply
 of obligations and promises; a daemon tick that also runs it is not wired yet.
 
+## Lanes on the same files line up and start early
+
+Two code tasks that name the same file used to run side by side and meet the conflict at landing. Now a
+new code task whose spec shares a file with an open code task gets that task in its `depends_on` (the
+newest one that may be waited on: never one holding a device or waiting itself, never one in its own
+lineage, never when the new task is urgent), and says so in the coordinator's notes. The wait is short:
+a queued code task whose only unmet dependency is a code task whose change is approved or batched in the
+push queue starts at once on that head, as `start_when: landed:#N` does, instead of waiting for the landing.
+Any other unmet dependency, or a task that carries a branch, keeps waiting for 'done'. A spec whose history
+estimate (its `cells:` times the median cell time, else the median run of its kind and tier) passes
+`overlap.split_hours` gets a split note: advice only.
+
+Settings under `overlap` (all default on): `auto_depend`, `early_deps`; `split_hours` (default 2, 0 = off).
+
 ## Where things live
 
 | Path | Holds |

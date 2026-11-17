@@ -109,6 +109,7 @@ from . import projmove
 from . import applyff, landff
 from . import userstep
 from . import ownwait
+from . import overlapdep
 from . import rankinherit
 from . import waitpoll
 from . import workernotify
@@ -15900,6 +15901,11 @@ class Daemon:
             self._start_probe(t["id"], d["when"], now, "start_when")
             if t["id"] not in self._probes:
                 self._start_verdict(t, self._probe_rc.pop(t["id"])[0], now)
+        try:   # a plain dependency on an approved code change starts early, as landed:#N does (overlapdep.py)
+            for tid in overlapdep.start_early(db, self.p, now):
+                log(self.p, f"task {tid} starts early on its dependency's approved head (overlapdep)")
+        except Exception:
+            log(self.p, "early dependency starts: " + traceback.format_exc().replace("\n", " | ")[:1000])
         self._dead_landed_waits(deferred, now)
         try:
             lanewait.rebase_notes(db, now)

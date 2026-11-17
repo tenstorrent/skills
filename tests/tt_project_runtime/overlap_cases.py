@@ -44,6 +44,7 @@ def test_task_add_warns_when_another_open_code_task_names_the_same_new_file(env)
     is no build dependency, so it runs beside; once it waits on that task the digest line drops the warning."""
     from ttp import coordinator as coord, overlap
     p = make(env)
+    p.set_config("overlap.auto_depend", False)   # these cases pin the plain overlap; overlapdep_cases has its own
     _on_base(p, "runtime/ttp/progress.py")
     first = p.db.add_task("progress check", "Add runtime/ttp/progress.py and tests/tt_project_runtime/"
                           "progress_cases.py with a stall detector.", kind="code", status="running")
@@ -81,6 +82,7 @@ def test_task_add_flags_a_file_an_unlanded_finished_branch_adds_as_a_new_file(en
     from ttp import coordinator as coord, overlap
     from ttp.db import deferral
     p = make(env)
+    p.set_config("overlap.auto_depend", False)   # these cases pin the plain overlap; overlapdep_cases has its own
     p.set_config("delivery.landed_probe", "test -e landed/{id}")   # no push branch: how landed:#<id> is checked
     (p.root / "runtime" / "ttp").mkdir(parents=True, exist_ok=True)
     (p.root / "runtime/ttp/relay.py").write_text("x = 1\n")
@@ -120,6 +122,7 @@ def test_task_add_gives_no_warning_for_ignored_common_files_hubs_or_bare_names(e
     folder (named in passing). URLs and words like and/or are no paths."""
     from ttp import coordinator as coord, overlap
     p = make(env)
+    p.set_config("overlap.auto_depend", False)   # these cases pin the plain overlap; overlapdep_cases has its own
     (p.root / "runtime" / "ttp").mkdir(parents=True, exist_ok=True)
     (p.root / "runtime/ttp/daemon.py").write_text("#" * 2000 + "\n")
     subprocess.run(["git", "-C", str(p.root), "add", "runtime/ttp/daemon.py"], check=True)
@@ -149,6 +152,7 @@ def test_worker_prompt_lists_unlanded_branches_that_touch_its_files(env):
     branches are not listed."""
     from ttp.prompts import worker_task
     p = make(env)
+    p.set_config("overlap.auto_depend", False)   # these cases pin the plain overlap; overlapdep_cases has its own
     done = p.db.add_task("progress check", "s", kind="code", status="done")
     branch = f"ttp/t{done}-progress-check"
     head = _branch_adding(p, branch, {"runtime/ttp/progress.py": "def append(state, rec): ...\n"})
@@ -172,6 +176,7 @@ def test_task_add_gives_no_warning_for_folders_or_the_required_check_files(env):
     (delivery.push_checks) name never count, however small; a shared runtime/ttp/progress.py still warns."""
     from ttp import coordinator as coord, overlap
     p = make(env)
+    p.set_config("overlap.auto_depend", False)   # these cases pin the plain overlap; overlapdep_cases has its own
     files = ["plugins/tt-project/runtime/ttp/relay.py", "plugins/tt-project/runtime/ttp/webapp.py",
              "tests/test_plugin_catalogue.py", "tests/test_tt_project_plugin.py",
              "tests/test_tt_project_runtime.py", "tests/tt_project_runtime/relay_cases.py"]
@@ -208,6 +213,7 @@ def test_overlap_lists_only_open_or_recent_unlanded_tasks(env):
     still off the push branch (start_when landed:#<id>) counts; the most recent are listed first."""
     from ttp import coordinator as coord, overlap
     p = make(env)
+    p.set_config("overlap.auto_depend", False)   # these cases pin the plain overlap; overlapdep_cases has its own
     root = p.root
     def git(*args):
         return subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True,
@@ -255,6 +261,7 @@ def test_overlap_warning_names_the_most_recent_few_then_a_count(env):
     names only those; the digest drops it once the task depends on them."""
     from ttp import coordinator as coord, overlap
     p = make(env)
+    p.set_config("overlap.auto_depend", False)   # these cases pin the plain overlap; overlapdep_cases has its own
     _on_base(p, "runtime/ttp/relay.py")
     ids = [p.db.add_task(f"t{i}", "Change runtime/ttp/relay.py.", kind="code", status="queued") for i in range(5)]
     assert coord.apply(p, [{"type": "task_add", "title": "mine", "kind": "code",
@@ -284,6 +291,7 @@ def test_a_shared_hot_or_settled_file_alone_never_chains_a_task(env, monkeypatch
     from ttp import coordinator as coord, overlap, reviewcap, settled
     from ttp.db import deferral, dependency_ids
     p = make(env)
+    p.set_config("overlap.auto_depend", False)   # these cases pin the plain overlap; overlapdep_cases has its own
     p.set_config("delivery.landed_probe", "test -e landed/{id}")   # no push branch: how landed:#<id> is checked
     hot, calm = "runtime/ttp/progress.py", "runtime/ttp/sweep.py"
     _on_base(p, hot, calm)
@@ -324,6 +332,7 @@ def test_task_add_chains_only_on_a_new_file_or_symbol_of_another_task(env):
     from ttp import coordinator as coord, overlap
     from ttp.db import deferral, dependency_ids
     p = make(env)
+    p.set_config("overlap.auto_depend", False)   # these cases pin the plain overlap; overlapdep_cases has its own
     p.set_config("delivery.landed_probe", "test -e landed/{id}")
     _on_base(p, "runtime/ttp/relay.py")
     (p.root / "runtime/ttp/relay.py").write_text("def send_once(x):\n    return x\n")
@@ -366,6 +375,7 @@ def test_task_add_never_chains_on_a_path_prefix_or_glob_only_on_a_complete_new_p
     from ttp import coordinator as coord, overlap
     from ttp.db import deferral, dependency_ids
     p = make(env)
+    p.set_config("overlap.auto_depend", False)   # these cases pin the plain overlap; overlapdep_cases has its own
     p.set_config("delivery.landed_probe", "test -e landed/{id}")
     _on_base(p, "tests/test_tt_project_plugin.py", "tests/test_tt_project_runtime.py", "runtime/ttp/relay.py")
 
@@ -417,6 +427,7 @@ def test_task_add_checks_the_branch_a_task_starts_from_before_chaining_on_a_new_
         return subprocess.run(["git", "-C", str(p.root), *args], check=True, capture_output=True,
                               text=True).stdout.strip()
     p = make(env)
+    p.set_config("overlap.auto_depend", False)   # these cases pin the plain overlap; overlapdep_cases has its own
     p.set_config("delivery.landed_probe", "test -e landed/{id}")
     _on_base(p, "runtime/ttp/relay.py")
     maker = p.db.add_task("maker", "Add a stall detector.", kind="code", status="running")
@@ -458,6 +469,7 @@ def test_task_add_never_chains_on_a_shared_path_outside_the_repo(env):
     from ttp import coordinator as coord
     from ttp.db import deferral, dependency_ids
     p = make(env)
+    p.set_config("overlap.auto_depend", False)   # these cases pin the plain overlap; overlapdep_cases has its own
     p.set_config("delivery.landed_probe", "test -e landed/{id}")
     _on_base(p, "runtime/ttp/relay.py")
     outside = "Write `$TTP_RUN_DIR/result.json`, note it in tt-project/harness/MEMORY.md, read " \
@@ -475,6 +487,7 @@ def test_settled_records_lapse_after_14_days_unless_given_an_expiry(env):
     and the setting is configurable."""
     from ttp import settled
     p = make(env)
+    p.set_config("overlap.auto_depend", False)   # these cases pin the plain overlap; overlapdep_cases has its own
     now = time.time()
     old = settled.add(p, ["runtime/ttp/a.py"], "old rule", created=now - 15 * 86400,
                       expires=None, commit=False)
@@ -499,6 +512,7 @@ def test_overlap_chain_never_waits_on_a_task_that_waits_on_the_new_tasks_own_lin
     from ttp import coordinator as coord, reviewcap
     from ttp.db import deferral
     p = make(env)
+    p.set_config("overlap.auto_depend", False)   # these cases pin the plain overlap; overlapdep_cases has its own
     p.set_config("delivery.landed_probe", "test -e landed/{id}")   # no push branch: how landed:#<id> is checked
     hot = "runtime/ttp/progress.py"   # on no base yet (its folder is): each task here adds it
     _on_base(p, "runtime/ttp/relay.py")
@@ -535,6 +549,7 @@ def test_a_task_that_rebases_or_re_lands_a_change_never_waits_on_that_change_lan
     from ttp import coordinator as coord, reviewcap
     from ttp.db import deferral
     p = make(env)
+    p.set_config("overlap.auto_depend", False)   # these cases pin the plain overlap; overlapdep_cases has its own
     p.set_config("delivery.landed_probe", "test -e landed/{id}")
     hot = "runtime/ttp/progress.py"
     _on_base(p, "runtime/ttp/relay.py")
@@ -558,6 +573,7 @@ def test_an_automatic_chain_uses_depends_on_where_no_landing_can_be_checked(env,
     from ttp import coordinator as coord, overlap
     from ttp.db import deferral, dependency_ids
     p = make(env)
+    p.set_config("overlap.auto_depend", False)   # these cases pin the plain overlap; overlapdep_cases has its own
     hot = calm = "runtime/ttp/progress.py"   # on no base yet (its folder is): the open task adds it
     _on_base(p, "runtime/ttp/relay.py")
 
@@ -591,6 +607,7 @@ def test_overlap_never_chains_or_suggests_depends_on_onto_device_or_waiting_task
     from ttp import coordinator as coord, overlap, reviewcap
     from ttp.db import deferral, dependency_ids
     p = make(env)
+    p.set_config("overlap.auto_depend", False)   # these cases pin the plain overlap; overlapdep_cases has its own
     p.set_config("device.locks", ["board0"])
     hot = "runtime/ttp/progress.py"   # on no base yet (its folder is): every task here adds it
     _on_base(p, "runtime/ttp/relay.py")
@@ -634,6 +651,7 @@ def test_a_continue_hop_drops_overlap_depends_on_onto_device_or_waiting_tasks(en
     from ttp import coordinator as coord
     from ttp.db import dependency_ids
     p = make(env)
+    p.set_config("overlap.auto_depend", False)   # these cases pin the plain overlap; overlapdep_cases has its own
     f = "runtime/ttp/progress.py"
     later = p.db.add_task("later", "Land the next batch.", kind="work", status="queued")
     a = p.db.add_task("A/B device run", f"Change {f}.", kind="code", status="running",
@@ -673,6 +691,7 @@ def test_an_urgent_task_keeps_its_new_file_chain_through_task_add_task_update_an
     from ttp.daemon import Daemon
     from ttp.db import deferral
     p = make(env)
+    p.set_config("overlap.auto_depend", False)   # these cases pin the plain overlap; overlapdep_cases has its own
     p.set_config("delivery.landed_probe", "test -e landed/{id}")
     _on_base(p, "runtime/ttp/relay.py")
     maker = p.db.add_task("maker", "Add runtime/ttp/stall.py with a detector.", kind="code", status="running")

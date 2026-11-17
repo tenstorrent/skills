@@ -716,7 +716,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # a settled area (settled.py) without an expiry of its own counts for settled_days.
     "overlap": {"enabled": True, "hub_bytes": 150000, "branch_days": 14, "settled_days": 14,
                 "ignore": ["CHANGELOG*", ".changeset/*", "changesets/*", "plugin.json", "marketplace.json",
-                           "package.json", "package-lock.json", "__init__.py"]},
+                           "package.json", "package-lock.json", "__init__.py"],
+                # overlapdep.py: lanes on the same files line up and start early; split advice
+                "auto_depend": True, "early_deps": True, "split_hours": 2.0},
     # The daily waste ledger (waste.py, `ttp waste`): a project whose avoidable share passes target_share
     # gets one fix task for its largest bucket (fix_task); wake_usd, max_runs and review_rounds are the
     # limits past which a coordinator wake, a task's runs and a change's review rounds count as avoidable.

@@ -80,6 +80,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     obligations,
     orderedask,
     outagemsg,
+    overlapdep,
     pauseends,
     plainreply,
     plangate,
@@ -3170,6 +3171,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     safe = safe or convgate.DEPENDENCY   # a real dependency: an urgent task keeps it too
                 else:
                     tie = None
+                if not tie and not urgent.is_urgent({"priority": a.get("priority") or 3, "spec": a.get("spec")}) \
+                        and (auto := overlapdep.auto_dependency(p, kind, clash, deps, roots)) \
+                        and str(auto[0]) not in landed.task_refs(when):   # overlapdep.py: lines up behind it
+                    deps = [*deps, auto[0]]
+                    notes.append(f"task_add: waits for #{auto[0]} ({auto[1]}); starts early once its change is approved")
                 labels += [file_overlap.label(clash, tie and tie[0], landing)] if clash else []
                 if lineage := _lineage_tie(p, kind, labels, {old["id"]} if old else set()):
                     labels.append(f"{worktree.LINEAGE_HOLD}{lineage[0]}")
@@ -3204,6 +3210,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                      f"an owner's work on")
                 if uo_note := _user_order(p, a, new_id, f"{title}\n{a.get('spec') or ''}", messages):
                     notes.append(f"task_add: #{new_id} {uo_note}")
+                try:   # advice only: a spec whose history estimate is long (overlapdep.split_note)
+                    if sn := overlapdep.split_note(p, kind, tier, a.get("spec") or ""):
+                        notes.append(f"task_add: #{new_id}: {sn}")
+                except Exception:
+                    pass
                 try:   # a spec missing its order's words or the earlier findings: a note, never a refusal
                     notes.extend(ctxblock.spec_notes(p, new_id))
                 except Exception as e:
