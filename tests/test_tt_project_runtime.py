@@ -3645,6 +3645,9 @@ def _run_to_end(argv, timeout=30, **kw):
     fails, at ten times the deadline, counted in the same stall-capped slices (a stall after the first clock
     read must not end it either)."""
     left, cap = timeout, 10 * timeout
+    own_group = not (kw.get("start_new_session") is False or "process_group" in kw or "preexec_fn" in kw)
+    if own_group:
+        kw["start_new_session"] = True   # so a timeout ends the command's whole tree, not only the command
     with subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kw) as proc:
         while True:
             last = time.monotonic()
@@ -3660,10 +3663,24 @@ def _run_to_end(argv, timeout=30, **kw):
                 if not _proc_tree_runnable(proc.pid):
                     left -= spent
                 if left <= 0 or cap <= 0:
-                    proc.kill()
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL) if own_group else proc.kill()
+                    except OSError:
+                        proc.kill()
                     proc.wait()   # not communicate(): a descendant it left may hold its pipes open
                     raise
     return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+
+def test_run_to_end_ends_the_whole_tree_of_a_command_that_times_out(tmp_path):
+    """A command that runs past its deadline is ended with everything it started: a process it left behind
+    would run on after the test (a busy loop did, for hours)."""
+    pidfile = tmp_path / "child.pid"
+    with pytest.raises(subprocess.TimeoutExpired):
+        _run_to_end(["sh", "-c", f"sleep 300 & echo $! > {pidfile}; wait"], timeout=1)
+    child = int(pidfile.read_text())
+    assert _wait_for(lambda: not os.path.exists(f"/proc/{child}") or
+                     Path(f"/proc/{child}/stat").read_text().rpartition(")")[2].split()[0] == "Z", 10)
+
 
 def _wait_for(pred, timeout=30.0) -> bool:
     deadline = time.time() + timeout
