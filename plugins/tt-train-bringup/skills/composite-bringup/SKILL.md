@@ -122,6 +122,18 @@ never an accepted baseline (see the
 [measurement protocol](../optimization-loop/SKILL.md#measurement-protocol)), and the work log says
 which of the two it is.
 
+### The learning check
+
+A loss trajectory over fresh data measures agreement with the reference, not learning: over a
+hundred real steps a LoRA run's loss moves less than the batch-to-batch spread, so a flat curve and
+a working optimiser look identical, and so do a working optimiser and a gradient that is being
+dropped, mis-signed or synced on the wrong axis after the comparison window ends. Add a check that
+cannot pass without learning: take one fixed batch, repeat it for K steps at the recipe's optimiser
+settings, and require the loss to fall by a stated factor (a small adapter on one batch goes most of
+the way to zero). State K and the factor before the run, assert them in the script, and record the
+curve. It costs K steps and it is the only evidence in the phase that the update reaches the
+parameters.
+
 When the plan's layout has tensor or data parallelism, the harness also runs every module at the
 per-rank shard shapes (the shapes the kernels actually see; a single-chip-only harness let the
 first TP chain of the reference bring-up crash on shapes it had never tested), and the loss match
@@ -156,8 +168,10 @@ Keep cold, warm, random-init and real-weight measurements distinct when comparin
 ## Gate
 
 PCC harness passes for every module and layer kind on the forward and every gradient at real shapes,
-including the per-rank shard shapes when the plan's layout is multi-chip. Loss over N steps matches
-torch within tolerance at the plan's layout. Full model runs training steps on the plan's chips
+including the per-rank shard shapes when the plan's layout is multi-chip. The real-weight two-layer
+check against the HF model class passes, loss over N steps matches torch within tolerance at the
+plan's layout (with the reference's layer count stated), and the fixed-batch learning check drives
+the loss down by its stated factor. Full model runs training steps on the plan's chips
 within the plan's memory budget. The first-baseline checks above have evidence, with no frozen
 gradient work or redundant constant preparation deferred to the loop. `doc/perf_analysis.md` exists
 with the baseline, the measured host/dispatch gap and the top-op kernel attribution. `doc/composite/README.md`
