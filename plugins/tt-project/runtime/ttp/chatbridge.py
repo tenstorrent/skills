@@ -928,7 +928,7 @@ class Bridge:
                             usage = (json.loads(line[5:]) or {}).get("usage") or usage
                         except (ValueError, AttributeError):
                             pass
-                    if line:
+                    if line.startswith("data:"):   # no `event:` or comment lines: an OpenAI client reads them as broken data
                         data = (line + "\n\n").encode()
                         h.wfile.write(b"%x\r\n%s\r\n" % (len(data), data))
                         h.wfile.flush()

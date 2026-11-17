@@ -4091,3 +4091,14 @@ def test_chatbridge_relays_openai_calls_with_their_own_tools_and_counts_usage(mo
     assert second["stream_options"] == {"include_usage": True}
     assert stats["usage"] == {"calls": 2, "input_tokens": 90, "output_tokens": 10, "cache_read_input_tokens": 40}
     assert _CB_KEY not in json.dumps(stats)
+
+
+def test_chatbridge_relay_forwards_only_data_lines_of_an_openai_stream(mock_chat):
+    # An upstream may send named events and comments between chunks; an OpenAI client reads them as broken data.
+    from ttp.chatbridge import Bridge
+    first = b'{"choices": [{"index": 0, "delta": {"content": "hi"}}]}\n\nevent: x-note\n: true'
+    up = mock_chat((200, [first, {"choices": [], "usage": {"prompt_tokens": 5, "completion_tokens": 2}}]))
+    with Bridge(up.url, _CB_KEY, "up-model") as b:
+        status, text = _post(b, {"model": "m", "stream": True, "messages": []}, path="/v1/chat/completions")
+    assert status == 200 and '"hi"' in text and "[DONE]" in text
+    assert "event:" not in text and ": true" not in text
