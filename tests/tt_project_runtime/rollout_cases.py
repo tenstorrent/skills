@@ -103,3 +103,167 @@ def test_rollout_state_is_account_wide_and_touches_no_project_file(env, capsys):
     assert st["flags"]["push_isolation"]["level"] == 1 and st["rings"] == {"1": ["someone"]}
     for key in ("flags", "rings", "excluded", "thresholds", "scratch_cap_usd"):
         assert f"rollout.{key}" in project.ACCOUNT_USER_ONLY and key in project.ACCOUNT_KEYS["rollout"]
+
+
+H = 3600.0
+
+
+def _ro_flag(flag, to, ago_h, kind="set"):
+    """The flag set to `to` `ago_h` hours back: its account value and a ledger record with that time."""
+    from ttp import project, rollout
+    rollout._put("flags", flag, to)
+    rec = {"ts": time.time() - ago_h * H, "kind": kind, "flag": flag, "from": "off", "to": to, "reason": "t", "by": "user",
+           "snapshot": {}}
+    project.durable_append(project.HOME_DIR / rollout.LEDGER, json.dumps(rec) + "\n")
+
+
+def _ro_runs(p, n, failed, ago_h, status_fail="failed"):
+    for i in range(n):
+        p.db.x("INSERT INTO runs(task,role,status,started,ended) VALUES(1,'worker',?,?,?)",
+               (status_fail if i < failed else "done", time.time() - ago_h * H - 5, time.time() - ago_h * H))
+
+
+def _ro_landed(p, took_h, cost, ago_h):
+    tid = p.db.add_task("t", "s", kind="code")
+    land = time.time() - ago_h * H
+    p.db.x("UPDATE tasks SET created=?, spent_usd=? WHERE id=?", (land - took_h * H, cost, tid))
+    p.db.x("INSERT INTO task_landings(marker, task, sha, target, ts) VALUES(?,?,?,?,?)", (f"m{tid}", tid, "a" * 40, "main", land))
+
+
+def test_health_signals_fail_only_past_their_threshold_and_sample_minimum(env):
+    from ttp import rollout_health as rh
+    p = make(env)
+    th, now = rh.thresholds({"thresholds": {"min_runs": 20}}), time.time() + 60
+    since = now - 24 * H
+    _ro_runs(p, 40, 4, 100)                # baseline: 10% failed
+    _ro_runs(p, 19, 19, 5)                 # too few runs to judge
+    assert rh.signals(p.db, since, now, th)["failing"] == [] and not rh.signals(p.db, since, now, th)["enough"]
+    _ro_runs(p, 1, 1, 5, "lost")           # 20 runs, all failed
+    _ro_runs(p, 30, 30, 5, "auth")         # auth failures are not counted
+    v = rh.signals(p.db, since, now, th)
+    assert v["runs"] == 20 and any(s.startswith("failed runs 100% against 10%") for s in v["failing"])
+    _ro_landed(p, 1, 2.0, 100)
+    _ro_landed(p, 1, 2.0, 101)
+    for _ in range(2):
+        _ro_landed(p, 3, 9.0, 3)
+    assert not [s for s in rh.signals(p.db, since, now, th)["failing"] if "landing" in s], "two landings are too few"
+    _ro_landed(p, 3, 9.0, 2)
+    failing = rh.signals(p.db, since, now, th)["failing"]
+    assert any("median time to land 3.0 h against 1.0 h" in s for s in failing)
+    assert any("cost per landing $9.00 against $2.00" in s for s in failing)
+    assert rh.thresholds({"thresholds": {"cost_x": 5, "bogus": 1, "stuck_h": "x"}})["cost_x"] == 5.0
+    assert "bogus" not in rh.thresholds({"thresholds": {"bogus": 1}})
+
+
+def test_health_flags_a_new_high_alert_a_forward_revert_and_a_stuck_task(env):
+    from ttp import rollout_health as rh
+    p = make(env)
+    th, now = rh.thresholds(None), time.time() + 60
+    since = now - 24 * H
+    ins = "INSERT INTO alerts(key, raised, severity, text) VALUES(?,?,?,'x')"
+    p.db.x(ins, ("push_not_landing", now - 100 * H, "high"))     # seen in the baseline: not new
+    p.db.x(ins, ("push_not_landing", now - 5 * H, "high"))
+    p.db.x(ins, ("push_queue_dying", now - 5 * H, "low"))        # not high
+    p.db.x(ins, ("some_other_key", now - 5 * H, "high"))         # not in the landing path
+    assert rh.signals(p.db, since, now, th)["failing"] == []
+    p.db.x(ins, ("after_push_failed", now - 4 * H, "high"))
+    assert rh.signals(p.db, since, now, th)["failing"] == ["new high alert after_push_failed"]
+    rid = p.db.add_task("Redo #7 alone: x", "s", kind="code", origin="daemon")
+    assert any("1 forward revert" in s for s in rh.signals(p.db, since, now, th)["failing"])
+    p.db.x("DELETE FROM tasks WHERE id=?", (rid,))
+    tid = p.db.add_task("stuck", "s", kind="code")
+    p.db.x("UPDATE tasks SET status='running', updated=? WHERE id=?", (now - 3 * H, tid))
+    assert any(f"#{tid}" in s for s in rh.signals(p.db, since, now, th)["failing"])
+    p.db.x("INSERT INTO runs(task,role,status,started) VALUES(?,'worker','running',?)", (tid, now - 3 * H))
+    assert not any(f"#{tid}" in s for s in rh.signals(p.db, since, now, th)["failing"]), "a live run is not stuck"
+
+
+def test_a_flags_window_starts_when_it_reached_the_ring_and_a_rollback_resets_it(env):
+    from ttp import rollout, rollout_health as rh
+    recs = [{"flag": "f", "kind": k, "to": t, "ts": ts} for k, t, ts in
+            (("set", 0, 10), ("promote", 1, 20), ("promote", 2, 30), ("rollback", "off", 40), ("arm", "off", 41),
+             ("clean", 0, 42), ("set", 1, 50))]
+    assert rh.entered("f", 0, recs[:3]) == 10 and rh.entered("f", 1, recs[:3]) == 20 and rh.entered("f", 2, recs[:3]) == 30
+    assert rh.entered("f", 0, recs) == 50 and rh.entered("f", 1, recs) == 50 and rh.entered("f", 2, recs) is None
+    assert rh.entered("f", 2, recs[:1]) is None
+
+
+def test_a_flag_promotes_only_with_every_listed_projects_clean_vote_after_the_soak(env):
+    from ttp import rollout, rollout_health as rh
+    now = time.time()
+    _ro_flag("deslop", 1, 30)
+    rollout.vote("deslop", "alpha", {})
+    rollout.vote("deslop", "alpha", {})
+    assert [r["reason"] for r in rollout.ledger("deslop") if r["kind"] == "clean"] == ["alpha clean"], "one vote each"
+    names = ["alpha", "beta"]
+    recs = lambda: rollout.ledger()
+    assert not rh.ready("deslop", 1, names, recs(), {}, now), "beta has not voted"
+    rollout.vote("deslop", "beta", {})
+    assert rh.ready("deslop", 1, names, recs(), {}, now + 1)
+    assert not rh.ready("deslop", 1, names, recs(), {"thresholds": {"soak_h_1": 40}}, now), "the soak has not passed"
+    assert not rh.ready("deslop", 2, names, recs(), {}, now) and not rh.ready("deslop", 1, [], recs(), {}, now)
+    assert rollout.frozen("deslop") is None, "votes never thaw or freeze a flag"
+
+
+def _watch(env, name="demo"):
+    from ttp.daemon import Daemon
+    p = make(env, name)
+    return p, Daemon(p.base)
+
+
+def test_the_daemon_rolls_a_flag_back_for_everyone_on_a_failing_signal_without_a_model(env):
+    from ttp import rollout
+    p, d = _watch(env)
+    rollout.set_ring(p.name, "1")
+    _ro_flag("deslop", 1, 3)
+    _ro_runs(p, 40, 4, 100)
+    _ro_runs(p, 20, 20, 1)
+    assert d.rollout_watch() == ["deslop"]
+    assert rollout.level("deslop") == rollout.OFF and rollout.frozen("deslop")["by"] == f"daemon:{p.name}"
+    assert "failed runs" in rollout.frozen("deslop")["reason"] and rollout.frozen("deslop")["snapshot"]["failing"]
+    note = p.db.one("SELECT text, severity FROM messages WHERE ref='rollout_rollback:deslop'")
+    assert note["severity"] == "normal" and "rolled back for every project" in note["text"] and "rollout arm deslop" in note["text"]
+    d._last_rolloutwatch = 0
+    assert d.rollout_watch() == [], "frozen: nothing more to do"
+    assert [r["kind"] for r in rollout.ledger("deslop")] == ["set", "rollback"]
+    assert rollout.rollback("deslop", "again", f"daemon:other").endswith("already")
+
+
+def test_the_daemon_leaves_a_projects_own_setting_and_unlisted_rings_alone_and_runs_every_15_minutes(env):
+    from ttp import rollout
+    p, d = _watch(env)
+    _ro_flag("deslop", 1, 3)
+    _ro_runs(p, 40, 4, 100)
+    _ro_runs(p, 20, 20, 1)
+    assert d.rollout_watch() == [] and rollout.level("deslop") == 1, "ring 2 is not covered by level 1"
+    rollout.set_ring(p.name, "1")
+    cfg = p.read_config()[0]
+    cfg.setdefault("deslop", {})["enabled"] = False
+    p.config_path.write_text(json.dumps(cfg))
+    d._load_config()
+    d._last_rolloutwatch = 0
+    assert d.rollout_watch() == [] and rollout.level("deslop") == 1
+    assert d.rollout_watch() == [] and d._last_rolloutwatch > time.time() - 5
+
+
+def test_the_daemon_votes_clean_and_promotes_when_the_ring_is_complete(env):
+    from ttp import rollout
+    p, d = _watch(env)
+    rollout.set_ring(p.name, "1")
+    _ro_flag("eta_history", 1, 30)
+    _ro_runs(p, 40, 4, 100)
+    _ro_runs(p, 24, 2, 1)
+    assert d.rollout_watch() == ["eta_history"] and rollout.level("eta_history") == 2
+    assert [r["kind"] for r in rollout.ledger("eta_history")] == ["set", "clean", "promote"]
+    assert rollout.ledger("eta_history")[-1]["by"] == f"daemon:{p.name}"
+
+
+def test_a_ring_with_no_samples_for_72_hours_stays_and_leaves_a_low_note(env):
+    from ttp import rollout
+    p, d = _watch(env)
+    rollout.set_ring(p.name, "1")
+    _ro_flag("device_prewarm", 1, 80)
+    assert d.rollout_watch() == []
+    assert rollout.level("device_prewarm") == 1 and rollout.frozen("device_prewarm") is None
+    note = p.db.one("SELECT text, severity FROM messages WHERE ref='rollout_thin:device_prewarm'")
+    assert note["severity"] == "low" and "too few runs" in note["text"]

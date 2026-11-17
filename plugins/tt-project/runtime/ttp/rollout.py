@@ -97,7 +97,7 @@ def ledger(flag: str | None = None) -> list[dict]:
 
 def frozen(flag: str) -> dict | None:
     """The ledger's last record for `flag` when it is a rollback (the flag waits for `arm`), else None."""
-    recs = ledger(flag)
+    recs = [r for r in ledger(flag) if r.get("kind") in ("set", "promote", "rollback", "arm")]
     return recs[-1] if recs and recs[-1].get("kind") == "rollback" else None
 
 
@@ -174,10 +174,23 @@ def rollback(flag: str, reason: str, by: str = "user", snapshot: dict | None = N
     """Turn `flag` off and freeze it until `arm`; the daemon calls this on a health failure, no model."""
     _check(flag)
     with _locked():
+        if by.startswith("daemon") and frozen(flag):   # another project's daemon got there first
+            return f"{flag} is rolled back already"
         old = level(flag)
         _put("flags", flag, None)
         _record("rollback", flag, old, OFF, reason or "rollback", by, snapshot)
     return f"{flag}: {old} -> off (frozen until `ttp rollout arm {flag}`)"
+
+
+def vote(flag: str, project: str, snapshot: dict) -> None:
+    """A project's clean health vote (ledgered, `reason` leads with its name); promotion needs one per
+    project listed in the flag's ring."""
+    with _locked():
+        since = max((r.get("ts") or 0 for r in ledger(flag) if r.get("kind") in ("set", "promote", "rollback", "arm")),
+                    default=0)   # one vote per project and stretch of the flag
+        if not frozen(flag) and not any(r.get("kind") == "clean" and r.get("reason") == f"{project} clean"
+                                        and (r.get("ts") or 0) >= since for r in ledger(flag)):
+            _record("clean", flag, level(flag), level(flag), f"{project} clean", f"daemon:{project}", snapshot)
 
 
 def arm(flag: str, reason: str = "", by: str = "user") -> str:

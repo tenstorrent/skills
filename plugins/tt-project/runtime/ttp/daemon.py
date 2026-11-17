@@ -52,6 +52,7 @@ from . import ownrunhold
 from . import reviewnow
 from . import untrusted
 from . import branchcap
+from . import rollout, rollout_health
 from . import localfault
 from . import sshmux
 from . import wakecost
@@ -1364,6 +1365,7 @@ class Daemon:
         self._last_prune = 0.0
         self._last_leftovers = 0.0   # when prune_leftovers last ran
         self._last_branchcap = 0.0   # when branch_cap last ran
+        self._last_rolloutwatch = 0.0   # when rollout_watch last ran
         self._branchcap_backlog = False   # its last sweep stopped at a limit: the next comes sooner
         self._prune_more: str | None = None   # "plain" or "force": worktrees were left to archive, sweep next tick
         self._release_due = 0.0   # when the installed tt-project release is next compared with the harness
@@ -2422,7 +2424,7 @@ class Daemon:
         for step in (self.lift_boot_pause, self.reap_runs, self.reap_waiting_checks, self.wake_after_reboot, self.meter_running, self.rebook_per_call_step, self.rebook_no_call_step, self.rebook_no_usage_step, self.watch_runs, self.watch_urgent_messages, self.check_steer_reads, self.relay_escalations, self.post_held_notifies, self.reconcile_tasks, self.retry_workspaces, self.tend_pushes,
                      self.sweep_sandbox_trees,
                      self.verify_pushes,
-                     self.tick_prune_worktrees, self.prune_leftovers, self.branch_cap, self.land_harness_worktrees, self.backup_branches, self.replicate_state, self.check_local_only, self.check_disk,
+                     self.tick_prune_worktrees, self.prune_leftovers, self.branch_cap, self.rollout_watch, self.land_harness_worktrees, self.backup_branches, self.replicate_state, self.check_local_only, self.check_disk,
                      self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends, self.check_move, self.track_outages,
                      self.check_integrity, self.heal_harness_git,
                      self.sync_schedules, self.lint_charter, self.lint_worker_prompt, self.tend_holds, self.record_ttr, self.alert_long_pause, self.reclassify_alerts,
@@ -15330,6 +15332,47 @@ class Daemon:
                         f"{', '.join(r['branch'] for r in gone[:10])}")
         branchcap.scan(self.p, now)
         return gone
+
+    def rollout_watch(self, every_s: float = 900) -> list[str]:
+        """Every 15 min, no model call: for each release-ring flag this project has on through the account's
+        rings (its own explicit setting is left alone), compare the window since the flag reached its ring
+        with the project's own trailing 7 days (rollout_health). A failing signal rolls the flag back for
+        every project (rollout.rollback: off and frozen until `ttp rollout arm`), alerts this project's
+        coordinator and tells the user; a clean window with enough samples votes for promotion, and the
+        vote that completes a ring's list promotes the flag one ring."""
+        now = time.time()
+        if now - self._last_rolloutwatch < every_s:
+            return []
+        self._last_rolloutwatch = now
+        cfg, name, done = rollout.settings(), self.p.name, []
+        recs = rollout.ledger()
+        for flag in rollout.FLAGS:
+            ring, lv = rollout.ring_of(name, cfg), rollout.level(flag, cfg)
+            if lv == rollout.OFF or ring is None or ring > lv or rollout.frozen(flag) \
+                    or rollout.own_setting(self.p.raw_config(), rollout.FLAGS[flag]["key"]):
+                continue
+            v = rollout_health.verdict(self.p.db, flag, ring, recs, cfg, now)
+            if v is None:
+                continue
+            if v["failing"]:
+                why = "; ".join(v["failing"])
+                log(self.p, f"rollout: {rollout.rollback(flag, why, f'daemon:{name}', v)}: {why}")
+                self.alert(f"rollout_rollback:{flag}", f"Release flag {flag} was rolled back for every project "
+                           f"(health in {name}: {why}). It stays off until `ttp rollout arm {flag}` once a fix landed.",
+                           severity="normal", every_s=0)
+                done.append(flag)
+            elif v["enough"] and ring == lv and lv in (0, 1):
+                rollout.vote(flag, name, v)
+                recs = rollout.ledger()
+                names = (cfg.get("rings") or {}).get(str(lv)) or []
+                if rollout_health.ready(flag, lv, names, recs, cfg, now):
+                    log(self.p, "rollout: " + rollout.promote(flag, f"clean in {', '.join(names)}", f"daemon:{name}"))
+                    done.append(flag)
+            elif ring == lv and lv in (0, 1) and now - v["since"] > rollout_health.thresholds(cfg)["max_window_h"] * 3600:
+                self.alert(f"rollout_thin:{flag}", f"Release flag {flag} has too few runs or landings in {name} to "
+                           f"promote after {rollout_health.thresholds(cfg)['max_window_h']:g} h; it stays at ring {lv}.",
+                           severity="low", every_s=24 * 3600)
+        return done
 
     def tick_prune_worktrees(self) -> list[dict]:
         """The tick's prune_worktrees: at most every PRUNE_TICK_MIN_S even while tasks keep finishing
