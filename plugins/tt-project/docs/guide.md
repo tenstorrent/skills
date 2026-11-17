@@ -4155,6 +4155,12 @@ and run it again.
 
 A task that hands off `waiting` on its own `ttp checks --result` or `ttp push --result` and whose `next_step` only says to report what happened ("report the push", "record the checks result and finish") needs no model once the result is in: the daemon records the hand-off's `on_pass` (or `done` with its summary) itself, as it does for a hand-off with no `next_step`. Only one short sentence of that kind counts. A step with a second action, a command, a rebase, a PR or shell punctuation keeps the wake. A spec change without `wake_now` or an `urgent:` line already sleeps until the wait ends, and a needs_review hand-off of an urgent or owed task is already reviewed at once; neither needed a change.
 
+## What a deadline needs ranks first, and a lost runner is replaced at once
+
+Dispatch ranks the required owners of an open obligation first, then urgent tasks. A task such an owner (or an urgent task) depends on, directly or through other tasks, now takes that rank too: it gets the earliest due of the owners that need it (`rankinherit.py`, used by `db.ready_tasks` and the daemon's dispatch), so routine work of a better priority never starts ahead of what a deadline waits for. An urgent task itself keeps its own lane. Unreadable obligations or open tasks lose only this boost, never the queue.
+
+A run whose supervisor process is gone (its recorded start no longer matches) is lost at once, even when its last lease renewal is under 3 minutes old; before, the daemon waited for the lease to go stale first. The task is then requeued and started by the next dispatch pass. Dispatch itself runs every 3 to 20 seconds while a task could start, so an idle slot and a ready task meet within a minute.
+
 ## Where things live
 
 | Path | Holds |

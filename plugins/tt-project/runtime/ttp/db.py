@@ -1219,10 +1219,10 @@ END""")
             self.q("SELECT * FROM tasks WHERE status='queued' AND (not_before IS NULL OR not_before<=?) "
                    "ORDER BY priority, id", (time.time(),))
         if rows:
-            from . import obligations, resumefirst
+            from . import obligations, rankinherit, resumefirst
             rows = resumefirst.order(rows)   # within a priority, a woken wait first (resumefirst.py)
             try:
-                due = obligations.owner_due(self)
+                due = rankinherit.inherited_due(self)   # owners and what they depend on (rankinherit.py)
             except Exception:   # unreadable obligations only lose the boost, never the queue
                 due = {}
             if due:

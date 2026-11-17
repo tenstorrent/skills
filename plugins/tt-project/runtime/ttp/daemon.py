@@ -109,6 +109,7 @@ from . import projmove
 from . import applyff, landff
 from . import userstep
 from . import ownwait
+from . import rankinherit
 from . import waitpoll
 from . import workernotify
 from . import anchors
@@ -846,9 +847,10 @@ def _push_not_landed(probe, rc) -> bool:
 
 
 def _owner_due(db) -> dict:
-    """obligations.owner_due, or none when unreadable (ready_tasks treats it the same way)."""
+    """obligations.owner_due with the dependencies of owners inherited (rankinherit), or none when unreadable
+    (ready_tasks treats it the same way)."""
     try:
-        return obligations.owner_due(db)
+        return rankinherit.inherited_due(db)
     except Exception:
         return {}
 
@@ -4519,8 +4521,10 @@ class Daemon:
             fresh = time.time() - (run_dir / "lease").stat().st_mtime <= LEASE_STALE_S
         except OSError:
             fresh = False
-        return fresh or (self._this_boot(r["boot_id"]) and bool(r["pid"]) and _alive(r["pid"])
-                         and self._is_supervisor(r) is not False)
+        this_boot = self._this_boot(r["boot_id"])
+        if fresh and this_boot and r["pid"] and self._is_supervisor(r) is False:
+            return False   # its supervisor is gone though its last lease is young: lost now, not 3 min on (L7)
+        return fresh or (this_boot and bool(r["pid"]) and _alive(r["pid"]) and self._is_supervisor(r) is not False)
 
     def _is_supervisor(self, r: dict) -> bool | None:
         """Whether the run's pid is still its supervisor: the start recorded beside it at launch
@@ -11456,7 +11460,7 @@ class Daemon:
         """obligations.owner_due, or {} when obligations are unreadable: they only lose the boost, never
         the queue (as db.ready_tasks)."""
         try:
-            return obligations.owner_due(self.p.db)
+            return rankinherit.inherited_due(self.p.db)
         except Exception:
             log(self.p, "obligation owners unreadable\n" + traceback.format_exc())
             return {}
