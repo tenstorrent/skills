@@ -177,7 +177,7 @@ No `result.json`, no credit.
  "on_pass_cmd": "if waiting: a check that writes the final hand-off (below)",
  "then": [{"retry_when": "if waiting: a later wait of a known sequence (below)"}],
  "wait_kind": "if waiting: self (your own detached checks or jobs, a planned window), user (a user step) or external",
- "eta": "outside work end ISO+tz, eta_basis: how",
+ "eta": "outside work end ISO+tz, eta_basis: how (add the conservative finish)",
 <!-- /ttp:if wait -->
 <!-- ttp:if device -->
  "needs_deep": "device task only: the problem you could not solve at this tier; its retry runs deep",
@@ -208,7 +208,9 @@ No `result.json`, no credit.
 <!-- /ttp:if cells -->
 - `waiting` when a resource is busy (a reservation, a queue, a review): back after `retry_after_s`,
   not an attempt. Urgent work: a retry, deadline wake or promised time sits at the expected finish of
-  what it waits on (`ttp eta <task>`), never a padded worst case. Save what you learned first. Always give a `retry_when`, run model-free every few
+  what it waits on (`ttp eta <task>`), never a padded worst case. For a long wait name the steps at
+  agent speed, the resource each waits on, likely and conservative finish, and re-estimate when 50%
+  over. Save what you learned first. Always give a `retry_when`, run model-free every few
   minutes in the project root: read-only, under a minute, printing a line naming its wait; exit 0
   once the wait is over whatever the outcome, 1 while it is not (75, a busy `ttp lock`, or 255, ssh
   failing, also keep it asleep); other exits wake it as broken. A failing remote command

@@ -18,6 +18,9 @@ with a threshold under `coordinator.course_check` in project.json (0 turns one o
   ($2); the median needs `spend_min_samples` (5) finished tasks. At most COSTLY_SHOWN lines, open
   tasks first, then the costliest finished ones, in id order; one count line names the rest and
   `ttp course <project>`, which lists them all.
+- over_estimate: a running worker run, at least `over_min_min` (15) minutes old, past `over_estimate`
+  (0.5, i.e. 50%) over the median of its kind and tier's done runs (needs `over_min_samples` (3)
+  of them). The coordinator re-estimates it: steer, split or restart it, and update promises.
 - idle_turns: the last `idle_turns` (6) or more coordinator turns in a row decided nothing, with
   their cost and what woke them.
 
@@ -37,7 +40,7 @@ from .db import DB, TERMINAL_TASK_STATES, deferral
 KEY = "course_check"
 HEADER = "## Course check (correct course this turn, or say in summary why it is fine)"
 DEFAULTS = {"fails_24h": 3, "queued_h": 6, "spend_ratio": 3, "spend_min_usd": 2, "spend_min_samples": 5,
-            "idle_turns": 6}
+            "idle_turns": 6, "over_estimate": 0.5, "over_min_samples": 3, "over_min_min": 15}
 BAD_RUNS = ("failed", "lost", "timeout", "stalled")
 DAY = 86400
 TITLE_CHARS = 60
@@ -133,6 +136,30 @@ def spend(db: DB, ratio: float, floor: float, samples: float, now: float) -> lis
     return out
 
 
+def over_estimate(db: DB, over: float, samples: int, floor_min: float, now: float) -> list[dict]:
+    """The running worker runs that have gone `over` (0.5: 50%) past the median of the done runs of their
+    kind and tier (eta.history; their kind alone when none of that tier), at least `floor_min` minutes in,
+    when `samples` or more done runs measure the median: {"id", "title", "kind", "min", "median_min", "n"}."""
+    if over <= 0:
+        return []
+    rows = db.q("SELECT t.id, t.title, t.kind, t.tier, r.started FROM runs r JOIN tasks t ON t.id=r.task "
+                "WHERE r.status='running' AND r.role!='coordinator' AND r.started IS NOT NULL ORDER BY t.id")
+    if not rows:
+        return []
+    from . import eta
+    h = eta.history(db, now)
+    out = []
+    for r in rows:
+        runs = h["run"].get((r["kind"], r["tier"])) or h["kind"].get(r["kind"]) or []
+        if len(runs) < samples:
+            continue
+        med, spent = eta._med(runs), now - float(r["started"])
+        if med and spent >= floor_min * 60 and spent > med * (1 + over):
+            out.append({"id": r["id"], "title": r["title"], "kind": r["kind"], "min": spent / 60,
+                        "median_min": med / 60, "n": len(runs)})
+    return out
+
+
 def _note(raw: Any) -> dict:
     try:
         note = json.loads(raw or "{}")
@@ -198,6 +225,15 @@ def digest_lines(db: DB, cfg: dict | None, now: float | None = None,
         lines.append(f"- costly: {len(rest)} more not listed ({n_open} open, {len(rest) - n_open} finished in 24 h; "
                      f"${sum(t['usd'] for t in rest):.2f}) | list them all: "
                      f"`ttp course {(cfg or {}).get('name') or '<project>'}`")
+    try:
+        slow = over_estimate(db, s["over_estimate"], int(s["over_min_samples"]), s["over_min_min"], now)
+    except Exception:   # an estimate that cannot be read only loses its line, never the section
+        slow = []
+    for t in slow:
+        lines.append(f"- over its estimate: #{t['id']} '{_title(t)}' has run {t['min']:.0f} min, {t['min'] / t['median_min']:.1f}x "
+                     f"the median {t['median_min']:.0f} min of {t['n']} done {t['kind']} runs | re-estimate it: read its "
+                     "progress, steer or split it, or restart it, and update any promise that waits on it")
+        ident.append(f"over_estimate:{t['id']}")
     if i := idle_turns(db, s["idle_turns"]):
         woke = ", ".join(f"{k} {v}" for k, v in sorted(i["wakes"].items(), key=lambda kv: (-kv[1], kv[0])))
         lines.append(f"- idle turns: the last {i['n']} coordinator turns decided nothing (${i['usd']:.2f} over "

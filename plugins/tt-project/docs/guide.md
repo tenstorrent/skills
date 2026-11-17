@@ -738,7 +738,9 @@ coordinator with that evidence.
   dependency or paused resource while worker slots are free; a task that spent `spend_ratio` (3)
   times the 7-day median of its kind and at least `spend_min_usd` ($2), given `spend_min_samples` (5)
   finished ones (at most 10 lines, open tasks first, then a count line; `ttp course <project>` lists
-  them all); and the last `idle_turns` (6) coordinator turns in a row that decided nothing.
+  them all); a running worker run at least `over_min_min` (15) minutes old that is `over_estimate` (0.5)
+  over the median of its kind and tier (`over_min_samples` (3) done runs measure it), which the coordinator
+  re-estimates; and the last `idle_turns` (6) coordinator turns in a row that decided nothing.
   Thresholds live under `coordinator.course_check` (0 turns one off). The coordinator corrects course
   in that turn or says why it is fine.
 - Corrections: a user or chat message that points out a miss is a likely correction, flagged
