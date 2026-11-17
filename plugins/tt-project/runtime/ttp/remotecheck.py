@@ -71,6 +71,7 @@ NO_ENV = "no-env"     # ... and when the pinned Python env cannot be made there 
 NO_WRAP = "no-wrap"   # the exit marker's form when the remote wrapper is missing there: a host fault
 WRAP_REFUSED = "wrap-refused"   # ... and when the wrapper refused the run (WRAP_REFUSED_ENV): a host fault
 WRAP_REFUSED_ENV = "TTP_WRAP_REFUSED"   # the file a wrapper writes before it exits FAULT_RC to refuse a run
+WRAP_STARTED = "wrap-started"   # the marker's form the command prints first behind a wrapper: the wrapper started it
 REAL_HOME = "ttp_real_home"   # the remote shell variable scratchhome.remote_lines keeps the real HOME in
 # Behind a spill wrapper: the pinned checks env first on PATH again and the user site off (runnerenv.remote_lines)
 REFRONT = ('if [ -n "${TTP_CHECKS_ENV_BIN:-}" ]; then PATH="$TTP_CHECKS_ENV_BIN${PATH:+:$PATH}"; '
@@ -468,9 +469,11 @@ def _run_script(q: str, exports_: str, cmd: str, mark: str, wrap: tuple[str, ...
     FAULT_RC after writing the file WRAP_REFUSED_ENV names prints its WRAP_REFUSED form. With `prio`, it all
     runs behind the host's `nice` and `ionice` (_priority). Behind a wrapper the pinned checks env
     (TTP_CHECKS_ENV_BIN, runnerenv.remote_lines) goes first on PATH again, so a wrapper that puts its own env first never hides it.
-    Python's output is unbuffered there (UNBUFFERED, before the check's env, which may set it otherwise)."""
+    Python's output is unbuffered there (UNBUFFERED, before the check's env, which may set it otherwise).
+    Behind a wrapper the command first prints the marker's WRAP_STARTED form: a wrapper that fails before it
+    starts the command (its own `set -e` step tripping on a busy host) is then a host fault, not the check's exit."""
     if wrap:
-        cmd = REFRONT + cmd
+        cmd = f"printf '\\n%s%s\\n' {mark} {WRAP_STARTED}\n" + REFRONT + cmd
     w = " ".join(map(shlex.quote, wrap))
     if wrap:   # the wrapper finds its own files under the account's real HOME; the check runs in the scratch one
         w = f'env HOME="${{{REAL_HOME}:-$HOME}}" {w} env HOME="$HOME"'
@@ -1009,6 +1012,7 @@ def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, s
         proc = subprocess.Popen(_ssh(host, script, direct), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT)
         rc, held, no_wrap, refused, wrap_refused, timing = None, b"", False, False, False, False
+        started = not wrap   # behind a wrapper: once the command printed the WRAP_STARTED marker
         out = sys.stdout.buffer
         for raw in iter(proc.stdout.readline, b""):
             text = raw.decode(errors="replace").strip()
@@ -1020,6 +1024,9 @@ def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, s
                 continue
             if text.startswith(mark + WRAP_REFUSED):   # the wrapper's reason after it, if it wrote one
                 wrap_refused, held = " ".join(text[len(mark + WRAP_REFUSED):].split()) or True, b""
+                continue
+            if text == mark + WRAP_STARTED:
+                started, held = True, b""
                 continue
             if text in (mark + NO_WRAP, mark + NO_ENV):
                 no_wrap, held = text[len(mark):], b""
@@ -1053,6 +1060,9 @@ def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, s
             return _fault(host, f"the spill wrapper {wrap[0]!r} refused the run there {WRAP_SETTING}{said} (exit "
                                 f"{FAULT_RC} and {WRAP_REFUSED_ENV}; its reason, if any, is above), so the check did not "
                                 "run there"), ""
+        if rc and not started:
+            return _fault(host, f"the spill wrapper {wrap[0]!r} exited {rc} before it started the check {WRAP_SETTING}, "
+                                "so the check did not run there"), ""
         if rc == FAULT_RC:
             _say(f"the command exited {FAULT_RC}; reported as 1, so it does not read as an unreachable host")
             return 1, ""

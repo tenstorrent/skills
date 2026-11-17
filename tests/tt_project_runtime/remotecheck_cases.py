@@ -2801,9 +2801,10 @@ def test_a_remote_wrapper_missing_on_the_host_is_a_fault_and_the_command_never_r
 
 def test_a_remote_wrapper_that_records_its_refusal_is_a_host_fault_and_a_plain_exit_75_still_fails(tmp_path):
     """A spill wrapper that refuses the run (a busy host) writes the file TTP_WRAP_REFUSED names and exits
-    FAULT_RC: a host fault, so the check runs again elsewhere, never a failed check. Exit 75 without that
-    file (from the wrapper or the check), the file with any other exit, or a check that writes it unwrapped
-    keep today's reading: 75 as 1, other codes as they are; a real failure stays a failure."""
+    FAULT_RC: a host fault, so the check runs again elsewhere, never a failed check. Exit 75 from the check
+    itself, or from a check that writes the file unwrapped, keeps today's reading (75 as 1); a real failure
+    stays a failure. A wrapper that exits before it starts the check (75 without the file, or any other code)
+    is a host fault too: the check never ran."""
     from ttp import remotecheck
     repo = _rc_repo(tmp_path)
     git = ["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=t"]
@@ -2833,11 +2834,46 @@ def test_a_remote_wrapper_that_records_its_refusal_is_a_host_fault_and_a_plain_e
     rc, out = go("exit 75")
     assert rc == 1 and "reported as 1" in out and remotecheck.SIG not in out, out
     rc, out = go("true", refuse="plain75")
-    assert rc == 1 and remotecheck.SIG not in out, "the wrapper's own 75 without the file is today's 1"
+    assert rc == remotecheck.FAULT_RC and "exited 75 before it started the check" in out, out
     rc, out = go("true", refuse="mark9")
-    assert rc == 9 and remotecheck.SIG not in out, "the file with another exit code is no refusal"
+    assert rc == remotecheck.FAULT_RC and "exited 9 before it started the check" in out, out
+    assert " refused the run there " not in out, "the file with another exit code is no refusal"
     rc, out = go('[ -n "$TTP_WRAP_REFUSED" ] && touch "$TTP_WRAP_REFUSED"; exit 75', wrap=())
     assert rc == 1 and remotecheck.SIG not in out, "unwrapped, there is no wrapper to refuse"
+    assert _rc_left(tmp_path) == []
+
+
+def test_a_wrapper_that_dies_before_it_starts_the_check_is_a_host_fault_never_the_checks_exit(tmp_path):
+    """A spill wrapper whose own step fails before it starts the check (a `set -e` script whose /proc scan
+    trips on a process that ended mid-read, on a host busy with short-lived processes) exits 2 with no output
+    of the check: that was read as the check's exit 2, so a post-landing suite failed with no failing test
+    named. It is a host fault, so the check runs again elsewhere; once the wrapper started the check, every
+    exit of the check is its own, also before it printed anything."""
+    from ttp import remotecheck
+    repo = _rc_repo(tmp_path)
+    git = ["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=t"]
+    (repo / "die.sh").write_text('#!/bin/bash\nset -euo pipefail\n'
+                                 'if [ -n "${DIE:-}" ]; then u=$(awk 1 /proc/no-such-pid/status 2>/dev/null); fi\n'
+                                 'exec "$@"\n')
+    (repo / "die.sh").chmod(0o755)
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-qm", "die"], check=True)
+    bin_, remote = _rc_fake_ssh(tmp_path)
+    ran = tmp_path / "ran"
+
+    def go(cmd, die=""):
+        r = subprocess.run(remotecheck.argv(cmd, "box1", {}, "", ("./die.sh",)), cwd=repo,
+                           env=_rc_env(bin_, remote, DIE=die), capture_output=True, text=True, timeout=60)
+        return r.returncode, r.stdout + r.stderr
+    rc, out = go(f"echo ran >> {ran}; exit 2", die="1")
+    assert rc == remotecheck.FAULT_RC and f"{remotecheck.SIG}box1" in out, out
+    assert "'./die.sh' exited 2 before it started the check" in out and not ran.exists(), out
+    assert remotecheck.wrap_fault(out)[0] == "box1" and remotecheck.wrap_busy(out) == ("", ""), out
+    rc, out = go(f"echo ran >> {ran}; exit 2")
+    assert rc == 2 and ran.exists() and remotecheck.SIG not in out, "the check's own exit 2 stays a failure"
+    rc, out = go("kill -TERM $$")
+    assert rc == 143 and remotecheck.SIG not in out, "a check killed before any output is still its own exit"
+    assert remotecheck.WRAP_STARTED not in out and "ttp-remote-rc" not in out, out
     assert _rc_left(tmp_path) == []
 
 
