@@ -203,7 +203,8 @@ def choose(db, cfg: dict, task: dict | None, tier: str, picked: dict | None = No
             run, why = "opus", f"needs Opus: {b}"[:200]
         elif arm == "glm" and held(db, cfg):
             run, why = "claude", "switched back"
-        elif arm == "glm" and (w := stays(db, cfg, task, tier, picked)):
+        elif arm == "glm" and (w := stays(db, cfg, task, "standard" if tier == "light" else tier, picked)):
+            # a light wake is no stay (the arm owns all of a task's runs); a tier-up retry still is
             run, why = "claude", w   # a pin, protected class, late review round or force line added since
     return {"arm": arm, "run": run, "why": why or str(got.get("why") or "")}
 

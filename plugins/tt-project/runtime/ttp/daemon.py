@@ -13838,11 +13838,14 @@ class Daemon:
         (route.py), or None: `fallback` is none when it starts there, else why it starts on the core
         provider (a cool-down after a fallback, or the auth gate holding the endpoint). With no tier,
         rule or pick route, its run class `cls` routes it (runclass.target): a review or floor run too.
-        A code task on the code route's chat arm (`arm`, codearm.choose) is routed to the arm's model first."""
+        A code task on the code route's chat arm (`arm`, codearm.choose) is routed to the arm's model first; any
+        other run of a code task under the arm (Claude, Sonnet, a bounce) stays on core, whatever its tier."""
         arm = arm if arm is not None else self._code_arm(task, tier, picked, peek=True)
         if arm and arm["run"] == "glm" and (s := codearm.settings(self.cfg)):
             e = self._route_entry(task, tier, s["provider"], s["model"], now, cls=cls, arm=True)
             return {**e, codearm.KEY: "glm", **({"pick_effort": s["effort"]} if s["effort"] else {})}
+        if arm:   # the arm owns every run of its code task: the tier route never moves one (light wakes included)
+            return None
         dp = self._model_pick(task, tier, peek=peek)
         if dp is not None:   # the model pick (modelpick.py) decides this tier's route
             got = modelpick.target(self.cfg, dp)

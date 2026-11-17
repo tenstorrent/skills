@@ -236,3 +236,30 @@ def test_ttp_push_from_a_run_that_handed_back_is_refused_before_it_touches_anyth
         assert e.value.code == push.REFUSED
         err = capsys.readouterr().err
         assert "handed its task back to Opus" in err and "talks to a person" in err
+
+
+def test_the_arm_owns_every_run_of_a_code_task_light_wakes_and_the_tier_route_included(env):
+    """With the arm on, a claude-arm task's runs never take the old tier route to the chat provider, and a glm
+    task's light wakes go to its arm; a tier-up run of a glm task and a task without an arm are as before."""
+    from ttp import codearm, daemon
+    p = make(env)
+    cfg = {**_ca_cfg(), "providers": {"chat": {"endpoint": "placeholder", "base_url": "https://chat.example.invalid/v1",
+                                                "tiers": {"light": "example-org/light-model"}}},
+           "route": {**_ca_cfg()["route"], "classes": {"light": {"to": "chat", "model": "example-org/light-model"}}}}
+    d = daemon.Daemon.__new__(daemon.Daemon)
+    d.p, d.cfg = p, cfg
+    d._model_pick = lambda *a, **k: None
+    glm, forced = _ca_task(p), _ca_task(p, "tidy it\ncode_arm: claude")
+    for t in (glm, forced):
+        codearm.choose(p.db, cfg, t, "standard")
+    assert codearm.recorded(p.db, forced["id"])["arm"] == "claude"
+    for tier in ("standard", "light"):   # the old tier route sent a light wake to chat
+        assert d._route(forced, tier, None, 1.0, cls="light") is None, tier
+    for tier in ("standard", "light"):
+        got = d._route(glm, tier, None, 1.0, cls="light")
+        assert got and got["to"] == "chat" and got["model"] == _CA_GLM["model"] and got[codearm.KEY] == "glm", tier
+    assert codearm.choose(p.db, cfg, glm, "light")["run"] == "glm"
+    assert codearm.choose(p.db, cfg, glm, "deep")["run"] == "claude"   # a tier-up run stays on Claude
+    assert d._route(glm, "deep", None, 1.0, cls="hard") is None
+    off = {k: v for k, v in cfg.items() if k != "route"} | {"route": {"classes": cfg["route"]["classes"]}}
+    assert codearm.choose(p.db, off, glm, "light") is None   # arm off: the old route applies
