@@ -13827,6 +13827,7 @@ class Daemon:
     def _code_arm(self, task: dict, tier: str, picked: dict | None, peek: bool = False) -> dict | None:
         """The code route's arm for this run (codearm.choose), or None (off, not code, or not readable)."""
         try:
+            codearm.log_refusal(self.p.db, self.cfg, lambda m: log(self.p, m))   # once per setting
             return codearm.choose(self.p.db, self.cfg, task, tier, picked, peek=peek)
         except Exception as e:   # the arm must never hold a task back: in doubt, Claude
             log(self.p, f"task {task.get('id')}: code arm not chosen: {type(e).__name__}: {e}"[:300])

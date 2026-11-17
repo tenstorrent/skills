@@ -8,8 +8,9 @@ Setting, under the code route it builds on (`route.code_sonnet`; off when that r
    "glm_seed": "",                                     # the coin's seed: a new seed re-deals new tasks only
    "glm_cap": {"start": 4, "min": 1, "max": 8},        # concurrent runs on the arm, moved by refusals
    "glm_guard_pts": 10, "glm_guard_min": 15}           # the switch-back guard
-The arm has the shape of a `route.device_ab_shadow` arm. A real worker run is Claude Code on the chat bridge
-(providers/chat.py), so `claude-code` is the only harness a live arm can take; any other keeps tasks on Claude.
+The arm has the shape of a `route.device_ab_shadow` arm. A live arm run needs a guarded harness (HARNESSES: one whose
+command layer enforces glmguard's side-effect guard); on any other harness `glm_share` is treated as 0 and tasks
+keep their normal route (refusal logs why once). Claude Code is not one: GLM there is untested live.
 
 Who takes the coin (choose): a new standard-tier code task that the Sonnet route could take (runclass.code_route:
 no pin, no outside input, no deep ask, not a retry), with no resource of any kind (device, machine, lock, read),
@@ -50,7 +51,11 @@ DAYS_KV = "code_arm_days"           # the guard's daily rows, newest last
 CAP_KV = "code_arm_cap"             # {"cap", "ts", "why"}
 ARMS = ("glm", "sonnet", "claude")
 BOUNCE = "needs_opus"               # the route entry's fallback for a bounce (route.BOUNCE)
-HARNESSES = ("claude-code",)        # the harnesses a live worker run can take
+# The harnesses a live worker run can take: only a harness whose command layer enforces the arm's side-effect
+# guard (glmguard). Claude Code's GLM runs are untested live and landed 0 of 8 in the benchmark, so it is not one.
+HARNESSES: tuple = ()
+KNOWN_HARNESSES = ("claude-code", "mini-swe-agent", "codex")   # named in a setting; only HARNESSES run live
+REFUSED_KV = "code_arm_refused"     # {"mark", "why", "ts"}: the setting a live refusal was logged for
 FORCE = re.compile(r"(?mi)^\s*code_arm:\s*(claude|opus|sonnet)\b")
 CONCLUSION = re.compile(r"(?mi)^\s*conclusion:")
 # A spec that leaves a design or policy choice open (weigh options, a trade-off, no data settles it) is Opus's
@@ -92,8 +97,8 @@ def settings(cfg: dict) -> dict | None:
     share = _num(got.get("glm_share"), 0, 1, 0.0)
     arm = got.get("glm") if isinstance(got.get("glm"), dict) else {}
     model = str(arm.get("model") or "").strip()
-    if share <= 0 or not model:
-        return None
+    if share <= 0 or not model or str(arm.get("harness") or "claude-code") not in HARNESSES:
+        return None   # a share on a harness that is not guarded is 0 for a live run (refusal says why)
     c = got.get("glm_cap") if isinstance(got.get("glm_cap"), dict) else {}
     lo = int(_num(c.get("min"), 1, 64, CAP["min"]))
     hi = max(lo, int(_num(c.get("max"), 1, 64, CAP["max"])))
@@ -103,6 +108,38 @@ def settings(cfg: dict) -> dict | None:
             "cap": {"start": min(hi, max(lo, int(_num(c.get("start"), 1, 64, CAP["start"])))), "min": lo, "max": hi},
             "pts": _num(got.get("glm_guard_pts"), 0, 100, GUARD_PTS),
             "min_tasks": int(_num(got.get("glm_guard_min"), 1, 10000, GUARD_MIN))}
+
+
+def refusal(cfg: dict) -> str:
+    """Why a live `glm_share` > 0 is treated as 0, '' when it is not: its `glm.harness` is not a guarded harness
+    (HARNESSES), so no run takes the arm and every code task keeps its normal route."""
+    from . import runclass
+    if not runclass.code_settings(cfg):
+        return ""
+    got = (cfg.get("route") or {}).get("code_sonnet")
+    got = got if isinstance(got, dict) else {}
+    arm = got.get("glm") if isinstance(got.get("glm"), dict) else {}
+    if _num(got.get("glm_share"), 0, 1, 0.0) <= 0 or not str(arm.get("model") or "").strip():
+        return ""
+    harness = str(arm.get("harness") or "claude-code")
+    if harness in HARNESSES:
+        return ""
+    return (f"route.code_sonnet glm_share is treated as 0: glm.harness {harness!r} is not a guarded harness "
+            f"({', '.join(HARNESSES) or 'none yet'}); a live arm run needs the side-effect guard in its command layer")
+
+
+def log_refusal(db, cfg: dict, log=None) -> str:
+    """The refusal's reason, logged once per setting (kv REFUSED_KV keeps the setting it was logged for)."""
+    why = refusal(cfg)
+    if not why:
+        return ""
+    mark = setting_mark(cfg)
+    got = db.kv(REFUSED_KV)
+    if not (isinstance(got, dict) and got.get("mark") == mark):
+        db.set_kv(REFUSED_KV, {"mark": mark, "why": why, "ts": time.time()})
+        if log:
+            log(why)
+    return why
 
 
 def setting_mark(cfg: dict) -> str:

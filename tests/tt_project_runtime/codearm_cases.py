@@ -16,8 +16,9 @@ def _ca_task(p, spec="tidy the helper and add a test", **kw):
     return p.db.task(t)
 
 
-def test_code_arm_is_off_by_default_and_needs_a_share_and_a_model():
+def test_code_arm_is_off_by_default_and_needs_a_share_and_a_model(monkeypatch):
     from ttp import codearm
+    monkeypatch.setattr(codearm, "HARNESSES", ("claude-code",))   # a stand-in guarded harness
     assert codearm.settings({}) is None
     assert codearm.settings({"route": {"code_sonnet": {"glm_share": 0.5}}}) is None   # no model
     assert codearm.settings({"route": {"code_sonnet": {"glm": dict(_CA_GLM)}}}) is None   # no share
@@ -263,3 +264,22 @@ def test_the_arm_owns_every_run_of_a_code_task_light_wakes_and_the_tier_route_in
     assert d._route(glm, "deep", None, 1.0, cls="hard") is None
     off = {k: v for k, v in cfg.items() if k != "route"} | {"route": {"classes": cfg["route"]["classes"]}}
     assert codearm.choose(p.db, off, glm, "light") is None   # arm off: the old route applies
+
+
+def test_a_live_share_on_a_harness_that_is_not_guarded_is_zero_and_logged_once(env, monkeypatch):
+    from ttp import codearm
+    monkeypatch.setattr(codearm, "HARNESSES", ())   # the shipped default: no guarded harness yet
+    p = make(env)
+    cfg = _ca_cfg()
+    assert codearm.settings(cfg) is None and "claude-code" in codearm.refusal(cfg)
+    assert codearm.choose(p.db, cfg, _ca_task(p), "standard") is None   # the task keeps its normal route
+    logged: list = []
+    assert codearm.log_refusal(p.db, cfg, logged.append) and len(logged) == 1
+    codearm.log_refusal(p.db, cfg, logged.append)
+    assert len(logged) == 1   # once per setting
+    cfg2 = _ca_cfg(glm_share=0.4)
+    codearm.log_refusal(p.db, cfg2, logged.append)
+    assert len(logged) == 2   # a changed setting logs again
+    assert codearm.refusal({}) == "" and codearm.refusal(_ca_cfg(glm_share=0)) == ""   # off: nothing to refuse
+    monkeypatch.setattr(codearm, "HARNESSES", ("claude-code",))
+    assert codearm.refusal(cfg) == "" and codearm.settings(cfg)["share"] == 1.0   # a guarded harness runs live
