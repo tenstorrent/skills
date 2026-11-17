@@ -2091,6 +2091,15 @@ For each urgent message the daemon, with no model call:
    a turn running, reaches that turn as an update; a second miss (`second_s` later) notifies the user at
    high. Each deadline fires once.
 
+Urgent also jumps the queue (part 2). An urgent message skips the debounce and the relay window, is read
+first in the coordinator's digest and tagged `[URGENT: ...]`, and, when a turn is already running, reaches
+it at once: an update in the run's steer file that the turn's hook hands over after its next tool call (the
+same path task updates take). A turn that cannot read updates, or has not read it within
+`urgent_msg.read_s` (90 s), is cut at a safe point with a resumable stop: its messages and events stay
+queued, nothing is marked failed, and the next turn resumes the same session with the urgent message
+first. A turn on a provider with no update hook is cut after `urgent_msg.cut_after_s` (30 s). The queue's
+safety holds (backoff, spend gates, a stopped provider) still apply. Every provider behaves the same.
+
 The coordinator's prompt makes the first finding due within 5 minutes with times, exempt from the rule
 that acks wait for the chat digest. During a long turn it posts it with `ttp urgent-reply <chat> <text>`
 (coordinator turns only, and only to a chat with an open urgent message) instead of waiting for the
