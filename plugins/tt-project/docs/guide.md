@@ -906,6 +906,28 @@ coordinator with that evidence.
   unreachable hosts and code and review tasks are exempt. Each close registers one reopen watch:
   the same probe every 6 h for 14 days, off the tick; its first pass queues one `reopens:<id>`
   follow-up with the closed task's spec.
+- Landing time breakdown (landings.py, `ttp landings [--days N] [--from <date>] [--top N] [--json]`),
+  model-free from the task, run, event, push-queue and checks records. For each task that landed, the wall
+  time from creation to landing is split by cause, each second counted once: queue before the first run,
+  run, review, checks run, checks slot, push queue or batch, and the gaps between runs by cause (own job,
+  retry wait, dependency, deferral, busy resource, ask or user, unknown). The tasks that carried the same
+  change (fixes, rebases, reviews) count as the change's own time. The output gives the median, p75, p90 and
+  mean, each step's total and share, runs per landed task, push batches that died with their causes, and
+  the slowest landings with their dominant cause. `ttp status` and the web app's task rows show each open
+  task's current step and how long it has been in it. The daily review lists the 5 slowest landings of 24 h
+  and the top recurring cause of 7 days, and queues one fix task titled `landing time: <cause>` for that
+  cause, never a second while one is open.
+- ETA ledger (etaledger.py, `ttp eta --calibration`): every ETA shown (the Expected finish of a task or a
+  promise, an obligation due, `ttp eta` output) is appended to `state/eta-ledger.jsonl` with its likely
+  and conservative times, and its delivered time once the work lands or the obligation closes. Promises
+  made before the ledger are backfilled from the obligation records. The weekly calibration line (also in
+  the daily review) gives the count, the median of actual over promised time and the share delivered by the
+  conservative time or the due. The target: 80% delivered by the conservative time, median ratio 0.7 to
+  1.3. A per-kind correction factor (median of actual over raw ETA, bounded 0.5 to 3, from at least 5
+  deliveries of that kind) scales the time left of the Expected finish shown; estimates inside the critical
+  path stay raw, so nothing compounds. Config `eta`: `correction: false` turns the factor off, `min_samples`,
+  `clamp` ([lo, hi]), `conservative_x` (the conservative time's multiple until enough deliveries measure
+  it) and `ledger: false` (record nothing).
 - Expected finish of outside waits (eta.py, `ttp eta`): a waiting task whose `retry_when` watches work
   outside the harness (a Slurm job, a detached run, another project's ack: any probe but a bare clock
   gate or `landed:#<id>`) shows 'no measured finish yet' with no time, in `ttp eta`, the coordinator's

@@ -751,7 +751,24 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
         from . import promptdrift
         if drift := promptdrift.line(p):
             out.append(drift)
+        try:   # where landing time went and how accurate the ETAs were (landings.py, etaledger.py)
+            from . import etaledger, landings
+            out += landings.audit_lines(db, now)
+            etaledger.refresh(db, p, now)
+            out.append(etaledger.line(etaledger.calibration(db, now, etaledger.cfg(p))))
+        except Exception:   # an unreadable record: the review goes on without these lines
+            pass
     return out or [NOTHING]
+
+
+def landing_report(db: DB, p: Project | None, now: float) -> dict:
+    """The landing breakdown summary (7 days) and the ETA calibration, for `ttp audit --json`."""
+    try:
+        from . import etaledger, landings
+        sm = landings.summary(landings.landed(db, now - 7 * 86400, now), 5)
+        return {"landing_breakdown": sm, "eta_calibration": etaledger.calibration(db, now, etaledger.cfg(p))}
+    except Exception:
+        return {}
 
 
 def report(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_h: float = BLOCKED_H,
@@ -777,4 +794,5 @@ def report(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked
             "context_gaps": context_gaps(db, since), "coordinator_fixes": coordfix.entries(db, since, now),
             "approval_to_landed": pushq.landing_times(db, since), "per_landed": per_landed(p, db, now),
             "outscan_refusals": outscan.refusal_counts(db, since),
-            **({"rule_cites": rulecite.metric(p, now, window_s)} if p is not None else {})}
+            **({"rule_cites": rulecite.metric(p, now, window_s)} if p is not None else {}),
+            **landing_report(db, p, now)}

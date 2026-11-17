@@ -1956,7 +1956,14 @@ def status_text(p: Project, verbose: bool = False) -> str:
     lines.extend(integrate.status_lines(db, cfg, quiet=True))
     if rows:
         lines.append("waiting:")
+    try:   # each waiting task's live landing step and how long it has been in it
+        from . import landings
+        blk = landings.blocking(db, [t for t in (db.task(i) for i in rows) if t], now)
+    except Exception:
+        blk = {}
     for tid, r in rows.items():
+        if tid in blk:
+            r["what"].append(landings.blocking_words(blk[tid]))
         lines.append(f"  #{tid} {'; '.join(r['what'])}: {r['title']}" + (f" — {'; '.join(r['why'])}" if r["why"] else ""))
         lines += r["extra"]
     recent = feed(db, now, limit=3)
@@ -2522,22 +2529,69 @@ def cmd_runs_live(a) -> None:
 def cmd_eta(a) -> None:
     """Expected finish of a task or obligation from its critical path (eta.py): measured medians, no padding.
     Workers read it before setting a retry or deadline wake."""
-    from . import eta, obligations
-    p = need(a.name, sys.argv[1:]) if a.name else here()
+    from . import eta, etaledger, obligations
+    target, name = a.target, a.name
+    if a.calibration and target and not str(target).lstrip("#o").isdigit():
+        target, name = None, target   # `ttp eta --calibration <project>`
+    p = need(name, sys.argv[1:]) if name else here()
     if not p:
         die("no tt-project project here; name one: `ttp eta <task> <name>`")
-    ref, now = str(a.target).lstrip("#"), time.time()
+    now = time.time()
+    if a.calibration:
+        etaledger.refresh(p.db, p, now, force=True)
+        cal = etaledger.calibration(p.db, now, etaledger.cfg(p), days=a.days)
+        print(json.dumps({**cal, "factors": (p.db.kv(etaledger.KEY) or {}).get("factors", {})}, indent=1)
+              if a.json else etaledger.line(cal))
+        return
+    if not target:
+        die("ttp eta needs a task id or an obligation key (or --calibration)")
+    ref = str(target).lstrip("#")
     if ref.isdigit():
         e = eta.estimate(p.db, int(ref), now, core=eta.core_of(p), delivery=p.config().get("delivery"))
+        key = f"t{ref}"
     elif (o := obligations.get(p.db, ref)) is not None:
         e = eta.obligation_estimate(p.db, o, now, eta._Est(p.db, now, core=eta.core_of(p),
                                                            delivery=p.config().get("delivery")))
+        key = o["id"]
     else:
         die(f"not a task id or obligation: {a.target}")
+    etaledger.refresh(p.db, p, now)
+    etaledger.record(p.db, p, [(key, etaledger.kind_of(p.db, e), e)], now, src="cli",
+                     due={key: ((o or {}).get("promise") or {}).get("due")} if not ref.isdigit() else None)
     if a.json:
         print(json.dumps({**e, "wake_at": eta.wake_at(e), "field": eta.field(e, p, now)}, indent=1))
     else:
         print(eta.text(e, p, now))
+
+
+def cmd_landings(a) -> None:
+    """Where landing time went over the last `--days` (landings.py), read-only and model-free."""
+    from . import landings
+    p = need(a.name, sys.argv[1:]) if a.name else here()
+    if not p:
+        die("no tt-project project here; name one: `ttp landings <name>`")
+    now = time.time()
+    since = now - a.days * 86400
+    if a.since:   # a date or time in this machine's zone, or an epoch
+        try:
+            since = float(a.since)
+        except ValueError:
+            try:
+                since = _dt.datetime.fromisoformat(a.since).timestamp()
+            except ValueError:
+                die(f"--from: not a date, time or epoch: {a.since}")
+        a.days = (now - since) / 86400
+    rows = landings.landed(p.db, since, now)
+    sm = landings.summary(rows, top=a.top)
+    sm["push_batch_died"] = landings.push_batch_deaths(p.db, since)
+    sm["events"] = landings.event_counts(p.db, since)
+    if a.json:
+        print(json.dumps(sm, indent=1))
+        return
+    print(landings.text(sm, a.days))
+    pb = sm["push_batch_died"]
+    if pb["count"]:
+        print(f"push batches that died: {pb['count']} ({', '.join(f'{k} {v}' for k, v in pb['causes'].items())})")
 
 
 def cmd_push_audit(a) -> None:
@@ -15861,10 +15915,24 @@ def main(argv: list[str] | None = None) -> None:
 
     s = sub.add_parser("eta", help="expected finish of a task or obligation from its critical path (measured "
                                    "medians): quote it, and set retry and deadline wakes at it")
-    s.add_argument("target", help="a task id (#12 or 12) or an obligation key (o5)")
+    s.add_argument("target", nargs="?", help="a task id (#12 or 12) or an obligation key (o5)")
     s.add_argument("name", nargs="?", help="the project (default: the one here)")
     s.add_argument("--json", action="store_true", help="print JSON (wake_at: the epoch to wake at)")
+    s.add_argument("--calibration", action="store_true",
+                   help="how the ETAs given compared with what was delivered (median actual/promised, share "
+                        "delivered by the conservative time or due) and the per-kind correction in use")
+    s.add_argument("--days", type=float, default=7.0, help="with --calibration: the window (default 7)")
     s.set_defaults(fn=cmd_eta)
+
+    s = sub.add_parser("landings", help="where landing time goes: created to landed split into queue, runs, "
+                                        "review, checks, push queue and gaps between runs by cause (model-free)")
+    s.add_argument("name", nargs="?", help="the project (default: the one here)")
+    s.add_argument("--days", type=float, default=7.0, help="landings of the last N days (default 7)")
+    s.add_argument("--from", dest="since", help="landings since this date or time (2026-11-12, or an epoch) "
+                                                "instead of the last --days")
+    s.add_argument("--top", type=int, default=5, help="how many slowest landings to list (default 5)")
+    s.add_argument("--json", action="store_true", help="print JSON")
+    s.set_defaults(fn=cmd_landings)
 
     s = sub.add_parser("hostcheck", help="one read-only check from a fixed catalogue on a host (`local`, this host "
                                          "or a ttp machines alias, through the project's own access)")

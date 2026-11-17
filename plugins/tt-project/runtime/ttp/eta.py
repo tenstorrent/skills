@@ -518,9 +518,20 @@ class _Est:
         return {"done": done, "end": end, "path": path, "legs": legs, "why": None, "overrun": over, "start": begin}
 
 
+def corrected(db, e: dict, now: float) -> dict:
+    """`e` with the ETA ledger's per-kind correction of its time left (etaledger.shown): the estimate to quote.
+    Estimates inside _Est stay raw, so a dependency chain never compounds it."""
+    from . import etaledger
+    try:
+        return etaledger.shown(db, e, now, etaledger.kind_of(db, e))
+    except Exception:
+        return e
+
+
 def estimate(db, tid: int, now: float | None = None, hist: dict | None = None, core: str | None = None,
              delivery: dict | None = None) -> dict:
-    return _Est(db, time.time() if now is None else now, hist, core, delivery).task(int(tid))
+    now = time.time() if now is None else now
+    return corrected(db, _Est(db, now, hist, core, delivery).task(int(tid)), now)
 
 
 def core_of(where) -> str | None:
@@ -562,7 +573,7 @@ def obligation_estimate(db, o: dict, now: float | None = None, est: _Est | None 
             return e
         if worst is None or e["end"] > worst["end"]:
             worst = e
-    return worst
+    return corrected(db, worst, est.now)
 
 
 def _dur(s: float) -> str:
@@ -579,8 +590,11 @@ def field(e: dict, where, now: float | None = None) -> str:
     if e["why"]:
         return f"ETA: no estimate yet ({e['why']})"
     path = "→".join(f"#{i}" for i in e["path"])
+    cons = e.get("conservative")
     return (f"ETA {timefmt.short(e['end'], where, now)} (critical path {path}"
-            + (", overrunning its median" if e["overrun"] else "") + ")")
+            + (", overrunning its median" if e["overrun"] else "")
+            + (f"; conservative {timefmt.short(cons, where, now)}" if cons and cons > e["end"] else "")
+            + (f"; corrected x{e['factor']:g} from past deliveries" if e.get("factor", 1.0) != 1.0 else "") + ")")
 
 
 def text(e: dict, where, now: float | None = None) -> str:
@@ -696,13 +710,17 @@ def state_lines(db, where, now: float | None = None, host=None, skip=()) -> list
     proms = open_promises(db)
     if not hot and not proms:
         return []
+    from . import etaledger
+    etaledger.refresh(db, where, now)
     est = _Est(db, now, core=core_of(where), delivery=delivery_of(where))
+    given: list = []
     out = ["## Expected finish (critical path, measured medians; quote these, never padded worst cases)"]
     # no estimate for one gate and reason: one line (titles in Open tasks); the gate ('after') is kept
     same: dict[tuple[str, str], list[tuple[dict, dict]]] = {}
     for t in hot[:10]:
         on = host(t) if host else ""
-        e = est.task(t['id'])
+        e = corrected(db, est.task(t['id']), now)
+        given.append((f"t{t['id']}", etaledger.kind_of(db, e), e))
         why = str(e["why"] or "").removeprefix(f"#{t['id']} ")
         if why and not on:
             same.setdefault((str(e.get("after") or ""), why), []).append((t, e))
@@ -714,5 +732,11 @@ def state_lines(db, where, now: float | None = None, host=None, skip=()) -> list
             out.append(f"- #{got[0][0]['id']} {got[0][0]['title'][:80]}: {field(got[0][1], where, now)}")
         else:
             out.append(f"- {ids}: ETA: after {after} ({why})" if after else f"- {ids}: ETA: no estimate yet ({why})")
-    out += [f"- promise {o['id']}: {field(obligation_estimate(db, o, now, est), where, now)}" for o in proms[:10]]
+    due = {}
+    for o in proms[:10]:
+        e = obligation_estimate(db, o, now, est)
+        out.append(f"- promise {o['id']}: {field(e, where, now)}")
+        given.append((o["id"], etaledger.kind_of(db, e), e))
+        due[o["id"]] = (o.get("promise") or {}).get("due")
+    etaledger.record(db, where, given, now, due=due)
     return out

@@ -768,7 +768,13 @@ def state_payload(p: Project, db: DB) -> dict:
     cfg, probed = p.config(), {}
     est = eta._Est(db, now, core=eta.core_of(cfg), delivery=eta.delivery_of(cfg))
     topped = topup.counts(db)   # budget top-ups of urgent or user-ordered tasks (topup.py)
+    try:   # each open task's live landing step and how long it has been in it (landings.py)
+        from . import landings
+        blk = landings.blocking(db, tasks, now)
+    except Exception:
+        blk = {}
     for t in tasks:
+        t["blocking_step"] = landings.blocking_words(blk[t["id"]]) if t["id"] in blk else None
         t["budget_topups"] = topped.get(t["id"])
         t["job_use"] = [f"job {j['name']}: {j['line']}" for j in job_use.values() if j.get("task") == t["id"]] or None
         t["review_since"] = in_review.get(t["id"])
