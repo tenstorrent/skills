@@ -627,3 +627,15 @@ def test_daily_a_cheat_flagged_cell_is_never_landed_and_is_listed_apart(tmp_path
     md = (root / "table.md").read_text()
     assert "## Flagged by the cheat audit" in md and "A-1 glm: runs 'git fetch'" in md
     assert "v1: cannot separate the models (user msg #3111)." in md
+
+
+def test_daily_a_flagged_cell_is_not_counted_landed_by_the_second_grader_either(tmp_path):
+    from ttp import benchdaily
+    root = tmp_path / "daily"
+    (root / "days").mkdir(parents=True)
+    cell = {**_dd_cell("A", "glm", "chat:g:max", 1, 4, 4, True, 2.0, 30, claude=False), "outcome": "flagged",
+            "flags": ["runs 'git fetch'"], "second_landed": True, "second_criteria": 4, "second_correctness": 4}
+    (root / "days" / "2026-11-15.json").write_text(json.dumps(
+        {"day": "2026-11-15", "cells": [cell], "skipped": [], "dropped": []}))
+    g = benchdaily.write_table(root)["models"]["chat:g:max"]
+    assert (g["landed"], g["second_landed"]) == (0, 0)

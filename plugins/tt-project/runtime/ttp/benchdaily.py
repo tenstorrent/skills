@@ -659,7 +659,8 @@ def cumulative(root: Path | None = None) -> dict:
                 "usd_per_task": round(sum(r["cost_usd"] for r in rows) / n, 2),
                 "min_per_task": round(sum(r["minutes"] for r in rows) / n, 1),
                 "stops": sum(1 for r in rows if r["stopped"]),
-                **({"second_n": len(two), "second_landed": sum(1 for r in two if r["second_landed"]),
+                **({"second_n": len(two),
+                    "second_landed": sum(1 for r in two if r["second_landed"] and r.get("outcome") != "flagged"),
                     "second_criteria": round(sum(r["second_criteria"] for r in two) / len(two), 2),
                     "second_correctness": round(sum(r["second_correctness"] for r in two) / len(two), 2)}
                    if (two := [r for r in rows if "second_landed" in r]) else {})} if n else {}
