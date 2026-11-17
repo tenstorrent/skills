@@ -38,7 +38,9 @@ other model goes through the endpoint and its runner is wrapped in `ttp lock <re
 LOCK, "" for none), so one endpoint model runs at a time. reference.parallel (default 1) runs that many of a
 model's tasks at once. limit_s 0 (harborslice) gives every model its task's own limit. A model listed in
 reference.chat goes through the project's chat endpoint (providers.chat; no reference endpoint needed) by a
-loopback relay in the runner (one per trial, like the bridge) that times every call, under the same lock.
+loopback relay in the runner (one per trial, like the bridge) that times every call, under the same lock; the
+relay adds the effort's request fields (providers.chat.effort_fields, as a chat worker at that effort gets) and
+the table's how-called line names them (parity request).
 reference.run names a comparison run: its trials, rows and table live in terminalbench/<run> (ref_dir) and
 reference.note is printed in its table.
 
@@ -434,19 +436,25 @@ def ref_runner(cfg: dict, model: str, env: dict, *, trial: Callable | None = Non
         meta = {"started": clock(), "tasks": harborslice.tasks(home, s), "effort": ref_effort(s, model), "route": via,
                 "model": model}
         meta["parity"] = parity(s, model, meta, via, harborslice.version(env))
+        if via == CHAT_ROUTE:   # what the relay adds for the effort (providers.chat.effort_fields), never a key or URL
+            from . import chatbridge
+            f = chatbridge.settings(cfg, "standard", model, meta["effort"]).get("fields") or {}
+            meta["parity"]["request"] = (json.dumps(f, sort_keys=True) if f else
+                                         "no effort field (none in providers.chat.effort_fields): the server's default")
         durable_write(d / f"{sl}.json", json.dumps(meta))
     try:
         if via == BRIDGE_ROUTE:   # the logged-in CLI, no key: the agent's env points at the loopback server
             from .claudebridge import ClaudeCliBridge
             mk = bridge or (lambda m, e: ClaudeCliBridge.from_settings({"model": m, "effort": e}))
             make = lambda: mk(model, meta["effort"])   # noqa: E731
-        elif via == CHAT_ROUTE:   # the chat endpoint's key stays in the relay; the effort rides in the call (ref_command)
-            from . import chatbridge
-            mk = chat or (lambda m: chatbridge.Bridge.from_settings(chatbridge.settings(cfg, "standard", m, "")))
+        elif via == CHAT_ROUTE:   # the chat endpoint's key stays in the relay, which also adds the effort's request
+            from . import chatbridge   # fields (providers.chat.effort_fields), as for a chat worker at that effort
+            mk = chat or (lambda m: chatbridge.Bridge.from_settings(
+                chatbridge.settings(cfg, "standard", m, meta["effort"])))
             make = lambda: mk(model)   # noqa: E731
         else:
             make = None
-        cmd = harborslice.COMMAND if via == BRIDGE_ROUTE else ref_command(meta["effort"])
+        cmd = harborslice.COMMAND if via in (BRIDGE_ROUTE, CHAT_ROUTE) else ref_command(meta["effort"])
         hist = serverhealth.History(folder() / HISTORY)
         done, put, dead, info = _rows(d / f"{sl}.jsonl", meta["tasks"]), Lock(), Event(), {}
 
@@ -623,7 +631,7 @@ def table(run: str, note: str = "") -> str:
     out += ["", f"Passed counts scored trials only; the denominator is the task count. Limit: {', '.join(lims) or '?'} "
             f"(seconds per task, or each task's own limit), counted as {pars[0].get('limit_counts') if pars else '?'}.", "",
             "## Cut-offs", ""] + (cuts or ["None."]) + [""]
-    out += benchparity.section(pars, extra=("route",))
+    out += benchparity.section(pars, extra=("route", "request"))
     if note:
         out += ["## Note", "", note, ""]
     return "\n".join(out)

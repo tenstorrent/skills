@@ -468,6 +468,7 @@ def test_terminalbench_reference_chat_route_holds_out_a_slow_server_cut_reruns_i
     assert "| open-m | max | chat | 2 of 3 |" in md
     assert "open-m / t2: server (" in md and "rerun on a healthy server: passed" in md
     assert "open-m / t3: model: cut at the limit while the server ran at normal speed" in md
+    assert "request no effort field (none in providers.chat.effort_fields)" in md, "how the effort reached the server"
     assert "## How each arm was called" in md and "older rows are not comparable" in md
 
 

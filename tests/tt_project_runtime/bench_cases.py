@@ -1354,6 +1354,7 @@ def test_terminalbench_trial_runs_terminus2_with_the_key_in_env_only_and_resumes
     assert cmd[cmd.index("-a") + 1] == "terminus-2" and cmd[cmd.index("-m") + 1] == "openai/org/m-a"
     assert cmd[cmd.index("-n", 3) + 1] == "1" and cmd[cmd.index("-i") + 1] == "t-a"
     assert cmd[cmd.index("--agent-timeout-multiplier") + 1] == "0.5", "900 s of the task's own 1800 s"
+    assert cmd[cmd.index("--path") + 1] == str(ds) and "--dataset" not in cmd, "a local folder goes by --path"
     assert 'llm_call_kwargs={"num_retries":8}' in cmd and not any("fake-key" in w or "endpoint" in w for w in cmd)
     assert got == {"reward": 1.0, "min": 6.0, "error": None}
     assert harborslice.trial("org/m-a", "t-a", tmp_path / "jobs", env, st, runner) == got and len(calls) == 1, \

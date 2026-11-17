@@ -288,6 +288,9 @@ def trial(model: str, task: str, root: Path, env: dict, st: dict, runner: Callab
             job.parent.mkdir(parents=True, exist_ok=True)
             cmd = [w.format(model=model, task=task, jobs=job.parent, name=job.name, dataset=st["dataset"],
                             agent=st["agent"]) for w in shlex.split(command or COMMAND)]
+            if Path(st["dataset"]).expanduser().is_dir():   # a local dataset folder: harbor takes it by --path
+                cmd = ["--path" if w == "--dataset" else str(Path(w).expanduser()) if w == st["dataset"] else w
+                       for w in cmd]
             lim = _task_limit(st["dataset"], task)
             if lim and st["limit_s"]:
                 cmd += ["--agent-timeout-multiplier", f"{st['limit_s'] / lim:.4g}"]

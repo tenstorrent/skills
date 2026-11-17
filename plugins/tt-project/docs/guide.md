@@ -1704,7 +1704,8 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    naming the endpoint step and starts nothing.
    For a same-conditions comparison, `reference.bridge` lists models called through the logged-in
    `claude` CLI (no API key) and `reference.chat` models called through the project's chat endpoint by a
-   relay that times each call (under the `chat-server` lock, one such model at a time); `reference.run`
+   relay that times each call and adds the effort's request fields from `providers.chat.effort_fields`
+   (under the `chat-server` lock, one such model at a time); `reference.run`
    names the run's own folder and `limit_s` 0 gives every model each task's own limit. A chat-route task
    cut off while the server ran slower than that model's normal speed is held out, never failed, and
    rerun one at a time once a probe shows the server healthy (at most `reference.rounds` times). The run
