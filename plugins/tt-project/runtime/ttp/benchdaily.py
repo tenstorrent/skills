@@ -24,7 +24,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import bench, benchblind, benchrun, blindreview, effort, gitmemo, serverhealth
+from . import bench, benchblind, benchpack, benchrun, blindreview, effort, gitmemo, serverhealth
 from .project import durable_write, open_append
 
 CAP_USD = 40.0       # Claude spend a day (arm runs plus reviews)
@@ -583,6 +583,7 @@ def cumulative(root: Path | None = None) -> dict:
     """The running table from every day's record under `root`/days: per project and arm, and per arm overall."""
     root = root or home()
     cells, gaps, seconds, server, reruns, limits = [], [], [], [], [], {}
+    orig, gone, left = {"n": 0, "passed": 0, "per_task": {}}, [], []
     days = sorted((root / "days").glob("*.json")) if (root / "days").exists() else []
     for p in days:
         try:
@@ -591,6 +592,12 @@ def cumulative(root: Path | None = None) -> dict:
             continue
         cells += [{**c, "day": p.stem} for c in rec.get("cells") or []]
         limits[p.stem] = rec.get("limit_s")
+        if o := rec.get("original"):   # the original landed change, graded blind with the arms (benchpack)
+            orig["n"] += o["n"]
+            orig["passed"] += o["passed"]
+            orig["per_task"].update({f"{p.stem}/{t}": v for t, v in o["per_task"].items()})
+        gone += [{"day": p.stem, **x} for x in rec.get("dropped_original") or []]
+        left += [{"day": p.stem, **x} for x in rec.get("not_code_bench") or []]
         server += [{"day": p.stem, **x} for x in rec.get("server") or []]
         reruns += [{"day": p.stem, **x} for x in rec.get("reruns") or []]
         if (cmp := (rec.get("second_grader") or {}).get("compare")):
@@ -621,6 +628,9 @@ def cumulative(root: Path | None = None) -> dict:
             "models": {m: agg(rs) for m, rs in sorted(per.items())}, "gaps": gaps,
             **({"server": server} if server else {}),
             **({"reruns": reruns} if reruns else {}),
+            **({"original": orig} if orig["n"] else {}),
+            **({"dropped_original": gone} if gone else {}),
+            **({"not_code_bench": left} if left else {}),
             "parity": [parity_row(m, rs, limits) for m, rs in sorted(per.items())],
             **({"second_days": seconds} if seconds else {})}
 
@@ -669,6 +679,20 @@ def table_md(cum: dict) -> str:
     for proj, ms in cum["projects"].items():
         lines += ["", f"## {proj}", "", head]
         lines += [_row(m, a, two) for m, a in ms.items()]
+    if cum.get("original"):
+        o = cum["original"]
+        lines += ["", "## Original change", "",
+                  f"The change that really landed, graded blind in the same batch as the arms: {o['passed']}/{o['n']} "
+                  "passed. A task whose original does not pass is out of the table (listed below); the arms are "
+                  "compared on the rest."]
+    if cum.get("dropped_original"):
+        lines += ["", "## Dropped: the original change did not pass", ""]
+        lines += [f"- {x['day']}: {x['project']} {x['task']}: {x['why']}" for x in cum["dropped_original"]]
+    if cum.get("not_code_bench"):
+        lines += ["", "## Not in the code bench", "",
+                  "Tasks whose original worker's context cannot be rebuilt (live-only: it needed a live system; "
+                  "invalid: its records or its criteria cannot support a fair comparison):"]
+        lines += [f"- {x['day']}: {x['project']} {x['task']}: {x['class']}: {x['why']}" for x in cum["not_code_bench"]]
     if cum.get("server"):
         lines += ["", f"## {serverhealth.NOT_SCORED[0].upper() + serverhealth.NOT_SCORED[1:]}", "",
                   "Cells the model server cut (the limit, the wall ceiling or a capacity refusal while it ran slower than "
@@ -716,14 +740,20 @@ def parse_arms(extra: list[str] | None, glm_harness: str | None = None) -> dict:
     return dict(benchrun.parse_arm(x) for x in texts)
 
 
-def build_tasks(day: str, picked: dict, root: Path, bench_dir: Path, skip: str | None = None) -> dict[str, dict]:
-    """The day's bench tasks (build) of every picked project, from picked.json and the project mirrors."""
+def build_tasks(day: str, picked: dict, root: Path, bench_dir: Path, skip: str | None = None,
+                left: list | None = None) -> dict[str, dict]:
+    """The day's bench tasks (build) of every picked project, from picked.json and the project mirrors. Each gets
+    its context pack (benchpack); a task that is live-only or invalid is left out and, with `left`, listed there."""
     projs = {p["name"]: p for p in projects(skip)}
     tasks: dict[str, dict] = {}
     for name in sorted({k["project"] for k in picked["order"]}):
         repo = root / "mirrors" / slug(name)
         tasks.update(build(day, projs[name], [k for k in picked["order"] if k["project"] == name], repo, bench_dir))
-    return tasks
+    kept, out = benchpack.screen(tasks, {n: open_ro(projs[n]["db"]) for n in {t["project"] for t in tasks.values()}},
+                                 bench_dir)
+    if left is not None:
+        left += out
+    return kept
 
 
 def run_day(day: str, start: float, end: float, arms: dict, cfg: dict, cap: float = CAP_USD, parallel: int = PARALLEL,
@@ -771,15 +801,21 @@ def run_day(day: str, start: float, end: float, arms: dict, cfg: dict, cap: floa
     for name, arm in arms.items():
         benchrun.check_harness(name, arm)
     arms = {name: benchrun.resolve_harness(arm, opts or {}) for name, arm in arms.items()}
-    tasks = build_tasks(day, picked, root, bench_dir, skip)
-    order = [f"{slug(k['project'])}-{k['task']}" for k in picked["order"]]
+    left: list[dict] = []
+    tasks = build_tasks(day, picked, root, bench_dir, skip, left)
+    order = [f"{slug(k['project'])}-{k['task']}" for k in picked["order"] if f"{slug(k['project'])}-{k['task']}" in tasks]
     opts = {"timeout_s": LIMIT_S, "stall_s": 900, "budget_usd": CELL_USD, "review_usd": REVIEW_USD,
             "test_cmd": benchrun.TEST_CMD, "test_timeout_s": 900, "dry_run": False, "scratch_home": True,
             "review_mean": prior_review_mean(root, day), **(opts or {})}
     done = run_cells(day, tasks, arms, out, bench_dir, opts, cfg, cap, parallel, order, say)
-    graded = blind_review(out, tasks, arms, cfg, ask, ask2=ask2)
+    benchpack.add_original(out, tasks)
+    graded = blind_review(out, tasks, {**arms, benchpack.ORIGINAL: benchpack.ORIGINAL_ARM}, cfg, ask, ask2=ask2)
     skipped = picked.get("skipped", []) + done["skipped"]
-    rec = day_record(day, tasks, arms, out, graded, skipped, picked["dropped"])
+    rec = day_record(day, tasks, {**arms, benchpack.ORIGINAL: benchpack.ORIGINAL_ARM}, out, graded, skipped,
+                     picked["dropped"])
+    rec["cells"], gone, rec["original"] = benchpack.split_original(rec["cells"])
+    rec["dropped_original"] = gone
+    rec["not_code_bench"] = left   # live-only or invalid: left out of the code bench, with why
     rec["faults"] = picked.get("faults", [])
     rec["admitted"] = done["admitted"]   # which reservation rule admitted each task
     rec["limit_s"] = opts["timeout_s"]   # the parity check's limit (cumulative)
@@ -852,6 +888,7 @@ def rerun_day(day: str, stops: list[tuple[str, str]], root: Path | None = None, 
                 for n, a in (rec.get("arms") or {}).items()}
     arms = {name: benchrun.resolve_harness(arm, opts or {}) for name, arm in arms.items()}
     tasks = build_tasks(day, picked, root, bench_dir, skip)
+    tasks = {t: v for t, v in tasks.items() if t not in {x["task"] for x in rec.get("dropped_original") or []}}
 
     def match(tid: str, want: str) -> bool:
         return tid == want or tid.endswith(f"-{want}") or str((tasks.get(tid) or {}).get("source_task")) == want

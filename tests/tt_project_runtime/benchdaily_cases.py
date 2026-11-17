@@ -324,11 +324,13 @@ def _dd_run_day_stubs(monkeypatch, tmp_path, benchdaily, projs, mirror):
     monkeypatch.setattr(benchdaily, "repo_of", lambda proj, repos=None: tmp_path)
     monkeypatch.setattr(benchdaily, "mirror", mirror)
     monkeypatch.setattr(benchdaily, "pick", lambda db, repo, start, end: ([{"task": 1, "base": "b", "head": "h"}], []))
-    monkeypatch.setattr(benchdaily, "build", lambda day, proj, kept, repo, bench_dir: {f"{proj['name']}-1": {}})
+    monkeypatch.setattr(benchdaily, "build", lambda day, proj, kept, repo, bench_dir: {f"{proj['name']}-1": {"project": proj["name"]}})
+    monkeypatch.setattr(benchdaily.benchpack, "screen", lambda tasks, dbs, bench_dir: (tasks, []))
+    monkeypatch.setattr(benchdaily.benchpack, "add_original", lambda out, tasks, lock=None: [])
     monkeypatch.setattr(benchdaily, "prior_review_mean", lambda root, day: None)
     monkeypatch.setattr(benchdaily, "run_cells", lambda *a, **k: {"skipped": [], "admitted": {}})
     monkeypatch.setattr(benchdaily, "blind_review", lambda *a, **k: {})
-    monkeypatch.setattr(benchdaily, "day_record", lambda *a, **k: {"spend": {}})
+    monkeypatch.setattr(benchdaily, "day_record", lambda *a, **k: {"spend": {}, "cells": []})
     monkeypatch.setattr(benchdaily, "write_table", lambda root: None)
 
 

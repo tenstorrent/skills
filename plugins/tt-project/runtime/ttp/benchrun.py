@@ -40,7 +40,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import bench, cellenv, cellnet, cellns, gitmemo, serverhealth
+from . import bench, benchpack, cellenv, cellnet, cellns, gitmemo, serverhealth
 from .project import durable_write, open_append
 
 PROMPT = ("You are working in the git repository in your current directory. Do the task below there: make "
@@ -859,6 +859,10 @@ def run_cell(bench_dir: Path, out: Path, task: dict, cell: dict, arm: dict, opts
         return {**row, "outcome": "not_isolated", "passed": False,
                 "why": ["not isolated: neither bwrap (bubblewrap) nor unshare (util-linux) can build a mount "
                         "namespace here, so the cell is not run, scored or ranked"]}
+    try:   # what the original worker had at dispatch, the same text for every arm (benchpack)
+        pack = benchpack.read(task)
+    except (benchpack.PackError, OSError) as e:
+        return {**row, "outcome": "error", "passed": False, "why": [f"context pack: {e}"[:300]]}
     keep = out / "cells" / f"{task['task']}-r{cell['rep']}-{cell['arm']}"
     hidden = hidden_paths(bench_dir.resolve(), out.resolve(), [task.get("repo"), opts.get("repo")], opts.get("state"))
     tmp = Path(tempfile.mkdtemp(prefix="cell-"))
@@ -885,15 +889,16 @@ def run_cell(bench_dir: Path, out: Path, task: dict, cell: dict, arm: dict, opts
                         "why": [f"isolation self-test: {x}"[:300] for x in problems]}
             roots = [Path(x).expanduser() for r in repos for x in (r, Path(r).resolve())]
             spec = bench.scrub_spec(spec, roots, [h for h in hidden if h not in roots], Path.home())
+            pack = bench.scrub_spec(pack, roots, [h for h in hidden if h not in roots], Path.home()) if pack else ""
             row["isolated"] = cell.backend
             conf, own = dict(cell.conf), session_dirs(ws, cell.conf.get("CLAUDE_CONFIG_DIR"))
         else:   # No earlier transcripts within reach: the arm's CLI gets a config folder of the cell's own.
             conf, logins = scratch_home(arm["provider"], tmp, not opts.get("dry_run")) \
                 if opts.get("scratch_home", True) else ({}, [])
             own = session_dirs(ws, conf.get("CLAUDE_CONFIG_DIR"))
-        text, copts = prompt(spec, opts, grade_workers(cell_env)), opts
+        text, copts = benchpack.frame(pack, prompt(spec, opts, grade_workers(cell_env))), opts
         if arm.get("planner"):   # planner-then-executor: the plan comes first, its time counts in the limit
-            plan, why = plan_step(tmp, ws, task, arm, opts, cfg, hidden, row, keep)
+            plan, why = plan_step(tmp, ws, {**task, "pack_text": pack}, arm, opts, cfg, hidden, row, keep)
             if not plan:
                 return {**row, "outcome": "error", "passed": False, "why": [why]}
             text = f"{text}\n\n{PLAN_HEADER}\n\n{plan}"
@@ -952,7 +957,8 @@ def plan_step(tmp: Path, ws: Path, task: dict, arm: dict, opts: dict, cfg: dict,
                 return "", "planner cell: " + "; ".join(problems)[:300]
             conf, own = dict(cell.conf), session_dirs(pws, cell.conf.get("CLAUDE_CONFIG_DIR"))
         spec = bench.scrub_spec(task["spec"], [], [], Path.home()) if cell is None else task["spec"]
-        prov, wall, hung = launch(run, pws, PLAN_PROMPT.format(spec=mark_live(spec)), planner, opts, cfg, hidden, cell_env,
+        spec = benchpack.frame(task.get("pack_text") or "", mark_live(spec))
+        prov, wall, hung = launch(run, pws, PLAN_PROMPT.format(spec=spec), planner, opts, cfg, hidden, cell_env,
                                   conf, own, cell, read_only=True)
         row["planner_wall_s"] = wall
         usage = prov.parse(run / "output.jsonl", run / "stderr.log")
