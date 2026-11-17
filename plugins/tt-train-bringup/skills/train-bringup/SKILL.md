@@ -82,6 +82,21 @@ paths, layouts and one-time constant preparation. Apply the
 [first-baseline checks](../composite-bringup/SKILL.md#before-accepting-the-first-baseline) before
 handing off to the loop; useful FLOPs follow the actual recipe, including frozen-base work for LoRA.
 
+### Phase budget
+
+A phase has a wall-clock budget and the agent knows it. State it at the start of the phase, in the
+work log, with the wall time already spent; update it when a long artefact starts and when it ends.
+The budget is what makes the cost of an artefact a decision instead of a surprise: a reference
+trajectory, a sweep, a full-epoch run or a hundred-step demonstration is costed first (time one
+unit, multiply) and compared against the time the phase has left. When an artefact would consume
+the phase, take the cheaper form that still meets its gate and write the reduction down — fewer
+reference layers, fewer steps, a ranked subset of a sweep — rather than letting one artefact own
+the phase and leaving the rest of the gate unmet.
+
+The plan phase is the cheapest and the easiest to overspend: its artefacts are analysis and one
+day-1 characterisation, and the device phases need the remaining time. A plan that is complete and
+correct still fails the run if it leaves nothing for the baseline and the loop.
+
 `tt-device-usage` and `stage-review` provide shared requirements; `autodebug`, `autotriage` and
 `autofix` come from the dependency. Every phase ends with an independent `stage-review` that returns
 `clean-pass`; findings require repairs and re-review. Commit phase-owned changes locally; never push.
