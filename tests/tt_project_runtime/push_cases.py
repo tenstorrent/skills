@@ -2211,21 +2211,20 @@ def test_a_push_batch_pushes_the_entries_after_a_blamed_first_one_once_they_pass
     assert "e1:" not in _git_out(origin, "show", "proj:.changeset/p-b1.md")
 
 
-def test_a_push_batch_checks_the_entries_after_a_blamed_one_once_only(env, monkeypatch, capsys):
-    """Entries 1 and 3 of five both fail: entry 1 is blamed, 2..5 are checked once without it and fail
-    (entry 3); the batch tries no further round, pushes nothing and requeues 2..5 as tested."""
+def test_a_push_batch_searches_the_entries_after_a_blamed_one_and_lands_the_prefix_that_passes(env, monkeypatch, capsys):
+    """Entries 1 and 3 of five both fail: entry 1 is blamed, 2..5 are checked without it and fail
+    (entry 3), so that head is searched too: entry 2 passes alone and lands at once; 3..5 go back
+    untested (no try, no backoff) for the next batch, which starts at once."""
     log = env["tmp"] / "checks.log"
     p, repo, origin, other = _bump_setup(env, monkeypatch, [f"echo run >> {log}",
                                                             "test -z \"$(ls plugins/p | grep bad)\""])
     heads = [_entry(repo, f"e{n}", {f"plugins/p/{'bad' if n in (1, 3) else 'f'}{n}.txt": f"{n}\n"})
              for n in range(1, 6)]
     rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
-    assert _statuses(m) == ["check_failed", "requeued", "requeued", "requeued", "requeued"], m
+    assert _statuses(m) == ["check_failed", "pushed", "requeued", "requeued", "requeued"], m
     out = capsys.readouterr().out
-    assert out.count("without it") == 1 and "they fail too; requeued" in out
-    # full head, prefixes 2 and 1, the tip, then the one extra round
-    assert len(log.read_text().split()) == m["checks"]["runs"] == 5
-    assert all("untested" not in r["detail"] for r in m["results"][1:]), "they were checked without entry 1"
+    assert out.count("without it") == 1 and "they fail too: searching those 4" in out
+    assert [r["detail"] for r in m["results"][2:]] == [{"untested": True}] * 3, m
 
 
 def test_entries_after_a_blamed_one_are_requeued_untested_without_an_extra_round(env, monkeypatch):
@@ -16856,7 +16855,8 @@ def test_a_push_batch_blames_the_change_when_its_failing_test_fails_twice_on_it_
     calls = _rerun_stub(monkeypatch, tip, lambda where, sel: 0 if where == "tip" else 1)
     heads = [_entry(repo, n, {f"{n}.txt": f"{n}\n"}) for n in ("e1", "e2")]
     rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
-    assert _statuses(m) == ["check_failed", "requeued"] and m["outcome"] != "tip_failed", m
+    # Both entries fail on their own (the stub fails every head): the rescue replays e2 without e1 and blames it too.
+    assert _statuses(m) == ["check_failed", "check_failed"] and m["outcome"] != "tip_failed", m
     assert not m.get("flaky_tests") and m["checks"]["flaky"] is False and not m.get("pre_existing")
     assert m["checks"]["tip_reruns"] == batch.TIP_RERUNS
     assert calls.count(("tip", _SEL)) == batch.TIP_RERUNS, calls

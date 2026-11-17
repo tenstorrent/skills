@@ -127,6 +127,9 @@ UNREACH_AFTER = 3               # batches in a row that could not reach the targ
 UNREACH_PROBE_S = 1800          # ... then the remote is asked this often, model-free, instead of starting batches
 UNREACH_PROBE_TIMEOUT_S = 20    # ... each ask bounded, as the tick waits for it
 UNREACH_RE = re.compile(r"cannot (?:reach|fetch) ")   # a batch error that is the remote's (push.refusal, batch.push_phase)
+REMOTE_UP_S = 120               # a remote that answered the pre-batch probe is not asked again this soon
+REMOTE_DOWN_GAP_S = 60          # one that did not answer is asked again at most this often, until it does
+REMOTE_PROBE_TIMEOUT_S = 15     # ... each ask bounded, as the tick waits for it
 LANDED_OUTCOMES = ("pushed", "landed")   # batch outcomes that put the approvals on the push branch
 DEPLOY_ALERTED = "deploy_alerted"   # deploy.ALERTED: the last deploy alert, by commit
 RERUN_START_S = 900              # a receipt's rerun that has not taken it up in this long never started
@@ -2011,6 +2014,46 @@ def _reach_ok(p: Project, name: str, now: float | None = None) -> bool:
     return ok
 
 
+def _remote_up(p: Project, name: str, now: float | None = None) -> bool:
+    """One cheap read-only ask (a bounded `git ls-remote`) that the remote of target `name` answers,
+    before a batch is built: while it does not, no batch starts and no approval's try is counted. An
+    answer is kept REMOTE_UP_S; a silent remote is asked again after REMOTE_DOWN_GAP_S, so the first
+    batch starts within about a minute of its return. Going down and coming back are each one event.
+    A remote that answers without the branch counts as up (the batch reports that itself)."""
+    db = p.db
+    now = time.time() if now is None else now
+    st = _state(db)
+    seen = st.get("remote") if isinstance(st.get("remote"), dict) and st["remote"].get("target") == name else {}
+    if seen.get("down"):
+        if now - float(seen.get("at") or 0) < REMOTE_DOWN_GAP_S:
+            return False
+    elif now - float(seen.get("up_at") or 0) < REMOTE_UP_S:
+        return True
+    remote, _, branch = name.partition("/")
+    why = ""
+    try:
+        r = _git(p, "ls-remote", "--exit-code", "--heads", remote, f"refs/heads/{branch}",
+                 timeout=REMOTE_PROBE_TIMEOUT_S)
+        rc, why = r.returncode, next(iter(reversed((r.stderr or "").strip().splitlines())), "")
+    except (OSError, subprocess.SubprocessError) as e:
+        rc, why = None, f"{type(e).__name__}: {e}"
+    if rc in (0, 2):
+        if rc == 0 and (seen.get("down") or isinstance(st.get("unreachable"), dict)):
+            st.pop("unreachable", None)     # it answers with the branch: the stop after failed batches ends too
+            _event(db, None, "push_target_reachable", f"the push remote of {name} answers again; push batches go on",
+                   queued=False)
+        st["remote"] = {"target": name, "up_at": now}
+        db.set_kv(KV, st)
+        return True
+    if not seen.get("down"):
+        _event(db, None, "push_remote_down",
+               f"the push remote of {name} does not answer ({str(why)[:200] or 'no answer'}); no batch is built and "
+               f"no approval's try is counted until it does (asked every {REMOTE_DOWN_GAP_S} s)", queued=False)
+    st["remote"] = {"target": name, "down": float(seen.get("down") or now), "at": now, "why": str(why)[:300]}
+    db.set_kv(KV, st)
+    return False
+
+
 def _forget_moved_tip(p: Project, remote: str, branch: str) -> None:
     """Drop the failing tip once the branch has moved past it (as last fetched): that clears its alert."""
     db = p.db
@@ -2080,6 +2123,8 @@ def schedule(p: Project, cfg: dict | None = None, log: Callable[[str], None] = l
     if not tgt:
         return None
     name = f"{tgt[0]}/{tgt[1]}"
+    if not _remote_up(p, name):
+        return None     # no batch is built (and no try counted) while the remote does not answer
     if not _reach_ok(p, name):
         return None
     if retarget(p, name):
@@ -2244,12 +2289,21 @@ def _died_db(p: Project, b: dict, m: dict, alert: Callable, why: str, now: float
                    f"{'s' if len(rows) != 1 else ''} back in the queue, run again at once", queued=False)
             push._forget_lock(Path(b["marker"]))
             return
-        db.x("UPDATE push_queue SET status='approved', tries=tries+1, updated=? WHERE batch=? AND status='batched'",
-             (now, b["id"]))
+        # A remote that did not answer is no fault of the entries or the batch: no try, no death and no
+        # backoff are counted; _remote_up holds the next batch until the remote answers.
+        reach = m.get("outcome") == "error" and bool(
+            UNREACH_RE.match(str(m.get("message") or "")) or REACH_RE.search(str(m.get("message") or "")))
+        db.x("UPDATE push_queue SET status='approved', tries=tries+?, updated=? WHERE batch=? AND status='batched'",
+             (0 if reach else 1, now, b["id"]))
         tries = max([r["tries"] + 1 for r in rows] or [1])
         st = _state(db)
-        st["deaths"] = int(st.get("deaths") or 0) + 1
-        st["backoff_until"] = now + min(BACKOFF_MAX_S, BACKOFF_STEP_S * tries)
+        if reach:
+            st.pop("backoff_until", None)
+            st["remote"] = {"target": str(m.get("target") or b["target"] or ""), "down": now, "at": now,
+                            "why": str(m.get("message") or "")[:300]}
+        else:
+            st["deaths"] = int(st.get("deaths") or 0) + 1
+            st["backoff_until"] = now + min(BACKOFF_MAX_S, BACKOFF_STEP_S * tries)
         un = _note_unreachable(st, b, m, now)
         stop = bool(un and un["n"] >= UNREACH_AFTER)
         tell = stop and not un.get("alerted")
@@ -2262,7 +2316,8 @@ def _died_db(p: Project, b: dict, m: dict, alert: Callable, why: str, now: float
         _event(db, None, "push_batch_died",
                f"push batch {b['id']} {why}; {len(rows)} approval{'s' if len(rows) != 1 else ''} back in the queue, "
                + (f"no batch starts until its remote answers (asked every {UNREACH_PROBE_S // 60} min)" if stop
-                  else f"retried after {st['backoff_until'] - now:.0f} s"),
+                  else f"no try counted; the remote is asked every {REMOTE_DOWN_GAP_S} s and the batch runs once it answers"
+                  if reach else f"retried after {st['backoff_until'] - now:.0f} s"),
                queued=queued, severity="high" if queued else "normal")
     push._forget_lock(Path(b["marker"]))     # dead: nothing holds it; the next batch has its own
     if tell:

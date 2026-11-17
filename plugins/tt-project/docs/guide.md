@@ -4138,6 +4138,19 @@ chains); `--restore`, run on the standby, makes `PATH/tt-project` from the newes
 in `DIR` (or snapshot N). A restore refuses a non-empty target: if one is cut off, remove its folder
 and run it again.
 
+## Push batches that survive failing entries and remote outages
+
+- One failing entry never sinks a batch. After an entry is blamed, the entries after it are replayed
+  without it and checked; when that head fails too, it is searched the same way, again and again, up
+  to six rounds per batch. The first passing prefix lands at once and the entries no round reached are
+  requeued untested: no try counted, no backoff, and the next batch starts straight away.
+- Before a batch is built the queue asks the remote, with one bounded read-only `git ls-remote`,
+  whether it answers (a pass is remembered for two minutes). A remote that does not answer starts no
+  batch and counts no try against any entry; one `push_remote_down` event is posted, the remote is asked
+  again every minute, and the first batch starts once it answers (`push_target_reachable`). A batch that
+  ended on a remote error puts its entries back with no try, no death and no backoff.
+- A batch cut short by a reboot still resumes at once, with no try counted.
+
 ## Where things live
 
 | Path | Holds |

@@ -84,7 +84,7 @@ DROP_TODO = ("import sys\nf, drop = sys.argv[-1], sys.argv[1:-1]\nkeep = [ln for
 # that rebase's own settings, whatever the user's: no todo reordering, no check of the dropped lines,
 # and no other branch moved along (rebase.updateRefs would move a task branch the replay passes)
 DROP_CONFIG = ("-c", "rebase.autoSquash=false", "-c", "rebase.missingCommitsCheck=ignore", "-c", "rebase.updateRefs=false")
-RESCUES = 1                        # checks per batch of the entries after a blamed one, replayed without it
+RESCUES = 6                        # checks per batch of the entries after a blamed one, replayed without it (one per blamed entry)
 SUSPECTS = 8                       # entries a failed full head's new failing tests point at, each probed alone (_culprits)
 NO_TESTS = 5                       # pytest's exit status when nothing was selected: a cap probe of a check without cap tests
 RERUN_S = 600.0                    # delivery.push_rerun_s: the time limit of one rerun of a failed check's failing tests
@@ -1664,6 +1664,7 @@ class Batch:
         self.retried = False                   # this round checked the entries after a blamed one (_rescue)
         self.early = False                     # a prefix passed and pushes; the later entries ride the next train (_lands)
         self.rescues = 0                       # such checks in the batch: at most RESCUES
+        self.untested: set[int] = set()        # entries no check reached, requeued with no try counted (_rescue)
         self.reran: dict[str, set[str]] = {"head": set(), "tip": set()}   # failing test ids rerun there (_run_ids)
         self.judged: dict[tuple[str, str], bool] = {}   # (head, failing test id) -> new on that head (_judged)
         self.new_ids: dict[str, list[str]] = {}  # a failed check's output tail -> its test ids new on its head (_judged)
@@ -1921,7 +1922,7 @@ class Batch:
         self.tip_passed = False
         self.tip_tried = 0
         self.researched = 0
-        self.rescued, self.retried, self.early, self.culprits = {}, False, False, {}
+        self.rescued, self.retried, self.early, self.culprits, self.untested = {}, False, False, {}, set()
         carried = self._replay(tip, checks)
         if not carried:
             return self._close(0, "nothing")
@@ -2062,7 +2063,7 @@ class Batch:
             elif self.yielded_to:
                 self._set(i, "requeued", yielded=True, restarts=self._restarts() + 1,   # stopped for an urgent approval
                           **self._fail_carried(carried, k, failed))
-            elif (failed or self.early) and not self.retried:
+            elif i in self.untested or ((failed or self.early) and not self.retried):
                 # after the blamed entry, never checked without it, or after a prefix that passed (_lands)
                 self._set(i, "requeued", untested=True)
             else:
@@ -3196,7 +3197,7 @@ class Batch:
                 self.checks["cpu_s"] = round(self.checks.get("cpu_s", 0.0) + checkcap.child_cpu_s() - cpu0, 1)
         return None
 
-    def _judge(self, tip: str, carried: list, heads: dict, checks: list[str]):
+    def _judge(self, tip: str, carried: list, heads: dict, checks: list[str], failed_full: tuple | None = None):
         """Check the full head; when it fails, find the first failing entry by a binary search over
         prefixes (each prefix: entries 1..k plus a bump), checking the tip alone only when prefix 1
         fails. Returns (entries to push, head to push or None, (cmd, tail) of the blamed entry's
@@ -3228,7 +3229,8 @@ class Batch:
         A combined head gets a cap probe first (_caps). When it fails only on prompt size cap tests,
         the search runs on cap probes alone, then one full check of the longest prefix that passed
         them: the entry that breaks a cap goes back to be trimmed (pushq's trim requeue) without a full
-        check of any head that breaks one. A full failure of that prefix searches below it in full."""
+        check of any head that breaks one. A full failure of that prefix searches below it in full.
+        `failed_full`: the failure of the full head, already checked by the caller (_rescue's rounds)"""
         m = len(carried)
         known = self.m.get("bad_tip") if isinstance(self.m.get("bad_tip"), dict) else {}
         bad = known.get("tip") == tip and not self._known_excused(tip, known)
@@ -3261,7 +3263,7 @@ class Batch:
                 "the search resumes without checking it again")
             self.full_fail, fails = kf, {m: kf}
         else:
-            fail = self._check(heads[m], checks)
+            fail = failed_full or self._check(heads[m], checks)
             if fail is None:
                 return m, heads[m], None
             self.full_fail, fails = fail, {m: fail}
@@ -3464,44 +3466,84 @@ class Batch:
 
     def _rescue(self, tip: str, carried: list, k: int, checks: list[str]) -> str | None:
         """After _judge blamed carried entry 1 (k 0): replay the later carried entries in order onto the
-        tip and check that head once, in this batch. With k entries before the blamed one that passed
+        tip and check that head, in this batch. With k entries before the blamed one that passed
         (k > 0), none: their head pushes at once and the later entries go to the next train, as no
-        entry joins a head that passed (user msg #2317). An entry built on the blamed one (it would
-        replay its commits) or whose replay conflicts or adds nothing without it is skipped and requeued; the others still go.
-        When the full head's failure names its new tests (self.new_ids), that head is checked on those
-        tests alone (_ids_check) and then on the checks that never ran on the full head (_rest_check), not
-        in full a second time; a probe that cannot tell checks it in full (_check_rest). Returns the head that pushes the
-        replayed entries (self.rescued), or None (nothing after the blamed entry, none replays, or a
-        failing check: those entries are requeued). A batch makes at most RESCUES such checks, whatever
-        their outcome."""
+        entry joins a head that passed (user msg #2317). An entry built on a blamed one (it would
+        replay its commits) or whose replay conflicts or adds nothing without it is skipped and requeued;
+        the others still go.
+        The first round checks the head on the tests the full head's failure named (self.new_ids,
+        _ids_check) and then on the checks that never ran on the full head (_rest_check), not in full a
+        second time; a probe that cannot tell checks it in full (_check_rest). When that head fails too,
+        another entry is to blame: the search runs on the replayed entries (_judge, the known failure
+        given), blames the first failing one (self.culprits: check_failed), and the rounds go on with
+        the entries after it, each replayed without every blamed entry, until a prefix passes (its head
+        pushes, self.rescued) or the entries run out or the batch has made RESCUES such checks. The entries
+        no check reached (the ones after a prefix that passed, a search stopped, the rounds spent) are
+        requeued untested (self.untested): no try counted, the next batch takes them at once. One failing
+        entry never sinks the others. Returns the head that pushes the replayed entries, or None
+        (nothing after the blamed entry, none replays, or the tip itself fails)."""
         later = carried[1:]
         if not later or k or self.detail_tip is not None or self.rescues >= RESCUES:
             return None
-        replayed, skipped = self._replay_without(tip, later, self._own(carried, 0))
         blamed = self.entries[carried[0][0]].get("id")
-        if skipped:
-            say(f"entr{'y' if len(skipped) == 1 else 'ies'} {', '.join(map(str, skipped))} after {blamed} "
-                f"{'does' if len(skipped) == 1 else 'do'} not replay without it; requeued")
-        if not replayed:
-            return None
-        say(f"checking the {len(replayed)} entr{'y' if len(replayed) == 1 else 'ies'} after "
-            f"{blamed} without it")
-        try:
-            head = self._head(tip, replayed, len(replayed))
-        except Refused:
-            return None
-        if self._yield_now():
-            return None
-        self.rescues += 1
-        self.retried = True
-        if len(replayed) > 1 and isinstance(self._caps(head, checks, replayed[-1][1]), tuple):
-            say("they break a prompt size cap too; requeued")
-            return None
-        if self._check_rest(head, checks) is not None:
-            say("they fail too; requeued")
-            return None
-        self.rescued = dict(replayed)
-        return head
+        own = self._own(carried, 0)
+        pool, first, found = later, True, {}
+        while pool and self.rescues < RESCUES and not self.yielded_to:
+            replayed, skipped = self._replay_without(tip, pool, own)
+            if skipped:
+                say(f"entr{'y' if len(skipped) == 1 else 'ies'} {', '.join(map(str, skipped))} after {blamed} "
+                    f"{'does' if len(skipped) == 1 else 'do'} not replay without it; requeued")
+            if not replayed:
+                return self._rescued_none(found, pool, skipped)
+            say(f"checking the {len(replayed)} entr{'y' if len(replayed) == 1 else 'ies'} after "
+                f"{blamed} without {'it' if first else 'the blamed ones'}")
+            try:
+                head = self._head(tip, replayed, len(replayed))
+            except Refused:
+                return self._rescued_none(found, pool, skipped)
+            if self._yield_now():
+                return self._rescued_none(found, replayed, skipped)
+            self.rescues += 1
+            self.retried = True
+            if len(replayed) > 1 and isinstance(self._caps(head, checks, replayed[-1][1]), tuple):
+                say("they break a prompt size cap too; requeued")
+                return self._rescued_none(found, [], skipped)
+            fail = self._check_rest(head, checks) if first else self._check(head, checks)
+            first = False
+            if fail is None:
+                self.culprits.update(found)
+                self.rescued = dict(replayed)
+                return head
+            say(f"they fail too: searching those {len(replayed)}")
+            heads = {len(replayed): head}
+            k2, head2, failed2 = self._judge(tip, replayed, heads, checks, failed_full=fail)
+            if failed2 is None and head2 is not None and self.rescued:   # _culprits took the entries its tests point at out
+                self.culprits = {**found, **self.culprits}
+                return head2
+            if failed2 is None and head2 is not None:        # a prefix passed (_lands): the rest wait for the next train
+                self.culprits.update(found)
+                self.rescued = dict(replayed[:k2])
+                self.untested |= {i for i, _ in replayed[k2:]}
+                return head2
+            if failed2 is None or self.detail_tip is not None:   # tip fails, search stopped: nothing was settled
+                self.untested |= {i for i, _ in replayed}
+                return None
+            n = [i for i, _ in carried].index(replayed[0][0])
+            found[replayed[0][0]] = failed2
+            say(f"entry {self.entries[replayed[0][0]].get('id')} fails the checks too: taken out; "
+                f"{len(replayed) - 1} entr{'y' if len(replayed) == 2 else 'ies'} go on without it")
+            own |= self._own(carried, n)
+            pool = replayed[1:]
+        self.culprits.update(found)
+        self.untested |= {i for i, _ in pool}
+        return None
+
+    def _rescued_none(self, found: dict, pool: list, skipped: list) -> None:
+        """The rounds end with no head to push: the blamed entries found so far are check_failed and
+        the entries still untested (`pool`) wait for the next batch, no try counted."""
+        self.culprits.update(found)
+        skip = set(skipped)
+        self.untested |= {i for i, _ in pool if self.entries[i].get("id") not in skip}
 
     def _yield_now(self, left: int = 1) -> bool:
         """Before each further full check of the search for the entry that broke the checks: whether an
