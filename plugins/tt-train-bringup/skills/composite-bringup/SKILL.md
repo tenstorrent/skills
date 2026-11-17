@@ -82,6 +82,32 @@ required. Then run N training steps of the full model and compare the loss traje
 torch reference within a stated tolerance. Put the harness under `tt-train/tests/python/` so it runs
 as an ordinary test.
 
+### Budget the reference before running it
+
+The torch reference is the most expensive artefact of this phase and the one most likely to consume
+it. Cost it before starting: time one reference step and multiply by N. A 24B model's forward and
+backward on CPU is minutes per step and tens of gigabytes of host memory, so a ten-step trajectory
+at the full layer count is over an hour on twenty cores. Record that estimate in the work log
+next to the phase's remaining wall-clock budget, then pick the cheapest form that still exercises
+the whole graph:
+
+1. the full model, when its measured cost fits the budget;
+2. a GPU reference, when one is available;
+3. the same model at a reduced **layer count** (the first L of the real layers, real weights),
+   with L stated in the README and in the gate.
+
+Hidden size, head counts, head dim, sequence length, vocabulary, dtype policy, optimiser and the
+data are never reduced; only depth is, and only with the reduction written down. A reduced-depth
+trajectory is a passed gate when it is labelled as one.
+
+The reference is a host job and the device is not idle while it runs. **No reference process, and
+no other heavy host job, runs during a device timing run**: a CPU reference saturating the host's
+cores and memory bandwidth inflates every wall-clock step and can starve dispatch outright. Either
+the reference finishes first, or the timing run waits. A run taken beside one is a diagnostic,
+never an accepted baseline (see the
+[measurement protocol](../optimization-loop/SKILL.md#measurement-protocol)), and the work log says
+which of the two it is.
+
 When the plan's layout has tensor or data parallelism, the harness also runs every module at the
 per-rank shard shapes (the shapes the kernels actually see; a single-chip-only harness let the
 first TP chain of the reference bring-up crash on shapes it had never tested), and the loss match

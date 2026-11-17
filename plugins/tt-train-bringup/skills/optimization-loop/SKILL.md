@@ -250,6 +250,9 @@ Measurement rules, all in one place:
   exceeds its cycle gain (and the reverse).
 - Step-time noise is one to two percent; for smaller changes report device time with the clock
   stated.
+- The host is quiet: no torch reference, build, profiler or other heavy host job runs during a
+  timing run. Check before the run and record what was running; a run taken beside a CPU reference
+  is a diagnostic, not a result row, however clean its telemetry looks.
 - No forbidden fidelity, batch or run type, in any run, including clock experiments.
 
 Tracy never runs on the full model, and no full-step time is ever projected from a profile. The
