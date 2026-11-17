@@ -579,7 +579,8 @@ def chunk_problems(spec: dict) -> list:
     out = []
     for label, code in _job_texts(spec):
         for m in re.finditer(rf"\b{BROKER}\s+(run|run-bg)\b[^\n;|&]*", code):
-            for t in _TLIMIT.findall(m.group(0)):
+            # only the broker's own flags: what follows ` -- ` belongs to the command it runs
+            for t in _TLIMIT.findall(re.split(r"\s--(?:\s|$)", m.group(0), maxsplit=1)[0]):
                 if int(t) > BROKER_MAX_S:
                     out.append(f"{label}: `{m.group(0)[:80]}` asks for -t {t}, above the broker's limit of "
                                f"{BROKER_MAX_S} s; {chunk_advice()}")

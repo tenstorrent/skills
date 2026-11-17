@@ -20,6 +20,7 @@ def test_devqprewarm_chunk_guard_refuses_a_broker_call_over_the_limit_in_any_spe
     for cmd in ("tt-device-mcp run-bg --preemptable -t 1500 python3 x.py",
                 "tt-device-mcp run-bg --preemptable -t $LIMIT python3 x.py",
                 "python3 x.py -t 99999",             # not a broker call: another tool's -t
+                "tt-device-mcp run -t 600 -- python3 -m pytest --timeout=3000 tests/",   # after `--`: the job's own flag
                 "tt-device-mcp status -t 99999"):
         assert devq.chunk_problems({"cmd": cmd}) == [], cmd
 
