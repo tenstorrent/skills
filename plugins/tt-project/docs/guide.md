@@ -2066,6 +2066,35 @@ running work is interrupted only by the preemption below:
   reviews (work tasks with no branch; a code or harness task changes the change) runs beside them (one low observation), unless its spec reads that task's output (`#<id>`
   and output, result, log or report on one line).
 
+### Urgent messages never go silent
+
+An inbound message (a chat message, `ttp say`) is urgent when its sender marks it (`urgent:` or
+`[urgent]` at the start, `ttp say --urgent`, `ttp note --to <project> --urgent`) or a conservative,
+model-free classifier sees an urgent marker word (`urgent`, `asap`, `emergency`, `sev0`, `outage`, `drop
+everything` ...) or a report that a person's live service is broken (a word like down or broken near a
+word like live, stream, production or customers). "Not urgent", "no rush" and "whenever" switch the
+marker words off. `urgent_msg.markers` adds words, `urgent_msg.enabled: false` turns it off; a false
+positive costs one ack and, if no reply follows, one late notice.
+
+For each urgent message the daemon, with no model call:
+
+1. posts an ack in the sender's chat within `urgent_msg.ack_s` (60 s): who is on it (the coordinator, and
+   the task a `#<id>` in the text names, when open), and when the first finding is due (receipt +
+   `first_s`, 5 min) in the project's home zone, ending with `delivery.ai_tag`;
+2. keeps the deadlines on disk (kv `urgent_msgs`), so a restart loses none and each fires once;
+3. closes them at the coordinator's first substantive reply in that chat after receipt (a reply or an ask:
+   not the ack, a late notice or a digest line);
+4. at a missed first-finding deadline tells the sender's chat the reply is late with the next check time,
+   and raises one high `urgent_msg_late` event: its must-act item wakes the coordinator at once, or, with
+   a turn running, reaches that turn as an update; a second miss (`second_s` later) notifies the user at
+   high. Each deadline fires once.
+
+The coordinator's prompt makes the first finding due within 5 minutes with times, exempt from the rule
+that acks wait for the chat digest. During a long turn it posts it with `ttp urgent-reply <chat> <text>`
+(coordinator turns only, and only to a chat with an open urgent message) instead of waiting for the
+turn's end. A `ttp note --to` has no chat to ack in: a marked note becomes a high event that wakes the
+receiving project at once.
+
 ### A missed promise changes the plan
 
 A promise, order or claim whose due passes with nothing delivered records a miss (replan.py). Moving

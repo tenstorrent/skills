@@ -97,6 +97,7 @@ from . import indexignore
 from . import plangate
 from . import lanewait
 from . import steerack
+from . import msgurgent
 from . import coordsession
 from . import thenwaits
 from . import probematch
@@ -2404,7 +2405,7 @@ class Daemon:
         self.tend_lease()
         # Compared as callables, not by name, so a step replaced on the instance is gated the same way.
         lease_off = [] if self.lease_held() else [getattr(self, n) for n in LEASE_STEPS]
-        for step in (self.lift_boot_pause, self.reap_runs, self.reap_waiting_checks, self.wake_after_reboot, self.meter_running, self.rebook_per_call_step, self.rebook_no_call_step, self.rebook_no_usage_step, self.watch_runs, self.check_steer_reads, self.relay_escalations, self.post_held_notifies, self.reconcile_tasks, self.retry_workspaces, self.tend_pushes,
+        for step in (self.lift_boot_pause, self.reap_runs, self.reap_waiting_checks, self.wake_after_reboot, self.meter_running, self.rebook_per_call_step, self.rebook_no_call_step, self.rebook_no_usage_step, self.watch_runs, self.watch_urgent_messages, self.check_steer_reads, self.relay_escalations, self.post_held_notifies, self.reconcile_tasks, self.retry_workspaces, self.tend_pushes,
                      self.sweep_sandbox_trees,
                      self.verify_pushes,
                      self.tick_prune_worktrees, self.prune_leftovers, self.branch_cap, self.land_harness_worktrees, self.backup_branches, self.replicate_state, self.check_local_only, self.check_disk,
@@ -5783,6 +5784,11 @@ class Daemon:
                          r["id"]))
             self._suggest_split(r, usage.cache_read_tokens or 0)
             self._record_running_windows(r, out)
+
+    def watch_urgent_messages(self) -> None:
+        """Ack each urgent inbound message and watch its first-finding deadline (msgurgent); model-free."""
+        for line in msgurgent.tick(self.p, self.cfg, steer=lambda t, k: msgurgent.deliver_running(self.p, t, k)):
+            log(self.p, f"urgent message: {line}")
 
     def check_steer_reads(self) -> None:
         """A running worker that has not read its coordinator update (steer.md past steer.offset) for

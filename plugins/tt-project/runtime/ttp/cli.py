@@ -1134,6 +1134,9 @@ def cmd_say(a) -> None:
         context, finding = "\n".join(x for x in (context, finding) if x), ""
     elif finding:   # the relayer's own findings alone: data, never the user's word
         context = "\n".join(x for x in (finding, context) if x)
+    if getattr(a, "urgent", False):
+        from . import msgurgent
+        text, context = msgurgent.mark(text, context)
     if not text and not finding:
         die("empty message" if not context else NO_WORDS)
     bid = getattr(a, "broadcast", None)
@@ -2829,6 +2832,12 @@ def cmd_note(a) -> None:
         die("ttp note only works inside a tt-project run")
     a.sent_text = a.text   # the leak scan reads what was asked to be sent, before masking (_note_to)
     a.text = redact.scrub(a.text)   # progress.md and a note's recipients keep no key or secret
+    if getattr(a, "urgent", False):
+        if not a.to:
+            die("ttp note: --urgent goes with --to", 2)
+        from . import msgurgent
+        a.text, _ = msgurgent.mark(a.text, "")
+        a.sent_text, a.severity = msgurgent.mark(a.sent_text, "")[0], "high"
     if getattr(a, "reply", None) and a.to:
         die("ttp note: --reply answers the note's sender by its own route; leave out --to", 2)
     if getattr(a, "confirms", None):
@@ -2877,6 +2886,28 @@ def cmd_steer(a) -> None:
         print("this run's hook hands any update over after each tool call, this one included")
     elif not print_update():
         print("no new update for your task")
+
+
+def cmd_urgent_reply(a) -> None:
+    """`ttp urgent-reply <chat> <text>`: the coordinator's mid-turn first finding for an urgent message,
+    posted in that chat now instead of at the end of the turn (msgurgent.py). Only the coordinator's own
+    turn may, only to a chat with an open urgent message, and it closes that message's deadline."""
+    from . import coordtools, msgparts, msgurgent
+    if os.environ.get(coordtools.ROLE_ENV) != "coordinator":
+        die("ttp urgent-reply is the coordinator's: workers report with `ttp note` and the hand-off")
+    p = here()
+    if p is None:
+        die("ttp urgent-reply: no project here")
+    chat = None if a.chat in ("", "all") else a.chat
+    if not msgurgent.open_for_chat(p.db, chat):
+        die(f"ttp urgent-reply: no urgent message awaits a reply in chat {a.chat}; answer with a reply action")
+    text = a.text.strip()
+    if not text:
+        die("ttp urgent-reply: the text is empty")
+    if why := msgparts.too_long(text, "ttp urgent-reply"):
+        die(why)
+    ids = msgparts.post(p.db, text, chat=chat, kind="reply", severity="normal")
+    print(f"posted ({', '.join(f'#{i}' for i in ids)})")
 
 
 def cmd_notify(a) -> None:
@@ -15334,7 +15365,7 @@ COMMAND_GROUPS = (
     ("everyday", ("new", "connect", "web", "status", "say", "listen", "list", "overview", "find", "task",
                   "memory", "obligation", "config", "pause", "resume", "drain", "alerts", "issues", "mute",
                   "quarantine", "machines", "runs", "logs", "doctor")),
-    ("inside a run", ("note", "steer", "notify", "progress", "checks", "checks-shard", "checks-yield", "lock",
+    ("inside a run", ("note", "steer", "urgent-reply", "notify", "progress", "checks", "checks-shard", "checks-yield", "lock",
                       "host-run", "detach", "devq", "push", "install-check", "land", "express", "clip", "sandbox", "pool-wait", "pool-admit",
                       "pool-shard", "skill", "killscan", "svcscan", "leftover-procs", "said", "hostcheck", "paths")),
     ("probes (retry_when, start_when)", ("landed", "alive", "eta", "ci", "ack-wait", "ssh-preflight", "broker-released",
@@ -15520,6 +15551,8 @@ def main(argv: list[str] | None = None) -> None:
                    "kept apart from the user's words")
     s.add_argument("--finding", default="", help="a relayer's own findings, sent with no user's words; shown to "
                    "the coordinator as data, never the user's word")
+    s.add_argument("--urgent", action="store_true", help="mark it urgent: the project acks it within a minute and "
+                   "owes a first finding within 5 minutes (msgurgent.py)")
     s.add_argument("--holder", help=argparse.SUPPRESS)   # the relayer listening (relayers.holder_id)
     s.add_argument("--all", action="store_true", help="send to every project `ttp list` shows, once each: "
                    "a resend within 24 h reaches only those that did not get it yet")
@@ -15553,6 +15586,11 @@ def main(argv: list[str] | None = None) -> None:
                         "and alerts, which are what a relayer passes on)")
     s.set_defaults(fn=cmd_listen)
 
+    s = sub.add_parser("urgent-reply", help="coordinator only: post the first finding for an urgent message now")
+    s.add_argument("chat", help="the chat the urgent message came in")
+    s.add_argument("text", help="the finding, with times")
+    s.set_defaults(fn=cmd_urgent_reply)
+
     s = sub.add_parser("steer", help="print the coordinator's unread update for this run (also printed by ttp note)")
     s.set_defaults(fn=cmd_steer)
 
@@ -15567,6 +15605,9 @@ def main(argv: list[str] | None = None) -> None:
                         "even when that project is not in `ttp list`")
     s.add_argument("--severity", choices=["low", "normal", "high"], default="normal",
                    help="with --to: the severity of the event the other project's coordinator gets")
+    s.add_argument("--urgent", action="store_true",
+                   help="with --to: mark the note urgent (an `urgent:` prefix, severity high): the other "
+                        "project's coordinator takes it at once, past the batching holds")
     s.add_argument("--confirms", metavar="FP",
                    help="the fix of upstream note FP works here; the text is the evidence. Records this project's "
                         "ack, the fixing project's model-free receipt, and sends no note; with --to or --reply the "

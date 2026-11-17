@@ -635,6 +635,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # A running worker that has not read a coordinator update (steer.md) for ack_after_s raises one
     # steer_unread event to the coordinator (steerack.py); 0: off.
     "steer": {"ack_after_s": 300},
+    # Urgent inbound messages (msgurgent.py): a message the sender marks urgent, or one the conservative
+    # classifier reads as an urgent marker or a person's broken live service, gets a model-free ack within
+    # ack_s and a first finding due first_s after receipt; a miss tells the sender's chat and wakes the
+    # coordinator, a second one (second_s later) notifies the user at high. markers: extra words that
+    # count as urgent; enabled false: off. Such a message also skips the relay window and debounce.
+    "urgent_msg": {"enabled": True, "ack_s": 60, "first_s": 300, "second_s": 300, "markers": []},
     # The project's own host-reaching commands (a script in its harness bin/ that wraps ssh), which a
     # fenced Claude worker runs outside the Bash sandbox as a simple command, as it runs ssh (fencefree.py):
     # each a name in bin/ or {command, env: [VAR, ...]} (also frees `VAR=... name ...`).

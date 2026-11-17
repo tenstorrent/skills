@@ -1060,14 +1060,16 @@ END""")
     def post(self, direction: str, text: str, chat: str | None = None, channel: str = "chat",
              kind: str = "user", severity: str = "normal", ref: str | None = None,
              handled: bool = False, provenance: str | None = None, ext_id: str | None = None,
-             context: str | None = None, broadcast: str | None = None) -> int:
-        """`provenance` (inbound): how the message came in, set by the code that received it, never
+             context: str | None = None, broadcast: str | None = None, keep_tag: bool = False) -> int:
+        """`keep_tag` (outbound): keep a trailing AI-authorship tag, for a model-free reply to a sender who
+        may not be the user (msgurgent's ack and late notice).
+        `provenance` (inbound): how the message came in, set by the code that received it, never
         taken from the sender. Only some count as the user's word for a PR approval (prguard).
         `context` (inbound): what a relayer added to the user's words; `text` holds only those words.
         `broadcast` (inbound): the id of the broadcast it came with (`ttp say --all`, broadcast.py).
         Outbound messages go to the user's own chats, so a trailing AI-authorship tag is dropped (aitag)."""
         from . import alerts
-        if direction == "out":
+        if direction == "out" and not keep_tag:
             text = self.for_user(text)
         ts = time.time()
         with self.tx():
