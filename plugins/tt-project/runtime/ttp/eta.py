@@ -11,6 +11,12 @@ last WINDOW_S days), never a worst case or padding:
 - run: the median run time of its kind and tier (else of its kind). A running task has the median of
   the longer runs left (those past its elapsed time); past every measured run it is `overrunning`
   and due now.
+- long job: a task that runs a bench or another long job (a non-code task whose spec has an enumerable
+  `cells:` line, or any task with a `long_job:` line) runs its cells at the median seconds per cell of
+  earlier done tasks of its kind (history(): their worker run time over their requested cells), never
+  the kind's median run; a running one has what is left of that. With no per-cell time measured, or no
+  cell list, it has no estimate ('no estimate yet', a long job with no per-cell time measured). A
+  waiting one whose hand-off gives a measured `eta` (see outside work) uses that.
 - review and landing: a code task then waits the median review (hand-off to review done) and the
   median push-queue row from approval to pushed or landed, each only when the project did one in the
   window (else the leg is not part of its path). A task in review or with an approved row has only
@@ -62,6 +68,8 @@ import re
 import statistics
 import time
 from pathlib import Path
+
+from . import cells
 
 WINDOW_S = 14 * 86400
 LONG_H = 2.0
@@ -122,17 +130,24 @@ def landing_waits(t: dict) -> list[int]:
 
 
 def history(db, now: float | None = None) -> dict:
-    """The measured samples of the window: run times by (kind, tier) and kind, first-start waits by
+    """The measured samples of the window: run times by (kind, tier) and kind, seconds per cell by kind
+    (a done task's worker run time over the cells its `cells:` lines request), first-start waits by
     lock label and overall, review and landing times."""
     now = time.time() if now is None else now
     t0 = now - WINDOW_S
-    h = {"run": {}, "kind": {}, "queue": {}, "wait": [], "review": [], "land": [], "batch": []}
+    h = {"run": {}, "kind": {}, "cell": {}, "queue": {}, "wait": [], "review": [], "land": [], "batch": []}
     for r in db.q("SELECT r.started s, r.ended e, t.kind k, t.tier tr FROM runs r JOIN tasks t ON t.id=r.task "
                   "WHERE r.role!='coordinator' AND r.ended>? AND r.started IS NOT NULL AND r.ended>r.started "
                   "ORDER BY r.id DESC LIMIT ?", (t0, ROWS)):
         d = float(r["e"]) - float(r["s"])
         h["run"].setdefault((r["k"], r["tr"]), []).append(d)
         h["kind"].setdefault(r["k"], []).append(d)
+    for r in db.q("SELECT t.kind k, t.spec spec, SUM(r.ended-r.started) d FROM runs r JOIN tasks t ON t.id=r.task "
+                  "WHERE r.role!='coordinator' AND r.ended>? AND r.started IS NOT NULL AND r.ended>r.started "
+                  "AND t.status='done' AND t.spec LIKE '%cells:%' GROUP BY t.id ORDER BY t.id DESC LIMIT ?",
+                  (t0, ROWS)):
+        if n := len(cells.requested(r["spec"])):
+            h["cell"].setdefault(r["k"], []).append(float(r["d"]) / n)
     for r in db.q("SELECT t.created c, t.not_before nb, t.labels labels, t.depends_on deps, MIN(r.started) s "
                   "FROM tasks t JOIN runs r ON r.task=t.id WHERE t.created>? AND r.role!='coordinator' "
                   "GROUP BY t.id ORDER BY t.id DESC LIMIT ?", (t0, ROWS)):
@@ -208,6 +223,21 @@ def outside_wait(t: dict, now: float, reports=None) -> dict | None:
         for _, r in sorted(mine, key=lambda x: x[0]):
             at = measured(r) or at   # a later valid report wins; an invalid one keeps the last
     return {"at": at, "follows": bool(str(res.get("on_pass_cmd") or "").strip())}
+
+
+LONG_JOB = re.compile(r"(?mi)^\s*long_job:\s*\S")
+
+
+def long_job(t: dict) -> list[str] | None:
+    """The cells of a task that runs a bench or another long job, [] for a long job with no cell list,
+    None for any other task. A long job is a non-code task whose spec has an enumerable `cells:` line
+    (one name per measurement), or any task with a `long_job:` line; a code task's cells are checks of
+    its change, which its usual run median covers."""
+    spec = str(t.get("spec") or "")
+    cs = cells.requested(spec)
+    if LONG_JOB.search(spec) or (cs and t.get("kind") != "code"):
+        return cs
+    return None
 
 
 class _Est:
@@ -435,6 +465,13 @@ class _Est:
                     start, path = e["end"], [tid] + e["path"]
             runs = self._run(t)
             ow = outside_wait(t, now, self.reports) if st != "running" else None
+            lj = long_job(t) if not ow else None
+            if lj is not None:   # a bench or other long job: its cells at the measured per-cell time, never the kind's median
+                per = _med(self.h["cell"].get(t["kind"]) or [])
+                if per is None or not lj:
+                    return {**self._none(tid, f"no estimate yet: a long job with no per-cell time measured by "
+                                              f"an earlier {t['kind']} run"), "path": path}
+                runs = [per * len(lj)]
             if st != "running" and (pr := merge_gate(gate_probe(t))) is not None and not (ow and ow["at"]):
                 return self._after(tid, f"PR #{pr} merges or closes", "a merge gate has no measured finish", path)
             if ow and ow["at"] is None:

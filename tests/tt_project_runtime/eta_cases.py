@@ -463,6 +463,70 @@ def test_eta_outside_work_wait_uses_a_measured_eta_with_its_basis(env):
         assert e["end"] is None and "no measured finish yet" in e["why"], bad
 
 
+def _eta_cell_history(p, now, per_cell=100, n=6, kind="work"):
+    """A done `kind` task that ran `n` cells in `n * per_cell` s of worker time."""
+    names = ", ".join(f"c{i}" for i in range(n))
+    tid = p.db.add_task(f"past bench {kind}", f"run it\ncells: {names}", kind=kind, status="done")
+    c = now - 86400
+    p.db.x("UPDATE tasks SET created=? WHERE id=?", (c, tid))
+    p.db.x("INSERT INTO runs(task, role, started, ended, status) VALUES(?, 'worker', ?, ?, 'ok')",
+           (tid, c + 60, c + 60 + n * per_cell))
+
+
+def test_eta_a_long_job_runs_its_cells_at_the_measured_per_cell_time_never_the_kind_median(env):
+    from ttp import eta
+    p = make(env)
+    now = time.time()
+    _eta_history(p, now)                                   # a work run median of 1200 s: wrong for a bench
+    spec = "run the bench\ncells: a, b, c, d, e, f"
+    t = p.db.add_task("bench six models", spec, kind="work")
+    # No per-cell time measured yet: no estimate, not the 1200 s code-style median.
+    e = eta.estimate(p.db, t, now)
+    assert e["end"] is None and "no estimate yet" in e["why"] and "per-cell" in e["why"]
+    assert "no estimate yet" in eta.field(e, p, now)
+    _eta_cell_history(p, now, per_cell=600, n=4)           # 600 s per cell
+    h = eta.history(p.db, now)
+    assert h["cell"] == {"work": [600.0]}
+    e = eta.estimate(p.db, t, now, hist=h)
+    assert e["why"] is None and [k for k, _ in e["legs"]] == ["queue", "run"]
+    assert e["legs"][1][1] == pytest.approx(6 * 600)
+    # Running: what is left of the cells' time, overrunning once past it.
+    r = p.db.add_task("running bench", spec, kind="work", status="running")
+    p.db.x("INSERT INTO runs(task, role, started, status) VALUES(?, 'worker', ?, 'running')", (r, now - 1000))
+    e = eta.estimate(p.db, r, now, hist=h)
+    assert e["end"] == pytest.approx(now + 3600 - 1000) and not e["overrun"]
+    p.db.x("UPDATE runs SET started=? WHERE task=?", (now - 5000, r))
+    e = eta.estimate(p.db, r, now, hist=h)
+    assert e["overrun"] and e["end"] == pytest.approx(now)
+    # A `long_job:` line without cells has no per-cell basis; a descriptive cells line and a code task's
+    # cells keep the usual estimate.
+    lj = p.db.add_task("soak", "long_job: soak test", kind="work")
+    assert "per-cell" in eta.estimate(p.db, lj, now, hist=h)["why"]
+    plain = p.db.add_task("plain", "do it. cells: whatever this means in prose", kind="work")
+    assert eta.estimate(p.db, plain, now, hist=h)["legs"][-1] == ("run", pytest.approx(1500))   # the kind median, the bench run included
+    code = p.db.add_task("code with test cells", "cells: t1, t2", kind="code")
+    assert "per-cell" not in str(eta.estimate(p.db, code, now, hist=h)["why"])   # only no code run measured
+
+
+def test_eta_a_long_job_with_a_detached_runs_eta_in_its_handoff_uses_it(env):
+    from ttp import eta
+    p = make(env)
+    now = time.time()
+    _eta_history(p, now)
+    _eta_cell_history(p, now, per_cell=600, n=4)
+    probe = "ttp detach --check --host box /runs/7/job"
+    t = _eta_waiting(p, now, retry_when=probe, eta=now + 5400, eta_basis="the job's log: 30 of 90 cells after 30 min")
+    p.db.update_task(t, spec="bench\ncells: a, b, c, d, e, f")
+    e = eta.estimate(p.db, t, now)
+    assert e["why"] is None and [k for k, _ in e["legs"]][0] == "outside work"
+    assert e["legs"][0][1] == pytest.approx(5400)
+    # Without an eta in the hand-off it has no finish at all, not the per-cell or code-task median.
+    t2 = _eta_waiting(p, now, retry_when=probe)
+    p.db.update_task(t2, spec="bench\ncells: a, b, c, d, e, f")
+    e = eta.estimate(p.db, t2, now)
+    assert e["end"] is None and "no measured finish yet" in e["why"]
+
+
 def test_eta_time_and_landing_waits_keep_their_estimates(env):
     from ttp import eta
     p = make(env)
