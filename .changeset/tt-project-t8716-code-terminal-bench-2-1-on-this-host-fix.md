@@ -12,3 +12,4 @@
 - tests: exempt the bench fix round's scratch first-try patch from the durable-write check (t8716)
 - bench: the TB table shows failed server calls (stream or parse errors included) of all calls per model, and names harbor-broken trials as not run (t8716)
 - bench: a resumed TB trial reads its task's time limit too, so a resume with no bench limit no longer crashes (t8716)
+- bench: the TB table gives each model's 95% interval and says one run cannot separate overlapping models; the bridge wording drops a verdict word (t8716)
