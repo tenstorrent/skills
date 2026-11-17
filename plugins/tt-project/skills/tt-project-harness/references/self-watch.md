@@ -20,6 +20,8 @@ A run past a limit at every sample for `selfwatch.window_s` (60 s) is a runaway:
 | `selfwatch.procs` | 3000 live processes | a heavy build or pytest -n 64 keeps a few hundred alive |
 | `selfwatch.load_x`, `selfwatch.load_share` | 2, 0.5 | host load at twice its cores while the run uses half of them |
 | `selfwatch.grace_s` | 5 s | between TERM and KILL |
+| `selfwatch.leak_grace_s` | 600 s | how long a leftover process of an ended task is left before it is ended (0: never) |
+| `selfwatch.leak_term_s` | 5 s | between TERM and KILL for a leftover process |
 | `selfwatch.act` | true | false only reports |
 
 Each also reads `TTP_SELFWATCH_<KEY>`; 0 turns a limit off. A runaway is stopped: the run's supervisor gets a
@@ -32,6 +34,17 @@ as unattributed churn (in the line and the daemon log), a warning, never a stop.
 storm of processes that each live shorter than the gap between two pid listings (about 50 ms) may be
 under-counted, and then shows only as unattributed churn; a storm whose processes live 2 s, or that is still
 running at a sample, is counted and stopped at the default limits.
+
+Leftover processes (`Daemon._self_leaks`, `selfwatch.Leaks`): a process of this project, found by its environment
+(`TTP_PROJECT`) and not by the tree it sits in, that names a task (`TTP_TASK`) with no running run is a leftover
+(a busy loop or a server a worker's probe left behind after its run ended, re-parented to init or systemd). It is
+ended after `leak_grace_s`: TERM, then KILL after `leak_term_s`, one pid at a time and only while its start time
+is unchanged. It is never ended when its task has a running run, a live detached job (`ttp detach`) or live checks
+of any of its runs, a keeper hold or a held lock; when it sits under a process of such a task or under the
+daemon; when it belongs to another project or has no readable environment; or selected by name or pattern.
+`selfwatch.act` false only reports. Each end is audited (pid, task, run, command line, CPU seconds, age) in one
+`selfwatch_leak` event on the task, the daemon log and one alert; waiting and recently ended leftovers show in the
+status line. A daemon restart starts the grace again.
 
 The same line shows what the project holds and installed past its own host (runtime `selfaudit.py`):
 

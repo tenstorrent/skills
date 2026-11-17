@@ -10681,6 +10681,10 @@ class Daemon:
         except Exception:
             log(self.p, "self-watch audit: " + traceback.format_exc().replace("\n", " | ")[:1000])
         snap["stopped"] = (db.kv(selfwatch.KV) or {}).get("stopped")
+        try:
+            snap.update(self._self_leaks(w, s, now, dirs))
+        except Exception:
+            log(self.p, "self-watch leftovers: " + traceback.format_exc().replace("\n", " | ")[:1000])
         if snap.pop("churn_new", False):
             log(self.p, f"self-watch: unattributed churn, {snap['churn_s']:g} new processes/s on the host that this "
                         "project's own counted processes do not explain; reported, not acted on")
@@ -10717,6 +10721,62 @@ class Daemon:
             self.alert(f"selfwatch:runaway:{r['run']}", text, severity="normal", every_s=0)
             snap["stopped"] = {"ts": now, "run": r["run"], "task": r["task"], "why": r["why"]}
         db.set_kv(selfwatch.KV, snap)
+
+    def _self_leaks(self, w, s: dict, now: float, dirs: list) -> dict:
+        """Leftover processes of ended tasks (selfwatch.Leaks): this project's processes (by environment)
+        that name a task with no running run, no live detached job or checks, no keeper hold and no held
+        lock stay selfwatch.leak_grace_s, then are ended (TERM, KILL) and audited: one event on the task,
+        one log line and one alert each. Another project's, a live run's, a detached job's and the
+        daemon's own processes are never touched. Returns the snapshot's `leaks` (waiting) and
+        `leaks_ended` (the last hour's)."""
+        from . import cli, hold, selfaudit, selfwatch
+        db = self.p.db
+        kept = [e for e in (db.kv(selfwatch.KV) or {}).get("leaks_ended") or [] if now - float(e.get("ts", 0)) < 3600]
+        out = {"leaks": [], "leaks_ended": kept, "leak_grace_s": s["leak_grace_s"]}
+        if not s["leak_grace_s"]:
+            return out
+        lk = self.__dict__.setdefault("_selfleaks", selfwatch.Leaks(w.proc))
+        cand = selfwatch.leftovers(w.procs, w.daemon_pid)
+        if not cand:
+            lk.first = {}
+            return out
+        tasks = {c["task"] for c in cand.values()}
+        live = {str(r["task"]) for r in db.q("SELECT task FROM runs WHERE status='running' AND task IS NOT NULL")}
+        live |= {str(r["id"]) for r in db.q("SELECT id FROM tasks WHERE status='running'")}
+        keep = {str(h.get("task")) for h in hold.holding(self.p.state / "holds")}
+        keep |= {str(x["task"]) for x in selfaudit.own_locks(dirs, self.p.base) if x.get("task")}
+        for t in tasks - live - keep:
+            for r in db.q("SELECT id, dir FROM runs WHERE task=?", (int(t),)):
+                rd = self._run_dir(r)
+                if hold.live(hold.run_jobs(rd)) or cli._checks_alive(cli._read_checks_pid(rd)):
+                    keep.add(t)
+                    break
+        waiting, due = lk.step(cand, w.procs, live, keep, now, s["leak_grace_s"])
+        out["leaks"] = [{k: c[k] for k in ("pid", "task", "run", "since")} for c in waiting + due]
+        if not due:
+            return out
+        if not s["act"]:
+            if not getattr(self, "_leak_noact_logged", False):
+                self._leak_noact_logged = True
+                log(self.p, f"self-watch: {len(due)} leftover process(es) of ended tasks; selfwatch.act is off: not ended")
+            return out
+        ended = selfwatch.end_leaks(w.proc, due, s["leak_term_s"])
+        try:   # a lock one of them held is cleared and logged by the reaper
+            self.reap_locks()
+        except Exception:
+            log(self.p, "self-watch lock release: " + traceback.format_exc().replace("\n", " | ")[:1000])
+        for r in ended:
+            text = (f"Self-watch ended a leftover process of an ended run: {selfwatch.leak_text(r)}. It was left "
+                    f"{s['leak_grace_s']:g} s after its task had no live run, detached job or hold; TERM"
+                    + (", then KILL." if r["killed"] else ", it ended."))
+            log(self.p, text)
+            db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                 (now, "daemon", "selfwatch_leak", "normal", text, "new", int(r["task"])))
+            self.alert(f"selfwatch:leak:{r['pid']}:{r['start']}", text, severity="normal", every_s=0)
+            out["leaks_ended"].append({k: v for k, v in r.items() if k != "start"} | {"ts": now})
+        done = {r["pid"] for r in ended}
+        out["leaks"] = [x for x in out["leaks"] if x["pid"] not in done]
+        return out
 
     def _slot_dirs(self) -> list:
         """The slot-lock folders the project's runs take locks in: its own, its shared resources' and the

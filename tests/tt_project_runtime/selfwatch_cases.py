@@ -353,3 +353,109 @@ def test_selfaudit_holdings_count_only_this_projects_held_locks_its_keeper_holds
         for fh in fds:
             fh.close()
     assert selfaudit.run_locks([d], p.base, "7") == [], "a lock its holder let go is not held"
+
+
+def _sw_leak_world(tmp_path):
+    """A fake /proc with: pid 3000, a busy loop of ended task 8701 (parent init); 3100, a process of task 55
+    that has a live run, and its child 3101 that names ended task 8701; 3200 of ended task 60 (a keeper holds
+    it); 3300 of ended task 61 under the daemon (pid 100); 3400 of another project's ended task 8701; 3500 with
+    no task; 3600 of ended task 62 whose detached job still runs."""
+    base = tmp_path / "proj" / "tt-project"
+    other = tmp_path / "other" / "tt-project"
+    base.mkdir(parents=True, exist_ok=True)
+    mine = lambda task, run: {"TTP_PROJECT": str(base), "TTP_RUN_ID": run, "TTP_TASK": task}
+    procs = {100: (1, 100, 50, {"PATH": "/bin"}), 3000: (1, 3000, 9000, mine("8701", "18352")),
+             3100: (1, 3100, 10, mine("55", "7")), 3101: (3100, 3100, 10, mine("8701", "7")),
+             3200: (1, 3200, 10, mine("60", "8")), 3300: (100, 3300, 10, mine("61", "9")),
+             3400: (1, 3400, 10, {"TTP_PROJECT": str(other), "TTP_RUN_ID": "1", "TTP_TASK": "8701"}),
+             3500: (1, 3500, 10, {"TTP_PROJECT": str(base), "TTP_RUN_ID": "1"}),
+             3600: (1, 3600, 10, mine("62", "10"))}
+    return base, procs
+
+
+def test_selfwatch_leftovers_end_only_a_processes_of_an_ended_task_after_the_grace_never_a_live_or_held_one(tmp_path):
+    from ttp import selfwatch
+    root = tmp_path / "proc"
+    base, procs = _sw_leak_world(tmp_path)
+    _sw_proc(root, 1, procs)
+    (root / "uptime").write_text("40000.5 1000.0\n")
+    (root / "3000" / "cmdline").write_bytes(b"python3\0-c\0while 1: pass\0")
+    w = selfwatch.Watch(base, proc=root, daemon_pid=100, cores=4)
+    w.step(selfwatch.settings(None), 0.0)
+    cand = selfwatch.leftovers(w.procs, 100)
+    assert sorted(cand) == [3000, 3100, 3101, 3200, 3600], "no daemon child, no other project, no task-less process"
+    leaks = selfwatch.Leaks(root)
+    live, keep = {"55"}, {"60", "62"}
+    waiting, due = leaks.step(cand, w.procs, live, keep, 1000.0, 600.0)
+    assert [c["pid"] for c in waiting] == [3000] and due == [], "3101 sits under a live run's process"
+    waiting, due = leaks.step(cand, w.procs, live, keep, 1599.0, 600.0)
+    assert due == [], "not before the grace"
+    waiting, due = leaks.step(cand, w.procs, live, keep, 1600.0, 600.0)
+    assert [c["pid"] for c in due] == [3000] and waiting == []
+    sent, shown = [], []
+
+    def kill(pid, sig):
+        sent.append((pid, sig))   # TERM is ignored by the busy loop: KILL is needed
+
+    got = selfwatch.end_leaks(root, due, 5.0, kill=kill, sleep=shown.append)
+    assert sent == [(3000, signal.SIGTERM), (3000, signal.SIGKILL)] and shown == [5.0], sent
+    r = got[0]
+    assert (r["pid"], r["task"], r["run"], r["args"], r["cpu_s"], r["killed"]) == \
+        (3000, "8701", "18352", "python3 -c while 1: pass", 90.0, True), r
+    assert r["age_s"] == round(40000.5 - (3000 + 7) / selfwatch.TICK)
+    assert "pid 3000 of task #8701 (run 18352), 90 s of CPU, running 11.1 h: python3 -c while 1: pass" in selfwatch.leak_text(r)
+    # A process that ended on TERM gets no KILL, and one whose pid was reused (new start time) is not signalled.
+    sent.clear()
+    _sw_proc(root, 1, {pid: v for pid, v in procs.items() if pid != 3000})
+    assert selfwatch.end_leaks(root, due, 5.0, kill=kill, sleep=shown.append) == [] and sent == []
+    _sw_proc(root, 1, {**procs, 3000: (1, 3000, 9000, procs[3000][3])})
+    (root / "3000" / "stat").write_text(f"3000 (x) S 1 3000 0 0 0 0 0 0 0 0 5 0 0 0 20 0 1 0 99999 0 256\n")
+    assert selfwatch.end_leaks(root, due, 5.0, kill=kill, sleep=shown.append) == [] and sent == []
+    # A task that comes alive again drops its clock.
+    leaks.step(cand, w.procs, {"55", "8701"}, keep, 1700.0, 600.0)
+    assert leaks.first == {}
+
+
+def test_the_daemon_ends_a_leftover_of_a_done_task_once_audits_it_and_spares_live_and_detached_ones(env, monkeypatch, tmp_path):
+    import json as _json
+    from ttp import locks, selfaudit, selfwatch
+    from ttp.daemon import Daemon
+    from ttp.web import state_payload
+    p = make(env)
+    monkeypatch.setenv("TTP_SELFWATCH_EVERY_S", "30")
+    monkeypatch.setenv("TTP_SELFWATCH_LEAK_GRACE_S", "600")
+    monkeypatch.setenv("TTP_SELFWATCH_LEAK_TERM_S", "0")
+    root = tmp_path / "proc"
+    mine = lambda task, run: {"TTP_PROJECT": str(p.base), "TTP_RUN_ID": run, "TTP_TASK": task}
+    done_id = p.db.x("INSERT INTO tasks(title,spec,kind,status,priority,created,updated) VALUES('d','s','code','done',3,0,0)")
+    live_id = p.db.x("INSERT INTO tasks(title,spec,kind,status,priority,created,updated) VALUES('l','s','code','running',3,0,0)")
+    job_id = p.db.x("INSERT INTO tasks(title,spec,kind,status,priority,created,updated) VALUES('j','s','code','done',3,0,0)")
+    rd = tmp_path / "run-job"
+    rd.mkdir()
+    (rd / "detached.json").write_text(_json.dumps([{"rc": str(rd / "a.rc")}]))
+    p.db.x("INSERT INTO runs(task,role,status,dir,started) VALUES(?,?,?,?,0)", (job_id, "worker", "done", str(rd)))
+    p.db.x("INSERT INTO runs(task,role,status,dir,started) VALUES(?,?,?,?,0)", (live_id, "worker", "running", str(tmp_path / "run-live")))
+    procs = {100: (1, 100, 50, {"PATH": "/bin"}), 3000: (1, 3000, 9000, mine(str(done_id), "18352")),
+             3100: (1, 3100, 10, mine(str(live_id), "7")), 3600: (1, 3600, 10, mine(str(job_id), "10"))}
+    _sw_proc(root, 0, procs)
+    (root / "3000" / "cmdline").write_bytes(b"python3\0-c\0while 1: pass\0")
+    sent = []
+    monkeypatch.setattr(os, "kill", lambda t, sig: sent.append((t, sig)))
+    monkeypatch.setattr(locks, "job_ended", lambda rc: False)
+    d = Daemon(p.base)
+    d._selfwatch = selfwatch.Watch(p.base, proc=root, daemon_pid=100, cores=64)
+    d._selfaudit = selfaudit.Audit(p.base, "tt-project-x", crontab=lambda: [], units=lambda: [], ssh=lambda alias: None)
+    d._selfleaks = selfwatch.Leaks(root)
+    d.check_self_watch()
+    snap = p.db.kv(selfwatch.KV)
+    assert [x["pid"] for x in snap["leaks"]] == [3000] and not sent, "first seen: only waiting, in the status line"
+    assert "1 leftover process(es) of ended tasks" in state_payload(p, p.db)["selfwatch"]
+    d._selfleaks.first = {k: 0.0 for k in d._selfleaks.first}   # it has been there for the whole grace
+    d._selfwatch_at = 0.0
+    d.check_self_watch()
+    assert sent == [(3000, signal.SIGTERM), (3000, signal.SIGKILL)], sent
+    ev = p.db.q("SELECT * FROM events WHERE kind='selfwatch_leak'")
+    assert len(ev) == 1 and ev[0]["task"] == done_id and "pid 3000" in ev[0]["text"] and "while 1: pass" in ev[0]["text"], ev
+    snap = p.db.kv(selfwatch.KV)
+    assert snap["leaks"] == [] and [e["pid"] for e in snap["leaks_ended"]] == [3000]
+    assert "ended leftover pid 3000" in state_payload(p, p.db)["selfwatch"]

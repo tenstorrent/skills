@@ -26,8 +26,13 @@ kernel drops the flock locks they held and the lock reaper clears their labels. 
 event with the reason and numbers, and the user one notify. The daemon's own group and processes are
 never signalled; a fork storm on the host that this project's processes do not account for is only
 reported in the line, never acted on.
+Leftovers: a process of this project (by its environment, not by tree) that names a task (TTP_TASK) with no
+running run, no live detached job or checks of it, no keeper hold and no held lock, and that sits under no such
+process and not under the daemon, is ended after LEAK_GRACE_S (Leaks, end_leaks: TERM, KILL after LEAK_TERM_S, one
+pid at a time and only while its start time is unchanged). Each end is audited (pid, task, command line, CPU,
+age) in an event and the log, and alerted once. Never selected by name, never another project's.
 Settings: config `selfwatch.<key>` (every_s, window_s, spawn_s, procs, load_x, load_share, grace_s,
-act), else env TTP_SELFWATCH_<KEY>; 0 turns a limit off, act false only reports. The defaults sit
+leak_grace_s, leak_term_s, act), else env TTP_SELFWATCH_<KEY>; 0 turns a limit (leak_grace_s: the leftover reaper) off, act false only reports. The defaults sit
 well above a heavy build or test suite (make -j64 starts some hundreds of processes a second and keeps
 a few hundred alive; pytest -n 64 a few hundred) and well below a fork storm (thousands a second).
 The last snapshot goes to db kv KV; line() is its one line in ttp status, the web app and the
@@ -55,8 +60,11 @@ PROCS = 3000            # live processes of one run
 LOAD_X = 2.0            # host load over its cores ...
 LOAD_SHARE = 0.5        # ... while the run uses this share of them
 GRACE_S = 5.0
+LEAK_GRACE_S = 600.0    # a process of an ended task is left this long before it is ended
+LEAK_TERM_S = 5.0       # between TERM and KILL for a leftover process
 DEFAULTS = {"every_s": EVERY_S, "window_s": WINDOW_S, "spawn_s": SPAWN_S, "procs": PROCS,
-            "load_x": LOAD_X, "load_share": LOAD_SHARE, "grace_s": GRACE_S, "act": True}
+            "load_x": LOAD_X, "load_share": LOAD_SHARE, "grace_s": GRACE_S, "act": True,
+            "leak_grace_s": LEAK_GRACE_S, "leak_term_s": LEAK_TERM_S}
 TICK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
 PAGE = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
 
@@ -127,6 +135,7 @@ class Watch:
         self.churn = False                              # unattributed churn reported in this episode
         self.since: dict[str, float] = {}               # run -> first sample past a limit
         self.acted: set[str] = set()
+        self.procs: dict[int, tuple] = {}               # the last scan (see scan())
 
     def _whose(self, pid: int, start: int, ppid: int, seen: dict) -> tuple:
         if (pid, start) not in self.env:
@@ -134,7 +143,8 @@ class Watch:
             if pid == self.daemon_pid or (ppid in seen and seen[ppid][0] == "daemon" and not (env or {}).get("TTP_RUN_ID")):
                 self.env[(pid, start)] = ("daemon", "daemon", None)
             elif procowner.owns_env(self.base, env):
-                self.env[(pid, start)] = ("own", env.get("TTP_RUN_ID") or "other", env.get("TTP_TASK_ID"))
+                self.env[(pid, start)] = ("own", env.get("TTP_RUN_ID") or "other",
+                                          env.get("TTP_TASK_ID") or env.get("TTP_TASK"))
             else:
                 self.env[(pid, start)] = (None, None, None)
         return self.env[(pid, start)]
@@ -179,7 +189,7 @@ class Watch:
     def step(self, s: dict, now: float | None = None) -> dict:
         now = time.time() if now is None else now
         h = host(self.proc, self.base, self.cores)
-        procs = self.scan()
+        procs = self.procs = self.scan()
         live = {(pid, v[5]) for pid, v in procs.items()}
         self.env = {k: v for k, v in self.env.items() if k in live}
         prev = self.last or {}
@@ -282,6 +292,116 @@ def stop(w: Watch, r: dict, grace_s: float, kill: Callable[[int, int, bool], Non
     return done
 
 
+def _cmdline(proc: Path, pid: int, n: int = 160) -> str:
+    try:
+        raw = (proc / str(pid) / "cmdline").read_bytes()
+    except OSError:
+        return ""
+    return " ".join(a for a in raw.decode(errors="replace").split("\0") if a)[:n]
+
+
+def _uptime(proc: Path) -> float | None:
+    try:
+        return float((proc / "uptime").read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def leftovers(procs: dict[int, tuple], daemon_pid: int) -> dict[int, dict]:
+    """pid -> {pid, start, task, run, ticks} of this project's processes that name a task (owner "own",
+    a numeric TTP_TASK), never the daemon or a process under it. Whether its task still has a live run is
+    decided by the caller (Leaks.step)."""
+    out: dict[int, dict] = {}
+    for pid, (who, run, task, ppid, _pg, start, ticks, _rss) in procs.items():
+        if who != "own" or not str(task or "").isdigit() or pid == daemon_pid:
+            continue
+        up, hops = ppid, 0
+        while up in procs and up != daemon_pid and hops < 64:
+            up, hops = procs[up][3], hops + 1
+        if up == daemon_pid and daemon_pid in procs:
+            continue   # a child of the daemon (a push, a check): the daemon's own
+        out[pid] = {"pid": pid, "start": start, "task": str(task), "run": run, "ticks": ticks, "ppid": ppid}
+    return out
+
+
+class Leaks:
+    """Processes of this project that name a task with no live run (see the module doc), first seen at a
+    sample; step() returns those past the grace. Kept across daemon ticks, in memory: a daemon restart
+    starts the grace again."""
+
+    def __init__(self, proc: Path = PROC):
+        self.proc = Path(proc)
+        self.first: dict[tuple[int, int], float] = {}
+
+    def step(self, cand: dict[int, dict], procs: dict[int, tuple], live: set[str], keep: set[str],
+             now: float, grace_s: float) -> tuple[list[dict], list[dict]]:
+        """(waiting, due): each a list of candidates. A candidate whose task is live or kept (a running
+        run, a detached job, a held lock, a keeper) or that sits under such a process is no leftover
+        and its clock is dropped."""
+        safe = live | keep
+        seen: dict[tuple[int, int], dict] = {}
+        for pid, c in cand.items():
+            up, hops, under = c["ppid"], 0, False
+            while up in procs and hops < 64:
+                if str(procs[up][2] or "") in safe:
+                    under = True
+                    break
+                up, hops = procs[up][3], hops + 1
+            if c["task"] in safe or under:
+                continue
+            seen[(pid, c["start"])] = c
+        self.first = {k: self.first.get(k, now) for k in seen}
+        waiting, due = [], []
+        for k, c in seen.items():
+            (due if now - self.first[k] >= grace_s else waiting).append({**c, "since": self.first[k]})
+        return waiting, due
+
+
+def end_leaks(proc: Path, due: list[dict], term_s: float,
+              kill: Callable[[int, int], None] | None = None,
+              sleep: Callable[[float], None] = time.sleep) -> list[dict]:
+    """TERM, then KILL after term_s, each pid of `due` still the same process (its start time unchanged:
+    a reused pid is never signalled), singly, never its group. Returns one audit record per pid: pid,
+    task, run, args, CPU seconds, age, and `killed` (it needed KILL) or `gone` (it was gone before)."""
+    kill = kill or os.kill
+    up = _uptime(proc)
+    recs: list[dict] = []
+    for c in due:
+        st = _stat(proc, c["pid"])
+        if st is None or st[2] != c["start"]:
+            continue
+        recs.append({"pid": c["pid"], "start": c["start"], "task": c["task"], "run": c["run"],
+                     "args": _cmdline(proc, c["pid"]), "cpu_s": round(st[3] / TICK, 1),
+                     "age_s": None if up is None else round(max(0.0, up - c["start"] / TICK)),
+                     "killed": False})
+
+    def same(r: dict) -> bool:
+        st = _stat(proc, r["pid"])
+        return st is not None and st[2] == r["start"]
+
+    for r in recs:
+        try:
+            kill(r["pid"], signal.SIGTERM)
+        except OSError:
+            pass
+    if recs:
+        sleep(term_s)
+    for r in recs:
+        if same(r):
+            try:
+                kill(r["pid"], signal.SIGKILL)
+                r["killed"] = True
+            except OSError:
+                pass
+    return recs
+
+
+def leak_text(r: dict) -> str:
+    age = "" if r.get("age_s") is None else f", running {r['age_s'] / 3600:.1f} h"
+    return (f"pid {r['pid']} of task #{r['task']} (run {r['run']}), {r['cpu_s']:g} s of CPU{age}: "
+            f"{r['args'] or '(no command line)'}")
+
+
 def line(snap: dict | None, now: float | None = None) -> str:
     """One line: host, own tree, and the last runaway stopped within the hour."""
     if not snap or not snap.get("sampled"):
@@ -300,6 +420,12 @@ def line(snap: dict | None, now: float | None = None) -> str:
     from .selfaudit import line as audit_line
     if extra := audit_line(snap):   # held machines, installed entries, holdings (selfaudit)
         out += "; " + extra
+    if snap.get("leaks"):
+        out += (f"; {len(snap['leaks'])} leftover process(es) of ended tasks, ended after "
+                f"{snap.get('leak_grace_s', LEAK_GRACE_S):g} s: " + ", ".join(
+                    f"pid {x['pid']} (task #{x['task']})" for x in snap["leaks"][:3]))
+    for x in [e for e in snap.get("leaks_ended") or [] if now - float(e.get("ts", 0)) < 3600][-2:]:
+        out += f"; ended leftover {leak_text(x)}"
     last = snap.get("stopped") or {}
     if last and now - float(last.get("ts", 0)) < 3600:
         out += f"; stopped runaway run {last['run']} (task #{last.get('task')}): {last['why']}"
