@@ -4151,6 +4151,10 @@ and run it again.
   ended on a remote error puts its entries back with no try, no death and no backoff.
 - A batch cut short by a reboot still resumes at once, with no try counted.
 
+## A report-only next step settles a wait without a model
+
+A task that hands off `waiting` on its own `ttp checks --result` or `ttp push --result` and whose `next_step` only says to report what happened ("report the push", "record the checks result and finish") needs no model once the result is in: the daemon records the hand-off's `on_pass` (or `done` with its summary) itself, as it does for a hand-off with no `next_step`. Only one short sentence of that kind counts. A step with a second action, a command, a rebase, a PR or shell punctuation keeps the wake. A spec change without `wake_now` or an `urgent:` line already sleeps until the wait ends, and a needs_review hand-off of an urgent or owed task is already reviewed at once; neither needed a change.
+
 ## Where things live
 
 | Path | Holds |

@@ -20,6 +20,8 @@ import shlex
 import subprocess
 from pathlib import Path
 
+from . import ownwait
+
 # The fields a final hand-off carries over from the waiting one (daemon.DEFAULT_ON_PASS_KEYS).
 KEYS = ("artifacts", "metrics", "self_check", "resolves", "no_push", "no_split", "published", "outcome", "tried")
 HEAD_RE = re.compile(r"[0-9a-f]{7,40}")
@@ -80,7 +82,7 @@ def settle(run_dir: Path, head: str) -> tuple[int, str, dict | None]:
     if len(words) != 4 or words[1:3] != ["checks", "--result"] \
             or ("$" not in words[3] and Path(words[3]).resolve() != run_dir.resolve()):
         return 1, f"{run_dir}/result.json does not wait on these checks", None
-    if waited.get("next_step"):
+    if ownwait.names_step(waited):
         return 1, "the hand-off names a next_step: the task wakes to run it", None
     if isinstance(waited.get("on_pass"), dict):
         return 0, f"checks passed on {checked[:12]}: recorded the hand-off's on_pass", waited["on_pass"]

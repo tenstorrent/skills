@@ -108,6 +108,7 @@ from . import rampup
 from . import projmove
 from . import applyff, landff
 from . import userstep
+from . import ownwait
 from . import waitpoll
 from . import workernotify
 from . import anchors
@@ -23227,7 +23228,7 @@ def default_on_pass(task: dict, full: dict) -> dict | None:
     asks for a PR or a landing the worker runs itself (LANDS_ITSELF_RE)."""
     if task.get("kind") != "code" or not isinstance(full, dict) or full.get("status") != "waiting":
         return None
-    if full.get("next_step") or full.get("on_pass_cmd") is not None or full.get("pr") \
+    if ownwait.names_step(full) or full.get("on_pass_cmd") is not None or full.get("pr") \
             or full.get("wake_tier") not in (None, "", "light"):
         return None
     spec = str(task.get("spec") or "")
@@ -23256,7 +23257,7 @@ def checks_settle_fill(task: dict, result: dict, run_dir: Path, ttp: str) -> tup
     if default_on_pass(task, result) is not None:
         return result, ""
     spec = str(task.get("spec") or "")
-    after = ("a next_step" if result.get("next_step") else "a PR" if result.get("pr")
+    after = ("a next_step" if ownwait.names_step(result) else "a PR" if result.get("pr")
              else f"wake_tier {result['wake_tier']}" if result.get("wake_tier") not in (None, "", "light")
              else "a review verdict" if task.get("kind") == "review"
              else "a PR or landing in its spec" if prguard.delivery_instruction(spec) or LANDS_ITSELF_RE.search(spec)
@@ -23294,7 +23295,7 @@ def push_on_pass(task: dict, full: dict) -> dict | None:
     a hand-off with a next_step, an on_pass_cmd, a PR or a wake_tier other than light."""
     if task.get("kind") not in ("code", "review") or not isinstance(full, dict) or full.get("status") != "waiting":
         return None
-    if full.get("next_step") or full.get("on_pass_cmd") is not None or full.get("pr") \
+    if ownwait.names_step(full) or full.get("on_pass_cmd") is not None or full.get("pr") \
             or full.get("wake_tier") not in (None, "", "light"):
         return None
     summary = full.get("summary")
