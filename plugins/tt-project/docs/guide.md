@@ -1467,6 +1467,18 @@ A blind review scores each arm's answer 1-5 on answering what was asked, support
 agreement with the established answer. The report is a per-arm table split by class, with dollars and
 minutes. It detaches like `daily`.
 
+`ttp bench facts [--set cases.json] [--out <replay run folder>] [--freeze]` grades a replay run by fact match
+instead of a 1-5 score. The case file is JSON: `{"cases": [{"key": "<project>:<id>", "project", "id", "class",
+"facts": [{"source": "<where in the records>", "text": "<one checkable statement>"}]}], "dropped": [...]}`, 2 to
+4 facts per case, written from the project's records before any arm runs. `--freeze` records the file's sha256
+(`cases.sha256`); grading refuses a file that is not frozen or has changed. Two graders (Opus and the open model,
+high effort, never above; `bench.facts.graders` replaces them) judge each answer with the arm hidden: per fact
+match, partial, miss or contradicted. The lower verdict counts and each fact they judged differently is
+flagged. The table (`facts.md`, `facts.json` beside the run folder) gives per arm the fact verdict counts, the
+fact-match score, the cases hit (score of at least half) with a Wilson 95% interval and a paired verdict per
+arm pair. A cell no model ran in is its own count and left out of every rate; an empty answer from a model that
+ran is graded and fails.
+
 ### OpenAI-compatible endpoints (the `chat` provider)
 
 The `chat` provider runs Claude Code workers against any endpoint that speaks the OpenAI Chat

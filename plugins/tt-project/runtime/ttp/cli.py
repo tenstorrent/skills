@@ -9357,6 +9357,8 @@ def cmd_bench(a) -> None:
         return _bench_daily(p, a)
     if a.action == "replay":
         return _bench_replay(p, a)
+    if a.action == "facts":
+        return _bench_facts(p, a)
     if not a.out:
         die(f"bench {a.action}: --out is required")
     if a.action == "run":
@@ -9482,6 +9484,29 @@ def _bench_daily(p, a) -> None:
     print(f"ttp bench daily: {day}: {len(rec['cells'])} cell(s) scored, {len(rec['skipped'])} skipped, "
           f"{len(rec['dropped'])} dropped; Claude ${sp['claude_usd']:.2f} (cap ${cap:.0f}), GLM ${sp['glm_usd']:.2f}; "
           f"table {benchdaily.home() / 'table.md'}")
+
+
+def _bench_facts(p, a) -> None:
+    """`ttp bench facts [--set cases.json] [--out <run folder>] [--freeze]`: fact-match grading of a replay run
+    (benchfacts.py): the frozen case file's 2-4 facts per question, judged by two graders with the arm hidden.
+    `--freeze` records the case file's sha256 and stops; grading refuses a file that is not frozen or changed."""
+    from . import benchfacts, benchreplay
+    cases = Path(a.set).expanduser() if a.set else benchfacts.home() / "cases.json"
+    try:
+        if a.freeze:
+            print(f"ttp bench facts: {cases} frozen, sha256 {benchfacts.freeze(cases)}")
+            return
+        run = Path(a.out).expanduser() if a.out else benchreplay.home() / "run"
+        rec = json.loads((run.parent / "replay.json").read_text()) if (run.parent / "replay.json").exists() else {}
+        names = {k: f"{v.get('model')} {v.get('effort')}" for k, v in (rec.get("arms_def") or {}).items()}
+        res = benchfacts.run(cases, run, p.config(), asks=None, parallel=a.parallel or 4, names=names,
+                             out=run.parent)
+    except (OSError, ValueError, RuntimeError) as e:
+        die(f"bench facts: {e}")
+    s = res["summary"]
+    print(f"ttp bench facts: {sum(x['n'] for x in s['arms'].values())} answer(s) graded, "
+          f"{len(res['not_run'])} not run, {len(res['ungraded'])} ungraded, {len(s['disagreements'])} fact(s) the "
+          f"graders judged differently; table {run.parent / 'facts.md'}")
 
 
 def _bench_replay(p, a) -> None:
@@ -16172,11 +16197,12 @@ def main(argv: list[str] | None = None) -> None:
                                       "that add tests, keeps the tests that fail on the base and pass on the head, "
                                       "builds a clean one-commit workspace at each base and holds out the landed "
                                       "test files, with a hash-pinned manifest")
-    s.add_argument("action", choices=["prep", "cells", "run", "blind", "fair", "daily", "replay", "reach"],
+    s.add_argument("action", choices=["prep", "cells", "run", "blind", "fair", "daily", "replay", "facts", "reach"],
                    help="daily: the day's landed code tasks of every project on this host through Sonnet, Opus and "
                         "an open model, blind-reviewed, into the running table (starts in the background); replay: "
                         "the offline replay of finished device and analysis tasks as sealed questions "
-                        "(`ttp bench replay --help`); prep: build the bench in --out; fair: read-only, whether each task of the --bench folder "
+                        "(`ttp bench replay --help`); facts: fact-match grading of a replay run (--out its run folder, --set the "
+                        "case file, --freeze records the case file's hash first); prep: build the bench in --out; fair: read-only, whether each task of the --bench folder "
                         "is fair (its held-out tests require nothing the change made up that its spec does not "
                         "state), naming what is unstated; cells: seeded-bug and prompt-injection cells from the "
                         "--bench folder's small tasks in --out, with a hash-pinned cells.json; run: the head-to-head of two or more arms on --bench, "
@@ -16187,7 +16213,7 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--blind-word", action="append", help=argparse.SUPPRESS)
     s.add_argument("--since", help="keep tasks created on or after this date (YYYY-MM-DD): the "
                                                   "later of the compared models' release dates")
-    s.add_argument("--out", help="prep, cells, run: a new folder for the workspaces, held-out tests and manifest (required)")
+    s.add_argument("--out", help="facts: the replay run folder (default: the replay home's run); prep, cells, run: a new folder for the workspaces, held-out tests and manifest (required)")
     s.add_argument("--repo", help="the repository the tasks landed in (default: the project root); `run` also "
                    "denies it, its git dir and worktrees to the cells")
     s.add_argument("--limit", type=int, default=0, help="keep (prep) or run (run) at most this many tasks (default: all)")
@@ -16234,7 +16260,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--cell-budget", type=float, default=0, help="daily, replay: dollar budget per arm run")
     s.add_argument("--max-lines", type=int, default=0, help="daily: drop landed changes over this many non-test lines")
     s.add_argument("--only-project", action="append", help="daily: only this project, repeatable (default: all here)")
-    s.add_argument("--set", help="replay: the established-answers file (default: <bench home>/../replay/established.json)")
+    s.add_argument("--freeze", action="store_true", help="facts: record the case file's sha256 (grading refuses an "
+                   "unfrozen or changed file) and stop")
+    s.add_argument("--set", help="facts: the case file (default <bench home>/../replay/facts/cases.json); replay: the established-answers file (default: <bench home>/../replay/established.json)")
     s.add_argument("--only", action="append", help="replay: only this question key (project:id) or class "
                    "(device, analysis), repeatable")
     s.set_defaults(fn=cmd_bench)
