@@ -3080,6 +3080,12 @@ def _note_to(a, run_dir: str) -> None:
     if got == "full":
         die(f"not sent: {upstream.OUTBOX_MAX} notes of this project already wait to go to other projects. "
             f"Put it in the hand-off instead and keep working")
+    if got == "queued" and a.severity == "high":
+        print(f"note for {a.to} queued: number {place} in this project's outbox, ahead of the normal notes: this "
+              f"project already filed {upstream.HIGH_NOTES_PER_HOUR} high-severity notes in the last hour (their own "
+              f"allowance, apart from the {upstream.NOTES_PER_HOUR} others); its daemon files it as "
+              f"{upstream.note_id(a.to, text)} when that allows{sent}. Nothing to wait for: keep working")
+        return
     if got == "queued":
         print(f"note for {a.to} queued: number {place} in this project's outbox (other projects get at most "
               f"{upstream.NOTES_PER_HOUR} of its notes an hour); its daemon files it as "
@@ -3096,6 +3102,9 @@ def _note_to(a, run_dir: str) -> None:
         return
     print(f"note for {a.to} " + ("already in its inbox" if got == "duplicate" else "filed in its inbox")
           + f" as {upstream.note_id(a.to, text)}" + sent
+          + (f"; high severity: filed at once on its own allowance ({upstream.high_used(me.name)} of "
+             f"{upstream.HIGH_NOTES_PER_HOUR} an hour), apart from the normal limit"
+             if got == "sent" and a.severity == "high" else "")
           + (f"; this machine cannot reach {back}, so it waits here until {back}'s daemon takes it on its next "
              f"call (it asks at least hourly for a week after sending notes here)" if back else "")
           + (f"; this machine's daemon sends it on to {(far.get('ssh') or far['host']) if far else at}" if far or at else "")

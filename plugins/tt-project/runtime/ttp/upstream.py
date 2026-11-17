@@ -88,6 +88,7 @@ REMOTE = "~/.tt-project/upstream.jsonl"
 LOCAL = "@here"             # the cursor's key for this machine's inbox (never a host name)
 LOCAL_TO = "@here-to"       # and for a project that reads only the notes addressed to it
 NOTES_PER_HOUR = 10         # addressed notes one project may file an hour
+HIGH_NOTES_PER_HOUR = 5     # high-severity ones it may file an hour on top of that (a hold or a stop must not queue)
 REPEAT_S = 86400            # a task's note naming the same note ids as one it sent this recently is a repeat
 NOTE_SEVERITIES = ("low", "normal", "high")
 FORWARD_EVERY_S = 60        # how often a daemon looks for notes to send on to other machines
@@ -341,13 +342,17 @@ def send(source: str, task: int | None, to: str, text: str, severity: str = "nor
         if had is not None or (sender != "daemon" and _repeat(notes, source, task, to, text, confirms, now, severity)):
             return "duplicate"
         # A daemon's page (bounded by its routing, once per step) is neither limited nor counted.
+        # A high-severity note has an allowance of its own (HIGH_NOTES_PER_HOUR, the record's `lane`) beside the
+        # NOTES_PER_HOUR of the others, so a hold or a stop is filed at once while the others wait.
+        high = sender != "daemon" and severity == "high"
         if sender != "daemon" and sum(1 for n in notes if n.get("to") and n.get("project") == source
-                                      and n.get("from") != "daemon"
-                                      and now - float(n.get("ts") or 0) < 3600) >= NOTES_PER_HOUR:
+                                      and n.get("from") != "daemon" and (n.get("lane") == "high") == high
+                                      and now - float(n.get("ts") or 0) < 3600) >= (
+                                          HIGH_NOTES_PER_HOUR if high else NOTES_PER_HOUR):
             return "limited"
         f.write((json.dumps({"ts": now, "project": source, "host": project.hostname(), "task": task,
                              "from": "daemon" if sender == "daemon" else "worker", "to": to, "severity": severity if severity in NOTE_SEVERITIES
-                             else "normal", "title": title, "spec": text, "fp": fp, **({"at": at} if at else {}),
+                             else "normal", **({"lane": "high"} if high else {}), "title": title, "spec": text, "fp": fp, **({"at": at} if at else {}),
                              **({"back": back} if back and not at else {}),
                              **({"reply_to": reply_of(text)} if reply_of(text) else {}),
                              **({"confirms": _confirms(confirms)} if _confirms(confirms) and sender != "daemon" else {}),
@@ -401,6 +406,30 @@ def outbox_pending(state: Path) -> int:
     return len(_outbox(state))
 
 
+def high_used(source: str, now: float | None = None) -> int:
+    """How many high-severity notes (the `lane` of `send`) `source` filed in the last hour."""
+    now = now or time.time()
+    try:
+        with open(path(), "rb") as f:
+            fcntl.flock(f, fcntl.LOCK_SH)
+            notes = _lines(f.read())[0]
+    except FileNotFoundError:
+        return 0
+    return sum(1 for n in notes if n.get("lane") == "high" and n.get("project") == source
+               and now - float(n.get("ts") or 0) < 3600)
+
+
+def _filing_order(waiting: list[dict]) -> list[dict]:
+    """The outbox in the order `drain_outbox` files it: high-severity notes first, each group in the order
+    the notes came (a stable sort)."""
+    return sorted(waiting, key=lambda n: str(n.get("severity")) != "high")
+
+
+def _place(waiting: list[dict], i: int) -> int:
+    """The 1-based place of `waiting[i]` in the filing order (`_filing_order`)."""
+    return _filing_order(waiting).index(waiting[i]) + 1
+
+
 def send_or_queue(state: Path, source: str, task: int | None, to: str, text: str, severity: str = "normal",
                   now: float | None = None, at: str | None = None, back: str | None = None,
                   confirms: str | None = None, reply_to: str | None = None) -> tuple[str, int]:
@@ -416,13 +445,13 @@ def send_or_queue(state: Path, source: str, task: int | None, to: str, text: str
     reply_to = reply_of(text)
     with _outbox_lock(state):
         waiting = _outbox(state)
-        for i, n in enumerate(waiting, 1):
+        for i, n in enumerate(waiting):
             if n["fp"] == fp:
                 if severity in NOTE_SEVERITIES and _rank(severity) > _rank(n.get("severity")):
                     n["severity"] = severity
                     _rewrite(Path(state) / OUTBOX_FILE, waiting)
-                return "queued", i
-        if not waiting or _filed(fp):
+                return "queued", _place(waiting, i)
+        if not waiting or _filed(fp) or severity == "high":   # a high note does not wait behind the others
             got = send(source, task, to, text, severity, now, at=at, back=back, confirms=confirms, reply_to=reply_to)
             if got != "limited":
                 return got, 0
@@ -435,7 +464,7 @@ def send_or_queue(state: Path, source: str, task: int | None, to: str, text: str
             {"ts": now, "task": task, "to": to, "text": text, "fp": fp, **({"at": at} if at else {}),
              **({"back": back} if back and not at else {}), **({"confirms": _confirms(confirms)} if _confirms(confirms) else {}),
              **({"reply_to": reply_to} if reply_to else {}), "severity": severity if severity in NOTE_SEVERITIES else "normal"}, sort_keys=True) + "\n")
-        return "queued", len(waiting) + 1
+        return "queued", _place(waiting + [{"severity": severity}], len(waiting))
 
 
 _NOTE_ID_RE = re.compile(r"(?<![0-9A-Za-z])[0-9a-f]{16}(?![0-9A-Za-z])")
@@ -512,15 +541,20 @@ def drain_outbox(state: Path, source: str, now: float | None = None) -> tuple[in
         return 0, []
     with _outbox_lock(state):
         waiting = _outbox(state)
-        filed, stuck = 0, []
-        while waiting:
-            n = waiting[0]
-            if send(source, n.get("task"), n["to"], n["text"], str(n.get("severity") or "normal"), now,
-                    at=_at(n), back=_at(n, "back"), confirms=_confirms(n.get("confirms")),
-                    reply_to=_confirms(n.get("reply_to"))) == "limited":
-                break
-            waiting.pop(0)
-            filed += 1
+        filed, stuck, limited, left = 0, [], set(), []
+        # High-severity notes first, then the rest in order; each group stops at its own hourly limit.
+        for n in _filing_order(waiting):
+            high = str(n.get("severity")) == "high"
+            if high in limited:
+                left.append(n)
+            elif send(source, n.get("task"), n["to"], n["text"], str(n.get("severity") or "normal"), now,
+                      at=_at(n), back=_at(n, "back"), confirms=_confirms(n.get("confirms")),
+                      reply_to=_confirms(n.get("reply_to"))) == "limited":
+                limited.add(high)
+                left.append(n)
+            else:
+                filed += 1
+        waiting = [n for n in waiting if any(n is m for m in left)]
         for n in waiting:
             if not n.get("stuck") and now - float(n.get("ts") or now) >= OUTBOX_STUCK_S:
                 n["stuck"] = True
@@ -2374,7 +2408,10 @@ def note_state(fp: str) -> dict:
 def _queued(fp: str, state: Path | None, run_dir: Path | None) -> str:
     """Where note `fp` waits before it is filed: this project's outbox or this run's directory, or ''."""
     if state and any(n.get("fp") == fp for n in _outbox(state)):
-        return "in this project's outbox (the hourly limit); its daemon files it when the limit allows"
+        high = any(n.get("fp") == fp and n.get("severity") == "high" for n in _outbox(state))
+        return ("in this project's outbox, ahead of the normal notes: the high-severity allowance "
+                f"({HIGH_NOTES_PER_HOUR} an hour) is spent; its daemon files it as soon as that allows" if high else
+                "in this project's outbox (the hourly limit); its daemon files it when the limit allows")
     try:
         lines = (Path(run_dir) / QUEUED_FILE).read_text().splitlines() if run_dir else []
     except OSError:
@@ -2390,6 +2427,16 @@ def _queued(fp: str, state: Path | None, run_dir: Path | None) -> str:
 
 
 def note_status(fp: str, state: Path | None = None, run_dir: Path | None = None) -> tuple[int, str]:
+    """`_note_status`, plus which hourly allowance a filed note went through: a high-severity note is filed
+    on its own (`HIGH_NOTES_PER_HOUR`), apart from the normal limit."""
+    rc, line = _note_status(fp, state, run_dir)
+    n = _find(_check_fp(fp))[0]
+    if n is not None and n.get("lane") == "high":
+        line += f" (filed on the high-severity allowance of {HIGH_NOTES_PER_HOUR} an hour, apart from the normal limit)"
+    return rc, line
+
+
+def _note_status(fp: str, state: Path | None = None, run_dir: Path | None = None) -> tuple[int, str]:
     """`ttp note --status <id>`: where a note `ttp note --to` sent stands, as (exit code, one line):
     0 delivered (the project it is for read it), 1 on its way (queued, filed-local or forwarded), 2
     unknown. The machine that runs the project is asked over ssh once the forward cursor is past the

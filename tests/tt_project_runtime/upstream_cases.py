@@ -1171,7 +1171,7 @@ def test_a_tasks_repeat_note_at_a_higher_severity_is_an_escalation_and_is_filed(
 
 
 def test_a_higher_severity_repeat_is_queued_on_the_outbox_and_run_queue_paths(env, monkeypatch):
-    """Past the hourly limit, a task's escalation of a queued or filed note queues; a same-severity repeat
+    """Past the hourly limit, a task's escalation of a queued or filed note queues (a high one files at once, on its own allowance); a same-severity repeat
     is still dropped, and `repeat_of` names no earlier note for the escalation."""
     from ttp import upstream
     src, dst, fp = _confirm_pair(env)
@@ -1179,15 +1179,15 @@ def test_a_higher_severity_repeat_is_queued_on_the_outbox_and_run_queue_paths(en
     for i in range(upstream.NOTES_PER_HOUR):
         upstream.send(src.name, 1, "second", f"filler {i}", now=now)
     assert upstream.send_or_queue(src.state, src.name, 57, "second", f"{fp} looks off", "low", now=now) == ("queued", 1)
-    assert upstream.repeat_of(src.state, src.name, 57, "second", f"{fp} blocks", now=now, severity="high") is None
-    assert upstream.send_or_queue(src.state, src.name, 57, "second", f"{fp} blocks", "high", now=now) == ("queued", 2)
-    assert upstream.send_or_queue(src.state, src.name, 57, "second", f"{fp} still blocks", "high",
+    assert upstream.repeat_of(src.state, src.name, 57, "second", f"{fp} blocks", now=now, severity="normal") is None
+    assert upstream.send_or_queue(src.state, src.name, 57, "second", f"{fp} blocks", "normal", now=now) == ("queued", 2)
+    assert upstream.send_or_queue(src.state, src.name, 57, "second", f"{fp} still blocks", "normal",
                                   now=now) == ("duplicate", 0)
     run_dir = _note_run(env, monkeypatch, src)
     upstream.queue(run_dir, "second", f"{fp}: low again", "low")
     got = upstream.send_queued(run_dir, src.name, 57, src.state)
     assert got["duplicate"] == 1 and got["queued"] == 0, got
-    assert [n["severity"] for n in upstream._outbox(src.state)] == ["low", "high"]
+    assert [n["severity"] for n in upstream._outbox(src.state)] == ["low", "normal"]
 
 
 def _addressed(env, fp):
@@ -1613,3 +1613,80 @@ def test_a_general_note_another_machines_reader_gets_is_a_handled_copy_for_a_rea
     assert "a copy: sent on to farbox, where project beta reads the user's upstream inbox" in rows[0]["text"]
     line = upstream.digest_line(p, cfg, [rows[1]])
     assert "from a worker of alpha on laptop (sent on from laptop) to the upstream inbox (general)" in line
+
+
+def test_high_severity_notes_file_at_once_ahead_of_the_queue_on_their_own_allowance(env, monkeypatch):
+    """A high note files at once when the normal limit is full and others wait, goes ahead of queued normal
+    ones when it must wait itself, has an hourly allowance of its own, and leaves normal notes as they were."""
+    from ttp import upstream
+    src, dst, fp = _confirm_pair(env)
+    now = time.time()
+    for i in range(upstream.NOTES_PER_HOUR):
+        upstream.send(src.name, 1, "second", f"filler {i}", now=now)
+    assert upstream.send_or_queue(src.state, src.name, 2, "second", "normal a", now=now) == ("queued", 1)
+    assert upstream.send_or_queue(src.state, src.name, 2, "second", "low b", "low", now=now) == ("queued", 2)
+    # Filed at once, behind nothing, though the normal limit is full and two notes wait.
+    assert upstream.send_or_queue(src.state, src.name, 3, "second", "hold now", "high", now=now) == ("sent", 0)
+    hold = upstream.note_id("second", "hold now")
+    (n,) = [n for n in upstream._lines(upstream.path().read_bytes())[0] if n["fp"] == hold]
+    assert n["severity"] == "high" and n["lane"] == "high"
+    assert upstream.high_used(src.name, now) == 1
+    assert "high-severity allowance" in upstream.note_status(hold)[1]
+    # Its allowance is limited too: the rest wait, ahead of the normal ones, and keep their order.
+    for i in range(1, upstream.HIGH_NOTES_PER_HOUR):
+        assert upstream.send_or_queue(src.state, src.name, 3, "second", f"hold {i}", "high", now=now)[0] == "sent"
+    assert upstream.send_or_queue(src.state, src.name, 3, "second", "hold late 1", "high", now=now) == ("queued", 1)
+    assert upstream.send_or_queue(src.state, src.name, 3, "second", "hold late 2", "high", now=now) == ("queued", 2)
+    assert upstream.send_or_queue(src.state, src.name, 2, "second", "normal c", now=now) == ("queued", 5)
+    assert upstream.send_or_queue(src.state, src.name, 2, "second", "normal a", "high", now=now) == ("queued", 1)   # raised in place: first in, so first out of the high ones
+    late = upstream.note_id("second", "hold late 1")
+    assert "ahead of the normal notes" in upstream._queued(late, src.state, None)
+    # An hour on, the high ones file first, then the normal ones in their order (the limit is 10).
+    upstream.drain_outbox(src.state, src.name, now + 3700)
+    texts = [n["spec"] for n in upstream._lines(upstream.path().read_bytes())[0] if n["to"] == "second"
+             and n["ts"] > now + 3000]
+    assert texts[:3] == ["normal a", "hold late 1", "hold late 2"]
+    assert texts[3:] == ["low b", "normal c"]
+    assert not upstream._outbox(src.state)
+
+
+def test_a_full_high_allowance_does_not_hold_normal_notes_and_normal_limits_are_unchanged(env, monkeypatch):
+    from ttp import upstream
+    src, dst, fp = _confirm_pair(env)
+    now = time.time()
+    for i in range(upstream.HIGH_NOTES_PER_HOUR):
+        assert upstream.send(src.name, 1, "second", f"hold {i}", "high", now=now) == "sent"
+    assert upstream.send(src.name, 1, "second", "hold more", "high", now=now) == "limited"
+    # The high notes do not use the normal limit.
+    for i in range(upstream.NOTES_PER_HOUR):
+        assert upstream.send(src.name, 2, "second", f"n {i}", now=now) == "sent"
+    assert upstream.send(src.name, 2, "second", "n over", now=now) == "limited"
+    assert upstream.send_or_queue(src.state, src.name, 2, "second", "n over", now=now) == ("queued", 1)
+    assert upstream.send_or_queue(src.state, src.name, 2, "second", "hold more", "high", now=now) == ("queued", 1)
+    # A limited high note does not stop the normal ones from filing once their own limit allows.
+    upstream.drain_outbox(src.state, src.name, now + 1800)
+    assert upstream.outbox_pending(src.state) == 2
+    upstream.drain_outbox(src.state, src.name, now + 3700)
+    assert upstream.outbox_pending(src.state) == 0
+
+
+def test_note_to_says_which_allowance_a_high_note_used(env, monkeypatch, capsys):
+    from ttp import cli, upstream
+    src, dst, fp = _confirm_pair(env)
+    _note_run(env, monkeypatch, src)
+    now = time.time()
+    for i in range(upstream.NOTES_PER_HOUR):
+        upstream.send(src.name, 1, "second", f"filler {i}", now=now)
+    capsys.readouterr()
+    assert _note(cli, "--to", "second", "--severity", "high", "stop the work") == 0
+    out = capsys.readouterr().out
+    assert "filed in its inbox" in out and "filed at once on its own allowance (1 of" in out
+    assert _note(cli, "--to", "second", "ordinary") == 0
+    assert "queued: number 1 in this project's outbox (other projects get at most" in capsys.readouterr().out
+    for i in range(upstream.HIGH_NOTES_PER_HOUR - 1):
+        assert _note(cli, "--to", "second", "--severity", "high", f"stop {i}") == 0
+    capsys.readouterr()
+    assert _note(cli, "--to", "second", "--severity", "high", "stop again") == 0
+    assert "ahead of the normal notes" in capsys.readouterr().out
+    assert _note(cli, "--status", upstream.note_id("second", "stop again")) == 1
+    assert "high-severity allowance" in capsys.readouterr().out
