@@ -58,3 +58,4 @@ code +80: a `done` hand-off stops each live detached job its `retry_when` or `ne
 every +80: a `done` hand-off stops each live detached job its `retry_when` or `next_step` does not name
 every +170: the devq fence says to queue device jobs at task start, that a runner's prewarm builds off the device, and that a broker call over 1500 s is refused (#8778)
 system +170: the devq fence says to queue device jobs at task start, that a runner's prewarm builds off the device, and that a broker call over 1500 s is refused (#8778)
+code +170: the devq fence says to queue device jobs at task start, that a runner's prewarm builds off the device, and that a broker call over 1500 s is refused (#8778)
