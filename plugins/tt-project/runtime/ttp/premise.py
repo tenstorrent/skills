@@ -369,6 +369,9 @@ def question_spec(task: dict, check: str) -> str:
     spec = task.get("spec") or ""
     if len(spec) > SPEC_CHARS:
         spec = spec[:SPEC_CHARS] + " ..."
+    # Quoted in a fence, so its lines (pr_branch:, premise_cmd:) are never read as the question's own: a
+    # copied pr_branch: line once made the check a code task that queued a premise check of its own.
+    spec = spec.replace("```", "'''")
     return (f"Premise check for code task #{task['id']} \"{task['title']}\", before it is run. Check only "
             f"by reading (records, files, git history, command output): change no file, commit, push or "
             f"queue nothing, and run only commands that write nothing outside your run folder. An "
@@ -395,7 +398,7 @@ def question_spec(task: dict, check: str) -> str:
             f"code that already handles it. Code covering only some of them is no \"fails\": answer "
             f"\"holds\" and list the rest in \"uncovered\". A \"fails\" with any condition uncited is "
             f"read as \"holds\" and the code task runs.\n\n"
-            f"The code task's spec, for context:\n{spec}")
+            f"The code task's spec, for context:\n```\n{spec}\n```")
 
 
 def _split(db, task: dict, check: str) -> int | None:

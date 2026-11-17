@@ -37,6 +37,20 @@ def test_a_code_task_with_a_premise_line_waits_on_a_light_question_check_first(e
     assert premise.tend(p.db) == [] and p.db.one("SELECT COUNT(*) n FROM tasks WHERE kind='question'")["n"] == 1
 
 
+def test_a_premise_question_quotes_its_code_spec_fenced_so_its_branch_line_never_makes_it_code(env):
+    """A premise question once copied its code task's `pr_branch:` line, ran as kind code onto that branch
+    and queued a premise check of its own: the quoted spec sits in a fence its own lines never leave."""
+    from ttp import premise, publishkind
+    p = _premise_project(env)
+    cid = _code(p, spec="pr_branch: fix-retry\nGoal: add the retry.\npremise: the retry is missing\n"
+                        "```\nsample\n```\nChange: add it.")
+    premise.tend(p.db)
+    q = p.db.one("SELECT * FROM tasks WHERE kind='question'")
+    assert q and "pr_branch: fix-retry" in q["spec"] and q["spec"].count("```") == 2, q and q["spec"]
+    assert publishkind.resolve(p.db, "question", q["spec"]) is None
+    assert premise.tend(p.db) == [] and p.db.task(q["id"])["kind"] == "question" and cid
+
+
 def test_only_an_explicit_premise_line_on_a_fresh_code_task_is_split(env):
     from ttp import premise
     p = _premise_project(env)
