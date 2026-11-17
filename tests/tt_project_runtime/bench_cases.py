@@ -2477,6 +2477,7 @@ def test_bench_run_arm_harness_types_parse_install_once_into_the_bench_folder_an
     bin_dir.mkdir()
     (bin_dir / "npm").write_text(
         "#!/bin/sh\nif [ \"$1\" = view ]; then echo 9.8.7; exit 0; fi\n"
+        "if [ \"$1\" = pack ]; then echo packed > \"$4/pkg.tgz\"; exit 0; fi\n"
         "echo \"$@\" >> \"$(dirname \"$0\")/npm.log\"\nmkdir -p \"$3/node_modules/.bin\"\n"
         "printf '#!/bin/sh\\nprintf \"%%s\\\\n\" \"$@\" > \"$TTP_RUN_DIR/argv.txt\"\\n"
         "cat \"$OPENCODE_CONFIG\" > \"$TTP_RUN_DIR/seen-config.json\"\\nenv > \"$TTP_RUN_DIR/env.txt\"\\n' "

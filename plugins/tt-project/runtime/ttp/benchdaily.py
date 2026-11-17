@@ -24,7 +24,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import bench, benchblind, benchrun, effort, gitmemo
+from . import bench, benchblind, benchrun, effort, gitmemo, serverhealth
 from .project import durable_write, open_append
 
 CAP_USD = 40.0       # Claude spend a day (arm runs plus reviews)
@@ -444,12 +444,12 @@ def second_reviewer(cfg: dict | None) -> dict | None:
             "provider": str(got.get("provider") or "chat")}
 
 
-def second_grade(out: Path, cfg: dict, ask2=None, rubric=benchblind.RUBRIC) -> dict | None:
+def second_grade(out: Path, cfg: dict, ask2=None, rubric=benchblind.RUBRIC, folder: str = "blind") -> dict | None:
     """Regrade the revealed batch in <out>/blind with the second reviewer into <out>/blind2 (resumable); returns
     {"reviewer", "scored": {item: (task, arm, score)}, "unscored", "compare", "review": spend} or None when there
     is none (no reviewer configured and no `ask2`, or no revealed batch). `ask2`: a reviewer callable for tests."""
     rv = second_reviewer(cfg)
-    blind, blind2 = out / "blind", out / "blind2"
+    blind, blind2 = out / folder, out / f"{folder}2"
     if (rv is None and ask2 is None) or not (blind / "batch.json").exists():
         return None
     if json.loads((blind / "batch.json").read_text())["phase"] != "revealed":
@@ -478,29 +478,29 @@ def second_grade(out: Path, cfg: dict, ask2=None, rubric=benchblind.RUBRIC) -> d
     by_item = {it["id"]: it["task"] for it in b["items"]}
     prior = 0.0
     try:
-        prior = float(json.loads((out / "review2.json").read_text()).get("cost_usd") or 0)
+        prior = float(json.loads((out / ("review2.json" if folder == "blind" else f"review2-{folder}.json")).read_text()).get("cost_usd") or 0)
     except (OSError, ValueError):
         pass
-    durable_write(out / "review2.json", json.dumps({"cost_usd": round(prior + float(spend.get("cost_usd", 0)), 4),
+    durable_write(out / ("review2.json" if folder == "blind" else f"review2-{folder}.json"), json.dumps({"cost_usd": round(prior + float(spend.get("cost_usd", 0)), 4),
                                                    "calls": spend.get("calls", 0)}))
     return {"reviewer": rv, "scored": {i: (by_item[i], labels[i], s) for i, s in b["scores"].items()},
             "unscored": unscored, "compare": benchblind.compare(blind, blind2), "review": spend}
 
 
 def blind_review(out: Path, tasks: dict, arms: dict, cfg: dict, ask=None, seed: int | None = None,
-                 build=None, rubric=benchblind.RUBRIC, ask2=None) -> dict:
+                 build=None, rubric=benchblind.RUBRIC, ask2=None, folder: str = "blind") -> dict:
     """Seal the finished cells, have the Opus reviewer score each blind, and return {item: (task, arm, score)}
     once revealed; an item the reviewer could not score stays out of the table. `ask`: a reviewer
     callable for tests. `build(out, tasks, arms)` and `rubric`: another kind of cell and its rubric (the
     offline replay's answers); the default builds the diff cells. With a second reviewer (`bench.second_reviewer`,
     or `ask2`) the revealed batch is graded again, and the result's "second" holds that grading."""
-    blind = out / "blind"
+    blind = out / folder
     spend: dict = {}
     if not blind.exists():
         built = build(out, tasks, arms) if build else benchrun.blind_cells(out, tasks, arms, [{"rep": 0}])
         if not built["cells"]:
             return {"scored": {}, "unscored": [], "review": spend}
-        durable_write(out / "cells.json", json.dumps(built, indent=1) + "\n")
+        durable_write(out / ("cells.json" if folder == "blind" else f"cells-{folder}.json"), json.dumps(built, indent=1) + "\n")
         benchblind.prep(built["cells"], blind, seed, rubric)
     if ask is None:
         prov, model, eff = REVIEWER
@@ -514,8 +514,8 @@ def blind_review(out: Path, tasks: dict, arms: dict, cfg: dict, ask=None, seed: 
             benchblind.score(blind, it["id"], ask(benchblind.prompt(it, b.get("rubric") or benchblind.RUBRIC)))
         except (benchblind.Refused, OSError, ValueError, subprocess.SubprocessError) as e:
             unscored.append({"item": it["id"], "why": str(e)[:200]})
-    prior = review_spent(out)
-    durable_write(out / "review.json", json.dumps({"cost_usd": round(prior + float(spend.get("cost_usd", 0)), 4),
+    prior = review_spent(out) if folder == "blind" else 0.0
+    durable_write(out / ("review.json" if folder == "blind" else f"review-{folder}.json"), json.dumps({"cost_usd": round(prior + float(spend.get("cost_usd", 0)), 4),
                                                   "calls": spend.get("calls", 0)}))
     b = json.loads((blind / "batch.json").read_text())
     try:
@@ -527,9 +527,17 @@ def blind_review(out: Path, tasks: dict, arms: dict, cfg: dict, ask=None, seed: 
     by_item = {it["id"]: it["task"] for it in b["items"]}
     got = {"scored": {i: (by_item[i], seal[i], s) for i, s in b["scores"].items()}, "unscored": unscored,
            "review": spend}
-    if b["phase"] == "revealed" and (sec := second_grade(out, cfg, ask2, rubric)):
+    if b["phase"] == "revealed" and (sec := second_grade(out, cfg, ask2, rubric, folder)):
         got["second"] = sec
     return got
+
+
+def server_cells(rows: dict, tasks: dict) -> list[dict]:
+    """The cells of `rows` (read_rows) the server cut and no rerun has replaced: named in the day's record."""
+    return [{"project": (tasks.get(r["task"]) or {}).get("project", ""), "task": r["task"], "arm": r["arm"],
+             "model": f"{r.get('provider')}:{r.get('model')}:{r.get('effort')}", "status": serverhealth.NOT_SCORED,
+             "why": r.get("server_reason") or [], "was": r.get("was")}
+            for (t, rep, a), r in sorted(rows.items(), key=lambda kv: str(kv[0])) if r.get("outcome") == serverhealth.OUTCOME]
 
 
 def day_record(day: str, tasks: dict, arms: dict, out: Path, graded: dict, skipped: list, dropped: list) -> dict:
@@ -558,7 +566,9 @@ def day_record(day: str, tasks: dict, arms: dict, out: Path, graded: dict, skipp
                 c["second_criteria"], c["second_correctness"] = int(sc["criteria"]), int(sc["correctness"])
                 c["second_landed"] = landed({"scores": sc}, rows.get((c["task"], 0, c["arm"])) or {})
     claude_cells = sum(c["cost_usd"] for c in cells if c["claude"])
-    return {"day": day, "cells": cells, "skipped": skipped, "dropped": dropped,
+    # Cells the server cut: not scored and never a fail, queued for a rerun (serverhealth.py); named, not counted.
+    server = server_cells(rows, tasks)
+    return {"day": day, "cells": cells, **({"server": server} if server else {}), "skipped": skipped, "dropped": dropped,
             "unscored": graded.get("unscored", []),
             **({"second_grader": {"reviewer": sec["reviewer"], "compare": sec["compare"],
                                   "unscored": sec["unscored"]}} if sec else {}),
@@ -572,7 +582,7 @@ def day_record(day: str, tasks: dict, arms: dict, out: Path, graded: dict, skipp
 def cumulative(root: Path | None = None) -> dict:
     """The running table from every day's record under `root`/days: per project and arm, and per arm overall."""
     root = root or home()
-    cells, gaps, seconds = [], [], []
+    cells, gaps, seconds, server, reruns = [], [], [], [], []
     days = sorted((root / "days").glob("*.json")) if (root / "days").exists() else []
     for p in days:
         try:
@@ -580,6 +590,8 @@ def cumulative(root: Path | None = None) -> dict:
         except (OSError, ValueError):
             continue
         cells += rec.get("cells") or []
+        server += [{"day": p.stem, **x} for x in rec.get("server") or []]
+        reruns += [{"day": p.stem, **x} for x in rec.get("reruns") or []]
         if (cmp := (rec.get("second_grader") or {}).get("compare")):
             seconds.append({"day": p.stem, "ranking_changed": cmp["ranking_changed"], "rank_a": cmp["rank_a"],
                             "rank_b": cmp["rank_b"]})
@@ -606,6 +618,8 @@ def cumulative(root: Path | None = None) -> dict:
             "projects": {proj: {m: agg(rs) for (pr, m), rs in sorted(by.items()) if pr == proj}
                          for proj in sorted({c["project"] for c in cells})},
             "models": {m: agg(rs) for m, rs in sorted(per.items())}, "gaps": gaps,
+            **({"server": server} if server else {}),
+            **({"reruns": reruns} if reruns else {}),
             **({"second_days": seconds} if seconds else {})}
 
 
@@ -633,6 +647,18 @@ def table_md(cum: dict) -> str:
     for proj, ms in cum["projects"].items():
         lines += ["", f"## {proj}", "", head]
         lines += [_row(m, a, two) for m, a in ms.items()]
+    if cum.get("server"):
+        lines += ["", f"## {serverhealth.NOT_SCORED[0].upper() + serverhealth.NOT_SCORED[1:]}", "",
+                  "Cells the model server cut (the limit, the wall ceiling or a capacity refusal while it ran slower than "
+                  "the model's normal speed). They are never counted as fails; each is rerun, one at a time, once the "
+                  "server is healthy:"]
+        lines += [f"- {x['day']}: {x['project']} {x['task']} {x['arm']} ({x['model']}): {'; '.join(x.get('why') or [])}"
+                  for x in cum["server"]]
+    if cum.get("reruns"):
+        lines += ["", "## Server reruns", "", "Stops rechecked against the server rule, each rerun at normal server speed; "
+                  "the cause says whether the server or the model stopped the first run:"]
+        lines += [f"- {x['day']}: {x['task']} {x['arm']}: first run {(x.get('was') or {}).get('outcome') or 'stopped'}"
+                  f" -> {x.get('rerun_outcome') or 'not rerun'}: {x['cause']}" for x in cum["reruns"]]
     if cum.get("second_days"):
         lines += ["", "## Second grader", "", "The same masked batch graded again by a second model; the ranking is by mean "
                   "total, best first:"]
@@ -662,6 +688,16 @@ def parse_arms(extra: list[str] | None, glm_harness: str | None = None) -> dict:
     harness = GLM_HARNESS if glm_harness is None else (glm_harness or "claude")
     texts = list(extra) if extra else [*ARMS, f"{GLM_ARM}:{harness}"]
     return dict(benchrun.parse_arm(x) for x in texts)
+
+
+def build_tasks(day: str, picked: dict, root: Path, bench_dir: Path, skip: str | None = None) -> dict[str, dict]:
+    """The day's bench tasks (build) of every picked project, from picked.json and the project mirrors."""
+    projs = {p["name"]: p for p in projects(skip)}
+    tasks: dict[str, dict] = {}
+    for name in sorted({k["project"] for k in picked["order"]}):
+        repo = root / "mirrors" / slug(name)
+        tasks.update(build(day, projs[name], [k for k in picked["order"] if k["project"] == name], repo, bench_dir))
+    return tasks
 
 
 def run_day(day: str, start: float, end: float, arms: dict, cfg: dict, cap: float = CAP_USD, parallel: int = PARALLEL,
@@ -709,11 +745,7 @@ def run_day(day: str, start: float, end: float, arms: dict, cfg: dict, cap: floa
     for name, arm in arms.items():
         benchrun.check_harness(name, arm)
     arms = {name: benchrun.resolve_harness(arm, opts or {}) for name, arm in arms.items()}
-    projs = {p["name"]: p for p in projects(skip)}
-    tasks: dict[str, dict] = {}
-    for name in sorted({k["project"] for k in picked["order"]}):
-        repo = root / "mirrors" / slug(name)
-        tasks.update(build(day, projs[name], [k for k in picked["order"] if k["project"] == name], repo, bench_dir))
+    tasks = build_tasks(day, picked, root, bench_dir, skip)
     order = [f"{slug(k['project'])}-{k['task']}" for k in picked["order"]]
     opts = {"timeout_s": LIMIT_S, "stall_s": 900, "budget_usd": CELL_USD, "review_usd": REVIEW_USD,
             "test_cmd": benchrun.TEST_CMD, "test_timeout_s": 900, "dry_run": False, "scratch_home": True,
@@ -726,6 +758,123 @@ def run_day(day: str, start: float, end: float, arms: dict, cfg: dict, cap: floa
     rec["admitted"] = done["admitted"]   # which reservation rule admitted each task
     rec["arms"] = {k: {f: v.get(f, "") for f in ("provider", "model", "effort", "harness")} for k, v in arms.items()}
     durable_write(root / "days" / f"{day}.json", json.dumps(rec, indent=1) + "\n")
+    write_table(root)
+    return rec
+
+
+RERUN_WHY = ("recorded before the server's waits were measured: whether the model server was slow is unknown; "
+             "the rerun at normal speed decides")
+
+
+def stop_cause(new: dict) -> str:
+    """Who stopped an earlier stop, from the cell that reran it: a rerun that ended inside the limit means the
+    server cut the first run ("server"); one that stopped again with the server at normal speed means the model
+    ("model"); one the server cut again stays "server (still slow)"."""
+    if new.get("outcome") == serverhealth.OUTCOME:
+        return "server (still slow)"
+    if new.get("hang_guard") or new.get("outcome") in ("timeout", "stalled"):
+        return "model"
+    return "server"
+
+
+def _blind_build(sub_tasks: dict, sub_arms: dict):
+    """A blind batch of only the rerun arms: each arm's cells built alone, so a task whose other arm is still
+    queued for a rerun is not left out."""
+    def build(out, tasks, arms):
+        merged: dict[str, dict] = {}
+        for name, arm in sub_arms.items():
+            for c in benchrun.blind_cells(out, sub_tasks, {name: arm}, [{"rep": 0}])["cells"]:
+                m = merged.setdefault(c["task"], {"task": c["task"], "criteria": c["criteria"], "arms": {}})
+                m["arms"].update(c["arms"])
+        return {"cells": list(merged.values())}
+    return build
+
+
+def _rerun_folder(out: Path) -> str:
+    """The blind folder of this rerun: the last one while it is unfinished, else a new one."""
+    names = sorted((x.name for x in out.glob("blind-rerun*") if x.is_dir() and not x.name.endswith("2")),
+                   key=lambda n: int(n[len("blind-rerun"):] or 1))
+    if names:
+        try:
+            if json.loads((out / names[-1] / "batch.json").read_text())["phase"] != "revealed":
+                return names[-1]
+        except (OSError, ValueError, KeyError):
+            return names[-1]
+    return f"blind-rerun{len(names) + 1}" if names else "blind-rerun"
+
+
+def rerun_day(day: str, stops: list[tuple[str, str]], root: Path | None = None, cfg: dict | None = None,
+              opts: dict | None = None, arms: dict | None = None, probe=None, lock=None, sleep=time.sleep, ask=None,
+              ask2=None, progress=None, skip: str | None = None) -> dict:
+    """Check an earlier day's stops against the server rule, through the bench's own code. `stops` are (task, arm)
+    pairs (a task is its id or its source task number). Each stop's cell is marked `server` (not scored, never a
+    fail), rerun one at a time once the server is healthy (benchrun.rerun_cells), graded in a blind batch of its
+    own (the day's first batch stays as it was), and merged into the day's record: the new scores replace the stop,
+    `reruns` says for each whether the server or the model stopped it (stop_cause), and the cumulative table is
+    written again. Returns the day's record."""
+    say = progress or (lambda s: print(s, file=sys.stderr, flush=True))
+    root = root or home()
+    out = root / "runs" / day
+    day_file = root / "days" / f"{day}.json"
+    rec = json.loads(day_file.read_text())
+    picked = json.loads((out / "picked.json").read_text())
+    bench_dir = out / "bench"
+    if arms is None:
+        arms = {n: benchrun.parse_arm(f"{n}={a['provider']}:{a['model']}:{a['effort']}"
+                                      + (f":{a['harness']}" if a.get("harness") else ""))[1]
+                for n, a in (rec.get("arms") or {}).items()}
+    arms = {name: benchrun.resolve_harness(arm, opts or {}) for name, arm in arms.items()}
+    tasks = build_tasks(day, picked, root, bench_dir, skip)
+
+    def match(tid: str, want: str) -> bool:
+        return tid == want or tid.endswith(f"-{want}") or str((tasks.get(tid) or {}).get("source_task")) == want
+    cells = sorted({(tid, name) for tid in tasks for want, name in stops if match(tid, want) and name in arms})
+    if not cells:
+        raise ValueError(f"no cell of {day} matches {stops}")
+    base = {"timeout_s": LIMIT_S, "stall_s": 900, "budget_usd": CELL_USD, "review_usd": REVIEW_USD,
+            "test_cmd": benchrun.TEST_CMD, "test_timeout_s": 900, "dry_run": False, "scratch_home": True, **(opts or {})}
+    marked = benchrun.recheck_stops(out, [(tid, 0, name) for tid, name in cells], RERUN_WHY)
+    say(f"bench daily: {day}: {len(marked)} stop(s) marked as server cells, rerunning one at a time")
+    added = benchrun.rerun_cells(bench_dir, out, tasks, arms, [], 0, base, cfg or {}, probe, sleep, lock, only=cells,
+                                 task_opts=lambda t: {"repo": Path(t["source_root"]), "state": Path(t["state"])})
+    now = read_rows(out / "results.jsonl")
+    done = [(tid, name) for tid, name in cells if (r := now.get((tid, 0, name))) and r.get("outcome") != serverhealth.OUTCOME]
+    graded = {"scored": {}, "unscored": []}
+    sub_arms = {name: arms[name] for _, name in done}
+    sub_tasks = {tid: tasks[tid] for tid, _ in done}
+    folder = _rerun_folder(out)
+    if done:
+        graded = blind_review(out, sub_tasks, sub_arms, cfg or {}, ask, build=_blind_build(sub_tasks, sub_arms),
+                              ask2=ask2, folder=folder)
+    new = day_record(day, tasks, arms, out, graded, [], [])
+    keep = {(c["task"], c["arm"]) for c in new["cells"]}
+    rec["cells"] = [c for c in rec["cells"] if (c["task"], c["arm"]) not in keep] + new["cells"]
+    prior = {(x["task"], x["arm"]): x for x in rec.get("reruns") or []}
+    for r in added:
+        if (r["task"], r["arm"]) in cells and r.get("rerun_of"):
+            prior[(r["task"], r["arm"])] = {"task": r["task"], "arm": r["arm"], "was": (r["rerun_of"].get("was") or {}),
+                                            "cause": stop_cause(r), "rerun_outcome": r.get("outcome"),
+                                            "rerun_minutes": round(float(r.get("wall_s") or 0) / 60, 2)}
+    for tid, name in cells:
+        r = now.get((tid, 0, name)) or {}
+        if (tid, name) not in prior and r.get("outcome") == serverhealth.OUTCOME:
+            prior[(tid, name)] = {"task": tid, "arm": name, "was": r.get("was") or {}, "cause": "server (not rerun yet)"}
+    rec["reruns"] = sorted(prior.values(), key=lambda x: (x["task"], x["arm"]))
+    rec["server"] = server_cells(now, tasks)
+    if not rec["server"]:
+        rec.pop("server", None)
+    sp = rec.setdefault("spend", {})
+    extra = {k: float(new["spend"].get(k) or 0) for k in ("claude_arms_usd", "glm_usd")}
+    review2 = float((json.loads((out / f"review2-{folder}.json").read_text()) if (out / f"review2-{folder}.json").exists()
+                     else {}).get("cost_usd") or 0)
+    review = float((json.loads((out / f"review-{folder}.json").read_text()) if (out / f"review-{folder}.json").exists()
+                    else {}).get("cost_usd") or 0)
+    for k, v in extra.items():
+        sp[k] = round(float(sp.get(k) or 0) + v, 4)
+    sp["review_usd"] = round(float(sp.get("review_usd") or 0) + review, 4)
+    sp["claude_usd"] = round(float(sp.get("claude_usd") or 0) + extra["claude_arms_usd"] + review, 4)
+    sp["review2_usd"] = round(float(sp.get("review2_usd") or 0) + review2, 4)
+    durable_write(day_file, json.dumps(rec, indent=1) + "\n")
     write_table(root)
     return rec
 

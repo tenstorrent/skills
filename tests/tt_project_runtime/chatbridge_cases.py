@@ -2179,7 +2179,7 @@ def test_chatbridge_an_answer_that_is_not_json_is_a_malformed_endpoint_fault(env
     up = mock_chat((200, b"<html>gateway</html>"))
     with Bridge(up.url, _CB_KEY, "m") as b:
         code, _ = _post(b, hi)
-        st = b.stats()
+        st = {k: v for k, v in b.stats().items() if k != "server"}
     assert code == 502 and st == {"last_fault": "malformed", "faults": {"malformed": 1}}
     # A routed run that ended on it falls back with the endpoint cooling down, as for any endpoint fault.
     from ttp.daemon import Daemon
@@ -2206,7 +2206,7 @@ def test_chatbridge_a_streamed_chunk_that_is_not_a_json_object_is_a_malformed_en
                           {"choices": [{"delta": {"content": "tial"}, "finish_reason": "stop"}]}]))
     with Bridge(up.url, _CB_KEY, "m") as b:
         code, text = _post(b, _CB_HI_STREAM)
-        st = b.stats()
+        st = {k: v for k, v in b.stats().items() if k != "server"}
     ev = _cb_events(text)
     assert code == 200 and st == {"last_fault": "malformed", "faults": {"malformed": 1}}
     assert ev[-1]["type"] == "error" and ev[-1]["error"]["type"] == "api_error"
@@ -2220,7 +2220,7 @@ def test_chatbridge_a_stream_with_blank_data_lines_is_no_fault(mock_chat):
     up = mock_chat((200, [b"", {"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]}]))
     with Bridge(up.url, _CB_KEY, "m") as b:
         code, text = _post(b, _CB_HI_STREAM)
-        st = b.stats()
+        st = {k: v for k, v in b.stats().items() if k != "server"}
     assert st == {"last_fault": "", "faults": {}} and _cb_events(text)[-1]["type"] == "message_stop"
 
 
@@ -2231,7 +2231,7 @@ def test_chatbridge_a_stream_of_only_bad_chunks_falls_back_and_cools_the_endpoin
     up = mock_chat((200, [b"<html>bad gateway</html>", b"{oops"]))
     with Bridge(up.url, _CB_KEY, "m") as b:
         code, text = _post(b, _CB_HI_STREAM)
-        st = b.stats()
+        st = {k: v for k, v in b.stats().items() if k != "server"}
     ev = _cb_events(text)
     assert [e["type"] for e in ev] == ["error"] and ev[0]["error"]["type"] == "api_error"
     assert st == {"last_fault": "malformed", "faults": {"malformed": 1}}
@@ -2327,7 +2327,7 @@ def test_chatbridge_records_endpoint_fault_kinds_without_their_text(mock_chat):
         _post(b, hi)
         assert b.stats()["last_fault"] == "rate_limit"
         _post(b, hi)
-        st = b.stats()
+        st = {k: v for k, v in b.stats().items() if k != "server"}
     assert st == {"last_fault": "", "faults": {"error": 1, "rate_limit": 1}}
     assert _CB_KEY not in json.dumps(st)
     with socket.socket() as s:
@@ -2430,7 +2430,7 @@ def test_chatbridge_without_effort_fields_sends_the_request_unchanged(mock_chat)
     up = mock_chat(_EF_OK)
     with Bridge(up.url, _CB_KEY, "made-up-model-a", effort="high") as b:
         _post(b, _EF_HI)
-        st = b.stats()
+        st = {k: v for k, v in b.stats().items() if k != "server"}
     assert up.seen[0]["body"] == to_chat(_EF_HI, "made-up-model-a")
     assert st == {"last_fault": "", "faults": {}}, "no effort record without fields"
 

@@ -1343,10 +1343,11 @@ def resolve_harness(arm: dict, opts: dict) -> dict:
     kind = arm.get("harness")
     if not kind or opts.get("dry_run"):
         return arm
-    inst = harness_ready(kind, arm.get("harness_version", ""), opts.get("harness_dir"))
+    pins = opts.get("harness_versions") or {}
+    inst = harness_ready(kind, arm.get("harness_version") or pins.get(kind, ""), opts.get("harness_dir"))
     got = {**arm, "harness_version": inst["version"], "harness_install": inst, "effort_mapping": CLAUDE_EFFORT_NOTE if arm.get("provider") == "claude" else EFFORT_NOTE[kind]}
     if kind == "codex":   # Codex speaks the Responses API: a LiteLLM proxy, outside the cell, turns it into Chat Completions
-        proxy = harness_ready("litellm-proxy", arm.get("proxy_version", ""), opts.get("harness_dir"))
+        proxy = harness_ready("litellm-proxy", arm.get("proxy_version") or pins.get("litellm-proxy", ""), opts.get("harness_dir"))
         got.update(proxy_version=proxy["version"], proxy_install=proxy)
     return got
 
@@ -1386,15 +1387,53 @@ def chat_probe(cfg: dict, model: str, effort: str = "", max_tokens: int = 200) -
 
 def rerun_server(bench_dir: Path, out: Path, opts: dict, cfg: dict, probe=None, sleep=time.sleep,
                  lock=None, only: list[tuple] | None = None) -> list[dict]:
-    """Rerun the cells of the plan in <out> that stopped on the server (serverhealth.queue), one at a time, each
-    only once a health probe shows its model at normal speed (serverhealth.wait_healthy; `probe(model, effort)`
-    defaults to chat_probe). `lock` (a context manager factory) wraps each run, so the endpoint's other users
-    take turns. A cell that stops on the server again stays queued (and shows `not scored (server)`); a cell
-    that ran to its end is graded as any cell: its new row replaces the old (results.jsonl: the last row of a
-    cell wins) and names it (`rerun_of`). Returns the rows added."""
+    """rerun_cells for the plan in <out> (plan.json): the cells that stopped on the server (serverhealth.queue)."""
     plan = json.loads((out / "plan.json").read_text())
-    arms, man = plan["arms"], verified(bench_dir)
+    man = verified(bench_dir)
     tasks = {t["task"]: {**t, "repo": man.get("repo")} for t in man["tasks"]}
+    return rerun_cells(bench_dir, out, tasks, plan["arms"], plan["cells"], plan["seed"], opts, cfg, probe, sleep, lock,
+                       only)
+
+
+def recheck_stops(out: Path, cells: list[tuple], why: str) -> list[dict]:
+    """Mark earlier stops as `server` cells to rerun (the rule applies to runs made before the server's waits were
+    recorded): for each (task, rep, arm) whose last row is a limit stop (timeout, stalled, a capacity refusal), a new
+    row marks it `server` (not scored, never a fail) with `why`, keeping the old row as `was`; its rerun decides
+    whether the stop was the server's or the model's. Returns the rows added."""
+    rows = {}
+    for line in (out / "results.jsonl").read_text().splitlines():
+        try:
+            r = json.loads(line)
+            rows[(r["task"], r["rep"], r["arm"])] = r
+        except (ValueError, KeyError, TypeError):
+            continue
+    added = []
+    for key in cells:
+        old = rows.get(key)
+        if not old or old.get("outcome") == serverhealth.OUTCOME or old.get("passed") is True:   # a pass stays a pass
+            continue
+        new = {k: v for k, v in old.items() if k not in ("was",)}
+        new = serverhealth.mark(new, [why])
+        new["was"] = {k: old.get(k) for k in ("outcome", "passed", "wall_s", "hang_guard", "cost_usd")}
+        with open_append(out / "results.jsonl", "ab+") as f:
+            torn = f.seek(0, 2) > 0 and f.seek(-1, 2) >= 0 and f.read(1) != b"\n"
+            f.write((b"\n" if torn else b"") + json.dumps(new).encode() + b"\n")
+            f.flush()
+            os.fsync(f.fileno())
+        added.append(new)
+    return added
+
+
+def rerun_cells(bench_dir: Path, out: Path, tasks: dict, arms: dict, cells: list[dict], seed: int, opts: dict,
+                cfg: dict, probe=None, sleep=time.sleep, lock=None, only: list[tuple] | None = None,
+                task_opts=None) -> list[dict]:
+    """Rerun the cells of <out> that stopped on the server (serverhealth.queue), one at a time, each only once a
+    health probe shows its model at normal speed (serverhealth.wait_healthy; `probe(model, effort)` defaults to
+    chat_probe). `lock` (a context manager factory) wraps each run, so the endpoint's other users take turns.
+    A cell that stops on the server again stays queued (`not scored (server)`); a cell that ran to its end is
+    graded as any cell: its new row replaces the old (the last row of a cell wins) and names it (`rerun_of`).
+    `only`: (task|None, arm|None) pairs. `task_opts(task)`: the options a task's run adds (a daily bench's
+    repository and state folder per task). Returns the rows added."""
     rows = []
     for line in (out / "results.jsonl").read_text().splitlines():
         try:
@@ -1403,8 +1442,7 @@ def rerun_server(bench_dir: Path, out: Path, opts: dict, cfg: dict, probe=None, 
             continue
     added = []
     for old in serverhealth.queue(rows):
-        key = (old["task"], old["rep"], old["arm"])
-        if only and key not in only:
+        if only and not any(t in (None, old["task"]) and n in (None, old["arm"]) for t, n in only):
             continue
         arm = arms[old["arm"]]
         hist = history(opts)
@@ -1426,18 +1464,20 @@ def rerun_server(bench_dir: Path, out: Path, opts: dict, cfg: dict, probe=None, 
         if kept.exists():   # the stopped attempt's files stay beside the rerun's
             kept.rename(kept.with_name(f"{kept.name}.server{n}"))
         with (lock() if lock else contextlib.nullcontext()):
-            new = {**run_cell(bench_dir, out, tasks[old["task"]], cell, arm, opts, cfg), "seed": plan["seed"],
+            new = {**run_cell(bench_dir, out, tasks[old["task"]], cell, arm,
+                              {**opts, **(task_opts(tasks[old["task"]]) if task_opts else {})}, cfg), "seed": seed,
                    "rerun_of": {"outcome": old.get("outcome"), "server_reason": old.get("server_reason"),
-                                "probe": last, "attempts": int(old.get("server_attempts") or 1) + 1}}
+                                "was": old.get("was"), "probe": last, "attempts": n + 1}}
         if new.get("outcome") == serverhealth.OUTCOME:
-            new["server_attempts"] = new["rerun_of"]["attempts"]
+            new["server_attempts"] = n + 1
         with open_append(out / "results.jsonl", "ab+") as f:
             torn = f.seek(0, 2) > 0 and f.seek(-1, 2) >= 0 and f.read(1) != b"\n"
             f.write((b"\n" if torn else b"") + json.dumps(new).encode() + b"\n")
             f.flush()
             os.fsync(f.fileno())
         added.append(new)
-    durable_write(out / "cells.json", json.dumps(blind_cells(out, tasks, arms, plan["cells"]), indent=1) + "\n")
+    if cells:
+        durable_write(out / "cells.json", json.dumps(blind_cells(out, tasks, arms, cells), indent=1) + "\n")
     return added
 
 

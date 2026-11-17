@@ -9328,6 +9328,21 @@ def cmd_bench(a) -> None:
           f"manifest {out / 'manifest.json'}")
 
 
+def _server_opts(p, conf: dict, no_agent_time: bool = False, ceiling: float = 0, versions=None) -> dict:
+    """The server-wait rules (serverhealth.py) as bench options: the limit counts the agent's own time;
+    `bench.server` holds the knobs, `bench.harness_versions` and `versions` (kind=version) the harness pins."""
+    srv = conf.get("server") or {}
+    o = {"agent_time": not no_agent_time and srv.get("agent_time", True), "ceiling_factor": srv.get("ceiling_factor"),
+         "server_factor": srv.get("factor"), "server_window": srv.get("window"), "server_min_calls": srv.get("min_calls"),
+         "probe_every_s": srv.get("probe_every_s"), "probe_max_s": srv.get("probe_max_s"),
+         "server_history": str(Path(srv.get("history") or p.state / "bench-server-history.json").expanduser()),
+         "harness_versions": {**(conf.get("harness_versions") or {}),
+                              **dict(x.split("=", 1) for x in versions or [] if "=" in x)}}
+    if ceiling:
+        o["ceiling_factor"] = ceiling
+    return o
+
+
 def _bench_daily(p, a) -> None:
     """`ttp bench daily [--day YYYY-MM-DD] [--cap-usd N]`: the day's landed code tasks from every project on
     this host through Sonnet, Opus and an open model, blind-reviewed, into the running table (benchdaily.py).
@@ -9343,6 +9358,25 @@ def _bench_daily(p, a) -> None:
     except (ValueError, KeyError, OSError, benchrun.BenchError) as e:
         die(f"bench daily: {e}")
     cap = a.cap_usd if a.cap_usd is not None else float(conf.get("cap_usd", benchdaily.CAP_USD))
+    if a.rerun_stops:   # in this shell: it waits for a healthy server and runs one cell at a time
+        held = benchdaily.lock(day)
+        if held is None:
+            die(f"bench daily: a run for {day} is already running on this host")
+        opts = {k: v for k, v in (("budget_usd", a.cell_budget or conf.get("cell_budget_usd")),
+                                  ("timeout_s", conf.get("timeout_s"))) if v}
+        if not a.arm_name:
+            die("bench daily --rerun-stops: name the arm(s) with --arm-name")
+        bconf = p.config().get("bench") or {}
+        try:
+            rec = benchdaily.rerun_day(day, [(t.strip(), n) for t in a.rerun_stops.split(",") if t.strip()
+                                             for n in a.arm_name],
+                                       cfg=p.config(), opts={**opts, **_server_opts(p, bconf)})
+        except (OSError, ValueError, RuntimeError, KeyError, benchrun.BenchError) as e:
+            die(f"bench daily: {e}")
+        for r in rec.get("reruns") or []:
+            print(f"ttp bench daily: {day}: {r['task']} {r['arm']}: {r['cause']}")
+        print(f"ttp bench daily: {day}: table {benchdaily.home() / 'table.md'}")
+        return
     if not a.here:
         argv = ["--day", day, "--tz", tz, "--cap-usd", str(cap)] + [x for arm in (a.arm or []) for x in ("--arm", arm)]
         argv += ["--glm-harness", a.glm_harness] if a.glm_harness is not None else []
@@ -9456,7 +9490,7 @@ def _bench_run(p, a) -> None:
     cfg = p.config()
     conf = cfg.get("bench") or {}
     arms = {k: {"provider": v.get("provider", ""), "model": v.get("model", ""), "effort": v.get("effort", ""),
-                **{f: v[f] for f in ("harness", "harness_version") if v.get(f) and v.get(f) != "claude"}}
+                **{f: v[f] for f in ("harness", "harness_version", "proxy_version", "planner") if v.get(f) and v.get(f) != "claude"}}
             for k, v in (conf.get("arms") or {}).items()}
     try:
         if a.arm:
@@ -9468,6 +9502,15 @@ def _bench_run(p, a) -> None:
                 "budget_usd": a.budget or conf.get("budget_usd", 8.0), "test_cmd": a.test_cmd or benchrun.TEST_CMD,
                 "test_timeout_s": conf.get("test_timeout_s", 900), "dry_run": a.dry_run,
                 "scratch_home": conf.get("scratch_home", True), "repo": Path(a.repo or p.root).expanduser().resolve(), "state": p.state}
+        opts.update(_server_opts(p, conf, no_agent_time=a.no_agent_time, ceiling=a.ceiling, versions=a.harness_version))
+        if a.rerun_server:
+            rows = benchrun.rerun_server(Path(a.bench).expanduser().resolve(), Path(a.out).expanduser().resolve(),
+                                         opts, cfg, only=[(t, n) for t in (a.task or [None]) for n in (a.arm_name or [None])] if a.task or a.arm_name else None)
+            for r in rows:
+                print(f"task {r['task']} {r['arm']}: {benchrun.serverhealth.describe(r)}"
+                      + (f" (rerun of a server stop)" if r.get("rerun_of") else " (still waiting for a healthy server)"))
+            print(f"ttp bench run --rerun-server: {len(rows)} cell(s) handled")
+            return
         rows = benchrun.run(Path(a.bench).expanduser().resolve(), Path(a.out).expanduser().resolve(), arms,
                             a.reps or conf.get("reps", 1), seed, opts, cfg, limit=a.limit, only=a.task)
     except (benchrun.BenchError, OSError, ValueError) as e:
@@ -16079,7 +16122,7 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--seeded", type=int, default=0, help="cells: build at most this many seeded-bug cells "
                                                          "(default: one per small task whose tests catch a mutation)")
     s.add_argument("--arm", action="append", help="run: name=provider:model:effort[:harness[@version]], repeatable "
-                   "(default: bench.arms); harness: claude (default), opencode or mini-swe-agent (chat provider only)")
+                   "(default: bench.arms); harness: claude (default), opencode, mini-swe-agent or codex (chat provider; mini-swe-agent and codex also claude); a last field plan=provider~model~effort adds a planner")
     s.add_argument("--task", type=int, action="append", help="run: only this bench task, repeatable (default: all)")
     s.add_argument("--reps", type=int, default=0, help="run: repeats per task and arm (default: bench.reps, 1)")
     s.add_argument("--seed", type=int, help="run: the arm-order seed (default: a random one, recorded)")
@@ -16091,6 +16134,17 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--no-validate", action="store_true", help="prep: skip validation: keep every added test unrun "
                                                                "(a count, or a host that cannot run the tests)")
     s.add_argument("--dry-run", action="store_true", help="run: every arm on the fake agent, no model call")
+    s.add_argument("--no-agent-time", action="store_true", help="run: the limit counts wall time, not the agent's own "
+                   "(wall minus the time waiting on the model server)")
+    s.add_argument("--ceiling", type=float, default=0, help="run: wall ceiling as a multiple of the limit (default 3)")
+    s.add_argument("--harness-version", action="append", help="run: pin a harness or proxy, kind=version "
+                   "(codex=..., litellm-proxy=...), repeatable")
+    s.add_argument("--rerun-server", action="store_true", help="run: rerun the cells in --out that stopped on the "
+                   "server, one at a time, each once a health probe shows normal speed (--task and --arm-name narrow it)")
+    s.add_argument("--arm-name", action="append", help="run --rerun-server: only this arm's cells, repeatable")
+    s.add_argument("--rerun-stops", help="daily: with --day and --arm-name, recheck these earlier stops (task numbers, "
+                   "comma separated) against the server rule: mark them `server`, rerun one at a time at normal server "
+                   "speed, grade the reruns in their own blind batch and update the day's record and the table")
     s.add_argument("--day", help="daily: the landed day to bench (YYYY-MM-DD in --tz; default: yesterday)")
     s.add_argument("--tz", help="daily: the zone the day is read in (default: bench.daily.tz, else the built-in one)")
     s.add_argument("--cap-usd", type=float, help="daily: the day's Claude spend cap, arm runs plus reviews "
