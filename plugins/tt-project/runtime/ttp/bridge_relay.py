@@ -41,6 +41,15 @@ relay, and the relay ends it itself on exit, so a restart never leaves two. Any 
 When the box-side loop finds this session's forwarded agent dead (exit 5: two failed `ssh-add -l`
 in a row, 30 s apart), the session reconnects after 5, 20, then 60 s; a fourth dead agent within
 10 min of the last exits, so the service's restart pacing applies.
+
+ssh runs in a process group of its own, and the relay never relies on it exiting by itself: open
+forwarded-agent channels can keep it up long after its remote command ended, holding the local
+agent's connections. The remote command reports its own end on stderr (`ttp-bridge-end <exit>`,
+from its EXIT trap); an ssh still up 3 s later is ended with its whole group (SIGTERM, SIGKILL 5 s
+later) and the relay goes on as if ssh had exited with that code. With --tag the relay also asks
+the local agent the session forwards for its keys every 30 s (`ssh-add -l`, 10 s timeout): a
+timeout or a failed exchange, confirmed by one more check, logs one line saying why, ends the
+group and reconnects like a dead agent above. A stop (SIGTERM, SIGINT) ends the group the same way.
 """
 from __future__ import annotations
 
@@ -421,6 +430,13 @@ STEADY_S = 60   # a session that stayed up this long starts a fresh count of for
 AGENT_DEAD = 5  # the box-side loop's exit when this session's forwarded agent stopped answering (bridge.py)
 AGENT_RETRY_S = (5, 20, 60)   # reconnects after a dead agent, then the service's own restart pacing
 AGENT_STEADY_S = 600   # a session that stayed up this long starts a fresh count of dead-agent reconnects
+END = re.compile(r"^ttp-bridge-end (\d+)\s*$")   # the remote command's own last line (tagged's EXIT trap)
+END_GRACE_S = 3.0      # once the remote command ended, ssh gets this long to exit before its group is ended
+KILL_GRACE_S = 5.0     # SIGTERM to ssh's process group, then SIGKILL this long after
+LOCAL_CHECK_S = 30.0   # how often the local agent the session forwards is asked for its keys
+LOCAL_TIMEOUT_S = 10.0   # an `ssh-add -l` that takes longer is a hung agent
+LOCAL_RECHECK_S = 2.0  # a failed check is confirmed by one more this soon after
+ENV_AGENT = "TTP_BRIDGE_AGENT"   # bridge.py's name for the service's own agent in its ssh wrapper
 
 # On the box (POSIX sh; ss, else /proc): $1 the tag prefix, $2 the record name prefix, then the ports.
 # Prints `ended <port> <pid> <age s>` per session it ends and `kept <port> <pid> <why>` per listener it
@@ -492,10 +508,12 @@ def rec_name(tag: str) -> str:
 
 def tagged(ssh: list[str], tag: str) -> list[str]:
     """The session with its tag at the head of its remote command (a no-op `:` the box can read), then
-    the session record: its sshd's pid and its own, written private and removed when it exits."""
+    the session record: its sshd's pid and its own, written private and removed when it exits; its last
+    stderr line names its exit code, so the relay can end an ssh that stays up after it."""
     rec = '"${XDG_CACHE_HOME:-$HOME/.cache}/tt-project/"' + shlex.quote(rec_name(tag) + ".pid")
     return ssh[:-1] + [f": {TAG}{tag}; ttp_rec={rec}; (umask 077; mkdir -p \"${{ttp_rec%/*}}\" && "
-                       f'echo "$PPID $$" > "$ttp_rec") 2>/dev/null; trap \'rm -f "$ttp_rec"\' EXIT; ' + ssh[-1]]
+                       f'echo "$PPID $$" > "$ttp_rec") 2>/dev/null; '
+                       f'trap \'ttp_rc=$?; rm -f "$ttp_rec"; echo "ttp-bridge-end $ttp_rc" >&2\' EXIT; ' + ssh[-1]]
 
 
 def cleanup_argv(ssh: list[str], prefix: str, ports: list[int]) -> list[str]:
@@ -541,18 +559,117 @@ def clean(ssh: list[str], prefix: str, ports: list[int]) -> None:
               f"{': ' + r.stderr.strip()[-200:] if r.stderr.strip() else ''})", file=sys.stderr, flush=True)
 
 
-def session(ssh: list[str], state: dict) -> tuple[int, bool]:
-    """Run one session, passing its stderr through; (exit code, whether a forward failed)."""
-    child = subprocess.Popen(ssh, stderr=subprocess.PIPE)
-    state["child"] = child
-    if state["stop"]:
-        child.terminate()
-    failed = False
+def forwarded_agent(ssh: list[str], env=None) -> str:
+    """The local agent socket the session forwards ('' for none): ssh's first ForwardAgent option, a
+    path, `$VAR`/`${VAR}` (bridge.py's own name stands for the service's SSH_AUTH_SOCK) or `yes`."""
+    env = os.environ if env is None else env
+    opts = ssh[:ssh.index("--")] if "--" in ssh else ssh
+    val = next((b.split("=", 1)[1].strip().strip('"') for a, b in zip(opts, opts[1:])
+                if a == "-o" and b.lower().startswith("forwardagent=")), "")
+    if val.lower() == "yes":
+        return env.get("SSH_AUTH_SOCK", "")
+    m = re.fullmatch(r"\$\{?(\w+)\}?", val)
+    if m:
+        return env.get(m.group(1)) or (env.get("SSH_AUTH_SOCK", "") if m.group(1) == ENV_AGENT else "")
+    return "" if val.lower() in ("", "no") else os.path.expanduser(val)
+
+
+def agent_fault(sock: str) -> str | None:
+    """Why the agent at `sock` does not answer ('' when it does, None when ssh-add cannot run here):
+    `ssh-add -l` exits 0, or 1 with no keys; 2, a timeout or a failed exchange is a dead agent."""
+    try:
+        r = subprocess.run(["ssh-add", "-l"], env=dict(os.environ, SSH_AUTH_SOCK=sock), stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True, timeout=LOCAL_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return f"ssh-add -l got no answer within {LOCAL_TIMEOUT_S:g}s"
+    except OSError:
+        return None
+    out = (r.stdout + r.stderr).strip()
+    if r.returncode == 0 or (r.returncode == 1 and not re.search(r"error fetching|communication with agent", out, re.I)):
+        return ""
+    return f"ssh-add -l exit {r.returncode}{': ' + out.splitlines()[-1][:120] if out else ''}"
+
+
+def watch_agent(sock: str, sess: dict, done: threading.Event) -> None:
+    """Every LOCAL_CHECK_S, ask the forwarded agent for its keys; two failures in a row set sess["agent"]."""
+    while not done.wait(LOCAL_CHECK_S):
+        why = agent_fault(sock)
+        if why is None:
+            return
+        if why and not done.wait(LOCAL_RECHECK_S):
+            why = agent_fault(sock)
+            if why:
+                sess["agent"] = why
+                return
+
+
+def signal_group(child: subprocess.Popen, sig: int) -> None:
+    try:
+        os.killpg(child.pid, sig)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        if child.poll() is None:
+            child.send_signal(sig)
+
+
+def end_group(child: subprocess.Popen) -> None:
+    """End ssh and everything in its process group: SIGTERM, then SIGKILL after KILL_GRACE_S."""
+    signal_group(child, signal.SIGTERM)
+    try:
+        child.wait(timeout=KILL_GRACE_S)
+    except subprocess.TimeoutExpired:
+        pass
+    signal_group(child, signal.SIGKILL)
+
+
+def pass_stderr(child: subprocess.Popen, sess: dict) -> None:
     for raw in child.stderr:
+        line = raw.decode(errors="replace")
+        m = END.match(line)
+        if m:
+            sess["end"], sess["end_t"] = int(m.group(1)), time.monotonic()
+            continue
         sys.stderr.buffer.write(raw)
         sys.stderr.flush()
-        failed = failed or FORWARD_FAILED in raw.decode(errors="replace")
-    return child.wait(), failed
+        sess["failed"] = sess["failed"] or FORWARD_FAILED in line
+
+
+def session(ssh: list[str], state: dict) -> tuple[int, bool]:
+    """Run one session, passing its stderr through; (exit code, whether a forward failed). ssh is ended
+    with its group once its remote command ended (that command's exit code) or the local agent it
+    forwards stopped answering (AGENT_DEAD), never left to exit by itself."""
+    child = subprocess.Popen(ssh, stderr=subprocess.PIPE, start_new_session=True)
+    state["child"] = child
+    sess: dict = {"failed": False, "end": None, "end_t": 0.0, "agent": ""}
+    done = threading.Event()
+    reader = threading.Thread(target=pass_stderr, args=(child, sess), daemon=True)
+    reader.start()
+    sock = forwarded_agent(ssh)
+    if sock:
+        threading.Thread(target=watch_agent, args=(sock, sess, done), daemon=True).start()
+    rc = None
+    while rc is None:
+        try:
+            rc = child.wait(timeout=0.5)
+            break
+        except subprocess.TimeoutExpired:
+            pass
+        if state["stop"]:
+            end_group(child)
+        elif sess["end"] is not None and time.monotonic() - sess["end_t"] >= END_GRACE_S:
+            print(f"ttp bridge: the remote command ended (exit {sess['end']}) but ssh stayed up; ending it",
+                  file=sys.stderr, flush=True)
+            end_group(child)
+            rc = sess["end"]
+        elif sess["agent"]:
+            print(f"ttp bridge: the local agent this session forwards stopped answering ({sess['agent']}); "
+                  "ending the session", file=sys.stderr, flush=True)
+            end_group(child)
+            rc = AGENT_DEAD
+    done.set()
+    reader.join(timeout=2)   # stderr ends with the group; an escaped holder of the pipe never blocks the relay
+    return rc, sess["failed"]
 
 
 def wait(seconds: float, state: dict) -> None:
@@ -622,7 +739,7 @@ def main(argv: list[str], platform: str | None = None, awake_spawn=None) -> int:
     def end(signum, _frame):
         state["stop"] = True
         if state["child"] is not None:
-            state["child"].terminate()
+            signal_group(state["child"], signal.SIGTERM)
 
     def lost():
         state["lost"] = True
@@ -646,9 +763,9 @@ def main(argv: list[str], platform: str | None = None, awake_spawn=None) -> int:
 def run(ssh: list[str], tag: str, d: str, state: dict) -> int:
     """The session (with --tag, its stale-session and dead-agent recovery) until it ends or is stopped."""
     if not tag:
-        state["child"] = subprocess.Popen(ssh)
+        state["child"] = subprocess.Popen(ssh, start_new_session=True)
         if state["stop"]:
-            state["child"].terminate()
+            end_group(state["child"])
         return state["child"].wait()
     prefix, ports, cleaned, dead = f"{computer_id(d)}/{tag}/", forward_ports(ssh), False, 0
     while True:

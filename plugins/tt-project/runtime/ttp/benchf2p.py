@@ -82,8 +82,10 @@ def select(repo: Path, base: str, head: str, module_text: str, cmd: str = bench.
 
 def _run(cmd: str, tree: Path, timeout: float) -> dict:
     """One pytest run of the module on `tree`: {"rc", "tail", "passed", "failed"} with the test
-    ids read from the run's verbose per-test lines ("path::name OUTCOME", pytest -v)."""
-    argv = [*shlex.split(cmd), MODULE, "-v", "--tb=no", "-p", "no:cacheprovider"]
+    ids read from the run's verbose per-test lines ("path::name OUTCOME", pytest -v). The command's own
+    -q is dropped: it would cancel -v (the default bench.TEST_CMD has one), leaving no per-test line."""
+    argv = [*[a for a in shlex.split(cmd) if not re.fullmatch(r"-q+|--quiet", a)],
+            MODULE, "-v", "--tb=no", "-p", "no:cacheprovider"]
     with tempfile.TemporaryFile(mode="w+", errors="replace") as sink:
         try:
             proc = subprocess.run(argv, cwd=tree, stdin=subprocess.DEVNULL, stdout=sink,

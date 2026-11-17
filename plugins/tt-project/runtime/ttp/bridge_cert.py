@@ -117,9 +117,8 @@ def block_lines(cfg: dict, box: str) -> tuple[list[str], set[str]]:
              "# short-lived certificate the workstation renews; once it ends, they fail."]
     for h in c["boxes"][box]["hosts"]:
         names = ",".join([h["name"], *h["aliases"]])
-        # the link is down when its agent does not answer (ssh-add exits 2), not only when its socket is gone
-        down = (f' !exec "SSH_AUTH_SOCK=$HOME/{link_path(cfg, bridged[h["name"]])} ssh-add -l >/dev/null 2>&1; [ $? -lt 2 ]"'
-                if h["name"] in bridged else "")
+        # the link is down when its agent does not answer (ssh-add exits 2 or hangs), not only when its socket is gone
+        down = f' !exec "{agent_up(link_path(cfg, bridged[h["name"]]))}"' if h["name"] in bridged else ""
         lines += ["", f"Match originalhost {names}{down} exec \"sh {p['valid']}\"", f"  HostName {h['target']}",
                   "  Port 22", "  IdentityAgent none", "  IdentitiesOnly yes", f"  IdentityFile {p['key']}",
                   f"  CertificateFile {p['cert']}"]
@@ -132,6 +131,18 @@ def block_lines(cfg: dict, box: str) -> tuple[list[str], set[str]]:
                   "  KbdInteractiveAuthentication no", "  HostbasedAuthentication no", "  GSSAPIAuthentication no",
                   "  BatchMode yes"]
     return lines, allowed
+
+
+PROBE_S = 3   # an agent link that has not answered `ssh-add -l` by then counts as down
+
+
+def agent_up(link: str) -> str:
+    """A Match exec command: exit 0 while the agent behind `$HOME/<link>` answers (ssh-add -l exits 0 or 1).
+    A hung agent is killed after PROBE_S and counts as down, so every ssh falls through to the next
+    route instead of hanging with it. POSIX sh only (no `timeout`, which macOS lacks), whatever the
+    login shell; ssh waits for the probe's shell, not for the watchdog's leftover sleep."""
+    return (f"sh -c 'SSH_AUTH_SOCK=$HOME/{link} ssh-add -l >/dev/null 2>&1 & p=$!; "
+            f"(sleep {PROBE_S}; kill $p) >/dev/null 2>&1 & w=$!; wait $p; r=$?; kill $w 2>/dev/null; [ $r -lt 2 ]'")
 
 
 def link_path(cfg: dict, agent: str) -> str:

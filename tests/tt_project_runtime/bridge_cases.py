@@ -836,8 +836,8 @@ def test_bridge_cert_expired_fails_closed(tmp_path, monkeypatch):
     # after that every login method is off for the host, so no other key is tried
     block = bridge.render_block(cfg, "box-1")
     k = "~/.config/tt-project/bridge-cert"
-    assert ('Match originalhost build-a,ba !exec "SSH_AUTH_SOCK=$HOME/.ssh/tt-agent/auto.sock ssh-add -l >/dev/null 2>&1; '
-            f'[ $? -lt 2 ]" exec "sh {k}/valid"') in block
+    assert (f'Match originalhost build-a,ba !exec "{bridge_cert.agent_up(".ssh/tt-agent/auto.sock")}" '
+            f'exec "sh {k}/valid"') in block
     assert f'!exec "sh {k}/valid quiet"' in block and "  PubkeyAuthentication no" in block
     assert f"  IdentityFile {k}/id_ed25519\n  CertificateFile {k}/id_ed25519-cert.pub" in block
     assert block.index("Match originalhost") < block.index("Host build-a")   # first match wins
@@ -1132,11 +1132,21 @@ if step == 'agentdead':
 if step == 'auth':
     sys.stderr.write('user@box-a: Permission denied (publickey).\\n')
     sys.exit(255)
+if step == 'linger':   # the remote command ended, but open agent channels keep ssh up; it ignores SIGTERM
+    import signal, subprocess, time
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    kid = subprocess.Popen(['sleep', '120'])   # a helper in ssh's process group (ProxyCommand-like)
+    open(os.path.join(d, 'kid.pid'), 'w').write(str(kid.pid))
+    sys.stderr.write('ttp-bridge-end 5\\n'); sys.stderr.flush()
+    time.sleep(120)
+if step == 'hold':     # a healthy session that stays up a few seconds
+    import time
+    time.sleep(float(os.environ.get('FAKE_HOLD_S', '3')))
 sys.exit(0)
 """
 
 
-def _fake_relay_ssh(d, plan):
+def _fake_relay_ssh(d, plan, agent="/agents/a.sock"):
     import json
     import sys
     d.mkdir(parents=True, exist_ok=True)
@@ -1145,7 +1155,7 @@ def _fake_relay_ssh(d, plan):
     ssh.write_text(f"#!{sys.executable}\n" + _BRIDGE_FAKE_SSH)
     ssh.chmod(0o755)
     return [str(ssh), "-T", "-n", "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes", "-o", "ConnectTimeout=20",
-            "-o", "IdentitiesOnly=yes", "-o", "IdentityFile=/keys/login.pub", "-o", "ForwardAgent=/agents/a.sock",
+            "-o", "IdentitiesOnly=yes", "-o", "IdentityFile=/keys/login.pub", "-o", f"ForwardAgent={agent}",
             "-R", "127.0.0.1:2301:build-a.example.com:22", "-R", "127.0.0.1:2302:build-b.example.com:22",
             "--", "box-a", "echo linked"]
 
@@ -1289,6 +1299,7 @@ def test_bridge_refresh_reinstalls_a_service_whose_command_changed(tmp_path, mon
 _BRIDGE_STUB_SSH_ADD = """#!/bin/sh
 t=$SSH_AUTH_SOCK
 [ -L "$t" ] && t=$(readlink "$t")
+[ -e "$t.hang" ] && exec sleep 60
 [ -e "$t.dead" ] && { echo "Could not open a connection to your authentication agent." >&2; exit 2; }
 [ -e "$t.fetch" ] && { echo "error fetching identities: communication with agent failed" >&2; exit 1; }
 [ -e "$t.empty" ] && { echo "The agent has no identities."; exit 1; }
@@ -1376,6 +1387,135 @@ def test_bridge_dead_agent_reconnects_with_bounded_retries(tmp_path, monkeypatch
     rc = bridge_relay.main(["--tag", "box-a/auto", str(tmp_path / "relay" / "box-a.auto"), "--", *argv])
     assert rc == bridge_relay.AGENT_DEAD and len(_calls(tmp_path / "t")) == 4
     assert "died again after each reconnect" in capfd.readouterr().err
+
+
+def test_bridge_cert_agent_probe_counts_a_hung_agent_as_down(tmp_path):
+    # cells: cert-probe-timeout
+    # The Match exec probe of the offline route: an answering agent (keys or none) is up; a dead one or
+    # one whose ssh-add hangs is down within the probe's time limit, so ssh falls through, never hangs.
+    import os
+    import subprocess
+    import time
+    from ttp import bridge_cert
+    path, socks = _bridge_stub_agents(tmp_path, "a")
+    probe = bridge_cert.agent_up("a.sock")
+    env = dict(os.environ, PATH=path, HOME=str(tmp_path))
+
+    def up():
+        t0 = time.monotonic()
+        rc = subprocess.run(["sh", "-c", probe], env=env, stdin=subprocess.DEVNULL, timeout=30).returncode
+        return rc == 0, time.monotonic() - t0
+    assert up()[0]
+    (tmp_path / "a.sock.empty").write_text("")
+    assert up()[0]
+    (tmp_path / "a.sock.empty").unlink()
+    (tmp_path / "a.sock.dead").write_text("")
+    assert not up()[0]
+    (tmp_path / "a.sock.dead").unlink()
+    (tmp_path / "a.sock.hang").write_text("")
+    ok, took = up()
+    assert not ok and took < bridge_cert.PROBE_S + 3
+    for s in socks:
+        s.close()
+
+
+def _bridge_alive(pid):
+    """A process that still runs (a zombie has ended)."""
+    import os
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    try:
+        return open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()[0] != "Z"
+    except OSError:
+        return False
+
+
+def test_bridge_remote_command_reports_its_end(tmp_path):
+    # cells: relay-end-marker
+    # tagged()'s EXIT trap writes the remote command's exit code as its last stderr line and keeps that code.
+    import os
+    import subprocess
+    from ttp import bridge_relay
+    for tail, rc in (("exit 5", 5), ("true", 0)):
+        cmd = bridge_relay.tagged(["ssh", "--", "box-a", tail], "aaaaaaaaaaaa/box-a/auto/0001")[-1]
+        r = subprocess.run(["sh", "-c", cmd], env=dict(os.environ, XDG_CACHE_HOME=str(tmp_path)),
+                           capture_output=True, text=True, timeout=30)
+        assert r.returncode == rc and r.stderr.splitlines()[-1] == f"ttp-bridge-end {rc}"
+        assert bridge_relay.END.match(r.stderr.splitlines()[-1])
+
+
+def test_bridge_ssh_left_up_after_its_remote_command_is_ended_and_reconnects(tmp_path, monkeypatch, capfd):
+    # cells: relay-linger-kill
+    # The remote loop exited 5, but ssh stays up (and ignores SIGTERM): the relay ends its whole
+    # process group (SIGKILL after the grace), then reconnects as for a dead agent.
+    import time
+    from ttp import bridge_relay
+    monkeypatch.setattr(bridge_relay, "AGENT_RETRY_S", (0, 0, 0))
+    monkeypatch.setattr(bridge_relay, "END_GRACE_S", 0.3)
+    monkeypatch.setattr(bridge_relay, "KILL_GRACE_S", 0.5)
+    argv = _fake_relay_ssh(tmp_path / "s", ["linger", "ok"])
+    t0 = time.monotonic()
+    rc = bridge_relay.main(["--tag", "box-a/auto", str(tmp_path / "relay" / "box-a.auto"), "--", *argv])
+    assert rc == 0 and len(_calls(tmp_path / "s")) == 2 and time.monotonic() - t0 < 30
+    kid = int((tmp_path / "s" / "kid.pid").read_text())
+    assert _bridge_wait(lambda: not _bridge_alive(kid), 10)   # the group went with it
+    err = capfd.readouterr().err
+    assert "the remote command ended (exit 5) but ssh stayed up" in err and "reconnecting in 0s" in err
+    assert "ttp-bridge-end" not in err   # the marker is read, not passed through
+
+
+def test_bridge_hung_local_agent_ends_the_session_and_reconnects(tmp_path, monkeypatch, capfd):
+    # cells: relay-agent-hang
+    # The local agent the session forwards stops answering (ssh-add -l hangs past its timeout, twice):
+    # the relay ends the still-running ssh, logs why, and reconnects; the second session runs on.
+    import time
+    from ttp import bridge_relay
+    path, socks = _bridge_stub_agents(tmp_path, "a")
+    monkeypatch.setenv("PATH", path)
+    monkeypatch.setenv("FAKE_HOLD_S", "60")
+    for k, v in (("AGENT_RETRY_S", (0, 0, 0)), ("LOCAL_CHECK_S", 0.2), ("LOCAL_TIMEOUT_S", 0.5),
+                 ("LOCAL_RECHECK_S", 0.1), ("KILL_GRACE_S", 0.5)):
+        monkeypatch.setattr(bridge_relay, k, v)
+    sock = tmp_path / "a.sock"
+    (tmp_path / "a.sock.hang").write_text("")
+    argv = _fake_relay_ssh(tmp_path / "s", ["hold", "ok"], agent=str(sock))
+    t0 = time.monotonic()
+    rc = bridge_relay.main(["--tag", "box-a/auto", str(tmp_path / "relay" / "box-a.auto"), "--", *argv])
+    assert rc == 0 and len(_calls(tmp_path / "s")) == 2 and time.monotonic() - t0 < 30
+    err = capfd.readouterr().err
+    assert "the local agent this session forwards stopped answering (ssh-add -l got no answer" in err
+    assert err.count("stopped answering (") == 1 and "reconnecting in 0s" in err
+    for s in socks:
+        s.close()
+
+
+def test_bridge_healthy_local_agent_leaves_the_session_alone(tmp_path, monkeypatch, capfd):
+    # cells: relay-agent-healthy
+    from ttp import bridge_relay
+    path, socks = _bridge_stub_agents(tmp_path, "a")
+    monkeypatch.setenv("PATH", path)
+    monkeypatch.setenv("FAKE_HOLD_S", "2")
+    monkeypatch.setattr(bridge_relay, "LOCAL_CHECK_S", 0.2)
+    monkeypatch.setattr(bridge_relay, "LOCAL_TIMEOUT_S", 2.0)
+    argv = _fake_relay_ssh(tmp_path / "s", ["hold"], agent=str(tmp_path / "a.sock"))
+    rc = bridge_relay.main(["--tag", "box-a/auto", str(tmp_path / "relay" / "box-a.auto"), "--", *argv])
+    assert rc == 0 and len(_calls(tmp_path / "s")) == 1
+    assert "stopped answering" not in capfd.readouterr().err
+    for s in socks:
+        s.close()
+
+
+def test_bridge_relay_reads_the_forwarded_agent_socket(monkeypatch):
+    # cells: relay-agent-socket
+    from ttp import bridge_relay
+    env = {"SSH_AUTH_SOCK": "/run/agent.sock", "OTHER": "/run/other.sock", "HOME": "/home/u"}
+    def fa(v):
+        return bridge_relay.forwarded_agent(["ssh", "-o", f"ForwardAgent={v}", "--", "box", "true"], env)
+    assert fa("/a/b.sock") == "/a/b.sock" and fa("yes") == "/run/agent.sock" and fa("no") == ""
+    assert fa("${TTP_BRIDGE_AGENT}") == "/run/agent.sock" and fa("$OTHER") == "/run/other.sock"
+    assert bridge_relay.forwarded_agent(["ssh", "--", "box", "-o ForwardAgent=/x"], env) == ""
 
 
 def _bridge_watch_setup(env, tmp_path, monkeypatch, block=None):

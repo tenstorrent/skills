@@ -40,6 +40,18 @@
   cleanup login ends only the box account's own sshd session on that port carrying this
   workstation's tag for the same box and agent, then it retries once. Nothing to do by hand;
   `ttp bridge status --deep` names a held port, and `ttp setup`/upgrade refresh changed services.
+- A `ttp bridge` session never relies on ssh exiting by itself: open forwarded-agent channels can
+  keep ssh up after its remote command ended, holding connections to the local agent until the
+  agent runs out of open files. The relay ends ssh with its whole process group (SIGTERM, then
+  SIGKILL) once the remote command ended, or once the local agent it forwards stops answering a
+  timed `ssh-add -l` twice in a row, logs one line saying why, and reconnects with backoff.
+- Opt-in, never a default: a bridge agent may forward a dedicated agent instead of the login
+  agent, so a burst of forwarded connections cannot exhaust the agent everything else uses. The
+  user starts it themselves with a raised open-file limit (for example
+  `sh -c 'ulimit -n <limit>; exec ssh-agent -D -a <socket path>'` under their own login service),
+  loads its keys themselves with `SSH_AUTH_SOCK=<socket path> ssh-add`, and sets that socket path
+  as the agent's `"agent"` in the bridge config. tt-project never creates, copies or loads keys
+  for it.
 
 ## When a task needs a path between machines
 

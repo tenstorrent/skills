@@ -38,6 +38,17 @@ def test_f2p_select_keeps_only_tests_that_fail_on_base_and_pass_on_head(tmp_path
     assert got["why"] == "kept the tests that fail on the base tree and pass on the change"
 
 
+def test_f2p_select_with_the_default_quiet_command_still_reads_each_test(tmp_path):
+    # cells: f2p-default-cmd
+    # bench.TEST_CMD carries -q, which cancels select's -v: the per-test lines vanished and every task
+    # read "collected no test". Its own interpreter stands in for python3; the flags stay as shipped.
+    from ttp import bench, benchf2p
+    assert " -q " in bench.TEST_CMD + " "
+    repo = _f2p_repo(tmp_path, CAP, FIX)
+    got = benchf2p.select(repo, "HEAD~1", "HEAD", GOOD, cmd=bench.TEST_CMD.replace("python3", sys.executable, 1))
+    assert got["fault"] is False and got["kept"] == ["f2p_test_module.py::test_thing"], got
+
+
 def test_f2p_select_drops_a_module_that_passes_everywhere_or_nowhere(tmp_path):
     from ttp import benchf2p
     repo = _f2p_repo(tmp_path, CAP, FIX)
