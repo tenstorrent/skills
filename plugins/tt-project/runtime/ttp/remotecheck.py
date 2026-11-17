@@ -149,11 +149,24 @@ def argv(cmd: str, host: str, env: dict | None = None, commit: str = "", wrap: t
             *(["--spill", spill] if spill else []), "--", cmd]
 
 
+def real_home_env() -> list[str]:
+    """`env HOME=<real HOME>` when this process runs under a check's scratch HOME (scratchhome.REAL_HOME_ENV
+    names the account's real one), else []. ssh reads the account's config under HOME, and its Match exec
+    probes (an agent socket, a certificate check) expand it: under the scratch HOME they fail and ssh offers
+    only file keys. The check's own commands keep the scratch HOME; nothing but HOME is named here."""
+    from . import scratchhome
+    real = os.environ.get(scratchhome.REAL_HOME_ENV, "")
+    if not real or not os.path.isabs(real) or "\n" in real or real == os.environ.get("HOME"):
+        return []
+    return ["env", f"HOME={real}"]
+
+
 def _ssh(host: str, script: str, direct: bool = False, compress: bool = False) -> list[str]:
     # The login shell parses the command line: hand it one quoted word for sh, whatever that shell is.
     # compress: the tree copy (a plain tar, about 3x smaller compressed) on a slow link.
-    return [*SSH, *(DIRECT if direct else []), *(["-o", "Compression=yes"] if compress else []), host,
-            f"sh -c {shlex.quote(script)}"]
+    # Every caller (checkspill's probe, slurmcheck) takes this argv, so each ssh runs under the real HOME.
+    return [*real_home_env(), *SSH, *(DIRECT if direct else []), *(["-o", "Compression=yes"] if compress else []),
+            host, f"sh -c {shlex.quote(script)}"]
 
 
 def paused(host: str, where: str | Path | None = None) -> str:

@@ -6231,3 +6231,53 @@ def test_a_second_run_of_a_project_spills_to_a_host_free_of_its_checks_and_spill
         with pytest.raises(ValueError):
             coordinator.USER_SETTABLE["checks.spill_runs_per_host"](bad)
     assert coordinator.USER_SETTABLE["checks.spill_runs_per_host"]("2") == 2
+
+
+def test_every_ssh_a_check_host_run_starts_gets_the_real_home_while_the_process_runs_under_a_scratch_one(
+        tmp_path, monkeypatch):
+    """ssh reads the account's config under HOME and its Match exec probes expand it: under a check's scratch
+    HOME they fail and ssh offers only file keys. remotecheck's argv (login, probe, slurm, copy, run) runs
+    under the real HOME scratchhome keeps in TTP_REAL_HOME; nothing else, no key or socket path, is named."""
+    from ttp import checkspill, remotecheck, scratchhome, slurmcheck
+    real, scratch = tmp_path / "real-home", tmp_path / "scratch"
+    real.mkdir(), scratch.mkdir()
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    (bin_ / "ssh").write_text('#!/bin/sh\necho "HOME=$HOME"\n')   # a fake ssh: says the HOME it runs under
+    (bin_ / "ssh").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_}:{os.environ['PATH']}")
+    monkeypatch.setenv("HOME", str(scratch))
+    monkeypatch.delenv(scratchhome.REAL_HOME_ENV, raising=False)
+    assert remotecheck._ssh("h", "true")[0] == "ssh", "no scratch HOME known: argv unchanged"
+
+    # scratchhome.apply keeps the real HOME, and a nested run keeps the outermost one
+    out = scratchhome.apply({"HOME": str(real)}, tmp_path / "run", [])
+    assert out["HOME"] != str(real) and out[scratchhome.REAL_HOME_ENV] == str(real)
+    nested = scratchhome.apply({**out}, tmp_path / "run2", [])
+    assert nested[scratchhome.REAL_HOME_ENV] == str(real) and nested["HOME"] != out["HOME"]
+
+    monkeypatch.setenv(scratchhome.REAL_HOME_ENV, str(real))
+    argv = remotecheck._ssh("h", "true", direct=True, compress=True)
+    assert argv[:2] == ["env", f"HOME={real}"] and argv[2] == "ssh" and argv[-2] == "h"
+    assert not any(w in ("-i", "-F") or "Identity" in w for w in argv), argv
+    for kw in (dict(), dict(direct=True)):
+        r = subprocess.run(remotecheck._ssh("h", "true", **kw), capture_output=True, text=True)
+        assert r.stdout.strip() == f"HOME={real}", r
+    # the process, and so a check's own commands, keep the scratch HOME
+    assert os.environ["HOME"] == str(scratch)
+
+    seen = []
+
+    def fake(cmd, *a, **k):
+        seen.append(cmd)
+        return subprocess.CompletedProcess(cmd, 255, "", "ssh: Permission denied (publickey).\n")
+    monkeypatch.setattr(checkspill.subprocess, "run", fake)
+    checkspill.probe("h")
+    monkeypatch.setattr(slurmcheck.subprocess, "run", fake)
+    slurmcheck._ssh("h", "true", 5)
+    assert len(seen) == 2 and all(c[:2] == ["env", f"HOME={real}"] for c in seen), seen
+
+    # a malformed value, or the real HOME already in force, adds nothing
+    for bad in ("relative/home", f"{real}\nx", str(scratch)):
+        monkeypatch.setenv(scratchhome.REAL_HOME_ENV, bad)
+        assert remotecheck._ssh("h", "true")[0] == "ssh", bad

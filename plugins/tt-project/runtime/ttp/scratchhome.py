@@ -31,6 +31,7 @@ import shutil
 HOME_FILES = (".gitconfig",)
 FILES_ENV = "TTP_CHECKS_HOME_FILES"   # in a check's env when on: the files (JSON), for a check run on another host
 FOLDER = "home"
+REAL_HOME_ENV = "TTP_REAL_HOME"   # in a check's env when on: the account's real HOME, for what must run as the account (remotecheck's ssh)
 XDG = {"XDG_CONFIG_HOME": ".config", "XDG_DATA_HOME": ".local/share", "XDG_STATE_HOME": ".local/state"}
 KEEP = {"RUSTUP_HOME": ".rustup", "CARGO_HOME": ".cargo", "PYENV_ROOT": ".pyenv", "GOPATH": "go",
         "NVM_DIR": ".nvm", "HF_HOME": ".cache/huggingface"}
@@ -105,7 +106,8 @@ def apply(env: dict, folder: str | Path, files: list[str]) -> dict:
     from . import project
     real = Path(env.get("HOME") or os.path.expanduser("~"))
     home = Path(folder) / FOLDER   # one per run: its checks share it, and a later call keeps what they wrote
-    out = {**env, "HOME": str(home), FILES_ENV: json.dumps(files)}
+    # A nested run keeps the first (outermost) real HOME: its own HOME is already a scratch one.
+    out = {**env, "HOME": str(home), FILES_ENV: json.dumps(files), REAL_HOME_ENV: env.get(REAL_HOME_ENV) or str(real)}
     for var, rel in XDG.items():
         (home / rel).mkdir(parents=True, exist_ok=True)
         out[var] = str(home / rel)
