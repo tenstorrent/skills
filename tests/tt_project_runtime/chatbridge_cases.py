@@ -4102,3 +4102,27 @@ def test_chatbridge_relay_forwards_only_data_lines_of_an_openai_stream(mock_chat
         status, text = _post(b, {"model": "m", "stream": True, "messages": []}, path="/v1/chat/completions")
     assert status == 200 and '"hi"' in text and "[DONE]" in text
     assert "event:" not in text and ": true" not in text
+
+
+def test_model_scores_read_the_project_on_a_connection_of_their_own_thread(env, monkeypatch):
+    """The model-score refresh runs in a thread: reading runs on the daemon's connection (made in its main
+    thread) failed every time with sqlite's 'objects created in a thread can only be used in that same
+    thread', so the scores were never published."""
+    from ttp import daemon as dmn, modelscore
+    from ttp.daemon import Daemon
+    _rank_home(env, monkeypatch)
+    monkeypatch.setenv("TTP_TEST_MODEL_RANKING", "1")
+    p = make(env)
+    _route_config(p)
+    d = Daemon(p.base)
+    d._load_config()
+    d.p.db.one("SELECT 1")   # the daemon's own connection exists, made in this thread
+    recorded, logged = [], []
+    monkeypatch.setattr(modelscore, "record", lambda name, rows, now: recorded.append(rows))
+    monkeypatch.setattr(modelscore, "publish", lambda served, now: {"changed": False})
+    monkeypatch.setattr(dmn, "log", lambda where, text, *a, **k: logged.append(text))
+    d.refresh_model_scores()
+    d._scores_job.join(30)
+    assert not d._scores_job.is_alive()
+    assert not [t for t in logged if "not published" in t], logged
+    assert recorded == [modelscore.live_rows(p, time.time())]

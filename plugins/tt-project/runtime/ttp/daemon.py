@@ -4981,15 +4981,21 @@ class Daemon:
                 or self._scores_job is not None and self._scores_job.is_alive()):
             return
         self._scores_tried, where, served = now, self.p, modelrank.served(self.p.state, now)
+        base = self.p.base
 
         def work() -> None:
+            own = None
             try:
-                modelscore.record(where.name, modelscore.live_rows(where, time.time()), time.time())
+                own = Project(base)   # its own connection: a sqlite one serves only the thread that made it
+                modelscore.record(where.name, modelscore.live_rows(own, time.time()), time.time())
                 out = modelscore.publish(served, time.time())
                 if out["changed"]:
                     log(where, f"model scores: standard class {out['old']} -> {out['new']}")
             except Exception as e:   # a local fault: the type only; the last rankings stay
                 log(where, f"model scores: not published: {type(e).__name__}: {e}")
+            finally:
+                if own is not None and own._db is not None:
+                    own._db.close()
 
         self._scores_job = threading.Thread(target=work, name="model-scores", daemon=True)
         self._scores_job.start()
