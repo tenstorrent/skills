@@ -10936,8 +10936,11 @@ def cmd_task(a) -> None:
         from . import blindreview
         # A blind review sees no model, provider, effort, spend or arm label, and no model names in the text.
         blind = blindreview.mask if blindreview.caller_blind() else (lambda v: v)
+        from . import codearm
+        arm = None if blindreview.caller_blind() else codearm.recorded(p.db, t["id"])   # the code route's arm
         if a.json:
             print(json.dumps(blind({**t, **({"abandoned": {"why": gone[0], "ts": gone[1]}} if gone else {}),
+                              **({codearm.KEY: arm} if arm else {}),
                               **({probewake.KEY: {"run": woke[0], **woke[1]}} if woke else {}),
                               **({"superseded": sup} if sup else {}), "blocker_sweep": swept}), indent=2, default=str))
         else:
@@ -10947,6 +10950,8 @@ def cmd_task(a) -> None:
             if gone:
                 lines.append(f"abandoned {timefmt.long(gone[1], p)}: {gone[0]}")
             lines += sweep.task_lines(swept, p)
+            if arm:
+                lines.append(codearm.show_line(arm))
             if woke:
                 lines.append(f"run {woke[0]} " + probewake.show_line(woke[1], lambda ts: timefmt.long(ts, p)))
             print(blind(show_task(blind(t)) + ("\n\n" + "\n".join(lines) if lines else "")))

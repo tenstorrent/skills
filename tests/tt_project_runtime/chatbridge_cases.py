@@ -2020,6 +2020,33 @@ def test_a_routed_run_that_hands_off_failed_is_no_fallback(env, monkeypatch):
     assert run["status"] == "failed" and "priced" not in route.of(run["note"])
 
 
+def test_a_code_arm_run_that_asks_for_opus_requeues_on_opus_with_no_attempt_and_no_fault(env, monkeypatch):
+    from ttp import codearm, route
+    from ttp.daemon import Daemon
+    p = make(env)
+    _route_config(p)
+    d = Daemon(p.base)
+    monkeypatch.setattr(d, "observe", lambda *a, **k: None)
+    tid = p.db.add_task("tidy", "", kind="code", tier="standard", priority=3, budget_usd=8.0, labels=[])
+    routed = {"tier": "standard", "to": "chat", "model": _RT_MODEL, "fallback": "none", codearm.KEY: "glm"}
+    run, task = _route_finish(p, d, tid, {"rc": 0, "bridge": {"last_fault": ""}}, routed=routed,
+                              result={"status": "blocked", "needs_opus": "a design choice the spec leaves open",
+                                      "summary": "needs Opus: a design choice the spec leaves open"})
+    e = route.of(run["note"])
+    assert run["status"] == "fallback" and e["fallback"] == route.BOUNCE
+    assert e["bounce"] == "a design choice the spec leaves open"
+    assert task["status"] == "queued" and int(task["attempts"] or 0) == 0
+    assert route.cooling(p.db, "chat", time.time()) == ""   # no fault counted against the provider
+    assert json.loads((p.runs / str(run["id"]) / "result.json").read_text())["status"] == route.BOUNCE
+    assert codearm.bounced(p.db, tid) == "a design choice the spec leaves open"
+    assert "bounced: needs Opus: a design" in route.fallback_line(run["id"], e)
+    # A plain block on the arm is a block, not a bounce.
+    tid2 = p.db.add_task("tidy 2", "", kind="code", tier="standard", priority=3, budget_usd=8.0, labels=[])
+    run, task = _route_finish(p, d, tid2, {"rc": 0, "bridge": {"last_fault": ""}}, routed=routed,
+                              result={"status": "blocked", "summary": "waits on #12"})
+    assert route.of(run["note"])["fallback"] == "none" and task["status"] == "blocked"
+
+
 def _dispatch_task(p, d, monkeypatch, tid):
     """Dispatch with only task `tid` queued; returns (provider, tier, kwargs) of its start."""
     from ttp import budget as bud

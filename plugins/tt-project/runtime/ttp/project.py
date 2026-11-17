@@ -723,7 +723,8 @@ EXTRA_KEYS = {
     # model_bench.terminalbench: the Terminal-Bench settings (harborslice.settings, tbcycle.settings), set as one object.
     "model_bench": {"terminalbench"},
     # route: run-class routing (runclass.py). code_sonnet: {"share", "kinds", "guard", "guard_pts", "alarm_p"} or false, the code
-    # route and its daily guard (runclass.guard_run); core_cheap: {class: {"model", "effort"} | false} or false. Both
+    # route and its daily guard (runclass.guard_run), plus its GLM arm (codearm.py: "glm_share", "glm" {"provider",
+    # "model", "effort", "harness"}, "glm_seed", "glm_cap" {"start", "min", "max"}, "glm_guard_pts", "glm_guard_min"); core_cheap: {class: {"model", "effort"} | false} or false. Both
     # are account keys too (ACCOUNT_KEYS): the account's value first, the project's own over it. classes,
     # review_small_lines, review_medium_lines: the run classes' map and review sizes; host_max: host-wide (HOST_WIDE_KEYS).
     "route": {"code_sonnet", "core_cheap", "device_ab", "device_ab_shadow", "classes", "review_small_lines", "review_medium_lines", "host_max"},

@@ -966,6 +966,7 @@ class Bridge:
                     self._end_call(h, 0, "fault")
                     return h._reply(*self._fault_reply(_chunk_error(data, self._scrub), data))
                 self._ok()
+                self._count(data.get("usage"))   # a translated call is counted too (cached apart: usage_of)
                 self._end_call(h, usage_of(data.get("usage"))["output_tokens"])
                 return h._reply(200, from_chat(data, body.get("model") or self.model))
             self._stream(h, resp, Stream(body.get("model") or self.model))
@@ -1015,6 +1016,7 @@ class Bridge:
             if not errored:
                 self._ok()
                 send(st.end())
+            self._count(st.usage or None)
             self._end_call(h, usage_of(st.usage)["output_tokens"] or seen // 120, "fault" if errored else "ok")
             h.wfile.write(b"0\r\n\r\n")
             h.wfile.flush()

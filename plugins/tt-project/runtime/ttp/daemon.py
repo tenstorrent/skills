@@ -39,6 +39,7 @@ from pathlib import Path
 from . import runtimeload   # first of its own: its LOADED_AT is when the daemon imported its code
 from . import blindreview
 from . import rolerestore
+from . import codearm
 from . import deviceab
 from . import deviceshadow
 from . import batchrun
@@ -2619,6 +2620,21 @@ class Daemon:
                 self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
                             (now, "daemon", "code_route_guard", "high", runclass.guard_text(row)[:1500], "queued"))
                 log(self.p, "code-route guard tripped: every code kind runs on Opus until route.code_sonnet changes")
+        # The code route's GLM arm (codearm.py): its daily switch-back guard (a trip holds the share at 0, told
+        # once at normal) and its hourly worker cap.
+        if now - getattr(self, "_code_arm_checked", 0.0) >= 3600:
+            self._code_arm_checked = now
+            try:
+                row = codearm.guard_run(self.p.db, self.cfg, now)
+                if row and row.get("new_trip"):
+                    self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                                (now, "daemon", "code_arm_guard", "normal", codearm.guard_text(row)[:1500], "queued"))
+                    log(self.p, f"code route GLM arm switched back: {row.get('why')}"[:300])
+                if (moved := codearm.cap_tick(self.p.db, self.cfg, now)) and moved["cap"] != moved["was"]:
+                    log(self.p, f"code route GLM arm: worker cap {moved['was']} -> {moved['cap']} "
+                                f"({moved.get('why')})"[:300])
+            except Exception as e:   # never holds the loop
+                log(self.p, f"code arm tick failed: {type(e).__name__}: {e}"[:300])
         # route.device_ab: the test arm's incident stop (one high event) and the masked reviews.
         if now - getattr(self, "_device_ab_checked", 0.0) >= 300:
             self._device_ab_checked = now
@@ -6846,7 +6862,11 @@ class Daemon:
                 salvaged = False
                 log(p, f"run {r['id']}: salvaging its hand-off failed: {e}")
         # A run without its system prompt never stands on its hand-off: it is held and the task blocked.
-        handed_off = r["role"] != "coordinator" and refused != "instructions_missing" and \
+        # A code arm run that asked for Opus (codearm.contract) hands nothing off: it falls back to the core
+        # provider at Opus, with no attempt spent, no route cooling and no fault counted for the arm.
+        bounce = codearm.bounce_reason(_read_result(run_dir / RESULT_FILE)) \
+            if on_route and routed and routed.get(codearm.KEY) and refused != "instructions_missing" else ""
+        handed_off = r["role"] != "coordinator" and refused != "instructions_missing" and not bounce and \
             (_read_result(run_dir / RESULT_FILE) or {}).get("status") in HANDOFF_STATES
         if r["role"] != "coordinator" and r["task"] and not handed_off:
             self._outside_writes(r, run_dir)
@@ -6877,8 +6897,19 @@ class Daemon:
         fell = route.fell_back(status, exit_info, usage.error) if on_route and not handed_off else ""
         # A routed run that ended without a hand-off on its own (timed out, failed, no valid result.json)
         # also falls back, unless a host sleep cut it (lost to the sleep, as any run).
-        own = route.own_cause(status) if on_route and not handed_off and not fell and not slept else ""
-        fell = fell or own
+        own = route.own_cause(status) if on_route and not handed_off and not fell and not slept and not bounce else ""
+        fell = (route.BOUNCE if bounce and status not in ("limit", "auth") else "") or fell or own
+        if bounce:
+            # Its result.json says blocked (the Stop hook's states); kept as a bounce, it requeues the task
+            # (FREE_ENDS) instead of blocking it.
+            try:
+                got = _read_result(run_dir / RESULT_FILE) or {}
+                durable_write(run_dir / RESULT_FILE, json.dumps(
+                    {**got, "status": route.BOUNCE, "handoff_status": got.get("status"), "needs_opus": bounce,
+                     "summary": f"needs Opus: {bounce}"}, indent=1))
+            except OSError as e:
+                log(p, f"run {r['id']}: its bounce was not recorded in {RESULT_FILE}: {e}")
+            log(p, f"run {r['id']} of task {r['task']} bounced to Opus: {bounce}")
         if fell and status not in ("limit", "auth"):
             status = "fallback"   # the endpoint or the routed run failed: no attempt, the same tier on the core provider
         net_lost = status in SLEEP_CUT and bool(NET_LOST_RE.search(usage.error or ""))
@@ -6902,8 +6933,12 @@ class Daemon:
             note[route.KEY] = {**routed, **({"fallback": fell} if fell else {}), **({"salvaged": True} if salvaged else {}),
                                **({"cause": _route_cause(stopped or status, exit_info, usage, run_dir)} if own else {}),
                                **({"priced": priced} if priced is not None else {}),
+                               **({"bounce": bounce} if bounce else {}),
                                "wall_s": round(float(exit_info.get("ended") or time.time()) - float(r["started"] or 0), 1)}
-            if fell and not own and (got := route.upstream_entry(exit_info.get("bridge") or {})):
+            if routed.get(codearm.KEY) and on_route and (got := codearm.run_summary(exit_info.get("bridge"))):
+                note[codearm.KEY] = {**(note.get(codearm.KEY) if isinstance(note.get(codearm.KEY), dict) else {}),
+                                     "bridge": got}   # the per-arm table's tokens, waits and refusals
+            if fell and not own and not bounce and (got := route.upstream_entry(exit_info.get("bridge") or {})):
                 note[route.KEY]["upstream"] = got   # e.g. 404 model_not_found, apart from a 5xx
             sent = route.effort_entry(exit_info.get("bridge") or {}) if on_route else None
             if sent:
@@ -6933,7 +6968,7 @@ class Daemon:
                         self.alert(f"route-model-missing:{routed['tier']}|{model}",
                                    route.missing_notice(self.cfg, routed["to"], routed["tier"], model),
                                    severity="normal", every_s=0)
-            elif fell and not own:   # an endpoint fault cools the endpoint; a run's own end only its task
+            elif fell and not own and not bounce:   # an endpoint fault cools the endpoint; a run's own end only its task
                 route.cool(db, self.cfg, routed["to"], fell, r["id"], time.time())
         elif r["provider"] == modelrank.TO and isinstance(note.get(modelrank.KEY), dict) and r["model"] and \
                 route.fell_back(status, exit_info, usage.error) == "model_missing":
@@ -8242,11 +8277,12 @@ class Daemon:
                                                      f"hand-off said: {result.get('summary') or ''}"[:1500])
         summary = str((result.get("summary") if isinstance(result, dict) else None)
                       or (usage.final_text or usage.error or "")[:1500])
-        if status in FREE_ENDS and not rstatus and r.get("id"):
+        if status in FREE_ENDS and rstatus in (None, "", route.BOUNCE) and r.get("id"):
             # A routed run that fell back is one route line in the feed, never a failed run with the
             # endpoint's error text: the core provider's run that follows is the outcome that counts.
             fb = route.of((db.one("SELECT note FROM runs WHERE id=?", (r["id"],)) or {}).get("note"))
-            if fb and fb.get("fallback") in (*route.FAULTS, *route.RUN_CAUSES) and r.get("provider") == fb.get("to"):
+            if fb and fb.get("fallback") in (*route.FAULTS, *route.RUN_CAUSES, route.BOUNCE) \
+                    and r.get("provider") == fb.get("to"):
                 summary = route.fallback_line(r["id"], fb)
         if status == "ok" and rstatus == "blocked" and isinstance(result, dict):
             # Its own detached jobs still run: the task is not blocked but waiting on them, and they keep
@@ -10367,6 +10403,14 @@ class Daemon:
                              "each PROBLEM today):\n" + "\n".join(f"- {line}" for line in muted))
             except Exception as e:   # nor must the mute list
                 log(self.p, f"mute review lines failed: {type(e).__name__}: {e}")
+        if payload.get("audit_report", s["name"] == "daily-review"):
+            try:
+                arms = codearm.review_lines(db, self.cfg)
+                if arms:
+                    spec += ("\n\nCode route arms, last 24 h (GLM vs Sonnet vs Opus; the switch-back guard is "
+                             "model-free):\n" + "\n".join(arms))
+            except Exception as e:   # nor must the arm table
+                log(self.p, f"code arm lines failed: {type(e).__name__}: {e}")
         if (self.cfg.get("upstream") or {}).get("ingest") and payload.get("audit_report", s["name"] == "daily-review"):
             try:
                 line = upstream.orphans_line()
@@ -13216,10 +13260,13 @@ class Daemon:
                 "wake": bool(wake), "tier": tier, "review_tier": review_pick or {},
                 conflictfix.KEY: (review_pick or {}).get(conflictfix.KEY)}}, self.cfg)
             # A tier routed to another provider (route.py) runs there unless it is cooling down.
-            routed = self._route(task, tier, picked, now, cls=run_cls)
+            arm = self._code_arm(task, tier, picked)   # recorded on the task before its first run
+            routed = self._route(task, tier, picked, now, cls=run_cls, arm=arm)
             lease = None
             if routed and routed["fallback"] == "none":
                 why = self._no_room(routed["to"], ctx)
+                if not why and routed.get(codearm.KEY) and codearm.full(db, self.cfg):
+                    why = "slots"   # the arm's own concurrency cap (codearm.cap_tick moves it)
                 if not why:
                     lease = self._route_lease(task, routed, tier, now)
                     why = "" if lease else "slots"
@@ -13295,7 +13342,9 @@ class Daemon:
                     note[untrusted.KEY] = {"set": True, **({"kept_core": f"{to[0]}:{to[1]}"} if to else {})}
                 # A cheap class on the Claude core provider (no tt model serves it): a cheap Claude model.
                 # The code route (runclass.code_route) applies whatever a model pick chose; other classes keep it.
-                code_state = self._code_state()
+                code_state = codearm.code_state(self._code_state(), arm)
+                if arm:
+                    note[codearm.KEY] = arm
                 cheap = None if dp and run_cls != "hard" else runclass.core_cheap(
                     self.cfg, task, run_cls, tier, run_prov, routed, picked, code_state)
                 dab = None
@@ -13314,7 +13363,8 @@ class Daemon:
                 if cheap:
                     note[runclass.CHEAP_KEY] = cheap
                 try:   # a routed model pick runs its option's effort: no A/B arm; nor does a cheap core run
-                    ab = None if cheap or ((routed or {}).get("model_pick") and run_prov == routed["to"]) else \
+                    ab = None if cheap or (((routed or {}).get("model_pick") or (routed or {}).get(codearm.KEY))
+                                           and run_prov == routed["to"]) else \
                         effortab.assign(db, self.cfg, task, tier, run_prov, jev=self.jev)
                 except Exception as e:   # the A/B must never hold a task back
                     ab = None
@@ -13335,7 +13385,10 @@ class Daemon:
                                                conflict=note.get(conflictfix.KEY)), None
                 prompt += startcheck.prompt_lines(found)   # a resumed session is told too
                 prompt += probewake.prompt_lines(woke_probe, lambda ts: timefmt.long(ts, self.p))
-                members = [] if note.get("wake") or note.get("resumes") else \
+                on_arm = bool(routed and routed.get(codearm.KEY) and run_prov == routed["to"])
+                if on_arm:   # the arm's run may hand the task back to Opus (codearm.BOUNCE)
+                    prompt += codearm.contract()
+                members = [] if note.get("wake") or note.get("resumes") or on_arm else \
                     self._batch_members(task, ready, batched | set(fate), live)
                 if members:
                     note["batch"] = {"id": f"b{task['id']}", "members": [m["id"] for m in members]}
@@ -13771,12 +13824,25 @@ class Daemon:
             log(self.p, f"task {task['id']}: tier floor not applied: {e}")
             return None
 
+    def _code_arm(self, task: dict, tier: str, picked: dict | None, peek: bool = False) -> dict | None:
+        """The code route's arm for this run (codearm.choose), or None (off, not code, or not readable)."""
+        try:
+            return codearm.choose(self.p.db, self.cfg, task, tier, picked, peek=peek)
+        except Exception as e:   # the arm must never hold a task back: in doubt, Claude
+            log(self.p, f"task {task.get('id')}: code arm not chosen: {type(e).__name__}: {e}"[:300])
+            return None
+
     def _route(self, task: dict, tier: str, picked: dict | None, now: float, peek: bool = False,
-               cls: str | None = None) -> dict | None:
+               cls: str | None = None, arm: dict | None = None) -> dict | None:
         """The run note's `route` entry for a worker run of a tier routed to another provider
         (route.py), or None: `fallback` is none when it starts there, else why it starts on the core
         provider (a cool-down after a fallback, or the auth gate holding the endpoint). With no tier,
-        rule or pick route, its run class `cls` routes it (runclass.target): a review or floor run too."""
+        rule or pick route, its run class `cls` routes it (runclass.target): a review or floor run too.
+        A code task on the code route's chat arm (`arm`, codearm.choose) is routed to the arm's model first."""
+        arm = arm if arm is not None else self._code_arm(task, tier, picked, peek=True)
+        if arm and arm["run"] == "glm" and (s := codearm.settings(self.cfg)):
+            e = self._route_entry(task, tier, s["provider"], s["model"], now, cls=cls, arm=True)
+            return {**e, codearm.KEY: "glm", **({"pick_effort": s["effort"]} if s["effort"] else {})}
         dp = self._model_pick(task, tier, peek=peek)
         if dp is not None:   # the model pick (modelpick.py) decides this tier's route
             got = modelpick.target(self.cfg, dp)
@@ -13819,9 +13885,11 @@ class Daemon:
             return None
 
     def _route_entry(self, task: dict, tier: str, name: str, model: str, now: float, rule_i: int | str | None = None,
-                     cls: str | None = None, pick: bool = False, core_only: bool = False) -> dict | None:
+                     cls: str | None = None, pick: bool = False, core_only: bool = False,
+                     arm: bool = False) -> dict | None:
         """The route entry; `core_only` returns it only when the run starts on core anyway (a rerun after
-        a fallback, or escalated), else None."""
+        a fallback, or escalated), else None. `arm`: a code arm run (codearm.py), whose review and checks fixes
+        keep their lineage's arm."""
         rule = {} if rule_i is None else {"rule": rule_i}   # the providers.chat.routes rule it matched
         after = route.fell_back_before(self.p.db, task["id"]) if task.get("id") else None
         if after:   # the task fell back on its own once: the rest of its runs stay on the core provider
@@ -13831,6 +13899,8 @@ class Daemon:
         except Exception as e:   # escalation must never hold a task back
             log(self.p, f"task {task['id']}: route escalation not checked: {type(e).__name__}: {e}")
             esc = {}
+        if arm and esc.get("escalated") in ("review fix", "checks fix"):
+            esc = {}   # a follow-up fix keeps its parent's arm (codearm.choose)
         if esc:   # urgent, user-ordered, a fix of a routed change or a lineage's misses: the core provider
             return {"tier": tier, "to": name, "model": model, **rule, "fallback": route.ESCALATED, **esc}
         if core_only:

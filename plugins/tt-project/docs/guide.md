@@ -1203,6 +1203,29 @@ words in the spec) do. Each code run's note records the decision and its reason;
 daemon raises a normal `route_share_low` event when the code route, or a device A/B's test arm, took under half
 its configured share over at least 10 runs, naming the top reasons.
 
+A second code arm (off by default) sends a share of new code tasks to a chat model instead of Sonnet,
+under `route.code_sonnet`: `{"glm_share": 0.5, "glm": {"provider": "chat", "model": "<chat model>", "effort":
+"max", "harness": "claude-code"}, "glm_seed": "", "glm_cap": {"start": 4, "min": 1, "max": 8},
+"glm_guard_pts": 10, "glm_guard_min": 15}`. It is off while `glm_share` is 0 or unset, `glm.model` is empty
+or the code route is off. Only a new standard-tier code task the Sonnet route could take, with no resource of
+any kind, no protected class (urgent, device, optimization or performance, conclusion), no `conclusion:` line,
+no user order and no `code_arm: claude` line takes the coin; anything else, or anything in doubt, stays on
+Claude. The coin is a hash of the seed and task id, recorded once per task (`ttp task show` prints `code route
+arm: ...`, the run note's route entry carries `code_arm`), and a follow-up (continue or review fix) keeps its
+lineage's arm. Reviews, plans, questions, verdicts, conclusions and coordinators never take it. A run on the
+arm that needs deep thinking or a person hands off `{"status": "blocked", "needs_opus": "<reason>"}` and pushes
+nothing: the daemon requeues the task on Opus with no attempt spent and no fault counted against the
+provider, and logs the reason. `claude-code` (Claude Code on the chat bridge) is the only live harness; any
+other keeps tasks on Claude. The daily review shows one line per arm (glm, sonnet, claude): first-try review
+fails, fix rounds and median time to land, bounces, reverts within 3 days, server waits and refusals, tokens
+in (uncached and cached apart) and out, and $. A model-free guard runs daily over the last 7 days: when the
+arm's landed-within-one-fix-round rate is more than `glm_guard_pts` points below Sonnet's (each with
+`glm_guard_min` decided tasks) or it has more reverts, its share is held at 0 until `route.code_sonnet`
+changes, the reason is recorded and one normal event goes out. Concurrent runs on the arm start at
+`glm_cap.start`; each hour with no refusals and low server waits raises the cap by one, an hour with
+refusals lowers it by one. `pricing.<provider>` rows `[$/M input, cached input, output]` price its tokens,
+cached ones at the cache-read rate.
+
 A device A/B compares two Claude models on device tasks; it is off by default. `route.device_ab` (a project
 and account key, the project's value over the account's) takes `{"projects": [...], "arms": {"sonnet":
 {"model": "sonnet", "effort": "high"}, "opus": {"model": "opus", "effort": "high"}}, "share": 0.5, "days": 3,

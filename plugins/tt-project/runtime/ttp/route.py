@@ -116,6 +116,7 @@ MODELS_FILE = "endpoint-models.json"   # under the project state dir: {provider:
 MODELS_EVERY_S = 60         # the daemon's model-free /models check runs this often per provider (models_every)
 RETRY_QUIET_S = 86400       # a re-hold of the same model this soon after its quiet retry sends no new notice
 FAULTS = ("down", "error", "rate_limit", "auth", "malformed", "model_missing")
+BOUNCE = "needs_opus"   # a code arm run handed the task back to Opus (codearm.BOUNCE)
 RUN_CAUSES = ("timeout", "failed", "no_handoff")   # a routed run's own end without a hand-off (own_cause)
 OWN_CAUSE_WORDS = ("timed out", "stalled", "exited without", "result.json", "exit ")   # fallback_line shows these
 # busy: the routed-to provider's gate or a pause held new work, no fault; busy_wait_expired: its slots
@@ -588,7 +589,7 @@ def fell_back_before(db, task_id: int) -> int | None:
     for r in db.q("SELECT id, provider, note FROM runs WHERE task=? AND role='worker' AND note LIKE ? "
                   "ORDER BY id DESC", (task_id, f'%"{KEY}"%')):
         e = of(r["note"]) or {}
-        if e.get("fallback") in RUN_CAUSES and r["provider"] == e.get("to"):
+        if e.get("fallback") in (*RUN_CAUSES, BOUNCE) and r["provider"] == e.get("to"):
             return int(r["id"])
     return None
 
@@ -705,6 +706,10 @@ def fallback_line(run_id, e: dict) -> str:
     cause = str(e.get("cause") or "")   # the daemon's own words only (_route_cause), never the run's error text
     detail = detail or (cause[:120] if why in RUN_CAUSES and cause.startswith(OWN_CAUSE_WORDS) else "")
     model = f" ({e['model']})" if e.get("model") else ""
+    if why == BOUNCE:   # the run asked for Opus (codearm.py): its own words, cut, never its error text
+        return (f"routed run {run_id} on {e.get('to') or TO}{model} bounced: needs Opus: "
+                f"{str(e.get('bounce') or 'no reason given')[:200]}; requeued on the core provider at Opus, "
+                f"no attempt spent")
     return (f"routed run {run_id} on {e.get('to') or TO}{model} fell back: {why}"
             + (f" ({detail})" if detail else "")
             + f"; requeued at {e.get('tier') or 'its tier'} on the core provider, no attempt spent")

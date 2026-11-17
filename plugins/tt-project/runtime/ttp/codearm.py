@@ -1,0 +1,480 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""The code route's second arm: new code tasks on a chat model (GLM-style) or Sonnet by a seeded coin, off by default.
+
+Setting, under the code route it builds on (`route.code_sonnet`; off when that route is off):
+  {"glm_share": 0.5,                                   # 0..1 of eligible new code tasks; 0 or unset: off
+   "glm": {"provider": "chat", "model": "<chat model>", "effort": "max", "harness": "claude-code"},
+   "glm_seed": "",                                     # the coin's seed: a new seed re-deals new tasks only
+   "glm_cap": {"start": 4, "min": 1, "max": 8},        # concurrent runs on the arm, moved by refusals
+   "glm_guard_pts": 10, "glm_guard_min": 15}           # the switch-back guard
+The arm has the shape of a `route.device_ab_shadow` arm. A real worker run is Claude Code on the chat bridge
+(providers/chat.py), so `claude-code` is the only harness a live arm can take; any other keeps tasks on Claude.
+
+Who takes the coin (choose): a new standard-tier code task that the Sonnet route could take (runclass.code_route:
+no pin, no outside input, no deep ask, not a retry), with no resource of any kind (device, machine, lock, read),
+no protected class (route.protected: urgent, device, optimization or performance, conclusion), no `conclusion:`
+line, not user-ordered and no `code_arm: claude` line (the coordinator's force). Anything else, or anything in
+doubt, is the `claude` arm: the code route as before. The coin is sha256 of the seed and task id, recorded once per
+task (kv `code_arm:<id>`) with its seed and why, so every run of the task reads the same arm. A follow-up (a
+continue or a review fix) takes its lineage's arm (chaincap.chain), never a new coin.
+
+Each run of a `glm` task starts on the arm's provider and model (the route entry's `code_arm`) unless a check
+holds it now: a `needs Opus` bounce or a fallback before (its later runs start on Claude), the switch-back
+guard, a protected class or pin added since. Opus keeps every judgment run: reviews, plans, questions,
+conclusions and coordinators never take this route (route.eligible keeps reviews off it; kinds other than
+code never reach it). A `sonnet` task runs the Sonnet code route without its canary share.
+
+Bounce: a run on the arm that cannot do the task (deep thinking, design, a root cause, people) hands off
+`{"status": "needs_opus", "needs_opus": "<reason>"}`, pushes nothing and publishes no branch. The daemon requeues
+it on Claude at Opus (no attempt spent, no fallback counted against the provider) and logs the reason.
+
+Daily: a per-arm table (day_table) for the daily review and a model-free switch-back guard (guard_run): when GLM
+lands within one fix round more than `glm_guard_pts` points less often than Sonnet (each with `glm_guard_min`
+decided tasks), or has more reverts within 3 days, the arm's share is held at 0 until the setting changes, the
+reason is recorded and one normal event goes out. The cap (cap_tick) starts at `glm_cap.start` concurrent runs;
+an hour with no refusals and low server waits raises it by one, an hour with refusals lowers it by one.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import time
+
+KEY = "code_arm"                    # a route entry's and a run note's field: the arm the run took
+ARM_KV = "code_arm:"                # kv code_arm:<task id>: {"arm", "why", "seed", "ts"}
+OFF_KV = "code_arm_off"             # the guard's trip: {"ts", "setting", "why", "row"}
+DAYS_KV = "code_arm_days"           # the guard's daily rows, newest last
+CAP_KV = "code_arm_cap"             # {"cap", "ts", "why"}
+ARMS = ("glm", "sonnet", "claude")
+BOUNCE = "needs_opus"               # the route entry's fallback for a bounce (route.BOUNCE)
+HARNESSES = ("claude-code",)        # the harnesses a live worker run can take
+FORCE = re.compile(r"(?mi)^\s*code_arm:\s*(claude|opus|sonnet)\b")
+CONCLUSION = re.compile(r"(?mi)^\s*conclusion:")
+REVERT_TITLE = re.compile(r"^Revert #(\d+)\b")
+REVERT_S = 3 * 86400.0
+WINDOW_S = 7 * 86400.0              # the table's and the guard's window
+GUARD_PTS = 10.0
+GUARD_MIN = 15
+GUARD_EVERY_S = 23 * 3600.0
+GUARD_KEEP = 90
+CAP = {"start": 4, "min": 1, "max": 8}
+CAP_EVERY_S = 3600.0
+WAIT_LOW_S = 10.0                   # mean server wait per call (chatbridge per_call wait_s) that still counts as low
+
+
+def _num(v, lo: float, hi: float, default: float) -> float:
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and lo <= v <= hi else default
+
+
+def _labels(task: dict) -> list[str]:
+    try:
+        got = json.loads(task.get("labels") or "[]")
+    except (TypeError, ValueError):
+        return []
+    return [str(x) for x in got] if isinstance(got, list) else []
+
+
+def settings(cfg: dict) -> dict | None:
+    """The arm's settings, or None when it is off: the code route off (runclass.code_settings), `glm_share` unset
+    or 0, or no `glm.model`."""
+    from . import runclass
+    if not runclass.code_settings(cfg):
+        return None
+    got = (cfg.get("route") or {}).get("code_sonnet")
+    got = got if isinstance(got, dict) else {}
+    share = _num(got.get("glm_share"), 0, 1, 0.0)
+    arm = got.get("glm") if isinstance(got.get("glm"), dict) else {}
+    model = str(arm.get("model") or "").strip()
+    if share <= 0 or not model:
+        return None
+    c = got.get("glm_cap") if isinstance(got.get("glm_cap"), dict) else {}
+    lo = int(_num(c.get("min"), 1, 64, CAP["min"]))
+    hi = max(lo, int(_num(c.get("max"), 1, 64, CAP["max"])))
+    return {"share": share, "provider": str(arm.get("provider") or "chat"), "model": model,
+            "effort": str(arm.get("effort") or "max"), "harness": str(arm.get("harness") or "claude-code"),
+            "seed": str(got.get("glm_seed") or ""),
+            "cap": {"start": min(hi, max(lo, int(_num(c.get("start"), 1, 64, CAP["start"])))), "min": lo, "max": hi},
+            "pts": _num(got.get("glm_guard_pts"), 0, 100, GUARD_PTS),
+            "min_tasks": int(_num(got.get("glm_guard_min"), 1, 10000, GUARD_MIN))}
+
+
+def setting_mark(cfg: dict) -> str:
+    return json.dumps((cfg.get("route") or {}).get("code_sonnet"), sort_keys=True, default=str)
+
+
+def held(db, cfg: dict) -> bool:
+    """A switch-back trip holds the share at 0 while `route.code_sonnet` is unchanged since."""
+    got = db.kv(OFF_KV)
+    return isinstance(got, dict) and bool(got.get("ts")) and got.get("setting") == setting_mark(cfg)
+
+
+def coin(task_id, share: float, seed: str = "") -> bool:
+    """The seeded coin: the same task and seed get the same side every time."""
+    h = hashlib.sha256(f"code-arm:{seed}:{task_id}".encode()).hexdigest()
+    return int(h[:8], 16) % 1000 < share * 1000
+
+
+def recorded(db, task_id) -> dict | None:
+    got = db.kv(f"{ARM_KV}{task_id}")
+    return got if isinstance(got, dict) and got.get("arm") in ARMS else None
+
+
+def show_line(arm: dict) -> str:
+    """`ttp task show`'s line: 'code route arm: glm (coin at share 0.5)'."""
+    return f"code route arm: {arm.get('arm')}" + (f" ({arm['why']})" if arm.get("why") else "")
+
+
+def bounced(db, task_id) -> str:
+    """The reason of the task's last `needs Opus` bounce, '' when it had none."""
+    from .route import KEY as ROUTE, of
+    for r in db.q("SELECT note FROM runs WHERE task=? AND role='worker' AND note LIKE ? ORDER BY id DESC",
+                  (task_id, f'%"{BOUNCE}"%')):
+        e = of(r["note"]) or {}
+        if e.get("fallback") == BOUNCE:
+            return str(e.get("bounce") or "needs Opus")
+    return ""
+
+
+def stays(db, cfg: dict, task: dict, tier: str, picked: dict | None = None) -> str:
+    """Why `task` stays on Claude now ('' when the arm may take it): the Sonnet route's own stays
+    (runclass.code_route), a resource, a protected class, a `conclusion:` line, the force line, a user order,
+    an unsupported harness."""
+    from . import route, runclass, urgent
+    if (task.get("kind") or "") != "code":
+        return "not_code"
+    if str(tier or task.get("tier") or "standard") != "standard":
+        return "tier"
+    if any(lb.startswith(("resource:", "exclusive:", "read:")) for lb in _labels(task)):
+        return "resources"
+    _, why = runclass.code_route(cfg, task, picked, {k: "full" for k in runclass.CODE_KINDS})
+    if why:
+        return why
+    if FORCE.search(str(task.get("spec") or "")):
+        return "forced_claude"
+    if CONCLUSION.search(str(task.get("spec") or "")):
+        return "conclusion"
+    if task.get("origin") == "user" or urgent.user_ordered(task):
+        return "user_ordered"
+    try:
+        if why := route.protected(db, cfg, task, tier):
+            return why
+    except Exception:   # in doubt, Claude
+        return "unchecked"
+    s = settings(cfg) or {}
+    if s.get("harness") not in HARNESSES:
+        return "harness_unsupported"
+    return ""
+
+
+def choose(db, cfg: dict, task: dict | None, tier: str, picked: dict | None = None, peek: bool = False) -> dict | None:
+    """This run's arm: {"arm" (recorded, stable), "run" ("glm", "sonnet", "opus" or "claude": what this run
+    takes), "why"}, or None when the arm is off or the task is not code. The first call for a task records its
+    arm (unless `peek`); a follow-up takes its lineage's recorded arm."""
+    s = settings(cfg)
+    if not s or not task or task.get("kind") != "code" or not task.get("id"):
+        return None
+    tid = int(task["id"])
+    got = recorded(db, tid)
+    if not got:
+        from . import chaincap
+        ch = chaincap.chain(db, tid) or [task]
+        parent = next((a for t in reversed(ch[:-1]) if (a := recorded(db, t["id"]))), None)
+        if len(ch) > 1:
+            got = {"arm": parent["arm"] if parent else "claude", "why": f"lineage of #{ch[0]['id']}"
+                   + ("" if parent else " (no arm)"), "seed": s["seed"], "ts": time.time()}
+        else:
+            why = stays(db, cfg, task, tier, picked)
+            arm = "claude" if why else "glm" if coin(tid, s["share"], s["seed"]) else "sonnet"
+            got = {"arm": arm, "why": why or f"coin at share {s['share']:g}", "seed": s["seed"], "ts": time.time()}
+        if not peek:
+            db.set_kv(f"{ARM_KV}{tid}", got)
+    arm, run, why = got["arm"], got["arm"], ""
+    if arm in ("glm", "sonnet"):
+        if b := bounced(db, tid):
+            run, why = "opus", f"needs Opus: {b}"[:200]
+        elif arm == "glm" and held(db, cfg):
+            run, why = "claude", "switched back"
+        elif arm == "glm" and (w := stays(db, cfg, task, tier, picked)):
+            run, why = "claude", w   # a pin, protected class, late review round or force line added since
+    return {"arm": arm, "run": run, "why": why or str(got.get("why") or "")}
+
+
+def code_state(state: dict, arm: dict | None) -> dict:
+    """The Sonnet route's state for a run of `arm` (choose): a sonnet arm skips the canary share (the coin
+    decided it) but keeps a quality hold; a bounce keeps it on Opus (runclass "needs_opus")."""
+    if not arm:
+        return state
+    from .runclass import CODE_KINDS
+    if arm["run"] == "opus":
+        return {**state, "arm": "opus"}
+    if arm["run"] == "sonnet":
+        return {**{k: "full" for k in CODE_KINDS}, **{k: v for k, v in state.items() if v == "off"}}
+    return state
+
+
+def contract(reason_hint: str = "") -> str:
+    """The prompt block a run on the arm gets: when and how to bounce."""
+    return ("\n\n## Needs Opus (your exit)\n"
+            "You run on the cheaper model arm. Hand the task back to Opus, at once and before you change anything, "
+            "when it needs deep thinking (a design choice, a root cause you cannot find from the code and logs, a "
+            "trade-off with no clear answer in the spec) or involves human interaction (a reply, a post, a review "
+            "comment, a person's decision). To hand it back, write result.json with "
+            '`{"status": "blocked", "needs_opus": "<one-line reason>", "summary": "needs Opus: <reason>"}` '
+            "and stop (the `needs_opus` field makes it a hand-back, not a block). On that exit never run `ttp push`, `git push` or publish a branch; commits you made stay local. "
+            "It spends no attempt and does not count as a failure." + (f"\n{reason_hint}" if reason_hint else ""))
+
+
+def bounce_reason(res: dict | None) -> str:
+    """The reason a hand-off asks for Opus, '' when it does not."""
+    if not isinstance(res, dict) or str(res.get("status") or "") not in ("blocked", BOUNCE):
+        return ""
+    r = str(res.get("needs_opus") or "").strip() or (
+        str(res.get("summary") or "").strip() if str(res.get("status")) == BOUNCE
+        or str(res.get("summary") or "").lower().startswith("needs opus:") else "")
+    if not r:
+        return ""
+    return (r[len("needs Opus:"):].strip() if r.lower().startswith("needs opus:") else r)[:300] or "no reason given"
+
+
+def run_summary(stats: dict | None) -> dict | None:
+    """What a run note keeps of the chat bridge's stats for the per-arm table: tokens (uncached in, cached in,
+    out), calls, refusals (429/503 given up, rate-limit faults), busy waits and server wait seconds."""
+    if not isinstance(stats, dict):
+        return None
+    u = stats.get("usage") if isinstance(stats.get("usage"), dict) else {}
+    busy = stats.get("busy") if isinstance(stats.get("busy"), dict) else {}
+    faults = stats.get("faults") if isinstance(stats.get("faults"), dict) else {}
+    srv = stats.get("server") if isinstance(stats.get("server"), dict) else {}
+    calls = srv.get("per_call") if isinstance(srv.get("per_call"), list) else []
+
+    def n(d, k):
+        v = d.get(k)
+        return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
+    return {"calls": n(u, "calls"), "in": n(u, "input_tokens"), "cached": n(u, "cache_read_input_tokens"),
+            "out": n(u, "output_tokens"), "waits": n(busy, "waits"), "refusals": n(busy, "gave_up") + n(faults, "rate_limit"),
+            "wait_s": round(sum(float(c.get("wait_s") or 0) for c in calls if isinstance(c, dict))
+                            + float(busy.get("waited_s") or 0), 1)}
+
+
+def cost(cfg: dict, provider: str, model: str, toks: dict) -> float | None:
+    """$ for tokens {"in" (uncached), "cached", "out"} at `pricing.<provider>` ([$/M input, cached input, output]
+    for the model, else its "default" row): cached tokens at the cache-read rate. None when no rate is set."""
+    rows = (cfg.get("pricing") or {}).get(provider) or {}
+    row = rows.get(model) if isinstance(rows, dict) else None
+    if not (isinstance(row, (list, tuple)) and len(row) == 3):
+        row = rows.get("default") if isinstance(rows, dict) else None
+    if not (isinstance(row, (list, tuple)) and len(row) == 3):
+        return None
+    i, c, o = (float(x) for x in row)
+    return round((int(toks.get("in") or 0) * i + int(toks.get("cached") or 0) * c + int(toks.get("out") or 0) * o) / 1e6, 6)
+
+
+def _note(raw) -> dict:
+    try:
+        got = json.loads(raw or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return got if isinstance(got, dict) else {}
+
+
+def day_table(db, cfg: dict, since: float, until: float) -> dict:
+    """Per arm, over new code tasks given an arm in [since, until): tasks, first-try review fails, rounds to land,
+    time to land, bounces, reverts within 3 days, server waits and refusals, tokens (uncached in, cached in, out),
+    $ and the switch-back rate (decided tasks that landed within one fix round)."""
+    from . import chaincap, landed
+    out = {a: {"tasks": 0, "reviewed": 0, "review_fails": 0, "landed": 0, "rounds": 0, "land_s": [], "bounces": 0,
+               "reverts": 0, "decided": 0, "one_round": 0, "waits": 0, "refusals": 0, "wait_s": 0.0, "in": 0,
+               "cached": 0, "out": 0, "usd": 0.0} for a in ARMS}
+    reverts: dict[int, float] = {}
+    for r in db.q("SELECT title, created FROM tasks WHERE title LIKE 'Revert #%' AND created>=?", (since,)):
+        if m := REVERT_TITLE.match(str(r["title"] or "")):
+            reverts.setdefault(int(m.group(1)), float(r["created"] or 0))
+    roots: dict[int, str] = {}
+    for r in db.q("SELECT key, value FROM kv WHERE key LIKE ? AND ts>=? AND ts<?", (f"{ARM_KV}%", since, until)):
+        tail = str(r["key"])[len(ARM_KV):]
+        try:
+            rec = json.loads(r["value"]) if isinstance(r["value"], str) else r["value"]
+        except ValueError:
+            continue
+        if tail.isdigit() and isinstance(rec, dict) and rec.get("arm") in ARMS:
+            roots[int(tail)] = rec["arm"]
+    lines: dict[int, list[dict]] = {}
+    for k in db.q("SELECT id FROM tasks WHERE kind='code' AND created>=?", (since,)):
+        c = chaincap.chain(db, int(k["id"]))
+        if c and c[0]["id"] in roots and len(c) > len(lines.get(c[0]["id"]) or []):
+            lines[c[0]["id"]] = c
+    for rid, arm in roots.items():
+        ch = lines.get(rid)
+        if not ch or ch[0]["id"] != rid or chaincap.prev_of(dict(ch[0])) is not None:
+            continue   # a follow-up is counted in its root's lineage
+        a = out[arm]
+        a["tasks"] += 1
+        root, ids = ch[0], [c["id"] for c in ch]
+        fr = db.one("SELECT status FROM tasks WHERE kind='review' AND status IN ('done','failed') AND labels LIKE ? "
+                    "ORDER BY id LIMIT 1", (f'%"auto_review:{rid}"%',))
+        if fr:
+            a["reviewed"] += 1
+            a["review_fails"] += fr["status"] == "failed"
+        fixes = sum(1 for c in ch[1:] if chaincap.is_review_fix(c))
+        got = any(landed.recorded(db, i)[0] for i in ids)
+        settled = all(str(c.get("status") or "") in ("done", "failed", "cancelled") for c in ch)
+        land_t = None
+        if got:
+            a["landed"] += 1
+            a["rounds"] += fixes
+            q = db.one(f"SELECT MIN(updated) AS t FROM push_queue WHERE task IN ({','.join('?' * len(ids))}) "
+                       "AND status IN ('pushed','landed')", tuple(ids))
+            if q and q["t"]:
+                land_t = float(q["t"])
+                a["land_s"].append(land_t - float(root.get("created") or land_t))
+        if got or settled:
+            a["decided"] += 1
+            a["one_round"] += bool(got) and fixes <= 1
+        base = land_t or float(root.get("created") or 0)
+        a["reverts"] += sum(1 for i in ids if i in reverts and reverts[i] - base <= REVERT_S)
+        for run in db.q(f"SELECT cost_usd, note FROM runs WHERE role='worker' AND task IN "
+                        f"({','.join('?' * len(ids))})", tuple(ids)):
+            n = _note(run["note"])
+            rt = n.get("route") if isinstance(n.get("route"), dict) else {}
+            a["bounces"] += rt.get("fallback") == BOUNCE
+            g = n.get(KEY) if isinstance(n.get(KEY), dict) else {}
+            s = g.get("bridge") if isinstance(g.get("bridge"), dict) else {}
+            for k in ("waits", "refusals", "in", "cached", "out"):
+                a[k] += int(s.get(k) or 0)
+            a["wait_s"] = round(a["wait_s"] + float(s.get("wait_s") or 0), 1)
+            a["usd"] = round(a["usd"] + float(run["cost_usd"] or 0), 4)
+    for a in out.values():
+        ls = sorted(a.pop("land_s"))
+        a["land_h_median"] = round(ls[len(ls) // 2] / 3600, 2) if ls else None
+        a["rounds_per_landed"] = round(a["rounds"] / a["landed"], 2) if a["landed"] else None
+        a["fail_rate"] = round(a["review_fails"] / a["reviewed"], 4) if a["reviewed"] else None
+        a["one_round_rate"] = round(a["one_round"] / a["decided"], 4) if a["decided"] else None
+    return {"since": since, "until": until, "arms": out}
+
+
+def guard_check(db, cfg: dict, now: float | None = None) -> dict:
+    """The switch-back row: trips when GLM's landed-within-one-fix-round rate is more than `pts` points below
+    Sonnet's (each with `min_tasks` decided tasks), or GLM has more reverts within 3 days."""
+    now = time.time() if now is None else now
+    s = settings(cfg) or {"pts": GUARD_PTS, "min_tasks": GUARD_MIN}
+    tab = day_table(db, cfg, now - WINDOW_S, now)
+    g, so = tab["arms"]["glm"], tab["arms"]["sonnet"]
+    enough = min(g["decided"], so["decided"]) >= s["min_tasks"]
+    gap = round((so["one_round_rate"] - g["one_round_rate"]) * 100, 1) if enough else None
+    why = ""
+    if enough and gap > s["pts"]:
+        why = (f"GLM landed within one fix round {g['one_round_rate']:.0%} of {g['decided']} tasks against Sonnet's "
+               f"{so['one_round_rate']:.0%} of {so['decided']}: {gap:g} points below (limit {s['pts']:g})")
+    elif g["reverts"] > so["reverts"]:
+        why = f"GLM had {g['reverts']} reverts within 3 days against Sonnet's {so['reverts']}"
+    return {"ts": now, "table": tab, "enough": enough, "gap_pts": gap, "pts": s["pts"], "min_tasks": s["min_tasks"],
+            "tripped": bool(why), "why": why}
+
+
+def guard_run(db, cfg: dict, now: float | None = None) -> dict | None:
+    """Daily: None when the arm is off or the guard ran under GUARD_EVERY_S ago; else the row, kept in DAYS_KV. A
+    new trip records OFF_KV with the current setting and comes back with "new_trip": the caller raises the event."""
+    now = time.time() if now is None else now
+    if not settings(cfg):
+        return None
+    rows = db.kv(DAYS_KV)
+    rows = [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+    if rows and now - float(rows[-1].get("ts") or 0) < GUARD_EVERY_S:
+        return None
+    row = guard_check(db, cfg, now)
+    row["held"] = held(db, cfg)
+    db.set_kv(DAYS_KV, (rows + [row])[-GUARD_KEEP:])
+    if row["tripped"] and not row["held"]:
+        db.set_kv(OFF_KV, {"ts": now, "setting": setting_mark(cfg), "why": row["why"]})
+        return {**row, "new_trip": True}
+    return row
+
+
+def guard_text(row: dict) -> str:
+    return (f"Code route GLM arm switched back: {row.get('why')}. Its share is held at 0 (new code tasks take Sonnet "
+            "or Opus as before) until route.code_sonnet changes.")
+
+
+def table_lines(tab: dict, held_why: str = "") -> list[str]:
+    """The per-arm table for the daily review, one line per arm with tasks."""
+    out = []
+    for name, a in (tab.get("arms") or {}).items():
+        if not a.get("tasks"):
+            continue
+        fr = f"{a['review_fails']}/{a['reviewed']}" if a["reviewed"] else "0/0"
+        land = f"{a['land_h_median']:g} h" if a.get("land_h_median") is not None else "n/a"
+        rounds = f"{a['rounds_per_landed']:g}" if a.get("rounds_per_landed") is not None else "n/a"
+        out.append(f"- {name}: {a['tasks']} tasks, first-try review fails {fr}, landed {a['landed']} "
+                   f"({rounds} fix rounds, median {land} to land), bounces {a['bounces']}, reverts {a['reverts']}, "
+                   f"server waits {a['waits']} ({a['wait_s']:g} s), refusals {a['refusals']}, tokens in "
+                   f"{a['in']:,} uncached + {a['cached']:,} cached, out {a['out']:,}, ${a['usd']:.2f}")
+    if held_why:
+        out.append(f"- switched back: {held_why}")
+    return out
+
+
+def review_lines(db, cfg: dict, now: float | None = None) -> list[str]:
+    """The daily review's per-arm block over the last day; [] while the arm is off and never tripped."""
+    now = time.time() if now is None else now
+    if not settings(cfg) and not held(db, cfg):
+        return []
+    off = db.kv(OFF_KV) if held(db, cfg) else None
+    return table_lines(day_table(db, cfg, now - 86400, now), str((off or {}).get("why") or ""))
+
+
+def running(db) -> int:
+    """Runs on the arm now (worker runs not ended whose route entry carries KEY)."""
+    from .route import of
+    return sum(1 for r in db.q("SELECT note FROM runs WHERE role='worker' AND ended IS NULL AND note LIKE ?",
+                               (f'%"{KEY}"%',)) if (of(r["note"]) or {}).get(KEY) == "glm")
+
+
+def cap(db, cfg: dict) -> int:
+    s = settings(cfg)
+    if not s:
+        return 0
+    got = db.kv(CAP_KV)
+    c = int(got.get("cap") or 0) if isinstance(got, dict) else 0
+    return min(s["cap"]["max"], max(s["cap"]["min"], c)) if c else s["cap"]["start"]
+
+
+def full(db, cfg: dict) -> bool:
+    """Whether the arm's concurrency cap is taken."""
+    return running(db) >= cap(db, cfg)
+
+
+def cap_tick(db, cfg: dict, now: float | None = None) -> dict | None:
+    """Hourly: the cap moves by the last hour's arm runs: refusals lower it by one; none, with low server waits
+    (mean under WAIT_LOW_S per call), raise it by one. None when the arm is off, no run ended or it is too soon."""
+    now = time.time() if now is None else now
+    s = settings(cfg)
+    if not s:
+        return None
+    got = db.kv(CAP_KV)
+    got = got if isinstance(got, dict) else {}
+    if now - float(got.get("ts") or 0) < CAP_EVERY_S:
+        return None
+    runs = calls = refusals = 0
+    wait_s = 0.0
+    for r in db.q("SELECT note FROM runs WHERE role='worker' AND ended>=? AND note LIKE ?",
+                  (now - CAP_EVERY_S, f'%"{KEY}"%')):
+        g = _note(r["note"]).get(KEY)
+        b = g.get("bridge") if isinstance(g, dict) and isinstance(g.get("bridge"), dict) else None
+        if not b:
+            continue
+        runs += 1
+        calls += int(b.get("calls") or 0)
+        refusals += int(b.get("refusals") or 0)
+        wait_s += float(b.get("wait_s") or 0)
+    old = cap(db, cfg)
+    new, why = old, "no change"
+    if refusals:
+        new, why = max(s["cap"]["min"], old - 1), f"{refusals} refusals in the last hour"
+    elif runs and wait_s / max(calls, 1) < WAIT_LOW_S:
+        new, why = min(s["cap"]["max"], old + 1), f"{runs} runs, no refusals, mean server wait {wait_s / max(calls, 1):.1f} s"
+    elif not runs:
+        why = "no runs ended"
+    db.set_kv(CAP_KV, {"cap": new, "ts": now, "why": why})
+    return {"cap": new, "was": old, "why": why}

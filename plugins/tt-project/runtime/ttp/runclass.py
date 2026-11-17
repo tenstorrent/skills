@@ -138,11 +138,13 @@ CODE_STATE_KV = "code_sonnet_state"
 CODE_ROUTE_KEY = "code_route"    # a code run's note: {"to", "why"} (code_decision)
 # Why a code run stays on Opus (code_route): the stats and the share alarm count these.
 CODE_STAY = ("tier", "device_run", "route_off", "kind_off", "user_pin", "review_round", "pr_fix", "untrusted_input",
-             "deep", "retry", "quality_hold", "canary_share", "provider", "core_provider", "device_ab")
+             "deep", "retry", "quality_hold", "canary_share", "provider", "core_provider", "device_ab",
+             "needs_opus")
 # Stays the route keeps by design (the user's pin, untrusted text, device runs, late review rounds, PR fixes, the
 # device A/B, a run on another provider): the share alarm leaves them out of its base, so it counts only runs the
 # route should have taken. A class-routed run (code_decision's "run_class:<cls>", e.g. a light chat run) is kept too.
-CODE_KEEP = ("user_pin", "untrusted_input", "device_run", "device_ab", "review_round", "pr_fix", "provider")
+CODE_KEEP = ("user_pin", "untrusted_input", "device_run", "device_ab", "review_round", "pr_fix", "provider",
+             "needs_opus")
 
 
 def code_kept(why: str) -> bool:
@@ -417,6 +419,8 @@ def code_route(cfg: dict, task: dict | None, picked: dict | None = None,
         return None, "kind_off"
     if any(str(task.get(k) or "") for k in ("provider", "model", "effort")):
         return None, "user_pin"
+    if (state or {}).get("arm") == "opus":   # a code arm run asked for Opus (codearm.py): the rest stay there
+        return None, "needs_opus"
     if kind == "review_fix":   # its review_fix label keeps it off other routes, not this one
         if review_round(task) >= REVIEW_ROUND_MAX:
             return None, "review_round"   # a late round stays on Opus
