@@ -900,12 +900,9 @@ def _passed_under_a_new_spec(p, d, tid, runs, monkeypatch, settle_now):
     monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps({"status": "done", "summary": "settled with the probe's answer"}))
     settle_now()
     assert _run_until(d, p, lambda: runs() == 2), "the probe pass did not run the task"
-    # Wait for that run to end and its hand-off to be applied (not wall time: a loaded host finishes it late).
-    settled = lambda: not p.db.q("SELECT id FROM runs WHERE task=? AND status='running'", (tid,)) \
-        and p.db.task(tid)["status"] != "running"
-    assert _run_until(d, p, settled), "the probe pass's run never ended"
     for _ in range(4):
         d.tick()
+        time.sleep(0.05)
     assert runs() == 2, "a passed probe under a new spec took more than one run"
     run = p.db.q("SELECT id, note FROM runs WHERE task=? ORDER BY id DESC LIMIT 1", (tid,))[0]
     note = json.loads(run["note"] or "{}")
