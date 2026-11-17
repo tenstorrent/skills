@@ -41,6 +41,7 @@ import hashlib
 import json
 import re
 import time
+from pathlib import Path
 
 KEY = "code_arm"                    # a route entry's and a run note's field: the arm the run took
 ARM_KV = "code_arm:"                # kv code_arm:<task id>: {"arm", "why", "seed", "ts"}
@@ -244,6 +245,26 @@ def bounce_reason(res: dict | None) -> str:
     if not r:
         return ""
     return (r[len("needs Opus:"):].strip() if r.lower().startswith("needs opus:") else r)[:300] or "no reason given"
+
+
+def handed_back(run_dir) -> str:
+    """The reason the run in `run_dir` handed its task back to Opus (its result.json carries `needs_opus`), ''
+    when it did not or the file is unreadable. Read where a hand-back must publish nothing (`ttp push`)."""
+    try:
+        data = json.loads((Path(run_dir) / "result.json").read_text())
+    except (OSError, ValueError, TypeError):
+        return ""
+    return bounce_reason(data if isinstance(data, dict) else None)
+
+
+def task_handed_back(p, task_id) -> str:
+    """The hand-back reason of the task's latest worker run, '' when that run did not hand back (a task
+    requeued on Claude after a bounce has a newer run that did the work). The push queue skips such a head."""
+    try:
+        row = p.db.q("SELECT id, dir FROM runs WHERE task=? AND role='worker' ORDER BY id DESC LIMIT 1", (int(task_id),))
+    except (TypeError, ValueError):
+        return ""
+    return handed_back(row[0]["dir"] or p.runs / str(row[0]["id"])) if row else ""
 
 
 def run_summary(stats: dict | None) -> dict | None:

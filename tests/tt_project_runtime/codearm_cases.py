@@ -192,3 +192,47 @@ def test_task_show_prints_the_code_arm(env, monkeypatch, capsys):
     assert "code route arm: sonnet (coin at share 0.5)" in capsys.readouterr().out
     cli.main(["task", "show", str(t["id"]), "--json"])
     assert json.loads(capsys.readouterr().out)[codearm.KEY]["arm"] == "sonnet"
+
+
+def _ca_run(p, task_id, result, role="worker"):
+    """A finished run of the task whose run dir holds `result` as its result.json; returns the run dir."""
+    rid = p.db.x("INSERT INTO runs(task,role,provider,started,ended,status) VALUES(?,?,?,?,?,?)",
+                 (task_id, role, "chat", time.time() - 60, time.time(), "done"))
+    d = p.runs / str(rid)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "result.json").write_text(json.dumps(result))
+    return d
+
+
+def test_handed_back_reads_the_runs_result_and_the_latest_worker_run_counts(env):
+    from ttp import codearm
+    p = make(env)
+    t = _ca_task(p)["id"]
+    d = _ca_run(p, t, {"status": "blocked", "needs_opus": "a design choice"})
+    assert codearm.handed_back(d) == "a design choice"
+    assert codearm.handed_back(d / "missing") == "" and codearm.handed_back(None) == ""
+    (d / "result.json").write_text("not json")
+    assert codearm.handed_back(d) == ""
+    (d / "result.json").write_text(json.dumps({"status": "blocked", "needs_opus": "a design choice"}))
+    assert codearm.task_handed_back(p, t) == "a design choice"
+    _ca_run(p, t, {"status": "done", "summary": "did the work on Opus"})   # requeued on Claude: it may push
+    assert codearm.task_handed_back(p, t) == ""
+    assert codearm.task_handed_back(p, 987654) == "" and codearm.task_handed_back(p, "x") == ""
+
+
+def test_ttp_push_from_a_run_that_handed_back_is_refused_before_it_touches_anything(env, monkeypatch, capsys):
+    from ttp import cli, push
+    p = make(env)
+    t = _ca_task(p)["id"]
+    d = _ca_run(p, t, {"status": "blocked", "needs_opus": "talks to a person"})
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.setenv("TTP_RUN_DIR", str(d))
+    monkeypatch.setattr(push, "run", lambda *a, **k: pytest.fail("a hand-back reached the push"))
+    monkeypatch.setattr(push, "detach", lambda *a, **k: pytest.fail("a hand-back reached the push"))
+    for argv in (["push"], ["push", "--detach"], ["push", "--own"]):
+        capsys.readouterr()
+        with pytest.raises(SystemExit) as e:
+            cli.main(argv)
+        assert e.value.code == push.REFUSED
+        err = capsys.readouterr().err
+        assert "handed its task back to Opus" in err and "talks to a person" in err

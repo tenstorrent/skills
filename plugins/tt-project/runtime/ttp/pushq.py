@@ -24,6 +24,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     checkdirs,
     batch,
     chatdigest,   # the chat's status pace: a routine hand-off waits for its next status post
+    codearm,
     conflictfix,
     coordinator as coord,
     cyclenotice,
@@ -928,6 +929,9 @@ def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None
     tgt = target(p) if enabled(p, cfg) else None
     notes = []
     for t in push._reviewed(p, str(task["id"])):
+        if why := codearm.task_handed_back(p, t["id"]):   # a code arm run that asked for Opus pushes nothing
+            return {"invalid": f"#{t['id']}'s latest run handed the task back to Opus (needs_opus: {why}): "
+                               f"its head is not approved for the push queue"}
         if onto := push.pr_elsewhere(p, t, d):
             if tgt and _absent(p, tgt[0], onto):
                 notes.append(f"#{t['id']}'s pr_branch label {onto} was ignored: {tgt[0]} has no such branch"

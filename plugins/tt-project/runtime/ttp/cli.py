@@ -3353,6 +3353,11 @@ def _cmd_push(a, push) -> None:
                                          if (c := Project(d)).exists()), None)
     if not p or not p.exists():
         die("ttp push: no tt-project project here (run it inside a run or a project's worktree)")
+    if os.environ.get("TTP_RUN_DIR") and not (a.queue or a.stop or a.stop_batch or a.cancel or a.free):
+        from . import codearm   # a run that handed its task back to Opus (codearm.contract) publishes nothing
+        if why := codearm.handed_back(os.environ["TTP_RUN_DIR"]):
+            die(f"ttp push: this run handed its task back to Opus (needs_opus: {why}): it pushes and publishes "
+                f"nothing; its commits stay local", push.REFUSED)
     if coord and (why := push.approved_landing(p, Path.cwd())[1]):   # only a head a review approved
         die(f"ttp push: {coordtools.PUSH_REFUSAL}: {why}")
     if a.queue:

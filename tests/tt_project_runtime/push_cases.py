@@ -22700,3 +22700,24 @@ def test_a_code_reply_with_no_review_ahead_posts_at_its_hand_off(env, monkeypatc
     t = _held_reply_code(env, monkeypatch, s, review=False)
     assert _c1_replies(s.p) == ["The relay fix is in."]
     assert replymsg.HELD not in json.loads(t["result"])
+
+
+def test_the_push_queue_does_not_approve_a_head_whose_latest_run_handed_the_task_back(env, monkeypatch):
+    """A code arm run that asked for Opus (`needs_opus`) published nothing: its reviewed head is not approved
+    for the queue; a newer worker run that did the work (the task requeued on Claude) is approved again."""
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    rid = s.p.db.x("INSERT INTO runs(task,role,provider,started,ended,status) VALUES(?,?,?,?,?,?)",
+                   (s.code, "worker", "chat", time.time() - 60, time.time(), "done"))
+    d = s.p.runs / str(rid)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "result.json").write_text(json.dumps({"status": "blocked", "needs_opus": "a design choice"}))
+    entry = [{"branch": s.branch, "head": s.head}]
+    check = pushq.check_approval(s.p, s.p.db.task(s.review), entry)
+    assert "handed the task back to Opus" in check.get("invalid", ""), check
+    rid = s.p.db.x("INSERT INTO runs(task,role,provider,started,ended,status) VALUES(?,?,?,?,?,?)",
+                   (s.code, "worker", "claude", time.time(), time.time(), "done"))
+    d = s.p.runs / str(rid)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "result.json").write_text(json.dumps({"status": "done", "summary": "done on Opus"}))
+    assert pushq.check_approval(s.p, s.p.db.task(s.review), entry).get("entries")
