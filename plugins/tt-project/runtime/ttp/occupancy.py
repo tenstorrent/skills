@@ -37,12 +37,11 @@ import fcntl
 import json
 import os
 import re
-import subprocess
 import time
 from pathlib import Path
 from typing import Any, Callable
 
-from . import project
+from . import boundedchild, project
 
 SOURCES = "occupancy-sources.json"
 READINGS = "occupancy-readings.json"
@@ -177,24 +176,15 @@ def _read_file(src: dict, now: float) -> tuple[str, str]:
 def _read_cmd(src: dict) -> tuple[str, str]:
     cwd = src.get("base") or None
     limit = src.get("timeout_s", TIMEOUT_S)
-    try:
-        # its own process group, so a timeout ends the probe and every child it started
-        proc = subprocess.Popen(src["cmd"], shell=True, cwd=cwd if cwd and os.path.isdir(cwd) else None,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                stdin=subprocess.DEVNULL, start_new_session=True)
-    except OSError as e:
-        return "unknown", f"could not run: {e}"
-    try:
-        out, err = proc.communicate(timeout=limit)
-    except subprocess.TimeoutExpired:
-        with contextlib.suppress(OSError):
-            os.killpg(proc.pid, 9)
-        with contextlib.suppress(Exception):
-            proc.communicate(timeout=5)
+    # boundedchild: its own process group, killed whole on a timeout, a signal or the return
+    res = boundedchild.run(src["cmd"], limit, shell=True, cwd=cwd if cwd and os.path.isdir(cwd) else None)
+    if res.timed_out:
         return "unknown", f"timed out after {limit:g} s"
-    tail = (out or err or "").strip().splitlines()[-1:] or [""]
-    state = {0: "live", 1: "free"}.get(proc.returncode, "unknown")
-    return state, f"exit {proc.returncode}" + (f": {tail[0][:120]}" if tail[0] else "")
+    if res.rc is None:
+        return "unknown", f"could not run: {res.error or 'no exit code'}"
+    tail = (res.out or res.err or "").strip().splitlines()[-1:] or [""]
+    state = {0: "live", 1: "free"}.get(res.rc, "unknown")
+    return state, f"exit {res.rc}" + (f": {tail[0][:120]}" if tail[0] else "")
 
 
 def read_source(src: dict, now: float | None = None) -> tuple[str, str]:

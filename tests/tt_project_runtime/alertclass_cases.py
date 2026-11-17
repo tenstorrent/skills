@@ -23,6 +23,7 @@ ALERT_SITES = {
         ("decisions", "an unanswered ask decided on its recommendation (non-blocking ask)")],
     ("daemon.py", "Daemon.update_gates"): [("funds", "a provider's budget gate turned red")],
     ("daemon.py", "Daemon._recover_upgrade"): [("outages", "a harness upgrade was cut short and rolled back or finished")],
+    ("daemon.py", "Daemon.watch_occupancy.post"): [("outages", "a job of this project ran on a box while a live realtime stream (or its quiet window) held it: posted at once, once per overlap, as the user ordered")],
     ("daemon.py", "Daemon.alert"): [("outages", "the keyed condition helper: a live condition, cleared when it ends")],
     ("daemon.py", "Daemon.remind_logouts"): [("outages", "a logout whose work runs on another provider: one low status line"),
                                               ("user-blocker", "a provider stays logged out and no other provider can run its work")],
