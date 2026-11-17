@@ -1869,6 +1869,9 @@ def pick(p, cfg: dict, tell, what: str = "", off: str = "", why_here: str = "") 
         why = allowed(p, cfg, alias)
         usable = not why   # past `allowed`, a skip is the host being busy unless it is out of reach
         why, dev = why or backed_off(host, now) or busy_why(host, now) or lock_busy(p, cfg, alias), ""
+        if not why:   # a live realtime stream on the box (occupancy.py): no check runs there, as on a busy host
+            from . import occupancy
+            why = occupancy.blocks_any([alias, machine or "", host or ""], "test", now)
         if not why and beside:
             dev = device_busy(p, cfg, host)
             _note_skip(host, "", p.name, own_only=True)   # this project's earlier skip no longer holds

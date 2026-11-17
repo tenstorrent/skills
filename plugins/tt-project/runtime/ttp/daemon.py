@@ -2412,7 +2412,7 @@ class Daemon:
                      self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends, self.check_move, self.track_outages,
                      self.check_integrity, self.heal_harness_git,
                      self.sync_schedules, self.lint_charter, self.lint_worker_prompt, self.tend_holds, self.record_ttr, self.alert_long_pause, self.reclassify_alerts,
-                     self.check_linger, self.check_notifier, self.check_overseer, self.alert_slurm_paused, self.check_gh_auth, self.check_reach, self.check_spill_health, self.check_chats,
+                     self.check_linger, self.check_notifier, self.check_overseer, self.alert_slurm_paused, self.check_gh_auth, self.check_reach, self.check_spill_health, self.watch_occupancy, self.check_chats,
                      self.probe_mcp):
             if step in lease_off:
                 continue
@@ -5229,6 +5229,43 @@ class Daemon:
             self._reach = threading.Thread(target=reach.probe, args=(due, self._probe_env()), daemon=True,
                                            name="machine-reach")
             self._reach.start()
+
+    def watch_occupancy(self) -> None:
+        """The occupancy watchdog (occupancy.watch), about once a minute: publish this project's sources, read
+        every source registered on this host, and flag each job of this project that ran on a box while a live
+        realtime stream (or its quiet window) held it. A flag posts to this project's chat at once at high
+        severity (never held by the digest or hourly limits) and is kept for status and the daily review. A
+        source of this project's own that cannot tell raises one event per episode: held boxes count it live."""
+        from . import occupancy
+        now = time.time()
+        if now - getattr(self, "_occupancy_at", 0.0) < occupancy.WAIT_S:
+            return
+        self._occupancy_at = now
+        occupancy.WHERE = self.p
+        db = self.p.db
+
+        def post(key: str, text: str) -> None:
+            db.post("out", text, chat=None, kind="alert", severity="high", ref=key)
+            db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                 (now, "daemon", "occupancy_violation", "high", text[:1000], "new", None))
+            log(self.p, text)
+
+        out = occupancy.watch(self.p, db, now, post)
+        told = dict(db.kv("occupancy_unknown_told", {}) or {})
+        bad = {stream: r for stream, r in out.get("unknown") or []}
+        for stream, r in bad.items():
+            if stream in told:
+                continue
+            text = (f"The occupancy source this project registered for {stream} cannot tell whether a live stream "
+                    f"holds it ({r.get('detail') or 'no answer'}). Every project counts the box as live, so no deploy, "
+                    f"restart, test or reset runs there until it answers. Fix the source in this project's settings "
+                    f"(`occupancy.sources.{stream}`).")
+            db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                 (now, "daemon", "occupancy_unknown", "normal", text, "new", None))
+            told[stream] = now
+        told = {k: v for k, v in told.items() if k in bad}
+        if told != (db.kv("occupancy_unknown_told", {}) or {}):
+            db.set_kv("occupancy_unknown_told", told)
 
     def check_spill_health(self) -> None:
         """The spill hosts' health check (spillhealth): probe the due ones in a thread, and act here on the
@@ -10347,6 +10384,10 @@ class Daemon:
                 spec += "\n\nUnblocking quality:\n" + "\n".join(f"- {line}" for line in unblock.lines(db, cfg=self.cfg))
                 spec += (f"\n\nStuck longer than {sweep.REVIEW_LONG_H:g}h, with the blocker sweep's outcome:\n"
                          + "\n".join(f"- {line}" for line in sweep.review_lines(db, where=self.p)))
+                from . import occupancy
+                occupancy.WHERE = self.p
+                if occ := occupancy.status_lines(db):
+                    spec += "\n\nOccupancy watchdog (last 24 h):\n" + "\n".join(f"- {line.strip()}" for line in occ)
                 moved = failover.review_lines(db, where=self.p)
                 if moved:
                     spec += ("\n\nProvider failovers (last 24 h; tasks moved off a provider that could not "

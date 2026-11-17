@@ -57,6 +57,11 @@ and build/run recipes on the box).
 - Reserve or allocate only for the run, release right after it, and re-reserve when needed. Never
   auto-extend a reservation, and hold nothing idle.
 - A project's charter can narrow these rules (which machines, how long); it never widens them.
+- Before a deploy, restart, test, benchmark, warm-up, health check or reset on a box, run
+  `ttp occupancy <alias> --step <step>` and stay off while it exits 75: a live realtime stream holds
+  the box, or its front box (router or proxy) for a deploy or restart, until about a minute after the
+  stream ends. Work shared with real users through the device broker is never held. The project that
+  runs the stream registers its source (see "Boxes real users share" in the tt-project skill).
 
 ## Work on the box
 

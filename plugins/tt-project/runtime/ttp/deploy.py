@@ -363,6 +363,9 @@ def _takeover(p, rec: dict, outcome: str, kind: str, reason: str, t: dict, now: 
     from . import cyclenotice
     if p is not None and (h := cyclenotice.project_held(p)):   # busy: no try spent
         return "pending", "", f"host-side takeover held: {cyclenotice.line(h, p)}; {reason}"
+    from . import occupancy, project as _project
+    if why := occupancy.blocks(_project.hostname(), "deploy"):   # a live realtime stream here: no try spent
+        return "pending", "", f"host-side takeover held: {why}; {reason}"
     try:
         child = launch_takeover(p, rec["name"], _owner_task(rec))
     except OSError as e:

@@ -1728,6 +1728,12 @@ def status_text(p: Project, verbose: bool = False) -> str:
     from . import fleethold
     for hold in sorted(fleethold.active().values(), key=lambda x: x.get("id") or 0):
         lines.append(fleethold.line(hold, p))
+    try:   # the occupancy watchdog's flags: jobs of this project that ran under a live realtime stream
+        from . import occupancy
+        occupancy.WHERE = p
+        lines.extend(occupancy.status_lines(p.db, now))
+    except Exception:
+        pass
     for pr in h["resources_paused"]:
         if pr.get("fleet"):
             continue   # one line per hold above
@@ -8570,6 +8576,68 @@ def cmd_host_run(a) -> None:
     sys.exit(hostrun.request(p, cmd, timeout=a.timeout, detach=a.detach))
 
 
+def cmd_occupancy(a) -> None:
+    """`ttp occupancy <alias>`: whether a live realtime stream holds the box (occupancy.py). Exit 0 when
+    the step may run, 75 while it must stay off (live, inside the quiet window, or a source that cannot
+    tell); `--wait` retries about every minute until it may run (or --timeout). `--list`: the sources
+    every project on this host registered."""
+    from . import occupancy
+    base = os.environ.get("TTP_PROJECT")
+    if base:
+        p = Project(base)
+        occupancy.WHERE = p
+        try:
+            occupancy.publish(p)   # this project's own sources count at once, before its daemon's next tick
+        except Exception as e:
+            print(f"ttp occupancy: could not publish this project's sources: {e}", file=sys.stderr)
+    if a.should_stop or a.stop_switch or a.clear_stop:
+        if not base:
+            die("ttp occupancy: the stop switch works inside a tt-project project (TTP_PROJECT)")
+        try:
+            if a.stop_switch:
+                print(f"stop switch set for {a.stop_switch}: {occupancy.request_stop(p, a.stop_switch, 'ttp occupancy --stop-switch')}")
+                return
+            if a.clear_stop:
+                print(f"stop switch of {a.clear_stop}: " + ("cleared" if occupancy.clear_stop(p, a.clear_stop) else "was not set"))
+                return
+            why = occupancy.should_stop(p, a.should_stop, a.target, a.step if a.step != "test" else "bench")
+        except ValueError as e:
+            die(f"ttp occupancy: {e}")
+        if why:
+            print(f"{a.should_stop}: stop before the next trial: {why}")
+        sys.exit(0 if why else 1)
+    if a.list or not a.target:
+        reg = occupancy.registry()
+        if a.json:
+            print(json.dumps(reg, indent=1, sort_keys=True))
+            return
+        if not reg:
+            print("No occupancy source registered on this host: nothing is held. A project registers one "
+                  "with `ttp config occupancy.sources.<alias> '{\"cmd\": \"<read-only command>\"}'`.")
+            return
+        for proj, r in sorted(reg.items()):
+            for alias, src in sorted((r.get("sources") or {}).items()):
+                fronts = f", fronts {', '.join(src['fronts'])}" if src.get("fronts") else ""
+                how = f"cmd {src['cmd']!r}" if src.get("cmd") else f"file {src['file']}"
+                print(f"{alias}: {proj}, {how}, timeout {src.get('timeout_s', occupancy.TIMEOUT_S):g} s, "
+                      f"quiet {r.get('quiet_s', occupancy.QUIET_S):g} s{fronts}")
+        return
+    deadline = None if not a.timeout else time.time() + a.timeout
+    while True:
+        res = occupancy.check(a.target, a.step, fresh=a.fresh)
+        if not res["blocks"] or not a.wait or (deadline is not None and time.time() >= deadline):
+            break
+        print(res["why"], file=sys.stderr, flush=True)
+        time.sleep(occupancy.WAIT_S if deadline is None else max(1.0, min(occupancy.WAIT_S, deadline - time.time())))
+    print(json.dumps(res, indent=1, sort_keys=True) if a.json else occupancy.text(res))
+    sys.exit(75 if res["blocks"] else 0)
+
+
+def _lock_step(a) -> str:
+    """The step a `ttp lock` command is, for the occupancy check: --step, else reset when --disruptive, else test."""
+    return getattr(a, "step", None) or ("reset" if getattr(a, "disruptive", False) else "test")
+
+
 def cmd_lock(a) -> None:
     """Hold one slot of a shared resource while a command runs: `ttp lock <resource> -- <cmd...>`.
 
@@ -8678,6 +8746,16 @@ def cmd_lock(a) -> None:
             if waiting:
                 _end_wait()
             die(f"refused: {held_by[1]}", 75)
+        if live := _occupied():
+            if waiting:
+                _end_wait()
+            die(f"refused: {live}; retry in about a minute (`ttp occupancy {todo[0]['name']}`)", 75)
+
+    def _occupied() -> str:
+        # A live realtime stream on the box (occupancy.py): checked before each try, as a pause is.
+        from . import occupancy
+        occupancy.WHERE = p
+        return occupancy.blocks_any([L["name"] for L in todo], _lock_step(a))
 
     from . import shared
     cfg = p.config()
@@ -8712,6 +8790,12 @@ def cmd_lock(a) -> None:
                   if a.json else held_by[1])
             sys.exit(75)
         die(f"refused: {held_by[1]}", 75)
+    if live := _occupied():
+        if a.probe:
+            print(json.dumps({"name": todo[0]["name"], "free": False, "line": live, "occupancy": True})
+                  if a.json else live)
+            sys.exit(75)
+        die(f"refused: {live}; retry in about a minute (`ttp occupancy {todo[0]['name']}`)", 75)
 
     def _unwritable(e: OSError, L: dict) -> None:
         # Never a private lock instead: other holders would not see it. Say what is wrong.
@@ -8805,6 +8889,7 @@ def cmd_lock(a) -> None:
                                                    cmd=activity.head(cmd), start=time.time(),
                                                    **{k: v for k, v in lk.taker().items() if k != "node"},
                                                    boot=boot_id(), **({"disruptive": True} if a.disruptive else {}),
+                                                   **({"step": a.step} if getattr(a, "step", None) else {}),
                                                    **({"job_rc": j} if (j := lk.job_fields().get("job_rc")) else {})))
         rc = 1
         try:
@@ -9965,6 +10050,8 @@ def cmd_detach(a) -> None:
         die("--remote-pid and --remote-marker go with --remote-host <ssh alias>")
     if rhost and (a.remote or a.check is not None):
         die("--remote-host is for a local job that drives another host; --remote starts the job there itself")
+    if a.check is None and a.command:
+        _detach_occupied(a, rhost)
     if a.remote:
         _detach_remote(a, _own_ttp())
         return
@@ -10273,6 +10360,8 @@ def _detach_stop(what: str, given: str | None = None) -> int:
         return _detach_stop_checks(rc, given)
     if not detach._entry(rc) and rc.suffix == ".json" and rc.parent.name == "pushes":
         return _detach_stop_push(rc, given)   # a detached `ttp push` marker
+    if not detach._entry(rc) and "/" not in what and (got := _schedule_stop(what.removesuffix(".rc"), given)) is not None:
+        return got
     if not detach._entry(rc):
         return _launcher_stop(what, rc)
     base = rc.parent.parent.parent.parent if rc.parent.parent.name == "runs" else None
@@ -10328,6 +10417,30 @@ def _detach_stop_checks(rc: Path, given: str | None) -> int:
     code, text, _ = jobstop.stop_checks(p, run_dir, caller, run, given)
     print(text if code != 3 else f"ttp detach --stop: {text}", file=sys.stderr if code == 3 else sys.stdout)
     return code
+
+
+def _schedule_stop(name: str, given: str | None) -> int | None:
+    """`ttp detach --stop <schedule>`: a runner a command schedule of this project launched. Sets its stop
+    switch (occupancy.request_stop: a runner checking `ttp occupancy --should-stop` ends before its next
+    trial) and kills the schedule's live process groups (schedrun.GROUPS_KEY). None when no schedule of
+    this project has that name (the other lookups go on)."""
+    from . import occupancy, schedrun
+    if not os.environ.get("TTP_PROJECT"):
+        return None
+    p = Project(os.environ["TTP_PROJECT"])
+    groups = {pid: rec for pid, rec in (p.db.kv(schedrun.GROUPS_KEY, {}) or {}).items()
+              if (rec or {}).get("schedule") == name}
+    if not groups and not p.db.one("SELECT name FROM schedules WHERE name=?", (name,)):
+        return None
+    try:
+        occupancy.request_stop(p, name, given or "ttp detach --stop")
+    except ValueError:
+        return None
+    killed = [pid for pid, rec in groups.items() if schedrun._kill(int(pid), rec.get("start"))]
+    schedrun._forget(p.db, [int(x) for x in groups])
+    print(f"{name}: stop switch set" + (f"; stopped process group(s) {', '.join(killed)}" if killed
+                                         else "; no run of it is live"))
+    return 0
 
 
 def _detach_stop_push(marker: Path, given: str | None) -> int:
@@ -10651,6 +10764,18 @@ def _ssh_sh(host: str, script: str, args: list, timeout: float = 60,
         return None
 
 
+def _detach_occupied(a, rhost: str | None) -> None:
+    """A job on a box a live realtime stream holds (its --remote or --remote-host, its --lock resources) is not
+    started: exit 75 with why (`ttp occupancy`), so the run retries in about a minute."""
+    from . import occupancy
+    occupancy.WHERE = Project(os.environ["TTP_PROJECT"]) if os.environ.get("TTP_PROJECT") else None
+    locks = [r for v in (getattr(a, "lock", None) or []) for r in str(v).split(",") if r]
+    why = occupancy.blocks_any([a.remote or "", rhost or "", *locks], getattr(a, "step", None) or "test")
+    if why:
+        from . import cyclenotice
+        die(f"ttp detach: not started: {why}; retry in about a minute (`ttp occupancy <box>`)", cyclenotice.BUSY)
+
+
 def _detach_remote(a, ttp: str) -> None:
     """`ttp detach --remote <ssh alias> [--dir <remote dir>] <name> -- <command...>`: start the driver
     on that host with setsid nohup, so it outlives this run, ssh and a reboot of this host. <name>.log,
@@ -10872,6 +10997,13 @@ def cmd_devq(a) -> None:
         args, install, limit = rest, False, 50 if a.op == "probe" else 120
     else:
         args, install, limit = rest[:1], False, 120
+    if a.op in ("submit", "start", "clear"):
+        from . import occupancy
+        occupancy.WHERE = p
+        why = occupancy.blocks_any([a.runner, str(rc.get("host") or "")], "reset" if a.op == "clear" else "test")
+        if why:
+            from . import cyclenotice
+            die(f"devq {a.op}: not sent: {why}; retry in about a minute", cyclenotice.BUSY)
     argv = devq.host_call(a.runner, rc, a.op, args, install)
     try:
         r = subprocess.run(argv, input=devq.source(), text=True, timeout=limit)
@@ -13444,6 +13576,23 @@ def _cycle_hold(paths: list[str], a, where=None, auto_rec: Project | None = None
         f"(--ignore-cycle-notice proceeds anyway)", cyclenotice.BUSY)
 
 
+def _occupancy_hold(p: Project, a, step: str, auto_rec: Project | None = None) -> None:
+    """Exit 75 (busy), changing nothing, while a live realtime stream holds this host or this host is a
+    stream's front box (occupancy.py): an upgrade deploys and restarts the daemon. `auto_rec`: the daemon's
+    own upgrade, recorded as held; it is retried on its next round."""
+    from . import cyclenotice, occupancy
+    occupancy.WHERE = p
+    here = hostname()
+    why = occupancy.blocks(here, step)
+    if not why:
+        return
+    if auto_rec is not None:
+        from . import release
+        release.finish(auto_rec, "held", why=why)
+    die(f"held: {why}; nothing was changed. It goes ahead once the stream is over (`ttp occupancy {here} "
+        f"--step {step}`)", cyclenotice.BUSY)
+
+
 from .release import SETUP_JOURNAL  # noqa: E402  (release.hold_reason holds automatic upgrades while it exists)
 SETUP_PARTS = ("runtime", "template", "bin", "skills", ".claude-plugin", ".codex-plugin")    # skills: readable by workers of any project
 
@@ -13641,6 +13790,7 @@ def cmd_upgrade(a) -> None:
     if not a.auto and a.apply is None:
         _refresh_stable_copy(p.name)
     _cycle_hold(cyclenotice_paths(p), a, p, auto_rec=p if a.auto else None)
+    _occupancy_hold(p, a, "deploy", auto_rec=p if a.auto else None)
     from . import notifier
     for ln in notifier.refresh(send_test=not a.auto):   # this machine's notifier on the installed code too
         print(ln)
@@ -15375,7 +15525,7 @@ COMMAND_GROUPS = (
                   "memory", "obligation", "config", "pause", "resume", "drain", "alerts", "issues", "mute",
                   "quarantine", "machines", "runs", "logs", "doctor")),
     ("inside a run", ("note", "steer", "urgent-reply", "notify", "progress", "checks", "checks-shard", "checks-yield", "lock",
-                      "host-run", "detach", "devq", "push", "install-check", "land", "express", "clip", "sandbox", "pool-wait", "pool-admit",
+                      "occupancy", "host-run", "detach", "devq", "push", "install-check", "land", "express", "clip", "sandbox", "pool-wait", "pool-admit",
                       "pool-shard", "skill", "killscan", "svcscan", "leftover-procs", "said", "hostcheck", "paths")),
     ("probes (retry_when, start_when)", ("landed", "alive", "eta", "ci", "ack-wait", "ssh-preflight", "broker-released",
                                          "deployed", "goal", "hours")),
@@ -16252,8 +16402,35 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--disruptive", action="store_true",
                    help="the command may reset, power-cycle or reboot what it holds: `ttp machines activity` "
                         "and the resume note after a reboot list it first")
+    s.add_argument("--step", choices=("deploy", "restart", "test", "bench", "warmup", "health", "reset"), default=None,
+                   help="what the command does on the box, for the occupancy check (`ttp occupancy`): a front box "
+                        "is covered only for deploy and restart (default: reset with --disruptive, else test)")
     s.add_argument("command", nargs=argparse.REMAINDER, help="the command to run while holding it (after --)")
     s.set_defaults(fn=cmd_lock)
+
+    s = sub.add_parser("occupancy", help="whether a live realtime stream holds a box: ask before a deploy, "
+                                         "restart, test, benchmark, warm-up, health check or reset there", description=(
+        "One shared, model-free check every project on the host answers the same: live, free or unknown, "
+        "with each source, when it was read and when the box clears (the stream's end plus the quiet window, "
+        "occupancy.quiet_s, default 60 s). Sources are each project's own, in its settings: "
+        "`occupancy.sources.<alias>` = {\"cmd\": \"<read-only command: exit 0 live, 1 none>\" or \"file\": \"<path>\", "
+        "\"timeout_s\": 10, \"fronts\": [\"<front box alias>\"]}. A front box (a router or proxy) is held only for "
+        "deploy and restart. A source that cannot tell counts as live. No source for a box: free. Sharing a box "
+        "with real users through the device broker is never held. Exit 0: the step may run; 75: stay off."))
+    s.add_argument("target", nargs="?", default="", help="a machine alias, a resource on it or its host name")
+    s.add_argument("--step", choices=("deploy", "restart", "test", "bench", "warmup", "health", "reset"), default="test",
+                   help="what is about to run there (default test); a front box holds only deploy and restart")
+    s.add_argument("--wait", action="store_true", help="retry about every minute until the step may run")
+    s.add_argument("--timeout", type=float, default=None, help="with --wait: give up after this many seconds (exit 75)")
+    s.add_argument("--fresh", action="store_true", help="read every source now (else a reading under 20 s old is reused)")
+    s.add_argument("--json", action="store_true", help="the answer as JSON")
+    s.add_argument("--list", action="store_true", help="the sources every project on this host registered")
+    s.add_argument("--should-stop", metavar="RUNNER",
+                   help="for a long runner, before each trial: exit 0 (stop now) when its stop switch is set or a live "
+                   "stream holds <target> (step bench unless --step says otherwise), 1 to go on")
+    s.add_argument("--stop-switch", metavar="RUNNER", help="set RUNNER's stop switch (`ttp detach --stop RUNNER` sets it too)")
+    s.add_argument("--clear-stop", metavar="RUNNER", help="clear RUNNER's stop switch before a new series")
+    s.set_defaults(fn=cmd_occupancy)
 
     s = sub.add_parser("host-run", help="run a command config runner.host_commands allows (a sudo read, say) "
                                         "outside the sandbox, through the daemon", description=(
@@ -16500,6 +16677,8 @@ def main(argv: list[str] | None = None) -> None:
                    help="repeatable (or A,B): the job runs its command under one `ttp lock` of them all, so it takes "
                    "them all or nothing by ttp lock's rules before the command starts and holds them until it ends "
                    "(its .rc) or its processes are gone; a paused one exits 75 at once and starts nothing")
+    s.add_argument("--step", choices=("deploy", "restart", "test", "bench", "warmup", "health", "reset"), default=None,
+                   help="what the job does on its box (default test): checked against `ttp occupancy` before it starts")
     s.add_argument("--reap", metavar="NAME|RC",
                    help="close the record of a job that is over now, as the daemon does each minute: ended "
                    "with its exit code, or died when gone without one; refuses (exit 1) while it runs; idempotent")

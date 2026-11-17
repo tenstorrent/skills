@@ -226,6 +226,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Machines in the user's list (ttp machines) this project uses, beside those its resources and
     # shared_resources name: the change ledger, health coverage and idle capacity read only these.
     "machines": {"allowed": []},
+    # Box occupancy (occupancy.py): this project's read-only source per machine alias telling whether a live
+    # realtime stream holds the box ({alias: {"cmd" | "file", "timeout_s", "fronts": [front box aliases]}}),
+    # shared with every project on the host, and the quiet window after a stream ends. None: nothing changes.
+    "occupancy": {"sources": {}, "quiet_s": 60},
     # The access bridge's agent links on this host (bridgewatch.py): a link that stops answering shows
     # a low status line at once; still down after agent_alert_after_min, the user gets one normal
     # alert. It clears once the agent answered for agent_steady_min; a drop before that is the same outage.

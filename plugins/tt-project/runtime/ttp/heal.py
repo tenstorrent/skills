@@ -895,6 +895,18 @@ def machine_of(spec: dict, known: dict | None = None) -> str | None:
                  if res == a or res.startswith((a + "-", a + ":"))), None)
 
 
+def _occupied(p: Any, spec: dict, step: str) -> str:
+    """Why a live realtime stream holds the check's box for `step` (`ttp occupancy`), else ""."""
+    from . import occupancy
+    occupancy.WHERE = p
+    return occupancy.blocks_any([machine_of(spec) or "", str(spec.get("resource") or "")], step)
+
+
+def _occupancy_wait() -> float:
+    from . import occupancy
+    return float(occupancy.WAIT_S)
+
+
 def known_outage(spec: dict, now: float) -> tuple[str, dict] | None:
     """(alias, record) of a known machine-ledger outage on the check's machine or `resource`, else None."""
     alias, res = machine_of(spec), str(spec.get("resource") or "")
@@ -1003,6 +1015,10 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
         return "unhealthy (fix interrupted; rechecking)", float(st["fix_started"]) + spec["settle_s"]
     from . import pauseends
     pauses = pauseends.owned(p)
+    held = _occupied(p, spec, "health")
+    if held:   # a live realtime stream holds the box: no check now, retried in about a minute
+        _save(db, name, st)
+        return f"held: {held}", now + _occupancy_wait()
     rc, out = check(spec, st, cwd, env)
     off = recovery_off(out)
     if off:   # recovery switched off is unhealthy whatever the exit code, and no exemption covers it
@@ -1191,6 +1207,10 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
         st["fixes"] = fixes
         return _escalate(host, name, spec, st, now,
                          f"{len(fixes)} fixes in {spec['window_h']:g} h used up its cap ({spec['max_fixes']})")
+    held = _occupied(p, spec, "reset")
+    if held:   # never fix (reset, power cycle) under a live realtime stream; not counted, retried soon
+        _save(db, name, st)
+        return f"unhealthy (fix held: {held})", now + _occupancy_wait()
     # Recorded before the fix runs: a restart in the middle still counts it, and rechecks next.
     deferred, deferred_on, told = (st.pop(k, None) for k in ("deferred_since", "deferred_on", "deferred_told"))
     st.update(fixes=fixes + [now], phase="fixing", fix_started=now)

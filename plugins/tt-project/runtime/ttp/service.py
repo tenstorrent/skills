@@ -1176,6 +1176,15 @@ def daemon_stopped(p: Project) -> bool:
     return not _running_daemons(p, main) and not old_daemon_beats(p, time.time())
 
 
+def occupied(p: Project) -> str:
+    """Why no restart runs here now: a live realtime stream holds this host, or it is a live stream's front
+    box (occupancy.py), until its quiet window ends; "" when none (no source registered: always "")."""
+    from . import occupancy
+    from .project import hostname
+    why = occupancy.blocks(hostname(), "restart")
+    return f"{p.name}'s daemon was not restarted: {why}; nothing was changed" if why else ""
+
+
 def restart_running(p: Project) -> Restarted:
     """An upgrade's restart (`ttp upgrade`, and so a push's deploy): new files reach a running daemon only.
     A stopped daemon stays stopped (outcome `stopped`): it runs the files on disk at its next start, which
@@ -1206,6 +1215,8 @@ def restart(p: Project, wait_s: float = 60, restart_fn=None, tick_wait_s: float 
     The result's `outcome` says how it went."""
     from .daemon import start_marker
     if why := foreign_refusal(p, "restart"):
+        return _said(why, "refused")
+    if why := occupied(p):
         return _said(why, "refused")
     restart_fn = restart_fn or restart_service
     stop_s, main = _manager_view(p)

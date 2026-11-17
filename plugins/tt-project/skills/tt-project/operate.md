@@ -108,6 +108,35 @@
   that reads the token another way) can still read what that user can. For a hard boundary, run
   workers under a separate OS account or in a sandbox that cannot read the project's `state/`.
 
+## Boxes real users share
+
+One shared, model-free check answers whether a live realtime stream (one that needs realtime
+guarantees) holds a box: `ttp occupancy <alias> --step <step>` prints live, quiet, unknown or free,
+with each source, when it was read and when the box clears (the stream's end plus a quiet window,
+`occupancy.quiet_s`, default 60 s). Exit 0: the step may run; 75: stay off. `--wait` retries about
+every minute; `--list` shows every source registered on the host.
+
+- Register a source in the project that runs the stream, per machine alias, as a read-only command
+  (exit 0 live, 1 none, anything else or a timeout counts as live) or a file it reads (JSON
+  `{"live": true}` or the word `live` or `free`; a file older than `max_age_s`, default 120 s,
+  counts as unknown): `ttp config occupancy.sources.box-a '{"cmd": "<read-only probe>",
+  "timeout_s": 10, "fronts": ["router-a"]}'`. `fronts` names the box's front boxes (router or
+  proxy): they are held only for deploy and restart while the stream is live.
+- Registrations are shared through the tt-project home folder, so every project on the host
+  consults every source, not only its own. No source registered: nothing is held. Nothing ships one.
+- Every harness path checks it before it starts work on a box: `ttp lock` of a machine or device
+  resource (`--step`), checks and their spill, after-push deploys and `ttp upgrade`, daemon
+  restarts, heal checks and their fixes, `ttp detach` jobs (`--remote`, `--remote-host`, `--lock`,
+  `--step`) and device jobs. Work shared with real users through the device broker is never held.
+- The daemon's watchdog reads every source about once a minute and flags each job of its project
+  that ran on a box while a stream (or its quiet window) held it: a high-severity post to the
+  project's chat at once, kept for `ttp status` and the daily review. A source of its own that
+  cannot tell raises one event.
+- Long runners: `ttp occupancy <alias> --should-stop <runner>` before each trial exits 0 when the
+  runner's stop switch is set or a stream holds the box. `ttp detach --stop <schedule>` sets the
+  switch of a command schedule's runner and stops its live process groups; `ttp occupancy
+  --clear-stop <runner>` clears it before a new series.
+
 ## Queue times
 
 Every project cuts its queue times with the resources its charter allows (the template charter's
