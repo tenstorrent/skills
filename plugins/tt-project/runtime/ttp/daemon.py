@@ -154,7 +154,7 @@ from .route import KEY as ROUTE_KEY, run_model as route_run_model   # start_run'
 from . import checkcap
 from . import conflictfix
 from . import correction
-from . import slop
+from . import deslop, slop
 from . import slowcomplaint
 from . import credits
 from . import gatewake
@@ -1389,6 +1389,7 @@ class Daemon:
         self._scores_job: threading.Thread | None = None   # the model scoreboard (refresh_model_scores)
         self._scores_tried = 0.0
         self._bench_tried = 0.0   # the last hourly model bench owner check (run_model_bench)
+        self._deslop_tried = 0.0   # the last hourly check of the deslop schedule (keep_deslop)
         self._cli_watch: threading.Thread | None = None   # CLI versions being read (watch_cli_versions)
         self._cli_watched = 0.0   # when that last started
         self._replica_checked = 0.0
@@ -2498,6 +2499,7 @@ class Daemon:
                 self.refresh_model_ranking,
                 self.refresh_model_scores,
                 self.run_model_bench,
+                self.keep_deslop,
                 self.refresh_coverage,
                 self.lift_quarantine,
                 self.sweep_holds,
@@ -5028,6 +5030,21 @@ class Daemon:
 
         self._scores_job = threading.Thread(target=work, name="model-scores", daemon=True)
         self._scores_job.start()
+
+    def keep_deslop(self) -> None:
+        """Hourly, model-free: keep the `deslop` schedule (deslop.py) on while deslop.enabled, off otherwise."""
+        now = time.time()
+        if now - self._deslop_tried < 3600:
+            return
+        self._deslop_tried = now
+        c = deslop.settings(self.cfg)
+        try:
+            did = deslop.ensure(self.p, self.p.db, bool(c["enabled"]), str(c["every"]))
+        except ValueError as e:   # a broken schedules file or a bad `every`: the next check tries again
+            log(self.p, f"deslop: schedule not changed: {e}")
+            return
+        if did:
+            log(self.p, f"deslop: schedule {did} (deslop.enabled {'on' if c['enabled'] else 'off'})")
 
     def run_model_bench(self) -> None:
         """The machine's shared daily model bench (benchowner.py), model-free, hourly: check the owner
@@ -10350,20 +10367,25 @@ class Daemon:
         skip = "" if force else self._schedule_precheck(s, payload)
         if skip:
             return skip
-        spec = payload.get("spec") or s["description"]
+        picked = deslop.plan(self.p, self.cfg) if payload.get("deslop") else None
+        if isinstance(picked, str):
+            return picked
+        spec = picked["spec"] if picked else payload.get("spec") or s["description"]
         prompt_file = payload.get("prompt")
         if prompt_file and (self.p.harness / "prompts" / prompt_file).exists():
             spec = (self.p.harness / "prompts" / prompt_file).read_text() + "\n\n" + spec
         if feed := self._review_feed(s, payload):   # marked with when it was read: a late start re-reads it
             spec += sched.wrap_feed(feed, time.time(), timefmt.home(self.p))
         with db.tx():   # the evidence is the state at enqueue: what changes during the run stays new
-            tid = db.add_task(f"[{s['name']}] {s['description'][:120] or 'recurring task'}", spec,
+            tid = db.add_task(picked["title"] if picked else f"[{s['name']}] {s['description'][:120] or 'recurring task'}", spec,
                               kind=payload.get("kind", "work"), tier=payload.get("tier", "standard"),
                               priority=2 if force else int(payload.get("priority", 4)),
                               budget_usd=sched.run_budget(self.cfg, s, payload, spent),
                               origin="schedule", labels=[s["name"]])
             if evidence is not None:
                 sched.record_evidence(db, s["name"], tid, evidence)
+            if picked:
+                deslop.record(db, picked, tid)
         return "queued"
 
     def _review_feed(self, s: dict, payload: dict) -> str:

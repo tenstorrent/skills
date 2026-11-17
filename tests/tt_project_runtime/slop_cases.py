@@ -109,3 +109,72 @@ def test_the_shipped_prompts_carry_the_deslop_rule():
     assert "re-implements a rule an existing function already decides" in review and "replays one recorded incident" in review
     assert "never add a second copy" in code and "ttp slop --diff" in code
     assert "ttp slop" in daily
+
+
+def _deslop_project(env, monkeypatch):
+    """A project whose root holds one over-target subsystem (`pkg`: the same rules twice), the deslop flag on,
+    and the daemon with the `deslop` schedule row the pass runs from."""
+    from ttp import daemon, deslop
+    p = make(env)
+    pad = "".join(f"def f{i}(x):\n    return x + {i + 2}\n" for i in range(30))
+    for n in ("a", "b"):
+        (p.root / "pkg").mkdir(exist_ok=True)
+        (p.root / "pkg" / f"{n}.py").write_text(CHOOSER + pad)
+    monkeypatch.setattr(deslop, "_base", lambda _p: None)   # the working tree stands for the base branch
+    dm = daemon.Daemon(p.base)
+    dm.cfg["deslop"] = {"enabled": True}
+    s = {"name": "deslop", "budget_usd_day": None, "last_run": None, "description": deslop.DESCRIPTION}
+    return p, dm, s
+
+
+def _deslop_tasks(p):
+    return p.db.q("SELECT * FROM tasks WHERE origin='schedule' AND labels=? ORDER BY id", (json.dumps(["deslop"]),))
+
+
+def test_the_deslop_pass_queues_exactly_one_refactor_task_and_waits_while_it_is_open(env, monkeypatch):
+    from ttp import deslop
+    p, dm, s = _deslop_project(env, monkeypatch)
+    assert dm._schedule_llm(s, dict(deslop.PAYLOAD)) == "queued"
+    (task,) = _deslop_tasks(p)
+    assert task["kind"] == "code" and task["title"].startswith("[deslop] refactor pkg"), task["title"]
+    for need in ("No behaviour change", "duplicate rules", "device or machine work", "change freeze", "settled area",
+                 "before and after numbers"):
+        assert need in task["spec"], (need, task["spec"])
+    state = p.db.kv("deslop")
+    assert state["passes"][-1]["subsystem"] == "pkg" and state["passes"][-1]["task"] == task["id"], state
+    assert state["baseline"]["subsystems"]["pkg"]["duplicates"] >= 1, state["baseline"]
+    assert dm._schedule_llm(s, dict(deslop.PAYLOAD)).endswith("previous run still open")   # one open task at a time
+    assert len(_deslop_tasks(p)) == 1
+    p.db.x("UPDATE tasks SET status='done' WHERE id=?", (task["id"],))
+    again = dm._schedule_llm(s, dict(deslop.PAYLOAD))   # pkg was refactored lately: never the same subsystem twice in gap_days
+    assert all(t["title"] != task["title"] for t in _deslop_tasks(p)[1:]), again
+
+
+def test_the_deslop_pass_skips_a_paused_or_switched_off_project(env, monkeypatch):
+    from ttp import deslop, projpause
+    p, dm, s = _deslop_project(env, monkeypatch)
+    projpause.pause(p.db, "user", "change freeze")
+    assert dm._schedule_llm(s, dict(deslop.PAYLOAD)) == "skipped: the project is paused"
+    assert not _deslop_tasks(p)
+    projpause.resume(p.db, "user")
+    dm.cfg["deslop"] = {"enabled": False}
+    assert dm._schedule_llm(s, dict(deslop.PAYLOAD)).startswith("skipped: deslop.enabled is off")
+    assert not _deslop_tasks(p)
+
+
+def test_the_deslop_schedule_follows_the_flag_and_the_hourly_check_keeps_it(env):
+    from ttp import daemon, deslop
+    p = make(env)
+    dm = daemon.Daemon(p.base)
+    row = lambda: p.db.one("SELECT enabled, every_s FROM schedules WHERE name='deslop'")   # noqa: E731
+    assert row() is None and deslop.ensure(p, p.db, False, "1d") == ""   # off by default: nothing is added
+    dm.cfg["deslop"] = {"enabled": True, "every": "2d"}
+    dm.keep_deslop()
+    assert row()["enabled"] == 1 and row()["every_s"] == 2 * 86400, row()
+    assert deslop.ensure(p, p.db, True, "2d") == ""                      # unchanged: no write
+    dm.cfg["deslop"] = {"enabled": False}
+    dm.keep_deslop()
+    assert row()["enabled"] == 1                                         # the hourly guard: not again within the hour
+    dm._deslop_tried = 0.0
+    dm.keep_deslop()
+    assert row()["enabled"] == 0, row()

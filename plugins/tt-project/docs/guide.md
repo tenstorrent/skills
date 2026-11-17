@@ -918,6 +918,14 @@ coordinator with that evidence.
   delta and a rule that fails a change re-implementing a rule an existing function decides, adding an incident-diary
   comment or docstring, or adding a test that only replays one incident; the code-worker prompt says the same, and
   the daily review quotes the scan numbers. Scan flags are findings for the reviewer to judge, not verdicts.
+  The periodic pass (deslop.py) is the llm schedule `deslop`, on only while `deslop.enabled` is true (default off;
+  the daemon checks the flag hourly and adds or removes the schedule, every `deslop.every`, default 1d). Each pass
+  scans the base branch, records the numbers against the targets (kv `deslop`: baseline, newest scan, past passes),
+  skips every subsystem refactored within `deslop.gap_days` (3), picks the one furthest over its targets and queues
+  one code task: no behaviour change, tests unchanged and green, each over-target number cut by `deslop.step_share`
+  (20%) or to its target, charter holds, change freezes and settled areas respected, no device or machine work. Its
+  review compares the before and after numbers the spec carries. No pass runs while the project is paused or while
+  the last one is open.
 - Landing time breakdown (landings.py, `ttp landings [--days N] [--from <date>] [--top N] [--json]`),
   model-free from the task, run, event, push-queue and checks records. For each task that landed, the wall
   time from creation to landing is split by cause, each second counted once: queue before the first run,
