@@ -24,7 +24,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import bench, benchblind, benchfix, benchpack, benchrun, benchv2, blindreview, effort, gitmemo, serverhealth
+from . import bench, benchblind, benchfix, benchnotrun, benchpack, benchrun, benchv2, blindreview, effort, gitmemo, serverhealth
 from .project import durable_write, open_append
 
 CAP_USD = 0.0        # Claude spend a day (arm runs plus reviews); 0: no cap (the runaway guard is separate)
@@ -348,17 +348,31 @@ def run_task(out: Path, bench_dir: Path, task: dict, arms: dict, opts: dict, cfg
     path = out / "results.jsonl"
     have = read_rows(path)
     added = []
+    canary = opts.get("canary")   # benchnotrun.Canary: an arm whose first cell was not run launches nothing more
+    opts = {k: v for k, v in opts.items() if k != "canary"}
     reps = range(int(opts.get("reps", 1) or 1) if task.get("repeat") else 1)
     for name, arm in arms.items():
         for rep in reps:
-            if (key := (task["task"], rep, name)) in have and not have[key].get("endpoint_fault"):
+            if (key := (task["task"], rep, name)) in have and not retry(have[key]):
+                continue
+            if canary and canary.before(name) == "stop":
                 continue
             cell = {"task": task["task"], "rep": rep, "arm": name}
-            row = benchrun.run_cell(bench_dir, out, {**task, "task": task["task"]}, cell, arm,
-                                    {**opts, "repo": Path(task["source_root"]), "state": Path(task["state"])}, cfg)
+            row = None
+            try:
+                row = benchrun.run_cell(bench_dir, out, {**task, "task": task["task"]}, cell, arm,
+                                        {**opts, "repo": Path(task["source_root"]), "state": Path(task["state"])}, cfg)
+            finally:
+                if canary:
+                    canary.after(name, row)
             append_row(path, row, lock)
             added.append(row)
     return added
+
+
+def retry(row: dict) -> bool:
+    """Whether a cell's row means it runs again on a resume: the endpoint failed it, or no model ran in it."""
+    return bool(row.get("endpoint_fault")) or row.get("outcome") == benchnotrun.OUTCOME
 
 
 def _run_task(out: Path, bench_dir: Path, task: dict, arms: dict, opts: dict, cfg: dict, ledger: Ledger,
@@ -394,8 +408,7 @@ def run_cells(day: str, tasks: dict[str, dict], arms: dict, out: Path, bench_dir
     todo = [t for t in (order or list(tasks)) if t in tasks]
     def full(t: str) -> bool:
         reps = range(int(opts.get("reps", 1) or 1)) if tasks[t].get("repeat") else range(1)
-        return all((t, rep, a) in rows and not rows[(t, rep, a)].get("endpoint_fault")
-                   for a in arms for rep in reps)
+        return all((t, rep, a) in rows and not retry(rows[(t, rep, a)]) for a in arms for rep in reps)
     ran += [t for t in todo if full(t)]
     todo = [t for t in todo if not full(t)]
     ledger.finished += [sum(float(rows[(t, rep, a)].get("cost_usd") or 0) for a in arms if is_claude(arms[a])
@@ -404,6 +417,9 @@ def run_cells(day: str, tasks: dict[str, dict], arms: dict, out: Path, bench_dir
     if ran and not (out / "review.json").exists():
         ledger.reviews += ledger.reservation(worst, review)[1] * len(ran)   # a resumed run's finished cells are not reviewed yet: their reviews still spend
     pending: dict = {}
+    # each arm's first cell of this run goes alone (benchnotrun.Canary); an arm with a row from an earlier run is cleared
+    canary = benchnotrun.Canary({r["arm"] for r in rows.values() if r["arm"] in arms and not retry(r)})
+    opts = {**opts, "canary": canary}
     gates: dict[str, threading.Semaphore] = {p: threading.Semaphore(max(1, n)) for p, n in limit.items()}
     def gate(arms_of_task: dict) -> threading.Semaphore:
         """A task's cells are gated by the provider that runs them: all-chat under the chat gate (GLM cells
@@ -449,7 +465,10 @@ def run_cells(day: str, tasks: dict[str, dict], arms: dict, out: Path, bench_dir
             pending[f] = (tid, hold)
         for f in list(pending):
             finish(f)
-    return {"ran": ran, "skipped": skipped, "admitted": admitted, "claude_usd": ledger.total(), "reserved_reviews": ledger.reviews}
+    for why in canary.stopped.values():
+        say(f"ERROR: {why}")
+    return {"ran": ran, "skipped": skipped, "admitted": admitted, "claude_usd": ledger.total(), "reserved_reviews": ledger.reviews,
+            "stopped_arms": dict(canary.stopped)}
 
 
 def prior_review_mean(root: Path, before: str | None = None) -> float | None:
@@ -481,7 +500,8 @@ def landed(score: dict, row: dict) -> bool:
     """Landed: requirements and correctness both at least LANDED_MIN of 4; a run that hit the time limit
     (or stalled) is a fail whatever its diff shows, and a cell the cheat audit flagged (a hard flag) never
     lands, whatever the graders gave its diff."""
-    if row.get("hang_guard") or row.get("outcome") in ("timeout", "stalled", "error", "runner_timeout", "flagged"):
+    if row.get("hang_guard") or row.get("outcome") in ("timeout", "stalled", "error", "runner_timeout", "flagged",
+                                                         benchnotrun.OUTCOME):
         return False
     s = score.get("scores") or {}
     return int(s.get("criteria", 0)) >= LANDED_MIN and int(s.get("correctness", 0)) >= LANDED_MIN
@@ -622,6 +642,15 @@ def server_cells(rows: dict, tasks: dict) -> list[dict]:
             for (t, rep, a), r in sorted(rows.items(), key=lambda kv: str(kv[0])) if r.get("outcome") == serverhealth.OUTCOME]
 
 
+def not_run_cells(rows: dict, tasks: dict, arms: dict) -> list[dict]:
+    """The cells of `rows` no model ran in (never launched, zero model calls, the server broke it): named in the
+    day's record with the reason; a model that ran and left no diff is not among them, it failed."""
+    return [benchnotrun.cell_record(r, (tasks.get(r["task"]) or {}).get("project", ""),
+                                    f"{r.get('provider')}:{r.get('model')}:{r.get('effort')}"
+                                    + (f":{arms[r['arm']]['harness']}" if (arms.get(r["arm"]) or {}).get("harness") else ""))
+            for (t, rep, a), r in sorted(rows.items(), key=lambda kv: str(kv[0])) if r.get("outcome") == benchnotrun.OUTCOME]
+
+
 def day_record(day: str, tasks: dict, arms: dict, out: Path, graded: dict, skipped: list, dropped: list) -> dict:
     """The day's rows, one per task and arm that was reviewed: project, scores, landed, cost, minutes."""
     rows = read_rows(out / "results.jsonl")
@@ -658,7 +687,10 @@ def day_record(day: str, tasks: dict, arms: dict, out: Path, graded: dict, skipp
     claude_cells = sum(c["cost_usd"] for c in cells if c["claude"])
     # Cells the server cut: not scored and never a fail, queued for a rerun (serverhealth.py); named, not counted.
     server = server_cells(rows, tasks)
-    return {"day": day, "cells": cells, **({"server": server} if server else {}), "skipped": skipped, "dropped": dropped,
+    # Cells no model ran in (benchnotrun.py): their own count, outside every pass-rate denominator, never reviewed.
+    not_run = not_run_cells(rows, tasks, arms)
+    return {"day": day, "cells": cells, **({"server": server} if server else {}), **({"not_run": not_run} if not_run else {}),
+            "skipped": skipped, "dropped": dropped,
             "unscored": graded.get("unscored", []),
             **({"second_grader": {"reviewer": sec["reviewer"], "compare": sec["compare"],
                                   "unscored": sec["unscored"]}} if sec else {}),
@@ -715,7 +747,7 @@ def add_fix_spend(rec: dict, fix: dict) -> None:
 def cumulative(root: Path | None = None) -> dict:
     """The running table from every day's record under `root`/days: per project and arm, and per arm overall."""
     root = root or home()
-    cells, gaps, seconds, server, reruns, limits, fixed = [], [], [], [], [], {}, []
+    cells, gaps, seconds, server, reruns, limits, fixed, idle = [], [], [], [], [], {}, [], []
     orig, gone, left = {"n": 0, "passed": 0, "per_task": {}}, [], []
     days = sorted((root / "days").glob("*.json")) if (root / "days").exists() else []
     for p in days:
@@ -733,6 +765,7 @@ def cumulative(root: Path | None = None) -> dict:
         gone += [{"day": p.stem, **x} for x in rec.get("dropped_original") or []]
         left += [{"day": p.stem, **x} for x in rec.get("not_code_bench") or []]
         server += [{"day": p.stem, **x} for x in rec.get("server") or []]
+        idle += [{"day": p.stem, **x} for x in rec.get("not_run") or []]
         reruns += [{"day": p.stem, **x} for x in rec.get("reruns") or []]
         if (cmp := (rec.get("second_grader") or {}).get("compare")):
             seconds.append({"day": p.stem, "ranking_changed": cmp["ranking_changed"], "rank_a": cmp["rank_a"],
@@ -760,11 +793,24 @@ def cumulative(root: Path | None = None) -> dict:
     for c in cells:
         by.setdefault((c["project"], c["model"]), []).append(c)
         per.setdefault(c["model"], []).append(c)
+    # a not-run cell (this check's and a server cut) is its own count per model, outside n and every rate
+    gone_by, gone_per = {}, {}
+    for x in idle + server:
+        gone_by[(x["project"], x["model"])] = gone_by.get((x["project"], x["model"]), 0) + 1
+        gone_per[x["model"]] = gone_per.get(x["model"], 0) + 1
+
+    def with_idle(a: dict, k: int) -> dict:
+        return {**(a or {"n": 0, "landed": 0, "criteria": 0, "correctness": 0, "usd": 0, "usd_per_task": 0,
+                         "min_per_task": 0, "stops": 0}), **({"not_run": k} if k else {})}
+    projects = sorted({c["project"] for c in cells} | {pr for pr, _ in gone_by})
     return {"days": [p.stem for p in days],
-            "projects": {proj: {m: agg(rs) for (pr, m), rs in sorted(by.items()) if pr == proj}
-                         for proj in sorted({c["project"] for c in cells})},
-            "models": {m: agg(rs) for m, rs in sorted(per.items())}, "gaps": gaps,
+            "projects": {proj: {m: with_idle(agg(by[(pr, m)]) if (pr, m) in by else None, gone_by.get((pr, m), 0))
+                                for (pr, m) in sorted(set(by) | set(gone_by)) if pr == proj}
+                         for proj in projects},
+            "models": {m: with_idle(agg(per[m]) if m in per else None, gone_per.get(m, 0))
+                       for m in sorted(set(per) | set(gone_per))}, "gaps": gaps,
             **({"server": server} if server else {}),
+            **({"not_run": idle} if idle else {}),
             **({"reruns": reruns} if reruns else {}),
             **({"original": orig} if orig["n"] else {}),
             **({"fix_round": benchfix.summary(fixed)} if fixed else {}),
@@ -801,11 +847,11 @@ def _row(label: str, a: dict, second: bool = False) -> str:
     tail = (f" {a['second_landed']}/{a['second_n']} ({a['second_criteria']}/{a['second_correctness']}) |"
             if a.get("second_n") else " |") if second else ""
     return (f"| {label} | {a['n']} | {a['landed']}/{a['n']} | {a['criteria']} | {a['correctness']} | "
-            f"${a['usd']} | ${a['usd_per_task']} | {a['min_per_task']} | {a['stops']} |{tail}")
+            f"${a['usd']} | ${a['usd_per_task']} | {a['min_per_task']} | {a['stops']} | {a.get('not_run', 0)} |{tail}")
 
 
-HEAD = ("| {} | N | landed | requirements (0-4) | correctness (0-4) | $ total | $ per task | minutes per task | 60-min stops |{}\n"
-        "|---|---|---|---|---|---|---|---|---|{}")
+HEAD = ("| {} | N | landed | requirements (0-4) | correctness (0-4) | $ total | $ per task | minutes per task | 60-min stops | not run |{}\n"
+        "|---|---|---|---|---|---|---|---|---|---|{}")
 
 
 def table_md(cum: dict) -> str:
@@ -816,7 +862,8 @@ def table_md(cum: dict) -> str:
     lines = [f"# Daily model bench: cumulative ({len(cum['days'])} day(s): {', '.join(cum['days']) or 'none'})", "",
              "v1: cannot separate the models (user msg #3111).", "",
              "Landed = requirements and correctness each at least 3 of 4 by the blind Opus review; a 60-minute stop is "
-             "a fail. $ per task is each arm's own spend (an open model's is GLM spend, not Claude spend).", "",
+             "a fail, and so is a model that worked and left no diff. Not run = no model ran in the cell (never launched, "
+             "zero model calls, or the server broke it): its own count, outside N and every rate. $ per task is each arm's own spend (an open model's is GLM spend, not Claude spend).", "",
              "## Per model", "", head]
     lines += [_row(m, a, two) for m, a in cum["models"].items()]
     for proj, ms in cum["projects"].items():
@@ -845,6 +892,10 @@ def table_md(cum: dict) -> str:
                   "server is healthy:"]
         lines += [f"- {x['day']}: {x['project']} {x['task']} {x['arm']} ({x['model']}): {'; '.join(x.get('why') or [])}"
                   for x in cum["server"]]
+    if cum.get("not_run"):
+        lines += ["", "## Not run", "", "Cells no model ran in. They are never counted done or failed and are outside "
+                  "every pass rate; the count per arm is in the tables above:"]
+        lines += [f"- {x['day']}: {x['project']} {x['task']} {x['arm']} ({x['model']}): {x['why']}" for x in cum["not_run"]]
     if cum.get("flagged"):
         lines += ["", "## Flagged by the cheat audit", "", "Cells whose own tool calls ran a history or forge command or "
                   "named a hidden path. They are shown, graded, and never counted as landed:"]
@@ -990,6 +1041,8 @@ def run_day(day: str, start: float, end: float, arms: dict, cfg: dict, cap: floa
     rec["not_code_bench"] = left   # live-only or invalid: left out of the code bench, with why
     rec["faults"] = picked.get("faults", [])
     rec["admitted"] = done["admitted"]   # which reservation rule admitted each task
+    if done.get("stopped_arms"):   # an arm whose first cell was not run launched nothing more (benchnotrun.Canary)
+        rec["stopped_arms"] = done["stopped_arms"]
     rec["limit_s"] = opts["timeout_s"]   # the parity check's limit (cumulative)
     rec["arms"] = {k: {f: v.get(f, "") for f in ("provider", "model", "effort", "harness")} for k, v in arms.items()}
     durable_write(root / "days" / f"{day}.json", json.dumps(rec, indent=1) + "\n")

@@ -17,7 +17,7 @@ import shutil
 import sys
 from pathlib import Path
 
-from . import bench, benchblind, benchdaily, benchparity, benchrun, gitmemo
+from . import bench, benchblind, benchdaily, benchnotrun, benchparity, benchrun, gitmemo
 from .project import durable_write
 
 CAP_USD = 60.0          # Claude spend of the whole replay (arm runs plus reviews)
@@ -294,8 +294,13 @@ def answer_cells(entries: dict[str, dict]):
         for tid, task in tasks.items():
             if any((tid, 0, a) not in rows or rows[(tid, 0, a)].get("endpoint_fault") for a in arms):
                 continue
+            # an arm whose cell no model ran in has no answer to review (benchnotrun.py): it is left out, never graded
+            # as an empty answer; a model that worked and wrote nothing is graded ("(no answer was written)") and fails
+            live = [a for a in sorted(arms) if not benchnotrun.is_not_run(rows[(tid, 0, a)])]
+            if not live:
+                continue
             side = {}
-            for a in sorted(arms):
+            for a in live:
                 keep = out / "cells" / f"{tid}-r0-{a}"
                 side[a] = {"diff": answer_of(keep), **{k: arms[a].get(k, "") for k in ("provider", "model", "effort")},
                            "run_id": keep.name, "session_id": rows[(tid, 0, a)].get("session_id") or "",
@@ -311,6 +316,7 @@ def table(out: Path, tasks: dict, arms: dict, graded: dict, faults: list, skippe
     minutes per question, hang-guard stops; plus spend by provider kind and each arm's parity row
     (benchdaily.parity_row: its scored questions as the task set, the hang guard as the limit)."""
     rows = benchdaily.read_rows(out / "results.jsonl")
+    idle = benchnotrun.tally(list(rows.values()))   # per arm: cells no model ran in, outside every N and rate
     cells = []
     for _, (tid, arm, score) in sorted(graded["scored"].items()):
         r = rows.get((tid, 0, arm)) or {}
@@ -347,6 +353,10 @@ def table(out: Path, tasks: dict, arms: dict, graded: dict, faults: list, skippe
             "spend": {"claude_arms_usd": round(claude, 4), "review_usd": round(spend, 4),
                       "claude_usd": round(claude + spend, 4),
                       "glm_usd": round(sum(c["cost_usd"] for c in cells if not c["claude"]), 4)},
+            **({"not_run": {"per_arm": idle, "cells": [
+                {"task": r["task"], "arm": r["arm"], "why": benchnotrun.cell_record(r)["why"]}
+                for r in sorted(rows.values(), key=lambda r: (str(r["task"]), str(r["arm"]))) if benchnotrun.is_not_run(r)]}}
+               if idle else {}),
             "faults": faults, "skipped": skipped, "unscored": graded.get("unscored", []),
             "parity": [benchdaily.parity_row(":".join([str(arms[a].get(f) or "") for f in ("provider", "model", "effort")]
                                                       + ([arms[a]["harness"]] if arms[a].get("harness") else [])),
@@ -355,14 +365,16 @@ def table(out: Path, tasks: dict, arms: dict, graded: dict, faults: list, skippe
 
 
 HEAD_ROW = ("| arm | N | answered (1-5) | supported (1-5) | agrees (1-5) | agrees 4+ | $ per question | "
-            "minutes per question | hang-guard stops |\n|---|---|---|---|---|---|---|---|---|")
+            "minutes per question | hang-guard stops | not run |\n|---|---|---|---|---|---|---|---|---|---|")
 
 
 def table_md(rec: dict, names: dict[str, str]) -> str:
     """The replay table as markdown: one block per class, then all questions."""
     lines = ["# Offline replay: sealed questions blind-reviewed against what the project later established", "",
              "Scores are the blind Opus review's, 1 (worst) to 5. `agrees` compares with the established answer, "
-             "written from later records before any arm ran. $ per question is each arm's own spend.", ""]
+             "written from later records before any arm ran. $ per question is each arm's own spend. A model that worked and "
+             "wrote no answer failed the question. Not run = no model ran in the cell (never launched, zero model "
+             "calls, or the server broke it): its own count per arm, outside N and every rate.", ""]
     for cls in (*CLASSES, "all"):
         have = {a: v[cls] for a, v in rec["arms"].items() if v.get(cls)}
         if not have:
@@ -370,7 +382,8 @@ def table_md(rec: dict, names: dict[str, str]) -> str:
         lines += [f"## {cls}", "", HEAD_ROW]
         for a, v in have.items():
             lines.append(f"| {names.get(a, a)} | {v['n']} | {v['answered']} | {v['supported']} | {v['agrees']} | "
-                         f"{v['agree_4plus']}/{v['n']} | ${v['usd_per_task']} | {v['min_per_task']} | {v['stops']} |")
+                         f"{v['agree_4plus']}/{v['n']} | ${v['usd_per_task']} | {v['min_per_task']} | {v['stops']} | "
+                         f"{(rec.get('not_run') or {}).get('per_arm', {}).get(a, 0) if cls == 'all' else ''} |")
         lines.append("")
     if sg := rec.get("second_grader"):
         cmp = sg.get("compare") or {}
@@ -383,7 +396,9 @@ def table_md(rec: dict, names: dict[str, str]) -> str:
     sp = rec["spend"]
     lines += [f"Spend: Claude ${sp['claude_usd']:.2f} (arms ${sp['claude_arms_usd']:.2f}, reviews ${sp['review_usd']:.2f}); "
               f"GLM ${sp['glm_usd']:.2f}."]
-    for title, items in (("Not built", rec["faults"]), ("Not run", rec["skipped"]), ("Not scored", rec["unscored"])):
+    for title, items in (("Not built", rec["faults"]), ("Skipped", rec["skipped"]), ("Not scored", rec["unscored"]),
+                         ("Not run (no model ran)", [{**x, "task": f"{x['task']} {names.get(x['arm'], x['arm'])}"}
+                                                     for x in (rec.get("not_run") or {}).get("cells", [])])):
         if items:
             lines += ["", f"{title}:"] + [f"- {x.get('key') or x.get('task') or x.get('item')}: {x['why']}" for x in items]
     if rec.get("parity"):

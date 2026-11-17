@@ -40,7 +40,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import bench, benchpack, cellenv, cellnet, cellns, gitmemo, serverhealth
+from . import bench, benchnotrun, benchpack, cellenv, cellnet, cellns, gitmemo, serverhealth
 from .project import durable_write, open_append
 
 PROMPT = ("You are working in the git repository in your current directory. Do the task below there: make "
@@ -1335,6 +1335,7 @@ def _finish(row: dict, bench_dir: Path, task: dict, ws: Path, run: Path, keep: P
         if ((ended.get("bridge") or {}).get("busy") or {}).get("gave_up"):
             row["capacity_stop"] = True   # the bridge waited out the model's 429s as far as allowed
     server_status(row, ended, opts)
+    benchnotrun.apply(row, ended, diff)   # no model ran in the cell: not run, never done (user msgs #3135, #3137)
     keep.mkdir(parents=True, exist_ok=True)
     for name in ("output.jsonl", "exit.json", "result.json", "run.json", "runner.log", "stderr.log",
                  "trajectory.json", "opencode.json", "mini.yaml", "harness.sh", "codexproxy.log"):
@@ -1386,6 +1387,7 @@ def blind_cells(out: Path, tasks: dict, arms: dict, cells: list[dict]) -> dict:
         except (ValueError, KeyError, TypeError):
             continue
     rows = {k: r for k, r in rows.items() if r.get("outcome") != serverhealth.OUTCOME}   # not scored until rerun
+    idle = {k for k, r in rows.items() if r.get("outcome") == benchnotrun.OUTCOME}   # no model ran: never reviewed
     reps = sorted({c["rep"] for c in cells})
     got = []
     for tid, task in tasks.items():
@@ -1393,12 +1395,14 @@ def blind_cells(out: Path, tasks: dict, arms: dict, cells: list[dict]) -> dict:
             if any((tid, rep, a) not in rows for a in arms):
                 continue
             side = {}
-            for a in sorted(arms):
+            for a in sorted(a for a in arms if (tid, rep, a) not in idle):   # the other arms are still compared
                 r, keep = rows[(tid, rep, a)], out / "cells" / f"{tid}-r{rep}-{a}"
                 diff = (keep / "diff.patch").read_text(errors="replace") if (keep / "diff.patch").exists() else ""
                 side[a] = {"diff": diff, **{k: arms[a].get(k, "") for k in ("provider", "model", "effort")},
                            "run_id": keep.name, "session_id": r.get("session_id") or "",
                            "transcript": str(keep / "output.jsonl")}
+            if not side:
+                continue
             got.append({"task": str(tid) if len(reps) == 1 else f"{tid}-r{rep}",
                         "criteria": criteria(str(task.get("spec") or "")), "arms": side})
     return {"cells": got}
@@ -1559,15 +1563,22 @@ def run(bench_dir: Path, out: Path, arms: dict, reps: int, seed: int, opts: dict
     for line in (out / "results.jsonl").read_text().splitlines() if (out / "results.jsonl").exists() else []:
         try:
             r = json.loads(line)
-            if not r.get("endpoint_fault"):   # a cell the endpoint failed runs again
+            if not r.get("endpoint_fault") and r.get("outcome") != benchnotrun.OUTCOME:   # a cell the endpoint failed or no model ran in runs again
                 done.add((r["task"], r["rep"], r["arm"]))
         except (ValueError, KeyError, TypeError):
             continue   # a line torn by a crash: its cell runs again
     added = []
+    canary = benchnotrun.Canary({a for _, _, a in done})   # an arm with a row from an earlier run is cleared
     for cell in plan["cells"]:
         if (cell["task"], cell["rep"], cell["arm"]) in done:
             continue
-        row = {**run_cell(bench_dir, out, tasks[cell["task"]], cell, arms[cell["arm"]], opts, cfg), "seed": seed}
+        if canary.before(cell["arm"]) == "stop":   # the arm's first cell was not run: nothing else of it launches
+            continue
+        row = None
+        try:
+            row = {**run_cell(bench_dir, out, tasks[cell["task"]], cell, arms[cell["arm"]], opts, cfg), "seed": seed}
+        finally:
+            canary.after(cell["arm"], row)
         with open_append(out / "results.jsonl", "ab+") as f:
             torn = f.seek(0, 2) > 0 and f.seek(-1, 2) >= 0 and f.read(1) != b"\n"
             f.write((b"\n" if torn else b"") + json.dumps(row).encode() + b"\n")
@@ -1575,4 +1586,8 @@ def run(bench_dir: Path, out: Path, arms: dict, reps: int, seed: int, opts: dict
             os.fsync(f.fileno())
         added.append(row)
     durable_write(out / "cells.json", json.dumps(blind_cells(out, tasks, arms, plan["cells"]), indent=1) + "\n")
+    if canary.stopped:
+        durable_write(out / "stopped_arms.json", json.dumps(canary.stopped, indent=1) + "\n")
+        for why in canary.stopped.values():
+            print(f"bench: {why}", file=sys.stderr, flush=True)
     return added
