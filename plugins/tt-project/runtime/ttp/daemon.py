@@ -41,7 +41,7 @@ from . import blindreview
 from . import rolerestore
 from . import codearm
 from . import glmguard
-from . import glmharness
+from . import glmharness, policyfiles
 from . import deviceab
 from . import deviceshadow
 from . import batchrun
@@ -6776,6 +6776,26 @@ class Daemon:
                    "(over-counted) until the table or a pricing.claude override names it.",
                    severity="low", every_s=30 * 86400)
 
+    def _policy_bounce(self, r: dict) -> str:
+        """After a run on the code arm: 'policy files touched: <paths>' when its task's branch changes a file of the
+        project's policy list (policyfiles), else ''. Model-free; the refusal keeps the branch tip as evidence and
+        sends the task back to Opus (a bounce). A branch that cannot be read is no bounce: review reads it."""
+        try:
+            task = self.p.db.task(r["task"]) or {}
+            patterns = policyfiles.load(self.p.harness)
+            branch = task.get("branch") or worktree.worktree_branch(self.p, task)
+            if not (patterns and branch):
+                return ""
+            why = policyfiles.bounce_diff(self.p, {**task, "branch": branch}, patterns,
+                                          worktree.diff_lines(self.p, [branch]))
+            if why:
+                log(self.p, f"run {r['id']} of task {r['task']}: {why}; branch tip kept at "
+                            f"{policyfiles.EVIDENCE_REF}{r['task']}")
+            return why
+        except Exception as e:
+            log(self.p, f"run {r['id']}: policy diff not checked: {type(e).__name__}: {e}"[:300])
+            return ""
+
     def _outside_writes(self, r: dict, run_dir: Path) -> None:
         """A run that ended without a valid hand-off: what it touched outside its working directory and
         run dir goes to its outside.json (its task's next run reads it) and, once, to the coordinator
@@ -6946,6 +6966,9 @@ class Daemon:
         # provider at Opus, with no attempt spent, no route cooling and no fault counted for the arm.
         bounce = codearm.bounce_reason(_read_result(run_dir / RESULT_FILE)) \
             if on_route and routed and routed.get(codearm.KEY) and refused != "instructions_missing" else ""
+        if not bounce and on_route and routed and routed.get(codearm.KEY) == "glm" and r["task"] \
+                and r["role"] != "coordinator" and refused != "instructions_missing":
+            bounce = self._policy_bounce(r)   # a run on the arm that changed a policy file hands nothing off
         handed_off = r["role"] != "coordinator" and refused != "instructions_missing" and not bounce and \
             (_read_result(run_dir / RESULT_FILE) or {}).get("status") in HANDOFF_STATES
         if r["role"] != "coordinator" and r["task"] and not handed_off:
@@ -13930,8 +13953,9 @@ class Daemon:
     def _code_arm(self, task: dict, tier: str, picked: dict | None, peek: bool = False) -> dict | None:
         """The code route's arm for this run (codearm.choose), or None (off, not code, or not readable)."""
         try:
-            codearm.log_refusal(self.p.db, self.cfg, lambda m: log(self.p, m))   # once per setting
-            return codearm.choose(self.p.db, self.cfg, task, tier, picked, peek=peek)
+            policy = policyfiles.load(self.p.harness)   # the project's own list; none: no live arm (codearm.refusal)
+            codearm.log_refusal(self.p.db, self.cfg, lambda m: log(self.p, m), policy)   # once per setting
+            return codearm.choose(self.p.db, self.cfg, task, tier, picked, peek=peek, policy=policy)
         except Exception as e:   # the arm must never hold a task back: in doubt, Claude
             log(self.p, f"task {task.get('id')}: code arm not chosen: {type(e).__name__}: {e}"[:300])
             return None

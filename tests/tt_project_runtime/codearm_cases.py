@@ -543,3 +543,135 @@ def test_config_and_doctor_say_why_a_live_share_on_claude_code_is_zero():
     from ttp import cli
     assert "codearm.refusal(p.config())" in inspect.getsource(cli.cmd_config)
     assert "codearm.refusal(p.config())" in inspect.getsource(cli.cmd_doctor)
+
+
+# The policy file list (policyfiles.py): the code that decides what needs an audit record, review, approval, budget or push.
+_PF_LIST = ["src/rt/coordfix.py", "src/rt/daemon.py", "src/rt/*guard.py", "docs/policy/**", "gate.py"]
+
+
+def test_policy_list_loads_comments_and_globs_and_a_missing_list_is_empty(tmp_path):
+    from ttp import policyfiles
+    assert policyfiles.load(tmp_path) == []
+    (tmp_path / policyfiles.FILE).write_text("# a comment\n\nsrc/a.py  # why\n/lead/b.py\nsrc/**/c.py\n")
+    got = policyfiles.load(tmp_path)
+    assert got == ["src/a.py", "lead/b.py", "src/**/c.py"]
+    assert policyfiles.matches(got, "src/a.py") and policyfiles.matches(got, "src/x/y/c.py")
+    assert policyfiles.matches(got, "src/c.py") and not policyfiles.matches(got, "other/src/a.py")
+    assert policyfiles.matches(["gate.py"], "deep/dir/gate.py")   # no slash: any depth
+    assert not policyfiles.matches(["src/*.py"], "src/sub/a.py") and policyfiles.matches(["x.py"], "./x.py")
+    (tmp_path / policyfiles.FILE).write_text("# only comments\n")
+    assert policyfiles.load(tmp_path) == []
+
+
+def test_a_spec_about_a_policy_file_or_term_is_policy_class_and_replay_14s_case_is():
+    from ttp import policyfiles
+    t = lambda title, spec="": {"title": title, "spec": spec}   # noqa: E731
+    # replay 14: a spec about one function of a listed module
+    assert "coordfix" in policyfiles.task_reason(_PF_LIST, t("rewrite coordfix._python_reads", "classify the writes"))
+    assert policyfiles.task_reason(_PF_LIST, t("x", "Where: src/rt/daemon.py, finish_run"))
+    assert policyfiles.task_reason(_PF_LIST, t("x", "edit rt/daemon.py"))   # a path tail
+    assert policyfiles.task_reason(_PF_LIST, t("x", "the file docs/policy/review.md changes"))   # a glob
+    assert policyfiles.task_reason(_PF_LIST, t("x", "touch gate.py"))
+    for term in ("add an audit record for each refusal", "tighten the review gate", "the budget cap check",
+                 "change the push queue batching", "the ask gate wording", "a charter gate for tags"):
+        assert policyfiles.task_reason([], t("x", term)).startswith("policy term"), term
+    # ordinary specs, including the boilerplate every spec carries, are not policy
+    assert not policyfiles.task_reason(_PF_LIST, t("tidy the helper", "rename a variable in util.py; land with `ttp push`; "
+                                                                       "the approved head is pushed. See Daemon docs."))
+    assert not policyfiles.task_reason(_PF_LIST, t("x", "uses os.path.join and json.dumps in helpers.py"))
+
+
+def test_a_policy_class_task_never_takes_the_coin_and_shows_opus_with_the_reason(env):
+    from ttp import codearm
+    p = make(env)
+    cfg = _ca_cfg(glm={**_CA_GLM, "harness": "mini-swe-agent"})
+    ok = _ca_task(p)
+    assert codearm.choose(p.db, cfg, ok, "standard", policy=_PF_LIST)["arm"] == "glm"
+    bad = _ca_task(p, "rewrite coordfix._python_reads so a write is never labelled a read")
+    got = codearm.choose(p.db, cfg, bad, "standard", policy=_PF_LIST)
+    assert got["arm"] == "claude" and got["run"] == "claude" and got["why"].startswith("policy: names coordfix._python_reads")
+    assert codearm.recorded(p.db, bad["id"])["why"].startswith("policy:")   # recorded once, read by every run
+    assert codearm.show_line(codearm.recorded(p.db, bad["id"])).startswith("code route arm: opus (policy: ")
+    assert codearm.show_line({"arm": "claude", "why": "judgment"}) == "code route arm: claude (judgment)"
+    # a task that gets a policy spec after its coin keeps no GLM run
+    later = _ca_task(p)
+    assert codearm.choose(p.db, cfg, later, "standard", policy=_PF_LIST)["run"] == "glm"
+    p.db.x("UPDATE tasks SET spec=? WHERE id=?", ("now also change the review gate", later["id"]))
+    again = codearm.choose(p.db, cfg, p.db.task(later["id"]), "standard", policy=_PF_LIST)
+    assert again["arm"] == "glm" and again["run"] == "claude" and "policy term" in again["why"]
+
+
+def test_a_project_without_a_policy_list_cannot_run_the_arm_live_and_logs_it_once(env):
+    from ttp import codearm
+    p = make(env)
+    cfg = _ca_cfg(glm={**_CA_GLM, "harness": "mini-swe-agent"})
+    assert codearm.settings(cfg, []) is None and codearm.settings(cfg, ["a.py"]) is not None
+    assert codearm.settings(cfg) is not None   # not checked: the daemon and the CLI always pass the list
+    why = codearm.refusal(cfg, [])
+    assert "no policy file list" in why and "policy_files.txt" in why and codearm.refusal(cfg, ["a.py"]) == ""
+    assert codearm.refusal(_ca_cfg(glm_share=0.0), []) == ""   # nothing live, nothing to refuse
+    logged: list = []
+    assert codearm.log_refusal(p.db, cfg, logged.append, []) == why and len(logged) == 1
+    codearm.log_refusal(p.db, cfg, logged.append, [])
+    assert len(logged) == 1
+    assert codearm.choose(p.db, cfg, _ca_task(p), "standard", policy=[]) is None   # every task keeps its route
+
+
+def test_a_diff_that_touches_a_policy_file_is_refused_with_its_tip_kept_and_the_branch_reset(tmp_path):
+    import subprocess
+    from types import SimpleNamespace
+    from ttp import policyfiles, worktree
+
+    def git(*a):
+        return subprocess.run(["git", "-C", str(repo), *a], capture_output=True, text=True, check=True).stdout.strip()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@example.invalid")
+    git("config", "user.name", "t")
+    (repo / "src" / "rt").mkdir(parents=True)
+    (repo / "src/rt/coordfix.py").write_text("a = 1\n")
+    (repo / "src/rt/util.py").write_text("b = 1\n")
+    git("add", "-A")
+    git("commit", "-qm", "base")
+    base = git("rev-parse", "HEAD")
+    git("update-ref", f"{worktree.FORK_POINT_REF}7", base)
+    git("checkout", "-qb", "ttp/t7-x")
+    (repo / "src/rt/coordfix.py").write_text("a = 2\n")
+    (repo / "src/rt/util.py").write_text("b = 2\n")
+    git("commit", "-qam", "glm change")
+    tip = git("rev-parse", "HEAD")
+    git("checkout", "-q", "main")
+    p = SimpleNamespace(root=repo, worktrees=tmp_path / "no-worktrees")
+    task = {"id": 7, "branch": "ttp/t7-x"}
+    changed = {"src/rt/util.py": 2, "src/rt/coordfix.py": 2}
+    assert policyfiles.bounce_diff(p, task, ["src/rt/other.py"], changed) == ""   # none listed: no refusal, no reset
+    assert git("rev-parse", "ttp/t7-x") == tip
+    why = policyfiles.bounce_diff(p, task, _PF_LIST, changed)
+    assert why == "policy files touched: src/rt/coordfix.py"
+    assert git("rev-parse", f"{policyfiles.EVIDENCE_REF}7") == tip   # the GLM tip is kept as evidence
+    assert git("rev-parse", "ttp/t7-x") == base   # the Opus run starts from the fork point, not the GLM commits
+    assert policyfiles.bounce_diff(p, task, _PF_LIST, None) == ""
+
+
+def test_the_daemon_bounces_a_glm_run_that_touched_a_policy_file_and_the_next_run_is_opus(env, monkeypatch):
+    import inspect
+    from types import SimpleNamespace
+    from ttp import daemon, policyfiles, worktree
+    src = inspect.getsource(daemon.Daemon.finish_run)
+    assert 'routed.get(codearm.KEY) == "glm"' in src and "self._policy_bounce(r)" in src
+    p = make(env)
+    (p.harness / policyfiles.FILE).write_text("src/rt/coordfix.py\n")
+    t = _ca_task(p)
+    p.db.x("UPDATE tasks SET branch='ttp/t9-x' WHERE id=?", (t["id"],))
+    seen: list = []
+    monkeypatch.setattr(worktree, "diff_lines", lambda pp, refs, **kw: {"src/rt/coordfix.py": 3, "README.md": 1})
+    monkeypatch.setattr(policyfiles, "bounce_diff", lambda pp, task, pats, ch: seen.append((pats, ch)) or "policy files touched: src/rt/coordfix.py")
+    monkeypatch.setattr(daemon, "log", lambda pp, m: seen.append(m))
+    me = SimpleNamespace(p=p)
+    got = daemon.Daemon._policy_bounce(me, {"id": 1, "task": t["id"]})
+    assert got == "policy files touched: src/rt/coordfix.py" and seen[0][0] == ["src/rt/coordfix.py"]
+    monkeypatch.setattr(worktree, "diff_lines", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no git")))
+    assert daemon.Daemon._policy_bounce(me, {"id": 1, "task": t["id"]}) == ""   # unreadable: review reads it
+    (p.harness / policyfiles.FILE).unlink()
+    assert daemon.Daemon._policy_bounce(me, {"id": 1, "task": t["id"]}) == ""

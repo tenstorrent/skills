@@ -87,11 +87,11 @@ def _labels(task: dict) -> list[str]:
     return [str(x) for x in got] if isinstance(got, list) else []
 
 
-def settings(cfg: dict) -> dict | None:
+def settings(cfg: dict, policy: list | None = None) -> dict | None:
     """The arm's settings, or None when it is off: the code route off (runclass.code_settings), `glm_share` unset
-    or 0, or no `glm.model`."""
+    or 0, no `glm.model`, or an empty policy list (`policy` is the project's policyfiles.load; None: not checked)."""
     from . import runclass
-    if not runclass.code_settings(cfg):
+    if not runclass.code_settings(cfg) or policy is not None and not policy:
         return None
     got = (cfg.get("route") or {}).get("code_sonnet")
     got = got if isinstance(got, dict) else {}
@@ -118,10 +118,11 @@ def harness(cfg: dict) -> str:
     return str(arm.get("harness") or "claude-code")
 
 
-def refusal(cfg: dict) -> str:
+def refusal(cfg: dict, policy: list | None = None) -> str:
     """Why a live `glm_share` > 0 is treated as 0, '' when it is not: its `glm.harness` is not a guarded harness
-    (HARNESSES), so no run takes the arm and every code task keeps its normal route."""
-    from . import runclass
+    (HARNESSES), or the project has no policy list (`policy` empty: fail closed), so no run takes the arm and
+    every code task keeps its normal route."""
+    from . import policyfiles, runclass
     if not runclass.code_settings(cfg):
         return ""
     got = (cfg.get("route") or {}).get("code_sonnet")
@@ -131,17 +132,21 @@ def refusal(cfg: dict) -> str:
         return ""
     harness = str(arm.get("harness") or "claude-code")
     if harness in HARNESSES:
+        if policy is not None and not policy:
+            return (f"route.code_sonnet glm_share is treated as 0: this project has no policy file list "
+                    f"(harness/{policyfiles.FILE}); the arm never takes a task before the project names the "
+                    f"files that decide its audit, review, approval, budget and push rules")
         return ""
     return (f"route.code_sonnet glm_share is treated as 0: glm.harness {harness!r} is not a guarded harness "
             f"({', '.join(HARNESSES) or 'none yet'}); a live arm run needs the side-effect guard in its command layer")
 
 
-def log_refusal(db, cfg: dict, log=None) -> str:
+def log_refusal(db, cfg: dict, log=None, policy: list | None = None) -> str:
     """The refusal's reason, logged once per setting (kv REFUSED_KV keeps the setting it was logged for)."""
-    why = refusal(cfg)
+    why = refusal(cfg, policy)
     if not why:
         return ""
-    mark = setting_mark(cfg)
+    mark = setting_mark(cfg) + ("|no-policy" if "policy file list" in why else "")
     got = db.kv(REFUSED_KV)
     if not (isinstance(got, dict) and got.get("mark") == mark):
         db.set_kv(REFUSED_KV, {"mark": mark, "why": why, "ts": time.time()})
@@ -172,8 +177,10 @@ def recorded(db, task_id) -> dict | None:
 
 
 def show_line(arm: dict) -> str:
-    """`ttp task show`'s line: 'code route arm: glm (coin at share 0.5)'."""
-    return f"code route arm: {arm.get('arm')}" + (f" ({arm['why']})" if arm.get("why") else "")
+    """`ttp task show`'s line: 'code route arm: glm (coin at share 0.5)'; a policy-class task reads 'opus (policy: ...)'."""
+    why = str(arm.get("why") or "")
+    name = "opus" if arm.get("arm") == "claude" and why.startswith("policy:") else arm.get("arm")
+    return f"code route arm: {name}" + (f" ({why})" if why else "")
 
 
 def bounced(db, task_id) -> str:
@@ -187,11 +194,12 @@ def bounced(db, task_id) -> str:
     return ""
 
 
-def stays(db, cfg: dict, task: dict, tier: str, picked: dict | None = None) -> str:
+def stays(db, cfg: dict, task: dict, tier: str, picked: dict | None = None, policy: list | None = None) -> str:
     """Why `task` stays on Claude now ('' when the arm may take it): the Sonnet route's own stays
     (runclass.code_route), a resource, a protected class, a `conclusion:` line, the force line, a user order,
-    an unsupported harness."""
-    from . import route, runclass, urgent
+    a policy-class spec (policyfiles.task_reason against the project's list `policy`, model-free), an unsupported
+    harness."""
+    from . import policyfiles, route, runclass, urgent
     if (task.get("kind") or "") != "code":
         return "not_code"
     if str(tier or task.get("tier") or "standard") != "standard":
@@ -214,17 +222,20 @@ def stays(db, cfg: dict, task: dict, tier: str, picked: dict | None = None) -> s
             return why
     except Exception:   # in doubt, Claude
         return "unchecked"
+    if policy and (why := policyfiles.task_reason(policy, task)):
+        return f"policy: {why}"
     s = settings(cfg) or {}
     if s.get("harness") not in HARNESSES:
         return "harness_unsupported"
     return ""
 
 
-def choose(db, cfg: dict, task: dict | None, tier: str, picked: dict | None = None, peek: bool = False) -> dict | None:
+def choose(db, cfg: dict, task: dict | None, tier: str, picked: dict | None = None, peek: bool = False,
+           policy: list | None = None) -> dict | None:
     """This run's arm: {"arm" (recorded, stable), "run" ("glm", "sonnet", "opus" or "claude": what this run
     takes), "why"}, or None when the arm is off or the task is not code. The first call for a task records its
     arm (unless `peek`); a follow-up takes its lineage's recorded arm."""
-    s = settings(cfg)
+    s = settings(cfg, policy)
     if not s or not task or task.get("kind") != "code" or not task.get("id"):
         return None
     tid = int(task["id"])
@@ -237,7 +248,7 @@ def choose(db, cfg: dict, task: dict | None, tier: str, picked: dict | None = No
             got = {"arm": parent["arm"] if parent else "claude", "why": f"lineage of #{ch[0]['id']}"
                    + ("" if parent else " (no arm)"), "seed": s["seed"], "ts": time.time()}
         else:
-            why = stays(db, cfg, task, tier, picked)
+            why = stays(db, cfg, task, tier, picked, policy)
             arm = "claude" if why else "glm" if coin(tid, s["share"], s["seed"]) else "sonnet"
             got = {"arm": arm, "why": why or f"coin at share {s['share']:g}", "seed": s["seed"], "ts": time.time()}
         if not peek:
@@ -248,7 +259,7 @@ def choose(db, cfg: dict, task: dict | None, tier: str, picked: dict | None = No
             run, why = "opus", f"needs Opus: {b}"[:200]
         elif arm == "glm" and held(db, cfg):
             run, why = "claude", "switched back"
-        elif arm == "glm" and (w := stays(db, cfg, task, "standard" if tier == "light" else tier, picked)):
+        elif arm == "glm" and (w := stays(db, cfg, task, "standard" if tier == "light" else tier, picked, policy)):
             # a light wake is no stay (the arm owns all of a task's runs); a tier-up retry still is
             run, why = "claude", w   # a pin, protected class, late review round or force line added since
     return {"arm": arm, "run": run, "why": why or str(got.get("why") or "")}
