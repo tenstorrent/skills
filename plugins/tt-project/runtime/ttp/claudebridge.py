@@ -173,10 +173,25 @@ _INVOKE = re.compile(r'<invoke\s+name="(?P<name>[^"]*)"\s*>(?P<body>.*?)</invoke
 _PARAM = re.compile(r'<parameter\s+name="([^"]*)"\s*>(.*?)</parameter>', re.DOTALL)
 
 
+def _typed(found: dict, schema: dict) -> dict:
+    """The parameters read from XML tags, as strings, given the types their tool's schema declares."""
+    props = schema.get("properties") or {}
+    out = {}
+    for k, v in found.items():
+        kind = (props.get(k) or {}).get("type")
+        try:
+            out[k] = int(v) if kind == "integer" else float(v) if kind == "number" else \
+                v.strip().lower() == "true" if kind == "boolean" else json.loads(v) if kind in ("array", "object") else v
+        except ValueError:
+            out[k] = v
+    return out
+
+
 def parse_reply(text: str, tools: list[dict]) -> tuple[str, list[dict]]:
     """(text outside the tool blocks, OpenAI tool_calls) of the CLI's reply. A block for an unknown tool
     is left as text for the agent to meet (its format error), never dropped."""
     singles = {(t.get("function") or {}).get("name"): _single_string(t.get("function") or {}) for t in tools or ()}
+    schemas = {(t.get("function") or {}).get("name"): (t.get("function") or {}).get("parameters") or {} for t in tools or ()}
     calls, n = [], 0
 
     def take_invoke(m: re.Match) -> str:
@@ -209,8 +224,11 @@ def parse_reply(text: str, tools: list[dict]) -> tuple[str, list[dict]]:
         else:
             try:
                 args = json.loads(body)
-            except ValueError:
-                return m.group(0)
+            except ValueError:   # the XML form a CLI model falls back to: <parameter name="p">v</parameter>
+                found = {k: v.strip("\n") for k, v in _PARAM.findall(body)}
+                if not found:
+                    return m.group(0)
+                args = _typed(found, schemas.get(name) or {})
         n += 1
         calls.append({"id": f"call_{n}", "type": "function",
                       "function": {"name": name, "arguments": json.dumps(args)}})
@@ -219,6 +237,40 @@ def parse_reply(text: str, tools: list[dict]) -> tuple[str, list[dict]]:
     if not calls:   # no block in our format: the model fell back to the XML form it was trained on
         rest = _INVOKE.sub(take_invoke, rest).strip()
     return rest, calls
+
+
+def stream_chunks(answer: dict) -> list[dict]:
+    """The Chat Completions stream chunks of one whole `answer`: the role, the text, the tool call (its
+    arguments whole), the finish reason, then the usage."""
+    base = {"id": answer["id"], "object": "chat.completion.chunk", "created": answer["created"], "model": answer["model"]}
+    choice = answer["choices"][0]
+    msg = choice["message"]
+    delta = [{"role": "assistant", "content": ""}]
+    if msg.get("content"):
+        delta.append({"content": msg["content"]})
+    for i, c in enumerate(msg.get("tool_calls") or ()):
+        delta.append({"tool_calls": [{"index": i, "id": c["id"], "type": "function", "function": c["function"]}]})
+    chunks = [{**base, "choices": [{"index": 0, "delta": d, "finish_reason": None}]} for d in delta]
+    chunks.append({**base, "choices": [{"index": 0, "delta": {}, "finish_reason": choice["finish_reason"]}]})
+    chunks.append({**base, "choices": [], "usage": answer["usage"]})
+    return chunks
+
+
+def reply_stream(h, answer: dict) -> None:
+    """Send `answer` as a Server-Sent Events stream (chunked), the form a streaming agent asks for."""
+    h.send_response(200)
+    h.send_header("Content-Type", "text/event-stream")
+    h.send_header("Cache-Control", "no-cache")
+    h.send_header("Transfer-Encoding", "chunked")
+    h.end_headers()
+    try:
+        for chunk in [*stream_chunks(answer), "[DONE]"]:
+            data = (f"data: {chunk if isinstance(chunk, str) else json.dumps(chunk)}\n\n").encode()
+            h.wfile.write(b"%x\r\n%s\r\n" % (len(data), data))
+        h.wfile.write(b"0\r\n\r\n")
+        h.wfile.flush()
+    except OSError:
+        pass
 
 
 def result_usage(res: dict) -> dict:
@@ -356,10 +408,13 @@ class ClaudeCliBridge(Bridge):
         if calls:
             msg["tool_calls"] = calls
         total_in = got["input_tokens"] + got["cache_read_input_tokens"] + got["cache_write_tokens"]
-        h._reply(200, {"id": f"chatcmpl-{int(time.time() * 1000)}", "object": "chat.completion",
-                       "created": int(time.time()), "model": self.model,
-                       **({"ttp_dropped_tool_calls": dropped} if dropped else {}),
-                       "choices": [{"index": 0, "message": msg,
-                                    "finish_reason": "tool_calls" if calls else "stop"}],
-                       "usage": {"prompt_tokens": total_in, "completion_tokens": got["output_tokens"],
-                                 "total_tokens": total_in + got["output_tokens"]}})
+        answer = {"id": f"chatcmpl-{int(time.time() * 1000)}", "object": "chat.completion",
+                  "created": int(time.time()), "model": self.model,
+                  **({"ttp_dropped_tool_calls": dropped} if dropped else {}),
+                  "choices": [{"index": 0, "message": msg,
+                               "finish_reason": "tool_calls" if calls else "stop"}],
+                  "usage": {"prompt_tokens": total_in, "completion_tokens": got["output_tokens"],
+                            "total_tokens": total_in + got["output_tokens"]}}
+        if body.get("stream"):   # a streaming agent (Codex through its proxy) reads the answer as chunks
+            return reply_stream(h, answer)
+        h._reply(200, answer)

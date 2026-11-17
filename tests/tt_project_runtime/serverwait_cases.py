@@ -447,3 +447,41 @@ def test_plan_step_an_empty_answer_or_a_hung_planner_is_an_error_not_a_plan(tmp_
     benchrun, ws, tmp, arm, task, row, keep, _ = _plan_step_fixture(tmp_path / "b", monkeypatch, "a plan", hung=True)
     plan, why = benchrun.plan_step(tmp, ws, task, arm, {"isolate": False}, {}, [], row, keep)
     assert plan == "" and "hung" in why
+
+
+def test_claudebridge_a_streaming_request_gets_the_answer_as_chat_completion_chunks():
+    from ttp import claudebridge
+    answer = {"id": "c1", "object": "chat.completion", "created": 1, "model": "m",
+              "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok", "tool_calls": [
+                  {"id": "call_1", "type": "function", "function": {"name": "sh", "arguments": "{\"command\": \"ls\"}"}}]},
+                           "finish_reason": "tool_calls"}],
+              "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}}
+    chunks = claudebridge.stream_chunks(answer)
+    deltas = [c["choices"][0]["delta"] for c in chunks if c["choices"]]
+    assert deltas[0]["role"] == "assistant" and {"content": "ok"} in deltas
+    assert deltas[2]["tool_calls"][0]["function"]["arguments"] == "{\"command\": \"ls\"}"
+    assert chunks[-2]["choices"][0]["finish_reason"] == "tool_calls" and chunks[-1]["usage"]["total_tokens"] == 8
+
+    class H:
+        def __init__(self):
+            self.sent, self.wfile = [], io.BytesIO()
+        def send_response(self, c): self.sent.append(c)
+        def send_header(self, k, v): self.sent.append((k, v))
+        def end_headers(self): pass
+    h = H()
+    claudebridge.reply_stream(h, answer)
+    wire = h.wfile.getvalue()
+    assert h.sent[0] == 200 and ("Content-Type", "text/event-stream") in h.sent
+    assert b"data: [DONE]" in wire and wire.endswith(b"0\r\n\r\n")
+
+
+def test_claudebridge_parse_reply_reads_the_xml_parameter_form_of_a_tool_with_several_parameters():
+    from ttp import claudebridge
+    tools = [{"type": "function", "function": {"name": "run", "parameters": {"type": "object", "properties": {
+        "cmd": {"type": "string"}, "wait_ms": {"type": "integer"}, "tty": {"type": "boolean"}}}}}]
+    reply = 'first\n<tool_call name="run">\n<parameter name="cmd">ls -la</parameter>\n<parameter name="wait_ms">500</parameter>\n<parameter name="tty">true</parameter>\n</tool_call>'
+    text, calls = claudebridge.parse_reply(reply, tools)
+    assert text == "first" and len(calls) == 1
+    assert json.loads(calls[0]["function"]["arguments"]) == {"cmd": "ls -la", "wait_ms": 500, "tty": True}
+    text, calls = claudebridge.parse_reply('<tool_call name="run">not json, no tags</tool_call>', tools)
+    assert calls == [] and "not json" in text
