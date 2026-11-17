@@ -27547,6 +27547,7 @@ DURABLE_EXEMPT = {
     ("cellns_init.py", 'open(path, "wb").close()'): "an empty mount-point file in the namespace's own tmpfs root, gone with the namespace; never state",
     ("bench.py", 'with open(log, "wb") as sink:'): "a validation run's pytest output in its temporary folder, read once for a fault's tail and removed with it",
     ("harborslice.py", 'f = open(d / f"{i}.lock", "w")'): "an empty flock file for one host trial slot; only the lock matters, nothing is written",
+    ("harborslice.py", 'stderr=open(d / "ssh.log", "wb")'): "the docker socket forward's ssh error output in its own temporary folder, read once if it fails to come up and removed with it; never state",
     ("tbcycle.py", 'f = open(path, "a")'): "an empty flock file (state or a model's runner lock); only the lock matters, nothing is written",
     ("bridge_relay.py", 'with os.fdopen(fd, "w") as f:'): "the relay is standard library only (the service runs a copy); its random computer id is written to a temp file and renamed, and a lost one is only made again",
     ("bridge_relay.py", 'os.replace(path + ".tmp", path)'): "the rename of that computer id's temp file; a lost id is only made again",
