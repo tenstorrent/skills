@@ -3868,6 +3868,13 @@ class Daemon:
                 if "effort" in pin:
                     pin["effort"] = raised
                 note = {**(note or {}), "effort_floor": {"model": model, "to": raised}}
+        if role != "coordinator" and task and blindreview.is_blind_task(task) and effort:
+            capped = blindreview.cap_effort(effort)   # a blind grader never runs above blindreview.GRADER_EFFORT
+            if capped != effort:
+                note = {**(note or {}), "effort_capped": {"from": effort, "to": capped, "why": "grader"}}
+                effort = capped
+                if "effort" in pin:
+                    pin["effort"] = capped
         if role != "coordinator" and isinstance((note or {}).get(effortab.KEY), dict):
             note = {**note, effortab.KEY: effortab.ran(self.p.db, note[effortab.KEY], effort)}
         prices = (self.cfg.get("pricing") or {}).get(provider) or {}

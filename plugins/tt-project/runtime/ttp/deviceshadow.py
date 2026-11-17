@@ -6,7 +6,7 @@ Setting (a project and an account key; the project's own value wins; it never to
   {"arms": [{"name": "glm", "model": "<chat model>", "effort": "max", "harness": "mini-swe-agent",
              "provider": "chat"}, ...],                    # one object with a model of its own is one arm
    "version": "", "timeout_s": 1800, "budget_usd": 3, "stall_s": 600, "code_mb": 200, "enabled": true,
-   "second_reviewer": {"model": "<another model family>", "effort": "max", "provider": "chat"}}
+   "second_reviewer": {"model": "<another model family>", "effort": "high", "provider": "chat"}}   # a grader runs at high at most
 Every arm gets the identical setup: the same sealed read-only copy, the same spec, the same tool (the harness),
 no ssh, lock, broker or resource, the same time limit and budget, the same blind review. For each device task
 the live device A/B takes in (deviceab.assign returned a note: either arm, its projects) one shadow run per arm

@@ -68,13 +68,13 @@ ANSWER = re.compile(r'"device_ab_scores"\s*:\s*\{[^{}]*\}')
 
 def second_reviewer(cfg: dict | None) -> dict | None:
     """The second blind reviewer (`route.device_ab_shadow.second_reviewer`: model, effort, provider (default
-    chat)), another model family than the first; None when unset. It applies to the live A/B's reviews and the
+    chat)), another model family than the first, its effort at most high (blindreview.cap_effort); None when unset. It applies to the live A/B's reviews and the
     shadow's, with the same masked inputs and rubric."""
     got = (((cfg or {}).get("route") or {}).get("device_ab_shadow") or {})
     got = got.get("second_reviewer") if isinstance(got, dict) else None
     if not isinstance(got, dict) or not isinstance(got.get("model"), str) or not got["model"].strip():
         return None
-    return {"model": got["model"].strip(), "effort": str(got.get("effort") or "max"),
+    return {"model": got["model"].strip(), "effort": blindreview.cap_effort(got.get("effort")),
             "provider": str(got.get("provider") or "chat")}
 
 

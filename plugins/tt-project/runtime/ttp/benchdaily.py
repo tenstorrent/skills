@@ -24,7 +24,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import bench, benchblind, benchrun, effort, gitmemo, serverhealth
+from . import bench, benchblind, benchrun, blindreview, effort, gitmemo, serverhealth
 from .project import durable_write, open_append
 
 CAP_USD = 40.0       # Claude spend a day (arm runs plus reviews)
@@ -434,13 +434,13 @@ def landed(score: dict, row: dict) -> bool:
 
 
 def second_reviewer(cfg: dict | None) -> dict | None:
-    """The second blind grader (`bench.second_reviewer`: model, effort (default max), provider (default chat)),
+    """The second blind grader (`bench.second_reviewer`: model, effort (default high, never above it), provider (default chat)),
     another model family than the first; None when unset. It grades every bench table's batch (the daily bench, the
     replay) again with the same masked items and rubric."""
     got = ((cfg or {}).get("bench") or {}).get("second_reviewer")
     if not isinstance(got, dict) or not isinstance(got.get("model"), str) or not got["model"].strip():
         return None
-    return {"model": got["model"].strip(), "effort": str(got.get("effort") or "max"),
+    return {"model": got["model"].strip(), "effort": blindreview.cap_effort(got.get("effort")),
             "provider": str(got.get("provider") or "chat")}
 
 

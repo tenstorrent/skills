@@ -509,3 +509,69 @@ def test_a_worker_wake_of_a_code_task_with_a_conclusion_line_starts_at_its_class
     assert run("work", dict(waits, escalated_wake=True)) == [("high", True)], "a non-code wake keeps the floor"
     assert run("code") == [("high", False)], "a first run keeps the floor"
     assert run("review") == [("high", False)], "a review keeps the floor"
+
+
+def test_a_blind_graders_chat_pin_survives_the_floor_and_a_non_grader_still_drops_it(env, monkeypatch):
+    """A blind-review second reviewer (structured BLIND_LABEL, never a title match) keeps provider and model
+    under the conclusion floor; the same pin on an ordinary floor task is still dropped."""
+    from ttp import blindreview, deviceab, tierfloor
+    p, d, started = _floor_daemon(env, monkeypatch)
+    cfg = dict(d.cfg, core_provider="claude")
+    cfg.setdefault("route", {})["device_ab_shadow"] = {
+        "second_reviewer": {"model": "glm-x", "effort": "max", "provider": "chat"}}
+    live = p.db.add_task("Soak", "Run it.", kind="work", tier="standard", origin="coordinator",
+                         labels=["device_ab:glm", "needs_device"])
+    p.db.x("UPDATE tasks SET status='done' WHERE id=?", (live,))
+    new = deviceab.queue_reviews(p.db, {"test": "glm"}, 0.0, second=deviceab.second_reviewer(cfg))
+    grader = next(p.db.task(i) for i in new if p.db.task(i)["provider"] == "chat")
+    assert (grader["model"], grader["effort"]) == ("glm-x", "high"), "created at high, never the configured max"
+    assert blindreview.BLIND_LABEL in grader["labels"] and tierfloor.target(p.db, cfg, grader)
+    assert tierfloor.unpin(p.db, cfg, grader) is None
+    d.cfg = cfg
+    task, why = d._floor_unpin(grader)
+    assert (task["provider"], task["model"], why) == ("chat", "glm-x", "")
+    assert p.db.task(grader["id"])["provider"] == "chat" and p.db.task(grader["id"])["model"] == "glm-x"
+    plain = p.db.add_task("Verdict", "Give the pass/fail call.", tier="standard", origin="coordinator",
+                          provider="chat", model="glm-x")
+    assert tierfloor.unpin(p.db, cfg, p.db.task(plain))["clear"] == {"provider": None, "model": None}
+
+
+def test_a_blind_grader_never_runs_above_high_effort(env, monkeypatch):
+    """A grader configured or queued at max (or xhigh) runs at high; an ordinary task keeps its max; lower
+    efforts stay."""
+    from ttp import blindreview
+    from ttp.daemon import Daemon
+    from ttp.providers import codex as codex_provider
+
+    class Built(Exception):
+        pass
+
+    def build(self, **kw):
+        raise Built(kw["effort"])
+    monkeypatch.setattr(codex_provider.Codex, "build", build)
+    assert [blindreview.cap_effort(e) for e in ("max", "xhigh", "high", "medium", "low", "", None)] == \
+        ["high", "high", "high", "medium", "low", "high", "high"]
+    p = make(env)
+    grader = p.db.add_task("Review", "Score it.", kind="question", tier="standard", origin="daemon",
+                           provider="codex", effort="max", labels=["x_review:1", blindreview.BLIND_LABEL])
+    plain = p.db.add_task("Why?", "x", kind="question", tier="standard", origin="coordinator",
+                          provider="codex", effort="max")
+    d = Daemon(p.base)
+
+    def launch(tid):
+        with pytest.raises(Built) as got:
+            d.start_run("worker", "go", "codex", "standard", str(p.root), task=p.db.task(tid))
+        return str(got.value)
+
+    assert launch(grader) == "high" and launch(plain) == "max"
+    p.db.update_task(grader, effort="medium")
+    assert launch(grader) == "medium"
+
+
+def test_the_bench_and_device_second_reviewers_cap_a_configured_max_at_high(env):
+    from ttp import benchdaily, deviceab
+    for effort, want in (("max", "high"), ("xhigh", "high"), (None, "high"), ("medium", "medium")):
+        sr = {"model": "glm-x", **({"effort": effort} if effort else {})}
+        got = deviceab.second_reviewer({"route": {"device_ab_shadow": {"second_reviewer": sr}}})
+        assert (got["effort"], got["provider"]) == (want, "chat"), effort
+        assert benchdaily.second_reviewer({"bench": {"second_reviewer": sr}})["effort"] == want, effort

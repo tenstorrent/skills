@@ -19,6 +19,7 @@ import secrets
 from pathlib import Path
 
 BLIND_LABEL = "blind_review"
+GRADER_EFFORT = "high"   # the most effort a grader runs at (a grader is not an action: max only costs)
 # Labels of the reviews the daemon queues for device work (deviceab and deviceshadow: first and second
 # reviewer). Each names its reviewer slot and subject, so two of them differ when their labels do, whatever
 # their titles say (supersede.duplicate_of), and they are not the coordinator's new tasks (coordinator.tasks_made).
@@ -123,6 +124,15 @@ def review_slots(task: dict | None) -> set[str]:
 
 def is_blind_task(task: dict | None) -> bool:
     return bool(task) and BLIND_LABEL in _labels(task.get("labels"))
+
+
+def cap_effort(effort: str | None) -> str:
+    """A grader's effort: unset is GRADER_EFFORT, anything above GRADER_EFFORT (xhigh, max) runs at it."""
+    from .failover import EFFORT_RANK
+    e = str(effort or "").strip().lower()
+    if not e:
+        return GRADER_EFFORT
+    return GRADER_EFFORT if e in EFFORT_RANK and EFFORT_RANK.index(e) > EFFORT_RANK.index(GRADER_EFFORT) else e
 
 
 def env(task: dict | None) -> dict[str, str]:

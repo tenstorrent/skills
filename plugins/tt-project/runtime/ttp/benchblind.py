@@ -334,8 +334,10 @@ def provider_ask(provider: str, model: str, effort: str, budget_usd: float, cfg:
     own agent: the CLI asks Anthropic otherwise, and the open model's id never reaches it. `spend`:
     a dict the caller owns, filled per call with the reviewer's measured cost (calls, cost_usd,
     cost_estimated) so a suite can report its review spend."""
+    from .blindreview import cap_effort
     from .providers import get_provider
     prov = get_provider(provider).use(model)
+    effort = cap_effort(effort) if effort else effort   # a grader never runs above high
 
     def note(u) -> None:
         if spend is not None:

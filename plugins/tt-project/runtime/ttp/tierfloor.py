@@ -241,9 +241,12 @@ def unpin(db, cfg: dict, task: dict) -> dict | None:
     {"model": None}) when it pins the chat provider (route.TO) or its provider's light-tier model, with
     `why`; None otherwise. It then runs on the core provider at its tier's model."""
     from . import route
+    from . import blindreview
     prov, model = str(task.get("provider") or ""), str(task.get("model") or "")
     if not (prov or model) or not target(db, cfg, task):
         return None
+    if blindreview.is_blind_task(task):
+        return None   # a blind grader's model is its design (a second opinion from another family), not a cheap pin
     core = cfg.get("core_provider") or "claude"
     if prov == route.TO and core != route.TO:
         return {"clear": {"provider": None, "model": None}, "why": f"pinned to the {route.TO} provider"}
