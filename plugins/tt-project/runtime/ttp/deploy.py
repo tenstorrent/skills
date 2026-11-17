@@ -84,6 +84,14 @@ def restart_wait(p) -> float:
         return RESTART_WAIT_S
 
 
+def registered_here(name: str, registry: dict | None = None) -> bool:
+    """Whether `name` is a project registered on this machine now. A deploy check follows only those: a scratch
+    project that was never registered, or was removed (`ttp remove`), has no deploy to verify and never alerts."""
+    reg = project.load_registry().get("projects") or {} if registry is None else registry
+    e = reg.get(name)
+    return isinstance(e, dict) and e.get("host") in (None, project.hostname())
+
+
 def _probe(rec: dict, now: float) -> dict:
     return overview.deploy_status(rec["name"], rec["entry"], rec["target"], rec.get("commit"), now,
                                   project.hostname(), allow_newer=True)
@@ -124,7 +132,9 @@ def assess(rec: dict, row: dict, now: float, where=None) -> tuple[str, str, str]
 
 def _failing(db, recs: list, now: float) -> bool:
     takeovers = db.kv(TAKEOVERS) or {}
-    return any(rec and not rec.get("closed") and _judge(None, rec, _probe(rec, now), dict(takeovers.get(rec["name"]) or {}),
+    reg = project.load_registry().get("projects") or {}
+    return any(rec and not rec.get("closed") and registered_here(rec["name"], reg)
+               and _judge(None, rec, _probe(rec, now), dict(takeovers.get(rec["name"]) or {}),
                                                         now)[0] == "failed"
                for rec in recs)
 
@@ -435,12 +445,15 @@ def record(p, report: dict, now: float | None = None) -> dict:
     now = time.time() if now is None else now
     registry = project.load_registry().get("projects") or {}
     wait = restart_wait(p)
-    pending, rows, failed = [], [], []
+    pending, rows, failed, dropped = [], [], [], 0
     with p.db.tx():
         checks = p.db.kv(CHECKS) or {}
         takeovers = p.db.kv(TAKEOVERS) or {}
         for row in report["projects"]:
             row = dict(row)
+            if not registered_here(row["name"], registry):
+                dropped += 1   # named but not registered here (a scratch or removed project): no check, no alert
+                continue
             key = condition_key(row["name"], report["target"])
             old = checks.get(key) or {}
             owner = row.get("owner") if row.get("settling") else row.get("merge_owner")
@@ -506,7 +519,7 @@ def record(p, report: dict, now: float | None = None) -> dict:
                                   "commit": report.get("commit"), "at": now})
         for name, text in pending:   # one live line per project, updated in place by a newer release
             _post_pending(p, name, text, now)
-    failed = any(r["outcome"] == "failed" for r in rows) or (not rows and report["rc"] != 0)
+    failed = any(r["outcome"] == "failed" for r in rows) or (not rows and not dropped and report["rc"] != 0)
     return {**report, "projects": rows, "rc": int(failed)}
 
 
@@ -526,8 +539,16 @@ def tick(p, alert, now: float | None = None) -> None:
         for name, t in takeovers.items():
             _reap(name, t, now, p)
         failing: list = []
+        registry = project.load_registry().get("projects") or {}
         for key, rec in checks.items():
-            if rec.get("closed") or now < float(rec.get("next_probe") or 0):
+            if rec.get("closed"):
+                continue
+            if not registered_here(rec["name"], registry):   # removed or never registered: close quietly
+                _settle(rec, "removed", now)
+                rec["closed"] = now
+                changed = True
+                continue
+            if now < float(rec.get("next_probe") or 0):
                 continue
             rec["next_probe"] = now + PROBE_S
             changed = True

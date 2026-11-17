@@ -96,3 +96,48 @@ def test_remove_is_listed_among_the_admin_commands_and_a_glm_run_cannot_run_it()
     from ttp import cli, glmguard
     assert "remove" in dict(cli.COMMAND_GROUPS)["admin"]
     assert "remove" not in glmguard.SUBS_ALLOWED
+
+
+def test_a_deploy_check_follows_only_projects_registered_here_and_never_alerts_for_a_scratch_one(env, tmp_path):
+    """A scratch project that was never registered gets no check and no alert, even when named; a registered
+    project behind the release still alerts."""
+    from ttp import alerts, deploy, overview
+    p = make(env)
+    _deploy_lib("0.5.0")
+    _, db = _deploy_project(tmp_path, "alpha", "0.5.0", running="0.4.9")
+    now = time.time()
+    got = deploy.record(p, overview.deployed(names=["ghost"]), now)
+    assert got["rc"] == 0 and got["projects"] == [], got
+    assert not (p.db.kv(deploy.CHECKS) or {}) and not p.db.q("SELECT key FROM alerts"), "a ghost raised something"
+    pages = []
+    deploy.tick(p, lambda key, text, severity, **_: pages.append(key), now + 10 * deploy.GRACE_S)
+    assert pages == []
+    # a registered one behind the release is still judged and alerted
+    db.set_kv("daemon", {"pid": 0, "host": "testhost"})
+    deploy.record(p, overview.deployed(names=["alpha"]), now)
+    deploy.tick(p, lambda key, text, severity, **_: pages.append(key), now + 10 * deploy.GRACE_S)
+    assert pages == ["deploy-behind:alpha"], pages
+    assert alerts.holds(p.db, "deploy-behind:alpha", now, now + 10 * deploy.GRACE_S)
+    db.close()
+
+
+def test_an_open_deploy_alert_closes_when_its_project_is_removed(env, tmp_path):
+    from ttp import alerts, deploy, overview, project
+    p = make(env)
+    _deploy_lib("0.5.0")
+    _, db = _deploy_project(tmp_path, "scratch", "0.5.0", running="0.4.9")
+    db.set_kv("daemon", {"pid": 0, "host": "testhost"})
+    now = time.time()
+    deploy.record(p, overview.deployed(names=["scratch"]), now)
+    deploy.tick(p, lambda *a, **k: None, now + 10 * deploy.GRACE_S)
+    t = now + 10 * deploy.GRACE_S
+    assert deploy.holds_behind(p.db, "scratch", t) and alerts.holds(p.db, "deploy-behind:scratch", now, t)
+    project.unregister("scratch")
+    t += deploy.PROBE_S
+    pages = []
+    deploy.tick(p, lambda key, text, severity, **_: pages.append(key), t)
+    recs = [r for r in (p.db.kv(deploy.CHECKS) or {}).values() if r.get("name") == "scratch"]
+    assert recs and all(r.get("closed") and r.get("outcome") == "removed" for r in recs), recs
+    assert pages == [] and not deploy.holds_behind(p.db, "scratch", t)
+    assert not alerts.holds(p.db, "deploy-behind:scratch", now, t), "its alert must clear"
+    db.close()
