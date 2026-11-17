@@ -485,6 +485,78 @@ def test_a_sentence_naming_no_task_id_or_host_is_never_marked(env):
         assert _oh_sent(p)[-1] == text and onhost.MARK not in _oh_sent(p)[-1]
 
 
+# Finished results naming the soak task's machines but none of its title words.
+_OH_RESULTS = ("The benchmark on box-a finished: 412 tokens/s median, all 32 chips passed.",
+               "box-b completed the rerun at 14:05 with no errors.",
+               "Both runs are done on box-c; results are in the table.")
+
+
+def _oh_soak(p, labels=()):
+    return p.db.add_task("fan curve soak across three boxes", "s", kind="work", status="queued", reply_chat="c1",
+                         labels=["resource:box-a", "resource:box-b", "resource:box-c", *labels])
+
+
+def test_a_held_chat_task_never_marks_finished_results_naming_its_machines(env):
+    """Upstream note ffc0d10f20780a94: a user-paused queued task naming three machines tied every finished
+    result naming one of them to itself by resource label alone, and the reply went out marked as planned."""
+    from ttp import coordinator as coord, onhost
+    from ttp.db import PAUSED_RESOURCES_KEY
+    p = make(env)
+    held = {"paused": lambda: p.db.set_kv(PAUSED_RESOURCES_KEY, {"box-a": {"reason": "user hold", "since": 1,
+                                                                           "by": "user"}}),
+            "blocked": lambda: p.db.x("UPDATE tasks SET status='blocked' WHERE id=?", (tid,)),
+            "start_after": lambda: p.db.x("UPDATE tasks SET labels=? WHERE id=?", (json.dumps(
+                [*json.loads(p.db.task(tid)["labels"]), f"start_after:{time.time() + 7200}"]), tid)),
+            "start_when": lambda: p.db.x("UPDATE tasks SET labels=? WHERE id=?", (json.dumps(
+                [*json.loads(p.db.task(tid)["labels"]), "start_when:test -e /nonexistent-x"]), tid))}
+    for turn, (how, hold) in enumerate(held.items(), 1):
+        p.db.set_kv(PAUSED_RESOURCES_KEY, {})
+        tid = _oh_soak(p)
+        hold()
+        assert not [t for t in onhost.scope(p, "x", "c1") if t.get("id") == tid], how
+        # Even a claim sharing its title words: the held task cannot be under way, so no chat reply ties to it.
+        for text in (*_OH_RESULTS, "The soak on box-a finished: 412 tokens/s.", "Running the fan soak on box-a now."):
+            coord.apply(p, [{"type": "reply", "text": text, "chat": "c1"}], turn=turn)
+            assert _oh_sent(p)[-1] == text, (how, _oh_sent(p)[-1])
+        p.db.x("UPDATE tasks SET status='cancelled' WHERE id=?", (tid,))
+    # A start_after already passed holds nothing: the task is covered again.
+    p.db.set_kv(PAUSED_RESOURCES_KEY, {})
+    tid = _oh_soak(p, [f"start_after:{time.time() - 60}"])
+    assert [t for t in onhost.scope(p, "x", "c1") if t.get("id") == tid]
+
+
+def test_a_chat_task_is_tied_by_its_id_or_resource_and_title_never_by_resource_alone(env):
+    from ttp import coordinator as coord, onhost
+    p = make(env)
+    tid = _oh_soak(p)
+    # A machine name alone: finished results and claims about other work on that machine stay as written.
+    for turn, text in enumerate((*_OH_RESULTS, "Draining the check queue on box-a now."), 1):
+        coord.apply(p, [{"type": "reply", "text": text, "chat": "c1"}], turn=turn)
+        assert _oh_sent(p)[-1] == text, _oh_sent(p)[-1]
+    # Its #id still ties it: the guard's purpose stays.
+    coord.apply(p, [{"type": "reply", "text": f"Running #{tid} on box-a now.", "chat": "c1"}], turn=10)
+    got = _oh_sent(p)[-1]
+    assert got.startswith(f"{onhost.MARK} Running #{tid} on box-a now.") and f"#{tid}: queued for a worker" in got, got
+    # So does its resource together with a distinctive word of its title.
+    coord.apply(p, [{"type": "reply", "text": "Soaking box-b now, fan curve first.", "chat": "c1"}], turn=11)
+    got = _oh_sent(p)[-1]
+    assert got.startswith(f"{onhost.MARK} Soaking box-b now") and f"#{tid}: queued for a worker" in got, got
+    # A reply's own task (owners) is still tied by its resource alone: the reply speaks for it.
+    coord.apply(p, [{"type": "reply", "text": "Draining box-c now.", "chat": "c1", "owners": [tid]}], turn=12)
+    assert _oh_sent(p)[-1].startswith(f"{onhost.MARK} Draining box-c now."), _oh_sent(p)[-1]
+
+
+def test_onhost_title_words_skip_plain_words_and_resource_names():
+    from ttp import onhost
+    t = {"title": "rerun the fan-curve soak on box-a", "labels": json.dumps(["resource:box-a"]), "via_chat": True}
+    assert onhost._title_words(t) == {"curv", "soak"}
+    assert not onhost._about("The rerun on box-a finished.", t)   # 'rerun' is a plain word
+    assert not onhost._about("Soaking the boards now.", t)        # its title word without its resource
+    assert onhost._about("Soaking box-a now.", t)
+    assert onhost._about("Soaking box-a now.", {**t, "via_chat": False}) and \
+        onhost._about("Draining box-a now.", {**t, "via_chat": False})
+
+
 def test_a_queued_task_whose_detached_driver_is_live_counts_as_under_way(env, monkeypatch):
     from ttp import coordinator as coord, onhost
     p = make(env)

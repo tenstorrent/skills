@@ -26,7 +26,10 @@ batch adds or updates. When one of them has not started on its host (or was stop
 still run) and a sentence claims an action is under way or done ('now', '...ing it', 'started',
 'stopped', 'only X runs') about it, that sentence is kept but marked planned, not started, and the honest
 status of each such task is appended. A claim is about a task only when it names its #id or its resource
-or host; any other sentence states a fact about other work and stays as written. A task with a detached
+or host; for an open task tied only by answering the chat, its resource together with a distinctive word
+of its title (a machine name alone is shared by many tasks and finished results), and a held one (blocked,
+deferred, on a paused resource) is not covered at all. Any other sentence states a fact about other work
+and stays as written. A task with a detached
 job still live on its host (a queued task's driver too) is under way. Inside a block meant to be posted
 as written (segments(): a fenced code block, text between '---' lines, a '>' quote) nothing is inserted:
 the marker goes on its own line after the block, quoting the sentence. Nothing else in the message changes
@@ -432,15 +435,50 @@ def passes(p, probe: str, timeout: float = CLAIM_PROBE_S) -> bool:
 def scope(p, text: str, chat: str | None, owners=(), batch_ids=(), pending: list | None = None) -> list[dict]:
     """The tasks a reply speaks for: named (#id), its owners (`owners`), this batch's (`batch_ids`) and
     `pending` (host task_add actions of this batch not added yet). Open tasks answering `chat` are covered
-    too, marked `via_chat`: guard() ties a sentence to one of those only by its #id or its resource."""
+    too, marked `via_chat`, unless they are held: blocked, deferred by a start_after or start_when not yet
+    passed, or on a paused resource (they cannot start, so no reply describes them as under way). guard()
+    ties a sentence to a via_chat task only by its #id, or by its resource together with a distinctive word
+    of its title (_about)."""
     ids = {int(x) for x in re.findall(r"#(\d{1,9})\b", text or "")}
     ids |= {int(x) for x in owners or [] if str(x).isdigit()} | {int(x) for x in batch_ids or []}
     out = [t for i in sorted(ids) if (t := p.db.task(i))]
     if chat:
-        out += [dict(t, via_chat=True) for r in p.db.q("SELECT id FROM tasks WHERE reply_chat=? AND status NOT IN "
-                                                       "('done','failed','cancelled','exhausted') ORDER BY id", (chat,))
-                if r["id"] not in ids and (t := p.db.task(r["id"]))]
+        rows = p.db.q("SELECT id FROM tasks WHERE reply_chat=? AND status NOT IN "
+                      "('done','failed','cancelled','exhausted') ORDER BY id", (chat,))
+        more = [t for r in rows if r["id"] not in ids and (t := p.db.task(r["id"]))]
+        if more:
+            try:
+                cfg = p.config()
+            except Exception:
+                cfg = {}
+            now, paused = time.time(), _paused(p, cfg)
+            out += [dict(t, via_chat=True) for t in more if not _held(t, now, paused, cfg)]
     return out + list(pending or [])
+
+
+def _paused(p, cfg: dict) -> set[str]:
+    """The project's paused resources, by name and as canonical locks (empty when they cannot be read)."""
+    from . import locks
+    try:
+        got = set(p.db.paused_resources())
+        return got | {locks.canonical(cfg, r) for r in got}
+    except Exception:
+        return set()
+
+
+def _held(task: dict, now: float, paused: set[str], cfg: dict | None = None) -> bool:
+    """Whether a chat's open task cannot start now: blocked, deferred (a start_when not yet passed, or a
+    start_after still ahead) or naming a paused resource."""
+    from .db import deferral
+    if task.get("status") == "blocked":
+        return True
+    d = deferral(task)
+    if d.get("when") or (d.get("after") or 0) > now:
+        return True
+    try:
+        return bool(paused and set(resources(task, cfg)) & paused)
+    except Exception:
+        return False
 
 
 def _names(sentence: str, task: dict) -> bool:
@@ -450,6 +488,48 @@ def _names(sentence: str, task: dict) -> bool:
             if n and re.search(rf"(?i)(?<![\w-]){re.escape(n)}(?![\w-])", sentence):
                 return True
     return False
+
+
+# Title words that name no particular task: a sentence sharing only these ties it to none.
+_PLAIN = {"about", "after", "again", "also", "before", "check", "checks", "code", "fix", "from", "into", "make",
+          "more", "need", "once", "only", "over", "rerun", "result", "results", "review", "same", "some", "task",
+          "tasks", "test", "tests", "that", "their", "them", "then", "they", "this", "upstream", "what", "when",
+          "where", "which", "with", "work", "your", "while", "every", "each", "both", "other", "until", "still",
+          "across", "three", "four", "five", "machine", "machines", "host", "hosts", "boxes", "node", "nodes",
+          "device", "devices", "chip", "chips", "board", "boards", "server", "servers", "cluster"}
+
+
+def _stem(w: str) -> str:
+    for suf in ("ing", "ed", "es", "s"):
+        if w.endswith(suf) and len(w) - len(suf) >= 3:
+            w = w[:-len(suf)]
+            break
+    return w[:-1] if w.endswith("e") and len(w) > 3 else w
+
+
+def _title_words(task: dict) -> set[str]:
+    """A task title's distinctive words, stemmed: 4+ letters, not a plain word and not one of its resources."""
+    own = _own(task)
+    return {_stem(w) for w in re.findall(r"[a-z][a-z0-9]+", str(task.get("title") or "").lower())
+            if len(w) >= 4 and w not in _PLAIN and _stem(w) not in own}
+
+
+def _own(task: dict) -> set[str]:
+    """Stemmed name parts of a task's resources ('box-a' gives 'box' and 'a'): never title words."""
+    return {_stem(x) for r in resources(task) for x in re.findall(r"[a-z0-9]+", r.lower())}
+
+
+def _about(sentence: str, task: dict) -> bool:
+    """Whether a sentence naming no #id is about a covered task. A chat's open task (via_chat) needs its
+    resource and a distinctive word of its title: a resource label alone names a machine many tasks and
+    finished results share, not this task. Other covered tasks (the reply's owners, this batch's) by their
+    resource or host."""
+    if not _names(sentence, task):
+        return False
+    if not task.get("via_chat"):
+        return True
+    said = {_stem(w) for w in re.findall(r"[a-z][a-z0-9]+", sentence.lower())} - _own(task)
+    return bool(_title_words(task) & said)
 
 
 _FENCE = re.compile(r"^\s*(`{3,}|~{3,})")
@@ -556,12 +636,12 @@ def guard(p, text: str, tasks: list[dict], now: float | None = None, proofs=(), 
                 continue
             named = {int(x) for x in re.findall(r"#(\d{1,9})\b", parts[k])}
             # A sentence is about an unstarted task only when it names its #id, or (naming no #id) that
-            # task's resource or host. Any other claim sentence is left as written: it states a fact about
-            # other work, whatever its subject.
+            # task's resource or host (a chat's open task: with a word of its title too, _about). Any other
+            # claim sentence is left as written: it states a fact about other work, whatever its subject.
             if named:
                 hit = {j for j in pool if waiting[j][0].get("id") in named}
             else:
-                hit = {j for j in pool if _names(parts[k], waiting[j][0])}
+                hit = {j for j in pool if _about(parts[k], waiting[j][0])}
             if not hit:
                 continue
             # A reply claim whose expect probe passes now shows it done: posted as written.
