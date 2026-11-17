@@ -36,6 +36,7 @@ from . import __version__, poll_s  # noqa: E402
 from .db import CHANGES_NEEDED, SUPERSEDED, chat_floor, task_outcome
 from . import outbox, redact
 from .devq import unmask_devices
+from .detach import VERDICT_SH as _DETACH_VERDICT_SH
 from . import chatgone, checksqueue, checkwait, hoststate, runnerenv, scriptwatch, setupfault, sshcmd, syntaxfault, timefmt, workerloss
 from . import schedule as sched
 from .project import here as project_here
@@ -10395,7 +10396,8 @@ s=$(sed "s/.*) //" /proc/$$/stat 2>/dev/null | cut -d" " -f20)
 [ -n "$s" ] || s=$(ps -o lstart= -p $$ 2>/dev/null | tr -s " " _)
 echo "$(date +%s) $s" >"$p.start"
 echo $$ >"$p.pid.tmp"; mv "$p.pid.tmp" "$p.pid"
-"$@" >"$p.log" 2>&1 </dev/null; c=$?; echo $c >"$p.rc.tmp"; mv "$p.rc.tmp" "$p.rc"' sh "$p" "$@" \
+o=$p.log
+"$@" >"$o" 2>&1 </dev/null; c=$?; ''' + _DETACH_VERDICT_SH + r'''echo $c >"$p.rc.tmp"; mv "$p.rc.tmp" "$p.rc"' sh "$p" "$@" \
   >/dev/null 2>&1 </dev/null &
 i=0; while [ ! -s "$p.pid" ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done
 [ -s "$p.pid" ] || { echo "nopid $p"; exit 5; }

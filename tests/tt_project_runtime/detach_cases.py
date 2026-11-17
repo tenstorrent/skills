@@ -3664,3 +3664,87 @@ def test_detach_check_finds_a_bare_job_name_in_this_run_then_in_the_run_folders(
     r = _ttp_run(p, "detach", "--check", "nosuchjob", env={"TTP_RUN_DIR": str(other)})
     assert r.returncode == 2 and "no job recorded at" in r.stdout, (r.stdout, r.stderr)
     assert not list(p.runs.glob("*/*.lost")) and not list(p.root.glob("*.lost"))
+
+
+def _run_wrapped(tmp_path, cmd, **env):
+    """Run cmd through the local detach wrapper and return (recorded rc, log text)."""
+    from ttp import detach, locks
+    rc = tmp_path / "run" / "job.rc"
+    rc.parent.mkdir(parents=True)
+    lock = locks.try_take([locks.job_lock(rc)], "detached job job", "why")
+    try:
+        detach.start(rc, rc.with_suffix(".log"), cmd, str(tmp_path), {**os.environ, **env}, lock)
+    finally:
+        lock.close()
+    assert _wait_for_path(rc)
+    detach.reap_children()
+    return rc.read_text().strip(), rc.with_suffix(".log").read_text()
+
+
+_FAILED_RUN = 'printf "..F\\nFAILED tests/t.py::a\\n=== 3 failed, 10 passed in 1.20s ===\\n"; exit 1'
+
+
+def test_a_failing_test_command_piped_into_tail_is_not_recorded_as_a_pass(tmp_path):
+    """The dogfood cut that moved its release tag past 3 failed tests: `pytest ... | tail -30` exits with
+    tail's 0, so the wrapper reads the log's last test summary and records exit 1, saying why."""
+    rc, log = _run_wrapped(tmp_path, ["sh", "-c", f"({_FAILED_RUN}) 2>&1 | tail -n 30"])
+    assert rc == "1"
+    assert "3 failed, 10 passed" in log and "recorded exit 1" in log
+
+
+def test_a_passing_or_cut_pipeline_keeps_its_exit_0(tmp_path):
+    rc, log = _run_wrapped(tmp_path, ["sh", "-c", 'printf "....\\n12 passed, 1 skipped in 0.50s\\n" | tail -n 5'])
+    assert rc == "0" and "recorded exit" not in log
+    # a `| head` that cut the output before any summary: nothing to read, nothing changed
+    rc, _ = _run_wrapped(tmp_path / "b", ["sh", "-c", 'yes "line" | head -n 3'])
+    assert rc == "0"
+
+
+def test_the_last_test_summary_decides_and_a_failing_exit_is_kept(tmp_path):
+    # a rerun that passed after an earlier failed round: the last summary wins
+    rc, _ = _run_wrapped(tmp_path, ["sh", "-c", 'printf "1 failed in 1.0s\\n2 passed in 1.0s\\n"'])
+    assert rc == "0"
+    rc, log = _run_wrapped(tmp_path / "u", ["sh", "-c", 'printf "Ran 4 tests in 0.1s\\n\\nFAILED (failures=2)\\n" | cat'])
+    assert rc == "1" and "recorded exit 1" in log
+    rc, log = _run_wrapped(tmp_path / "e", ["sh", "-c", 'printf "1 passed, 2 errors in 3.1s\\n"'])
+    assert rc == "1"
+    rc, log = _run_wrapped(tmp_path / "x", ["sh", "-c", "echo 2 passed in 0.1s; exit 7"])
+    assert rc == "7" and "recorded exit" not in log
+
+
+def test_the_rc_only_opt_out_and_ttp_commands_keep_their_exit_code(tmp_path):
+    rc, _ = _run_wrapped(tmp_path, ["sh", "-c", f"({_FAILED_RUN}) | tail -n 3"], TTP_DETACH_RC_ONLY="1")
+    assert rc == "0"
+    # `ttp checks` passes a head whose only failures also fail on its base: its exit code is its verdict
+    fake = tmp_path / "bin" / "ttp"
+    fake.parent.mkdir()
+    fake.write_text('#!/bin/sh\nprintf "2 failed, 9 passed in 1.0s\\n"\n')
+    fake.chmod(0o755)
+    rc, _ = _run_wrapped(tmp_path / "t", [str(fake), "checks"])
+    assert rc == "0"
+
+
+def test_a_failing_test_pipeline_fails_its_check_and_skips_its_on_pass(tmp_path):
+    """What an on_pass reads (`ttp detach --check`, the job's .rc) sees the failure."""
+    from ttp import detach
+    _run_wrapped(tmp_path, ["sh", "-c", f"({_FAILED_RUN}) | tail -n 30"])
+    assert detach.state(tmp_path / "run" / "job.rc") == ("ended", "1")
+
+
+def test_the_remote_wrapper_reads_the_test_summary_too(tmp_path):
+    from ttp import cli
+    e = dict(os.environ)
+    if not shutil.which("setsid"):
+        fake = tmp_path / "fakebin"
+        fake.mkdir()
+        (fake / "setsid").write_text("#!/bin/sh\nexec \"$@\"\n")
+        (fake / "setsid").chmod(0o755)
+        e["PATH"] = f"{fake}{os.pathsep}{e['PATH']}"
+    rdir = tmp_path / "remote"
+    for name, script, want in (("bad", f"({_FAILED_RUN}) | tail -n 30", "1"),
+                               ("good", 'echo "5 passed in 0.2s" | tail -n 1', "0")):
+        out = subprocess.run(["sh", "-c", cli._REMOTE_START, "sh", str(rdir), name, "sh", "-c", script], env=e,
+                             capture_output=True, text=True, timeout=30).stdout
+        assert out.startswith("started "), out
+        assert _wait_for_path(rdir / f"{name}.rc")
+        assert (rdir / f"{name}.rc").read_text().strip() == want, (rdir / f"{name}.log").read_text()

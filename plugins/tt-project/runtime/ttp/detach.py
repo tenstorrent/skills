@@ -4,7 +4,8 @@
 
 A job writes <name>.log, then <name>.rc with its exit code, in the run's folder. Its wrapper writes
 <name>.started the moment it runs and holds <name>.lock (locks.job_lock) while any of its processes
-lives, so a job gone without an .rc is told apart from one still running.
+lives, so a job gone without an .rc is told apart from one still running. An exit 0 whose log's last test
+summary reports failures (a test command piped into tail) is recorded as 1 (VERDICT_SH).
 
 A sandbox that runs each command in a PID namespace or a cgroup of its own can end every process the
 command started once it returns, a new session or not: the job would die before its first line. As
@@ -305,9 +306,24 @@ _SECRET_ENV = re.compile(r"TOKEN|SECRET|PASSW|CREDENTIAL|API_?KEY|_KEY$|AUTH", r
 # <name>.started (the wrapper's pid) and <name>.rc are written by rename, so a reader never sees one empty.
 # With TTP_ACTIVITY_LOG and TTP_ACTIVITY_ID set (unset before the job runs), the job's end is appended
 # to that project's activity log (activity.py).
+# A job's exit 0 is its verdict, but a test command piped into tail or head (`bash -c 'pytest ... | tail
+# -30'`) exits with the last command's 0 however its tests went, and an on_pass reading the .rc would act
+# on failed tests. So once the command exited 0, the wrapper reads the last test summary in the log's
+# last 200 lines (pytest's "N failed, M passed in Xs", unittest's "FAILED (failures=N)" or "OK"): one
+# that reports failures or errors makes the recorded exit 1, with a line in the log saying why. A failing
+# exit code is never changed, no pipeline is run differently (a `| head` that ends on SIGPIPE behaves as
+# before), a `ttp` command keeps its own verdict (`ttp checks` passes a head whose only failures also
+# fail on its base), and TTP_DETACH_RC_ONLY=1 in the job's environment keeps the exit code as it is.
+# Uses $o (the log), $c (the exit code) and $1 (the command's first word); no single quotes, so the
+# remote wrapper can embed it (cli._REMOTE_START).
+VERDICT_SH = (r'if [ "$c" = 0 ] && [ -z "${TTP_DETACH_RC_ONLY-}" ]; then case ${1##*/} in ttp) ;; *) '
+              r'v=$(tail -n 200 "$o" 2>/dev/null | grep -aE "[0-9]+ (passed|failed|errors?|skipped|deselected|'
+              r'xfailed|xpassed|warnings?)[, ].*in [0-9.]+s|^FAILED \((failures|errors)=|^OK$|^OK \(" | tail -n 1); '
+              r'case $v in *[0-9]" failed"*|*[0-9]" error"*|"FAILED ("*) echo "ttp detach: the command exited 0 '
+              r'but its last test summary reports failures ($v); recorded exit 1" >>"$o"; c=1 ;; esac ;; esac; fi; ')
 WRAPPER = ('o="$1" r="$2" s="$3" t="$4" k="$5"; shift 5; a=${TTP_ACTIVITY_LOG-} i=${TTP_ACTIVITY_ID-}; '
            'unset TTP_ACTIVITY_LOG TTP_ACTIVITY_ID; echo $$ >"$s.tmp"; mv "$s.tmp" "$s"; '
-           '"$@" >"$o" 2>&1 </dev/null; c=$?; '
+           '"$@" >"$o" 2>&1 </dev/null; c=$?; ' + VERDICT_SH +
            'rm -rf "$t" "$k"; echo $c >"$r.tmp"; mv "$r.tmp" "$r"; [ -z "$a" ] || '
            'printf \'{"end": %s, "ev": "job_end", "id": "%s", "rc": %s}\\n\' "$(date +%s)" "$i" "$c" >>"$a" 2>/dev/null')
 _TMP_VARS = ("TMPDIR", "TMP", "TEMP")

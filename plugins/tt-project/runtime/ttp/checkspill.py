@@ -2429,6 +2429,7 @@ def _known_good_start(p, cfg: dict | None, alias: str, rc: Path) -> tuple[str, s
         for f in (rc, rc.with_suffix(".log"), detach.lost(rc), detach.started(rc)):
             f.unlink(missing_ok=True)
         env = {k: v for k, v in project.command_env(p).items() if k not in ("TTP_LOCKS_HELD", "TTP_LOCKS_SHARED")}
+        env["TTP_DETACH_RC_ONLY"] = "1"  # the checks' own exit codes are the verdict
         pid = detach.start(rc, rc.with_suffix(".log"), ["sh", "-c", script], str(repo), env, lock)
     finally:
         lock.close()
