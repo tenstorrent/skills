@@ -86,9 +86,7 @@ def _load(name: str) -> dict:
 
 def _save(name: str, doc: dict) -> None:
     path = _path(name)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(doc, indent=1, sort_keys=True))
-    os.replace(tmp, path)
+    project.durable_write(path, json.dumps(doc, indent=1, sort_keys=True))
 
 
 def _num(v: Any, default: float) -> float:
@@ -465,9 +463,7 @@ def stop_file(p: Any, name: str) -> Path:
 def request_stop(p: Any, name: str, why: str = "") -> Path:
     f = stop_file(p, name)
     f.parent.mkdir(parents=True, exist_ok=True)
-    tmp = f.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"at": time.time(), "why": why or "stop requested"}) + "\n")
-    os.replace(tmp, f)
+    project.durable_write(f, json.dumps({"at": time.time(), "why": why or "stop requested"}) + "\n")
     return f
 
 

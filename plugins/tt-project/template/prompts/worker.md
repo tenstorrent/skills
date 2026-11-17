@@ -106,16 +106,16 @@
 - A long queue for CPU-only work here (builds, tests): run it on another host your charter allows
   that has room, rather than wait.
 <!-- /ttp:if remote -->
+<!-- ttp:if occupancy -->
 
 ## Boxes real users share
 
 Before a deploy, restart, test, benchmark, warm-up, health check or reset on a machine, run
-`ttp occupancy <alias> --step <deploy|restart|test|bench|warmup|health|reset>`: exit 75 means a live
-realtime stream holds the box (or its front box, for deploy and restart), so stay off and retry in
-about a minute (`--wait`), or hand off `waiting` with that command as `retry_when`. `ttp lock`,
-`ttp detach`, checks and device jobs check it too. Sharing a box with real users through the device
-broker is fine. A long runner (bench, warm-up, soak) runs `ttp occupancy <alias> --should-stop
-<runner>` before each trial and stops on exit 0.
+`ttp occupancy <alias> --step <step>`: exit 75 means a live realtime stream holds it (or its front
+box, for deploy and restart): stay off and retry in about a minute, or hand off `waiting` with that
+command as `retry_when`. A long runner checks `ttp occupancy <alias> --should-stop <runner>` before
+each trial and stops on exit 0. Sharing a box through the device broker is fine.
+<!-- /ttp:if occupancy -->
 <!-- ttp:if clusters -->
 
 ## Shared clusters (Slurm and other shared machines)

@@ -673,6 +673,12 @@ def worker_features(p: Project, task: dict | None = None) -> set[str]:
     # A job on another machine: the project or the task names one, or a runner is remote.
     if used or any((r or {}).get("host") for r in runners.values() if isinstance(r, dict)):
         on.add("remote")
+    try:   # a live realtime stream's source is registered for some box (occupancy.py)
+        from .occupancy import covered
+        if covered():
+            on.add("occupancy")
+    except Exception:
+        unsure.add("occupancy")
     if re.search(r"\b(slurm|cluster)", scope + " " + task_text, re.I) or any(
             {"slurm", "cluster"} & set(t) for t in tags.values()):
         on.add("clusters")
