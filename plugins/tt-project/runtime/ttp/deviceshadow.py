@@ -49,7 +49,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from . import blindreview, deviceab
+from . import blindreview, deviceab, gitmemo
 
 KEY = "device_ab_shadow"                  # under route
 KV_PREFIX = "device_shadow:"              # device_shadow:<task id>:<arm> -> the run's record
@@ -144,8 +144,8 @@ def _tar_into(data: bytes, dest: Path) -> int:
 def _commit(repo: Path, ref: str) -> str:
     """The commit `ref` names in `repo`, or ""."""
     try:
-        r = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "-q", f"{ref}^{{commit}}"],
-                           capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+        r = gitmemo.run(["git", "-C", str(repo), "rev-parse", "--verify", "-q", f"{ref}^{{commit}}"],
+                        capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
         return ""
     return "" if r.returncode else r.stdout.strip()
@@ -157,8 +157,8 @@ SHA_RE = re.compile(r"\b(?=[0-9]*[a-f])[0-9a-f]{7,40}\b")   # a commit a spec na
 
 def _git_out(repo: Path, *args: str) -> tuple[int, str]:
     try:
-        r = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=30,
-                           stdin=subprocess.DEVNULL)
+        r = gitmemo.run(["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=30,
+                        stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
         return 1, ""
     return r.returncode, r.stdout.strip()
