@@ -234,7 +234,7 @@ Posts and drafts people other than the user read (Slack, Jira, GitHub, email) an
 <!-- /ttp:if !drafts_during_freeze -->
 - A PR leaves draft ONLY on the user's explicit yes, never on your judgment, a policy or a default. In order, one step at a time:
   1. an independent `review` task passes the change;
-  2. pr-watch reports it clean: a `pr_findings` event (CI failing, bot comments open) has one
+  2. pr-watch reports it clean: a `pr_findings` event (any open draft on our branches) has one
      owner: an open task on the PR, or a fix task the daemon queues. Queue a code task on the PR's branch only if the event says none owns them; wait for `pr_clean`;
   3. ask_user (blocking `review`) with the PR's URL in the text;
   4. on the user's clear yes, `pr_approve` it with their words in `quote` (it covers the head commit pr-watch read before the yes; new commits need a fresh yes);

@@ -591,6 +591,11 @@ REVIEW_FAILURE_KEY, REVIEW_FAILURE_KINDS = "review_failure", ("check_only", "sub
 PRECHECK_TAIL_LINES, PRECHECK_KILLED_RCS = 20, (124, 137, 143)
 # A PR whose open findings outlive the task that delivered it gets this many fix tasks from the daemon.
 PR_FIX_ROUNDS = 2
+# What a PR's finishing task brings it to: a draft at the finish line, ready for human review.
+PR_FINISH_LINE = ("Take it to the finish line for human review: CI green (a check that also fails on the base "
+                  "branch does not hold it), every bot comment and review thread fixed or answered, and the "
+                  "description current with the head (what it changes, how it was tested). Never mark it ready, "
+                  "merge it or request reviewers. Anything you post on GitHub ends with [authored by AI].")
 PROBE_EVERY_S = 180     # how often a waiting task's `retry_when` (or a deferred one's `start_when`) probe runs
 NOT_YET_RCS = (1, 75, 255)   # probe exits meaning "not yet": 1, EX_TEMPFAIL (a busy `ttp lock`), ssh unreachable
 JOB_FAILED = "detached job failed"   # what a `ttp detach --check` exit detach.FAILED_RC found (Daemon._job_failed)
@@ -10395,6 +10400,14 @@ class Daemon:
                     spec += f"\n\nResponsibilities: {line}." + responsibilities.review_advice(db)
             except Exception as e:   # nor must the inventory
                 log(self.p, f"health coverage line failed: {type(e).__name__}: {e}")
+        if s["name"] == "daily-review":
+            try:
+                from . import watchers as _pw
+                if line := _pw.purview_line(db):
+                    spec += (f"\n\n{line}. Every open draft is taken to ready for human review; a stalled one "
+                             f"gets one finishing task on its branch.")
+            except Exception as e:   # nor must the purview record
+                log(self.p, f"github purview line failed: {type(e).__name__}: {e}")
         if s["name"] == "daily-review":
             try:
                 line = pushq.target_line(db, timefmt.home(self.p))
@@ -21706,7 +21719,8 @@ class Daemon:
         works on its branch owns them. With none, and the task that delivered it done, the daemon
         queues one code task on the PR's branch to fix or answer each, so findings never outlive their
         owner. None, nothing queued, when that task did not finish done, PR_FIX_ROUNDS such tasks did
-        not clear them or the task cap is reached: the coordinator then decides."""
+        not clear them or the task cap is reached: the coordinator then decides. A PR no task of the
+        project opened (pr-watch's purview: `rec["purview"]`) gets that one task as well, with no source."""
         db = self.p.db
         branch = str(rec.get("branch") or "")
         for t in db.q("SELECT * FROM tasks WHERE kind='code' AND status NOT IN (?,?,?) ORDER BY id",
@@ -21715,15 +21729,17 @@ class Daemon:
                     or (branch and t["branch"] == branch) or f'"pr_fix:{key}"' in (t["labels"] or ""):
                 return t, False
         src = db.task(int(rec.get("task") or 0))
-        if not src or src["status"] != "done":
+        if (not src or src["status"] != "done") and not (src is None and rec.get("purview")):
             return None, False
         # The delivering task's open review, or a fix or re-review of its stack, comes first: a PR fix
         # queued beside it would be a second owner (and a failed review queues its own fix).
-        if stack := self._open_stack(src["id"]):
+        if src and (stack := self._open_stack(src["id"])):
             return stack[0], False
         rounds = db.one("SELECT COUNT(*) n FROM tasks WHERE labels LIKE ?", (f'%"pr_fix:{key}"%',))["n"]
         if rounds >= PR_FIX_ROUNDS or coord.next_task_slot(db, coord.task_cap(self.cfg)) is not None:
             return None, False
+        if src is None:
+            return self._purview_fix(key, rec, what, branch)
         branch = branch or src["branch"] or ""
         try:   # a branch another worktree holds cannot be checked out again: then build on its head
             held = branch and f"branch refs/heads/{branch}" in worktree._git(
@@ -21746,6 +21762,7 @@ class Daemon:
             f"Pull request {url} still has open findings after task #{src['id']} ({src['title']}) finished: {what}.",
             "This task owns them now; no other task does. Fix or answer each bot review comment on the PR "
             "(answers end with the hidden line <!-- ttp -->) and get CI green.",
+            PR_FINISH_LINE,
             f"{on}. {deliver}",
             f"Put {url} in the hand-off's `pr`."])
         with db.tx():
@@ -21756,6 +21773,45 @@ class Daemon:
                               labels=[f"continues:{src['id']}", f"pr_fix:{key}", untrusted.LABEL]   # PR comments, CI logs
                               + ([f"pr_branch:{branch}"] if branch else []), **pin_of(src))
         log(self.p, f"{key}: open findings outlived task {src['id']}; queued fix #{fid}")
+        return db.task(fid), True
+
+    def _purview_fix(self, key: str, rec: dict, what: str, branch: str) -> tuple[dict | None, bool]:
+        """pr_findings_owner's one finishing task for a PR no task of the project opened (`rec["purview"]`)."""
+        db, url = self.p.db, rec.get("url") or key
+        pb = str((self.cfg.get("delivery") or {}).get("push_branch") or "").strip()
+        on_push = bool(branch) and (pb == branch or pb.endswith("/" + branch))
+        if on_push:
+            deliver = (f"The PR's branch {branch} is this project's push branch: land the fix there as any change "
+                       f"lands (review, then the push queue or `ttp push`); never push to it by hand.")
+        elif own_push(self.cfg) == "off":
+            deliver = (f"Own pushes are off in this project (delivery.own_push): build on the PR's branch {branch} "
+                       f"and {push.own_landing(self.cfg)}.")
+        else:
+            deliver = (f"This task's branch is the PR's branch {branch}: build on it and publish with "
+                       f"`ttp push --own --detach` (fast-forward only).")
+        spec = "\n".join([
+            f"Pull request {url} ({rec.get('title') or 'no title'}) is in this project's GitHub purview (its head is "
+            f"a branch the project works on) and no task of the project opened it. It is short of ready for "
+            f"human review: {what}.",
+            "This task owns that now; no other task does. Fix or answer each failing check, bot comment and "
+            "review thread (answers end with the hidden line <!-- ttp -->).",
+            PR_FINISH_LINE,
+            "A person opened this PR: never rewrite their text. Keep the harness's part of the description in "
+            "one marked section at its end, between the lines <!-- ttp:purview --> and <!-- /ttp:purview -->, "
+            "added if missing and rewritten in place after that (one current place, the person's words "
+            "untouched, no comment trail); it ends with [authored by AI].",
+            deliver, f"Put {url} in the hand-off's `pr`."])
+        rounds = db.one("SELECT COUNT(*) n FROM tasks WHERE labels LIKE ?", (f'%"pr_fix:{key}"%',))["n"]
+        if rounds >= PR_FIX_ROUNDS or coord.next_task_slot(db, coord.task_cap(self.cfg)) is not None:
+            return None, False
+        with db.tx():
+            fid = db.add_task(f"Finish PR: {rec.get('title') or key}"[:200], spec, kind="code",
+                              tier="standard", priority=2, origin="daemon",
+                              budget_usd=float(self.cfg["budget"]["task_default_usd"].get("standard", 8.0)),
+                              branch=branch if branch and not on_push and own_push(self.cfg) != "off" else None,
+                              labels=[f"pr_fix:{key}", untrusted.LABEL]
+                              + ([f"pr_branch:{branch}"] if branch and not on_push else []))
+        log(self.p, f"{key}: purview PR short of ready with no owner; queued #{fid}")
         return db.task(fid), True
 
     def _open_stack(self, root: int) -> list[dict]:

@@ -124,6 +124,181 @@ def _one_per_pr(rows: list[dict], seen: dict) -> list[dict]:
     return [t for t in out.values() if (seen.get(t["pr_url"]) or {}).get("state") not in DONE_STATES]
 
 
+
+# GitHub purview: open PRs the project answers for though none of its tasks opened them, found from
+# structured records only (never charter wording): PRs whose head is the push branch or a branch its tasks
+# work on, in the repos it pushes to or delivers PRs in, and the PRs or repos `watchers.purview_extra` names
+# (shipped empty). Found at most hourly; each is read while the project is active on it (an open task on
+# its branch, its head moved in ACTIVE_S, CI pending) and at least once a day.
+PURVIEW_KEY = "pr_purview"          # {"at": ts, "prs": {url: {"branch", "author", "since", "read"}}}
+BODY_KEY = "pr_bodies"              # {pr_key: {"hash": body hash, "head": head sha it was current for}}
+PURVIEW_EVERY_S = 3600
+ACTIVE_S = 6 * 3600
+BODY_GRACE_S = 3600                 # a head moved this long ago with the description unchanged: stale
+_REPO_RE = re.compile(r"github\.com[:/]([\w.-]+/[\w.-]+?)(?:\.git)?/?$")
+
+
+def _purview_scope(daemon) -> tuple[set[str], set[str], set[str]]:
+    """(repos owner/name, head branches, PR URLs) the purview covers."""
+    db, cfg = daemon.p.db, getattr(daemon, "cfg", None) or {}
+    repos, branches, urls = set(), set(), set()
+    try:
+        from .channeltag import push_remote
+        remote, branch = push_remote(["git", "-C", str(daemon.p.base)], cfg)
+        if branch:
+            branches.add(branch)
+            import subprocess
+            out = subprocess.run(["git", "-C", str(daemon.p.base), "remote", "get-url", remote],
+                                 capture_output=True, text=True, timeout=10).stdout.strip()
+            if m := _REPO_RE.search(out):
+                repos.add(m.group(1))
+    except Exception:   # noqa: BLE001 - no push remote: the other records still count
+        pass
+    since = time.time() - 30 * DAY
+    for t in db.q("SELECT branch, labels, pr_url FROM tasks WHERE created>? OR status NOT IN "
+                  "('done','failed','cancelled')", (since,)):
+        if t["branch"]:
+            branches.add(t["branch"])
+        for lab in json.loads(t["labels"] or "[]") if (t["labels"] or "").startswith("[") else []:
+            if isinstance(lab, str) and lab.startswith("pr_branch:") and lab[10:].strip():
+                branches.add(lab[10:].strip())
+        if (k := prguard.pr_key(t["pr_url"] or "")) and "#" in k:
+            repos.add(k.split("#", 1)[0])
+    for x in (cfg.get("watchers") or {}).get("purview_extra") or []:
+        x = str(x).strip()
+        if prguard.is_pr(x):
+            urls.add(x)
+        elif re.fullmatch(r"[\w.-]+/[\w.-]+", x):
+            repos.add(x)
+    return repos, branches, urls
+
+
+def _discover(daemon, now: float) -> dict:
+    """The purview record, refreshed when older than PURVIEW_EVERY_S: one `gh pr list` per repo."""
+    db = daemon.p.db
+    rec = dict(db.kv(PURVIEW_KEY, {}) or {})
+    prs = dict(rec.get("prs") or {})
+    if now - float(rec.get("at") or 0) < PURVIEW_EVERY_S:
+        return rec
+    repos, branches, urls = _purview_scope(daemon)
+    found, ok = {}, True
+    for repo in sorted(repos) if branches else ():   # no branch of its own: nothing to look for
+        rows = _gh(["pr", "list", "--repo", repo, "--state", "open", "--limit", "100",
+                    "--json", "url,headRefName,author,isDraft"], str(daemon.p.root))
+        if not isinstance(rows, list):
+            ok = False
+            continue
+        for r in rows:
+            if r.get("url") and r.get("headRefName") in branches:
+                found[r["url"]] = {"branch": r["headRefName"], "author": (r.get("author") or {}).get("login")}
+    for u in urls:
+        found.setdefault(u, {})
+    if not ok:   # a repo gh could not list keeps its known PRs
+        found = {**{u: v for u, v in prs.items() if u not in found}, **found}
+    rec = {"at": now, "prs": {u: {**prs.get(u, {"since": now}), **v} for u, v in found.items()}}
+    db.set_kv(PURVIEW_KEY, rec)
+    return rec
+
+
+def _purview_rows(daemon, rows: list[dict], findings: dict, heads: dict, now: float) -> list[dict]:
+    """Purview PRs no task names, as watch rows (id None), each when due: active or unread for a day."""
+    db = daemon.p.db
+    named = {prguard.pr_key(t["pr_url"]) for t in rows}
+    prs = (_discover(daemon, now).get("prs") or {})
+    busy = {t["branch"] for t in db.q("SELECT branch FROM tasks WHERE branch IS NOT NULL AND status NOT IN "
+                                      "('done','failed','cancelled')")}
+    out = []
+    for url, v in sorted(prs.items()):
+        key = prguard.pr_key(url)
+        if not key or key in named:
+            continue
+        active = (v.get("branch") in busy or (findings.get(key) or {}).get("pending")
+                  or now - float((heads.get(key) or {}).get("seen") or 0) < ACTIVE_S)
+        if active or now - float(v.get("read") or 0) >= DAY:
+            out.append({"id": None, "pr_url": url, "title": "", "status": "open", "purview": True})
+    return out
+
+
+def _mark_read(db, urls: list[str], now: float) -> None:
+    rec = dict(db.kv(PURVIEW_KEY, {}) or {})
+    prs = rec.get("prs") or {}
+    for u in urls:
+        if u in prs:
+            prs[u]["read"] = now
+    if urls:
+        db.set_kv(PURVIEW_KEY, {**rec, "prs": prs})
+
+
+def body_stale(pr: dict, bodies: dict, heads: dict, now: float) -> str:
+    """Why the PR's description is behind its head, "" when current: empty, or the head moved (over
+    BODY_GRACE_S ago) since the description last changed. First sight: GitHub's dates decide."""
+    key, head = prguard.pr_key(pr.get("url") or ""), pr.get("headRefOid")
+    body = str(pr.get("body") or "")
+    if not key or not head or pr.get("body") is None:
+        return ""   # not read: nothing known
+    h = hashlib.sha256(body.encode()).hexdigest()[:16]
+    old = bodies.get(key)
+    if old is None:
+        edited = pr.get("lastEditedAt") or pr.get("createdAt") or ""
+        behind = bool(pr.get("headDate") and edited and pr["headDate"] > edited)
+        bodies[key] = old = {"hash": h, "head": None if behind else head}
+    elif old.get("hash") != h:
+        bodies[key] = old = {"hash": h, "head": head}
+    if not body.strip():
+        return "description empty"
+    if old.get("head") == head:
+        return ""
+    moved = float((heads.get(key) or {}).get("seen") or 0)
+    if old.get("head") and now - moved < BODY_GRACE_S:
+        return ""
+    return "description older than the head (commits since it was last edited)"
+
+
+def human_open(data: dict | None) -> list[str]:
+    """URLs of review threads a person started that are unresolved, not outdated and not answered by a
+    run (a reply carrying the hidden line <!-- ttp -->)."""
+    pr = (((data or {}).get("data") or {}).get("repository") or {}).get("pullRequest") or {}
+    out = []
+    for th in (pr.get("reviewThreads") or {}).get("nodes") or []:
+        cs = (th.get("comments") or {}).get("nodes") or []
+        if (cs and not _is_bot(cs[0].get("author")) and not th.get("isResolved") and not th.get("isOutdated")
+                and "<!-- ttp -->" not in str(cs[-1].get("body") or "")):
+            out.append(cs[0].get("url") or "?")
+    return out
+
+
+BASE_CHECKS_KEY, BASE_CHECKS_S = "pr_base_checks", 1800
+
+
+def _base_failing(pr: dict, cache: dict, cwd: str, now: float) -> set[str]:
+    """Checks failing on the PR's base branch tip, read at most once per repo and base every BASE_CHECKS_S
+    (`cache` is BASE_CHECKS_KEY's value, saved by the caller)."""
+    key, base = prguard.pr_key(pr.get("url") or ""), pr.get("baseRefName")
+    if not key or not base:
+        return set()
+    ref = f"{key.split('#', 1)[0]}@{base}"
+    hit = cache.get(ref) or {}
+    if now - float(hit.get("at") or 0) >= BASE_CHECKS_S:
+        got = _gh(["api", f"repos/{ref.split('@')[0]}/commits/{base}/check-runs?per_page=100", "--jq",
+                   '[.check_runs[] | select(.conclusion=="failure" or .conclusion=="timed_out") | .name]'], cwd)
+        cache[ref] = hit = {"at": now, "failing": sorted(got) if isinstance(got, list) else []}
+    return set(hit.get("failing") or ())
+
+
+def purview_line(db) -> str:
+    """The daily review's 'GitHub purview' line: open drafts by finish-line state, the oldest stalled."""
+    recs = [r for r in (db.kv(prguard.FINDINGS_KEY, {}) or {}).values() if r.get("draft")]
+    people = len((db.kv(PURVIEW_KEY, {}) or {}).get("prs") or {})
+    if not recs and not people:
+        return ""
+    n = {s: sum(r.get("finish") == s for r in recs) for s in ("ready", "finishing", "stalled")}
+    asked = sum(r.get("finish") == "ready" and str(r.get("notified") or "").startswith("clean") for r in recs)
+    stalled = [float(r["stalled_since"]) for r in recs if r.get("finish") == "stalled" and r.get("stalled_since")]
+    oldest = f" (oldest {(time.time() - min(stalled)) / 3600:.0f} h)" if stalled else ""
+    return (f"GitHub purview: {len(recs)} open draft PRs: {n['ready']} ready ({asked} review asked), "
+            f"{n['finishing']} finishing, {n['stalled']} stalled{oldest}; {people} PRs no task opened watched")
+
+
 def _sized_deadline(daemon, payload: dict) -> float:
     """The seconds the prs watcher's PRs take at PR_READ_EST_S each, pr_workers at once, capped at
     PR_DEADLINE_AUTO_MAX_S (0 when they cannot be counted)."""
@@ -251,11 +426,12 @@ _CONNS = {
     "comments": ("comments(first:100){" + _PAGE + "nodes{" + _AUTHOR + "body createdAt url}}", ("comments",)),
     "reviews": ("reviews(first:100){" + _PAGE + "nodes{id " + _AUTHOR + "state body submittedAt url "
                 "comments(first:50){totalCount nodes{" + _AUTHOR + "body}}}}", ("reviews",)),
-    "checks": ("commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){" + _PAGE
+    "checks": ("commits(last:1){nodes{commit{committedDate statusCheckRollup{contexts(first:100){" + _PAGE
                + "nodes{__typename ... on CheckRun{name status conclusion} ... on StatusContext{context state}}}}}}}",
                ("commits", "nodes", -1, "commit", "statusCheckRollup", "contexts")),
 }
-_PR_SEL = ("state isDraft mergeable reviewDecision url title headRefOid headRefName " + _AUTHOR
+_PR_SEL = ("state isDraft mergeable reviewDecision url title headRefOid headRefName baseRefName body lastEditedAt "
+           "createdAt " + _AUTHOR
            + "".join(sel for sel, _ in _CONNS.values())
            + "reviewThreads(first:100){nodes{isResolved isOutdated path comments(first:50){nodes{" + _AUTHOR
            + "body url}}}}")
@@ -298,7 +474,10 @@ def _views(node: dict, nodes: dict) -> tuple[dict, dict]:
             "reviewDecision": node.get("reviewDecision") or "", "statusCheckRollup": nodes["checks"],
             "comments": nodes["comments"], "reviews": [{k: v for k, v in r.items() if k != "comments"} for r in reviews],
             "url": node.get("url"), "title": node.get("title"), "author": node.get("author"),
-            "headRefOid": node.get("headRefOid"), "headRefName": node.get("headRefName")}
+            "headRefOid": node.get("headRefOid"), "headRefName": node.get("headRefName"),
+            "baseRefName": node.get("baseRefName"), "body": node.get("body"),
+            "lastEditedAt": node.get("lastEditedAt"), "createdAt": node.get("createdAt"),
+            "headDate": _at(node, ("commits", "nodes", -1, "commit", "committedDate"))}
     data = {"data": {"repository": {"pullRequest": {
         "comments": {"nodes": nodes["comments"][-100:]}, "reviews": {"nodes": reviews[-100:]},
         "reviewThreads": node.get("reviewThreads") or {"nodes": []}}}}}
@@ -372,7 +551,10 @@ class PrCycle:
         if got is None:
             return True, None
         view, data = json.loads(json.dumps(got))   # each consumer its own copy
-        return True, data if what == "data" else {f: view.get(f) for f in what}
+        if what == "data":
+            return True, data
+        # The description's dates gh pr view cannot give ride along with its body (body_stale reads them).
+        return True, {f: view.get(f) for f in [*what, *(("lastEditedAt", "headDate") if "body" in what else ())]}
 
     def _read(self, batch: dict, cwd: str, timeout: float, run) -> None:
         """The batched query within `timeout`, first pages only: a PR with more is left to ask gh itself."""
@@ -487,7 +669,8 @@ def pr_signature(pr: dict) -> dict:
             "failing": failing[:10], "activity": activity, "n_human": len(human)}
 
 
-PR_FIELDS = "state,isDraft,mergeable,reviewDecision,statusCheckRollup,comments,reviews,url,title,author,headRefOid,headRefName"
+PR_FIELDS = ("state,isDraft,mergeable,reviewDecision,statusCheckRollup,comments,reviews,url,title,author,headRefOid,"
+             "headRefName,baseRefName,body,createdAt")
 
 
 def _read_pr(t: dict, root: str, end: float, run_end: float | None) -> dict:
@@ -613,19 +796,27 @@ def watch_prs(daemon, payload: dict | None = None) -> str:
     findings = dict(db.kv(prguard.FINDINGS_KEY, {}) or {})
     heads = dict(db.kv(prguard.HEADS_KEY, {}) or {})
     drafts = dict(db.kv(prguard.DRAFT_SEEN_KEY, {}) or {})
+    bodies = dict(db.kv(BODY_KEY, {}) or {})
+    base_cache = dict(db.kv(BASE_CHECKS_KEY, {}) or {})
     changed = 0
     # Each PR once, however many tasks name it; merged and closed PRs are no longer read. The least
     # recently checked go first, so a run cut short is continued by the next and a PR that keeps timing
     # out waits behind the others.
     watch = _one_per_pr(rows, seen)
-    tried = {u: n for u, n in (db.kv(PR_TRIED_KEY, {}) or {}).items() if u in {t["pr_url"] for t in watch}}
-    stint = max(tried.values(), default=0) + 1
-    order = sorted(watch, key=lambda t: tried.get(t["pr_url"], 0))
-    t0 = _now()
     # gh cannot read and no delivery.gh_route alias answers its calls (a queue for the workstation is no
     # answer now): public PRs are read anonymously (ghanon)
     via = ghroute.route(getattr(daemon, "cfg", None), str(daemon.p.base))
     logged_out = ghauth.down() is not None and via in ("", ghroute.WORKSTATION)
+    if not logged_out:
+        try:
+            watch += [t for t in _purview_rows(daemon, rows, findings, heads, time.time())
+                      if (seen.get(t["pr_url"]) or {}).get("state") not in DONE_STATES]
+        except Exception as e:   # noqa: BLE001 - the purview never stops the task PRs' reads
+            _log(daemon, f"pr-watch: purview not read: {type(e).__name__}: {e}")
+    tried = {u: n for u, n in (db.kv(PR_TRIED_KEY, {}) or {}).items() if u in {t["pr_url"] for t in watch}}
+    stint = max(tried.values(), default=0) + 1
+    order = sorted(watch, key=lambda t: tried.get(t["pr_url"], 0))
+    t0 = _now()
     auth_token = _AUTH.set(auth := [])
     results, spawned = {}, 0
     try:
@@ -668,9 +859,15 @@ def watch_prs(daemon, payload: dict | None = None) -> str:
                        for r in pr.get("reviews") or [])
         pr = _with_review_comments(pr, data)
         sig = pr_signature(pr)
-        _check_unapproved(daemon, t, pr, sig, before, flagged, drafts)
-        _check_findings(daemon, t, pr, sig, findings, data)
+        if not t.get("purview"):   # leaving draft on a PR no task opened is its author's doing
+            _check_unapproved(daemon, t, pr, sig, before, flagged, drafts)
+        stale = body_stale(pr, bodies, heads, time.time()) if sig.get("draft") is True else ""
+        failing_base = _base_failing(pr, base_cache, root, time.time()) if sig["failing"] else set()
+        _check_findings(daemon, t, pr, sig, findings, data, stale=stale, failing_base=failing_base)
         old = seen.get(t["pr_url"])
+        if t.get("purview"):   # only its findings are news: no pr_changed for a PR no task opened
+            seen[t["pr_url"]] = sig
+            continue
         if old and sig["mergeable"] == "UNKNOWN" and old.get("mergeable") not in (None, "UNKNOWN"):
             sig = {**sig, "mergeable": old["mergeable"]}   # GitHub is recomputing: keep the last known value
         if old and wrappers and data is None:
@@ -707,6 +904,11 @@ def watch_prs(daemon, payload: dict | None = None) -> str:
     db.set_kv(prguard.UNAPPROVED_KEY, flagged)
     db.set_kv(prguard.FINDINGS_KEY, findings)
     db.set_kv(prguard.HEADS_KEY, heads)
+    db.set_kv(BODY_KEY, {k: v for k, v in bodies.items() if k in findings})
+    db.set_kv(BASE_CHECKS_KEY, {k: v for k, v in base_cache.items()
+                                if time.time() - float(v.get("at") or 0) < BASE_CHECKS_S})
+    _mark_read(db, [t["pr_url"] for t in order if t.get("purview") and (results.get(t["pr_url"]) or {}).get("pr")],
+               time.time())
     keys = {prguard.pr_key(t["pr_url"]) for t in rows}
     db.set_kv(prguard.DRAFT_SEEN_KEY, {k: v for k, v in drafts.items() if k in keys})
     db.set_kv(PR_TRIED_KEY, tried)
@@ -860,10 +1062,15 @@ def bot_open(data: dict) -> list[str]:
     return [u for _, u in bot_findings(data)]
 
 
-def _check_findings(daemon, t: dict, pr: dict, sig: dict, findings: dict, data: dict | None) -> None:
+def _check_findings(daemon, t: dict, pr: dict, sig: dict, findings: dict, data: dict | None, *,
+                    stale: str = "", failing_base: set | None = None) -> None:
     """Record an open PR's findings and tell the coordinator when they change: CI failing or bot
     review comments open is work (a fix task); CI green with every bot comment fixed or answered is
-    when it may ask the user for a review. `data` is the PR's BOT_QUERY answer (None: unread)."""
+    when it may ask the user for a review. `data` is the PR's BOT_QUERY answer (None: unread).
+    A draft's finish line also needs every person's review thread answered and its description
+    current (`stale`: why not); a check failing on its base too (`failing_base`) does not hold it.
+    Each draft is `ready`, `finishing` (an open task owns its findings) or `stalled` (none does: one
+    high event once it stays so a day)."""
     db, url = daemon.p.db, pr.get("url") or t["pr_url"]
     key = prguard.pr_key(url)
     if not key:
@@ -877,55 +1084,90 @@ def _check_findings(daemon, t: dict, pr: dict, sig: dict, findings: dict, data: 
         bots, bot_keys = [u for _, u in found], sorted(k for k, _ in found)
     else:   # unread: keep what was known
         bots, bot_keys = old.get("bot", []), old.get("bot_keys", sorted(old.get("bot", [])))
+    draft = sig.get("draft") is True
+    humans = (human_open(data) if data is not None else old.get("human", [])) if draft else []
+    base = set(failing_base or ())
     rec = {"task": t["id"], "url": url, "branch": pr.get("headRefName") or old.get("branch"),
-           "failing": sig["failing"], "pending": sig["checks"] == "pending",
+           "failing": [c for c in sig["failing"] if c not in base], "pending": sig["checks"] == "pending",
+           "base_failing": sorted(base & set(sig["failing"])),
            "bot_open": len(bots), "bot": bots[:10], "bot_keys": bot_keys,
-           "notified": old.get("notified"), "owner": old.get("owner")}
+           "notified": old.get("notified"), "owner": old.get("owner"),
+           "draft": draft, "stale": stale, "human": humans[:10], "finish": old.get("finish"),
+           "stalled_since": old.get("stalled_since"), "paged": old.get("paged"),
+           "title": pr.get("title") or old.get("title") or ""}
+    if t.get("purview"):
+        rec["purview"] = True
     findings[key] = rec
     if rec["pending"]:
         return
-    dirty = bool(rec["failing"] or rec["bot_open"])
+    dirty = bool(rec["failing"] or rec["bot_open"] or stale or humans)
     if not dirty and data is None:
         return   # bot comments unread: never clean on that, the next real read decides (notified kept)
     what = "; ".join([*(["CI failing: " + ", ".join(rec["failing"])] if rec["failing"] else []),
                       *([f"{len(bots)} bot review comment(s) neither fixed nor answered: "
-                         + ", ".join(bots[:5])] if bots else [])])
+                         + ", ".join(bots[:5])] if bots else []),
+                      *([f"{len(humans)} review thread(s) from people not answered: " + ", ".join(humans[:5])]
+                        if humans else []),
+                      *([stale + " (bring it current: what it changes, how it was tested)"] if stale else [])])
+    who = f"PR for task #{t['id']}" if t["id"] else "PR on a branch this project works on (no task of it opened it)"
     # Open findings always have one owner: an open task on the PR, else a fix task the daemon queues
     # once the task that delivered it is done (Daemon.pr_findings_owner). pr-watch only reports them.
     owner, made = daemon.pr_findings_owner(key, rec, what) if dirty and hasattr(daemon, "pr_findings_owner") \
         else (None, False)
     lost = dirty and not owner and rec["owner"] is not None
     rec["owner"] = owner["id"] if owner else None
+    now = time.time()
+    rec["finish"] = "stalled" if dirty and not owner else "finishing" if dirty else "ready"
+    if rec["finish"] != "stalled":
+        rec["stalled_since"] = rec["paged"] = None
+    elif draft:
+        rec["stalled_since"] = rec["stalled_since"] or now
+        if now - float(rec["stalled_since"]) > DAY and not rec["paged"]:
+            rec["paged"] = now
+            db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                 (now, "pr", "pr_findings", "high",
+                  f"{who} ({url}) is a draft stalled short of ready for over a day with no owner: {what}. Queue "
+                  f"one code task on its branch to finish it, or say why it stays.", "queued", t["id"]))
     # Keyed by finding, not URL: a bot re-posting the same open finding under a new URL is no news.
-    mark = json.dumps([rec["failing"], bot_keys]) if dirty else "clean"
+    # Clean is told once per head: a new head that is clean again is news (its draft may be asked about).
+    head = pr.get("headRefOid") or ""
+    mark = json.dumps([rec["failing"], bot_keys, humans, bool(stale)] if (humans or stale) else
+                      [rec["failing"], bot_keys]) if dirty else f"clean@{head}" if head else "clean"
     if dirty and "bot_keys" not in old and rec["notified"] == json.dumps([rec["failing"], sorted(bots)]):
         rec["notified"] = mark   # a record from before keys were kept, already told these findings
-    if not made and not lost and (mark == rec["notified"] or (not dirty and rec["notified"] is None)):
-        rec["notified"] = mark   # a PR clean when first seen needs no news: its task's hand-off said so
+    if not dirty and rec["notified"] == "clean":
+        rec["notified"] = mark   # a record from before heads were kept, already told it is clean
+    first = not dirty and rec["notified"] is None and (t["id"] is not None or not draft)
+    if not made and not lost and (mark == rec["notified"] or first):
+        rec["notified"] = mark   # a task's PR clean when first seen needs no news: its task's hand-off said so
         return
     rec["notified"] = mark
     status = "queued"
     if made:
-        text = (f"PR for task #{t['id']} ({url}) has open findings: {what}. No open task owned them, so the daemon "
+        text = (f"{who} ({url}) has open findings: {what}. No open task owned them, so the daemon "
                 f"queued code task #{owner['id']} on the PR's branch to fix or answer each. Queue no other task "
                 f"for them. Do not ask the user to review it until pr-watch reports it clean.")
         status = "handled"
     elif owner:
-        text = (f"PR for task #{t['id']} ({url}) has open findings: {what}. Open task #{owner['id']} "
+        text = (f"{who} ({url}) has open findings: {what}. Open task #{owner['id']} "
                 f"({owner['status']}) owns them"
                 + (" (a review of its change; the daemon queues their fix once its review chain ends)"
                    if owner["kind"] == "review" else "")
                 + ": queue no other task for them. Do not ask the user to review it until pr-watch reports it clean.")
         status = "queued" if owner["status"] == "blocked" else "handled"
     elif dirty:
-        text = (f"PR for task #{t['id']} ({url}) has open findings: {what}. This is work"
+        text = (f"{who} ({url}) has open findings: {what}. This is work"
                 + (" and no open task owns them now" if lost else "")
                 + ": queue a code task (on the PR's branch) to fix or answer each and get CI green. Do not ask "
                   "the user to review it until pr-watch reports it clean.")
     else:
-        text = (f"PR for task #{t['id']} ({url}) is clean: CI green and every bot review comment fixed or "
-                f"answered. If its review task passed, ask the user for a draft review now (ask_user, "
-                f"blocking review, with its URL).")
+        text = (f"{who} ({url}) is clean: CI green"
+                + (f" (failing on its base too: {', '.join(rec['base_failing'])})" if rec["base_failing"] else "")
+                + " and every bot review comment fixed or answered"
+                + (", every person's review thread answered and its description current: a draft at the finish "
+                   "line" if draft else "")
+                + ". If its review task passed, ask the user for a draft review now (ask_user, blocking review, "
+                  "with its URL); never take it out of draft yourself.")
     db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
          (time.time(), "pr", "pr_findings" if dirty else "pr_clean", "normal", text, status, t["id"]))
 

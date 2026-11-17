@@ -3731,6 +3731,23 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   coordinator asks the user before a draft PR under a code freeze, and the ask gate lets that ask
   through (an ask about a draft PR outside a freeze is still refused). Leaving draft always needs
   the user's yes, and human reviewers are never requested, whatever the setting.
+- Draft PRs are taken to the finish line, and pr-watch enforces it. Its GitHub purview is every open
+  PR of the project's tasks plus every open PR whose head is a branch the project works on (the push
+  branch, task branches and `pr_branch:` lines of tasks open or made in the last 30 days), even one a
+  person opened; it is found from those records only, listed hourly with one `gh pr list` per repo
+  through the usual gh route, never from charter wording. `watchers.purview_extra` (empty by
+  default) adds PR URLs or `owner/repo` names. A PR is read every poll while it is active (an open
+  task on its branch, findings pending, or its head moved in the last 6 h), else once a day. Each
+  open draft is `ready` (CI green, a check also failing on the base branch tip not counted; every bot
+  comment and every person's review thread fixed or answered; the description current: not empty
+  and edited since the head last moved), `finishing` (an open task owns what is left) or `stalled`
+  (no owner). Short of ready, it gets one finishing task through the usual one-owner path (for a PR
+  no task opened: `Finish PR: <title>` on its branch, or landed through the push queue when its head
+  is the push branch; on a person's PR the harness keeps its words in one marked section at the end of
+  the description, never rewriting theirs). A draft stalled over a day pages the coordinator once at
+  high; a ready one raises `pr_clean` once per head, and the coordinator then asks the user for a
+  draft review. The daily review's `GitHub purview` line counts drafts by state and the age of the
+  oldest stalled one. Runs never mark a PR ready, merge it or request reviewers.
 - `delivery.pr_body_check` (off by default) turns a project's own PR body rules into a model-free
   guard: a worker's `gh pr create`, and a `gh pr edit` that sets the body, first run the command it
   names on the body (from `--body`, `--body-file` or `-F`; on stdin and as the file in

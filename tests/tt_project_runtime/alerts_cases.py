@@ -1945,7 +1945,8 @@ def _gql_node(n: int, *, state="OPEN", draft=True, decision=None, checks=(("buil
     who = lambda login: {"__typename": "Bot" if login.endswith("[bot]") else "User", "login": login}
     return {"state": state, "isDraft": draft, "mergeable": "MERGEABLE", "reviewDecision": decision,
             "url": f"https://github.com/acme/widgets/pull/{n}", "title": f"t{n}", "headRefOid": HEAD,
-            "headRefName": f"b{n}", "author": who("dev"),
+            "headRefName": f"b{n}", "author": who("dev"), "baseRefName": "main", "body": f"Change {n}.",
+            "createdAt": "2026-01-01T00:00:00Z",
             "comments": [{"author": who(a), "body": b, "createdAt": f"2026-01-01T00:{i // 60:02d}:{i % 60:02d}Z",
                           "url": f"c{n}-{i}"} for i, (a, b) in enumerate(comments)],
             "reviews": [{"id": f"R{n}-{i}", "author": who(a), "state": st, "body": b, "submittedAt": "2026-01-02",
@@ -1964,7 +1965,7 @@ class _BatchGh:
     or (rc, stderr); a `hidden` PR is null in the batched answer with a FORBIDDEN error, yet gh pr view reads it."""
 
     def __init__(self, prs: dict):
-        self.prs, self.calls, self.fail, self.hidden = prs, [], None, set()
+        self.prs, self.calls, self.fail, self.hidden, self.base_failing = prs, [], None, set(), []
 
     def _page(self, items: list, after: str | None) -> dict:
         start = int(after or 0)
@@ -1975,7 +1976,7 @@ class _BatchGh:
         out = {k: v for k, v in pr.items() if k not in ("comments", "reviews", "checks")}
         for k in ("comments", "reviews"):
             out[k] = self._page(pr[k], after if only == k else None)
-        out["commits"] = {"nodes": [{"commit": {"statusCheckRollup": {"contexts": self._page(
+        out["commits"] = {"nodes": [{"commit": {"committedDate": pr.get("headDate"), "statusCheckRollup": {"contexts": self._page(
             pr["checks"], after if only == "contexts" else None)}}}]}
         return out
 
@@ -1992,8 +1993,14 @@ class _BatchGh:
                     "reviewDecision": pr["reviewDecision"] or "", "statusCheckRollup": pr["checks"],
                     "comments": [{"author": {"login": c["author"]["login"]}, "body": c["body"]} for c in pr["comments"]],
                     "reviews": [{k: v for k, v in r.items() if k != "comments"} for r in pr["reviews"]],
-                    **{k: pr[k] for k in ("url", "title", "author", "headRefOid", "headRefName")}}
+                    **{k: pr[k] for k in ("url", "title", "author", "headRefOid", "headRefName", "baseRefName", "body",
+                                          "createdAt")}}
             return ok({k: view[k] for k in a[4].split(",")})
+        if a[:2] == ["pr", "list"]:
+            return ok([{"url": pr["url"], "headRefName": pr["headRefName"], "author": pr["author"],
+                        "isDraft": pr["isDraft"]} for pr in self.prs.values()])
+        if a[0] == "api" and "/check-runs" in a[1]:
+            return ok(self.base_failing)
         if self.fail == "hang":
             return boundedchild.Result(None, "", "", timed_out=True, error=f"timed out after {timeout} s")
         if self.fail:
@@ -2015,6 +2022,138 @@ class _BatchGh:
         errors = [{"type": "FORBIDDEN" if int(n) in self.hidden else "NOT_FOUND", "path": ["repository", f"p{i}"]}
                   for i, n in aliases if repo[f"p{i}"] is None]
         return boundedchild.Result(1 if errors else 0, json.dumps({"data": {"repository": repo}, "errors": errors}), "")
+
+
+def _purview_setup(env, monkeypatch, prs: dict, **cfg):
+    """A project with a done code task on branch b9 that opened no PR, and a fake gh listing `prs` in acme/widgets
+    (named by watchers.purview_extra): PR 9 on b9 is in the project's purview though no task names it."""
+    from ttp import boundedchild
+    from ttp.daemon import Daemon
+    p = make(env)
+    p.db.x("INSERT INTO tasks(title,kind,status,branch,created) VALUES(?,?,?,?,?)",
+           ("t", "code", "done", "b9", time.time()))
+    gh = _BatchGh(prs)
+    monkeypatch.setattr(boundedchild, "run", gh)
+    d = Daemon(p.base)
+    d.cfg = {**d.cfg, "watchers": {**d.cfg["watchers"], "purview_extra": ["acme/widgets"]}, **cfg}
+    return p, gh, d
+
+
+def _pr_fixes(p, n=9):
+    return p.db.q("SELECT * FROM tasks WHERE labels LIKE ?", (f'%"pr_fix:acme/widgets#{n}"%',))
+
+
+def test_a_person_opened_draft_short_of_ready_gets_one_finishing_task(env, monkeypatch):
+    """A draft a person opened on a branch the project works on, CI failing, is found from the project's
+    records (no task names it) and gets exactly one finishing task over repeated polls; PRs on other branches
+    are not the project's."""
+    from ttp import prguard, watchers
+    p, gh, d = _purview_setup(env, monkeypatch, {
+        9: _gql_node(9, checks=(("build", "COMPLETED", "FAILURE"),)),
+        5: _gql_node(5, checks=(("build", "COMPLETED", "FAILURE"),))})
+    for _ in range(3):
+        watchers.watch_prs(d)
+    fix = _pr_fixes(p)
+    assert len(fix) == 1 and fix[0]["title"].startswith("Finish PR: ") and fix[0]["kind"] == "code"
+    assert "<!-- ttp:purview -->" in fix[0]["spec"] and '"pr_branch:b9"' in fix[0]["labels"]
+    assert "Never mark it ready" in fix[0]["spec"] and "[authored by AI]" in fix[0]["spec"]
+    assert not _pr_fixes(p, 5), "PR 5's head is no branch of the project"
+    rec = p.db.kv(prguard.FINDINGS_KEY)["acme/widgets#9"]
+    assert rec["purview"] and rec["finish"] == "finishing" and rec["owner"] == fix[0]["id"]
+    assert sum(c[:2] == ["pr", "list"] for c in gh.calls) == 1, "discovery is hourly, not every poll"
+    assert not any(c[:2] in (["pr", "ready"], ["pr", "merge"], ["pr", "edit"]) for c in gh.calls)
+
+
+def test_a_purview_draft_on_the_push_branch_lands_its_fix_through_the_push_queue(env, monkeypatch):
+    from ttp import watchers
+    p, gh, d = _purview_setup(env, monkeypatch, {9: _gql_node(9, checks=(("build", "COMPLETED", "FAILURE"),))})
+    d.cfg = {**d.cfg, "delivery": {**d.cfg["delivery"], "push_branch": "b9"}}
+    watchers.watch_prs(d)
+    (fix,) = _pr_fixes(p)
+    assert fix["branch"] is None and "pr_branch:" not in fix["labels"] and "push queue" in fix["spec"]
+
+
+def test_a_stale_description_holds_a_green_draft_short_of_ready(env, monkeypatch):
+    """CI green and no comments, but commits newer than the description's last edit: one finding names the
+    description until it is edited; an unanswered person's review thread counts the same way."""
+    from ttp import prguard, watchers
+    pr = {**_gql_node(9), "createdAt": "2026-01-01T00:00:00Z", "lastEditedAt": None, "headDate": "2026-01-03T00:00:00Z"}
+    p, gh, d = _purview_setup(env, monkeypatch, {9: pr})
+    watchers.watch_prs(d)
+    rec = p.db.kv(prguard.FINDINGS_KEY)["acme/widgets#9"]
+    assert rec["stale"] and rec["finish"] == "finishing" and len(_pr_fixes(p)) == 1
+    assert "description" in _pr_fixes(p)[0]["spec"]
+    watchers.watch_prs(d)
+    assert p.db.kv(prguard.FINDINGS_KEY)["acme/widgets#9"]["stale"], "unedited, it stays stale"
+    gh.prs[9] = {**_gql_node(9, threads=[("dev2", "why this?", False)]), "body": "Change 9, tested."}   # edited
+    watchers.watch_prs(d)
+    rec = p.db.kv(prguard.FINDINGS_KEY)["acme/widgets#9"]
+    assert rec["human"] and not rec["stale"] and len(_pr_fixes(p)) == 1, "still one owner"
+
+
+def test_a_draft_stalled_a_day_pages_once_at_high_and_a_ready_one_is_told_once_per_head(env, monkeypatch):
+    """No finishing task can be queued (its rounds are spent): the draft is stalled, paged once at high after
+    a day; once ready it raises pr_clean once for its head, again only for a new head."""
+    from ttp import prguard, watchers
+    p, gh, d = _purview_setup(env, monkeypatch, {9: _gql_node(9, checks=(("build", "COMPLETED", "FAILURE"),))})
+    for _ in range(2):
+        p.db.x("INSERT INTO tasks(title,kind,status,labels,created) VALUES(?,?,?,?,?)",
+               ("old fix", "code", "done", '["pr_fix:acme/widgets#9"]', time.time()))
+    watchers.watch_prs(d)
+    rec = p.db.kv(prguard.FINDINGS_KEY)["acme/widgets#9"]
+    assert rec["finish"] == "stalled" and not rec["paged"] and len(_pr_fixes(p)) == 2
+    high = lambda: p.db.q("SELECT * FROM events WHERE source='pr' AND severity='high'")
+    assert not high()
+    p.db.set_kv(prguard.FINDINGS_KEY, {"acme/widgets#9": {**rec, "stalled_since": time.time() - 25 * 3600}})
+    for _ in range(2):
+        watchers.watch_prs(d)
+    assert len(high()) == 1 and "stalled" in high()[0]["text"] and "a day" in high()[0]["text"]
+    assert "GitHub purview: 1 open draft PRs: 0 ready (0 review asked), 0 finishing, 1 stalled (oldest 25 h)" \
+        in watchers.purview_line(p.db)
+    clean = lambda: p.db.q("SELECT * FROM events WHERE source='pr' AND kind='pr_clean'")
+    gh.prs[9] = _gql_node(9)
+    for _ in range(2):
+        watchers.watch_prs(d)
+    rec = p.db.kv(prguard.FINDINGS_KEY)["acme/widgets#9"]
+    assert rec["finish"] == "ready" and len(clean()) == 1 and "never take it out of draft" in clean()[0]["text"]
+    assert "1 ready (1 review asked)" in watchers.purview_line(p.db)
+    gh.prs[9] = {**_gql_node(9), "headRefOid": "f" * 40}
+    watchers.watch_prs(d)
+    assert len(clean()) == 2, "a new head that is clean is news again"
+
+
+def test_a_check_failing_on_the_base_too_does_not_hold_a_draft(env, monkeypatch):
+    from ttp import prguard, watchers
+    p, gh, d = _purview_setup(env, monkeypatch, {9: _gql_node(9, checks=(("build", "COMPLETED", "FAILURE"),))})
+    gh.base_failing = ["build"]
+    watchers.watch_prs(d)
+    rec = p.db.kv(prguard.FINDINGS_KEY)["acme/widgets#9"]
+    assert rec["finish"] == "ready" and rec["base_failing"] == ["build"] and not _pr_fixes(p)
+    (ev,) = p.db.q("SELECT * FROM events WHERE source='pr' AND kind='pr_clean'")
+    assert "failing on its base too: build" in ev["text"]
+
+
+def test_an_idle_purview_pr_is_read_daily_and_an_active_one_every_poll(env, monkeypatch):
+    from ttp import watchers
+    p, gh, d = _purview_setup(env, monkeypatch, {9: _gql_node(9)})
+    now = [time.time()]
+    monkeypatch.setattr(watchers.time, "time", lambda: now[0])
+    reads = lambda: sum(c[:2] == ["api", "graphql"] or c[:2] == ["pr", "view"] for c in gh.calls)
+    watchers.watch_prs(d)
+    first = reads()
+    assert first >= 1
+    now[0] += 7 * 3600   # its head unmoved for over 6 h and no open task on its branch: idle
+    watchers.watch_prs(d)
+    assert reads() == first, "an idle purview PR waits a day"
+    now[0] += 18 * 3600
+    watchers.watch_prs(d)
+    assert reads() > first, "read again after a day"
+    p.db.x("INSERT INTO tasks(title,kind,status,branch,created) VALUES(?,?,?,?,?)",
+           ("busy", "code", "running", "b9", now[0]))
+    n = reads()
+    now[0] += 600
+    watchers.watch_prs(d)
+    assert reads() > n, "active (an open task on its branch): every poll"
 
 
 def _pr_batch_setup(env, monkeypatch, prs: dict):
@@ -2172,7 +2311,7 @@ def test_batched_prs_with_more_pages_each_read_them_in_their_own_time(env, monke
         sigs.append(p.db.kv("pr_signatures"))
     assert len(sigs[1]) == 8 and sigs[0] == sigs[1]
     assert all(s["failing"] == ["job7"] for s in sigs[1].values())
-    assert len(gh.calls) == 8 * 2 + 1 + 8 * 2, "per-PR: view and findings; batched: one query, then each PR's"
+    assert len(gh.calls) == 8 * 2 + 1 + 8 * 2 + 1, "per-PR: view and findings; batched: one query, then each PR's; the base's checks once"
 
 
 def test_a_batched_pr_whose_pages_outlast_its_time_shows_as_not_checked(env, monkeypatch):
@@ -2256,7 +2395,7 @@ def test_a_multi_page_batched_pr_is_read_per_pr_with_no_paging_in_the_batch(env,
     p, gh = _pr_batch_setup(env, monkeypatch, {1: _gql_node(1), 2: _gql_node(2, checks=many), 3: _gql_node(3)})
     assert watchers.watch_prs(Daemon(p.base)).startswith("ok (3 PRs, 3 changed)")
     assert not any("$after" in x for c in gh.calls for x in c), gh.calls
-    assert len(gh.calls) == 3, gh.calls   # the batched query, then PR 2's view and findings
+    assert len(gh.calls) == 4, gh.calls   # the batched query, PR 2's view and findings, its base's checks
     assert gh.calls[1][:3] == ["pr", "view", "https://github.com/acme/widgets/pull/2"] and "number=2" in gh.calls[2]
     assert p.db.kv("pr_signatures")["https://github.com/acme/widgets/pull/2"]["failing"] == ["job120"]
 
