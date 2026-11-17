@@ -52,6 +52,60 @@ def test_pack_strip_prompt_keeps_what_the_worker_read_and_cuts_the_harness_opera
         assert kept in got
 
 
+_BP_DELIVERY_PROMPT = (
+    "# BINDING RESTRICTIONS\n- Push only to branch x; never `git push` to main; open no pull requests with gh pr.\n\n"
+    "# You are a worker\n\n## Landing on the project's branch\n\nland with `ttp push` after `git fetch origin`\n\n"
+    "## Pull requests\n\nopen a draft with `gh pr create`\n\n"
+    "# YOUR TASK\n\nfix the parser\n- run the tests\n- then `git push` the branch\n- keep the diff small\n")
+
+
+def test_pack_strip_drops_delivery_steps_but_keeps_the_restrictions_as_written():
+    from ttp import benchpack
+    got = benchpack.strip_prompt(_BP_DELIVERY_PROMPT)
+    assert not benchpack.DELIVERY.search(got.split("# CHARTER")[0].split("\n\n", 1)[1]), got
+    for gone in ("Landing on the project", "Pull requests", "ttp push", "gh pr create", "git fetch origin", "then `git push`"):
+        assert gone not in got
+    for kept in ("never `git push` to main", "open no pull requests with gh pr", "fix the parser", "run the tests",
+                 "keep the diff small"):
+        assert kept in got
+
+
+def test_pack_attach_rebuilds_an_older_pack_at_a_run_boundary_and_keep_pins_the_one_a_cell_ran_on(tmp_path):
+    from ttp import benchpack
+    db = _BpDb()
+    _bp_run(tmp_path, db, 41, _BP_DELIVERY_PROMPT)
+    bench = tmp_path / "bench"
+    task = {"task": "P-41", "source_task": 41, "title": "t", "spec": "s", "head": ""}
+    here = bench / "P-41"
+    here.mkdir(parents=True)
+    old = "# Context pack\n\nland with `ttp push` and git fetch\n"
+    (here / "pack.md").write_text(old)
+    (here / "pack.json").write_text(json.dumps({"class": benchpack.CODE, "why": "", "sources": {},
+                                                  "sha256": benchpack._sha(old)}))
+    pinned = benchpack.attach(task, db, bench, {"P-41": benchpack._sha(old)})
+    assert pinned["pack"]["sha256"] == benchpack._sha(old) and "ttp push" in benchpack.read(pinned), \
+        "cells already run keep their pack: arms never mix packs inside one result set"
+    fresh = benchpack.attach(task, db, bench)
+    assert fresh["pack"]["version"] == benchpack.PACK_VERSION and fresh["pack"]["sha256"] != benchpack._sha(old)
+    assert "ttp push" not in benchpack.read(fresh) and "fix the parser" in benchpack.read(fresh)
+    assert (here / "pack.md").read_text() == old, "the older file stays for cells still running on it"
+    again = benchpack.attach(task, db, bench)
+    assert again["pack"]["sha256"] == fresh["pack"]["sha256"], "rebuilt once"
+    assert benchpack.attach(task, db, bench, {"P-41": "0" * 64})["pack"]["sha256"] == fresh["pack"]["sha256"]
+
+
+def test_pack_sha_is_recorded_per_cell_and_pack_keep_reads_it_from_the_rows(tmp_path):
+    from ttp import benchdaily, benchpack, benchrun
+    db = _BpDb()
+    _bp_run(tmp_path, db, 61)
+    t = benchpack.attach({"task": "P-61", "source_task": 61, "title": "t", "spec": "s", "head": ""}, db, tmp_path / "b")
+    row = benchrun.pack_fields(t)
+    assert row["pack_sha256"] == t["pack"]["sha256"] and row["pack_version"] == benchpack.PACK_VERSION
+    assert benchrun.pack_fields({"task": "x"}) == {}
+    assert benchdaily.pack_keep({("P-61", 0, "a"): row, ("P-62", 0, "a"): {"outcome": "pass"}}) == \
+        {"P-61": t["pack"]["sha256"]}
+
+
 def test_pack_refs_finds_earlier_tasks_and_user_messages_and_a_fix_titles_review():
     from ttp import benchpack
     spec = "see #8715 and user msg #3107, msgs #3085, #3088 and #8800 fix; also #9000 and issue &#123"

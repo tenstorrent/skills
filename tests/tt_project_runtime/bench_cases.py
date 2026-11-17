@@ -1863,6 +1863,45 @@ def test_mini_trajectory_audit_reads_only_the_agents_own_calls(tmp_path):
     assert benchrun.agent_records(b"not json") == b""
 
 
+def test_audit_flags_only_what_the_agent_ran_in_every_arm_format(tmp_path):
+    """A mini-swe-agent cell whose prompt names `gh pr` and `git fetch` but whose actions do not is not flagged; one
+    whose action runs `git fetch` is. Claude Code's records wrap the tool call in an inner message ({"type":
+    "assistant", "message": {"type": "message", "content": [tool_use]}}): the call is the agent's command, the
+    prompt and the prose around it are not. Codex items and a user message block are read the same way (#3128)."""
+    from ttp import benchrun
+    task = {"task": 7, "head": "f" * 40, "heldout": []}
+    prompt = "Landing: run `gh pr create`, `ttp push` and git fetch origin when done."
+    def mini(*cmds):
+        return benchrun.agent_records(json.dumps({"messages": [
+            {"role": "system", "content": prompt}, {"role": "user", "content": prompt},
+            *({"role": "assistant", "content": "ok", "tool_calls": [
+                {"function": {"name": "bash", "arguments": json.dumps({"command": c})}, "id": "1", "type": "function"}]}
+              for c in cmds)]}).encode()).decode()
+    assert benchrun.audit(mini("ls", "pytest -q"), task, []) == []
+    assert benchrun.audit(mini("git fetch github"), task, []) == ["runs 'git fetch'"]
+
+    def claude(cmd, prose="I will not run gh pr or git fetch."):
+        lines = [{"type": "system", "subtype": "init", "tools": ["gh pr"]},
+                 {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": prompt}]}},
+                 {"type": "assistant", "message": {"id": "m", "type": "message", "role": "assistant", "content": [
+                     {"type": "text", "text": prose},
+                     {"type": "tool_use", "id": "u1", "name": "Bash", "input": {"command": cmd}}]}},
+                 {"type": "user", "message": {"role": "user", "content": [
+                     {"type": "tool_result", "tool_use_id": "u1", "content": "see gh pr create and git fetch"}]}}]
+        return "".join(json.dumps(x) + "\n" for x in lines)
+    assert benchrun.audit(claude("ls -la"), task, []) == [], "the prompt, prose and a tool reply flag nothing"
+    assert benchrun.audit(claude("gh pr create --fill"), task, []) == ["runs 'gh pr'"]
+    assert benchrun.audit(claude("git log --all"), task, []) == ["runs 'git log --all'"]
+
+    def codex(cmd):
+        return "".join(json.dumps(x) + "\n" for x in [
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "gh pr and git fetch are banned"}},
+            {"type": "item.completed", "item": {"type": "command_execution", "command": cmd,
+                                                "aggregated_output": "git fetch gh pr"}}])
+    assert benchrun.audit(codex("ls"), task, []) == []
+    assert benchrun.audit(codex("git fetch origin"), task, []) == ["runs 'git fetch'"]
+
+
 def _reaudit_day(env, tmp_path, monkeypatch, date="2026-11-10"):
     # Two models' replay cells of one day, run for real on the fake provider (the candidate fixes the task): the
     # first's row is then rewritten as an isolated cell the old audit flagged (never graded), the second's

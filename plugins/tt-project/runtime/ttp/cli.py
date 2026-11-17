@@ -9417,6 +9417,22 @@ def _bench_daily(p, a) -> None:
         die(f"bench daily: {e}")
     cap = a.cap_usd if a.cap_usd is not None else float(conf.get("cap_usd", benchdaily.CAP_USD) or 0)
     cells = {p: max(1, int((conf.get("cells") or {}).get(p) or 0)) for p in ("claude", "glm") if (conf.get("cells") or {}).get(p)}
+    if a.fix_round:   # in this shell: one fix run per cell the day's first review did not land, then a blind regrade
+        held = benchdaily.lock(day)
+        if held is None:
+            die(f"bench daily: a run for {day} is already running on this host")
+        opts = {k: v for k, v in (("budget_usd", a.cell_budget or conf.get("cell_budget_usd")),
+                                  ("timeout_s", conf.get("timeout_s"))) if v}
+        bconf = p.config().get("bench") or {}
+        try:
+            rec = benchdaily.fix_day(day, cfg=p.config(), opts={**opts, **_server_opts(p, bconf)})
+        except (OSError, ValueError, RuntimeError, KeyError, benchrun.BenchError) as e:
+            die(f"bench daily: {e}")
+        cells = (rec.get("fix_round") or {}).get("cells") or []
+        print(f"ttp bench daily: {day}: fix round: {sum(1 for c in cells if c['fix_ran'])} fix run(s); landed first try "
+              f"{sum(1 for c in cells if c['landed_first'])}/{len(cells)}, after one fix "
+              f"{sum(1 for c in cells if c['landed_fixed'])}/{len(cells)}; table {benchdaily.home() / 'table.md'}")
+        return
     if a.rerun_stops:   # in this shell: it waits for a healthy server and runs one cell at a time
         held = benchdaily.lock(day)
         if held is None:
@@ -16204,6 +16220,10 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--rerun-stops", help="daily: with --day and --arm-name, recheck these earlier stops (task numbers, "
                    "comma separated) against the server rule: mark them `server`, rerun one at a time at normal server "
                    "speed, grade the reruns in their own blind batch and update the day's record and the table")
+    s.add_argument("--fix-round", action="store_true", help="daily: with --day, the review-fix round of that finished "
+                   "day: one fix run per cell the first blind review did not land, given the reviewer's findings, then "
+                   "graded again blind; adds landed-first-try vs landed-after-one-fix to the day's record and the table "
+                   "(a new day runs it by itself unless bench.fix.enabled is false)")
     s.add_argument("--day", help="daily: the landed day to bench (YYYY-MM-DD in --tz; default: yesterday)")
     s.add_argument("--tz", help="daily: the zone the day is read in (default: bench.daily.tz, else the built-in one)")
     s.add_argument("--cap-usd", type=float, help="daily: the day's Claude spend cap, arm runs plus reviews "

@@ -31,8 +31,15 @@ ORIGINAL_ARM = {"provider": "original", "model": "landed-change", "effort": ""}
 # Sections of the worker prompt that tell a worker how to operate the harness (progress notes, hand-off file,
 # machine locks): they mean nothing in a bench cell. Everything else stays, so the pack is what the worker read.
 DROP_HEADS = ("Progress", "Working in parallel", "Shared clusters", "Updates mid-task", "Handoff", "Budget and time",
-              "KNOWN PATHS", "FORKED FROM")
+              "KNOWN PATHS", "FORKED FROM", "Landing on the project's branch", "Pull requests")
 PREAMBLE_END = "# BINDING RESTRICTIONS"
+# The delivery steps of the original worker (land, push, open a PR, fetch): a cell has no remote and its agent may
+# not use one, and the cheat audit rightly flags them, so no arm's pack carries a step that orders one. The same
+# cut for every arm. Bump PACK_VERSION when this changes: a pack built under an older one is rebuilt at the
+# next run boundary (attach), never inside a run.
+DELIVERY = re.compile(r"\bgh\s+(?:pr|api|repo)\b|\bttp\s+(?:push|express)\b|\bgit\s+(?:push|fetch|pull|clone|ls-remote)\b"
+                      r"|\bgit\s+remote\s+add\b|\bgit\s+log\s+--all\b")
+PACK_VERSION = 2
 
 # A command whose output is a read of live state: its result goes into the pack as the original run saw it.
 SNAP = re.compile(r"\bttp\s+(?:status|task|tasks|list|schedules|memory|config|runs|events|audit|paths|said|machines|"
@@ -88,7 +95,41 @@ def strip_prompt(text: str) -> str:
                 drop = level
         if drop is None:
             out.append(line)
-    return "\n".join(out).strip() + "\n"
+    return strip_delivery("\n".join(out)).strip() + "\n"
+
+
+def _units(text: str) -> list[list[str]]:
+    # Blocks the delivery cut works on: a fenced code block, a heading line, a list item with its continuation
+    # lines, or a paragraph; a blank line ends a unit and belongs to it.
+    units: list[list[str]] = []
+    fence = False
+    for line in text.splitlines():
+        s = line.lstrip()
+        if fence:
+            units[-1].append(line)
+            fence = not s.startswith("```")
+            continue
+        open_ = bool(units) and units[-1][0].strip() != "" and units[-1][-1].strip() != "" \
+            and not units[-1][0].lstrip().startswith(("#", "```"))
+        if s and open_ and not s.startswith(("#", "```")) and not re.match(r"(?:[-*+]|\d+[.)])\s", s):
+            units[-1].append(line)
+        elif not s and units:
+            units[-1].append(line)
+        else:
+            units.append([line])
+            fence = s.startswith("```")
+    return units
+
+
+def strip_delivery(text: str) -> str:
+    """`text` without the units (list item, paragraph, code block) that order a delivery step (DELIVERY). The
+    binding restrictions block, up to the next top-level heading, is kept as written: it forbids, it does not order."""
+    head, rest = "", text
+    if text.startswith(PREAMBLE_END):
+        m = re.search(r"\n# (?!BINDING)", text)
+        head, rest = (text[:m.start() + 1], text[m.start() + 1:]) if m else (text, "")
+    kept = ["\n".join(u) for u in _units(rest) if not DELIVERY.search("\n".join(u))]
+    return head + "\n".join(kept)
 
 
 def original_run(db, task_id: int) -> dict | None:
@@ -226,6 +267,7 @@ def build_pack(db, task: dict) -> dict:
     d = Path(run["dir"])
     prompt = strip_prompt((d / "prompt.md").read_text(errors="replace"))
     snap, remote = snapshot(d / "output.jsonl")
+    snap = [x for x in snap if not DELIVERY.search(x["label"])]   # a delivery step read is no more context than its order
     if remote:
         return {"class": LIVE_ONLY, "why": f"the original run ran on another machine or a device: {remote[0]}",
                 "text": "", "sha256": "", "sources": {"run": run["id"]}}
@@ -270,23 +312,41 @@ def build_pack(db, task: dict) -> dict:
             "sources": {"run": run["id"], **used, "snapshot": len(snap), "review_findings": bool(findings)}}
 
 
-def attach(task: dict, db, bench_dir: Path) -> dict:
-    """The task's pack written beside its workspace (pack.md and pack.json, built once and reused) and the
-    task dict with `pack` ({path, sha256, ...}) and `pack_class`. A task that is not code-bench carries
-    `pack_class` and `pack_why` and no pack."""
+def attach(task: dict, db, bench_dir: Path, keep: dict | None = None) -> dict:
+    """The task's pack written beside its workspace (`pack-<sha12>.md` and pack.json, built once and reused) and
+    the task dict with `pack` ({path, sha256, version, ...}) and `pack_class`. A task that is not code-bench carries
+    `pack_class` and `pack_why` and no pack. A pack built under an older PACK_VERSION is rebuilt here, at the start
+    of a run; its file stays where it is, so cells still running on it keep reading it. `keep`: {task: sha256} of
+    the packs the cells already run in this result set used: that pack is reused (never a newer one beside it), so
+    the arms of one repeat set never mix packs."""
     here = bench_dir / str(task["task"])
-    meta, md = here / "pack.json", here / "pack.md"
-    if meta.exists() and (md.exists() or json.loads(meta.read_text()).get("class") != CODE):
-        info = json.loads(meta.read_text())
-    else:
+    meta = here / "pack.json"
+    info = json.loads(meta.read_text()) if meta.exists() else None
+    if info is not None:
+        info.setdefault("file", "pack.md")
+        if info["class"] == CODE and not (here / info["file"]).exists():
+            info = None
+    if want := (keep or {}).get(str(task["task"])):
+        for f in sorted(here.glob("pack*.md")):
+            if _sha(f.read_text()) == want:   # a pack a cell of this result set already ran on
+                same = info is not None and info.get("sha256") == want
+                info = {"class": CODE, "why": "", "sha256": want, "file": f.name,
+                        "version": info.get("version", 1) if same else 1, "sources": info.get("sources", {}) if same else {}}
+                break
+        else:
+            want = None
+    if info is None or (not want and info.get("version", 1) < PACK_VERSION):
         info = build_pack(db, task)
+        info["version"] = PACK_VERSION
         here.mkdir(parents=True, exist_ok=True)
         if info["text"]:
-            durable_write(md, info["text"])
+            info["file"] = f"pack-{info['sha256'][:12]}.md"
+            durable_write(here / info["file"], info["text"])
         durable_write(meta, json.dumps({k: v for k, v in info.items() if k != "text"}, indent=1) + "\n")
     out = {**task, "pack_class": info["class"], "pack_why": info.get("why", "")}
     if info["class"] == CODE:
-        out["pack"] = {"path": str(md), "sha256": info["sha256"], "sources": info.get("sources", {})}
+        out["pack"] = {"path": str(here / info["file"]), "sha256": info["sha256"], "version": info.get("version", 1),
+                       "sources": info.get("sources", {})}
     return out
 
 
@@ -310,12 +370,12 @@ def frame(pack: str, prompt_text: str) -> str:
     return f"{pack}\n\n---\n\n{prompt_text}" if pack else prompt_text
 
 
-def screen(tasks: dict, dbs: dict, bench_dir: Path) -> tuple[dict, list[dict]]:
+def screen(tasks: dict, dbs: dict, bench_dir: Path, keep: dict | None = None) -> tuple[dict, list[dict]]:
     """(code-bench tasks with their packs attached, [{project, task, class, why}] for those left out), `dbs`:
     project name -> read-only db."""
     kept, left = {}, []
     for tid, t in tasks.items():
-        got = attach(t, dbs[t["project"]], bench_dir)
+        got = attach(t, dbs[t["project"]], bench_dir, keep)
         if got["pack_class"] == CODE:
             kept[tid] = got
         else:

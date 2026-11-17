@@ -24,7 +24,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import bench, benchblind, benchpack, benchrun, benchv2, blindreview, effort, gitmemo, serverhealth
+from . import bench, benchblind, benchfix, benchpack, benchrun, benchv2, blindreview, effort, gitmemo, serverhealth
 from .project import durable_write, open_append
 
 CAP_USD = 0.0        # Claude spend a day (arm runs plus reviews); 0: no cap (the runaway guard is separate)
@@ -667,12 +667,55 @@ def day_record(day: str, tasks: dict, arms: dict, out: Path, graded: dict, skipp
                       "glm_usd": round(sum(c["cost_usd"] for c in cells if not c["claude"]), 4)}}
 
 
+# -- review-fix round (benchfix.py)
+
+def fix_round(out: Path, bench_dir: Path, tasks: dict, arms: dict, graded: dict, opts: dict, cfg: dict, reps: int = 1,
+              ask=None, ask2=None, guard: float | None = None, say=None) -> dict | None:
+    """The real pipeline's review-fix loop, once: every arm cell the first blind review did not land gets one fix
+    run with the reviewer's findings, and the fixed diffs are graded again in a blind batch of their own
+    (`blind-fix`). Returns {"cells", "skipped", "unscored", "spend"} for the day's record, or None when
+    `bench.fix.enabled` is off. Resumable: a fix with a row is not run again, a finished batch is kept."""
+    if not benchfix.enabled(cfg):
+        return None
+    say = say or (lambda s: None)
+    rows = read_rows(out / "results.jsonl")
+    first = benchfix.first_cells(graded, rows, tasks, arms, reps, benchpack.ORIGINAL, landed)
+    need = benchfix.needing_fix(first)
+    fixrows, skipped = read_rows(out / benchfix.FILE), []
+    if need:
+        spent = sum(float(r.get("cost_usd") or 0) for r in rows.values() if is_claude(arms.get(r["arm"], {}))) + review_spent(out)
+        got = benchfix.run_fixes(out, bench_dir, tasks, arms, need, opts, cfg, benchrun.run_cell, read_rows, append_row,
+                                 cells_limits(cfg), guard, spent, is_claude, say)
+        fixrows, skipped = got["rows"], got["skipped"]
+    regraded = {"scored": {}, "unscored": [], "review": {}}
+    if any(benchfix.fixed_ok(r) for r in fixrows.values()):
+        regraded = blind_review(out, tasks, arms, cfg, ask, build=benchfix.regrade_build(fixrows, reps, benchrun.blind_cells),
+                                ask2=ask2, folder=benchfix.FOLDER)
+    cells = benchfix.cell_rows(first, fixrows, regraded, landed)
+    review = 0.0
+    try:
+        review = float(json.loads((out / f"review-{benchfix.FOLDER}.json").read_text()).get("cost_usd") or 0)
+    except (OSError, ValueError):
+        pass
+    return {"cells": cells, "skipped": skipped, "unscored": regraded.get("unscored", []),
+            "spend": {"claude_usd": round(sum(c["fix_usd"] for c in cells if c["fix_claude"]), 4),
+                      "glm_usd": round(sum(c["fix_usd"] for c in cells if not c["fix_claude"]), 4),
+                      "review_usd": round(review, 4)}}
+
+
+def add_fix_spend(rec: dict, fix: dict) -> None:
+    """The fix round's spend joins the day's: Claude fixes and the regrade review count toward the Claude total."""
+    sp, f = rec.setdefault("spend", {}), fix["spend"]
+    sp["fix_claude_usd"], sp["fix_glm_usd"], sp["fix_review_usd"] = f["claude_usd"], f["glm_usd"], f["review_usd"]
+    sp["claude_usd"] = round(float(sp.get("claude_usd") or 0) + f["claude_usd"] + f["review_usd"], 4)
+
+
 # -- cumulative table
 
 def cumulative(root: Path | None = None) -> dict:
     """The running table from every day's record under `root`/days: per project and arm, and per arm overall."""
     root = root or home()
-    cells, gaps, seconds, server, reruns, limits = [], [], [], [], [], {}
+    cells, gaps, seconds, server, reruns, limits, fixed = [], [], [], [], [], {}, []
     orig, gone, left = {"n": 0, "passed": 0, "per_task": {}}, [], []
     days = sorted((root / "days").glob("*.json")) if (root / "days").exists() else []
     for p in days:
@@ -681,6 +724,7 @@ def cumulative(root: Path | None = None) -> dict:
         except (OSError, ValueError):
             continue
         cells += [{**c, "day": p.stem} for c in rec.get("cells") or []]
+        fixed += [{**c, "day": p.stem} for c in (rec.get("fix_round") or {}).get("cells") or []]
         limits[p.stem] = rec.get("limit_s")
         if o := rec.get("original"):   # the original landed change, graded blind with the arms (benchpack)
             orig["n"] += o["n"]
@@ -723,6 +767,7 @@ def cumulative(root: Path | None = None) -> dict:
             **({"server": server} if server else {}),
             **({"reruns": reruns} if reruns else {}),
             **({"original": orig} if orig["n"] else {}),
+            **({"fix_round": benchfix.summary(fixed)} if fixed else {}),
             **({"dropped_original": gone} if gone else {}),
             **({"not_code_bench": left} if left else {}),
             **({"flagged": flagged} if (flagged := [
@@ -783,6 +828,8 @@ def table_md(cum: dict) -> str:
                   f"The change that really landed, graded blind in the same batch as the arms: {o['passed']}/{o['n']} "
                   "passed. A task whose original does not pass is out of the table (listed below); the arms are "
                   "compared on the rest."]
+    if cum.get("fix_round"):
+        lines += [""] + benchfix.section(cum["fix_round"])
     if cum.get("dropped_original"):
         lines += ["", "## Dropped: the original change did not pass", ""]
         lines += [f"- {x['day']}: {x['project']} {x['task']}: {x['why']}" for x in cum["dropped_original"]]
@@ -842,8 +889,14 @@ def parse_arms(extra: list[str] | None, glm_harness: str | None = None) -> dict:
     return dict(benchrun.parse_arm(x) for x in texts)
 
 
+def pack_keep(rows: dict) -> dict:
+    """{task: sha256} of the context pack the cells already run used (results.jsonl rows, by (task, rep, arm)):
+    a resumed result set keeps its pack, so the arms of one repeat set never mix packs."""
+    return {str(k[0]): r["pack_sha256"] for k, r in sorted(rows.items(), key=lambda kv: str(kv[0])) if r.get("pack_sha256")}
+
+
 def build_tasks(day: str, picked: dict, root: Path, bench_dir: Path, skip: str | None = None,
-                left: list | None = None) -> dict[str, dict]:
+                left: list | None = None, keep: dict | None = None) -> dict[str, dict]:
     """The day's bench tasks (build) of every picked project, from picked.json and the project mirrors. Each gets
     its context pack (benchpack); a task that is live-only or invalid is left out and, with `left`, listed there."""
     projs = {p["name"]: p for p in projects(skip)}
@@ -852,7 +905,7 @@ def build_tasks(day: str, picked: dict, root: Path, bench_dir: Path, skip: str |
         repo = root / "mirrors" / slug(name)
         tasks.update(build(day, projs[name], [k for k in picked["order"] if k["project"] == name], repo, bench_dir))
     kept, out = benchpack.screen(tasks, {n: open_ro(projs[n]["db"]) for n in {t["project"] for t in tasks.values()}},
-                                 bench_dir)
+                                 bench_dir, keep)
     if left is not None:
         left += out
     return kept
@@ -904,7 +957,7 @@ def run_day(day: str, start: float, end: float, arms: dict, cfg: dict, cap: floa
         benchrun.check_harness(name, arm)
     arms = {name: benchrun.resolve_harness(arm, opts or {}) for name, arm in arms.items()}
     left: list[dict] = []
-    tasks = build_tasks(day, picked, root, bench_dir, skip, left)
+    tasks = build_tasks(day, picked, root, bench_dir, skip, left, pack_keep(read_rows(out / "results.jsonl")))
     v2cfg = (cfg.get("bench") or {}).get("repeats") or {}
     reps = max(1, int(v2cfg.get("runs", 1)))
     grades = max(1, int(v2cfg.get("grades", 1)))
@@ -930,6 +983,9 @@ def run_day(day: str, start: float, end: float, arms: dict, cfg: dict, cap: floa
     rec = day_record(day, tasks, {**arms, benchpack.ORIGINAL: benchpack.ORIGINAL_ARM}, out, graded, skipped,
                      picked["dropped"])
     rec["cells"], gone, rec["original"] = benchpack.split_original(rec["cells"])
+    if fix := fix_round(out, bench_dir, tasks, arms, graded, opts, cfg, reps, ask, ask2, guard_usd(cfg, bool(order)), say):
+        rec["fix_round"] = {k: fix[k] for k in ("cells", "skipped", "unscored")}
+        add_fix_spend(rec, fix)
     rec["dropped_original"] = gone
     rec["not_code_bench"] = left   # live-only or invalid: left out of the code bench, with why
     rec["faults"] = picked.get("faults", [])
@@ -1003,7 +1059,7 @@ def rerun_day(day: str, stops: list[tuple[str, str]], root: Path | None = None, 
                                       + (f":{a['harness']}" if a.get("harness") else ""))[1]
                 for n, a in (rec.get("arms") or {}).items()}
     arms = {name: benchrun.resolve_harness(arm, opts or {}) for name, arm in arms.items()}
-    tasks = build_tasks(day, picked, root, bench_dir, skip)
+    tasks = build_tasks(day, picked, root, bench_dir, skip, None, pack_keep(read_rows(out / "results.jsonl")))
     tasks = {t: v for t, v in tasks.items() if t not in {x["task"] for x in rec.get("dropped_original") or []}}
 
     def match(tid: str, want: str) -> bool:
@@ -1054,6 +1110,49 @@ def rerun_day(day: str, stops: list[tuple[str, str]], root: Path | None = None, 
     sp["review_usd"] = round(float(sp.get("review_usd") or 0) + review, 4)
     sp["claude_usd"] = round(float(sp.get("claude_usd") or 0) + extra["claude_arms_usd"] + review, 4)
     sp["review2_usd"] = round(float(sp.get("review2_usd") or 0) + review2, 4)
+    durable_write(day_file, json.dumps(rec, indent=1) + "\n")
+    write_table(root)
+    return rec
+
+
+def fix_day(day: str, root: Path | None = None, cfg: dict | None = None, opts: dict | None = None,
+            arms: dict | None = None, ask=None, ask2=None, progress=None, skip: str | None = None) -> dict:
+    """The review-fix round of an earlier day (benchfix.py), through the bench's own code: read the day's first
+    review back from its blind folder (no new scoring), run one fix per cell that did not land, grade the fixed
+    diffs in the `blind-fix` batch and merge the round into the day's record (`fix_round`, spend) and the
+    cumulative table. Returns the day's record; a day with a round already keeps it unless cells are new."""
+    say = progress or (lambda s: print(s, file=sys.stderr, flush=True))
+    root = root or home()
+    cfg = cfg or {}
+    out = root / "runs" / day
+    day_file = root / "days" / f"{day}.json"
+    rec = json.loads(day_file.read_text())
+    if not (out / "blind" / "batch.json").exists():
+        raise ValueError(f"{day} has no blind review to read the findings from")
+    picked = json.loads((out / "picked.json").read_text())
+    bench_dir = out / "bench"
+    if arms is None:
+        arms = {n: benchrun.parse_arm(f"{n}={a['provider']}:{a['model']}:{a['effort']}"
+                                      + (f":{a['harness']}" if a.get("harness") else ""))[1]
+                for n, a in (rec.get("arms") or {}).items()}
+    arms = {name: benchrun.resolve_harness(arm, opts or {}) for name, arm in arms.items()}
+    tasks = build_tasks(day, picked, root, bench_dir, skip, None, pack_keep(read_rows(out / "results.jsonl")))
+    tasks = {t: v for t, v in tasks.items() if t not in {x["task"] for x in rec.get("dropped_original") or []}}
+    reps = max(1, int(((cfg.get("bench") or {}).get("repeats") or {}).get("runs", 1)))
+    for tid in tasks:
+        tasks[tid]["repeat"] = True
+    graded = blind_review(out, tasks, {**arms, benchpack.ORIGINAL: benchpack.ORIGINAL_ARM}, cfg, ask, ask2=ask2,
+                          reps=list(range(reps)))
+    base = {"timeout_s": LIMIT_S, "stall_s": 900, "budget_usd": CELL_USD, "review_usd": REVIEW_USD,
+            "test_cmd": benchrun.TEST_CMD, "test_timeout_s": 900, "dry_run": False, "scratch_home": True, **(opts or {})}
+    fix = fix_round(out, bench_dir, tasks, arms, graded, base, cfg, reps, ask, ask2, None, say)
+    if fix is None:
+        raise ValueError("the review-fix round is off (bench.fix.enabled)")
+    rec["fix_round"] = {k: fix[k] for k in ("cells", "skipped", "unscored")}
+    sp = rec.setdefault("spend", {})
+    sp["claude_usd"] = round(float(sp.get("claude_usd") or 0) - float(sp.get("fix_claude_usd") or 0)
+                             - float(sp.get("fix_review_usd") or 0), 4)   # a second pass replaces the first's spend
+    add_fix_spend(rec, fix)
     durable_write(day_file, json.dumps(rec, indent=1) + "\n")
     write_table(root)
     return rec

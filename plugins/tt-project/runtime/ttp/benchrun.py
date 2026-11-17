@@ -343,7 +343,9 @@ OUTPUT_KEYS = frozenset({"tool_use_result", "tool_result_meta", "aggregated_outp
                          "formatted_output", "result", "content_result"})
 OUTPUT_TYPES = frozenset({"tool_result", "function_call_output", "custom_tool_call_output", "mcp_tool_call_output"})
 NOT_AGENT = frozenset({"system", "user"})   # records the provider writes, or a tool's results (Claude's user record)
-MESSAGE_TYPES = frozenset({"text", "thinking", "redacted_thinking", "agent_message", "reasoning", "message"})
+MESSAGE_TYPES = frozenset({"text", "thinking", "redacted_thinking", "agent_message", "reasoning", "output_text",
+                           "input_text"})
+NOT_AGENT_ROLES = frozenset({"system", "user", "developer", "tool"})   # a message with one of these is the prompt or a reply
 
 
 def agent_text(transcript: str, messages: bool = True) -> str:
@@ -363,6 +365,10 @@ def agent_text(transcript: str, messages: bool = True) -> str:
         elif isinstance(v, dict):
             kind = v.get("type")
             if kind in OUTPUT_TYPES or (not messages and kind in MESSAGE_TYPES):
+                return
+            # A message wrapper (Claude's assistant record holds {"type": "message", "content": [text, tool_use ..]})
+            # is not skipped whole: its tool calls are the agent's commands, only its text is prose.
+            if kind == "message" and v.get("role") in NOT_AGENT_ROLES:
                 return
             for k, x in v.items():
                 if k not in OUTPUT_KEYS:
@@ -875,9 +881,20 @@ def reach_probe(targets: list) -> tuple[list[tuple[str, str, str]], list[str]]:
     return rows, problems
 
 
+def pack_fields(task: dict) -> dict:
+    """Which context pack a cell ran on, for its row: the arms of a repeat set must all show the same one."""
+    p = task.get("pack") or {}
+    return {"pack_sha256": p["sha256"], "pack_version": p.get("version", 1)} if p.get("sha256") else {}
+
+
 def run_cell(bench_dir: Path, out: Path, task: dict, cell: dict, arm: dict, opts: dict, cfg: dict) -> dict:
-    """Run one cell, grade it and return its results row (also written under <out>/cells)."""
-    row = {**cell, **arm, "dry_run": bool(opts.get("dry_run"))}
+    """Run one cell, grade it and return its results row (also written under <out>/cells). A cell with a
+    `fix` ({diff, findings}) is the review-fix round (benchfix.py): the first try's diff is applied and
+    committed first, the agent gets the reviewer's findings after the task, and the diff it leaves is
+    still taken against the task's base, so it holds the first try and the fix together."""
+    cell = dict(cell)
+    fix = cell.pop("fix", None)
+    row = {**cell, **arm, "dry_run": bool(opts.get("dry_run")), **({"fix_round": 1} if fix else {})}
     if opts.get("isolate", ISOLATE) and not cellns.backend():   # nothing to run it in: no work, no score
         return {**row, "outcome": "not_isolated", "passed": False,
                 "why": ["not isolated: neither bwrap (bubblewrap) nor unshare (util-linux) can build a mount "
@@ -886,7 +903,8 @@ def run_cell(bench_dir: Path, out: Path, task: dict, cell: dict, arm: dict, opts
         pack = benchpack.read(task)
     except (benchpack.PackError, OSError) as e:
         return {**row, "outcome": "error", "passed": False, "why": [f"context pack: {e}"[:300]]}
-    keep = out / "cells" / f"{task['task']}-r{cell['rep']}-{cell['arm']}"
+    row.update(pack_fields(task) if pack else {})
+    keep = out / "cells" / f"{task['task']}-r{cell['rep']}-{cell['arm']}{'-fix' if fix else ''}"
     hidden = hidden_paths(bench_dir.resolve(), out.resolve(), [task.get("repo"), opts.get("repo")], opts.get("state"))
     tmp = Path(tempfile.mkdtemp(prefix="cell-"))
     logins, cell = [], None
@@ -896,6 +914,8 @@ def run_cell(bench_dir: Path, out: Path, task: dict, cell: dict, arm: dict, opts
         if problems := leaks(ws, task):
             return {**row, "outcome": "isolation_failed", "passed": False, "why": problems}
         start = bench._git(ws, "rev-parse", "HEAD").stdout.strip()
+        if fix and (why := apply_first_try(ws, str(fix.get("diff") or ""))):
+            return {**row, "outcome": "error", "passed": False, "why": [why]}
         try:   # the agent and all it starts run in the cell's own venv, the user site off
             cell_env = cellenv.env(cellenv.make(tmp / "venv", opts.get("cell_packages", cellenv.SEED)), _clean_env())
         except cellenv.Unavailable as e:
@@ -920,7 +940,9 @@ def run_cell(bench_dir: Path, out: Path, task: dict, cell: dict, arm: dict, opts
                 if opts.get("scratch_home", True) else ({}, [])
             own = session_dirs(ws, conf.get("CLAUDE_CONFIG_DIR"))
         text, copts = benchpack.frame(pack, prompt(spec, opts, grade_workers(cell_env))), opts
-        if arm.get("planner"):   # planner-then-executor: the plan comes first, its time counts in the limit
+        if fix:
+            text = f"{text}\n\n{FIX_HEADER}\n\n{str(fix.get('findings') or '').strip() or NO_FINDINGS}"
+        if arm.get("planner") and not fix:   # planner-then-executor: the plan comes first, its time counts in the limit
             plan, why = plan_step(tmp, ws, {**task, "pack_text": pack}, arm, opts, cfg, hidden, row, keep)
             if not plan:
                 return {**row, "outcome": "error", "passed": False, "why": [why]}
@@ -945,6 +967,29 @@ def run_cell(bench_dir: Path, out: Path, task: dict, cell: dict, arm: dict, opts
         if cell is not None:
             cell.close()
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+FIX_HEADER = ("A reviewer read your first try at this task and found it does not meet the requirements. Your first "
+              "try is already in the working tree, committed. Fix it: address each finding below against the "
+              "requirements, run the tests, and finish with the change complete. Do not start over unless the "
+              "findings call for it.\n\nThe reviewer's findings:")
+NO_FINDINGS = "(the reviewer wrote no notes: it scored the requirements or the correctness below the bar)"
+
+
+def apply_first_try(ws: Path, diff: str) -> str:
+    """Apply a first try's diff to the cell's workspace and commit it there (the base commit stays the cell's
+    start, so the final diff is the first try plus the fix). "" when done, else why not. An empty diff is a
+    first try that changed nothing: the fix round then starts from the base."""
+    if not diff.strip():
+        return ""
+    patch = ws.parent / "first-try.patch"
+    patch.write_text(diff if diff.endswith("\n") else diff + "\n")
+    got = bench._git(ws, "apply", "--whitespace=nowarn", str(patch))
+    if got.returncode != 0:
+        return f"the first try's diff does not apply to the base: {got.stderr.strip()[:300]}"
+    bench._git(ws, "add", "-A")
+    got = bench._git(ws, "-c", "user.name=bench", "-c", "user.email=bench@localhost", "commit", "-q", "-m", "first try")
+    return "" if got.returncode == 0 else f"could not commit the first try: {got.stderr.strip()[:300]}"
 
 
 PLAN_PROMPT = ("You are the planner for a coding task another engineer will carry out without asking you anything. "
