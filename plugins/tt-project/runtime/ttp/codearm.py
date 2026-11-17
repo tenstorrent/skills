@@ -52,6 +52,10 @@ BOUNCE = "needs_opus"               # the route entry's fallback for a bounce (r
 HARNESSES = ("claude-code",)        # the harnesses a live worker run can take
 FORCE = re.compile(r"(?mi)^\s*code_arm:\s*(claude|opus|sonnet)\b")
 CONCLUSION = re.compile(r"(?mi)^\s*conclusion:")
+# A spec that leaves a design or policy choice open (weigh options, a trade-off, no data settles it) is Opus's
+# deep thinking (user's rollout rule): kept off the arm model-free, since a dry-run GLM run decided one itself.
+JUDGMENT = re.compile(r"(?i)\bweigh(?:s|ing)?\b|\btrade-?offs?\b|\bno (?:measurements?|data|evidence)\b[^.\n]{0,40}"
+                      r"\bsettles?\b|\b(?:decide|choose)\s+(?:between|which design|the (?:design|policy|default))\b")
 REVERT_TITLE = re.compile(r"^Revert #(\d+)\b")
 REVERT_S = 3 * 86400.0
 WINDOW_S = 7 * 86400.0              # the table's and the guard's window
@@ -155,6 +159,8 @@ def stays(db, cfg: dict, task: dict, tier: str, picked: dict | None = None) -> s
         return "forced_claude"
     if CONCLUSION.search(str(task.get("spec") or "")):
         return "conclusion"
+    if JUDGMENT.search(str(task.get("spec") or "")):
+        return "judgment"
     if task.get("origin") == "user" or urgent.user_ordered(task):
         return "user_ordered"
     try:
@@ -217,10 +223,12 @@ def code_state(state: dict, arm: dict | None) -> dict:
 def contract(reason_hint: str = "") -> str:
     """The prompt block a run on the arm gets: when and how to bounce."""
     return ("\n\n## Needs Opus (your exit)\n"
-            "You run on the cheaper model arm. Hand the task back to Opus, at once and before you change anything, "
-            "when it needs deep thinking (a design choice, a root cause you cannot find from the code and logs, a "
-            "trade-off with no clear answer in the spec) or involves human interaction (a reply, a post, a review "
-            "comment, a person's decision). To hand it back, write result.json with "
+            "You run on the cheaper model arm. Opus does planning and deep thinking. Before your first edit, ask: does "
+            "the spec leave a choice for me to make (which design, policy or default, between options it names or "
+            "not, with no measurement or rule in the spec that settles it)? Must I find a root cause the code and "
+            "logs do not show? Does it involve a person (a reply, a post, a review comment, someone's decision)? "
+            "If any answer is yes, hand the task back to Opus at once and change nothing: do not decide it yourself, "
+            "even if you could. Build only what the spec already decided. To hand it back, write result.json with "
             '`{"status": "blocked", "needs_opus": "<one-line reason>", "summary": "needs Opus: <reason>"}` '
             "and stop (the `needs_opus` field makes it a hand-back, not a block). On that exit never run `ttp push`, `git push` or publish a branch; commits you made stay local. "
             "It spends no attempt and does not count as a failure." + (f"\n{reason_hint}" if reason_hint else ""))

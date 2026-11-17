@@ -46,6 +46,10 @@ def test_code_arm_keeps_resources_conclusions_forces_pins_devices_and_judgment_o
     assert codearm.stays(p.db, cfg, p.db.task(t["id"]), "standard") == "resources"
     assert codearm.stays(p.db, cfg, _ca_task(p, "fix it\nconclusion: the verdict"), "standard") != ""
     assert codearm.stays(p.db, cfg, _ca_task(p, "fix it\ncode_arm: claude"), "standard") == "forced_claude"
+    for spec in ("decide how to batch. There are no measurements that settle it. Weigh speed against reverts.",
+                 "pick a lock design; the trade-off is latency", "choose between per-repo and per-area batches"):
+        assert codearm.stays(p.db, cfg, _ca_task(p, spec), "standard") == "judgment", spec
+    assert codearm.stays(p.db, cfg, _ca_task(p, "drop the stale lock after use; the spec decided the design"), "standard") == ""
     assert codearm.stays(p.db, cfg, _ca_task(p, model="opus"), "standard") == "user_pin"
     assert codearm.stays(p.db, cfg, _ca_task(p, "optimize the kernel's throughput"), "standard") != ""
     assert codearm.stays(p.db, cfg, _ca_task(p), "deep") == "tier"
@@ -86,6 +90,7 @@ def test_needs_opus_bounce_reason_and_route_line():
     assert codearm.bounce_reason(None) == ""
     assert route.BOUNCE == codearm.BOUNCE
     assert '"needs_opus"' in codearm.contract() and "never run `ttp push`" in codearm.contract()
+    assert "do not decide it yourself" in codearm.contract()
 
 
 def test_a_bounce_keeps_the_task_on_opus_after(env):
