@@ -405,6 +405,34 @@ def test_post_land_failure_that_passes_on_rerun_is_flaky_quarantined_and_never_r
     assert gatejudge.file_orphans(p) == [], "already owned: the daemon's sweep files nothing more"
 
 
+def test_post_land_run_cut_short_without_a_list_of_failing_tests_is_rerun_then_reported_interrupted(
+        env, tmp_path, monkeypatch):
+    """A full run that exits non-zero with no complete list of failing tests (a host fault, a kill, a crash
+    before collection) says nothing about the change: it is rerun once, and a pass then is a pass. Cut short
+    again, it is reported as interrupted, never as a test failure: no revert, no fix task."""
+    from ttp import postland
+    n = tmp_path / "count"
+    once = f"sh -c \"c=\\$(cat {n} 2>/dev/null || echo 0); echo x >> {n}; [ \\$c = 0 ] && exit 2; {_PL_PASS}\""
+    p, g, pushed, _ = _pl_land(env, tmp_path, monkeypatch, once)
+    postland.tend(p, p.config())
+    assert postland.tend(p, p.config()) == f"post-landing checks passed on {pushed[:10]}; a run cut short passed on its rerun"
+    assert len(n.read_text().split()) == 2, "rerun once, not more"
+    assert p.db.kv(postland.KEY)["last"]["outcome"] == "pass"
+
+
+def test_post_land_run_cut_short_twice_is_reported_interrupted_never_failed_nor_reverted(env, tmp_path, monkeypatch):
+    from ttp import postland
+    p2, g2, pushed2, _ = _pl_land(env, tmp_path, monkeypatch, "sh -c \"echo 'collecting ...'; exit 2\"")
+    postland.tend(p2, p2.config())
+    assert postland.tend(p2, p2.config()) == "interrupted"
+    last = p2.db.kv(postland.KEY)["last"]
+    assert last["outcome"] == "interrupted" and "exited 2, then 2 on a rerun" in last["why"]
+    (ev,) = p2.db.q("SELECT * FROM events WHERE text LIKE ?", (f"Post-landing checks on {pushed2[:10]}: interrupted:%",))
+    assert "cut short" in ev["text"] and "unattributed" not in ev["text"]
+    assert not p2.db.q("SELECT id FROM tasks WHERE title LIKE 'Revert%' OR title LIKE 'Fix%'")
+    assert not p2.db.q("SELECT id FROM push_queue WHERE status='approved'")
+
+
 _PL_X = "tests/t.py::test_x"
 _PL_BAD = f"sh -c \"grep -qs bad pl*.txt && {{ {_PL_FAIL}; }}; {_PL_PASS}\""
 

@@ -237,7 +237,7 @@ def apply(p: Project, job: dict, got: dict) -> str:
     from . import pushq
     db, sha, out = p.db, job["sha"][:10], got.get("outcome")
     if out == "pass":
-        return f"post-landing checks passed on {sha}"
+        return f"post-landing checks passed on {sha}" + ("; a run cut short passed on its rerun" if got.get("rerun") else "")
     ids = " ".join(got.get("ids") or [])
     owned = got.get("owned") or {}
     named = " ".join(f"{i} (deflake #{t})" for i, t in sorted(owned.items()))
@@ -364,14 +364,24 @@ def _judge(p: Project, job: dict, checks: list, run, owned: dict) -> dict:
     from . import gatejudge, sharedchecks
     sha, points = job["sha"], job["points"]
     flaky: list[str] = []
+    cut: list[str] = []   # runs cut short that passed on their rerun
     for cmd in checks:
         rc, text = run(sha, cmd)
         if rc == 0:
             continue
         ids, complete = sharedchecks.failing_ids(text)
-        if not ids or not complete:
-            return {"outcome": "unattributed", "why": f"`{cmd}` exited {rc} without a complete list of failing tests",
-                    "cmd": str(cmd), "tail": text[-3000:]}
+        if not ids or not complete:   # cut short (a host fault, a kill, a crash): it says nothing of the change
+            rc2, text2 = run(sha, cmd)   # so once more, before anything is read into it
+            if rc2 == 0:
+                cut.append(f"`{cmd}` exited {rc} without a complete list of failing tests, then passed on a rerun")
+                continue
+            ids, complete = sharedchecks.failing_ids(text2)
+            if not ids or not complete:
+                return {"outcome": "interrupted", "cmd": str(cmd), "tail": text2[-3000:],
+                        "why": f"`{cmd}` exited {rc}, then {rc2} on a rerun, each time without a complete list of "
+                               "failing tests: the run was cut short (or could not collect its tests), so no test "
+                               "is known to fail and nothing is reverted"}
+            rc, text = rc2, text2
         again = gatejudge.failed_of(*run(sha, cmd, ids), ids, at="head")
         if again is None:
             return {"outcome": "undecided", "why": "the rerun could not tell", "ids": ids, "cmd": str(cmd)}
@@ -410,7 +420,7 @@ def _judge(p: Project, job: dict, checks: list, run, owned: dict) -> dict:
         # a fix owner like the tests gate's flakes get: the day's deflake task of each module
         tasks = gatejudge.deflake(p.db, new, seen, now, p, task_default_usd(cfg, "standard")) if new else []
         return {"outcome": "flaky" if flaky else "pass", "ids": flaky, "deflake": tasks, "before_fix": early}
-    return {"outcome": "pass"}
+    return {"outcome": "pass"} | ({"rerun": cut} if cut else {})
 
 
 def revert(p: Project, repo: Path, job: dict, e: dict, cmd, ids: list[str], run) -> dict:
