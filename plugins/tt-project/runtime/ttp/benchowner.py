@@ -15,6 +15,11 @@ SCHEDULE (`ttp model-bench run --detach`, daily at bench_at home time), SUITE_SC
 model-bench suite --detach`, an hour later, which first rebuilds its bench folders when stale) and,
 while model_bench.terminalbench.on, TB_SCHEDULE (`ttp model-bench terminalbench --detach`, hourly:
 tbcycle.py's model-free step; ensure_tb); every other project's are off.
+
+Failure streaks (streak): each scheduled cycle (the daily bench, the suite with its device A/B, a Terminal-Bench
+step) counts its failures in a row per schedule; a pass resets the count. The STREAK_FAILS-th failure in a row
+queues one observation event (source "model-bench", one per streak) naming the schedule and the cause, so a
+cycle that keeps failing is fixed the same day instead of only filling its log.
 """
 from __future__ import annotations
 
@@ -26,7 +31,8 @@ COMMAND = "ttp model-bench run --detach"
 SUITE_SCHEDULE = "model-suite"
 SUITE_COMMAND = "ttp model-bench suite --detach"
 LIVE_S = 900                       # a daemon heartbeat younger than this is a live daemon
-SEEN = "model-bench-owner-seen"    # kv: the poke this project's daemon handled last
+SEEN = "model-bench-owner-seen"
+STREAK_FAILS = 3                   # failures in a row of one scheduled cycle that raise its event    # kv: the poke this project's daemon handled last
 
 
 def settings(cfg: dict) -> dict:
@@ -171,3 +177,35 @@ def ensure_tb(p, db, owner: bool, on: bool) -> str:
     except Exception:   # the database holds it; the file catches up on the next change
         pass
     return did
+
+
+def streak(p, schedule: str, cause: str = "", now: float | None = None, *, what: str = "") -> int:
+    """Count one run of the scheduled cycle `schedule`: a failure (`cause`, one line) adds one, a pass (empty
+    cause) resets the count. The STREAK_FAILS-th failure in a row queues one observation event naming the
+    schedule (`what`, default "The scheduled bench cycle <schedule> failed") and the cause; one per streak. The count is
+    kept in streak-<schedule>.json in the bench folder. Returns the streak length."""
+    import time
+    from . import modelbench
+    from .project import durable_write
+    now = time.time() if now is None else now
+    f = modelbench.home() / f"streak-{schedule}.json"
+    try:
+        st = json.loads(f.read_text())
+        st = st if isinstance(st, dict) else {}
+    except (OSError, ValueError):
+        st = {}
+    if not cause:
+        if st.get("fails"):
+            durable_write(f, json.dumps({"fails": 0}))
+        return 0
+    st = {"fails": int(st.get("fails") or 0) + 1, "since": st.get("since") or now, "cause": cause.strip()[:400]}
+    f.parent.mkdir(parents=True, exist_ok=True)
+    durable_write(f, json.dumps(st))
+    if st["fails"] >= STREAK_FAILS:
+        fp = f"bench-streak:{schedule}:{int(st['since'])}"
+        if not p.db.one("SELECT 1 FROM events WHERE fingerprint = ? AND kind = 'observation'", (fp,)):
+            p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
+                   (now, "model-bench", "observation", fp, "normal",
+                    f"{what or f'The scheduled bench cycle {schedule} failed'} {st['fails']} times in a row: "
+                    f"{st['cause']}", "queued"))
+    return st["fails"]

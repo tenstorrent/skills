@@ -577,3 +577,24 @@ def test_replay_run_end_to_end_in_a_dry_run_builds_reviews_blind_and_writes_the_
     again = benchreplay.run_replay(arms, p.config(), cap=10.0, parallel=2, root=root, established=est, ask=ask,
                                    opts={"dry_run": True}, progress=lambda s: None, projects=proj, seed=1)
     assert len(prompts) == 4 and len(again["cells"]) == 4, "a rerun reuses the questions, the cells and the scores"
+
+
+def test_daily_table_marks_arms_that_ran_other_tasks_or_another_limit_not_comparable_and_says_how_each_was_called(tmp_path):
+    from ttp import benchdaily
+    root = tmp_path / "daily"
+    (root / "days").mkdir(parents=True)
+    cells = [_dd_cell("A", "son", "claude:s:high", 1, 4, 4, True, 0.5, 10),
+             _dd_cell("A", "glm", "chat:g:max:mini-swe-agent", 1, 4, 4, True, 2.0, 30, claude=False),
+             _dd_cell("A", "son", "claude:s:high", 2, 4, 4, True, 0.5, 10),
+             _dd_cell("A", "glm", "chat:g:max:mini-swe-agent", 2, 4, 4, True, 2.0, 30, claude=False)]
+    (root / "days" / "2026-11-14.json").write_text(json.dumps({"day": "2026-11-14", "cells": cells, "limit_s": 3600}))
+    benchdaily.write_table(root)
+    md = (root / "table.md").read_text()
+    assert "All 2 rows ran under the same conditions" in md, "a different harness is what the arms compare"
+    assert "- chat:g:max:mini-swe-agent: provider chat; kind chat endpoint through the run's bridge; effort max" in md
+    (root / "days" / "2026-11-15.json").write_text(json.dumps({"day": "2026-11-15", "limit_s": 1800, "cells": [
+        _dd_cell("A", "son", "claude:s:high", 3, 4, 4, True, 0.5, 10)]}))
+    benchdaily.write_table(root)
+    md = (root / "table.md").read_text()
+    assert "- task_set differs" in md and "- limit_s differs (most rows: 3600): claude:s:high 1800/3600" in md
+    assert "Not comparable: claude:s:high" in md

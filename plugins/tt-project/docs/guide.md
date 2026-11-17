@@ -1702,6 +1702,18 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    scores` and `show` list them beside the ranking, marked as reference, or, with none booked, an
    earlier 20-task subset result marked as such. With no endpoint saved, `--reference` prints one line
    naming the endpoint step and starts nothing.
+   For a same-conditions comparison, `reference.bridge` lists models called through the logged-in
+   `claude` CLI (no API key) and `reference.chat` models called through the project's chat endpoint by a
+   relay that times each call (under the `chat-server` lock, one such model at a time); `reference.run`
+   names the run's own folder and `limit_s` 0 gives every model each task's own limit. A chat-route task
+   cut off while the server ran slower than that model's normal speed is held out, never failed, and
+   rerun one at a time once a probe shows the server healthy (at most `reference.rounds` times). The run
+   then writes `table.md` in its folder: passed of scored per model, every cut-off with a server-or-model
+   verdict, median server wait and tokens/s, Claude dollars, the limit, `reference.note`, and a parity
+   section that marks any arm run on another task set, limit or rerun rule as not comparable and says
+   how each arm was called. The daily bench table carries the same parity section.
+   Every scheduled bench cycle (the daily bench, the suite, a Terminal-Bench step) counts its failures
+   in a row; the third raises one event naming the cause, so a cycle that keeps failing gets fixed.
    Endpoint faults (down, rate limit, auth) park nothing. With no ranked model served, or the whole endpoint
    cooling down, runs start on the core provider as before. Only `chat` has a served list: Claude
    Code, Codex and Cursor models are not ranked (provider failover covers a provider that cannot start

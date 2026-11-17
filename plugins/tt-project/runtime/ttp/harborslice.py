@@ -308,12 +308,23 @@ def trial(model: str, task: str, root: Path, env: dict, st: dict, runner: Callab
 
 
 def score(got: list[dict]) -> dict:
-    """{"passed", "trials", "pass_rate", "median_min", "faults"} of a model's trials; faults are not trials."""
-    done = [g for g in got if g["reward"] is not None]
+    """{"passed", "trials", "pass_rate", "median_min", "faults"} of a model's trials; faults are not trials.
+    A trial the server cut (outcome "server", serverhealth) is neither: it is counted as "server", not scored."""
+    srv = sum(g.get("outcome") == "server" for g in got)
+    done = [g for g in got if g["reward"] is not None and g.get("outcome") != "server"]
     mins = [g["min"] for g in done if g["min"] is not None]
     passed = sum(g["reward"] > 0 for g in done)
     return {"passed": passed, "trials": len(done), "pass_rate": round(passed / len(done), 3) if done else None,
-            "median_min": round(statistics.median(mins), 1) if mins else None, "faults": len(got) - len(done)}
+            "median_min": round(statistics.median(mins), 1) if mins else None,
+            "faults": len(got) - len(done) - srv, **({"server": srv} if srv else {})}
+
+
+def version(env: dict) -> str:
+    """The harbor version installed in the child's venv (its dist-info), '' when unknown."""
+    v = (env or {}).get("VIRTUAL_ENV")
+    for f in sorted(Path(v).glob("lib/*/site-packages/harbor-*.dist-info")) if v else []:
+        return f.name[len("harbor-"):-len(".dist-info")]
+    return ""
 
 
 def compose(root: Path, st: dict, env: dict | None = None, runner: Callable = _run,

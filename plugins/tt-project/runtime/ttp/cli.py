@@ -9045,12 +9045,58 @@ def cmd_model_bench(a) -> None:
         print(f"model {a.action if a.action != 'run' else 'bench'} started (pid {child.pid}; log {log})", file=sys.stderr)
         return
     now = _t.time()
+    from .benchowner import SCHEDULE, SUITE_SCHEDULE, TB_SCHEDULE
     if a.action == "suite":
-        return _model_suite(p, a, now)
-    if a.action == "terminalbench":
-        return _terminalbench(p, a, now)
-    out = modelbench.run(p.name, p.config(), modelrank.parked_models(p.db), now, force=a.force)
-    print(json.dumps(out, indent=1))
+        if a.dry_run or getattr(a, "reaudit", False) or getattr(a, "reference_from", None):
+            return _model_suite(p, a, now)
+        return _bench_cycle(p, SUITE_SCHEDULE, now, lambda: _model_suite(p, a, now))
+    if a.action == "terminalbench":   # its own pre-flight counts a cycle's dies (tbcycle.preflight); a crash counts here
+        if getattr(a, "reference", False) or a.runner:
+            return _terminalbench(p, a, now)
+        return _bench_cycle(p, TB_SCHEDULE, now, lambda: _terminalbench(p, a, now), dies=False)
+
+    def daily() -> None:   # a skip for a missing key fails the cycle; a busy lock or a bench done today is no run
+        out = modelbench.run(p.name, p.config(), modelrank.parked_models(p.db), now, force=a.force)
+        print(json.dumps(out, indent=1))
+        return out["failed"] if out.get("failed") else False if "skipped" in out else None
+    _bench_cycle(p, SCHEDULE, now, daily)
+
+
+class _LastLine:
+    """A stream that writes through and keeps the last line written (the cause a `die` printed)."""
+
+    def __init__(self, inner):
+        self.inner, self.last, self._part = inner, "", ""
+
+    def write(self, text: str) -> int:
+        lines = (self._part + text).split("\n")
+        self._part = lines[-1]
+        self.last = next((ln for ln in reversed(lines) if ln.strip()), self.last)
+        return self.inner.write(text)
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+
+def _bench_cycle(p, schedule: str, now: float, fn, dies: bool = True):
+    """Run one cycle of the bench owner's `schedule` and count it in benchowner.streak: an exception, a
+    non-zero exit (only with `dies`; the cause is the last line it printed to stderr) or a returned cause (a
+    string) is a failure, None a pass, and a skip (`fn` returns False) leaves the count alone."""
+    from . import benchowner
+    tee = sys.stderr = _LastLine(sys.stderr)
+    try:
+        got = fn()
+    except SystemExit as e:
+        if dies and e.code not in (0, None):
+            benchowner.streak(p, schedule, tee.last.removeprefix("ttp: ") or f"exit {e.code}", now)
+        raise
+    except Exception as e:
+        benchowner.streak(p, schedule, f"{type(e).__name__}: {e}", now)
+        raise
+    finally:
+        sys.stderr = tee.inner
+    if got is not False:
+        benchowner.streak(p, schedule, got if isinstance(got, str) else "", now)
 
 
 def _model_bench_argv(a) -> list[str]:
@@ -9108,13 +9154,15 @@ def _terminalbench(p, a, now: float) -> None:
 
 def _terminalbench_reference(p, a, cfg: dict) -> None:
     """`ttp model-bench terminalbench --reference`: the one-time reference run, by hand only (tbcycle.py).
-    A model in reference.bridge goes through the claude CLI and needs no endpoint; any other needs the saved
-    one: none saved, one plain line, nothing started."""
+    A model in reference.bridge goes through the claude CLI, one in reference.chat through the chat endpoint's
+    relay, and neither needs a reference endpoint; any other needs the saved one: none saved, one plain line,
+    nothing started."""
     from . import endpoint, harborslice, tbcycle
-    ref = tbcycle.settings(cfg)["reference"]
+    st = tbcycle.settings(cfg)
+    ref = st["reference"]
     alias = ref["endpoint"]
     got = endpoint.credentials(alias) if alias else None
-    bridged = a.runner in ref["bridge"] if a.runner else all(m in ref["bridge"] for m in ref["models"])
+    bridged = all(tbcycle.route(st, m) != tbcycle.ENDPOINT_ROUTE for m in ([a.runner] if a.runner else ref["models"]))
     if not got and not bridged:
         die("model-bench terminalbench --reference: no reference endpoint saved; save an Anthropic-capable one with "
             "`ttp secret endpoint <alias> --url <base url>`, then `ttp config <project> "

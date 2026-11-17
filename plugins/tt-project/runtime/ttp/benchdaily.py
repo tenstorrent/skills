@@ -582,14 +582,15 @@ def day_record(day: str, tasks: dict, arms: dict, out: Path, graded: dict, skipp
 def cumulative(root: Path | None = None) -> dict:
     """The running table from every day's record under `root`/days: per project and arm, and per arm overall."""
     root = root or home()
-    cells, gaps, seconds, server, reruns = [], [], [], [], []
+    cells, gaps, seconds, server, reruns, limits = [], [], [], [], [], {}
     days = sorted((root / "days").glob("*.json")) if (root / "days").exists() else []
     for p in days:
         try:
             rec = json.loads(p.read_text())
         except (OSError, ValueError):
             continue
-        cells += rec.get("cells") or []
+        cells += [{**c, "day": p.stem} for c in rec.get("cells") or []]
+        limits[p.stem] = rec.get("limit_s")
         server += [{"day": p.stem, **x} for x in rec.get("server") or []]
         reruns += [{"day": p.stem, **x} for x in rec.get("reruns") or []]
         if (cmp := (rec.get("second_grader") or {}).get("compare")):
@@ -620,7 +621,25 @@ def cumulative(root: Path | None = None) -> dict:
             "models": {m: agg(rs) for m, rs in sorted(per.items())}, "gaps": gaps,
             **({"server": server} if server else {}),
             **({"reruns": reruns} if reruns else {}),
+            "parity": [parity_row(m, rs, limits) for m, rs in sorted(per.items())],
             **({"second_days": seconds} if seconds else {})}
+
+
+PARITY_FIELDS = ("task_set", "tasks", "limit_s", "limit_counts", "rerun_rule")
+RERUN_RULE = "a cell the server cut is not scored and rerun one at a time once the server is healthy"
+
+
+def parity_row(key: str, cells: list[dict], limits: dict) -> dict:
+    """One model's conditions for the parity check (benchparity): its arm (provider:model:effort[:harness]),
+    the cells it ran (day/task) as the task set and the limit of each day it ran (one value, or each day's)."""
+    from . import benchparity
+    prov, model, effort, *h = key.split(":") + [""] * 3
+    lim = sorted({str(limits.get(c.get("day"))) for c in cells if limits.get(c.get("day")) is not None})
+    return {"arm": key, "model": model, "provider": prov, "effort": effort, "harness": h[0] or "claude (the provider's CLI)",
+            "agent": h[0] or "claude", "kind": "provider CLI" if not h[0] else "chat endpoint through the run's bridge",
+            "task_set": benchparity.task_set([f"{c.get('day')}/{c['task']}" for c in cells]), "tasks": len(cells),
+            "limit_s": "/".join(lim) if lim else None, "limit_counts": "the cell's wall time (a stop is a fail)",
+            "rerun_rule": RERUN_RULE}
 
 
 def _row(label: str, a: dict, second: bool = False) -> str:
@@ -659,6 +678,10 @@ def table_md(cum: dict) -> str:
                   "the cause says whether the server or the model stopped the first run:"]
         lines += [f"- {x['day']}: {x['task']} {x['arm']}: first run {(x.get('was') or {}).get('outcome') or 'stopped'}"
                   f" -> {x.get('rerun_outcome') or 'not rerun'}: {x['cause']}" for x in cum["reruns"]]
+    if cum.get("parity"):
+        from . import benchparity
+        # the harness is part of what an arm compares (the harness A/B), so only the conditions must match
+        lines += [""] + benchparity.section(cum["parity"], fields=PARITY_FIELDS)
     if cum.get("second_days"):
         lines += ["", "## Second grader", "", "The same masked batch graded again by a second model; the ranking is by mean "
                   "total, best first:"]
@@ -756,6 +779,7 @@ def run_day(day: str, start: float, end: float, arms: dict, cfg: dict, cap: floa
     rec = day_record(day, tasks, arms, out, graded, skipped, picked["dropped"])
     rec["faults"] = picked.get("faults", [])
     rec["admitted"] = done["admitted"]   # which reservation rule admitted each task
+    rec["limit_s"] = opts["timeout_s"]   # the parity check's limit (cumulative)
     rec["arms"] = {k: {f: v.get(f, "") for f in ("provider", "model", "effort", "harness")} for k, v in arms.items()}
     durable_write(root / "days" / f"{day}.json", json.dumps(rec, indent=1) + "\n")
     write_table(root)

@@ -252,7 +252,9 @@ def test_terminalbench_step_without_compose_stops_before_any_trial_with_one_mess
     err = capsys.readouterr().err.strip()
     assert len(err.splitlines()) == 1 and "docker compose is missing" in err
     assert started == [], "no step, no runner launched"
-    assert json.loads((tbcycle.folder() / tbcycle.PREFLIGHT_FILE).read_text())["fails"] == 1, "the failure is counted"
+    from ttp import benchowner, modelbench
+    assert json.loads((modelbench.home() / f"streak-{benchowner.TB_SCHEDULE}.json").read_text())["fails"] == 1, \
+        "the failure is counted"
 
 
 def test_terminalbench_compose_binary_in_the_benchs_own_folder_needs_no_setting(tmp_path, monkeypatch):
@@ -335,12 +337,13 @@ def test_terminalbench_reference_through_the_claude_bridge_has_no_endpoint_its_o
     monkeypatch.setattr(harborslice, "trial", fake_trial)
     _FakeBridge.made.clear()
     assert tbcycle.ref_runner(cfg, "claude-sonnet-5-5", {"A": "b"}, clock=lambda: clock["t"], bridge=_FakeBridge) == 3
+    assert len(_FakeBridge.made) == 3, "one bridge per trial: its server wait and tokens/s are the trial's own"
     b = _FakeBridge.made[0]
-    assert (b.model, b.effort, b.state) == ("claude-sonnet-5-5", "high", ["start", "stop"]), "up for the run, then down"
+    assert (b.model, b.effort, b.state) == ("claude-sonnet-5-5", "high", ["start", "stop"]), "up for the trial, then down"
     assert {x[1:3] for x in seen} == {("http://127.0.0.1:1/v1", "run-token")}, "the agent reaches the bridge, no key"
     assert all("reasoning_effort" not in x[3] for x in seen), "the CLI carries the effort, not the call arguments"
     row = tbcycle.reference()[0]
-    assert row["route"] == "claude-cli" and row["effort"] == "high" and row["cost_usd"] == 1.2345
+    assert row["route"] == "claude-cli" and row["effort"] == "high" and row["cost_usd"] == 3.7035, "the trials' bridges summed"
     assert row["claude_cli"] == "9.9 (Claude Code)" and row["passed"] == 3
     got = tbcycle.ref_start(cfg, ["something-else"], [].append)   # a bridge model needs no endpoint listing
     assert got["not_served"] == []
@@ -396,3 +399,170 @@ def test_terminalbench_preflight_raises_one_event_on_the_third_failure_in_a_row_
     assert len(events()) == 1, "two failures after a pass raise nothing"
     tbcycle.preflight(p, why, clock["t"] + 8)
     assert len(events()) == 2, "a new streak of three raises its own event"
+
+
+def _calls(n, tps, wait):
+    return [{"st": "ok", "out": 400, "tps": tps, "wait_s": wait} for _ in range(n)]
+
+
+class _FakeChat:
+    """The chat relay's surface (chatbridge.Bridge) with no process; per_call is the next trial's calls."""
+    made, plan = [], []
+
+    def __init__(self, model):
+        self.model, self.per_call = model, (_FakeChat.plan.pop(0) if _FakeChat.plan else _calls(12, 50.0, 1.0))
+        _FakeChat.made.append(self)
+
+    def start(self):
+        return self
+
+    def stop(self):
+        pass
+
+    def openai_env(self):
+        return {"OPENAI_BASE_URL": "http://127.0.0.1:2/v1", "OPENAI_API_KEY": "run-token"}
+
+    def stats(self):
+        return {"server": {"calls": len(self.per_call), "wait_median_s": self.per_call[0]["wait_s"],
+                           "tps_median": self.per_call[0]["tps"], "per_call": self.per_call}}
+
+
+def test_terminalbench_reference_chat_route_holds_out_a_slow_server_cut_reruns_it_healthy_and_writes_the_table(
+        env, monkeypatch):
+    from ttp import serverhealth, tbcycle
+    d, cfg, clock, sleeps, sleep = _tb_setup(env, monkeypatch, tasks=("t1", "t2", "t3"), limit_s=0, reference={
+        "models": ["open-m"], "chat": ["open-m"], "efforts": {"open-m": "max"}, "run": "r89", "parallel": 1,
+        "note": "older rows are not comparable"})
+    serverhealth.History(tbcycle.folder() / tbcycle.HISTORY).add("open-m", _calls(20, 50.0, 1.0))
+    _FakeChat.made.clear()
+    _FakeChat.plan[:] = [_calls(12, 50.0, 1.0), _calls(12, 5.0, 30.0), _calls(12, 50.0, 1.0), _calls(12, 50.0, 1.0)]
+    tries = []
+
+    def trial(model, task, root):
+        tries.append(task)
+        if task == "t2" and tries.count("t2") == 1:
+            return {"reward": 0.0, "min": 15.0, "error": "AgentTimeoutError"}   # cut while the server ran slow
+        if task == "t3":
+            return {"reward": 0.0, "min": 15.0, "error": "AgentTimeoutError"}   # cut at normal speed: the model's
+        return {"reward": 1.0, "min": 3.0, "error": None}
+    probes = []
+    monkeypatch.setattr(serverhealth, "probe", lambda b, m, *a, **k: probes.append(m) or
+                        {"ok": True, "wait_s": 1.0, "tps": 50.0})
+    assert tbcycle.ref_runner(cfg, "open-m", {}, trial=trial, clock=lambda: clock["t"], chat=_FakeChat,
+                              sleep=sleep) == 4
+    assert tries == ["t1", "t2", "t3", "t2"] and probes == ["open-m"], "the server's cut reran after a healthy probe"
+    lines = [json.loads(x) for x in (tbcycle.ref_dir("r89") / "open-m.jsonl").read_text().splitlines()]
+    assert lines[1]["outcome"] == "server" and lines[1]["reward"] is None and lines[1]["heldout_reward"] == 0.0
+    assert lines[2].get("outcome") != "server", "a cut at normal speed stays the model's fail"
+    assert lines[3]["task"] == "t2" and lines[3]["rerun"] == 1 and lines[3]["reward"] == 1.0
+    row = tbcycle.reference("r89")[0]
+    assert (row["passed"], row["trials"], row.get("server", 0)) == (2, 3, 0) and row["route"] == "chat"
+    assert row["limit_s"] == "each task's own (task.toml)" and "probe shows it healthy" in row["rerun_rule"]
+    assert not tbcycle.reference(), "a named run books apart from the default reference"
+    md = (tbcycle.ref_dir("r89") / "table.md").read_text()
+    assert "| open-m | max | chat | 2 of 3 |" in md
+    assert "open-m / t2: server (" in md and "rerun on a healthy server: passed" in md
+    assert "open-m / t3: model: cut at the limit while the server ran at normal speed" in md
+    assert "## How each arm was called" in md and "older rows are not comparable" in md
+
+
+def test_terminalbench_reference_rejudges_a_cut_made_before_the_models_normal_speed_was_known(env, monkeypatch):
+    from ttp import serverhealth, tbcycle
+    d, cfg, clock, sleeps, sleep = _tb_setup(env, monkeypatch, tasks=("t1", "t2"), reference={
+        "models": ["open-m"], "chat": ["open-m"], "parallel": 1, "rounds": 0})
+    _FakeChat.made.clear()
+    _FakeChat.plan[:] = [_calls(3, 5.0, 30.0), _calls(12, 50.0, 1.0)]   # t1's slow calls come first: no normal yet
+
+    def trial(model, task, root):
+        return {"reward": 0.0, "min": 15.0, "error": "AgentTimeoutError"} if task == "t1" else \
+            {"reward": 1.0, "min": 3.0, "error": None}
+    monkeypatch.setattr(serverhealth, "MIN_CALLS", 10)
+    tbcycle.ref_runner(cfg, "open-m", {}, trial=trial, clock=lambda: clock["t"], chat=_FakeChat, sleep=sleep)
+    got = tbcycle._rows(tbcycle.ref_dir("") / "open-m.jsonl", ["t1", "t2"])
+    assert got["t1"]["outcome"] == "server" and "server_calls" not in got["t1"], "judged again once normal was known"
+    row = tbcycle.reference()[0]
+    assert (row["passed"], row["trials"], row["server"]) == (1, 1, 1), "rounds 0: held out, never failed"
+
+
+def test_terminalbench_chat_reference_model_needs_no_reference_endpoint(env, monkeypatch):
+    from ttp import tbcycle
+    d, cfg, clock, sleeps, sleep = _tb_setup(env, monkeypatch, reference={
+        "models": ["a", "b", "c"], "bridge": ["a"], "chat": ["b"]})
+    s = tbcycle.settings(cfg)
+    assert [tbcycle.route(s, m) for m in "abc"] == ["claude-cli", "chat", "endpoint"]
+    got = tbcycle.ref_start(cfg, ["c"], [].append)
+    assert got["not_served"] == [], "only the endpoint route is checked against the endpoint's model list"
+    bad = {"model_bench": {"terminalbench": {"reference": {"run": "../x", "rounds": -1}}}}
+    assert tbcycle.settings(bad)["reference"]["run"] == "" and tbcycle.settings(bad)["reference"]["rounds"] == 3
+
+
+def test_bench_parity_marks_rows_with_a_different_limit_task_set_or_rerun_rule_not_comparable():
+    from ttp import benchparity
+    base = {"harness": "harbor 0.26.0", "agent": "terminus-2", "task_set": benchparity.task_set(["b", "a"]),
+            "tasks": 2, "limit_s": 900, "limit_counts": "agent wall time", "rerun_rule": "server cut-offs rerun",
+            "provider": "chat", "kind": "relay", "model": "m1", "effort": "max"}
+    assert benchparity.task_set(["a", "b"]) == base["task_set"], "order does not change the task set"
+    rows = [base, {**base, "model": "m2"}, {**base, "model": "m3", "limit_s": 0},
+            {**base, "model": "m4", "task_set": benchparity.task_set(["a", "c"])},
+            {**base, "model": "m5", "rerun_rule": "unlimited reruns"}]
+    got = benchparity.compare(rows)
+    assert set(got["differs"]) == {"limit_s", "task_set", "rerun_rule"}
+    assert got["not_comparable"] == ["m3 (max)", "m4 (max)", "m5 (max)"]
+    md = "\n".join(benchparity.section(rows))
+    assert "Not comparable: m3 (max), m4 (max), m5 (max)" in md and "- m1 (max): provider chat; kind relay" in md
+    assert "All 2 rows ran under the same conditions" in "\n".join(benchparity.section(rows[:2]))
+    assert "(not recorded)" in "\n".join(benchparity.section([base, {"model": "old", "effort": "x"}]))
+
+
+def test_every_scheduled_bench_cycle_raises_one_event_naming_its_cause_on_the_third_failure_in_a_row(env, monkeypatch, capsys):
+    import argparse as ap
+    from ttp import benchowner, cli, modelbench
+    d, cfg, clock, sleeps, sleep = _tb_setup(env, monkeypatch)
+    p = make(env)
+    events = lambda: [r["text"] for r in p.db.q("SELECT text FROM events WHERE source = 'model-bench'")]
+    out = {"v": {"skipped": "no working key for chat endpoint gw: 401", "report": True,
+                 "failed": "no working key for chat endpoint gw: 401"}}
+    monkeypatch.setattr(modelbench, "run", lambda *x, **k: out["v"])
+    monkeypatch.setattr(cli, "here", lambda: p)
+    p.config = lambda: cfg
+    daily = ap.Namespace(action="run", detach=False, force=False)
+    for _ in range(2):
+        cli.cmd_model_bench(daily)
+    assert events() == []
+    out["v"] = {"skipped": "another project on this host is running today's bench", "report": False}
+    cli.cmd_model_bench(daily)
+    assert events() == [], "a busy lock is no run: the streak neither grows nor resets"
+    out["v"] = {"skipped": "no working key for chat endpoint gw: 401", "report": False,
+                "failed": "no working key for chat endpoint gw: 401"}
+    cli.cmd_model_bench(daily)
+    ev = events()
+    assert len(ev) == 1 and "model-bench failed 3 times in a row" in ev[0] and "401" in ev[0], ev
+    cli.cmd_model_bench(daily)
+    assert len(events()) == 1, "one event per streak"
+    out["v"] = {"date": "d", "results": {}}
+    cli.cmd_model_bench(daily)
+    assert json.loads((modelbench.home() / "streak-model-bench.json").read_text())["fails"] == 0, "a pass resets"
+
+    def suite(fail):   # the suite (with its device A/B) dies with its cause on stderr
+        def fn():
+            if fail:
+                cli.die("model-bench suite: no complete bench folder pair")
+        return lambda: cli._bench_cycle(p, benchowner.SUITE_SCHEDULE, clock["t"], fn)
+    for _ in range(3):
+        with pytest.raises(SystemExit):
+            suite(True)()
+    ev = [t for t in events() if "model-suite" in t]
+    assert len(ev) == 1 and "no complete bench folder pair" in ev[0] and "ttp: " not in ev[0], ev
+    assert "no complete bench folder pair" in capsys.readouterr().err, "the cause still reaches the log"
+
+    def crash():
+        raise RuntimeError("step broke")
+    for _ in range(3):   # a Terminal-Bench step that crashes counts in the same streak as its pre-flight
+        with pytest.raises(RuntimeError):
+            cli._bench_cycle(p, benchowner.TB_SCHEDULE, clock["t"], crash, dies=False)
+    ev = [t for t in events() if "terminalbench" in t]
+    assert len(ev) == 1 and "RuntimeError: step broke" in ev[0], ev
+    for _ in range(3):
+        with pytest.raises(SystemExit):   # its pre-flight already counted a die: not counted twice
+            cli._bench_cycle(p, benchowner.TB_SCHEDULE, clock["t"] + 10, lambda: cli.die("off"), dies=False)
+    assert json.loads((modelbench.home() / "streak-terminalbench.json").read_text())["fails"] == 3

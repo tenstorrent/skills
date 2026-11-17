@@ -207,7 +207,8 @@ def bench(model: str, ask: Callable[[str, str], str]) -> dict:
 
 def run(project: str, cfg: dict, parked: dict[str, float], now: float, *, force: bool = False,
         lister=None, ask=None) -> dict:
-    """Today's bench for the host, under LOCK. Returns {"skipped": why, "report": bool} or today's record
+    """Today's bench for the host, under LOCK. Returns {"skipped": why, "report": bool} (with "failed": why
+    when no endpoint key works: the cycle failed rather than skipped) or today's record
     ({"date", "owner", "arms", "results", "weak"}). `lister(url, key)` and `ask(model, prompt)` replace the
     endpoint calls (tests)."""
     from . import endpoint, modelrank
@@ -230,7 +231,7 @@ def run(project: str, cfg: dict, parked: dict[str, float], now: float, *, force:
             report = not _read(d / OWNER).get("nokey_since")
             owner_update(lambda o: {**o, "nokey_since": o.get("nokey_since") or now, "tried": now})
             _write(today, {"date": day(now), "owner": project, "at": now, "skipped": why, "report": report})
-            return {"skipped": why, "report": report}
+            return {"skipped": why, "report": report, "failed": why}
         ask = ask or (lambda m, p: _post(got.url, got.key, m, p))
         picked = arms(modelrank.ranking(cfg), list(ids), parked, now)
         results = {m: {**bench(m, ask), "arm": arm} for m, arm in picked.items()}

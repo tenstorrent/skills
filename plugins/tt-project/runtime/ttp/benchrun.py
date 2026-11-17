@@ -1275,24 +1275,12 @@ def server_status(row: dict, ended: dict, opts: dict) -> None:
     `server` (not scored, never a fail, queued for a rerun) when it was cut by the limit, the ceiling or a
     capacity refusal while its calls ran slower than the model's normal speed (serverhealth.classify). A
     cell that passed stays a pass. The healthy cells' calls define each model's normal speed."""
-    bridge = ended.get("bridge") or {}
-    srv = bridge.get("server") or {}
     row["limit_rule"] = (ended.get("limits") or {}).get("rule") or "wall_time"
     if ended.get("limits"):
         row["limits"] = ended["limits"]
-    if srv:
-        row["server"] = {k: v for k, v in srv.items() if k != "per_call"}
-    hist, factor = history(opts), server_factor(opts)
-    normal = hist.normal(row.get("model", ""), int(opts.get("server_min_calls") or serverhealth.MIN_CALLS))
-    if normal:
-        row["server_normal"] = normal
-    if row.get("outcome") in ("fail", "done", "error"):
-        why = serverhealth.classify(ended.get("stopped"), bridge, normal, factor)
-        if why:
-            serverhealth.mark(row, why)
-            return
-    if srv.get("per_call") and not serverhealth.slow(srv["per_call"], normal, factor):
-        hist.add(row.get("model", ""), srv["per_call"])
+    serverhealth.judge(row, ended.get("stopped"), ended.get("bridge") or {}, history(opts), server_factor(opts),
+                       int(opts.get("server_min_calls") or serverhealth.MIN_CALLS),
+                       scored=row.get("outcome") in ("fail", "done", "error"))
 
 
 def criteria(spec: str) -> str:
@@ -1352,37 +1340,18 @@ def resolve_harness(arm: dict, opts: dict) -> dict:
     return got
 
 
-PROBE_PROMPT = "Count from 1 to 120, separated by single spaces. Write only the numbers."
+PROBE_PROMPT = serverhealth.PROBE_PROMPT
 
 
 def chat_probe(cfg: dict, model: str, effort: str = "", max_tokens: int = 200) -> dict:
     """A short health probe of the chat endpoint for `model`: one streamed call through a bridge (so the call is
     timed as a cell's calls are): {ok, wait_s, tps, out}. Never raises; a refusal or an outage is {ok: False}."""
-    import urllib.request
     from . import chatbridge
     try:
         bridge = chatbridge.Bridge.from_settings(chatbridge.settings(cfg, "standard", model, effort))
     except Exception as e:   # no key, no endpoint: the probe cannot tell, and says so
         return {"ok": False, "why": f"{type(e).__name__}"}
-    try:
-        bridge.start()
-        req = urllib.request.Request(bridge.url + "/v1/chat/completions", method="POST", data=json.dumps({
-            "model": model, "stream": True, "max_tokens": max_tokens,
-            "messages": [{"role": "user", "content": PROBE_PROMPT}]}).encode(),
-            headers={"content-type": "application/json", "authorization": f"Bearer {bridge.token}"})
-        with urllib.request.urlopen(req, timeout=180) as r:
-            while r.read(4096):
-                pass
-    except Exception as e:
-        return {"ok": False, "why": f"{type(e).__name__}"}
-    finally:
-        bridge.stop()
-    rows = bridge.calls.export().get("per_call") or []
-    ok = [r for r in rows if r.get("st") == "ok"]
-    if not ok:
-        return {"ok": False, "why": "no answered call"}
-    last = ok[-1]
-    return {"ok": True, "wait_s": last["wait_s"], "tps": last["tps"], "out": last["out"]}
+    return serverhealth.probe(bridge, model, PROBE_PROMPT, max_tokens)
 
 
 def rerun_server(bench_dir: Path, out: Path, opts: dict, cfg: dict, probe=None, sleep=time.sleep,

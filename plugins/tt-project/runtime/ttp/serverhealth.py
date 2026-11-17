@@ -295,6 +295,61 @@ def wait_healthy(probe, normal: dict | None, factor: float = FACTOR, every_s: fl
         sleep(every_s)
 
 
+def judge(row: dict, stopped: str | None, bridge: dict, hist: "History", factor: float = FACTOR,
+          min_calls: int = MIN_CALLS, scored: bool = True) -> list[str]:
+    """Record what the server did to one cell (row's `server`: the call summary, `server_normal`) and mark it
+    `server` when classify says so; a cell that is not `scored` (a pass) is never marked. Healthy calls of an
+    unmarked cell join the model's History. Returns the reasons it was marked, [] when it was not."""
+    b = bridge or {}
+    srv = b.get("server") or {}
+    if srv:
+        row["server"] = {k: v for k, v in srv.items() if k != "per_call"}
+    model = str(row.get("model") or "")
+    normal = hist.normal(model, min_calls)
+    if normal:
+        row["server_normal"] = normal
+    if scored:
+        why = classify(stopped, b, normal, factor)
+        if why:
+            mark(row, why)
+            return why
+    if srv.get("per_call") and not slow(srv["per_call"], normal, factor):
+        hist.add(model, srv["per_call"])
+    return []
+
+
+PROBE_PROMPT = "Count from 1 to 120, separated by single spaces. Write only the numbers."
+
+
+def probe(bridge, model: str, prompt: str = PROBE_PROMPT, max_tokens: int = 200, timeout_s: float = 180.0) -> dict:
+    """A short health probe through a bench bridge (not yet started; it is started and stopped here): one
+    streamed call, timed as a cell's calls are: {ok, wait_s, tps, out}. Never raises; a refusal or an
+    outage is {ok: False}."""
+    import urllib.request
+    try:
+        bridge.start()
+        req = urllib.request.Request(bridge.url + "/v1/chat/completions", method="POST", data=json.dumps({
+            "model": model, "stream": True, "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": prompt}]}).encode(),
+            headers={"content-type": "application/json", "authorization": f"Bearer {bridge.token}"})
+        with urllib.request.urlopen(req, timeout=timeout_s) as r:
+            while r.read(4096):
+                pass
+    except Exception as e:
+        return {"ok": False, "why": f"{type(e).__name__}"}
+    finally:
+        try:
+            bridge.stop()
+        except Exception:
+            pass
+    rows = bridge.calls.export().get("per_call") or []
+    ok = [r for r in rows if r.get("st") == "ok"]
+    if not ok:
+        return {"ok": False, "why": "no answered call"}
+    last = ok[-1]
+    return {"ok": True, "wait_s": last["wait_s"], "tps": last["tps"], "out": last["out"]}
+
+
 def describe(row: dict) -> str:
     """How a table shows a cell: `not scored (server)` for a server cell, else its outcome."""
     return NOT_SCORED if row.get("outcome") == OUTCOME else str(row.get("outcome") or "")

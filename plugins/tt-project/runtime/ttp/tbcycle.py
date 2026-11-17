@@ -36,12 +36,27 @@ agent reaches as OPENAI_BASE_URL; no API key, no endpoint), at its effort (refer
 reference.effort); its row carries route "claude-cli", the CLI version and the dollars it reported. Every
 other model goes through the endpoint and its runner is wrapped in `ttp lock <reference.lock>` (default
 LOCK, "" for none), so one endpoint model runs at a time. reference.parallel (default 1) runs that many of a
-model's tasks at once. limit_s 0 (harborslice) gives every model its task's own limit.
+model's tasks at once. limit_s 0 (harborslice) gives every model its task's own limit. A model listed in
+reference.chat goes through the project's chat endpoint (providers.chat; no reference endpoint needed) by a
+loopback relay in the runner (one per trial, like the bridge) that times every call, under the same lock.
+reference.run names a comparison run: its trials, rows and table live in terminalbench/<run> (ref_dir) and
+reference.note is printed in its table.
+
+Server verdicts (serverhealth): a chat-route trial cut at its limit (or refused) while the server answered
+slower than this model's normal speed (server-history.json) is held out as outcome "server", never failed;
+a cut made before the normal speed was known is judged again once it is (rejudge). Once the pool is done,
+each held-out task is rerun one at a time after a probe shows the server healthy (probe_every_s up to
+probe_max_s), at most reference.rounds times, with the same limit. The run books each row once nothing is
+owed and writes terminalbench/<run>/table.md (table): passed of scored per model, the server-held tasks, the
+cut-offs with a server-or-model verdict each, median server wait and tokens/s, Claude dollars, the limit,
+benchparity.section (same task set, limit and rerun rule, and how each arm was called) and the note.
 
 Pre-flight (preflight): a cycle that cannot start (no working endpoint key, no harbor venv, no docker
-compose) used to fail only in terminalbench.log. Each failure is counted in terminalbench/preflight.json and
-a pass resets it; the PREFLIGHT_FAILS-th failure in a row raises one observation event (source
-"model-bench", one per streak) naming the cause, so the owner fixes it the same day.
+compose) used to fail only in terminalbench.log. Each failure is counted in the bench owner's streak of
+TB_SCHEDULE (benchowner.streak, which also counts a step that crashed) and a pass resets it; the
+PREFLIGHT_FAILS-th (benchowner.STREAK_FAILS) failure in a row raises one observation
+event (source "model-bench", one per streak, benchowner.streak) naming the cause, so the owner fixes it the
+same day.
 """
 from __future__ import annotations
 
@@ -59,8 +74,14 @@ REF, REF_FILE, REF_MODELS, REF_EFFORT = "reference", "reference.jsonl", ("claude
 # Shown until a reference run is booked: an earlier run of the DEFAULT_TASKS subset (Terminus 2, 900 s per task).
 SUBSET_REFERENCE = ({"model": "Opus 5.5", "effort": "low", "passed": 14, "trials": 20},
                     {"model": "Sonnet 5.5", "effort": "low", "passed": 14, "trials": 20})
-LOCK, BRIDGE_ROUTE = "chat-server", "claude-cli"
-PREFLIGHT_FILE, PREFLIGHT_FAILS = "preflight.json", 3
+LOCK, BRIDGE_ROUTE, CHAT_ROUTE, ENDPOINT_ROUTE = "chat-server", "claude-cli", "chat", "endpoint"
+KIND = {BRIDGE_ROUTE: "bridge: the logged-in claude CLI (claude -p) behind a loopback server, no API key",
+        CHAT_ROUTE: "endpoint: the chat endpoint (providers.chat) through a loopback relay that times each call",
+        ENDPOINT_ROUTE: "endpoint: the saved reference endpoint, called directly"}
+PROVIDER = {BRIDGE_ROUTE: "claude", CHAT_ROUTE: "chat", ENDPOINT_ROUTE: "endpoint"}
+ROUNDS, PROBE_EVERY_S, PROBE_MAX_S, HISTORY = 3, 120.0, 3600.0, "server-history.json"
+RESERVED = {REF, "cycles", "harbor", "compose"}
+PREFLIGHT_FAILS = 3   # benchowner.STREAK_FAILS
 SUBSET_NOTE = "20-task subset (2026-10-27, low effort, 900 s per task)"
 
 
@@ -76,46 +97,35 @@ def settings(cfg: dict) -> dict:
     ms = r.get("models")
     eff = str(r.get("effort") or REF_EFFORT)
     br, ef = r.get("bridge"), r.get("efforts")
-    par = r.get("parallel")
+    par, rd, run = r.get("parallel"), r.get("rounds"), str(r.get("run") or "")
+    ch = r.get("chat")
+
+    def secs(k, d):
+        v = r.get(k, d)
+        return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0 else d
     ref = {"endpoint": str(r.get("endpoint") or ""),
            "models": [str(m) for m in ms if str(m).strip()] if isinstance(ms, list) else list(REF_MODELS),
            "effort": eff if eff.isalpha() else REF_EFFORT,   # it goes into the harbor command line
            "bridge": [str(m) for m in br if str(m).strip()] if isinstance(br, list) else [],
            "efforts": {str(k): str(v) for k, v in ef.items() if str(v).isalpha()} if isinstance(ef, dict) else {},
            "parallel": int(par) if isinstance(par, int) and not isinstance(par, bool) and par >= 1 else 1,
+           "chat": [str(m) for m in ch if str(m).strip()] if isinstance(ch, list) else [],
+           "run": run if run.replace("-", "").replace("_", "").replace(".", "").isalnum() and run not in RESERVED
+           and not run.startswith(".") else "",
+           "note": str(r.get("note") or ""),
+           "rounds": int(rd) if isinstance(rd, int) and not isinstance(rd, bool) and rd >= 0 else ROUNDS,
+           "probe_every_s": secs("probe_every_s", PROBE_EVERY_S), "probe_max_s": secs("probe_max_s", PROBE_MAX_S),
            "lock": str(r["lock"]) if isinstance(r.get("lock"), str) else LOCK}
     return {**harborslice.settings(cfg), "cycle_h": max(hours("cycle_h", CYCLE_H), 1.0),
             "new_model_h": hours("new_model_h", NEW_MODEL_H), REF: ref}
 
 
 def preflight(p, cause: str = "", now: float | None = None) -> int:
-    """Count a cycle's pre-flight: a failure (`cause`, one line) adds one, a pass (empty cause) resets the count.
-    The PREFLIGHT_FAILS-th failure in a row queues one observation event naming the cause (one per streak).
-    Returns the streak length."""
-    from .project import durable_write
-    now = time.time() if now is None else now
-    f = folder() / PREFLIGHT_FILE
-    try:
-        st = json.loads(f.read_text())
-        st = st if isinstance(st, dict) else {}
-    except (OSError, ValueError):
-        st = {}
-    if not cause:
-        if st.get("fails"):
-            durable_write(f, json.dumps({"fails": 0}))
-        return 0
-    st = {"fails": int(st.get("fails") or 0) + 1, "since": st.get("since") or now, "cause": cause[:400]}
-    folder().mkdir(parents=True, exist_ok=True)
-    durable_write(f, json.dumps(st))
-    if st["fails"] >= PREFLIGHT_FAILS:
-        fp = f"terminalbench-preflight:{int(st['since'])}"
-        if not p.db.one("SELECT 1 FROM events WHERE fingerprint = ? AND kind = 'observation'", (fp,)):
-            p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
-                   (now, "model-bench", "observation", fp, "normal",
-                    f"Terminal-Bench cycles failed their pre-flight {st['fails']} times in a row, so no trial runs: "
-                    f"{st['cause']}", "queued"))
-    return st["fails"]
-
+    """Count a cycle's pre-flight in benchowner.streak (schedule TB_SCHEDULE): a failure
+    (`cause`, one line) adds one, a pass (empty cause) resets the count; the PREFLIGHT_FAILS-th failure in a row
+    queues one observation event naming the cause (one per streak). Returns the streak length."""
+    from . import benchowner
+    return benchowner.streak(p, benchowner.TB_SCHEDULE, cause, now, what="Terminal-Bench cycles failed their pre-flight")
 
 def folder() -> Path:
     from . import modelbench
@@ -300,10 +310,25 @@ def _pace(model: str, n: int, at: float) -> None:
         lock.close()
 
 
-def reference() -> list[dict]:
-    """The booked reference rows, one per model (the first booked; module doc)."""
+def ref_dir(run: str = "") -> Path:
+    """Where a reference run keeps its trials and rows: terminalbench/reference, or terminalbench/<run> for a
+    named comparison run (reference.run)."""
+    return folder() / (run or REF)
+
+
+def ref_file(run: str = "") -> Path:
+    return ref_dir(run) / REF_FILE if run else folder() / REF_FILE
+
+
+def route(s: dict, model: str) -> str:
+    """How a reference model is called: the claude CLI bridge, the chat endpoint's relay or the reference endpoint."""
+    return BRIDGE_ROUTE if model in s[REF]["bridge"] else CHAT_ROUTE if model in s[REF]["chat"] else ENDPOINT_ROUTE
+
+
+def reference(run: str = "") -> list[dict]:
+    """The booked reference rows, one per model (the first booked; module doc); `run`: a named run's."""
     out: dict[str, dict] = {}
-    for r in _rows(folder() / REF_FILE).values():
+    for r in _rows(ref_file(run)).values():
         if isinstance(r.get("model"), str):
             out.setdefault(r["model"], r)
     return list(out.values())
@@ -331,14 +356,16 @@ def ref_start(cfg: dict, served: list[str] | None, launch: Callable[[str], None]
     """Start a reference runner per reference model not booked, not running and served by the endpoint
     (`served` None: unknown, all)."""
     from .harborslice import slug
-    booked = {r["model"] for r in reference()}
+    s = settings(cfg)
+    run = s[REF]["run"]
+    booked = {r["model"] for r in reference(run)}
     got: dict[str, list] = {"launched": [], "booked": [], "running": [], "not_served": []}
-    for m in settings(cfg)[REF]["models"]:
+    for m in s[REF]["models"]:
         if m in booked:
             got["booked"].append(m)
-        elif served is not None and m not in served and m not in settings(cfg)[REF]["bridge"]:
+        elif served is not None and m not in served and route(s, m) == ENDPOINT_ROUTE:
             got["not_served"].append(m)
-        elif (held := _locked(folder() / REF / f"{slug(m)}.lock")) is None:
+        elif (held := _locked(ref_dir(run) / f"{slug(m)}.lock")) is None:
             got["running"].append(m)
         else:
             held.close()
@@ -357,71 +384,249 @@ def ref_effort(s: dict, model: str) -> str:
     return s[REF]["efforts"].get(model) or s[REF]["effort"]
 
 
+def parity(s: dict, model: str, meta: dict, via: str, harbor: str) -> dict:
+    """The conditions a reference row ran under (benchparity.FIELDS and how it was called): never a key or URL."""
+    from . import benchparity
+    lim = s["limit_s"]
+    return {"harness": f"harbor {harbor}".strip(), "agent": s["agent"], "provider": PROVIDER[via], "route": via,
+            "kind": KIND[via], "model": model, "effort": meta["effort"],
+            "task_set": benchparity.task_set(meta["tasks"]), "tasks": len(meta["tasks"]),
+            "limit_s": int(lim) if lim else "each task's own (task.toml)",
+            "limit_counts": "harbor's agent timeout: the agent's wall time per task, model calls included",
+            "rerun_rule": (f"a cut-off or capacity refusal while the server ran slow is not scored and rerun one at "
+                           f"a time once a probe shows it healthy (up to {s[REF]['rounds']} reruns); no limit raise"
+                           if via != ENDPOINT_ROUTE else "none: every trial is scored as it ran")}
+
+
 def ref_runner(cfg: dict, model: str, env: dict, *, trial: Callable | None = None, clock: Callable = time.time,
-               bridge: Callable | None = None) -> int:
+               bridge: Callable | None = None, chat: Callable | None = None, sleep: Callable = time.sleep) -> int:
     """Run `model`'s reference tasks (resuming), then book its row once; returns trials run. A booked model
     runs nothing (module doc). A bridge model gets the claude CLI's loopback server (bridge(model, effort)
-    builds it) for the run; reference.parallel tasks run at once."""
+    builds it), a chat model the chat endpoint's relay (chat(model)), one per trial so its server wait and
+    tokens/s are the trial's own; reference.parallel tasks run at once. A trial cut while the server ran slow
+    is `server` (serverhealth.judge): not scored, rerun one at a time once a probe shows the server healthy."""
+    import shutil
     from concurrent.futures import ThreadPoolExecutor
     from threading import Event, Lock
-    from . import harborslice, modelbench, modelsuite
+    from . import harborslice, modelbench, modelsuite, serverhealth
     from .project import durable_write
-    if any(r["model"] == model for r in reference()):
+    s = settings(cfg)
+    run = s[REF]["run"]
+    if any(r["model"] == model for r in reference(run)):
         return 0
-    d, sl = folder() / REF, harborslice.slug(model)
+    d, sl = ref_dir(run), harborslice.slug(model)
+    d.mkdir(parents=True, exist_ok=True)
     held = _locked(d / f"{sl}.lock")
     if held is None:
         return 0   # its reference runner is already running
-    s, home, ran = settings(cfg), modelbench.home(), 0
-    via = BRIDGE_ROUTE if model in s[REF]["bridge"] else "endpoint"
+    home, ran = modelbench.home(), 0
+    via = route(s, model)
     try:
         meta = json.loads((d / f"{sl}.json").read_text())
     except (OSError, ValueError):
-        meta = {"started": clock(), "tasks": harborslice.tasks(home, s), "effort": ref_effort(s, model), "route": via}
+        meta = {"started": clock(), "tasks": harborslice.tasks(home, s), "effort": ref_effort(s, model), "route": via,
+                "model": model}
+        meta["parity"] = parity(s, model, meta, via, harborslice.version(env))
         durable_write(d / f"{sl}.json", json.dumps(meta))
-    srv, cost = None, 0.0
     try:
         if via == BRIDGE_ROUTE:   # the logged-in CLI, no key: the agent's env points at the loopback server
             from .claudebridge import ClaudeCliBridge
-            srv = (bridge or (lambda m, e: ClaudeCliBridge.from_settings({"model": m, "effort": e})))(
-                model, meta["effort"]).start()
-            env = {**env, **srv.openai_env()}
+            mk = bridge or (lambda m, e: ClaudeCliBridge.from_settings({"model": m, "effort": e}))
+            make = lambda: mk(model, meta["effort"])   # noqa: E731
+        elif via == CHAT_ROUTE:   # the chat endpoint's key stays in the relay; the effort rides in the call (ref_command)
+            from . import chatbridge
+            mk = chat or (lambda m: chatbridge.Bridge.from_settings(chatbridge.settings(cfg, "standard", m, "")))
+            make = lambda: mk(model)   # noqa: E731
+        else:
+            make = None
         cmd = harborslice.COMMAND if via == BRIDGE_ROUTE else ref_command(meta["effort"])
-        trial = trial or (lambda m, t, root: harborslice.trial(m, t, root, env, s, command=cmd, home=home))
-        done, put = _rows(d / f"{sl}.jsonl", meta["tasks"]), Lock()
+        hist = serverhealth.History(folder() / HISTORY)
+        done, put, dead, info = _rows(d / f"{sl}.jsonl", meta["tasks"]), Lock(), Event(), {}
 
-        dead = Event()
+        def attempt(t: str, n: int = 0) -> dict:
+            b = make() if make else None
+            e, st, cost = env, {}, None
+            if b is not None:
+                b.start()
+                e = {**env, **b.openai_env()}
+            try:
+                got = (trial(model, t, d / "trials") if trial else
+                       harborslice.trial(model, t, d / "trials", e, s, command=cmd, home=home))
+                if b is not None:
+                    st = b.stats() or {}
+                    cost = b.cost_so_far() if hasattr(b, "cost_so_far") else None
+                    info.setdefault("cli", (st.get("claude_cli") or {}).get("version", ""))
+            finally:
+                if b is not None:
+                    b.stop()
+            r = {"task": t, "at": clock(), "model": model, **got, **({"rerun": n} if n else {}),
+                 **({"cost_usd": round(cost, 4)} if cost else {})}
+            if b is not None:
+                stopped, scored = "timeout" if got.get("error") == "AgentTimeoutError" else None, not (got.get("reward") or 0) > 0
+                with put:   # History is one file shared by the parallel trials
+                    normal = hist.normal(model)
+                    if serverhealth.judge(r, stopped, st, hist, scored=scored):
+                        r["heldout_reward"], r["reward"] = got.get("reward"), None
+                    elif scored and stopped and not normal:
+                        # cut before the model's normal speed was known: judged again once it is (rejudge)
+                        r["server_calls"] = {k: st[k] for k in ("busy", "upstream", "last_fault") if k in st}
+                        r["server_calls"]["server"] = {"per_call": (st.get("server") or {}).get("per_call") or []}
+            return r
+
+        def rejudge() -> None:
+            normal = hist.normal(model)
+            for t in meta["tasks"]:
+                r = done.get(t) or {}
+                if not normal or "server_calls" not in r:
+                    continue
+                r = {k: v for k, v in r.items() if k != "server_calls"}
+                why = serverhealth.classify("timeout" if r.get("error") == "AgentTimeoutError" else None,
+                                            done[t]["server_calls"], normal)
+                r["server_normal"] = normal
+                if why:
+                    serverhealth.mark(r, why)
+                    r["heldout_reward"], r["reward"] = r.get("reward"), None
+                keep(r)
+
+        def keep(r: dict) -> None:
+            with put:
+                done[r["task"]] = r
+                modelsuite._append(d / f"{sl}.jsonl", r)
 
         def one(t):
             if dead.is_set():
                 return   # a trial died: start no more
             try:
-                r = {"task": t, "at": clock(), **trial(model, t, d / "trials")}
+                keep(attempt(t))
             except BaseException:
                 dead.set()
                 raise
-            with put:
-                done[t] = r
-                modelsuite._append(d / f"{sl}.jsonl", r)
         todo = [t for t in meta["tasks"] if t not in done]
         with ThreadPoolExecutor(max_workers=max(1, min(s[REF]["parallel"], len(todo) or 1))) as pool:
             for f in [pool.submit(one, t) for t in todo]:
                 f.result()
         ran = len(todo)
+        rejudge()
+        while make is not None:   # the server's cut-offs: one at a time, each after a healthy probe
+            left = [done[t] for t in meta["tasks"] if done[t].get("outcome") == serverhealth.OUTCOME
+                    and int(done[t].get("rerun") or 0) < s[REF]["rounds"]]
+            if not left:
+                break
+            ok, _ = serverhealth.wait_healthy(lambda: serverhealth.probe(make(), model), hist.normal(model),
+                                              every_s=s[REF]["probe_every_s"], max_s=s[REF]["probe_max_s"],
+                                              sleep=sleep, clock=clock)
+            if not ok:
+                break   # still slow: the cut-offs stay not scored (server); a later start reruns them
+            r = left[0]
+            shutil.rmtree(d / "trials" / sl / harborslice.slug(r["task"]), ignore_errors=True)
+            keep(attempt(r["task"], int(r.get("rerun") or 0) + 1))
+            ran += 1
+        if any(done[t].get("outcome") == serverhealth.OUTCOME and int(done[t].get("rerun") or 0) < s[REF]["rounds"]
+               for t in meta["tasks"]):
+            if run:
+                write_table(run, s[REF]["note"])
+            return ran   # reruns still owed: booked once the server lets them run
         extra = {}
-        if srv is not None:
-            cost = srv.cost_so_far()
-            extra = {"cost_usd": round(cost, 4), "claude_cli": srv.stats().get("claude_cli", {}).get("version", "")}
+        if make is not None:
+            spent = sum(float(r.get("cost_usd") or 0) for r in _rows(d / f"{sl}.jsonl").values())
+            extra = {"cost_usd": round(spent, 4)} if via == BRIDGE_ROUTE else {}
+            if info.get("cli"):
+                extra["claude_cli"] = info["cli"]
         sc = harborslice.score([done[t] for t in meta["tasks"]])
-        modelsuite._append(folder() / REF_FILE, {
+        modelsuite._append(ref_file(run), {
             "date": modelbench.day(clock()), "model": model, "suite": "terminalbench", "reference": True,
             "effort": meta["effort"], "agent": s["agent"], "dataset": s["dataset"], "started": meta["started"],
-            "route": via, "tasks": len(meta["tasks"]), "at": clock(), **extra, **sc, "score": sc["pass_rate"]})
+            "route": via, **parity(s, model, meta, via, harborslice.version(env)), "at": clock(), **extra, **sc,
+            "score": sc["pass_rate"], **({"run": run} if run else {})})
+        if run:
+            write_table(run, s[REF]["note"])
         return ran
     finally:
-        if srv is not None:
-            srv.stop()
         held.close()
+
+
+def _med(xs: list) -> float | None:
+    import statistics
+    xs = [x for x in xs if isinstance(x, (int, float))]
+    return round(statistics.median(xs), 1) if xs else None
+
+
+def _verdict(r: dict, lines: list[dict]) -> str | None:
+    """A cut-off's verdict ("server" or "model", with why), None when the task was never cut."""
+    from . import serverhealth
+    cut = [x for x in lines if x.get("error") == "AgentTimeoutError" or x.get("outcome") == serverhealth.OUTCOME]
+    if not cut:
+        return None
+    if r.get("outcome") == serverhealth.OUTCOME:
+        return "server, not scored: " + "; ".join(r.get("server_reason") or [])
+    if any(x.get("outcome") == serverhealth.OUTCOME for x in cut):
+        first = next(x for x in cut if x.get("outcome") == serverhealth.OUTCOME)
+        res = "passed" if (r.get("reward") or 0) > 0 else "cut at the limit at normal speed" if r.get(
+            "error") == "AgentTimeoutError" else "failed"
+        return f"server ({'; '.join(first.get('server_reason') or [])}); rerun on a healthy server: {res}"
+    srv = r.get("server") or {}
+    if r.get("server_normal"):
+        n = r["server_normal"]
+        return (f"model: cut at the limit while the server ran at normal speed (median wait {srv.get('wait_median_s')} s, "
+                f"{srv.get('tps_median')} tokens/s; normal {n.get('wait_s')} s, {n.get('tps')} tokens/s)")
+    if srv:
+        return "model: cut at the limit; no normal server speed known for this model, so the server was not judged"
+    return "model: cut at the limit (no server timing on this route)"
+
+
+def table(run: str, note: str = "") -> str:
+    """The named run's markdown table (terminalbench/<run>/table.md): passed of the task count per model over
+    scored trials, cut-offs with a server-or-model verdict each, median server wait and tokens/s, the limit,
+    Claude dollars, parity and how each model was called. Read from the trial rows, so it shows a run in progress."""
+    from . import benchparity, harborslice, serverhealth
+    d, metas = ref_dir(run), []
+    for f in sorted(d.glob("*.json")):
+        try:
+            m = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(m, dict) and isinstance(m.get("tasks"), list):
+            metas.append((f.stem, m))
+    booked = {r["model"] for r in reference(run)}
+    out = [f"# Terminal-Bench run {run}", "",
+           "| model | effort | route | passed | scored | not scored (server) | faults | not run | cut-offs "
+           "| median server wait s | median tokens/s | Claude $ | state |",
+           "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    cuts, pars = [], []
+    for sl, m in metas:
+        tasks, model = m["tasks"], m.get("model") or sl
+        all_lines = list(_rows(d / f"{sl}.jsonl").values())
+        latest = _rows(d / f"{sl}.jsonl", tasks)
+        sc = harborslice.score(list(latest.values()))
+        n_cut = 0
+        for t in tasks:
+            if t in latest and (v := _verdict(latest[t], [x for x in all_lines if x.get("task") == t])):
+                n_cut += 1
+                cuts.append(f"- {model} / {t}: {v}")
+        srv = [x.get("server") or {} for x in latest.values() if x.get("outcome") != serverhealth.OUTCOME]
+        cost = sum(float(x.get("cost_usd") or 0) for x in all_lines)
+        par = {**(m.get("parity") or {}), "model": model, "effort": m.get("effort")}
+        pars.append(par)
+        out.append(f"| {model} | {m.get('effort')} | {m.get('route')} | {sc['passed']} of {len(tasks)} | {sc['trials']} "
+                   f"| {sc.get('server', 0)} | {sc['faults']} | {len(tasks) - len(latest)} | {n_cut} "
+                   f"| {_med([x.get('wait_median_s') for x in srv])} | {_med([x.get('tps_median') for x in srv])} "
+                   f"| {round(cost, 2) if m.get('route') == BRIDGE_ROUTE else '-'} "
+                   f"| {'booked' if model in booked else 'running or owed reruns'} |")
+    lims = sorted({str(p.get("limit_s")) for p in pars})
+    out += ["", f"Passed counts scored trials only; the denominator is the task count. Limit: {', '.join(lims) or '?'} "
+            f"(seconds per task, or each task's own limit), counted as {pars[0].get('limit_counts') if pars else '?'}.", "",
+            "## Cut-offs", ""] + (cuts or ["None."]) + [""]
+    out += benchparity.section(pars, extra=("route",))
+    if note:
+        out += ["## Note", "", note, ""]
+    return "\n".join(out)
+
+
+def write_table(run: str, note: str = "") -> Path:
+    from .project import durable_write
+    path = ref_dir(run) / "table.md"
+    durable_write(path, table(run, note))
+    return path
 
 
 def launch(p, model: str, reference: bool = False) -> None:
@@ -434,7 +639,7 @@ def launch(p, model: str, reference: bool = False) -> None:
         argv = [sys.executable, "-m", "ttp", "model-bench", "terminalbench", *(["--reference"] * reference),
                 "--runner", model]
         ref = settings(p.config())[REF]
-        if reference and ref["lock"] and model not in ref["bridge"]:   # one endpoint model at a time
+        if reference and ref["lock"] and model not in ref["bridge"]:   # one endpoint or chat model at a time
             argv = [sys.executable, "-m", "ttp", "lock", ref["lock"], "--", *argv]
         # own session: the paced benchmark runner outlives the daemon tick that starts it
         subprocess.Popen(argv,
