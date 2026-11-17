@@ -7,3 +7,7 @@
 - model-bench terminalbench: a local dataset folder goes to harbor by --path; the chat arms send the effort through the relay's providers.chat.effort_fields and the how-called line records the request fields (t8716)
 - bench replay: the table ends with the parity check and how each arm was called; a harness-less arm's parity row names its own provider's CLI, not claude (t8716)
 - bench: TB trials gate on the engine host's idle CPU (remote engines too); trials with no model call or broken by failed calls are not run, rerun and shown as not run (t8716)
+- bench: a TB trial harbor broke before grading (lost docker engine) is not run and rerun, never a fail (t8716)
+- bench: an unreachable docker engine stops the TB runner with no row written, so it never uses up reruns or books a model (t8716)
+- tests: exempt the bench fix round's scratch first-try patch from the durable-write check (t8716)
+- bench: the TB table shows failed server calls (stream or parse errors included) of all calls per model, and names harbor-broken trials as not run (t8716)
