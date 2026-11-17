@@ -250,6 +250,10 @@ Measurement rules, all in one place:
   exceeds its cycle gain (and the reverse).
 - Step-time noise is one to two percent; for smaller changes report device time with the clock
   stated.
+- The timed region is the one the composite phase declared (upload, forward, backward, gradient
+  sync, optimiser) and does not grow: data preparation, loss read-back, per-step assertions and
+  evidence writes stay outside it. An iteration that changes what the timer covers is not a
+  speed-up; re-time the previous row the same way before comparing.
 - The host is quiet: no torch reference, build, profiler or other heavy host job runs during a
   timing run. Check before the run and record what was running; a run taken beside a CPU reference
   is a diagnostic, not a result row, however clean its telemetry looks.

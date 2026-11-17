@@ -161,6 +161,13 @@ its candidate. Create `doc/optimization/README.md` and `doc/perf_analysis.md` in
 row (composite baseline), the first ranked cost table (per-copy cost times slice copies, a ranking, not a step time), and
 the three per-copy tables with the scaling check in the evidence directory.
 Record actual compute cores, participating chips, useful FLOPs and nominal peak with the baseline.
+State what the step timer contains, and keep host bookkeeping out of it. The timed region is the
+training step: the input upload, the forward, the backward, the gradient sync and the optimiser.
+Tokenisation and batch assembly, the host read-back of the loss, per-step assertions over the
+parameter list, allocator snapshots and evidence writes all sit outside it, or the number is not a
+step time and every MFU built on it is wrong in the model's favour. Where host work genuinely
+belongs to the step (an unavoidable read-back, a data path that cannot be prefetched), it stays
+inside and the README says so, with its measured cost, as a loop candidate.
 Exclude compilation and warmup from timing, and inspect per-step time and loaded clock trends;
 if they are still settling, extend the run to report a settled window or label the result transient.
 Keep cold, warm, random-init and real-weight measurements distinct when comparing runs.
