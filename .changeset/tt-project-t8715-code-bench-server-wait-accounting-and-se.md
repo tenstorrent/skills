@@ -12,3 +12,4 @@
 - bridge: claude bridge streams chat-completion chunks and reads the XML parameter form of tool calls (t8715)
 - bridge: one tool call per reply in the claude bridge prompt, both call forms parsed (t8715)
 - bridge: the chat relay forwards only data lines of a stream, so named events and comments from an upstream no longer break an OpenAI client (t8715)
+- bridge: the claude bridge mends a model's slips in the tool-call form (doubled opener, tool_call_args tag, stray closers, open last block, raw newlines in JSON) (t8715)
