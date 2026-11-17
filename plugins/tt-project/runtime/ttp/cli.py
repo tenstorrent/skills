@@ -15374,6 +15374,11 @@ def _merge_upstream(h: Path, tmp: Path, ident: list[str], base: str = "main",
         subprocess.run(["git", "-C", str(h), "worktree", "remove", "--force", str(tmp)], capture_output=True)
 
 
+def cmd_rollout(a) -> None:
+    from . import rollout
+    sys.exit(rollout.run(a))
+
+
 def cmd_alerts(a) -> None:
     if (a.ack is not None) != (a.why is not None) or a.why is not None and not a.why.strip():
         die("ttp alerts: --ack <message id> requires a non-empty --why <text>")
@@ -15630,7 +15635,7 @@ TASK_TIERS = ("light", "standard", "deep")                              # as cha
 # `ttp --help` lists the commands in these groups; a command in none is listed under "other".
 COMMAND_GROUPS = (
     ("everyday", ("new", "connect", "web", "status", "say", "listen", "list", "overview", "find", "task",
-                  "memory", "obligation", "config", "pause", "resume", "drain", "alerts", "issues", "mute",
+                  "memory", "obligation", "config", "pause", "resume", "drain", "alerts", "rollout", "issues", "mute",
                   "quarantine", "machines", "runs", "logs", "doctor")),
     ("inside a run", ("note", "steer", "urgent-reply", "notify", "progress", "checks", "checks-shard", "checks-yield", "lock",
                       "occupancy", "host-run", "detach", "devq", "push", "install-check", "land", "express", "clip", "sandbox", "pool-wait", "pool-admit",
@@ -17403,6 +17408,16 @@ def main(argv: list[str] | None = None) -> None:
                    "it closes, or a keyed one moves to the feed while it holds")
     s.add_argument("--why", help="reason for acknowledging the alert (required with --ack)")
     s.set_defaults(fn=cmd_alerts)
+
+    s = sub.add_parser("rollout", help="release rings: show or change which projects a flagged change is on for")
+    s.add_argument("action", choices=["status", "ring", "set", "promote", "rollback", "arm"],
+                   help="status; ring PROJECT 0|1|2|exclude|include; set FLAG off|0|1|2; promote FLAG (one ring wider); "
+                        "rollback FLAG (off and frozen); arm FLAG (a fix landed: unfreeze)")
+    s.add_argument("target", nargs="?", help="the project (ring) or the flag")
+    s.add_argument("value", nargs="?", help="the ring (ring) or the level (set)")
+    s.add_argument("--reason", help="why (kept in the rollout ledger)")
+    s.add_argument("--json", action="store_true", help="status as JSON")
+    s.set_defaults(fn=cmd_rollout)
 
     s = sub.add_parser("consent", help="the user's one answer per question asked once (desktop notifier, local "
                        "view tunnels): show it, or record it")

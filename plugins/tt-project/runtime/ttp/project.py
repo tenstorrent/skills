@@ -3298,13 +3298,17 @@ ACCOUNT_KEYS = {"budget": {"global_daily_usd", "daily_target_usd", "day_start", 
                            "no_spill_hosts",   # hosts no project's checks spill to (checkspill.no_spill; a run only adds)
                            "slurm_overflow",   # a Slurm cluster the pool's overflow runs on (slurmcheck)
                            "smoke_max_s",
-                           *CPU_GROUP_KEYS}}   # the landing check time limit (gatetime.max_s), project first
+                           *CPU_GROUP_KEYS},   # the landing check time limit (gatetime.max_s), project first
+                # release rings (rollout.py): flags {flag: off|0|1|2}, rings {"0": [names], "1": [names]}, excluded [names],
+                # thresholds (the health watch's limits), scratch_cap_usd (a ring-0 scratch project's daily spend cap)
+                "rollout": {"flags", "rings", "excluded", "thresholds", "scratch_cap_usd"}}
 # Account keys a run may only clear (ttp config --account refuses setting them inside a run): remove them
 # ('') or set them to their off value (ACCOUNT_OFF_VALUE), which only reduces their reach.
 # The ranking's source and key file too: the key goes to that source, so only the user names either.
 ACCOUNT_USER_ONLY = {"checks.spill_hosts", "checks.slurm_overflow", "providers.chat.ranking_source",
-                     "providers.chat.ranking_key_file"}
-ACCOUNT_OFF_VALUE = {"checks.spill_hosts": [], "checks.slurm_overflow": {}}
+                     "providers.chat.ranking_key_file", "rollout.flags", "rollout.rings", "rollout.excluded",
+                     "rollout.thresholds", "rollout.scratch_cap_usd"}
+ACCOUNT_OFF_VALUE = {"checks.spill_hosts": [], "checks.slurm_overflow": {}, "rollout.flags": {}}
 # Host-wide account keys the runtime reads only from the account settings: a project's own copy would
 # show a value nothing uses, so layered() shows the account's in every project and set_config refuses one.
 # Account keys three deep, below a provider: never merged into a project's settings (a project that does not

@@ -5101,3 +5101,19 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   `./systemctl`) or over ssh are flagged as such: a local shim does not stop them.
 - Resuming a lost run's session works on Claude Code and Codex; Cursor starts fresh.
 - A laptop pauses while it sleeps. Use an always-on machine for round-the-clock work.
+
+## Release rings
+
+A big change ships dark behind a flag that widens ring by ring. Ring 0 is throwaway scratch projects
+(a clone whose only remote is a local bare repo), ring 1 a small canary set of real projects, ring 2 every
+other project; a project listed in neither is ring 2, and an excluded project never takes a flag. The state is
+the account settings every project already reads (`rollout.flags`, `rollout.rings`, `rollout.excluded`) plus an
+append-only ledger, `rollout.jsonl`, in the account home. A flag is `off` or the widest ring that has it on; a
+project's own explicit setting for the feature's key wins over the ring rule, and the ring rule is read on each
+daemon tick, so a change needs no restart.
+
+`ttp rollout status` shows it; `ttp rollout ring <project> 0|1|2|exclude|include`, `set <flag> off|0|1|2`
+and `promote <flag>` change it; `rollback <flag>` turns a flag off and freezes it until `arm <flag>` (a fix
+landed). Only the user's terminal widens a flag or edits the ring lists; a run may read the state or roll a
+flag back. The command writes only the account settings and the ledger, never a project's charter, memory,
+config or state. The shipped defaults list no project: which projects are in ring 1 is the account's setting.
