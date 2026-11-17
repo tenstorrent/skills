@@ -89,6 +89,24 @@ def test_claude_cli_render_keeps_the_system_prompt_byte_for_byte_and_round_trips
     assert [json.loads(c["function"]["arguments"]) for c in calls] == [{"command": "ls"}, {"command": "pwd"}]   # the bridge keeps the first
 
 
+def test_claude_cli_parse_reply_mends_a_models_slips_in_the_call_form():
+    from ttp import claudebridge
+    tool = {"type": "function", "function": {"name": "exec_command", "parameters": {"type": "object", "properties": {
+        "cmd": {"type": "string"}, "yield_time_ms": {"type": "integer"}}}}}
+    want = {"cmd": "ls\nwc", "yield_time_ms": 5}
+    body = '{"cmd": "ls\nwc", "yield_time_ms": 5}'   # a raw newline inside the JSON string
+    for reply in (f'<tool_call name="exec_command">\n<tool_call name="exec_command">\n{body}\n</tool_call>\n</tool_call>',
+                  f'<tool_call name="exec_command">\n<tool_call_args>\n{body}\n</tool_call_args>\n</tool_call>',
+                  f'<tool_call name="exec_command">\n<tool_call_args>\n{body}\n</tool_call>',
+                  f'<tool_call name="exec_command">\n{body}\n</parameter>\n</tool_call>',
+                  f'Doing it.\n<tool_call name="exec_command">\n{body}'):
+        text, calls = claudebridge.parse_reply(reply, [tool])
+        assert len(calls) == 1 and json.loads(calls[0]["function"]["arguments"]) == want and text in ("", "Doing it."), reply
+    cut = '<tool_call name="exec_command">\n{"cmd": "ls", "yield'   # cut off mid-reply: stays text, no call
+    text, calls = claudebridge.parse_reply(cut, [tool])
+    assert calls == [] and text == cut
+
+
 def test_claude_cli_render_blocks_only_grow_so_each_call_reuses_the_previous_calls_prompt_cache():
     from ttp import claudebridge
     call = lambda n: {"id": f"c{n}", "type": "function", "function": {"name": "bash", "arguments": json.dumps({"command": f"x{n}"})}}

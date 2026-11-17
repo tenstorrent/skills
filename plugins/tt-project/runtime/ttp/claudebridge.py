@@ -188,6 +188,32 @@ def _typed(found: dict, schema: dict) -> dict:
     return out
 
 
+_OPEN = re.compile(r'<tool_call\b[^>]*>')
+_STRAY = re.compile(r'(?:\s*</(?:tool_call_args|parameter|invoke)>)+\s*$')
+
+
+def _tidy(text: str, singles: dict) -> str:
+    """The reply with a model's slips in the call form mended: a doubled opener, a <tool_call_args> tag around
+    the JSON, doubled closers, and a final block left open when its JSON arguments are whole."""
+    text = re.sub(r'(<tool_call\b[^>]*>)(?:\s*<tool_call\b[^>]*>)+', r'\1', text)
+    text = re.sub(r'(<tool_call\b[^>]*>\s*)<tool_call_args[^>]*>', r'\1', text)
+    text = re.sub(r'</tool_call_args>(\s*</tool_call>)', r'\1', text)
+    text = re.sub(r'(</tool_call>)(?:\s*</tool_call>)+', r'\1', text)
+    last = None
+    for last in _OPEN.finditer(text):
+        pass
+    if last and "</tool_call>" not in text[last.end():] and "</invoke>" not in text[last.end():]:
+        name = (_NAME.search(last.group(0)) or [None, ""])[1]
+        if singles.get(name) == "":   # a JSON-argument tool: the arguments must be whole to take an open block
+            body = _STRAY.sub("", text[last.end():]).strip()
+            try:
+                json.loads(body, strict=False)
+                text = text[:last.end()] + "\n" + body + "\n</tool_call>"
+            except ValueError:
+                pass
+    return text
+
+
 def parse_reply(text: str, tools: list[dict]) -> tuple[str, list[dict]]:
     """(text outside the tool blocks, OpenAI tool_calls) of the CLI's reply. A block for an unknown tool
     is left as text for the agent to meet (its format error), never dropped."""
@@ -224,7 +250,7 @@ def parse_reply(text: str, tools: list[dict]) -> tuple[str, list[dict]]:
             args = {single: _unwrap(body, single)}
         else:
             try:
-                args = json.loads(body)
+                args = json.loads(_STRAY.sub("", body) if body.lstrip().startswith("{") else body, strict=False)   # raw newlines in a string are read as meant
             except ValueError:   # the XML form a CLI model falls back to: <parameter name="p">v</parameter>
                 found = {k: v.strip("\n") for k, v in _PARAM.findall(body)}
                 if not found:
@@ -234,7 +260,7 @@ def parse_reply(text: str, tools: list[dict]) -> tuple[str, list[dict]]:
         calls.append({"id": f"call_{n}", "type": "function",
                       "function": {"name": name, "arguments": json.dumps(args)}})
         return ""
-    rest = _BLOCK.sub(take, text.strip()).strip()
+    rest = _BLOCK.sub(take, _tidy(text.strip(), singles)).strip()
     rest = _INVOKE.sub(take_invoke, rest).strip()   # the XML form the model was trained on, alone or mixed in
     return rest, calls
 
