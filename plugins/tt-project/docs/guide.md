@@ -4171,7 +4171,22 @@ turn. `waketier.direct` counts, per task kind and wake reason, the last `waiting
 and more than `share` (0.5) of them escalated, such a wake runs at the task's own tier at once. Wakes
 of a wait handed back unchanged, escalated wakes and failure reasons never take it, and
 `waiting.wake_escalation.enabled` false turns it off. `ttp stats --wakes` lists each kind and reason's
-escalation rate. The daemon applies the pick where it sets a wake's tier.
+escalation rate. The pick is a function for the daemon's wake-tier step to call; that call is not wired yet.
+
+## A big ETA gets an independent check
+
+An ETA that covers 3 or more owner tasks (`eta.min_tasks`) or more than 4 hours (`eta.min_hours`) is a
+plan one agent wrote alone. When the coordinator records or changes such an obligation or promise,
+`etacheck.sweep` queues one urgent review-kind task, the checker, with no model call: the obligation,
+its owner tasks, their ETA lines (the estimate is shown as preliminary) and the files their specs name.
+The checker answers in its hand-off with `eta_check`: a verdict (`ok`, `optimistic`, `pessimistic`,
+`unclear`) and up to 5 proposals to finish sooner. STATE's `ETA checks` section shows each open order's
+check (queued, running, or the verdict with its proposals) and asks the coordinator to carry them in its
+next post on the order. A check is found by its label (obligation and owner-set digest), so it is queued
+once per owner set; a failed one is retried once. `eta.check_route` picks its model: `review` (default,
+the review route), a tier (`light`, `standard`) or `{"tier", "provider", "model", "effort"}`; a checker
+never runs at max, and `eta.enabled` false turns the check off. The sweep runs in the coordinator's apply
+of obligations and promises; a daemon tick that also runs it is not wired yet.
 
 ## Where things live
 
