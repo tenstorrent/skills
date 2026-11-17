@@ -314,3 +314,20 @@ def test_a_second_failed_review_with_an_open_fix_gets_its_own_fix_and_re_review(
     assert out and out[0] != fid and dep in out[2], out
     assert "the second finding" not in p.db.task(fid)["spec"]
     assert f'"review_fix:{rev2}"' in p.db.task(out[0])["labels"]
+
+
+def test_a_review_fix_continues_the_task_the_review_depends_on_never_one_its_spec_only_mentions(env):
+    """A review's spec cited a later change that builds on the reviewed branch (a stack): the fix went on
+    that later task. The review's own dependency decides; a review with no dependency still takes the covered
+    stack's tip."""
+    p = make(env)
+    from ttp.db import continues_id
+    base_id, base_branch, _, (rev,) = _finish_code(env, p, "reviewed change", {"core.py": 30})
+    later, later_branch, _, _ = _finish_code(
+        env, p, "builds on it", {"extra.py": 10},
+        edit=lambda path: _git_out(path, "-c", "user.name=t", "-c", "user.email=t@t", "merge", "-q", "--no-edit",
+                                   base_branch))
+    p.db.update_task(rev["id"], spec=rev["spec"] + f"\nIt must fit with #{later} (branch {later_branch}).")
+    _fail_review(env, p, rev["id"], [{"title": "wake storm", "spec": "add hysteresis"}])
+    (fix,) = p.db.q("SELECT * FROM tasks WHERE title LIKE ?", (f"Fix review #{rev['id']}:%",))
+    assert continues_id(fix) == base_id != later, "the fix went on a task the spec only mentions"

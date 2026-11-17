@@ -21682,9 +21682,10 @@ class Daemon:
                 return self._fix_external_review(review, first, ext[0], ext[1], fups, summary)
         code = None
         try:
-            # A review of a stack (a fix on top of its change) is fixed on the stack's tip. A branch
-            # its spec only mentions (another change it must fit with) is no part of the stack.
-            for group in (cands, [t for t in cands if t["id"] in deps]):
+            # The fix continues the task the review depends on, never one its spec only mentions (another
+            # change it must fit with, or one that builds on the reviewed branch): the review's own
+            # dependencies decide first; with none, the covered tasks' stack tip does.
+            for group in ([t for t in cands if t["id"] in deps], cands):
                 tips = [t for t in group if all(o is t or worktree._closest_ancestor(self.p, [o["branch"]], t["branch"])
                                                 for o in group)]
                 if tips:
