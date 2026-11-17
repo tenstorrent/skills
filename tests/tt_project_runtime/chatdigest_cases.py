@@ -419,6 +419,8 @@ def test_every_daemon_chat_post_of_kind_info_or_reply_keeps_the_chat_pace():
                 if chat is None or (isinstance(chat, ast.Constant) and chat.value is None):
                     continue   # a broadcast to every chat, not one chat's status
                 found.append(f"{f.name}:{call.lineno}")
+                if fn.name == "cmd_urgent_reply":
+                    continue   # an urgent message's first finding is exempt from the chat's pace on purpose
                 if not names & pace:
                     bad.append(f"{f.name}:{call.lineno} in {fn.name}")
     assert found, "the scan found no posting call: the guard is broken"

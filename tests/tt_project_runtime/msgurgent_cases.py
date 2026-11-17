@@ -251,7 +251,7 @@ def test_urgent_messages_are_read_first_by_the_coordinator_wake_and_the_digest(e
     a = _urg_inbound(p, "status: all green")
     b = _urg_inbound(p, "urgent: the live stream is down")
     c = _urg_inbound(p, "ok thanks")
-    rows = p.db.q("SELECT * FROM messages WHERE direction='in' ORDER BY id")
+    rows = [r for r in p.db.q("SELECT * FROM messages WHERE direction='in' ORDER BY id") if r["id"] in (a, b, c)]
     ordered, ids = msgurgent.first(p.db, p.config(), rows)
     assert [m["id"] for m in ordered] == [b, a, c] and ids == {b}
     plain, none = msgurgent.first(p.db, p.config(), [r for r in rows if r["id"] != b])
