@@ -24,7 +24,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import bench, benchblind, benchpack, benchrun, blindreview, effort, gitmemo, serverhealth
+from . import bench, benchblind, benchpack, benchrun, benchv2, blindreview, effort, gitmemo, serverhealth
 from .project import durable_write, open_append
 
 CAP_USD = 40.0       # Claude spend a day (arm runs plus reviews)
@@ -326,14 +326,16 @@ def run_task(out: Path, bench_dir: Path, task: dict, arms: dict, opts: dict, cfg
     path = out / "results.jsonl"
     have = read_rows(path)
     added = []
+    reps = range(int(opts.get("reps", 1) or 1) if task.get("repeat") else 1)
     for name, arm in arms.items():
-        if (key := (task["task"], 0, name)) in have and not have[key].get("endpoint_fault"):
-            continue
-        cell = {"task": task["task"], "rep": 0, "arm": name}
-        row = benchrun.run_cell(bench_dir, out, {**task, "task": task["task"]}, cell, arm,
-                                {**opts, "repo": Path(task["source_root"]), "state": Path(task["state"])}, cfg)
-        append_row(path, row, lock)
-        added.append(row)
+        for rep in reps:
+            if (key := (task["task"], rep, name)) in have and not have[key].get("endpoint_fault"):
+                continue
+            cell = {"task": task["task"], "rep": rep, "arm": name}
+            row = benchrun.run_cell(bench_dir, out, {**task, "task": task["task"]}, cell, arm,
+                                    {**opts, "repo": Path(task["source_root"]), "state": Path(task["state"])}, cfg)
+            append_row(path, row, lock)
+            added.append(row)
     return added
 
 
@@ -351,10 +353,14 @@ def run_cells(day: str, tasks: dict[str, dict], arms: dict, out: Path, bench_dir
     lock = threading.Lock()
     ran, skipped, admitted = [], [], []
     todo = [t for t in (order or list(tasks)) if t in tasks]
-    full = lambda t: all((t, 0, a) in rows and not rows[(t, 0, a)].get("endpoint_fault") for a in arms)
+    def full(t: str) -> bool:
+        reps = range(int(opts.get("reps", 1) or 1)) if tasks[t].get("repeat") else range(1)
+        return all((t, rep, a) in rows and not rows[(t, rep, a)].get("endpoint_fault")
+                   for a in arms for rep in reps)
     ran += [t for t in todo if full(t)]
     todo = [t for t in todo if not full(t)]
-    ledger.finished += [sum(float(rows[(t, 0, a)].get("cost_usd") or 0) for a in arms if is_claude(arms[a]))
+    ledger.finished += [sum(float(rows[(t, rep, a)].get("cost_usd") or 0) for a in arms if is_claude(arms[a])
+                             for rep in range(int(opts.get("reps", 1) or 1) if tasks[t].get("repeat") else 1))
                         for t in ran]   # a resumed run's finished tasks count toward the measured mean
     if ran and not (out / "review.json").exists():
         ledger.reviews += ledger.reservation(worst, review)[1] * len(ran)   # a resumed run's finished cells are not reviewed yet: their reviews still spend
@@ -487,8 +493,26 @@ def second_grade(out: Path, cfg: dict, ask2=None, rubric=benchblind.RUBRIC, fold
             "unscored": unscored, "compare": benchblind.compare(blind, blind2), "review": spend}
 
 
+def _grade_batch(blfolder: Path, ask) -> dict:
+    """Score and reveal one sealed copy of the batch in `blfolder` (a regrade folder)."""
+    b = json.loads((blfolder / "batch.json").read_text())
+    unscored = []
+    for it in b["items"]:
+        if it["id"] in b["scores"]:
+            continue
+        try:
+            benchblind.score(blfolder, it["id"], ask(benchblind.prompt(it, b.get("rubric") or benchblind.RUBRIC)))
+        except (benchblind.Refused, OSError, ValueError, subprocess.SubprocessError) as e:
+            unscored.append({"item": it["id"], "why": str(e)[:200]})
+    b = json.loads((blfolder / "batch.json").read_text())
+    if len(b["scores"]) == len(b["items"]) and b["phase"] == "scoring":
+        b = benchblind.reveal(blfolder)
+    return b
+
+
 def blind_review(out: Path, tasks: dict, arms: dict, cfg: dict, ask=None, seed: int | None = None,
-                 build=None, rubric=benchblind.RUBRIC, ask2=None, folder: str = "blind") -> dict:
+                 build=None, rubric=benchblind.RUBRIC, ask2=None, folder: str = "blind", grades: int = 1,
+                 reps: list[int] | None = None) -> dict:
     """Seal the finished cells, have the Opus reviewer score each blind, and return {item: (task, arm, score)}
     once revealed; an item the reviewer could not score stays out of the table. `ask`: a reviewer
     callable for tests. `build(out, tasks, arms)` and `rubric`: another kind of cell and its rubric (the
@@ -497,7 +521,8 @@ def blind_review(out: Path, tasks: dict, arms: dict, cfg: dict, ask=None, seed: 
     blind = out / folder
     spend: dict = {}
     if not blind.exists():
-        built = build(out, tasks, arms) if build else benchrun.blind_cells(out, tasks, arms, [{"rep": 0}])
+        built = build(out, tasks, arms) if build else benchrun.blind_cells(out, tasks, arms,
+                                                                             [{"rep": r} for r in (reps or [0])])
         if not built["cells"]:
             return {"scored": {}, "unscored": [], "review": spend}
         durable_write(out / ("cells.json" if folder == "blind" else f"cells-{folder}.json"), json.dumps(built, indent=1) + "\n")
@@ -514,6 +539,15 @@ def blind_review(out: Path, tasks: dict, arms: dict, cfg: dict, ask=None, seed: 
             benchblind.score(blind, it["id"], ask(benchblind.prompt(it, b.get("rubric") or benchblind.RUBRIC)))
         except (benchblind.Refused, OSError, ValueError, subprocess.SubprocessError) as e:
             unscored.append({"item": it["id"], "why": str(e)[:200]})
+    reg = {}   # extra gradings: {item: (task, arm, score)} per copy, for grade-to-grade noise (v2)
+    for i in range(1, grades):   # copies after the first: independent gradings of the same diffs
+        sub = out / f"{folder}-grade{i + 1}"
+        if not sub.exists():
+            benchblind.regrade(blind, sub)
+        bb = _grade_batch(sub, ask)
+        labels = json.loads((sub / "seal.json").read_text())["labels"]
+        by_item = {it["id"]: it["task"] for it in bb["items"]}
+        reg[i + 1] = {i2: (by_item[i2], labels[i2], sc) for i2, sc in bb["scores"].items()}
     prior = review_spent(out) if folder == "blind" else 0.0
     durable_write(out / ("review.json" if folder == "blind" else f"review-{folder}.json"), json.dumps({"cost_usd": round(prior + float(spend.get("cost_usd", 0)), 4),
                                                   "calls": spend.get("calls", 0)}))
@@ -526,7 +560,7 @@ def blind_review(out: Path, tasks: dict, arms: dict, cfg: dict, ask=None, seed: 
     seal = json.loads((blind / "seal.json").read_text())["labels"]   # the review is over: the labels may be read
     by_item = {it["id"]: it["task"] for it in b["items"]}
     got = {"scored": {i: (by_item[i], seal[i], s) for i, s in b["scores"].items()}, "unscored": unscored,
-           "review": spend}
+           "review": spend, **({"regrades": reg} if reg else {})}
     if b["phase"] == "revealed" and (sec := second_grade(out, cfg, ask2, rubric, folder)):
         got["second"] = sec
     return got
@@ -545,9 +579,10 @@ def day_record(day: str, tasks: dict, arms: dict, out: Path, graded: dict, skipp
     rows = read_rows(out / "results.jsonl")
     cells = []
     for item, (tid, arm, score) in sorted(graded["scored"].items()):
-        r = rows.get((tid, 0, arm)) or {}
+        r = next((rows[k] for k in rows if k[0] == tid and k[2] == arm), rows.get((tid, 0, arm)) or {})
         t = tasks.get(tid) or {}
-        cells.append({"project": t.get("project", ""), "task": tid, "source_task": t.get("source_task"), "arm": arm,
+        cells.append({"project": t.get("project", ""), "task": tid, "source_task": t.get("source_task"),
+                      "rep": int(r.get("rep", 0)), "arm": arm,
                       "model": f"{arms[arm].get('provider')}:{arms[arm].get('model')}:{arms[arm].get('effort')}"
                                + (f":{arms[arm]['harness']}" if arms[arm].get("harness") else ""),
                       "claude": is_claude(arms[arm]),
@@ -557,6 +592,11 @@ def day_record(day: str, tasks: dict, arms: dict, out: Path, graded: dict, skipp
                       "minutes": round(float(r.get("wall_s") or 0) / 60, 2),
                       "stopped": bool(r.get("hang_guard")) or r.get("outcome") in ("timeout", "stalled"),
                       "outcome": r.get("outcome", "")})
+    regrades = graded.get("regrades") or {}
+    reps_graded = {tid: [] for tid in tasks}
+    for gi, items in regrades.items():
+        for _, (tid, arm, sc) in items.items():
+            reps_graded.setdefault(tid, []).append((arm, sc))
     sec = graded.get("second")
     if sec:
         two = {(t, a): sc for t, a, sc in sec["scored"].values()}
@@ -803,13 +843,27 @@ def run_day(day: str, start: float, end: float, arms: dict, cfg: dict, cap: floa
     arms = {name: benchrun.resolve_harness(arm, opts or {}) for name, arm in arms.items()}
     left: list[dict] = []
     tasks = build_tasks(day, picked, root, bench_dir, skip, left)
+    v2cfg = (cfg.get("bench") or {}).get("repeats") or {}
+    reps = max(1, int(v2cfg.get("runs", 1)))
+    grades = max(1, int(v2cfg.get("grades", 1)))
+    cap_n = int(v2cfg.get("subset", 0) or 0)
+    # The repeat subset is drawn first, seeded, so every arm and every grade covers the same tasks.
+    repeat_ids = sorted(tasks)[:cap_n] if cap_n and len(tasks) > cap_n else sorted(tasks) if cap_n else []
+    rng = random.Random(seed)
+    rng.shuffle(repeat_ids)
+    repeat_ids = set(repeat_ids)
+    for tid in tasks:
+        tasks[tid]["repeat"] = tid in repeat_ids
     order = [f"{slug(k['project'])}-{k['task']}" for k in picked["order"] if f"{slug(k['project'])}-{k['task']}" in tasks]
     opts = {"timeout_s": LIMIT_S, "stall_s": 900, "budget_usd": CELL_USD, "review_usd": REVIEW_USD,
             "test_cmd": benchrun.TEST_CMD, "test_timeout_s": 900, "dry_run": False, "scratch_home": True,
-            "review_mean": prior_review_mean(root, day), **(opts or {})}
+            "review_mean": prior_review_mean(root, day), "reps": reps, **(opts or {})}
+    if opts.get("reps", reps) != reps:
+        raise RuntimeError("an explicit --reps opt overrides the repeats.runs setting; set bench.repeats.runs")
     done = run_cells(day, tasks, arms, out, bench_dir, opts, cfg, cap, parallel, order, say)
     benchpack.add_original(out, tasks)
-    graded = blind_review(out, tasks, {**arms, benchpack.ORIGINAL: benchpack.ORIGINAL_ARM}, cfg, ask, ask2=ask2)
+    graded = blind_review(out, tasks, {**arms, benchpack.ORIGINAL: benchpack.ORIGINAL_ARM}, cfg, ask, ask2=ask2,
+                          grades=grades, reps=list(range(reps)))
     skipped = picked.get("skipped", []) + done["skipped"]
     rec = day_record(day, tasks, {**arms, benchpack.ORIGINAL: benchpack.ORIGINAL_ARM}, out, graded, skipped,
                      picked["dropped"])
