@@ -314,6 +314,17 @@ def _locked(home: Path | None = None):
         durable_write(path, json.dumps(data, indent=1, sort_keys=True))
 
 
+def forget(project: str, home: Path | None = None) -> bool:
+    """Drop `project`'s row from the shared machine record (a removed project: its pid, running count and base
+    no longer count toward the machine-wide worker limit); True when it had one. Nothing is created when the
+    record does not exist."""
+    home = home or _home()
+    if not (home / STATE).exists():
+        return False
+    with _locked(home) as data:
+        return data["projects"].pop(project, None) is not None
+
+
 def _alive(pid) -> bool:
     try:
         os.kill(int(pid), 0)

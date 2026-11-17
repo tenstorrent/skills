@@ -12570,16 +12570,36 @@ def cmd_service(a) -> None:
     if a.cmd == "start":
         print(service.install(p))
     elif a.cmd == "stop":
-        print(service.uninstall(p))
-        pid = p.state / "daemon.pid"
-        if pid.exists():
-            try:
-                os.kill(int(pid.read_text()), 15)
-            except (OSError, ValueError):
-                pass
-        print(stop_workers(p, a.kill))
+        print(stop_project(p, a.kill))
     else:
         _exit_for_restart(service.restart(p))
+
+
+def stop_project(p: Project, kill: bool) -> str:
+    """Remove the project's service, end its daemon and stop its workers (`ttp stop`, `ttp remove`)."""
+    from . import service
+    out = [service.uninstall(p)]
+    pid = p.state / "daemon.pid"
+    if pid.exists():
+        try:
+            os.kill(int(pid.read_text()), 15)
+        except (OSError, ValueError):
+            pass
+    out.append(stop_workers(p, kill))
+    return "\n".join(out)
+
+
+def cmd_remove(a) -> None:
+    """Take a project off this machine (projectremove.py): stop it, prune its rows from the shared records, unregister it."""
+    p = need(a.name, sys.argv[1:])
+    own = os.environ.get("TTP_PROJECT")
+    if os.environ.get("TTP_RUN_DIR") and own and Path(own).resolve() in (Path(p.base).resolve(), Path(p.root).resolve()):
+        die("ttp remove: a run cannot remove its own project (its daemon is running it); a scratch project it made is fine", 2)
+    from . import projectremove
+    if a.delete_files and (why := projectremove.delete_refusal(p)):
+        die(f"ttp remove: {why}", 2)
+    for ln in projectremove.remove(p, lambda: stop_project(p, True), delete=a.delete_files):
+        print(ln)
 
 
 def stop_workers(p: Project, kill: bool, wait_s: float = 60) -> str:
@@ -15571,7 +15591,7 @@ COMMAND_GROUPS = (
                       "pool-shard", "skill", "killscan", "svcscan", "leftover-procs", "said", "hostcheck", "paths")),
     ("probes (retry_when, start_when)", ("landed", "alive", "eta", "ci", "ack-wait", "ssh-preflight", "broker-released",
                                          "deployed", "goal", "hours")),
-    ("admin", ("setup", "upgrade", "start", "stop", "restart", "adopt", "prune", "secret", "consent",
+    ("admin", ("setup", "upgrade", "start", "stop", "restart", "remove", "adopt", "prune", "secret", "consent",
                "notifier", "schedules", "heal", "upstream", "lease", "replicate", "check-plan", "stats", "audit",
                "push-audit", "ttr", "selfchange", "spend-today", "throughput", "model-trip", "echoes", "course",
                "uninstall", "bench", "model-bench", "model", "waste", "slop", "bridge", "gh-queue", "move", "landings")),
@@ -16829,6 +16849,13 @@ def main(argv: list[str] | None = None) -> None:
     s = sub.add_parser("find", help="locate a project by name (registry, then chat logs)")
     s.add_argument("name", help="the project")
     s.set_defaults(fn=cmd_find)
+    s = sub.add_parser("remove", help="take a project off this machine: stops its daemon and workers, removes its service "
+                                      "files, prunes its rows from the shared per-machine records and unregisters it; "
+                                      "deletes its files only with --delete-files")
+    s.add_argument("name", help="the project")
+    s.add_argument("--delete-files", action="store_true",
+                   help="also delete the project's tt-project folder (state, runs, worktrees, harness); the code repo stays")
+    s.set_defaults(fn=cmd_remove)
     s = sub.add_parser("adopt", help="record where a project lives")
     s.add_argument("name", help="the project")
     s.add_argument("--host", help="the machine it runs on (default: this one)")

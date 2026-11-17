@@ -861,6 +861,32 @@ def release(claim_keys: list[str], cleared: float) -> None:
         os.close(fd)
 
 
+def forget_claims(owner: str) -> int:
+    """Drop every machine-wide claim held by `owner` (a project's tt-project folder) when the project is removed;
+    returns how many went. A claim file that cannot be read or written leaves things as they are."""
+    path = claims_path()
+    if not path.exists():
+        return 0
+    try:
+        fd = os.open(str(path.with_suffix(".lock")), os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        return 0
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        data = json.loads(path.read_text())
+        if not isinstance(data, dict):
+            return 0
+        keep = {k: v for k, v in data.items() if not (isinstance(v, dict) and v.get("owner") == owner)}
+        if keep != data:
+            from .project import write_json
+            write_json(path, keep, 0o600)
+        return len(data) - len(keep)
+    except (OSError, ValueError):
+        return 0
+    finally:
+        os.close(fd)
+
+
 def owner_alive(owner: str) -> bool:
     """The project at `owner` has a running daemon: its pid file (removed when the daemon stops)
     names a live one."""
