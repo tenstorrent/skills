@@ -3825,8 +3825,9 @@ def test_a_timed_out_run_whose_thread_never_ends_is_observed_once_more_as_stuck(
         run.killed_at -= schedrun.STUCK_FACTOR * run.timeout
         d.run_schedules()
         d.run_schedules()
-        stuck_rows = [r for r in issues() if r["watch_key"]]
-        assert run.stuck and len(issues()) == 2 and len(stuck_rows) == 1, issues()
+        keys = sorted(r["watch_key"] for r in issues())
+        assert run.stuck and keys == ["schedule-stuck:spin", "schedule-timeout:spin"], issues()
+        stuck_rows = [r for r in issues() if r["watch_key"] == "schedule-stuck:spin"]
         assert stuck_rows[0]["count"] == 1 and "still going" in stuck_rows[0]["title"], stuck_rows
         _due(p, "spin")
         d.run_schedules()
