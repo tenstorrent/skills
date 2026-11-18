@@ -10,7 +10,9 @@ MAX_WINDOW_H, then a low note says so). Thresholds are settings: rollout.thresho
 """
 from __future__ import annotations
 
+import re
 import statistics
+import subprocess
 import time
 
 from . import postland, pushq, rollout
@@ -77,9 +79,48 @@ def _landings(db, a: float, b: float) -> list[tuple[float, float]]:
     return [(r["l"] - (r["c"] or r["l"]), float(r["s"] or 0)) for r in rows]
 
 
-def signals(db, since: float, now: float, th: dict, area: str | None = None) -> dict:
+_SPAN = re.compile(r"Forward revert of ([0-9a-f]*)\.\.([0-9a-f]+) by ")
+
+
+def _reverted_files(repo: str | None, spec: str) -> set[str] | None:
+    """The files the reverted span (a revert task's "Forward revert of <base>..<sha>") changed, read from git
+    in `repo`; None when the span or the repo cannot be read."""
+    m = _SPAN.search(spec or "")
+    if not m or not repo:
+        return None
+    base, sha = m.groups()
+    cmd = ["git", "-C", repo, "diff", "--name-only", base, sha] if base else \
+        ["git", "-C", repo, "show", "--name-only", "--format=", sha]
+    try:
+        got = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return set(got.stdout.split()) if got.returncode == 0 else None
+
+
+def _reverts(db, since: float, now: float, flag: str | None, repo: str | None) -> tuple[list[str], list[str]]:
+    """(the revert tasks that count against `flag`, those whose reverted commit cannot be resolved). A revert
+    counts only when the commit it reverted changed a file of the flag's gated code (rollout.FLAGS[flag]["code"]);
+    never against a shadow flag; an unresolved one counts against no flag."""
+    meta = rollout.FLAGS.get(flag or "", {})
+    code = set(meta.get("code") or ())
+    hit, unknown = [], []
+    for r in db.q("SELECT id, spec FROM tasks WHERE title LIKE ? ESCAPE '\\' AND created>=? AND created<?",
+                  ("Revert %" + postland.REVERT_TITLE_TAIL.replace("%", "\\%").replace("_", "\\_"), since, now)):
+        files = _reverted_files(repo, r["spec"])
+        if files is None:
+            unknown.append(f"#{r['id']}")
+        elif code and not meta.get("shadow") and files & code:
+            hit.append(f"#{r['id']}")
+    return hit, unknown
+
+
+def signals(db, since: float, now: float, th: dict, area: str | None = None, flag: str | None = None,
+            repo: str | None = None) -> dict:
     """The window [since, now) against the baseline before `since`: the measures and the failing signals.
-    `area` is the flag's area: a new high alert counts only if its key starts with one of ALERT_AREAS[area]."""
+    `area` is the flag's area: a new high alert counts only if its key starts with one of ALERT_AREAS[area].
+    `flag` and `repo` (the project's git root) attribute forward reverts: see _reverts; "unattributed" lists
+    the reverts whose commit could not be read, shown and never failing."""
     base_a = since - th["baseline_days"] * 86400
     nb, fb = _runs(db, base_a, since)
     nw, fw = _runs(db, since, now)
@@ -102,26 +143,26 @@ def signals(db, since: float, now: float, th: dict, area: str | None = None) -> 
     seen = raised(base_a, since)
     for key in sorted(raised(since, now) - seen):
         fail.append(f"new alert {key}")
-    rev = db.one("SELECT COUNT(*) n FROM tasks WHERE title LIKE ? ESCAPE '\\' AND created>=? AND created<?",
-                 ("Revert %" + postland.REVERT_TITLE_TAIL.replace("%", "\\%").replace("_", "\\_"), since, now))["n"]
+    rev, unattributed = _reverts(db, since, now, flag, repo)
     if rev:
-        fail.append(f"{rev} forward revert(s) of a landed change")
+        fail.append(f"{len(rev)} forward revert(s) of a landed change touching this flag's code: {', '.join(rev[:5])}")
     stuck = db.q("SELECT id FROM tasks WHERE status='running' AND updated<? AND NOT EXISTS "
                  "(SELECT 1 FROM runs WHERE runs.task=tasks.id AND runs.status='running')", (now - th["stuck_h"] * H,))
     if stuck:
         fail.append("tasks with no run and no change for " + f"{th['stuck_h']:g} h: " + ", ".join(f"#{r['id']}" for r in stuck[:5]))
     enough = nw >= th["min_runs"] or len(lw) >= th["min_landings"]
     return {"runs": nw, "failed": fw, "landings": len(lw), "base_runs": nb, "base_landings": len(lb),
-            "failing": fail, "enough": enough}
+            "failing": fail, "enough": enough, "unattributed": unattributed}
 
 
-def verdict(db, flag: str, ring: int, recs: list[dict], cfg: dict, now: float | None = None) -> dict | None:
+def verdict(db, flag: str, ring: int, recs: list[dict], cfg: dict, now: float | None = None,
+            repo: str | None = None) -> dict | None:
     """None when `flag` does not cover `ring`; else signals() plus 'since' and 'level' (the ring entered)."""
     now = now or time.time()
     since = entered(flag, ring, recs)
     if since is None:
         return None
-    v = signals(db, since, now, thresholds(cfg), rollout.FLAGS.get(flag, {}).get("area"))
+    v = signals(db, since, now, thresholds(cfg), rollout.FLAGS.get(flag, {}).get("area"), flag, repo)
     v["since"] = since
     return v
 

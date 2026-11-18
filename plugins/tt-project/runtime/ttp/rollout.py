@@ -25,18 +25,30 @@ from typing import Any, Iterator
 LEDGER = "rollout.jsonl"
 OFF = "off"
 LEVELS = (OFF, 0, 1, 2)
-# name: the feature's existing config key it gates. A feature's own task wires its on() call; a flag shows
-# here before that only so `ttp rollout set` can name it. A flag whose feature already runs for every project
-# graduates (leaves this list), never gating it off: push_isolation, the push batch survival (a reliability fix).
-FLAGS: dict[str, dict[str, str]] = {
-    "glm_code": {"key": "route.code_sonnet.glm_share", "area": "route"},
-    "eta_history": {"key": "eta.history", "area": "eta"},
-    "device_prewarm": {"key": "device.prewarm", "area": "device"},
-    "deslop": {"key": "deslop.enabled", "area": "review"},
+# name: the feature's existing config key it gates, its area, and `code`: the files holding its on() call sites
+# and the code reading its key, relative to the repo root. The health watch counts a post-landing revert against a
+# flag only when the reverted commit touched one of them (rollout_health); a flag with no wiring yet has none.
+# `shadow` marks a flag that only records beside the real behaviour (it posts and changes nothing), so a revert
+# never counts against it. A flag whose feature already runs for every project graduates (leaves this list),
+# never gating it off: push_isolation, the push batch survival (a reliability fix).
+_RT = "plugins/tt-project/runtime/ttp/"
+
+
+def _code(*names: str) -> tuple[str, ...]:
+    return tuple(_RT + n for n in names)
+
+
+FLAGS: dict[str, dict[str, Any]] = {
+    "glm_code": {"key": "route.code_sonnet.glm_share", "area": "route", "code": _code("codearm.py")},
+    "eta_history": {"key": "eta.history", "area": "eta", "shadow": True,
+                    "code": _code("etaledger.py", "costlevers.py", "cli.py")},
+    "device_prewarm": {"key": "device.prewarm", "area": "device", "code": ()},
+    "deslop": {"key": "deslop.enabled", "area": "review", "code": _code("deslop.py")},
     # The cost levers (costlevers.py): off until a ring turns them on.
-    "fresh_continue": {"key": "worker.fresh_continue", "area": "worker"},
-    "coord_wake_settle": {"key": "coordinator.wake_settle", "area": "coordinator"},
-    "output_trim": {"key": "output.trim", "area": "output"},
+    "fresh_continue": {"key": "worker.fresh_continue", "area": "worker", "code": _code("costlevers.py", "ctxfork.py")},
+    "coord_wake_settle": {"key": "coordinator.wake_settle", "area": "coordinator",
+                          "code": _code("costlevers.py", "wakesettle.py", "daemon.py")},
+    "output_trim": {"key": "output.trim", "area": "output", "code": _code("costlevers.py")},
 }
 
 

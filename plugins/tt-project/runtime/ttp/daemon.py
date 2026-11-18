@@ -15493,7 +15493,7 @@ class Daemon:
             if lv == rollout.OFF or ring is None or ring > lv or rollout.frozen(flag) \
                     or rollout.own_setting(self.p.raw_config(), rollout.FLAGS[flag]["key"]):
                 continue
-            v = rollout_health.verdict(self.p.db, flag, ring, recs, cfg, now)
+            v = rollout_health.verdict(self.p.db, flag, ring, recs, cfg, now, str(self.p.root))
             if v is None:
                 continue
             if v["failing"]:

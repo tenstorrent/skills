@@ -174,7 +174,8 @@ def test_health_flags_a_new_high_alert_in_the_flags_area_a_forward_revert_and_a_
     p.db.x("DELETE FROM tasks WHERE id=?", (rid,))
     p.db.add_task(f"Revert #7 ttp/t7-x{postland.REVERT_TITLE_TAIL}", "Forward revert of aaa..bbb by the post-landing checks.",
                   kind="review", status="pushing")
-    assert any("1 forward revert" in s for s in rh.signals(p.db, since, now, th, area)["failing"])
+    got = rh.signals(p.db, since, now, th, area, "glm_code")
+    assert not any("revert" in s for s in got["failing"]) and got["unattributed"], "an unreadable revert counts against no flag"
     p.db.x("DELETE FROM tasks WHERE title LIKE 'Revert %'")
     tid = p.db.add_task("stuck", "s", kind="code")
     p.db.x("UPDATE tasks SET status='running', updated=? WHERE id=?", (now - 3 * _RH, tid))
@@ -438,3 +439,139 @@ def test_eta_history_shadow_logs_a_pair_and_a_baseline_only_with_the_flag_on(env
     capsys.readouterr()
     cli.main(["eta", p.name, "--calibration"])
     assert "ETA shadow (eta_history, 7 d): 1 compared" in capsys.readouterr().out
+
+
+_RT = "plugins/tt-project/runtime/ttp/"
+
+
+def _git(repo, *argv):
+    import subprocess
+    return subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t", *argv],
+                          capture_output=True, text=True, check=True).stdout.strip()
+
+
+def _ro_repo(tmp_path, *changed):
+    """A throwaway repo: a base commit, then one commit changing the runtime files `changed`. Returns
+    (repo, the revert task's spec naming that span)."""
+    repo = tmp_path / "repo"
+    (repo / _RT).mkdir(parents=True)
+    _git(tmp_path, "init", "-q", str(repo))
+    for n in ("etaledger.py", "deslop.py", "daemon.py", "sched.py", "costlevers.py"):
+        (repo / _RT / n).write_text("x = 0\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+    base = _git(repo, "rev-parse", "HEAD")
+    for n in changed:
+        (repo / _RT / n).write_text("x = 1\n")
+    _git(repo, "commit", "-qam", "change")
+    sha = _git(repo, "rev-parse", "HEAD")
+    return str(repo), f"Forward revert of {base[:10]}..{sha[:10]} by the post-landing checks."
+
+
+def _ro_revert(p, spec):
+    from ttp import postland
+    return p.db.add_task(f"Revert #7 ttp/t7-x{postland.REVERT_TITLE_TAIL}", spec, kind="review", status="pushing")
+
+
+def _revert_count(p, flag, repo):
+    from ttp import rollout, rollout_health as rh
+    now = time.time() + 60
+    return rh.signals(p.db, now - 24 * _RH, now, rh.thresholds(None), rollout.FLAGS[flag]["area"], flag, repo)
+
+
+def test_a_revert_counts_only_against_a_flag_whose_gated_code_the_reverted_commit_touched(env, tmp_path):
+    # cells: unrelated_revert, gated_revert
+    p = make(env)
+    repo, spec = _ro_repo(tmp_path, "sched.py")
+    _ro_revert(p, spec)
+    for flag in ("deslop", "output_trim", "glm_code", "coord_wake_settle"):
+        got = _revert_count(p, flag, repo)
+        assert got["failing"] == [] and got["unattributed"] == [], f"{flag}: a revert of unrelated code is no signal"
+    p.db.x("DELETE FROM tasks WHERE title LIKE 'Revert %'")
+    repo, spec = _ro_repo(tmp_path / "b", "deslop.py")
+    _ro_revert(p, spec)
+    got = _revert_count(p, "deslop", repo)
+    assert len(got["failing"]) == 1 and "1 forward revert(s) of a landed change" in got["failing"][0]
+    assert _revert_count(p, "fresh_continue", repo)["failing"] == [], "another flag's code is not this one's"
+
+
+def test_a_revert_of_a_run_schedules_change_does_not_trip_the_eta_flag_in_shadow(env, tmp_path):
+    # cells: shadow_flag, unrelated_revert: the 2026-11-17 false trip (a daemon.py change reverted, eta_history rolled back)
+    from ttp import rollout
+    p = make(env)
+    repo, spec = _ro_repo(tmp_path, "daemon.py")
+    _ro_revert(p, spec)
+    assert _revert_count(p, "eta_history", repo)["failing"] == []
+    assert _revert_count(p, "deslop", repo)["failing"] == []
+    assert rollout.FLAGS["eta_history"]["shadow"] is True
+
+
+def test_a_shadow_flag_never_counts_a_revert_even_of_its_own_code(env, tmp_path):
+    # cells: shadow_flag
+    p = make(env)
+    repo, spec = _ro_repo(tmp_path, "etaledger.py")
+    _ro_revert(p, spec)
+    assert _revert_count(p, "eta_history", repo)["failing"] == []
+    from ttp import rollout
+    saved = dict(rollout.FLAGS["eta_history"])
+    try:
+        rollout.FLAGS["eta_history"].pop("shadow")
+        assert len(_revert_count(p, "eta_history", repo)["failing"]) == 1, "the same revert counts once the flag is not shadow"
+    finally:
+        rollout.FLAGS["eta_history"].clear()
+        rollout.FLAGS["eta_history"].update(saved)
+
+
+def test_a_revert_whose_commit_cannot_be_resolved_is_listed_unattributed_and_fails_no_flag(env, tmp_path):
+    # cells: unattributed_revert
+    from ttp import rollout, rollout_health as rh
+    p = make(env)
+    repo, _ = _ro_repo(tmp_path, "deslop.py")
+    gone = _ro_revert(p, "Forward revert of 1234567890..abcdef1234 by the post-landing checks.")
+    none = _ro_revert(p, "no span in this text")
+    for flag in rollout.FLAGS:
+        got = _revert_count(p, flag, repo)
+        assert got["failing"] == [] and got["unattributed"] == [f"#{gone}", f"#{none}"], flag
+    assert _revert_count(p, "deslop", None)["unattributed"] == [f"#{gone}", f"#{none}"], "no repo: unresolved too"
+    now = time.time() + 60
+    recs = [{"flag": "deslop", "kind": "set", "to": 1, "ts": now - 24 * _RH}]
+    v = rh.verdict(p.db, "deslop", 1, recs, {}, now, repo)
+    assert v["unattributed"] == [f"#{gone}", f"#{none}"] and v["failing"] == []
+
+
+def test_the_daemon_passes_its_project_root_so_a_gated_revert_rolls_the_flag_back_and_an_unrelated_one_does_not(env, tmp_path):
+    from ttp import rollout
+    p, d = _watch(env)
+    rollout.set_ring(p.name, "1")
+    _ro_flag("deslop", 1, 3)
+    repo, spec = _ro_repo(tmp_path, "sched.py")
+    d.p.root = type(p.root)(repo)
+    _ro_revert(p, spec)
+    assert d.rollout_watch() == [] and rollout.level("deslop") == 1
+    repo, spec = _ro_repo(tmp_path / "g", "deslop.py")
+    d.p.root = type(p.root)(repo)
+    p.db.x("DELETE FROM tasks WHERE title LIKE 'Revert %'")
+    _ro_revert(p, spec)
+    d._last_rolloutwatch = 0
+    assert d.rollout_watch() == ["deslop"] and "forward revert" in rollout.frozen("deslop")["reason"]
+
+
+def test_every_flag_call_site_lies_in_the_files_the_flags_code_list_names():
+    # cells: gated_revert: the health watch trusts rollout.FLAGS[flag]["code"], so a new on() call site must be listed
+    import re
+    from pathlib import Path
+    from ttp import rollout
+    rt = Path(rollout.__file__).parent
+    pat = re.compile(r"(?:rollout\.on|lever_on|costlevers\.lever_on)\(\s*(?:[\w.]+\s*,\s*)?[\"'](\w+)[\"']")
+    sites: dict[str, set[str]] = {}
+    for f in rt.glob("*.py"):
+        if f.name in ("rollout.py", "rollout_health.py"):
+            continue
+        for flag in pat.findall(f.read_text()):
+            sites.setdefault(flag, set()).add(_RT + f.name)
+    assert set(sites) <= set(rollout.FLAGS), f"on() names a flag that is not in FLAGS: {set(sites) - set(rollout.FLAGS)}"
+    assert "eta_history" in sites and "glm_code" in sites, "the scan must find the known call sites"
+    for flag, files in sites.items():
+        assert files <= set(rollout.FLAGS[flag]["code"]), f"{flag}: on() outside its code list: {sorted(files - set(rollout.FLAGS[flag]['code']))}"
+    for flag, meta in rollout.FLAGS.items():
+        assert all((rt.parent.parent.parent.parent / c).is_file() for c in meta["code"]), f"{flag}: a listed code file does not exist"
