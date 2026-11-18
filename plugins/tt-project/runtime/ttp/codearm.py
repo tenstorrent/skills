@@ -126,13 +126,17 @@ def ring_gate(cfg: dict, project: str, raw: dict | None) -> dict:
     try:
         if rollout.own_setting(raw, rollout.FLAGS["glm_code"]["key"]):
             return cfg
-        live = bool(str(((got.get("glm") if isinstance(got.get("glm"), dict) else {}) or {}).get("model") or "").strip())
+        if not str(((got.get("glm") if isinstance(got.get("glm"), dict) else {}) or {}).get("model") or "").strip():
+            return cfg   # no arm model: no coin flip either way (settings)
         share = _num(got.get("glm_share"), 0, 1, 0.0)
-        on = live and rollout.on("glm_code", project, raw)
+        on = rollout.on("glm_code", project, raw)
     except Exception:   # in doubt, no coin flip
         on, share = False, 0.0
+    want = (share if share > 0 else RING_SHARE) if on else 0
+    if want == share and "glm_share" in got:
+        return cfg
     got = dict(got)
-    got["glm_share"] = (share if share > 0 else RING_SHARE) if on else 0
+    got["glm_share"] = want
     cfg["route"] = {**cfg["route"], "code_sonnet": got}
     return cfg
 
