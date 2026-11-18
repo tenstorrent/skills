@@ -418,6 +418,8 @@ def test_every_daemon_chat_post_of_kind_info_or_reply_keeps_the_chat_pace():
                     continue
                 if chat is None or (isinstance(chat, ast.Constant) and chat.value is None):
                     continue   # a broadcast to every chat, not one chat's status
+                if fn.name == "cmd_urgent_reply":
+                    continue   # the coordinator's own mid-turn reply to a user's urgent message: never paced
                 found.append(f"{f.name}:{call.lineno}")
                 if fn.name == "cmd_urgent_reply":
                     continue   # an urgent message's first finding is exempt from the chat's pace on purpose
