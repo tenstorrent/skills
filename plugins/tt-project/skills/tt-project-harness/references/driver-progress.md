@@ -9,6 +9,7 @@ ttp progress report result  --key nightly-filler "batch 12 of 40 done"
 ```
 
 - Kinds: `result` (a counted result: it ends a streak), `refusal`, `stall` and `failure` (they count toward one).
+- A `failure` inside a `ttp detach` job also marks a failed step on the job (`<name>.stepfail`). The job still runs, so `ttp detach --check` still exits 1 and every probe reads it as not yet, but it prints the failure, and the daemon wakes the task waiting on that check at once, at its own tier, with the failures and the log's last lines. Its `on_pass_cmd` is not run, since the job has not ended. Each batch of failures wakes it once: the daemon moves them to `<name>.stepfail.seen`. So report a failed step that needs the task's attention as `failure`, and a busy lock or a retry as `refusal`.
 - `--key` names what the report is about, the same on every loop. Inside a `ttp detach` job it defaults to `<task>/<job name>`.
 - A refusal on a busy lock adds `--resource <name>`: its holders now (task and run, or an external label, with pid and live or stale) are recorded from the lock state `ttp lock --probe --json` reads, or `unknown` when it cannot be read. `--holder "<who>"` records what the driver knows instead. The stall observation and `ttp status` name the holder, so nobody needs a run to find it.
 - The project comes from `TTP_PROJECT` or the folder it runs in, as for other `ttp` commands.

@@ -242,6 +242,75 @@ def failed_why(probe: str, rc, cwd=None) -> str:
     return f"probe exit {rc}"
 
 
+# A failed step of a job whose driver keeps running: `ttp progress report failure` inside a `ttp detach`
+# job (progress.JOB_ENV) appends {"ts", "key", "reason"} to <name>.stepfail. The job still runs, so its
+# `detach --check` still exits 1 (every probe consumer reads it as "not yet"), and prints the failure; the
+# daemon, probing a waiting task's retry_when, takes the lines (take_step_failures: renamed to
+# <name>.stepfail.seen) and wakes the task once per batch of failures (Daemon._step_failed).
+STEP_FAILS_MAX = 20   # lines a wake quotes; the file keeps them all until taken
+
+
+def step_failed(rc: Path) -> Path:
+    return job_rc(rc).with_suffix(".stepfail")
+
+
+def note_step_failure(rc: Path, key: str, reason: str, now: float | None = None) -> None:
+    """Records one failed step of the running job `rc` (an OSError is the caller's)."""
+    line = json.dumps({"ts": round(time.time() if now is None else now, 3), "key": key, "reason": reason})
+    durable_append(step_failed(rc), line + "\n")
+
+
+def step_failures(rc: Path) -> list[dict]:
+    """The job's failed steps not yet taken, oldest first; [] when none or unreadable."""
+    try:
+        text = step_failed(rc).read_text()
+    except OSError:
+        return []
+    return [r for ln in text.splitlines() if (r := _json_line(ln))]
+
+
+def step_line(recs: list[dict]) -> str:
+    """'N failed step(s), last at <time>: <reason>' for a check's output and a wake."""
+    last = recs[-1]
+    when = time.strftime("%H:%M:%S %Z", time.localtime(float(last.get("ts") or 0)))
+    return f"{len(recs)} failed step{'s' if len(recs) != 1 else ''}, last at {when}: {last.get('reason') or '(no reason)'}"
+
+
+def take_step_failures(probe: str, cwd=None) -> list[tuple[Path, list[dict]]]:
+    """The failed steps of each still-running job a probe's local `detach --check` names, each job's file
+    renamed to <name>.stepfail.seen (appended to an earlier one) so the same failures wake its task once.
+    A job that ended is left out: its own exit code, not a step, is then the check's verdict."""
+    taken = []
+    try:
+        jobs = _checked(probe, cwd)
+    except ValueError:
+        return []
+    for rc in jobs:
+        f = step_failed(rc)
+        if not f.exists() or state(rc)[0] != "running":
+            continue
+        seen = f.with_name(f.name + ".seen")
+        try:
+            os.replace(f, tmp := f.with_name(f.name + f".{os.getpid()}"))
+            text = tmp.read_text()
+            durable_append(seen, text)
+            tmp.unlink()
+        except OSError:
+            continue
+        recs = [r for ln in text.splitlines() if (r := _json_line(ln))]
+        if recs:
+            taken.append((rc, recs))
+    return taken
+
+
+def _json_line(ln: str) -> dict | None:
+    try:
+        rec = json.loads(ln)
+    except ValueError:
+        return None
+    return rec if isinstance(rec, dict) else None
+
+
 # The first line of a failed job's log that names its failure, case-sensitive so ordinary words do not
 # match: a Python traceback, any word ending in Error (ValueError, Error:), the word error or ERROR, and
 # FAIL or FAILED (pytest, ctest). Lower-case "fail"/"failed" is left out: "0 failed" is a pass.

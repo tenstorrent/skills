@@ -9986,7 +9986,7 @@ def cmd_progress(a) -> None:
     records the lock's holders now (progress.holder_text, "unknown" when unreadable). No daemon needed;
     exit 0 once given a project and a key, even when the line cannot be written, so a driver under
     `set -e` keeps going."""
-    from . import progress
+    from . import detach, progress
     ap = argparse.ArgumentParser(prog="ttp progress report")
     ap.add_argument("kind", choices=progress.KINDS)
     ap.add_argument("reason", nargs="?", default="")
@@ -10022,6 +10022,11 @@ def cmd_progress(a) -> None:
         progress.append(p.state, rec)
     except OSError as e:
         print(f"ttp progress report: not recorded ({e})", file=sys.stderr)
+    if a.kind == "failure" and (job := os.environ.get(progress.JOB_ENV)):   # wakes the task waiting on the job
+        try:
+            detach.note_step_failure(Path(job), key, a.reason)
+        except OSError as e:
+            print(f"ttp progress report: the failed step was not marked on its job ({e})", file=sys.stderr)
 
 
 def _job_base_env(state: Path | None) -> dict | None:
@@ -10165,8 +10170,10 @@ def cmd_detach(a) -> None:
                 print(f"{rc.stem}: gone without an exit code ({why})" + ("" if ser else f"; see {rc.with_suffix('.log')}"))
             else:
                 ended = False
+                steps = [] if ser or st != "running" else detach.step_failures(rc)
                 print(f"{rc.stem}: {'queued for the daemon, which starts it outside the sandbox' if st == 'queued' else 'running'}"
-                      + (f" ({why})" if why else ""))
+                      + (f" ({why})" if why else "")
+                      + (f"; {detach.step_line(steps)} (a waiting task wakes on it)" if steps else ""))
             one_ended = one_ended or st in ("ended", "lost")
         if rows is not None:
             sys.exit(_rows_verdict(_count_rows(Path(rows)), rows, after or 0, one_ended))

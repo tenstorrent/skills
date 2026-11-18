@@ -3748,3 +3748,56 @@ def test_the_remote_wrapper_reads_the_test_summary_too(tmp_path):
         assert out.startswith("started "), out
         assert _wait_for_path(rdir / f"{name}.rc")
         assert (rdir / f"{name}.rc").read_text().strip() == want, (rdir / f"{name}.log").read_text()
+
+
+def test_a_failed_step_of_a_live_driver_wakes_its_waiting_task_once_and_a_healthy_one_sleeps(
+        env, tmp_path, monkeypatch):
+    """`ttp progress report failure` inside a `ttp detach` job marks the job's step failed: its check still
+    exits 1 (running; every probe consumer reads it as not yet) and names the failure, and the daemon wakes
+    the task waiting on that check at once, past its on_pass_cmd, once per batch of failures. A refusal
+    marks nothing, and a live driver with no failed step keeps its task asleep."""
+    import fcntl
+    from ttp import cli, daemon as dmod, detach, progress
+    p = make(env)
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    monkeypatch.setenv("TTP_PROJECT", str(p.root))
+    jobs = tmp_path / "jobs"
+    jobs.mkdir()
+    rc = jobs / "driver.rc"
+    (jobs / "detached.json").write_text(json.dumps([{"name": "driver", "rc": str(rc), "pid": os.getpid(),
+                                                     "started": time.time(), "status": "running"}]))
+    lk = open(rc.with_suffix(".lock"), "a")
+    fcntl.flock(lk, fcntl.LOCK_EX)   # the driver lives
+    rc.with_suffix(".log").write_text("step 1 ok\nstep 2: harbor exited 3\n")
+    ran = tmp_path / "ran"
+    tid, _ = _on_pass_cmd_task(p, tmp_path, f"echo ran > {ran}", probe=f"ttp detach --check {rc}")
+    dm = dmod.Daemon(p.base)
+
+    def report(kind, why):
+        monkeypatch.setenv(progress.JOB_ENV, str(rc))
+        try:
+            cli.main(["progress", "report", kind, "--key", "tb/driver", why])
+        except SystemExit as e:
+            assert not e.code, e.code
+        finally:
+            monkeypatch.delenv(progress.JOB_ENV)
+
+    _settle_probe(dm, tid)
+    assert dm._probe_rc[tid][0] == 1 and not _ready(p, tid), "a healthy live driver woke its task"
+    report("refusal", "lock busy (exit 75)")
+    assert not detach.step_failed(rc).exists(), "a refusal marked a failed step"
+    report("failure", "row 7 ended: harbor exited 3")
+    r = _ttp_run(p, "detach", "--check", str(rc))
+    assert r.returncode == 1 and "1 failed step" in r.stdout and "row 7 ended" in r.stdout, (r.stdout, r.stderr)
+    assert detach.failed_check(f"ttp detach --check {rc}", r.returncode) is False   # not an ended job
+    _settle_probe(dm, tid)
+    res = json.loads(p.db.task(tid)["result"])
+    assert _ready(p, tid) and "a step of its detached job failed" in res["woke"], res
+    assert "row 7 ended: harbor exited 3" in res["woke"] and "harbor exited 3" in res["woke"].split("last lines:")[1]
+    assert res["escalated_wake"] is True and not ran.exists(), "the on_pass_cmd ran for a job still running"
+    assert not detach.step_failed(rc).exists() and "row 7" in detach.step_failed(rc).with_suffix(".stepfail.seen").read_text()
+    assert detach.take_step_failures(f"ttp detach --check {rc}") == [], "taken failures woke it twice"
+    lk.close()
+    rc.write_text("0\n")   # once the job ended, its own exit code is the verdict, never a stale step
+    detach.note_step_failure(rc, "tb/driver", "late")
+    assert detach.take_step_failures(f"ttp detach --check {rc}") == []

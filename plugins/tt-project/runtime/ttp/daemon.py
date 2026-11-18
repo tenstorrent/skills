@@ -612,6 +612,7 @@ PR_FINISH_LINE = ("Take it to the finish line for human review: CI green (a chec
                   "merge it or request reviewers. Anything you post on GitHub ends with [authored by AI].")
 PROBE_EVERY_S = 180     # how often a waiting task's `retry_when` (or a deferred one's `start_when`) probe runs
 NOT_YET_RCS = (1, 75, 255)   # probe exits meaning "not yet": 1, EX_TEMPFAIL (a busy `ttp lock`), ssh unreachable
+JOB_STEP_FAILED = "a step of its detached job failed"   # its driver reported it (Daemon._step_failed)
 JOB_FAILED = "detached job failed"   # what a `ttp detach --check` exit detach.FAILED_RC found (Daemon._job_failed)
 PROBE_TIMEOUT_S = 60
 CLAIM_EVERY_S = 30   # check_claims: how often due claim checks are re-run
@@ -16005,6 +16006,10 @@ class Daemon:
             self._probe_rc[tid] = ("timeout" if rc is None else rc, now, probe)
             if task and task["status"] == "queued":
                 self._flag_never_passes(task, probe, rc, outs[id(proc)])
+            if rc == 1 and task and task["status"] == "queued" and (task["not_before"] or 0) > now \
+                    and detach.CHECK_RE.search(probe) and (steps := detach.take_step_failures(probe, self.p.root)):
+                self._step_failed(task, steps, now)   # its driver lives on, but a step failed: wake past the gate
+                continue
             gated = self._gate_answer(task, probe, self._probe_rc[tid][0], outs[id(proc)], now) if task else None
             if gated == "same":
                 continue   # asleep after a wake-gate skip on this very answer: the gate judged it
@@ -18801,6 +18806,27 @@ class Daemon:
             logs = f"its job logs could not be read: {type(e).__name__}: {e}"[:300]
         if logs:
             why += f"\n{logs}"
+        tier = task["tier"] if task["tier"] in bud.TIER_ORDER else "standard"
+        self._wake_waiting(task, why, now, extra={"wake_tier": tier, "escalated_wake": True}, kind="job_failed")
+
+    def _step_failed(self, task: dict, steps: list, now: float) -> None:
+        """A waiting task's `ttp detach --check` still reads its job running, but the job's driver reported
+        failed steps (`ttp progress report failure`, detach.take_step_failures, already taken so they
+        wake it once): the task wakes at once at its own tier with each job's failures and log tail,
+        never through its on_pass_cmd, which is for a job that ended."""
+        lines = []
+        for rc, recs in steps:
+            lines.append(f"{rc.stem} ({rc}): {detach.step_line(recs)}")
+            lines += [f"  {r.get('key') or '?'}: {r.get('reason') or '(no reason)'}"
+                      for r in recs[-detach.STEP_FAILS_MAX:]]
+        why = f"{JOB_STEP_FAILED}; the driver still runs:\n" + "\n".join(lines)
+        for rc, _ in steps:
+            lf = rc.with_suffix(".log")
+            try:
+                why += f"\n{lf.name}, last lines:\n" + (file_tail(lf, 20, 2000, 200) or "(empty)")
+            except OSError as e:
+                why += f"\n{lf.name}: its log could not be read ({type(e).__name__})"
+        log(self.p, f"task {task['id']}: {JOB_STEP_FAILED} in " + ", ".join(rc.stem for rc, _ in steps))
         tier = task["tier"] if task["tier"] in bud.TIER_ORDER else "standard"
         self._wake_waiting(task, why, now, extra={"wake_tier": tier, "escalated_wake": True}, kind="job_failed")
 
