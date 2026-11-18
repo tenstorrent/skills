@@ -27705,6 +27705,7 @@ DURABLE_EXEMPT = {
     ("modelbench.py", 'with open(d / LOCK, "a") as lk:'): "the host bench's flock guard file, never written",
     ("modelbench.py", 'with open(d / OWNER_LOCK, "a") as lk:'): "the bench owner lease's flock guard file, never written",
     ("modelbench.py", 'with open(d / MODELS_LOCK, "a") as lk:'): "the model verdicts' flock guard file, never written",
+    ("release.py", 'with open(HOME_DIR / ".upgrade-holds.lock", "a") as lk:'): "the release holds' flock guard file, never written",
     ("untrusted.py", 'with open(path, "a") as f:'): "a run's untrusted-source marks in its own run dir, read when that run ends; a crash that loses one ends the run too; never project state",
     ("remotecheck.py", 'Path(scratch, "objects", "info", "alternates").write_text('): "points a scratch repository in a TemporaryDirectory at this one's objects for one bundle; it is gone when the bundle is sent, never project state",
     ("installcheck.py", "dest.write_bytes(r.read())"): "the downloaded installer script in the install check's own folder, fetched again by each check; never state",
