@@ -393,6 +393,24 @@ def test_an_owed_or_user_blocking_hand_off_posts_at_once(env, monkeypatch):
     assert [i["task"] for i in p.db.kv(chatdigest.KV)["held"]["main"]] == [c["id"]]
 
 
+def test_a_hand_off_also_posts_once_in_the_chat_of_an_obligation_it_delivers(env, monkeypatch):
+    """#3399: a task replying to chat A that owns an order from chat B, or names one from chat C by key,
+    posts its hand-off in A, B and C, once each; an order from A itself adds no second post in A."""
+    from ttp import chatdigest, obligations, pushq
+    monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
+    p = make(env)
+    now = time.time()
+    a = _cd_task(p, "find the causes", chat="A")
+    for text, owners, chat in (("the causes", [a["id"]], "B"), ("the causes again", [a["id"]], "A"),
+                               ("a related order", [], "C")):
+        mid = p.db.post("in", text, chat=chat)
+        obligations.add_order(p, text, mid, owners=owners, chat=chat, action_class="read", now=now)
+    oc = next(o["id"] for o in obligations.items(p.db) if o["promise"]["chat"] == "C")
+    pushq._reply(p.db, a, "done", f"Causes and fixes (for {oc}).")
+    want = [f"Causes and fixes (for {oc})."]
+    assert (_cd_out(p, "A"), _cd_out(p, "B"), _cd_out(p, "C")) == (want, want, want)
+
+
 def test_every_daemon_chat_post_of_kind_info_or_reply_keeps_the_chat_pace():
     """Built from the posting code itself: every call in the runtime that posts an out message of kind
     'info' or 'reply' to a chat (chat not None) must sit in a function that applies the chat's pace

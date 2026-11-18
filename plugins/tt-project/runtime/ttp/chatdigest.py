@@ -418,16 +418,55 @@ def _line(task: dict, new: str, text: str) -> str:
 def handoff(db, cfg: dict | None, task: dict, new: str, text: str, now: float | None = None, p=None) -> list[int]:
     """Post the daemon's hand-off `text` of `task` (ended `new`) to its reply chat at once when the user needs
     it now (owed, needs_user) or the chat has no status gap; else hold one short line of it for the chat's
-    next status post (module doc). The message ids posted ([] when held). Any fault posts it at once. With the
-    project `p`, a done hand-off posted at once records the promises its text makes in the chat."""
-    from . import msgparts
+    next status post (module doc). The same goes, once each, to the chat of every obligation the hand-off
+    delivers that came from another chat (obligation_chats). The message ids posted ([] when held). Any fault
+    posts it at once. With the project `p`, a done hand-off posted at once records the promises its text makes
+    in the chat."""
     chat = None if task.get("reply_chat") in (None, "", "all") else task["reply_chat"]
+    ids = _handoff_to(db, cfg, task, new, text, chat, now, p)
+    try:
+        extra = obligation_chats(db, task, chat, text) if chat is not None else []
+    except Exception:   # the reply chat already has it
+        extra = []
+    for other in extra:
+        ids += _handoff_to(db, cfg, task, new, text, other, now, p, delivers=True)
+    return ids
+
+
+OBLIGATION_KEY = re.compile(r"(?<![\w-])o\d+(?![\w-])")
+
+
+def obligation_chats(db, task: dict, chat: str | None, text: str) -> list[str]:
+    """The chats, other than `chat`, of the obligations a hand-off delivers or reports on: one the task owns
+    (owed's rule: open, or closed by this task's receipt), or one its `text` names by key that is open or this
+    task closed. An obligation of every chat ("all") or of `chat` itself adds none; each chat once."""
+    from . import obligations
+    tid = int(task["id"])
+    named = set(OBLIGATION_KEY.findall(str(text or "")))
+    here = obligations._chat(chat)
+    out: list[str] = []
+    for o in obligations.items(db):
+        if o.get("dropped") or not (tid in obligations._owner_ids(o) or o.get("id") in named):
+            continue
+        if not obligations._open(o) and (o.get("receipt") or {}).get("task") != tid:
+            continue
+        where = (o.get("promise") or {}).get("chat")
+        if where is None or obligations._chat(where) in ("all", here) or where in out:
+            continue
+        out.append(where)
+    return out
+
+
+def _handoff_to(db, cfg: dict | None, task: dict, new: str, text: str, chat: str | None, now: float | None,
+                p, delivers: bool = False) -> list[int]:
+    """Post or hold one chat's copy; `delivers` (an obligation's own chat) always posts at once."""
+    from . import msgparts
     try:
         if cfg is None:
             from pathlib import Path
             from .project import Project
             cfg = Project(Path(db.path).parent.parent).config()
-        if (status_gap_s(cfg, chat) > 0 and not owed(db, int(task["id"]), chat)
+        if (not delivers and status_gap_s(cfg, chat) > 0 and not owed(db, int(task["id"]), chat)
                 and not (new in ("failed", "blocked") and needs_user(text))):
             hold(db, chat, _line(task, new, text), HANDOFF, now, task=int(task["id"]))
             return []
