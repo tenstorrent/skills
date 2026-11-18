@@ -22,7 +22,7 @@ Task names: <modelbench.home()>/harbor-tasks.txt (setting tasks_file), one per l
 none there: the full set of a local dataset folder (setting dataset, each task a folder with task.toml),
 the DEFAULT_TASKS subset first so a partial cycle still compares with earlier subset runs; a registry
 dataset name (no folder): the DEFAULT_TASKS subset only. Settings: model_bench.terminalbench {on, tasks_file, agent, limit_s, concurrency,
-floor_share, dataset, compose} (settings; limit_s 0 keeps each task's own limit, the same for every model). Before any trial, compose() makes sure `docker compose` runs, linking
+floor_share, dataset, compose, engine_waits_s} (settings; limit_s 0 keeps each task's own limit, the same for every model). Before any trial, compose() makes sure `docker compose` runs, linking
 a compose plugin found in docker's usual cli-plugins folders or the setting compose into a docker config folder
 the bench owns; none: the run stops with one message naming what is missing. The older suite slice (`ttp model-bench suite --harbor N`) uses the same
 trial runner. Harbor is installed only into a venv the run owns, never with `pip install --user`: built on a
@@ -73,14 +73,23 @@ DEFAULT_TASKS = ("adaptive-rejection-sampler", "code-from-image", "count-dataset
 IDLE_MIN, LOAD_SHARE, GAUGE = 20.0, 0.85, "nproc; cat /proc/loadavg; vmstat 1 2 | tail -1"
 _RATE = re.compile(r"\b429\b|rate.?limit", re.I)
 _AFTER = re.compile(r"retry.?after\D{0,12}(\d+(?:\.\d+)?)", re.I)
-# harbor could not reach the docker engine (a remote engine's host went away, say): no trial can run there, so
-# trial() raises EngineDown instead of returning a row, and the runner stops without using up reruns or booking
+# harbor could not reach the docker engine (a remote engine's host went away, say): nothing ran, so no row is
+# written and no rerun is used. trial() waits ENGINE_WAITS_S (settings' engine_waits_s), re-probing the engine
+# after each wait, and resumes the same job once it answers; only when every wait passed with the engine still
+# down does it raise EngineDown, and the runner stops.
 _ENGINE_DOWN = re.compile(r"docker daemon is not running|cannot connect to the docker daemon|error during connect",
                           re.I)
+ENGINE_WAITS_S, ENGINE_PROBE = (60, 120, 300, 600), ["docker", "info", "--format", "{{.ServerVersion}}"]
 
 
 class EngineDown(RuntimeError):
-    """harbor could not reach the docker engine: nothing ran, so no row is written (the runner stops)."""
+    """The docker engine stayed unreachable through every engine wait: no row is written (the runner stops)."""
+
+
+def engine_up(env: dict, runner: Callable = None) -> bool:
+    """Whether the docker engine the trials use (env's DOCKER_HOST) answers."""
+    rc, out = (runner or _run)(ENGINE_PROBE, env, 60)
+    return rc == 0 and not _ENGINE_DOWN.search(out)
 
 
 def settings(cfg: dict) -> dict:
@@ -96,7 +105,15 @@ def settings(cfg: dict) -> dict:
             "limit_s": 0.0 if s.get("limit_s") == 0 and not isinstance(s.get("limit_s"), bool) else num("limit_s", LIMIT_S, 60),
             "concurrency": int(num("concurrency", 0, 0)), "floor_share": num("floor_share", FLOOR_SHARE, 0),
             "dataset": str(s.get("dataset") or DATASET), "compose": str(s.get("compose") or ""),
-            "idle_min": num("idle_min", IDLE_MIN, 0), "load_share": num("load_share", LOAD_SHARE, 0)}
+            "idle_min": num("idle_min", IDLE_MIN, 0), "load_share": num("load_share", LOAD_SHARE, 0),
+            "engine_waits_s": _waits(s.get("engine_waits_s"))}
+
+
+def _waits(v) -> list[float]:
+    """engine_waits_s: a list of seconds (each >= 1), [] for none; anything else is the default."""
+    if isinstance(v, list) and all(isinstance(x, (int, float)) and not isinstance(x, bool) and x >= 1 for x in v):
+        return [float(x) for x in v]
+    return [float(x) for x in ENGINE_WAITS_S]
 
 
 def tasks(home: Path, st: dict) -> list[str]:
@@ -423,6 +440,7 @@ def trial(model: str, task: str, root: Path, env: dict, st: dict, runner: Callab
           sleep: Callable = time.sleep, command: str | None = None, home: Path | None = None) -> dict:
     """One (model, task) trial under root/<model>/<task>, resumed or read when already there (module doc)."""
     job, reruns, waits = root / slug(model) / slug(task), 1, MAX_RATE_WAITS
+    engine_waits = list(st.get("engine_waits_s", ENGINE_WAITS_S))
     while True:
         if waits <= 0:
             return {"reward": None, "min": None, "error": "endpoint rate limit (429) did not clear"}
@@ -458,7 +476,18 @@ def trial(model: str, task: str, root: Path, env: dict, st: dict, runner: Callab
             lock.close()
         if outcome(job) is None:   # harbor ended without finishing the job
             if _ENGINE_DOWN.search(out):
-                raise EngineDown(f"docker engine unreachable for {task}: {out.strip()[-200:]}")
+                spent = 0.0
+                while engine_waits:
+                    w = engine_waits.pop(0)
+                    sleep(w)
+                    spent += w
+                    if engine_up(env, runner):
+                        break
+                else:
+                    raise EngineDown(f"docker engine unreachable for {task}"
+                                     f"{f' after waiting {spent / 60:.0f} min' if spent else ''}: "
+                                     f"{out.strip()[-200:]}")
+                continue
             if _RATE.search(out):
                 m = _AFTER.search(out)
                 sleep(min(float(m.group(1)) if m else RETRY_S, TASK_TIMEOUT_S))

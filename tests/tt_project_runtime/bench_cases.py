@@ -1375,17 +1375,45 @@ def test_terminalbench_trial_runs_terminus2_with_the_key_in_env_only_and_resumes
     assert env_["OPENAI_API_KEY"] == "fake-key" and env_["OPENAI_BASE_URL"].endswith("/v1")
 
 
-def test_terminalbench_an_unreachable_docker_engine_stops_the_trial_without_a_row(tmp_path):
+def test_terminalbench_an_unreachable_docker_engine_waits_then_resumes_or_stops_without_a_row(tmp_path):
     from ttp import harborslice
     st = {**harborslice.settings({}), "concurrency": 1}
-    calls = []
+    assert st["engine_waits_s"] == [60.0, 120.0, 300.0, 600.0]
+    down = "Docker daemon is not running. Please start Docker and try again."
+    calls, slept = [], []
 
     def runner(cmd, e, t):
         calls.append(cmd)
-        return 1, "Docker daemon is not running. Please start Docker and try again."
+        return 1, down
+    with pytest.raises(harborslice.EngineDown, match="after waiting 18 min"):
+        harborslice.trial("org/m-a", "t-a", tmp_path / "jobs", {}, st, runner, sleep=slept.append)
+    harbor = [c for c in calls if c != harborslice.ENGINE_PROBE]
+    assert slept == [60.0, 120.0, 300.0, 600.0] and len(calls) - len(harbor) == 4, "one probe after each wait"
+    assert len(harbor) == 1, "no harbor rerun while the engine stays down: nothing ran, so nothing is scored"
+    # the engine answers again on the second probe: the same job resumes and its row is the trial's own
+    calls, slept, probes = [], [], iter([(1, down), (0, "29.0")])
+
+    def flaky(cmd, e, t):
+        calls.append(cmd)
+        if cmd == harborslice.ENGINE_PROBE:
+            return next(probes)
+        if sum(c != harborslice.ENGINE_PROBE for c in calls) == 1:
+            return 1, down
+        _fake_trial(cmd, 1.0)
+        return 0, ""
+    got = harborslice.trial("org/m-a", "t-b", tmp_path / "jobs", {}, st, flaky, sleep=slept.append)
+    assert got["reward"] == 1.0 and slept == [60.0, 120.0], "waits only until the engine answers, then reruns"
+    # configured waits: a list of seconds; [] stops at once; junk falls back to the default
+    st0 = harborslice.settings({"model_bench": {"terminalbench": {"engine_waits_s": []}}})
+    calls, slept = [], []
     with pytest.raises(harborslice.EngineDown):
-        harborslice.trial("org/m-a", "t-a", tmp_path / "jobs", {}, st, runner, sleep=lambda s: None)
-    assert len(calls) == 1, "no rerun against an engine that is gone: nothing ran, so nothing is scored"
+        harborslice.trial("org/m-a", "t-c", tmp_path / "jobs", {}, st0, runner, sleep=slept.append)
+    assert slept == [] and len(calls) == 1
+    assert harborslice.settings({"model_bench": {"terminalbench": {"engine_waits_s": [5, 10]}}})[
+        "engine_waits_s"] == [5.0, 10.0]
+    for junk in ("60", [0], [True], [-1, 5], {"a": 1}):
+        assert harborslice.settings({"model_bench": {"terminalbench": {"engine_waits_s": junk}}})[
+            "engine_waits_s"] == [60.0, 120.0, 300.0, 600.0]
 
 
 def test_terminalbench_429_is_waited_out_and_a_setup_error_reruns_once(tmp_path):
