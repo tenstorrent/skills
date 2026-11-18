@@ -358,6 +358,43 @@ def test_glm_guard_lets_a_glm_run_run_its_checks_in_every_form(argv, env, monkey
                                   {"TTP_PROJECT": str(p.base), **_GG_RUN_ENV}) is None
 
 
+class _GatesPassed(BaseException):
+    pass
+
+
+@_pytest.mark.parametrize("name", sorted(__import__("ttp.glmguard", fromlist=["x"]).SUBS_ALLOWED))
+def test_glm_guard_passes_every_allowed_command_with_and_without_arguments(name, env, monkeypatch, tmp_path):
+    """cell guard_checks: `checks`, `clip`, `lock`, `detach` and `pool-*` keep the commands after -- in a.cmd."""
+    from ttp import cli, glmguard
+    p = make(env)
+    wt, rd = _gg_run(tmp_path)
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.setenv("TTP_RUN_DIR", str(rd))
+    monkeypatch.setenv("TTP_CODE_ARM_GUARD", "1")
+    monkeypatch.setattr(cli, "_recover_setup", lambda: (_ for _ in ()).throw(_GatesPassed()))
+    parsed = 0
+    for argv in ([name], [name, "show", "1"], [name, "live"], [name, "--", "true"], [name, "x", "--", "true"], [name, "x", "--", "sh", "-c", "true"]):
+        try:
+            cli.main(argv)
+        except _GatesPassed:
+            parsed += 1
+        except SystemExit as e:
+            assert e.code != 2 or not (rd / glmguard.HIT).exists(), (argv, glmguard.hit_reason(rd))
+    assert parsed and not (rd / glmguard.HIT).exists(), (name, glmguard.hit_reason(rd))
+
+
+def test_glm_guard_still_refuses_ttp_note(env, monkeypatch, tmp_path):
+    from ttp import cli, glmguard
+    p = make(env)
+    wt, rd = _gg_run(tmp_path)
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.setenv("TTP_RUN_DIR", str(rd))
+    monkeypatch.setenv("TTP_CODE_ARM_GUARD", "1")
+    with _pytest.raises(SystemExit):
+        cli.main(["note", "hi"])
+    assert glmguard.hit_reason(rd).startswith("`ttp note`")
+
+
 @_pytest.mark.parametrize("argv,name", [(["note", "--to", "other", "hi"], "note"), (["notify", "hi"], "notify"),
                                          (["task", "add", "x"], "task add"), (["say", "hi"], "say")])
 def test_glm_guard_refusal_names_the_command_it_refused(argv, name, env, monkeypatch, tmp_path, capsys):
