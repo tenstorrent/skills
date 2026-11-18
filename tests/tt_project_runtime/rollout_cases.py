@@ -332,20 +332,20 @@ def test_a_new_alert_votes_rollback_only_for_the_flag_in_its_own_area_by_the_key
     p = make(env)
     th, now = rh.thresholds(None), time.time() + 60
     since = now - 24 * _RH
-    ins = "INSERT INTO alerts(key, raised, severity, text) VALUES(?,?,?,'x')"
+    raise_ = lambda key, sev: p.db.post("out", "x", kind="alert", severity=sev, ref=key)   # the path every alert takes
     for key, sev in (("auth:glm", "high"), ("model-trip:glm|code", "low"), ("model-demote:m|code", "low"),
                      ("route-model-missing:std|m", "normal"), ("after_push_failed", "high"), ("push_tip_failing", "high"),
                      ("auth:claude", "low"), ("eta_ledger_stale", "high")):
-        p.db.x(ins, (key, now - 3 * _RH, sev))
+        raise_(key, sev)
     area = lambda flag: rollout.FLAGS[flag]["area"]
     got = lambda flag: rh.signals(p.db, since, now, th, area(flag))["failing"]
-    assert got("glm_code") == ["new alert auth:glm", "new alert model-demote:m|code", "new alert model-trip:glm|code"]
+    assert got("glm_code") == ["new alert auth:glm"], "model routing trips are low and never stored: not judged"
     assert got("push_isolation") == ["new alert after_push_failed", "new alert push_tip_failing"]
     for none in ("eta_history", "device_prewarm", "deslop"):
         assert got(none) == [], none
     assert rh.signals(p.db, since, now, th)["failing"] == [], "no area, no alert votes"
-    p.db.x(ins, ("auth:glm", now - 100 * _RH, "high"))   # already in the baseline: not new
-    assert got("glm_code") == ["new alert model-demote:m|code", "new alert model-trip:glm|code"]
+    p.db.x("UPDATE alerts SET raised=? WHERE key='auth:glm'", (now - 100 * _RH,))   # already in the baseline: not new
+    assert got("glm_code") == []
     recs = [{"flag": "glm_code", "kind": "set", "to": 1, "ts": since}]
     assert rh.verdict(p.db, "glm_code", 0, recs, {}, now)["failing"] == got("glm_code"), "the daemon's path judges the same"
 
@@ -360,4 +360,39 @@ def test_every_alert_prefix_of_an_area_is_a_key_the_runtime_raises():
         for pre in prefixes:
             pat = re.compile(r"(alert\(\s*f?|_ALERT\s*=\s*)[\"']" + re.escape(pre))
             assert any(pat.search(t) for t in src.values()), f"{area}: nothing in the runtime raises {pre!r}"
-    assert set(rh.ALERT_ANY_SEVERITY) <= set(rh.ALERT_AREAS["route"])
+
+
+def _raised_severities(pre: str) -> set[str]:
+    """The severities the runtime's alert(...) calls give a key starting with `pre` (a call without one is high,
+    the default of Daemon.alert); none found: the key is raised some other way, as high."""
+    import ast
+    from pathlib import Path
+    from ttp import rollout_health as rh
+    found: set[str] = set()
+    for f in Path(rh.__file__).parent.glob("*.py"):
+        for n in ast.walk(ast.parse(f.read_text())):
+            if not (isinstance(n, ast.Call) and getattr(n.func, "attr", getattr(n.func, "id", "")) == "alert" and n.args):
+                continue
+            key = n.args[0]
+            head = (key.values[0] if isinstance(key, ast.JoinedStr) and key.values else key)
+            if not (isinstance(head, ast.Constant) and isinstance(head.value, str) and head.value.startswith(pre)):
+                continue
+            sev = {k.arg: k.value for k in n.keywords}.get("severity") or (n.args[2] if len(n.args) > 2 else None)
+            found.add(sev.value if isinstance(sev, ast.Constant) else "high")
+    return found
+
+
+def test_every_alert_prefix_of_an_area_is_stored_where_the_health_watch_reads_it(env):
+    from ttp import alerts, rollout_health as rh
+    p = make(env)
+    th, now = rh.thresholds(None), time.time() + 60
+    since = now - 24 * _RH
+    for area, prefixes in rh.ALERT_AREAS.items():
+        keys = []
+        for pre in prefixes:
+            assert "high" in (_raised_severities(pre) or {"high"}), f"{area}: {pre} is never raised high: not stored"
+            keys.append(pre + "x" if pre.endswith(":") else pre)
+        for key in keys:
+            assert alerts.tracked("alert", "high", key), f"{area}: {key} raised high is not stored as an alert"
+            p.db.post("out", "x", kind="alert", severity="high", ref=key)
+        assert rh.signals(p.db, since, now, th, area)["failing"] == [f"new alert {k}" for k in sorted(keys)], area

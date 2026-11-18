@@ -18,14 +18,13 @@ from . import postland, pushq, rollout
 DEFAULTS = {"failed_runs_pts": 5.0, "min_runs": 20, "land_time_x": 1.5, "cost_x": 1.3, "min_landings": 3,
             "stuck_h": 2.0, "baseline_days": 7.0, "soak_h_0": 1.0, "soak_h_1": 24.0, "max_window_h": 72.0}
 # Alerts a flag is judged on: only those of its own area (rollout.FLAGS[flag]["area"]), each a key prefix, new
-# since the baseline. A high alert counts; the model alerts of the route area are raised low and count at any
-# severity (ALERT_ANY_SEVERITY). An area with no alert of its own is an empty tuple and is judged on the generic
-# signals alone (failed runs, time to land, cost per landing, stuck tasks, forward reverts), which cover the
-# landing path. The prefixes are the keys the runtime raises (a test checks each against the source).
-ALERT_ANY_SEVERITY = ("model-trip:", "model-demote:", "model-rank:")
+# since the baseline. Only a high alert counts: it is the one stored in the alerts table. An area with no alert of
+# its own is an empty tuple and is judged on the generic signals alone (failed runs, time to land, cost per
+# landing, stuck tasks, forward reverts), which cover the landing path. The prefixes are keys the runtime raises
+# and stores there (a test checks each against the source and the real raise path).
 ALERT_AREAS = {
     "push": (pushq.LANDING_ALERT, pushq.BAD_TIP_ALERT, "push_queue_dying", "after_push_failed"),
-    "route": ("auth:",) + ALERT_ANY_SEVERITY,
+    "route": ("auth:",),
     "eta": (),
     "device": (),
     "review": (),
@@ -96,7 +95,7 @@ def signals(db, since: float, now: float, th: dict, area: str | None = None) -> 
 
     def raised(a: float, b: float) -> set[str]:
         return {r["key"] for r in db.q("SELECT DISTINCT key, severity FROM alerts WHERE raised>=? AND raised<?", (a, b))
-                if r["key"].startswith(prefixes) and (r["severity"] == "high" or r["key"].startswith(ALERT_ANY_SEVERITY))}
+                if r["key"].startswith(prefixes) and r["severity"] == "high"}
     seen = raised(base_a, since)
     for key in sorted(raised(since, now) - seen):
         fail.append(f"new alert {key}")
