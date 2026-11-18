@@ -1974,3 +1974,23 @@ def test_throughput_a_closed_requeue_wait_charges_a_resource_only_from_its_gate_
     box = _tp_lane(rep, "resource:boxA")
     assert box["count"] == 2 and 300 <= box["median_s"] <= box["p90_s"] <= 400, box
     assert _tp_lane(rep, "deferral")["count"] == 2
+
+
+def test_throughput_report_names_the_lost_runner_replacement_gap(env):
+    p = make(env)
+    from ttp import throughput
+    now = time.time()
+    tid = p.db.add_task("t", "s", kind="work", tier="light", origin="user")
+    ins = "INSERT INTO runs(task,role,provider,started,ended,status) VALUES(?,?,?,?,?,?)"
+    p.db.x(ins, (tid, "worker", "fake", now - 900, now - 600, "lost"))
+    rep = throughput.review(p, p.config(), gates={}, now=now)
+    assert rep["replace_gap"]["count"] == 1 and rep["replace_gap"]["open"] == 1
+    txt = throughput.text({**rep, "changes": [], "kept": []})
+    assert "Lost runners: 1 in the window" in txt and "1 over the target" in txt and "SLOW" in txt, txt
+    p.db.x(ins, (tid, "worker", "fake", now - 560, now - 100, "ok"))   # replaced 40 s after the loss
+    rep = throughput.review(p, p.config(), gates={}, now=now)
+    txt = throughput.text({**rep, "changes": [], "kept": []})
+    assert "0 over the target" in txt and "SLOW" not in txt.split("Lost runners")[1].split("\n")[0], txt
+    p.db.x("DELETE FROM runs")
+    assert "Lost runners" not in throughput.text({**throughput.review(p, p.config(), gates={}, now=now),
+                                                  "changes": [], "kept": []})

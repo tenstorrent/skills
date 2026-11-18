@@ -120,7 +120,7 @@ import re
 import time
 from pathlib import Path
 
-from . import gatetime, loadcaps
+from . import gatetime, loadcaps, replacegap
 from .db import DB, START_PASSED, deferral
 
 KV = "throughput_changes"   # kv: [{"id", "ts", "key", "old", "new", "why", "undo", "trigger", "undone"}], newest last
@@ -1376,6 +1376,7 @@ def review(p, cfg: dict, since_s: float = DAY, do_apply: bool = False, trigger: 
     now = time.time() if now is None else now
     rep = measure(p.db, cfg, since_s, now, gates)
     rep["host_checks"] = host_shares(since_s, now)
+    rep["replace_gap"] = replacegap.summary(p.db, since_s, now)
     earlier = recent(p.db, now)
     if do_apply:
         rep["changes"], rep["kept"] = apply(p, cfg, rep, trigger, now)
@@ -1472,6 +1473,11 @@ def text(rep: dict) -> str:
                        f"{_dur(x['wait_s'])}" + (f"; {x['over_share_waits']} wait(s) ended while "
                                                  f"{', '.join(x['over_share_by'])} held over its fair share"
                                                  if x["over_share_waits"] else ""))
+    if (rg := rep.get("replace_gap")) and rg.get("count"):
+        out.append(f"Lost runners: {rg['count']} in the window; a task waited median {_dur(rg['median_s'])}, p90 "
+                   f"{_dur(rg['p90_s'])} for its replacement run (target {_dur(rg['target_s'])}), "
+                   f"{rg['over_target']} over the target" + (f", {rg['open']} still without a next run" if rg["open"] else "")
+                   + (" SLOW" if rg["p90_s"] > rg["target_s"] else ""))
     for c in rep.get("changes") or []:
         out.append(f"Changed #{c['id']}: {c['key']} {c['old']} -> {c['new']} ({c['why']}); undo: {c['undo']}")
     for c in rep.get("would_change") or []:
