@@ -529,6 +529,18 @@ def test_a_takeover_that_cannot_start_sends_one_note_with_its_error(env, monkeyp
     assert len(got) == 1 and "no installed release" in got[0]["spec"] and "--apply` is refused" in got[0]["spec"]
 
 
+def test_the_daemons_takeover_waits_while_a_release_hold_stands_then_runs_once(env, monkeypatch):
+    from ttp import release
+    p, tid, calls, _ = _stale_finish_task(env, monkeypatch)
+    release.set_hold(p.name, "demo running", time.time() + 3600)
+    for _ in range(2):
+        assert release.escalate_stuck(p) == ""
+    assert not calls and p.db.task(tid)["status"] == "queued" and not _stuck_notes(tid)
+    release.lift_hold(p.name)
+    assert release.escalate_stuck(p).startswith("took over") and calls == [tid]
+    assert release.escalate_stuck(p) == "" and calls == [tid] and not _stuck_notes(tid)
+
+
 def test_a_release_hold_skips_the_automatic_upgrade_until_it_expires(env, monkeypatch):
     """A user's 'keep it on its release until the demo is over' (release.set_hold, in this host's tt-project
     home) holds the daemon's own hourly upgrade, not only a deploy; once its time passes the upgrade runs."""

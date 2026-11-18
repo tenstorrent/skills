@@ -560,6 +560,9 @@ def escalate_stuck(p: Project) -> str:
         rec["first"] = now
         db.set_kv(KV_FINISH_STUCK, rec)
         return ""
+    if upgrade_hold(p.name):        # a release hold refuses the takeover too: it runs once the hold ends
+        db.set_kv(KV_FINISH_STUCK, rec)
+        return ""
     if takeover_busy(p):            # retried at the next check; nothing is recorded
         db.set_kv(KV_FINISH_STUCK, rec)
         return ""
