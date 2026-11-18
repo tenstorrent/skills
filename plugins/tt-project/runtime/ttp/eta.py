@@ -469,7 +469,7 @@ class _Est:
             left, over = self._left(self.h["land"], now - float(row["created"]))
             return {"done": now, "end": now + left, "path": [tid], "legs": [("landing", left)], "why": None,
                     "overrun": over}
-        legs, path, over, notes = [], [tid], False, []
+        legs, path, over, notes, deferred = [], [tid], False, [], None
         start = now
         begin = None
         if st == "review":
@@ -549,13 +549,19 @@ class _Est:
                 left, over = self._left(runs, now - float(r["started"])) if r and r["started"] else (self._m(runs), False)
                 legs.append(("run", left * lx))
             else:
-                if st == "waiting" or t.get("not_before"):
-                    start = max(start, float(t.get("not_before") or 0))
+                nb = float(t.get("not_before") or 0)
+                if st != "queued":
+                    start = max(start, nb)
                 if hold := self._held(t):
                     if hold[0] is None:
                         return {**self._held_none(tid, hold[1]), "path": path}
                     start = max(start, hold[0])
                 if st == "queued":
+                    # A queued task deferred to its not_before (start_after, the tests gate) waits that out in
+                    # its queue leg, so the leg never reads 0m while the task cannot start for hours.
+                    defer = max(0.0, nb - start)
+                    if defer:
+                        deferred = nb
                     locks = _locks(t)
                     waits = [w for lk in locks if (w := self._m(self.h["queue"].get(lk, [])) ) is not None]
                     wait = max(waits) if waits else self._m(self.h["wait"])
@@ -564,7 +570,7 @@ class _Est:
                     dx = self._depthx()
                     if dx > 1.0:
                         notes.append(f"queue depth x{dx:.2f}")
-                    legs.append(("queue " + ",".join(locks) if waits else "queue", wait * dx))
+                    legs.append(("queue " + ",".join(locks) if waits else "queue", wait * dx + defer))
                 begin = start + sum(x for _, x in legs)   # when a worker is expected to start it
                 legs.append(("run", self._m(runs) * lx))
             done = start + sum(x for _, x in legs)
@@ -575,7 +581,7 @@ class _Est:
             legs.append(("landing", self._m(self.h["land"])))
             end += legs[-1][1]
         return {"done": done, "end": end, "path": path, "legs": legs, "why": None, "overrun": over, "start": begin,
-                "notes": notes}
+                "notes": notes, "deferred": deferred}
 
 
 def with_p90(est: _Est, e: dict, *tids: int) -> dict:
@@ -671,6 +677,9 @@ def text(e: dict, where, now: float | None = None) -> str:
     """field() with its legs, for `ttp eta`."""
     legs = ", ".join(f"{k} {_dur(v)}" for k, v in e["legs"])
     notes = ", ".join(e.get("notes") or [])
+    if e.get("deferred") and legs:
+        from . import timefmt
+        legs += f"; deferred until {timefmt.short(e['deferred'], where, now)}"
     return field(e, where, now) + (f"; legs of #{e['path'][0]}: {legs}" if legs else "") + (
         f"; adjusted: {notes}" if notes else "") + (
         "; likely = medians (p50) and conservative = p90 of this project's last 14 days, by kind and size"

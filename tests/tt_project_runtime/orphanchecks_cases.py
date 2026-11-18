@@ -114,6 +114,37 @@ def test_a_remote_check_names_its_owner_and_its_cleanup_stops_what_the_run_left_
     assert _rc_left(tmp_path) == []
 
 
+def test_the_reap_finds_a_checkouts_processes_with_one_find_not_a_readlink_per_process(tmp_path):
+    """The reap's scan of /proc is one find call where find has -lname, not a readlink fork per process of
+    the account (on a busy host that ran the cleanup after every check for minutes); a folder name with glob
+    characters matches only itself, so a sibling it would match as a pattern keeps running."""
+    from ttp import orphanchecks
+    if not Path("/proc/self/cwd").exists() or subprocess.run(
+            ["find", "/proc/self/cwd", "-maxdepth", "0", "-lname", "x"], capture_output=True).returncode:
+        pytest.skip("needs /proc and a find with -lname")
+    remote = tmp_path / "remote"
+    target = _oc_checkout(remote, "a*b", "x")
+    sibling = _oc_checkout(remote, "aXb", "x")
+    stub = tmp_path / "stub"
+    stub.mkdir()
+    calls = tmp_path / "readlink-calls"
+    (stub / "readlink").write_text(f"#!/bin/sh\necho x >> {calls}\nexec /bin/readlink \"$@\"\n")
+    (stub / "readlink").chmod(0o755)
+    procs = {d.name: _oc_sleep_in(d, tmp_path) for d in (target, sibling)}
+    try:
+        out = subprocess.run(["sh", "-c", orphanchecks.reap_script([str(target)], 1)], capture_output=True,
+                             text=True, timeout=60, env={**os.environ, "PATH": f"{stub}{os.pathsep}{os.environ['PATH']}"})
+        assert out.stdout.split() == [orphanchecks.REAP_MARK, str(target), str(procs[target.name].pid)], out
+        assert procs[target.name].wait(timeout=15) is not None and not target.exists()
+        assert procs[sibling.name].poll() is None and sibling.exists()
+        assert not calls.exists(), "no readlink per process"
+    finally:
+        for p in procs.values():
+            if p.poll() is None:
+                p.kill()
+            p.wait()
+
+
 def test_orphan_check_sweep_scans_each_check_host_once_per_window_for_all_projects(tmp_path, monkeypatch):
     """sweep covers the spill hosts and delivery.checks_host, never "local"; a host scanned within the
     window (by any project of this user: a stamp in the tt-project home) is skipped."""

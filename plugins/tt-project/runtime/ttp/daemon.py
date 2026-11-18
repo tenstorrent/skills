@@ -616,6 +616,7 @@ PR_FINISH_LINE = ("Take it to the finish line for human review: CI green (a chec
                   "merge it or request reviewers. Anything you post on GitHub ends with [authored by AI].")
 PROBE_EVERY_S = 180     # how often a waiting task's `retry_when` (or a deferred one's `start_when`) probe runs
 NOT_YET_RCS = (1, 75, 255)   # probe exits meaning "not yet": 1, EX_TEMPFAIL (a busy `ttp lock`), ssh unreachable
+PREMISE_HELD = "its premise command (`premise_cmd:`)"   # _start_hold's held_by words for an unrun premise
 JOB_STEP_FAILED = "a step of its detached job failed"   # its driver reported it (Daemon._step_failed)
 JOB_FAILED = "detached job failed"   # what a `ttp detach --check` exit detach.FAILED_RC found (Daemon._job_failed)
 PROBE_TIMEOUT_S = 60
@@ -11402,8 +11403,13 @@ class Daemon:
                 elif (d := deferral(t)).get("when") or (d.get("after") or 0) > now:
                     held = "its start gate: " + convgate.gate_words((d.get("after") or 0) > now and d.get("after"),
                                                                      d.get("when"), now)
-                elif why := self._start_hold(t, t["provider"] or core, ctx):
+                elif (why := self._start_hold(t, t["provider"] or core, ctx)) and not (
+                        PREMISE_HELD in ctx["held_by"].get(tid, "") and float(t.get("not_before") or 0) > now):
                     held = self._hold_words(t, why, ctx)
+                elif (nb := float(t.get("not_before") or 0)) > now:
+                    # Deferred (the tests gate sets a bare not_before): dispatch skips it, so its premise
+                    # command has not run yet and never holds it.
+                    held = f"its not_before: deferred until {timefmt.short(nb, self.p, now)}"
                 else:
                     held = "nothing now (dispatch starts it at its next pass)"
                 text = (f"Urgent start: #{tid} {t['title'][:80]} (user-ordered: {urgent.why(t)}) has not started "
@@ -13919,7 +13925,7 @@ class Daemon:
             ctx["held_by"][task["id"]] = why
             return "held"
         if not self._premise_fresh(task, now):
-            ctx["held_by"][task["id"]] = "its premise command (`premise_cmd:`), run by the daemon before it starts"
+            ctx["held_by"][task["id"]] = f"{PREMISE_HELD}, run by the daemon before it starts"
             return "held"
         if coord.task_resources(task) & ctx["paused"].keys():
             ctx["holds"][task["id"]] = {"kind": "pause", "resource": sorted(coord.task_resources(task)

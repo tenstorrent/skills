@@ -1926,11 +1926,17 @@ def status_text(p: Project, verbose: bool = False) -> str:
             fin = f", {eta.field(e, p, now)}" if est and ((e := est.task(t["id"]))["end"] or e.get("after")) else ""
         except Exception:
             fin = ""
-        row(t, f"{t['status']} ({urgent.mark(db, t, now)}{fin})", f"urgent: {urgent.shown_why(db, t, now)}"
+        # A future not_before (start_after, the tests gate) is when it can start at all: say so, never
+        # only that it is queued.
+        nb = f", deferred until {at(t['not_before'], now, tz)}" if float(t.get("not_before") or 0) > now else ""
+        row(t, f"{t['status']} ({urgent.mark(db, t, now)}{nb}{fin})", f"urgent: {urgent.shown_why(db, t, now)}"
             + (f"; {topup.words(topped[t['id']])}" if t["id"] in topped else ""))
     for t in h["waiting"][:5]:
         why = re.sub(r";? *next try \S+$", "", t["blocked_reason"] or "").strip()
-        row(t, f"waiting, next try {at(t['not_before'], now, tz)}", why,
+        if not why and t["id"] in rows:
+            continue   # its urgent row already says deferred until when
+        # No retry recorded (no blocked reason): a deferral to its not_before, not a next try.
+        row(t, f"{'waiting, next try' if why else 'deferred until'} {at(t['not_before'], now, tz)}", why,
             [f"    job {j['name']}: {j['line']}" for j in (db.kv("job_use", {}) or {}).values() if j.get("task") == t["id"]])
     for t in h["deferred"][:5]:
         broken = t["starts"].startswith(BROKEN_START + ":")

@@ -745,32 +745,34 @@ def test_a_long_once_listen_blocks_in_one_call_and_returns_at_the_first_reply_or
     p = make(env)
     _relay_chat(p)
     monkeypatch.setattr(cli, "here", lambda: None)
-    real_time, clock = time.time, [0.0]
-    monkeypatch.setattr(cli.time, "time", lambda: real_time() + clock[0])
-    naps = []
+    post = [True]
 
-    def nap(s, post=True):
-        naps.append(s)
-        clock[0] += 2
-        if post and len(naps) == 3:
+    def answer(n):
+        if post[0] and n == 3:
             p.db.post("out", "the answer", chat="c1")
-    monkeypatch.setattr(cli.time, "sleep", nap)
+    # A frozen clock moved only by this test's own naps: the heartbeat thread of a parallel checks run
+    # sleeps for real (its sleeps are not naps), and no wall time of a loaded host shortens the timeout.
+    clock, naps = _fake_clock(cli, monkeypatch, on_nap=answer, frozen=True)
     capsys.readouterr()
     cli.main(["listen", "demo", "--chat", "c1", "--once", "--timeout", "600", "--ack", "0"])
     out = capsys.readouterr().out
     assert "the answer" in out and len(naps) == 3 and clock[0] < 600, (out, naps)
     # Nothing arrives: one call, empty output, back at the timeout.
     naps.clear()
-    monkeypatch.setattr(cli.time, "sleep", lambda s: nap(s, post=False))
+    post[0] = False
     last = p.db.one("SELECT MAX(id) m FROM messages")["m"]
     cli.main(["listen", "demo", "--chat", "c1", "--once", "--timeout", "10", "--ack", str(last)])
     assert capsys.readouterr().out == "" and 4 <= len(naps) <= 7, naps
 
 
-def _fake_clock(cli, monkeypatch, step=2.0, on_nap=None):
+def _fake_clock(cli, monkeypatch, step=2.0, on_nap=None, frozen=False):
     # time.sleep is patched process-wide: only this test's own thread moves the clock, so a sleep in any
-    # other thread (a pytest plugin, a leftover helper) neither skips the test's waits nor counts as a nap
+    # other thread (a pytest plugin, a leftover helper) neither skips the test's waits nor counts as a nap.
+    # `frozen`: the clock starts at the real time and moves only by the naps, never by the host's wall time.
     real_time, real_sleep, clock, naps = time.time, time.sleep, [0.0], []
+    if frozen:
+        base = real_time()
+        real_time = lambda: base
     owner = threading.get_ident()
 
     def nap(s):

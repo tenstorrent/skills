@@ -483,7 +483,8 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         why.append(f"{len(net_held)} task(s) held: network ({', '.join(provs)}); they start once the API host "
                    f"resolves")
     if waiting:
-        why.append(f"{len(waiting)} task(s) waiting, next try {at(waiting[0]['not_before'], now, tz)}")
+        why.append(f"{len(waiting)} task(s) waiting, " + ("next try" if waiting[0]["blocked_reason"] else "deferred until")
+                   + f" {at(waiting[0]['not_before'], now, tz)}")
     if deferred:
         why.append(f"{len(deferred)} task(s) deferred, first {deferred[0]['starts']}")
     retry = db.kv(coord.RETRY_WAKE_KEY) or {}

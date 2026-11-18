@@ -84,19 +84,38 @@ def list_script(tag: str) -> str:
             f"seen=\"$seen $d\"; echo {LIST_MARK} \"$d\" - - {GONE_AGE}\ndone; echo {SKIP_MARK} $k; exit 0")
 
 
+def _lname(path: str) -> str:
+    """`path` as a find -lname pattern matching only itself: its glob characters bracketed."""
+    return "".join(f"[{c}]" if c in "*?[" else "\\\\" if c == "\\" else c for c in path)
+
+
 def reap_script(dirs: list[str], grace_s: int) -> str:
     """The host's side of a reap: for each checkout, the process groups of this user's processes working in
     it, by number (TERM, then KILL after `grace_s`), never this script's own; then the folder goes.
-    One REAP_MARK line per checkout: "<mark> <dir> <groups, comma-separated or ->"."""
-    ds = " ".join(shlex.quote(d) for d in dirs)
+    One REAP_MARK line per checkout: "<mark> <dir> <groups, comma-separated or ->".
+    The processes working in it come from one `find` over /proc where find has -lname (GNU, BSD), not a
+    `readlink` per process of the account: on a busy host that loop forked thousands of times and the
+    cleanup after every check ran for minutes (a fake-ssh test on a loaded test host overran its limit)."""
+    calls = "".join(f"_ttp_reap {shlex.quote(d)} {shlex.quote(_lname(d))}\n" for d in dirs)
     return ("me=$(id -u); mine=$(ps -o pgid= -p $$ | tr -d ' ')\n"
-            f"for d in {ds}; do\n"
-            "[ ! -e \"$d\" ] || [ -O \"$d\" ] || continue\n"
-            "gs=\"\"\n"
+            "lname=; find /proc/self/cwd -maxdepth 0 -lname x >/dev/null 2>&1 && lname=1\n"
+            "_ttp_reap() {\n"
+            "d=$1\n"
+            "[ ! -e \"$d\" ] || [ -O \"$d\" ] || return 0\n"
+            "if [ -n \"$lname\" ]; then\n"
+            "ps_=$(find /proc/[0-9]*/cwd -maxdepth 0 -user \"$me\" \\( -lname \"$2\" -o -lname \"$2/*\" "
+            "-o -lname \"$2 (deleted)\" \\) 2>/dev/null)\n"
+            "else\n"
+            "ps_=\n"
             "for p in /proc/[0-9]*; do\n"
             "[ -O \"$p\" ] || continue\n"
             "c=$(readlink \"$p/cwd\" 2>/dev/null) || continue\n"
-            "case \"$c\" in \"$d\"|\"$d\"/*|\"$d (deleted)\") ;; *) continue;; esac\n"
+            "case \"$c\" in \"$d\"|\"$d\"/*|\"$d (deleted)\") ps_=\"$ps_ $p/cwd\";; esac\n"
+            "done\n"
+            "fi\n"
+            "gs=\"\"\n"
+            "for p in $ps_; do\n"
+            "p=${p%/cwd}\n"
             "g=$(ps -o pgid= -p \"${p#/proc/}\" 2>/dev/null | tr -d ' ')\n"
             "[ -n \"$g\" ] && [ \"$g\" -gt 1 ] && [ \"$g\" != \"$mine\" ] || continue\n"
             "case \" $gs \" in *\" $g \"*) ;; *) gs=\"$gs $g\";; esac\n"
@@ -106,7 +125,8 @@ def reap_script(dirs: list[str], grace_s: int) -> str:
             "for g in $gs; do kill -KILL \"-$g\" 2>/dev/null; done\n"
             "rm -rf \"$d\"\n"
             f"set -- $gs; IFS=,; echo {REAP_MARK} \"$d\" \"${{*:--}}\"; unset IFS\n"
-            "done; exit 0")
+            "}\n"
+            f"{calls}exit 0")
 
 
 def orphans(out: str, grace_s: float = GRACE_S, alive=owner_alive) -> list[str]:

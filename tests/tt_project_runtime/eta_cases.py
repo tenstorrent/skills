@@ -254,7 +254,11 @@ def test_eta_red_spend_gate_starts_held_work_at_its_known_reset(env):
     assert eta.estimate(p.db, t, now)["end"] == pytest.approx(now + 1800 + 1500)
     # A later not_before stays the start; a running task is not held.
     p.db.x("UPDATE tasks SET not_before=? WHERE id=?", (now + 5000, t))
-    assert eta.estimate(p.db, t, now)["end"] == pytest.approx(now + 5000 + 1500)
+    e = eta.estimate(p.db, t, now)
+    assert e["end"] == pytest.approx(now + 5000 + 1500)
+    # Its queue leg waits it out past the plan window's reset (cell eta_not_before), never a 0m queue.
+    assert [x for k, x in e["legs"] if k.startswith("queue")][0] >= 5000 - 1800, e["legs"]
+    assert "deferred until" in eta.text(e, "UTC", now), eta.text(e, "UTC", now)
     r = p.db.add_task("already running", "s", kind="work", status="running")
     p.db.x("INSERT INTO runs(task, role, started, status) VALUES(?, 'worker', ?, 'running')", (r, now - 100))
     assert eta.estimate(p.db, r, now)["end"] < now + 1800

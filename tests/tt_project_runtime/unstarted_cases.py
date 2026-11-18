@@ -790,6 +790,40 @@ def test_the_daemons_own_backoffs_and_start_gates_are_never_an_urgent_tasks_own_
     assert woken in got, "counted from its wake, not from the latest backoff"
 
 
+def test_an_urgent_code_task_deferred_by_a_bare_not_before_is_held_by_it_never_by_its_unrun_premise(
+        env, monkeypatch):
+    """check_urgent_start: a queued urgent code task whose bare not_before (the tests gate sets one, no
+    start_after label) is ahead is held by that not_before, named with its time; its premise command
+    runs only once it is ready, so the event never blames the premise. Once the not_before passes, an
+    unrun premise is named again."""
+    from ttp import timefmt
+    from ttp.daemon import Daemon
+    p = make(env)
+    _no_events(p)
+    p.db.x("UPDATE tasks SET status='done'")
+    d = Daemon(p.base)
+    d.cfg = p.config()
+    d.update_gates()
+    d.settling = lambda: False
+    start = time.time()
+    tid = p.db.add_task("deflake", "s\nurgent: the user ordered it\npremise_cmd: true", kind="code",
+                        tier="light", origin="user")
+    p.db.x("UPDATE tasks SET labels=?, created=? WHERE id=?", (json.dumps(["resource:box-a"]), start - 3600, tid))
+    p.db.update_task(tid, not_before=start + 3 * 3600)
+
+    def check(at):
+        monkeypatch.setattr(time, "time", lambda: at)
+        d._urgent_start_checked = at - 60
+        d.check_urgent_start()
+        return {e["task"]: e["text"] for e in p.db.q("SELECT * FROM events WHERE fingerprint LIKE 'urgent_start:%'")}
+    text = check(start + 60)[tid]
+    assert f"its not_before: deferred until {timefmt.short(start + 3 * 3600, p, start + 60)}" in text, text
+    assert "premise" not in text, text
+    p.db.x("DELETE FROM events WHERE fingerprint LIKE 'urgent_start:%'")
+    text = check(start + 3 * 3600 + 60)[tid]
+    assert "premise command" in text and "not_before" not in text, text
+
+
 def test_an_expect_claim_with_no_owner_open_20_min_is_never_announced_not_started(env):
     """A claim is promise-shaped but owes no work: an expect claim still open 20 min on raises no
     announced_not_started and shows in neither the promises digest nor the sweep's items."""
