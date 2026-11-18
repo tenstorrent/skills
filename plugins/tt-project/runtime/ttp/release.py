@@ -778,13 +778,9 @@ def lift_hold(name: str) -> dict | None:
 
 
 def _probe_over(probe: str, cwd: str) -> bool:
-    try:
-        r = subprocess.run(probe, shell=True, cwd=cwd if os.path.isdir(cwd) else None, timeout=HOLD_PROBE_S,
-                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           start_new_session=True)
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return r.returncode == 0
+    from . import boundedchild
+    return boundedchild.run(probe, HOLD_PROBE_S, shell=True, cwd=cwd if os.path.isdir(cwd) else None,
+                            stderr="devnull").rc == 0
 
 
 def upgrade_hold(name: str, now: float | None = None, probe: bool = True) -> dict | None:
