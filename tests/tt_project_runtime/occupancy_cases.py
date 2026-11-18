@@ -142,7 +142,7 @@ def test_occupancy_watchdog_flags_an_overlap_and_posts_once(env, monkeypatch):
     occ = _occ_home(env["home"], monkeypatch)
     occ.publish(_OccProj("streamer", p.root, {"box-a": {"cmd": "exit 0"}}))
     now = time.time()
-    span = {"id": "j1", "kind": "lock", "start": now - 30, "end": None, "resource": "box-a", "machine": "box-a",
+    span = {"id": "j1", "kind": "lock", "start": now, "end": None, "resource": "box-a", "machine": "box-a",
             "task": 7, "cmd": "pytest", "disruptive": False}
     monkeypatch.setattr(activity, "entries", lambda state: [span])
     monkeypatch.setattr(activity, "spans", lambda recs, here: [span])
@@ -165,13 +165,76 @@ def test_occupancy_watchdog_front_box_flags_only_deploys(env, monkeypatch):
     occ = _occ_home(env["home"], monkeypatch)
     occ.publish(_OccProj("streamer", p.root, {"box-a": {"cmd": "exit 0", "fronts": ["router-a"]}}))
     now = time.time()
-    test_span = {"id": "t1", "kind": "lock", "start": now - 10, "end": None, "resource": "router-a",
+    test_span = {"id": "t1", "kind": "lock", "start": now, "end": None, "resource": "router-a",
                  "machine": "router-a", "task": 3, "cmd": "pytest"}
     deploy_span = {**test_span, "id": "d1", "step": "deploy"}
     monkeypatch.setattr(activity, "entries", lambda state: [])
     monkeypatch.setattr(activity, "spans", lambda recs, here: [test_span, deploy_span])
     out = occupancy.watch(p, p.db, now, None)
     assert [f["step"] for f in out["flags"]] == ["deploy"]
+
+
+def _watch_with(monkeypatch, spans):
+    from ttp import activity
+    monkeypatch.setattr(activity, "entries", lambda state: [])
+    monkeypatch.setattr(activity, "spans", lambda recs, here: spans)
+
+
+def test_occupancy_watchdog_flags_only_device_use_of_the_box(env, monkeypatch):
+    """A CPU check, a test suite and a host process driving other hosts (ssh, a cluster, docker over ssh) that
+    ran on the box's host during a live window are not flagged: only spans on the box's own devices are."""
+    from ttp import occupancy, project
+    p = make(env)
+    occ = _occ_home(env["home"], monkeypatch)
+    here = project.hostname()
+    occ.publish(_OccProj("streamer", p.root, {here: {"cmd": "exit 0"}}))
+    now = time.time()
+    base = {"kind": "lock", "start": now, "end": None, "host": here, "task": 5, "cmd": "run"}
+    spans = [{**base, "id": "cpu", "resource": "checks-slot"},            # a ttp checks run
+             {**base, "id": "suite", "kind": "job"},                      # a test suite, no resource
+             {**base, "id": "ssh", "resource": "cluster-a"},              # drives another host
+             {**base, "id": "drv", "machine": "box-far"},                 # a remote job elsewhere
+             {**base, "id": "dev", "resource": f"{here}-device"},         # the box's device lock
+             {**base, "id": "rst", "step": "reset"}]                      # a reset step on this host
+    _watch_with(monkeypatch, spans)
+    out = occupancy.watch(p, p.db, now, None)
+    assert sorted(f["key"].split(":")[0] for f in out["flags"]) == ["dev", "rst"], out["flags"]
+
+
+def test_occupancy_watchdog_never_flags_a_job_that_started_before_the_stream(env, monkeypatch):
+    from ttp import occupancy
+    p = make(env)
+    occ = _occ_home(env["home"], monkeypatch)
+    occ.publish(_OccProj("streamer", p.root, {"box-a": {"cmd": "exit 0"}}))
+    now = time.time()
+    old = {"id": "old", "kind": "lock", "start": now - 3600, "end": None, "resource": "box-a-device", "task": 1,
+           "cmd": "bench"}
+    new = {**old, "id": "new", "start": now + 2, "task": 2}
+    _watch_with(monkeypatch, [old, new])
+    out = occupancy.watch(p, p.db, now + 2, None)
+    assert [f["task"] for f in out["flags"]] == [2], out["flags"]
+
+
+def test_occupancy_watchdog_posts_one_alert_per_stream_event_with_the_source_reason(env, monkeypatch):
+    from ttp import occupancy
+    p = make(env)
+    occ = _occ_home(env["home"], monkeypatch)
+    occ.publish(_OccProj("streamer", p.root, {"box-a": {"cmd": "echo hold with no owner shown; exit 0"}}, quiet_s=0))
+    now = time.time()
+    mk = lambda i, t: {"id": f"d{i}", "kind": "lock", "start": t, "end": None, "resource": "box-a-device",   # noqa: E731
+                       "task": i, "cmd": "bench"}
+    posts = []
+    post = lambda key, text: posts.append((key, text))   # noqa: E731
+    _watch_with(monkeypatch, [mk(i, now) for i in range(12)])
+    out = occupancy.watch(p, p.db, now, post)
+    assert len(out["flags"]) == 12 and len(posts) == 1, posts
+    text = posts[0][1]
+    assert "12 job(s)" in text and "+2 more" in text and "hold with no owner shown" in text, text
+    assert text.count("task #") == 10, text
+    # a job joining the same event is kept for status but posts nothing more
+    _watch_with(monkeypatch, [mk(i, now) for i in range(12)] + [mk(99, now + 5)])
+    assert len(occupancy.watch(p, p.db, now + 5, post)["flags"]) == 1 and len(posts) == 1
+    assert len(occupancy.recent_flags(p.db, 86400, now + 6)) == 13
 
 
 def test_occupancy_stop_switch_and_should_stop(env, tmp_path):

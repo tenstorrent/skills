@@ -215,6 +215,9 @@ def _reading(proj: str, alias: str, src: dict, now: float, fresh: bool) -> dict:
             spans[-1][1] = now
         rec = {"state": state, "detail": detail, "at": now, "spans": spans[-200:],
                "last_live": now if state != "free" else rec.get("last_live"),
+               # what the source said at its last live or unknown read (a real clip, or a fail-safe hold)
+               "live_state": state if state != "free" else rec.get("live_state"),
+               "live_detail": detail if state != "free" else rec.get("live_detail"),
                "unknown_since": (rec.get("unknown_since") or now) if state == "unknown" else None,
                "quiet_s": src.get("quiet_s", QUIET_S)}
         doc[key] = rec
@@ -381,11 +384,39 @@ def _job_step(s: dict) -> str:
     return "reset" if s.get("disruptive") else "test"
 
 
+EVENTS_KEY = "occupancy_events"   # kv: stream events (box plus window start) already posted (watch)
+EVENT_LIST = 10                   # jobs an event's post lists; the rest are "+N more"
+DEVICE_STEPS = ("reset",)         # a step that touches the box's devices whatever the lock says
+
+
+def _uses_devices(cfg: dict, alias: str, s: dict, step: str) -> bool:
+    """A span uses `alias`'s own devices: a broker job on it (`machine`), a lock on its device resources
+    (checkspill.device_locks_of: `<alias>-device`, its shared device names, device.locks) or on the alias
+    itself, or a device or reset step with no resource of another machine. Read from the span's structured
+    fields, never its command: a CPU check, a test suite or a host process driving other hosts (ssh, a
+    Slurm cluster, docker over ssh) is not device use."""
+    from . import checkspill
+    if s.get("machine"):
+        return s["machine"] == alias
+    res = str(s.get("resource") or "")
+    if res:
+        if res == alias or res in checkspill.device_locks_of(cfg, alias):
+            return True
+        return step in DEVICE_STEPS and _names_alias(alias, res)
+    return step in DEVICE_STEPS or bool(s.get("disruptive"))
+
+
+def _names_alias(alias: str, res: str) -> bool:
+    return res == alias or res.startswith((alias + "-", alias + ":"))
+
+
 def watch(p, db, now: float | None = None, post: Callable[[str, str], None] | None = None) -> dict:
     """The daemon's model-free watchdog, one pass: publish this project's sources, read every
     registered source (cached), raise one event per own source that cannot tell, and flag each job of
-    this project that ran on a covered box while its stream was live or inside its quiet window (a
-    front box: deploys and restarts only). A flag posts once, at high severity, and is kept in kv."""
+    this project that used a covered box's own devices (_uses_devices) and started while its stream was
+    live or inside its quiet window (a front box: deploys and restarts only). A job that started before
+    the stream went live is never flagged. Per-job flags are kept in kv for status; one alert per stream
+    event (box plus window start) posts at high severity, listing the jobs and the source's own reason."""
     from . import activity
     now = time.time() if now is None else now
     publish(p)
@@ -405,10 +436,13 @@ def watch(p, db, now: float | None = None, post: Callable[[str, str], None] | No
     from .machines import load as machines_load
     here = project.hostname()
     known = machines_load()
+    cfg = p.config()
     # A span that ran on this host counts as on `alias` only while `alias` is this host.
     local = {a for a in cov if a == here or str((known.get(a) or {}).get("hostname") or "").lower() == here.lower()}
     seen = db.kv(SEEN_KEY, {})
     flags = db.kv(FLAGS_KEY, [])
+    events = db.kv(EVENTS_KEY, {})
+    new: dict[str, list[dict]] = {}
     recs = [r for r in activity.entries(p.state) if now - float(r.get("start") or r.get("end") or now) < HISTORY_S]
     for s in activity.spans(recs, here):
         sid = str(s.get("id"))
@@ -418,11 +452,16 @@ def watch(p, db, now: float | None = None, post: Callable[[str, str], None] | No
             if not activity.on_machine(alias, s, {here.lower()} if alias in local else set()):
                 continue
             step = _job_step(s)
+            device = _uses_devices(cfg, alias, s, step)
             for proj, stream, src, role in regs:
-                if role == "front" and step not in FRONT_STEPS:
+                if role == "front":
+                    if step not in FRONT_STEPS:
+                        continue
+                elif not device:
                     continue
                 rec = readings.get(f"{proj}:{stream}") or {}
-                hit = next(((a, b) for a, b in _live_windows(rec, now) if start <= b and end >= a), None)
+                # Only a job that started while the stream was live (or in its quiet tail) counts.
+                hit = next(((a, b) for a, b in _live_windows(rec, now) if a <= start <= b and end >= a), None)
                 fkey = f"{sid}:{alias}:{proj}:{stream}"
                 if hit is None or fkey in seen:
                     continue
@@ -430,25 +469,48 @@ def watch(p, db, now: float | None = None, post: Callable[[str, str], None] | No
                 flag = {"key": fkey, "alias": alias, "stream": stream, "role": role, "source": proj,
                         "task": s.get("task"), "kind": s.get("kind"), "step": step,
                         "resource": s.get("resource") or s.get("machine"), "cmd": str(s.get("cmd") or "")[:160],
-                        "start": start, "end": s.get("end"), "live_from": hit[0], "quiet_to": hit[1], "at": now}
+                        "start": start, "end": s.get("end"), "live_from": hit[0], "quiet_to": hit[1], "at": now,
+                        "reason": str(rec.get("live_detail") or rec.get("detail") or ""),
+                        "reading": str(rec.get("live_state") or rec.get("state") or "")}
                 flags.append(flag)
                 out["flags"].append(flag)
-                if post:
-                    post(f"occupancy:violation:{fkey}", flag_text(flag))
+                new.setdefault(f"{alias}:{proj}:{stream}:{int(hit[0])}", []).append(flag)
+    if post:
+        for ekey, fl in new.items():
+            if ekey not in events:
+                post(f"occupancy:violation:{ekey}", event_text(fl))
+    for ekey in new:
+        events[ekey] = now
     db.set_kv(SEEN_KEY, {k: v for k, v in seen.items() if now - float(v) < HISTORY_S})
+    db.set_kv(EVENTS_KEY, {k: v for k, v in events.items() if now - float(v) < HISTORY_S})
     db.set_kv(FLAGS_KEY, flags[-FLAGS_KEPT:])
     return out
 
 
-def flag_text(f: dict) -> str:
-    role = f" (front of {f['stream']})" if f["role"] == "front" else ""
+def _job_line(f: dict) -> str:
     end = _clock(f["end"]) if f.get("end") is not None else "still running"
-    return (f"A job of this project ran on {f['alias']}{role} while a live realtime stream held it: task "
-            f"#{f.get('task') or '?'} {f['kind']} ({f['step']}) on {f.get('resource') or f['alias']}, "
-            f"{_clock(f['start'])}-{end}; the stream was live from {_clock(f['live_from'])} and quiet until "
-            f"{_clock(f['quiet_to'])} (source of {f['source']}). Command: {f['cmd'] or '?'}. "
+    return (f"task #{f.get('task') or '?'} {f['kind']} ({f['step']}) on {f.get('resource') or f['alias']}, "
+            f"{_clock(f['start'])}-{end}")
+
+
+def event_text(fl: list[dict]) -> str:
+    """One alert for a stream event: the box and window, the source's own reason at the hit (a real clip or
+    a fail-safe hold with no owner shown), the first EVENT_LIST jobs and "+N more"."""
+    f = fl[0]
+    role = f" (front of {f['stream']})" if f["role"] == "front" else ""
+    why = f.get("reason") or "no reason given"
+    shown = "; ".join(_job_line(x) for x in fl[:EVENT_LIST])
+    more = f"; +{len(fl) - EVENT_LIST} more" if len(fl) > EVENT_LIST else ""
+    return (f"{len(fl)} job(s) of this project used {f['alias']}{role} while a live realtime stream held it: the "
+            f"stream was live from {_clock(f['live_from'])} and quiet until {_clock(f['quiet_to'])} (source of "
+            f"{f['source']}, {f.get('reading') or 'live'}: {why}). Jobs: {shown}{more}. "
             f"Every deploy, restart, test, benchmark, warm-up, health check or reset there must ask "
             f"`ttp occupancy {f['alias']}` first and stay off while it says so.")
+
+
+def flag_text(f: dict) -> str:
+    """One job's flag as an alert (event_text of a single job)."""
+    return event_text([f])
 
 
 def recent_flags(db, since_s: float = 86400, now: float | None = None) -> list[dict]:
