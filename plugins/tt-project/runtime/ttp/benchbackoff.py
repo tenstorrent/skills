@@ -85,9 +85,9 @@ class Backoff:
         print(f"bench back-off: {self.model} capacity refusals {rec['refusal_pct']}% over {calls} calls; "
               f"trials at once {old} -> {new} ({why})", file=sys.stderr, flush=True)
         if self.log is not None:
+            from .project import durable_append
             try:
-                with self.log.open("a") as f:
-                    f.write(json.dumps(rec) + "\n")
+                durable_append(self.log, json.dumps(rec) + "\n")
             except OSError:
                 pass
         self.cv.notify_all()
