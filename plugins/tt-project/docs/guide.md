@@ -5137,6 +5137,16 @@ ring's soak (1 h in ring 0, 24 h in ring 1). Too few samples never promote: afte
 `promote` by hand ignores health, as the user's own word. A project's own explicit setting for the feature's key
 is never touched by the watch.
 
+Wired flags. `glm_code` gates the code route's GLM coin flip (codearm.py): a project's own
+`route.code_sonnet.glm_share` wins as written, 0 included; without one, the flag on gives the account's share,
+else 0.5 (`codearm.RING_SHARE`), and the flag off makes it 0, so no coin flip runs. The arm still needs a
+`route.code_sonnet.glm` model, and Claude review, the policy-file bounce and the switch-back guard are
+unchanged. `fresh_continue` (`worker.fresh_continue`), `coord_wake_settle` (`coordinator.wake_settle`) and
+`output_trim` (`output.trim`) gate the cost levers of costlevers.py and wakesettle.py; `ttp status` and the
+daily review show their numbers. A flag whose feature already runs for every project graduates and leaves the
+list instead of being gated off: `push_isolation` (push batches that survive one failing entry or a remote
+outage). `eta_history`, `device_prewarm` and `deslop` gate nothing yet.
+
 Scratch projects. A project listed in ring 0 has a soft daily spend cap, $25 by default
 (`rollout.scratch_cap_usd`, the project's own value first, 0 turns it off). Past it, routine tasks wait in the
 queue and start when the day's spend falls under it. Urgent tasks, tasks answering the user's chat and owners of

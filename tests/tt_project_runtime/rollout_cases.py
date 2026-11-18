@@ -93,14 +93,14 @@ def test_rollout_state_is_account_wide_and_touches_no_project_file(env, capsys):
     p = make(env)
     before = {f: f.read_bytes() for f in p.base.rglob("*") if f.is_file() and f.suffix in (".json", ".md")}
     _roll(capsys, "ring", "someone", "1")
-    _roll(capsys, "set", "push_isolation", "1")
+    _roll(capsys, "set", "eta_history", "1")
     assert {f: f.read_bytes() for f in before} == before
     data = json.loads(project.account_settings_path().read_text())
-    assert data["rollout"] == {"flags": {"push_isolation": 1}, "rings": {"1": ["someone"]}}
+    assert data["rollout"] == {"flags": {"eta_history": 1}, "rings": {"1": ["someone"]}}
     assert oct(project.account_settings_path().stat().st_mode & 0o777) == "0o600"
     assert (project.HOME_DIR / rollout.LEDGER).exists()
     st = json.loads(_roll(capsys, "status", "--json")[1])
-    assert st["flags"]["push_isolation"]["level"] == 1 and st["rings"] == {"1": ["someone"]}
+    assert st["flags"]["eta_history"]["level"] == 1 and st["rings"] == {"1": ["someone"]}
     for key in ("flags", "rings", "excluded", "thresholds", "scratch_cap_usd"):
         assert f"rollout.{key}" in project.ACCOUNT_USER_ONLY and key in project.ACCOUNT_KEYS["rollout"]
 
@@ -160,7 +160,7 @@ def test_health_flags_a_new_high_alert_in_the_flags_area_a_forward_revert_and_a_
     p = make(env)
     th, now = rh.thresholds(None), time.time() + 60
     since = now - 24 * _RH
-    area = rollout.FLAGS["push_isolation"]["area"]
+    area = "push"   # the push queue's area (push_isolation graduated: #8769 runs for every project)
     ins = "INSERT INTO alerts(key, raised, severity, text) VALUES(?,?,?,'x')"
     p.db.x(ins, ("push_not_landing", now - 100 * _RH, "high"))     # seen in the baseline: not new
     p.db.x(ins, ("push_not_landing", now - 5 * _RH, "high"))
@@ -340,7 +340,8 @@ def test_a_new_alert_votes_rollback_only_for_the_flag_in_its_own_area_by_the_key
     area = lambda flag: rollout.FLAGS[flag]["area"]
     got = lambda flag: rh.signals(p.db, since, now, th, area(flag))["failing"]
     assert got("glm_code") == ["new alert auth:glm"], "model routing trips are low and never stored: not judged"
-    assert got("push_isolation") == ["new alert after_push_failed", "new alert push_tip_failing"]
+    assert rh.signals(p.db, since, now, th, "push")["failing"] == ["new alert after_push_failed", "new alert push_tip_failing"]
+    assert "push_isolation" not in rollout.FLAGS, "graduated: #8769's push batch survival runs for every project"
     for none in ("eta_history", "device_prewarm", "deslop"):
         assert got(none) == [], none
     assert rh.signals(p.db, since, now, th)["failing"] == [], "no area, no alert votes"
