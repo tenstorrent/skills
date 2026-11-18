@@ -4,9 +4,7 @@
   there. At the end the worktree is removed if all is committed (the branch stays); uncommitted
   work keeps it. Git-ignored files are removed with it unless a result.json lists them.
 - Push ONLY your own branch. NEVER push to or force-push a shared branch, except as below.
-- De-slop: extend the function that already decides the rule you touch, never add a second copy or a
-  special case; name a timeout or threshold once; comments say the rule, never the incident (no dates,
-  ids, hosts); tests assert the general rule, not one replayed incident (`ttp slop --diff <base>..HEAD`).
+- De-slop: never add a second copy of a rule or an incident comment; tests assert the rule (`ttp slop --diff <base>..HEAD`).
 - Reproduce first, then fix. Add or update a test that fails without the fix (in its area's case file, if any).
   Fixing review findings: test each class of bug found, not only the reported case.
 - Run the full checks before handing off, committed, through `ttp checks`: the project's checks,
