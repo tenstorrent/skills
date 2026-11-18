@@ -334,6 +334,7 @@ from .providers.jev import Jev, JevOutOfFunds, Pause as JevPause
 from .prompts import RUN_DIR_MARK
 
 TICK_S = 3.0
+WASTE_LEDGER_KV = "waste_ledger_at"   # kv: when the waste ledger last ran (the daily review or check_daily_waste)
 NOTICE_EVERY_S = 10.0   # how often the heartbeat reads the device broker's power-cycle notice (Daemon._cycle_notice)
 # With no run, push or startable task the wait between ticks doubles each tick up to this (_between_ticks):
 # an idle daemon ticks, and starts its steps' git, ps and probe processes, a few times a minute, not 20.
@@ -634,6 +635,7 @@ HARNESS_HEAD_S = 10
 # still wake it. Such a wake does not count harder against SPEC_WAKES_PER_H: the hold already keeps the
 # next spec wake out for longer than the cap's hour, so weighting it again would only double count.
 SPEC_SEEN_KEY, SPEC_WAKES_KEY, SPEC_WAKES_PER_H = "spec_seen", "spec_wakes", 3
+SPEC_SEEN_LEN_KEY = "spec_seen_len"   # the length of the spec base SPEC_SEEN_KEY fingerprints (wakesettle.pass_record_only)
 SPEC_WAKE_NOW_KEY = "wake_now"
 SPEC_WAKE_COALESCE_S = 1800
 SPEC_URGENT_KEY, SPEC_URGENT_WOKE_KEY = "spec_urgent", "spec_urgent_woke"
@@ -2476,6 +2478,7 @@ class Daemon:
         for step in (   # one step per line: two changes adding steps merge without a conflict
                 self.run_schedules,
                 self.check_self_review,
+                self.check_daily_waste,
                 self.poll_slack,
                 self.check_resource_trouble,
                 self.read_upstream,
@@ -7608,6 +7611,7 @@ class Daemon:
         try:
             cur = wakecost.current_row(r, usage, session, self.p.runs)
             state, text = wakecost.check(self.cfg, self.p.db, self.p.runs, state, cur)
+            costlevers.note_wake_tools(self.p, int(r["id"]), cur.get("tools"), time.time())
             state = wakecost.cold_cap(self.cfg, self.p.db, self.p.runs, state, cur, r.get("provider") or "",
                                       str(r.get("model") or ""))
         except Exception:   # bookkeeping: the next wake checks again
@@ -8746,10 +8750,12 @@ class Daemon:
                 log(self.p, said)
             if "waiting_since" in extra:
                 # The spec it slept on: a later change (a task_update) applies when its wait ends (_spec_wake).
-                from .prompts import spec_digest
+                from .prompts import spec_base, spec_digest
                 # An update the run never read keeps the spec it started on, so its next run gets that change.
                 slept_on = self.p.db.task(task["id"]) or task
                 extra[SPEC_SEEN_KEY] = missed["started"] if missed else spec_digest(slept_on)
+                if not missed:
+                    extra[SPEC_SEEN_LEN_KEY] = len(spec_base(slept_on))
                 extra[SPEC_URGENT_KEY] = _urgent_seen(prev_res) if missed else urgent.lines(slept_on["spec"])
                 if (woke_on := prev_res.get(SPEC_URGENT_WOKE_KEY)) == key["key"]:   # one urgent wake per wait
                     extra[SPEC_URGENT_WOKE_KEY] = woke_on
@@ -10640,6 +10646,7 @@ class Daemon:
         chat, and over target one fix task for the largest bucket unless one is still open."""
         from . import waste
         now = time.time()
+        db.set_kv(WASTE_LEDGER_KV, now)
         cfg = waste.settings(self.cfg)
         rep = waste.report(db, now - 86400, now, self.cfg)
         if rep["total"] <= 0:
@@ -10671,6 +10678,20 @@ class Daemon:
             f"conclusion: the cause and the fix, with figures.",
             kind="harness", tier="standard", priority=2, origin="daemon", labels=[label])
         return out + f"\nQueued fix task #{tid} for {waste.LABELS[bucket]}."
+
+    def check_daily_waste(self, every_s: float = 600) -> None:
+        """The waste ledger once a day without a model (rings.coord_wake_settle, off by default): the alert and
+        the fix task of the daily review, whether or not that review runs. The daily review's own call counts
+        as the day's run (it stamps WASTE_LEDGER_KV)."""
+        now = time.time()
+        if now - getattr(self, "_daily_waste_checked", 0.0) < every_s:
+            return
+        self._daily_waste_checked = now
+        if not costlevers.lever_on(self.p, "coord_wake_settle"):
+            return
+        if now - float(self.p.db.kv(WASTE_LEDGER_KV, 0) or 0) < 86400:
+            return
+        self._waste_ledger(self.p.db)
 
     def check_self_review(self, every_s: float = 60) -> None:
         """Model-free check that the daily self-review still happens (selfreview.tick): restores a
@@ -18160,8 +18181,20 @@ class Daemon:
             if (task["not_before"] or 0) < after:
                 self.p.db.update_task(task["id"], not_before=after)
             return
-        from .prompts import spec_digest
-        seen, sha = load_result(task["result"]).get(SPEC_SEEN_KEY), spec_digest(task)
+        from .prompts import spec_base, spec_digest
+        prev = load_result(task["result"])
+        seen, sha = prev.get(SPEC_SEEN_KEY), spec_digest(task)
+        if isinstance(seen, str) and seen != sha and why.startswith("probe passed") and wakesettle.on(self.p) \
+                and wakesettle.pass_record_only(spec_base(task), seen, prev.get(SPEC_SEEN_LEN_KEY), task["title"]):
+            # rings.coord_wake_settle: the edit only recorded this pass. Its new spec is now the baseline and the
+            # pass takes the normal path below (on_pass recorded model-free where clear), not the escalated wake.
+            wakesettle.record(self.p.db, "probe", "skip", [], now, 0.0, f"#{task['id']}: spec edit only records the "
+                              "probe pass", kinds=["probe_spec_pass"])
+            log(self.p, f"task {task['id']}: its spec changed only to record that its probe passed: no spec-change wake")
+            res = dump_result({**prev, SPEC_SEEN_KEY: sha, SPEC_SEEN_LEN_KEY: len(spec_base(task))})
+            self.p.db.update_task(task["id"], result=res)
+            task = dict(task, result=res)
+            seen = sha
         if isinstance(seen, str) and seen != sha:
             # Its spec changed since the hand-off: no on_pass or on_pass_cmd (written before the change) is
             # recorded or run. One run settles both: it gets the probe's answer (probewake) with the change.

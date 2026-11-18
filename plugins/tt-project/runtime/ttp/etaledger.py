@@ -12,6 +12,11 @@ The correction: per task kind, the median of actual / raw-estimated time over th
 kept in the project's kv (`eta_factors`) so every estimate reads the same one. Config `eta`: `correction`
 (false: off), `min_samples`, `clamp` [low, high], `conservative_x` (the conservative time's multiple of
 the time left when too few deliveries give a measured one), `ledger` (false: record nothing).
+Shadow (rings.eta_history, key eta.history, off by default): with the flag on, a task's ETA row also carries
+`hist`, the end the measured history gives on its own (eta.history: the median first-start wait plus the
+median run time of the task's kind and tier, else of its kind). Nothing users see changes. `shadow` and
+`shadow_line` give the baseline: ETAs compared, and each method's median and p90 absolute error against
+the actual finish.
 Target (docs): 80% delivered by the conservative time, median actual / promised between 0.7 and 1.3.
 """
 from __future__ import annotations
@@ -132,6 +137,31 @@ def kind_of(db, e: dict) -> str:
     return (t or {}).get("kind") or ""
 
 
+def _hist_on(where) -> bool:
+    """The eta_history shadow flag, only for a project (a bare config dict has no ring)."""
+    if not hasattr(where, "raw_config"):
+        return False
+    from . import costlevers
+    return costlevers.lever_on(where, "eta_history")
+
+
+def hist_end(db, ref: str, now: float, h: dict | None = None) -> float | None:
+    """The finish the measured history gives a task ref (`t12`) at `now`: the median first-start wait plus the
+    median run time of its kind and tier, else of its kind; None for a promise or without samples.
+    `h` is eta.history's result, read once per caller."""
+    if not (ref.startswith("t") and ref[1:].isdigit()):
+        return None
+    t = db.task(int(ref[1:]))
+    if not t:
+        return None
+    from . import eta
+    h = eta.history(db, now) if h is None else h
+    runs = h["run"].get((t["kind"], t.get("tier"))) or h["kind"].get(t["kind"])
+    if not runs:
+        return None
+    return now + (statistics.median(h["wait"]) if h["wait"] else 0.0) + statistics.median(runs)
+
+
 def record(db, where, items: list[tuple[str, str, dict]], now: float, src: str = "state",
            due: dict | None = None) -> int:
     """Append the ETAs given: items are (ref, kind, shown estimate); a ref already recorded in the last
@@ -143,6 +173,8 @@ def record(db, where, items: list[tuple[str, str, dict]], now: float, src: str =
         if "shown" in r:
             last[r["ref"]] = r
     rows = []
+    hist = None
+    shadow_on = _hist_on(where)
     for ref, kind, e in items:
         if e.get("why") or not e.get("end") or e["end"] <= now:
             continue
@@ -154,6 +186,15 @@ def record(db, where, items: list[tuple[str, str, dict]], now: float, src: str =
                "shown": e["end"], "conservative": e.get("conservative") or e["end"]}
         if due and due.get(ref):
             row["due"] = due[ref]
+        if shadow_on:
+            try:
+                if hist is None:
+                    from . import eta
+                    hist = eta.history(db, now)
+                if (he := hist_end(db, ref, now, hist)) is not None:
+                    row["hist"] = round(he, 1)
+            except Exception:   # a shadow never costs the ETA row
+                pass
         rows.append(row)
         last[ref] = row
     _append(db, rows)
@@ -236,7 +277,8 @@ def pairs(rows: list[dict], since: float) -> list[dict]:
             continue
         out.append({"ref": ref, "kind": r.get("kind") or "", "promised": p, "raw": max(r["likely"] - r["ts"], 60.0),
                     "conservative": (r.get("conservative") or r["shown"]) - r["ts"],
-                    "due": (r["due"] - r["ts"]) if r.get("due") else None, "actual": max(done[ref] - r["ts"], 0.0)})
+                    "due": (r["due"] - r["ts"]) if r.get("due") else None, "actual": max(done[ref] - r["ts"], 0.0),
+                    "hist": max(r["hist"] - r["ts"], 0.0) if r.get("hist") else None})
     return out
 
 
@@ -264,6 +306,34 @@ def line(cal: dict) -> str:
     return (f"ETA calibration, {cal['days']:g} d: {cal['count']} delivered, median actual/promised "
             f"{cal['median_ratio']:.2f}, {cal['share_by_conservative']:.0%} by the conservative time or due "
             f"(target {TARGET_SHARE:.0%}, median {TARGET_RATIO[0]}-{TARGET_RATIO[1]})")
+
+
+def _p90(xs: list[float]) -> float:
+    xs = sorted(xs)
+    return xs[min(len(xs) - 1, int(0.9 * len(xs)))]
+
+
+def shadow(db, since: float) -> dict:
+    """{"count", "current": {"median", "p90"}, "hist": {...}} of the delivered ETAs since `since` that carry a
+    shadow `hist`: each method's absolute error (seconds) against the actual finish."""
+    ps = [p for p in pairs(read(db), since) if p.get("hist")]
+    if not ps:
+        return {"count": 0}
+    cur = [abs(p["actual"] - p["promised"]) for p in ps]
+    his = [abs(p["actual"] - p["hist"]) for p in ps]
+    return {"count": len(ps), "current": {"median": statistics.median(cur), "p90": _p90(cur)},
+            "hist": {"median": statistics.median(his), "p90": _p90(his)}}
+
+
+def shadow_line(sh: dict) -> str:
+    """`ETA shadow (eta_history, 7 d): 12 compared; abs error median/p90 current 14m/52m, history 9m/40m`."""
+    if not sh.get("count"):
+        return "ETA shadow (eta_history, 7 d): no delivered ETA with a history estimate yet"
+
+    def m(x: dict) -> str:
+        return f"{x['median'] / 60:.0f}m/{x['p90'] / 60:.0f}m"
+    return (f"ETA shadow (eta_history, 7 d): {sh['count']} compared; abs error median/p90 current "
+            f"{m(sh['current'])}, history {m(sh['hist'])}")
 
 
 def _clamp(c: dict) -> tuple[float, float]:

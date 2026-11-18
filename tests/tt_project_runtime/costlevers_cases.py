@@ -185,3 +185,148 @@ def test_cost_lever_metrics_show_in_status_and_the_daily_review(env, capsys):
     assert set(rep["landings"]) == {"done_code", "judged", "table_only"}
     out = audit.lines(p.db, now, 86400, 24, p)
     assert any("fresh continue" in x for x in out) and any("output trim" in x for x in out)
+
+
+def _wake_run(p, tools, cost=0.4, ago=100):
+    """A finished coordinator run whose transcript holds `tools` tool calls; returns its id."""
+    now = time.time()
+    rid = p.db.x("INSERT INTO runs(role, started, ended, status, cost_usd, provider) VALUES(?,?,?,?,?,?)",
+                 ("coordinator", now - ago, now - ago + 30, "ok", cost, "claude"))
+    d = p.runs / str(rid)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "output.jsonl").write_text("\n".join(json.dumps({"message": {"content": [
+        {"type": "tool_use", "id": f"c{i}", "name": "Bash", "input": {}}]}}) for i in range(tools)) + "\n")
+    return rid
+
+
+def test_a_wake_of_8_tool_calls_steers_the_next_digest_only_with_the_lever_on(env):
+    from ttp import costlevers, coordinator
+    p = make(env)
+    heavy, light = _wake_run(p, 8), _wake_run(p, 7)
+    # Lever off: nothing is read or stored, and the digest carries no steer.
+    costlevers.note_wake_tools(p, heavy, 8, time.time())
+    assert p.db.kv(costlevers.STEER_KEY, None) is None and costlevers.steer_lines(p) == []
+    p.set_config("coordinator.wake_settle", True)
+    costlevers.note_wake_tools(p, light, 7, time.time())
+    assert costlevers.steer_lines(p) == []
+    costlevers.note_wake_tools(p, heavy, None, time.time())   # no transcript: unknown, not heavy
+    assert costlevers.steer_lines(p) == []
+    costlevers.note_wake_tools(p, heavy, 8, time.time())
+    steer = costlevers.steer_lines(p)
+    assert len(steer) == 1 and "8 tool calls" in steer[0] and "one shell call" in steer[0] and "worker" in steer[0]
+    assert "## Tool calls" in dict(coordinator.digest_parts(p, {}, [], [])[0])["tool_steer"]
+    costlevers.note_wake_tools(p, light, 7, time.time())      # a lighter wake clears it
+    assert costlevers.steer_lines(p) == []
+    costlevers.note_wake_tools(p, heavy, 9, time.time())
+    p.set_config("coordinator.wake_settle", False)
+    assert costlevers.steer_lines(p) == [] and "tool_steer" not in dict(coordinator.digest_parts(p, {}, [], [])[0])
+
+
+def test_wake_tool_metric_counts_heavy_wakes_and_their_dollars_in_status_and_the_daily_review(env):
+    from ttp import audit, costlevers
+    p = make(env)
+    now = time.time()
+    assert costlevers.wake_tools_line(p, now - 7 * 86400, now) == ""
+    _wake_run(p, 9, cost=1.5, ago=300)
+    _wake_run(p, 8, cost=0.5, ago=200)
+    _wake_run(p, 3, cost=0.25, ago=100)
+    rep = costlevers.wake_tools_report(p, now - 7 * 86400, now)
+    assert rep == {"wakes": 3, "heavy": 2, "usd": 2.25, "heavy_usd": 2.0, "max": 9}
+    line = costlevers.wake_tools_line(p, now - 7 * 86400, now)
+    assert line == "wake tools [off]: 2 of 3 coordinator wakes made 8+ tool calls ($2.00 of $2.25; most 9)"
+    assert any("wake tools [off]" in x for x in costlevers.status_lines(p, now))
+    assert any("wake tools [off]" in x for x in audit.lines(p.db, now, 86400, 24, p))
+
+
+def test_the_daily_waste_check_runs_from_the_daemon_once_a_day_and_only_with_the_lever_on(env, monkeypatch):
+    from ttp import daemon as dmod
+    p = make(env)
+    d = dmod.Daemon(p.base)
+    calls = []
+    monkeypatch.setattr(d, "_waste_ledger", lambda db: calls.append(1))
+    d.check_daily_waste(0)
+    assert calls == [], "off by default"
+    p.set_config("coordinator.wake_settle", True)
+    d.cfg = p.config()
+    d.check_daily_waste(0)
+    assert calls == [1]
+    p.db.set_kv(dmod.WASTE_LEDGER_KV, time.time() - 3600)   # the ledger ran an hour ago (the review's own call counts)
+    d.check_daily_waste(0)
+    assert calls == [1]
+    p.db.set_kv(dmod.WASTE_LEDGER_KV, time.time() - 90000)
+    d.check_daily_waste(0)
+    assert calls == [1, 1]
+    d.check_daily_waste(600)   # throttled in memory
+    assert calls == [1, 1]
+    d._waste_ledger = dmod.Daemon._waste_ledger.__get__(d)
+    d._waste_ledger(p.db)
+    assert time.time() - float(p.db.kv(dmod.WASTE_LEDGER_KV, 0)) < 60
+
+
+def test_pass_record_only_accepts_just_text_that_records_a_passed_probe(env):
+    from ttp import prompts, wakesettle
+    base = "Goal: ship the change.\nWhere: runtime/ttp/x.py"
+    seen = prompts.digest_of(base, "t")
+    ok = lambda spec, n=len(base), s=seen: wakesettle.pass_record_only(spec, s, n, "t")   # noqa: E731
+    assert ok(base) and ok(base + "\n\n")
+    assert ok(base + "\n\n## Update\nUpdate: its start_when probe passed.\n")
+    assert ok(base + "\n\n## Update\nretry_when passed\n\n## Update\nthe probe is met\n")
+    for bad in ("\n\n## Update\nIts probe passed, but do not push; user msg #12 changes the goal.\n",
+                "\n\n## Update\nUse the new approach from the review.\n",
+                "\n\n## Update\nprobe passed\nline 2\nline 3\nline 4\n",
+                "\n\nA second goal line.\n",
+                "\n\n## Update\nretry_when passed\n\nand also: rename x\n"):
+        assert not ok(base + bad), bad
+    assert not ok("Goal: other.\nWhere: runtime/ttp/x.py\n\n## Update\nprobe passed")   # the spec itself changed
+    assert not wakesettle.pass_record_only(base + "\n\n## Update\nprobe passed", seen, None, "t")
+    assert not wakesettle.pass_record_only(base + "\n\n## Update\nprobe passed", seen, len(base) + 5, "t")
+    assert not wakesettle.pass_record_only(base + "\n\n## Update\nprobe passed", seen, True, "t")
+
+
+def _waiting_on_probe(p, spec):
+    from ttp import prompts
+    from ttp.daemon import SPEC_SEEN_KEY, SPEC_SEEN_LEN_KEY
+    tid = p.db.add_task("wait", spec, kind="work", origin="user")
+    t = p.db.task(tid)
+    res = {"status": "waiting", "summary": "waiting", "retry_when": "true",
+           SPEC_SEEN_KEY: prompts.spec_digest(t), SPEC_SEEN_LEN_KEY: len(prompts.spec_base(t))}
+    p.db.update_task(tid, status="waiting", result=json.dumps(res))
+    return tid
+
+
+def test_a_spec_edit_that_only_records_the_probe_pass_wakes_no_model_with_the_lever_on(env, monkeypatch):
+    from ttp import prompts
+    from ttp.daemon import Daemon, SPEC_SEEN_KEY, SPEC_SEEN_LEN_KEY
+    p = make(env)
+    d = Daemon(p.base)
+    woke = []
+    monkeypatch.setattr(d, "_wake_waiting", lambda task, why, now, **k: woke.append((why, k.get("kind"))))
+    now = time.time()
+
+    def edit(tid, text):
+        p.db.update_task(tid, spec=p.db.task(tid)["spec"] + "\n\n## Update\n" + text + "\n")
+
+    # Lever off (the default): the edit is a spec change and wakes a run with the change.
+    t1 = _waiting_on_probe(p, "Goal: wait for the deploy.")
+    edit(t1, "Update: its retry_when probe passed.")
+    d._probe_passed(p.db.task(t1), now)
+    assert [k for _, k in woke] == ["spec_change"]
+    assert p.db.one("SELECT COUNT(*) n FROM wake_decisions WHERE gate='probe'")["n"] == 0
+    woke.clear()
+    p.set_config("coordinator.wake_settle", True)
+    d.cfg = p.config()
+    # Lever on: the same edit is recorded as the new baseline and settled without the spec-change wake.
+    d._probe_passed(p.db.task(t1), now)
+    assert "spec_change" not in [k for _, k in woke]
+    res = json.loads(p.db.task(t1)["result"])
+    assert res[SPEC_SEEN_KEY] == prompts.spec_digest(p.db.task(t1))
+    assert res[SPEC_SEEN_LEN_KEY] == len(prompts.spec_base(p.db.task(t1)))
+    row = p.db.one("SELECT verb, usd FROM wake_decisions WHERE gate='probe'")
+    assert row["verb"] == "skip" and row["usd"] == 0
+    woke.clear()
+    # An edit that says more than the pass still wakes a run with the change.
+    t2 = _waiting_on_probe(p, "Goal: wait for the deploy.")
+    edit(t2, "Its probe passed. Also change the goal to the other branch.")
+    d._probe_passed(p.db.task(t2), now)
+    assert [k for _, k in woke] == ["spec_change"]
+    assert json.loads(p.db.task(t2)["result"])[SPEC_SEEN_KEY] != prompts.spec_digest(p.db.task(t2)), "unsettled"

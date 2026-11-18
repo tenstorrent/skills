@@ -141,6 +141,7 @@ from . import onhost
 from . import claimcheck
 from . import reach
 from . import coordsession
+from . import costlevers
 from . import oldorders
 from . import wakecost
 from . import spans
@@ -1754,6 +1755,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     section("eta", safe_eta(lambda: eta.state_lines(db, p, now, host=lambda t: onhost.line(p, t, now)), []))
     section("etacheck", safe_eta(lambda: etacheck.state_lines(db, p, now), []))
     section("stops", safe_eta(lambda: onhost.stop_lines(p, now), []))
+    section("tool_steer", safe_eta(lambda: costlevers.steer_lines(p), []))   # rings.coord_wake_settle: only with it on
     lines = []
     sent = db.q("SELECT * FROM messages WHERE direction='out' AND kind IN ('reply','ask','alert') "
                 "ORDER BY id DESC LIMIT ?", (RECENT_OUT * msgparts.MAX_PARTS,))

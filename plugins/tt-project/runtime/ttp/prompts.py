@@ -1276,14 +1276,22 @@ def no_commit_line(p: Project, task: dict) -> str:
 _OBLIGATION_BLOCK = re.compile(r"\n*^#{2,3} Obligation .*?\n*(?=^## (?!Obligation )|\Z)", re.M | re.S)
 
 
+def spec_base(task: dict) -> str:
+    """The spec text spec_digest fingerprints: the spec without its appended `## Obligation` blocks."""
+    spec, cut = _OBLIGATION_BLOCK.subn("\n\n", str(task["spec"] or ""))
+    return spec.rstrip() if cut else spec
+
+
+def digest_of(text: str, title: str) -> str:
+    return hashlib.sha256(str(text or title).encode()).hexdigest()[:16]
+
+
 def spec_digest(task: dict) -> str:
     """A short fingerprint of the task's spec, kept with each run, so a resumed session learns of a
     spec that changed while it was cut off. Appended `## Obligation` blocks are promise bookkeeping the
     run also gets through steer.md: they change no digest, so they never wake a waiting task. A spec
     without one keeps its digest byte for byte (obligations.attach strips the trailing space it follows)."""
-    spec, cut = _OBLIGATION_BLOCK.subn("\n\n", str(task["spec"] or ""))
-    spec = spec.rstrip() if cut else spec
-    return hashlib.sha256(str(spec or task["title"]).encode()).hexdigest()[:16]
+    return digest_of(spec_base(task), task["title"])
 
 
 def worker_resume(p: Project, task: dict, lost: dict) -> str:

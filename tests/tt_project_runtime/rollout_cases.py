@@ -397,3 +397,44 @@ def test_every_alert_prefix_of_an_area_is_stored_where_the_health_watch_reads_it
             assert alerts.tracked("alert", "high", key), f"{area}: {key} raised high is not stored as an alert"
             p.db.post("out", "x", kind="alert", severity="high", ref=key)
         assert rh.signals(p.db, since, now, th, area)["failing"] == [f"new alert {k}" for k in sorted(keys)], area
+
+
+def _eta_pair(p, now, shown_s, history=3):
+    """A landed code task with an ETA of `shown_s` seconds logged when it started, after `history` earlier
+    landed code tasks (the history estimate reads them); returns its ref."""
+    from ttp import etaledger
+    for i in range(history):
+        _landed_code(p, now, created=-40000 - 900 * i, runs=((-39900 - 900 * i, -39300 - 900 * i),),
+                     pushed=-39000 - 900 * i)
+    tid = _landed_code(p, now, created=-7200, runs=((-7000, -6500),), pushed=-600)
+    etaledger.record(p.db, p, [(f"t{tid}", "code", {"end": now - 7000 + shown_s, "path": [tid]})], now - 7000)
+    etaledger.settle(p.db, now)
+    return f"t{tid}"
+
+
+def test_eta_history_shadow_logs_a_pair_and_a_baseline_only_with_the_flag_on(env, capsys):
+    from ttp import cli, costlevers, etaledger
+    p = make(env)
+    now = time.time()
+    assert not costlevers.lever_on(p, "eta_history")
+    _eta_pair(p, now, 3600)
+    rows = [json.loads(x) for x in etaledger._path(p.db).read_text().splitlines()]
+    assert rows and all("hist" not in r for r in rows), "flag off: nothing new is read or logged"
+    assert etaledger.shadow(p.db, now - 7 * 86400)["count"] == 0
+    assert costlevers.eta_shadow_line(p, now - 7 * 86400) == ""
+    capsys.readouterr()
+    cli.main(["eta", p.name, "--calibration"])
+    assert "ETA calibration" in (out := capsys.readouterr().out) and "ETA shadow" not in out
+    # Flag on: each ETA is logged beside its history estimate, and the baseline line renders.
+    p.set_config("eta.history", True)
+    _eta_pair(p, now, 1800)
+    rows = [json.loads(x) for x in etaledger._path(p.db).read_text().splitlines()]
+    assert sum("hist" in r for r in rows) == 1
+    sh = etaledger.shadow(p.db, now - 7 * 86400)
+    assert sh["count"] == 1 and sh["current"]["median"] >= 0 and sh["hist"]["median"] >= 0
+    line = costlevers.eta_shadow_line(p, now - 7 * 86400)
+    assert line.startswith("ETA shadow (eta_history, 7 d): 1 compared; abs error median/p90 current ")
+    assert any("ETA shadow" in x for x in costlevers.status_lines(p, now))
+    capsys.readouterr()
+    cli.main(["eta", p.name, "--calibration"])
+    assert "ETA shadow (eta_history, 7 d): 1 compared" in capsys.readouterr().out

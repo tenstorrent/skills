@@ -2572,7 +2572,7 @@ def cmd_runs_live(a) -> None:
 def cmd_eta(a) -> None:
     """Expected finish of a task or obligation from its critical path (eta.py): measured medians, no padding.
     Workers read it before setting a retry or deadline wake."""
-    from . import eta, etaledger, obligations
+    from . import costlevers, eta, etaledger, obligations
     target, name = a.target, a.name
     if a.calibration and target and not str(target).lstrip("#o").isdigit():
         target, name = None, target   # `ttp eta --calibration <project>`
@@ -2583,8 +2583,10 @@ def cmd_eta(a) -> None:
     if a.calibration:
         etaledger.refresh(p.db, p, now, force=True)
         cal = etaledger.calibration(p.db, now, etaledger.cfg(p), days=a.days)
-        print(json.dumps({**cal, "factors": (p.db.kv(etaledger.KEY) or {}).get("factors", {})}, indent=1)
-              if a.json else etaledger.line(cal))
+        sh = etaledger.shadow(p.db, now - a.days * 86400) if costlevers.lever_on(p, "eta_history") else None
+        print(json.dumps({**cal, "factors": (p.db.kv(etaledger.KEY) or {}).get("factors", {}),
+                          **({"shadow": sh} if sh else {})}, indent=1)
+              if a.json else "\n".join([etaledger.line(cal)] + ([etaledger.shadow_line(sh)] if sh else [])))
         return
     if not target:
         die("ttp eta needs a task id or an obligation key (or --calibration)")

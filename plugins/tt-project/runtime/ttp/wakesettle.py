@@ -20,6 +20,13 @@ Never settled: a user or chat source, high or critical severity, a must-act item
 text, a review, failure, restriction or outage (settlehook.never_reason, kinds aside). One event that
 does not qualify sends the whole batch to the turn, as it is. Urgent user messages never pass here.
 
+Probe-pass spec edit (same flag, gate `probe`): a waiting task whose start_when or retry_when probe passed and
+whose spec changed since its hand-off normally wakes at its own tier with the change (the daemon's
+_probe_passed). When the change is only text recording that pass (`pass_record_only`: `## Update` blocks
+whose every line says a wait, probe, gate, start_when or retry_when passed, nothing else), the task goes
+through the normal probe-pass path instead (on_pass recorded model-free where clear). Anything else about
+the edit still wakes it. Counted in wake_decisions with no dollars claimed: the saving is the escalated wake.
+
 Reopened: a rule-settled event whose task (else kind and fingerprint) has a later event, within
 REOPEN_S, that a coordinator turn handled rather than a rule. The target is under 2% of rule settles.
 """
@@ -33,7 +40,7 @@ import time
 from . import settlehook
 
 TABLE = "wake_decisions"
-GATES = ("triage", "quiet", "turn", "hook", "rule")
+GATES = ("triage", "quiet", "turn", "hook", "rule", "probe")
 MEDIAN_KEY = "wake_settle_median"   # kv: {"at", "usd"}: the median coordinator wake cost, cached an hour
 MEDIAN_TTL_S = 3600.0
 MEDIAN_WINDOW_S = 7 * 86400.0
@@ -68,18 +75,51 @@ def median_usd(db, now: float) -> float:
 
 
 def record(db, gate: str, verb: str, evs: list[dict], now: float | None = None, usd: float | None = None,
-           why: str = "") -> None:
+           why: str = "", kinds: list[str] | None = None) -> None:
     """Count one pre-screen decision. A skip avoids one wake at the median cost unless `usd` says else."""
     try:
         now = time.time() if now is None else now
         if usd is None:
             usd = median_usd(db, now) if verb == "skip" else 0.0
-        kinds = sorted({str(e.get("kind")) for e in evs}) if evs else ["wake_due"]
+        kinds = kinds or (sorted({str(e.get("kind")) for e in evs}) if evs else ["wake_due"])
         db.x(f"INSERT INTO {TABLE}(ts, gate, verb, kinds, events, usd, why) VALUES(?,?,?,?,?,?,?)",
              (now, gate, verb, json.dumps(kinds), json.dumps(sorted(int(e["id"]) for e in evs)), float(usd or 0),
               why[:300]))
     except Exception:   # counting never stops a wake decision
         pass
+
+
+_UPDATE_BLOCK = re.compile(r"^## Update\b[^\n]*\n?(.*?)(?=^## Update\b|\Z)", re.M | re.S)
+_PASS_LINE = re.compile(r"^(?:update\s*:\s*)?(?:the |its |this task's |your )?(?:start_when|retry_when|wait|probe|gate)"
+                        r"(?:\s+\w+){0,2}\s+(?:passed|has passed|is met|was met|now holds|holds now|is true|exited 0)"
+                        r"(?:\s*\([^)\n]{0,40}\))?[\s.!]*$", re.I)
+_NOT_PASS = re.compile(r"\b(?:user msg|correction|never|must|do not|don't|instead|cancel|priority|restrict|freeze|"
+                       r"start from|do only|proceed|ack|where:|no_push|premise|urgent)\b|#\d+ msg|\bmsg #", re.I)
+
+
+def pass_record_only(spec_base: str, seen: str, seen_len, title: str = "") -> bool:
+    """Whether a waiting task's spec changed since its hand-off only by text recording a passed probe.
+    `spec_base` is the current prompts.spec_base, `seen` the digest the hand-off slept on and `seen_len`
+    the length of its spec base then (the daemon stores it): the current base must start with exactly that
+    spec (its digest equals `seen`), and what follows must be `## Update` blocks (or nothing) whose every
+    line matches the positive list. Anything unproven, longer than 3 lines a block, or not on the list
+    is not a pass record."""
+    from . import prompts
+    if isinstance(seen_len, bool) or not isinstance(seen_len, int) or not 0 <= seen_len <= len(spec_base):
+        return False
+    if prompts.digest_of(spec_base[:seen_len], title) != seen:
+        return False
+    added = spec_base[seen_len:].strip()
+    if not added:
+        return True
+    if not added.startswith("## Update"):
+        return False
+    blocks = _UPDATE_BLOCK.findall(added)
+    for body in blocks:
+        lines = [x.strip() for x in body.splitlines() if x.strip()]
+        if len(lines) > 3 or any(not _PASS_LINE.match(x) or _NOT_PASS.search(x) for x in lines):
+            return False
+    return bool(blocks)
 
 
 def _key(e: dict) -> tuple:

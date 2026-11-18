@@ -5143,9 +5143,13 @@ else 0.5 (`codearm.RING_SHARE`), and the flag off makes it 0, so no coin flip ru
 `route.code_sonnet.glm` model, and Claude review, the policy-file bounce and the switch-back guard are
 unchanged. `fresh_continue` (`worker.fresh_continue`), `coord_wake_settle` (`coordinator.wake_settle`) and
 `output_trim` (`output.trim`) gate the cost levers of costlevers.py and wakesettle.py; `ttp status` and the
-daily review show their numbers. A flag whose feature already runs for every project graduates and leaves the
+daily review show their numbers. `coord_wake_settle` also runs the daemon's daily waste check without a model,
+steers the wake after one that made 8+ tool calls to batch its reads, and settles a waiting task's spec edit that
+only records its passed probe (the wake-tools line counts 8+ call wakes with or without the flag). `eta_history`
+(`eta.history`) gates a shadow only: each ETA is logged beside a history-based one and `ttp eta --calibration`
+shows the 7-day error of both; no shown ETA changes. A flag whose feature already runs for every project graduates and leaves the
 list instead of being gated off: `push_isolation` (push batches that survive one failing entry or a remote
-outage). `eta_history`, `device_prewarm` and `deslop` gate nothing yet.
+outage). `device_prewarm` and `deslop` gate nothing yet.
 
 Scratch projects. A project listed in ring 0 has a soft daily spend cap, $25 by default
 (`rollout.scratch_cap_usd`, the project's own value first, 0 turns it off). Past it, routine tasks wait in the
