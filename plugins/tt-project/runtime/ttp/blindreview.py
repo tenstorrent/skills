@@ -24,6 +24,10 @@ GRADER_EFFORT = "high"   # the most effort a grader runs at (a grader is not an 
 # reviewer). Each names its reviewer slot and subject, so two of them differ when their labels do, whatever
 # their titles say (supersede.duplicate_of), and they are not the coordinator's new tasks (coordinator.tasks_made).
 DAEMON_REVIEW_PREFIXES = ("device_ab_review", "device_shadow_review")
+# A blind device reviewer's read budget: unbounded log reading made second reviews 3-10x the first's turns.
+READ_BUDGET = ("Read budget: about 15 tool calls in total. Read result.json, runs.md and the run summary first; "
+               "grep logs with short context, never re-render whole transcripts; spot-check at most 3 cited "
+               "facts against the logs.")
 ENV = "TTP_BLIND"
 CODES_KV = "blind_review_codes"   # {code: "<tid>:<arm>"}
 

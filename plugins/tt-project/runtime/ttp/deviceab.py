@@ -428,14 +428,15 @@ def review_spec(task: dict, run_dir: str) -> str:
         "know which model ran it, and must not try to find out (never read the run's model, provider or effort).",
         "", "1. answered: did the result answer what the task asked, fully and directly? (0 none, 4 fully)",
         "2. supported: are its conclusions supported by the logs, commands and outputs it cites? Check the cited "
-        "logs where you can read them. (0 unsupported, 4 every conclusion backed)",
+        "facts within the read budget below. (0 unsupported, 4 every conclusion backed)",
         "", f"Task title: {blindreview.scrub(task.get('title'))}", "Task spec:",
         blindreview.scrub(str(task.get("spec") or "")[:6000]), "",
         f"Its final status: {task.get('status')}.",
         f"Its hand-off (result.json), progress and transcript, with model names masked: "
         f"{run_dir or '(no run folder recorded)'} (a task that ran more than once has one folder per run there, "
-        f"oldest first, listed in runs.md: read them all); the task's result in `ttp task show {task['id']}`. Read the "
+        f"oldest first, listed in runs.md); the task's result in `ttp task show {task['id']}`. Read the "
         "run only there: never its run folder or the project's state.",
+        blindreview.READ_BUDGET,
         "", "Read only: change nothing, run no device or machine command.",
         'Return in result.json: "device_ab_scores": {"answered": <0-4>, "supported": <0-4>, "why": "<one line>"}.',
         "conclusion: the two scores with a one-line reason.",

@@ -568,8 +568,8 @@ def review_spec(task: dict, handoff: str, run_dir: str) -> str:
         blindreview.scrub(str(task.get("spec") or "")[:6000]), "",
         f"Its final status: {task.get('status')}. The real run's hand-off (result.json), progress and transcript, "
         f"and the plan (plan.md), with model names masked: {run_dir or '(no run folder recorded)'} (a real run in "
-        "several legs has one folder per leg there, oldest first, listed in runs.md: read them all); its result in "
-        f"`ttp task show {task['id']}`. Read the runs only there: never a run folder or the project's state.", "",
+        "several legs has one folder per leg there, oldest first, listed in runs.md); its result in "
+        f"`ttp task show {task['id']}`. Read the runs only there: never a run folder or the project's state.", blindreview.READ_BUDGET, "",
         "The plan (commands it would run, then its conclusion):", "---", handoff[:HANDOFF_MAX], "---", "",
         "Read only: change nothing, run no device or machine command.",
         'Return in result.json: "device_shadow_scores": {"agreement": <1-5>, "harmful": [{"step": "<text>", '

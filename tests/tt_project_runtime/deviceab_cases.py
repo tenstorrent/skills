@@ -452,3 +452,12 @@ def test_device_ab_a_fleet_report_counts_only_when_it_names_the_runs_device_as_a
     real = _dab_event(p, "observation", fleet + "\n- box1-device: chip hang, broker reset failed.",
                       source="watcher:fleet-health")
     assert deviceab.tick(p.db, cfg, 2800.0)["stop"]["event"] == real
+
+
+def test_device_ab_and_shadow_review_specs_carry_a_read_budget_not_read_them_all(env):
+    from ttp import blindreview, deviceab, deviceshadow
+    task = {"id": 7, "kind": "work", "title": "Run the soak", "spec": "Run it.", "status": "done"}
+    for spec in (deviceab.review_spec(task, "/runs/7"), deviceshadow.review_spec(task, "plan", "/runs/7")):
+        assert blindreview.READ_BUDGET in spec
+        assert "about 15 tool calls" in spec and "at most 3 cited facts" in spec
+        assert "read them all" not in spec and "where you can read them" not in spec
