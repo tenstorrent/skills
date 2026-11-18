@@ -892,6 +892,7 @@ def _raised_at(e: BaseException) -> str:
 LOG_FAIL_S = 300   # a daemon.log that cannot be written says so on stderr at most this often
 LOG_MAX_BYTES = 16 * 1024 * 1024   # past this daemon.log rotates to LOG_OLD; one old copy is kept
 LOG_OLD = "daemon.log.1"
+SLOP_BLOCKS_MAX = 256   # tasks whose review's de-slop block Daemon._slop_blocks holds before it starts over
 _LOG_FAIL = {"t": float("-inf"), "n": 0}   # when stderr last said so; lines dropped since the last one written
 # A finish round's log lines (Daemon._finish_rounds): written once it commits or fails, dropped when
 # it rolls back to run again (GitMiss), so a retried round never logs a line twice.
@@ -8114,7 +8115,7 @@ class Daemon:
             log(self.p, f"task {task['id']}: reading git before finishing failed: {type(e).__name__}: {e}")
         if time.monotonic() - t0 >= gitmemo.PREFETCH_GIT_S:   # the rest is read in the finish, or degrades as a git failure does
             log(self.p, f"task {task['id']}: reading git before finishing stopped at its {gitmemo.PREFETCH_GIT_S:.0f} s budget")
-        if result.get("status") == "done" and task["kind"] == "code" and task.get("branch"):
+        if result.get("status") == "done" and task.get("branch") and self._code_change(task):   # the finish's review gate
             self._prefetch_slop(task)
 
     def _prefetch_slop(self, task: dict) -> None:
@@ -8124,7 +8125,7 @@ class Daemon:
             full = worktree._git(self.p.root, "rev-parse", "--verify", "--quiet", f"{task['branch']}^{{commit}}",
                                  check=False)
             if full:
-                if len(self._slop_blocks) >= 256:
+                if len(self._slop_blocks) >= SLOP_BLOCKS_MAX:
                     self._slop_blocks.clear()
                 self._slop_blocks[task["id"]] = (full, self._slop_block(task, task["branch"], full))
         except Exception as e:

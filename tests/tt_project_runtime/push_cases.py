@@ -7920,6 +7920,35 @@ def test_a_passed_probe_reads_the_push_queues_rejected_commit_git_before_its_fin
         block = d._slop_block(s.p.db.task(c), cbranch, chead)
     assert not spawned and f"..{chead[:12]}`" in block and block.endswith(slop.RULE)
 
+def test_a_done_work_task_with_a_branch_change_gets_its_review_scan_read_before_the_finish_transaction(
+        env, monkeypatch):
+    """The finish queues the auto review for any task Daemon._code_change holds for, a work task whose
+    branch changes something included: its de-slop scan is read by the same predicate before the transaction."""
+    import inspect
+    from ttp.daemon import Daemon
+    s = _pq(env, monkeypatch)
+    monkeypatch.setattr(Daemon, "_precheck", lambda self, task, head: None)
+    c, _, chead, _ = _pq_stacked(s, "worked")
+    s.p.db.update_task(c, kind="work")
+    d = Daemon(s.p.base)
+    in_tx = lambda: s.p.db.conn.in_transaction or d.p.db.conn.in_transaction   # noqa: E731
+    scans, real_popen = [], subprocess.Popen
+
+    def popen(argv, *a, **k):
+        if in_tx() and isinstance(argv, list) and any(x in ("cat-file", "ls-tree") for x in argv) \
+                and any(f.function == "_slop_block" for f in inspect.stack()):   # not the diff's ref reads
+            scans.append(argv)
+        return real_popen(argv, *a, **k)
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    d._slop_blocks.clear()
+    d._prefetch_git(s.p.db.task(c), {"status": "done", "summary": "made the change"})
+    assert d._slop_blocks.get(c, ("",))[0] == chead
+    with d.p.db.tx():
+        rid, added = d._auto_review(d.p.db.task(c), "made the change")
+    assert added and "Scan delta of this change" in s.p.db.task(rid)["spec"]
+    assert not scans, f"the de-slop scan ran inside the finish transaction: {scans}"
+
+
 def test_the_push_queue_accepts_a_head_stacked_on_a_passed_branch_landed_or_not(env, monkeypatch):
     from ttp import pushq
     s = _pq(env, monkeypatch)
