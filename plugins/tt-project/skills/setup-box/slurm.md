@@ -112,6 +112,66 @@ After submitting:
    means `squeue` failed and the job may still run: retry later, never resubmit on it.
 4. `box.py slurm verify-clean <box> <node>`, and record the end time with `ttp note`.
 
+## Build once, test in parallel
+
+For a large build (tt-metal and the like) and many tests against it, build once per checkout and
+run the tests as separate jobs on that build. Both are plain `sbatch` batch jobs with a time limit,
+placed by Slurm under the same rules as `submit` (the site file's `demo_nodes` and
+`excluded_nodes`, `--allow` for the charter's node list):
+
+| Command | What |
+|---|---|
+| `build <box> --partition P --time T --name NAME --checkout PATH --purpose TEXT --command CMD` | one job that runs the build under an exclusive `flock` on a lock in the checkout's git dir. It records the tree it built (`HEAD` plus a checksum of `git diff HEAD`) and skips the command when that tree is already built: `build: reused`. Prints a `next:` line for `test` |
+| `test <box> ... --after JOB --command CMD [--command CMD ...]` | one job per `--command` (named `NAME-1`, `NAME-2`, ...), each started only once the build job succeeded (`--dependency=afterok:JOB`). Each holds the build lock shared, so tests run side by side but never during a build, and refuses (exit 96) when the tree is not the one built: rebuild first |
+| `cases <box> ... --cases FILE [--chips N] [--devices D] [--fresh]` | one resumable job for a list of cases (below) |
+| `verdict <box> <job> --name NAME` | the job's verdict without reading its log (below) |
+
+Where the site file sets `slurm.container_run` (a command prefix that runs one command inside the
+site's image), `build`, `test` and `cases` run their commands through it; `--no-container` runs
+them on the node directly. The prefix and image come from the site file, never from a default.
+
+### Resumable case jobs
+
+`--cases FILE` lists one case per line: `<id><TAB><command>` (`#` lines are comments; ids are plain
+names, each once). The job:
+
+1. checks the node first: fewer `/dev/tenstorrent` devices than the partition's chips (or
+   `--chips`), or a failing `tt-smi -ls`, marks the node bad;
+2. runs each case in turn, logging it to `<rundir>/cases/<id>.log` and appending
+   `PASS|FAIL rc=N <seconds>s <node> <job> | <id>` to `<rundir>/results.tsv`;
+3. skips cases already in `results.tsv`, so a preempted or resubmitted job carries on where it
+   stopped. Resubmitting the same `--name` keeps the results; `--fresh` starts over.
+
+On a bad node it appends `<node> <date> <why>` to the bad-node list (`<slurm.state_dir>/bad_nodes.txt`,
+default `<workdir_root>/state`), and resubmits itself with that node added to `--exclude`, at most
+3 attempts in all (exit 98 after a resubmit, 95 when out of attempts). The resubmitted job writes
+to the same `job.log`; `status` and `verdict` print `resubmitted as job N`: follow that job. New
+`build`, `test` and `cases` jobs also exclude nodes marked bad within `--bad-days` (default 7).
+
+### Verdict: read it, not the whole log
+
+`box.py slurm verdict <box> <job> --name NAME` reads the job's state (`sacct`, else `scontrol`),
+its `job.rc` and the end of its `job.log`, and prints without a model:
+
+```
+verdict: failed at step test; rc 1; FAILED
+pytest: 1 failed, 9 passed in 3.20s
+failed tests: tests/test_x.py::test_a
+error: E       AssertionError: 3 != 4
+```
+
+The verdict is `passed`, `failed`, `timeout`, `cancelled` or `unknown`; the step comes from the
+`==> <step> start` and `==> <step> done rc=N` lines the job scripts write; at most 5 distinct error
+lines follow. Exit 0 passed, 1 otherwise, 2 while the job still runs or nothing is known. `status`
+prints the same lines once a job ended. Workers read the verdict and open `job.log` or a case's log
+only for what it does not answer. A failed check that ran as a Slurm job prints the same verdict line.
+
+Credit: the build-once and parallel-test flow follows the tt-sbatch workflow; resumable cases, the
+node check, the bad-node list and resubmits follow the idea of tenstorrent/tt-blaze's exabox-slurm
+job script; the model-free verdict follows the idea of tenstorrent/tt-slurm-cluster-mcp's log
+parser. Neither repository grants a licence we could find, so no code was copied: these are our own
+implementations of the ideas.
+
 ## Status after a job ends
 
 - Where accounting is enabled, `sacct -j <job>` gives the final state. Where it is disabled

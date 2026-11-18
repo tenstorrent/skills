@@ -49,6 +49,8 @@ fails `box.py site check` with `missing version/boxes wrapper`.
 | `ird.mgmt_ssh` | no | ssh options for `ird.mgmt` (`HostName`, `User`, `Port`, `IdentityFile`, `IdentitiesOnly`, `CertificateFile`, `ProxyJump`), so `ird_e2e.sh` reaches it without your personal ssh config (`ird.md`) |
 | `slurm.login` | `slurm` | ssh alias of the login node |
 | `slurm.partitions` | `slurm` | non-empty list: `name`, `chips` (whole number > 0; leave it out or `"unknown"` until the first job measures it, `slurm.md`), `board` (board type), optional `exclusive` (whole-node only) |
+| `slurm.container_run` | no | the site's wrapper that runs one command inside its build image (e.g. `<runtime> exec --bind <shared path> <image ref>`): `build`, `test` and `cases` run their commands through it (`slurm.md`). Leave it out to run on the node directly |
+| `slurm.state_dir` | no | shared folder for the route's own state, such as the bad-node list `cases` keeps (default `<workdir_root>/state`) |
 | `demo_nodes` | no | nodes kept for demos: never allocate them |
 | `excluded_nodes` | no | nodes never to use |
 | `mcp` | no | site-only MCP endpoints by server name; `mcp.glean` is the Glean server `agents install` adds (`agents.md`) |

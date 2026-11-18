@@ -5367,6 +5367,7 @@ def _fake_slurm(tmp_path, node="State=IDLE LastBusyTime=2000-01-01T00:00:00", re
     (fake / "res.txt").write_text(res)
     (fake / "squeue.txt").write_text(queue)
     (fake / "sinfo.txt").write_text("node07\n")
+    (fake / "part.txt").write_text("PartitionName=p4 Nodes=node07 OverSubscribe=EXCLUSIVE State=UP\n")
     tools = {
         "ssh": 'while [ "${1#-}" != "$1" ]; do shift 2; done; shift; exec bash -c "$*"',
         "scontrol": 'case "$*" in *partition*) cat "$FAKE/part.txt" 2>/dev/null;; *reservation*) [ -s "$FAKE/res.txt" ] && cat "$FAKE/res.txt" || '
@@ -5504,6 +5505,178 @@ def test_setup_box_slurm_submit_without_node_lets_slurm_place_the_job(tmp_path):
         r = run(*base, *extra)
         assert r.returncode == 1 and "pass it as --node" in r.stdout, r.stdout
     assert not (fake / "sbatch.args").exists()
+
+
+def _run_job(script, *, env=None, cwd=None, bin_dir=None):
+    """Run a written batch script here, as Slurm would on the node (already its own process group)."""
+    import subprocess
+    e = {**os.environ, "TTP_JOB_PGRP": "1", **(env or {})}
+    if bin_dir:
+        e.update(PATH=f"{bin_dir}:{e['PATH']}", FAKE=str(bin_dir.parent / "fake"))
+    return subprocess.run(["/bin/bash", str(script)], capture_output=True, text=True, timeout=60, env=e, cwd=cwd)
+
+
+def _git_checkout(path):
+    import subprocess
+    path.mkdir(parents=True)
+    for cmd in (["git", "init", "-q"], ["git", "-c", "user.email=t@example.com", "-c", "user.name=t", "commit",
+                                         "-q", "--allow-empty", "-m", "init"]):
+        subprocess.run(cmd, cwd=path, check=True, capture_output=True)
+    (path / "src.txt").write_text("v1\n")
+    subprocess.run(["git", "add", "src.txt"], cwd=path, check=True)
+    subprocess.run(["git", "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-q", "-m", "src"],
+                   cwd=path, check=True)
+
+
+def test_setup_box_slurm_build_once_then_tests_share_the_build(tmp_path):
+    run, fake = _fake_slurm(tmp_path)
+    co = tmp_path / "work" / "repo"
+    _git_checkout(co)
+    (fake / "sinfo.txt").write_text("node07\nnode08\nnode09\n")
+    base = ["--partition", "p4", "--time", "30", "--checkout", str(co), "--purpose", "build check"]
+    r = run("build", "<box-alias>", "--name", "b1", *base, "--allow", "node07,node08",
+            "--command", "echo compiling; echo built > out.bin")
+    assert r.returncode == 0, r.stdout + r.stderr
+    args = (fake / "sbatch.args").read_text()
+    # Slurm places it, never on demo/excluded nodes nor partition nodes outside --allow.
+    assert "--nodes=1 --exclude=demo1,bad1,node09 -p p4 --time=30 --job-name=b1 " in args, args
+    assert "-w" not in args.split() and "next: box.py slurm test <box-alias> --after 4242" in r.stdout
+    build = tmp_path / "work" / "runs" / "b1" / "job.sbatch"
+    out = _run_job(build)
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert "==> build start" in out.stdout and "build: built at" in out.stdout and (co / "out.bin").exists()
+    assert not [p for p in co.iterdir() if p.name.startswith(".ttp")]  # the marker lives in .git
+    (co / "out.bin").unlink()
+    out = _run_job(build)
+    assert "build: reused" in out.stdout and not (co / "out.bin").exists()
+
+    r = run("test", "<box-alias>", "--name", "t", *base, "--after", "4242",
+            "--command", "test -f out.bin || echo no-bin", "--command", "exit 3")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "--dependency=afterok:4242 --kill-on-invalid-dep=yes" in (fake / "sbatch.args").read_text()
+    t1, t2 = (tmp_path / "work" / "runs" / n / "job.sbatch" for n in ("t-1", "t-2"))
+    assert t1.is_file() and t2.is_file()
+    assert _run_job(t1).returncode == 0
+    out = _run_job(t2)
+    assert out.returncode == 3 and "==> test done rc=3" in out.stdout
+    # A changed tree is not the build's: the test refuses to run on it.
+    (co / "src.txt").write_text("v2\n")
+    out = _run_job(t1)
+    assert out.returncode == 96 and "not built at" in out.stdout
+    assert "--after 'x'" in run("test", "<box-alias>", "--name", "t", *base, "--after", "x",
+                                "--command", "true").stdout
+    # Every rule of submit holds: a time limit, no salloc, a checkout on shared storage.
+    assert "--time is required" in run("build", "<box-alias>", "--name", "b", *base[:2], *base[4:],
+                                       "--command", "make").stdout
+    assert "salloc" in run("test", "<box-alias>", "--name", "t", *base, "--command", "salloc -N1").stdout
+    r = run("build", "<box-alias>", "--name", "b", *base, "--allow", "nodeX", "--command", "make")
+    assert r.returncode == 1 and "no node of partition p4 is left" in r.stdout
+
+
+def test_setup_box_slurm_build_runs_in_the_site_container(tmp_path):
+    run, fake = _fake_slurm(tmp_path)
+    site = json.loads((tmp_path / "boxes.json").read_text())
+    site["boxes"]["<box-alias>"]["slurm"]["container_run"] = "wrap-in-image --bind /shared"
+    (tmp_path / "boxes.json").write_text(json.dumps(site))
+    co = str(tmp_path / "work" / "repo")
+    base = ["--partition", "p4", "--time", "30", "--checkout", co, "--purpose", "p", "--name", "b"]
+    assert run("build", "<box-alias>", *base, "--command", "make").returncode == 0
+    assert "wrap-in-image --bind /shared /bin/bash -c make" in (fake / "job.sbatch").read_text()
+    assert run("build", "<box-alias>", *base, "--no-container", "--command", "make").returncode == 0
+    assert "wrap-in-image" not in (fake / "job.sbatch").read_text()
+
+
+def test_setup_box_slurm_cases_resume_and_resubmit_without_a_bad_node(tmp_path):
+    import subprocess
+    run, fake = _fake_slurm(tmp_path)
+    co = tmp_path / "work" / "repo"
+    co.mkdir(parents=True)
+    devs = tmp_path / "dev"
+    devs.mkdir()
+    for i in range(4):
+        (devs / str(i)).write_text("")
+    cases = tmp_path / "cases.tsv"
+    cases.write_text("# id<TAB>command\nc1\techo one\nc2\techo boom; echo 'RuntimeError: bad thing' >&2; exit 2\n"
+                     "c3\techo three\n")
+    base = ["cases", "<box-alias>", "--partition", "p4", "--time", "60", "--name", "cs", "--checkout", str(co),
+            "--purpose", "cases", "--cases", str(cases), "--dev-dir", str(devs), "--tt-smi", "no-such-tt-smi"]
+    r = run(*base)
+    assert r.returncode == 0, r.stdout + r.stderr
+    rundir = tmp_path / "work" / "runs" / "cs"
+    script = rundir / "job.sbatch"
+    out = _run_job(script, bin_dir=tmp_path / "bin")
+    assert out.returncode == 1, out.stdout + out.stderr
+    res = (rundir / "results.tsv").read_text().splitlines()
+    assert [ln.split()[0] for ln in res] == ["PASS", "FAIL", "PASS"] and res[1].endswith("| c2")
+    assert "RuntimeError: bad thing" in out.stdout and (rundir / "cases" / "c2.log").is_file()
+    # A preempted run carries on: done cases are skipped, the one cut off runs again.
+    (rundir / "results.tsv").write_text("\n".join(res[:2]) + "\n")
+    out = _run_job(script, bin_dir=tmp_path / "bin")
+    assert out.stdout.count("done in an earlier run, skipped") == 2 and "==> case:c3 start" in out.stdout
+    assert len((rundir / "results.tsv").read_text().splitlines()) == 3
+    # Resubmitting the same --name keeps the results; --fresh clears them.
+    assert run(*base).returncode == 0 and (rundir / "results.tsv").is_file()
+    assert run(*base, "--fresh").returncode == 0 and not (rundir / "results.tsv").exists()
+
+    # A node short of devices is recorded as bad and the job resubmits itself without it.
+    (devs / "3").unlink()
+    (fake / "sbatch.args").unlink()
+    out = _run_job(script, bin_dir=tmp_path / "bin")
+    host = subprocess.run(["hostname", "-s"], capture_output=True, text=True).stdout.strip()
+    assert out.returncode == 98 and "3 of 4 devices" in out.stdout, out.stdout + out.stderr
+    assert "resubmitted as job 4242 (attempt 2 of 3)" in out.stdout
+    assert (rundir / "job.next").read_text().strip() == "4242"
+    args = (fake / "sbatch.args").read_text()
+    assert f"--exclude={','.join(sorted(['demo1', 'bad1', host]))}" in args and "--open-mode=append" in args
+    bad = (tmp_path / "work" / "state" / "bad_nodes.txt").read_text()
+    assert bad.startswith(f"{host} ") and "3 of 4 devices" in bad
+    assert not (rundir / "results.tsv").read_text().strip()
+    # The third attempt stops instead of resubmitting.
+    (fake / "sbatch.args").unlink()
+    out = _run_job(script, env={"TTP_CASES_ATTEMPT": "3"}, bin_dir=tmp_path / "bin")
+    assert out.returncode == 95 and not (fake / "sbatch.args").exists()
+    # A new submit leaves out the recently bad node; --bad-days 0 does not.
+    assert run(*base).returncode == 0 and host in (fake / "sbatch.args").read_text()
+    assert run(*base, "--bad-days", "0").returncode == 0 and host not in (fake / "sbatch.args").read_text()
+    # Bad cases files are refused before anything is sent.
+    for text, why in (("c1 echo\n", "expected <id><TAB><command>"), ("c1\ta\nc1\tb\n", "listed twice"),
+                      ("a b\tx\n", "not a plain name"), ("# none\n", "lists no case")):
+        cases.write_text(text)
+        assert why in run(*base).stdout, text
+
+
+def test_setup_box_slurm_verdict_reads_rc_state_and_log(tmp_path):
+    run, fake = _fake_slurm(tmp_path)
+    (tmp_path / "bin" / "sacct").write_text('#!/bin/bash\ncat "$FAKE/sacct.txt"\n')
+    (tmp_path / "bin" / "sacct").chmod(0o755)
+    rundir = tmp_path / "work" / "runs" / "t1"
+    rundir.mkdir(parents=True)
+    (rundir / "job.log").write_text(
+        "==> build start\nbuild: reused\n==> build done rc=0\n==> test start\n"
+        "E       AssertionError: 3 != 4\nFAILED tests/test_x.py::test_a - AssertionError\n"
+        "==== 1 failed, 9 passed in 3.20s ====\n==> test done rc=1\n")
+    (rundir / "job.rc").write_text("1\n")
+    (fake / "sacct.txt").write_text("FAILED\n")
+    r = run("verdict", "<box-alias>", "4242", "--name", "t1")
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert r.stdout.splitlines()[0] == "verdict: failed at step test; rc 1; FAILED"
+    assert "pytest: 1 failed, 9 passed in 3.20s" in r.stdout and "tests/test_x.py::test_a" in r.stdout
+    assert "error: E       AssertionError: 3 != 4" in r.stdout
+    (fake / "sacct.txt").write_text("TIMEOUT\n")
+    assert "verdict: timeout" in run("verdict", "<box-alias>", "4242", "--name", "t1").stdout
+    (fake / "sacct.txt").write_text("RUNNING\n")
+    r = run("verdict", "<box-alias>", "4242", "--name", "t1")
+    assert r.returncode == 2 and "no verdict until it ends" in r.stdout
+    (fake / "sacct.txt").write_text("COMPLETED\n")
+    (rundir / "job.rc").write_text("0\n")
+    (rundir / "job.log").write_text("==> test start\n==> test done rc=0\n")
+    (rundir / "job.next").write_text("4243\n")
+    r = run("verdict", "<box-alias>", "4242", "--name", "t1")
+    assert r.returncode == 0 and "verdict: passed" in r.stdout and "resubmitted as job 4243" in r.stdout
+    assert "pass --name" in run("verdict", "<box-alias>", "4242").stdout
+    # status prints the verdict once the job ended
+    r = run("status", "<box-alias>", "4242", "--name", "t1")
+    assert "no longer in squeue" in r.stdout and "verdict: passed" in r.stdout
 
 
 def test_setup_box_slurm_status_and_verify_clean(tmp_path):

@@ -157,6 +157,13 @@ def check_box(alias: str, e, known=KNOWN_KEYS) -> "tuple[List[str], List[str]]":
                         err.append(f"{where}.board is missing")
                     if "exclusive" in p and not isinstance(p["exclusive"], bool):
                         err.append(f"{where}.exclusive must be true or false")
+            for k in ("container_run", "state_dir"):
+                v = sl.get(k)
+                if v is not None and not (_str(v) and "\n" not in v):
+                    err.append(f"{alias}: slurm.{k} must be a one-line string")
+            sd = sl.get("state_dir")
+            if isinstance(sd, str) and sd.strip() and not sd.startswith(("/", "~/", "$")):
+                err.append(f"{alias}: slurm.state_dir must be an absolute path on shared storage")
     if not err:
         for fn in CHECKS.get(route, []):
             err.extend(fn(alias, e))

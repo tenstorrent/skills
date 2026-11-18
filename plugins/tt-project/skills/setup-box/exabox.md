@@ -21,6 +21,10 @@ every rule and command in `slurm.md` applies. This page adds what is particular 
 - Accounting may be disabled: `sacct` then does not work. Read status from `squeue` and
   `scontrol show job` while the job lives, and from its `job.rc` and `job.log` afterwards
   (`box.py slurm status`).
+- Long runs of many tests: `box.py slurm cases` (`slurm.md`) checks the node's boards first, keeps
+  a results file per case and resubmits itself without a bad node, so a preempted job carries on
+  where it stopped. Build once with `box.py slurm build` and run tests on it with `box.py slurm
+  test`. Read each job's `box.py slurm verdict`, not its whole log.
 - The default time limit may be short and the maximum unlimited: always pass `--time` as the
   expected run time plus a small margin. Preemption may cancel a job: resubmit it.
 - Node-local disk, `/tmp` and `/dev/shm` may be wiped around each job. Keep checkouts, builds,

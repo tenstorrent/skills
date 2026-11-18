@@ -72,7 +72,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import remotecheck, runnerenv
+from . import remotecheck, runnerenv, slurmverdict
 
 KEY = "checks.slurm_overflow"
 DEFAULT_WORKDIR = "~/ttp-checks"
@@ -82,6 +82,7 @@ _PARTITION = re.compile(r"[A-Za-z0-9_.,-]{1,128}")
 _WORKDIR = re.compile(r"(/|~/|\$HOME/)[A-Za-z0-9_./-]*|~|\$HOME")
 JOBS_LOG = "jobs.jsonl"
 JOBS_LOG_MAX_BYTES = 256 * 1024
+TAIL_BYTES = 256 * 1024   # the end of a job's output kept for its verdict (slurmverdict)
 PROBE_TIMEOUT_S = 30
 CALL_TIMEOUT_S = 60
 SCANCEL_TIMEOUT_S = 4   # a stopped check is killed 5 s after its TERM (cli._end_check)
@@ -818,6 +819,9 @@ def main(args: list[str]) -> int:
                  f"--time={minutes} min) in {tmp}")
             rc, state, why, seen = _follow(host, q, job, s, poll, submitted, note)
             active = False
+            tail = seen.pop("tail", b"")
+            if rc != 0:   # one model-free line: the failed step, the pytest summary, the first errors
+                _say(slurmverdict.one_line(slurmverdict.verdict(tail.decode(errors="replace"), state, rc)))
             log_job({**rec, "end": time.time(), "state": state, **({"rc": rc} if rc is not None else {})})
             died = _start_fail(job, state, why, seen) if rc is None else None
             if (died or rc is not None or seen.get("out_bytes") or state in ("COMPLETED", "TIMEOUT")) and (
@@ -864,6 +868,7 @@ def _follow(host: str, q: str, job: str, s: dict, poll: float, submitted: float,
     mark = f"ttp-slurm:{secrets.token_hex(6)}"
     sent, last_ok, left, started, noted = 0, time.time(), None, None, ""
     out = sys.stdout.buffer
+    tail = bytearray()
     jq = shlex.quote(job)
     while True:
         script = (f"s=$(squeue -h -j {jq} -o %T 2>/dev/null | head -n 1); r=$(head -n 1 {q}/rc 2>/dev/null); "
@@ -877,7 +882,7 @@ def _follow(host: str, q: str, job: str, s: dict, poll: float, submitted: float,
         parts = head_line.decode(errors="replace").split("|")
         if got is None or got.returncode != 0 or parts[0] != mark:
             if time.time() - last_ok > LOST_S:
-                return None, "UNKNOWN", f"the submit host stopped answering for {LOST_S:g} s; the job ends at its time limit", {"out_bytes": sent}
+                return None, "UNKNOWN", f"the submit host stopped answering for {LOST_S:g} s; the job ends at its time limit", {"out_bytes": sent, "tail": bytes(tail)}
             time.sleep(poll)
             continue
         last_ok = time.time()
@@ -885,6 +890,8 @@ def _follow(host: str, q: str, job: str, s: dict, poll: float, submitted: float,
             out.write(body)
             out.flush()
             sent += len(body)
+            tail += body
+            del tail[:-TAIL_BYTES]
         state, rc = (parts[1].strip().upper() if len(parts) > 1 else ""), (parts[2].strip() if len(parts) > 2 else "")
         if len(parts) > 3 and (node := parts[3].strip()[:128]) and node != noted:   # the node the job runs on
             noted = node
@@ -895,19 +902,19 @@ def _follow(host: str, q: str, job: str, s: dict, poll: float, submitted: float,
         if rc.isdigit():
             if state in _ACTIVE:   # the script wrote its code: the job is ending
                 time.sleep(min(poll, 2))
-            return int(rc), "COMPLETED", "", {"out_bytes": sent}
+            return int(rc), "COMPLETED", "", {"out_bytes": sent, "tail": bytes(tail)}
         if state in _ACTIVE:
             left = None
             if state == "PENDING" and started is None and time.time() - submitted > s["max_pending_s"]:
                 scancel(host, job)
-                return None, "PENDING", f"cluster: it did not start within {s['max_pending_s']} s", {"out_bytes": sent}
+                return None, "PENDING", f"cluster: it did not start within {s['max_pending_s']} s", {"out_bytes": sent, "tail": bytes(tail)}
             time.sleep(poll)
             continue
         left = left or time.time()
         final, code, elapsed = _final(host, job)
         if elapsed is None and started is not None:   # sacct gave none: from when it was seen running
             elapsed = round(time.time() - started)
-        seen = {"out_bytes": sent, "code": code, "elapsed_s": elapsed}
+        seen = {"out_bytes": sent, "code": code, "elapsed_s": elapsed, "tail": bytes(tail)}
         if final in _ACTIVE:   # squeue missed it: the grace counts from its end
             left = None
             time.sleep(poll)
