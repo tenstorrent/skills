@@ -127,18 +127,20 @@ def _mark_report_only(item: dict, found: list[dict]) -> dict:
 
 
 PR_WORD_RE = re.compile(r"\b(?:pulls?|prs?)\b", re.I)
+PR_HINT = " (a PR: its owner/repo#N, or its owner/repo beside a PR word, in the check's command, check or fix)"
 
 
 def pr_item(url: str, prs_on: list[str], found: list[dict]) -> dict:
-    """The inventory item of the open PR `url`. The built-in PR watcher covers it; else a command watcher
-    whose text names the PR (its URL or owner/repo#N), or its repo (owner/repo) beside a PR word (`gh pr
-    list -R owner/repo`, `.../repos/owner/repo/pulls`), covers it, report-only: a project that may keep no
-    gh login on its host watches its PRs with its own command watcher, and those PRs are not missing."""
+    """The inventory item of the open PR `url`. The built-in PR watcher covers it; else an enabled command
+    schedule whose text names the PR (its URL or owner/repo#N), or its repo (owner/repo) beside a PR word
+    (`gh pr list -R owner/repo`, `.../repos/owner/repo/pulls`), covers it: a heal check by the same match
+    as a command watcher, which alone is report-only. A project that may keep no gh login on its host
+    watches its PRs with its own checks, and those PRs are not missing."""
     if prs_on:
         return {"kind": "pr", "name": url, "covered_by": [f"builtin: PR watcher {prs_on[0]}"]}
     key = prguard.pr_key(url) or ""
     repo = key.split("#", 1)[0]
-    names = [w["name"] for w in found if not w["heal"] and key
+    names = [w["name"] for w in found if key
              and (key in prguard.pr_keys(w["text"])
                   or (re.search(r"(?<![\w.-])" + re.escape(repo) + r"(?![\w.-]|/(?!pulls?\b))", w["text"], re.I)
                       and PR_WORD_RE.search(w["text"])))]
@@ -428,7 +430,7 @@ def digest_lines(db) -> list[str]:
     return [f"## Health coverage changed: {rec['line']}"
             + (f"; now covered: {', '.join(fixed)}" if fixed else "")
             + ("; give each missing one a heal check (harness/schedules.json, `heal` block) naming it"
-               if gaps else "")]
+               + (PR_HINT if any(g.startswith("pr ") for g in gaps) else "") if gaps else "")]
 
 
 def review_advice(db) -> str:

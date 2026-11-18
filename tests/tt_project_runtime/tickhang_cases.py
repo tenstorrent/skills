@@ -507,3 +507,19 @@ def test_a_finish_round_rolled_back_by_a_git_miss_is_never_counted_as_a_cut_off_
     assert _titles(p, "before", "misses", "after") == [1, 1, 1], "a rolled-back round lost an action"
     assert not any("cut off twice" in x for x in p.db.kv(coord.REJECTED_KEY, []))
     assert not json.loads((tmp_path / "coord-run" / dm.COORD_JOURNAL).read_text()).get("cuts")
+
+
+def test_a_step_stopped_at_its_budget_naming_no_item_names_the_code_line_it_was_on(env, monkeypatch):
+    """The case behind it: run_schedules hit its budget every tick in pure Python and the slow event said
+    only 'it names no item it works on'. A stop with no item and no child command names the innermost
+    line of the runtime it was stopped on, in the slow event and the stuck record."""
+    p = make(env)
+    from ttp import daemon as dmod, deslop, slop
+    d = dmod.Daemon(p.base)
+    monkeypatch.setattr(dmod, "STEP_BUDGET_S", 0.05)
+    monkeypatch.setattr(dmod, "STEP_HARD_SLACK_S", 0.05)
+    monkeypatch.setattr(slop, "scan", lambda *a, **k: time.sleep(30))
+    d._run_step(lambda: deslop.plan(p, {"deslop": {"enabled": True}}), "slow_plan")
+    [ev] = p.db.q("SELECT * FROM events WHERE kind='tick_step_slow'")
+    assert "held longest by code at deslop.py:" in ev["text"] and "in plan" in ev["text"], ev["text"]
+    assert d._step_stuck["slow_plan"][0].startswith("code at deslop.py:")
