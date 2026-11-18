@@ -124,7 +124,8 @@ def spans(recs: list[dict], here: str | None = None) -> list[dict]:
         ev = r.get("ev")
         if ev in ("take", "job"):
             e = ends.get(r["id"], {})
-            by[r["id"]] = {**r, "kind": "lock" if ev == "take" else "job", "end": e.get("end"), "rc": e.get("rc")}
+            by[r["id"]] = {**r, "kind": "lock" if ev == "take" else "job", "end": e.get("end"), "rc": e.get("rc"),
+                           **({"reaped": True} if e.get("reaped") else {})}
     out = []
     for s in by.values():
         s.pop("ev", None)
@@ -146,6 +147,43 @@ def spans(recs: list[dict], here: str | None = None) -> list[dict]:
             s["state"] = "unknown"
         out.append(s)
     return sorted(out, key=lambda s: float(s.get("start") or 0))
+
+
+REAP_AGE_S = 120.0   # a record younger than this is never closed: its wrapper may not hold the job lock yet
+
+
+def _gone(s: dict, here: str, now: float) -> bool:
+    """Whether the process a span with no end logged stood for is known to be gone, on this host only (a
+    record of another host, a remote job or another PID namespace stays unknown, never gone): its lock
+    file is free, its pid is dead on this boot, or the host booted again since."""
+    from .liveness import pid_state, DEAD
+    if s.get("host") != here or s.get("machine") or now - float(s.get("start") or now) < REAP_AGE_S:
+        return False
+    if s["kind"] == "job" and s.get("rcfile"):
+        return not _held(Path(s["rcfile"]).with_suffix(".lock"))
+    if s["kind"] == "lock" and s.get("job_rc"):
+        return not _held(Path(s["job_rc"]).with_suffix(".lock"))
+    if s["kind"] == "lock" and s.get("pid"):
+        if s.get("boot") and not _same_boot(s["boot"]):
+            return True
+        return _own_pid(s) and pid_state(s["pid"]) == DEAD
+    return False
+
+
+def reap(state: Path, recs: list[dict] | None = None, here: str | None = None, now: float | None = None) -> list[str]:
+    """Close every record with no end logged whose process is gone (_gone): an end entry marked `reaped` is
+    appended, so it never reads as live again (no alert, no open span in status). Model-free; run on every
+    occupancy pass and at daemon start. Returns the ids closed."""
+    here = project.hostname() if here is None else here
+    now = time.time() if now is None else now
+    recs = entries(state) if recs is None else recs
+    done = []
+    for s in spans(recs, here):
+        if s.get("end") is None and s.get("state") == "unknown" and _gone(s, here, now):
+            append(state, {"ev": "job_end" if s["kind"] == "job" else "release", "id": s["id"], "end": now,
+                           "rc": None, "reaped": True})
+            done.append(str(s["id"]))
+    return done
 
 
 def _rc(text: str):

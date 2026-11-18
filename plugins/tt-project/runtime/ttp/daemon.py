@@ -5284,10 +5284,10 @@ class Daemon:
         occupancy.WHERE = self.p
         db = self.p.db
 
-        def post(key: str, text: str) -> None:
-            db.post("out", text, chat=None, kind="alert", severity="high", ref=key)
+        def post(key: str, text: str, severity: str = "high") -> None:
+            db.post("out", text, chat=None, kind="alert", severity=severity, ref=key)
             db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
-                 (now, "daemon", "occupancy_violation", "high", text[:1000], "new", None))
+                 (now, "daemon", "occupancy_violation", severity, text[:1000], "new", None))
             log(self.p, text)
 
         out = occupancy.watch(self.p, db, now, post)

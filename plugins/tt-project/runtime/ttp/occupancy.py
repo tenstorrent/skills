@@ -410,18 +410,26 @@ def _names_alias(alias: str, res: str) -> bool:
     return res == alias or res.startswith((alias + "-", alias + ":"))
 
 
-def watch(p, db, now: float | None = None, post: Callable[[str, str], None] | None = None) -> dict:
+def watch(p, db, now: float | None = None, post: Callable[..., None] | None = None) -> dict:
     """The daemon's model-free watchdog, one pass: publish this project's sources, read every
     registered source (cached), raise one event per own source that cannot tell, and flag each job of
     this project that used a covered box's own devices (_uses_devices) and started while its stream was
     live or inside its quiet window (a front box: deploys and restarts only). A job that started before
-    the stream went live is never flagged. Per-job flags are kept in kv for status; one alert per stream
-    event (box plus window start) posts at high severity, listing the jobs and the source's own reason."""
+    the stream went live is never flagged, nor is a record whose process is gone (activity.reap closes those
+    first, here on every pass) or whose liveness is unknown: only a live job, or one that really ended after
+    the window began, counts. Per-job flags are kept in kv for status; one alert per stream event (box plus
+    window start, kept across restarts) lists the jobs and the source's own reason, at high severity when
+    the source reported a real live stream and normal when the box only counted as live because the source
+    could not tell (a fail-safe hold)."""
     from . import activity
     now = time.time() if now is None else now
     publish(p)
     cov = covered()
     out = {"read": 0, "flags": [], "unknown": []}
+    here = project.hostname()
+    reaped = activity.reap(p.state, here=here, now=now)   # also with no source: a gone process never reads live
+    if reaped:
+        out["reaped"] = reaped
     readings: dict[str, dict] = {}
     for alias, regs in cov.items():
         for proj, stream, src, role in regs:
@@ -434,7 +442,6 @@ def watch(p, db, now: float | None = None, post: Callable[[str, str], None] | No
     if not cov:
         return out
     from .machines import load as machines_load
-    here = project.hostname()
     known = machines_load()
     cfg = p.config()
     # A span that ran on this host counts as on `alias` only while `alias` is this host.
@@ -445,6 +452,8 @@ def watch(p, db, now: float | None = None, post: Callable[[str, str], None] | No
     new: dict[str, list[dict]] = {}
     recs = [r for r in activity.entries(p.state) if now - float(r.get("start") or r.get("end") or now) < HISTORY_S]
     for s in activity.spans(recs, here):
+        if s.get("state") == "unknown" or s.get("reaped"):
+            continue   # never a live process: not a job of the stream
         sid = str(s.get("id"))
         start = float(s.get("start") or 0)
         end = float(s["end"]) if s.get("end") is not None else now
@@ -478,7 +487,8 @@ def watch(p, db, now: float | None = None, post: Callable[[str, str], None] | No
     if post:
         for ekey, fl in new.items():
             if ekey not in events:
-                post(f"occupancy:violation:{ekey}", event_text(fl))
+                real = all(f.get("reading") == "live" for f in fl)
+                post(f"occupancy:violation:{ekey}", event_text(fl), "high" if real else "normal")
     for ekey in new:
         events[ekey] = now
     db.set_kv(SEEN_KEY, {k: v for k, v in seen.items() if now - float(v) < HISTORY_S})

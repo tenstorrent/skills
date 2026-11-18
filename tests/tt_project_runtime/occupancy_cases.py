@@ -147,10 +147,10 @@ def test_occupancy_watchdog_flags_an_overlap_and_posts_once(env, monkeypatch):
     monkeypatch.setattr(activity, "entries", lambda state: [span])
     monkeypatch.setattr(activity, "spans", lambda recs, here: [span])
     posts = []
-    out = occupancy.watch(p, p.db, now, lambda key, text: posts.append((key, text)))
+    out = occupancy.watch(p, p.db, now, lambda key, text, sev="high": posts.append((key, text, sev)))
     assert len(out["flags"]) == 1 and len(posts) == 1
     assert "box-a" in posts[0][1] and "#7" in posts[0][1]
-    occupancy.watch(p, p.db, now + 1, lambda key, text: posts.append((key, text)))
+    occupancy.watch(p, p.db, now + 1, lambda key, text, sev="high": posts.append((key, text, sev)))
     assert len(posts) == 1   # posted once
     assert any("box-a" in line for line in occupancy.status_lines(p.db, now + 2))
     # a job on a box no stream holds is never flagged
@@ -224,7 +224,7 @@ def test_occupancy_watchdog_posts_one_alert_per_stream_event_with_the_source_rea
     mk = lambda i, t: {"id": f"d{i}", "kind": "lock", "start": t, "end": None, "resource": "box-a-device",   # noqa: E731
                        "task": i, "cmd": "bench"}
     posts = []
-    post = lambda key, text: posts.append((key, text))   # noqa: E731
+    post = lambda key, text, sev="high": posts.append((key, text, sev))   # noqa: E731
     _watch_with(monkeypatch, [mk(i, now) for i in range(12)])
     out = occupancy.watch(p, p.db, now, post)
     assert len(out["flags"]) == 12 and len(posts) == 1, posts
@@ -306,3 +306,55 @@ def test_occupancy_internal_error_holds_a_box_with_a_source_and_frees_the_rest(t
     assert occ.blocks("box-a", "test") and occ.blocks("box-other", "test") == ""
     occ._path(occ.SOURCES).write_text("not json")
     assert occ.blocks("box-a", "test") == ""
+
+
+def test_occupancy_watchdog_never_flags_a_record_with_no_live_process(env, monkeypatch):
+    """A record whose process is gone is closed (reaped) on the pass and never flagged; one whose liveness is
+    unknown (another PID namespace or host) is not flagged either; a live job of the same window is."""
+    from ttp import activity, occupancy, project
+    p = make(env)
+    occ = _occ_home(env["home"], monkeypatch)
+    here = project.hostname()
+    occ.publish(_OccProj("streamer", p.root, {here: {"cmd": "exit 0"}}))
+    now = time.time()
+    t0 = now - 300
+    lock = lambda n: str(p.state / f"{n}.rc")   # noqa: E731
+    live_lock = open(str(p.state / "live.lock"), "w")
+    import fcntl
+    fcntl.flock(live_lock, fcntl.LOCK_EX)
+    try:
+        rec = lambda i, **kw: {"ev": "job", "id": i, "project": p.name, "host": here, "task": 3, "start": t0,   # noqa: E731
+                               "resource": f"{here}-device", "cmd": "bench", **kw}
+        for r in (rec("stale", rcfile=lock("stale")), rec("alive", rcfile=lock("live")),
+                  rec("far", host="elsewhere"), rec("remote", machine=here, host="elsewhere")):
+            activity.append(p.state, r)
+        out = occupancy.watch(p, p.db, now, None)   # the stream goes live now; the records started before it
+        assert out["reaped"] == ["stale"], out
+        spans = {s["id"]: s for s in activity.spans(activity.entries(p.state), here)}
+        assert spans["stale"]["state"] == "ended" and spans["stale"]["reaped"] is True
+        assert spans["alive"]["state"] == "running" and spans["far"]["state"] == "unknown"
+        # a fresh pass reaps nothing more, and a job started inside the window and still alive is flagged
+        activity.append(p.state, rec("new", rcfile=lock("live"), start=now + 5))
+        activity.append(p.state, rec("newfar", host="elsewhere", start=now + 5))
+        out = occupancy.watch(p, p.db, now + 10, None)
+        assert "reaped" not in out and sorted(f["key"].split(":")[0] for f in out["flags"]) == ["new"], out
+    finally:
+        live_lock.close()
+
+
+def test_occupancy_alert_is_normal_severity_for_a_failsafe_hold_and_high_for_a_real_stream(env, monkeypatch):
+    from ttp import occupancy
+    p = make(env)
+    occ = _occ_home(env["home"], monkeypatch)
+    occ.publish(_OccProj("streamer", p.root, {"box-a": {"cmd": "exit 0"}, "box-b": {"cmd": "exit 3"}}, quiet_s=0))
+    now = time.time()
+    posts = []
+    post = lambda key, text, sev="high": posts.append((key, sev))   # noqa: E731
+    mk = lambda i, box: {"id": f"{box}{i}", "kind": "lock", "start": now, "end": None, "resource": f"{box}-device",   # noqa: E731
+                         "task": i, "cmd": "bench"}
+    _watch_with(monkeypatch, [mk(i, b) for i in range(30) for b in ("box-a", "box-b")])
+    occupancy.watch(p, p.db, now, post)
+    assert sorted((k.split(":")[2], sev) for k, sev in posts) == [("box-a", "high"), ("box-b", "normal")], posts
+    # the same windows on a later pass (and after a restart, the events being kept in the database) post nothing
+    occupancy.watch(p, p.db, now + 5, post)
+    assert len(posts) == 2

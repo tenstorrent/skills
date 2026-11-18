@@ -245,3 +245,27 @@ def test_machines_activity_reads_another_projects_run_record_read_only(env, tmp_
             conn.close()
     finally:
         held.close()
+
+
+def test_reap_closes_only_records_whose_process_is_known_gone(tmp_path):
+    """A lock of this host whose pid is dead or whose boot is another one is closed with a `reaped` end; a
+    young record, a live pid, another host's record and a remote job stay as they are."""
+    import os
+    from ttp import activity, runner
+    st = tmp_path
+    now = time.time()
+    me = os.getpid()
+    base = {"ev": "take", "host": "h1", "start": now - 600, "resource": "r", "cmd": "x"}
+    recs = [{**base, "id": "dead", "pid": 2 ** 22 + 7, "boot": next(iter(runner.boot_ids()), "b")},
+            {**base, "id": "reboot", "pid": me, "boot": "another-boot"},
+            {**base, "id": "alive", "pid": me, "boot": next(iter(runner.boot_ids()), "b")},
+            {**base, "id": "young", "pid": 2 ** 22 + 9, "boot": next(iter(runner.boot_ids()), "b"), "start": now - 5},
+            {**base, "id": "far", "host": "h2", "pid": 2 ** 22 + 11, "boot": "another-boot"}]
+    for r in recs:
+        activity.append(st, r)
+    done = activity.reap(st, here="h1", now=now)
+    assert sorted(done) == ["dead", "reboot"], done
+    got = {s["id"]: s for s in activity.spans(activity.entries(st), "h1")}
+    assert got["dead"]["state"] == "ended" and got["dead"]["reaped"] and got["dead"]["end"] == now
+    assert got["far"]["state"] == "unknown" and got["young"]["state"] == "unknown"
+    assert activity.reap(st, here="h1", now=now + 1) == []   # closed once
