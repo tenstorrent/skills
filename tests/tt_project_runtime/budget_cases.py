@@ -1737,7 +1737,7 @@ def test_an_unclear_checks_wait_falls_back_to_a_light_wake(env, monkeypatch, tmp
     elif change == "not_handoff":
         (run_dir / "result.json").write_text(json.dumps({"status": "done", "summary": "x", "on_pass": DONE_ON_PASS}))
     elif change == "no_on_pass":   # a step left after the checks: no default on_pass (see below)
-        _set_handoff(p, tid, run_dir, next_step="report the push")
+        _set_handoff(p, tid, run_dir, next_step="rebase onto the push branch and fix any conflicts")
     _settle_probe(d, tid)
     task = p.db.task(tid)
     res = json.loads(task["result"])
@@ -1787,7 +1787,7 @@ def test_passed_checks_without_on_pass_still_wake_when_work_is_left(env, monkeyp
     tid, _ = _checks_wait_task(p, tmp_path)
     run_dir = tmp_path / f"run-{tid}"
     if change == "next_step":
-        _set_handoff(p, tid, run_dir, next_step="report the push")
+        _set_handoff(p, tid, run_dir, next_step="rebase onto the push branch and fix any conflicts")
     elif change == "wake_tier":
         _set_handoff(p, tid, run_dir, wake_tier="standard")
     elif change == "pr":
@@ -1939,7 +1939,7 @@ def test_a_waiting_hand_off_whose_push_landed_records_its_on_pass_model_free(env
      {"on_pass": {"status": "done", "summary": "x"}}, "its push did not land: batch refused (not reviewed)"),
     ({"kind": "batch", "outcome": "nothing", "phase": "finished"}, {"on_pass": {"status": "done", "summary": "x"}},
      "its push finished without pushing"),
-    ({"status": "pushed", "sha": "a" * 40}, {"next_step": "report the push"}, "probe passed"),
+    ({"status": "pushed", "sha": "a" * 40}, {"next_step": "rebase onto the push branch and fix any conflicts"}, "probe passed"),
     ({"status": "pushed", "sha": "a" * 40}, {"on_pass": {"status": "waiting", "summary": "x"}},
      "its on_pass was not applied: on_pass status must be done or needs_review")])
 def test_a_push_wait_that_did_not_land_or_leaves_work_still_wakes_the_task(env, monkeypatch, tmp_path, body, hand,

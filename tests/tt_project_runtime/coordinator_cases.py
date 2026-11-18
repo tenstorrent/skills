@@ -10902,6 +10902,7 @@ def test_a_plain_needs_review_hand_off_the_daemon_reviews_raises_no_effort(env, 
     from ttp import coordinator as coord
     from ttp.daemon import Daemon
     p = make(env)
+    p.set_config("review.at_once", False)   # the sweep path; with it on the daemon queues the review itself (reviewnow)
     p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
     tid, _, _, _ = _finish_code(env, p, "plain", {"a.py": 5}, result={"status": "needs_review", "summary": "ok"})
     plain = p.db.one("SELECT * FROM events WHERE task=? AND kind='task_review'", (tid,))

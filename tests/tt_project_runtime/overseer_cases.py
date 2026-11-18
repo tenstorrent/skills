@@ -110,6 +110,7 @@ def test_a_review_waits_for_its_prechecks_only_while_they_run_on_a_host_for_a_me
     now = time.time()
     p, tid, out, started = _running_precheck_review(env, now)
     p.db.x("UPDATE tasks SET priority=3, spec='review it' WHERE id=?", (tid,))   # not urgent, owes nothing
+    p.set_config("review.hold_for_precheck", True)   # off by default: a review runs beside its checks
     d = Daemon(p.base)
     held = lambda: d._precheck_holds(p.db.task(tid), now)   # noqa: E731
     started(now - 600)
@@ -148,6 +149,8 @@ def test_an_urgent_or_owed_review_never_waits_for_its_prechecks(env, monkeypatch
     assert not held(), "an urgent review was held for its running pre-checks"
     assert overseer.measure(p, now)["failing"] == ["urgent work ready with a free slot for 15 min"]
     p.db.x("UPDATE tasks SET priority=3, spec='review it' WHERE id=?", (tid,))
+    p.set_config("review.hold_for_precheck", True)   # off by default (reviewnow)
+    d = Daemon(p.base)
     assert held(), "a routine review still waits for running pre-checks"
     oid = obligations.add(p, "land the fix (user msg #1)", owners=[tid])
     assert not held(), "a review owing an obligation was held"

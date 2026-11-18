@@ -48,6 +48,8 @@ from . import batchrun
 from . import leadmode
 from . import coordprecheck
 from . import rejtally
+from . import ownrunhold
+from . import reviewnow
 from . import untrusted
 from . import branchcap
 from . import localfault
@@ -478,14 +480,15 @@ def checks_marker_probe(probe: str) -> str:
     return m.group(0) if m else ""
 
 
-def precheck_holds(state: Path, task: dict, now: float, db=None) -> bool:
+def precheck_holds(state: Path, task: dict, now: float, db=None, hold: bool = True) -> bool:
     """Review `task` waits for the checks the daemon started on its head (Daemon._precheck) only while
     they run on a host (cli.CHECKS_RUNNING, written once they left every queue), never while they wait
     for a host checks slot, a lane or another run (cli.CHECKS_SLOT_WAIT), and at most precheck_hold_s
     after they began running. An urgent review (urgent.is_urgent) or one owning an open obligation (with
     `db`) is never held: it starts at once and reads their result only if it is there. Read-only: files
-    under `state` and `db` only, so the overseer reads the same hold (Daemon._precheck_holds)."""
-    if task["kind"] != "review":
+    under `state` and `db` only, so the overseer reads the same hold (Daemon._precheck_holds). `hold` is
+    review.hold_for_precheck (reviewnow): off, no review waits for its checks."""
+    if task["kind"] != "review" or not hold:
         return False
     name = next((x[len(PRECHECK_LABEL):] for x in push._labels(task) if x.startswith(PRECHECK_LABEL)), "")
     if not name or "/" in name:
@@ -9124,7 +9127,8 @@ class Daemon:
         # An urgent or owed one's (an open obligation's owner) review is queued at once on a needs_review hand-off
         # too (no sweep_after_s wait); any other needs_review hand-off goes to the coordinator, unreviewed.
         reviewable = new == "done" or new == "review" and (urgent.is_urgent(task)
-                                                          or bool(obligations.owned_open(db, task["id"])))
+                                                          or bool(obligations.owned_open(db, task["id"]))
+                                                          or reviewnow.at_once(self.cfg, task, new, plain, result))
         # A change over chains.split_lines goes back to its worker once with a split order, before the review
         # it would get: only a hand-off that review would follow, so a needs_review request is never swallowed.
         resplit = self._split_back(task, result, int(task["attempts"] or 0)) \
@@ -15888,6 +15892,8 @@ class Daemon:
                     and not self._gh_logged_out(rc, outs[id(proc)], now):
                 # A new answer after a skip that no branch above handles: wake now, not at the backoff.
                 # A gh logout sleeps on to its timer (_hold_waiting folds it into the host's gh-auth alert).
+                if ownrunhold.hold(self.p, self.cfg, load_result(task["result"])):
+                    continue   # its own checks or push still run: they settle model-free when they end
                 self._wake_waiting(task, f"its probe's answer changed (exit {rc})", now, kind="probe_changed")
         for gone_tid in [t for t in self._probe_ctx.keys() | self._probe_diag.keys()
                          if t not in self._probes and t not in self._probe_rc
@@ -17945,7 +17951,7 @@ class Daemon:
                             f"wake; it wakes once that window ends, with every update since")
             return False
         try:
-            held = self._spec_wake_hold(t, probe, now)
+            held = ownrunhold.hold(self.p, self.cfg, prev, urgent=hurry) or self._spec_wake_hold(t, probe, now)
         except Exception as e:   # an unreadable hold keeps it asleep: its probe and timer still wake it
             held = f"its holds could not be read ({type(e).__name__}: {e})"
         if held:
@@ -21276,7 +21282,7 @@ class Daemon:
         """A review waits for the checks the daemon started on its head (_precheck) while they run on a
         host, at most precheck_hold_s after they began, unless it is urgent or owed (precheck_holds): the
         reviewer then reads their result at once."""
-        return precheck_holds(self.p.state, task, now, self.p.db)
+        return precheck_holds(self.p.state, task, now, self.p.db, reviewnow.hold_for_precheck(self.cfg))
 
     def _precheck_words(self, task: dict) -> str:
         """What the checks _precheck_holds waits for are doing, in words: waiting for a host checks slot

@@ -31465,6 +31465,7 @@ def test_with_the_push_queue_on_the_daemon_starts_the_checks_as_it_queues_the_re
     assert _wait_precheck(out) == "0", (out / cli.CHECKS_OUT).read_text()
     tree = _git_out(p.root, "rev-parse", f"{head}^{{tree}}").strip()
     assert cli._recorded_pass(p, tree, ["test -f app.py"]), "the reviewer's `ttp checks` could not reuse the pass"
+    p.set_config("review.hold_for_precheck", True)   # off by default: a review runs beside its checks
     d, now = Daemon(p.base), time.time()
     task = p.db.task(rev["id"])
     assert not d._precheck_holds(task, now), "finished checks hold the review"
@@ -31610,6 +31611,7 @@ def test_a_review_held_for_its_checks_does_not_fill_a_slot_for_the_turn_batch(en
     (out / cli.CHECKS_RUNNING).write_text(json.dumps({"since": time.time() - 30}))   # on a host, not queued
     rid = p.db.add_task("Review #1: x", "s", kind="review", tier="standard", origin="daemon",
                         labels=[PRECHECK_LABEL + out.name])
+    p.set_config("review.hold_for_precheck", True)
     d = Daemon(p.base)
     d.gates = {}
     evs = [{"ts": time.time() - 10, "kind": "task_done", "severity": "normal"}]

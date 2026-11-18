@@ -175,8 +175,9 @@ passed again for Claude Code with workers in the write fence (38 s, $0.12).
   at that commit), with the push checks, and refuses any other head. Before that guard, on 2026-10-21, a Claude Code worker whose
   task said to land its change pushed it straight to the remote; `ttp doctor --loop` still fails
   such a landing.
-- A code task's plain `needs_review` hand-off gets its review from the daemon's review sweep,
-  `review.sweep_after_s` (default 5 min) after its run ended; a `done` hand-off gets it at once.
+- A code task's plain `needs_review` hand-off gets its review from the daemon at once
+  (`review.at_once`; false: the review sweep, `review.sweep_after_s`, default 5 min after its run
+  ended); a `done` hand-off gets it at once.
 - Claude Code: a host without bubblewrap or socat (Linux) runs workers unfenced and raises one
   low issue. The fence frees ssh and its kin by name only as a simple command on its own (also
   under `timeout N` or `ttp lock <res> --`). Any of these keeps the whole line fenced (measured):

@@ -95,7 +95,8 @@ def _hold(d, task: dict, since: float, cfg: dict, state: Path, now: float) -> st
         paused = d.paused_resources(shared=False)
     if task_resources(task) & paused.keys():
         return "a resource it needs is paused"
-    if precheck_holds(state, task, now, d):
+    from .reviewnow import hold_for_precheck
+    if precheck_holds(state, task, now, d, hold_for_precheck(cfg)):
         return "its review's prechecks are running"
     ev = d.one("SELECT text FROM events WHERE kind='dispatch_hold' AND task=? AND ts>=? ORDER BY ts DESC LIMIT 1",
                (task["id"], since))

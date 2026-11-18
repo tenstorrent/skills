@@ -459,3 +459,31 @@ def test_batch_members_land_by_their_own_commits_or_rebased_copies_with_no_trail
     assert batchrun.landed_sha(p, b["id"], commits=shas) == ""
     git("-c", "user.name=r", "-c", "user.email=r@example.com", "cherry-pick", shas[1], cwd=land)
     assert batchrun.landed_sha(p, b["id"], commits=shas) == git("rev-parse", "HEAD", cwd=land)
+
+
+def test_batch_members_wait_while_their_lead_is_pushing_and_settle_when_its_push_ends(env):
+    """A lead that ended 'pushing' (its push is in the queue) still holds its members: they are not
+    requeued alone, so no worker starts only to find its commit already on the push branch. A landed push
+    closes them with it; a failed one sends them back."""
+    from ttp import batchrun
+    from ttp.db import dump_result
+    p = make(env)
+    lead, ok, bad = _batch_tasks(p, 3)
+    batchrun.record(p.db, lead, [ok, bad], "ttp/t-push", p.config())
+    for m in (ok, bad):
+        p.db.update_task(m["id"], status="running", branch="ttp/t-push")
+    p.db.update_task(lead["id"], status="pushing")
+    assert batchrun.holds(p.db.task(lead["id"])) and batchrun.tend(p) == []
+    assert {p.db.task(m["id"])["status"] for m in (ok, bad)} == {"running"}
+    members = [{"id": ok["id"], "status": "done", "summary": "fixed"},
+               {"id": bad["id"], "status": "failed", "reason": "broke"}]
+    p.db.update_task(lead["id"], status="done", result=dump_result({"status": "done", "members": members}))
+    got = {m: s for m, s, _ in batchrun.tend(p)}
+    assert got == {ok["id"]: "done", bad["id"]: "queued"}
+    lead2, m2 = _batch_tasks(p, 2)
+    batchrun.record(p.db, lead2, [m2], "ttp/t-push2", p.config())
+    p.db.update_task(m2["id"], status="running", branch="ttp/t-push2")
+    p.db.update_task(lead2["id"], status="pushing")
+    assert batchrun.tend(p) == []
+    p.db.update_task(lead2["id"], status="failed")
+    assert [(m, s) for m, s, _ in batchrun.tend(p)] == [(m2["id"], "queued")]

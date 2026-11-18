@@ -48,7 +48,9 @@ from pathlib import Path
 from .db import dump_result, load_result
 
 KV = "batchrun:"
-HOLDING = ("running", "waiting", "review")   # lead statuses that keep its members held
+# Lead statuses that keep its members held. A lead 'pushing' has its push in the queue: its members wait,
+# without a model call, for the push result (landed: done; failed: requeued) instead of starting at once.
+HOLDING = ("running", "waiting", "review", "pushing")
 SMALL = ("light", "standard")
 BATCH_MAX = 20   # dispatch.batch_max (user 11-12: "5 max makes no sense ... just do a lot more work per thread")
 TIER_RANK = {"light": 0, "standard": 1, "deep": 2}
@@ -62,7 +64,8 @@ KEEP_S = 14 * 86400   # a settled record stays readable (review and checks group
 
 def holds(lead: dict | None) -> bool:
     """The lead still holds its members: it runs, waits or is in review, or it is queued asleep on its
-    own wait (a waiting hand-off is stored as queued with a `waiting` result), as a detached push is."""
+    own wait (a waiting hand-off is stored as queued with a `waiting` result), as a detached push is; or its
+    push is in the queue ('pushing')."""
     if not lead:
         return False
     if lead["status"] in HOLDING:

@@ -53,16 +53,18 @@ def test_an_urgent_code_task_gets_its_review_at_priority_one_on_a_needs_review_h
     tid, _, _, reviews = _finish_code(env, p, "hot done", {"b.py": 5}, before=hot)
     assert [r["priority"] for r in reviews] == [1]
     tid, _, _, reviews = _finish_code(env, p, "routine", {"c.py": 5}, result={"status": "needs_review", "summary": "ok"})
-    assert reviews == [], "a routine needs_review hand-off still waits for the coordinator or the sweep"
+    assert len(reviews) == 1, "a plain needs_review hand-off waited for the coordinator or the sweep (reviewnow)"
     tid, _, _, reviews = _finish_code(env, p, "routine done", {"d.py": 5})
     assert [r["priority"] for r in reviews] == [p.db.task(tid)["priority"]], "a routine review keeps its chain's (chainprio)"
 
 
 def test_an_owed_code_task_gets_its_review_at_once_on_a_needs_review_hand_off(env):
     """A task that owns an open obligation is reviewed in the same pass as an urgent one, at its own
-    priority; once the obligation has its receipt or is dropped it waits for the sweep again."""
+    priority; once the obligation has its receipt or is dropped a plain hand-off is still reviewed at once
+    (review.at_once, reviewnow) and a hand-off with notes waits for the sweep again."""
     from ttp import obligations
     p = make(env)
+    p.set_config("review.at_once", False)
     _with_origin(env, clone=False)
     owed = lambda tid, head: obligations.add(p, "the fix the user asked for", owners=[tid])   # noqa: E731
     tid, _, _, reviews = _finish_code(env, p, "owed fix", {"o.py": 5}, before=owed,
@@ -117,7 +119,7 @@ def test_an_urgent_question_task_that_committed_its_change_gets_its_review_in_th
     assert t["branch"] in reviews[0]["spec"]
     # A routine one is still a code task now, so the sweep and the coordinator see a change to review.
     tid = _question_on_own_branch(env, p, "routine q", "Fix it.")
-    assert _finish_question(env, p, tid) == [] and p.db.task(tid)["kind"] == "code"
+    assert len(_finish_question(env, p, tid)) == 1 and p.db.task(tid)["kind"] == "code"   # reviewed at once (reviewnow)
     tid = _question_on_own_branch(env, p, "routine done", "Fix it.")
     assert len(_finish_question(env, p, tid, "done")) == 1
 
