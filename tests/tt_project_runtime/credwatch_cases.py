@@ -731,6 +731,32 @@ def test_credwatch_a_bridge_reconnect_remaking_its_links_and_up_markers_raises_n
     assert "file sock automation.sock" in r.stdout and "file other" not in r.stdout, r.stdout
 
 
+def test_credwatch_a_bridge_up_marker_reported_by_a_runner_of_an_older_runtime_is_never_told_and_fails_nothing(
+        env, monkeypatch):
+    """A runner loads credwatch when its run starts: one started before an upgrade taught bridge_file the
+    up-markers still reports the marker a reconnect rewrote. The daemon's classify (this runtime) calls it
+    `expected`, even when the run's own ssh wrote it: it fails no hand-off and observe tells nothing about it,
+    while a key changed beside it is still told."""
+    from ttp import credwatch
+    home = env["tmp"] / "acct"
+    monkeypatch.setenv("HOME", str(home))
+    key, marker = home / ".ssh" / "id_ed25519", home / ".ssh" / "tt-agent" / "automation.sock.up"
+    now = time.time()
+    run_dir = env["tmp"] / "run8"
+    run_dir.mkdir()
+    (run_dir / "output.jsonl").write_text(json.dumps(_bash(f"ssh box-1 true; echo 2 > {marker}")) + "\n")
+    ch = [[str(marker), "changed"], [str(key), "changed"]]
+    marks = {str(marker): [[2, 1, 5, 1], [3, 2, 6, 2]], str(key): [[100, 1, 7, 1], [90, 2, 8, 2]]}
+    got = credwatch.classify(ch, marks, now - 600, now, run_dir, str(home))
+    assert got[str(marker)][0] == "expected" and got[str(key)][0] == "outside_alarm", got
+    assert credwatch.excused(got) == {str(marker), str(key)}
+    db = make(env).db
+    assert credwatch.observe(db, {"id": 8, "task": 43, "role": "worker", "started": now - 600}, ch, now, got, "UTC") == 1
+    rows = db.q("SELECT severity, text FROM events WHERE fingerprint LIKE 'credwatch:%'")
+    assert [r["severity"] for r in rows] == ["high"] and "sock.up" not in rows[0]["text"], rows
+    assert credwatch.unwatched(str(marker)) and not credwatch.unwatched(str(key))
+
+
 def test_the_suites_own_folder_watch_skips_the_same_bridge_up_markers_as_credwatch():
     import conftest
     from ttp import bridge_cert

@@ -76,6 +76,17 @@ def bridge_file(name: str) -> bool:
     return name.endswith(".sock") or up_marker(name)
 
 
+def churn(name: str) -> bool:
+    """A file name the watch leaves out wherever it is (CHURN_NAMES, a host list, a bridge file)."""
+    return name.startswith(CHURN_NAMES) or HOST_LIST in name or bridge_file(name)
+
+
+def unwatched(path: str) -> bool:
+    """A path whose name this runtime does not watch (churn). A runner started on an older runtime still
+    reports one it watched (a bridge up-marker before bridge_file knew it): classify drops it."""
+    return churn(Path(path).name)
+
+
 def ssh_private(name: str) -> bool:
     """A file name in ~/.ssh that may hold a private key."""
     return not (name.endswith(".pub") or name in SSH_PUBLIC or HOST_LIST in name or name.startswith("cm-") or "%" in name
@@ -127,8 +138,7 @@ def _walk(top: str) -> list[str]:
     for root, dirs, names in os.walk(top):
         dirs[:] = sorted(d for d in dirs if d not in CHURN_DIRS)
         for name in sorted(names):
-            if (name.startswith(CHURN_NAMES) or HOST_LIST in name or bridge_file(name)
-                    or os.path.basename(root) == ".ssh" and ssh_config(name)):
+            if churn(name) or os.path.basename(root) == ".ssh" and ssh_config(name):
                 continue
             path = os.path.join(root, name)
             try:
@@ -459,6 +469,8 @@ def classify(changed: list, marks: dict, start: float | None, end: float, run_di
     """{path: [verdict, change time ns, note]} for each change of `changed` (changes() rows); `marks` is
     the runner's {path: [before, after]} (exit.json cred_marks), the change time the file's new ctime (its
     last one for a removal, else `end`). Verdicts, first that holds:
+    - expected: a path this runtime does not watch (unwatched), reported by a runner that started on an
+      older one: never told, fails nothing.
     - metadata: only ctime moved: nothing was written.
     - ledger: this machine's change ledger records it as made while the run ran (ledger_entry); note: the entry.
     - run (FAILS): a command or file edit the run issued writes the path or such a store (transcript_hit); note: it.
@@ -477,7 +489,9 @@ def classify(changed: list, marks: dict, start: float | None, end: float, run_di
             entry = ledger_entry(path, start, end, home)
         except Exception:   # an unreadable ledger records nothing
             entry = None
-        if how == "metadata":
+        if unwatched(path):
+            out[path] = ["expected", at, ""]
+        elif how == "metadata":
             out[path] = ["metadata", at, ""]
         elif entry:
             by = f"project {entry.get('by') or '?'}" + (f" task #{entry['task']}" if entry.get("task") else "")
@@ -550,7 +564,7 @@ def observe(db, run: dict, changed: list, now: float, verdicts: dict | None = No
         if kind == FAILS:
             mine.append(f"{path} {how}" + (f" ({note})" if note else ""))
             continue
-        if kind == "deliberate":   # an open 'none: deliberate' ledger entry names it: not told again
+        if kind in ("deliberate", "expected"):   # an open 'none: deliberate' ledger entry names it, or unwatched
             continue
         if not _claim(f"credwatch:{path}:{int(at / 1e9 // 60)}:{kind}:{how}", now):
             continue
