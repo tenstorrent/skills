@@ -1,0 +1,5 @@
+---
+"tt-project": patch
+---
+
+`tt-project`: every new start on a box asks occupancy first and waits or moves while a live stream holds it, through one shared helper (`occupancy.wait_free` / `wait_here`, a model-free look about every 15 s until the quiet window passes). `ttp lock` waits instead of refusing (past `--timeout` or half the run's stall limit it exits 75 with the `ttp lock --probe` retry); a local `ttp detach` job starts at once and waits inside the job, its log saying why (`--remote` on a held box is still not started); checks spill to an allowed free host or wait; Terminal-Bench trials and harness A/B cells wait before each start; `ttp occupancy --wait` takes `--also` and `--timeout`. Jobs already running on this host while a stream holds it get their process groups lowered (autogroup nice 19, else nice 19, idle I/O) and restored once the box is free, never signalled; each change and restore goes to the activity log (`lowered`, `restored`). An unreadable source counts as held and the wait line says why; a repeated wait line is printed once per new reason, not per read time.

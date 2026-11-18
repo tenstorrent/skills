@@ -6232,6 +6232,25 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
                                start if foreground and p else None):
                 return None
             continue
+        # A live realtime stream on this host (occupancy.py) holds new runs here: a run that may spill tries the
+        # spill hosts (each asked the same, checkspill.pick); else, or with none free, it waits holding nothing
+        # here and looks again about every 15 s, until the stream's quiet window passed.
+        if p is not None and (live := _occupancy_here(p)):
+            if spill_to and checkspill.hosts(spill_cfg) and (claim := checkspill.pick(
+                    p, spill_cfg, lambda line: line in told or (told.add(line), tell(line)), what, spill_off,
+                    f"this host is held: {live}")) is not None:
+                slot = checkcap.Slot()
+                slot.spill = claim
+                return slot
+            from . import occupancy
+            line = f"not running here: {live}; looking again every {occupancy.POLL_S:.0f} s"
+            if line not in told:
+                told.add(line)
+                tell(line)
+            if not _spill_wait(run_dir, out, occupancy.POLL_S, waiting, moved, yielder,
+                               start if foreground and p else None):
+                return None
+            continue
         # Spill first (checkspill.first), and while this host's disk is saturated by writes (diskgate, which
         # holds new local runs): the spill hosts are tried before any place here; after it, each bound below
         # tries them again, so a run held here by the load guard or a cap still goes to a host with room.
@@ -6336,6 +6355,13 @@ def _spill_fail_verdict(spilled, passed, executed, timed_out, rc, failed, todo, 
     except OSError:
         pass
     return hosts
+
+
+def _occupancy_here(p) -> str:
+    """Why a live realtime stream holds this host for a new checks run (`ttp occupancy`), or ""."""
+    from . import occupancy, project as project_mod
+    occupancy.WHERE = p
+    return occupancy.blocks_any([project_mod.hostname()], "test")
 
 
 def _spill_wait(run_dir: Path, out, bound: float, waiting, moved, yielder, since: float | None) -> bool:
@@ -8610,7 +8636,7 @@ def cmd_host_run(a) -> None:
 def cmd_occupancy(a) -> None:
     """`ttp occupancy <alias>`: whether a live realtime stream holds the box (occupancy.py). Exit 0 when
     the step may run, 75 while it must stay off (live, inside the quiet window, or a source that cannot
-    tell); `--wait` retries about every minute until it may run (or --timeout). `--list`: the sources
+    tell); `--wait` looks again about every 15 s until it may run (or --timeout). `--list`: the sources
     every project on this host registered."""
     from . import occupancy
     base = os.environ.get("TTP_PROJECT")
@@ -8653,14 +8679,14 @@ def cmd_occupancy(a) -> None:
                 print(f"{alias}: {proj}, {how}, timeout {src.get('timeout_s', occupancy.TIMEOUT_S):g} s, "
                       f"quiet {r.get('quiet_s', occupancy.QUIET_S):g} s{fronts}")
         return
-    deadline = None if not a.timeout else time.time() + a.timeout
-    while True:
-        res = occupancy.check(a.target, a.step, fresh=a.fresh)
-        if not res["blocks"] or not a.wait or (deadline is not None and time.time() >= deadline):
-            break
-        print(res["why"], file=sys.stderr, flush=True)
-        time.sleep(occupancy.WAIT_S if deadline is None else max(1.0, min(occupancy.WAIT_S, deadline - time.time())))
-    print(json.dumps(res, indent=1, sort_keys=True) if a.json else occupancy.text(res))
+    if a.wait:   # the shared start gate (occupancy.wait_free): about every 15 s, the wait line says why
+        occupancy.wait_free([a.target, *(a.also or [])], a.step, max_wait_s=a.timeout,
+                            say=lambda line: print(f"ttp occupancy: {line}", file=sys.stderr, flush=True))
+    res = occupancy.check(a.target, a.step, fresh=a.fresh)
+    also = "" if res["blocks"] else occupancy.blocks_any(a.also or [], a.step)
+    if also:
+        res = {**res, "blocks": True, "why": also}
+    print(json.dumps(res, indent=1, sort_keys=True) if a.json else (also or occupancy.text(res)))
     sys.exit(75 if res["blocks"] else 0)
 
 
@@ -8777,16 +8803,36 @@ def cmd_lock(a) -> None:
             if waiting:
                 _end_wait()
             die(f"refused: {held_by[1]}", 75)
-        if live := _occupied():
-            if waiting:
-                _end_wait()
-            die(f"refused: {live}; retry in about a minute (`ttp occupancy {todo[0]['name']}`)", 75)
 
     def _occupied() -> str:
-        # A live realtime stream on the box (occupancy.py): checked before each try, as a pause is.
+        # A live realtime stream on the box (occupancy.py).
         from . import occupancy
         occupancy.WHERE = p
         return occupancy.blocks_any([L["name"] for L in todo], _lock_step(a))
+
+    def _wait_occupied() -> None:
+        # The command starts only once no live stream holds the box (occupancy.wait_free): it waits, looking
+        # about every 15 s, within --timeout and, inside a run's agent, half its stall limit; past that the
+        # task hands off waiting on the probe, which answers busy while the box is held.
+        from . import occupancy
+        occupancy.WHERE = p
+        bound = a.timeout or None
+        if not os.environ.get("TTP_DETACHED") and os.environ.get("TTP_RUN_DIR"):
+            try:
+                cap = float(json.loads((Path(os.environ["TTP_RUN_DIR"]) / "run.json").read_text()).get("stall_s") or 0) / 2
+            except (OSError, ValueError, AttributeError):
+                cap = 0.0
+            bound = min(bound, cap) if bound and cap else (bound or cap or None)
+        got = occupancy.wait_free([L["name"] for L in todo], _lock_step(a), max_wait_s=bound,
+                                  say=lambda line: print(f"ttp lock: {line}", file=sys.stderr, flush=True))
+        if not got["ok"]:
+            try:
+                if waiting:
+                    _end_wait()
+            except NameError:   # the first check runs before the queue wait is set up
+                pass
+            die(f"{got['why']}; waited {got['waited_s']:.0f} s. Hand the task back now: result.json status "
+                f"`waiting`, retry_when `ttp lock --probe {' '.join(L['name'] for L in todo)}`", 75)
 
     from . import shared
     cfg = p.config()
@@ -8826,7 +8872,7 @@ def cmd_lock(a) -> None:
             print(json.dumps({"name": todo[0]["name"], "free": False, "line": live, "occupancy": True})
                   if a.json else live)
             sys.exit(75)
-        die(f"refused: {live}; retry in about a minute (`ttp occupancy {todo[0]['name']}`)", 75)
+        _wait_occupied()
 
     def _unwritable(e: OSError, L: dict) -> None:
         # Never a private lock instead: other holders would not see it. Say what is wrong.
@@ -8938,6 +8984,7 @@ def cmd_lock(a) -> None:
         # This run's task holds the resource for its whole run already, exclusively even for a --shared
         # command: a nested plain `ttp lock` of it inside the command just runs too.
         _refuse_paused()
+        _wait_occupied()
         todo = [L for L in todo if L not in run_held]
         if a.shared:
             child_env.update(TTP_LOCKS_SHARED=",".join(shared_locks + [L["res"] for L in todo]),
@@ -9100,6 +9147,7 @@ def cmd_lock(a) -> None:
             for t in tickets:
                 lk.dequeue(t)
             tickets.clear()
+            _wait_occupied()   # a stream that went live while this queued: the slot is kept, the start waits
             for L in todo:   # as the task's run does once it has its slot (runner._take_exclusive)
                 if L["mine"]:
                     lk.unreserve(L["mark"], L["own"])
@@ -10088,8 +10136,7 @@ def cmd_detach(a) -> None:
         die("--remote-pid and --remote-marker go with --remote-host <ssh alias>")
     if rhost and (a.remote or a.check is not None):
         die("--remote-host is for a local job that drives another host; --remote starts the job there itself")
-    if a.check is None and a.command:
-        _detach_occupied(a, rhost)
+    held_on = _detach_occupied(a, rhost) if a.check is None and a.command else []
     if a.remote:
         _detach_remote(a, _own_ttp())
         return
@@ -10151,6 +10198,8 @@ def cmd_detach(a) -> None:
         cmd = pooled
     if job_locks:
         cmd = _lock_job(job_locks, cmd)
+    if held_on:   # waits outside its locks, so it holds none of them while the stream is live
+        cmd = _occupancy_wait_argv(held_on, getattr(a, "step", None) or "test", cmd)
     pid = None
     from . import activity
     job_env, aid = dict(os.environ), activity.new_id()
@@ -10802,16 +10851,33 @@ def _ssh_sh(host: str, script: str, args: list, timeout: float = 60,
         return None
 
 
-def _detach_occupied(a, rhost: str | None) -> None:
-    """A job on a box a live realtime stream holds (its --remote or --remote-host, its --lock resources) is not
-    started: exit 75 with why (`ttp occupancy`), so the run retries in about a minute."""
-    from . import occupancy
+def _detach_occupied(a, rhost: str | None) -> list[str]:
+    """The boxes a new detached job starts on (this host, its --remote-host, its --lock resources) that a live
+    realtime stream holds now (`ttp occupancy`): [] when none. A --remote job is not started on a held box:
+    exit 75 with why, so the run retries; a local one starts its wait at once (_occupancy_wait_argv)."""
+    from . import occupancy, project as project_mod
     occupancy.WHERE = Project(os.environ["TTP_PROJECT"]) if os.environ.get("TTP_PROJECT") else None
     locks = [r for v in (getattr(a, "lock", None) or []) for r in str(v).split(",") if r]
-    why = occupancy.blocks_any([a.remote or "", rhost or "", *locks], getattr(a, "step", None) or "test")
-    if why:
-        from . import cyclenotice
-        die(f"ttp detach: not started: {why}; retry in about a minute (`ttp occupancy <box>`)", cyclenotice.BUSY)
+    step = getattr(a, "step", None) or "test"
+    if a.remote:
+        if why := occupancy.blocks_any([a.remote, *locks], step):
+            from . import cyclenotice
+            die(f"ttp detach: not started: {why}; retry in about a minute (`ttp occupancy <box>`)", cyclenotice.BUSY)
+        return []
+    targets = [t for t in (project_mod.hostname(), rhost or "", *locks) if t]
+    if why := occupancy.blocks_any(targets, step):
+        print(f"ttp detach: {why}; the job waits for it before it starts, looking about every "
+              f"{occupancy.POLL_S:.0f} s (its log shows the wait)", file=sys.stderr)
+        return targets
+    return []
+
+
+def _occupancy_wait_argv(targets: list[str], step: str, cmd: list[str]) -> list[str]:
+    """A detached job held by a live stream: it starts with `ttp occupancy --wait` on its boxes, then execs."""
+    ttp = shlex.join([sys.executable, str(Path(__file__).resolve().parents[2] / "bin" / "ttp")])
+    words = shlex.join(["occupancy", "--wait", "--step", step, targets[0],
+                        *[w for t in targets[1:] for w in ("--also", t)]])
+    return ["/bin/sh", "-c", f'{ttp} {words} >&2 || exit 75; exec "$@"', "sh", *cmd]
 
 
 def _detach_remote(a, ttp: str) -> None:
@@ -16543,7 +16609,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("target", nargs="?", default="", help="a machine alias, a resource on it or its host name")
     s.add_argument("--step", choices=("deploy", "restart", "test", "bench", "warmup", "health", "reset"), default="test",
                    help="what is about to run there (default test); a front box holds only deploy and restart")
-    s.add_argument("--wait", action="store_true", help="retry about every minute until the step may run")
+    s.add_argument("--wait", action="store_true", help="look again about every 15 s until the step may run")
+    s.add_argument("--also", action="append", default=[], metavar="TARGET",
+                   help="another box the step needs free too (repeatable)")
     s.add_argument("--timeout", type=float, default=None, help="with --wait: give up after this many seconds (exit 75)")
     s.add_argument("--fresh", action="store_true", help="read every source now (else a reading under 20 s old is reused)")
     s.add_argument("--json", action="store_true", help="the answer as JSON")

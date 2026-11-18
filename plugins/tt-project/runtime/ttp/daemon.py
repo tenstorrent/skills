@@ -5279,9 +5279,17 @@ class Daemon:
         every source registered on this host, and flag each job of this project that ran on a box while a live
         realtime stream (or its quiet window) held it. A flag posts to this project's chat at once at high
         severity (never held by the digest or hourly limits) and is kept for status and the daily review. A
-        source of this project's own that cannot tell raises one event per episode: held boxes count it live."""
+        source of this project's own that cannot tell raises one event per episode: held boxes count it live.
+        About every 15 s, this project's detached jobs already running on a held box of this host drop to the
+        lowest priority and come back once it is free (occupancy.lower_running); none is ever killed."""
         from . import occupancy
         now = time.time()
+        if now - getattr(self, "_occupancy_low_at", 0.0) >= occupancy.POLL_S:
+            self._occupancy_low_at = now
+            try:
+                occupancy.lower_running(self.p, self.p.db, now)
+            except Exception as e:   # never stops the watchdog below
+                log(self.p, f"occupancy: lowering running jobs failed: {type(e).__name__}: {e}")
         if now - getattr(self, "_occupancy_at", 0.0) < occupancy.WAIT_S:
             return
         self._occupancy_at = now

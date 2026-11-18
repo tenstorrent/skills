@@ -113,7 +113,7 @@
 Before a deploy, restart, test, benchmark, warm-up, health check or reset on a machine, run
 `ttp occupancy <alias> --step <step>`: exit 75 means a live realtime stream holds it (or its front
 box, for deploy and restart): stay off and retry in about a minute, or hand off `waiting` with that
-command as `retry_when`. A long runner checks `ttp occupancy <alias> --should-stop <runner>` before
+command as `retry_when`. `ttp lock` and `ttp detach` wait for a held box themselves. A long runner checks `ttp occupancy <alias> --should-stop <runner>` before
 each trial and stops on exit 0. Sharing a box through the device broker is fine.
 <!-- /ttp:if occupancy -->
 <!-- ttp:if clusters -->

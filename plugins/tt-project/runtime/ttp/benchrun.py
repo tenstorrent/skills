@@ -906,6 +906,9 @@ def run_cell(bench_dir: Path, out: Path, task: dict, cell: dict, arm: dict, opts
     row.update(pack_fields(task) if pack else {})
     keep = out / "cells" / f"{task['task']}-r{cell['rep']}-{cell['arm']}{'-fix' if fix else ''}"
     hidden = hidden_paths(bench_dir.resolve(), out.resolve(), [task.get("repo"), opts.get("repo")], opts.get("state"))
+    if not opts.get("dry_run"):   # a live stream on this host: the cell waits for it (occupancy.wait_free)
+        from . import occupancy
+        occupancy.wait_here("bench", "benchrun")
     tmp = Path(tempfile.mkdtemp(prefix="cell-"))
     logins, cell = [], None
     try:

@@ -108,9 +108,15 @@ def test_occupancy_cli_check_lock_and_detach_refuse_while_live(env, tmp_path):
     r = subprocess.run([sys.executable, str(TTP), "occupancy", "box-a", "--json"], env=e, capture_output=True,
                        text=True)
     assert json.loads(r.stdout)["blocks"] is True
-    r = subprocess.run([sys.executable, str(TTP), "lock", "box-a", "--", "true"], env=e, capture_output=True,
-                       text=True)
-    assert r.returncode == 75 and "live realtime stream" in r.stderr, r
+    # A held start waits (looking again on its own) instead of being refused; past its --timeout the task is
+    # told to hand back waiting on the probe, which answers busy while the box is held.
+    r = subprocess.run([sys.executable, str(TTP), "lock", "--timeout", "1", "box-a", "--", "true"],
+                       env={**e, "TTP_TEST_POLL_S": "0.2"}, capture_output=True, text=True)
+    assert r.returncode == 75 and "live realtime stream" in r.stderr and "waiting:" in r.stderr, r
+    assert "retry_when `ttp lock --probe box-a`" in r.stderr, r
+    r = subprocess.run([sys.executable, str(TTP), "occupancy", "--wait", "--timeout", "1", "box-a"],
+                       env={**e, "TTP_TEST_POLL_S": "0.2"}, capture_output=True, text=True)
+    assert r.returncode == 75 and "waiting:" in r.stderr, r
     r = subprocess.run([sys.executable, str(TTP), "lock", "--probe", "box-a"], env=e, capture_output=True, text=True)
     assert r.returncode == 75, r
     r = subprocess.run([sys.executable, str(TTP), "detach", "--remote", "box-a", "job1", "--", "true"], env=e,
@@ -383,3 +389,192 @@ def test_occupancy_watchdog_flags_a_remote_job_started_inside_the_window_once(en
         out = occupancy.watch(p, p.db, now + t, post)
         assert sorted(f["key"].split(":")[0] for f in out["flags"]) == (["new"] if t == 10 else []), out
     assert len(posts) == 1 and "box-a" in posts[0][1] and posts[0][2] == "high"
+
+
+class _OccClock:
+    """A fake clock and sleep for occupancy.wait_free: each sleep moves time on and runs `on_sleep`."""
+    def __init__(self, on_sleep=None, step=30.0):
+        self.t, self.naps, self.on_sleep, self.step = time.time(), [], on_sleep, step
+
+    def clock(self):
+        return self.t
+
+    def sleep(self, s):
+        self.naps.append(s)
+        self.t += self.step
+        if self.on_sleep:
+            self.on_sleep(len(self.naps))
+
+
+def test_occupancy_wait_free_start_waits_through_the_quiet_window_then_runs(tmp_path, monkeypatch):
+    occ = _occ_home(tmp_path, monkeypatch)
+    flag = _occ_flag_file(tmp_path, "stream", "live")
+    occ.publish(_OccProj("streamer", tmp_path, {"box-a": {"file": str(flag), "max_age_s": 10_000}}))
+    fake = _OccClock(lambda n: n == 1 and flag.write_text("free"))
+    said = []
+    got = occ.wait_free(["box-a"], "test", poll_s=15, say=said.append, sleep=fake.sleep, clock=fake.clock)
+    assert got["ok"] and got["move"] == "" and got["why"] == ""
+    # live at the first look, then inside the quiet window (60 s after the stream ended), then free
+    assert 2 <= len(fake.naps) <= 4 and all(n == 15 for n in fake.naps), fake.naps
+    assert said and said[0].startswith("waiting: ") and "looking again every 15 s" in said[0]
+    assert got["waited_s"] >= 60
+
+
+def test_occupancy_wait_free_moves_to_a_free_host(tmp_path, monkeypatch):
+    occ = _occ_home(tmp_path, monkeypatch)
+    occ.publish(_OccProj("streamer", tmp_path, {"box-a": {"cmd": "exit 0"}, "box-b": {"cmd": "exit 0"},
+                                                "box-c": {"cmd": "exit 1"}}))
+    fake, said = _OccClock(), []
+    got = occ.wait_free(["box-a"], "test", moves=["box-b", ["box-c", "box-c.example"]], say=said.append,
+                        sleep=fake.sleep, clock=fake.clock)
+    assert got == {**got, "ok": True, "move": "box-c"} and fake.naps == [], got
+    assert said == [f"moved to box-c: {got['why']}"] and "box-a" in got["why"]
+    # every host held, with a bound: it hands back not ok, having waited
+    got = occ.wait_free(["box-a"], "test", moves=["box-b"], max_wait_s=40, sleep=fake.sleep, clock=fake.clock)
+    assert got["ok"] is False and got["move"] == "" and got["why"] and fake.naps
+
+
+def test_occupancy_wait_free_unreadable_source_counts_as_held_and_says_why(tmp_path, monkeypatch):
+    occ = _occ_home(tmp_path, monkeypatch)
+    occ.publish(_OccProj("streamer", tmp_path, {"box-a": {"cmd": "exit 3"}}))
+    fake, said = _OccClock(), []
+    got = occ.wait_free(["box-a"], "test", max_wait_s=60, say=said.append, sleep=fake.sleep, clock=fake.clock)
+    assert got["ok"] is False
+    assert len(said) == 1 and "could not tell" in said[0] and "counted as live" in said[0], said
+    # an internal error is held too, never a silent pass
+    monkeypatch.setattr(occ, "blocks_any", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    said.clear()
+    got = occ.wait_free(["box-a"], "test", max_wait_s=30, say=said.append, sleep=fake.sleep, clock=fake.clock)
+    assert got["ok"] is False and "counted as live" in got["why"] and said
+
+
+def test_occupancy_running_job_is_lowered_then_restored_and_never_killed(env, monkeypatch):
+    import os as _os
+    from ttp import activity, locks, occupancy, project
+    p = make(env)
+    occ = _occ_home(env["home"], monkeypatch)
+    here = project.hostname()
+    occ.publish(_OccProj("streamer", p.root, {here: {"cmd": "exit 0"}}, quiet_s=60))
+    now = time.time()
+    job = {"id": "j1", "kind": "job", "state": "running", "start": now - 5, "job": "soak", "task": 9,
+           "rcfile": "/nonexistent/soak.rc"}
+    monkeypatch.setattr(activity, "entries", lambda state: [{"host": here}])
+    monkeypatch.setattr(activity, "spans", lambda recs, h: [job])
+    calls = []
+    monkeypatch.setattr(occupancy, "_job_group", lambda s: 4242)
+    monkeypatch.setattr(locks, "start_time", lambda pid: "t-4242")
+    real_getpgid, real_kill, real_killpg = _os.getpgid, _os.kill, _os.killpg
+    monkeypatch.setattr(_os, "getpgid", lambda pid: pid if pid == 4242 else real_getpgid(pid))
+    monkeypatch.setattr(occupancy, "_nice_get", lambda g: 0)
+    monkeypatch.setattr(occupancy, "_io_get", lambda g: "2 4")
+    monkeypatch.setattr(occupancy, "_autogroup_get", lambda g: 0)
+    monkeypatch.setattr(occupancy, "_autogroup_set", lambda g, n: calls.append(("autogroup", g, n)) or "")
+    monkeypatch.setattr(occupancy, "_nice_set", lambda g, n: calls.append(("nice", g, n)) or "")
+    monkeypatch.setattr(occupancy, "_io_set", lambda g, v: calls.append(("io", g, v)) or "")
+
+    def guard(real):
+        def call(pid, sig):
+            if abs(pid) == 4242:   # the job's group; the source reader still cleans up its own child
+                raise AssertionError(f"a running job was signalled: {pid} {sig}")
+            return real(pid, sig)
+        return call
+    monkeypatch.setattr(_os, "kill", guard(real_kill))
+    monkeypatch.setattr(_os, "killpg", guard(real_killpg))
+    logged = []
+    monkeypatch.setattr(activity, "append", lambda state, rec: logged.append(rec))
+
+    out = occupancy.lower_running(p, p.db, now)
+    assert out == {"lowered": ["j1"], "restored": []}
+    assert calls == [("autogroup", 4242, 19), ("io", 4242, "3 0")]
+    assert logged[-1]["ev"] == "lowered" and logged[-1]["pgid"] == 4242 and logged[-1]["why"]
+    assert occupancy.lower_running(p, p.db, now + 1)["lowered"] == []   # once, while it stays live
+    # the stream ends; past its quiet window the job gets back what it had
+    occ.publish(_OccProj("streamer", p.root, {here: {"cmd": "exit 1"}}, quiet_s=60))
+    calls.clear()
+    out = occupancy.lower_running(p, p.db, now + 600)
+    assert out == {"lowered": [], "restored": ["j1"]}
+    assert calls == [("autogroup", 4242, 0), ("io", 4242, "2 4")]
+    assert logged[-1]["ev"] == "restored" and logged[-1]["restored"]["io"] == "2 4" and "gone" not in logged[-1]
+    assert p.db.kv(occupancy.LOWERED_KEY) == {}
+
+
+def test_occupancy_lowering_without_autogroup_records_a_nice_it_could_not_raise_back(env, monkeypatch):
+    import os as _os
+    from ttp import activity, locks, occupancy, project
+    p = make(env)
+    occ = _occ_home(env["home"], monkeypatch)
+    here = project.hostname()
+    occ.publish(_OccProj("streamer", p.root, {here: {"cmd": "exit 3"}}))   # unreadable: held
+    now = time.time()
+    job = {"id": "j2", "kind": "job", "state": "running", "start": now, "job": "bench"}
+    monkeypatch.setattr(activity, "entries", lambda state: [{"host": here}])
+    monkeypatch.setattr(activity, "spans", lambda recs, h: [job])
+    monkeypatch.setattr(occupancy, "_job_group", lambda s: 777)
+    monkeypatch.setattr(locks, "start_time", lambda pid: "t")
+    real_getpgid = _os.getpgid
+    monkeypatch.setattr(_os, "getpgid", lambda pid: pid if pid == 777 else real_getpgid(pid))
+    monkeypatch.setattr(occupancy, "_nice_get", lambda g: 0)
+    monkeypatch.setattr(occupancy, "_io_get", lambda g: "")
+    monkeypatch.setattr(occupancy, "_autogroup_get", lambda g: None)
+    monkeypatch.setattr(occupancy, "_io_set", lambda g, v: "")
+    monkeypatch.setattr(occupancy, "_nice_set", lambda g, n: "" if n == 19 else "Permission denied")
+    logged = []
+    monkeypatch.setattr(activity, "append", lambda state, rec: logged.append(rec))
+    assert occupancy.lower_running(p, p.db, now)["lowered"] == ["j2"]
+    occ.publish(_OccProj("streamer", p.root, {here: {"cmd": "exit 1"}}, quiet_s=0))
+    assert occupancy.lower_running(p, p.db, now + 600)["restored"] == ["j2"]
+    assert "raising it back needs privilege" in logged[-1]["errors"][0]
+
+
+def test_occupancy_detach_local_start_waits_inside_the_job(env, tmp_path, monkeypatch):
+    import argparse
+    from ttp import cli, occupancy, project
+    _occ_home(tmp_path, monkeypatch)
+    monkeypatch.setattr(occupancy, "blocks_any", lambda targets, step="test", now=None:
+                        "box-a: a live realtime stream holds it" if "box-a" in targets else "")
+    a = argparse.Namespace(remote=None, lock=["box-a"], step=None)
+    assert cli._detach_occupied(a, None) == [project.hostname(), "box-a"]
+    assert cli._detach_occupied(argparse.Namespace(remote=None, lock=[], step=None), None) == []
+    with pytest.raises(SystemExit) as ex:   # a --remote start on a held box is still not started
+        cli._detach_occupied(argparse.Namespace(remote="box-a", lock=[], step=None), None)
+    assert ex.value.code == 75
+    argv = cli._occupancy_wait_argv(["box-free"], "test", ["sh", "-c", "echo ran"])
+    assert argv[:2] == ["/bin/sh", "-c"] and "occupancy --wait --step test box-free" in argv[2]
+    r = subprocess.run(argv, env={**os.environ, "TTP_HOME": str(tmp_path / "occ-home")}, capture_output=True,
+                       text=True, timeout=60)
+    assert r.returncode == 0 and r.stdout.strip() == "ran", r
+
+
+def test_occupancy_harness_ab_cell_start_waits_for_the_box(monkeypatch, tmp_path):
+    from ttp import benchrun, cellns, occupancy
+
+    class Asked(Exception):
+        pass
+    asked = []
+    monkeypatch.setattr(cellns, "backend", lambda: "fake")
+    monkeypatch.setattr(occupancy, "wait_here", lambda step, who="", **k: asked.append((step, who)) or (_ for _ in ()).throw(Asked()))
+    with pytest.raises(Asked):
+        benchrun.run_cell(tmp_path, tmp_path / "out", {"task": "t"}, {"rep": 1, "arm": "a"}, {"arm": "a"}, {}, {})
+    assert asked == [("bench", "benchrun")]
+    asked.clear()   # a dry run starts nothing on the box: it does not wait
+    try:
+        benchrun.run_cell(tmp_path, tmp_path / "out", {"task": "t"}, {"rep": 1, "arm": "a"}, {"arm": "a"}, {"dry_run": True}, {})
+    except Exception:
+        pass
+    assert asked == []
+
+
+def test_occupancy_tbcycle_runner_trial_waits_for_its_gate(monkeypatch, tmp_path):
+    from ttp import tbcycle
+    order = []
+    monkeypatch.setattr(tbcycle, "_locked", lambda path: type("L", (), {"close": lambda self: None})())
+    cyc = {"n": 1, "tasks": ["t1"], "last_start": 0}
+    seq = iter([(cyc, "t1"), (cyc, None)])
+    monkeypatch.setattr(tbcycle, "_next", lambda cfg, home, model, now: next(seq))
+    monkeypatch.setattr(tbcycle, "settings", lambda cfg: {"cycle_h": 0})
+    monkeypatch.setattr(tbcycle, "folder", lambda: tmp_path)
+    import ttp.modelbench as mb
+    monkeypatch.setattr(mb, "home", lambda: tmp_path)
+    tbcycle.runner({}, "m", {}, trial=lambda m, t, root: order.append("trial") or {},
+                   gate=lambda: order.append("gate"), sleep=lambda s: None)
+    assert order[:2] == ["gate", "trial"], order

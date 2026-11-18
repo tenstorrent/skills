@@ -29,6 +29,10 @@ source registered for a box the answer is free and nothing changes.
 Readings are shared in ~/.tt-project/occupancy-readings.json (each source read at most every CACHE_S),
 with each source's live spans for the last HISTORY_S, which the daemon's watchdog (watch) intersects
 with this project's own jobs on the box (activity.py): an overlap posts at once at high severity.
+
+New starts wait or move (wait_free, wait_here): `ttp lock`, `ttp detach`, checks, Terminal-Bench trials
+and harness A/B cells look again every POLL_S until the box is free, or start on an allowed free host.
+Jobs already running on this host while a stream holds it are lowered, never signalled (lower_running).
 """
 from __future__ import annotations
 
@@ -37,6 +41,7 @@ import fcntl
 import json
 import os
 import re
+import sys
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -349,6 +354,52 @@ def blocks_any(targets, step: str = "test", now: float | None = None) -> str:
     return ""
 
 
+POLL_S = 15.0   # a waiting start looks again about this often (readings are shared, CACHE_S)
+
+
+def wait_free(targets, step: str = "test", *, moves=(), poll_s: float | None = None, max_wait_s: float | None = None,
+              say: Callable[[str], None] | None = None, sleep: Callable[[float], None] = time.sleep,
+              clock: Callable[[], float] = time.time) -> dict:
+    """The one gate every new start on a box asks first (`ttp lock`, `ttp detach`, checks, bench trials).
+    While a live stream holds any of `targets` for `step` (its quiet window included; a source that cannot
+    tell counts as live), the start moves to the first of `moves` (each an alias or a list of names for one
+    other host) that is free, else waits, looking again about every `poll_s`, and says each new reason
+    once. Never raises. Returns {"ok": bool, "move": <the free move's first name> or "", "waited_s",
+    "why": the last hold}; ok False only after `max_wait_s`."""
+    from . import poll_s as _poll
+    poll_s = _poll(POLL_S) if poll_s is None else poll_s
+    targets = [str(t) for t in targets if t]
+    t0, said, why = clock(), "", ""
+    while True:
+        try:
+            why = blocks_any(targets, step, clock())
+            if not why:
+                return {"ok": True, "move": "", "waited_s": clock() - t0, "why": ""}
+            for m in moves:
+                names = [m] if isinstance(m, str) else [str(x) for x in m if x]
+                if names and not blocks_any(names, step, clock()):
+                    if say:
+                        say(f"moved to {names[0]}: {why}")
+                    return {"ok": True, "move": names[0], "waited_s": clock() - t0, "why": why}
+        except Exception as e:   # never a silent pass: wait as for a source that cannot tell
+            _note_error(e)
+            why = why or f"occupancy check failed ({type(e).__name__}): counted as live"
+        if max_wait_s is not None and clock() - t0 >= max_wait_s:
+            return {"ok": False, "move": "", "waited_s": clock() - t0, "why": why}
+        if say and (same := re.sub(r", read \d\d:\d\d[^;]*", "", why)) != said:   # a new reason, not a new read time
+            say(f"waiting: {why}; looking again every {poll_s:.0f} s")
+            said = same
+        sleep(poll_s if max_wait_s is None else max(0.0, min(poll_s, max_wait_s - (clock() - t0))))
+
+
+def wait_here(step: str = "bench", who: str = "", **kw) -> dict:
+    """wait_free for a start on this host (a bench trial or cell, whose box is the host it runs on); the
+    wait line goes to stderr, prefixed with `who`."""
+    from . import project
+    kw.setdefault("say", lambda line: print(f"{who or 'ttp'}: {line}", file=sys.stderr, flush=True))
+    return wait_free([project.hostname()], step, **kw)
+
+
 def _note_error(e: Exception) -> None:
     try:
         with open(_path("occupancy-errors.log"), "a") as f:
@@ -528,6 +579,165 @@ def status_lines(db, now: float | None = None) -> list[str]:
     return [f"Occupancy: {len(fl)} job(s) here ran on a box while a live stream held it in 24 h:"] + \
            [f"  {f['alias']}: task #{f.get('task') or '?'} {f['step']} at {_clock(f['start'])} "
             f"(source of {f['source']})" for f in fl[-5:]]
+
+
+
+# --- Jobs already running while a stream is live: lowered, never killed ----------------------------------
+
+LOWERED_KEY = "occupancy_lowered"   # kv: this project's job groups lowered, with what restores each
+LOW_NICE = 19
+
+
+def _io_get(pid: int) -> str:
+    """The process's I/O class and level as ionice arguments ("2 4", "0 0"), or "" when unknown."""
+    r = boundedchild.run(["ionice", "-p", str(pid)], timeout=5)
+    out = str(r.out or "").strip() if r.rc == 0 else ""
+    m = re.match(r"(none|realtime|best-effort|idle)(?:: prio (\d+))?", out)
+    if not m:
+        return ""
+    return f"{('none', 'realtime', 'best-effort', 'idle').index(m.group(1))} {m.group(2) or 0}"
+
+
+def _io_set(pgid: int, cls_level: str) -> str:
+    """Set the group's I/O class ("3 0" idle); "" when done, else why not."""
+    cls, level = (cls_level.split() + ["0"])[:2]
+    args = ["ionice", "-c", cls] + (["-n", level] if cls in ("1", "2") else []) + ["-P", str(pgid)]
+    r = boundedchild.run(args, timeout=5)
+    return "" if r.rc == 0 else (str(r.err or "").strip()[-200:] or r.error or f"ionice exit {r.rc}")
+
+
+def _autogroup_get(pid: int) -> int | None:
+    """The session's scheduler autogroup nice (Linux, autogroup on), or None."""
+    try:
+        if Path("/proc/sys/kernel/sched_autogroup_enabled").read_text().strip() != "1":
+            return None
+        m = re.search(r"nice (-?\d+)", Path(f"/proc/{pid}/autogroup").read_text())
+        return int(m.group(1)) if m else None
+    except OSError:
+        return None
+
+
+def _autogroup_set(pid: int, nice: int) -> str:
+    """Set the session's autogroup nice; the kernel allows any non-negative value without privilege, so a
+    restore always works (it takes one change per 100 ms across the host: retried). "" when done."""
+    err = ""
+    for _ in range(10):
+        try:
+            with open(f"/proc/{pid}/autogroup", "w") as f:
+                f.write(str(nice))
+            return ""
+        except BlockingIOError:
+            err = "busy"
+            time.sleep(0.15)
+        except OSError as e:
+            return e.strerror or str(e)
+    return err
+
+
+def _nice_get(pgid: int) -> int:
+    return os.getpriority(os.PRIO_PGRP, pgid)
+
+
+def _nice_set(pgid: int, nice: int) -> str:
+    try:
+        os.setpriority(os.PRIO_PGRP, pgid, nice)
+        return ""
+    except OSError as e:
+        return e.strerror or str(e)
+
+
+def _job_group(s: dict) -> int | None:
+    """The live process group of a running detached job of this host (its wrapper leads its own session),
+    from its run's detached.json; None when unknown, gone or its pid was reused."""
+    from . import locks
+    rc = str(s.get("rcfile") or "")
+    if not rc:
+        return None
+    try:
+        jobs = json.loads((Path(rc).parent / "detached.json").read_text())
+    except (OSError, ValueError):
+        return None
+    for j in jobs if isinstance(jobs, list) else []:
+        if not isinstance(j, dict) or str(j.get("rc") or "") != rc or not j.get("pid"):
+            continue
+        pid = int(j["pid"])
+        try:
+            if os.getsid(pid) != pid or os.getpgid(pid) != pid:
+                return None
+        except OSError:
+            return None
+        if j.get("pid_start") is not None and locks.start_time(pid) != j["pid_start"]:
+            return None   # another process now has its pid
+        return pid
+    return None
+
+
+def lower_running(p, db, now: float | None = None) -> dict:
+    """The daemon's pass for this project's jobs already running on this host: while a live stream holds a
+    box on this host (its quiet window included; unknown counts as live), each running detached job's
+    process group drops to the lowest priority (autogroup nice 19 where the kernel groups by session, else
+    nice 19; I/O class idle), and once the box is free again it goes back to what it had. No signal is ever
+    sent: a job is never killed or stopped. Each change and each restore goes to the activity log
+    (ev "lowered" / "restored"). A nice the kernel lets only a privileged process raise again stays low,
+    and the restore record says so."""
+    from . import activity
+    now = time.time() if now is None else now
+    here = project.hostname()
+    lowered = db.kv(LOWERED_KEY, {})
+    out: dict[str, list] = {"lowered": [], "restored": []}
+    try:
+        from .machines import load as machines_load
+        known = machines_load()
+    except Exception:
+        known = {}
+    local = [a for a in covered() if a == here or str((known.get(a) or {}).get("hostname") or "").lower() == here.lower()]
+    why = blocks_any(local, "test", now) if local else ""
+    running = {}
+    if why:
+        recs = [r for r in activity.entries(p.state) if r.get("host") == here]
+        for s in activity.spans(recs, here):
+            if s["kind"] == "job" and s.get("state") == "running" and not s.get("machine"):
+                running[str(s["id"])] = s
+    for sid, s in running.items():
+        if sid in lowered:
+            continue
+        pgid = _job_group(s)
+        if pgid is None:
+            continue
+        from .locks import start_time
+        before = {"pgid": pgid, "nice": _nice_get(pgid), "io": _io_get(pgid), "autogroup": _autogroup_get(pgid),
+                  "pid_start": start_time(pgid)}
+        errs = [e for e in ((_autogroup_set(pgid, LOW_NICE) if before["autogroup"] is not None
+                             else _nice_set(pgid, LOW_NICE)), _io_set(pgid, "3 0")) if e]
+        lowered[sid] = {**before, "at": now, "task": s.get("task"), "job": s.get("job")}
+        activity.append(p.state, activity.base(p.name, ev="lowered", id=sid, at=now, pgid=pgid, why=why[:300],
+                                               before=before, **({"errors": errs} if errs else {})))
+        out["lowered"].append(sid)
+    for sid in [k for k in lowered if k not in running]:
+        # The box is free (or the job ended): what the job had comes back.
+        rec = lowered.pop(sid)
+        pgid = int(rec["pgid"])
+        from .locks import start_time
+        try:
+            alive = os.getpgid(pgid) == pgid and start_time(pgid) == rec.get("pid_start")
+        except OSError:
+            alive = False   # ended, or its pid is another process's now: nothing to restore
+        errs = []
+        if alive:
+            if rec.get("autogroup") is not None:
+                errs.append(_autogroup_set(pgid, int(rec["autogroup"])))
+            else:
+                e = _nice_set(pgid, int(rec["nice"]))
+                errs.append(f"nice stays {LOW_NICE}: raising it back needs privilege ({e})" if e else "")
+            if rec.get("io"):
+                errs.append(_io_set(pgid, rec["io"]))
+        errs = [e for e in errs if e]
+        activity.append(p.state, activity.base(p.name, ev="restored", id=sid, at=now, pgid=pgid,
+                                               restored={k: rec.get(k) for k in ("nice", "io", "autogroup")},
+                                               **({"errors": errs} if errs else {}), **({} if alive else {"gone": True})))
+        out["restored"].append(sid)
+    db.set_kv(LOWERED_KEY, lowered)
+    return out
 
 
 # --- Stop switch for long runners (bench, warm-up, soak): checked before each trial ---------------------

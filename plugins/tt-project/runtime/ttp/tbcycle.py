@@ -279,10 +279,15 @@ def _next(cfg: dict, home: Path, model: str, now: float) -> tuple[dict, str | No
 
 
 def runner(cfg: dict, model: str, env: dict, *, trial: Callable | None = None, sleep: Callable = time.sleep,
-           clock: Callable = time.time, stop: Callable[[], str] | None = None) -> int:
+           clock: Callable = time.time, stop: Callable[[], str] | None = None,
+           gate: Callable | None = None) -> int:
     """Run `model`'s cycle to its end, one paced trial at a time (module doc); returns trials run. `stop`
-    (benchowner.trial_stop) is asked before each trial: a reason ends the run there, the cycle kept."""
-    from . import harborslice, modelbench, modelsuite
+    (benchowner.trial_stop) is asked before each trial: a reason ends the run there, the cycle kept. Each real
+    trial first asks `ttp occupancy` for this host and waits while a live stream holds it (`gate`; an
+    injected `trial` runs nothing here, so it is gated only when `gate` is given)."""
+    from . import harborslice, modelbench, modelsuite, occupancy
+    if gate is None and trial is None:
+        gate = lambda: occupancy.wait_here("bench", "tbcycle", sleep=sleep, clock=clock)   # noqa: E731
     held = _locked(folder() / "running" / f"{harborslice.slug(model)}.lock")
     if held is None:
         return 0   # its runner is already running
@@ -299,6 +304,8 @@ def runner(cfg: dict, model: str, env: dict, *, trial: Callable | None = None, s
                 sleep(wait)
             if stop and stop():
                 return ran
+            if gate:   # a live stream on this host: the trial waits for it (occupancy.wait_free)
+                gate()
             cyc["last_start"] = clock()
             got = trial(model, task, folder() / "cycles" / str(cyc["n"]))
             modelsuite._append(folder() / "cycles" / str(cyc["n"]) / f"{harborslice.slug(model)}.jsonl",
@@ -413,7 +420,7 @@ def parity(s: dict, model: str, meta: dict, via: str, harbor: str) -> dict:
 
 def ref_runner(cfg: dict, model: str, env: dict, *, trial: Callable | None = None, clock: Callable = time.time,
                bridge: Callable | None = None, chat: Callable | None = None, sleep: Callable = time.sleep,
-               stop: Callable[[], str] | None = None) -> int:
+               stop: Callable[[], str] | None = None, gate: Callable | None = None) -> int:
     """Run `model`'s reference tasks (resuming), then book its row once; returns trials run. A booked model
     runs nothing (module doc). A bridge model gets the claude CLI's loopback server (bridge(model, effort)
     builds it), a chat model the chat endpoint's relay (chat(model)), one per trial so its server wait and
@@ -423,8 +430,10 @@ def ref_runner(cfg: dict, model: str, env: dict, *, trial: Callable | None = Non
     import shutil
     from concurrent.futures import ThreadPoolExecutor
     from threading import Event, Lock
-    from . import harborslice, modelbench, modelsuite, serverhealth
+    from . import harborslice, modelbench, modelsuite, occupancy, serverhealth
     from .project import durable_write
+    if gate is None and trial is None:   # each real trial asks `ttp occupancy` for this host first (runner)
+        gate = lambda: occupancy.wait_here("bench", "tbcycle", sleep=sleep, clock=clock)   # noqa: E731
     s = settings(cfg)
     run = s[REF]["run"]
     if any(r["model"] == model for r in reference(run)):
@@ -465,6 +474,8 @@ def ref_runner(cfg: dict, model: str, env: dict, *, trial: Callable | None = Non
         done, put, dead, halt, info = _rows(d / f"{sl}.jsonl", meta["tasks"]), Lock(), Event(), Event(), {}
 
         def attempt(t: str, n: int = 0) -> dict:
+            if gate:   # a live stream on this host: the trial waits for it (occupancy.wait_free)
+                gate()
             b = make() if make else None
             e, st, cost = env, {}, None
             if b is not None:

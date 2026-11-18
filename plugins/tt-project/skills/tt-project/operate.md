@@ -114,8 +114,9 @@
 One shared, model-free check answers whether a live realtime stream (one that needs realtime
 guarantees) holds a box: `ttp occupancy <alias> --step <step>` prints live, quiet, unknown or free,
 with each source, when it was read and when the box clears (the stream's end plus a quiet window,
-`occupancy.quiet_s`, default 60 s). Exit 0: the step may run; 75: stay off. `--wait` retries about
-every minute; `--list` shows every source registered on the host.
+`occupancy.quiet_s`, default 60 s). Exit 0: the step may run; 75: stay off. `--wait` looks again
+about every 15 s until the box is free (`--timeout` bounds it, `--also <alias>` adds boxes);
+`--list` shows every source registered on the host.
 
 - Register a source in the project that runs the stream, per machine alias, as a read-only command
   (exit 0 live, 1 none, anything else or a timeout counts as live) or a file it reads (JSON
@@ -129,6 +130,17 @@ every minute; `--list` shows every source registered on the host.
   resource (`--step`), checks and their spill, after-push deploys and `ttp upgrade`, daemon
   restarts, heal checks and their fixes, `ttp detach` jobs (`--remote`, `--remote-host`, `--lock`,
   `--step`) and device jobs. Work shared with real users through the device broker is never held.
+- A new start on a held box waits rather than failing: `ttp lock` looks again about every 15 s until
+  the quiet window passes (past `--timeout`, or half the run's stall limit, it exits 75 and the task
+  hands back `waiting` on `ttp lock --probe`); a local `ttp detach` job starts at once and waits
+  inside the job, its log saying why (`--remote` on a held box is still not started); checks spill
+  to another allowed host whose box is free, else wait; Terminal-Bench trials and harness A/B cells
+  wait before each start. A source that cannot tell counts as held, and the wait line says so.
+- Jobs already running on this host while a stream holds it are lowered, never killed or stopped:
+  the daemon drops each detached job's process group to the lowest CPU priority (autogroup nice 19,
+  else nice 19) and idle I/O, and gives back what it had once the box is free. Each change and
+  restore goes to the activity log (`lowered`, `restored`); a plain nice that only a privileged
+  process may raise again stays at 19, and the restore record says so.
 - The daemon's watchdog reads every source about once a minute and flags each job of its project
   that ran on a box while a stream (or its quiet window) held it: a high-severity post to the
   project's chat at once, kept for `ttp status` and the daily review. A source of its own that
