@@ -13,19 +13,22 @@ from __future__ import annotations
 import statistics
 import time
 
-from . import postland, rollout
+from . import postland, pushq, rollout
 
 DEFAULTS = {"failed_runs_pts": 5.0, "min_runs": 20, "land_time_x": 1.5, "cost_x": 1.3, "min_landings": 3,
             "stuck_h": 2.0, "baseline_days": 7.0, "soak_h_0": 1.0, "soak_h_1": 24.0, "max_window_h": 72.0}
-# High alerts a flag is judged on: only those of its own area (rollout.FLAGS[flag]["area"]), each a key prefix.
-# The landing-path alerts belong to the push area alone; every other flag is still judged on the generic
-# signals (failed runs, time to land, cost per landing, stuck tasks, forward reverts), which cover the landing path.
+# Alerts a flag is judged on: only those of its own area (rollout.FLAGS[flag]["area"]), each a key prefix, new
+# since the baseline. A high alert counts; the model alerts of the route area are raised low and count at any
+# severity (ALERT_ANY_SEVERITY). An area with no alert of its own is an empty tuple and is judged on the generic
+# signals alone (failed runs, time to land, cost per landing, stuck tasks, forward reverts), which cover the
+# landing path. The prefixes are the keys the runtime raises (a test checks each against the source).
+ALERT_ANY_SEVERITY = ("model-trip:", "model-demote:", "model-rank:")
 ALERT_AREAS = {
-    "push": ("push_not_landing", "push_queue_dying", "after_push_failed", "coordinator_failed", "push_tip_failing"),
-    "route": ("route", "model_", "auth_"),
-    "eta": ("eta",),
-    "device": ("device", "broker"),
-    "review": ("review", "deslop"),
+    "push": (pushq.LANDING_ALERT, pushq.BAD_TIP_ALERT, "push_queue_dying", "after_push_failed"),
+    "route": ("auth:",) + ALERT_ANY_SEVERITY,
+    "eta": (),
+    "device": (),
+    "review": (),
 }
 H = 3600.0
 
@@ -89,11 +92,14 @@ def signals(db, since: float, now: float, th: dict, area: str | None = None) -> 
         cw, cb = sum(x[1] for x in lw) / len(lw), sum(x[1] for x in lb) / len(lb)
         if cb and cw > th["cost_x"] * cb:
             fail.append(f"cost per landing ${cw:.2f} against ${cb:.2f} ({len(lw)} landings)")
-    seen = {r["key"] for r in db.q("SELECT key FROM alerts WHERE severity='high' AND raised>=? AND raised<?",
-                                   (base_a, since))}
-    for r in db.q("SELECT DISTINCT key FROM alerts WHERE severity='high' AND raised>=? AND raised<?", (since, now)):
-        if r["key"].startswith(ALERT_AREAS.get(area or "", ())) and r["key"] not in seen:
-            fail.append(f"new high alert {r['key']}")
+    prefixes = ALERT_AREAS.get(area or "", ())
+
+    def raised(a: float, b: float) -> set[str]:
+        return {r["key"] for r in db.q("SELECT DISTINCT key, severity FROM alerts WHERE raised>=? AND raised<?", (a, b))
+                if r["key"].startswith(prefixes) and (r["severity"] == "high" or r["key"].startswith(ALERT_ANY_SEVERITY))}
+    seen = raised(base_a, since)
+    for key in sorted(raised(since, now) - seen):
+        fail.append(f"new alert {key}")
     rev = db.one("SELECT COUNT(*) n FROM tasks WHERE title LIKE ? ESCAPE '\\' AND created>=? AND created<?",
                  ("Revert %" + postland.REVERT_TITLE_TAIL.replace("%", "\\%").replace("_", "\\_"), since, now))["n"]
     if rev:

@@ -168,7 +168,7 @@ def test_health_flags_a_new_high_alert_in_the_flags_area_a_forward_revert_and_a_
     p.db.x(ins, ("some_other_key", now - 5 * _RH, "high"))         # in no area
     assert rh.signals(p.db, since, now, th, area)["failing"] == []
     p.db.x(ins, ("after_push_failed", now - 4 * _RH, "high"))
-    assert rh.signals(p.db, since, now, th, area)["failing"] == ["new high alert after_push_failed"]
+    assert rh.signals(p.db, since, now, th, area)["failing"] == ["new alert after_push_failed"]
     rid = p.db.add_task("Redo #7 alone: x", "s", kind="code", origin="daemon")   # reverted before landing: routine
     assert not any("revert" in s for s in rh.signals(p.db, since, now, th, area)["failing"])
     p.db.x("DELETE FROM tasks WHERE id=?", (rid,))
@@ -327,21 +327,37 @@ def test_dispatch_leaves_a_routine_task_queued_past_the_scratch_cap_and_starts_a
     assert ordered in started and routine not in started, "work the user ordered is never held by the cap"
 
 
-def test_a_new_high_alert_votes_rollback_only_for_the_flag_in_its_own_area(env):
+def test_a_new_alert_votes_rollback_only_for_the_flag_in_its_own_area_by_the_keys_the_harness_raises(env):
     from ttp import rollout, rollout_health as rh
     p = make(env)
     th, now = rh.thresholds(None), time.time() + 60
     since = now - 24 * _RH
-    p.db.x("INSERT INTO alerts(key, raised, severity, text) VALUES('device_prewarm_failed',?,'high','x')", (now - 3 * _RH,))
-    p.db.x("INSERT INTO alerts(key, raised, severity, text) VALUES('after_push_failed',?,'high','x')", (now - 3 * _RH,))
+    ins = "INSERT INTO alerts(key, raised, severity, text) VALUES(?,?,?,'x')"
+    for key, sev in (("auth:glm", "high"), ("model-trip:glm|code", "low"), ("model-demote:m|code", "low"),
+                     ("route-model-missing:std|m", "normal"), ("after_push_failed", "high"), ("push_tip_failing", "high"),
+                     ("auth:claude", "low"), ("eta_ledger_stale", "high")):
+        p.db.x(ins, (key, now - 3 * _RH, sev))
     area = lambda flag: rollout.FLAGS[flag]["area"]
-    assert rh.signals(p.db, since, now, th, area("device_prewarm"))["failing"] == ["new high alert device_prewarm_failed"]
-    assert rh.signals(p.db, since, now, th, area("push_isolation"))["failing"] == ["new high alert after_push_failed"]
-    for other in ("eta_history", "deslop", "glm_code"):
-        assert rh.signals(p.db, since, now, th, area(other))["failing"] == [], other
+    got = lambda flag: rh.signals(p.db, since, now, th, area(flag))["failing"]
+    assert got("glm_code") == ["new alert auth:glm", "new alert model-demote:m|code", "new alert model-trip:glm|code"]
+    assert got("push_isolation") == ["new alert after_push_failed", "new alert push_tip_failing"]
+    for none in ("eta_history", "device_prewarm", "deslop"):
+        assert got(none) == [], none
     assert rh.signals(p.db, since, now, th)["failing"] == [], "no area, no alert votes"
-    rollout.set_ring(p.name, "1")
-    for flag in rollout.FLAGS:
-        assert (rh.verdict(p.db, flag, 0, [{"flag": flag, "kind": "set", "to": 1, "ts": since}], {}, now) or {}).get("failing") \
-            == {"device_prewarm": ["new high alert device_prewarm_failed"],
-                "push_isolation": ["new high alert after_push_failed"]}.get(flag, []), flag
+    p.db.x(ins, ("auth:glm", now - 100 * _RH, "high"))   # already in the baseline: not new
+    assert got("glm_code") == ["new alert model-demote:m|code", "new alert model-trip:glm|code"]
+    recs = [{"flag": "glm_code", "kind": "set", "to": 1, "ts": since}]
+    assert rh.verdict(p.db, "glm_code", 0, recs, {}, now)["failing"] == got("glm_code"), "the daemon's path judges the same"
+
+
+def test_every_alert_prefix_of_an_area_is_a_key_the_runtime_raises():
+    import re
+    from pathlib import Path
+    from ttp import rollout, rollout_health as rh
+    src = {f.name: f.read_text() for f in Path(rh.__file__).parent.glob("*.py") if f.name != "rollout_health.py"}
+    assert {a["area"] for a in rollout.FLAGS.values()} <= set(rh.ALERT_AREAS)
+    for area, prefixes in rh.ALERT_AREAS.items():
+        for pre in prefixes:
+            pat = re.compile(r"(alert\(\s*f?|_ALERT\s*=\s*)[\"']" + re.escape(pre))
+            assert any(pat.search(t) for t in src.values()), f"{area}: nothing in the runtime raises {pre!r}"
+    assert set(rh.ALERT_ANY_SEVERITY) <= set(rh.ALERT_AREAS["route"])
