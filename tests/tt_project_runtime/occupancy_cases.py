@@ -208,3 +208,38 @@ def test_occupancy_detach_stop_reaches_a_schedule_runner(env):
     finally:
         if proc.poll() is None:
             proc.kill()
+
+
+def test_occupancy_registry_drops_a_project_whose_folder_is_gone(tmp_path, monkeypatch):
+    occ = _occ_home(tmp_path, monkeypatch)
+    gone = tmp_path / "deleted-project"
+    gone.mkdir()
+    occ.publish(_OccProj("stale", gone, {"box-a": {"cmd": "exit 0"}}))
+    occ.publish(_OccProj("alive", tmp_path, {"box-b": {"cmd": "exit 1"}}))
+    assert occ.blocks("box-a", "test")   # its folder exists: the registration counts
+    gone.rmdir()
+    assert set(occ.registry()) == {"alive"}
+    assert occ.blocks("box-a", "test") == "" and not occ.check("box-a", "test", fresh=True)["sources"]
+    assert occ.check("box-b", "test", fresh=True)["sources"]   # other projects' registrations stay
+
+
+def test_occupancy_internal_error_holds_a_box_with_a_source_and_frees_the_rest(tmp_path, monkeypatch):
+    occ = _occ_home(tmp_path, monkeypatch)
+    occ.publish(_OccProj("streamer", tmp_path, {"box-a": {"cmd": "exit 1", "fronts": ["router-a"]}}))
+
+    def boom(*a, **k):
+        raise RuntimeError("internal fault")
+    monkeypatch.setattr(occ, "check", boom)
+    why = occ.blocks("box-a", "test")
+    assert why and "unknown" in why and "box-a" in why
+    assert occ.blocks("box-a-device", "bench")   # a resource on the box is held too
+    assert occ.blocks("router-a", "deploy") and occ.blocks("router-a", "restart")
+    assert occ.blocks("router-a", "test") == ""   # a front box is covered only for deploys and restarts
+    assert occ.blocks("box-other", "test") == ""   # no source registered: stays free
+    log = (occ._path("occupancy-errors.log")).read_text()
+    assert "RuntimeError: internal fault" in log
+    # a registry too broken to read still holds nothing it cannot tie to a source, and never raises
+    monkeypatch.setattr(occ, "covered", boom)
+    assert occ.blocks("box-a", "test") and occ.blocks("box-other", "test") == ""
+    occ._path(occ.SOURCES).write_text("not json")
+    assert occ.blocks("box-a", "test") == ""

@@ -136,8 +136,11 @@ def publish(p, cfg: dict | None = None) -> dict:
 
 
 def registry() -> dict:
-    """{project: {"sources", "quiet_s", "base"}} of every project on the host that registered one."""
-    return {k: v for k, v in (_load(SOURCES).get("projects") or {}).items() if isinstance(v, dict)}
+    """{project: {"sources", "quiet_s", "base"}} of every project on the host that registered one.
+    A registration whose project folder (`base`) is gone is dropped: a deleted project's stale source
+    must never hold a box for the projects that remain."""
+    return {k: v for k, v in (_load(SOURCES).get("projects") or {}).items()
+            if isinstance(v, dict) and not (v.get("base") and not os.path.exists(str(v["base"])))}
 
 
 def covered() -> dict[str, list[tuple[str, str, dict, str]]]:
@@ -298,15 +301,42 @@ def why_line(res: dict) -> str:
 
 def blocks(target: str, step: str = "test", now: float | None = None) -> str:
     """The reason `step` must not run on `target` now, or "" (free, or no source registered).
-    Never raises: a broken registry blocks nothing it cannot read, a broken source counts as live."""
+    Never raises: a broken source counts as live, and an internal error counts as unknown (held) on a
+    box that has a registered source; where none is registered it stays free."""
     if not target:
         return ""
     try:
         res = check(target, step, now)
-    except Exception as e:   # a bug here must never hold the whole harness; the watchdog still flags
+    except Exception as e:   # logged; a box with a source is held, any other box stays free
         _note_error(e)
-        return ""
+        return _error_hold(target, step)
     return res["why"] if res["blocks"] else ""
+
+
+def _error_hold(target: str, step: str) -> str:
+    """The unknown-hold reason after an internal error, or "" when no source covers `target` for `step`."""
+    try:
+        for alias, regs in covered().items():
+            if _matches(alias, target) and any(role == "stream" or step in FRONT_STEPS
+                                               for _p, _s, _src, role in regs):
+                return f"{alias}: occupancy check failed (unknown), stay off for {step} until it reads again"
+    except Exception as e:
+        _note_error(e)
+        return _error_hold_raw(target, step)
+    return ""
+
+
+def _error_hold_raw(target: str, step: str) -> str:
+    """Last resort when the registry cannot be parsed by `covered()`: a raw scan of the file."""
+    try:
+        for reg in (_load(SOURCES).get("projects") or {}).values():
+            for alias, src in (reg.get("sources") or {}).items():
+                fronts = src.get("fronts") or [] if isinstance(src, dict) else []
+                if _matches(alias, target) or (step in FRONT_STEPS and any(_matches(str(f), target) for f in fronts)):
+                    return f"{alias}: occupancy check failed (unknown), stay off for {step} until it reads again"
+    except Exception:
+        pass
+    return ""
 
 
 def blocks_any(targets, step: str = "test", now: float | None = None) -> str:
