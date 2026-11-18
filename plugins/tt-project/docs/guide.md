@@ -26,6 +26,13 @@ it printed, then sends; `--wait <seconds>` (at most 300) also waits for the answ
 sent. A failure to read replies is reported on stderr and never stops the message. `ttp listen demo
 --chat <id> --once`, printed after each say, reads the chat without sending.
 
+A project never sits inside another project's folder: `ttp new` refuses such a `--dir` (and a name already
+registered for another live project) and names `~/.tt-project/scratch/<name>` as the place for scratch and
+dry-run projects. `ttp stop`, `ttp remove` (with or without `--delete-files`) and `ttp adopt` act only on
+the named project's own folder: they refuse a folder whose `harness/project.json` names another project, a
+service unit, daemon or registry row of that name that belongs to another folder, and a parent project
+found by walking up from the current folder.
+
 ## How it works
 
 ```

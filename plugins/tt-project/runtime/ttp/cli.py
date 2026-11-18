@@ -61,6 +61,9 @@ def die(msg: str, code: int = 2) -> None:
 _HERE: Project | None = None   # the project _project_name_argv put in a command's empty name slot
 
 
+_WALKED: set[str] = set()   # the bases local_project found only by walking up from the current folder
+
+
 def local_project(name: str) -> Project | None:
     if _HERE is not None and _HERE.name == name:
         return _HERE
@@ -71,8 +74,34 @@ def local_project(name: str) -> Project | None:
     for d in [cur, *cur.parents]:
         cand = Project(d)
         if cand.exists() and cand.name == name:
+            if d != cur:
+                _WALKED.add(str(cand.base))
             return cand
     return None
+
+
+def walked_up(p: Project) -> bool:
+    """Whether p was found above the current folder rather than named: in the registry, the current
+    folder itself, or the run's own project (TTP_PROJECT). A stop or removal never acts on such a parent."""
+    if str(p.base) in _WALKED:
+        return True
+    if _HERE is None or _HERE is not p or os.environ.get("TTP_PROJECT"):
+        return False
+    try:
+        return Path.cwd().resolve() not in (Path(p.root).resolve(), Path(p.base).resolve())
+    except OSError:
+        return True
+
+
+def ensure_own(p: Project, name: str, what: str) -> None:
+    """Refuse `what` (stop, remove, adopt) of p unless p is the named project's own folder (projectremove.identity_refusal),
+    found by its name or its own folder, never a parent found by walking up."""
+    from . import projectremove
+    if walked_up(p):
+        die(f"ttp {what}: {p.name} at {p.root} was found by walking up from {Path.cwd()}; name it "
+            f"(`ttp {what} {p.name}`) or run it from {p.root}", 2)
+    if why := projectremove.identity_refusal(p, name):
+        die(f"ttp {what}: refused: {why}", 2)
 
 
 def remote_entry(name: str) -> dict | None:
@@ -849,6 +878,8 @@ def cmd_new(a) -> None:
     if a.host and not machines.names_here(a.host):   # an alias for this machine creates it here
         return new_remote(a, brief)
     root = Path(a.dir).expanduser().resolve() if a.dir else _default_root()
+    if why := new_refusal(a.name, root):
+        die(f"ttp new: refused: {why}", 2)
     p = bootstrap(root, a.name, brief, a.provider or detect_provider(), a.home_tz, a.home_from or "",
                   relayer=bool(getattr(a, "relayer", False)))
     register(a.name, {"host": hostname(), "dir": str(p.root)})
@@ -878,6 +909,36 @@ def cmd_new(a) -> None:
     print(line)
     if rc:
         sys.exit(rc)
+
+
+def scratch_dir(name: str) -> Path:
+    """Where a run's scratch or dry-run project goes: under the account's tt-project folder, outside every project."""
+    from .project import HOME_DIR
+    return HOME_DIR / "scratch" / name
+
+
+def new_refusal(name: str, root: Path) -> str:
+    """Why `ttp new <name>` at `root` is refused, else '': a project inside another project's folder (a scratch
+    project made in a worktree or a harness) shares its parents with that project, and its remove or stop could
+    resolve to it; a name registered here for another folder that still holds that project would be taken over."""
+    root = root.resolve()
+    inside = next((Project(d) for d in root.parents if Project(d).exists()), None)
+    if inside is None:
+        for other, entry in load_registry().get("projects", {}).items():
+            if isinstance(entry, dict) and entry.get("dir") and entry.get("host") in (None, hostname()):
+                o = Project(entry["dir"])
+                if o.exists() and o.root.resolve() in root.parents:
+                    inside = o
+                    break
+    if inside is not None:
+        return (f"{root} is inside project {inside.name}'s folder {inside.root}; make a scratch project outside every "
+                f"project, by default in {scratch_dir(name)} (`ttp new {name} --dir {scratch_dir(name)} --no-service`)")
+    entry = load_registry().get("projects", {}).get(name)
+    if isinstance(entry, dict) and entry.get("dir") and entry.get("host") in (None, hostname()):
+        o = Project(entry["dir"])
+        if o.exists() and o.root.resolve() != root:
+            return f"{name!r} is already registered here at {o.root}; pick another name"
+    return ""
 
 
 def hand_start_cmd(p: Project) -> str:
@@ -11216,10 +11277,29 @@ def cmd_find(a) -> None:
             f"then `ttp adopt {a.name} --host HOST --dir DIR`", 1)
 
 
+def adopt_refusal(name: str, d: str) -> str:
+    """Why adopting the folder `d` here as `name` would take over another project's name, else '': the folder's
+    project must call itself `name`, and a registry row of that name may point only at it or at a folder that
+    holds no project any more."""
+    p = Project(d)
+    if p.exists() and p.name != name:
+        return (f"the project at {p.root} calls itself {p.name!r} in its harness/project.json, not {name!r}; "
+                f"its daemon and service would act as {p.name!r}")
+    entry = load_registry().get("projects", {}).get(name)
+    if isinstance(entry, dict) and entry.get("dir") and entry.get("host") in (None, hostname()):
+        other = Project(entry["dir"])
+        if other.exists() and other.base.resolve() != p.base.resolve():
+            return (f"{name!r} is registered here at {other.root}, which still holds that project; "
+                    f"`ttp remove {name}` it first, or adopt this folder under its own name")
+    return ""
+
+
 def cmd_adopt(a) -> None:
     from . import machines
     # Another name for this machine (an alias, its FQDN) is stored as its own short name.
     host = a.host if a.host and not machines.names_here(a.host) else hostname()
+    if host == hostname() and (why := adopt_refusal(a.name, a.dir)):
+        die(f"ttp adopt: refused: {why}", 2)
     register(a.name, {"host": host, "dir": a.dir})
     print(MARKER.format(name=a.name, host=host, dir=a.dir))
 
@@ -12665,6 +12745,7 @@ def cmd_service(a) -> None:
     if a.cmd == "start":
         print(service.install(p))
     elif a.cmd == "stop":
+        ensure_own(p, a.name, "stop")
         print(stop_project(p, a.kill))
     else:
         _exit_for_restart(service.restart(p))
@@ -12691,6 +12772,7 @@ def cmd_remove(a) -> None:
     if os.environ.get("TTP_RUN_DIR") and own and Path(own).resolve() in (Path(p.base).resolve(), Path(p.root).resolve()):
         die("ttp remove: a run cannot remove its own project (its daemon is running it); a scratch project it made is fine", 2)
     from . import projectremove
+    ensure_own(p, a.name, "remove")
     if a.delete_files and (why := projectremove.delete_refusal(p)):
         die(f"ttp remove: {why}", 2)
     for ln in projectremove.remove(p, lambda: stop_project(p, True), delete=a.delete_files):

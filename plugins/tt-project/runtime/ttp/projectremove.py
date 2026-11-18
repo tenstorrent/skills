@@ -12,14 +12,84 @@ machine-wide worker record keeps counting against the others' limit), so this on
    machine-wide alert claims it holds), never by hand-editing them;
 4. unregister it (the registry row).
 
+Every step acts on the project whose own folder was named, never another one (identity_refusal): the daemon,
+service units and registry row are keyed by the project's configured name, so a folder whose harness/project.json
+carries another project's name (a scratch project built from a copied config) would otherwise stop, uninstall and
+unregister that other project. `ttp stop`, `ttp remove`, `--delete-files`, `ttp adopt` and the clean-up of a failed
+`ttp new` refuse such a folder, and a live daemon, unit or registry row of that name that belongs elsewhere.
+
 Files are deleted only with an explicit flag (`--delete-files`): the project's own tt-project folder (state, runs,
 worktrees, harness) goes, the code repository beside it stays and its git worktree records are pruned. Without the
 flag the folder stays where it is, so the project can be adopted again."""
 from __future__ import annotations
 
+import os
+import plistlib
 import shutil
 import subprocess
+import sys
 from pathlib import Path
+
+
+def _res(path) -> Path:
+    try:
+        return Path(path).resolve()
+    except OSError:
+        return Path(path)
+
+
+def unit_dir_of(text: str) -> str:
+    """The WorkingDirectory= of a systemd unit's text ('' when it has none)."""
+    return next((ln.split("=", 1)[1].strip() for ln in text.splitlines() if ln.startswith("WorkingDirectory=")), "")
+
+
+def pid_dir(pid: int) -> Path | None:
+    """The working folder of process `pid` (the daemon runs in its project's tt-project folder), or None where
+    it cannot be read (no /proc, another user's process)."""
+    try:
+        return Path(os.readlink(f"/proc/{pid}/cwd"))
+    except OSError:
+        return None
+
+
+def identity_refusal(p, name: str | None = None) -> str | None:
+    """Why stopping, removing or adopting `p` could act on another project, else None. The service units, the
+    registry row and the shared records go by p.name (its harness/project.json), so each must be p's own:
+    - `name`, the name the command was given, is p's configured name;
+    - the registry row of that name on this host points at p's folder;
+    - an installed systemd unit or launchd agent of that name runs in p's folder;
+    - the pid in p's daemon.pid, when it runs, runs in p's folder."""
+    from . import project, service
+    base = _res(p.base)
+    if name and p.name != name:
+        return (f"the folder {p.root} calls itself {p.name!r} in its harness/project.json, not {name!r}: its daemon, "
+                f"service and registry row are those of {p.name!r}, so nothing was stopped or removed")
+    entry = project.load_registry().get("projects", {}).get(p.name)
+    if isinstance(entry, dict) and entry.get("dir") and entry.get("host") in (None, project.hostname()):
+        if (other := _res(project.Project(entry["dir"]).base)) != base:
+            return (f"the registered project {p.name!r} is at {other.parent}, not {p.root}: this folder carries "
+                    f"another project's name, so nothing of {p.name!r} was stopped or removed")
+    try:
+        unit = service._unit(p)
+        wd = unit_dir_of(unit.read_text()) if unit.exists() else ""
+    except OSError:
+        wd = ""
+    if wd and _res(wd) != base:
+        return f"the service {unit.name} runs the project at {wd}, not {p.base}: it is another project's, left alone"
+    if sys.platform == "darwin":
+        try:
+            agent = service._agent(p)
+            wd = plistlib.loads(agent.read_bytes()).get("WorkingDirectory", "") if agent.exists() else ""
+        except (OSError, ValueError, AttributeError):
+            wd = ""
+        if wd and _res(wd) != base:
+            return f"the launchd agent {agent.name} runs the project at {wd}, not {p.base}: it is another project's, left alone"
+    from .daemon import _alive, _read_pid
+    pid = _read_pid(Path(p.state) / "daemon.pid")
+    if pid and pid != os.getpid() and _alive(pid) and (cwd := pid_dir(pid)) is not None and _res(cwd) != base:
+        return (f"the pid {pid} in {p.state / 'daemon.pid'} runs in {cwd}, not {p.base}: it is not this project's "
+                "daemon, so it was not signalled")
+    return None
 
 
 def pruners(p) -> list:
@@ -48,6 +118,13 @@ def delete_refusal(p) -> str | None:
         return f"{base} is not a tt-project folder with a harness"
     if base in (Path("/"), Path.home().resolve()) or base.parent == Path("/"):
         return f"{base} is too broad to delete"
+    from . import project
+    for name, entry in project.load_registry().get("projects", {}).items():
+        if not (isinstance(entry, dict) and entry.get("dir") and entry.get("host") in (None, project.hostname())):
+            continue
+        other = _res(project.Project(entry["dir"]).base)
+        if other != base and (base in other.parents or other == base.parent):
+            return f"{base} holds another registered project's folder ({name} at {other})"
     return None
 
 
@@ -59,8 +136,8 @@ def delete_files(p) -> list[str]:
         return [f"files kept: {why}"]
     base = Path(p.base)
     gone = []
-    for d in {Path(p.state), Path(p.worktrees)}:
-        if d.name.endswith(".noindex") and d.is_dir():
+    for d in {Path(p.state), Path(p.worktrees)}:   # only the project's own moved folders, beside its links
+        if d.name.endswith(".noindex") and d.is_dir() and not d.is_symlink() and _res(d).parent == _res(base):
             shutil.rmtree(d, ignore_errors=True)
     shutil.rmtree(base, ignore_errors=True)
     gone.append(f"deleted {base}")
@@ -78,9 +155,15 @@ def remove(p, stop, delete: bool = False, unregister=None) -> list[str]:
     returns its report. Returns one line per step."""
     from . import project
     lines = []
+    if why := identity_refusal(p):
+        return [f"refused: {why}"]
     lines.append(f"stopped: {stop()}")
     lines.extend(prune_shared(p))
-    (unregister or project.unregister)(p.name)
-    lines.append(f"unregistered {p.name}")
+    entry = project.load_registry().get("projects", {}).get(p.name)
+    if isinstance(entry, dict) and entry.get("dir") and _res(project.Project(entry["dir"]).base) != _res(p.base):
+        lines.append(f"registry row {p.name} points elsewhere ({entry['dir']}): kept")
+    else:
+        (unregister or project.unregister)(p.name)
+        lines.append(f"unregistered {p.name}")
     lines.extend(delete_files(p) if delete else [f"files kept in {p.base} (--delete-files removes them)"])
     return lines

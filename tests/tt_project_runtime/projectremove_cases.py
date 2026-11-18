@@ -147,3 +147,140 @@ def test_an_open_deploy_alert_closes_when_its_project_is_removed(env, tmp_path):
     assert pages == [] and not deploy.holds_behind(p.db, "scratch", t)
     assert not alerts.holds(p.db, "deploy-behind:scratch", now, t), "its alert must clear"
     db.close()
+
+
+def _pr_fake_units(monkeypatch, env, projects):
+    """Fake systemd unit files (never the host's): one per project, running in its own folder."""
+    from ttp import service
+    d = env["tmp"] / "fake-units"
+    d.mkdir(parents=True, exist_ok=True)
+    for q in projects:
+        (d / f"{service.unit_name(q)}.service").write_text(f"[Service]\nWorkingDirectory={q.base}\n")
+    monkeypatch.setattr(service, "_unit", lambda q: d / f"{service.unit_name(q)}.service")
+    return d
+
+
+def _pr_named_as(p, name):
+    """Give p's harness/project.json another project's name (a scratch project built from a copied config)."""
+    import json
+    f = p.harness / "project.json"
+    cfg = json.loads(f.read_text())
+    cfg["name"] = name
+    f.write_text(json.dumps(cfg))
+
+
+def test_removing_a_nested_project_that_carries_the_outer_ones_name_leaves_the_outer_project_alone(env, monkeypatch, capsys):
+    """The outage: a scratch project nested in another's root, its config copied from that project, was removed and
+    its remove stopped, uninstalled and unregistered the outer one. Now it is refused and nothing of the outer moves."""
+    import pytest
+    from ttp import cli, project
+    outer = make(env, "outer")
+    inner_root = outer.root / "scratch-inner"
+    inner = cli.bootstrap(inner_root, "inner", "scratch", "fake")
+    project.register("inner", {"host": "testhost", "dir": str(inner.root)})
+    _pr_named_as(inner, "outer")
+    units = _pr_fake_units(monkeypatch, env, [outer])
+    stopped = []
+    monkeypatch.setattr(cli, "stop_project", lambda proj, kill: stopped.append(proj.name) or "stopped")
+    for argv in (["remove", "inner"], ["remove", "inner", "--delete-files"], ["stop", "inner"]):
+        with pytest.raises(SystemExit) as e:
+            cli.main(argv)
+        assert e.value.code == 2 and "calls itself 'outer'" in capsys.readouterr().err, argv
+    assert stopped == [] and (units / "tt-project-outer.service").exists()
+    reg = project.load_registry()["projects"]
+    assert reg["outer"]["dir"] == str(outer.root) and "inner" in reg and inner.base.is_dir()
+
+
+def test_remove_and_stop_refuse_when_the_named_projects_unit_registry_row_or_daemon_is_anothers(env, monkeypatch, capsys):
+    import os
+    import pytest
+    from ttp import cli, project, projectremove
+    p = make(env, "scratch")
+    stopped = []
+    monkeypatch.setattr(cli, "stop_project", lambda proj, kill: stopped.append(proj.name) or "stopped")
+    elsewhere = env["tmp"] / "elsewhere" / "tt-project"
+    elsewhere.mkdir(parents=True)
+    # a unit of that name running another folder
+    from ttp import service
+    d = env["tmp"] / "units"
+    d.mkdir()
+    (d / "tt-project-scratch.service").write_text(f"[Service]\nWorkingDirectory={elsewhere}\n")
+    monkeypatch.setattr(service, "_unit", lambda q: d / f"{service.unit_name(q)}.service")
+    for argv in (["remove", "scratch"], ["stop", "scratch"]):
+        with pytest.raises(SystemExit) as e:
+            cli.main(argv)
+        assert e.value.code == 2 and "another project's, left alone" in capsys.readouterr().err
+    (d / "tt-project-scratch.service").write_text(f"[Service]\nWorkingDirectory={p.base}\n")
+    # a live pid in its daemon.pid that runs in another folder (this test process, run from elsewhere)
+    (p.state / "daemon.pid").write_text("4242\n")
+    from ttp import daemon
+    monkeypatch.setattr(daemon, "_alive", lambda pid: pid == 4242)
+    monkeypatch.setattr(projectremove, "pid_dir", lambda pid: elsewhere)
+    with pytest.raises(SystemExit):
+        cli.main(["remove", "scratch"])
+    assert "not this project's daemon" in capsys.readouterr().err
+    monkeypatch.setattr(projectremove, "pid_dir", lambda pid: p.base)
+    assert projectremove.identity_refusal(p, "scratch") is None
+    (p.state / "daemon.pid").unlink()
+    assert stopped == [] and "scratch" in project.load_registry()["projects"]
+    # removal still works for its own project, and never drops a row that points elsewhere
+    lines = projectremove.remove(p, lambda: "stopped", unregister=lambda n: stopped.append(("unreg", n)))
+    assert "unregistered scratch" in lines and ("unreg", "scratch") in stopped
+    project.register("scratch", {"host": "testhost", "dir": str(elsewhere.parent)})
+    assert "is at" in projectremove.identity_refusal(p, "scratch")
+    assert projectremove.remove(p, lambda: "stopped")[0].startswith("refused:")
+
+
+def test_stop_never_acts_on_a_parent_project_found_by_walking_up(env, monkeypatch, capsys):
+    import pytest
+    from ttp import cli
+    p = make(env, "outer")
+    sub = p.root / "some" / "scratch-dir"
+    sub.mkdir(parents=True)
+    monkeypatch.chdir(sub)
+    monkeypatch.delenv("TTP_PROJECT", raising=False)
+    monkeypatch.setattr(cli, "stop_project", lambda proj, kill: pytest.fail("stopped a parent"))
+    with pytest.raises(SystemExit) as e:
+        cli.main(["stop"])
+    assert e.value.code == 2 and "found by walking up" in capsys.readouterr().err
+    stopped = []
+    monkeypatch.setattr(cli, "stop_project", lambda proj, kill: stopped.append(proj.name) or "stopped")
+    monkeypatch.chdir(p.root)
+    cli.main(["stop"])
+    cli.main(["stop", "outer"])
+    assert stopped == ["outer", "outer"]
+
+
+def test_new_refuses_a_dir_inside_another_projects_root_and_names_the_scratch_place(env, monkeypatch, capsys):
+    import pytest
+    from ttp import cli, project
+    outer = make(env, "outer")
+    for d in (outer.root / "nested", outer.base / "harness" / "x"):
+        with pytest.raises(SystemExit) as e:
+            cli.main(["new", "glmdry", "--dir", str(d), "--no-service", "--provider", "fake"])
+        err = capsys.readouterr().err
+        assert e.value.code == 2 and "inside project outer's folder" in err and "scratch/glmdry" in err, err
+        assert not (d / "tt-project").exists()
+    assert "glmdry" not in project.load_registry()["projects"]
+    # a name registered for another live project is not taken over
+    with pytest.raises(SystemExit):
+        cli.main(["new", "outer", "--dir", str(env["tmp"] / "elsewhere"), "--no-service", "--provider", "fake"])
+    assert "already registered" in capsys.readouterr().err
+    assert project.load_registry()["projects"]["outer"]["dir"] == str(outer.root)
+    assert cli.new_refusal("glmdry", cli.scratch_dir("glmdry")) == ""
+
+
+def test_adopt_never_takes_over_another_projects_name(env, capsys):
+    import pytest
+    from ttp import cli, project
+    p = make(env, "outer")
+    other = env["tmp"] / "other"
+    with pytest.raises(SystemExit):
+        cli.main(["adopt", "outer", "--dir", str(other)])
+    assert "still holds that project" in capsys.readouterr().err
+    q = cli.bootstrap(other, "inner", "scratch", "fake")
+    _pr_named_as(q, "outer")
+    with pytest.raises(SystemExit):
+        cli.main(["adopt", "inner", "--dir", str(other)])
+    assert "calls itself 'outer'" in capsys.readouterr().err
+    assert project.load_registry()["projects"]["outer"]["dir"] == str(p.root)
