@@ -395,19 +395,15 @@ def _uses_devices(cfg: dict, alias: str, s: dict, step: str) -> bool:
     itself, or a device or reset step with no resource of another machine. Read from the span's structured
     fields, never its command: a CPU check, a test suite or a host process driving other hosts (ssh, a
     Slurm cluster, docker over ssh) is not device use."""
-    from . import checkspill
+    from . import checkspill, responsibilities
     if s.get("machine"):
         return s["machine"] == alias
     res = str(s.get("resource") or "")
     if res:
         if res == alias or res in checkspill.device_locks_of(cfg, alias):
             return True
-        return step in DEVICE_STEPS and _names_alias(alias, res)
+        return step in DEVICE_STEPS and responsibilities._names(alias, res)
     return step in DEVICE_STEPS or bool(s.get("disruptive"))
-
-
-def _names_alias(alias: str, res: str) -> bool:
-    return res == alias or res.startswith((alias + "-", alias + ":"))
 
 
 def watch(p, db, now: float | None = None, post: Callable[..., None] | None = None) -> dict:
@@ -416,8 +412,8 @@ def watch(p, db, now: float | None = None, post: Callable[..., None] | None = No
     this project that used a covered box's own devices (_uses_devices) and started while its stream was
     live or inside its quiet window (a front box: deploys and restarts only). A job that started before
     the stream went live is never flagged, nor is a record whose process is gone (activity.reap closes those
-    first, here on every pass) or whose liveness is unknown: only a live job, or one that really ended after
-    the window began, counts. Per-job flags are kept in kv for status; one alert per stream event (box plus
+    first, here on every pass); a job whose liveness is unknown (a remote one) counts by its start alone.
+    Per-job flags are kept in kv for status; one alert per stream event (box plus
     window start, kept across restarts) lists the jobs and the source's own reason, at high severity when
     the source reported a real live stream and normal when the box only counted as live because the source
     could not tell (a fail-safe hold)."""
@@ -452,11 +448,12 @@ def watch(p, db, now: float | None = None, post: Callable[..., None] | None = No
     new: dict[str, list[dict]] = {}
     recs = [r for r in activity.entries(p.state) if now - float(r.get("start") or r.get("end") or now) < HISTORY_S]
     for s in activity.spans(recs, here):
-        if s.get("state") == "unknown" or s.get("reaped"):
-            continue   # never a live process: not a job of the stream
+        if s.get("reaped"):
+            continue   # its process is gone: not a job of the stream
         sid = str(s.get("id"))
         start = float(s.get("start") or 0)
-        end = float(s["end"]) if s.get("end") is not None else now
+        # A remote job's end is known only on its host: it is unknown here, so it counts only by its start.
+        end = start if s.get("state") == "unknown" else float(s["end"]) if s.get("end") is not None else now
         for alias, regs in cov.items():
             if not activity.on_machine(alias, s, {here.lower()} if alias in local else set()):
                 continue
@@ -516,11 +513,6 @@ def event_text(fl: list[dict]) -> str:
             f"{f['source']}, {f.get('reading') or 'live'}: {why}). Jobs: {shown}{more}. "
             f"Every deploy, restart, test, benchmark, warm-up, health check or reset there must ask "
             f"`ttp occupancy {f['alias']}` first and stay off while it says so.")
-
-
-def flag_text(f: dict) -> str:
-    """One job's flag as an alert (event_text of a single job)."""
-    return event_text([f])
 
 
 def recent_flags(db, since_s: float = 86400, now: float | None = None) -> list[dict]:

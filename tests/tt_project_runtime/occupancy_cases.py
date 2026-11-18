@@ -310,7 +310,7 @@ def test_occupancy_internal_error_holds_a_box_with_a_source_and_frees_the_rest(t
 
 def test_occupancy_watchdog_never_flags_a_record_with_no_live_process(env, monkeypatch):
     """A record whose process is gone is closed (reaped) on the pass and never flagged; one whose liveness is
-    unknown (another PID namespace or host) is not flagged either; a live job of the same window is."""
+    unknown (another PID namespace or host) is not flagged for starting before the window; a job of the window is."""
     from ttp import activity, occupancy, project
     p = make(env)
     occ = _occ_home(env["home"], monkeypatch)
@@ -333,11 +333,12 @@ def test_occupancy_watchdog_never_flags_a_record_with_no_live_process(env, monke
         spans = {s["id"]: s for s in activity.spans(activity.entries(p.state), here)}
         assert spans["stale"]["state"] == "ended" and spans["stale"]["reaped"] is True
         assert spans["alive"]["state"] == "running" and spans["far"]["state"] == "unknown"
-        # a fresh pass reaps nothing more, and a job started inside the window and still alive is flagged
+        # a fresh pass reaps nothing more; a job started inside the window and still alive is flagged, and so is
+        # a job on the box from another host (unknown liveness) by its start, while the old ones are not
         activity.append(p.state, rec("new", rcfile=lock("live"), start=now + 5))
         activity.append(p.state, rec("newfar", host="elsewhere", start=now + 5))
         out = occupancy.watch(p, p.db, now + 10, None)
-        assert "reaped" not in out and sorted(f["key"].split(":")[0] for f in out["flags"]) == ["new"], out
+        assert "reaped" not in out and sorted(f["key"].split(":")[0] for f in out["flags"]) == ["new", "newfar"], out
     finally:
         live_lock.close()
 
@@ -358,3 +359,27 @@ def test_occupancy_alert_is_normal_severity_for_a_failsafe_hold_and_high_for_a_r
     # the same windows on a later pass (and after a restart, the events being kept in the database) post nothing
     occupancy.watch(p, p.db, now + 5, post)
     assert len(posts) == 2
+
+
+def test_occupancy_watchdog_flags_a_remote_job_started_inside_the_window_once(env, monkeypatch):
+    """A `ttp detach --remote <box>` job logs only its start here, so its liveness stays unknown: it is flagged
+    when it started inside the live window (once), and not when it started before the window."""
+    from ttp import activity, occupancy, project
+    p = make(env)
+    occ = _occ_home(env["home"], monkeypatch)
+    here = project.hostname()
+    occ.publish(_OccProj("streamer", p.root, {"box-a": {"cmd": "exit 0"}}, quiet_s=0))
+    now = time.time()
+    rec = lambda i, **kw: {"ev": "job", "id": i, "project": p.name, "host": here, "task": 3, "machine": "box-a",   # noqa: E731
+                           "cmd": "bench", **kw}
+    activity.append(p.state, rec("old", start=now - 600))
+    out = occupancy.watch(p, p.db, now, None)   # the stream goes live now
+    assert out["flags"] == [], out
+    activity.append(p.state, rec("new", start=now + 5))
+    activity.append(p.state, rec("other", start=now + 5, machine="box-far"))
+    posts = []
+    post = lambda key, text, sev="high": posts.append((key, text, sev))   # noqa: E731
+    for t in (10, 20):
+        out = occupancy.watch(p, p.db, now + t, post)
+        assert sorted(f["key"].split(":")[0] for f in out["flags"]) == (["new"] if t == 10 else []), out
+    assert len(posts) == 1 and "box-a" in posts[0][1] and posts[0][2] == "high"
