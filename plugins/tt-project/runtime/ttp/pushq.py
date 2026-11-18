@@ -158,7 +158,9 @@ STACK_ROWS = 12                 # the newest open rows status reads for the stac
 STACK_GIT_S = 5                 # ... each ancestry check bounded, as `ttp status` and the web app wait for it
 RATE_S = 86400                  # status counts the batches that landed approvals in this long
 ROW_RESULTS = ("pushed", "landed", "conflict", "check_failed", "requeued", "refused", "scope_held")
-AFTER_STATES = ("ok", "failed", "timeout", "killed", "skipped")
+AFTER_STATES = ("ok", "failed", "timeout", "killed", "skipped", "superseded")
+DEFAULT_RETRY_S = 300           # delivery.after_push_retry_s: how often a deferred after_push (exit 75) runs again
+DEFAULT_DEFER_ALERT_H = 24      # delivery.after_push_defer_alert_h: a deferral open this long tells the coordinator
 STATS_S = 7 * 86400            # the conflict counts `ttp push --queue` and the web app show cover this long
 INHERIT_WINDOW_S = 30 * 86400  # reviews finished this long ago at most tell which branches were rejected
 INHERIT_GIT_S = 30             # each git call of that check, bounded, as the tick waits for it
@@ -3043,10 +3045,19 @@ def _after(p: Project, b: dict, m: dict, status: str, alert: Callable, now: floa
                                "after_finalized IS NULL", (status, now, b["id"])).rowcount:
             return
         what = f"{_short(m.get('pushed_sha'))}" + (f" as {m['version']}" if m.get("version") else "")
+        since = float((m.get("after_deferred") or {}).get("deferred_since") or 0)
         if status == "ok":
             took = (float(ap.get("ended") or 0) - float(ap.get("started") or 0)) if ap.get("ended") else None
-            _event(db, None, "after_push_ok", f"after_push of {what} (batch {b['id']}) succeeded"
-                                              + (f" in {took:.0f} s" if took and took > 0 else ""), queued=False)
+            if since:    # the one closing event of a deferral episode
+                _event(db, None, "after_push_ok", f"deploy done after deferral: after_push of {what} (batch {b['id']}) "
+                       f"succeeded, {_age(max(0.0, now - since))} after it was first deferred", queued=False, severity="low")
+            else:
+                _event(db, None, "after_push_ok", f"after_push of {what} (batch {b['id']}) succeeded"
+                                                  + (f" in {took:.0f} s" if took and took > 0 else ""), queued=False)
+        elif status == "superseded":
+            _event(db, None, "after_push_superseded", f"the deferred after_push of {what} (batch {b['id']}) will not "
+                   f"run again: {ap.get('by') or 'a newer push'}'s after_push of {b['target']} replaces it",
+                   queued=False, severity="low")
         elif status in ("failed", "timeout", "killed"):
             tail = _tail_of(m, ap)
             how = {"failed": f"failed (exit {ap.get('exit')})", "timeout": "timed out",
@@ -3087,7 +3098,7 @@ def _cycle_held(p: Project, cfg: dict | None) -> str:
     return cyclenotice.line(h, p) if h else ""
 
 
-def _resume(p: Project, b: dict, marker: Path, now: float, free: bool = False) -> bool:
+def _resume(p: Project, b: dict, marker: Path, now: float, free: bool = False, deferred: bool = False) -> bool:
     """Run the after_push of a batch whose process died in it once more: the same
     `ttp push --batch <marker>`, which resumes at after_push since the marker has an outcome. It holds
     the batch's after_push lock (not `push:`, so upgrades do not wait for it), passed down as at the
@@ -3106,12 +3117,15 @@ def _resume(p: Project, b: dict, marker: Path, now: float, free: bool = False) -
         m = _read(marker)
         for k in ("after_held", "held_said"):
             m.pop(k, None)
+        if deferred:     # its deferred outcome goes, so the batch runs after_push again (batch._resume)
+            m.pop("after_push", None)
         m.update(lock=str(lock_path), phase="after_push", resumed=now)
         write_json(marker, m)
         child = _spawn(p, b["id"], marker, lock)
         child.stdin.close()
-        _event(db, None, "after_push_resumed", f"push batch {b['id']}: its after_push stopped before it finished "
-                                               f"(a reboot?); running it once more", queued=False)
+        if not deferred:    # a deferral's retries make no event each: its episode has one (_tell_deferral)
+            _event(db, None, "after_push_resumed", f"push batch {b['id']}: its after_push stopped before it finished "
+                                                   f"(a reboot?); running it once more", queued=False)
     finally:
         lock.close()
     return True
@@ -3124,6 +3138,79 @@ def _note_after_push(p: Project, cfg: dict | None) -> None:
     off = not _after_push_set(p, cfg)
     if bool(p.db.kv(AFTER_PUSH_OFF)) != off:
         p.db.set_kv(AFTER_PUSH_OFF, off)
+
+
+def _retry_s(p: Project, cfg: dict | None = None) -> float:
+    return _num(_delivery(p, cfg).get("after_push_retry_s"), DEFAULT_RETRY_S, float, 60)
+
+
+def _tell_deferral(p: Project, ep: dict, what: str, ap: dict, now: float, cfg: dict | None = None) -> bool:
+    """A deferred after_push (exit 75: the deploy stayed off a busy box) is not a failure: one normal
+    after_push_deferred event per deferral episode, never per retry, and one coordinator event once it stays
+    open past delivery.after_push_defer_alert_h. `ep` (the receipt, or a batch marker's after_deferred)
+    records both. Whether `ep` changed."""
+    changed = False
+    reason = str(ap.get("reason") or "deploy deferred")
+    if not ep.get("deferred_said"):
+        _event(p.db, None, "after_push_deferred", f"{reason} (after_push of {what}). The push stands; the deploy "
+               f"runs again every {_age(_retry_s(p, cfg))} until the box is free", queued=False)
+        ep["deferred_said"] = now
+        changed = True
+    limit = _num(_delivery(p, cfg).get("after_push_defer_alert_h"), DEFAULT_DEFER_ALERT_H, float, 0) * 3600
+    since = float(ep.get("deferred_since") or now)
+    if limit and not ep.get("deferred_long_said") and now - since >= limit:
+        _event(p.db, None, "after_push_deferred_long", f"after_push of {what} is still deferred after "
+               f"{_age(now - since)}: {reason}. The push stands and the daemon keeps retrying; nothing failed",
+               queued=True)
+        ep["deferred_long_said"] = now
+        changed = True
+    return changed
+
+
+def _tend_deferred(p: Project, folder: Path, receipt: Path, rid: str, m: dict, now: float) -> bool:
+    """An ordinary push's deferred after_push (receipt status deferred): replaced by a newer push of its
+    target (reported, never run again), else told once and run again every delivery.after_push_retry_s,
+    model-free, until it ends otherwise. The receipt keeps it all, so a daemon restart keeps the retry.
+    Whether it was reported."""
+    ap = m.get("after_push") if isinstance(m.get("after_push"), dict) else {}
+    what = _short(m.get("pushed_sha")) + f" to {m.get('target') or '?'}"
+    if newer := _newer_deploy(p, folder, m):
+        m.update(status="finished", ended=now, reported=now, after_push={
+            **ap, "status": "superseded", "by": newer,
+            "tail": f"deferred; {newer}'s after_push deploys a newer push of {m.get('target')}"})
+        _event(p.db, None, "after_push_superseded", f"the deferred after_push of {what} will not run again: "
+               f"{newer}'s after_push of {m.get('target') or '?'} replaces it", queued=False, severity="low")
+        write_json(receipt, m)
+        return True
+    if _tell_deferral(p, m, what, ap, now):
+        write_json(receipt, m)
+    due = float(ap.get("ended") or m.get("deferred_since") or 0) + _retry_s(p)
+    if now >= due and not _cycle_held(p, None):
+        _rerun_receipt(p, receipt, rid, now)
+    return False
+
+
+def _tend_deferred_batch(p: Project, b: dict, marker: Path, m: dict, cfg: dict | None, alert: Callable,
+                         now: float) -> bool:
+    """A push batch's deferred after_push, as _tend_deferred: the marker's after_deferred keeps the episode;
+    a retry resumes the batch at after_push without spending a resume. Whether it changed anything."""
+    ap = m.get("after_push") if isinstance(m.get("after_push"), dict) else {}
+    if newer := _newer_deploy(p, p.state / batch.RECEIPTS, {"target": b["target"], "started": b["started"]},
+                              batch=b["id"]):
+        _after(p, b, {**m, "after_push": {**ap, "status": "superseded", "by": newer}}, "superseded", alert, now)
+        return True
+    ep = dict(m.get("after_deferred") or {})
+    ep.setdefault("deferred_since", ap.get("ended") or now)
+    what = _short(m.get("pushed_sha")) + (f" as {m['version']}" if m.get("version") else "") + f" (batch {b['id']})"
+    told = _tell_deferral(p, ep, what, ap, now, cfg)
+    if ep != m.get("after_deferred"):
+        m = {**m, "after_deferred": ep}
+        write_json(marker, m)
+    if b["after_push"] != "deferred":   # status reads 'deploy deferred' while it waits (not finalized)
+        p.db.x("UPDATE push_batches SET after_push='deferred' WHERE id=? AND after_finalized IS NULL", (b["id"],))
+    if now >= float(ap.get("ended") or 0) + _retry_s(p, cfg) and not _cycle_held(p, cfg):
+        return _resume(p, b, marker, now, free=True, deferred=True) or told
+    return told
 
 
 def tend_receipts(p: Project, alert: Callable = lambda *a, **k: None, now: float | None = None) -> list[str]:
@@ -3143,6 +3230,10 @@ def tend_receipts(p: Project, alert: Callable = lambda *a, **k: None, now: float
                 receipt.unlink(missing_ok=True)
             continue
         rid = str(m.get("id") or receipt.stem)
+        if m.get("status") == "deferred":    # not a failure: retried until it ends otherwise or is replaced
+            if _tend_deferred(p, folder, receipt, rid, m, now):
+                done.append(rid)
+            continue
         if m.get("status") == "rerun" and float(m.get("rerun_at") or 0) <= now - RERUN_START_S \
                 and int(m.get("tries") or 0) >= MAX_RESUMES:
             m["status"] = "running"     # its rerun never got going: reported below as stopped
@@ -3176,7 +3267,12 @@ def tend_receipts(p: Project, alert: Callable = lambda *a, **k: None, now: float
         status = str(ap.get("status") or "failed")
         what = _short(m.get("pushed_sha")) + f" to {m.get('target') or '?'}" + (
             f" (task #{m['task']})" if m.get("task") else "")
-        if status == "ok":
+        if status == "ok" and m.get("deferred_since"):    # the one closing event of a deferral episode
+            _event(p.db, None, "after_push_ok", f"deploy done after deferral: after_push of {what} succeeded, "
+                   f"{_age(max(0.0, now - float(m['deferred_since'])))} after it was first deferred",
+                   queued=False, severity="low")
+            p.db.set_kv(AFTER_PUSH_OK, max(now, time.time()))
+        elif status == "ok":
             took = float(ap.get("ended") or 0) - float(ap.get("started") or 0)
             _event(p.db, None, "after_push_ok", f"after_push of {what} succeeded"
                                                 + (f" in {took:.0f} s" if took > 0 else ""), queued=False)
@@ -3196,7 +3292,7 @@ def tend_receipts(p: Project, alert: Callable = lambda *a, **k: None, now: float
     return done
 
 
-def _newer_deploy(p: Project, folder: Path, m: dict) -> str:
+def _newer_deploy(p: Project, folder: Path, m: dict, batch: str | None = None) -> str:
     """What replaced the stopped after_push of receipt `m`: a newer ordinary push's after_push of the same
     target that has started (its receipt, unless held), or a push batch that pushed to it since; else ""."""
     target, started = m.get("target"), float(m.get("started") or 0)
@@ -3209,7 +3305,7 @@ def _newer_deploy(p: Project, folder: Path, m: dict) -> str:
             return f"push {_short(o.get('pushed_sha'))}"
     try:
         row = p.db.one("SELECT id FROM push_batches WHERE target=? AND outcome='pushed' AND COALESCE(ended, started)>? "
-                       "ORDER BY started DESC LIMIT 1", (target, started))
+                       "AND id IS NOT ? ORDER BY started DESC LIMIT 1", (target, started, batch))
     except Exception:
         row = None
     return f"push batch {row['id']}" if row else ""
@@ -3223,6 +3319,7 @@ def _rerun_receipt(p: Project, receipt: Path, rid: str, now: float) -> None:
         return
     if m.get("status") == "rerun" and float(m.get("rerun_at") or 0) > now - RERUN_START_S:
         return          # its process is starting (or another tick started it): not twice
+    deferred = m.get("status") == "deferred"
     if m.get("status") in ("running", "rerun"):
         m["tries"] = int(m.get("tries") or 0) + 1
         why = "a reboot cut it short" if m.get("boot") and not runner.same_boot(m.get("boot")) else \
@@ -3230,6 +3327,8 @@ def _rerun_receipt(p: Project, receipt: Path, rid: str, now: float) -> None:
     else:
         why = "the power-cycle notice it waited for is gone" if m.get("status") == "held" else "its rerun did not start"
     m.update(status="rerun", rerun_at=now)
+    if deferred:
+        m.pop("after_push", None)    # the retry records its own outcome (batch.record_after)
     write_json(receipt, m)
     try:
         with open(receipt.with_suffix(".log"), "ab") as out:
@@ -3242,8 +3341,9 @@ def _rerun_receipt(p: Project, receipt: Path, rid: str, now: float) -> None:
         _event(p.db, None, "after_push_failed", f"after_push of {_short(m.get('pushed_sha'))} could not run again: "
                                                 f"{e}", queued=True, severity="high")
         return
-    _event(p.db, None, "after_push_resumed", f"after_push of {_short(m.get('pushed_sha'))}: running it again "
-                                             f"({why})", queued=False)
+    if not deferred:    # a deferral's retries make no event each: its episode has one (_tell_deferral)
+        _event(p.db, None, "after_push_resumed", f"after_push of {_short(m.get('pushed_sha'))}: running it again "
+                                                 f"({why})", queued=False)
 
 
 def finalize(p: Project, cfg: dict | None = None, alert: Callable = lambda *a, **k: None,
@@ -3288,6 +3388,10 @@ def finalize(p: Project, cfg: dict | None = None, alert: Callable = lambda *a, *
             if b["after_finalized"] is not None:
                 continue
         ap = m.get("after_push") if isinstance(m.get("after_push"), dict) else {}
+        if ap.get("status") == "deferred" and not live:   # retried, not finalized (_tend_deferred_batch)
+            if _tend_deferred_batch(p, b, marker, m, cfg, alert, now_) and b["id"] not in changed:
+                changed.append(b["id"])
+            continue
         status = ap.get("status") if ap.get("status") in AFTER_STATES else None
         if m.get("phase") == "finished" or (status and not live):
             _after(p, b, m, status or "skipped", alert, now_)
@@ -3618,7 +3722,8 @@ OUTCOME_WORDS = {"pushed": "pushed", "landed": "already on the branch", "nothing
                  "script_torn": "held: a script outside the change was rewritten as its check ran",
                  "setup_fault": "held: a check failed before any test ran (setup or pool)"}
 AFTER_WORDS = {"ok": "deploy ok", "failed": "deploy failed", "timeout": "deploy timed out",
-               "killed": "deploy cut short", "skipped": "no deploy"}
+               "killed": "deploy cut short", "skipped": "no deploy", "deferred": "deploy deferred",
+               "superseded": "deploy superseded"}
 
 
 def _age(s: float) -> str:

@@ -534,6 +534,8 @@ USER_SETTABLE = {
     "delivery.after_push": lambda v: push.checks_of(v),
     "delivery.after_push_timeout_s": lambda v: push_queue_number("after_push_timeout_s", v),
     "delivery.deploy_restart_wait_s": lambda v: push_queue_number("deploy_restart_wait_s", v),
+    "delivery.after_push_retry_s": lambda v: push_queue_number("after_push_retry_s", v),
+    "delivery.after_push_defer_alert_h": lambda v: push_queue_number("after_push_defer_alert_h", v),
     # A git remote each finished code task's branch is backed up to, fast-forward only; "" turns it off.
     "delivery.backup_remote": lambda v: _backup_remote(v),
     # Branches each push also fast-forwards to the pushed commit (e.g. a 'last best' main); [] turns it off.

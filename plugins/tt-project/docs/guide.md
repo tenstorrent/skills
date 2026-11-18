@@ -3696,7 +3696,17 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   commit; empty without `version_bump`), `TTP_PUSH_TARGET`, `TTP_PUSH_TASKS`, `TTP_PUSH_BATCH` and
   `TTP_PROJECT` set. A failed `after_push` alerts the coordinator but never fails the reviews:
   their change is already on the branch. A malformed `after_push` (a scalar such as `true`) counts
-  as a failed one. After setup and upgrades, use `ttp deployed "$TTP_PUSHED_VERSION"
+  as a failed one. An `after_push` that exits 75 deferred the deploy (for example, a box it must
+  keep off is busy with a live stream) and is not a failure: its last line starting `after_push:
+  deploy deferred:` is the reason; the push records it as `deploy deferred`, raises one normal
+  `after_push_deferred` event per deferral (no alert, nothing high), and the daemon runs it again,
+  model-free, every `delivery.after_push_retry_s` (default 300, at least 60) until it exits
+  otherwise. The retry is kept on disk (the receipt, or the batch's marker), so it survives a
+  daemon restart; a newer push of the same branch replaces it (one low `after_push_superseded`
+  event). A retry that succeeds ends it with one low `deploy done after deferral` event; any other
+  non-zero exit fails as above. A deferral still open after `delivery.after_push_defer_alert_h`
+  (default 24; 0 never) raises one normal `after_push_deferred_long` event for the coordinator.
+  After setup and upgrades, use `ttp deployed "$TTP_PUSHED_VERSION"
   --commit "$TTP_PUSHED_SHA" --after-push` as the final verification (after allowing new
   daemons to complete their first tick). This mode returns 0 for done or pending, and 1 for
   failed. A pending merge needs a live daemon, a harness task owner and a known takeover

@@ -3755,6 +3755,10 @@ def after_push(p: Project, marker: Path, m: dict) -> dict:
                 say(f"after_push: {cmd} ran past {timeout:.0f} s; killed")
                 out.update(status="timeout", exit=None, cmd=cmd)
                 break
+            if rc == push.DEFERRED_RC:    # it kept the deploy off a busy box: retried later (pushq.tend_deferred)
+                out.update(status="deferred", exit=rc, cmd=cmd, reason=deferred_reason(tail))
+                say(f"after_push: {cmd} deferred the deploy: {out['reason']}")
+                break
             if rc != 0:
                 say(f"after_push: {cmd} failed (exit {rc})")
                 out.update(status="failed", exit=rc, cmd=cmd)
@@ -3765,6 +3769,29 @@ def after_push(p: Project, marker: Path, m: dict) -> dict:
     if out["status"] == "ok":
         say("after_push: done")
     return out
+
+
+DEFERRED_LINE = "after_push: deploy deferred:"   # the line a deferring after_push prints its reason on
+
+
+def deferred_reason(tail: str) -> str:
+    """Why an after_push deferred its deploy (exit 75): its last `after_push: deploy deferred: <why>` line,
+    else the last line it printed."""
+    lines = [ln.strip() for ln in str(tail or "").splitlines() if ln.strip()]
+    for ln in reversed(lines):
+        if ln.startswith(DEFERRED_LINE):
+            return "deploy deferred: " + ln[len(DEFERRED_LINE):].strip()
+    return f"deploy deferred: {lines[-1][:300]}" if lines else "deploy deferred"
+
+
+def record_after(m: dict, after: dict) -> None:
+    """Write an ordinary push's after_push outcome into its receipt `m`: a deferred one leaves the receipt
+    open (status deferred) for the daemon's retry, keeping when the deferral began; any other closes it."""
+    if isinstance(after, dict) and after.get("status") == "deferred":
+        m.update(after_push=after, status="deferred",
+                 deferred_since=m.get("deferred_since") or after.get("ended") or time.time())
+    else:
+        m.update(after_push=after, status="finished", ended=time.time())
 
 
 RECEIPTS = "after_push"   # under the project's state: one receipt per after_push of an ordinary push
@@ -3808,7 +3835,7 @@ def after_ordinary_push(p: Project, repo: Path, sha: str, target: str, tip: str 
             say(f"after_push: {type(e).__name__}: {e}")
             after = {"status": "failed", "exit": None, "cmd": None, "tail": f"{type(e).__name__}: {e}",
                      "started": m["started"], "ended": time.time()}
-        m.update(after_push=after, status="finished", ended=time.time())
+        record_after(m, after)
         write_json(receipt, m)     # before the lock goes: running with a free lock reads as killed
     finally:
         if lock is not None:
@@ -3857,7 +3884,7 @@ def _run_detached(p: Project, receipt: Path, log: Path, lock) -> dict | None:
     except OSError:
         proc.wait()
     m = push._read(receipt)
-    if m.get("status") == "finished" and isinstance(m.get("after_push"), dict):
+    if m.get("status") in ("finished", "deferred") and isinstance(m.get("after_push"), dict):
         return m["after_push"]
     return {"status": "killed", "exit": proc.returncode, "cmd": None, "started": m.get("started"), "ended": time.time(),
             "tail": f"its after_push process ended (exit {proc.returncode}) before it recorded an outcome"}
@@ -3921,7 +3948,7 @@ def rerun_receipt(p: Project, receipt, first: bool = False) -> int:
             say(f"after_push: {type(e).__name__}: {e}")
             after = {"status": "failed", "exit": None, "cmd": None, "tail": f"{type(e).__name__}: {e}",
                      "started": m.get("resumed") or m.get("started"), "ended": time.time()}
-        m.update(after_push=after, status="finished", ended=time.time())
+        record_after(m, after)
         write_json(receipt, m)     # before the lock goes: running with a free lock reads as killed
     finally:
         lock.close()

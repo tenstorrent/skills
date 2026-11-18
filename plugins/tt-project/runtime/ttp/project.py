@@ -839,7 +839,7 @@ EXTRA_KEYS = {
                  "push_setup_fault_escalate_after", "after_push",
                  "push_solo_paths", "push_cap_tests", "push_entry_checks", "push_rerun_s", "push_hard_tests", "mechanical_merge_paths",
                  "after_push_timeout_s", "backup_remote", "fast_forward_also", "mirror_remotes",
-                 "allow_protected_push_branch", "own_push", "own_push_remote", "own_push_reserved_lane", "deploy_restart_wait_s", "plugin_version_guard",
+                 "allow_protected_push_branch", "own_push", "own_push_remote", "own_push_reserved_lane", "deploy_restart_wait_s", "after_push_retry_s", "after_push_defer_alert_h", "plugin_version_guard",
                  "checks_fast_globs", "checks_fast_exclude",   # these two: `ttp checks` fast path (push.FAST_GLOBS),
                  "checks_targeted", "checks_targeted_always",   # a task's `ttp checks` runs the tests its diff reaches (testpick)
                  "task_checks",   # a task's own `ttp checks` list (testpick.task_set); unset: the push checks
@@ -1178,6 +1178,9 @@ def approved_heads_may_push(cfg: dict) -> bool:
 # push_age_s: an approval sorts one priority better per this many seconds waited, never past priority 2
 # (pushq._approved; 0 = off), so a stream of priority 1-2 approvals cannot starve a routine one.
 # and then runs after_push (commands like push_checks), killed after after_push_timeout_s.
+# after_push_retry_s: an after_push that exits 75 deferred its deploy (a box it keeps off is busy); the
+# daemon runs it again this often until it ends otherwise or a newer push replaces it (pushq.tend_deferred);
+# after_push_defer_alert_h: a deferral still open this long tells the coordinator once (0 = never).
 # push_landing_alert_h: approvals waiting this long with nothing landed raise a high alert (0 = off).
 # push_script_torn_escalate_after: batches held script_torn on one check this many times in a row raise a
 # high alert (pushq._held_told; 0 = off); push_setup_fault_escalate_after: the same for batches held
@@ -1186,14 +1189,16 @@ PUSH_QUEUE_DEFAULTS = {"push_queue": False, "push_batch_s": 300, "push_batch_max
                        "push_age_s": 14400,
                        "push_landing_alert_h": 4, "push_script_torn_escalate_after": 3,
                        "push_setup_fault_escalate_after": 3,
-                       "after_push_timeout_s": 1800, "deploy_restart_wait_s": 900}
+                       "after_push_timeout_s": 1800, "deploy_restart_wait_s": 900,
+                       "after_push_retry_s": 300, "after_push_defer_alert_h": 24}
 # key: (minimum, whether the minimum itself is allowed, whole numbers only)
 PUSH_QUEUE_NUMBERS = {"push_batch_s": (0, True, False), "push_batch_max": (1, True, True),
                       "push_min_gap_s": (0, True, False), "push_age_s": (0, True, False),
                       "push_landing_alert_h": (0, True, False),
                       "push_script_torn_escalate_after": (0, True, True),
                       "push_setup_fault_escalate_after": (0, True, True),
-                      "after_push_timeout_s": (0, False, False), "deploy_restart_wait_s": (0, True, False)}
+                      "after_push_timeout_s": (0, False, False), "deploy_restart_wait_s": (0, True, False),
+                      "after_push_retry_s": (60, True, False), "after_push_defer_alert_h": (0, True, False)}
 
 
 def push_queue_number(key: str, v: Any) -> float | int:

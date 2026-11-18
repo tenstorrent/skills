@@ -65,6 +65,7 @@ from .testpick import TASK_KEY
 # Exit codes, distinct so a worker can say why it did not push. BUSY: another push to the same
 # branch kept the lock past `delivery.push_wait_s`; the task hands back `waiting`.
 REFUSED, CONFLICT, CHECKS_FAILED, KEPT_MOVING, REJECTED, BUSY = 2, 3, 4, 5, 6, 75
+DEFERRED_RC = 75   # delivery.after_push's exit for 'deploy deferred' (a box it must keep off is busy): retried
 DEFAULT_ROUNDS = 3
 DEFAULT_WAIT_S = 900       # the lock wait with no measured check run, and its floor otherwise
 WAIT_MARGIN_S = 60          # on top of two check runs: the holder may start over once
@@ -5426,7 +5427,9 @@ def run_after(p: Project, repo: Path) -> dict | None:
     except Exception as e:   # never changes what the push did
         out = {"status": "failed", "exit": None, "tail": f"{type(e).__name__}: {e}"}
         print(f"ttp push: after_push: {type(e).__name__}: {e}", file=sys.stderr)
-    if out and out.get("status") != "ok":
+    if out and out.get("status") == "deferred":
+        print(f"ttp push: {after_words(out)}; the push stands", file=sys.stderr)
+    elif out and out.get("status") != "ok":
         print(f"ttp push: warning: {after_words(out)}; the push stands", file=sys.stderr)
     return out
 
@@ -5442,6 +5445,9 @@ pending_after: tuple[str, str, str] | None = None   # (sha, target, tip) whose a
 
 def after_words(a: dict) -> str:
     """An after_push outcome in a few words: `after_push ok`, `after_push failed (exit 2) in <cmd>`."""
+    if a.get("status") == "deferred":   # not a failure: the daemon runs it again once the box is free
+        return f"after_push {a.get('reason') or 'deploy deferred'}; it retries by itself" + (
+            f" (receipt {a['receipt']})" if a.get("receipt") else "")
     how = {"failed": f"failed (exit {a.get('exit')})", "timeout": "timed out"}.get(a.get("status"), a.get("status"))
     return f"after_push {how}" + (f" in `{a['cmd']}`" if a.get("cmd") and a.get("status") != "ok" else "") + (
         f" (receipt {a['receipt']})" if a.get("receipt") and a.get("status") != "ok" else "")
@@ -6233,6 +6239,8 @@ def result(marker: Path, pushed_only: bool = False) -> int:
             print("ttp push: warning: after_push stopped before it finished; the push stands")
         elif a.get("status") == "ok":
             print("ttp push: after_push ok")
+        elif a.get("status") == "deferred":
+            print(f"ttp push: {after_words(a)}; the push stands")
         elif a.get("status") and a.get("status") != "skipped":
             print(f"ttp push: warning: {after_words(a)}; the push stands")
     else:
