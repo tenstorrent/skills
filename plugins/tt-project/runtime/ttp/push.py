@@ -54,6 +54,7 @@ from . import (checkcap, checkdirs, checkspill, checkwait, checklane, cleantree,
 from . import __version__
 from .budget import DOC_SUFFIXES, task_default_usd
 from .db import continues_id, dependency_ids, load_result
+from .liveness import pid_ns
 from .project import (Project, approved_heads_may_push, code_tasks_may_push, durable_append, durable_write, git_fsync_env, hostname,
                       load_registry, nice_level, open_append_or_null, own_creates_pr_branch, own_push, push_queue_on,
                       rebase_replace, renice, write_json)
@@ -498,7 +499,7 @@ def harness_plan_problem(cmd: str) -> str | None:
     if (opts.get("--purpose") != "harness" or len(opts) != 3 or "--definition-path" not in opts
             or not ("--definition-at-head" in opts
                     or pinned and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", pinned))
-            or not _inside(opts["--definition-path"])):
+            or not _repo_relative(opts["--definition-path"])):
         return want
     return None
 
@@ -590,11 +591,6 @@ def _adds_nothing(repo: Path, base: str, head: str) -> bool:
         return True
     ahead = _git(repo, "rev-list", "--count", f"{base}..{head}")
     return ahead.returncode != 0 or ahead.stdout.strip() == "0"
-
-
-def _tail(text: str) -> str:
-    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
-    return lines[-1] if lines else ""
 
 
 def _exists_reason(repo: Path, head: str, check: Check) -> str | None:
@@ -1699,13 +1695,13 @@ def _form_problem(c: dict) -> str | None:
         return (f"{c!r}: unknown key(s) {', '.join(extra)}; a check object takes only run, if_exists, if_changed, "
                 "purpose, host, env, sandbox, cwd, silent_s, ignore_paths, pytest, spill and spill_wrap_cmd")
     cond = c.get("if_exists")
-    if cond is not None and not _inside(cond):
+    if cond is not None and not _repo_relative(cond):
         return f"{c!r}: if_exists must be a path or glob inside the repository"
     cond = c.get("if_changed")
-    if cond is not None and not (_inside(cond) or (isinstance(cond, list) and cond and all(map(_inside, cond)))):
+    if cond is not None and not (_repo_relative(cond) or (isinstance(cond, list) and cond and all(map(_repo_relative, cond)))):
         return f"{c!r}: if_changed must be a path or glob inside the repository, or a list of them"
     cond = c.get("ignore_paths")
-    if cond is not None and not (_inside(cond) or (isinstance(cond, list) and cond and all(map(_inside, cond)))):
+    if cond is not None and not (_repo_relative(cond) or (isinstance(cond, list) and cond and all(map(_repo_relative, cond)))):
         return f"{c!r}: ignore_paths must be a path or glob inside the repository, or a list of them"
     purpose = c.get("purpose")
     if purpose is not None and purpose not in PURPOSES:
@@ -1736,7 +1732,7 @@ def _form_problem(c: dict) -> str | None:
     return None
 
 
-def _inside(v: Any) -> bool:
+def _repo_relative(v: Any) -> bool:
     """`v` is a repo-relative path or glob: not empty, absolute, home-relative or leaving the repo."""
     p = v.strip() if isinstance(v, str) else ""
     norm = posixpath.normpath(p) if p else ""
@@ -2261,9 +2257,9 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
     Never a detached HEAD, main/master, the
     push branch or the branch work starts from; publish also refuses the remote's default branch.
     A notes branch (is_notes_branch) is published under its own name whatever pr_branch the task carries.
-    Another of the task's own ttp/t<id>-... branches than the one its run was given (_switched) is
+    Another of the task's own ttp/t<id>-... branches than the one its run was given (_switched_reason) is
     refused, unless the run was given a branch not its own that it was not told to deliver on
-    (_fresh): that fresh branch goes under its own name.
+    (_fresh_own_branch): that fresh branch goes under its own name.
     Another task's ttp/t<id>-... branch the task only inherited is refused (foreign_pr_branch).
     With `--own-branch` (OWN_BRANCH_ENV) the task's own checked-out ttp/t<id>-... branch is published
     under its own name, never onto a pr_branch it carries.
@@ -2275,34 +2271,24 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
         raise ValueError("--own publishes the checked-out branch, not a detached HEAD")
     m = OWN_BRANCH.fullmatch(branch)
     task = os.environ.get("TTP_TASK")
-    fresh = bool(m and task and m.group(1) == task and _fresh(p, task, branch))
+    fresh = bool(m and task and m.group(1) == task and _fresh_own_branch(p, task, branch))
     as_is = bool(m and task and m.group(1) == task and (fresh or os.environ.get(OWN_BRANCH_ENV)))
     # The branch the dispatcher built it on (delivery_source: its pr_branch or rebases: record, or the
     # one of a task it continues), as its own branch or with that branch itself checked out. Its own
     # record as written first, so an invalid one is refused below rather than skipped.
-    onto = (_pr_branch(p, task) or pr_branch_of(p, _task_row(p, task))) if task and not as_is else ""
+    onto = (_recorded_pr_branch(p, task) or pr_branch_of(p, _task_row(p, task))) if task and not as_is else ""
     notes = is_notes_branch(p, branch)   # publishes itself, never onto a pr_branch
     if task and not as_is and not notes and (named := worktree.named_branch(_task_row(p, task) or {})) in PROTECTED:
         raise ValueError(f"--own never pushes to a shared branch ({named}): this task's pr_branch or "
                          f"rebases: record names it")
-    if m and task and m.group(1) == task and not notes and not as_is and (why := _switched(p, task, branch)):
+    if m and task and m.group(1) == task and not notes and not as_is and (why := _switched_reason(p, task, branch)):
         raise ValueError(why)
     carried = bool(onto and not notes and (m and m.group(1) == task or branch == onto))
     if m and task and m.group(1) != task and not carried and not notes:
         # A review publishes the code task it covers onto that task's pr_branch, as the task would:
         # from that task's own branch, or from the pr_branch itself checked out (a task's ttp/t<id>-...
         # branch another task carries as its pr_branch, e.g. one publishing a finished task's work).
-        reviewed = _reviewed(p, task)
-        onto = next((b for t in reviewed
-                     if (b := pr_branch_of(p, t)) and (str(t["id"]) == m.group(1) or b == branch)), "")
-        # Or, from the reviewed task's own branch, onto the one branch a `pr_branch:` line of the
-        # review's own spec names (the code task carried no label; the review delivers it there).
-        # Accepted gap: a branch still checked out in a done task's kept worktree is not freed here
-        # or in worktree.py; the error names the holding worktree, and worktree retention clears it.
-        if not onto and any(str(t["id"]) == m.group(1) for t in reviewed):
-            named = {g.group("branch") for g in worktree.SPEC_PR_BRANCH.finditer(
-                str((_task_row(p, task) or {}).get("spec") or ""))}
-            onto = named.pop() if len(named) == 1 else ""
+        onto = _review_onto(p, task, m.group(1), branch)
         carried = bool(onto)
     if not carried and not notes and task and rebase_replace(p.config()) != "lease" and any(
             r and worktree.rebased_branch(r) == branch for r in [_task_row(p, task)] + _reviewed(p, task)):
@@ -2319,13 +2305,7 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
                          f"#{m.group(1)}'s branch, which this task does not carry: not pushing. If the work "
                          f"must go onto {branch}, {pr_branch_route(branch)}")
     d = p.config().get("delivery") or {}
-    remote, shared = target(p, repo) if str(d.get("push_branch") or "").strip() else ("origin", "")
-    if configured := own_push_remote(d, repo):
-        remote = configured
-    elif remote_less(repo):
-        remote = LOCAL
-    elif why := local_remote_problem(p, repo, remote):
-        raise ValueError(why)
+    remote, shared = _own_remote(p, repo, d)
     if carried and remote != LOCAL:
         remote = _pr_head(repo, branch, remote)
     if task and not notes and (why := foreign_pr_branch(p, task, branch, f"{remote}/{branch}")):
@@ -2336,10 +2316,42 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
     mine = OWN_BRANCH.fullmatch(branch)
     if carried and not (mine and mine.group(1) == task):
         local = _git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}").returncode == 0
-        if not local and not _on_remote(repo, remote, branch):
+        if not local and not _branch_on_remote(repo, remote, branch):
             raise ValueError(f"this task's pr_branch {branch} exists neither here nor on {remote}: --own "
                              f"publishes onto an existing branch only, never creates one")
     return remote, branch
+
+
+def _review_onto(p: Project, task: str, owner: str, branch: str) -> str:
+    """The branch review task `task`, on task #`owner`'s ttp/t<id>-... `branch`, publishes onto (own_target):
+    the pr_branch of the code task it covers, else the one branch its own spec's `pr_branch:` line names;
+    "" when none."""
+    reviewed = _reviewed(p, task)
+    onto = next((b for t in reviewed
+                 if (b := pr_branch_of(p, t)) and (str(t["id"]) == owner or b == branch)), "")
+    # Or, from the reviewed task's own branch, onto the one branch a `pr_branch:` line of the
+    # review's own spec names (the code task carried no label; the review delivers it there).
+    # Accepted gap: a branch still checked out in a done task's kept worktree is not freed here
+    # or in worktree.py; the error names the holding worktree, and worktree retention clears it.
+    if not onto and any(str(t["id"]) == owner for t in reviewed):
+        named = {g.group("branch") for g in worktree.SPEC_PR_BRANCH.finditer(
+            str((_task_row(p, task) or {}).get("spec") or ""))}
+        onto = named.pop() if len(named) == 1 else ""
+    return onto
+
+
+def _own_remote(p: Project, repo: Path, d: dict) -> tuple[str, str]:
+    """(remote, push branch) `ttp push --own` publishes to (own_target): delivery.own_push_remote, else the
+    push branch's remote (origin when unset); LOCAL in a repo with no remote. A remote that is someone's
+    working copy is refused (ValueError)."""
+    remote, shared = target(p, repo) if str(d.get("push_branch") or "").strip() else ("origin", "")
+    if configured := own_push_remote(d, repo):
+        remote = configured
+    elif remote_less(repo):
+        remote = LOCAL
+    elif why := local_remote_problem(p, repo, remote):
+        raise ValueError(why)
+    return remote, shared
 
 
 def _pr_head(repo: Path, branch: str, remote: str) -> str:
@@ -2410,7 +2422,7 @@ def harness_repo(p: Project | None, repo: Path) -> bool:
     return bool(mine and theirs) and Path(mine).resolve() == Path(theirs).resolve()
 
 
-def _names(k: str, paths: list[Path], name: str, p: Project | None) -> bool:
+def _key_names_repo(k: str, paths: list[Path], name: str, p: Project | None) -> bool:
     """Whether repo key `k` (not `harness`) names the repository known by `paths` and `name` (_repo_keys):
     its main checkout's folder name, or a path (absolute, ~, or relative to the project root)."""
     path, root = Path(k).expanduser(), p.root if p is not None else None
@@ -2424,7 +2436,7 @@ def repo_named(keys: list[str], repo: Path, p: Project | None = None) -> bool:
     if HARNESS_KEY in keys and harness_repo(p, repo):
         return True
     paths, name = _repo_keys(repo)
-    return any(k != HARNESS_KEY and _names(k, paths, name, p) for k in keys)
+    return any(k != HARNESS_KEY and _key_names_repo(k, paths, name, p) for k in keys)
 
 
 def repo_checks(d: dict, repo: Path, p: Project | None = None) -> tuple[Any, str]:
@@ -2441,7 +2453,7 @@ def repo_checks(d: dict, repo: Path, p: Project | None = None) -> tuple[Any, str
             return by[HARNESS_KEY], f"delivery.{BY_REPO}.{HARNESS_KEY}"
         paths, name = _repo_keys(repo)
         for k, v in by.items():
-            if k != HARNESS_KEY and _names(k, paths, name, p):
+            if k != HARNESS_KEY and _key_names_repo(k, paths, name, p):
                 return v, f"delivery.{BY_REPO}[{k!r}]"
     if harness:
         return [c.config() for c in check_list(d.get("push_checks")) if c.purpose == "harness"], HARNESS_UNSET
@@ -2521,7 +2533,7 @@ def own_push_remote(d: dict, repo: Path) -> str:
     return v
 
 
-def _local_path(url: str, repo: Path) -> Path | None:
+def _remote_local_path(url: str, repo: Path) -> Path | None:
     """The filesystem path a remote's URL names (a path or file:// URL), else None (a network remote)."""
     if url.startswith("file://"):
         return Path(unquote(url[len("file://"):]))
@@ -2553,7 +2565,7 @@ def local_remote_problem(p: Project, repo: Path, remote: str) -> str:
     another registered project's folder, i.e. someone else's copy rather than a shared remote.
     Network remotes and other local paths (e.g. a bare repo of this project's own) pass."""
     url = _git(repo, "remote", "get-url", "--push", remote).stdout.strip()
-    path = _local_path(url, repo)
+    path = _remote_local_path(url, repo)
     if path is None or not path.exists():
         return ""
     path = path.resolve()
@@ -2706,7 +2718,7 @@ def _local_tip(repo: Path, branch: str) -> str:
     return _git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}^{{commit}}").stdout.strip()
 
 
-def _holder(repo: Path, branch: str) -> str:
+def _branch_holder(repo: Path, branch: str) -> str:
     """The other worktree that has local branch `branch` checked out, or "" (none, or `repo` itself)."""
     top, cur = Path(repo).resolve(), ""
     for line in _git(repo, "worktree", "list", "--porcelain").stdout.splitlines():
@@ -2725,7 +2737,7 @@ def local_refusal(repo: Path, branch: str) -> str:
     if branch in PROTECTED:
         return f"refusing to move the local branch {branch}"
     if branch != _git(repo, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip() \
-            and (held := _holder(repo, branch)):
+            and (held := _branch_holder(repo, branch)):
         dirty = _git(Path(held), "status", "--porcelain", "--untracked-files=no")
         if dirty.returncode != 0 or dirty.stdout.strip():
             return (f"no git remote, and {branch} is checked out in another worktree ({held}) with "
@@ -2750,7 +2762,7 @@ def _move_local(repo: Path, branch: str, head: str, say: Callable[[str], None]) 
     if why := local_refusal(repo, branch):   # again: it may have changed during the checks
         say(why)
         return REJECTED
-    if held := _holder(repo, branch):
+    if held := _branch_holder(repo, branch):
         wt = Path(held)
         if _git(wt, "symbolic-ref", "--quiet", "HEAD").stdout.strip() != f"refs/heads/{branch}":
             say(f"could not move local branch {branch}: the worktree {held} no longer has it checked out")
@@ -2826,7 +2838,7 @@ def _labels(t: dict | None) -> list[str]:
         return []
 
 
-def _pr_branch(p: Project, task: str | None) -> str:
+def _recorded_pr_branch(p: Project, task: str | None) -> str:
     """The branch task `task` is recorded as delivering onto (worktree.recorded_pr_branch: its label or
     the latest `pr_branch:` line an update appended to its spec), as written, or ""."""
     t = _task_row(p, task)
@@ -2846,7 +2858,7 @@ def is_notes_branch(p: Project, branch: str) -> bool:
     return branch != (str(t.get("branch") or "") or f"ttp/t{t['id']}-{worktree.slug(str(t.get('title') or ''))}")
 
 
-def _switched(p: Project, task: str, branch: str) -> str:
+def _switched_reason(p: Project, task: str, branch: str) -> str:
     """Why `ttp push --own` must not publish the checked-out `branch`, one of task `task`'s own
     ttp/t<id>-... branches, or "": the worktree left the branch the task's run was given (its row's
     branch) for another of its own. Publishing it would push onto the task's pr_branch, or a
@@ -2855,26 +2867,26 @@ def _switched(p: Project, task: str, branch: str) -> str:
     given = str((t or {}).get("branch") or "")
     if not given or given == branch:
         return ""
-    onto = _pr_branch(p, task)
+    onto = _recorded_pr_branch(p, task)
     to = f", which it publishes onto {onto}" if onto and onto != given else ""
     return (f"this worktree has {branch} checked out, but task #{task} delivers from {given}{to}: "
             f"--own publishes neither. Switch back to {given} (bring the commits over, e.g. "
             f"`git checkout {given} && git merge --ff-only {branch}`) and rerun")
 
 
-def _fresh(p: Project, task: str, branch: str) -> bool:
+def _fresh_own_branch(p: Project, task: str, branch: str) -> bool:
     """Whether `branch`, one of task `task`'s own ttp/t<id>-... branches, is a fresh one the task made
     off a branch its run was given that is not its own and that it was not told to deliver on (e.g.
     one inherited through `continues`, when its spec asked for a new branch): neither that branch
     nor its pr_branch is named in a `pr_branch:` line of its spec, and it is no fix of a PR's
-    findings (`pr_fix:`). It publishes under its own name, never onto either, and _switched does
+    findings (`pr_fix:`). It publishes under its own name, never onto either, and _switched_reason does
     not apply."""
     t = _task_row(p, task) or {}
     given = str(t.get("branch") or "")
     mg = OWN_BRANCH.fullmatch(given)
     if not given or given == branch or (mg and mg.group(1) == task):
         return False
-    onto = _pr_branch(p, task)
+    onto = _recorded_pr_branch(p, task)
     spec = str(t.get("spec") or "")
     return not any(b and worktree.spec_names_pr_branch(spec, b) for b in (given, onto)) \
         and not any(x.startswith("pr_fix:") for x in _labels(t))
@@ -2914,7 +2926,7 @@ def _may_land(p: Project, task: str, owner: str, branch: str) -> bool:
     return owner in refs
 
 
-def _on_remote(repo: Path, remote: str, branch: str) -> bool:
+def _branch_on_remote(repo: Path, remote: str, branch: str) -> bool:
     """Whether a push to `remote` finds `branch` there, so it creates none: on each of its push URLs."""
     def has(side: str) -> bool:
         ls = _git(repo, "ls-remote", "--heads", side, f"refs/heads/{branch}")
@@ -2947,7 +2959,7 @@ def own_gate(p: Project, repo: Path, remote: str, branch: str) -> None:
         raise ValueError(f"own pushes are off in this project (delivery.own_push = off): it pushes to no "
                          f"remote branch but delivery.push_branch, so {remote}/{branch} is not pushed. Never "
                          f"publish it another way (no `git push`): {own_landing(cfg)}")
-    if mode == "existing_only" and not own_pr_branch(p, cfg, branch) and not _on_remote(repo, remote, branch):
+    if mode == "existing_only" and not own_pr_branch(p, cfg, branch) and not _branch_on_remote(repo, remote, branch):
         setting = ("delivery.own_push is unset, which reads as existing_only; only the user sets it to on"
                    if unset else "delivery.own_push = existing_only")
         raise ValueError(f"{remote} has no branch {branch}, and this project lets `ttp push --own` publish "
@@ -3046,7 +3058,7 @@ def _resolve(p: Project, repo: Path, own: bool = False) -> tuple[str, str, bool]
         raise ValueError(why)
     if not str(d.get("push_branch") or "").strip() and m and m.group(1) == task:
         remote, own_branch = own_target(p, repo)
-        if _on_remote(repo, remote, own_branch):
+        if _branch_on_remote(repo, remote, own_branch):
             print(f"ttp push: no delivery.push_branch; {remote}/{branch} is this task's own branch, "
                   f"publishing it as with --own", file=sys.stderr)
             return remote, own_branch, True
@@ -3166,7 +3178,7 @@ def untested_landing(p: Project, repo: Path, task: str, d: dict) -> str:
     head = _git(repo, "rev-parse", "HEAD").stdout.strip()
     if prguard.task_pass(p, task, head, str(repo)):
         return ""
-    own = (f" To publish the branch under its own name instead, run `ttp push --own --detach`."
+    own = (" To publish the branch under its own name instead, run `ttp push --own --detach`."
            if own_push({"delivery": d}) != "off" else "")
     return (f"task #{task} is a code task and `ttp checks` has not passed on this commit ({head[:10]}) in "
             f"this worktree with no uncommitted changes: plain `ttp push` delivers to the push branch, so "
@@ -3196,7 +3208,7 @@ def _commit_of(repo: Path, ref: str) -> str:
     return _git(repo, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}").stdout.strip()
 
 
-def _carried(repo: Path, ref: str) -> int:
+def _commits_over(repo: Path, ref: str) -> int:
     """How many commits HEAD has that `ref` does not: what a rebase onto `ref` would carry."""
     out = _git(repo, "rev-list", "--count", "HEAD", f"^{ref}")
     return int(out.stdout.strip()) if out.returncode == 0 and out.stdout.strip().isdigit() else -1
@@ -3228,11 +3240,11 @@ def base_candidates(p: Project, repo: Path, remote: str, push_to: str, branch: s
 
 def real_base(p: Project, repo: Path, remote: str, push_to: str, branch: str) -> tuple[str, int]:
     """(ref, carried) of the checked-out branch's nearest base among base_candidates: the one HEAD
-    has the fewest commits over (_carried); on a tie a configured one, the push target first."""
+    has the fewest commits over (_commits_over); on a tie a configured one, the push target first."""
     configured, other = base_candidates(p, repo, remote, push_to, branch)
     best = ("", -1)
     for ref in configured + other:
-        n = _carried(repo, ref)
+        n = _commits_over(repo, ref)
         if n >= 0 and (best[1] < 0 or n < best[1]):
             best = (ref, n)
     return best
@@ -3638,7 +3650,7 @@ def code_paths(repo: Path, tip: str, head: str = "HEAD") -> list[str]:
 MANIFESTS = (".claude-plugin/plugin.json", ".codex-plugin/plugin.json")
 
 
-def _version(repo: Path, rev: str, path: str) -> str:
+def _manifest_version(repo: Path, rev: str, path: str) -> str:
     """The `version` in the JSON file `path` at `rev`, or "" when it has none or cannot be read."""
     show = _git(repo, "show", f"{rev}:{path}")
     try:
@@ -3679,8 +3691,8 @@ def stale_versions(repo: Path, tip: str) -> list[str]:
     out = []
     for d in names:
         for m in MANIFESTS:
-            v = _version(repo, tip, f"{d}/{m}")
-            if v and v == _version(repo, "HEAD", f"{d}/{m}"):
+            v = _manifest_version(repo, tip, f"{d}/{m}")
+            if v and v == _manifest_version(repo, "HEAD", f"{d}/{m}"):
                 out.append(f"{d} {v}")
                 break
     return out
@@ -3991,7 +4003,7 @@ def free_probe(p: Project) -> str:
 STALL_S = 30   # the lock free this long while a waiter ahead does not take it: the next one takes it
 
 
-def _priority(p: Project) -> int | None:
+def _task_priority(p: Project) -> int | None:
     try:
         return checkcap.task_priority(p) if p else None
     except Exception:   # an unreadable task only loses the ordering, never the wait
@@ -4045,7 +4057,7 @@ def take(p: Project, remote: str, branch: str, wait_s: float, poll_s: float = 1.
     name = lock_name(remote, branch)
     started = since if since is not None and since <= time.time() else time.time()
     try:
-        ticket = locks.enqueue(locks_dir, resource, who, since=started, priority=_priority(p))
+        ticket = locks.enqueue(locks_dir, resource, who, since=started, priority=_task_priority(p))
     except OSError:   # no queue: plain polling, in no fixed order
         ticket = None
     mine = ticket
@@ -4171,9 +4183,9 @@ def push(repo: Path, remote: str, branch: str, checks: list[str], rounds: int = 
     lock = hold() if hold else None
     if hold and lock is None:
         return BUSY
-    global last_pushed, last_tip, last_carried
-    last_pushed = last_tip = None
-    last_carried = []
+    global last_pushed
+    last_pushed = None
+    last_carried.clear()
     keep = published(repo, remote, branch)
     if keep:
         # The rebase would rewrite a branch the remote already has, and a later `ttp push --own` of
@@ -4194,7 +4206,6 @@ def push(repo: Path, remote: str, branch: str, checks: list[str], rounds: int = 
 
 
 last_pushed: str | None = None   # the commit the last push() pushed; HEAD may be back on its branch
-last_tip: str | None = None      # the branch's tip that last push() pushed onto
 last_carried: list[str] = []     # verdictcarry.line of each check pass the last push() carried across a rebase
 last_reach: dict | None = None   # reach() of the last run(): whether it is on the branch it is meant to reach
 
@@ -4256,29 +4267,61 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
     during them is not overwritten either. One the remote lacks is refused (a rebase never creates
     its branch). `never_force` (delivery.never_force) refuses a lease push outright."""
     repo = Path(_git(repo, "rev-parse", "--show-toplevel").stdout.strip() or repo)
+    rc, local, head, read = _own_refusal(repo, remote, branch, checks, say, base, ff_only, lease, start, start_ref,
+                                         never_force)
+    if rc is not None:
+        return rc
+    lock = hold() if hold else None
+    if hold and lock is None:
+        return BUSY
+    Steps(lock, say).go("own push")    # its checks and push, one step: no rebase to pause between
+    try:
+        head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+        rc, todo = _own_todo(repo, head, checks, say, base, recorded, host, cfg, p, reuse, check_run_dir)
+        if rc is None:
+            rc = _own_checks(repo, remote, branch, head, base, todo, local, check_run_dir, cfg, p, say, timed)
+        if rc is not None:
+            return rc
+        if _git(repo, "rev-parse", "HEAD").stdout.strip() != head:
+            say(f"HEAD moved off {head[:10]} during the checks; not pushing")
+            return REFUSED
+        return _move_local(repo, branch, head, say) if local else _own_push_head(repo, remote, branch, head, read,
+                                                                                 lease, say)
+    finally:
+        if lock is not None:
+            lock.close()
+
+
+def _own_refusal(repo: Path, remote: str, branch: str, checks: list[str], say: Callable[[str], None],
+                 base: str | None, ff_only: bool, lease: bool, start: str, start_ref: str,
+                 never_force: bool) -> tuple[int | None, bool, str, str]:
+    """publish's refusals before it takes the lock, as (exit code or None to go on, local, HEAD, the
+    remote tip read): a lease under never_force, a dirty tree, a branch it may not push, a HEAD the
+    remote already has (exit 0), a lease on a missing branch or one that would lose commits, and
+    code with no checks."""
     if lease and never_force:
         say(f"not replacing {remote}/{branch} under a lease: delivery.never_force is true, so nothing is "
             f"force-pushed (delivery.rebase_replace lease needs it off); deliver the rebase on a new branch")
-        return REFUSED
+        return REFUSED, False, "", ""
     if _git(repo, "status", "--porcelain", "--untracked-files=no").stdout.strip():
         say("uncommitted changes; commit first")
-        return REFUSED
+        return REFUSED, False, "", ""
     local = remote == LOCAL and remote_less(repo)
     why = local_refusal(repo, branch) if local else \
         refusal(repo, remote, branch) or (behind(repo, remote, branch) if ff_only else "")
     if why:
         say(why)
-        return REFUSED
+        return REFUSED, local, "", ""
     head = _git(repo, "rev-parse", "HEAD").stdout.strip()
     read = _existing_tip(repo, remote, branch) if not local else ""
     if not local and head and read == head:
         # Already published (e.g. by the change a review covers): nothing to check or push again.
         say(f"{head[:10]} is already {remote}/{branch}'s tip; nothing to push")
-        return 0
+        return 0, local, head, read
     if lease and not local and not read:
         say(f"{remote} has no branch {branch} (or it cannot be read): a rebase replaces an existing branch "
             f"under a lease and never creates one; not pushing")
-        return REFUSED
+        return REFUSED, local, head, read
     if lease and not local and (lost := unkept(repo, head, read, start)):
         more = f" and {len(lost) - 5} more" if len(lost) > 5 else ""
         since = f"since the rebase started from {start[:10]}" if start else "(no rebase start is recorded)"
@@ -4287,103 +4330,113 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
             f"not pushed. Rebase again onto {read[:10]} ({remote}/{branch}'s tip) so HEAD holds them; if HEAD "
             f"already holds them in another form, record that tip as the start: "
             f"git update-ref {start_ref or worktree.REBASE_START_REF + '<task id>'} {read}")
-        return REJECTED
+        return REJECTED, local, head, read
     if not checks and (code := code_paths(repo, base) if base else ["(no push target to compare with)"]):
         more = f" and {len(code) - 3} more" if len(code) > 3 else ""
         say(f"no checks configured, and this change touches more than docs ({', '.join(code[:3])}{more}): "
             + no_checks_hint(repo))
-        return REFUSED
-    lock = hold() if hold else None
-    if hold and lock is None:
-        return BUSY
-    Steps(lock, say).go("own push")    # its checks and push, one step: no rebase to pause between
+        return REFUSED, local, head, read
+    return None, local, head, read
+
+
+def _own_todo(repo: Path, head: str, checks: list[str], say: Callable[[str], None], base: str | None,
+              recorded: dict | None, host: str, cfg: dict | None, p: Project | None,
+              reuse: Callable[[str, list, list], str] | None, check_run_dir: str | None) -> tuple[int | None, list]:
+    """The checks publish runs on `head`, as (exit code or None to go on, the commands): the applicable
+    project checks; when every one is skipped, the commands `recorded` passing on `head` (on `host`, behind
+    checks.wrap_cmd); none when a recorded pass of the same commands and environment is reused."""
     try:
-        head = _git(repo, "rev-parse", "HEAD").stdout.strip()
-        try:
-            todo, skipped = applicable(repo, head, checks, say, base or "", candidate=True)
-        except ScopeError as e:
-            say(f"{e}; not pushing")
-            return CHECKS_FAILED
-        extras = False
-        if checks and not todo:
-            todo = extras = with_host(recorded_extras(recorded, head, checks), host)
-            if todo:
-                try:
-                    wrap = wrap_of(cfg, repo, p)
-                except ValueError as e:
-                    say(f"{e}; not pushing")
-                    return CHECKS_FAILED
-                todo = extras = with_wrap(todo, wrap, skip=lambda c: checklane.no_device(c, cfg))
-                if any(getattr(c, "wrap", None) for c in todo) and (why := wrap_problem(wrap, repo)):
-                    say(f"{why}; not pushing")
-                    return CHECKS_FAILED
-            if not todo and outside_scope(checks, skipped):
-                say(f"{head[:10]}: {OUT_OF_SCOPE}")
-            elif not todo:
-                say(f"{head[:10]}: {NONE_APPLY}; not pushing: {NONE_APPLY_OWN_FIX}")
-                return CHECKS_FAILED
-        if todo and reuse and (hit := _reused(repo, head, todo, check_run_dir, reuse)):
-            say(f"{head[:10]}: reused the pass of {len(todo)} check(s) {hit} on this tree with the same "
-                f"commands and environment; not running them again"
-                + (" (every project check was skipped; these are the commands after `--`)" if extras else ""))
-            todo = []
-        elif extras:
-            say(f"{head[:10]}: every project check was skipped; running the {len(todo)} command(s) "
-                f"`ttp checks` recorded passing on this commit: {'; '.join(todo)}")
-        tip = (_local_tip(repo, branch) if local else _existing_tip(repo, remote, branch)) if todo else ""
-        if todo and (why := runner_wait(todo, repo, check_env("own", tip, check_run_dir, branch), say)):
-            return why
-        try:
-            # Spill first (delivery.checks_spill_first): a spill host before the own-branch lane here.
-            slot, todo = spill_slot(todo, head, say, p)
-            slot = slot or run_slot(todo, head, say, priority=own_lane_key(repo, remote, cfg), proj=p, repo=repo)
-        except checkcap.Unavailable as e:
-            say(f"{e}; not pushing")
-            return CHECKS_FAILED
-        with slot:
-            started = time.time()
-            env = {**check_env("own", tip, check_run_dir, branch), **slot.env()}
-            for line in sandbox_lines(todo):
-                say(line)
-            excused = False
-            for cmd in todo:
-                cmd, rc = _run_or_here(cmd, repo, env, say, seen := {},
-                                       lambda: check_slot(head, say, priority=own_lane_key(repo, remote, cfg), repo=repo))
-                if rc != 0:
-                    if rc == CHECKS_FAILED:
-                        rc = _gate_here(cmd, repo, env, say, head, base or "", seen, p,
-                                        lambda: check_slot(head, say, priority=own_lane_key(repo, remote, cfg), repo=repo))
-                    if rc == 0:
-                        excused = True   # its reruns are no check time
-                        continue
-                    if rc != BUSY:
-                        say(f"check failed on {head[:10]}: {cmd}{where(cmd)}; not pushing")
-                    return rc
-        if todo and timed and not excused:
-            timed(time.time() - started, gatetime.lock_waits(env.get("TTP_RUN_DIR"), started))
-        if _git(repo, "rev-parse", "HEAD").stdout.strip() != head:
-            say(f"HEAD moved off {head[:10]} during the checks; not pushing")
-            return REFUSED
-        if local:
-            return _move_local(repo, branch, head, say)
-        if lease and not local:
-            # Never a plain force push: only while the remote still has the tip read before the checks.
-            if _git(repo, "push", f"--force-with-lease=refs/heads/{branch}:{read}", remote,
-                    f"{head}:refs/heads/{branch}", quiet=False).returncode == 0:
-                say(f"pushed {head[:10]} to {remote}/{branch}, replacing {read[:10]} (a rebase, under a lease)")
-                return 0
-            say(f"push to {remote}/{branch} was rejected: it no longer has {read[:10]}, the tip the lease was "
-                f"taken on (someone pushed to it since); not overwritten")
-            return REJECTED
-        if _git(repo, "push", remote, f"{head}:refs/heads/{branch}", quiet=False).returncode == 0:
-            say(f"pushed {head[:10]} to {remote}/{branch}")
+        todo, skipped = applicable(repo, head, checks, say, base or "", candidate=True)
+    except ScopeError as e:
+        say(f"{e}; not pushing")
+        return CHECKS_FAILED, []
+    extras = False
+    if checks and not todo:
+        todo = extras = with_host(recorded_extras(recorded, head, checks), host)
+        if todo:
+            try:
+                wrap = wrap_of(cfg, repo, p)
+            except ValueError as e:
+                say(f"{e}; not pushing")
+                return CHECKS_FAILED, []
+            todo = extras = with_wrap(todo, wrap, skip=lambda c: checklane.no_device(c, cfg))
+            if any(getattr(c, "wrap", None) for c in todo) and (why := wrap_problem(wrap, repo)):
+                say(f"{why}; not pushing")
+                return CHECKS_FAILED, []
+        if not todo and outside_scope(checks, skipped):
+            say(f"{head[:10]}: {OUT_OF_SCOPE}")
+        elif not todo:
+            say(f"{head[:10]}: {NONE_APPLY}; not pushing: {NONE_APPLY_OWN_FIX}")
+            return CHECKS_FAILED, []
+    if todo and reuse and (hit := _reused(repo, head, todo, check_run_dir, reuse)):
+        say(f"{head[:10]}: reused the pass of {len(todo)} check(s) {hit} on this tree with the same "
+            f"commands and environment; not running them again"
+            + (" (every project check was skipped; these are the commands after `--`)" if extras else ""))
+        todo = []
+    elif extras:
+        say(f"{head[:10]}: every project check was skipped; running the {len(todo)} command(s) "
+            f"`ttp checks` recorded passing on this commit: {'; '.join(todo)}")
+    return None, todo
+
+
+def _own_checks(repo: Path, remote: str, branch: str, head: str, base: str | None, todo: list, local: bool,
+                check_run_dir: str | None, cfg: dict | None, p: Project | None, say: Callable[[str], None],
+                timed: Callable[[float], None] | None) -> int | None:
+    """Run publish's checks `todo` on `head` in a check slot (a spill host first, else the own-branch
+    lane here): the exit code that stops the push, or None when they passed (their time goes to `timed`)."""
+    tip = (_local_tip(repo, branch) if local else _existing_tip(repo, remote, branch)) if todo else ""
+    if todo and (why := runner_wait(todo, repo, check_env("own", tip, check_run_dir, branch), say)):
+        return why
+    try:
+        # Spill first (delivery.checks_spill_first): a spill host before the own-branch lane here.
+        slot, todo = spill_slot(todo, head, say, p)
+        slot = slot or run_slot(todo, head, say, priority=own_lane_key(repo, remote, cfg), proj=p, repo=repo)
+    except checkcap.Unavailable as e:
+        say(f"{e}; not pushing")
+        return CHECKS_FAILED
+    with slot:
+        started = time.time()
+        env = {**check_env("own", tip, check_run_dir, branch), **slot.env()}
+        for line in sandbox_lines(todo):
+            say(line)
+        excused = False
+        for cmd in todo:
+            cmd, rc = _run_or_here(cmd, repo, env, say, seen := {},
+                                   lambda: check_slot(head, say, priority=own_lane_key(repo, remote, cfg), repo=repo))
+            if rc != 0:
+                if rc == CHECKS_FAILED:
+                    rc = _gate_here(cmd, repo, env, say, head, base or "", seen, p,
+                                    lambda: check_slot(head, say, priority=own_lane_key(repo, remote, cfg), repo=repo))
+                if rc == 0:
+                    excused = True   # its reruns are no check time
+                    continue
+                if rc != BUSY:
+                    say(f"check failed on {head[:10]}: {cmd}{where(cmd)}; not pushing")
+                return rc
+    if todo and timed and not excused:
+        timed(time.time() - started, gatetime.lock_waits(env.get("TTP_RUN_DIR"), started))
+    return None
+
+
+def _own_push_head(repo: Path, remote: str, branch: str, head: str, read: str, lease: bool,
+                   say: Callable[[str], None]) -> int:
+    """Push the checked `head` to remote/branch: under a lease on `read`, the tip read before the checks,
+    when `lease`; else a plain push the remote takes only as a fast-forward."""
+    if lease:
+        # Never a plain force push: only while the remote still has the tip read before the checks.
+        if _git(repo, "push", f"--force-with-lease=refs/heads/{branch}:{read}", remote,
+                f"{head}:refs/heads/{branch}", quiet=False).returncode == 0:
+            say(f"pushed {head[:10]} to {remote}/{branch}, replacing {read[:10]} (a rebase, under a lease)")
             return 0
-        say(f"push to {remote}/{branch} was rejected (never forced: it must fast-forward what the remote has; "
-            f"only a rebase under delivery.rebase_replace lease replaces a branch)")
+        say(f"push to {remote}/{branch} was rejected: it no longer has {read[:10]}, the tip the lease was "
+            f"taken on (someone pushed to it since); not overwritten")
         return REJECTED
-    finally:
-        if lock is not None:
-            lock.close()
+    if _git(repo, "push", remote, f"{head}:refs/heads/{branch}", quiet=False).returncode == 0:
+        say(f"pushed {head[:10]} to {remote}/{branch}")
+        return 0
+    say(f"push to {remote}/{branch} was rejected (never forced: it must fast-forward what the remote has; "
+        f"only a rebase under delivery.rebase_replace lease replaces a branch)")
+    return REJECTED
 
 
 RERERE = ("-c", "rerere.enabled=true", "-c", "rerere.autoUpdate=true")
@@ -4621,23 +4674,8 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
         if rnd == 1 and (leak := leak_step(repo, tip, say)):
             say(f"{leak}; not pushing")
             return CHECKS_FAILED
-        # A head built on a landed dependency's approved head leaves out its stale copies (--onto);
-        # a conflict in its own commits then goes the usual way.
-        ok = bool(dep := _dependency(repo, tip, landed or {}, say)) and _rebase(repo, tip, dep)
-        if dep and not ok:
-            _git(repo, "rebase", "--abort")
-            say(f"the rebase --onto {upstream} {dep[:10]} conflicts; rebasing onto {upstream} as before")
-        if not ok and not _rebase(repo, tip):
-            _git(repo, "rebase", "--abort")
-            if not _land_squashed(repo, tip, upstream, say):
-                if keep:
-                    # Rebasing the branch by hand would rewrite what the remote already has.
-                    say(f"rebase onto {upstream} conflicts; {keep} is already on {remote}, so do not rebase it: "
-                        f"merge {upstream} into it (`git fetch {remote} {branch} && git merge {upstream}`), "
-                        "resolve keeping both sides' intents, commit, then rerun")
-                else:
-                    say(f"rebase onto {upstream} conflicts; resolve it keeping both sides' intents, then rerun")
-                return CONFLICT
+        if (r := _rebase_round(repo, remote, branch, tip, keep, landed or {}, say)) is not None:
+            return r
         if version_bump and (r := bump(repo, tip, version_bump, say)):
             return r
         head = _git(repo, "rev-parse", "HEAD").stdout.strip()
@@ -4656,46 +4694,13 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
         elif checks and not todo:
             say(f"{head[:10]}: {NONE_APPLY}; not pushing: {NONE_APPLY_FIX}")
             return CHECKS_FAILED
-        # A pass from an earlier round carries when the rebase changed nothing the check covers.
-        run, carried = [], []
-        for cmd in todo:
-            was = passes.get(str(cmd))
-            delta = verdictcarry.carry(repo, cmd, *was, tip, head, exclude or []) if was else None
-            if delta is None:
-                run.append(cmd)
-            else:
-                carried.append(f"{verdictcarry.line(was[1], delta)}: {cmd}")
-                say(carried[-1])
+        run, carried = _carry_passes(repo, todo, passes, tip, head, exclude or [], say)
         steps.between()   # waiting for a checks runner or slot: an upgrade may go now
         if run and (why := runner_wait(run, repo, check_env("target", tip, check_run_dir, branch), say)):
             return why
-        try:
-            # Spill first (delivery.checks_spill_first): a spill host before the push priority slot here.
-            slot, run = spill_slot(run, head, say)
-            slot = slot or run_slot(run, head, say, priority=priority_key(repo, remote, branch), repo=repo)
-        except checkcap.Unavailable as e:
-            say(f"{e}; not pushing")
-            return CHECKS_FAILED
-        with slot:
-            steps.go("checks")
-            started = time.time()
-            env = {**check_env("target", tip, check_run_dir, branch), **slot.env()}
-            for line in sandbox_lines(run):
-                say(line)
-            excused = set()
-            for cmd in run:
-                cmd, rc = _run_or_here(cmd, repo, env, say, seen := {},
-                                       lambda: check_slot(head, say, priority=priority_key(repo, remote, branch), repo=repo))
-                if rc != 0:
-                    if rc == CHECKS_FAILED:
-                        rc = _gate_here(cmd, repo, env, say, head, tip, seen, None,
-                                        lambda: check_slot(head, say, priority=priority_key(repo, remote, branch), repo=repo))
-                    if rc == 0:
-                        excused.add(str(cmd))
-                        continue
-                    if rc != BUSY:
-                        say(f"check failed on {head[:10]}: {cmd}{where(cmd)}; not pushing")
-                    return rc
+        rc, started, env, excused = _round_checks(repo, remote, branch, run, head, tip, check_run_dir, say, steps)
+        if rc is not None:
+            return rc
         if run and not carried and timed and not excused:
             timed(time.time() - started, gatetime.lock_waits(env.get("TTP_RUN_DIR"), started))
         # A check the tests gate excused did not pass: no later round carries it.
@@ -4706,7 +4711,7 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
             continue
         # Without --force the remote refuses anything that is not a fast-forward of what we tested on.
         if _git(repo, "push", remote, f"{head}:refs/heads/{branch}", quiet=False).returncode == 0:
-            last_pushed, last_tip = head, tip
+            last_pushed = head
             last_carried[:] = carried
             say(f"pushed {head[:10]} to {upstream}")
             return 0
@@ -4716,6 +4721,83 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
         say(f"{upstream} moved before the push; round {rnd + 1}")
     say(f"{upstream} kept moving for {rounds} rounds; not pushing")
     return KEPT_MOVING
+
+
+def _carry_passes(repo: Path, todo: list, passes: dict[str, tuple[str, str]], tip: str, head: str, exclude: list[str],
+           say: Callable[[str], None]) -> tuple[list, list[str]]:
+    """(checks to run, lines for passes carried) for push round on `head` over `tip` (_rounds): a pass from an
+    earlier round (`passes`) carries when the rebase changed nothing the check covers (verdictcarry)."""
+    run, carried = [], []
+    for cmd in todo:
+        was = passes.get(str(cmd))
+        delta = verdictcarry.carry(repo, cmd, *was, tip, head, exclude) if was else None
+        if delta is None:
+            run.append(cmd)
+        else:
+            carried.append(f"{verdictcarry.line(was[1], delta)}: {cmd}")
+            say(carried[-1])
+    return run, carried
+
+
+def _rebase_round(repo: Path, remote: str, branch: str, tip: str, keep: str, landed: dict[str, str],
+                  say: Callable[[str], None]) -> int | None:
+    """Rebase HEAD onto fetched `tip` of remote/branch for one push round (_rounds): None once rebased (or its
+    squashed work landed), CONFLICT with the fix to make when it conflicts."""
+    upstream = f"{remote}/{branch}"
+    # A head built on a landed dependency's approved head leaves out its stale copies (--onto);
+    # a conflict in its own commits then goes the usual way.
+    ok = bool(dep := _dependency(repo, tip, landed, say)) and _rebase(repo, tip, dep)
+    if dep and not ok:
+        _git(repo, "rebase", "--abort")
+        say(f"the rebase --onto {upstream} {dep[:10]} conflicts; rebasing onto {upstream} as before")
+    if not ok and not _rebase(repo, tip):
+        _git(repo, "rebase", "--abort")
+        if not _land_squashed(repo, tip, upstream, say):
+            if keep:
+                # Rebasing the branch by hand would rewrite what the remote already has.
+                say(f"rebase onto {upstream} conflicts; {keep} is already on {remote}, so do not rebase it: "
+                    f"merge {upstream} into it (`git fetch {remote} {branch} && git merge {upstream}`), "
+                    "resolve keeping both sides' intents, commit, then rerun")
+            else:
+                say(f"rebase onto {upstream} conflicts; resolve it keeping both sides' intents, then rerun")
+            return CONFLICT
+    return None
+
+
+def _round_checks(repo: Path, remote: str, branch: str, run: list, head: str, tip: str,
+                  check_run_dir: str | None, say: Callable[[str], None], steps: Steps
+                  ) -> tuple[int | None, float, dict, set]:
+    """Run push checks `run` on `head` (rebased on `tip`) in a spill or local check slot for one push round
+    (_rounds): (None, start time, check env, checks the tests gate excused) when all pass, else the failing
+    exit code first."""
+    try:
+        # Spill first (delivery.checks_spill_first): a spill host before the push priority slot here.
+        slot, run = spill_slot(run, head, say)
+        slot = slot or run_slot(run, head, say, priority=priority_key(repo, remote, branch), repo=repo)
+    except checkcap.Unavailable as e:
+        say(f"{e}; not pushing")
+        return CHECKS_FAILED, 0.0, {}, set()
+    with slot:
+        steps.go("checks")
+        started = time.time()
+        env = {**check_env("target", tip, check_run_dir, branch), **slot.env()}
+        for line in sandbox_lines(run):
+            say(line)
+        excused = set()
+        for cmd in run:
+            cmd, rc = _run_or_here(cmd, repo, env, say, seen := {},
+                                   lambda: check_slot(head, say, priority=priority_key(repo, remote, branch), repo=repo))
+            if rc != 0:
+                if rc == CHECKS_FAILED:
+                    rc = _gate_here(cmd, repo, env, say, head, tip, seen, None,
+                                    lambda: check_slot(head, say, priority=priority_key(repo, remote, branch), repo=repo))
+                if rc == 0:
+                    excused.add(str(cmd))
+                    continue
+                if rc != BUSY:
+                    say(f"check failed on {head[:10]}: {cmd}{where(cmd)}; not pushing")
+                return rc, started, env, excused
+    return None, started, env, excused
 
 
 def _kill_tree(pid: int) -> None:
@@ -4769,6 +4851,40 @@ def _copy_out(stream, collect: workerloss.Collector, keep: deque | None = None) 
         stream.close()
 
 
+def _kill_check(proc: subprocess.Popen) -> None:
+    """End check `proc` and every process under it, and reap it (_timed_wait)."""
+    _kill_tree(proc.pid)
+    proc.wait()
+
+
+def _past_limit(proc: subprocess.Popen, cmd: Any, say: Callable[[str], None],
+                collect: workerloss.Collector | None, stretched: bool, now: float, started: float, run_s: float,
+                pool_s: float, granted: float, pooling: bool) -> tuple[int | None, bool]:
+    """Check `proc`, run past check_limit_s (_timed_wait): (None, stretched) while it progresses below the
+    CHECK_STRETCH ceiling (said once), else ended: (124, stretched), timed out."""
+    ceiling = check_limit_s * CHECK_STRETCH
+    quiet = now - collect.at if collect is not None and collect.at else None
+    if not pooling and quiet is not None and quiet < CHECK_PROGRESS_S and run_s < ceiling:
+        if not stretched:
+            stretched = True
+            say(f"check past its limit of {check_limit_s:.0f} s but still making progress (its last "
+                f"output line {quiet:.0f} s ago): it runs on while its output keeps coming, ended "
+                f"after {CHECK_PROGRESS_S:.0f} s without a line or at {ceiling:.0f} s counted: "
+                f"{cmd}{where(cmd)}")
+    else:
+        _kill_check(proc)
+        why = "" if not stretched else (
+            f"; it ran on past the limit while progressing, until {ceiling:.0f} s counted"
+            if run_s >= ceiling else f"; it ran on past the limit while progressing, until "
+            f"{quiet or 0:.0f} s without an output line")
+        say(f"check ran past its limit of {check_limit_s:.0f} s and was ended: timed out after "
+            f"{now - started:.0f} s: {cmd}{where(cmd)} ({run_s:.0f} s counted; {pool_s:.0f} s waiting for a "
+            f"test-pool slot and {granted:.0f} s waiting for a grant not counted; "
+            f"delivery.push_checks_timeout_s; unset: 4x the last measured check run, at least 4 h{why})")
+        return 124, stretched
+    return None, stretched
+
+
 def _timed_wait(proc: subprocess.Popen, waits: Path, cmd: Any, say: Callable[[str], None],
                 collect: workerloss.Collector | None = None) -> int:
     """Wait for check `proc`; its exit code. Its time limit (check_limit_s) counts its run time: its wall time
@@ -4813,43 +4929,23 @@ def _timed_wait(proc: subprocess.Popen, waits: Path, cmd: Any, say: Callable[[st
             ran = now - started - granted
             run_s = ran - pool_s   # its run time: a wait for a pool slot is the pool's, not the change's
             if pooling and pool_wait_s and pool_s >= pool_wait_s:
-                _kill_tree(proc.pid)
-                proc.wait()
+                _kill_check(proc)
                 say(f"check waited {pool_s:.0f} s for a test-pool slot, past its bound of {pool_wait_s:.0f} s, "
                     f"and was ended: {cmd}{where(cmd)} (delivery.push_pool_wait_s; unset: "
                     f"{POOL_WAIT_S / 3600:.0f} h; every pool host was busy or held that long)")
                 return POOL_STARVED
             if queued and now - started - pool_s >= check_limit_s + check_queue_s:
-                _kill_tree(proc.pid)
-                proc.wait()
+                _kill_check(proc)
                 say(f"check still waiting for a grant (a lock, a checks lane or a checks slot) after "
                     f"{(now - started) / 60:.0f} min and was ended before it ran: {cmd}{where(cmd)}")
                 return QUEUED
             if not queued and run_s >= check_limit_s:
-                ceiling = check_limit_s * CHECK_STRETCH
-                quiet = now - collect.at if collect is not None and collect.at else None
-                if not pooling and quiet is not None and quiet < CHECK_PROGRESS_S and run_s < ceiling:
-                    if not stretched:
-                        stretched = True
-                        say(f"check past its limit of {check_limit_s:.0f} s but still making progress (its last "
-                            f"output line {quiet:.0f} s ago): it runs on while its output keeps coming, ended "
-                            f"after {CHECK_PROGRESS_S:.0f} s without a line or at {ceiling:.0f} s counted: "
-                            f"{cmd}{where(cmd)}")
-                else:
-                    _kill_tree(proc.pid)
-                    proc.wait()
-                    why = "" if not stretched else (
-                        f"; it ran on past the limit while progressing, until {ceiling:.0f} s counted"
-                        if run_s >= ceiling else f"; it ran on past the limit while progressing, until "
-                        f"{quiet or 0:.0f} s without an output line")
-                    say(f"check ran past its limit of {check_limit_s:.0f} s and was ended: timed out after "
-                        f"{now - started:.0f} s: {cmd}{where(cmd)} ({run_s:.0f} s counted; {pool_s:.0f} s waiting for a "
-                        f"test-pool slot and {granted:.0f} s waiting for a grant not counted; "
-                        f"delivery.push_checks_timeout_s; unset: 4x the last measured check run, at least 4 h{why})")
-                    return 124
+                rc, stretched = _past_limit(proc, cmd, say, collect, stretched, now, started, run_s, pool_s,
+                                            granted, pooling)
+                if rc is not None:
+                    return rc
             if not queued and pooling and ran >= check_limit_s:
-                _kill_tree(proc.pid)
-                proc.wait()
+                _kill_check(proc)
                 say(f"check still waiting for a test-pool slot at its limit of {check_limit_s:.0f} s and was ended, "
                     f"busy, not failed: {cmd}{where(cmd)} ({pool_s:.0f} s waiting for a test-pool slot, {run_s:.0f} s "
                     "run; every pool host was busy or held)")
@@ -4900,51 +4996,7 @@ def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None], seen: 
     kept: deque = deque(maxlen=GATE_LINES)
 
     def once() -> int:
-        collect.reset()
-        kept.clear()
-        sys.stdout.flush()
-        sys.stderr.flush()
-        waits = Path(tempfile.mkdtemp(prefix="check-waits-", dir=env.get("TTP_RUN_DIR") or None)).resolve()
-        # A landing's check (to the push branch, or `ttp land`) runs under a landing mark: a `ttp lock`
-        # in it goes ahead of non-landing waiters (landmark.py). No other check inherits one.
-        mark = landmark.hold() if env.get("TTP_PUSH_MODE") == "target" else None
-        try:
-            argv = testslots.low_priority(check_argv(cmd, repo, env))
-            guard = hoststate.Guard(env, tokens=[repo], argv=argv)   # the real crontab and units, compared after a local check
-            # own session: its group is ended once it ends (_end_group), or by checkgroup if this push dies first
-            proc = subprocess.Popen([*CHECK_GROUP, str(os.getpid()), "--", *argv], cwd=repo,
-                                    env={**{k: v for k, v in env.items() if k != landmark.ENV}, checkwait.ENV: str(waits),
-                                         **({landmark.ENV: str(mark.path)} if mark else {}),
-                                         # its run-time limit, for a sharded pool run's admission (pooladmit)
-                                         **({pooladmit.LIMIT_ENV: f"{time.time():.0f}:{check_limit_s:.0f}"}
-                                            if check_limit_s is not None else {})},
-                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, pass_fds=checkdirs.inherited(),
-                                    start_new_session=True)
-        except BaseException:
-            if mark:
-                mark.close()
-            raise
-        reader = threading.Thread(target=_copy_out, args=(proc.stdout, collect, kept), daemon=True)
-        reader.start()
-        try:
-            rc = _timed_wait(proc, waits, cmd, say, collect)
-            _end_group(proc.pid)   # what it left running ends first: nothing writes after the compare
-            changed, said = guard.end()
-            for line in said:
-                say(line)
-            return CHECKS_FAILED if changed and rc == 0 else rc
-        except BaseException:   # stopped (run_detached's SIGTERM): the check ends with it, as run() did
-            proc.kill()
-            proc.wait()
-            _end_group(proc.pid)   # the command under checkgroup too, before the compare
-            guard.stopped(say)   # a change made before the stop: restored and reported, not the next baseline
-            raise
-        finally:
-            _end_group(proc.pid)
-            reader.join(timeout=10)   # a child that left the group may keep the pipe open; do not wait on it
-            shutil.rmtree(waits, ignore_errors=True)
-            if mark:
-                mark.close()
+        return _check_once(cmd, repo, env, say, collect, kept)
     reruns = setup_reruns = 0
     while True:
         rc = scriptwatch.rerun(once, bool, None if remote_host(cmd) else str(cmd), repo, env, say, on_pass=True)
@@ -4953,10 +5005,7 @@ def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None], seen: 
                 seen.update(rc=0, text="".join(kept))
             return 0
         if rc in (QUEUED, POOL_BUSY):   # it never ran, or waited for a full pool at its limit: not the change
-            say(f"{'queued, not run' if rc == QUEUED else 'busy, not failed'}: {cmd}{where(cmd)}; not pushing. "
-                "Hand off `waiting`; retry_when: "
-                f"test \"$(date +%s)\" -ge {int(time.time()) + QUEUED_RETRY_S}")
-            return BUSY
+            return _not_run(cmd, rc, say)
         # Failed before any test ran (its work dir gone, a bad archive, no free pool slot): the host or its pool,
         # not the change. A setup fault runs again up to setupfault.RERUNS times; a starved pool waits.
         fault = setupfault.starved() if rc == POOL_STARVED else (
@@ -4985,10 +5034,7 @@ def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None], seen: 
                 seen.update(rc=0, text="".join(kept))
             return 0
         if rc in (QUEUED, POOL_BUSY):
-            say(f"{'queued, not run' if rc == QUEUED else 'busy, not failed'}: {cmd}{where(cmd)}; not pushing. "
-                "Hand off `waiting`; retry_when: "
-                f"test \"$(date +%s)\" -ge {int(time.time()) + QUEUED_RETRY_S}")
-            return BUSY
+            return _not_run(cmd, rc, say)
         if torn := syntaxfault.transient(collect.text(), repo, env.get("TTP_PUSH_TIP")):
             say(f"{syntaxfault.line(torn, str(cmd))}; not pushing. Hand off `waiting`; retry_when: "
                 f"test \"$(date +%s)\" -ge {int(time.time()) + syntaxfault.RETRY_S}")
@@ -4997,16 +5043,89 @@ def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None], seen: 
         say(f"{workerloss.line(loss, str(cmd))}; not pushing. Hand off `waiting`; retry_when: "
             f"test \"$(date +%s)\" -ge {int(time.time()) + WORKER_LOSS_S}")
         return BUSY
+    if (verdict := _host_verdict(cmd, rc, repo, collect.text(), say)) is not None:
+        return verdict
+    if rc == BUSY:   # its own "busy" (a lock, a test pool or a gate rerun that admitted it nowhere): not the change
+        say(f"busy, not failed: {cmd}{where(cmd)} exited 75 (no free slot, lock or pool); not pushing. Hand off "
+            f"`waiting`; retry_when: test \"$(date +%s)\" -ge {int(time.time()) + QUEUED_RETRY_S}")
+        return BUSY
+    if seen is not None:
+        seen.update(rc=rc, text="".join(kept))
+    return CHECKS_FAILED
+
+
+def _check_once(cmd: Any, repo: Path, env: dict, say: Callable[[str], None], collect: Any, kept: deque) -> int:
+    """One run of push check `cmd` (_run_one): its exit code, its output copied into `collect` and the last
+    lines into `kept`; a change it left in the real crontab or units fails a pass (hoststate)."""
+    collect.reset()
+    kept.clear()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    waits = Path(tempfile.mkdtemp(prefix="check-waits-", dir=env.get("TTP_RUN_DIR") or None)).resolve()
+    # A landing's check (to the push branch, or `ttp land`) runs under a landing mark: a `ttp lock`
+    # in it goes ahead of non-landing waiters (landmark.py). No other check inherits one.
+    mark = landmark.hold() if env.get("TTP_PUSH_MODE") == "target" else None
+    try:
+        argv = testslots.low_priority(check_argv(cmd, repo, env))
+        guard = hoststate.Guard(env, tokens=[repo], argv=argv)   # the real crontab and units, compared after a local check
+        # own session: its group is ended once it ends (_end_group), or by checkgroup if this push dies first
+        proc = subprocess.Popen([*CHECK_GROUP, str(os.getpid()), "--", *argv], cwd=repo,
+                                env={**{k: v for k, v in env.items() if k != landmark.ENV}, checkwait.ENV: str(waits),
+                                     **({landmark.ENV: str(mark.path)} if mark else {}),
+                                     # its run-time limit, for a sharded pool run's admission (pooladmit)
+                                     **({pooladmit.LIMIT_ENV: f"{time.time():.0f}:{check_limit_s:.0f}"}
+                                        if check_limit_s is not None else {})},
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, pass_fds=checkdirs.inherited(),
+                                start_new_session=True)
+    except BaseException:
+        if mark:
+            mark.close()
+        raise
+    reader = threading.Thread(target=_copy_out, args=(proc.stdout, collect, kept), daemon=True)
+    reader.start()
+    try:
+        rc = _timed_wait(proc, waits, cmd, say, collect)
+        _end_group(proc.pid)   # what it left running ends first: nothing writes after the compare
+        changed, said = guard.end()
+        for line in said:
+            say(line)
+        return CHECKS_FAILED if changed and rc == 0 else rc
+    except BaseException:   # stopped (run_detached's SIGTERM): the check ends with it, as run() did
+        proc.kill()
+        proc.wait()
+        _end_group(proc.pid)   # the command under checkgroup too, before the compare
+        guard.stopped(say)   # a change made before the stop: restored and reported, not the next baseline
+        raise
+    finally:
+        _end_group(proc.pid)
+        reader.join(timeout=10)   # a child that left the group may keep the pipe open; do not wait on it
+        shutil.rmtree(waits, ignore_errors=True)
+        if mark:
+            mark.close()
+
+
+def _not_run(cmd: Any, rc: int, say: Callable[[str], None]) -> int:
+    """BUSY for check `cmd` that never ran (QUEUED) or waited for a full pool at its limit (POOL_BUSY): not the
+    change; the hand-off waits QUEUED_RETRY_S."""
+    say(f"{'queued, not run' if rc == QUEUED else 'busy, not failed'}: {cmd}{where(cmd)}; not pushing. "
+        "Hand off `waiting`; retry_when: "
+        f"test \"$(date +%s)\" -ge {int(time.time()) + QUEUED_RETRY_S}")
+    return BUSY
+
+
+def _host_verdict(cmd: Any, rc: int, repo: Path, text: str, say: Callable[[str], None]) -> int | None:
+    """BUSY when failed check `cmd` (exit `rc`, output `text`) failed for its host, not the change: its spill
+    wrapper declined a busy host, or an environment fault (recorded, envfault); else None."""
     spilled = getattr(cmd, "was", None) is not None   # _run_or_here runs it on another spill host or here
     if (spilled and rc == remotecheck.FAULT_RC and (host := remote_host(cmd))
-            and (busy := remotecheck.wrap_busy(collect.text())[1])):
+            and (busy := remotecheck.wrap_busy(text)[1])):
         # Its spill wrapper declined the run (a busy host): neither the host's fault nor the change's. No
         # environment fault or observation; that host cools off (checkspill.busy_add) and the check moves on.
         checkspill.busy_add(host, busy)
         cmd.wrap_busy = busy
         say(f"spill host {host} is busy (its spill wrapper declined the run: {busy}); not a fault")
         return BUSY
-    if fault := remote_fault(cmd, rc, repo, collect.text()):
+    if fault := remote_fault(cmd, rc, repo, text):
         p = None
         if base := os.environ.get("TTP_PROJECT"):
             p = Project(base)
@@ -5015,13 +5134,7 @@ def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None], seen: 
         say(envfault.line(fault) if spilled else
             f"{envfault.line(fault)}; not pushing. Hand off `waiting`; retry_when: {envfault.retry_when(p, fault)}")
         return BUSY
-    if rc == BUSY:   # its own "busy" (a lock, a test pool or a gate rerun that admitted it nowhere): not the change
-        say(f"busy, not failed: {cmd}{where(cmd)} exited 75 (no free slot, lock or pool); not pushing. Hand off "
-            f"`waiting`; retry_when: test \"$(date +%s)\" -ge {int(time.time()) + QUEUED_RETRY_S}")
-        return BUSY
-    if seen is not None:
-        seen.update(rc=rc, text="".join(kept))
-    return CHECKS_FAILED
+    return None
 
 
 def _gated(cmd: Any) -> bool:
@@ -5230,8 +5343,9 @@ def _run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None
     except ValueError as e:
         print(f"ttp push: {e}", file=sys.stderr)
         return REFUSED
-    global last_ff, last_reach, last_after, pending_after, check_limit_s, check_queue_s, pool_wait_s
-    last_ff, last_reach, last_after, pending_after = [], None, None, None
+    global last_reach, last_after, pending_after, check_limit_s, check_queue_s, pool_wait_s
+    last_ff.clear()
+    last_reach, last_after, pending_after = None, None, None
     check_limit_s, check_queue_s, pool_wait_s = limit_s, wait_s, pool_s
     global check_lock
     check_lock = runnerenv.lock_of(p.config(), repo)
@@ -5244,34 +5358,21 @@ def _run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None
         tracked = _git(repo, "rev-parse", "--verify", "-q", f"refs/remotes/{remote}/{branch}").stdout.strip()
         return env_wait(p, repo, tracked, "HEAD", e, lambda m: print(f"ttp push: {m}", file=sys.stderr))
     if own:   # delivery.push_exclude_paths guards the push branch only
-        say_target(repo, remote, branch)
-        # The docs-only test, if_changed scopes and the project's own checks may all compare with the
-        # shared branch this work leaves from: always fetch it (cheap), so none sees a stale base.
-        base = own_base(p, repo, remote)
-        # A rebase replaces the branch it rebases, keeping what it gained since the rebase started.
-        rebase = own_rebase(p, branch)
-        lease, start = rebase is not None, worktree.rebase_start(repo, rebase["id"]) if rebase else ""
-        start_ref = f"{worktree.REBASE_START_REF}{rebase['id']}" if rebase else ""
+        args = _own_args(p, repo, remote, branch)
         rc = publish(repo, remote, branch, checks, hold=lambda: take(p, remote, branch, wait_s),
-                     timed=lambda s, w=0.0: record_check_s(p, s, w), base=base,
-                     ff_only=own_ff_only(branch) and not lease, lease=lease, start=start, start_ref=start_ref,
+                     timed=lambda s, w=0.0: record_check_s(p, s, w),
                      recorded=recorded or recorded_checks(os.environ.get("TTP_RUN_DIR")), check_run_dir=output,
                      reuse=lambda tree, cmds, envs, parts: _own_pass(p, tree, cmds, envs, parts), host=d.get("checks_host") or "",
-                     never_force=never_force_on(p.config()), cfg=p.config(), p=p)
+                     never_force=never_force_on(p.config()), cfg=p.config(), p=p, **args)
     else:
         rc = push(repo, remote, branch, checks, rounds, hold=lambda: take(p, remote, branch, wait_s),
                   version_bump=version_bump, timed=lambda s, w=0.0: record_check_s(p, s, w),
                   exclude=exclude_list(d.get("push_exclude_paths")), allow=allow_protected(d), check_run_dir=output,
                   guard=version_guard(d), landed=landed_heads(p.db))
-        if rc == 0 and last_pushed and (also := fast_forward_list(d.get("fast_forward_also"))):
-            last_ff = fast_forward(repo, remote, last_pushed, also, branch)
-        if rc == 0 and last_pushed and (mirrors := mirror_list(d.get("mirror_remotes"))):
-            last_ff = last_ff + mirror_safely(repo, last_pushed, mirrors, f"{remote}/{branch}")
-            for line in ff_warnings(last_ff):
-                if line.startswith("not mirrored "):
-                    run_note(f"ttp push: pushed {last_pushed[:10]} to {remote}/{branch}, but {line}")
+        if rc == 0 and last_pushed:
+            _spread(repo, remote, branch, d)
         if rc == 0 and last_pushed:   # a push queue batch runs its own (batch.run_batch), never this
-            pending_after = (last_pushed, f"{remote}/{branch}", last_tip or "")
+            pending_after = (last_pushed, f"{remote}/{branch}", "")
     if rc == 0 and remote != LOCAL:   # no remote: nothing to fetch the intended branch from
         sha = (None if own else last_pushed) or _git(repo, "rev-parse", "HEAD").stdout.strip()
         try:
@@ -5284,6 +5385,32 @@ def _run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None
     if after and pending_after:
         last_after = run_after(p, repo)
     return rc
+
+
+def _own_args(p: Project, repo: Path, remote: str, branch: str) -> dict:
+    """publish's base, fast-forward and lease arguments for `ttp push --own` of `branch` (_run)."""
+    say_target(repo, remote, branch)
+    # The docs-only test, if_changed scopes and the project's own checks may all compare with the
+    # shared branch this work leaves from: always fetch it (cheap), so none sees a stale base.
+    base = own_base(p, repo, remote)
+    # A rebase replaces the branch it rebases, keeping what it gained since the rebase started.
+    rebase = own_rebase(p, branch)
+    lease, start = rebase is not None, worktree.rebase_start(repo, rebase["id"]) if rebase else ""
+    start_ref = f"{worktree.REBASE_START_REF}{rebase['id']}" if rebase else ""
+    return {"base": base, "ff_only": own_ff_only(branch) and not lease, "lease": lease, "start": start,
+            "start_ref": start_ref}
+
+
+def _spread(repo: Path, remote: str, branch: str, d: dict) -> None:
+    """After a push of last_pushed to remote/branch (_run): fast-forward delivery.fast_forward_also and mirror
+    delivery.mirror_remotes, into last_ff; a branch not mirrored gets a run note."""
+    if also := fast_forward_list(d.get("fast_forward_also")):
+        last_ff[:] = fast_forward(repo, remote, last_pushed, also, branch)
+    if mirrors := mirror_list(d.get("mirror_remotes")):
+        last_ff.extend(mirror_safely(repo, last_pushed, mirrors, f"{remote}/{branch}"))
+        for line in ff_warnings(last_ff):
+            if line.startswith("not mirrored "):
+                run_note(f"ttp push: pushed {last_pushed[:10]} to {remote}/{branch}, but {line}")
 
 
 def run_after(p: Project, repo: Path) -> dict | None:
@@ -5480,14 +5607,6 @@ def _tail(path: str | None, n: int = LOG_TAIL) -> str:
         return "\n".join(Path(path).read_text(errors="replace").splitlines()[-n:]) if path else ""
     except OSError:
         return ""
-
-
-def pid_ns() -> str | None:
-    """This process's PID namespace ("pid:[4026531836]"); None where there is no /proc."""
-    try:
-        return os.readlink("/proc/self/ns/pid")
-    except OSError:
-        return None
 
 
 def cgroup() -> str | None:
@@ -5862,7 +5981,7 @@ def _run_retrying(p: Project, repo: Path, marker: Path, own: bool, rec: dict | N
     m = _read(marker)
     remote, branch = str(m.get("remote") or ""), str(m.get("branch") or "")
     done = _retries(m)
-    if done and done[-1].get("cause") == REBOOT and _rebasing(repo):
+    if done and done[-1].get("cause") == REBOOT and _rebase_in_progress(repo):
         print("ttp push: aborting the rebase the reboot cut short", file=sys.stderr, flush=True)
         _git(repo, "rebase", "--abort")
     while True:
@@ -5903,7 +6022,7 @@ def moved_on(p: Project, repo: Path, remote: str, branch: str, start: str) -> st
     return tip if descends(repo, start, "HEAD") and descends(repo, start, tip) else ""
 
 
-def _rebasing(repo: Path) -> bool:
+def _rebase_in_progress(repo: Path) -> bool:
     git_dir = Path(_git(repo, "rev-parse", "--absolute-git-dir").stdout.strip() or ".")
     return any((git_dir / d).is_dir() for d in ("rebase-merge", "rebase-apply"))
 
@@ -5936,14 +6055,14 @@ def _restartable(m: dict) -> bool:
     return bool(m.get("repo") and m.get("log") and m.get("check_run_dir")) and isinstance(m.get("env"), dict)
 
 
-def _spent(m: dict) -> str:
+def _retries_spent(m: dict) -> str:
     n = len(_retries(m))
     if not (_rebooted(m) and _restartable(m)) or n < retries_of(m.get("retry_max")):
         return ""
     return f"; {REBOOT}: already retried {n} time(s), the most delivery.push_retries allows"
 
 
-def _requeue(marker: Path, m: dict) -> bool:
+def _requeue_rebooted(marker: Path, m: dict) -> bool:
     """Queue again, for the daemon to start (_tend_one), the push of `marker` that a host reboot cut
     short, while its retries last. True when it is queued (or another process is handling it right now:
     its run lock is taken), False to record it as failed."""
@@ -5980,10 +6099,10 @@ def _settle(marker: Path) -> dict:
         return m
     if m.get("status") == "running" and locks.any_free([_run_lock(marker)]):
         m = _read(marker)      # read after the lock: the push writes its outcome before letting go
-        if m.get("status") == "running" and _requeue(marker, m):
+        if m.get("status") == "running" and _requeue_rebooted(marker, m):
             return _read(marker)
         if m.get("status") == "running":
-            m.update(status="failed", exit=None, ended=time.time(), reason=_dead_reason(m) + _spent(m))
+            m.update(status="failed", exit=None, ended=time.time(), reason=_dead_reason(m) + _retries_spent(m))
             write_json(marker, m)
             _forget_lock(marker)
     elif m.get("status") == "queued" and time.time() - float(m.get("queued") or 0) > QUEUED_S:
@@ -6228,7 +6347,7 @@ def cancel(p: Project, marker: Path) -> int:
         pid = m.get("pid")
         if m.get("status") == "running" and isinstance(pid, int) and pid > 1:
             did = True
-            m["cancel_requested"] = by   # a reboot's requeue (_requeue) never starts it again
+            m["cancel_requested"] = by   # a reboot's requeue (_requeue_rebooted) never starts it again
             write_json(marker, m)
             say(f"ttp push: stopping the push process group {pid} (TERM, then KILL after {CANCEL_GRACE_S} s)")
             if not _end_cancelled_group(marker, pid, say):
@@ -6385,35 +6504,8 @@ def stop_own(p: Project, marker: Path, why: str = "") -> int:
         if jobstop.end_push(p, marker, why, int(me)) is None and _read(marker).get("status") in ("queued", "running"):
             say(f"not stopped: the daemon is starting the push {marker.stem} right now; run this again")
             return NOT_STOPPED
-    else:
-        run_lock, pid = _run_lock(marker), m.get("pid")
-        if not (isinstance(pid, int) and pid > 1) or str(marker) not in jobstop._argv(pid):
-            say(f"not stopped: pid {pid} of the push {marker.stem} is not its push process")
-            return NOT_STOPPED
-        sent = []
-        for sig, group in ((signal.SIGTERM, False), (signal.SIGKILL, True)):
-            if group and side.exists():
-                break   # it began its git push meanwhile: never interrupted
-            try:
-                os.killpg(pid, sig) if group else os.kill(pid, sig)
-                sent.append(sig)
-            except OSError:
-                pass
-            deadline = time.monotonic() + STOP_TERM_S
-            while not locks.any_free([run_lock]) and time.monotonic() < deadline:
-                time.sleep(0.1)
-            if locks.any_free([run_lock]):
-                break
-        for sig in sent:
-            detachjob.signalled(marker, sig, pid, "push.stop_own", why, by="push", group=sig == signal.SIGKILL,
-                             state=p.state, task=int(me))
-        if not locks.any_free([run_lock]):
-            say(f"not stopped: the push {marker.stem} " + ("began its git push, which is never interrupted"
-                if side.exists() else f"did not end within {STOP_TERM_S:.0f} s of SIGTERM"))
-            return NOT_STOPPED
-        if _read(marker).get("status") == "pushed":
-            say(f"not removed: the push {marker.stem} pushed before it ended; its marker stays for its result")
-            return NOT_STOPPED
+    elif (rc := _stop_running(p, marker, m, me, why, say)) is not None:
+        return rc
     for f in (marker, marker.with_suffix(".log"), marker.with_suffix(POOL_STATUS_SUFFIX), side, _run_lock(marker)):
         try:
             f.unlink()
@@ -6421,6 +6513,41 @@ def stop_own(p: Project, marker: Path, why: str = "") -> int:
             pass
     print(f"ttp push: stopped the push {marker.stem} (task #{me}) and removed its marker: {why}")
     return 0
+
+
+def _stop_running(p: Project, marker: Path, m: dict, me: str, why: str, say: Callable[[str], None]) -> int | None:
+    """End task #`me`'s running detached push `marker` (marker data `m`) for stop_own: SIGTERM to its process,
+    then SIGKILL to its group after STOP_TERM_S unless it began its git push; None once it ended without
+    pushing, else NOT_STOPPED."""
+    side, run_lock, pid = marker.with_suffix(GIT_PUSH_SUFFIX), _run_lock(marker), m.get("pid")
+    if not (isinstance(pid, int) and pid > 1) or str(marker) not in jobstop._argv(pid):
+        say(f"not stopped: pid {pid} of the push {marker.stem} is not its push process")
+        return NOT_STOPPED
+    sent = []
+    for sig, group in ((signal.SIGTERM, False), (signal.SIGKILL, True)):
+        if group and side.exists():
+            break   # it began its git push meanwhile: never interrupted
+        try:
+            os.killpg(pid, sig) if group else os.kill(pid, sig)
+            sent.append(sig)
+        except OSError:
+            pass
+        deadline = time.monotonic() + STOP_TERM_S
+        while not locks.any_free([run_lock]) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        if locks.any_free([run_lock]):
+            break
+    for sig in sent:
+        detachjob.signalled(marker, sig, pid, "push.stop_own", why, by="push", group=sig == signal.SIGKILL,
+                         state=p.state, task=int(me))
+    if not locks.any_free([run_lock]):
+        say(f"not stopped: the push {marker.stem} " + ("began its git push, which is never interrupted"
+            if side.exists() else f"did not end within {STOP_TERM_S:.0f} s of SIGTERM"))
+        return NOT_STOPPED
+    if _read(marker).get("status") == "pushed":
+        say(f"not removed: the push {marker.stem} pushed before it ended; its marker stays for its result")
+        return NOT_STOPPED
+    return None
 
 
 STOP_BATCH_WAIT_S = 30.0   # stop_batch: how long it waits to see the batch write its 'stopped' outcome
