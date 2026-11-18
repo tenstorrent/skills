@@ -172,21 +172,25 @@ def _ssh(host: str, script: str, direct: bool = False, compress: bool = False) -
 
 
 def paused(host: str, where: str | Path | None = None) -> str:
-    """"paused by <who>: <reason>" when check host `host` is paused, else "": a pause of this project or
-    a shared one (lockprobe.pause), or one another project set on its alias or host name
-    (checkspill.paused_elsewhere). The project is the one the check runs in (project.here, from
-    `where` else this folder); with none, or one it cannot read, nothing is paused."""
-    from . import checkspill, lockprobe, machines, project
+    """paused_in for check host `host` in the project the check runs in (project.here, from `where` else this
+    folder); with none, or one it cannot read, nothing is paused."""
+    from . import project
     try:
         p = project.here(where)
-        if p is None:
-            return ""
-        held = lockprobe.pause(p, p.config(), host)
-        who = (held.get("project") if isinstance(held, dict) else "") or p.name
-        if held is None and (got := checkspill.paused_elsewhere(p, host, machines.load().get(host))):
-            who, held = got
+        return paused_in(p, p.config(), host) if p is not None else ""
     except Exception:
         return ""
+
+
+def paused_in(p, cfg: dict, host: str, machine: dict | None = None) -> str:
+    """"paused by <who>: <reason>" when `host` is paused for project `p`, else "": a pause of this project or
+    a shared one (lockprobe.pause), or one another project set on its alias or host name
+    (checkspill.paused_elsewhere; `machine` its machines record, else read). Errors propagate."""
+    from . import checkspill, lockprobe, machines
+    held = lockprobe.pause(p, cfg, host)
+    who = (held.get("project") if isinstance(held, dict) else "") or p.name
+    if held is None and (got := checkspill.paused_elsewhere(p, host, machine or machines.load().get(host))):
+        who, held = got
     if held is None:
         return ""
     reason = held.get("reason") if isinstance(held, dict) else ""

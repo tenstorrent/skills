@@ -453,18 +453,13 @@ def start(p, task: dict, cfg: dict | None = None) -> list[str]:
 
 def paused(p, cfg: dict, task: dict) -> str:
     """Why a shadow run may not start here now: this host or a resource the live task names is paused, by the
-    lookup a spill check uses (lockprobe.pause, checkspill.paused_elsewhere); "" when none is."""
-    from . import checkspill, lockprobe, machines, project
+    rule a spill check uses (remotecheck.paused_in); "" when none is."""
+    from . import machines, project, remotecheck
     from .coordinator import task_resources
     hit = machines.here()
     for n in dict.fromkeys([*([hit[0]] if hit else []), project.hostname(), *sorted(task_resources(task))]):
-        got = lockprobe.pause(p, cfg, n)
-        who = "" if got is None else "this project"
-        if got is None and (other := checkspill.paused_elsewhere(p, n, hit[1] if hit and n == hit[0] else None)):
-            who, got = other
-        if who:
-            why = got.get("reason") if isinstance(got, dict) else ""
-            return f"{n} is paused by {who}{': ' + str(why) if why else ''}"
+        if why := remotecheck.paused_in(p, cfg, n, hit[1] if hit and n == hit[0] else None):
+            return f"{n} is {why}"
     return ""
 
 
