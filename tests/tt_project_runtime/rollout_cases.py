@@ -155,22 +155,27 @@ def test_health_signals_fail_only_past_their_threshold_and_sample_minimum(env):
     assert "bogus" not in rh.thresholds({"thresholds": {"bogus": 1}})
 
 
-def test_health_flags_a_new_high_alert_a_forward_revert_and_a_stuck_task(env):
-    from ttp import rollout_health as rh
+def test_health_flags_a_new_high_alert_in_the_flags_area_a_forward_revert_and_a_stuck_task(env):
+    from ttp import postland, rollout, rollout_health as rh
     p = make(env)
     th, now = rh.thresholds(None), time.time() + 60
     since = now - 24 * _RH
+    area = rollout.FLAGS["push_isolation"]["area"]
     ins = "INSERT INTO alerts(key, raised, severity, text) VALUES(?,?,?,'x')"
     p.db.x(ins, ("push_not_landing", now - 100 * _RH, "high"))     # seen in the baseline: not new
     p.db.x(ins, ("push_not_landing", now - 5 * _RH, "high"))
     p.db.x(ins, ("push_queue_dying", now - 5 * _RH, "low"))        # not high
-    p.db.x(ins, ("some_other_key", now - 5 * _RH, "high"))         # not in the landing path
-    assert rh.signals(p.db, since, now, th)["failing"] == []
+    p.db.x(ins, ("some_other_key", now - 5 * _RH, "high"))         # in no area
+    assert rh.signals(p.db, since, now, th, area)["failing"] == []
     p.db.x(ins, ("after_push_failed", now - 4 * _RH, "high"))
-    assert rh.signals(p.db, since, now, th)["failing"] == ["new high alert after_push_failed"]
-    rid = p.db.add_task("Redo #7 alone: x", "s", kind="code", origin="daemon")
-    assert any("1 forward revert" in s for s in rh.signals(p.db, since, now, th)["failing"])
+    assert rh.signals(p.db, since, now, th, area)["failing"] == ["new high alert after_push_failed"]
+    rid = p.db.add_task("Redo #7 alone: x", "s", kind="code", origin="daemon")   # reverted before landing: routine
+    assert not any("revert" in s for s in rh.signals(p.db, since, now, th, area)["failing"])
     p.db.x("DELETE FROM tasks WHERE id=?", (rid,))
+    p.db.add_task(f"Revert #7 ttp/t7-x{postland.REVERT_TITLE_TAIL}", "Forward revert of aaa..bbb by the post-landing checks.",
+                  kind="review", status="pushing")
+    assert any("1 forward revert" in s for s in rh.signals(p.db, since, now, th, area)["failing"])
+    p.db.x("DELETE FROM tasks WHERE title LIKE 'Revert %'")
     tid = p.db.add_task("stuck", "s", kind="code")
     p.db.x("UPDATE tasks SET status='running', updated=? WHERE id=?", (now - 3 * _RH, tid))
     assert any(f"#{tid}" in s for s in rh.signals(p.db, since, now, th)["failing"])
@@ -320,3 +325,23 @@ def test_dispatch_leaves_a_routine_task_queued_past_the_scratch_cap_and_starts_a
     ordered = p.db.add_task("ordered", "answer", kind="work", tier="light", priority=3, reply_chat="chat1")
     d._dispatch({})
     assert ordered in started and routine not in started, "work the user ordered is never held by the cap"
+
+
+def test_a_new_high_alert_votes_rollback_only_for_the_flag_in_its_own_area(env):
+    from ttp import rollout, rollout_health as rh
+    p = make(env)
+    th, now = rh.thresholds(None), time.time() + 60
+    since = now - 24 * _RH
+    p.db.x("INSERT INTO alerts(key, raised, severity, text) VALUES('device_prewarm_failed',?,'high','x')", (now - 3 * _RH,))
+    p.db.x("INSERT INTO alerts(key, raised, severity, text) VALUES('after_push_failed',?,'high','x')", (now - 3 * _RH,))
+    area = lambda flag: rollout.FLAGS[flag]["area"]
+    assert rh.signals(p.db, since, now, th, area("device_prewarm"))["failing"] == ["new high alert device_prewarm_failed"]
+    assert rh.signals(p.db, since, now, th, area("push_isolation"))["failing"] == ["new high alert after_push_failed"]
+    for other in ("eta_history", "deslop", "glm_code"):
+        assert rh.signals(p.db, since, now, th, area(other))["failing"] == [], other
+    assert rh.signals(p.db, since, now, th)["failing"] == [], "no area, no alert votes"
+    rollout.set_ring(p.name, "1")
+    for flag in rollout.FLAGS:
+        assert (rh.verdict(p.db, flag, 0, [{"flag": flag, "kind": "set", "to": 1, "ts": since}], {}, now) or {}).get("failing") \
+            == {"device_prewarm": ["new high alert device_prewarm_failed"],
+                "push_isolation": ["new high alert after_push_failed"]}.get(flag, []), flag

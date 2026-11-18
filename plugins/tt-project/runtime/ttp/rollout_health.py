@@ -13,10 +13,20 @@ from __future__ import annotations
 import statistics
 import time
 
+from . import postland, rollout
+
 DEFAULTS = {"failed_runs_pts": 5.0, "min_runs": 20, "land_time_x": 1.5, "cost_x": 1.3, "min_landings": 3,
             "stuck_h": 2.0, "baseline_days": 7.0, "soak_h_0": 1.0, "soak_h_1": 24.0, "max_window_h": 72.0}
-# High alerts that mean the landing path is hurt, whichever flag is on.
-ALERT_KEYS = ("push_not_landing", "push_queue_dying", "after_push_failed", "coordinator_failed", "push_tip_failing")
+# High alerts a flag is judged on: only those of its own area (rollout.FLAGS[flag]["area"]), each a key prefix.
+# The landing-path alerts belong to the push area alone; every other flag is still judged on the generic
+# signals (failed runs, time to land, cost per landing, stuck tasks, forward reverts), which cover the landing path.
+ALERT_AREAS = {
+    "push": ("push_not_landing", "push_queue_dying", "after_push_failed", "coordinator_failed", "push_tip_failing"),
+    "route": ("route", "model_", "auth_"),
+    "eta": ("eta",),
+    "device": ("device", "broker"),
+    "review": ("review", "deslop"),
+}
 H = 3600.0
 
 
@@ -62,8 +72,9 @@ def _landings(db, a: float, b: float) -> list[tuple[float, float]]:
     return [(r["l"] - (r["c"] or r["l"]), float(r["s"] or 0)) for r in rows]
 
 
-def signals(db, since: float, now: float, th: dict) -> dict:
-    """The window [since, now) against the baseline before `since`: the measures and the failing signals."""
+def signals(db, since: float, now: float, th: dict, area: str | None = None) -> dict:
+    """The window [since, now) against the baseline before `since`: the measures and the failing signals.
+    `area` is the flag's area: a new high alert counts only if its key starts with one of ALERT_AREAS[area]."""
     base_a = since - th["baseline_days"] * 86400
     nb, fb = _runs(db, base_a, since)
     nw, fw = _runs(db, since, now)
@@ -81,10 +92,10 @@ def signals(db, since: float, now: float, th: dict) -> dict:
     seen = {r["key"] for r in db.q("SELECT key FROM alerts WHERE severity='high' AND raised>=? AND raised<?",
                                    (base_a, since))}
     for r in db.q("SELECT DISTINCT key FROM alerts WHERE severity='high' AND raised>=? AND raised<?", (since, now)):
-        if r["key"] in ALERT_KEYS and r["key"] not in seen:
+        if r["key"].startswith(ALERT_AREAS.get(area or "", ())) and r["key"] not in seen:
             fail.append(f"new high alert {r['key']}")
-    rev = db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon' AND title LIKE 'Redo #%' AND created>=? AND created<?",
-                 (since, now))["n"]
+    rev = db.one("SELECT COUNT(*) n FROM tasks WHERE title LIKE ? ESCAPE '\\' AND created>=? AND created<?",
+                 ("Revert %" + postland.REVERT_TITLE_TAIL.replace("%", "\\%").replace("_", "\\_"), since, now))["n"]
     if rev:
         fail.append(f"{rev} forward revert(s) of a landed change")
     stuck = db.q("SELECT id FROM tasks WHERE status='running' AND updated<? AND NOT EXISTS "
@@ -102,7 +113,7 @@ def verdict(db, flag: str, ring: int, recs: list[dict], cfg: dict, now: float | 
     since = entered(flag, ring, recs)
     if since is None:
         return None
-    v = signals(db, since, now, thresholds(cfg))
+    v = signals(db, since, now, thresholds(cfg), rollout.FLAGS.get(flag, {}).get("area"))
     v["since"] = since
     return v
 

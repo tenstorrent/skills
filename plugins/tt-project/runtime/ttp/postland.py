@@ -44,6 +44,9 @@ EVENT = "post_land"
 BUSY_PASSES = 3   # passes a landing waits on a busy test lock (each after gatejudge's backoff) before it is unattributed
 DEAD_RETRIES = 2  # reruns of a landing whose driver died without a result (a reboot, a kill) before it is an error
 
+# A forward revert task's title is "Revert <who>" + this tail; the release-ring health watch counts them.
+REVERT_TITLE_TAIL = ": post-landing tests fail"
+
 
 def driver_argv(job: Path) -> list[str]:
     """The driver process; tests put a stub here."""
@@ -266,7 +269,7 @@ def apply(p: Project, job: dict, got: dict) -> str:
             f"Output tail:\n{str(got.get('tail') or '')[-2000:]}")
     if got.get("revert_head"):   # the revert first; the fix starts once it has landed, on top of it
         with db.tx():
-            tid = db.add_task(f"Revert {who}: post-landing tests fail", kind="review", status="pushing",
+            tid = db.add_task(f"Revert {who}{REVERT_TITLE_TAIL}", kind="review", status="pushing",
                               spec=f"Forward revert of {span} by the post-landing checks.")
             pushq.approve(p, tid, None, {"entries": [{"branch": got["revert_branch"], "head": got["revert_head"]}],
                                          "target": job["target"]})

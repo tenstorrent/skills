@@ -5121,9 +5121,12 @@ config or state. The shipped defaults list no project: which projects are in rin
 Health watch. Every 15 minutes the daemon compares each project that has a flag on with its own trailing 7 days
 before the flag reached its ring, with no model call. A flag turns off for everyone, is frozen and writes the
 ledger (the daemon's rollback) on: failed runs up 5 points (at least 20 runs, login failures excluded); median
-time to land over 1.5x or cost per landing over 1.3x (at least 3 landings); a new high alert on the landing path
-(`push_not_landing`, `push_queue_dying`, `after_push_failed`, `coordinator_failed`, `push_tip_failing`) not seen
-in the baseline; a forward revert of a landed change; or a task running with no run and no change for 2 h. The
+time to land over 1.5x or cost per landing over 1.3x (at least 3 landings); a new high alert in the flag's own area
+(the `area` of `ttp rollout status`: `push` is judged on `push_not_landing`, `push_queue_dying`, `after_push_failed`,
+`coordinator_failed`, `push_tip_failing`; `route`, `eta`, `device` and `review` on alerts whose key starts with
+`route`/`model_`/`auth_`, `eta`, `device`/`broker`, `review`/`deslop`) not seen in the baseline; landing-path alerts do
+not roll back a flag of another area, whose landing health the generic signals already cover; a forward revert by the
+post-landing checks of a landed change (a member reverted before landing is routine and not counted); or a task running with no run and no change for 2 h. The
 limits are settings (`rollout.thresholds`: `failed_runs_pts`, `min_runs`, `land_time_x`, `cost_x`,
 `min_landings`, `stuck_h`, `baseline_days`, `soak_h_0`, `soak_h_1`, `max_window_h`). A rollback raises a normal
 alert for the project's coordinator; the flag stays off until `ttp rollout arm <flag>`. A flag promotes one ring
