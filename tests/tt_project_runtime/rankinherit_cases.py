@@ -82,3 +82,59 @@ def test_a_run_whose_supervisor_is_gone_is_lost_though_its_lease_is_young(env, t
     assert d._run_alive(dict(row, boot_id="another-boot")) is True
     (run_dir / "exit.json").write_text("{}")
     assert d._run_alive(row) is False
+
+
+def _lost_run(p, d, tmp_path, tid, name):
+    """A worker run of task tid whose supervisor died on this boot a moment ago (lease still young, its
+    recorded start matching no process), reaped by the daemon's own pass. Returns the run's row."""
+    import json
+    run_dir = tmp_path / name
+    run_dir.mkdir()
+    gone = subprocess.Popen([sys.executable, "-c", "pass"])
+    gone.wait()
+    (run_dir / "runner.pid").write_text(f"{gone.pid}\n123456\n")
+    (run_dir / "lease").touch()
+    (run_dir / "output.jsonl").write_text(json.dumps({"_session": "s", "_cost": 0.1}))
+    (run_dir / "run.json").write_text(json.dumps({"cwd": str(p.root)}))
+    p.db.update_task(tid, status="running")
+    p.db.x("INSERT INTO runs(task,role,provider,started,status,dir,boot_id,pid,note) VALUES(?,?,?,?,?,?,?,?,?)",
+           (tid, "worker", "fake", time.time() - 90, "running", str(run_dir), d.boot, gone.pid,
+            json.dumps({"spec_sha": "x"})))
+    d.reap_runs()
+    return p.db.one("SELECT * FROM runs WHERE task=? ORDER BY id DESC LIMIT 1", (tid,))
+
+
+def test_a_lost_runner_s_task_is_ready_again_on_the_same_pass_that_finds_it(env, tmp_path):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    p.db.x("UPDATE tasks SET status='done'")
+    tid = p.db.add_task("crashed", "s", kind="work", tier="light", origin="user", priority=2)
+    t0 = time.time()
+    run = _lost_run(p, d, tmp_path, tid, "first")
+    assert run["status"] == "lost"
+    task = p.db.task(tid)
+    # No attempt spent and no retry timer: the first loss in a row is dispatched at the next tick.
+    assert task["status"] == "queued" and task["attempts"] == 0 and not task["not_before"], dict(task)
+    assert tid in [t["id"] for t in p.db.ready_tasks()]
+    assert time.time() - t0 < 120   # the whole find-and-requeue is far inside the 2 min target
+
+
+def test_replacement_gaps_run_from_the_last_sign_of_life_to_the_next_worker_run(env):
+    p = make(env)
+    from ttp import replacegap
+    now = 1_000_000.0
+    tid = p.db.add_task("t", "s", kind="work", tier="light", origin="user")
+    other = p.db.add_task("o", "s", kind="work", tier="light", origin="user")
+    ins = "INSERT INTO runs(task,role,provider,started,ended,status) VALUES(?,?,?,?,?,?)"
+    p.db.x(ins, (tid, "worker", "fake", now - 900, now - 600, "lost"))
+    p.db.x(ins, (tid, "worker", "fake", now - 540, now - 100, "ok"))     # replaced 60 s after the loss
+    p.db.x(ins, (other, "worker", "fake", now - 500, now - 400, "lost"))  # no next run yet: open until now
+    p.db.x(ins, (other, "coordinator", "fake", now - 380, now - 370, "ok"))   # a coordinator run is no replacement
+    p.db.x(ins, (tid, "worker", "fake", now - 9e5, now - 8e5, "lost"))   # older than the window
+    got = {g["task"]: g for g in replacegap.gaps(p.db, 86400.0, now)}
+    assert got[tid]["gap_s"] == 60.0 and not got[tid]["open"]
+    assert got[other]["gap_s"] == 400.0 and got[other]["open"]
+    s = replacegap.summary(p.db, 86400.0, now)
+    assert s["count"] == 2 and s["over_target"] == 1 and s["open"] == 1 and s["p90_s"] == 400.0
+    assert replacegap.summary(p.db, 10.0, now)["count"] == 0
