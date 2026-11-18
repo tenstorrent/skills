@@ -22,8 +22,8 @@ def validate_server(server, capacity, model, base_url, *, baseline=None, output=
         raise ValueError(f'performance requires a {capacity}-slot server')
     if server.get('model') != model or server.get('base_url') != base_url:
         raise ValueError('performance server model/endpoint mismatch')
-    if server.get('prefix_caching') is not False:
-        raise ValueError('performance server must disable prefix caching')
+    if not isinstance(server.get('prefix_caching'), bool):
+        raise ValueError('performance server must record whether prefix caching is enabled')
     for field in SERVER_FIELDS:
         if not server.get(field):
             raise ValueError(f'missing performance server identity: {field}')

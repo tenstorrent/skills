@@ -11,12 +11,13 @@ from benchmark_stage.responses import read_jsonl, scoring_response
 from benchmark_stage.subsets import digest, flatten
 
 
-def evaluate(*, model, base_url, manifest_path, group, output, generation=None):
+def evaluate(*, model, base_url, manifest_path, group, output, generation=None, concurrency=32):
     return evaluate_groups(model=model, base_url=base_url, manifest_path=manifest_path,
-                           groups=[group], output=output, generation=generation, shared=False)[group]
+                           groups=[group], output=output, generation=generation, shared=False,
+                           concurrency=concurrency)[group]
 
 
-def evaluate_groups(*, model, base_url, manifest_path, groups, output, generation=None, shared=True):
+def evaluate_groups(*, model, base_url, manifest_path, groups, output, generation=None, shared=True, concurrency=32):
     from importlib.metadata import version
     from lm_eval import evaluator
     from lm_eval.models.openai_completions import LocalChatCompletion
@@ -114,7 +115,7 @@ def evaluate_groups(*, model, base_url, manifest_path, groups, output, generatio
     # the complete stage's deadline, including queued and in-flight requests.
     request_timeout_seconds = 3600
     backend = RecordedChat(model=model, base_url=base_url.rstrip('/') + '/v1/chat/completions',
-                           num_concurrent=32, max_retries=0, timeout=request_timeout_seconds,
+                           num_concurrent=concurrency, max_retries=0, timeout=request_timeout_seconds,
                            tokenized_requests=False, tokenizer_backend=None, max_gen_toks=2048)
     started = time.time()
     result = evaluator.simple_evaluate(
@@ -148,7 +149,7 @@ def evaluate_groups(*, model, base_url, manifest_path, groups, output, generatio
                 projected[field] = {k: v for k, v in projected[field].items() if k in {*children, group}}
         projected['benchmark_stage'] = {
             'model': model, 'group': group, 'subset_sha256': expected_hash,
-            'concurrency': 32, 'elapsed_seconds': elapsed,
+            'concurrency': concurrency, 'elapsed_seconds': elapsed,
             'timing_scope': 'shared accuracy pass' if shared else 'single task group',
             'shared_groups': groups if shared else [],
             'request_timeout_seconds': request_timeout_seconds,

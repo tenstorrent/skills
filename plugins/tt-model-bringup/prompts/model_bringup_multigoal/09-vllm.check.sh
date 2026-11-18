@@ -27,4 +27,7 @@ contract_rc=$?
 
 python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_prefill_features.py" \
   --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}" --stage vllm || exit $?
+python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_agentic_serving.py" \
+  --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}" --stage vllm || serving=$?
+[ "${serving:-0}" -gt "$contract_rc" ] && contract_rc=$serving
 exit "$contract_rc"

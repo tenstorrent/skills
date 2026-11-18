@@ -21,4 +21,9 @@ python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_context_contract.py" \
 
 python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_prefill_features.py" \
   --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}" \
-  --stage optimized-vllm --require-burst
+  --stage optimized-vllm --require-burst || rc=$?
+[ "${rc:-0}" -ge 2 ] && exit "$rc"
+python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_agentic_serving.py" \
+  --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}" --stage optimized-vllm || serving=$?
+[ "${serving:-0}" -gt "${rc:-0}" ] && rc=$serving
+exit "${rc:-0}"

@@ -179,7 +179,7 @@ python -m readiness_check.run_vllm_server \
   --model-dir "$MODEL_DIR" \
   --hf-model "$HF_MODEL_OR_LOCAL_WEIGHTS" \
   --mesh-device T3K \
-  --max-num-seqs 32 \
+  --max-num-seqs <batch the release serves> \
   --max-model-len "$MAX_MODEL_LEN" \
   --tt-config '{"sample_on_device_mode": "all"}' \
   --additional-server-args "--served-model-name $HF_MODEL"

@@ -20,4 +20,10 @@ python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_context_contract.py" \
   --stage full-model --require-contract || exit $?
 
 python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_serving_contract.py" \
-  --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}" --require-contract
+  --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}" --require-contract || contract=$?
+[ "${contract:-0}" -ge 2 ] && exit "$contract"
+rc=${contract:-0}
+python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_agentic_serving.py" \
+  --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}" --stage full-model || serving=$?
+[ "${serving:-0}" -gt "$rc" ] && rc=$serving
+exit "$rc"
