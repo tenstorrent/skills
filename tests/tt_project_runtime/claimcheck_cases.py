@@ -291,6 +291,24 @@ def test_a_cant_reach_claim_is_judged_by_each_machines_last_ssh_probe(env):
     assert _cc_sent(p)[-1].startswith(claimcheck.FALSE_MARK) and _cc_false_events(p)
 
 
+def test_a_reach_claim_seen_from_another_host_never_tests_that_host_as_a_target(env):
+    """Upstream note eebc378fb8d5a9c6: 'From box-a, box-b is unreachable' was marked false because box-a,
+    the claim's source, answered this host's probe. The record holds probes from this host only: a claim
+    seen from another host is left unverified, never judged on its source or its targets."""
+    from ttp import claimcheck, machines, reach
+    p = make(env)
+    now = time.time()
+    for h in ("box-a", "box-b"):
+        machines.add(h)
+    reach.record({"box-a": True, "box-b": True}, now - 60)
+    for text in ("From box-a, box-b is unreachable.", "box-b can't be reached from box-a.",
+                 "From the laptop, box-b is unreachable."):
+        got, false, unv = claimcheck.check(p, text, now=now)
+        assert not false and unv == 1, (text, got, false)
+    _, false, _ = claimcheck.check(p, "box-b is unreachable from here.", now=now)
+    assert false, "reach from this host is still judged"
+
+
 def test_the_digest_shows_each_machines_reach_and_the_daemon_probes_due_machines(env, monkeypatch):
     from ttp import coordinator as coord, daemon as dm, machines, netwait, reach
     p = make(env)

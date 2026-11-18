@@ -95,9 +95,29 @@ def digest_lines(p, now: float | None = None) -> list[str]:
     return out
 
 
+# 'From X, ... cannot reach Y' or '... unreachable from X': reach seen from X, not from this host.
+_SOURCE = re.compile(r"(?i)\bfrom\s+(?:the\s+)?([\w.-]*\w)")
+_HERE = {"here", "this", "localhost"}
+
+
+def _source(sentence: str) -> str | None:
+    """The host a reach claim is seen from, when it names one other than this host."""
+    import socket
+    me = {socket.gethostname().split(".")[0].lower(), socket.gethostname().lower()}
+    for m in _SOURCE.finditer(sentence):
+        if m.group(1).lower() not in _HERE | me:
+            return m.group(1)
+    return None
+
+
 def judge(p, sentence: str, now: float) -> tuple[str, str]:
     """('false' | 'ok' | 'unverified', why) for a sentence saying machines cannot be reached: false when one
-    it names answered ssh within ssh.reach_fresh_min, ok when each it names failed one that fresh."""
+    it names answered ssh within ssh.reach_fresh_min, ok when each it names failed one that fresh. A claim
+    seen from another host ('From X, ...') is unverified: the record holds probes from this host only, and
+    X itself is the claim's source, never a target (upstream note eebc378fb8d5a9c6)."""
+    src = _source(sentence)
+    if src:
+        return "unverified", f"reach from {src} is not probed here; the record holds this host's ssh probes only"
     fresh = _settings(p)[1]
     st = read()
     names = [a for a, m in machines.load().items()
