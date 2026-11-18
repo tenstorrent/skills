@@ -27530,6 +27530,7 @@ def test_durable_write_syncs_renames_and_keeps_the_mode(env, monkeypatch):
 # Every place the runtime writes a file directly, and why it need not survive a power cut. Anything
 # else goes through project.durable_write / durable_append / write_json.
 DURABLE_EXEMPT = {
+    ("occupancy.py", 'open(f"/proc/{pid}/autogroup", "w")'): "a kernel setting (a session's autogroup nice) written through /proc while a stream holds the box; never state",
     ("rolerestore.py", '(Path(run_dir) / ROLE_FILE).write_text('): "a run's role restatement in its own run folder, rewritten at every run start; a cut file only skips one restatement",
     ("rolerestore.py", '(Path(run_dir) / RESTATED_FILE).write_text('): "a run's count of restatements already given, in its own run folder; a cut count only restates once more",
     ("deviceshadow.py", 'f.write_text(f"#!/bin/sh'): "the refusing stand-in for a device tool in a shadow cell's temporary folder, rebuilt for every cell; never state",
