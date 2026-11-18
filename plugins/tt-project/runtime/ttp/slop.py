@@ -34,6 +34,8 @@ import tokenize
 from collections import defaultdict
 from pathlib import PurePosixPath
 
+from . import gitmemo
+
 DEFAULTS = {
     "enabled": False,            # the deslop schedule (the review rule and the scan are always on)
     "every": "1d",
@@ -363,7 +365,8 @@ def _analyze(path: str, key: str, text_fn, max_lines: int, deadline: float | Non
 
 
 def _git(root, *args, check=True) -> str:
-    r = subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True, errors="replace", timeout=120)
+    r = gitmemo.run(["git", "-C", str(root), *args], capture_output=True, text=True, errors="replace",
+                    stdin=subprocess.DEVNULL, timeout=120)
     if r.returncode and check:
         raise RuntimeError(r.stderr.strip() or f"git {args[0]} failed")
     return r.stdout if r.returncode == 0 else ""

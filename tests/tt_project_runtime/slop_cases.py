@@ -154,6 +154,7 @@ def test_the_deslop_pass_skips_a_paused_or_switched_off_project(env, monkeypatch
     from ttp import deslop, projpause
     p, dm, s = _deslop_project(env, monkeypatch)
     projpause.pause(p.db, "user", "change freeze")
+    p.db.set_kv("paused", True)
     assert dm._schedule_llm(s, dict(deslop.PAYLOAD)) == "skipped: the project is paused"
     assert not _deslop_tasks(p)
     projpause.resume(p.db, "user")
