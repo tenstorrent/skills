@@ -109,7 +109,6 @@ rates explain. It runs on the local machine; no CI is needed.
 
 | Field | Default |
 |---|---|
-| `entry` | `autoport` (stages 01–11 ran), or `existing` (see Entry paths) |
 | `mode` | `quick` (phase 1, no task containers), `agentic` (phases 1–2; needs Docker, RAM and disk for task containers), `extended` (agentic plus the extended phase). Each mode includes the one before. Default `agentic` |
 | `batch_sizes` | `[1, 8, 16, 32]`; replaces the default decode batch set for every stage |
 | `phase1` | `{"suite": "r1_gpqa_diamond", "tasks": 10}` |
@@ -130,14 +129,6 @@ rates explain. It runs on the local machine; no CI is needed.
 Before stage 9 the operator proves the setup: Docker (or the harness's container runtime), gated dataset
 credentials, and host RAM and disk for task containers. A mode or machine change
 mid-run repeats stage 10's agent-load checks.
-
-### Entry paths
-
-- **`autoport`**: a new model through stages 01–11. Limits and release rows come from the closest model
-  in tt-inference-server's model specs with a published reference; record which.
-- **`existing`**: the model already has a tt-inference-server model spec. Start at stage 11 with that
-  spec's serving config, limits and release rows; stages 06–10 evidence is not required, and the gate
-  skips the `agentic_serving.json` checks.
 
 ### References
 
@@ -256,7 +247,7 @@ Triage: script, then sub-agent, then the coordinator.
   `looping_actions`, `repeating_tokens`, `stalled` or `anomaly` with high confidence and cited calls proves it
   did not just need more room; otherwise rerun it at a higher limit.
 
-Before the first eval run (stage 11's end or stage 12's start), send one short request through the served
+Before the first eval run, at stage 12's start once its server is up, send one short request through the served
 route and check that the server's log holds its body, token counts and finish reason
 (`reply_digest.py --check-log --log <server log> --id <its id> --record doc/agentic_evals/logging_check.json`
 does it and records `pass`). If it fails, fix response logging (a flag value the server does not parse is enough to lose every reply) before any

@@ -658,14 +658,15 @@ def test_roofline_rejects_invalid_measurement_inputs(tmp_path, mutation):
     with pytest.raises(ValueError): load_roofline(run)
 
 
+@pytest.mark.parametrize('execution', ['sequential', 'shared'])
 @pytest.mark.parametrize('collect', [True, False])
-def test_runner_collects_each_profile_before_switching_with_same_deadline(tmp_path, monkeypatch, collect):
+def test_runner_collects_each_profile_before_switching_with_same_deadline(tmp_path, monkeypatch, collect, execution):
     from benchmark_stage import run as runner
     source = tmp_path / 'manifest.json'
     source.write_text(json.dumps({'manifest_sha256': 'fixture', 'groups': {}}))
     config_path = tmp_path / 'config.json'
     config_path.write_text(json.dumps(dict(model='org/model', base_url='http://unused', performance_server_command=['server-control'],
-        manifest=str(source), tasks=[], roofline_command=['collector'], concurrencies=[1, 32])))
+        manifest=str(source), tasks=[], roofline_command=['collector'], concurrencies=[1, 32], accuracy_execution=execution)))
     deadlines = []
     events = []
     def completed(argv, log, deadline):

@@ -9,7 +9,7 @@ record, and blocks (exit 2) only where a score or a failure could be hidden:
   - a failed task has no cause and evidence, or a task cut off while progressing was not rerun at a higher limit;
   - a rerun changed the score for anything but an infrastructure failure or a limit-cut task, or the
     first-attempt failures do not add up to the score;
-  - the operator's inputs.json holds an unknown mode or entry.
+  - the operator's inputs.json holds an unknown mode.
 Everything else is advisory (exit 1): serving evidence of stages 06-10 (workload, memory ledger, prefix caching,
 growing contexts, per-batch configurations), stage-11 rates and anomaly check, the server size, the logging check,
 explained time, reasoning setting and limits, anomaly and precision-fix entries, interval and mark recomputation,
@@ -35,7 +35,6 @@ LOGGING_CHECK = EVALS / "logging_check.json"
 MIN_HIT_FRACTION = 0.9
 MODES = {"quick": ("phase1",), "agentic": ("phase1", "phase2"), "extended": ("phase1", "phase2")}
 DEFAULT_MODE = "agentic"
-ENTRIES = ("autoport", "existing")
 DEFAULT_TASKS = 10
 DEFAULT_BATCH_SIZES = (1, 8, 16, 32)
 DEFAULT_EXTENDED_SUITES = ("r1_gpqa_diamond", "swe_bench_verified")
@@ -148,8 +147,6 @@ def operator_inputs(model_dir: Path, problems: list) -> dict:
             inputs = read(path, problems)
             if inputs.get("mode", DEFAULT_MODE) not in MODES:
                 problems.append((2, f"{INPUTS} mode must be one of {', '.join(MODES)}"))
-            if inputs.get("entry", "autoport") not in ENTRIES:
-                problems.append((2, f"{INPUTS} entry must be one of {', '.join(ENTRIES)}"))
             return inputs
     return {}
 
@@ -461,6 +458,17 @@ def check_config(run: dict, validated: list, problems: list) -> None:
         problems.append((1, f"run {name} config needs the sha it ran and its precision config"))
 
 
+def check_earlier_run(run: dict, problems: list) -> None:
+    """A scored run that is not a phase's result still has to be collected and give every failure a cause."""
+    name = run.get("id", "?")
+    if run.get("collected") is not True:
+        problems.append((2, f"run {name} was not collected: it needs collected true in results.json"))
+    for row in run.get("failures") or []:
+        if isinstance(row, dict) and (row.get("cause") not in CAUSES or not row.get("evidence") or not row.get("task")):
+            problems.append((2, f"run {name}: failure row {row.get('task')!r} needs task, cause "
+                                f"({', '.join(CAUSES)}) and evidence"))
+
+
 def check_evals(model_dir: Path, inputs: dict, evidence: dict, problems: list) -> None:
     evals = model_dir / EVALS
     validated = check_rates(model_dir, evidence, problems, full=False, inputs=inputs)
@@ -469,6 +477,7 @@ def check_evals(model_dir: Path, inputs: dict, evidence: dict, problems: list) -
     phases = results.get("phases") or {}
     mode = inputs.get("mode", DEFAULT_MODE)
     all_passed = True
+    selected = set()
     for phase in MODES.get(mode, ()):
         spec = inputs.get(phase) or {}
         tasks = spec.get("tasks", DEFAULT_TASKS)
@@ -477,6 +486,7 @@ def check_evals(model_dir: Path, inputs: dict, evidence: dict, problems: list) -
             unmet(problems, inputs, phase, f"{phase} has no scored run in results.json")
             all_passed = False
             continue
+        selected.add(run.get("id"))
         passed = check_run(run, inputs, validated, phase, tasks, problems)
         all_passed = all_passed and passed
         record = phases.get(phase) or {}
@@ -485,6 +495,8 @@ def check_evals(model_dir: Path, inputs: dict, evidence: dict, problems: list) -
         if record.get("pass") is False and not record.get("reason"):
             problems.append((1, f"{phase} is not passed yet; results.json phases.{phase}.reason must say why"))
     for run in runs.values():
+        if run.get("id") not in selected and run.get("score"):
+            check_earlier_run(run, problems)
         if run.get("voided") or run.get("excluded"):
             problems.append((2, f"run {run.get('id')} is voided or excluded; void per task, never the list"))
     check_anomalies(results, runs, phases, inputs, problems)
@@ -525,8 +537,7 @@ def main() -> int:
     model_dir = Path(args.model_dir or "models/autoports/" + re.sub(r"[^a-z0-9]+", "_", args.hf_model.lower()).strip("_"))
     problems: list = []
     inputs = operator_inputs(model_dir, problems) if args.stage in ("benchmark", "agentic-evals") else {}
-    existing = inputs.get("entry") == "existing"
-    evidence = {} if existing else read(model_dir / EVIDENCE, problems)
+    evidence = read(model_dir / EVIDENCE, problems)
     if evidence and args.stage in ("full-model", "vllm", "optimized-vllm", "agentic-evals"):
         check_memory(evidence, problems)
         if args.stage != "full-model":

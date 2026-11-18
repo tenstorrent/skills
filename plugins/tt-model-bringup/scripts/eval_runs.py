@@ -82,7 +82,7 @@ def start(args: argparse.Namespace) -> int:
         raise SystemExit("start needs a command after --")
     if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]*", args.id):
         raise SystemExit(f"run id {args.id!r} may use letters, digits, '.', '_' and '-' only")
-    runs_path = args.model_dir / RUNS
+    runs_path = (args.model_dir / RUNS).resolve()
     exit_file = runs_path.parent / f"{args.id}.exit"
     log = pathlib.Path(args.log) if args.log else runs_path.parent / "current" / args.id / "run.log"
     log.parent.mkdir(parents=True, exist_ok=True)

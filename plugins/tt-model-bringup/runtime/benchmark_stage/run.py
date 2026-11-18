@@ -121,7 +121,9 @@ def run(*, config_path, output):
         summary['accuracy_execution'] = execution
         summary['concurrencies'] = concurrencies
         summary['accuracy_concurrency'] = accuracy_concurrency
-        batches = [config['tasks']] if execution == 'shared' else [[task] for task in config['tasks']]
+        batches = [[task] for task in config['tasks']]
+        if execution == 'shared' and config['tasks']:
+            batches = [config['tasks']]
         for batch in batches:
             generation = config.get('generation', {}).get(batch[0], {})
             if any(config.get('generation', {}).get(task, {}) != generation for task in batch):

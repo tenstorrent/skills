@@ -448,11 +448,6 @@ def test_phase_1_not_passed_still_lets_phase_2_count_and_skips_extended(tmp_path
     assert code == 1 and 'starts after both phases pass' in stderr
 
 
-def test_existing_entry_skips_the_serving_evidence(tmp_path):
-    code, stderr = goal12(tmp_path, inputs={'mode': 'quick', 'entry': 'existing'}, data={})
-    assert (code, stderr) == (0, '')
-
-
 def test_unknown_mode_is_critical(tmp_path):
     assert goal12(tmp_path, inputs={'mode': 'light'})[0] == 2
 
@@ -654,17 +649,6 @@ def test_time_faster_than_explained_passes_with_a_note(tmp_path):
     assert code == 0 and 'NOTE' in stderr and 'pessimistic' in stderr
 
 
-def test_context_contract_is_optional_for_an_existing_model(tmp_path):
-    """entry: existing starts at stage 11; stages 06-10, which write the contract, never ran."""
-    script = PLUGIN / 'scripts/check_context_contract.py'
-    args = [sys.executable, str(script), '--model-dir', 'm', '--stage', 'benchmark', '--require-contract',
-            '--optional-for-existing']
-    assert subprocess.run(args, cwd=tmp_path, capture_output=True).returncode == 2
-    (tmp_path / 'bringup/agentic_evals').mkdir(parents=True)
-    (tmp_path / 'bringup/agentic_evals/inputs.json').write_text(json.dumps({'entry': 'existing'}))
-    assert subprocess.run(args, cwd=tmp_path, capture_output=True).returncode == 0
-
-
 def test_no_stage_reads_an_earlier_run():
     """Each run is independent: no skill, prompt or script of the plugin names a cross-run record."""
     root = Path(__file__).resolve().parents[1] / 'plugins/tt-model-bringup'
@@ -685,3 +669,23 @@ def test_a_non_finite_explained_time_does_not_pass(tmp_path):
 def test_eval_checks_run_when_serving_evidence_is_missing(tmp_path):
     code, stderr = check(tmp_path, 'agentic-evals', {}, {'mode': 'quick'})
     assert code == 2 and 'phase1 has no scored run' in stderr
+
+
+def test_an_earlier_scored_run_is_still_collected_and_explained(tmp_path):
+    first = scored_run('first')
+    later = scored_run('later', solved=9)
+    later['band_pass'] = True
+    phases = {'phase1': {'run': 'later', 'pass': True}}
+    assert goal12(tmp_path, runs=[first, later], phases=phases)[0] == 0
+    first['collected'] = False
+    code, stderr = goal12(tmp_path, runs=[first, later], phases=phases)
+    assert code == 2 and 'run first was not collected' in stderr
+    first['collected'] = True
+    first['failures'][0].pop('cause')
+    code, stderr = goal12(tmp_path, runs=[first, later], phases=phases)
+    assert code == 2 and 'run first: failure row' in stderr
+
+
+def test_an_earlier_run_without_a_score_does_not_block(tmp_path):
+    aborted = {'id': 'killed', 'phase': 'phase1', 'collected': False}
+    assert goal12(tmp_path, runs=[aborted, scored_run()])[0] == 0

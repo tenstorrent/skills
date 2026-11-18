@@ -84,3 +84,12 @@ def test_status_lists_finished_runs_by_default(tmp_path):
     call('wait', '--model-dir', str(tmp_path), '--minutes', '1', '--look-s', '0.1')
     shown = call('status', '--model-dir', str(tmp_path))
     assert shown.returncode == 0 and json.loads(shown.stdout.splitlines()[0])['id'] == 'done'
+
+
+def test_a_relative_model_dir_works_with_another_working_directory(tmp_path, monkeypatch):
+    (tmp_path / 'model').mkdir()
+    (tmp_path / 'harness').mkdir()
+    monkeypatch.chdir(tmp_path)
+    call('start', '--model-dir', 'model', '--id', 'r1', '--cwd', 'harness', '--', 'true')
+    call('wait', '--model-dir', 'model', '--minutes', '1', '--look-s', '0.1')
+    assert runs(tmp_path / 'model')['r1']['conclusion'] == 'exit 0'
