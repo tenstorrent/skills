@@ -1320,7 +1320,7 @@ def _schedule_job(p, tmp_path, argv, cwd=None, **env):
     return proc
 
 
-def _ended(proc, timeout=20):
+def _job_ended(proc, timeout=20):
     try:
         proc.wait(timeout)
         return True
@@ -1357,7 +1357,7 @@ def test_turning_a_schedule_off_stops_the_detached_jobs_its_runs_left_and_nothin
         assert mine.poll() is None and jobstop.running(rc)
         sched.set_enabled(p.db, "bench", False)
         d._stop_off_schedule_jobs()   # the tick after it is turned off
-        assert _ended(mine) and _until_true(lambda: not jobstop.running(rc))
+        assert _job_ended(mine) and _until_true(lambda: not jobstop.running(rc))
         assert other.poll() is None and elsewhere.poll() is None   # an enabled schedule's, another project's
         ev = [json.loads(e["data"]) for e in p.db.q("SELECT data FROM events WHERE kind=?", (jobstop.EVENT,))]
         assert {e.get("schedule") for e in ev} == {"bench"} and len(ev) == 2, ev
@@ -1392,7 +1392,7 @@ def test_a_schedule_already_off_has_jobs_started_before_the_marker_stopped_on_th
         d = Daemon(p.base)
         d.gates = {}
         d.run_schedules()
-        assert _ended(old) and _ended(locked)
+        assert _job_ended(old) and _job_ended(locked)
         assert tasks.poll() is None and unrelated.poll() is None and outside.poll() is None
         texts = [e["text"] for e in p.db.q("SELECT text FROM events WHERE kind=?", (jobstop.EVENT,))]
         assert len(texts) == 2 and all("schedule bench" in t and "started before" in t for t in texts), texts
@@ -1425,7 +1425,7 @@ def test_bench_hold_stops_this_projects_runner_groups_recorded_or_older_and_deta
         assert all(x.poll() is None for x in (recorded, old, outside, ref, foreign))
         p.set_config("model_bench.hold", True)
         d._stop_off_schedule_jobs()   # held: the tick stops this project's runners at once
-        assert _ended(recorded) and _ended(old)
+        assert _job_ended(recorded) and _job_ended(old)
         assert all(x.poll() is None for x in (outside, ref, foreign))
         sig = [json.loads(x) for x in (p.state / detach.SIGNALS).read_text().splitlines()]
         assert {s["reason"] for s in sig} == {tbcycle.STOP_REASON}
@@ -1436,7 +1436,7 @@ def test_bench_hold_stops_this_projects_runner_groups_recorded_or_older_and_deta
         assert set(schedjobs.recorded(p)) == {later.pid}   # gone entries dropped on write
         r = _ttp_run(p, "detach", "--stop", "terminalbench", env={"TTP_PROJECT": str(p.base)})
         assert r.returncode == 0, r.stderr
-        assert _ended(later) and "recorded terminalbench runner" in r.stdout, r.stdout
+        assert _job_ended(later) and "recorded terminalbench runner" in r.stdout, r.stdout
     finally:
         for x in (recorded, old, outside, ref, foreign, later):
             if x:

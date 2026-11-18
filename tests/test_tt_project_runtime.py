@@ -27663,6 +27663,7 @@ DURABLE_EXEMPT = {
     ("devq.py", 'open(lockf, "a")'): "a flock guard file, never written",
     ("devq.py", 'runner.lock", "a")'): "a flock guard file, never written",
     ("detach.py", '.lock", "a")'): "the queue folder's flock guard file, never written",
+    ("detach.py", 'os.replace(f, tmp := f.with_name(f.name + f".{os.getpid()}"))'): "claims a driver's step-failed file by renaming it within its folder (one reader takes it); its text then goes durably to the .seen file",
     ("onhost.py", '.lock", "a")'): "the started-on-host record's flock guard file, never written",
     ("prbody.py", 'os.fdopen(fd, "w"'): "a PR body handed to the project's body check in a private temp file, deleted once the check ends; never state",
     ("watchdog.py", "mark.write_text"): "names a process, which a reboot ends",
