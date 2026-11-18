@@ -4219,7 +4219,10 @@ turn. `waketier.direct` counts, per task kind and wake reason, the last `waiting
 and more than `share` (0.5) of them escalated, such a wake runs at the task's own tier at once. Wakes
 of a wait handed back unchanged, escalated wakes and failure reasons never take it, and
 `waiting.wake_escalation.enabled` false turns it off. `ttp stats --wakes` lists each kind and reason's
-escalation rate. The pick is a function for the daemon's wake-tier step to call; that call is not wired yet.
+escalation rate. The daemon's task start calls it for a wake that would run light and is not already lifted
+by a conclusion floor; the run's wake note then carries `direct`. Because direct wakes no longer add light cases,
+every 8th direct wake of a kind and reason still runs light so the rate is re-measured. A lookup error leaves the
+wake light.
 
 ## A big ETA gets an independent check
 

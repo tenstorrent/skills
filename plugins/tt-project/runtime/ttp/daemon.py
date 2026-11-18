@@ -1273,6 +1273,8 @@ def _findings(fups: list[dict], review: dict, tag: str) -> str:
                       for n, f in enumerate(fups, 1))
 
 
+WAKE_PROBE_EVERY = 8   # of the wakes waketier.direct sends to a task's own tier, one runs light to re-measure
+
 class Daemon:
     def __init__(self, base: str | Path):
         self.p = Project(base)
@@ -13338,6 +13340,11 @@ class Daemon:
             wake = bud.wake_tier(task["tier"], prev, self.cfg, self.p.harness)
             if need and wake:   # a wake whose wait is over may write the answer the user reads
                 wake = max(wake, need["tier"], key=bud.TIER_ORDER.index)
+            direct = None
+            if wake == bud.TIER_ORDER[0] and not (need and need["tier"] != bud.TIER_ORDER[0]):
+                direct = self._wake_direct(task, prev)   # a wake that almost always escalates starts at its own tier
+                if direct:
+                    wake = direct["tier"]
             tier = bud.clamp_tier(wake or task["tier"], gate)
             run_cls = runclass.classify(task, {"role": "worker", "note": {
                 "wake": bool(wake), "tier": tier, "review_tier": review_pick or {},
@@ -13402,7 +13409,8 @@ class Daemon:
                     note["wake"] = {"tier": tier, "escalated": bool(pv.get("escalated_wake")),
                                     "reason": waketier.reason(pv), "gate": (gated or {}).get("by") or "none",
                                     "by": (pv[waketier.PICK].get("by") or "jev") if pv.get(waketier.PICK) else "rule",
-                                    **({"pick": pv[waketier.PICK]} if pv.get(waketier.PICK) else {})}
+                                    **({"pick": pv[waketier.PICK]} if pv.get(waketier.PICK) else {}),
+                                    **({"direct": direct} if direct else {})}
                 if gated:
                     note[waitgate.USE] = gated
                 woke_probe = probewake.valid(db.kv(probewake.KV_PREFIX + str(task["id"]))) \
@@ -14306,6 +14314,25 @@ class Daemon:
         log(self.p, f"task {task['id']} wake tier: light, not {got['from']} ({_picked_by(got)}; "
                     f"reason {waketier.reason(prev)})")
         return out
+
+    def _wake_direct(self, task: dict, prev: dict) -> dict | None:
+        """waketier.direct for a wake about to start at light, or None: it keeps its tier. Every WAKE_PROBE_EVERY-th
+        wake of a kind and reason still runs light, so the escalation rate keeps being measured."""
+        try:
+            got = waketier.direct(self.p.db, self.cfg, task, prev)
+            if not got:
+                return None
+            key = f"wake_direct_n:{got['kind']}:{got['reason']}"
+            n = int(self.p.db.kv(key, 0) or 0) + 1
+            self.p.db.set_kv(key, n)
+            if n % WAKE_PROBE_EVERY == 0:
+                return None
+        except Exception as e:   # a wake keeps its tier
+            log(self.p, f"task {task['id']}: wake direct failed: {type(e).__name__}: {e}")
+            return None
+        log(self.p, f"task {task['id']} wake tier: {got['tier']}, not light (direct: {got['kind']} wakes for "
+                    f"{got['reason']} escalated {got['escalated']}/{got['cases']})")
+        return got
 
     def _unreserve(self, task: dict) -> None:
         for res in _exclusive(task):

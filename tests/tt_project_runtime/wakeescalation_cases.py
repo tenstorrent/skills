@@ -78,3 +78,44 @@ def test_direct_never_applies_to_escalated_stale_fix_or_light_tasks_and_survives
     assert waketier.direct(junk, {}, _task(), _prev()) is not None
     bad = {"waiting": {"wake_escalation": {"last_n": "x", "share": None, "min_cases": []}}}
     assert waketier.escalation_settings(bad) == waketier.ESCALATION_DEFAULTS
+
+
+class _KVDB(_RunsDB):
+    def __init__(self, rows):
+        super().__init__(rows)
+        self.store = {}
+
+    def kv(self, key, default=None):
+        return self.store.get(key, default)
+
+    def set_kv(self, key, value):
+        self.store[key] = value
+
+
+def _daemon(db, cfg=None):
+    import types
+    from ttp import daemon
+    return daemon, types.SimpleNamespace(p=types.SimpleNamespace(db=db), cfg=cfg or {})
+
+
+def test_the_wake_start_uses_the_own_tier_off_switch_restores_light_and_every_8th_runs_light(monkeypatch):
+    daemon, d = _daemon(_KVDB(_esc_runs(1, "code", "EEEEEE")))
+    lines = []
+    monkeypatch.setattr(daemon, "log", lambda p, m: lines.append(m))
+    got = daemon.Daemon._wake_direct(d, _task(), _prev())
+    assert got and got["tier"] == "standard" and "escalated 6/6" in lines[-1] and "code wakes for spec_change" in lines[-1]
+    tiers = [(daemon.Daemon._wake_direct(d, _task(), _prev()) or {}).get("tier") for _ in range(7)]
+    assert tiers == ["standard"] * 6 + [None]   # the 8th wake of this kind and reason (1 + 7) runs light
+    assert daemon.Daemon._wake_direct(d, _task(), _prev())["tier"] == "standard"
+    off = {"waiting": {"wake_escalation": {"enabled": False}}}
+    daemon, d = _daemon(_KVDB(_esc_runs(1, "code", "EEEEEE")), off)
+    assert daemon.Daemon._wake_direct(d, _task(), _prev()) is None
+
+
+def test_a_failing_direct_lookup_keeps_the_wake_light(monkeypatch):
+    from ttp import waketier
+    daemon, d = _daemon(_KVDB([]))
+    lines = []
+    monkeypatch.setattr(daemon, "log", lambda p, m: lines.append(m))
+    monkeypatch.setattr(waketier, "direct", lambda *a: (_ for _ in ()).throw(RuntimeError("boom")))
+    assert daemon.Daemon._wake_direct(d, _task(), _prev()) is None and "wake direct failed" in lines[-1]
