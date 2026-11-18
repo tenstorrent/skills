@@ -15,7 +15,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import overview, project, service, timefmt
+from . import overview, project, release, service, timefmt
 from .db import SEVERITY_RANK
 
 CHECKS = "deploy_checks"
@@ -556,6 +556,12 @@ def tick(p, alert, now: float | None = None) -> None:
             if service.stopped_at(rec["name"], rec.get("entry") or {}, row):   # stopped on purpose: closed quietly
                 _settle(rec, "stopped", now)
                 rec["closed"] = now
+                continue
+            hold = row.get("state") != overview.OK and release.upgrade_hold(rec["name"], now)
+            if hold:   # kept on its release on purpose: no takeover, no alert; its daemon upgrades once it ends
+                _settle(rec, "held", now)
+                rec["closed"] = now
+                _log(p, rec["name"], f"deploy of {rec.get('target')} skipped: release {release.hold_text(hold, p)}")
                 continue
             outcome, kind, reason = _judge(p, rec, row, takeovers.setdefault(rec["name"], {}), now, start=True)
             _settle(rec, outcome, now)

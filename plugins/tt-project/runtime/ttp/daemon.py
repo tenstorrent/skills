@@ -14823,6 +14823,13 @@ class Daemon:
                                               f"{stuck}.", "normal", every_s=0)
         why = release.hold_reason(self.p, d)
         release.note_push_hold(self.p, d["key"], why)
+        if why.startswith(release.HELD_BY_USER):   # skipped while it stands; checked again as its time ends
+            hold = release.upgrade_hold(self.p.name, probe=False) or {}
+            self._release_due = min(self._release_due, float(hold.get("until") or self._release_due) + 1)
+            if why != getattr(self, "_release_user_hold", ""):
+                self._release_user_hold = why
+                log(self.p, f"automatic upgrade to {d['installed']} skipped: {why}")
+            return
         if why:
             soon = why.endswith(("in flight", release.CYCLE_HELD, release.RECHECK))
             if soon:    # past upgrade.push_hold_min a push step's end is looked for sooner

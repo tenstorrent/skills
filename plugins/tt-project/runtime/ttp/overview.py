@@ -590,8 +590,8 @@ def deployed(target: str | None = None, commit: str | None = None, names: list[s
         return {**out, "rc": CANNOT, "text": "cannot tell: no version given and no release installed (`ttp setup`)"}
     reg = project.load_registry().get("projects") or {}
     pick = sorted(reg) if not names else names
-    rows, stopped = [], []
-    from . import service
+    rows, stopped, held = [], [], []
+    from . import release, service, timefmt
     for n in pick:
         e = reg.get(n)
         if not isinstance(e, dict):
@@ -599,8 +599,11 @@ def deployed(target: str | None = None, commit: str | None = None, names: list[s
                          "line": f"{n}\tcannot tell: not registered on this machine"})
         elif names or e.get("host") in (None, here):
             row = deploy_status(n, e, target, commit, now, here, fresh_s, allow_newer)
+            hold = row["state"] != OK and release.upgrade_hold(n, now)
             if not names and service.stopped_at(n, e, row):
                 stopped.append(n)   # stopped on purpose: no verdict, count or alert until it is started again
+            elif hold:   # kept on its release on purpose (`ttp upgrade <name> --hold`): no verdict or count either
+                held.append((n, f"{n}\t{release.hold_text(hold, timefmt.ambient())} (left out of this deploy)"))
             else:
                 rows.append(row)
     rc = max((r["state"] for r in rows), default=OK)
@@ -612,5 +615,6 @@ def deployed(target: str | None = None, commit: str | None = None, names: list[s
     if not rows:
         first = f"{head}: no projects registered on this machine"
     lines = [first] + [r["line"] for r in sorted(rows, key=lambda r: -r["state"])]   # what holds it back first
-    lines += [f"{n}\t{service.STOPPED_ON_PURPOSE}" for n in stopped]
-    return {**out, "rc": rc, "projects": rows, "stopped": stopped, "text": "\n".join(lines)}
+    lines += [f"{n}\t{service.STOPPED_ON_PURPOSE}" for n in stopped] + [ln for _, ln in held]
+    return {**out, "rc": rc, "projects": rows, "stopped": stopped, "held": [n for n, _ in held],
+            "text": "\n".join(lines)}

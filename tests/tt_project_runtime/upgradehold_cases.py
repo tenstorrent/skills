@@ -527,3 +527,88 @@ def test_a_takeover_that_cannot_start_sends_one_note_with_its_error(env, monkeyp
     assert release.escalate_stuck(p) == "" and calls == [tid]
     got = _stuck_notes(tid)
     assert len(got) == 1 and "no installed release" in got[0]["spec"] and "--apply` is refused" in got[0]["spec"]
+
+
+def test_a_release_hold_skips_the_automatic_upgrade_until_it_expires(env, monkeypatch):
+    """A user's 'keep it on its release until the demo is over' (release.set_hold, in this host's tt-project
+    home) holds the daemon's own hourly upgrade, not only a deploy; once its time passes the upgrade runs."""
+    from ttp import release
+    p, d, launches = _release_daemon(env, monkeypatch)
+    h = release.set_hold(p.name, "demo running", time.time() + 3600)
+    assert not (p.base / "state" / release.HOLDS_FILE).exists() and release.holds_path().is_file()
+    d.check_release()
+    assert launches == [] and _harness_commit(p) == "aaaa1111"
+    why = release.hold_reason(p, release.drift(p))
+    assert why.startswith(release.HELD_BY_USER + "held: demo running until ")
+    assert "held: demo running until" in release.line(p, p.db, {})
+    assert d._release_due <= h["until"] + 1, "looked at again once the hold ends, not an hour later"
+    assert "skipped: release held: demo running" in (p.logs / "daemon.log").read_text()
+    holds = json.loads(release.holds_path().read_text())
+    holds[p.name]["until"] = time.time() - 1   # its end passed
+    release.holds_path().write_text(json.dumps(holds))
+    assert release.upgrade_hold(p.name) is None and release.hold_reason(p, release.drift(p)) == ""
+    d._release_due = 0
+    d.check_release()
+    assert launches == [p.base] and _harness_commit(p) == "bbbb2222"
+
+
+def test_a_release_hold_probe_ends_it_and_every_hold_has_a_bounded_end(env, tmp_path):
+    from ttp import release
+    marker = tmp_path / "demo-over"
+    h = release.set_hold("alpha", "demo", probe=f"test -e {marker} || exit 1")
+    assert h["until"] <= time.time() + release.HOLD_MAX_S + 1, "a probe alone still ends within 7 days"
+    assert "until `test -e" in release.hold_text(h) and "at the latest" in release.hold_text(h)
+    assert release.upgrade_hold("alpha")
+    marker.touch()
+    assert release.upgrade_hold("alpha") is None and "alpha" not in json.loads(release.holds_path().read_text())
+    for kw in ({"until": time.time() + 8 * 86400}, {"until": time.time() - 1}, {}, {"probe": "true"}):
+        with pytest.raises(ValueError):
+            release.set_hold("alpha", "demo", **kw)
+    with pytest.raises(ValueError):
+        release.set_hold("alpha", " ", time.time() + 60)
+
+
+def test_ttp_upgrade_hold_refuses_plain_upgrades_and_override_is_logged(env, monkeypatch, capsys):
+    from ttp import cli, release
+    p, d, launches = _release_daemon(env, monkeypatch)
+    cli.main(["upgrade", p.name, "--hold", "--until", "2h", "--why", "demo running"])
+    assert "release held: demo running until" in capsys.readouterr().out
+    for argv in ([], ["--auto", "--project-dir", str(p.base)]):
+        with pytest.raises(SystemExit) as e:
+            cli.main(["upgrade", p.name, *argv])
+        assert e.value.code == 75 and "nothing was changed" in capsys.readouterr().err
+    assert _harness_commit(p) == "aaaa1111" and p.db.kv(release.KV_AUTO)["outcome"] == "held"
+    for bad in (["--hold", "--why", "x"], ["--hold", "--until", "8d", "--why", "x"], ["--hold", "--until", "1h"],
+                ["--why", "x"], ["--release", "--why", "x"]):
+        with pytest.raises(SystemExit) as e:
+            cli.main(["upgrade", p.name, *bad])
+        assert e.value.code not in (0, None), bad
+    with contextlib.redirect_stdout(io.StringIO()):
+        cli.main(["upgrade", p.name, "--override-hold"])
+    assert _harness_commit(p) == "bbbb2222"
+    assert "release hold overridden by `ttp upgrade" in (p.logs / "upgrade.log").read_text()
+    cli.main(["upgrade", p.name, "--release"])
+    assert "release hold lifted" in capsys.readouterr().out and release.upgrade_hold(p.name) is None
+
+
+def test_ttp_deployed_shows_a_release_hold_and_the_deploy_loop_skips_it(env, tmp_path, monkeypatch):
+    from ttp import deploy, overview, release
+    p = make(env)
+    _deploy_lib('0.5.0')
+    _deploy_project(tmp_path, 'alpha', '0.4.9')
+    now = time.time()
+    report = overview.deployed(names=['alpha'])
+    report['projects'][0]['takeover_at'] = now + 1
+    deploy.record(p, report, now)   # an open check, from before the hold
+    release.set_hold('alpha', 'demo running', now + 3600)
+    held = overview.deployed(names=['alpha'])
+    assert held['rc'] == 0 and held['held'] == ['alpha'] and held['projects'] == []
+    assert 'alpha\theld: demo running until ' in held['text']
+    started, pages = [], []
+    monkeypatch.setattr(deploy, 'launch_takeover', lambda *a: started.append(a))
+    for i in range(3):
+        deploy.tick(p, lambda *a, **k: pages.append(a), now + deploy.GRACE_S + deploy.PROBE_S * (i + 1))
+    rec = p.db.kv(deploy.CHECKS)['deploy:alpha:0.5.0']
+    assert rec['closed'] and rec['outcome'] == 'held' and not started and not pages
+    release.lift_hold('alpha')
+    assert overview.deployed(names=['alpha'])['rc'] != 0, "behind again once the hold is lifted"

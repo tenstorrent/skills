@@ -13638,6 +13638,46 @@ def _cycle_hold(paths: list[str], a, where=None, auto_rec: Project | None = None
         f"(--ignore-cycle-notice proceeds anyway)", cyclenotice.BUSY)
 
 
+def _release_hold(p: Project, a) -> None:
+    """`ttp upgrade <name> --hold --until <time> | --until-probe <cmd> --why <text>`, or `--release`: set or
+    lift the project's release hold in this host's tt-project home (release.set_hold)."""
+    from . import ends, release
+    if a.release:
+        if a.hold or a.until or a.until_probe or a.why:
+            die("--release takes no --hold, --until, --until-probe or --why")
+        gone = release.lift_hold(p.name)
+        print(f"{p.name}: release hold lifted ({gone.get('why')})" if gone else f"{p.name}: no release hold was set")
+        return
+    if not a.hold:
+        die("--until, --until-probe and --why go with --hold")
+    try:
+        until = ends.parse_expires(a.until, what="--until", max_s=release.HOLD_MAX_S, where=p) if a.until else None
+        h = release.set_hold(p.name, a.why or "", until, a.until_probe or "")
+    except ValueError as e:
+        die(str(e))
+    print(f"{p.name}: release {release.hold_text(h, p)}. Its automatic upgrade, deploy takeovers and `ttp upgrade` "
+          f"skip it until then; `ttp upgrade {p.name} --release` lifts it, --override-hold upgrades once anyway")
+
+
+def _upgrade_held(p: Project, a) -> None:
+    """Exit 75 (busy), changing nothing, while the project has a release hold (release.upgrade_hold);
+    --override-hold goes on, logged in its logs/upgrade.log. The daemon's own upgrade is recorded as held."""
+    from . import cyclenotice, release
+    hold = release.upgrade_hold(p.name)
+    if not hold:
+        return
+    why = release.hold_text(hold, p)
+    if a.override_hold and not a.auto:
+        line = f"release hold overridden by `ttp upgrade {p.name} --override-hold` (pid {os.getpid()}): {why}"
+        print(f"warning: {line}", file=sys.stderr)
+        append_text(p.logs / "upgrade.log", f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} {line}\n")
+        return
+    if a.auto:
+        release.finish(p, "held", why=f"release {why}")
+    die(f"upgrade refused: {p.name}'s release is {why}; nothing was changed. `ttp upgrade {p.name} --release` lifts "
+        f"the hold; --override-hold upgrades anyway (logged)", cyclenotice.BUSY)
+
+
 def _occupancy_hold(p: Project, a, step: str, auto_rec: Project | None = None) -> None:
     """Exit 75 (busy), changing nothing, while a live realtime stream holds this host or this host is a
     stream's front box (occupancy.py): an upgrade deploys and restarts the daemon. `auto_rec`: the daemon's
@@ -13849,6 +13889,9 @@ def cmd_upgrade(a) -> None:
             print(mm.push(entry.get("ssh") or entry["host"]))
             sys.exit(forward(entry, sys.argv[1:]))
         p = need(a.name, sys.argv[1:])
+    if a.hold or a.release or a.until or a.until_probe or a.why:
+        return _release_hold(p, a)
+    _upgrade_held(p, a)
     if not a.auto and a.apply is None:
         _refresh_stable_copy(p.name)
     _cycle_hold(cyclenotice_paths(p), a, p, auto_rec=p if a.auto else None)
@@ -17335,6 +17378,17 @@ def main(argv: list[str] | None = None) -> None:
                    help="host-side takeover: harness task TASK missed its takeover deadline, so this upgrade "
                         "takes the template merge over from it even while it still shows activity; with --apply, "
                         "fences TASK when it is blocked or past that deadline, then applies the merge")
+    s.add_argument("--hold", action="store_true",
+                   help="keep the project on its current release: its automatic upgrade, deploy takeovers and a "
+                        "plain `ttp upgrade` skip it until --until and/or --until-probe; needs --why")
+    s.add_argument("--until", metavar="TIME",
+                   help="with --hold: when it ends, a delay (12h, 3d) or an ISO time, at most 7 days away")
+    s.add_argument("--until-probe", metavar="CMD",
+                   help="with --hold: a read-only shell probe; exit 0 ends the hold (it ends after 7 days anyway)")
+    s.add_argument("--why", help="with --hold: the reason, shown in status and `ttp deployed`")
+    s.add_argument("--release", action="store_true", help="lift the project's release hold")
+    s.add_argument("--override-hold", action="store_true",
+                   help="upgrade although a release hold stands (logged in the project's logs/upgrade.log)")
     s.set_defaults(fn=cmd_upgrade)
 
     s = sub.add_parser("alerts", help="list broadcast alerts or acknowledge one")

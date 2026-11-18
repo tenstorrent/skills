@@ -715,9 +715,111 @@ def copy_failed(p: Project, e: BaseException) -> bool:
     return True
 
 
+HOLDS_FILE = "upgrade-holds.json"   # in HOME_DIR: {name: {why, until, probe, cwd, set}}, this host's release holds
+HOLD_MAX_S = 7 * 86400   # every release hold ends within this, a probe-ended one too
+HOLD_PROBE_S = 20        # a hold's end probe runs at most this long; a slow or failing one keeps the hold
+HELD_BY_USER = "release "   # hold_reason's line for a release hold starts so: "release held: <why> until <end>"
+
+
+def holds_path() -> Path:
+    return HOME_DIR / HOLDS_FILE
+
+
+def _read_holds() -> dict:
+    try:
+        d = json.loads(holds_path().read_text())
+    except (OSError, ValueError):
+        return {}
+    return {k: v for k, v in d.items() if isinstance(v, dict)} if isinstance(d, dict) else {}
+
+
+def _edit_holds(change) -> dict:
+    """Apply `change(holds)` under this host's holds lock, drop the holds past their end time, write back."""
+    HOME_DIR.mkdir(parents=True, exist_ok=True)
+    with open(HOME_DIR / ".upgrade-holds.lock", "a") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        holds = _read_holds()
+        change(holds)
+        now = time.time()
+        holds = {k: v for k, v in holds.items() if float(v.get("until") or 0) > now}
+        durable_write(holds_path(), json.dumps(holds, indent=1, sort_keys=True) + "\n")
+        return holds
+
+
+def set_hold(name: str, why: str, until: float | None = None, probe: str = "", cwd: str = "",
+             now: float | None = None) -> dict:
+    """Hold project `name` on its current release: its daemon's automatic upgrade, the deploy loop's takeover
+    and a plain `ttp upgrade` skip it until `until` (at most HOLD_MAX_S away) or until `probe` exits 0 (run
+    from `cwd`), whichever comes first; a probe alone still ends at HOLD_MAX_S. Stored in this host's
+    tt-project home, never in the project's own state or config. Replaces an earlier hold of `name`."""
+    from . import ends
+    now = time.time() if now is None else now
+    why = " ".join(str(why or "").split())
+    if not why:
+        raise ValueError("a release hold needs --why: the reason the user or status reads")
+    if until is None and not probe:
+        raise ValueError("a release hold needs an end: --until <time> and/or --until-probe <command>")
+    if until is not None and not now < until <= now + HOLD_MAX_S + 60:
+        raise ValueError(f"a release hold ends ahead of now and at most {HOLD_MAX_S // 86400} days away")
+    if probe:
+        ends.check_sh(probe, "--until-probe")
+        ends.check_not_trivial(probe, "--until-probe")
+    rec = {"why": why[:300], "until": until if until is not None else now + HOLD_MAX_S, "set": now,
+           "probe": probe, "cwd": cwd or os.getcwd(), "timed": until is not None}
+    _edit_holds(lambda h: h.__setitem__(name, rec))
+    return rec
+
+
+def lift_hold(name: str) -> dict | None:
+    """Remove project `name`'s release hold; the one removed (None: there was none)."""
+    gone: list = []
+    _edit_holds(lambda h: gone.append(h.pop(name, None)))
+    return gone[0]
+
+
+def _probe_over(probe: str, cwd: str) -> bool:
+    try:
+        r = subprocess.run(probe, shell=True, cwd=cwd if os.path.isdir(cwd) else None, timeout=HOLD_PROBE_S,
+                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           start_new_session=True)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0
+
+
+def upgrade_hold(name: str, now: float | None = None, probe: bool = True) -> dict | None:
+    """Project `name`'s release hold while it stands, else None: past its time it is over; its probe (unless
+    `probe` is False) exiting 0 ends it too, and that ending is recorded."""
+    now = time.time() if now is None else now
+    h = _read_holds().get(name)
+    if not h or float(h.get("until") or 0) <= now:
+        return None
+    if probe and h.get("probe") and _probe_over(str(h["probe"]), str(h.get("cwd") or "")):
+        try:
+            _edit_holds(lambda hs: hs.pop(name, None) if hs.get(name, {}).get("set") == h.get("set") else None)
+        except OSError:
+            pass
+        return None
+    return h
+
+
+def hold_text(h: dict, where=None) -> str:
+    """'held: <why> until <end>' of a release hold (upgrade_hold)."""
+    at = timefmt.long(float(h["until"]), where)
+    if not h.get("probe"):
+        end = at
+    elif h.get("timed", True):
+        end = f"{at} or until `{h['probe']}` exits 0"
+    else:
+        end = f"`{h['probe']}` exits 0 (at the latest {at})"
+    return f"held: {h.get('why') or 'no reason given'} until {end}"
+
+
 def hold_reason(p: Project, d: dict) -> str:
     """Why the daemon must not start an automatic upgrade to `d` now ("" = go)."""
     from . import cyclenotice
+    if hold := upgrade_hold(p.name):   # the user's word, kept in this host's tt-project home (set_hold)
+        return HELD_BY_USER + hold_text(hold, p)
     h = cyclenotice.project_held(p)
     if h:       # busy, not a try: nothing is recorded, so it starts once the notice is gone
         return cyclenotice.line(h, p) + "; " + CYCLE_HELD
@@ -806,6 +908,9 @@ def line(p: Project, db, cfg: dict) -> str:
         return text + " (same version from another commit: not applied automatically)"
     if not (cfg.get("upgrade") or {}).get("auto", True):
         return text + f" (upgrade.auto is off: `ttp upgrade {p.name}` applies it)"
+    hold = upgrade_hold(p.name, probe=False)
+    if hold:
+        return text + f" (release {hold_text(hold, p)}; `ttp upgrade {p.name} --release` lifts it)"
     h = finish_holder(p, db)
     if h:
         return text + f" (the merge needs harness task #{h['task']}; {holder_line(p, h, db)})"

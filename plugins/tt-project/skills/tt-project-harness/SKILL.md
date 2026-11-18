@@ -411,3 +411,12 @@ The boot is told by the kernel's boot id (on macOS, kern.bootsessionuuid, else k
   upgrade task holds the live harness until it ends: a newer release moves `upstream` and retargets
   that task (exit 75) instead of queuing another. The harness repo refuses any other merge of
   `upstream` into `main`.
+- Release hold: `ttp upgrade <name> --hold --until <12h|ISO time> [--until-probe "<cmd>"] --why
+  "<text>"` keeps a project on its current release, for an order like "keep project X on its release
+  until the demo is over"; `ttp upgrade <name> --release` lifts it. The hold lives in the shared
+  tt-project home of that project's host (`~/.tt-project/upgrade-holds.json`), never in the held
+  project's own state or config, so another project may set it. It ends at its time (7 days at most)
+  or once its probe exits 0, whichever comes first. While it holds, the daemon's automatic upgrade,
+  the deploy loop's takeovers and a plain `ttp upgrade <name>` (or `--apply`) skip the project
+  (exit 75, nothing changed, logged); `--override-hold` upgrades anyway and is logged in its
+  `logs/upgrade.log`. `ttp deployed` and the status line show `held: <why> until <end>`.
