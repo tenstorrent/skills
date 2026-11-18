@@ -739,7 +739,8 @@ LEASE_STEPS = ("dispatch", "maybe_coordinate", "run_schedules", "start_pushes", 
                "route_machines", "backup_branches", "retry_rejected", "post_held_notifies")
 HOST_CYCLE_SEEN_KEY = "host_cycle_seen"   # kv: power-cycle intent id -> held or lapsed, each logged or posted once
 ROOT_RECHECK_S = 300   # an open root-checkout alert's condition is looked at again this often
-PAGED_KEY = "watch_paged:"   # kv per command schedule: {"<project>\t<line key>": {at, first, n}} (pageto)
+PAGED_KEY = "watch_paged:"   # kv per command schedule: {"<project>\t<line key>": {at, first, n, seen}} (pageto)
+PAGED_TTL_S = 24 * 3600   # a filed key is remembered this long after it was last reported, or until cleared
 PROGRESS_KEY = "progress_raised"   # kv: driver key -> its stalled streak's first report (watch_progress)
 STALL_KEY = "stall"   # kv: {"run": the last worker run when a stall was raised} (Daemon.check_stall)
 # kv: run id -> {pid, started, lean} of a reap in progress (Daemon._reap_mark). One an earlier daemon
@@ -10292,18 +10293,19 @@ class Daemon:
             scr.close_watcher_issues(self.p.db, source, why=scr.CLEAN_RUN_WHY)
             scr.settle_receipts(self.p.db, source, started, ())   # and its errors are repaired
             scr.settle_mutes(self.p.db, source, started)   # and so are its muted conditions' clocks
-            if self.p.db.kv(PAGED_KEY + s["name"]):   # a line paged again later is a new episode
-                self.p.db.set_kv(PAGED_KEY + s["name"], {})
+            paged = self.p.db.kv(PAGED_KEY + s["name"]) or {}
+            if (live := _paged_live(paged, time.time())) != paged:   # a filed key outlives a quiet run
+                self.p.db.set_kv(PAGED_KEY + s["name"], live)
             if self.p.db.kv(watchgrace.KV + s["name"]):   # and a key seen again counts its grace afresh
                 self.p.db.set_kv(watchgrace.KV + s["name"], {})
             return "ok (0 observations)"
         n, errs, sides, subjects = 0, 0, 0, set()
-        paged = dict(self.p.db.kv(PAGED_KEY + s["name"]) or {})
-        reported: set[str] = set()
         filed = 0
         # grace_min: a keyed line at normal or above, and an error line, is held until its key (one for
         # all error lines) has been reported that long (watchgrace).
         grace, now = watchgrace.grace_s(payload), time.time()
+        # A key unreported for PAGED_TTL_S is over: its recurrence pages again.
+        paged = _paged_live(self.p.db.kv(PAGED_KEY + s["name"]) or {}, now)
         graced = dict(self.p.db.kv(watchgrace.KV + s["name"]) or {}) if grace else {}
         seen, held, held_errs, lines, main_errs = set(), 0, 0, 0, 0
         for obs in _observations(text):
@@ -10342,8 +10344,11 @@ class Daemon:
                 target = self._page_target(s["name"], obs)
                 if target is not None:   # another project's: a note to it, not an observation here
                     k = f"{target}\t{_line_key(obs, body)}"
-                    reported.add(k)
-                    filed += self._page_line(s["name"], target, obs, body, paged, k, rewake, filed)
+                    if obs.get("cleared") is True:   # over: told once if it was filed; a recurrence files again
+                        if paged.pop(k, None) is not None:
+                            filed += self._page_line(s["name"], target, obs, body, {}, k, None, filed)
+                    else:
+                        filed += self._page_line(s["name"], target, obs, body, paged, k, rewake, filed)
                     n += 1
                     continue
             self.observe(errors if error else source, body, obs.get("severity"), rewake_after_s=rewake,
@@ -10357,8 +10362,7 @@ class Daemon:
             n += 1
             errs += error and not side
             sides += side
-        if ok:   # a line no longer reported is over: its recurrence pages again
-            paged = {k: v for k, v in paged.items() if k in reported}
+        if ok:
             # and a key no longer reported counts its grace afresh, unless the check could not run
             if not (main_errs and main_errs == lines):
                 graced = watchgrace.forget(graced, seen)
@@ -10396,6 +10400,8 @@ class Daemon:
         seconds (None: never) or on every run with "repeat": true. Returns 1 if it filed a note."""
         now = time.time()
         last = paged.get(k)
+        if last:
+            last["seen"] = now
         ep = _line_episode(obs)
         if last and ep and last.get("episode") not in (None, ep):
             last = None   # another episode of a keyed line: a new note, as a new issue would be (screen)
@@ -10417,7 +10423,7 @@ class Daemon:
         if got not in ("sent", "duplicate"):
             log(self.p, f"watcher {name}: note to {target}: {got}; retried on its next run")
             return 0
-        paged[k] = {"at": now, "first": first, "n": int(last["n"]) + 1 if last else 1,
+        paged[k] = {"at": now, "first": first, "n": int(last["n"]) + 1 if last else 1, "seen": now,
                     **({"episode": ep} if ep else {})}
         log(self.p, f"watcher {name}: paged {target}: {text[:200]}")
         return 1
@@ -23302,6 +23308,13 @@ def _line_key(obs: dict, body: str) -> str:
     if isinstance(key, str) and key.strip():
         return key.strip()
     return "text:" + hashlib.sha256(" ".join(body.split()).encode()).hexdigest()[:16]
+
+
+def _paged_live(paged: dict, now: float) -> dict:
+    """The filed keys still remembered: reported within PAGED_TTL_S. A quiet or failed run, or a run
+    without the line, forgets none, so a flapping condition is filed once per key, not once per flap."""
+    return {k: v for k, v in paged.items()
+            if isinstance(v, dict) and now - float(v.get("seen") or v.get("at") or 0) < PAGED_TTL_S}
 
 
 def _line_episode(obs: dict) -> str | None:

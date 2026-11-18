@@ -205,3 +205,46 @@ def test_watchgrace_never_holds_a_crashed_command_or_errors_without_a_grace(env,
     monkeypatch.setattr(dm.schedrun, "run_group",
                         lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, _GRACE_CANT, ""))
     assert run2() == "error (1 lines: check could not run)"   # no grace_min: as before
+
+
+def test_a_paged_to_line_is_filed_once_per_key_across_quiet_runs_until_a_day_passes_or_it_clears(env, monkeypatch):
+    """A flapping condition (reported, a clean run, reported again) files one note per key, not one per
+    flap: a filed key outlives quiet and failed runs for PAGED_TTL_S after its last report, or until a
+    line with its key says "cleared": true (told to the target once). Upstream note 1058fac64646f600."""
+    # cells: to_line_once_per_key
+    from ttp import daemon as dm
+    from ttp import screen as scr
+    p = make(env)
+    clock = {"t": 1_800_000_000.0}
+    monkeypatch.setattr(scr.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(dm.time, "time", lambda: clock["t"])
+    out = {"stdout": "", "rc": 0}
+    monkeypatch.setattr(dm.schedrun, "run_group",
+                        lambda cmd, **kw: subprocess.CompletedProcess(cmd, out["rc"], out["stdout"], ""))
+    d = dm.Daemon(p.base)
+    _peer(env, "ops")
+    line = {"text": "box-a: held", "severity": "high", "key": "hold:A", "to": "ops"}
+
+    def run(*lines, rc=0, dt=60):
+        clock["t"] += dt
+        out["stdout"], out["rc"] = "\n".join(json.dumps(x) for x in lines), rc
+        d._run_command_watcher({"name": "hw"}, {"command": "x"})
+
+    for _ in range(5):   # held, healthy, held, a run without it, a failed run: one note
+        run(line)
+        run()
+        run(dict(line, key="other", to=None, text="something else"))
+        run(rc=2)
+    assert len(_notes_to("ops")) == 1
+    run(dict(line, cleared=True, text="box-a: hold over"))   # told once, and forgotten
+    run(dict(line, cleared=True, text="box-a: hold over"))
+    assert [n["spec"].split(": ", 1)[1] for n in _notes_to("ops")] == ["box-a: held", "box-a: hold over"]
+    run(line)   # a recurrence after its clear files again
+    assert len(_notes_to("ops")) == 3
+    run(dt=dm.PAGED_TTL_S - 120)
+    run(line)   # reported within the day: the same key, past its rewake, so a reminder of it
+    assert len(_notes_to("ops")) == 4 and "(still reported: note 2)" in _notes_to("ops")[-1]["spec"]
+    run(dt=dm.PAGED_TTL_S + 1)
+    assert not p.db.kv(dm.PAGED_KEY + "hw"), "a day unreported: forgotten"
+    run(line)
+    assert len(_notes_to("ops")) == 5 and "still" not in _notes_to("ops")[-1]["spec"]

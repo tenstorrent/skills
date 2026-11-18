@@ -49250,18 +49250,16 @@ def test_command_watcher_to_pages_another_project_once_per_key_until_rewake(env,
     run("hw", line, dict(line, key="hold:B", text="box-a: held (cause B)"))
     notes = _notes_to("ops")
     assert len(notes) == 4 and all("still reported: note 2" in n["spec"] for n in notes[2:])
-    # A cause no longer reported is over; its recurrence (a later minute) pages again. "repeat": true
-    # pages every run.
+    # A cause unreported for a day is over; its recurrence pages again (watchgrace_cases has the flap
+    # within the day). "repeat": true pages every run.
     run("hw", line)
     real = time.time
-    monkeypatch.setattr(dm.time, "time", lambda: real() + 120)
+    monkeypatch.setattr(dm.time, "time", lambda: real() + dm.PAGED_TTL_S + 60)
     run("hw", dict(line, key="hold:B", text="box-a: held (cause B)"))
     assert len(_notes_to("ops")) == 5 and "still" not in _notes_to("ops")[-1]["spec"]
     run("hw", dict(line, repeat=True))
     run("hw", dict(line, repeat=True))
     assert len(_notes_to("ops")) == 7
-    run("hw")   # a clean run clears it all
-    assert not p.db.kv(dm.PAGED_KEY + "hw")
 
 
 def test_command_watcher_to_unknown_or_own_project_is_observed_here(env, monkeypatch):
