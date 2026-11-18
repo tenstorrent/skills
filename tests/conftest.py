@@ -377,6 +377,10 @@ def secret_folders(env=None) -> list[str]:
     return [os.path.join(home, ".ssh"), gh]
 
 
+# bridge_cert.UP_MARKER: the agent probe's cache beside a bridge link, rewritten by any ssh use, no secret
+_UP_MARKER = re.compile(r"\.sock\.up(\.\d+)?$")
+
+
 def folder_marks(folders) -> dict[str, tuple]:
     """{path: (size, mtime_ns, ctime_ns, inode)} of each regular file under `folders`, by lstat alone:
     private keys and gh's token are never opened or read."""
@@ -385,7 +389,7 @@ def folder_marks(folders) -> dict[str, tuple]:
     for top in folders:
         for root, dirs, names in os.walk(top):
             for name in names:
-                if name.startswith("known_hosts"):
+                if name.startswith("known_hosts") or _UP_MARKER.search(name):
                     continue
                 path = os.path.join(root, name)
                 try:

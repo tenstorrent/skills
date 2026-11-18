@@ -135,6 +135,13 @@ def block_lines(cfg: dict, box: str) -> tuple[list[str], set[str]]:
 
 PROBE_S = 3   # an agent link that has not answered `ssh-add -l` by then counts as down
 PROBE_CACHE_S = 5   # a healthy answer is reused this long (ssh runs the probe in every Match block it parses)
+UP_MARKER = re.compile(r"\.sock\.up(\.\d+)?$")   # agent_up's cache file beside a link, and its temp copy
+
+
+def up_marker(name: str) -> bool:
+    """A file name of agent_up's cache (`<agent>.sock.up`, or the `.<pid>` copy it renames into place):
+    an epoch, no secret, rewritten by any ssh that parses the bridge's block once its cache is stale."""
+    return bool(UP_MARKER.search(name))
 
 
 def agent_up(link: str) -> str:

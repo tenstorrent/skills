@@ -651,3 +651,51 @@ def test_credwatch_hook_words_split_as_shlex_does_with_long_runs_shortened():
     for cmd in cases:
         for punctuation, commenters in ((";&|()", "#"), (";&|()<>", "#"), (";&|()<>", "")):
             assert words(cmd, punctuation, commenters) == plain(cmd, punctuation, commenters), (cmd[:80], punctuation)
+
+
+def test_credwatch_a_bridge_reconnect_remaking_its_links_and_up_markers_raises_nothing_and_a_key_change_still_does(
+        tmp_path, monkeypatch):
+    """The access bridge remakes its agent links (`<agent>.sock`) on each (re)connect and rewrites each
+    link's up-marker (`<agent>.sock.up`, through a `.<pid>` copy) on any ssh that probes the agent: no
+    secret, so no change there is told. A changed key file beside them still is. `ttp bridge status`
+    does not count the markers as stray files either."""
+    from ttp import bridge, credwatch, pathguard
+    from ttp.bridge_cert import agent_up
+    home = tmp_path / "h"
+    sock = home / ".ssh" / "tt-agent"
+    sock.mkdir(parents=True)
+    agent = tmp_path / "agent.sock"
+    agent.write_text("")
+    key = home / ".ssh" / "id_ed25519"
+    key.write_text("k\n")
+    (sock / "automation.sock").symlink_to(agent)
+    (sock / "automation.sock.up").write_text("1\n")
+    (home / ".ssh" / "flat.sock.up").write_text("1\n")   # a socket folder of ~/.ssh itself
+    monkeypatch.setattr(pathguard, "_homes", lambda env: [str(home)])
+    monkeypatch.setattr(pathguard, "paths", lambda cfg=None: ["~/.ssh"])
+    monkeypatch.setenv("HOME", str(home))
+    before = credwatch.snapshot()
+    assert str(key) in before["kinds"] and not [p for p in before["kinds"] if ".sock" in p], sorted(before["kinds"])
+    time.sleep(0.05)   # past the kernel's coarse ctime tick
+    (sock / "automation.sock").unlink()   # a reconnect: the link remade, the marker rewritten by rename
+    (sock / "automation.sock").symlink_to(agent)
+    (sock / "automation.sock.up.4242").write_text("2\n")
+    os.replace(sock / "automation.sock.up.4242", sock / "automation.sock.up")
+    (sock / "automation.sock.up.4243").write_text("3\n")   # a probe caught mid-rename
+    (home / ".ssh" / "flat.sock.up").write_text("22\n")
+    assert credwatch.changes(before, credwatch.snapshot()) == []
+    key.write_text("k2\n")
+    assert credwatch.changes(before, credwatch.snapshot()) == [[str(key), "changed"]]
+    assert "f=$HOME/.ssh/tt-agent/automation.sock.up" in agent_up(".ssh/tt-agent/automation.sock")
+    conf = tmp_path / "bridge.json"
+    conf.write_text(json.dumps({"boxes": {"box-1": {"login": {}, "agents": {"automation": {"agent": "env", "forward": [
+        {"name": "build-a", "target": "build-a.example.com", "port": 2301}]}}}}}))
+    r = subprocess.run(["sh", "-c", bridge.probe_script(bridge.load(conf), "box-1")], capture_output=True, text=True,
+                       timeout=60, env={**os.environ, "HOME": str(home)})
+    assert "file sock automation.sock" in r.stdout and "file other" not in r.stdout, r.stdout
+
+
+def test_the_suites_own_folder_watch_skips_the_same_bridge_up_markers_as_credwatch():
+    import conftest
+    from ttp import bridge_cert
+    assert conftest._UP_MARKER.pattern == bridge_cert.UP_MARKER.pattern

@@ -25,7 +25,8 @@ Two kinds of file (files()):
   under the write guard's protected paths (guarded_paths: pathguard.paths(), the folders walked). Nothing
   a run does rewrites them: created, removed or any change of size, mtime, ctime or inode counts. Files
   their own tools rewrite in normal use are left out (CHURN: ssh's host key lists, any name holding
-  known_hosts, gh's state file, caches).
+  known_hosts, gh's state file, caches; the access bridge's agent links and up-markers, which each
+  reconnect and agent probe remake: bridge_file).
 - logins: the providers' own login files (Provider.credential_files). Their CLIs rewrite them on every
   token refresh, so only a removal, or a rewrite to under half the size it had, counts.
 
@@ -68,10 +69,17 @@ def ssh_config(name: str) -> bool:
     return base == "config" or base.endswith("_config") or name.startswith(("config-", "config~"))
 
 
+def bridge_file(name: str) -> bool:
+    """A file the access bridge makes on each connect and probe in its socket folder: an agent link
+    (`<agent>.sock`) or its up-marker (bridge_cert.up_marker). Neither holds a secret."""
+    from .bridge_cert import up_marker
+    return name.endswith(".sock") or up_marker(name)
+
+
 def ssh_private(name: str) -> bool:
     """A file name in ~/.ssh that may hold a private key."""
     return not (name.endswith(".pub") or name in SSH_PUBLIC or HOST_LIST in name or name.startswith("cm-") or "%" in name
-                or ssh_config(name))
+                or ssh_config(name) or bridge_file(name))
 
 
 def store_paths(home: str | Path | None = None, env=None) -> list[str]:
@@ -119,7 +127,8 @@ def _walk(top: str) -> list[str]:
     for root, dirs, names in os.walk(top):
         dirs[:] = sorted(d for d in dirs if d not in CHURN_DIRS)
         for name in sorted(names):
-            if name.startswith(CHURN_NAMES) or HOST_LIST in name or os.path.basename(root) == ".ssh" and ssh_config(name):
+            if (name.startswith(CHURN_NAMES) or HOST_LIST in name or bridge_file(name)
+                    or os.path.basename(root) == ".ssh" and ssh_config(name)):
                 continue
             path = os.path.join(root, name)
             try:

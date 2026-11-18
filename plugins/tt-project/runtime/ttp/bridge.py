@@ -619,7 +619,7 @@ def probe_script(cfg: dict, box: str) -> str:
         for h in a["forward"]:
             parts.append(f'(exec 3<>/dev/tcp/127.0.0.1/{h["port"]}) 2>/dev/null && echo "port {h["port"]} up" '
                          f'|| echo "port {h["port"]} down"')
-    parts.append('for f in "$d"/* "$d"/.*; do [ -e "$f" ] || [ -L "$f" ] || continue; case "$f" in */.|*/..) continue;; esac; '
+    parts.append('for f in "$d"/* "$d"/.*; do [ -e "$f" ] || [ -L "$f" ] || continue; case "$f" in */.|*/..|*.sock.up|*.sock.up.[0-9]*) continue;; esac; '
                  'if [ -S "$f" ] || [ -L "$f" ]; then echo "file sock ${f##*/}"; else echo "file other ${f##*/}"; fi; done')
     return "bash -c " + shlex.quote("; ".join(parts))
 
