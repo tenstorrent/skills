@@ -8,7 +8,7 @@ Setting (a project and an account key; the project's own value wins; it never to
    "version": "", "timeout_s": 1800, "budget_usd": 3, "stall_s": 600, "code_mb": 200, "enabled": true,
    "second_reviewer": {"model": "<another model family>", "effort": "high", "provider": "chat"}}   # a grader runs at high at most
 Every arm gets the identical setup: the same sealed read-only copy, the same spec, the same tool (the harness),
-no ssh, lock, broker or resource, the same time limit and budget, the same blind review. For each device task
+no ssh, broker or device, the same time limit and budget, the same blind review. For each device task
 the live device A/B takes in (deviceab.assign returned a note: either arm, its projects) one shadow run per arm
 starts at the live dispatch, once per task and arm (the kv record `device_shadow:<task id>:<arm>` is the mark).
 It gets the task's title and spec and a read-only copy of the code and of the project's state and logs as of
@@ -22,8 +22,11 @@ Read only by construction, not by prompt: the agent runs in the bench's mount na
 its state folder, the runtime and the real home are not there; the code and state copies are bound read-only;
 its scratch folder is the only writable path; ssh, scp, rsync, ttp, sudo, gh, curl, device tools and the like are
 refusing stand-ins that also cover the system copies; no credential, forge token or ssh agent is in its
-environment. It holds no lock and names no resource, takes no task row and no label the A/B counts, so it is in
-none of the A/B's counts or stop rules, and its failure never reaches the live task.
+environment. It takes no task row and no label the A/B counts, so it is in none of the A/B's counts or stop
+rules, and its failure never reaches the live task. Its agent may run the project's suites on this host, so it
+runs as a check does: never while this host or a resource the live task names is paused (paused: recorded
+`skipped` with the pause, at the start and again before the agent starts), and only on a grant of the host's
+test slots (testslots.acquire, waited for up to the arm's time limit, else `skipped`), held for the agent's life.
 The cell has a network namespace of its own, empty but for loopback: nothing the host listens on is reachable
 from it, whatever client a script uses. The model calls are made outside it (the chat bridge, the claude CLI) and
 reach the agent through a socket in the cell's folder (cellnet.py).
@@ -414,9 +417,18 @@ def start(p, task: dict, cfg: dict | None = None) -> list[str]:
     and arm. Never raises into the dispatch. Returns the arms started."""
     cfg = cfg if cfg is not None else p.config()
     s = settings(cfg)
-    started, pins = [], None
+    started, pins, held = [], None, None
     for arm, a in (s or {}).get("arms", {}).items():
         if deviceab._kv(p.db, f"{KV_PREFIX}{task['id']}:{arm}"):
+            continue
+        if held is None:
+            try:
+                held = paused(p, cfg, p.db.task(task["id"]) or task)
+            except Exception as e:   # never into the dispatch; an unchecked pause keeps the arm off
+                held = f"could not check for a pause: {type(e).__name__}: {e}"
+        if held:
+            record(p.db, task["id"], arm, status="skipped", started=time.time(), ended=time.time(), minutes=0.0,
+                   model=f"{a['model']}:{a['effort']}", harness=a["harness"], error=f"no arm run: {held}"[:400])
             continue
         if pins is None:   # the code every arm copies, pinned once for the task (each arm's run retries a miss)
             try:
@@ -439,10 +451,27 @@ def start(p, task: dict, cfg: dict | None = None) -> list[str]:
     return started
 
 
+def paused(p, cfg: dict, task: dict) -> str:
+    """Why a shadow run may not start here now: this host or a resource the live task names is paused, by the
+    lookup a spill check uses (lockprobe.pause, checkspill.paused_elsewhere); "" when none is."""
+    from . import checkspill, lockprobe, machines, project
+    from .coordinator import task_resources
+    hit = machines.here()
+    for n in dict.fromkeys([*([hit[0]] if hit else []), project.hostname(), *sorted(task_resources(task))]):
+        got = lockprobe.pause(p, cfg, n)
+        who = "" if got is None else "this project"
+        if got is None and (other := checkspill.paused_elsewhere(p, n, hit[1] if hit and n == hit[0] else None)):
+            who, got = other
+        if who:
+            why = got.get("reason") if isinstance(got, dict) else ""
+            return f"{n} is paused by {who}{': ' + str(why) if why else ''}"
+    return ""
+
+
 def run(p, task_id: int, arm_name: str) -> dict:
     """The detached runner for one arm: snapshot, run the model in its read-only cell, write the hand-off and the
     record."""
-    from . import benchrun, cellenv, cellns
+    from . import benchrun, cellenv, cellns, testslots
     cfg = p.config()
     s = settings(cfg)
     task = p.db.one("SELECT id, title, spec, kind FROM tasks WHERE id=?", (task_id,))
@@ -453,7 +482,7 @@ def run(p, task_id: int, arm_name: str) -> dict:
         return record(p.db, task_id, arm_name, status="error", ended=time.time(), error="off, no such arm or task")
     a = s["arms"][arm_name]
     tmp = Path(tempfile.mkdtemp(prefix="shadow-"))
-    status, err, spend, handoff, called, cell = "error", "", {}, "", "", None
+    status, err, spend, handoff, called, cell, grant = "error", "", {}, "", "", None, None
     try:
         ro, ws = tmp / "ro", tmp / "work"
         paths = {str(Path(p.root).resolve()): str(ro / "code"), str(Path(p.state).resolve()): str(ro / "state"),
@@ -479,7 +508,13 @@ def run(p, task_id: int, arm_name: str) -> dict:
         cell, problems = benchrun.isolate(tmp, ws, arm, opts, hidden, [str(p.root)])
         if problems:
             err = "isolation self-test: " + "; ".join(problems)[:400]
+        elif (grant := testslots.acquire(f"device-shadow #{task_id} {arm_name}", wait_s=float(s["timeout_s"]),
+                                         cfg=cfg, project_name=p.name)) is None:
+            status, err = "skipped", "no arm run: the host's test slots stayed busy for the arm's time limit"
+        elif held := paused(p, cfg, p.db.task(int(task_id)) or dict(task)):
+            status, err = "skipped", f"no arm run: {held}"[:400]
         else:
+            cell_env = {**cell_env, **grant.env()}
             body = prompt(task, ro, ws, paths, [note] if note else [])
             prov, wall, hung = benchrun.launch(tmp / "run", ws, body, arm, opts, cfg, hidden, cell_env,
                                                dict(cell.conf), [], cell)
@@ -501,6 +536,8 @@ def run(p, task_id: int, arm_name: str) -> dict:
     except Exception as e:   # the shadow never reaches the live task: it is recorded and ends
         err = f"{type(e).__name__}: {e}"[:400]
     finally:
+        if grant is not None:
+            grant.close()
         if cell is not None:
             cell.close()
         shutil.rmtree(tmp, ignore_errors=True)

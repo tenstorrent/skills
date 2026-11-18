@@ -533,3 +533,93 @@ def test_a_second_reviewer_whose_provider_is_not_allowed_gets_no_twin_and_the_fi
     p.db.x("UPDATE tasks SET status='done' WHERE id=?", (tid2,))
     out = deviceab.tick(p.db, {**cfg, "providers_allowed": ["claude"]}, 2.0)
     assert len(out["reviews"]) == 1 and all(p.db.task(i)["provider"] != "chat" for i in out["reviews"])
+
+
+def _shadow_fake_run(p, monkeypatch):
+    # run()'s cell and agent stood in: returns the launches seen (each with its cell env).
+    import pathlib
+    from ttp import benchrun, cellenv
+    launches = []
+
+    class Cell:
+        conf = {}
+
+        def close(self):
+            pass
+
+    def launch(run_dir, ws, body, arm, opts, cfg_, hidden, cell_env, conf, logins, cell):
+        launches.append(dict(cell_env))
+        pathlib.Path(run_dir).mkdir(parents=True, exist_ok=True)
+        (pathlib.Path(run_dir) / "exit.json").write_text("{}")
+        (pathlib.Path(ws) / "handoff.md").write_text("## Commands\n`pytest -q` - run the suite\n## Conclusion\nok")
+        return "chat", 1.0, False
+    monkeypatch.setattr(benchrun, "harness_ready", lambda kind, version="", root=None: {"dir": "x"})
+    monkeypatch.setattr(benchrun, "isolate", lambda *a, **k: (Cell(), []))
+    monkeypatch.setattr(benchrun, "launch", launch)
+    monkeypatch.setattr(cellenv, "make", lambda *a, **k: pathlib.Path("/nonexistent-venv"))
+    monkeypatch.setattr(cellenv, "env", lambda *a, **k: {})
+    return launches
+
+
+def test_device_shadow_on_a_paused_host_or_resource_starts_and_runs_no_arm_and_records_the_skip(env, monkeypatch):
+    # The shadow's agent may run the project's suites on this host: a pause of a resource the live task names, or
+    # of this host, keeps every arm off, recorded `skipped` with the pause (never done), at start and in run.
+    import subprocess
+    from ttp import coordinator, deviceshadow, project
+    p = make(env)
+    cfg = _shadow_cfg(p)
+    p.config = lambda: cfg
+    tid = _dab_task(p)
+    spawned, real = [], subprocess.Popen
+    monkeypatch.setattr(subprocess, "Popen", lambda argv, **k: spawned.append(argv) if "device-shadow" in argv
+                        else real(argv, **k))
+    coordinator.pause_resource(p, "box1-device", True, reason="maintenance", by="user")
+    assert deviceshadow.start(p, p.db.task(tid), cfg) == [] and spawned == []
+    recs = deviceshadow.shadows(p.db.q)
+    assert {arm for (_, arm) in recs} == {"glm", "sonnet-h", "opus-h"}
+    for rec in recs.values():
+        assert rec["status"] == "skipped" and "box1-device is paused" in rec["error"] and "maintenance" in rec["error"]
+    assert f"skipped #{tid}: no arm run: box1-device is paused" in "\n".join(deviceshadow.report_text(
+        deviceshadow.report(p.db.q)))
+    # A run started before the pause still runs no suite: the check before the agent starts.
+    launches = _shadow_fake_run(p, monkeypatch)
+    got = deviceshadow.run(p, tid, "glm")
+    assert got["status"] == "skipped" and "box1-device is paused" in got["error"] and launches == []
+    # This host's own pause keeps an arm off too.
+    coordinator.pause_resource(p, "box1-device", False, by="user")
+    coordinator.pause_resource(p, project.hostname(), True, reason="host upkeep", by="user")
+    got = deviceshadow.run(p, tid, "glm")
+    assert got["status"] == "skipped" and "host upkeep" in got["error"] and launches == []
+    coordinator.pause_resource(p, project.hostname(), False, by="user")
+    got = deviceshadow.run(p, tid, "glm")
+    assert got["status"] == "done" and len(launches) == 1, got
+
+
+def test_device_shadow_run_takes_the_hosts_test_slots_for_its_agent_and_never_runs_beside_a_full_pool(env, monkeypatch):
+    # The arm's agent runs on a grant of the host's test slots (as a worker's checks do), held for its life and
+    # passed to it; a pool that stays full for the arm's time limit is a recorded skip, never a run beside it.
+    from ttp import deviceshadow, testslots
+    p = make(env)
+    cfg = _shadow_cfg(p, timeout_s=60)
+    p.config = lambda: cfg
+    tid = _dab_task(p)
+    launches = _shadow_fake_run(p, monkeypatch)
+    asked, closed = [], []
+
+    class Grant:
+        k = 2
+
+        def env(self):
+            return {"TTP_TEST_SLOTS": "2"}
+
+        def close(self):
+            closed.append(len(launches))
+    monkeypatch.setattr(testslots, "acquire", lambda holder, **k: asked.append((holder, k)) or None)
+    got = deviceshadow.run(p, tid, "glm")
+    assert got["status"] == "skipped" and "test slots" in got["error"] and launches == []
+    assert asked[0][0] == f"device-shadow #{tid} glm" and asked[0][1]["wait_s"] == 60.0
+    assert asked[0][1]["project_name"] == p.name
+    monkeypatch.setattr(testslots, "acquire", lambda holder, **k: Grant())
+    got = deviceshadow.run(p, tid, "glm")
+    assert got["status"] == "done", got
+    assert launches == [{"TTP_TEST_SLOTS": "2"}] and closed == [1], "held while the agent ran, then released"
