@@ -352,10 +352,16 @@ def _probe(p, expect: str, env: dict | None = None, timeout: float = PROBE_TIMEO
 _EVIDENCE = re.compile(r"(?:^|[\s(\"'`])(?:/|~/|\./|\$\w+/)\S+|\b\S+\.(?:log|out|txt|json|jsonl|rc|csv)\b")
 
 
+FALSE_KEY = "claims_false"   # result.json: the hand-off's claims its run's records disproved (Daemon._effect_claims)
+
+
 def handoff_mark(result: dict) -> str:
-    """' (unverified: ...)' for a hand-off whose summary claims a live state and cites no evidence."""
+    """' (false: ...)' for a hand-off whose 'no side effects' claim its run's records disproved; ' (unverified:
+    ...)' for one whose summary claims a live state and cites no evidence."""
     try:
         res = result if isinstance(result, dict) else {}
+        if res.get(FALSE_KEY):
+            return f" (false, by the run's own records: {'; '.join(map(str, res[FALSE_KEY]))[:600]})"
         summary = str(res.get("summary") or "")
         if not detect(summary) or res.get("artifacts") or _EVIDENCE.search(summary):
             return ""

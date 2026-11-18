@@ -394,3 +394,51 @@ def test_outside_writes_record_names_the_scan_that_saw_a_write_no_guard_refused(
     assert got["q.txt"]["status"] == "completed" and got["q.txt"]["guard"] == sidefx.SEEN_BY, got
     assert got["r"]["status"] == "refused" and "PreToolUse:Bash hook error" in got["r"]["guard"], got
     assert "stopped by" not in sidefx._names([got["q.txt"]])
+
+
+def test_a_no_side_effects_claim_is_checked_against_the_runs_own_effects_on_other_projects(env, tmp_path, scratch_home):
+    """cell handoff_side_effect_claim: a hand-off claiming no side effects outside its folder, from a run that
+    stopped another project's unit and ran a git checkout in another project's harness, is marked false in its
+    result.json and raised high; the effect on another project is raised even without a claim. Another
+    project's registry row removed or daemon stopped since the spawn is found from the spawn snapshot."""
+    import os
+    from ttp import claimcheck, project, sidefx
+    from ttp.daemon import Daemon
+    p = make(env)
+    peer = tmp_path / "peer"
+    (peer / "tt-project" / "state").mkdir(parents=True)
+    (peer / "tt-project" / "state" / "daemon.pid").write_text(str(os.getpid()))
+    project.register("peer", {"host": "testhost", "dir": str(peer)})
+    other = tmp_path / "other"
+    (other / "tt-project").mkdir(parents=True)
+    project.register("other", {"host": "testhost", "dir": str(other)})
+    d = Daemon(p.base)
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    calls = _claude_calls(("Bash", {"command": "systemctl --user stop tt-project-peer.service"}),
+                          ("Bash", {"command": f"git -C {peer}/tt-project/harness checkout -- project.json"}),
+                          ("Bash", {"command": "systemctl --user restart tt-project-demo"}))   # its own: no effect
+    claim = {"status": "done", "summary": "Fixed it. No side effects outside the worktree."}
+    rid, run_dir, _ = _sidefx_run(d, calls, wt, result=claim, rc=0)
+    res = json.loads((run_dir / "result.json").read_text())
+    assert any("tt-project-peer" in x and "git checkout" in x for x in res[claimcheck.FALSE_KEY]), res
+    assert "demo" not in json.dumps(res[claimcheck.FALSE_KEY])
+    assert claimcheck.handoff_mark(res).startswith(" (false, by the run's own records:")
+    ev = p.db.q("SELECT * FROM events WHERE kind=?", (claimcheck.KIND,))
+    assert len(ev) == 1 and ev[0]["severity"] == "high" and "tt-project-peer" in ev[0]["text"]
+    # no claim: the effect on another project is still raised, and the hand-off is not marked
+    rid, run_dir, _ = _sidefx_run(d, calls, wt, result={"status": "done", "summary": "Fixed it."}, rc=0)
+    assert claimcheck.FALSE_KEY not in json.loads((run_dir / "result.json").read_text())
+    ev = p.db.q("SELECT * FROM events WHERE kind='peer_effects'")
+    assert len(ev) == 1 and "tt-project-peer" in ev[0]["text"] and ev[0]["severity"] == "high"
+    # a true claim stays unmarked
+    rid, run_dir, _ = _sidefx_run(d, _claude_calls(("Bash", {"command": f"ls {peer}"})), wt, result=claim, rc=0)
+    assert claimcheck.FALSE_KEY not in json.loads((run_dir / "result.json").read_text())
+    # from the spawn snapshot: a peer's daemon stopped and another's registry row removed
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    sidefx.snapshot_peers(snap, p.base)
+    (peer / "tt-project" / "state" / "daemon.pid").write_text("4194999")
+    project.unregister("other")
+    got = sidefx.peer_effects(snap, p.base, "demo")
+    assert "project peer's daemon was stopped" in got and "project other's registry row was removed" in got

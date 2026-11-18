@@ -572,10 +572,14 @@ def deploy_status(name: str, entry: dict, target: str, commit: str | None, now: 
 
 
 def deployed(target: str | None = None, commit: str | None = None, names: list[str] | None = None,
-             fresh_s: float = DEPLOY_FRESH_S, now: float | None = None, allow_newer: bool = False) -> dict:
+             fresh_s: float = DEPLOY_FRESH_S, now: float | None = None, allow_newer: bool = False,
+             skip_unregistered: bool = False) -> dict:
     """{"rc", "target", "commit", "projects": [...], "text"} for `ttp deployed`. The registry is read now,
     so a project registered after the deploy started is checked too; projects on other machines are
-    not (unless named). rc: 0 every project passes, 1 some are pending, 2 some cannot be told."""
+    not (unless named). With `skip_unregistered` (a deploy), a named project no longer registered, or whose
+    folder holds no project any more, was removed since the deploy listed it: left out and named, never a
+    failure; a plain check reports it (cannot tell), so a typo is not passed. rc: 0 every project passes, 1 some are pending, 2 some cannot be
+    told."""
     from .release import runtime_commit
     now = now or time.time()
     here = project.hostname()
@@ -590,13 +594,17 @@ def deployed(target: str | None = None, commit: str | None = None, names: list[s
         return {**out, "rc": CANNOT, "text": "cannot tell: no version given and no release installed (`ttp setup`)"}
     reg = project.load_registry().get("projects") or {}
     pick = sorted(reg) if not names else names
-    rows, stopped, held = [], [], []
+    rows, stopped, held, gone = [], [], [], []
     from . import release, service, timefmt
     for n in pick:
         e = reg.get(n)
-        if not isinstance(e, dict):
+        if not isinstance(e, dict) and skip_unregistered:   # removed since the deploy listed it: never a failure
+            gone.append(f"{n}\tleft out: no longer registered on this machine")
+        elif not isinstance(e, dict):
             rows.append({"name": n, "state": CANNOT, "reason": "not registered on this machine",
                          "line": f"{n}\tcannot tell: not registered on this machine"})
+        elif skip_unregistered and e.get("host") in (None, here) and not (Path(str(e.get("dir") or "/nonexistent")) / project.FOLDER / "state" / "project.db").is_file():
+            gone.append(f"{n}\tleft out: its folder {e.get('dir')} holds no project database any more")
         elif names or e.get("host") in (None, here):
             row = deploy_status(n, e, target, commit, now, here, fresh_s, allow_newer)
             hold = row["state"] != OK and release.upgrade_hold(n, now)
@@ -615,6 +623,6 @@ def deployed(target: str | None = None, commit: str | None = None, names: list[s
     if not rows:
         first = f"{head}: no projects registered on this machine"
     lines = [first] + [r["line"] for r in sorted(rows, key=lambda r: -r["state"])]   # what holds it back first
-    lines += [f"{n}\t{service.STOPPED_ON_PURPOSE}" for n in stopped] + [ln for _, ln in held]
+    lines += [f"{n}\t{service.STOPPED_ON_PURPOSE}" for n in stopped] + [ln for _, ln in held] + gone
     return {**out, "rc": rc, "projects": rows, "stopped": stopped, "held": [n for n, _ in held],
-            "text": "\n".join(lines)}
+            "gone": [ln.split("\t")[0] for ln in gone], "text": "\n".join(lines)}

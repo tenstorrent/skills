@@ -911,3 +911,41 @@ esac
     assert subprocess.run(["sh", "-c", script], env=environ, timeout=30).returncode == 1
     assert (st / "log").read_text().split().count("bootstrap") == 2
     assert "reload of gui/501/x failed: launchctl bootstrap: Bootstrap failed: 5" in (p.logs / "daemon.out").read_text()
+
+
+def test_a_units_daemon_waits_for_its_outside_daemon_instead_of_restart_looping(env, monkeypatch):
+    """cell unit_no_restart_loop: the unit's daemon that finds this project's daemon running outside the unit
+    (started from an ssh session's scope) waits, feeding the watchdog, and takes over once it exits; it never
+    exits 1 for Restart=always to relaunch every 10 s. Outside a unit, or for another folder's daemon, it
+    does not wait. The unit's restart asks only that outside daemon (the pid in daemon.pid) to stop."""
+    import os
+    from ttp import daemon as dm, projectremove, service
+    p = make(env)
+    (p.state / "daemon.pid").write_text("777777")
+    d = dm.Daemon(p.base)
+    monkeypatch.setattr(dm, "OUTSIDE_WAIT_S", 0)
+    monkeypatch.setattr(dm, "_alive", lambda pid: pid == 777777)
+    monkeypatch.setattr(projectremove, "pid_dir", lambda pid: p.base)
+    beats = []
+    monkeypatch.setattr(dm, "sd_notify", lambda msg, addr: beats.append(msg) or True)
+    tries = iter([False, False, True])
+    monkeypatch.setattr(d, "_single_instance", lambda: next(tries))
+    monkeypatch.delenv("INVOCATION_ID", raising=False)
+    assert d._await_outside_daemon(p.state / "daemon.pid") is False   # a shell start: no unit, no wait
+    monkeypatch.setenv("INVOCATION_ID", "abc")
+    assert d._await_outside_daemon(p.state / "daemon.pid") is True and beats == ["WATCHDOG=1"] * 3
+    monkeypatch.setattr(projectremove, "pid_dir", lambda pid: env["home"] / "elsewhere" / "tt-project")
+    assert d._await_outside_daemon(p.state / "daemon.pid") is False   # another folder's daemon: never waited on
+    # the unit's restart ends only the outside daemon named in daemon.pid, and only when it is outside the unit
+    monkeypatch.setattr(projectremove, "pid_dir", lambda pid: p.base)
+    monkeypatch.setattr(dm, "_is_daemon", lambda pid: pid == 777777)
+    killed = []
+    monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    monkeypatch.setattr(service, "_manager_view", lambda q: (0.0, 555))
+    assert service._end_outside_daemon(p, wait_s=0) == 777777 and killed == [(777777, 15)]
+    killed.clear()
+    monkeypatch.setattr(service, "_manager_view", lambda q: (0.0, 777777))   # it is the unit's own main process
+    assert service._end_outside_daemon(p, wait_s=0) is None and not killed
+    monkeypatch.setattr(service, "_manager_view", lambda q: (0.0, 555))
+    monkeypatch.setattr(dm, "_is_daemon", lambda pid: False)   # a recycled pid: no daemon, never signalled
+    assert service._end_outside_daemon(p, wait_s=0) is None and not killed

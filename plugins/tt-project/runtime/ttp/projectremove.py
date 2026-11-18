@@ -44,12 +44,14 @@ def unit_dir_of(text: str) -> str:
 
 
 def pid_dir(pid: int) -> Path | None:
-    """The working folder of process `pid` (the daemon runs in its project's tt-project folder), or None where
-    it cannot be read (no /proc, another user's process)."""
+    """The project folder a daemon process `pid` serves (its command line: `-m ttp.daemon <base>`), or None
+    where it cannot be read (no /proc, another user's process) or the process is no tt-project daemon."""
     try:
-        return Path(os.readlink(f"/proc/{pid}/cwd"))
+        argv = Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace").split("\0")
     except OSError:
         return None
+    i = argv.index("ttp.daemon") if "ttp.daemon" in argv else -1
+    return Path(argv[i + 1]) if 0 <= i < len(argv) - 1 and argv[i + 1] else None
 
 
 def identity_refusal(p, name: str | None = None) -> str | None:
@@ -87,8 +89,8 @@ def identity_refusal(p, name: str | None = None) -> str | None:
     from .daemon import _alive, _read_pid
     pid = _read_pid(Path(p.state) / "daemon.pid")
     if pid and pid != os.getpid() and _alive(pid) and (cwd := pid_dir(pid)) is not None and _res(cwd) != base:
-        return (f"the pid {pid} in {p.state / 'daemon.pid'} runs in {cwd}, not {p.base}: it is not this project's "
-                "daemon, so it was not signalled")
+        return (f"the pid {pid} in {p.state / 'daemon.pid'} is the daemon of {cwd}, not {p.base}: it is not this "
+                "project's daemon, so it was not signalled")
     return None
 
 
@@ -157,13 +159,21 @@ def remove(p, stop, delete: bool = False, unregister=None) -> list[str]:
     lines = []
     if why := identity_refusal(p):
         return [f"refused: {why}"]
-    lines.append(f"stopped: {stop()}")
+    # A step that fails (its daemon or unit already gone, a record unreadable) is reported; the registry row
+    # is dropped all the same, so a removed project never lingers as a registered one the deploy waits on.
+    try:
+        lines.append(f"stopped: {stop()}")
+    except Exception as e:
+        lines.append(f"not stopped: {str(e)[:160]}")
     lines.extend(prune_shared(p))
-    entry = project.load_registry().get("projects", {}).get(p.name)
-    if isinstance(entry, dict) and entry.get("dir") and _res(project.Project(entry["dir"]).base) != _res(p.base):
-        lines.append(f"registry row {p.name} points elsewhere ({entry['dir']}): kept")
-    else:
-        (unregister or project.unregister)(p.name)
-        lines.append(f"unregistered {p.name}")
+    try:
+        entry = project.load_registry().get("projects", {}).get(p.name)
+        if isinstance(entry, dict) and entry.get("dir") and _res(project.Project(entry["dir"]).base) != _res(p.base):
+            lines.append(f"registry row {p.name} points elsewhere ({entry['dir']}): kept")
+        else:
+            (unregister or project.unregister)(p.name)
+            lines.append(f"unregistered {p.name}")
+    except Exception as e:
+        lines.append(f"not unregistered {p.name}: {str(e)[:160]}")
     lines.extend(delete_files(p) if delete else [f"files kept in {p.base} (--delete-files removes them)"])
     return lines

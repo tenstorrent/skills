@@ -211,7 +211,7 @@ def test_remove_and_stop_refuse_when_the_named_projects_unit_registry_row_or_dae
             cli.main(argv)
         assert e.value.code == 2 and "another project's, left alone" in capsys.readouterr().err
     (d / "tt-project-scratch.service").write_text(f"[Service]\nWorkingDirectory={p.base}\n")
-    # a live pid in its daemon.pid that runs in another folder (this test process, run from elsewhere)
+    # a live pid in its daemon.pid that is the daemon of another folder
     (p.state / "daemon.pid").write_text("4242\n")
     from ttp import daemon
     monkeypatch.setattr(daemon, "_alive", lambda pid: pid == 4242)
@@ -284,3 +284,53 @@ def test_adopt_never_takes_over_another_projects_name(env, capsys):
         cli.main(["adopt", "inner", "--dir", str(other)])
     assert "calls itself 'outer'" in capsys.readouterr().err
     assert project.load_registry()["projects"]["outer"]["dir"] == str(p.root)
+
+
+def test_a_deploy_leaves_out_a_project_removed_since_it_was_listed_never_failing_on_it(env, tmp_path):
+    """cell deploy_skips_removed: a project named by the deploy that is no longer registered, or whose
+    registered folder holds no project any more, is left out and named; the rest still decide the verdict."""
+    import shutil
+    from ttp import overview, project
+    _deploy_lib("0.5.0")
+    _, db = _deploy_project(tmp_path, "alpha", "0.5.0")
+    base, db2 = _deploy_project(tmp_path, "gone", "0.5.0")
+    db2.close()
+    shutil.rmtree(base)   # its folder deleted, its registry row left behind
+    assert overview.deployed("0.5.0", names=["alpha", "ghost"])["rc"] == 2   # a plain check names a typo
+    got = overview.deployed("0.5.0", names=["alpha", "gone", "ghost"], skip_unregistered=True)
+    assert got["rc"] == 0, got["text"]
+    assert [r["name"] for r in got["projects"]] == ["alpha"] and sorted(got["gone"]) == ["ghost", "gone"]
+    assert "ghost\tleft out: no longer registered" in got["text"] and "gone\tleft out: its folder" in got["text"]
+    # a registered folder whose project database is gone (a half-removed scratch project) is left out too
+    nodb, db3 = _deploy_project(tmp_path, "nodb", "0.5.0")
+    db3.close()
+    (nodb / "state" / "project.db").unlink()
+    got = overview.deployed("0.5.0", names=["alpha", "nodb"], skip_unregistered=True)
+    assert got["rc"] == 0 and got["gone"] == ["nodb"] and got["text"].count("nodb\tleft out") == 1
+    # a removed project never hides a real failure of another one
+    _deploy_project(tmp_path, "beta", "0.4.9")[1].close()
+    assert overview.deployed("0.5.0", names=["beta", "gone"], skip_unregistered=True)["rc"] != 0
+    assert overview.deployed("0.5.0", names=["gone"])["rc"] == 2   # a plain check still reports it
+    assert "gone" in project.load_registry()["projects"]   # read only: the row is not touched
+    db.close()
+
+
+@pytest.mark.parametrize("delete", [False, True])
+def test_remove_drops_the_registry_row_even_when_its_daemon_is_gone_or_a_step_fails(env, monkeypatch, capsys, delete):
+    """A8: `ttp remove` (with or without --delete-files) always drops the removed project's registry row, also
+    when its daemon or unit is already gone and the stop step fails, or a shared record cannot be pruned."""
+    from ttp import cli, project, projectremove
+    for name in ("scratch",):
+        p = make(env, name)
+        project.register("other", {"host": "testhost", "dir": str(env["home"] / "other-repo")})
+
+        def boom(proj, kill):
+            raise RuntimeError("no unit tt-project-" + proj.name)
+        monkeypatch.setattr(cli, "stop_project", boom)
+        monkeypatch.setattr(projectremove, "pruners", lambda q: [("machine-wide worker record", lambda: 1 / 0)])
+        cli.main(["remove", name] + (["--delete-files"] if delete else []))
+        out = capsys.readouterr().out
+        assert "not stopped: no unit" in out and "not pruned machine-wide worker record" in out, out
+        assert f"unregistered {name}" in out
+        assert name not in project.load_registry()["projects"] and "other" in project.load_registry()["projects"]
+        assert p.base.is_dir() != delete

@@ -687,3 +687,98 @@ def prompt_block(run_dir: Path, latest: bool = True) -> str:
     return (f"\nRun {rec.get('run')}, {which} of this task, ended without a hand-off and did these outside "
             f"your folders: {_names(found)}. Check their effect (paths only: never print a credential file's "
             "contents), report it in your hand-off, and do not repeat them.\n")
+
+
+# Effects on other projects: what a run did to another project of this machine (its registry row, its daemon, its
+# unit, its harness checkout), checked at the hand-off against a snapshot taken at the spawn. A hand-off claiming
+# no side effects is checked against these and against the writes outside its folders (scan()).
+PEERS = "peers-before.json"
+NO_EFFECTS_RE = re.compile(
+    r"\b(?:no (?:other |further |external )?side[- ]?effects?|nothing (?:else |outside [^.;\n]{1,80}?)?(?:was )?"
+    r"(?:touched|changed|modified|affected)|touched nothing|no changes? (?:were made )?outside)", re.I)
+OUTSIDE_RE = re.compile(r"outside (?:of )?(?:the |its |my )?[`'\"]?((?:~|/)[^\s`'\";,]+)")
+UNIT_STOP_RE = re.compile(r"\bsystemctl\b[^;&|\n]*\b(stop|disable|kill|restart|mask|reset-failed)\b[^;&|\n]*?"
+                          r"\btt-project-([\w.@-]+?)(?:\.service)?(?=[\s;&|'\"]|$)")
+GIT_REWRITE_RE = re.compile(r"\bgit\b[^;&|\n]*\b(checkout|reset|clean|restore|switch|stash)\b")
+
+
+def _peers(own_base) -> dict:
+    """{name: {"dir", "daemon"}} of the other projects registered on this machine; `daemon`: its pid file
+    names a live process."""
+    from . import project
+    own = os.path.realpath(str(own_base))
+    out = {}
+    for name, e in (project.load_registry().get("projects") or {}).items():
+        if not (isinstance(e, dict) and e.get("dir") and e.get("host") in (None, project.hostname())):
+            continue
+        base = os.path.join(str(e["dir"]), project.FOLDER)
+        if os.path.realpath(base) == own:
+            continue
+        alive = False
+        try:
+            pid = int(Path(base, "state", "daemon.pid").read_text().strip())
+            os.kill(pid, 0)
+            alive = True
+        except (OSError, ValueError):
+            pass
+        out[name] = {"dir": str(e["dir"]), "daemon": alive}
+    return out
+
+
+def snapshot_peers(run_dir: Path, own_base) -> None:
+    """At a run's spawn: the other projects of this machine as they are now (peers-before.json)."""
+    from .project import durable_write
+    durable_write(Path(run_dir) / PEERS, json.dumps(_peers(own_base)))
+
+
+def peer_effects(run_dir: Path, own_base, own_name: str) -> list[str]:
+    """What the run did to another project of this machine: its registry row gone, its daemon stopped since the
+    spawn (peers-before.json), a call that stopped or disabled another project's unit, a git checkout, reset or
+    clean in another project's folder (a call no guard refused). One line each."""
+    out: list[str] = []
+    try:
+        before = json.loads((Path(run_dir) / PEERS).read_text())
+    except (OSError, ValueError):
+        before = {}
+    now = _peers(own_base)
+    for name, was in sorted(before.items()):
+        if name not in now:
+            out.append(f"project {name}'s registry row was removed")
+        elif was.get("daemon") and not now[name]["daemon"]:
+            out.append(f"project {name}'s daemon was stopped")
+    folders = {n: os.path.join(e["dir"], "tt-project") for n, e in {**before, **now}.items()}
+    for it in items(Path(run_dir), own_only=True):
+        if it["kind"] != "shell" or it["status"] == "refused":
+            continue
+        cmd = it["what"]
+        for m in UNIT_STOP_RE.finditer(cmd):
+            if m.group(2) != own_name:
+                out.append(f"`systemctl {m.group(1)}` of another project's unit tt-project-{m.group(2)}")
+        if (g := GIT_REWRITE_RE.search(cmd)):
+            for n, f in sorted(folders.items()):
+                if re.search(re.escape(f) + r"(?:/|\b)", cmd):
+                    out.append(f"`git {g.group(1)}` in project {n}'s folder {f}")
+    return list(dict.fromkeys(out))
+
+
+def claim_check(run_dir: Path, result: dict, cwd: str, own_base, own_name: str,
+                home: str | None = None) -> tuple[list[str], list[str]]:
+    """(the run's effects on other projects, its hand-off's false 'no side effects' claims). A claim in its
+    summary or message ('no side effects', 'nothing outside X touched') is false when the run's own records
+    show an effect on another project or a write outside its working folder, run dir and the X it names."""
+    effects = peer_effects(run_dir, own_base, own_name)
+    res = result if isinstance(result, dict) else {}
+    text = "\n".join(str(res.get(k) or "") for k in ("summary", "message", "conclusion"))
+    false = []
+    for m in NO_EFFECTS_RE.finditer(text):
+        claim = text[max(0, text.rfind("\n", 0, m.start()) + 1):][:240].split("\n", 1)[0]
+        extra = [x.group(1) for x in OUTSIDE_RE.finditer(claim)]
+        writes = [f["path"] for f in scan(Path(run_dir), cwd, home)
+                  if f["class"] == "write" and f["status"] != "refused"
+                  and not _inside(f["path"], [os.path.normpath(os.path.expanduser(x)) for x in extra])]
+        why = effects + ([f"wrote outside its folders: {', '.join(writes[:5])}" + (f" and {len(writes) - 5} more" if len(writes) > 5 else "")]
+                         if writes else [])
+        if why:
+            false.append((claim.strip(), "; ".join(why)))
+        break   # one claim per hand-off is enough to mark it
+    return effects, false

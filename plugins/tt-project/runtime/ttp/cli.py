@@ -11255,7 +11255,8 @@ def cmd_deployed(a) -> None:
     in the reporting project (done/pending exit 0, failed exit 1)."""
     from . import overview as ov
     names = [n.strip() for n in (a.projects or "").split(",") if n.strip()] or None
-    data = ov.deployed(a.version, a.commit, names, a.fresh_s, allow_newer=True)
+    data = ov.deployed(a.version, a.commit, names, a.fresh_s, allow_newer=True,
+                       skip_unregistered=a.after_push or a.skip_removed)
     if a.after_push:
         from . import deploy
         p = here()
@@ -17077,6 +17078,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--after-push", action="store_true",
                    help="accept owned merges with takeover times, record follow-ups in this project, "
                         "and alert on failures; exit 0 for done/pending, 1 for failed")
+    s.add_argument("--skip-removed", action="store_true",
+                   help="leave out a named project that is no longer registered here or whose folder holds "
+                        "no project any more (removed since the deploy listed it), as --after-push does")
     s.set_defaults(fn=cmd_deployed)
     s = sub.add_parser("find", help="locate a project by name (registry, then chat logs)")
     s.add_argument("name", help="the project")

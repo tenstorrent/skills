@@ -705,6 +705,37 @@ def refresh(p: Project) -> bool:
     return rewrote
 
 
+def _end_outside_daemon(p: Project, wait_s: float | None = None) -> int | None:
+    """This project's own daemon running outside its systemd unit (started from a shell or an ssh session's
+    scope; the unit's daemon waits for it, Daemon._await_outside_daemon): ask it to stop (SIGTERM, its
+    orderly stop) and wait until it exits, so the restart moves the daemon into its unit. Only the pid in
+    daemon.pid, only when it is this project's daemon (its command line names this folder) and not the
+    unit's main process; workers and detached jobs are never signalled. The pid it ended, else None."""
+    from .daemon import _alive, _is_daemon, _read_pid
+    from .projectremove import pid_dir
+    pid = _read_pid(p.state / "daemon.pid")
+    if not pid or pid == os.getpid() or not _is_daemon(pid):
+        return None
+    d = pid_dir(pid)
+    if d is None or Path(d).resolve() != Path(p.base).resolve():
+        return None
+    stop_s, main = _manager_view(p)
+    try:
+        inside = _unit(p).name in Path(f"/proc/{pid}/cgroup").read_text()   # its own unit's cgroup
+    except OSError:
+        inside = main is None or pid == main   # no /proc: only the manager's own word says it is outside
+    if inside or pid == main:
+        return None
+    try:
+        os.kill(pid, 15)
+    except OSError:
+        return None
+    deadline = time.time() + (stop_s if wait_s is None else wait_s)
+    while time.time() < deadline and _alive(pid):
+        time.sleep(0.5)
+    return pid
+
+
 def restart_service(p: Project) -> str:
     """Restart the daemon process. Running workers are not touched: the new daemon adopts them (they
     run in sessions of their own, and the agent's AbandonProcessGroup keeps them through a bootout)."""
@@ -721,6 +752,7 @@ def restart_service(p: Project) -> str:
             return "restarted"
         # The agent is not loaded: stop the old daemon, then load the agent so launchd starts the new one.
     elif (unit := _unit(p)).exists():
+        _end_outside_daemon(p)
         try:
             r = _run("systemctl", "--user", "restart", unit.name)
         except subprocess.TimeoutExpired as e:

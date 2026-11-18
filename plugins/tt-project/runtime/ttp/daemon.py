@@ -1649,8 +1649,9 @@ class Daemon:
             return 2
         pidfile = self.p.state / "daemon.pid"
         if not self._single_instance():
-            print(f"daemon already running (pid {_read_pid(pidfile)})", file=sys.stderr)
-            return 1
+            if not self._await_outside_daemon(pidfile):
+                print(f"daemon already running (pid {_read_pid(pidfile)})", file=sys.stderr)
+                return 1
         pidfile.write_text(str(os.getpid()))
         # The last stop's record was read when this boot was noted (_note_boot); from here on a
         # reboot that finds none of this boot's was abrupt.
@@ -1817,6 +1818,35 @@ class Daemon:
         # Running workers are left alone: they write their results to disk and the next start
         # adopts them. `ttp stop --kill` and cancels end them explicitly.
         return 0
+
+    def _await_outside_daemon(self, pidfile: Path) -> bool:
+        """Started by its own systemd unit (INVOCATION_ID) while this project's daemon still runs outside it
+        (started from a shell, an ssh session's scope): exiting 1 made Restart=always relaunch the unit every
+        RestartSec, forever. Instead wait, feeding the unit's watchdog, and take over once that daemon exits
+        (service.restart_service ends it at its next restart, so the daemon moves into its unit). Nothing
+        else is touched: detached jobs and workers keep running. True once this one holds the lock; False
+        at once outside a unit or when the holder is no daemon of this project, and on a stop signal."""
+        if not os.environ.get("INVOCATION_ID"):
+            return False
+        from .projectremove import pid_dir
+        other = _read_pid(pidfile)
+        if not (other and other != os.getpid() and _alive(other)):
+            return False
+        d = pid_dir(other)
+        if d is not None and Path(d).resolve() != Path(self.p.base).resolve():
+            return False
+        addr = os.environ.get("NOTIFY_SOCKET")
+        msg = (f"this project's daemon runs outside its service (pid {other}); the service waits for it to "
+               "exit and takes over then, without restarting in a loop")
+        print(msg, file=sys.stderr)
+        log(self.p, msg)
+        while not self.stopping:
+            sd_notify("WATCHDOG=1", addr)
+            time.sleep(OUTSIDE_WAIT_S)
+            if self._single_instance():
+                log(self.p, f"the daemon outside its service (pid {other}) exited; the service's daemon takes over")
+                return True
+        return False
 
     def _single_instance(self) -> bool:
         """Hold an exclusive lock on state/daemon.lock for the process lifetime: the kernel drops it
@@ -4506,6 +4536,11 @@ class Daemon:
                 if why := glmharness.apply(spec, run_dir, self.cfg, runtime_dir, budget_usd=budget_usd):
                     log(self.p, f"run {run_id}: code arm: {why}; handed back to Opus")
             durable_write(run_dir / "run.json", json.dumps(spec, indent=1))   # read again after a reboot
+            if role != "coordinator":
+                try:   # the other projects as they are now: the hand-off's side-effect check compares (sidefx)
+                    sidefx.snapshot_peers(run_dir, self.p.base)
+                except Exception as e:
+                    log(self.p, f"run {run_id}: no peer snapshot: {type(e).__name__}: {e}"[:300])
             if role == "coordinator":
                 self._coord_snapshot(run_dir, wake_guard=not prov.tool_hooks)
             # A step-budget stop waits from the spawn until the supervisor is recorded: one landing in
@@ -6828,6 +6863,30 @@ class Daemon:
             log(self.p, f"run {r['id']}: policy diff not checked: {type(e).__name__}: {e}"[:300])
             return ""
 
+    def _effect_claims(self, r: dict, run_dir: Path) -> None:
+        """What the run did to another project of this machine (its registry row, daemon, unit or harness checkout:
+        sidefx.peer_effects) is raised to the coordinator; a hand-off claiming no side effects that its records
+        disprove is marked false in its result.json (claimcheck.handoff_mark shows it) and raised high."""
+        db = self.p.db
+        try:
+            cwd = str((_read_result(run_dir / "run.json") or {}).get("cwd") or "")
+            result = _read_result(run_dir / RESULT_FILE)
+            effects, false = sidefx.claim_check(run_dir, result or {}, cwd, self.p.base, self.p.name)
+            if false and isinstance(result, dict):
+                result[claimcheck.FALSE_KEY] = [f"{c[:160]} ({why[:400]})" for c, why in false]
+                durable_write(run_dir / RESULT_FILE, json.dumps(result, indent=1))
+                claimcheck.raise_false(db, false, f"task #{r['task']} hand-off (run {r['id']})")
+            elif effects:
+                fp = f"peer_effects:{r['id']}"
+                if not db.one("SELECT 1 FROM events WHERE fingerprint=?", (fp,)):
+                    db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
+                         (time.time(), "daemon", "peer_effects", fp, "high",
+                          f"run {r['id']} of task #{r['task']} touched another project of this machine: "
+                          f"{'; '.join(effects)}. Check that project is whole (its daemon up, its registry row and "
+                          f"harness as they were) and fix it now"[:4000], "queued", r["task"]))
+        except Exception:   # the check only discloses: a failure never costs the run its end
+            log(self.p, f"run {r['id']}: side-effect claim check failed\n" + traceback.format_exc())
+
     def _outside_writes(self, r: dict, run_dir: Path) -> None:
         """A run that ended without a valid hand-off: what it touched outside its working directory and
         run dir goes to its outside.json (its task's next run reads it) and, once, to the coordinator
@@ -7005,6 +7064,8 @@ class Daemon:
             (_read_result(run_dir / RESULT_FILE) or {}).get("status") in HANDOFF_STATES
         if r["role"] != "coordinator" and r["task"] and not handed_off:
             self._outside_writes(r, run_dir)
+        if r["role"] != "coordinator" and r["task"]:
+            self._effect_claims(r, run_dir)
         if status == "timeout" and handed_off:
             cut_off, status = status, "ok"   # it handed off before the clock ran out: the work is done, not wasted
         if usage.auth_failed and not slept_auth and not exit_info.get("launch_auth") and not handed_off \
@@ -24431,6 +24492,11 @@ def register_stack_dump(state: Path):
         old.close()
     _STACK_FILE[:] = [f]
     return f
+
+
+# How often a unit-started daemon that waits for one running outside its unit checks the lock and feeds
+# the watchdog (Daemon._await_outside_daemon): well inside any WatchdogSec the unit sets.
+OUTSIDE_WAIT_S = 5.0
 
 
 def sd_notify(msg: str, addr: str | None) -> bool:
