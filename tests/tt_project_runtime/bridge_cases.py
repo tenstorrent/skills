@@ -1995,3 +1995,66 @@ def test_daemon_keep_awake_never_holds_the_display_or_the_battery():
     from ttp import awake
     a = awake.argv(4242)
     assert a[0] == "caffeinate" and not {"-d", "-u", "-m"} & set(a) and "-s" in a and a[-2:] == ["-w", "4242"]
+
+
+def _unbounded_ssh_adds(root):
+    """Each `ssh-add` the plugin runs or ships with no bound: a subprocess call without `timeout=`, or a
+    shell command string (ssh-add after SSH_AUTH_SOCK=, `$(`, a separator or at its start, with shell syntax
+    in the string) not run under `timeout` (`$t ssh-add`, `timeout N ssh-add`) or a kill watchdog
+    (`ssh-add ... & p=$!`). Docstrings, comments, messages and bare names (deny lists) are text."""
+    import ast
+    import re
+    cmd = re.compile(r"(?:SSH_AUTH_SOCK=\S*\s+|\$\(\s*|(?:^|[;&|(])\s*)(?:\$t\s+|timeout \d+\s+)?ssh-add\b")
+    bounded = re.compile(r"(\$t|timeout \d+)\s+ssh-add|ssh-add[^;|]*&\s*p=\$!")
+    shell = re.compile(r"[$|>;&]")
+    bad = []
+    for f in sorted(root.rglob("*")):
+        if not f.is_file() or f.suffix not in (".py", ".sh", "") or "__pycache__" in f.parts:
+            continue
+        try:
+            text = f.read_text()
+        except (UnicodeDecodeError, OSError):
+            continue
+        if "ssh-add" not in text:
+            continue
+        if f.suffix != ".py" and not text.startswith("#!"):
+            continue
+        if f.suffix != ".py":
+            for n, ln in enumerate(text.splitlines(), 1):
+                code = ln.split("#", 1)[0] if not ln.lstrip().startswith("#") else ""
+                if cmd.search(code) and not bounded.search(code):
+                    bad.append(f"{f.relative_to(root)}:{n}")
+            continue
+        tree = ast.parse(text)
+        docs = {id(n.body[0].value) for n in ast.walk(tree)
+                if isinstance(n, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.body
+                and isinstance(n.body[0], ast.Expr) and isinstance(n.body[0].value, ast.Constant)}
+        parts = {id(x) for j in ast.walk(tree) if isinstance(j, ast.JoinedStr) for x in j.values}
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Call):
+                first = n.args[0] if n.args else None
+                if isinstance(first, (ast.List, ast.Tuple)) and first.elts and \
+                        isinstance(first.elts[0], ast.Constant) and first.elts[0].value == "ssh-add" and \
+                        not any(k.arg == "timeout" for k in n.keywords):
+                    bad.append(f"{f.relative_to(root)}:{n.lineno}")
+            elif isinstance(n, ast.JoinedStr) or isinstance(n, ast.Constant) and isinstance(n.value, str) \
+                    and id(n) not in docs and id(n) not in parts:
+                v = n.value if isinstance(n, ast.Constant) else "".join(
+                    x.value if isinstance(x, ast.Constant) else "{}" for x in n.values)
+                if cmd.search(v) and shell.search(v) and not bounded.search(v):
+                    bad.append(f"{f.relative_to(root)}:{n.lineno}")
+    return bad
+
+
+def test_every_ssh_add_the_plugin_runs_or_ships_is_bounded_so_a_dead_forward_never_hangs_it(tmp_path):
+    # cells: sshadd_bounded, sshadd_guard_test
+    from ttp import bridge
+    plugin = RUNTIME.parent
+    assert _unbounded_ssh_adds(plugin) == [], "bound it: subprocess timeout=, `timeout 10` (with a fallback) or a watchdog"
+    script = bridge.probe_script(_bridge_cfg(), "box-1")
+    assert 't="timeout 10"' in script and "$t ssh-add -l" in script, "the bridge's box probe is bounded too"
+    (tmp_path / "x.py").write_text('import subprocess\nsubprocess.run(["ssh-add", "-l"])\n'
+                                   'CMD = "SSH_AUTH_SOCK=$s ssh-add -l | grep -c SHA256"\n'
+                                   'OK = "timeout 10 ssh-add -l"\nNOTE = "load keys with `ssh-add`"\n')
+    (tmp_path / "y").write_text("#!/bin/sh\nn=$(ssh-add -l)   # count keys\n# ssh-add -l in a comment\n")
+    assert _unbounded_ssh_adds(tmp_path) == ["x.py:2", "x.py:3", "y:2"], "the guard catches what it should"

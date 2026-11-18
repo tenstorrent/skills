@@ -607,13 +607,14 @@ def refresh_checked(platform: str | None = None, path: Path | None = None,
 
 def probe_script(cfg: dict, box: str) -> str:
     """Read-only, on the box: per agent whether its link answers and how many keys it offers; per
-    forwarded host whether its port listens; the block's presence; what the socket dir holds."""
+    forwarded host whether its port listens; the block's presence; what the socket dir holds. Each
+    `ssh-add -l` is bounded (`timeout 10` where the box has it), so a dead forward reads as 0 keys, never a hang."""
     b = cfg["boxes"][box]
-    parts = [f'd={_remote(cfg["socket_dir"])}',
+    parts = [f'd={_remote(cfg["socket_dir"])}', 't=; command -v timeout >/dev/null 2>&1 && t="timeout 10"',
              f'grep -qxF {shlex.quote(BEGIN)} "$HOME/.ssh/config" 2>/dev/null && echo "block yes" || echo "block no"']
     for an, a in b["agents"].items():
         s = _remote(link(cfg, an))
-        parts.append(f'if [ -S {s} ]; then n=$(SSH_AUTH_SOCK={s} ssh-add -l 2>/dev/null | grep -c SHA256); '
+        parts.append(f'if [ -S {s} ]; then n=$(SSH_AUTH_SOCK={s} $t ssh-add -l 2>/dev/null | grep -c SHA256); '
                      f'echo "agent {an} up $n"; else echo "agent {an} down 0"; fi')
         for h in a["forward"]:
             parts.append(f'(exec 3<>/dev/tcp/127.0.0.1/{h["port"]}) 2>/dev/null && echo "port {h["port"]} up" '
