@@ -9,3 +9,4 @@
 - de-slop step 2: deslop schedule (flag deslop.enabled), one refactor task per pass, hold and pause skips, docs, tests
 - de-slop: slop git reads go through gitmemo.run; pause test sets the paused flag
 - de-slop: shorter code-worker line fits the worker prompt cap after the rebase
+- de-slop: a deslop schedule that never ran is due once at enable, not a period away
