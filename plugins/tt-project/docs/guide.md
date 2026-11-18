@@ -4221,7 +4221,7 @@ of a wait handed back unchanged, escalated wakes and failure reasons never take 
 `waiting.wake_escalation.enabled` false turns it off. `ttp stats --wakes` lists each kind and reason's
 escalation rate. The daemon's task start calls it for a wake that would run light and is not already lifted
 by a conclusion floor; the run's wake note then carries `direct`. Because direct wakes no longer add light cases,
-every 8th direct wake of a kind and reason still runs light so the rate is re-measured. A lookup error leaves the
+every 8th started direct wake of a kind and reason still runs light so the rate is re-measured (the decision is made once per wake: a start held for a slot neither logs nor counts again). A lookup error leaves the
 wake light.
 
 ## A big ETA gets an independent check

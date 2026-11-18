@@ -84,6 +84,11 @@ class _KVDB(_RunsDB):
     def __init__(self, rows):
         super().__init__(rows)
         self.store = {}
+        self.scans = 0
+
+    def q(self, sql, params=()):
+        self.scans += 1
+        return super().q(sql, params)
 
     def kv(self, key, default=None):
         return self.store.get(key, default)
@@ -95,27 +100,88 @@ class _KVDB(_RunsDB):
 def _daemon(db, cfg=None):
     import types
     from ttp import daemon
-    return daemon, types.SimpleNamespace(p=types.SimpleNamespace(db=db), cfg=cfg or {})
+    d = types.SimpleNamespace(p=types.SimpleNamespace(db=db), cfg=cfg or {}, _wake_directs={})
+    d._wake_direct = lambda t, pv: daemon.Daemon._wake_direct(d, t, pv)
+    d._wake_direct_started = lambda t: daemon.Daemon._wake_direct_started(d, t)
+    return daemon, d
 
 
-def test_the_wake_start_uses_the_own_tier_off_switch_restores_light_and_every_8th_runs_light(monkeypatch):
-    daemon, d = _daemon(_KVDB(_esc_runs(1, "code", "EEEEEE")))
+def test_a_held_wake_decides_once_logs_once_and_only_a_started_run_counts(monkeypatch):
+    db = _KVDB(_esc_runs(1, "code", "EEEEEE"))
+    daemon, d = _daemon(db)
     lines = []
     monkeypatch.setattr(daemon, "log", lambda p, m: lines.append(m))
-    got = daemon.Daemon._wake_direct(d, _task(), _prev())
-    assert got and got["tier"] == "standard" and "escalated 6/6" in lines[-1] and "code wakes for spec_change" in lines[-1]
-    tiers = [(daemon.Daemon._wake_direct(d, _task(), _prev()) or {}).get("tier") for _ in range(7)]
-    assert tiers == ["standard"] * 6 + [None]   # the 8th wake of this kind and reason (1 + 7) runs light
-    assert daemon.Daemon._wake_direct(d, _task(), _prev())["tier"] == "standard"
+    task = {**_task(), "result": "r1"}
+    for _ in range(3):   # three ticks of a start held by a full route slot
+        assert d._wake_direct(task, _prev())["tier"] == "standard"
+    assert db.scans == 1 and lines == [] and db.store == {}
+    d._wake_direct_started(task)
+    assert db.store == {"wake_direct_n:code:spec_change": 1} and len(lines) == 1
+    assert "escalated 6/6" in lines[0] and "code wakes for spec_change" in lines[0]
+    d._wake_direct_started(task)   # a second call for the same start counts nothing
+    assert db.store == {"wake_direct_n:code:spec_change": 1} and len(lines) == 1
+
+
+def test_the_8th_started_direct_wake_runs_light_even_when_earlier_ticks_were_held(monkeypatch):
+    daemon, d = _daemon(_KVDB(_esc_runs(1, "code", "EEEEEE")))
+    monkeypatch.setattr(daemon, "log", lambda p, m: None)
+    tiers = []
+    for n in range(1, 10):
+        task = {**_task(), "result": f"r{n}"}   # a new wake: a new result
+        for _ in range(3):   # held ticks never advance the counter
+            got = d._wake_direct(task, _prev())
+        tiers.append((got or {}).get("tier"))
+        d._wake_direct_started(task)
+    assert tiers == ["standard"] * 7 + [None, "standard"]
+    assert d.p.db.store["wake_direct_n:code:spec_change"] == 9
+
+
+def test_the_off_switch_restores_light_and_an_error_keeps_the_wake_light(monkeypatch):
+    from ttp import waketier
     off = {"waiting": {"wake_escalation": {"enabled": False}}}
     daemon, d = _daemon(_KVDB(_esc_runs(1, "code", "EEEEEE")), off)
-    assert daemon.Daemon._wake_direct(d, _task(), _prev()) is None
-
-
-def test_a_failing_direct_lookup_keeps_the_wake_light(monkeypatch):
-    from ttp import waketier
+    assert d._wake_direct({**_task(), "result": "r"}, _prev()) is None
     daemon, d = _daemon(_KVDB([]))
     lines = []
     monkeypatch.setattr(daemon, "log", lambda p, m: lines.append(m))
     monkeypatch.setattr(waketier, "direct", lambda *a: (_ for _ in ()).throw(RuntimeError("boom")))
-    assert daemon.Daemon._wake_direct(d, _task(), _prev()) is None and "wake direct failed" in lines[-1]
+    assert d._wake_direct({**_task(), "result": "r"}, _prev()) is None and "wake direct failed" in lines[-1]
+    d._wake_direct_started({**_task(), "result": "r"})   # nothing to count
+    assert d.p.db.store == {}
+
+
+def test_start_tasks_starts_a_mostly_escalating_wake_at_the_own_tier_with_direct_in_the_note(env, monkeypatch):
+    from ttp import waketier
+    from ttp.daemon import Daemon
+    p = make(env)
+    p.db.x("UPDATE tasks SET status='done'")
+    d = Daemon(p.base)
+    d.jev = None
+    monkeypatch.setattr(d, "_workdir_for", lambda t: (str(p.base), None))
+    started = []
+    monkeypatch.setattr(d, "start_run", lambda *a, **k: started.append((a, k)) or 0)
+    calls = []
+    waits = {"status": "waiting", "summary": "checks run", "retry_when": "ttp checks --result /tmp/run/1",
+             "waiting_for": "checks", "next_step": "push"}
+    t = p.db.add_task("Copy the log", "x", kind="work", tier="standard", origin="coordinator",
+                      provider="claude", budget_usd=8.0)
+    p.db.update_task(t, result=json.dumps(waits))
+    why = waketier.reason(waits)
+    monkeypatch.setattr(waketier, "escalation_cases", lambda db, *a: calls.append(1) or [("work", why, True)] * 6)
+    d.dispatch()
+    ((a, k),) = started
+    assert a[3] == "standard" and k["note"]["wake"]["tier"] == "standard"
+    assert k["note"]["wake"]["direct"] == {"tier": "standard", "kind": "work", "reason": why,
+                                           "cases": 6, "escalated": 6}
+    assert len(calls) == 1 and p.db.kv(f"wake_direct_n:work:{why}") == 1
+    # Off: the same wake stays light and carries no direct block.
+    started.clear()
+    p.set_config("waiting.wake_escalation.enabled", False)
+    p.db.update_task(t, status="queued", result=json.dumps(waits))
+    d = Daemon(p.base)
+    d.jev = None
+    monkeypatch.setattr(d, "_workdir_for", lambda t: (str(p.base), None))
+    monkeypatch.setattr(d, "start_run", lambda *a, **k: started.append((a, k)) or 0)
+    d.dispatch()
+    ((a, k),) = started
+    assert a[3] == "light" and "direct" not in k["note"]["wake"]

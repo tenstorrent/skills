@@ -1431,6 +1431,7 @@ class Daemon:
         self._stale_user_held: set[str] = set()   # wait_stale fingerprints already logged as held by the user
         self._urgent_own_logged: dict[int, int] = {}   # task -> run whose own-wait hold check_urgent_start logged
         self._urgent_woke_from: dict[int, tuple] = {}   # task -> (its woke text, when that wake made it due); pruned by check_urgent_start
+        self._wake_directs: dict[int, dict] = {}   # task id -> its wake's direct decision (_wake_direct), until a run starts
         self._route_waits: dict[int, float] = {}   # task id -> since when it waits for a routed slot (route.wait_s)
         self._stall_probes: dict[str, list] = {}   # probe (or a caller's key) -> its re-check: [Pending, started, answer or None]
         self._git_memo: dict[int, dict] = {}   # task -> git facts its hand-off is judged by, read before the tx (_prefetch_git)
@@ -13497,6 +13498,7 @@ class Daemon:
                                         resume=lost["session"] if lost else None,
                                         min_effort=None if tierfloor.wake_keeps_effort(task, run_cls)
                                         else (need or {}).get("effort") or None)
+                self._wake_direct_started(task)   # counted and logged once, for the run that started
                 if dab:   # route.device_ab_shadow: read only shadow runs of this task, off by default; never hold it
                     try:
                         deviceshadow.start(self.p, task, self.cfg)
@@ -14316,23 +14318,41 @@ class Daemon:
         return out
 
     def _wake_direct(self, task: dict, prev: dict) -> dict | None:
-        """waketier.direct for a wake about to start at light, or None: it keeps its tier. Every WAKE_PROBE_EVERY-th
-        wake of a kind and reason still runs light, so the escalation rate keeps being measured."""
+        """waketier.direct for a wake about to start at light, or None: it keeps its tier. Decided once per wake:
+        later ticks of a start held for a slot reuse it, and nothing is counted or logged until a run starts
+        (_wake_direct_started). Every WAKE_PROBE_EVERY-th started wake of a kind and reason still runs light, so
+        the escalation rate keeps being measured."""
+        memo = self._wake_directs.get(task["id"])
+        if memo and memo["result"] == task.get("result"):
+            return memo["got"]
+        got, key, n = None, None, 0
         try:
             got = waketier.direct(self.p.db, self.cfg, task, prev)
-            if not got:
-                return None
-            key = f"wake_direct_n:{got['kind']}:{got['reason']}"
-            n = int(self.p.db.kv(key, 0) or 0) + 1
-            self.p.db.set_kv(key, n)
-            if n % WAKE_PROBE_EVERY == 0:
-                return None
+            if got:
+                key = f"wake_direct_n:{got['kind']}:{got['reason']}"
+                n = int(self.p.db.kv(key, 0) or 0) + 1
+                if n % WAKE_PROBE_EVERY == 0:
+                    got = None
         except Exception as e:   # a wake keeps its tier
             log(self.p, f"task {task['id']}: wake direct failed: {type(e).__name__}: {e}")
-            return None
-        log(self.p, f"task {task['id']} wake tier: {got['tier']}, not light (direct: {got['kind']} wakes for "
-                    f"{got['reason']} escalated {got['escalated']}/{got['cases']})")
+            got, key = None, None
+        if len(self._wake_directs) > 500:
+            self._wake_directs.clear()
+        self._wake_directs[task["id"]] = {"result": task.get("result"), "got": got, "key": key, "n": n}
         return got
+
+    def _wake_direct_started(self, task: dict) -> None:
+        """A run started for the wake: advance its kind and reason's probe counter and log the decision once."""
+        memo = self._wake_directs.pop(task["id"], None)
+        if not memo or not memo["key"] or memo["result"] != task.get("result"):   # not this wake's decision
+            return
+        try:
+            self.p.db.set_kv(memo["key"], memo["n"])
+        except Exception as e:
+            log(self.p, f"task {task['id']}: wake direct count failed: {type(e).__name__}: {e}")
+        if got := memo["got"]:
+            log(self.p, f"task {task['id']} wake tier: {got['tier']}, not light (direct: {got['kind']} wakes for "
+                        f"{got['reason']} escalated {got['escalated']}/{got['cases']})")
 
     def _unreserve(self, task: dict) -> None:
         for res in _exclusive(task):
