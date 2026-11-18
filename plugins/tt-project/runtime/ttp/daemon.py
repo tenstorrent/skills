@@ -14727,7 +14727,8 @@ class Daemon:
         # A lock wait is a queue wait the coordinator handles: it gets it as its queue-wait item once per
         # holder (lockreap.signature), not before a dead holder had time to be released (dead_unreleased);
         # the wait stays in the web app and status. Only a wait behind the user's own pause of the resource
-        # goes to chat. The alert is posted again only when its holder changes.
+        # goes to chat. A lock changing hands posts nothing: the new holder's wait counts from then, and a gap
+        # with no holder is a hand-over unless it lasts past lockreap.HANDOVER_S (a stuck lock: the coordinator).
         dead_seen, dead_now = getattr(self, "_lock_dead_seen", {}), set()
         paused, seen = db.paused_resources(), dict(db.kv(lockreap.WAIT_KV, {}) or {})
         for w in waits:
@@ -14738,9 +14739,28 @@ class Daemon:
             dead = lockreap.dead_unreleased(w, got["kept"], dead_seen, now)
             dead_now |= {(w["lock"], h.get("path") or "", h.get("pid")) for h in w["holders"] if h.get("state") == "dead"}
             user = lockreap.users_pause(w, paused) is not None
-            sig = lockreap.signature(w) + ("|user" if user else "")
-            text = lockreap.wait_text(w, now, got["kept"])
             rec = seen.get(key) or {"n": 0, "since": now - w["waited_s"]}
+            held = lockreap.signature(w)
+            if not w["holders"] and not w["lock"].startswith("devq:"):
+                gap = rec.setdefault("gap", now)
+                if now - gap < lockreap.HANDOVER_S:
+                    seen[key] = rec   # the lock is changing hands: its next waiter is about to take it
+                    continue
+                w = {**w, "free_s": now - gap}   # no waiter took it within the grace: a stuck lock
+            else:
+                rec.pop("gap", None)
+                if rec.get("held") not in (None, held):
+                    # It changed hands: no alert; the new holder's wait counts from now.
+                    lockreap.settle_item(db, w["lock"])
+                    alerts.close_key(db, key, "the lock changed hands", now=now,
+                                     text=f"Lock {w['lock']} changed hands: its wait counts again from now.")
+                    rec = {"n": int(rec.get("n") or 0), "since": now}
+            rec["held"] = held
+            if not user and now - rec["since"] < limit:
+                seen[key] = rec   # not long behind this holder yet
+                continue
+            sig = held + ("|user" if user else "")
+            text = lockreap.wait_text({**w, "waited_s": now - rec["since"]}, now, got["kept"])
             if rec.get("sig") != sig:
                 rec.update(sig=sig, n=int(rec.get("n") or 0) + 1)
                 ep = db.one("SELECT * FROM alerts WHERE key=? AND cleared IS NULL ORDER BY id DESC LIMIT 1", (key,))

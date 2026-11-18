@@ -50,6 +50,7 @@ from . import locks, procowner
 WAIT_ALERT_MIN = 30   # config locks.wait_alert_min: a lock wait longer than this raises lock-wait:<name>
 GRACE_S = 60.0        # a holder seen dead this long (two sweeps) before what keeps its lock is reaped
 KILL_AFTER_S = 10.0   # a reaped process still there this long after SIGTERM gets SIGKILL
+HANDOVER_S = 120.0    # a lock with waiters and no holder this long is stuck; shorter, it is changing hands
 FREE_WAIT_S = 3.0     # free_ended (`ttp detach --reap/--stop`) waits this long after each signal for a slot to go free
 EVENT_KIND = "lock_released"
 # While the daemon runs, a dead holder's lock that only its own run keeps is released this soon: the first
@@ -612,7 +613,8 @@ def wait_text(w: dict, now: float | None = None, kept: dict | None = None) -> st
     parts = []
     for h in w["holders"] or [{}]:
         if not h:
-            parts.append("no holder found (a slot may have been freed just now)")
+            parts.append(f"none for {_dur(w['free_s'])} while waiters queue (no waiter took the freed lock: "
+                         "it may be stuck)" if w.get("free_s") else "no holder found (a slot may have been freed just now)")
             continue
         who, have = h["holder"], h["holder"].translate(_PUNCT).split()
         extra = [f"task #{h['task']}" if h.get("task") and f"#{h['task']}" not in have else "",

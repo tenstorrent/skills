@@ -292,6 +292,18 @@ def _lock_wait_rows(p, key):
     return p.db.q("SELECT text, channel FROM messages WHERE direction='out' AND ref=? ORDER BY id", (key,))
 
 
+def _lock_wait_alerts(p, key="lock-wait:gate"):
+    return p.db.q("SELECT text, channel FROM messages WHERE direction='out' AND kind='alert' AND ref=? ORDER BY id",
+                  (key,))
+
+
+def _lockwait_clock(monkeypatch):
+    """time.time() reads now[0], moved by the test."""
+    now = [time.time()]
+    monkeypatch.setattr(time, "time", lambda: now[0])
+    return now
+
+
 def _prime_reaper(dmn, p):
     """Give daemon `dmn` a reaper that first saw today's dead holders past the grace, so its next sweep judges them."""
     from ttp import checkcap, lockreap
@@ -395,8 +407,8 @@ def test_lock_wait_names_the_live_shared_holder_not_the_stale_slot_label(env, mo
 
 def test_lock_wait_is_one_alert_and_one_item_per_holder_and_goes_to_chat_only_behind_the_users_pause(env, monkeypatch):
     """cells one_alert_per_wait, wait_to_coordinator: ticks and new waiters repeat nothing; a new holder posts
-    once more, quietly, and gives the coordinator a new item; the user's own pause of the resource is the
-    one wait that reaches the chat, and no coordinator item then."""
+    nothing (the lock changed hands: its wait counts again from then, test_lock_wait_hand_over_*); the user's
+    own pause of the resource is the one wait that reaches the chat, and no coordinator item then."""
     from ttp import daemon as dm, db as dbmod, locks
     p = make(env)
     d = p.state / "locks"
@@ -415,21 +427,115 @@ def test_lock_wait_is_one_alert_and_one_item_per_holder_and_goes_to_chat_only_be
         f = _reap_slot(d / "gate.0.lock", pid=4200, pid_start="12", pgid=4200, run_id="71", task_id="5")
         dmn.reap_locks()
         dmn.reap_locks()
-        rows = _lock_wait_rows(p, "lock-wait:gate")
-        assert [r["channel"] for r in rows] == ["quiet", "quiet"] and "task #5" in rows[1]["text"], rows
-        items = _lock_wait_items(p)
-        assert len(items) == 2 and json.loads(items[1]["data"])["must_act"]["tasks"] == [5], items
+        assert [r["channel"] for r in _lock_wait_alerts(p)] == ["quiet"], "a lock changing hands raises no alert"
+        [item] = _lock_wait_items(p)
+        assert item["status"] == "handled", "the old holder's item is moot"
         p.db.set_kv(dbmod.PAUSED_RESOURCES_KEY,
                     {"gate": {"reason": "hands off", "since": time.time(), "by": "user"}})
         dmn.reap_locks()
         dmn.reap_locks()
-        rows = _lock_wait_rows(p, "lock-wait:gate")
-        assert [r["channel"] for r in rows] == ["quiet", "quiet", "chat"], rows
-        assert len(_lock_wait_items(p)) == 2, "only the user can lift their pause: no coordinator item"
+        rows = _lock_wait_alerts(p)
+        assert [r["channel"] for r in rows] == ["quiet", "chat"] and "task #5" in rows[1]["text"], rows
+        assert len(_lock_wait_items(p)) == 1, "only the user can lift their pause: no coordinator item"
     finally:
         for t in tickets:
             locks.dequeue(t)
         f.close()
+
+
+def test_lock_wait_user_route_a_quiet_lock_wait_is_never_listed_as_sent_to_the_user(env, monkeypatch):
+    """cell user_route: a wait not behind the user's pause posts on the quiet channel only (web app and
+    status), and the coordinator's digest never lists it under what was sent to the user, so the coordinator
+    never tells the user (or itself) they got it."""
+    from ttp import coordinator as coord, daemon as dm, locks
+    p = make(env)
+    d = p.state / "locks"
+    f = _reap_slot(d / "gate.0.lock", pid=4100, pid_start="11", pgid=4100, run_id="70", task_id="7")
+    _ReapProcs(monkeypatch, {4100: {"start": "11", "pgid": 4100}}, [4100])
+    ticket = locks.enqueue(d, "gate", "task #8", since=time.time() - 31 * 60)
+    p.db.post("out", "an answer the user got", chat="c1", kind="reply")
+    try:
+        dm.Daemon(p.base).reap_locks()
+        assert [r["channel"] for r in _lock_wait_alerts(p)] == ["quiet"]
+        assert len(_lock_wait_items(p)) == 1, "the coordinator gets it as its queue-wait item"
+        sent = coord.digest(p, {}, [], []).split("## Recently sent to the user")[1].split("\n## ")[0]
+        assert "an answer the user got" in sent and "Lock gate" not in sent, sent
+    finally:
+        locks.dequeue(ticket)
+        f.close()
+
+
+def test_lock_wait_hand_over_raises_nothing_and_the_wait_counts_again_from_the_new_holder(env, monkeypatch):
+    """cell handover: the holder stops, the slot is free a few seconds with waiters queued, a waiter takes it.
+    No alert and no coordinator item for the gap or the new holder; the old item is settled; the wait counts
+    from the hand-over, so the new holder is named only once it held past locks.wait_alert_min."""
+    from ttp import daemon as dm, locks
+    p = make(env)
+    d = p.state / "locks"
+    now = _lockwait_clock(monkeypatch)
+    f = _reap_slot(d / "gate.0.lock", pid=4100, pid_start="11", pgid=4100, run_id="70", task_id="7")
+    _ReapProcs(monkeypatch, {4100: {"start": "11", "pgid": 4100}, 4200: {"start": "12", "pgid": 4200}}, [4100])
+    tickets = [locks.enqueue(d, "gate", "task #8", since=now[0] - 31 * 60),
+               locks.enqueue(d, "gate", "task #9", since=now[0] - 20 * 60)]
+    try:
+        dmn = dm.Daemon(p.base)
+        dmn.reap_locks()
+        assert len(_lock_wait_alerts(p)) == 1 and len(_lock_wait_items(p)) == 1
+        f.close()                                                   # the holder stops: no holder for a moment
+        for _ in range(2):
+            now[0] += 10
+            dmn.reap_locks()
+        assert len(_lock_wait_alerts(p)) == 1, "no holder with waiters queued is a hand-over, not a new holder"
+        now[0] += 5
+        f = _reap_slot(d / "gate.0.lock", pid=4200, pid_start="12", pgid=4200, run_id="71", task_id="5")
+        dmn.reap_locks()
+        dmn.reap_locks()
+        assert len(_lock_wait_alerts(p)) == 1, "a lock changing hands raises no alert"
+        assert [e["status"] for e in _lock_wait_items(p)] == ["handled"]
+        assert not p.db.one("SELECT id FROM alerts WHERE key='lock-wait:gate' AND cleared IS NULL")
+        now[0] += 29 * 60
+        dmn.reap_locks()
+        assert len(_lock_wait_alerts(p)) == 1, "the wait counts from the hand-over"
+        now[0] += 2 * 60
+        dmn.reap_locks()
+        rows = _lock_wait_alerts(p)
+        assert len(rows) == 2 and rows[1]["channel"] == "quiet" and "task #5" in rows[1]["text"], rows
+        assert "31 min" in rows[1]["text"], rows[1]["text"]
+        items = _lock_wait_items(p)
+        assert len(items) == 2 and json.loads(items[1]["data"])["must_act"]["tasks"] == [5], items
+    finally:
+        for t in tickets:
+            locks.dequeue(t)
+        f.close()
+
+
+def test_lock_wait_stuck_lock_with_no_holder_past_the_grace_reaches_the_coordinator(env, monkeypatch):
+    """cell stuck_lock: the holder is gone and no waiter takes the lock within lockreap.HANDOVER_S: the
+    coordinator gets a queue-wait item naming a stuck lock, still off the user's chat."""
+    from ttp import daemon as dm, lockreap, locks
+    p = make(env)
+    d = p.state / "locks"
+    now = _lockwait_clock(monkeypatch)
+    f = _reap_slot(d / "gate.0.lock", pid=4100, pid_start="11", pgid=4100, run_id="70", task_id="7")
+    _ReapProcs(monkeypatch, {4100: {"start": "11", "pgid": 4100}}, [4100])
+    ticket = locks.enqueue(d, "gate", "task #8", since=now[0] - 31 * 60)
+    try:
+        dmn = dm.Daemon(p.base)
+        dmn.reap_locks()
+        assert len(_lock_wait_items(p)) == 1
+        f.close()
+        now[0] += 10
+        dmn.reap_locks()
+        assert len(_lock_wait_items(p)) == 1 and len(_lock_wait_alerts(p)) == 1, "within the grace: a hand-over"
+        now[0] += lockreap.HANDOVER_S
+        dmn.reap_locks()
+        dmn.reap_locks()
+        rows = _lock_wait_alerts(p)
+        assert [r["channel"] for r in rows] == ["quiet", "quiet"] and "may be stuck" in rows[1]["text"], rows
+        items = _lock_wait_items(p)
+        assert len(items) == 2 and "may be stuck" in items[1]["text"] and items[1]["status"] == "queued", items
+    finally:
+        locks.dequeue(ticket)
 
 
 def test_dead_unreleased_counts_a_dead_holder_once_the_sweep_had_time_to_release_it():

@@ -1757,8 +1757,11 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     section("stops", safe_eta(lambda: onhost.stop_lines(p, now), []))
     section("tool_steer", safe_eta(lambda: costlevers.steer_lines(p), []))   # rings.coord_wake_settle: only with it on
     lines = []
+    # A quiet alert (web app and status only, e.g. a lock wait the coordinator gets as its queue-wait item)
+    # never reached a chat: listing it here would tell the coordinator the user got it.
     sent = db.q("SELECT * FROM messages WHERE direction='out' AND kind IN ('reply','ask','alert') "
-                "ORDER BY id DESC LIMIT ?", (RECENT_OUT * msgparts.MAX_PARTS,))
+                "AND (channel IS NULL OR channel!=?) ORDER BY id DESC LIMIT ?",
+                ("quiet", RECENT_OUT * msgparts.MAX_PARTS))   # alerts.QUIET
     sent = [m for m in sent if not msgparts.continued(m["text"])][:RECENT_OUT]   # a long reply: its first part
     if sent:
         lines.append("## Recently sent to the user (do not repeat these)")
