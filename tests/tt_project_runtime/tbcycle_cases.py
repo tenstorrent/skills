@@ -676,3 +676,96 @@ def test_terminalbench_schedule_stays_off_while_held_and_once_turned_off_on_purp
     assert benchowner.ensure_tb(p, p.db, True, True) == "on", "the hold ended: back on"
     schedule.set_enabled(p.db, benchowner.TB_SCHEDULE, False)   # someone turns it off on purpose
     assert benchowner.ensure_tb(p, p.db, True, True) == "" and not sched()["enabled"], "never re-enabled"
+
+
+def _tb_refusing(pct, peaks=None):
+    import threading
+    now, gate = [0], threading.Lock()
+
+    def trial(model, task, root):
+        with gate:
+            now[0] += 1
+            if peaks is not None:
+                peaks.append(now[0])
+        time.sleep(0.03)
+        with gate:
+            now[0] -= 1
+        return {"reward": 1.0, "min": 1.0, "error": None,
+                "server": {"calls": 10, "failed_calls": pct // 10, "failed_by": {"capacity": pct // 10}}}
+    return trial
+
+
+def test_terminalbench_reference_backs_off_to_the_probed_level_once_capacity_refusals_pass_20_percent(env, monkeypatch):
+    from ttp import benchbackoff, tbcycle
+    d, cfg, clock, sleeps, sleep = _tb_setup(env, monkeypatch, tasks=[f"t{i}" for i in range(14)], reference={
+        "models": ["org/open-m"], "parallel": 6, "endpoint": "gw"})
+    probe = benchbackoff.probe_file("org/open-m")
+    assert probe == d / "concurrency" / "org-open-m.json", "the model's / becomes -"
+    probe.parent.mkdir()
+    probe.write_text(json.dumps({"model": "org/open-m", "measured_at": 1, "safe_level": 2, "levels": {
+        "2": {"calls": 40, "refused": 1, "refusal_pct": 2.5}, "4": {"calls": 40, "refused": 6, "refusal_pct": 15.0}}}))
+    peaks = []
+    assert tbcycle.ref_runner(cfg, "org/open-m", {}, trial=_tb_refusing(50, peaks), clock=lambda: clock["t"]) == 14
+    log = [json.loads(x) for x in (tbcycle.ref_dir("") / "org-open-m.backoff.jsonl").read_text().splitlines()]
+    assert log[0]["from"] == 6 and log[0]["to"] == 2 and log[0]["refusal_pct"] == 50.0, "over 20%: the probed level"
+    assert all(e["to"] < e["from"] for e in log), "the level only goes down"
+    assert max(peaks[:6]) > 2 and max(peaks[-4:]) <= 2, "running trials finish; new ones start only under the level"
+    assert len(tbcycle.reference()) == 1, "every trial was scored: the model is booked as before"
+    cfg["model_bench"]["terminalbench"]["reference"].update(models=["calm-m"], parallel=3, run="calm")
+    assert tbcycle.ref_runner(cfg, "calm-m", {}, trial=_tb_refusing(10), clock=lambda: clock["t"]) == 14
+    assert not (tbcycle.ref_dir("calm") / "calm-m.backoff.jsonl").exists(), "10% refusals: the level stays"
+
+
+def test_terminalbench_backoff_without_a_probe_record_steps_down_until_refusals_fall_under_5_percent(env, monkeypatch):
+    from ttp import benchbackoff
+    _tb_setup(env, monkeypatch)
+    t = {"now": 1000.0}
+    b = benchbackoff.Backoff("org/new-m", 8, env["tmp"] / "bo.jsonl", clock=lambda: t["now"])
+    assert b.probed is None, "no probe record"
+    row = lambda n, cap: {"server": {"calls": n, "failed_by": {"capacity": cap}}}   # noqa: E731
+    assert b.seen(row(10, 3)) == 8, "too few calls to judge"
+    assert b.seen(row(10, 3)) == 6, "30% refused: one step down"
+    assert b.seen(row(20, 3)) == 4, "backing off and still 15% refused: the next step"
+    assert b.seen(row(20, 2)) == 3 and b.seen(row(20, 1)) == 2, "5% or more: down again"
+    assert b.seen(row(40, 1)) == 2, "under 5%: it holds there"
+    assert b.seen(row(20, 1)) == 2 and b.seen({"reward": 1.0}) == 2, "rows without calls change nothing"
+    for _ in range(4):
+        b.seen(row(20, 20))
+    assert b.level == 1, "never below one trial at once"
+    log = [json.loads(x) for x in (env["tmp"] / "bo.jsonl").read_text().splitlines()]
+    assert [(e["from"], e["to"]) for e in log] == [(8, 6), (6, 4), (4, 3), (3, 2), (2, 1)]
+    assert log[0]["why"] == "no probe record: one step down" and log[0]["refusal_pct"] == 30.0
+    calm = benchbackoff.Backoff("org/new-m", 4, clock=lambda: t["now"])
+    assert calm.seen(row(40, 6)) == 4, "15% while not backing off: under the 20% trigger, the level stays"
+    old = benchbackoff.Backoff("org/new-m", 4, clock=lambda: t["now"])
+    old.seen(row(200, 100))
+    assert old.level == 3
+    t["now"] += 3600
+    old.seen(row(100, 0)), old.seen(row(20, 0))
+    assert old.rate()[1] == 120, "the window is the last 100 calls or 10 minutes, whichever holds more"
+
+
+def test_terminalbench_reference_reruns_only_not_scored_tasks_at_the_asked_level_replacing_their_rows(env, monkeypatch):
+    from ttp import serverhealth, tbcycle
+    d, cfg, clock, sleeps, sleep = _tb_setup(env, monkeypatch, tasks=[f"t{i}" for i in range(6)], reference={
+        "models": ["open-m"], "parallel": 6, "endpoint": "gw", "rounds": 1})
+    rows = tbcycle.ref_dir("") / "open-m.jsonl"
+    rows.parent.mkdir(parents=True, exist_ok=True)
+    old = [{"task": f"t{i}", "model": "open-m", "reward": 1.0, "min": 1.0} for i in (0, 1)] + [
+        {"task": f"t{i}", "model": "open-m", "reward": None, "min": 1.0, "heldout_reward": 0.0, "outcome": serverhealth.OUTCOME,
+         **({"rerun": 1} if i == 5 else {})} for i in (2, 3, 4, 5)]
+    rows.write_text("".join(json.dumps(r) + "\n" for r in old))
+    peaks, ran = [], []
+    trial = _tb_refusing(0, peaks)
+
+    def counted(model, task, root):
+        ran.append(task)
+        return trial(model, task, root)
+    assert tbcycle.ref_runner(cfg, "open-m", {}, trial=counted, clock=lambda: clock["t"], rerun_server=2) == 4
+    assert sorted(ran) == ["t2", "t3", "t4", "t5"], "only the not-scored tasks, a used-up rerun count included"
+    assert max(peaks) <= 2, "at the asked level"
+    got = tbcycle._rows(rows, [f"t{i}" for i in range(6)])
+    assert all(got[t]["reward"] == 1.0 and got[t].get("outcome") != serverhealth.OUTCOME for t in got), \
+        "each new row replaces its old one"
+    assert got["t5"]["rerun"] == 2 and got["t0"].get("rerun") is None
+    assert len(tbcycle.reference()) == 1, "all scored now: booked"

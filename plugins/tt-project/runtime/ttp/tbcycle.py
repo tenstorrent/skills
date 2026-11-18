@@ -423,17 +423,20 @@ def parity(s: dict, model: str, meta: dict, via: str, harbor: str) -> dict:
 
 def ref_runner(cfg: dict, model: str, env: dict, *, trial: Callable | None = None, clock: Callable = time.time,
                bridge: Callable | None = None, chat: Callable | None = None, sleep: Callable = time.sleep,
-               stop: Callable[[], str] | None = None, gate: Callable | None = None) -> int:
+               stop: Callable[[], str] | None = None, gate: Callable | None = None,
+               rerun_server: int = 0) -> int:
     """Run `model`'s reference tasks (resuming), then book its row once; returns trials run. A booked model
     runs nothing (module doc). A bridge model gets the claude CLI's loopback server (bridge(model, effort)
     builds it), a chat model the chat endpoint's relay (chat(model)), one per trial so its server wait and
     tokens/s are the trial's own; reference.parallel tasks run at once. A trial cut while the server ran slow
     is `server` (serverhealth.judge): not scored, rerun one at a time once a probe shows the server healthy.
-    `stop` (benchowner.trial_stop) is asked before each trial: a reason starts no more, nothing is booked."""
+    `stop` (benchowner.trial_stop) is asked before each trial: a reason starts no more, nothing is booked.
+    Capacity refusals over 20% lower the trials at once (benchbackoff). `rerun_server` N first reruns every
+    task whose latest row is `server` (not scored), N at once, its new row replacing the old one."""
     import shutil
     from concurrent.futures import ThreadPoolExecutor
     from threading import Event, Lock
-    from . import harborslice, modelbench, modelsuite, occupancy, serverhealth
+    from . import benchbackoff, harborslice, modelbench, modelsuite, occupancy, serverhealth
     from .project import durable_write
     if gate is None and trial is None:   # each real trial asks `ttp occupancy` for this host first (runner)
         gate = lambda: occupancy.wait_here("bench", "tbcycle", sleep=sleep, clock=clock)   # noqa: E731
@@ -535,27 +538,44 @@ def ref_runner(cfg: dict, model: str, env: dict, *, trial: Callable | None = Non
                 modelsuite._append(d / f"{sl}.jsonl", r)
 
         def one(t, n=0):
-            if dead.is_set() or halt.is_set():
-                return   # a trial died, or the bench is held or stopped: start no more
-            if stop and stop():
-                halt.set()
-                return
-            if n:   # a not-run trial again: its old job is not resumed
-                shutil.rmtree(d / "trials" / sl / harborslice.slug(t), ignore_errors=True)
+            bo.slot()   # no new trial while more than the back-off level run; running ones are never stopped
             try:
-                keep(attempt(t, n))
+                if dead.is_set() or halt.is_set():
+                    return   # a trial died, or the bench is held or stopped: start no more
+                if stop and stop():
+                    halt.set()
+                    return
+                if n:   # a not-run trial again: its old job is not resumed
+                    shutil.rmtree(d / "trials" / sl / harborslice.slug(t), ignore_errors=True)
+                r = attempt(t, n)
+                keep(r)
+                bo.seen(r)
             except BaseException:
                 dead.set()
                 raise
+            finally:
+                bo.free()
+
+        def pooled(todo: list, level: int) -> None:
+            with ThreadPoolExecutor(max_workers=max(1, min(level, len(todo)))) as pool:
+                for f in [pool.submit(one, t, int(done[t].get("rerun") or 0) + 1 if t in done else 0) for t in todo]:
+                    f.result()
         ran = 0
+        bo = benchbackoff.Backoff(model, rerun_server or s[REF]["parallel"], d / f"{sl}.backoff.jsonl", clock=clock)
+        if rerun_server:   # the not-scored (server) rows again at the asked level, each new row replacing its old one
+            todo = [t for t in meta["tasks"] if (done.get(t) or {}).get("outcome") == serverhealth.OUTCOME]
+            if todo:
+                pooled(todo, bo.level)
+                if halt.is_set():
+                    return ran
+                ran += len(todo)
+            bo.level = min(bo.level, s[REF]["parallel"]) if bo.backing else s[REF]["parallel"]
         while True:   # new trials, then not-run ones again (each up to reference.rounds times)
             todo = [t for t in meta["tasks"] if t not in done or (not_run(done[t])
                                                                    and int(done[t].get("rerun") or 0) < s[REF]["rounds"])]
             if not todo:
                 break
-            with ThreadPoolExecutor(max_workers=max(1, min(s[REF]["parallel"], len(todo)))) as pool:
-                for f in [pool.submit(one, t, int(done[t].get("rerun") or 0) + 1 if t in done else 0) for t in todo]:
-                    f.result()
+            pooled(todo, bo.level)
             if halt.is_set():
                 return ran
             ran += len(todo)

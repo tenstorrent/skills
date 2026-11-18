@@ -9417,7 +9417,8 @@ def _terminalbench(p, a, now: float) -> None:
         if extra is None:
             fail(why)
         print(json.dumps({"model": a.runner, "trials": tbcycle.runner(
-            cfg, a.runner, {**env, **extra}, stop=lambda: benchowner.trial_stop(p))}))
+            cfg, a.runner, {**env, **extra}, stop=lambda: benchowner.trial_stop(p),
+            rerun_server=max(0, int(getattr(a, "rerun_server", 0) or 0)))}))
         return
     extra, why = tbcycle.compose(cfg)
     if extra is None:   # checked before any runner starts: no trial without compose
@@ -16839,6 +16840,9 @@ def main(argv: list[str] | None = None) -> None:
                         "list, through the endpoint named by model_bench.terminalbench.reference.endpoint; booked "
                         "once, never on the schedule")
     s.add_argument("--runner", metavar="MODEL", help=argparse.SUPPRESS)   # one model's paced runner (tbcycle.launch)
+    s.add_argument("--rerun-server", type=int, default=0, metavar="N",
+                   help="terminalbench --reference --runner MODEL: first rerun MODEL's not-scored (server) tasks, "
+                        "N at once, each new row replacing its old one")
     s.set_defaults(fn=cmd_model_bench)
 
     s = sub.add_parser("ack-wait", help="wait model-free for another project's reply to a `ttp note --to`: probe "
