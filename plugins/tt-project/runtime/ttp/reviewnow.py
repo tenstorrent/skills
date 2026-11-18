@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """A routine needs_review hand-off gets its review at once.
 
-A code task that hands off `needs_review` with nothing else to decide (no follow-ups, findings or notes,
+A task that hands off `needs_review` with nothing else to decide (no follow-ups, findings or notes,
 normal severity: the daemon marks it `plain`) has the review the daemon queues for it anyway; waiting for
 the review sweep (`review.sweep_after_s`, 300 s) only delays it. `at_once` says when the review is queued
 in the hand-off's own step. `review.at_once` false turns it off, and the sweep stays the fallback."""
@@ -13,12 +13,13 @@ def enabled(cfg: dict) -> bool:
     return bool(((cfg or {}).get("review") or {}).get("at_once", True))
 
 
-def at_once(cfg: dict, task: dict, new: str, plain: bool, result: dict | None = None) -> bool:
+def at_once(cfg: dict, new: str, plain: bool, result: dict | None = None) -> bool:
     """Whether a hand-off that moved `task` to status `new` queues its review now: a plain needs_review
-    hand-off of a code task, with review.at_once on. One that asks a question of the coordinator is its
-    to read first, never queued here."""
+    hand-off, with review.at_once on. Whether the task has a change to review is the daemon's one code
+    test (Daemon._code_change), which gates the review itself; the task's kind is no gate here. One that
+    asks a question of the coordinator is its to read first, never queued here."""
     asks = isinstance(result, dict) and bool(result.get("question") or result.get("reason"))
-    return new == "review" and plain and not asks and task.get("kind") == "code" and enabled(cfg)
+    return new == "review" and plain and not asks and enabled(cfg)
 
 
 def hold_for_precheck(cfg: dict) -> bool:

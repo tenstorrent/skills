@@ -4125,7 +4125,7 @@ is open raises one `cap_wait` event naming the key.
 | `review.unreviewed_per_pass` | `budget.max_parallel_workers` (old: 2) | reviews the backstop sweep queues per pass | convenience |
 | `review.auto_fix_rounds` | 1 (old: 2) | daemon-queued fix and re-review rounds per stack before the coordinator decides | convenience |
 | `review.sweep_after_s` | 300 s (old: 1800) | a code task left in review before its review is queued | convenience |
-| `review.at_once` | on | a plain `needs_review` code hand-off waiting for the sweep before its review is queued (false: the sweep, `review.sweep_after_s`) | convenience |
+| `review.at_once` | on | a plain `needs_review` hand-off with a change waiting for the sweep before its review is queued (false: the sweep, `review.sweep_after_s`) | convenience |
 | `review.hold_for_precheck` | off | a routine review waiting for the checks the daemon started on its head: off, the review runs beside them and `ttp checks` reuses the recorded pass once the head is unchanged (true: it waits at most the median checks run) | convenience |
 | `waiting.hold_own_runs` | on | a spec or probe-change wake of a task whose own `ttp checks` or push still runs: it waits until they end (they settle model-free; an `urgent:` update still wakes) | convenience |
 | `review.unreviewed_wait_s` | 1800 s | a code task waiting externally (a busy lock too) before the backstop reviews its head | convenience |

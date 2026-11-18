@@ -42,24 +42,79 @@ def test_a_dead_or_finished_own_run_holds_no_wake(env, tmp_path):
     assert ownrunhold.hold(p, p.config(), load_result(p.db.task(tid)["result"])) is None
 
 
-def test_a_plain_needs_review_code_hand_off_is_reviewed_at_once(env):
+def test_a_plain_needs_review_hand_off_with_a_change_is_reviewed_at_once_whatever_its_kind(env):
     from ttp import reviewnow
     p = make(env)
     cfg = p.config()
-    code = {"kind": "code"}
-    assert reviewnow.at_once(cfg, code, "review", True)
-    assert not reviewnow.at_once(cfg, code, "review", False), "notes or follow-ups still go to the coordinator"
-    assert not reviewnow.at_once(cfg, code, "done", True)
-    assert not reviewnow.at_once(cfg, {"kind": "work"}, "review", True)
+    assert reviewnow.at_once(cfg, "review", True)
+    assert not reviewnow.at_once(cfg, "review", False), "notes or follow-ups still go to the coordinator"
+    assert not reviewnow.at_once(cfg, "done", True)
+    assert not reviewnow.at_once(cfg, "review", True, {"question": "which one?"}), "a question is the coordinator's"
     p.set_config("review.at_once", False)
-    assert not reviewnow.at_once(p.config(), code, "review", True), "the off-switch"
+    assert not reviewnow.at_once(p.config(), "review", True), "the off-switch"
     _with_origin(env, clone=False)
     p.set_config("review.at_once", True)
     _, _, _, reviews = _finish_code(env, p, "plain", {"x.py": 3}, result={"status": "needs_review", "summary": "ok"})
     assert len(reviews) == 1
+    # One predicate (Daemon._code_change) decides: a work task whose branch changes files is reviewed like a code task.
+    _, _, _, reviews = _finish_code(env, p, "plain work", {"w.py": 3}, kind="work",
+                                    result={"status": "needs_review", "summary": "ok"})
+    assert len(reviews) == 1
+    _, _, _, reviews = _finish_code(env, p, "no change", {}, kind="work",
+                                    result={"status": "needs_review", "summary": "ok"})
+    assert reviews == [], "a work task whose branch changes nothing has nothing to review"
     _, _, _, reviews = _finish_code(env, p, "with notes", {"y.py": 3}, result={
         "status": "needs_review", "summary": "ok", "followups": [{"title": "later", "spec": "more"}]})
     assert reviews == [], "a hand-off with follow-ups is the coordinator's"
+
+
+def _own_checks_sleeper(p, tmp_path):
+    """A waiting task on its own live `ttp checks --result`, with its spec digest taken (so a spec edit
+    counts), and a daemon whose probes never start; returns (daemon, tid)."""
+    from ttp import daemon as dmod
+    from ttp.prompts import spec_digest
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    tid, _ = _hold_checks_wait(p, tmp_path, alive=True)
+    res = json.loads(p.db.task(tid)["result"])
+    p.db.update_task(tid, result=json.dumps({**res, "spec_seen": spec_digest(p.db.task(tid))}))
+    d = dmod.Daemon(p.base)
+    d._start_probe = lambda *a, **k: None
+    return d, tid
+
+
+def test_a_wake_now_spec_change_waits_while_the_tasks_own_checks_run_but_an_urgent_line_wakes_it(env, monkeypatch, tmp_path):
+    p = make(env)
+    d, tid = _own_checks_sleeper(p, tmp_path)
+    d.probe_waiting()
+    _edit_spec(p, tid, "also report the peak memory")   # a coordinator task_update with wake_now
+    d.probe_waiting()
+    assert _asleep(p, tid), "a spec change woke a task whose own checks still run"
+    assert "woke" not in json.loads(p.db.task(tid)["result"])
+    _edit_spec(p, tid, "urgent: the user is waiting")
+    d.probe_waiting()
+    assert not _asleep(p, tid), "an urgent line waits for the checks"
+    assert "spec" in json.loads(p.db.task(tid)["result"]).get("woke", "")
+    p2 = make(env)
+    d2, tid2 = _own_checks_sleeper(p2, tmp_path / "off")
+    p2.set_config("waiting.hold_own_runs", False)
+    d2.cfg = p2.config()
+    _edit_spec(p2, tid2, "also report the peak memory")
+    d2.probe_waiting()
+    assert not _asleep(p2, tid2), "with the hold off, a wake_now spec change wakes it as before"
+
+
+def test_a_changed_probe_answer_waits_while_the_tasks_own_checks_run(env, monkeypatch, tmp_path):
+    from ttp import daemon as dmod
+    for hold, woke in ((True, False), (False, True)):
+        p = make(env)
+        d, tid = _own_checks_sleeper(p, tmp_path / f"h{hold}")
+        p.set_config("waiting.hold_own_runs", hold)
+        d.cfg = p.config()
+        probe = dmod._current_probe(p.db.task(tid))
+        monkeypatch.setattr(d, "_gate_answer", lambda *a, **k: "changed")
+        d._probe_left = [(tid, object(), probe, 2, "", "", "")]   # its probe answered exit 2: a new answer
+        d.probe_waiting()
+        assert (not _asleep(p, tid)) is woke, (hold, json.loads(p.db.task(tid)["result"]))
 
 
 def test_a_routine_review_runs_beside_its_prechecks_unless_the_hold_is_turned_on(env, tmp_path, monkeypatch):

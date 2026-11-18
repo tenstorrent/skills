@@ -9128,7 +9128,7 @@ class Daemon:
         # too (no sweep_after_s wait); any other needs_review hand-off goes to the coordinator, unreviewed.
         reviewable = new == "done" or new == "review" and (urgent.is_urgent(task)
                                                           or bool(obligations.owned_open(db, task["id"]))
-                                                          or reviewnow.at_once(self.cfg, task, new, plain, result))
+                                                          or reviewnow.at_once(self.cfg, new, plain, result))
         # A change over chains.split_lines goes back to its worker once with a split order, before the review
         # it would get: only a hand-off that review would follow, so a needs_review request is never swallowed.
         resplit = self._split_back(task, result, int(task["attempts"] or 0)) \
