@@ -2117,6 +2117,9 @@ def cmd_status(a) -> None:
             print(ln)
         if ln := gatetime.waits_line(p.db, p.state):
             print(ln)
+        from . import costlevers
+        for ln in costlevers.status_lines(p):   # the cost levers' metrics, last 7 days (rings flags)
+            print(ln)
         from . import notifier
         for ln in notifier.status_lines():   # this machine's notifier: on old code, or failing to deliver
             print(ln)

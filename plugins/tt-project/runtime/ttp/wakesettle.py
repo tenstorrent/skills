@@ -1,0 +1,231 @@
+"""Coordinator wake decisions: counted, and (behind rings.coord_wake_settle) routine batches settled by rule.
+
+Counter (always on: it changes no behaviour). Every pre-screen decision on a coordinator wake is one row
+in the project DB's wake_decisions table: the gate (`triage` for waketriage, `quiet` for quietgate,
+`turn` for turngate, `hook` for settlehook, `rule` for this module), its verb (`skip` or `wake`), the
+event kinds and ids, and the dollars a skip avoided at the median coordinator wake cost of the last 7
+days. `summary` and `audit_line` read it for `ttp status` and the daily review.
+
+Rule settle (flag `coord_wake_settle`, config coordinator.wake_settle, off by default). A batch whose
+every event is one of these is settled without a model run, the events marked handled:
+- a plain task_done (no follow-up proposed, nothing depends on it, no waiting parent; the daemon's
+  _plain_done) of a code, work or harness task with no reply chat, no obligation, no failure text, and a
+  result that names no `continue:` or `partial:`;
+- an upstream_note at info to normal severity: the daemon files it itself;
+- a re-check: an observation, idle_capacity, steer_unread, ready_not_started, machine_change_overdue,
+  charter_retry or stale_holds event whose kind, task and fingerprint (else text) a coordinator turn
+  already met within coordinator.wake_settle_recheck_s (default 6 h), and that was rule-settled fewer
+  than RECHECK_MAX times since, so a condition that persists still reaches a turn.
+Never settled: a user or chat source, high or critical severity, a must-act item, promise or obligation
+text, a review, failure, restriction or outage (settlehook.never_reason, kinds aside). One event that
+does not qualify sends the whole batch to the turn, as it is. Urgent user messages never pass here.
+
+Reopened: a rule-settled event whose task (else kind and fingerprint) has a later event, within
+REOPEN_S, that a coordinator turn handled rather than a rule. The target is under 2% of rule settles.
+"""
+from __future__ import annotations
+
+import json
+import re
+import statistics
+import time
+
+from . import settlehook
+
+TABLE = "wake_decisions"
+GATES = ("triage", "quiet", "turn", "hook", "rule")
+MEDIAN_KEY = "wake_settle_median"   # kv: {"at", "usd"}: the median coordinator wake cost, cached an hour
+MEDIAN_TTL_S = 3600.0
+MEDIAN_WINDOW_S = 7 * 86400.0
+DEFAULT_USD = 0.58   # used until the project has coordinator runs of its own
+RECHECK_S = 6 * 3600.0
+RECHECK_MAX = 3
+REOPEN_S = 86400.0
+TASK_KINDS = ("code", "work", "harness")
+ROUTINE_KINDS = ("task_done", "upstream_note")
+RECHECK_KINDS = ("observation", "idle_capacity", "steer_unread", "ready_not_started", "machine_change_overdue",
+                 "charter_retry", "stale_holds")
+_OPEN_RESULT = re.compile(r"\bcontinue:|\bpartial:|\bcells unreported\b", re.I)
+
+
+
+def on(p) -> bool:
+    """Whether rule settling is on for project `p` (ring flag rings.coord_wake_settle; off by default)."""
+    from . import costlevers
+    return costlevers.lever_on(p, "coord_wake_settle")
+
+
+def median_usd(db, now: float) -> float:
+    """The median cost of the project's coordinator wakes over the last 7 days (cached an hour)."""
+    seen = db.kv(MEDIAN_KEY, {}) or {}
+    if now - float(seen.get("at") or 0) < MEDIAN_TTL_S and seen.get("usd") is not None:
+        return float(seen["usd"])
+    costs = [float(r["cost_usd"] or 0) for r in db.q(
+        "SELECT cost_usd FROM runs WHERE role='coordinator' AND started>? AND cost_usd>0", (now - MEDIAN_WINDOW_S,))]
+    usd = round(statistics.median(costs), 4) if costs else DEFAULT_USD
+    db.set_kv(MEDIAN_KEY, {"at": now, "usd": usd})
+    return usd
+
+
+def record(db, gate: str, verb: str, evs: list[dict], now: float | None = None, usd: float | None = None,
+           why: str = "") -> None:
+    """Count one pre-screen decision. A skip avoids one wake at the median cost unless `usd` says else."""
+    try:
+        now = time.time() if now is None else now
+        if usd is None:
+            usd = median_usd(db, now) if verb == "skip" else 0.0
+        kinds = sorted({str(e.get("kind")) for e in evs}) if evs else ["wake_due"]
+        db.x(f"INSERT INTO {TABLE}(ts, gate, verb, kinds, events, usd, why) VALUES(?,?,?,?,?,?,?)",
+             (now, gate, verb, json.dumps(kinds), json.dumps(sorted(int(e["id"]) for e in evs)), float(usd or 0),
+              why[:300]))
+    except Exception:   # counting never stops a wake decision
+        pass
+
+
+def _key(e: dict) -> tuple:
+    return (e.get("kind"), e.get("task"), e.get("fingerprint") or str(e.get("text") or "")[:300])
+
+
+def _rule_ids(db, since: float) -> set[int]:
+    out: set[int] = set()
+    for r in db.q(f"SELECT events FROM {TABLE} WHERE gate='rule' AND verb='skip' AND ts>?", (since,)):
+        out.update(json.loads(r["events"] or "[]"))
+    return out
+
+
+def _recheck(db, e: dict, now: float, window: float, ruled: set[int]) -> str | None:
+    """Why re-check event `e` may be settled (a turn already met it), or None."""
+    kind, task, fp = _key(e)
+    where = "kind=? AND id<? AND ts>? AND status='handled' AND " + ("task=?" if task is not None else "task IS NULL")
+    args = [kind, int(e["id"]), now - window] + ([task] if task is not None else [])
+    prior = [r for r in db.q(f"SELECT id, fingerprint, text FROM events WHERE {where} ORDER BY id DESC LIMIT 50", args)
+             if (r["fingerprint"] or str(r["text"] or "")[:300]) == fp]
+    met = [r for r in prior if r["id"] not in ruled]
+    if not met:
+        return None
+    if len([r for r in prior if r["id"] in ruled and r["id"] > met[0]["id"]]) >= RECHECK_MAX:
+        return None
+    return f"repeats event {met[0]['id']} a turn met"
+
+
+def settle_reason(db, e: dict, task: dict | None, owners, plain_done, now: float, window: float,
+                  ruled: set[int]) -> str | None:
+    """Why event `e` is settled by rule, or None when a turn must see it."""
+    from . import mustact
+    if e.get("kind") in mustact.KINDS:
+        return None
+    kind = e.get("kind")
+    base = dict(e, kind="observation") if kind in RECHECK_KINDS else e
+    if kind in ("charter_retry", "machine_change_overdue", "stale_holds", "steer_unread", "ready_not_started",
+                "idle_capacity"):
+        # their own text names restrictions, machines or failures by design: only the hard guards apply
+        if e.get("severity") not in settlehook.SEVERITIES or str(e.get("source") or "").startswith(("user", "chat")):
+            return None
+        if e.get("task") is not None and int(e["task"]) in owners:
+            return None
+        try:
+            if (json.loads(e.get("data") or "{}") or {}).get("must_act"):
+                return None
+        except (TypeError, ValueError, AttributeError):
+            pass
+    elif settlehook.never_reason(base if kind == "observation" else e, task, owners):
+        return None
+    if kind in RECHECK_KINDS:
+        return _recheck(db, e, now, window, ruled)
+    if kind == "upstream_note":
+        return "upstream note: the daemon files it"
+    if kind == "task_done":
+        if not task or task.get("kind") not in TASK_KINDS or task.get("reply_chat"):
+            return None
+        if _OPEN_RESULT.search(str(task.get("result") or "")) or not plain_done(e):
+            return None
+        return "plain task_done: no follow-up, nothing depends on it"
+    return None
+
+
+def settle(db, cfg: dict, evs: list[dict], now: float, plain_done) -> tuple[list[int], str]:
+    """Settle the batch by rule when every event qualifies: (settled ids, log line), else ([], "")."""
+    from . import obligations, pagesev
+    own = [e for e in evs if not pagesev.rides_along(e)]
+    if not own:
+        return [], ""
+    ids = [int(e["id"]) for e in own]
+    rows = {r["id"]: r for r in db.q(f"SELECT id, ts, kind, severity, source, text, data, task, fingerprint "
+                                     f"FROM events WHERE id IN ({','.join('?' * len(ids))})", ids)}
+    try:
+        owners = set(obligations.owner_due(db))
+        window = float((cfg.get("coordinator") or {}).get("wake_settle_recheck_s", RECHECK_S) or RECHECK_S)
+    except Exception:   # owners unknown: nothing is settled
+        return [], ""
+    ruled = _rule_ids(db, now - window)
+    whys = {}
+    for i in ids:
+        e = rows.get(i)
+        if e is None:
+            return [], ""
+        why = settle_reason(db, e, db.task(e["task"]) if e.get("task") is not None else None, owners,
+                            plain_done, now, window, ruled)
+        if not why:
+            return [], ""
+        whys[i] = why
+    db.x(f"UPDATE events SET status='handled' WHERE status='queued' AND id IN ({','.join('?' * len(ids))})", ids)
+    record(db, "rule", "skip", [rows[i] for i in ids], now, why="; ".join(sorted(set(whys.values())))[:300])
+    return ids, (f"coordinator wake settled by rule: events {ids} ("
+                 + "; ".join(sorted(set(whys.values())))[:300] + f"), ~${median_usd(db, now):.2f} saved")
+
+
+def reopened(db, since: float, until: float | None = None) -> tuple[int, int]:
+    """(rule-settled events since `since`, of them reopened): a later event on the same task (else same
+    kind and fingerprint) within REOPEN_S that a turn handled rather than a rule."""
+    until = time.time() if until is None else until
+    ruled = _rule_ids(db, since - REOPEN_S)
+    mine = [i for i in _rule_ids(db, since) if i in ruled]
+    if not mine:
+        return 0, 0
+    rows = db.q(f"SELECT id, ts, kind, task, fingerprint, text FROM events WHERE id IN ({','.join('?' * len(mine))})",
+                mine)
+    back = 0
+    for r in rows:
+        if r["task"] is not None:
+            later = db.q("SELECT id FROM events WHERE task=? AND id>? AND ts<? AND status='handled'",
+                         (r["task"], r["id"], min(float(r["ts"]) + REOPEN_S, until)))
+        else:
+            later = [x for x in db.q("SELECT id, fingerprint, text FROM events WHERE kind=? AND task IS NULL AND id>? "
+                                     "AND ts<? AND status='handled'", (r["kind"], r["id"], min(float(r["ts"]) + REOPEN_S, until)))
+                     if (x["fingerprint"] or str(x["text"] or "")[:300]) == (r["fingerprint"] or str(r["text"] or "")[:300])]
+        if any(x["id"] not in ruled for x in later):
+            back += 1
+    return len(rows), back
+
+
+def summary(db, since: float, until: float | None = None) -> dict:
+    """Decisions since `since`: per gate {skip, wake, usd}, totals, and the rule settles' reopen rate."""
+    until = time.time() if until is None else until
+    out: dict = {"gates": {}, "skips": 0, "wakes": 0, "usd": 0.0}
+    for r in db.q(f"SELECT gate, verb, COUNT(*) n, SUM(usd) usd FROM {TABLE} WHERE ts>? AND ts<=? GROUP BY gate, verb",
+                  (since, until)):
+        g = out["gates"].setdefault(r["gate"], {"skip": 0, "wake": 0, "usd": 0.0})
+        g[r["verb"]] = g.get(r["verb"], 0) + int(r["n"])
+        g["usd"] = round(g["usd"] + float(r["usd"] or 0), 2)
+        out["skips" if r["verb"] == "skip" else "wakes"] += int(r["n"])
+        out["usd"] = round(out["usd"] + float(r["usd"] or 0), 2)
+    out["wake_runs"] = int(db.one("SELECT COUNT(*) n FROM runs WHERE role='coordinator' AND started>? AND started<=?",
+                                  (since, until))["n"])
+    out["rule_settled"], out["rule_reopened"] = reopened(db, since, until)
+    return out
+
+
+def line(db, since: float, until: float | None = None) -> str:
+    """One line: wakes run, skips by gate with $ avoided, and the rule settles' reopen rate."""
+    s = summary(db, since, until)
+    if not s["skips"] and not s["wakes"] and not s["wake_runs"]:
+        return ""
+    gates = ", ".join(f"{g} {v['skip']}" for g, v in sorted(s["gates"].items()) if v.get("skip"))
+    rate = (f"; rule settles reopened {s['rule_reopened']}/{s['rule_settled']}"
+            f" ({100.0 * s['rule_reopened'] / s['rule_settled']:.1f}%, target under 2%)") if s["rule_settled"] else ""
+    return (f"coordinator wakes: {s['wake_runs']} ran, {s['skips']} settled without a model"
+            + (f" ({gates})" if gates else "") + f", ~${s['usd']:.2f} avoided" + rate)
+
+
+def audit_line(db, since: float) -> str:
+    return line(db, since)

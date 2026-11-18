@@ -33,6 +33,10 @@ FLAGS: dict[str, dict[str, str]] = {
     "eta_history": {"key": "eta.history", "area": "eta"},
     "device_prewarm": {"key": "device.prewarm", "area": "device"},
     "deslop": {"key": "deslop.enabled", "area": "review"},
+    # The cost levers of task #8790 (costlevers.py): off until a ring turns them on.
+    "fresh_continue": {"key": "worker.fresh_continue", "area": "worker"},
+    "coord_wake_settle": {"key": "coordinator.wake_settle", "area": "coordinator"},
+    "output_trim": {"key": "output.trim", "area": "output"},
 }
 
 

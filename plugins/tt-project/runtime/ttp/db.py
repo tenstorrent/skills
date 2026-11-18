@@ -185,6 +185,11 @@ CREATE TABLE IF NOT EXISTS task_landings (
   marker TEXT PRIMARY KEY, task INTEGER NOT NULL, sha TEXT NOT NULL, target TEXT NOT NULL, ts REAL);
 CREATE INDEX IF NOT EXISTS task_landings_task ON task_landings(task);
 
+-- Coordinator wake pre-screen decisions (wakesettle.py): gate, verb, event kinds and ids, $ a skip avoided.
+CREATE TABLE IF NOT EXISTS wake_decisions (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL,
+  gate TEXT NOT NULL, verb TEXT NOT NULL, kinds TEXT, events TEXT, usd REAL DEFAULT 0, why TEXT);
+CREATE INDEX IF NOT EXISTS wake_decisions_ts ON wake_decisions(ts);
+
 -- A task's work that landed on the push branch as another commit (a re-land after a push conflict):
 -- its branch head when recorded and the commit that carries it (`ttp task superseded`, landed.py).
 CREATE TABLE IF NOT EXISTS task_superseded (

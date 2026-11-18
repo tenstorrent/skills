@@ -59,7 +59,7 @@ import statistics
 import time
 from typing import Any
 
-from . import budget, chaincap, dailyspend, checkprestage, coordfix, coordmodel, correction, ends, gatejudge, gatetime, landed, obligations, outscan, plainreply, planuse, quietgate, relay, replan, reviewstats, routinedefault, route, rulecite, schedule, settlehook, sharedchecks, stalegate, suitecost, sweepskip, timefmt, turngate, unblock, upstream
+from . import budget, chaincap, dailyspend, checkprestage, coordfix, coordmodel, correction, ends, gatejudge, gatetime, landed, obligations, outscan, plainreply, planuse, quietgate, relay, replan, reviewstats, routinedefault, route, rulecite, schedule, settlehook, sharedchecks, stalegate, suitecost, sweepskip, timefmt, turngate, unblock, upstream, wakesettle
 from .db import DB, continues_id, load_result
 from .project import Project
 
@@ -647,6 +647,11 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
         out.append(f"coordinator turns skipped ({quietgate.QUIET}): {quiet['n']}, ~${quiet['usd']:.2f} saved")
     if settled := settlehook.audit_line(db, since):
         out.append(settled)
+    if decided := wakesettle.audit_line(db, since):
+        out.append(decided)
+    if p is not None:   # the cost levers' fresh-continue and output metrics (costlevers.py)
+        from . import costlevers
+        out.extend(costlevers.audit_lines(p, since))
     sweeps = sweepskip.counts(db, since, now)
     if sweeps["model"] or sweeps["skipped"]:
         out.append(f"blocker sweeps: {sweeps['model']} by the model, {sweeps['skipped']} skipped model-free "
@@ -786,7 +791,7 @@ def report(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked
             "retried_tasks": retried_tasks(db, since), "continued_tasks": continued_tasks(db, since),
             "review_fix_tasks": continued_tasks(db, since, fixes=True),
             "coordinator_turns": coordinator_turns(db, since),
-            "coordinator_cache": budget.coordinator_cache(db, now, window_s)["window"], "turns_skipped": turngate.skipped(db, since), "turns_quiet": quietgate.skipped(db, since), "settle_hook": settlehook.summary(db, since), "sweeps": sweepskip.counts(db, since, now),
+            "coordinator_cache": budget.coordinator_cache(db, now, window_s)["window"], "turns_skipped": turngate.skipped(db, since), "turns_quiet": quietgate.skipped(db, since), "settle_hook": settlehook.summary(db, since), "wake_decisions": wakesettle.summary(db, since), "sweeps": sweepskip.counts(db, since, now),
             "finished": done, "per_outcome": per_outcome(done, unpriced), "cost_bases": cost_bases(db, done),
             "plan_usage": planuse.summary(db, since, now, p.config() if p is not None else None),
             "no_change_code": no_change_code(db, since), "stuck": stuck_long(db, now, blocked_h), "review_loops": review_loops(db, since),

@@ -135,6 +135,7 @@ from . import urgent
 from . import eventhold
 from . import msgwake
 from . import waketriage
+from . import costlevers, wakesettle
 from . import convgate
 from . import readywait, unstarted
 from . import boundedchild
@@ -3895,6 +3896,9 @@ class Daemon:
             ab = (note or {}).get(effortab.KEY)
             if not pin.get("effort") and isinstance(ab, dict) and ab.get("effort"):
                 effort = str(ab["effort"])   # the task's effort A/B arm or Jev's pick (effortab.assign)
+            elif not pin.get("effort") and isinstance(ot := (note or {}).get(costlevers.TRIM_KEY), dict) \
+                    and ot.get("effort"):
+                effort = str(ot["effort"])   # rings.output_trim's pick for a mechanical spec (costlevers)
         if min_effort and role != "coordinator":
             # A conclusion run's effort floor (tierfloor.py), as this provider takes it.
             lifted = failover.kept_effort(provider, min_effort)
@@ -4235,7 +4239,7 @@ class Daemon:
                     # The hand-off rule goes last, after the task: a fork's copied history ends in the
                     # coordinator's {"actions"} answers, and a retry of a role miss says why.
                     prompt = prompt + "\n\n" + ctxfork.handoff_tail(missed)
-                note = {**(note or {}), ctxfork.KEY: {**{k: got[k] for k in ("how", "why", "session", "tokens", "tail", "run", "lane", "from", "role_gap")
+                note = {**(note or {}), ctxfork.KEY: {**{k: got[k] for k in ("how", "why", "session", "tokens", "tail", "run", "lane", "from", "role_gap", "fresh")
                                                          if k in got}, **({"prefix": prefix_by} if prefix_by else {})}}
             elif task and role in ctxfork.ROLES:   # a lost run continued in its own session (_resumable)
                 note = {**(note or {}), ctxfork.KEY: {"how": "resume", "why": "continues its own session",
@@ -12781,6 +12785,18 @@ class Daemon:
             if own_n and w is None and not [e for e in evs if not pagesev.rides_along(e)] and (
                     not evs or now - min(e["ts"] for e in evs) < pagesev.RIDE_ALONG_MAX_S):
                 return
+        if evs and not msgs and not rerun and not lead and not hot and wakesettle.on(self.p):
+            try:   # rings.coord_wake_settle: a batch of only routine events is settled by rule (wakesettle.py)
+                ids, line = wakesettle.settle(db, self.cfg, evs, now, self._plain_done)
+            except Exception:   # the rule only saves money: a failure runs the turn
+                ids, line = [], "coordinator rule settle failed: " + traceback.format_exc().replace("\n", " | ")[:1500]
+            if line:
+                log(self.p, line)
+            if ids:
+                evs = [e for e in evs if e["id"] not in ids]
+                if w is None and not [e for e in evs if not pagesev.rides_along(e)] and (
+                        not evs or now - min(e["ts"] for e in evs) < pagesev.RIDE_ALONG_MAX_S):
+                    return
         if not msgs and not rerun and not fire and not lead:
             try:
                 # Every open task held by what no turn lifts, and nothing new since the last turn: a
@@ -12796,6 +12812,7 @@ class Daemon:
                 if quietgate.quiet(db, self.cfg, evs, msgs, pre, due_now, self._quiet_fp(gates_now), now,
                                    coord.UNBLOCK_KINDS, sweep.SWEEP_KIND):
                     usd = quietgate.skip(db, evs, due_now, now)
+                    wakesettle.record(db, "quiet", "skip", evs, now, usd)
                     if not evs:
                         # Counts as a repeat, and the next wake backs off from this skip.
                         db.set_kv("idle_wake", {**wake, "skipped": now})
@@ -12821,6 +12838,7 @@ class Daemon:
                                         pre, coord.UNBLOCK_KINDS)
                 if match:
                     turngate.skip(db, evs, match, now)
+                    wakesettle.record(db, "turn", "skip", evs, now, match["usd"])
                     log(self.p, f"coordinator turn skipped: events {[e['id'] for e in evs]} repeat what "
                         f"turn(s) {match['runs']} met and decided nothing on (~${match['usd']:.2f} saved)")
                     return
@@ -12836,6 +12854,8 @@ class Daemon:
                 folded, line = False, "coordinator wake triage failed: " + traceback.format_exc().replace("\n", " | ")[:1500]
             if line:
                 log(self.p, line)
+            if line or folded:   # a fresh verdict (a repeat of a held skip logs nothing and is not counted)
+                wakesettle.record(db, "triage", "skip" if folded else "wake", triage, now)
             if folded:
                 return
         hour_turns = db.one("SELECT COUNT(*) n FROM runs WHERE role='coordinator' AND started>?", (now - 3600,))["n"]
@@ -13016,9 +13036,13 @@ class Daemon:
                              key=settlehook.FAULT_KEY, pin=True)
                 return evs, False
             done = settlehook.apply(db, run, now)
+            left = [e for e in evs if e["id"] not in done]
             if done:
                 log(self.p, "settle hook settled " + "; ".join(f"event {i}: {run.settle[i]}" for i in done))
-            return [e for e in evs if e["id"] not in done], False
+                # a turn is avoided only when no event that starts one is left
+                wakesettle.record(db, "hook", "skip", [e for e in evs if e["id"] in done], now,
+                                  None if not [e for e in left if not pagesev.rides_along(e)] else 0.0)
+            return left, False
         except Exception:   # the hook only saves turns: a failure runs the turn
             self._settle_run = None
             log(self.p, "settle hook failed: " + traceback.format_exc().replace("\n", " | ")[:1500])
@@ -13533,6 +13557,12 @@ class Daemon:
                     log(self.p, f"task {task['id']}: effort A/B not assigned: {e}")
                 if ab:
                     note[effortab.KEY] = ab
+                elif not cheap and not ((routed or {}).get("model_pick") and run_prov == (routed or {}).get("to")):
+                    try:   # rings.output_trim: a mechanical work or harness spec runs at medium effort
+                        if ot := costlevers.effort_pick(self.p, self.cfg, task, tier, run_prov):
+                            note[costlevers.TRIM_KEY] = ot
+                    except Exception as e:   # the pick must never hold a task back
+                        log(self.p, f"task {task['id']}: output trim effort pick failed: {e}"[:300])
                 if review_pick:
                     note["review_tier"] = review_pick
                     if review_pick.get(conflictfix.KEY):
