@@ -324,15 +324,38 @@ def device_names(task: dict, cfg: dict | None) -> list[str]:
 
 WATCHER = re.compile(r"(?i)(device|machine|broker|hardware|power|chip|board|box|health)")
 TASK_REF = re.compile(r"#(\d+)")
+RUN_REF = re.compile(r"(?i)\b(?:run\s+#?|runs/)(\d+)\b")
+# Where a report names a device only as a bystander: a reporter that cannot reach another box, a paused, healthy or
+# idle box, or one entry of a checked/paused/healthy list. `{n}` is the escaped device name.
+BYSTANDER = (r"(?<![\w.-]){n}(?!\w)\s+(?:cannot|can't|can not|could not)\s+(?:reach|see|check)\b",
+             r"(?<![\w.-]){n}(?!\w)\s+(?:is\s+|was\s+)?(?:paused|healthy|ok|fine|idle|up)\b",
+             r"\b(?:checked|paused|healthy|ok|skipped)\b:?(?:\s*[\w.-]+,)*\s*(?<![\w.-]){n}(?!\w)")
 
 
-def incident_event(e: dict, run_task: Any, names: list[str]) -> bool:
-    """Whether event `e` is a real device or machine incident of a run of task `run_task` that held the device
-    resources `names`. Two shapes count, never a coordinator action, audit, flag, digest, note or chat event and
-    never a daemon-written observation:
+def names_affected(text: str, name: str) -> bool:
+    """Whether report `text` names device `name` as affected: one of its lines names it, outside any bystander
+    mention, beside a hang, reset, recovery, power-cycle or hold word."""
+    n = re.escape(name)
+    whole = re.compile(rf"(?<![\w.-]){n}(?!\w)")
+    for line in text.splitlines():
+        if not (whole.search(line) and INCIDENT.search(line)):
+            continue
+        for pat in BYSTANDER:
+            line = re.sub(pat.format(n=n), " ", line, flags=re.I)
+        if whole.search(line):
+            return True
+    return False
+
+
+def incident_event(e: dict, run_task: Any, names: list[str], run_id: Any = None) -> bool:
+    """Whether event `e` is a real device or machine incident of run `run_id` of task `run_task` that held the
+    device resources `names`. Two shapes count, never a coordinator action, audit, flag, digest, note or chat event
+    and never a daemon-written observation:
     - an event of an incident kind, carrying the run's task id or naming a device resource the run held;
-    - an observation from a device or machine watcher naming a hang, reset, recovery, power cycle or hold, that
-      names a device resource the run held (its task id alone is not enough) and does not cite another task.
+    - an observation from a device or machine watcher naming a hang, reset, recovery, power cycle or hold that
+      cites the run's task or run id, or else cites no other task and names a device resource the run held as
+      affected (names_affected): a fleet report listing the device as paused, healthy, checked or as a box that
+      cannot reach another is not about it, and the event's task column alone is not enough.
     A host name every task mentions is not enough, and a run with no device resource is tied only by its task id
     on an incident-kind event. A notice about another task (a deferral, a retest, a review) is never one."""
     kind, text = str(e.get("kind") or ""), str(e.get("text") or "")
@@ -346,9 +369,15 @@ def incident_event(e: dict, run_task: Any, names: list[str]) -> bool:
     source = str(e.get("source") or "")
     if not (source.startswith("watcher:") and WATCHER.search(source[len("watcher:"):])):
         return False
-    if any(run_task is None or int(m) != int(run_task) for m in TASK_REF.findall(text)):
+    if run_id is not None and any(int(m) == int(run_id) for m in RUN_REF.findall(text)):
+        return True
+    cited = {int(m) for m in TASK_REF.findall(RUN_REF.sub(" ", text))}
+    if run_task is not None and int(run_task) in cited:
+        return True
+    if cited:
         return False
-    return any(n in hay for n in names)
+    report = text + "\n" + str(e.get("data") or "")
+    return any(names_affected(report, n) for n in names)
 
 
 def find_incident(db, cfg: dict, s: dict, since: float, now: float) -> dict | None:
@@ -365,7 +394,7 @@ def find_incident(db, cfg: dict, s: dict, since: float, now: float) -> dict | No
         until = (float(r["ended"]) if r.get("ended") else now) + INCIDENT_AFTER_S
         for e in db.q("SELECT id, source, kind, text, data, task FROM events WHERE ts>=? AND ts<=? "
                       "AND kind NOT LIKE 'device_ab%'", (float(r["started"] or 0), until)):
-            if incident_event(e, r["task"], names):
+            if incident_event(e, r["task"], names, r["id"]):
                 return {"task": r["task"], "run": r["id"], "event": e["id"], "text": str(e.get("text") or "")[:300]}
     return None
 
@@ -381,7 +410,7 @@ def recheck_stop(db, cfg: dict, s: dict, stop: dict, now: float) -> str:
     if not e or not run:
         return ""
     task = db.task(int(run[0]["task"])) if run[0].get("task") else None
-    if incident_event(e[0], run[0]["task"], device_names(task or {}, cfg)):
+    if incident_event(e[0], run[0]["task"], device_names(task or {}, cfg), run[0]["id"]):
         return ""
     why = (f"Device A/B: lifted the {stop.get('arm') or s['test']} arm's stop (task #{stop.get('task')}, event "
            f"{stop.get('event')}, kind {e[0].get('kind')}): it is not a device incident tied to the run's own "

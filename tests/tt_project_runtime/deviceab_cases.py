@@ -419,3 +419,36 @@ def test_device_ab_the_next_tick_lifts_a_recorded_deferral_notice_stop(env):
                                    "text": "task #9999 defers our work"})
     got = deviceab.tick(p.db, cfg, 3000.0)
     assert got["lifted"] and not deviceab.stopped(p.db)
+
+
+def test_device_ab_a_fleet_report_counts_only_when_it_names_the_runs_device_as_affected_or_cites_the_run(env):
+    from ttp import deviceab
+    p = make(env)
+    cfg = _dab_cfg(p)
+    tid, rid = _dab_sonnet_run(p, cfg, ["resource:box1-device", "needs_device"])
+    # A fleet report about other boxes that lists the run's device only as paused, checked or as a reporter.
+    fleet = ("fleet report: known outage unchanged: hostb, hostc\n"
+             "hostb: automatic recovery is not overridden; reset ladder: 25 attempts in 24 h\n"
+             "box1-device is paused by the user: no problems are raised for it\n"
+             "Fleet has 3 problems (checked hosta, hostb, hostc; paused: hostd, box1-device):\n"
+             "- box1-device cannot reach hostb after its reset (shows it offline).\n"
+             "- hostc: power cycle failed.")
+    _dab_event(p, "observation", fleet, source="watcher:fleet-health")
+    assert deviceab.tick(p.db, cfg, 2700.0)["stop"] is None and not deviceab.stopped(p.db)
+    e = {"kind": "observation", "source": "watcher:fleet-health", "text": fleet}
+    assert not deviceab.incident_event(e, tid, ["box1-device"], rid)
+    # The same report naming the run's device as affected stops the arm.
+    affected = dict(e, text=fleet + "\n- box1-device: chip hang, broker reset failed.")
+    assert deviceab.incident_event(affected, tid, ["box1-device"], rid)
+    assert deviceab.incident_event(dict(e, text="hold on box1-device after a hang"), tid, ["box1-device"], rid)
+    # Citing the run (its run id or task id) stops it too, even when the device is only listed.
+    for cite in (f"run {rid}", f"runs/{rid}", f"#{tid}"):
+        assert deviceab.incident_event(dict(e, text=fleet + f"\n- left by {cite}"), tid, ["box1-device"], rid), cite
+    # Another run's or task's id does not.
+    for cite in (f"run {rid + 1}", f"#{tid + 1}"):
+        assert not deviceab.incident_event(dict(e, text=fleet + f"\n- left by {cite}"), tid, ["box1-device"], rid)
+    # A longer name that only starts with the device's is not the device.
+    assert not deviceab.incident_event(dict(e, text="box1-device2: chip hang"), tid, ["box1-device"], rid)
+    real = _dab_event(p, "observation", fleet + "\n- box1-device: chip hang, broker reset failed.",
+                      source="watcher:fleet-health")
+    assert deviceab.tick(p.db, cfg, 2800.0)["stop"]["event"] == real
