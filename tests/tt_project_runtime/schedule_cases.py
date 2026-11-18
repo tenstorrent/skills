@@ -1241,3 +1241,59 @@ def test_a_command_watcher_side_error_alone_is_not_a_failed_run(env):
     assert run(line("ledger: entry missing") + line("x", error=True) + side) \
         == "ok (1 observations, 1 errors, 1 side errors)"
     assert sched.failing(run(side, rc=3))
+
+
+def test_a_slow_llm_schedule_runs_off_the_tick_and_one_that_keeps_timing_out_is_one_keyed_observation(env, monkeypatch):
+    """The case behind it: a plain llm schedule's run (its de-slop scan) ran on the tick, so run_schedules
+    hit its step budget every tick and named no schedule. Every schedule now runs off the tick under its own
+    timeout: the step returns after its short wait, a quick schedule beside the slow one still runs, the
+    step names the schedule it starts, and each timeout of the slow one is the same keyed observation."""
+    import threading
+    from ttp import daemon as dmod, schedule as sched
+    p = make(env)
+    sched.upsert(p.db, "slow-plan", "llm", "1d", payload={"spec": "plan it", "deslop": True})
+    sched.upsert(p.db, "quick", "command", "1d", payload={"command": "true", "timeout_s": 30})
+    release = threading.Event()
+    real = dmod.Daemon._schedule_llm
+
+    def slow_llm(self, s, payload):
+        if s["name"] == "slow-plan":
+            release.wait(60)
+            return "skipped: released"
+        return real(self, s, payload)
+    monkeypatch.setattr(dmod.Daemon, "_schedule_llm", slow_llm)
+    real_timeout = dmod.Daemon._schedule_timeout
+    monkeypatch.setattr(dmod.Daemon, "_schedule_timeout",
+                        lambda self, s, payload: 0.3 if s["name"] == "slow-plan" else real_timeout(self, s, payload))
+    d = dmod.Daemon(p.base)
+    d.gates = {}
+    seen, held = [], []
+    monkeypatch.setattr(d, "observe", lambda source, text, *a, **k: seen.append((text, k.get("key"))))
+    real_over = d._step_over
+    monkeypatch.setattr(d, "_step_over", lambda holder, task=None: held.append(holder) or real_over(holder, task))
+
+    def due():
+        p.db.x("UPDATE schedules SET next_run=? WHERE name IN ('slow-plan','quick')", (time.time() - 1,))
+    try:
+        for n in (1, 2):
+            due()
+            t = time.monotonic()
+            d.run_schedules()
+            assert time.monotonic() - t < dmod.SCHEDULE_WAIT_S + 5, "the slow schedule held the step"
+            assert "slow-plan" in d._sched_runs
+            assert p.db.one("SELECT last_status FROM schedules WHERE name='quick'")["last_status"] is not None
+            time.sleep(0.4)
+            d.run_schedules()   # past its timeout: recorded failed, observed under its key
+            timeouts = [k for text, k in seen if "slow-plan timed out" in text]
+            assert timeouts == ["schedule-timeout:slow-plan"] * n, seen
+            assert p.db.one("SELECT last_status FROM schedules WHERE name='slow-plan'")["last_status"].startswith(
+                "error: timed out")
+            release.set()
+            d._sched_runs["slow-plan"].done.wait(30)
+            d.run_schedules()   # its thread ended: dropped, so it can run again
+            assert "slow-plan" not in d._sched_runs
+            release.clear()
+    finally:
+        release.set()
+    assert any(h.startswith("schedule slow-plan (llm: de-slop scan)") for h in held), held
+    assert any(h.startswith("schedule quick (command: true)") for h in held), held
