@@ -34,8 +34,8 @@ Reference routes (a same-conditions comparison): a model listed in reference.bri
 logged-in claude CLI (claudebridge.ClaudeCliBridge, a loopback server in the runner's own process that the
 agent reaches as OPENAI_BASE_URL; no API key, no endpoint), at its effort (reference.efforts[model], else
 reference.effort); its row carries route "claude-cli", the CLI version and the dollars it reported. Every
-other model goes through the endpoint and its runner is wrapped in `ttp lock <reference.lock>` (default
-LOCK, "" for none), so one endpoint model runs at a time. reference.parallel (default 1) runs that many of a
+other model goes through the endpoint and its runner takes `ttp lock <reference.lock>` (default LOCK, ""
+for none) before each trial (EndpointLock), so one endpoint model runs at a time; a stay-off wait frees it. reference.parallel (default 1) runs that many of a
 model's tasks at once. limit_s 0 (harborslice) gives every model its task's own limit. A model listed in
 reference.chat goes through the project's chat endpoint (providers.chat; no reference endpoint needed) by a
 loopback relay in the runner (one per trial, like the bridge) that times every call, under the same lock; the
@@ -421,10 +421,71 @@ def parity(s: dict, model: str, meta: dict, via: str, harbor: str) -> dict:
                            if via != ENDPOINT_ROUTE else "none: every trial is scored as it ran")}
 
 
+class EndpointLock:
+    """The shared endpoint lock (reference.lock) for a reference runner, held by a `ttp lock <name> -- <helper>`
+    child whose helper only waits on its stdin, so taking it waits in line like any other `ttp lock` user (arrival
+    order, pauses, the activity log) and closing that stdin frees it. take() before a trial (it stays held across
+    trials), done() after; pause() frees it while no trial is in flight, during a stay-off wait that makes no model
+    calls (occupancy.wait_free on_wait), and the next take() queues for it again. A dead runner's helper reads EOF
+    and exits, freeing it."""
+    READY = "ttp-endpoint-lock: held"
+
+    def __init__(self, name: str, *, cwd=None, env: dict | None = None, sleep: Callable = time.sleep,
+                 say: Callable[[str], None] | None = None):
+        from threading import Lock
+        self.name, self.cwd, self.env, self.sleep = name, cwd, env, sleep
+        self.say = say or (lambda line: print(f"tbcycle: {line}", file=sys.stderr, flush=True))
+        self.proc, self.busy, self.mu, self.takes, self.pauses = None, 0, Lock(), 0, 0
+
+    def argv(self) -> list:
+        helper = f"import sys; print({self.READY!r}, flush=True); sys.stdin.read()"
+        return [sys.executable, "-m", "ttp", "lock", self.name, "--", sys.executable, "-c", helper]
+
+    def take(self) -> None:
+        with self.mu:
+            self.busy += 1
+            while self.proc is None:
+                proc = subprocess.Popen(self.argv(), cwd=self.cwd, env=self.env, stdin=subprocess.PIPE,
+                                        stdout=subprocess.PIPE, text=True)
+                if any(line.strip() == self.READY for line in iter(proc.stdout.readline, "")):
+                    self.proc, self.takes = proc, self.takes + 1
+                    break
+                rc = proc.wait()
+                if rc != 75:   # 75: paused or busy; anything else is not a lock we can wait for
+                    self.busy -= 1
+                    raise RuntimeError(f"endpoint lock {self.name}: ttp lock exited {rc}")
+                self.say(f"endpoint lock {self.name} paused or busy (ttp lock 75): asking again in 60 s")
+                self.sleep(60)
+
+    def done(self) -> None:
+        with self.mu:
+            self.busy = max(0, self.busy - 1)
+
+    def pause(self) -> None:
+        with self.mu:
+            if self.proc is not None and not self.busy:
+                self.say(f"stay-off wait: endpoint lock {self.name} freed until the next trial")
+                self._free()
+                self.pauses += 1
+
+    def release(self) -> None:
+        with self.mu:
+            self._free()
+
+    def _free(self) -> None:
+        proc, self.proc = self.proc, None
+        if proc is not None:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+            proc.wait()
+
+
 def ref_runner(cfg: dict, model: str, env: dict, *, trial: Callable | None = None, clock: Callable = time.time,
                bridge: Callable | None = None, chat: Callable | None = None, sleep: Callable = time.sleep,
                stop: Callable[[], str] | None = None, gate: Callable | None = None,
-               rerun_server: int = 0) -> int:
+               rerun_server: int = 0, lock: EndpointLock | None = None) -> int:
     """Run `model`'s reference tasks (resuming), then book its row once; returns trials run. A booked model
     runs nothing (module doc). A bridge model gets the claude CLI's loopback server (bridge(model, effort)
     builds it), a chat model the chat endpoint's relay (chat(model)), one per trial so its server wait and
@@ -432,14 +493,17 @@ def ref_runner(cfg: dict, model: str, env: dict, *, trial: Callable | None = Non
     is `server` (serverhealth.judge): not scored, rerun one at a time once a probe shows the server healthy.
     `stop` (benchowner.trial_stop) is asked before each trial: a reason starts no more, nothing is booked.
     Capacity refusals over 20% lower the trials at once (benchbackoff). `rerun_server` N first reruns every
-    task whose latest row is `server` (not scored), N at once, its new row replacing the old one."""
+    task whose latest row is `server` (not scored), N at once, its new row replacing the old one.
+    An endpoint or chat model takes reference.lock itself (EndpointLock, `lock` in tests) before each trial
+    and frees it during a stay-off wait (`gate(on_wait)`), which makes no model calls."""
     import shutil
     from concurrent.futures import ThreadPoolExecutor
     from threading import Event, Lock
     from . import benchbackoff, harborslice, modelbench, modelsuite, occupancy, serverhealth
     from .project import durable_write
     if gate is None and trial is None:   # each real trial asks `ttp occupancy` for this host first (runner)
-        gate = lambda: occupancy.wait_here("bench", "tbcycle", sleep=sleep, clock=clock)   # noqa: E731
+        gate = lambda on_wait=None: occupancy.wait_here("bench", "tbcycle", sleep=sleep, clock=clock,   # noqa: E731
+                                                        on_wait=on_wait)
     s = settings(cfg)
     run = s[REF]["run"]
     if any(r["model"] == model for r in reference(run)):
@@ -451,6 +515,8 @@ def ref_runner(cfg: dict, model: str, env: dict, *, trial: Callable | None = Non
         return 0   # its reference runner is already running
     home, ran = modelbench.home(), 0
     via = route(s, model)
+    if lock is None and trial is None and s[REF]["lock"] and via != BRIDGE_ROUTE:   # one endpoint model at a time
+        lock = EndpointLock(s[REF]["lock"], sleep=sleep)
     try:
         meta = json.loads((d / f"{sl}.json").read_text())
     except (OSError, ValueError):
@@ -480,14 +546,16 @@ def ref_runner(cfg: dict, model: str, env: dict, *, trial: Callable | None = Non
         done, put, dead, halt, info = _rows(d / f"{sl}.jsonl", meta["tasks"]), Lock(), Event(), Event(), {}
 
         def attempt(t: str, n: int = 0) -> dict:
-            if gate:   # a live stream on this host: the trial waits for it (occupancy.wait_free)
-                gate()
-            b = make() if make else None
-            e, st, cost = env, {}, None
-            if b is not None:
-                b.start()
-                e = {**env, **b.openai_env()}
+            if gate:   # a live stream on this host: the trial waits for it (occupancy.wait_free), lock freed
+                gate(lock.pause) if lock else gate()
+            if lock:   # held across trials; queues again after a stay-off freed it
+                lock.take()
+            b, e, st, cost = None, env, {}, None
             try:
+                b = make() if make else None
+                if b is not None:
+                    b.start()
+                    e = {**env, **b.openai_env()}
                 got = (trial(model, t, d / "trials") if trial else
                        harborslice.trial(model, t, d / "trials", e, s, command=cmd, home=home))
                 if b is not None:
@@ -497,6 +565,8 @@ def ref_runner(cfg: dict, model: str, env: dict, *, trial: Callable | None = Non
             finally:
                 if b is not None:
                     b.stop()
+                if lock:
+                    lock.done()
             r = {"task": t, "at": clock(), "model": model, **got, **({"rerun": n} if n else {}),
                  **({"cost_usd": round(cost, 4)} if cost else {})}
             if b is not None:   # the relay's endpoint faults by kind and its capacity waits, on every row
@@ -615,6 +685,8 @@ def ref_runner(cfg: dict, model: str, env: dict, *, trial: Callable | None = Non
             write_table(run, s[REF]["note"])
         return ran
     finally:
+        if lock:
+            lock.release()
         held.close()
 
 
@@ -740,9 +812,8 @@ def launch(p, model: str, reference: bool = False) -> None:
     with open(folder() / f"{(REF + '-') * reference}{slug(model)}.log", "ab") as out:
         argv = [sys.executable, "-m", "ttp", "model-bench", "terminalbench", *(["--reference"] * reference),
                 "--runner", model]
-        ref = settings(p.config())[REF]
-        if reference and ref["lock"] and model not in ref["bridge"]:   # one endpoint or chat model at a time
-            argv = [sys.executable, "-m", "ttp", "lock", ref["lock"], "--", *argv]
+        # an endpoint or chat reference runner takes reference.lock itself per trial (EndpointLock), so a stay-off
+        # wait frees it; no `ttp lock` wraps the whole runner
         # own session: the paced benchmark runner outlives the daemon tick that starts it
         proc = subprocess.Popen(argv,
                                 cwd=p.root, env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,

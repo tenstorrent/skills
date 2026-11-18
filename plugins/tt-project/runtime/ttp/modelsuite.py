@@ -864,7 +864,7 @@ def reaudit(date: str, bench_dir: Path, opts: dict, models: list[str] | None = N
 
 
 def _reaudit(date, out, bench_dir, opts, models, now, say) -> dict:
-    from . import benchrun, modelbench
+    from . import benchrun, modelbench, serverhealth
     from .project import durable_write
     d = modelbench.home()
     man = benchrun.verified(bench_dir)
@@ -896,7 +896,7 @@ def _reaudit(date, out, bench_dir, opts, models, now, say) -> dict:
                                    benchrun.secret_lines(bench_dir, task), diff,
                                    benchrun.session_dirs(ws, _session_conf(run_json)))
             log = (keep / "tests.log").read_text(errors="replace") if (keep / "tests.log").is_file() else ""
-            if flags and [f for f in flags if not f.startswith("quote_matches: ")]:
+            if benchrun.hard_flags(flags):
                 fixed.update(outcome="flagged", passed=False)
             elif r.get("outcome") == "flagged" or log.startswith(NOT_GRADED):
                 passed, tail = _regrade(bench_dir, task, diff, opts)
@@ -909,6 +909,7 @@ def _reaudit(date, out, bench_dir, opts, models, now, say) -> dict:
             fixed.update(outcome="error", passed=False,
                          why=["re-audit: the cell's kept transcript or its task in the bench folder is gone"])
         fixed.update(reaudit=True, was=r.get("outcome"), at=now)
+        serverhealth.over_refused(fixed, opts.get("capacity_refusal_max"))   # over the refusal share: not run (server)
         _append(out / "results.jsonl", fixed)
         say(f"{model} task {tid}: {r.get('outcome')} -> {fixed['outcome']}" +
             (f" ({'; '.join(fixed['flagged'])})" if fixed.get("flagged") else ""))

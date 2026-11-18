@@ -354,7 +354,7 @@ def test_terminalbench_reference_through_the_claude_bridge_has_no_endpoint_its_o
     assert got["not_served"] == []
 
 
-def test_terminalbench_reference_runs_parallel_tasks_and_wraps_endpoint_runners_in_the_chat_server_lock(env, monkeypatch):
+def test_terminalbench_reference_runs_parallel_tasks_and_endpoint_runners_take_the_chat_server_lock(env, monkeypatch):
     import threading
     import types
     from ttp import tbcycle
@@ -381,7 +381,8 @@ def test_terminalbench_reference_runs_parallel_tasks_and_wraps_endpoint_runners_
     tbcycle.launch(p, "open-m", reference=True)
     tbcycle.launch(p, "claude-x", reference=True)
     tbcycle.launch(p, "open-m")
-    assert argv[0][3:6] == ["lock", "chat-server", "--"] and argv[0][-3:] == ["--reference", "--runner", "open-m"]
+    assert "lock" not in argv[0] and argv[0][-3:] == ["--reference", "--runner", "open-m"], \
+        "no `ttp lock` wraps the whole runner: it takes the chat-server lock per trial (EndpointLock)"
     assert "lock" not in argv[1] and "--reference" in argv[1], "the claude arm takes no chat-server lock"
     assert "lock" not in argv[2], "the paced cycle is unchanged"
     assert recorded == [tbcycle.REF_RUNNER, tbcycle.REF_RUNNER, tbcycle.RUNNER], "each runner's group is recorded"
@@ -769,3 +770,66 @@ def test_terminalbench_reference_reruns_only_not_scored_tasks_at_the_asked_level
         "each new row replaces its old one"
     assert got["t5"]["rerun"] == 2 and got["t0"].get("rerun") is None
     assert len(tbcycle.reference()) == 1, "all scored now: booked"
+
+
+class _TbLockLog:
+    """A stand-in EndpointLock that logs take/done/pause/release, freed only by a pause with no trial in flight."""
+    def __init__(self, log):
+        self.log, self.held, self.busy = log, False, 0
+
+    def take(self):
+        self.log.append("take" if not self.held else "keep")
+        self.held, self.busy = True, self.busy + 1
+
+    def done(self):
+        self.busy -= 1
+        self.log.append("done")
+
+    def pause(self):
+        if self.held and not self.busy:
+            self.held = False
+            self.log.append("pause")
+
+    def release(self):
+        self.held = False
+        self.log.append("release")
+
+
+def test_terminalbench_reference_frees_the_chat_server_lock_during_a_stay_off_wait(env, monkeypatch):
+    """A stay-off wait (no model calls) frees reference.lock; the next trial takes it again, in line; with no
+    wait it stays held across trials. The stay-off wait itself is unchanged (occupancy.wait_free)."""
+    from ttp import occupancy, tbcycle
+    d, cfg, clock, sleeps, sleep = _tb_setup(env, monkeypatch, tasks=["t1", "t2", "t3"], reference={
+        "models": ["open-m"], "endpoint": "gw"})
+    log, holds = [], iter(["", "stay off for bench: box-a: a live realtime stream holds it", "", ""])
+    monkeypatch.setattr(occupancy, "blocks_any", lambda targets, step, now: next(holds, ""))
+    def gate(on_wait=None):   # the real wait, its sleep faked
+        assert occupancy.wait_free(["box-a"], "bench", poll_s=5, sleep=lambda s: log.append(f"sleep {s:.0f}"),
+                                   clock=lambda: clock["t"], on_wait=on_wait)["ok"]
+    def trial(model, task, out):
+        log.append(f"trial {task}")
+        return {"reward": 1.0, "min": 1.0, "error": None}
+    lock = _TbLockLog(log)
+    assert tbcycle.ref_runner(cfg, "open-m", {}, trial=trial, clock=lambda: clock["t"], gate=gate, lock=lock) == 3
+    assert log == ["take", "trial t1", "done", "pause", "sleep 5", "take", "trial t2", "done",
+                   "keep", "trial t3", "done", "release"], log
+    # the real lock: a pause frees it only with no trial in flight, and take() queues for it again
+    class Helper(tbcycle.EndpointLock):
+        def argv(self):
+            return [sys.executable, "-c", f"import sys; print({self.READY!r}, flush=True); sys.stdin.read()"]
+    said = []
+    h = Helper("chat-server", say=said.append)
+    h.take()
+    first = h.proc
+    h.pause()
+    assert h.proc is first and h.pauses == 0, "a trial in flight keeps it"
+    h.done()
+    h.pause()
+    assert h.proc is None and first.poll() == 0 and h.pauses == 1 and "freed until the next trial" in said[-1]
+    h.take()
+    assert h.proc is not None and h.proc is not first and h.takes == 2
+    h.done()
+    h.release()
+    assert h.proc is None
+    assert tbcycle.EndpointLock("chat-server").argv()[2:6] == ["ttp", "lock", "chat-server", "--"], \
+        "taken through `ttp lock`, waiting in line like any other user"

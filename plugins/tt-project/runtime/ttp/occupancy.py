@@ -366,13 +366,14 @@ POLL_S = 15.0   # a waiting start looks again about this often (readings are sha
 
 def wait_free(targets, step: str = "test", *, moves=(), poll_s: float | None = None, max_wait_s: float | None = None,
               say: Callable[[str], None] | None = None, sleep: Callable[[float], None] = time.sleep,
-              clock: Callable[[], float] = time.time) -> dict:
+              clock: Callable[[], float] = time.time, on_wait: Callable[[], None] | None = None) -> dict:
     """The one gate every new start on a box asks first (`ttp lock`, `ttp detach`, checks, bench trials).
     While a live stream holds any of `targets` for `step` (its quiet window included; a source that cannot
     tell counts as live), the start moves to the first of `moves` (each an alias or a list of names for one
     other host) that is free, else waits, looking again about every `poll_s`, and says each new reason
     once. Never raises. Returns {"ok": bool, "move": <the free move's first name> or "", "waited_s",
-    "why": the last hold}; ok False only after `max_wait_s`."""
+    "why": the last hold}; ok False only after `max_wait_s`. `on_wait` is called once, before the first
+    sleep of a real wait (a caller frees what it holds while it waits, such as a shared lock)."""
     from . import poll_s as _poll
     poll_s = _poll(POLL_S) if poll_s is None else poll_s
     targets = [str(t) for t in targets if t]
@@ -396,6 +397,12 @@ def wait_free(targets, step: str = "test", *, moves=(), poll_s: float | None = N
         if say and (same := re.sub(r", read \d\d:\d\d[^;]*", "", why)) != said:   # a new reason, not a new read time
             say(f"waiting: {why}; looking again every {poll_s:.0f} s")
             said = same
+        if on_wait:
+            try:
+                on_wait()
+            except Exception as e:   # never stops the wait
+                _note_error(e)
+            on_wait = None
         sleep(poll_s if max_wait_s is None else max(0.0, min(poll_s, max_wait_s - (clock() - t0))))
 
 

@@ -34,6 +34,7 @@ CAPACITY_STATUS = (429, 503, 529)
 CAPACITY = ("rate_limit", "capacity", "overloaded", "overload", "unavailable", "not_served", "busy")
 OUTCOME = "server"
 NOT_SCORED = "not scored (server)"
+REFUSAL_MAX = 0.2       # a cell whose calls the server refused for capacity more often than this share: not run (server)
 RULE = "agent_time"     # the limit rule a cell ran under (its row's `limit_rule`); older rows ran under wall time
 
 
@@ -278,8 +279,54 @@ def void(row: dict) -> bool:
     return row.get("outcome") == OUTCOME and bool(row.get("was")) and bool(row.get("server"))
 
 
-def latest(rows) -> dict[tuple, dict]:
-    """The last row of each cell (task, rep, arm), void marks skipped; rows without a cell key are skipped."""
+def refusal_share(row: dict) -> tuple[float, int, int]:
+    """(share, refused, calls) of a row's model calls the server refused for capacity (429/503, its call summary's
+    `failed_by.capacity` over `calls`); a row given as the bridge record reads its `server` summary the same way."""
+    srv = row.get("server") if isinstance(row.get("server"), dict) else {}
+    by = srv.get("failed_by") if isinstance(srv.get("failed_by"), dict) else {}
+    try:
+        calls, refused = int(srv.get("calls") or 0), int(by.get("capacity") or 0)
+    except (TypeError, ValueError):
+        return 0.0, 0, 0
+    return (refused / calls if calls > 0 else 0.0), refused, calls
+
+
+def refusal_limit(row: dict, default: float | None = None) -> float:
+    """The capacity-refusal threshold a row is judged by: the one recorded when it was judged
+    (`capacity_refusal_max`), else `default` (`bench.server.capacity_refusal_max`), else REFUSAL_MAX."""
+    for v in (row.get("capacity_refusal_max"), default):
+        try:
+            if v is not None and not isinstance(v, bool) and 0 <= float(v) <= 1:
+                return float(v)
+        except (TypeError, ValueError):
+            pass
+    return REFUSAL_MAX
+
+
+def over_refused(row: dict, limit: float | None = None) -> bool:
+    """Mark `row` not run (server) when over `limit` of its calls were capacity refusals (user msg #3538): out of
+    every denominator, unscored and unflagged (its audit flags move to `unscored_flags`), whatever it scored. A
+    cell already not run (no model ran) stays as it is. True when it is such a cell."""
+    from . import benchnotrun
+    share, refused, calls = refusal_share(row)
+    cap = refusal_limit(row, limit)
+    if not calls or share <= cap or row.get("outcome") == benchnotrun.OUTCOME:
+        return False
+    if row.get("outcome") == OUTCOME and row.get("capacity_refusals") is not None:
+        return True
+    was = row.get("outcome")
+    mark(row, [f"{round(share * 100)}% capacity refusals ({refused} of {calls} calls; over {round(cap * 100)}%)"])
+    row.update(capacity_refusals=round(share, 3), capacity_refusal_max=cap,
+               **({"scored_as": was} if was and was != OUTCOME else {}))
+    if row.get("flagged"):
+        row["unscored_flags"] = row.pop("flagged")
+    return True
+
+
+def latest(rows, limit: float | None = None) -> dict[tuple, dict]:
+    """The last row of each cell (task, rep, arm), void marks skipped; rows without a cell key are skipped. A row
+    over its capacity-refusal threshold (over_refused, `limit` for rows that recorded none) comes back marked
+    not run (server), as a copy: the file is never rewritten."""
     last: dict = {}
     for r in rows:
         try:
@@ -288,6 +335,11 @@ def latest(rows) -> dict[tuple, dict]:
             continue
         if not void(r):
             last[key] = r
+    for key, r in last.items():
+        if refusal_share(r)[0] > refusal_limit(r, limit) and r.get("capacity_refusals") is None:
+            c = dict(r)
+            if over_refused(c, limit):
+                last[key] = c
     return last
 
 
@@ -322,10 +374,11 @@ def wait_healthy(probe, normal: dict | None, factor: float = FACTOR, every_s: fl
 
 
 def judge(row: dict, stopped: str | None, bridge: dict, hist: "History", factor: float = FACTOR,
-          min_calls: int = MIN_CALLS, scored: bool = True) -> list[str]:
+          min_calls: int = MIN_CALLS, scored: bool = True, refusal_max: float | None = None) -> list[str]:
     """Record what the server did to one cell (row's `server`: the call summary, `server_normal`) and mark it
-    `server` when classify says so; a cell that is not `scored` (a pass) is never marked. Healthy calls of an
-    unmarked cell join the model's History. Returns the reasons it was marked, [] when it was not."""
+    `server` when classify says so; a cell that is not `scored` (a pass) is never marked by classify. A cell
+    over `refusal_max` capacity refusals (over_refused) is marked whatever it scored, a flag or a pass too.
+    Healthy calls of an unmarked cell join the model's History. Returns the reasons it was marked, [] when not."""
     b = bridge or {}
     srv = b.get("server") or {}
     if srv:
@@ -334,6 +387,9 @@ def judge(row: dict, stopped: str | None, bridge: dict, hist: "History", factor:
     normal = hist.normal(model, min_calls)
     if normal:
         row["server_normal"] = normal
+    row["capacity_refusal_max"] = refusal_limit({}, refusal_max)
+    if over_refused(row, refusal_max):
+        return list(row["server_reason"])
     if scored:
         why = classify(stopped, b, normal, factor)
         if why:

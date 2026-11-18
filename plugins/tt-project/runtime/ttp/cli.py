@@ -9593,7 +9593,8 @@ def _model_suite(p, a, now: float) -> None:
             (modelsuite.folders(modelbench.home()) or (None,))[0]
         if not bench_dir:
             die(f"model-bench suite --reaudit: no `ttp bench prep` folder under {modelbench.home()}; name one with --bench")
-        opts = {"test_cmd": benchrun.TEST_CMD, "test_timeout_s": 900, "dry_run": a.dry_run}
+        opts = {"test_cmd": benchrun.TEST_CMD, "test_timeout_s": 900, "dry_run": a.dry_run,
+                "capacity_refusal_max": ((cfg.get("bench") or {}).get("server") or {}).get("capacity_refusal_max")}
         try:
             got = modelsuite.reaudit(a.date or modelbench.day(now), bench_dir, opts,
                                      [m.strip() for m in a.models.split(",") if m.strip()] if a.models else None, now,
@@ -9751,7 +9752,7 @@ def _server_opts(p, conf: dict, no_agent_time: bool = False, ceiling: float = 0,
     srv = conf.get("server") or {}
     o = {"agent_time": not no_agent_time and srv.get("agent_time", True), "ceiling_factor": srv.get("ceiling_factor"),
          "server_factor": srv.get("factor"), "server_window": srv.get("window"), "server_min_calls": srv.get("min_calls"),
-         "probe_every_s": srv.get("probe_every_s"), "probe_max_s": srv.get("probe_max_s"),
+         "capacity_refusal_max": srv.get("capacity_refusal_max"), "probe_every_s": srv.get("probe_every_s"), "probe_max_s": srv.get("probe_max_s"),
          "server_history": str(Path(srv.get("history") or p.state / "bench-server-history.json").expanduser()),
          "harness_versions": {**(conf.get("harness_versions") or {}),
                               **dict(x.split("=", 1) for x in versions or [] if "=" in x)}}

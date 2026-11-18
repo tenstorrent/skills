@@ -94,3 +94,31 @@ def test_a_quoted_edit_that_permits_what_another_item_bans_is_still_refused(env)
         assert "\"Never run a test on host-x while it holds a user's job" in err[0], err
         assert "Never undo another project's step" not in err[0], err
         assert p.charter_path.read_text() == charter
+_BOX_A_ITEMS = ("# demo\n\n## Restrictions\n- Never open pull requests. (user msg #1)\n"
+                "- Whenever box-b is too full, CPU checks may run on box-a, but never device work. (user msg #1)\n"
+                "- Exception (a) to 'Never change the power limit of a serving host': box-a may keep its power "
+                "limit at 170 W during soaks, never above 170 W. (user msg #1)\n"
+                "- Never change the power limit of a serving host. (user msg #1)\n")
+
+
+def test_charter_gate_power_limit_exception_ignores_items_that_only_name_the_host(env):
+    """Upstream note e5f551e13689fbef: an exception lowering box-a's power limit was refused as wider than an
+    item allowing CPU checks on box-a and an older power exception there, though neither bans that action.
+    Only items restricting the exception's action count; a real ban on power changes on box-a still blocks."""
+    p = make(env)
+    from ttp import coordinator as coord
+    act = {"type": "charter_update", "section": "Restrictions",
+           "excepts": "Never change the power limit of a serving host.", "text": "box-a may lower its power limit to 160 W."}
+    p.charter_path.write_text(_BOX_A_ITEMS)
+    mids, src = _turn_said(p, "change the power limit of box-a from 170 to 160 W")
+    assert coord.apply(p, [{**act, "source": src}], turn=1, user_turn=True, messages=mids) == []
+    stored = [ln for ln in p.charter_path.read_text().splitlines() if "160 W" in ln]
+    assert len(stored) == 1 and "Exception to \"Never change the power limit of a serving host.\"" in stored[0]
+    assert "Exception (a)" not in stored[0]     # it narrows the ban itself, not the older exception quoting it
+    assert coord._ban_part("- Whenever box-b is too full, CPU checks may run on box-a, but never device work.") \
+        .strip() == "never device work"
+    p.charter_path.write_text(_BOX_A_ITEMS + "- Never change the power limit of box-a. (user msg #1)\n")
+    mids, src = _turn_said(p, "change the power limit of box-a from 170 to 160 W")
+    err = coord.apply(p, [{**act, "source": src}], turn=2, user_turn=True, messages=mids)
+    assert err and "wider than a ban another item keeps" in err[0] and "Never change the power limit of box-a" in err[0]
+    assert "160 W" not in p.charter_path.read_text()

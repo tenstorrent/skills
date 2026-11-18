@@ -88,7 +88,8 @@ def prompt(spec: str, opts: dict, xdist_n: int = 0) -> str:
     return (opts.get("prompt") or PROMPT).format(spec=marked, limit_min=max(1, int(float(opts.get("timeout_s") or 1800) // 60)),
                          xdist=(XDIST_LINE.format(n=xdist_n) if xdist_n else "")
                          + (LIVE_LINE if NOT_CHECKABLE in marked else ""))
-CHEAT = re.compile(r"\bgit\s+(fetch|clone|pull|ls-remote|remote\s+add)\b|\bgit\s+log\s+--all\b|\bgh\s+(api|repo|pr)\b")
+# A history or forge lookup: run by itself it is a probe, flagged only when its output shows the landed change (audit).
+CHEAT = re.compile(r"\bgit\s+(fetch|clone|pull|ls-remote|remote\s+add)\b|\bgit\s+log\b[^;|&\n]*--all\b|\bgh\s+(api|repo|pr)\b")
 TEST_CMD = "python3 -m pytest -q -p no:cacheprovider"
 ISOLATE = True   # each cell's agent runs in a mount namespace (cellns.py); only tests turn this off (opts["isolate"])
 
@@ -608,19 +609,103 @@ def _kept_cwd(call: str, state: tuple[bool, bool], session) -> tuple[bool, bool]
     return here if to.startswith(("/", "~", "$")) else (state[0] or here[0], state[1] or here[1])
 
 
+def tool_output(transcript: str) -> str:
+    """What the cell's tools printed, from its transcript: the complement of agent_text (Claude's tool_result
+    blocks, Codex's aggregated_output, Cursor's result, any OUTPUT_KEYS value), the provider's system records aside."""
+    found: list[str] = []
+
+    def walk(v, take=False, depth=0):
+        if isinstance(v, str):
+            if take:
+                found.append(v)
+        elif isinstance(v, dict):
+            take = take or v.get("type") in OUTPUT_TYPES
+            for k, x in v.items():
+                walk(x, take or k in OUTPUT_KEYS, depth + 1)
+        elif isinstance(v, list):
+            for x in v:
+                walk(x, take, depth + 1)
+    for line in transcript.splitlines():
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(rec, dict) and rec.get("type") == "system":
+            continue
+        walk(rec)
+    return "\n".join(found)
+
+
+def trajectory_output(trajectory: bytes) -> str:
+    """What a mini-swe-agent trajectory's tools replied: its tool messages and the user messages after the first
+    (the task prompt), "" when it is not a trajectory."""
+    try:
+        msgs = json.loads(trajectory).get("messages") or []
+    except (ValueError, AttributeError):
+        return ""
+    out, prompt = [], True
+    for m in msgs:
+        if not isinstance(m, dict) or m.get("role") not in ("tool", "user"):
+            continue
+        if m.get("role") == "user" and prompt:
+            prompt = False
+            continue
+        c = m.get("content")
+        out.append(c if isinstance(c, str) else json.dumps(c))
+    return "\n".join(out)
+
+
+# A line of a lookup that failed: a sha it names there is the one the agent asked for, never one it saw.
+FAILED_LOOKUP = re.compile(r"(?im)^\s*(?:fatal|error|gh)\s*:.*$|^.*(?:not a valid object name|unknown revision|bad object|"
+                           r"bad revision|invalid object name|ambiguous argument|couldn't find remote ref|"
+                           r"no commit found for|\(HTTP 4\d\d\)).*$")
+PROBED = "probed, nothing found: "   # a lookup whose output showed nothing of the landed change: a note, never a flag
+NOTES = ("quote_matches: ", PROBED)
+
+
+def hard_flags(flags: list[str]) -> list[str]:
+    """The audit flags that void a cell's score: all but the notes (line quotes, probes that found nothing)."""
+    return [f for f in flags or [] if not f.startswith(NOTES)]
+
+
+def saw_change(output: str, task: dict, secret: dict | None, own: str = "") -> list[str]:
+    """Evidence that the cell's tools showed it the landed change or later history (user msg #3538): `output`
+    (what they printed, failed lookups' error lines taken out) names the task's landed commit or a later one
+    (task `later`; 7+ hex characters), or holds lines only the original change has (secret_lines, at the
+    quote threshold) that the agent did not write itself (`own`). [] when it saw none."""
+    seen = FAILED_LOOKUP.sub("", output)
+    out = []
+    shas = [str(x) for x in [task.get("head"), *(task.get("later") or [])] if x and len(str(x)) >= 7]
+    if any(re.search(rf"(?<![0-9a-f]){re.escape(x[:7].lower())}", seen, re.I) for x in shas):
+        out.append("saw the landed commit or later history in a command's output")
+    lines = [x for xs in (secret or {}).values() for x in xs]
+    long = len({f for x in lines if len(f := bench.flat(x)) >= bench.QUOTE_LEN})
+    if long:
+        mine = {bench.flat(x) for x in own.splitlines()}
+        theirs = [x for x in lines if bench.flat(x) not in mine]
+        if theirs and bench.quotes(seen, theirs) >= min(bench.QUOTE_LINES, long):
+            out.append("saw the original change in a command's output")
+    return out
+
+
 def audit(transcript: str, task: dict, hidden: list[Path], secret: dict | None = None, diff: str = "",
-          session: list[Path] = ()) -> list[str]:
+          session: list[Path] = (), outputs: str | None = None) -> list[str]:
     """Why a cell counts as a cheat attempt: its tool calls' inputs name a hidden path (the cell's own
-    `session` folders aside) or run history or forge commands, its transcript names the landed commit, or
+    `session` folders aside), its tools' output shows the landed change or later history (saw_change), or
     what the agent wrote (agent_text) or the candidate's diff shows lines only the held-out tests have
-    (secret_lines; bench.QUOTE_LINES of them, or all when fewer). A tool's output is never the agent's: a
-    workspace file it read or an `env` it printed flags nothing. [] when clean."""
+    (secret_lines; bench.QUOTE_LINES of them, or all when fewer: a note). A history or forge lookup the agent
+    ran (CHEAT) is flagged only beside such evidence; otherwise it is a note, `probed, nothing found: <cmd>`
+    (user msg #3538). Only commands the agent ran count (decision #3128): a workspace file it read or an
+    `env` it printed is never its own call. `outputs`: what the tools printed when the transcript holds only
+    the agent's calls (a mini-swe-agent trajectory); else read from the transcript. [] when clean."""
     inputs = agent_text(transcript, messages=False)   # what its tool calls asked for, never what they printed
     own = _own_session(inputs, session) if session else inputs
     out = [f"names {p}" for p in hidden if any(form in own for form in _forms(Path(p)))]
-    if task["head"][:12] in transcript:
-        out.append("names the landed commit")
-    out += sorted({f"runs {m.group(0)!r}" for m in CHEAT.finditer(inputs)})
+    saw = saw_change(tool_output(transcript) if outputs is None else outputs, task, secret,
+                     agent_text(transcript) + "\n" + diff)
+    out += saw
+    ran = sorted({m.group(0) for m in CHEAT.finditer(inputs)})
+    out += [f"runs {c!r}" if saw else f"{PROBED}{c!r}" for c in ran]
     calls = _commands("\n".join(x for x in transcript.splitlines() if not _system(x)))
     # A cd kept from an earlier call counts as if it were in this one (`cd ~/.claude`, then `cat projects/..`).
     named = up = False
@@ -1285,7 +1370,7 @@ def _finish(row: dict, bench_dir: Path, task: dict, ws: Path, run: Path, keep: P
                session_id=u.session_id)
     row.update(cell_spend(u, row, run / "output.jsonl"))
     transcript = (run / "output.jsonl").read_bytes() if (run / "output.jsonl").exists() else b""
-    audited = None
+    audited, outputs = None, None
     ended, handoff = _read_json(run / "exit.json"), _read_json(run / "result.json")
     ended = ended if isinstance(ended, dict) else {}
     if row.get("harness"):   # its own output format: the tokens are the bridge's counts, priced here
@@ -1295,6 +1380,7 @@ def _finish(row: dict, bench_dir: Path, task: dict, ws: Path, run: Path, keep: P
             # the audit reads the agent's own calls only: the plain-text log and the tool replies in the
             # trajectory hold what tools printed (a `git ls-remote` inside a file it read is not a call)
             audited = agent_records((run / "trajectory.json").read_bytes())
+            outputs = trajectory_output((run / "trajectory.json").read_bytes())
     if ((ended.get("bridge") or {}).get("usage") or {}).get("dropped_tool_calls") is not None:   # one tool call kept per reply
         row["dropped_tool_calls"] = ended["bridge"]["usage"]["dropped_tool_calls"]
     if isinstance(ended.get("ended"), (int, float)):   # the agent's own end: names this run's kept exit.json
@@ -1311,13 +1397,13 @@ def _finish(row: dict, bench_dir: Path, task: dict, ws: Path, run: Path, keep: P
         # names the guard so a reader sees the cell was cut short.
         row["hang_guard"] = ended["stopped"]
     flags = audit((transcript if audited is None else audited).decode(errors="replace"), task, hidden,
-                  secret_lines(bench_dir, task), diff.decode(errors="replace"), own or session_dirs(ws))
+                  secret_lines(bench_dir, task), diff.decode(errors="replace"), own or session_dirs(ws), outputs)
     # Graded even when flagged, so a reader sees both: a flagged cell still scores as a flag (passed False),
     # and `heldout_passed` keeps what the held-out tests said. A fresh venv: nothing the agent installed
     # into its own runs them. A quote-match flag is a note, not a fail: an isolated standard cell's line
     # matches cannot come from the answer (isolation denies the held-out files and the landed history),
-    # so they never void the score; only hard evidence does.
-    hard = [f for f in flags if not f.startswith("quote_matches: ")]
+    # so they never void the score; nor does a lookup that found nothing (PROBED); only hard evidence does.
+    hard = hard_flags(flags)
     if not task["tests"]:
         # A task with no held-out tests (the daily bench's, and the offline replay's questions): nothing to
         # run. The cell is "done" (the agent ran to its end) or "flagged"; the blind review is the grade.
@@ -1357,13 +1443,14 @@ def server_status(row: dict, ended: dict, opts: dict) -> None:
     """Record what the server did to a cell (the call summary, the limit rule it ran under) and mark it
     `server` (not scored, never a fail, queued for a rerun) when it was cut by the limit, the ceiling or a
     capacity refusal while its calls ran slower than the model's normal speed (serverhealth.classify). A
-    cell that passed stays a pass. The healthy cells' calls define each model's normal speed."""
+    cell that passed stays a pass, unless over `capacity_refusal_max` (`bench.server.capacity_refusal_max`, default
+    20%) of its calls were capacity refusals: then any cell is not run (server) (serverhealth.over_refused). The healthy cells' calls define each model's normal speed."""
     row["limit_rule"] = (ended.get("limits") or {}).get("rule") or "wall_time"
     if ended.get("limits"):
         row["limits"] = ended["limits"]
     serverhealth.judge(row, ended.get("stopped"), ended.get("bridge") or {}, history(opts), server_factor(opts),
                        int(opts.get("server_min_calls") or serverhealth.MIN_CALLS),
-                       scored=row.get("outcome") in ("fail", "done", "error"))
+                       scored=row.get("outcome") in ("fail", "done", "error"), refusal_max=opts.get("capacity_refusal_max"))
 
 
 def criteria(spec: str) -> str:

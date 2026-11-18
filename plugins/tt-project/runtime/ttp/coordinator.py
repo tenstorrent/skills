@@ -6941,8 +6941,11 @@ def _excepted_item(charter: str, clause: str) -> tuple[str, str] | None:
     want = _loose(restriction_source.bare(clause))
     want = want if len(want.split()) >= 3 else ""   # a clause, not a word every ban has
     mark = _loose(SCOPED_EXCEPTION.split("{clause}")[0])
-    return next(((s, sec) for s, sec, _ in _restriction_items(charter) if want and want in _loose(restriction_source.bare(s))
-                 and _BAN_RE.search(s) and not _loose(s).startswith(mark)), None)
+    found = [(s, sec) for s, sec, _ in _restriction_items(charter) if want and want in _loose(restriction_source.bare(s))
+             and _BAN_RE.search(s) and not _loose(s).startswith(mark)]
+    # The ban itself before an item that only quotes it (an older exception "to 'Never ...': box-a may ...")
+    return min(found, key=lambda f: (_loose(restriction_source.bare(f[0])).strip(" .") != want.strip(" ."),
+                                     not _loose(restriction_source.bare(f[0])).startswith(want)), default=None)
 
 
 # What makes an exception a new risk class, so only the user's own words naming its whole scope allow it
@@ -6979,15 +6982,30 @@ def _ordered_work(charter: str, text: str, names: set[str], unsaid: list[str], s
     return ""
 
 
+def _ban_part(item: str) -> str:
+    """What Restrictions item `item` bans: the whole item when it permits nothing, else only its clauses
+    with a ban word, quoted text left out. An item that allows work on a host ("CPU checks may run on
+    box-a, but never device work") or an older exception quoting the ban it narrows ("Exception to
+    'Never change the power limit': box-a may keep 170 W, never above") restricts only what those clauses
+    name, not everything it mentions."""
+    bare = restriction_source.bare(item)
+    if not _may_lift(bare):
+        return item
+    unquoted = re.sub(r"'[^']*'|\"[^\"]*\"|\u2018[^\u2019]*\u2019|\u201c[^\u201d]*\u201d", " ", bare)
+    bans = [c for c in re.split(r"[,;:.]\s|\bbut\b|[;:.]$", unquoted) if _BAN_RE.search(c)]
+    return " ".join(bans) or item
+
+
 def _bans_in_scope(other: str, text: str, names: set[str]) -> bool:
     """Whether Restrictions item `other` bans what exception `text` permits on a name of its scope `names`:
-    it names one of them and bans any action there ("never touch"), the exception's own action, or, when
-    neither names a known action, the same thing beyond names and kinds of target. Sharing a name alone is
-    no contradiction: "No device tests on node-7 outside the lock" keeps its ban beside an exception that
-    lets workers power cycle node-7, and workers obey both."""
+    it names one of them and its ban (_ban_part: an allowing item's ban clauses only) bans any action there
+    ("never touch"), the exception's own action, or, when neither names a known action, the same thing
+    beyond names and kinds of target. Sharing a name alone is no contradiction: "No device tests on node-7
+    outside the lock" keeps its ban beside an exception that lets workers power cycle node-7, and workers
+    obey both; nor is an item that allows work on node-7, or an older exception there."""
     if not _scope_names(other) & names:
         return False
-    (oa, oo), (ta, to) = (_target(restriction_source.bare(x), conditions=False) for x in (other, text))
+    (oa, oo), (ta, to) = (_target(restriction_source.bare(x), conditions=False) for x in (_ban_part(other), text))
     if _ANY in oa or oa and ta and _same_action(oa, ta):
         return True
     return not oa and not ta and bool((oo & to) - names - _KINDS)
@@ -8535,14 +8553,14 @@ def _use_charter_approval(p: Project, rid: str, key: str | None) -> None:
 # with it: a test fails when the source of CHARTER_GUARD_FUNCS no longer has CHARTER_GUARD_PIN's
 # sha256. A user's change that failed under an older guard for another reason than the guard
 # (reraise_charter_changes) is then raised at once.
-CHARTER_GUARD_VERSION = 22
+CHARTER_GUARD_VERSION = 23
 CHARTER_GUARD_FUNCS = ("_reject_contradicting_append", "_append_conflicts", "_overlaps", "_on_object", "_quote_hits",
                        "_item_quote_hits", "_items", "_norm", "_may_lift", "_lifts_item", "_companion_clause",
                        "_ref_ids", "_companion_exception", "_changed_sentences", "_quoted_news",
                        "_charter_approval", "_ask_charter_approval", "_conflict_reason", "_scope_names",
                        "_scoped_exception", "_excepted_item", "_orders_banned",
                        "_same_target", "_delivery_names", "_undelivered", "_edit_overlaps", "_bans_in_scope")
-CHARTER_GUARD_PIN = (22, "43e8b0af354d3822638537d94f92b6c9bc745c14bc8baad584e3c093452fefd9")
+CHARTER_GUARD_PIN = (23, "27ba06ea21a4129e2b7b61ce6bc219198858d321171c78cfa6e7ab0fd0ad5ee1")
 CHARTER_RERAISE_KEY = "charter_reraise"   # kv: {"version", "ts"} of the last re-raise pass
 
 

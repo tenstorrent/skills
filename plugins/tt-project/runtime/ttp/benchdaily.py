@@ -663,7 +663,7 @@ def day_record(day: str, tasks: dict, arms: dict, out: Path, graded: dict, skipp
                       "minutes": round(float(r.get("wall_s") or 0) / 60, 2),
                       "stopped": bool(r.get("hang_guard")) or r.get("outcome") in ("timeout", "stalled"),
                       "outcome": r.get("outcome", ""),
-                      **({"flags": [f for f in r["flagged"] if not f.startswith("quote_matches: ")]}
+                      **({"flags": benchrun.hard_flags(r["flagged"])}
                          if r.get("outcome") == "flagged" and r.get("flagged") else {})})
     regrades = graded.get("regrades") or {}
     reps_graded = {tid: [] for tid in tasks}

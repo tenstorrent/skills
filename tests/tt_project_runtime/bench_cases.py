@@ -584,9 +584,11 @@ def test_bench_run_cell_cannot_reach_the_landed_commit_later_history_or_the_held
     arms = {"a": {"provider": "claude", "model": "", "effort": ""}, "b": {"provider": "claude", "model": "", "effort": ""}}
     out = tmp_path / "h2h"
     rows = benchrun.run(tmp_path / "bench", out, arms, 1, 1, _bench_opts(tmp_path), p.config())
-    # The hunt's history command is in its transcript (as a real agent's tool call is): the audit flags the
-    # cell, which fails ungraded; isolation is what the found files below show.
-    assert [(r["outcome"], r["flagged"], r["passed"]) for r in rows] == [("flagged", ["runs 'git log --all'"], False)] * 2
+    # The hunt's history command is in its transcript (as a real agent's tool call is), but its output never
+    # showed the landed commit: a probe that found nothing is a note, not a flag (user msg #3538), and the cell
+    # is graded (it fails: no fix); isolation is what the found files below show.
+    assert [(r["outcome"], r["flagged"], r["passed"]) for r in rows] == \
+        [("fail", ["probed, nothing found: 'git log --all'"], False)] * 2
     for r in rows:
         found = (out / "cells" / f"{tid}-r1-{r['arm']}" / "diff.patch").read_text()
         assert "found.txt" in found and task["head"] not in found and f"+{task['base']}" in found, "history up to the base"
@@ -611,15 +613,31 @@ def test_bench_run_cell_cannot_reach_the_landed_commit_later_history_or_the_held
     subprocess.run([*g, "tag", "-d", "t"], check=True)
     found = benchrun.leaks(ws, task)
     assert f"commit {task['head'][:12]}" in found and any(f.endswith("objects HEAD does not reach") for f in found), found
-    # The transcript audit flags a candidate that names a hidden path, the landed commit or runs history commands.
-    flags = benchrun.audit(f"cat {tmp_path / 'bench'}/x; git show {task['head']}; git fetch origin; gh api x",
-                           task, [tmp_path / "bench"])
-    assert flags == [f"names {tmp_path / 'bench'}", "names the landed commit", "runs 'gh api'", "runs 'git fetch'"]
+    # The transcript audit flags a candidate that names a hidden path; history and forge lookups whose output
+    # showed nothing of the landed change are notes, not flags (user msg #3538), and a failed lookup's error
+    # naming the sha it asked for is not a sighting.
+    asked = f"cat {tmp_path / 'bench'}/x; git show {task['head']}; git fetch origin; gh api x"
+    failed = f"fatal: bad object {task['head']}\nerror: Not a valid object name {task['head'][:12]}\n"
+    flags = benchrun.audit(asked, task, [tmp_path / "bench"], outputs=failed)
+    assert flags == [f"names {tmp_path / 'bench'}", "probed, nothing found: 'gh api'", "probed, nothing found: 'git fetch'"]
+    assert benchrun.hard_flags(flags) == [f"names {tmp_path / 'bench'}"]
+    # Output that shows the landed commit (or a later one) flags the lookups beside it.
+    shown = f"From origin\n * [new branch] main -> origin/main\ncommit {task['head']}\n"
+    assert benchrun.audit(asked, task, [], outputs=shown) == [
+        "saw the landed commit or later history in a command's output", "runs 'gh api'", "runs 'git fetch'"]
+    assert benchrun.audit("git log --all", {**task, "later": ["ab" * 20]}, [], outputs=f"commit {'AB' * 20}\n") == [
+        "saw the landed commit or later history in a command's output", "runs 'git log --all'"]
     assert benchrun.audit("git log --oneline; pytest -q", task, [tmp_path / "bench"]) == []
     secret = benchrun.secret_lines(tmp_path / "bench", task)
     assert secret == {"tests/test_mod.py": ["def test_new():", "    assert mod.new() == 2, 'new() returns two'"]}
     seen = json.dumps({"type": "user", "content": [{"text": "    assert mod.new() == 2, 'new() returns two'\n"}]})
     assert benchrun.audit(seen, task, [], secret) == [], "a tool's output is not what the agent wrote"
+    # An empty fetch or gh api reply is a probe that found nothing; a reply holding the original diff flags it.
+    for cmd, probe in (("git fetch origin", "git fetch"), ("gh api repos/o/r/commits", "gh api")):
+        assert benchrun.audit(cmd, task, [], secret, outputs="") == [f"probed, nothing found: {probe!r}"]
+    diff = "diff --git a/tests/test_mod.py\n+def test_new():\n+    assert mod.new() == 2, 'new() returns two'\n"
+    assert benchrun.audit("gh api repos/o/r/commits", task, [], secret, outputs=diff) == [
+        "saw the original change in a command's output", "runs 'gh api'"]
     wrote = json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Write", "input": {
         "file_path": "tests/test_x.py", "content": "def test_x():\n    assert mod.new() == 2, 'new() returns two'\n"}}]}})
     assert benchrun.audit(wrote, task, [], secret) == ["quote_matches: 1"]
@@ -1884,7 +1902,7 @@ def test_bench_audit_flags_only_distinctive_held_out_lines_and_what_the_agent_it
     assert benchrun.audit(printed + "\n" + codex, task, [hidden]) == [], "a tool's output is not the agent's"
     asked = json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash",
                         "input": {"command": f"cat {hidden}/tests/test_mod.py; gh pr view 1"}}]}})
-    assert benchrun.audit(asked, task, [hidden]) == [f"names {hidden}", "runs 'gh pr'"]
+    assert benchrun.audit(asked, task, [hidden]) == [f"names {hidden}", "probed, nothing found: 'gh pr'"]
     ran = json.dumps({"type": "item.completed", "item": {"type": "command_execution",
                       "command": f"ls {hidden}", "aggregated_output": ""}})
     assert benchrun.audit(ran, task, [hidden]) == [f"names {hidden}"]
@@ -1908,7 +1926,12 @@ def test_mini_trajectory_audit_reads_only_the_agents_own_calls(tmp_path):
     assert benchrun.audit(clean.decode(), task, []) == [], "a tool reply, the prompt and prose flag nothing"
     cheat = benchrun.agent_records(traj(call("git ls-remote origin && git fetch origin"), read))
     flags = benchrun.audit(cheat.decode(), task, [])
+    assert flags == ["probed, nothing found: 'git fetch'", "probed, nothing found: 'git ls-remote'"]
+    # The same calls whose replies show the landed commit are flagged (user msg #3538).
+    saw = traj(call("git ls-remote origin && git fetch origin"), {"role": "tool", "content": f"{task['head']}\tHEAD"})
+    flags = benchrun.audit(benchrun.agent_records(saw).decode(), task, [], outputs=benchrun.trajectory_output(saw))
     assert "runs 'git ls-remote'" in flags and "runs 'git fetch'" in flags
+    assert benchrun.trajectory_output(traj(call("ls"))) == "", "the task prompt is not a tool's reply"
     assert benchrun.agent_records(b"not json") == b""
 
 
@@ -1927,20 +1950,24 @@ def test_audit_flags_only_what_the_agent_ran_in_every_arm_format(tmp_path):
                 {"function": {"name": "bash", "arguments": json.dumps({"command": c})}, "id": "1", "type": "function"}]}
               for c in cmds)]}).encode()).decode()
     assert benchrun.audit(mini("ls", "pytest -q"), task, []) == []
-    assert benchrun.audit(mini("git fetch github"), task, []) == ["runs 'git fetch'"]
+    assert benchrun.audit(mini("git fetch github"), task, []) == ["probed, nothing found: 'git fetch'"]
 
-    def claude(cmd, prose="I will not run gh pr or git fetch."):
+    def claude(cmd, prose="I will not run gh pr or git fetch.", reply="see gh pr create and git fetch"):
         lines = [{"type": "system", "subtype": "init", "tools": ["gh pr"]},
                  {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": prompt}]}},
                  {"type": "assistant", "message": {"id": "m", "type": "message", "role": "assistant", "content": [
                      {"type": "text", "text": prose},
                      {"type": "tool_use", "id": "u1", "name": "Bash", "input": {"command": cmd}}]}},
                  {"type": "user", "message": {"role": "user", "content": [
-                     {"type": "tool_result", "tool_use_id": "u1", "content": "see gh pr create and git fetch"}]}}]
+                     {"type": "tool_result", "tool_use_id": "u1", "content": reply}]}}]
         return "".join(json.dumps(x) + "\n" for x in lines)
     assert benchrun.audit(claude("ls -la"), task, []) == [], "the prompt, prose and a tool reply flag nothing"
-    assert benchrun.audit(claude("gh pr create --fill"), task, []) == ["runs 'gh pr'"]
-    assert benchrun.audit(claude("git log --all"), task, []) == ["runs 'git log --all'"]
+    assert benchrun.audit(claude("gh pr create --fill"), task, []) == ["probed, nothing found: 'gh pr'"]
+    # git log --all printing only older commits is a probe that found nothing; printing the landed one flags it.
+    older = "commit " + "1" * 40 + "\nAuthor: a\n\n    base\n"
+    assert benchrun.audit(claude("git log --all", reply=older), task, []) == ["probed, nothing found: 'git log --all'"]
+    assert benchrun.audit(claude("git log --all", reply=older + "commit " + "f" * 40), task, []) == [
+        "saw the landed commit or later history in a command's output", "runs 'git log --all'"]
 
     def codex(cmd):
         return "".join(json.dumps(x) + "\n" for x in [
@@ -1948,7 +1975,7 @@ def test_audit_flags_only_what_the_agent_ran_in_every_arm_format(tmp_path):
             {"type": "item.completed", "item": {"type": "command_execution", "command": cmd,
                                                 "aggregated_output": "git fetch gh pr"}}])
     assert benchrun.audit(codex("ls"), task, []) == []
-    assert benchrun.audit(codex("git fetch origin"), task, []) == ["runs 'git fetch'"]
+    assert benchrun.audit(codex("git fetch origin"), task, []) == ["probed, nothing found: 'git fetch'"]
 
 
 def _reaudit_day(env, tmp_path, monkeypatch, date="2026-11-10"):
@@ -2071,9 +2098,16 @@ def test_model_suite_run_refuses_while_another_run_holds_the_day_folder(env, tmp
 def test_bench_flagged_cell_is_still_graded_and_the_prompt_names_a_focused_test_command(env, tmp_path, monkeypatch):
     from ttp import benchrun
     p, tid, task = _bench_built(env, tmp_path)
-    # A correct fix, plus a history hunt the audit flags: the row keeps both the flag and the grade.
-    monkeypatch.setenv("TTP_FAKE_SHELL", "git log --all >/dev/null; " + _BENCH_FIX)
+    # A correct fix, plus a history hunt whose output showed the landed commit (a tool result in the transcript):
+    # the audit flags it, and the row keeps both the flag and the grade.
+    import shlex
+    shown = json.dumps({"type": "user", "message": {"content": [{"type": "tool_result", "content": f"commit {task['head']}"}]}})
     arms = {"a": {"provider": "claude", "model": "", "effort": ""}, "b": {"provider": "claude", "model": "", "effort": ""}}
+    # The same hunt with nothing found is a note: the cell is scored (user msg #3538).
+    monkeypatch.setenv("TTP_FAKE_SHELL", "git log --all >/dev/null; " + _BENCH_FIX)
+    for r in benchrun.run(tmp_path / "bench", tmp_path / "h2h-probe", arms, 1, 1, _bench_opts(tmp_path), p.config()):
+        assert r["outcome"] == "pass" and r["flagged"] == ["probed, nothing found: 'git log --all'"], r
+    monkeypatch.setenv("TTP_FAKE_SHELL", f"git log --all >/dev/null; echo {shlex.quote(shown)}; " + _BENCH_FIX)
     out = tmp_path / "h2h"
     for r in benchrun.run(tmp_path / "bench", out, arms, 1, 1, _bench_opts(tmp_path), p.config()):
         assert r["outcome"] == "flagged" and r["passed"] is False and r["heldout_passed"] is True, r

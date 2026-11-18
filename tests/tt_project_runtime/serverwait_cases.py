@@ -590,3 +590,53 @@ def test_serverhealth_failed_calls_split_by_kind_and_an_old_fault_counts_as_othe
     assert s["failed_calls"] == 5
     assert s["failed_by"] == {"stream": 1, "parse": 1, "capacity": 2, "other": 1}
     assert "failed_by" not in serverhealth.summarize(rows[:1]), "no failed call: no split"
+
+
+def _refused(pct, outcome="pass", **kw):
+    """A cell row whose 100 model calls had `pct` capacity refusals (429/503)."""
+    return {"task": "t", "rep": 1, "arm": "a", "model": "m", "outcome": outcome, "passed": outcome == "pass",
+            "server": {"calls": 100, "failed_calls": pct, "failed_by": {"capacity": pct}}, **kw}
+
+
+def test_serverhealth_a_cell_over_the_capacity_refusal_threshold_is_not_run_server(tmp_path):
+    """User msg #3538: a cell with over 20% capacity refusals is 'not run (server)', not scored and not flagged;
+    the threshold is the config key bench.server.capacity_refusal_max (default 20%)."""
+    from ttp import benchdaily, benchrun, cli, serverhealth
+    hist = serverhealth.History(tmp_path / "h.json")
+    bridge = lambda row: {"server": row.pop("server")}
+    for pct, outcome in ((21, "pass"), (74, "flagged"), (25, "fail")):
+        row = _refused(pct, outcome, flagged=["runs 'git log --all'"] if outcome == "flagged" else [])
+        why = serverhealth.judge(row, None, bridge(row), hist, scored=outcome != "pass")
+        assert why == [f"{pct}% capacity refusals ({pct} of 100 calls; over 20%)"], why
+        assert row["outcome"] == serverhealth.OUTCOME and row["passed"] is None and not row.get("flagged"), row
+        assert serverhealth.describe(row) == serverhealth.NOT_SCORED and row["scored_as"] == outcome
+        assert benchrun.hard_flags(row.get("flagged")) == [] and row["capacity_refusal_max"] == 0.2
+        if outcome == "flagged":
+            assert row["unscored_flags"] == ["runs 'git log --all'"], "kept for the record, never counted"
+    for pct, outcome in ((19, "pass"), (20, "fail"), (3, "flagged")):
+        row = _refused(pct, outcome, flagged=["runs 'gh pr'"] if outcome == "flagged" else [])
+        assert serverhealth.judge(row, None, bridge(row), hist, scored=False) == []
+        assert row["outcome"] == outcome and "capacity_refusals" not in row, "at or under the threshold: scored"
+    # A cell no model ran stays as it is; a cell with no calls has no share.
+    row = _refused(50, "not_run")
+    assert serverhealth.judge(row, None, bridge(row), hist) == [] and row["outcome"] == "not_run"
+    assert serverhealth.over_refused({"outcome": "pass", "server": {"calls": 0, "failed_by": {"capacity": 0}}}) is False
+    # The config key sets the threshold, recorded on the row so a later table judges it the same way.
+    opts = cli._server_opts(type("P", (), {"state": tmp_path})(), {"server": {"capacity_refusal_max": 0.5}})
+    assert opts["capacity_refusal_max"] == 0.5
+    row = _refused(30)
+    assert serverhealth.judge(row, None, bridge(row), hist, refusal_max=0.5) == [] and row["capacity_refusal_max"] == 0.5
+    for bad in (2, -1, "x", True):
+        assert serverhealth.refusal_limit({}, bad) == serverhealth.REFUSAL_MAX
+    # Rows written before the rule are re-judged when read (a marked copy; the file is unchanged), out of every
+    # denominator: the day's table takes only the cells left.
+    old, ok = _refused(21, "pass", rep=1), _refused(19, "pass", rep=2)
+    path = tmp_path / "results.jsonl"
+    path.write_text(json.dumps(old) + "\n" + json.dumps(ok) + "\n")
+    rows = benchdaily.read_rows(path)
+    assert [rows[("t", r, "a")]["outcome"] for r in (1, 2)] == [serverhealth.OUTCOME, "pass"]
+    assert "capacity_refusals" not in json.loads(path.read_text().splitlines()[0]), "the file is never rewritten"
+    assert serverhealth.queue(list(rows.values())) == [rows[("t", 1, "a")]], "queued for a rerun, not scored"
+    from ttp import modelsuite
+    assert modelsuite._rate(list(rows.values())) == 1.0, "only the 19% cell is in the denominator"
+    assert serverhealth.latest([old], limit=0.25)[("t", 1, "a")]["outcome"] == "pass", "the configured limit applies"
