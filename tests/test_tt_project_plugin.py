@@ -7501,16 +7501,16 @@ def test_docs_say_each_line_once():
 
 def test_the_coordinator_prompt_states_the_on_host_rule():
     text = " ".join((PLUGIN / "template" / "prompts" / "coordinator.md").read_text(encoding="utf-8").split())
-    assert "A machine or device action is under way only once STATE shows its task `on <resource> since`; " \
-           "before that say 'queued for a worker, ETA X', and a stop is 'stop requested' until its jobs are gone." in text
+    rule = text[text.index("A machine or device action is under way only once STATE shows its task `on <resource> since`"):]
+    rule = rule[:rule.index("gone.") + 5]
+    assert "before that say 'queued for a worker, ETA X'" in rule and "a stop is 'stop requested' until its jobs are gone." in rule
 
 
 def test_coordinator_prompt_names_the_reply_length_limit():
     """A reply or notify over the chat's 6000 chars goes as parts; over 24000 it is rejected (msgparts)."""
     coordinator = " ".join((PLUGIN / "template" / "prompts" / "coordinator.md").read_text(encoding="utf-8").split())
     out = coordinator[coordinator.index("# Output"):coordinator.index("| action |")]
-    assert "Keep a `reply` or `notify` under 6000 chars: a longer one goes as numbered parts, one over 24000 is " \
-           "rejected." in out
+    assert "Keep a `reply` or `notify` under 6000 chars (longer: numbered parts; over 24000: rejected)." in out
 
 
 def test_worker_prompt_guards_paid_model_api_spend_in_detached_jobs():
