@@ -3,3 +3,7 @@
 ---
 
 Device A/B shadow runs honour pauses and the host's test slots. An arm does not start, and its agent does not run, while this host or a resource the live task names is paused; the arm is recorded `skipped` with the pause. Its agent runs only on a grant of the host's test slots, held for its life, and a pool that stays full for the arm's time limit is a recorded skip. A shadow agent had run a project's full check suite on a paused host.
+
+A credential watch observation about a host change goes through the mute screen: an active mute on the daemon's observations that matches it stores it muted and counts it, so it wakes nobody; a write a run did itself is never muted.
+
+A stay-off alert (a job of this project used a box while a live realtime stream held it) closes once every job it flagged ended, or once the stream's window ended and none of them is known to still run there; the clearing is told once. A later hit overlapping an alert's window joins it, so a box and stream window raise one alert, and a job started in that window after it closed raises it again.

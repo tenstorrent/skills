@@ -469,10 +469,11 @@ def watch(p, db, now: float | None = None, post: Callable[..., None] | None = No
     live or inside its quiet window (a front box: deploys and restarts only). A job that started before
     the stream went live is never flagged, nor is a record whose process is gone (activity.reap closes those
     first, here on every pass); a job whose liveness is unknown (a remote one) counts by its start alone.
-    Per-job flags are kept in kv for status; one alert per stream event (box plus
-    window start, kept across restarts) lists the jobs and the source's own reason, at high severity when
-    the source reported a real live stream and normal when the box only counted as live because the source
-    could not tell (a fail-safe hold)."""
+    Per-job flags are kept in kv for status; one alert per stream event (box plus window, a later hit
+    overlapping it joins it; kept across restarts) lists the jobs and the source's own reason, at high severity
+    when the source reported a real live stream and normal when the box only counted as live because the source
+    could not tell (a fail-safe hold). It closes once its jobs ended, or once the window ended and none is known
+    to still run there (_close_ended)."""
     from . import activity
     now = time.time() if now is None else now
     publish(p)
@@ -502,11 +503,15 @@ def watch(p, db, now: float | None = None, post: Callable[..., None] | None = No
     flags = db.kv(FLAGS_KEY, [])
     events = db.kv(EVENTS_KEY, {})
     new: dict[str, list[dict]] = {}
+    fresh: set[str] = set()   # events whose alert this pass posts
     recs = [r for r in activity.entries(p.state) if now - float(r.get("start") or r.get("end") or now) < HISTORY_S]
+    jobs: dict[str, str] = {}   # span id -> running, ended or unknown (a remote job's end is known only there)
     for s in activity.spans(recs, here):
+        sid = str(s.get("id"))
+        jobs[sid] = ("ended" if s.get("reaped") or s.get("end") is not None
+                     else "unknown" if s.get("state") == "unknown" else "running")
         if s.get("reaped"):
             continue   # its process is gone: not a job of the stream
-        sid = str(s.get("id"))
         start = float(s.get("start") or 0)
         # A remote job's end is known only on its host: it is unknown here, so it counts only by its start.
         end = start if s.get("state") == "unknown" else float(s["end"]) if s.get("end") is not None else now
@@ -536,18 +541,70 @@ def watch(p, db, now: float | None = None, post: Callable[..., None] | None = No
                         "reading": str(rec.get("live_state") or rec.get("state") or "")}
                 flags.append(flag)
                 out["flags"].append(flag)
-                new.setdefault(f"{alias}:{proj}:{stream}:{int(hit[0])}", []).append(flag)
+                ekey = _event_for(events, alias, proj, stream, hit, now)
+                ev = events[ekey]
+                ev["jobs"] = sorted(set(ev.get("jobs") or []) | {sid})
+                ev["at"] = now
+                if ev.pop("closed", None) is not None:
+                    fresh.add(ekey)   # a job started in the window after its alert closed: told again
+                new.setdefault(ekey, []).append(flag)
     if post:
         for ekey, fl in new.items():
-            if ekey not in events:
+            if ekey in fresh:
                 real = all(f.get("reading") == "live" for f in fl)
                 post(f"occupancy:violation:{ekey}", event_text(fl), "high" if real else "normal")
-    for ekey in new:
-        events[ekey] = now
+    _close_ended(db, events, jobs, readings, now, set(new))
     db.set_kv(SEEN_KEY, {k: v for k, v in seen.items() if now - float(v) < HISTORY_S})
-    db.set_kv(EVENTS_KEY, {k: v for k, v in events.items() if now - float(v) < HISTORY_S})
+    db.set_kv(EVENTS_KEY, {k: v for k, v in events.items() if now - _event_at(v) < HISTORY_S})
     db.set_kv(FLAGS_KEY, flags[-FLAGS_KEPT:])
     return out
+
+
+def _event_at(v) -> float:
+    return float(v.get("at") or 0) if isinstance(v, dict) else float(v)
+
+
+def _event_for(events: dict, alias: str, proj: str, stream: str, hit: tuple[float, float], now: float) -> str:
+    """The stream event (box and window) a job's hit joins: an event of the same box and stream whose window
+    overlaps the hit (a window whose start moved, a stream back live inside its quiet tail), else a new one,
+    marked closed so the caller reopens and posts it. A record from before events kept their window (a bare
+    time) joins only by its exact key and is not posted again."""
+    base = f"{alias}:{proj}:{stream}"
+    for k, v in events.items():
+        if isinstance(v, dict) and v.get("base") == [alias, proj, stream] \
+                and float(v["from"]) <= hit[1] and hit[0] <= float(v["to"]):
+            v["from"], v["to"] = min(float(v["from"]), hit[0]), max(float(v["to"]), hit[1])
+            return k
+    ekey = f"{base}:{int(hit[0])}"
+    old = events.get(ekey)
+    events[ekey] = {"base": [alias, proj, stream], "from": hit[0], "to": hit[1], "jobs": [], "at": now}
+    if old is None:
+        events[ekey]["closed"] = now   # reopened at once by the caller, so its alert is posted
+    return ekey
+
+
+def _close_ended(db, events: dict, jobs: dict[str, str], readings: dict, now: float, joined: set[str]) -> None:
+    """Close each open stay-off alert whose condition is over (user msg #904: alerts clear with their
+    condition): every job it flagged ended (or its record is gone), or the stream's window ended and none of
+    them is known to still run there (a remote job's end is known only on its host). An event a job joined
+    this pass waits for the next one."""
+    from . import alerts
+    for ekey, ev in events.items():
+        if not isinstance(ev, dict) or ev.get("closed") is not None or not ev.get("jobs") or ekey in joined:
+            continue
+        states = {jobs.get(j, "ended") for j in ev["jobs"]}
+        if "running" in states:
+            continue
+        alias, proj, stream = ev["base"]
+        if states != {"ended"}:
+            if any(a <= now <= b for a, b in _live_windows(readings.get(f"{proj}:{stream}") or {}, now)):
+                continue
+            why = "the stream's window ended and no job it flagged is known to run there"
+        else:
+            why = "every job it flagged ended"
+        ev["closed"] = now
+        alerts.close_key(db, f"occupancy:violation:{ekey}", why, now,
+                         text=f"Cleared: the stay-off alert for {alias} ({stream}): {why}.")
 
 
 def _job_line(f: dict) -> str:

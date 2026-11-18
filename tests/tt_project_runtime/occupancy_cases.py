@@ -421,6 +421,89 @@ def test_occupancy_watchdog_flags_a_remote_job_started_inside_the_window_once(en
     assert len(posts) == 1 and "box-a" in posts[0][1] and posts[0][2] == "high"
 
 
+def _occ_alert_post(p):
+    """The daemon's post (Daemon.watch_occupancy): an outbound alert keyed by the event, which opens an episode."""
+    return lambda key, text, sev="high": p.db.post("out", text, chat=None, kind="alert", severity=sev, ref=key)
+
+
+def _occ_episodes(p):
+    return [(r["key"].split(":")[2], r["cleared"] is not None, r["cleared_why"])
+            for r in p.db.q("SELECT key, cleared, cleared_why FROM alerts WHERE key LIKE 'occupancy:violation:%' ORDER BY id")]
+
+
+def test_occupancy_stay_off_alert_closes_once_its_jobs_end_and_a_later_job_in_the_window_raises_it_again(env, monkeypatch):
+    """One alert per box and stream window, whatever its jobs and passes; it closes (told once) when the last job
+    it flagged ends, and a job started later in the same window raises that one alert again."""
+    from ttp import occupancy
+    p = make(env)
+    occ = _occ_home(env["home"], monkeypatch)
+    occ.publish(_OccProj("streamer", p.root, {"box-a": {"cmd": "exit 0"}}, quiet_s=0))
+    now = time.time()
+    post = _occ_alert_post(p)
+    mk = lambda i, t, end=None: {"id": f"d{i}", "kind": "lock", "start": t, "end": end,   # noqa: E731
+                                 "resource": "box-a-device", "task": i, "cmd": "bench"}
+    _watch_with(monkeypatch, [mk(1, now), mk(2, now)])
+    occupancy.watch(p, p.db, now, post)
+    _watch_with(monkeypatch, [mk(1, now), mk(2, now), mk(3, now + 5)])
+    occupancy.watch(p, p.db, now + 5, post)
+    assert _occ_episodes(p) == [("box-a", False, None)]   # one alert for three jobs over two passes
+    _watch_with(monkeypatch, [mk(1, now, now + 8), mk(2, now, now + 9), mk(3, now + 5)])
+    occupancy.watch(p, p.db, now + 10, post)
+    assert _occ_episodes(p) == [("box-a", False, None)]   # one job still runs there
+    _watch_with(monkeypatch, [mk(1, now, now + 8), mk(2, now, now + 9), mk(3, now + 5, now + 12)])
+    occupancy.watch(p, p.db, now + 15, post)
+    assert _occ_episodes(p) == [("box-a", True, "every job it flagged ended")]
+    told = p.db.q("SELECT text FROM messages WHERE kind='resolved' AND ref LIKE 'occupancy:violation:%'")
+    assert len(told) == 1 and "box-a" in told[0]["text"], told
+    occupancy.watch(p, p.db, now + 20, post)
+    assert len(_occ_episodes(p)) == 1   # nothing reopens on its own
+    _watch_with(monkeypatch, [mk(1, now, now + 8), mk(4, now + 25)])
+    occupancy.watch(p, p.db, now + 25, post)
+    assert [e[1] for e in _occ_episodes(p)] == [True, False]
+
+
+def test_occupancy_stay_off_alert_of_a_remote_job_closes_once_the_stream_ends(env, monkeypatch):
+    """A remote job's end is known only on its host: its alert holds while the stream is live and closes once
+    the stream's window ended; a job still known to run on the box keeps it open past the window."""
+    from ttp import occupancy
+    p = make(env)
+    occ = _occ_home(env["home"], monkeypatch)
+    flag = _occ_flag_file(env["home"], "stream", "live")
+    occ.publish(_OccProj("streamer", p.root, {"box-a": {"file": str(flag), "max_age_s": 10_000},
+                                              "box-b": {"file": str(flag), "max_age_s": 10_000}}, quiet_s=0))
+    now = time.time()
+    post = _occ_alert_post(p)
+    remote = {"id": "r1", "kind": "job", "start": now, "end": None, "state": "unknown", "machine": "box-a",
+              "task": 5, "cmd": "bench"}
+    local = {"id": "l1", "kind": "lock", "start": now, "end": None, "resource": "box-b-device", "task": 6,
+             "cmd": "bench"}
+    _watch_with(monkeypatch, [remote, local])
+    occupancy.watch(p, p.db, now, post)
+    occupancy.watch(p, p.db, now + 30, post)
+    assert sorted(_occ_episodes(p)) == [("box-a", False, None), ("box-b", False, None)]
+    flag.write_text("free")
+    occupancy.watch(p, p.db, now + 60, post)   # the read that ends the stream's span
+    occupancy.watch(p, p.db, now + 100, post)
+    assert [e[1] for e in sorted(_occ_episodes(p))] == [False, False]   # inside the quiet minute after it
+    occupancy.watch(p, p.db, now + 125, post)
+    assert sorted(_occ_episodes(p)) == [
+        ("box-a", True, "the stream's window ended and no job it flagged is known to run there"),
+        ("box-b", False, None)]
+
+
+def test_occupancy_a_hit_overlapping_an_event_window_joins_it(env, monkeypatch):
+    """A stream back live inside its quiet tail (a new span whose start moved) is the same event: one alert."""
+    from ttp import occupancy
+    events = {"box-a:streamer:main:100": 100.0}   # kept before events stored their window: joins by key only
+    assert occupancy._event_for(events, "box-a", "streamer", "main", (100.0, 160.0), 110.0) == "box-a:streamer:main:100"
+    assert "closed" not in events["box-a:streamer:main:100"]   # never posted again
+    assert occupancy._event_for(events, "box-a", "streamer", "main", (150.0, 220.0), 150.0) == "box-a:streamer:main:100"
+    assert events["box-a:streamer:main:100"]["to"] == 220.0
+    k = occupancy._event_for(events, "box-a", "streamer", "main", (400.0, 460.0), 400.0)
+    assert k == "box-a:streamer:main:400" and events[k]["closed"] == 400.0   # a new window: its own alert
+    assert occupancy._event_for(events, "box-b", "streamer", "main", (150.0, 220.0), 150.0) == "box-b:streamer:main:150"
+
+
 class _OccClock:
     """A fake clock and sleep for occupancy.wait_free: each sleep moves time on and runs `on_sleep`."""
     def __init__(self, on_sleep=None, step=30.0):
