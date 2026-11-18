@@ -392,3 +392,30 @@ def test_loopback_live_connect_from_a_namespace_without_the_host_network(tmp_pat
         server.close()
         proxy.close()
     assert "before=refused" in out.stdout and "after=pong" in out.stdout, (out.stdout, out.stderr)
+
+
+@pytest.mark.parametrize("shell", ["bash", "dash"])
+def test_loopproxy_script_and_the_run_zsh_files_put_the_wrapper_folder_first_again(shell, tmp_path):
+    """A PATH a command or the user's own startup file changed gets the run's gh wrapper folder back in
+    front (loopproxy.sh for Claude Code's Bash, the run's ZDOTDIR files for zsh); once is enough."""
+    if not shutil.which(shell):
+        pytest.skip(f"no {shell}")
+    from ttp import ghhold
+    from ttp.loopproxy import SCRIPT
+    wrap, user = tmp_path / "wrap", tmp_path / "user"
+    user.mkdir()
+    (user / ".zshrc").write_text('PATH="/opt/sys/bin:$PATH"; export PATH; USER_RC=ran\n')
+    (tmp_path / "run").mkdir()
+    zd = ghhold.zdotdir(tmp_path / "run", str(user))
+    base = {"PATH": f"/usr/bin:/bin:{wrap}", "TTP_RUN_BIN": str(wrap), "HOME": str(tmp_path)}
+    for script, extra in ((SCRIPT, {}), (zd / ".zshrc", {"ZDOTDIR": str(zd), "TTP_ZDOTDIR_ORIG": str(user)})):
+        twice = '. "$1"; ' if script == SCRIPT else ""   # loopproxy.sh runs before every command
+        out = subprocess.run([shell, "-c", twice + '. "$1"; printf "%s|%s|%s" "$PATH" "${USER_RC-}" "${ZDOTDIR-}"',
+                              "sh", str(script)], capture_output=True, text=True, env={**base, **extra}, timeout=30)
+        path, rc, zdot = out.stdout.split("|")
+        assert out.returncode == 0 and path.split(":")[0] == str(wrap), (script, out.stdout, out.stderr)
+        assert path.split(":").count(str(wrap)) == 2, "put in front once, the old entry left"
+        assert (rc, zdot) == (("ran", str(zd)) if extra else ("", "")), (script, out.stdout)
+    out = subprocess.run([shell, "-c", '. "$1"; printf %s "$PATH"', "sh", str(SCRIPT)], capture_output=True,
+                         text=True, env={"PATH": "/usr/bin:/bin"}, timeout=30)
+    assert out.stdout == "/usr/bin:/bin", "no run bin folder: PATH untouched"

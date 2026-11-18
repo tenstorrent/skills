@@ -703,14 +703,17 @@ def _read_body(path: str, stdin_text: str | None) -> str | None:
         return None
 
 
-def _form_problem(sub: str, args: list[str], stdin_text: str | None, cfg: dict | None) -> str | None:
-    """body_form_problem for the body `gh pr create|edit <args>` sets (none: --fill, an editor)."""
+def _form_problem(sub: str, args: list[str], stdin_text: str | None, cfg: dict | None,
+                  cwd: str | None = None) -> str | None:
+    """body_form_problem for the body `gh pr create|edit <args>` sets (none: --fill, an editor); a
+    relative --body-file is read from `cwd` (None: this process's)."""
     from .prbody import CREATE_VALUES, EDIT_VALUES, _scan
     opts, _ = _scan(args, CREATE_VALUES if sub == "create" else EDIT_VALUES)
     try:
         bodies = [opts[k] for k in ("--body", "-b") if k in opts]
         bodies += [b for k in ("--body-file", "-F") if k in opts
-                   for b in [_read_body(opts[k], stdin_text)] if b is not None]
+                   for b in [_read_body(opts[k] if not cwd or opts[k] in STDIN_PATHS
+                                        else os.path.join(cwd, opts[k]), stdin_text)] if b is not None]
     except ValueError as e:
         return str(e)
     return body_form_problem(bodies, _project_config() if cfg is None else cfg) if bodies else None
@@ -730,6 +733,18 @@ def _api_form_problem(args: list[str], stdin_text: str | None, cfg: dict | None)
     except prbody._Unread:
         return None   # gh cannot send what it cannot read either
     return body_form_problem(bodies, _project_config() if cfg is None else cfg)
+
+
+def form_problem(args: list[str], cwd: str | None = None, stdin_text: str | None = None,
+                 cfg: dict | None = None) -> str | None:
+    """The PR body rule (body_form_problem) for one `gh <args>` command line, before it runs: the tool
+    hook's check on every provider (hook.pre_tool_use), the same rule this wrapper applies in check().
+    A body it cannot read yet (stdin, a file the same command writes) is left to the wrapper."""
+    if args[:2] in (["pr", "create"], ["pr", "edit"]):
+        return _form_problem(args[1], args[2:], stdin_text, cfg, cwd)
+    if args[:1] == ["api"]:
+        return _api_form_problem(args[1:], stdin_text, cfg)
+    return None
 
 
 # --- reading a gh command line ----------------------------------------------------------------
@@ -1325,6 +1340,8 @@ def real_gh(own_dir: str) -> str | None:
 
 
 def main(argv: list[str], own_dir: str) -> int:
+    from . import ghhold
+    ghhold.restore(os.environ)   # the run's gh credentials, held from its agent for this wrapper only
     real = real_gh(own_dir)
     if not real:
         print("gh: not found on PATH", file=sys.stderr)

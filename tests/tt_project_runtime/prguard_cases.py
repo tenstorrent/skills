@@ -512,3 +512,126 @@ def test_workers_gh_checks_a_pr_body_from_stdin_and_passes_gh_the_same_bytes(env
         r = _gh_main(p, tmp_path, ["pr", "edit", "7", "--body-file", path], data, fake=fake)
         assert r.returncode == 0 and (tmp_path / "gh.stdin").read_bytes() == data, (path, r.stderr)
         (tmp_path / "gh.stdin").unlink()
+
+
+def _ghhold_bins(tmp_path):
+    """A stand-in harness gh wrapper and a stand-in real gh, each in its own folder."""
+    shim, real = tmp_path / "wrap", tmp_path / "sysbin"
+    for d, text in ((shim, "#!/bin/sh\n# from ttp.prguard import main\n"), (real, "#!/bin/sh\necho real\n")):
+        d.mkdir()
+        (d / "gh").write_text(text)
+        (d / "gh").chmod(0o755)
+    return shim, real
+
+
+def test_ghhold_holds_the_gh_credentials_for_the_wrapper_only_and_marks_a_path_that_skips_it(tmp_path):
+    """The agent's env carries no gh token and an empty GH_CONFIG_DIR; the wrapper's restore() puts them
+    back; git's github.com helper goes through the wrapper; a PATH whose first gh is not the wrapper marks
+    the run; with no wrapper on PATH nothing changes."""
+    from ttp import ghhold
+    shim, real = _ghhold_bins(tmp_path)
+    run = tmp_path / "run"
+    run.mkdir()
+    base = {"PATH": f"{shim}:{real}:/usr/bin", "HOME": str(tmp_path), "GH_TOKEN": "tok-a", "GITHUB_TOKEN": "tok-b",
+            "GH_CONFIG_DIR": str(tmp_path / "ghconf"), "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "user.name",
+            "GIT_CONFIG_VALUE_0": "x"}
+    out = ghhold.hold(base, run)
+    assert not {"GH_TOKEN", "GITHUB_TOKEN"} & set(out) and out["GH_CONFIG_DIR"] == str(run / ghhold.EMPTY)
+    assert not list((run / ghhold.EMPTY).iterdir()) and out[ghhold.BIN_ENV] == str(shim)
+    assert out["TTP_GH_HELD_GH_TOKEN"] == "tok-a" and out["TTP_GH_HELD_GH_CONFIG_DIR"] == str(tmp_path / "ghconf")
+    assert out["GIT_CONFIG_COUNT"] == "3" and out["GIT_CONFIG_KEY_0"] == "user.name"
+    assert out["GIT_CONFIG_KEY_1"] == out["GIT_CONFIG_KEY_2"] == "credential.https://github.com.helper"
+    assert out["GIT_CONFIG_VALUE_1"] == "" and out["GIT_CONFIG_VALUE_2"] == f"!{shim / 'gh'} auth git-credential"
+    assert (run / ghhold.ZDOT / ".zshrc").is_file() and out["ZDOTDIR"] == str(run / ghhold.ZDOT)
+    assert not ghhold.marked(str(run)) and ghhold.hold(out, run) == out, "held once"
+    back = dict(out)
+    ghhold.restore(back)
+    assert {k: back.get(k) for k in ("GH_TOKEN", "GITHUB_TOKEN", "GH_CONFIG_DIR", ghhold.HOLD_ENV)} == {
+        "GH_TOKEN": "tok-a", "GITHUB_TOKEN": "tok-b", "GH_CONFIG_DIR": str(tmp_path / "ghconf"), ghhold.HOLD_ENV: None}
+    assert not [k for k in back if k.startswith(ghhold.HELD)]
+    bare = {**base, "PATH": f"{real}:/usr/bin"}
+    assert ghhold.hold(bare, run) == bare, "no wrapper to restore them: nothing held"
+    other = tmp_path / "run2"
+    other.mkdir()
+    ghhold.hold({**base, "PATH": f"{real}:{shim}"}, other)
+    assert ghhold.marked(str(other)) and str(real / "gh") in (other / ghhold.MARK).read_text()
+
+
+def test_ghhold_wrapper_runs_the_real_gh_with_the_held_credentials(env, tmp_path):
+    """bin/gh restores what hold() held before it runs the real gh: the token the agent never saw."""
+    from ttp import ghhold
+    p = make(env)
+    fake = tmp_path / "realbin"
+    fake.mkdir()
+    (fake / "gh").write_text(f"#!{sys.executable}\nimport os\n"
+                             "print(os.environ.get('GH_TOKEN'), os.environ.get('GH_CONFIG_DIR'), "
+                             f"os.environ.get('{ghhold.HOLD_ENV}'))\n")
+    (fake / "gh").chmod(0o755)
+    run = tmp_path / "run"
+    run.mkdir()
+    agent = ghhold.hold({**os.environ, "PATH": f"{p.harness / 'bin'}:{fake}:{os.environ['PATH']}",
+                         "GH_TOKEN": "tok-held", "TTP_PROJECT": str(p.base), "TTP_PYTHON": sys.executable}, run)
+    agent.pop("PYTHONPATH", None)
+    assert "GH_TOKEN" not in agent
+    r = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True, env=agent, timeout=60)
+    assert r.stdout.split() == ["tok-held", str(os.environ.get("GH_CONFIG_DIR")), "None"], (r.stdout, r.stderr)
+    r = subprocess.run([str(fake / "gh"), "auth", "status"], capture_output=True, text=True, env=agent, timeout=60)
+    assert r.stdout.split() == ["None", str(run / ghhold.EMPTY), str(run / ghhold.EMPTY)], "around the wrapper"
+
+
+def test_hook_refuses_a_pr_body_with_internal_refs_or_over_the_cap_on_any_gh_path(env, tmp_path, monkeypatch):
+    """The tool hook applies the wrapper's PR body rule before the command runs, so a bare gh a login
+    shell's PATH resolves around the wrapper gets it too; a short plain body passes."""
+    from ttp import hook
+    p = make(env)
+    monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path))
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+
+    def why(cmd):
+        out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(tmp_path)})
+        spec = (out or {}).get("hookSpecificOutput") or {}
+        return spec.get("permissionDecisionReason", "") if spec.get("permissionDecision") == "deny" else None
+
+    long = " ".join(["word"] * 400)
+    (tmp_path / "body.md").write_text("Fixes the flaky retry; found in task #29.\n")
+    assert "internal" in why('gh pr create --draft --title t --body "Found by run 250 for task #29."')
+    assert "internal" in why("cd . && gh pr create --draft --title t --body-file body.md")
+    assert "words" in why(f'gh pr edit 7 --body "{long}"')
+    assert why('gh pr create --draft --title t --body "Retries now back off, so a slow server no longer '
+               'fails the sync."') is None
+    assert why("gh pr view 7") is None
+    assert why("/usr/bin/" + 'gh pr create --draft --title t --body "ok"'), "a path to gh is refused outright"
+
+
+def test_hook_refuses_gh_writes_in_a_run_whose_first_gh_was_not_the_wrapper(env, tmp_path, monkeypatch):
+    from ttp import ghhold, hook
+    p = make(env)
+    monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path))
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+
+    def denied(cmd):
+        out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(tmp_path)})
+        spec = (out or {}).get("hookSpecificOutput") or {}
+        return spec.get("permissionDecision") == "deny" and spec.get("permissionDecisionReason", "")
+
+    assert not denied('gh pr comment 7 --body "Looks fine now."')
+    ghhold.mark(tmp_path, "first gh on PATH: /usr/bin/gh")
+    assert "not the harness gh wrapper" in denied('gh pr comment 7 --body "Looks fine now."')
+    assert "not the harness gh wrapper" in denied("gh api -X PATCH repos/acme/widgets/pulls/7 -f title=x")
+    assert not denied("gh pr view 7") and not denied("gh api repos/acme/widgets/pulls/7")
+
+
+def test_worker_agent_env_holds_the_gh_token_behind_the_wrapper(env, monkeypatch):
+    """A worker's agent sees no gh token and an empty GH_CONFIG_DIR (the runner's hold, on every provider)."""
+    from ttp.daemon import Daemon
+    p = make(env)
+    monkeypatch.setenv("GH_TOKEN", "tok-worker")
+    monkeypatch.setenv("TTP_FAKE_SHELL", 'env > "$TTP_RUN_DIR/agent-env.txt"')
+    tid = p.db.add_task("look at the env", "s", kind="work", tier="light", origin="user")
+    d = Daemon(p.base)
+    d.dispatch()
+    _finish_runs(p, d)
+    run = pathlib.Path(p.db.one("SELECT dir FROM runs WHERE task=?", (tid,))["dir"])
+    seen = dict(line.split("=", 1) for line in (run / "agent-env.txt").read_text().splitlines() if "=" in line)
+    assert "GH_TOKEN" not in seen and seen.get("GH_CONFIG_DIR") == str(run / "gh-empty"), seen.get("GH_CONFIG_DIR")
+    assert seen.get("TTP_RUN_BIN") == str(p.harness / "bin") and seen.get("ZDOTDIR") == str(run / "zdotdir")

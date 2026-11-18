@@ -60,7 +60,7 @@ import time
 import traceback
 from pathlib import Path
 
-from . import glmguard, glmharness, loopproxy, poll_s, project, serverhealth
+from . import ghhold, glmguard, glmharness, loopproxy, poll_s, project, serverhealth
 from .project import Project, durable_write, lower_priority
 
 LEASE_EVERY_S = 30
@@ -583,6 +583,8 @@ def supervise(run_dir: Path) -> int:
     env = {**os.environ, **_env_files(spec), **env_extra}
     # A proxy on `localhost` as 127.0.0.1 (loopproxy): in memory only, the values may carry credentials.
     env.update(loopproxy.fixed(env))
+    # gh credentials only through the run's gh wrapper, on every provider (ghhold.py)
+    env = ghhold.hold(env, run_dir)
     if spec.get("waits_idle"):   # its hook turns wait calls back to a waiting hand-off (hook.idle_wait)
         env[WAITS_IDLE_ENV] = "1"
     lease, out_path = run_dir / "lease", run_dir / "output.jsonl"

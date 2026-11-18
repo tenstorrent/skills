@@ -477,7 +477,7 @@ HTTP_CLIENT_RE = re.compile(r"\b(?:curl|wget|httpie|http|xh|python3?|node|ruby|p
                             r"|aiohttp|axios|octokit|Octokit)\b(?!:)")
 GITHUB_API_RE = re.compile(r"api\.github\.com|/api/v3\b|/graphql\b|\bGITHUB_(?:API|GRAPHQL)_URL\b", re.I)
 # A token gh would use, sent by hand to a GitHub API path
-TOKEN_API_RE = re.compile(r"\b(?:GH_TOKEN|GITHUB_TOKEN|GH_ENTERPRISE_TOKEN|GITHUB_ENTERPRISE_TOKEN)\b")
+TOKEN_API_RE = re.compile(r"\b(?:TTP_GH_HELD_\w+|GH_TOKEN|GITHUB_TOKEN|GH_ENTERPRISE_TOKEN|GITHUB_ENTERPRISE_TOKEN)\b")
 API_PATH_RE = re.compile(r"/repos/|\bgraphql\b", re.I)
 DRAFT_CHANGE_RE = re.compile(r"markPullRequestReadyForReview|createPullRequest|[\"']?draft[\"']?\s*[=:]\s*false",
                              re.I)
@@ -1458,6 +1458,8 @@ def _pre_tool_use(payload: dict) -> tuple[dict | None, None]:
     if not why:
         from . import killguard
         why = killguard.refusal(cmd, str(payload.get("cwd") or os.getcwd()))
+    if not why:   # a PR body's form, and gh writes where the first gh is not the wrapper (ghhold.py)
+        why = gh_form(segments, str(payload.get("cwd") or os.getcwd()))
     if not why:   # a curl or wget post to others (aitag)
         from . import aitag
         why = aitag.http_problem(segments, str(payload.get("cwd") or os.getcwd()))
@@ -1494,6 +1496,25 @@ def _pre_tool_use(payload: dict) -> tuple[dict | None, None]:
         out = {"hookEventName": "PreToolUse", **({"additionalContext": hint} if hint else {})}
         return ({"hookSpecificOutput": out} if len(out) > 1 else None), None
     return _deny(why), None
+
+
+def gh_form(segments: list[list[str]], cwd: str) -> str | None:
+    """Why a gh command in `segments` must not run, checked before it runs on every provider whose tool
+    hook runs, so a gh reached around the wrapper is held to the same rule: a PR body's form
+    (prguard.form_problem, the wrapper's own rule), and, in a run whose first gh was not the wrapper,
+    any gh write (ghhold.marked_refusal)."""
+    from . import ghhold, prguard
+    if why := ghhold.marked_refusal(segments):
+        return why
+    for s in segments:
+        if s and os.path.basename(s[0]) == "gh":
+            try:
+                why = prguard.form_problem(s[1:], cwd)
+            except Exception:   # the wrapper checks it again when it runs
+                why = None
+            if why:
+                return why
+    return None
 
 
 def local_guard(payload: dict) -> str | None:

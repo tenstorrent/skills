@@ -59,4 +59,9 @@ if [ -n "${TTP_PREV_CLAUDE_ENV_FILE-}" ] && [ -r "$TTP_PREV_CLAUDE_ENV_FILE" ]; 
   TTP_PREV_CLAUDE_ENV_FILE=$_ttp_p; export TTP_PREV_CLAUDE_ENV_FILE
   unset _ttp_p
 fi
+# The harness gh wrapper's folder first on PATH again, whatever the user's shell setup put in front of it
+# (ghhold.py): a bare `gh` stays the wrapper.
+if [ -n "${TTP_RUN_BIN-}" ]; then
+  case ":$PATH" in ":$TTP_RUN_BIN:"*) ;; *) PATH="$TTP_RUN_BIN:$PATH"; export PATH ;; esac
+fi
 unset _ttp_v _ttp_x _ttp_s _ttp_r _ttp_a _ttp_u _ttp_h _ttp_l
