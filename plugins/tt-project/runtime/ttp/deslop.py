@@ -4,8 +4,9 @@
 
 `ensure` (hourly, from the daemon) adds or removes the schedule. Each pass (`plan`, called by the daemon's
 schedule run, model-free) scans the project's base branch (slop.py), records the numbers against the
-targets, skips every subsystem refactored within `deslop.gap_days`, picks the worst of the rest and returns
-the spec of one refactor code task. No pass runs while the project is paused, and none queues a second task
+targets, skips every subsystem refactored within `deslop.gap_days`, picks the worst of the rest (narrowed to
+its worst part while it is over `deslop.max_pass_lines`, slop.pass_target) and returns the spec of one refactor
+code task. No pass runs while the project is paused, and none queues a second task
 while the last one is open (the schedule's own one-open-run rule). The task's spec tells its worker to
 change no behaviour, keep the tests green, respect holds, change freezes and settled areas, and never run
 device or machine work; its review compares the before and after numbers the spec carries.
@@ -25,6 +26,7 @@ KEY = "deslop"
 KEEP_PASSES = 20
 PAYLOAD = {"kind": "code", "tier": "standard", "priority": 4, "deslop": True, "skip_if_idle": False}
 DESCRIPTION = "Periodic de-slop pass: one no-behaviour-change refactor of the subsystem furthest over its code-quality targets"
+OFF_SKIP = "skipped: deslop.enabled is off"
 ROW_KEYS = ("lines", "duplicates", "globals", "magic", "magic_per_kloc", "long_functions", "fn_max", "noise_share")
 
 
@@ -38,9 +40,10 @@ def settings(cfg: dict) -> dict:
 
 def ensure(p, db, on: bool, every: str) -> str:
     """Keep the schedule on, every `every`, while `on`; off otherwise. Returns what changed ('' none).
-    A schedule that never ran is due at once, once: the first pass is not a whole `every` away."""
+    A schedule that never made a pass is due at once, once: the first pass is not a whole `every` away, nor is
+    it after a run that only skipped because the flag was off."""
     from . import schedule as sched, timefmt
-    row = db.one("SELECT enabled, every_s, payload, last_run FROM schedules WHERE name=?", (SCHEDULE,))
+    row = db.one("SELECT enabled, every_s, payload, last_run, last_status FROM schedules WHERE name=?", (SCHEDULE,))
     if not on and not (row and row["enabled"]):
         return ""
     did = ""
@@ -54,7 +57,9 @@ def ensure(p, db, on: bool, every: str) -> str:
         sched.set_enabled(db, SCHEDULE, False, home=timefmt.home(p))
         did = "off"
     state = db.kv(KEY, {}) or {}
-    if on and not state.get("kicked") and not (row and row["last_run"]):
+    ran = float(row["last_run"] or 0) if row else 0.0
+    off_skip = bool(row) and str(row["last_status"] or "").startswith(OFF_SKIP)
+    if on and not state.get("passes") and (not ran or off_skip) and float(state.get("kicked") or 0) <= ran:
         db.x("UPDATE schedules SET next_run=? WHERE name=?", (time.time(), SCHEDULE))
         db.set_kv(KEY, {**state, "kicked": time.time()})
         did = did or "due"
@@ -66,9 +71,12 @@ def ensure(p, db, on: bool, every: str) -> str:
     return did
 
 
+def _pass_row(sub: dict, thresholds: dict) -> dict:
+    return {**{k: sub.get(k, 0) for k in ROW_KEYS}, "excess": slop.excess(sub, thresholds)}
+
+
 def _rows(rep: dict, thresholds: dict) -> dict:
-    return {n: {**{k: s.get(k, 0) for k in ROW_KEYS}, "excess": slop.excess(s, thresholds)}
-            for n, s in rep["subsystems"].items()}
+    return {n: _pass_row(s, thresholds) for n, s in rep["subsystems"].items()}
 
 
 def _base(p) -> str | None:
@@ -88,9 +96,14 @@ def _numbers(row: dict, c: dict) -> str:
             f"(target {t['noise_share']})")
 
 
-def spec(p, c: dict, sub: str, row: dict, ref: str | None) -> str:
+def _settled_files(p) -> set[str]:
+    """The files of the project's live settled areas: never a pass's target."""
     from . import settled
-    frozen = [f for r in settled.live(p) for f in r.get("files") or []]
+    return {f for r in settled.live(p) for f in r.get("files") or []}
+
+
+def spec(p, c: dict, sub: str, row: dict, ref: str | None) -> str:
+    frozen = _settled_files(p)
     lines = [
         f"Goal: one de-slop refactor of the subsystem `{sub}`, chosen by the model-free scan (`ttp slop {p.name}`) "
         "as the one furthest over its code-quality targets and not refactored lately. No behaviour change.",
@@ -107,8 +120,8 @@ def spec(p, c: dict, sub: str, row: dict, ref: str | None) -> str:
         + "; if the subsystem is frozen, do nothing and say so in the hand-off. Never run device or machine work. "
         "Leave generated copies and vendored code alone. Run only the affected tests while iterating, then the "
         "project's checks once.",
-        f"Hand-off: the before and after numbers of `{sub}` (run `ttp slop {p.name} --ref <head>` and read its "
-        "row) and the commits. Its review checks those numbers and fails a change whose numbers did not improve "
+        f"Hand-off: the before and after numbers of `{sub}` (run `ttp slop {p.name} --ref <head> --subsystem {sub}` "
+        "and read its row) and the commits. Its review checks those numbers and fails a change whose numbers did not improve "
         "or that changed behaviour.",
     ]
     return "\n\n".join(lines)
@@ -120,23 +133,24 @@ def plan(p, cfg: dict, now: float | None = None) -> dict | str:
     now = time.time() if now is None else now
     c, db = settings(cfg), p.db
     if not c["enabled"]:
-        return "skipped: deslop.enabled is off"
+        return OFF_SKIP
     if projpause.current(db):
         return "skipped: the project is paused"
     ref = _base(p)
-    rep = slop.scan(p.root, ref, c, None, str(p.state / "slop-cache.json"))
-    rows = _rows(rep, c["thresholds"])
+    infos = slop.scan_files(p.root, ref, c, None, str(p.state / "slop-cache.json"))
+    rows = _rows(slop.aggregate(infos, c), c["thresholds"])
     state = db.kv(KEY, {}) or {}
     state["last_scan"] = {"at": now, "ref": ref, "subsystems": rows}
     state.setdefault("baseline", state["last_scan"])
     recent = {x.get("subsystem") for x in state.get("passes") or [] if now - float(x.get("at") or 0) < c["gap_days"] * 86400}
-    pick = slop.choose(rep, c, recent)
+    pick = slop.pass_target(infos, c, recent | _settled_files(p))
     db.set_kv(KEY, state)
     if not pick:
         return "skipped: every subsystem is under its targets or was refactored lately"
-    sub, excess = pick
-    return {"title": f"[{SCHEDULE}] refactor {sub}: {excess} over targets, no behaviour change", "spec": spec(p, c, sub, rows[sub], ref),
-            "subsystem": sub, "ref": ref, "row": rows[sub], "excess": excess}
+    sub, excess, numbers = pick
+    row = _pass_row(numbers, c["thresholds"])
+    return {"title": f"[{SCHEDULE}] refactor {sub}: {excess} over targets, no behaviour change", "spec": spec(p, c, sub, row, ref),
+            "subsystem": sub, "ref": ref, "row": row, "excess": excess}
 
 
 def record(db, picked: dict, task: int, now: float | None = None) -> None:

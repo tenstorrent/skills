@@ -2456,7 +2456,9 @@ def cmd_slop(a) -> None:
     p = need(a.name, sys.argv[1:]) if a.name else here()
     if not p:
         die("no tt-project project here; name one: `ttp slop <name>`")
-    cfg = p.config().get("deslop") or {}
+    cfg = dict(p.config().get("deslop") or {})
+    if a.subsystem:
+        cfg["subsystems"] = [*a.subsystem, *(cfg.get("subsystems") or [])]
     cache = str(p.state / "slop-cache.json")
     try:
         if a.diff:
@@ -2469,13 +2471,13 @@ def cmd_slop(a) -> None:
                 return
             print("\n".join(slop.delta_lines(d, show=20) or ["the change adds none of what the scan counts"]))
             return
+        if a.next:
+            pick = slop.pass_target(slop.scan_files(p.root, a.ref, cfg, a.paths or None, cache), cfg)
+            print(json.dumps({"subsystem": pick[0], "excess": pick[1]} if pick else {"subsystem": None}))
+            return
         rep = slop.scan(p.root, a.ref, cfg, a.paths or None, cache)
     except RuntimeError as e:
         die(f"slop: {e}")
-    if a.next:
-        pick = slop.choose(rep, cfg)
-        print(json.dumps({"subsystem": pick[0], "excess": pick[1]} if pick else {"subsystem": None}))
-        return
     print(slop.dump(rep) if a.json else slop.text(rep, cfg))
 
 
@@ -16276,7 +16278,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--ref", help="a commit or branch to scan (default: the working tree)")
     s.add_argument("--paths", nargs="+", metavar="GLOB", help="scan only files matching these globs")
     s.add_argument("--diff", metavar="BASE..HEAD", help="the numbers a change adds, new duplicates and incident-style comments")
-    s.add_argument("--next", action="store_true", help="print the subsystem a de-slop pass would refactor (JSON)")
+    s.add_argument("--subsystem", nargs="+", metavar="PATH", help="count these directories or files as subsystems "
+                                                                  "of their own (a de-slop pass's target)")
+    s.add_argument("--next", action="store_true", help="print the subsystem or part a de-slop pass would refactor (JSON)")
     s.add_argument("--json", action="store_true", help="print JSON")
     s.set_defaults(fn=cmd_slop)
 

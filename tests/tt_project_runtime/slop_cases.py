@@ -191,3 +191,48 @@ def test_a_deslop_schedule_that_never_ran_is_due_once_not_a_whole_period_away(en
     assert deslop.ensure(p, p.db, True, "1d") == "" and nxt() > time.time() + 80000, "pulled forward twice"
     p.db.set_kv(deslop.KEY, {})   # a schedule made before this rule: never ran, never kicked
     assert deslop.ensure(p, p.db, True, "1d") == "due" and nxt() <= time.time()
+
+
+def test_a_deslop_pass_narrows_a_subsystem_too_large_for_one_pass_to_its_worst_part(tmp_path):
+    from ttp import slop
+    pad = "".join(f"def g{i}(x):\n    return x\n" for i in range(30))
+    root = _slop_repo(tmp_path, {
+        "big/a/x.py": CHOOSER + "\n_cache = {}\nseen = []\nready = set()\nmore = []\nlast = {}\nnext_ = []\n" + pad,
+        "big/a/y.py": pad.replace("def g", "def h"),
+        "big/b/z.py": pad.replace("def g", "def k"),
+        "big/c.py": CHOOSER.replace("choose_box", "pick_box") + pad.replace("def g", "def m"),
+    })
+    infos = slop.scan_files(root)
+    assert slop.pass_target(infos, {"max_pass_lines": 0})[0] == "big"            # 0: the whole subsystem
+    sub, excess, numbers = slop.pass_target(infos, {"max_pass_lines": 50})
+    assert sub == "big/a/x.py" and excess > 0 and numbers["globals"] == 6, (sub, numbers)   # a file is the floor
+    assert slop.pass_target(infos, {"max_pass_lines": 50}, {"big/a/x.py"})[0] == "big/a"   # nothing worse under it: the part above
+    assert slop.pass_target(infos, {"max_pass_lines": 10 ** 6})[0] == "big"
+
+
+def test_the_deslop_pass_queues_the_part_and_its_spec_names_how_to_rescan_it(env, monkeypatch):
+    from ttp import deslop
+    p, dm, s = _deslop_project(env, monkeypatch)
+    dm.cfg["deslop"] = {"enabled": True, "max_pass_lines": 50}
+    assert dm._schedule_llm(s, dict(deslop.PAYLOAD)) == "queued"
+    (task,) = _deslop_tasks(p)
+    sub = p.db.kv("deslop")["passes"][-1]["subsystem"]
+    assert sub in ("pkg/a.py", "pkg/b.py") and task["title"].startswith(f"[deslop] refactor {sub}:"), task["title"]
+    assert f"--subsystem {sub}" in task["spec"], task["spec"]
+
+
+def test_a_deslop_schedule_whose_only_run_skipped_while_off_is_due_once_when_on(env):
+    import time
+    from ttp import deslop
+    p = make(env)
+    nxt = lambda: p.db.one("SELECT next_run FROM schedules WHERE name='deslop'")["next_run"]   # noqa: E731
+    assert deslop.ensure(p, p.db, True, "1d") == "on"
+    ran = p.db.kv(deslop.KEY)["kicked"] + 0.001   # the run after the first kick, which skipped: the flag was off then
+    p.db.x("UPDATE schedules SET last_run=?, last_status=?, next_run=? WHERE name='deslop'",
+           (ran, deslop.OFF_SKIP, ran + 86400))
+    assert deslop.ensure(p, p.db, True, "1d") == "due" and nxt() <= time.time() + 1, "a skip stamp counted as a pass"
+    p.db.x("UPDATE schedules SET next_run=? WHERE name='deslop'", (time.time() + 86400,))
+    assert deslop.ensure(p, p.db, True, "1d") == "", "pulled forward twice"
+    p.db.set_kv(deslop.KEY, {"passes": [{"at": ran, "subsystem": "pkg", "task": 1}]})
+    p.db.x("UPDATE schedules SET last_run=?, last_status=? WHERE name='deslop'", (time.time() + 5, deslop.OFF_SKIP))
+    assert deslop.ensure(p, p.db, True, "1d") == "", "a project with a pass on record waits for its period"

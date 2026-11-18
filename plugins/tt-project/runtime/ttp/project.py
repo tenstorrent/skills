@@ -731,7 +731,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # are always on; `enabled` turns on the daily `deslop` schedule that queues one refactor task for the
     # worst subsystem. subsystems: path prefixes (default: the top-level directories); thresholds: the targets
     # a pass works toward; step_share: the share of an over-target number a pass cuts; gap_days: how long a
-    # refactored subsystem is left alone; exclude: path globs left out of the scan.
+    # refactored subsystem is left alone; max_pass_lines: a larger subsystem's pass takes its worst part;
+    # exclude: path globs left out of the scan.
     "deslop": copy.deepcopy(slop.DEFAULTS),
 }
 

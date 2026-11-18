@@ -37,6 +37,7 @@ The daily review's quality line quotes the scan numbers per subsystem.
 | `enabled` | false | the periodic pass below |
 | `every` | 1d | how often the pass runs |
 | `gap_days` | 3 | a subsystem refactored within this many days is skipped |
+| `max_pass_lines` | 20000 | a pass on a larger subsystem takes its worst directory or file instead, one level down at a time (0: the whole subsystem) |
 | `step_share` | 0.2 | each pass cuts an over-target number by this share, or to its target |
 | `subsystems` | [] | paths that count as subsystems (empty: the repo's top-level directories) |
 | `exclude` | [] | globs left out of every scan |
@@ -46,9 +47,10 @@ The daily review's quality line quotes the scan numbers per subsystem.
 ## The periodic pass (`deslop.enabled`)
 
 With `deslop.enabled` on, the daemon keeps the llm schedule `deslop` (every `deslop.every`, default 1d); off removes it.
-Each pass is model-free until the task is queued: it scans the base branch, records the numbers against the targets, skips the subsystems refactored within `gap_days`, and picks the worst of the rest.
+Each pass is model-free until the task is queued: it scans the base branch, records the numbers against the targets, skips the subsystems refactored within `gap_days` and the files of live settled areas, and picks the worst of the rest. While that pick is over `max_pass_lines`, it takes the worst directory or file one level down instead, so one pass stays a reviewable change.
 It then queues one code task for that subsystem: no behaviour change, the existing tests unchanged and green, each over-target number cut by `step_share` or to its target, every hold, pause, change freeze and settled area respected, no device or machine work.
 The task's spec carries the before numbers; its review checks them against the after numbers and fails a change that did not improve them or changed behaviour.
 No pass runs while the project is paused or while the previous task is open.
-The newest scans and passes are in the project's `deslop` state (`ttp status` shows the schedule; `ttp slop <project> --next` shows the pick).
+A schedule that has made no pass yet is due at once when the flag turns on, also after runs that only skipped while it was off.
+The newest scans and passes are in the project's `deslop` state (`ttp status` shows the schedule; `ttp slop <project> --next` shows the pick; `--subsystem <path>` gives a part its own row).
 Roll it out one project at a time: turn it on, let the first passes land clean for a day, then the next project.

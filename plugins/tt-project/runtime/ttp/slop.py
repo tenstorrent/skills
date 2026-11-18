@@ -42,6 +42,7 @@ DEFAULTS = {
     "subsystems": [],            # [] = the top-level directories; else path prefixes, each one subsystem
     "max_function_lines": 80,
     "gap_days": 3,               # a subsystem refactored within this many days is skipped
+    "max_pass_lines": 20000,     # a pass takes a part of a larger subsystem (pass_target); 0 = the whole subsystem
     "step_share": 0.2,           # each pass cuts an over-threshold number by this share, or to its threshold
     "thresholds": {"duplicates": 0, "globals": 5, "magic_per_kloc": 15.0, "long_functions": 0,
                    "noise_share": 0.1},
@@ -462,13 +463,21 @@ def aggregate(infos: list[_Info], cfg: dict | None = None) -> dict:
     return {"subsystems": dict(sorted(res.items())), "duplicate_groups": sorted(dups, key=lambda d: (d["kind"], d["name"]))}
 
 
-def scan(root, ref: str | None = None, cfg: dict | None = None, paths: list[str] | None = None,
-         cache: str | None = None) -> dict:
-    """The report for `ref` (default: the working tree). `cache`: a JSON file keeping each analyzed blob."""
+def scan_files(root, ref: str | None = None, cfg: dict | None = None, paths: list[str] | None = None,
+         cache: str | None = None) -> list[_Info]:
+    """The scanned files of `ref` (default: the working tree). `cache`: a JSON file keeping each analyzed blob."""
     c = {**DEFAULTS, **(cfg or {})}
     _load(cache)
     infos = read_tree(root, ref, paths, list(c["exclude"] or []), int(c["max_function_lines"]))
     _save(cache)
+    return infos
+
+
+def scan(root, ref: str | None = None, cfg: dict | None = None, paths: list[str] | None = None,
+         cache: str | None = None) -> dict:
+    """The report for `ref` (default: the working tree). `cache`: a JSON file keeping each analyzed blob."""
+    c = {**DEFAULTS, **(cfg or {})}
+    infos = scan_files(root, ref, c, paths, cache)
     rep = aggregate(infos, c)
     rep["ref"] = ref or "working tree"
     rep["noisy"] = [{"at": f"{i.path}:{ln}", "text": t[:120]} for i in infos for ln, t in i.noisy]
@@ -491,6 +500,32 @@ def choose(rep: dict, cfg: dict | None = None, skip: set[str] | None = None) -> 
             if n not in (skip or set()) and n != "(root)" and s["lines"] >= 50]
     rows = [r for r in rows if r[0] > 0]
     return (max(rows)[1], max(rows)[0]) if rows else None
+
+
+def _one_level_down(paths: list[str], sub: str) -> list[str]:
+    """One level under `sub`: each directory there and each file directly in it."""
+    depth = len(PurePosixPath(sub).parts) + 1
+    return sorted({"/".join(PurePosixPath(p).parts[:depth]) for p in paths if p.startswith(sub + "/")})
+
+
+def pass_target(infos: list[_Info], cfg: dict | None = None, skip: set[str] | None = None) -> tuple[str, float, dict] | None:
+    """What one de-slop pass takes: the subsystem `choose` picks and, while it is over `max_pass_lines`, its worst
+    directory or file one level down that is not in `skip`, as (path, excess, numbers). A single file is the floor."""
+    c = {**DEFAULTS, **(cfg or {})}
+    limit = int(c.get("max_pass_lines") or 0)
+    rep = aggregate(infos, c)
+    pick = choose(rep, c, skip)
+    while pick and limit and rep["subsystems"][pick[0]]["lines"] > limit:
+        parts = _one_level_down([i.path for i in infos], pick[0])
+        if not parts:
+            break
+        inner = aggregate(infos, {**c, "subsystems": parts})
+        inner["subsystems"] = {n: s for n, s in inner["subsystems"].items() if n in parts}
+        deeper = choose(inner, c, skip)
+        if not deeper:
+            break
+        rep, pick = inner, deeper
+    return (pick[0], pick[1], rep["subsystems"][pick[0]]) if pick else None
 
 
 def delta(root, base: str, head: str, cfg: dict | None = None, cache: str | None = None,

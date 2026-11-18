@@ -910,7 +910,7 @@ coordinator with that evidence.
   unreachable hosts and code and review tasks are exempt. Each close registers one reopen watch:
   the same probe every 6 h for 14 days, off the tick; its first pass queues one `reopens:<id>`
   follow-up with the closed task's spec.
-- De-slop (slop.py, `ttp slop <project> [--paths <glob>] [--diff <base>..<head>] [--next] [--json]`), model-free:
+- De-slop (slop.py, `ttp slop <project> [--paths <glob>] [--subsystem <path>] [--diff <base>..<head>] [--next] [--json]`), model-free:
   per subsystem (a top-level directory of the code repo, or `deslop.subsystems`) it counts duplicate rules (same-name
   functions in more than one place, near-duplicate bodies by normalized syntax tree), module-level mutable state, magic
   numbers (timing literals apart), function length (max, p90, count over `deslop.max_function_lines`) and comment
@@ -923,11 +923,13 @@ coordinator with that evidence.
   The periodic pass (deslop.py) is the llm schedule `deslop`, on only while `deslop.enabled` is true (default off;
   the daemon checks the flag hourly and adds or removes the schedule, every `deslop.every`, default 1d). Each pass
   scans the base branch, records the numbers against the targets (kv `deslop`: baseline, newest scan, past passes),
-  skips every subsystem refactored within `deslop.gap_days` (3), picks the one furthest over its targets and queues
-  one code task: no behaviour change, tests unchanged and green, each over-target number cut by `deslop.step_share`
+  skips every subsystem refactored within `deslop.gap_days` (3) and the files of live settled areas, picks the one
+  furthest over its targets (one over `deslop.max_pass_lines`, 20000, narrowed to its worst directory or file, one
+  level down at a time) and queues one code task: no behaviour change, tests unchanged and green, each over-target number cut by `deslop.step_share`
   (20%) or to its target, charter holds, change freezes and settled areas respected, no device or machine work. Its
   review compares the before and after numbers the spec carries. No pass runs while the project is paused or while
-  the last one is open.
+  the last one is open. A schedule with no pass yet is due at once when the flag turns on, also after runs that
+  only skipped while it was off.
 - Landing time breakdown (landings.py, `ttp landings [--days N] [--from <date>] [--top N] [--json]`),
   model-free from the task, run, event, push-queue and checks records. For each task that landed, the wall
   time from creation to landing is split by cause, each second counted once: queue before the first run,
