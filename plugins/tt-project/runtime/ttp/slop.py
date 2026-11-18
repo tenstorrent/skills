@@ -107,7 +107,8 @@ def _noisy(text: str) -> bool:
 
 class _Info:
     """What one file adds to the scan; cached by blob id, so a delta rereads only what changed."""
-    __slots__ = ("path", "test", "lines", "funcs", "globals", "magic", "timing", "fn_lengths", "comments", "noisy", "hashes")
+    __slots__ = ("path", "test", "lines", "funcs", "globals", "magic", "timing", "fn_lengths", "comments", "noisy", "hashes",
+                 "error")
 
     def __init__(self, path: str, test: bool):
         self.path, self.test = path, test
@@ -120,6 +121,7 @@ class _Info:
         self.comments = 0
         self.noisy: list[tuple[int, str]] = []
         self.hashes: list[tuple[str, str, int, int]] = []  # (hash, name, line, size)
+        self.error = ""   # why the file could not be parsed: its counters are then None (unknown), never 0
 
 
 def _body(fn) -> list:
@@ -162,7 +164,9 @@ def _scan_py(path: str, text: str, max_lines: int) -> _Info:
     info.lines = sum(1 for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#"))
     try:
         tree = ast.parse(text)
-    except (SyntaxError, ValueError, RecursionError):
+    except (SyntaxError, ValueError, RecursionError) as e:
+        info.error = f"{type(e).__name__}: {e}"[:200]
+        info.globals = info.magic = info.timing = info.comments = None
         return info
     doc_lines: set[int] = set()
     try:
@@ -302,7 +306,7 @@ def _scan_lines(path: str, text: str, ext: str) -> _Info:
 
 _CACHE: dict[tuple, _Info] = {}
 _CACHE_MAX = 20000
-VERSION = 1   # bump with a change to what a file's scan records: older cache files are ignored
+VERSION = 2   # bump with a change to what a file's scan records: older cache files are ignored
 _loaded: set[str] = set()
 
 
@@ -440,6 +444,9 @@ def aggregate(infos: list[_Info], cfg: dict | None = None) -> dict:
                                                   "magic_timing": 0, "fn_lengths": [], "comments": 0, "noisy": 0})
         s["files"] += 1
         s["lines"] += i.lines
+        if getattr(i, "error", ""):   # unparsed: its counters are unknown, named instead of counted as 0
+            s.setdefault("unparsed", []).append(f"{i.path}: {i.error}")
+            continue
         s["globals"] += 0 if i.test else i.globals
         s["magic"] += 0 if i.test else i.magic
         s["magic_timing"] += 0 if i.test else i.timing
@@ -460,6 +467,8 @@ def aggregate(infos: list[_Info], cfg: dict | None = None) -> dict:
                      "long_functions": sum(1 for n in ls if n > maxl),
                      "comment_lines": s["comments"], "noisy_lines": s["noisy"],
                      "noise_share": round(s["noisy"] / s["comments"], 3) if s["comments"] else 0.0}
+        if s.get("unparsed"):
+            res[name]["unparsed"] = s["unparsed"]
     return {"subsystems": dict(sorted(res.items())), "duplicate_groups": sorted(dups, key=lambda d: (d["kind"], d["name"]))}
 
 
@@ -481,6 +490,7 @@ def scan(root, ref: str | None = None, cfg: dict | None = None, paths: list[str]
     rep = aggregate(infos, c)
     rep["ref"] = ref or "working tree"
     rep["noisy"] = [{"at": f"{i.path}:{ln}", "text": t[:120]} for i in infos for ln, t in i.noisy]
+    rep["parse_errors"] = [{"path": i.path, "error": i.error} for i in infos if i.error]
     return rep
 
 

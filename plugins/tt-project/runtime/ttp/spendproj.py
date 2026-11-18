@@ -7,7 +7,9 @@ reach time later than the reset is ever printed. Without a known reset (a rollin
 says so and projects nothing. The coordinator quotes this line from STATE instead of computing one.
 
 The rate: the slope of the recent readings of a running total (`trail`, at most TRAIL_S old), else
-the period's average since its start."""
+the period's average since its start. An estimated part of the total (another machine's local-log
+estimate of its other sessions) counts only at its period average (`split_rate`): a one-off jump
+in an estimate, when its logs are first read or re-read, is never taken for a rate."""
 from __future__ import annotations
 
 from . import timefmt
@@ -44,6 +46,19 @@ def rate(readings, spent: float, now: float, start: float | None = None) -> floa
     if start is not None and now - start >= TRAIL_MIN_S:
         return max(spent, 0.0) / ((now - start) / HOUR)
     return None
+
+
+def split_rate(prev, spent: float, estimated: float, now: float, start: float | None = None
+               ) -> tuple[list[list[float]], float | None]:
+    """(trail, dollars per hour) for a total `spent` of which `estimated` is an estimate: the trail and
+    its slope follow the measured part only, the estimated part adds its average since `start`. None
+    when neither can be measured."""
+    est = min(max(float(estimated or 0), 0.0), max(spent, 0.0))
+    measured = max(spent - est, 0.0)
+    got = trail(prev, measured, now, start)
+    per_h = rate(got, measured, now, start)
+    est_h = rate(None, est, now, start) if est else None
+    return got, (None if per_h is None and est_h is None else (per_h or 0.0) + (est_h or 0.0))
 
 
 def line(spent: float, cap: float, per_h: float | None, reset_at: float | None, now: float, where) -> str:

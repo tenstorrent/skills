@@ -688,11 +688,11 @@ def _global(db: DB, g: Gate, b: dict, provider: str, day: tuple[float, float] | 
     g.numbers.update({"global_today": round(t["usd"], 2), "global_cap": cap, "global_stale": t["stale"],
                       "global_includes": t["includes"], "global_resets_at": end if day else None,
                       **{f"global_{k}": round(t.get(k) or 0, 2) for k in ("plan_usd", "unbilled_usd", "stale_usd")}})
-    # The burn rate for the reach-the-cap projection (spendproj): this total's recent readings, kept
-    # in the saved gate across ticks.
+    # The burn rate for the reach-the-cap projection (spendproj): the measured part's recent readings,
+    # kept in the saved gate across ticks, plus the estimated sessions' average (split_rate).
     prev = ((db.kv("gates", {}) or {}).get(provider) or {}).get("numbers") or {}
-    g.numbers["global_trail"] = spendproj.trail(prev.get("global_trail"), t["usd"], now, start)
-    per_h = spendproj.rate(g.numbers["global_trail"], t["usd"], now, start)
+    g.numbers["global_trail"], per_h = spendproj.split_rate(prev.get("global_trail"), t["usd"],
+                                                            t.get("remote_sessions_usd") or 0, now, start)
     g.numbers["global_per_h"] = None if per_h is None else round(per_h, 2)
     if t["usd"] >= cap:
         when = f"; new work resumes at the reset in {max(end - now, 0) / HOUR:.1f} h" if day else ""

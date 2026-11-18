@@ -236,3 +236,16 @@ def test_a_deslop_schedule_whose_only_run_skipped_while_off_is_due_once_when_on(
     p.db.set_kv(deslop.KEY, {"passes": [{"at": ran, "subsystem": "pkg", "task": 1}]})
     p.db.x("UPDATE schedules SET last_run=?, last_status=? WHERE name='deslop'", (time.time() + 5, deslop.OFF_SKIP))
     assert deslop.ensure(p, p.db, True, "1d") == "", "a project with a pass on record waits for its period"
+
+
+def test_slop_scan_reports_a_file_it_cannot_parse_with_null_counters_and_the_error(tmp_path):
+    """upstream note 573d7f75c2361ee7: a parse error is no clean file of zero counters."""
+    from ttp import slop
+    info = slop._scan_py("pkg/broken.py", "def f(:\n    X = []\n", 80)
+    assert info.error.startswith("SyntaxError") and info.globals is None and info.magic is None
+    assert info.comments is None and info.timing is None
+    root = _slop_repo(tmp_path, {"pkg/broken.py": "def f(:\n    pass\n", "pkg/ok.py": CHOOSER})
+    rep = slop.scan(root, "HEAD", {"subsystems": ["pkg"]})
+    assert [e["path"] for e in rep["parse_errors"]] == ["pkg/broken.py"]
+    sub = rep["subsystems"]["pkg"]
+    assert sub["files"] == 2 and sub["unparsed"][0].startswith("pkg/broken.py: SyntaxError")

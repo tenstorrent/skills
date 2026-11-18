@@ -5254,6 +5254,27 @@ def test_the_burn_rate_is_the_recent_slope_else_the_periods_average():
     assert spendproj.rate([], 5.0, now, None) is None and spendproj.trail("junk", 1.0, now) == [[now, 1.0]]
 
 
+def test_a_one_off_jump_in_an_estimated_source_is_never_taken_for_a_rate():
+    """Measured spend at $86/h; another machine's estimate of its other sessions jumps $370 in one
+    reading (its logs read at last). The rate stays the measured slope plus the estimate's average
+    over the period, so no false 'reaches the cap' line; the plain trail would have read ~$450/h."""
+    from ttp import spendproj
+    now, reset = _proj_now()
+    start = now - 23.6 * 3600
+    t, per_h = [], None
+    for i, usd in enumerate((1200.0, 1221.5, 1243.0, 1264.5, 1286.0)):   # +$21.5 per 15 min, measured
+        est = 370.0 if i == 4 else 0.0
+        t, per_h = spendproj.split_rate(t, usd + est, est, now - (4 - i) * 900, start)
+    assert per_h == pytest.approx(86.0 + 370.0 / 23.6)
+    assert t[-1][1] == 1286.0   # the trail keeps the measured part only
+    assert "reaches the cap" not in spendproj.line(1656.0, 3000.0, per_h, reset, now, _PROJ_ZONE)
+    raw = spendproj.rate([[r[0], r[1]] for r in t[:-1]], 1656.0, now, start)
+    assert raw > 400   # what the old projection read
+    # Without an estimate it is the plain slope; an estimate larger than the total is clamped.
+    assert spendproj.split_rate(t[:-1], 1286.0, 0, now, start)[1] == pytest.approx(86.0)
+    assert spendproj.split_rate([], 5.0, 50.0, now, None) == ([[now, 0.0]], None)
+
+
 def test_status_and_state_budget_lines_carry_the_projection_with_the_reset(env):
     """`ttp status` and the web header (usage_line) and the coordinator's STATE (caps_line) quote
     the projection against the global cap's reset, in the home zone: never '08:35'."""
