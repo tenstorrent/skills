@@ -513,12 +513,17 @@ def test_a_probes_raw_result_is_kept_beside_its_verdict(env, monkeypatch):
     from ttp import daemon as dmod
     d = dmod.Daemon(p.base)
     # Killed on its timeout: the verdict is "not yet", the raw result says it was killed.
-    monkeypatch.setattr(dmod, "PROBE_TIMEOUT_S", 0.3)
-    slow = f"echo started-{os.getpid()}; sleep 30"
+    # It times out only once it really runs and has printed (a loaded host may take longer than the
+    # timeout just to start it, and a probe stopped before it starts never prints).
+    monkeypatch.setattr(dmod, "PROBE_TIMEOUT_S", 600)
+    ran = p.base / "probe-ran"
+    slow = f"echo started-{os.getpid()}; touch '{ran}'; sleep 30"
     tid = _due_waiting_task(p, slow)
     p.db.update_task(tid, not_before=time.time() + 3600)
     d.probe_waiting()
     proc = d._probes[tid][0]
+    assert _wait_for(lambda: ran.exists(), _load_scaled(30)), "the probe never started"
+    monkeypatch.setattr(dmod, "PROBE_TIMEOUT_S", 0.3)
     deadline = time.monotonic() + _load_scaled(10)
     while tid in d._probes and time.monotonic() < deadline:
         time.sleep(0.2)

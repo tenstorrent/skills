@@ -61,8 +61,8 @@ def owner_alive(pid: str, start: str) -> bool:
 
 def list_script(tag: str) -> str:
     """The host's side of the scan: one LIST_MARK line per checkout of this user carrying `tag` in its owner
-    file: "<mark> <dir> <pid> <start> <age s>"; and "<mark> <dir> - - GONE_AGE" per removed checkout this
-    user's processes still work in (removed while its run went on: no owner can stop it any more)."""
+    file: "<mark> <dir> <pid> <start> <age s>"; and "<mark> <dir> - - GONE_AGE" per removed checkout of that
+    folder this user's processes still work in (removed while its run went on: no owner can stop it any more)."""
     return (f"now=$(date +%s); k=0; for d in \"${{TMPDIR:-/tmp}}\"/ttp-check.*; do\n"
             f"[ -d \"$d\" ] || continue\n"
             f"[ -O \"$d\" ] && [ -f \"$d/{OWNER_FILE}\" ] || {{ k=$((k+1)); continue; }}\n"
@@ -71,10 +71,13 @@ def list_script(tag: str) -> str:
             f"m=$(stat -c %Y \"$d\" 2>/dev/null) || continue\n"
             f"echo {LIST_MARK} \"$d\" \"$pid\" \"$st\" $((now - m))\ndone\n"
             # Processes of this user still working in a checkout that is gone: nothing owns them any more.
+            # Only checkouts of the folder read above (its real path, as /proc shows a cwd): a removed
+            # ttp-check.* folder elsewhere is not one of ours.
+            "b=$(cd \"${TMPDIR:-/tmp}\" 2>/dev/null && pwd -P) || b=/tmp\n"
             "seen=\"\"; for p in /proc/[0-9]*; do\n"
             "[ -O \"$p\" ] || continue\n"
             "c=$(readlink \"$p/cwd\" 2>/dev/null) || continue\n"
-            "case \"$c\" in */ttp-check.*' (deleted)') ;; *) continue;; esac\n"
+            "case \"$c\" in \"$b\"/ttp-check.*' (deleted)') ;; *) continue;; esac\n"
             "r=${c#*/ttp-check.}; d=\"${c%%/ttp-check.*}/ttp-check.${r%%[/ ]*}\"\n"
             "[ ! -e \"$d\" ] || continue\n"
             "case \" $seen \" in *\" $d \"*) continue;; esac\n"

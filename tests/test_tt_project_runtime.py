@@ -40660,6 +40660,12 @@ def test_responsibility_inventory_shows_an_unwatched_machine_until_a_check_names
     d = dm.Daemon(p.base)
     p.db.x("UPDATE schedules SET next_run=0 WHERE name='daily-review'")
     d.run_schedules()
+    # The due command watchers it also started run on their own threads: stop them and wait for their
+    # ends, so none outlives the test (a slow name lookup can keep `ping` going past it).
+    from ttp import schedrun
+    runs = list(d._sched_runs.values())
+    schedrun.stop(p.db, runs)
+    assert all(run.done.wait(_load_scaled(30)) for run in runs), "a schedule run never ended"
     t = p.db.one("SELECT spec FROM tasks WHERE labels LIKE '%daily-review%'")
     assert t and "Responsibilities: health coverage:" in t["spec"]
 

@@ -122,9 +122,11 @@ class Pending:
                 late = self._stopped
                 if not late:
                     self.proc, self.file = proc, f
-            if late:   # given up while it started: leave nothing running
+            if late:   # given up while it started: leave nothing running, and let poll() see its end
                 kill(proc)
                 f.close()
+                with self._mu:
+                    self.proc = proc
         except Exception as e:
             self.error = str(e) or type(e).__name__
         finally:

@@ -261,7 +261,9 @@ box "${RESERVE[@]}" > "$RUN_DIR/reserve.out" 2>&1; rc=$?
 OUT=$(cat "$RUN_DIR/reserve.out")
 RID=$(printf '%s\n' "$OUT" | awk '$1 == "reserved" {print $2; exit}')
 while IFS= read -r l; do note "  $l"; done < <(printf '%s\n' "$OUT" | grep -e '^warning: ' -e '^note: ird reserved ')
-[ $rc -eq 0 ] && [ -n "$RID" ] || fail "box.py ird reserve (rc $rc): $(printf '%s' "$OUT" | grep -v '^warning: ' | tail -n 3)"
+if [ $rc -ne 0 ] || [ -z "$RID" ]; then
+  fail "box.py ird reserve (rc $rc): $(printf '%s' "$OUT" | grep -v '^warning: ' | tail -n 3)"
+fi
 EXPIRES=$(printf '%s\n' "$OUT" | sed -n 's/^reserved .* expires=\([^ ]*\).*/\1/p')
 MACHINE=$(printf '%s\n' "$OUT" | sed -n 's/^reserved .* machine=\([^ ]*\).*/\1/p')
 RES_LINE="$RID on $MACHINE"

@@ -12172,6 +12172,9 @@ def test_push_checks_on_a_remote_host_skip_this_hosts_load_guard_checks_slot_and
     monkeypatch.setattr(testslots, "load_guard", lambda: "the host's CPU is overloaded")
     monkeypatch.setattr(push, "check_slot", lambda *a, **k: pytest.fail("no local checks slot"))
     _remote_load(monkeypatch, {"checkhost": [(3.0, 64)]})
+    # Its check slots there: a fake probe with room, no ssh (a real one to a name nothing answers can take 10 s).
+    from ttp import checkspill
+    monkeypatch.setattr(checkspill, "probe", lambda h, b=False: (4, "", ""))
     before = len(checkcap.grant_records())
     run = push.check_list([{"run": "pytest -n 16 tests", "host": "checkhost"},
                            "claude plugin validate plugins/tt-project --strict"])

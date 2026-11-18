@@ -458,6 +458,9 @@ def test_a_test_s_process_tree_orphaned_in_its_pytest_temp_folder_is_stopped_and
         while time.time() < deadline and not [n for n in leftoverchecks.pids() if real_ppid(n) == tree.pid]:
             time.sleep(0.05)
         (child,) = [n for n in leftoverchecks.pids() if real_ppid(n) == tree.pid]
+        # The scan sees only this test's processes: on the whole host, min_age=0 would also stop the
+        # orphans other tests running beside it keep in their own pytest temp folders (a devq runner).
+        monkeypatch.setattr(leftoverchecks, "pids", lambda: [tree.pid, child, other.pid])
         mine = lambda rs: [r for r in rs if r["pid"] in tops]
         assert mine(leftoverchecks.test_orphans(p, set(), dry_run=True, min_age=3600)) == []   # too young
         (f,) = mine(leftoverchecks.test_orphans(p, set(), dry_run=True, min_age=0))
