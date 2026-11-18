@@ -92,7 +92,8 @@ def _result_text(res: dict) -> str:
 
 def _git(cwd: str, *args: str) -> str:
     try:
-        r = subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True, timeout=30)
+        from . import gitmemo
+        r = gitmemo.run(["git", "-C", cwd, *args], capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.SubprocessError):
         return ""
     return r.stdout if r.returncode == 0 else ""

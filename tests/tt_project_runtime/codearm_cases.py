@@ -756,3 +756,44 @@ def test_the_launch_script_sets_the_digest_flag_only_when_asked_and_a_result_lin
             return (1.0, 0.1, 4.0)
     line = json.loads(glmharness.result_line({"usage": usage}, Prov()))
     assert line["ttp_calls"] == 4 and line["ttp_context_tokens_per_call"] == 80_000
+
+
+def test_glm_code_ring_flag_gates_the_coin_flip_and_the_projects_own_share_wins(env, capsys):
+    from ttp import codearm
+
+    def cfg(**over):
+        c = _ca_cfg(**over)
+        if "glm_share" not in over:
+            c["route"]["code_sonnet"].pop("glm_share")
+        return c
+
+    def share(raw, c):
+        return codearm.ring_gate(c, "demo", raw)["route"]["code_sonnet"]["glm_share"]
+
+    own = {"route": {"code_sonnet": {"glm_share": 0.25}}}
+    zero = {"route": {"code_sonnet": {"glm_share": 0}}}
+    # Flag off: no coin flip without the project's own share, even with one from the account settings.
+    assert share({}, cfg()) == 0 and codearm.settings(codearm.ring_gate(cfg(), "demo", {})) is None
+    assert share({}, cfg(glm_share=0.3)) == 0
+    assert share(own, cfg(glm_share=0.25)) == 0.25   # the project's own value wins
+    # Ring 0 on: the shipped share, or the account's; the project's own value still wins, 0 included.
+    assert _roll(capsys, "ring", "demo", "0")[0] == 0
+    assert _roll(capsys, "set", "glm_code", "0")[0] == 0
+    assert codearm.settings(codearm.ring_gate(cfg(), "demo", {}))["share"] == codearm.RING_SHARE == 0.5
+    assert share({}, cfg(glm_share=0.3)) == 0.3
+    assert share(own, cfg(glm_share=0.25)) == 0.25
+    assert codearm.settings(codearm.ring_gate(cfg(glm_share=0), "demo", zero)) is None
+    nomodel = cfg()
+    nomodel["route"]["code_sonnet"].pop("glm")
+    assert codearm.settings(codearm.ring_gate(nomodel, "demo", {})) is None   # no model: still no arm
+    assert share({}, cfg()) == 0.5 and codearm.ring_gate(cfg(), "other", {})["route"]["code_sonnet"]["glm_share"] == 0
+    # The project's settings, as the daemon and the CLI read them, carry the gated share.
+    p = make(env)
+    raw = json.loads(p.config_path.read_text())
+    raw.setdefault("route", {})["code_sonnet"] = {"share": 1.0, "glm": dict(_CA_GLM)}
+    p.config_path.write_text(json.dumps(raw))
+    assert p.config()["route"]["code_sonnet"]["glm_share"] == 0.5
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    d._load_config()
+    assert d.cfg["route"]["code_sonnet"]["glm_share"] == 0.5

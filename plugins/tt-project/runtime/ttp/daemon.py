@@ -1866,7 +1866,7 @@ class Daemon:
         established project starts no coordinator turn or worker run (both would route on the
         defaults) and says so in one alert, which clears once the file reads again."""
         raw, status = self.p.read_config()
-        self.cfg = layered(raw)
+        self.cfg = codearm.ring_gate(layered(raw), self.p.name, raw)   # the glm_code release-ring flag
         self._raw_cfg = raw   # which tiers the project sets itself (cursortiers.apply)
         # The process sandbox for checks, off unless the project turns it on: this daemon's own check
         # runs read it here, its workers from their environment (start_run).

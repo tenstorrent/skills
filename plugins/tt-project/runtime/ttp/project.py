@@ -1892,7 +1892,9 @@ class Project:
         return (self.state / "project.db").is_file()
 
     def config(self) -> dict:
-        return layered(self.raw_config())
+        from . import codearm
+        raw = self.raw_config()
+        return codearm.ring_gate(layered(raw), self.name, raw)
 
     def set_config(self, dotted: str, value: Any, by: dict | None = None) -> None:
         """Write one key into project.json and record who set it (`by`, configwho.by; none: unknown)."""

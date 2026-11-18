@@ -111,6 +111,32 @@ def settings(cfg: dict, policy: list | None = None) -> dict | None:
             "min_tasks": int(_num(got.get("glm_guard_min"), 1, 10000, GUARD_MIN))}
 
 
+RING_SHARE = 0.5   # the coin flip's share where the glm_code ring flag turns it on and the project sets none
+
+
+def ring_gate(cfg: dict, project: str, raw: dict | None) -> dict:
+    """Apply the `glm_code` release-ring flag (rollout.py) to `cfg`'s code route, in place, and return `cfg`.
+    The project's own `route.code_sonnet.glm_share` in its project.json wins as written. Without one, the
+    flag on gives a share from the account settings, else RING_SHARE; the flag off makes it 0, so no coin
+    flip runs. Claude review, the policy-file bounce and the switch-back guard are unchanged."""
+    got = (cfg.get("route") or {}).get("code_sonnet")
+    if not isinstance(got, dict):
+        return cfg
+    from . import rollout
+    try:
+        if rollout.own_setting(raw, rollout.FLAGS["glm_code"]["key"]):
+            return cfg
+        live = bool(str(((got.get("glm") if isinstance(got.get("glm"), dict) else {}) or {}).get("model") or "").strip())
+        share = _num(got.get("glm_share"), 0, 1, 0.0)
+        on = live and rollout.on("glm_code", project, raw)
+    except Exception:   # in doubt, no coin flip
+        on, share = False, 0.0
+    got = dict(got)
+    got["glm_share"] = (share if share > 0 else RING_SHARE) if on else 0
+    cfg["route"] = {**cfg["route"], "code_sonnet": got}
+    return cfg
+
+
 def harness(cfg: dict) -> str:
     """The harness the arm's live runs use (`route.code_sonnet.glm.harness`, default claude-code)."""
     got = (cfg.get("route") or {}).get("code_sonnet")
