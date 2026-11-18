@@ -131,13 +131,13 @@ def settle(row: dict, runs_dir: pathlib.Path) -> bool:
     return True
 
 
-def look(runs_path: pathlib.Path, ids: list[str]) -> list[dict]:
+def look(runs_path: pathlib.Path, ids: list[str], open_only: bool = False) -> list[dict]:
     with locked(runs_path) as data:
         rows = [row for row in data["runs"] if not ids or row.get("id") in ids]
         missing = set(ids) - {row.get("id") for row in rows}
         if missing:
             raise SystemExit(f"no run {sorted(missing)} in {runs_path}")
-        if not ids:
+        if open_only and not ids:
             rows = [row for row in rows if not row.get("conclusion")]
         for row in rows:
             if "id" in row:
@@ -149,7 +149,7 @@ def wait(args: argparse.Namespace) -> int:
     runs_path = args.model_dir / RUNS
     ids = args.id or []
     if not ids:  # every run open now; runs started later are not waited on
-        ids = [row["id"] for row in look(runs_path, []) if not row.get("conclusion")]
+        ids = [row["id"] for row in look(runs_path, [], open_only=True)]
     deadline = time.monotonic() + 60 * args.minutes
     rows = look(runs_path, ids) if ids else []
     while rows and any(not row.get("conclusion") for row in rows) and time.monotonic() < deadline:

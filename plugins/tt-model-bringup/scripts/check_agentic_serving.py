@@ -130,7 +130,7 @@ def check_growing_contexts(evidence: dict, row, caching: bool, problems: list) -
 
 
 def number(value) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
 def wilson(solved: int, n: int, z: float = 1.96) -> tuple[float, float]:
@@ -533,7 +533,7 @@ def main() -> int:
             check_serving(evidence, args.stage, problems)
     if args.stage == "benchmark":
         check_rates(model_dir, evidence, problems, full=True, inputs=inputs)
-    if args.stage == "agentic-evals" and (evidence or existing):
+    if args.stage == "agentic-evals":
         check_evals(model_dir, inputs, evidence, problems)
     for level, message in problems:
         print(f"{('NOTE', 'ADVISORY', 'CRITICAL')[level]}: {message}", file=sys.stderr)

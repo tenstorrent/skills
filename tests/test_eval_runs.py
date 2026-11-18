@@ -77,3 +77,10 @@ def test_a_run_id_cannot_leave_the_run_folder(tmp_path):
     for bad in ('../x', 'a/b', '.hidden', ''):
         started = call('start', '--model-dir', str(tmp_path), '--id', bad, '--', 'true')
         assert started.returncode != 0 and 'letters, digits' in started.stderr
+
+
+def test_status_lists_finished_runs_by_default(tmp_path):
+    call('start', '--model-dir', str(tmp_path), '--id', 'done', '--', 'true')
+    call('wait', '--model-dir', str(tmp_path), '--minutes', '1', '--look-s', '0.1')
+    shown = call('status', '--model-dir', str(tmp_path))
+    assert shown.returncode == 0 and json.loads(shown.stdout.splitlines()[0])['id'] == 'done'

@@ -673,3 +673,15 @@ def test_no_stage_reads_an_earlier_run():
             text = path.read_text(errors='ignore')
             for word in ('learned.json', 'best_config', 'task_times', 'best-known'):
                 assert word not in text, f'{path} mentions {word}'
+
+
+def test_a_non_finite_explained_time_does_not_pass(tmp_path):
+    run = scored_run()
+    run['explained_hours'] = float('nan')
+    code, stderr = goal12(tmp_path, runs=[run])
+    assert code == 1 and 'no explained_hours' in stderr
+
+
+def test_eval_checks_run_when_serving_evidence_is_missing(tmp_path):
+    code, stderr = check(tmp_path, 'agentic-evals', {}, {'mode': 'quick'})
+    assert code == 2 and 'phase1 has no scored run' in stderr
