@@ -429,6 +429,42 @@ def test_credwatch_classify_ledger_transcript_and_outside_verdicts(env, monkeypa
     assert credwatch.transcript_hit(run_dir, gh, str(home))[0] == 2
 
 
+def test_credwatch_a_deliberate_ledger_entry_and_an_observation_mute_quiet_outside_changes(env, monkeypatch):
+    """An open ledger entry whose undo is 'none: deliberate' covers the path's later rewrites too, even
+    one added before the run: no observation. Closed, it no longer does. A coordinator's observation
+    mute (source daemon) quiets the outside-change observation; a run's own write is never muted."""
+    from ttp import credwatch, machines, screen
+    from ttp import machine_ledger as ml
+    home = env["tmp"] / "acct"
+    monkeypatch.setenv("HOME", str(home))
+    key = home / ".ssh" / "id_ed25519"
+    key.parent.mkdir(parents=True)
+    machines.add("testhost")
+    now = time.time()
+    run_dir = env["tmp"] / "run9"
+    run_dir.mkdir()
+    ch = [[str(key), "changed"]]
+    c = ml.add_change("testhost", "key ~/.ssh/id_ed25519 rotated on purpose", "none: deliberate", "proj-x",
+                      expires="1d", now=now - 5 * 3600)
+    got = credwatch.classify(ch, {}, now - 600, now, run_dir, str(home))
+    assert got[str(key)][0] == "deliberate" and credwatch.excused(got) == {str(key)}, got
+    db = make(env).db
+    run = {"id": 9, "task": 43, "role": "worker", "started": now - 600}
+    assert credwatch.observe(db, run, ch, now, got, "UTC") == 0
+    assert not db.q("SELECT 1 FROM events WHERE fingerprint LIKE 'credwatch:%'")
+    ml.close_change(c["id"], "done", "proj-x", now=now - 4 * 3600)
+    assert credwatch.classify(ch, {}, now - 600, now, run_dir, str(home))[str(key)][0] != "deliberate"
+    # A mute on the outside-change observation: queued as muted, counted, not told.
+    screen.mute(db, "daemon", "Credential files changed", 24, why="known key rotation")
+    out = {str(key): ["outside", int(now * 1e9), ""]}
+    assert credwatch.observe(db, run, ch, now + 120, out, "UTC") == 0
+    rows = db.q("SELECT status FROM events WHERE fingerprint LIKE 'credwatch:host:%'")
+    assert [r["status"] for r in rows] == ["muted"], rows
+    # The run's own write is told whatever the mute.
+    mine = {str(key): [credwatch.FAILS, int(now * 1e9), "output.jsonl line 1: x"]}
+    assert credwatch.observe(db, run, ch, now + 240, mine, "UTC") == 1
+
+
 def _bash(cmd: str) -> dict:
     """A Claude stream-json event issuing `cmd` through the Bash tool."""
     return {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash", "input": {"command": cmd}}]}}

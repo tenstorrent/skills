@@ -361,10 +361,18 @@ def ledger_entry(path: str, start: float | None, now: float, home: str = "") -> 
     if not me:
         return None
     lo = (start or now) - LEDGER_SLACK_S
+    # An open entry whose undo is a no-op ('none: deliberate') covers the path's later changes too: the
+    # user said the file changes on purpose, so each rewrite is not told again while it stands.
     hits = [c for c in machine_ledger.changes([me[0]], open_only=False)
-            if any(lo <= float(c.get(k) or 0) <= now for k in ("added", "since"))
+            if (any(lo <= float(c.get(k) or 0) <= now for k in ("added", "since")) or deliberate(c))
             and _names(str(c.get("what") or ""), path, home)]
     return max(hits, key=lambda c: float(c.get("added") or 0), default=None)
+
+
+def deliberate(entry: dict) -> bool:
+    """A ledger entry still open whose undo is `none: deliberate`, as observe's text asks for a change made
+    on purpose (another no-op undo, such as a test's, is only a `ledger` verdict while the run ran)."""
+    return not entry.get("closed") and str(entry.get("undo") or "").strip().lower().startswith("none: deliberate")
 
 
 _HITS: dict = {}   # transcript_hit's answers by (run dir, path, home, the transcript's and refusal log's stamps)
@@ -473,7 +481,8 @@ def classify(changed: list, marks: dict, start: float | None, end: float, run_di
             out[path] = ["metadata", at, ""]
         elif entry:
             by = f"project {entry.get('by') or '?'}" + (f" task #{entry['task']}" if entry.get("task") else "")
-            out[path] = ["ledger", at, f"#{entry.get('id')} by {by}: {str(entry.get('what') or '')[:300]}"]
+            out[path] = ["deliberate" if deliberate(entry) else "ledger", at,
+                         f"#{entry.get('id')} by {by}: {str(entry.get('what') or '')[:300]}"]
         elif hit := transcript_hit(run_dir, path, home):
             out[path] = [FAILS, at, f"output.jsonl line {hit[0]}: {hit[1]}"]
         else:
@@ -541,6 +550,8 @@ def observe(db, run: dict, changed: list, now: float, verdicts: dict | None = No
         if kind == FAILS:
             mine.append(f"{path} {how}" + (f" ({note})" if note else ""))
             continue
+        if kind == "deliberate":   # an open 'none: deliberate' ledger entry names it: not told again
+            continue
         if not _claim(f"credwatch:{path}:{int(at / 1e9 // 60)}:{kind}:{how}", now):
             continue
         sev = "high" if kind == "outside_alarm" else sev
@@ -558,6 +569,11 @@ def observe(db, run: dict, changed: list, now: float, verdicts: dict | None = No
               f"the user to log in again (for gh: `gh auth login`). Nothing was restored.", "queued"))
         told += 1
     if rest:
+        # The changes made outside the run honour the coordinator's observation mutes (source daemon); a
+        # run's own credential writes never do: they fail its hand-off.
+        from . import screen
+        text = f"Credential files changed during {who} and not by it: {'; '.join(rest)}"
+        status = "muted" if screen.count_muted(db, "daemon", text, sev, now) else "queued"
         try:
             from . import machines
             alias = (machines.here() or ["<this machine's alias>"])[0]
@@ -569,6 +585,6 @@ def observe(db, run: dict, changed: list, now: float, verdicts: dict | None = No
               f"for the host, no run failed): {'; '.join(rest)[:1500]}. If the user or their agent changed one on "
               f"purpose, record it so later runs are not blamed: `ttp machines change add {alias} \"<what> "
               f"<path>\" --undo 'none: deliberate'`. If a login no longer works, ask the user to log in again "
-              f"(for gh: `gh auth login`). Nothing was restored.", "queued"))
-        told += 1
+              f"(for gh: `gh auth login`). Nothing was restored.", status))
+        told += status == "queued"
     return told
