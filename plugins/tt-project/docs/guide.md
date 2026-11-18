@@ -429,7 +429,8 @@ coordinator with that evidence.
   refuses, or the code repo has no git remote (or not the one it names). The config check and
   `ttp doctor` say so. A review the coordinator adds
   for the same work replaces the daemon's while it has not started. A review that fails with
-  follow-ups gets one fix task on the reviewed branch and a re-review from the daemon, and the
+  follow-ups gets one fix task on the reviewed branch, continuing the reviewed task (the task the
+  review depends on, never one its spec only mentions), and a re-review from the daemon, and the
   tasks waiting on the failed review wait on the re-review instead of being blocked. The re-review
   depends on the fix; a fix that ends with no new commits on the reviewed head blocks it and wakes
   the coordinator, so the same head is never re-reviewed (`review.auto_fix_rounds`, default 1,
@@ -3711,7 +3712,10 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   place (the newest release, since when it is behind, why), and only a daemon going down pages
   again. The push queue sends no after_push alert of its own for that failure. The alert clears
   once the project's own daemon reports the release, and a recovered
-  daemon returns to pending. Missing ownership/deadlines, current upgrade errors and daemons
+  daemon returns to pending. The check follows only projects registered on this machine: a
+  named project that is not (a scratch project, or one `ttp remove` took off) is left out of the
+  verdict and never raises a deploy alert, and an open deploy check or alert of a project
+  removed since closes by itself. Missing ownership/deadlines, current upgrade errors and daemons
   that fail to start remain failures; an older release's upgrade error does not count.
   Keep nonzero upgrade errors as failures in the deploy command; exit 75 means deferred
   (nothing changed) and 76 applied with the restart deferred to the daemon; both need this
