@@ -1,0 +1,213 @@
+---
+name: composite-bringup
+description: Implement the full training model in tt-train (ttml autograd) on the plan's chips (one chip, or the plan's TP/DP layout when the model does not fit one), correctness first, using existing kernels wherever the plan's kernel inventory has them and composed ttml ops elsewhere, and build the PCC harness that compares the forward output and every gradient against torch. Use as the second phase of train-bringup.
+---
+
+# Composite bring-up
+
+Before using this skill, follow the startup in [the train-bringup entrypoint](../train-bringup/SKILL.md#startup)
+and read `doc/plan.md` from the plan phase.
+
+## What to build
+
+Implement every layer kind and the full model in ttml autograd under
+`tt-train/sources/ttml/ttml/models/<model>/`, with a training example under
+`tt-train/sources/examples/<model>_train/` that runs real steps (data, loss, optimiser) on the
+plan's chips (one chip, or the TP/DP layout of the plan's multi-chip fit section).
+Follow the kernel inventory's selected training paths: use compatible existing fused kernels and
+program configs, compose from ttml ops where support is missing, and document why a fallback is
+needed. Load HF weights through a documented loader. Apply the freeze map from day one: per-input
+`requires_grad` must suppress the gradient computation, allocation and reduction, not merely discard
+its result. Preserve input gradients through frozen modules wherever earlier trainable parameters
+need them.
+
+Keep one layout contract from the start: activations cross module boundaries as `[B, 1, T, W]` in
+tile layout with heads merged on the last dimension. A module that needs another layout converts
+internally so the cost is visible to its owner. Putting a head axis on dimension −2 pads it to 32
+rows and every following op streams the padding; avoid it where an existing kernel allows, and
+record it where it cannot be avoided yet.
+
+## Mesh code rules
+
+On a multi-chip layout (the plan's `mesh` block) the model follows these rules from the first
+commit; each is a numerics bug that a single-chip test never shows:
+
+- LoRA adapters are sharded with their base weight. A column-parallel base (q, k, v, gate, up)
+  shards adapter B on its output dimension and replicates A; a row-parallel base (o, down)
+  shards adapter A on its input dimension and replicates B. The adapter product then lands in the
+  same shard as the base output and needs no extra collective.
+- DP syncs trainable gradients only: `ttml.sync_gradients` (or its equivalent) runs over the
+  parameters with `requires_grad`, on the `dp` axis only, after the backward and before the
+  optimiser. Frozen weights never get a gradient to sync. TP-sharded gradients are already
+  per-shard correct and are not reduced over `tp`.
+- The seed is the same on every rank, so replicated parameters (adapter A, norms) start
+  identical; check it once by comparing a replicated parameter across ranks after init.
+- Data is sharded from the global batch in reference order: the global batch is the batch the
+  torch reference trains on, and DP rank `i` takes its `i`-th contiguous slice. The continuation
+  goldens are made at the global batch and stay valid for any DP size.
+- The loss is the mean over the global batch: the mean of per-rank token-weighted losses over the
+  total number of loss tokens, not a mean of per-rank means when ranks carry different token
+  counts. With the gradient averaged over `dp` the update equals the single-replica one.
+
+## ttml traps that cost device time
+
+Each of these cost the reference bring-ups a device run and a debugging session; none of them is
+visible from the API's signature.
+
+- `ModuleBase::register_tensor` calls `set_requires_grad(true)` unconditionally, so a parameter
+  frozen before registration comes back trainable. Freeze immediately **after** registration and
+  assert the trainable count and that no frozen parameter has an initialised gradient.
+- `ttml.sync_gradients` iterates the parameters whose gradient is *initialised*, not those with
+  `requires_grad`. Pass the filtered trainable map explicitly; a stray frozen gradient would
+  otherwise be all-reduced in silence, and the freeze map's own check would not see it.
+- A replicated parameter under a sharded base (LoRA's A on a column-parallel projection) holds a
+  TP-partial gradient that nothing sums for you: `sync_gradients` deliberately excludes the `tp`
+  axis. Sum it in the module.
+- `ttnn.matmul` infers the result's tensor topology from the operands without accounting for
+  `transpose_a`, so a `dW` computed as `dY^T X` is labelled with `dY`'s shard dimension and gathers
+  on the wrong axis later. Restore the operand's topology on the result and let the gradient
+  harness confirm it; local values are correct, only the metadata is wrong, so only a gathered
+  comparison catches it.
+- A step that runs collectives on one axis and then on another can stall at the transition
+  (CCL semaphore pools carry no axis identity): the reference bring-up hung with most chips in a
+  DP reduce-scatter and the rest in the following all-gather. Complete the whole mesh before
+  changing the participant set, keep that synchronisation inside the step timing, and record it.
+- Host-side reads of a distributed tensor need a mesh composer or `Sharding.gather` with replica
+  verification; a raw `to_numpy` either fails or hands back one shard. Gathered shapes are checked
+  before any PCC number is accepted.
+
+## Before accepting the first baseline
+
+Correctness-first includes removing avoidable work using existing capabilities. During implementation
+and the baseline profile below, check these properties and record the evidence in `doc/composite/README.md`:
+
+- The executed backward agrees with the freeze map: no unused base-weight, norm-parameter or
+  embedding gradients, and all required activation and adapter gradients remain. Check op emission
+  as well as gradient values; a discarded dW can leave numerical tests passing.
+- Constant preparation happens once when valid: frozen embedding untilize, weight packing or
+  transposition, and position caches. Do not cache data that changes with optimiser updates or
+  inputs; include persistent copies in the memory budget.
+- Large matmuls use the selected orientation and explicit supported program configs where needed,
+  in both forward and backward at the actual shard shapes. Confirm those paths execute; a config
+  keyed only on the global shape can silently miss every TP call.
+- Explain each large matmul, collective, layout conversion and host synchronisation in a step.
+  Remove redundant conversions, repeated constant work and unnecessary host reads using existing
+  paths. Retain required communication, data/loss work and correctness checks. Necessary layout
+  ops are allowed; record their reason and measured cost for the loop.
+
+Fix violations before measuring and accepting the composite baseline. There is no universal minimum initial MFU.
+New optimisation kernels and exhaustive config sweeps belong to the loop after the baseline uses
+the planned capabilities and passes the forward, gradient and loss checks.
+
+## PCC harness
+
+Build the harness in this phase; every later verification reuses it. Per module and per layer kind,
+at real shapes and the real dtype policy, compare against a torch fp64 reference fed with
+bf16-rounded inputs: the forward output and **every** gradient (inputs and trainable parameters).
+Report PCC and relative error per tensor; PCC above 0.999 can hide a systematic bias, so both are
+required. Then run N training steps of the full model and compare the loss trajectory against the
+torch reference within a stated tolerance. Put the harness under `tt-train/tests/python/` so it runs
+as an ordinary test.
+
+### The real-weight end-to-end check
+
+The module harness compares random weights against a reference the same agent wrote, so a convention
+both sides get wrong the same way cancels: RoPE pair order and its weight permutation, head order in
+a packed projection, the halves of a packed SwiGLU. Otherwise only the loss trajectory catches
+those, and it is the phase's most expensive evidence.
+
+Run the cheap version first: the **real checkpoint**'s first two layers, embedding, final norm and
+LM head, on real token ids, against `AutoModelForCausalLM` at the pinned revision truncated to the
+same two layers, in fp64; compare logits by PCC and relative error at the harness's bars. Minutes,
+no hand-written reference, and it fails on every convention mistake above. Record it as its own row
+in `doc/composite/README.md`; the trajectory then tests the optimiser, data path and accumulation,
+not the architecture.
+
+### Budget the reference before running it
+
+The torch reference is the most expensive artefact of this phase and the one most likely to consume
+it. Cost it before starting: time one reference step and multiply by N. A 24B model's forward and
+backward on CPU is minutes per step and tens of gigabytes of host memory, so a ten-step trajectory
+at the full layer count is over an hour on twenty cores. Record that estimate in the work log
+next to the phase's remaining wall-clock budget, then pick the cheapest form that still exercises
+the whole graph:
+
+1. the full model, when its measured cost fits the budget;
+2. a GPU reference, when one is available;
+3. the same model at a reduced **layer count** (the first L of the real layers, real weights),
+   with L stated in the README and in the gate.
+
+Hidden size, head counts, head dim, sequence length, vocabulary, dtype policy, optimiser and the
+data are never reduced; only depth is, and only with the reduction written down. A reduced-depth
+trajectory is a passed gate when it is labelled as one.
+
+The reference is a host job and the device is not idle while it runs. **No reference process, and
+no other heavy host job, runs during a device timing run**: a CPU reference saturating the host's
+cores and memory bandwidth inflates every wall-clock step and can starve dispatch outright. Either
+the reference finishes first, or the timing run waits. A run taken beside one is a diagnostic,
+never an accepted baseline (see the
+[measurement protocol](../optimization-loop/SKILL.md#measurement-protocol)), and the work log says
+which of the two it is.
+
+### The learning check
+
+A loss trajectory over fresh data measures agreement with the reference, not learning: over a
+hundred real steps a LoRA run's loss moves less than the batch-to-batch spread, so a flat curve and
+a working optimiser look identical, and so do a working optimiser and a gradient that is being
+dropped, mis-signed or synced on the wrong axis after the comparison window ends. Add a check that
+cannot pass without learning: take one fixed batch, repeat it for K steps at the recipe's optimiser
+settings, and require the loss to fall by a stated factor (a small adapter on one batch goes most of
+the way to zero). State K and the factor before the run, assert them in the script, and record the
+curve. It costs K steps and it is the only evidence in the phase that the update reaches the
+parameters.
+
+When the plan's layout has tensor or data parallelism, the harness also runs every module at the
+per-rank shard shapes (the shapes the kernels actually see; a single-chip-only harness let the
+first TP chain of the reference bring-up crash on shapes it had never tested), and the loss match
+runs at that layout with the loss gathered on the host. The loss script fails loudly: a missing
+loss log, fewer than N steps, or a NaN is a failed gate, never an empty file to read past later.
+
+Never shrink hidden size, head counts, sequence length or weight shapes to make evidence easier to
+collect; small shapes are for debugging only.
+
+## Baseline measurement
+
+Before leaving this phase, take the first measurement so the loop has a baseline: a cooled MFU run
+without the profiler on the full model on the plan's chips, telemetry sampler attached (wall
+ms/step, MFU against the nominal peak with the plan's FLOP count, per-chip settled clock and the
+critical chip next to it) and Tracy runs at 1x, 2x and 4x the plan's representative slice with
+real shapes (per-op cost per slice copy and the scaling check; on a mesh, at the plan's layout,
+per chip), as described in the
+[optimisation loop's measurement protocol](../optimization-loop/SKILL.md#measurement-protocol).
+Never run Tracy on the full model and never project a full-step time from it. Measure the host/dispatch gap here, on the slice:
+the slice run's wall-clock minus its summed device time, with Tracy's cycles converted to the
+delivered clock first; the plan does not guess it. Attribute the top three ttnn ops to their compiled kernel source, DEST sync mode and % of peak
+(the plan's section 1 entries, now confirmed from the profile) so the loop's first iteration has
+its candidate. Create `doc/optimization/README.md` and `doc/perf_analysis.md` in the
+[loop's document format](../optimization-loop/SKILL.md#document-format): the result table with one
+row (composite baseline), the first ranked cost table (per-copy cost times slice copies, a ranking, not a step time), and
+the three per-copy tables with the scaling check in the evidence directory.
+Record actual compute cores, participating chips, useful FLOPs and nominal peak with the baseline.
+State what the step timer contains, and keep host bookkeeping out of it. The timed region is the
+training step: the input upload, the forward, the backward, the gradient sync and the optimiser.
+Tokenisation and batch assembly, the host read-back of the loss, per-step assertions over the
+parameter list, allocator snapshots and evidence writes all sit outside it, or the number is not a
+step time and every MFU built on it is wrong in the model's favour. Where host work genuinely
+belongs to the step (an unavoidable read-back, a data path that cannot be prefetched), it stays
+inside and the README says so, with its measured cost, as a loop candidate.
+Exclude compilation and warmup from timing, and inspect per-step time and loaded clock trends;
+if they are still settling, extend the run to report a settled window or label the result transient.
+Keep cold, warm, random-init and real-weight measurements distinct when comparing runs.
+
+## Gate
+
+PCC harness passes for every module and layer kind on the forward and every gradient at real shapes,
+including the per-rank shard shapes when the plan's layout is multi-chip. The real-weight two-layer
+check against the HF model class passes, loss over N steps matches torch within tolerance at the
+plan's layout (with the reference's layer count stated), and the fixed-batch learning check drives
+the loss down by its stated factor. Full model runs training steps on the plan's chips
+within the plan's memory budget. The first-baseline checks above have evidence, with no frozen
+gradient work or redundant constant preparation deferred to the loop. `doc/perf_analysis.md` exists
+with the baseline, the measured host/dispatch gap and the top-op kernel attribution. `doc/composite/README.md`
+and `work_log.md` record commands, PCC and relative-error tables, perf, limitations and artefacts.
+`stage-review` returns `clean-pass`.

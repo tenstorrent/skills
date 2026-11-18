@@ -4,6 +4,15 @@ This repository is a marketplace of independent Tenstorrent plugins. Keep the us
 one repository to register, a small finder installed by default where the host supports that, and
 all substantive workflows installed only when the user chooses them.
 
+## Branch safety
+
+Agents must never modify local or remote `main`, or write in a worktree checked out on `main`.
+Do not check out `main`, commit to it, merge/rebase/reset it, move/delete its ref, or push to it.
+Use the task's non-`main` branch. If the checkout is on `main` or detached, create a separate
+worktree with a new task branch from the current commit before writing; leave the original
+checkout untouched. Read-only comparisons against `main` are allowed without checking it out.
+Recheck the branch on resume and before staging or committing; delegated agents inherit this rule.
+
 ## User and permission contract
 
 - `tt-skills` contains discovery guidance only. It may recommend an optional plugin, but must not

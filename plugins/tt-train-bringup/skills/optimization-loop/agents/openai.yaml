@@ -1,0 +1,7 @@
+interface:
+  display_name: "Optimisation Loop"
+  short_description: "Measure, classify, cost, boost the biggest kernel, verify, repeat to the roofline target"
+  default_prompt: "Use $optimization-loop on the composite training model: MFU and Tracy, classify every op into useful math / layout / glue / wasted / dispatch, cost in wall ms/step with training multiplicity, take the biggest math kernel first, verify with the PCC harness, MFU rerun and Tracy diff, and repeat until the roofline target or hardware ceiling in doc/plan.md is met."
+
+policy:
+  allow_implicit_invocation: true
