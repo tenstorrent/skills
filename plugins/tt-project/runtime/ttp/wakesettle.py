@@ -89,7 +89,8 @@ def record(db, gate: str, verb: str, evs: list[dict], now: float | None = None, 
         pass
 
 
-_UPDATE_BLOCK = re.compile(r"^## Update\b[^\n]*\n?(.*?)(?=^## Update\b|\Z)", re.M | re.S)
+_UPDATE_SPLIT = re.compile(r"^(?=## Update\b)", re.M)
+_UPDATE_HEAD = re.compile(r"## Update(?: \d{4}-\d{2}-\d{2} \d{2}:\d{2} [A-Za-z0-9+-]{1,8})?(?: \(turn [\w.-]{1,24}\))?[ \t]*")
 _PASS_LINE = re.compile(r"^(?:update\s*:\s*)?(?:the |its |this task's |your )?(?:start_when|retry_when|wait|probe|gate)"
                         r"(?:\s+\w+){0,2}\s+(?:passed|has passed|is met|was met|now holds|holds now|is true|exited 0)"
                         r"(?:\s*\([^)\n]{0,40}\))?[\s.!]*$", re.I)
@@ -101,8 +102,8 @@ def pass_record_only(spec_base: str, seen: str, seen_len, title: str = "") -> bo
     """Whether a waiting task's spec changed since its hand-off only by text recording a passed probe.
     `spec_base` is the current prompts.spec_base, `seen` the digest the hand-off slept on and `seen_len`
     the length of its spec base then (the daemon stores it): the current base must start with exactly that
-    spec (its digest equals `seen`), and what follows must be `## Update` blocks (or nothing) whose every
-    line matches the positive list. Anything unproven, longer than 3 lines a block, or not on the list
+    spec (its digest equals `seen`), and what follows must be `## Update` blocks (or nothing), each with a
+    bare header (only the harness's time and turn suffix) and at least one line, every line on the positive list. Anything unproven, longer than 3 lines a block, or not on the list
     is not a pass record."""
     from . import prompts
     if isinstance(seen_len, bool) or not isinstance(seen_len, int) or not 0 <= seen_len <= len(spec_base):
@@ -114,12 +115,15 @@ def pass_record_only(spec_base: str, seen: str, seen_len, title: str = "") -> bo
         return True
     if not added.startswith("## Update"):
         return False
-    blocks = _UPDATE_BLOCK.findall(added)
-    for body in blocks:
+    for block in _UPDATE_SPLIT.split(added):
+        if not block.strip():
+            continue
+        head, _, body = block.partition("\n")
         lines = [x.strip() for x in body.splitlines() if x.strip()]
-        if len(lines) > 3 or any(not _PASS_LINE.match(x) or _NOT_PASS.search(x) for x in lines):
+        if not _UPDATE_HEAD.fullmatch(head) or not 0 < len(lines) <= 3 \
+                or any(not _PASS_LINE.match(x) or _NOT_PASS.search(x) for x in lines):
             return False
-    return bool(blocks)
+    return True
 
 
 def _key(e: dict) -> tuple:

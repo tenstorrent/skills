@@ -160,7 +160,7 @@ def test_health_flags_a_new_high_alert_in_the_flags_area_a_forward_revert_and_a_
     p = make(env)
     th, now = rh.thresholds(None), time.time() + 60
     since = now - 24 * _RH
-    area = "push"   # the push queue's area (push_isolation graduated: #8769 runs for every project)
+    area = "push"   # the push queue's area (push_isolation graduated: it runs for every project)
     ins = "INSERT INTO alerts(key, raised, severity, text) VALUES(?,?,?,'x')"
     p.db.x(ins, ("push_not_landing", now - 100 * _RH, "high"))     # seen in the baseline: not new
     p.db.x(ins, ("push_not_landing", now - 5 * _RH, "high"))
@@ -341,7 +341,7 @@ def test_a_new_alert_votes_rollback_only_for_the_flag_in_its_own_area_by_the_key
     got = lambda flag: rh.signals(p.db, since, now, th, area(flag))["failing"]
     assert got("glm_code") == ["new alert auth:glm"], "model routing trips are low and never stored: not judged"
     assert rh.signals(p.db, since, now, th, "push")["failing"] == ["new alert after_push_failed", "new alert push_tip_failing"]
-    assert "push_isolation" not in rollout.FLAGS, "graduated: #8769's push batch survival runs for every project"
+    assert "push_isolation" not in rollout.FLAGS, "graduated: the push batch survival runs for every project"
     for none in ("eta_history", "device_prewarm", "deslop"):
         assert got(none) == [], none
     assert rh.signals(p.db, since, now, th)["failing"] == [], "no area, no alert votes"

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""The cost levers of task #8790, each behind its own release-ring flag (rollout.FLAGS), all off by default:
+"""The cost levers, each behind its own release-ring flag (rollout.FLAGS), all off by default:
 
 - rings.fresh_continue (key worker.fresh_continue): a continue, fix or retry run starts fresh instead of
   resuming an earlier worker session (ctxfork.prepare skips the resume source), with a compact hand-off

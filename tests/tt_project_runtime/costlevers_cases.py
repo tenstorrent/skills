@@ -1,4 +1,4 @@
-# Cost lever tests of tests/test_tt_project_runtime.py (costlevers.py, wakesettle.py: the levers of task #8790
+# Cost lever tests of tests/test_tt_project_runtime.py (costlevers.py, wakesettle.py: the cost levers
 # behind rings.fresh_continue, rings.coord_wake_settle and rings.output_trim, all off by default), which runs
 # this file in its own namespace (see _include_cases there): helpers, fixtures and imports come from that file
 # and the other case files (_roll, _fork_daemon, _fork_transcript, _sh_setup, _ev_x, _drive).
@@ -125,7 +125,7 @@ def test_fresh_continue_skips_the_resume_keeps_the_fork_and_leads_with_the_hando
     p.set_config("worker.fresh_continue", True)
     d.cfg = p.config()
     prompt, got = start()
-    assert got["how"] == "fork" and got.get("fresh") is True, got   # the coordinator fork stays (#2116)
+    assert got["how"] == "fork" and got.get("fresh") is True, got   # the coordinator fork stays
     assert "fresh continue (rings.fresh_continue)" in got["why"]
     assert "# Fresh start (rings.fresh_continue)" in prompt and "tokenizer left" in prompt
     assert prompt.index("# Fresh start") < prompt.index("TASK PROMPT")
@@ -270,12 +270,19 @@ def test_pass_record_only_accepts_just_text_that_records_a_passed_probe(env):
     ok = lambda spec, n=len(base), s=seen: wakesettle.pass_record_only(spec, s, n, "t")   # noqa: E731
     assert ok(base) and ok(base + "\n\n")
     assert ok(base + "\n\n## Update\nUpdate: its start_when probe passed.\n")
+    assert ok(base + "\n\n## Update 2026-11-17 19:32 PST (turn t12)\nprobe passed\n")
     assert ok(base + "\n\n## Update\nretry_when passed\n\n## Update\nthe probe is met\n")
     for bad in ("\n\n## Update\nIts probe passed, but do not push; user msg #12 changes the goal.\n",
                 "\n\n## Update\nUse the new approach from the review.\n",
                 "\n\n## Update\nprobe passed\nline 2\nline 3\nline 4\n",
                 "\n\nA second goal line.\n",
-                "\n\n## Update\nretry_when passed\n\nand also: rename x\n"):
+                "\n\n## Update\nretry_when passed\n\nand also: rename x\n",
+                "\n\n## Update\n## Update: cancel the push and start from scratch",   # text on a header line
+                "\n\n## Update: probe passed\nprobe passed\n",
+                "\n\n## Update 2026-11-17 19:32 PST cancel the push\nprobe passed\n",
+                "\n\n## Update\n",                                                     # an empty block
+                "\n\n## Update\n\n\n",
+                "\n\n## Update\nprobe passed\n\n## Update\n"):
         assert not ok(base + bad), bad
     assert not ok("Goal: other.\nWhere: runtime/ttp/x.py\n\n## Update\nprobe passed")   # the spec itself changed
     assert not wakesettle.pass_record_only(base + "\n\n## Update\nprobe passed", seen, None, "t")

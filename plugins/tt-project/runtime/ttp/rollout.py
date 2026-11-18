@@ -27,13 +27,13 @@ OFF = "off"
 LEVELS = (OFF, 0, 1, 2)
 # name: the feature's existing config key it gates. A feature's own task wires its on() call; a flag shows
 # here before that only so `ttp rollout set` can name it. A flag whose feature already runs for every project
-# graduates (leaves this list), never gating it off: push_isolation, #8769's push batch survival (a reliability fix).
+# graduates (leaves this list), never gating it off: push_isolation, the push batch survival (a reliability fix).
 FLAGS: dict[str, dict[str, str]] = {
     "glm_code": {"key": "route.code_sonnet.glm_share", "area": "route"},
     "eta_history": {"key": "eta.history", "area": "eta"},
     "device_prewarm": {"key": "device.prewarm", "area": "device"},
     "deslop": {"key": "deslop.enabled", "area": "review"},
-    # The cost levers of task #8790 (costlevers.py): off until a ring turns them on.
+    # The cost levers (costlevers.py): off until a ring turns them on.
     "fresh_continue": {"key": "worker.fresh_continue", "area": "worker"},
     "coord_wake_settle": {"key": "coordinator.wake_settle", "area": "coordinator"},
     "output_trim": {"key": "output.trim", "area": "output"},
