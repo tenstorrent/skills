@@ -7849,7 +7849,7 @@ def test_a_passed_probe_reads_the_push_queues_rejected_commit_git_before_its_fin
     rejected-commit check (pushq._inherited: `git show -p`, patch-id, rev-list), read there for a code
     task's review (carried) and a review's approval (check_approval), held the write lock while git ran.
     Now _prefetch_git reads it before (pushq.prefetch_git) and the same calls inside read the memo."""
-    from ttp import pushq
+    from ttp import pushq, slop
     from ttp.daemon import Daemon
     s = _pq(env, monkeypatch)
     monkeypatch.setattr(Daemon, "_precheck", lambda self, task, head: None)
@@ -7889,6 +7889,7 @@ def test_a_passed_probe_reads_the_push_queues_rejected_commit_git_before_its_fin
     rid = s.p.db.one("SELECT id FROM tasks WHERE kind='review' AND status='queued' AND depends_on LIKE ?",
                      (f"%{c}%",))["id"]
     assert f"carries unreviewed commits from tasks whose latest review failed (#{x}: " in s.p.db.task(rid)["spec"]
+    assert "Scan delta of this change" in s.p.db.task(rid)["spec"]   # the de-slop scan, read before the transaction
     # Its review approves that head: refused for the same commits, judged by the memo too.
     passed(rid, {"status": "done", "summary": "passes", "push": [{"branch": cbranch, "head": chead}]})
     t = s.p.db.task(rid)
@@ -7912,6 +7913,12 @@ def test_a_passed_probe_reads_the_push_queues_rejected_commit_git_before_its_fin
     other = [a for a in spawned if not ref_read(a)]
     assert not other, f"a child other than a local ref read ran inside the finish transaction: {other}"
     assert not d._git_memo, "a memo outlived its transaction"
+    # A head the warm-up did not scan: inside a transaction the block names the command, scanning nothing.
+    spawned.clear()
+    d._slop_blocks.clear()
+    with d.p.db.tx():
+        block = d._slop_block(s.p.db.task(c), cbranch, chead)
+    assert not spawned and f"..{chead[:12]}`" in block and block.endswith(slop.RULE)
 
 def test_the_push_queue_accepts_a_head_stacked_on_a_passed_branch_landed_or_not(env, monkeypatch):
     from ttp import pushq

@@ -1443,6 +1443,7 @@ class Daemon:
         self._stall_probes: dict[str, list] = {}   # probe (or a caller's key) -> its re-check: [Pending, started, answer or None]
         self._git_memo: dict[int, dict] = {}   # task -> git facts its hand-off is judged by, read before the tx (_prefetch_git)
         self._git_attempts: dict[int, gitmemo.Attempt] = {}   # task -> its finish's gitreplay attempt, from the warm-up
+        self._slop_blocks: dict[int, tuple[str, str]] = {}   # task -> (head, its review's de-slop block), read before the tx
         self._start_rc: dict[int, tuple[int | str, float, str]] = {}   # a start_when's last not-yet or broken verdict
         self._premise_runs: dict[int, tuple] = {}   # task -> its running premise command: (Pending, started, cmd)
         self._premise_ok: dict[int, tuple[float, str]] = {}   # task -> when its premise command last exited 0, cmd
@@ -8113,6 +8114,21 @@ class Daemon:
             log(self.p, f"task {task['id']}: reading git before finishing failed: {type(e).__name__}: {e}")
         if time.monotonic() - t0 >= gitmemo.PREFETCH_GIT_S:   # the rest is read in the finish, or degrades as a git failure does
             log(self.p, f"task {task['id']}: reading git before finishing stopped at its {gitmemo.PREFETCH_GIT_S:.0f} s budget")
+        if result.get("status") == "done" and task["kind"] == "code" and task.get("branch"):
+            self._prefetch_slop(task)
+
+    def _prefetch_slop(self, task: dict) -> None:
+        """The de-slop block of the review _auto_review queues for this code task, read now, outside the
+        finish transaction and its git memo: the scan reads whole trees, which must never hold the write lock."""
+        try:
+            full = worktree._git(self.p.root, "rev-parse", "--verify", "--quiet", f"{task['branch']}^{{commit}}",
+                                 check=False)
+            if full:
+                if len(self._slop_blocks) >= 256:
+                    self._slop_blocks.clear()
+                self._slop_blocks[task["id"]] = (full, self._slop_block(task, task["branch"], full))
+        except Exception as e:
+            log(self.p, f"task {task['id']}: slop delta not read before finishing: {type(e).__name__}: {e}")
 
     def _prefetch_hop(self, task: dict, fups: list[dict]) -> None:
         """For _prefetch_git: what _split and _continue_ready read from git for a done task."""
@@ -20818,7 +20834,13 @@ class Daemon:
 
     def _slop_block(self, task: dict, branch: str, full: str) -> str:
         """The review spec's de-slop block (slop.py): the change's scan delta and the rule that fails a change
-        re-implementing an existing rule, adding diary comments or a replay-only test. Never fails the spec."""
+        re-implementing an existing rule, adding diary comments or a replay-only test. Never fails the spec.
+        Inside a write transaction it only reads what _prefetch_slop read: no scan holds the lock."""
+        got = self._slop_blocks.get(task["id"])
+        if got and got[0] == full:
+            return got[1]
+        if self.p.db.conn.in_transaction:
+            return f"(the scan was not read for this head: run `ttp slop --diff <its base>..{full[:12]}`)\n" + slop.RULE
         try:
             base, _ = worktree.own_base(self.p, task, branch)
             return slop.review_block(self.p.root, base, full, self.cfg.get("deslop"),
