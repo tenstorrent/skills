@@ -463,6 +463,8 @@ USER_SETTABLE = {
     "jev.enabled": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     # The effort A/B of standard-tier code tasks and Jev's effort pick (effortab.py).
     "effort_ab.enabled": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
+    # The stay-off watchdog's alert switch (occupancy.settings): off keeps flags for status, posts nothing.
+    "occupancy.alerts": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     "effort_ab.jev_pick": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     "runner.pin_verify": pin_verify_mode,
     # What `ttp host-run` may run on the host outside the sandbox: stored only as a list hostrun accepts.

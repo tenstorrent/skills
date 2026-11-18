@@ -11023,8 +11023,10 @@ def _detach_remote(a, ttp: str) -> None:
         from . import onhost
         onhost.record(os.environ["TTP_RUN_DIR"], [a.remote], "remote")   # its task's first command on that machine
     if p := here():   # its end is known only on that host: the log keeps the start
+        dev = {k: v for k, v in (("step", getattr(a, "step", None)), ("devices", getattr(a, "devices", None)),
+                                 ("disruptive", getattr(a, "disruptive", None) or None)) if v}
         activity.append(p.state, activity.base(p.name, ev="job", id=activity.new_id(), job=a.name,
-                                               machine=a.remote, cmd=activity.head(cmd), start=time.time()))
+                                               machine=a.remote, cmd=activity.head(cmd), start=time.time(), **dev))
     print(f"detached {a.name} on {a.remote} (pid {pid})\nlog: {prefix}.log\nrc:  {prefix}.rc\n"
           f"hand off: status waiting, survives_reboot true, retry_when "
           f"\"{ttp} detach --check --host {shlex.quote(a.remote)}{mirror} {shlex.quote(prefix)}\"")

@@ -102,7 +102,9 @@ def _num(v: Any, default: float) -> float:
 
 
 def settings(cfg: dict) -> dict:
-    """A project's own registrations from its settings: {"sources": {alias: source}, "quiet_s"}."""
+    """A project's own registrations from its settings: {"sources": {alias: source}, "quiet_s", "alerts"}.
+    `alerts` (on by default) is the watchdog's post switch: off, flags are still kept for status and the daily
+    review, but none is posted and no event raised; the pre-step check is the same either way."""
     sec = cfg.get("occupancy") if isinstance(cfg.get("occupancy"), dict) else {}
     out = {}
     for alias, src in (sec.get("sources") or {}).items() if isinstance(sec.get("sources"), dict) else ():
@@ -113,7 +115,12 @@ def settings(cfg: dict) -> dict:
                            "timeout_s": _num(src.get("timeout_s"), TIMEOUT_S),
                            "max_age_s": _num(src.get("max_age_s"), FILE_MAX_AGE_S),
                            "fronts": [str(f) for f in fronts] if isinstance(fronts, list) else [str(fronts)]}
-    return {"sources": out, "quiet_s": _num(sec.get("quiet_s"), QUIET_S)}
+    return {"sources": out, "quiet_s": _num(sec.get("quiet_s"), QUIET_S), "alerts": alerts_on(sec.get("alerts"))}
+
+
+def alerts_on(v: Any) -> bool:
+    """`occupancy.alerts`: on unless set to false, off, no or 0."""
+    return v is None or str(v).strip().lower() not in ("false", "off", "no", "0")
 
 
 def source_problem(value: Any) -> str | None:
@@ -428,6 +435,11 @@ def _live_windows(rec: dict, now: float) -> list[tuple[float, float]]:
     return [(float(a), (float(b) if b is not None else now) + quiet) for a, b in rec.get("spans") or []]
 
 
+def _open_window(rec: dict, hit: tuple[float, float]) -> bool:
+    """The stream of window `hit` has not ended yet (its span has no end): its end is not known."""
+    return any(b is None and abs(float(a) - hit[0]) < 1e-6 for a, b in rec.get("spans") or [])
+
+
 def _job_step(s: dict) -> str:
     st = str(s.get("step") or "")
     if st in STEPS:
@@ -438,23 +450,36 @@ def _job_step(s: dict) -> str:
 EVENTS_KEY = "occupancy_events"   # kv: stream events (box plus window start) already posted (watch)
 EVENT_LIST = 10                   # jobs an event's post lists; the rest are "+N more"
 DEVICE_STEPS = ("reset",)         # a step that touches the box's devices whatever the lock says
+REMOTE_DEVICE_STEPS = ("bench", "warmup", "reset")   # a remote job's declared step that runs on the box's devices
 
 
 def _uses_devices(cfg: dict, alias: str, s: dict, step: str) -> bool:
-    """A span uses `alias`'s own devices: a broker job on it (`machine`), a lock on its device resources
-    (checkspill.device_locks_of: `<alias>-device`, its shared device names, device.locks) or on the alias
-    itself, or a device or reset step with no resource of another machine. Read from the span's structured
-    fields, never its command: a CPU check, a test suite or a host process driving other hosts (ssh, a
-    Slurm cluster, docker over ssh) is not device use."""
+    """A span uses `alias`'s own devices: a lock on its device resources (checkspill.device_locks_of:
+    `<alias>-device`, its shared device names, device.locks) or on the alias itself, a remote job on it that
+    declared device use (`ttp detach --remote --devices N` or a bench, warm-up or reset step), or a device or
+    reset step with no resource of another machine. Read from the span's structured fields, never its command:
+    a CPU check, a test suite, a lock waiter, a log read over ssh or a host process driving other hosts (ssh, a
+    Slurm cluster, docker over ssh) is not device use, nor is any process that merely runs on the box's host
+    (user msg #3518)."""
     from . import checkspill, responsibilities
     if s.get("machine"):
-        return s["machine"] == alias
+        if s["machine"] != alias:
+            return False
+        if not s.get("resource"):
+            return bool(s.get("disruptive")) or str(s.get("step") or "") in REMOTE_DEVICE_STEPS \
+                or (str(s.get("devices") or "0").isdigit() and int(s.get("devices") or 0) > 0)
     res = str(s.get("resource") or "")
     if res:
         if res == alias or res in checkspill.device_locks_of(cfg, alias):
             return True
         return step in DEVICE_STEPS and responsibilities._names(alias, res)
     return step in DEVICE_STEPS or bool(s.get("disruptive"))
+
+
+def _box(alias: str, known: dict) -> str:
+    """The box an alias names: its registered hostname (`ttp machines`), else the alias, lower case. Two
+    aliases of one box (an ssh alias and the box's own name) are one box, so a job there is flagged once."""
+    return str((known.get(alias) or {}).get("hostname") or alias).lower()
 
 
 def _local_aliases(aliases, known: dict, here: str) -> list[str]:
@@ -473,7 +498,9 @@ def watch(p, db, now: float | None = None, post: Callable[..., None] | None = No
     overlapping it joins it; kept across restarts) lists the jobs and the source's own reason, at high severity
     when the source reported a real live stream and normal when the box only counted as live because the source
     could not tell (a fail-safe hold). It closes once its jobs ended, or once the window ended and none is known
-    to still run there (_close_ended)."""
+    to still run there (_close_ended). Aliases of one box (_box) count as one box: a job is flagged and alerted
+    once, whichever alias names it. With `occupancy.alerts` off nothing is posted and no event is opened; the
+    flags are still kept."""
     from . import activity
     now = time.time() if now is None else now
     publish(p)
@@ -497,6 +524,8 @@ def watch(p, db, now: float | None = None, post: Callable[..., None] | None = No
     from .machines import load as machines_load
     known = machines_load()
     cfg = p.config()
+    alerting = settings(cfg)["alerts"]
+    boxes = {a: _box(a, known) for a in cov}
     # A span that ran on this host counts as on `alias` only while `alias` is this host.
     local = set(_local_aliases(cov, known, here))
     seen = db.kv(SEEN_KEY, {})
@@ -515,7 +544,8 @@ def watch(p, db, now: float | None = None, post: Callable[..., None] | None = No
         start = float(s.get("start") or 0)
         # A remote job's end is known only on its host: it is unknown here, so it counts only by its start.
         end = start if s.get("state") == "unknown" else float(s["end"]) if s.get("end") is not None else now
-        for alias, regs in cov.items():
+        done: set[tuple[str, str, str]] = set()   # (box, source project, role) this span was counted against
+        for alias, regs in sorted(cov.items()):
             if not activity.on_machine(alias, s, {here.lower()} if alias in local else set()):
                 continue
             step = _job_step(s)
@@ -530,25 +560,30 @@ def watch(p, db, now: float | None = None, post: Callable[..., None] | None = No
                 # Only a job that started while the stream was live (or in its quiet tail) counts.
                 hit = next(((a, b) for a, b in _live_windows(rec, now) if a <= start <= b and end >= a), None)
                 fkey = f"{sid}:{alias}:{proj}:{stream}"
-                if hit is None or fkey in seen:
+                bkey = f"{sid}:box={boxes[alias]}:{proj}:{role}"   # the same job on another alias of this box
+                if hit is None or fkey in seen or bkey in seen or (boxes[alias], proj, role) in done:
                     continue
-                seen[fkey] = now
+                done.add((boxes[alias], proj, role))
+                seen[fkey] = seen[bkey] = now
                 flag = {"key": fkey, "alias": alias, "stream": stream, "role": role, "source": proj,
                         "task": s.get("task"), "kind": s.get("kind"), "step": step,
                         "resource": s.get("resource") or s.get("machine"), "cmd": str(s.get("cmd") or "")[:160],
                         "start": start, "end": s.get("end"), "live_from": hit[0], "quiet_to": hit[1], "at": now,
+                        "open": _open_window(rec, hit), "quiet_s": float(rec.get("quiet_s", QUIET_S)),
                         "reason": str(rec.get("live_detail") or rec.get("detail") or ""),
                         "reading": str(rec.get("live_state") or rec.get("state") or "")}
                 flags.append(flag)
                 out["flags"].append(flag)
-                ekey = _event_for(events, alias, proj, stream, hit, now)
+                if not alerting:
+                    continue   # alerts off: kept for status and the daily review, no event opened or posted
+                ekey = _event_for(events, alias, proj, stream, hit, now, boxes)
                 ev = events[ekey]
                 ev["jobs"] = sorted(set(ev.get("jobs") or []) | {sid})
                 ev["at"] = now
                 if ev.pop("closed", None) is not None:
                     fresh.add(ekey)   # a job started in the window after its alert closed: told again
                 new.setdefault(ekey, []).append(flag)
-    if post:
+    if post and alerting:
         for ekey, fl in new.items():
             if ekey in fresh:
                 real = all(f.get("reading") == "live" for f in fl)
@@ -564,20 +599,25 @@ def _event_at(v) -> float:
     return float(v.get("at") or 0) if isinstance(v, dict) else float(v)
 
 
-def _event_for(events: dict, alias: str, proj: str, stream: str, hit: tuple[float, float], now: float) -> str:
-    """The stream event (box and window) a job's hit joins: an event of the same box and stream whose window
+def _event_for(events: dict, alias: str, proj: str, stream: str, hit: tuple[float, float], now: float,
+               boxes: dict[str, str] | None = None) -> str:
+    """The stream event (box and window) a job's hit joins: an event of the same box (any alias of it, _box)
+    and source project whose window
     overlaps the hit (a window whose start moved, a stream back live inside its quiet tail), else a new one,
     marked closed so the caller reopens and posts it. A record from before events kept their window (a bare
     time) joins only by its exact key and is not posted again."""
     base = f"{alias}:{proj}:{stream}"
+    boxes = boxes or {}
+    box = boxes.get(alias, alias)
     for k, v in events.items():
-        if isinstance(v, dict) and v.get("base") == [alias, proj, stream] \
+        if isinstance(v, dict) and (v.get("base") == [alias, proj, stream]
+                                    or (v.get("box") == box and list(v.get("base") or [])[1:2] == [proj])) \
                 and float(v["from"]) <= hit[1] and hit[0] <= float(v["to"]):
             v["from"], v["to"] = min(float(v["from"]), hit[0]), max(float(v["to"]), hit[1])
             return k
     ekey = f"{base}:{int(hit[0])}"
     old = events.get(ekey)
-    events[ekey] = {"base": [alias, proj, stream], "from": hit[0], "to": hit[1], "jobs": [], "at": now}
+    events[ekey] = {"base": [alias, proj, stream], "box": box, "from": hit[0], "to": hit[1], "jobs": [], "at": now}
     if old is None:
         events[ekey]["closed"] = now   # reopened at once by the caller, so its alert is posted
     return ekey
@@ -613,6 +653,18 @@ def _job_line(f: dict) -> str:
             f"{_clock(f['start'])}-{end}")
 
 
+def _window_words(fl: list[dict]) -> str:
+    """When the stream held the box: a stream still running has no known end, so its clear time is never
+    given as a clock time (user msg #3518: "quiet until" while it was still live was false)."""
+    f = fl[0]
+    if any(x.get("open") for x in fl):
+        q = float(f.get("quiet_s", QUIET_S))
+        after = ("once it ends" if q <= 0 else "about 1 minute after it ends" if q <= 90
+                 else f"about {round(q / 60)} minutes after it ends")
+        return f"the stream is live since {_clock(f['live_from'])} and still running; the box clears {after}"
+    return f"the stream was live from {_clock(f['live_from'])} and the box was quiet until {_clock(f['quiet_to'])}"
+
+
 def event_text(fl: list[dict]) -> str:
     """One alert for a stream event: the box and window, the source's own reason at the hit (a real clip or
     a fail-safe hold with no owner shown), the first EVENT_LIST jobs and "+N more"."""
@@ -621,9 +673,8 @@ def event_text(fl: list[dict]) -> str:
     why = f.get("reason") or "no reason given"
     shown = "; ".join(_job_line(x) for x in fl[:EVENT_LIST])
     more = f"; +{len(fl) - EVENT_LIST} more" if len(fl) > EVENT_LIST else ""
-    return (f"{len(fl)} job(s) of this project used {f['alias']}{role} while a live realtime stream held it: the "
-            f"stream was live from {_clock(f['live_from'])} and quiet until {_clock(f['quiet_to'])} (source of "
-            f"{f['source']}, {f.get('reading') or 'live'}: {why}). Jobs: {shown}{more}. "
+    return (f"{len(fl)} job(s) of this project used {f['alias']}{role} while a live realtime stream held it: "
+            f"{_window_words(fl)} (source of {f['source']}, {f.get('reading') or 'live'}: {why}). Jobs: {shown}{more}. "
             f"Every deploy, restart, test, benchmark, warm-up, health check or reset there must ask "
             f"`ttp occupancy {f['alias']}` first and stay off while it says so.")
 
@@ -633,12 +684,22 @@ def recent_flags(db, since_s: float = 86400, now: float | None = None) -> list[d
     return [f for f in db.kv(FLAGS_KEY, []) if now - float(f.get("at", 0)) < since_s]
 
 
+def _alerts_here() -> bool:
+    """`occupancy.alerts` of the project WHERE names (on when there is none or it cannot be read)."""
+    try:
+        sec = WHERE.config().get("occupancy") if callable(getattr(WHERE, "config", None)) else None
+        return alerts_on(sec.get("alerts") if isinstance(sec, dict) else None)
+    except Exception:
+        return True
+
+
 def status_lines(db, now: float | None = None) -> list[str]:
     """`ttp status` and the daily review: the last day's flagged overlaps."""
     fl = recent_flags(db, 86400, now)
     if not fl:
         return []
-    return [f"Occupancy: {len(fl)} job(s) here ran on a box while a live stream held it in 24 h:"] + \
+    paused = "" if _alerts_here() else " (alerts paused: occupancy.alerts is off)"
+    return [f"Occupancy: {len(fl)} job(s) here ran on a box while a live stream held it in 24 h{paused}:"] + \
            [f"  {f['alias']}: task #{f.get('task') or '?'} {f['step']} at {_clock(f['start'])} "
             f"(source of {f['source']})" for f in fl[-5:]]
 

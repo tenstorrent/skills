@@ -611,7 +611,11 @@ def deployed(target: str | None = None, commit: str | None = None, names: list[s
             if not names and service.stopped_at(n, e, row):
                 stopped.append(n)   # stopped on purpose: no verdict, count or alert until it is started again
             elif hold:   # kept on its release on purpose (`ttp upgrade <name> --hold`): no verdict or count either
-                held.append((n, f"{n}\t{release.hold_text(hold, timefmt.ambient())} (left out of this deploy)"))
+                runs = runtime_version(Path(str(e.get("dir") or "")) / project.FOLDER / "harness" / "runtime")
+                lag = release.releases_behind(runs, target)
+                gap = f"{lag} release{'s' if lag != 1 else ''} behind {target}" if lag is not None else f"target {target}"
+                held.append((n, f"{n}\t{release.hold_text(hold, timefmt.ambient())} (left out of this deploy; "
+                                f"runs {runs or 'an unknown version'}, {gap})", runs, lag))
             else:
                 rows.append(row)
     rc = max((r["state"] for r in rows), default=OK)
@@ -623,6 +627,7 @@ def deployed(target: str | None = None, commit: str | None = None, names: list[s
     if not rows:
         first = f"{head}: no projects registered on this machine"
     lines = [first] + [r["line"] for r in sorted(rows, key=lambda r: -r["state"])]   # what holds it back first
-    lines += [f"{n}\t{service.STOPPED_ON_PURPOSE}" for n in stopped] + [ln for _, ln in held] + gone
-    return {**out, "rc": rc, "projects": rows, "stopped": stopped, "held": [n for n, _ in held],
+    lines += [f"{n}\t{service.STOPPED_ON_PURPOSE}" for n in stopped] + [h[1] for h in held] + gone
+    return {**out, "rc": rc, "projects": rows, "stopped": stopped, "held": [h[0] for h in held],
+            "held_versions": {h[0]: {"runs": h[2], "behind": h[3]} for h in held},
             "gone": [ln.split("\t")[0] for ln in gone], "text": "\n".join(lines)}

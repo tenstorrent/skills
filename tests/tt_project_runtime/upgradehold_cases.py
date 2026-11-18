@@ -624,3 +624,18 @@ def test_ttp_deployed_shows_a_release_hold_and_the_deploy_loop_skips_it(env, tmp
     assert rec['closed'] and rec['outcome'] == 'held' and not started and not pages
     release.lift_hold('alpha')
     assert overview.deployed(names=['alpha'])['rc'] != 0, "behind again once the hold is lifted"
+
+
+def test_ttp_deployed_lists_a_held_project_with_its_version_and_lag(env, tmp_path):
+    """A project a release hold keeps off the deploy is listed with the version it runs and how many
+    releases it is behind, so a stale project is visible (user msg #3518)."""
+    from ttp import overview, release
+    make(env)
+    _deploy_lib('0.5.12')
+    _deploy_project(tmp_path, 'alpha', '0.5.3')
+    release.set_hold('alpha', 'demo running', time.time() + 3600)
+    held = overview.deployed(names=['alpha'])
+    assert held['held'] == ['alpha'] and held['held_versions'] == {'alpha': {'runs': '0.5.3', 'behind': 9}}
+    assert 'alpha\theld: demo running until ' in held['text']
+    assert 'left out of this deploy; runs 0.5.3, 9 releases behind 0.5.12' in held['text']
+    assert release.releases_behind('0.4.9', '0.5.0') is None and release.releases_behind('', '0.5.0') is None

@@ -144,7 +144,15 @@ about every 15 s until the box is free (`--timeout` bounds it, `--also <alias>` 
 - The daemon's watchdog reads every source about once a minute and flags each job of its project
   that ran on a box while a stream (or its quiet window) held it: a high-severity post to the
   project's chat at once, kept for `ttp status` and the daily review. A source of its own that
-  cannot tell raises one event.
+  cannot tell raises one event. Only a device job counts: one holding a device resource of that box,
+  a `ttp detach --remote` job there declaring `--devices`, `--disruptive` or a bench, warm-up or
+  reset `--step`, or a reset or disruptive step on the host itself; a process that merely runs on
+  the host (a driver or lock waiter for another box, a log read) is never flagged. Aliases of one box
+  (the same `hostname` in `ttp machines`) give one alert per job. An alert for a stream still running
+  says it is live since its start and that the box clears about a minute after it ends.
+- `occupancy.alerts` (on by default; a coordinator may set it): `ttp config occupancy.alerts false`
+  pauses the watchdog's posts and events while its flags stay in `ttp status` and the daily review;
+  every check before a start is unchanged.
 - Long runners: `ttp occupancy <alias> --should-stop <runner>` before each trial exits 0 when the
   runner's stop switch is set or a stream holds the box. `ttp detach --stop <schedule>` sets the
   switch of a command schedule's runner and stops its live process groups; `ttp occupancy

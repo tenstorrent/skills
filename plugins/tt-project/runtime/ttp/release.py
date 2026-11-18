@@ -59,6 +59,15 @@ def _num(v: str) -> tuple[int, ...]:
     return tuple(int(x) for x in re.findall(r"\d+", v))
 
 
+def releases_behind(cur: str, target: str) -> int | None:
+    """How many releases version `cur` is behind `target`: the patch gap within one major.minor line
+    (every release bumps the patch); None when either is unknown or the lines differ."""
+    c, t = _num(cur or ""), _num(target or "")
+    if len(c) != 3 or len(t) != 3 or c[:2] != t[:2]:
+        return None
+    return max(t[2] - c[2], 0)
+
+
 def is_newer(a: str, b: str) -> bool:
     """Version `a` is strictly newer than `b` (an unknown version is older than any known one)."""
     return _num(a) > _num(b)

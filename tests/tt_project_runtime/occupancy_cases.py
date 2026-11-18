@@ -48,7 +48,7 @@ def test_occupancy_no_source_is_free_and_changes_nothing(tmp_path, monkeypatch):
     assert occ.blocks("box-a", "deploy") == "" and occ.blocks("", "test") == ""
     import json as _json
     from ttp import project
-    assert _json.loads(_json.dumps(project.DEFAULT_CONFIG["occupancy"])) == {"sources": {}, "quiet_s": 60}
+    assert _json.loads(_json.dumps(project.DEFAULT_CONFIG["occupancy"])) == {"sources": {}, "quiet_s": 60, "alerts": True}
 
 
 def test_occupancy_quiet_window_holds_a_minute_after_the_stream_ends(tmp_path, monkeypatch):
@@ -222,7 +222,7 @@ def test_occupancy_watchdog_counts_a_host_job_only_against_the_box_it_drives(env
             {**base, "id": f"lockb{tag}", "resource": "box-b"},                  # ttp lock box-b -- ssh box-b ...
             {**base, "id": f"rstb{tag}", "step": "reset", "resource": "box-b"},  # a reset of box-b from H
             {**base, "id": f"devb{tag}", "resource": "box-b-device"},            # box-b's device lock
-            {**base, "id": f"remb{tag}", "kind": "job", "machine": "box-b"},     # a remote job on box-b
+            {**base, "id": f"remb{tag}", "kind": "job", "machine": "box-b", "devices": 1},   # a remote device job
             {**base, "id": f"devh{tag}", "resource": f"{here}-device", "cmd": "bench"}])   # device work on H
         return sorted((f["key"].split(":")[0], f["alias"]) for f in occupancy.watch(p, p.db, now, None)["flags"])
 
@@ -407,7 +407,7 @@ def test_occupancy_watchdog_flags_a_remote_job_started_inside_the_window_once(en
     occ.publish(_OccProj("streamer", p.root, {"box-a": {"cmd": "exit 0"}}, quiet_s=0))
     now = time.time()
     rec = lambda i, **kw: {"ev": "job", "id": i, "project": p.name, "host": here, "task": 3, "machine": "box-a",   # noqa: E731
-                           "cmd": "bench", **kw}
+                           "cmd": "bench", "devices": 1, **kw}
     activity.append(p.state, rec("old", start=now - 600))
     out = occupancy.watch(p, p.db, now, None)   # the stream goes live now
     assert out["flags"] == [], out
@@ -474,7 +474,7 @@ def test_occupancy_stay_off_alert_of_a_remote_job_closes_once_the_stream_ends(en
     now = time.time()
     post = _occ_alert_post(p)
     remote = {"id": "r1", "kind": "job", "start": now, "end": None, "state": "unknown", "machine": "box-a",
-              "task": 5, "cmd": "bench"}
+              "task": 5, "cmd": "bench", "devices": 1}
     local = {"id": "l1", "kind": "lock", "start": now, "end": None, "resource": "box-b-device", "task": 6,
              "cmd": "bench"}
     _watch_with(monkeypatch, [remote, local])
@@ -691,3 +691,129 @@ def test_occupancy_tbcycle_runner_trial_waits_for_its_gate(monkeypatch, tmp_path
     tbcycle.runner({}, "m", {}, trial=lambda m, t, root: order.append("trial") or {},
                    gate=lambda: order.append("gate"), sleep=lambda s: None)
     assert order[:2] == ["gate", "trial"], order
+
+
+def _occ_two_aliases(env, monkeypatch, alerts=None):
+    """A live, open stream on box-a, registered under box-a and box-a-host (one box: both name this host in
+    the machine list) with router-a as its front; the watching project runs on this same host."""
+    import json
+    from ttp import project
+    p = make(env)
+    occ = _occ_home(env["home"], monkeypatch)
+    here = project.hostname()
+    (project.HOME_DIR / "machines.json").write_text(json.dumps({"machines": {
+        "box-a": {"tags": [], "hostname": here}, "box-a-host": {"tags": [], "hostname": here}}}))
+    src = {"cmd": "echo stream live; exit 0", "fronts": ["router-a"]}
+    occ.publish(_OccProj("streamer", p.root, {"box-a": src, "box-a-host": src}))
+    if alerts is not None:
+        cfg = p.config()
+        cfg.setdefault("occupancy", {})["alerts"] = alerts
+        monkeypatch.setattr(type(p), "config", lambda self: cfg)
+    return p, occ, here
+
+
+def test_occupancy_replay_host_processes_on_a_held_box_are_never_flagged(env, monkeypatch):
+    """Replay of a false-alert burst (user msg #3518): a live stream on box-a, whose host also runs this
+    project. Bench drivers and lock holders for another box's work, a waiter with no resource, an ssh log read
+    on another box and on box-a itself, and a span started 2 days earlier all run on box-a's host. No broker job
+    is on box-a: nothing is flagged and nothing is posted."""
+    from ttp import occupancy
+    p, occ, here = _occ_two_aliases(env, monkeypatch)
+    now = time.time()
+    occupancy.watch(p, p.db, now, None)   # the stream goes live now and stays open
+    t = now + 5
+    host = {"start": t, "end": None, "host": here, "task": 4}
+    spans = [{**host, "id": "drv", "kind": "job", "cmd": "ssh box-b bench"},                  # driver for box-b
+             {**host, "id": "lockb", "kind": "lock", "resource": "box-b-device", "cmd": "bench"},
+             {**host, "id": "lockw", "kind": "job", "cmd": "ttp lock --wait box-b -- run"},  # a waiter
+             {**host, "id": "tailb", "kind": "job", "machine": "box-b", "state": "unknown", "cmd": "tail log"},
+             {**host, "id": "taila", "kind": "job", "machine": "box-a", "state": "unknown", "cmd": "tail log"},
+             {**host, "id": "old", "kind": "lock", "start": now - 2 * 86400, "resource": "box-a-device",
+              "cmd": "bench"}]
+    _watch_with(monkeypatch, spans)
+    posts = []
+    out = occupancy.watch(p, p.db, t, lambda key, text, sev="high": posts.append((key, text, sev)))
+    assert out["flags"] == [] and posts == [], (out["flags"], posts)
+
+
+def test_occupancy_a_broker_job_on_a_held_box_gives_one_alert_whatever_its_aliases(env, monkeypatch):
+    """A device job on the held box that starts inside the live window gives exactly one alert, even with the
+    box registered under two aliases: a device lock, a remote job that declared devices, and a reset step on
+    the box's host each count once against the box, and a later pass posts nothing more."""
+    from ttp import occupancy
+    p, occ, here = _occ_two_aliases(env, monkeypatch)
+    now = time.time()
+    occupancy.watch(p, p.db, now, None)
+    t = now + 5
+    host = {"start": t, "end": None, "host": here, "task": 6}
+    spans = [{**host, "id": "dev", "kind": "lock", "resource": "box-a-device", "cmd": "bench"},
+             {**host, "id": "rem", "kind": "job", "machine": "box-a", "state": "unknown", "devices": 1,
+              "cmd": "render"},
+             {**host, "id": "rst", "kind": "job", "step": "reset", "cmd": "reset"}]
+    _watch_with(monkeypatch, spans)
+    posts = []
+    post = lambda key, text, sev="high": posts.append((key, text, sev))   # noqa: E731
+    out = occupancy.watch(p, p.db, t, post)
+    assert sorted(f["key"].split(":")[0] for f in out["flags"]) == ["dev", "rem", "rst"], out["flags"]
+    assert len(posts) == 1 and posts[0][2] == "high" and "3 job(s)" in posts[0][1], posts
+    assert occupancy.watch(p, p.db, t + 30, post)["flags"] == [] and len(posts) == 1
+
+
+def test_occupancy_alert_for_an_open_stream_never_says_quiet_until(env, monkeypatch):
+    """A stream still live has no known end: its alert says live since <time> and that the box clears about
+    1 minute after the stream ends; once the stream ended, the quiet-until time is given."""
+    from ttp import occupancy
+    p, occ, here = _occ_two_aliases(env, monkeypatch)
+    now = time.time()
+    occupancy.watch(p, p.db, now, None)
+    _watch_with(monkeypatch, [{"id": "d1", "kind": "lock", "start": now + 5, "end": None, "host": here,
+                               "resource": "box-a-device", "task": 2, "cmd": "bench"}])
+    posts = []
+    occupancy.watch(p, p.db, now + 5, lambda key, text, sev="high": posts.append(text))
+    assert len(posts) == 1 and "quiet until" not in posts[0], posts
+    assert f"live since {occupancy._clock(now)}" in posts[0] and "about 1 minute after it ends" in posts[0], posts
+    closed = {"open": False, "live_from": now, "quiet_to": now + 60, "quiet_s": 60}
+    assert f"quiet until {occupancy._clock(now + 60)}" in occupancy._window_words([closed])
+
+
+def test_occupancy_alerts_switch_off_keeps_flags_and_posts_nothing(env, monkeypatch):
+    """`occupancy.alerts` off: the job is still flagged and kept for status and the daily review, but no alert
+    is posted and no event is opened; the pre-step check still refuses. Back on, a new job in the window posts."""
+    from ttp import coordinator, occupancy
+    assert occupancy.settings({})["alerts"] is True
+    assert occupancy.settings({"occupancy": {"alerts": "off"}})["alerts"] is False
+    assert coordinator.settable("occupancy.alerts")("false") is False
+    p, occ, here = _occ_two_aliases(env, monkeypatch, alerts=False)
+    now = time.time()
+    occupancy.watch(p, p.db, now, None)
+    mk = lambda i, t: {"id": f"d{i}", "kind": "lock", "start": t, "end": None, "host": here,   # noqa: E731
+                       "resource": "box-a-device", "task": i, "cmd": "bench"}
+    _watch_with(monkeypatch, [mk(1, now + 5)])
+    posts = []
+    post = lambda key, text, sev="high": posts.append(key)   # noqa: E731
+    out = occupancy.watch(p, p.db, now + 5, post)
+    assert len(out["flags"]) == 1 and posts == [] and p.db.kv(occupancy.EVENTS_KEY, {}) == {}
+    occupancy.WHERE = p
+    try:
+        assert any("alerts paused" in line for line in occupancy.status_lines(p.db, now + 6))
+    finally:
+        occupancy.WHERE = None
+    # precheck_unchanged: the pre-step check holds the box either way
+    assert occupancy.blocks("box-a", "test", now + 6) and occupancy.blocks("box-a-host", "bench", now + 6)
+    p.config()["occupancy"]["alerts"] = True
+    _watch_with(monkeypatch, [mk(1, now + 5), mk(2, now + 7)])
+    assert len(occupancy.watch(p, p.db, now + 7, post)["flags"]) == 1 and len(posts) == 1
+
+
+def test_occupancy_remote_detach_records_its_declared_device_use(env):
+    """`ttp detach --remote` records its step and declared devices, which the watchdog reads (a bare remote
+    command is a process on that host, not device use)."""
+    import pathlib
+    from ttp import cli
+    src = (pathlib.Path(cli.__file__)).read_text()
+    assert '("devices", getattr(a, "devices", None))' in src
+    from ttp import occupancy
+    assert not occupancy._uses_devices({}, "box-a", {"machine": "box-a"}, "test")
+    assert occupancy._uses_devices({}, "box-a", {"machine": "box-a", "devices": 2}, "test")
+    assert occupancy._uses_devices({}, "box-a", {"machine": "box-a", "step": "bench"}, "bench")
+    assert not occupancy._uses_devices({}, "box-a", {"machine": "box-b", "devices": 2}, "test")
