@@ -143,10 +143,16 @@ names, each once). The job:
    stopped. Resubmitting the same `--name` keeps the results; `--fresh` starts over.
 
 On a bad node it appends `<node> <date> <why>` to the bad-node list (`<slurm.state_dir>/bad_nodes.txt`,
-default `<workdir_root>/state`), and resubmits itself with that node added to `--exclude`, at most
-3 attempts in all (exit 98 after a resubmit, 95 when out of attempts). The resubmitted job writes
-to the same `job.log`; `status` and `verdict` print `resubmitted as job N`: follow that job. New
-`build`, `test` and `cases` jobs also exclude nodes marked bad within `--bad-days` (default 7).
+default `<workdir_root>/state`), naming the node by its Slurm node name (`SLURMD_NODENAME`, the
+hostname only outside Slurm) and dropping entries older than the bad-node window as it rewrites the
+file. It then resubmits itself with that node added to `--exclude`, at most 3 attempts in all
+(exit 98 after a resubmit, 95 when out of attempts). The resubmitted job writes to the same
+`job.log`; `status` and `verdict` print `verdict: resubmitted; rc 98; ...; resubmitted as job N`
+(`verdict` exits 2, not final): follow that job. New `build`, `test` and `cases` jobs also exclude
+nodes marked bad within `--bad-days` (default 7). sbatch refuses a job whose `--exclude` names a
+node it does not know, so every `--exclude` (from `submit` too) keeps only nodes
+`sinfo -p <partition>` lists; when sinfo lists none, recorded bad nodes are left out and only the
+site file's nodes are excluded.
 
 ### Verdict: read it, not the whole log
 

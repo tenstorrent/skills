@@ -380,7 +380,8 @@ def cmd_submit(args) -> int:
             if args.allow is not None or args.min_idle > 0:
                 raise Refused("--allow and --min-idle check a named node: pick one with survey "
                               "and pass it as --node")
-            place = _scheduler_placement(e, login, part)
+            opts, skip = _placed(e, login, part, None, 0)
+            place = opts + _excl(skip)
     except (Refused, box.SiteError) as err:
         print(f"refused: {err}")
         return 1
@@ -544,8 +545,12 @@ def _placed(e: dict, login: str, part: dict, allow: Optional[List[str]],
             raise Refused(f"sinfo cannot list partition {pname}'s nodes to apply --allow "
                           f"(exit {r.returncode}): {r.stderr.strip()[-300:]}")
         skip += [n for n in members if n not in allow]
-    if bad_days > 0:
-        skip += fresh_bad(bad_out, datetime.datetime.now().astimezone(), bad_days)
+    fresh = fresh_bad(bad_out, datetime.datetime.now().astimezone(), bad_days) if bad_days > 0 else []
+    # sbatch refuses the whole job when --exclude names a node it does not know (a renamed or retired
+    # node, a hostname that is not the Slurm node name), and leaving out a node outside the partition
+    # changes nothing: keep only partition members. When sinfo listed none, keep the site file's
+    # names and leave the recorded bad nodes out rather than risk an invalid --exclude.
+    skip = [n for n in skip + fresh if n in members] if members else skip
     skip = list(dict.fromkeys(_name("node", n) for n in skip))
     if members and all(n in skip for n in members):
         raise Refused(f"no node of partition {pname} is left once --allow, demo_nodes, excluded_nodes "
@@ -628,20 +633,23 @@ def parse_cases(text: str) -> List[Tuple[str, str]]:
 
 
 def cases_command(cases: List[Tuple[str, str]], rundir: str, bad_file: str, resubmit: List[str],
-                  skip: List[str], chips: Optional[int], prefix: str, *, dev_dir: str = "/dev/tenstorrent",
-                  tt_smi: str = "tt-smi") -> str:
-    """The cases job: check the node (device count, tt-smi -ls); on a bad node record it, resubmit
-    itself without it (at most MAX_ATTEMPTS in all) and stop; else run each case not yet in
-    results.tsv, appending one line per case, so a rerun (preempted, resubmitted, or the same --name
-    again) carries on where the last one stopped."""
+                  skip: List[str], chips: Optional[int], prefix: str, *, partition: str,
+                  dev_dir: str = "/dev/tenstorrent", tt_smi: str = "tt-smi", keep_days: float = BAD_DAYS) -> str:
+    """The cases job: check the node (device count, tt-smi -ls); on a bad node record it by its Slurm
+    node name (bad_nodes.txt keeps only the last `keep_days`), resubmit itself without it (at most
+    MAX_ATTEMPTS in all, excluding only nodes `partition` lists) and stop; else run each case not yet
+    in results.tsv, appending one line per case, so a rerun (preempted, resubmitted, or the same
+    --name again) carries on where the last one stopped."""
     rd, d, smi = _rpath(rundir), shlex.quote(dev_dir), shlex.quote(tt_smi)
+    pname = shlex.quote(_name("partition", partition))
+    keep = int(max(keep_days, BAD_DAYS) * 86400)
     body = "\n".join(f"{cid}\t{cmd}" for cid, cmd in cases)
     need = (f'if [ "$n" -lt {int(chips)} ]; then why="$n of {int(chips)} devices in "{d}; fi\n'
             if chips else "")
     return f"""res={rd}/results.tsv
 bad={_rpath(bad_file)}
 attempt=${{TTP_CASES_ATTEMPT:-1}}
-node=$(hostname -s 2>/dev/null || hostname)
+node=${{SLURMD_NODENAME:-$(hostname -s 2>/dev/null || hostname)}}
 mkdir -p {rd}/cases
 touch "$res"
 echo "==> node-check start"
@@ -650,14 +658,23 @@ why=""
 {need}if [ -z "$why" ] && command -v {smi} >/dev/null && ! timeout 120 {smi} -ls >/dev/null 2>&1; then why="tt-smi -ls failed"; fi
 if [ -n "$why" ]; then
   echo "node check failed on $node: $why"
-  mkdir -p "$(dirname "$bad")" && echo "$node $(date -Is) $why" >> "$bad"
+  mkdir -p "$(dirname "$bad")"
+  (flock 9 2>/dev/null
+   cut=$(( $(date +%s) - {keep} ))
+   {{ [ -f "$bad" ] && while read -r b t rest; do
+       s=$(date -d "$t" +%s 2>/dev/null) || continue
+       [ "$s" -ge "$cut" ] && echo "$b $t $rest"
+     done < "$bad"
+     echo "$node $(date -Is) $why"; }} > "$bad.$$" && mv -f "$bad.$$" "$bad") 9>>"$bad.lock"
   echo "$node" >> {rd}/excluded.txt
   echo "==> node-check done rc=1"
   if [ "$attempt" -ge {MAX_ATTEMPTS} ]; then
     echo "error: node check failed on $attempt nodes; not resubmitting (at most {MAX_ATTEMPTS})"; exit 95
   fi
-  ex=$( (printf '%s\\n' {' '.join(shlex.quote(x) for x in skip)}; cat {rd}/excluded.txt) | grep -v '^$' | sort -u | paste -sd, -)
-  j=$(env -u TTP_JOB_PGRP TTP_CASES_ATTEMPT=$((attempt + 1)) {shlex.join(resubmit)} --exclude="$ex" \\
+  m=$(sinfo -h -N -p {pname} -o %N 2>/dev/null | grep -v '^$' | sort -u)
+  ex=$( (printf '%s\\n' {' '.join(shlex.quote(x) for x in skip)}; cat {rd}/excluded.txt) | grep -v '^$' | sort -u |
+       if [ -n "$m" ]; then grep -Fx -f <(printf '%s\\n' "$m"); else cat; fi | paste -sd, -)
+  j=$(env -u TTP_JOB_PGRP TTP_CASES_ATTEMPT=$((attempt + 1)) {shlex.join(resubmit)} ${{ex:+"--exclude=$ex"}} \\
       --open-mode=append --output={rd}/job.log --error={rd}/job.log {rd}/job.sbatch)
   if [ -z "$j" ]; then echo "error: resubmitting failed"; exit 95; fi
   echo "${{j%%;*}}" > {rd}/job.next
@@ -741,7 +758,8 @@ def cmd_cases(args) -> int:
     resubmit = ["sbatch", "--parsable", *opts, "-p", args.partition, f"--time={args.time}",
                 f"--job-name={args.name}"]
     command = cases_command(cases, rundir, _bad_file(e), resubmit, skip, chips, _run_prefix(e, args),
-                            dev_dir=args.dev_dir, tt_smi=args.tt_smi)
+                            partition=args.partition, dev_dir=args.dev_dir, tt_smi=args.tt_smi,
+                            keep_days=args.bad_days)
     if args.fresh:
         r = _login(login, f"rm -f {_rpath(rundir)}/results.tsv {_rpath(rundir)}/excluded.txt; "
                           f"rm -rf {_rpath(rundir)}/cases")
@@ -771,7 +789,10 @@ def job_verdict(login: str, job: str, rundir: Optional[str]) -> Tuple[dict, str]
     state, _, rest = r.stdout.partition("\n")
     rc_s, nxt, log = (rest.split("---\n", 3)[1:] + ["", "", ""])[:3] if rundir else ("", "", "")
     rc = int(rc_s.strip()) if re.fullmatch(r"-?\d+", rc_s.strip()) else None
-    return v.verdict(log, state=state.strip(), rc=rc), nxt.strip()
+    out, nxt = v.verdict(log, state=state.strip(), rc=rc), nxt.strip()
+    if rc == 98 and nxt:  # the cases job's node check failed and it resubmitted itself: not a failure
+        out = dict(out, verdict="resubmitted", step="", why=f"node check failed; resubmitted as job {nxt}")
+    return out, nxt
 
 
 def cmd_verdict(args) -> int:
@@ -792,7 +813,7 @@ def cmd_verdict(args) -> int:
     print("\n".join(lines))
     if nxt:
         print(f"resubmitted as job {nxt}: wait for it, then run verdict on {nxt}")
-    return {"passed": 0, "unknown": 2}.get(v["verdict"], 1)
+    return {"passed": 0, "unknown": 2, "resubmitted": 2}.get(v["verdict"], 1)
 
 
 def _csv(v: str) -> List[str]:

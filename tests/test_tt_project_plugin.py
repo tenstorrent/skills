@@ -5374,7 +5374,11 @@ def _fake_slurm(tmp_path, node="State=IDLE LastBusyTime=2000-01-01T00:00:00", re
                     '{ echo "No reservations in the system"; exit 1; };; *) cat "$FAKE/node.txt";; esac',
         "sinfo": 'cat "$FAKE/sinfo.txt"',
         "squeue": 'cat "$FAKE/squeue.txt"',
-        "sbatch": 'echo "$*" > "$FAKE/sbatch.args"; for a; do s=$a; done; cp "$s" "$FAKE/job.sbatch"; echo 4242',
+        # Like Slurm, refuse an --exclude naming a node sinfo does not know.
+        "sbatch": 'for a; do case "$a" in --exclude=*) for n in $(echo "${a#*=}" | tr , " "); do '
+                  'cut -d"|" -f1 "$FAKE/sinfo.txt" | grep -qx "$n" || '
+                  '{ echo "$*" > "$FAKE/sbatch.refused"; echo "sbatch: error: Invalid node name specified" >&2; exit 1; }; done;; esac; done; '
+                  'echo "$*" > "$FAKE/sbatch.args"; for a; do s=$a; done; cp "$s" "$FAKE/job.sbatch"; echo 4242',
     }
     for name, body in tools.items():
         (bin_ / name).write_text(f"#!/bin/bash\n{body}\n")
@@ -5485,8 +5489,12 @@ def test_setup_box_slurm_submit_without_node_lets_slurm_place_the_job(tmp_path):
     r = run(*base)
     assert r.returncode == 0, r.stdout + r.stderr
     args = (fake / "sbatch.args").read_text()
-    assert args.startswith("--parsable --nodes=1 --exclude=demo1,bad1 -p p4 --time=30 "), args
+    # demo1 and bad1 are not in the partition: sbatch would refuse them in --exclude.
+    assert args.startswith("--parsable --nodes=1 -p p4 --time=30 "), args
     assert "-w" not in args.split() and "--exclusive" not in args
+    (fake / "sinfo.txt").write_text("node07\ndemo1\nbad1\n")
+    assert run(*base).returncode == 0
+    assert (fake / "sbatch.args").read_text().startswith("--parsable --nodes=1 --exclude=demo1,bad1 -p p4 ")
     assert "node: assigned by Slurm" in r.stdout
     note = next(ln for ln in r.stdout.splitlines() if ln.startswith("note: ttp note "))
     assert "node assigned by Slurm" in note and "job 4242" in note
@@ -5495,7 +5503,7 @@ def test_setup_box_slurm_submit_without_node_lets_slurm_place_the_job(tmp_path):
     (tmp_path / "boxes.json").write_text(json.dumps(site))
     (fake / "part.txt").write_text("PartitionName=p4 Nodes=node07 OverSubscribe=NO State=UP\n")
     assert run(*base).returncode == 0
-    assert "--nodes=1 --exclude=demo1,bad1 --exclusive -p p4" in (fake / "sbatch.args").read_text()
+    assert "--nodes=1 --exclusive --exclude=demo1,bad1 -p p4" in (fake / "sbatch.args").read_text()
     (fake / "part.txt").write_text("PartitionName=p4 Nodes=node07 OverSubscribe=EXCLUSIVE State=UP\n")
     assert run(*base).returncode == 0
     assert "--exclusive" not in (fake / "sbatch.args").read_text()
@@ -5538,8 +5546,9 @@ def test_setup_box_slurm_build_once_then_tests_share_the_build(tmp_path):
             "--command", "echo compiling; echo built > out.bin")
     assert r.returncode == 0, r.stdout + r.stderr
     args = (fake / "sbatch.args").read_text()
-    # Slurm places it, never on demo/excluded nodes nor partition nodes outside --allow.
-    assert "--nodes=1 --exclude=demo1,bad1,node09 -p p4 --time=30 --job-name=b1 " in args, args
+    # Slurm places it, never on partition nodes outside --allow; demo/excluded nodes outside the
+    # partition are left out of --exclude, which sbatch would refuse.
+    assert "--nodes=1 --exclude=node09 -p p4 --time=30 --job-name=b1 " in args, args
     assert "-w" not in args.split() and "next: box.py slurm test <box-alias> --after 4242" in r.stdout
     build = tmp_path / "work" / "runs" / "b1" / "job.sbatch"
     out = _run_job(build)
@@ -5571,6 +5580,9 @@ def test_setup_box_slurm_build_once_then_tests_share_the_build(tmp_path):
     assert "salloc" in run("test", "<box-alias>", "--name", "t", *base, "--command", "salloc -N1").stdout
     r = run("build", "<box-alias>", "--name", "b", *base, "--allow", "nodeX", "--command", "make")
     assert r.returncode == 1 and "no node of partition p4 is left" in r.stdout
+    (fake / "sinfo.txt").write_text("node07\nnode08\nnode09\ndemo1\n")
+    assert run("build", "<box-alias>", "--name", "b2", *base, "--command", "true").returncode == 0
+    assert "--exclude=demo1 " in (fake / "sbatch.args").read_text()
 
 
 def test_setup_box_slurm_build_runs_in_the_site_container(tmp_path):
@@ -5588,6 +5600,7 @@ def test_setup_box_slurm_build_runs_in_the_site_container(tmp_path):
 
 def test_setup_box_slurm_cases_resume_and_resubmit_without_a_bad_node(tmp_path):
     import subprocess
+    import datetime
     run, fake = _fake_slurm(tmp_path)
     co = tmp_path / "work" / "repo"
     co.mkdir(parents=True)
@@ -5618,26 +5631,48 @@ def test_setup_box_slurm_cases_resume_and_resubmit_without_a_bad_node(tmp_path):
     assert run(*base).returncode == 0 and (rundir / "results.tsv").is_file()
     assert run(*base, "--fresh").returncode == 0 and not (rundir / "results.tsv").exists()
 
-    # A node short of devices is recorded as bad and the job resubmits itself without it.
+    # A node short of devices is recorded as bad by its Slurm node name, not its hostname, and the
+    # job resubmits itself without it, excluding only nodes the partition lists (bad1 is not one).
+    # Entries older than the bad-node window are dropped as the file is rewritten.
     (devs / "3").unlink()
     (fake / "sbatch.args").unlink()
-    out = _run_job(script, bin_dir=tmp_path / "bin")
+    (fake / "sinfo.txt").write_text("node07\nnode08\ndemo1\n")
+    state = tmp_path / "work" / "state"
+    state.mkdir(parents=True)
+    now = datetime.datetime.now().astimezone()
+    old, recent = ((now - datetime.timedelta(days=d)).isoformat(timespec="seconds") for d in (10, 1))
+    (state / "bad_nodes.txt").write_text(f"old3 {old} tt-smi -ls failed\ngone9 {recent} retired since\n")
+    assert run(*base).returncode == 0
+    out = _run_job(script, env={"SLURMD_NODENAME": "node08"}, bin_dir=tmp_path / "bin")
     host = subprocess.run(["hostname", "-s"], capture_output=True, text=True).stdout.strip()
     assert out.returncode == 98 and "3 of 4 devices" in out.stdout, out.stdout + out.stderr
+    assert "node check failed on node08" in out.stdout
     assert "resubmitted as job 4242 (attempt 2 of 3)" in out.stdout
     assert (rundir / "job.next").read_text().strip() == "4242"
     args = (fake / "sbatch.args").read_text()
-    assert f"--exclude={','.join(sorted(['demo1', 'bad1', host]))}" in args and "--open-mode=append" in args
-    bad = (tmp_path / "work" / "state" / "bad_nodes.txt").read_text()
-    assert bad.startswith(f"{host} ") and "3 of 4 devices" in bad
+    assert "--exclude=demo1,node08 " in args and "--open-mode=append" in args, args
+    bad = (state / "bad_nodes.txt").read_text().splitlines()
+    assert [ln.split()[0] for ln in bad] == ["gone9", "node08"] and "3 of 4 devices" in bad[1], bad
+    assert host not in (state / "bad_nodes.txt").read_text() or host == "node08"
     assert not (rundir / "results.tsv").read_text().strip()
     # The third attempt stops instead of resubmitting.
     (fake / "sbatch.args").unlink()
-    out = _run_job(script, env={"TTP_CASES_ATTEMPT": "3"}, bin_dir=tmp_path / "bin")
+    out = _run_job(script, env={"TTP_CASES_ATTEMPT": "3", "SLURMD_NODENAME": "node08"}, bin_dir=tmp_path / "bin")
     assert out.returncode == 95 and not (fake / "sbatch.args").exists()
-    # A new submit leaves out the recently bad node; --bad-days 0 does not.
-    assert run(*base).returncode == 0 and host in (fake / "sbatch.args").read_text()
-    assert run(*base, "--bad-days", "0").returncode == 0 and host not in (fake / "sbatch.args").read_text()
+    # A new submit leaves out the recently bad node but not the one the partition no longer lists
+    # (sbatch would refuse it); --bad-days 0 leaves out neither.
+    r = run(*base)
+    args = (fake / "sbatch.args").read_text()
+    assert r.returncode == 0 and "--exclude=demo1,node08 " in args and "gone9" not in args, r.stdout + args
+    r = run(*base, "--bad-days", "0")
+    assert r.returncode == 0 and "node08" not in (fake / "sbatch.args").read_text(), r.stdout
+    # With sinfo listing nothing, recorded bad nodes are left out of --exclude rather than risked
+    # (this fake sbatch then refuses the site file's names, which a real cluster knows).
+    (fake / "sinfo.txt").write_text("")
+    run(*base)
+    assert "--exclude=demo1,bad1 " in (fake / "sbatch.refused").read_text()
+    (fake / "sinfo.txt").write_text("node07\nnode08\ndemo1\nbad1\n")
+    assert run(*base).returncode == 0 and "--exclude=demo1,bad1,node08 " in (fake / "sbatch.args").read_text()
     # Bad cases files are refused before anything is sent.
     for text, why in (("c1 echo\n", "expected <id><TAB><command>"), ("c1\ta\nc1\tb\n", "listed twice"),
                       ("a b\tx\n", "not a plain name"), ("# none\n", "lists no case")):
@@ -5673,6 +5708,14 @@ def test_setup_box_slurm_verdict_reads_rc_state_and_log(tmp_path):
     (rundir / "job.next").write_text("4243\n")
     r = run("verdict", "<box-alias>", "4242", "--name", "t1")
     assert r.returncode == 0 and "verdict: passed" in r.stdout and "resubmitted as job 4243" in r.stdout
+    # A cases job that found its node bad and resubmitted itself (rc 98) is not a failure.
+    (rundir / "job.rc").write_text("98\n")
+    (fake / "sacct.txt").write_text("FAILED\n")
+    r = run("verdict", "<box-alias>", "4242", "--name", "t1")
+    assert r.returncode == 2 and r.stdout.startswith("verdict: resubmitted; rc 98; FAILED; node check failed; "
+                                                     "resubmitted as job 4243"), r.stdout
+    (rundir / "job.rc").write_text("0\n")
+    (fake / "sacct.txt").write_text("COMPLETED\n")
     assert "pass --name" in run("verdict", "<box-alias>", "4242").stdout
     # status prints the verdict once the job ended
     r = run("status", "<box-alias>", "4242", "--name", "t1")
