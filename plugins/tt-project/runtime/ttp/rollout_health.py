@@ -28,6 +28,9 @@ ALERT_AREAS = {
     "eta": (),
     "device": (),
     "review": (),
+    "worker": (),
+    "coordinator": (),
+    "output": (),
 }
 H = 3600.0
 
