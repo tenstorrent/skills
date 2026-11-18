@@ -441,15 +441,22 @@ def _lane_waits_on(project_name: str, base: str, key: str, q: list, cfg: dict | 
     """What each waiter in lane `base`'s queue `q` (in turn order) waits on: the lane itself while its
     lanes are all held; with one free, the project cap only while the project's running checks fill it
     (testslots.cap_turn's count: testslots.project_held), else the host gate a run of the project holding a
-    lane waits on (_host_gate: the test-slot pool or the load guard), else nothing (about to start)."""
+    lane waits on (_host_gate: the test-slot pool or the load guard), else nothing (about to start) for the
+    first waiters the free lanes (and the cap's room) fit; the waiters behind them wait on the lane (or cap)."""
     held = _held_numbered(base)
     n = 1 if key.startswith("w") else max(1, slots(cfg, held))
     if held >= n:
         return [label for _ in q]
     cap = project_cap(cfg)
-    on = CAP_LABEL if cap > 0 and len(testslots.project_held(project_name)) >= cap else \
-        _host_gate(project_name) or "nothing (about to start)"
-    return [on for _ in q]
+    if cap > 0 and len(testslots.project_held(project_name)) >= cap:
+        return [CAP_LABEL for _ in q]
+    # Only the first waiters, as many as there are free lanes, can start now: the rest wait for those to
+    # take their lanes (several local full checks run side by side up to the free lanes and the cap).
+    free, rest = n - held, label
+    if cap > 0 and (room := cap - len(testslots.project_held(project_name))) < free:
+        free, rest = room, CAP_LABEL
+    on = _host_gate(project_name) or "nothing (about to start)"
+    return [on if i < free else rest for i in range(len(q))]
 
 
 HOST_GATE = "the host's gate: "   # _host_gate's prefix (waits()' limit "host")

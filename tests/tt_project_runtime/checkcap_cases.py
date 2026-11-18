@@ -4550,6 +4550,38 @@ def test_the_cap_label_shows_only_at_the_cap_and_below_it_the_wait_names_the_hos
             g and g.close()
 
 
+def test_waiters_behind_the_free_lanes_wait_on_the_lane_not_on_nothing(env, monkeypatch):
+    """Several full checks of one repository run side by side up to its lanes and the project cap: with 3
+    lanes, 2 held and room under the cap, the first waiter is about to start and the one behind it waits
+    on the lane (the free lane is the first's), never "nothing (about to start)"; at the cap's room the
+    waiter behind waits on the cap."""
+    from ttp import checkcap, checklane, locks, testslots
+    _lane_env(monkeypatch)
+    _slot_sizes(monkeypatch, 32, 4, TTP_TEST_PROJECT_MAX=6)
+    p = make(env)
+    p.set_config("checks.slots", 3)
+    p.set_config("checks.wait_event_s", 1)
+    cfg = p.config()
+    monkeypatch.setattr(checklane, "_proc", lambda pid: {"command": "", "cwd": "", "ppid": None, "sid": None, "env": None})
+    three = lambda _held: 3   # noqa: E731
+    gs = [testslots.suite_hold(p.name, repo=_LANE_REPO, slots=three, cap=6, wait_s=0, pending=True, running=True,
+                               who=f"run {i}") for i in (1, 2)]
+    tickets = []
+    try:
+        assert all(g and g.files for g in gs) and all(testslots.claim_running(g, p.name, three, 6) for g in gs)
+        for i in (98, 99):
+            tickets.append(locks.enqueue(checkcap.slot_dir(), testslots._suite_resource(p.name, _LANE_REPO),
+                                         f"{p.name}: full checks (run {i}, pid 4242)", time.time() - 200 + i, priority=2))
+        w = checklane.waits(p.name, cfg)
+        assert [x["waits_on"] for x in w] == ["nothing (about to start)", w[0]["lane"]], w
+        assert w[1]["limit"] == "lanes", w
+    finally:
+        for t in tickets:
+            locks.dequeue(t)
+        for g in gs:
+            g and g.close()
+
+
 def test_a_long_holder_is_a_likely_hang_only_when_its_log_and_cpu_stalled_else_slow_under_load(monkeypatch):
     """checks.wait_hang_factor x the median alone says a holder is long, not hung: a likely hang needs
     checkstall's stalled view (its log not grown for its threshold) and, where the daemon's CPU reading
