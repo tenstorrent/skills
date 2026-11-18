@@ -179,3 +179,15 @@ def test_the_deslop_schedule_follows_the_flag_and_the_hourly_check_keeps_it(env)
     dm._deslop_tried = 0.0
     dm.keep_deslop()
     assert row()["enabled"] == 0, row()
+
+
+def test_a_deslop_schedule_that_never_ran_is_due_once_not_a_whole_period_away(env):
+    import time
+    from ttp import deslop
+    p = make(env)
+    nxt = lambda: p.db.one("SELECT next_run FROM schedules WHERE name='deslop'")["next_run"]   # noqa: E731
+    assert deslop.ensure(p, p.db, True, "1d") == "on" and nxt() <= time.time(), "the first pass waited a day"
+    p.db.x("UPDATE schedules SET next_run=? WHERE name='deslop'", (time.time() + 86400,))
+    assert deslop.ensure(p, p.db, True, "1d") == "" and nxt() > time.time() + 80000, "pulled forward twice"
+    p.db.set_kv(deslop.KEY, {})   # a schedule made before this rule: never ran, never kicked
+    assert deslop.ensure(p, p.db, True, "1d") == "due" and nxt() <= time.time()

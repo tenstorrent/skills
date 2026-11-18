@@ -37,24 +37,32 @@ def settings(cfg: dict) -> dict:
 
 
 def ensure(p, db, on: bool, every: str) -> str:
-    """Keep the schedule on, every `every`, while `on`; off otherwise. Returns what changed ('' none)."""
+    """Keep the schedule on, every `every`, while `on`; off otherwise. Returns what changed ('' none).
+    A schedule that never ran is due at once, once: the first pass is not a whole `every` away."""
     from . import schedule as sched, timefmt
-    row = db.one("SELECT enabled, every_s, payload FROM schedules WHERE name=?", (SCHEDULE,))
+    row = db.one("SELECT enabled, every_s, payload, last_run FROM schedules WHERE name=?", (SCHEDULE,))
     if not on and not (row and row["enabled"]):
         return ""
-    if on and row and row["enabled"] and row["every_s"] == sched.parse_every(every) \
-            and json.loads(row["payload"] or "{}") == PAYLOAD:
-        return ""
-    sched.before_change(p)
-    if on:
+    did = ""
+    if on and not (row and row["enabled"] and row["every_s"] == sched.parse_every(every)
+                   and json.loads(row["payload"] or "{}") == PAYLOAD):
+        sched.before_change(p)
         sched.upsert(db, SCHEDULE, "llm", every, None, True, None, DESCRIPTION, dict(PAYLOAD), timefmt.home(p))
-    else:
+        did = "on"
+    elif not on:
+        sched.before_change(p)
         sched.set_enabled(db, SCHEDULE, False, home=timefmt.home(p))
-    did = "on" if on else "off"
-    try:
-        sched.write_file(p, f"schedule {SCHEDULE}: {did} (deslop.enabled)")
-    except Exception:   # the database holds it; the file catches up on the next change
-        pass
+        did = "off"
+    state = db.kv(KEY, {}) or {}
+    if on and not state.get("kicked") and not (row and row["last_run"]):
+        db.x("UPDATE schedules SET next_run=? WHERE name=?", (time.time(), SCHEDULE))
+        db.set_kv(KEY, {**state, "kicked": time.time()})
+        did = did or "due"
+    if did:
+        try:
+            sched.write_file(p, f"schedule {SCHEDULE}: {did} (deslop.enabled)")
+        except Exception:   # the database holds it; the file catches up on the next change
+            pass
     return did
 
 
