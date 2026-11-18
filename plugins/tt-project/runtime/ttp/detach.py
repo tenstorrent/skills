@@ -390,11 +390,24 @@ VERDICT_SH = (r'if [ "$c" = 0 ] && [ -z "${TTP_DETACH_RC_ONLY-}" ]; then case ${
               r'xfailed|xpassed|warnings?)[, ].*in [0-9.]+s|^FAILED \((failures|errors)=|^OK$|^OK \(" | tail -n 1); '
               r'case $v in *[0-9]" failed"*|*[0-9]" error"*|"FAILED ("*) echo "ttp detach: the command exited 0 '
               r'but its last test summary reports failures ($v); recorded exit 1" >>"$o"; c=1 ;; esac ;; esac; fi; ')
-WRAPPER = ('o="$1" r="$2" s="$3" t="$4" k="$5"; shift 5; a=${TTP_ACTIVITY_LOG-} i=${TTP_ACTIVITY_ID-}; '
+# Once the job's rc is written, the wrapper removes the job's temp and record dirs only when no other
+# process holds its job lock: a `setsid nohup` child that outlives the job inherited both the lock and
+# $TMPDIR, and removing the dir under it made its mktemp fail (a deploy continuation died so). The dash
+# shell cannot close a two-digit descriptor, so the wrapper execs this to drop its own copy of the lock,
+# test it and remove the dirs when free; a held lock leaves them to sweep, which drops them once it frees.
+_CLEAN_PY = ("import fcntl, os, shutil, sys\n"
+             "os.closerange(int(sys.argv[1]), int(sys.argv[1]) + 1)\n"
+             "try:\n    fd = os.open(sys.argv[2], os.O_RDONLY)\n    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+             "except FileNotFoundError:\n    pass\n"
+             "except OSError:\n    sys.exit(0)\n"
+             "for d in sys.argv[3:]:\n    shutil.rmtree(d, ignore_errors=True)\n")
+WRAPPER = ('o="$1" r="$2" s="$3" t="$4" k="$5" py="$6" cl="$7" fd="$8" lk="$9"; shift 9; '
+           'a=${TTP_ACTIVITY_LOG-} i=${TTP_ACTIVITY_ID-}; '
            'unset TTP_ACTIVITY_LOG TTP_ACTIVITY_ID; echo $$ >"$s.tmp"; mv "$s.tmp" "$s"; '
            '"$@" >"$o" 2>&1 </dev/null; c=$?; ' + VERDICT_SH +
-           'rm -rf "$t" "$k"; echo $c >"$r.tmp"; mv "$r.tmp" "$r"; [ -z "$a" ] || '
-           'printf \'{"end": %s, "ev": "job_end", "id": "%s", "rc": %s}\\n\' "$(date +%s)" "$i" "$c" >>"$a" 2>/dev/null')
+           'echo $c >"$r.tmp"; mv "$r.tmp" "$r"; [ -z "$a" ] || '
+           'printf \'{"end": %s, "ev": "job_end", "id": "%s", "rc": %s}\\n\' "$(date +%s)" "$i" "$c" >>"$a" 2>/dev/null; '
+           'if [ -x "$py" ]; then exec "$py" -I -S -c "$cl" "$fd" "$lk" "$t" "$k" 2>/dev/null; fi; rm -rf "$t" "$k"')
 _TMP_VARS = ("TMPDIR", "TMP", "TEMP")
 
 
@@ -465,7 +478,8 @@ def start(rc: Path, log: Path, cmd: list, cwd: str, env: dict, lock, *, check: b
                cwd, *cmd]
         cwd = str(work)
     proc = subprocess.Popen(["/bin/sh", "-c", WRAPPER, "sh", str(log), str(rc), str(started(rc)), str(tmp),
-                             str(record), *cmd],
+                             str(record), sys.executable or "", _CLEAN_PY, str(lock.fileno()),
+                             str(locks.job_lock(rc)), *cmd],
                             cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
                             pass_fds=(lock.fileno(),),
@@ -1347,14 +1361,16 @@ def _superseded(rc: Path, m: dict) -> bool:
 
 def sweep(state: Path) -> None:
     """Remove the temp dirs of jobs that ended or are gone: the wrapper removes its own when the job
-    ends, but not when it is killed or the host restarts. A job that still runs holds its lock."""
+    ends, but not when it is killed, the host restarts or a child that outlived the job (a `setsid nohup`
+    continuation) still holds its lock and uses its $TMPDIR. A job or such a child holds the job lock, so
+    an ended job's dir stays until that frees."""
     folder = Path(state) / SCRATCH
     for d in sorted(folder.iterdir()) if folder.is_dir() else []:
         m = re.fullmatch(r"(?:([0-9]+)|check-([0-9a-f]{32}))-([A-Za-z0-9._-]{1,64})", d.name)
         if not m or d.is_symlink() or not d.is_dir():
             continue
         rc = Path(state) / ("runs" if m[1] else "check-reports") / (m[1] or m[2]) / f"{m[3]}.rc"
-        if rc.exists() or lost(rc).exists() or locks.any_free([locks.job_lock(rc)]):
+        if lost(rc).exists() or locks.any_free([locks.job_lock(rc)]):
             _drop(d)
 
 

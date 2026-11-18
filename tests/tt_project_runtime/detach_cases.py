@@ -417,6 +417,42 @@ def test_detach_lock_holds_one_or_two_locks_for_the_jobs_life_and_lets_go_once_i
             assert _probe_json(p, run_env, res)[0] == 0
 
 
+def test_a_detached_jobs_tmpdir_outlives_the_job_while_a_setsid_child_still_uses_it(env, tmp_path):
+    """A `setsid nohup` child that outlives its job inherits the job's TMPDIR and lock: the wrapper leaves
+    the dir while the child holds the lock (its mktemp after the job ended once failed), and sweep drops
+    it once the child is gone. A job with no such child still removes its own dir when it ends."""
+    from ttp import detach, locks
+    p = make(env)
+    run_dir = p.runs / "7"
+    run_dir.mkdir(parents=True)
+    out, go = tmp_path / "out", tmp_path / "go"
+    child = (f"sleep 0.5; d=$(mktemp) && echo \"$d\" >{shlex.quote(str(out))}; "
+             f"{shlex.join(_until(go))}")
+    cmd = ["sh", "-c", f"setsid nohup sh -c {shlex.quote(child)} >/dev/null 2>&1 & exit 0"]
+    run_env = _lock_job_env(env, p, run_dir)
+    assert _ttp_run(p, "detach", "cont", "--", *cmd, env=run_env).returncode == 0
+    rc = (run_dir / "cont.rc").resolve()
+    record = detach.scratch(rc)
+    tmp = detach.tmp_dir(record)
+    try:
+        assert _wait_for_path(rc) and rc.read_text().strip() == "0"
+        assert _until_true(lambda: out.exists() and out.read_text().strip())
+        made = pathlib.Path(out.read_text().strip())
+        assert made.parent == tmp and made.exists() and record.is_dir()
+        detach.sweep(p.state)   # the child still holds the job lock
+        assert tmp.is_dir() and record.is_dir()
+    finally:
+        go.touch()
+    assert _until_true(lambda: locks.any_free([locks.job_lock(rc)]))
+    detach.sweep(p.state)
+    assert not record.exists() and not tmp.exists()
+
+    plain = ["sh", "-c", "sleep 0.5"]
+    assert _ttp_run(p, "detach", "plain", "--", *plain, env=run_env).returncode == 0
+    rc2 = (run_dir / "plain.rc").resolve()
+    assert _wait_for_path(rc2) and _until_true(lambda: not detach.scratch(rc2).exists())
+
+
 def test_detach_lock_lets_go_once_the_job_is_lost(env, tmp_path):
     from ttp import detach
     p = make(env)

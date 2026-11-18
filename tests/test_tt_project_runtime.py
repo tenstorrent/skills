@@ -35860,7 +35860,8 @@ def test_a_detached_job_keeps_its_own_temp_dir_after_its_run_ends_and_it_goes_wh
     assert rc.read_text().strip() == "0", (run_dir / "build.log").read_text()
     assert seen.read_text().split() == [str(tmp)] * 3
     assert (run_dir / "build.log").read_text().strip() == "scratch"
-    assert not own.exists() and not tmp.exists(), "removed once the job ended"
+    # Right after its rc: the wrapper writes the rc, then removes the dirs once no child holds the job lock.
+    assert _until_true(lambda: not own.exists() and not tmp.exists()), "removed once the job ended"
 
 
 def test_the_daemon_sweeps_the_temp_dir_of_a_detached_job_killed_before_it_could_remove_it(env):
@@ -35901,7 +35902,7 @@ def test_a_detached_job_gets_a_short_temp_dir_that_holds_a_unix_socket(env):
     assert rc.read_text().strip() == "0", (run_dir / "sock.log").read_text()
     tmp = (run_dir / "sock.log").read_text().strip()
     assert shorttmp.owned(tmp), tmp
-    assert not pathlib.Path(tmp).exists() and not detach.scratch(rc).exists(), "removed once the job ended"
+    assert _until_true(lambda: not pathlib.Path(tmp).exists() and not detach.scratch(rc).exists()), "removed once the job ended"
 
 
 def test_detach_check_waits_while_running_and_wakes_when_the_job_dies(env):
