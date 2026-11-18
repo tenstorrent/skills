@@ -8804,6 +8804,20 @@ def cmd_lock(a) -> None:
                 _end_wait()
             die(f"refused: {held_by[1]}", 75)
 
+    detached = bool(os.environ.get("TTP_DETACHED"))
+    run_dir = Path(os.environ["TTP_RUN_DIR"]) if os.environ.get("TTP_RUN_DIR") else None
+    try:
+        spec = json.loads((run_dir / "run.json").read_text()) if run_dir else {}
+    except (OSError, ValueError):
+        spec = {}
+    waiting = False
+    # A wait's limit: --timeout, and inside a run's agent at most half its stall limit (the lock queue
+    # and the occupancy wait both use it).
+    cap = 0.0 if detached else float(spec.get("stall_s") or 0) / 2
+
+    def _bounded(timeout):
+        return timeout if not cap else (cap if not timeout else min(timeout, cap))
+
     def _occupied() -> str:
         # A live realtime stream on the box (occupancy.py).
         from . import occupancy
@@ -8816,21 +8830,12 @@ def cmd_lock(a) -> None:
         # task hands off waiting on the probe, which answers busy while the box is held.
         from . import occupancy
         occupancy.WHERE = p
-        bound = a.timeout or None
-        if not os.environ.get("TTP_DETACHED") and os.environ.get("TTP_RUN_DIR"):
-            try:
-                cap = float(json.loads((Path(os.environ["TTP_RUN_DIR"]) / "run.json").read_text()).get("stall_s") or 0) / 2
-            except (OSError, ValueError, AttributeError):
-                cap = 0.0
-            bound = min(bound, cap) if bound and cap else (bound or cap or None)
+        bound = _bounded(a.timeout) or None
         got = occupancy.wait_free([L["name"] for L in todo], _lock_step(a), max_wait_s=bound,
                                   say=lambda line: print(f"ttp lock: {line}", file=sys.stderr, flush=True))
         if not got["ok"]:
-            try:
-                if waiting:
-                    _end_wait()
-            except NameError:   # the first check runs before the queue wait is set up
-                pass
+            if waiting:
+                _end_wait()
             die(f"{got['why']}; waited {got['waited_s']:.0f} s. Hand the task back now: result.json status "
                 f"`waiting`, retry_when `ttp lock --probe {' '.join(L['name'] for L in todo)}`", 75)
 
@@ -8946,13 +8951,6 @@ def cmd_lock(a) -> None:
     if any(L["device"] for L in todo):
         child_env["TTP_NO_DEVICE"] = "0"   # a device lock is the sanctioned way to a device
         child_env = unmask_devices(child_env)   # and sees the devices a run's own commands do not
-    detached = bool(os.environ.get("TTP_DETACHED"))
-    run_dir = Path(os.environ["TTP_RUN_DIR"]) if os.environ.get("TTP_RUN_DIR") else None
-    try:
-        spec = json.loads((run_dir / "run.json").read_text()) if run_dir else {}
-    except (OSError, ValueError):
-        spec = {}
-    waiting = False
     from . import activity
     from .runner import boot_id
 
@@ -9015,15 +9013,14 @@ def cmd_lock(a) -> None:
     # may wait for a lock this waiter's holder has, and neither would ever go on.
     past_multi = bool(held_locks or shared_locks or whole)
     timeout = a.timeout
-    cap = float(spec.get("stall_s") or 0) / 2
     capped = False
-    if cap and not detached:
+    if cap:
         if timeout is not None and (timeout == 0 or timeout > cap):
             print(f"ttp lock: --timeout {timeout:.0f} capped to {cap:.0f} s inside a run; if it runs out, "
                   f"hand off `waiting` with retry_when `ttp lock --probe{' --shared' if a.shared else ''} {what}`",
                   file=sys.stderr, flush=True)
         capped = not timeout or timeout > cap
-        timeout = cap if timeout is None or timeout == 0 else min(timeout, cap)
+        timeout = _bounded(timeout)
     for L in todo:
         L["mark"] = lk.reserve_path(L["where"], L["res"])
     wait_dir = None if detached else run_dir

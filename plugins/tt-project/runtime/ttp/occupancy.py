@@ -457,6 +457,11 @@ def _uses_devices(cfg: dict, alias: str, s: dict, step: str) -> bool:
     return step in DEVICE_STEPS or bool(s.get("disruptive"))
 
 
+def _local_aliases(aliases, known: dict, here: str) -> list[str]:
+    """The covered aliases that are this host (by alias or by registered hostname)."""
+    return [a for a in aliases if a == here or str((known.get(a) or {}).get("hostname") or "").lower() == here.lower()]
+
+
 def watch(p, db, now: float | None = None, post: Callable[..., None] | None = None) -> dict:
     """The daemon's model-free watchdog, one pass: publish this project's sources, read every
     registered source (cached), raise one event per own source that cannot tell, and flag each job of
@@ -492,7 +497,7 @@ def watch(p, db, now: float | None = None, post: Callable[..., None] | None = No
     known = machines_load()
     cfg = p.config()
     # A span that ran on this host counts as on `alias` only while `alias` is this host.
-    local = {a for a in cov if a == here or str((known.get(a) or {}).get("hostname") or "").lower() == here.lower()}
+    local = set(_local_aliases(cov, known, here))
     seen = db.kv(SEEN_KEY, {})
     flags = db.kv(FLAGS_KEY, [])
     events = db.kv(EVENTS_KEY, {})
@@ -690,7 +695,7 @@ def lower_running(p, db, now: float | None = None) -> dict:
         known = machines_load()
     except Exception:
         known = {}
-    local = [a for a in covered() if a == here or str((known.get(a) or {}).get("hostname") or "").lower() == here.lower()]
+    local = _local_aliases(covered(), known, here)
     why = blocks_any(local, "test", now) if local else ""
     running = {}
     if why:
