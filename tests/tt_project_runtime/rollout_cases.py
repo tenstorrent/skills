@@ -123,8 +123,8 @@ def _ro_runs(p, n, failed, ago_h, status_fail="failed"):
                (status_fail if i < failed else "done", time.time() - ago_h * _RH - 5, time.time() - ago_h * _RH))
 
 
-def _ro_landed(p, took_h, cost, ago_h):
-    tid = p.db.add_task("t", "s", kind="code")
+def _ro_landed(p, took_h, cost, ago_h, tier="standard"):
+    tid = p.db.add_task("t", "s", kind="code", tier=tier)
     land = time.time() - ago_h * _RH
     p.db.x("UPDATE tasks SET created=?, spent_usd=? WHERE id=?", (land - took_h * _RH, cost, tid))
     p.db.x("INSERT INTO task_landings(marker, task, sha, target, ts) VALUES(?,?,?,?,?)", (f"m{tid}", tid, "a" * 40, "main", land))
@@ -133,7 +133,7 @@ def _ro_landed(p, took_h, cost, ago_h):
 def test_health_signals_fail_only_past_their_threshold_and_sample_minimum(env):
     from ttp import rollout_health as rh
     p = make(env)
-    th, now = rh.thresholds({"thresholds": {"min_runs": 20}}), time.time() + 60
+    th, now = rh.thresholds({"thresholds": {"min_runs": 20, "min_landings": 3}}), time.time() + 60
     since = now - 24 * _RH
     _ro_runs(p, 40, 4, 100)                # baseline: 10% failed
     _ro_runs(p, 19, 19, 5)                 # too few runs to judge
@@ -153,6 +153,108 @@ def test_health_signals_fail_only_past_their_threshold_and_sample_minimum(env):
     assert any("cost per landing $9.00 against $2.00" in s for s in failing)
     assert rh.thresholds({"thresholds": {"cost_x": 5, "bogus": 1, "stuck_h": "x"}})["cost_x"] == 5.0
     assert "bogus" not in rh.thresholds({"thresholds": {"bogus": 1}})
+
+
+def _ro_kind_runs(p, kind, n, failed, ago_h):
+    tid = p.db.add_task("r", "s", kind=kind)
+    for i in range(n):
+        p.db.x("INSERT INTO runs(task,role,status,started,ended) VALUES(?,'worker',?,?,?)",
+               (tid, "failed" if i < failed else "done", time.time() - ago_h * _RH - 5, time.time() - ago_h * _RH))
+
+
+def test_a_cost_or_rate_check_needs_20_landings_by_default_and_the_sample_is_configurable(env):
+    # cells: min_sample: the 2026-11-18 false trip (cost per landing $5.46 against $3.65 on 6 landings)
+    from ttp import rollout_health as rh
+    p = make(env)
+    now = time.time() + 60
+    since = now - 24 * _RH
+    for i in range(10):
+        _ro_landed(p, 1, 3.65, 100 + i)
+    for i in range(6):
+        _ro_landed(p, 5, 5.46, 3 + i)
+    assert rh.DEFAULTS["min_landings"] == 20
+    v = rh.signals(p.db, since, now, rh.thresholds(None), "eta", "deslop")
+    assert v["failing"] == [] and v["matched_landings"] == 6 and not v["enough"], "6 landings are too few to judge"
+    got = rh.signals(p.db, since, now, rh.thresholds({"thresholds": {"min_landings": 6}}), "eta", "deslop")["failing"]
+    assert any(s.startswith("cost per landing $5.46 against $3.65 for the same task kinds (6 landings") for s in got)
+
+
+def test_cost_time_and_failure_rate_compare_the_same_task_kinds_never_a_raw_average(env):
+    # cells: like_for_like
+    from ttp import rollout_health as rh
+    p = make(env)
+    now = time.time() + 60
+    since, th = now - 24 * _RH, rh.thresholds(None)
+    for i in range(20):                      # baseline: cheap light work and dearer standard work, raw $3.00
+        _ro_landed(p, 0.5, 1.0, 100 + i, "light")
+        _ro_landed(p, 2, 5.0, 100 + i, "standard")
+    for i in range(22):                      # window: only standard work, each at its own kind's baseline
+        _ro_landed(p, 2, 5.0, 2 + i / 10, "standard")
+    for i in range(3):                       # a kind the baseline lacks is left out of the sample
+        _ro_landed(p, 9, 40.0, 1, "deep")
+    _ro_kind_runs(p, "review", 40, 12, 100)  # baseline: reviews fail 30%, code 0%: raw 15%
+    _ro_kind_runs(p, "code", 40, 0, 100)
+    _ro_kind_runs(p, "review", 30, 9, 2)     # window: only reviews, still 30%
+    v = rh.signals(p.db, since, now, th, "review", "deslop")
+    assert v["failing"] == [], v["failing"]
+    assert v["landings"] == 25 and v["matched_landings"] == 22 and set(v["kinds"]) == {"code/standard"}
+    assert v["matched_runs"] == 30 and v["enough"]
+    _ro_kind_runs(p, "review", 10, 10, 1)    # now 19 of 40 reviews failed: 47.5% against their own 30%
+    got = rh.signals(p.db, since, now, th, "review", "deslop")["failing"]
+    assert got == ["failed runs 48% against 30% for the same task kinds (40 runs)"], got
+
+
+def test_a_shadow_flag_is_exempt_from_every_health_judgment_and_the_daemon_never_rolls_it_back(env, tmp_path):
+    # cells: shadow_exempt
+    from ttp import rollout, rollout_health as rh
+    p, d = _watch(env)
+    rollout.set_ring(p.name, "1")
+    _ro_flag("eta_history", 1, 30)
+    for i in range(25):
+        _ro_landed(p, 1, 1.0, 100 + i)
+        _ro_landed(p, 9, 20.0, 1 + i / 10)
+    _ro_runs(p, 40, 4, 100)
+    _ro_runs(p, 30, 30, 1)
+    repo, spec = _ro_repo(tmp_path, "etaledger.py")
+    d.p.root = type(p.root)(repo)
+    _ro_revert(p, spec)
+    stuck = p.db.add_task("s", "s", kind="code", status="running")
+    p.db.x("UPDATE tasks SET updated=? WHERE id=?", (time.time() - 5 * _RH, stuck))
+    p.db.x("INSERT INTO alerts(key,severity,text,raised) VALUES('after_push_failed','high','x',?)", (time.time() - _RH,))
+    v = rh.verdict(p.db, "eta_history", 1, rollout.ledger(), {}, time.time() + 60, repo)
+    assert v["failing"] == [] and v["shadow"]
+    exempt = " | ".join(v["exempt"])
+    for what in ("failed runs", "cost per landing", "median time to land", "forward revert", "no run and no change"):
+        assert what in exempt, what
+    d.rollout_watch()                        # a clean vote may promote it; it is never rolled back
+    assert rollout.frozen("eta_history") is None and rollout.level("eta_history") in (1, 2)
+    assert p.db.one("SELECT 1 FROM messages WHERE ref='rollout_rollback:eta_history'") is None, "no alert either"
+    saved = dict(rollout.FLAGS["eta_history"])
+    try:
+        rollout.FLAGS["eta_history"].pop("shadow")
+        assert rh.verdict(p.db, "eta_history", 1, rollout.ledger(), {}, time.time() + 60, repo)["failing"]
+    finally:
+        rollout.FLAGS["eta_history"].clear()
+        rollout.FLAGS["eta_history"].update(saved)
+    assert "-> off" in rollout.rollback("eta_history", "by hand", "user") and rollout.level("eta_history") == rollout.OFF
+    assert rollout.status()["flags"]["eta_history"]["shadow"] and not rollout.status()["flags"]["deslop"]["shadow"]
+
+
+def test_a_real_per_kind_regression_over_20_landings_still_rolls_the_flag_back_and_says_why(env):
+    # cells: real_trip
+    from ttp import rollout
+    p, d = _watch(env)
+    rollout.set_ring(p.name, "1")
+    _ro_flag("deslop", 1, 30)
+    for i in range(20):
+        _ro_landed(p, 1, 2.0, 100 + i)
+        _ro_landed(p, 1, 4.0, 1 + i / 10)
+    assert d.rollout_watch() == ["deslop"] and rollout.level("deslop") == rollout.OFF
+    why = rollout.frozen("deslop")["reason"]
+    assert "cost per landing $4.00 against $2.00 for the same task kinds (20 landings: code/standard 20 at $4.00 " \
+           "against $2.00)" in why, why
+    note = p.db.one("SELECT text FROM messages WHERE ref='rollout_rollback:deslop'")["text"]
+    assert "cost per landing $4.00" in note and "20 landings" in note
 
 
 def test_health_flags_a_new_high_alert_in_the_flags_area_a_forward_revert_and_a_stuck_task(env):
@@ -507,7 +609,7 @@ def test_a_revert_of_a_run_schedules_change_does_not_trip_the_eta_flag_in_shadow
 
 
 def test_a_shadow_flag_never_counts_a_revert_even_of_its_own_code(env, tmp_path):
-    # cells: shadow_flag
+    # cells: shadow_flag, shadow_exempt
     p = make(env)
     repo, spec = _ro_repo(tmp_path, "etaledger.py")
     _ro_revert(p, spec)

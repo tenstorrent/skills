@@ -7,6 +7,11 @@ days before that. `check` returns the failing signals (rollback), `verdict` also
 enough samples to vote "clean". Promotion needs a clean vote from every project listed in the flag's current
 ring, after that ring's soak; silence never promotes (too few samples stretch the window to
 MAX_WINDOW_H, then a low note says so). Thresholds are settings: rollout.thresholds overrides DEFAULTS.
+
+Rates and costs are compared like for like: work is grouped by task kind and tier, each window sample is set
+against the baseline of its own group (groups the baseline lacks are left out), and a check judges only once
+its matched sample reaches its minimum. A shadow flag (rollout.FLAGS[flag]["shadow"]) changes no run, so no
+signal judges it: the watch never rolls it back; `ttp rollout rollback` by hand still does.
 """
 from __future__ import annotations
 
@@ -17,7 +22,7 @@ import time
 
 from . import postland, pushq, rollout
 
-DEFAULTS = {"failed_runs_pts": 5.0, "min_runs": 20, "land_time_x": 1.5, "cost_x": 1.3, "min_landings": 3,
+DEFAULTS = {"failed_runs_pts": 5.0, "min_runs": 20, "land_time_x": 1.5, "cost_x": 1.3, "min_landings": 20,
             "stuck_h": 2.0, "baseline_days": 7.0, "soak_h_0": 1.0, "soak_h_1": 24.0, "max_window_h": 72.0}
 # Alerts a flag is judged on: only those of its own area (rollout.FLAGS[flag]["area"]), each a key prefix, new
 # since the baseline. Only a high alert counts: it is the one stored in the alerts table. An area with no alert of
@@ -66,17 +71,42 @@ def _med(xs: list[float]) -> float | None:
     return statistics.median(xs) if xs else None
 
 
-def _runs(db, a: float, b: float) -> tuple[int, int]:
-    rows = db.q("SELECT status FROM runs WHERE role!='coordinator' AND ended>=? AND ended<? AND status NOT IN "
-                "('running','auth')", (a, b))
-    return len(rows), sum(1 for r in rows if r["status"] in ("failed", "lost"))
+def _group(r) -> str:
+    return f"{r['kind'] or '?'}/{r['tier'] or '?'}"
 
 
-def _landings(db, a: float, b: float) -> list[tuple[float, float]]:
-    """(seconds from task creation to its first landing, the task's spend) per task landed in [a, b)."""
-    rows = db.q("SELECT t.created c, t.spent_usd s, MIN(l.ts) l FROM task_landings l JOIN tasks t ON t.id=l.task "
-                "WHERE t.kind='code' GROUP BY t.id HAVING MIN(l.ts)>=? AND MIN(l.ts)<?", (a, b))
-    return [(r["l"] - (r["c"] or r["l"]), float(r["s"] or 0)) for r in rows]
+def _runs(db, a: float, b: float) -> dict[str, list[int]]:
+    """{kind/tier: [runs, failed]} of the worker runs that ended in [a, b), login failures left out."""
+    out: dict[str, list[int]] = {}
+    for r in db.q("SELECT r.status, t.kind, COALESCE(t.assigned_tier, t.tier) tier FROM runs r LEFT JOIN tasks t "
+                  "ON t.id=r.task WHERE r.role!='coordinator' AND r.ended>=? AND r.ended<? AND r.status NOT IN "
+                  "('running','auth')", (a, b)):
+        n = out.setdefault(_group(r), [0, 0])
+        n[0] += 1
+        n[1] += r["status"] in ("failed", "lost")
+    return out
+
+
+def _landings(db, a: float, b: float) -> list[tuple[float, float, str]]:
+    """(seconds from task creation to its first landing, the task's spend, its kind/tier) per task landed in [a, b)."""
+    rows = db.q("SELECT t.created c, t.spent_usd s, t.kind, COALESCE(t.assigned_tier, t.tier) tier, MIN(l.ts) l "
+                "FROM task_landings l JOIN tasks t ON t.id=l.task WHERE t.kind='code' GROUP BY t.id "
+                "HAVING MIN(l.ts)>=? AND MIN(l.ts)<?", (a, b))
+    return [(r["l"] - (r["c"] or r["l"]), float(r["s"] or 0), _group(r)) for r in rows]
+
+
+def _per_kind(window: list[tuple[float, float, str]], base: list[tuple[float, float, str]]) -> dict[str, dict]:
+    """{kind/tier: window count, window and baseline mean cost, baseline median time} for the groups both have."""
+    out = {}
+    for g in sorted({x[2] for x in window} & {x[2] for x in base}):
+        w, b = [x for x in window if x[2] == g], [x for x in base if x[2] == g]
+        out[g] = {"n": len(w), "base_n": len(b), "cost": sum(x[1] for x in w) / len(w),
+                  "base_cost": sum(x[1] for x in b) / len(b), "base_time": _med([x[0] for x in b])}
+    return out
+
+
+def _kinds_text(per: dict[str, dict]) -> str:
+    return ", ".join(f"{g} {v['n']} at ${v['cost']:.2f} against ${v['base_cost']:.2f}" for g, v in per.items())
 
 
 _SPAN = re.compile(r"Forward revert of ([0-9a-f]*)\.\.([0-9a-f]+) by ")
@@ -101,7 +131,7 @@ def _reverted_files(repo: str | None, spec: str) -> set[str] | None:
 def _reverts(db, since: float, now: float, flag: str | None, repo: str | None) -> tuple[list[str], list[str]]:
     """(the revert tasks that count against `flag`, those whose reverted commit cannot be resolved). A revert
     counts only when the commit it reverted changed a file of the flag's gated code (rollout.FLAGS[flag]["code"]);
-    never against a shadow flag; an unresolved one counts against no flag."""
+    an unresolved one counts against no flag."""
     meta = rollout.FLAGS.get(flag or "", {})
     code = set(meta.get("code") or ())
     hit, unknown = [], []
@@ -110,7 +140,7 @@ def _reverts(db, since: float, now: float, flag: str | None, repo: str | None) -
         files = _reverted_files(repo, r["spec"])
         if files is None:
             unknown.append(f"#{r['id']}")
-        elif code and not meta.get("shadow") and files & code:
+        elif code and files & code:
             hit.append(f"#{r['id']}")
     return hit, unknown
 
@@ -120,21 +150,35 @@ def signals(db, since: float, now: float, th: dict, area: str | None = None, fla
     """The window [since, now) against the baseline before `since`: the measures and the failing signals.
     `area` is the flag's area: a new high alert counts only if its key starts with one of ALERT_AREAS[area].
     `flag` and `repo` (the project's git root) attribute forward reverts: see _reverts; "unattributed" lists
-    the reverts whose commit could not be read, shown and never failing."""
+    the reverts whose commit could not be read, shown and never failing. A shadow flag's would-be signals are
+    listed under "exempt" and never under "failing"."""
     base_a = since - th["baseline_days"] * 86400
-    nb, fb = _runs(db, base_a, since)
-    nw, fw = _runs(db, since, now)
+    rb, rw = _runs(db, base_a, since), _runs(db, since, now)
+    nw, fw = sum(v[0] for v in rw.values()), sum(v[1] for v in rw.values())
+    nb = sum(v[0] for v in rb.values())
     lb, lw = _landings(db, base_a, since), _landings(db, since, now)
     fail: list[str] = []
-    if nw >= th["min_runs"] and nb and 100.0 * (fw / nw - fb / nb) > th["failed_runs_pts"]:
-        fail.append(f"failed runs {100 * fw / nw:.0f}% against {100 * fb / nb:.0f}% ({nw} runs)")
-    if len(lw) >= th["min_landings"] and len(lb) >= 1:
-        mw, mb = _med([x[0] for x in lw]), _med([x[0] for x in lb])
-        if mb and mw > th["land_time_x"] * mb:
-            fail.append(f"median time to land {mw / H:.1f} h against {mb / H:.1f} h ({len(lw)} landings)")
-        cw, cb = sum(x[1] for x in lw) / len(lw), sum(x[1] for x in lb) / len(lb)
+    # Failed runs: the window's rate against the baseline's rate re-weighted to the window's mix of kinds.
+    both = [g for g in rw if rb.get(g, [0])[0]]
+    nm, fm = sum(rw[g][0] for g in both), sum(rw[g][1] for g in both)
+    expect = sum(rw[g][0] * rb[g][1] / rb[g][0] for g in both)
+    if nm >= th["min_runs"] and 100.0 * (fm - expect) / nm > th["failed_runs_pts"]:
+        fail.append(f"failed runs {100 * fm / nm:.0f}% against {100 * expect / nm:.0f}% for the same task kinds "
+                    f"({nm} runs)")
+    per = _per_kind(lw, lb)
+    matched = [x for x in lw if x[2] in per]
+    if len(matched) >= th["min_landings"]:
+        mw = _med([x[0] for x in matched])
+        mb = _med([per[x[2]]["base_time"] for x in matched])
+        ratio = _med([x[0] / per[x[2]]["base_time"] for x in matched if per[x[2]]["base_time"]])
+        if ratio and ratio > th["land_time_x"]:
+            fail.append(f"median time to land {mw / H:.1f} h against {mb / H:.1f} h for the same task kinds "
+                        f"({len(matched)} landings: {_kinds_text(per)})")
+        cw = sum(x[1] for x in matched) / len(matched)
+        cb = sum(per[x[2]]["base_cost"] for x in matched) / len(matched)
         if cb and cw > th["cost_x"] * cb:
-            fail.append(f"cost per landing ${cw:.2f} against ${cb:.2f} ({len(lw)} landings)")
+            fail.append(f"cost per landing ${cw:.2f} against ${cb:.2f} for the same task kinds "
+                        f"({len(matched)} landings: {_kinds_text(per)})")
     prefixes = ALERT_AREAS.get(area or "", ())
 
     def raised(a: float, b: float) -> set[str]:
@@ -150,9 +194,13 @@ def signals(db, since: float, now: float, th: dict, area: str | None = None, fla
                  "(SELECT 1 FROM runs WHERE runs.task=tasks.id AND runs.status='running')", (now - th["stuck_h"] * H,))
     if stuck:
         fail.append("tasks with no run and no change for " + f"{th['stuck_h']:g} h: " + ", ".join(f"#{r['id']}" for r in stuck[:5]))
-    enough = nw >= th["min_runs"] or len(lw) >= th["min_landings"]
-    return {"runs": nw, "failed": fw, "landings": len(lw), "base_runs": nb, "base_landings": len(lb),
-            "failing": fail, "enough": enough, "unattributed": unattributed}
+    enough = nm >= th["min_runs"] or len(matched) >= th["min_landings"]
+    out = {"runs": nw, "failed": fw, "landings": len(lw), "base_runs": nb, "base_landings": len(lb),
+           "matched_runs": nm, "matched_landings": len(matched), "kinds": per,
+           "failing": fail, "enough": enough, "unattributed": unattributed}
+    if rollout.FLAGS.get(flag or "", {}).get("shadow"):
+        out.update(failing=[], exempt=fail, shadow=True)
+    return out
 
 
 def verdict(db, flag: str, ring: int, recs: list[dict], cfg: dict, now: float | None = None,

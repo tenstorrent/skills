@@ -5138,14 +5138,20 @@ config or state. The shipped defaults list no project: which projects are in rin
 Health watch. Every 15 minutes the daemon compares each project that has a flag on with its own trailing 7 days
 before the flag reached its ring, with no model call. A flag turns off for everyone, is frozen and writes the
 ledger (the daemon's rollback) on: failed runs up 5 points (at least 20 runs, login failures excluded); median
-time to land over 1.5x or cost per landing over 1.3x (at least 3 landings); a new alert in the flag's own area, one not seen in the baseline
+time to land over 1.5x or cost per landing over 1.3x (at least 20 landings). These compare like for like: each run
+or landing is set against the baseline of its own task kind and tier, kinds the baseline lacks are left out of
+both the sample and the comparison, and the rollback names the metric, the sample and each kind's figures, so a
+window of costlier kinds of work never trips a flag. Also: a new alert in the flag's own area, one not seen in the baseline
 (the `area` of `ttp rollout status`, judged on the keys the daemon raises: `push` on the high alerts
 `push_not_landing`, `push_tip_failing`, `push_queue_dying` and `after_push_failed`; `route` on the high
 `auth:<provider>` login alert only (model routing trips, `model-trip:`, `model-demote:` and `model-rank:`, are low
 alerts the router acts on itself by demoting the model; they never reach the alerts table and are not judged); `eta`, `device` and `review` raise no alert of their own, so they are judged
 on the generic signals alone); landing-path alerts do
 not roll back a flag of another area, whose landing health the generic signals already cover; a forward revert by the
-post-landing checks of a landed change (a member reverted before landing is routine and not counted); or a task running with no run and no change for 2 h. The
+post-landing checks of a landed change that touched a file the flag gates (its `code` list; a member reverted
+before landing is routine and not counted, and a revert whose commit cannot be read counts against no flag); or a task running with no run and no change for 2 h. A shadow flag (`shadow` in `ttp rollout status`: it only
+records beside the normal path, posts nothing, changes no run and makes no model call; `eta_history` is one) is
+judged on none of these: the watch never rolls it back, and `ttp rollout rollback` by hand still does. The
 limits are settings (`rollout.thresholds`: `failed_runs_pts`, `min_runs`, `land_time_x`, `cost_x`,
 `min_landings`, `stuck_h`, `baseline_days`, `soak_h_0`, `soak_h_1`, `max_window_h`). A rollback raises a normal
 alert for the project's coordinator; the flag stays off until `ttp rollout arm <flag>`. A flag promotes one ring

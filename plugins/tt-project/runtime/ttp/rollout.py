@@ -28,9 +28,10 @@ LEVELS = (OFF, 0, 1, 2)
 # name: the feature's existing config key it gates, its area, and `code`: the files holding its on() call sites
 # and the code reading its key, relative to the repo root. The health watch counts a post-landing revert against a
 # flag only when the reverted commit touched one of them (rollout_health); a flag with no wiring yet has none.
-# `shadow` marks a flag that only records beside the real behaviour (it posts and changes nothing), so a revert
-# never counts against it. A flag whose feature already runs for every project graduates (leaves this list),
-# never gating it off: push_isolation, the push batch survival (a reliability fix).
+# `shadow` marks a flag that only records beside the real behaviour (it posts nothing, changes no run and makes no
+# model call), so no health signal judges it (rollout_health.signals). A flag whose feature already runs for every
+# project graduates (leaves this list), never gating it off: push_isolation, the push batch survival (a reliability
+# fix).
 _RT = "plugins/tt-project/runtime/ttp/"
 
 
@@ -265,7 +266,8 @@ def scratch_hold(state: tuple[float, float] | None, task: dict, owners=()) -> st
 def status() -> dict:
     cfg = settings()
     return {"rings": cfg.get("rings") or {}, "excluded": cfg.get("excluded") or [],
-            "flags": {f: {"level": level(f, cfg), "key": m["key"], "frozen": bool(frozen(f))}
+            "flags": {f: {"level": level(f, cfg), "key": m["key"], "frozen": bool(frozen(f)),
+                          "shadow": bool(m.get("shadow"))}
                       for f, m in sorted(FLAGS.items())}}
 
 
@@ -288,7 +290,8 @@ def run(a) -> int:
             print("rings: " + (", ".join(f"{k}: {','.join(v)}" for k, v in sorted(st["rings"].items())) or "none")
                   + "; excluded: " + (", ".join(st["excluded"]) or "none"))
             for f, e in st["flags"].items():
-                print(f"{f}: {e['level']}{' (frozen)' if e['frozen'] else ''}  gates {e['key']}")
+                print(f"{f}: {e['level']}{' (frozen)' if e['frozen'] else ''}  gates {e['key']}"
+                      + ("  (shadow: the health watch never rolls it back)" if e["shadow"] else ""))
             return 0
         reason = (a.reason or "").strip()
         if not a.target or (act in ("ring", "set") and a.value is None):
