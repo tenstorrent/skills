@@ -5065,7 +5065,7 @@ class Daemon:
     def run_model_bench(self) -> None:
         """The machine's shared daily model bench (benchowner.py), model-free, hourly: check the owner
         lease (take it over or poke its owner when stale), keep this project's bench and Terminal-Bench
-        schedules on only while it owns the lease, run it now on a poke, and report the owner's newest bench once: a
+        schedules on only while it owns the lease and model_bench.hold does not hold it, run it now on a poke, and report the owner's newest bench once: a
         keyless skip is one low alert per outage, a bench one log line."""
         from . import benchowner, harborslice, modelbench, rankfresh, schednow
         if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get("TTP_TEST_MODEL_BENCH"):
@@ -5085,15 +5085,15 @@ class Daemon:
         if got.get("poked"):
             db.post("out", f"The machine's daily chat model bench has no recent result; poked its owner "
                     f"{got['poked']} to run it now.", chat=None, kind="info", severity="low")
-        owner = lease.get("project") == me
+        owner, hold = lease.get("project") == me, benchowner.held(cfg, now)
         try:
-            benchowner.ensure(self.p, db, owner, benchowner.settings(cfg)["at"])
-            benchowner.ensure_tb(self.p, db, owner, harborslice.settings(cfg)["on"])
+            benchowner.ensure(self.p, db, owner, benchowner.settings(cfg)["at"], hold)
+            benchowner.ensure_tb(self.p, db, owner, harborslice.settings(cfg)["on"], hold)
         except ValueError as e:   # a broken schedules file: the next check tries again
             log(self.p, f"model bench: schedule not changed: {e}")
         seen = db.kv(benchowner.SEEN, {}) or {}
         poke = lease.get("poke") or {}
-        if owner and float(poke.get("at") or 0) > float(seen.get("poke") or 0):
+        if owner and not hold and float(poke.get("at") or 0) > float(seen.get("poke") or 0):
             schednow.request(self.p, benchowner.SCHEDULE, "model-bench-poke")
             db.post("out", f"{poke.get('by') or 'Another project'} poked this project to run the machine's "
                     "daily chat model bench; running it now.", chat=None, kind="info", severity="low")

@@ -16,6 +16,14 @@ model-bench suite --detach`, an hour later, which first rebuilds its bench folde
 while model_bench.terminalbench.on, TB_SCHEDULE (`ttp model-bench terminalbench --detach`, hourly:
 tbcycle.py's model-free step; ensure_tb); every other project's are off.
 
+Hold (held): model_bench.hold true, or an end time (epoch seconds, or an ISO time read in the home zone when it
+names none), holds this project's bench: its daemon turns the three schedules off and runs no poke until the hold
+ends, then turns them back on; its Terminal-Bench runners start no new trial (trial_stop, checked before each
+one, also stops on model_bench.terminalbench.on false or the occupancy stop switch `terminalbench`). The lease
+ages as usual, so another eligible project may take the bench over. ensure never turns back on a schedule that
+was turned off on purpose: OWN records the state ensure itself last set or saw on, and a schedule off while
+OWN says on was turned off by someone else, so it stays off until it is turned on again by hand.
+
 Failure streaks (streak): each scheduled cycle (the daily bench, the suite with its device A/B, a Terminal-Bench
 step) counts its failures in a row per schedule; a pass resets the count. The STREAK_FAILS-th failure in a row
 queues one observation event (source "model-bench", one per streak) naming the schedule and the cause, so a
@@ -32,7 +40,9 @@ SUITE_SCHEDULE = "model-suite"
 SUITE_COMMAND = "ttp model-bench suite --detach"
 LIVE_S = 900                       # a daemon heartbeat younger than this is a live daemon
 SEEN = "model-bench-owner-seen"
-STREAK_FAILS = 3                   # failures in a row of one scheduled cycle that raise its event    # kv: the poke this project's daemon handled last
+STREAK_FAILS = 3                   # failures in a row of one scheduled cycle that raise its event
+OWN = "model-bench-schedules-own"  # kv: {schedule: "on" | "off"}, what ensure last set or saw (module doc)
+STOP_NAME = "terminalbench"        # the occupancy stop switch every Terminal-Bench runner checks (trial_stop)
 
 
 def settings(cfg: dict) -> dict:
@@ -45,6 +55,47 @@ def settings(cfg: dict) -> dict:
             return default * 3600
     return {"opt_out": bool(s.get("opt_out")), "poke_s": hours("poke_after_h", 48),
             "take_s": hours("take_over_after_h", 72), "at": str(s.get("bench_at") or "02:00")}
+
+
+def held(cfg: dict, now: float | None = None) -> str:
+    """Why model_bench.hold holds this project's bench now, "" when it does not (module doc). An end that
+    cannot be read holds until the setting is removed."""
+    import time
+    from datetime import datetime
+    from . import timefmt
+    s = cfg.get("model_bench") if isinstance(cfg.get("model_bench"), dict) else {}
+    v = s.get("hold")
+    if isinstance(v, str) and v.strip().lower() in ("", "0", "false", "off", "no"):
+        return ""
+    if isinstance(v, str) and v.strip().lower() in ("1", "true", "on", "yes"):
+        v = True
+    if v is None or v is False:
+        return ""
+    if v is True:
+        return "model_bench.hold is on"
+    try:
+        end = float(v)
+    except (TypeError, ValueError):
+        try:
+            got = datetime.fromisoformat(str(v).strip())
+            end = (got if got.tzinfo else got.replace(tzinfo=timefmt.zone(cfg))).timestamp()
+        except ValueError:
+            return f"model_bench.hold is on (its end {v!r} is not a time: held until it is removed)"
+    now = time.time() if now is None else now
+    return f"model_bench.hold is on until {timefmt.long(end, cfg)}" if now < end else ""
+
+
+def trial_stop(p, now: float | None = None) -> str:
+    """Why a Terminal-Bench runner of project `p` must start no new trial, "" to go on: the bench is held,
+    model_bench.terminalbench.on is false or the stop switch STOP_NAME is set. Reads the settings afresh, so a
+    change reaches a runner that is already running before its next trial."""
+    from . import harborslice, occupancy
+    cfg = p.config()
+    if why := held(cfg, now):
+        return why
+    if not harborslice.settings(cfg)["on"]:
+        return "model_bench.terminalbench.on is false"
+    return occupancy.should_stop(p, STOP_NAME, now=now)
 
 
 def _paused(db: Path) -> bool:
@@ -117,23 +168,35 @@ def _later(at: str, hours: int = 1) -> str:
     return f"{(h + hours) % 24:02d}:{m:02d}"
 
 
-def ensure(p, db, owner: bool, at: str) -> str:
-    """The owner keeps SCHEDULE on, daily at `at`, and SUITE_SCHEDULE an hour later; any other project
-    keeps both off. Returns what changed."""
+def _on_purpose_off(name: str, row, own: dict) -> bool:
+    """Schedule `name` is off and ensure last set or saw it on: someone turned it off on purpose."""
+    return bool(row) and not row["enabled"] and own.get(name) == "on"
+
+
+def ensure(p, db, owner: bool, at: str, hold: str = "") -> str:
+    """The owner keeps SCHEDULE on, daily at `at`, and SUITE_SCHEDULE an hour later; any other project, or
+    one whose bench is held (`hold`, held), keeps both off. Never turns on a schedule turned off on purpose
+    (module doc). Returns what changed."""
     from . import schedule as sched, timefmt
+    owner = owner and not hold
     want = [(SCHEDULE, COMMAND, at, "the machine's shared daily chat model bench (this project owns it)"),
             (SUITE_SCHEDULE, SUITE_COMMAND, _later(at),
              "the machine's shared daily model suite, bench folders kept fresh (this project owns it)")]
-    todo = []
+    was = dict(db.kv(OWN, {}) or {})
+    own, todo = dict(was), []
     for name, cmd, when, desc in want:
         row = db.one("SELECT enabled, at, payload FROM schedules WHERE name=?", (name,))
+        if owner and row and row["enabled"]:
+            own[name] = "on"
         if not owner and not (row and row["enabled"]):
             continue
-        if owner and row and row["enabled"] and row["at"] == when \
-                and json.loads(row["payload"] or "{}").get("command") == cmd:
+        if owner and (_on_purpose_off(name, row, own) or row and row["enabled"] and row["at"] == when
+                      and json.loads(row["payload"] or "{}").get("command") == cmd):
             continue
         todo.append((name, cmd, when, desc))
     if not todo:
+        if own != was:
+            db.set_kv(OWN, own)
         return ""
     sched.before_change(p)
     for name, cmd, when, desc in todo:
@@ -141,6 +204,8 @@ def ensure(p, db, owner: bool, at: str) -> str:
             sched.upsert(db, name, "command", "1d", when, True, None, desc, {"command": cmd}, timefmt.home(p))
         else:
             sched.set_enabled(db, name, False, home=timefmt.home(p))
+        own[name] = "on" if owner else "off"
+    db.set_kv(OWN, own)
     did = "on" if owner else "off"
     try:
         sched.write_file(p, f"schedule {', '.join(t[0] for t in todo)}: {did} (model bench owner)")
@@ -154,15 +219,20 @@ TB_SCHEDULE = "terminalbench"
 TB_COMMAND = "ttp model-bench terminalbench --detach"
 
 
-def ensure_tb(p, db, owner: bool, on: bool) -> str:
+def ensure_tb(p, db, owner: bool, on: bool, hold: str = "") -> str:
     """The owner keeps TB_SCHEDULE (tbcycle.step, hourly) on while model_bench.terminalbench.on; any other
-    project, or `on` false, keeps it off. Separate from SCHEDULE. Returns what changed."""
+    project, `on` false or a held bench (`hold`) keeps it off. Never turns on a schedule turned off on purpose
+    (module doc). Separate from SCHEDULE. Returns what changed."""
     from . import schedule as sched, timefmt
-    want = owner and on
+    want = owner and on and not hold
     row = db.one("SELECT enabled, every_s, payload FROM schedules WHERE name=?", (TB_SCHEDULE,))
+    own = dict(db.kv(OWN, {}) or {})
+    if want and row and row["enabled"] and own.get(TB_SCHEDULE) != "on":
+        db.set_kv(OWN, {**own, TB_SCHEDULE: "on"})
     if not want and not (row and row["enabled"]):
         return ""
-    if want and row and row["enabled"] and json.loads(row["payload"] or "{}").get("command") == TB_COMMAND:
+    if want and (_on_purpose_off(TB_SCHEDULE, row, own) or row and row["enabled"]
+                 and json.loads(row["payload"] or "{}").get("command") == TB_COMMAND):
         return ""
     sched.before_change(p)
     if want:
@@ -171,6 +241,7 @@ def ensure_tb(p, db, owner: bool, on: bool) -> str:
                      "the bench; model-free)", {"command": TB_COMMAND}, timefmt.home(p))
     else:
         sched.set_enabled(db, TB_SCHEDULE, False, home=timefmt.home(p))
+    db.set_kv(OWN, {**db.kv(OWN, {}), TB_SCHEDULE: "on" if want else "off"})
     did = "on" if want else "off"
     try:
         sched.write_file(p, f"schedule {TB_SCHEDULE}: {did} (model bench owner)")

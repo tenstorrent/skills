@@ -9332,10 +9332,13 @@ def _model_bench_argv(a) -> list[str]:
 
 def _terminalbench(p, a, now: float) -> None:
     """`ttp model-bench terminalbench`: the model-free step, or (--runner) one model's paced runner (tbcycle.py)."""
-    from . import endpoint, harborslice, tbcycle
+    from . import benchowner, endpoint, harborslice, tbcycle
     cfg = p.config()
     if not tbcycle.settings(cfg)["on"]:
         die("model-bench terminalbench: off (model_bench.terminalbench.on is false)")
+    if not getattr(a, "reference", False) and (why := benchowner.held(cfg, now)):
+        print(json.dumps({"held": why}))   # a normal run that starts nothing (benchowner.held)
+        return
     if getattr(a, "reference", False):
         return _terminalbench_reference(p, a, cfg)
 
@@ -9356,7 +9359,7 @@ def _terminalbench(p, a, now: float) -> None:
         if extra is None:
             fail(why)
         print(json.dumps({"model": a.runner, "trials": tbcycle.runner(
-            cfg, a.runner, {**env, **extra})}))
+            cfg, a.runner, {**env, **extra}, stop=lambda: benchowner.trial_stop(p))}))
         return
     extra, why = tbcycle.compose(cfg)
     if extra is None:   # checked before any runner starts: no trial without compose
@@ -9373,7 +9376,7 @@ def _terminalbench_reference(p, a, cfg: dict) -> None:
     A model in reference.bridge goes through the claude CLI, one in reference.chat through the chat endpoint's
     relay, and neither needs a reference endpoint; any other needs the saved one: none saved, one plain line,
     nothing started."""
-    from . import endpoint, harborslice, tbcycle
+    from . import benchowner, endpoint, harborslice, tbcycle
     st = tbcycle.settings(cfg)
     ref = st["reference"]
     alias = ref["endpoint"]
@@ -9392,7 +9395,7 @@ def _terminalbench_reference(p, a, cfg: dict) -> None:
         if extra is None:
             die(f"model-bench terminalbench --reference: {why}")
         print(json.dumps({"model": a.runner, "reference": True, "trials": tbcycle.ref_runner(
-            cfg, a.runner, {**env, **extra})}))
+            cfg, a.runner, {**env, **extra}, stop=lambda: benchowner.trial_stop(p))}))
         return
     ids = None
     if got:

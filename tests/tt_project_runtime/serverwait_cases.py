@@ -504,3 +504,12 @@ def test_claudebridge_parse_reply_tolerates_a_mismatched_closing_tag():
         "cmd": {"type": "string"}, "dir": {"type": "string"}}}}}]
     text, calls = claudebridge.parse_reply('<tool_call name="run">\n<parameter name="cmd">ls</parameter>\n</invoke>', tools)
     assert text == "" and json.loads(calls[0]["function"]["arguments"]) == {"cmd": "ls"}
+
+
+def test_serverhealth_failed_calls_split_by_kind_and_an_old_fault_counts_as_other():
+    from ttp import serverhealth
+    rows = [{"st": s, "out": 0, "tps": 0.0, "wait_s": 1.0, "dur_s": 1.0} for s in ("ok", "stream", "parse", "capacity", "capacity", "fault")]
+    s = serverhealth.summarize(rows)
+    assert s["failed_calls"] == 5
+    assert s["failed_by"] == {"stream": 1, "parse": 1, "capacity": 2, "other": 1}
+    assert "failed_by" not in serverhealth.summarize(rows[:1]), "no failed call: no split"

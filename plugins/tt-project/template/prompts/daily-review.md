@@ -32,7 +32,8 @@ model-free command schedule or pre-step writing files you read.
    outcome or a LOOP is a defect: say why the sweep did not resolve it.
    Throughput: run `ttp throughput <name> --apply`. Report each slow lane (p90 wait, limit), each
    change it made with its undo line, and each limit it left and why; a slow lane it could not
-   change gets a `harness:` follow-up naming the setting or cause.
+   change gets a `harness:` follow-up naming the setting or cause. Report the lost-runner
+   replacement gap (median, p90, count over the 2 min target) when it shows one.
    Queue times: where the user asked for speed or priority, cut every wait that idle hosts or slots
    could drain (no spend cap rises without the user's word); a hold throttling work with no visible
    reason gets fixed or its rule named. Calm projects may go slower.

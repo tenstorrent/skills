@@ -279,8 +279,9 @@ def _next(cfg: dict, home: Path, model: str, now: float) -> tuple[dict, str | No
 
 
 def runner(cfg: dict, model: str, env: dict, *, trial: Callable | None = None, sleep: Callable = time.sleep,
-           clock: Callable = time.time) -> int:
-    """Run `model`'s cycle to its end, one paced trial at a time (module doc); returns trials run."""
+           clock: Callable = time.time, stop: Callable[[], str] | None = None) -> int:
+    """Run `model`'s cycle to its end, one paced trial at a time (module doc); returns trials run. `stop`
+    (benchowner.trial_stop) is asked before each trial: a reason ends the run there, the cycle kept."""
     from . import harborslice, modelbench, modelsuite
     held = _locked(folder() / "running" / f"{harborslice.slug(model)}.lock")
     if held is None:
@@ -296,6 +297,8 @@ def runner(cfg: dict, model: str, env: dict, *, trial: Callable | None = None, s
             last = float(cyc.get("last_start") or 0)
             if (wait := last + gap - clock()) > 0:
                 sleep(wait)
+            if stop and stop():
+                return ran
             cyc["last_start"] = clock()
             got = trial(model, task, folder() / "cycles" / str(cyc["n"]))
             modelsuite._append(folder() / "cycles" / str(cyc["n"]) / f"{harborslice.slug(model)}.jsonl",
@@ -409,12 +412,14 @@ def parity(s: dict, model: str, meta: dict, via: str, harbor: str) -> dict:
 
 
 def ref_runner(cfg: dict, model: str, env: dict, *, trial: Callable | None = None, clock: Callable = time.time,
-               bridge: Callable | None = None, chat: Callable | None = None, sleep: Callable = time.sleep) -> int:
+               bridge: Callable | None = None, chat: Callable | None = None, sleep: Callable = time.sleep,
+               stop: Callable[[], str] | None = None) -> int:
     """Run `model`'s reference tasks (resuming), then book its row once; returns trials run. A booked model
     runs nothing (module doc). A bridge model gets the claude CLI's loopback server (bridge(model, effort)
     builds it), a chat model the chat endpoint's relay (chat(model)), one per trial so its server wait and
     tokens/s are the trial's own; reference.parallel tasks run at once. A trial cut while the server ran slow
-    is `server` (serverhealth.judge): not scored, rerun one at a time once a probe shows the server healthy."""
+    is `server` (serverhealth.judge): not scored, rerun one at a time once a probe shows the server healthy.
+    `stop` (benchowner.trial_stop) is asked before each trial: a reason starts no more, nothing is booked."""
     import shutil
     from concurrent.futures import ThreadPoolExecutor
     from threading import Event, Lock
@@ -457,7 +462,7 @@ def ref_runner(cfg: dict, model: str, env: dict, *, trial: Callable | None = Non
             make = None
         cmd = harborslice.COMMAND if via in (BRIDGE_ROUTE, CHAT_ROUTE) else ref_command(meta["effort"])
         hist = serverhealth.History(folder() / HISTORY)
-        done, put, dead, info = _rows(d / f"{sl}.jsonl", meta["tasks"]), Lock(), Event(), {}
+        done, put, dead, halt, info = _rows(d / f"{sl}.jsonl", meta["tasks"]), Lock(), Event(), Event(), {}
 
         def attempt(t: str, n: int = 0) -> dict:
             b = make() if make else None
@@ -477,7 +482,10 @@ def ref_runner(cfg: dict, model: str, env: dict, *, trial: Callable | None = Non
                     b.stop()
             r = {"task": t, "at": clock(), "model": model, **got, **({"rerun": n} if n else {}),
                  **({"cost_usd": round(cost, 4)} if cost else {})}
-            if b is not None:
+            if b is not None:   # the relay's endpoint faults by kind and its capacity waits, on every row
+                busy = st.get("busy") or {}
+                r["relay"] = {"faults": dict(st.get("faults") or {}), "waits": int(busy.get("waits") or 0),
+                              "gave_up": int(busy.get("gave_up") or 0)}
                 stopped, scored = "timeout" if got.get("error") == "AgentTimeoutError" else None, not (got.get("reward") or 0) > 0
                 with put:   # History is one file shared by the parallel trials
                     normal = hist.normal(model)
@@ -513,8 +521,11 @@ def ref_runner(cfg: dict, model: str, env: dict, *, trial: Callable | None = Non
                 modelsuite._append(d / f"{sl}.jsonl", r)
 
         def one(t, n=0):
-            if dead.is_set():
-                return   # a trial died: start no more
+            if dead.is_set() or halt.is_set():
+                return   # a trial died, or the bench is held or stopped: start no more
+            if stop and stop():
+                halt.set()
+                return
             if n:   # a not-run trial again: its old job is not resumed
                 shutil.rmtree(d / "trials" / sl / harborslice.slug(t), ignore_errors=True)
             try:
@@ -531,6 +542,8 @@ def ref_runner(cfg: dict, model: str, env: dict, *, trial: Callable | None = Non
             with ThreadPoolExecutor(max_workers=max(1, min(s[REF]["parallel"], len(todo)))) as pool:
                 for f in [pool.submit(one, t, int(done[t].get("rerun") or 0) + 1 if t in done else 0) for t in todo]:
                     f.result()
+            if halt.is_set():
+                return ran
             ran += len(todo)
         rejudge()
         while make is not None:   # the server's cut-offs: one at a time, each after a healthy probe
@@ -541,8 +554,8 @@ def ref_runner(cfg: dict, model: str, env: dict, *, trial: Callable | None = Non
             ok, _ = serverhealth.wait_healthy(lambda: serverhealth.probe(make(), model), hist.normal(model),
                                               every_s=s[REF]["probe_every_s"], max_s=s[REF]["probe_max_s"],
                                               sleep=sleep, clock=clock)
-            if not ok:
-                break   # still slow: the cut-offs stay not scored (server); a later start reruns them
+            if not ok or (stop and stop()):
+                break   # still slow (or held): the cut-offs stay not scored (server); a later start reruns them
             r = left[0]
             shutil.rmtree(d / "trials" / sl / harborslice.slug(r["task"]), ignore_errors=True)
             keep(attempt(r["task"], int(r.get("rerun") or 0) + 1))

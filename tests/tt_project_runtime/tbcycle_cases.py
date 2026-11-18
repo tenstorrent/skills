@@ -627,3 +627,49 @@ def test_terminalbench_not_run_covers_no_calls_and_server_broken_unsolved_trials
     assert not tbcycle.not_run({"reward": None, "error": "AgentTimeoutError", "server": {"calls": 9}})
     md_rows = {"t1": {"task": "t1", "reward": 0.0, "server": {"calls": 4, "failed_calls": 1}}}
     assert [t for t, r in md_rows.items() if tbcycle.not_run(r)] == ["t1"]
+
+
+def test_terminalbench_runners_start_no_trial_once_stop_gives_a_reason_and_keep_the_cycle(env, monkeypatch):
+    from ttp import tbcycle
+    d, cfg, clock, sleeps, sleep = _tb_setup(env, monkeypatch, reference={"models": ["r-a"], "parallel": 2})
+    calls, why = [], []
+    stop = lambda: why[0] if why else ""
+    ok = _tb_trial(clock, {}, calls)
+    why.append("model_bench.hold is on")
+    assert tbcycle.runner(cfg, "m-a", {}, trial=ok, sleep=sleep, clock=lambda: clock["t"], stop=stop) == 0
+    assert tbcycle.ref_runner(cfg, "r-a", {}, trial=ok, clock=lambda: clock["t"], stop=stop) == 0
+    assert calls == [] and tbcycle.reference() == [], "held: no trial starts, nothing booked"
+    why.clear()
+    assert tbcycle.runner(cfg, "m-a", {}, trial=ok, sleep=sleep, clock=lambda: clock["t"], stop=stop) == 3
+    assert tbcycle.ref_runner(cfg, "r-a", {}, trial=ok, clock=lambda: clock["t"], stop=stop) == 3
+    assert len(tbcycle.reference()) == 1, "the hold lifted: both run on"
+
+
+class _FaultChat(_FakeChat):
+    def stats(self):
+        return {**super().stats(), "faults": {"rate_limit": 2, "malformed": 1}, "busy": {"waits": 3, "waited_s": 40.0,
+                                                                                         "gave_up": 1}}
+
+
+def test_terminalbench_reference_rows_save_the_relays_faults_by_kind_and_its_busy_waits(env, monkeypatch):
+    from ttp import tbcycle
+    d, cfg, clock, sleeps, sleep = _tb_setup(env, monkeypatch, tasks=("t1",), reference={
+        "models": ["open-m"], "chat": ["open-m"], "run": "rf", "parallel": 1})
+    _FakeChat.plan[:] = []
+    calls = []
+    assert tbcycle.ref_runner(cfg, "open-m", {}, trial=_tb_trial(clock, {}, calls), clock=lambda: clock["t"],
+                              chat=_FaultChat, sleep=sleep) == 1
+    (line,) = [json.loads(x) for x in (tbcycle.ref_dir("rf") / "open-m.jsonl").read_text().splitlines()]
+    assert line["relay"] == {"faults": {"rate_limit": 2, "malformed": 1}, "waits": 3, "gave_up": 1}
+
+
+def test_terminalbench_schedule_stays_off_while_held_and_once_turned_off_on_purpose(env):
+    from ttp import benchowner, schedule
+    p = make(env)
+    sched = lambda: p.db.one("SELECT enabled FROM schedules WHERE name=?", (benchowner.TB_SCHEDULE,))
+    assert benchowner.ensure_tb(p, p.db, True, True) == "on"
+    assert benchowner.ensure_tb(p, p.db, True, True, hold="model_bench.hold is on") == "off"
+    assert benchowner.ensure_tb(p, p.db, True, True, hold="model_bench.hold is on") == "", "held: stays off"
+    assert benchowner.ensure_tb(p, p.db, True, True) == "on", "the hold ended: back on"
+    schedule.set_enabled(p.db, benchowner.TB_SCHEDULE, False)   # someone turns it off on purpose
+    assert benchowner.ensure_tb(p, p.db, True, True) == "" and not sched()["enabled"], "never re-enabled"

@@ -2739,3 +2739,49 @@ def test_harbor_trial_slots_keep_the_floor_grow_only_past_the_host_gate_and_coun
     assert (home / "tb-slots-box" / "0.lock").exists(), "a remote engine's slots are its own"
     for f in held + [remote]:
         f.close()
+
+
+def test_model_bench_hold_reads_on_off_and_an_end_and_keeps_both_schedules_off_until_it_ends(env):
+    import datetime as dt
+    from ttp import benchowner
+    now = 1_800_000_000.0
+    assert benchowner.held({}, now) == "" and benchowner.held({"model_bench": {"hold": "false"}}, now) == ""
+    assert benchowner.held({"model_bench": {"hold": True}}, now) == "model_bench.hold is on"
+    assert benchowner.held({"model_bench": {"hold": now + 60}}, now).startswith("model_bench.hold is on until")
+    assert benchowner.held({"model_bench": {"hold": now - 60}}, now) == "", "its end passed"
+    iso = dt.datetime.fromtimestamp(now + 3600, dt.timezone.utc).isoformat()
+    assert benchowner.held({"model_bench": {"hold": iso}}, now)
+    assert benchowner.held({"model_bench": {"hold": iso}}, now + 7200) == ""
+    assert benchowner.held({"model_bench": {"hold": "soon-ish"}}, now).endswith("held until it is removed)"), \
+        "an end it cannot read holds until the setting is removed"
+    p = make(env)
+    on = lambda: {r["name"]: r["enabled"] for r in p.db.q("SELECT name, enabled FROM schedules WHERE name LIKE 'model-%'")}
+    assert benchowner.ensure(p, p.db, True, "23:30") == "on"
+    assert benchowner.ensure(p, p.db, True, "23:30", hold="model_bench.hold is on") == "off"
+    assert set(on().values()) == {0}, "held: both off though this project holds the lease"
+    assert benchowner.ensure(p, p.db, True, "23:30", hold="model_bench.hold is on") == ""
+    assert benchowner.ensure(p, p.db, True, "23:30") == "on" and set(on().values()) == {1}, "the hold ended"
+
+
+def test_bench_owner_never_re_enables_a_schedule_turned_off_on_purpose(env):
+    from ttp import benchowner, schedule
+    p = make(env)
+    assert benchowner.ensure(p, p.db, True, "23:30") == "on"
+    schedule.set_enabled(p.db, benchowner.SUITE_SCHEDULE, False)   # turned off by hand
+    assert benchowner.ensure(p, p.db, True, "23:30") == ""
+    on = {r["name"]: r["enabled"] for r in p.db.q("SELECT name, enabled FROM schedules WHERE name LIKE 'model-%'")}
+    assert on == {benchowner.SCHEDULE: 1, benchowner.SUITE_SCHEDULE: 0}, "the other stays the owner's"
+
+
+def test_terminalbench_trial_stop_reads_the_hold_the_on_setting_and_the_stop_switch_live(env):
+    from ttp import benchowner, occupancy
+    p = make(env)
+    assert benchowner.trial_stop(p) == ""
+    p.set_config("model_bench.terminalbench.on", False)
+    assert "terminalbench.on" in benchowner.trial_stop(p)
+    p.set_config("model_bench.terminalbench.on", True)
+    occupancy.request_stop(p, benchowner.STOP_NAME, "drain for a demo")
+    assert "drain for a demo" in benchowner.trial_stop(p)
+    occupancy.clear_stop(p, benchowner.STOP_NAME)
+    p.set_config("model_bench.hold", True)
+    assert benchowner.trial_stop(p) == "model_bench.hold is on"

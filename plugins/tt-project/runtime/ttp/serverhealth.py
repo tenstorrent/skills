@@ -143,15 +143,24 @@ def _med(xs: list[float]) -> float:
     return round(statistics.median(xs), 2) if xs else 0.0
 
 
+FAILED_KINDS = ("stream", "parse", "capacity", "other")   # a failed call's kind (its row's `st`)
+
+
 def summarize(rows: list[dict], wait_total: float | None = None, dropped: int = 0) -> dict:
-    """One cell's server summary from its call rows: the calls, the wait, tokens, tokens/s, failed calls."""
+    """One cell's server summary from its call rows: the calls, the wait, tokens, tokens/s, failed calls
+    and, when any failed, how many of each kind (`failed_by`, FAILED_KINDS: a stream that broke or ended in
+    an error, an answer that did not parse, the server at capacity, other; an older row's "fault" is other)."""
     ok = [r for r in rows if r.get("st") == "ok"]
+    by = {k: 0 for k in FAILED_KINDS}
+    for r in rows:
+        if r.get("st") != "ok":
+            by[r.get("st") if r.get("st") in by else "other"] += 1
     tps = [r["tps"] for r in ok if r.get("out", 0) >= MIN_OUT and r.get("tps", 0) > 0]
     wait = sum(r["wait_s"] for r in rows) if wait_total is None else wait_total
     return {"calls": len(rows) + dropped, "failed_calls": len(rows) - len(ok), "wait_s": round(wait, 1),
             "wait_median_s": _med([r["wait_s"] for r in ok]), "wait_max_s": round(max([r["wait_s"] for r in rows], default=0.0), 1),
             "out_tokens": sum(int(r.get("out") or 0) for r in rows), "tps_median": _med(tps),
-            "dur_s": round(sum(r["dur_s"] for r in rows), 1)}
+            "dur_s": round(sum(r["dur_s"] for r in rows), 1), **({"failed_by": by} if len(rows) > len(ok) else {})}
 
 
 # -- the limit

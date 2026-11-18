@@ -794,12 +794,12 @@ class Bridge:
 
     def _timed_open(self, h, req: dict):
         """_open, timed as one call of `h` (its first byte is marked when the stream's first line is read)."""
-        self._end_call(h, 0, "fault")   # an earlier attempt of the same request that failed
+        self._end_call(h, 0, "other")   # an earlier attempt of the same request that failed
         call = self.calls.begin()
         try:
             resp = self._open(req)
-        except BaseException:
-            call.end(0, "fault")
+        except BaseException as e:   # a 429 or 503 (the codes busy_wait waits out) is the server at capacity
+            call.end(0, "capacity" if getattr(e, "code", 0) in (429, 503) else "other")
             raise
         h.ttp_call = call
         return resp
@@ -902,10 +902,10 @@ class Bridge:
                 try:
                     data = json.loads(resp.read())
                 except ValueError:
-                    self._end_call(h, 0, "fault")
+                    self._end_call(h, 0, "parse")
                     return h._reply(*self._malformed("the upstream answer is not JSON"))
                 if data.get("error"):
-                    self._end_call(h, 0, "fault")
+                    self._end_call(h, 0, "other")
                     return h._reply(*self._fault_reply(_chunk_error(data, self._scrub), data))
                 self._ok()
                 self._count(data.get("usage"))
@@ -939,7 +939,7 @@ class Bridge:
                 self._fault(0)
                 broke = True
             self._count(usage)
-            self._end_call(h, usage_of(usage)["output_tokens"] or seen // 120, "fault" if broke else "ok")
+            self._end_call(h, usage_of(usage)["output_tokens"] or seen // 120, "stream" if broke else "ok")
 
     def _count(self, u) -> None:
         if not isinstance(u, dict):
@@ -960,10 +960,10 @@ class Bridge:
                 try:
                     data = json.loads(resp.read())
                 except ValueError:
-                    self._end_call(h, 0, "fault")
+                    self._end_call(h, 0, "parse")
                     return h._reply(*self._malformed("the upstream answer is not JSON"))
                 if data.get("error"):
-                    self._end_call(h, 0, "fault")
+                    self._end_call(h, 0, "other")
                     return h._reply(*self._fault_reply(_chunk_error(data, self._scrub), data))
                 self._ok()
                 self._count(data.get("usage"))   # a translated call is counted too (cached apart: usage_of)
@@ -983,7 +983,7 @@ class Bridge:
                 h.wfile.write(b"%x\r\n%s\r\n" % (len(data), data))
                 h.wfile.flush()
 
-        errored, seen = False, 0
+        errored, seen = "", 0   # the failed call's kind (serverhealth.FAILED_KINDS) once the stream fails
         try:
             for raw in resp:
                 if getattr(h, "ttp_call", None) is not None:
@@ -1005,23 +1005,23 @@ class Bridge:
                     # Fails the answer, even after good chunks: the lost piece may hold a tool call's
                     # arguments, and a retry beats a silently wrong call. No upstream text: it may echo the key.
                     send(_sse("error", self._malformed("the upstream stream sent a chunk that is not a JSON object")[1]))
-                    errored = True
+                    errored = "parse"
                     break
                 if chunk.get("error"):
                     code, err = self._fault_reply(_chunk_error(chunk, self._scrub), chunk)
                     send(_sse("error", err))
-                    errored = True
+                    errored = "stream"
                     break
                 send(st.feed(chunk))
             if not errored:
                 self._ok()
                 send(st.end())
             self._count(st.usage or None)
-            self._end_call(h, usage_of(st.usage)["output_tokens"] or seen // 120, "fault" if errored else "ok")
+            self._end_call(h, usage_of(st.usage)["output_tokens"] or seen // 120, errored or "ok")
             h.wfile.write(b"0\r\n\r\n")
             h.wfile.flush()
         except (OSError, socket.timeout) as e:
-            self._end_call(h, 0, "fault")
+            self._end_call(h, 0, "stream")
             self._fault(0)
             try:   # the upstream stream broke: say so in the stream, as the API does
                 send(_sse("error", error_for(0, self._scrub(str(e)))[1]))
