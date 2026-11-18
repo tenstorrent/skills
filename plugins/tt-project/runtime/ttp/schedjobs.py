@@ -172,7 +172,7 @@ def _end_session(p, name: str, s: dict, why: str, reason: str = REASON, of: str 
     from . import detach, jobstop
     from .runner import proc_start
     starts = {pid: proc_start(pid) for pid in s["pids"]}
-    tag = Path(f"schedule-{name}")
+    tag = p.logs / f"schedule-{name}"   # absolute: a relative tag would land its .log in the caller's cwd
     sent = []
     for sig, wait in ((signal.SIGTERM, jobstop.PIDS_TERM_S), (signal.SIGKILL, jobstop.FREE_WAIT_S)):
         if not any(_alive(pid, t) for pid, t in starts.items()):

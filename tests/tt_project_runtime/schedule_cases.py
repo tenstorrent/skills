@@ -1356,8 +1356,12 @@ def test_turning_a_schedule_off_stops_the_detached_jobs_its_runs_left_and_nothin
         d._stop_off_schedule_jobs()   # all on: nothing stopped
         assert mine.poll() is None and jobstop.running(rc)
         sched.set_enabled(p.db, "bench", False)
+        cwd = p.state / "post-land" / "tree"   # a suite run from a checkout inside the state (post-land)
+        cwd.mkdir(parents=True)
+        monkeypatch.chdir(cwd)
         d._stop_off_schedule_jobs()   # the tick after it is turned off
         assert _job_ended(mine) and _until_true(lambda: not jobstop.running(rc))
+        assert not list(cwd.iterdir()) and "SIGTERM" in (p.logs / "schedule-bench.log").read_text()
         assert other.poll() is None and elsewhere.poll() is None   # an enabled schedule's, another project's
         ev = [json.loads(e["data"]) for e in p.db.q("SELECT data FROM events WHERE kind=?", (jobstop.EVENT,))]
         assert {e.get("schedule") for e in ev} == {"bench"} and len(ev) == 2, ev
