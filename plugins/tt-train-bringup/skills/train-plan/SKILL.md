@@ -122,6 +122,28 @@ the bring-up. Record these alongside
 batch, sequence, TP/DP and useful FLOPs; never copy a previous box's core count or multiply TP work
 by the chip count again. Cross-box comparisons report wall time and both denominators explicitly.
 
+Two numbers come out of this section, not one. The op sum above is the **cost estimate of the first
+implementation**: your own planned kernels, layouts, collectives and glue priced at their rooflines.
+It predicts what the composite phase will measure, and it is not the target. A target derived from
+your own op list can only ever say the plan is already optimal, and a loop that exits on it exits at
+the baseline: the reference bring-up summed 1914 ms/step (15.6 % MFU), wrote that into this section
+as the target, measured 15.9 % in iteration 1, declared the target met and closed the phase with a
+clean stage review. Only the user reopened it.
+
+- **Target**: the MFU the user requires, copied from the hard-constraints block, with the wall
+  ms/step it implies (`useful_FLOPs / (nominal_peak × target_MFU)`). A requirement, not a
+  prediction. Nothing in the plan derives it.
+- **Estimate**: the op sum, labelled as the first implementation's cost, with the reasons it sits
+  below the target (unfused streams, repeated operands, serialised collectives, launch cost).
+- The distance between the two is the loop's job. A plan whose target equals its own estimate has no
+  target.
+
+Ask for the figure on day 1 if the user has not given one, and never proceed on an invented one. For
+a dense training step on a box authorised for this model, anything under 50 % of nominal peak is a
+number the user approves, never one the plan awards itself. The target moves only on the user's
+instruction; record who set it and when. Later phases re-read it from the hard-constraints block,
+never from a measured result.
+
 The target is one wall-clock ms/step and one MFU figure against the nominal peak of the authorised
 chips (for example 1350 MHz, 148.5 TFLOP/s per chip; the box's sum for a TP run), the same number
 the loop's MFU runs report. It is never cycle time, never a single-chip number for a model that
@@ -198,7 +220,8 @@ so the composite phase's layout choices already favour fewer bytes and fewer act
 `doc/plan.md` contains the hard-constraints block and the five artefacts with numbers, the exact
 reference commit and HF revision, the recipe, the chips and their firmware bundle. The roofline
 target is a single wall ms/step and MFU figure at the nominal peak with its derivation and the
-delivered-clock margin; the top three ops name their compiled kernel source, % of peak and the
+delivered-clock margin, and it is the user's required MFU, with the op sum written beside it as the
+first implementation's cost estimate (one number where there should be two is a plan defect); the top three ops name their compiled kernel source, % of peak and the
 cores their program config launches against the chip's grid; the
 multi-chip fit decision is explicit; on an authorised box every allowed shape and layout is costed
 and the fastest that fits is chosen. The inventory selects reusable training paths, layouts and

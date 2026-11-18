@@ -22,6 +22,10 @@ them.
   model needs it) and MFU against the nominal peak (the plan's figure, e.g. 1350 MHz). "MFU at the
   delivered clock" is a diagnostic only, never a result row. Slice profiles and
   single-chip subset MFU runs rank the next item and are never reported as results.
+- Exit target: the plan's required MFU, read from its hard-constraints block. Not the plan's cost
+  estimate for the first implementation, not the best iteration measured, not re-derived from the
+  ranked table. The loop never lowers it. A target that looks unreachable is a question for the
+  user, asked with the roofline evidence, and the loop keeps running until they answer.
 - Batch and sequence length as the recipe states them.
 - One change per commit, reviewed and verified on its own, so the history bisects.
 - Any other constraint the user states (no pushes, cool-down protocol, forbidden runs).
@@ -408,7 +412,8 @@ target, or the plan's hardware ceiling is reached (the delivered-clock margin st
 the telemetry showing the cap in every result row), or every remaining item in the ranked table is
 useful math at a stated fraction of its own
 roofline with a documented blocker for the rest. A sum of unbuilt ceilings is not a hardware
-ceiling, and "the target is unreachable" is not an exit. "Near its roofline" needs, per item: the roofline
+ceiling, "the target is unreachable" is not an exit, and a target rewritten to the number measured
+is not a target met. A clean-pass review closes an iteration, never the phase. "Near its roofline" needs, per item: the roofline
 figure (bytes or FLOPs at the measured clock), the measured fraction, and the kernel attempt that
 failed to close the gap (a sweep of a library kernel's program configs is tuning, not an attempt).
 Collectives count as a remaining item until overlap with compute was tried. Without these the loop

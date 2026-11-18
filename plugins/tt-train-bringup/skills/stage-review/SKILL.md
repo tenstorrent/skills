@@ -111,6 +111,8 @@ Plan:
   assumption;
 - the target is cycle time, a single-chip number for a model that needs the box, or MFU re-based to
   the delivered clock instead of the nominal peak with the delivered clock as a stated margin;
+- the target is the plan's own op sum rather than the user's required MFU, or the section carries
+  one number where the target and the first-implementation cost estimate both belong;
 - the top three ops of the step lack their compiled kernel source, sync mode and % of peak, or the
   hard-constraints block is missing;
 - on an authorised box, a layout (shape and DP / TP / DP x TP) was chosen without the alternatives
@@ -175,6 +177,9 @@ Optimisation loop:
   not hidden behind compute), or the critical chip is not named;
 - the exit claim does not match the plan's target and margin, or the final MFU
   does not reproduce the best iteration's number;
+- the phase is closed below the plan's target, the target was lowered, re-derived from a
+  measurement or replaced by the baseline estimate, or a clean-pass iteration review is reported as
+  phase completion;
 - the final path fails the PCC harness or loss match;
 - the loop is closed, or the turn ended after a review, with the target unmet and a remaining item
   whose "near roofline" or "inherent" claim has no roofline figure, measured fraction and kernel

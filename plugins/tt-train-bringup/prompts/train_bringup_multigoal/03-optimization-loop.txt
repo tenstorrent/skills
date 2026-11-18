@@ -16,6 +16,6 @@ Goal completion requirements:
 - Rejections include cost, attempts, reason and retry-when condition; retry when it becomes true. For collectives follow the persistent-buffer overlap and TP-loss safeguards, then reduce bytes against the measured floor.
 - Keep result/ranked/rejected tables, ledger and work log in the skill's document format. Evidence files stay under 500 KB; raw Tracy dumps stay outside the repo. Stage by path, commit one code change at a time, never push, and log SHAs.
 - Final evidence includes gap decomposition, memory peak and every remaining math item's roofline, measured fraction and kernel attempt. Stop only at the target margin, the hardware ceiling demonstrated by telemetry, or all remaining items proven near roofline under the skill's exit gate.
-- $stage-review runs every eight iterations or at milestones and returns `clean-pass` at closure. Fix/re-review P1; fix a round's P2 together. Review is a checkpoint, not a reason to stop with the target unmet.
+- $stage-review runs every eight iterations or at milestones and returns `clean-pass` at closure. Fix/re-review P1; fix a round's P2 together. Review is a checkpoint, not a reason to stop with the target unmet; a clean-pass below the plan's target closes an iteration, not the phase, and the target is never lowered or re-derived from a measurement.
 
 Unmet requirements and failed gates are work. Stop only after `$autofix` fails or for a decision only the user can make (a hardware limit or constraint change).
