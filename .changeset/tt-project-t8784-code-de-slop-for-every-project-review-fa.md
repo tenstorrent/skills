@@ -10,3 +10,4 @@
 - de-slop: slop git reads go through gitmemo.run; pause test sets the paused flag
 - de-slop: shorter code-worker line fits the worker prompt cap after the rebase
 - de-slop: a deslop schedule that never ran is due once at enable, not a period away
+- rollout health: a forward revert counts only against a flag whose gated code the reverted commit touched, never a shadow flag; unresolved reverts are listed unattributed
