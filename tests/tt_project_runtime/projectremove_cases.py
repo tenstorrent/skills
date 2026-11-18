@@ -80,7 +80,7 @@ def test_remove_refuses_to_delete_a_folder_that_is_not_a_tt_project_folder(env, 
 def test_a_run_cannot_remove_its_own_project_but_can_remove_a_scratch_one(env, monkeypatch, capsys):
     import pytest
     from ttp import cli, project
-    own, scratch = make(env, "own"), make(env, "scratch")
+    own = make(env, "own")   # one repo holds one project: the same project is "its own" first, then another run's scratch one
     monkeypatch.setattr(cli, "stop_project", lambda proj, kill: "stopped")
     monkeypatch.setenv("TTP_RUN_DIR", str(env["tmp"] / "run"))
     monkeypatch.setenv("TTP_PROJECT", str(own.base))
@@ -88,8 +88,9 @@ def test_a_run_cannot_remove_its_own_project_but_can_remove_a_scratch_one(env, m
         cli.main(["remove", "own"])
     assert e.value.code == 2 and "cannot remove its own project" in capsys.readouterr().err
     assert "own" in project.load_registry()["projects"]
-    cli.main(["remove", "scratch"])
-    assert "scratch" not in project.load_registry()["projects"]
+    monkeypatch.setenv("TTP_PROJECT", str(env["tmp"] / "some-other-project" / "tt-project"))
+    cli.main(["remove", "own"])
+    assert "own" not in project.load_registry()["projects"]
 
 
 def test_remove_is_listed_among_the_admin_commands_and_a_glm_run_cannot_run_it():
@@ -104,7 +105,7 @@ def test_a_deploy_check_follows_only_projects_registered_here_and_never_alerts_f
     from ttp import alerts, deploy, overview
     p = make(env)
     _deploy_lib("0.5.0")
-    _, db = _deploy_project(tmp_path, "alpha", "0.5.0", running="0.4.9")
+    _, db = _deploy_project(tmp_path, "alpha", "0.4.9")
     now = time.time()
     got = deploy.record(p, overview.deployed(names=["ghost"]), now)
     assert got["rc"] == 0 and got["projects"] == [], got
@@ -113,11 +114,16 @@ def test_a_deploy_check_follows_only_projects_registered_here_and_never_alerts_f
     deploy.tick(p, lambda key, text, severity, **_: pages.append(key), now + 10 * deploy.GRACE_S)
     assert pages == []
     # a registered one behind the release is still judged and alerted
-    db.set_kv("daemon", {"pid": 0, "host": "testhost"})
-    deploy.record(p, overview.deployed(names=["alpha"]), now)
-    deploy.tick(p, lambda key, text, severity, **_: pages.append(key), now + 10 * deploy.GRACE_S)
+    from ttp import release
+    db.add_task(release.UPGRADE_TASK_TITLE, "merge", kind="harness")
+    report = overview.deployed(names=["alpha"])
+    report["projects"][0]["takeover_at"] = now + 1
+    assert deploy.record(p, report, now)["rc"] == 0
+    due = now + 1 + deploy.GRACE_S
+    deploy.tick(p, lambda key, text, severity, **_: pages.append(key), due + deploy.PROBE_S)
+    deploy.tick(p, lambda key, text, severity, **_: pages.append(key), due + deploy.PROBE_S * 2)
     assert pages == ["deploy-behind:alpha"], pages
-    assert alerts.holds(p.db, "deploy-behind:alpha", now, now + 10 * deploy.GRACE_S)
+    assert alerts.holds(p.db, "deploy-behind:alpha", now, due)
     db.close()
 
 

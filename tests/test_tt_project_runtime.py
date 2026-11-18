@@ -574,7 +574,7 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     from ttp import benchrun   # bench cells run isolated (cellns.py), which needs a mount namespace: the isolation
     monkeypatch.setattr(benchrun, "ISOLATE", False)   # tests (bench_cases) turn it on; the rest run cells as before
     from ttp import codearm   # the arm's tests run a live arm on a stand-in guarded harness (codearm_cases tests the refusal)
-    monkeypatch.setattr(codearm, "HARNESSES", ("claude-code",))
+    monkeypatch.setattr(codearm, "HARNESSES", ("claude-code", "mini-swe-agent"))
     from ttp import hostcpu   # the fresh module tests import
     monkeypatch.setattr(hostcpu, "MEMINFO", tmp_path / "no-meminfo")   # memory reads as unknown: never this host's own
     monkeypatch.setattr(hostcpu, "mach_mem_free", lambda: None)   # (memory tests set it)

@@ -232,6 +232,8 @@ def test_runtime_is_standard_library_only_and_python39_compatible():
                 continue
             # The resume plugin is loaded only into the checked repo's own pytest, never by the runtime.
             plugin = py.parent.name == "pytest_resume" and names == ["pytest"]
+            # glmenv.py is loaded only inside the GLM arm's mini-swe-agent process, which brings its own package.
+            plugin = plugin or (py.name == "glmenv.py" and names == ["minisweagent"])
             for n in names:
                 assert _is_stdlib(n) or n == "ttp" or plugin, f"{py}: imports non-stdlib module {n}"
         if re.search(r"\w\]?\s*\|\s*None\b", src):

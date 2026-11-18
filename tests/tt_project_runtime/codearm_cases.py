@@ -242,11 +242,12 @@ def test_ttp_push_from_a_run_that_handed_back_is_refused_before_it_touches_anyth
 def test_the_arm_owns_every_run_of_a_code_task_light_wakes_and_the_tier_route_included(env):
     """With the arm on, a claude-arm task's runs never take the old tier route to the chat provider, and a glm
     task's light wakes go to its arm; a tier-up run of a glm task and a task without an arm are as before."""
-    from ttp import codearm, daemon
+    from ttp import codearm, daemon, policyfiles
     p = make(env)
-    cfg = {**_ca_cfg(), "providers": {"chat": {"endpoint": "placeholder", "base_url": "https://chat.example.invalid/v1",
+    (p.harness / policyfiles.FILE).write_text("src/policy_module.py\n")   # a live arm needs the project's policy list
+    cfg = {**_ca_cfg(glm={**_CA_GLM, "harness": "mini-swe-agent"}), "providers": {"chat": {"endpoint": "placeholder", "base_url": "https://chat.example.invalid/v1",
                                                 "tiers": {"light": "example-org/light-model"}}},
-           "route": {**_ca_cfg()["route"], "classes": {"light": {"to": "chat", "model": "example-org/light-model"}}}}
+           "route": {**_ca_cfg(glm={**_CA_GLM, "harness": "mini-swe-agent"})["route"], "classes": {"light": {"to": "chat", "model": "example-org/light-model"}}}}
     d = daemon.Daemon.__new__(daemon.Daemon)
     d.p, d.cfg = p, cfg
     d._model_pick = lambda *a, **k: None
@@ -541,8 +542,8 @@ def test_the_daemon_wires_the_live_harness_in_and_the_runner_costs_it():
 def test_config_and_doctor_say_why_a_live_share_on_claude_code_is_zero():
     import inspect
     from ttp import cli
-    assert "codearm.refusal(p.config())" in inspect.getsource(cli.cmd_config)
-    assert "codearm.refusal(p.config())" in inspect.getsource(cli.cmd_doctor)
+    assert "codearm.refusal(p.config()" in inspect.getsource(cli.cmd_config)
+    assert "codearm.refusal(p.config()" in inspect.getsource(cli.cmd_doctor)
 
 
 # The policy file list (policyfiles.py): the code that decides what needs an audit record, review, approval, budget or push.
