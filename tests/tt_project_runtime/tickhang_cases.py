@@ -518,7 +518,7 @@ def test_a_step_stopped_at_its_budget_naming_no_item_names_the_code_line_it_was_
     d = dmod.Daemon(p.base)
     monkeypatch.setattr(dmod, "STEP_BUDGET_S", 0.05)
     monkeypatch.setattr(dmod, "STEP_HARD_SLACK_S", 0.05)
-    monkeypatch.setattr(slop, "scan", lambda *a, **k: time.sleep(30))
+    monkeypatch.setattr(slop, "scan_files", lambda *a, **k: time.sleep(30))
     d._run_step(lambda: deslop.plan(p, {"deslop": {"enabled": True}}), "slow_plan")
     [ev] = p.db.q("SELECT * FROM events WHERE kind='tick_step_slow'")
     assert "held longest by code at deslop.py:" in ev["text"] and "in plan" in ev["text"], ev["text"]
