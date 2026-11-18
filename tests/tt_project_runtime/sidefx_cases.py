@@ -472,6 +472,27 @@ def test_outside_writes_reads_a_heredoc_body_as_data_and_the_claim_check_names_n
     assert any("tt-project-peer" in x for x in sidefx.peer_effects(rd, p.base, "demo"))
 
 
+def test_a_quoted_heredoc_operator_hides_no_real_command_after_it(env, tmp_path, scratch_home):
+    """`<<X` inside quotes, an escape or a comment opens no heredoc: the writes and unit stops after it are found."""
+    from ttp import sidefx
+    p = make(env)
+    wt, rd, o = tmp_path / "wt", tmp_path / "run", tmp_path / "o"
+    wt.mkdir(), rd.mkdir()
+    shapes = [f'echo "a <<X"\nrm -f {o}/f\nsystemctl --user stop tt-project-peer.service\nX',
+              f"echo 'a <<X'\nrm -f {o}/f\nsystemctl --user stop tt-project-peer.service\nX",
+              f"echo a \\<<X\nrm -f {o}/f\nsystemctl --user stop tt-project-peer.service\nX",
+              f"echo ok # <<X\nrm -f {o}/f\nsystemctl --user stop tt-project-peer.service\nX"]
+    for cmd in shapes:
+        assert sidefx.classify_paths(cmd, str(scratch_home), str(wt), str(rd)).get(f"{o}/f", ("",))[0] == "write", cmd
+        (rd / "output.jsonl").write_text("".join(json.dumps(x) + "\n" for x in _claude_calls(("Bash", {"command": cmd}))))
+        assert [f["path"] for f in sidefx.scan(rd, str(wt))] == [f"{o}/f"], cmd
+        assert any("tt-project-peer" in x for x in sidefx.peer_effects(rd, p.base, "demo")), cmd
+    # an unquoted heredoc after a line with a quoted one still hides its body
+    cmd = f'echo "a <<X" && cat >> {wt}/t <<EOF\nrm -f {o}/g\nEOF'
+    (rd / "output.jsonl").write_text("".join(json.dumps(x) + "\n" for x in _claude_calls(("Bash", {"command": cmd}))))
+    assert sidefx.scan(rd, str(wt)) == []
+
+
 def test_outside_writes_names_no_read_only_command_path_or_argument_as_written(tmp_path, scratch_home):
     """Read-only commands, process substitution, output thrown into /dev/null, a PATH-style assignment and a
     path inside a quoted argument are no writes; real redirects, tee, cp, rm and `bash -c` writes still are."""

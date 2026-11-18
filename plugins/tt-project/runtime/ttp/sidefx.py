@@ -29,6 +29,8 @@ import re
 import shlex
 from pathlib import Path
 
+from .hook import _quoting
+
 FILE = "outside.json"
 # The `guard` of a call no guard refused: the hooks block only protected and credential paths (pathguard,
 # hook.py), so a write elsewhere, such as a tee into /tmp, runs, and this run-end scan is what records it.
@@ -94,17 +96,26 @@ def _expand(path: str, home: str, cwd: str, run_dir: str, base: str | None = Non
     return os.path.normpath(p)
 
 
+def _operators(cmd: str, start: int, stop: int | None = None):
+    """The heredoc operators in cmd[start:stop] that are not quoted, escaped or in a comment (hook._quoting)."""
+    for m in HEREDOC_RE.finditer(cmd, start, len(cmd) if stop is None else stop):
+        first = cmd.rfind("\n", 0, m.start()) + 1
+        last = cmd.find("\n", m.start())
+        if not _quoting(cmd[first:len(cmd) if last < 0 else last])[m.start() - first][0]:
+            yield m
+
+
 def _heredocs(cmd: str) -> str:
     """`cmd` with each heredoc's body taken out: the text it feeds a command is data, not commands run or
     paths written. A body fed to a shell or an interpreter (`bash <<EOF`, `python3 - <<EOF`) runs, so it
     stays as that command's `-c` script. A heredoc whose end line is missing is kept as it is."""
     out, pos = [], 0
-    while (m := HEREDOC_RE.search(cmd, pos)):
+    while (m := next(_operators(cmd, pos), None)):
         nl = cmd.find("\n", m.end())
         if nl < 0:
             break
         line, at, parts, ok = cmd.rfind("\n", 0, m.start()) + 1, nl + 1, [], True
-        for o in HEREDOC_RE.finditer(cmd, m.start(), nl):   # each body follows the line, in order
+        for o in _operators(cmd, m.start(), nl):   # each body follows the line, in order
             word = o.group(2) or o.group(3) or o.group(4)
             end = re.compile("^" + ("\t*" if o.group(1) else "") + re.escape(word) + "$", re.M).search(cmd, at)
             if not end:
