@@ -1292,6 +1292,38 @@ def test_bridge_refresh_reinstalls_a_service_whose_command_changed(tmp_path, mon
     assert bridge.refresh("darwin", conf) == []
 
 
+def test_bridge_refresh_restarts_a_session_whose_relay_copy_changed_and_the_check_follows_it(tmp_path, monkeypatch):
+    # cells: relay_restart_on_change
+    import json
+    import plistlib
+    from ttp import bridge
+    monkeypatch.delenv("TTP_TEST_NO_BRIDGE_REFRESH", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(bridge, "HOME_DIR", tmp_path)
+    monkeypatch.setattr(bridge, "RELAY", tmp_path / "bridge_relay.py")
+    conf = tmp_path / "bridge.json"
+    conf.write_text(json.dumps({"boxes": {"box-1": {"login": {}, "agents": {"auto": {"agent": "env", "forward": [
+        {"name": "build-a", "target": "build-a.example.com", "port": 2301}]}}}}}))
+    started = []
+    monkeypatch.setattr(bridge, "start", lambda box, an, argv, platform=None: started.append(argv) or "restarted")
+    argv = bridge.service_argv(bridge.load(conf), "box-1", "auto", platform="darwin")
+    f = bridge.service_file("box-1", "auto", "darwin")
+    f.parent.mkdir(parents=True)
+    f.write_bytes(plistlib.dumps(bridge.launchd_plist("box-1", "auto", argv)))
+    bridge.RELAY.write_text("# an older release's relay\n")
+    restarted = {}
+    assert bridge.refresh("darwin", conf, restarted=restarted) == ["bridge box-1 auto: relay changed; restarted"]
+    assert started == [argv] and bridge.RELAY.read_bytes() == \
+        pathlib.Path(bridge.__file__).with_name("bridge_relay.py").read_bytes(), "the same command, the new relay"
+    assert restarted == {("box-1", "auto"): "restarted"}, "refresh_checked then checks the restarted session"
+    assert bridge.refresh("darwin", conf) == [] and len(started) == 1, "relay and command unchanged: left running"
+    checked = []
+    monkeypatch.setattr(bridge, "status", lambda *a, **k: checked.append(a) or ([], 0), raising=False)
+    bridge.RELAY.write_text("# older again\n")
+    out, rc = bridge.refresh_checked("darwin", conf, wait_s=0)
+    assert out[0] == "bridge box-1 auto: relay changed; restarted" and len(started) == 2
+
+
 # --- a dead agent behind a live-looking link (box loop, wrapper reconnect, host watch) --------------
 # A stub ssh-add answers by marker files next to the socket it is asked about: <sock>.dead (exit 2),
 # <sock>.fetch (exit 1, a failed exchange), <sock>.empty (exit 1, no keys). No real agent or key.

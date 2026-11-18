@@ -313,15 +313,16 @@ def service_argv(cfg: dict, box: str, agent: str, ssh: str | None = None, platfo
             *[f"{h['name']}={h['target']}%{h['interface']}" for h in bound], "--", *argv]
 
 
-def install_relay() -> None:
-    """Copy bridge_relay.py where the service runs it, only when its content changed."""
+def install_relay() -> bool:
+    """Copy bridge_relay.py where the service runs it, only when its content changed; True when it did."""
     data = Path(__file__).with_name("bridge_relay.py").read_bytes()
     try:
         if RELAY.read_bytes() == data:
-            return
+            return False
     except OSError:
         pass
     durable_write(RELAY, data, mode=0o600)
+    return True
 
 
 def render_block(cfg: dict, box: str) -> str:
@@ -552,27 +553,26 @@ def installed_argv(box: str, agent: str, platform: str | None = None) -> list[st
 
 def refresh(platform: str | None = None, path: Path | None = None, restarted: dict | None = None) -> list[str]:
     """After `ttp setup` or an upgrade: re-install the relay copy and restart each installed session
-    whose command changed (into `restarted`: (box, agent) -> what the restart said). Nothing when no
-    bridge is configured or installed here."""
+    whose command changed, or every one when the relay copy changed (a running session keeps the old
+    relay's code until it restarts), into `restarted`: (box, agent) -> what the restart said. Nothing
+    when no bridge is configured or installed here."""
     if os.environ.get("TTP_TEST_NO_BRIDGE_REFRESH") or not (path or CONFIG).is_file():
         return []
     try:
         cfg = load(path)
     except (BadConfig, OSError, ValueError) as e:
         return [f"bridge: config not read ({e}); services left as they are"]
-    out = []
-    for box, b in cfg["boxes"].items():
-        for an in b["agents"]:
-            have = installed_argv(box, an, platform)
-            if have is None:
-                continue
-            argv = service_argv(cfg, box, an, platform=platform)
-            install_relay()
-            if have != argv:
-                said = start(box, an, argv, platform)
-                if restarted is not None:
-                    restarted[(box, an)] = said
-                out.append(f"bridge {box} {an}: service command changed; {said}")
+    out, have = [], {(box, an): installed_argv(box, an, platform) for box, b in cfg["boxes"].items()
+                     for an in b["agents"]}
+    have = {k: v for k, v in have.items() if v is not None}
+    relay = bool(have) and install_relay()
+    for (box, an), old in have.items():
+        argv = service_argv(cfg, box, an, platform=platform)
+        if old != argv or relay:
+            said = start(box, an, argv, platform)
+            if restarted is not None:
+                restarted[(box, an)] = said
+            out.append(f"bridge {box} {an}: {'service command' if old != argv else 'relay'} changed; {said}")
     return out
 
 
