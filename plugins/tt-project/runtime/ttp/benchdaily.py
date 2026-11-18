@@ -321,14 +321,8 @@ def build(day: str, proj: dict, kept: list[dict], repo: Path, bench_dir: Path) -
 
 
 def read_rows(path: Path) -> dict[tuple, dict]:
-    rows = {}
-    for line in path.read_text().splitlines() if path.exists() else []:
-        try:
-            r = json.loads(line)
-            rows[(r["task"], r["rep"], r["arm"])] = r
-        except (ValueError, KeyError, TypeError):
-            continue
-    return rows
+    """The last row of each cell (serverhealth.latest: void server marks skipped)."""
+    return serverhealth.latest(benchrun.json_lines(path))
 
 
 def append_row(path: Path, row: dict, lock: threading.Lock) -> None:
@@ -903,8 +897,9 @@ def table_md(cum: dict) -> str:
     if cum.get("reruns"):
         lines += ["", "## Server reruns", "", "Stops rechecked against the server rule, each rerun at normal server speed; "
                   "the cause says whether the server or the model stopped the first run:"]
-        lines += [f"- {x['day']}: {x['task']} {x['arm']}: first run {(x.get('was') or {}).get('outcome') or 'stopped'}"
-                  f" -> {x.get('rerun_outcome') or 'not rerun'}: {x['cause']}" for x in cum["reruns"]]
+        lines += [f"- {x['day']}: {x['task']} {x['arm']}: {x.get('rerun_outcome') or 'not rerun'} on rerun (first run "
+                  f"{(x.get('was') or {}).get('outcome') or 'stopped'}; {CAUSE_TEXT.get(x['cause'], x['cause'])})"
+                  for x in cum["reruns"]]
     if cum.get("parity"):
         from . import benchparity
         # the harness is part of what an arm compares (the harness A/B), so only the conditions must match
@@ -1054,6 +1049,11 @@ RERUN_WHY = ("recorded before the server's waits were measured: whether the mode
              "the rerun at normal speed decides")
 
 
+CAUSE_TEXT = {"server": "the server stopped the first run", "model": "the model stopped it again at normal server speed",
+              "server (still slow)": "the server is still slow, queued again",
+              "server (not rerun yet)": "queued, not rerun yet"}
+
+
 def stop_cause(new: dict) -> str:
     """Who stopped an earlier stop, from the cell that reran it: a rerun that ended inside the limit means the
     server cut the first run ("server"); one that stopped again with the server at normal speed means the model
@@ -1127,7 +1127,12 @@ def rerun_day(day: str, stops: list[tuple[str, str]], root: Path | None = None, 
     added = benchrun.rerun_cells(bench_dir, out, tasks, arms, [], 0, base, cfg or {}, probe, sleep, lock, only=cells,
                                  task_opts=lambda t: {"repo": Path(t["source_root"]), "state": Path(t["state"])})
     now = read_rows(out / "results.jsonl")
-    done = [(tid, name) for tid, name in cells if (r := now.get((tid, 0, name))) and r.get("outcome") != serverhealth.OUTCOME]
+    # only cells rerun now, or rerun earlier with no rerun entry yet (a call that ended before its review): a cell
+    # whose rerun is already recorded is not graded again
+    ran = {(r["task"], r["arm"]) for r in added if r.get("rerun_of")}
+    known = {(x["task"], x["arm"]) for x in rec.get("reruns") or [] if x.get("rerun_outcome")}
+    done = [(tid, name) for tid, name in cells if (r := now.get((tid, 0, name))) and r.get("outcome") != serverhealth.OUTCOME
+            and ((tid, name) in ran or (r.get("rerun_of") and (tid, name) not in known))]
     graded = {"scored": {}, "unscored": []}
     sub_arms = {name: arms[name] for _, name in done}
     sub_tasks = {tid: tasks[tid] for tid, _ in done}

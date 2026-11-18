@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import itertools
 import json
 import os
 import random
@@ -1378,17 +1379,20 @@ def criteria(spec: str) -> str:
     return mark_live("\n".join(lines[start:end]).strip())
 
 
+def json_lines(path: Path):
+    """The rows of a JSON-lines file, unreadable lines skipped (a torn last line); nothing when it is missing."""
+    for line in path.read_text().splitlines() if path.exists() else []:
+        try:
+            yield json.loads(line)
+        except ValueError:
+            continue
+
+
 def blind_cells(out: Path, tasks: dict, arms: dict, cells: list[dict]) -> dict:
     """The blind review's input from <out>/results.jsonl: one cell per task and repeat whose arms all
     have a row (a repeat's task id gets '-r<rep>' when the plan has several). Each arm carries its diff
     and only what names the arm, so prep masks those tokens; run stats stay in results.jsonl."""
-    rows = {}
-    for line in (out / "results.jsonl").read_text().splitlines() if (out / "results.jsonl").exists() else []:
-        try:
-            r = json.loads(line)
-            rows[(r["task"], r["rep"], r["arm"])] = r
-        except (ValueError, KeyError, TypeError):
-            continue
+    rows = serverhealth.latest(json_lines(out / "results.jsonl"))
     rows = {k: r for k, r in rows.items() if r.get("outcome") != serverhealth.OUTCOME}   # not scored until rerun
     idle = {k for k, r in rows.items() if r.get("outcome") == benchnotrun.OUTCOME}   # no model ran: never reviewed
     reps = sorted({c["rep"] for c in cells})
@@ -1453,18 +1457,15 @@ def recheck_stops(out: Path, cells: list[tuple], why: str) -> list[dict]:
     """Mark earlier stops as `server` cells to rerun (the rule applies to runs made before the server's waits were
     recorded): for each (task, rep, arm) whose last row is a limit stop (timeout, stalled, a capacity refusal), a new
     row marks it `server` (not scored, never a fail) with `why`, keeping the old row as `was`; its rerun decides
-    whether the stop was the server's or the model's. Returns the rows added."""
-    rows = {}
-    for line in (out / "results.jsonl").read_text().splitlines():
-        try:
-            r = json.loads(line)
-            rows[(r["task"], r["rep"], r["arm"])] = r
-        except (ValueError, KeyError, TypeError):
-            continue
+    whether the stop was the server's or the model's. A row whose server waits were measured (`server`) or that is
+    itself a rerun (`rerun_of`) is never marked: the server rule already judged it. Returns the rows added."""
+    rows = serverhealth.latest(json_lines(out / "results.jsonl"))
     added = []
     for key in cells:
         old = rows.get(key)
         if not old or old.get("outcome") == serverhealth.OUTCOME or old.get("passed") is True:   # a pass stays a pass
+            continue
+        if old.get("server") or old.get("rerun_of"):   # waits measured, or a rerun that ended: already judged
             continue
         new = {k: v for k, v in old.items() if k not in ("was",)}
         new = serverhealth.mark(new, [why])
@@ -1488,12 +1489,7 @@ def rerun_cells(bench_dir: Path, out: Path, tasks: dict, arms: dict, cells: list
     graded as any cell: its new row replaces the old (the last row of a cell wins) and names it (`rerun_of`).
     `only`: (task|None, arm|None) pairs. `task_opts(task)`: the options a task's run adds (a daily bench's
     repository and state folder per task). Returns the rows added."""
-    rows = []
-    for line in (out / "results.jsonl").read_text().splitlines():
-        try:
-            rows.append(json.loads(line))
-        except ValueError:
-            continue
+    rows = list(json_lines(out / "results.jsonl"))
     added = []
     for old in serverhealth.queue(rows):
         if only and not any(t in (None, old["task"]) and n in (None, old["arm"]) for t, n in only):
@@ -1515,8 +1511,8 @@ def rerun_cells(bench_dir: Path, out: Path, tasks: dict, arms: dict, cells: list
         cell = {"task": old["task"], "rep": old["rep"], "arm": old["arm"], "slot": old.get("slot", 0)}
         kept = out / "cells" / f"{old['task']}-r{old['rep']}-{old['arm']}"
         n = int(old.get("server_attempts") or 1)
-        if kept.exists():   # the stopped attempt's files stay beside the rerun's
-            kept.rename(kept.with_name(f"{kept.name}.server{n}"))
+        if kept.exists():   # the stopped attempt's files stay beside the rerun's, under the first free name
+            kept.rename(next(p for i in itertools.count(1) if not (p := kept.with_name(f"{kept.name}.server{i}")).exists()))
         with (lock() if lock else contextlib.nullcontext()):
             new = {**run_cell(bench_dir, out, tasks[old["task"]], cell, arm,
                               {**opts, **(task_opts(tasks[old["task"]]) if task_opts else {})}, cfg), "seed": seed,

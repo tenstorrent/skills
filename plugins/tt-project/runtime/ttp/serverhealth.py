@@ -271,12 +271,29 @@ def mark(row: dict, why: list[str]) -> dict:
     return row
 
 
+def void(row: dict) -> bool:
+    """A recheck mark (`was`, from benchrun.recheck_stops) on a run whose server waits were already measured
+    (`server`, from judge): the recheck rule covers only runs made before the waits were recorded, so the mark is
+    void and the run it marked stands."""
+    return row.get("outcome") == OUTCOME and bool(row.get("was")) and bool(row.get("server"))
+
+
+def latest(rows) -> dict[tuple, dict]:
+    """The last row of each cell (task, rep, arm), void marks skipped; rows without a cell key are skipped."""
+    last: dict = {}
+    for r in rows:
+        try:
+            key = (r["task"], r["rep"], r["arm"])
+        except (KeyError, TypeError):
+            continue
+        if not void(r):
+            last[key] = r
+    return last
+
+
 def queue(rows: list[dict]) -> list[dict]:
     """The rerun queue: the latest row of each cell (task, rep, arm) whose outcome is `server`, in order."""
-    latest: dict = {}
-    for r in rows:
-        latest[(r.get("task"), r.get("rep"), r.get("arm"))] = r
-    return [r for r in latest.values() if r.get("outcome") == OUTCOME]
+    return [r for r in latest(rows).values() if r.get("outcome") == OUTCOME]
 
 
 def healthy(probe: dict, normal: dict | None, factor: float = FACTOR) -> bool:

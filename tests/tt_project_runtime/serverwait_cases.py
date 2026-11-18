@@ -237,6 +237,42 @@ def test_benchrun_rerun_cells_run_one_at_a_time_after_a_healthy_probe_and_replac
     assert benchrun.rerun_cells(tmp_path, out, tasks, arms, [], 15, {}, {}, probe=lambda m, e: {"ok": True}) == []
 
 
+def test_benchrun_recheck_stops_never_marks_a_measured_run_or_a_finished_rerun(tmp_path):
+    from ttp import benchrun
+    out = _server_out(tmp_path, [
+        {"task": "1", "rep": 0, "arm": "a", "outcome": "timeout", "passed": False, "hang_guard": True,
+         "server": {"calls": 9, "wait_s": 0.4}},
+        {"task": "2", "rep": 0, "arm": "a", "outcome": "flagged", "passed": False,
+         "rerun_of": {"outcome": "server", "attempts": 2}}])
+    assert benchrun.recheck_stops(out, [("1", 0, "a"), ("2", 0, "a")], "recorded before accounting") == []
+    assert len((out / "results.jsonl").read_text().splitlines()) == 2
+
+
+def test_benchrun_rerun_cells_keep_an_earlier_attempt_folder_under_the_next_free_name(tmp_path, monkeypatch):
+    from ttp import benchrun
+    out = _server_out(tmp_path, [{"task": "1", "rep": 0, "arm": "a", "outcome": "server", "passed": None}])
+    for name, text in (("1-r0-a", "attempt 3"), ("1-r0-a.server1", "attempt 1"), ("1-r0-a.server2", "attempt 2")):
+        (out / "cells" / name).mkdir(parents=True)
+        (out / "cells" / name / "marker").write_text(text)
+    monkeypatch.setattr(benchrun, "run_cell", lambda *a, **k: {"task": "1", "rep": 0, "arm": "a", "outcome": "done"})
+    added = benchrun.rerun_cells(tmp_path, out, {"1": {"task": "1"}}, {"a": {"provider": "chat", "model": "m",
+                                 "effort": "max"}}, [], 0, {"server_history": ""}, {}, probe=lambda m, e: {"ok": True})
+    assert [r["outcome"] for r in added] == ["done"]
+    assert [(out / "cells" / f"1-r0-a.server{i}" / "marker").read_text() for i in (1, 2, 3)] == \
+        ["attempt 1", "attempt 2", "attempt 3"]
+
+
+def test_serverhealth_a_recheck_mark_on_a_measured_run_is_void():
+    from ttp import serverhealth
+    rerun = {"task": "1", "rep": 0, "arm": "a", "outcome": "done", "server": {"calls": 9}, "rerun_of": {"attempts": 2}}
+    stale = {**rerun, "outcome": "server", "passed": None, "server_reason": ["before"], "was": {"outcome": "done"}}
+    mark = {"task": "2", "rep": 0, "arm": "a", "outcome": "server", "was": {"outcome": "timeout"}}
+    judged = {"task": "3", "rep": 0, "arm": "a", "outcome": "server", "server": {"calls": 9}}
+    assert [serverhealth.void(r) for r in (stale, mark, judged)] == [True, False, False]
+    assert serverhealth.latest([rerun, stale, mark, judged])[("1", 0, "a")] is rerun
+    assert [r["task"] for r in serverhealth.queue([rerun, stale, mark, judged])] == ["2", "3"]
+
+
 def test_benchrun_rerun_cells_leave_a_cell_queued_while_the_server_stays_slow_and_filter_by_only(tmp_path, monkeypatch):
     from ttp import benchrun
     out = _server_out(tmp_path, [
@@ -375,7 +411,7 @@ def test_rerun_day_marks_the_stop_reruns_it_and_names_the_server_as_the_cause(tm
     assert rec["reruns"][0]["cause"] == "server" and rec["reruns"][0]["was"]["outcome"] == "timeout"
     assert "server" not in rec
     md = (root / "table.md").read_text()
-    assert "Server reruns" in md and "P-1 glm: first run timeout -> done: server" in md
+    assert "Server reruns" in md and "P-1 glm: done on rerun (first run timeout; the server stopped the first run)" in md
     assert json.loads((root / "days" / "2026-11-15.json").read_text())["reruns"] == rec["reruns"]
 
 
@@ -394,6 +430,47 @@ def test_rerun_day_a_cell_still_slow_stays_not_scored_and_names_no_cause_yet(tmp
     assert rec["server"][0]["task"] == "P-1" and rec["reruns"][0]["cause"] == "server (still slow)"
     with pytest.raises(ValueError):
         benchdaily.rerun_day("2026-11-15", [("9", "glm")], root=root, progress=lambda s: None)
+
+
+def test_rerun_day_again_on_cells_whose_reruns_ended_keeps_them_and_lists_their_outcome(tmp_path, monkeypatch):
+    """A second --rerun-stops on cells already rerun (a stale `server` mark from an earlier call is in the file and
+    their first attempt's folder is already kept as .server1): nothing is marked, rerun or graded again, nothing
+    raises, and the table names each rerun's outcome, not the stale mark."""
+    from ttp import benchdaily, benchrun
+    root = tmp_path / "daily"
+    out = root / "runs" / "2026-11-15"
+    (out / "bench").mkdir(parents=True)
+    (root / "days").mkdir(parents=True)
+    (out / "picked.json").write_text(json.dumps({"day": "2026-11-15", "order": [], "dropped": []}))
+    stop = {"task": "P-1", "rep": 0, "arm": "glm", "outcome": "flagged", "passed": False, "wall_s": 3600}
+    mark = {**stop, "outcome": "server", "passed": None, "server_reason": [benchdaily.RERUN_WHY],
+            "was": {"outcome": "flagged"}}
+    rerun = {**stop, "wall_s": 1994, "server": {"calls": 40, "wait_s": 0.5}, "server_normal": True,
+             "rerun_of": {"outcome": "server", "was": {"outcome": "flagged"}, "attempts": 2}}
+    stale = {**rerun, "outcome": "server", "passed": None, "server_reason": [benchdaily.RERUN_WHY],
+             "was": {"outcome": "flagged"}}
+    (out / "results.jsonl").write_text("".join(json.dumps(r) + "\n" for r in (stop, mark, rerun, stale)))
+    for name in ("P-1-r0-glm", "P-1-r0-glm.server1"):
+        (out / "cells" / name).mkdir(parents=True)
+        (out / "cells" / name / "marker").write_text(name)
+    reruns = [{"task": "P-1", "arm": "glm", "was": {"outcome": "flagged"}, "cause": "server",
+               "rerun_outcome": "flagged", "rerun_minutes": 33.23}]
+    (root / "days" / "2026-11-15.json").write_text(json.dumps({
+        "day": "2026-11-15", "cells": [], "skipped": [], "dropped": [], "spend": {}, "reruns": reruns,
+        "arms": {"glm": {"provider": "chat", "model": "m", "effort": "max", "harness": ""}}}))
+    monkeypatch.setattr(benchdaily, "build_tasks", lambda *a, **k: {"P-1": {"project": "P", "source_task": 1,
+                                                                            "source_root": str(tmp_path), "state": str(tmp_path)}})
+    monkeypatch.setattr(benchrun, "run_cell", lambda *a, **k: pytest.fail("a finished rerun ran again"))
+    monkeypatch.setattr(benchdaily, "blind_review", lambda *a, **k: pytest.fail("a graded rerun was graded again"))
+    before = (out / "results.jsonl").read_text()
+    rec = benchdaily.rerun_day("2026-11-15", [("1", "glm")], root=root, probe=lambda m, e: {"ok": True},
+                               opts={"server_history": ""}, progress=lambda s: None)
+    assert (out / "results.jsonl").read_text() == before, "no row appended"
+    assert rec["reruns"] == reruns and "server" not in rec
+    assert benchdaily.read_rows(out / "results.jsonl")[("P-1", 0, "glm")] == rerun, "the stale mark does not count"
+    md = (root / "table.md").read_text()
+    assert "P-1 glm: flagged on rerun (first run flagged; the server stopped the first run)" in md
+    assert ": server\n" not in md
 
 
 class _FakeUsage:
