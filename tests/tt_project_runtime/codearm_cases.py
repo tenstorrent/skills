@@ -311,7 +311,7 @@ def test_glm_guard_is_on_for_an_arm_run_by_its_variable_or_its_marker_and_off_fo
 
 @_pytest.mark.parametrize("cmd,action,refused", [
     ("push", "", False), ("checks", "", False), ("lock", "", False), ("detach", "", False), ("task", "show", False),
-    ("task", "list", False), ("note", "", True), ("say", "", True), ("ask", "", True), ("notify", "", True),
+    ("task", "list", False), ("note", "", False), ("say", "", True), ("ask", "", True), ("notify", "", True),
     ("upstream", "", True), ("task", "add", True), ("task", "steer-me", True), ("obligation", "", True),
     ("memory", "", True), ("config", "", True), ("secret", "", True), ("issues", "", True)])
 def test_glm_guard_cli_allows_checks_and_push_and_refuses_everything_that_reaches_someone(cmd, action, refused):
@@ -327,16 +327,16 @@ def test_glm_guard_cli_gate_ends_the_run_as_a_bounce_to_opus_and_a_normal_run_is
     monkeypatch.setenv("TTP_PROJECT", str(p.base))
     monkeypatch.setenv("TTP_RUN_DIR", str(rd))
     monkeypatch.delenv("TTP_CODE_ARM_GUARD", raising=False)
-    cli.glm_gate(type("A", (), {"cmd": "note", "action": ""})())   # not a GLM-arm run: nothing happens
+    cli.glm_gate(type("A", (), {"cmd": "notify", "action": ""})())   # not a GLM-arm run: nothing happens
     assert not (rd / glmguard.HIT).exists()
     monkeypatch.setenv("TTP_CODE_ARM_GUARD", "1")
     cli.glm_gate(type("A", (), {"cmd": "checks", "action": ""})())   # an allowed command passes
     with _pytest.raises(SystemExit) as e:
-        cli.glm_gate(type("A", (), {"cmd": "note", "action": ""})())
+        cli.glm_gate(type("A", (), {"cmd": "notify", "action": ""})())
     assert e.value.code == 2 and "GLM arm" in capsys.readouterr().err
     res = json.loads((rd / "result.json").read_text())
     assert codearm.bounce_reason(res).startswith("guard: ") and res["status"] == "blocked"
-    assert glmguard.hit_reason(rd).startswith("`ttp note`")
+    assert glmguard.hit_reason(rd).startswith("`ttp notify`")
 
 
 @_pytest.mark.parametrize("argv", [["checks"], ["checks", "--dry-run"], ["checks", "--fresh", "--", "true"],
@@ -383,19 +383,96 @@ def test_glm_guard_passes_every_allowed_command_with_and_without_arguments(name,
     assert parsed and not (rd / glmguard.HIT).exists(), (name, glmguard.hit_reason(rd))
 
 
-def test_glm_guard_still_refuses_ttp_note(env, monkeypatch, tmp_path):
-    from ttp import cli, glmguard
+def _gg_env(env, monkeypatch, tmp_path):
     p = make(env)
     wt, rd = _gg_run(tmp_path)
     monkeypatch.setenv("TTP_PROJECT", str(p.base))
     monkeypatch.setenv("TTP_RUN_DIR", str(rd))
     monkeypatch.setenv("TTP_CODE_ARM_GUARD", "1")
+    return p, wt, rd
+
+
+def test_a_glm_runs_plain_note_goes_only_to_its_own_task_log(env, monkeypatch, tmp_path):
+    """cells: glm_note_plain, glm_note_log_only (user msg #3512: ttp note goes only to the task's own log)."""
+    from ttp import cli, glmguard, upstream
+    p, wt, rd = _gg_env(env, monkeypatch, tmp_path)
+    before = p.db.one("SELECT COUNT(*) n FROM messages")["n"]
+    monkeypatch.setattr(upstream, "maybe_fallback", lambda *a, **k: _pytest.fail("a GLM note sent notes on"))
+    monkeypatch.setattr(cli, "_note_to", lambda *a, **k: _pytest.fail("a GLM note reached another project"))
+    cli.main(["note", "milestone: built the parser"])
+    assert "milestone: built the parser" in (rd / "progress.md").read_text()
+    assert not (rd / glmguard.HIT).exists() and not (rd / "result.json").exists()
+    assert p.db.one("SELECT COUNT(*) n FROM messages")["n"] == before, "no chat outbox row"
+    assert sorted(x.name for x in rd.iterdir()) == ["progress.md"], "no notify, escalation or peer note file"
+    assert glmguard.shell_refusal('ttp note "update: ack" 2>&1', str(wt), str(rd), {"TTP_PROJECT": str(p.base),
+                                                                                 **_GG_RUN_ENV}) is None
+
+
+@_pytest.mark.parametrize("argv,route", [
+    (["note", "--to", "other", "hi"], "--to"), (["note", "--to=other", "hi"], "--to"),
+    (["note", "--reply", "abc123", "hi"], "--reply"), (["note", "--rep", "abc123", "hi"], "--reply"),
+    (["note", "--to", "other", "--urgent", "hi"], "--to"), (["note", "--confirms", "abc123", "works"], "--confirms"),
+    (["note", "--severity", "high", "hi"], "--severity"), (["note", "--status", "7"], "--status")])
+def test_glm_guard_refuses_every_route_from_a_note_to_a_person_or_another_project(argv, route, env, monkeypatch,
+                                                                                tmp_path, capsys):
+    """cells: glm_note_to_refused, glm_note_routes_refused"""
+    from ttp import cli, glmguard
+    p, wt, rd = _gg_env(env, monkeypatch, tmp_path)
+    with _pytest.raises(SystemExit) as e:
+        cli.main(argv)
+    assert e.value.code == 2 and f"`ttp note {route}`" in capsys.readouterr().err
+    assert glmguard.hit_reason(rd).startswith(f"`ttp note {route}`")
+    words = " ".join(f"'{w}'" if " " in w else w for w in argv)
+    assert glmguard.shell_refusal(f"ttp {words}", str(wt), str(rd), {"TTP_PROJECT": str(p.base), **_GG_RUN_ENV})
+    assert set(glmguard.NOTE_ROUTES) >= {"--" + x.dest for x in _note_options() if x.dest != "text"}, \
+        "a new `ttp note` flag is refused on the GLM arm until it is judged"
+
+
+def _note_options():
+    import argparse
+    from ttp import cli
+    seen = {}
+    real = argparse.ArgumentParser.parse_args
+
+    def grab(self, *a, **k):
+        seen.update(self._subparsers._group_actions[0].choices)
+        raise SystemExit(0)
+    try:
+        argparse.ArgumentParser.parse_args = grab
+        cli.main(["note", "x"])
+    except SystemExit:
+        pass
+    finally:
+        argparse.ArgumentParser.parse_args = real
+    return [x for x in seen["note"]._actions if x.dest != "help"]
+
+
+def test_glm_guard_refuses_notify(env, monkeypatch, tmp_path):
+    """cells: glm_notify_refused"""
+    from ttp import cli, glmguard
+    p, wt, rd = _gg_env(env, monkeypatch, tmp_path)
     with _pytest.raises(SystemExit):
-        cli.main(["note", "hi"])
-    assert glmguard.hit_reason(rd).startswith("`ttp note`")
+        cli.main(["notify", "done"])
+    assert glmguard.hit_reason(rd).startswith("`ttp notify`") and not (rd / "notify.jsonl").exists()
 
 
-@_pytest.mark.parametrize("argv,name", [(["note", "--to", "other", "hi"], "note"), (["notify", "hi"], "notify"),
+def test_the_glm_prompt_names_only_commands_its_guard_allows_and_says_where_notes_go():
+    """cells: prompt_commands_allowed, glm_prompt_note_rule: the prompt's list is built from the guard's own."""
+    import re
+    from ttp import codearm, glmguard
+    text = codearm.contract()
+    told, never = text.split("Never use", 1)
+    named = set(re.findall(r"`ttp ([a-z][\w-]*)", told))
+    assert named >= glmguard.SUBS_ALLOWED and "note" in named
+    for cmd in named:
+        assert glmguard.cli_refusal(cmd, "show") is None, cmd
+    assert "goes only to your task's own log" in told and "coordinator decides what reaches a chat" in told
+    assert "`ttp notify`" in never and "`ttp note --to`" in never and "--reply" in never and "refused" in never
+    assert glmguard.cli_refusal("notify") and glmguard.cli_refusal("note", "", ["--to"])
+    assert glmguard.cli_refusal("note", "", ["--reply"])
+
+
+@_pytest.mark.parametrize("argv,name", [(["note", "--to", "other", "hi"], "note --to"), (["notify", "hi"], "notify"),
                                          (["task", "add", "x"], "task add"), (["say", "hi"], "say")])
 def test_glm_guard_refusal_names_the_command_it_refused(argv, name, env, monkeypatch, tmp_path, capsys):
     from ttp import cli, glmguard
@@ -429,9 +506,10 @@ def test_glm_guard_keeps_a_hand_off_the_run_wrote_before_it_was_stopped(tmp_path
     "ttp upstream 'x'", "git push origin HEAD", "git -C . push --force", "gh pr comment 1 --body x",
     "gh issue create -t x", "gh api repos/o/r/issues -f title=x", "curl -X POST https://x.invalid -d a=b",
     "curl --data a=b https://x.invalid", "ssh host true", "mail -s x a@b", "sqlite3 $TTP_PROJECT/state/project.db 'x'",
-    "unset TTP_CODE_ARM_GUARD; ttp note x", "TTP_CODE_ARM_GUARD=0 ttp note x", "env -i ttp note x",
+    "unset TTP_CODE_ARM_GUARD; ttp notify x", "TTP_CODE_ARM_GUARD=0 ttp notify x", "env -i ttp notify x",
     "rm $TTP_RUN_DIR/glm_guard.on", "echo x > /etc/hosts-copy", "cd /tmp/elsewhere-x && echo x > ~/note.txt",
-    "bash -c 'ttp note x'", "cat > ~/.tt-project/machine-workers.json"])
+    "bash -c 'ttp notify x'", "bash -c 'ttp note --to other x'", "ttp note --reply abc x",
+    "cat > ~/.tt-project/machine-workers.json"])
 def test_glm_guard_refuses_a_shell_command_that_reaches_a_person_a_project_or_something_outside_the_worktree(cmd, tmp_path):
     from ttp import glmguard
     wt, rd = _gg_run(tmp_path)
@@ -439,7 +517,7 @@ def test_glm_guard_refuses_a_shell_command_that_reaches_a_person_a_project_or_so
 
 
 @_pytest.mark.parametrize("cmd", [
-    "ttp checks", "ttp push", "ttp proj checks --detach", "git status", "git commit -am x", "git diff HEAD~1",
+    "ttp checks", "ttp push", "ttp proj checks --detach", "ttp note 'update: ack'", "bash -c 'ttp note x'", "git status", "git commit -am x", "git diff HEAD~1",
     "python3 -m pytest -q tests", "echo hi > out.txt", "cat a | grep b > $TTP_RUN_DIR/notes.txt", "gh pr view 1",
     "gh api repos/o/r/pulls/1", "curl -s https://x.invalid/doc", "ttp task show 5", "ttp lock acquire x -- true",
     "ls /tmp", "sed -i s/a/b/ src/mod.py"])
@@ -459,7 +537,7 @@ def test_glm_guard_reads_a_ttp_call_without_its_redirections(cmd, tmp_path):
     assert glmguard.shell_refusal(cmd, str(wt), str(rd), {"TTP_PROJECT": str(tmp_path / "proj"), **_GG_RUN_ENV}) is None, cmd
 
 
-@_pytest.mark.parametrize("cmd", ["ttp note hi 2>&1", "ttp 2>/dev/null note hi", "ttp remove x >/dev/null"])
+@_pytest.mark.parametrize("cmd", ["ttp notify hi 2>&1", "ttp 2>/dev/null notify hi", "ttp note --to x hi 2>&1", "ttp remove x >/dev/null"])
 def test_glm_guard_still_refuses_a_redirected_ttp_call_it_would_refuse_bare(cmd, tmp_path):
     from ttp import glmguard
     wt, rd = _gg_run(tmp_path)
@@ -500,7 +578,8 @@ def test_glm_guard_refuses_a_file_write_outside_the_worktree_and_any_connector_t
     assert "outside its worktree" in ask("Write", {"file_path": str(tmp_path / "other" / "a.py")})
     assert "outside its worktree" in ask("Edit", {"file_path": "../escape.py"})
     assert ask("mcp__slack__post_message", {"text": "x"}) and ask("Read", {"file_path": "/etc/hostname"}) is None
-    assert ask("Bash", {"command": "ttp note hi"}) and ask("Bash", {"command": "ttp checks"}) is None
+    assert ask("Bash", {"command": "ttp notify hi"}) and ask("Bash", {"command": "ttp checks"}) is None
+    assert ask("Bash", {"command": "ttp note hi"}) is None and ask("Bash", {"command": "ttp note --to x hi"})
 
 
 def test_glm_guard_hook_denies_a_refused_call_and_ends_the_run_as_a_bounce(monkeypatch, tmp_path):

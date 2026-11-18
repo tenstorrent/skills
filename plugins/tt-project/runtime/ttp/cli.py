@@ -2969,8 +2969,9 @@ def cmd_note(a) -> None:
     elif a.to or getattr(a, "reply", None):
         _note_to(a, run_dir)
     durable_append(Path(run_dir) / "progress.md", f"{timefmt.clock()} {a.text}\n")
-    from . import upstream
-    upstream.maybe_fallback()   # the daemon cannot reach a forward target: send its notes from this run
+    from . import glmguard, upstream
+    if not glmguard.active():   # a GLM-arm run's note stays in its own log: it sends nobody's notes on
+        upstream.maybe_fallback()   # the daemon cannot reach a forward target: send its notes from this run
     print_update()
 
 
@@ -17680,7 +17681,10 @@ def glm_gate(a, name: str | None = None) -> None:
     cmd = name if name is not None else getattr(a, "cmd", "")
     cmd = cmd if isinstance(cmd, str) else ""
     action = str(getattr(a, "action", "") or getattr(a, "op", "") or "")
-    why = glmguard.cli_refusal(cmd, action)
+    flags = [f"--{k}" for k in ("to", "reply", "confirms", "status") if getattr(a, k, None) is not None] + \
+        (["--urgent"] if getattr(a, "urgent", False) else []) + \
+        (["--severity"] if getattr(a, "severity", "normal") not in (None, "normal") else []) if cmd == "note" else []
+    why = glmguard.cli_refusal(cmd, action, flags)
     if why:
         glmguard.hit(os.environ.get("TTP_RUN_DIR"), why)
         die(f"refused: {why}", 2)

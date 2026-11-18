@@ -7,9 +7,11 @@ person or another project, write the project's records or touch anything outside
 rule cannot hold that for a cheaper model, so the harness enforces it in code, with no model call, on
 every harness the arm runs:
 
-- `ttp` (cli.glm_gate) runs only the commands in SUBS_ALLOWED: checks, push, reads of its own task and
-  the lock and detach it needs. `note`, `say`, `ask`, `notify`, `upstream`, task, obligation, memory and
-  config writes, and every other command are refused.
+- `ttp` (cli.glm_gate) runs only the commands in SUBS_ALLOWED: checks, push, reads of its own task, the
+  lock and detach it needs, and a plain `ttp note "<text>"`, which goes only to the run's own task log
+  (progress.md); the coordinator decides what reaches a chat. Every route from a note to a person or
+  another project (NOTE_ROUTES: --to, --reply and the flags that go with them), `say`, `ask`, `notify`,
+  `upstream`, task, obligation, memory and config writes, and every other command are refused.
 - The hook (hook.pre_tool_use, Claude Code and any provider with hooks) and the command layer of a harness
   without hooks (glmenv, for mini-swe-agent) ask tool_refusal() before each call: a `ttp` command the
   list does not allow, a raw `git push`, a `gh` write, an HTTP post, ssh or mail, a database or state
@@ -39,8 +41,10 @@ KEPT = "result.pre-guard.json"   # a hand-off the run wrote before the guard rep
 SUBS_ALLOWED = frozenset({
     "push", "checks", "checks-shard", "checks-yield", "pool-wait", "pool-admit", "pool-shard", "install-check",
     "clip", "hours", "alive", "landed", "lock", "detach", "eta", "list", "find", "overview", "said", "runs", "task",
-    "paths"})
+    "paths", "note"})
 TASK_ACTIONS = frozenset({"show", "list"})
+# `ttp note` flags that send a note on, or change a record beyond the run's own log: refused on the GLM arm.
+NOTE_ROUTES = ("--to", "--reply", "--urgent", "--severity", "--confirms", "--status")
 GH_READS = frozenset({"view", "list", "diff", "status", "checks"})
 REACH = frozenset({"ssh", "scp", "sftp", "mail", "mailx", "sendmail", "mutt", "nc", "ncat", "telnet", "sqlite3"})
 HTTP = frozenset({"curl", "wget", "http", "https", "httpie"})
@@ -118,8 +122,21 @@ def hit_reason(run_dir) -> str:
     return str(got.get("why") or "guard") if isinstance(got, dict) else "guard"
 
 
-def cli_refusal(cmd: str, action: str = "") -> str | None:
-    """Why a GLM-arm run may not run `ttp <cmd> [<action>]`, else None."""
+def note_route(flags) -> str:
+    """The first of `flags` (option words of a `ttp note` call, argparse prefixes included) that routes the
+    note past the run's own log, else ''."""
+    for w in flags:
+        opt = str(w).split("=", 1)[0]
+        if len(opt) > 2 and opt.startswith("--") and any(o.startswith(opt) for o in NOTE_ROUTES):
+            return next(o for o in NOTE_ROUTES if o.startswith(opt))
+    return ""
+
+
+def cli_refusal(cmd: str, action: str = "", flags=()) -> str | None:
+    """Why a GLM-arm run may not run `ttp <cmd> [<action>]` with option words `flags`, else None."""
+    if cmd == "note" and (route := note_route(flags)):
+        return (f"`ttp note {route}` is not allowed to a run on the GLM arm: its notes go only to its own task log, "
+                f"and the coordinator decides what reaches a person, a chat or another project")
     if cmd in SUBS_ALLOWED and (cmd != "task" or action in TASK_ACTIONS):
         return None
     what = f"`ttp {cmd}" + (f" {action}" if cmd == "task" and action else "") + "`" if cmd else "a ttp call naming no command"
@@ -191,7 +208,8 @@ def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None) -> str | None
     plain, _ = hook._split(REDIRECT.sub(" ", cmd))   # `ttp checks 2>&1`: the 2 is no word of the call
     for seg in hook._all_segments(plain) + hook._segments(plain, strip=False):
         words = _ttp_args(seg, project)
-        if words and (why := cli_refusal(words[0], words[1] if len(words) > 1 else "")):
+        if words and (why := cli_refusal(words[0], words[1] if len(words) > 1 else "",
+                                         [w for w in seg if w.startswith("--")])):
             return why
     for seg in segs:
         if not seg:

@@ -319,7 +319,19 @@ def contract(reason_hint: str = "") -> str:
             "even if you could. Build only what the spec already decided. To hand it back, write result.json with "
             '`{"status": "blocked", "needs_opus": "<one-line reason>", "summary": "needs Opus: <reason>"}` '
             "and stop (the `needs_opus` field makes it a hand-back, not a block). On that exit never run `ttp push`, `git push` or publish a branch; commits you made stay local. "
-            "It spends no attempt and does not count as a failure." + (f"\n{reason_hint}" if reason_hint else ""))
+            "It spends no attempt and does not count as a failure." + _guard_lines()
+            + (f"\n{reason_hint}" if reason_hint else ""))
+
+
+def _guard_lines() -> str:
+    """What the arm's guard (glmguard) lets a run use, built from its own lists so the prompt cannot drift."""
+    from .glmguard import SUBS_ALLOWED
+    cmds = ", ".join(f"`ttp {c}`" for c in sorted(SUBS_ALLOWED - {"note"}))
+    return ("\n\nOn this arm the harness runs only these ttp commands: " + cmds + " (task: show and list only), "
+            "and `ttp note`. Any other ttp command this prompt names is refused and hands the task back to Opus. "
+            'Use `ttp note "<text>"` for progress and to ack updates: it goes only to your task\'s own log, and '
+            "the coordinator decides what reaches a chat. Never use `ttp notify`, `ttp note --to` or `--reply`: "
+            "they are refused.")
 
 
 def bounce_reason(res: dict | None) -> str:

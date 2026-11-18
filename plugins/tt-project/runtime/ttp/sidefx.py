@@ -774,14 +774,14 @@ def _peers(own_base) -> dict:
         base = os.path.join(str(e["dir"]), project.FOLDER)
         if os.path.realpath(base) == own:
             continue
-        alive = False
+        alive, pid = False, None
         try:
             pid = int(Path(base, "state", "daemon.pid").read_text().strip())
             os.kill(pid, 0)
             alive = True
         except (OSError, ValueError):
             pass
-        out[name] = {"dir": str(e["dir"]), "daemon": alive,
+        out[name] = {"dir": str(e["dir"]), "daemon": alive, **({"pid": pid} if alive else {}),
                      **({"made_by": e["made_by"]} if isinstance(e.get("made_by"), dict) else {})}
     return out
 
@@ -794,6 +794,31 @@ def _own_scratch(was: dict, own_name: str, task) -> bool:
         return False
     root = os.path.realpath(str(project.HOME_DIR / "scratch")) + os.sep
     return os.path.realpath(str(was.get("dir") or "")).startswith(root)
+
+
+READERS = frozenset({"cat", "ls", "grep", "rg", "head", "tail", "less", "wc", "stat", "find", "file", "echo",
+                     "printf", "jq", "test", "[", "diff", "du", "tree", "realpath", "readlink", "basename", "dirname"})
+
+
+def _made_it(calls: list[tuple[str, str]], name: str, was: dict) -> bool:
+    """One of the run's own calls ([(kind, what)]) could have removed project `name`'s registry row or stopped its
+    daemon: a command (no plain reader) naming it, its folder or its daemon's pid, or a write of the registry. A
+    change another run made in the same window (it created and removed its own scratch project) is not this
+    run's."""
+    marks = {name, str(was.get("dir") or "").rstrip("/")} | ({str(was["pid"])} if was.get("pid") else set())
+    marks.discard("")
+    for kind, what in calls:
+        if kind == "file":
+            if os.path.basename(what.rstrip("/")) == "registry.json":
+                return True
+            continue
+        words = what.split()
+        if not words or os.path.basename(words[0]) in READERS:
+            continue
+        if any(w.rstrip("/") in marks or w.rstrip("/").startswith(tuple(m + "/" for m in marks if "/" in m))
+               or os.path.basename(w) == "registry.json" for w in words[1:]):
+            return True
+    return False
 
 
 def _run_task(run_dir) -> int | None:
@@ -812,7 +837,8 @@ def snapshot_peers(run_dir: Path, own_base) -> None:
 
 def peer_effects(run_dir: Path, own_base, own_name: str) -> list[str]:
     """What the run did to another project of this machine: its registry row gone, its daemon stopped since the
-    spawn (peers-before.json; not a scratch project the run's task made, _own_scratch), a call that stopped or disabled another project's unit, a git checkout, reset or
+    spawn (peers-before.json; only by one of the run's own commands, _made_it; not a scratch project the run's
+    task made, _own_scratch), a call that stopped or disabled another project's unit, a git checkout, reset or
     clean in another project's folder (a call no guard refused). One line each."""
     out: list[str] = []
     try:
@@ -821,16 +847,20 @@ def peer_effects(run_dir: Path, own_base, own_name: str) -> list[str]:
         before = {}
     now = _peers(own_base)
     task = _run_task(run_dir)
+    own = [it for it in items(Path(run_dir), own_only=True) if it["status"] != "refused"]
+    calls = [("file", it["what"]) if it["kind"] == "file" else ("shell", c)
+             for it in own if it["kind"] in ("file", "shell")
+             for c in (commands(it["what"]) if it["kind"] == "shell" else [it["what"]])]
     for name, was in sorted(before.items()):
         if name not in now and _own_scratch(was, own_name, task):
             continue   # its own scratch project, removed again
-        if name not in now:
-            out.append(f"project {name}'s registry row was removed")
-        elif was.get("daemon") and not now[name]["daemon"]:
-            out.append(f"project {name}'s daemon was stopped")
+        gone = name not in now
+        if not (gone or (was.get("daemon") and not now[name]["daemon"])) or not _made_it(calls, name, was):
+            continue   # unchanged, or changed by another run's or a person's command in the same window
+        out.append(f"project {name}'s registry row was removed" if gone else f"project {name}'s daemon was stopped")
     folders = {n: os.path.join(e["dir"], "tt-project") for n, e in {**before, **now}.items()}
-    for it in items(Path(run_dir), own_only=True):
-        if it["kind"] != "shell" or it["status"] == "refused":
+    for it in own:
+        if it["kind"] != "shell":
             continue
         for cmd in commands(it["what"]):   # commands run, not quoted text or a heredoc's body
             for m in UNIT_STOP_RE.finditer(cmd):

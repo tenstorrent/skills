@@ -1288,7 +1288,10 @@ nothing: the daemon requeues the task on Opus with no attempt spent and no fault
 provider, and logs the reason. `mini-swe-agent` is the only live harness: its command layer is a model-free
 guard that refuses a side effect outside the run's own hand-off (a `ttp` command outside the allowed set, a raw
 `git push`, a GitHub write, an HTTP post, ssh or mail, a state or database write, a write outside the worktree, a
-read of stored secrets) and ends the run as a hand-back to Opus. A live share on any other harness (Claude Code
+read of stored secrets) and ends the run as a hand-back to Opus. A plain `ttp note "<text>"` is allowed and goes
+only to the run's own task log; every route from a note to a person, a chat or another project (`--to`, `--reply`,
+`--urgent`, `--severity`, `--confirms`, `--status`) and `ttp notify` stay refused, so the coordinator decides what
+reaches a chat. The arm's prompt lists the commands its guard allows. A live share on any other harness (Claude Code
 included) is treated as 0 and logged once per setting. A run that handed back cannot `ttp push`, and every run
 of a code task follows the arm recorded for it, light wakes included. `route.code_sonnet.glm.digest` (off by
 default) gives the model a command's output over about 8 KB as its first lines, every failing line and its tail,

@@ -440,6 +440,8 @@ def test_a_no_side_effects_claim_is_checked_against_the_runs_own_effects_on_othe
     sidefx.snapshot_peers(snap, p.base)
     (peer / "tt-project" / "state" / "daemon.pid").write_text("4194999")
     project.unregister("other")
+    (snap / "output.jsonl").write_text("".join(json.dumps(x) + "\n" for x in _claude_calls(
+        ("Bash", {"command": f"kill {os.getpid()}"}), ("Bash", {"command": "ttp remove other"}))))
     got = sidefx.peer_effects(snap, p.base, "demo")
     assert "project peer's daemon was stopped" in got and "project other's registry row was removed" in got
 
@@ -537,6 +539,8 @@ def test_peer_effects_lets_a_run_remove_the_scratch_project_its_own_task_made(en
     sidefx.snapshot_peers(rd, p.base)
     for name in rows:
         project.unregister(name)
+    (rd / "output.jsonl").write_text("".join(json.dumps(x) + "\n" for x in _claude_calls(
+        *[("Bash", {"command": f"ttp remove {n} --delete-files"}) for n in rows])))
     got = sidefx.peer_effects(rd, p.base, "demo")
     assert "project theirs's registry row was removed" in got and "project outside's registry row was removed" in got
     assert not any("mine" in x for x in got), got
@@ -550,3 +554,35 @@ def test_ttp_new_in_a_run_records_which_task_made_the_project(env, monkeypatch):
     assert cli._made_by() == {"made_by": {"project": "demo", "task": 57}}
     monkeypatch.delenv("TTP_TASK")
     assert cli._made_by() == {}
+
+
+def test_a_peer_change_another_run_made_in_the_same_window_is_never_this_runs_effect(env, tmp_path):
+    """cells: peer_concurrent_attribution. A scratch project another run made and removed while this run ran, and a
+    daemon someone else stopped, are no effect of this run; its own `ttp remove`, kill of the daemon's pid or write
+    of the registry is."""
+    import os
+    from ttp import project, sidefx
+    p = make(env)
+    for n in ("scratchx", "peer"):
+        (tmp_path / n / "tt-project" / "state").mkdir(parents=True)
+        project.register(n, {"host": "testhost", "dir": str(tmp_path / n),
+                             "made_by": {"project": "demo", "task": 913}})
+    (tmp_path / "peer" / "tt-project" / "state" / "daemon.pid").write_text(str(os.getpid()))
+    rd = tmp_path / "run"
+    rd.mkdir()
+    (rd / "run.json").write_text(json.dumps({"env": {"TTP_TASK": "796"}}))
+    sidefx.snapshot_peers(rd, p.base)
+    project.unregister("scratchx")   # the other run's own `ttp remove scratchx --delete-files`
+    (tmp_path / "peer" / "tt-project" / "state" / "daemon.pid").write_text("4194999")
+
+    def effects(*cmds, tool="Bash"):
+        (rd / "output.jsonl").write_text("".join(json.dumps(x) + "\n" for x in _claude_calls(
+            *[(tool, {"command": c} if tool == "Bash" else {"file_path": c, "content": "{}"}) for c in cmds])))
+        return sidefx.peer_effects(rd, p.base, "demo")
+    assert effects("ttp list", "git status", f"cat {project.registry_path()}", "grep -rn scratchx notes.md",
+                   f"ls {tmp_path}/scratchx") == []
+    assert effects("ttp remove scratchx --delete-files") == ["project scratchx's registry row was removed"]
+    assert effects(f"kill {os.getpid()}") == ["project peer's daemon was stopped"]
+    assert effects("ttp peer stop") == ["project peer's daemon was stopped"]
+    assert len(effects(str(project.registry_path()), tool="Write")) == 2
+    assert effects(f"rm -rf {tmp_path}/scratchx") == ["project scratchx's registry row was removed"]
