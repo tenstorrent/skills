@@ -374,7 +374,9 @@ def test_terminalbench_reference_runs_parallel_tasks_and_wraps_endpoint_runners_
     assert 1 < peak[0] <= 3, "reference.parallel tasks at once, never more"
     assert len((tbcycle.folder() / "reference" / "open-m.jsonl").read_text().splitlines()) == 6, "one row each"
     argv = []
-    monkeypatch.setattr(tbcycle.subprocess, "Popen", lambda a, **k: argv.append(a))
+    monkeypatch.setattr(tbcycle.subprocess, "Popen", lambda a, **k: argv.append(a) or types.SimpleNamespace(pid=os.getpid()))
+    recorded = []
+    monkeypatch.setattr(tbcycle.schedjobs, "record", lambda p, pid, what: recorded.append(what))
     p = types.SimpleNamespace(root=env["tmp"], config=lambda: cfg)
     tbcycle.launch(p, "open-m", reference=True)
     tbcycle.launch(p, "claude-x", reference=True)
@@ -382,6 +384,7 @@ def test_terminalbench_reference_runs_parallel_tasks_and_wraps_endpoint_runners_
     assert argv[0][3:6] == ["lock", "chat-server", "--"] and argv[0][-3:] == ["--reference", "--runner", "open-m"]
     assert "lock" not in argv[1] and "--reference" in argv[1], "the claude arm takes no chat-server lock"
     assert "lock" not in argv[2], "the paced cycle is unchanged"
+    assert recorded == [tbcycle.REF_RUNNER, tbcycle.REF_RUNNER, tbcycle.RUNNER], "each runner's group is recorded"
     cfg["model_bench"]["terminalbench"]["reference"]["lock"] = ""
     tbcycle.launch(p, "open-m", reference=True)
     assert "lock" not in argv[3], "an empty lock setting wraps nothing"

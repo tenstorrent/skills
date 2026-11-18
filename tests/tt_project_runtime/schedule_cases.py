@@ -1442,3 +1442,81 @@ def test_bench_hold_stops_this_projects_runner_groups_recorded_or_older_and_deta
             if x:
                 x.kill()
                 x.wait()
+
+
+def test_an_llm_schedules_slow_plan_step_finishes_and_one_past_its_cap_retries_later_with_a_backoff(env, monkeypatch):
+    """The case behind it: off the tick, an llm schedule's timeout was its precheck's plus two graces (about
+    180 s), so the daily review's 361 s feed was recorded failed and its result dropped. Its timeout now
+    covers its plan step (SCHEDULE_LLM_PLAN_S): a slow plan step finishes and records. One past even that is
+    recorded failed and runs again after SCHEDULE_LLM_RETRY_S (never the next tick, never past its period);
+    a task it queued late is recorded, and a run that ends resets the backoff."""
+    import threading
+    from ttp import daemon as dmod, schedule as sched
+    p = make(env)
+    sched.upsert(p.db, "review", "llm", "1d", payload={"spec": "review it"})
+    d = dmod.Daemon(p.base)
+    d.gates = {}
+    monkeypatch.setattr(d, "observe", lambda *a, **k: None)
+    row = p.db.one("SELECT * FROM schedules WHERE name='review'")
+    assert d._schedule_timeout(row, {}) >= 361 + 120   # the daily review's measured plan step, past its precheck
+    monkeypatch.setattr(dmod, "_watcher_timeout", lambda payload: 0)
+    monkeypatch.setattr(dmod, "SCHEDULE_GRACE_S", 0)
+    step, release = {"s": 0.0}, threading.Event()
+
+    def plan(self, s, payload):
+        if step["s"]:
+            time.sleep(step["s"])
+        else:
+            release.wait(30)
+        return "queued"
+    monkeypatch.setattr(dmod.Daemon, "_schedule_llm", plan)
+
+    def status():
+        return p.db.one("SELECT last_status, next_run FROM schedules WHERE name='review'")
+
+    def tick_until_done():
+        for _ in range(100):
+            d.run_schedules()
+            if "review" not in d._sched_runs:
+                return
+            time.sleep(0.05)
+        raise AssertionError("the run never ended")
+
+    monkeypatch.setattr(dmod, "SCHEDULE_LLM_PLAN_S", 1.5)
+    step["s"] = 0.5   # slow, inside its cap: it finishes and records
+    p.db.x("UPDATE schedules SET next_run=? WHERE name='review'", (time.time() - 1,))
+    tick_until_done()
+    assert status()["last_status"] == "queued"
+
+    monkeypatch.setattr(dmod, "SCHEDULE_LLM_PLAN_S", 0.2)
+    step["s"] = 0.0   # past its cap: held until released
+    for n, wait in ((1, 600), (2, 1800)):
+        p.db.x("UPDATE schedules SET next_run=? WHERE name='review'", (time.time() - 1,))
+        d.run_schedules()
+        time.sleep(0.4)
+        before = time.time()
+        d.run_schedules()
+        got = status()
+        assert got["last_status"].startswith("error: timed out"), got["last_status"]
+        assert before - 5 <= float(got["next_run"]) - wait <= time.time() + 5, (n, got["next_run"] - before)
+        assert p.db.kv(dmod.SCHEDULE_LLM_RETRY_KEY) == {"review": n}
+        release.set()
+        d._sched_runs["review"].done.wait(30)
+        d.run_schedules()   # its late result queued a task: recorded, not dropped
+        assert "review" not in d._sched_runs
+        assert status()["last_status"] == "queued (after its timeout)"
+        release.clear()
+        d.run_schedules()   # not due: nothing starts on the next tick
+        assert "review" not in d._sched_runs
+        p.db.set_kv(dmod.SCHEDULE_LLM_RETRY_KEY, {"review": n})   # the late record reset it; the test keeps the streak
+    p.db.x("UPDATE schedules SET every_s=? WHERE name='review'", (900,))
+    p.db.x("UPDATE schedules SET next_run=? WHERE name='review'", (time.time() - 1,))
+    d.run_schedules()
+    time.sleep(0.4)
+    before = time.time()
+    d.run_schedules()
+    assert float(status()["next_run"]) <= before + 900 + 5   # never past its own period
+    release.set()
+    d._sched_runs["review"].done.wait(30)
+    d.run_schedules()
+    assert p.db.kv(dmod.SCHEDULE_LLM_RETRY_KEY) == {}   # a run that ended resets the backoff

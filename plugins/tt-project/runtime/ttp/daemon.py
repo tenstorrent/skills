@@ -429,6 +429,9 @@ WATCHER_MAX_S = HEARTBEAT_STALE_S - 60   # a command watcher's timeout_s is capp
 # in the tick that started them and a slow one never holds it.
 SCHEDULE_WAIT_S = 2.0
 SCHEDULE_GRACE_S = 30   # past its own bounds (command timeout, builtin deadline), a run is killed and failed
+SCHEDULE_LLM_PLAN_S = 900   # an llm schedule's own work before its enqueue (its feed, a whole-repo de-slop scan)
+SCHEDULE_LLM_RETRY_S = (600, 1800, 3600, 7200)   # an llm run past its timeout runs again after these, capped at its period
+SCHEDULE_LLM_RETRY_KEY = "schedule_llm_timeouts"   # kv: name -> timeouts in a row (the backoff step)
 # Under state/: every thread's stack, on SIGUSR1 or SIGUSR2 (register_stack_dump) and on a tick overrun
 # or stall (check_overrun). ttp.watchdog copies each new dump to state/incidents/.
 STACKS_FILE = "daemon-stacks.log"
@@ -9815,7 +9818,9 @@ class Daemon:
         builtin watcher stuck in Python) is observed once more, under its own key. llm schedules run off the
         tick too (their precheck, gates, de-slop scan and enqueue), so one slow schedule never holds the step;
         each start names its schedule (_step_over), so a slow step says which one. A schedule that keeps
-        timing out is one keyed observation (schedule-timeout:<name>), not a new one each run."""
+        timing out is one keyed observation (schedule-timeout:<name>), not a new one each run. An llm run's
+        timeout covers its plan step (SCHEDULE_LLM_PLAN_S); one past it runs again after SCHEDULE_LLM_RETRY_S
+        (_llm_retry_at), and a task it queued late is recorded."""
         db, runs = self.p.db, self._sched_runs
         if not self._sched_swept:   # what an earlier daemon's runs left: their schedules are still due
             self._sched_swept = True
@@ -9850,7 +9855,11 @@ class Daemon:
         for name, run in list(runs.items()):
             if run.done.is_set():
                 runs.pop(name)
-                if run.timed_out:
+                if run.timed_out and run.s["kind"] == "llm" and run.result[0] == "queued":
+                    log(self.p, f"schedule {name}: its run recorded failed at its timeout queued its task after "
+                                f"{time.monotonic() - run.started:.0f} s; recorded as queued")
+                    self._schedule_ran(run.s, "queued (after its timeout)", None)
+                elif run.timed_out:
                     log(self.p, f"schedule {name}: its run recorded failed at its timeout ended after "
                                 f"{time.monotonic() - run.started:.0f} s; its result is dropped")
                 elif run.stopped:
@@ -9875,7 +9884,7 @@ class Daemon:
                 self.observe(scr.error_source(f"watcher:{name}"), f"schedule {name} {why[7:]}: its run was "
                              f"stopped ({killed} process group(s) killed) and counts as failed", "normal",
                              lifecycle=scr.ERROR, key=f"schedule-timeout:{name}")
-                self._schedule_ran(run.s, why, None)
+                self._schedule_ran(run.s, why, self._llm_retry_at(run.s))
                 self._schedule_answer(run, why)
 
     def _schedule_now(self, due: list[dict]) -> None:
@@ -10088,8 +10097,9 @@ class Daemon:
         if s["kind"] == "watcher":
             from .watchers import bounds
             return bounds(self, payload, payload.get("builtin") or s["name"])[0] + SCHEDULE_GRACE_S
-        if s["kind"] == "llm":   # its precheck, then the gates and the enqueue around it
-            return _watcher_timeout({"timeout_s": payload.get("precheck_timeout_s")}) + 2 * SCHEDULE_GRACE_S
+        if s["kind"] == "llm":   # its precheck, its own plan step (feed, de-slop scan), the gates and the enqueue
+            return (_watcher_timeout({"timeout_s": payload.get("precheck_timeout_s")}) + SCHEDULE_LLM_PLAN_S
+                    + 2 * SCHEDULE_GRACE_S)
         t = _watcher_timeout(payload) if str(payload.get("command") or "").strip() else 0
         if payload.get("heal"):
             try:
@@ -10098,6 +10108,20 @@ class Daemon:
                 step = heal.MAX_TIMEOUT_S
             t += 3 * step + heal.LOCK_WAIT_S + 10   # check, suppress probe, fix after its lock wait
         return max(t, 1) + SCHEDULE_GRACE_S
+
+    def _llm_retry_at(self, s: dict) -> float | None:
+        """When an llm schedule whose run just timed out runs again: SCHEDULE_LLM_RETRY_S by its timeouts in a
+        row, never past its own period, never on the next tick. None for any other kind."""
+        if s["kind"] != "llm":
+            return None
+        db = self.p.db
+        with db.tx():
+            counts = db.kv(SCHEDULE_LLM_RETRY_KEY, {}) or {}
+            n = counts[s["name"]] = int(counts.get(s["name"]) or 0) + 1
+            db.set_kv(SCHEDULE_LLM_RETRY_KEY, counts)
+        wait = min(SCHEDULE_LLM_RETRY_S[min(n, len(SCHEDULE_LLM_RETRY_S)) - 1], int(s["every_s"]))
+        log(self.p, f"schedule {s['name']}: timeout {n} in a row; it runs again in {wait} s")
+        return time.time() + wait
 
     def _schedule_ran(self, s: dict, status: str, again: float | None) -> None:
         """Record one run of schedule `s` (its row when the run started) and its failure handling."""
@@ -10115,7 +10139,11 @@ class Daemon:
             progress.note_schedule(db, row["name"], status)
         except Exception as e:   # counting must never keep the run from being recorded
             log(self.p, f"progress check: could not count schedule {row['name']}: {type(e).__name__}: {e}")
-        if again is not None:   # a heal check's grace end or settle recheck comes before its period
+        if row["kind"] == "llm" and not status.startswith("error: timed out"):   # a run ended: its backoff resets
+            counts = db.kv(SCHEDULE_LLM_RETRY_KEY, {}) or {}
+            if counts.pop(row["name"], None) is not None:
+                db.set_kv(SCHEDULE_LLM_RETRY_KEY, counts)
+        if again is not None:   # a heal check's grace end or settle recheck, an llm timeout's retry, before its period
             db.x("UPDATE schedules SET next_run=MIN(next_run, ?) WHERE name=?", (again, row["name"]))
         elif row["kind"] == "command" and (spec := heal.of(payload)):   # backing off while healthy
             parts = status.split("; ")
