@@ -168,7 +168,7 @@ def test_replan_clock_times_from_20_to_23_are_promises(env):
 def test_replan_prompt_rule_and_docs(env):
     coord_md = (RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text()
     guide = (RUNTIME.parent / "docs" / "guide.md").read_text()
-    assert "A missed promise or order is a trigger to change approach, never only to post a new time" in coord_md
+    assert "A missed promise or order means change approach, not just a new time" in coord_md
     assert "### A missed promise changes the plan" in guide and "`missed promises`" in guide
 
 
