@@ -38,17 +38,27 @@ KEPT = "result.pre-guard.json"   # a hand-off the run wrote before the guard rep
 # a build or test needs. Everything else changes state or reaches someone outside the hand-off.
 SUBS_ALLOWED = frozenset({
     "push", "checks", "checks-shard", "checks-yield", "pool-wait", "pool-admit", "pool-shard", "install-check",
-    "clip", "hours", "alive", "landed", "lock", "detach", "eta", "list", "find", "overview", "said", "runs", "task"})
+    "clip", "hours", "alive", "landed", "lock", "detach", "eta", "list", "find", "overview", "said", "runs", "task",
+    "paths"})
 TASK_ACTIONS = frozenset({"show", "list"})
 GH_READS = frozenset({"view", "list", "diff", "status", "checks"})
 REACH = frozenset({"ssh", "scp", "sftp", "mail", "mailx", "sendmail", "mutt", "nc", "ncat", "telnet", "sqlite3"})
 HTTP = frozenset({"curl", "wget", "http", "https", "httpie"})
 HTTP_DATA = re.compile(r"(?:^|\s)(?:-X\s*(?:POST|PUT|PATCH|DELETE)|--request\s+(?:POST|PUT|PATCH|DELETE)|-d\b|--data\S*|"
                        r"-F\b|--form\S*|-T\b|--upload-file|--post-\S+)", re.I)
-# A command that edits what identifies the run: the guard's own variable, or the run's identity.
-TAMPER = re.compile(r"\b(?:unset|export|declare|env\s+(?:-\S+\s+)*|set)\b[^;|&\n]*\b(?:TTP_CODE_ARM_GUARD|TTP_RUN_DIR|TTP_TASK|"
-                    r"TTP_PROJECT|TTP_RUN_ID)\b|\b(?:TTP_CODE_ARM_GUARD|TTP_RUN_DIR|TTP_TASK|TTP_PROJECT|TTP_RUN_ID)=|"
-                    r"\benv\s+-i\b|\bglm_guard\.(?:on|json)\b")
+# A command that edits what identifies the run: the guard's own variable, or the run's identity. Only where a shell
+# reads an assignment (the start of a command, after a wrapper such as sudo or env, or a -c or eval script), so
+# `echo TTP_RUN_DIR=$TTP_RUN_DIR` is a read, while `TTP_RUN_DIR=x cmd`, `export`, `env`, `unset`, `read` and
+# `printf -v` of one are edits.
+_IDS = r"(?:TTP_CODE_ARM_GUARD|TTP_RUN_DIR|TTP_TASK|TTP_PROJECT|TTP_RUN_ID)"
+_AT = (r"(?:^|[;&|({}\n`!]|\$\(|\b(?:then|do|else|elif|if|while|until)\s|(?:-c|eval)\s+['\"]?)\s*"
+       r"(?:(?:sudo|exec|command|nohup|time|nice|xargs|builtin|doas)\s+(?:-\S+\s+)*)*")
+TAMPER = re.compile(
+    _AT + r"(?:(?:unset|export|declare|typeset|local|readonly|env|set|read|mapfile|readarray|for)\b[^;|&\n]*\b"
+    + _IDS + r"\b|printf\s+-v\s*" + _IDS + r"\b|(?:[A-Za-z_]\w*=\S*\s+)*" + _IDS + r"\+?=)"
+    r"|\benv\s+-i\b|\bglm_guard\.(?:on|json)\b", re.M)
+# A shell redirection (`2>&1`, `>out.log`, `<in`): its fd digit and target are no words of a ttp call.
+REDIRECT = re.compile(r"(?<![\w$])\d*(?:&>>?|>>?|<<?<?|>&|<&)\s*(?:&?\d+-?|[^\s;|&<>()]+)?")
 STATE_DB = re.compile(r"\bproject\.db\b|\bmachine-workers\.json\b|\b\.tt-project/(?:locks|machines)\b")
 WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit", "apply_patch", "ApplyPatch"}
 READ_TOOLS = {"Read", "Grep", "Glob", "LS", "TodoWrite", "Task", "WebSearch", "WebFetch"}
@@ -178,16 +188,18 @@ def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None) -> str | None
     commands, _ = hook._split(cmd)
     segs = hook._all_segments(commands) + hook._segments(commands, strip=False)
     project = _own_name(e)
+    plain, _ = hook._split(REDIRECT.sub(" ", cmd))   # `ttp checks 2>&1`: the 2 is no word of the call
+    for seg in hook._all_segments(plain) + hook._segments(plain, strip=False):
+        words = _ttp_args(seg, project)
+        if words and (why := cli_refusal(words[0], words[1] if len(words) > 1 else "")):
+            return why
     for seg in segs:
         if not seg:
             continue
         name = os.path.basename(seg[0])
         words = _ttp_args(seg, project)
         if words is not None:
-            if not words:
-                continue
-            if why := cli_refusal(words[0], words[1] if len(words) > 1 else ""):
-                return why
+            continue   # read above, without its redirections
         elif name == "git" and _git_word(seg[1:]) == "push":
             return "a run on the GLM arm publishes only with `ttp push` (after its checks), never `git push`"
         elif name == "gh":

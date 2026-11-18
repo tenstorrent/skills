@@ -6846,22 +6846,38 @@ class Daemon:
     def _policy_bounce(self, r: dict) -> str:
         """After a run on the code arm: 'policy files touched: <paths>' when its task's branch changes a file of the
         project's policy list (policyfiles), else ''. Model-free; the refusal keeps the branch tip as evidence and
-        sends the task back to Opus (a bounce). A branch that cannot be read is no bounce: review reads it."""
+        sends the task back to Opus (a bounce). The diff is read in the task's own code repository (its worktree,
+        or the repository that worktree belongs to), never only the project root: a task whose code lives in
+        another repository has no branch there, and reading nothing there passed every change. A branch or diff
+        that cannot be read is a loud error and a bounce, never a pass."""
         try:
             task = self.p.db.task(r["task"]) or {}
             patterns = policyfiles.load(self.p.harness)
-            branch = task.get("branch") or worktree.worktree_branch(self.p, task)
-            if not (patterns and branch):
+            if not patterns:
                 return ""
-            why = policyfiles.bounce_diff(self.p, {**task, "branch": branch}, patterns,
-                                          worktree.diff_lines(self.p, [branch]))
+            branch = task.get("branch") or worktree.worktree_branch(self.p, task)
+            root, changed, why = policyfiles.task_diff(self.p, task, branch)
             if why:
-                log(self.p, f"run {r['id']} of task {r['task']}: {why}; branch tip kept at "
+                raise RuntimeError(why)
+            why = policyfiles.bounce_diff(self.p, {**task, "branch": branch}, patterns, changed)
+            if why:
+                log(self.p, f"run {r['id']} of task {r['task']}: {why} (diff read in {root}); branch tip kept at "
                             f"{policyfiles.EVIDENCE_REF}{r['task']}")
             return why
         except Exception as e:
-            log(self.p, f"run {r['id']}: policy diff not checked: {type(e).__name__}: {e}"[:300])
-            return ""
+            why = f"policy diff not readable, so the change was not accepted: {type(e).__name__}: {e}"[:300]
+            log(self.p, f"run {r['id']} of task {r['task']}: {why}")
+            fp = f"policy_diff_unread:{r['id']}"
+            try:
+                if not self.p.db.one("SELECT 1 FROM events WHERE fingerprint=?", (fp,)):
+                    self.p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) "
+                                "VALUES(?,?,?,?,?,?,?,?)",
+                                (time.time(), "daemon", "policy_diff_unread", fp, "high",
+                                 f"run {r['id']} of task #{r['task']} on the GLM code arm: {why}. The task goes back "
+                                 "to Opus; fix what kept the diff unreadable", "queued", r["task"]))
+            except Exception:
+                pass
+            return why
 
     def _effect_claims(self, r: dict, run_dir: Path) -> None:
         """What the run did to another project of this machine (its registry row, daemon, unit or harness checkout:

@@ -111,6 +111,26 @@ def _git(cwd, *args: str) -> str:
     return got.stdout.strip() if got.returncode == 0 else ""
 
 
+def task_diff(p, task: dict, branch: str) -> tuple[Path, dict | None, str]:
+    """(repo, changed paths, error) of task `task`'s `branch` in the task's own code repository: its worktree
+    when it has one (a linked worktree reads the refs of the repository it belongs to, wherever that is), else
+    the project root. The base is the task's recorded fork point there, else the project's base branch. The
+    error ('' when none) names a branch or base that does not resolve there: the caller fails loudly on it."""
+    from . import worktree
+    path = Path(p.worktrees) / f"t{task['id']}"
+    root = path if worktree.is_git(path) else Path(p.root)
+    if not branch:
+        return root, None, f"task #{task['id']} has no branch on record and no worktree branch"
+    if not _git(root, "rev-parse", "--verify", "--quiet", f"{branch}^{{commit}}"):
+        return root, None, f"branch {branch} of task #{task['id']} does not exist in {root}"
+    base = worktree.fork_point(root, task["id"])
+    if not base:
+        base = worktree.resolve_base(p)
+        if not _git(root, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}"):
+            return root, None, f"no fork point of task #{task['id']} and no base {base} in {root}"
+    return root, worktree.diff_lines(p, [branch], base=base, root=root) or {}, ""
+
+
 def bounce_diff(p, task: dict, patterns: list[str], changed: dict | None) -> str:
     """After a run on the arm: the reason to bounce its task to Opus ('' when its branch touches no policy file).
     `changed` is the branch's paths against its base (worktree.diff_lines). The branch tip is saved first
@@ -120,18 +140,18 @@ def bounce_diff(p, task: dict, patterns: list[str], changed: dict | None) -> str
         return ""
     from . import worktree
     tid, branch = task["id"], task.get("branch") or ""
-    path = p.worktrees / f"t{tid}"
-    root = path if path.is_dir() else p.root
+    path = Path(p.worktrees) / f"t{tid}"
+    root = path if path.is_dir() else p.root   # the task's own repository: a worktree shares its repo's refs
     try:
         tip = _git(root, "rev-parse", "--verify", "--quiet", branch or "HEAD")
         if tip:
-            _git(p.root, "update-ref", f"{EVIDENCE_REF}{tid}", tip)
-        fork = worktree.fork_point(p.root, tid)
+            _git(root, "update-ref", f"{EVIDENCE_REF}{tid}", tip)
+        fork = worktree.fork_point(root, tid)
         if tip and fork and fork != tip:
             if path.is_dir() and worktree.worktree_branch(p, task):
                 _git(path, "reset", "--hard", fork)
             elif branch:
-                _git(p.root, "update-ref", f"refs/heads/{branch}", fork)
+                _git(root, "update-ref", f"refs/heads/{branch}", fork)
     except Exception:   # the evidence and reset are best effort: the refusal stands
         pass
     return "policy files touched: " + ", ".join(found)[:240]

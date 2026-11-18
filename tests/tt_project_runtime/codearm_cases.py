@@ -377,6 +377,44 @@ def test_glm_guard_allows_the_commands_a_build_needs(cmd, tmp_path):
     assert glmguard.shell_refusal(cmd, str(wt), str(rd), {"TTP_PROJECT": str(tmp_path / "proj"), **_GG_RUN_ENV}) is None, cmd
 
 
+@_pytest.mark.parametrize("cmd", [
+    "ttp checks 2>&1 | tail -3", "ttp checks >$TTP_RUN_DIR/checks.log 2>&1", "ttp 2>&1 checks", "ttp task show 5 2>/dev/null",
+    "ttp push 2>&1 | tail -5"])
+def test_glm_guard_reads_a_ttp_call_without_its_redirections(cmd, tmp_path):
+    """cell guard_redirect: the fd digit of `2>&1` is no word of the call."""
+    from ttp import glmguard
+    wt, rd = _gg_run(tmp_path)
+    assert glmguard.shell_refusal(cmd, str(wt), str(rd), {"TTP_PROJECT": str(tmp_path / "proj"), **_GG_RUN_ENV}) is None, cmd
+
+
+@_pytest.mark.parametrize("cmd", ["ttp note hi 2>&1", "ttp 2>/dev/null note hi", "ttp remove x >/dev/null"])
+def test_glm_guard_still_refuses_a_redirected_ttp_call_it_would_refuse_bare(cmd, tmp_path):
+    from ttp import glmguard
+    wt, rd = _gg_run(tmp_path)
+    assert glmguard.shell_refusal(cmd, str(wt), str(rd), {"TTP_PROJECT": str(tmp_path / "proj"), **_GG_RUN_ENV}), cmd
+
+
+@_pytest.mark.parametrize("cmd", [
+    "echo TTP_RUN_DIR=$TTP_RUN_DIR", 'echo "TTP_TASK=$TTP_TASK run=$TTP_RUN_ID"', "printenv TTP_PROJECT",
+    "grep TTP_TASK= notes.txt", "ttp paths"])
+def test_glm_guard_allows_reading_the_runs_identity_and_ttp_paths(cmd, tmp_path):
+    """cells guard_echo_env, guard_paths."""
+    from ttp import glmguard
+    wt, rd = _gg_run(tmp_path)
+    assert glmguard.shell_refusal(cmd, str(wt), str(rd), {"TTP_PROJECT": str(tmp_path / "proj"), **_GG_RUN_ENV}) is None, cmd
+
+
+@_pytest.mark.parametrize("cmd", [
+    "TTP_RUN_DIR=/tmp/x ttp push", "export TTP_TASK=3", "env TTP_PROJECT=x ttp push", "FOO=1 TTP_RUN_ID=2 ttp push",
+    "true; TTP_TASK=1 ttp push", "bash -c 'TTP_TASK=2 ttp push'", "eval TTP_TASK=2", "sudo env TTP_TASK=1 ttp push",
+    "read TTP_TASK <<< 3", "printf -v TTP_TASK 3", "declare -x TTP_RUN_DIR=/x", "(TTP_TASK=1 ttp push)",
+    "echo $(TTP_TASK=1 ttp push)", "if true; then TTP_TASK=1; fi", "TTP_TASK+=1", "echo x && TTP_CODE_ARM_GUARD= ttp push"])
+def test_glm_guard_refuses_every_real_edit_of_the_runs_identity(cmd, tmp_path):
+    from ttp import glmguard
+    wt, rd = _gg_run(tmp_path)
+    assert glmguard.shell_refusal(cmd, str(wt), str(rd), {"TTP_PROJECT": str(tmp_path / "proj"), **_GG_RUN_ENV}), cmd
+
+
 def test_glm_guard_refuses_a_file_write_outside_the_worktree_and_any_connector_tool(tmp_path):
     from ttp import glmguard
     wt, rd = _gg_run(tmp_path)
@@ -666,16 +704,56 @@ def test_the_daemon_bounces_a_glm_run_that_touched_a_policy_file_and_the_next_ru
     t = _ca_task(p)
     p.db.x("UPDATE tasks SET branch='ttp/t9-x' WHERE id=?", (t["id"],))
     seen: list = []
-    monkeypatch.setattr(worktree, "diff_lines", lambda pp, refs, **kw: {"src/rt/coordfix.py": 3, "README.md": 1})
+    monkeypatch.setattr(policyfiles, "task_diff", lambda pp, task, br: (pp.root, {"src/rt/coordfix.py": 3, "README.md": 1}, ""))
     monkeypatch.setattr(policyfiles, "bounce_diff", lambda pp, task, pats, ch: seen.append((pats, ch)) or "policy files touched: src/rt/coordfix.py")
     monkeypatch.setattr(daemon, "log", lambda pp, m: seen.append(m))
     me = SimpleNamespace(p=p)
     got = daemon.Daemon._policy_bounce(me, {"id": 1, "task": t["id"]})
     assert got == "policy files touched: src/rt/coordfix.py" and seen[0][0] == ["src/rt/coordfix.py"]
-    monkeypatch.setattr(worktree, "diff_lines", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no git")))
-    assert daemon.Daemon._policy_bounce(me, {"id": 1, "task": t["id"]}) == ""   # unreadable: review reads it
+    monkeypatch.setattr(policyfiles, "task_diff", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no git")))
+    got = daemon.Daemon._policy_bounce(me, {"id": 1, "task": t["id"]})   # unreadable: a loud bounce, never a pass
+    assert got.startswith("policy diff not readable") and "no git" in got
+    assert p.db.one("SELECT severity FROM events WHERE kind='policy_diff_unread'")["severity"] == "high"
     (p.harness / policyfiles.FILE).unlink()
     assert daemon.Daemon._policy_bounce(me, {"id": 1, "task": t["id"]}) == ""
+
+
+def test_the_policy_check_reads_the_diff_in_the_tasks_own_code_repo_and_a_missing_branch_is_loud(env, monkeypatch, tmp_path):
+    """cell policy_bounce_code_repo: the task's code lives in a repository other than the project root (its
+    worktree is a linked worktree of that repository); the project root has no such branch."""
+    import subprocess
+    from types import SimpleNamespace
+    from ttp import daemon, policyfiles, worktree
+
+    def git(repo, *a):
+        return subprocess.run(["git", "-C", str(repo), *a], capture_output=True, text=True, check=True).stdout.strip()
+    p = make(env)
+    (p.harness / policyfiles.FILE).write_text("src/rt/coordfix.py\n")
+    t = _ca_task(p)
+    code = tmp_path / "code-repo"
+    (code / "src/rt").mkdir(parents=True)
+    git(code, "init", "-q", "-b", "main")
+    git(code, "config", "user.email", "t@example.invalid")
+    git(code, "config", "user.name", "t")
+    (code / "src/rt/coordfix.py").write_text("a = 1\n")
+    git(code, "add", "-A")
+    git(code, "commit", "-qm", "base")
+    branch = f"ttp/t{t['id']}-x"
+    wt = p.worktrees / f"t{t['id']}"
+    git(code, "worktree", "add", "-q", "-b", branch, str(wt))
+    git(code, "update-ref", f"{worktree.FORK_POINT_REF}{t['id']}", git(code, "rev-parse", "HEAD"))
+    (wt / "src/rt/coordfix.py").write_text("a = 2\n")
+    git(wt, "commit", "-qam", "glm change")
+    tip = git(wt, "rev-parse", "HEAD")
+    p.db.x("UPDATE tasks SET branch=? WHERE id=?", (branch, t["id"]))
+    monkeypatch.setattr(daemon, "log", lambda pp, m: None)
+    me = SimpleNamespace(p=p)
+    assert daemon.Daemon._policy_bounce(me, {"id": 1, "task": t["id"]}) == "policy files touched: src/rt/coordfix.py"
+    assert git(code, "rev-parse", f"{policyfiles.EVIDENCE_REF}{t['id']}") == tip   # evidence kept in the code repo
+    p.db.x("UPDATE tasks SET branch='ttp/gone' WHERE id=?", (t["id"],))
+    got = daemon.Daemon._policy_bounce(me, {"id": 2, "task": t["id"]})
+    assert "does not exist" in got and "ttp/gone" in got
+    assert p.db.one("SELECT 1 FROM events WHERE kind='policy_diff_unread' AND fingerprint='policy_diff_unread:2'")
 
 
 # The tool-output digest of the mini-swe-agent GLM harness (glmenv.digest): server capacity, never a hidden failure.
