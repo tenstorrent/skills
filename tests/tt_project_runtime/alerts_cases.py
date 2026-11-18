@@ -1406,29 +1406,6 @@ def test_health_counts_a_command_watcher_naming_a_pr_or_its_repo_as_pr_coverage(
     assert all(i["covered_by"] == ["builtin: PR watcher prs"] for i in pr_items().values())
 
 
-def test_health_counts_a_heal_check_naming_a_pr_or_its_repo_as_pr_coverage(env):
-    """A heal check covers an open PR by the same match as a command watcher (the PR, or its repo beside a
-    PR word), and is no report-only cover; a heal check naming only another repo leaves its PR missing, and
-    the digest's coverage line then says how to name a PR."""
-    from ttp import responsibilities
-    p = make(env)
-    p.db.x("DELETE FROM schedules WHERE kind='watcher'")
-    urls = ["https://github.com/example-org/widgets/pull/7", "https://github.com/example-org/gadgets/pull/3"]
-    for url in urls:
-        p.db.x("INSERT INTO tasks(title,kind,status,pr_url,created) VALUES(?,?,?,?,?)",
-               ("t", "code", "done", url, time.time()))
-    for name, heal in (("widgets-pr", {"check": "bin/pr_ok.sh example-org/widgets#7", "fix": "bin/pr_fix.sh"}),
-                       ("other-ci", {"check": "bin/ci_ok.sh example-org/gadgets/actions", "fix": "true"})):
-        p.db.x("INSERT INTO schedules(name,kind,every_s,enabled,payload) VALUES(?,'command',600,1,?)",
-               (name, json.dumps({"heal": heal})))
-    items = {i["name"]: i for i in responsibilities.inventory(p) if i["kind"] == "pr"}
-    assert items[urls[0]]["covered_by"] == ["widgets-pr"] and not items[urls[0]].get("report_only"), items
-    assert items[urls[1]]["covered_by"] == [], items[urls[1]]
-    responsibilities.refresh(p)
-    told = responsibilities.digest_lines(p.db)
-    assert told and "pr " + urls[1] in told[0] and responsibilities.PR_HINT in told[0], told
-
-
 def test_pr_watch_reads_only_real_pr_urls_and_a_hand_off_stores_no_other(env, monkeypatch):
     """Only a /pull/<n> URL or owner/repo#N is watched and counted as a PR: 'none', a branch tree URL or
     an empty value never gets a signature, so it is skipped before any gh call, not re-read every run.

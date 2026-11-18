@@ -2168,8 +2168,6 @@ class Daemon:
                 self._step_allow = None
         except StepBudgetSpent as e:   # stopped where it was: next tick resumes after the item it was on
             self._step_killed = e.cmd or "-"
-            if not self._step_holder and not e.cmd:   # it named no item: name the code line it was stopped on
-                self._step_holder = _stopped_at(e.__traceback__)
             if name in self._step_at:
                 self._step_cursor[name] = self._step_at[name]
             log(self.p, f"tick step {name} stopped at its budget ({e})")
@@ -9790,10 +9788,8 @@ class Daemon:
         that does not answer) never holds messages or dispatch; the tick waits at most SCHEDULE_WAIT_S
         for them. A run past its timeout (_schedule_timeout) has its process groups killed and is
         recorded as a failed run; one still going schedrun.STUCK_FACTOR x its timeout after that kill (a
-        builtin watcher stuck in Python) is observed once more, under its own key. llm schedules run off the
-        tick too (their precheck, gates, de-slop scan and enqueue), so one slow schedule never holds the step;
-        each start names its schedule (_step_over), so a slow step says which one. A schedule that keeps
-        timing out is one keyed observation (schedule-timeout:<name>), not a new one each run."""
+        builtin watcher stuck in Python) is observed once more, under its own key. An llm schedule with a
+        `precheck` runs off the tick too, so its shell check never holds the tick either."""
         db, runs = self.p.db, self._sched_runs
         if not self._sched_swept:   # what an earlier daemon's runs left: their schedules are still due
             self._sched_swept = True
@@ -9814,9 +9810,14 @@ class Daemon:
             self._log_step_error("schedule run-now requests", e, 1000)
         for s in due:
             payload = json.loads(s["payload"] or "{}")
-            if self._step_over(_schedule_label(s, payload)):
-                break   # still due: the next tick starts the rest
-            runs[s["name"]] = self._start_schedule(s, payload)
+            if s["kind"] in ("command", "watcher") or (s["kind"] == "llm" and _precheck_cmd(payload)):
+                runs[s["name"]] = self._start_schedule(s, payload)
+                continue
+            try:
+                status = self._schedule_llm(s, payload)
+            except Exception as e:
+                status = f"error: {type(e).__name__}: {e}"[:200]
+            self._schedule_ran(s, status, None)
         until = time.monotonic() + SCHEDULE_WAIT_S
         for run in list(runs.values()):
             if not run.timed_out:
@@ -9848,7 +9849,7 @@ class Daemon:
                 why = f"error: timed out after {run.timeout:.0f} s"
                 self.observe(scr.error_source(f"watcher:{name}"), f"schedule {name} {why[7:]}: its run was "
                              f"stopped ({killed} process group(s) killed) and counts as failed", "normal",
-                             lifecycle=scr.ERROR, key=f"schedule-timeout:{name}")
+                             lifecycle=scr.ERROR)
                 self._schedule_ran(run.s, why, None)
                 self._schedule_answer(run, why)
 
@@ -10018,7 +10019,7 @@ class Daemon:
         return n
 
     def _start_schedule(self, s: dict, payload: dict) -> schedrun.Run:
-        """Start one command, heal, builtin watcher or llm run in its own thread. It works on a
+        """Start one command, heal, builtin watcher or prechecked llm run in its own thread. It works on a
         copy of the daemon with its own database connection; its watchdog pings are the tick's own business."""
         self._warn_over_cap(s, payload)
         host = copy.copy(self)
@@ -23086,24 +23087,6 @@ def _watcher_timeout(payload: dict) -> int:
     except (TypeError, ValueError):
         want = 120
     return max(1, min(want, WATCHER_MAX_S))
-
-
-def _stopped_at(tb) -> str:
-    """The innermost frame of this package (stepclock aside) in traceback `tb`, as 'code at file:line in fn'."""
-    here, at = os.path.dirname(os.path.abspath(__file__)), ""
-    while tb is not None:
-        f = tb.tb_frame.f_code.co_filename
-        if os.path.dirname(os.path.abspath(f)) == here and os.path.basename(f) != "stepclock.py":
-            at = f"code at {os.path.basename(f)}:{tb.tb_lineno} in {tb.tb_frame.f_code.co_name}"
-        tb = tb.tb_next
-    return at
-
-
-def _schedule_label(s: dict, payload: dict) -> str:
-    """How a tick step names schedule `s`: its name, kind and command, for the step's slow and stuck messages."""
-    what = str(payload.get("command") or payload.get("builtin") or _precheck_cmd(payload)
-               or ("de-slop scan" if payload.get("deslop") else "")).strip()
-    return f"schedule {s['name']} ({s['kind']}" + (f": {what[:120]}" if what else "") + ")"
 
 
 def _precheck_cmd(payload: dict) -> str:
