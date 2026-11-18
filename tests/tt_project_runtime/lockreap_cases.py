@@ -300,7 +300,12 @@ def _prime_reaper(dmn, p):
     dmn._lock_reaper = r
 
 
-def test_lock_wait_alert_stays_off_chat_while_the_holder_lives_and_posts_once_when_it_dies_unreleased(env, monkeypatch):
+def _lock_wait_items(p, lock="gate"):
+    return p.db.q("SELECT kind, severity, text, data, status FROM events WHERE kind='queue_wait' AND data LIKE ? "
+                  "ORDER BY id", (f'%"key": "qwait-lock-{lock}"%',))
+
+
+def test_lock_wait_alert_stays_off_chat_and_goes_to_the_coordinator_once_a_dead_holder_is_left_unreleased(env, monkeypatch):
     from ttp import daemon as dm, locks
     p = make(env)
     d = p.state / "locks"
@@ -315,26 +320,27 @@ def test_lock_wait_alert_stays_off_chat_while_the_holder_lives_and_posts_once_wh
         rows = _lock_wait_rows(p, "lock-wait:gate")
         assert [r["channel"] for r in rows] == ["quiet"], rows      # holder alive: web app and status only
         assert "holder alive" in rows[0]["text"]
+        [ev] = _lock_wait_items(p)                                  # the coordinator's queue-wait item, once
+        assert ev["severity"] == "normal" and json.loads(ev["data"])["must_act"]["tasks"] == [7]
         del procs[4100]                                             # it dies; another project's process keeps the slot
         dmn.reap_locks()
-        assert [r["channel"] for r in _lock_wait_rows(p, "lock-wait:gate")] == ["quiet"], "the sweep may still release it"
+        assert len(_lock_wait_items(p)) == 1, "the sweep may still release it"
         _prime_reaper(dmn, p)
         for _ in range(3):
             dmn.reap_locks()
         dm.Daemon(p.base).reap_locks()
-        rows = _lock_wait_rows(p, "lock-wait:gate")
-        assert [r["channel"] for r in rows] == ["quiet", "chat"], rows   # posted once, not per tick
-        assert "dead" in rows[1]["text"] and "pid 4100" in rows[1]["text"]
+        assert [r["channel"] for r in _lock_wait_rows(p, "lock-wait:gate")] == ["quiet"]   # never the user's chat
+        items = _lock_wait_items(p)
+        assert len(items) == 1, items                               # the same holder: no new item
     finally:
         locks.dequeue(ticket)
     dmn.reap_locks()
     assert not p.db.one("SELECT id FROM alerts WHERE key='lock-wait:gate' AND cleared IS NULL")
-    rows = _lock_wait_rows(p, "lock-wait:gate")
-    assert rows[-1]["text"].startswith("Cleared:") and rows[-1]["channel"] == "chat", rows
+    assert all(e["status"] == "handled" for e in _lock_wait_items(p)), "the wait ended: its item is moot"
     f.close()
 
 
-def test_lock_wait_alert_behind_a_dead_holder_the_sweep_kept_posts_to_chat_at_once(env, monkeypatch):
+def test_lock_wait_behind_a_dead_holder_the_sweep_kept_goes_to_the_coordinator_at_once(env, monkeypatch):
     from ttp import daemon as dm, locks
     p = make(env)
     d = p.state / "locks"
@@ -346,10 +352,83 @@ def test_lock_wait_alert_behind_a_dead_holder_the_sweep_kept_posts_to_chat_at_on
         _prime_reaper(dmn, p)
         dmn.reap_locks()
         dmn.reap_locks()
-        rows = _lock_wait_rows(p, "lock-wait:gate")
-        assert [r["channel"] for r in rows] == ["chat"], rows
+        assert [r["channel"] for r in _lock_wait_rows(p, "lock-wait:gate")] == ["quiet"]
+        [ev] = _lock_wait_items(p)
+        assert ev["severity"] == "high" and "dead" in ev["text"] and "qwait-lock-gate" in ev["text"]
     finally:
         locks.dequeue(ticket)
+        f.close()
+
+
+def test_lock_wait_names_the_live_shared_holder_not_the_stale_slot_label(env, monkeypatch):
+    """cell holder_named_live: a shared hold labels itself under <res>.shared; the slot file keeps the label
+    of its last exclusive holder, long gone. The wait names the live holder's task, run and job."""
+    from ttp import daemon as dm, lockreap, locks
+    p = make(env)
+    d = p.state / "locks"
+    me = os.getpid()
+    start = locks.start_time(me)
+    for k in ("TTP_PROJECT", "TTP_RUN_DIR"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("TTP_RUN_ID", "88")
+    monkeypatch.setenv("TTP_TASK", "8")
+    slot = d / "srv.0.lock"
+    slot.parent.mkdir(parents=True, exist_ok=True)
+    slot.write_text(json.dumps({"holder": "task #7 (run 70)", "pid": 4100, "pid_start": "11", "task_id": "7",
+                                "run_id": "70", "since": time.time() - 26 * 3600, "command": "regrade"}))
+    _ReapProcs(monkeypatch, {me: {"start": start, "pgid": me}}, [me])
+    hold = locks.try_take_shared([slot], "task #8 (run 88)", extra={"job": "driver", "job_pid": me})
+    ticket = locks.enqueue(d, "srv", "task #9", since=time.time() - 31 * 60)
+    try:
+        [w] = lockreap.long_waits([d], 30 * 60)
+        text = lockreap.wait_text(w)
+        assert "task #8 (run 88)" in text and "detached job driver" in text and "shared" in text, text
+        assert "#7" not in text and "4100" not in text and "holder alive" in text, text
+        assert text.count("#8") == 1 and text.count("shared") == 1, "what the label names is not named twice"
+        dm.Daemon(p.base).reap_locks()
+        [row] = _lock_wait_rows(p, "lock-wait:srv")
+        assert "task #8 (run 88)" in row["text"] and "#7" not in row["text"]
+    finally:
+        locks.dequeue(ticket)
+        hold.close()
+
+
+def test_lock_wait_is_one_alert_and_one_item_per_holder_and_goes_to_chat_only_behind_the_users_pause(env, monkeypatch):
+    """cells one_alert_per_wait, wait_to_coordinator: ticks and new waiters repeat nothing; a new holder posts
+    once more, quietly, and gives the coordinator a new item; the user's own pause of the resource is the
+    one wait that reaches the chat, and no coordinator item then."""
+    from ttp import daemon as dm, db as dbmod, locks
+    p = make(env)
+    d = p.state / "locks"
+    f = _reap_slot(d / "gate.0.lock", pid=4100, pid_start="11", pgid=4100, run_id="70", task_id="7")
+    _ReapProcs(monkeypatch, {4100: {"start": "11", "pgid": 4100}, 4200: {"start": "12", "pgid": 4200}}, [4100])
+    tickets = [locks.enqueue(d, "gate", "task #8", since=time.time() - 31 * 60)]
+    try:
+        dmn = dm.Daemon(p.base)
+        for _ in range(3):
+            dmn.reap_locks()
+        tickets.append(locks.enqueue(d, "gate", "task #9", since=time.time() - 40 * 60))
+        dm.Daemon(p.base).reap_locks()
+        assert [r["channel"] for r in _lock_wait_rows(p, "lock-wait:gate")] == ["quiet"]
+        assert len(_lock_wait_items(p)) == 1
+        f.close()                                                   # another holder takes it
+        f = _reap_slot(d / "gate.0.lock", pid=4200, pid_start="12", pgid=4200, run_id="71", task_id="5")
+        dmn.reap_locks()
+        dmn.reap_locks()
+        rows = _lock_wait_rows(p, "lock-wait:gate")
+        assert [r["channel"] for r in rows] == ["quiet", "quiet"] and "task #5" in rows[1]["text"], rows
+        items = _lock_wait_items(p)
+        assert len(items) == 2 and json.loads(items[1]["data"])["must_act"]["tasks"] == [5], items
+        p.db.set_kv(dbmod.PAUSED_RESOURCES_KEY,
+                    {"gate": {"reason": "hands off", "since": time.time(), "by": "user"}})
+        dmn.reap_locks()
+        dmn.reap_locks()
+        rows = _lock_wait_rows(p, "lock-wait:gate")
+        assert [r["channel"] for r in rows] == ["quiet", "quiet", "chat"], rows
+        assert len(_lock_wait_items(p)) == 2, "only the user can lift their pause: no coordinator item"
+    finally:
+        for t in tickets:
+            locks.dequeue(t)
         f.close()
 
 

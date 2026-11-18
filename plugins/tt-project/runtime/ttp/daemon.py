@@ -14694,9 +14694,9 @@ class Daemon:
     def reap_locks(self) -> None:
         """Every tick, model-free (ttp.lockreap): reap what keeps a harness lock whose holder is dead,
         or that a detached job of this project left once it and its task ended (the project's slot locks, its shared resources' and the check slots), log each release as an
-        event, and raise one lock-wait:<name> alert per lock a waiter has waited on past
-        locks.wait_alert_min, naming its holder (quiet: web app and status, unless a dead holder's lock
-        was not released, lockreap.dead_unreleased); it clears once nobody waits that long. The checks-slot
+        event, and keep one lock-wait:<name> alert per lock a waiter has waited on past
+        locks.wait_alert_min, naming its live holder (quiet: web app and status, unless the user's own pause
+        holds it), and give the wait to the coordinator as its queue-wait item; it clears once nobody waits that long. The checks-slot
         queue counts only while a holder is not judged alive; a waiting task's device-queue job counts
         as lock devq:<runner> (lockreap.devq_waits)."""
         from . import checkcap, lockreap
@@ -14724,28 +14724,45 @@ class Daemon:
         waits += lockreap.devq_waits(db, limit, now, current=_current_probe)
         folded = self.alert_lock_cycles(now)
         keys = set()
-        # A wait behind a live or unjudgeable holder stays in the web app and status; only one behind a dead
-        # holder the sweep did not release goes to chat, once per episode, also when a quiet one turns so.
+        # A lock wait is a queue wait the coordinator handles: it gets it as its queue-wait item once per
+        # holder (lockreap.signature), not before a dead holder had time to be released (dead_unreleased);
+        # the wait stays in the web app and status. Only a wait behind the user's own pause of the resource
+        # goes to chat. The alert is posted again only when its holder changes.
         dead_seen, dead_now = getattr(self, "_lock_dead_seen", {}), set()
+        paused, seen = db.paused_resources(), dict(db.kv(lockreap.WAIT_KV, {}) or {})
         for w in waits:
             if w["lock"] in folded:
                 continue   # the lock-cycle alert names it
             key = f"lock-wait:{w['lock']}"
             keys.add(key)
-            loud = lockreap.dead_unreleased(w, got["kept"], dead_seen, now)
+            dead = lockreap.dead_unreleased(w, got["kept"], dead_seen, now)
             dead_now |= {(w["lock"], h.get("path") or "", h.get("pid")) for h in w["holders"] if h.get("state") == "dead"}
-            ep = db.one("SELECT * FROM alerts WHERE key=? AND cleared IS NULL ORDER BY id DESC LIMIT 1", (key,))
-            if ep:
-                if loud and not alerts.acked(db, ep) and not alerts.known(db, key, "normal") and not db.one(
-                        "SELECT id FROM messages WHERE direction='out' AND ref=? AND channel='chat' AND ts>=? LIMIT 1",
-                        (key, ep["raised"])):
-                    db.post("out", lockreap.wait_text(w, now, got["kept"]), chat=None, kind="alert",
+            user = lockreap.users_pause(w, paused) is not None
+            sig = lockreap.signature(w) + ("|user" if user else "")
+            text = lockreap.wait_text(w, now, got["kept"])
+            rec = seen.get(key) or {"n": 0, "since": now - w["waited_s"]}
+            if rec.get("sig") != sig:
+                rec.update(sig=sig, n=int(rec.get("n") or 0) + 1)
+                ep = db.one("SELECT * FROM alerts WHERE key=? AND cleared IS NULL ORDER BY id DESC LIMIT 1", (key,))
+                if ep:
+                    loud = user and not alerts.acked(db, ep) and not alerts.known(db, key, "normal")
+                    db.post("out", text, chat=None, channel="chat" if loud else alerts.QUIET, kind="alert",
                             severity="normal", ref=key)
                 else:
-                    db.x("UPDATE alerts SET last=? WHERE key=? AND cleared IS NULL", (now, key))
-                continue
-            self.alert(key, lockreap.wait_text(w, now, got["kept"]), severity="normal", quiet=not loud)
+                    self.alert(key, text, severity="normal", quiet=not user)
+            else:
+                db.x("UPDATE alerts SET last=? WHERE key=? AND cleared IS NULL", (now, key))
+            pending = not dead and any(h.get("state") == "dead" for h in w["holders"])   # the sweep may still free it
+            if not user and not pending and rec.get("told") != sig and not w["lock"].startswith("devq:"):
+                # (a device-queue wait is its waiting task's: queuewait raises it)
+                lockreap.raise_item(db, w, text, rec["since"], rec["n"], self.p.name, now, dead)
+                rec["told"] = sig
+            seen[key] = rec
         self._lock_dead_seen = {k: v for k, v in dead_seen.items() if k in dead_now}
+        for key in [k for k in seen if k not in keys]:
+            seen.pop(key)
+            lockreap.settle_item(db, key.partition(":")[2])
+        db.set_kv(lockreap.WAIT_KV, seen)
         for ep in db.q("SELECT DISTINCT key FROM alerts WHERE key LIKE 'lock-wait:%' AND cleared IS NULL"):
             if ep["key"] not in keys:
                 lock = ep["key"].partition(":")[2]

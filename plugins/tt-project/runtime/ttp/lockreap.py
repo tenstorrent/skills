@@ -23,8 +23,11 @@ it by design, and the kernel frees it once the last one ends. A label with no pi
 judged dead on two sweeps GRACE_S apart before anything is reaped.
 
 long_waits finds each lock whose oldest live waiter (its queue ticket) has waited past the config
-`locks.wait_alert_min` (default WAIT_ALERT_MIN): the daemon raises one keyed alert per lock
-(`lock-wait:<name>`), naming the holder, and clears it when the wait ends. The checks-slot queue
+`locks.wait_alert_min` (default WAIT_ALERT_MIN): the daemon keeps one keyed alert per lock
+(`lock-wait:<name>`, web app and status), naming the live holder (live_holders: a shared hold by its own
+label, never the stale label its slot keeps), and clears it when the wait ends. The wait goes to the
+coordinator as its queue-wait item, once per holder (signature); only a wait behind the user's own pause
+of the resource goes to the user (users_pause). The checks-slot queue
 (checkcap) counts only while a holder is not judged alive (stuck_only): a wait behind running checks is
 normal queueing. A device-queue job queued behind another (devq, read from its waiting task's probe)
 raises `lock-wait:devq:<runner>` the same way (devq_waits).
@@ -375,7 +378,8 @@ def holder_info(path: Path, h: dict | None = None) -> dict:
     since = float(h.get("since") or 0) if isinstance(h.get("since"), (int, float)) else 0.0
     return {"lock": Path(path).name, "path": str(path), "holder": str(h.get("holder") or "?"),
             "pid": h.get("pid"), "command": str(h.get("command") or "")[:200], "task": h.get("task_id"),
-            "run": h.get("run_id"), "project": locks.project_of(h, Path(path).parent), "since": since}
+            "run": h.get("run_id"), "job": h.get("job"), "job_pid": h.get("job_pid"),
+            "project": locks.project_of(h, Path(path).parent), "since": since}
 
 
 def slot_files(dirs) -> list[Path]:
@@ -445,17 +449,76 @@ def long_waits(dirs, threshold_s: float, now: float | None = None, mine=None, on
             oldest = min(locks._arrival(t) or now for t in tickets)
             if now - oldest < threshold_s:
                 continue
-            slots = [s for s in sorted(Path(d).glob(f"{res}.*.lock")) if _held(s) in ("held", "shared")]
-            holders = []
-            for s in slots:
-                h = label(s)
-                state, why = verdict(h)
-                holders.append({**holder_info(s, h), "state": state, "why": why})
+            holders = live_holders(sorted(Path(d).glob(f"{res}.*.lock")))
             if stuck_only and all(h["state"] == "alive" for h in holders):
                 continue
             out.append({"lock": res, "dir": str(d), "waiters": len(tickets), "waited_s": now - oldest,
                         "holders": holders})
     return out
+
+
+def live_holders(slots: list[Path]) -> list[dict]:
+    """Who holds the resource whose slot files are `slots` now: each exclusively held slot's label, and, when
+    any slot is held shared, each live shared holder's own label (locks.shared_holders), never the slot's: a
+    slot keeps the label of its last exclusive holder, who may hold nothing now."""
+    states = {s: _held(s) for s in slots}
+    out = []
+    for s, st in states.items():
+        if st == "held":
+            h = label(s)
+            state, why = verdict(h)
+            out.append({**holder_info(s, h), "state": state, "why": why})
+    if "shared" in states.values():
+        sd = locks.shared_dir(list(states))
+        for h in locks.shared_holders(list(states)):
+            state, why = verdict(h)
+            out.append({**holder_info(sd, h), "lock": sd.name, "shared": True, "state": state, "why": why})
+    return out
+
+
+def signature(w: dict) -> str:
+    """What one lock-wait episode is about: the lock and who holds it (task, run, job, pid, shared). A new
+    signature is a changed holder; waiters coming and going and the wait's length leave it alone."""
+    hs = sorted(f"{h.get('task') or ''}/{h.get('run') or ''}/{h.get('job') or ''}/{h.get('pid') or ''}/"
+                f"{'s' if h.get('shared') else 'x'}" for h in w.get("holders") or [])
+    return w["lock"] + "|" + ",".join(hs)
+
+
+def users_pause(w: dict, paused: dict) -> dict | None:
+    """The user's own pause (db.paused_resources, `by` user) of wait `w`'s resource: then only the user can
+    clear the wait. None otherwise: the coordinator handles it."""
+    got = (paused or {}).get(w["lock"])
+    return got if isinstance(got, dict) and got.get("by") == "user" else None
+
+
+WAIT_KV = "lock_waits"   # kv: lock-wait:<name> -> {sig, n, since, told}: the episode, its holder, what the coordinator got
+QUEUE_KIND = "queue_wait"   # queuewait.KIND: the coordinator's must-act queue-wait item
+
+
+def item_key(lock: str) -> str:
+    return f"qwait-lock-{lock}"
+
+
+def raise_item(db, w: dict, text: str, since: float, n: int, project: str, now: float, dead: bool) -> bool:
+    """Give the coordinator wait `w` as its queue-wait item (mustact): one event per episode and holder (`n`),
+    owned by the holders' tasks of `project`. High when a dead holder keeps the lock unreleased."""
+    from . import obligations
+    k = item_key(w["lock"])
+    tasks = sorted({int(h["task"]) for h in w["holders"]
+                    if str(h.get("task") or "").isdigit() and h.get("project") in (None, project)})
+    opts = (f"free it if its holder is stuck or dead (`ttp lock --probe --json {w['lock']}` shows the live record)",
+            "move the waiting work to another resource the charter allows (task_update resources)",
+            f"else a noop naming {k}: a live holder's lock is a safety rule")
+    msg = f"{k}: {text} Options: " + " | ".join(f"({i}) {o}" for i, o in enumerate(opts, 1))
+    data = {"must_act": {"key": k, "chat": "all", "tasks": tasks, "kind": QUEUE_KIND, "episode": f"lock:{w['lock']}"}}
+    return obligations._raise(db, now, f"{QUEUE_KIND}:lock:{w['lock']}:{int(since)}:{n}", QUEUE_KIND, msg,
+                              tasks[0] if tasks else None, data, severity="high" if dead else "normal")
+
+
+def settle_item(db, lock: str) -> None:
+    """The wait on `lock` ended: its unread queue-wait item is moot."""
+    db.x("UPDATE events SET status='handled' WHERE kind=? AND status='queued' AND data LIKE ?",
+         (QUEUE_KIND, f'%"episode": "lock:{lock}"%'))
 
 
 DEVQ_WAITS_KEY = "devq_waits"   # kv: task id -> what its plain `ttp devq probe` last said of its job's queue wait
@@ -534,6 +597,9 @@ def _ticket_text(t: Path) -> str:
         return ""
 
 
+_PUNCT = str.maketrans("(),;", "    ")
+
+
 def _dur(s: float) -> str:
     return f"{s / 3600:.1f} h" if s >= 5400 else f"{int(s // 60)} min"
 
@@ -548,10 +614,14 @@ def wait_text(w: dict, now: float | None = None, kept: dict | None = None) -> st
         if not h:
             parts.append("no holder found (a slot may have been freed just now)")
             continue
-        who = h["holder"]
-        if h.get("task") or h.get("project"):
-            who += " (" + ", ".join(x for x in (f"task #{h['task']}" if h.get("task") else "",
-                                                 f"project {h['project']}" if h.get("project") else "") if x) + ")"
+        who, have = h["holder"], h["holder"].translate(_PUNCT).split()
+        extra = [f"task #{h['task']}" if h.get("task") and f"#{h['task']}" not in have else "",
+                 f"run {h['run']}" if h.get("run") and str(h["run"]) not in have else "",
+                 f"detached job {h['job']}" if h.get("job") else "",
+                 "shared" if h.get("shared") and "shared" not in have else "",
+                 f"project {h['project']}" if h.get("project") else ""]
+        if any(extra):
+            who += " (" + ", ".join(x for x in extra if x) + ")"
         held = f", held {_dur(now - h['since'])}" if h.get("since") else ""
         alive = {"alive": "alive", "dead": f"dead: {h['why']}"}.get(h["state"], f"alive unknown: {h['why']}")
         line = f"{who}, pid {h.get('pid') or '?'} (`{h['command'][:120] or '?'}`){held}, holder {alive}"
