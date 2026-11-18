@@ -40,7 +40,7 @@ def test_remove_stops_prunes_shared_rows_and_unregisters_but_keeps_files_by_defa
     import json
     from ttp import cli, machinecap, project
     p = make(env, "scratch")
-    make(env, "other")
+    project.register("other", {"host": "testhost", "dir": str(env["home"] / "other-repo")})   # registered only: one repo holds one project
     _pr_shared(env, "scratch", p.base)
     monkeypatch.setattr(cli, "stop_project", lambda proj, kill: f"stopped {proj.name} kill={kill}")
     cli.main(["remove", "scratch"])

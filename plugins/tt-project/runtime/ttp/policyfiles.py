@@ -15,8 +15,9 @@ a listed file or uses a policy term (TERMS); after a run on the arm, a branch th
 from __future__ import annotations
 
 import re
-import subprocess
 from pathlib import Path
+
+from . import gitmemo
 
 FILE = "policy_files.txt"
 EVIDENCE_REF = "refs/ttp/policy-bounce/t"   # + task id: the branch tip a refused hand-off was saved at
@@ -106,7 +107,7 @@ def task_reason(patterns: list[str], task: dict) -> str:
 
 
 def _git(cwd, *args: str) -> str:
-    got = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, timeout=120)
+    got = gitmemo.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, timeout=120)
     return got.stdout.strip() if got.returncode == 0 else ""
 
 
