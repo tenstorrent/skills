@@ -17624,11 +17624,14 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("dir", help="the project's tt-project folder")
     s.set_defaults(fn=cmd_daemon)
 
-    a = ap.parse_args(_project_name_argv(sub, _say_finding_argv(_say_all_argv(_secret_value_argv(_secret_env_argv(_bench_blind_argv(_bridge_argv(
-        sys.argv[1:] if argv is None else list(argv)))))))))
-    dry_run_stub(a)
+    argv = _project_name_argv(sub, _say_finding_argv(_say_all_argv(_secret_value_argv(_secret_env_argv(_bench_blind_argv(_bridge_argv(
+        sys.argv[1:] if argv is None else list(argv))))))))
+    a = ap.parse_args(argv)
+    # The command's name from argv: a.cmd is the commands after -- in `checks`, `detach` and others
+    name = next((w for w in argv if w in sub.choices), "")
+    dry_run_stub(a, name)
     blind_gate(a)
-    glm_gate(a)
+    glm_gate(a, name)
     try:
         _recover_setup()     # a `ttp setup` a reboot cut short: finished or rolled back before anything else
     except Exception as e:
@@ -17650,13 +17653,15 @@ def blind_gate(a) -> None:
             die(f"refused: {why}", 2)
 
 
-def glm_gate(a) -> None:
+def glm_gate(a, name: str | None = None) -> None:
     """A run on the code arm's GLM side (glmguard) runs only the commands the guard allows; a refused one ends
-    the run as a hand-back to Opus (glmguard.hit), and exits 2."""
+    the run as a hand-back to Opus (glmguard.hit), and exits 2. `name`: the command's name (main reads it from
+    argv, since a.cmd is the commands after -- for `checks` and others)."""
     from . import glmguard
     if not glmguard.active():
         return
-    cmd = str(getattr(a, "cmd", "") or "")
+    cmd = name if name is not None else getattr(a, "cmd", "")
+    cmd = cmd if isinstance(cmd, str) else ""
     action = str(getattr(a, "action", "") or getattr(a, "op", "") or "")
     why = glmguard.cli_refusal(cmd, action)
     if why:
@@ -17664,13 +17669,13 @@ def glm_gate(a) -> None:
         die(f"refused: {why}", 2)
 
 
-def dry_run_stub(a) -> None:
+def dry_run_stub(a, name: str | None = None) -> None:
     """Under an on_pass_cmd's dry run (onpassdry.ENV), `ttp note`, `notify`, `push` and `land` do nothing
     and exit 0, and what would start work or touch a device (`ttp lock`, `devq submit|start|clear`,
     `detach` without --check) is refused (exit 75, as a busy resource), so nothing leaves the run and no
     device or shared machine is touched."""
     from .onpassdry import ENV
-    cmd = a.cmd
+    cmd = name if name is not None else a.cmd
     if os.environ.get(ENV) != "1":
         return
     if cmd == "lock" or (cmd == "devq" and a.op in ("submit", "start", "clear")) \

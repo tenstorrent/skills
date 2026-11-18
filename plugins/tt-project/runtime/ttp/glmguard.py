@@ -122,8 +122,8 @@ def cli_refusal(cmd: str, action: str = "") -> str | None:
     """Why a GLM-arm run may not run `ttp <cmd> [<action>]`, else None."""
     if cmd in SUBS_ALLOWED and (cmd != "task" or action in TASK_ACTIONS):
         return None
-    what = f"ttp {cmd}" + (f" {action}" if cmd == "task" and action else "")
-    return (f"`{what}` is not allowed to a run on the GLM arm (it changes records or reaches a person or another "
+    what = f"`ttp {cmd}" + (f" {action}" if cmd == "task" and action else "") + "`" if cmd else "a ttp call naming no command"
+    return (f"{what} is not allowed to a run on the GLM arm (it changes records or reaches a person or another "
             f"project outside the hand-off); hand the task back to Opus")
 
 

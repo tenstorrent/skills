@@ -339,6 +339,41 @@ def test_glm_guard_cli_gate_ends_the_run_as_a_bounce_to_opus_and_a_normal_run_is
     assert glmguard.hit_reason(rd).startswith("`ttp note`")
 
 
+@_pytest.mark.parametrize("argv", [["checks"], ["checks", "--dry-run"], ["checks", "--fresh", "--", "true"],
+                                    ["checks", "--result", "x"]])
+def test_glm_guard_lets_a_glm_run_run_its_checks_in_every_form(argv, env, monkeypatch, tmp_path):
+    """cell guard_checks: `ttp checks` stores the commands after -- as a.cmd, which once hid its name."""
+    from ttp import cli, glmguard
+    p = make(env)
+    wt, rd = _gg_run(tmp_path)
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.setenv("TTP_RUN_DIR", str(rd))
+    monkeypatch.setenv("TTP_CODE_ARM_GUARD", "1")
+    ran = []
+    monkeypatch.setattr(cli, "cmd_checks", lambda a: ran.append(a))
+    cli.main(argv)
+    assert len(ran) == 1 and not (rd / glmguard.HIT).exists(), argv
+    monkeypatch.chdir(wt)
+    assert glmguard.shell_refusal(f"cd {wt} && ttp {' '.join(argv)} 2>&1 | tail -20", str(wt), str(rd),
+                                  {"TTP_PROJECT": str(p.base), **_GG_RUN_ENV}) is None
+
+
+@_pytest.mark.parametrize("argv,name", [(["note", "--to", "other", "hi"], "note"), (["notify", "hi"], "notify"),
+                                         (["task", "add", "x"], "task add"), (["say", "hi"], "say")])
+def test_glm_guard_refusal_names_the_command_it_refused(argv, name, env, monkeypatch, tmp_path, capsys):
+    from ttp import cli, glmguard
+    p = make(env)
+    wt, rd = _gg_run(tmp_path)
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.setenv("TTP_RUN_DIR", str(rd))
+    monkeypatch.setenv("TTP_CODE_ARM_GUARD", "1")
+    with _pytest.raises(SystemExit) as e:
+        cli.main(argv)
+    assert e.value.code == 2 and f"`ttp {name}`" in capsys.readouterr().err
+    assert glmguard.hit_reason(rd).startswith(f"`ttp {name}`")
+    assert glmguard.cli_refusal("", "").startswith("a ttp call naming no command")
+
+
 def test_glm_guard_keeps_a_hand_off_the_run_wrote_before_it_was_stopped(tmp_path):
     import json
     from ttp import glmguard
