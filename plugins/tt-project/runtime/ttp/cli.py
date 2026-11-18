@@ -868,6 +868,18 @@ def defaults_lines(budget: dict, jev_key: bool, name: str = "<name>") -> list[st
     return out
 
 
+def _made_by() -> dict:
+    """{"made_by": {"project", "task"}} when a run makes the project (TTP_PROJECT, TTP_TASK): the run's own
+    scratch project, which sidefx.peer_effects lets it remove again."""
+    base, task = os.environ.get("TTP_PROJECT"), os.environ.get("TTP_TASK") or ""
+    if not base or not task.isdigit():
+        return {}
+    try:
+        return {"made_by": {"project": Project(base).name, "task": int(task)}}
+    except Exception:
+        return {}
+
+
 def cmd_new(a) -> None:
     if not NAME_RE.match(a.name):
         die("project names use letters, digits, '.', '_' and '-' (max 63)")
@@ -882,7 +894,7 @@ def cmd_new(a) -> None:
         die(f"ttp new: refused: {why}", 2)
     p = bootstrap(root, a.name, brief, a.provider or detect_provider(), a.home_tz, a.home_from or "",
                   relayer=bool(getattr(a, "relayer", False)))
-    register(a.name, {"host": hostname(), "dir": str(p.root)})
+    register(a.name, {"host": hostname(), "dir": str(p.root), **_made_by()})
     from . import coordinator as coord
     if a.coordinator_effort != coord.DEFAULT_EFFORT:   # before the daemon starts, so its first turn has it
         p.set_config("coordinator.effort", a.coordinator_effort, by={"by": "user", "via": "ttp new"})
@@ -3173,7 +3185,12 @@ def _note_to(a, run_dir: str) -> None:
         die(f"not sent: {e}. Nothing was filed or queued")
     from . import taskfacts
     # The tasks it names, as the records show them now: what it states of them may be stale.
-    text = taskfacts.note_suffix(me, text, upstream.SPEC_CHARS)
+    from . import peerhold
+    # The target's pause or spend gate and resume time, before anyone waits on it (user msg #3496).
+    held = "" if routed or far else peerhold.line(a.to, peerhold.of(a.to), me)
+    if held:
+        print(f"{held}: work waiting on its answer waits at least until then")
+    text = taskfacts.note_suffix(me, text, upstream.SPEC_CHARS, held)
     sent = f"; stored {upstream.receipt(text)}"
     task = os.environ.get("TTP_TASK") or ""
     try:

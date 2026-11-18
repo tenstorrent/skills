@@ -516,3 +516,37 @@ def test_outside_writes_names_no_read_only_command_path_or_argument_as_written(t
                   f"bash -c 'echo z > {o}/f4'", f"git clone https://example.com/r {o}/clone",
                   f"f={o}/f5; echo x > $f") \
         == {f"{o}/f1", f"{o}/f2", str(o), f"{o}/f3", f"{o}/f4", f"{o}/clone", f"{o}/f5"}
+
+
+def test_peer_effects_lets_a_run_remove_the_scratch_project_its_own_task_made(env, tmp_path, monkeypatch):
+    """A scratch project under the account's scratch folder that this run's task made (`ttp new` records made_by)
+    may be removed again without a peer-effects alert; one another task made, or one outside the scratch folder,
+    still raises it."""
+    from ttp import project, sidefx
+    p = make(env)
+    scratch = project.HOME_DIR / "scratch"
+    rows = {"mine": (scratch / "mine", {"project": "demo", "task": 57}),
+            "theirs": (scratch / "theirs", {"project": "demo", "task": 58}),
+            "outside": (tmp_path / "outside", {"project": "demo", "task": 57})}
+    for name, (d, by) in rows.items():
+        (d / "tt-project" / "state").mkdir(parents=True)
+        project.register(name, {"host": "testhost", "dir": str(d), "made_by": by})
+    rd = tmp_path / "run"
+    rd.mkdir()
+    (rd / "run.json").write_text(json.dumps({"env": {"TTP_TASK": "57"}}))
+    sidefx.snapshot_peers(rd, p.base)
+    for name in rows:
+        project.unregister(name)
+    got = sidefx.peer_effects(rd, p.base, "demo")
+    assert "project theirs's registry row was removed" in got and "project outside's registry row was removed" in got
+    assert not any("mine" in x for x in got), got
+
+
+def test_ttp_new_in_a_run_records_which_task_made_the_project(env, monkeypatch):
+    from ttp import cli
+    p = make(env)
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.setenv("TTP_TASK", "57")
+    assert cli._made_by() == {"made_by": {"project": "demo", "task": 57}}
+    monkeypatch.delenv("TTP_TASK")
+    assert cli._made_by() == {}

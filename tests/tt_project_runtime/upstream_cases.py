@@ -1690,3 +1690,82 @@ def test_note_to_says_which_allowance_a_high_note_used(env, monkeypatch, capsys)
     assert "ahead of the normal notes" in capsys.readouterr().out
     assert _note(cli, "--status", upstream.note_id("second", "stop again")) == 1
     assert "high-severity allowance" in capsys.readouterr().out
+
+
+def _second(env, name="other"):
+    """A second project on this machine, in its own clone of the test repo."""
+    from ttp.cli import bootstrap
+    from ttp.project import register
+    repo2 = env["tmp"] / f"repo-{name}"
+    subprocess.run(["git", "clone", "-q", str(env["repo"]), str(repo2)], check=True)
+    p = bootstrap(repo2, name, "Another project.", "fake")
+    register(name, {"host": "testhost", "dir": str(p.root)})
+    return p
+
+
+def _hold_on_window(p, resets_at: float) -> None:
+    """`p`'s daemon last saw its core provider's 7-day window stop new work until `resets_at`."""
+    p.db.set_kv("gates", {"claude": {"allow_new_work": False, "level": "red",
+                                     "reasons": ["7d window at 90% (the project stops at 90%)"],
+                                     "numbers": {"plan": [{"window": "7d", "resets_at": resets_at}]}}})
+
+
+def test_peer_hold_reads_another_projects_pause_and_spend_gate_with_its_resume_time(env):
+    """peerhold.state reads a project on this machine read-only: a spend gate holding new work gives its window's
+    reset, a pause gives its end, and a project that runs or is not here is never reported held (user msg #3496)."""
+    from ttp import peerhold, projpause
+    other = make(env, "other")
+    assert peerhold.state(other) == {"held": False, "why": "", "until": None}
+    at = time.time() + 30 * 3600
+    _hold_on_window(other, at)
+    st = peerhold.state(other)
+    assert st["held"] and st["until"] == at and "7d window" in st["why"] and "window resets" in st["why"], st
+    line = peerhold.line("other", st, "UTC")
+    assert line.startswith("other held until ") and "UTC" in line
+    from datetime import datetime, timezone
+    end = datetime.fromtimestamp(at + 60, timezone.utc).isoformat()
+    projpause.pause(other.db, "user", "repairs", "chat", end, time.time(), None)
+    other.db.set_kv("paused", True)
+    st = peerhold.state(other)
+    assert st["held"] and "paused by user: repairs" in st["why"] and abs(st["until"] - (at + 60)) < 1, st
+    assert peerhold.of("not-here") is None and peerhold.line("x", None, "UTC") == ""
+
+
+def test_a_note_to_a_held_project_prints_and_carries_its_resume_time(env, monkeypatch, capsys):
+    """`ttp note --to` a project whose spend gate holds it prints when it resumes, and the note's facts suffix
+    carries the same line; a project that runs gets neither."""
+    from ttp import cli
+    src = make(env)
+    other = _second(env)
+    _note_run(env, monkeypatch, src)
+    assert _note(cli, "--to", "other", "can you rerun the bench?") == 0
+    assert " held " not in capsys.readouterr().out
+    assert "[facts at send time" not in _upstream_inbox(env)[-1]["spec"]
+    _hold_on_window(other, time.time() + 30 * 3600)
+    assert _note(cli, "--to", "other", "can you rerun the bench now?") == 0
+    out = capsys.readouterr().out
+    assert "other held until " in out and "waits at least until then" in out, out
+    spec = _upstream_inbox(env)[-1]["spec"]
+    assert spec.startswith(f"can you rerun the bench now? [facts at send time from {src.name}'s records: other held until ")
+
+
+def test_a_promise_whose_owner_task_sent_a_note_names_the_held_project_and_flags_an_early_due(env, monkeypatch):
+    """The digest's promise line names a project the owner task sent a note to (linked by the inbox's sender task,
+    not by wording) while it is held, and flags a due before its resume time unless the promise quotes it."""
+    from ttp import cli, obligations, peerhold, timefmt
+    src = make(env)
+    other = _second(env)
+    _note_run(env, monkeypatch, src, task="57")
+    assert _note(cli, "--to", "other", "please rerun") == 0
+    now = time.time()
+    at = now + 30 * 3600
+    _hold_on_window(other, at)
+    o = {"id": "o1", "text": "bench table by tomorrow", "owners": {"57": {}},
+         "promise": {"chat": "c", "message": 1, "due": now + 3600, "timed": True, "tasks": [57]}}
+    got = peerhold.promise_note(src.name, o, "UTC", now)
+    assert got.startswith("; other held until ") and "DUE BEFORE IT RESUMES" in got, got
+    o["text"] = f"bench table once other resumes at {timefmt.short(at, 'UTC', now).split(' ')[-2]}"
+    assert "DUE BEFORE" not in peerhold.promise_note(src.name, o, "UTC", now)
+    o["promise"]["tasks"], o["owners"] = [58], {}
+    assert peerhold.promise_note(src.name, o, "UTC", now) == ""   # task 58 sent no note
+    assert obligations._peer_hold("", o, now, "UTC") == ""

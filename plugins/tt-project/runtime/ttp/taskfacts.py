@@ -168,13 +168,16 @@ def prompt_block(p, task: dict, now: float | None = None) -> str:
             + "\n".join(f"- {x}" for x in got))
 
 
-def note_suffix(p, text: str, limit: int) -> str:
+def note_suffix(p, text: str, limit: int, held: str = "") -> str:
     """`text` (a note to another project, one line) with its named tasks' live records appended, as many
-    as fit within `limit` characters; `text` itself when none do or nothing is named."""
+    as fit within `limit` characters; `text` itself when none do or nothing is named. `held` (peerhold.line:
+    the target project held until its resume time) goes first in the block when it fits."""
     try:
         got = lines(p, text)
     except Exception:
-        return text
+        got = []
+    if held:
+        got = [held, *got]
     while got:
         out = f"{text}{FACTS_MARK}{p.name}'s records: {' | '.join(got)}]"
         if len(out) <= limit:

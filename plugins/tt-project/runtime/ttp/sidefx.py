@@ -781,8 +781,27 @@ def _peers(own_base) -> dict:
             alive = True
         except (OSError, ValueError):
             pass
-        out[name] = {"dir": str(e["dir"]), "daemon": alive}
+        out[name] = {"dir": str(e["dir"]), "daemon": alive,
+                     **({"made_by": e["made_by"]} if isinstance(e.get("made_by"), dict) else {})}
     return out
+
+
+def _own_scratch(was: dict, own_name: str, task) -> bool:
+    """A project this run's task made itself (`ttp new` records made_by) under the account's scratch folder."""
+    from . import project
+    by = was.get("made_by") or {}
+    if task is None or by.get("project") != own_name or by.get("task") != task:
+        return False
+    root = os.path.realpath(str(project.HOME_DIR / "scratch")) + os.sep
+    return os.path.realpath(str(was.get("dir") or "")).startswith(root)
+
+
+def _run_task(run_dir) -> int | None:
+    try:
+        got = (json.loads((Path(run_dir) / "run.json").read_text()).get("env") or {}).get("TTP_TASK")
+        return int(got) if str(got or "").isdigit() else None
+    except (OSError, ValueError, AttributeError):
+        return None
 
 
 def snapshot_peers(run_dir: Path, own_base) -> None:
@@ -793,7 +812,7 @@ def snapshot_peers(run_dir: Path, own_base) -> None:
 
 def peer_effects(run_dir: Path, own_base, own_name: str) -> list[str]:
     """What the run did to another project of this machine: its registry row gone, its daemon stopped since the
-    spawn (peers-before.json), a call that stopped or disabled another project's unit, a git checkout, reset or
+    spawn (peers-before.json; not a scratch project the run's task made, _own_scratch), a call that stopped or disabled another project's unit, a git checkout, reset or
     clean in another project's folder (a call no guard refused). One line each."""
     out: list[str] = []
     try:
@@ -801,7 +820,10 @@ def peer_effects(run_dir: Path, own_base, own_name: str) -> list[str]:
     except (OSError, ValueError):
         before = {}
     now = _peers(own_base)
+    task = _run_task(run_dir)
     for name, was in sorted(before.items()):
+        if name not in now and _own_scratch(was, own_name, task):
+            continue   # its own scratch project, removed again
         if name not in now:
             out.append(f"project {name}'s registry row was removed")
         elif was.get("daemon") and not now[name]["daemon"]:

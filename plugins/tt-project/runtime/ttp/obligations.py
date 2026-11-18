@@ -1710,8 +1710,9 @@ def open_promises(db) -> list[dict]:
     return [o for o in items(db) if (pr := o.get("promise")) and not pr.get("claim") and _open(o)]
 
 
-def promise_lines(db, now: float | None = None, where=None) -> list[str]:
-    """The digest's section: every open promise, overdue ones first."""
+def promise_lines(db, now: float | None = None, where=None, sender: str = "") -> list[str]:
+    """The digest's section: every open promise, overdue ones first. With `sender` (this project's name),
+    each names the held projects its owner tasks sent notes to (peerhold.promise_note)."""
     now = time.time() if now is None else now
     rows = sorted(open_promises(db), key=lambda o: o["promise"]["due"])
     if not rows:
@@ -1719,8 +1720,20 @@ def promise_lines(db, now: float | None = None, where=None) -> list[str]:
     late = sum(1 for o in rows if now >= o["promise"]["due"])
     out = [f"## Promises made in chat: {len(rows)} open" + (f", {late} OVERDUE" if late else "")
            + " (send each deliverable in its chat; an honest update waits for its digest; close with `obligation` key + evidence)"]
-    out += [f"- {o['id']} {o['text'][:200]} [{_promise_state(o, now, where)}]" for o in rows]
+    out += [f"- {o['id']} {o['text'][:200]} [{_promise_state(o, now, where)}{_peer_hold(sender, o, now, where)}]"
+            for o in rows]
     return out
+
+
+def _peer_hold(sender: str, o: dict, now: float, where) -> str:
+    """'; <project> held until <time>' for a project the promise's owner tasks sent notes to (peerhold)."""
+    from . import peerhold
+    if not sender:
+        return ""
+    try:
+        return peerhold.promise_note(sender, o, where, now)
+    except Exception:
+        return ""
 
 
 def close_promise(db, oid: str, why: str, by: str, now: float | None = None) -> bool:

@@ -1751,7 +1751,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
                               msg_ids, now)
     section("user_words", lines, "\n".join(lines[1:]),
             f"## The user's latest words on blocked items: {len(lines) - 1} lines (as last turn; apply them)")
-    section("promises", obligations.promise_lines(db, now, home))
+    section("promises", obligations.promise_lines(db, now, home, p.name))
     section("eta", safe_eta(lambda: eta.state_lines(db, p, now, host=lambda t: onhost.line(p, t, now)), []))
     section("etacheck", safe_eta(lambda: etacheck.state_lines(db, p, now), []))
     section("stops", safe_eta(lambda: onhost.stop_lines(p, now), []))
