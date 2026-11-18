@@ -207,6 +207,36 @@ def test_occupancy_watchdog_flags_only_device_use_of_the_box(env, monkeypatch):
     assert sorted(f["key"].split(":")[0] for f in out["flags"]) == ["dev", "rst"], out["flags"]
 
 
+def test_occupancy_watchdog_counts_a_host_job_only_against_the_box_it_drives(env, monkeypatch):
+    """A job launched on host H that drives box B over ssh (`ttp lock B -- ssh B ...`, a reset step naming B, a
+    remote job on B) never counts against H while a stream holds H; it counts against B only while B is held and
+    it uses B's own devices. Device work on H itself is still flagged against H."""
+    from ttp import occupancy, project
+    p = make(env)
+    occ = _occ_home(env["home"], monkeypatch)
+    here = project.hostname()
+
+    def flagged(now, tag):
+        base = {"kind": "lock", "start": now, "end": None, "host": here, "task": 9, "cmd": "ssh box-b run"}
+        _watch_with(monkeypatch, [
+            {**base, "id": f"lockb{tag}", "resource": "box-b"},                  # ttp lock box-b -- ssh box-b ...
+            {**base, "id": f"rstb{tag}", "step": "reset", "resource": "box-b"},  # a reset of box-b from H
+            {**base, "id": f"devb{tag}", "resource": "box-b-device"},            # box-b's device lock
+            {**base, "id": f"remb{tag}", "kind": "job", "machine": "box-b"},     # a remote job on box-b
+            {**base, "id": f"devh{tag}", "resource": f"{here}-device", "cmd": "bench"}])   # device work on H
+        return sorted((f["key"].split(":")[0], f["alias"]) for f in occupancy.watch(p, p.db, now, None)["flags"])
+
+    now = time.time()
+    # host_job_driving_other_box_not_flagged: only H is held; nothing that drives box-b counts against H.
+    occ.publish(_OccProj("streamer", p.root, {here: {"cmd": "exit 0"}, "box-b": {"cmd": "exit 1"}}))
+    assert flagged(now, 1) == [("devh1", here)]
+    # device_job_on_held_box_flagged: once box-b is held too, its device work counts against box-b, never H.
+    occ.publish(_OccProj("streamer", p.root, {here: {"cmd": "exit 0"}, "box-b": {"cmd": "exit 0"}}))
+    later = now + occupancy.CACHE_S + 1
+    assert flagged(later, 2) == sorted([("devb2", "box-b"), ("devh2", here), ("lockb2", "box-b"),
+                                        ("remb2", "box-b"), ("rstb2", "box-b")])
+
+
 def test_occupancy_watchdog_never_flags_a_job_that_started_before_the_stream(env, monkeypatch):
     from ttp import occupancy
     p = make(env)
