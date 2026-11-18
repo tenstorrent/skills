@@ -320,8 +320,9 @@ def drive(p: Project, job: dict, say=print) -> dict:
             sel_env = gatejudge.select_env(sel, env) if sel else {}
             claim, sent = (None, cmd) if sel else _spill(p, cmd, at, say)
             try:
-                _, rc = push._run_or_here(sent, tree.path, {**env, "PWD": str(tree.path), **sel_env}, say, got,
-                                          checkcap.Slot)
+                ran, rc = push._run_or_here(sent, tree.path, {**env, "PWD": str(tree.path), **sel_env}, say, got,
+                                            checkcap.Slot)
+                run.hosts.append(push.remote_host(ran) or "this host")
             finally:
                 if claim is not None:
                     claim.close()
@@ -329,6 +330,7 @@ def drive(p: Project, job: dict, say=print) -> dict:
         finally:
             tree.close()
 
+    run.hosts = []   # where each run ran, for _judge's report
     try:
         return _drive(p, job, checks, run)
     except Busy as ex:
@@ -368,22 +370,34 @@ def _judge(p: Project, job: dict, checks: list, run, owned: dict) -> dict:
     sha, points = job["sha"], job["points"]
     flaky: list[str] = []
     cut: list[str] = []   # runs cut short that passed on their rerun
+    after: list[str] = []   # runs whose every test passed, failed after them by a session hook
+    hosts = getattr(run, "hosts", [])
+
+    def on() -> str:
+        return f" on {hosts[-1]}" if hosts else ""
+
     for cmd in checks:
         rc, text = run(sha, cmd)
         if rc == 0:
             continue
         ids, complete = sharedchecks.failing_ids(text)
+        if not ids and (done := sharedchecks.ran_clean(text)):   # a rerun would end the same: none is spent
+            after.append(f"`{cmd}` ran every test{on()} ({done}) but exited {rc} after them: "
+                         + " | ".join(sharedchecks.after_tests(text)))
+            continue
         if not ids or not complete:   # cut short (a host fault, a kill, a crash): it says nothing of the change
+            first = on()
             rc2, text2 = run(sha, cmd)   # so once more, before anything is read into it
             if rc2 == 0:
-                cut.append(f"`{cmd}` exited {rc} without a complete list of failing tests, then passed on a rerun")
+                cut.append(f"`{cmd}` exited {rc}{first} without a complete list of failing tests, then passed on a "
+                           f"rerun{on()}")
                 continue
             ids, complete = sharedchecks.failing_ids(text2)
             if not ids or not complete:
                 return {"outcome": "interrupted", "cmd": str(cmd), "tail": text2[-3000:],
-                        "why": f"`{cmd}` exited {rc}, then {rc2} on a rerun, each time without a complete list of "
-                               "failing tests: the run was cut short (or could not collect its tests), so no test "
-                               "is known to fail and nothing is reverted"}
+                        "why": f"`{cmd}` exited {rc}{first}, then {rc2}{on()} on a rerun, each time without a "
+                               "complete list of failing tests: the run was cut short (or could not collect its "
+                               "tests), so no test is known to fail and nothing is reverted"}
             rc, text = rc2, text2
         again = gatejudge.failed_of(*run(sha, cmd, ids), ids, at="head")
         if again is None:
@@ -413,6 +427,9 @@ def _judge(p: Project, job: dict, checks: list, run, owned: dict) -> dict:
         out = {"outcome": "guilty", "ids": ids, "cmd": str(cmd), "entry": e, "tail": text[-3000:]}
         out.update(revert(p, Path(job["repo"]), job, e, cmd, ids, run))
         return out
+    if after:   # the change's tests pass; what failed the session is named, never reverted
+        return {"outcome": "session_failed", "ids": flaky, "why": "; ".join(after) + "; no test fails and nothing "
+                "is reverted"} | ({"rerun": cut} if cut else {})
     if flaky:
         from .budget import task_default_usd
         cfg, now = p.config(), time.time()

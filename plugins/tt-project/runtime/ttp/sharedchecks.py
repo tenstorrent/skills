@@ -92,6 +92,25 @@ def failing_ids(output: str) -> tuple[list[str], bool]:
     return ids, n == len(lines)
 
 
+def ran_clean(output: str) -> str:
+    """pytest's last summary line when it ran to its end with tests passed and none failed or in error, so a
+    non-zero exit came after the tests (a session hook such as a conftest guard), else ''."""
+    s = _SUMMARY.findall(output or "")
+    if not s or stopped_early(output) or re.search(r"\b\d+ (?:failed|errors?)\b", s[-1]) \
+            or not re.search(r"\b\d+ passed\b", s[-1]):
+        return ""
+    return s[-1]
+
+
+def after_tests(output: str, n: int = 6) -> list[str]:
+    """The first `n` lines pytest printed after its last test ran (past the [100%] progress mark), where a
+    session hook says why it failed the run."""
+    text = output or ""
+    i = text.rfind("[100%]")
+    return [ln.strip()[:300] for ln in text[i + 6:].splitlines()
+            if ln.strip() and not _SUMMARY.match(ln.strip())][:n] if i >= 0 else []
+
+
 # pytest stopped before the end (-x/--maxfail, an interrupt or collection errors): the tests after the
 # stop never ran, so the failing ids are not all the failures there are.
 _STOPPED = re.compile(r"^!+ (?:stopping after \d+ failures?|.*KeyboardInterrupt.*) !+$|^Interrupted: |^KeyboardInterrupt$", re.M)

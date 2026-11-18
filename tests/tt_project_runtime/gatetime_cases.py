@@ -426,11 +426,30 @@ def test_post_land_run_cut_short_twice_is_reported_interrupted_never_failed_nor_
     postland.tend(p2, p2.config())
     assert postland.tend(p2, p2.config()) == "interrupted"
     last = p2.db.kv(postland.KEY)["last"]
-    assert last["outcome"] == "interrupted" and "exited 2, then 2 on a rerun" in last["why"]
+    assert last["outcome"] == "interrupted" and "exited 2 on this host, then 2 on this host on a rerun" in last["why"]
     (ev,) = p2.db.q("SELECT * FROM events WHERE text LIKE ?", (f"Post-landing checks on {pushed2[:10]}: interrupted:%",))
     assert "cut short" in ev["text"] and "unattributed" not in ev["text"]
     assert not p2.db.q("SELECT id FROM tasks WHERE title LIKE 'Revert%' OR title LIKE 'Fix%'")
     assert not p2.db.q("SELECT id FROM push_queue WHERE status='approved'")
+
+
+def test_post_land_run_whose_tests_all_pass_but_a_session_guard_fails_is_named_so_and_never_rerun(
+        env, tmp_path, monkeypatch):
+    """Every test passed, then a session hook (a conftest guard) exited 1: no rerun is spent (it would end
+    the same), and the report names the host and the guard's own lines, never 'cut short', nor a revert."""
+    from ttp import postland
+    n = tmp_path / "count"
+    check = (f"sh -c \"echo x >> {n}; echo '.... [100%]guard: tests wrote outside their temp folders:'; "
+             f"echo '  tree/stray.log: created'; echo; echo '4 passed, 1 skipped in 0.10s'; exit 1\"")
+    p, g, pushed, _ = _pl_land(env, tmp_path, monkeypatch, check)
+    postland.tend(p, p.config())
+    assert postland.tend(p, p.config()) == "session_failed"
+    assert len(n.read_text().split()) == 1, "no rerun spent"
+    (ev,) = p.db.q("SELECT * FROM events WHERE text LIKE ?", (f"Post-landing checks on {pushed[:10]}: session_failed:%",))
+    assert "ran every test on this host (4 passed, 1 skipped in 0.10s) but exited 1" in ev["text"]
+    assert "tests wrote outside their temp folders: | tree/stray.log: created" in ev["text"]
+    assert "cut short" not in ev["text"] and ev["kind"] == "observation" and ev["status"] == "queued"
+    assert not p.db.q("SELECT id FROM tasks WHERE title LIKE 'Revert%' OR title LIKE 'Fix%'")
 
 
 _PL_X = "tests/t.py::test_x"
