@@ -296,6 +296,10 @@ class Codex(Provider):
         if effort:
             argv += ["-c", f"model_reasoning_effort={effort}"]
         argv += ["-c", "approval_policy=never"]
+        # Commands run as `<shell> -c`, not `-lc`: a login shell's profile (macOS path_helper, a PATH line
+        # in ~/.profile) puts its own folders before the run's harness bin, so a bare `gh` or `git` would
+        # skip the run's wrappers. Older builds ignore the key.
+        argv += ["-c", "allow_login_shell=false"]
         if read_only:
             # A decision-only turn: no user config, MCP servers or execpolicy rules, as Claude's --restricted.
             argv += self._ignore_user_config() + ([IGNORE_RULES] if self._exec_flag(IGNORE_RULES) else [])

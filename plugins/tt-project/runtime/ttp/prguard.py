@@ -15,6 +15,9 @@ It refuses, whatever the agent or provider:
 - with `delivery.pr_body_check` set, `gh pr create`, a `gh pr edit` that sets the body and a
   `gh api` REST or GraphQL call that writes a PR body when the project's own PR body check refuses
   the body (prbody); also `gh issue edit` and issue body edits, when the target is a PR.
+- in every project, a PR body (`gh pr create`, `gh pr edit` that sets it, a `gh api` REST POST or
+  PATCH to a pulls endpoint, GraphQL createPullRequest/updatePullRequest) that names internal
+  tt-project references or is longer than its word cap (body_form_problem); the run rewrites it.
 REST routes match `repos/<o>/<r>/...` and its alias `repositories/<id>/...`; GraphQL matches the
 `graphql` endpoint however it is spelled (`/graphql`, `graphql/`, any case, a full URL, GitHub
 Enterprise's `https://<host>/api/graphql`). PRs named by a full URL are looked up on its host.
@@ -55,9 +58,11 @@ from __future__ import annotations
 import json
 import os
 import re
+import unicodedata
 import select
 import shlex
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -586,6 +591,147 @@ def _body_problem(sub: str, args: list[str], real: str, stdin_text: str | None, 
     return prbody.problem(sub, args, _project_config() if cfg is None else cfg, real, stdin_text)
 
 
+# --- the form of a PR body, in every project ---------------------------------------------------
+
+PR_BODY_MAX_WORDS = 300   # delivery.pr_body_max_words: words of prose a PR body may hold
+# A count after "run 3", "review 2", "ask 3": the noun it counts, so the phrase is prose, not an id.
+_COUNTED = (r"(?:time|job|test|iteration|step|sec(?:ond)?|s|ms|min(?:ute)?|h|hr|hour|day|worker|thread|"
+            r"process(?:e)?|core|device|chip|card|board|node|host|machine|[gc]pu|batch(?:e)?|epoch|sample|"
+            r"case|file|model|layer|token|request|round|trial|pass(?:e)?|cycle|loop|seed|shard|replica|"
+            r"instance|container|question|item|check|build|benchmark|quer(?:y|ie)|more)s?\b|"
+            r"people\b|persons?\b|x\b|in\s+parallel\b|at\s+once\b|concurrently\b|each\b|per\b")
+# A number, or a range of two (3-4, 3 to 4), taken whole (the lookahead keeps it from backtracking).
+_NUM = r"(?=(?P<n>\d+(?:\s*(?:-|–|to|or)\s*\d+)?))(?P=n)(?![.,]?\w)"
+INTERNAL_REF_RES = (
+    # run 250, runs 250 and 290, rerun 12; never "run 3 times", "runs on N150", "test run"
+    re.compile(rf"\b(?:re-?)?(?:runs?|reviews?|tasks?|asks?)(?:\s*#\s*\d+\b|\s+{_NUM}(?!\s+(?:{_COUNTED})))", re.I),
+    re.compile(r"\b(?:user\s+)?(?:msgs?|messages?)\s*#\s*\d+\b|\b(?:user\s+)?msgs?\s+\d+\b", re.I),
+    re.compile(r"(?<![-\w./])o\d{2,}\b"),                   # an obligation id (o1084); not -O2 or o3
+    re.compile(r"\bttp/t\d+[\w./-]*|(?<![-\w./])t\d{2,}-[a-z](?:[\w./-]*\w)?"),   # a task's branch (t8900-fix-x); not t3000
+    re.compile(r"\btt-project/(?:state|worktrees)\b[\w./-]*|\bworktrees/t\d+[\w./-]*|\bstate/runs?/\d+[\w./-]*"),
+)
+_HTML_COMMENT_RE = re.compile(r"<!--.*?(?:-->|\Z)", re.S)
+_FENCE_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,}).*?(?:^[ \t]{0,3}\1[ \t]*$|\Z)", re.S | re.M)
+_PROSE_WORD_RE = re.compile(r"[^\W_]")
+_TEMPLATE_DIRS = ("", ".github", "docs")
+FORM_HOW = ("Rewrite the body and retry: 2-3 sentences of why on top, then what changed and how it was "
+            "tested, no internal run, task or review ids")
+
+
+def internal_refs(body: str) -> list[str]:
+    """The internal tt-project references a PR body names, in order: run, task, review, ask and user
+    message ids (`run 250`, `task #29`, `review #45`; a bare number followed by a counted noun, as in
+    `run 3 times`, is prose), obligation ids (o1084), task branches (ttp/t12-x, t8900-x), and
+    paths into a project's state/ or worktrees/, read with invisible characters (zero-width, soft hyphen)
+    dropped. GitHub refs (#12, owner/repo#12, URLs), shas, versions and hardware names (t3000) are not."""
+    body = "".join(c for c in body or "" if unicodedata.category(c) != "Cf")
+    found = [(m.start(), m.group(0).strip()) for r in INTERNAL_REF_RES for m in r.finditer(body)]
+    return list(dict.fromkeys(t for _, t in sorted(found)))
+
+
+def _template_lines(cwd: str | None) -> set[str]:
+    """The lines of the repo's PR templates (root, .github/ or docs/; a file or a folder of them, any
+    case), stripped; from the git top of `cwd`."""
+    top = _git_out(cwd, "rev-parse", "--show-toplevel")
+    out: set[str] = set()
+    if not top:
+        return out
+    for sub in _TEMPLATE_DIRS:
+        d = Path(top, sub)
+        try:
+            entries = list(d.iterdir())
+        except OSError:
+            continue
+        for e in entries:
+            name = e.name.lower()
+            files = ([e] if name == "pull_request_template.md" else sorted(e.glob("*.md"))
+                     if name == "pull_request_template" and e.is_dir() else [])
+            for f in files:
+                try:
+                    out.update(x.strip() for x in f.read_text(errors="replace").splitlines())
+                except OSError:
+                    continue
+    out.discard("")
+    return out
+
+
+def prose_words(body: str, template: set[str] = frozenset()) -> int:
+    """Words of prose in a PR body: HTML comments, fenced code blocks and lines found unchanged in the
+    repo's PR template (`template`) do not count, nor tokens without a letter or digit."""
+    text = _FENCE_RE.sub("", _HTML_COMMENT_RE.sub("", body or ""))
+    return sum(1 for line in text.splitlines() if line.strip() not in template
+               for w in line.split() if _PROSE_WORD_RE.search(w))
+
+
+def max_words(cfg: dict) -> int:
+    v = (cfg.get("delivery") or {}).get("pr_body_max_words")
+    return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else PR_BODY_MAX_WORDS
+
+
+def body_form_problem(bodies: list[str], cfg: dict, cwd: str | None = None) -> str | None:
+    """Why PR `bodies` may not be sent: internal references, or more words of prose than the cap
+    (delivery.pr_body_max_words, default PR_BODY_MAX_WORDS; only project config raises it)."""
+    bodies = [b for b in bodies if b and b.strip()]
+    if not bodies:
+        return None
+    refs = list(dict.fromkeys(r for b in bodies for r in internal_refs(b)))
+    cap, template = max_words(cfg), None
+    why = []
+    if refs:
+        why.append("it names internal tt-project references (" + ", ".join(repr(r) for r in refs[:12]) + ")")
+    for b in bodies:
+        if len(b.split()) <= cap:
+            continue
+        template = _template_lines(cwd) if template is None else template
+        if (n := prose_words(b, template)) > cap:
+            why.append(f"it has {n} words of prose, over the cap of {cap} (delivery.pr_body_max_words)")
+            break
+    return f"refused: the PR body is not sent: {'; '.join(why)}. {FORM_HOW}." if why else None
+
+
+def _read_body(path: str, stdin_text: str | None) -> str | None:
+    """A body file's text (stdin as the wrapper read it); None when gh will not read it either. A pipe
+    or device other than stdin is refused: reading it here would leave gh nothing."""
+    if path in STDIN_PATHS:
+        return stdin_text
+    try:
+        if not stat.S_ISREG(os.stat(path).st_mode):
+            raise ValueError(f"refused: pass the PR body in a regular file (--body-file <path>), not {path!r}")
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _form_problem(sub: str, args: list[str], stdin_text: str | None, cfg: dict | None) -> str | None:
+    """body_form_problem for the body `gh pr create|edit <args>` sets (none: --fill, an editor)."""
+    from .prbody import CREATE_VALUES, EDIT_VALUES, _scan
+    opts, _ = _scan(args, CREATE_VALUES if sub == "create" else EDIT_VALUES)
+    try:
+        bodies = [opts[k] for k in ("--body", "-b") if k in opts]
+        bodies += [b for k in ("--body-file", "-F") if k in opts
+                   for b in [_read_body(opts[k], stdin_text)] if b is not None]
+    except ValueError as e:
+        return str(e)
+    return body_form_problem(bodies, _project_config() if cfg is None else cfg) if bodies else None
+
+
+def _api_form_problem(args: list[str], stdin_text: str | None, cfg: dict | None) -> str | None:
+    """body_form_problem for a PR body a `gh api` call writes: a REST POST/PATCH to a pulls endpoint
+    (`body` field, --input JSON) or a GraphQL createPullRequest/updatePullRequest."""
+    from . import prbody
+    endpoint, method = _api_target(args)
+    rest = REST_PR_RE.match(endpoint) and method in ("POST", "PATCH")
+    if not rest and endpoint.strip("/").lower() != "graphql":
+        return None
+    try:
+        bodies = (prbody._rest_bodies(args, stdin_text, None) if rest else
+                  prbody._graphql_bodies(args, stdin_text, None, match=prbody.GQL_PR_ONLY_RE.search, issues=False)[1])
+    except prbody._Unread:
+        return None   # gh cannot send what it cannot read either
+    return body_form_problem(bodies, _project_config() if cfg is None else cfg)
+
+
 # --- reading a gh command line ----------------------------------------------------------------
 
 def _opts(args: list[str], names: tuple[str, ...]) -> list[str]:
@@ -799,7 +945,8 @@ def check(args: list[str], real: str, db=None, stdin_text: str | None = None, _d
             if "--dry-run" in more:
                 return None
             if any(a in ("-d", "--draft", "--draft=true") for a in more):
-                return _checks_problem() or _body_problem("create", more, real, stdin_text, cfg)
+                return (_form_problem("create", more, stdin_text, cfg) or _checks_problem()
+                        or _body_problem("create", more, real, stdin_text, cfg))
             return "refused: PRs are opened as drafts only; add --draft. " + HOW
         if sub == "ready":
             if "--undo" in more:
@@ -815,7 +962,7 @@ def check(args: list[str], real: str, db=None, stdin_text: str | None = None, _d
         if sub == "edit":
             if _humans(_opts(more, ("--add-reviewer",))):
                 return _no_reviewers(seen, " ".join(more))
-            return _body_problem("edit", more, real, stdin_text, cfg)
+            return _form_problem("edit", more, stdin_text, cfg) or _body_problem("edit", more, real, stdin_text, cfg)
     if cmd == "issue" and rest[:1] == ["edit"]:   # a PR is an issue: this may rewrite a PR's body
         from . import prbody
         return prbody.issue_problem(rest[1:], _project_config() if cfg is None else cfg, real, stdin_text)
@@ -828,7 +975,8 @@ def check(args: list[str], real: str, db=None, stdin_text: str | None = None, _d
         if why:
             return why
     if cmd == "api":
-        return _check_api(rest, real, db, stdin_text, allowed, seen) or _api_body_problem(rest, real, stdin_text, cfg)
+        return (_check_api(rest, real, db, stdin_text, allowed, seen) or _api_form_problem(rest, stdin_text, cfg)
+                or _api_body_problem(rest, real, stdin_text, cfg))
     return None
 
 
@@ -1197,16 +1345,16 @@ def main(argv: list[str], own_dir: str) -> int:
     if why:
         print(f"gh (tt-project): {why}", file=sys.stderr)
         return 1
-    stdin_text = None
+    stdin_text = stdin_raw = None   # stdin_raw: the bytes gh gets as they came, when a check read them
     if args[:1] == ["api"] and ("-" in _opts(args, ("--input",))
                                 or any(f.endswith("=@-") for f in _opts(args, ("-F", "--field")))):
         stdin_text = sys.stdin.read()
     elif args[:2] in (["pr", "create"], ["pr", "edit"], ["issue", "edit"]):
         from .prbody import CREATE_VALUES, EDIT_VALUES, _scan
         given, _ = _scan(args[2:], CREATE_VALUES if args[1] == "create" else EDIT_VALUES)
-        if "-" in (given.get("--body-file"), given.get("-F")):   # the body check reads it, then gh
-            stdin_text = sys.stdin.read()
-    stdin_raw = None   # bytes gh gets as they came, when the AI-authorship check read them (aitag)
+        if STDIN_PATHS.intersection((given.get("--body-file"), given.get("-F"))):   # the body checks read it, then gh
+            stdin_raw = sys.stdin.buffer.read()
+            stdin_text = stdin_raw.decode("utf-8", "replace")
     if stdin_text is None and needs_stdin(args) and (args[:1] == ["api"] or tuple(args[:2]) in AITAG_STDIN):
         stdin_raw = sys.stdin.buffer.read()
         stdin_text = stdin_raw.decode("utf-8", "replace")

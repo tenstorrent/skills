@@ -265,9 +265,9 @@ def test_pr_body_check_unset_leaves_gh_api_calls_unchanged(env, tmp_path, monkey
     p, gh, seen = _pr_body_project(env, tmp_path)
     from ttp import prbody, prguard
 
-    def no_read(*a, **k):
-        raise AssertionError("a body was read while the check is unset")
-    monkeypatch.setattr(prbody, "_read", no_read)
+    def no_run(*a, **k):   # every PR body is read for its form (prguard.body_form_problem), never checked
+        raise AssertionError("the check ran while it is unset")
+    monkeypatch.setattr(prbody, "_run", no_run)
     calls = [["api", "-X", "PATCH", "repos/acme/widgets/pulls/7", "-f", "body=no type"],
              ["api", "-X", "PATCH", "repos/acme/widgets/pulls/7", "--input", "-"],
              ["api", "repos/acme/widgets/pulls", "-F", "draft=true", "-F", "body=@-"],

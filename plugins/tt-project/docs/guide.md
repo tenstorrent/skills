@@ -3897,6 +3897,14 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   high; a ready one raises `pr_clean` once per head, and the coordinator then asks the user for a
   draft review. The daily review's `GitHub purview` line counts drafts by state and the age of the
   oldest stalled one. Runs never mark a PR ready, merge it or request reviewers.
+- Every project's worker `gh` refuses a PR body (`gh pr create`, `gh pr edit` that sets it, a `gh api`
+  POST or PATCH to a pulls endpoint, GraphQL `createPullRequest`/`updatePullRequest`) that names
+  internal references (`run 250`, `task #29`, `review #45`, obligation ids, `ttp/t<id>` branches,
+  paths into `state/` or `worktrees/`; a count such as `run 3 times` is prose) or holds more than
+  `delivery.pr_body_max_words` (default 300) words of prose; HTML comments, fenced code and lines
+  unchanged from the repo's PR template do not count. Nothing is sent and the run rewrites the body:
+  2-3 sentences of why on top, then what changed and how it was tested. Only project config raises
+  the cap.
 - `delivery.pr_body_check` (off by default) turns a project's own PR body rules into a model-free
   guard: a worker's `gh pr create`, and a `gh pr edit` that sets the body, first run the command it
   names on the body (from `--body`, `--body-file` or `-F`; on stdin and as the file in

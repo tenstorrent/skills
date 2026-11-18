@@ -15,7 +15,8 @@ run. A call whose result is already in the stream when the check ends (the comma
 the run: the runner records a warning instead (WARN_FILE, also GUARD_LOG and progress.md), the run goes on
 (a secret refusal of an untrusted run still stops it: must_stop), and the daemon turns the warnings into
 one event when the run ends. Every record names the call's id and its stage (started: stopped while it
-ran; finished: it had already run). Rewrites and hints the hook would add are not applied. Runs whose provider passes the harness hook
+ran; finished: it had already run). Rewrites and hints the hook would add are not applied; a
+call that reads untrusted text marks the run as the hook's PostToolUse does (hook.mark_untrusted). Runs whose provider passes the harness hook
 (Provider.harness_hook) or whose hook already ran when it started (hook.HOOKED_FILE) are left alone; the
 marker is read before the agent starts, since the agent could write it itself."""
 from __future__ import annotations
@@ -150,6 +151,8 @@ def _main() -> int:
         out, _ = hook.pre_tool_use(payload, stage="started")
     except Exception:
         return 0
+    if os.environ.get("TTP_RUN_DIR"):   # the hook's PostToolUse mark, which these runs never get
+        hook.mark_untrusted(payload, os.environ["TTP_RUN_DIR"])
     spec = (out or {}).get("hookSpecificOutput") or {}
     if spec.get("permissionDecision") == "deny":
         print(str(spec.get("permissionDecisionReason") or "refused"))

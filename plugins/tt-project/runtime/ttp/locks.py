@@ -1523,6 +1523,21 @@ def landing_first(q: list[Path], now: float | None = None) -> list[Path]:
     return front + [t for t in q if t not in front]
 
 
+def shared_behind(q: list[Path]) -> list[Path]:
+    """`q` with each shared waiter moved to just after the last exclusive waiter there that arrived before
+    it: urgency, landing and fairness order exclusive waiters among themselves and shared ones among
+    themselves, but a shared waiter never passes an older exclusive one (its hold would keep that one
+    out for as long as shared holders keep coming). Exclusive waiters keep their places, so none waits
+    on a shared one held back behind it."""
+    q = list(q)
+    for s in [t for t in q if is_shared(t)]:
+        i = q.index(s)
+        older = [j for j, t in enumerate(q) if j > i and not is_shared(t) and _arrival(t) < _arrival(s)]
+        if older:
+            q.insert(older[-1], q.pop(i))
+    return q
+
+
 def is_shared(ticket: Path) -> bool:
     return ticket.name.endswith(SHARED_TICKET)
 
@@ -1768,7 +1783,7 @@ def my_turn(locks_dir: Path, resource: str, ticket: Path, slots: int, fair: bool
     """Whether this ticket may take the resource now. An exclusive one: among the first `slots`
     waiters (urgent tickets, task priority URGENT_PRIORITY or better, before the rest), one per free
     slot, with no shared waiter ahead. A shared one: no exclusive waiter
-    ahead, so it never jumps one. `fair`: waiters are counted in fair_order (with `urgent_max`), not
+    ahead, and never ahead of an older exclusive one, urgent or landing or not (shared_behind). `fair`: waiters are counted in fair_order (with `urgent_max`), not
     arrival order (and `aged_before`, `aged_turns`, `bare_last`, `share` as there). Either way landing waiters go first (landing_first). `past_multi`
     (a waiter that holds locks already): waiters for several resources at
     once ahead are not counted, as one of them may wait for a lock this waiter's holder has: waiting
@@ -1780,7 +1795,7 @@ def my_turn(locks_dir: Path, resource: str, ticket: Path, slots: int, fair: bool
         q = fair_order(locks_dir, resource, q, urgent_max, aged_before, aged_turns, bare_last, share)
     else:   # urgent waiters (an urgent task's) first, a user-ordered one (priority 0) before them, arrival
         q = sorted(q, key=lambda t: min(ticket_priority(t), URGENT_PRIORITY + 1))   # order within: plain arrival
-    q = landing_first(q)
+    q = shared_behind(landing_first(q))
     ahead = [t for t in q[:q.index(ticket)] if not (past_multi and is_multi(t))]
     if is_shared(ticket):
         return all(is_shared(t) for t in ahead)

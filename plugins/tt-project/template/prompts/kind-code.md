@@ -90,7 +90,8 @@
   `ttp push --own-branch --detach` then publishes your own branch under its own name.
 - Every review comment (bot or human) and CI failure on your PR is part of the work: fix it, or
   briefly answer on the PR why not, until CI is green.
-- Description: what improved and why, one line of how, key numbers.
+- Description: 2-3 sentences of why on top, then what changed and how it was tested, no internal
+  run, task or review ids, under the word cap (`gh` refuses a body that breaks this; rewrite it).
   Keep it and your PR comments current.
 - Every PR comment or review you post ends with the hidden line `<!-- ttp -->`, so the PR watcher
   skips it.

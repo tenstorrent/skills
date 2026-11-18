@@ -343,3 +343,12 @@ def test_harness_hook_commands_never_import_files_from_the_worktree(tmp_path):
         r = subprocess.run(["sh", "-c", cmd], input=payload, capture_output=True, text=True, cwd=wt, env=env,
                            timeout=60)
         assert '"deny"' in r.stdout, (name, cmd, r.stdout, r.stderr[-500:])
+
+
+def test_a_hookless_run_that_reads_a_download_is_marked_untrusted_and_stopped_at_a_gh_write(tmp_path, monkeypatch):
+    from ttp import streamguard, untrusted
+    ex, run_dir = _sg_run(tmp_path, monkeypatch, "codex", [
+        _sg_codex_line("curl -sL https://example.com/a.tar.gz -o a.tgz"),
+        _sg_codex_line("gh pr edit 12 --body x")])
+    assert untrusted.marked(run_dir) == ["download"], "the hook's PostToolUse mark, which this run never gets"
+    assert ex["stopped"] == "guard" and "untrusted" in streamguard.take(run_dir)["why"]

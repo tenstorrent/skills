@@ -16026,6 +16026,7 @@ def test_codex_worker_launches_on_stdin_and_hands_off(env, monkeypatch):
     cwd = str(env["repo"])
     assert argv[1:3] == ["exec", "--json"] and argv[argv.index("-C") + 1] == cwd
     assert argv[argv.index("-s") + 1] == "workspace-write" and "approval_policy=never" in argv
+    assert "allow_login_shell=false" in argv, "a login shell's profile could put the real gh before the shim"
     assert "model_reasoning_effort=low" in argv and "sandbox_workspace_write.network_access=true" in argv
     assert any(a.startswith("sandbox_workspace_write.writable_roots=") for a in argv)
     assert "--output-schema" not in argv and argv[-1] == "-", "the prompt must arrive on stdin"

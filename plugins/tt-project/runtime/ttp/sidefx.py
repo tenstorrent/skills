@@ -12,7 +12,8 @@ Edit, MultiEdit, NotebookEdit, apply_patch, a Codex file_change, an MCP write to
 the run's working directory and run dir. A shell command counts when it redirects into a file or runs
 a writing verb; any command naming a path under the home's config or credential folders counts too.
 Text that names no local path is left out first: a grep-like pattern, an awk or sed regex literal, a
-'path' with regex anchors or escapes, a comparison such as `>=`, and an ssh remote command; so is
+'path' with regex anchors or escapes, a comparison such as `>=`, an ssh remote command and a heredoc's
+body (data, unless a shell or interpreter runs it); so is
 Claude Code's saved large tool output (~/.claude/projects/*/tool-results), which the model only reads.
 The list (paths only, never a command's text or a file's contents) goes to the run dir's
 outside.json, to the next run of the task as one prompt block (still named when a later run also ends
@@ -77,6 +78,9 @@ GIT_OPTS = set("Cc") | {"--git-dir", "--work-tree", "--namespace", "--config-env
 LOCAL_TEXT_MAX = 50000   # longer commands (a big heredoc) are read as they are
 TOOL_OUTPUT_RE = re.compile(r"/\.claude/projects/[^/]+/tool-results(?:/|$)")
 HARMLESS = ("/dev/null", "/dev/stdout", "/dev/stderr", "/dev/fd/", "/dev/tty", "/proc/self/")
+# A heredoc operator and its end word (not a here-string <<<, nor a shift such as $((1<<2)))
+HEREDOC_RE = re.compile(r"(?<!<)<<(-?)[ \t]*(?:'([^'\n]+)'|\"([^\"\n]+)\"|\\?([A-Za-z_][\w.@%+-]*))")
+ASSIGN_RE = re.compile(r"[A-Za-z_]\w*=.*", re.S)
 
 
 def _expand(path: str, home: str, cwd: str, run_dir: str, base: str | None = None) -> str:
@@ -88,6 +92,48 @@ def _expand(path: str, home: str, cwd: str, run_dir: str, base: str | None = Non
     if not p.startswith("/"):
         p = os.path.join(base or cwd, p)
     return os.path.normpath(p)
+
+
+def _heredocs(cmd: str) -> str:
+    """`cmd` with each heredoc's body taken out: the text it feeds a command is data, not commands run or
+    paths written. A body fed to a shell or an interpreter (`bash <<EOF`, `python3 - <<EOF`) runs, so it
+    stays as that command's `-c` script. A heredoc whose end line is missing is kept as it is."""
+    out, pos = [], 0
+    while (m := HEREDOC_RE.search(cmd, pos)):
+        nl = cmd.find("\n", m.end())
+        if nl < 0:
+            break
+        line, at, parts, ok = cmd.rfind("\n", 0, m.start()) + 1, nl + 1, [], True
+        for o in HEREDOC_RE.finditer(cmd, m.start(), nl):   # each body follows the line, in order
+            word = o.group(2) or o.group(3) or o.group(4)
+            end = re.compile("^" + ("\t*" if o.group(1) else "") + re.escape(word) + "$", re.M).search(cmd, at)
+            if not end:
+                ok = False
+                break
+            seg = re.split(r"[;&|(]", cmd[line:o.start()])[-1].split()
+            name = next((w for w in seg if not ASSIGN_RE.fullmatch(w) and w not in PREFIXES), "").rsplit("/", 1)[-1]
+            parts.append((o, f"-c {shlex.quote(cmd[at:end.start()])}" if name in SHELLS | INTERPS else ""))
+            at = end.end() + 1
+        if not ok:
+            break
+        out.append(cmd[pos:m.start()])
+        k = m.start()
+        for o, rep in parts:
+            out.append(cmd[k:o.start()] + rep)
+            k = o.end()
+        out.append(cmd[k:nl + 1])
+        pos = min(at, len(cmd))
+    return "".join(out) + cmd[pos:]
+
+
+def _tokens(cmd: str) -> list[str] | None:
+    """`cmd`'s words and operators as the shell splits them (a heredoc's body out), or None when it cannot."""
+    try:
+        lex = shlex.shlex(_heredocs(cmd), posix=True, punctuation_chars="();<>|&\n")
+        lex.whitespace, lex.whitespace_split, lex.commenters = " \t\r", True, ""
+        return list(lex)
+    except ValueError:
+        return None
 
 
 def _inside(path: str, roots: list[str]) -> bool:
@@ -111,14 +157,9 @@ def sensitive(path: str, home: str) -> bool:
 def _local_text(cmd: str, depth: int = 0) -> str:
     """`cmd` with the words that name no local path blanked: a grep-like pattern, an awk or sed program's
     regex literals and an ssh remote command (the remote host's paths); a `sh -c` script is read the same
-    way. Text the shell cannot split is kept as it is."""
-    if len(cmd) > LOCAL_TEXT_MAX:
-        return cmd
-    try:
-        lex = shlex.shlex(cmd, posix=True, punctuation_chars="();<>|&\n")
-        lex.whitespace, lex.whitespace_split, lex.commenters = " \t\r", True, ""
-        toks = list(lex)
-    except ValueError:
+    way; a heredoc's body is taken out (_heredocs). Text the shell cannot split is kept as it is."""
+    cmd = _heredocs(cmd)
+    if len(cmd) > LOCAL_TEXT_MAX or (toks := _tokens(cmd)) is None:
         return cmd
     spans, at = [], 0   # each word's place in cmd (None when quoting changed its text)
     for t in toks:
@@ -415,12 +456,8 @@ def commands(cmd: str, depth: int = 0) -> list[str]:
     """Each simple command `cmd` runs, as its words without redirects, an argument holding a space (quoted
     text: a commit message, an echo's) as `_` and an empty one as '' (a `bash -c` script's own commands in
     its place): what a check for a command's words reads, so a tool's name inside a quoted argument is no
-    run of it. [cmd] when the shell cannot split it."""
-    try:
-        lex = shlex.shlex(cmd, posix=True, punctuation_chars="();<>|&\n")
-        lex.whitespace, lex.whitespace_split, lex.commenters = " \t\r", True, ""
-        toks = list(lex)
-    except ValueError:
+    run of it, nor is a heredoc's body (_heredocs). [cmd] when the shell cannot split it."""
+    if (toks := _tokens(cmd)) is None:
         return [cmd]
     out: list[str] = []
 
@@ -453,12 +490,8 @@ def classify_paths(cmd: str, home: str, cwd: str, run_dir: str, depth: int = 0) 
     target, a writing verb's target, a copy's destination, inline code that writes), `executed` (the
     command word, a script an interpreter runs), `read` (an input redirect, a reader's or copy's source)
     or `mentioned` (any other argument); the strongest per path. A `bash -c` script is read the same way,
-    its reasons naming it. {} when the shell cannot split it."""
-    try:
-        lex = shlex.shlex(cmd, posix=True, punctuation_chars="();<>|&\n")
-        lex.whitespace, lex.whitespace_split, lex.commenters = " \t\r", True, ""
-        toks = list(lex)
-    except ValueError:
+    its reasons naming it; a heredoc's body is data (_heredocs). {} when the shell cannot split it."""
+    if (toks := _tokens(cmd)) is None:
         return {}
     punct = [bool(t) and all(c in "();<>|&\n" for c in t) for t in toks]   # an empty argument ('') is a word
     out: dict[str, tuple[str, str]] = {}
@@ -547,6 +580,9 @@ def classify_paths(cmd: str, home: str, cwd: str, run_dir: str, depth: int = 0) 
             for a in paths[:1]:
                 put(a, "executed", f"{name} runs it")
         else:
+            if name in PROGS - {"sed"}:   # an awk program's own `print > "/file"`
+                for m in (m for a in paths for m in REDIRECT_RE.finditer(a)):
+                    put(m.group(1), "write", f"{name} program's output file")
             for a in paths:
                 put(a, "read" if name in READERS else "mentioned", f"{name} argument")
     return out
@@ -575,10 +611,23 @@ def _classes(it: dict, home: str, cwd: str, rd: str) -> dict[str, tuple[str, str
         return {_expand(it["what"], home, cwd, rd): ("write", f"{it['tool']} edit")}
     what = _local_text(it["what"])
     named = _shell_paths(what, home, cwd, rd)
-    writes = bool(WRITE_RE.search(what) or REDIRECT_RE.search(what))
+    if _tokens(what) is None:   # unsplit: any write-like text makes each path it names a probable write
+        writes = bool(WRITE_RE.search(what) or REDIRECT_RE.search(what))
+        return {p: ("write", "redirect or tee target") if writes else ("mentioned", "named")
+                for p in named if writes or sensitive(p, home)}
     cls = classify_paths(what, home, cwd, rd)
-    return {p: cls.get(p) or ("write", "redirect or tee target") if writes else cls.get(p) or ("mentioned", "named")
-            for p in named if writes or sensitive(p, home)}
+    for c in commands(what):   # a writing verb classify_paths does not model (git clone, unzip) writes what it names
+        c = " ".join(w for w in c.split() if not ASSIGN_RE.fullmatch(w))
+        if WRITE_RE.search(c):
+            for p in _shell_paths(c, home, cwd, rd):
+                if cls.get(p, ("mentioned",))[0] == "mentioned":
+                    cls[p] = ("write", "named by a writing command")
+    if any(v[0] == "write" and "$" in p for p, v in cls.items()):   # a write through a variable may hit any path named
+        for p in named:
+            if cls.get(p, ("mentioned",))[0] == "mentioned":
+                cls[p] = ("write", "redirect or tee target")
+    writes = any(v[0] == "write" for v in cls.values())
+    return {p: cls.get(p) or ("mentioned", "named") for p in named if writes or sensitive(p, home)}
 
 
 def scan(run_dir: Path, cwd: str, home: str | None = None) -> list[dict]:
@@ -750,14 +799,14 @@ def peer_effects(run_dir: Path, own_base, own_name: str) -> list[str]:
     for it in items(Path(run_dir), own_only=True):
         if it["kind"] != "shell" or it["status"] == "refused":
             continue
-        cmd = it["what"]
-        for m in UNIT_STOP_RE.finditer(cmd):
-            if m.group(2) != own_name:
-                out.append(f"`systemctl {m.group(1)}` of another project's unit tt-project-{m.group(2)}")
-        if (g := GIT_REWRITE_RE.search(cmd)):
-            for n, f in sorted(folders.items()):
-                if re.search(re.escape(f) + r"(?:/|\b)", cmd):
-                    out.append(f"`git {g.group(1)}` in project {n}'s folder {f}")
+        for cmd in commands(it["what"]):   # commands run, not quoted text or a heredoc's body
+            for m in UNIT_STOP_RE.finditer(cmd):
+                if m.group(2) != own_name:
+                    out.append(f"`systemctl {m.group(1)}` of another project's unit tt-project-{m.group(2)}")
+            if (g := GIT_REWRITE_RE.search(cmd)):
+                for n, f in sorted(folders.items()):
+                    if re.search(re.escape(f) + r"(?:/|\b)", cmd):
+                        out.append(f"`git {g.group(1)}` in project {n}'s folder {f}")
     return list(dict.fromkeys(out))
 
 

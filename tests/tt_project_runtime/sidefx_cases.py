@@ -442,3 +442,56 @@ def test_a_no_side_effects_claim_is_checked_against_the_runs_own_effects_on_othe
     project.unregister("other")
     got = sidefx.peer_effects(snap, p.base, "demo")
     assert "project peer's daemon was stopped" in got and "project other's registry row was removed" in got
+
+
+def test_outside_writes_reads_a_heredoc_body_as_data_and_the_claim_check_names_no_effect(env, tmp_path, scratch_home):
+    """A heredoc's body is the text it feeds a command, not commands or paths written: appending test code that
+    names other projects' units and /proc paths writes only the heredoc's own target, and stops nothing."""
+    from ttp import sidefx
+    p = make(env)
+    wt, rd = tmp_path / "wt", tmp_path / "run"
+    wt.mkdir(), rd.mkdir()
+    body = ("def test_x():\n    run('systemctl --user stop tt-project-peer.service')\n"
+            "    os.system(\"systemctl --user restart tt-project-demo.service\")\n"
+            "    cwd = os.readlink(f'/proc/{pid}/cwd') or '/nonexistent'\n"
+            "    open(f'/proc/{pid}/cmdline').read()  # it's a read\n"
+            f"    Path('{tmp_path}/other/tt-project/projectremove_cases.py').write_text('x')\n")
+    cmd = f"cd {wt} && cat >> tests/x_cases.py <<'EOF'\n{body}EOF\necho done"
+    (rd / "output.jsonl").write_text("".join(json.dumps(x) + "\n" for x in _claude_calls(("Bash", {"command": cmd}))))
+    assert sidefx.scan(rd, str(wt)) == []
+    assert sidefx.classify_paths(cmd, str(scratch_home), str(wt), str(rd))[f"{wt}/tests/x_cases.py"][0] == "write"
+    assert sidefx.claim_check(rd, {"summary": "No side effects outside the worktree."}, str(wt), p.base, "demo") \
+        == ([], [])
+    # a body fed to a shell or an interpreter runs: its writes and unit stops are found
+    sh = f"bash <<'EOF'\nsystemctl --user stop tt-project-peer.service\nrm -f {tmp_path}/o/f\nEOF"
+    py = f"python3 - <<EOF\nopen('{tmp_path}/o/g', 'w').write('z')\nEOF"
+    (rd / "output.jsonl").write_text("".join(json.dumps(x) + "\n" for x in _claude_calls(
+        ("Bash", {"command": sh}), ("Bash", {"command": py}))))
+    assert {f["path"]: f["class"] for f in sidefx.scan(rd, str(wt))} == {f"{tmp_path}/o/f": "write",
+                                                                        f"{tmp_path}/o/g": "write"}
+    assert any("tt-project-peer" in x for x in sidefx.peer_effects(rd, p.base, "demo"))
+
+
+def test_outside_writes_names_no_read_only_command_path_or_argument_as_written(tmp_path, scratch_home):
+    """Read-only commands, process substitution, output thrown into /dev/null, a PATH-style assignment and a
+    path inside a quoted argument are no writes; real redirects, tee, cp, rm and `bash -c` writes still are."""
+    from ttp import sidefx
+    wt, rd, o = tmp_path / "wt", tmp_path / "run", tmp_path / "elsewhere"
+    wt.mkdir(), rd.mkdir()
+
+    def writes(*cmds):
+        (rd / "output.jsonl").write_text("".join(json.dumps(x) + "\n" for x in _claude_calls(
+            *[("Bash", {"command": c}) for c in cmds])))
+        return {f["path"] for f in sidefx.scan(rd, str(wt)) if f["class"] == "write"}
+
+    for c in (f"wc -l {o}/a/locks.py", f"diff {o}/a/locks.py {o}/b/locks.py && echo IDENTICAL",
+              f"P={o}/a.py; diff <(grep -n def $P) <(grep -n def {o}/b.py)", f"sed -n 1,20p {o}/x.py",
+              f"grep -n foo {o}/dir 2>/dev/null", f"ls {o}/state 2>/dev/null", f"ls {o}/state &>/dev/null",
+              f"cat {o}/state >/dev/null", f"export PATH={o}/bin:$PATH && cp a.txt b.txt",
+              f"PATH={o}/bin:$PATH make -C . > build.log", f"python3 gen.py --note \"see {o}/t29/file\" > out.txt",
+              f"cat {o}/notes.md > notes.md 2>/dev/null"):
+        assert writes(c) == set(), c
+    assert writes(f"echo x > {o}/f1", f"echo y | tee {o}/f2", f"cp a.txt {o}/", f"rm {o}/f3",
+                  f"bash -c 'echo z > {o}/f4'", f"git clone https://example.com/r {o}/clone",
+                  f"f={o}/f5; echo x > $f") \
+        == {f"{o}/f1", f"{o}/f2", str(o), f"{o}/f3", f"{o}/f4", f"{o}/clone", f"{o}/f5"}

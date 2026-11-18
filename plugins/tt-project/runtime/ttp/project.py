@@ -849,6 +849,7 @@ EXTRA_KEYS = {
                  "checks_spill_hosts", "checks_spill_exclude", "checks_spill_after_s", "checks_spill_first", "checks_remote_only",   # where busy checks may spill to (checkspill)
                  "check_prestage",   # a short foreground run before `ttp checks --detach` (checkprestage)
                  "pr_body_check",   # a project's own PR body check before gh pr create/edit (prbody)
+                 "pr_body_max_words",   # words of prose a PR body may hold (prguard.PR_BODY_MAX_WORDS)
                  "ai_tag",   # the AI-authorship tag a post to others ends with (aitag)
                  "max_open_branches", "max_work_threads", "delete_landed_branches", "dead_branch_days",   # open-branch soft cap (branchcap)
                  "rebase_replace", "never_force",   # whether a rebase replaces its branch (rebase_replace)
@@ -1435,6 +1436,9 @@ def config_problems(raw: dict, root: Path | None = None, fetch: bool = False) ->
     out += prestage_problems(delivery.get("check_prestage"))
     from .prbody import problems as pr_body_problems
     out += pr_body_problems(delivery.get("pr_body_check"))
+    v = delivery.get("pr_body_max_words")
+    if v is not None and not (isinstance(v, int) and not isinstance(v, bool) and v > 0):
+        out.append("delivery.pr_body_max_words: not a positive whole number of words")
     from .aitag import problems as ai_tag_problems
     out += ai_tag_problems(delivery.get("ai_tag"))
     if delivery.get("checks_host") not in (None, ""):

@@ -430,3 +430,85 @@ def test_draft_guard_allows_a_path_that_keeps_the_harness_bin_first(env, tmp_pat
                f"PATH='{bin_}/'x:$PATH gh pr ready 7", 'PATH="$TTP_PROJECT/harness/bin"\'/x\':$PATH gh pr ready 7']
     for cmd in refused:
         assert denied(cmd), cmd
+
+
+# --- the form of every PR body (prguard.body_form_problem) -------------------------------------------
+
+def test_pr_body_internal_refs_are_ids_not_github_refs_counts_or_versions():
+    from ttp.prguard import internal_refs
+    for text, want in (("Seen in run 250, and run 290.", ["run 250", "run 290"]), ("per review #45", ["review #45"]),
+                       ("task #29 and task 29", ["task #29", "task 29"]), ("Run #7 failed", ["Run #7"]),
+                       ("runs 250 or 290", ["runs 250 or 290"]), ("(rerun 12)", ["rerun 12"]),
+                       ("ask #3, ask 12", ["ask #3", "ask 12"]), ("user msg #4; msg 9", ["user msg #4", "msg 9"]),
+                       ("o1084 holds", ["o1084"]), ("Task#29, r\u200bun 250", ["Task#29", "run 250"]), ("on ttp/t8900-x-y", ["ttp/t8900-x-y"]), ("see t8900-fix-x.", ["t8900-fix-x"]),
+                       ("in tt-project/state/runs/123", ["tt-project/state/runs/123"]),
+                       ("at worktrees/t8900/a.py", ["worktrees/t8900/a.py"])):
+        assert internal_refs(text) == want, (text, internal_refs(text))
+    for text in ("Fixes #123", "owner/repo#12", "https://github.com/o/r/pull/9", "sha 89a2ea3bd", "0.2.1339, v1.2.3",
+                 "step 2", "a test run", "run 3 times", "runs 2 jobs", "runs on N150", "run 3-4 times", "run 1.5 hours",
+                 "run 2x faster", "-O2 and o3", "run 100 iterations", "review 2 files", "ask 3 questions",
+                 "run 8 tests in parallel", "tests/t3000/x.py", "runs on t3000 and n300", "the run's state", "runs 10 seconds"):
+        assert internal_refs(text) == [], (text, internal_refs(text))
+
+
+def test_pr_body_word_cap_skips_comments_code_and_template_lines(tmp_path):
+    from ttp.prguard import body_form_problem, prose_words
+    repo = tmp_path / "repo"
+    (repo / ".github").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    template = "## Why\n\n## How it was tested\n" + "".join(f"- [ ] checklist item number {i}\n" for i in range(80))
+    (repo / ".github" / "PULL_REQUEST_TEMPLATE.md").write_text(template)
+    assert prose_words("<!-- a b c -->\n```\nx y z\n```\n~~~\nq\n~~~\nOne two, three.\n| - |") == 3
+    assert body_form_problem([template], {}, str(repo)) is None   # a template alone never trips it
+    long = template + "word " * 301
+    why = body_form_problem([long], {}, str(repo))
+    assert why and "301 words of prose, over the cap of 300 (delivery.pr_body_max_words)" in why, why
+    assert "2-3 sentences of why on top" in why and "no internal run, task or review ids" in why
+    assert body_form_problem([long], {"delivery": {"pr_body_max_words": 400}}, str(repo)) is None
+    assert body_form_problem([long], {"delivery": {"pr_body_max_words": "lots"}}, str(repo))   # bad value: default
+    assert body_form_problem([long], {}, str(tmp_path)) and body_form_problem(["", "  "], {}) is None
+
+
+def test_workers_gh_refuses_a_pr_body_with_internal_ids_or_over_the_cap_on_every_route(env, tmp_path):
+    """Every project: nothing is sent, the refusal names each phrase and tells the run to rewrite."""
+    p = make(env)
+    gh = _gh_runner(p, tmp_path)
+    bad, long = tmp_path / "bad.md", tmp_path / "long.md"
+    bad.write_text("Why: run 250 showed it.\n\nSee review #45 and task #29.\n")
+    long.write_text("Plain words. " * 160)
+    inp = tmp_path / "in.json"
+    inp.write_text(json.dumps({"body": "per run 290"}))
+    for args in (("pr", "create", "--draft", "-t", "t", "-b", "from run 250"), ("pr", "create", "-d", "-tt", "-F", str(bad)),
+                 ("pr", "create", "--draft", "--body-file", str(long)), ("pr", "edit", "7", "--body=task #29"),
+                 ("api", "-X", "PATCH", "repos/acme/widgets/pulls/7", "-f", "body=see review #45"),
+                 ("api", "repos/acme/widgets/pulls", "-F", "draft=true", "--input", str(inp)),
+                 ("api", "graphql", "-f", _CREATE % ',draft:true,body:"ask #3"')):
+        rc, err, ran = gh(*args)
+        assert rc == 1 and ran == [] and "Rewrite the body and retry" in err, (args, err)
+        assert "320 words of prose, over the cap of 300" in err if args[-1] == str(long) else "internal" in err, err
+    rc, err, _ = gh("pr", "create", "--draft", "-F", str(bad))
+    assert "'run 250', 'review #45', 'task #29'" in err, err
+    rc, err, ran = gh("pr", "create", "--draft", "-F", "/dev/null")   # a pipe or device: gh would get nothing
+    assert rc == 1 and ran == [] and "regular file" in err, err
+    p.set_config("delivery.pr_body_max_words", 400)   # only project config raises the cap
+    for args in (("pr", "create", "--draft", "--body-file", str(long)), ("pr", "create", "--draft", "--fill"),
+                 ("pr", "create", "--draft", "-t", "t"), ("pr", "create", "--draft", "-b", "Fixes #12; run 3 times."),
+                 ("pr", "edit", "7", "--add-label", "x"), ("api", "-X", "PATCH", "repos/acme/widgets/pulls/7", "-f", "title=t")):
+        rc, err, ran = gh(*args)
+        assert rc == 0 and ran == [" ".join(args)], (args, err)
+
+
+def test_workers_gh_checks_a_pr_body_from_stdin_and_passes_gh_the_same_bytes(env, tmp_path):
+    p = make(env)
+    fake = tmp_path / "stdinbin"
+    fake.mkdir()
+    (fake / "gh").write_text(f"#!{sys.executable}\nimport sys\n"
+                             f"open({str(tmp_path / 'gh.stdin')!r}, 'wb').write(sys.stdin.buffer.read())\n")
+    (fake / "gh").chmod(0o755)
+    for path in ("-", "/dev/stdin"):
+        r = _gh_main(p, tmp_path, ["pr", "create", "--draft", "-t", "t", "--body-file", path], b"as run 250 found\n", fake=fake)
+        assert r.returncode == 1 and b"'run 250'" in r.stderr and not (tmp_path / "gh.stdin").exists(), (path, r.stderr)
+        data = "Faster startup — caches warm.\n".encode()
+        r = _gh_main(p, tmp_path, ["pr", "edit", "7", "--body-file", path], data, fake=fake)
+        assert r.returncode == 0 and (tmp_path / "gh.stdin").read_bytes() == data, (path, r.stderr)
+        (tmp_path / "gh.stdin").unlink()

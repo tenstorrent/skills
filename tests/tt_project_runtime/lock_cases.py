@@ -2585,3 +2585,130 @@ def test_a_kept_hold_covers_its_job_from_the_moment_the_keeper_label_is_written(
         assert seen and set(seen) == {hold.label(hold.who(7), 61, hold.LABEL)}, seen
     finally:
         f.close()
+
+
+def test_an_urgent_or_landing_shared_lock_waiter_never_passes_an_older_exclusive_one(tmp_path):
+    """locks.my_turn (shared_behind): a shared waiter goes only once every exclusive waiter that arrived
+    before it went, whatever its priority or landing, in arrival and fair order; it still goes before a
+    later routine exclusive one, and a later urgent exclusive one still goes ahead of a routine landing."""
+    from ttp import locks
+    q, now = tmp_path / "q", time.time()
+    old = locks.enqueue(q, "model-server", "routine exclusive", since=now - 60)
+    hot = locks.enqueue(q, "model-server", "urgent shared", since=now - 50, shared=True, priority=1)
+    land = locks.enqueue(q, "model-server", "landing shared", since=now - 40, shared=True, landing=True)
+    late = locks.enqueue(q, "model-server", "later exclusive", since=now - 30)
+    every = [old, hot, land, late]
+    try:
+        for fair in (False, True):
+            assert [locks.my_turn(q, "model-server", t, 1, fair=fair) for t in every] == [True, False, False, False]
+            assert not locks.my_turn(q, "model-server", late, 2, fair=fair), "never past the shared ones"
+        locks.dequeue(old)   # the exclusive waiter ran
+        for fair in (False, True):
+            assert [locks.my_turn(q, "model-server", t, 1, fair=fair) for t in every[1:]] == [True, True, False]
+        urgent = locks.enqueue(q, "model-server", "urgent exclusive", since=now - 20, priority=1)
+        every.append(urgent)
+        assert locks.my_turn(q, "model-server", hot, 1) and not locks.my_turn(q, "model-server", urgent, 1)
+        assert not locks.my_turn(q, "model-server", land, 1), "behind the urgent exclusive one now"
+    finally:
+        for t in every:
+            locks.dequeue(t)
+
+
+def test_an_exclusive_lock_waiter_waits_for_an_older_shared_waiter_and_a_shared_hold(tmp_path):
+    """The other order: an exclusive waiter behind an older shared ticket does not take its turn, and once
+    that one holds the resource (shared), the exclusive one takes no slot until the hold ends."""
+    from ttp import locks
+    q, now = tmp_path / "q", time.time()
+    paths = locks.slot_paths(q, "model-server", 1)
+    shared = locks.enqueue(q, "model-server", "shared", since=now - 60, shared=True)
+    excl = locks.enqueue(q, "model-server", "exclusive", since=now - 30)
+    hold = f = None
+    try:
+        assert not locks.my_turn(q, "model-server", excl, 1) and locks.take_in_turn(q, "model-server", excl,
+                                                                                    paths, "exclusive") is None
+        hold = locks.take_in_turn(q, "model-server", shared, paths, "shared")
+        assert isinstance(hold, locks.SharedHold)
+        locks.dequeue(shared)
+        assert locks.take_in_turn(q, "model-server", excl, paths, "exclusive") is None, "held shared"
+        hold.close()
+        hold = None
+        f = locks.take_in_turn(q, "model-server", excl, paths, "exclusive")
+        assert f is not None
+    finally:
+        for x in (hold, f):
+            if x is not None:
+                x.close()
+        locks.dequeue(shared)
+        locks.dequeue(excl)
+
+
+def _older_copy_shared_turn(locks_dir, resource, ticket):
+    """What an older runtime sharing the locks dir (one with this queue contract, e.g. 0.2.1265) checks before a
+    shared `ttp lock` takes: the tickets in <resource>.queue (no hidden names) whose file lock is held, by
+    name; ".p<n>" before ".g" its priority (none: routine), urgent ones (<= 1) first, then by name; it goes
+    only when every ticket ahead of it ends in "-shared"."""
+    import fcntl
+    import math
+    from pathlib import Path
+    d = Path(locks_dir) / f"{resource}.queue"
+    live = []
+    for name in sorted(os.listdir(d)):
+        if name.startswith("."):
+            continue
+        with open(d / name) as fh:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except OSError:
+                live.append(name)
+
+    def prio(name):
+        head = name.removesuffix("-shared").partition(".g")[0]
+        return min(float(head.rpartition(".p")[2]) if ".p" in head else math.inf, 2)
+    order = sorted(live, key=prio)
+    return all(n.endswith("-shared") for n in order[:order.index(Path(ticket).name)])
+
+
+def test_an_older_runtimes_shared_waiter_queues_behind_this_runtimes_exclusive_waiter(tmp_path):
+    """The queue is a contract with older runtimes sharing the locks dir: this runtime's exclusive waiter
+    publishes its ticket where and as they read it, so an older copy's shared waiter that arrived later waits
+    behind it, and an older copy's earlier shared ticket keeps this one's exclusive waiter back."""
+    from ttp import locks
+    q, now = tmp_path / "q", time.time()
+    excl = locks.enqueue(q, "model-server", "exclusive", since=now - 60)
+    theirs = locks.enqueue(q, "model-server", "older copy's shared", since=now - 30, shared=True)
+    try:
+        assert excl.parent == q / "model-server.queue"
+        assert not _older_copy_shared_turn(q, "model-server", theirs)
+        locks.dequeue(excl)
+        assert _older_copy_shared_turn(q, "model-server", theirs)
+        excl = locks.enqueue(q, "model-server", "exclusive", since=now)
+        assert not locks.my_turn(q, "model-server", excl, 1)
+    finally:
+        locks.dequeue(excl)
+        locks.dequeue(theirs)
+
+
+def test_ttp_lock_runs_an_older_exclusive_waiter_before_an_urgent_tasks_shared_command(env, tmp_path):
+    """End to end: a routine exclusive `ttp lock` waits behind a holder; an urgent task's `ttp lock --shared`
+    that queues after it starts only once the exclusive command ended."""
+    p = make(env)
+    hot = p.db.add_task("urgent bench", "s", kind="work", origin="user", priority=1)
+    marks, go_h, go_e = tmp_path / "marks", tmp_path / "go-h", tmp_path / "go-e"
+    h = _lock(_lock_env(env, p), "model-server", cmd=_mark(marks, "H", go_h))
+    procs = [h]
+    try:
+        _until_or_ended(lambda: marks.exists() and "start H" in marks.read_text(), procs)
+        procs.append(_lock(_lock_env(env, p), "model-server", cmd=_mark(marks, "E", go_e)))
+        _until_or_ended(lambda: _queue_len(p, "model-server") == 1, procs)
+        procs.append(_lock(_lock_env(env, p, TTP_TASK=str(hot)), "--shared", "model-server", cmd=_mark(marks, "S")))
+        _until_or_ended(lambda: _queue_len(p, "model-server") == 2, procs)
+        go_h.touch()
+        _until_or_ended(lambda: "start E" in marks.read_text(), procs[1:])
+        time.sleep(0.5)
+        assert "start S" not in marks.read_text(), marks.read_text()
+    finally:
+        go_h.touch()
+        go_e.touch()
+    assert _ended(procs) == [0, 0, 0], [x.stderr.read() for x in procs]
+    starts = [ln.split()[1] for ln in marks.read_text().splitlines() if ln.startswith("start")]
+    assert starts == ["H", "E", "S"], starts
