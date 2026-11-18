@@ -46,6 +46,7 @@ from . import deviceab
 from . import deviceshadow
 from . import batchrun
 from . import leadmode
+from . import schedjobs
 from . import coordprecheck
 from . import rejtally
 from . import ownrunhold
@@ -1347,6 +1348,7 @@ class Daemon:
         self._audit_done: dict = {}    # the push audit's settled refs while a capped round goes on
         self._push_carry: dict[str, tuple[float, dict]] = {}   # push checks' remote answers kept for later ticks
         self._sched_runs: dict[str, schedrun.Run] = {}   # schedule name -> its run going on off the tick
+        self._off_scheds: tuple = (None, 0.0)   # schedules off at the last schedjobs sweep, and when
         self._sched_swept = False   # process groups an earlier daemon's schedule runs left are killed
         self._step_name = ""     # the tick step running now
         self._step_began: float | None = None   # monotonic: when the running tick step began (None: none runs)
@@ -9785,6 +9787,25 @@ class Daemon:
         return out
 
     # schedules and watchers ------------------------------------------------------------------------
+    def _stop_off_schedule_jobs(self) -> None:
+        """tbcycle.stop_runners while benchowner.trial_stop says stop (runners older than trial_stop never ask it),
+        and schedjobs.sweep: the jobs turned-off schedules left running are stopped, at once on the tick after
+        a schedule is turned off (the set of schedules that are off changed), else every schedjobs.SWEEP_S."""
+        from . import benchowner, tbcycle
+        try:
+            bench = benchowner.trial_stop(self.p) if tbcycle.configured(self.p) else ""
+        except (OSError, ValueError) as e:
+            bench = ""
+            log(self.p, f"turned-off schedules' jobs: benchowner.trial_stop could not be read ({e})")
+        off = (tuple(r["name"] for r in self.p.db.q("SELECT name FROM schedules WHERE enabled=0 ORDER BY name")),
+               bool(bench))
+        now = time.monotonic()
+        if off == self._off_scheds[0] and now - self._off_scheds[1] < schedjobs.SWEEP_S:
+            return
+        self._off_scheds = (off, now)
+        for r in schedjobs.sweep(self.p) + (tbcycle.stop_runners(self.p, bench) if bench else []):
+            log(self.p, r["text"])
+
     def run_schedules(self) -> None:
         """Start each due schedule whose last run ended and record the runs that ended. Commands, heal
         checks and builtin watchers run off the tick (schedrun), so a hung one (a gh call, ssh to a box
@@ -9813,6 +9834,10 @@ class Daemon:
             self._schedule_now(due)
         except Exception as e:
             self._log_step_error("schedule run-now requests", e, 1000)
+        try:
+            self._stop_off_schedule_jobs()
+        except Exception as e:
+            self._log_step_error("turned-off schedules' jobs", e, 1000)
         for s in due:
             payload = json.loads(s["payload"] or "{}")
             if self._step_over(_schedule_label(s, payload)):
@@ -10210,8 +10235,8 @@ class Daemon:
         started = time.time()
         timeout = _watcher_timeout(payload)
         try:   # exit 1 is a normal run that found something: never rerun (its reports would be lost)
-            out = schedrun.run_group(cmd, cwd=str(self.p.root), timeout=timeout, env=command_env(self.p),
-                                     ok=(0, 1))
+            out = schedrun.run_group(cmd, cwd=str(self.p.root), timeout=timeout,
+                                     env={**command_env(self.p), schedjobs.ENV: s["name"]}, ok=(0, 1))
         except subprocess.TimeoutExpired:   # its whole process group is killed: a failed run
             note = sched.capped_note(payload.get("timeout_s"), WATCHER_MAX_S)
             self.observe(errors, f"watcher command timed out{f' after {timeout} s' + note if note else ''}: {cmd}",

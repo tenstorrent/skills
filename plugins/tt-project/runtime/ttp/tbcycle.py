@@ -71,8 +71,11 @@ import time
 from pathlib import Path
 from typing import Callable
 
+from . import schedjobs
+
 DIR, STATE, CYCLE_H, NEW_MODEL_H = "terminalbench", "state.json", 24.0, 3.0
 NOT_RUN = "not_run"   # a bridge or chat trial with no model call or broken by failed calls (not_run): rerun, shown as not run
+RUNNER, REF_RUNNER, STOP_REASON = "terminalbench runner", "terminalbench reference runner", "bench.stop"
 REF, REF_FILE, REF_MODELS, REF_EFFORT = "reference", "reference.jsonl", ("claude-opus-5-5", "claude-sonnet-5-5"), "medium"
 # Shown until a reference run is booked: an earlier run of the DEFAULT_TASKS subset (Terminus 2, 900 s per task).
 SUBSET_REFERENCE = ({"model": "Opus 5.5", "effort": "low", "passed": 14, "trials": 20},
@@ -721,6 +724,38 @@ def launch(p, model: str, reference: bool = False) -> None:
         if reference and ref["lock"] and model not in ref["bridge"]:   # one endpoint or chat model at a time
             argv = [sys.executable, "-m", "ttp", "lock", ref["lock"], "--", *argv]
         # own session: the paced benchmark runner outlives the daemon tick that starts it
-        subprocess.Popen(argv,
-                         cwd=p.root, env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
-                         start_new_session=True)
+        proc = subprocess.Popen(argv,
+                                cwd=p.root, env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+                                start_new_session=True)
+    schedjobs.record(p, proc.pid, REF_RUNNER if reference else RUNNER)   # found by `ttp detach --stop` and the daemon
+
+
+def configured(p) -> bool:
+    """Whether this project may have Terminal-Bench runners at all: model_bench.terminalbench is set, or a
+    launch is recorded (so projects without the bench never scan for runners)."""
+    mb = p.config().get("model_bench")
+    return isinstance(mb, dict) and isinstance(mb.get("terminalbench"), dict) or bool(schedjobs.recorded(p))
+
+
+def runner_sessions(p, live: list[dict] | None = None) -> list[dict]:
+    """This project's live Terminal-Bench runners, the reference run aside: recorded by launch, or (started
+    before the record) a session leader of this project (schedjobs.sessions) running `ttp model-bench
+    terminalbench --runner` under the project's root in the caller's (the daemon's) cgroup. Each with `how`."""
+    own = schedjobs._cgroup("self")
+    out = []
+    for s in schedjobs.sessions(p) if live is None else live:
+        if rec := s.get("record"):
+            if rec.get("what") == RUNNER:
+                out.append({**s, "how": "recorded runner"})
+        elif (s["words"][:2] == ["model-bench", "terminalbench"] and "--runner" in s["argv"]
+              and "--reference" not in s["argv"] and s["env"].get("TTP_PROJECT") and schedjobs.under_root(p, s)
+              and schedjobs._cgroup(s["sid"]) == own):
+            out.append({**s, "how": "runs `ttp model-bench terminalbench --runner` here (started before its record)"})
+    return out
+
+
+def stop_runners(p, why: str, live: list[dict] | None = None) -> list[dict]:
+    """End each runner_sessions() runner (schedjobs._end_session, audited) because `why`
+    (benchowner.trial_stop): a runner that predates trial_stop never asks it."""
+    return [r for s in runner_sessions(p, live)
+            if (r := schedjobs._end_session(p, "terminalbench", s, why, reason=STOP_REASON, of=RUNNER))]

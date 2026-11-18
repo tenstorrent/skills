@@ -1297,3 +1297,148 @@ def test_a_slow_llm_schedule_runs_off_the_tick_and_one_that_keeps_timing_out_is_
         release.set()
     assert any(h.startswith("schedule slow-plan (llm: de-slop scan)") for h in held), held
     assert any(h.startswith("schedule quick (command: true)") for h in held), held
+
+
+# A schedule turned off stops the jobs its runs left running (schedjobs). The case behind it: a schedule
+# was off, but runners it had started a day earlier kept running and loading a shared server, and no
+# task owned them to stop them.
+def _schedule_job(p, tmp_path, argv, cwd=None, **env):
+    """A detached process of this project (its own session, working in `cwd`, default the project root)
+    running `argv`, whose first word (ttp) is a script named ttp that sleeps; TTP_* task variables cleared
+    unless given in `env` (an empty value drops the variable)."""
+    fake = tmp_path / "bin" / "ttp"
+    if not fake.exists():
+        fake.parent.mkdir(parents=True, exist_ok=True)
+        fake.write_text(f"#!{sys.executable}\nimport time\ntime.sleep(120)\n")
+        fake.chmod(0o755)
+    e = {k: v for k, v in os.environ.items() if k not in ("TTP_TASK", "TTP_TASK_ID", "TTP_RUN_ID", "TTP_SCHEDULE")}
+    e.update({"TTP_PROJECT": str(p.base), **env})
+    e = {k: v for k, v in e.items() if v != ""}
+    proc = subprocess.Popen([str(fake), *argv[1:]], env=e, start_new_session=True, cwd=str(cwd or p.root),
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    assert _until_true(lambda: str(fake).encode() in Path(f"/proc/{proc.pid}/cmdline").read_bytes())
+    return proc
+
+
+def _ended(proc, timeout=20):
+    try:
+        proc.wait(timeout)
+        return True
+    except subprocess.TimeoutExpired:
+        return False
+
+
+@pytest.mark.skipif(not Path("/proc/self/environ").exists(), reason="reads /proc")
+def test_turning_a_schedule_off_stops_the_detached_jobs_its_runs_left_and_nothing_else(env, tmp_path, monkeypatch):
+    from ttp import detach, jobstop, schedjobs, schedule as sched
+    from ttp.daemon import Daemon
+    monkeypatch.setattr(jobstop, "PIDS_TERM_S", 2.0)
+    p = make(env)
+    cmd = "ttp model-bench terminalbench --detach"
+    sched.upsert(p.db, "bench", "command", "1h", payload={"command": cmd})
+    sched.upsert(p.db, "other", "command", "1h", payload={"command": "ttp other check"})
+    argv = ["ttp", "model-bench", "terminalbench", "--runner", "m"]
+    mine = _schedule_job(p, tmp_path, argv, TTP_SCHEDULE="bench")
+    other = _schedule_job(p, tmp_path, argv, TTP_SCHEDULE="other")
+    elsewhere = _schedule_job(p, tmp_path, argv, TTP_SCHEDULE="bench", TTP_PROJECT=str(tmp_path / "another"))
+    run_dir = p.runs / "7"
+    run_dir.mkdir(parents=True)
+    r = _ttp_run(p, "detach", "drv", "--", *_until(tmp_path / "never"),
+                 env={"TTP_RUN_DIR": str(run_dir), "TTP_SCHEDULE": "bench", "TTP_TASK": "", "TTP_TASK_ID": "",
+                      "TTP_RUN_ID": "", "TTP_HOME": str(env["home"])})
+    assert r.returncode == 0, r.stderr
+    rc = (run_dir / "drv.rc").resolve()
+    assert _until_true(lambda: jobstop.running(rc))
+    assert _record(rc).get("schedule") == "bench"   # the registry names the schedule that started it
+    try:
+        d = Daemon(p.base)
+        d.gates = {}
+        d._stop_off_schedule_jobs()   # all on: nothing stopped
+        assert mine.poll() is None and jobstop.running(rc)
+        sched.set_enabled(p.db, "bench", False)
+        d._stop_off_schedule_jobs()   # the tick after it is turned off
+        assert _ended(mine) and _until_true(lambda: not jobstop.running(rc))
+        assert other.poll() is None and elsewhere.poll() is None   # an enabled schedule's, another project's
+        ev = [json.loads(e["data"]) for e in p.db.q("SELECT data FROM events WHERE kind=?", (jobstop.EVENT,))]
+        assert {e.get("schedule") for e in ev} == {"bench"} and len(ev) == 2, ev
+        sig = [json.loads(x) for x in (p.state / detach.SIGNALS).read_text().splitlines()]
+        assert {s["reason"] for s in sig} == {schedjobs.REASON} and {s["by"] for s in sig} >= {schedjobs.BY}
+        d._stop_off_schedule_jobs()   # nothing left: no second event
+        assert len(p.db.q("SELECT id FROM events WHERE kind=?", (jobstop.EVENT,))) == 2
+    finally:
+        for x in (mine, other, elsewhere):
+            x.kill()
+            x.wait()
+        (tmp_path / "never").touch()
+
+
+@pytest.mark.skipif(not Path("/proc/self/environ").exists(), reason="reads /proc")
+def test_a_schedule_already_off_has_jobs_started_before_the_marker_stopped_on_the_next_tick(env, tmp_path, monkeypatch):
+    from ttp import jobstop, schedjobs, schedule as sched
+    from ttp.daemon import Daemon
+    monkeypatch.setattr(jobstop, "PIDS_TERM_S", 2.0)
+    p = make(env)
+    sched.upsert(p.db, "bench", "command", "1h", enabled=False,
+                 payload={"command": "ttp model-bench terminalbench --detach"})
+    assert schedjobs.command_words("ttp model-bench terminalbench --detach && echo ok") == ["model-bench", "terminalbench"]
+    runner = ["ttp", "model-bench", "terminalbench", "--runner", "m"]
+    old = _schedule_job(p, tmp_path, runner)   # no TTP_SCHEDULE: started before the upgrade
+    locked = _schedule_job(p, tmp_path, ["ttp", "lock", "chat", "--", "python3", "-m", "ttp", "model-bench",
+                                         "terminalbench", "--reference", "--runner", "m"])
+    tasks = _schedule_job(p, tmp_path, runner, TTP_TASK="5")   # a task's run: follows its task
+    unrelated = _schedule_job(p, tmp_path, ["ttp", "model-bench", "status"])
+    outside = _schedule_job(p, tmp_path, runner, cwd=tmp_path)   # not under the project's root: not proven ours
+    try:
+        d = Daemon(p.base)
+        d.gates = {}
+        d.run_schedules()
+        assert _ended(old) and _ended(locked)
+        assert tasks.poll() is None and unrelated.poll() is None and outside.poll() is None
+        texts = [e["text"] for e in p.db.q("SELECT text FROM events WHERE kind=?", (jobstop.EVENT,))]
+        assert len(texts) == 2 and all("schedule bench" in t and "started before" in t for t in texts), texts
+    finally:
+        for x in (old, locked, tasks, unrelated, outside):
+            x.kill()
+            x.wait()
+
+
+@pytest.mark.skipif(not Path("/proc/self/environ").exists(), reason="reads /proc")
+def test_bench_hold_stops_this_projects_runner_groups_recorded_or_older_and_detach_stop_finds_recorded_ones(
+        env, tmp_path, monkeypatch):
+    from ttp import detach, jobstop, schedjobs, tbcycle
+    from ttp.daemon import Daemon
+    monkeypatch.setattr(jobstop, "PIDS_TERM_S", 2.0)
+    p = make(env)
+    p.set_config("model_bench.terminalbench", {"on": True})
+    runner = ["ttp", "model-bench", "terminalbench", "--runner", "m"]
+    recorded = _schedule_job(p, tmp_path, runner, TTP_PROJECT="")   # its environment names no project
+    schedjobs.record(p, recorded.pid, tbcycle.RUNNER, "terminalbench")
+    old = _schedule_job(p, tmp_path, runner)   # started by an older launcher: no record, no trial_stop
+    outside = _schedule_job(p, tmp_path, runner, cwd=tmp_path)
+    ref = _schedule_job(p, tmp_path, ["ttp", "model-bench", "terminalbench", "--reference", "--runner", "m"])
+    foreign = _schedule_job(p, tmp_path, runner, TTP_PROJECT=str(tmp_path / "another"))
+    later = None
+    try:
+        d = Daemon(p.base)
+        d.gates = {}
+        d._stop_off_schedule_jobs()   # the bench runs: nothing stopped
+        assert all(x.poll() is None for x in (recorded, old, outside, ref, foreign))
+        p.set_config("model_bench.hold", True)
+        d._stop_off_schedule_jobs()   # held: the tick stops this project's runners at once
+        assert _ended(recorded) and _ended(old)
+        assert all(x.poll() is None for x in (outside, ref, foreign))
+        sig = [json.loads(x) for x in (p.state / detach.SIGNALS).read_text().splitlines()]
+        assert {s["reason"] for s in sig} == {tbcycle.STOP_REASON}
+        texts = [e["text"] for e in p.db.q("SELECT text FROM events WHERE kind=?", (jobstop.EVENT,))]
+        assert len(texts) == 2 and all("model_bench.hold is on" in t for t in texts), texts
+        later = _schedule_job(p, tmp_path, runner, TTP_PROJECT="")
+        schedjobs.record(p, later.pid, tbcycle.RUNNER, "terminalbench")
+        assert set(schedjobs.recorded(p)) == {later.pid}   # gone entries dropped on write
+        r = _ttp_run(p, "detach", "--stop", "terminalbench", env={"TTP_PROJECT": str(p.base)})
+        assert r.returncode == 0, r.stderr
+        assert _ended(later) and "recorded terminalbench runner" in r.stdout, r.stdout
+    finally:
+        for x in (recorded, old, outside, ref, foreign, later):
+            if x:
+                x.kill()
+                x.wait()

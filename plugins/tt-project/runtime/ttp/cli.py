@@ -10518,15 +10518,17 @@ def _detach_stop_checks(rc: Path, given: str | None) -> int:
 def _schedule_stop(name: str, given: str | None) -> int | None:
     """`ttp detach --stop <schedule>`: a runner a command schedule of this project launched. Sets its stop
     switch (occupancy.request_stop: a runner checking `ttp occupancy --should-stop` ends before its next
-    trial) and kills the schedule's live process groups (schedrun.GROUPS_KEY). None when no schedule of
-    this project has that name (the other lookups go on)."""
-    from . import occupancy, schedrun
+    trial) and kills the schedule's live process groups (schedrun.GROUPS_KEY), then stops the detached jobs
+    its runs left (schedjobs.stop: marked, recorded by their launcher, or older ones by their command). None
+    when no schedule of this project has that name (the other lookups go on)."""
+    from . import occupancy, schedjobs, schedrun
     if not os.environ.get("TTP_PROJECT"):
         return None
     p = Project(os.environ["TTP_PROJECT"])
     groups = {pid: rec for pid, rec in (p.db.kv(schedrun.GROUPS_KEY, {}) or {}).items()
               if (rec or {}).get("schedule") == name}
-    if not groups and not p.db.one("SELECT name FROM schedules WHERE name=?", (name,)):
+    row = p.db.one("SELECT payload FROM schedules WHERE name=?", (name,))
+    if not groups and not row and not any(v.get("schedule") == name for v in schedjobs.recorded(p).values()):
         return None
     try:
         occupancy.request_stop(p, name, given or "ttp detach --stop")
@@ -10534,8 +10536,14 @@ def _schedule_stop(name: str, given: str | None) -> int | None:
         return None
     killed = [pid for pid, rec in groups.items() if schedrun._kill(int(pid), rec.get("start"))]
     schedrun._forget(p.db, [int(x) for x in groups])
+    try:
+        payload = json.loads((row["payload"] if row else None) or "{}")
+    except ValueError:
+        payload = {}
+    jobs = schedjobs.stop(p, name, payload if isinstance(payload, dict) else {}, given or "ttp detach --stop")
     print(f"{name}: stop switch set" + (f"; stopped process group(s) {', '.join(killed)}" if killed
-                                         else "; no run of it is live"))
+                                         else "; no run of it is live")
+          + "".join(f"; {j['text']}" for j in jobs))
     return 0
 
 

@@ -938,8 +938,9 @@ def owner(env=None, state: Path | None = None) -> dict:
     (jobstop.task_jobs). Shown, never proof alone: a stop or kill also checks the db and the process."""
     env = os.environ if env is None else env
     out = {"project": env.get("TTP_PROJECT") or (str(state.parent) if state is not None else None),
-           "task": env.get("TTP_TASK") or env.get("TTP_TASK_ID"), "run": env.get("TTP_RUN_ID")}
-    return {k: int(v) if k != "project" and str(v).isdigit() else v for k, v in out.items() if v}
+           "task": env.get("TTP_TASK") or env.get("TTP_TASK_ID"), "run": env.get("TTP_RUN_ID"),
+           "schedule": env.get("TTP_SCHEDULE")}   # schedjobs.ENV: a command schedule's run started it
+    return {k: int(v) if k in ("task", "run") and str(v).isdigit() else v for k, v in out.items() if v}
 
 
 def close(rc: Path, now: float | None = None) -> dict | None:
