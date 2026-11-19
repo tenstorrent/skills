@@ -45,16 +45,13 @@ triage → kill → reset (only if the backend needs one) → verify → cache (
 | Caller | Kill per mode's substitution table. |
 | Foreign | STOP. Report owner. NEVER kill another agent's job. |
 
-- NEVER shell-kill a device process: `kill`, `kill -9`, `pkill`, any signal.
-- Route through the backend's kill.
-- A shell kill skips the graceful stop. It can force a full reboot.
+- NEVER shell-kill a device process (`kill`, `kill -9`, `pkill`, any signal). It skips the graceful stop and can force a full reboot. Full rule: `mcp.md` § Failure handling.
 
 ## Step 3 — Reset the device
 
 - Reset per mode's substitution table, only when it calls for one.
 - The backend resets automatically after a hang.
 - tt-device-mcp: reset only per `mcp.md` § After a kill.
-- A second reset delays every user waiting on the device.
 - Confirm it in step 4.
 - **ALL device processes MUST be dead before any reset.**
 - Reset with a live handle can wedge the machine.
@@ -101,5 +98,5 @@ rm -rf -- "$HOME/.cache/tt-metal-cache/" "<workspace>/.tt-metal-cache/"
 | "I'll `tt-smi -r` via Bash" | NEVER. Reset goes through the backend. |
 | "I'll kill first, triage after" | NEVER. Triage needs the inspector RPC alive. |
 | "I'll reset while the process holds the device" | NEVER. Confirm dead in step 2 first. |
-| "I'll always reset after a kill" | Not under tt-device-mcp. Its broker resets and runs the full check. See `mcp.md` § After a kill. |
+| "I'll always reset after a kill" | No. See `mcp.md` § After a kill. |
 | "I'll always clear the cache" | Only when kernel code changed. |

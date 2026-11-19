@@ -22,11 +22,8 @@ Tools on the `tt-device-mcp` MCP server. Names per `tt-buddy:buddy` § Host mapp
 - Set it to the run's envelope (`execution.md` § Job-timeout envelope).
 - Won't fit 1500s: move host work off the device, or split.
 - A `timeout` result's `hint` names the limit that fired.
-- Stuck: past expected runtime with flat output, or a wedge signature.
-- See `SKILL.md` § Long-run watchdog, `recovery.md` § Detect the wedge early.
-- **Wedge-kill rule:** triage at once, then kill your own job.
-- No need to ask the user: it is your job.
-- Then follow § After a kill. Do not reset by default.
+- Stuck: past expected runtime with flat output, or a wedge signature (`recovery.md` § Detect the wedge early).
+- **Wedge-kill rule:** triage at once, then kill your own job — no need to ask the user; it is your job. Then follow § After a kill: do not reset by default.
 - Foreign-owned hung job: STOP. Report owner.
 - NEVER kill another agent's job.
 - Reset only with an empty queue: nothing running or queued.
@@ -86,9 +83,7 @@ Mode-agnostic rows: `execution.md` § Failure handling.
 - The gate probes the device and resets until healthy.
 - Reset steps depend on platform and privileges.
 - The broker kills jobs on timeout or 300s silence.
-- Queue held: the gate is recovering. Wait.
-- After a hang: tt-device-mcp resets the device automatically.
-- Confirm: `tt_device_queue_status` shows the queue not held.
+- Queue held: the gate is recovering. Wait. Confirm: `tt_device_queue_status` shows the queue not held.
 
 ## Recovery substitutions
 
