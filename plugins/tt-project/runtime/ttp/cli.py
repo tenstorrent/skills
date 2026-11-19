@@ -1984,7 +1984,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
         lines.append(f"  {d}")
     # Waiting: each task once, in lane order (urgent, waiting, deferred, logged out, network-held).
     from . import urgent
-    from .coordinator import BROKEN_START
+    from .coordinator import BROKEN_START, handoff_wait
     rows: dict[int, dict] = {}
 
     def row(t: dict, what: str, why: str = "", extra: list | None = None) -> None:
@@ -2006,6 +2006,8 @@ def status_text(p: Project, verbose: bool = False) -> str:
         # A future not_before (start_after, the tests gate) is when it can start at all: say so, never
         # only that it is queued.
         nb = f", deferred until {at(t['not_before'], now, tz)}" if float(t.get("not_before") or 0) > now else ""
+        if own := handoff_wait(t, now):   # its own wait's age (its waiting row names what), no bare ETA
+            nb, fin = f", {own.split(' for ')[0]}", fin if "no estimate" not in fin else ""
         row(t, f"{t['status']} ({urgent.mark(db, t, now)}{nb}{fin})", f"urgent: {urgent.shown_why(db, t, now)}"
             + (f"; {topup.words(topped[t['id']])}" if t["id"] in topped else ""))
     for t in h["waiting"][:5]:

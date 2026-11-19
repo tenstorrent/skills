@@ -111,7 +111,7 @@ function trendHtml(series) {
 }
 
 function taskRow(t) {
-  const label = deferred(t) ? esc(t.starts) : waiting(t) ? "waiting" : held(t) ? heldAs(t) : depWait(t) ? esc(depWait(t)) : t.review_since ? `review ${agoH(t.review_since)}` : t.status === "pushing" ? "approved, pushing" : t.outcome === "changes_needed" ? "changes needed" : esc(t.status);
+  const label = deferred(t) ? esc(t.starts) : waiting(t) ? esc(t.waiting || "waiting") : held(t) ? heldAs(t) : depWait(t) ? esc(depWait(t)) : t.review_since ? `review ${agoH(t.review_since)}` : t.status === "pushing" ? "approved, pushing" : t.outcome === "changes_needed" ? "changes needed" : esc(t.status);
   const noteLabel = t.status === "blocked" ? "Blocked" : waiting(t) ? "Waiting" : held(t) ? "Held" : "Note";
   return `<details class="row"><summary><span class="id">#${t.id}</span> <span class="st st-${t.outcome || t.status}">${label}</span>
     <span class="title">${esc(t.title)}</span> <span class="meta">${esc(t.tier)} · ${money(t.spent_usd)}${t.budget_usd ? " / " + money(t.budget_usd) : ""} · ${agoH(t.updated)} ago${t.pr_url ? ` · ${isHttp(t.pr_url) ? link(t.pr_url, "PR") : "PR " + esc(t.pr_url)}` : ""}</span></summary>
@@ -230,7 +230,7 @@ function board(st) {
     ["stuck", "Stuck, the project is on it", stuck(st).map((t) => [`#${t.id} ${t.title} — ${t.wait.text}`, ` (${t.wait.age_text})`])],
     ["review", "Ready for review", st.tasks.filter(ready).map((t) => [`#${t.id} ${t.title}`, t.review_since ? ` (in review ${agoH(t.review_since)})` : ""])],
     ["work", "Working", st.tasks.filter((t) => t.status === "running").map((t) => [`#${t.id} ${t.title}`])],
-    ["queued", "Queued", st.tasks.filter((t) => t.status === "queued").map((t) => [`#${t.id} ${t.title}${deferred(t) ? ` (${t.starts})` : waiting(t) ? ` (waiting, next try ${at(t.not_before)})` : ""}`])],
+    ["queued", "Queued", st.tasks.filter((t) => t.status === "queued").map((t) => [`#${t.id} ${t.title}${deferred(t) ? ` (${t.starts})` : waiting(t) ? ` (${t.waiting || "waiting"}, next try ${at(t.not_before)})` : ""}`])],
   ];
   R.rows($("#board"), cols.map(([cls, name, items]) => ({ key: cls, html: `<div class="col ${cls}"><h3>${name}<span class="n">${items.length}</span></h3>` +
     // What waits on the user shows in full and every item of it: never only an id to look up (user msg #2424).

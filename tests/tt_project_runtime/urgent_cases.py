@@ -270,6 +270,27 @@ def test_status_says_deferred_until_for_a_queued_task_whose_not_before_is_ahead(
     assert f"#{retry} waiting, next try " in out, out
 
 
+def test_status_digest_and_web_name_an_urgent_hand_off_wait_and_its_age_not_deferred_until(env):
+    """An urgent task asleep on its own hand-off wait reads 'waiting <age>' and what it waits on in status,
+    the digest's Open tasks line and the web payload, never only 'deferred until' or 'ETA: no estimate'."""
+    from ttp import cli, coordinator as coord, web
+    p = make(env)
+    now = time.time()
+    hot = p.db.add_task("hot fix", "Fix it.\nurgent: the user is waiting", kind="code", origin="coordinator")
+    p.db.update_task(hot, not_before=now + 600, blocked_reason="waiting for its smoke job; its probe says "
+                     "smoke job PENDING (Resources); next try 13:27",
+                     result=json.dumps({"status": "waiting", "retry_when": "sh probe.sh",
+                                        "waiting_since": now - 133 * 60 - 5}))
+    line = next(x for x in cli.status_text(p).splitlines() if f"#{hot} " in x)
+    assert "waiting 2h13m" in line and "PENDING (Resources)" in line, line
+    assert "deferred until" not in line and "no estimate" not in line, line
+    assert coord.handoff_wait(p.db.task(hot), now).startswith("waiting 2h13m for its smoke job; its probe says")
+    digest = next(x for x in coord.digest(p, {}, [], []).splitlines() if x.startswith(f"- #{hot} |"))
+    assert "queued (waiting 2h13m)" in digest, digest
+    rows = {t["id"]: t for t in web.state_payload(p, p.db)["tasks"]}
+    assert rows[hot]["waiting"] == "waiting 2h13m"
+
+
 def _gate_add(p, title, priority=1, spec="s", **gate):
     """A task_add with a start gate; (its id, the apply notes)."""
     from ttp import coordinator as coord

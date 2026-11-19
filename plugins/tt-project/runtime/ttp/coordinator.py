@@ -1662,7 +1662,8 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
         cont = continues_id(t)
         title = (clip(t["title"], TITLE_CHARS) + (f" (continues #{cont})" if cont else "")
                  + (f" (owns {', '.join(owns[t['id']])})" if owns.get(t["id"]) else ""))
-        starts = (starts_text(t, now, where=p, db=db) if t["status"] == "queued" else
+        starts = (starts_text(t, now, where=p, db=db) or handoff_wait(t, now).split(" for ")[0]
+                  if t["status"] == "queued" else
                   f"{(now - in_review[t['id']]) / 3600:.1f}h in review" if t["id"] in in_review else "")
         lines.append(f"- #{t['id']} | {t['status']}{f' ({starts})' if starts else ''} | {t['tier']} | p{t['priority']} | "
                      f"{(now - t['created']) / 3600:.1f}h | {title} | {note}")
@@ -2659,6 +2660,20 @@ def starts_text(task: dict, now: float | None = None, plain: bool = False, where
         when = f"when: {clip(d['when'], 160)}" + (f" ({clip(d['why'], 160)})" if d.get("why") else "")
     text = "starts " + (f"{_clock(after, where)}" + (f", then {when}" if when else "") if after else when)
     return f"{held}; {text}" if held else text
+
+
+def handoff_wait(task: dict, now: float | None = None) -> str:
+    """'waiting 2h13m for <what>' for a queued task asleep on its own hand-off wait (a probe, a detached job,
+    a smoke): what it waits on and for how long, never only 'deferred until'; '' otherwise."""
+    now = time.time() if now is None else now
+    prev = load_result(task.get("result"))
+    since = prev.get("waiting_since")
+    if task.get("status") != "queued" or float(task.get("not_before") or 0) <= now \
+            or prev.get("status") != "waiting" or not isinstance(since, (int, float)):
+        return ""
+    m = max(0, int((now - since) / 60))
+    what = re.sub(r"^waiting for |;? *next try \S+$", "", (task.get("blocked_reason") or "").strip()).strip()
+    return f"waiting {f'{m // 60}h{m % 60:02d}m' if m >= 60 else f'{m}m'}" + (f" for {clip(what, 240)}" if what else "")
 
 
 def review_holds(task: dict, db, now: float) -> str:
