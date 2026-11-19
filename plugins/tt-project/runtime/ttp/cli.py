@@ -13156,7 +13156,7 @@ def cmd_config(a) -> None:
     if a.chat_settable:
         return cmd_chat_settable(a.name, a.key)
     if a.account:
-        if a.value is not None:
+        if a.value is not None or a.add is not None:
             die("usage: ttp config --account KEY [VALUE]")
         from .coordinator import NEEDS_USER
         if run and a.key is not None and a.name in NEEDS_USER:
@@ -13181,7 +13181,7 @@ def cmd_config(a) -> None:
     else:
         p = need(a.name, sys.argv[1:])
     if a.add is not None:
-        if a.value is not None or not a.key or a.account:
+        if a.value is not None or not a.key:
             die("usage: ttp config [NAME] KEY --add VALUE")
         node = p.config()
         for part in a.key.split("."):
