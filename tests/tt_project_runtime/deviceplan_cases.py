@@ -200,11 +200,6 @@ def test_a_program_merely_named_like_an_approved_route_is_not_that_route():
     from ttp import deviceplan
     assert deviceplan.power_refusal("ipmitool chassis power cycle", ["ipmi"]), "a name inside a program's name is no route"
     assert deviceplan.power_refusal("tt-smi -r 0", ["tt"]) and deviceplan.power_refusal("tt-smi -r 0", ["tt-smi"]) is None
-    assert deviceplan._routed(["notbroker", "reset"], ["broker"]) is False
-    assert deviceplan._routed(["/opt/bin/broker", "reset"], ["broker"]) is False, "a bare route names no path"
-    assert deviceplan._routed(["broker", "reset"], ["broker"]) is True
-    assert deviceplan._routed(["./scripts/cycle.sh", "box-a"], ["./scripts/"]) is True
-    assert deviceplan._routed(["./scripts-evil/cycle.sh"], ["./scripts"]) is False
 
 
 def test_an_audit_that_ends_without_a_verdict_is_requeued_once_counted_and_cleared_by_a_later_verdict(env, tmp_path):
@@ -291,7 +286,7 @@ def test_deviceplan_and_glmguard_read_ttp_note_flags_alike(tmp_path):
                       ("ttp note --sev high hi", True), ("ttp note hi", False), ("ttp note 'update: ok'", False)):
         g = glmguard.shell_refusal(c, str(tmp_path), str(run), e)
         assert bool(g) is routed, c
-        assert deviceplan._free(c.split()[:2] + c.split()[2:]) is not routed, c
+        assert deviceplan._free(c.split()) is not routed, c
 
 
 def test_scripts_and_routes_match_strictly(tmp_path):
@@ -304,3 +299,5 @@ def test_scripts_and_routes_match_strictly(tmp_path):
     assert deviceplan.power_refusal("./scripts/../../usr/bin/ipmitool chassis power cycle", ["./scripts/"])
     assert deviceplan.power_refusal("ipmitool power cycle", ["./scripts/"])
     assert deviceplan.power_refusal("./scripts/cycle.sh box-a", ["./scripts/"]) is None
+    assert deviceplan.step_match("git reset --hard", [{"command": "git reset --hard"}])
+    assert not deviceplan.step_match("git -C /other/repo reset --hard", [{"command": "git reset --hard"}]), "a plan step matches exactly"

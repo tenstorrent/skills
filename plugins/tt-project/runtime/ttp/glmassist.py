@@ -140,7 +140,7 @@ def refusal(run_dir, plan: bool, step=None) -> str | None:
     used = sum(float(r.get("minutes") or 0) for r in done)
     if used >= float(lim.get("max_minutes") or 0):
         return f"this run's advisor minutes are used up ({used:.1f} of {lim.get('max_minutes')}); decide yourself"
-    if step is not None:   # a device run's Opus check before a reset, power cycle, flash or firmware step (#3648)
+    if step is not None:   # a device run's Opus check before a reset, power cycle, flash or firmware step
         from . import deviceplan
         if not lim.get("device") or not planned(run_dir):
             return "`--check-step` checks a step of a device run's plan: run `ttp advise --plan` first"

@@ -19,11 +19,8 @@ from . import glmassist
 SSH_SAFE = frozenset("nTtqx46C")
 SSH_SAFE_OPTS = {"batchmode", "connecttimeout", "serveraliveinterval", "serveralivecountmax", "loglevel"}
 
-SHADOW = re.compile(r"/tmp/(?:ttp-\d+/[0-9a-f]+/)?shadow-[\w-]+/")
-
-
 def norm(s):
-    s = SHADOW.sub("/SHADOW/", s.strip())   # a plan written in another run's shadow dir still matches
+    s = s.strip()
     if s.startswith("$ "):
         s = s[2:]
     return " ".join(s.replace('"', " ").replace("'", " ").split())
@@ -35,21 +32,11 @@ def split_host(c):
 
 def step_match(cmd, steps):
     """The command, as a whole, is one of the plan's steps (placeholders match any value without shell operators)."""
-    host, rest = split_host(norm(cmd))
-    if _step_match(host, rest, steps):
-        return True
-    def loose(x):   # `git -C <repo> x` and `git x` in the repo: one step; a ledger entry's free-text label is not the step
-        x = re.sub(r"\bgit -C \S+", "git", x)
-        return re.sub(r"(\bttp machines change add \S+).*", r"\1", x, flags=re.S)
-    return _step_match(host, loose(rest), [{"host": s.get("host"), "command": loose(norm(s.get("command") or ""))} for s in steps])
+    return _step_match(*split_host(norm(cmd)), steps)
 
 
 def _step_match(host, rest, steps):
-    for s0 in steps:
-        for s in (s0, {"host": s0.get("host"), "command": re.sub(r"\s+\([^()]*\)\s*$", "", norm(s0.get("command") or ""))}):
-          if _one_step(host, rest, s):
-            return True
-    return False
+    return any(_one_step(host, rest, s) for s in steps)
 
 
 def _one_step(host, rest, s):
@@ -496,7 +483,8 @@ def _state(db) -> dict:
 def bounce_kind(run_dir, bounce: str = "") -> str:
     """Why a GLM device run went back to Opus: the guard's kind (out_of_plan, power, plan, check, gate, guard),
     "other" for any other bounce, "" for none."""
-    got = _read(Path(run_dir) / "glm_guard.json") if run_dir else None
+    from . import glmguard
+    got = _read(Path(run_dir) / glmguard.HIT) if run_dir else None
     if isinstance(got, dict) and got.get("kind"):
         return str(got["kind"])
     return "other" if bounce else ""
