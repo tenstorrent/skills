@@ -19,11 +19,26 @@ claude spend) and user corrections (correction.py's kv, kept 7 days): a correcti
 project count, not per arm.
 
 Wave gate (judge): the project's GLM arm (kv glm_work_arm arm glm) against its own Claude baseline: its holdout
-tasks plus the tasks whose first worker run started in the BASE_DAYS before its first arm record, off GLM.
-"wait" until `route.glm_work.min_tasks` (MIN_TASKS) GLM tasks have an outcome (their first review decided, or
-ended with no review open) and the baseline has BASE_MIN; "worse" when the GLM review first-pass rate is lower
-by more than `route.glm_work.worse_pts` (WORSE_PTS) points, its failed-or-reopened rate higher by more, or any
-device incident on a GLM run; else "ok".
+tasks plus the tasks whose first worker run started in the BASE_DAYS before its first arm record, off GLM. It
+answers "worse" (roll the project back), "ok" (it may advance) or "wait" (hold the wave where it is). Every
+setting is under `route.glm_work` (settings()); a signal is "worse by" the gap in the direction that hurts.
+- Any device incident on a GLM run: "worse" at once, whatever the sample (a safety stop, not a statistic).
+- Minimum sample: below `min_tasks` (MIN_TASKS) GLM tasks with an outcome (their first review decided, or ended
+  with no review open) or `min_base` (BASE_MIN) baseline ones, "wait" with "not enough data", so noise on a small
+  holdout neither advances nor rolls back a wave. The review signals also need `min_base` reviewed tasks in each
+  arm; with fewer they are reported as not measured and gate nothing.
+- Advance and rollback (GATED): first review pass rate and failed-or-reopened rate (points, `advance_pts`
+  ADVANCE_PTS, `rollback_pts` ROLLBACK_PTS; the older `worse_pts` sets rollback_pts), fix rounds per reviewed
+  task (rounds, `advance_rounds` ADVANCE_ROUNDS, `rollback_rounds` ROLLBACK_ROUNDS) and the bounce rate (points
+  of tasks bounced to Opus or deep, `advance_bounce_pts` ADVANCE_BOUNCE_PTS, `rollback_bounce_pts`
+  ROLLBACK_BOUNCE_PTS: a bounce still ends on Opus, so it costs time and money before quality, hence the wider
+  margins). Worse by more than the rollback margin: "worse"; by more than the tighter advance margin: "wait".
+- Advance only (HOLD_ONLY): the project's tasks done per day since the first arm record against the BASE_DAYS
+  before it (a percent drop, `hold_done_pct` HOLD_DONE_PCT; needs `min_base` tasks before) and user corrections
+  in the last CORR_DAYS days (more than `hold_corrections` HOLD_CORRECTIONS). Both are per project and move with
+  the user's own workload, so they hold a wave but never roll one back.
+- Reported only: Claude $/day and bad output by day (report()).
+The verdict lists each signal ("signals": glm, base, worse_by, verdict ok | hold | worse | unmeasured).
 
 Bad output by day (bad_output): each GLM run's exit record (the chat bridge's stats, chatbridge.JUNK_PATTERNS
 and the counters beside it) summed per home-zone day of its start: tool calls Claude Code rejected for bad
@@ -44,11 +59,21 @@ ROLES = ("coordinator", "plan", "review", "code", "work", "question", "harness",
 KINDS = ("plan", "review", "code", "work", "question", "harness")
 ARM_KV = "glm_work_arm:"          # kv glm_work_arm:<task id>: {"arm": "glm" | "holdout", "why", "ts"}
 CODE_ARM_KV = "code_arm:"         # codearm.ARM_KV
-MIN_TASKS, WORSE_PTS, BASE_DAYS, BASE_MIN = 25, 15.0, 14, 5
+MIN_TASKS, BASE_DAYS, BASE_MIN = 25, 14, 10
+ADVANCE_PTS, ROLLBACK_PTS = 5.0, 15.0
+ADVANCE_ROUNDS, ROLLBACK_ROUNDS = 0.25, 0.5
+ADVANCE_BOUNCE_PTS, ROLLBACK_BOUNCE_PTS = 10.0, 25.0
+HOLD_DONE_PCT, HOLD_CORRECTIONS, CORR_DAYS = 25.0, 3, 7
+# The wave gate's signals: (name, quality() key, higher is worse, advance setting, rollback setting).
+GATED = (("first review pass rate", "first_pass_pct", False, "advance_pts", "rollback_pts"),
+         ("failed or reopened rate", "bad_pct", True, "advance_pts", "rollback_pts"),
+         ("fix rounds per reviewed task", "fix_rounds_per_reviewed", True, "advance_rounds", "rollback_rounds"),
+         ("bounce rate", "bounce_pct", True, "advance_bounce_pts", "rollback_bounce_pts"))
+REVIEW_KEYS = ("first_pass_pct", "fix_rounds_per_reviewed")   # need min_base reviewed tasks in each arm
 CHUNK = 500
 BAD_KEYS = ("tool_input_errors", "args_unparsed", "args_repaired", "empty_content", "junk_responses")
 FIRE_KEYS = ("outward_drafts", "gate_stops", "guard_bounces")   # glmguard's fires, read from the run folder
-LOOP_KEYS = {"loop_nudges": "nudges", "loop_stops": "stops"}   # chatbridge stats loop (the loop guard)   # chatbridge stats bad_output
+LOOP_KEYS = {"loop_nudges": "nudges", "loop_stops": "stops"}   # chatbridge stats loop (the loop guard)
 BAD_DAYS = 7
 
 
@@ -211,6 +236,7 @@ def quality(db, cfg: dict, tids, tasks: dict, runs: dict, reviews: dict, fixes: 
     q["first_pass_pct"] = rate(q["first_pass"], q["reviewed"])
     q["bad_pct"] = rate(q["failed"] + q["reopened"], q["decided"])
     q["fix_rounds_per_reviewed"] = round(q["fix_rounds"] / q["reviewed"], 2) if q["reviewed"] else None
+    q["bounce_pct"] = rate(q["bounces"], q["tasks"])
     q["done_per_day"] = round(q["done"] / days, 2) if days > 0 else None
     return q
 
@@ -374,49 +400,101 @@ def text(s: dict) -> str:
 
 
 def settings(cfg: dict) -> dict:
-    """route.glm_work's min_tasks and worse_pts, else MIN_TASKS and WORSE_PTS."""
+    """The wave gate's sample minimums and margins: route.glm_work's own values, else the defaults (module doc)."""
     raw = ((cfg.get("route") or {}).get("glm_work")) if isinstance(cfg.get("route"), dict) else None
     raw = raw if isinstance(raw, dict) else {}
     num = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0   # noqa: E731
-    return {"min_tasks": int(raw["min_tasks"]) if num(raw.get("min_tasks")) else MIN_TASKS,
-            "worse_pts": float(raw["worse_pts"]) if num(raw.get("worse_pts")) else WORSE_PTS}
+    got = lambda k, d: type(d)(raw[k]) if num(raw.get(k)) else d   # noqa: E731
+    return {"min_tasks": got("min_tasks", MIN_TASKS), "min_base": got("min_base", BASE_MIN),
+            "advance_pts": got("advance_pts", ADVANCE_PTS),
+            "rollback_pts": got("rollback_pts", got("worse_pts", ROLLBACK_PTS)),
+            "advance_rounds": got("advance_rounds", ADVANCE_ROUNDS),
+            "rollback_rounds": got("rollback_rounds", ROLLBACK_ROUNDS),
+            "advance_bounce_pts": got("advance_bounce_pts", ADVANCE_BOUNCE_PTS),
+            "rollback_bounce_pts": got("rollback_bounce_pts", ROLLBACK_BOUNCE_PTS),
+            "hold_done_pct": got("hold_done_pct", HOLD_DONE_PCT),
+            "hold_corrections": got("hold_corrections", HOLD_CORRECTIONS)}
+
+
+def _first_runs(db, lo: float, hi: float) -> set[int]:
+    """Tasks whose first worker run started in [lo, hi)."""
+    return {r["task"] for r in db.q("SELECT task, MIN(started) s FROM runs WHERE role='worker' AND task IS NOT NULL "
+                                    "GROUP BY task HAVING s>=? AND s<?", (lo, hi))}
+
+
+def signals(g: dict, b: dict, before: dict, after: dict, corrections: int, st: dict) -> list[dict]:
+    """Each wave-gate signal (module doc): the GLM arm `g` against the baseline `b`, the project's throughput
+    `after` its first arm record against `before`, and the user corrections; verdict ok | hold | worse | unmeasured."""
+    out = []
+    for name, key, up, adv, back in GATED:
+        gv, bv = g.get(key), b.get(key)
+        few = key in REVIEW_KEYS and min(g["reviewed"], b["reviewed"]) < st["min_base"]
+        if gv is None or bv is None or few:
+            out.append({"signal": name, "glm": gv, "base": bv, "worse_by": None, "verdict": "unmeasured"})
+            continue
+        by = round((gv - bv) if up else (bv - gv), 2)
+        out.append({"signal": name, "glm": gv, "base": bv, "worse_by": by, "advance": st[adv], "rollback": st[back],
+                    "verdict": "worse" if by > st[back] else "hold" if by > st[adv] else "ok"})
+    bd, ad = before.get("done_per_day"), after.get("done_per_day")
+    if before["decided"] < st["min_base"] or not bd or ad is None:
+        out.append({"signal": "tasks done per day", "glm": ad, "base": bd, "worse_by": None, "verdict": "unmeasured"})
+    else:
+        by = round(100.0 * (bd - ad) / bd, 1)
+        out.append({"signal": "tasks done per day", "glm": ad, "base": bd, "worse_by": by, "advance": st["hold_done_pct"],
+                    "verdict": "hold" if by > st["hold_done_pct"] else "ok"})
+    out.append({"signal": "user corrections", "glm": corrections, "base": None, "worse_by": None,
+                "advance": st["hold_corrections"],
+                "verdict": "hold" if corrections > st["hold_corrections"] else "ok"})
+    return out
+
+
+def _says(s: dict) -> str:
+    fmt = lambda v: "-" if v is None else f"{v:g}"   # noqa: E731
+    if s["signal"] == "user corrections":
+        return f"user corrections {s['glm']} in {CORR_DAYS} days (holds above {fmt(s['advance'])})"
+    tail = "" if s["verdict"] == "unmeasured" else f", worse by {fmt(s['worse_by'])}"
+    return f"{s['signal']} GLM {fmt(s['glm'])} vs Claude {fmt(s['base'])}{tail} ({s['verdict']})"
 
 
 def judge(p, cfg: dict, now: float) -> dict:
-    """{"state": "ok" | "worse" | "wait", "why", "n"}: the project's GLM arm against its own Claude baseline (the
-    module doc); n is the GLM tasks with an outcome."""
+    """{"state": "ok" | "worse" | "wait", "why", "n", "signals"}: the project's GLM arm against its own Claude
+    baseline (the module doc); n is the GLM tasks with an outcome."""
+    from . import correction
     db, st = p.db, settings(cfg)
     recs = arm_records(db)
     if not recs:
-        return {"state": "wait", "why": "no glm_work arm records yet", "n": 0}
+        return {"state": "wait", "why": "not enough data: no glm_work arm records yet", "n": 0, "signals": []}
     t0 = min(float(r.get("ts") or now) for r in recs.values())
     since = t0 - BASE_DAYS * 86400
-    pre = {r["task"]: r for r in db.q("SELECT task, MIN(started) s FROM runs WHERE role='worker' AND task IS NOT NULL "
-                                      "GROUP BY task HAVING s>=? AND s<?", (since, t0))}
-    ids = set(recs) | set(pre)
+    pre, post = _first_runs(db, since, t0), _first_runs(db, t0, now)
+    ids = set(recs) | pre | post
     tasks, runs = _tasks(db, ids), _worker_runs(db, ids)
+    work = lambda ts: [t for t in ts if (tasks.get(t) or {}).get("kind") != "review"]   # noqa: E731
     glm = [t for t, r in recs.items() if r.get("arm") == "glm"]
     base = [t for t, r in recs.items() if r.get("arm") == "holdout"] + [
-        t for t in pre if t not in recs and (tasks.get(t) or {}).get("kind") != "review" and runs.get(t)
+        t for t in work(pre) if t not in recs and runs.get(t)
         and not on_glm(runs[t][0]["provider"], runs[t][0]["model"], runs[t][0]["note"])]
     ctx = (_reviews(db, since), _fix_rounds(db, since), _requeued(db, since))
     days = max((now - t0) / 86400, 1e-9)
     g = quality(db, cfg, glm, tasks, runs, *ctx, days, now)
     b = quality(db, cfg, base, tasks, runs, *ctx, days, now)
+    before = quality(db, cfg, work(pre), tasks, runs, *ctx, BASE_DAYS, t0)
+    after = quality(db, cfg, work(post), tasks, runs, *ctx, days, now)
+    corr = sum(1 for c in (db.kv(correction.KEY, []) or [])
+               if isinstance(c, dict) and now - CORR_DAYS * 86400 <= float(c.get("ts") or 0) < now)
+    sig = signals(g, b, before, after, corr, st)
     n = g["decided"]
-    nums = (f"GLM first review passed {g['first_pass_pct']}% of {g['reviewed']}, failed or reopened {g['bad_pct']}% "
-            f"of {n}; Claude baseline {b['first_pass_pct']}% of {b['reviewed']}, {b['bad_pct']}% of {b['decided']}")
-    if n < st["min_tasks"]:
-        return {"state": "wait", "why": f"{n} of {st['min_tasks']} GLM tasks with an outcome; {nums}", "n": n}
+    nums = (f"GLM {n} tasks with an outcome, Claude baseline {b['decided']}; " + "; ".join(_says(s) for s in sig))
+    out = lambda state, why: {"state": state, "why": f"{why}; {nums}", "n": n, "signals": sig}   # noqa: E731
     if g["incidents"]:
-        return {"state": "worse", "why": f"{g['incidents']} device incident(s) on GLM runs; {nums}", "n": n}
-    if b["decided"] < BASE_MIN:
-        return {"state": "wait", "why": f"the Claude baseline has {b['decided']} tasks with an outcome (needs "
-                                         f"{BASE_MIN}); {nums}", "n": n}
-    m = st["worse_pts"]
-    if g["first_pass_pct"] is not None and b["first_pass_pct"] is not None and b["reviewed"] >= BASE_MIN \
-            and g["first_pass_pct"] < b["first_pass_pct"] - m:
-        return {"state": "worse", "why": f"first review pass rate lower by more than {m:g} points; {nums}", "n": n}
-    if g["bad_pct"] is not None and b["bad_pct"] is not None and g["bad_pct"] > b["bad_pct"] + m:
-        return {"state": "worse", "why": f"failed or reopened rate higher by more than {m:g} points; {nums}", "n": n}
-    return {"state": "ok", "why": f"within {m:g} points of the Claude baseline; {nums}", "n": n}
+        return out("worse", f"{g['incidents']} device incident(s) on GLM runs")
+    if n < st["min_tasks"] or b["decided"] < st["min_base"]:
+        return out("wait", f"not enough data: {n} of {st['min_tasks']} GLM tasks and {b['decided']} of "
+                           f"{st['min_base']} baseline tasks with an outcome")
+    worse = [s["signal"] for s in sig if s["verdict"] == "worse"]
+    if worse:
+        return out("worse", f"worse than the Claude baseline past the rollback margin: {', '.join(worse)}")
+    held = [s["signal"] for s in sig if s["verdict"] == "hold"]
+    if held:
+        return out("wait", f"holding the wave: {', '.join(held)} past the advance margin")
+    return out("ok", "within every advance margin of the Claude baseline")

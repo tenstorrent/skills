@@ -170,19 +170,22 @@ def test_glm_work_logs_starts_fallbacks_and_waits_per_hour_and_prunes_old_hours(
     assert len(glmwork.hours(p.db)) == 1   # the hour 60 h back is pruned
 
 
-def test_a_class_route_runs_every_keep_core_check_first(env):
-    """The run-class route no longer returns before the floor and protected checks (not covered)."""
-    from ttp import daemon
+def test_a_class_route_runs_every_keep_core_check_first(env, monkeypatch):
+    """A run class that routes to chat moves a plain work run there, while a conclusion, deep-tier, device or
+    question run stays on core: the class route returns only after the floor and protected checks."""
+    from ttp import runclass
     p = make(env)
-    cfg = {"providers": {"chat": {"endpoint": "placeholder", "base_url": "https://chat.example.invalid/v1"}},
-           "route": {"classes": {"routine": {"to": "chat", "model": _GW_MODEL}}}}
-    d = _gw_daemon(p, cfg)
-    plain = _gw_task(p)
-    got = d._route(plain, "standard", None, 1.0, cls="routine")
-    assert got is None or got["to"] == "chat"
-    assert d._route(_gw_task(p, kind="review"), "standard", None, 1.0, cls="routine") is None
-    assert d._route(_gw_task(p, reply_chat="chat-1"), "standard", None, 1.0, cls="routine") is None
-    assert d._route(_gw_task(p, provider="claude"), "standard", None, 1.0, cls="routine") is None
+    d = _gw_daemon(p, {"providers": {"chat": {"endpoint": "placeholder", "base_url": "https://chat.example.invalid/v1"}}})
+    d._code_arm = lambda *a, **k: None
+    monkeypatch.setattr(runclass, "target", lambda *a, **k: {"to": "chat", "model": _GW_MODEL, "rule": None})
+    d._route_entry = lambda task, tier, name, model, now, rule=None, cls=None, core_only=False, **k: (
+        None if core_only else {"to": name, "model": model})
+    route = lambda t, tier="standard": d._route(t, tier, None, 1.0, cls="routine")   # noqa: E731
+    assert route(_gw_task(p)) == {"to": "chat", "model": _GW_MODEL}
+    assert route(_gw_task(p, spec="tidy the helper and add a test\nconclusion: the helper is tidy")) is None
+    assert route(_gw_task(p), tier="deep") is None
+    assert route(_gw_task(p, spec="reset the device and rerun the hang on the board")) is None
+    assert route(_gw_task(p, kind="question")) is None
 
 
 def test_rank_exclude_keeps_a_model_off_every_ranking_and_stand_in_list(env):

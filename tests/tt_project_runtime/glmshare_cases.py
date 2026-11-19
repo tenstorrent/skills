@@ -93,11 +93,13 @@ def _gs_decided(p, start, passed, provider="chat", arm=None, ts=None):
 def test_glm_share_judge_waits_for_enough_glm_tasks_then_compares_with_the_project_s_own_claude_baseline(env):
     from ttp import glmshare
     p = make(env)
-    cfg = {"route": {"glm_work": {"min_tasks": 3, "worse_pts": 15}}}
+    cfg = {"route": {"glm_work": {"min_tasks": 3, "min_base": 5, "worse_pts": 15}}}
     now = 1_000_000_000.0 + 60 * 86400
     t0 = now - 5 * 86400
     assert glmshare.judge(p, cfg, now)["state"] == "wait"          # no arm records yet
-    assert glmshare.settings({}) == {"min_tasks": 25, "worse_pts": 15.0}
+    st = glmshare.settings({})
+    assert (st["min_tasks"], st["min_base"], st["advance_pts"], st["rollback_pts"]) == (25, 10, 5.0, 15.0)
+    assert glmshare.settings(cfg)["rollback_pts"] == 15.0                # the older worse_pts sets the rollback margin
     # Baseline: 4 of 5 passed in the 14 days before the first arm record, plus a passing holdout task.
     for ok in (1, 1, 1, 1, 0):
         _gs_decided(p, t0 - 3 * 86400, ok, provider="claude")
@@ -110,7 +112,7 @@ def test_glm_share_judge_waits_for_enough_glm_tasks_then_compares_with_the_proje
     _gs_decided(p, t0 + 7200, 1, arm="glm")
     v = glmshare.judge(p, cfg, now)
     assert (v["state"], v["n"]) == ("ok", 3), v
-    assert "GLM first review passed 100.0% of 3" in v["why"] and "Claude baseline 83.3% of 6" in v["why"]
+    assert "GLM 3 tasks with an outcome, Claude baseline 6" in v["why"]
     # Any device incident on a GLM run: worse.
     p.db.x("INSERT INTO events(ts,source,kind,text,task) VALUES(?,?,?,?,?)", (t0 + 60, "watcher", "device_reset", "x", g1))
     v = glmshare.judge(p, cfg, now)
@@ -120,9 +122,71 @@ def test_glm_share_judge_waits_for_enough_glm_tasks_then_compares_with_the_proje
     for _ in range(3):
         _gs_decided(p, t0 + 9000, 0, arm="glm")
     v = glmshare.judge(p, cfg, now)
-    assert (v["state"], v["n"]) == ("worse", 6) and "lower by more than 15 points" in v["why"] and "50.0% of 6" in v["why"]
-    assert glmshare.judge(p, {"route": {"glm_work": {"min_tasks": 3, "worse_pts": 40}}}, now)["state"] == "ok"
+    assert (v["state"], v["n"]) == ("worse", 6) and "first review pass rate GLM 50 vs Claude 83.3" in v["why"]
+    # Inside a wider rollback margin but past the advance margin: the wave holds.
+    v = glmshare.judge(p, {"route": {"glm_work": {"min_tasks": 3, "min_base": 5, "rollback_pts": 40}}}, now)
+    assert v["state"] == "wait" and "holding the wave: first review pass rate" in v["why"]
 
+
+
+_GS_CFG = {"route": {"glm_work": {"min_tasks": 4, "min_base": 4}}}
+
+
+def _gs_waved(p, now, glm_passed=(1, 1, 1, 1)):
+    """A project at its wave gate: 4 passing Claude tasks in the baseline window, then GLM arm tasks."""
+    t0 = now - 5 * 86400
+    for _ in range(4):
+        _gs_decided(p, t0 - 3 * 86400, 1, provider="claude")
+    return t0, [_gs_decided(p, t0 + 3600 * (i + 1), ok, arm="glm") for i, ok in enumerate(glm_passed)]
+
+
+def _gs_verdict(v, name):
+    return next(s["verdict"] for s in v["signals"] if s["signal"] == name)
+
+
+@pytest.mark.parametrize("signal", ["fix rounds per reviewed task", "bounce rate", "tasks done per day",
+                                    "user corrections"])
+def test_glm_share_judge_each_new_signal_past_its_advance_margin_holds_the_wave(env, signal):
+    from ttp import correction, glmshare, route
+    p = make(env)
+    now = 1_000_000_000.0 + 60 * 86400
+    t0, glm = _gs_waved(p, now)
+    assert glmshare.judge(p, _GS_CFG, now)["state"] == "ok"
+    if signal == "fix rounds per reviewed task":       # 2 of 4 reviewed GLM tasks took a fix round: 0.5 vs 0
+        for tid in glm[:2]:
+            rb = _gs_review(p, tid, "failed")
+            _gs_task(p, labels=[f"review_fix:{rb}", f"continues:{tid}"])
+    elif signal == "bounce rate":                      # 1 of 4 GLM tasks bounced to Opus: 25 points vs 0
+        _gs_run(p, glm[0], t0 + 7200, 1, note={route.KEY: {"to": route.TO, "fallback": route.BOUNCE}})
+    elif signal == "tasks done per day":               # 20 done in the 14 days before, 4 in the 5 since
+        for _ in range(16):
+            _gs_decided(p, t0 - 2 * 86400, 1, provider="claude")
+    else:                                              # 4 user corrections in the last 7 days
+        p.db.set_kv(correction.KEY, [{"msg": f"m{i}", "ts": now - 86400} for i in range(4)])
+    v = glmshare.judge(p, _GS_CFG, now)
+    assert (v["state"], _gs_verdict(v, signal)) == ("wait", "hold"), v
+    assert f"holding the wave: {signal}" in v["why"]
+
+
+def test_glm_share_judge_rolls_back_a_clearly_worse_glm_arm(env):
+    from ttp import glmshare
+    p = make(env)
+    now = 1_000_000_000.0 + 60 * 86400
+    _gs_waved(p, now, glm_passed=(1, 0, 0, 0))
+    v = glmshare.judge(p, _GS_CFG, now)
+    assert v["state"] == "worse", v
+    assert _gs_verdict(v, "first review pass rate") == _gs_verdict(v, "failed or reopened rate") == "worse"
+
+
+def test_glm_share_judge_says_not_enough_data_below_the_minimum_sample_in_either_arm(env):
+    from ttp import glmshare
+    p = make(env)
+    now = 1_000_000_000.0 + 60 * 86400
+    _gs_waved(p, now, glm_passed=(0, 0, 0, 0))                          # clearly worse, but 4 of 25 GLM tasks
+    v = glmshare.judge(p, {}, now)
+    assert v["state"] == "wait" and v["why"].startswith("not enough data: 4 of 25 GLM tasks"), v
+    v = glmshare.judge(p, {"route": {"glm_work": {"min_tasks": 4, "min_base": 5}}}, now)   # 4 of 5 baseline
+    assert v["state"] == "wait" and "4 of 5 baseline tasks" in v["why"], v
 
 def test_glm_share_counts_bad_output_per_day_from_glm_runs_exit_records(env):
     """#3660: the bridge's bad-output counters (tool input errors, unparsed arguments, reasoning-only and junk

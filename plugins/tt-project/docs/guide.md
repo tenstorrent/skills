@@ -5339,7 +5339,17 @@ flag; an excluded project never, and a project's own setting still wins. The sta
 the rings (`rollout.waves`, `rollout.wave_at`, `rollout.project_rollback`), as user-only as they are: a run may
 not set them, and the waves and the level change only from the terminal. The gate runs from the daemons without
 a model, at most once an hour per flag across the account: it judges each project of the covered waves against
-its own Claude baseline (`ok`, `worse`, or `wait` with too few reviewed tasks). A `worse` project is rolled back
+its own Claude baseline: `ok`, `worse` or `wait`. Below the minimum sample (`route.glm_work.min_tasks` GLM tasks,
+default 25, and `min_base` baseline tasks with an outcome, default 10; the review signals need that many
+reviewed tasks in each arm) the verdict is `wait` with "not enough data". A device incident on a GLM run is
+`worse` at once. Four signals gate both ways, each with a tight advance margin and a wider rollback margin, so
+noise holds a wave but only a clear gap rolls a project back: first review pass rate and failed or reopened rate
+(5 / 15 points, `advance_pts` / `rollback_pts`), fix rounds per reviewed task (0.25 / 0.5, `advance_rounds` /
+`rollback_rounds`) and bounce rate (10 / 25 points, `advance_bounce_pts` / `rollback_bounce_pts`). Two only hold
+the next wave, because they are project-wide and not tied to the GLM arm alone: tasks done per day down more than
+25% from the 14 days before GLM (`hold_done_pct`) and more than 3 user corrections in 7 days
+(`hold_corrections`). Claude $/day and bad output are reported, never gating. Each verdict lists every signal
+with both arms, the gap and the margins. A `worse` project is rolled back
 for that flag alone, the others keep it; it stays off until `ttp rollout arm <flag> <project>`. When every project
 left in the current wave is `ok`, and none went worse in that pass, the next wave opens; `wait` holds it. Each
 move and rollback is in the ledger (`advance`, `project_rollback`, `project_arm`) and raises one event for the
