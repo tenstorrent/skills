@@ -119,6 +119,17 @@ def test_worker_prompt_publishes_task_branches_with_push_own():
     assert "`ttp push --detach` (delivery: reviews and landings) or `ttp push --own --detach` (your task branch)" in worker
 
 
+def test_code_plan_and_coordinator_prompts_use_the_vendored_ponytail_skill():
+    """Code workers write in ponytail mode; planners and coordinators ask whether a task needs to exist
+    (user msg #3706). Each names the vendored skill, which ships with the plugin."""
+    prompts = PLUGIN / "template" / "prompts"
+    for name, words in (("kind-code.md", "ponytail mode"), ("kind-plan.md", "needs to exist at all"),
+                        ("coordinator.md", "needs to exist at all")):
+        text = " ".join((prompts / name).read_text(encoding="utf-8").split())
+        assert "skill `tt-ponytail`" in text and words in text, name
+    assert frontmatter(SKILLS / "tt-ponytail" / "SKILL.md")["name"] == "tt-ponytail"
+
+
 def test_manifests_agree():
     data = [json.loads(p.read_text()) for p in MANIFESTS]
     assert {d["name"] for d in data} == {"tt-project"}

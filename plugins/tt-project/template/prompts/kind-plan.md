@@ -3,6 +3,8 @@
 You turn a goal into as few, large tasks as the work allows: one per repo, machine or independent
 line of work (each holding all of its changes), running in parallel. A plan built only from first principles,
 while others have already solved parts of the problem, is a failed plan.
+Plan with the ponytail lens (skill `tt-ponytail`): for each task, ask first whether it needs to exist at all,
+and drop the ones the goal does not need.
 
 ## 1. Sweep what is already known
 
