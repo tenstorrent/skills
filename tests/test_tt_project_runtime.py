@@ -27649,6 +27649,7 @@ DURABLE_EXEMPT = {
     ("checkcap.py", "_preempt_path(pid).write_text("): "an urgent run's preempt request, read only while both live; one lost to a crash only leaves that run waiting as before",
     ("shared.py", '.guard", "a")'): "a flock guard file, never written",
     ("globalcap.py", 'global-spend.lock", "a")'): "a flock guard file, never written",
+    ("globalcap.py", 'os.replace(tmp / "s.db", snap)'): "a stopped project's read snapshot, a cache rebuilt from its source; sqlite's checkpoint syncs the copy before the rename",
     ("poolshard.py", 'pool-shards.lock", "a")'): "a flock guard file, never written",
     ("harborslice.py", 'f = open(d / f"{i}.lock", "w")'): "an empty flock file holding one of the host's trial slots; only the lock is used, its contents never read",
     ("poolshard.py", "open(d / LOG, \"a\")"): "the pool stall log, one line per stall or clear, read only by people; the marks and history it describes are written durably",
