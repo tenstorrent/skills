@@ -140,7 +140,7 @@ def bounce_diff(p, task: dict, patterns: list[str], changed: dict | None) -> str
     found = hits(patterns, changed or {})
     if not found:
         return ""
-    if codearm.USER_ARM.search(str(task.get("spec") or "")) and codearm.user_arm(p.db, task)[0]:
+    if codearm.user_arm(p.db, task)[0]:
         return ""   # the user ordered it onto the arm
     tid, branch = task["id"], task.get("branch") or ""
     path = Path(p.worktrees) / f"t{tid}"
