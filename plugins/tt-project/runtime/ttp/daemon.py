@@ -4379,6 +4379,9 @@ class Daemon:
                 tmp_env["TTP_SANDBOXED"] = "1"   # privlock.sandboxed_run
                 if prov.fence_by_name:
                     tmp_env["TTP_FENCE_BY_NAME"] = "1"
+            glm_env = glmguard.run_env(provider, note, glmguard.device_task(task))
+            if glm_env:   # a run under the GLM guards writes scratch files where its guard lets it (glmguard.scratch_env)
+                tmp_env.update(glmguard.scratch_env(run_dir, tmp_env))
             if mcp_servers:
                 # Outside the repo and the run directory, owner-only: server entries can carry tokens.
                 fd, mcp_path = tempfile.mkstemp(prefix=f"ttp-mcp-{run_id}-", suffix=".json")
@@ -4463,7 +4466,6 @@ class Daemon:
             glmassist.arm(run_dir, (note or {}).get(glmassist.KEY))   # its ask-Opus limits, when switched on
             if glmguard.env_for(note) or coordroute.guard_env(note):   # a GLM run: guarded even where its variable is unset
                 glmguard.mark(run_dir)
-            glm_env = glmguard.run_env(provider, note, glmguard.device_task(task))
             if glm_env:   # a run on the chat model: outward posts become drafts, a device run stops at a failed gate
                 glmguard.mark_run(run_dir, glm_env[glmguard.RUN_ENV] == glmguard.DEVICE,
                                   glmguard.gate_lines(str((task or {}).get("spec") or "")))
@@ -13984,6 +13986,8 @@ class Daemon:
                 if on_glm and (assist := glmassist.for_run(self.cfg)):   # ask-Opus switches, logged per run
                     note[glmassist.KEY] = assist
                     prompt += glmassist.prompt_lines(assist)
+                if glmguard.run_env(run_prov, note):   # its TMPDIR is a scratch folder of its own (start_run)
+                    prompt += f"\n\n{glmguard.SCRATCH_LINE}\n"
                 members = [] if note.get("wake") or note.get("resumes") or on_arm else \
                     self._batch_members(task, ready, batched | set(fate), live)
                 if members:

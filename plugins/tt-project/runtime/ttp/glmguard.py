@@ -76,6 +76,12 @@ REDIRECT = re.compile(r"(?<![\w$])\d*(?:&>>?|>>?|<<?<?|>&|<&)\s*(?:&?\d+-?|[^\s;
 STATE_DB = re.compile(r"\bproject\.db\b|\bmachine-workers\.json\b|\b\.tt-project/(?:locks|machines)\b")
 # Every run on the chat model (the code arm, a GLM work route, a routine coordinator lane, a bench run as a task):
 # human interaction stays on Opus, so its outward posts become drafts an Opus step reviews and sends.
+SCRATCH = "tmp"               # in the run folder: the run's own scratch folder, its TMPDIR (TMP, TEMP)
+SCRATCH_VARS = ("TMPDIR", "TMP", "TEMP")
+SCRATCH_LINE = ("Keep scratch files in $TMPDIR (a folder of your own in your run folder) or your worktree, never in"
+                " /tmp: the guard refuses writes anywhere else.")
+_SCRATCH_REF = re.compile(r"\$(?:\{(?:TMPDIR|TMP|TEMP)\}|(?:TMPDIR|TMP|TEMP)(?!\w))")
+_SCRATCH_SET = re.compile(r"(?<![\w${])(?:TMPDIR|TMP|TEMP)(?!\w)")   # the command names one itself (sets it)
 RUN_ENV = "TTP_GLM_RUN"       # "1", or DEVICE for a run on a device task
 RUN_MARK = "glm_run.json"     # in the run folder: {"device", "gates"}, read where the variable is gone
 DEVICE = "device"
@@ -107,6 +113,23 @@ def env_for(note: dict | None) -> dict[str, str]:
     from . import codearm
     arm = (note or {}).get(codearm.KEY)
     return {ENV: "1"} if isinstance(arm, dict) and arm.get("run") == "glm" else {}
+
+
+def scratch_env(run_dir, env=None) -> dict[str, str]:
+    """TMPDIR, TMP and TEMP for a run under the GLM guards: `env`'s own short temp dir (a fenced run's, from
+    shorttmp) when it has one, else the run folder's scratch folder, made here. The guard lets writes go there."""
+    tmp = (env or {}).get("TMPDIR") or ""
+    if not _own_tmp(tmp, str(run_dir)):
+        tmp = str(Path(run_dir) / SCRATCH)
+        Path(tmp).mkdir(exist_ok=True)
+    return {var: tmp for var in SCRATCH_VARS}
+
+
+def _own_tmp(tmp: str, run_dir: str) -> bool:
+    """Whether `tmp` is a run's own scratch folder: its run folder's, or a short temp dir shorttmp made."""
+    from . import shorttmp
+    return bool(tmp) and ((bool(run_dir) and os.path.normpath(tmp) == os.path.normpath(Path(run_dir) / SCRATCH))
+                          or shorttmp.owned(tmp))
 
 
 def mark(run_dir) -> None:
@@ -223,9 +246,15 @@ def _gh_posts(seg: list[str]) -> bool:
                                                          and not HTTP_DATA.search(" ".join(seg[1:])))
 
 
-def _roots(cwd: str, run_dir: str) -> list[str]:
+def _scratch(run_dir: str, env) -> str:
+    """The run's scratch folder as the guard reads it: its TMPDIR when that is its own, else the run folder's."""
+    tmp = str(env.get("TMPDIR") or "")
+    return tmp if _own_tmp(tmp, run_dir) else (str(Path(run_dir) / SCRATCH) if run_dir else "")
+
+
+def _roots(cwd: str, run_dir: str, scratch: str = "") -> list[str]:
     out = []
-    for x in (cwd, run_dir):
+    for x in (cwd, run_dir, scratch):
         if x:
             out += [os.path.normpath(x), os.path.realpath(x)]
     return out
@@ -263,9 +292,11 @@ def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None) -> str | None
             return "a run on the GLM arm does not send data to a service (an HTTP post)"
         elif name in REACH:
             return f"`{name}` reaches another host, person or database: not for a run on the GLM arm"
-    home = os.path.expanduser("~")
-    roots = _roots(cwd, run_dir)
-    for path, (cls, why) in sidefx.classify_paths(cmd, home, cwd or os.getcwd(), run_dir).items():
+    home, tmp = os.path.expanduser("~"), _scratch(run_dir, e)
+    roots = _roots(cwd, run_dir, tmp)
+    # $TMPDIR is the run's scratch folder, unless the command sets it itself: then it is read as /tmp
+    paths = _SCRATCH_REF.sub(lambda m: "/tmp" if _SCRATCH_SET.search(cmd) or not tmp else tmp, cmd)
+    for path, (cls, why) in sidefx.classify_paths(paths, home, cwd or os.getcwd(), run_dir).items():
         if cls == "write" and not sidefx._inside(path, roots):
             return f"it writes outside its worktree: {path} ({why})"
     return None
@@ -284,7 +315,7 @@ def tool_refusal(payload: dict, env=None) -> str | None:
     if tool.startswith("mcp__"):
         return "a connector tool reaches a person or a service outside the hand-off"
     if tool in WRITE_TOOLS:
-        home, roots = os.path.expanduser("~"), _roots(cwd, run_dir)
+        home, roots = os.path.expanduser("~"), _roots(cwd, run_dir, _scratch(run_dir, e))
         paths = sidefx._arg_paths(args) + sidefx._patch_paths(json.dumps(args) if tool == "apply_patch" else
                                                               str(args.get("input") or args.get("patch") or ""))
         for p in paths:

@@ -586,6 +586,51 @@ def test_glm_guard_refuses_a_file_write_outside_the_worktree_and_any_connector_t
     assert ask("Bash", {"command": "ttp note hi"}) is None and ask("Bash", {"command": "ttp note --to x hi"})
 
 
+@_pytest.mark.parametrize("cmd", [
+    "git diff > $TMPDIR/daemon_diff.txt", "cp src/a.py ${TMPDIR}/a.orig.py", 'echo x > "$TMP/x"', "tee $TEMP/y < a.txt",
+    "mkdir -p $TMPDIR/sub && cp a $TMPDIR/sub/", "echo x > {scratch}/z"])
+def test_glm_guard_allows_writes_to_the_runs_own_scratch_folder(cmd, tmp_path):
+    """cell scratch_allowed: $TMPDIR (TMP, TEMP) is the run folder's scratch folder, by name or by path."""
+    from ttp import glmguard
+    wt, rd = _gg_run(tmp_path)
+    tmp = glmguard.scratch_env(rd)["TMPDIR"]
+    env_ = {"TTP_PROJECT": str(tmp_path / "proj"), "TTP_RUN_DIR": str(rd), "TMPDIR": tmp, **_GG_RUN_ENV}
+    assert glmguard.shell_refusal(cmd.replace("{scratch}", tmp), str(wt), str(rd), env_) is None, cmd
+    assert glmguard.tool_refusal({"tool_name": "Bash", "tool_input": {"command": cmd.replace("{scratch}", tmp)},
+                                  "cwd": str(wt)}, env_) is None, cmd
+
+
+@_pytest.mark.parametrize("cmd", [
+    "git diff > /tmp/daemon_diff.txt", "cp src/a.py /tmp/a.orig.py", "echo x > /tmp/x", "TMPDIR=/tmp; cp a $TMPDIR/x",
+    "export TMPDIR=/var/tmp && echo x > $TMPDIR/y", "TMP=/tmp cp a ${TMP}/x"])
+def test_glm_guard_still_refuses_writes_to_tmp_and_to_a_tmpdir_the_command_set_itself(cmd, tmp_path):
+    """cell scratch_tmp_refused: the scratch folder opens no other part of /tmp."""
+    from ttp import glmguard
+    wt, rd = _gg_run(tmp_path)
+    tmp = glmguard.scratch_env(rd)["TMPDIR"]
+    env_ = {"TTP_PROJECT": str(tmp_path / "proj"), "TTP_RUN_DIR": str(rd), "TMPDIR": tmp, **_GG_RUN_ENV}
+    assert "outside its worktree" in (glmguard.shell_refusal(cmd, str(wt), str(rd), env_) or ""), cmd
+
+
+def test_a_glm_runs_scratch_folder_is_in_its_run_folder_or_its_own_short_temp_dir_and_its_prompt_names_it(tmp_path):
+    """cell scratch_env: the daemon exports it for every run under the GLM guards; a Write there is allowed."""
+    import inspect
+    from ttp import daemon, glmguard
+    wt, rd = _gg_run(tmp_path)
+    env_ = glmguard.scratch_env(rd)
+    assert env_ == dict.fromkeys(("TMPDIR", "TMP", "TEMP"), str(rd / "tmp")) and (rd / "tmp").is_dir()
+    assert glmguard.scratch_env(rd, {"TMPDIR": "/tmp"}) == env_   # a TMPDIR that is not its own is replaced
+    run = {"TTP_RUN_DIR": str(rd), **env_, **_GG_RUN_ENV}
+    assert glmguard.tool_refusal({"tool_name": "Write", "tool_input": {"file_path": str(rd / "tmp" / "a.txt")},
+                                  "cwd": str(wt)}, run) is None
+    assert "outside its worktree" in glmguard.tool_refusal(
+        {"tool_name": "Write", "tool_input": {"file_path": "/tmp/a.txt"}, "cwd": str(wt)}, run)
+    src = inspect.getsource(daemon)
+    assert "tmp_env.update(glmguard.scratch_env(run_dir, tmp_env))" in src
+    assert "if glmguard.run_env(run_prov, note):" in src and "glmguard.SCRATCH_LINE" in src
+    assert "$TMPDIR" in glmguard.SCRATCH_LINE and "/tmp" in glmguard.SCRATCH_LINE
+
+
 def test_glm_guard_hook_denies_a_refused_call_and_ends_the_run_as_a_bounce(monkeypatch, tmp_path):
     import json
     from ttp import codearm, hook
