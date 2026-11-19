@@ -10,9 +10,8 @@ alike) and the GLM shell (glmenv.refusal) ask it. RULES, with the setting each r
 - slurm_nodes (guards.slurm): srun, sbatch or salloc naming nodes (-w, --nodelist) that squeue shows
   holding another user's job, or sinfo shows drained, down or reserved; --jobid or --dependency onto
   another user's job; scancel of another user's job (by id or -u); and scontrol update of a node's
-  state are refused, also inside ssh to a login host (the same ssh runs the query there). -u $USER
-  (or ${USER}, $LOGNAME, $(whoami)) is the caller; a job id squeue no longer knows has no live
-  holder. Any other query that fails or times out refuses: the rule never guesses. Set guards.slurm to true on a project that
+  state are refused, also inside ssh to a login host (the same ssh runs the query there). A query
+  that fails or times out refuses: the rule never guesses. Set guards.slurm to true on a project that
   uses Slurm; guards.slurm_queue_pinned true also lets an sbatch without --immediate name busy or
   drained nodes, since it only queues. Calls inside wrapper scripts are not seen.
 - landing_push (delivery.push_branch, delivery.fast_forward_also, delivery.mirror_remotes and
@@ -41,9 +40,6 @@ FIRES = "ruleguard.jsonl"
 SLURM_PROGS = {"srun", "sbatch", "salloc", "scancel", "scontrol"}
 SCANCEL_VALUE_OPTS = {"-A", "-M", "-n", "-p", "-q", "-R", "-s", "-t", "-u", "-w"}
 QUERY_TIMEOUT_S = 15
-CALLER = {"$USER", "${USER}", "$LOGNAME", "${LOGNAME}", "$(whoami)", "`whoami`", "$(id -un)", "`id -un`"}   # -u forms naming the caller
-CALLER_SUBST = re.compile(r"(?:-u\s*|--user[=\s]+)\$\((?:whoami|id -un)\)")   # unquoted: split off as "$"
-_ANY_SUBST = re.compile(r"(?:-u\s*|--user[=\s]+)\$\([^)]*\)")
 HELD_STATES = ("drain", "drng", "down", "resv", "reserved", "maint")
 PUSH_VALUE_OPTS = {"--repo", "--receive-pack", "--exec", "-o", "--push-option"}
 UNDO_MIN_CHARS = 8
@@ -154,22 +150,10 @@ def _query(prefix: list[str], script: str, env) -> str:
     return got.stdout
 
 
-def _scancel_callers(command) -> bool | None:
-    """Whether every unquoted `-u $(...)` inside a scancel's own text (a command's text ends at
-    ; && || | or a line break) is the caller's own name; None when there is none. Read over the whole
-    command: the shell parse keeps only a call's words before its first substitution. A substitution of
-    another command (`squeue -u $(whoami)`) is no scancel's."""
-    found = [bool(CALLER_SUBST.fullmatch(m.group(0)))
-             for text in re.split(r"\s*(?:;|&&|\|\||\||\n)\s*", str(command)) if re.search(r"\bscancel\b", text)
-             for m in _ANY_SUBST.finditer(text)]
-    return all(found) if found else None
-
-
 def _slurm(command, segments, cfg, cwd, env) -> str | None:
     g = cfg.get("guards") or {}
     if not g.get("slurm"):
         return None
-    own = _scancel_callers(command)
     for prefix, words in _slurm_calls(segments):
         prog, args = os.path.basename(words[0]), words[1:]
         if prog == "scontrol":
@@ -181,8 +165,7 @@ def _slurm(command, segments, cfg, cwd, env) -> str | None:
         queued = prog == "sbatch" and not any(a == "-I" or a.startswith("--immediate") for a in args)
         nodes = "" if queued and g.get("slurm_queue_pinned") else ",".join(_opt(args, "-w", "--nodelist"))
         if prog == "scancel":
-            users = [u for u in _opt(args, "-u", "--user")
-                     if u not in CALLER and not (u == "$" and own)] + ["$"] * (own is False)
+            users = _opt(args, "-u", "--user")
             jobs = [a for i, a in enumerate(args) if re.match(r"\d", a) and (i == 0 or args[i - 1] not in SCANCEL_VALUE_OPTS)]
             nodes = ""
         else:
@@ -195,9 +178,7 @@ def _slurm(command, segments, cfg, cwd, env) -> str | None:
         if nodes:
             script += f" && squeue -h -w {q(nodes)} -o '%u %i' && echo @@ && sinfo -h -N -n {q(nodes)} -o '%N %T'"
         for j in jobs:
-            # a job that ended is no longer listed: squeue -j exits 1 with 'Invalid job id', no live holder
-            script += (f" && echo @@ && {{ squeue -h -j {q(j)} -o '%u %i' 2>/dev/null"
-                       f" || squeue -h -j {q(j)} 2>&1 | grep -q 'Invalid job id'; }}")
+            script += f" && echo @@ && squeue -h -j {q(j)} -o '%u %i'"
         try:
             parts = _query(prefix, script, env).split("@@")
         except (OSError, RuntimeError, subprocess.SubprocessError):

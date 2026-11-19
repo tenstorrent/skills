@@ -209,9 +209,8 @@ def _tip(repo: Path, onto: str, fetch: bool) -> tuple[str, str]:
         remote, _, branch = onto[len("refs/remotes/"):].partition("/")
     if fetch and remote in remotes and branch:
         try:
-            from .ghroute import push_argv
-            subprocess.run(push_argv(["git", "-C", str(repo), "fetch", "-q", remote,
-                                      f"+refs/heads/{branch}:refs/remotes/{remote}/{branch}"]),
+            subprocess.run(["git", "-C", str(repo), "fetch", "-q", remote,
+                            f"+refs/heads/{branch}:refs/remotes/{remote}/{branch}"],
                            stdin=subprocess.DEVNULL, capture_output=True, timeout=FETCH_S,
                            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
         except subprocess.TimeoutExpired:

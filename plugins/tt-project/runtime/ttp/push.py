@@ -2136,7 +2136,7 @@ def _fetch_bounded(repo: Path, remote: str, branch: str) -> str:
     """_fetch with no prompt, no stdin and at most REACH_FETCH_S: "" when it times out."""
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
     try:
-        if subprocess.run(ghroute.push_argv(["git", "-C", str(repo), "fetch", remote, f"+refs/heads/{branch}:{tracking_ref(remote, branch)}"]),
+        if subprocess.run(["git", "-C", str(repo), "fetch", remote, f"+refs/heads/{branch}:{tracking_ref(remote, branch)}"],
                           stdin=subprocess.DEVNULL, stdout=2, text=True, env=env,
                           timeout=REACH_FETCH_S).returncode != 0:
             return ""
