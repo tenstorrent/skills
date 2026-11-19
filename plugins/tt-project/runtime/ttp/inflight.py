@@ -15,6 +15,11 @@ Refusals: a capacity or rate-limit answer (HTTP 429, 503, 529) halves the host's
 once (floor 1, refused()); it then comes back by one per quiet minute (RESTORE_S), never above the
 cap. The level lives in level.json beside the slots, written under level.lock. Calls already in
 flight when the level drops finish; new ones take only slots below the level.
+
+Priority: a process whose environment has TTP_CHAT_PRIORITY=low (`ttp bench`, `ttp model-bench` and
+the tool probe set it; their children inherit it) takes no free slot while a normal call is
+waiting for one. A normal call that waits marks itself with a `wait.*` file it holds an flock on
+(gone with the process, like a slot); a low call only orders itself behind those, never ahead.
 """
 from __future__ import annotations
 
@@ -30,6 +35,11 @@ DIR = "chat-inflight"   # under the account home's locks/
 RESTORE_S = 60.0   # one more call allowed per this many quiet seconds after a refusal
 POLL_S = (0.2, 1.0)   # a waiting call's next try, a random wait in this range
 REFUSALS = (429, 503, 529)   # answers that lower the level
+PRIORITY_ENV = "TTP_CHAT_PRIORITY"   # "low": wait while a normal call waits (benches, probes, A/B runs)
+
+
+def low_priority(environ=None) -> bool:
+    return str((os.environ if environ is None else environ).get(PRIORITY_ENV) or "").strip().lower() == "low"
 
 
 def cap() -> int:
@@ -130,25 +140,76 @@ def _try(d: Path, n: int) -> tuple[int, int] | None:
     return None
 
 
-def acquire(timeout_s: float, sleep=time.sleep, clock=time.monotonic) -> Slot | None:
-    """A slot for one call, waiting up to `timeout_s`; None when none came free in time. No cap: a
-    Slot that holds nothing, at once. The cap and level are read again on every try."""
-    start = clock()
-    while True:
-        n = allowed()
-        if n <= 0:
-            return Slot()
-        d = folder()
+def _live(f: Path) -> bool:
+    """True while some process holds `f`'s flock; a file no one holds is removed (its waiter died)."""
+    try:
+        fd = os.open(f, os.O_RDWR)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return True
+    else:
         try:
-            d.mkdir(parents=True, exist_ok=True)
+            f.unlink()
         except OSError:
-            return Slot()   # the account home cannot be written: no cap can hold, never stop the call
-        got = _try(d, n)
-        if got:
-            return Slot(got[0], got[1], round(clock() - start, 3))
-        if clock() - start >= timeout_s:
-            return None
-        sleep(random.uniform(*POLL_S))
+            pass
+        return False
+    finally:
+        os.close(fd)
+
+
+def normal_waiting(d: Path | None = None) -> bool:
+    """Whether a normal-priority call is waiting for a slot now."""
+    d = folder() if d is None else d
+    return any(_live(f) for f in d.glob("wait.*")) if d.is_dir() else False
+
+
+def _mark_waiting(d: Path) -> tuple[int, Path] | None:
+    f = d / f"wait.{os.getpid()}.{random.getrandbits(32):08x}"
+    try:
+        fd = os.open(f, os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return None
+    return fd, f
+
+
+def _unmark(mark: tuple[int, Path] | None) -> None:
+    if mark:
+        try:
+            mark[1].unlink()
+        except OSError:
+            pass
+        os.close(mark[0])
+
+
+def acquire(timeout_s: float, sleep=time.sleep, clock=time.monotonic, low: bool | None = None) -> Slot | None:
+    """A slot for one call, waiting up to `timeout_s`; None when none came free in time. No cap: a
+    Slot that holds nothing, at once. The cap and level are read again on every try. `low` (default:
+    TTP_CHAT_PRIORITY=low) takes no slot while a normal call waits."""
+    start, low, mark = clock(), low_priority() if low is None else low, None
+    try:
+        while True:
+            n = allowed()
+            if n <= 0:
+                return Slot()
+            d = folder()
+            try:
+                d.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                return Slot()   # the account home cannot be written: no cap can hold, never stop the call
+            got = None if low and normal_waiting(d) else _try(d, n)
+            if got:
+                return Slot(got[0], got[1], round(clock() - start, 3))
+            if clock() - start >= timeout_s:
+                return None
+            if not low and mark is None:
+                mark = _mark_waiting(d)
+            sleep(random.uniform(*POLL_S))
+    finally:
+        _unmark(mark)
 
 
 def held() -> int:

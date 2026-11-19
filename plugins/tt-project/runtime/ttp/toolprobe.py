@@ -250,6 +250,6 @@ def main(cfg: dict, n: int, alias: str = "", model: str = "", tier: str = "stand
         raise ValueError("no chat endpoint or model: set providers.chat (endpoint, tiers.<tier>.model) "
                          "or pass --endpoint and --model")
     jp = entry.get("junk_patterns")
-    os.environ.setdefault("TTP_CHAT_PRIORITY", "low")   # a probe never takes a slot before project work
+    os.environ.setdefault(inflight.PRIORITY_ENV, "low")   # a probe never takes a slot before project work
     return probe(n, endpoint_post(alias, str(entry.get("base_url") or "")), model,
                  jp if isinstance(jp, dict) and not chatbridge._junk_problems(jp) else None)

@@ -332,3 +332,26 @@ def test_babysit_and_modelbench_calls_take_a_slot_and_back_off(env, monkeypatch)
     finally:
         hold.release()
     assert modelbench.JITTER > 0
+
+
+def test_inflight_low_priority_calls_wait_while_a_normal_call_waits(env):
+    from ttp import inflight
+    _cap(1)
+    assert inflight.low_priority({"TTP_CHAT_PRIORITY": "low"}) and not inflight.low_priority({})
+    held = inflight.acquire(1, low=False)
+    ticks = iter(range(100))
+    seen = []
+    got = inflight.acquire(2, low=False, sleep=lambda s: seen.append(inflight.normal_waiting()),
+                           clock=lambda: next(ticks))
+    assert got is None and seen and all(seen), "a normal call marks itself while it waits"
+    assert not inflight.normal_waiting(), "and unmarks once it stops waiting"
+    mark = inflight._mark_waiting(inflight.folder())   # a normal call waiting elsewhere
+    held.release()
+    assert inflight.acquire(0, low=True) is None, "a low call yields the free slot"
+    with inflight.acquire(0, low=False) as s:
+        assert s.index == 0
+    inflight._unmark(mark)
+    with inflight.acquire(0, low=True) as s:
+        assert s.index == 0, "no normal call waits: the low call goes"
+    (inflight.folder() / "wait.999999.dead").write_text("")   # a waiter that died: no flock on it
+    assert not inflight.normal_waiting() and not (inflight.folder() / "wait.999999.dead").exists()

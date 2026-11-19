@@ -17863,6 +17863,8 @@ def main(argv: list[str] | None = None) -> None:
     dry_run_stub(a, name)
     blind_gate(a)
     glm_gate(a, name)
+    if name in ("bench", "model-bench"):   # inflight.PRIORITY_ENV: their chat calls yield to project work
+        os.environ.setdefault("TTP_CHAT_PRIORITY", "low")
     try:
         _recover_setup()     # a `ttp setup` a reboot cut short: finished or rolled back before anything else
     except Exception as e:

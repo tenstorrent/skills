@@ -1956,6 +1956,9 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    `tool_choice` `auto` (some endpoints refuse a forced choice), validates each call with
    jsonschema from a virtual environment (the checks env), never the user's site-packages, and
    prints the valid, invalid, wrong-tool, refused and junk counts as JSON.
+   Calls from a process with `TTP_CHAT_PRIORITY=low` in its environment (`ttp bench`, `ttp
+   model-bench` and the probe set it, and their children inherit it) take no free slot while a
+   project's call is waiting for one.
 
 The key stays in the per-user secrets store and the bridge's upstream requests: the agent gets
 only the bridge's address and a per-run token. Reasoning text from the endpoint is dropped
