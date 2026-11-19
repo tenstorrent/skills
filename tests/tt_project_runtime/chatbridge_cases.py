@@ -4032,10 +4032,10 @@ def test_a_swap_in_another_call_never_sends_the_stand_ins_fields_with_the_old_mo
     up = mock_chat(_MID_OK)
     real = chatbridge.to_chat
     with _mid_bridge(up, tmp_path, ["run-model", "alt-model"], fields={"reasoning_effort": "low"}) as b:
-        def racing(body, model, max_tokens):
+        def racing(body, model, *rest):
             with b._swap_lock:   # what a parallel call's _swapped does
                 b.model, b.fields, b.rejected = "alt-model", {"reasoning_effort": "high"}, False
-            return real(body, model, max_tokens)
+            return real(body, model, *rest)
         monkeypatch.setattr(chatbridge, "to_chat", racing)
         assert _post(b, _MID_ASK)[0] == 200
     sent = [s["body"] for s in up.seen if "body" in s]
