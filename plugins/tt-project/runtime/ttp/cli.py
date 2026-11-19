@@ -13232,6 +13232,25 @@ def cmd_config(a) -> None:
         p, a.key, a.value = here(), a.name, a.key
     else:
         p = need(a.name, sys.argv[1:])
+    if a.add is not None:
+        if a.value is not None or not a.key or a.account:
+            die("usage: ttp config [NAME] KEY --add VALUE")
+        node = p.config()
+        for part in a.key.split("."):
+            node = node.get(part) if isinstance(node, dict) else None
+        from .project import key_type_problem
+        if node is None and key_type_problem(a.key, []) is None and key_type_problem(a.key, {}):
+            node = []   # a list key with no default, not set yet
+        if not isinstance(node, list):
+            die(f"{a.key} is not a list key: --add adds one item to a list")
+        try:
+            item = json.loads(a.add)
+        except ValueError:
+            item = a.add
+        if item in node:
+            print(f"{a.key} already has {json.dumps(item)}")
+            return
+        a.value = json.dumps(node + [item])   # set through the same checks as a whole value
     if a.value is None:
         node = p.config()   # the effective config: project.json over the defaults
         for part in (a.key or "").split(".") if a.key else []:
@@ -17777,6 +17796,9 @@ def main(argv: list[str] | None = None) -> None:
                                             "refuses another type")
     s.add_argument("--account", action="store_true",
                    help="the account-level setting (" + ", ".join(account_keys()) + "); '' removes it")
+    s.add_argument("--add", metavar="VALUE",
+                   help="add one item (JSON or plain text) to a list key, keeping its other items; an item it "
+                        "already has is left as is, and a key that is not a list is refused")
     s.add_argument("--chat-settable", action="store_true",
                    help="check, without setting it, whether a coordinator config_set accepts KEY (and VALUE): "
                         "ttp config --chat-settable KEY [VALUE]; KEY `list` prints every accepted key")
