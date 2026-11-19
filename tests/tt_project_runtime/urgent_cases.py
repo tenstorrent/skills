@@ -213,6 +213,13 @@ def test_an_urgent_task_in_review_ten_minutes_raises_one_review_stall(env):
     assert stalls() == [], "review_stall_s 0 turns it off for urgent tasks too"
 
 
+def test_the_code_prompt_hands_an_urgent_task_to_review_beside_its_device_or_cluster_smoke():
+    text = " ".join((RUNTIME.parent / "template" / "prompts" / "kind-code.md").read_text().split())
+    rule = text.split("Urgent (priority 1")[1].split("- While you iterate")[0]
+    assert "once your CPU checks pass, hand off `done`" in rule and "runs beside the review" in rule
+    assert "push still waits for required checks" in rule
+
+
 def test_the_device_runner_takes_an_urgent_job_before_older_routine_ones(tmp_path):
     from ttp import devq
     d = tmp_path / "rq"

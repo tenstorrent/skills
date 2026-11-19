@@ -21,6 +21,8 @@
   files such as checks.running (refused). If only recording the result is
   left, put it in `on_pass` (`"on_pass": {"status": "done", "summary": "..."}`): a pass on the
   same head records it model-free. No `on_pass`, `next_step`, PR or landing left: a pass records `done`.
+- Urgent (priority 1 or `urgent:`): once your CPU checks pass, hand off `done`; a device, cluster or
+  remote smoke runs beside the review (say in `summary` how to read it). The push still waits for required checks.
 - While you iterate, run only the tests your change affects (a file, `pytest -k`, `file::test`),
   never the full suite: each fix would cost a full run. Run `ttp checks`
   once at the end, committed, before the hand-off. A direct full-suite run is refused.
