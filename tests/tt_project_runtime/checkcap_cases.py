@@ -2734,7 +2734,6 @@ def test_wall_cap_extends_a_run_still_progressing_and_stops_a_silent_or_stalled_
     assert near.granted <= near.room and near.cap_s + near.granted <= checkwall.CEILING_S
     assert checkwall.Extension(3600).room == 1800
 
-
 def test_a_check_printing_but_stuck_at_0_percent_is_stopped_after_15_min_not_left_to_the_cap(tmp_path, monkeypatch):
     # #9048: shards skipped every held pool host and printed `[0%] 0/273` for 2 h until the wall-time cap.
     from ttp import checkwall
