@@ -404,13 +404,18 @@ def _read(path: Path) -> dict:
         return {}
 
 
+def _write(path: Path, rec: dict) -> None:
+    from .project import durable_write
+    durable_write(path, json.dumps(rec, indent=1))
+
+
 def shadow_started(state_dir, opus_run, shadow_run, why_routine, now: float | None = None) -> None:
     path = shadow_path(state_dir, opus_run)
     path.parent.mkdir(parents=True, exist_ok=True)
     rec = _read(path)
     rec.update({"opus_run": int(opus_run), "shadow_run": shadow_run, "ts": time.time() if now is None else now,
                 "routine_why": why_routine})
-    path.write_text(json.dumps(rec, indent=1))
+    _write(path, rec)
 
 
 def shadow_side(state_dir, opus_run, side: str, actions, status: str, cost: float = 0.0,
@@ -428,7 +433,7 @@ def shadow_side(state_dir, opus_run, side: str, actions, status: str, cost: floa
     rec[side] = side_rec
     if "opus" in rec and "glm" in rec:
         rec["compare"] = compare(rec["opus"], rec["glm"])
-    path.write_text(json.dumps(rec, indent=1))
+    _write(path, rec)
     return rec
 
 
