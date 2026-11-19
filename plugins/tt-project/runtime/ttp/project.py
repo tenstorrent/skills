@@ -763,8 +763,8 @@ EXTRA_KEYS = {
     # "effort", "harness", "holdout", "holdout_held", "seed", "kinds", "keep_urgent", "fallback" {"provider", "model", "effort"},
     # "min_tasks", "worse_pts", "bounce" (false: a GLM hand-off asking for Opus or deep stands, glmwork.bounce_reason)); core_cheap: {class: {"model", "effort"} | false} or false. Both
     # are account keys too (ACCOUNT_KEYS): the account's value first, the project's own over it. classes,
-    # review_small_lines, review_medium_lines: the run classes' map and review sizes; host_max: host-wide (HOST_WIDE_KEYS).
-    "route": {"code_sonnet", "core_cheap", "device_ab", "device_ab_shadow", "classes", "review_small_lines", "review_medium_lines", "host_max", "glm_work"},
+    # review_small_lines: the run classes' map and the small-review size; host_max: host-wide (HOST_WIDE_KEYS).
+    "route": {"code_sonnet", "core_cheap", "device_ab", "device_ab_shadow", "classes", "review_small_lines", "host_max", "glm_work"},
     "budget": {"max_waits", "hourly_floor_usd", "estimate_weights", "hourly_waste_usd", "hourly_waste_runs",
                "hourly_coordinator_turns", "hourly_coordinator_repeats", "max_pace_hold_s",
                "cap_yellow_pct"},   # max_pace_hold_s: deprecated and ignored; accepted so old configs stay quiet
@@ -1135,6 +1135,7 @@ RETIRED_KEYS = {
     "upgrade.merge_retry_h": "a conflicting upgrade queues its merge task at once, never on a timer",
     "upgrade.task_every_h": "a conflicting upgrade queues its merge task at once, never on a timer",
     "coordinator.unblock_effort": "every coordinator runs at one effort level, coordinator.effort",
+    "route.review_medium_lines": "every review runs on Opus, so no review is sized into the routine class",
     "bridge.agent_alert_grace_min": "replaced by bridge.agent_alert_after_min (when the user is told) and "
                                     "bridge.agent_steady_min (when an outage ends)",
 }
@@ -3324,7 +3325,7 @@ CPU_GROUP_KEYS = {"cpu_quota", "busy_cpu_quota", "busy_probe", "busy_probe_s", "
 # project's own project.json, so the projects on a machine agree unless one overrides a key.
 ACCOUNT_KEYS = {"budget": {"global_daily_usd", "daily_target_usd", "day_start", "timezone", "push_spend_to"}, "pricing": {"claude", "codex"},
                 "guards": {"protected_paths"},   # paths no run on the host writes (pathguard)
-                "route": {"host_max", "classes", "review_small_lines", "review_medium_lines", "code_sonnet", "core_cheap", "device_ab", "device_ab_shadow", "glm_work"},   # route.host_limit; run-class routing (runclass.py); route.device_ab (deviceab.py)
+                "route": {"host_max", "classes", "review_small_lines", "code_sonnet", "core_cheap", "device_ab", "device_ab_shadow", "glm_work"},   # route.host_limit; run-class routing (runclass.py); route.device_ab (deviceab.py)
                 "checks": {"host_max", "bare_slots", "idle_hold_s", "load_extra", "live_cores", "nice", "ionice", "priority_turns", "urgent_slots", "preempt_after_s", "test_pool", "test_run_max",
                            "test_run_min", "test_project_max", "test_project_slots", "test_project_workers", "load_guard", "load_sustain_s", "build_pool", "build_run_max", "build_project_max", "wall_cap_s",
                            "slots", "light_cmds", "max_wait_s", "wait_event_s", "priority_age_s",

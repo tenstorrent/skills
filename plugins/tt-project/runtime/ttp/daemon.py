@@ -3986,6 +3986,15 @@ class Daemon:
                 if "effort" in pin:
                     pin["effort"] = raised
                 note = {**(note or {}), "effort_floor": {"model": model, "to": raised}}
+        if (role == "reviewer" or (task or {}).get("kind") == "review") and provider == "claude" \
+                and not (task and failover.required(self.p.db, task)):
+            # Reviews, their retries and re-reviews run on Opus at high or more, whatever the tier map or a
+            # re-review's light sizing picked; only a pin the user required keeps its model.
+            kept = runclass.review_model(model, effort)
+            if kept != (model, effort):
+                note = {**(note or {}), "review_model": {"from": f"{model}:{effort}", "to": ":".join(kept)}}
+                model, effort = kept
+                pin.update({k: v for k, v in zip(("model", "effort"), kept) if k in pin})
         if role != "coordinator" and task and blindreview.is_blind_task(task) and effort:
             capped = blindreview.cap_effort(effort)   # a blind grader never runs above blindreview.GRADER_EFFORT
             if capped != effort:

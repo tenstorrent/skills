@@ -23,7 +23,7 @@ def test_run_classes_cover_every_kind_of_run():
     assert c({"kind": "review", "tier": "standard", "title": "r"}, {"note": {"review_tier": {"lines": 900}}}) == "hard"
     assert c({"kind": "review", "tier": "standard", "title": "r"}, {"note": {}}) == "hard"   # size unknown
     assert c({"kind": "review", "tier": "standard", "title": "r"}, {"note": {"review_tier": {"lines": 120}}},
-             {"route": {"review_small_lines": 100}}) == "routine"
+             {"route": {"review_small_lines": 100}}) == "hard"
     assert c({"kind": "code", "tier": "standard", "title": "x"}, {"note": {"wake": {"tier": "light"}}}) == "worker_wake"
     assert c({"kind": "code", "tier": "light", "title": "x"}) == "light"
     assert c({"kind": "question", "tier": "standard", "title": "why"}) == "status_report"
@@ -42,10 +42,6 @@ def test_routine_runs_take_sonnet_at_high_effort_by_default_and_opus_keeps_hard_
     for kind in ("work", "question", "harness"):
         t = {"kind": kind, "tier": "standard", "title": "tidy the notes"}
         assert c(t) == ("status_report" if kind == "question" else "routine"), kind
-    review = {"kind": "review", "tier": "standard", "title": "r"}
-    assert c(review, {"note": {"review_tier": {"lines": 350}}}) == "routine"
-    assert c(review, {"note": {"review_tier": {"lines": 401}}}) == "hard"
-    assert c(review, {"note": {"review_tier": {"lines": 450}}}, {"route": {"review_medium_lines": 500}}) == "routine"
     for t in ({"kind": "code", "tier": "standard", "title": "x"}, {"kind": "plan", "tier": "standard", "title": "p"},
               {"kind": "work", "tier": "deep", "title": "x"}, {"kind": "work", "tier": "standard", "title": "x",
                                                                 "spec": "run it on the device (tt-smi reset)"}):
@@ -456,6 +452,50 @@ def test_a_code_run_on_sonnet_starts_at_high_by_every_route_and_a_non_code_run_k
     assert argv(model="opus", effort="low") == ("opus", "low")
 
 
+def test_a_review_run_starts_on_opus_whatever_the_tier_map_or_its_sizing_and_a_review_over_the_small_size_is_hard(env, monkeypatch):
+    """A re-review sized light, on a project whose light tier maps to Sonnet low, and a standard-tier review
+    over the small size both start on Opus at high; the latter is of class hard (never routine) with no cheap
+    pick in its run note; so does a review pinned to Sonnet."""
+    from ttp import runclass
+    from ttp.daemon import Daemon
+    from ttp.providers import claude as claude_provider
+
+    class Built(Exception):
+        pass
+    real = claude_provider.Claude.build
+
+    def build(self, **kw):   # the real command line; no agent process starts
+        raise Built(real(self, **kw)[0])
+    monkeypatch.setattr(claude_provider.Claude, "build", build)
+    p = make(env)
+    p.set_config("providers.claude.tiers.light", {"model": "sonnet", "effort": "low"})
+    d = Daemon(p.base)
+
+    def argv(kind="review", role="reviewer", tier="light", note=None, **fields):
+        t = p.db.add_task("Review #1: x", "x", kind=kind, tier=tier, origin="daemon", **fields)
+        with pytest.raises(Built) as got:
+            d.start_run(role, "go", "claude", tier, str(p.root), task=p.db.task(t), note=note)
+        a = list(got.value.args[0])
+        return a[a.index("--model") + 1], (a[a.index("--effort") + 1] if "--effort" in a else "")
+
+    assert argv() == ("opus", "high")
+    review = p.db.task(p.db.add_task("Review #2: x", "x", kind="review", tier="standard", origin="daemon"))
+    note = {"review_tier": {"lines": runclass.SMALL_LINES + 50}}
+    assert runclass.classify(review, {"note": note}) == "hard"
+    cheap = runclass.core_cheap({**d.cfg, "core_provider": "claude"}, review, "hard", "standard", "claude")
+    assert cheap is None and argv(tier="standard", note=note) == ("opus", "high")
+    run_note = {**note, **({runclass.CHEAP_KEY: cheap} if cheap else {})}   # as the dispatch records it
+    p.db.x("INSERT INTO runs(task,role,provider,model,started,status,cost_usd,note) VALUES(?,?,?,?,?,?,?,?)",
+           (review["id"], "reviewer", "claude", "opus", time.time() - 60, "ok", 0.1, json.dumps(run_note)))
+    stats = runclass.by_class(p.db, d.cfg, time.time() - 3600)
+    assert set(stats["classes"]) == {"hard"} and not stats["cheap"]
+    assert argv(model="sonnet", effort="low") == ("opus", "high")
+    assert argv(model="opus", effort="max") == ("opus", "max")
+    assert argv(kind="question", role="worker") == ("sonnet", "low"), "other kinds keep the tier map"
+    assert runclass.review_model("claude-fable-5-1", "xhigh") == ("claude-fable-5-1", "xhigh")
+    assert runclass.review_model("haiku", "") == ("opus", "high")
+
+
 def test_an_urgent_task_takes_its_class_cheap_route_in_every_cheap_class_and_hard_work_keeps_core():
     from ttp import route, runclass
     cfg = _rc_cfg()
@@ -822,10 +862,10 @@ def test_reviews_run_on_their_tiers_core_model_in_every_run_class(env):
     assert runclass.routes(cfg)["review_small"] == "core" and runclass.routes(cfg)["status_report"] == "chat"
     r = {"kind": "review", "tier": "standard", "title": "Review #1: x", "labels": "[]"}
     assert runclass.target(cfg, r, "standard", "review_small") is None
-    assert runclass.core_cheap({}, r, "review_small", "standard", "claude") is None
-    assert runclass.core_cheap({"route": {"core_cheap": {"review_small": {"model": "haiku"}}}},
-                               r, "review_small", "standard", "claude") is None
-    assert runclass.core_cheap({}, r, "status_report", "standard", "claude")["model"] == "sonnet"
+    for cls in runclass.CLASSES:   # no cheap class or cheap config moves a review off its Opus model
+        assert runclass.core_cheap({}, r, cls, "standard", "claude") is None, cls
+        assert runclass.core_cheap({"route": {"core_cheap": {cls: {"model": "haiku"}}}},
+                                   r, cls, "standard", "claude") is None, cls
     user = {**cfg, "route": {"classes": {c: "chat" for c in runclass.CLASSES}}}
     assert runclass.routes(user)["review_small"] == "chat"
     p = make(env)

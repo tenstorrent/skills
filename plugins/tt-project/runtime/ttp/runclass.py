@@ -7,14 +7,13 @@ babysit decisions: jev_calls rows, DECISION_USES); screening (watcher, log and a
 worker_wake (a waiting task's resume turn); status_report (a question, or a work task whose deliverable
 is a status, measurement or report); rebase (a push-conflict fix or a rebase task); review_small (a
 review whose diff is under `route.review_small_lines`, SMALL_LINES); light (light tier); routine (a work,
-question or harness task, or a review up to `route.review_medium_lines`, MEDIUM_LINES); hard (the rest:
-code, plan, deep, device work, large reviews). The dispatch records it on the run note (KEY); a run
+question or harness task); hard (the rest: code, plan, deep, device work, every other review). The dispatch records it on the run note (KEY); a run
 without one is classified the same way at read time from its note.
 
 Routing: `route.classes` {class: "chat" | "core"} (account-level, then the project's value over it)
 over DEFAULT: when the chat provider has a model (chat_model), every class in CHAT goes to chat and
-coordinator, review_small, routine and hard stay on core; the coordinator and every review (a review judges
-work: its tier's core model) never move, whatever the map says. A task's own provider or model pin wins (route.eligible); a task the rule list keeps on core (route.kept_core: needs_deep,
+coordinator, review_small, routine and hard stay on core; the coordinator and every review never move,
+whatever the map says, and a review on Claude runs on Opus at high effort or more (review_model). A task's own provider or model pin wins (route.eligible); a task the rule list keeps on core (route.kept_core: needs_deep,
 user_deep, review_fix, untrusted_input) stays on core; urgency is no such reason here (it orders the run and
 nothing else: an urgent task's cheap-class run takes the class's cheap route), and so does a task the daemon made
 from outside input (untrusted) until the untrusted-input hook guards are live. The model is the run tier's chat
@@ -25,14 +24,13 @@ no class.
 Cheap core fallback (core_cheap): a run of a CHAT class that starts on the Claude core provider anyway (no
 chat model configured, the chat endpoint cooling, logged out or its key refused, its slots full) runs on a
 cheap Claude model at low effort (CORE_CHEAP, under `route.core_cheap` {class: {"model", "effort"} | false},
-false for all) instead of its tier's model, so only the coordinator and hard work run on Opus. It applies at
-the standard tier (light runs keep the light tier's own cheap model; deep is hard), never to a task class
+false for all) instead of its tier's model, so only the coordinator, reviews and hard work run on Opus. It applies at
+the standard tier (light runs keep the light tier's own cheap model; deep is hard), never to a review, a task class
 routing could not move (routable), a model pick, or a class `route.classes` keeps on core. Once the chat
 endpoint answers with a working key, the route's fallback is none and the run goes to the tt model again
 with no config edit. The run note records it (CHEAP_KEY).
 
-Routine (ROUTINE): standard-tier work, question and harness runs and reviews up to MEDIUM_LINES that no
-cheaper class takes run on Sonnet at high effort on the Claude core provider (CORE_CHEAP), never on the chat
+Routine (ROUTINE): standard-tier work, question and harness runs that no cheaper class takes run on Sonnet at high effort on the Claude core provider (CORE_CHEAP), never on the chat
 provider unless `route.classes` sends them there. Opus keeps code, plan, device, deep and user_deep runs,
 needs_deep, urgent and review_fix tasks, tier-up retries and pinned runs (provider, model or effort).
 On by default (ROUTINE_MODEL; `route.core_cheap.routine` {"model", "effort"} picks another); off with
@@ -96,8 +94,8 @@ import time
 KEY = "run_class"
 CLASSES = ("coordinator", "wake_decision", "screening", "worker_wake", "status_report", "rebase",
            "review_small", "light", "routine", "hard")
-# Reviews (review_small too) judge work, so they always run on their tier's core model: route.eligible keeps
-# every review on core before any class route returns, whatever route.classes says.
+# Reviews (review_small and hard) judge work: route.eligible keeps every review on core
+# before any class route returns, whatever route.classes says, and core_cheap never moves one (review_model).
 CHAT = ("wake_decision", "screening", "worker_wake", "status_report", "rebase", "light")
 # The cheap classes an urgent task does not lift to core (urgency sets order only, decision 2026-11-08 23:55
 # PST); a light-tier first run is not one of them: an urgent one starts on core.
@@ -105,7 +103,6 @@ ORDER_ONLY = tuple(c for c in CHAT if c != "light")
 DECISION_USES = ("wake_gate", "wake_tier", "babysit")
 SCREEN_USES = ("screen",)
 SMALL_LINES = 300
-MEDIUM_LINES = 400
 ROUTINE = "routine"
 ROUTINE_KINDS = ("work", "question", "harness")
 QUALITY_GAP = 0.10
@@ -218,13 +215,7 @@ def classify(task: dict | None, run: dict | None = None, cfg: dict | None = None
         return "rebase"
     if kind == "review":
         lines = (note.get("review_tier") or {}).get("lines")
-        small = small_lines(cfg)
-        if isinstance(lines, (int, float)) and task.get("tier") != "deep":
-            if lines < small:
-                return "review_small"
-            if lines <= medium_lines(cfg):
-                return ROUTINE
-        return "hard"
+        return "review_small" if isinstance(lines, (int, float)) and lines < small_lines(cfg) else "hard"
     if note.get("wake"):
         return "worker_wake"
     if tier == "light":
@@ -237,11 +228,6 @@ def classify(task: dict | None, run: dict | None = None, cfg: dict | None = None
 def small_lines(cfg: dict | None) -> int:
     v = ((cfg or {}).get("route") or {}).get("review_small_lines")
     return int(v) if isinstance(v, int) and not isinstance(v, bool) and v > 0 else SMALL_LINES
-
-
-def medium_lines(cfg: dict | None) -> int:
-    v = ((cfg or {}).get("route") or {}).get("review_medium_lines")
-    return int(v) if isinstance(v, int) and not isinstance(v, bool) and v > 0 else MEDIUM_LINES
 
 
 def chat_model(cfg: dict, tier: str) -> str:
@@ -309,9 +295,10 @@ def core_cheap(cfg: dict, task: dict | None, cls: str, tier: str, provider: str,
                picked: dict | None = None, code_state: dict | None = None) -> dict | None:
     """The cheap Claude model a run of class `cls` takes when it starts on `provider` (the core one) at
     `tier`: {"provider", "model", "effort", "class", "why"}, or None (its tier's model): not the Claude core
-    provider, not a CHAT class, not the standard tier, the run goes to the chat provider (`routed` with no
+    provider, a review, not a CHAT class, not the standard tier, the run goes to the chat provider (`routed` with no
     fallback), the task is one routing could not move, or `route.classes` keeps the class on core."""
-    if provider != CHEAP_PROVIDER or (cfg.get("core_provider") or "claude") != provider or tier != "standard":
+    if provider != CHEAP_PROVIDER or (cfg.get("core_provider") or "claude") != provider or tier != "standard" \
+            or (task or {}).get("kind") == "review":
         return None
     if cls == "hard":
         return code_sonnet(cfg, task, picked, code_state)
@@ -343,6 +330,18 @@ def code_effort(task: dict | None, model: str | None, effort: str | None) -> str
         return effort or ""
     from .tierfloor import _rank
     return eff if _rank(eff) >= _rank(CODE_EFFORT_MIN) else CODE_EFFORT_MIN
+
+
+def review_model(model: str | None, effort: str | None) -> tuple[str, str]:
+    """A review run on Claude: Opus (or above) at high effort or more (deviceab.REVIEW_MODEL), whatever a
+    tier map, a review's sizing, a route or a cheap class picked."""
+    from .deviceab import REVIEW_MODEL
+    from .tierfloor import _rank
+    if not any(f in str(model or "").lower() for f in ("opus", "fable")):
+        model = REVIEW_MODEL["model"]
+    if _rank(effort) < _rank(REVIEW_MODEL["effort"]):
+        effort = REVIEW_MODEL["effort"]
+    return str(model), str(effort)
 
 
 def code_kind(task: dict | None, cfg: dict | None = None) -> str:
