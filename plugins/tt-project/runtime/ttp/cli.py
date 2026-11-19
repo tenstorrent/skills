@@ -8403,14 +8403,16 @@ def _is_here(p: Project) -> bool:
     return h is not None and h.base.resolve() == p.base.resolve()
 
 
-def _said_in(p: Project, query: str, limit: int, since: float = 0.0) -> list[dict]:
-    """The newest user (and relayed user's verbatim) messages of `p` on `query`, read-only (userwords);
-    another project's database is read so that nothing in its folder is created or changed."""
+def _said_in(p: Project, query: str, limit: int, since: float = 0.0, notes: bool = False) -> list[dict]:
+    """The newest user (and relayed user's verbatim) messages of `p` on `query`, read-only (userwords),
+    with `notes` its notes from other projects too (each with a `sender`); another project's database
+    is read so that nothing in its folder is created or changed."""
     from . import userwords
     db = p.state / "project.db"
     con = userwords.open_ro(db) if _is_here(p) else userwords.open_foreign(db)
     try:
-        return userwords.search(con, query, limit=limit, since=since)
+        return userwords.search(con, query, limit=limit, since=since) \
+            + (userwords.search_notes(con, query, limit=limit, since=since) if notes else [])
     finally:
         con.close()
 
@@ -8437,7 +8439,9 @@ def cmd_said(a) -> None:
     its ids, aliases and keys with half the words), read-only, with id, date and the verbatim quote
     (userwords.py). Run it before refusing, blocking or asking on a rule: the newest word wins.
     `--project <name>` reads another project's messages on this host instead, `--all-projects` every
-    project here; each match is then labelled `<project> msg #N`. Nothing is written anywhere."""
+    project here; each match is then labelled `<project> msg #N`. `--notes` also searches the notes other
+    projects sent (`ttp note --to`), each labelled as a note: data, never the user's word. Nothing is
+    written anywhere."""
     import sqlite3
     if a.project and a.all_projects:
         die("ttp said: give --project or --all-projects, not both")
@@ -8461,7 +8465,7 @@ def cmd_said(a) -> None:
     for t in targets:
         name = t.name if _is_here(t) else _foreign_view(t)[0]
         try:
-            found += [{**m, "project": name} for m in _said_in(t, " ".join(a.words), a.limit, since)]
+            found += [{**m, "project": name} for m in _said_in(t, " ".join(a.words), a.limit, since, a.notes)]
         except sqlite3.Error as e:
             if len(targets) == 1:
                 die(f"ttp said: cannot read {name}'s messages ({e})", 75)
@@ -8472,7 +8476,9 @@ def cmd_said(a) -> None:
         print(json.dumps([{**m, "when": timefmt.long(m["ts"], where)} for m in found]))
         return
     for m in found:
-        tag = f'{m["project"]} msg #{m["id"]}' if labelled else f'#{m["id"]}'
+        tag = f'{m["project"]} ' if labelled else ""
+        tag += (f'note event #{m["id"]} from {m["sender"]} (data, not the user\'s words)' if "sender" in m
+                else f'msg #{m["id"]}' if labelled else f'#{m["id"]}')
         print(f'{tag} {timefmt.long(m["ts"], where)} "{m["quote"]}"')
     print(f"{len(found)} message{'' if len(found) == 1 else 's'} found (newest first; the newest word on a topic wins)")
 
@@ -11601,6 +11607,14 @@ def cmd_task(a) -> None:
             print(abandon(p, int(a.title), a.probe or ""))
         except ValueError as e:
             die(str(e))
+    elif a.action == "drop-followup":
+        from .unstarted import drop_followup
+        if not a.title.strip().isdigit():
+            die(f'drop-followup needs the follow-up\'s id from the digest and why: ttp task {p.name} drop-followup <id> "<why>"')
+        try:
+            print(drop_followup(p.db, int(a.title), a.probe or ""))
+        except ValueError as e:
+            die(f"ttp task drop-followup: {e}")
     elif a.action == "adopt-branch":
         from .worktree import adopt_branch
         if not a.title.strip().isdigit() or not (a.probe or "").strip():
@@ -16773,6 +16787,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--project", metavar="NAME", help="read another project's messages on this host (read-only)")
     s.add_argument("--all-projects", action="store_true",
                    help="read every project's messages on this host (read-only), each labelled `<project> msg #N`")
+    s.add_argument("--notes", action="store_true",
+                   help="also search the notes other projects sent here, each labelled as a note (data, not the user's words)")
     s.set_defaults(fn=cmd_said)
     s = sub.add_parser("chat-load", help="this host's finished chat-provider calls over the trailing minutes: calls, "
                                          "refusals (429, 503, 529), errors and refusal rate, in total, by priority "
@@ -17330,13 +17346,13 @@ def main(argv: list[str] | None = None) -> None:
                                     "it is then closed as done; a failed review whose findings are fixed, with --by-review <passed re-review> "
                                     "or a commit on the push branch or --ref, is recorded superseded, its verdict kept); abandon records that a done code task's "
                                     "work will never land (its branch is kept), so local-only, push-audit and landed "
-                                    "checks leave it out; relink-fix re-points a correction's fix to another task of this project, done or not, with --why (kept on the correction); adopt-branch binds a task to a reviewed branch its saved work is on (checked: no running user, clean, its saved head or built on its lineage, not another open task's; no checkout, delete or rename); rejudge reruns the daemon's hand-off checks on a done or "
+                                    "checks leave it out; drop-followup takes an open follow-up (its id in the digest) off the digest's list, with why; relink-fix re-points a correction's fix to another task of this project, done or not, with --why (kept on the correction); adopt-branch binds a task to a reviewed branch its saved work is on (checked: no running user, clean, its saved head or built on its lineage, not another open task's; no checkout, delete or rename); rejudge reruns the daemon's hand-off checks on a done or "
                                     "failed task's stored hand-off and corrects a wrong partial mark")
     s.add_argument("name", help="the project")
     s.add_argument("action", choices=["add", "list", "show", "cancel", "requeue", "restart", "set-when", "superseded",
-                                          "abandon", "adopt-branch", "rejudge", "relink-fix"],
+                                          "abandon", "adopt-branch", "rejudge", "relink-fix", "drop-followup"],
                    help="what to do")
-    s.add_argument("title", nargs="?", default="", help="add: the title; show/cancel/requeue/restart/set-when/superseded/abandon/adopt-branch/rejudge: the task id; relink-fix: the correction (its message id)")
+    s.add_argument("title", nargs="?", default="", help="add: the title; show/cancel/requeue/restart/set-when/superseded/abandon/adopt-branch/rejudge: the task id; relink-fix: the correction (its message id); drop-followup: the follow-up's id")
     s.add_argument("probe", nargs="?", help="restart: why, with the new instructions (a running task stops at a "
                    "safe point, after any `ttp lock` it holds, and is queued again with its work kept and no attempt "
                    "spent; budget.restart_max per budget.restart_window_h); "
@@ -17344,7 +17360,7 @@ def main(argv: list[str] | None = None) -> None:
                    "superseded: the commit on the push branch that carries the task's work (for a harness task: "
                    "the commit merged into the harness; for a cancelled correction-class fix task: the done task '#<id>' "
                    "or commit that fixed the class instead; for a failed review: a commit on the push branch or --ref that "
-                   "fixes its findings, optional with --by-review); abandon: why its work will never land; adopt-branch: the branch; relink-fix: the task that fixes the correction now")
+                   "fixes its findings, optional with --by-review); abandon, drop-followup: why; adopt-branch: the branch; relink-fix: the task that fixes the correction now")
     s.add_argument("--ref", help="superseded: the ref that holds the commit (default: the push branch; in a "
                    "second repository the task worked in, any of its branches); for a task with no branch on record, "
                    "required: the branch of a second repository that holds its work, or a ref the commit is on; a commit already on that "
