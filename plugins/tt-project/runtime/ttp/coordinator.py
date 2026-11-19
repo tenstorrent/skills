@@ -177,6 +177,7 @@ from .db import (
     review_subject,
     reviewed_ids,
     task_outcome,
+    waiting_handoff,
     without_deferral,
 )
 from .project import _stamp_ts, rebase_problems, rebase_replace, rebase_replace_mode
@@ -1711,7 +1712,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
             f"SELECT text FROM messages WHERE id IN ({','.join('?' * len(msg_ids))})", list(msg_ids)))
     lines = tried.digest_lines(db, p, now, said)
     section("tried", lines, "\n".join(lines[1:]), f"## Tried work: {len(lines) - 1} ledger lines (as last turn)")
-    section("followups", unstarted.followup_lines(p, now))
+    section("followups", unstarted.followup_lines(p))
     recurring = sched.with_costs(db)
     lines = ["## Recurring"] if recurring else []
     for s in recurring:
@@ -2667,10 +2668,8 @@ def handoff_wait(task: dict, now: float | None = None) -> str:
     """'waiting 2h13m' for a queued task asleep on its own hand-off wait (a probe, a detached job, a smoke):
     how long, never only 'deferred until' (its waiting row says what on); '' otherwise."""
     now = time.time() if now is None else now
-    prev = load_result(task.get("result"))
-    since = prev.get("waiting_since")
-    if task.get("status") != "queued" or float(task.get("not_before") or 0) <= now \
-            or prev.get("status") != "waiting" or not isinstance(since, (int, float)):
+    since = waiting_handoff(task).get("waiting_since")
+    if float(task.get("not_before") or 0) <= now or not isinstance(since, (int, float)):
         return ""
     return f"waiting {timefmt.dur(max(0.0, now - since))}"
 

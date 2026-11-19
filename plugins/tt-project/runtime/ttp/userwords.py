@@ -19,6 +19,7 @@ sentence of filler words must not match a topic on generic words alone).
 """
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 import time
@@ -28,9 +29,8 @@ from . import reask, timefmt
 USER_SQL = ("SELECT id, ts, text, context FROM messages WHERE direction='in' AND kind='user' AND ts>=? "
             "AND COALESCE(provenance,'')!='system' AND COALESCE(channel,'')!='system' ORDER BY id DESC LIMIT ?")
 # Notes from other projects (upstream._event_text): data, never the user's words (`ttp said --notes`).
-NOTES_SQL = ("SELECT id, ts, text, NULL FROM events WHERE kind='upstream_note' AND text LIKE 'note to this project from %' "
+NOTES_SQL = ("SELECT id, ts, text, data FROM events WHERE kind='upstream_note' AND text LIKE 'note to this project from %' "
              "AND ts>=? ORDER BY id DESC LIMIT ?")
-NOTE_FROM = re.compile(r"note to this project from (?:the daemon|a worker) of (\S+)")
 SCAN = 3000          # newest user messages read per lookup
 DAYS = 120.0         # the digest's look-back
 PER_ITEM = 3         # lines per blocked item
@@ -124,9 +124,11 @@ def search_notes(con, query: str, limit: int = 5, since: float = 0.0) -> list[di
     if not qw and not qa:
         return []
     sender, rows = {}, []
-    for mid, ts, text, _ in con.execute(NOTES_SQL, (since, SCAN)).fetchall():
-        f = NOTE_FROM.match(text or "")
-        sender[mid] = f.group(1) if f else "?"
+    for mid, ts, text, data in con.execute(NOTES_SQL, (since, SCAN)).fetchall():
+        try:
+            sender[mid] = str(json.loads(data or "{}").get("from") or "?")   # the event's own sender (upstream._note_data)
+        except (ValueError, AttributeError):
+            sender[mid] = "?"
         rows.append((mid, ts, (text or "").partition("): ")[2], None))   # the note's own words, not the header
     return [{**m, "sender": sender[m["id"]]} for m in _match(rows, lambda s: _query_hit(qw, qa, s), limit)]
 

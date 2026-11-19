@@ -536,7 +536,7 @@ def test_a_handed_off_follow_up_of_any_kind_stays_in_the_digest_until_taken_up_o
                    f"proposed follow-up{' (folded into #1: same file)' if f['title'] == 'Fold me' else ''}: "
                    f"{f['title']} — {f['spec']}", status, src))
            for f, status in zip(fups, ("queued", "handled", "handled", "handled", "handled"))]
-    assert [f["id"] for f in unstarted.open_followups(p.db, now)] == [ids[1]], \
+    assert [f["id"] for f in unstarted.open_followups(p.db)] == [ids[1]], \
         "the queued one is in this turn's events; continue:, upstream: and folded ones have their own owner"
     p.db.x("UPDATE events SET status='handled' WHERE id=?", (ids[0],))   # a turn or gate handled it
     digest = coord.digest(p, {}, [], [])
@@ -546,8 +546,25 @@ def test_a_handed_off_follow_up_of_any_kind_stays_in_the_digest_until_taken_up_o
     assert drop(str(ids[1]), "") != 0
     assert drop(str(ids[1]), "covered by the existing docs") == 0
     assert f"follow-up {ids[1]} of #{src} dropped" in capsys.readouterr().out
-    assert unstarted.open_followups(p.db, now) == [] and "## Open follow-ups" not in coord.digest(p, {}, [], [])
-    assert unstarted.open_followups(p.db, now + unstarted.MAX_AGE_S + 1) == []
+    assert unstarted.open_followups(p.db) == [] and "## Open follow-ups" not in coord.digest(p, {}, [], [])
+
+
+def test_an_open_followup_stays_listed_however_old_until_queued_or_dropped(env):
+    from ttp import unstarted
+    p = make(env)
+    src = p.db.add_task("review the soak change", "s", kind="review", tier="light", origin="coordinator", priority=3)
+    fups = [{"title": "Add a soak timeout to the nightly config", "spec": "x"},
+            {"title": "Document the soak flags", "spec": "y"},
+            {"title": "Trim the soak log", "spec": "z"}]
+    p.db.update_task(src, status="done", result=json.dumps({"status": "done", "followups": fups}))
+    old = time.time() - 30 * 3600
+    ids = [p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                  (old, f"task:{src}", "followup_proposed", "normal", f"proposed follow-up: {f['title']} — {f['spec']}",
+                   "handled", src)) for f in fups]
+    assert [f["id"] for f in unstarted.open_followups(p.db)] == ids, "a 30 h old follow-up is still listed"
+    p.db.add_task("Add a soak timeout to the nightly config", "s", kind="code", tier="light", origin="coordinator")
+    unstarted.drop_followup(p.db, ids[1], "covered by the existing docs")
+    assert [f["id"] for f in unstarted.open_followups(p.db)] == [ids[2]], "one queued and one dropped are not"
 
 
 def test_status_and_web_name_the_dependency_a_queued_task_waits_on(env):

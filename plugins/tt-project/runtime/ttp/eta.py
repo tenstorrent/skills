@@ -49,7 +49,7 @@ last WINDOW_S days), never a worst case or padding:
   since it began waiting does (the newest valid one wins): then it finishes at that eta, plus the median
   run only when no on_pass_cmd ends it. Its next probe time is never taken for its finish; with no measured eta it is gated like a start gate. A wait the
   daemon already woke (`woke` in its hand-off) is due and keeps the usual queue and run legs. A wait on
-  its own `ttp checks --result` (OWN_CHECKS) is no outside work: with no eta given it ends at the wait's
+  its own `ttp checks --result` (budget.result_wait) is no outside work: with no eta given it ends at the wait's
   start plus the median of the project's recent completed checks runs (checkwall.recent), leg 'own checks'.
 - hold: a queued or waiting task whose provider's spend gate (kv `gates`) allows no new work starts no
   earlier than the gate's known reset (budget.hold_clears: a cap's period end, a plan window's reset,
@@ -200,16 +200,13 @@ def _epoch(v) -> float | None:
     return d.timestamp() if d.tzinfo else None
 
 
-OWN_CHECKS = re.compile(r"\s*\S*\bttp\s+checks\s+--result\s+\S+\s*")   # a wait on its own `ttp checks --detach`
-
-
 def outside_wait(t: dict, now: float, reports=None, state: Path | None = None) -> dict | None:
     """A waiting task whose retry_when watches work outside the harness (a Slurm job, a detached run, a
     peer's ack: any probe but a bare clock gate or a landing wait, `landed:#N` or `ttp landed --task N`
     terms): {"at": the newest measured `eta` (with an `eta_basis`, still ahead) from its hand-off or its
     `ttp progress report` lines since it began waiting (`reports`: progress.entries lines, or a callable
     giving them, read only for such a wait), or None, "follows": an on_pass_cmd records the end, no run,
-    "own": the wait is its own `ttp checks` (OWN_CHECKS): with no eta given, it ends at the wait's start plus
+    "own": the wait is its own `ttp checks` (budget.result_wait): with no eta given, it ends at the wait's start plus
     the median wall time of the project's recent completed checks runs (checkwall.recent under `state`)}.
     None for any other task, and for one the daemon already woke (its hand-off's `woke`: it is due and
     waits only for dispatch), which keep the usual estimate."""
@@ -245,7 +242,8 @@ def outside_wait(t: dict, now: float, reports=None, state: Path | None = None) -
                 and ts >= since]
         for _, r in sorted(mine, key=lambda x: x[0]):
             at = measured(r, _epoch(r.get("ts"))) or at   # a later valid report wins; an invalid one keeps the last
-    own = bool(OWN_CHECKS.fullmatch(probe))
+    from .budget import result_wait
+    own = (result_wait(probe) or ("",))[0] == "checks"
     if own and at is None and since is not None:
         from . import checkwall
         if runs := checkwall.recent(state, now):

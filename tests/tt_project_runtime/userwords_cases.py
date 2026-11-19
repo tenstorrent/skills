@@ -211,8 +211,10 @@ def test_ttp_said_notes_also_searches_notes_from_other_projects_labelled_as_data
     mine = p.db.post("in", "Keep the nightly soak on box-a1.", chat=None, kind="user", provenance="web-session")
     _, text = upstream._event_text({"to": p.name, "project": "otherproj", "host": "h1",
                                     "spec": "The nightly soak on box-a1 moved to the weekend."})
-    ev = p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
-                (_time.time() + 1, "upstream", "upstream_note", "normal", text + " [note abc]", "handled"))
+    note = {"fp": "abc", "to": p.name, "project": "otherproj", "host": "h1"}
+    ev = p.db.x("INSERT INTO events(ts,source,kind,severity,text,data,status) VALUES(?,?,?,?,?,?,?)",
+                (_time.time() + 1, "upstream", "upstream_note", "normal", text + " [note abc]",
+                 upstream._note_data(note), "handled"))
     monkeypatch.setenv("TTP_PROJECT", str(p.base))
     assert _ttp_said("nightly", "soak") == 0
     out = capsys.readouterr().out
