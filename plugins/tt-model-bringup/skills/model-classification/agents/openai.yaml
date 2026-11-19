@@ -1,0 +1,7 @@
+interface:
+  display_name: "Model Classification"
+  short_description: "Route models into text, vision, or multimodal bring-up"
+  default_prompt: "Use $model-classification to inspect only the authorized upstream source, classify the model, write a pinned model contract, and select the correct TTNN bring-up workflow."
+
+policy:
+  allow_implicit_invocation: true
