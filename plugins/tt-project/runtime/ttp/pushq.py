@@ -2578,7 +2578,7 @@ def _settle_trimmed(p: Project, task: dict, b: dict, m: dict, prev: dict, summar
                     r: dict, trim, trims: int) -> None:
     """_settle for a review whose push checks failed only on prompt size caps: the change fit alone, not
     with what landed before it. A light run trims it to fit and approves again, instead of a failed
-    review (and a shared-check incident)."""
+    review and a shared-check failure."""
     db, tid = p.db, task["id"]
     d = _detail(r)
     woke = (f"the push checks `{d.get('cmd') or 'the push checks'}` failed in batch {b['id']} only on prompt "
