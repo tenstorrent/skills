@@ -168,14 +168,41 @@ INHERIT_GIT_S = 30             # each git call of that check, bounded, as the ti
 # daemon): a later approval by the same review (after a push conflict) keeps them for its lineage.
 JUDGED_KEY = "inherited_judged"
 RESOLVES_MAX = 20               # upstream note fingerprints one approval may resolve (a hand-off's `resolves`)
+MIN_S = 60                      # seconds in the units messages show durations in
+HOUR_S = 3600
+DAY_S = 86400
+AGE_MIN_UNTIL_S = 2 * HOUR_S    # _age_text: a duration shorter than this reads in minutes ...
+AGE_H_UNTIL_S = 2 * DAY_S       # ... then in hours up to this, then in days
+GIT_TIMEOUT_S = 120             # a git call bounded by no caller's own limit
+PUSH_PROBE_GIT_S = 60           # the dry-run push that checks push access (_auth_probe)
+PATCH_GIT_S = 60                # the cherry-pick walk that finds a head's patches on the tip (_patch_on)
+TOUCH_GIT_S = 30                # the log that tells whether old..new changes some files (touches)
+MEMO_MAX = 512                  # entries a per-(tip, head) git answer cache keeps before it starts over
+ANC_MEMO_MAX = 2048             # ... and the ancestry cache (_ancestor)
+BASES_WALK_MAX = 20             # tasks a continues chain is followed through for its start points (_fork_bases)
+REBASE_WALK_MAX = 50            # ... and for an open rebase of a review (auto_rebase)
+TAIL_LINES = 20                 # log lines a batch failure quotes ...
+BRIEF_TAIL_LINES = 5            # ... and a one-line reason quotes
+MARKER_READS = 3                # marker reads alive makes while its lock field keeps changing
+NO_PRIORITY = 9                 # the batch-order priority of a row whose task has none (_prio)
+DEFAULT_PRIORITY = 5            # a task's priority when it has none
+DEFAULT_MAX_ATTEMPTS = 3        # a task's attempts when it names none
+DEFAULT_TASK_USD = 8.0          # a daemon task's budget when budget.task_default_usd names none for its tier
+SHA_MATCH_MIN = 7               # the shortest sha prefix two commit names must share to be one commit
+TEST_NAME_MIN = 6               # the shortest failing test name a spec or hand-off is matched on
+IDENT_FIELDS = 5                # fields per commit in _tip_idents' log: sha, name, email, date, committer time + files
+SUMMARY_LAST = 5                # batches summary lists
+ENTRIES_LIMIT = 50              # queue entries the web app lists
+QUEUE_TEXT_LAST = 10            # batches `ttp push --queue` lists
+RETRY_MIN_S = 60                # the least delivery.after_push_retry_s may be
 _HEX40 = re.compile(r"[0-9a-f]{40}")
 REBASE_LABEL = "push_rebase:"   # + the conflicting head: a review the daemon queued to rebase it (auto_rebase)
 REBASE_AFTER = 2                # the conflicting batch at which a review leaves batching for a rebase task
 _children: dict[str, subprocess.Popen] = {}   # batch processes this daemon started, reaped by finalize
 _default_branches: dict[tuple[str, str], tuple[float, str | None]] = {}   # (root, remote): (until, branch)
-_files_seen: dict[tuple[str, str], frozenset | None] = {}   # (tip, head): the files the head changes (_changed)
+_tip_head_seen: dict[tuple[str, str, str], Any] = {}   # (kind, tip, head): a git answer about tip..head (_remember_tip_head)
 _anc_seen: dict[tuple[str, str], bool] = {}   # (a, b): a is an ancestor of b (_ancestor); commits never change
-_recover_asked: dict[str, float] = {}         # batch id: when its remote was last asked (_recover)
+_recover_asked: dict[str, float] = {}         # batch id: when its remote was last asked (_recover_batch)
 _absent_seen: dict[tuple[str, str, str], tuple[float, bool, str]] = {}   # (root, remote, branch): (until, absent, why)
 
 
@@ -205,7 +232,7 @@ def target(p: Project) -> tuple[str, str] | None:
         return None
 
 
-def _git(p: Project, *args: str, timeout: float = 120, **kw) -> subprocess.CompletedProcess:
+def _git(p: Project, *args: str, timeout: float = GIT_TIMEOUT_S, **kw) -> subprocess.CompletedProcess:
     # Within a daemon tick step or finish transaction gitmemo caps it (check_approval runs in one).
     return gitmemo.run(["git", "-C", str(p.root), *args], text=True, capture_output=True,
                        timeout=timeout,
@@ -291,7 +318,7 @@ def _auth_probe(p: Project, remote: str, branch: str) -> bool:
     non-fast-forward) counts as working; a network or credential failure does not."""
     try:
         r = _git(p, "push", "--dry-run", "--porcelain", remote,
-                 f"refs/remotes/{remote}/{branch}:refs/heads/{branch}", timeout=60)
+                 f"refs/remotes/{remote}/{branch}:refs/heads/{branch}", timeout=PUSH_PROBE_GIT_S)
     except (OSError, subprocess.SubprocessError):
         return False
     out = f"{r.stdout or ''}\n{r.stderr or ''}"
@@ -310,7 +337,7 @@ def _queue_key(rows: list[dict]) -> str:
     return hashlib.sha1(json.dumps(sorted([r["id"], r["head"]] for r in rows)).encode()).hexdigest()[:16]
 
 
-def _streak(db, st: dict, target: str, outcome: str, why: str, now: float, tip: str | None) -> str | None:
+def _fail_streak(db, st: dict, target: str, outcome: str, why: str, now: float, tip: str | None) -> str | None:
     """Count a push or batch to `target` that failed before landing (died, error, rejected) in
     st["fail_streak"]. The SAME_FAIL_AFTER-th one in a row failing the same way (_fail_sig) returns the
     text of the one push_same_failure event for it, and due holds the queue on it (_same_held) instead
@@ -334,14 +361,14 @@ def _streak(db, st: dict, target: str, outcome: str, why: str, now: float, tip: 
     return (f"The last {fs['count']} push batches to {target} failed the same way ({outcome}): {fs['why']}. "
             f"Failing since {time.strftime('%Y-%m-%d %H:%M %Z', time.localtime(float(fs['since'])))}. The queue "
             f"no longer retries on a timer: " + (
-                f"it retries once a dry-run push to the remote works (checked every {AUTH_PROBE_S / 60:g} min)."
+                f"it retries once a dry-run push to the remote works (checked every {AUTH_PROBE_S / MIN_S:g} min)."
                 if fs["reach"] else
-                f"it retries when the tip or the approvals change, or after {SAME_FAIL_HOLD_S // 3600} h.")
+                f"it retries when the tip or the approvals change, or after {SAME_FAIL_HOLD_S // HOUR_S} h.")
             + " Fix the cause (the remote, the host's network or credential, or the batch's error) to land now.")
 
 
 def _same_held(p: Project, st: dict, remote: str, branch: str, rows: list[dict], tip: str, now: float) -> str:
-    """Why due holds the queue on a same failure st["fail_streak"] told the coordinator about (_streak),
+    """Why due holds the queue on a same failure st["fail_streak"] told the coordinator about (_fail_streak),
     or "" once it may run: for a remote that could not be reached or authenticated, once a model-free
     dry-run push works (_auth_probe, at most every AUTH_PROBE_S, never in a transaction); for any other
     failure, once the tip or the approvals change or SAME_FAIL_HOLD_S passed."""
@@ -360,7 +387,7 @@ def _same_held(p: Project, st: dict, remote: str, branch: str, rows: list[dict],
     if not ok:
         return (f"held: the last {fs['count']} push batches failed the same way ({str(fs.get('why'))[:200]}); "
                 + ("retried once a dry-run push to the remote works" if fs.get("reach") else
-                   f"retried when the tip or the approvals change, or {_at(float(fs['told']) + SAME_FAIL_HOLD_S, now, p)}"))
+                   f"retried when the tip or the approvals change, or {timefmt.short(float(fs['told']) + SAME_FAIL_HOLD_S, p, now)}"))
     fs["told"] = None   # one more try; failing the same way it holds again at once, without another event
     if fs.get("reach"):
         st.pop("backoff_until", None)   # the remote answers: no reason left to wait
@@ -399,7 +426,7 @@ def _torn_text(cmd: str, rec: dict, b: dict, logs) -> str:
             f"{', '.join(scripts) or 'a script'} outside the change: something rewrites "
             f"{'that script' if len(scripts) == 1 else 'those scripts'} in place while the check "
             f"runs. Batches {', '.join(map(str, rec['runs']))} (logs: {logs}/<batch>.log). The "
-            f"approvals stay queued and are retried every {syntaxfault.RETRY_S // 60} min; find "
+            f"approvals stay queued and are retried every {syntaxfault.RETRY_S // MIN_S} min; find "
             f"what writes the script and make it rename a temp file into place. This clears "
             f"once that check passes.")
 
@@ -409,7 +436,7 @@ def _setup_text(cmd: str, rec: dict, b: dict, logs) -> str:
             f"failed before any test ran, after {setupfault.RERUNS} reruns each: "
             f"{'; '.join(rec['seen']) or 'no fault line kept'}. Batches {', '.join(map(str, rec['runs']))} "
             f"(logs: {logs}/<batch>.log). The approvals stay queued and are retried every "
-            f"{setupfault.RETRY_S // 60} min, but this fault keeps coming back: fix the host or test pool the "
+            f"{setupfault.RETRY_S // MIN_S} min, but this fault keeps coming back: fix the host or test pool the "
             f"check copies to (or the dir it names). Until then its next setup fault on a batch head isolates the "
             f"entry that brings it, and the rest push; one on the tip alone still holds the batch. This clears "
             f"once that check passes or a batch pushes.")
@@ -561,14 +588,14 @@ def _short(sha: str | None) -> str:
     return (sha or "?")[:7]
 
 
-def _reach(db, batch: str | None, b: dict | None = None, m: dict | None = None) -> dict | None:
+def _batch_reach(db, batch: str | None, b: dict | None = None, m: dict | None = None) -> dict | None:
     """push.reach as batch `batch` recorded it in its marker (`m` when `b` is that batch): whether
     what it pushed is on the branch the work is meant to reach. None when unknown or not asked."""
     if b is not None and m is not None and batch == b["id"]:
         r = m.get("reach")
     else:
         row = db.one("SELECT marker FROM push_batches WHERE id=?", (batch,)) if batch else None
-        r = _read(Path(row["marker"])).get("reach") if row else None
+        r = push._read(Path(row["marker"])).get("reach") if row else None
     return r if isinstance(r, dict) else None
 
 
@@ -586,7 +613,7 @@ def target_line(db, tz: str | None = None) -> str | None:
     no batch recorded a reach (the branches are the same, no marker, or nothing pushed yet)."""
     row = db.one("SELECT id, target, ended, started FROM push_batches WHERE outcome IN ('pushed','landed') "
                  "ORDER BY started DESC LIMIT 1")
-    r = _reach(db, row["id"]) if row else None
+    r = _batch_reach(db, row["id"]) if row else None
     if not r or not r.get("ref") or r["ref"] == row["target"]:
         return None
     if tz:   # the project's home zone
@@ -685,7 +712,7 @@ def _inherited(p: Project, task: dict, entries: list[dict], tip: str, now: float
     failed: {head: {task id: ["<short sha> <subject>", ...]}}. A commit counts by its hash or by its
     patch-id, so a rebased or cherry-picked copy of a rejected commit is caught too. A rejected
     branch's commits that a passed task's branch also holds are that task's (it was stacked on it).
-    Only a rejected task's own work counts as its own: what its starts reach (_bases: the commit it
+    Only a rejected task's own work counts as its own: what its starts reach (_fork_bases: the commit it
     started from, its dependencies' branches, its fork point) is not, so a dependent's failed review
     never blocks its prerequisite.
     Within a gitmemo scope the answer is kept by task, heads and tip: prefetch_git reads it before the
@@ -695,13 +722,13 @@ def _inherited(p: Project, task: dict, entries: list[dict], tip: str, now: float
     return gitmemo.cached(key, lambda: _read_inherited(p, task, entries, tip, now))
 
 
-def _bases(p: Project, tid: int, have: set[str], forks: set[str]) -> list[str]:
+def _fork_bases(p: Project, tid: int, have: set[str], forks: set[str]) -> list[str]:
     """What task `tid`'s own work starts on: the commit it started from (lanewait.START_FROM), the
     branches of the tasks it depends on or started early on (lanewait.EARLY) and its fork point
     (FORK_POINT_REF), where present, also those of the tasks it continues (it carries their start),
     never their own commits. What these reach is never `tid`'s own commits."""
     out, seen, t = [], set(), p.db.task(tid)
-    while t and t["id"] not in seen and len(seen) < 20:
+    while t and t["id"] not in seen and len(seen) < BASES_WALK_MAX:
         seen.add(t["id"])
         if f"{FORK_POINT_REF}{t['id']}" in forks:
             out.append(f"{FORK_POINT_REF}{t['id']}")
@@ -730,7 +757,7 @@ def _read_inherited(p: Project, task: dict, entries: list[dict], tip: str, now: 
     by_task: dict[int, set[str]] = {}
     for b, t in bad.items():
         by_task.setdefault(t, set()).update(_git(p, "rev-list", "--no-merges", b, "--not", tip, *good,
-                                                 *_bases(p, t, have, forks), timeout=INHERIT_GIT_S).stdout.split())
+                                                 *_fork_bases(p, t, have, forks), timeout=INHERIT_GIT_S).stdout.split())
     rejected = sorted(set().union(*by_task.values()))
     if not rejected:
         return {}
@@ -778,7 +805,7 @@ def carried(p: Project, task: dict, head: str, cfg: dict | None = None) -> dict[
         return {}
 
 
-def _entry(e: dict) -> dict:
+def _approval_entry(e: dict) -> dict:
     """An approval entry as check_approval keeps it."""
     return {"branch": str(e.get("branch") or "").strip()[:200], "head": str(e.get("head") or "").strip().lower()}
 
@@ -800,7 +827,7 @@ def prefetch_git(p: Project, task: dict, result: dict, cfg: dict | None = None) 
     if task.get("kind") != "review" or not isinstance(entries, list) or not entries \
             or d.get("push_queue") is not True or not push_allowed(d):
         return
-    out = [_entry(e) for e in entries if isinstance(e, dict)]
+    out = [_approval_entry(e) for e in entries if isinstance(e, dict)]
     tgt = target(p) if enabled(p, cfg) else None
     tip = _tracking_tip(p, *tgt) if tgt else ""
     if not tip or len(out) != len(entries) or not all(_HEX40.fullmatch(e["head"]) for e in out):
@@ -811,13 +838,13 @@ def prefetch_git(p: Project, task: dict, result: dict, cfg: dict | None = None) 
         # not run inside the transaction
         fix_branches(p, task, named_refs(p, task))
         for e in out:
-            _markers(p, e["head"], tip)
+            _stray_markers(p, e["head"], tip)
         _inherited(p, task, out, tip, time.time())
     except subprocess.TimeoutExpired:
         pass   # not kept: check_approval reads it again, bounded, as before
 
 
-def _markers(p: Project, head: str, tip: str) -> list[str]:
+def _stray_markers(p: Project, head: str, tip: str) -> list[str]:
     """The conflict markers (conflictfix.stray_markers) a commit adds that `head` carries over `tip`, its
     copies already on `tip` aside. Kept within a gitmemo scope, as _inherited."""
     return gitmemo.cached(("pushq.markers", head, tip), lambda: conflictfix.stray_markers(
@@ -887,7 +914,7 @@ def _all_landed(p: Project, shas: list[str]) -> bool:
 def _patch_on(p: Project, tip: str, sha: str) -> bool:
     """Every commit `sha` adds over its merge base with `tip` has a patch-equivalent commit on `tip`."""
     try:
-        r = _git(p, "rev-list", "--cherry-pick", "--right-only", "--no-merges", f"{tip}...{sha}", timeout=60)
+        r = _git(p, "rev-list", "--cherry-pick", "--right-only", "--no-merges", f"{tip}...{sha}", timeout=PATCH_GIT_S)
     except (OSError, subprocess.SubprocessError):
         return False
     return r.returncode == 0 and not r.stdout.strip()
@@ -932,19 +959,9 @@ def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None
         return {"ignored": "the push queue is off (delivery.push_queue)"
                            + ("; what it names is already on the push branch" if named else "")}
     tgt = target(p) if enabled(p, cfg) else None
-    notes = []
-    for t in push._reviewed(p, str(task["id"])):
-        if why := codearm.task_handed_back(p, t["id"]):   # a code arm run that asked for Opus pushes nothing
-            return {"invalid": f"#{t['id']}'s latest run handed the task back to Opus (needs_opus: {why}): "
-                               f"its head is not approved for the push queue"}
-        if onto := push.pr_elsewhere(p, t, d):
-            if tgt and _absent(p, tgt[0], onto):
-                notes.append(f"#{t['id']}'s pr_branch label {onto} was ignored: {tgt[0]} has no such branch"
-                             f"{_fork_why(p, tgt[0], onto)}, so the review's approval delivers it to the push branch")
-                continue
-            return {"invalid": f"#{t['id']} delivers onto its pr_branch {onto}, not the push branch"
-                               f"{_fork_why(p, tgt[0], onto) if tgt else ''}: publish it there with "
-                               f"`ttp push --own --detach` instead of approving it for the push queue"}
+    bad, notes = _pr_branch_notes(p, task, d, tgt)
+    if bad:
+        return bad
     if not tgt:
         return {"invalid": "no target branch: set delivery.push_branch"}
     why = _refusal(p, *tgt, push.allow_protected(d))
@@ -952,6 +969,48 @@ def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None
         return {"invalid": why}
     if not isinstance(entries, list) or not entries or not all(isinstance(e, dict) for e in entries):
         return {"invalid": 'list the approved commits as "push": [{"branch": ..., "head": <40-hex sha>}]'}
+    bad, out, added, accepted = _entry_verdicts(p, task, entries, _conflicted_heads(p, task), tgt)
+    if bad:
+        return bad
+    tip = _tracking_tip(p, *tgt)
+    for e in out if tip else []:
+        try:
+            hits = _stray_markers(p, e["head"], tip)
+        except subprocess.TimeoutExpired:
+            hits = []   # git hung: the batch scans the commits again before it carries them
+        if hits:
+            return {"invalid": f"{_short(e['head'])}: {conflictfix.marker_refusal(hits)}", "markers": hits}
+    bad, taken = _inherited_verdict(p, task, out, tip, accepted)
+    if bad:
+        return bad
+    return {"entries": out, "target": f"{tgt[0]}/{tgt[1]}", "added": added,
+            **({"inherited": taken} if taken else {}), **({"notes": notes} if notes else {})}
+
+
+def _pr_branch_notes(p: Project, task: dict, d: dict, tgt: tuple[str, str] | None) -> tuple[dict | None, list[str]]:
+    """check_approval's verdict on the tasks the review reviewed: ({"invalid": why}, []) for one a code
+    arm handed back or one delivering onto a pr_branch the push remote has, else (None, notes on the
+    pr_branch labels ignored because the remote has no such branch)."""
+    notes = []
+    for t in push._reviewed(p, str(task["id"])):
+        if why := codearm.task_handed_back(p, t["id"]):   # a code arm run that asked for Opus pushes nothing
+            return {"invalid": f"#{t['id']}'s latest run handed the task back to Opus (needs_opus: {why}): "
+                               f"its head is not approved for the push queue"}, []
+        if onto := push.pr_elsewhere(p, t, d):
+            if tgt and _absent(p, tgt[0], onto):
+                notes.append(f"#{t['id']}'s pr_branch label {onto} was ignored: {tgt[0]} has no such branch"
+                             f"{_fork_why(p, tgt[0], onto)}, so the review's approval delivers it to the push branch")
+                continue
+            return {"invalid": f"#{t['id']} delivers onto its pr_branch {onto}, not the push branch"
+                               f"{_fork_why(p, tgt[0], onto) if tgt else ''}: publish it there with "
+                               f"`ttp push --own --detach` instead of approving it for the push queue"}, []
+    return None, notes
+
+
+def _conflicted_heads(p: Project, task: dict) -> list[str]:
+    """The heads a re-approval by `task` follows up on (any commit may then be approved): its latest
+    batch's conflicting rows, else the head a rebase review re-approves, else the head its own
+    `ttp push` stopped on."""
     rows = p.db.q("SELECT status, head, created FROM push_queue WHERE task=? ORDER BY id", (task["id"],))
     conflicted = [r["head"] for r in rows if r["created"] == rows[-1]["created"] and r["status"] == "conflict"]
     if not conflicted and (h := rebase_head(task)) and not any(r["status"] in OPEN_ROWS for r in rows):
@@ -960,15 +1019,24 @@ def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None
         conflicted = [h]
     if not conflicted and (h := _push_conflict(p, task, rows)):
         conflicted = [h]   # its own `ttp push` (the queue off) stopped on a rebase conflict
+    return conflicted
+
+
+def _entry_verdicts(p: Project, task: dict, entries: list[dict], conflicted: list[str],
+                    tgt: tuple[str, str]) -> tuple[dict | None, list[dict], dict, dict]:
+    """check_approval's check of each entry's head: ({"invalid": why}, ...) for the first that is no
+    full hash of a commit here, or (no re-approval after a conflict) none of the reviewed refs, their
+    fix branches nor an ancestor of one; else (None, the entries as kept, {head: commit lines it adds
+    over the conflicting heads}, {head: task ids its entry lists as inherited})."""
     reviewed: list[str] | None = None
     built: list[tuple[str, str]] = []
     out, added, accepted = [], {}, {}
     for e in entries:
         head = str(e.get("head") or "").strip().lower()
         if not _HEX40.fullmatch(head):
-            return {"invalid": f"head {head[:60] or '(none)'!r} is not a full 40-character commit hash"}
+            return {"invalid": f"head {head[:60] or '(none)'!r} is not a full 40-character commit hash"}, [], {}, {}
         if not _commit(p, head):
-            return {"invalid": f"{head} is not a commit in {p.root}"}
+            return {"invalid": f"{head} is not a commit in {p.root}"}, [], {}, {}
         if conflicted:
             log = _git(p, "log", "--format=%h %s", "-n", "20", head, "--not", *conflicted)
             added[head] = log.stdout.splitlines() if log.returncode == 0 else []
@@ -983,18 +1051,18 @@ def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None
             if not _contains(p, reviewed, head) and \
                     not any(_contains(p, [tip], head) and _contains(p, [head], on) for tip, on in built) and \
                     not _same_change(p, head, reviewed, tgt):
-                return {"invalid": f"{head} is none of the reviewed refs ({names}) nor an ancestor of one"}
-        out.append(_entry(e))
+                return {"invalid": f"{head} is none of the reviewed refs ({names}) nor an ancestor of one"}, [], {}, {}
+        out.append(_approval_entry(e))
         ids = e.get("inherited") if isinstance(e.get("inherited"), list) else []
         accepted[head] = {int(str(i).lstrip("#")) for i in ids if str(i).lstrip("#").isdigit()}
-    tip = _tracking_tip(p, *tgt)
-    for e in out if tip else []:
-        try:
-            hits = _markers(p, e["head"], tip)
-        except subprocess.TimeoutExpired:
-            hits = []   # git hung: the batch scans the commits again before it carries them
-        if hits:
-            return {"invalid": f"{_short(e['head'])}: {conflictfix.marker_refusal(hits)}", "markers": hits}
+    return None, out, added, accepted
+
+
+def _inherited_verdict(p: Project, task: dict, out: list[dict], tip: str | None,
+                       accepted: dict[str, set[int]]) -> tuple[dict | None, dict[str, list[int]]]:
+    """check_approval's check of the commits each head carries from tasks whose latest review failed
+    (_inherited): ({"invalid": why}, {}) for a head carrying one its entry does not list and the review's
+    lineage did not judge earlier, else (None, {head: the tasks it carries})."""
     try:
         carried = _inherited(p, task, out, tip, time.time()) if tip else {}
     except subprocess.TimeoutExpired:
@@ -1016,10 +1084,9 @@ def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None
                                f"this review and, if they are sound, add \"inherited\": {sorted(left)} to its entry"
                                + (f". #{', #'.join(map(str, mine))} {'is' if len(mine) == 1 else 'are'} in this "
                                   f"review's own lineage: if you judged the whole range, listing "
-                                  f"{'it' if len(mine) == 1 else 'them'} is the default step" if mine else "")}
+                                  f"{'it' if len(mine) == 1 else 'them'} is the default step" if mine else "")}, {}
         taken[head] = sorted(by_task)
-    return {"entries": out, "target": f"{tgt[0]}/{tgt[1]}", "added": added,
-            **({"inherited": taken} if taken else {}), **({"notes": notes} if notes else {})}
+    return None, taken
 
 
 def _absent(p: Project, remote: str, branch: str, ask: bool | None = None) -> bool:
@@ -1135,7 +1202,7 @@ def _requeue(db, task: dict, woke: str, extra: dict | None = None) -> None:
                    result=dump_result({**prev, "woke": woke[:1500], **(extra or {})}))
 
 
-def _cancel(db, ids: list[int]) -> None:
+def _cancel_rows(db, ids: list[int]) -> None:
     if ids:
         db.x(f"UPDATE push_queue SET status='cancelled', updated=? WHERE status IN ('approved','held') AND id IN "
              f"({','.join('?' * len(ids))})", (time.time(), *ids))
@@ -1155,7 +1222,7 @@ def cancel_orphans(p: Project) -> int:
         for r in rows:
             by_task.setdefault(r["task"], []).append(r)
         for tid, rs in by_task.items():
-            _cancel(db, [r["id"] for r in rs])
+            _cancel_rows(db, [r["id"] for r in rs])
             task = db.task(tid)
             status = rs[0]["status"] or "gone"
             expected = status in ("cancelled", "queued", "running", "gone")
@@ -1176,7 +1243,7 @@ def queue_off(p: Project, cfg: dict | None = None) -> int:
         return 0
     with db.tx():
         for t in tasks:
-            _cancel(db, [r["id"] for r in db.q("SELECT id FROM push_queue WHERE task=? AND status IN ('approved','held')",
+            _cancel_rows(db, [r["id"] for r in db.q("SELECT id FROM push_queue WHERE task=? AND status IN ('approved','held')",
                                                 (t["id"],))])
             _requeue(db, t, "push queue turned off: push with ttp push")
             _event(db, t, "task_requeued", f"#{t['id']} {t['title']}: the push queue was turned off; its review "
@@ -1184,7 +1251,7 @@ def queue_off(p: Project, cfg: dict | None = None) -> int:
     return len(tasks)
 
 
-def _tip(p: Project, name: str, fetch: bool) -> str | None:
+def _target_tip(p: Project, name: str, fetch: bool) -> str | None:
     """The tip of target `name` (remote/branch) as its tracking ref has it, after a bounded fetch when
     asked; None when it cannot be read."""
     remote, _, branch = name.partition("/")
@@ -1202,7 +1269,7 @@ def _follows(p: Project, old: str, name: str) -> bool:
     """Whether target `name`'s tip has target `old`'s tip in it (or both are one commit): an approval
     for `old` stands on `name`, as nothing it was reviewed against is missing there. The old target's
     tip is read from its tracking ref only: it may be the remote that cannot be reached."""
-    was, now = _tip(p, old, False), _tip(p, name, True)
+    was, now = _target_tip(p, old, False), _target_tip(p, name, True)
     if not (was and now):
         return False
     try:
@@ -1216,7 +1283,7 @@ def _same_patch(p: Project, head: str, old: str, name: str) -> bool:
     """Whether `head` carries the same commits, by patch-id, past target `name`'s tip as past target
     `old`'s (both read from their tracking refs, `name` fetched by _follows): the change's own patch
     is unchanged on the new target, so its approval stands there though the targets diverged."""
-    was, now = _tip(p, old, False), _tip(p, name, False)
+    was, now = _target_tip(p, old, False), _target_tip(p, name, False)
     if not (was and now and _HEX40.fullmatch(head or "")):
         return False
     try:
@@ -1266,7 +1333,7 @@ def retarget(p: Project, name: str) -> int:
                 _event(db, task, "push_retargeted", f"#{tid}: push target changed from {old} to {name}, {why}, "
                                                     f"so its approval moves with it (no review rerun)", queued=False)
                 continue
-            _cancel(db, [r["id"] for r in db.q("SELECT id FROM push_queue WHERE task=? AND status IN ('approved','held')",
+            _cancel_rows(db, [r["id"] for r in db.q("SELECT id FROM push_queue WHERE task=? AND status IN ('approved','held')",
                                                 (tid,))])
             woke = f"push target changed: approved for {old}, the target is now {name}"
             _requeue(db, task, woke)
@@ -1312,7 +1379,7 @@ def _approved(db, name: str, now: float | None = None, age_s: float = DEFAULT_AG
 def _prio(r: dict) -> int:
     """A row's priority for the batch order: its aged priority (_approved), else its task's (9 if none)."""
     v = r.get("aged_priority", r.get("priority"))
-    return int(v if v is not None else 9)
+    return int(v if v is not None else NO_PRIORITY)
 
 
 def _sent_back(db, rows: list[dict]) -> set[int]:
@@ -1349,16 +1416,22 @@ def dep_waits(p: Project, rows: list[dict], now: float) -> dict[int, dict]:
     return out
 
 
-_idents_seen: dict[tuple[str, str], dict | None] = {}
+def _remember_tip_head(kind: str, tip: str, head: str, value: Any) -> Any:
+    """Keep `value` as git's answer of `kind` about tip..head in _tip_head_seen (commits never change),
+    starting over once it holds MEMO_MAX answers; returns `value`."""
+    if len(_tip_head_seen) > MEMO_MAX:
+        _tip_head_seen.clear()
+    _tip_head_seen[(kind, tip, head)] = value
+    return value
 
 
-def _idents(p: Project, tip: str, head: str) -> dict | None:
+def _tip_idents(p: Project, tip: str, head: str) -> dict | None:
     """{(author name, email, author date): [(sha, committer time, files, patch-id), ...]} of tip..head's
     commits (merges aside), cached; None when git cannot tell in STACK_GIT_S. A rebase, amend or reword
     keeps a commit's author ident and moves its committer time (batch._rewritten matches commits the same
     way); one author may make several commits within one second, so an ident alone never names one."""
-    if (tip, head) in _idents_seen:
-        return _idents_seen[(tip, head)]
+    if ("idents", tip, head) in _tip_head_seen:
+        return _tip_head_seen[("idents", tip, head)]
     try:
         r = _git(p, "log", "--no-merges", "--name-only", "--date=raw",
                  "--format=%x00%H%x00%an%x00%ae%x00%ad%x00%ct", f"{tip}..{head}", "--", timeout=STACK_GIT_S)
@@ -1373,16 +1446,14 @@ def _idents(p: Project, tip: str, head: str) -> dict | None:
     pids = {f[1]: f[0] for f in (ln.split() for ln in pid.stdout.splitlines()) if len(f) == 2}
     out: dict = {}
     parts = r.stdout.split("\0")[1:]
-    for k in range(0, len(parts) - 4, 5):
-        sha, name, email, date = parts[k:k + 4]
-        ct, _, files = parts[k + 4].partition("\n")
+    last = IDENT_FIELDS - 1   # the committer time, with the files after it
+    for k in range(0, len(parts) - last, IDENT_FIELDS):
+        sha, name, email, date = parts[k:k + last]
+        ct, _, files = parts[k + last].partition("\n")
         if ct.isdigit():
             out.setdefault((name, email, date), []).append(
                 (sha, int(ct), frozenset(x for x in files.split("\n") if x), pids.get(sha, "")))
-    if len(_idents_seen) > 512:
-        _idents_seen.clear()
-    _idents_seen[(tip, head)] = out
-    return out
+    return _remember_tip_head("idents", tip, head, out)
 
 
 def overlap_waits(p: Project, rows: list[dict], now: float, tip: str) -> tuple[dict[int, dict], dict[int, int]]:
@@ -1418,11 +1489,11 @@ def overlap_waits(p: Project, rows: list[dict], now: float, tip: str) -> tuple[d
     waits: dict[int, dict] = {}
     before: dict[int, int] = {}
     for r in rows:
-        mine = _idents(p, tip, r["head"]) or {}
+        mine = _tip_idents(p, tip, r["head"]) or {}
         for branch, o in others.items() if mine else ():
             if branch == r["branch"] or o["task"] == r["task"] or o["head"] == r["head"]:
                 continue
-            theirs = _idents(p, tip, o["head"]) or {}
+            theirs = _tip_idents(p, tip, o["head"]) or {}
             stale = [sha for k, cs in mine.items() for sha, ct, files, pid in cs
                      if any(o_sha != sha and o_ct > ct and o_files == files and o_pid != pid
                             for o_sha, o_ct, o_files, o_pid in theirs.get(k, ()))]
@@ -1439,7 +1510,7 @@ def overlap_waits(p: Project, rows: list[dict], now: float, tip: str) -> tuple[d
     return waits, before
 
 
-def _ordered(rows: list[dict], before: dict[int, int], approved: set[int]) -> list[dict]:
+def _landing_order(rows: list[dict], before: dict[int, int], approved: set[int]) -> list[dict]:
     """`rows` with each row that another must follow (overlap_waits' before) placed ahead of it; a row
     whose predecessor is approved but not among `rows` waits for a batch that takes both."""
     by = {r["id"]: r for r in rows}
@@ -1485,7 +1556,7 @@ def _tip_fix(p: Project, rows: list[dict], bad: dict) -> dict | None:
     against a tip that fails on its own."""
     ids = [str(i) for i in bad.get("ids") or []]
     files = {i.split("::")[0] for i in ids if i.split("::")[0].endswith(".py")}
-    names = {n for i in ids if "::" in i and len(n := i.rsplit("::", 1)[1].split("[")[0]) >= 6}
+    names = {n for i in ids if "::" in i and len(n := i.rsplit("::", 1)[1].split("[")[0]) >= TEST_NAME_MIN}
     tip = str(bad.get("tip") or "").lower()
 
     def names_tip(x: str) -> bool:
@@ -1519,7 +1590,7 @@ def _urgent_waits(p: Project, live: str, now: float) -> None:
         if r["id"] in told:
             continue
         t = db.task(r["task"])
-        if t and (urgent.covers_urgent(db, t) or int(t.get("priority") or 5) <= 1):
+        if t and (urgent.covers_urgent(db, t) or int(t.get("priority") or DEFAULT_PRIORITY) <= 1):
             new.append(r)
     if not new and told == (st.get("urgent_told") or []):
         return
@@ -1527,7 +1598,7 @@ def _urgent_waits(p: Project, live: str, now: float) -> None:
     db.set_kv(KV, st)
     for r in new:
         _event(db, db.task(r["task"]), "push_urgent_waiting",
-               f"urgent approval of review #{r['task']} has waited {(now - float(r['created'])) / 60:.0f} min "
+               f"urgent approval of review #{r['task']} has waited {(now - float(r['created'])) / MIN_S:.0f} min "
                f"behind the running push batch {live}: stop that batch or push this one alone if it cannot wait",
                queued=True, severity="high")
 
@@ -1567,52 +1638,18 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None, lock: boo
     rows = _approved(db, f"{remote}/{branch}", now, _num(d.get("push_age_s"), DEFAULT_AGE_S, float, 0))
     if not rows:
         return [], "nothing approved"
-    deps = dep_waits(p, rows, now)
-    laps, before = overlap_waits(p, [r for r in rows if r["id"] not in deps], now, _tracking_tip(p, remote, branch))
-    if deps := {**laps, **deps}:
-        waiting, rows = [r for r in rows if r["id"] in deps], [r for r in rows if r["id"] not in deps]
-        if not rows:
-            return [], "; ".join(deps[r["id"]].get("why") or (
-                f"review #{r['task']}'s approval waits for review #{deps[r['id']]['task']} to "
-                f"land its sent-back head {_short(deps[r['id']]['head'])}, which it is built on") for r in waiting)
+    rows, before, waits = _free_of_waits(p, rows, now, _tracking_tip(p, remote, branch))
+    if not rows:
+        return [], waits
     approved = {r["id"] for r in rows}
-    paused = db.paused_resources()
-    if push.lock_name(remote, branch) in paused or "push" in paused:
-        return [], "the push resource is paused"
     st = _state(db)
-    if held := _same_held(p, st, remote, branch, rows, _tracking_tip(p, remote, branch), now):
+    if held := _start_held(p, st, remote, branch, rows, now, lock):
         return [], held
-    if float(st.get("backoff_until") or 0) > now and not _auth_back(p, st, remote, branch, now):
-        why = " (the last push was rejected for authentication: it retries once push access works)" \
-            if st.get("auth_wait") else ""
-        return [], f"backing off until {_at(float(st['backoff_until']), now, p)}{why}"
-    if held := envfault.held(p, now):   # a check runner the host lacks: checks would only fail on it
-        return [], held
-    # A detached push that only queues for the turn does not hold it (push.busy_locks): the batch queues
-    # behind it in arrival order; while the batch's turn is reserved, run locks do not hold it back.
-    if lock and (not locks.any_free(push.lock_paths(p, remote, branch)) or (
-            not turn_reserved(p, now) and push.busy_locks(p))):
-        return [], LOCK_WHY
-    bad = st.get("bad_tip") or {}
-    tried: set = set()
-    if bad.get("tip") and _tracking_tip(p, remote, branch) == bad["tip"]:
-        # Approvals not yet tried on the failing tip go first: one of them may fix it. With none, the
-        # tried ones wait, so the same tip is not checked again and again.
-        tried = set(bad.get("tried") or [])
-        fresh = [r for r in rows if r["id"] not in tried]
-        if fix := _tip_fix(p, fresh, bad):
-            return [{**fix, "tip_fix": True}], (f"approval #{fix['id']} (review #{fix['task']}) fixes the failing tip {_short(bad['tip'])}: "
-                           f"it goes alone first, then the rest rebuild on the new tip")
-        if not fresh and now < (until := _bad_until(bad)):
-            return [], (f"held: the tip {_short(bad['tip'])} fails its checks on its own and every approval was "
-                        f"tried on it; next try {_at(until, now, p)} unless the tip or the approvals change")
-        rows = fresh + [r for r in rows if r["id"] in tried]
-    window = _num(d.get("push_batch_s"), DEFAULT_BATCH_S, float, 0)
-    cap = int(_num(d.get("push_batch_max"), DEFAULT_BATCH_MAX, int, 1))   # starts a train; caps none
-    gap = _num(d.get("push_min_gap_s"), DEFAULT_MIN_GAP_S, float, 0)
+    picked, rows, tried = _bad_tip_order(p, st, remote, branch, rows, now)
+    if picked:
+        return picked
     last = db.one("SELECT id, outcome, COALESCE(after_finalized, finalized, ended, started) AS freed "
                   "FROM push_batches ORDER BY started DESC LIMIT 1")
-    clean = not last or last["outcome"] in CLEAN_OUTCOMES
     # Approvals the last batch requeued after a blamed entry without checking them: no gap, as it
     # spent its checks on the others (batch._close marks them "untested").
     untested = [r for r in rows if last and r["batch"] == last["id"] and _detail(r).get("untested")]
@@ -1627,6 +1664,103 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None, lock: boo
     if last and last["outcome"] == "rebooted" and (cut := _cut_members(db, last, rows)):
         return cut
     fast = fast_ids(p, rows, _tracking_tip(p, remote, branch), skip=tried)
+    why, wait = _start_why(db, d, rows, last, untested, yielded, now)
+    if wait and not fast:
+        return [], wait
+    if wait:
+        why = _fast_lead_why(db, rows, fast)
+    rows = [r for r in rows if r["id"] in fast] + [r for r in rows if r["id"] not in fast]   # they lead
+    if before:   # overlapping approvals: the one holding the newer commits goes first (overlap_waits)
+        rows = _landing_order(rows, before, approved)
+        if not rows:
+            return [], "overlapping approvals wait for a batch that takes them in order"
+    tip = _tracking_tip(p, remote, branch)
+    solo = _solo_paths(d)   # aging lets a routine approval lead, never skip the one-per-batch hold
+    taken, held = _one_solo(p, rows, len(rows), solo, tip, fast_ids(p, rows, tip, skip=tried, aged=False) if solo else fast)
+    if held:
+        why += (f"; {len(held)} more approval{'s' if len(held) != 1 else ''} touching delivery.push_solo_paths "
+                f"wait{'s' if len(held) == 1 else ''} for a later batch (one per batch)")
+    return taken, why
+
+
+def _free_of_waits(p: Project, rows: list[dict], now: float, tip: str) -> tuple[list[dict], dict, str]:
+    """due's approvals without those waiting on another review's landing (dep_waits) or on an
+    overlapping earlier one (overlap_waits): (the rest, overlap_waits' order, why every one waits)."""
+    deps = dep_waits(p, rows, now)
+    laps, before = overlap_waits(p, [r for r in rows if r["id"] not in deps], now, tip)
+    if not (deps := {**laps, **deps}):
+        return rows, before, ""
+    waiting, rows = [r for r in rows if r["id"] in deps], [r for r in rows if r["id"] not in deps]
+    return rows, before, "; ".join(deps[r["id"]].get("why") or (
+        f"review #{r['task']}'s approval waits for review #{deps[r['id']]['task']} to "
+        f"land its sent-back head {_short(deps[r['id']]['head'])}, which it is built on") for r in waiting)
+
+
+def _fast_lead_why(db, rows: list[dict], fast) -> str:
+    """Why the fast approvals start a train now. Independent, urgent or priority 1-2 approvals start one
+    at once (no window, no gap); every other approval rides in it, so the full checks run once for all
+    (a failing one leaves the train by its failing tests alone)."""
+    lead = [r for r in rows if r["id"] in fast]
+    hot = sum(1 for r in lead if urgent.covers_urgent(db, db.task(r["task"])))
+    why = (f"{len(lead)} approval{'s' if len(lead) != 1 else ''} that "
+           f"{'is' if len(lead) == 1 else 'are'} urgent, priority 1-{FAST_PRIORITY} or share no file with an "
+           f"earlier unlanded one" + (f" ({hot} an urgent review)" if hot else ""))
+    if len(rows) > len(lead):
+        why += f"; {len(rows) - len(lead)} more ride in the train"
+    return why
+
+
+def _start_held(p: Project, st: dict, remote: str, branch: str, rows: list[dict], now: float,
+                lock: bool) -> str | None:
+    """Why due starts no batch for approvals that are due (a pause, a same-failure hold, a backoff, a
+    runner fault, another push's turn), or None."""
+    paused = p.db.paused_resources()
+    if push.lock_name(remote, branch) in paused or "push" in paused:
+        return "the push resource is paused"
+    if held := _same_held(p, st, remote, branch, rows, _tracking_tip(p, remote, branch), now):
+        return held
+    if float(st.get("backoff_until") or 0) > now and not _auth_back(p, st, remote, branch, now):
+        why = " (the last push was rejected for authentication: it retries once push access works)" \
+            if st.get("auth_wait") else ""
+        return f"backing off until {timefmt.short(float(st['backoff_until']), p, now)}{why}"
+    if held := envfault.held(p, now):   # a check runner the host lacks: checks would only fail on it
+        return held
+    # A detached push that only queues for the turn does not hold it (push.busy_locks): the batch queues
+    # behind it in arrival order; while the batch's turn is reserved, run locks do not hold it back.
+    if lock and (not locks.any_free(push.lock_paths(p, remote, branch)) or (
+            not turn_reserved(p, now) and push.busy_locks(p))):
+        return LOCK_WHY
+    return None
+
+
+def _bad_tip_order(p: Project, st: dict, remote: str, branch: str, rows: list[dict],
+                   now: float) -> tuple[tuple[list[dict], str] | None, list[dict], set]:
+    """due's order on a known-bad tip: (due's answer, rows, tried) when an approval fixes the tip or every
+    one was tried on it; else (None, the approvals not tried on it first, the ids tried on it)."""
+    bad = st.get("bad_tip") or {}
+    if not (bad.get("tip") and _tracking_tip(p, remote, branch) == bad["tip"]):
+        return None, rows, set()
+    # Approvals not yet tried on the failing tip go first: one of them may fix it. With none, the
+    # tried ones wait, so the same tip is not checked again and again.
+    tried = set(bad.get("tried") or [])
+    fresh = [r for r in rows if r["id"] not in tried]
+    if fix := _tip_fix(p, fresh, bad):
+        return ([{**fix, "tip_fix": True}], (f"approval #{fix['id']} (review #{fix['task']}) fixes the failing tip {_short(bad['tip'])}: "
+                f"it goes alone first, then the rest rebuild on the new tip")), rows, tried
+    if not fresh and now < (until := _bad_until(bad)):
+        return ([], (f"held: the tip {_short(bad['tip'])} fails its checks on its own and every approval was "
+                     f"tried on it; next try {timefmt.short(until, p, now)} unless the tip or the approvals change")), rows, tried
+    return None, fresh + [r for r in rows if r["id"] in tried], tried
+
+
+def _start_why(db, d: dict, rows: list[dict], last: dict | None, untested: list[dict], yielded: list[dict],
+               now: float) -> tuple[str, str]:
+    """(why due starts a batch now, "") or ("", what it waits for) by the batch window, the gap after a
+    batch that did not end clean and the approvals the last batch left (fast ones aside)."""
+    window = _num(d.get("push_batch_s"), DEFAULT_BATCH_S, float, 0)
+    cap = int(_num(d.get("push_batch_max"), DEFAULT_BATCH_MAX, int, 1))   # starts a train; caps none
+    gap = _num(d.get("push_min_gap_s"), DEFAULT_MIN_GAP_S, float, 0)
+    clean = not last or last["outcome"] in CLEAN_OUTCOMES
     why = wait = ""
     if last and last["outcome"] == "rebooted":   # none of its members is still approved
         why = f"a rerun of {last['id']}, cut short by a reboot"
@@ -1649,36 +1783,12 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None, lock: boo
         why = "no review is running or ready"
     else:
         wait = "waiting for more approvals"
-    if wait and not fast:
-        return [], wait
-    if wait:
-        # Independent, urgent or priority 1-2 approvals start a train now (no window, no gap); every
-        # other approval rides in it, so the full checks run once for all (a failing one leaves the
-        # train by its failing tests alone).
-        lead = [r for r in rows if r["id"] in fast]
-        hot = sum(1 for r in lead if urgent.covers_urgent(db, db.task(r["task"])))
-        why = (f"{len(lead)} approval{'s' if len(lead) != 1 else ''} that "
-               f"{'is' if len(lead) == 1 else 'are'} urgent, priority 1-{FAST_PRIORITY} or share no file with an "
-               f"earlier unlanded one" + (f" ({hot} an urgent review)" if hot else ""))
-        if len(rows) > len(lead):
-            why += f"; {len(rows) - len(lead)} more ride in the train"
-    rows = [r for r in rows if r["id"] in fast] + [r for r in rows if r["id"] not in fast]   # they lead
-    if before:   # overlapping approvals: the one holding the newer commits goes first (overlap_waits)
-        rows = _ordered(rows, before, approved)
-        if not rows:
-            return [], "overlapping approvals wait for a batch that takes them in order"
-    tip = _tracking_tip(p, remote, branch)
-    solo = _solo_paths(d)   # aging lets a routine approval lead, never skip the one-per-batch hold
-    taken, held = _one_solo(p, rows, len(rows), solo, tip, fast_ids(p, rows, tip, skip=tried, aged=False) if solo else fast)
-    if held:
-        why += (f"; {len(held)} more approval{'s' if len(held) != 1 else ''} touching delivery.push_solo_paths "
-                f"wait{'s' if len(held) == 1 else ''} for a later batch (one per batch)")
-    return taken, why
+    return why, wait
 
 
-def _members(marker) -> list[int]:
+def _marker_ids(marker) -> list[int]:
     """The entry ids of a batch marker, in its order."""
-    return [e["id"] for e in (_read(Path(marker)).get("entries") or []) if isinstance(e, dict)
+    return [e["id"] for e in (push._read(Path(marker)).get("entries") or []) if isinstance(e, dict)
             and isinstance(e.get("id"), int)] if marker else []
 
 
@@ -1690,7 +1800,7 @@ def _cut_members(db, last: dict, rows: list[dict]) -> tuple[list[dict], str] | N
     after it wait for the next batch. None when no member is left."""
     b = db.one("SELECT marker FROM push_batches WHERE id=?", (last["id"],))
     mine = {r["id"]: r for r in rows if r["batch"] == last["id"]}
-    order = _members(b["marker"] if b else None)
+    order = _marker_ids(b["marker"] if b else None)
     kept = [mine[i] for i in order if i in mine] + [r for i, r in mine.items() if i not in order]
     if not kept:
         return None
@@ -1707,17 +1817,13 @@ def _cut_members(db, last: dict, rows: list[dict]) -> tuple[list[dict], str] | N
 def _changed(p: Project, tip: str, head: str) -> frozenset | None:
     """The files `head` changes over its merge base with `tip` (`git diff tip...head`), cached per
     (tip, head); None when git cannot tell."""
-    if (tip, head) in _files_seen:
-        return _files_seen[(tip, head)]
+    if ("files", tip, head) in _tip_head_seen:
+        return _tip_head_seen[("files", tip, head)]
     try:
         r = _git(p, "diff", "--name-only", "--no-renames", f"{tip}...{head}", timeout=INHERIT_GIT_S)
     except (OSError, subprocess.SubprocessError):
         return None
-    got = frozenset(r.stdout.split("\n")) - {""} if r.returncode == 0 else None
-    if len(_files_seen) > 512:
-        _files_seen.clear()
-    _files_seen[(tip, head)] = got
-    return got
+    return _remember_tip_head("files", tip, head, frozenset(r.stdout.split("\n")) - {""} if r.returncode == 0 else None)
 
 
 def fast_ids(p: Project, rows: list[dict], tip: str, skip: set = frozenset(), aged: bool = True) -> set[int]:
@@ -1823,7 +1929,7 @@ def bad_tip_ids(db) -> list[str]:
 def touches(p: Project, old: str, new: str, files: list[str]) -> bool:
     """A commit in old..new changes one of `files`; True when git cannot tell (a rerun is the safe side)."""
     try:
-        r = _git(p, "log", "--format=%H", f"{old}..{new}", "--", *files, timeout=30)
+        r = _git(p, "log", "--format=%H", f"{old}..{new}", "--", *files, timeout=TOUCH_GIT_S)
     except (OSError, subprocess.SubprocessError):
         return True
     return r.returncode != 0 or bool(r.stdout.strip())
@@ -1899,31 +2005,7 @@ def start(p: Project, rows: list[dict], name: str, now: float | None = None, ext
         if cur := target(p):
             name = f"{cur[0]}/{cur[1]}"     # delivery.push_branch as it is now, whatever the caller read
         m["target"] = name
-        if bad := _known_bad(db, rows):
-            m["bad_tip"] = bad
-        if len(rows) == 1 and rows[0].get("tip_fix") and (tb := _state(db).get("bad_tip") or {}).get("tip"):
-            # the lone tip fix (due): its checks also run the tip's failing tests by id (batch.tip_fix_check)
-            m["tip_fix"] = {"tip": tb["tip"], "cmd": tb.get("cmd"),
-                            "ids": [str(i) for i in tb.get("ids") or []] if isinstance(tb.get("ids"), list) else []}
-        if (st_bad := _state(db).get("bad_tip") or {}).get("tip") and st_bad.get("tried"):
-            # due leaves these out of its urgent-first pick while the tip is this one: the batch never
-            # stops its search for them (batch.Batch._yield_now), or the next batch would stop again
-            m["yield_skip"] = {"tip": st_bad["tip"], "ids": list(st_bad["tried"])}
-        if iso := _setup_isolate(db):
-            m["setup_isolate"] = iso    # alerted setup_fault checks: their next setup fault isolates an entry
-        last = db.one("SELECT id, outcome, marker FROM push_batches ORDER BY started DESC LIMIT 1")
-        if last and last["outcome"] == "rebooted" and last["marker"] and not _read(Path(last["marker"])).get("rerun_by"):
-            was, ids = _members(last["marker"]), [r["id"] for r in rows]
-            m["resumes"] = {"batch": last["id"], "kept": [i for i in was if i in ids],
-                            "left_out": [i for i in was if i not in ids], "added": [i for i in ids if i not in was]}
-        if restarts := max((int(n) if str(n := _detail(r).get("restarts")).isdigit() else 1
-                            for r in rows if _detail(r).get("yielded")), default=0):
-            m["restarts"] = restarts    # stops for urgent ones its rows had: batch.Batch._may_yield caps them
-        kfs = [_detail(r).get("known_fail") for r in rows]
-        if kfs and isinstance(kfs[0], dict) and all(k == kfs[0] for k in kfs) and \
-                sorted(str(h[0]) for h in kfs[0].get("heads") or [] if isinstance(h, list) and h) == \
-                sorted(str(r["id"]) for r in rows):
-            m["known_fail"] = kfs[0]    # what the stopped search learned: batch.Batch._known_fail resumes from it
+        m.update(_batch_notes(db, rows))
         m["check_run_dir"] = str(checkdirs.new(p.state, marker, push.scratch_need(p, p.root)))
         m["check_report_dir"] = str(checkdirs.reports(Path(m["check_run_dir"])))
         write_json(marker, m)
@@ -1945,7 +2027,7 @@ def start(p: Project, rows: list[dict], name: str, now: float | None = None, ext
             child.stdin.close()      # the go
         prev = db.one("SELECT * FROM push_batches WHERE outcome='rebooted' AND id!=? ORDER BY started DESC LIMIT 1",
                       (bid,))
-        if prev and _read(Path(prev["marker"])).get("rerun_by") is None:
+        if prev and push._read(Path(prev["marker"])).get("rerun_by") is None:
             _close_marker(prev, {"rerun_by": bid})
     except _Changed:
         marker.unlink(missing_ok=True)
@@ -1954,6 +2036,39 @@ def start(p: Project, rows: list[dict], name: str, now: float | None = None, ext
     finally:
         lock.close()             # the child holds the run lock from here on
     return bid
+
+
+def _batch_notes(db, rows: list[dict]) -> dict:
+    """What start puts on a new batch's marker from the queue's state and its rows: the known-bad tip
+    and the tip fix's failing tests, the ids tried on that tip, the setup faults to isolate, what it
+    resumes from a rebooted batch, its restart count and the failure the last search learned."""
+    m: dict = {}
+    if bad := _known_bad(db, rows):
+        m["bad_tip"] = bad
+    if len(rows) == 1 and rows[0].get("tip_fix") and (tb := _state(db).get("bad_tip") or {}).get("tip"):
+        # the lone tip fix (due): its checks also run the tip's failing tests by id (batch.tip_fix_check)
+        m["tip_fix"] = {"tip": tb["tip"], "cmd": tb.get("cmd"),
+                        "ids": [str(i) for i in tb.get("ids") or []] if isinstance(tb.get("ids"), list) else []}
+    if (st_bad := _state(db).get("bad_tip") or {}).get("tip") and st_bad.get("tried"):
+        # due leaves these out of its urgent-first pick while the tip is this one: the batch never
+        # stops its search for them (batch.Batch._yield_now), or the next batch would stop again
+        m["yield_skip"] = {"tip": st_bad["tip"], "ids": list(st_bad["tried"])}
+    if iso := _setup_isolate(db):
+        m["setup_isolate"] = iso    # alerted setup_fault checks: their next setup fault isolates an entry
+    last = db.one("SELECT id, outcome, marker FROM push_batches ORDER BY started DESC LIMIT 1")
+    if last and last["outcome"] == "rebooted" and last["marker"] and not push._read(Path(last["marker"])).get("rerun_by"):
+        was, ids = _marker_ids(last["marker"]), [r["id"] for r in rows]
+        m["resumes"] = {"batch": last["id"], "kept": [i for i in was if i in ids],
+                        "left_out": [i for i in was if i not in ids], "added": [i for i in ids if i not in was]}
+    if restarts := max((int(n) if str(n := _detail(r).get("restarts")).isdigit() else 1
+                        for r in rows if _detail(r).get("yielded")), default=0):
+        m["restarts"] = restarts    # stops for urgent ones its rows had: batch.Batch._may_yield caps them
+    kfs = [_detail(r).get("known_fail") for r in rows]
+    if kfs and isinstance(kfs[0], dict) and all(k == kfs[0] for k in kfs) and \
+            sorted(str(h[0]) for h in kfs[0].get("heads") or [] if isinstance(h, list) and h) == \
+            sorted(str(r["id"]) for r in rows):
+        m["known_fail"] = kfs[0]    # what the stopped search learned: batch.Batch._known_fail resumes from it
+    return m
 
 
 class _Changed(Exception):
@@ -2156,20 +2271,16 @@ def schedule(p: Project, cfg: dict | None = None, log: Callable[[str], None] = l
 
 
 # finalize -----------------------------------------------------------------------------------------
-def _read(marker: Path) -> dict:
-    return push._read(marker)
-
-
 def alive(marker: Path) -> tuple[bool, dict]:
     """(whether the batch process of `marker` runs, the marker as read after testing its lock), in
     the order push.result uses: read the marker, test the lock it names, read it again. A lock field
     that changed meanwhile (the batch moved to its after_push lock) is tested again. A batch is dead
     when it is not finished and its current lock is free; a missing marker is a dead batch."""
-    m = _read(marker)
-    for _ in range(3):
+    m = push._read(marker)
+    for _ in range(MARKER_READS):
         lock = m.get("lock")
         free = locks.any_free([Path(lock)]) if lock else True
-        again = _read(marker)
+        again = push._read(marker)
         if again.get("lock") == lock:
             return not free and again.get("phase") != "finished", again
         m = again
@@ -2196,7 +2307,7 @@ def holding(db, task_id: int) -> tuple[bool, str] | None:
     return not stalled, f"push queue ({row['status']}{', stalled' if stalled else ''})"
 
 
-def _reap(bid: str) -> None:
+def _reap_child(bid: str) -> None:
     child = _children.get(bid)
     if child is not None and child.poll() is not None:
         _children.pop(bid, None)
@@ -2210,7 +2321,7 @@ def _detail(r: dict) -> dict:
     return d if isinstance(d, dict) else {}
 
 
-def _tail_of(m: dict, detail: dict | None = None, n: int = 20) -> str:
+def _tail_of(m: dict, detail: dict | None = None, n: int = TAIL_LINES) -> str:
     tail = str((detail or {}).get("tail") or "")
     return "\n".join((tail or push._tail(m.get("log"), n)).splitlines()[-n:])
 
@@ -2228,7 +2339,7 @@ def _close_marker(b: dict, extra: dict | None = None) -> None:
     """Rewrite the batch's marker as finished with the DB row's outcome and end (atomic, never inside a
     transaction), so a file never stays `running` once its row is final. A live batch is left alone."""
     marker = Path(b["marker"])
-    m = _read(marker)
+    m = push._read(marker)
     if not m or m.get("kind") != "batch" or not b.get("finalized"):
         return
     if m.get("status") == "finished" and m.get("outcome") and not extra:
@@ -2247,7 +2358,7 @@ def close_strays(p: Project) -> list[str]:
     done = []
     rows = p.db.q("SELECT * FROM push_batches WHERE finalized IS NOT NULL ORDER BY started")
     for i, b in enumerate(rows):
-        m = _read(Path(b["marker"]))
+        m = push._read(Path(b["marker"]))
         if m and m.get("kind") == "batch" and m.get("status") == "running" and not m.get("outcome"):
             nxt = next((r["id"] for r in rows[i + 1:]), None) if b["outcome"] == "rebooted" else None
             _close_marker(b, {"rerun_by": nxt} if nxt else None)
@@ -2287,7 +2398,7 @@ def _died_db(p: Project, b: dict, m: dict, alert: Callable, why: str, now: float
             st.pop("backoff_until", None)
             db.set_kv(KV, st)
             _event(db, None, "push_batch_died",
-                   f"push batch {b['id']} was cut short by the {_at(rebooted, now, p)} reboot; {len(rows)} approval"
+                   f"push batch {b['id']} was cut short by the {timefmt.short(rebooted, p, now)} reboot; {len(rows)} approval"
                    f"{'s' if len(rows) != 1 else ''} back in the queue, run again at once", queued=False)
             push._forget_lock(Path(b["marker"]))
             return
@@ -2311,13 +2422,13 @@ def _died_db(p: Project, b: dict, m: dict, alert: Callable, why: str, now: float
         tell = stop and not un.get("alerted")
         if tell:
             un["alerted"] = now
-        same = _streak(db, st, b["target"], outcome, why, now, m.get("tip"))
+        same = _fail_streak(db, st, b["target"], outcome, why, now, m.get("tip"))
         db.set_kv(KV, st)
         if same:
             _event(db, None, "push_same_failure", same, queued=True, severity="high")
         _event(db, None, "push_batch_died",
                f"push batch {b['id']} {why}; {len(rows)} approval{'s' if len(rows) != 1 else ''} back in the queue, "
-               + (f"no batch starts until its remote answers (asked every {UNREACH_PROBE_S // 60} min)" if stop
+               + (f"no batch starts until its remote answers (asked every {UNREACH_PROBE_S // MIN_S} min)" if stop
                   else f"no try counted; the remote is asked every {REMOTE_DOWN_GAP_S} s and the batch runs once it answers"
                   if reach else f"retried after {st['backoff_until'] - now:.0f} s"),
                queued=queued, severity="high" if queued else "normal")
@@ -2328,7 +2439,7 @@ def _died_db(p: Project, b: dict, m: dict, alert: Callable, why: str, now: float
                              f"`{un['remote']}` cannot be reached or has no branch `{un['target'].partition('/')[2]}` "
                              f"({un['why'][:200]}). delivery.push_branch is "
                              f"`{setting}`. The push queue starts no more batches for it: it asks the remote every "
-                             f"{UNREACH_PROBE_S // 60} min without a model call and goes on once it answers with the branch or "
+                             f"{UNREACH_PROBE_S // MIN_S} min without a model call and goes on once it answers with the branch or "
                              f"delivery.push_branch changes. If the remote is wrong, the coordinator points "
                              f"delivery.push_branch at one that can be reached.", severity="high")
     elif stop:
@@ -2339,7 +2450,7 @@ def _died_db(p: Project, b: dict, m: dict, alert: Callable, why: str, now: float
               severity="high")
 
 
-def _on_remote(repo: Path, remote: str, branch: str, sha: str, fetch: bool) -> bool | None:
+def _sha_on_remote(repo: Path, remote: str, branch: str, sha: str, fetch: bool) -> bool | None:
     """Whether `sha` is on remote/branch: the tracking ref first (a push that went through moved it),
     then a bounded fetch when asked. None when the branch cannot be read."""
     if fetch:
@@ -2362,7 +2473,7 @@ def _on_remote(repo: Path, remote: str, branch: str, sha: str, fetch: bool) -> b
         return None
 
 
-def _recover(p: Project, b: dict, marker: Path, m: dict, now: float) -> dict | None:
+def _recover_batch(p: Project, b: dict, marker: Path, m: dict, now: float) -> dict | None:
     """A batch that died with no outcome but had begun `git push` (batch.Batch._mark_pushing). If
     that head is on the branch, the push went through: the marker gets the outcome it would have
     written (pushed, with each entry's result), so finalize applies it and resumes its after_push,
@@ -2376,10 +2487,10 @@ def _recover(p: Project, b: dict, marker: Path, m: dict, now: float) -> dict | N
     if not (_HEX40.fullmatch(sha) and remote and branch):
         return m
     repo = Path(m.get("repo") or p.root)
-    on = _on_remote(repo, remote, branch, sha, fetch=False) or None   # not on the tracking ref: ask the remote
+    on = _sha_on_remote(repo, remote, branch, sha, fetch=False) or None   # not on the tracking ref: ask the remote
     if on is None and now - _recover_asked.get(b["id"], 0) >= RECOVER_GAP_S:
         _recover_asked[b["id"]] = now
-        on = _on_remote(repo, remote, branch, sha, fetch=True)
+        on = _sha_on_remote(repo, remote, branch, sha, fetch=True)
     if on is None:
         try:
             since = float(pg["first_checked"])
@@ -2442,124 +2553,154 @@ def _settle(p: Project, tid: int, b: dict, m: dict, now: float) -> None:
     if "check_failed" in states and trims < conflictfix.TRIM_MAX:
         r = next(r for r in current if r["status"] == "check_failed")
         trim = conflictfix.cap_failure(str(_detail(r).get("tail") or ""), _delivery(p).get("push_cap_tests"))
+    args = (p, task, b, m, prev, summary, target)
     if trim:
-        # Only prompt size caps failed: the change fit alone, not with what landed before it. A light
-        # run trims it to fit and approves again, instead of a failed review (and a shared-check incident).
-        d = _detail(r)
-        woke = (f"the push checks `{d.get('cmd') or 'the push checks'}` failed in batch {b['id']} only on prompt "
-                f"size caps, on {r['branch'] or '?'} at {_short(r['head'])} merged onto {target}: "
-                f"{conflictfix.over_text(trim)}")
-        cf = conflictfix.mark(str(r["head"] or ""), r["branch"] or "", target, str(m.get("tip") or ""), [], True,
-                              trims + 1, trim=trim)
-        _requeue(db, task, woke, {conflictfix.KEY: cf, conflictfix.TRIMS: trims + 1})
-        _event(db, task, "task_requeued", f"#{tid} {task['title']}: {woke}; {TRIM_EVENT}", queued=False)
+        _settle_trimmed(*args, r, trim, trims)
     elif "check_failed" in states:
-        r = next(r for r in current if r["status"] == "check_failed")
-        d = _detail(r)
-        cmd, tail = str(d.get("cmd") or "the push checks"), _tail_of(m, d)
-        text = (f"the push checks failed on {r['branch'] or '?'} at {_short(r['head'])} in batch {b['id']}: "
-                f"`{cmd}`\n{tail}")
-        # The review found no code fault: only the checks failed (reviewcap's area cap and the
-        # coordinator's effort rules read review_failure and the failing ids).
-        ids, complete = sharedchecks.failing_ids(str(d.get("tail") or ""))
-        db.update_task(tid, status="failed", blocked_reason=None, result=dump_result(
-            {**prev, "status": "failed", "summary": f"{text}\n(review: {summary})"[:1500],
-             "review_failure": "check_only", sharedchecks.FAILING_KEY: ids, sharedchecks.COMPLETE_KEY: complete,
-             "push_failed": {"branch": r["branch"], "head": r["head"], "cmd": cmd, "tail": tail[-1500:],
-                             "batch": b["id"]}}))
-        _event(db, task, "task_failed", f"#{tid} {task['title']} → failed: {text}", queued=True)
-        _reply(db, task, "failed", text)
+        _settle_check_failed(*args, current)
     elif "refused" in states:
         r = next(r for r in current if r["status"] == "refused")
         d = _detail(r)
-        why = str(d.get("why") or d.get("message") or _tail_of(m, d, 5) or "the batch refused it")
+        why = str(d.get("why") or d.get("message") or _tail_of(m, d, BRIEF_TAIL_LINES) or "the batch refused it")
         reason = f"push refused: {why}"[:500]
         db.update_task(tid, status="blocked", blocked_reason=reason,
                        result=dump_result({**prev, "status": "blocked", "summary": summary}))
         pagesev.raise_blocked(db, task, reason, f"#{tid} {task['title']} → blocked: {reason}")
         _reply(db, task, "blocked", summary, need=reason)
     elif "conflict" in states:
-        r = next(r for r in current if r["status"] == "conflict")
-        d = _detail(r)
-        files = ", ".join(str(f) for f in (d.get("files") or [])[:20]) or "?"
-        woke = (f"push conflict: {r['branch'] or '?'} at {r['head']} conflicts with {target} at "
-                f"{d.get('onto') or m.get('tip') or '?'} in {files}")
-        if d.get("cmd"):
-            tail = _tail_of({}, d, 5)
-            woke += f"; its checks failed after the batch merged both sides' changes: {d['cmd']}"
-            if tail:
-                woke += f" ({tail[-300:]})"
-        done = [x for x in current if x["status"] in ("pushed", "landed")]
-        if done:
-            woke += "; already landed: " + ", ".join(f"{x['branch'] or '?'} at {_short(x['head'])} ({x['status']} as "
-                                                     f"{_short(x['pushed_sha'])})" for x in done)
-        # Conflict fixes cost no review attempt (conflictfix.py): their own count is the approvals the
-        # queue sent back, this one included.
-        sent = db.one("SELECT COUNT(DISTINCT created) n FROM push_queue WHERE task=? AND status='conflict'",
-                      (tid,))["n"]
-        # From its second conflicting batch on, it leaves batching for one rebase task on a branch of its
-        # own (auto_rebase), rather than another conflict fix tried again in a later batch.
-        held = open_rebase(db, task, str(r["head"] or "")) if sent >= REBASE_AFTER else None
-        rebase = auto_rebase(p, task, r, target, woke) if sent >= REBASE_AFTER and not held else None
-        if held or rebase or sent > int(task["max_attempts"] or 3):
-            text = f"{woke}. It keeps conflicting after {sent - 1} conflict fix{'es' if sent != 2 else ''}"
-            if rebase:
-                text += f"; the daemon queued #{rebase} to rebase it once more and re-approve it"
-            elif held:
-                text += f"; rebase task #{held} is still open for it, so no second one was queued"
-            db.update_task(tid, status="failed", blocked_reason=None, result=dump_result(
-                {**prev, "status": "failed", "summary": text[:1500],
-                 # a push conflict, not a verdict: the unchanged-head rule never keeps it (reviewreuse.judged)
-                 "push_conflict": {"branch": r["branch"] or "", "head": str(r["head"] or ""),
-                                   "files": [str(f) for f in (d.get("files") or [])[:20]]},
-                 **({"auto_rebase": rebase or held} if rebase or held else {})}))
-            # With a rebase queued, nothing is the coordinator's to decide yet: its own failure is.
-            _event(db, task, "task_failed", f"#{tid} {task['title']} → failed: {text}", queued=not (rebase or held))
-            if not rebase:
-                _reply(db, task, "failed", text)
-        else:
-            raw = [str(f) for f in (d.get("files") or [])]
-            textual = bool(raw) and not raw[0].startswith("(the rebase") and not d.get("cmd")
-            cf = conflictfix.mark(str(r["head"] or ""), r["branch"] or "", target,
-                                  str(d.get("onto") or m.get("tip") or ""), raw, textual, sent)
-            _requeue(db, task, woke, {conflictfix.KEY: cf})
-            _event(db, task, "task_requeued", f"#{tid} {task['title']}: {woke}; its review runs again to settle it"
-                   + ("" if cf.get("escalate") else " as a light conflict fix"), queued=False)
+        _settle_conflict(*args, current)
     elif states <= {"pushed", "landed"}:
-        done = [x for x in rows if x["status"] in ("pushed", "landed")]
-        last = max(done, key=lambda x: x["id"])
-        new = [x for x in current if x["status"] == "pushed"]
-        tail = _landing({**last, "status": "pushed" if new else "landed"}, last["target"] or target,
-                        _reach(db, last["batch"], b, m))
-        ff = [str(x) for x in m.get("fast_forward") or []] if new else []
-        if ff:   # delivery.fast_forward_also and mirror_remotes, as read back from the remotes
-            tail += "; " + "; ".join(f"warning: {x}" if x in push.ff_warnings([x]) else x for x in ff)
-        result = {**prev, "status": "done", "summary": f"{summary.rstrip()} ({tail})".strip()[:1500],
-                  "pushed": [{"branch": x["branch"], "head": x["head"], "sha": x["pushed_sha"], "version": x["version"],
-                              "batch": x["batch"], "status": x["status"]} for x in done]}
-        if ff:
-            result["fast_forward"] = ff
-        result.pop("woke", None)
-        # Its approval carried across a conflict the batch settled in shared docs (batch.settle_union).
-        if carried := [str(_detail(x)["approval_carried"]) for x in current
-                       if x["status"] == "pushed" and _detail(x).get("approval_carried")]:
-            result["approval_carried"] = carried
-            _event(db, task, "approval_carried", f"#{tid} {task['title']}: batch {b['id']} kept its approval: "
-                                                 f"{carried[0]}", queued=False)
-        # How the batch merged its shared docs with the landings before it (batch.Batch._doc_merge).
-        if docs := [d for x in current if x["status"] == "pushed" for d in _detail(x).get("doc_merges") or []]:
-            result["doc_merges"] = docs
-            _event(db, task, "doc_merged", f"#{tid} {task['title']}: batch {b['id']} merged shared docs: "
-                                           f"{batch.doc_merge_text(docs)}"[:1500], queued=False)
-        db.update_task(tid, status="done", blocked_reason=None, result=dump_result(result))
-        # Handled: the coordinator sees it in its next turn's task list; no turn is spent on it.
-        _event(db, task, "task_done", f"#{tid} {task['title']} → done ({tail}, batch {b['id']}): {summary[:1200]}",
-               queued=False)
-        _reply(db, task, "done", _done_text(prev, result["summary"], tail))
-        covered = _covers(db, task, rows)
-        settle_reviewed(db, now, only=covered)
-        post_held(db, covered, f"shipped by review #{tid}: {tail}")
+        _settle_landed(*args, rows, current, now)
     # else: some of its rows are still approved or batched; it keeps waiting.
+
+
+def _settle_trimmed(p: Project, task: dict, b: dict, m: dict, prev: dict, summary: str, target: str,
+                    r: dict, trim, trims: int) -> None:
+    """_settle for a review whose push checks failed only on prompt size caps: the change fit alone, not
+    with what landed before it. A light run trims it to fit and approves again, instead of a failed
+    review (and a shared-check incident)."""
+    db, tid = p.db, task["id"]
+    d = _detail(r)
+    woke = (f"the push checks `{d.get('cmd') or 'the push checks'}` failed in batch {b['id']} only on prompt "
+            f"size caps, on {r['branch'] or '?'} at {_short(r['head'])} merged onto {target}: "
+            f"{conflictfix.over_text(trim)}")
+    cf = conflictfix.mark(str(r["head"] or ""), r["branch"] or "", target, str(m.get("tip") or ""), [], True,
+                          trims + 1, trim=trim)
+    _requeue(db, task, woke, {conflictfix.KEY: cf, conflictfix.TRIMS: trims + 1})
+    _event(db, task, "task_requeued", f"#{tid} {task['title']}: {woke}; {TRIM_EVENT}", queued=False)
+
+
+def _settle_check_failed(p: Project, task: dict, b: dict, m: dict, prev: dict, summary: str, target: str,
+                    current: list[dict]) -> None:
+    """_settle for a review whose push checks failed: it fails as check_only, naming the failing tests."""
+    db, tid = p.db, task["id"]
+    r = next(r for r in current if r["status"] == "check_failed")
+    d = _detail(r)
+    cmd, tail = str(d.get("cmd") or "the push checks"), _tail_of(m, d)
+    text = (f"the push checks failed on {r['branch'] or '?'} at {_short(r['head'])} in batch {b['id']}: "
+            f"`{cmd}`\n{tail}")
+    # The review found no code fault: only the checks failed (reviewcap's area cap and the
+    # coordinator's effort rules read review_failure and the failing ids).
+    ids, complete = sharedchecks.failing_ids(str(d.get("tail") or ""))
+    db.update_task(tid, status="failed", blocked_reason=None, result=dump_result(
+        {**prev, "status": "failed", "summary": f"{text}\n(review: {summary})"[:1500],
+         "review_failure": "check_only", sharedchecks.FAILING_KEY: ids, sharedchecks.COMPLETE_KEY: complete,
+         "push_failed": {"branch": r["branch"], "head": r["head"], "cmd": cmd, "tail": tail[-1500:],
+                         "batch": b["id"]}}))
+    _event(db, task, "task_failed", f"#{tid} {task['title']} → failed: {text}", queued=True)
+    _reply(db, task, "failed", text)
+
+
+def _settle_conflict(p: Project, task: dict, b: dict, m: dict, prev: dict, summary: str, target: str,
+                    current: list[dict]) -> None:
+    """_settle for a review that conflicted with the target: a conflict fix runs, or from its second
+    conflicting batch one rebase task, or past its attempts it fails."""
+    db, tid = p.db, task["id"]
+    r = next(r for r in current if r["status"] == "conflict")
+    d = _detail(r)
+    files = ", ".join(str(f) for f in (d.get("files") or [])[:20]) or "?"
+    woke = (f"push conflict: {r['branch'] or '?'} at {r['head']} conflicts with {target} at "
+            f"{d.get('onto') or m.get('tip') or '?'} in {files}")
+    if d.get("cmd"):
+        tail = _tail_of({}, d, BRIEF_TAIL_LINES)
+        woke += f"; its checks failed after the batch merged both sides' changes: {d['cmd']}"
+        if tail:
+            woke += f" ({tail[-300:]})"
+    done = [x for x in current if x["status"] in ("pushed", "landed")]
+    if done:
+        woke += "; already landed: " + ", ".join(f"{x['branch'] or '?'} at {_short(x['head'])} ({x['status']} as "
+                                                 f"{_short(x['pushed_sha'])})" for x in done)
+    # Conflict fixes cost no review attempt (conflictfix.py): their own count is the approvals the
+    # queue sent back, this one included.
+    sent = db.one("SELECT COUNT(DISTINCT created) n FROM push_queue WHERE task=? AND status='conflict'",
+                  (tid,))["n"]
+    # From its second conflicting batch on, it leaves batching for one rebase task on a branch of its
+    # own (auto_rebase), rather than another conflict fix tried again in a later batch.
+    held = open_rebase(db, task, str(r["head"] or "")) if sent >= REBASE_AFTER else None
+    rebase = auto_rebase(p, task, r, target, woke) if sent >= REBASE_AFTER and not held else None
+    if held or rebase or sent > int(task["max_attempts"] or DEFAULT_MAX_ATTEMPTS):
+        text = f"{woke}. It keeps conflicting after {sent - 1} conflict fix{'es' if sent != 2 else ''}"
+        if rebase:
+            text += f"; the daemon queued #{rebase} to rebase it once more and re-approve it"
+        elif held:
+            text += f"; rebase task #{held} is still open for it, so no second one was queued"
+        db.update_task(tid, status="failed", blocked_reason=None, result=dump_result(
+            {**prev, "status": "failed", "summary": text[:1500],
+             # a push conflict, not a verdict: the unchanged-head rule never keeps it (reviewreuse.judged)
+             "push_conflict": {"branch": r["branch"] or "", "head": str(r["head"] or ""),
+                               "files": [str(f) for f in (d.get("files") or [])[:20]]},
+             **({"auto_rebase": rebase or held} if rebase or held else {})}))
+        # With a rebase queued, nothing is the coordinator's to decide yet: its own failure is.
+        _event(db, task, "task_failed", f"#{tid} {task['title']} → failed: {text}", queued=not (rebase or held))
+        if not rebase:
+            _reply(db, task, "failed", text)
+    else:
+        raw = [str(f) for f in (d.get("files") or [])]
+        textual = bool(raw) and not raw[0].startswith("(the rebase") and not d.get("cmd")
+        cf = conflictfix.mark(str(r["head"] or ""), r["branch"] or "", target,
+                              str(d.get("onto") or m.get("tip") or ""), raw, textual, sent)
+        _requeue(db, task, woke, {conflictfix.KEY: cf})
+        _event(db, task, "task_requeued", f"#{tid} {task['title']}: {woke}; its review runs again to settle it"
+               + ("" if cf.get("escalate") else " as a light conflict fix"), queued=False)
+
+
+def _settle_landed(p: Project, task: dict, b: dict, m: dict, prev: dict, summary: str, target: str,
+                    rows: list[dict], current: list[dict], now: float) -> None:
+    """_settle for a review whose rows all landed: it is done, with what landed and how."""
+    db, tid = p.db, task["id"]
+    done = [x for x in rows if x["status"] in ("pushed", "landed")]
+    last = max(done, key=lambda x: x["id"])
+    new = [x for x in current if x["status"] == "pushed"]
+    tail = _landing({**last, "status": "pushed" if new else "landed"}, last["target"] or target,
+                    _batch_reach(db, last["batch"], b, m))
+    ff = [str(x) for x in m.get("fast_forward") or []] if new else []
+    if ff:   # delivery.fast_forward_also and mirror_remotes, as read back from the remotes
+        tail += "; " + "; ".join(f"warning: {x}" if x in push.ff_warnings([x]) else x for x in ff)
+    result = {**prev, "status": "done", "summary": f"{summary.rstrip()} ({tail})".strip()[:1500],
+              "pushed": [{"branch": x["branch"], "head": x["head"], "sha": x["pushed_sha"], "version": x["version"],
+                          "batch": x["batch"], "status": x["status"]} for x in done]}
+    if ff:
+        result["fast_forward"] = ff
+    result.pop("woke", None)
+    # Its approval carried across a conflict the batch settled in shared docs (batch.settle_union).
+    if carried := [str(_detail(x)["approval_carried"]) for x in current
+                   if x["status"] == "pushed" and _detail(x).get("approval_carried")]:
+        result["approval_carried"] = carried
+        _event(db, task, "approval_carried", f"#{tid} {task['title']}: batch {b['id']} kept its approval: "
+                                             f"{carried[0]}", queued=False)
+    # How the batch merged its shared docs with the landings before it (batch.Batch._doc_merge).
+    if docs := [d for x in current if x["status"] == "pushed" for d in _detail(x).get("doc_merges") or []]:
+        result["doc_merges"] = docs
+        _event(db, task, "doc_merged", f"#{tid} {task['title']}: batch {b['id']} merged shared docs: "
+                                       f"{batch.doc_merge_text(docs)}"[:1500], queued=False)
+    db.update_task(tid, status="done", blocked_reason=None, result=dump_result(result))
+    # Handled: the coordinator sees it in its next turn's task list; no turn is spent on it.
+    _event(db, task, "task_done", f"#{tid} {task['title']} → done ({tail}, batch {b['id']}): {summary[:1200]}",
+           queued=False)
+    _reply(db, task, "done", _done_text(prev, result["summary"], tail))
+    covered = _covers(db, task, rows)
+    settle_reviewed(db, now, only=covered)
+    post_held(db, covered, f"shipped by review #{tid}: {tail}")
 
 
 def rebase_head(task: dict) -> str:
@@ -2601,7 +2742,7 @@ def auto_rebase(p: Project, review: dict, row: dict, target: str, woke: str) -> 
     if not _HEX40.fullmatch(head):
         return None
     seen, t = set(), review
-    while t and t["id"] not in seen and len(seen) < 50:   # the review and the tasks it continues
+    while t and t["id"] not in seen and len(seen) < REBASE_WALK_MAX:   # the review and the tasks it continues
         seen.add(t["id"])
         if f'"{REBASE_LABEL}' in (t.get("labels") or ""):
             return None
@@ -2640,7 +2781,7 @@ def auto_rebase(p: Project, review: dict, row: dict, target: str, woke: str) -> 
     rid = db.add_task(f"Rebase {branch or _short(head)} onto {target} after push conflicts (review #{review['id']})",
                       spec, kind="review", tier=tier, priority=review["priority"], origin="daemon",
                       reply_chat=review["reply_chat"],
-                      budget_usd=float(((cfg.get("budget") or {}).get("task_default_usd") or {}).get(tier, 8.0)),
+                      budget_usd=float(((cfg.get("budget") or {}).get("task_default_usd") or {}).get(tier, DEFAULT_TASK_USD)),
                       depends_on=[d for d in dependency_ids(review) if isinstance(d, int)],
                       labels=[*keep, f"continues:{review['id']}", f"{REBASE_LABEL}{head}"], **pin_of(review))
     return rid
@@ -2717,7 +2858,7 @@ def settle_reviewed(db, now: float | None = None, only: set[int] | None = None) 
         if not shipped:
             continue
         last = max(shipped, key=lambda x: x["id"])
-        tail = f"shipped by review #{latest['id']}: " + _landing(last, last["target"], _reach(db, last["batch"]))
+        tail = f"shipped by review #{latest['id']}: " + _landing(last, last["target"], _batch_reach(db, last["batch"]))
         prev = load_result(t["result"])
         summary = str(prev.get("summary") or "")
         result = {**prev, "status": "done", "summary": f"{summary.rstrip()} ({tail})".strip()[:1500],
@@ -2733,6 +2874,78 @@ def settle_reviewed(db, now: float | None = None, only: set[int] | None = None) 
             _reply(db, t, "done", _done_text(prev, result["summary"], tail))
         closed.append(t["id"])
     return closed
+
+
+def _apply_rows(db, rows: list[dict], results: dict, m: dict, now: float) -> list[int]:
+    """Move each of a finishing batch's rows to what the batch made of it (_apply); returns the tasks of
+    the rows that landed."""
+    outcome = str(m.get("outcome"))
+    sha, version, tip = m.get("pushed_sha"), m.get("version"), m.get("tip")
+    shipped: list[int] = []
+    for r in rows:
+        res = results.get(r["id"]) or {}
+        status = res.get("status") if res.get("status") in ROW_RESULTS else (
+            "refused" if outcome == "refused" else "requeued")
+        detail = res.get("detail") if isinstance(res.get("detail"), dict) else None
+        if outcome == "refused" and not detail:
+            detail = {"why": str(m.get("message") or "")[:2000] or None}
+        text = json.dumps(detail)[:8000] if detail else None
+        if status in ("pushed", "landed"):
+            shipped.append(r["task"])
+            own = res.get("sha") if isinstance(res.get("sha"), str) and _HEX40.fullmatch(res["sha"]) else None
+            db.x("UPDATE push_queue SET status=?, pushed_sha=?, landed_sha=?, version=?, detail=?, updated=? "
+                 "WHERE id=?", (status, sha or tip, own or sha or tip, version, text, now, r["id"]))
+        elif status in ("conflict", "check_failed", "refused"):
+            db.x("UPDATE push_queue SET status=?, detail=?, updated=? WHERE id=?", (status, text, now, r["id"]))
+        elif status == "scope_held":   # its push needs a token scope the credential lacks (scopehold)
+            db.x("UPDATE push_queue SET status='held', detail=?, updated=? WHERE id=?", (text, now, r["id"]))
+        else:   # requeued, or the batch did not get to it (busy, moved, rejected, tip_failed)
+            db.x("UPDATE push_queue SET status='approved', tries=tries+?, detail=?, updated=? WHERE id=?",
+                 (1 if outcome == "moved" else 0, text, now, r["id"]))
+    return shipped
+
+
+def _apply_tip(db, st: dict, b: dict, m: dict, rows: list[dict], results: dict, now: float) -> list[tuple]:
+    """Record in the queue state `st` what a finishing batch showed about the push branch's tip: a tip
+    that fails its own checks (bad_tip, its event and, after TIP_FAILS batches, its alert), or one that
+    passed or moved; returns the alerts to raise once the batch is finalized (_apply)."""
+    outcome, tip = str(m.get("outcome")), m.get("tip")
+    later: list[tuple] = []
+    bad = st.get("bad_tip") or {}
+    d = m.get("tip_check") if isinstance(m.get("tip_check"), dict) else {}
+    first = next((x.get("detail") for x in results.values() if isinstance(x.get("detail"), dict)
+                  and x["detail"].get("cmd")), {}) or {}
+    cmd = d.get("cmd") or first.get("cmd") or "the push checks"
+    if outcome == "tip_failed" and tip:
+        same = bad.get("tip") == tip
+        fails = int(bad.get("fails") or 0) + 1 if same else 1
+        tried = set(bad.get("tried") or []) if same else set()
+        # Only the approvals the batch showed do not fix the tip are tried; the rest go first next
+        # time. A marker from a release before "tip_tried" counts every approval it carried.
+        shown = m.get("tip_tried") if isinstance(m.get("tip_tried"), list) else [r["id"] for r in rows]
+        tried |= {r["id"] for r in rows if r["id"] in shown}
+        st["bad_tip"] = {"tip": tip, "fails": fails, "tried": sorted(tried), "at": now,
+                         "cmd": cmd, "alerted": bool(same and bad.get("alerted")) or fails >= TIP_FAILS,
+                         "ids": sharedchecks.failing_ids(str(d.get("tail") or first.get("tail") or ""))[0]}
+        if fails >= TIP_FAILS and not (same and bad.get("alerted")):
+            later.append((BAD_TIP_ALERT, f"The push branch {b['target']} fails its own checks at {_short(tip)} "
+                                         f"(`{cmd}`) in {fails} push batches in a row. The queue no longer checks "
+                                         f"that tip alone: it tries approvals not yet tried on it first, and "
+                                         f"pushes them if the tip with them passes. This clears once the tip "
+                                         f"changes or passes.", "high"))
+    elif bad.get("tip") and (outcome == "pushed" or (outcome in ("landed", "nothing") and m.get("tip_passed"))
+                             or (tip and tip != bad["tip"])):
+        # The tip passed (with what was pushed, or alone), or moved: its alert clears (alerts.holds).
+        # A batch that carried nothing, or that the version guard stopped, never showed it passing.
+        st.pop("bad_tip", None)
+    if outcome in ("pushed", "landed", "nothing"):
+        st.pop("backoff_until", None)
+        st.pop("auth_wait", None)
+    if outcome == "tip_failed" and tip and tip not in (st.get("tips_told") or []):
+        st["tips_told"] = ((st.get("tips_told") or []) + [tip])[-TIPS_TOLD:]
+        _event(db, None, "push_tip_failed", f"the push branch tip {_short(tip)} of {b['target']} fails its checks: "
+                                            f"`{cmd}`\n{_tail_of(m, d or first)}", queued=True, severity="high")
+    return later
 
 
 def _apply(p: Project, b: dict, m: dict, alert: Callable, now: float) -> None:
@@ -2755,67 +2968,14 @@ def _apply(p: Project, b: dict, m: dict, alert: Callable, now: float) -> None:
                  checks.get("cpu_s"), now, b["id"])).rowcount:
             return
         rows = db.q("SELECT * FROM push_queue WHERE batch=? AND status='batched' ORDER BY id", (b["id"],))
-        shipped: list[int] = []
-        for r in rows:
-            res = results.get(r["id"]) or {}
-            status = res.get("status") if res.get("status") in ROW_RESULTS else (
-                "refused" if outcome == "refused" else "requeued")
-            detail = res.get("detail") if isinstance(res.get("detail"), dict) else None
-            if outcome == "refused" and not detail:
-                detail = {"why": str(m.get("message") or "")[:2000] or None}
-            text = json.dumps(detail)[:8000] if detail else None
-            if status in ("pushed", "landed"):
-                shipped.append(r["task"])
-                own = res.get("sha") if isinstance(res.get("sha"), str) and _HEX40.fullmatch(res["sha"]) else None
-                db.x("UPDATE push_queue SET status=?, pushed_sha=?, landed_sha=?, version=?, detail=?, updated=? "
-                     "WHERE id=?", (status, sha or tip, own or sha or tip, version, text, now, r["id"]))
-            elif status in ("conflict", "check_failed", "refused"):
-                db.x("UPDATE push_queue SET status=?, detail=?, updated=? WHERE id=?", (status, text, now, r["id"]))
-            elif status == "scope_held":   # its push needs a token scope the credential lacks (scopehold)
-                db.x("UPDATE push_queue SET status='held', detail=?, updated=? WHERE id=?", (text, now, r["id"]))
-            else:   # requeued, or the batch did not get to it (busy, moved, rejected, tip_failed)
-                db.x("UPDATE push_queue SET status='approved', tries=tries+?, detail=?, updated=? WHERE id=?",
-                     (1 if outcome == "moved" else 0, text, now, r["id"]))
+        shipped = _apply_rows(db, rows, results, m, now)
         st = _state(db)
         st["deaths"] = 0
         if outcome != "rejected":
             st.pop("fail_streak", None)   # a batch that got further than the last one: no same failure in a row
         back = [r["id"] for r in db.q("SELECT id FROM push_queue WHERE batch=? AND status='approved'", (b["id"],))]
         st.pop("hold", None)   # the time-boxed hold of older releases; bad_tip replaces it
-        bad = st.get("bad_tip") or {}
-        d = m.get("tip_check") if isinstance(m.get("tip_check"), dict) else {}
-        first = next((x.get("detail") for x in results.values() if isinstance(x.get("detail"), dict)
-                      and x["detail"].get("cmd")), {}) or {}
-        cmd = d.get("cmd") or first.get("cmd") or "the push checks"
-        if outcome == "tip_failed" and tip:
-            same = bad.get("tip") == tip
-            fails = int(bad.get("fails") or 0) + 1 if same else 1
-            tried = set(bad.get("tried") or []) if same else set()
-            # Only the approvals the batch showed do not fix the tip are tried; the rest go first next
-            # time. A marker from a release before "tip_tried" counts every approval it carried.
-            shown = m.get("tip_tried") if isinstance(m.get("tip_tried"), list) else [r["id"] for r in rows]
-            tried |= {r["id"] for r in rows if r["id"] in shown}
-            st["bad_tip"] = {"tip": tip, "fails": fails, "tried": sorted(tried), "at": now,
-                             "cmd": cmd, "alerted": bool(same and bad.get("alerted")) or fails >= TIP_FAILS,
-                             "ids": sharedchecks.failing_ids(str(d.get("tail") or first.get("tail") or ""))[0]}
-            if fails >= TIP_FAILS and not (same and bad.get("alerted")):
-                later.append((BAD_TIP_ALERT, f"The push branch {b['target']} fails its own checks at {_short(tip)} "
-                                             f"(`{cmd}`) in {fails} push batches in a row. The queue no longer checks "
-                                             f"that tip alone: it tries approvals not yet tried on it first, and "
-                                             f"pushes them if the tip with them passes. This clears once the tip "
-                                             f"changes or passes.", "high"))
-        elif bad.get("tip") and (outcome == "pushed" or (outcome in ("landed", "nothing") and m.get("tip_passed"))
-                                 or (tip and tip != bad["tip"])):
-            # The tip passed (with what was pushed, or alone), or moved: its alert clears (alerts.holds).
-            # A batch that carried nothing, or that the version guard stopped, never showed it passing.
-            st.pop("bad_tip", None)
-        if outcome in ("pushed", "landed", "nothing"):
-            st.pop("backoff_until", None)
-            st.pop("auth_wait", None)
-        if outcome == "tip_failed" and tip and tip not in (st.get("tips_told") or []):
-            st["tips_told"] = ((st.get("tips_told") or []) + [tip])[-TIPS_TOLD:]
-            _event(db, None, "push_tip_failed", f"the push branch tip {_short(tip)} of {b['target']} fails its checks: "
-                                                f"`{cmd}`\n{_tail_of(m, d or first)}", queued=True, severity="high")
+        later += _apply_tip(db, st, b, m, rows, results, now)
         _flaky_told(db, st, b, m, now)
         _dropped_told(db, b, m)
         if warn := push.ff_warnings(m.get("fast_forward")):
@@ -2831,8 +2991,8 @@ def _apply(p: Project, b: dict, m: dict, alert: Callable, now: float) -> None:
             st["backoff_until"] = max(float(st.get("backoff_until") or 0), now + setupfault.RETRY_S)
         if outcome == "rejected":
             st["backoff_until"] = now + BACKOFF_MAX_S
-            why = str(m.get('message') or _tail_of(m, None, 5))[:1500]
-            if same := _streak(db, st, b["target"], outcome, why, now, tip):
+            why = str(m.get('message') or _tail_of(m, None, BRIEF_TAIL_LINES))[:1500]
+            if same := _fail_streak(db, st, b["target"], outcome, why, now, tip):
                 _event(db, None, "push_same_failure", same, queued=True, severity="high")
             if auth := bool(AUTH_RE.search(why)):   # the credential: retried once push access works (_auth_back)
                 st["auth_wait"] = {"at": now}
@@ -2841,9 +3001,9 @@ def _apply(p: Project, b: dict, m: dict, alert: Callable, now: float) -> None:
             later.append(("push_rejected", f"The push queue's push to {b['target']} was rejected: {why}. "
                                            f"The approvals stay queued and are retried " + (
                                                f"as soon as push access works again (checked every "
-                                               f"{AUTH_PROBE_S / 60:g} min, at the latest in {BACKOFF_MAX_S // 60} "
+                                               f"{AUTH_PROBE_S / MIN_S:g} min, at the latest in {BACKOFF_MAX_S // MIN_S} "
                                                f"min); this alert clears then." if auth else
-                                               f"in {BACKOFF_MAX_S // 60} min."), "high"))
+                                               f"in {BACKOFF_MAX_S // MIN_S} min."), "high"))
         later += _held_told(p, st, b, m, now, "script_torn") + _held_told(p, st, b, m, now, "setup_fault")
         db.set_kv(KV, st)
         later += _hold_scoped(p, b, m, now)
@@ -2905,7 +3065,7 @@ def _hold_scoped(p: Project, b: dict, m: dict, now: float) -> list[tuple]:
             continue   # the condition's alert is out already
         n = len(rows)
         tasks = "; ".join(f"#{r['task']} {r['title'] or ''} ({r['branch'] or '?'} at {_short(r['head'])})" for r in rows)
-        every = scopehold.probe_s(d) / 60
+        every = scopehold.probe_s(d) / MIN_S
         later.append((f"{scopehold.ALERT}:{scope}",
                       f"The push to {b['target']} was refused: the token it pushes with lacks the `{scope}` scope, "
                       f"needed to change {', '.join(files[:10]) or 'the files it names'}. Held: {tasks}. {rest} "
@@ -3050,7 +3210,7 @@ def _after(p: Project, b: dict, m: dict, status: str, alert: Callable, now: floa
             took = (float(ap.get("ended") or 0) - float(ap.get("started") or 0)) if ap.get("ended") else None
             if since:    # the one closing event of a deferral episode
                 _event(db, None, "after_push_ok", f"deploy done after deferral: after_push of {what} (batch {b['id']}) "
-                       f"succeeded, {_age(max(0.0, now - since))} after it was first deferred", queued=False, severity="low")
+                       f"succeeded, {_age_text(max(0.0, now - since))} after it was first deferred", queued=False, severity="low")
             else:
                 _event(db, None, "after_push_ok", f"after_push of {what} (batch {b['id']}) succeeded"
                                                   + (f" in {took:.0f} s" if took and took > 0 else ""), queued=False)
@@ -3078,7 +3238,7 @@ def _deploy_alerted(p: Project, m: dict, ap: dict) -> bool:
     for this commit: one deploy outcome sends one alert, so the push queue sends none of its own."""
     rec = p.db.kv(DEPLOY_ALERTED) or {}
     a, b = str(rec.get("commit") or ""), str(m.get("pushed_sha") or "")
-    return (len(min(a, b, key=len)) >= 7 and (a.startswith(b) or b.startswith(a))
+    return (len(min(a, b, key=len)) >= SHA_MATCH_MIN and (a.startswith(b) or b.startswith(a))
             and float(rec.get("at") or 0) >= float(ap.get("started") or 0))
 
 
@@ -3098,7 +3258,7 @@ def _cycle_held(p: Project, cfg: dict | None) -> str:
     return cyclenotice.line(h, p) if h else ""
 
 
-def _resume(p: Project, b: dict, marker: Path, now: float, free: bool = False, deferred: bool = False) -> bool:
+def _resume_after_push(p: Project, b: dict, marker: Path, now: float, free: bool = False, deferred: bool = False) -> bool:
     """Run the after_push of a batch whose process died in it once more: the same
     `ttp push --batch <marker>`, which resumes at after_push since the marker has an outcome. It holds
     the batch's after_push lock (not `push:`, so upgrades do not wait for it), passed down as at the
@@ -3114,7 +3274,7 @@ def _resume(p: Project, b: dict, marker: Path, now: float, free: bool = False, d
                                "AND after_finalized IS NULL", (0 if free else 1, b["id"], MAX_RESUMES,
                                                                int(free))).rowcount:
             return False
-        m = _read(marker)
+        m = push._read(marker)
         for k in ("after_held", "held_said"):
             m.pop(k, None)
         if deferred:     # its deferred outcome goes, so the batch runs after_push again (batch._resume)
@@ -3140,8 +3300,8 @@ def _note_after_push(p: Project, cfg: dict | None) -> None:
         p.db.set_kv(AFTER_PUSH_OFF, off)
 
 
-def _retry_s(p: Project, cfg: dict | None = None) -> float:
-    return _num(_delivery(p, cfg).get("after_push_retry_s"), DEFAULT_RETRY_S, float, 60)
+def _after_push_retry_s(p: Project, cfg: dict | None = None) -> float:
+    return _num(_delivery(p, cfg).get("after_push_retry_s"), DEFAULT_RETRY_S, float, RETRY_MIN_S)
 
 
 def _tell_deferral(p: Project, ep: dict, what: str, ap: dict, now: float, cfg: dict | None = None) -> bool:
@@ -3153,14 +3313,14 @@ def _tell_deferral(p: Project, ep: dict, what: str, ap: dict, now: float, cfg: d
     reason = str(ap.get("reason") or "deploy deferred")
     if not ep.get("deferred_said"):
         _event(p.db, None, "after_push_deferred", f"{reason} (after_push of {what}). The push stands; the deploy "
-               f"runs again every {_age(_retry_s(p, cfg))} until the box is free", queued=False)
+               f"runs again every {_age_text(_after_push_retry_s(p, cfg))} until the box is free", queued=False)
         ep["deferred_said"] = now
         changed = True
-    limit = _num(_delivery(p, cfg).get("after_push_defer_alert_h"), DEFAULT_DEFER_ALERT_H, float, 0) * 3600
+    limit = _num(_delivery(p, cfg).get("after_push_defer_alert_h"), DEFAULT_DEFER_ALERT_H, float, 0) * HOUR_S
     since = float(ep.get("deferred_since") or now)
     if limit and not ep.get("deferred_long_said") and now - since >= limit:
         _event(p.db, None, "after_push_deferred_long", f"after_push of {what} is still deferred after "
-               f"{_age(now - since)}: {reason}. The push stands and the daemon keeps retrying; nothing failed",
+               f"{_age_text(now - since)}: {reason}. The push stands and the daemon keeps retrying; nothing failed",
                queued=True)
         ep["deferred_long_said"] = now
         changed = True
@@ -3184,7 +3344,7 @@ def _tend_deferred(p: Project, folder: Path, receipt: Path, rid: str, m: dict, n
         return True
     if _tell_deferral(p, m, what, ap, now):
         write_json(receipt, m)
-    due = float(ap.get("ended") or m.get("deferred_since") or 0) + _retry_s(p)
+    due = float(ap.get("ended") or m.get("deferred_since") or 0) + _after_push_retry_s(p)
     if now >= due and not _cycle_held(p, None):
         _rerun_receipt(p, receipt, rid, now)
     return False
@@ -3208,8 +3368,8 @@ def _tend_deferred_batch(p: Project, b: dict, marker: Path, m: dict, cfg: dict |
         write_json(marker, m)
     if b["after_push"] != "deferred":   # status reads 'deploy deferred' while it waits (not finalized)
         p.db.x("UPDATE push_batches SET after_push='deferred' WHERE id=? AND after_finalized IS NULL", (b["id"],))
-    if now >= float(ap.get("ended") or 0) + _retry_s(p, cfg) and not _cycle_held(p, cfg):
-        return _resume(p, b, marker, now, free=True, deferred=True) or told
+    if now >= float(ap.get("ended") or 0) + _after_push_retry_s(p, cfg) and not _cycle_held(p, cfg):
+        return _resume_after_push(p, b, marker, now, free=True, deferred=True) or told
     return told
 
 
@@ -3222,7 +3382,7 @@ def tend_receipts(p: Project, alert: Callable = lambda *a, **k: None, now: float
     folder = p.state / batch.RECEIPTS
     done = []
     for receipt in sorted(folder.glob("*.json")) if folder.is_dir() else []:
-        m = _read(receipt)
+        m = push._read(receipt)
         if not m:
             continue
         if m.get("reported"):
@@ -3239,9 +3399,9 @@ def tend_receipts(p: Project, alert: Callable = lambda *a, **k: None, now: float
             m["status"] = "running"     # its rerun never got going: reported below as stopped
             write_json(receipt, m)
         cut = m.get("status") == "running" and locks.any_free([batch._after_lock(p, rid)]) \
-            and _read(receipt).get("status") == "running"    # read after the lock: the outcome is written before it goes
+            and push._read(receipt).get("status") == "running"    # read after the lock: the outcome is written before it goes
         if cut and (newer := _newer_deploy(p, folder, m)):
-            m = _read(receipt)     # a newer deploy of the same branch replaced it: recorded, never run again
+            m = push._read(receipt)     # a newer deploy of the same branch replaced it: recorded, never run again
             m.update(status="finished", ended=now, after_push={
                 "status": "superseded", "exit": None, "started": m.get("started"), "by": newer,
                 "tail": f"stopped before it finished; {newer}'s after_push deploys a newer push of {m.get('target')}"})
@@ -3257,7 +3417,7 @@ def tend_receipts(p: Project, alert: Callable = lambda *a, **k: None, now: float
         if m.get("status") == "running":
             if not cut:
                 continue
-            m = _read(receipt)
+            m = push._read(receipt)
             if m.get("status") == "running":
                 m.update(status="finished", ended=now, after_push={
                     "status": "killed", "exit": None, "started": m.get("started"),
@@ -3269,7 +3429,7 @@ def tend_receipts(p: Project, alert: Callable = lambda *a, **k: None, now: float
             f" (task #{m['task']})" if m.get("task") else "")
         if status == "ok" and m.get("deferred_since"):    # the one closing event of a deferral episode
             _event(p.db, None, "after_push_ok", f"deploy done after deferral: after_push of {what} succeeded, "
-                   f"{_age(max(0.0, now - float(m['deferred_since'])))} after it was first deferred",
+                   f"{_age_text(max(0.0, now - float(m['deferred_since'])))} after it was first deferred",
                    queued=False, severity="low")
             p.db.set_kv(AFTER_PUSH_OK, max(now, time.time()))
         elif status == "ok":
@@ -3299,7 +3459,7 @@ def _newer_deploy(p: Project, folder: Path, m: dict, batch: str | None = None) -
     if not target or not started:
         return ""
     for other in sorted(folder.glob("*.json"), reverse=True):
-        o = _read(other)
+        o = push._read(other)
         if o and o.get("id") != m.get("id") and o.get("target") == target and o.get("status") != "held" \
                 and float(o.get("started") or 0) > started:
             return f"push {_short(o.get('pushed_sha'))}"
@@ -3314,7 +3474,7 @@ def _newer_deploy(p: Project, folder: Path, m: dict, batch: str | None = None) -
 def _rerun_receipt(p: Project, receipt: Path, rid: str, now: float) -> None:
     """An ordinary push's after_push that waited for a power-cycle notice (no resume spent) or that a reboot
     cut short (once, MAX_RESUMES): run it again, detached (batch.rerun_receipt), once no notice holds."""
-    m = _read(receipt)
+    m = push._read(receipt)
     if _cycle_held(p, None):
         return
     if m.get("status") == "rerun" and float(m.get("rerun_at") or 0) > now - RERUN_START_S:
@@ -3354,12 +3514,12 @@ def finalize(p: Project, cfg: dict | None = None, alert: Callable = lambda *a, *
     changed = []
     for b in db.q("SELECT * FROM push_batches WHERE after_finalized IS NULL ORDER BY started"):
         now_ = time.time() if now is None else now
-        _reap(b["id"])
+        _reap_child(b["id"])
         marker = Path(b["marker"])
         live, m = alive(marker)
         if b["finalized"] is None:
             if not live and not m.get("outcome") and isinstance(m.get("pushing"), dict):
-                m = _recover(p, b, marker, m, now_)
+                m = _recover_batch(p, b, marker, m, now_)
                 if m is None:
                     continue
             if m.get("outcome") and (m.get("tip") or m["outcome"] in CLEAN_OUTCOMES):
@@ -3371,7 +3531,7 @@ def finalize(p: Project, cfg: dict | None = None, alert: Callable = lambda *a, *
             else:
                 why = (f"failed: {str(m.get('message') or '')[:300]}" if m.get("outcome") == "error"
                        else f"ended while pushing {_short(m['unverified'])} (a reboot, a kill or a crash), and "
-                            f"{b['target']} could not be read for {RECOVER_S // 60} min to tell whether it landed. "
+                            f"{b['target']} could not be read for {RECOVER_S // MIN_S} min to tell whether it landed. "
                             f"If it did, the next batch finds the approvals on the branch, but no after_push "
                             f"ran for it" if m.get("unverified")
                        else "ended before writing an outcome (a reboot, a kill or a crash)" if m
@@ -3406,7 +3566,7 @@ def finalize(p: Project, cfg: dict | None = None, alert: Callable = lambda *a, *
                 write_json(marker, {**m, "held_said": now_})
             continue
         elif m.get("after_held") or int(b["after_tries"] or 0) < MAX_RESUMES:
-            if _resume(p, b, marker, now_, free=bool(m.get("after_held"))):
+            if _resume_after_push(p, b, marker, now_, free=bool(m.get("after_held"))):
                 changed.append(b["id"])
             continue
         else:
@@ -3427,7 +3587,7 @@ def prune_refs(p: Project) -> int:
     if not db.one("SELECT id FROM push_queue LIMIT 1"):
         return 0
     refs = _git(p, "for-each-ref", "--format=%(refname)", REF_PREFIX)
-    gone, cut = 0, time.time() - LANDED_DAYS * 86400
+    gone, cut = 0, time.time() - LANDED_DAYS * DAY_S
     for ref in refs.stdout.split() if refs.returncode == 0 else []:
         tail = ref[len(REF_PREFIX):]
         row = db.one("SELECT q.status, q.updated, t.status AS task_status FROM push_queue q LEFT JOIN tasks t ON t.id=q.task "
@@ -3468,7 +3628,7 @@ def tend(p: Project, cfg: dict | None = None, alert: Callable = lambda *a, **k: 
     the queue was turned off (not while the settings cannot be read: `may_requeue` False), and
     finalize batches. Cheap while the queue is empty."""
     for bid in list(_children):
-        _reap(bid)
+        _reap_child(bid)
     db = p.db
     if may_requeue:
         _note_after_push(p, cfg)
@@ -3504,7 +3664,7 @@ def check_landing(p: Project, cfg: dict | None = None, alert: Callable = lambda 
     marks = ",".join("?" * len(LANDED_OUTCOMES))
     landed = db.one(f"SELECT MAX(finalized) AS t FROM push_batches WHERE outcome IN ({marks})", LANDED_OUTCOMES)
     since = max(float(oldest["t"]), float(landed["t"] or 0) if landed else 0.0)
-    if now - since < hours * 3600:
+    if now - since < hours * HOUR_S:
         return False
     tries = db.q("SELECT outcome FROM push_batches WHERE started>=? AND finalized IS NOT NULL", (since,))
     st = _state(db)
@@ -3514,7 +3674,7 @@ def check_landing(p: Project, cfg: dict | None = None, alert: Callable = lambda 
     db.set_kv(KV, st)
     cut = sum(1 for r in tries if r["outcome"] == "rebooted")
     alert(LANDING_ALERT, f"Nothing has landed on {'/'.join(tgt) if tgt else 'the push branch'} for "
-                         f"{(now - since) / 3600:.1f} h although approvals wait: {len(tries)} push batch"
+                         f"{(now - since) / HOUR_S:.1f} h although approvals wait: {len(tries)} push batch"
                          f"{'es' if len(tries) != 1 else ''} tried, {cut} of them cut short by a host reboot. "
                          f"The queue keeps retrying; this clears once a batch lands.", severity="high")
     return True
@@ -3576,7 +3736,7 @@ def check_no_batch(p: Project, cfg: dict | None = None, alert: Callable = lambda
     holds = no_batch_holds(p, cfg, now)
     n = db.one("SELECT COUNT(*) AS n FROM push_queue WHERE status='approved'")["n"]
     text = (f"{n} approved change{'s' if n != 1 else ''} {'have' if n != 1 else 'has'} waited "
-            f"{(now - since) / 60:.0f} min and no push batch runs. What holds it: {'; '.join(holds)}. "
+            f"{(now - since) / MIN_S:.0f} min and no push batch runs. What holds it: {'; '.join(holds)}. "
             f"This clears once a batch starts.")
     st["no_batch"] = {"alerted": True, "since": since, "at": now, "holds": holds}
     db.set_kv(KV, st)
@@ -3640,7 +3800,7 @@ def _ancestor(p: Project, a: str, b: str) -> bool | None:
         return None
     if r.returncode not in (0, 1):
         return False   # a commit not here (yet): not counted, asked again next time
-    if len(_anc_seen) > 2048:
+    if len(_anc_seen) > ANC_MEMO_MAX:
         _anc_seen.clear()
     _anc_seen[(a, b)] = r.returncode == 0
     return _anc_seen[(a, b)]
@@ -3665,7 +3825,7 @@ def stack_depth(p: Project, rows: list[dict]) -> int:
     return max(depth.values(), default=0)
 
 
-def summary(p: Project, now: float | None = None, last: int = 5, db=None) -> dict:
+def summary(p: Project, now: float | None = None, last: int = SUMMARY_LAST, db=None) -> dict:
     """The queue for status displays: approved rows with their ages, the live batch's phase and
     age, and the last batches with outcome, sha, version and after_push; model-free numbers: the oldest
     row approved and not landed, the stack depth (stack_depth) and the batches that landed in RATE_S.
@@ -3681,7 +3841,7 @@ def summary(p: Project, now: float | None = None, last: int = 5, db=None) -> dic
     live = None
     b = db.one("SELECT * FROM push_batches WHERE after_finalized IS NULL ORDER BY started DESC LIMIT 1")
     if b:
-        m = _read(Path(b["marker"]))
+        m = push._read(Path(b["marker"]))
         live = {"id": b["id"], "target": b["target"], "age_s": round(now - b["started"], 1),
                 "phase": m.get("phase") or ("after_push" if b["finalized"] else "push"),
                 "rows": db.one("SELECT COUNT(*) n FROM push_queue WHERE batch=?", (b["id"],))["n"]}
@@ -3690,7 +3850,7 @@ def summary(p: Project, now: float | None = None, last: int = 5, db=None) -> dic
                for r in db.q("SELECT * FROM push_batches WHERE finalized IS NOT NULL ORDER BY started DESC LIMIT ?",
                              (last,))]
     for x in batches:
-        x["reach"] = _reach(db, x["id"]) if x["outcome"] in ("pushed", "landed") else None
+        x["reach"] = _batch_reach(db, x["id"]) if x["outcome"] in ("pushed", "landed") else None
         x["landing"] = (push.landing(x["pushed_sha"], x["target"], x["reach"], x["version"]) if x["pushed_sha"] and
                         x["outcome"] == "pushed" else f"already on {x['target']}{push.reach_words(x['reach'])}"
                         if x["outcome"] == "landed" else None)
@@ -3698,7 +3858,7 @@ def summary(p: Project, now: float | None = None, last: int = 5, db=None) -> dic
                     "AND pushed_sha IS NOT NULL ORDER BY started DESC LIMIT 1")
     known = {x["id"]: x["reach"] for x in batches}
     if pushed:
-        pushed["reach"] = known[pushed["id"]] if pushed["id"] in known else _reach(db, pushed["id"])
+        pushed["reach"] = known[pushed["id"]] if pushed["id"] in known else _batch_reach(db, pushed["id"])
     st = _state(db)
     open_ = db.q(f"SELECT id, head, created FROM push_queue WHERE status IN ({','.join('?' * len(OPEN_ROWS))}) "
                  "ORDER BY id", OPEN_ROWS)
@@ -3706,9 +3866,9 @@ def summary(p: Project, now: float | None = None, last: int = 5, db=None) -> dic
                     "AND ended>=?", (*LANDED_OUTCOMES, now - RATE_S))["n"]
     return {"on": enabled(p), "approved": approved, "held": held, "live": live, "last": batches, "last_pushed": pushed,
             "oldest_open_s": round(now - min(r["created"] for r in open_), 1) if open_ else None,
-            "stack_depth": stack_depth(p, open_), "landed_24h": landed, "landings_per_h": round(landed * 3600 / RATE_S, 2),
+            "stack_depth": stack_depth(p, open_), "landed_24h": landed, "landings_per_h": round(landed * HOUR_S / RATE_S, 2),
             "backoff_until": st.get("backoff_until"), "bad_tip": st.get("bad_tip"), "deaths": int(st.get("deaths") or 0),
-            "conflicts": conflict_stats(db, now - STATS_S), "conflict_fixes": conflictfix.stats(db, now - 86400)}
+            "conflicts": conflict_stats(db, now - STATS_S), "conflict_fixes": conflictfix.stats(db, now - DAY_S)}
 
 
 # What a live batch is doing, a finished batch's outcome and its after_push, in words for the user.
@@ -3726,13 +3886,10 @@ AFTER_WORDS = {"ok": "deploy ok", "failed": "deploy failed", "timeout": "deploy 
                "superseded": "deploy superseded"}
 
 
-def _age(s: float) -> str:
+def _age_text(s: float) -> str:
     s = max(float(s), 0.0)
-    return f"{int(s // 60)} min" if s < 7200 else f"{s / 3600:.0f} h" if s < 172800 else f"{s / 86400:.0f} days"
-
-
-def _at(ts: float, now: float, where) -> str:
-    return timefmt.short(ts, where, now)
+    return (f"{int(s // MIN_S)} min" if s < AGE_MIN_UNTIL_S else f"{s / HOUR_S:.0f} h" if s < AGE_H_UNTIL_S
+            else f"{s / DAY_S:.0f} days")
 
 
 def shown(p: Project, db=None) -> bool:
@@ -3752,11 +3909,11 @@ def status_line(p: Project, now: float | None = None, sm: dict | None = None, db
     parts = []
     n = len(sm["approved"])
     if n:
-        parts.append(f"{n} approved (oldest {_age(max(a['age_s'] for a in sm['approved']))})")
+        parts.append(f"{n} approved (oldest {_age_text(max(a['age_s'] for a in sm['approved']))})")
     live = sm["live"]
     if live:
         k = live["rows"]
-        parts.append(f"batch {PHASE_WORDS.get(live['phase'], live['phase'])} since {_age(live['age_s'])} "
+        parts.append(f"batch {PHASE_WORDS.get(live['phase'], live['phase'])} since {_age_text(live['age_s'])} "
                      f"({k} change{'s' if k != 1 else ''})")
     if held := sm.get("held"):
         scopes = ", ".join(f"`{x}`" for x in dict.fromkeys(h["scope"] or "?" for h in held))
@@ -3765,35 +3922,35 @@ def status_line(p: Project, now: float | None = None, sm: dict | None = None, db
         parts.append("empty")
     oldest = sm.get("oldest_open_s")
     if oldest is not None and (not n or oldest > max(a["age_s"] for a in sm["approved"])):
-        parts.append(f"oldest not landed {_age(oldest)}")   # a batched or held row older than every approved one
+        parts.append(f"oldest not landed {_age_text(oldest)}")   # a batched or held row older than every approved one
     if (sm.get("stack_depth") or 0) > 1:
         parts.append(f"stacked {sm['stack_depth']} deep")
     last = sm["last"][0] if sm["last"] else None
     if last and last["outcome"] != "pushed" and not (live and live["id"] == last["id"]):
         parts.append(f"last batch {OUTCOME_WORDS.get(last['outcome'], last['outcome'])} "
-                     f"{_age(now - (last['ended'] or last['started']))} ago")
+                     f"{_age_text(now - (last['ended'] or last['started']))} ago")
     bad = sm.get("bad_tip") or {}
     wait = max(float(sm.get("backoff_until") or 0), _bad_until(bad) if bad.get("tip") else 0.0)
     if int(bad.get("fails") or 0) >= TIP_FAILS:
         parts.append(f"the branch tip {_short(bad['tip'])} fails its own checks")
     if wait > now and n and not live:
-        parts.append(f"next try {_at(wait, now, p)}")
+        parts.append(f"next try {timefmt.short(wait, p, now)}")
     lp = sm.get("last_pushed")
     if lp:
         parts.append("last " + push.landing(lp["pushed_sha"], lp.get("target") or "", None, lp["version"])
-                     + (f" {_age(now - lp['ended'])} ago" if lp["ended"] else "") + push.reach_words(lp.get("reach")))
+                     + (f" {_age_text(now - lp['ended'])} ago" if lp["ended"] else "") + push.reach_words(lp.get("reach")))
         if lp["after_push"] in AFTER_WORDS and lp["after_push"] != "skipped":
             parts.append(AFTER_WORDS[lp["after_push"]])   # while it deploys, the live part says so
     stall = (_state(db or p.db).get("no_batch") or {}) if n and not live else {}
     if stall.get("alerted"):   # check_no_batch: approvals wait and no batch runs
-        parts.append(f"no batch for {_age(now - float(stall.get('since') or now))}: "
+        parts.append(f"no batch for {_age_text(now - float(stall.get('since') or now))}: "
                      + "; ".join(stall.get("holds") or []))
     if got := sm.get("landed_24h"):
         parts.append(f"{got} batch{'es' if got != 1 else ''} landed in 24 h ({sm['landings_per_h']:g}/h)")
     return "push queue" + ("" if sm["on"] else " (off)") + ": " + " · ".join(parts)
 
 
-def entries(p: Project, sm: dict, now: float, limit: int = 50, db=None) -> list[dict]:
+def entries(p: Project, sm: dict, now: float, limit: int = ENTRIES_LIMIT, db=None) -> list[dict]:
     """The rows still in the queue and those of the batches in `sm` (a summary), newest first."""
     ids = [b["id"] for b in sm["last"]] + ([sm["live"]["id"]] if sm["live"] else [])
     rows = (db or p.db).q("SELECT q.*, t.title FROM push_queue q LEFT JOIN tasks t ON t.id=q.task WHERE q.status IN "
@@ -3811,11 +3968,11 @@ def web(p: Project, db=None, now: float | None = None) -> dict | None:
     if not shown(p, db):
         return None
     now = time.time() if now is None else now
-    sm = summary(p, now, last=10, db=db)
+    sm = summary(p, now, last=QUEUE_TEXT_LAST, db=db)
     return {**sm, "line": status_line(p, now, sm, db), "entries": entries(p, sm, now, db=db)}
 
 
-def queue_text(p: Project, now: float | None = None, last: int = 10) -> str:
+def queue_text(p: Project, now: float | None = None, last: int = QUEUE_TEXT_LAST) -> str:
     """`ttp push --queue`: the open entries and the recent ones, then the last batches."""
     now = time.time() if now is None else now
     sm = summary(p, now, last=last)
@@ -3826,10 +3983,10 @@ def queue_text(p: Project, now: float | None = None, last: int = 10) -> str:
         lines.append(f"  #{r['task']} {r['branch'] or '?'} {r['head']} {r['status']}"
                      + (f" (try {r['tries'] + 1})" if r["tries"] and r["status"] == "approved" else "")
                      + (f" in {r['batch']}" if r["batch"] and r["status"] != "approved" else "")
-                     + f", {_age(r['age_s'])} old" + (f": {r['title']}" if r["title"] else ""))
+                     + f", {_age_text(r['age_s'])} old" + (f": {r['title']}" if r["title"] else ""))
     c = sm["conflicts"]
     if c["entries"]:
-        lines.append(f"last {STATS_S // 86400} days: {c['entries']} entr{'ies' if c['entries'] != 1 else 'y'} done, "
+        lines.append(f"last {STATS_S // DAY_S} days: {c['entries']} entr{'ies' if c['entries'] != 1 else 'y'} done, "
                      f"{c['conflicted']} conflicted ({c['conflict_pct']}%), {c['auto_resolved']} resolved in the batch, "
                      f"{c['sent_back']} sent back ({c['sent_back_pct']}%)")
     f = sm.get("conflict_fixes") or {}
@@ -3840,7 +3997,7 @@ def queue_text(p: Project, now: float | None = None, last: int = 10) -> str:
     lv = sm["live"]
     lines.append("batches, newest first:" if sm["last"] or lv else "batches: none yet")
     if lv and lv["id"] not in [b["id"] for b in sm["last"]]:   # still in its push phase
-        lines.append(f"  {lv['id']} running: {PHASE_WORDS.get(lv['phase'], lv['phase'])} since {_age(lv['age_s'])}, "
+        lines.append(f"  {lv['id']} running: {PHASE_WORDS.get(lv['phase'], lv['phase'])} since {_age_text(lv['age_s'])}, "
                      f"{lv['rows']} change{'s' if lv['rows'] != 1 else ''}")
     for b in sm["last"]:
         what = OUTCOME_WORDS.get(b["outcome"], b["outcome"] or "?")
@@ -3851,6 +4008,6 @@ def queue_text(p: Project, now: float | None = None, last: int = 10) -> str:
         checks = (f", checks {b['check_runs']} run{'s' if b['check_runs'] != 1 else ''}"
                   + (f" in {b['check_s']:.0f} s" if b["check_s"] is not None else "")) if b["check_runs"] is not None else ""
         deploy = AFTER_WORDS.get(b["after_push"], b["after_push"]) if b["after_push"] else (
-            f"deploying since {_age(lv['age_s'])}" if lv and lv["id"] == b["id"] else "deploy pending")
-        lines.append(f"  {b['id']} {_age(now - (b['ended'] or b['started']))} ago: {what}{checks}, {deploy}")
+            f"deploying since {_age_text(lv['age_s'])}" if lv and lv["id"] == b["id"] else "deploy pending")
+        lines.append(f"  {b['id']} {_age_text(now - (b['ended'] or b['started']))} ago: {what}{checks}, {deploy}")
     return "\n".join(lines)
