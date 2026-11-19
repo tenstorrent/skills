@@ -4161,6 +4161,7 @@ def test_chatbridge_waits_out_a_model_at_capacity_honoring_retry_after(mock_chat
     with Bridge(up.url, _CB_KEY, "example/model") as b:
         slept = []
         b._sleep = slept.append
+        b._jitter = lambda w: w
         code, text = _post(b, _HI)
         st = b.stats()
     assert code == 200 and json.loads(text)["content"] == [{"type": "text", "text": "ok"}], text
@@ -4176,6 +4177,7 @@ def test_chatbridge_gives_up_on_a_model_at_capacity_past_its_caps_as_a_capacity_
     with Bridge(up.url, _CB_KEY, "example/model", busy_retries=3, busy_wait_s=600) as b:
         slept = []
         b._sleep = slept.append
+        b._jitter = lambda w: w
         code, text = _post(b, _HI)
         st = b.stats()
     # Three retries, then the 429 goes to the agent: still a rate limit to the runner, named as a capacity stop.
@@ -4188,6 +4190,7 @@ def test_chatbridge_gives_up_on_a_model_at_capacity_past_its_caps_as_a_capacity_
                    (429, {"error": {"message": "Request too large: too many tokens per minute"}}), _OK)
     with Bridge(up.url, _CB_KEY, "example/model", busy_wait_s=30) as b:
         b._sleep = slept.append
+        b._jitter = lambda w: w
         assert _post(b, _HI)[0] == 429 and b.stats()["busy"]["gave_up"] == 1
         assert _post(b, _HI)[0] == 200, "the next call goes out"
         assert _post(b, _HI)[0] == 429 and b.stats()["busy"]["gave_up"] == 1, "a request too large is not waited on"

@@ -40,7 +40,7 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-from . import endpoint
+from . import endpoint, inflight
 from .budget import TIER_ORDER
 
 KEY = "babysit"
@@ -167,13 +167,20 @@ def _post(s: dict, messages: list, timeout: float) -> dict:
     req = urllib.request.Request(url, data=body, method="POST", headers={
         "Authorization": f"Bearer {key}", "Content-Type": "application/json"})
     opener = urllib.request.build_opener(endpoint._NoRedirect)
+    slot = inflight.acquire(timeout)   # the host's chat in-flight cap (chat.max_inflight)
+    if slot is None:
+        raise Unavailable("no free chat in-flight slot (chat.max_inflight)")
     try:
         with opener.open(req, timeout=timeout) as r:
             return json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
+        if e.code in inflight.REFUSALS:
+            inflight.refused()
         raise Unavailable(f"HTTP {e.code}") from None
     except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
         raise Unavailable(type(e).__name__) from None
+    finally:
+        slot.release()
 
 
 def _cut_off(data: Any) -> bool:

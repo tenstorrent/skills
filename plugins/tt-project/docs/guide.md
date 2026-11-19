@@ -1939,6 +1939,23 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    `TTP_CHAT_PRESERVE_THINKING=1` (or `0` to force it off) in the environment of the process that
    starts the run, such as a bench or A/B command; config keys still set the details. The run's exit
    record counts the turns returned and sent back under `bridge.thinking`.
+7. A shared endpoint: `ttp config --account chat.max_inflight 8` caps the chat calls every project
+   on this host has in flight at once (workers' bridges, benches, probes and babysat decisions),
+   counted together through slot files under the account's `locks/chat-inflight` folder; a process
+   that dies frees its slot. Unset (the default) there is no cap. Only the user raises or removes
+   it; anyone may lower it. A capacity or rate-limit answer (429, 503, 529) halves the host's level
+   at once (floor 1), and it comes back by one per quiet minute, never above the cap; busy retries
+   wait with exponential backoff and jitter. A call that finds no slot waits; one that waits past
+   the busy limit goes back to Claude Code as overloaded. The run's exit record counts its waits
+   under `bridge.inflight`, and its bad output under `bridge.bad_output`: tool calls Claude Code
+   rejected for bad input (`tool_input_errors`), tool arguments that did not parse and went on as
+   `{}` (`args_unparsed`), answers with only reasoning (`empty_content`) and answers holding a junk
+   pattern (`junk_responses`, `junk_hits`; `providers.chat.junk_patterns` replaces the built-in
+   list of name to regex, `{}` turns the scan off). `ttp bench toolprobe --n 30` sends 30
+   strict-schema tool-call probes, one at a time under the cap, naming the tool in the prompt with
+   `tool_choice` `auto` (some endpoints refuse a forced choice), validates each call with
+   jsonschema from a virtual environment (the checks env), never the user's site-packages, and
+   prints the valid, invalid, wrong-tool, refused and junk counts as JSON.
 
 The key stays in the per-user secrets store and the bridge's upstream requests: the agent gets
 only the bridge's address and a per-run token. Reasoning text from the endpoint is dropped

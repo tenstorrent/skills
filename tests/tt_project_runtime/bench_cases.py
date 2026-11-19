@@ -1541,6 +1541,7 @@ def test_model_bench_post_retries_a_busy_answer_then_scores_and_a_model_still_bu
     import urllib.error
     from ttp import modelbench
     monkeypatch.setattr(modelbench, "home", lambda: tmp_path / "bench-home")
+    monkeypatch.setattr(modelbench, "JITTER", 0.0)   # exact waits (jitter spreads them by up to JITTER)
     slept = []
     # Retry-After header: waited, then the answer is scored
     op = _Busy([429, "391"], hint={"Retry-After": "11"})

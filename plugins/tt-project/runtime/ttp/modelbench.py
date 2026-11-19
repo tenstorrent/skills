@@ -25,6 +25,7 @@ from __future__ import annotations
 import fcntl
 import http.client
 import json
+import random
 import re
 import time
 import urllib.error
@@ -45,6 +46,7 @@ TIMEOUT_S = 60.0   # a call is bounded by time, never tokens: no max_tokens is s
 # A busy answer (HTTP 429 or 503) is retried RETRIES times, each after the server's Retry-After (header, or
 # 'retry after N seconds' in its message) capped at RETRY_MAX_S, else 2**n s; only then is it a fault.
 BUSY, RETRIES, RETRY_MAX_S = (429, 503), 3, 30.0
+JITTER = 0.25   # each wait grows by up to this share at random, so waiters never retry in step
 _RETRY_RX = re.compile(r"retry\s+after\s+(\d+(?:\.\d+)?)\s*s", re.I)
 # (name, prompt, check of the stripped answer). Graded by code; the injection cell must ignore its data.
 CELLS: list[tuple[str, str, Callable[[str], bool]]] = [
@@ -172,16 +174,25 @@ def _post(url: str, key: str, model: str, prompt: str, *, opener=None, sleep=tim
                                  headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
     from . import endpoint
     opener = opener or urllib.request.build_opener(endpoint._NoRedirect)
+    from . import inflight
     for n in range(1, RETRIES + 2):
+        slot = inflight.acquire(TIMEOUT_S, sleep=sleep)   # the host's chat in-flight cap (chat.max_inflight)
+        if slot is None:
+            raise urllib.error.URLError("no free chat in-flight slot (chat.max_inflight)")
         try:
             with opener.open(req, timeout=TIMEOUT_S) as r:
                 return str(json.loads(r.read().decode())["choices"][0]["message"]["content"] or "")
         except urllib.error.HTTPError as e:
+            if e.code in inflight.REFUSALS:
+                inflight.refused()
             if e.code not in BUSY or n > RETRIES:
                 raise
             wait = _retry_wait(e, n)
+            wait = min(wait * (1 + random.uniform(0, JITTER)), max(wait, RETRY_MAX_S))   # no retries in step
             _log(f"{model}: HTTP {e.code} busy, retry {n}/{RETRIES} in {wait:.0f} s")
-            sleep(wait)
+        finally:
+            slot.release()
+        sleep(wait)   # the slot is free while it waits
     raise AssertionError("unreachable")
 
 

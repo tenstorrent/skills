@@ -743,6 +743,7 @@ META_KEYS = {"name", "id", "host", "root", "created", "tt_project_version", "pri
              "home_timezone", "home_timezone_from"}
 EXTRA_KEYS = {
     "waste": {"moved_at"},
+    "chat": {"max_inflight"},   # account-level only (HOST_WIDE_KEYS): the host's chat calls in flight (inflight.py)
     # model_bench.terminalbench: the Terminal-Bench settings (harborslice.settings, tbcycle.settings), set as one object.
     "model_bench": {"terminalbench"},
     # route: run-class routing (runclass.py). code_sonnet: {"share", "kinds", "guard", "guard_pts", "alarm_p"} or false, the code
@@ -912,6 +913,8 @@ PROVIDER_KEYS = {"billing", "tiers", "plugin_dirs", "worker_isolation", "write_f
                  "busy_retries", "busy_wait_s",
                  # preserve_thinking: the model's reasoning kept across turns (chatbridge.thinking_of), off by default.
                  "preserve_thinking",
+                 # junk_patterns: name -> regex for the bad-output count (chatbridge.JUNK_PATTERNS replaced).
+                 "junk_patterns",
                  # providers.chat only: the rules-first model pick (modelpick.py); its keys (enabled, min_p,
                  # options) are checked by modelpick.config_problems.
                  "dispatch"}
@@ -3322,7 +3325,8 @@ ACCOUNT_KEYS = {"budget": {"global_daily_usd", "daily_target_usd", "day_start", 
                 # thresholds (the health watch's limits), scratch_cap_usd (a ring-0 scratch project's daily spend cap),
                 # waves {flag: [[names]]}, wave_at {flag: k} and project_rollback {flag: {name: {ts, why}}} (auto's wave gate)
                 "rollout": {"flags", "rings", "excluded", "thresholds", "scratch_cap_usd", "waves", "wave_at",
-                            "project_rollback"}}
+                            "project_rollback"},
+                "chat": {"max_inflight"}}   # the host's chat-provider calls in flight at once (inflight.py)
 # Account keys a run may only clear (ttp config --account refuses setting them inside a run): remove them
 # ('') or set them to their off value (ACCOUNT_OFF_VALUE), which only reduces their reach.
 # The ranking's source and key file too: the key goes to that source, so only the user names either.
@@ -3342,7 +3346,7 @@ ACCOUNT_OFF_VALUE = {"checks.spill_hosts": [], "checks.slurm_overflow": {}, "rol
 # host's shared /models poll interval while any project routes to chat, and else (served.every_s).
 ACCOUNT_NESTED_KEYS = {"providers.chat.model_ranking", "providers.chat.rank_exclude", "providers.chat.class_ranking", "providers.chat.class_prefs", "providers.chat.ranking_source", "providers.chat.ranking_every_s",
                        "providers.chat.ranking_key_file", "providers.chat.served_every_s", "providers.chat.served_idle_s"}
-HOST_WIDE_KEYS = {"checks.host_max", "route.host_max", "checks.spill_hosts", "checks.no_spill_hosts", "checks.slurm_overflow", "checks.dirty_max_mb", "checks.io_full_max",
+HOST_WIDE_KEYS = {"checks.host_max", "route.host_max", "chat.max_inflight", "checks.spill_hosts", "checks.no_spill_hosts", "checks.slurm_overflow", "checks.dirty_max_mb", "checks.io_full_max",
                   "checks.push_priority_wait_s"}
 
 

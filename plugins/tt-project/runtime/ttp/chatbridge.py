@@ -61,8 +61,10 @@ import email.utils
 import hashlib
 import hmac
 import http.server
+import io
 import json
 import os
+import random
 import re
 import secrets
 import socket
@@ -73,7 +75,7 @@ import urllib.error
 import urllib.request
 import uuid
 
-from . import endpoint, redact, serverhealth
+from . import endpoint, inflight, redact, serverhealth
 from .providers.base import challenged
 
 UPSTREAM_TIMEOUT_S = 600
@@ -100,13 +102,28 @@ SWAP_ERRORS = 3   # 5xx or no-answer calls in a row that swap a model the served
 # again, honoring Retry-After (its header, else a "retry after N seconds" in the body, else 2, 4, 8 ... s),
 # at most BUSY_RETRIES times and BUSY_WAIT_S seconds in all per call (providers.chat.busy_retries and
 # busy_wait_s), each wait at most BUSY_WAIT_MAX_S. Past that the 429 goes to the agent as a capacity stop.
-BUSY_RETRIES, BUSY_WAIT_S, BUSY_WAIT_MAX_S = 4, 180.0, 60.0
+# Each wait is at least BUSY_WAIT_MIN_S (never an immediate retry) and gets up to BUSY_JITTER more (jitter),
+# so the runs a refusal hit together do not all come back at once.
+BUSY_RETRIES, BUSY_WAIT_S, BUSY_WAIT_MAX_S, BUSY_WAIT_MIN_S, BUSY_JITTER = 4, 180.0, 60.0, 1.0, 0.25
 RETRY_AFTER_RE = re.compile(r"retry\s+(?:after|in)\s+(\d+(?:\.\d+)?)\s*s", re.I)
 NEVER_FITS_RE = re.compile(r"request too large|insufficient.{0,20}(?:credit|quota|balance)", re.I)   # waiting cannot help
 REASONING_FIELDS = ("reasoning", "reasoning_content")   # where Chat Completions servers put a turn's reasoning
 # (vLLM 0.20 and later reads only `reasoning` on input, vllm issue 38488: the default field sent back)
 THINKING_ENV = "TTP_CHAT_PRESERVE_THINKING"   # 1 or 0: preserved thinking on or off for one run (settings)
 THINKING_SKIP = ("flash",)   # model id words whose runs never get reasoning back (preserve_thinking.skip_models)
+# Bad output, counted per run (stats()["bad_output"]): tool calls Claude Code rejected for bad input (an
+# is_error tool_result in a later request, worded as a <tool_use_error> input fault, each tool_use id once);
+# tool calls whose arguments do not parse as an object (sent on as {}, which Claude Code then rejects);
+# answers with no text and no tool call, only reasoning (empty_content); and answers whose reasoning, text
+# or tool arguments match a junk pattern (providers.chat.junk_patterns, an object of name -> regex that
+# replaces these; {} turns the junk scan off).
+JUNK_PATTERNS = {"U+FFFD": "\ufffd", "AMEAME": "AMEAME", "paren_run": r"(?:\(\s){5,}",
+                 "ById": r"(?<![A-Za-z0-9_.$])ById(?![A-Za-z0-9_])"}
+TOOL_INPUT_RE = re.compile(
+    r"InputValidationError|No such tool available|required parameter|unexpected parameter"
+    r"|invalid (?:tool )?(?:parameters?|input|arguments?)|missing required (?:parameter|argument|field)"
+    r"|could not be parsed|not valid JSON|invalid JSON|JSON\.?parse|unparseable|Unexpected token"
+    r"|Unterminated string|Expected property name", re.I)
 
 
 class _ClientGone(Exception):
@@ -142,7 +159,62 @@ def settings(cfg: dict, tier: str, model: str, effort: str = "", standins=(), se
             "model": model, "max_tokens": int(cap or 0), **({"context_window": int(window)} if window else {}),
             **({"effort": effort, "fields": fields} if fields else {}),
             **({"effort": effort, "standins": alts, "served": [str(d) for d in served]} if alts and served else {}),
-            **({"thinking": think} if think else {}), **busy}
+            **({"thinking": think} if think else {}), **busy,
+            **({"junk_patterns": dict(entry["junk_patterns"])}
+               if isinstance(entry.get("junk_patterns"), dict) and not _junk_problems(entry["junk_patterns"]) else {})}
+
+
+def _junk_problems(raw) -> list[str]:
+    if raw is None:
+        return []
+    if not isinstance(raw, dict):
+        return ["providers.chat.junk_patterns: not an object of name -> regex"]
+    out = []
+    for k, v in raw.items():
+        try:
+            re.compile(v) if isinstance(v, str) and v else None
+        except re.error as e:
+            out.append(f"providers.chat.junk_patterns.{k}: not a valid regex ({e})")
+            continue
+        if not isinstance(v, str) or not v:
+            out.append(f"providers.chat.junk_patterns.{k}: not a non-empty regex string")
+    return out
+
+
+def output_parts(chunk: dict) -> list[tuple[str, str]]:
+    """The model text in a Chat Completions answer or stream chunk, as (kind, text): content,
+    reasoning and each tool call's arguments (kind args:<index>), for the junk scan."""
+    out = []
+    for c in (chunk.get("choices") or []) if isinstance(chunk, dict) else ():
+        m = (c.get("message") or c.get("delta") or {}) if isinstance(c, dict) else {}
+        if not isinstance(m, dict):
+            continue
+        for f in ("content",) + REASONING_FIELDS:
+            if isinstance(m.get(f), str) and m[f]:
+                out.append(("reasoning" if f != "content" else f, m[f]))
+        for i, t in enumerate(m.get("tool_calls") or ()):
+            a = ((t.get("function") or {}).get("arguments")) if isinstance(t, dict) else None
+            if isinstance(a, str) and a:
+                out.append((f"args:{t.get('index', i)}", a))
+    return out
+
+
+def tool_input_errors(body: dict) -> list[str]:
+    """The ids (else texts) of tool results in a Messages request that report a tool call Claude Code
+    rejected for bad input (TOOL_INPUT_RE inside a <tool_use_error>)."""
+    out = []
+    for m in (body.get("messages") or ()) if isinstance(body, dict) else ():
+        if not isinstance(m, dict) or m.get("role") != "user" or not isinstance(m.get("content"), list):
+            continue
+        for b in m["content"]:
+            if not (isinstance(b, dict) and b.get("type") == "tool_result" and b.get("is_error")):
+                continue
+            c = b.get("content")
+            text = c if isinstance(c, str) else " ".join(
+                x.get("text") or "" for x in (c or ()) if isinstance(x, dict))
+            if "<tool_use_error>" in text and TOOL_INPUT_RE.search(text):
+                out.append(str(b.get("tool_use_id") or text[:200]))
+    return out
 
 
 def _count_ok(v) -> bool:
@@ -169,7 +241,12 @@ def busy_wait(status: int, headers, detail: str, n: int) -> float | None:
         got = float(m.group(1))
     if got is None and status == 503:
         return None   # a plain 503 is an outage: the mid-run swap handles those
-    return min(max(got if got is not None else 2.0 ** n, 0.0), BUSY_WAIT_MAX_S)
+    return min(max(got if got is not None else 2.0 ** n, BUSY_WAIT_MIN_S), BUSY_WAIT_MAX_S)
+
+
+def jitter(wait: float) -> float:
+    """`wait` plus up to BUSY_JITTER of itself at random, never past BUSY_WAIT_MAX_S."""
+    return min(wait * (1.0 + random.uniform(0.0, BUSY_JITTER)), max(wait, BUSY_WAIT_MAX_S))
 
 
 def window_of(entry: dict, model: str, row: dict | None = None) -> int:
@@ -334,6 +411,7 @@ def config_problems(raw: dict) -> list[str]:
         return ["providers.chat: not an object; chat runs cannot start"]
     out = _effort_problems(entry["effort_fields"]) if entry.get("effort_fields") is not None else []
     out += _thinking_problems(entry.get("preserve_thinking"))
+    out += _junk_problems(entry.get("junk_patterns"))
     try:
         endpoint.slot(str(entry.get("endpoint") or ""))
     except ValueError:
@@ -456,6 +534,18 @@ def to_chat(body: dict, model: str, cap: int = 0, think: dict | None = None) -> 
         req["stream"] = True
         req["stream_options"] = {"include_usage": True}
     return req
+
+
+def args_unparsed(text: str) -> bool:
+    """Whether a tool call's arguments text is not empty yet holds no JSON object (tool_input gives {})."""
+    text = str(text or "").strip()
+    if not text:
+        return False
+    try:
+        got, _ = json.JSONDecoder().raw_decode(text)
+    except ValueError:
+        return True
+    return not isinstance(got, dict)
 
 
 def tool_input(arguments) -> dict:
@@ -710,6 +800,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         except (_ClientGone, *CLIENT_GONE):   # one line, no traceback: the caller left (e.g. its own timeout)
             self.close_connection = True
             print("chatbridge: the client hung up before its answer was written", file=sys.stderr, flush=True)
+        finally:   # a host in-flight slot a path left held (inflight.py): freed with its request
+            slot, self.ttp_slot = getattr(self, "ttp_slot", None), None
+            if slot is not None:
+                slot.release()
 
     def _write(self, data: bytes) -> None:
         try:
@@ -770,7 +864,8 @@ class Bridge:
     def __init__(self, base_url: str, key: str, model: str, max_tokens: int = 0,
                  timeout: float = UPSTREAM_TIMEOUT_S, context_window: int = 0, effort: str = "",
                  fields: dict | None = None, standins: list | None = None, served: list | None = None,
-                 busy_retries: int | None = None, busy_wait_s: float | None = None, thinking: dict | None = None):
+                 busy_retries: int | None = None, busy_wait_s: float | None = None, thinking: dict | None = None,
+                 junk_patterns: dict | None = None):
         self.base_url, self._key, self.model = endpoint.base_url(base_url), key, model
         self.thinking = dict(thinking or {})   # preserved thinking (thinking_of), {} when off
         self.thought = {"returned": 0, "sent": 0}   # reasoning turns given to the client / sent back upstream
@@ -795,6 +890,13 @@ class Bridge:
         # bench row sets it so a withdrawn model's agents stop calling the endpoint: tbcycle.MISSING_MAX).
         self.missing_max, self.missing_local = 0, 0
         self.calls = serverhealth.Calls()   # per call: server wait, output tokens, tokens/s (stats()["server"])
+        self.inflight = inflight.Waits()   # the host in-flight cap's slot waits (stats()["inflight"])
+        self._jitter = jitter
+        jp = JUNK_PATTERNS if junk_patterns is None or _junk_problems(junk_patterns) else junk_patterns
+        self.junk = {k: re.compile(v) for k, v in jp.items()}
+        self.bad = {"tool_input_errors": 0, "args_unparsed": 0, "empty_content": 0, "junk_responses": 0,
+                    "junk_hits": {}}   # stats()["bad_output"]
+        self._bad_seen: set[str] = set()   # tool_use ids counted (Claude Code resends the whole history)
         self._sleep = time.sleep
         self.server: http.server.ThreadingHTTPServer | None = None
         self.thread: threading.Thread | None = None
@@ -824,6 +926,7 @@ class Bridge:
                    **{"context_window": s.get("context_window") or 0, "effort": s.get("effort") or "",
                       "fields": s.get("fields") or {}, "standins": s.get("standins") or [],
                       "served": s.get("served") or [], "thinking": s.get("thinking") or {},
+                      "junk_patterns": s.get("junk_patterns"),
                       **{k: s[k] for k in ("busy_retries", "busy_wait_s") if _count_ok(s.get(k))}, **kw})
 
     @property
@@ -967,26 +1070,50 @@ class Bridge:
                 **({"usage": dict(self.usage)} if self.usage["calls"] else {}),
                 **({"missing_local": self.missing_local} if self.missing_local else {}),
                 **({"thinking": {"field": self.thinking.get("field"), **self.thought}} if self.thinking else {}),
-                **({"server": self.calls.export()} if self.calls.rows else {})}
+                **({"server": self.calls.export()} if self.calls.rows else {}),
+                **({"inflight": self.inflight.export()} if self.inflight else {}),
+                **({"bad_output": {**self.bad, "junk_hits": dict(self.bad["junk_hits"])}}
+                   if any(v for k, v in self.bad.items() if k != "junk_hits") else {})}
 
     def server_wait_s(self) -> float:
         """The time spent waiting on the server so far (in-flight calls included): the cell limit does not count it."""
         return self.calls.wait_s()
 
     def _timed_open(self, h, req: dict):
-        """_open, timed as one call of `h` (its first byte is marked when the stream's first line is read)."""
+        """_open, timed as one call of `h` (its first byte is marked when the stream's first line is read),
+        holding one of the host's in-flight slots (inflight.py) until the call ends (_end_call)."""
         self._end_call(h, 0, "other")   # an earlier attempt of the same request that failed
+        slot = inflight.acquire(self.timeout)
+        with self._swap_lock:
+            if slot is None:
+                self.inflight.timeouts += 1
+            elif slot.index >= 0:
+                self.inflight.add(slot.waited_s)
+        if slot is None:   # the host's cap stayed full: an overload answer, never sent upstream
+            msg = f"overloaded: the host's chat in-flight cap ({inflight.KEY}) had no free slot in {self.timeout:.0f} s"
+            raise urllib.error.HTTPError("inflight", 529, "overloaded", None,   # type: ignore[arg-type]
+                                         io.BytesIO(json.dumps({"error": {"message": msg}}).encode()))
+        if slot.waited_s:
+            self.calls.sleep_wait(slot.waited_s)
         call = self.calls.begin()
         try:
             resp = self._open(req)
         except BaseException as e:   # a 429 or 503 (the codes busy_wait waits out) is the server at capacity
-            call.end(0, "capacity" if getattr(e, "code", 0) in (429, 503) else "other")
+            slot.release()
+            code = getattr(e, "code", 0)
+            if code in inflight.REFUSALS and inflight.refused():   # the host backs off at once
+                with self._swap_lock:
+                    self.inflight.refusals += 1
+            call.end(0, "capacity" if code in (429, 503) else "other")
             raise
-        h.ttp_call = call
+        h.ttp_call, h.ttp_slot = call, slot
         return resp
 
     def _end_call(self, h, out: int, status: str = "ok") -> None:
         call, h.ttp_call = getattr(h, "ttp_call", None), None
+        slot, h.ttp_slot = getattr(h, "ttp_slot", None), None
+        if slot is not None:
+            slot.release()
         if call is not None:
             call.end(out, status)
 
@@ -1002,6 +1129,7 @@ class Bridge:
         wait = busy_wait(e.code, e.headers, detail, tries + 1)
         if wait is None or self.busy_retries <= 0 or self.busy_wait_s <= 0:   # 0: no waits (the answer as it came)
             return None
+        wait = self._jitter(wait)
         with self._swap_lock:
             if tries >= self.busy_retries or waited + wait > self.busy_wait_s:
                 self.busy["gave_up"] += 1
@@ -1101,13 +1229,14 @@ class Bridge:
                 self._ok()
                 self._count(data.get("usage"))
                 self._end_call(h, usage_of(data.get("usage"))["output_tokens"])
+                self._scan(output_parts(data))
                 return h._reply(200, data)
             h.send_response(200)
             h.send_header("Content-Type", "text/event-stream")
             h.send_header("Cache-Control", "no-cache")
             h.send_header("Transfer-Encoding", "chunked")
             h.end_headers()
-            usage, seen, status = None, 0, "ok"
+            usage, seen, status, parts = None, 0, "ok", []
             try:
                 for raw in resp:
                     if getattr(h, "ttp_call", None) is not None:
@@ -1116,7 +1245,9 @@ class Bridge:
                     if line.startswith("data:") and line[5:].strip() not in ("", "[DONE]"):
                         seen += len(line)
                         try:
-                            usage = (json.loads(line[5:]) or {}).get("usage") or usage
+                            obj = json.loads(line[5:]) or {}
+                            usage = obj.get("usage") or usage
+                            parts += output_parts(obj)
                         except (ValueError, AttributeError):
                             pass
                     if line.startswith("data:"):   # no `event:` or comment lines: an OpenAI client reads them as broken data
@@ -1129,6 +1260,7 @@ class Bridge:
                 status = "stream"
             finally:
                 self._count(usage)
+                self._scan(parts)
                 self._end_call(h, usage_of(usage)["output_tokens"] or seen // 120, status)
 
     def _count(self, u) -> None:
@@ -1148,12 +1280,41 @@ class Bridge:
             with self._swap_lock:
                 self.thought["sent"] += n
 
+    def _rejected(self, body: dict) -> None:
+        """Count the tool calls Claude Code rejected for bad input since the last request (stats())."""
+        new = [i for i in tool_input_errors(body) if i not in self._bad_seen]
+        if new:
+            with self._swap_lock:
+                self._bad_seen.update(new)
+                self.bad["tool_input_errors"] += len(set(new))
+
+    def _scan(self, parts) -> None:
+        """Count one answer's bad output (its (kind, text) parts, joined per kind; stats()): junk by pattern,
+        tool arguments that do not parse, and an answer that is reasoning only."""
+        if not parts:
+            return
+        by: dict[str, list[str]] = {}
+        for kind, text in parts:
+            by.setdefault(kind, []).append(text)
+        texts = {k: "".join(v) for k, v in by.items()}
+        unparsed = sum(1 for k, t in texts.items() if k.startswith("args:") and args_unparsed(t))
+        empty = not any(k == "content" or k.startswith("args:") for k in texts)
+        hits = [k for k, rx in self.junk.items() if any(rx.search(t) for t in texts.values())]
+        if hits or unparsed or empty:
+            with self._swap_lock:
+                self.bad["args_unparsed"] += unparsed
+                self.bad["empty_content"] += int(empty)
+                self.bad["junk_responses"] += int(bool(hits))
+                for k in hits:
+                    self.bad["junk_hits"][k] = self.bad["junk_hits"].get(k, 0) + 1
+
     def _returned(self, n: int) -> None:
         if n:
             with self._swap_lock:
                 self.thought["returned"] += n
 
     def forward(self, h: _Handler, body: dict) -> None:
+        self._rejected(body)
         got = self._send(h, lambda used: to_chat(body, used, self.max_tokens, self.thinking))
         if got is None:
             return
@@ -1173,6 +1334,7 @@ class Bridge:
                 self._ok()
                 self._count(data.get("usage"))   # a translated call is counted too (cached apart: usage_of)
                 self._end_call(h, usage_of(data.get("usage"))["output_tokens"])
+                self._scan(output_parts(data))
                 out = from_chat(data, body.get("model") or self.model, think)
                 self._returned(sum(1 for b in out["content"] if b.get("type") == "thinking"))
                 return h._reply(200, out)
@@ -1193,7 +1355,7 @@ class Bridge:
             if data:
                 h._write(b"%x\r\n%s\r\n" % (len(data), data))
 
-        errored, seen = "", 0   # the failed call's kind (serverhealth.FAILED_KINDS) once the stream fails
+        errored, seen, parts = "", 0, []   # the failed call's kind (serverhealth.FAILED_KINDS) once the stream fails
         try:
             for raw in resp:
                 if getattr(h, "ttp_call", None) is not None:
@@ -1222,12 +1384,14 @@ class Bridge:
                     send(_sse("error", err))
                     errored = "stream"
                     break
+                parts += output_parts(chunk)
                 send(st.feed(chunk))
             if not errored:
                 self._ok()
                 send(st.end())
         except _ClientGone:   # the client hung up: no upstream fault; handle_one_request logs it
             self._count(st.usage or None)
+            self._scan(parts)
             self._end_call(h, usage_of(st.usage)["output_tokens"] or seen // 120)
             raise
         except (OSError, socket.timeout) as e:
@@ -1241,6 +1405,7 @@ class Bridge:
             h.close_connection = True
             return
         self._count(st.usage or None)
+        self._scan(parts)
         self._end_call(h, usage_of(st.usage)["output_tokens"] or seen // 120, errored or "ok")
         h._write(b"0\r\n\r\n")
 

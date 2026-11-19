@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""The account's host checks caps (KEYS: checks.host_max, checks.load_extra), changed through the daemon.
+"""The account's host caps (KEYS: checks.host_max, checks.load_extra, chat.max_inflight), changed through the daemon.
 
 When a host overloads, the harness, a coordinator or a worker may need to lower the caps every project
 of the account shares on it. The account settings file lives in the account home, which a worker's
@@ -17,6 +17,8 @@ Each change appends one synced line to LOG in the account home: when, the key, t
 who made it (configwho's role with its project, task and run) and the command that undoes it. A value
 the user set (the log's last line for the key is the user's, or the log does not explain the value: it
 was set at a terminal before this log or by hand) is refused for anyone else: only the user changes it.
+A RAISE_USER_ONLY key's cap is only lowered by anyone else: raising it, or removing or zeroing a set
+cap, is the user's (setting one where none was set lowers it from no cap).
 """
 from __future__ import annotations
 
@@ -26,7 +28,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-KEYS = ("checks.host_max", "checks.load_extra")
+KEYS = ("checks.host_max", "checks.load_extra", "chat.max_inflight")
+RAISE_USER_ONLY = ("chat.max_inflight",)   # caps only the user raises (a shared endpoint's load)
 MAX = 4096   # a whole number of check runs at most this
 LOG = "account-settings.jsonl"   # in project.HOME_DIR: one line per change made through here
 REQUESTS = "account-requests"   # under a project's state: changes a worker queued (apply_requests)
@@ -86,6 +89,11 @@ def user_set(key: str, value: Any = None) -> bool:
     return rec is None or rec.get("by") == "user" or rec.get("new") != value
 
 
+def raises(key: str, old: Any, new: Any) -> bool:
+    """Whether setting RAISE_USER_ONLY `key` from `old` to `new` raises its cap (None or 0: no cap)."""
+    return key in RAISE_USER_ONLY and bool(old) and (not new or new > old)
+
+
 def undo_cmd(key: str, old: Any) -> str:
     return f"ttp config --account {key} " + (json.dumps(str(old)) if old is not None else '""')
 
@@ -96,13 +104,15 @@ def apply(key: str, value: Any, by: dict) -> str:
     the user."""
     from .project import durable_append, set_account_setting
     if key not in KEYS:
-        raise ValueError(f"{key} is not an account checks cap set through the daemon; those are: {', '.join(KEYS)}")
+        raise ValueError(f"{key} is not an account cap set through the daemon; those are: {', '.join(KEYS)}")
     value = conv(key)(value)
     old = current(key)
     who = str((by or {}).get("by") or "unknown")
     if who != "user" and user_set(key, old):
         raise ValueError(f"{key} is {json.dumps(old)}, set by the user: only the user changes it "
                          f"(ask them, with the value and why)")
+    if who != "user" and raises(key, old, value):
+        raise ValueError(f"{key} is {json.dumps(old)}: raising or removing it is the user's word only")
     if old == value:
         return f"{key} is {json.dumps(value)} already (account-level); nothing changed"
     set_account_setting(key, value)
@@ -122,10 +132,12 @@ def queue(state: Path, key: str, value: Any, by: dict) -> tuple[str, bool]:
     user's value, raises ValueError here). Returns (its id, False when it was queued already)."""
     from .project import write_json
     if key not in KEYS:
-        raise ValueError(f"{key} is not an account checks cap set through the daemon; those are: {', '.join(KEYS)}")
+        raise ValueError(f"{key} is not an account cap set through the daemon; those are: {', '.join(KEYS)}")
     value = conv(key)(value)
     if by.get("by") != "user" and user_set(key):
         raise ValueError(f"{key} is {json.dumps(current(key))}, set by the user: only the user changes it")
+    if by.get("by") != "user" and raises(key, current(key), value):
+        raise ValueError(f"{key} is {json.dumps(current(key))}: raising or removing it is the user's word only")
     rid = request_id(key, value, by)
     path = Path(state) / REQUESTS / f"{rid}.json"
     if path.exists():

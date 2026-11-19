@@ -9785,6 +9785,15 @@ def cmd_bench(a) -> None:
         return
     if a.action == "reach":   # needs no project: a probe of the cell's own network
         raise SystemExit(_bench_reach([w[1:] for w in a.blind_word or []]))
+    if a.action == "toolprobe":   # a project's providers.chat when run in one, else --endpoint and --model
+        from . import toolprobe
+        p = here()
+        try:
+            got = toolprobe.main(p.config() if p else {}, max(1, a.n), a.endpoint, a.model, a.tier)
+        except ValueError as e:
+            die(f"bench toolprobe: {e}")
+        print(json.dumps(got, indent=2))
+        return
     from . import bench
     if a.action == "fair":   # read-only: each task's verdict in an existing prep folder
         if not a.bench:
@@ -17024,7 +17033,8 @@ def main(argv: list[str] | None = None) -> None:
                                       "that add tests, keeps the tests that fail on the base and pass on the head, "
                                       "builds a clean one-commit workspace at each base and holds out the landed "
                                       "test files, with a hash-pinned manifest")
-    s.add_argument("action", choices=["prep", "cells", "run", "blind", "fair", "daily", "replay", "facts", "reach"],
+    s.add_argument("action", choices=["prep", "cells", "run", "blind", "fair", "daily", "replay", "facts", "reach",
+                                        "toolprobe"],
                    help="daily: the day's landed code tasks of every project on this host through Sonnet, Opus and "
                         "an open model, blind-reviewed, into the running table (starts in the background); replay: "
                         "the offline replay of finished device and analysis tasks as sealed questions "
@@ -17036,8 +17046,15 @@ def main(argv: list[str] | None = None) -> None:
                         "results and the blind review's cells.json in --out; blind: the blind review "
                         "(`ttp bench blind prep <run folder>... --out <dir>`, then review, score, reveal; regrade and compare "
                         "for a second grader; `ttp bench blind --help`); reach: `ttp bench reach HOST:PORT ...` tries a TCP connect to "
-                        "each target from inside real bench cells and exits 0 only if all are unreachable")
+                        "each target from inside real bench cells and exits 0 only if all are unreachable; "
+                        "toolprobe: `ttp bench toolprobe --n 30` sends N strict-schema tool-call probes to the chat "
+                        "endpoint, one at a time under the host's in-flight cap, and prints valid, invalid and refused "
+                        "counts and junk hits as JSON")
     s.add_argument("--blind-word", action="append", help=argparse.SUPPRESS)
+    s.add_argument("--n", type=int, default=30, help="toolprobe: how many probes (default 30)")
+    s.add_argument("--endpoint", default="", help="toolprobe: the saved endpoint alias (default: providers.chat.endpoint)")
+    s.add_argument("--model", default="", help="toolprobe: the model (default: providers.chat.tiers.<--tier>.model)")
+    s.add_argument("--tier", default="standard", help="toolprobe: the tier whose model it probes (default standard)")
     s.add_argument("--since", help="keep tasks created on or after this date (YYYY-MM-DD): the "
                                                   "later of the compared models' release dates")
     s.add_argument("--out", help="facts: the replay run folder (default: the replay home's run); prep, cells, run: a new folder for the workspaces, held-out tests and manifest (required)")
