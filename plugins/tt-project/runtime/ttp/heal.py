@@ -201,7 +201,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
-from . import outagemsg, pageto, schedrun, screen, scriptwatch, sshagent, sshfail, timefmt
+from . import outagemsg, pageto, schedrun, screen, sshagent, sshfail, timefmt
 from .db import DB
 from .project import command_env, durable_write
 
@@ -597,11 +597,7 @@ def check(spec: dict, state: dict, cwd: str, env: dict | None = None) -> tuple[i
     if fn and not spec.get("check"):
         return fn(spec, state, cwd)
     end = time.monotonic() + spec["timeout_s"]
-    said: list[str] = []
-    rc, out = _capped(spec, scriptwatch.rerun(lambda: _shell(spec["check"], cwd, max(end - time.monotonic(), 1), env),
-                                              lambda r: r[0] != 0, spec["check"], cwd, env or _env(), said.append,
-                                              again=lambda: end - time.monotonic() >= 1))
-    return rc, "\n".join([out, *said]) if said else out
+    return _capped(spec, _shell(spec["check"], cwd, max(end - time.monotonic(), 1), env))
 
 
 def finding(rc: int, out: str) -> bool:

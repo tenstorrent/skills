@@ -1150,13 +1150,12 @@ def test_a_command_schedule_status_counts_error_lines_apart_and_a_run_of_only_er
 
 
 def test_a_command_watcher_that_crashes_at_a_normal_exit_code_is_a_failed_run_that_leaves_its_issues(
-        env, tmp_path, capsys, monkeypatch):
+        env, tmp_path, capsys):
     """A watcher that crashes prints nothing on stdout: exit 1 with stderr, or a Python traceback at exit 0,
     is a failed run ('error: watcher command failed rc=N: <stderr tail>', shown by `ttp schedules`), never
-    'ok (0 observations)': its open reports, receipts and mutes stay as they are. A quiet exit 1, chatter on
-    stderr at exit 0 and the runner's own rerun note are still clean runs."""
-    import subprocess
-    from ttp import cli, schedrun, schedule as sched
+    'ok (0 observations)': its open reports, receipts and mutes stay as they are. A quiet exit 1 and chatter on
+    stderr at exit 0 are still clean runs."""
+    from ttp import cli, schedule as sched
     r = _receipt_rig(env, tmp_path, name="acct")
     tick, db, src, err, out = r["tick"], r["db"], r["src"], r["err"], r["out"]
     state = lambda: {x["title"]: x["status"] for x in db().q("SELECT title, status FROM issues WHERE source=?", (src,))}
@@ -1174,11 +1173,6 @@ def test_a_command_watcher_that_crashes_at_a_normal_exit_code_is_a_failed_run_th
     # Clean runs: chatter on stderr at exit 0, then a quiet exit 1, which closes its reports as before.
     assert tick(command="echo warming up >&2; true")[0] == "ok (0 observations)"
     assert tick("")[0] == "ok (0 observations)" and state() == {"ledger: entry missing": "fixed"}
-    # A rerun after its script changed: the runner's note on stderr is not the command's own.
-    note = "ttp: script.sh changed while it ran: ran it again\n"
-    monkeypatch.setattr(schedrun, "run_group", lambda *a, **k: setattr(
-        c := subprocess.CompletedProcess("x", 1, "", note), "rerun_note", note) or c)
-    assert tick()[0] == "ok (0 observations)"
 
 
 def test_a_daily_review_starting_late_re_reads_its_coordinator_stats_at_start(env):

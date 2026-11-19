@@ -55,7 +55,7 @@ from collections import Counter, deque
 from pathlib import Path
 
 from . import (checkcap, checkdirs, checklane, checkspill, cleantree, conflictfix, cyclenotice, envfault, gatejudge, landmark, locks, push, pushpass, runner, scopehold,
-               scriptwatch, setupfault, syntaxfault, testslots, workerloss, urgent,
+               setupfault, syntaxfault, testslots, workerloss, urgent,
                sharedchecks, slowtests, suitecost, testpick, verdictcarry, worktree)
 from .project import Project, command_env, durable_write, write_json
 from . import ghroute, gatetime, gitmemo, hoststate
@@ -2800,8 +2800,7 @@ class Batch:
                            collect=collect, urgent_mark=self._urgent_mark())
         reruns = torn = setup = 0
         while True:
-            rc, tail, _ = scriptwatch.rerun(once, lambda r: r[0] != 0, None if push.remote_host(cmd) else str(cmd),
-                                            self.wt, env, say, on_pass=True)
+            rc, tail, _ = once()
             if rc == 0 or push.remote_host(cmd) and (not getattr(cmd, "spilled", False)
                                                     or rc == push.remotecheck.FAULT_RC):
                 return rc, tail   # a spilled check's infra reruns run again on its spill host; its host fault: _check

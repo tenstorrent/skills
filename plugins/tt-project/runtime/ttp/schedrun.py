@@ -23,7 +23,7 @@ import threading
 import time
 from typing import Any, Callable
 
-from . import probespawn, scriptwatch
+from . import probespawn
 from .runner import proc_start
 
 GROUPS_KEY = "schedule_groups"   # kv: pgid -> {schedule, start}: live process groups of schedule runs
@@ -193,22 +193,11 @@ def kill_all(db: Any) -> list[str]:
     return lines
 
 
-def run_group(cmd: str, *, cwd: str, timeout: float, env: dict | None,
-              ok: tuple[int, ...] = (0,)) -> subprocess.CompletedProcess:
+def run_group(cmd: str, *, cwd: str, timeout: float, env: dict | None) -> subprocess.CompletedProcess:
     """subprocess.run(cmd, shell=True) in a session of its own, kept in GROUPS_KEY while it runs. A
     timeout kills the whole group (the shell's children too) and raises TimeoutExpired; a daemon stop
-    in the meantime raises Stopped. A run that exits outside `ok` (the caller's normal answers) while a
-    script it names was rewritten runs once more in the time left (scriptwatch), its stderr starting
-    with that note; a normal answer is never rerun, so its output is never dropped."""
-    end = time.monotonic() + timeout
-    said: list[str] = []
-    out = scriptwatch.rerun(lambda: _run_group(cmd, cwd=cwd, timeout=max(end - time.monotonic(), 1), env=env),
-                            lambda r: r.returncode not in ok, cmd, cwd, env, said.append,
-                            again=lambda: end - time.monotonic() >= 1)
-    out.rerun_note = "".join(f"ttp: {line}\n" for line in said)   # not the command's own stderr
-    if said:
-        out.stderr = out.rerun_note + (out.stderr or "")
-    return out
+    in the meantime raises Stopped."""
+    return _run_group(cmd, cwd=cwd, timeout=timeout, env=env)
 
 
 def _run_group(cmd: str, *, cwd: str, timeout: float, env: dict | None) -> subprocess.CompletedProcess:

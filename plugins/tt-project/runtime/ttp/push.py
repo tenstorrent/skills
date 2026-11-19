@@ -50,7 +50,7 @@ from typing import Any, Callable
 from urllib.parse import quote, unquote
 
 from . import (checkcap, checkdirs, checkspill, checkwait, checklane, cleantree, coordtools, envfault, gatejudge, gatetime, gitcache, ghroute, gitmemo, hoststate, landed, landmark, leakfile, locks, machines, outscan, ponytail, pooladmit, prguard, prhead, remotecheck, remoteload, repoid, runner, runnerenv, scratchhome,
-               sandbox, scriptwatch, settinghold, setupfault, sharedchecks, shorttmp, slurmcheck, syntaxfault, testslots, timefmt, verified, workerloss, worktree)
+               sandbox, settinghold, setupfault, sharedchecks, shorttmp, slurmcheck, syntaxfault, testslots, timefmt, verified, workerloss, worktree)
 from . import __version__
 from .budget import DOC_SUFFIXES, task_default_usd
 from .db import continues_id, dependency_ids, load_result
@@ -5010,7 +5010,7 @@ def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None], seen: 
         return _check_once(cmd, repo, env, say, collect, kept)
     reruns = setup_reruns = 0
     while True:
-        rc = scriptwatch.rerun(once, bool, None if remote_host(cmd) else str(cmd), repo, env, say, on_pass=True)
+        rc = once()
         if rc == 0:
             if seen is not None:
                 seen.update(rc=0, text="".join(kept))
@@ -5039,7 +5039,7 @@ def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None], seen: 
     if not remote_host(cmd) and (torn := syntaxfault.transient(collect.text(), repo, env.get("TTP_PUSH_TIP"))):
         say(syntaxfault.rerun_line(torn, str(cmd)))
         time.sleep(syntaxfault.SETTLE_S)
-        rc = scriptwatch.rerun(once, bool, str(cmd), repo, env, say, on_pass=True)
+        rc = once()
         if rc == 0:
             if seen is not None:
                 seen.update(rc=0, text="".join(kept))

@@ -11952,18 +11952,21 @@ def test_a_checks_run_that_cannot_resume_is_never_preempted_past_90_percent(env,
 
 def test_a_rerun_within_one_checks_run_runs_every_test_file_again(env, tmp_path, monkeypatch, capsys):
     """#7218: the resume record a check keeps in a run never thins a rerun the same run makes after a fault
-    (a rewritten script, a torn file, a lost worker): that rerun runs every file again."""
-    from ttp import checkcap, cli, scriptwatch
+    (a torn file, a lost worker): that rerun runs every file again."""
+    from ttp import checkcap, cli, workerloss
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
     monkeypatch.delenv(checkcap.RESUME_ENV, raising=False)
     monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
     monkeypatch.delenv("VIRTUAL_ENV", raising=False)
-    monkeypatch.setattr(scriptwatch, "rerun", lambda run_once, *a, **k: (run_once(), run_once())[1])
+    losses = [{"tests": 1, "workers": {}}]   # the first failure reads as a lost worker, once
+    monkeypatch.setattr(workerloss, "lost", lambda _out: losses.pop() if losses else None)
+    monkeypatch.setattr(workerloss, "only", lambda loss: loss is not None)
     ran = tmp_path / "ran.txt"
     suite = repo / "suite"
     suite.mkdir()
     for name in ("a", "b"):
-        (suite / f"test_{name}.py").write_text(f"def test_{name}():\n    open({str(ran)!r}, 'a').write('{name}\\n')\n")
+        (suite / f"test_{name}.py").write_text(f"def test_{name}():\n    open({str(ran)!r}, 'a').write('{name}\\n')\n"
+                                               f"    assert open({str(ran)!r}).read().count('{name}') > 1\n")
     subprocess.run([*git, "add", "suite"], check=True)
     subprocess.run([*git, "commit", "-qm", "suite"], check=True)
     cli.main(["checks", "--", "python3", "-m", "pytest", "-q", "-p", "no:cacheprovider", "suite"])

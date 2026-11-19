@@ -37,7 +37,7 @@ from .db import CHANGES_NEEDED, REPLIES_ONLY, SUPERSEDED, chat_floor, task_outco
 from . import outbox, redact
 from .devq import unmask_devices
 from .detach import VERDICT_SH as _DETACH_VERDICT_SH
-from . import chatgone, checksqueue, checkwait, hoststate, runnerenv, scriptwatch, setupfault, sshcmd, syntaxfault, timefmt, workerloss
+from . import chatgone, checksqueue, checkwait, hoststate, runnerenv, setupfault, sshcmd, syntaxfault, timefmt, workerloss
 from . import schedule as sched
 from .project import here as project_here
 from .project import (NAME_RE, Project, hostname, load_registry, load_secrets, register, save_secret,
@@ -5012,7 +5012,7 @@ def _cmd_checks(a) -> None:
                 check_start = out.tell()
                 if pushpass.resumable(c) and not push.remote_host(c) and not retry:   # one plain local pytest run
                     env |= slowtests.env(Path(run_dir) / slowtests.FILE, env)
-                def said(line: str) -> None:   # a script it runs was rewritten as it ran: once more
+                def said(line: str) -> None:   # a fault it reruns after (a torn file, a lost worker): once more
                     nonlocal check_start
                     print(f"ttp checks: {line}", flush=True)
                     out.write(f"ttp checks: {line}\n")
@@ -5042,21 +5042,9 @@ def _cmd_checks(a) -> None:
                         if deadline is not None:
                             deadline = ran_since + wall + (wall_ext.granted if wall_ext else 0.0)
 
-                def rerun_fits() -> bool:   # a rerun that cannot end before the cap only holds the lane
-                    left = checkwall.deadline_left(deadline)
-                    if left is None or took[0] <= left:
-                        return True
-                    line = (f"{scriptwatch.LABEL} skipped: the run took {checkwall.span(took[0])} and only "
-                            f"{checkwall.span(left)} is left before the wall-time cap; its result stands")
-                    print(f"ttp checks: {line}", flush=True)
-                    out.write(f"ttp checks: {line}\n")
-                    out.flush()
-                    return False
-
                 try:
                     while True:
-                        rc = scriptwatch.rerun(run_once, bool, None if push.remote_host(c) else str(c), cwd, env, said,
-                                               again=rerun_fits)
+                        rc = run_once()
                         # The wrapper's lock refused it as paused: it and the other wrapped commands run on
                         # checks.fallback_lane once, never on the paused resource (a paused fallback waits).
                         if (rc == 75 and fallback[0] and not fallback[2] and not fell_back and str(c) in wrapped

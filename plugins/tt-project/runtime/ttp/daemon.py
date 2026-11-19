@@ -9891,9 +9891,9 @@ class Daemon:
             rewake = 6 * 3600
         started = time.time()
         timeout = _watcher_timeout(payload)
-        try:   # exit 1 is a normal run that found something: never rerun (its reports would be lost)
+        try:
             out = schedrun.run_group(cmd, cwd=str(self.p.root), timeout=timeout,
-                                     env={**command_env(self.p), schedjobs.ENV: s["name"]}, ok=(0, 1))
+                                     env={**command_env(self.p), schedjobs.ENV: s["name"]})
         except subprocess.TimeoutExpired:   # its whole process group is killed: a failed run
             note = sched.capped_note(payload.get("timeout_s"), WATCHER_MAX_S)
             self.observe(errors, f"watcher command timed out{f' after {timeout} s' + note if note else ''}: {cmd}",
@@ -9905,7 +9905,7 @@ class Daemon:
         ok = out.returncode in (0, 1)
         # A crash at a normal exit code reports nothing either: no stdout, and exit 1 with stderr or a
         # traceback at exit 0. It is a failed run, not a clean one: its issues, receipts and mutes stand.
-        own = (out.stderr or "")[len(getattr(out, "rerun_note", "") or ""):].strip()
+        own = (out.stderr or "").strip()
         if ok and not text and own and (out.returncode == 1 or "Traceback (most recent call last)" in own):
             ok = False
         failed = not ok and not text   # the daemon reports the failure itself
@@ -10434,10 +10434,8 @@ class Daemon:
         if not cmd:
             return ""
         timeout = _watcher_timeout({"timeout_s": payload.get("precheck_timeout_s")})
-        try:   # 0 (skip) and 1 (go ahead) are its answers; any other exit may be a script rewritten
-            # mid-run, and the rerun's answer (perhaps a skip) saves a model run that fail-open would spend
-            out = schedrun.run_group(cmd, cwd=str(self.p.root), timeout=timeout, env=command_env(self.p),
-                                     ok=(0, 1))
+        try:   # 0 (skip) and 1 (go ahead) are its answers
+            out = schedrun.run_group(cmd, cwd=str(self.p.root), timeout=timeout, env=command_env(self.p))
         except subprocess.TimeoutExpired:
             log(self.p, f"schedule {s['name']}: precheck timed out after {timeout} s"
                         f"{sched.capped_note(payload.get('precheck_timeout_s'), WATCHER_MAX_S)}; the run goes ahead")
