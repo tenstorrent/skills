@@ -664,20 +664,23 @@ def test_every_ttp_upgrade_mode_logs_who_ran_it_at_its_start(env, monkeypatch, t
         monkeypatch.delenv(var, raising=False)
     release.set_hold(p.name, "demo running", time.time() + 3600)
     before = len(_upgrade_log_lines(p))     # the fixture's own setup upgrade
-    modes = [(["--apply", "deadbeef"], "apply"), (["--take-over-from", "99"], "takeover"), ([], "plain")]
+    modes = [(["--apply", "deadbeef"], "apply"), (["--take-over-from", "99"], "takeover"), ([], "plain"),
+             (["--auto"], "auto")]
     for argv, mode in modes:
         assert _run_upgrade(cli, ["upgrade", p.name, *argv]) == 75, mode     # refused by the hold, still logged
+    assert _run_upgrade(cli, ["upgrade", p.name, "--hold", "--until", "2h", "--why", "demo running"]) == 0
     other = tmp_path / "otherproj"
     monkeypatch.setenv("TTP_PROJECT", str(other))
     monkeypatch.setenv("TTP_TASK", "42")
     monkeypatch.setenv("TTP_RUN_ID", "7")
     _run_upgrade(cli, ["upgrade", p.name, "--override-hold"])
     lines = _upgrade_log_lines(p)[before:]
-    assert [ln.split(" mode=")[1].split()[0] for ln in lines] == ["apply", "takeover", "plain", "plain+override-hold"]
+    assert [ln.split(" mode=")[1].split()[0] for ln in lines] == ["apply", "takeover", "plain", "auto", "hold",
+                                                                   "plain+override-hold"]
     for ln in lines:
         assert f"ttp upgrade {p.name} " in ln and f"pid={os.getpid()} " in ln and f"parent={os.getppid()}" in ln
-    assert all(ln.endswith("by=terminal") for ln in lines[:3])
-    assert lines[3].endswith("by=project otherproj task 42 run 7")
+    assert all(ln.endswith("by=terminal") for ln in lines[:5])
+    assert lines[5].endswith("by=project otherproj task 42 run 7")
 
 
 def test_the_conflict_paths_finish_task_records_who_queued_it_never_user(env, monkeypatch):

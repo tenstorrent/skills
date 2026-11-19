@@ -8380,10 +8380,28 @@ def _host_projects() -> list[Project]:
     return out
 
 
+def _foreign_view(p: Project) -> tuple[str, str]:
+    """(name, home zone) of a project, read from its project.json only: Project.name and the zone
+    helpers go through raw_config, which may write the last good copy into that project's state/."""
+    try:
+        cfg = json.loads(p.config_path.read_text())
+    except (OSError, ValueError):
+        cfg = {}
+    cfg = cfg if isinstance(cfg, dict) else {}
+    return str(cfg.get("name") or p.root.name), timefmt.zone_name(cfg)
+
+
+def _is_here(p: Project) -> bool:
+    h = here()
+    return h is not None and h.base.resolve() == p.base.resolve()
+
+
 def _said_in(p: Project, query: str, limit: int, since: float = 0.0) -> list[dict]:
-    """The newest user (and relayed user's verbatim) messages of `p` on `query`, read-only (userwords)."""
+    """The newest user (and relayed user's verbatim) messages of `p` on `query`, read-only (userwords);
+    another project's database is read so that nothing in its folder is created or changed."""
     from . import userwords
-    con = userwords.open_ro(p.state / "project.db")
+    db = p.state / "project.db"
+    con = userwords.open_ro(db) if _is_here(p) else userwords.open_foreign(db)
     try:
         return userwords.search(con, query, limit=limit, since=since)
     finally:
@@ -8413,16 +8431,17 @@ def cmd_said(a) -> None:
         if p is None:
             die("ttp said: no project here (run it in a project or its run)")
         targets = [p]
-    where = p or (targets[0] if targets else None)
+    where = p or (_foreign_view(targets[0])[1] if targets else None)
     since = time.time() - a.days * 86400 if a.days else 0.0
     found = []
     for t in targets:
+        name = t.name if _is_here(t) else _foreign_view(t)[0]
         try:
-            found += [{**m, "project": t.name} for m in _said_in(t, " ".join(a.words), a.limit, since)]
+            found += [{**m, "project": name} for m in _said_in(t, " ".join(a.words), a.limit, since)]
         except sqlite3.Error as e:
             if len(targets) == 1:
-                die(f"ttp said: cannot read {t.name}'s messages ({e})", 75)
-            print(f"ttp said: skipped {t.name}: cannot read its messages ({e})", file=sys.stderr)
+                die(f"ttp said: cannot read {name}'s messages ({e})", 75)
+            print(f"ttp said: skipped {name}: cannot read its messages ({e})", file=sys.stderr)
     found = sorted(found, key=lambda m: -m["ts"])[:a.limit]
     labelled = bool(a.project or a.all_projects)
     if a.json:
@@ -13887,7 +13906,8 @@ def _hold_words(p: Project) -> list[str]:
         except sqlite3.Error:
             return []
     newest = sorted(found.values(), key=lambda m: -m["ts"])[:2]
-    return [f'{p.name} msg #{m["id"]} {timefmt.long(m["ts"], p)}: "{m["quote"]}" (the user\'s newest word there '
+    name, zone = (p.name, p) if _is_here(p) else _foreign_view(p)
+    return [f'{name} msg #{m["id"]} {timefmt.long(m["ts"], zone)}: "{m["quote"]}" (the user\'s newest word there '
             f'on a freeze, demo or hold)' for m in newest]
 
 

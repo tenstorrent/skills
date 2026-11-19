@@ -212,3 +212,57 @@ def test_a_release_hold_prints_the_projects_newest_words_on_a_freeze_first(env, 
     out = capsys.readouterr().out
     assert f"{p.name} msg #{said} " in out and ("freeze is lifted" in out or "demo is over" in out), out
     assert out.index(f"msg #{said}") < out.index("release held: demo running")
+
+
+def _stopped_foreign_project(env, monkeypatch, last_good: str):
+    """Project B with a relayed lift, its daemon stopped: every connection closed and no -wal or -shm
+    file left. `last_good`: 'stale' (project.json newer than its last good copy) or 'none'."""
+    from ttp import relay
+    q = _second_project(env, "otherproj")
+    said = q.db.post("in", f"The demo is over, the freeze is lifted.\n{relay.MARK}\nrelayed for the user",
+                     chat=None, kind="user", provenance="cli-legacy")
+    q.db.close()
+    q._db = None
+    for ext in ("-wal", "-shm"):
+        (q.state / f"project.db{ext}").unlink(missing_ok=True)
+    good = q.state / "project.last-good.json"
+    if last_good == "none":
+        good.unlink(missing_ok=True)
+    else:
+        good.write_text("{}\n")
+        os.utime(good, (time.time() - 60, time.time() - 60))
+    return q, said
+
+
+def _tree(folder):
+    """Every path under `folder` with its size and mtime: any file made or changed there shows."""
+    return {str(f.relative_to(folder)): (f.stat().st_size, f.stat().st_mtime_ns)
+            for f in sorted(folder.rglob("*"))}
+
+
+def test_reading_another_projects_words_creates_or_changes_no_file_in_its_folder(env, capsys, monkeypatch, tmp_path):
+    """A plain read-only open of a cleanly closed WAL database made its -wal and -shm files, and its name
+    and zone were read through raw_config, which writes a last good copy of its settings: `ttp said
+    --project/--all-projects` and the --hold freeze words leave the other project's folder as it was."""
+    from ttp import cli
+    p = make(env)
+    for last_good in ("stale", "none"):
+        q, said = _stopped_foreign_project(env, monkeypatch, last_good)
+        before = _tree(q.base)
+        for where in ("here", "outside"):
+            if where == "here":
+                monkeypatch.setenv("TTP_PROJECT", str(p.base))
+            else:
+                monkeypatch.delenv("TTP_PROJECT", raising=False)
+                monkeypatch.chdir(tmp_path)
+                assert cli.here() is None
+            for flags in (["--project", "otherproj"], ["--all-projects"]):
+                assert _ttp_said("demo", "freeze", *flags) == 0, (where, flags)
+                out = capsys.readouterr().out
+                assert f"otherproj msg #{said} " in out and "freeze is lifted" in out, (where, flags, out)
+            words = cli._hold_words(q)
+            assert words and words[0].startswith(f"otherproj msg #{said} "), words
+            assert _tree(q.base) == before, (last_good, where)
+        shutil.rmtree(q.root)
+        from ttp.project import unregister
+        unregister("otherproj")
