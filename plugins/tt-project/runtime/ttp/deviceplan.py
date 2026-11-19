@@ -17,7 +17,6 @@ from . import glmassist
 
 # ssh options a plan run may pass (strict ssh_target): none forwards a port, jumps, runs a local command or reads another config
 SSH_SAFE = frozenset("nTtqx46C")
-LOCAL_COMMAND = re.compile(r"proxycommand|localcommand|knownhostscommand|permitlocalcommand", re.I)
 SSH_SAFE_OPTS = {"batchmode", "connecttimeout", "serveraliveinterval", "serveralivecountmax", "loglevel"}
 
 SHADOW = re.compile(r"/tmp/(?:ttp-\d+/[0-9a-f]+/)?shadow-[\w-]+/")
@@ -149,48 +148,22 @@ def gate(cfg: dict, project: str, raw: dict | None) -> dict:
     return cfg
 
 
-def _ssh_options(w):
-    """([(letter, value)], destination index) of the ssh call `w`, read as ssh's getopt does (hook's table of
-    options that take a value): bundles and attached values (`-oProxyCommand=x`) included; value None for a flag."""
-    from .hook import SSH_ARG_OPTS
-    opts, i = [], 1
-    while i < len(w) and w[i].startswith("-") and w[i] != "-":
-        a = w[i]
-        for j in range(1, len(a)):
-            if a[j] in SSH_ARG_OPTS:
-                if not a[j + 1:]:
-                    i += 1
-                opts.append((a[j], a[j + 1:] or (w[i] if i < len(w) else "")))
-                break
-            opts.append((a[j], None))
-        i += 1
-    return opts, (i if i < len(w) else None)
-
-
 def ssh_target(w, strict: bool = False):
     """(host, remote command) of the ssh call `w`, else None. Strict, for a plan run, fails closed: None for an
     option but a few harmless ones, an option after the destination (ssh parses options again there; later words
-    are the remote command), a `--`, or a local-command option anywhere."""
+    are the remote command), a `--`, or a local-command option (credguard.ssh_runs_local)."""
+    from . import credguard
     if not w or os.path.basename(w[0]) != "ssh":
         return None
-    opts, i = _ssh_options(w)
+    opts, i = credguard.ssh_walk(w)
     if i is None:
         return None
     if strict:
-        safe = all(v is None and f in SSH_SAFE or f in "pl" or f == "o" and re.split(r"[=\s]", v)[0].lower() in SSH_SAFE_OPTS
-                   for f, v in opts)
-        if not safe or w[i + 1:][:1] and w[i + 1].startswith("-") or "--" in w[i + 1:] or LOCAL_COMMAND.search(" ".join(w)):
+        safe = all(o in SSH_SAFE or o in "pl" or o == "o" and re.split(r"[=\s]", v)[0].lower() in SSH_SAFE_OPTS
+                   for o, v, _ in opts)
+        if not safe or w[i + 1:][:1] and w[i + 1].startswith("-") or "--" in w[i + 1:] or credguard.ssh_runs_local(w):
             return None
     return w[i].split("@")[-1].lower(), " ".join(w[i + 1:])   # ssh itself joins its words with spaces
-
-
-def plan_hosts(run_dir) -> set[str]:
-    """The hosts the plan's steps run on (a step's host, or the host of its `ssh <host> ...` command)."""
-    out = set()
-    for st in (plan(run_dir) or {}).get("steps") or []:
-        h = split_host(norm(str(st.get("command") or "")))[0]
-        out |= {str(st.get("host") or "").split("@")[-1].lower(), h}
-    return out - {"", "local", "localhost", "this machine", "the project host"}
 
 
 def _segs(cmd: str):
@@ -328,9 +301,9 @@ def _read(path):
 
 def marked(run_dir) -> bool:
     """The run is a GLM device run under the plan route (the daemon's glm_run.json mark)."""
-    from .glmguard import RUN_MARK
-    got = _read(Path(run_dir) / RUN_MARK) if run_dir else None
-    return isinstance(got, dict) and bool(got.get("device")) and got.get("plan") is True
+    from . import glmguard
+    got = glmguard.glm_run({"TTP_RUN_DIR": str(run_dir or "")})
+    return bool(got and got["device"] and got["plan"])
 
 
 def plan(run_dir) -> dict | None:
@@ -376,7 +349,9 @@ def _gates(st: dict) -> list[str]:
 def _static(cmd: str, s: dict, cwd: str, run_dir: str = "") -> str | None:
     if why := power_refusal(cmd, s["power_routes"]):
         return why
-    if any(os.path.basename(w[0]) == "ssh" and not ssh_target(w, strict=True) for w in _segs(cmd) or []):
+    segs = _segs(cmd)
+    if any(os.path.basename(w[0]) == "ssh" and not ssh_target(w, strict=True) for w in segs or []) or \
+            segs is None and any(os.path.basename(x) == "ssh" for x in re.split(r"[\s`;&|()'\"]+", cmd)):
         return "an ssh step carries only harmless ssh options and its whole remote command as one quoted word"
     try:
         from . import aitag, glmguard, hook, pathguard, ruleguard
@@ -616,12 +591,10 @@ def stop(db, project: str, why: str) -> None:
 
 
 def counters(db) -> dict:
-    """{"runs", "bounce_rate", "bounces", "audits_done", "audits_clean", "glm_harm", "plan_harm", "stopped"}."""
+    """The stored state (_state), its "runs" the count and "bounce_rate" the share of the recent runs that bounced."""
     st = _state(db)
     b = sum(1 for r in st["runs"] if r.get("bounce"))
-    return {"runs": st["n"], "bounce_rate": round(b / len(st["runs"]), 3) if st["runs"] else 0.0,
-            "bounces": st["bounces"], "audits_done": st["audits_done"], "audits_clean": st["audits_clean"],
-            "audits_missing": st["audits_missing"], "glm_harm": st["glm_harm"], "plan_harm": st["plan_harm"], "stopped": st["stopped"]}
+    return {**st, "runs": st["n"], "bounce_rate": round(b / len(st["runs"]), 3) if st["runs"] else 0.0}
 
 
 def daily_line(db) -> str:

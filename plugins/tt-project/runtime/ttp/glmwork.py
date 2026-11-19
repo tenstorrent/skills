@@ -214,7 +214,7 @@ def keeps_core(db, cfg: dict, task: dict, tier: str, cls: str | None = None, pic
         return "person"
     if DESIGN.search(text) or modelpick.HARD.search(text) or codearm.JUDGMENT.search(text):
         return "design"
-    if (tierfloor.device_run(task, cfg) or tierfloor.DEVICE_SPEC.search(text)) and not deviceplan.on(cfg):
+    if deviceplan.device(task, cfg) and not deviceplan.on(cfg):
         return "device"   # with glm_device on, a device task runs on GLM under an Opus plan (deviceplan.py)
     s = settings(cfg) or {}
     if s.get("keep_urgent") and urgent.is_urgent(task):

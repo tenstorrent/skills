@@ -276,7 +276,8 @@ def test_a_plan_step_that_mails_or_routes_a_note_fails_the_plan_check(tmp_path):
     from ttp import deviceplan
     run, _ = _dp_run(tmp_path)
     for c in ("mail -s report ops@example.com < /dev/null", "ttp note --urgent done", "sqlite3 x.db 'select 1'",
-              "ssh box-a -o ProxyCommand=x ls", "ssh -oProxyCommand=x box-a ls", "ssh box-a -- ls"):
+              "ssh box-a -o ProxyCommand=x ls", "ssh -oProxyCommand=x box-a ls", "ssh box-a -- ls",
+              "ssh box-a -o ProxyCommand=x ls `true`"):
         plan = _DP_PLAN.replace("broker reset box-a", c)
         assert deviceplan.store(run, plan, str(tmp_path), {}), c
         assert deviceplan.plan(run) is None, c

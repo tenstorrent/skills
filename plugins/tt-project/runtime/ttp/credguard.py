@@ -242,15 +242,20 @@ def _passing_words(argv: list[str], hands_on: bool = True) -> list[str]:
 def ssh_options(argv: list[str]) -> list[tuple[str, str, str]]:
     """(option letter, value, the word holding the value) for each option of an ssh, scp or sftp call.
     Options end at the first operand, for ssh at the one after its host: the rest is the remote command."""
+    return ssh_walk(argv)[0]
+
+
+def ssh_walk(argv: list[str]):
+    """(ssh_options(argv), index of the ssh host word, None for scp, sftp or a call with no host)."""
     name = os.path.basename(argv[0])
     takes = SSH_OPTS.get(name, SSH_OPTS["ssh"])[0]
-    out, i, host = [], 1, name not in ("ssh", "autossh")
+    out, i, host, dest = [], 1, name not in ("ssh", "autossh"), None
     while i < len(argv) and argv[i] != "--":
         w = argv[i]
         if not w.startswith("-") or w == "-":
             if host:
                 break
-            host, i = True, i + 1
+            host, dest, i = True, i, i + 1
             continue
         j = next((k for k, c in enumerate(w[1:], 1) if c in takes), None)
         out += [(c, "", "") for c in w[1:j]]
@@ -261,7 +266,7 @@ def ssh_options(argv: list[str]) -> list[tuple[str, str, str]]:
         val = tail or (argv[i + 1] if i + 1 < len(argv) else "")
         out.append((w[j], val, w if tail else val))
         i += 1 if tail else 2
-    return out
+    return out, dest
 
 
 def ssh_own_file(value: str, kind: str = "config") -> bool:

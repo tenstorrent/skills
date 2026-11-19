@@ -209,14 +209,6 @@ def plan_bookkeeping(words: list[str]) -> bool:
     return any(words[:len(b)] == list(b) for b in PLAN_BOOKKEEPING)
 
 
-def plan_ssh(seg: list[str], run_dir: str) -> str | None:
-    """The remote command of `ssh <host> <cmd>` in a device run under an Opus plan, when the host is one the
-    plan's steps name and no option forwards, jumps or runs a local command; else None."""
-    from . import deviceplan
-    got = deviceplan.ssh_target(seg, strict=True)
-    return got[1] if got and got[1].strip() and got[0] in deviceplan.plan_hosts(run_dir) else None
-
-
 def _ttp_args(seg: list[str], project: str) -> list[str] | None:
     """The words after `ttp` in a command segment (an optional leading project name dropped), None for a
     segment that is not a ttp call."""
@@ -318,7 +310,15 @@ def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None, remote: bool 
         elif name in HTTP and HTTP_DATA.search(" ".join(seg[1:])):
             return "a run on the GLM arm does not send data to a service (an HTTP post)"
         elif name in REACH:
-            rest = plan_ssh(seg, run_dir) if plan and name == "ssh" else None
+            rest = None
+            if plan and name == "ssh":   # the host is one the plan's steps name (strict ssh, no jump or local command)
+                from . import deviceplan
+                got = deviceplan.ssh_target(seg, strict=True)
+                hosts = {h for st in (deviceplan.plan(run_dir) or {}).get("steps") or []
+                         for h in (str(st.get("host") or "").split("@")[-1].lower(),
+                                   deviceplan.split_host(deviceplan.norm(str(st.get("command") or "")))[0])}
+                if got and got[1].strip() and got[0] in hosts - {"", "local", "localhost", "this machine", "the project host"}:
+                    rest = got[1]
             if rest is None:
                 return f"`{name}` reaches another host, person or database: not for a run on the GLM arm"
             if why := shell_refusal(rest, cwd, run_dir, e, remote=True):

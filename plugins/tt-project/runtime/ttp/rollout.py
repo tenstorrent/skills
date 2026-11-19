@@ -158,15 +158,6 @@ def stop_project(flag: str, project: str, why: str, by: str = "daemon") -> bool:
     return True
 
 
-def _judge(flag: str):
-    """The wave gate's judge for `flag`: its own (FLAGS "judge") or glmshare.judge."""
-    if FLAGS.get(flag, {}).get("judge") == "deviceplan":
-        from .deviceplan import judge
-        return judge
-    from .glmshare import judge
-    return judge
-
-
 def ledger(flag: str | None = None) -> list[dict]:
     out = []
     try:
@@ -417,7 +408,8 @@ def wave_tick(now: float | None = None, judge=None, projects: dict | None = None
         excl = set(cfg.get("excluded") or [])
         verdicts: dict[str, dict] = {}
         try:
-            fj = judge if judge is not None else _judge(flag)
+            from . import deviceplan, glmshare
+            fj = judge or (deviceplan.judge if FLAGS.get(flag, {}).get("judge") == "deviceplan" else glmshare.judge)
         except ImportError:
             continue
         for name in (n for w in ws[:k + 1] for n in w if n not in excl and n not in back):
