@@ -812,10 +812,11 @@ def test_code_quality_counts_a_task_retried_a_tier_up_as_bad_on_the_model_it_sta
     assert q["state"] == "off"
 
 
-def test_reviews_run_on_their_tiers_core_model_unless_the_user_routes_them():
-    """A review (review_small too) judges work: by default it is neither routed to the chat provider nor
-    put on the cheap core fallback, so it runs on its tier's core model; route.classes may still route it."""
-    from ttp import runclass
+def test_reviews_run_on_their_tiers_core_model_in_every_run_class(env):
+    """A review judges work: it is neither routed to the chat provider nor put on the cheap core fallback,
+    so every run of it, in every run class (a push-conflict fix's rebase run too), runs on its tier's core
+    model, even when route.classes sends every class to the chat provider."""
+    from ttp import daemon, runclass
     cfg = _rc_cfg()
     assert "review_small" not in runclass.CHAT and "review_small" not in runclass.CORE_CHEAP
     assert runclass.routes(cfg)["review_small"] == "core" and runclass.routes(cfg)["status_report"] == "chat"
@@ -825,9 +826,16 @@ def test_reviews_run_on_their_tiers_core_model_unless_the_user_routes_them():
     assert runclass.core_cheap({"route": {"core_cheap": {"review_small": {"model": "haiku"}}}},
                                r, "review_small", "standard", "claude") is None
     assert runclass.core_cheap({}, r, "status_report", "standard", "claude")["model"] == "sonnet"
-    user = {**cfg, "route": {"classes": {"review_small": "chat"}}}
+    user = {**cfg, "route": {"classes": {c: "chat" for c in runclass.CLASSES}}}
     assert runclass.routes(user)["review_small"] == "chat"
-    assert runclass.target(user, r, "standard", "review_small")["rule"] == "class:review_small"
+    p = make(env)
+    d = daemon.Daemon.__new__(daemon.Daemon)
+    d.p, d.cfg, d._model_pick = p, user, lambda *a, **k: None
+    review = p.db.task(p.db.add_task("Review #1: x", "check it", kind="review", tier="standard", priority=3))
+    work = p.db.task(p.db.add_task("work task", "do it", kind="work", tier="standard", priority=3))
+    assert d._route(work, "standard", None, 1.0, cls="rebase")["to"] == "chat"
+    for cls in runclass.CLASSES:
+        assert d._route(review, "standard", None, 1.0, cls=cls) is None, cls
 
 
 def test_code_sonnet_and_core_cheap_are_project_and_account_keys_the_project_value_layers_over(env):

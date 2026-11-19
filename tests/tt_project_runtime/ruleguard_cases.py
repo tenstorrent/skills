@@ -92,6 +92,41 @@ def test_slurm_nodes_lets_free_nodes_and_own_jobs_pass(rule_home):
     assert _rg_deny("sbatch job.sh", rule_home.work) is None   # the scheduler picks: nothing to ask
 
 
+def test_slurm_nodes_lets_a_queue_only_sbatch_name_busy_nodes_only_when_the_project_says_so(rule_home):
+    rule_home.cfg["guards"] = {"slurm": True}
+    (rule_home.fake / "nodes").write_text("someone-else 4411\n")
+    (rule_home.fake / "sinfo").write_text("node8 drained\n")
+    assert "4411" in _rg_deny("sbatch -w node8 job.sh", rule_home.work)
+    rule_home.cfg["guards"]["slurm_queue_pinned"] = True
+    assert _rg_deny("sbatch -w node8 job.sh", rule_home.work) is None
+    assert _rg_deny("ssh login 'sbatch --nodelist=node8 -t 30 job.sh'", rule_home.work) is None
+    # Calls that block for the node, or join or follow another user's job, are still refused
+    for cmd in ("sbatch -I -w node8 job.sh", "sbatch --immediate -w node8 job.sh", "srun -w node8 hostname",
+                "salloc -w node8"):
+        assert "4411" in _rg_deny(cmd, rule_home.work), cmd
+    (rule_home.fake / "job").write_text("someone-else 5150\n")
+    for cmd in ("sbatch -w node8 --dependency=afterok:5150 job.sh", "sbatch -d afterany:5150+5 job.sh",
+                "srun --jobid=5150 hostname"):
+        assert "5150" in _rg_deny(cmd, rule_home.work), cmd
+    (rule_home.fake / "job").write_text(f"{rule_home.me} 4412\n")
+    assert _rg_deny("sbatch -w node8 --dependency=afterany:4412 job.sh", rule_home.work) is None
+
+
+def test_slurm_nodes_refuses_scancel_of_another_users_job_and_node_state_updates(rule_home):
+    rule_home.cfg["guards"] = {"slurm": True}
+    (rule_home.fake / "job").write_text("someone-else 5150\n")
+    for cmd in ("scancel 5150", "ssh login 'scancel -s 9 5150'", "scancel --signal=TERM 5150_2"):
+        assert "5150" in _rg_deny(cmd, rule_home.work), cmd
+    assert "someone-else" in _rg_deny("scancel -u someone-else", rule_home.work)
+    (rule_home.fake / "job").write_text(f"{rule_home.me} 4412\n")
+    assert _rg_deny("scancel 4412", rule_home.work) is None
+    assert _rg_deny(f"scancel -u {rule_home.me} -s 9", rule_home.work) is None
+    for cmd in ("scontrol update NodeName=node8 State=DRAIN Reason=x", "ssh login 'scontrol update nodename=node8 state=resume'"):
+        assert "node's state" in _rg_deny(cmd, rule_home.work), cmd
+    assert _rg_deny("scontrol show node node8", rule_home.work) is None
+    assert _rg_deny("scontrol update JobId=4412 TimeLimit=30", rule_home.work) is None
+
+
 def test_slurm_nodes_refuses_when_the_queue_cannot_be_read(rule_home):
     rule_home.cfg["guards"] = {"slurm": True}
     (rule_home.fake / "broken").write_text("")

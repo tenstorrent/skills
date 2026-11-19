@@ -8,10 +8,12 @@ alike) and the GLM shell (glmenv.refusal) ask it. RULES, with the setting each r
 - protected_paths (guards.protected_paths): no write under a listed path, here or in text ssh runs
   on another host. pathguard.py enforces it beside the credential folders it always guards.
 - slurm_nodes (guards.slurm): srun, sbatch or salloc naming nodes (-w, --nodelist) that squeue shows
-  holding another user's job, or sinfo shows drained, down or reserved, and --jobid onto another
-  user's job are refused, also inside ssh to a login host (the same ssh runs the query there). A
-  query that fails or times out refuses: the rule never guesses. Set guards.slurm to true on a
-  project that uses Slurm.
+  holding another user's job, or sinfo shows drained, down or reserved; --jobid or --dependency onto
+  another user's job; scancel of another user's job (by id or -u); and scontrol update of a node's
+  state are refused, also inside ssh to a login host (the same ssh runs the query there). A query
+  that fails or times out refuses: the rule never guesses. Set guards.slurm to true on a project that
+  uses Slurm; guards.slurm_queue_pinned true also lets an sbatch without --immediate name busy or
+  drained nodes, since it only queues. Calls inside wrapper scripts are not seen.
 - landing_push (delivery.push_branch, delivery.fast_forward_also, delivery.mirror_remotes and
   delivery.channel_tags): a raw `git push` to one of them is refused; `ttp push` is the route, which
   pushes only what the push queue approved.
@@ -35,7 +37,8 @@ RULES = ("protected_paths", "slurm_nodes", "landing_push", "user_undo")
 OFF_KEY = "guards.off"
 SLURM_KEY = "guards.slurm"
 FIRES = "ruleguard.jsonl"
-SLURM_PROGS = {"srun", "sbatch", "salloc"}
+SLURM_PROGS = {"srun", "sbatch", "salloc", "scancel", "scontrol"}
+SCANCEL_VALUE_OPTS = {"-A", "-M", "-n", "-p", "-q", "-R", "-s", "-t", "-u", "-w"}
 QUERY_TIMEOUT_S = 15
 HELD_STATES = ("drain", "drng", "down", "resv", "reserved", "maint")
 PUSH_VALUE_OPTS = {"--repo", "--receive-pack", "--exec", "-o", "--push-option"}
@@ -126,7 +129,7 @@ def _opt(args: list[str], short: str, long: str) -> list[str]:
 
 
 def _slurm_calls(segments: list[list[str]]):
-    """(ssh prefix or [], the slurm call's words) for each srun/sbatch/salloc, also inside ssh's command."""
+    """(ssh prefix or [], the slurm call's words) for each SLURM_PROGS call, also inside ssh's command."""
     from . import hook, pathguard
     for s in segments:
         name = os.path.basename(s[0]) if s else ""
@@ -148,13 +151,27 @@ def _query(prefix: list[str], script: str, env) -> str:
 
 
 def _slurm(command, segments, cfg, cwd, env) -> str | None:
-    if not (cfg.get("guards") or {}).get("slurm"):
+    g = cfg.get("guards") or {}
+    if not g.get("slurm"):
         return None
     for prefix, words in _slurm_calls(segments):
-        args = words[1:]
-        nodes = ",".join(_opt(args, "-w", "--nodelist"))
-        jobs = _opt(args, "", "--jobid")
-        if not nodes and not jobs:
+        prog, args = os.path.basename(words[0]), words[1:]
+        if prog == "scontrol":
+            low = [a.lower() for a in args]
+            if low[:1] == ["update"] and any(a.startswith("nodename=") for a in low) and any(a.startswith("state=") for a in low):
+                return ("slurm_nodes (guards.slurm): scontrol update of a node's state changes it for every user; "
+                        "leave node states to the cluster's admins")
+            continue
+        queued = prog == "sbatch" and not any(a == "-I" or a.startswith("--immediate") for a in args)
+        nodes = "" if queued and g.get("slurm_queue_pinned") else ",".join(_opt(args, "-w", "--nodelist"))
+        if prog == "scancel":
+            users = _opt(args, "-u", "--user")
+            jobs = [a for i, a in enumerate(args) if re.match(r"\d", a) and (i == 0 or args[i - 1] not in SCANCEL_VALUE_OPTS)]
+            nodes = ""
+        else:
+            users = []
+            jobs = _opt(args, "", "--jobid") + [j for d in _opt(args, "-d", "--dependency") for j in re.findall(r":(\d+)", d)]
+        if not nodes and not jobs and not users:
             continue
         q = shlex.quote
         script = "id -un && echo @@"
@@ -165,7 +182,7 @@ def _slurm(command, segments, cfg, cwd, env) -> str | None:
         try:
             parts = _query(prefix, script, env).split("@@")
         except (OSError, RuntimeError, subprocess.SubprocessError):
-            return (f"slurm_nodes (guards.slurm): squeue or sinfo could not tell who holds {nodes or ', '.join(jobs)}, "
+            return (f"slurm_nodes (guards.slurm): squeue or sinfo could not tell who holds {nodes or ', '.join(jobs or users)}, "
                     "so the call is refused; name free nodes the queue can confirm, or let the scheduler pick")
         me, rest = parts[0].strip(), parts[1:]
         node_jobs, states, job_rows = (rest[0], rest[1], rest[2:]) if nodes else ("", "", rest)
@@ -173,10 +190,12 @@ def _slurm(command, segments, cfg, cwd, env) -> str | None:
         others = sorted({r[1] for r in rows if len(r) >= 2 and r[0] != me})
         held = sorted({r[0] for r in (ln.split() for ln in states.splitlines())
                        if len(r) >= 2 and any(h in r[1].lower() for h in HELD_STATES)})
-        if others or held:
-            what = (f"jobs {', '.join(others)} of another user" if others else "") + \
-                   ("; " if others and held else "") + (f"nodes {', '.join(held)} drained, down or reserved" if held else "")
-            return (f"slurm_nodes (guards.slurm): {os.path.basename(words[0])} onto {what}; never take nodes or jobs "
+        strangers = sorted({u for u in users if u != me})
+        what = [f"jobs {', '.join(others)} of another user"] * bool(others) + \
+               [f"nodes {', '.join(held)} drained, down or reserved"] * bool(held) + \
+               [f"the jobs of user {', '.join(strangers)}"] * bool(strangers)
+        if what:
+            return (f"slurm_nodes (guards.slurm): {prog} onto {'; '.join(what)}; never take nodes or jobs "
                     "others hold: ask the scheduler for free nodes")
     return None
 
@@ -267,7 +286,8 @@ def listing(cfg: dict) -> list[str]:
     except Exception:
         ordered = []
     src = {"protected_paths": f"guards.protected_paths: {', '.join(extra) or 'none'} (credential folders always)",
-           "slurm_nodes": f"guards.slurm: {'on' if (cfg.get('guards') or {}).get('slurm') else 'unset'}",
+           "slurm_nodes": f"guards.slurm: {'on' if (cfg.get('guards') or {}).get('slurm') else 'unset'}"
+                          + ("; slurm_queue_pinned: on" if (cfg.get('guards') or {}).get('slurm_queue_pinned') else ""),
            "landing_push": "delivery.push_branch, fast_forward_also, mirror_remotes, channel_tags: "
                            + (", ".join(sorted(branches | tags)) or "none"),
            "user_undo": f"user-ordered ledger entries: {', '.join(ordered) or 'none'}"}

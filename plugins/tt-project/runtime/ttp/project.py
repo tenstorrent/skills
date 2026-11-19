@@ -659,8 +659,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # user_site: "auto" refuses installs into the shared ~/.local while `ttp list` shows several projects
     # on the host, "on" always (usersite.py).
     # off: rule checks turned off (ruleguard.RULES; the user's word only); slurm: true checks srun, sbatch and
-    # salloc node picks against squeue on a cluster host (ruleguard.py).
-    "guards": {"local": [], "protected_paths": [], "user_site": "auto", "off": [], "slurm": False},
+    # salloc node picks against squeue on a cluster host (ruleguard.py); slurm_queue_pinned: true lets a
+    # queue-only sbatch name busy or drained nodes.
+    "guards": {"local": [], "protected_paths": [], "user_site": "auto", "off": [], "slurm": False,
+               "slurm_queue_pinned": False},
     # Worker and reviewer runs, everything they start (detached checks, tests, reference models) and
     # the pushes and push batches the daemon starts run this many nice levels below the daemon
     # (0-19; 0 = normal priority), so they never slow the host's own work. The daemon and the
