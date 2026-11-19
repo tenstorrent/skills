@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Ramp-up after an outage: work restarts a few tasks at a time, never all at once.
 
-Each tick Daemon.track_outages hands observe() the outage signs it sees: the project pause, the
-lease not held, a provider's open login breaker, a provider's budget gate closed to new work, a
+Each tick Daemon.track_outages hands observe() the outage signs it sees: the project pause, a
+provider's open login breaker, a provider's budget gate closed to new work, a
 provider whose API host does not resolve, the settle after the host woke, each paused resource. A
 new boot counts as an outage that just ended. When a sign ends, a ramp starts (kv KEY): {since,
 cause, base, scope}. While it runs, dispatch starts a worker only while the running workers (in its

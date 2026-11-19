@@ -4595,7 +4595,7 @@ def test_a_long_holder_is_a_likely_hang_only_when_its_log_stalled_else_slow_unde
     cfg = {"checks": {"wait_hang_factor": 3}}
     evs = _queue_events(1, holders=[h])
     grew = {"at": now - 5}
-    stat = lambda path: (grew["at"], 1000)   # noqa: E731 - the log's mtime and size
+    stat = lambda path: grew["at"]   # noqa: E731 - the log's mtime
 
     why, inc = checklane.wait_wake(evs, None, cfg, now, 600.0, stat=stat)
     assert why == ["new"] and inc["slow"] and not inc["hang"], (why, inc)

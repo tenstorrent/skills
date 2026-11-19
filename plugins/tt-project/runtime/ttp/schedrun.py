@@ -197,10 +197,6 @@ def run_group(cmd: str, *, cwd: str, timeout: float, env: dict | None) -> subpro
     """subprocess.run(cmd, shell=True) in a session of its own, kept in GROUPS_KEY while it runs. A
     timeout kills the whole group (the shell's children too) and raises TimeoutExpired; a daemon stop
     in the meantime raises Stopped."""
-    return _run_group(cmd, cwd=cwd, timeout=timeout, env=env)
-
-
-def _run_group(cmd: str, *, cwd: str, timeout: float, env: dict | None) -> subprocess.CompletedProcess:
     # stdin /dev/null: a command that reads it gets EOF, never the daemon's own stdin (an open pipe would
     # hold it to its timeout)
     run, env = probespawn.hidden(cmd, env)

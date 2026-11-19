@@ -5020,11 +5020,10 @@ def _cmd_checks(a) -> None:
                     check_start = out.tell()
                 began = time.monotonic()
                 loss_reruns = torn_reruns = setup_reruns = 0
-                took, runs = [0.0], [0]
+                runs = [0]
 
                 def run_once():   # one run of the check; the run's deadline moves by any cap extension
                     nonlocal deadline
-                    t0 = time.monotonic()
                     if runs[0] and (record := resume_vars.get("TTP_PYTEST_RESUME")):
                         try:   # a rerun after a fault in this run runs every file again
                             durable_write(Path(record), "")
@@ -5038,7 +5037,6 @@ def _cmd_checks(a) -> None:
                                           silent_s=checkwall.silent_limit(c), extend=wall_ext,
                                           pass_fds=(a.tmp_fd,) if group and getattr(a, "tmp_fd", None) is not None else ())
                     finally:
-                        took[0] = time.monotonic() - t0
                         if deadline is not None:
                             deadline = ran_since + wall + (wall_ext.granted if wall_ext else 0.0)
 

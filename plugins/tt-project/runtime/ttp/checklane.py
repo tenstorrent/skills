@@ -1116,12 +1116,12 @@ def _holder_key(rec: dict) -> str:
     return f"{rec.get('task') or rec.get('holder') or 'run'}:{rec.get('pid')}:{rec.get('run_since') or rec.get('since')}"
 
 
-def _log_mtime(path: str) -> tuple[float, int] | None:
+def _log_mtime(path: str) -> float | None:
     try:
         st = os.stat(path)
     except OSError:
         return None
-    return st.st_mtime, st.st_size
+    return st.st_mtime
 
 
 def _hung(h: dict, now: float, cfg: dict | None, stat=None) -> bool | None:
@@ -1141,7 +1141,7 @@ def _hung(h: dict, now: float, cfg: dict | None, stat=None) -> bool | None:
     if limit is None:
         est = (h.get("cost") or {}).get("est_s") if isinstance(h.get("cost"), dict) else None
         limit = max(HANG_LOG_MIN_S, float(est) if isinstance(est, (int, float)) and est > 0 else 0.0)
-    return bool(limit > 0 and now - max(float(since), st[0] if st else 0.0) >= limit)
+    return bool(limit > 0 and now - max(float(since), st if st else 0.0) >= limit)
 
 
 def wait_wake(events: list[dict], incident: dict | None, cfg: dict | None, now: float,

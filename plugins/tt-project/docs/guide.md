@@ -2372,7 +2372,7 @@ workers finish with their work kept, as with `ttp drain`. It raises no long-paus
 ## Ramp-up after an outage
 
 When an outage ends (a host reboot, the project or one of its resources resumed, a provider's login,
-budget gate or network back, the lease taken again), new workers do not all start at once. Starts
+budget gate or network back), new workers do not all start at once. Starts
 begin at `budget.ramp_start` (2) workers above those still running and double every
 `budget.ramp_step_s` (180 s) until they pass `budget.max_parallel_workers`. Urgent work is first in
 the pick order, so it takes the first starts. A resumed resource ramps only its own tasks.
