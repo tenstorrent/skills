@@ -307,7 +307,7 @@ def choose(db, cfg: dict, task: dict | None, tier: str, picked: dict | None = No
         ch = chaincap.chain(db, tid) or [task]
         parent = next((a for t in reversed(ch[:-1]) if (a := recorded(db, t["id"]))), None)
         mid, ignored = user_arm(db, task)
-        if mid and not (why := stays(db, cfg, task, tier, picked, policy)):   # the user's order: no coin, no lineage
+        if mid and not stays(db, cfg, task, tier, picked, policy):   # the user's order: no coin, no lineage
             got = {"arm": "glm", "why": f"user msg #{mid}", "seed": s["seed"], "ts": time.time()}
         elif len(ch) > 1:
             got = {"arm": parent["arm"] if parent else "claude", "why": f"lineage of #{ch[0]['id']}"
