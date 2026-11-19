@@ -226,7 +226,7 @@ def test_upgrade_unfinished_merge_line_never_follows_a_symlinked_upgrade_log(env
     assert e.value.code == 1 and "unfinished merge" in err and "refused to append to" in err
     assert target.read_text() == "keep me\n"
     rows = p.db.q("SELECT data FROM events WHERE kind='append_refused'")
-    assert rows and "unfinished merge" in json.loads(rows[0]["data"])["text"]
+    assert any("unfinished merge" in json.loads(r["data"])["text"] for r in rows)
 
 
 def test_automatic_upgrade_launch_never_follows_a_symlinked_upgrade_log(env, tmp_path, monkeypatch):

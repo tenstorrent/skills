@@ -173,3 +173,42 @@ def test_ttp_said_lists_the_newest_matching_user_words_read_only(env, capsys, mo
             con.execute("DELETE FROM messages")
     finally:
         con.close()
+
+
+def test_ttp_said_reads_another_projects_relayed_user_words_read_only(env, capsys, monkeypatch):
+    """A user's lift relayed into another project looked unexplained from here: `--project <name>` and
+    `--all-projects` read those projects' user words too, labelled by project, changing nothing there."""
+    import json as _json
+    from ttp import relay
+    p = make(env)
+    q = _second_project(env, "otherproj")
+    mine = p.db.post("in", "The demo freeze stays on box-a1 for now.", chat=None, kind="user",
+                     provenance="web-session")
+    theirs = q.db.post("in", f"The demo is over, the freeze is lifted.\n{relay.MARK}\nrelayed for the user",
+                       chat=None, kind="user", provenance="cli-legacy")
+    before = q.db.q("SELECT id, handled FROM messages ORDER BY id")
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    assert _ttp_said("demo", "freeze") == 0
+    out = capsys.readouterr().out
+    assert f"#{mine} " in out and "lifted" not in out, "without a flag only this project is read"
+    assert _ttp_said("demo", "freeze", "--project", "otherproj") == 0
+    out = capsys.readouterr().out
+    assert out.splitlines()[0].startswith(f"otherproj msg #{theirs} ") and "freeze is lifted" in out
+    assert "demo msg" not in out
+    assert _ttp_said("demo", "freeze", "--all-projects", "--json") == 0
+    got = _json.loads(capsys.readouterr().out)
+    assert [(m["project"], m["id"]) for m in got] == [("otherproj", theirs), ("demo", mine)], got
+    assert _ttp_said("demo", "--project", "nosuchproj") != 0
+    assert _ttp_said("demo", "--project", "otherproj", "--all-projects") != 0
+    assert q.db.q("SELECT id, handled FROM messages ORDER BY id") == before
+
+
+def test_a_release_hold_prints_the_projects_newest_words_on_a_freeze_first(env, capsys):
+    from ttp import cli, relay
+    p = make(env)
+    said = p.db.post("in", f"The demo is over. The freeze is lifted.\n{relay.MARK}\ncontext", chat=None,
+                     kind="user", provenance="cli-legacy")
+    cli.main(["upgrade", p.name, "--hold", "--until", "2h", "--why", "demo running"])
+    out = capsys.readouterr().out
+    assert f"{p.name} msg #{said} " in out and ("freeze is lifted" in out or "demo is over" in out), out
+    assert out.index(f"msg #{said}") < out.index("release held: demo running")

@@ -8369,30 +8369,68 @@ def cmd_hours(a) -> None:
         sys.exit(0 if ok else 1)
 
 
+def _host_projects() -> list[Project]:
+    """Every project registered on this host whose folder is here, by name."""
+    out = []
+    for name, entry in sorted(load_registry().get("projects", {}).items()):
+        if entry.get("host") in (None, hostname()) and entry.get("dir") and Path(entry["dir"]).is_dir():
+            cand = Project(entry["dir"])
+            if cand.exists():
+                out.append(cand)
+    return out
+
+
+def _said_in(p: Project, query: str, limit: int, since: float = 0.0) -> list[dict]:
+    """The newest user (and relayed user's verbatim) messages of `p` on `query`, read-only (userwords)."""
+    from . import userwords
+    con = userwords.open_ro(p.state / "project.db")
+    try:
+        return userwords.search(con, query, limit=limit, since=since)
+    finally:
+        con.close()
+
+
 def cmd_said(a) -> None:
     """`ttp said <words>`: the newest of the user's own recorded messages on a topic (every word, or
     its ids, aliases and keys with half the words), read-only, with id, date and the verbatim quote
-    (userwords.py). Run it before refusing, blocking or asking on a rule: the newest word wins."""
+    (userwords.py). Run it before refusing, blocking or asking on a rule: the newest word wins.
+    `--project <name>` reads another project's messages on this host instead, `--all-projects` every
+    project here; each match is then labelled `<project> msg #N`. Nothing is written anywhere."""
     import sqlite3
-    from . import userwords
+    if a.project and a.all_projects:
+        die("ttp said: give --project or --all-projects, not both")
     p = here()
-    if p is None:
-        die("ttp said: no project here (run it in a project or its run)")
-    now = time.time()
-    try:
-        con = userwords.open_ro(p.state / "project.db")
+    if a.all_projects:
+        targets = _host_projects()
+        if p is not None and all(t.base.resolve() != p.base.resolve() for t in targets):
+            targets.insert(0, p)
+    elif a.project:
+        q = local_project(a.project)
+        if q is None or not q.exists():
+            die(f"ttp said: no project {a.project!r} on this host")
+        targets = [q]
+    else:
+        if p is None:
+            die("ttp said: no project here (run it in a project or its run)")
+        targets = [p]
+    where = p or (targets[0] if targets else None)
+    since = time.time() - a.days * 86400 if a.days else 0.0
+    found = []
+    for t in targets:
         try:
-            found = userwords.search(con, " ".join(a.words), limit=a.limit,
-                                     since=now - a.days * 86400 if a.days else 0.0)
-        finally:
-            con.close()
-    except sqlite3.Error as e:
-        die(f"ttp said: cannot read the project's messages ({e})", 75)
+            found += [{**m, "project": t.name} for m in _said_in(t, " ".join(a.words), a.limit, since)]
+        except sqlite3.Error as e:
+            if len(targets) == 1:
+                die(f"ttp said: cannot read {t.name}'s messages ({e})", 75)
+            print(f"ttp said: skipped {t.name}: cannot read its messages ({e})", file=sys.stderr)
+    found = sorted(found, key=lambda m: -m["ts"])[:a.limit]
+    labelled = bool(a.project or a.all_projects)
     if a.json:
-        print(json.dumps([{**m, "when": timefmt.long(m["ts"], p)} for m in found]))
+        print(json.dumps([{**m, "when": timefmt.long(m["ts"], where)} for m in found]))
         return
     for m in found:
-        print(f'#{m["id"]} {timefmt.long(m["ts"], p)} "{m["quote"]}"')
+        tag = f'{m["project"]} msg #{m["id"]}' if labelled else f'#{m["id"]}'
+        print(f'{tag} {timefmt.long(m["ts"], where)} "{m["quote"]}"')
     print(f"{len(found)} message{'' if len(found) == 1 else 's'} found (newest first; the newest word on a topic wins)")
 
 
@@ -13834,6 +13872,25 @@ def _cycle_hold(paths: list[str], a, where=None, auto_rec: Project | None = None
         f"(--ignore-cycle-notice proceeds anyway)", cyclenotice.BUSY)
 
 
+HOLD_TOPICS = ("freeze", "frozen", "demo", "hold", "release", "lifted")
+
+
+def _hold_words(p: Project) -> list[str]:
+    """The project's newest user words on a freeze, demo, hold or release (at most 2, read-only), shown
+    before a release hold is set, so a lift already said there (relayed into that project too) is seen."""
+    import sqlite3
+    found: dict[int, dict] = {}
+    for word in HOLD_TOPICS:
+        try:
+            for m in _said_in(p, word, 2):
+                found.setdefault(m["id"], m)
+        except sqlite3.Error:
+            return []
+    newest = sorted(found.values(), key=lambda m: -m["ts"])[:2]
+    return [f'{p.name} msg #{m["id"]} {timefmt.long(m["ts"], p)}: "{m["quote"]}" (the user\'s newest word there '
+            f'on a freeze, demo or hold)' for m in newest]
+
+
 def _release_hold(p: Project, a) -> None:
     """`ttp upgrade <name> --hold --until <time> | --until-probe <cmd> --why <text>`, or `--release`: set or
     lift the project's release hold in this host's tt-project home (release.set_hold)."""
@@ -13846,6 +13903,8 @@ def _release_hold(p: Project, a) -> None:
         return
     if not a.hold:
         die("--until, --until-probe and --why go with --hold")
+    for line in _hold_words(p):
+        print(line)
     try:
         until = ends.parse_expires(a.until, what="--until", max_s=release.HOLD_MAX_S, where=p) if a.until else None
         h = release.set_hold(p.name, a.why or "", until, a.until_probe or "")
@@ -13893,6 +13952,8 @@ def _log_upgrade_invoker(p: Project, a) -> None:
     """One line in the project's logs/upgrade.log at the start of every `ttp upgrade`: the time, the mode,
     the caller's pid and parent command, and who ran it (the run, task and project the env names, else
     'terminal'), so any upgrade can be traced to its caller."""
+    if getattr(p, "logs", None) is None:
+        return
     append_text(p.logs / "upgrade.log",
                 f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} ttp upgrade {p.name} mode={_upgrade_mode(a)} "
                 f"pid={os.getpid()} parent={_parent_command() or '?'} by={_upgrade_invoker()}\n", p)
@@ -16638,6 +16699,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("-n", "--limit", type=int, default=5, help="at most this many messages (default 5)")
     s.add_argument("--days", type=float, default=0, help="look back only this many days (default: all)")
     s.add_argument("--json", action="store_true", help="print the matches as JSON")
+    s.add_argument("--project", metavar="NAME", help="read another project's messages on this host (read-only)")
+    s.add_argument("--all-projects", action="store_true",
+                   help="read every project's messages on this host (read-only), each labelled `<project> msg #N`")
     s.set_defaults(fn=cmd_said)
 
     s = sub.add_parser("model-trip", help="strata the model-pick tripwire sent back to the core model; --h2h "
