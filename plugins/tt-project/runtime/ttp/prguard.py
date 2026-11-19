@@ -923,6 +923,36 @@ def _checks_problem(cwd: str | None = None) -> str | None:
             f"{head[:12] or '(unknown)'}. " + CHECKS_HOW)
 
 
+def _size_problem(args: list[str], stdin_text: str | None, cfg: dict | None, cwd: str | None = None) -> str | None:
+    """Inside a run: why this draft PR is too big to open (ponytail.size_problem at
+    review.ponytail_pr_lines, measured against origin/<--base>, else origin/HEAD); its reason may be in
+    the task's spec or the PR body. None outside a run or when the size is unknown."""
+    run_dir = os.environ.get("TTP_RUN_DIR")
+    if not run_dir:
+        return None
+    from . import ponytail
+    from .prbody import CREATE_VALUES, _scan
+    cfg = _project_config() if cfg is None else cfg
+    if not ponytail.limit(cfg or {}, pr=True):
+        return None
+    opts, _ = _scan(args, CREATE_VALUES)
+    head = _git_out(cwd, "rev-parse", "HEAD")
+    base = opts.get("--base") or opts.get("-B")
+    added = next((n for ref in ([f"origin/{base}"] if base else []) + ["origin/HEAD"]
+                  if (n := ponytail.added_lines(cwd or ".", ref, head)) is not None), None) if head else None
+    text = " ".join(str(opts[k]) for k in ("--body", "-b") if k in opts)
+    for k in ("--body-file", "-F"):
+        if k in opts:
+            try:
+                text += "\n" + (_read_body(opts[k], stdin_text) or "")
+            except ValueError:
+                pass
+    db = _project_db()
+    row = db.task(int(t)) if db and (t := os.environ.get("TTP_TASK", "")).isdigit() else None
+    why = ponytail.size_problem(cfg, added, f"{(row or {}).get('spec') or ''}\n{text}", run_dir, head, pr=True)
+    return f"refused: draft PR too big: {why}" if why else None
+
+
 def _no_reviewers(seen: list | None, text: str) -> str:
     if seen is not None:
         seen.append(("reviewers", sorted(pr_keys(text))))
@@ -961,7 +991,7 @@ def check(args: list[str], real: str, db=None, stdin_text: str | None = None, _d
                 return None
             if any(a in ("-d", "--draft", "--draft=true") for a in more):
                 return (_form_problem("create", more, stdin_text, cfg) or _checks_problem()
-                        or _body_problem("create", more, real, stdin_text, cfg))
+                        or _size_problem(more, stdin_text, cfg) or _body_problem("create", more, real, stdin_text, cfg))
             return "refused: PRs are opened as drafts only; add --draft. " + HOW
         if sub == "ready":
             if "--undo" in more:

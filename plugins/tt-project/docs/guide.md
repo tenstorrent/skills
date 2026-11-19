@@ -457,6 +457,17 @@ coordinator with that evidence.
   project may word the rule that way. The rule sits in its own block of `prompts/kind-review.md`,
   between `<!-- ttp:result-rule -->` marker lines the prompt leaves out: a project that rewords it
   keeps its wording through template upgrades without merge conflicts.
+- Ponytail lane (`review.ponytail_lane`, on by default): a daemon-queued code review also runs a
+  separate ponytail review (skill `tt-ponytail-review`) in a fresh-context subagent on
+  `review.ponytail_model` (default `opus`), and writes its verdict to `ponytail.json` in the run dir.
+  The review counts as passed only when both verdicts pass. A finding that code should not exist fails
+  it, and so does a copied or vendored tree unless the spec has a `vendored: <user msg>` line. A model-free
+  size gate counts added lines (`git diff --numstat`, binaries and `delivery.push_exclude_paths` left
+  out): over `review.ponytail_land_lines` (400) before landing, or `review.ponytail_pr_lines` (200, for
+  repos reached only by pull request, such as another team's tt-metal) before `gh pr create --draft`, a
+  change needs a `why this size: <reason>` line in its spec, hand-off or PR body and a passed lane.
+  The defaults sit near the 95th and 90th percentiles of this repository's own landed changes; 0 turns
+  the gate off.
 - A review judges the diff plus the gate results that already exist for the head it reviews, and
   never starts or waits on a repeat of a test that passed on that head: a further test it wants is a
   finding, and its verdict still goes out. Only the required checks (the suite and any smoke test)

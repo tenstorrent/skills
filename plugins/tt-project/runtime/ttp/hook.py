@@ -170,9 +170,10 @@ NO_BRANCH_ENV = "TTP_NO_BRANCH_ON_RECORD"
 HANDOFF_STATES = ("done", "blocked", "failed", "needs_review", "waiting")
 
 
-def handoff_problem(path: Path) -> str | None:
+def handoff_problem(path: Path, lane: bool | None = None) -> str | None:
     """Why `path` is no hand-off the daemon would take (it reads it with json.loads, as
-    daemon._read_result does), None when it is one."""
+    daemon._read_result does), None when it is one. A ponytail-lane review (`lane`, default its run's
+    ponytail.ENV) hands off done only with a readable lane verdict beside it."""
     try:
         text = path.read_text()
     except FileNotFoundError:
@@ -188,6 +189,11 @@ def handoff_problem(path: Path) -> str | None:
     if data.get("status") not in HANDOFF_STATES:
         return (f"{RESULT_FILE} status {data.get('status')!r} is not a hand-off state "
                 f"({', '.join(HANDOFF_STATES)})")
+    from . import ponytail
+    if data.get("status") == "done" and (ponytail.required() if lane is None else lane) and \
+            (why := ponytail.lane_problem(path.parent)) and not why.startswith(ponytail.FAILED):
+        return (f"{why}: run the ponytail lane (skill tt-ponytail-review, in a fresh-context subagent) and "
+                f"write its verdict to {ponytail.FILE} in the run dir first")
     if "then" in data:
         from . import thenwaits
         if why := thenwaits.problem(data):

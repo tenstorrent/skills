@@ -490,7 +490,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
                "area_fail_cap": 3, "blocked_long_h": 12, "rule_blocks_min": 3, "sweep_after_s": 300,
                "unreviewed_per_pass": None, "unreviewed_max_age_h": 72, "unreviewed_wait_s": 1800,
                "carried_hold_max_h": 24, "auto_fix_rounds": 1, "hop_max": 2,
-               "fork_target": 0.9},   # hourly.py: the share of worker and review runs started from a fork or resume
+               "fork_target": 0.9,   # hourly.py: the share of worker and review runs started from a fork or resume
+               # ponytail.py: a code change's review also runs the ponytail lane on ponytail_model; a change
+               # adding more lines than ponytail_land_lines (landing) or ponytail_pr_lines (a draft PR, the
+               # stricter: other teams' repos) needs a `why this size:` line and a passed lane (0: off).
+               # Defaults from landed history: about p95 of own changes (400), under own p90 for PRs (200).
+               "ponytail_lane": True, "ponytail_model": "opus", "ponytail_land_lines": 400,
+               "ponytail_pr_lines": 200},
     # Continue chains (chaincap): a task_add that continues a lineage past max_hops hops, max_stalls
     # failed or no-progress hops in a row or max_usd spent (0 turns one off), or one in an area under
     # review.area_fail_cap, is refused unless its `reason` names what changed in a tricky turn.

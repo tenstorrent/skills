@@ -46,6 +46,7 @@ from . import glmguard
 from . import glmharness, policyfiles
 from . import deviceab
 from . import deviceshadow
+from . import ponytail
 from . import batchrun
 from . import leadmode
 from . import schedjobs
@@ -4524,6 +4525,8 @@ class Daemon:
                     env[handoffcheck.SENDBACKS_ENV] = f"{used}/{handoffcheck.max_sendbacks(self.cfg)}"
                 # Its hook warns a code hand-off that names no change the daemon could review (hook.handoff_warning).
                 env.pop(NO_BRANCH_ENV, None)   # never an inherited value
+                # A ponytail-lane review hands off done only with the lane's verdict (ponytail.FILE).
+                env[ponytail.ENV] = "1" if role == "reviewer" and ponytail.labelled(row) is not None else ""
                 if role == "worker" and task.get("kind") == "code" \
                         and not (self.p.db.task(task["id"]) or task).get("branch"):
                     env[NO_BRANCH_ENV] = "1"
@@ -8567,7 +8570,10 @@ class Daemon:
             from .hook import handoff_problem
             # A bad `then` or a waits-only `continue:` follow-up (hook.handoff_problem): a provider without a
             # Stop hook gets the session back once to fix it, as one with a hook is refused in-run.
-            if handoff_problem(run_dir / RESULT_FILE) and (redo := self._handoff_resume(r, task, usage, run_dir)):
+            if (bad := handoff_problem(run_dir / RESULT_FILE, lane=task["kind"] == "review"
+                                       and ponytail.labelled(task) is not None)) \
+                    and (redo := self._handoff_resume(r, task, usage, run_dir,
+                                                      f"it ended without a valid hand-off: {bad}")):
                 rstatus, result = None, {}
         # A project's own result rule (`done` plus a verdict): the change must not proceed. The task is
         # stored failed, so its fix and re-review follow and nothing is approved, but the review itself
@@ -8575,6 +8581,17 @@ class Daemon:
         rejects = rstatus == "done" and task["kind"] == "review" and review_rejects(result)
         if rejects:
             rstatus, result = "failed", dict(result, status=CHANGES_NEEDED)
+        elif rstatus == "done" and task["kind"] == "review" and own and (
+                lane := ponytail.gate(self.cfg, task, run_dir, result))[0]:
+            # The ponytail lane failed it, or the change is over the size limit with no reason: its fixes
+            # follow as for any failed review. No verdict at all is a form failure: nothing to fix.
+            why, fix = lane
+            fups = [f for f in result.get("followups") or [] if isinstance(f, dict)]
+            rstatus, result = "failed", dict(
+                result, status=CHANGES_NEEDED if fix else "failed",
+                summary=f"Ponytail lane: {why}. {result.get('summary') or ''}"[:4000],
+                followups=fups + [{"title": f"Fix ponytail finding: {f}"[:200], "spec": f} for f in fix],
+                **{REVIEW_FAILURE_KEY: "substantive" if fix else "approval"})
         if own and rstatus in HANDOFF_STATES and rstatus != "failed" and (
                 cred := _cred_changed(run_dir)):
             # The run's own transcript shows it changed a credential file (credwatch.classify, observed
@@ -21134,6 +21151,17 @@ class Daemon:
                 log(self.p, f"task {task['id']}: its size against its own base was not read: {e}")
             if size := splitgate.review_line(cfg, task, changes, base=based):
                 lines.append(size)
+        lane = None   # the ponytail lane's label, for a code change (sa50: _code_change is the predicate)
+        if ponytail.on(cfg) and self._code_change(task):
+            added = None
+            if not ext and not published and branch and full:
+                try:
+                    added = ponytail.added_lines(self.p.root, worktree.own_base(self.p, task, branch)[0], full,
+                                                 push.exclude_list(d.get("push_exclude_paths")))
+                except Exception as e:
+                    log(self.p, f"task {task['id']}: its added lines were not read: {e}")
+            lines.append(ponytail.spec_line(cfg, added))
+            lane = ponytail.label(added)
         fups = load_result(task.get("result")).get("followups")
         fups = [coord.clip(f["title"], 120) for f in fups if isinstance(f, dict) and f.get("title")] \
             if isinstance(fups, list) else []
@@ -21302,7 +21330,7 @@ class Daemon:
             + ([f"{PRECHECK_LABEL}t{task['id']}-{full[:12]}"] if checks else []) + ([push.REVIEW_ONLY_LABEL] if elsewhere or off or never or ext else []) + ([push.LAND_LABEL] if lands else []) \
             + ([f"pr_branch:{elsewhere}"] if own_step else []) + reviewhold.labels(full, held) \
             + ([extchange.HEAD_LABEL + ext["head"]] if ext else []) \
-            + ([chaincap.SPLIT_REVIEW_LABEL + own_split] if stall else [])
+            + ([chaincap.SPLIT_REVIEW_LABEL + own_split] if stall else []) + ([lane] if lane else [])
         # Read again where the review is added: a cancel or a continuation since the read above wins.
         with db.tx():
             if stale := self._stale_source(task):
@@ -21706,7 +21734,8 @@ class Daemon:
                 integrate.with_members(first.get("spec") or "", [ms[i] for i in ok], tip=(branch, new))]),
             kind="review", tier=rtier, priority=chainprio.of(db, ms[ok[0]], review), origin="daemon",
             budget_usd=float(cfg["budget"]["task_default_usd"].get(rtier, 8.0)), depends_on=ok,
-            labels=[f"continues:{review['id']}"] + ([push.REVIEW_ONLY_LABEL] if only else []),
+            labels=[f"continues:{review['id']}"] + ([push.REVIEW_ONLY_LABEL] if only else [])
+            + ponytail.carried(review, first),
             **(pin_of(review) or {}))
         moved = [] if approved else [t["id"] for t in coord._open_dependents(db, review["id"])]
         if not approved:
@@ -22468,7 +22497,7 @@ class Daemon:
                               depends_on=[fid], labels=[f"auto_review:{fid}", f"continues:{review['id']}",
                                                         f"{FIX_BASE_LABEL}{head}"]
                               + ([push.REVIEW_ONLY_LABEL] if only else []) + ([push.LAND_LABEL] if lands else [])
-                              + ([f"pr_branch:{onto}"] if publish and onto else []),
+                              + ([f"pr_branch:{onto}"] if publish and onto else []) + ponytail.carried(review, first),
                               **(pin_of(review) or pin_of(code)))
             if prfix or hop:
                 owner = (f"failed too. This task is the PR's one fixer: fix its blocking findings as well." if prfix
@@ -22535,7 +22564,8 @@ class Daemon:
                     f"The first review's spec (#{first['id']}):\n{(first.get('spec') or '')[:REVIEW_FIX_SPEC_CHARS]}"]),
                 kind="review", tier=rtier, priority=chainprio.of(db, db.task(fid), review), origin="daemon",
                 budget_usd=float(cfg["budget"]["task_default_usd"].get(rtier, 8.0)),
-                depends_on=[fid], labels=[f"auto_review:{fid}", f"continues:{review['id']}", push.REVIEW_ONLY_LABEL],
+                depends_on=[fid], labels=[f"auto_review:{fid}", f"continues:{review['id']}", push.REVIEW_ONLY_LABEL,
+                                          *ponytail.carried(review, first)],
                 **(pin_of(review) or pin_of(code)))
             db.update_task(fid, spec="\n".join([
                 f"Fix the blocking findings of review #{review['id']} ({review['title']}) on code task "

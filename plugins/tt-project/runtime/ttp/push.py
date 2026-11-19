@@ -49,7 +49,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, unquote
 
-from . import (checkcap, checkdirs, checkspill, checkwait, checklane, cleantree, coordtools, envfault, gatejudge, gatetime, gitcache, ghroute, gitmemo, hoststate, landed, landmark, leakfile, locks, machines, outscan, pooladmit, prguard, prhead, remotecheck, remoteload, repoid, runner, runnerenv, scratchhome,
+from . import (checkcap, checkdirs, checkspill, checkwait, checklane, cleantree, coordtools, envfault, gatejudge, gatetime, gitcache, ghroute, gitmemo, hoststate, landed, landmark, leakfile, locks, machines, outscan, ponytail, pooladmit, prguard, prhead, remotecheck, remoteload, repoid, runner, runnerenv, scratchhome,
                sandbox, scriptwatch, settinghold, setupfault, sharedchecks, shorttmp, slurmcheck, syntaxfault, testslots, timefmt, verified, workerloss, worktree)
 from . import __version__
 from .budget import DOC_SUFFIXES, task_default_usd
@@ -3082,6 +3082,8 @@ def _resolve(p: Project, repo: Path, own: bool = False) -> tuple[str, str, bool]
                          f"its own commits (`git rebase --onto {upstream} {base}`) and rerun")
     if task and (why := code_run_landing(p, task, f"{remote}/{push_to}", d, repo)):
         raise ValueError(why)
+    if task and (why := ponytail_landing(p, task, f"{remote}/{push_to}", d, repo)):
+        raise ValueError(why)
     if m and task and m.group(1) == task:
         if (approved := (approval_marker(p, os.getpid()) or {}).get("sha")) and not code_tasks_may_push(p.config()) \
                 and approved == _git(repo, "rev-parse", "HEAD").stdout.strip() and approved_head(p, approved):
@@ -3104,6 +3106,24 @@ def _resolve(p: Project, repo: Path, own: bool = False) -> tuple[str, str, bool]
         elif why := untested_landing(p, repo, task, d):
             raise ValueError(why)
     return remote, push_to, False
+
+
+def ponytail_landing(p: Project, task: str, upstream: str, d: dict, repo: Path) -> str:
+    """Why task `task`'s run must not land HEAD on `upstream`, or "": a ponytail-lane review whose lane
+    has not passed HEAD, or a change over review.ponytail_land_lines without its reason and a passed lane
+    (ponytail.size_problem; the lane's verdict is in this run's dir)."""
+    row = p.db.task(int(task)) if str(task).isdigit() else None
+    if not row:
+        return ""
+    run_dir, head = os.environ.get("TTP_RUN_DIR"), _git(repo, "rev-parse", "HEAD").stdout.strip()
+    cfg = p.config()
+    if ponytail.labelled(row) is not None and ponytail.on(cfg) and (why := ponytail.lane_problem(run_dir, head)):
+        return f"ttp push: refused, {why}. Landing needs the ponytail lane's pass on HEAD as well as yours"
+    added = ponytail.added_lines(repo, upstream, head, exclude_list(d.get("push_exclude_paths"))) \
+        if ponytail.limit(cfg) else None
+    if why := ponytail.size_problem(cfg, added, str(row.get("spec") or ""), run_dir, head):
+        return f"ttp push: refused, {why}"
+    return ""
 
 
 def code_run_landing(p: Project, task: str, upstream: str, d: dict, repo: Path | None = None) -> str:

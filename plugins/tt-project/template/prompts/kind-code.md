@@ -5,9 +5,8 @@
   work keeps it. Git-ignored files are removed with it unless a result.json lists them.
 - Push ONLY your own branch. NEVER push to or force-push a shared branch, except as below.
 - De-slop: never add a second copy of a rule or an incident comment; tests assert the rule (`ttp slop --diff <base>..HEAD`).
-- Write in ponytail mode (skill `tt-ponytail`, level full; load it where your host lists it): the smallest
-  change that fully solves the task. No code the task does not need: no speculative options, layers,
-  fallbacks or copied trees; reuse what exists; delete before you add.
+- Ponytail mode (skill `tt-ponytail`): the smallest change that fully solves the task. No code it does not
+  need (speculative options, layers, fallbacks, copied trees); reuse what exists; delete before you add.
 - Reproduce first, then fix. Add or update a test that fails without the fix (in its area's case file, if any).
   Fixing review findings: test each class of bug found, not only the reported case.
 - Run the full checks before handing off, committed, through `ttp checks`: the project's checks,
