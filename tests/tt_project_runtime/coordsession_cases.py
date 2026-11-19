@@ -1989,37 +1989,6 @@ def test_resumed_wakes_that_never_reached_the_api_book_nothing(env):
     assert all(c < 0.001 for c in retries), retries
     assert d._session_total_before("C", 1 << 62) == 38.26
 
-def test_runs_booked_at_a_session_s_running_total_are_re_booked_once(env):
-    p = make(env)
-    from ttp.daemon import SESSION_REBOOK_KEY, Daemon
-    d = Daemon(p.base)
-    wake = lambda mode: {"turn": {"session": {"mode": mode, "why": "continued"}}}
-    old = time.time() - 8 * 86400
-    rows = [_cs_claude_run(p, "C", 3.0, wake("resume"), ended=old),   # outside the window
-            _cs_claude_run(p, "C", 4.0, wake("new")), _cs_claude_run(p, "C", 5.5, wake("resume")),
-            _cs_claude_run(p, "C", 6.0, wake("resume")),
-            _cs_claude_run(p, "W", 9.0, {"resumes": {"session": "W"}}, task=7, role="worker"),   # no earlier total
-            _cs_claude_run(p, "N", 0.7, {}, task=8, role="worker")]
-    p.db.x("INSERT INTO tasks(id,title,kind,status,spent_usd) VALUES(7,'t','code','done',20.0)")
-    for r in rows:   # booked the old way: each at its full report
-        total = json.loads((p.runs / str(r["id"]) / "output.jsonl").read_text().splitlines()[1])["total_cost_usd"]
-        p.db.x("UPDATE runs SET cost_usd=?, status='ok' WHERE id=?", (total, r["id"]))
-        p.db.spend("claude", total, "x", ts=r["ended"])
-    ids = [r["id"] for r in rows]
-    ledger = lambda: round(p.db.one("SELECT SUM(usd) s FROM ledger")["s"], 6)
-    assert d.rebook_session_totals(dry_run=True) == [(ids[2], 5.5, 1.5), (ids[3], 6.0, 0.5)]
-    assert ledger() == 28.2 and p.db.kv(SESSION_REBOOK_KEY) is None, "a dry run wrote"
-    assert d.rebook_session_totals() == [(ids[2], 5.5, 1.5), (ids[3], 6.0, 0.5)]
-    cost = {r["id"]: round(r["cost_usd"], 6) for r in p.db.q("SELECT id, cost_usd FROM runs")}
-    assert [cost[i] for i in ids] == [3.0, 4.0, 1.5, 0.5, 9.0, 0.7]
-    assert ledger() == 18.7, "the ledger (dollar caps, global daily total) still counts the old totals"
-    assert json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (ids[3],))["note"])["session_rebooked"] == 6.0
-    assert p.db.kv(SESSION_REBOOK_KEY)["runs"] == 2
-    assert d.rebook_session_totals() is None, "ran twice"
-    p.db.x("DELETE FROM kv WHERE key=?", (SESSION_REBOOK_KEY,))
-    assert d.rebook_session_totals() == [], "a re-booked row was re-booked again"
-    assert ledger() == 18.7
-
 
 def _pc_call(mid, model="claude-opus-5-5", parent=None, **usage):
     """One stream-json line of assistant message `mid` (one content block) with its usage."""
@@ -2220,57 +2189,6 @@ def test_a_finished_claude_resume_books_its_calls_to_its_task_and_the_ledger(env
     assert abs(p.db.one("SELECT COALESCE(SUM(usd),0) s FROM ledger")["s"] - before - 2.0) < 1e-6
 
 
-def test_claude_runs_are_re_booked_once_at_their_per_call_cost(env, tmp_path):
-    """The one-time re-book sets each Claude run of the last 7 days to its calls' list price, up or down,
-    with its task's spend (never below $0) and a signed ledger row at the run's end; a dry run writes
-    nothing, and a second pass changes nothing."""
-    p = make(env)
-    from ttp.daemon import CALLS_REBOOK_KEY, Daemon
-    d = Daemon(p.base)
-    wake = lambda mode: {"turn": {"session": {"mode": mode, "why": "continued"}}}
-    old = time.time() - 8 * 86400
-    p.db.x("INSERT INTO tasks(id,title,kind,status,spent_usd) VALUES(7,'t','code','done',1.0)")
-    p.db.x("INSERT INTO tasks(id,title,kind,status,spent_usd) VALUES(8,'u','code','done',0.5)")
-    rows = [_pc_run(p, "C", 3.0, wake("resume"), [_pc_call("o", output_tokens=10_000)], ended=old),   # outside
-            _pc_run(p, "W", 1.0, {}, [_pc_call("u", output_tokens=100_000)], task=7, role="worker"),   # under: $2.00
-            _pc_run(p, "C", 7.0, wake("resume"), [_pc_call("v", output_tokens=20_000)]),   # over: $0.40
-            _pc_run(p, "F", 9.0, {"coord_context": {"how": "fork"}}, [_pc_call("f", output_tokens=5_000)],
-                    task=8, role="worker"),   # over: $0.10, its task's $0.50 floors at $0
-            _pc_run(p, "M", 0.6, {}, [_pc_call("m", output_tokens=30_000)], task=7, role="worker"),   # right already
-            _cs_claude_run(p, "L", 2.5, {}, task=7, role="worker")]   # no per-call usage: kept
-    cut = _cs_claude_run(p, "K", 0.0, {}, task=7, role="worker")   # cut off before its first call: kept
-    (p.runs / str(cut["id"]) / "output.jsonl").write_text(json.dumps({"type": "system", "subtype": "init"}) + "\n")
-    none = {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
-    lost = _pc_run(p, "G", 38.26, {"coord_context": {"how": "fork"}}, [], task=7, role="worker",
-                   result_usage=none)   # a fork that never reached the API: $0
-    logged = _pc_run(p, "T", 0.5, {}, [_pc_call("t", output_tokens=7)], task=7, role="worker")
-    _pc_log(p, tmp_path / "cfg", logged, "T", [("t", "claude-opus-5-5", 50_000)])   # its final usage: $1.00
-    rows += [cut, lost, logged]
-    for r, booked in zip(rows, (3.0, 1.0, 7.0, 9.0, 0.6, 2.5, 0.3, 38.26, 0.5)):
-        p.db.x("UPDATE runs SET cost_usd=?, status='ok' WHERE id=?", (booked, r["id"]))
-        p.db.spend("claude", booked, "x", ts=r["ended"])
-    ids = [r["id"] for r in rows]
-    ledger = lambda: round(p.db.one("SELECT SUM(usd) s FROM ledger")["s"], 6)
-    want = [(ids[1], 1.0, 2.0), (ids[2], 7.0, 0.4), (ids[3], 9.0, 0.1), (ids[7], 38.26, 0.0), (ids[8], 0.5, 1.0)]
-    assert d.rebook_per_call(dry_run=True) == want
-    assert ledger() == 62.16 and p.db.kv(CALLS_REBOOK_KEY) is None, "a dry run wrote"
-    assert d.rebook_per_call() == want
-    cost = {r["id"]: round(r["cost_usd"], 6) for r in p.db.q("SELECT id, cost_usd FROM runs")}
-    assert [cost[i] for i in ids] == [3.0, 2.0, 0.4, 0.1, 0.6, 2.5, 0.3, 0.0, 1.0]
-    assert ledger() == 9.9, "the ledger (dollar caps, global daily total) does not sum the per-call cost"
-    signed = sorted((round(x["usd"], 6), x["ts"]) for x in p.db.q("SELECT usd, ts FROM ledger WHERE source!='x'"))
-    assert signed == sorted([(1.0, rows[1]["ended"]), (-6.6, rows[2]["ended"]), (-8.9, rows[3]["ended"]),
-                             (-38.26, rows[7]["ended"]), (0.5, rows[8]["ended"])])
-    assert (round(p.db.task(7)["spent_usd"], 6), p.db.task(8)["spent_usd"]) == (0.5, 0.0), "below $0"
-    note = json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (ids[2],))["note"])
-    assert (note["calls_rebooked"], note["cost_calls"], note["reported_usd"]) == (7.0, 1, 7.0)
-    assert p.db.kv(CALLS_REBOOK_KEY)["runs"] == 5
-    assert d.rebook_per_call() is None, "ran twice"
-    p.db.x("DELETE FROM kv WHERE key=?", (CALLS_REBOOK_KEY,))
-    assert d.rebook_per_call() == [], "a re-booked row was re-booked again"
-    assert ledger() == 9.9
-
-
 def test_a_running_runs_session_log_is_read_from_where_the_last_pass_ended(tmp_path):
     """Metering a run still going reads each session log once, then only the bytes added since (a line still
     being written waits for the next pass); a log that shrank or was replaced is read again from its start."""
@@ -2318,55 +2236,6 @@ def test_a_lost_or_failed_fork_or_resume_books_nothing_whatever_its_result_repor
         events[-1].update(subtype="error_during_execution", is_error=True)
         out.write_text("".join(json.dumps(e) + "\n" for e in events))
     assert (_cs_finish(p, d, fork), _cs_finish(p, d, resume), _cs_finish(p, d, failed)) == (0.0, 0.0, 2.0)
-
-
-def test_the_per_call_re_book_of_a_large_backlog_runs_in_slices_with_the_totals_of_one_pass(env, tmp_path):
-    """The one-time re-book runs as a tick step in bounded slices: each stops after its run cap, keeps its place,
-    and the slice that ends sets the done marker; the runs, their costs and the ledger end as one pass leaves
-    them, and runs ending meanwhile are not part of it."""
-    import shutil
-    from ttp.daemon import CALLS_REBOOK_KEY, CALLS_REBOOK_PROGRESS_KEY, Daemon
-    results = []
-    for sliced in (False, True):
-        p = make(env) if not sliced else p
-        if sliced:   # the same backlog again: reset what the one pass wrote
-            shutil.rmtree(p.runs)
-            p.db.x("DELETE FROM runs")
-            p.db.x("DELETE FROM ledger")
-            p.db.x("DELETE FROM kv WHERE key IN (?,?)", (CALLS_REBOOK_KEY, CALLS_REBOOK_PROGRESS_KEY))
-        d = Daemon(p.base)
-        rows = []
-        for i in range(30):
-            r = _pc_run(p, f"S{i:02d}", 3.0, {"turn": {"session": {"mode": "resume", "why": "continued"}}},
-                        [_pc_call(f"m{i}", output_tokens=1000 * (i + 1))])
-            p.db.x("UPDATE runs SET cost_usd=3.0, status='ok' WHERE id=?", (r["id"],))
-            p.db.spend("claude", 3.0, "x", ts=r["ended"])
-            rows.append(r)
-        if not sliced:
-            changed = d.rebook_per_call()
-            slices = 1
-        else:
-            changed, slices = d.rebook_per_call(max_runs=4), 1
-            assert len(changed) == 4 and p.db.kv(CALLS_REBOOK_KEY) is None
-            assert p.db.kv(CALLS_REBOOK_PROGRESS_KEY)["cursor"] == rows[3]["id"]
-            late = _pc_run(p, "Z", 3.0, {}, [_pc_call("z", output_tokens=1000)])   # ends meanwhile
-            p.db.x("UPDATE runs SET cost_usd=3.0, status='ok' WHERE id=?", (late["id"],))
-            while True:
-                got = d.rebook_per_call(max_runs=4)
-                if got is None:
-                    break
-                changed, slices = changed + got, slices + 1
-                assert slices < 20
-            assert p.db.one("SELECT cost_usd FROM runs WHERE id=?", (late["id"],))["cost_usd"] == 3.0
-            assert p.db.kv(CALLS_REBOOK_PROGRESS_KEY) is None
-        done = p.db.kv(CALLS_REBOOK_KEY)
-        cost = [round(p.db.one("SELECT cost_usd FROM runs WHERE id=?", (r["id"],))["cost_usd"], 6) for r in rows]
-        ledger = round(p.db.one("SELECT SUM(usd) s FROM ledger")["s"], 6)
-        results.append((sorted(changed), cost, ledger, done["runs"], round(done["usd_after"], 6), slices))
-    whole, sliced = results
-    assert whole[5] == 1 and sliced[5] == 8 and d.rebook_per_call() is None
-    assert [x[1:] for x in whole[0]] == [x[1:] for x in sliced[0]] and whole[1:5] == sliced[1:5]
-    assert whole[3] == 30 and whole[1][0] == 0.02
 
 
 def test_coordsession_wakes_booked_at_the_running_total_are_re_netted_once(env):
