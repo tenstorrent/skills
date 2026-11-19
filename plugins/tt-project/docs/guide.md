@@ -3145,7 +3145,8 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   the tt-project test suite lists its 15 slowest test calls just above its `ttp-suite:` line. Every check runs in a
   pinned Python env the harness owns, the user site off, so `pip install --user` never changes what a check imports;
   `checks.python_lock` (project setting, default the plugin's lock of pytest and pytest-xdist) names its lock, and
-  `ttp checks --freeze-lock <file>` writes one that pins the user site's packages too (tt-project-harness
+  `ttp checks --freeze-lock <file>` writes one that pins the user site's packages too, to which a project adds
+  extra check tools such as a linter as exact pins (tt-project-harness
   push-checks reference, "The pinned Python env"). Each check also runs in a throwaway HOME of its run, here and on
   other hosts, with `checks.home_files` (default `[".gitconfig"]`, never a credential) copied in;
   `checks.scratch_home false` gives a project's checks the real HOME. `checks.wrap_cmd` (project setting, default unset) runs each command given after `ttp checks --`
