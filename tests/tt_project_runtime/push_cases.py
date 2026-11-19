@@ -14483,7 +14483,8 @@ def test_a_code_tasks_run_never_pushes_to_the_push_branch_while_code_tasks_may_p
         "hookSpecificOutput", {}).get("permissionDecision")
     assert deny("/usr/bin/git push origin HEAD:proj") == "deny"
     assert deny("cd x && env /usr/bin/git -C . push") == "deny"
-    assert deny("git push origin HEAD:proj") is None and deny("/usr/bin/git log --oneline") is None
+    assert deny("/usr/bin/git log --oneline") is None and deny(f"git push origin {own}") is None
+    assert deny("git push origin HEAD:proj") == "deny"   # plain git too: ruleguard's landing_push rule
     out = git_push("origin", own)
     assert out.returncode == 0, out.stderr
     assert _git_out(origin, "rev-parse", own) == _git_out(repo, "rev-parse", "HEAD")

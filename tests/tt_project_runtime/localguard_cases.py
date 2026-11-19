@@ -340,7 +340,9 @@ def test_the_guards_defaults_keep_local_and_protected_paths():
     # DEFAULT_CONFIG once held two "guards" keys: the later {"protected_paths": []} replaced {"local": []},
     # so guards.local had no default and `ttp config guards.local <string>` was saved unchecked.
     from ttp import project as proj
-    assert proj.DEFAULT_CONFIG["guards"] == {"local": [], "protected_paths": [], "user_site": "auto"}
+    assert proj.DEFAULT_CONFIG["guards"] == {"local": [], "protected_paths": [], "user_site": "auto", "off": [],
+                                             "slurm": False}
+    assert "guards.off needs a JSON list" in (proj.key_type_problem("guards.off", "landing_push") or "")
     assert "guards.local needs a JSON list" in (proj.key_type_problem("guards.local", "x.py") or "")
     assert "guards.protected_paths needs a JSON list" in (proj.key_type_problem("guards.protected_paths", "x") or "")
 

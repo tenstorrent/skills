@@ -6684,6 +6684,14 @@ _IDLE_RESET_REFUSED = [
 ]
 
 
+def test_a_user_only_setting_is_named_by_its_key_not_by_a_plain_last_word():
+    from ttp.coordinator import _names_needs_user
+    for said in ("set guards.off to []", "turn the guards off", "sandbox checks on?", "routine mode", "raise daily_usd"):
+        assert _names_needs_user(said), said
+    for said in ("Turn box-a off and back on?", "which mode?", "the checks passed", "the tools work"):
+        assert not _names_needs_user(said), said
+
+
 @pytest.mark.parametrize("text,fields", _IDLE_RESET_REFUSED)
 def test_an_ask_to_reset_an_idle_machine_the_project_holds_is_refused(env, text, fields):
     from ttp import machines, unblock

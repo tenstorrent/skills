@@ -7915,9 +7915,16 @@ _MONEY_RE = re.compile(r"\$|\b(?:budget|spend\w*|usd|dollars?|funds?|billing|pai
 
 
 def _names_needs_user(said: str) -> bool:
-    """True when the text names a setting only the user may change (NEEDS_USER), by key or by its last part."""
+    """True when the text names a setting only the user may change (NEEDS_USER), by key or by its last part. A
+    last part that is a plain word (off, mode, checks) counts only after its parent ("guards off", "sandbox checks"),
+    so "turn it off" names no setting."""
     low = said.lower()
-    return any(k in low or re.search(rf"\b{re.escape(k.rsplit('.', 1)[-1])}\b", low) for k in NEEDS_USER)
+    for k in NEEDS_USER:
+        parent, _, last = k.rpartition(".")
+        name = re.escape(last) if "_" in last or not parent else rf"{re.escape(parent.rsplit('.', 1)[-1])}[ ._-]{re.escape(last)}"
+        if k in low or re.search(rf"\b{name}\b", low):
+            return True
+    return False
 
 
 def _reversible_ask(a: dict, text: str, least: str = "") -> tuple[str, str] | None:
