@@ -22,13 +22,14 @@ provider (route.eligible keeps them on core); the A/B only acts on the Claude co
 Flip: a stable hash of (seed, project, task id) picks the arm, recorded on the task as device_ab:<arm> before
 its first run and kept on every later run. A tier-up retry runs on the control arm and is marked on its run.
 
-Stop: a real device incident (an event of an incident kind, or a watcher observation naming a hang, reset,
-recovery, power cycle or hold, that carries the run's task id or names a device resource the run held; never a
-coordinator action, audit, flag or note) during a test-arm run or within INCIDENT_AFTER_S after it stops the
-test arm at once
+Stop: a real device incident on a device a test-arm run changed (an event of an incident kind naming it, or a
+watcher observation naming a hang, reset, recovery, power cycle or hold on it or citing the run; never a recovery
+or serving-again report, an event about another device, a coordinator action, audit, flag or note) during the run
+or within INCIDENT_AFTER_S after it stops the test arm at once
 (STOP_KV; each tick re-tests a recorded stop against this rule and lifts one that no longer qualifies, with a
 device_ab event): its open tasks run on the control arm, new tasks are excluded, and the daemon raises one high event to
-the project's coordinator.
+the project's coordinator. A run that only read state (a question or report task, `read:` resources) is never
+charged. A re-armed start skips events at or before the stop it cleared.
 
 Review: each finished A/B task gets one masked review task (Opus at high effort, REVIEW_LABEL) that scores
 answered-what-was-asked and conclusions-supported-by-logs, 0-4 each; the spec never names the arm or model.
@@ -62,6 +63,12 @@ INCIDENT_KINDS = frozenset({"machine_condition", "machine_condition_held", "mach
                             "resource_trouble", "heal_failed"})
 INCIDENT_KIND = re.compile(r"^(?:device|broker)_(?:hang|hung|fault|reset|timeout|incident|down|error|failed|power\w*)$")
 INCIDENT = re.compile(r"(?i)\b(hang|hangs|hung|reset|resets|recover(?:y|ed|ing|ies)?|power[- ]?cycl\w*|hold)\b")
+# A health report that a device is back: not an incident unless the same line names a fault.
+RECOVERED = re.compile(r"(?i)\b(serv(?:es|ing|ed)\s+again|back\s+(?:up|online|in\s+service)|healthy\s+again|"
+                       r"recovered|after\s+recovery)\b")
+FAULT = re.compile(r"(?i)\b(hang|hangs|hung|stuck|fault\w*|fail\w*|error\w*|timeout|timed\s+out|down|crash\w*)\b")
+# Tasks that only read state: never charged with an incident.
+READ_ONLY_TITLE = re.compile(r"(?i)^\s*(?:\W*\w+:\s*)?(?:report|status)\b")
 REVIEW_MODEL = {"model": "opus", "effort": "high"}
 SCORE_KEYS = ("answered", "supported")
 ANSWER = re.compile(r'"device_ab_scores"\s*:\s*\{[^{}]*\}')
@@ -163,12 +170,14 @@ def _kv(db, key: str) -> dict:
 
 def start(db, s: dict, now: float | None = None) -> dict:
     """The A/B's start {"ts", "sig"}: recorded the first time this setting is seen; a new setting (other
-    projects, arms or seed) starts a new A/B and lifts an old stop."""
+    projects, arms or seed) starts a new A/B and lifts an old stop; events at or before that stop ("after") stay
+    spent and never stop the new one."""
     got = _kv(db, START_KV)
     if got.get("sig") == s["sig"] and isinstance(got.get("ts"), (int, float)):
         return got
+    old = stopped(db).get("ts")
     got = {"ts": float(s["start"] if s.get("start") is not None else now if now is not None else time.time()),
-           "sig": s["sig"]}
+           "sig": s["sig"], **({"after": float(old)} if isinstance(old, (int, float)) else {})}
     db.set_kv(START_KV, got)
     db.set_kv(STOP_KV, {})
     return got
@@ -308,9 +317,12 @@ def _note(run: dict) -> dict:
 
 
 def device_names(task: dict, cfg: dict | None) -> list[str]:
-    """The task's resource names that are devices: a `*-device` lock, a configured device lock or a machine
-    tagged `device`. A resource every task names (a project host with no device tag) is not one."""
+    """The devices the task may change: its write resources (never `read:` ones) that are a `*-device` lock, a
+    configured device lock or a machine tagged `device`. A resource every task names (a project host with no device
+    tag) is not one; a task that only reads state (a question, a report or status task) changes none."""
     from . import effort, locks, machines
+    if task.get("kind") == "question" or READ_ONLY_TITLE.match(str(task.get("title") or "")):
+        return []
     names = [n for n in effort._resource_names(task) if n]
     out = [n for n in names if n.endswith("-device")]
     try:
@@ -338,7 +350,7 @@ def names_affected(text: str, name: str) -> bool:
     n = re.escape(name)
     whole = re.compile(rf"(?<![\w.-]){n}(?!\w)")
     for line in text.splitlines():
-        if not (whole.search(line) and INCIDENT.search(line)):
+        if not (whole.search(line) and INCIDENT.search(line)) or (RECOVERED.search(line) and not FAULT.search(line)):
             continue
         for pat in BYSTANDER:
             line = re.sub(pat.format(n=n), " ", line, flags=re.I)
@@ -348,22 +360,23 @@ def names_affected(text: str, name: str) -> bool:
 
 
 def incident_event(e: dict, run_task: Any, names: list[str], run_id: Any = None) -> bool:
-    """Whether event `e` is a real device or machine incident of run `run_id` of task `run_task` that held the
-    device resources `names`. Two shapes count, never a coordinator action, audit, flag, digest, note or chat event
-    and never a daemon-written observation:
-    - an event of an incident kind, carrying the run's task id or naming a device resource the run held;
+    """Whether event `e` is a real device or machine incident of run `run_id` of task `run_task` that changed the
+    devices `names` (device_names). A run that changed none is never charged, nor is a recovery or serving-again
+    report. Two shapes count, never a coordinator action, audit, flag, digest, note or chat event and never a
+    daemon-written observation:
+    - an event of an incident kind naming a device the run changed (its task id alone is not enough: trouble on
+      another host lists the tasks it holds up);
     - an observation from a device or machine watcher naming a hang, reset, recovery, power cycle or hold that
       cites the run's task or run id, or else cites no other task and names a device resource the run held as
       affected (names_affected): a fleet report listing the device as paused, healthy, checked or as a box that
       cannot reach another is not about it, and the event's task column alone is not enough.
-    A host name every task mentions is not enough, and a run with no device resource is tied only by its task id
-    on an incident-kind event. A notice about another task (a deferral, a retest, a review) is never one."""
+    A host name every task mentions is not enough. A notice about another task (a deferral, a retest, a review) is never one."""
     kind, text = str(e.get("kind") or ""), str(e.get("text") or "")
     hay = text + " " + str(e.get("data") or "")
+    if not names or (RECOVERED.search(text) and not FAULT.search(text)):
+        return False
     if kind in INCIDENT_KINDS or INCIDENT_KIND.match(kind):
-        if e.get("task") is not None and run_task is not None and int(e["task"]) == int(run_task):
-            return True
-        return any(n in hay for n in names)
+        return any(re.search(rf"(?<![\w.-]){re.escape(n)}(?!\w)", hay) for n in names)
     if not (kind == "observation" and INCIDENT.search(text)):
         return False
     source = str(e.get("source") or "")
@@ -380,9 +393,10 @@ def incident_event(e: dict, run_task: Any, names: list[str], run_id: Any = None)
     return any(names_affected(report, n) for n in names)
 
 
-def find_incident(db, cfg: dict, s: dict, since: float, now: float) -> dict | None:
+def find_incident(db, cfg: dict, s: dict, since: float, now: float, after: float = 0.0) -> dict | None:
     """A device incident on a test-arm run that started after `since`: {"task", "run", "event", "text"}, else None.
-    Only real incident events tied to the run's own device count (incident_event)."""
+    Only real incident events after `after` (a cleared stop) tied to a device the run changed count
+    (incident_event)."""
     runs = db.q("SELECT id, task, started, ended, note FROM runs WHERE started>=? AND note LIKE ? ORDER BY id",
                 (since, f'%"{KEY}"%'))
     for r in runs:
@@ -392,8 +406,10 @@ def find_incident(db, cfg: dict, s: dict, since: float, now: float) -> dict | No
         task = db.task(int(r["task"])) if r.get("task") else None
         names = device_names(task or {}, cfg)
         until = (float(r["ended"]) if r.get("ended") else now) + INCIDENT_AFTER_S
-        for e in db.q("SELECT id, source, kind, text, data, task FROM events WHERE ts>=? AND ts<=? "
-                      "AND kind NOT LIKE 'device_ab%'", (float(r["started"] or 0), until)):
+        if not names:
+            continue
+        for e in db.q("SELECT id, source, kind, text, data, task FROM events WHERE ts>=? AND ts>? AND ts<=? "
+                      "AND kind NOT LIKE 'device_ab%'", (float(r["started"] or 0), after, until)):
             if incident_event(e, r["task"], names, r["id"]):
                 return {"task": r["task"], "run": r["id"], "event": e["id"], "text": str(e.get("text") or "")[:300]}
     return None
@@ -480,7 +496,7 @@ def tick(db, cfg: dict, now: float | None = None) -> dict:
     new_stop = lifted = None
     if stop := stopped(db):
         lifted = recheck_stop(db, cfg, s, stop, now) or None
-    if not stopped(db) and (hit := find_incident(db, cfg, s, st["ts"], now)):
+    if not stopped(db) and (hit := find_incident(db, cfg, s, st["ts"], now, float(st.get("after") or 0))):
         new_stop = {"ts": now, "arm": s["test"], **hit}
         db.set_kv(STOP_KV, new_stop)
     return {"stop": new_stop, "lifted": lifted, "reviews": queue_reviews(db, s, st["ts"], second=second_reviewer(cfg))}

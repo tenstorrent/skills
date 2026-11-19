@@ -333,12 +333,11 @@ def test_device_ab_a_coordinator_action_naming_the_host_is_not_a_device_incident
                    source=source)
     got = deviceab.tick(p.db, cfg, 2700.0)
     assert got["stop"] is None and not deviceab.stopped(p.db)
-    # Even a real incident kind about the host alone does not stop a run that held no device resource ...
+    # Even a real incident kind about the host, carrying the run's own task id, does not stop a run that changed
+    # no device.
     _dab_event(p, "machine_condition", "hostx: reset after a hang")
-    assert deviceab.tick(p.db, cfg, 2800.0)["stop"] is None
-    # ... unless it carries the run's own task id.
     _dab_event(p, "resource_trouble", "hostx: a hang", task=tid)
-    assert deviceab.tick(p.db, cfg, 2900.0)["stop"]["task"] == tid
+    assert deviceab.tick(p.db, cfg, 2900.0)["stop"] is None
 
 
 def test_device_ab_a_real_device_hang_on_the_runs_device_resource_stops_the_test_arm(env):
@@ -461,3 +460,51 @@ def test_device_ab_and_shadow_review_specs_carry_a_read_budget_not_read_them_all
         assert blindreview.READ_BUDGET in spec
         assert "about 15 tool calls" in spec and "at most 3 cited facts" in spec
         assert "read them all" not in spec and "where you can read them" not in spec
+
+
+def test_device_ab_a_run_that_only_read_state_or_a_recovery_report_never_stops_the_test_arm(env):
+    from ttp import deviceab
+    p = make(env)
+    cfg = _dab_cfg(p)
+    tid, rid = _dab_sonnet_run(p, cfg, ["resource:box-a-device", "needs_device"])
+    back = "box-a-device serves again; hold cleared after recovery"
+    _dab_event(p, "observation", back, source="watcher:fleet-health")
+    _dab_event(p, "machine_condition", "box-a-device recovered, back online")
+    assert deviceab.tick(p.db, cfg, 2700.0)["stop"] is None   # a recovery report is not an incident
+    hang = {"kind": "observation", "source": "watcher:fleet-health", "text": "box-a-device: chip hang, reset needed"}
+    assert deviceab.incident_event(hang, tid, deviceab.device_names(p.db.task(tid), cfg), rid)
+    # A question, a report task or `read:` resources change no device: nothing is charged to them.
+    for upd in ({"kind": "question"}, {"title": "Report box-a-device health"},
+                {"labels": ["read:box-a-device", "needs_device"]}):
+        task = dict(p.db.task(tid), **upd)
+        assert deviceab.device_names(task, cfg) == [] and not deviceab.incident_event(hang, tid, [], rid)
+
+
+def test_device_ab_trouble_on_another_box_never_stops_a_run_that_changed_box_a(env):
+    from ttp import deviceab
+    p = make(env)
+    cfg = _dab_cfg(p)
+    tid, _ = _dab_sonnet_run(p, cfg, ["resource:box-a-device", "needs_device"])
+    # Trouble on box-b lists the tasks it holds up, this one too: still not this run's incident.
+    _dab_event(p, "resource_trouble", "box-b-device: chip hang, 3 failures", task=tid)
+    _dab_event(p, "machine_condition", "box-b-device: reset after a hang", data='{"resource": "box-b-device"}')
+    assert deviceab.tick(p.db, cfg, 2700.0)["stop"] is None
+
+
+def test_device_ab_a_state_changing_run_stops_only_within_the_window_and_a_re_arm_skips_the_cleared_stop(env):
+    from ttp import deviceab
+    p = make(env)
+    cfg = _dab_cfg(p)
+    tid, rid = _dab_sonnet_run(p, cfg, ["resource:box-a-device", "needs_device"])
+    _dab_event(p, "machine_condition", "box-a-device: chip hang", ts=2600.0 + deviceab.INCIDENT_AFTER_S + 1)
+    assert deviceab.tick(p.db, cfg, 9000.0)["stop"] is None   # past the window after the run
+    eid = _dab_event(p, "machine_condition", "box-a-device: chip hang, reset needed")
+    got = deviceab.tick(p.db, cfg, 9100.0)["stop"]
+    assert (got["task"], got["run"], got["event"]) == (tid, rid, eid)
+    # A re-armed start (new setting, same window start) lifts the stop and skips the events at or before it.
+    re = _dab_cfg(p, max_tasks=135, start=1000)
+    assert deviceab.tick(p.db, re, 9200.0)["stop"] is None and not deviceab.stopped(p.db)
+    assert deviceab.start(p.db, deviceab.settings(re), 9300.0)["after"] == 9100.0
+    tid2, _ = _dab_sonnet_run(p, re, ["resource:box-a-device", "needs_device"], started=9400.0, ended=9500.0)
+    new = _dab_event(p, "machine_condition", "box-a-device: chip hang", ts=9450.0)
+    assert deviceab.tick(p.db, re, 9600.0)["stop"]["event"] == new
