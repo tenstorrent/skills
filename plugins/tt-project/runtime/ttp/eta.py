@@ -816,6 +816,13 @@ def row_estimate(db, est: _Est, t: dict, now: float) -> dict:
     return corrected(db, with_p90(est, est.task(t["id"]), t["id"]), now)
 
 
+def row_item(db, est: _Est, t: dict, now: float) -> tuple[str, str, dict]:
+    """Task `t`'s (ref, kind, estimate) as etaledger.record takes it."""
+    from . import etaledger
+    e = row_estimate(db, est, t, now)
+    return f"t{t['id']}", etaledger.kind_of(db, e), e
+
+
 def state_lines(db, where, now: float | None = None, host=None, skip=()) -> list[str]:
     """The STATE section: each urgent open task and each open promise with its expected finish. `host`:
     a task's started-on-host state (onhost.line), shown after its estimate. `skip`: task ids shown
@@ -835,8 +842,8 @@ def state_lines(db, where, now: float | None = None, host=None, skip=()) -> list
     same: dict[tuple[str, str, bool], list[tuple[dict, dict]]] = {}
     for t in hot:
         on = host(t) if host else ""
-        e = row_estimate(db, est, t, now)
-        given.append((f"t{t['id']}", etaledger.kind_of(db, e), e))
+        given.append(row_item(db, est, t, now))
+        e = given[-1][2]
         why = str(e["why"] or "").removeprefix(f"#{t['id']} ")
         if why and not on:
             same.setdefault((str(e.get("after") or ""), why, bool(e.get("gated"))), []).append((t, e))

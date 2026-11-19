@@ -11043,24 +11043,29 @@ class Daemon:
                               lambda m: log(self.p, m))
             self.observe("daemon:process-churn", obs["text"], obs["severity"], whole=True, key=obs["key"])
 
-    def check_eta_rows(self, every_s: float = 600) -> None:
-        """Model-free ETA ledger watch (etaledger.missing_rows): an urgent task dispatched within `eta.row_alarm_h`
-        hours that a coordinator wake has seen, with an estimate, yet no ETA row raises one normal observation."""
+    def check_eta_rows(self, every_s: float = 120) -> None:
+        """Model-free ETA ledger writer and watch: first the task ETA rows due between coordinator wakes
+        (etaledger.write_rows); then an urgent task dispatched within `eta.row_alarm_h` hours that a coordinator
+        wake has seen, with an estimate, yet still no ETA row raises one normal observation (etaledger.missing_rows)."""
         now = time.time()
         if now - getattr(self, "_eta_rows_checked", 0.0) < every_s:
             return
         self._eta_rows_checked = now
         from . import etaledger
         try:
+            etaledger.write_rows(self.p.db, self.p, now)
+        except Exception as e:   # a broken estimate never stops the loop; the alarm below still runs
+            log(self.p, f"eta rows write failed: {e}")
+        try:
             gone = etaledger.missing_rows(self.p.db, self.p, now)
-        except Exception as e:   # a broken estimate never stops the loop
+        except Exception as e:
             log(self.p, f"eta rows check failed: {e}")
             return
         if gone:
             ids = ", ".join(f"#{t['id']}" for t in gone)
             self.observe("daemon:eta-rows", f"ETA ledger: urgent task(s) {ids} were dispatched and have an estimate, "
-                         f"but no task ETA row was written since; the ETA writer (eta.state_lines) is not recording "
-                         f"them.", "normal", key="eta-rows-missing")
+                         f"but no task ETA row was written since; the ETA writers (eta.state_lines, "
+                         f"etaledger.write_rows) are not recording them.", "normal", key="eta-rows-missing")
 
     def check_self_watch(self) -> None:
         """Model-free watch on this host and this project's own process tree (selfwatch): one snapshot

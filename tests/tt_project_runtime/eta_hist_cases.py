@@ -226,7 +226,7 @@ def test_eta_shadow_leaves_out_a_pair_delivered_before_its_eta_was_written(env):
     assert sh["count"] == 1 and sh["hist"]["median"] == pytest.approx(400)
 
 
-def test_eta_row_alarm_flags_only_a_covered_task_with_no_row_and_clears_once_written(env):
+def test_eta_row_alarm_flags_only_a_covered_task_with_no_row_and_clears_once_written(env, monkeypatch):
     import types
     from ttp import daemon, eta, etaledger
     p = make(env)
@@ -247,6 +247,10 @@ def test_eta_row_alarm_flags_only_a_covered_task_with_no_row_and_clears_once_wri
     assert [t["id"] for t in etaledger.missing_rows(p.db, p, now)] == [hot]
     seen = []
     fake = types.SimpleNamespace(p=p, observe=lambda *a, **k: seen.append((a, k)))
+
+    def broken(*a):
+        raise RuntimeError("writer down")
+    monkeypatch.setattr(etaledger, "write_rows", broken)   # a failed model-free writer still lets the alarm run
     daemon.Daemon.check_eta_rows(fake)
     assert len(seen) == 1 and seen[0][0][0] == "daemon:eta-rows" and f"#{hot}" in seen[0][0][1]
     assert seen[0][0][2] == "normal" and seen[0][1]["key"] == "eta-rows-missing"
@@ -275,3 +279,39 @@ def test_eta_row_alarm_follows_the_writer_when_the_corrected_estimate_disagrees(
     assert etaledger.missing_rows(p.db, p, now) == []
     eta.state_lines(p.db, p, now)
     assert not any(r.get("ref") == f"t{tid}" for r in etaledger.read(p.db))
+
+
+def test_eta_rows_written_model_free_between_wakes_for_covered_tasks_only(env, monkeypatch):
+    import types
+    from ttp import daemon, etaledger
+    p = make(env)
+    now = time.time()
+    _eh_runs(p, now, "work", [600] * 6)
+
+    def running(title, priority):
+        tid = p.db.add_task(title, "s", kind="work", priority=priority, status="running")
+        p.db.x("UPDATE tasks SET created=? WHERE id=?", (now - 70, tid))
+        p.db.x("INSERT INTO runs(task, role, started, status) VALUES(?, 'worker', ?, 'running')", (tid, now - 60))
+        return tid
+    hot, cold = running("urgent", 1), running("routine", 3)
+    seen = []
+    fake = types.SimpleNamespace(p=p, observe=lambda *a, **k: seen.append((a, k)))
+    # No coordinator wake at all: the daemon's own pass writes the row, the same one STATE would.
+    daemon.Daemon.check_eta_rows(fake)
+    rows = [r for r in etaledger.read(p.db) if r.get("ref", "").startswith("t")]
+    assert [(r["ref"], r["src"]) for r in rows] == [(f"t{hot}", "daemon")]
+    assert rows[0]["shown"] > now and seen == []
+    # Only the first row: later passes add none while it stands (moves are STATE's to record at a wake).
+    fake._eta_rows_checked = 0.0
+    daemon.Daemon.check_eta_rows(fake)
+    assert len([r for r in etaledger.read(p.db) if r.get("ref") == f"t{hot}"]) == 1
+    assert not any(r.get("ref") == f"t{cold}" for r in etaledger.read(p.db))
+    # An urgent task whose estimate has no end (waits on outside work) still gets no row.
+    later = running("urgent outside", 1)
+    real = etaledger.shown
+    monkeypatch.setattr(etaledger, "shown", lambda db, e, n, kind: {**real(db, e, n, kind), "why": "waits on outside work"})
+    assert etaledger.write_rows(p.db, p, now) == 0
+    assert not any(r.get("ref") == f"t{later}" for r in etaledger.read(p.db))
+    p.set_config("eta.ledger", False)
+    monkeypatch.setattr(etaledger, "shown", real)
+    assert etaledger.write_rows(p.db, p, now) == 0

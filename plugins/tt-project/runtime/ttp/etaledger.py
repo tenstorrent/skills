@@ -222,6 +222,34 @@ def record(db, where, items: list[tuple[str, str, dict]], now: float, src: str =
     return len(rows)
 
 
+def _rowless(db) -> list[dict]:
+    """The tasks the row rule covers (eta.row_tasks) with no task ETA row since they were created."""
+    from . import eta
+    hot = eta.row_tasks(db)
+    if not hot:
+        return []
+    have: dict[str, float] = {}
+    for r in read(db):
+        if "shown" in r:
+            have[r["ref"]] = max(have.get(r["ref"], 0.0), float(r["ts"]))
+    return [t for t in hot if have.get(f"t{t['id']}", 0.0) < float(t["created"] or 0)]
+
+
+def write_rows(db, where, now: float) -> int:
+    """Model-free task ETA rows between coordinator wakes: each task the row rule covers that has no row yet gets
+    the one STATE would record (eta.row_item, through record()), so an urgent task estimated and finished between
+    two wakes still has its row. A task with no finite estimate still gets none. Returns the rows added."""
+    if cfg(where).get("ledger") is False:
+        return 0
+    todo = _rowless(db)
+    if not todo:
+        return 0
+    from . import eta
+    refresh(db, where, now)
+    est = eta._Est(db, now, core=eta.core_of(where), delivery=eta.delivery_of(where))
+    return record(db, where, [eta.row_item(db, est, t, now) for t in todo], now, src="daemon")
+
+
 def missing_rows(db, where, now: float) -> list[dict]:
     """The open tasks the row rule covers that have no ETA row: urgent (the first ten, as state_lines takes
     them), first dispatched within `row_alarm_h` hours, seen by a coordinator wake since, with an estimate
@@ -233,23 +261,16 @@ def missing_rows(db, where, now: float) -> list[dict]:
         win = ROW_ALARM_H * 3600
     if c.get("ledger") is False or win <= 0:
         return []
-    from . import eta
-    hot = eta.row_tasks(db)
-    if not hot:
-        return []
-    have: dict[str, float] = {}
-    for r in read(db):
-        if "shown" in r:
-            have[r["ref"]] = max(have.get(r["ref"], 0.0), float(r["ts"]))
     out, est = [], None
-    for t in hot:
+    for t in _rowless(db):
         first = db.one("SELECT MIN(started) s FROM runs WHERE task=? AND role!='coordinator' AND started IS NOT NULL",
                        (t["id"],))
         s = float(first["s"]) if first and first["s"] else None
-        if s is None or s < now - win or have.get(f"t{t['id']}", 0.0) >= float(t["created"] or 0):
+        if s is None or s < now - win:
             continue
         if not db.one("SELECT 1 x FROM runs WHERE role='coordinator' AND started>? LIMIT 1", (s,)):
             continue   # no digest since its dispatch: the writer has not had its chance yet
+        from . import eta
         if est is None:
             est = eta._Est(db, now, core=eta.core_of(where), delivery=eta.delivery_of(where))
         if rowable(eta.row_estimate(db, est, t, now), now):
