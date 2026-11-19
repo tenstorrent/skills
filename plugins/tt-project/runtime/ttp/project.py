@@ -439,10 +439,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # verdict and a device or machine run starts at least at this tier and effort, never
                     # on the chat provider ('standard/high'; 'off' turns the floor off).
                     "conclusion_floor": {"tier": "standard", "effort": "high"}},
-    # eta: the independent check of a big ETA (etacheck.py): `min_tasks` 3 owner tasks or `min_hours` 4 h queue one
-    # urgent review-kind checker; `check_route`: "review" (the review route), a tier (light, standard) or
-    # {"tier", "provider", "model", "effort"}, never max (#3106); `enabled` false turns it off.
-    "eta": {"enabled": True, "min_tasks": 3, "min_hours": 4.0, "check_route": "review", "max_files": 12, "attempts": 2},
     "notify": {"slack": False, "slack_min_severity": "high", "chat_min_severity": "normal",
                "hourly_status": True,   # hourly.py: the hourly status table (web app; main chat with chat_status)
                # chat_status: the chat digest and the hourly table go to chats too; chat_cost_alarm: the

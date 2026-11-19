@@ -59,7 +59,6 @@ from . import (   # one name per line: two changes adding names merge without a 
     dispatchguard,
     echoes,
     eta,
-    etacheck,
     effort,
     ends,
     failover,
@@ -1757,7 +1756,6 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
             f"## The user's latest words on blocked items: {len(lines) - 1} lines (as last turn; apply them)")
     section("promises", obligations.promise_lines(db, now, home, p.name))
     section("eta", safe_eta(lambda: eta.state_lines(db, p, now, host=lambda t: onhost.line(p, t, now)), []))
-    section("etacheck", safe_eta(lambda: etacheck.state_lines(db, p, now), []))
     section("stops", safe_eta(lambda: onhost.stop_lines(p, now), []))
     section("tool_steer", safe_eta(lambda: costlevers.steer_lines(p), []))   # rings.coord_wake_settle: only with it on
     lines = []
@@ -4511,10 +4509,6 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
         notes += obligations.adopt(p, {t: c for t, c in batch_tasks.items() if t in added})
     except Exception as e:
         notes.append(f"promise not adopted: {type(e).__name__}: {str(e)[:200]}")
-    try:   # a big ETA (3+ tasks or over 4 h) gets an independent check queued at once (etacheck.py)
-        notes += etacheck.sweep(db, p)
-    except Exception as e:
-        notes.append(f"ETA check not queued: {type(e).__name__}: {str(e)[:200]}")
     try:   # a reply already went out: tracking its claims never undoes or rejects it
         notes += obligations.record_claims(p, claimed, new_tasks)
     except Exception as e:
