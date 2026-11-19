@@ -176,12 +176,13 @@ def test_chatbridge_counts_tool_input_errors_once_and_junk_per_answer(mock_chat)
         assert _post(b, {**turn, "stream": True})[0] == 200
         assert _post(b, {"max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]})[0] == 200
         assert _post(b, {"max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]})[0] == 200
-        st = b.stats()
+        st, scanned = b.stats(), b.usage["scanned"]
     # t1 counted once (Bash's own failure is no input error); "getById" is no standalone ById.
     assert st["bad_output"]["tool_input_errors"] == 1
     assert st["bad_output"]["junk_responses"] == 3
     assert st["bad_output"]["junk_hits"] == {"AMEAME": 2, "U+FFFD": 1, "paren_run": 1}
     assert st["bad_output"]["args_unparsed"] == 1 and st["bad_output"]["empty_content"] == 1
+    assert scanned == 6, "every answer scanned, so a clean run reads as measured"
     from ttp import chatbridge
     assert chatbridge.args_unparsed("[1]") and not chatbridge.args_unparsed("")
     assert not chatbridge.args_unparsed('{"a": 1}{"b": 2}'), "two objects back to back: the first is sent"

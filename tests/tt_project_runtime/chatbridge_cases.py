@@ -4244,7 +4244,8 @@ def test_chatbridge_relays_openai_calls_with_their_own_tools_and_counts_usage(mo
     assert first["model"] == second["model"] == "up-model" and first["tools"] == [tool]
     assert first["reasoning_effort"] == "high" and up.seen[0]["auth"] == f"Bearer {_CB_KEY}"
     assert second["stream_options"] == {"include_usage": True}
-    assert stats["usage"] == {"calls": 2, "input_tokens": 90, "output_tokens": 10, "cache_read_input_tokens": 40}
+    assert stats["usage"] == {"calls": 2, "input_tokens": 90, "output_tokens": 10, "cache_read_input_tokens": 40,
+                              "scanned": 2}
     assert _CB_KEY not in json.dumps(stats)
 
 

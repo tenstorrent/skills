@@ -24,11 +24,19 @@ tasks plus the tasks whose first worker run started in the BASE_DAYS before its 
 ended with no review open) and the baseline has BASE_MIN; "worse" when the GLM review first-pass rate is lower
 by more than `route.glm_work.worse_pts` (WORSE_PTS) points, its failed-or-reopened rate higher by more, or any
 device incident on a GLM run; else "ok".
+
+Bad output by day (bad_output): each GLM run's exit record (the chat bridge's stats, chatbridge.JUNK_PATTERNS
+and the counters beside it) summed per home-zone day of its start: tool calls Claude Code rejected for bad
+input, tool arguments that did not parse, answers with reasoning only, and answers holding junk; each with
+its rate per answer (the answers the bridge scanned, usage.scanned) and the runs it hit. A run with no exit
+record (still running, or killed) or from a bridge before these counters is not counted, never shown as clean. The daily review lists the last BAD_DAYS days.
 """
 from __future__ import annotations
 
 import bisect
+import datetime
 import json
+from pathlib import Path
 
 from . import glmassist, route
 
@@ -38,6 +46,8 @@ ARM_KV = "glm_work_arm:"          # kv glm_work_arm:<task id>: {"arm": "glm" | "
 CODE_ARM_KV = "code_arm:"         # codearm.ARM_KV
 MIN_TASKS, WORSE_PTS, BASE_DAYS, BASE_MIN = 25, 15.0, 14, 5
 CHUNK = 500
+BAD_KEYS = ("tool_input_errors", "args_unparsed", "empty_content", "junk_responses")   # chatbridge stats bad_output
+BAD_DAYS = 7
 
 
 def on_glm(provider, model: str, note) -> bool:
@@ -213,7 +223,7 @@ def _requeued(db, since: float) -> set[int]:
 def report(p, since: float, now: float) -> dict:
     """The project's GLM share by role and quality per arm over [since, now) (the module doc)."""
     days, db, cfg = max(0.0, now - since) / 86400, p.db, p.config()
-    rows = db.q("SELECT id, task, role, provider, model, started, ended, note FROM runs WHERE started>=? AND started<?",
+    rows = db.q("SELECT id, task, role, provider, model, started, ended, note, dir FROM runs WHERE started>=? AND started<?",
                 (since, now))
     tasks = _tasks(db, (r["task"] for r in rows))
     roles = {k: {"runs": 0, "glm_runs": 0, "hours": 0.0, "glm_hours": 0.0} for k in ROLES}
@@ -248,7 +258,59 @@ def report(p, since: float, now: float) -> dict:
     return {"project": p.name, "since": since, "until": now, "days": days, "total": total, "roles": roles,
             "arms": arms, "claude_usd_per_day": round(float(usd or 0) / days, 2) if days > 0 else None,
             "corrections": {"n": len(corr), "per_arm": None,
-                            "note": "a correction names no task, so it is counted per project; kept 7 days"}}
+                            "note": "a correction names no task, so it is counted per project; kept 7 days"},
+            "bad_output": bad_output(p, rows)}
+
+
+def _bridge_of(p, r) -> dict | None:
+    """A run's exit-record bridge stats ({} when it had none), None when it has no exit record yet."""
+    d = Path(r["dir"]) if r["dir"] else p.runs / str(r["id"])
+    try:
+        got = json.loads((d / "exit.json").read_text())
+    except (OSError, ValueError):
+        return None
+    b = got.get("bridge") if isinstance(got, dict) else None
+    return b if isinstance(b, dict) else {}
+
+
+def bad_output(p, rows) -> list[dict]:
+    """The GLM runs' bad output per home-zone day, oldest first (the module doc)."""
+    from . import timefmt
+    tz, days = timefmt.zone(p), {}
+    for r in rows:
+        b = _bridge_of(p, r) if on_glm(r["provider"], r["model"], r["note"]) else None
+        scanned = (b or {}).get("usage", {}).get("scanned") if isinstance((b or {}).get("usage"), dict) else None
+        if not isinstance(scanned, int):
+            continue   # no exit record, or a bridge from before the counters: not measured, never a zero
+        day = datetime.datetime.fromtimestamp(float(r["started"] or 0), tz).strftime("%Y-%m-%d")
+        v = days.setdefault(day, {"day": day, "runs": 0, "answers": 0, "runs_hit": 0, **{k: 0 for k in BAD_KEYS}})
+        bad = b.get("bad_output") if isinstance(b.get("bad_output"), dict) else {}
+        n = {k: int(bad.get(k) or 0) for k in BAD_KEYS}
+        v["runs"] += 1
+        v["answers"] += scanned
+        v["runs_hit"] += any(n.values())
+        for k in BAD_KEYS:
+            v[k] += n[k]
+    for v in days.values():
+        v["pct"] = {k: round(100.0 * v[k] / v["answers"], 2) if v["answers"] else None for k in BAD_KEYS}
+    return [days[d] for d in sorted(days)]
+
+
+def bad_lines(got: list[dict]) -> list[str]:
+    """One line per day of bad_output's list."""
+    pct = lambda v: "-" if v is None else f"{v:g}%"   # noqa: E731
+    return [f"{v['day']}: {v['runs']} GLM runs, {v['answers']} answers; tool input errors {v['tool_input_errors']} "
+            f"({pct(v['pct']['tool_input_errors'])}), args unparsed {v['args_unparsed']} ({pct(v['pct']['args_unparsed'])}), "
+            f"reasoning-only {v['empty_content']} ({pct(v['pct']['empty_content'])}), junk {v['junk_responses']} "
+            f"({pct(v['pct']['junk_responses'])}); runs hit {v['runs_hit']}" for v in got]
+
+
+def daily_lines(p, now: float) -> list[str]:
+    """The daily review's lines: the last BAD_DAYS days of bad_output; [] with no GLM run in them."""
+    since = now - BAD_DAYS * 86400
+    rows = p.db.q("SELECT id, task, role, provider, model, started, ended, note, dir FROM runs WHERE started>=? "
+                  "AND started<?", (since, now))
+    return bad_lines(bad_output(p, rows))
 
 
 def text(s: dict) -> str:
@@ -266,6 +328,9 @@ def text(s: dict) -> str:
                      f"{q['bounces']} bounced, {q['incidents']} device incidents on GLM runs")
     lines.append(f"  Claude ${s['claude_usd_per_day'] or 0:.2f}/day; user corrections {s['corrections']['n']} "
                  "(per project: a correction names no task)")
+    if s.get("bad_output"):
+        lines.append("  GLM bad output by day (rate per answer):")
+        lines += [f"    {x}" for x in bad_lines(s["bad_output"])]
     return "\n".join(lines)
 
 

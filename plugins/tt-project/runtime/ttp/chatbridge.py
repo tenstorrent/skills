@@ -884,7 +884,8 @@ class Bridge:
         self.busy_retries = BUSY_RETRIES if busy_retries is None else int(busy_retries)
         self.busy_wait_s = BUSY_WAIT_S if busy_wait_s is None else float(busy_wait_s)
         # Passed-through OpenAI calls' usage (relay): their agents report none Claude-style, so the bridge counts.
-        self.usage = {"calls": 0, "input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0}
+        # `scanned`: answers _scan read for bad output, so a run's zero counts are told from a run never measured.
+        self.usage = {"calls": 0, "input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0, "scanned": 0}
         self.busy = {"waits": 0, "waited_s": 0.0, "gave_up": 0}   # capacity waits (busy_wait), for stats()
         # After this many model_missing answers, later calls get the 404 here, never upstream (0: no cap; a
         # bench row sets it so a withdrawn model's agents stop calling the endpoint: tbcycle.MISSING_MAX).
@@ -1291,6 +1292,8 @@ class Bridge:
     def _scan(self, parts) -> None:
         """Count one answer's bad output (its (kind, text) parts, joined per kind; stats()): junk by pattern,
         tool arguments that do not parse, and an answer that is reasoning only."""
+        with self._swap_lock:
+            self.usage["scanned"] += 1
         if not parts:
             return
         by: dict[str, list[str]] = {}

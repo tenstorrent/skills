@@ -122,3 +122,39 @@ def test_glm_share_judge_waits_for_enough_glm_tasks_then_compares_with_the_proje
     v = glmshare.judge(p, cfg, now)
     assert (v["state"], v["n"]) == ("worse", 6) and "lower by more than 15 points" in v["why"] and "50.0% of 6" in v["why"]
     assert glmshare.judge(p, {"route": {"glm_work": {"min_tasks": 3, "worse_pts": 40}}}, now)["state"] == "ok"
+
+
+def test_glm_share_counts_bad_output_per_day_from_glm_runs_exit_records(env):
+    """#3660: the bridge's bad-output counters (tool input errors, unparsed arguments, reasoning-only and junk
+    answers) per home-zone day, with a rate per answer and the runs hit; `ttp stats --glm-share` and the daily
+    review show them. Claude runs and runs with no exit record are not counted."""
+    from ttp import glmshare
+    p = make(env)
+    now = 1_000_000_000.0 + 30 * 86400
+    t1, t2 = now - 30 * 3600, now - 3 * 3600
+
+    def run(start, bridge, provider="chat", model=_GS_GLM):
+        rid = _gs_run(p, None, start, 1, provider=provider, model=model)
+        d = p.runs / str(rid)
+        d.mkdir(parents=True, exist_ok=True)
+        if bridge is not None:
+            (d / "exit.json").write_text(json.dumps({"rc": 0, "bridge": bridge}))
+        return rid
+
+    run(t1, {"usage": {"calls": 40, "scanned": 40},
+             "bad_output": {"tool_input_errors": 1, "args_unparsed": 1, "empty_content": 0,
+                            "junk_responses": 2, "junk_hits": {"AMEAME": 2}}})
+    run(t1 + 60, {"usage": {"calls": 60, "scanned": 60}})                       # clean
+    run(t1 + 90, {"usage": {"calls": 70}})                                     # before the counters: not counted
+    run(t2, {"usage": {"calls": 50, "scanned": 50}, "bad_output": {"empty_content": 1}})
+    run(t2, {"usage": {"calls": 9}, "bad_output": {"junk_responses": 9}}, provider="claude", model="opus")
+    run(t2, None)                                                             # no exit record yet
+    s = glmshare.report(p, now - 2 * 86400, now)
+    days = s["bad_output"]
+    assert [d["runs"] for d in days] == [2, 1] and [d["answers"] for d in days] == [100, 50]
+    assert (days[0]["tool_input_errors"], days[0]["args_unparsed"], days[0]["junk_responses"], days[0]["runs_hit"]) == (1, 1, 2, 1)
+    assert days[0]["pct"]["junk_responses"] == 2.0 and days[1]["pct"]["empty_content"] == 2.0
+    out = glmshare.text(s)
+    assert "GLM bad output by day" in out and "junk 2 (2%); runs hit 1" in out
+    lines = glmshare.daily_lines(p, now)
+    assert len(lines) == 2 and "reasoning-only 1 (2%)" in lines[1]

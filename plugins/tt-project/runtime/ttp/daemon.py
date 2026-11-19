@@ -10712,6 +10712,14 @@ class Daemon:
                 spec += self._waste_ledger(db)
             except Exception as e:   # nor must the waste ledger
                 log(self.p, f"waste ledger failed: {type(e).__name__}: {e}")
+            try:
+                from . import glmshare
+                if bad := glmshare.daily_lines(self.p, time.time()):
+                    spec += (f"\n\nGLM bad output by day (last {glmshare.BAD_DAYS} d; tool calls rejected for bad input, "
+                             "unparsed tool arguments, reasoning-only answers, junk answers; rate per answer):\n"
+                             + "\n".join(f"- {line}" for line in bad))
+            except Exception as e:   # nor must the GLM bad-output lines
+                log(self.p, f"GLM bad output lines failed: {type(e).__name__}: {e}")
         if payload.get("audit_report", s["name"] == "daily-review"):
             try:
                 from . import machine_ledger
