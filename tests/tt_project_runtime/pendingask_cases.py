@@ -97,4 +97,4 @@ def test_skill_rule_present():
     role = (plugin / "template" / "prompts" / "coordinator.md").read_text()
     assert "To the user an ask is `ask <id>`, never `#<id>`, quoted in full while open" in role
     guide = (plugin / "docs" / "guide.md").read_text()
-    assert "An open ask is shown in full wherever it waits on the user (user msg #2424)" in guide
+    assert "An open ask is shown in full wherever it waits on the user" in guide
