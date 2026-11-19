@@ -287,7 +287,7 @@ def test_an_order_asked_for_today_or_now_is_due_the_same_day(env, monkeypatch):
     at = datetime(2026, 11, 19, 10, 0, tzinfo=timezone.utc).timestamp()
     late = datetime(2026, 11, 19, 22, 30, tzinfo=timezone.utc).timestamp()
     ids = []
-    for text, ts in (("fix the queue today", at), ("do it now!", late), ("please build the deliverable", at)):
+    for text, ts in (("fix the queue today", at), ("do it now!", late), ("keep the old route for now.", at)):
         ids.append(p.db.post("in", text, chat="c1"))
         p.db.x("UPDATE messages SET ts=? WHERE id=?", (ts, ids[-1]))
     notes = [ob.add_order(p, "x", m, [tid], due=ts + 26 * 3600, action_class="change", now=ts)

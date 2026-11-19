@@ -1964,7 +1964,7 @@ ORDER_CLASSES = ("read", "change", "device")
 ORDER_START_S = 1800          # an order with no start_by: its owner's run starts within this after the message
 # Words asking for it the same day: such an order is due by the end of the message's home-zone day (or
 # SAME_DAY_MIN_S after it, sent late), never later, so an urgent ask is not promised for tomorrow.
-SAME_DAY = re.compile(r"\b(today|tonight|asap|right (now|away)|immediately|urgent(ly)?)\b|\bnow\b(?=\s*[!.?]|\s*$)",
+SAME_DAY = re.compile(r"\b(today|tonight|asap|right (now|away)|immediately|urgent(ly)?)\b|(?<!\bfor )\bnow\b(?=\s*[!.?]|\s*$)",
                       re.I | re.M)
 SAME_DAY_MIN_S = 4 * 3600
 CLAIM_WAIT_S = 1800           # a claim's probe that cannot answer (75, timeout) past its due: failed after this
