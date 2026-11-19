@@ -478,41 +478,76 @@ def _push_url(argv: list, remote: str = "origin") -> str:
 
 
 def test_push_over_ssh_survives_a_global_reverse_push_rewrite(env, monkeypatch):
-    """No https login here and a global url.https://github.com/.pushInsteadOf=git@github.com: rule (it
-    sends ssh pushes over https): an ssh-stored remote used to resolve to https, since pushInsteadOf
-    rules do not chain; push_argv now pins each GitHub remote's ssh form as its pushurl on the command
-    line, for an https-stored remote too, and leaves a logged-in host's push and every config file as
+    """No https login here and global reverse rules (url.https://github.com/.pushInsteadOf=git@github.com:
+    for every repo, an insteadOf for one): an ssh-stored remote used to resolve to https, since rewrites
+    do not chain; push_argv names each stored GitHub URL whole in its own ssh:// rule on the command
+    line, an explicit pushurl included, and leaves a logged-in host's push and every config file as
     they were."""
     from ttp import ghroute
     _ssh, _gh, repo = _no_login_here(env, monkeypatch)
     gitconfig = env["tmp"] / "gitconfig-reverse"
     subprocess.run(["git", "config", "--file", str(gitconfig), "url.https://github.com/.pushInsteadOf",
                     "git@github.com:"], check=True)
+    subprocess.run(["git", "config", "--file", str(gitconfig), "url.https://github.com/acme/pinned.insteadOf",
+                    "git@github.com:acme/pinned"], check=True)
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(gitconfig))
     git = lambda *a: subprocess.run(["git", "-C", str(repo), *a], check=True)
     git("remote", "add", "ssh-stored", "git@github.com:acme/gadgets.git")
-    git("remote", "add", "pinned", "https://github.com/acme/pinned.git")
-    git("config", "remote.pinned.pushurl", "git@github.com:acme/pinned-push.git")
+    git("remote", "add", "pinned", "git@github.com:acme/pinned.git")
+    git("config", "remote.pinned.pushurl", "https://github.com/acme/pinned.git")
     git("remote", "add", "elsewhere", "https://example.com/acme/other.git")
     before_cfg = (gitconfig.read_text(), (repo / ".git" / "config").read_text())
     old = lambda r: ["git", "-c", "url.git@github.com:.pushInsteadOf=https://github.com/", "-C", str(repo), "push", r, "main"]
     assert _push_url(old("ssh-stored"), "ssh-stored") == "https://github.com/acme/gadgets.git", "the fault reproduces"
     ssh = ghroute.push_argv(["git", "-C", str(repo), "push", "ssh-stored", "main"])
-    assert "remote.ssh-stored.pushurl=git@github.com:acme/gadgets.git" in ssh, ssh
-    assert _push_url(ssh, "ssh-stored") == "git@github.com:acme/gadgets.git"
-    https = ghroute.push_argv(["git", "-C", str(repo), "push", "origin", "main"])
-    assert _push_url(old("origin")) == "git@github.com:acme/widgets.git"
-    assert _push_url(https) == "git@github.com:acme/widgets.git"
-    # a remote with its own pushurl keeps it alone (no second push URL); a non-GitHub remote is untouched
-    assert not any("remote.pinned." in a or "remote.elsewhere." in a for a in https), https
-    assert _push_url(https, "pinned") == "git@github.com:acme/pinned-push.git"
-    assert _push_url(https, "elsewhere") == "https://example.com/acme/other.git"
-    assert "url.git@github.com:.pushInsteadOf=https://github.com/" in https, "a push naming a URL keeps the rule"
+    assert _push_url(ssh, "ssh-stored") == "ssh://git@github.com/acme/gadgets.git"
+    assert _push_url(ssh) == "ssh://git@github.com/acme/widgets.git"
+    assert _push_url(ssh, "pinned") == "ssh://git@github.com/acme/pinned.git", "an explicit https pushurl"
+    assert _push_url(ssh, "elsewhere") == "https://example.com/acme/other.git"
+    assert not any(a.startswith("remote.") for a in ssh), "no second push URL"
     assert (gitconfig.read_text(), (repo / ".git" / "config").read_text()) == before_cfg, "a config file was written"
     # a logged-in host pushes as it is
     monkeypatch.setattr(ghroute, "_https_login", lambda repo: True)
     argv = ["git", "-C", str(repo), "push", "ssh-stored", "main"]
     assert ghroute.push_argv(argv) == argv
+
+
+def test_https_fetch_without_login_or_agent_stays_https_with_the_helper_reset(env, monkeypatch):
+    """No https login and no ssh agent with a key (a daemon has no SSH_AUTH_SOCK): a fetch, pull or
+    ls-remote of a public GitHub repo is not sent to ssh, which would need a key; it runs as given with
+    the credential helper reset, so gh's is never asked. A push still goes over ssh, and with an agent a
+    fetch does too."""
+    from ttp import ghroute
+    _ssh, _gh, repo = _no_login_here(env, monkeypatch)
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(env["tmp"] / "gitconfig"))
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+    d = env["tmp"] / "agent"
+    d.mkdir()
+    (d / "ssh-add").write_text("#!/bin/sh\nexit 2\n")
+    (d / "ssh-add").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{d}:{os.environ['PATH']}")
+    ghroute._memo.clear()
+    for verb in ("fetch", "pull", "ls-remote"):
+        argv = ["git", "-C", str(repo), verb, "origin"]
+        assert ghroute.push_argv(argv) == ["git", "-c", "credential.https://github.com.helper=", *argv[1:]], verb
+    # the reset reaches github.com only: git still asks another host's helper (unscoped or its own)
+    asked = env["tmp"] / "asked"
+    helper = d / "helper"
+    helper.write_text(f"#!/bin/sh\necho \"$0 $1\" >> {asked}\n")
+    helper.chmod(0o755)
+    reset = ghroute.push_argv(["git", "-C", str(repo), "fetch", "origin"])[1:3]
+    for host in ("github.com", "git.example.com"):
+        subprocess.run(["git", "-c", f"credential.helper={helper}", "-c", f"credential.https://{host}.helper={helper}",
+                        *reset, "credential", "fill"], input=f"protocol=https\nhost={host}\n\n", text=True,
+                       capture_output=True, timeout=20, env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": ""})
+        assert (asked.read_text().count("get") if asked.exists() else 0) == (0 if host == "github.com" else 2), host
+    assert _push_url(ghroute.push_argv(["git", "-C", str(repo), "push", "origin", "main"])) == \
+        "ssh://git@github.com/acme/widgets.git"
+    (d / "ssh-add").write_text("#!/bin/sh\nexit 0\n")
+    ghroute._memo.clear()
+    fetch = ghroute.push_argv(["git", "-C", str(repo), "fetch", "origin"])
+    assert "url.ssh://git@github.com/.insteadOf=https://github.com/" in fetch, "with an agent a fetch goes over ssh"
+    assert ghroute.push_argv(["git", "-C", str(repo), "status"]) == ["git", "-C", str(repo), "status"]
 
 
 def test_ask_gate_refuses_a_gh_login_ask_on_a_remote_host(env):
@@ -539,12 +574,15 @@ def test_https_push_without_login_goes_over_the_ssh_form_and_its_failure_names_t
     _ssh, _gh, repo = _no_login_here(env, monkeypatch)
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(env["tmp"] / "gitconfig"))   # no credential helper
     argv = ghroute.push_argv(["git", "-C", str(repo), "push", "origin", "main"])
-    assert argv[1:3] == ["-c", "url.git@github.com:.pushInsteadOf=https://github.com/"], argv
-    assert ghroute.push_argv(["git", "-C", str(repo), "fetch", "origin"])[1] == "-C", "only a push"
+    assert argv[1:5] == ["-c", "url.ssh://git@github.com/.insteadOf=https://github.com/",
+                         "-c", "url.ssh://git@github.com/.pushInsteadOf=https://github.com/"], argv
+    assert _push_url(argv) == "ssh://git@github.com/acme/widgets.git"
+    status = ["git", "-C", str(repo), "status"]
+    assert ghroute.push_argv(status) == status, "a command that talks to no remote is as it is"
     seen = []
     monkeypatch.setattr(gitmemo, "_spawn", lambda a, t, kw: seen.append(list(a)))
     gitmemo._run(["git", "-C", str(repo), "push", "origin", "main"])
-    assert "url.git@github.com:.pushInsteadOf=https://github.com/" in seen[0], seen
+    assert "url.ssh://git@github.com/.pushInsteadOf=https://github.com/" in seen[0], seen
     url = subprocess.run(["git", "-C", str(repo), "remote", "get-url", "origin"], capture_output=True, text=True)
     assert url.stdout.strip() == "https://github.com/acme/widgets.git", "the stored remote was edited"
     assert not (env["tmp"] / "gitconfig").exists() or "credential" not in (env["tmp"] / "gitconfig").read_text()
@@ -666,6 +704,49 @@ def test_gh_workstation_runs_only_its_allowlist_and_never_resends_a_lost_write(e
     assert [e["key"] for e in ghqueue.take()] == [key]
     assert ghqueue.take(now=time.time() + ghqueue.CLAIM_S + 1) == []
     assert "it was not sent again" in json.loads((d / f"{key}.done").read_text())["stderr"]
+
+
+def test_gh_workstation_push_reaches_github_over_ssh_and_never_asks_the_credential_helper(env, monkeypatch):
+    """delivery.gh_route "workstation", no https login here, git's github.com credential helper the run's
+    gh wrapper (`gh auth git-credential`, off the workstation's allowlist) and a remote stored as ssh
+    with an explicit https pushurl and a user's reverse rules: ttp push's reach check (ls-remote of the
+    push side), its fetch and the push itself go over ssh and never ask the helper, so no token reaches
+    this host; `gh auth git-credential` and other gh commands off the allowlist are still refused."""
+    from ttp import ghqueue, ghroute, gitmemo
+    _cfg, repo, _gh, _ws_calls = _workstation(env, monkeypatch)
+    monkeypatch.setattr(ghroute, "_ssh_agent", lambda: True)   # Quad's case: the forwarded agent answers
+    d = env["tmp"] / "cred"
+    d.mkdir()
+    asked, dialed = d / "asked", d / "dialed"
+    (d / "gh").write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{asked}"\nexit 1\n')
+    (d / "ssh").write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{dialed}"\nexit 128\n')
+    for f in ("gh", "ssh"):
+        (d / f).chmod(0o755)
+    gitconfig = env["tmp"] / "gitconfig-ws"
+    subprocess.run(["git", "config", "--file", str(gitconfig), "url.https://github.com/.pushInsteadOf",
+                    "git@github.com:"], check=True)
+    subprocess.run(["git", "config", "--file", str(gitconfig), "--add", "url.https://github.com/acme/widgets.insteadOf",
+                    "git@github.com:acme/widgets"], check=True)
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(gitconfig))
+    for k, v in {"GIT_CONFIG_COUNT": "2", "GIT_CONFIG_KEY_0": "credential.https://github.com.helper",
+                 "GIT_CONFIG_VALUE_0": "", "GIT_CONFIG_KEY_1": "credential.https://github.com.helper",
+                 "GIT_CONFIG_VALUE_1": f"!{d / 'gh'} auth git-credential", "GIT_SSH_COMMAND": str(d / "ssh"),
+                 "GIT_TERMINAL_PROMPT": "0"}.items():
+        monkeypatch.setenv(k, v)
+    git = lambda *a: subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True)
+    git("remote", "set-url", "origin", "git@github.com:acme/widgets.git")
+    git("config", "remote.origin.pushurl", "https://github.com/acme/widgets.git")
+    git("-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", "x")
+    side = "https://github.com/acme/widgets.git"
+    for args in (["ls-remote", "--heads", side, "refs/heads/ttp/x"], ["ls-remote", "--heads", "origin"],
+                 ["fetch", "origin", "+refs/heads/main:refs/remotes/origin/main"], ["push", "origin", "HEAD:refs/heads/ttp/x"]):
+        r = gitmemo.run(["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=60)
+        assert r.returncode != 0 and "could not read Username" not in r.stderr, (args, r.stderr)
+    assert not asked.exists(), asked.read_text()
+    calls = dialed.read_text().splitlines()
+    assert len(calls) == 4 and all("git@github.com" in c and "acme/widgets.git" in c for c in calls), calls
+    assert "allowlist" in ghqueue.allowed(["auth", "git-credential", "get"], b"protocol=https\nhost=github.com\n")
+    assert "allowlist" in ghqueue.allowed(["auth", "token"]) and "allowlist" in ghqueue.allowed(["repo", "delete", "acme/widgets"])
 
 
 def test_gh_workstation_allows_pr_upkeep_title_body_edits_review_replies_and_closing_its_own_draft(env, monkeypatch):

@@ -10,10 +10,12 @@ or token is kept. Nobody is ever asked to log gh in there.
   ran on the same arguments. Unset or down (ssh exit 255): a `gh api` GET of a public repo is read
   without a login (public); a write is held with HELD_RC, for its caller to retry once the route is
   back (held); other reads fail as before.
-- A push to an https GitHub remote with no https login here goes over its ssh form
-  (git@github.com:<owner>/<repo>.git) with the forwarded ssh agent: `-c remote.<name>.pushurl` for each
-  GitHub remote, and a `-c url...pushInsteadOf` for a URL, on the git command line (push_argv), never
-  an edit of the stored remote.
+- With no https login here, a git push to a GitHub repo goes over its ssh form
+  (ssh://git@github.com/<owner>/<repo>.git) with the forwarded ssh agent: `-c url...insteadOf` and
+  `pushInsteadOf` rules on the git command line (push_argv), never an edit of the stored remote. A
+  fetch, pull or ls-remote does the same while an ssh agent with a key answers; without one it runs as
+  given with github.com's credential helpers reset, so a public repo reads anonymously. Git never asks a
+  credential helper for github.com, so no token reaches this host.
 - The ask and notify gates refuse a text telling the user to log gh in on a remote host (login_ask).
 """
 from __future__ import annotations
@@ -369,24 +371,48 @@ def value_of(v) -> str:
     return v
 
 
+_NET = {"push", "fetch", "pull", "ls-remote"}
+_SSH = "ssh://git@github.com/"
+# an empty value resets the helper list for github.com only: gh is never asked, other hosts' helpers are
+_NO_HELPER = ["-c", "credential.https://github.com.helper="]
+
+
+def _ssh_agent() -> bool:
+    """Whether an ssh agent holding a key answers here (`ssh-add -l` exit 0): a fetch or ls-remote goes
+    over ssh only then; without one a public repo is still read anonymously over https."""
+    def read():
+        try:
+            return subprocess.run(["ssh-add", "-l"], capture_output=True, timeout=10,
+                                  stdin=subprocess.DEVNULL).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            return False
+    return _cached(("agent", os.environ.get("SSH_AUTH_SOCK", "")), 60, read)
+
+
 def push_argv(argv: list | tuple, cwd: str | None = None) -> list | tuple:
-    """`argv` (a git command line) with https GitHub pushes sent over their ssh form when there is no
-    https login here; any other command as it is."""
+    """`argv` (a git command line) with its GitHub URLs sent over their ssh form when it talks to a
+    remote and there is no https login here; any other command as it is. A push always goes over ssh; a
+    fetch, pull or ls-remote only while an ssh agent with a key answers, else as given with the credential
+    helper reset (never gh's), so a public repo reads anonymously and a private one fails as unauthenticated."""
     from .gitmemo import git_args
     try:
         args = git_args(argv)
     except Exception:
         return argv
-    if not argv or os.path.basename(str(argv[0])) != "git" or not args or args[0] != "push":
+    if not argv or os.path.basename(str(argv[0])) != "git" or not args or args[0] not in _NET:
         return argv
     repo = next((str(argv[i + 1]) for i, a in enumerate(argv[:-1]) if a == "-C"), cwd)
     if _https_login(repo):
         return argv
-    # A remote with no pushurl gets its ssh form as one on this command line: an explicit pushurl skips
-    # pushInsteadOf, so a global reverse rule (url.https://github.com/.pushInsteadOf=git@github.com:)
-    # cannot turn it back to https. The rule stays for a push naming a URL.
-    pins = [x for name, url in _github_remotes(repo) for x in ("-c", f"remote.{name}.pushurl={url}")]
-    return [argv[0], "-c", "url.git@github.com:.pushInsteadOf=https://github.com/", *pins, *argv[1:]]
+    if args[0] != "push" and not _ssh_agent():
+        return [argv[0], *_NO_HELPER, *argv[1:]]
+    # git rewrites a URL once, by the longest matching rule, and pushInsteadOf before insteadOf (an
+    # explicit pushurl only by insteadOf). Each stored GitHub URL gets a rule naming it whole, so a
+    # user's reverse rule (url.https://github.com/.pushInsteadOf=git@github.com:) cannot send it to
+    # https, and the ssh:// form matches no git@github.com: rule. https://github.com/ covers a URL argument.
+    verbs = ("insteadOf", "pushInsteadOf") if args[0] == "push" else ("insteadOf",)
+    rules = [(_SSH, "https://github.com/"), *_github_remotes(repo)]
+    return [argv[0], *(x for ssh, url in rules for v in verbs for x in ("-c", f"url.{ssh}.{v}={url}")), *argv[1:]]
 
 
 _GH_URL_RE = re.compile(r"^(?:https://(?:[^@/]+@)?github\.com/|ssh://git@github\.com/|git@github\.com:)"
@@ -394,28 +420,20 @@ _GH_URL_RE = re.compile(r"^(?:https://(?:[^@/]+@)?github\.com/|ssh://git@github\
 
 
 def _github_remotes(repo: str | None) -> list[tuple[str, str]]:
-    """(name, ssh form) of each remote at `repo` whose stored URL is a GitHub repo (https or ssh form)
-    and that has no pushurl of its own (git would add a second push URL beside it)."""
+    """(ssh form, stored URL) of each url and pushurl of a remote at `repo` that names a GitHub repo
+    (https or ssh form)."""
     try:
         r = subprocess.run(["git", *(["-C", repo] if repo else []), "config", "--get-regexp",
                             r"^remote\..*\.(url|pushurl)$"], capture_output=True, text=True,
                            timeout=10, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
         return []
-    urls, pushed = {}, set()
+    out = {}
     for line in r.stdout.splitlines():
-        key, _, val = line.partition(" ")
-        name, _, field = key[len("remote."):].rpartition(".")
-        if field == "pushurl":
-            pushed.add(name)
-        elif name not in urls:
-            urls[name] = val.strip()
-    out = []
-    for name, url in urls.items():
-        m = _GH_URL_RE.match(url)
-        if m and name not in pushed:
-            out.append((name, f"git@github.com:{m.group(1)}"))
-    return out
+        url = line.partition(" ")[2].strip()
+        if m := _GH_URL_RE.match(url):
+            out.setdefault(url, f"{_SSH}{m.group(1)}")
+    return [(ssh, url) for url, ssh in out.items()]
 
 
 def push_hint(err: str) -> str:
@@ -423,7 +441,7 @@ def push_hint(err: str) -> str:
     if not re.search(r"could not read Username|Permission denied \(publickey\)|terminal prompts disabled", err or ""):
         return ""
     return ("no GitHub login here (none is kept on lab hosts; gh calls go on delivery.gh_route): the push went "
-            "over ssh (git@github.com:...), which needs a forwarded ssh agent with a GitHub key; it waits and "
+            "over ssh (ssh://git@github.com/...), which needs a forwarded ssh agent with a GitHub key; it waits and "
             "retries. Nobody logs in on this host.")
 
 
