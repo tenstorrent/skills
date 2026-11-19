@@ -541,6 +541,25 @@ def test_glm_guard_reads_a_ttp_call_without_its_redirections(cmd, tmp_path):
     assert glmguard.shell_refusal(cmd, str(wt), str(rd), {"TTP_PROJECT": str(tmp_path / "proj"), **_GG_RUN_ENV}) is None, cmd
 
 
+@_pytest.mark.parametrize("cmd", [
+    "cd /work/repo && ls >/dev/null 2>&1", "cd /work/repo && git log -1 2>&1 | tail -2", "cd /work/repo && ls 1>&2",
+    "cd /work/repo && ls >&2", "cd /work/repo && ls 2>&-", "cd /work/repo && ls 2>& 1", "cd /work/repo && cat <&3"])
+def test_glm_guard_reads_a_copied_or_closed_fd_as_no_file_after_a_cd_outside_the_worktree(cmd, tmp_path):
+    """`2>&1`, `>&2`, `2>&-`: no file is written, so no target resolves under the cd (once /work/repo/1)."""
+    from ttp import glmguard
+    wt, rd = _gg_run(tmp_path)
+    assert glmguard.shell_refusal(cmd, str(wt), str(rd), {"TTP_PROJECT": str(tmp_path / "proj"), **_GG_RUN_ENV}) is None, cmd
+
+
+@_pytest.mark.parametrize("cmd", [
+    "cd /work/repo && echo x > f", "cd /work/repo && echo x >> f 2>&1", "cd /work/repo && echo x >&f",
+    "cd /work/repo && ls 2>err.log", "ls &>/tmp/x", "ls 2>&1 >/tmp/x", "ls >&/tmp/x"])
+def test_glm_guard_still_refuses_a_redirect_to_a_file_outside_the_worktree(cmd, tmp_path):
+    from ttp import glmguard
+    wt, rd = _gg_run(tmp_path)
+    assert glmguard.shell_refusal(cmd, str(wt), str(rd), {"TTP_PROJECT": str(tmp_path / "proj"), **_GG_RUN_ENV}), cmd
+
+
 @_pytest.mark.parametrize("cmd", ["ttp notify hi 2>&1", "ttp 2>/dev/null notify hi", "ttp note --to x hi 2>&1", "ttp remove x >/dev/null"])
 def test_glm_guard_still_refuses_a_redirected_ttp_call_it_would_refuse_bare(cmd, tmp_path):
     from ttp import glmguard

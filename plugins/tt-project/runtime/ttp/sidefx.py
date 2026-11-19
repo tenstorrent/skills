@@ -520,7 +520,9 @@ def classify_paths(cmd: str, home: str, cwd: str, run_dir: str, depth: int = 0) 
     starts = _commands(toks, punct)
     for i, t in enumerate(toks):   # in order, so a relative path resolves under the cd before it
         if punct[i] and i + 1 < len(toks) and not punct[i + 1] and not t.endswith("("):
-            if ">" in t:
+            if t.endswith("&") and re.fullmatch(r"\d+-?|-", toks[i + 1]):
+                pass   # `2>&1`, `>&2`, `2>&-`: a file descriptor copied or closed, no file
+            elif ">" in t:
                 put(toks[i + 1], "write", "redirect target", True)
             elif "<" in t:
                 put(toks[i + 1], "read", "input redirect")
