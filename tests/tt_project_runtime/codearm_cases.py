@@ -918,7 +918,7 @@ def test_a_diff_that_touches_a_policy_file_is_refused_with_its_tip_kept_and_the_
     git("commit", "-qam", "glm change")
     tip = git("rev-parse", "HEAD")
     git("checkout", "-q", "main")
-    p = SimpleNamespace(root=repo, worktrees=tmp_path / "no-worktrees")
+    p = SimpleNamespace(root=repo, worktrees=tmp_path / "no-worktrees", db=None)   # no code_arm line: the db is never read
     task = {"id": 7, "branch": "ttp/t7-x"}
     changed = {"src/rt/util.py": 2, "src/rt/coordfix.py": 2}
     assert policyfiles.bounce_diff(p, task, ["src/rt/other.py"], changed) == ""   # none listed: no refusal, no reset
