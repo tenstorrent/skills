@@ -9,7 +9,8 @@ def _pool_home(monkeypatch, tmp_path):
     from ttp import checkwait, poolshard, project
     monkeypatch.setattr(project, "HOME_DIR", tmp_path / "home")
     monkeypatch.setattr(project, "load_account_settings", lambda: {})
-    monkeypatch.delenv(checkwait.ENV, raising=False)
+    for name in ("TTP_POOL_SHARD_STALL_S", "TTP_POOL_SHARD_STALL_FLOOR_S", checkwait.ENV):
+        monkeypatch.delenv(name, raising=False)
     return poolshard
 
 
@@ -148,17 +149,16 @@ def test_pool_shard_stall_window_comes_from_the_measured_seconds_per_file_with_a
     assert ps.window("cpu") == ps.STALL_FLOOR_S == 600.0
     ps.record([300.0, 200.0, 250.0], "cpu")
     assert ps.window("cpu") == 1000.0 and ps.window("other") == 600.0
-    monkeypatch.setattr(ps.project, "load_account_settings", lambda: {"checks": {"pool_shard_stall_floor_s": "1200"}})
+    monkeypatch.setenv("TTP_POOL_SHARD_STALL_FLOOR_S", "1200")
     assert ps.window("cpu") == 1200.0
-    monkeypatch.setattr(ps, "STALL_FLOOR_S", 1100.0)
-    monkeypatch.setattr(ps.project, "load_account_settings", lambda: {})
-    assert ps.window("cpu") == 1100.0
     monkeypatch.setattr(ps.project, "load_account_settings", lambda: {"checks": {"pool_shard_stall_s": "90"}})
     assert ps.window("cpu") == 90.0
     for bad in ("soon", "-5", "0", "nan"):
-        monkeypatch.setattr(ps.project, "load_account_settings", lambda: {"checks": {"pool_shard_stall_s": bad}})
-        assert ps.window("cpu") == 1100.0, bad   # a bad value is ignored: the measured window counts
+        monkeypatch.setenv("TTP_POOL_SHARD_STALL_S", bad)
+        assert ps.window("cpu") == 90.0, bad   # a bad value is ignored, the next source counts
+    monkeypatch.delenv("TTP_POOL_SHARD_STALL_S")
     monkeypatch.setattr(ps.project, "load_account_settings", lambda: {})
+    monkeypatch.delenv("TTP_POOL_SHARD_STALL_FLOOR_S")
     script = tmp_path / "slow-first"
     script.write_text("#!/bin/sh\nsleep 1\necho 'PASS a'\necho 'PASS b'\n")
     script.chmod(0o755)

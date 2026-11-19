@@ -2527,6 +2527,13 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
         os.close(fd)
 
 
+def has_changes(path: Path, since_ref: str) -> bool:
+    """Durable progress for a code task: commits past the base, or uncommitted edits."""
+    ahead = _git(path, "rev-list", "--count", f"{since_ref}..HEAD", check=False)
+    dirty = _git(path, "status", "--porcelain", check=False)
+    return (ahead.isdigit() and int(ahead) > 0) or bool(dirty)
+
+
 _HEX = re.compile(r"\b[0-9a-f]{7,40}\b")
 
 

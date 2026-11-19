@@ -1257,10 +1257,10 @@ def no_commit_line(p: Project, task: dict) -> str:
     target is an external artifact or a hash-pinned report) is told `ttp checks` has no target there,
     so it never runs candidate checks at an unrelated HEAD. "" for a review of a commit, or on error."""
     from . import extchange
-    from .util import task_labels
+    from .push import _labels
     from .worktree import reviewed_head
     try:
-        if extchange.heads(task_labels(dict(task))) or reviewed_head(p, dict(task)):
+        if extchange.heads(_labels(dict(task))) or reviewed_head(p, dict(task)):
             return ""
     except Exception:
         return ""
@@ -1352,3 +1352,8 @@ def worker_resume(p: Project, task: dict, lost: dict) -> str:
         text += ("\nUpdate for your task from the project coordinator. Where it differs from the spec, it wins:\n"
                  + "\n".join(update) + "\n")
     return "\n\n".join(x for x in (text, restrictions_pointer(p)) if x.strip())
+
+
+def worker_prompt(p: Project, task: dict, cwd: str, branch: str | None) -> str:
+    """The whole prompt in one piece, as a worker reads it."""
+    return worker_system(p) + "\n\n" + worker_task(p, task, cwd, branch)

@@ -2712,18 +2712,3 @@ def test_ttp_lock_runs_an_older_exclusive_waiter_before_an_urgent_tasks_shared_c
     assert _ended(procs) == [0, 0, 0], [x.stderr.read() for x in procs]
     starts = [ln.split()[1] for ln in marks.read_text().splitlines() if ln.startswith("start")]
     assert starts == ["H", "E", "S"], starts
-
-
-def test_flocked_makes_the_lock_file_and_excludes_others(tmp_path):
-    import fcntl
-
-    from ttp.util import flocked
-
-    path = tmp_path / "sub" / "x.lock"
-    with flocked(path, 0o666):
-        assert path.exists()
-        with open(path) as f:
-            with pytest.raises(BlockingIOError):
-                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    with open(path) as f:
-        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)

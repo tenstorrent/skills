@@ -51,19 +51,3 @@ def pid_state(pid: Any, ns: str | None = None) -> str:
     except OSError:
         return UNKNOWN
     return ALIVE
-
-
-def pid_alive(pid: Any) -> bool:
-    """Whether kill(pid, 0) finds the process here (a zombie counts; a foreign PID namespace is not
-    checked: see pid_state). A pid that exists but is not ours to signal is alive; one that is no
-    positive number is not."""
-    try:
-        pid = int(pid)
-        if pid <= 0:
-            return False
-        os.kill(pid, 0)
-    except PermissionError:
-        return True
-    except (OSError, TypeError, ValueError, OverflowError):
-        return False
-    return True

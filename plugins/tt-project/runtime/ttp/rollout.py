@@ -61,6 +61,7 @@ FLAGS: dict[str, dict[str, Any]] = {
     "device_prewarm": {"key": "device.prewarm", "area": "device", "code": ()},
     "deslop": {"key": "deslop.enabled", "area": "review", "code": _code("deslop.py")},
     # The cost levers (costlevers.py): off until a ring turns them on.
+    "fresh_continue": {"key": "worker.fresh_continue", "area": "worker", "code": _code("costlevers.py", "ctxfork.py")},
     "coord_wake_settle": {"key": "coordinator.wake_settle", "area": "coordinator",
                           "code": _code("costlevers.py", "wakesettle.py", "daemon.py")},
     "output_trim": {"key": "output.trim", "area": "output", "code": _code("costlevers.py")},

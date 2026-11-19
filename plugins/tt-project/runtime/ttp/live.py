@@ -31,7 +31,6 @@ from pathlib import Path
 
 from .project import durable_write, write_json
 from .providers.base import Provider, cli_output, status_check
-from .util import read_dict
 
 CHECKS = ("launch", "login", "session", "usage", "structured", "fence", "resume", "steer", "meter")
 PASS, FAIL, UNSUPPORTED = "pass", "fail", "unsupported"
@@ -324,6 +323,14 @@ def watch_dir(home: Path | None = None) -> Path:
     return Path(home or project.HOME_DIR) / WATCH_DIR
 
 
+def _read(path: Path) -> dict:
+    try:
+        v = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return v if isinstance(v, dict) else {}
+
+
 def read_version(prov: Provider) -> str:
     """The CLI's `--version`, read now: cli_version's answer is cached for the process, and a daemon
     outlives an upgrade. "" when it cannot be read."""
@@ -346,7 +353,7 @@ def check_versions(owner: str, providers: list[Provider], *, home: Path | None =
     now = time.time() if now is None else now
     d = watch_dir(home)
     d.mkdir(parents=True, exist_ok=True)
-    seen, started = read_dict(d / VERSIONS), []
+    seen, started = _read(d / VERSIONS), []
     for prov in providers:
         rec = seen.get(prov.name) if isinstance(seen.get(prov.name), dict) else {}
         if now - float(rec.get("checked_at") or 0) < WATCH_EVERY_S:
@@ -396,7 +403,7 @@ def harvest(owner: str, *, home: Path | None = None, now: float | None = None) -
     now = time.time() if now is None else now
     d, out = watch_dir(home), []
     for run in sorted(d.glob("*-*-*-*")) if d.is_dir() else []:
-        claim = read_dict(run / "claim.json")
+        claim = _read(run / "claim.json")
         if claim.get("owner") != owner or (run / "reported").exists():
             continue
         if not (run / "rc").exists() and now - float(claim.get("at") or 0) < WATCH_TIMEOUT_S + 600:
@@ -405,7 +412,7 @@ def harvest(owner: str, *, home: Path | None = None, now: float | None = None) -
             rc = int((run / "rc").read_text().strip())
         except (OSError, ValueError):
             rc = -1   # killed before it wrote one
-        r = read_dict(run / "out.json")
+        r = _read(run / "out.json")
         provider, version = str(claim.get("provider")), str(claim.get("version"))
         head = f"{provider} CLI changed to {version}: its live check (`ttp doctor --live {provider}`)"
         if r.get("checks") is not None:

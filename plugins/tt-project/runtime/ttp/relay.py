@@ -14,7 +14,7 @@ with no user's words (`ttp say <project> --finding <text>`) are a message of kin
 paths, dated timestamps, fenced command output). The digest labels context or findings citing any as
 facts to act on (`cited`); without records they stay data. Either way never a rule, pin or approval.
 
-`guard` is the model-free guard: a phrase, or a model or effort name, that the relayer context
+`context_only` is the model-free guard: a phrase, or a model or effort name, that the relayer context
 of this turn's messages holds and none of the user's own words do (those messages' verbatim text, the
 charter and the user-rule memory). The coordinator refuses a charter_update or a user-rule memory_add
 carrying one (restrictions, policies, standing rules, pins and approvals need the user's own words). A
@@ -202,6 +202,15 @@ def recent(db, ids: list[int] | None = None, now: float | None = None) -> list[d
     return [dict(r) for r in db.q(base + "ts>=? ORDER BY id", ((now or time.time()) - WINDOW_S,))]
 
 
+def context_only(text: str, messages: list[dict], terms: set[str] | frozenset = frozenset(),
+                 said: list[str] = ()) -> str:
+    """Why `text` rests on relayer context and not the user's words ('' when it does not): a phrase
+    of SHINGLE words (CONTENT of them not common words), or a model/effort name (`terms`, or one that
+    looks like a model name), found in some message's context and in none of the user's words: the
+    messages' verbatim text and `said` (text the user already backs: the charter, user-rule memory)."""
+    return guard(text, messages, terms, said)[0]
+
+
 def words_back(m: dict | None, limit: int = QUOTE_BACK) -> str:
     """For a rejection: message `m`'s own words, labelled as the user's, so the next turn can quote them
     exactly ('' when it has none). Cut at `limit` chars, with a marker."""
@@ -229,8 +238,7 @@ def near_miss(a: str, b: str) -> bool:
 
 def guard(text: str, messages: list[dict], terms: set[str] | frozenset = frozenset(),
           said: list[str] = (), typos: list[str] | None = None) -> tuple[str, dict | None]:
-    """Why `text` rests on relayer context and not the user's words ('' when it does not), with the message
-    whose context holds the phrase (None when there is none).
+    """context_only's reason, with the message whose context holds the phrase (None when there is none).
     `typos` (a list, for an entry's tag only, never a rule, pin or approval): a flagged pin term the user's
     verbatim words hold one edit away (near_miss) counts as theirs, and a line saying so is appended for
     each; a phrase counts only where it is the user's own with that one term swapped. A common word one
@@ -273,7 +281,7 @@ def guard(text: str, messages: list[dict], terms: set[str] | frozenset = frozens
 
 
 def pin_terms(cfg: dict, providers: bool = False) -> set[str]:
-    """Model names the config knows, for guard, and its provider names with `providers` (for a
+    """Model names the config knows, for context_only, and its provider names with `providers` (for a
     task's provider pin only: a bare provider name in a rule or charter text is too common to refuse;
     a requirement naming one is caught as a phrase)."""
     out: set[str] = set()

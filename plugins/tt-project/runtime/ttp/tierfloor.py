@@ -46,11 +46,11 @@ Known gaps (accepted, settled area sa38):
 """
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
 from .failover import EFFORT_RANK, TIERS, kept_effort, required
-from .util import task_labels
 
 KEY = "conclusion_floor"   # coordinator.conclusion_floor
 DEFAULT = {"tier": "standard", "effort": "high"}
@@ -101,6 +101,13 @@ def floor(cfg: dict) -> dict:
         return dict(DEFAULT)
 
 
+def _labels(task: dict) -> list[str]:
+    try:
+        return [str(x) for x in json.loads(task.get("labels") or "[]")]
+    except (TypeError, ValueError):
+        return []
+
+
 def _spec(task: dict) -> str:
     """The spec without the floor's own notes, so a note's words never make a task a floor run."""
     return "\n".join(x for x in (task.get("spec") or "").splitlines() if not x.lstrip().startswith(NOTE_PREFIX))
@@ -145,7 +152,7 @@ def reasons(task: dict, cfg: dict | None = None) -> list[str]:
     elif DEVICE_SPEC.search(spec):
         out.append("device action")
     if task.get("origin") == "schedule":
-        name = next(iter(task_labels(task)), "")
+        name = next(iter(_labels(task)), "")
         if name == DAILY_REVIEW or REPORT.search(name.replace("-", " ").replace("_", " ")):
             out.append(f"schedule {name}")
     return out

@@ -17,8 +17,6 @@ import json
 import re
 import time
 
-from .util import num_in, task_labels
-
 KEY = "glm_work"                    # a route entry's and a run note's field: the arm this run took
 ARM_KV = "glm_work_arm:"            # kv glm_work_arm:<task id>: {"arm": "glm"|"holdout", "why", "share", "ts"}
 HELD_KV = "glm_work_held"           # kv: {"state", "why", "ts"}: the wave gate's last verdict for this project
@@ -46,6 +44,10 @@ PERSON = re.compile(
 DESIGN = re.compile(
     r"(?i)\boptimi[sz](?:e|es|ed|ing|ation|ations)\b|\bre-?design\w*|\bdesign\s+(?:a|an|the|how|which)\b"
     r"|\barchitect\w*|\bpropose\b[^\n.]{0,40}\b(?:plan|design|approach)\b")
+
+
+def _num(v, lo: float, hi: float, default: float) -> float:
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and lo <= v <= hi else default
 
 
 def _raw(cfg: dict) -> dict:
@@ -76,7 +78,7 @@ def settings(cfg: dict) -> dict | None:
     kinds = g.get("kinds")
     return {"provider": str(g.get("provider") or "chat"), "model": m, "effort": str(g.get("effort") or "max"),
             "harness": str(g.get("harness") or "mini-swe-agent"),
-            "holdout": num_in(g.get("holdout"), 0, 1, HOLDOUT), "holdout_held": num_in(g.get("holdout_held"), 0, 1,
+            "holdout": _num(g.get("holdout"), 0, 1, HOLDOUT), "holdout_held": _num(g.get("holdout_held"), 0, 1,
                                                                                   HOLDOUT_HELD),
             "seed": str(g.get("seed") or ""),
             "kinds": tuple(str(k) for k in kinds) if isinstance(kinds, list) else KINDS,
@@ -186,6 +188,14 @@ def arm(db, cfg: dict, task: dict, peek: bool = False) -> dict | None:
     return got
 
 
+def _labels(task: dict) -> list[str]:
+    try:
+        got = json.loads(task.get("labels") or "[]")
+    except (TypeError, ValueError):
+        return []
+    return [str(x) for x in got] if isinstance(got, list) else []
+
+
 def keeps_core(db, cfg: dict, task: dict, tier: str, cls: str | None = None, picked: dict | None = None) -> str:
     """Why a run of `task` stays on the core provider on a covered project ('' when GLM may take it). Model-free,
     in order: coordinator, plan and review runs and verdicts (#3205), deep, a provider or model pin, outside
@@ -197,7 +207,7 @@ def keeps_core(db, cfg: dict, task: dict, tier: str, cls: str | None = None, pic
     text = f"{task.get('title') or ''}\n{task.get('spec') or ''}"
     if cls == "coordinator" or kind in ("plan", "review"):
         return kind if kind in ("plan", "review") else "coordinator"
-    labels = task_labels(task)
+    labels = _labels(task)
     if "verdict" in tierfloor.reasons(task, cfg):
         return "verdict"
     if tier == "deep" or any(lb in ("user_deep", "needs_deep") for lb in labels) or effort.wants_deep(task.get("result")):

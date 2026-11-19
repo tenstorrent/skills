@@ -154,8 +154,6 @@ from pathlib import Path
 from typing import Callable
 
 from . import checkwait, diskgate, hostcpu, locks, obligations, poll_s, project, timefmt, urgent
-from .util import read_dict
-from .lockreap import label as _label
 
 RESOURCE = "checks"
 OBLIGATION_PRIORITY = 0   # an open obligation's required owner: before every task priority (1 and up)
@@ -2055,7 +2053,7 @@ def preempt(by: str, every: list[Path], project_name: str | None = None,
         if band and not (owed and h.get("owed") is False):
             continue
         pid = int(h.get("ns_pid") or h.get("pid") or 0)
-        if pid <= 0 or claim_live(str(read_dict(_preempt_path(pid)).get("claim") or "")):
+        if pid <= 0 or claim_live(str(_read(_preempt_path(pid)).get("claim") or "")):
             continue   # none, or another asker's live claim waits for its slot already
         prio = h.get("priority")
         again = bool(h.get("preempted")) or "[preempted by " in str(h.get("holder") or "")
@@ -2097,7 +2095,7 @@ def ask_preempt(run: str, by: str, owners: list[dict] | tuple = ()) -> tuple[boo
     one whose label does not say it owes nothing counts as owed), and one that cannot be asked (behind a lock,
     or an older ttp: preemptible). Returns (asked, the line to print)."""
     for path in all_paths() + urgent_paths() + priority_paths():
-        h = read_dict(path)
+        h = _read(path)
         if str(h.get("run_id") or "") != str(run) and not any(same_owner(h, o) for o in owners):
             continue
         if not locks.held_labels([path]):
@@ -2151,7 +2149,7 @@ def claims(mine: str = "") -> int:
     for path in slot_dir().glob(f"{CLAIM}.*.json"):
         if mine and path.name == _claim_path(mine).name:
             continue
-        if _claim_live(read_dict(path), now):
+        if _claim_live(_read(path), now):
             n += 1
         elif now - _mtime(path) >= CLAIM_S:
             path.unlink(missing_ok=True)
@@ -2166,7 +2164,7 @@ def _mtime(path: Path) -> float:
 
 
 def claim_live(token: str) -> bool:
-    return bool(token) and _claim_live(read_dict(_claim_path(token)), time.time())
+    return bool(token) and _claim_live(_read(_claim_path(token)), time.time())
 
 
 def renew_claim(token: str, parked: bool, asked_parked: bool = False) -> None:
@@ -2175,13 +2173,13 @@ def renew_claim(token: str, parked: bool, asked_parked: bool = False) -> None:
     that asked while parked (`asked_parked`: it waits parked for that run's test slots) renews it parked for
     PARKED_CLAIM_S from the ask, time for the asked run to see the request and stop, never longer."""
     path = _claim_path(token)
-    rec = read_dict(path)
+    rec = _read(path)
     now = time.time()
     if not _claim_live(rec, now) or (parked and not (asked_parked and now - float(rec.get("made") or 0)
                                                       < PARKED_CLAIM_S)):
         return
     slot = slot_dir() / str(rec.get("slot") or "")
-    if rec.get("slot") and locks._slot_labels([slot]) and same_owner(read_dict(slot), rec.get("victim") or {}):
+    if rec.get("slot") and locks._slot_labels([slot]) and same_owner(_read(slot), rec.get("victim") or {}):
         with contextlib.suppress(OSError):
             _write(path, {**rec, "at": time.time()})
 
@@ -2189,11 +2187,11 @@ def renew_claim(token: str, parked: bool, asked_parked: bool = False) -> None:
 def claim_freed_s(token: str) -> float | None:
     """Seconds since the run the live claim `token` asked let go of its slot (its last renewal), None while
     it still holds it or the claim is gone."""
-    rec = read_dict(_claim_path(token))
+    rec = _read(_claim_path(token))
     if not token or not _claim_live(rec, time.time()):
         return None
     slot = slot_dir() / str(rec.get("slot") or "")
-    if rec.get("slot") and locks._slot_labels([slot]) and same_owner(read_dict(slot), rec.get("victim") or {}):
+    if rec.get("slot") and locks._slot_labels([slot]) and same_owner(_read(slot), rec.get("victim") or {}):
         return None
     return max(0.0, time.time() - float(rec.get("at") or 0))
 
@@ -2251,6 +2249,14 @@ YIELD_ENV = "TTP_CHECKS_YIELD"   # that stem, for the commands of a run that may
 YIELD_WAIT_S = 60.0   # ask_yield waits this long for the run to answer a yield (it looks every checkwall.POLL_S)
 
 
+def _read(path: Path) -> dict:
+    try:
+        got = json.loads(path.read_text() or "{}")
+    except (OSError, ValueError):
+        return {}
+    return got if isinstance(got, dict) else {}
+
+
 def _write(path: Path, rec: dict) -> None:
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     tmp.write_text(json.dumps(rec))
@@ -2269,7 +2275,7 @@ def serve_yield(slot, tell: Callable[[str], None] | None = None, stop: Callable[
         return
     base = Path(stem)
     reqs = [(float(req.get("at") or 0), f.name, f, req) for f in base.parent.glob(base.name + ".*.req")
-            for req in [read_dict(f)]]
+            for req in [_read(f)]]
     for _, _, f, req in sorted(reqs, key=lambda r: r[:2]):
         want, pid = req.get("want"), int(req.get("pid") or 0)
         if want == "yield" and (slot.f is not None or slot.yielded):
@@ -2310,7 +2316,7 @@ def ask_yield(want: str, pid: int | None = None, wait_s: float | None = None) ->
     span = YIELD_WAIT_S if wait_s is None else wait_s
     end = None if want == "resume" else time.time() + span
     try:
-        while read_dict(ack).get("id") != rid:
+        while _read(ack).get("id") != rid:
             if not locks._alive(owner):
                 return "the checks run that held the slot has ended"
             if end is not None and time.time() >= end:
@@ -2462,6 +2468,13 @@ def _counted(skip: Path | None = None, claimant: bool = False) -> int:
         n += not (h.get("waiting") and (float(h.get("since") or 0), path.name)
                   > (float(mine.get("since") or 0), skip.name))
     return n
+
+
+def _label(path: Path) -> dict:
+    try:
+        return locks.read_label(path)
+    except (OSError, ValueError):
+        return {}
 
 
 def _take(n: int, ps: list[Path], every: list[Path], holder: str, what: str, same: str, room: int | None = None,

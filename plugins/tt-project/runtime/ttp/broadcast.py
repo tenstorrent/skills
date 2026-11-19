@@ -14,6 +14,8 @@ builds the same record, and a later `--all` reaches only the rest.
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -23,7 +25,6 @@ import time
 from pathlib import Path
 
 from . import project, relay
-from .util import flocked
 
 REUSE_S = 24 * 3600     # a key resent within this reuses its broadcast id (and skips its deliveries)
 KEEP_S = 7 * 24 * 3600  # lines older than this go when the ledger is compacted
@@ -45,8 +46,13 @@ def key(text: str) -> str:
     return hashlib.sha256(normalize(text).encode()).hexdigest()
 
 
+@contextlib.contextmanager
 def _locked():
-    return flocked(path().with_suffix(".lock"))   # every project's `ttp say` on this machine appends here
+    project.HOME_DIR.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path().with_suffix(".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "rb+") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)   # every project's `ttp say` on this machine appends here
+        yield
 
 
 def _read() -> list[dict]:

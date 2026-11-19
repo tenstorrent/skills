@@ -391,12 +391,3 @@ def test_glmassist_a_glm_work_run_is_launched_with_its_switches_in_its_note_and_
     d = dmod.Daemon(p.base)
     prov, _tier, note = _route_dispatch(p, d, monkeypatch, title="count the files", kind="work", tier="standard")
     assert prov == "chat" and glmassist.KEY not in note
-
-
-def test_num_in_as_float_as_int():
-    from ttp.util import as_float, as_int, num_in
-
-    assert num_in(5, 1, 10, 2.0) == 5.0 and num_in(0, 1, 10, 2.0) == 2.0
-    assert num_in(True, 0, 10, 2.0) == 2.0 and num_in("5", 1, 10, 2.0) == 2.0
-    assert as_float("1.5", 0) == 1.5 and as_float(None, 3) == 3 and as_float("x", 3) == 3
-    assert as_int("7") == 7 and as_int(None) is None and as_int("x") is None

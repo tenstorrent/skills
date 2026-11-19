@@ -18911,7 +18911,7 @@ def test_a_spec_that_states_another_tasks_status_gets_its_live_record_at_dispatc
     spec = (f"Hand back: #{pushed}'s fix is not pushed yet and #{switched}'s switch is not serving; "
             f"#{queued} and #{gone} too (user msg #{switched}, PR #{pushed}, machine change #1, #99999).")
     tid = p.db.add_task("hand back", spec, kind="code")
-    assert [n for n, _ in taskfacts.refs(spec + f" #{tid}", {tid})] == [pushed, switched, queued, gone]
+    assert taskfacts.ids_in(spec + f" #{tid}", skip={tid}) == [pushed, switched, queued, gone]
     prompt = worker_task(p, p.db.task(tid), str(p.root), None)
     block = prompt[prompt.index("## Facts at send time"):]
     assert prompt.index("## Spec") < prompt.index("## Facts at send time")
@@ -18944,11 +18944,11 @@ def test_a_notes_facts_suffix_names_only_the_numbers_it_means_as_tasks(env):
     p = make(env)
     ids = [p.db.add_task(f"widget step {i}", "s", kind="code", status="done") for i in range(8)]
     a, b, c, d, e, f, g, h = ids
-    assert [n for n, _ in taskfacts.refs(f"Ledger #{a}, #{b} and #{c} extended by a week.")] == []
-    assert [n for n, _ in taskfacts.refs(f"Entries #{a}/#{b}, or #{c}; user msg #{d}, alert #{e}, hold #{f}.")] == []
-    assert [n for n, _ in taskfacts.refs(f"Machine change #{a}, #{b}; then task #{c} and #{d} landed.")] == [c, d]
-    assert [n for n, _ in taskfacts.refs(f"#{a} is done, see msg #{b}. #{c} next; Fixed it. #{d} too")] == [a, c, d]
-    assert [n for n, _ in taskfacts.refs(f"Ledger entries: #{a}, #{b}. Hand back: #{c}")] == [c]
+    assert taskfacts.ids_in(f"Ledger #{a}, #{b} and #{c} extended by a week.") == []
+    assert taskfacts.ids_in(f"Entries #{a}/#{b}, or #{c}; user msg #{d}, alert #{e}, hold #{f}.") == []
+    assert taskfacts.ids_in(f"Machine change #{a}, #{b}; then task #{c} and #{d} landed.") == [c, d]
+    assert taskfacts.ids_in(f"#{a} is done, see msg #{b}. #{c} next; Fixed it. #{d} too") == [a, c, d]
+    assert taskfacts.ids_in(f"Ledger entries: #{a}, #{b}. Hand back: #{c}") == [c]
     assert taskfacts.refs(f"Board #{g} rebooted; review #{h}") == [(g, False), (h, True)]
     note = (f"Ledger #{a}, #{b} and #{c} extended; task #{d} pushed; #{e} is waiting; msg #{f} answered; "
             f"Board #{g} reset.")

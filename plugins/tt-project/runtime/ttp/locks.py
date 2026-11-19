@@ -50,7 +50,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import liveness, timefmt
+from . import timefmt
 from .project import FOLDER, durable_write, ps_rows, zombie
 
 RESERVE_STALE_S = 120
@@ -1251,7 +1251,15 @@ def waited(run_dir: Path, now: float | None = None) -> float:
 
 
 def _alive(pid: int) -> bool:
-    return liveness.pid_alive(pid) and not zombie(pid)
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return not zombie(pid)
 
 
 def queue_dir(locks_dir: Path, resource: str) -> Path:

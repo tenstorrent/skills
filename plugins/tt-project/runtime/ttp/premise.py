@@ -72,7 +72,6 @@ import time
 
 from .db import TERMINAL_TASK_STATES, dump_result, load_result
 from .urgent import is_urgent
-from .util import task_labels
 
 LINE = re.compile(r"(?im)^[ \t]*(?:[-*][ \t]+)?premise:[ \t]*(\S.*?)[ \t]*$")
 CHECK_LABEL = "premise-check:"   # on the question: + the code task's id
@@ -152,7 +151,7 @@ def cmd_config(cfg: dict | None) -> tuple[float, float]:
 def runs_cmd(task: dict) -> str:
     """The premise command the daemon runs before dispatching `task`, or "": a code task's, until it
     gave no verdict once."""
-    if task.get("kind") != "code" or CMD_UNKNOWN in map(str, task_labels(task)):
+    if task.get("kind") != "code" or CMD_UNKNOWN in map(str, _labels(task)):
         return ""
     return command(task.get("spec"))
 
@@ -173,7 +172,7 @@ def _close(db, task: dict, words: str, extra: dict, label: str, now: float | Non
         t = db.task(task["id"])
         if not t or t["status"] != "queued":
             return False
-        db.update_task(t["id"], status="done", blocked_reason=None, labels=[*task_labels(t), label],
+        db.update_task(t["id"], status="done", blocked_reason=None, labels=[*_labels(t), label],
                        result=dump_result(result))
         _event(db, t, "task_done", "normal", f"#{t['id']} {t['title']} → done, not run ({words})", "queued", now)
         pushq._reply(db, t, "done", result["summary"])
@@ -232,7 +231,7 @@ def cmd_unknown(db, task: dict, cmd: str, why: str, now: float | None = None) ->
     now = time.time() if now is None else now
     with db.tx():
         t = db.task(task["id"])
-        labels = task_labels(t) if t else []
+        labels = _labels(t) if t else []
         if not t or t["status"] != "queued" or CMD_UNKNOWN in labels:
             return False
         upd: dict = {"labels": [*labels, CMD_UNKNOWN]}
@@ -251,14 +250,22 @@ def cmd_unknown(db, task: dict, cmd: str, why: str, now: float | None = None) ->
     return True
 
 
+def _labels(task: dict) -> list:
+    try:
+        got = json.loads(task.get("labels") or "[]")
+    except (TypeError, ValueError):
+        return []
+    return got if isinstance(got, list) else []
+
+
 def pending(task: dict) -> int | None:
     """The id of the premise check `task` still waits on (its `premise:<id>` label, not yet settled), or None."""
-    return next((int(m.group(1)) for x in task_labels(task) if (m := PENDING.match(str(x)))), None)
+    return next((int(m.group(1)) for x in _labels(task) if (m := PENDING.match(str(x)))), None)
 
 
 def is_check(task: dict) -> bool:
     """Whether `task` is a premise check the daemon queued for a code task."""
-    return task.get("kind") == "question" and any(str(x).startswith(CHECK_LABEL) for x in task_labels(task))
+    return task.get("kind") == "question" and any(str(x).startswith(CHECK_LABEL) for x in _labels(task))
 
 
 def verdict(result: dict) -> str:
@@ -343,7 +350,7 @@ def repeat(db, spec: str, now: float | None = None) -> dict | None:
             continue
         theirs = m.group(1)
         if (mine and mine <= _commits(theirs)) or (not mine and said and said == _words(theirs)):
-            owner = next((x[len(CHECK_LABEL):] for x in map(str, task_labels(q)) if x.startswith(CHECK_LABEL)), "")
+            owner = next((x[len(CHECK_LABEL):] for x in map(str, _labels(q)) if x.startswith(CHECK_LABEL)), "")
             return {"id": q["id"], "task": owner, "ts": float(q["ts"]),
                     "summary": str(res.get("summary") or "").strip()}
     return None
@@ -398,7 +405,7 @@ def _split(db, task: dict, check: str) -> int | None:
     """Queue `task`'s premise check and make `task` wait on it; None when another pass did already."""
     with db.tx():
         t = db.task(task["id"])
-        if not t or t["status"] != "queued" or any(str(x).startswith(LABEL) for x in task_labels(t)):
+        if not t or t["status"] != "queued" or any(str(x).startswith(LABEL) for x in _labels(t)):
             return None
         try:
             deps = json.loads(t["depends_on"] or "[]")
@@ -408,7 +415,7 @@ def _split(db, task: dict, check: str) -> int | None:
         qid = db.add_task(f"premise check for #{t['id']}: {t['title']}", question_spec(t, check),
                           kind="question", tier="light", priority=t["priority"], provider=t["provider"],
                           origin="daemon", labels=[f"{CHECK_LABEL}{t['id']}"], tier_source="premise_check")
-        db.update_task(t["id"], depends_on=[*deps, qid], labels=[*task_labels(t), f"{LABEL}{qid}"])
+        db.update_task(t["id"], depends_on=[*deps, qid], labels=[*_labels(t), f"{LABEL}{qid}"])
         db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
              (time.time(), "daemon", "premise_check", "low",
               f"#{t['id']} {t['title']}: its premise is checked first by question #{qid} (light); "
@@ -431,7 +438,7 @@ def _settle(db, task: dict, qid: int) -> str | None:
     now = time.time()
     with db.tx():
         t = db.task(task["id"])
-        labels = task_labels(t) if t else []
+        labels = _labels(t) if t else []
         if not t or t["status"] not in ("queued", "blocked") or f"{LABEL}{qid}" not in labels:
             return None
         labels = [f"{LABEL}{qid}:{got or 'unknown'}" if x == f"{LABEL}{qid}" else x for x in labels]
@@ -476,7 +483,7 @@ def _self(db, task: dict, check: str, qid: int | None = None) -> bool:
     now = time.time()
     with db.tx():
         t = db.task(task["id"])
-        labels = task_labels(t) if t else []
+        labels = _labels(t) if t else []
         if not t or t["status"] not in ("queued", "blocked"):
             return False
         if qid is None:
@@ -513,7 +520,7 @@ def tend(db) -> list[tuple[int, str]]:
     done: list[tuple[int, str]] = []
     for t in db.q("SELECT * FROM tasks WHERE kind='code' AND status IN ('queued','blocked') "
                   "AND (spec LIKE '%premise%' OR labels LIKE '%\"premise:%')"):
-        labels = [str(x) for x in task_labels(t)]
+        labels = [str(x) for x in _labels(t)]
         pend = pending(t)
         if pend is not None:
             if is_urgent(t) and (check := check_text(t["spec"])) and _self(db, t, check, pend):
@@ -533,7 +540,7 @@ def tend(db) -> list[tuple[int, str]]:
             done.append((t["id"], f"premise check #{qid} queued"))
     for q in db.q("SELECT * FROM tasks WHERE kind='question' AND status='queued' AND labels LIKE ?",
                   (f'%"{CHECK_LABEL}%',)):
-        owner = next((x[len(CHECK_LABEL):] for x in map(str, task_labels(q)) if x.startswith(CHECK_LABEL)), "")
+        owner = next((x[len(CHECK_LABEL):] for x in map(str, _labels(q)) if x.startswith(CHECK_LABEL)), "")
         t = db.task(int(owner)) if owner.isdigit() else None
         if t and t["status"] in TERMINAL_TASK_STATES and not db.one(
                 "SELECT 1 FROM runs WHERE task=? LIMIT 1", (q["id"],)):

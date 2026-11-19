@@ -1047,7 +1047,7 @@ def test_anonymous_reads_hold_the_host_cap_and_githubs_last_calls(env, monkeypat
     assert [ghanon.get(f"x/{i}", 60, cap=3) for i in range(3)] == [{"i": 0}, {"i": 1}, {"i": 2}]
     with pytest.raises(ghanon.Spent):
         ghanon.get("x/3", 60, cap=3)
-    assert len(asked) == 3
+    assert len(asked) == 3 and ghanon.calls_last_hour() == 3
     assert ghanon.get("x/0", 0, cap=3) == {"i": 0} and len(asked) == 3, "a spent budget serves the stale answer"
     routes["/x/4"] = (200, {"i": 4}, {"X-RateLimit-Remaining": str(ghanon.FLOOR),
                                       "X-RateLimit-Reset": str(int(time.time()) + 600)})

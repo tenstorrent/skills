@@ -58,7 +58,6 @@ from pathlib import Path
 
 from . import globalcap as gcap
 from . import project
-from .util import read_dict
 
 # $ per million tokens: (input, output, cache read, 5-minute cache write, 1-hour cache write), from the
 # published list (platform.claude.com/docs/en/about-claude/pricing). Keys are model ids without a
@@ -226,6 +225,14 @@ def _ts(s: str) -> float | None:
         return None
 
 
+def _json_file(path: Path) -> dict:
+    try:
+        got = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return got if isinstance(got, dict) else {}
+
+
 def billing_mode(env=None) -> str:
     """How this machine's Claude Code login is billed, from its login state: 'usage' (an API key, or
     a usage-based seat: every call billed per use), 'plan' (a subscription plan login: metered by
@@ -240,15 +247,15 @@ def billing_mode(env=None) -> str:
     session logs carry no sign of how a call was paid, so they are not read for this."""
     env = os.environ if env is None else env
     folder = Path(env["CLAUDE_CONFIG_DIR"]) if env.get("CLAUDE_CONFIG_DIR") else None
-    state = read_dict(folder / ".claude.json" if folder else Path.home() / ".claude.json")
+    state = _json_file(folder / ".claude.json" if folder else Path.home() / ".claude.json")
     folder = folder or Path.home() / ".claude"
-    settings = read_dict(folder / "settings.json")
+    settings = _json_file(folder / "settings.json")
     senv = settings.get("env") if isinstance(settings.get("env"), dict) else {}
     if (env.get("ANTHROPIC_API_KEY") or senv.get("ANTHROPIC_API_KEY") or settings.get("apiKeyHelper")
             or state.get("primaryApiKey")):
         return "usage"
     acct = state.get("oauthAccount") if isinstance(state.get("oauthAccount"), dict) else {}
-    oauth = read_dict(folder / ".credentials.json").get("claudeAiOauth")
+    oauth = _json_file(folder / ".credentials.json").get("claudeAiOauth")
     oauth = oauth if isinstance(oauth, dict) else {}
     if "usage" in str(acct.get("seatTier") or "").lower():
         return "usage"
@@ -702,6 +709,12 @@ def _session_priced(session_id: str, root: Path | None = None) -> tuple[float, d
             else:
                 by_key[k] = by_key.get(k, 0.0) + u
     return usd, by_key, unknown
+
+
+def session_cost(session_id: str, root: Path | None = None) -> tuple[float, bool] | None:
+    """The list price of one session's log (its subagents too), or None when there is no log."""
+    got = _session_priced(session_id, root)
+    return None if got is None else (got[0], bool(got[2]))
 
 
 def calibration_path() -> Path:

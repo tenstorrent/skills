@@ -248,8 +248,8 @@ def test_the_worktree_sweep_reads_each_push_marker_once_and_ended_ones_not_again
                                                             "repo": str(paths[i % 4])}))
     (folder / "live.json").write_text(json.dumps({"id": "live", "status": "queued", "repo": str(paths[0])}))
     reads = []
-    real = push.read_dict
-    monkeypatch.setattr(push, "read_dict", lambda m: reads.append(m.name) or real(m))
+    real = push._read
+    monkeypatch.setattr(push, "_read", lambda m: reads.append(m.name) or real(m))
     d = Daemon(p.base)
     res = {r["path"]: r for r in d.prune_worktrees(every_s=0, force=True)}
     assert res[str(paths[0])]["why"] == "a detached `ttp push` runs in it", res[str(paths[0])]

@@ -3,8 +3,6 @@
 # these tests under its name. Add new budget tests here, not there.
 from __future__ import annotations
 
-from ttp.daemon import BUDGET_SETTLE_S as _REAL_BUDGET_SETTLE_S   # read before the env fixture sets it to 0
-
 
 def test_caps_gate_escalates_and_blocks_new_work(env):
     p = make(env)
@@ -283,7 +281,7 @@ def test_plan_readings_of_another_plan_account_stop_counting_at_once(env):
     assert {w.window: w.utilization for w in wins} == {"seven_day": 86.0, "five_hour": 10.0}
     assert "7d 86%" in budget_line(p.db, now, "claude") and "7d avg 70%" in budget_line(p.db, now, "claude")
     _run(p, "acct-b | plan", now - 60)                  # the next run starts under another account
-    assert bud.plan_windows(p.db, now) == []
+    assert bud.plan_windows(p.db, now) == [] and bud.windows_from_snapshots(p.db, now) == []
     g = bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db, now), now)
     assert g.regime == "caps" and any("no plan readings of its own" in r for r in g.reasons), g.reasons
     assert g.numbers["spent_24h"] == 0 and g.level == "green", "the old plan's spend stays plan-billed"
@@ -293,8 +291,8 @@ def test_plan_readings_of_another_plan_account_stop_counting_at_once(env):
     # the new account reports: its windows count, and burn is measured from its readings alone
     _reading(p, now - 30, "acct-b | plan", "seven_day", 20.0, now + 2 * 86400)
     assert [(w.window, w.utilization) for w in bud.plan_windows(p.db, now)] == [("seven_day", 20.0)]
-    assert bud._slope(bud._readings(p.db, "claude", "seven_day", now + 2 * 86400, now, "acct-b | plan")) is None
-    assert bud._slope(bud._readings(p.db, "claude", "seven_day", now + 2 * 86400, now)) is not None, "both accounts mixed"
+    assert bud.burn_rate(p.db, "claude", "seven_day", now + 2 * 86400, now, "acct-b | plan") is None
+    assert bud.burn_rate(p.db, "claude", "seven_day", now + 2 * 86400, now) is not None, "both accounts mixed"
     g = bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db, now), now)
     assert g.regime == "windows" and g.numbers["utilization"] == 20.0, g.numbers
     assert budget_line(p.db, now, "claude", g.as_dict()).startswith("7d 20% - resets in")
@@ -674,8 +672,7 @@ def _settling_gates(p, monkeypatch):
     makes a red gate from the reasons (green when none); age(s) moves every red class's start back."""
     from ttp import budget as bud
     from ttp.daemon import Daemon
-    from ttp import daemon as dm
-    monkeypatch.setattr(dm, "BUDGET_SETTLE_S", _REAL_BUDGET_SETTLE_S)
+    monkeypatch.delenv("TTP_TEST_BUDGET_SETTLE_S")
     d = Daemon(p.base)
 
     def settle(reasons: list[str], holds: bool = True, lane: bool = False) -> bud.Gate:
@@ -712,7 +709,7 @@ def test_a_provider_that_stops_reporting_plan_windows_is_a_status_line_not_a_red
     """A plan provider moving to the dollar caps, red only for the coordinator turn guard that move
     brings (urgent work still starts), is the gate's status line: no alert however long it lasts."""
     from ttp import alerts as al
-    BUDGET_SETTLE_S = _REAL_BUDGET_SETTLE_S
+    from ttp.daemon import BUDGET_SETTLE_S
     p = make(env)
     _, settle, age = _settling_gates(p, monkeypatch)
     lapsed = "fake stopped reporting plan windows; its spend counts toward the dollar caps"
@@ -730,7 +727,7 @@ def test_a_provider_that_stops_reporting_plan_windows_is_a_status_line_not_a_red
 
 
 def test_a_cap_red_alerts_once_only_after_it_still_holds_work_past_the_settle(env, monkeypatch):
-    BUDGET_SETTLE_S = _REAL_BUDGET_SETTLE_S
+    from ttp.daemon import BUDGET_SETTLE_S
     p = make(env)
     _, settle, age = _settling_gates(p, monkeypatch)
     cap = "cap reached: $120.00/24h of $100"
@@ -759,7 +756,7 @@ def test_a_cap_red_alerts_once_only_after_it_still_holds_work_past_the_settle(en
 def test_a_one_tick_cap_flap_is_no_alert(env, monkeypatch):
     """Red, green, red: each red is one read, so neither still holds after the settle. The start
     of a run of red reads resets at each break, however old the episode."""
-    BUDGET_SETTLE_S = _REAL_BUDGET_SETTLE_S
+    from ttp.daemon import BUDGET_SETTLE_S
     p = make(env)
     _, settle, age = _settling_gates(p, monkeypatch)
     cap = "cap reached: $120.00/24h of $100"
@@ -775,7 +772,7 @@ def test_a_cap_alert_is_withdrawn_once_only_a_self_lifting_red_holds(env, monkey
     """Once no cap or funds reason holds work, readers drop the alert at once and the sweep closes it
     with one cleared line, though the gate stays red for the runaway guard."""
     from ttp import alerts as al
-    BUDGET_SETTLE_S = _REAL_BUDGET_SETTLE_S
+    from ttp.daemon import BUDGET_SETTLE_S
     p = make(env)
     d, settle, age = _settling_gates(p, monkeypatch)
     cap = "cap reached: $120.00/24h of $100"
@@ -1326,7 +1323,7 @@ def test_burn_rate_is_steady_across_whole_percent_readings(env):
         util = round(30 + 6 * (60 - minutes_ago) / 60)
         p.db.x("INSERT INTO snapshots(ts,provider,account,window,utilization,resets_at) VALUES(?,?,?,?,?,?)",
                (now - minutes_ago * 60, "claude", "a", "five_hour", util, resets))
-    rate = bud._slope(bud._readings(p.db, "claude", "five_hour", resets, now))
+    rate = bud.burn_rate(p.db, "claude", "five_hour", resets, now)
     assert 5.0 <= rate <= 7.0, rate
 
 
@@ -2702,7 +2699,7 @@ def test_this_machine_pushes_its_spend_in_the_background_and_a_failed_push_never
     monkeypatch.setattr(upstream, "ssh_pipe", lambda *a: (None, "exit 255: no route"))
     t1 = now + gcap.REFRESH_S
     assert gcap.push(b, t1) == 0
-    st = read_dict(gcap.push_state_path())["targets"]["server"]
+    st = gcap._json(gcap.push_state_path())["targets"]["server"]
     assert st["ok"] is False and st["fails"] == 1 and st["next"] == t1 + gcap.PUSH_BACKOFF_S[0], st
     assert not gcap._push_due(t1 + 60)
     # `none` turns pushing off; a list names the targets.
@@ -4898,7 +4895,7 @@ def test_a_plan_reading_is_filed_under_the_account_the_run_started_on(env, tmp_p
     assert accts == {want}, accts
     if now_acct == "plan-b":   # what status and the gate see once the daemon has looked at the login now
         p.db.set_kv(bud.ACCOUNT_KV + "claude", {"account": "plan-b", "ts": time.time()})
-        wins = [w for w in bud.plan_windows(p.db) if w.provider == "claude"]
+        wins = [w for w in bud.windows_from_snapshots(p.db) if w.provider == "claude"]
         held = bud.evaluate(p.db, p.config(), "claude", wins).level == "red"
         assert held == (want == "plan-b"), wins
 

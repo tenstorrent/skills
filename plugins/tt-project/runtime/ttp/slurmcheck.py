@@ -73,7 +73,6 @@ from pathlib import Path
 from typing import Any
 
 from . import remotecheck, runnerenv, slurmverdict
-from .util import read_dict
 
 KEY = "checks.slurm_overflow"
 DEFAULT_WORKDIR = "~/ttp-checks"
@@ -187,6 +186,14 @@ def _alive(pid: Any) -> bool:
     return pid_state(pid) != DEAD
 
 
+def _read(f: Path) -> dict:
+    try:
+        r = json.loads(f.read_text() or "{}")
+    except (OSError, ValueError):
+        return {}
+    return r if isinstance(r, dict) else {}
+
+
 def _rank(prio: Any, arrived: Any) -> tuple:
     return (prio if isinstance(prio, int) else 1 << 30, float(arrived or 0))
 
@@ -197,7 +204,7 @@ def ahead(prio: int | None, arrived: float, now: float | None = None) -> int:
     d = slurm_dir()
     n = 0
     for f in d.glob("want.*.json") if d.is_dir() else []:
-        r = read_dict(f)
+        r = _read(f)
         if r.get("pid") == os.getpid() or not _alive(r.get("pid")) or float(r.get("until") or 0) < now:
             continue
         if _rank(r.get("prio"), r.get("arrived")) < _rank(prio, arrived):
@@ -280,7 +287,7 @@ def reap() -> list[str]:
     d = slurm_dir()
     out = []
     for f in sorted(d.glob("job.*.json")) if d.is_dir() else []:
-        r = read_dict(f)
+        r = _read(f)
         if not r or _alive(r.get("pid")):
             continue
         if r.get("job") and r.get("host") and scancel(r["host"], str(r["job"])):
@@ -365,7 +372,7 @@ def _probe_key(s: dict) -> str:
 
 def probe_state(s: dict) -> dict:
     """The last workdir probe's verdict for these settings: {ok, why, at}, or {} when none ran."""
-    r = read_dict(slurm_dir() / PROBE_FILE).get(_probe_key(s))
+    r = _read(slurm_dir() / PROBE_FILE).get(_probe_key(s))
     return r if isinstance(r, dict) else {}
 
 
@@ -381,7 +388,7 @@ def probe_failed(s: dict, now: float | None = None) -> str:
 def _probe_save(s: dict, ok: bool, why: str) -> None:
     from .project import write_json
     f = slurm_dir() / PROBE_FILE
-    all_ = read_dict(f)
+    all_ = _read(f)
     all_[_probe_key(s)] = {"ok": ok, "why": why, "at": time.time()}
     try:
         write_json(f, all_)
@@ -405,7 +412,7 @@ def holders(project_name: str | None = None) -> list[dict]:
     for f in sorted(d.glob("*.*.json")) if d.is_dir() else []:
         if f.name.startswith(("want.", "job.")):
             continue
-        r = read_dict(f)
+        r = _read(f)
         if r.get("host") and _alive(r.get("pid")) and (project_name is None or r.get("project") == project_name):
             out.append(r)
     return out
@@ -415,7 +422,7 @@ def status_lines(project_name: str, now: float | None = None) -> list[str]:
     """`ttp status` lines: this project's checks running as Slurm overflow jobs, with their job ids."""
     now = time.time() if now is None else now
     d = slurm_dir()
-    live = [r for f in (sorted(d.glob("job.*.json")) if d.is_dir() else []) if (r := read_dict(f))
+    live = [r for f in (sorted(d.glob("job.*.json")) if d.is_dir() else []) if (r := _read(f))
             and r.get("project") == project_name and _alive(r.get("pid"))]
     out = []
     for r in holders(project_name):
@@ -458,7 +465,7 @@ def _armed(b: dict) -> bool:
 def tripped() -> dict | None:
     """The trip record while the overflow paused itself (TRIP_AFTER jobs in a row died at start) and the
     user has not set checks.slurm_overflow again since; else None."""
-    b = read_dict(slurm_dir() / BREAKER)
+    b = _read(slurm_dir() / BREAKER)
     return b if b.get("tripped") and not _armed(b) else None
 
 
@@ -479,7 +486,7 @@ def _breaker(start_fail: dict | None, now: float | None = None) -> dict | None:
     d.mkdir(parents=True, exist_ok=True)
     with open(d / (BREAKER + ".lock"), "a") as lk:
         fcntl.flock(lk, fcntl.LOCK_EX)
-        b = read_dict(d / BREAKER)
+        b = _read(d / BREAKER)
         if not b or _armed(b):
             b = {"since": now, "value": _digest(_raw()), "set": _last_set(), "count": 0, "jobs": []}
         if b.get("tripped"):

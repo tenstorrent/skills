@@ -31,6 +31,32 @@ def wilson(passed: int, n: int, z: float = 1.96) -> tuple[float, float]:
     return max(0.0, c - h), min(1.0, c + h)
 
 
+# -- flips
+
+
+def flip_rate(rows: list[dict]) -> dict:
+    """How often the landed verdict changes between repeat rows of the same (task, arm). Each row
+    carries {task, arm, landed}; a change between consecutive rows (by rep) is one flip. A pair with
+    fewer than 2 rows has nothing to flip. Returns {"by_pair", "flips", "decisions", "rate"}."""
+    by: dict[tuple[str, str], list[tuple[int, bool]]] = {}
+    for r in rows:
+        if r.get("landed") is None or "arm" not in r:
+            continue
+        key = (str(r["task"]), str(r["arm"]))
+        by.setdefault(key, []).append((int(r.get("rep", 0)), bool(r["landed"])))
+    pairs, flips, decisions = [], 0, 0
+    for (task, arm), rep_landed in sorted(by.items()):
+        if len(rep_landed) < 2:
+            continue
+        out = [v for _, v in sorted(rep_landed)]
+        f = sum(1 for a, b in zip(out, out[1:]) if a != b)
+        flips += f
+        decisions += len(out) - 1
+        pairs.append({"task": task, "arm": arm, "flips": f, "n": len(out), "outcomes": out})
+    return {"by_pair": pairs, "flips": flips, "decisions": decisions,
+            "rate": round(flips / decisions, 4) if decisions else None}
+
+
 # -- rates
 
 

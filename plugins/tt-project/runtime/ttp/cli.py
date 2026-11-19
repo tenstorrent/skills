@@ -6017,19 +6017,6 @@ def _checks_yield(p: Project | None, me: Path | None) -> str:
     return ""
 
 
-def _checks_teller(out, run_dir: Path):
-    """tell(line) for a checks wait: the line goes to `out`, stdout and the run's progress.md."""
-    def tell(line: str) -> None:
-        out.write(f"ttp checks: {line}\n")
-        out.flush()
-        print(f"ttp checks: {line}", flush=True)
-        try:
-            durable_append(run_dir / "progress.md", f"{timefmt.clock()} checks: {line}\n")
-        except OSError:
-            pass
-    return tell
-
-
 def _checks_follow(p: Project, run_dir: Path, out, head: str, me: Path | None, y, detached: bool = False):
     """Follow the run this one yielded to (checkjoin.Yield `y`) until it ends: (how, the record with its
     outcome); None once it ended without one (queue again); ("handover", None) once a foreground wait
@@ -6040,7 +6027,14 @@ def _checks_follow(p: Project, run_dir: Path, out, head: str, me: Path | None, y
     how, lead, start = y.how, y.target, time.time()
     key = f"checks-join:{os.getpid()}:{start}"
 
-    tell = _checks_teller(out, run_dir)
+    def tell(line: str) -> None:
+        out.write(f"ttp checks: {line}\n")
+        out.flush()
+        print(f"ttp checks: {line}", flush=True)
+        try:
+            durable_append(run_dir / "progress.md", f"{timefmt.clock()} checks: {line}\n")
+        except OSError:
+            pass
 
     line = checkjoin.said(how, head, lead)
     mine = str((checkjoin.read(me) or {}).get("key") or "")
@@ -6243,7 +6237,14 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     foreground = not detached and not os.environ.get("TTP_DETACHED")
     key = f"checks:{os.getpid()}:{time.time()}"
 
-    tell = _checks_teller(out, run_dir)
+    def tell(line: str) -> None:
+        out.write(f"ttp checks: {line}\n")
+        out.flush()
+        print(f"ttp checks: {line}", flush=True)
+        try:
+            durable_append(run_dir / "progress.md", f"{timefmt.clock()} checks: {line}\n")
+        except OSError:
+            pass
 
     def waiting(on: bool, suite: str = "", limit: int = 0, limit_from: str = "", spill: str = "") -> None:
         # The wait is recorded before the marker shows it, so whoever sees the marker sees both. `suite`:
@@ -9841,6 +9842,20 @@ def cmd_bench(a) -> None:
         print(json.dumps(got, indent=2))
         return
     from . import bench
+    if a.action == "fair":   # read-only: each task's verdict in an existing prep folder
+        if not a.bench:
+            die("bench fair: --bench <dir> (a `ttp bench prep` folder) is required")
+        try:
+            rows = bench.fair(Path(a.bench).expanduser(), Path(a.repo).expanduser() if a.repo else None)
+        except (OSError, ValueError) as e:
+            die(f"bench fair: {e}")
+        for r in rows:
+            print(f"#{r['task']}: " + ("cannot tell: " + r["why"] if r["fair"] is None else "fair" if r["fair"] else
+                                      "unfair: the spec does not state " + ", ".join(repr(x) for x in r["unstated"])))
+        n = sum(r["fair"] is True for r in rows)
+        print(f"{n} of {len(rows)} fair, {sum(r['fair'] is False for r in rows)} unfair, "
+              f"{sum(r['fair'] is None for r in rows)} unknown")
+        return
     p = here() or die("bench: no project here (run it in a project or with TTP_PROJECT set)")
     if a.action == "daily":
         return _bench_daily(p, a)
@@ -9877,15 +9892,18 @@ def cmd_bench(a) -> None:
           f"manifest {out / 'manifest.json'}")
 
 
-def _server_opts(p, conf: dict) -> dict:
+def _server_opts(p, conf: dict, no_agent_time: bool = False, ceiling: float = 0, versions=None) -> dict:
     """The server-wait rules (serverhealth.py) as bench options: the limit counts the agent's own time;
-    `bench.server` holds the knobs, `bench.harness_versions` the harness pins."""
+    `bench.server` holds the knobs, `bench.harness_versions` and `versions` (kind=version) the harness pins."""
     srv = conf.get("server") or {}
-    o = {"agent_time": srv.get("agent_time", True), "ceiling_factor": srv.get("ceiling_factor"),
+    o = {"agent_time": not no_agent_time and srv.get("agent_time", True), "ceiling_factor": srv.get("ceiling_factor"),
          "server_factor": srv.get("factor"), "server_window": srv.get("window"), "server_min_calls": srv.get("min_calls"),
          "capacity_refusal_max": srv.get("capacity_refusal_max"), "probe_every_s": srv.get("probe_every_s"), "probe_max_s": srv.get("probe_max_s"),
          "server_history": str(Path(srv.get("history") or p.state / "bench-server-history.json").expanduser()),
-         "harness_versions": dict(conf.get("harness_versions") or {})}
+         "harness_versions": {**(conf.get("harness_versions") or {}),
+                              **dict(x.split("=", 1) for x in versions or [] if "=" in x)}}
+    if ceiling:
+        o["ceiling_factor"] = ceiling
     return o
 
 
@@ -10088,7 +10106,7 @@ def _bench_run(p, a) -> None:
                 "budget_usd": a.budget or conf.get("budget_usd", 8.0), "test_cmd": a.test_cmd or benchrun.TEST_CMD,
                 "test_timeout_s": conf.get("test_timeout_s", 900), "dry_run": a.dry_run,
                 "scratch_home": conf.get("scratch_home", True), "repo": Path(a.repo or p.root).expanduser().resolve(), "state": p.state}
-        opts.update(_server_opts(p, conf))
+        opts.update(_server_opts(p, conf, no_agent_time=a.no_agent_time, ceiling=a.ceiling, versions=a.harness_version))
         if a.rerun_server:
             rows = benchrun.rerun_server(Path(a.bench).expanduser().resolve(), Path(a.out).expanduser().resolve(),
                                          opts, cfg, only=[(t, n) for t in (a.task or [None]) for n in (a.arm_name or [None])] if a.task or a.arm_name else None)
@@ -11372,7 +11390,7 @@ def cmd_ci(a) -> None:
     answer. Prints one line per run (`done:`, `hung:`, `running:`); see ciwait."""
     from . import ciwait
     rc, lines = ciwait.probe(repo=a.repo, branch=a.branch, sha=a.sha, workflow=a.workflow, run=a.run,
-                             hang=not a.no_hang)
+                             hang=not a.no_hang, factor=a.factor, floor_min=a.floor_min, default_min=a.default_min)
     for line in lines:
         print(line)
     sys.exit(rc)
@@ -11405,7 +11423,7 @@ def cmd_deployed(a) -> None:
     from . import overview as ov
     names = [n.strip() for n in (a.projects or "").split(",") if n.strip()] or None
     data = ov.deployed(a.version, a.commit, names, a.fresh_s, allow_newer=True,
-                       skip_unregistered=a.after_push)
+                       skip_unregistered=a.after_push or a.skip_removed)
     if a.after_push:
         from . import deploy
         p = here()
@@ -13232,25 +13250,6 @@ def cmd_config(a) -> None:
         p, a.key, a.value = here(), a.name, a.key
     else:
         p = need(a.name, sys.argv[1:])
-    if a.add is not None:
-        if a.value is not None or not a.key or a.account:
-            die("usage: ttp config [NAME] KEY --add VALUE")
-        node = p.config()
-        for part in a.key.split("."):
-            node = node.get(part) if isinstance(node, dict) else None
-        from .project import key_type_problem
-        if node is None and key_type_problem(a.key, []) is None and key_type_problem(a.key, {}):
-            node = []   # a list key with no default, not set yet
-        if not isinstance(node, list):
-            die(f"{a.key} is not a list key: --add adds one item to a list")
-        try:
-            item = json.loads(a.add)
-        except ValueError:
-            item = a.add
-        if item in node:
-            print(f"{a.key} already has {json.dumps(item)}")
-            return
-        a.value = json.dumps(node + [item])   # set through the same checks as a whole value
     if a.value is None:
         node = p.config()   # the effective config: project.json over the defaults
         for part in (a.key or "").split(".") if a.key else []:
@@ -16163,6 +16162,7 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--coordinator-effort", default="xhigh", choices=("minimal", "low", "medium", "high", "xhigh", "max"),
                    help="the effort the coordinator's turns run at (default: xhigh; each provider "
                         "takes its nearest level; later: ttp config <name> coordinator.effort LEVEL)")
+    s.add_argument("--no-secrets", action="store_true", help=argparse.SUPPRESS)   # the default now; old scripts pass it
     s.add_argument("--copy-secrets", action="store_true",
                    help="with --host: copy your saved keys there in plaintext (only a machine of your own; "
                         "a shared or build box fetches them at run time instead: `ttp secret store`)")
@@ -16611,7 +16611,7 @@ def main(argv: list[str] | None = None) -> None:
                         "posted and held now (coordinator.chat_digest_h)")
     s.add_argument("--coord-session", action="store_true",
                    help="the persistent coordinator session instead, per day: wakes, $/wake, context growth and tool "
-                        "calls per wake, rollovers, cache-read share, against break-even")
+                        "calls per wake, rollovers, cache-read share, against the stateless baseline and break-even")
     s.add_argument("--landing", action="store_true",
                    help="per landed change instead, per day: test runs and full suites, CPU-hours, $, and "
                         "approved to landed (median, p90); then $ per landed commit and subagents spawned over 24 h and 7 d")
@@ -17120,7 +17120,7 @@ def main(argv: list[str] | None = None) -> None:
                                       "that add tests, keeps the tests that fail on the base and pass on the head, "
                                       "builds a clean one-commit workspace at each base and holds out the landed "
                                       "test files, with a hash-pinned manifest")
-    s.add_argument("action", choices=["prep", "cells", "run", "blind", "daily", "replay", "facts", "reach",
+    s.add_argument("action", choices=["prep", "cells", "run", "blind", "fair", "daily", "replay", "facts", "reach",
                                         "toolprobe"],
                    help="daily: the day's landed code tasks of every project on this host through Sonnet, Opus and "
                         "an open model, blind-reviewed, into the running table (starts in the background); replay: "
@@ -17166,6 +17166,11 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--no-validate", action="store_true", help="prep: skip validation: keep every added test unrun "
                                                                "(a count, or a host that cannot run the tests)")
     s.add_argument("--dry-run", action="store_true", help="run: every arm on the fake agent, no model call")
+    s.add_argument("--no-agent-time", action="store_true", help="run: the limit counts wall time, not the agent's own "
+                   "(wall minus the time waiting on the model server)")
+    s.add_argument("--ceiling", type=float, default=0, help="run: wall ceiling as a multiple of the limit (default 3)")
+    s.add_argument("--harness-version", action="append", help="run: pin a harness or proxy, kind=version "
+                   "(codex=..., litellm-proxy=...), repeatable")
     s.add_argument("--rerun-server", action="store_true", help="run: rerun the cells in --out that stopped on the "
                    "server, one at a time, each once a health probe shows normal speed (--task and --arm-name narrow it)")
     s.add_argument("--arm-name", action="append", help="run --rerun-server: only this arm's cells, repeatable")
@@ -17347,6 +17352,7 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("command", nargs=argparse.REMAINDER, help="the command to run (after --)")
     s.set_defaults(fn=cmd_detach)
 
+    from . import ciwait
     s = sub.add_parser("ci", help="exit 0 once a commit's CI runs completed or a job hung, 1 while they run, "
                                   "75 if gh cannot answer, 4 if gh is not logged in (for retry_when)")
     s.add_argument("--repo", help="owner/repo (default: the repository of the current directory)")
@@ -17355,6 +17361,10 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--workflow", help="only this workflow")
     s.add_argument("--run", help="wait for this one run id")
     s.add_argument("--no-hang", action="store_true", help="wait for completion only, never wake on a hung job")
+    s.add_argument("--factor", type=float, default=ciwait.FACTOR, help="a job is hung past this many times its median")
+    s.add_argument("--floor-min", type=float, default=ciwait.FLOOR_MIN, help="never call a job hung before this many minutes")
+    s.add_argument("--default-min", type=float, default=ciwait.DEFAULT_MIN,
+                   help="the limit in minutes when no finished run of the workflow is known")
     s.set_defaults(fn=cmd_ci)
 
     s = sub.add_parser("devq", help="queue jobs on the project's serial device-job runner (config device.runners)")
@@ -17384,6 +17394,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--after-push", action="store_true",
                    help="accept owned merges with takeover times, record follow-ups in this project, "
                         "and alert on failures; exit 0 for done/pending, 1 for failed")
+    s.add_argument("--skip-removed", action="store_true",
+                   help="leave out a named project that is no longer registered here or whose folder holds "
+                        "no project any more (removed since the deploy listed it), as --after-push does")
     s.set_defaults(fn=cmd_deployed)
     s = sub.add_parser("find", help="locate a project by name (registry, then chat logs)")
     s.add_argument("name", help="the project")
@@ -17796,9 +17809,6 @@ def main(argv: list[str] | None = None) -> None:
                                             "refuses another type")
     s.add_argument("--account", action="store_true",
                    help="the account-level setting (" + ", ".join(account_keys()) + "); '' removes it")
-    s.add_argument("--add", metavar="VALUE",
-                   help="add one item (JSON or plain text) to a list key, keeping its other items; an item it "
-                        "already has is left as is, and a key that is not a list is refused")
     s.add_argument("--chat-settable", action="store_true",
                    help="check, without setting it, whether a coordinator config_set accepts KEY (and VALUE): "
                         "ttp config --chat-settable KEY [VALUE]; KEY `list` prints every accepted key")

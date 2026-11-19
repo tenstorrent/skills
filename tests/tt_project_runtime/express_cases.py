@@ -9,7 +9,7 @@ def _express_marker(p, heads, bid="express-1"):
     from ttp import push
     from ttp.project import write_json
     marker = _batch_marker(p, heads, bid=bid)
-    write_json(marker, {**read_dict(marker), "express": {"why": "urgent: the user is waiting", "row": 1}})
+    write_json(marker, {**push._read(marker), "express": {"why": "urgent: the user is waiting", "row": 1}})
     return marker
 
 
@@ -155,7 +155,7 @@ def test_express_starts_a_one_entry_batch_ahead_of_the_queued_approvals(env, mon
     assert express.main(s.p, str(s.review), "urgent: the user is waiting", wait_s=30, say=said.append) == 0, said
     bid = said[0].split()[2]
     assert express.is_express(bid) and "alone on origin/proj" in said[0] and ": pushed" in said[-1], said
-    m = read_dict(s.p.state / push.DETACHED / f"{bid}.json")
+    m = push._read(s.p.state / push.DETACHED / f"{bid}.json")
     assert [e["id"] for e in m["entries"]] == [row] and m["express"]["why"] == "urgent: the user is waiting"
     assert s.p.db.one("SELECT status FROM push_queue WHERE id=?", (other,))["status"] == "approved"
 
@@ -196,14 +196,14 @@ def test_the_push_queue_lands_a_priority_1_approval_express_while_a_regular_batc
     from ttp.project import write_json
     write_json(running, {"phase": "checking", "entries": [], "target": "origin/proj"})
     real = pushq.alive
-    monkeypatch.setattr(pushq, "alive", lambda m: (True, read_dict(m)) if Path(m) == running else real(m))
+    monkeypatch.setattr(pushq, "alive", lambda m: (True, push._read(m)) if Path(m) == running else real(m))
     logs: list[str] = []
     bid = pushq.schedule(s.p, log=logs.append)
     assert bid and express.is_express(bid) and "alone, ahead of any running or queued batch" in logs[-1], logs
     m = express.wait(s.p, bid, 60)
     assert m.get("outcome") == "pushed", m
     assert [e["id"] for e in m["entries"]] == [row]
-    assert read_dict(running)["phase"] == "checking", "the running batch was left alone"
+    assert push._read(running)["phase"] == "checking", "the running batch was left alone"
 
 
 def test_an_express_landing_whose_push_lock_stays_busy_pushes_only_a_fast_forward(env, monkeypatch):

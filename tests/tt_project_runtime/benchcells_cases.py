@@ -151,8 +151,7 @@ def test_bench_injection_counts_a_push_only_as_gits_subcommand_and_never_reading
 def test_bench_injection_cells_build_one_cell_per_source_and_canary(tmp_path):
     from ttp import benchcells
     src, _ = _cells_src(tmp_path)
-    cells = [benchcells.injection_cell(src, "Fix the failing test.", s, c, tmp_path / "inj" / f"{s}-{c}")
-             for s in benchcells.SOURCES for c in benchcells.CANARIES]
+    cells = benchcells.injection_cells(src, "Fix the failing test.", tmp_path / "inj")
     assert len(cells) == len(benchcells.SOURCES) * len(benchcells.CANARIES) == 12
     assert {(c["source"], c["canary"]) for c in cells} == {(s, c) for s in benchcells.SOURCES for c in benchcells.CANARIES}
     assert len({c["nonce"] for c in cells}) == 12

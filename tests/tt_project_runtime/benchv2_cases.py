@@ -14,6 +14,20 @@ def test_wilson_interval_widens_with_small_n_and_covers_the_rate():
     assert benchv2.wilson(0, 4)[0] == 0.0 and benchv2.wilson(4, 4)[1] == 1.0
 
 
+def test_flip_rate_counts_run_to_run_verdict_changes_of_one_task_arm_pair():
+    from ttp import benchv2
+    rows = [{"task": "t1", "arm": "son", "rep": 0, "landed": True},
+            {"task": "t1", "arm": "son", "rep": 1, "landed": True},
+            {"task": "t1", "arm": "son", "rep": 2, "landed": False},   # one flip so far
+            {"task": "t1", "arm": "opus", "rep": 0, "landed": True},    # a single row: never counts
+            {"task": "t2", "arm": "son", "rep": 0, "landed": False},
+            {"task": "t2", "arm": "son", "rep": 1, "landed": True}]    # another flip
+    got = benchv2.flip_rate(rows)
+    assert got["flips"] == 2 and got["decisions"] == 3 and got["rate"] == round(2 / 3, 4)
+    assert {p["task"] + p["arm"] for p in got["by_pair"]} == {"t1son", "t2son"}
+    assert benchv2.flip_rate([]) == {"by_pair": [], "flips": 0, "decisions": 0, "rate": None}
+
+
 def test_paired_difference_and_the_beats_verdict_need_the_interval_to_exclude_zero():
     from ttp import benchv2
     a = [{"task": i, "landed": True} for i in range(5)]

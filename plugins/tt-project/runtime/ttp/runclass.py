@@ -93,8 +93,6 @@ import os
 import re
 import time
 
-from .util import task_labels
-
 KEY = "run_class"
 CLASSES = ("coordinator", "wake_decision", "screening", "worker_wake", "status_report", "rebase",
            "review_small", "light", "routine", "hard")
@@ -190,6 +188,11 @@ def _note(run: dict | None) -> dict:
     return v if isinstance(v, dict) else {}
 
 
+def _labels(task: dict) -> list[str]:
+    from .route import _labels as labels
+    return labels(task)
+
+
 def classify(task: dict | None, run: dict | None = None, cfg: dict | None = None) -> str:
     """The run's class (CLASSES). `run` is its row (role, note) or the note being written; a recorded
     class (KEY) wins. Order: coordinator, hard by structure (deep tier, plan, device
@@ -211,7 +214,7 @@ def classify(task: dict | None, run: dict | None = None, cfg: dict | None = None
             or tierfloor.DEVICE_SPEC.search(str(task.get("spec") or "")):
         return "hard"
     # Rebase by structure only (a push-conflict fix, a rebase label), never by title words.
-    if note.get(conflictfix.KEY) or any(lb.startswith("rebase") for lb in task_labels(task)):
+    if note.get(conflictfix.KEY) or any(lb.startswith("rebase") for lb in _labels(task)):
         return "rebase"
     if kind == "review":
         lines = (note.get("review_tier") or {}).get("lines")
@@ -352,7 +355,7 @@ def code_kind(task: dict | None, cfg: dict | None = None) -> str:
     from . import tierfloor
     if tierfloor.device_run(task, cfg):
         return ""
-    labels = task_labels(task)
+    labels = _labels(task)
     if any(lb.startswith("review_fix") for lb in labels):
         return "review_fix"
     return "continue" if any(lb.startswith("continues:") for lb in labels) else "new"
@@ -361,7 +364,7 @@ def code_kind(task: dict | None, cfg: dict | None = None) -> str:
 def review_round(task: dict | None) -> int:
     """How many failed reviews a review fix answers: its ROUND_LABEL, else one per review_fix:<id> label it
     carries (a fix hop that took over a later round's findings has both); 0 when unknown or not a fix."""
-    labels = task_labels(task or {})
+    labels = _labels(task or {})
     rounds = [int(lb[len(ROUND_LABEL):]) for lb in labels if lb.startswith(ROUND_LABEL) and lb[len(ROUND_LABEL):].isdigit()]
     return max([*rounds, sum(1 for lb in labels if lb.startswith("review_fix:"))])
 
@@ -421,16 +424,16 @@ def code_route(cfg: dict, task: dict | None, picked: dict | None = None,
     if kind == "review_fix":   # its review_fix label keeps it off other routes, not this one
         if review_round(task) >= REVIEW_ROUND_MAX:
             return None, "review_round"   # a late round stays on Opus
-        if any(lb.startswith("pr_fix:") for lb in task_labels(task)):
+        if any(lb.startswith("pr_fix:") for lb in _labels(task)):
             return None, "pr_fix"   # a PR fix reads PR comments
         # the daemon made it from a review of this project's own diff, which untrusted() trusts; an
         # untrusted_input label the fixed work passed on still keeps it on Opus
-        task = {**task, "origin": "review", "labels": [lb for lb in task_labels(task) if not lb.startswith("review_fix")]}
+        task = {**task, "origin": "review", "labels": [lb for lb in _labels(task) if not lb.startswith("review_fix")]}
     from . import effort
     from .route import _has
-    if _has(task_labels(task), ("untrusted_input",)) or untrusted(task):
+    if _has(_labels(task), ("untrusted_input",)) or untrusted(task):
         return None, "untrusted_input"
-    if _has(task_labels(task), ("needs_deep", "user_deep")) or effort.wants_deep(task.get("result")):
+    if _has(_labels(task), ("needs_deep", "user_deep")) or effort.wants_deep(task.get("result")):
         return None, "deep"
     if (picked or {}).get("by") == "retry":
         return None, "retry"
@@ -627,7 +630,7 @@ def code_quality(db, cfg: dict, since: float, until: float | None = None) -> dic
     if tasks:
         for r in db.q("SELECT id, status, labels FROM tasks WHERE kind='review' AND status IN ('done','failed') "
                       "AND created>=? ORDER BY id", (since,)):
-            for lb in task_labels(dict(r)):
+            for lb in _labels(dict(r)):
                 if lb.startswith("auto_review:") and lb[12:].isdigit():
                     first.setdefault(int(lb[12:]), r["status"])
     out = {k: {m: {"tasks": 0, "bad": 0, "share": 0.0} for m in ("sonnet", "opus")} for k in CODE_KINDS}
@@ -807,7 +810,7 @@ def guard_day(db, since: float, until: float) -> dict:
     linked: dict = {}   # review-kind task id -> (the code task it names, its GUARD_ROLES role)
     if by_id:
         for r in db.q("SELECT id, status, labels, created FROM tasks WHERE kind='review' ORDER BY id"):
-            for lb in task_labels(dict(r)):
+            for lb in _labels(dict(r)):
                 pre, _, rest = lb.partition(":")
                 num = rest.split(":")[0]
                 if not num.isdigit():
@@ -861,7 +864,7 @@ def guard_day(db, since: float, until: float) -> dict:
     for ch in landed_lines:
         ids = {t["id"] for t in ch}
         for i, t in enumerate(ch):
-            ab = any(lb.startswith("device_ab:") for lb in task_labels(t))
+            ab = any(lb.startswith("device_ab:") for lb in _labels(t))
             add(t["id"], "device_ab" if ab else "code_worker" if i == 0 else "rework", t.get("spent_usd"), "worker")
         for rid, (tid, role) in linked.items():
             if tid in ids:

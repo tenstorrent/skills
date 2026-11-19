@@ -31,8 +31,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .util import read_dict
-
 DIR = "served"                    # under project.HOME_DIR
 EVENTS = "served-events.jsonl"    # under DIR: {"at", "endpoint", "id", "event": "appeared" | "gone"}
 LINK = "served-link.json"         # under a project's state dir: {provider: endpoint id} of its endpoint
@@ -72,19 +70,27 @@ def stale_s(rec: dict) -> float:
     return STALE_POLLS * (float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0 else EVERY_S)
 
 
+def _json(path: Path) -> dict:
+    try:
+        v = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return v if isinstance(v, dict) else {}
+
+
 def read(eid: str) -> dict:
     """The shared served list of endpoint `eid`, or {}."""
-    return read_dict(home() / f"{eid}.json") if eid else {}
+    return _json(home() / f"{eid}.json") if eid else {}
 
 
 def link(state: Path, prov: str) -> str:
     """The endpoint id the project's daemon last polled or read for `prov`, or ''."""
-    v = read_dict(Path(state) / LINK).get(prov)
+    v = _json(Path(state) / LINK).get(prov)
     return v if isinstance(v, str) else ""
 
 
 def _set_link(state: Path, prov: str, eid: str) -> None:
-    data = read_dict(Path(state) / LINK)
+    data = _json(Path(state) / LINK)
     if data.get(prov) != eid:
         from .project import durable_write
         durable_write(Path(state) / LINK, json.dumps({**data, prov: eid}))
@@ -130,7 +136,7 @@ def take(eid: str, holder: str, now: float) -> bool:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(home() / f"{eid}.lock", "a") as fd:
         fcntl.flock(fd, fcntl.LOCK_EX)
-        cur = read_dict(path)
+        cur = _json(path)
         if cur.get("holder") not in (None, holder) and float(cur.get("until") or 0) > now:
             return False
         from .project import durable_write

@@ -79,7 +79,6 @@ from pathlib import Path
 from . import detach, locks, procinfo, procowner
 from .db import load_result
 from .project import Project, durable_write, write_json
-from .util import read_dict
 
 ENDED = ("cancelled", "failed", "exhausted")   # task states whose jobs the daemon stops
 HANDED_OFF = ("done",)                          # hand-offs whose jobs the daemon stops unless the hand-off names them
@@ -1037,7 +1036,7 @@ def end_push(p: Project, marker: Path, why: str, task: int | None = None) -> dic
     neither waits nor runs."""
     from . import push
     marker = Path(marker)
-    m = read_dict(marker)
+    m = push._read(marker)
     if m.get("kind") == "batch" or m.get("status") not in ("queued", "running"):
         return None
     run_lock = push._run_lock(marker)
@@ -1048,7 +1047,7 @@ def end_push(p: Project, marker: Path, why: str, task: int | None = None) -> dic
         if lock is None:
             return None   # the daemon is starting it right now: stopped on the next pass
         with lock:
-            m = read_dict(marker)
+            m = push._read(marker)
             if m.get("status") != "queued":
                 return None
             m.update(status="failed", exit=None, ended=time.time(), reason=f"not started: {why}")
@@ -1093,7 +1092,7 @@ def ended_pushes(p: Project) -> list[tuple[Path, int, str]]:
     from . import push
     found = []
     for marker in sorted((p.state / push.DETACHED).glob("*.json")):
-        m = read_dict(marker)
+        m = push._read(marker)
         if m.get("kind") != "batch" and m.get("status") in ("queued", "running") and str(m.get("task") or "").isdigit():
             found.append((marker, int(m["task"])))
     out = []

@@ -336,8 +336,6 @@ from .providers.base import (
 from .providers.claude import as_windows
 from .providers.jev import Jev, JevOutOfFunds, Pause as JevPause
 from .prompts import RUN_DIR_MARK
-from .util import read_dict, task_labels
-from .liveness import pid_alive
 
 TICK_S = 3.0
 WASTE_LEDGER_KV = "waste_ledger_at"   # kv: when the waste ledger last ran (the daily review or check_daily_waste)
@@ -357,6 +355,10 @@ RED_CLEAR_RATIO = 0.8
 RED_REPEAT_S = 3600
 # A red only the user can clear is alerted only once it still holds new work this long after it began.
 BUDGET_SETTLE_S = 120.0
+
+
+def budget_settle_s() -> float:
+    return float(os.environ.get("TTP_TEST_BUDGET_SETTLE_S") or BUDGET_SETTLE_S)   # tests of other alerts: 0
 CLEAN_STOP_KEY = "clean_stop"   # kv: {boot, ts} of the daemon's last clean stop
 SCHEDULE_BUDGET_KEY = "schedule_budget_raised"   # kv: schedule -> when its own-budget skip last raised (_schedule_skip)
 SCHEDULE_BUDGET_SOURCE = "daemon:schedule-budget"
@@ -498,7 +500,7 @@ def precheck_holds(state: Path, task: dict, now: float, db=None, hold: bool = Tr
     review.hold_for_precheck (reviewnow): off, no review waits for its checks."""
     if task["kind"] != "review" or not hold:
         return False
-    name = next((x[len(PRECHECK_LABEL):] for x in task_labels(task) if x.startswith(PRECHECK_LABEL)), "")
+    name = next((x[len(PRECHECK_LABEL):] for x in push._labels(task) if x.startswith(PRECHECK_LABEL)), "")
     if not name or "/" in name:
         return False
     from . import urgent
@@ -1043,6 +1045,8 @@ def _du(args: list[str], timeout: float) -> tuple[dict[str, int], bool]:
 
 
 def _mount_of(path: Path) -> Path:
+    if os.environ.get("TTP_TEST_DISK_MOUNT"):   # tests measure a small folder, not the real disk
+        return Path(os.environ["TTP_TEST_DISK_MOUNT"])
     p = path.resolve()
     while not os.path.ismount(p) and p.parent != p:
         p = p.parent
@@ -3120,7 +3124,10 @@ class Daemon:
 
     def retire_ended(self) -> None:
         """Retire memory entries and charter sections whose end condition passed (see ends)."""
-        self._ends.tick(over=lambda what: self._step_over(f"the end probe of {what}"))
+        try:
+            self._ends.tick(over=lambda what: self._step_over(f"the end probe of {what}"))
+        except Exception:
+            log(self.p, "retiring ended instructions failed\n" + traceback.format_exc())
 
     def archive_hidden_memory(self) -> None:
         """Once a day, model-free: archive the decisions and facts every prompt has left out for
@@ -3395,7 +3402,10 @@ class Daemon:
 
     def check_mute_ends(self) -> None:
         """Observation mutes with an end_when probe: a pass ends the mute (pauseends.MuteEnds). Model-free."""
-        self._mute_ends.tick()
+        try:
+            self._mute_ends.tick()
+        except Exception:
+            log(self.p, "checking observation mute ends failed\n" + traceback.format_exc())
 
     def record_refused_appends(self) -> None:
         """Each append durable_append refused this daemon (a symlink or special file planted where a
@@ -3569,7 +3579,10 @@ class Daemon:
         """Start a push batch when one is due (pushq.schedule): local checks only, no model."""
         if not self.lease_held():
             return
-        pushq.schedule(self.p, self.cfg, log=lambda m: log(self.p, m))
+        try:
+            pushq.schedule(self.p, self.cfg, log=lambda m: log(self.p, m))
+        except Exception:
+            log(self.p, "push queue: starting a batch failed\n" + traceback.format_exc())
 
     def _check_sleep(self) -> None:
         """Notice that the host slept: the wall clock jumped ahead of the monotonic one, which stands
@@ -5167,7 +5180,7 @@ class Daemon:
         if not rankfresh.configured(cfg):
             return
         got = benchowner.check(me, cfg, now)
-        lease = read_dict(modelbench.home() / modelbench.OWNER)
+        lease = modelbench._read(modelbench.home() / modelbench.OWNER)
         if got.get("took") is not None:
             self.alert("model-bench-owner", f"This project now runs the machine's daily chat model bench "
                        f"(was: {got['took'] or 'nobody'}).", severity="low")
@@ -5235,8 +5248,9 @@ class Daemon:
         bridge.agent_alert_after_min, cleared once it answers steadily (bridgewatch.py)."""
         from . import bridgewatch
         now = time.time()
-        if now - getattr(self, "_bridge_watched", 0.0) < bridgewatch.EVERY_S:
-            return
+        if now - getattr(self, "_bridge_watched", 0.0) < bridgewatch.EVERY_S or (
+                os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get("TTP_TEST_BRIDGE_WATCH")):
+            return   # daemons under test never read the real ssh config
         self._bridge_watched = now
         bridgewatch.check(self, now)
 
@@ -9868,7 +9882,7 @@ class Daemon:
             # The alert clears itself once no such reason holds (alerts.holds).
             episodes[prov] = self._red_episodes(prov, g, now)
             held = [] if provider_paused else bud.user_held(g)   # a pause has its own alert
-            settle = BUDGET_SETTLE_S
+            settle = budget_settle_s()
             due = {c for c in map(bud.red_class, held) if not episodes[prov][c].get("alerted", True)
                    and now - float(episodes[prov][c].get("red_since", now)) >= settle}
             if held and not due and prev and prev.level != "red":
@@ -12113,7 +12127,7 @@ class Daemon:
     def _precheck_wait_since(self, task: dict) -> float | None:
         """When the checks _precheck_holds waits for began waiting for a host checks slot; None while they run."""
         from .cli import CHECKS_SLOT_WAIT
-        name = next((x[len(PRECHECK_LABEL):] for x in task_labels(task) if x.startswith(PRECHECK_LABEL)), "")
+        name = next((x[len(PRECHECK_LABEL):] for x in push._labels(task) if x.startswith(PRECHECK_LABEL)), "")
         try:
             since = json.loads((self.p.state / PRECHECKS_DIR / name / CHECKS_SLOT_WAIT).read_text()).get("since")
         except (OSError, ValueError, AttributeError):
@@ -15036,8 +15050,11 @@ class Daemon:
         """Flag this project's own harness/prompts/worker.md once per changed copy when it is much larger
         than the template's or has drifted from its sections (promptdrift.check): a stat call per tick,
         the compare at most hourly. Its coordinator merges it; the harness never edits it."""
-        from . import promptdrift
-        promptdrift.check(self.p)
+        try:
+            from . import promptdrift
+            promptdrift.check(self.p)
+        except Exception:
+            log(self.p, "worker prompt drift: " + traceback.format_exc().replace("\n", " | ")[:1000])
 
     def lint_charter(self) -> None:
         """Flag dated charter sections that contradict a standing restriction (coord.charter_lint);
@@ -16386,7 +16403,7 @@ class Daemon:
                 continue
             del self._probes[tid]
             if rc is None:
-                probespawn.kill(proc)
+                _kill_group(proc)
             if id(proc) not in outs:
                 outs[id(proc)], lines[id(proc)], raws[id(proc)] = self._probe_texts(proc)
                 tails[id(proc)] = outs[id(proc)].strip()[-300:]
@@ -16789,7 +16806,7 @@ class Daemon:
         run = self._probes.get(tid)
         if run and run[2] != probe:
             if not any(o != tid and r[0] is run[0] for o, r in self._probes.items()):
-                probespawn.kill(run[0])   # unless shared: the other task still needs its verdict
+                _kill_group(run[0])   # unless shared: the other task still needs its verdict
                 self._probe_text(run[0])
             del self._probes[tid]
             self._probed.pop(tid, None)
@@ -17280,7 +17297,7 @@ class Daemon:
             todo.append((t["id"], f"#{t['id']} {t['title']}: its checks", out, f"relaunch-t{t['id']}", True))
         for r in db.q("SELECT id, labels FROM tasks WHERE kind='review' AND status IN (?,?,?) AND labels LIKE ?",
                       (*checklane.PRECHECK_READERS, f"%{PRECHECK_LABEL}%")):
-            name = next((x[len(PRECHECK_LABEL):] for x in task_labels(r) if x.startswith(PRECHECK_LABEL)), "")
+            name = next((x[len(PRECHECK_LABEL):] for x in push._labels(r) if x.startswith(PRECHECK_LABEL)), "")
             if m := re.fullmatch(r"t(\d+)-[0-9a-f]{12}", name):
                 out = self.p.state / PRECHECKS_DIR / name
                 todo.append((int(m[1]), f"#{m[1]}: the precheck of review #{r['id']}", out, precheck_run_id(out), False))
@@ -19358,7 +19375,7 @@ class Daemon:
                 continue
             del self._on_pass[tid]
             if rc is None:
-                probespawn.kill(proc)
+                _kill_group(proc)
             r = db.one("SELECT * FROM runs WHERE id=?", (run_id,))
             if r and r["dir"]:
                 # Its notes were acknowledged when sent: they go out whatever it ends with.
@@ -20314,8 +20331,11 @@ class Daemon:
 
     def tend_mitigations(self) -> None:
         """Model-free: an overdue mitigation wakes the coordinator, a done fix lists its measures for undo."""
-        for line in mitigate.tend(self.p.db, self.p.name, where=self.p):
-            log(self.p, line)
+        try:
+            for line in mitigate.tend(self.p.db, self.p.name, where=self.p):
+                log(self.p, line)
+        except Exception:
+            log(self.p, "mitigations: " + traceback.format_exc().replace("\n", " | ")[:1500])
 
     def sweep_reviews(self) -> None:
         """Model-free retry of reviews left to the coordinator: a code task (or a work task whose branch
@@ -20915,7 +20935,7 @@ class Daemon:
                 continue
             ids = {s["id"]} | {h["id"] for h in chaincap.split_hops(db, x)}
             for r in reviews:
-                labels = task_labels(r)
+                labels = push._labels(r)
                 named = [i for i in sorted(ids) if f"auto_review:{i}" in labels
                          or r["title"].startswith(f"Review #{i}:")]
                 if x["id"] not in dependency_ids(r) or not named:
@@ -20951,7 +20971,7 @@ class Daemon:
                 continue
             db.update_task(r["id"], depends_on=list(dict.fromkeys(task["id"] if d in hops else d
                                                                   for d in dependency_ids(r))),
-                           labels=[lb for lb in task_labels(r) if not lb.startswith(chaincap.SPLIT_REVIEW_LABEL)],
+                           labels=[lb for lb in push._labels(r) if not lb.startswith(chaincap.SPLIT_REVIEW_LABEL)],
                            spec=f"{r['spec'] or ''}\n#{task['id']} delivered the rest of its split chain before this "
                                 f"review started: review the whole chain at #{task['id']}'s head instead.")
             log(self.p, f"review {r['id']}: still queued, now reviews split chain to hop {task['id']}")
@@ -20980,7 +21000,7 @@ class Daemon:
             (*TERMINAL_TASK_STATES, tid, f'%"continues:{tid}"%'))
             if continues_id(x) == tid and not self._waits_landing(x, tid) and not chaincap.hop_stall(x, now)
             and (worktree.gets_worktree(self.p, x["kind"]) or worktree.carried_branch(x))
-            and (fixes or not any(lb.startswith(("review_fix:", "pr_fix:")) for lb in task_labels(x)))), None)
+            and (fixes or not any(lb.startswith(("review_fix:", "pr_fix:")) for lb in push._labels(x)))), None)
 
     def _stale_source(self, task: dict) -> str:
         """Why no review of task `task` may be queued now, read live from the records ('' when one may):
@@ -21376,7 +21396,7 @@ class Daemon:
         repeated hand-offs. None when there is none."""
         for r in self.p.db.q("SELECT * FROM tasks WHERE kind='review' AND status!='cancelled' AND labels LIKE ? "
                              "ORDER BY id", (f'%"{extchange.HEAD_LABEL}%',)):
-            labels = task_labels(r)
+            labels = push._labels(r)
             if (f"auto_review:{task['id']}" in labels or task["id"] in dependency_ids(r)) \
                     and any(extchange.same_head(h, ch["head"]) for h in extchange.heads(labels)):
                 return r["id"]
@@ -21386,7 +21406,7 @@ class Daemon:
         """A queued review that covers code task `task` (the re-review _fix_failed_review queued with its
         fix) gets the external head the task's hand-off published, once per head: its label, for
         _reviewed_external, and a spec line saying exactly what to fetch and review."""
-        labels = task_labels(review)
+        labels = push._labels(review)
         if review["status"] != "queued" or any(extchange.same_head(h, ch["head"]) for h in extchange.heads(labels)):
             return
         spec = (f"{review.get('spec') or ''}\nNew head: #{task['id']} published its fix. "
@@ -21542,7 +21562,7 @@ class Daemon:
         round, and one review_nofix event naming any approved push of it left unlanded (reviewreuse.judged,
         carry, unlanded). A push-conflict rebase (pushq.rebase_head) always runs. False whenever it runs."""
         db = self.p.db
-        if extchange.heads(task_labels(task)):
+        if extchange.heads(push._labels(task)):
             return False   # its change lives in another repository: the project's git holds no head of it
         if pushq.rebase_head(task):
             return False   # a push-conflict rebase makes the new head: it runs whatever its old head's verdict
@@ -21707,7 +21727,7 @@ class Daemon:
         ok = sorted(i for i, v in vs.items() if v == "pass" and i in ms)
         if approved and set(integrate.landable(root, sorted(vs), vs)) >= set(ok):
             return None   # every passing member is pushing on its own head
-        only = push.REVIEW_ONLY_LABEL in task_labels(review) + task_labels(first)
+        only = push.REVIEW_ONLY_LABEL in push._labels(review) + push._labels(first)
         rtier = "deep" if review["tier"] == "deep" else "standard"
         rid = db.add_task(
             f"Re-review #{review['id']}: " + re.sub(r"^(?:Re-review #\d+: )+", "", review["title"]),
@@ -21798,7 +21818,7 @@ class Daemon:
                     review.get("spec") or ""):
                 return
             line = reviewstats.new_head_line(self.p, failed, branch, full)
-            pushes = push.REVIEW_ONLY_LABEL not in task_labels(review)
+            pushes = push.REVIEW_ONLY_LABEL not in push._labels(review)
             carried = pushq.carried(self.p, task, full, self.cfg) if pushes else {}
         except Exception as e:
             log(self.p, f"task {task['id']}: review #{review['id']} not told its new head: {e}")
@@ -21818,7 +21838,7 @@ class Daemon:
         branch = task.get("branch")
         if review["status"] != "queued" or review["kind"] != "review" or not branch \
                 or not (d.get("push_branch") and d.get("push_allowed", True)) \
-                or push.REVIEW_ONLY_LABEL in task_labels(review):
+                or push.REVIEW_ONLY_LABEL in push._labels(review):
             return
         try:
             full = worktree._git(self.p.root, "rev-parse", branch)
@@ -21827,7 +21847,7 @@ class Daemon:
         except Exception as e:
             log(self.p, f"task {task['id']}: checks not started for review #{review['id']}: {e}")
             return
-        labels = task_labels(review)
+        labels = push._labels(review)
         if f"{PRECHECK_LABEL}t{task['id']}-{full[:12]}" in labels:
             return
         checks = self._precheck(task, full)
@@ -21932,7 +21952,7 @@ class Daemon:
         another run of the same checks, or running."""
         from . import checkcap
         from .cli import CHECKS_SLOT_WAIT, _read_checks_pid
-        name = next((x[len(PRECHECK_LABEL):] for x in task_labels(task) if x.startswith(PRECHECK_LABEL)), "")
+        name = next((x[len(PRECHECK_LABEL):] for x in push._labels(task) if x.startswith(PRECHECK_LABEL)), "")
         out = self.p.state / PRECHECKS_DIR / name
         head = str(_read_checks_pid(out).get("head") or name.rsplit("-", 1)[-1])[:12]
         what = f"its review's pre-checks (`ttp checks` on {head}, started by the daemon)"
@@ -21969,7 +21989,7 @@ class Daemon:
         `ttp checks` reports a missing runner), a missing target or selector (check:<sig>), a timeout
         or kill, a head that moved, or a failure shared with other changes (sharedchecks), whose
         incident path holds the reviewer's own checks."""
-        name = next((x[len(PRECHECK_LABEL):] for x in task_labels(task) if x.startswith(PRECHECK_LABEL)), "")
+        name = next((x[len(PRECHECK_LABEL):] for x in push._labels(task) if x.startswith(PRECHECK_LABEL)), "")
         m = re.fullmatch(r"t(\d+)-[0-9a-f]{12}", name)
         if not m:
             return False
@@ -22351,7 +22371,7 @@ class Daemon:
         cands = [t for i in sorted(coord._covered(db, deps, spec))
                  for t in [db.task(i)] if t and t["kind"] == "code" and t["branch"]]
         # A review of a change published in another repository is fixed there (_fix_external_review).
-        if extchange.heads(task_labels(review) + task_labels(first)):
+        if extchange.heads(push._labels(review) + push._labels(first)):
             ext = next(((t, ch) for i in sorted((i for i in deps if isinstance(i, int)), reverse=True)
                         if (t := db.task(i)) and t["kind"] == "code" and (ch := self._external_change(t))), None)
             if ext:
@@ -22383,7 +22403,7 @@ class Daemon:
             return None
         base_title = re.sub(r"^(?:Fix review #\d+: )+", "", code["title"])
         # A stack kept off the push branch stays review only through its fix and re-review.
-        only = push.REVIEW_ONLY_LABEL in task_labels(review) + task_labels(first)
+        only = push.REVIEW_ONLY_LABEL in push._labels(review) + push._labels(first)
         tier, tsrc = effort.fix_tier(db, code, review, fups)   # db.add_task: a fix never runs light
         rtier = "deep" if review["tier"] == "deep" else "standard"   # a re-review never runs light
         tag = spans.new_tag()   # this spec's delimiter: the reviewer's findings and hand-off are data
@@ -22452,7 +22472,7 @@ class Daemon:
             flines = first_spec.splitlines()
             cut = max((i + 1 for i, ln in enumerate(flines) if ln == REVIEW_CHECK_LINE), default=0)
             body, tail = flines[:cut], flines[cut:]
-            publish = any(lb.startswith("pr_branch:") for lb in task_labels(first)) \
+            publish = any(lb.startswith("pr_branch:") for lb in push._labels(first)) \
                 or any(OWN_STEP.match(ln) for ln in tail)
             step = ""
             if publish and onto:
@@ -22488,7 +22508,7 @@ class Daemon:
                             f"it for the push queue. This overrides any push step in the first review's spec.")
             # A stack that lands with `ttp land` lands the fix's head, not the head the first review named.
             lands = land.local_branch(self.p, self.p.root) \
-                if not step and push.LAND_LABEL in task_labels(review) + task_labels(first) else ""
+                if not step and push.LAND_LABEL in push._labels(review) + push._labels(first) else ""
             if lands:
                 tail = [ln for ln in tail if not ln.startswith(land.STEP)]
                 step = land.step(lands, f"<#{fid}'s head as you reviewed it>")
@@ -22609,7 +22629,7 @@ class Daemon:
         out = []
         for r in self.p.db.q("SELECT * FROM tasks WHERE kind='review' AND status='queued' AND labels LIKE ?",
                              (f'%"{FIX_BASE_LABEL}%',)):
-            base = next((lb[len(FIX_BASE_LABEL):] for lb in task_labels(r) if lb.startswith(FIX_BASE_LABEL)), "")
+            base = next((lb[len(FIX_BASE_LABEL):] for lb in push._labels(r) if lb.startswith(FIX_BASE_LABEL)), "")
             if task["id"] not in dependency_ids(r) or not base:
                 continue
             try:
@@ -24752,6 +24772,12 @@ def _current_probe(task: dict) -> str | None:
     return probe if isinstance(probe, str) else None
 
 
+def _kill_group(proc: subprocess.Popen) -> None:
+    """Kill proc's session, waiting at most probespawn.KILL_WAIT_S for it (one stuck in the kernel must
+    not hold the tick)."""
+    probespawn.kill(proc)
+
+
 def _read_pid(path: Path) -> int | None:
     try:
         return int(path.read_text().strip())
@@ -24876,7 +24902,13 @@ def sd_notify(msg: str, addr: str | None) -> bool:
 
 def _alive(pid: int) -> bool:
     """pid runs: kill(pid, 0) finds it and it is not a zombie (ended, not reaped yet)."""
-    return pid_alive(pid) and not zombie(pid)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return not zombie(pid)
 
 
 def main() -> int:

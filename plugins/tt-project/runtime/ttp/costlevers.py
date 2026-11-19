@@ -2,6 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """The cost levers, each behind its own release-ring flag (rollout.FLAGS), all off by default:
 
+- rings.fresh_continue (key worker.fresh_continue): a continue, fix or retry run starts fresh instead of
+  resuming an earlier worker session (ctxfork.prepare skips the resume source), with a compact hand-off
+  (handoff_block: the earlier hand-offs, the review findings it fixes, the diff). A run that forks the
+  coordinator keeps the fork (full context stays). Its run note's coord_context carries "fresh": true.
 - rings.coord_wake_settle (key coordinator.wake_settle): wakesettle.py settles routine coordinator wakes
   without a model (a probe-passed spec edit that only records the pass is one of them); its decision counter
   (wake_decisions) records every pre-screen gate's verdict always. The daemon also runs the waste ledger
@@ -17,6 +21,9 @@
 Precedence (rollout.on): a project's own explicit value for the flag's key wins, else the ring rule, else off.
 
 Metrics (status_lines in `ttp status`, audit_lines in the daily review), last 7 days:
+- fresh: runs per arm (fresh vs resumed), $ per landing and landed rate of the arm's code tasks, tool calls
+  per run, review rounds per task; landings judged by landed.recorded (push queue, task_landings,
+  supersessions and the tasks that carry a change on), shown against task_landings alone.
 - wakes: wakesettle.line; wake tools: coordinator wakes with TOOLS_STEER or more tool calls and their $.
 - eta: the shadow baseline (ETAs compared, median and p90 absolute error of each method), flag on only.
 - output: output tokens and $ per worker run by kind, trimmed-effort runs vs the rest.
@@ -26,15 +33,18 @@ from __future__ import annotations
 import json
 import re
 import statistics
+import subprocess
 import time
 from typing import Any
-
 
 TRIM_KEY = "output_trim"     # run note: {"effort", "from", "why"} of an effort pick
 STATUS_KEY = "cost_levers_status"   # kv: {"at", "lines"}, the status lines cached
 STATUS_TTL_S = 1800.0
 WINDOW_S = 7 * 86400.0
-SAMPLE = 200                 # coordinator runs whose transcript is read for tool calls
+HANDOFF_CHARS = 48000        # about 12k tokens
+RESULT_CHARS = 8000
+DIFF_CHARS = 24000
+SAMPLE = 200                 # runs per arm whose transcript is read for tool calls
 TOOLS_STEER = 8              # a coordinator wake with this many tool calls steers the next one
 STEER_KEY = "wake_tools_steer"      # kv: {"run", "tools", "at"} of the wake that made TOOLS_STEER+ calls
 STEER_LINE = ("Last wake made {tools} tool calls (run {run}): each call re-reads the whole context. Batch "
@@ -69,12 +79,160 @@ def lever_on(p, flag: str) -> bool:
         return False
 
 
+# --- lever a: fresh continue -------------------------------------------------------------------------
+
+def _labels(task: dict) -> list[str]:
+    try:
+        got = json.loads(task.get("labels") or "[]")
+    except (TypeError, ValueError):
+        return []
+    return [x for x in got if isinstance(x, str)] if isinstance(got, list) else []
+
+
+def review_fixed(task: dict) -> int | None:
+    """The review a fix task fixes (its `review_fix:<id>` label), or None."""
+    return next((int(x[11:]) for x in _labels(task) if x.startswith("review_fix:") and x[11:].isdigit()), None)
+
+
+def _result_text(res: dict) -> str:
+    keep = {k: res[k] for k in ("status", "summary", "message", "findings", "followups", "self_check", "on_pass")
+            if res.get(k)}
+    text = json.dumps(keep, indent=1, ensure_ascii=False, default=str) if keep else ""
+    return text if len(text) <= RESULT_CHARS else text[:RESULT_CHARS] + "\n… (cut)"
+
+
+def _git(cwd: str, *args: str) -> str:
+    try:
+        from . import gitmemo
+        r = gitmemo.run(["git", "-C", cwd, *args], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return r.stdout if r.returncode == 0 else ""
+
+
+def handoff_block(p, task_id: int, cwd: str | None) -> str:
+    """The compact hand-off a fresh run of `task_id` starts with: its own last hand-off, the hand-off of the
+    task it continues, the findings of the review it fixes, and its work so far against the base branch.
+    '' when there is nothing. Capped at HANDOFF_CHARS."""
+    from . import chaincap
+    from .db import load_result
+    db = p.db
+    task = db.task(int(task_id))
+    if not task:
+        return ""
+    task = dict(task)
+    parts: list[str] = []
+    if text := _result_text(load_result(task.get("result"))):
+        parts.append(f"## This task's last hand-off (an earlier run)\n{text}")
+    prev = chaincap.prev_of(task)
+    if prev and (pt := db.task(int(prev))) and (text := _result_text(load_result(dict(pt).get("result")))):
+        parts.append(f"## Hand-off of #{prev} ({dict(pt).get('title') or ''}), which this task continues\n{text}")
+    rev = review_fixed(task)
+    if rev and rev != prev and (rt := db.task(rev)) and (text := _result_text(load_result(dict(rt).get("result")))):
+        parts.append(f"## Findings of review #{rev}, which this task fixes\n{text}")
+    if cwd:
+        from . import worktree
+        try:
+            base = worktree.base_ref(p)
+        except Exception:
+            base = ""
+        stat = _git(cwd, "diff", "--stat", f"{base}...HEAD") if base else ""
+        dirty = _git(cwd, "status", "--short")
+        if stat.strip() or dirty.strip():
+            diff = _git(cwd, "diff", f"{base}...HEAD") if base else ""
+            if len(diff) > DIFF_CHARS:
+                diff = diff[:DIFF_CHARS] + "\n… (cut: read the rest with git diff)"
+            parts.append(f"## Work on this branch so far (against {base or 'the base'})\n{stat.strip()}"
+                         + (f"\nuncommitted:\n{dirty.strip()}" if dirty.strip() else "")
+                         + (f"\n```diff\n{diff}\n```" if diff.strip() else ""))
+    if not parts:
+        return ""
+    out = ("# Fresh start (rings.fresh_continue)\nThis run starts fresh instead of resuming an earlier worker "
+           "session. What earlier runs left, in short (read files again as needed):\n\n" + "\n\n".join(parts))
+    return out if len(out) <= HANDOFF_CHARS else out[:HANDOFF_CHARS] + "\n… (cut)"
+
+
 def _note(raw: Any) -> dict:
     try:
         got = json.loads(raw or "{}")
     except (TypeError, ValueError):
         return {}
     return got if isinstance(got, dict) else {}
+
+
+def arm_of(note: dict) -> str:
+    """'fresh' (the lever started it fresh), 'resumed' (it resumed an earlier worker session) or ''."""
+    from . import ctxfork
+    cc = note.get(ctxfork.KEY)
+    if not isinstance(cc, dict):
+        return ""
+    return "fresh" if cc.get("fresh") else "resumed" if cc.get("how") == "resume" else ""
+
+
+def fresh_report(p, since: float, until: float | None = None) -> dict:
+    """{arm: {runs, usd, tasks, code_tasks, landed, usd_per_landing, landed_rate, tool_calls, review_rounds}}
+    plus "landings": {done_code, judged, table_only}: how complete the landing records are."""
+    from . import coordstats, landed
+    from .db import review_subject
+    db = p.db
+    until = time.time() if until is None else until
+    rows = db.q("SELECT r.id, r.task, r.cost_usd, r.note, r.dir, r.provider, t.kind FROM runs r JOIN tasks t "
+                "ON t.id=r.task WHERE r.role!='coordinator' AND r.started>=? AND r.started<? "
+                "AND r.status!='running'", (since, until))
+    arms: dict[str, dict] = {}
+    for r in rows:
+        a = arm_of(_note(r["note"]))
+        if not a:
+            continue
+        s = arms.setdefault(a, {"runs": [], "tasks": set(), "code": set()})
+        s["runs"].append(r)
+        s["tasks"].add(int(r["task"]))
+        if r["kind"] == "code":
+            s["code"].add(int(r["task"]))
+    done = [int(t["id"]) for t in db.q("SELECT id FROM tasks WHERE kind='code' AND status='done' "
+                                        "AND updated>=? AND updated<?", (since, until))]
+    want = set(done).union(*(s["code"] for s in arms.values())) if arms else set(done)
+    rws = landed.Rows(db, want) if want else None
+    land = {t: bool(landed.recorded(db, t, rows=rws)[0]) for t in want} if rws else {}
+    table = {int(x["task"]) for x in db.q("SELECT DISTINCT task FROM task_landings")}
+    subj: dict[int, int] = {}
+    for t in db.q("SELECT id, title FROM tasks WHERE kind='review' AND created>=?", (since - WINDOW_S,)):
+        if (s := review_subject(dict(t))) is not None:
+            subj[s] = subj.get(s, 0) + 1
+    out: dict = {}
+    for a, s in arms.items():
+        code_usd = sum(float(r["cost_usd"] or 0) for r in s["runs"] if int(r["task"]) in s["code"])
+        n_land = sum(1 for t in s["code"] if land.get(t))
+        calls = [c for r in s["runs"][-SAMPLE:] if (c := coordstats.tool_calls(r, p.runs)) is not None]
+        out[a] = {"runs": len(s["runs"]), "usd": round(sum(float(r["cost_usd"] or 0) for r in s["runs"]), 2),
+                  "tasks": len(s["tasks"]), "code_tasks": len(s["code"]), "landed": n_land,
+                  "usd_per_landing": round(code_usd / n_land, 2) if n_land else None,
+                  "landed_rate": round(n_land / len(s["code"]), 3) if s["code"] else None,
+                  "tool_calls": round(statistics.median(calls), 1) if calls else None,
+                  "review_rounds": round(sum(subj.get(t, 0) for t in s["code"]) / len(s["code"]), 2)
+                  if s["code"] else None}
+    out["landings"] = {"done_code": len(done), "judged": sum(1 for t in done if land.get(t)),
+                       "table_only": sum(1 for t in done if t in table)}
+    return out
+
+
+def fresh_line(p, since: float, until: float | None = None) -> str:
+    r = fresh_report(p, since, until)
+    lg = r.pop("landings")
+    arms = []
+    for a in ("fresh", "resumed"):
+        if s := r.get(a):
+            arms.append(f"{a} {s['runs']} runs"
+                        + (f", ${s['usd_per_landing']:.2f}/landing" if s["usd_per_landing"] is not None else "")
+                        + (f", landed {100 * s['landed_rate']:.0f}%" if s["landed_rate"] is not None else "")
+                        + (f", {s['tool_calls']:g} tool calls/run" if s["tool_calls"] is not None else "")
+                        + (f", {s['review_rounds']:g} review rounds/task" if s["review_rounds"] is not None else ""))
+    flag = "on" if lever_on(p, "fresh_continue") else "off"
+    if not arms and flag == "off":   # nothing to compare: no line
+        return ""
+    return (f"fresh continue [{flag}]: " + ("; ".join(arms) if arms else "no continue runs")
+            + f"; landings: {lg['judged']} of {lg['done_code']} done code tasks landed"
+            f" (task_landings alone: {lg['table_only']})")
 
 
 # --- lever c: output ---------------------------------------------------------------------------------
@@ -200,7 +358,8 @@ def eta_shadow_line(p, since: float, until: float | None = None) -> str:
 def lines(p, since: float, until: float | None = None) -> list[str]:
     from . import wakesettle
     out = []
-    for fn in (lambda p, s, u: wakesettle.line(p.db, s, u), wake_tools_line, output_line, eta_shadow_line):
+    for fn in (fresh_line, lambda p, s, u: wakesettle.line(p.db, s, u), wake_tools_line, output_line,
+               eta_shadow_line):
         try:
             if ln := fn(p, since, until):
                 out.append(ln)
@@ -225,10 +384,10 @@ def status_lines(p, now: float | None = None) -> list[str]:
 
 
 def audit_lines(p, since: float) -> list[str]:
-    """The daily review's lever lines: the wake-tools, output and eta shadow metrics (the wake line has its own
-    audit line)."""
+    """The daily review's lever lines: the fresh, wake-tools, output and eta shadow metrics (the wake line has
+    its own audit line)."""
     out = []
-    for fn in (wake_tools_line, output_line, eta_shadow_line):
+    for fn in (fresh_line, wake_tools_line, output_line, eta_shadow_line):
         try:
             if ln := fn(p, since):
                 out.append(ln)

@@ -54,15 +54,16 @@ no later run, release check or required whole-suite pass reuses it, and `ttp che
 excuses nothing."""
 from __future__ import annotations
 
+import fcntl
 import json
 import re
 import socket
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from . import checkwait, sharedchecks, timefmt
-from .util import flocked, read_dict
 
 QUARANTINE_FILE = "test_quarantine.json"   # in the project's state: {id: entry}
 BASE_FILE = "gate_base.json"               # in the project's state: {"host|base|id": {"failed", "ts"}}
@@ -260,8 +261,20 @@ def same_failure(head: dict | None, base: dict | None) -> bool:
     return False
 
 
+@contextmanager
 def _locked(path: Path):
-    return flocked(path.with_name(path.name + ".lock"), 0o666)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path.with_name(path.name + ".lock"), "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+
+
+def _load(path: Path) -> dict:
+    try:
+        d = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return d if isinstance(d, dict) else {}
 
 
 def _save(path: Path, d: dict) -> None:
@@ -272,7 +285,7 @@ def _save(path: Path, d: dict) -> None:
 def active(state: Path, now: float | None = None) -> dict:
     """The quarantined tests not expired: {id: entry}."""
     now = time.time() if now is None else now
-    return {k: v for k, v in read_dict(Path(state) / QUARANTINE_FILE).items()
+    return {k: v for k, v in _load(Path(state) / QUARANTINE_FILE).items()
             if isinstance(v, dict) and float(v.get("expires") or 0) > now}
 
 
@@ -281,7 +294,7 @@ def quarantine(state: Path, ids: list[str], evidence: dict, now: float, days: fl
     expired entries go. Returns the ids not quarantined before, for the one fix note."""
     path = Path(state) / QUARANTINE_FILE
     with _locked(path):
-        d = {k: v for k, v in read_dict(path).items() if isinstance(v, dict) and float(v.get("expires") or 0) > now}
+        d = {k: v for k, v in _load(path).items() if isinstance(v, dict) and float(v.get("expires") or 0) > now}
         new = [i for i in ids if i not in d]
         for i in ids:
             e = d.setdefault(i, {"first_seen": now})
@@ -298,7 +311,7 @@ def lift(state: Path, ids: list[str], why: str, commit: str = "", by: str = "dae
     now = time.time() if now is None else now
     path = Path(state) / QUARANTINE_FILE
     with _locked(path):
-        d = read_dict(path)
+        d = _load(path)
         gone = {i: d.pop(i) for i in ids if i in d}
         if gone:
             _save(path, d)
@@ -578,7 +591,7 @@ def premise_line(tid) -> str:
 
 
 def _saved(state: Path, where: str, base: str, ids: list[str], now: float) -> dict[str, dict]:
-    d = read_dict(Path(state) / BASE_FILE)
+    d = _load(Path(state) / BASE_FILE)
     out = {}
     for i in ids:
         e = d.get(f"{where}|{base}|{i}")
@@ -597,7 +610,7 @@ def save_base(state: Path, where: str, base: str, verdicts: dict[str, bool], now
     """Save base results, with each failure's mark (`how`, marks) to compare a later head failure with."""
     path = Path(state) / BASE_FILE
     with _locked(path):
-        d = {k: v for k, v in read_dict(path).items()
+        d = {k: v for k, v in _load(path).items()
              if isinstance(v, dict) and now - float(v.get("ts") or 0) < BASE_KEEP_S}
         for i, bad in verdicts.items():
             d[f"{where}|{base}|{i}"] = {"host": where, "failed": bad, "ts": now,
@@ -614,7 +627,7 @@ def save_new(state: Path, tree: str, check: str, v: dict, now: float) -> None:
         return
     path = Path(state) / NEW_FILE
     with _locked(path):
-        d = {k: e for k, e in read_dict(path).items() if isinstance(e, dict) and now - float(e.get("ts") or 0) < BASE_KEEP_S}
+        d = {k: e for k, e in _load(path).items() if isinstance(e, dict) and now - float(e.get("ts") or 0) < BASE_KEEP_S}
         d[f"{tree}|{check}"] = {"head": v.get("head") or "", "base": v.get("base") or "", "host": v.get("host") or "",
                                 "new": ids, "ts": now}
         _save(path, d)
@@ -624,7 +637,7 @@ def known_new(state: Path, tree: str, check: str, now: float | None = None) -> d
     """The saved blocking verdict (save_new) of `check` on head tree `tree`, else None. The same tree runs the
     same code, so the tests proven new on it fail there again whatever the base: a change must fix them."""
     now = time.time() if now is None else now
-    e = read_dict(Path(state) / NEW_FILE).get(f"{tree}|{check}") if tree else None
+    e = _load(Path(state) / NEW_FILE).get(f"{tree}|{check}") if tree else None
     return e if isinstance(e, dict) and e.get("new") and now - float(e.get("ts") or 0) < BASE_KEEP_S else None
 
 

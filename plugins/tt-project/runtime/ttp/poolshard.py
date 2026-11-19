@@ -20,13 +20,14 @@ files on that pool and prints one line per file done (DONE_RE, or --done-re). It
   the push log shows it, and it counts against the check's pool-wait bound (delivery.push_pool_wait_s) and
   the stall window, not as run time against its time limit (delivery.push_checks_timeout_s).
 
-The window: `checks.pool_shard_stall_s` (account settings) when set, else
+The window: `checks.pool_shard_stall_s` (account settings, or TTP_POOL_SHARD_STALL_S) when set, else
 STALL_FACTOR times the median seconds per file this machine measured (the time between two files of one
-shard, the newest KEEP per --what), at least the floor `checks.pool_shard_stall_floor_s` (default
-STALL_FLOOR_S)."""
+shard, the newest KEEP per --what), at least the floor `checks.pool_shard_stall_floor_s` (or
+TTP_POOL_SHARD_STALL_FLOOR_S; default STALL_FLOOR_S)."""
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import json
 import math
 import os
@@ -42,7 +43,6 @@ from pathlib import Path
 from typing import Callable
 
 from . import checkwait, project
-from .util import flocked, read_dict
 
 STALLED = 124
 DONE_RE = r"^(PASS|FAIL)\b|\[\s*\d+%\]\s*$"   # a PASS/FAIL line per file, or pytest's per-file progress line
@@ -69,24 +69,36 @@ def _num(v) -> float | None:
     return f if math.isfinite(f) and f > 0 else None
 
 
-def _setting(key: str) -> float | None:
+def _setting(env: str, key: str) -> float | None:
     try:
         checks = project.load_account_settings().get("checks") or {}
     except Exception:   # unreadable settings only lose the override
         checks = {}
-    v = checks.get(key)
-    return _num(v) if v not in (None, "") else None
+    for v in (os.environ.get(env), checks.get(key)):
+        if v not in (None, "") and (n := _num(v)) is not None:
+            return n
+    return None
 
 
 @contextlib.contextmanager
 def _locked():
     d = _dir()
-    with flocked(d / "pool-shards.lock", 0o666):
+    d.mkdir(parents=True, exist_ok=True)
+    with open(d / "pool-shards.lock", "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
         yield d
 
 
 def _history_path() -> Path:
     return _dir() / "pool-shard-files.json"
+
+
+def _read(path: Path) -> dict:
+    try:
+        v = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return v if isinstance(v, dict) else {}
 
 
 def _secs(v) -> list[float]:
@@ -95,7 +107,7 @@ def _secs(v) -> list[float]:
 
 def per_file(what: str = "") -> float | None:
     """The median seconds per file measured for `what`, None before any."""
-    got = _secs(read_dict(_history_path()).get(what or "-"))
+    got = _secs(_read(_history_path()).get(what or "-"))
     return statistics.median(got) if got else None
 
 
@@ -103,16 +115,16 @@ def record(seconds: list[float], what: str = "") -> None:
     if not seconds:
         return
     with _locked():
-        h = read_dict(_history_path())
+        h = _read(_history_path())
         h[what or "-"] = (_secs(h.get(what or "-")) + [round(s, 2) for s in seconds])[-KEEP:]
         project.durable_write(_history_path(), json.dumps(h, sort_keys=True))
 
 
 def window(what: str = "") -> float:
-    fixed = _setting("pool_shard_stall_s")
+    fixed = _setting("TTP_POOL_SHARD_STALL_S", "pool_shard_stall_s")
     if fixed:
         return fixed
-    floor = _setting("pool_shard_stall_floor_s") or STALL_FLOOR_S
+    floor = _setting("TTP_POOL_SHARD_STALL_FLOOR_S", "pool_shard_stall_floor_s") or STALL_FLOOR_S
     med = per_file(what)
     return max(floor, STALL_FACTOR * med) if med else floor
 
@@ -131,7 +143,7 @@ def mark(pool: str, shard: str, why: str, now: float | None = None) -> None:
 
 def marked(pool: str, now: float | None = None) -> dict | None:
     """The pool's stall mark while it is fresh (younger than MARK_TTL_S), else None."""
-    m = read_dict(_mark_path(pool))
+    m = _read(_mark_path(pool))
     since = _num(m.get("since"))
     now = time.time() if now is None else now
     return m if since and now - since < MARK_TTL_S else None

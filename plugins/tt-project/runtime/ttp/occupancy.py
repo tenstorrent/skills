@@ -37,6 +37,8 @@ Jobs already running on this host while a stream holds it are lowered, never sig
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -46,7 +48,6 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import boundedchild, project
-from .util import flocked, read_dict
 
 SOURCES = "occupancy-sources.json"
 READINGS = "occupancy-readings.json"
@@ -69,8 +70,23 @@ def _path(name: str) -> Path:
     return project.HOME_DIR / name
 
 
+@contextlib.contextmanager
 def _locked():
-    return flocked(_path(LOCK))
+    project.HOME_DIR.mkdir(parents=True, exist_ok=True)
+    fd = os.open(_path(LOCK), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def _load(name: str) -> dict:
+    try:
+        doc = json.loads(_path(name).read_text())
+    except (OSError, ValueError):
+        return {}
+    return doc if isinstance(doc, dict) else {}
 
 
 def _save(name: str, doc: dict) -> None:
@@ -108,11 +124,21 @@ def alerts_on(v: Any) -> bool:
     return v is None or str(v).strip().lower() not in ("false", "off", "no", "0")
 
 
+def source_problem(value: Any) -> str | None:
+    """Why an `occupancy.sources` value cannot be used, or None."""
+    if not isinstance(value, dict):
+        return "occupancy.sources is an object of machine alias -> {cmd | file, timeout_s, fronts}"
+    for alias, src in value.items():
+        if not isinstance(src, dict) or not (src.get("cmd") or src.get("file")):
+            return f"occupancy.sources.{alias} needs a read-only `cmd` (exit 0 live, 1 free) or a `file`"
+    return None
+
+
 def publish(p, cfg: dict | None = None) -> dict:
     """Write this project's registrations into the shared registry (removed when it has none)."""
     mine = settings(p.config() if cfg is None else cfg)
     with _locked():
-        doc = read_dict(_path(SOURCES))
+        doc = _load(SOURCES)
         projects = doc.setdefault("projects", {})
         if mine["sources"]:
             projects[p.name] = {**mine, "base": str(p.base), "at": time.time()}
@@ -126,7 +152,7 @@ def registry() -> dict:
     """{project: {"sources", "quiet_s", "base"}} of every project on the host that registered one.
     A registration whose project folder (`base`) is gone is dropped: a deleted project's stale source
     must never hold a box for the projects that remain."""
-    return {k: v for k, v in (read_dict(_path(SOURCES)).get("projects") or {}).items()
+    return {k: v for k, v in (_load(SOURCES).get("projects") or {}).items()
             if isinstance(v, dict) and not (v.get("base") and not os.path.exists(str(v["base"])))}
 
 
@@ -206,12 +232,12 @@ def _reading(proj: str, alias: str, src: dict, now: float, fresh: bool) -> dict:
     """The source's shared reading, read again when older than CACHE_S (or `fresh`); its live spans kept."""
     key = f"{proj}:{alias}"
     with _locked():
-        rec = (read_dict(_path(READINGS)).get(key) or {})
+        rec = (_load(READINGS).get(key) or {})
     if not fresh and rec and now - float(rec.get("at", 0)) < CACHE_S:
         return rec
     state, detail = read_source(src, now)
     with _locked():
-        doc = read_dict(_path(READINGS))
+        doc = _load(READINGS)
         rec = doc.get(key) or {}
         spans = _step_spans(rec.get("spans"), state in ("live", "unknown"), now)   # unknown holds: never a silent pass
         live = _step_spans(_live_spans(rec), state == "live", now)   # what the watchdog charges jobs to
@@ -335,7 +361,7 @@ def _error_hold(target: str, step: str) -> str:
 def _error_hold_raw(target: str, step: str) -> str:
     """Last resort when the registry cannot be parsed by `covered()`: a raw scan of the file."""
     try:
-        for reg in (read_dict(_path(SOURCES)).get("projects") or {}).values():
+        for reg in (_load(SOURCES).get("projects") or {}).values():
             for alias, src in (reg.get("sources") or {}).items():
                 fronts = src.get("fronts") or [] if isinstance(src, dict) else []
                 if _matches(alias, target) or (step in FRONT_STEPS and any(_matches(str(f), target) for f in fronts)):

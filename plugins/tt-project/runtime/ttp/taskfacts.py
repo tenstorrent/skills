@@ -74,6 +74,11 @@ def refs(text: str, skip=()) -> list[tuple[int, bool]]:
     return out[:MAX_TASKS]
 
 
+def ids_in(text: str, skip=()) -> list[int]:
+    """The task ids `text` names as `#<id>` (see refs)."""
+    return [n for n, _ in refs(text, skip)]
+
+
 def _clip(text, chars: int) -> str:
     text = " ".join(str(text or "").split())
     return text if len(text) <= chars else text[:chars - 1] + "…"

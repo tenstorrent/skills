@@ -49,6 +49,7 @@ second cannot both take the last place, and one tick starting all ready work sta
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import json
 import math
 import os
@@ -59,7 +60,6 @@ import time
 from pathlib import Path
 
 from . import hostcpu
-from .util import flocked
 
 STATE = "machine-workers.json"
 SIGNAL_S = 30.0     # signals are read at most this often per machine
@@ -301,7 +301,8 @@ def _locked(home: Path | None = None):
     home = home or _home()
     home.mkdir(parents=True, exist_ok=True)
     path = home / STATE
-    with flocked(home / (STATE + ".lock"), 0o666):
+    with open(home / (STATE + ".lock"), "a") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
         try:
             data = json.loads(path.read_text())
             data = data if isinstance(data, dict) else {}

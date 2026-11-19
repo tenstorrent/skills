@@ -77,6 +77,12 @@ RULE = ("De-slop rule (the scan numbers above are findings for you to judge, not
         "recorded incident without asserting the general rule it broke. An incident fix must fit the existing "
         "design or refactor it, never add one more special case beside it. A named, necessary constant is "
         "not a failure.")
+WORKER_RULE = ("Before you write code, find the function that already decides the rule you touch and extend or "
+               "refactor it: never add a second copy, a parallel special case, a timeout or threshold as a bare "
+               "number (name it once), a comment or docstring that tells an incident (a date, a task or ticket id, "
+               "a host name; say the rule and why, not the story), or a test that only replays one recorded "
+               "incident (assert the general rule it broke). `ttp slop --diff <base>..HEAD` shows what your change adds.")
+COUNTED = ("duplicates", "globals", "magic", "magic_timing", "long_functions", "noise")
 
 
 def _sub_of(path: str, subsystems: list[str]) -> str:

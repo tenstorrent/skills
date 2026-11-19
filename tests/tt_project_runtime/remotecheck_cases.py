@@ -3430,7 +3430,7 @@ def test_a_stopped_slurm_check_cancels_its_job_and_leaves_nothing(env, tmp_path)
     proc = _slurm_run(tmp_path, repo, "sleep 60", fake, wait=False)
     deadline = time.time() + 30
     while time.time() < deadline and not any(  # past the workdir probe's job: the check's own is sent
-            read_dict(f).get("job") == "101" for f in slurmcheck.slurm_dir().glob("job.*.json")):
+            slurmcheck._read(f).get("job") == "101" for f in slurmcheck.slurm_dir().glob("job.*.json")):
         time.sleep(0.1)
     assert (d / "sbatch.log").exists()
     proc.send_signal(signal.SIGTERM)
@@ -4563,9 +4563,9 @@ def test_a_push_batch_spills_its_checks_first_and_a_spill_host_fault_reruns_them
     bid = _pq_batch(s)
     marker = pathlib.Path(s.p.db.one("SELECT marker FROM push_batches WHERE id=?", (bid,))["marker"])
     monkeypatch.setattr(sys, "stdin", io.StringIO(""))
-    monkeypatch.setenv("TTP_RUN_DIR", read_dict(marker)["check_report_dir"])
+    monkeypatch.setenv("TTP_RUN_DIR", push._read(marker)["check_report_dir"])
     assert batch.run_batch(s.p, marker) == 0
-    assert read_dict(marker)["outcome"] == "pushed", read_dict(marker)
+    assert push._read(marker)["outcome"] == "pushed", push._read(marker)
     where = log.read_text().splitlines()
     assert where and "/ttp-check." in where[0], where
     if fault:
@@ -4791,9 +4791,9 @@ def test_a_spilled_push_batch_suite_is_judged_as_its_local_original(env, tmp_pat
     _pq_hand_off(env, s)
     marker = pathlib.Path(s.p.db.one("SELECT marker FROM push_batches WHERE id=?", (_pq_batch(s),))["marker"])
     monkeypatch.setattr(sys, "stdin", io.StringIO(""))
-    monkeypatch.setenv("TTP_RUN_DIR", read_dict(marker)["check_report_dir"])
+    monkeypatch.setenv("TTP_RUN_DIR", push._read(marker)["check_report_dir"])
     assert batch.run_batch(s.p, marker) == 0
-    m = read_dict(marker)
+    m = push._read(marker)
     assert m["outcome"] == "pushed", m
     [got] = m[{"flaky": "flaky_tests"}.get(kind, kind)]
     assert got["ids"] == ["test_g.py::test_g"], got
@@ -4822,9 +4822,9 @@ def test_a_spilled_push_batch_check_reruns_only_here_with_its_selection(env, tmp
     _pq_hand_off(env, s, task=review, push=[{"branch": branch, "head": _git_out(path, "rev-parse", "HEAD")}])
     marker = pathlib.Path(s.p.db.one("SELECT marker FROM push_batches WHERE id=?", (_pq_batch(s),))["marker"])
     monkeypatch.setattr(sys, "stdin", io.StringIO(""))
-    monkeypatch.setenv("TTP_RUN_DIR", read_dict(marker)["check_report_dir"])
+    monkeypatch.setenv("TTP_RUN_DIR", push._read(marker)["check_report_dir"])
     batch.run_batch(s.p, marker)
-    m = read_dict(marker)
+    m = push._read(marker)
     assert m["checks"].get("id_probes"), m
     lines = log.read_text().splitlines()
     first = next(n for n, ln in enumerate(lines) if "/ttp-check." in ln)
@@ -5161,11 +5161,11 @@ def test_a_push_batch_beside_a_host_pinned_suite_spills_and_its_light_check_take
         _pq_hand_off(env, s)
         marker = pathlib.Path(s.p.db.one("SELECT marker FROM push_batches WHERE id=?", (_pq_batch(s),))["marker"])
         monkeypatch.setattr(sys, "stdin", io.StringIO(""))
-        monkeypatch.setenv("TTP_RUN_DIR", read_dict(marker)["check_report_dir"])
+        monkeypatch.setenv("TTP_RUN_DIR", push._read(marker)["check_report_dir"])
         assert batch.run_batch(s.p, marker) == 0
     finally:
         held.close()
-    assert read_dict(marker)["outcome"] == "pushed", read_dict(marker)
+    assert push._read(marker)["outcome"] == "pushed", push._read(marker)
     where = log.read_text().splitlines()
     assert sorted(ln.split()[0] for ln in where) == ["light", "own", "pinned"], where
     assert all("/ttp-check." in ln for ln in where if not ln.startswith("light")), where

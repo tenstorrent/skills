@@ -31,13 +31,13 @@ project's providers_allowed (provallow.py): a task with none left waits on its p
 """
 from __future__ import annotations
 
+import json
 import re
 import time
 from typing import Any
 
 from . import headline, provallow, timefmt
 from .db import DB
-from .util import task_labels
 
 KIND = "provider_failover"
 REQUIRED_LABEL = "pin:required"      # the user's own words require the task's provider or model
@@ -173,6 +173,14 @@ def _held(gate: Any, pause: dict | None, logged_out: bool, now: float) -> tuple[
     return "; ".join(reasons), max(float(e) for e in ends)
 
 
+def _labels(task: dict) -> list:
+    try:
+        v = json.loads(task.get("labels") or "[]")
+    except (TypeError, ValueError):
+        return []
+    return v if isinstance(v, list) else []
+
+
 def required(db: DB, task: dict, depth: int = 8) -> bool:
     """Whether the task's pin is marked required: its own REQUIRED_LABEL, or one on a task it
     continues, reviews or fixes (so a review or fix keeps the pin its origin requires), unless its
@@ -183,7 +191,7 @@ def required(db: DB, task: dict, depth: int = 8) -> bool:
         if t["id"] in seen:
             continue
         seen.add(t["id"])
-        labels = task_labels(t)
+        labels = _labels(t)
         if PREFERRED_LABEL in labels:
             if t is task:
                 return False

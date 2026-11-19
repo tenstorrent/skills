@@ -328,6 +328,11 @@ def publish(served: list[str] | None, now: float) -> dict:
     return _locked(work)
 
 
+def fast_order(cls: str) -> list[str]:
+    """`cls`'s fast order from FILE (an urgent or critical-path start under auto), or []."""
+    return list(((_read().get("orders") or {}).get(cls) or {}).get("fast") or [])
+
+
 def text(got: dict) -> str:
     """build()'s class rankings as a table (`ttp model-bench scores`)."""
     lines = []

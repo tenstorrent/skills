@@ -1317,6 +1317,12 @@ def harness_spend(prov, usage: dict) -> dict:
     return out
 
 
+def cell_cost(u, arm: dict, output: Path | None = None) -> tuple[float, bool]:
+    """(USD, estimated) for a cell's agent: cell_spend's cost_usd and cost_estimated."""
+    got = cell_spend(u, arm, output)
+    return got["cost_usd"], got["cost_estimated"]
+
+
 def spend_summary(rows: list[dict]) -> dict:
     """The rows' spend for a report: cost_usd (their sum), estimated_cells and, when any is estimated,
     a note saying the sum is an estimate (a floor). Estimated rows without a cost_basis were priced

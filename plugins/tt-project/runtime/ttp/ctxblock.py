@@ -24,12 +24,12 @@ names none of the earlier findings of the work it continues: the run's block add
 """
 from __future__ import annotations
 
+import json
 import re
 import unicodedata
 from pathlib import Path
 
 from .db import load_result, review_subject
-from .util import task_labels
 
 CAP = 3000            # the whole section, header included
 WORDS_CHARS = 900     # one message's verbatim words
@@ -126,6 +126,14 @@ def task_ids(text: str) -> set[int]:
             if not any(a <= m.start() < b for a, b in msgs)}
 
 
+def _labels(task: dict) -> list:
+    try:
+        lb = json.loads(task.get("labels") or "[]")
+    except (TypeError, ValueError):
+        return []
+    return lb if isinstance(lb, list) else []
+
+
 def _prevs(task: dict) -> list[int]:
     """The tasks `task` directly carries on from: what it continues or follows, the review it fixes, the
     task a review reviews."""
@@ -133,7 +141,7 @@ def _prevs(task: dict) -> list[int]:
     out = []
     if (i := prev_of(task)) is not None:
         out.append(int(i))
-    for lb in task_labels(task):
+    for lb in _labels(task):
         if isinstance(lb, str) and lb.startswith("review_fix:") and lb[11:].isdigit():
             out.append(int(lb[11:]))
     if task.get("kind") == "review" and (s := review_subject(task)) is not None:

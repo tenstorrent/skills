@@ -18,8 +18,6 @@ import os
 import statistics
 import time
 
-from .util import as_float
-
 AUTO = "auto"
 KEY = "coord_cache_1h"   # kv: prefix key -> {"ts": start of its last 1h turn, the parts it was keyed on}
 WARM_MIN = 50            # coordinator.cache_warm_min: a 1h turn younger than this is warm
@@ -51,6 +49,14 @@ WORKER_DEFAULT = "5m"   # what "auto" picks for a run no later run is likely to 
 # runs it would have paid for, known afterwards, saved 2% on workers and nothing on reviews. A resumed
 # run after a wait would read its predecessor's history at 1h, but that pays only the 1h price of the
 # predecessor's whole run: about even (17 resumed runs). So no start-time rule saves here.
+
+
+def worker_setting(budget: dict) -> str:
+    """budget.worker_cache_ttl, the prompt cache lifetime of every run but the coordinator's: "5m" (the
+    default: a write at 1.25x input instead of 2x, and worker calls rarely sit 5 min apart), "1h", or
+    "off" (no setting: the agent's own default). Unset, "" or an unknown value is the default."""
+    v = str((budget or {}).get("worker_cache_ttl") or "").strip().lower()
+    return v if v in WORKER_TTLS and v != "auto" else WORKER_DEFAULT
 
 
 RESUMED_WINDOW_S = 3300   # how long after a 1h run ends its session is still read from cache (5 min short of 1 h)
@@ -258,7 +264,7 @@ def choose_session(state, mode: str, now: float, warm_min: float = WARM_MIN, sig
         return "5m", f"warm: the session's 5m wake ended {tail / 60:.0f} min ago; a 1h request would not read it"
     elif not isinstance(h1, (int, float)):
         reason = "cold: no 1h write of this session"
-    elif not 0 <= now - h1 < as_float(warm_min, WARM_MIN) * 60:
+    elif not 0 <= now - h1 < _num(warm_min, WARM_MIN) * 60:
         reason = f"cold: the session last wrote at 1h {max(now - h1, 0) / 60:.0f} min ago"
     elif c.get("ttl") != "1h":
         reason = f"cold: the session's 5m wakes since its 1h write {(now - h1) / 60:.0f} min ago are gone"
@@ -283,3 +289,8 @@ def session_ended(state, now: float) -> dict:
     return st
 
 
+def _num(value, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default

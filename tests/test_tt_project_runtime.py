@@ -486,10 +486,6 @@ CHECK_RUNNER_ENV = ("TTP_CHECKS_HOME_FILES", "TTP_CHECKS_PYTHON_LOCK", "TTP_CHEC
                     "TTP_PUSH_MODE", "TTP_PUSH_TIP", "TTP_PUSH_BRANCH")
 
 
-def _no_bridge_watch(self) -> None:
-    """Daemon.watch_bridge_agents under test: no ssh config read (bridge_cases calls bridgewatch.check itself)."""
-
-
 @pytest.fixture()
 def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     home = tmp_path / "home"
@@ -500,10 +496,12 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)   # a password manager's agent here never changes a timeout test
     monkeypatch.setenv("TTP_TEST_LOCAL_TZ", "UTC")   # home zones: never the zone of the machine running the tests
     monkeypatch.setenv("TTP_TEST_CLEAR_HOLD_S", "0")   # alerts clear on the first healthy sweep (alerts_cases tests the window)
+    monkeypatch.setenv("TTP_TEST_BUDGET_SETTLE_S", "0")   # a budget red alerts on its first read (budget_cases tests the settle)
     monkeypatch.setenv("TTP_TEST_POLL_S", "0.05")   # wait loops (runner, ttp lock, listen) check often
     monkeypatch.setenv("TTP_CHECKS_LOAD_GUARD", "0")   # suites never wait on the load of the host running the tests (loadguard tests set it)
     monkeypatch.setenv("TTP_TEST_REMOTE_ONLY", "0")   # a busy spill pool never holds checks on a laptop running the tests (checkspill.remote_only)
     monkeypatch.setenv("TTP_CHECKS_POOL_DIRS", str(tmp_path / "pool"))   # never this host's real pool runs (the suite's own run folder among them)
+    monkeypatch.setenv("TTP_TEST_DISK_MOUNT", str(tmp_path))   # the disk guard's du stays in the test folder
     monkeypatch.setenv("TTP_TEST_SSH_CONFIG", str(tmp_path / "ssh_config"))   # never the user's own ssh config
     monkeypatch.setenv("TTP_TEST_DEVICE_NODES", str(tmp_path / "no-device" / "tenstorrent*"))   # spill probes never scan the host's devices
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))   # `ttp setup` never writes the user's own skills
@@ -574,10 +572,6 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     sys.path.insert(0, str(RUNTIME))
     for mod in [m for m in list(sys.modules) if m == "ttp" or m.startswith("ttp.")]:
         del sys.modules[mod]
-    from ttp import daemon
-    monkeypatch.setattr(daemon, "BUDGET_SETTLE_S", 0.0)   # a budget red alerts on its first read (budget_cases tests the settle)
-    monkeypatch.setattr(daemon, "_mount_of", lambda path: tmp_path)   # the disk guard's du stays in the test folder
-    monkeypatch.setattr(daemon.Daemon, "watch_bridge_agents", _no_bridge_watch)   # daemons never read an ssh config
     from ttp import benchrun   # bench cells run isolated (cellns.py), which needs a mount namespace: the isolation
     monkeypatch.setattr(benchrun, "ISOLATE", False)   # tests (bench_cases) turn it on; the rest run cells as before
     from ttp import codearm   # the arm's tests run a live arm on a stand-in guarded harness (codearm_cases tests the refusal)
@@ -808,12 +802,6 @@ def _worker_text(p, task=None):
     text: what worker_system returned while it carried memory."""
     from ttp.prompts import worker_memory_block, worker_system
     return "\n\n".join(x for x in (worker_system(p, task), worker_memory_block(p)) if x)
-
-
-def worker_prompt(p, task: dict, cwd: str, branch: str | None) -> str:
-    """The whole prompt in one piece, as a worker reads it."""
-    from ttp.prompts import worker_system, worker_task
-    return worker_system(p) + "\n\n" + worker_task(p, task, cwd, branch)
 
 
 # make() bootstraps each project once per test process and clones it after that: a bootstrap is about
@@ -3717,12 +3705,6 @@ def _proc_state(pid):
         return None
 
 
-def read_dict(path) -> dict:
-    """ttp.util.read_dict, imported when called (ttp loads after the env fixture)."""
-    from ttp.util import read_dict
-    return read_dict(path)
-
-
 def _wait_for(pred, timeout=30.0) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -6267,6 +6249,7 @@ def test_no_provider_adds_cache_breakpoints_past_the_limit(monkeypatch):
 
 
 def test_worker_prompt_points_at_the_long_running_script_reference_which_keeps_its_rules(env):
+    from ttp.prompts import worker_prompt
     p = make(env)
     tid = p.db.add_task("fix", "fix it", kind="code", tier="light", origin="user")
     prompt = worker_prompt(p, p.db.task(tid), str(p.root), None)
@@ -6286,7 +6269,7 @@ def test_charter_restrictions_lead_every_worker_prompt_once(env):
     p.charter_path.write_text("# demo\n\n## Goals\nGo fast.\n\n## Restrictions\n(none stated yet)\n\n"
                               "## Policies\nDraft PRs.\n\n## Restrictions (added 2026-09-30)\n"
                               "Never merge to main (user msg #1).\n")
-    from ttp.prompts import charter_restrictions, restrictions_pointer
+    from ttp.prompts import charter_restrictions, restrictions_pointer, worker_prompt
     from ttp.coordinator import system_prompt
     body = charter_restrictions(p.charter_path.read_text())
     assert body == "Never merge to main (user msg #1)."
@@ -14908,7 +14891,7 @@ def test_disk_scans_never_walk_root_home_or_network_mounts(env, monkeypatch, tmp
     b = dm.disk_breakdown(p, p.base)
     assert b["top_skipped"] and not b["top"] and all(c[-1] != str(env["tmp"]) for c in ran), ran
     assert "top-level directories unknown" in dm.disk_usage_line(b, 1e9)
-    monkeypatch.setattr(dm, "_mount_of", lambda path: Path("/"))
+    monkeypatch.setenv("TTP_TEST_DISK_MOUNT", "/")
     ran.clear()
     dm.disk_breakdown(p, p.base)
     assert all(c[-1] != "/" for c in ran), "never du from /"
@@ -17628,7 +17611,7 @@ def test_a_charter_and_memory_heavy_project_keeps_the_worker_prompt_under_its_ca
     The charter and memory digest's headers name it too and count toward the digest's budget: they get
     the stand-in as well, so how many memory entries fit does not depend on the temp path's length."""
     from ttp import machines, prompts
-    from ttp.prompts import charter_restrictions
+    from ttp.prompts import charter_restrictions, worker_prompt
     p = make(env)
     monkeypatch.setattr(machines, "load", lambda: {})
     heads = prompts._worker_heads
@@ -18273,7 +18256,7 @@ def test_a_detached_push_runs_after_push_once_its_outcome_is_written_and_its_loc
     p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
     probe = (f"{sys.executable} -c \"import sys; sys.path.insert(0, '{RUNTIME}'); "
              f"from ttp import release; from ttp.project import Project; "
-             f"print('in_flight', bool(release.live_pushes(Project('{p.base}'))))\"")
+             f"print('in_flight', release.push_in_flight(Project('{p.base}')))\"")
     p.set_config("delivery.after_push", [f"(echo sha $TTP_PUSHED_SHA; {probe}) > {seen}"])
     _commit(repo, "mine.txt", "mine\n")
     rc, marker, retry = _detach(capsys)
@@ -19313,8 +19296,8 @@ def _run_batch(p, marker, monkeypatch):
     """`ttp push --batch <marker>` in this process, its go given: (exit code, the marker after it)."""
     from ttp import batch, push
     monkeypatch.setattr(sys, "stdin", io.StringIO(""))
-    monkeypatch.setenv("TTP_RUN_DIR", read_dict(marker)["check_report_dir"])
-    return batch.run_batch(p, marker), read_dict(marker)
+    monkeypatch.setenv("TTP_RUN_DIR", push._read(marker)["check_report_dir"])
+    return batch.run_batch(p, marker), push._read(marker)
 
 
 def test_a_push_batch_runs_its_checks_on_the_priority_slot_while_task_checks_queue(env, monkeypatch, capsys):
@@ -19955,7 +19938,7 @@ def test_after_push_runs_at_the_pushed_commit_in_a_clean_checkout_with_the_push_
     p, repo, origin, other = _bump_setup(env, monkeypatch, ["true"])
     probe = (f"{sys.executable} -c \"import sys; sys.path.insert(0, '{RUNTIME}'); from pathlib import Path; "
              f"from ttp import batch, locks, release; from ttp.project import Project; p = Project('{p.base}'); "
-             f"print('in_flight', bool(release.live_pushes(p))); print('held', locks.held(p.state / 'locks')); "
+             f"print('in_flight', release.push_in_flight(p)); print('held', locks.held(p.state / 'locks')); "
              f"print('alive', batch.alive(Path('{p.state / 'pushes' / 'b1.json'}')))\"")
     p.set_config("delivery.after_push", [
         f"(env | grep '^TTP_' | sort; echo head $(git rev-parse HEAD); echo dirty $(git status --porcelain | wc -l);"
@@ -21532,7 +21515,7 @@ def test_an_on_pass_cmd_keeps_the_task_asleep_while_it_runs_and_runs_once(env, m
         assert d._on_pass[tid][0] is proc and p.db.task(tid)["status"] == "queued"
         assert "woke" not in json.loads(p.db.task(tid)["result"])
     finally:
-        dmod.probespawn.kill(d._on_pass[tid][0])
+        dmod._kill_group(d._on_pass[tid][0])
 
 
 @pytest.mark.parametrize("stale_context", [False, True])
@@ -23977,7 +23960,7 @@ def test_machines_add_copies_the_list_in_the_background_past_a_down_host(env, tm
     assert "copying the machines list to far-down in the background" in out
     gate.touch()
     for _ in range(300):
-        if mm.PUSH_DONE in mm._push_logs()[-1].read_text().splitlines():
+        if mm.PUSH_DONE in mm.push_log().read_text().splitlines():
             break
         time.sleep(0.1)
     args = calls.read_text()
@@ -27668,6 +27651,7 @@ DURABLE_EXEMPT = {
     ("shared.py", '.guard", "a")'): "a flock guard file, never written",
     ("globalcap.py", 'global-spend.lock", "a")'): "a flock guard file, never written",
     ("globalcap.py", 'os.replace(tmp / "s.db", snap)'): "a stopped project's read snapshot, a cache rebuilt from its source; sqlite's checkpoint syncs the copy before the rename",
+    ("poolshard.py", 'pool-shards.lock", "a")'): "a flock guard file, never written",
     ("harborslice.py", 'f = open(d / f"{i}.lock", "w")'): "an empty flock file holding one of the host's trial slots; only the lock is used, its contents never read",
     ("poolshard.py", "open(d / LOG, \"a\")"): "the pool stall log, one line per stall or clear, read only by people; the marks and history it describes are written durably",
     ("localspend.py", 'session-spend.lock", "a")'): "a flock guard file, never written",
@@ -31383,6 +31367,34 @@ def test_batch_s_0_turns_batching_off(env, monkeypatch):
     assert _turn_within(d, clock, starts, float(d.cfg["coordinator"]["debounce_s"]) + 10)
 
 
+def test_replay_reports_the_turns_batching_saves_without_idle_slots(env):
+    from ttp import replay
+    p = make(env)
+    db = p.db
+    db.x("DELETE FROM runs")
+    t0 = time.time() - 7200
+
+    def history(workers):
+        db.x("DELETE FROM runs")
+        db.x("DELETE FROM events")
+        for _ in range(workers):
+            db.x("INSERT INTO runs(role, started, ended, status) VALUES('worker', ?, ?, 'ok')", (t0, t0 + 3000))
+        for at, kinds in ((100, ("task_done", "followup_proposed")), (200, ("task_done",)), (300, ("task_done",))):
+            ids = [db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                        (t0 + at, "task:1", k, "normal", k, "handled")) for k in kinds]
+            db.x("INSERT INTO runs(role, started, ended, status, cost_usd, note) VALUES('coordinator',?,?,'ok',0.1,?)",
+                 (t0 + at + 15, t0 + at + 25, json.dumps({"events": ids, "messages": []})))
+        return replay.load(pathlib.Path(db.path), 1, now=t0 + 3600)
+
+    out = replay.report(history(workers=2), 300, 2)
+    assert (out["replayed_turns"], out["batched_turns"]) == (3, 1), out
+    assert out["saved_pct"] > 60 and out["idle_slot_s"] == 0 and out["extra_idle_slot_s"] == 0
+    # A free slot with nothing to run: every hand-off gets its turn at once.
+    out = replay.report(history(workers=1), 300, 2)
+    assert out["turns_saved"] == 0 and out["held_s"] == 0, out
+    assert replay.main([str(db.path), "--days", "1", "--slots", "2"]) == 0
+
+
 def _finish_code(env, p, title, files, result=None, labels=None, before=None, edit=None, kind="code"):
     """A code task (or one of `kind`) that committed `files` (name -> lines), and what `edit(worktree)`
     changed, on its branch, then handed off. `before` is called with the task id and its branch's head
@@ -32887,6 +32899,7 @@ def test_a_mechanical_or_light_continue_hop_is_queued_at_light_tier_and_reads_it
     p = make(env)
     p.set_config("chains.requeue", False)   # the new-hop path, not chaincap.requeue
     from ttp import chaincap
+    from ttp.prompts import worker_prompt
     light = {"status": "done", "summary": "feature: part done, checks left",
              "followups": [{"title": "continue: feature", "spec": "Run the checks.", "tier": "light"}]}
     root, *_ = _finish_code(env, p, "feature", {"a.py": 10}, result=light)
@@ -35085,8 +35098,7 @@ def test_the_price_table_is_checked_against_reported_run_costs(env, tmp_path, mo
     for i in range(3):
         _log(logs, f"r{i}", [_call(f"r{i}", "m", now, output_tokens=M, cache_read_input_tokens=M)])
         _log(logs, f"r{i}", [_call(f"r{i}", "s", now, input_tokens=M)], sub="agent-x")
-    usd, _, unknown = ls._session_priced("r0")
-    assert (usd, unknown) == (15 + 0.3 + 3, set())
+    assert ls.session_cost("r0") == (15 + 0.3 + 3, False)
     assert ls.calibrate("r0", 18.3)["samples"] == 0 and ls.calibrate("r1", 18.3)["samples"] == 0, "fewer than DRIFT_RUNS"
     got = ls.calibrate("r2", 18.3)
     assert abs(got["drift"]) < 0.001 and not got["applied"] and got["alert"] is None, "the table disagrees"
@@ -46514,9 +46526,9 @@ def test_after_push_and_git_hooks_receive_no_managed_scratch(env, tmp_path, monk
         out = capsys.readouterr().out
         marker = pathlib.Path(next(ln.split(': ', 1)[1] for ln in out.splitlines() if ln.startswith('marker: ')))
         assert 'pushed' in _probe_until_done(p, push.result_probe(marker, p)).stdout
-        assert _wait_for(lambda: read_dict(marker).get('after_push', {}).get('ended'))
+        assert _wait_for(lambda: push._read(marker).get('after_push', {}).get('ended'))
         # It still releases its scratch after writing that; on a loaded host it outlives the test.
-        assert _wait_for(lambda: _pid_gone(int(read_dict(marker)['pid'])), timeout=_load_scaled(30))
+        assert _wait_for(lambda: _pid_gone(int(push._read(marker)['pid'])), timeout=_load_scaled(30))
     for path in (seen, hook_seen):
         recorded = json.loads(path.read_text())
         assert all(recorded.get(k) == str(normal) for k in ('TMPDIR', 'TMP', 'TEMP')), recorded

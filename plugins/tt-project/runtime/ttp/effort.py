@@ -23,7 +23,6 @@ import time
 
 from . import jevuse, machines
 from .db import DB, assigned_tier, dump_result, task_outcome
-from .util import task_labels
 
 JEV_USE = "effort"
 SHORT_SPEC = 800    # characters: a longer spec is not a lookup
@@ -48,6 +47,13 @@ def rules_tier(task: dict) -> str:
     return "standard"
 
 
+def _labels(task: dict) -> list[str]:
+    try:
+        return [str(x) for x in json.loads(task.get("labels") or "[]")]
+    except (TypeError, ValueError):
+        return []
+
+
 UP = {"light": "standard", "standard": "deep"}
 NEEDS_DEEP = "needs_deep"   # hand-off key: the problem a standard run could not solve at its tier
 USER_DEEP = "user_deep"     # label: the user asked for deep, so a device task keeps it on its first start
@@ -61,7 +67,7 @@ def fix_tier(db: DB, code: dict, review: dict, findings: list[dict]) -> tuple[st
     review fix's light floor (db.add_task) keeps at standard. Never the code task's own deep or a tier a
     retry raised it to."""
     from . import chaincap
-    if USER_DEEP in task_labels(review) or any(USER_DEEP in task_labels(t) for t in chaincap.chain(db, code["id"])):
+    if USER_DEEP in _labels(review) or any(USER_DEEP in _labels(t) for t in chaincap.chain(db, code["id"])):
         return "deep", "user_deep"
     if wants_deep(review.get("result")) or any(isinstance(f, dict) and str(f.get(NEEDS_DEEP) or "").strip()
                                               for f in findings):
@@ -71,12 +77,12 @@ def fix_tier(db: DB, code: dict, review: dict, findings: list[dict]) -> tuple[st
 
 
 def _resource_names(task: dict) -> list[str]:
-    return [lb.split(":", 1)[1] for lb in task_labels(task) if lb.startswith(("resource:", "exclusive:"))]
+    return [lb.split(":", 1)[1] for lb in _labels(task) if lb.startswith(("resource:", "exclusive:"))]
 
 
 def device_task(task: dict) -> bool:
     """Tagged `needs_device`, or names a `*-device` resource or a machine tagged `device`."""
-    if "needs_device" in task_labels(task):
+    if "needs_device" in _labels(task):
         return True
     names = _resource_names(task)
     if any(n.endswith("-device") for n in names):
@@ -102,7 +108,7 @@ def wants_deep(result) -> bool:
 
 def _continued(db: DB, task: dict) -> list[dict]:
     out = []
-    for label in task_labels(task):
+    for label in _labels(task):
         if label.startswith("continues:") and label[10:].isdigit():
             old = db.task(int(label[10:]))
             if old:
@@ -200,7 +206,7 @@ def pick(db: DB, cfg: dict, task: dict, provider: str, jev=None) -> dict | None:
         return {"tier": up, "from": task["tier"], "by": "retry", "review": review}
     first = task.get("origin") == "coordinator" and not int(task.get("attempts") or 0) \
         and not db.one("SELECT 1 FROM runs WHERE task=? AND role!='coordinator' LIMIT 1", (task["id"],))
-    if task.get("tier") == "deep" and first and USER_DEEP not in task_labels(task) and device_task(task) \
+    if task.get("tier") == "deep" and first and USER_DEEP not in _labels(task) and device_task(task) \
             and not any(wants_deep(old["result"]) for old in _continued(db, task)):
         return {"tier": "standard", "from": "deep", "by": "device", "review": review}
     if task.get("tier") != "standard" or task.get("origin") != "coordinator" or int(task.get("attempts") or 0):
@@ -213,7 +219,7 @@ def pick(db: DB, cfg: dict, task: dict, provider: str, jev=None) -> dict | None:
         got = {"jev_error": type(e).__name__}
     if not got or "tier" not in got:
         got = {**(got or {}), "tier": rules_tier(task), "by": "rules"}
-    if got.get("tier") == "light" and db._continues_failed_review(task_labels(task)):
+    if got.get("tier") == "light" and db._continues_failed_review(_labels(task)):
         got = {**got, "tier": "standard"}   # a fix of a failed review runs at least standard
     return {**got, "from": task["tier"], "review": review}
 

@@ -24,11 +24,12 @@ retained. The ledger
 only reads; it never closes a task, an obligation or a promise."""
 from __future__ import annotations
 
+import json
 import re
+from typing import Any
 
 from . import budget
 from .reviewreuse import FORCED_LABEL, HEAD_LABEL
-from .util import task_labels
 
 BUCKETS = ("stand_in", "superseded", "failed_task", "duplicate", "rereview", "review_rounds", "crashed",
            "over_runs", "costly_wake")
@@ -45,6 +46,14 @@ def settings(cfg: dict | None) -> dict:
     for k, v in ((cfg or {}).get("waste") or {}).items():
         got[k] = v
     return got
+
+
+def _labels(raw: Any) -> list[str]:
+    try:
+        got = json.loads(raw) if isinstance(raw, str) else raw
+    except ValueError:
+        return []
+    return [str(x) for x in got] if isinstance(got, list) else []
 
 
 def _num(labels: list[str], prefix: str) -> int | None:
@@ -83,7 +92,7 @@ def _task_sets(db, cfg: dict) -> dict[str, set[int]]:
     reviews: dict[int, list[str]] = {}
     for i in sorted(tasks):
         t = tasks[i]
-        labels = task_labels(t["labels"])
+        labels = _labels(t["labels"])
         prior = _num(labels, "continues:")
         if prior in out["superseded"] and t["status"] not in ("cancelled", "failed") and i not in gone:
             kept.add(prior)   # a successor carries its work on

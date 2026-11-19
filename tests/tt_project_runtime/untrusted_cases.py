@@ -117,6 +117,7 @@ def test_the_untrusted_write_label_allows_gh_and_curl_writes_but_no_credential_r
     assert untrusted.active() and "untrusted_input" in _why(tmp_path, "Bash", {"command": _WRITES[0]})
     monkeypatch.setenv(untrusted.ENV, "0")
     assert not untrusted.active()
+    assert untrusted.guards_live() is True
 
 
 def test_an_untrusted_input_runs_git_and_gh_wrappers_push_only_its_branches_and_write_nothing(

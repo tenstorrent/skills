@@ -37,8 +37,11 @@ being offered until a new reading changes them; a transport error (no answer, ti
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import json
+import os
 import re
 import time
 import uuid
@@ -47,7 +50,6 @@ from typing import Any
 
 from . import project
 from .db import DB
-from .util import flocked
 
 KV = "credits:"            # credits:<provider> -> the latest parsed reading, with "ts" and "account"
 USED = "reset_used:"       # reset_used:<provider> -> [{credit, window, against, why, outcome, ts, reported}]
@@ -178,9 +180,16 @@ def _write_shared(provider: str, account: str, entries: list[dict], now: float) 
     ][-KEEP_USED:], 0o600)
 
 
+@contextlib.contextmanager
 def _locked(provider: str, account: str):
     """The machine-wide lock of one provider account's free resets: one consume decision at a time."""
-    return flocked(_file(LOCK, provider, account))
+    project.HOME_DIR.mkdir(parents=True, exist_ok=True)
+    fd = os.open(_file(LOCK, provider, account), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
 
 
 def _same(e: dict, w) -> bool:

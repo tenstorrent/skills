@@ -1,10 +1,10 @@
 # Cost lever tests of tests/test_tt_project_runtime.py (costlevers.py, wakesettle.py: the cost levers
-# behind rings.coord_wake_settle and rings.output_trim, both off by default), which runs this file
-# in its own namespace (see _include_cases there): helpers, fixtures and imports come from that file
-# and the other case files (_roll, _sh_setup, _ev_x, _drive).
+# behind rings.fresh_continue, rings.coord_wake_settle and rings.output_trim, all off by default), which runs
+# this file in its own namespace (see _include_cases there): helpers, fixtures and imports come from that file
+# and the other case files (_roll, _fork_daemon, _fork_transcript, _sh_setup, _ev_x, _drive).
 from __future__ import annotations
 
-_LEVERS = ("coord_wake_settle", "output_trim")
+_LEVERS = ("fresh_continue", "coord_wake_settle", "output_trim")
 
 
 def test_cost_levers_are_off_by_default_and_a_ring_or_the_projects_own_key_turns_each_on(env, capsys):
@@ -19,13 +19,13 @@ def test_cost_levers_are_off_by_default_and_a_ring_or_the_projects_own_key_turns
     assert _roll(capsys, "ring", "demo", "0")[0] == 0
     assert _roll(capsys, "set", "output_trim", "0")[0] == 0
     assert costlevers.lever_on(p, "output_trim")
-    assert not costlevers.lever_on(p, "coord_wake_settle")
+    assert not costlevers.lever_on(p, "fresh_continue") and not costlevers.lever_on(p, "coord_wake_settle")
     assert costlevers.prompt_line(p, task) == costlevers.TRIM_LINE
     # The project's own explicit value wins over the ring, both ways.
     p.set_config("output.trim", False)
     assert not costlevers.lever_on(p, "output_trim") and costlevers.prompt_line(p, task) == ""
-    p.set_config("coordinator.wake_settle", True)
-    assert costlevers.lever_on(p, "coord_wake_settle")
+    p.set_config("worker.fresh_continue", True)
+    assert costlevers.lever_on(p, "fresh_continue")
 
 
 def _settle_evs(p, ids):
@@ -101,6 +101,49 @@ def test_wake_settle_flag_keeps_the_daemon_from_waking_on_a_routine_batch(env, m
     assert _drive(d, clock, starts), "a user message wakes a turn"
 
 
+def test_fresh_continue_skips_the_resume_keeps_the_fork_and_leads_with_the_handoff(env, monkeypatch, tmp_path):
+    from ttp import coordsession, ctxfork
+    p, d, cfg_dir, _run = _fork_daemon(env, monkeypatch, tmp_path)
+    sid = str(uuid.uuid4())
+    _fork_transcript(cfg_dir, p.base, sid)
+    p.db.set_kv(coordsession.KEY, {"id": sid, "provider": "claude", "context_tokens": 50000})
+    tid = p.db.add_task("fix the parser", "fix the parser bug", kind="code", origin="user")
+    p.db.x("UPDATE tasks SET result=? WHERE id=?",
+           (json.dumps({"status": "failed", "summary": "parser half fixed: tokenizer left"}), tid))
+    old = str(uuid.uuid4())
+    _fork_transcript(cfg_dir, p.root, old)   # the task's own earlier session, still warm
+    p.db.x("INSERT INTO runs(role, task, provider, started, ended, status, session_id) VALUES(?,?,?,?,?,?,?)",
+           ("worker", tid, "claude", time.time() - 120, time.time() - 60, "ok", old))
+
+    def start():
+        rid = d.start_run("worker", "TASK PROMPT", "claude", "standard", str(p.root), task=p.db.task(tid))
+        row = p.db.one("SELECT note FROM runs WHERE id=?", (rid,))
+        return (p.runs / str(rid) / "prompt.md").read_text(), json.loads(row["note"] or "{}").get(ctxfork.KEY)
+
+    prompt, got = start()   # off: the task's own warm session is resumed
+    assert got["how"] == "resume" and not got.get("fresh") and "# Fresh start" not in prompt, got["why"]
+    p.set_config("worker.fresh_continue", True)
+    d.cfg = p.config()
+    prompt, got = start()
+    assert got["how"] == "fork" and got.get("fresh") is True, got   # the coordinator fork stays
+    assert "fresh continue (rings.fresh_continue)" in got["why"]
+    assert "# Fresh start (rings.fresh_continue)" in prompt and "tokenizer left" in prompt
+    assert prompt.index("# Fresh start") < prompt.index("TASK PROMPT")
+    from ttp import costlevers
+    assert costlevers.arm_of({ctxfork.KEY: got}) == "fresh"
+    assert costlevers.arm_of({ctxfork.KEY: {"how": "resume"}}) == "resumed"
+
+
+def test_handoff_block_is_empty_without_history_and_capped(env):
+    from ttp import costlevers
+    p = make(env)
+    tid = p.db.add_task("t", "s", kind="code", origin="user")
+    assert costlevers.handoff_block(p, tid, None) == ""
+    p.db.x("UPDATE tasks SET result=? WHERE id=?", (json.dumps({"status": "done", "summary": "x" * 100000}), tid))
+    got = costlevers.handoff_block(p, tid, None)
+    assert got.startswith("# Fresh start") and len(got) <= costlevers.HANDOFF_CHARS + 20
+
+
 def test_output_trim_picks_medium_effort_only_for_mechanical_unpinned_work(env, capsys):
     from ttp import costlevers
     p = make(env)
@@ -126,18 +169,22 @@ def test_cost_lever_metrics_show_in_status_and_the_daily_review(env, capsys):
     p = make(env)
     now = time.time()
     wakesettle.record(p.db, "rule", "skip", [{"id": 9, "kind": "upstream_note"}], now - 10)
-    assert costlevers.output_line(p, now - 86400, now) == ""
+    assert costlevers.fresh_line(p, now - 86400, now) == "" and costlevers.output_line(p, now - 86400, now) == ""
+    p.set_config("worker.fresh_continue", True)
     tid = p.db.add_task("t", "s", kind="work", origin="user")
     p.db.x("INSERT INTO runs(role, task, started, ended, status, cost_usd, output_tokens, note) VALUES(?,?,?,?,?,?,?,?)",
            ("worker", tid, now - 100, now - 50, "ok", 0.5, 4000, json.dumps({"output_trim": {"effort": "medium"}})))
     got = costlevers.status_lines(p, now)
     assert got and all(x.startswith("cost levers (7d): ") for x in got)
     text = "\n".join(got)
+    assert "fresh continue [on]" in text and "landings:" in text
     assert "settled without a model (rule 1)" in text and "output trim [off]" in text
     assert "work 4.0k/$0.50" in text and "effort-picked 1 runs" in text
     assert costlevers.status_lines(p, now + 60) == got   # cached
+    rep = costlevers.fresh_report(p, now - 86400, now)
+    assert set(rep["landings"]) == {"done_code", "judged", "table_only"}
     out = audit.lines(p.db, now, 86400, 24, p)
-    assert any("output trim" in x for x in out)
+    assert any("fresh continue" in x for x in out) and any("output trim" in x for x in out)
 
 
 def _wake_run(p, tools, cost=0.4, ago=100):

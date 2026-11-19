@@ -44,8 +44,6 @@ import re
 import time
 from pathlib import Path
 
-from .util import num_in, task_labels
-
 KEY = "code_arm"                    # a route entry's and a run note's field: the arm the run took
 ARM_KV = "code_arm:"                # kv code_arm:<task id>: {"arm", "why", "seed", "ts"}
 OFF_KV = "code_arm_off"             # the guard's trip: {"ts", "setting", "why", "row"}
@@ -77,6 +75,18 @@ CAP_EVERY_S = 3600.0
 WAIT_LOW_S = 10.0                   # mean server wait per call (chatbridge per_call wait_s) that still counts as low
 
 
+def _num(v, lo: float, hi: float, default: float) -> float:
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and lo <= v <= hi else default
+
+
+def _labels(task: dict) -> list[str]:
+    try:
+        got = json.loads(task.get("labels") or "[]")
+    except (TypeError, ValueError):
+        return []
+    return [str(x) for x in got] if isinstance(got, list) else []
+
+
 def settings(cfg: dict, policy: list | None = None) -> dict | None:
     """The arm's settings, or None when it is off: the code route off (runclass.code_settings), `glm_share` unset
     or 0, no `glm.model`, or an empty policy list (`policy` is the project's policyfiles.load; None: not checked)."""
@@ -90,20 +100,20 @@ def settings(cfg: dict, policy: list | None = None) -> dict | None:
     else:
         if not runclass.code_settings(cfg) or policy is not None and not policy:
             return None
-        share = num_in(got.get("glm_share"), 0, 1, 0.0)
+        share = _num(got.get("glm_share"), 0, 1, 0.0)
         arm = got.get("glm") if isinstance(got.get("glm"), dict) else {}
         model = str(arm.get("model") or "").strip()
     if share <= 0 or not model or str(arm.get("harness") or "claude-code") not in HARNESSES:
         return None   # a share on a harness that is not guarded is 0 for a live run (refusal says why)
     c = got.get("glm_cap") if isinstance(got.get("glm_cap"), dict) else {}
-    lo = int(num_in(c.get("min"), 1, 64, CAP["min"]))
-    hi = max(lo, int(num_in(c.get("max"), 1, 64, CAP["max"])))
+    lo = int(_num(c.get("min"), 1, 64, CAP["min"]))
+    hi = max(lo, int(_num(c.get("max"), 1, 64, CAP["max"])))
     return {"share": share, "provider": str(arm.get("provider") or "chat"), "model": model,
             "effort": str(arm.get("effort") or "max"), "harness": str(arm.get("harness") or "claude-code"),
             "seed": str(arm.get("seed") or got.get("glm_seed") or ""), "glm_work": bool(glmwork.settings(cfg)),
-            "cap": {"start": min(hi, max(lo, int(num_in(c.get("start"), 1, 64, CAP["start"])))), "min": lo, "max": hi},
-            "pts": num_in(got.get("glm_guard_pts"), 0, 100, GUARD_PTS),
-            "min_tasks": int(num_in(got.get("glm_guard_min"), 1, 10000, GUARD_MIN))}
+            "cap": {"start": min(hi, max(lo, int(_num(c.get("start"), 1, 64, CAP["start"])))), "min": lo, "max": hi},
+            "pts": _num(got.get("glm_guard_pts"), 0, 100, GUARD_PTS),
+            "min_tasks": int(_num(got.get("glm_guard_min"), 1, 10000, GUARD_MIN))}
 
 
 RING_SHARE = 0.5   # the coin flip's share where the glm_code ring flag turns it on and the project sets none
@@ -123,7 +133,7 @@ def ring_gate(cfg: dict, project: str, raw: dict | None) -> dict:
             return cfg
         if not str(((got.get("glm") if isinstance(got.get("glm"), dict) else {}) or {}).get("model") or "").strip():
             return cfg   # no arm model: no coin flip either way (settings)
-        share = num_in(got.get("glm_share"), 0, 1, 0.0)
+        share = _num(got.get("glm_share"), 0, 1, 0.0)
         on = rollout.on("glm_code", project, raw)
     except Exception:   # in doubt, no coin flip
         on, share = False, 0.0
@@ -156,7 +166,7 @@ def refusal(cfg: dict, policy: list | None = None) -> str:
         got = (cfg.get("route") or {}).get("code_sonnet")
         got = got if isinstance(got, dict) else {}
         arm = got.get("glm") if isinstance(got.get("glm"), dict) else {}
-        if num_in(got.get("glm_share"), 0, 1, 0.0) <= 0 or not str(arm.get("model") or "").strip():
+        if _num(got.get("glm_share"), 0, 1, 0.0) <= 0 or not str(arm.get("model") or "").strip():
             return ""
         harness = str(arm.get("harness") or "claude-code")
     if harness in HARNESSES:
@@ -237,7 +247,7 @@ def stays(db, cfg: dict, task: dict, tier: str, picked: dict | None = None, poli
             return why
         if str(tier or task.get("tier") or "standard") not in ("standard", "light"):
             return "tier"
-        if any(lb.startswith(("resource:", "exclusive:", "read:")) for lb in task_labels(task)):
+        if any(lb.startswith(("resource:", "exclusive:", "read:")) for lb in _labels(task)):
             return "resources"
         if FORCE.search(str(task.get("spec") or "")):
             return "forced_claude"
@@ -246,7 +256,7 @@ def stays(db, cfg: dict, task: dict, tier: str, picked: dict | None = None, poli
         return ""
     if str(tier or task.get("tier") or "standard") != "standard":
         return "tier"
-    if any(lb.startswith(("resource:", "exclusive:", "read:")) for lb in task_labels(task)):
+    if any(lb.startswith(("resource:", "exclusive:", "read:")) for lb in _labels(task)):
         return "resources"
     _, why = runclass.code_route(cfg, task, picked, {k: "full" for k in runclass.CODE_KINDS})
     if why:

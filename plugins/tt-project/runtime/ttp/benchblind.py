@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import random
@@ -37,7 +38,6 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from .project import durable_write
-from .benchrun import _sha
 
 RUBRIC = (   # (name, max, what earns it): fixed, so scores of every batch compare
     ("criteria", 4, "does what the acceptance criteria ask, each point"),
@@ -128,6 +128,10 @@ def shuffle(cells: list[dict], seed: int) -> list[dict]:
         items += [{"id": f"{n}{chr(65 + i)}", "task": str(c["task"]), "label": lab} for i, lab in enumerate(labels)]
     rng.shuffle(items)
     return items
+
+
+def _sha(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
 
 
 def merge_cells(lists: list[list[dict]]) -> list[dict]:

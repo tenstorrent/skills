@@ -83,6 +83,11 @@ ENV_WHAT = "never dumps its environment, which holds tokens"
 CRED_WHAT = "never reads credential, token or secret files outside its worktree"
 
 
+def guards_live() -> bool:
+    """Whether this harness ships the untrusted-input guards (for routing such runs to other models)."""
+    return True
+
+
 @functools.lru_cache(maxsize=4)
 def _labels(task: str, base: str) -> tuple[str, ...]:
     if not task.isdigit() or not base:

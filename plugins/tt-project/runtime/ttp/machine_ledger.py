@@ -139,6 +139,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -154,7 +155,6 @@ from typing import Any, Callable
 
 from . import detach, ends, machines, netwait, outagetask, pagesev, project
 from .db import TERMINAL_TASK_STATES
-from .util import flocked
 
 LEDGER = "machine-changes.json"
 ROUTES = "machine-routes.json"
@@ -221,9 +221,16 @@ def _path(name: str) -> Path:
     return project.HOME_DIR / name
 
 
+@contextlib.contextmanager
 def _locked():
     """The one lock both files are read and written under."""
-    return flocked(_path(LOCK))
+    project.HOME_DIR.mkdir(parents=True, exist_ok=True)
+    fd = os.open(_path(LOCK), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
 
 
 def _read(name: str, empty: dict) -> dict:

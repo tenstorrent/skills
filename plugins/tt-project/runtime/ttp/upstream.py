@@ -74,7 +74,6 @@ from pathlib import Path
 
 from . import project
 from .project import durable_append
-from .util import read_dict
 
 KV_CURSOR = "upstream_cursor"
 LOCAL_EVERY_S = 60          # how often an ingesting project looks at this machine's inbox
@@ -1132,7 +1131,7 @@ def _replies_for(via: str, now: float | None = None) -> list[dict]:
            for n in notes if n.get("back") == via and n.get("to") and n.get("host") == here and not n.get("via")
            and now - float(n.get("ts") or 0) < REPLY_BACK_S][-REPLY_BACK_MAX:]
     if out:
-        doc = read_dict(back_path())
+        doc = _json(back_path())
         carried = dict(doc.get("carried") or {})
         if any(n["fp"] not in carried for n in out):
             carried.update({n["fp"]: now for n in out if n["fp"] not in carried})
@@ -2002,9 +2001,17 @@ def forward_path() -> Path:
     return project.HOME_DIR / "upstream-forward.json"
 
 
+def _json(p: Path) -> dict:
+    try:
+        d = json.loads(p.read_text())
+    except (OSError, ValueError):
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
 def forward_to() -> list[str] | None:
     """The user's `upstream.forward_to` machine aliases; None when unset (the default targets)."""
-    v = (read_dict(settings_path()).get("upstream") or {}).get("forward_to")
+    v = (_json(settings_path()).get("upstream") or {}).get("forward_to")
     return [str(a) for a in v] if isinstance(v, list) else None
 
 
@@ -2013,7 +2020,7 @@ def set_forward_to(aliases: list[str] | None) -> None:
     bad = [a for a in aliases or [] if not ALIAS_RE.fullmatch(a)]
     if bad:
         raise ValueError(f"not a machine alias: {', '.join(bad)}")
-    doc = read_dict(settings_path())
+    doc = _json(settings_path())
     up = dict(doc.get("upstream") or {})
     if aliases is None:
         up.pop("forward_to", None)
@@ -2444,7 +2451,7 @@ def _note_status(fp: str, state: Path | None = None, run_dir: Path | None = None
     if not to:
         return UNKNOWN, f"unknown: note {fp} is for tt-project's maintainers, not a project (`ttp upstream --mine`)"
     if n.get("back") and not n.get("via"):
-        if (when := (read_dict(back_path()).get("carried") or {}).get(fp)) is not None:
+        if (when := (_json(back_path()).get("carried") or {}).get(fp)) is not None:
             return DELIVERED, (f"sent back: {n['back']}'s daemon took note {fp} on its call here "
                                f"{max(0.0, time.time() - float(when)) / 3600:.1f} h ago; that machine files it for {to}")
         if time.time() - float(n.get("ts") or 0) >= REPLY_BACK_S:
@@ -2460,7 +2467,7 @@ def _note_status(fp: str, state: Path | None = None, run_dir: Path | None = None
         if read:
             return DELIVERED, f"delivered: {to}'s daemon read note {fp} from this machine's inbox"
         return ON_ITS_WAY, f"filed-local: note {fp} is in this machine's inbox; {to}'s daemon has not read it yet"
-    st = (read_dict(forward_path()).get("targets") or {}).get(target) or {}
+    st = (_json(forward_path()).get("targets") or {}).get(target) or {}
     if int(st.get("cursor") or 0) < end:
         why = (f" (sends there failing for {_failing_since(st, time.time()) / 3600:.1f} h: {st.get('last_error')})"
                if st.get("fails") else "")
@@ -2559,7 +2566,7 @@ def _failed(st: dict, err: str, now: float) -> None:
 
 
 def _forward(now: float, budget_s: float, context: str = "daemon") -> int:
-    targets_st: dict = dict(read_dict(forward_path()).get("targets") or {})
+    targets_st: dict = dict(_json(forward_path()).get("targets") or {})
     configured = forward_to()
     projects = _remote_projects()
     targets = configured if configured is not None else sorted(set(projects.values()))
@@ -2692,7 +2699,7 @@ def _forward(now: float, budget_s: float, context: str = "daemon") -> int:
 def forward_status(now: float | None = None) -> list[str]:
     """`ttp upstream --forward-status`: one line per target."""
     now = now or time.time()
-    targets_st = read_dict(forward_path()).get("targets") or {}
+    targets_st = _json(forward_path()).get("targets") or {}
     configured = forward_to()
     names = configured if configured is not None else sorted(set(_remote_projects().values()))
     if configured == []:
@@ -2745,7 +2752,7 @@ def failing(now: float | None = None, after_s: float = WARN_AFTER_S) -> dict[str
     now = now or time.time()
     configured = forward_to()
     names = configured if configured is not None else sorted(set(_remote_projects().values()))
-    targets_st = read_dict(forward_path()).get("targets") or {}
+    targets_st = _json(forward_path()).get("targets") or {}
     return {t: targets_st[t] for t in names if isinstance(targets_st.get(t), dict) and targets_st[t].get("fails")
             and _failing_since(targets_st[t], now) >= after_s}
 
@@ -2829,7 +2836,7 @@ def maybe_fallback(now: float | None = None) -> bool:
 def forwarded_reader(now: float | None = None) -> tuple[str, str] | None:
     """(target, project) when this machine's notes go to a machine whose inbox a project reads."""
     now = now or time.time()
-    for t, st in sorted((read_dict(forward_path()).get("targets") or {}).items()):
+    for t, st in sorted((_json(forward_path()).get("targets") or {}).items()):
         if isinstance(st, dict) and st.get("reader") and now - float(st.get("last_ok") or 0) < READER_FRESH_S:
             return t, st["reader"]
     return None

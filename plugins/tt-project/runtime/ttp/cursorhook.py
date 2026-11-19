@@ -51,7 +51,6 @@ import sys
 from pathlib import Path
 
 from . import hook
-from .util import read_dict
 
 DENIED_READS_ENV = "TTP_DENIED_READS"
 HOOKS_REL = Path(".cursor") / "hooks.json"
@@ -270,7 +269,7 @@ def install(cwd: str, run_dir: str) -> str:
     created_dir = not (c / ".cursor").exists()
     try:
         with _Locked(c):
-            side = read_dict(c / SIDECAR_REL)
+            side = _read_json(c / SIDECAR_REL)
             if not side:
                 hooks = c / HOOKS_REL
                 original = hooks.read_text() if hooks.exists() else None
@@ -297,14 +296,14 @@ def install(cwd: str, run_dir: str) -> str:
 def undo(run_dir) -> None:
     """Leave the hooks file this run joined; the last run out puts back what was there before."""
     rd = Path(run_dir)
-    state = read_dict(rd / RUN_STATE)
+    state = _read_json(rd / RUN_STATE)
     if not state.get("cwd"):
         return
     c = Path(state["cwd"])
     try:
         if (c / SIDECAR_REL).exists():
             with _Locked(c):
-                side = read_dict(c / SIDECAR_REL)
+                side = _read_json(c / SIDECAR_REL)
                 owners = [o for o in side.get("owners") or [] if o != str(rd)]
                 if side and owners:
                     _write(c / SIDECAR_REL, json.dumps({**side, "owners": owners}))
@@ -344,6 +343,14 @@ def _restore(c: Path, side: dict) -> None:
             (c / ".cursor").rmdir()
         except OSError:
             pass
+
+
+def _read_json(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 if __name__ == "__main__":

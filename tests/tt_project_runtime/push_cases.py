@@ -1412,7 +1412,7 @@ def test_a_detached_push_returns_at_once_and_its_marker_reports_the_pushed_sha_a
         p.set_config("delivery.push_wait_s", 0)   # it has kept the turn past the push wait
         assert _ttp("push", "--free") == 1, "the detached push holds the branch's turn"
         from ttp import release
-        assert release.live_pushes(p), "an upgrade must not swap the runtime under a detached push"
+        assert release.push_in_flight(p), "an upgrade must not swap the runtime under a detached push"
         gate.touch()
         r = _probe_until_done(p, probe)
         pushed = _git_out(origin, "rev-parse", "proj")
@@ -1421,7 +1421,7 @@ def test_a_detached_push_returns_at_once_and_its_marker_reports_the_pushed_sha_a
         assert (m["status"], m["exit"], m["sha"], m["version"]) == ("pushed", 0, pushed, "0.1.1")
         assert m["ended"] >= m["started"] and "bumped" in pathlib.Path(m["log"]).read_text()
         _wait_gone(m["pid"], time.time() + 10)   # the outcome is written a moment before the lock goes
-        assert _ttp("push", "--free") == 0 and not release.live_pushes(p)
+        assert _ttp("push", "--free") == 0 and not release.push_in_flight(p)
         from ttp import push
         assert not push._run_lock(marker).exists(), "a finished push leaves no lock file behind"
         # A month later the next detached push tidies the finished marker and its log away.
@@ -2345,7 +2345,7 @@ def test_an_urgent_approval_mid_search_waits_for_a_near_verdict_and_leads_the_ne
     """delivery.push_yield_wait_s (default 900 s): an urgent approval arriving mid-search, with the
     search's verdict expected that soon, does not stop it. No entry loses its checks: entry 1 is blamed,
     the rest land, nothing is requeued, and the urgent one, still approved, goes in the next batch."""
-    from ttp import pushq, urgent
+    from ttp import pushq
     p, repo, origin, heads = _bad_first(env, monkeypatch, wait_s=None)
     ran = _approved_mid_search(p, monkeypatch, 2, 1)
     rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
@@ -2353,7 +2353,7 @@ def test_an_urgent_approval_mid_search_waits_for_a_near_verdict_and_leads_the_ne
     assert not m.get("yielded_to") and len(ran) == m["checks"]["runs"] == 6, m
     assert "urgent approval 99 joins this batch's next split" in (out := capsys.readouterr().out), out
     assert "after its verdict, expected in about 0 min" in out, out
-    assert urgent.approvals_waiting(p.db, "origin/proj") == [99], "the urgent one still waits, approved"
+    assert pushq.yields_to(p, "origin/proj") == [99], "the urgent one still waits, approved"
     hot = _entry(repo, "hot", {"plugins/p/hot.txt": "h\n"})
     rc, m = _run_batch(p, _batch_marker(p, [hot], bid="b2"), monkeypatch)
     assert rc == 0 and _statuses(m) == ["pushed"] and _git_out(origin, "show", "proj:plugins/p/hot.txt") == "h", m
@@ -2364,7 +2364,7 @@ def test_an_urgent_approval_joins_a_long_search_instead_of_stopping_it(env, monk
     delivery.push_yield_restarts, an urgent approval arriving after the full head failed does not stop
     the search: every check runs once, entry 1 is blamed, the rest land, and the urgent one, still
     approved, lands first in the next batch."""
-    from ttp import batch, pushq, urgent
+    from ttp import batch, pushq
     monkeypatch.setattr(batch.Batch, "_verdict_s", lambda self, left: left * 1800.0)
     p, repo, origin, heads = _bad_first(env, monkeypatch, wait_s=None, restarts=None)
     ran = _approved_mid_search(p, monkeypatch, 1, 1)
@@ -2372,7 +2372,7 @@ def test_an_urgent_approval_joins_a_long_search_instead_of_stopping_it(env, monk
     assert rc == 0 and _statuses(m) == ["check_failed"] + ["pushed"] * 7, m
     assert not m.get("yielded_to") and len(ran) == m["checks"]["runs"] == 6, m
     assert "after its next check once the search ends" in capsys.readouterr().out
-    assert urgent.approvals_waiting(p.db, "origin/proj") == [99], "the urgent one leads the next batch"
+    assert pushq.yields_to(p, "origin/proj") == [99], "the urgent one leads the next batch"
     hot = _entry(repo, "hot", {"plugins/p/hot.txt": "h\n"})
     rc, m = _run_batch(p, _batch_marker(p, [hot], bid="b2"), monkeypatch)
     assert rc == 0 and _statuses(m) == ["pushed"] and _git_out(origin, "show", "proj:plugins/p/hot.txt") == "h", m
@@ -2398,7 +2398,7 @@ def test_a_stopped_search_hands_its_full_head_failure_to_the_next_batch(env, mon
 
     def resumed(bid, entries):
         marker = _batch_marker(p, [heads[n - 1] for n in entries], bid=bid)
-        mk = read_dict(marker)
+        mk = push._read(marker)
         for e, n in zip(mk["entries"], entries):
             e["id"] = n
         write_json(marker, {**mk, "known_fail": kf})
@@ -2431,7 +2431,7 @@ def test_a_batch_marker_carries_a_stopped_searchs_failure_only_for_its_own_rows(
         s.p.db.x("UPDATE push_queue SET status='approved', detail=? WHERE id=?",
                  (json.dumps({"yielded": True, "restarts": 1, "known_fail": kf}), row))
         bid = pushq.start(s.p, s.p.db.q("SELECT * FROM push_queue WHERE id=?", (row,)), "origin/proj")
-        m = read_dict(s.p.state / push.DETACHED / f"{bid}.json")
+        m = push._read(s.p.state / push.DETACHED / f"{bid}.json")
         assert (m.get("known_fail") == kf) is kept, m
         s.p.db.x("UPDATE push_queue SET status='approved', batch=NULL WHERE id=?", (row,))
         (s.p.state / push.DETACHED / f"{bid}.json").unlink()
@@ -2452,7 +2452,7 @@ def test_the_restarts_an_urgent_approval_causes_are_capped(env, monkeypatch, cap
     _approved_mid_search(p, monkeypatch, 2, 1)
     marker = _batch_marker(p, heads)
     if before:
-        write_json(marker, {**read_dict(marker), "restarts": before})
+        write_json(marker, {**push._read(marker), "restarts": before})
     rc, m = _run_batch(p, marker, monkeypatch)
     assert rc == 0, m
     if stops:
@@ -2548,7 +2548,7 @@ def test_a_batch_never_stops_its_search_for_an_urgent_approval_the_next_batch_wo
     p, repo, origin, heads = _bad_first(env, monkeypatch)
     _approved_mid_search(p, monkeypatch, 2, 1)
     marker = _batch_marker(p, heads)
-    m = read_dict(marker)
+    m = push._read(marker)
     tip = _git_out(origin, "rev-parse", "proj")
     if why == "after_yield":     # an older marker's word for one restart
         m["after_yield"] = True
@@ -2582,12 +2582,12 @@ def test_a_batch_marker_records_what_its_search_must_not_yield_to(env, monkeypat
     s.p.db.set_kv(pushq.KV, {"bad_tip": {"tip": "a" * 40, "fails": 1, "tried": [7]}})
     rows = s.p.db.q("SELECT * FROM push_queue WHERE id=?", (row,))
     bid = pushq.start(s.p, rows, "origin/proj")
-    m = read_dict(s.p.state / push.DETACHED / f"{bid}.json")
+    m = push._read(s.p.state / push.DETACHED / f"{bid}.json")
     assert m["restarts"] == restarts and m["yield_skip"] == {"tip": "a" * 40, "ids": [7]}, m
 
 
 def test_after_a_batch_stopped_its_search_the_urgent_approval_goes_alone_then_the_requeued_ones(env, monkeypatch):
-    from ttp import pushq, urgent
+    from ttp import pushq
     s = _pq(env, monkeypatch, push_batch_s=10 ** 6, push_batch_max=5)
     _pq_earlier(s)
     rows = [_pq_review(s)[1], _pq_review(s)[1]]
@@ -2596,7 +2596,7 @@ def test_after_a_batch_stopped_its_search_the_urgent_approval_goes_alone_then_th
     s.p.db.x("UPDATE push_queue SET status='batched', batch='b1' WHERE id IN (?,?)", tuple(rows))
     hot = _pq_review(s, priority=1)[1]
     calm = _pq_review(s, priority=3)[1]
-    assert urgent.approvals_waiting(s.p.db, "origin/proj") == [hot], "only the urgent approval stops a search"
+    assert pushq.yields_to(s.p, "origin/proj") == [hot], "only the urgent approval stops a search"
     m = {"outcome": "yielded", "ended": now, "yielded_to": [hot],
          "results": [{"id": r, "status": "requeued", "detail": {"yielded": True}} for r in rows]}
     pushq._apply(s.p, {"id": "b1", "target": "origin/proj"}, m, lambda *a, **k: None, now)
@@ -3702,13 +3702,13 @@ def test_the_daemon_leaves_a_push_batch_marker_to_the_batch(env, monkeypatch):
     marker = _batch_marker(p, [_entry(repo, "e1", {"f1.txt": "1\n"})])
     from ttp.project import write_json
     ap_lock = p.state / "locks" / "after_push:run-b1.0.lock"
-    write_json(marker, {**read_dict(marker), "phase": "after_push", "outcome": "pushed", "lock": str(ap_lock)})
+    write_json(marker, {**push._read(marker), "phase": "after_push", "outcome": "pushed", "lock": str(ap_lock)})
     before = marker.read_bytes()
     held = locks.try_take([ap_lock], "push batch b1 (after_push)")
     try:
         assert locks.any_free([push._run_lock(marker)]), "the run lock is free, as in the after_push"
         push.tend(p)
-        assert marker.read_bytes() == before and push._settle(marker) == read_dict(marker)
+        assert marker.read_bytes() == before and push._settle(marker) == push._read(marker)
     finally:
         held.close()
     push.tend(p)          # the batch died: the push queue judges it (pushq.finalize), not tend
@@ -3741,7 +3741,7 @@ def test_a_push_batch_on_a_known_failing_tip_never_checks_it_alone_and_pushes_a_
     tip = _git_out(origin, "rev-parse", "proj")
     heads = [_entry(repo, n, {f"plugins/p/{n}.txt": f"{n}\n"}) for n in names]
     marker = _batch_marker(p, heads)
-    write_json(marker, {**read_dict(marker), "bad_tip": {"tip": tip, "fresh": fresh, "cmd": "make test"}})
+    write_json(marker, {**push._read(marker), "bad_tip": {"tip": tip, "fresh": fresh, "cmd": "make test"}})
     rc, m = _run_batch(p, marker, monkeypatch)
     assert _statuses(m) == want, m
     out = capsys.readouterr().out
@@ -3761,13 +3761,13 @@ def test_a_push_batch_finds_the_push_lock_busy_and_touches_nothing(env, monkeypa
     marker = _batch_marker(p, [_entry(repo, "e1", {"f1.txt": "1\n"})])
     worktrees = _git_out(repo, "worktree", "list")
     held = push.take(p, "origin", "proj", 0, who="someone else")
-    monkeypatch.setenv("TTP_RUN_DIR", read_dict(marker)["check_report_dir"])
+    monkeypatch.setenv("TTP_RUN_DIR", push._read(marker)["check_report_dir"])
     monkeypatch.setattr(sys, "stdin", io.StringIO(""))
     try:
         assert _ttp("push", "--batch", str(marker)) == 75
     finally:
         held.close()
-    m = read_dict(marker)
+    m = push._read(marker)
     assert m["outcome"] == "busy" and _statuses(m) == ["requeued"] and "someone else" in m["message"], m
     assert _git_out(repo, "worktree", "list") == worktrees and not (p.worktrees / "push").exists()
 
@@ -4589,16 +4589,16 @@ def test_a_batch_records_its_reach_with_its_outcome_so_a_tick_meanwhile_cannot_s
     real, seen = push.reach, []
 
     def reach(*a, **kw):
-        seen.append(read_dict(marker).get("outcome"))
+        seen.append(push._read(marker).get("outcome"))
         _pq_tend(s)                 # a daemon tick while the fetch runs
         seen.append(s.p.db.task(s.review)["status"])
         return real(*a, **kw)
     monkeypatch.setattr(push, "reach", reach)
     monkeypatch.setattr(sys, "stdin", io.StringIO(""))
-    monkeypatch.setenv("TTP_RUN_DIR", read_dict(marker)["check_report_dir"])
+    monkeypatch.setenv("TTP_RUN_DIR", push._read(marker)["check_report_dir"])
     assert batch.run_batch(s.p, marker) == 0
     assert seen == [None, "pushing"], seen
-    m = read_dict(marker)
+    m = push._read(marker)
     assert m["outcome"] == "pushed" and m["reach"]["ref"] == "origin/main" and m["reach"]["on"] is False, m
     _pq_tend(s)
     t = s.p.db.task(s.review)
@@ -11315,7 +11315,7 @@ def test_check_output_missing_in_batch_process_fails_before_checks(env, monkeypa
     monkeypatch.setattr(sys, 'stdin', io.StringIO(''))
     monkeypatch.delenv('TTP_RUN_DIR', raising=False)
     assert batch.run_batch(p, marker) != 0
-    m = read_dict(marker)
+    m = push._read(marker)
     assert m['outcome'] == 'error' and 'TTP_RUN_DIR' in m['message']
     assert not check.exists()
 
@@ -11368,7 +11368,7 @@ def test_check_scratch_push_and_batch_live_across_recovery(env, tmp_path, monkey
         assert _ttp('push', '--detach') == 0
         output = capsys.readouterr().out
         marker = pathlib.Path(next(ln.split(': ', 1)[1] for ln in output.splitlines() if ln.startswith('marker: ')))
-        scratch = pathlib.Path(read_dict(marker)['check_run_dir'])
+        scratch = pathlib.Path(push._read(marker)['check_run_dir'])
         # No child or lifetime lock exists while queued; a new daemon must preserve the allocation.
         checkdirs.recover(p.state, p.runs)
         assert scratch.exists()
@@ -11379,7 +11379,7 @@ def test_check_scratch_push_and_batch_live_across_recovery(env, tmp_path, monkey
         _pq_hand_off(env, s)
         bid = _pq_batch(s, wait=False)
         marker = p.state / 'pushes' / f'{bid}.json'
-        scratch = pathlib.Path(read_dict(marker)['check_run_dir'])
+        scratch = pathlib.Path(push._read(marker)['check_run_dir'])
     try:
         assert _wait_for(ready.exists), marker.with_suffix('.log').read_text()
         fresh = Project(p.base)
@@ -11393,7 +11393,7 @@ def test_check_scratch_push_and_batch_live_across_recovery(env, tmp_path, monkey
         else:
             assert pushq._children[bid].wait(timeout=30) == 0
         assert _wait_for(lambda: not scratch.exists())
-        reports = pathlib.Path(read_dict(marker)['check_report_dir'])
+        reports = pathlib.Path(push._read(marker)['check_report_dir'])
         assert (reports / 'report').read_text() == 'kept'
     finally:
         if kind == 'batch':
@@ -11402,7 +11402,7 @@ def test_check_scratch_push_and_batch_live_across_recovery(env, tmp_path, monkey
                 os.killpg(child.pid, signal.SIGKILL)
                 child.wait(timeout=10)
         else:
-            pid = read_dict(marker).get('pid')
+            pid = push._read(marker).get('pid')
             if pid and not _gone_pid(pid):
                 os.killpg(pid, signal.SIGKILL)
 
@@ -11484,7 +11484,7 @@ def test_live_after_push_keeps_ordinary_temp_after_batch_supervisor_dies(env, tm
         checkdirs.recover(s.p.state, s.p.runs)
         assert pathlib.Path(temp).read_text() == 'alive'
         assert pathlib.Path(temp).is_relative_to(normal)
-        assert not pathlib.Path(read_dict(marker)['check_run_dir']).exists()
+        assert not pathlib.Path(push._read(marker)['check_run_dir']).exists()
     finally:
         if child.poll() is None:
             os.kill(child.pid, signal.SIGKILL)
@@ -15721,7 +15721,6 @@ def test_a_pr_branch_line_an_update_appends_rewrites_the_branch_label(env):
     `pr_branch` field does (`pr_branch: ""` sets no_pr_branch), so label readers (landed.carriers,
     worktree.fix_branches, the daemon's review queueing) agree with worktree.recorded_pr_branch. The
     field wins over a line of the same update; reviews keep their labels. task_add labels its line."""
-    from ttp.util import task_labels
     from ttp import coordinator as coord, landed, push, worktree
     p = make(env)
     owner = p.db.add_task("Speed up the loader", "s", kind="code")
@@ -15729,7 +15728,7 @@ def test_a_pr_branch_line_an_update_appends_rewrites_the_branch_label(env):
     p.db.update_task(owner, status="done", branch=theirs)
 
     def labels(tid):
-        return task_labels(p.db.task(tid))
+        return push._labels(p.db.task(tid))
 
     def update(tid, **a):
         assert coord.apply(p, [{"type": "task_update", "id": tid, **a}]) == []
@@ -15746,7 +15745,7 @@ def test_a_pr_branch_line_an_update_appends_rewrites_the_branch_label(env):
     assert labels(tid) == [f"pr_branch:{theirs}"]
     assert landed.carriers(p.db, owner)[tid][1] == owner
     assert worktree.fix_branches(p, {"id": 0}, [theirs]) == {f"ttp/t{tid}-fix-the-loader-pr": theirs}
-    assert any(lb.startswith("pr_branch:") for lb in task_labels(t))   # the daemon's review-queue check
+    assert any(lb.startswith("pr_branch:") for lb in push._labels(t))   # the daemon's review-queue check
     # A later line replaces it; a cleared line carries no branch.
     update(tid, spec="pr_branch: `feature/b`\nThen `pr_branch: feature/c` is prose, not a line.")
     assert labels(tid) == ["pr_branch:feature/b"]
@@ -15833,7 +15832,7 @@ def test_a_rebase_delivers_on_its_own_new_branch_by_default_and_never_leases(env
     t = p.db.task(tid)
     own = t["branch"]
     assert worktree.delivery_branch(t) == (old, True) and push.delivery_source(p, t)[1:] == (own, False)
-    assert push.own_target(p, repo) == ("origin", own) and push.own_rebase(p, own) is None
+    assert push.own_target(p, repo) == ("origin", own) and not push.own_lease(p, own)
     head = _git_out(repo, "rev-parse", "HEAD")
     assert _ttp("push", "--own") == 0, capsys.readouterr().err
     assert _git_out(origin, "rev-parse", own) == head and _git_out(origin, "rev-parse", old) == theirs
@@ -15861,7 +15860,7 @@ def test_rebase_replace_lease_replaces_the_rebased_branch_as_before(env, monkeyp
     assert project.config_problems(p.raw_config(), p.root) == [] or not any(
         "rebase_replace" in x for x in project.config_problems(p.raw_config(), p.root))
     t = p.db.task(tid)
-    assert push.delivery_source(p, t)[1:] == (old, True) and push.own_rebase(p, old) is not None
+    assert push.delivery_source(p, t)[1:] == (old, True) and push.own_lease(p, old)
     head = _git_out(repo, "rev-parse", "HEAD")
     assert _ttp("push", "--own") == 0, capsys.readouterr().err
     assert _git_out(origin, "rev-parse", old) == head and "under a lease" in capsys.readouterr().err
@@ -16109,7 +16108,7 @@ def test_an_upgraded_project_without_the_setting_rebases_onto_a_new_branch(env, 
     assert project.rebase_replace(p.config()) == "new_branch" and not project.never_force(p.config())
     assert not any("rebase_replace" in x or "never_force" in x for x in project.config_problems(p.raw_config(), p.root))
     t = p.db.task(tid)
-    assert push.delivery_source(p, t) == (t, t["branch"], False) and push.own_rebase(p, old) is None
+    assert push.delivery_source(p, t) == (t, t["branch"], False) and not push.own_lease(p, old)
 
 
 @pytest.mark.parametrize("spec_line", ["pr_branch: {old}", "`pr_branch: {old}`", "pr_branch: `{old}`"])
@@ -16123,7 +16122,7 @@ def test_own_push_publishes_a_rebase_onto_the_branch_it_rebases_under_a_lease(en
     t = p.db.task(tid)
     assert worktree.delivery_branch(t) == (old, True) and push.delivery_source(p, t)[1:] == (old, True)
     assert worktree.carried_head(p, t) == theirs   # what the dispatcher builds it on
-    assert push.own_target(p, repo) == ("origin", old) and push.own_rebase(p, old) is not None
+    assert push.own_target(p, repo) == ("origin", old) and push.own_lease(p, old)
     head = _git_out(repo, "rev-parse", "HEAD")
     assert _ttp("push", "--own") == 0, capsys.readouterr().err
     assert _git_out(origin, "rev-parse", old) == head
@@ -16143,7 +16142,7 @@ def test_own_push_publishes_a_rebase_onto_the_branch_it_rebases_under_a_lease(en
     assert "under a lease" in capsys.readouterr().err
     # A pr_branch task (no rebase) still only fast-forwards.
     p.db.update_task(tid, labels=json.dumps([f"pr_branch:{old}"]))
-    assert push.own_rebase(p, old) is None
+    assert not push.own_lease(p, old)
 
 
 def test_own_push_lease_keeps_a_branch_that_moved_during_the_checks(env, monkeypatch, tmp_path):
@@ -16211,12 +16210,12 @@ def test_a_continuation_of_a_rebase_task_publishes_onto_the_same_branch(env, mon
     monkeypatch.setenv("TTP_TASK", str(nxt))
     _git_out(repo, "checkout", "-q", "-B", own)
     assert push.delivery_source(p, p.db.task(nxt))[1:] == (old, True)
-    assert push.own_target(p, repo) == ("origin", old) and push.own_rebase(p, old) is not None
+    assert push.own_target(p, repo) == ("origin", old) and push.own_lease(p, old)
     assert _ttp("push", "--own") == 0, capsys.readouterr().err
     assert _git_out(origin, "rev-parse", old) == _git_out(repo, "rev-parse", "HEAD")
     # A cleared record (pr_branch "") stops the chain: it lands on the push branch, --own has no target.
     p.db.update_task(nxt, labels=json.dumps([f"continues:{tid}", "no_pr_branch"]))
-    assert push.delivery_source(p, p.db.task(nxt)) == (None, "", False) and push.own_rebase(p, old) is None
+    assert push.delivery_source(p, p.db.task(nxt)) == (None, "", False) and not push.own_lease(p, old)
     _git_out(repo, "checkout", "-q", "-B", old)
     with pytest.raises(ValueError, match="publishes only this task's own branch"):
         push.own_target(p, repo)
@@ -16233,7 +16232,7 @@ def test_own_push_refuses_a_rebase_branch_no_record_names_or_a_shared_one(env, m
     _git_out(repo, "checkout", "-q", "-B", old)
     with pytest.raises(ValueError, match="publishes only this task's own branch"):
         push.own_target(p, repo)
-    assert push.own_rebase(p, old) is None
+    assert not push.own_lease(p, old)
     assert _ttp("push", "--own") != 0 and _git_out(origin, "rev-parse", old) == theirs
     monkeypatch.setenv("TTP_TASK", str(tid))
     _git_out(repo, "checkout", "-q", f"ttp/t{tid}-rebase-the-example")
@@ -17197,7 +17196,7 @@ def test_a_push_batch_on_a_tip_known_to_fail_only_tests_excuses_them_and_pushes(
     tip = _git_out(origin, "rev-parse", "proj")
     _ids_stub(monkeypatch, tip, lambda tree, sel: {_FLAKY_ID}, how=lambda where, i: f"broke on the {where}")
     marker = _batch_marker(p, _entries(repo, 1))
-    write_json(marker, {**read_dict(marker), "bad_tip": {"tip": tip, "fresh": 0, "cmd": _FLAKY_CHECK, "ids": [_FLAKY_ID]}})
+    write_json(marker, {**push._read(marker), "bad_tip": {"tip": tip, "fresh": 0, "cmd": _FLAKY_CHECK, "ids": [_FLAKY_ID]}})
     rc, m = _run_batch(p, marker, monkeypatch)
     log = capsys.readouterr().out
     assert m["outcome"] == "pushed" and _statuses(m) == ["pushed"], log
@@ -18375,7 +18374,6 @@ def test_a_code_task_that_published_in_another_repo_gets_one_review_only_review_
     review sweep alike: standard (no diff to size), naming the repo, branch and head, fetched read-only
     into a scratch clone, review only with a no_push line. A sweep after it, a daemon restart or a
     repeated hand-off of the same head (also abbreviated) adds none; a new head gets its own."""
-    from ttp.util import task_labels
     from ttp import push
     from ttp.daemon import Daemon
     p = make(env)
@@ -18390,7 +18388,7 @@ def test_a_code_task_that_published_in_another_repo_gets_one_review_only_review_
     assert f"review exactly head {sha}" in spec and "\nno_push: change lives in an external repo\n" in spec
     assert "Review only: if it passes, hand off `done`. Do not push anything" in spec
     assert "ttp push` from" not in spec and "ttp push --own" not in spec and "precheck" not in spec.lower()
-    assert push.REVIEW_ONLY_LABEL in task_labels(rev) and f"published_head:{sha}" in task_labels(rev)
+    assert push.REVIEW_ONLY_LABEL in push._labels(rev) and f"published_head:{sha}" in push._labels(rev)
     d = Daemon(p.base)
     # Sweeps and a restart while it is open, and after it ended: no second review of this head.
     p.db.update_task(tid, status="review")
@@ -18445,7 +18443,6 @@ def test_a_failed_review_of_an_external_change_gets_a_fix_that_publishes_to_the_
     """A failed review of an external change follows the fix/re-review flow: the fix is told to publish
     onto the same external branch and name its new head in `published`; the re-review is review only;
     the fix's hand-off gives the queued re-review its new head once, and queues no second review."""
-    from ttp.util import task_labels
     from ttp import push
     from ttp.daemon import Daemon
     from ttp.db import continues_id, dependency_ids
@@ -18462,7 +18459,7 @@ def test_a_failed_review_of_an_external_change_gets_a_fix_that_publishes_to_the_
     assert f"publish the fix to the same branch ttp/t1-example of {_EXT_REPO}" in fix["spec"]
     assert '"published": {"repo": "' + _EXT_REPO + '", "branch": "ttp/t1-example", "head": "<new head sha>"}' in fix["spec"]
     assert dependency_ids(re_rev) == [fix["id"]] and re_rev["tier"] == "standard"
-    assert push.REVIEW_ONLY_LABEL in task_labels(re_rev) and "\nno_push: change lives in an external repo\n" in re_rev["spec"]
+    assert push.REVIEW_ONLY_LABEL in push._labels(re_rev) and "\nno_push: change lives in an external repo\n" in re_rev["spec"]
     assert "ttp push` from" not in re_rev["spec"] and dependency_ids(p.db.task(waiter)) == [re_rev["id"]]
     # The fix publishes a new head: the queued re-review learns it, once; no new review.
     new = "ef" * 20
@@ -18472,7 +18469,7 @@ def test_a_failed_review_of_an_external_change_gets_a_fix_that_publishes_to_the_
     (run_dir / "result.json").write_text(json.dumps(_ext_handoff(new, "fixed")))
     Daemon(p.base)._finish_worker({"task": fix["id"]}, Usage(cost_usd=1.0), "ok", run_dir)
     r = p.db.task(re_rev["id"])
-    assert f"published_head:{new}" in task_labels(r) and r["spec"].count(f"review exactly head {new}") == 1
+    assert f"published_head:{new}" in push._labels(r) and r["spec"].count(f"review exactly head {new}") == 1
     assert len(p.db.q("SELECT id FROM tasks WHERE kind='review'")) == 2
     assert Daemon(p.base)._auto_review(p.db.task(fix["id"]), "fixed") == (re_rev["id"], False)
     assert p.db.task(re_rev["id"])["spec"].count(f"review exactly head {new}") == 1
@@ -21538,7 +21535,7 @@ def test_target_from_setting_a_new_batch_takes_its_target_from_delivery_push_bra
     _git_out(s.repo, "remote", "add", "relay", str(relay))
     s.p.set_config("delivery.push_branch", "relay/proj")
     bid = pushq.start(s.p, s.p.db.q("SELECT * FROM push_queue WHERE id=?", (row,)), "origin/proj")
-    assert read_dict(s.p.state / push.DETACHED / f"{bid}.json")["target"] == "relay/proj"
+    assert push._read(s.p.state / push.DETACHED / f"{bid}.json")["target"] == "relay/proj"
     assert s.p.db.one("SELECT target FROM push_batches WHERE id=?", (bid,))["target"] == "relay/proj"
 
 
@@ -21556,7 +21553,7 @@ def test_resume_rereads_target_a_stale_batch_stops_before_its_checks_and_hands_i
     head = _entry(repo, "e1", {"f1.txt": "1\n"})
     marker = _batch_marker(p, [head])
     if resumed:
-        write_json(marker, {**read_dict(marker), "resumes": {"batch": "b0", "kept": [1], "left_out": [], "added": []}})
+        write_json(marker, {**push._read(marker), "resumes": {"batch": "b0", "kept": [1], "left_out": [], "added": []}})
     rc, m = _run_batch(p, marker, monkeypatch)
     assert m["outcome"] == "retargeted" and _statuses(m) == ["requeued"], m
     assert "relay/proj" in m["message"] and not m.get("checks", {}).get("runs"), m
@@ -21575,7 +21572,7 @@ def test_landed_entry_drop_the_batch_on_the_new_target_drops_what_it_already_has
     rc, m = _run_batch(p, _batch_marker(p, [h1, h2]), monkeypatch)
     assert m["outcome"] == "retargeted" and _statuses(m) == ["requeued", "requeued"], m
     marker = _batch_marker(p, [h1, h2], bid="b2")
-    write_json(marker, {**read_dict(marker), "target": "/".join(push.target(p, repo))})
+    write_json(marker, {**push._read(marker), "target": "/".join(push.target(p, repo))})
     rc, m = _run_batch(p, marker, monkeypatch)
     assert rc == 0 and _statuses(m) == ["landed", "pushed"], m
     assert _git_out(relay, "show", "proj:f2.txt") == "2" and _git_out(relay, "merge-base", "--is-ancestor", h1, "proj") == ""
@@ -21710,7 +21707,7 @@ def test_retarget_keeps_the_review_approval_of_an_unchanged_head(env, monkeypatc
     assert s.p.db.task(s.review)["status"] == "pushing", "the review does not run again"
     assert [e["kind"] for e in _pq_events(s.p, mark) if e["kind"] in ("task_requeued", "push_retargeted")] == [
         "push_retargeted"]
-    assert read_dict(s.p.state / push.DETACHED / f"{bid}.json")["target"] == "relay/proj"
+    assert push._read(s.p.state / push.DETACHED / f"{bid}.json")["target"] == "relay/proj"
     (env["tmp"] / "never").write_text("")
     pushq._children[bid].wait(timeout=30)
 
@@ -22463,7 +22460,7 @@ def test_the_lone_tip_fix_batch_also_runs_the_failing_ids(env, monkeypatch):
     rows, why = pushq.due(s.p, time.time() + 10 ** 6)
     assert [r["id"] for r in rows] == [fix], why
     bid = pushq.start(s.p, rows, "origin/proj")
-    m = read_dict(s.p.state / push.DETACHED / f"{bid}.json")
+    m = push._read(s.p.state / push.DETACHED / f"{bid}.json")
     assert m["tip_fix"]["ids"] == ["tests/test_other.py::test_a"], m
     checks = batch.tip_fix_check(m, push.check_list([cmd, {"host": "local", "run": "claude plugin validate x --strict"}]))
     assert [str(c) for c in checks] == [cmd, "claude plugin validate x --strict",
@@ -22761,18 +22758,3 @@ def test_the_push_queue_does_not_approve_a_head_whose_latest_run_handed_the_task
     d.mkdir(parents=True, exist_ok=True)
     (d / "result.json").write_text(json.dumps({"status": "done", "summary": "done on Opus"}))
     assert pushq.check_approval(s.p, s.p.db.task(s.review), entry).get("entries")
-
-
-def test_task_labels_and_read_dict_take_any_shape(tmp_path):
-    from ttp.util import loads_dict, read_dict, task_labels
-
-    assert task_labels({"labels": '["a", 3, "b"]'}) == ["a", "b"]
-    assert task_labels({"labels": ["a"]}) == ["a"] == task_labels(("a",))
-    for junk in ({"labels": "not json"}, {"labels": None}, {}, None, '{"a": 1}'):
-        assert task_labels(junk) == []
-    f = tmp_path / "x.json"
-    assert read_dict(f) == {}
-    for text, want in (('{"a": 1}', {"a": 1}), ("[1]", {}), ("nope", {}), ("", {})):
-        f.write_text(text)
-        assert read_dict(f) == want == read_dict(str(f)) == loads_dict(text)
-    assert loads_dict(None) == {}

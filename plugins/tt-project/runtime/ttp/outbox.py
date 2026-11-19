@@ -11,6 +11,7 @@ neither blocks the messages behind it nor disappears.
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import time
@@ -20,7 +21,6 @@ from pathlib import Path
 from typing import Iterator
 
 from . import project, redact
-from .util import flocked
 
 
 def folder() -> Path:
@@ -39,8 +39,12 @@ def new_id() -> str:
 def locked(name: str) -> Iterator[None]:
     """One process at a time appends to or flushes a project's outbox."""
     folder().mkdir(parents=True, exist_ok=True, mode=0o700)
-    with flocked(folder() / f"{name}.lock"):
+    fd = os.open(str(folder() / f"{name}.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
         yield
+    finally:
+        os.close(fd)
 
 
 def _read(name: str) -> tuple[list[dict], list[str]]:

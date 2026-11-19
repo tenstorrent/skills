@@ -459,6 +459,12 @@ def push_skips(hosts: list[str], known: dict[str, dict] | None = None,
     return out
 
 
+def push_log() -> Path:
+    """The newest background copy's log (a name in PUSH_LOGS that may not exist yet)."""
+    logs = _push_logs()
+    return logs[-1] if logs else project.HOME_DIR / PUSH_LOGS / "none.log"
+
+
 def _push_logs() -> list[Path]:
     """The background copies' logs, oldest first (each name starts with its start time in ns)."""
     return sorted((project.HOME_DIR / PUSH_LOGS).glob("*.log"))

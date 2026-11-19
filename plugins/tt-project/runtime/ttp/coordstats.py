@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
 """`ttp stats --coord-session`: how the persistent coordinator session (coordsession.py) did, per day
-in the project's home zone.
+in the project's home zone, against the stateless coordinator it replaced.
 
 The session is always on: every coordinator wake resumes it ("resume") or starts the next one ("new",
 seeded with the hand-off: a resume the provider rejected, an expired transcript, a changed prompt or
@@ -12,8 +12,10 @@ before the session was always on (a guard trip, a failed resume's stateless reru
 rows stay readable. Per day: wakes, $/wake, context growth per resumed wake (its first call's prompt
 less the previous wake's of the same session), new sessions, in-place compactions (session id, tokens
 before and after, from coordsession's `compactions`), tool calls per wake (tool_use blocks in its
-transcript; any provider), and the cache-read share of its prompt tokens. A day breaks even at
-<= 2 tool calls and <= 20k context growth per wake.
+transcript; any provider), and the cache-read share of its prompt tokens. The baseline is every
+coordinator run of the 7 days before the first "resume" or "new" wake: turns/day, $/turn and $/day. A
+day breaks even at <= 2 tool calls and <= 20k context growth per wake; it is over the baseline when
+all its coordinator runs cost more than the baseline's $/day (today: so far).
 
 Why each session wake did or did not resume (reason(), from the mode and why the daemon recorded at
 its decision, coordsession.decide): resumed, compacted in place (older releases: handover, a rollover
@@ -32,6 +34,7 @@ from . import timefmt
 
 BREAK_EVEN_TOOL_CALLS = 2
 BREAK_EVEN_GROWTH = 20000
+BASELINE_DAYS = 7
 
 
 def _note(raw) -> dict:
@@ -168,6 +171,16 @@ def report(db, runs_dir, tz: str, days: float = 7, now: float | None = None) -> 
     noted = [r for r in db.q(f"SELECT {cols} FROM runs WHERE role='coordinator' AND note LIKE '%session%' "
                              "ORDER BY started, id") if session_of(r)]
     first = next((r["started"] for r in noted if session_of(r).get("mode") in ("resume", "new")), None)
+    end = first if first is not None else now
+    base = db.q("SELECT started, cost_usd FROM runs WHERE role='coordinator' AND started>=? AND started<?",
+                (end - BASELINE_DAYS * 86400, end))
+    # A project younger than the window: its own span, at least a day (one early turn is no rate).
+    span = max(1.0, (end - min(r["started"] for r in base)) / 86400) if base else 0.0
+    usd = sum(r["cost_usd"] or 0 for r in base)
+    baseline = {"since": end - BASELINE_DAYS * 86400, "until": end, "turns": len(base), "days": round(span, 2),
+                "turns_per_day": round(len(base) / span, 1) if span > 0 else None,
+                "usd_per_turn": round(usd / len(base), 3) if base else None,
+                "usd_per_day": round(usd / span, 2) if span > 0 else None}
     since = now - days * 86400
     prev, by_day, off = {}, {}, {}
     for r in db.q("SELECT started, note FROM runs WHERE role='coordinator' AND started>=?", (since,)):
@@ -230,9 +243,10 @@ def report(db, runs_dir, tz: str, days: float = 7, now: float | None = None) -> 
                     "tool_calls_per_wake": tc, "tool_call_wakes": len(calls),
                     "cache_read_ratio": round(read / prompt, 3) if prompt else None,
                     "coordinator_usd": round(day_usd, 2),
+                    "over_baseline": None if baseline["usd_per_day"] is None else day_usd > baseline["usd_per_day"],
                     "break_even": None if growth is None or tc is None else
                     tc <= BREAK_EVEN_TOOL_CALLS and growth <= BREAK_EVEN_GROWTH})
-    return {"zone": tz, "days": days, "first_session_wake": first, "by_day": out,
+    return {"zone": tz, "days": days, "first_session_wake": first, "baseline": baseline, "by_day": out,
             "worker_context": worker_context(db, tz, since)}
 
 
@@ -261,13 +275,19 @@ def _day_bounds(day: str, tz: str) -> tuple[float, float]:
 
 
 def text(s: dict, name: str = "") -> str:
+    b = s["baseline"]
     f = lambda v, fmt: "n/a" if v is None else format(v, fmt)
-    lines = [f"Coordinator session{' of ' + name if name else ''}, last {s['days']:g} days ({s['zone']})"]
+    lines = [f"Coordinator session{' of ' + name if name else ''}, last {s['days']:g} days ({s['zone']}). "
+             f"Stateless baseline, {b['turns']} turns in the {BASELINE_DAYS} days before "
+             + ("the first session wake" if s["first_session_wake"] else "now (no session wake yet)")
+             + f": {f(b['turns_per_day'], '.1f')} turns/day, ${f(b['usd_per_turn'], '.3f')}/turn, "
+             f"${f(b['usd_per_day'], '.2f')}/day"]
     if not s["by_day"]:
         lines.append("  no session wakes in the window")
     for d in s["by_day"]:
         g = d["growth_per_wake"]
         even = {None: "unknown", True: "met", False: "missed"}[d["break_even"]]
+        over = {None: "no baseline", True: "OVER baseline", False: "under baseline"}[d["over_baseline"]]
         lines.append(
             f"  {d['day']}{' (so far)' if d['partial'] else ''}: {d['wakes']} wakes ({d['resumed']} resumed, "
             f"{d['rollovers']} new, {d['handoffs']} new with a hand-off, {d['stateless']} stateless), "
@@ -277,7 +297,7 @@ def text(s: dict, name: str = "") -> str:
             f"{f(d['tool_calls_per_wake'], '.1f')} tool calls/wake, cache reads "
             f"{'n/a' if d['cache_read_ratio'] is None else format(d['cache_read_ratio'], '.0%')}; "
             f"break-even (<= {BREAK_EVEN_TOOL_CALLS} tool calls, <= {BREAK_EVEN_GROWTH // 1000}k growth/wake): "
-            f"{even}; coordinator ${d['coordinator_usd']:.2f}")
+            f"{even}; coordinator ${d['coordinator_usd']:.2f} vs ${f(b['usd_per_day'], '.2f')}/day: {over}")
         size = d["rollover_tokens"]
         why = ", ".join(f"{k} {v}" + (f" (mean {size / 1000:.0f}k tokens)" if k == "rollover" and size else "")
                         for k, v in d["reasons"].items())

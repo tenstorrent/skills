@@ -10,7 +10,7 @@ def _stop_marker(env, monkeypatch, **more):
     from ttp.project import write_json
     p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
     marker = _batch_marker(p, [_entry(repo, "e1", {"plugins/p/f1.txt": "1\n"})])
-    write_json(marker, {**read_dict(marker), **more})
+    write_json(marker, {**push._read(marker), **more})
     return p, marker
 
 
@@ -33,7 +33,7 @@ def test_stop_batch_wants_a_why_and_a_batch_of_this_project(env, monkeypatch):
     write_json(own, {"kind": "push", "pid": os.getpid()})
     assert push.stop_batch(p, own, "why") == push.REFUSED
     assert push.stop_batch(p, env["tmp"] / "b1.json", "why") == push.REFUSED
-    write_json(marker, {**read_dict(marker), "outcome": "pushed"})
+    write_json(marker, {**push._read(marker), "outcome": "pushed"})
     assert push.stop_batch(p, marker, "why") == 0, "an ended batch: nothing to stop"
     assert not marker.with_suffix(batch.STOP_SUFFIX).exists()
 
@@ -106,7 +106,7 @@ def test_a_stopped_batch_puts_its_rows_back_to_approved_with_no_try_or_backoff_a
     s.p.db.x("UPDATE push_batches SET after_finalized=? WHERE id='b1'", (now,))
     bid = pushq.start(s.p, s.p.db.q("SELECT * FROM push_queue WHERE id IN (?,?) ORDER BY id", tuple(rows)),
                       "origin/proj")
-    nxt = read_dict(s.p.state / push.DETACHED / f"{bid}.json")
+    nxt = push._read(s.p.state / push.DETACHED / f"{bid}.json")
     assert "resumes" not in nxt and "known_fail" not in nxt, "a stopped batch is never resumed"
 
 
@@ -120,7 +120,7 @@ def test_a_stopped_batch_run_again_pushes_nothing(env, monkeypatch):
     heads = [_entry(repo, "e1", {"plugins/p/f1.txt": "1\n"})]
     marker = _batch_marker(p, heads)
     before = _git_out(origin, "rev-parse", "proj")
-    write_json(marker, {**read_dict(marker), "outcome": "stopped", "phase": "after_push",
+    write_json(marker, {**push._read(marker), "outcome": "stopped", "phase": "after_push",
                         "results": [{"id": 1, "status": "requeued", "detail": {"stopped": "dead target"}}]})
     rc, m = _run_batch(p, marker, monkeypatch)
     assert m["outcome"] == "stopped" and _statuses(m) == ["requeued"], m

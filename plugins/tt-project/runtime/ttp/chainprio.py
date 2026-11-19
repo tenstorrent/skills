@@ -5,20 +5,28 @@ task to the push. A hop the coordinator set a priority on (SET_LABEL) keeps it; 
 follows when a task of its chain changes priority (follow)."""
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from .db import DB, TERMINAL_TASK_STATES
-from .util import task_labels
 
 SET_LABEL = "priority_set"   # the coordinator set this task's priority: it no longer follows its chain
 HOP_PREFIXES = ("Review #", "Fix review #", "Re-review #")
 _COVER = ("auto_review:", "continues:", "review_fix:")
 
 
+def _labels(task: dict) -> list:
+    try:
+        labels = json.loads(task.get("labels") or "[]")
+    except (ValueError, TypeError):
+        return []
+    return labels if isinstance(labels, list) else []
+
+
 def covered(task: dict) -> list[int]:
     """The ids `task`'s labels say it covers (the task it reviews, continues or fixes the review of)."""
     out = []
-    for lb in task_labels(task):
+    for lb in _labels(task):
         for pre in _COVER:
             if isinstance(lb, str) and lb.startswith(pre) and lb[len(pre):].isdigit():
                 out.append(int(lb[len(pre):]))
@@ -33,7 +41,7 @@ def is_hop(task: dict) -> bool:
 def _effective(db: DB, task: dict, seen: set[int]) -> int | None:
     """`task`'s own priority, or for a hop nobody set one on, the one its chain gives it (so a closed
     hop's stale priority never holds its successors)."""
-    if is_hop(task) and SET_LABEL not in task_labels(task) and task["id"] not in seen:
+    if is_hop(task) and SET_LABEL not in _labels(task) and task["id"] not in seen:
         got = _of(db, [c for c in (db.task(i) for i in covered(task)) if c], seen | {task["id"]})
         if got is not None:
             return got
@@ -69,7 +77,7 @@ def follow(db: DB, changed: int) -> list[tuple[int, int, int]]:
                 (*TERMINAL_TASK_STATES, changed))
     out: list[tuple[int, int, int]] = []
     for t in rows:
-        if not is_hop(t) or SET_LABEL in task_labels(t) or root(db, t["id"]) != base:
+        if not is_hop(t) or SET_LABEL in _labels(t) or root(db, t["id"]) != base:
             continue
         cov = [c for c in (db.task(i) for i in covered(t)) if c]
         if not cov:
@@ -87,5 +95,5 @@ def set_labels(task: dict, upd: dict[str, Any]) -> list | None:
     if not is_hop(task):
         return None
     labels = upd.get("labels")
-    labels = list(task_labels(task) if labels is None else labels)
+    labels = list(_labels(task) if labels is None else labels)
     return None if SET_LABEL in labels else labels + [SET_LABEL]

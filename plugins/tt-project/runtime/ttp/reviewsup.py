@@ -17,11 +17,11 @@ was; task_outcome shows the review as `superseded`, so the daily review, the blo
 open changes_needed lists leave it out. Recording twice changes nothing."""
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 
 from .db import SUPERSEDED_KEY, dump_result, load_result, review_subject
-from .util import task_labels
 
 PASSED = ("done", "pushing")           # review statuses that approve (pushing: approved, in the push queue)
 
@@ -32,8 +32,16 @@ def record_of(task: dict) -> dict | None:
     return rec if isinstance(rec, dict) else None
 
 
+def _labels(task: dict) -> list[str]:
+    try:
+        vals = json.loads(task.get("labels") or "[]")
+    except (ValueError, TypeError):
+        return []
+    return [v for v in vals if isinstance(v, str)] if isinstance(vals, list) else []
+
+
 def _ids(task: dict, prefixes: tuple[str, ...]) -> list[int]:
-    return [int(v.partition(":")[2]) for v in task_labels(task)
+    return [int(v.partition(":")[2]) for v in _labels(task)
             if v.startswith(prefixes) and v.partition(":")[2].isdigit()]
 
 

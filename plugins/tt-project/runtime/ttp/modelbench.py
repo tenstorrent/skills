@@ -33,8 +33,6 @@ import urllib.request
 from pathlib import Path
 from typing import Callable
 
-from .util import read_dict
-
 DIR, LOCK, OWNER, MODELS = "model-bench", "bench.lock", "owner.json", "models.json"   # under project.HOME_DIR
 OWNER_LOCK = "owner.lock"       # every change to OWNER is made under it (owner_update)
 MODELS_LOCK = "models.lock"     # every change to MODELS is made under it (record)
@@ -83,6 +81,14 @@ def day(now: float) -> str:
     return time.strftime("%Y-%m-%d", time.localtime(now))
 
 
+def _read(path: Path) -> dict:
+    try:
+        v = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return v if isinstance(v, dict) else {}
+
+
 def _write(path: Path, data: dict) -> None:
     from .project import durable_write
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -95,7 +101,7 @@ def owner_update(step: Callable[[dict], dict]) -> dict:
     d.mkdir(parents=True, exist_ok=True)
     with open(d / OWNER_LOCK, "a") as lk:
         fcntl.flock(lk, fcntl.LOCK_EX)
-        old = read_dict(d / OWNER)
+        old = _read(d / OWNER)
         new = step(old)
         if new != old:
             _write(d / OWNER, new)
@@ -105,13 +111,13 @@ def owner_update(step: Callable[[dict], dict]) -> dict:
 def latest() -> dict:
     """The host's newest bench record (the owner's), or {}."""
     days = sorted(home().glob("20*.json")) if home().is_dir() else []
-    return read_dict(days[-1]) if days else {}
+    return _read(days[-1]) if days else {}
 
 
 def models() -> dict[str, dict]:
     """Per model benched on this host: {"at", "date", "score", "weak", "source"} of its last bench (bench or
     suite), plus "rechecks", its last weekly rechecks (record)."""
-    return read_dict(home() / MODELS)
+    return _read(home() / MODELS)
 
 
 def due(cfg: dict, now: float) -> bool:
@@ -226,14 +232,14 @@ def run(project: str, cfg: dict, parked: dict[str, float], now: float, *, force:
         except OSError:
             return {"skipped": "another project on this host is running today's bench", "report": False}
         if today.exists() and not force:
-            rec = read_dict(today)
+            rec = _read(today)
             return {"skipped": f"done today by {rec.get('owner') or '?'}", "report": False, "record": rec}
         alias = str(((cfg.get("providers") or {}).get("chat") or {}).get("endpoint") or "")
         got = endpoint.credentials(alias) if alias else None
         ok, msg, ids = (lister or endpoint.list_models)(got.url, got.key) if got else (False, "no key saved", None)
         if not ok or not ids:
             why = f"no working key for chat endpoint {alias or '(none)'}: {msg}"
-            report = not read_dict(d / OWNER).get("nokey_since")
+            report = not _read(d / OWNER).get("nokey_since")
             owner_update(lambda o: {**o, "nokey_since": o.get("nokey_since") or now, "tried": now})
             _write(today, {"date": day(now), "owner": project, "at": now, "skipped": why, "report": report})
             return {"skipped": why, "report": report, "failed": why}

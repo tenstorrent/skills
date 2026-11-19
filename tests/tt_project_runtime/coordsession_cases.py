@@ -529,12 +529,15 @@ def _cstat_run(p, started, cost, session=None, sid="", fc=None, tools=None, read
     return rid
 
 
-def test_coord_session_stats_report_each_figure_per_day(env):
+def test_coord_session_stats_report_each_figure_per_day_against_the_stateless_baseline(env):
     from ttp import coordstats
     p = make(env)
     day = 86400
     t0 = 1793750400.0   # 2026-11-04 00:00 UTC
     first = t0 + 3600
+    for i in range(14):   # the baseline: 14 stateless turns at $0.50 in the 7 days before the first session wake
+        _cstat_run(p, first - 7 * day + i * day / 2, 0.5)
+    _cstat_run(p, first - 8 * day, 9.0)   # before the baseline's window
     # 2026-11-04: a new session, two resumes, a stateless rerun and a coordinator run outside the session.
     _cstat_run(p, first, 0.3, "new", "s1", 50000, tools=2, read=40000, inp=1000, write=9000)
     _cstat_run(p, first + 600, 0.1, "resume", "s1", 60000, tools=1, read=58000, inp=2000)
@@ -547,27 +550,30 @@ def test_coord_session_stats_report_each_figure_per_day(env):
     now = t0 + day + 3600
     s = coordstats.report(p.db, p.runs, "UTC", 7, now=now)
     assert s["first_session_wake"] == first
+    assert s["baseline"] == {"since": first - 7 * day, "until": first, "turns": 14, "days": 7.0,
+                             "turns_per_day": 2.0, "usd_per_turn": 0.5, "usd_per_day": 1.0}
     d1, d2 = s["by_day"]
     assert d1 == {"day": "2026-11-04", "partial": False, "wakes": 4, "resumed": 2, "rollovers": 1, "stateless": 1,
                   "handoffs": 1,
                   "usd": 0.7, "usd_per_wake": 0.175, "growth_per_wake": 12500.0, "growth_wakes": 2,
                   "tool_calls_per_wake": 1.0, "tool_call_wakes": 3, "cache_read_ratio": round(168000 / 195000, 3),
-                  "coordinator_usd": 1.1, "break_even": True,
+                  "coordinator_usd": 1.1, "over_baseline": True, "break_even": True,
                   "reasons": {"resumed": 2, "new: other": 1, "stateless: other": 1}, "fallback_rate": 0.25,
                   "rollover_tokens": None, "failed_wakes": [], "mode_off": {"off, not recorded": 1}, "compactions": [],
                   "prefix_parts": {}}
     assert d2["day"] == "2026-11-05" and d2["partial"] and (d2["wakes"], d2["resumed"], d2["rollovers"]) == (2, 1, 1)
     assert d2["growth_per_wake"] == 35000.0 and d2["tool_calls_per_wake"] == 4.0 and d2["tool_call_wakes"] == 1
-    assert d2["break_even"] is False and d2["coordinator_usd"] == 0.5
+    assert d2["break_even"] is False and d2["over_baseline"] is False and d2["coordinator_usd"] == 0.5
     assert d2["cache_read_ratio"] == round(140000 / 140500, 3)
     # The previous wake of a session counts from before the window: day 2 alone still grows by 35k.
     [only] = coordstats.report(p.db, p.runs, "UTC", 0.5, now=now)["by_day"]
     assert only["day"] == "2026-11-05" and only["growth_per_wake"] == 35000.0
     out = coordstats.text(s, "demo")
+    assert "2.0 turns/day, $0.500/turn, $1.00/day" in out
     assert ("2026-11-04: 4 wakes (2 resumed, 1 new, 1 new with a hand-off, 1 stateless), $0.175/wake, "
             "context growth +12.5k/wake") in out
     assert "1.0 tool calls/wake, cache reads 86%; break-even" in out and ": met; coordinator $1.10" in out
-    assert "2026-11-05 (so far):" in out and ": missed; coordinator $0.50" in out
+    assert "OVER baseline" in out and "2026-11-05 (so far):" in out and ": missed; coordinator $0.50" in out
     # The day bounds follow the home zone: 01:00 UTC on 11-04 is still 11-03 in Los Angeles.
     assert coordstats.report(p.db, p.runs, "America/Los_Angeles", 7, now=now)["by_day"][0]["day"] == "2026-11-03"
     # Each in-place compaction coordsession recorded is listed on its day: session, tokens before and after.
@@ -667,17 +673,17 @@ def test_coord_session_stats_count_the_changed_prefix_parts_and_a_restart_apart(
             "none (same digests) 1, standing 1, template 1") in out, out
 
 
-def test_coord_session_stats_without_session_wakes_say_so(env, capsys):
+def test_coord_session_stats_without_session_wakes_or_baseline_say_so(env, capsys):
     from ttp import cli, coordstats
     p = make(env)
     now = time.time()
     s = coordstats.report(p.db, p.runs, "UTC", 7, now=now)
-    assert s["by_day"] == [] and s["first_session_wake"] is None
-    assert "no session wakes" in coordstats.text(s)
-    # A session wake with no transcript and no first-call context: unknown, not a pass.
+    assert s["by_day"] == [] and s["first_session_wake"] is None and s["baseline"]["turns_per_day"] is None
+    assert "no session wakes" in coordstats.text(s) and "n/a turns/day" in coordstats.text(s)
+    # A session wake with no baseline, no transcript and no first-call context: unknown, not a pass.
     _cstat_run(p, now - 60, 0.1, "new", "s1")
     [d] = coordstats.report(p.db, p.runs, "UTC", 7, now=now)["by_day"]
-    assert d["break_even"] is None and d["cache_read_ratio"] is None
+    assert d["break_even"] is None and d["over_baseline"] is None and d["cache_read_ratio"] is None
     _cstat_run(p, now - 30, 0.1, "resume", "s1", tools=1)
     [d] = coordstats.report(p.db, p.runs, "UTC", 7, now=now)["by_day"]
     assert d["growth_per_wake"] is None and d["break_even"] is None, "no first-call context: growth unknown"

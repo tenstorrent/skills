@@ -46,7 +46,6 @@ import time
 from pathlib import Path
 
 from . import locks, procowner
-from .locks import _pgid
 
 WAIT_ALERT_MIN = 30   # config locks.wait_alert_min: a lock wait longer than this raises lock-wait:<name>
 GRACE_S = 60.0        # a holder seen dead this long (two sweeps) before what keeps its lock is reaped
@@ -57,6 +56,13 @@ EVENT_KIND = "lock_released"
 # While the daemon runs, a dead holder's lock that only its own run keeps is released this soon: the first
 # tick that sees it dead, GRACE_S later the SIGTERM, KILL_AFTER_S after that the SIGKILL, plus tick slack.
 RELEASE_WITHIN_S = GRACE_S + KILL_AFTER_S + 30.0
+
+
+def _pgid(pid: int) -> int | None:
+    try:
+        return os.getpgid(pid)
+    except OSError:
+        return None
 
 
 def cmdline(pid: int) -> str:

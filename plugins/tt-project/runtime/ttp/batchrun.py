@@ -46,7 +46,6 @@ import time
 from pathlib import Path
 
 from .db import dump_result, load_result
-from .util import task_labels
 
 KV = "batchrun:"
 # Lead statuses that keep its members held. A lead 'pushing' has its push in the queue: its members wait,
@@ -144,6 +143,14 @@ def batch_max(cfg: dict) -> int:
         return BATCH_MAX
 
 
+def _labels(t: dict) -> list:
+    try:
+        v = json.loads(t.get("labels") or "[]")
+    except (ValueError, TypeError):
+        return []
+    return [lb for lb in v if isinstance(lb, str)] if isinstance(v, list) else []
+
+
 def _deps(t: dict) -> list[int]:
     try:
         return [int(d) for d in json.loads(t.get("depends_on") or "[]")]
@@ -152,17 +159,17 @@ def _deps(t: dict) -> list[int]:
 
 
 def _repo(t: dict) -> str:
-    return next((lb[7:] for lb in task_labels(t) if lb.startswith("pr_fix:")), "")
+    return next((lb[7:] for lb in _labels(t) if lb.startswith("pr_fix:")), "")
 
 
 def _exclusive(t: dict) -> bool:
-    return any(lb == "exclusive" or lb.startswith("exclusive:") for lb in task_labels(t))
+    return any(lb == "exclusive" or lb.startswith("exclusive:") for lb in _labels(t))
 
 
 def _resources(t: dict) -> set[str]:
     """The device and machine resources `t` holds (`resource:`, `exclusive:`), plus `needs_device`."""
-    out = {lb.split(":", 1)[1] for lb in task_labels(t) if lb.split(":", 1)[0] in ("resource", "exclusive")}
-    return out | ({"needs_device"} if "needs_device" in task_labels(t) else set())
+    out = {lb.split(":", 1)[1] for lb in _labels(t) if lb.split(":", 1)[0] in ("resource", "exclusive")}
+    return out | ({"needs_device"} if "needs_device" in _labels(t) else set())
 
 
 def fits(lead: dict, t: dict) -> bool:
@@ -174,7 +181,7 @@ def own_branch(t: dict, recorded: bool = True) -> bool:
     """`t` carries a branch of its own (a `pr_branch:` line or label, a PR fix, a continuation or, with
     `recorded`, a branch on its record): it neither joins a batch nor leads one, so no other task's work
     lands on a PR's or another task's branch. A lead's own recorded ttp/t<id> branch is its batch's."""
-    labels = task_labels(t)
+    labels = _labels(t)
     return bool((recorded and t.get("branch")) or t.get("pr_url") or "pr_branch:" in (t.get("spec") or "")
                 or any(str(x).startswith(("pr_branch:", "pr_fix:", "continues:")) for x in labels))
 
@@ -188,7 +195,7 @@ def eligible(lead: dict, t: dict) -> bool:
     # Any tier up to the lead's (the run takes the lead's model and effort): a deep lead takes deep work too.
     if _rank(t) > _rank(lead) or not fits(lead, t) or _repo(t) != _repo(lead):
         return False
-    if USER_DEEP in task_labels(t) and _rank(lead) < TIER_RANK["deep"]:
+    if USER_DEEP in _labels(t) and _rank(lead) < TIER_RANK["deep"]:
         return False
     if own_branch(t):
         return False

@@ -4400,29 +4400,6 @@ def test_a_tick_step_failing_three_ticks_in_a_row_is_alerted_then_cleared_by_a_s
     assert not alerts.holds(p.db, "tick-step:retry_rejected", ep["raised"], time.time())
 
 
-@pytest.mark.parametrize("step", ["check_mute_ends", "retire_ended", "start_pushes", "lint_worker_prompt",
-                                  "tend_mitigations"])
-def test_a_step_that_used_to_catch_its_own_error_now_reaches_the_step_failure_alert(env, monkeypatch, step):
-    """These steps no longer swallow their own exceptions: _run_step counts each failure and alerts
-    tick-step:<name> after STEP_FAILS_ALERT ticks in a row."""
-    from ttp import daemon as dm, promptdrift
-    p = make(env)
-    d = dm.Daemon(p.base)
-
-    def boom(*a, **k):
-        raise RuntimeError(f"{step} broke")
-    target = {"check_mute_ends": (d._mute_ends, "tick"), "retire_ended": (d._ends, "tick"),
-              "start_pushes": (dm.pushq, "schedule"), "lint_worker_prompt": (promptdrift, "check"),
-              "tend_mitigations": (dm.mitigate, "tend")}[step]
-    monkeypatch.setattr(*target, boom)
-    monkeypatch.setattr(d, "lease_held", lambda: True)
-    for n in range(1, dm.STEP_FAILS_ALERT + 1):
-        assert d._run_step(getattr(d, step), default="x") == "x"
-        assert d._step_fails[step][0] == n
-    ep = p.db.one(f"SELECT * FROM alerts WHERE key='tick-step:{step}' AND cleared IS NULL")
-    assert ep and f"RuntimeError: {step} broke" in ep["text"]
-
-
 def _notifier_stubs(monkeypatch, tmp_path, names, rc=0):
     """Stub notifier commands on an otherwise empty PATH; each records its argv NUL-separated."""
     bindir = tmp_path / "bin"

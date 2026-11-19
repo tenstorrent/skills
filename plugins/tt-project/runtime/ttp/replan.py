@@ -18,8 +18,6 @@ import re
 import statistics
 import time
 
-from .util import as_int
-
 FLAG_KIND = "promise_moved_unchanged"
 PLAN_FIELDS = ("priority", "resources", "depends_on", "status", "spec")
 PLAN_COLS = {"priority": "priority", "resources": "labels", "depends_on": "depends_on", "status": "status",
@@ -33,6 +31,13 @@ REPLAN_TEXT = ("\nMissed twice: re-plan now (a new split, route or owner: task_a
 
 def _names(text, key: str) -> bool:
     return bool(re.search(rf"(?<![\w./-]){re.escape(key)}(?![\w-]|\.\d)", str(text or "")))
+
+
+def _int(v) -> int | None:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
 
 
 def note_miss(pr: dict, now: float) -> int:
@@ -88,7 +93,7 @@ def snapshot(db, actions: list) -> dict[int, dict]:
     applies: plan_change compares them with the task after it."""
     out = {}
     for a in actions:
-        if isinstance(a, dict) and a.get("type") == "task_update" and (tid := as_int(a.get("id"))) is not None \
+        if isinstance(a, dict) and a.get("type") == "task_update" and (tid := _int(a.get("id"))) is not None \
                 and tid not in out and (t := db.task(tid)):
             out[tid] = {f: t[c] for f, c in PLAN_COLS.items()}
     return out
@@ -135,13 +140,13 @@ def plan_change(db, o: dict, actions: list, skip=(), since: float | None = None,
         if t == "task_add":
             if any(_names(v, key) for v in a.values() if isinstance(v, str)):
                 return f"task_add names {key}"
-            if as_int(a.get("continues")) in owners:
+            if _int(a.get("continues")) in owners:
                 return f"task_add continues #{a['continues']}"
-        elif t == "task_update" and as_int(a.get("id")) in owners:
+        elif t == "task_update" and _int(a.get("id")) in owners:
             if changed := _changed(db, a, before):
                 return f"task_update #{a['id']} changes {', '.join(changed)}"
         elif t == "obligation" and str(a.get("key") or "").strip() == key:
-            new = {x for x in (as_int(v) for v in a.get("owners") or []) if x is not None
+            new = {x for x in (_int(v) for v in a.get("owners") or []) if x is not None
                    and (x not in owners or since is not None
                         and float(((o.get("owners") or {}).get(str(x)) or {}).get("since") or 0) >= since)}
             if new:

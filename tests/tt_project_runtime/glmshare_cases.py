@@ -42,9 +42,9 @@ def test_glm_share_counts_model_hours_and_runs_per_role_and_quality_per_arm(env,
            (t + 9000, "user", "task_requeued", f"#{b} requeued from failed by the user", b))
     c = _gs_task(p, kind="work")                                                 # routed, fell back to Claude
     _gs_run(p, c, t, 0.5, provider="claude", model="opus", note={"route": {"to": "chat", "fallback": "needs_opus"}})
-    d = _gs_task(p, kind="work", labels=["needs_device", "resource:box-a-device"])   # device work on a lower-case glm
+    d = _gs_task(p, kind="work", labels=["needs_device"])                       # device work on a lower-case glm
     _gs_run(p, d, t, 1, model="other-org/glm-mini")
-    p.db.x("INSERT INTO events(ts,source,kind,text,task) VALUES(?,?,?,?,?)", (t + 600, "watcher", "device_hang", "box-a-device hung", d))
+    p.db.x("INSERT INTO events(ts,source,kind,text,task) VALUES(?,?,?,?,?)", (t + 600, "watcher", "device_hang", "hung", d))
     r = _gs_task(p, kind="review")
     _gs_run(p, r, t, 0.5, provider="claude", model="opus")
     _gs_run(p, None, now - 3 * 86400, 5, provider="chat", role="coordinator")   # before the window: not counted
@@ -113,10 +113,8 @@ def test_glm_share_judge_waits_for_enough_glm_tasks_then_compares_with_the_proje
     v = glmshare.judge(p, cfg, now)
     assert (v["state"], v["n"]) == ("ok", 3), v
     assert "GLM 3 tasks with an outcome, Claude baseline 6" in v["why"]
-    # Any device incident on a GLM run (on a device it changed): worse.
-    p.db.update_task(g1, labels=["resource:box-a-device"])
-    p.db.x("INSERT INTO events(ts,source,kind,text,task) VALUES(?,?,?,?,?)",
-           (t0 + 60, "watcher", "device_reset", "box-a-device reset", g1))
+    # Any device incident on a GLM run: worse.
+    p.db.x("INSERT INTO events(ts,source,kind,text,task) VALUES(?,?,?,?,?)", (t0 + 60, "watcher", "device_reset", "x", g1))
     v = glmshare.judge(p, cfg, now)
     assert v["state"] == "worse" and "1 device incident" in v["why"]
     p.db.x("DELETE FROM events WHERE kind='device_reset'")

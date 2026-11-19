@@ -101,8 +101,6 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from .util import task_labels
-
 TO = "chat"                 # the provider a tier can be routed to
 KEY = "route"               # the run note's entry
 ROUTES = "routes"           # providers.chat.routes: the ordered rule list (match)
@@ -183,6 +181,15 @@ def _rule(r) -> dict | None:
     return {**out, "effort": r.get("effort", ""), "route_timeout_s": v}
 
 
+def _labels(task: dict) -> list[str]:
+    v = task.get("labels") or "[]"
+    try:
+        v = json.loads(v) if isinstance(v, str) else v
+    except ValueError:
+        return []
+    return [str(x) for x in v] if isinstance(v, list) else []
+
+
 def _has(labels: list[str], names) -> bool:
     """A label `name` or `name:<anything>` (review_fix:<id>) for any of `names`."""
     return any(lb == n or lb.startswith(n + ":") for lb in labels for n in names)
@@ -195,7 +202,7 @@ def kept_core(task: dict, urgency: bool = True) -> bool:
     to the core model by it."""
     from . import effort, urgent
     keys = KEEP_CORE if urgency else tuple(k for k in KEEP_CORE if k != "urgent")
-    return _has(task_labels(task), keys) or (urgency and urgent.is_urgent(task)) \
+    return _has(_labels(task), keys) or (urgency and urgent.is_urgent(task)) \
         or effort.wants_deep(task.get("result"))
 
 
@@ -208,7 +215,7 @@ def match(cfg: dict, task: dict, tier: str) -> dict | None:
     got = rules(cfg)
     if got and kept_core(task):
         return None
-    labels = task_labels(task)
+    labels = _labels(task)
     for i, r in got:
         if (r["tiers"] and tier not in r["tiers"]) or (r["kinds"] and str(task.get("kind") or "") not in r["kinds"]) \
                 or (r["labels_any"] and not _has(labels, r["labels_any"])) or _has(labels, r["labels_none"]):
@@ -247,7 +254,7 @@ def protected(db, cfg: dict, task: dict, tier: str, urgency: bool = True) -> str
         return "device"
     if urgency and urgent.is_urgent(task):
         return "urgent"
-    if modelpick.UNTRUSTED in task_labels(task):
+    if modelpick.UNTRUSTED in modelpick._labels(task):
         return "untrusted"
     if modelpick.HARD.search(f"{task.get('title') or ''}\n{task.get('spec') or ''}"):
         return "optimization"
@@ -456,6 +463,17 @@ def routes_chat(cfg: dict, db=None) -> str:
     model pin, or babysitting), else '': the host's shared /models poll then runs at its busy interval (served.py)."""
     from . import babysit
     return _routed(cfg, db) or (chat_alias(cfg) if babysit.settings(cfg) else "")
+
+
+def models_due(cfg: dict, state: Path, now: float, db=None) -> str:
+    """The endpoint alias whose per-project /models check is due (a tier or run class routes to it, or with a
+    model ranking set a queued or running task pins a model on it, and the last check is models_every old),
+    else ''. The fallback when the host's shared poll cannot run (served.py)."""
+    alias = _routed(cfg, db)
+    if not alias:
+        return ""
+    last = read_served(state).get(TO) or {}
+    return alias if now - float(last.get("checked") or 0) >= models_every(cfg) else ""
 
 
 def _ranked_pin(cfg: dict, db) -> bool:

@@ -38,7 +38,6 @@ import time
 from pathlib import Path
 
 from . import gitcache, gitmemo, repoid
-from .util import read_dict
 
 SHARED = "shared"                # a claim on another task's commit
 KEY = "push_verify"              # tasks.result of a task in `pushing` until its claims are verified
@@ -184,7 +183,7 @@ def _markers(p, tid: int) -> list[tuple[Path, dict]]:
     from . import push
     out = []
     for marker in sorted((p.state / push.DETACHED).glob(f"t{tid}-*.json")):
-        m = read_dict(marker)
+        m = push._read(marker)
         if isinstance(m, dict) and m.get("kind") != "batch":
             out.append((marker, m))
     return out
@@ -328,7 +327,7 @@ def _net(repo, cache: dict, *args: str, timeout: float) -> subprocess.CompletedP
 
 def _read_marker(p, name: str) -> dict:
     from . import push
-    m = read_dict(p.state / push.DETACHED / name)
+    m = push._read(p.state / push.DETACHED / name)
     return m if isinstance(m, dict) else {}
 
 

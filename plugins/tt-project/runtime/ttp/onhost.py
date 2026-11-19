@@ -47,8 +47,6 @@ import re
 import time
 from pathlib import Path
 
-from .util import task_labels
-
 FILE = "onhost.json"
 CLOSED = ("done", "failed", "cancelled", "exhausted")
 MARK = "Planned, not started on the host yet:"
@@ -103,12 +101,20 @@ def record(run_dir, resources, kind: str = "lock", now: float | None = None) -> 
         pass
 
 
+def _labels(task: dict) -> list[str]:
+    try:   # a stored task's labels are JSON; a pending task_add's (pending()) a list
+        got = task.get("labels") if isinstance(task.get("labels"), list) else json.loads(task.get("labels") or "[]")
+    except (TypeError, ValueError):
+        return []
+    return [x for x in got if isinstance(x, str)] if isinstance(got, list) else []
+
+
 def resources(task: dict, cfg: dict | None = None) -> list[str]:
     """The machine or device resources a task names, as their canonical locks: `resource:`, `exclusive:`
     and, for `needs_device`, the project's device lock. Empty: not a host task."""
     from . import locks
     cfg = cfg or {}
-    labels = task_labels(task)
+    labels = _labels(task)
     out = [locks.canonical(cfg, lb.split(":", 1)[1]) for lb in labels
            if lb.split(":", 1)[0] in ("resource", "exclusive") and ":" in lb and lb.split(":", 1)[1]]
     if "needs_device" in labels and (dev := sorted(locks.device_locks(cfg))):

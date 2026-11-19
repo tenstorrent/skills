@@ -11510,7 +11510,7 @@ def test_checks_park_frees_the_queue_place_and_resumes_at_its_first_arrival_once
                                      f"test -e {flag}")
         assert code == 0 and "parked" in text and f"resumes when `test -e {flag}` passes" in text, text
         # Its queue place goes before its parked wait is written (checksqueue.hold): wait for both.
-        parked = lambda: "parked" in read_dict(run / cli.CHECKS_SLOT_WAIT)
+        parked = lambda: "parked" in checksqueue._json(run / cli.CHECKS_SLOT_WAIT)
         assert _wait_for(lambda: not tickets() and parked()), "a parked run holds no queue place"
         wait = json.loads((run / cli.CHECKS_SLOT_WAIT).read_text())
         assert wait["note"].startswith("checks run parked by the coordinator: user msg #1: let p1 go first"), wait

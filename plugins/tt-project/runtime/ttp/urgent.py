@@ -264,7 +264,7 @@ def covers_urgent(db, task: dict | None) -> bool:
 
 def approvals_waiting(db, target: str) -> list[int]:
     """Queue ids of the approved urgent rows (covers_urgent) for push target `target`, best priority
-    first: what a push batch searching for the entry that broke its checks stops for (batch.Batch._yield_now).
+    first: what a push batch searching for the entry that broke its checks stops for (pushq.yields_to).
     Here, not in pushq, so batch can import it at module level without an import cycle."""
     rows = db.q("SELECT q.id, q.task FROM push_queue q JOIN tasks t ON t.id=q.task WHERE q.status='approved' "
                 "AND t.status='pushing' AND q.target=? ORDER BY t.priority, q.id", (target,))

@@ -1208,6 +1208,7 @@ def test_a_lone_continue_re_queues_the_same_task_with_its_worktree_branch_and_a_
     prompt. No new task, no review yet; its next hand-off without a continue gets its review."""
     from ttp import chaincap, worktree
     from ttp.daemon import Daemon
+    from ttp.prompts import worker_prompt
     from ttp.providers.base import RunUsage as Usage
     p = make(env)
     def before(tid, head):   # the run's cost, recorded before the finish in the same round
@@ -1370,7 +1371,7 @@ def test_a_code_worker_is_told_to_split_past_the_configured_line_count_into_sepa
     each reviewed on their own: a follow-up waiting on this task's landing, never a `continue:` hop or a
     split/wip mark (chaincap: a split head skips its review and the chain's last hop reviews everything).
     Off (0), the rule and its marker are gone; no worker gets an unfilled placeholder."""
-    from ttp.prompts import SPLIT_MARK, _sections
+    from ttp.prompts import SPLIT_MARK, _sections, worker_prompt
     p = make(env)
     p.set_config("chains.split_lines", 200)   # opt-in since 11-12 (default off)
     tid = p.db.add_task("code: a big change", "do it", kind="code", origin="user")
