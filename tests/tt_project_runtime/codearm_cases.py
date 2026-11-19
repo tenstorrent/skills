@@ -507,6 +507,7 @@ def test_glm_guard_keeps_a_hand_off_the_run_wrote_before_it_was_stopped(tmp_path
 
 @_pytest.mark.parametrize("cmd", [
     "ttp note --to other 'hi'", "ttp ask 'ok?'", "ttp notify 'x'", "ttp some-project note hi", "ttp other-project checks", "ttp task add t s",
+    "ttp task p superseded 1 abc", "ttp task proj add t s", "ttp task show add t",
     "ttp upstream 'x'", "git push origin HEAD", "git -C . push --force", "gh pr comment 1 --body x",
     "gh issue create -t x", "gh api repos/o/r/issues -f title=x", "curl -X POST https://x.invalid -d a=b",
     "curl --data a=b https://x.invalid", "ssh host true", "mail -s x a@b", "sqlite3 $TTP_PROJECT/state/project.db 'x'",
@@ -523,7 +524,7 @@ def test_glm_guard_refuses_a_shell_command_that_reaches_a_person_a_project_or_so
 @_pytest.mark.parametrize("cmd", [
     "ttp checks", "ttp push", "ttp proj checks --detach", "ttp note 'update: ack'", "bash -c 'ttp note x'", "git status", "git commit -am x", "git diff HEAD~1",
     "python3 -m pytest -q tests", "echo hi > out.txt", "cat a | grep b > $TTP_RUN_DIR/notes.txt", "gh pr view 1",
-    "gh api repos/o/r/pulls/1", "curl -s https://x.invalid/doc", "ttp task show 5", "ttp lock acquire x -- true",
+    "gh api repos/o/r/pulls/1", "curl -s https://x.invalid/doc", "ttp task p show 1", "ttp task proj list", "ttp lock acquire x -- true",
     "ls /tmp", "sed -i s/a/b/ src/mod.py"])
 def test_glm_guard_allows_the_commands_a_build_needs(cmd, tmp_path):
     from ttp import glmguard
@@ -532,7 +533,7 @@ def test_glm_guard_allows_the_commands_a_build_needs(cmd, tmp_path):
 
 
 @_pytest.mark.parametrize("cmd", [
-    "ttp checks 2>&1 | tail -3", "ttp checks >$TTP_RUN_DIR/checks.log 2>&1", "ttp 2>&1 checks", "ttp task show 5 2>/dev/null",
+    "ttp checks 2>&1 | tail -3", "ttp checks >$TTP_RUN_DIR/checks.log 2>&1", "ttp 2>&1 checks", "ttp task proj show 5 2>/dev/null",
     "ttp push 2>&1 | tail -5"])
 def test_glm_guard_reads_a_ttp_call_without_its_redirections(cmd, tmp_path):
     """cell guard_redirect: the fd digit of `2>&1` is no word of the call."""

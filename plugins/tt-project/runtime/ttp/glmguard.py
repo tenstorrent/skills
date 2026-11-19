@@ -274,8 +274,8 @@ def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None) -> str | None
     plain, _ = hook._split(REDIRECT.sub(" ", cmd))   # `ttp checks 2>&1`: the 2 is no word of the call
     for seg in hook._all_segments(plain) + hook._segments(plain, strip=False):
         words = _ttp_args(seg, project)
-        if words and (why := cli_refusal(words[0], words[1] if len(words) > 1 else "",
-                                         [w for w in seg if w.startswith("--")])):
+        act = words[2:3] if words and words[0] == "task" else (words or [])[1:2]   # `ttp task <project> <action>`
+        if words and (why := cli_refusal(words[0], act[0] if act else "", [w for w in seg if w.startswith("--")])):
             return why
     for seg in segs:
         if not seg:
