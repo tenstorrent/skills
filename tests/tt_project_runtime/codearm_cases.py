@@ -686,7 +686,7 @@ def test_glmenv_refuses_what_the_guard_refuses_and_a_secret_read_and_allows_ordi
 
 def test_the_guarded_environment_ends_a_run_on_a_refused_command_and_runs_the_rest(tmp_path, monkeypatch):
     import json
-    from ttp import codearm, glmenv
+    from ttp import codearm, glmenv, glmguard
     wt, rd = _gg_run(tmp_path)
     monkeypatch.setenv("TTP_RUN_DIR", str(rd))
     monkeypatch.setenv("TTP_CODE_ARM_GUARD", "1")
@@ -700,8 +700,12 @@ def test_the_guarded_environment_ends_a_run_on_a_refused_command_and_runs_the_re
         pytest.skip("minisweagent is importable here: its own environment class is the base")
     env = type("Env", (glmenv.GuardedEnvironment, Base), {})()   # the guard sits before the base in the MRO
     assert env.execute({"command": "ls"}, str(wt))["returncode"] == 0 and ran == ["ls"]
+    # An outward post is not a refusal: it is kept as a draft for an Opus step and the run goes on.
+    got = env.execute({"command": "ttp note --to other hi"}, str(wt))
+    assert got["returncode"] == 2 and got["output"].startswith("not sent: ") and ran == ["ls"]
+    assert (rd / glmguard.DRAFTS).exists() and not (rd / "result.json").exists()
     with pytest.raises(glmenv.Submitted) as ei:
-        env.execute({"command": "ttp note --to other hi"}, str(wt))
+        env.execute({"command": "git push origin HEAD"}, str(wt))
     assert ran == ["ls"]   # the refused command never ran
     assert ei.value.messages[0]["extra"]["exit_status"] == "GuardRefused"
     assert codearm.bounce_reason(json.loads((rd / "result.json").read_text())).startswith("guard: ")
