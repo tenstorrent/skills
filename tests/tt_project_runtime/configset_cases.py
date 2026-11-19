@@ -584,3 +584,25 @@ def test_config_accepts_waiting_check_plan_whole_and_by_field_and_waketier_reads
     s = waketier.plan_settings(p.config())
     assert (s["enabled"], s["interim_share"], s["by"]) == (False, 0.3, "jev")
     assert "unknown" not in capsys.readouterr().out.lower()
+
+
+def test_config_add_appends_one_item_to_a_list_key_dedupes_and_refuses_other_keys(env, capsys):
+    """`ttp config NAME KEY --add VALUE` adds one item to a list key, keeping the others (its default's items
+    when unset); an item already there is left as is; a key that is not a list is refused, nothing written."""
+    from ttp import cli
+    from ttp.project import DEFAULT_CONFIG
+    p = make(env)
+    default = list(DEFAULT_CONFIG["sandbox"]["fence_freed_commands"])
+    cli.main(["config", "demo", "sandbox.fence_freed_commands", "--add", "make"])
+    assert p.config()["sandbox"]["fence_freed_commands"] == default + ["make"]
+    cli.main(["config", "demo", "sandbox.fence_freed_commands", "--add", "make"])
+    assert "already has" in capsys.readouterr().out
+    assert p.config()["sandbox"]["fence_freed_commands"] == default + ["make"]
+    cli.main(["config", "demo", "providers.claude.write_dirs", "--add", "out"])   # a list key with no default
+    assert p.config()["providers"]["claude"]["write_dirs"] == ["out"]
+    before = p.config_path.read_text()
+    for key in ("heal.escalate", "coordinator.turn_timeouts_s"):
+        with pytest.raises(SystemExit):
+            cli.main(["config", "demo", key, "--add", "x"])
+        assert "not a list key" in capsys.readouterr().err
+    assert p.config_path.read_text() == before
