@@ -2024,6 +2024,21 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    GLM route that stop is a bounce to Opus (`route.glm_work.bounce`), with no attempt spent. The
    exit record counts nudges and stops under `bridge.loop`, and `ttp stats --glm-share` and the
    daily review show them by day.
+8. Human interaction stays on Opus. On every run on the chat model, whatever route sent it there
+   (the chat provider, a code arm's GLM run, a routine coordinator lane), an outward post (`ttp
+   notify`, `say`, `ask`, `ttp note --to` or `--reply`, a `gh` comment or other write, an HTTP
+   post, mail, any connector tool such as Slack or Jira) is not sent. The hook, the CLI and the
+   harness's own command layer refuse it and record it as a draft in the run folder's
+   `outbound.jsonl` (one JSON per line: `channel`, `target`, `text`, `why`, `command`, `ts`), and
+   the run goes on. After the run the daemon hands the drafts to the coordinator's Opus session as
+   one `glm_outbound` event; it reviews each and sends it, with the AI authorship tag for anyone
+   other than the user, or drops it. A draft is never sent unreviewed.
+9. On a device task (its resources name a device or machine), the first failed gate command ends
+   the run: a `check:` or `gate:` line of the task's spec, `ttp checks`, `ttp lock`, or a broker
+   status or preflight. The task goes back to Opus with the command and its output, with no
+   attempt spent. Any other failed command does not stop it. `ttp stats --glm-share` and the daily
+   review count both by day: `outward_drafts`, `gate_stops`, and `guard_bounces` (the code arm's
+   other refusals).
 
 The key stays in the per-user secrets store and the bridge's upstream requests: the agent gets
 only the bridge's address and a per-run token. Reasoning text from the endpoint is dropped

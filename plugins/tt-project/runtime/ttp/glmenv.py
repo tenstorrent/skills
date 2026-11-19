@@ -11,6 +11,9 @@ no model call:
   a GitHub write, an HTTP post, ssh or mail, a state or database write, a write outside the worktree);
 - a read of the stored secrets (hook.secret_read, credguard.bash_refusal), as the Claude Code hook does.
 
+An outward post (glmguard.outward_shell) is not run but recorded as a draft for an Opus step, and the run goes on;
+on a device task a failed gate command ends the run as a hand-back to Opus with its output (glmguard.gate_stop).
+
 `ttp push` stays the one way to publish: it runs the project's checks first and refuses a run that handed its
 task back (cli.glm_gate and `_cmd_push`). The module imports minisweagent only inside the mini process; refusal()
 needs nothing but the standard library, so the harness's tests run without it.
@@ -106,12 +109,18 @@ class GuardedEnvironment(LocalEnvironment):
     def execute(self, action: dict, cwd: str = "", *, timeout: int | None = None):
         command = str(action.get("command") or "")
         run_dir = os.environ.get("TTP_RUN_DIR", "")
+        if draft := glmguard.outward_shell(command):   # an outward post: a draft for Opus, the run goes on
+            return {"output": glmguard.drafted(run_dir, draft), "returncode": 2, "exception_info": ""}
         why = refusal(command, cwd or getattr(getattr(self, "config", None), "cwd", "") or os.getcwd(), run_dir)
         if why:
             glmguard.hit(run_dir, why)   # the hand-back to Opus; the command is never run
             raise Submitted({"role": "exit", "content": f"refused by the guard: {why}",
                              "extra": {"exit_status": "GuardRefused", "submission": ""}})
         got = super().execute(action, cwd, timeout=timeout)
+        if isinstance(got, dict) and (why := glmguard.gate_stop(run_dir, command, got.get("returncode"),
+                                                                 str(got.get("output") or ""))):
+            raise Submitted({"role": "exit", "content": f"stopped: {why}",   # the hand-back to Opus with its output
+                             "extra": {"exit_status": "GateFailed", "submission": ""}})
         if os.environ.get(DIGEST_ENV) == "1" and run_dir and isinstance(got, dict) and isinstance(got.get("output"), str):
             got = {**got, "output": digest(got["output"], got.get("returncode"), Path(run_dir) / SAVE_DIR)}
         return got

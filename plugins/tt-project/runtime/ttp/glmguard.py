@@ -22,7 +22,17 @@ A refused attempt ends the run as a hand-back to Opus: hit() writes the run's gl
 `needs_opus` result.json (reason `guard: <what>`), the runner stops the agent at its next look and the
 daemon requeues the task on Opus without spending an attempt (codearm.bounce_reason). The guard applies to
 runs where active() holds: the daemon sets TTP_CODE_ARM_GUARD for a run whose arm is glm and writes MARK in
-its run folder, so a run that unsets the variable is still guarded. Other runs are not touched."""
+its run folder, so a run that unsets the variable is still guarded. Other runs are not touched.
+
+Every run on the chat model, whatever route sent it there (run_env: the chat provider, a code arm's GLM run, a
+routine coordinator lane), also gets two rules; the daemon sets RUN_ENV and writes RUN_MARK:
+- human interaction stays on Opus: an outward post (outward: `ttp notify`, `say`, `ask`, `ttp note --to/--reply`,
+  a `gh` write, an HTTP post, mail, any connector tool) is refused and recorded as a draft (DRAFTS: channel,
+  target, text, why, command), and the run goes on; after the run the daemon hands the drafts to the
+  coordinator's Opus session, which reviews each and sends or drops it (daemon.relay_glm_drafts);
+- on a device task (its resources name a device or machine), the first failed gate command (a `check:` or
+  `gate:` line of the spec, `ttp checks`, `ttp lock`, a broker status or preflight) ends the run as a hand-back
+  to Opus with the command and its output (gate_stop); any other failed command does not."""
 from __future__ import annotations
 
 import json
@@ -64,6 +74,21 @@ TAMPER = re.compile(
 # A shell redirection (`2>&1`, `>out.log`, `<in`): its fd digit and target are no words of a ttp call.
 REDIRECT = re.compile(r"(?<![\w$])\d*(?:&>>?|>>?|<<?<?|>&|<&)\s*(?:&?\d+-?|[^\s;|&<>()]+)?")
 STATE_DB = re.compile(r"\bproject\.db\b|\bmachine-workers\.json\b|\b\.tt-project/(?:locks|machines)\b")
+# Every run on the chat model (the code arm, a GLM work route, a routine coordinator lane, a bench run as a task):
+# human interaction stays on Opus, so its outward posts become drafts an Opus step reviews and sends.
+RUN_ENV = "TTP_GLM_RUN"       # "1", or DEVICE for a run on a device task
+RUN_MARK = "glm_run.json"     # in the run folder: {"device", "gates"}, read where the variable is gone
+DEVICE = "device"
+DRAFTS = "outbound.jsonl"     # in the run folder: one {channel, target, text, why, command, ts} per refused post
+GATE = "gate"
+OUTPUT_TAIL = 2000
+OUT_SUBS = frozenset({"notify", "say", "ask"})
+OUT_NOTE = ("--to", "--reply")
+MAIL = frozenset({"mail", "mailx", "sendmail", "mutt"})
+GATE_SUBS = frozenset({"checks", "lock"})
+BUSY = 75                     # `ttp lock` and the checks queue: busy, not failed
+BROKER = re.compile(r"(?i)\bbroker\b.*\b(?:status|preflight)\b|\bpreflight\b")
+GATE_LINE = re.compile(r"(?im)^\s*[-*]?\s*(?:check|gate)\s*:\s*`?([^`\n]+?)`?\s*$")
 WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit", "apply_patch", "ApplyPatch"}
 READ_TOOLS = {"Read", "Grep", "Glob", "LS", "TodoWrite", "Task", "WebSearch", "WebFetch"}
 
@@ -90,10 +115,12 @@ def mark(run_dir) -> None:
     durable_write(Path(run_dir) / MARK, "1")
 
 
-def hit(run_dir, why: str) -> None:
+def hit(run_dir, why: str, kind: str = "guard", detail: str = "") -> None:
     """End the run as a hand-back to Opus: record the refusal and replace its hand-off with a `needs_opus`
     one (a hand-off it already wrote is kept beside it). The runner stops the agent when HIT exists;
-    the daemon requeues the task on Opus. Never raises: a guard that cannot write still refuses."""
+    the daemon requeues the task on Opus. `kind`: "guard" for a refused side effect, GATE for a failed gate
+    command on a device run, whose output tail is `detail`. Never raises: a guard that cannot write still
+    refuses."""
     if not run_dir:
         return
     d = Path(run_dir)
@@ -106,9 +133,11 @@ def hit(run_dir, why: str) -> None:
                 durable_write(d / KEPT, res.read_bytes())
             except OSError:
                 pass
-        durable_write(res, json.dumps({"status": "blocked", "needs_opus": f"guard: {why}",
-                                       "summary": f"needs Opus: guard: {why}"}))
-        durable_write(d / HIT, json.dumps({"why": why, "ts": time.time()}))
+        durable_write(res, json.dumps({"status": "blocked", "needs_opus": f"{kind}: {why}",
+                                       "summary": f"needs Opus: {kind}: {why}",
+                                       **({"gate_output": detail[-OUTPUT_TAIL:]} if detail else {})}))
+        durable_write(d / HIT, json.dumps({"why": why, "kind": kind, "ts": time.time(),
+                                           **({"output": detail[-OUTPUT_TAIL:]} if detail else {})}))
     except OSError:
         pass
 
@@ -186,6 +215,14 @@ def _git_word(args: list[str]) -> str:
     return ""
 
 
+def _gh_posts(seg: list[str]) -> bool:
+    """Whether the `gh` call `seg` writes: anything but a read subcommand or a read-only `gh api`."""
+    from . import hook
+    args = [w for w in seg[1:] if not w.startswith("-")]
+    return not (args[1:2] and args[1] in GH_READS) and not (args[:1] == ["api"] and not hook._gh_write(seg)
+                                                         and not HTTP_DATA.search(" ".join(seg[1:])))
+
+
 def _roots(cwd: str, run_dir: str) -> list[str]:
     out = []
     for x in (cwd, run_dir):
@@ -220,11 +257,8 @@ def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None) -> str | None
             continue   # read above, without its redirections
         elif name == "git" and _git_word(seg[1:]) == "push":
             return "a run on the GLM arm publishes only with `ttp push` (after its checks), never `git push`"
-        elif name == "gh":
-            args = [w for w in seg[1:] if not w.startswith("-")]
-            if not (args[1:2] and args[1] in GH_READS) and not (args[:1] == ["api"] and not hook._gh_write(seg)
-                                                                 and not HTTP_DATA.search(" ".join(seg[1:]))):
-                return "a run on the GLM arm does not post to GitHub (comments, reviews, PRs, issues)"
+        elif name == "gh" and _gh_posts(seg):
+            return "a run on the GLM arm does not post to GitHub (comments, reviews, PRs, issues)"
         elif name in HTTP and HTTP_DATA.search(" ".join(seg[1:])):
             return "a run on the GLM arm does not send data to a service (an HTTP post)"
         elif name in REACH:
@@ -258,3 +292,191 @@ def tool_refusal(payload: dict, env=None) -> str | None:
             if not sidefx._inside(full, roots):
                 return f"it writes outside its worktree: {full}"
     return None
+
+
+def run_env(provider: str, note, device: bool = False) -> dict[str, str]:
+    """The flag for a run on the chat model, whatever route sent it there (empty for any other run): every
+    run on the chat provider or whose note routes it there (glm_work, a tier route, a model pick), a code
+    arm's GLM run and a coordinator lane or shadow turn. `device`: its task names a device or machine, so a
+    failed gate command stops it (gate_stop)."""
+    from . import coordroute, route
+    routed = note.get(route.KEY) if isinstance(note, dict) else None
+    on = (provider == route.TO or (isinstance(routed, dict) and routed.get("to") == route.TO)
+          or bool(env_for(note)) or bool(coordroute.guard_env(note)))
+    return {RUN_ENV: DEVICE if device else "1"} if on else {}
+
+
+def device_task(task: dict | None) -> bool:
+    """Whether `task` is device work: its resources name a device or machine."""
+    for k in ("resources", "resources_read"):
+        raw = (task or {}).get(k)
+        try:
+            got = json.loads(raw) if isinstance(raw, str) else raw
+        except ValueError:
+            got = raw
+        if got:
+            return True
+    return False
+
+
+def gate_lines(spec: str) -> list[str]:
+    """The commands of the `check:` and `gate:` lines of a task spec (or an arm's plan)."""
+    return [" ".join(m.split()) for m in GATE_LINE.findall(spec or "")][:20]
+
+
+def mark_run(run_dir, device: bool, gates=()) -> None:
+    """The daemon's marker for a run on the chat model (read by glm_run() where the variable is gone)."""
+    from .project import durable_write
+    durable_write(Path(run_dir) / RUN_MARK, json.dumps({"device": bool(device), "gates": list(gates)}))
+
+
+def glm_run(env=None) -> dict | None:
+    """{"device", "gates"} for a run on the chat model, None for any other run."""
+    e = os.environ if env is None else env
+    rd = str(e.get("TTP_RUN_DIR") or "")
+    try:
+        got = json.loads((Path(rd) / RUN_MARK).read_text()) if rd else None
+    except (OSError, ValueError):
+        got = None
+    if isinstance(got, dict):
+        gates = got.get("gates") if isinstance(got.get("gates"), list) else []
+        return {"device": bool(got.get("device")) or e.get(RUN_ENV) == DEVICE, "gates": [str(g) for g in gates]}
+    if e.get(RUN_ENV) in ("1", DEVICE) or active(e):
+        return {"device": e.get(RUN_ENV) == DEVICE, "gates": []}
+    return None
+
+
+def _value(seg: list[str], *names: str) -> str:
+    """The value of the first of option `names` in `seg` (`--x v` or `--x=v`), '' when absent."""
+    for i, w in enumerate(seg):
+        for n in names:
+            if w == n and i + 1 < len(seg):
+                return seg[i + 1]
+            if w.startswith(n + "=") and n.startswith("--"):
+                return w.split("=", 1)[1]
+    return ""
+
+
+def _outward_seg(seg: list[str], project: str) -> dict | None:
+    name = os.path.basename(seg[0])
+    words = _ttp_args(seg, project)
+    if words is not None:
+        if words and words[0] in OUT_SUBS:
+            return {"channel": words[0], "target": _value(seg, "--chat") or "user", "text": " ".join(words[1:]),
+                    "why": f"`ttp {words[0]}` reaches a person"}
+        flags = [w for w in seg if w.startswith("--")]
+        if words and words[0] == "note" and (route := note_route(flags)) in OUT_NOTE:
+            target = _value(seg, route)
+            return {"channel": "note", "target": target, "text": " ".join(w for w in words[1:] if w != target),
+                    "why": f"`ttp note {route}` reaches another project or a person"}
+        return None
+    if name == "gh" and _gh_posts(seg):
+        return {"channel": "github", "target": " ".join(w for w in seg[1:4] if not w.startswith("-")),
+                "text": _value(seg, "--body", "-b", "--title", "-t"), "why": "a `gh` write posts to GitHub"}
+    if name in HTTP and HTTP_DATA.search(" ".join(seg[1:])):
+        url = next((w for w in seg[1:] if "://" in w), "")
+        return {"channel": "http", "target": url, "text": _value(seg, "-d", "--data", "--data-raw", "-F", "--form"),
+                "why": "an HTTP post sends data to a service"}
+    if name in MAIL:
+        return {"channel": "mail", "target": " ".join(w for w in seg[1:] if not w.startswith("-"))[:200], "text": "",
+                "why": "mail reaches a person"}
+    return None
+
+
+def outward_shell(cmd: str, env=None) -> dict | None:
+    """The draft of the first outward post in shell command `cmd` (a `ttp notify`, `say` or `ask`, a
+    `ttp note --to/--reply`, a `gh` write, an HTTP post, mail), None when it posts nothing."""
+    from . import hook
+    e = os.environ if env is None else env
+    project = _own_name(e)
+    plain, _ = hook._split(REDIRECT.sub(" ", cmd))
+    for seg in hook._all_segments(plain) + hook._segments(plain, strip=False):
+        if seg and (d := _outward_seg(seg, project)):
+            return {**d, "command": cmd[:OUTPUT_TAIL]}
+    return None
+
+
+def outward(payload: dict, env=None) -> dict | None:
+    """The draft of a hook payload's outward post (a Bash command as outward_shell, any connector tool), else None."""
+    tool = str(payload.get("tool_name") or "")
+    args = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else {}
+    if tool == "Bash":
+        return outward_shell(str(args.get("command") or ""), env)
+    if tool.startswith("mcp__"):
+        target = next((str(args[k]) for k in ("channel", "channel_id", "to", "issueKey", "issue_key", "page_id",
+                                               "recipient", "user") if args.get(k)), "")
+        text = next((str(args[k]) for k in ("text", "body", "message", "content", "comment") if args.get(k)), "")
+        return {"channel": tool, "target": target, "text": text or json.dumps(args)[:OUTPUT_TAIL],
+                "why": "a connector tool reaches a person or a service"}
+    return None
+
+
+def outward_cli(cmd: str, text: str = "", to: str = "", reply: str = "", chat: str = "") -> dict | None:
+    """The draft of `ttp <cmd>` when it posts outward (the command layer of a run without hooks), else None."""
+    if cmd in OUT_SUBS:
+        return {"channel": cmd, "target": chat or "user", "text": text, "why": f"`ttp {cmd}` reaches a person"}
+    if cmd == "note" and (to or reply):
+        return {"channel": "note", "target": to or reply, "text": text,
+                "why": f"`ttp note {'--to' if to else '--reply'}` reaches another project or a person"}
+    return None
+
+
+def drafted(run_dir, d: dict) -> str:
+    """Record draft `d` in the run's DRAFTS (an identical one once) and return the refusal the model reads."""
+    if run_dir:
+        from .project import durable_append
+        f = Path(run_dir) / DRAFTS
+        key = (d.get("channel"), d.get("target"), d.get("text"))
+        try:
+            seen = any((x.get("channel"), x.get("target"), x.get("text")) == key
+                       for x in (json.loads(ln) for ln in f.read_text().splitlines() if ln.strip()))
+        except (OSError, ValueError):
+            seen = False
+        if not seen:
+            durable_append(f, json.dumps({**d, "ts": time.time()}) + "\n")
+    return (f"not sent: {d.get('why')}, and a run on the chat model hands outward posts off. It is recorded as a "
+            f"draft ({DRAFTS} in the run folder); after the run an Opus step reviews it and sends or drops it. "
+            f"Carry on with the task and do not retry the post")
+
+
+def drafts(run_dir) -> list[dict]:
+    """The drafts a run recorded."""
+    try:
+        lines = (Path(run_dir) / DRAFTS).read_text(errors="replace").splitlines()
+    except OSError:
+        return []
+    out = []
+    for ln in lines:
+        try:
+            d = json.loads(ln)
+        except ValueError:
+            continue
+        if isinstance(d, dict):
+            out.append(d)
+    return out
+
+
+def is_gate(cmd: str, gates=(), env=None) -> bool:
+    """Whether shell command `cmd` is a gate: a `check:`/`gate:` line of the spec, `ttp checks`, `ttp lock`,
+    or a broker status or preflight."""
+    from . import hook
+    norm = " ".join(cmd.split())
+    if any(g and (norm == g or norm.startswith(g + " ")) for g in gates):
+        return True
+    if BROKER.search(cmd):
+        return True
+    project = _own_name(os.environ if env is None else env)
+    plain, _ = hook._split(REDIRECT.sub(" ", cmd))
+    return any((w := _ttp_args(seg, project)) and w[0] in GATE_SUBS
+               for seg in hook._all_segments(plain) + hook._segments(plain, strip=False) if seg)
+
+
+def gate_stop(run_dir, cmd: str, rc, output: str, env=None) -> str | None:
+    """On a device run on the chat model, a gate command that failed (`rc` neither 0 nor busy) ends the run
+    as a hand-back to Opus with the command and its output; returns why, None when the run goes on."""
+    g = glm_run(env)
+    if not g or not g["device"] or rc in (0, BUSY, None) or not is_gate(cmd, g["gates"], env):
+        return None
+    why = f"a gate failed (exit {rc}): `{' '.join(cmd.split())[:160]}`"
+    hit(run_dir, why, GATE, output or "")
+    return why

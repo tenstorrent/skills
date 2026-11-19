@@ -17952,14 +17952,20 @@ def blind_gate(a) -> None:
 
 
 def glm_gate(a, name: str | None = None) -> None:
-    """A run on the code arm's GLM side (glmguard) runs only the commands the guard allows; a refused one ends
-    the run as a hand-back to Opus (glmguard.hit), and exits 2. `name`: the command's name (main reads it from
+    """A run on the chat model records an outward post (`ttp notify`, `say`, `ask`, `note --to/--reply`) as a
+    draft and exits 2 (glmguard.drafted). A run on the code arm's GLM side runs only the commands the guard
+    allows; a refused one ends the run as a hand-back to Opus (glmguard.hit), and exits 2. `name`: the command's name (main reads it from
     argv, since a.cmd is the commands after -- for `checks` and others)."""
     from . import glmguard
-    if not glmguard.active():
+    if glmguard.glm_run() is None:
         return
     cmd = name if name is not None else getattr(a, "cmd", "")
     cmd = cmd if isinstance(cmd, str) else ""
+    if d := glmguard.outward_cli(cmd, str(getattr(a, "text", "") or ""), str(getattr(a, "to", "") or ""),
+                                 str(getattr(a, "reply", "") or ""), str(getattr(a, "chat", "") or "")):
+        die(glmguard.drafted(os.environ.get("TTP_RUN_DIR"), d), 2)   # a draft for Opus; the run goes on
+    if not glmguard.active():
+        return
     action = str(getattr(a, "action", "") or getattr(a, "op", "") or "")
     flags = [f"--{k}" for k in ("to", "reply", "confirms", "status") if getattr(a, k, None) is not None] + \
         (["--urgent"] if getattr(a, "urgent", False) else []) + \

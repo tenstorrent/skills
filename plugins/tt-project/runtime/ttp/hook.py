@@ -367,11 +367,38 @@ def record_ssh(payload: dict, run_dir: str) -> None:
         pass
 
 
+EXIT_CODE = re.compile(r"(?i)\bexit(?:ed)?(?: with)? (?:code|status) (\d+)")
+
+
+def _gate_stop(payload: dict, run_dir: str) -> str:
+    """A failed gate command of a device run on the chat model ends the run as a hand-back to Opus
+    (glmguard.gate_stop); what the model reads then, '' when the run goes on. A failed call is one whose
+    payload carries an error (PostToolUseFailure) or a non-zero exit code in its response."""
+    if payload.get("tool_name") != "Bash":
+        return ""
+    from . import glmguard
+    if glmguard.glm_run() is None:
+        return ""
+    resp = payload.get("tool_response") if isinstance(payload.get("tool_response"), dict) else {}
+    err = str(payload.get("error") or "")
+    rc = next((resp[k] for k in ("exit_code", "exitCode", "returncode", "returnCode") if isinstance(resp.get(k), int)),
+              None)
+    if rc is None and err:
+        m = EXIT_CODE.search(err)
+        rc = int(m.group(1)) if m else 1
+    out = err or "\n".join(str(resp.get(k) or "") for k in ("stdout", "stderr"))
+    cmd = str((payload.get("tool_input") or {}).get("command") or "")
+    why = glmguard.gate_stop(run_dir, cmd, rc, out)
+    return f"{why}: the run stops here and the task goes back to Opus with this command and its output" if why else ""
+
+
 def post_tool_use(payload: dict) -> tuple[dict | None, Callable[[], None] | None]:
     run_dir = os.environ.get("TTP_RUN_DIR")
     if run_dir:
         mark_untrusted(payload, run_dir)
         record_ssh(payload, run_dir)
+        if stopped := _gate_stop(payload, run_dir):
+            return {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": stopped}}, None
     if not run_dir or payload.get("agent_id"):
         return None, None
     parts, marks = [], []
@@ -1377,6 +1404,8 @@ def pre_tool_use(payload: dict, stage: str = "before") -> tuple[dict | None, Non
 
 def _pre_tool_use(payload: dict) -> tuple[dict | None, None]:
     from . import glmguard, pathguard, untrusted
+    if glmguard.glm_run() is not None and (d := glmguard.outward(payload)):   # a draft for Opus, the run goes on
+        return _deny(glmguard.drafted(os.environ.get("TTP_RUN_DIR"), d)), None
     if glmguard.active() and (why := glmguard.tool_refusal(payload)):
         glmguard.hit(os.environ.get("TTP_RUN_DIR"), why)   # the run ends as a hand-back to Opus (no model call)
         return _deny(f"{why}; the run ends and its task goes back to Opus"), None

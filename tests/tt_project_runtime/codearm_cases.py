@@ -332,11 +332,11 @@ def test_glm_guard_cli_gate_ends_the_run_as_a_bounce_to_opus_and_a_normal_run_is
     monkeypatch.setenv("TTP_CODE_ARM_GUARD", "1")
     cli.glm_gate(type("A", (), {"cmd": "checks", "action": ""})())   # an allowed command passes
     with _pytest.raises(SystemExit) as e:
-        cli.glm_gate(type("A", (), {"cmd": "notify", "action": ""})())
+        cli.glm_gate(type("A", (), {"cmd": "task", "action": "add"})())
     assert e.value.code == 2 and "GLM arm" in capsys.readouterr().err
     res = json.loads((rd / "result.json").read_text())
     assert codearm.bounce_reason(res).startswith("guard: ") and res["status"] == "blocked"
-    assert glmguard.hit_reason(rd).startswith("`ttp notify`")
+    assert glmguard.hit_reason(rd).startswith("`ttp task add`")
 
 
 @_pytest.mark.parametrize("argv", [["checks"], ["checks", "--dry-run"], ["checks", "--fresh", "--", "true"],
@@ -415,13 +415,16 @@ def test_a_glm_runs_plain_note_goes_only_to_its_own_task_log(env, monkeypatch, t
     (["note", "--severity", "high", "hi"], "--severity"), (["note", "--status", "7"], "--status")])
 def test_glm_guard_refuses_every_route_from_a_note_to_a_person_or_another_project(argv, route, env, monkeypatch,
                                                                                 tmp_path, capsys):
-    """cells: glm_note_to_refused, glm_note_routes_refused"""
+    """cells: glm_note_to_refused, glm_note_routes_refused: a note to someone becomes a draft, other routes bounce."""
     from ttp import cli, glmguard
     p, wt, rd = _gg_env(env, monkeypatch, tmp_path)
     with _pytest.raises(SystemExit) as e:
         cli.main(argv)
     assert e.value.code == 2 and f"`ttp note {route}`" in capsys.readouterr().err
-    assert glmguard.hit_reason(rd).startswith(f"`ttp note {route}`")
+    if route in glmguard.OUT_NOTE:
+        assert [d["channel"] for d in glmguard.drafts(rd)] == ["note"] and not (rd / glmguard.HIT).exists()
+    else:
+        assert glmguard.hit_reason(rd).startswith(f"`ttp note {route}`")
     words = " ".join(f"'{w}'" if " " in w else w for w in argv)
     assert glmguard.shell_refusal(f"ttp {words}", str(wt), str(rd), {"TTP_PROJECT": str(p.base), **_GG_RUN_ENV})
     assert set(glmguard.NOTE_ROUTES) >= {"--" + x.dest for x in _note_options() if x.dest != "text"}, \
@@ -447,13 +450,14 @@ def _note_options():
     return [x for x in seen["note"]._actions if x.dest != "help"]
 
 
-def test_glm_guard_refuses_notify(env, monkeypatch, tmp_path):
+def test_glm_guard_turns_notify_into_a_draft_and_sends_nothing(env, monkeypatch, tmp_path):
     """cells: glm_notify_refused"""
     from ttp import cli, glmguard
     p, wt, rd = _gg_env(env, monkeypatch, tmp_path)
     with _pytest.raises(SystemExit):
         cli.main(["notify", "done"])
-    assert glmguard.hit_reason(rd).startswith("`ttp notify`") and not (rd / "notify.jsonl").exists()
+    assert [(d["channel"], d["text"]) for d in glmguard.drafts(rd)] == [("notify", "done")]
+    assert not (rd / glmguard.HIT).exists() and not (rd / "notify.jsonl").exists()
 
 
 def test_the_glm_prompt_names_only_commands_its_guard_allows_and_says_where_notes_go():
@@ -484,7 +488,7 @@ def test_glm_guard_refusal_names_the_command_it_refused(argv, name, env, monkeyp
     with _pytest.raises(SystemExit) as e:
         cli.main(argv)
     assert e.value.code == 2 and f"`ttp {name}`" in capsys.readouterr().err
-    assert glmguard.hit_reason(rd).startswith(f"`ttp {name}`")
+    assert glmguard.hit_reason(rd).startswith(f"`ttp {name}`") or glmguard.drafts(rd)
     assert glmguard.cli_refusal("", "").startswith("a ttp call naming no command")
 
 
@@ -589,13 +593,13 @@ def test_glm_guard_hook_denies_a_refused_call_and_ends_the_run_as_a_bounce(monke
     monkeypatch.setenv("TTP_RUN_DIR", str(rd))
     monkeypatch.setenv("TTP_PROJECT", str(tmp_path / "proj"))
     monkeypatch.setenv("TTP_CODE_ARM_GUARD", "1")
-    out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "ttp note --to other hi"}, "cwd": str(wt)})
+    out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "ttp task add x"}, "cwd": str(wt)})
     assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert "goes back to Opus" in out["hookSpecificOutput"]["permissionDecisionReason"]
     assert codearm.bounce_reason(json.loads((rd / "result.json").read_text())).startswith("guard: ")
     monkeypatch.delenv("TTP_CODE_ARM_GUARD")
     (rd / "glm_guard.json").unlink(), (rd / "result.json").unlink()
-    hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "ttp note --to other hi"}, "cwd": str(wt)})
+    hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "ttp task add x"}, "cwd": str(wt)})
     assert not (rd / "result.json").exists()   # not a GLM-arm run: the guard does not apply
 
 
@@ -1026,3 +1030,119 @@ def test_glm_code_ring_flag_gates_the_coin_flip_and_the_projects_own_share_wins(
     d = Daemon(p.base)
     d._load_config()
     assert d.cfg["route"]["code_sonnet"]["glm_share"] == 0.5
+
+
+# Every run on the chat model: outward posts become drafts for an Opus step; a device run stops at a failed gate.
+def _glm_run_env(monkeypatch, tmp_path, flag="1"):
+    from ttp import glmguard
+    wt, rd = _gg_run(tmp_path)
+    monkeypatch.setenv("TTP_RUN_DIR", str(rd))
+    monkeypatch.setenv("TTP_PROJECT", str(tmp_path / "proj"))
+    monkeypatch.delenv("TTP_CODE_ARM_GUARD", raising=False)
+    if flag:
+        monkeypatch.setenv(glmguard.RUN_ENV, flag)
+    else:
+        monkeypatch.delenv(glmguard.RUN_ENV, raising=False)
+    return wt, rd
+
+
+@_pytest.mark.parametrize("tool,tool_input,channel", [
+    ("Bash", {"command": "ttp notify 'build is green'"}, "notify"),
+    ("mcp__slack__post_message", {"channel": "C1", "text": "build is green"}, "mcp__slack__post_message")])
+def test_a_glm_work_runs_outward_post_is_refused_and_recorded_as_a_draft(tool, tool_input, channel, monkeypatch, tmp_path):
+    from ttp import glmguard, hook
+    wt, rd = _glm_run_env(monkeypatch, tmp_path)
+    out, _ = hook.pre_tool_use({"tool_name": tool, "tool_input": tool_input, "cwd": str(wt)})
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "recorded as a draft" in out["hookSpecificOutput"]["permissionDecisionReason"]
+    got = glmguard.drafts(rd)
+    assert [(d["channel"], d["text"]) for d in got] == [(channel, "build is green")]
+    assert not (rd / glmguard.HIT).exists(), "the run goes on"
+    hook.pre_tool_use({"tool_name": tool, "tool_input": tool_input, "cwd": str(wt)})
+    assert len(glmguard.drafts(rd)) == 1, "a retried post is one draft"
+
+
+def test_a_run_off_the_chat_model_posts_without_a_draft(monkeypatch, tmp_path):
+    from ttp import glmguard, hook
+    wt, rd = _glm_run_env(monkeypatch, tmp_path, flag="")
+    out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "ttp notify hi"}, "cwd": str(wt)})
+    assert out is None and glmguard.drafts(rd) == [] and glmguard.glm_run() is None
+
+
+def test_the_daemon_hands_a_runs_drafts_to_the_coordinator_once_as_one_event(env, tmp_path):
+    import json
+    from ttp import daemon, glmguard
+    p = make(env)
+    rd = tmp_path / "77"
+    rd.mkdir()
+    glmguard.drafted(rd, {"channel": "notify", "target": "user", "text": "build is green", "why": "w", "command": "c"})
+    assert daemon.relay_glm_drafts(p, {"id": 5}, rd) == 1
+    ev = p.db.one("SELECT * FROM events WHERE kind=?", (daemon.GLM_DRAFTS_KIND,))
+    assert ev["task"] == 5 and "none was sent" in ev["text"] and "AI authorship tag" in ev["text"]
+    assert json.loads(ev["text"].split("\n", 1)[1])["text"] == "build is green"
+    assert daemon.relay_glm_drafts(p, {"id": 5}, rd) == 0
+    assert daemon.GLM_DRAFTS_KIND not in __import__("ttp.coordroute", fromlist=["x"]).ROUTINE_KINDS
+
+
+@_pytest.mark.parametrize("cmd,device,stops", [
+    ("ttp checks", True, True), ("ttp lock blx -- tt-smi -r", True, True), ("./run_gate.sh --fast", True, True),
+    ("ls /missing", True, False), ("ttp checks", False, False)])
+def test_a_device_glm_run_stops_at_its_first_failed_gate_command_only(cmd, device, stops, monkeypatch, tmp_path):
+    import json
+    from ttp import glmguard, hook
+    wt, rd = _glm_run_env(monkeypatch, tmp_path, glmguard.DEVICE if device else "1")
+    glmguard.mark_run(rd, device, glmguard.gate_lines("Goal: x\ncheck: `./run_gate.sh --fast`\n"))
+    out, _ = hook.post_tool_use({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(wt),
+                                 "tool_response": {"exit_code": 1, "stdout": "FAILED: 3 tests"}})
+    assert (rd / glmguard.HIT).exists() is stops, cmd
+    if stops:
+        hit = json.loads((rd / glmguard.HIT).read_text())
+        assert hit["kind"] == glmguard.GATE and "FAILED: 3 tests" in hit["output"]
+        assert json.loads((rd / "result.json").read_text())["needs_opus"].startswith("gate: ")
+        assert "goes back to Opus" in json.dumps(out)
+
+
+def _glm_route_notes():
+    """One run note per route that can send a run to the chat model, in the shapes the daemon writes."""
+    from ttp import codearm, coordroute, glmwork, modelpick, route
+    to = {"to": route.TO, "model": "glm"}
+    return {
+        "code_arm": {codearm.KEY: {"arm": "glm", "run": "glm"}, route.KEY: {**to, "tier": "standard"}},
+        "glm_work": {route.KEY: {**to, "tier": "standard", glmwork.KEY: "glm"}},
+        "coordinator_lane": {coordroute.LANE: "routine"},
+        "coordinator_shadow": {coordroute.SHADOW: {"of": 1}},
+        "tier_route": {route.KEY: {**to, "tier": "light", "rule": 0}},
+        "model_pick": {route.KEY: {**to, "tier": "standard", "pick": True}, modelpick.KEY: {"pick": "glm"}},
+    }
+
+
+@_pytest.mark.parametrize("name", sorted(_glm_route_notes()))
+def test_every_route_to_the_chat_model_starts_under_the_outward_guard(name):
+    """Each route's note alone turns the guard on, so a launch on any provider is covered; a new route
+    shape goes in _glm_route_notes."""
+    import inspect
+    from ttp import daemon, glmguard, route
+    note = _glm_route_notes()[name]
+    assert glmguard.run_env("claude", note) == {glmguard.RUN_ENV: "1"}, name
+    assert glmguard.run_env("claude", note, device=True) == {glmguard.RUN_ENV: glmguard.DEVICE}, name
+    assert glmguard.run_env(route.TO, None) == {glmguard.RUN_ENV: "1"}   # a bench launched as a task
+    assert glmguard.run_env("claude", None) == {} and glmguard.run_env("claude", {route.KEY: {"to": "claude"}}) == {}
+    src = inspect.getsource(daemon)
+    assert "glmguard.run_env(provider, note, glmguard.device_task(task))" in src and "**glm_env," in src
+    assert "relay_glm_drafts(self.p, task, run_dir)" in src
+
+
+def test_glm_share_counts_the_guards_fires_per_day(env, tmp_path):
+    from ttp import glmguard, glmshare
+    rd = tmp_path / "r"
+    rd.mkdir()
+    glmguard.drafted(rd, {"channel": "notify", "target": "user", "text": "a"})
+    glmguard.drafted(rd, {"channel": "notify", "target": "user", "text": "b"})
+    glmguard.hit(rd, "`ttp checks` failed", glmguard.GATE, "out")
+    assert glmshare.guard_fires(rd) == {"outward_drafts": 2, "gate_stops": 1, "guard_bounces": 0}
+    p = make(env)
+    row = {"id": 1, "task": 1, "role": "worker", "provider": "chat", "model": "glm", "started": 1.7e9,
+           "ended": 1.7e9, "note": None, "dir": str(rd)}
+    day = glmshare.bad_output(p, [row])[0]
+    assert (day["outward_drafts"], day["gate_stops"], day["runs"]) == (2, 1, 0)
+    assert "outward drafts 2, gate stops 1" in glmshare.bad_lines([day])[0]

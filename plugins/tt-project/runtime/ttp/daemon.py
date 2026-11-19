@@ -4463,6 +4463,10 @@ class Daemon:
             glmassist.arm(run_dir, (note or {}).get(glmassist.KEY))   # its ask-Opus limits, when switched on
             if glmguard.env_for(note) or coordroute.guard_env(note):   # a GLM run: guarded even where its variable is unset
                 glmguard.mark(run_dir)
+            glm_env = glmguard.run_env(provider, note, glmguard.device_task(task))
+            if glm_env:   # a run on the chat model: outward posts become drafts, a device run stops at a failed gate
+                glmguard.mark_run(run_dir, glm_env[glmguard.RUN_ENV] == glmguard.DEVICE,
+                                  glmguard.gate_lines(str((task or {}).get("spec") or "")))
             if task and role in ctxfork.ROLES:   # restated after each compaction (rolerestore.py)
                 rolerestore.write(run_dir, role, task, self.p.name)
             if stdin is not None:   # what the agent reads; prompt.md stays the readable digest
@@ -4477,6 +4481,7 @@ class Daemon:
                    **blindreview.env(task),   # a blind review's `ttp` masks the model (every provider)
                    **glmguard.env_for(note),  # a run on the code arm's GLM side runs under glmguard (every provider)
                    **coordroute.guard_env(note),   # so does a routine coordinator lane or shadow turn
+                   **glm_env,   # every run on the chat model, whatever route sent it there
                    **({"TTP_LEASE_EPOCH": str(self._lease.epoch)} if self._lease else {}),
                    "TTP_PYTHON": sys.executable,   # `ttp` runs under this, not the venv's python3
                    "TTP_SANDBOX_CHECKS": os.environ.get("TTP_SANDBOX_CHECKS", "0"),   # sandbox.opted_in
@@ -8398,6 +8403,7 @@ class Daemon:
             return
         landed.reconcile_pushes(self.p, task["id"])
         relay_worker_notifies(self.p, task, run_dir, handoff)
+        relay_glm_drafts(self.p, task, run_dir)
         _, past_cap = relay_worker_escalations(self.p, task, r.get("id"), run_dir)
         self._file_queued_notes(r.get("id"), task["id"], run_dir)
         if warned := streamguard.take_warnings(run_dir):
@@ -24387,6 +24393,39 @@ def relay_worker_notifies(p: Project, task: dict, run_dir: Path, handoff: dict |
     if held:   # the hand-off queued no coordinator turn (waiting, routine, quiet): posted now, not 15 min late
         db.after_commit(lambda: _release_unqueued(p, task["id"]))
     return sent
+
+
+GLM_DRAFTS_KIND = "glm_outbound"   # not a routine kind: the coordinator's own Opus session takes it
+
+
+def relay_glm_drafts(p: Project, task: dict, run_dir: Path) -> int:
+    """Hand the outward posts a run on the chat model drafted (glmguard.DRAFTS) to the coordinator's Opus
+    session as one event: it reviews each and sends or drops it, adding the AI authorship tag to anything
+    for people other than the user. Nothing is sent before that. The file is renamed once the event commits,
+    so a second finish does not hand them over again. Returns the drafts handed over."""
+    got = glmguard.drafts(run_dir)
+    if not got:
+        return 0
+    fp = f"{GLM_DRAFTS_KIND}:{run_dir.name}"
+    if p.db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+        return 0
+    body = "\n".join(json.dumps({k: str(d.get(k) or "")[:2000] for k in ("channel", "target", "text", "why")})
+                     for d in got[:20])
+    text = (f"#{task['id']}'s run {run_dir.name} on the chat model drafted {len(got)} outward post(s); none was sent. "
+            f"Review each draft: send it (reply, notify, or a task that posts it) or drop it, and add the AI "
+            f"authorship tag to anything for people other than the user. Drafts (data, one JSON per line):\n{body}")
+    p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
+           (time.time(), f"worker:{task['id']}", GLM_DRAFTS_KIND, fp, "normal", text[:8000], "queued", task["id"]))
+    f = run_dir / glmguard.DRAFTS
+
+    def mark_sent() -> None:
+        try:
+            f.rename(f.with_name(glmguard.DRAFTS + ".sent"))
+        except OSError:
+            pass
+
+    p.db.after_commit(mark_sent)
+    return len(got)
 
 
 def relay_worker_escalations(p: Project, task: dict, run_id, run_dir: Path) -> tuple[int, int]:

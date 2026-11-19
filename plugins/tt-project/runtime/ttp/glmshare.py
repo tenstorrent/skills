@@ -47,6 +47,7 @@ CODE_ARM_KV = "code_arm:"         # codearm.ARM_KV
 MIN_TASKS, WORSE_PTS, BASE_DAYS, BASE_MIN = 25, 15.0, 14, 5
 CHUNK = 500
 BAD_KEYS = ("tool_input_errors", "args_unparsed", "args_repaired", "empty_content", "junk_responses")
+FIRE_KEYS = ("outward_drafts", "gate_stops", "guard_bounces")   # glmguard's fires, read from the run folder
 LOOP_KEYS = {"loop_nudges": "nudges", "loop_stops": "stops"}   # chatbridge stats loop (the loop guard)   # chatbridge stats bad_output
 BAD_DAYS = 7
 
@@ -274,18 +275,45 @@ def _bridge_of(p, r) -> dict | None:
     return b if isinstance(b, dict) else {}
 
 
+def guard_fires(d: Path) -> dict:
+    """glmguard's fires in one run folder: outward posts it drafted, the gate stop or other bounce it ended on."""
+    from . import glmguard
+    n = {k: 0 for k in FIRE_KEYS}
+    for name in (glmguard.DRAFTS, glmguard.DRAFTS + ".sent"):
+        try:
+            n["outward_drafts"] += sum(1 for ln in (d / name).read_text().splitlines() if ln.strip())
+        except OSError:
+            pass
+    try:
+        hit = json.loads((d / glmguard.HIT).read_text())
+    except (OSError, ValueError):
+        hit = None
+    if isinstance(hit, dict):
+        n["gate_stops" if hit.get("kind") == glmguard.GATE else "guard_bounces"] += 1
+    return n
+
+
 def bad_output(p, rows) -> list[dict]:
-    """The GLM runs' bad output per home-zone day, oldest first (the module doc)."""
+    """The GLM runs' bad output per home-zone day, oldest first (the module doc), with glmguard's fires
+    (FIRE_KEYS), which count on every GLM run, measured by the bridge or not."""
     from . import timefmt
     tz, days = timefmt.zone(p), {}
     for r in rows:
-        b = _bridge_of(p, r) if on_glm(r["provider"], r["model"], r["note"]) else None
+        if not on_glm(r["provider"], r["model"], r["note"]):
+            continue
+        b = _bridge_of(p, r)
+        fires = guard_fires(Path(r["dir"]) if r["dir"] else p.runs / str(r["id"]))
         scanned = (b or {}).get("usage", {}).get("scanned") if isinstance((b or {}).get("usage"), dict) else None
-        if not isinstance(scanned, int):
-            continue   # no exit record, or a bridge from before the counters: not measured, never a zero
         day = datetime.datetime.fromtimestamp(float(r["started"] or 0), tz).strftime("%Y-%m-%d")
-        v = days.setdefault(day, {"day": day, "runs": 0, "answers": 0, "runs_hit": 0,
-                                  **{k: 0 for k in (*BAD_KEYS, *LOOP_KEYS)}})
+        if not isinstance(scanned, int):   # no exit record, or a bridge from before the counters: not measured
+            if any(fires.values()):
+                v = days.setdefault(day, _day(day))
+                for k in FIRE_KEYS:
+                    v[k] += fires[k]
+            continue
+        v = days.setdefault(day, _day(day))
+        for k in FIRE_KEYS:
+            v[k] += fires[k]
         bad = b.get("bad_output") if isinstance(b.get("bad_output"), dict) else {}
         n = {k: int(bad.get(k) or 0) for k in BAD_KEYS}
         loop = b.get("loop") if isinstance(b.get("loop"), dict) else {}
@@ -300,6 +328,10 @@ def bad_output(p, rows) -> list[dict]:
     return [days[d] for d in sorted(days)]
 
 
+def _day(day: str) -> dict:
+    return {"day": day, "runs": 0, "answers": 0, "runs_hit": 0, **{k: 0 for k in (*BAD_KEYS, *LOOP_KEYS, *FIRE_KEYS)}}
+
+
 def bad_lines(got: list[dict]) -> list[str]:
     """One line per day of bad_output's list."""
     pct = lambda v: "-" if v is None else f"{v:g}%"   # noqa: E731
@@ -308,7 +340,8 @@ def bad_lines(got: list[dict]) -> list[str]:
             f"mended {v['args_repaired']}), "
             f"reasoning-only {v['empty_content']} ({pct(v['pct']['empty_content'])}), junk {v['junk_responses']} "
             f"({pct(v['pct']['junk_responses'])}); loop nudges {v.get('loop_nudges', 0)}, loop stops "
-            f"{v.get('loop_stops', 0)}; runs hit {v['runs_hit']}" for v in got]
+            f"{v.get('loop_stops', 0)}; runs hit {v['runs_hit']}; outward drafts {v.get('outward_drafts', 0)}, "
+            f"gate stops {v.get('gate_stops', 0)}, guard bounces {v.get('guard_bounces', 0)}" for v in got]
 
 
 def daily_lines(p, now: float) -> list[str]:
