@@ -38,5 +38,14 @@ by .github/workflows/tt-pr-review.md. Contributors credited in the README:
 dsyme, pelikhan, and mnkiefer.
 License text preserved from revision 099efdda60fe970829f53f29f726c35615cd55eb.
 
+DietrichGebert/ponytail
+https://github.com/DietrichGebert/ponytail
+Copyright (c) 2026 DietrichGebert
+MIT License: LICENSES/ponytail-MIT.txt
+
+Vendored as the tt-project skills tt-ponytail, tt-ponytail-review and
+tt-ponytail-audit (plugins/tt-project/skills/), text unchanged apart from names.
+License text preserved from revision 96608e078b2d5ea607c5c3b8b5a54d1c1fba6846.
+
 These license revisions identify the preserved license texts; the original
 catalogue import did not pin revisions for these two sources.

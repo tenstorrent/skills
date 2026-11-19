@@ -72,7 +72,7 @@ Claude Code (a branch or tag goes after `#`):
 export TT_PROJECT_REF=<release tag or branch>
 claude plugin marketplace add "https://github.com/tenstorrent/skills.git#$TT_PROJECT_REF"
 claude plugin install tt-project@tenstorrent-skills
-claude plugin details tt-project    # Skills (3): setup-box, tt-project, tt-project-harness
+claude plugin details tt-project    # Skills (6): setup-box, tt-ponytail, tt-ponytail-audit, tt-ponytail-review, tt-project, tt-project-harness
 "$(ls -d "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/plugins/cache/tenstorrent-skills/tt-project/*/ | sort -V | tail -1)bin/ttp" setup
 ```
 

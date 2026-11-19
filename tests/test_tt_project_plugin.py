@@ -62,6 +62,9 @@ def load_leak_patterns(path: pathlib.Path) -> list:
 # The public branch and tag teammates install from (README ## Dogfood install). Their names come from
 # the branch owner's handle, which local leak patterns may list; only these exact refs are exempt.
 PUBLISHED_REFS = ("smartonTT/tt-project-dogfood-1", "smartonTT/tt-project")
+# The notice lines of a vendored third-party skill pack (NOTICE, skills/tt-ponytail/SOURCE.md): its
+# upstream copyright line and public source URL stay with it (user msg #3706); only these exact lines.
+VENDORED_NOTICE_LINES = ("https://github.com/DietrichGebert/ponytail", "Copyright (c) 2026 DietrichGebert")
 
 
 def published_plugin_names() -> set:
@@ -74,7 +77,7 @@ def published_plugin_names() -> set:
 def assert_no_leaks(patterns: list, files, allow=frozenset()) -> None:
     for f in files:
         text = f.read_text(encoding="utf-8", errors="replace")
-        for ref in PUBLISHED_REFS:
+        for ref in (*PUBLISHED_REFS, *VENDORED_NOTICE_LINES):
             text = text.replace(ref, "")
         for pattern in patterns:
             m = next((m for m in pattern.finditer(text) if m.group(0).lower() not in allow), None)
@@ -128,7 +131,8 @@ def test_manifests_agree():
 
 def test_skills_are_discoverable_and_self_contained():
     skills = sorted(SKILLS.glob("*/SKILL.md"))
-    assert {p.parent.name for p in skills} == {"tt-project", "tt-project-harness", "setup-box"}
+    assert {p.parent.name for p in skills} == {"tt-project", "tt-project-harness", "setup-box", "tt-ponytail",
+                                                "tt-ponytail-review", "tt-ponytail-audit"}
     for path in skills:
         fm = frontmatter(path)
         assert fm["name"] == path.parent.name
