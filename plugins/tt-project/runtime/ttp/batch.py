@@ -2150,8 +2150,8 @@ class Batch:
             return h
         try:
             public = outscan.public_problem(self.repo, base, top, self.d, self.p)
-        except ValueError as e:
-            public = f"public scan could not read the entry's commits: {e}"
+        except Exception as e:
+            public = f"public scan could not run; not pushing: {e}"
         if public:
             self._set(i, "refused", message=public)
             return h

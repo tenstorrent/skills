@@ -839,7 +839,7 @@ EXTRA_KEYS = {
     # a branch whose tasks all ended that long ago, never approved and needed by no unfinished task.
     # public_scan_paths: repo globs a public repository publishes; every push refuses a commit adding a line
     # there that names a local-state term (machine, project, user, remote host, chat id) nothing else in the
-    # repository names, or a `msg #<digits>` reference (outscan.public_problem; unset, the default: off).
+    # repository names, or a `msg #<digits>` or `task #<digits>` reference (outscan.public_problem; unset, the default: off).
     # push_retries: how often a detached push retries a cause it clears itself, a non-fast-forward
     # (--own) or a reboot that cut it short (push.retries_of; default 2, 0: never).
     "delivery": {"base_ref", "push_branch", "landed_probe", "push_checks", "post_land_checks", "push_checks_by_repo", "push_exclude_paths", "public_scan_paths", "push_rounds", "push_wait_s",

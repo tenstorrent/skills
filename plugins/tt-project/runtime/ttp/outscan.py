@@ -553,7 +553,6 @@ def local_terms(p=None) -> dict[str, str]:
     (and a hostname's domain), project names, the user's login and name, git remote hosts and this
     project's chat ids. Read at check time and never written anywhere."""
     import getpass
-    import json
     import pwd
     from urllib.parse import urlsplit
     from . import machines, project
