@@ -222,3 +222,18 @@ def test_glm_share_counts_bad_output_per_day_from_glm_runs_exit_records(env):
     assert "GLM bad output by day" in out and "junk 2 (2%); loop nudges 0, loop stops 0; runs hit 1" in out
     lines = glmshare.daily_lines(p, now)
     assert len(lines) == 2 and "reasoning-only 1 (2%)" in lines[1]
+
+
+def test_glm_share_names_reviews_that_ran_on_glm_only_when_there_are_any(env):
+    from ttp import glmshare
+    p = make(env)
+    now = 1_000_000_000.0 + 30 * 86400
+    r = _gs_task(p, kind="review")
+    _gs_run(p, r, now - 20 * 3600, 0.5, provider="claude", model="opus")
+    assert "reviews on GLM" not in glmshare.text(glmshare.report(p, now - 86400, now))
+    _gs_run(p, r, now - 30 * 3600, 0.1, note={"run_class": "light"})
+    _gs_run(p, r, now - 10 * 3600, 0.1, note={"run_class": "rebase"})
+    _gs_run(p, None, now - 9 * 3600, 0.1, role="coordinator")
+    s = glmshare.report(p, now - 2 * 86400, now)
+    newest = datetime.datetime.fromtimestamp(now - 10 * 3600).strftime("%Y-%m-%d")
+    assert f"reviews on GLM: 2, newest {newest} (run class rebase)" in glmshare.text(s)

@@ -4525,3 +4525,27 @@ def test_chatbridge_vendor_defaults_reach_the_request_and_the_agent_env(mock_cha
     assert st["vendor"] == list(chatbridge.VENDOR_LEVERS)
     off = chatbridge.Bridge(up.url, _CB_KEY, "glm-5.3")
     assert "API_TIMEOUT_MS" not in off.env() and "CLAUDE_CODE_ATTRIBUTION_HEADER" not in off.env()
+
+
+def test_a_review_run_that_starts_on_the_chat_provider_raises_one_high_observation(env, monkeypatch):
+    from ttp import daemon as dmod
+    from ttp import runclass
+    p = make(env)
+    _route_config(p)
+    d = dmod.Daemon(p.base)
+    seen = []
+    monkeypatch.setattr(d, "observe", lambda source, text, hint=None, **k: seen.append((source, hint, k.get("key"), text)))
+
+    class Proc:   # never a real runner
+        pid = 4242
+    real = subprocess.Popen
+    monkeypatch.setattr(dmod.subprocess, "Popen",
+                        lambda argv, *a, **k: Proc() if "ttp.runner" in argv else real(argv, *a, **k))
+    work = p.db.add_task("work", "s", kind="work", tier="light", priority=3)
+    d.start_run("worker", "go", "chat", "light", str(p.root), task=p.db.task(work))
+    review = p.db.add_task("Review #1: x", "s", kind="review", tier="light", priority=3)
+    d.start_run("reviewer", "go", "claude", "light", str(p.root), task=p.db.task(review))
+    assert seen == []
+    d.start_run("reviewer", "go", "chat", "light", str(p.root), task=p.db.task(review), note={runclass.KEY: "rebase"})
+    assert [(s, h, k) for s, h, k, _ in seen] == [("daemon:review-on-glm", "high", "review-on-glm")]
+    assert f"review task {review}" in seen[0][3] and "run class rebase" in seen[0][3]

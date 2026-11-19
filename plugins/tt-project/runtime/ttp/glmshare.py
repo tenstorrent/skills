@@ -53,7 +53,7 @@ import datetime
 import json
 from pathlib import Path
 
-from . import glmassist, route
+from . import glmassist, route, runclass
 
 ROLES = ("coordinator", "plan", "review", "code", "work", "question", "harness", "device", "other")
 KINDS = ("plan", "review", "code", "work", "question", "harness")
@@ -287,7 +287,10 @@ def report(p, since: float, now: float) -> dict:
             "arms": arms, "claude_usd_per_day": round(float(usd or 0) / days, 2) if days > 0 else None,
             "corrections": {"n": len(corr), "per_arm": None,
                             "note": "a correction names no task, so it is counted per project; kept 7 days"},
-            "bad_output": bad_output(p, rows)}
+            "bad_output": bad_output(p, rows),
+            "reviews_on_glm": [{"run": r["id"], "started": r["started"], "class": _note(r["note"]).get(runclass.KEY) or "-"}
+                               for r in rows if (tasks.get(r["task"]) or {}).get("kind") == "review"
+                               and on_glm(r["provider"], r["model"], r["note"])]}
 
 
 def _bridge_of(p, r) -> dict | None:
@@ -393,6 +396,10 @@ def text(s: dict) -> str:
                      f"{q['bounces']} bounced, {q['incidents']} device incidents on GLM runs")
     lines.append(f"  Claude ${s['claude_usd_per_day'] or 0:.2f}/day; user corrections {s['corrections']['n']} "
                  "(per project: a correction names no task)")
+    if (rv := s.get("reviews_on_glm")):
+        last = max(rv, key=lambda x: x["started"])
+        lines.append(f"  reviews on GLM: {len(rv)}, newest {datetime.datetime.fromtimestamp(last['started']):%Y-%m-%d} "
+                     f"(run class {last['class']})")
     if s.get("bad_output"):
         lines.append("  GLM bad output by day (rate per answer):")
         lines += [f"    {x}" for x in bad_lines(s["bad_output"])]

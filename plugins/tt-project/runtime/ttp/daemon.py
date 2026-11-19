@@ -3912,8 +3912,8 @@ class Daemon:
             # Every turn at coordinator.effort, else coordinator.DEFAULT_EFFORT, as the provider takes
             # it; coordinator.model pins the model, so moving its tier's model (say light to a cheaper
             # one for workers) does not move the coordinator with it. Read from the config as it is now.
-            route = coord.coordinator_route(cfg, provider)
-            model, effort = route["model"], route["effort"]
+            cr = coord.coordinator_route(cfg, provider)
+            model, effort = cr["model"], cr["effort"]
             if lane := coordroute.route_of(note):   # a routine lane or shadow turn: the chat model (coordroute.py)
                 model, effort = lane["model"] or model, lane["effort"] or effort
             prompt_bytes = sum(len(text.encode("utf-8")) for text in (prompt, system or "", context or "", append_system or ""))
@@ -4618,6 +4618,10 @@ class Daemon:
                                                                     cache_ttl, session_ttl_at))
             except Exception as e:   # bookkeeping: the next session wake then goes at 1h
                 log(self.p, f"run {run_id}: session prompt cache wake not recorded: {e}")
+        if task and task.get("kind") == "review" and provider == route.TO:   # route.eligible keeps reviews on core
+            self.observe("daemon:review-on-glm", f"review task {task['id']} run {run_id} started on the {provider} provider "
+                         f"(run class {(note or {}).get(runclass.KEY) or '-'}): reviews must run on the core provider",
+                         "high", whole=True, key="review-on-glm")
         log(self.p, f"run {run_id} start role={role} provider={provider} tier={tier} task={task and task['id']} "
                     f"sandbox={prov.launch_sandbox(argv) or 'none'} "
                     f"({sandboxstate.run_summary(prov.launch_sandbox(argv), fence_on, fence_why, restrictions)})")
