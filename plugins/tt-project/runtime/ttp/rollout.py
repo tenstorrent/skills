@@ -56,6 +56,10 @@ FLAGS: dict[str, dict[str, Any]] = {
     # The project's routed work on GLM (glmwork.py); `waves`: it may run at auto, judged by glmshare.judge.
     "glm_work": {"key": "route.glm_work.on", "area": "route", "code": _code("glmwork.py", "codearm.py", "daemon.py"),
                  "waves": True, "arm": "glm"},
+    # Device work on GLM under an Opus plan (deviceplan.py, #3728); needs glm_work on too. Judged by
+    # deviceplan.judge; one harmful step GLM took on its own rolls the project back at once (stop_project).
+    "glm_device": {"key": "route.glm_work.device", "area": "route", "waves": True, "judge": "deviceplan",
+                   "code": _code("deviceplan.py", "glmwork.py", "glmassist.py", "hook.py"), "arm": "glm"},
     # Routine coordinator wakes on the chat model (coordroute.py): a ring runs them in shadow only (a read-only
     # lane turn beside the coordinator's own, nothing applied); live mode is the project's own setting.
     "glm_coord": {"key": "coordinator.routine.mode", "area": "coordinator", "code": _code("coordroute.py", "daemon.py"),
@@ -138,6 +142,29 @@ def rolled_back(flag: str, cfg: dict | None = None) -> dict:
     """{project: {ts, why}}: the projects the wave gate rolled back for `flag` alone (until `arm FLAG PROJECT`)."""
     got = ((cfg if cfg is not None else settings()).get("project_rollback") or {}).get(flag)
     return dict(got) if isinstance(got, dict) else {}
+
+
+def stop_project(flag: str, project: str, why: str, by: str = "daemon") -> bool:
+    """Roll `flag` back in `project` now, outside the hourly wave gate (deviceplan's stop); True when it was not
+    yet. It stays off there until `ttp rollout arm FLAG PROJECT`."""
+    _check(flag)
+    with _locked():
+        back = rolled_back(flag)
+        if project in back:
+            return False
+        back[project] = {"ts": round(time.time(), 3), "why": str(why)[:300]}
+        _put("project_rollback", flag, back)
+        _op("project_rollback", flag, str(why)[:300], by, project=project)
+    return True
+
+
+def _judge(flag: str):
+    """The wave gate's judge for `flag`: its own (FLAGS "judge") or glmshare.judge."""
+    if FLAGS.get(flag, {}).get("judge") == "deviceplan":
+        from .deviceplan import judge
+        return judge
+    from .glmshare import judge
+    return judge
 
 
 def ledger(flag: str | None = None) -> list[dict]:
@@ -375,11 +402,6 @@ def wave_tick(now: float | None = None, judge=None, projects: dict | None = None
     flags = [f for f in FLAGS if level(f) == AUTO]
     if not flags:
         return []
-    if judge is None:
-        try:
-            from .glmshare import judge
-        except ImportError:
-            return []
     with _locked():
         seen = _wave_state()
         due = [f for f in flags if not 0 <= now - float(seen.get(f) or 0) < WAVE_EVERY_S]
@@ -394,6 +416,10 @@ def wave_tick(now: float | None = None, judge=None, projects: dict | None = None
         ws, k, back = waves(flag, cfg), wave_at(flag, cfg), rolled_back(flag, cfg)
         excl = set(cfg.get("excluded") or [])
         verdicts: dict[str, dict] = {}
+        try:
+            fj = judge if judge is not None else _judge(flag)
+        except ImportError:
+            continue
         for name in (n for w in ws[:k + 1] for n in w if n not in excl and n not in back):
             p = projs.get(name)
             if p is None:
@@ -401,7 +427,7 @@ def wave_tick(now: float | None = None, judge=None, projects: dict | None = None
                 continue
             try:
                 from .project import layered
-                v = judge(p, layered(_raw(p)), now)
+                v = fj(p, layered(_raw(p)), now)
             except Exception as e:   # a judge that fails waits; it never rolls back or widens
                 v = {"state": "wait", "why": f"judge failed: {type(e).__name__}: {e}"[:200], "n": 0}
             verdicts[name] = v if isinstance(v, dict) else {"state": "wait", "why": "no verdict", "n": 0}

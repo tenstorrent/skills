@@ -65,7 +65,7 @@ def prompt_lines(s: dict | None) -> str:
     if not s:
         return ""
     out = []
-    if s.get("plan_first"):
+    if s.get("plan_first") and not s.get("device"):   # a device run's plan lines: deviceplan.glm_lines
         out.append('Before your first edit, run `ttp advise --plan "<the task in your own words, and the files you '
                    'expect to touch>"` and follow the plan it prints; `ttp push` refuses until a plan is on '
                    "record. If the plan starts with needs_opus:, hand the task back to Opus.")
@@ -91,10 +91,10 @@ def limits(run_dir) -> dict | None:
     return got if isinstance(got, dict) else None
 
 
-def calls(run_dir) -> list[dict]:
-    """The run's calls so far (LOG), oldest first."""
+def rows(path) -> list[dict]:
+    """The JSON object lines of a jsonl file, oldest first; unreadable lines are skipped."""
     try:
-        lines = (Path(run_dir) / LOG).read_text().splitlines()
+        lines = Path(path).read_text().splitlines()
     except OSError:
         return []
     out = []
@@ -106,6 +106,11 @@ def calls(run_dir) -> list[dict]:
         if isinstance(row, dict):
             out.append(row)
     return out
+
+
+def calls(run_dir) -> list[dict]:
+    """The run's calls so far (LOG), oldest first."""
+    return rows(Path(run_dir) / LOG)
 
 
 def hours(run_dir) -> float:
@@ -126,7 +131,7 @@ def push_refusal(run_dir) -> str | None:
             'words>"` and follow its plan before `ttp push`')
 
 
-def refusal(run_dir, plan: bool) -> str | None:
+def refusal(run_dir, plan: bool, step=None) -> str | None:
     """Why the run may not make this call now, else None."""
     lim = limits(run_dir) if run_dir else None
     if not lim:
@@ -135,6 +140,15 @@ def refusal(run_dir, plan: bool) -> str | None:
     used = sum(float(r.get("minutes") or 0) for r in done)
     if used >= float(lim.get("max_minutes") or 0):
         return f"this run's advisor minutes are used up ({used:.1f} of {lim.get('max_minutes')}); decide yourself"
+    if step is not None:   # a device run's Opus check before a reset, power cycle, flash or firmware step (#3648)
+        from . import deviceplan
+        if not lim.get("device") or not planned(run_dir):
+            return "`--check-step` checks a step of a device run's plan: run `ttp advise --plan` first"
+        steps = (deviceplan.plan(run_dir) or {}).get("steps") or []
+        cap = sum(1 for st in steps if deviceplan.risky(st["command"])) + 2
+        if sum(1 for r in done if r.get("kind") == "check") >= cap:
+            return f"this run has used its {cap} step checks; hand the task back to Opus"
+        return None
     if plan:
         if not lim.get("plan_first"):
             return "plan-first is off for this run; ask a question with `ttp advise \"<question>\"` instead"
@@ -165,10 +179,12 @@ def _binary() -> str:
 
 
 def ask(run_dir, question: str, *, cwd: str, plan: bool = False, db=None, source: str = "advisor",
-        run=None, binary: str | None = None, now=time.time) -> dict:
+        run=None, binary: str | None = None, now=time.time, step=None) -> dict:
     """One call: {"ok", "answer", "minutes", "cost_usd"} (or {"ok": False, "error"}), logged in LOG and
-    booked in `db` on the Claude side. Raises ValueError when refusal() refuses it."""
-    if why := refusal(run_dir, plan):
+    booked in `db` on the Claude side. Raises ValueError when refusal() refuses it. A device run's plan
+    (limits "device") is kept by deviceplan.store; `step` asks Opus to check that plan step ("verdict")."""
+    from . import deviceplan
+    if why := refusal(run_dir, plan, step):
         raise ValueError(why)
     lim = limits(run_dir) or {}
     used = sum(float(r.get("minutes") or 0) for r in calls(run_dir))
@@ -179,14 +195,23 @@ def ask(run_dir, question: str, *, cwd: str, plan: bool = False, db=None, source
             "--output-format", "json", "--tools", "Read,Grep,Glob", "--no-session-persistence",
             "--strict-mcp-config", "--setting-sources", "", "--max-budget-usd",
             f"{float(lim.get('max_usd') or DEFAULTS['max_usd']):.2f}", "--system-prompt", SYSTEM]
-    text = (PLAN + "\n\n--- task ---\n" if plan else "") + question.strip()
-    t0, row = now(), {"kind": "plan" if plan else "ask", "q": question.strip()[:500]}
+    device = plan and lim.get("device")
+    text = (deviceplan.DEVICE_PLAN + "\n\n--- task ---\n" + str(lim.get("task") or "")[:6000] + "\n\n--- the agent's "
+            "words ---\n" if device else PLAN + "\n\n--- task ---\n" if plan else "") + question.strip()
+    if step is not None:
+        text = deviceplan.check_text(run_dir, step) or ""
+        if not text:
+            raise ValueError(f"the plan has no step {step}")
+    t0 = now()
+    row = {"kind": "check" if step is not None else "plan" if plan else "ask", "q": question.strip()[:500]}
     try:
         if not exe:
             raise RuntimeError("no claude binary on this host")
         data = (run or _run)(argv, text, timeout, cwd)
         answer = str(data.get("result") or "").strip()
         row.update(ok=bool(answer), answer=answer[:4000])
+        if step is not None:
+            row.update(step=str(step), verdict="ok" if answer.lower().startswith("ok") else "stop")
     except Exception as e:   # a failed call still spends its minutes
         data, answer = {}, ""
         row.update(ok=False, error=f"{type(e).__name__}: {e}"[:300])
@@ -198,6 +223,11 @@ def ask(run_dir, question: str, *, cwd: str, plan: bool = False, db=None, source
     row.update(ts=round(t0, 1), minutes=round(max(0.0, now() - t0) / 60, 3), cost_usd=round(usd, 4), model=model)
     with open(Path(run_dir) / LOG, "a") as f:
         f.write(json.dumps(row, sort_keys=True) + "\n")
+    if device and row.get("ok"):
+        deviceplan.store(run_dir, answer, cwd)
+    elif row.get("verdict") == "stop":
+        from . import glmguard
+        glmguard.hit(run_dir, f"Opus's check stopped step {step}: {answer[:240]}", kind="check")
     if db is not None and usd:
         db.spend("claude", usd, source, account=model, tokens_in=int(usage.get("input_tokens") or 0),
                  tokens_out=int(usage.get("output_tokens") or 0))

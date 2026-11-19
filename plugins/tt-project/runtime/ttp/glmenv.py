@@ -39,7 +39,7 @@ except ImportError:   # tests and the daemon: the refusal logic below needs neit
             super().__init__()
             self.messages = messages
 
-from . import glmguard
+from . import deviceplan, glmguard
 
 CLASS_PATH = "ttp.glmenv.GuardedEnvironment"
 DIGEST_ENV = "TTP_GLM_DIGEST"   # the harness script sets it to 1 when the digest is on
@@ -114,12 +114,17 @@ class GuardedEnvironment(LocalEnvironment):
         run_dir = os.environ.get("TTP_RUN_DIR", "")
         if draft := glmguard.outward_shell(command):   # an outward post: a draft for Opus, the run goes on
             return {"output": glmguard.drafted(run_dir, draft), "returncode": 2, "exception_info": ""}
-        why = refusal(command, cwd or getattr(getattr(self, "config", None), "cwd", "") or os.getcwd(), run_dir)
-        if why:
+        here = cwd or getattr(getattr(self, "config", None), "cwd", "") or os.getcwd()
+        if (why := deviceplan.hook_refusal(command, here)) and why.endswith(" first"):   # take the plan or check first
+            return {"output": f"refused: {why}", "returncode": 2, "exception_info": ""}
+        if not why and (why := refusal(command, here, run_dir)):
             glmguard.hit(run_dir, why)   # the hand-back to Opus; the command is never run
+        if why:
             raise Submitted({"role": "exit", "content": f"refused by the guard: {why}",
                              "extra": {"exit_status": "GuardRefused", "submission": ""}})
         got = super().execute(action, cwd, timeout=timeout)
+        if isinstance(got, dict):
+            deviceplan.log_step(run_dir, command, got.get("returncode"), str(got.get("output") or ""))
         if isinstance(got, dict) and (why := glmguard.gate_stop(run_dir, command, got.get("returncode"),
                                                                  str(got.get("output") or ""))):
             raise Submitted({"role": "exit", "content": f"stopped: {why}",   # the hand-back to Opus with its output

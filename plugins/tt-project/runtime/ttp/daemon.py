@@ -37,7 +37,7 @@ import uuid
 from pathlib import Path
 
 from . import runtimeload   # first of its own: its LOADED_AT is when the daemon imported its code
-from . import blindreview, glmassist
+from . import blindreview, deviceplan, glmassist
 from . import rolerestore
 from . import codearm
 from . import glmwork
@@ -4336,8 +4336,9 @@ class Daemon:
             if glmguard.env_for(note) or coordroute.guard_env(note):   # a GLM run: guarded even where its variable is unset
                 glmguard.mark(run_dir)
             if glm_env:   # a run on the chat model: outward posts become drafts, a device run stops at a failed gate
-                glmguard.mark_run(run_dir, glm_env[glmguard.RUN_ENV] == glmguard.DEVICE,
-                                  glmguard.gate_lines(str((task or {}).get("spec") or "")))
+                plan = bool((note or {}).get(deviceplan.KEY))
+                glmguard.mark_run(run_dir, glm_env[glmguard.RUN_ENV] == glmguard.DEVICE or plan,
+                                  glmguard.gate_lines(str((task or {}).get("spec") or "")), plan=plan)
             if task and role in ctxfork.ROLES:   # restated after each compaction (rolerestore.py)
                 rolerestore.write(run_dir, role, task, self.p.name)
             if stdin is not None:   # what the agent reads; prompt.md stays the readable digest
@@ -6620,11 +6621,18 @@ class Daemon:
                 durable_write(run_dir / RESULT_FILE, json.dumps(
                     {**got, "status": route.BOUNCE, "handoff_status": got.get("status"), "needs_opus": bounce,
                      # the next run (fresh, on Opus) reads the bounced run's own hand-off as its previous attempt
-                     "summary": f"needs Opus: {bounce}" + (f"; its hand-off said: {said}"[:1200] if said else "")},
+                     "summary": f"needs Opus: {bounce}" + (f"; its hand-off said: {said}"[:1200] if said else "")
+                     + (f"; Opus's plan and the steps run: {run_dir / deviceplan.PLAN_FILE}, "
+                        f"{run_dir / deviceplan.STEPS}" if deviceplan.marked(run_dir) else "")},
                     indent=1))
             except OSError as e:
                 log(p, f"run {r['id']}: its bounce was not recorded in {RESULT_FILE}: {e}")
             log(p, f"run {r['id']} of task {r['task']} bounced to Opus: {bounce}")
+        if r["task"] and r["role"] != "coordinator":
+            try:   # a GLM device run's counters and Opus audit; an audit's verdict, the stop (#3728)
+                deviceplan.run_end(db, self.cfg, p.name, db.task(r["task"]), r["id"], run_dir, bounce)
+            except Exception as e:
+                log(p, f"run {r['id']}: the device route's bookkeeping failed: {e}")
         if fell and status not in ("limit", "auth"):
             status = "fallback"   # the endpoint or the routed run failed: no attempt, the same tier on the core provider
         net_lost = status in SLEEP_CUT and bool(NET_LOST_RE.search(usage.error or ""))
@@ -10205,6 +10213,12 @@ class Daemon:
                              + "\n".join(f"- {line}" for line in bad))
             except Exception as e:   # nor must the GLM bad-output lines
                 log(self.p, f"GLM bad output lines failed: {type(e).__name__}: {e}")
+            try:
+                from . import deviceplan
+                if dev := deviceplan.daily_line(db):
+                    spec += f"\n\n{dev}"
+            except Exception as e:   # nor must the device route's line
+                log(self.p, f"GLM device line failed: {type(e).__name__}: {e}")
         if payload.get("audit_report", s["name"] == "daily-review"):
             try:
                 from . import machine_ledger
@@ -13406,9 +13420,14 @@ class Daemon:
                     prompt += glmwork.contract()   # so may a GLM work run (glmwork.bounce_reason)
                 on_glm = on_arm or bool(routed and routed.get(glmwork.KEY) and run_prov == routed.get("to")
                                         and not routed.get("fallback_model"))
-                if on_glm and (assist := glmassist.for_run(self.cfg)):   # ask-Opus switches, logged per run
+                assist = glmassist.for_run(self.cfg) if on_glm else None
+                is_device = deviceplan.device(task, self.cfg)
+                if on_glm and is_device and deviceplan.on(self.cfg):   # Opus plans, GLM runs only that plan (#3728)
+                    assist, note[deviceplan.KEY] = deviceplan.assist(assist, self.cfg, task), True
+                if assist:   # ask-Opus switches, logged per run
                     note[glmassist.KEY] = assist
                     prompt += glmassist.prompt_lines(assist)
+                prompt += deviceplan.glm_lines() if note.get(deviceplan.KEY) else deviceplan.prompt_lines(is_device)
                 if glmguard.run_env(run_prov, note):   # its TMPDIR is a scratch folder of its own (start_run)
                     prompt += f"\n\n{glmguard.SCRATCH_LINE}\n"
                 members = [] if note.get("wake") or note.get("resumes") or on_arm else \

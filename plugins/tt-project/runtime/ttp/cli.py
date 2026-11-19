@@ -12622,13 +12622,18 @@ def cmd_advise(a) -> None:
     p = Project(os.environ["TTP_PROJECT"]) if os.environ.get("TTP_PROJECT") else None
     task = os.environ.get("TTP_TASK") or ""
     try:
+        if not a.question and a.check_step is None:
+            raise ValueError("give the question, or with --plan the task in your own words")
         row = glmassist.ask(run_dir, " ".join(a.question), cwd=os.getcwd(), plan=a.plan,
-                            db=p.db if p and p.exists() else None, source=f"advisor:{task or 'run'}")
+                            db=p.db if p and p.exists() else None, source=f"advisor:{task or 'run'}",
+                            step=a.check_step)
     except ValueError as e:
         die(f"ttp advise: {e}")
     if not row.get("ok"):
         die(f"ttp advise: the call failed ({row.get('error') or 'no answer'}); decide yourself or hand the task back")
     print(row["answer"])
+    if row.get("verdict") == "stop":
+        sys.exit(1)
 
 
 def cmd_alive(a) -> None:
@@ -17658,8 +17663,10 @@ def main(argv: list[str] | None = None) -> None:
         s.set_defaults(fn=cmd_pause)
     s = sub.add_parser("advise", help="inside a GLM-arm run with route.glm_work.advisor or plan_first on: ask Opus a "
                                        "read-only question (--plan: the plan to follow), within the run's limits")
-    s.add_argument("question", nargs="+", help="the question, or with --plan the task in your own words")
+    s.add_argument("question", nargs="*", help="the question, or with --plan the task in your own words")
     s.add_argument("--plan", action="store_true", help="ask for the plan a plan-first run follows")
+    s.add_argument("--check-step", metavar="N", help="a device run: ask Opus to check step N of its plan before a "
+                                                    "reset, power cycle, flash or firmware step")
     s.set_defaults(fn=cmd_advise)
     s = sub.add_parser("alive", help="whether the project really works now (for hand-back and takeover checks): exit 0 "
                                       "live; 1 not: a provider logged out, paused, or no successful model run lately")

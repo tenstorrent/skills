@@ -376,6 +376,14 @@ def record_ssh(payload: dict, run_dir: str) -> None:
 EXIT_CODE = re.compile(r"(?i)\bexit(?:ed)?(?: with)? (?:code|status) (\d+)")
 
 
+def _device_plan(payload: dict) -> str:
+    """A GLM device run under an Opus plan (deviceplan.py): why this command may not run, '' when it may."""
+    from . import deviceplan
+    cmd = str((payload.get("tool_input") or {}).get("command") or "")
+    why = deviceplan.hook_refusal(cmd, str(payload.get("cwd") or ""))
+    return "" if not why else why if why.endswith(" first") else f"{why}; the run ends and its task goes back to Opus"
+
+
 def _gate_stop(payload: dict, run_dir: str) -> str:
     """A failed gate command of a device run on the chat model ends the run as a hand-back to Opus
     (glmguard.gate_stop); what the model reads then, '' when the run goes on. A failed call is one whose
@@ -394,6 +402,8 @@ def _gate_stop(payload: dict, run_dir: str) -> str:
         rc = int(m.group(1)) if m else 1
     out = err or "\n".join(str(resp.get(k) or "") for k in ("stdout", "stderr"))
     cmd = str((payload.get("tool_input") or {}).get("command") or "")
+    from . import deviceplan
+    deviceplan.log_step(run_dir, cmd, rc, out)
     why = glmguard.gate_stop(run_dir, cmd, rc, out)
     return f"{why}: the run stops here and the task goes back to Opus with this command and its output" if why else ""
 
@@ -1415,6 +1425,8 @@ def _pre_tool_use(payload: dict) -> tuple[dict | None, None]:
     if glmguard.active() and (why := glmguard.tool_refusal(payload)):
         glmguard.hit(os.environ.get("TTP_RUN_DIR"), why)   # the run ends as a hand-back to Opus (no model call)
         return _deny(f"{why}; the run ends and its task goes back to Opus"), None
+    if payload.get("tool_name") == "Bash" and (why := _device_plan(payload)):
+        return _deny(why), None
     if why := _provenance(untrusted.mark_refusal(str(payload.get("tool_name") or ""), payload.get("tool_input") or {})):
         return _deny(why), None   # the run's untrusted-input mark, marked or not
     if why := pathguard.refusal(payload):   # a write into a credential folder or a protected path, on any tool

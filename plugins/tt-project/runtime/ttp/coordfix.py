@@ -101,7 +101,9 @@ PLAIN_READS = {"cat", "head", "tail", "less", "more", "ls", "stat", "wc", "diff"
                "test", "[", "jq", "uniq", "cut", "readlink", "realpath", "du", "tree", "grep", "egrep", "fgrep", "rg",
                "ag", "echo", "printf", "pwd", "date", "whoami", "id", "hostname", "uname", "which", "type", "true",
                "false", "df", "ps", "pgrep", "uptime", "free", "nproc", "basename", "dirname", "tr", "column", "nl",
-               "comm", "paste", "tac", "seq", "sleep", "cd", "xxd", "od", "strings", "env", "printenv", "lsof"}
+               "comm", "paste", "tac", "seq", "sleep", "cd", "xxd", "od", "strings", "env", "printenv", "lsof",
+               "lspci", "lsusb", "lsblk", "lscpu", "lsmod", "modinfo", "sensors", "zcat", "zgrep", "squeue", "sinfo",
+               "sacct", "sshare", "sprio"}
 WRAPPERS = {"timeout": 1, "nice": 0, "time": 0, "nohup": 0, "command": 0, "stdbuf": 0, "env": 0}   # words they take
 GIT_READS = {"log", "show", "status", "diff", "rev-parse", "merge-base", "ls-remote", "fetch", "ls-files", "ls-tree",
              "cat-file", "blame", "describe", "shortlog", "rev-list", "for-each-ref", "name-rev", "show-ref", "grep",
@@ -113,7 +115,7 @@ TTP_READS = READ_COMMANDS + (("paths",), ("list",), ("show",), ("quarantine", "l
                              ("push", "--queue"), ("push", "--result"), ("--help",), ("-h",), ("help",),
                              ("--version",), ("task", "*", "eta"), ("bridge", "status"), ("overview",), ("runs",), ("schedules", "*", "grace"),
                              ("schedules", "*", "show"), ("schedules", "*", "list"), ("obligation", "list"),
-                             ("task", "show"))   # the project may be left out: it is the one here
+                             ("task", "show"), ("occupancy",))   # the project may be left out: it is the one here
 SHELL_KEYWORDS = {"do", "then", "else", "elif", "if", "while", "until", "!", "{"}   # lead a command; `done`/`fi` end one
 PY_NAMES = re.compile(r"python(3(\.\d+)?)?")
 # python -c code that may write or run something else (besides an open() whose mode is not a plain read
@@ -129,6 +131,27 @@ PY_WRITES = re.compile(r"""\bO_(WRONLY|RDWR|CREAT|APPEND|TRUNC)\b|\b(setattr|del
 LAUNCHCTL_READS = {"print", "list", "print-disabled", "blame", "version", "help"}
 SYSTEMCTL_READS = {"status", "show", "list-units", "list-timers", "list-unit-files", "is-active", "is-enabled",
                    "is-failed", "cat", "list-dependencies", "list-sockets"}
+
+TT_SMI_READS = {"-s", "--snapshot", "-ls", "--list", "-v", "--version", "-h", "--help"}
+DMESG_WRITES = re.compile(r"-[a-zA-Z]*[cCDEn][a-zA-Z]*|--(?:clear|read-clear|console-\w+)\b.*")
+IPMI_OPT_ARG = {"-I", "-H", "-U", "-P", "-f", "-L", "-p", "-y", "-Y", "-C", "-k", "-K", "-t", "-b", "-T", "-B", "-m",
+                "-l", "-N", "-R", "-o", "-O", "-e", "-A", "-D", "-z"}
+IPMI_READ = re.compile(r"(?:sdr|sensor)(?:\s+(?:list|elist|get|type|info|reading)\b.*)?$|sel(?:\s+(?:list|elist|info|get)\b.*)?$"
+                       r"|fru(?:\s+(?:print|list)\b.*)?$|(?:chassis\s+)?(?:status|power\s+status)$|mc\s+(?:info|guid|selftest)$"
+                       r"|lan\s+print\b.*$|dcmi\s+(?:power\s+reading|discover|sensors)\b.*$")
+
+
+def _ipmi_words(args: list[str]) -> list[str]:
+    """ipmitool's subcommand words: its options and their values dropped."""
+    out, skip = [], False
+    for a in args:
+        if skip:
+            skip = False
+        elif a in IPMI_OPT_ARG:
+            skip = True
+        elif not a.startswith("-"):
+            out.append(a)
+    return out
 
 
 def _simple(cmd: str) -> list[list[str]] | None:
@@ -377,6 +400,14 @@ def _words_read(w: list[str], depth: int) -> bool:
         return bool(subs) and subs[0] in SYSTEMCTL_READS
     if name == "ssh":
         return _ssh_reads(args, depth)
+    if name == "ipmitool":
+        return bool(IPMI_READ.match(" ".join(_ipmi_words(args))))
+    if name == "tt-smi":
+        return bool(args) and all(a in TT_SMI_READS for a in args)
+    if name == "scontrol":
+        return args[:1] == ["show"]
+    if name == "dmesg":
+        return not any(DMESG_WRITES.fullmatch(a) for a in args)
     return False
 
 

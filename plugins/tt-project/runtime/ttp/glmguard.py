@@ -60,6 +60,8 @@ TASK_WRITES = frozenset({"add", "cancel", "requeue", "restart", "set-when", "sup
 # `ttp note` flags that send a note on, or change a record beyond the run's own log: refused on the GLM arm.
 NOTE_ROUTES = ("--to", "--reply", "--urgent", "--severity", "--confirms", "--status")
 GH_READS = frozenset({"view", "list", "diff", "status", "checks"})
+PLAN_BOOKKEEPING = (("machines", "change", "add"), ("machines", "change", "edit"), ("obligation", "progress"),
+                    ("occupancy",))
 REACH = frozenset({"ssh", "scp", "sftp", "mail", "mailx", "sendmail", "mutt", "nc", "ncat", "telnet", "sqlite3"})
 HTTP = frozenset({"curl", "wget", "http", "https", "httpie"})
 HTTP_DATA = re.compile(r"(?:^|\s)(?:-X\s*(?:POST|PUT|PATCH|DELETE)|--request\s+(?:POST|PUT|PATCH|DELETE)|-d\b|--data\S*|"
@@ -76,7 +78,8 @@ TAMPER = re.compile(
     + _IDS + r"\b|printf\s+-v\s*" + _IDS + r"\b|(?:[A-Za-z_]\w*=\S*\s+)*" + _IDS + r"\+?=)"
     r"|\benv\s+-i\b|\bglm_guard\.(?:on|json)\b", re.M)
 # A shell redirection (`2>&1`, `>out.log`, `<in`): its fd digit and target are no words of a ttp call.
-REDIRECT = re.compile(r"(?<![\w$])\d*(?:&>>?|>>?|<<?<?|>&|<&)\s*(?:&?\d+-?|[^\s;|&<>()]+)?")
+# the target stops at a quote: `ssh h "ls > f"` keeps its closing quote, so the remote command stays one word
+REDIRECT = re.compile(r"(?<![\w$])\d*(?:&>>?|>>?|<<?<?|>&|<&)\s*(?:&?\d+-?|[^\s;|&<>()'\"]+)?")
 STATE_DB = re.compile(r"\bproject\.db\b|\bmachine-workers\.json\b|\b\.tt-project/(?:locks|machines)\b")
 # Every run on the chat model (the code arm, a GLM work route, a routine coordinator lane, a bench run as a task):
 # human interaction stays on Opus, so its outward posts become drafts an Opus step reviews and sends.
@@ -200,6 +203,20 @@ def cli_refusal(cmd: str, action: str = "", flags=()) -> str | None:
             f"project outside the hand-off); hand the task back to Opus")
 
 
+def plan_bookkeeping(words: list[str]) -> bool:
+    """A device run's own records under an Opus plan (its machine ledger entries, its obligation progress) and the
+    device occupancy read. They stay in the project's records and reach no person."""
+    return any(words[:len(b)] == list(b) for b in PLAN_BOOKKEEPING)
+
+
+def plan_ssh(seg: list[str], run_dir: str) -> str | None:
+    """The remote command of `ssh <host> <cmd>` in a device run under an Opus plan, when the host is one the
+    plan's steps name and no option forwards, jumps or runs a local command; else None."""
+    from . import deviceplan
+    got = deviceplan.ssh_target(seg, strict=True)
+    return got[1] if got and got[1].strip() and got[0] in deviceplan.plan_hosts(run_dir) else None
+
+
 def _ttp_args(seg: list[str], project: str) -> list[str] | None:
     """The words after `ttp` in a command segment (an optional leading project name dropped), None for a
     segment that is not a ttp call."""
@@ -264,8 +281,9 @@ def _roots(cwd: str, run_dir: str, scratch: str = "") -> list[str]:
     return out
 
 
-def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None) -> str | None:
-    """Why a shell command of a GLM-arm run is refused (before it runs), else None."""
+def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None, remote: bool = False) -> str | None:
+    """Why a shell command of a GLM-arm run is refused (before it runs), else None. `remote`: the command an
+    ssh call runs on another host, whose paths are not this host's."""
     from . import hook, sidefx
     e = os.environ if env is None else env
     if TAMPER.search(cmd):
@@ -276,13 +294,15 @@ def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None) -> str | None
     segs = hook._all_segments(commands) + hook._segments(commands, strip=False)
     project = _own_name(e)
     plain, _ = hook._split(REDIRECT.sub(" ", cmd))   # `ttp checks 2>&1`: the 2 is no word of the call
+    plan = bool((glm_run(e) or {}).get("plan"))   # a device run under an Opus plan (deviceplan.py)
     for seg in hook._all_segments(plain) + hook._segments(plain, strip=False):
         words = _ttp_args(seg, project)
         act = (words or [])[1:2]
         if words and words[0] == "task":   # `ttp task [<project>] <action>`: a write anywhere wins
             acts = [w for w in words[1:] if w in TASK_WRITES or w in TASK_ACTIONS]
             act = [next((w for w in acts if w in TASK_WRITES), acts[0] if acts else "")]
-        if words and (why := cli_refusal(words[0], act[0] if act else "", [w for w in seg if w.startswith("--")])):
+        if words and not (plan and plan_bookkeeping(words)) and (
+                why := cli_refusal(words[0], act[0] if act else "", [w for w in seg if w.startswith("--")])):
             return why
     for seg in segs:
         if not seg:
@@ -298,7 +318,13 @@ def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None) -> str | None
         elif name in HTTP and HTTP_DATA.search(" ".join(seg[1:])):
             return "a run on the GLM arm does not send data to a service (an HTTP post)"
         elif name in REACH:
-            return f"`{name}` reaches another host, person or database: not for a run on the GLM arm"
+            rest = plan_ssh(seg, run_dir) if plan and name == "ssh" else None
+            if rest is None:
+                return f"`{name}` reaches another host, person or database: not for a run on the GLM arm"
+            if why := shell_refusal(rest, cwd, run_dir, e, remote=True):
+                return why
+    if remote:
+        return None
     home, tmp = os.path.expanduser("~"), _scratch(run_dir, e)
     roots = _roots(cwd, run_dir, tmp)
     # $TMPDIR (TMP, TEMP) is read as its value in the run's environment, or as /tmp where the command sets it itself
@@ -363,10 +389,12 @@ def gate_lines(spec: str) -> list[str]:
     return [" ".join(m.split()) for m in GATE_LINE.findall(spec or "")][:20]
 
 
-def mark_run(run_dir, device: bool, gates=()) -> None:
-    """The daemon's marker for a run on the chat model (read by glm_run() where the variable is gone)."""
+def mark_run(run_dir, device: bool, gates=(), plan: bool = False) -> None:
+    """The daemon's marker for a run on the chat model (read by glm_run() where the variable is gone); `plan`: a
+    device run under an Opus plan (deviceplan.py)."""
     from .project import durable_write
-    durable_write(Path(run_dir) / RUN_MARK, json.dumps({"device": bool(device), "gates": list(gates)}))
+    durable_write(Path(run_dir) / RUN_MARK, json.dumps({"device": bool(device), "gates": list(gates),
+                                                       **({"plan": True} if plan else {})}))
 
 
 def glm_run(env=None) -> dict | None:
@@ -379,9 +407,10 @@ def glm_run(env=None) -> dict | None:
         got = None
     if isinstance(got, dict):
         gates = got.get("gates") if isinstance(got.get("gates"), list) else []
-        return {"device": bool(got.get("device")) or e.get(RUN_ENV) == DEVICE, "gates": [str(g) for g in gates]}
+        return {"device": bool(got.get("device")) or e.get(RUN_ENV) == DEVICE, "gates": [str(g) for g in gates],
+                "plan": got.get("plan") is True}
     if e.get(RUN_ENV) in ("1", DEVICE) or active(e):
-        return {"device": e.get(RUN_ENV) == DEVICE, "gates": []}
+        return {"device": e.get(RUN_ENV) == DEVICE, "gates": [], "plan": False}
     return None
 
 

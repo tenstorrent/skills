@@ -117,17 +117,16 @@ def contract() -> str:
 def ring_gate(cfg: dict, project: str, raw: dict | None) -> dict:
     """Apply the `glm_work` release flag (rollout.py) to `cfg`, in place, and return it. The project's own
     `route.glm_work.on` in its project.json wins as written; else the flag decides (off in doubt)."""
-    from . import rollout
+    from . import deviceplan, rollout
     try:
         if rollout.own_setting(raw, rollout.FLAGS[KEY]["key"]):
-            return cfg
+            return deviceplan.gate(cfg, project, raw)
         on = rollout.on(KEY, project, raw)
     except Exception:
         on = False
-    if on == covered(cfg) and "on" in _raw(cfg):
-        return cfg
-    cfg["route"] = {**(cfg.get("route") or {}), KEY: {**_raw(cfg), "on": on}}
-    return cfg
+    if not (on == covered(cfg) and "on" in _raw(cfg)):
+        cfg["route"] = {**(cfg.get("route") or {}), KEY: {**_raw(cfg), "on": on}}
+    return deviceplan.gate(cfg, project, raw)
 
 
 def holdout(db, cfg: dict) -> float:
@@ -190,9 +189,10 @@ def keeps_core(db, cfg: dict, task: dict, tier: str, cls: str | None = None, pic
     """Why a run of `task` stays on the core provider on a covered project ('' when GLM may take it). Model-free,
     in order: coordinator, plan and review runs and verdicts (#3205), deep, a provider or model pin, outside
     text (untrusted_input), a tier-up retry, a GLM bounce (needs Opus or deep), a run that talks to a person
-    (#3512), optimization or design work, device work (#3324), urgent (only with keep_urgent), a kind off the
+    (#3512), optimization or design work, device work (#3324; with glm_device on it runs on GLM under an Opus
+    plan, deviceplan.py), urgent (only with keep_urgent), a kind off the
     list."""
-    from . import codearm, effort, modelpick, tierfloor, untrusted, urgent
+    from . import codearm, deviceplan, effort, modelpick, tierfloor, untrusted, urgent
     kind = str(task.get("kind") or "")
     text = f"{task.get('title') or ''}\n{task.get('spec') or ''}"
     if cls == "coordinator" or kind in ("plan", "review"):
@@ -214,8 +214,8 @@ def keeps_core(db, cfg: dict, task: dict, tier: str, cls: str | None = None, pic
         return "person"
     if DESIGN.search(text) or modelpick.HARD.search(text) or codearm.JUDGMENT.search(text):
         return "design"
-    if tierfloor.device_run(task, cfg) or tierfloor.DEVICE_SPEC.search(text):
-        return "device"
+    if (tierfloor.device_run(task, cfg) or tierfloor.DEVICE_SPEC.search(text)) and not deviceplan.on(cfg):
+        return "device"   # with glm_device on, a device task runs on GLM under an Opus plan (deviceplan.py)
     s = settings(cfg) or {}
     if s.get("keep_urgent") and urgent.is_urgent(task):
         return "urgent"
