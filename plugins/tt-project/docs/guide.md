@@ -597,10 +597,8 @@ coordinator with that evidence.
   with no session line in `ttp status`. `ttp status --verbose` shows the session's
   short id, wakes, context size and last decision. `ttp stats <name> --coord-session` reports each
   day's wakes, $/wake, context growth and tool calls per wake, in-place compactions (session id,
-  tokens before and after, how) and cache-read share beside
-  the stateless baseline (the 7 days before the first session wake: turns/day, $/turn), and flags
-  the break-even (at most 2 tool calls and 20k context growth per wake) and a day costing more
-  than the baseline's $/day. Each day counts wakes resumed, new, new with a hand-off (new for any
+  tokens before and after, how) and cache-read share, and flags
+  the break-even (at most 2 tool calls and 20k context growth per wake). Each day counts wakes resumed, new, new with a hand-off (new for any
   reason but the first session) and stateless (expected 0; older history rows keep their own labels,
   such as handover, rollover, spend guard or pause), names why wakes did not resume (a new session and
   its cause, a rejected resume, a provider that keeps no session, decide failed; a transcript gone
@@ -4662,7 +4660,7 @@ Workers can read Slack links you paste, using your Slack connector if you have o
     loopback ports and carrying this workstation's tag for the same box and agent (a random id made on
     the workstation, never a hostname): TERM, then KILL. It logs one line per ended session (port, pid,
     age) and retries at once; a second forward failure in a row exits for the supervisor to restart.
-    No sudo, no other account's process, no sshd config change. `status --deep` names a port held by a
+    No sudo, no other account's process, no sshd config change. `ttp bridge doctor` names a port held by a
     stale session. `ttp setup` and the upgrade re-install bridge services whose command changed, so
     nothing needs running by hand on the workstation.
   - A dead agent behind a live-looking link recovers too. Every 30 s the session asks its forwarded
@@ -4909,8 +4907,7 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   The hook (Claude Code, Codex, Cursor and the stream guard) and the run's `bin/git` and `bin/gh`, which
   scripts reach too, apply them on every provider. Known gaps: a path or command a script or inline code
   builds at run time (git and gh stay guarded), other HTTP clients, a GET carrying data in its URL and
-  connector (MCP) writes, which keep the AI-tag guard. `ttp.untrusted.guards_live()` tells routing code
-  that these guards ship.
+  connector (MCP) writes, which keep the AI-tag guard.
 - A session coordinator's Read, Grep and Glob calls are refused on the credential files listed at
   its launch and on what the worker hook's file tool check refuses.
 - Guards in the harness are a second line. Give the account the harness uses a fine-grained token

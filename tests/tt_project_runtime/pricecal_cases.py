@@ -51,7 +51,8 @@ def test_a_steady_small_drift_is_corrected_without_an_alert(env, tmp_path, monke
     start, end = gcap.day_bounds(b, now)
     assert abs(ls.estimate(b, start, end, now)["usd"] - (15 + 4 * _PRICED) * 1.03) < 1e-3   # the runs' logs count too
     # A run's own calibration still prices at the table, so the factor never feeds on itself.
-    assert ls.session_cost("r0") == (_PRICED, False)
+    usd, _, unknown = ls._session_priced("r0")
+    assert (usd, unknown) == (_PRICED, set())
 
 
 def test_a_large_drift_is_corrected_and_alerted_once_per_model_and_price_row(env, tmp_path, monkeypatch):

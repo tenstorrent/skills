@@ -38,11 +38,6 @@ def condition_key(name: str, version: str) -> str:
     return f"deploy:{name}:{version}"
 
 
-def release_key(version: str) -> str:
-    """The alert of a release's deploy, listing every project behind, as alerts before behind_key had one."""
-    return f"deploy:{version}"
-
-
 def behind_key(name: str) -> str:
     """The one ongoing alert of a project behind on releases: each new release updates it in place."""
     return f"deploy-behind:{name}"

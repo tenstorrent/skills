@@ -1775,8 +1775,7 @@ def test_a_model_missing_hold_ends_when_the_endpoint_lists_it_or_the_config_chan
     raw = (p.state / route.MODELS_FILE).read_text()
     assert _CB_KEY not in raw and up.url not in raw and "127.0.0.1" not in raw
     assert route.held(p.db, d.cfg, "light") == _RT_MODEL
-    assert route.models_due(d.cfg, p.state, time.time()) == ""   # at most hourly
-    assert route.models_due(d.cfg, p.state, time.time() + route.MODELS_EVERY_S) == "placeholder"
+    assert route._routed(d.cfg, None) == "placeholder"
     lines = route.model_lines(p.db, d.cfg, p.state, time.time(), lambda ts: "now")
     assert "routing: chat served 1 model at now: example-org/model-b" in lines, lines
     # Listed again at the next hourly check: the hold ends and the tier routes again.
@@ -2019,20 +2018,20 @@ def test_a_stale_served_list_holds_and_swaps_nothing_and_a_pinned_chat_task_keep
     _route_config(p, route=None, model_ranking=["rank-a"])
     d._load_config()
     assert not any(route.target(d.cfg, t) for t in ("light", "standard", "deep"))
-    assert route.models_due(d.cfg, p.state, now) == "placeholder"     # cheap run classes route to it
+    assert route._routed(d.cfg, None) == "placeholder"     # cheap run classes route to it
     from ttp import runclass
     p.set_config("route.classes", {c: "core" for c in runclass.CHAT})   # and no run class either
     d._load_config()
-    assert route.models_due(d.cfg, p.state, now) == ""                 # the daemon's db not given
-    assert route.models_due(d.cfg, p.state, now, p.db) == "placeholder"
+    assert route._routed(d.cfg, None) == ""                 # the daemon's db not given
+    assert route._routed(d.cfg, p.db) == "placeholder"
     p.db.x("UPDATE tasks SET status='done' WHERE id=?", (req,))
-    assert route.models_due(d.cfg, p.state, now, p.db) == ""           # no pinned chat task left
+    assert route._routed(d.cfg, p.db) == ""           # no pinned chat task left
     p.db.x("UPDATE tasks SET status='queued', provider=NULL WHERE id=?", (req,))
-    assert route.models_due(d.cfg, p.state, now, p.db) == ""           # an unset provider runs on the core one
-    assert route.models_due({**d.cfg, "core_provider": "chat"}, p.state, now, p.db) == "placeholder"
+    assert route._routed(d.cfg, p.db) == ""           # an unset provider runs on the core one
+    assert route._routed({**d.cfg, "core_provider": "chat"}, p.db) == "placeholder"
     _route_config(p, route=None)
     d._load_config()
-    assert route.models_due(d.cfg, p.state, now, p.db) == ""           # no ranking: as before
+    assert route._routed(d.cfg, p.db) == ""           # no ranking: as before
 
 
 def test_a_preference_pins_refused_stand_in_is_skipped_on_the_next_start(env, monkeypatch):
@@ -3297,7 +3296,7 @@ def test_a_new_higher_scoring_model_tops_the_rankings_and_model_ranking_stays_th
     assert not modelscore.publish(["m-old", "m-two", "m-new"], 3000.0)["changed"]
     rankfresh.refresh(["m-old"], "weekly", 1e8, "k", lambda u, k: _fake_index(("m-old", 99)))
     assert modelrank.ranking({})[0] == "m-new" and rankfresh.read_state()["scores"] == {"m-old": 99}
-    assert modelscore.fast_order("light")[0] == "m-new"
+    assert modelscore._read()["orders"]["light"]["fast"][0] == "m-new"
 
 
 def test_only_models_with_a_fair_score_are_ranked_best_first_so_a_weak_tb_rate_never_leads(env, monkeypatch):
@@ -3461,14 +3460,14 @@ def test_the_served_model_list_is_polled_every_minute_while_a_tier_or_run_class_
     assert route.models_every(d.cfg) == route.MODELS_EVERY_S == 60
     t0 = time.time()
     route.write_served(p.state, "chat", True, "HTTP 200", [_RT_MODEL], t0)
-    assert route.models_due(d.cfg, p.state, t0 + 59) == "" and route.models_due(d.cfg, p.state, t0 + 60) == "placeholder"
+    assert route._routed(d.cfg, None) == "placeholder"
     p.set_config("route.classes", {c: "core" for c in ("wake_decision", "screening", "worker_wake", "status_report",
                                                        "rebase", "review_small", "light")}, by=configwho.by("user", via="cli"))
     d._load_config()
-    assert route.models_due(d.cfg, p.state, t0 + 600) == ""   # nothing routes to chat: no check
+    assert route._routed(d.cfg, None) == ""   # nothing routes to chat: no check
     _route_config(p, models_every_s=300)
     d._load_config()
-    assert route.models_every(d.cfg) == 300 and route.models_due(d.cfg, p.state, t0 + 60) == ""
+    assert route.models_every(d.cfg) == 300
     # The daemon asks the host's shared poll (served.py) at most every served.CHECK_S; where its files
     # cannot be written, the project's own check runs instead, at the project's interval.
     from ttp import served
@@ -3657,7 +3656,7 @@ def test_a_gone_model_is_swapped_within_a_minute_and_a_smarter_new_one_is_tried_
     assert prov == "chat" and note[route.KEY]["model"] == _RT_MODEL and modelrank.KEY not in note[route.KEY]
     # Gone: the next minute's check leaves it out and the next start runs the next ranked model.
     t0 = time.time()
-    assert route.models_due(d.cfg, p.state, t0 + 60) == "placeholder"
+    assert route._routed(d.cfg, None) == "placeholder"
     route.write_served(p.state, "chat", True, "HTTP 200", ["rank-b"], t0 + 1)
     prov, _, note = _route_dispatch(p, d, monkeypatch, title="gone")
     assert note[route.KEY]["model"] == "rank-b" and note[route.KEY][modelrank.KEY] == {"from": _RT_MODEL, "why": "not listed"}

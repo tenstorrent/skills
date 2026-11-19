@@ -607,10 +607,6 @@ def clear_stuck(p: Project) -> None:
     p.db.x("DELETE FROM kv WHERE key=?", (KV_STUCK,))
 
 
-def push_in_flight(p: Project) -> bool:
-    return any(h.startswith("push:") for h in locks.held(p.state / "locks"))
-
-
 def push_hold_s(cfg: dict) -> float:
     try:
         v = float((cfg.get("upgrade") or {}).get("push_hold_min", PUSH_HOLD_MIN))

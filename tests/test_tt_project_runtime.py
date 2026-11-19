@@ -804,6 +804,12 @@ def _worker_text(p, task=None):
     return "\n\n".join(x for x in (worker_system(p, task), worker_memory_block(p)) if x)
 
 
+def worker_prompt(p, task: dict, cwd: str, branch: str | None) -> str:
+    """The whole prompt in one piece, as a worker reads it."""
+    from ttp.prompts import worker_system, worker_task
+    return worker_system(p) + "\n\n" + worker_task(p, task, cwd, branch)
+
+
 # make() bootstraps each project once per test process and clones it after that: a bootstrap is about
 # 15 git processes and 3 MB of copies, and most tests start with one. The clone gets the project's own
 # root, creation time and id, the git history a bootstrap at that root writes (commits rewritten in
@@ -6249,7 +6255,6 @@ def test_no_provider_adds_cache_breakpoints_past_the_limit(monkeypatch):
 
 
 def test_worker_prompt_points_at_the_long_running_script_reference_which_keeps_its_rules(env):
-    from ttp.prompts import worker_prompt
     p = make(env)
     tid = p.db.add_task("fix", "fix it", kind="code", tier="light", origin="user")
     prompt = worker_prompt(p, p.db.task(tid), str(p.root), None)
@@ -6269,7 +6274,7 @@ def test_charter_restrictions_lead_every_worker_prompt_once(env):
     p.charter_path.write_text("# demo\n\n## Goals\nGo fast.\n\n## Restrictions\n(none stated yet)\n\n"
                               "## Policies\nDraft PRs.\n\n## Restrictions (added 2026-09-30)\n"
                               "Never merge to main (user msg #1).\n")
-    from ttp.prompts import charter_restrictions, restrictions_pointer, worker_prompt
+    from ttp.prompts import charter_restrictions, restrictions_pointer
     from ttp.coordinator import system_prompt
     body = charter_restrictions(p.charter_path.read_text())
     assert body == "Never merge to main (user msg #1)."
@@ -17611,7 +17616,7 @@ def test_a_charter_and_memory_heavy_project_keeps_the_worker_prompt_under_its_ca
     The charter and memory digest's headers name it too and count toward the digest's budget: they get
     the stand-in as well, so how many memory entries fit does not depend on the temp path's length."""
     from ttp import machines, prompts
-    from ttp.prompts import charter_restrictions, worker_prompt
+    from ttp.prompts import charter_restrictions
     p = make(env)
     monkeypatch.setattr(machines, "load", lambda: {})
     heads = prompts._worker_heads
@@ -18256,7 +18261,7 @@ def test_a_detached_push_runs_after_push_once_its_outcome_is_written_and_its_loc
     p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
     probe = (f"{sys.executable} -c \"import sys; sys.path.insert(0, '{RUNTIME}'); "
              f"from ttp import release; from ttp.project import Project; "
-             f"print('in_flight', release.push_in_flight(Project('{p.base}')))\"")
+             f"print('in_flight', bool(release.live_pushes(Project('{p.base}'))))\"")
     p.set_config("delivery.after_push", [f"(echo sha $TTP_PUSHED_SHA; {probe}) > {seen}"])
     _commit(repo, "mine.txt", "mine\n")
     rc, marker, retry = _detach(capsys)
@@ -19938,7 +19943,7 @@ def test_after_push_runs_at_the_pushed_commit_in_a_clean_checkout_with_the_push_
     p, repo, origin, other = _bump_setup(env, monkeypatch, ["true"])
     probe = (f"{sys.executable} -c \"import sys; sys.path.insert(0, '{RUNTIME}'); from pathlib import Path; "
              f"from ttp import batch, locks, release; from ttp.project import Project; p = Project('{p.base}'); "
-             f"print('in_flight', release.push_in_flight(p)); print('held', locks.held(p.state / 'locks')); "
+             f"print('in_flight', bool(release.live_pushes(p))); print('held', locks.held(p.state / 'locks')); "
              f"print('alive', batch.alive(Path('{p.state / 'pushes' / 'b1.json'}')))\"")
     p.set_config("delivery.after_push", [
         f"(env | grep '^TTP_' | sort; echo head $(git rev-parse HEAD); echo dirty $(git status --porcelain | wc -l);"
@@ -21515,7 +21520,7 @@ def test_an_on_pass_cmd_keeps_the_task_asleep_while_it_runs_and_runs_once(env, m
         assert d._on_pass[tid][0] is proc and p.db.task(tid)["status"] == "queued"
         assert "woke" not in json.loads(p.db.task(tid)["result"])
     finally:
-        dmod._kill_group(d._on_pass[tid][0])
+        dmod.probespawn.kill(d._on_pass[tid][0])
 
 
 @pytest.mark.parametrize("stale_context", [False, True])
@@ -23960,7 +23965,7 @@ def test_machines_add_copies_the_list_in_the_background_past_a_down_host(env, tm
     assert "copying the machines list to far-down in the background" in out
     gate.touch()
     for _ in range(300):
-        if mm.PUSH_DONE in mm.push_log().read_text().splitlines():
+        if mm.PUSH_DONE in mm._push_logs()[-1].read_text().splitlines():
             break
         time.sleep(0.1)
     args = calls.read_text()
@@ -31367,34 +31372,6 @@ def test_batch_s_0_turns_batching_off(env, monkeypatch):
     assert _turn_within(d, clock, starts, float(d.cfg["coordinator"]["debounce_s"]) + 10)
 
 
-def test_replay_reports_the_turns_batching_saves_without_idle_slots(env):
-    from ttp import replay
-    p = make(env)
-    db = p.db
-    db.x("DELETE FROM runs")
-    t0 = time.time() - 7200
-
-    def history(workers):
-        db.x("DELETE FROM runs")
-        db.x("DELETE FROM events")
-        for _ in range(workers):
-            db.x("INSERT INTO runs(role, started, ended, status) VALUES('worker', ?, ?, 'ok')", (t0, t0 + 3000))
-        for at, kinds in ((100, ("task_done", "followup_proposed")), (200, ("task_done",)), (300, ("task_done",))):
-            ids = [db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
-                        (t0 + at, "task:1", k, "normal", k, "handled")) for k in kinds]
-            db.x("INSERT INTO runs(role, started, ended, status, cost_usd, note) VALUES('coordinator',?,?,'ok',0.1,?)",
-                 (t0 + at + 15, t0 + at + 25, json.dumps({"events": ids, "messages": []})))
-        return replay.load(pathlib.Path(db.path), 1, now=t0 + 3600)
-
-    out = replay.report(history(workers=2), 300, 2)
-    assert (out["replayed_turns"], out["batched_turns"]) == (3, 1), out
-    assert out["saved_pct"] > 60 and out["idle_slot_s"] == 0 and out["extra_idle_slot_s"] == 0
-    # A free slot with nothing to run: every hand-off gets its turn at once.
-    out = replay.report(history(workers=1), 300, 2)
-    assert out["turns_saved"] == 0 and out["held_s"] == 0, out
-    assert replay.main([str(db.path), "--days", "1", "--slots", "2"]) == 0
-
-
 def _finish_code(env, p, title, files, result=None, labels=None, before=None, edit=None, kind="code"):
     """A code task (or one of `kind`) that committed `files` (name -> lines), and what `edit(worktree)`
     changed, on its branch, then handed off. `before` is called with the task id and its branch's head
@@ -32899,7 +32876,6 @@ def test_a_mechanical_or_light_continue_hop_is_queued_at_light_tier_and_reads_it
     p = make(env)
     p.set_config("chains.requeue", False)   # the new-hop path, not chaincap.requeue
     from ttp import chaincap
-    from ttp.prompts import worker_prompt
     light = {"status": "done", "summary": "feature: part done, checks left",
              "followups": [{"title": "continue: feature", "spec": "Run the checks.", "tier": "light"}]}
     root, *_ = _finish_code(env, p, "feature", {"a.py": 10}, result=light)
@@ -35098,7 +35074,8 @@ def test_the_price_table_is_checked_against_reported_run_costs(env, tmp_path, mo
     for i in range(3):
         _log(logs, f"r{i}", [_call(f"r{i}", "m", now, output_tokens=M, cache_read_input_tokens=M)])
         _log(logs, f"r{i}", [_call(f"r{i}", "s", now, input_tokens=M)], sub="agent-x")
-    assert ls.session_cost("r0") == (15 + 0.3 + 3, False)
+    usd, _, unknown = ls._session_priced("r0")
+    assert (usd, unknown) == (15 + 0.3 + 3, set())
     assert ls.calibrate("r0", 18.3)["samples"] == 0 and ls.calibrate("r1", 18.3)["samples"] == 0, "fewer than DRIFT_RUNS"
     got = ls.calibrate("r2", 18.3)
     assert abs(got["drift"]) < 0.001 and not got["applied"] and got["alert"] is None, "the table disagrees"

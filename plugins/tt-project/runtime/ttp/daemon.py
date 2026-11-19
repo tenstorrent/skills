@@ -16403,7 +16403,7 @@ class Daemon:
                 continue
             del self._probes[tid]
             if rc is None:
-                _kill_group(proc)
+                probespawn.kill(proc)
             if id(proc) not in outs:
                 outs[id(proc)], lines[id(proc)], raws[id(proc)] = self._probe_texts(proc)
                 tails[id(proc)] = outs[id(proc)].strip()[-300:]
@@ -16806,7 +16806,7 @@ class Daemon:
         run = self._probes.get(tid)
         if run and run[2] != probe:
             if not any(o != tid and r[0] is run[0] for o, r in self._probes.items()):
-                _kill_group(run[0])   # unless shared: the other task still needs its verdict
+                probespawn.kill(run[0])   # unless shared: the other task still needs its verdict
                 self._probe_text(run[0])
             del self._probes[tid]
             self._probed.pop(tid, None)
@@ -19375,7 +19375,7 @@ class Daemon:
                 continue
             del self._on_pass[tid]
             if rc is None:
-                _kill_group(proc)
+                probespawn.kill(proc)
             r = db.one("SELECT * FROM runs WHERE id=?", (run_id,))
             if r and r["dir"]:
                 # Its notes were acknowledged when sent: they go out whatever it ends with.
@@ -24770,12 +24770,6 @@ def _current_probe(task: dict) -> str | None:
         return when
     probe = load_result(task["result"]).get("retry_when")
     return probe if isinstance(probe, str) else None
-
-
-def _kill_group(proc: subprocess.Popen) -> None:
-    """Kill proc's session, waiting at most probespawn.KILL_WAIT_S for it (one stuck in the kernel must
-    not hold the tick)."""
-    probespawn.kill(proc)
 
 
 def _read_pid(path: Path) -> int | None:

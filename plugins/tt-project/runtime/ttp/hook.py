@@ -1793,30 +1793,6 @@ def _pytest_args(argv: list[str]) -> list[str] | None:
     return None
 
 
-def _inline_code(argv: list[str]) -> str | None:
-    """The code of `python -c CODE` (also `-Ic CODE`, `-cCODE`), else None."""
-    if not argv or not re.fullmatch(r"python[\d.]*", os.path.basename(argv[0])):
-        return None
-    i = 1
-    while i < len(argv):
-        a = argv[i]
-        if not a.startswith("-") or a in ("-", "--"):
-            return None   # a script or stdin
-        if a.startswith("--"):   # --check-hash-based-pycs MODE, --version ...
-            i += 2 if a == "--check-hash-based-pycs" else 1
-            continue
-        for j, c in enumerate(a[1:], 1):
-            if c == "c":
-                return a[j + 1:] or (argv[i + 1] if i + 1 < len(argv) else None)
-            if c in "mWXQ":   # -m MOD runs a module; -W/-X/-Q take the rest of the word or the next one
-                if c == "m":
-                    return None
-                i += 0 if a[j + 1:] else 1
-                break
-        i += 1
-    return None
-
-
 def _pytest_parts(args: list[str], rel: str) -> tuple[set[str], set[tuple[str, str]]]:
     """(the paths a pytest run names, relative to the repository's top, "." when it names none;
     its selecting options as (option, value)). An option not known to take a value is a flag: its

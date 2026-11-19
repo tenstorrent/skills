@@ -1352,8 +1352,3 @@ def worker_resume(p: Project, task: dict, lost: dict) -> str:
         text += ("\nUpdate for your task from the project coordinator. Where it differs from the spec, it wins:\n"
                  + "\n".join(update) + "\n")
     return "\n\n".join(x for x in (text, restrictions_pointer(p)) if x.strip())
-
-
-def worker_prompt(p: Project, task: dict, cwd: str, branch: str | None) -> str:
-    """The whole prompt in one piece, as a worker reads it."""
-    return worker_system(p) + "\n\n" + worker_task(p, task, cwd, branch)

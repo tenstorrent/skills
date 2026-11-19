@@ -198,7 +198,6 @@ def test_the_digest_recently_finished_line_shows_the_cells_prefix(env):
 
 
 def test_only_a_worker_whose_spec_has_a_cells_line_is_told_about_the_cells_field(env):
-    from ttp.prompts import worker_prompt
     p = make(env)
     with_line = p.db.add_task("power sweep", SWEEP, kind="question", tier="light", origin="user")
     without = p.db.add_task("power sweep", "Measure throughput at 150W.", kind="question", tier="light", origin="user")

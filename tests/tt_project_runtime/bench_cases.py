@@ -251,11 +251,11 @@ def test_bench_unknown_symbols_counts_names_the_spec_gives_and_ignores_outside_m
     assert bench.unknown_symbols(repo, base, head, tests, "Add pkg/tool.py with run() and extra().") == []
 
 
-def test_bench_unstated_names_a_config_key_and_a_message_the_spec_never_gives(tmp_path, capsys):
+def test_bench_unstated_names_a_config_key_and_a_message_the_spec_never_gives(tmp_path):
     # The real case: the spec asks to make the 60% cut a config key, the held-out test requires one key name
     # and one error text the fix made up. A candidate could only guess them, so the task is not fair; once the
     # spec states both it is. An assert's own message, a docstring and plain inputs are no requirement.
-    from ttp import bench, cli
+    from ttp import bench
     repo, git, commit, rev = _bench_repo(tmp_path)
     commit({"pkg/__init__.py": "", "pkg/budget.py": "def level(cfg, used):\n    # the yellow cut\n"
             "    return 'yellow' if used >= 0.6 else 'green'\n"}, "budget")
@@ -282,10 +282,6 @@ def test_bench_unstated_names_a_config_key_and_a_message_the_spec_never_gives(tm
         {"task": 2, "base": "e" * 40, "head": head, "spec": vague, "tests": []}]}))
     assert [(r["task"], r["fair"], r["unstated"]) for r in bench.fair(bench_dir)] == \
         [(1, False, ["cap_yellow_pct", "must be a number above 0"]), (2, None, [])]
-    cli.main(["bench", "fair", "--bench", str(bench_dir)])
-    out = capsys.readouterr().out
-    assert "#1: unfair: the spec does not state 'cap_yellow_pct', 'must be a number above 0'" in out
-    assert "#2: cannot tell: its base or head commit is not in the repository" in out and "0 of 2 fair" in out
 
 
 
@@ -2127,6 +2123,12 @@ def test_bench_flagged_cell_is_still_graded_and_the_prompt_names_a_focused_test_
     assert "30 minutes" in benchrun.prompt("spec", {"timeout_s": 1800})
 
 
+def _cell_cost(u, arm: dict) -> tuple[float, bool]:
+    from ttp import benchrun
+    got = benchrun.cell_spend(u, arm)
+    return got["cost_usd"], got["cost_estimated"]
+
+
 def test_bench_cell_cut_off_before_its_result_line_is_priced_from_its_tokens(env, monkeypatch):
     from ttp import benchrun, localspend
     from ttp.providers.base import RunUsage
@@ -2138,16 +2140,16 @@ def test_bench_cell_cut_off_before_its_result_line_is_priced_from_its_tokens(env
     monkeypatch.setattr(localspend, "price", price)
     monkeypatch.setattr(localspend, "overrides", lambda: {})
     cut = RunUsage(input_tokens=10, output_tokens=2000, cache_read_tokens=50000, cache_write_tokens=300, estimated=True)
-    assert benchrun.cell_cost(cut, {"provider": "claude", "model": "m-one"}) == (1.25, True)
+    assert _cell_cost(cut, {"provider": "claude", "model": "m-one"}) == (1.25, True)
     assert seen["model"] == "m-one" and seen["usage"]["output_tokens"] == 2000
     assert seen["usage"]["cache_read_input_tokens"] == 50000
     # A reported cost stands; no tokens, or another provider (priced elsewhere), keeps what was parsed.
-    assert benchrun.cell_cost(RunUsage(cost_usd=0.5, output_tokens=9), {"provider": "claude"}) == (0.5, False)
-    assert benchrun.cell_cost(RunUsage(), {"provider": "claude"}) == (0.0, False)
-    assert benchrun.cell_cost(RunUsage(output_tokens=9), {"provider": "chat"}) == (0.0, False)
+    assert _cell_cost(RunUsage(cost_usd=0.5, output_tokens=9), {"provider": "claude"}) == (0.5, False)
+    assert _cell_cost(RunUsage(), {"provider": "claude"}) == (0.0, False)
+    assert _cell_cost(RunUsage(output_tokens=9), {"provider": "chat"}) == (0.0, False)
     # A pricing failure never breaks the cell.
     monkeypatch.setattr(localspend, "price", lambda *a, **k: 1 / 0)
-    assert benchrun.cell_cost(cut, {"provider": "claude", "model": "m"}) == (0.0, True)
+    assert _cell_cost(cut, {"provider": "claude", "model": "m"}) == (0.0, True)
 
 
 def _claude_stream(path, result: bool) -> None:
@@ -2188,14 +2190,13 @@ def test_bench_cut_off_claude_cell_prices_output_from_its_content_and_says_it_is
     want = -(-chars // benchrun.CHARS_PER_TOKEN)
     assert got["output_tokens"] == want > u.output_tokens and got["stream_output_tokens"] == 6
     assert got["cost_estimated"] is True and got["cost_basis"] == benchrun.CONTENT_BASIS and "floor" in got["cost_basis"]
-    assert got["cost_usd"] == round(want / 1000, 6) > benchrun.cell_cost(u, arm)[0]   # the raw sum alone: less
+    assert got["cost_usd"] == round(want / 1000, 6) > benchrun.cell_spend(u, arm)["cost_usd"]   # the raw sum alone: less
     assert seen[0]["cache_read_input_tokens"] == 2000 and seen[0]["input_tokens"] == 10
     # A run with its result line is priced as it reported, exactly as before: no estimate, no basis.
     whole = tmp_path / "whole.jsonl"
     _claude_stream(whole, result=True)
     u = get_provider("claude").parse(whole)
     assert benchrun.cell_spend(u, arm, whole) == {"cost_usd": 0.42, "cost_estimated": False}
-    assert benchrun.cell_cost(u, arm, whole) == (0.42, False)
     # Content shorter than the stream's count: the stream's count stands, still a floor.
     assert benchrun.cell_spend(get_provider("claude").parse(cut), arm, tmp_path / "missing.jsonl")["cost_basis"] \
         == benchrun.STREAM_BASIS

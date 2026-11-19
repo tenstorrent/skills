@@ -51,14 +51,6 @@ WORKER_DEFAULT = "5m"   # what "auto" picks for a run no later run is likely to 
 # predecessor's whole run: about even (17 resumed runs). So no start-time rule saves here.
 
 
-def worker_setting(budget: dict) -> str:
-    """budget.worker_cache_ttl, the prompt cache lifetime of every run but the coordinator's: "5m" (the
-    default: a write at 1.25x input instead of 2x, and worker calls rarely sit 5 min apart), "1h", or
-    "off" (no setting: the agent's own default). Unset, "" or an unknown value is the default."""
-    v = str((budget or {}).get("worker_cache_ttl") or "").strip().lower()
-    return v if v in WORKER_TTLS and v != "auto" else WORKER_DEFAULT
-
-
 RESUMED_WINDOW_S = 3300   # how long after a 1h run ends its session is still read from cache (5 min short of 1 h)
 WARM_WINDOW_S = 240       # the same for a 5m run
 

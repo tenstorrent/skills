@@ -281,7 +281,7 @@ def test_plan_readings_of_another_plan_account_stop_counting_at_once(env):
     assert {w.window: w.utilization for w in wins} == {"seven_day": 86.0, "five_hour": 10.0}
     assert "7d 86%" in budget_line(p.db, now, "claude") and "7d avg 70%" in budget_line(p.db, now, "claude")
     _run(p, "acct-b | plan", now - 60)                  # the next run starts under another account
-    assert bud.plan_windows(p.db, now) == [] and bud.windows_from_snapshots(p.db, now) == []
+    assert bud.plan_windows(p.db, now) == []
     g = bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db, now), now)
     assert g.regime == "caps" and any("no plan readings of its own" in r for r in g.reasons), g.reasons
     assert g.numbers["spent_24h"] == 0 and g.level == "green", "the old plan's spend stays plan-billed"
@@ -291,8 +291,8 @@ def test_plan_readings_of_another_plan_account_stop_counting_at_once(env):
     # the new account reports: its windows count, and burn is measured from its readings alone
     _reading(p, now - 30, "acct-b | plan", "seven_day", 20.0, now + 2 * 86400)
     assert [(w.window, w.utilization) for w in bud.plan_windows(p.db, now)] == [("seven_day", 20.0)]
-    assert bud.burn_rate(p.db, "claude", "seven_day", now + 2 * 86400, now, "acct-b | plan") is None
-    assert bud.burn_rate(p.db, "claude", "seven_day", now + 2 * 86400, now) is not None, "both accounts mixed"
+    assert bud._slope(bud._readings(p.db, "claude", "seven_day", now + 2 * 86400, now, "acct-b | plan")) is None
+    assert bud._slope(bud._readings(p.db, "claude", "seven_day", now + 2 * 86400, now)) is not None, "both accounts mixed"
     g = bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db, now), now)
     assert g.regime == "windows" and g.numbers["utilization"] == 20.0, g.numbers
     assert budget_line(p.db, now, "claude", g.as_dict()).startswith("7d 20% - resets in")
@@ -1323,7 +1323,7 @@ def test_burn_rate_is_steady_across_whole_percent_readings(env):
         util = round(30 + 6 * (60 - minutes_ago) / 60)
         p.db.x("INSERT INTO snapshots(ts,provider,account,window,utilization,resets_at) VALUES(?,?,?,?,?,?)",
                (now - minutes_ago * 60, "claude", "a", "five_hour", util, resets))
-    rate = bud.burn_rate(p.db, "claude", "five_hour", resets, now)
+    rate = bud._slope(bud._readings(p.db, "claude", "five_hour", resets, now))
     assert 5.0 <= rate <= 7.0, rate
 
 
@@ -4895,7 +4895,7 @@ def test_a_plan_reading_is_filed_under_the_account_the_run_started_on(env, tmp_p
     assert accts == {want}, accts
     if now_acct == "plan-b":   # what status and the gate see once the daemon has looked at the login now
         p.db.set_kv(bud.ACCOUNT_KV + "claude", {"account": "plan-b", "ts": time.time()})
-        wins = [w for w in bud.windows_from_snapshots(p.db) if w.provider == "claude"]
+        wins = [w for w in bud.plan_windows(p.db) if w.provider == "claude"]
         held = bud.evaluate(p.db, p.config(), "claude", wins).level == "red"
         assert held == (want == "plan-b"), wins
 
