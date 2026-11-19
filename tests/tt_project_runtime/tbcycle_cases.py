@@ -667,6 +667,46 @@ def test_terminalbench_reference_rows_save_the_relays_faults_by_kind_and_its_bus
     assert line["relay"] == {"faults": {"rate_limit": 2, "malformed": 1}, "waits": 3, "gave_up": 1}
 
 
+class _MissingChat(_FakeChat):
+    missing_max = 0
+
+    def stats(self):
+        return {**super().stats(), "faults": {"model_missing": 3}}
+
+
+def test_terminalbench_chat_model_the_endpoint_does_not_list_ends_its_row_as_not_run_server_with_no_call(
+        env, monkeypatch):
+    from ttp import tbcycle
+    d, cfg, clock, sleeps, sleep = _tb_setup(env, monkeypatch, tasks=("t1", "t2", "t3", "t4"), reference={
+        "models": ["open-m"], "chat": ["open-m"], "run": "ns", "parallel": 1})
+    _FakeChat.made[:], _FakeChat.plan[:] = [], []
+    calls, asked = [], []
+    assert tbcycle.ref_runner(cfg, "open-m", {}, trial=_tb_trial(clock, {}, calls), clock=lambda: clock["t"],
+                              chat=_FakeChat, sleep=sleep, listed=lambda m: asked.append(m) or False) == 0
+    assert asked == ["open-m"] and calls == [] and _FakeChat.made == [], "no trial, no relay: zero task calls"
+    assert json.loads((tbcycle.ref_dir("ns") / "open-m.json").read_text())["not_run"] == tbcycle.NOT_SERVED
+    assert "not run (server: model not served)" in tbcycle.table("ns") and tbcycle.reference("ns") == []
+
+
+def test_terminalbench_chat_model_withdrawn_mid_row_ends_the_row_after_the_bounded_calls_without_reruns(
+        env, monkeypatch):
+    from ttp import tbcycle
+    d, cfg, clock, sleeps, sleep = _tb_setup(env, monkeypatch, tasks=("t1", "t2", "t3", "t4"), reference={
+        "models": ["open-m"], "chat": ["open-m"], "run": "mm", "parallel": 1})
+    _FakeChat.made[:], _FakeChat.plan[:] = [], [[]]   # the first trial's agent got no answer: a not-run trial
+    calls = []
+    assert tbcycle.ref_runner(cfg, "open-m", {}, trial=_tb_trial(clock, {}, calls), clock=lambda: clock["t"],
+                              chat=_MissingChat, sleep=sleep, listed=lambda m: True) == 0
+    assert calls == [("open-m", "t1")] and sleeps == [], "one trial, then no new trial, rerun or server probe"
+    assert [b.missing_max for b in _FakeChat.made] == [tbcycle.MISSING_MAX], "its relay passes on at most 3 such answers"
+    assert json.loads((tbcycle.ref_dir("mm") / "open-m.json").read_text())["not_run"] == tbcycle.NOT_SERVED
+    assert "not run (server: model not served)" in tbcycle.table("mm") and tbcycle.reference("mm") == []
+    assert tbcycle.ref_runner(cfg, "open-m", {}, trial=_tb_trial(clock, {}, calls), clock=lambda: clock["t"],
+                              chat=_FakeChat, sleep=sleep, listed=lambda m: True) == 4
+    assert "not_run" not in json.loads((tbcycle.ref_dir("mm") / "open-m.json").read_text()), "served again: runs on"
+    assert [r["model"] for r in tbcycle.reference("mm")] == ["open-m"]
+
+
 def test_terminalbench_schedule_stays_off_while_held_and_once_turned_off_on_purpose(env):
     from ttp import benchowner, schedule
     p = make(env)

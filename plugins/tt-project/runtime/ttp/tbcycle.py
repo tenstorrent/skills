@@ -74,6 +74,8 @@ from typing import Callable
 from . import schedjobs
 
 DIR, STATE, CYCLE_H, NEW_MODEL_H = "terminalbench", "state.json", 24.0, 3.0
+NOT_SERVED = "server: model not served"   # a chat row whose model the endpoint does not list: ended, not run (server)
+MISSING_MAX = 3   # model_missing answers a trial's relay passes on before it answers the 404 itself (Bridge.missing_max)
 NOT_RUN = "not_run"   # a bridge or chat trial with no model call or broken by failed calls (not_run): rerun, shown as not run
 RUNNER, REF_RUNNER, STOP_REASON = "terminalbench runner", "terminalbench reference runner", "bench.stop"
 REF, REF_FILE, REF_MODELS, REF_EFFORT = "reference", "reference.jsonl", ("claude-opus-5-5", "claude-sonnet-5-5"), "medium"
@@ -485,7 +487,8 @@ class EndpointLock:
 def ref_runner(cfg: dict, model: str, env: dict, *, trial: Callable | None = None, clock: Callable = time.time,
                bridge: Callable | None = None, chat: Callable | None = None, sleep: Callable = time.sleep,
                stop: Callable[[], str] | None = None, gate: Callable | None = None,
-               rerun_server: int = 0, lock: EndpointLock | None = None) -> int:
+               rerun_server: int = 0, lock: EndpointLock | None = None,
+               listed: Callable[[str], bool | None] | None = None) -> int:
     """Run `model`'s reference tasks (resuming), then book its row once; returns trials run. A booked model
     runs nothing (module doc). A bridge model gets the claude CLI's loopback server (bridge(model, effort)
     builds it), a chat model the chat endpoint's relay (chat(model)), one per trial so its server wait and
@@ -495,7 +498,11 @@ def ref_runner(cfg: dict, model: str, env: dict, *, trial: Callable | None = Non
     Capacity refusals over 20% lower the trials at once (benchbackoff). `rerun_server` N first reruns every
     task whose latest row is `server` (not scored), N at once, its new row replacing the old one.
     An endpoint or chat model takes reference.lock itself (EndpointLock, `lock` in tests) before each trial
-    and frees it during a stay-off wait (`gate(on_wait)`), which makes no model calls."""
+    and frees it during a stay-off wait (`gate(on_wait)`), which makes no model calls.
+    A chat model the endpoint's model list leaves out (`listed(model)` False: the relay's GET /models, as the
+    served-models check reads it) runs nothing; one a trial's relay finds missing mid-row (model_missing) starts
+    no more trials and no reruns, each relay passing on at most MISSING_MAX such answers. Either way meta gets
+    `not_run` NOT_SERVED (the table's state) and nothing is booked; a later start that finds it listed clears it."""
     import shutil
     from concurrent.futures import ThreadPoolExecutor
     from threading import Event, Lock
@@ -542,8 +549,22 @@ def ref_runner(cfg: dict, model: str, env: dict, *, trial: Callable | None = Non
         else:
             make = None
         cmd = harborslice.COMMAND if via in (BRIDGE_ROUTE, CHAT_ROUTE) else ref_command(meta["effort"])
+
+        def not_served() -> int:   # the endpoint does not serve the model: the row ends, not run (server)
+            meta["not_run"] = NOT_SERVED
+            durable_write(d / f"{sl}.json", json.dumps(meta))
+            if run:
+                write_table(run, s[REF]["note"])
+            return ran
+        if listed is None and trial is None and via == CHAT_ROUTE:
+            listed = lambda m: _listed(mk(m))   # noqa: E731
+        if listed is not None and listed(model) is False:
+            return not_served()   # before any trial: no task call
+        if meta.pop("not_run", None):   # served again: the row runs on
+            durable_write(d / f"{sl}.json", json.dumps(meta))
         hist = serverhealth.History(folder() / HISTORY)
         done, put, dead, halt, info = _rows(d / f"{sl}.jsonl", meta["tasks"]), Lock(), Event(), Event(), {}
+        gone = Event()   # a relay found the model missing mid-row: no more trials
 
         def attempt(t: str, n: int = 0) -> dict:
             if gate:   # a live stream on this host: the trial waits for it (occupancy.wait_free), lock freed
@@ -553,6 +574,8 @@ def ref_runner(cfg: dict, model: str, env: dict, *, trial: Callable | None = Non
             b, e, st, cost = None, env, {}, None
             try:
                 b = make() if make else None
+                if via == CHAT_ROUTE and hasattr(b, "missing_max"):
+                    b.missing_max = MISSING_MAX
                 if b is not None:
                     b.start()
                     e = {**env, **b.openai_env()}
@@ -610,8 +633,8 @@ def ref_runner(cfg: dict, model: str, env: dict, *, trial: Callable | None = Non
         def one(t, n=0):
             bo.slot()   # no new trial while more than the back-off level run; running ones are never stopped
             try:
-                if dead.is_set() or halt.is_set():
-                    return   # a trial died, or the bench is held or stopped: start no more
+                if dead.is_set() or halt.is_set() or gone.is_set():
+                    return   # a trial died, the model is gone, or the bench is held or stopped: start no more
                 if stop and stop():
                     halt.set()
                     return
@@ -620,6 +643,8 @@ def ref_runner(cfg: dict, model: str, env: dict, *, trial: Callable | None = Non
                 r = attempt(t, n)
                 keep(r)
                 bo.seen(r)
+                if ((r.get("relay") or {}).get("faults") or {}).get("model_missing"):
+                    gone.set()
             except BaseException:
                 dead.set()
                 raise
@@ -636,6 +661,8 @@ def ref_runner(cfg: dict, model: str, env: dict, *, trial: Callable | None = Non
             todo = [t for t in meta["tasks"] if (done.get(t) or {}).get("outcome") == serverhealth.OUTCOME]
             if todo:
                 pooled(todo, bo.level)
+                if gone.is_set():
+                    return not_served()
                 if halt.is_set():
                     return ran
                 ran += len(todo)
@@ -646,6 +673,8 @@ def ref_runner(cfg: dict, model: str, env: dict, *, trial: Callable | None = Non
             if not todo:
                 break
             pooled(todo, bo.level)
+            if gone.is_set():
+                return not_served()
             if halt.is_set():
                 return ran
             ran += len(todo)
@@ -688,6 +717,14 @@ def ref_runner(cfg: dict, model: str, env: dict, *, trial: Callable | None = Non
         if lock:
             lock.release()
         held.close()
+
+
+def _listed(bridge) -> bool | None:
+    """Whether the chat endpoint's GET /models lists the bridge's model (None: unknown); never the key or URL."""
+    try:
+        return bridge.model_listed()
+    except Exception:   # the check failing says nothing about the model
+        return None
 
 
 def not_run(r: dict) -> bool:
@@ -775,16 +812,19 @@ def table(run: str, note: str = "") -> str:
         if par.get("route") in KIND:  # rows booked before a wording change print today's wording
             par["kind"] = KIND[par["route"]]
         pars.append(par)
+        state = ("booked" if model in booked else f"not run ({m['not_run']})" if m.get("not_run")
+                 else "running or owed reruns")
         out.append(f"| {model} | {m.get('effort')} | {m.get('route')} | {sc['passed']} of {len(tasks)} "
                    f"| {lo:.0%}-{hi:.0%} | {sc['trials']} "
                    f"| {sc.get('server', 0)} | {sc['faults']} | {len(tasks) - len(latest)} | {n_cut} | {failed} "
                    f"| {_med([x.get('wait_median_s') for x in srv])} | {_med([x.get('tps_median') for x in srv])} "
                    f"| {round(cost, 2) if m.get('route') == BRIDGE_ROUTE else '-'} "
-                   f"| {'booked' if model in booked else 'running or owed reruns'} |")
+                   f"| {state} |")
     lims = sorted({str(p.get("limit_s")) for p in pars})
     out += ["", "Passed counts scored trials only; the denominator is the task count. Not run: no trial yet, or "
             "one whose agent made no model call, whose failed server calls broke it short of a pass, or that harbor "
-            "broke before grading. Failed calls: server calls that failed (stream or parse errors included) of all "
+            "broke before grading. State not run (server: model not served): the chat endpoint's model list left the model "
+            "out, before or during the row; nothing is scored or booked. Failed calls: server calls that failed (stream or parse errors included) of all "
             "calls, over every trial run, reruns included. 95% interval: the Wilson interval of passed of the task count; "
             "this is one run per model, so the bench cannot separate models whose intervals overlap. "
             f"Limit: {', '.join(lims) or '?'} "

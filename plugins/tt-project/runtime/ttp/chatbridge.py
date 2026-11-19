@@ -52,6 +52,7 @@ import json
 import re
 import secrets
 import socket
+import sys
 import threading
 import time
 import urllib.error
@@ -62,7 +63,8 @@ from . import endpoint, redact, serverhealth
 from .providers.base import challenged
 
 UPSTREAM_TIMEOUT_S = 600
-MODEL_CHECK_TIMEOUT_S = 10   # the /models check a bare 404 gets (_model_listed)
+CLIENT_GONE = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)   # the client hung up mid-answer
+MODEL_CHECK_TIMEOUT_S = 10   # the /models check a bare 404 gets (model_listed)
 STOP_REASONS = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use",
                 "function_call": "tool_use", "content_filter": "end_turn"}
 # An upstream's prompt-too-long answers: OpenAI's code and the wordings of common servers (OpenAI,
@@ -87,6 +89,10 @@ SWAP_ERRORS = 3   # 5xx or no-answer calls in a row that swap a model the served
 BUSY_RETRIES, BUSY_WAIT_S, BUSY_WAIT_MAX_S = 4, 180.0, 60.0
 RETRY_AFTER_RE = re.compile(r"retry\s+(?:after|in)\s+(\d+(?:\.\d+)?)\s*s", re.I)
 NEVER_FITS_RE = re.compile(r"request too large|insufficient.{0,20}(?:credit|quota|balance)", re.I)   # waiting cannot help
+
+
+class _ClientGone(Exception):
+    """The client hung up while the bridge wrote to it: no upstream fault (an upstream read's OSError is one)."""
 
 
 class BridgeError(Exception):
@@ -547,13 +553,30 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args) -> None:   # nothing logged: paths and headers stay out of any file
         pass
 
+    def handle_one_request(self) -> None:
+        try:
+            super().handle_one_request()
+        except (_ClientGone, *CLIENT_GONE):   # one line, no traceback: the caller left (e.g. its own timeout)
+            self.close_connection = True
+            print("chatbridge: the client hung up before its answer was written", file=sys.stderr, flush=True)
+
+    def _write(self, data: bytes) -> None:
+        try:
+            self.wfile.write(data)
+            self.wfile.flush()
+        except CLIENT_GONE as e:
+            raise _ClientGone() from e
+
     def _reply(self, code: int, body: dict) -> None:
         data = json.dumps(body).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+        except CLIENT_GONE as e:
+            raise _ClientGone() from e
+        self._write(data)
 
     def _authorized(self) -> bool:
         got = self.headers.get("x-api-key") or ""
@@ -604,7 +627,7 @@ class Bridge:
         self.token = secrets.token_urlsafe(24)
         self.last_fault, self.faults = "", {}   # the last call's endpoint fault kind (fault_of), counts
         self.upstream: dict = {}   # the last failed answer's HTTP status and error code (upstream_of)
-        self._listed: bool | None | str = ""    # _model_listed's answer, "" until asked
+        self._listed: bool | None | str = ""    # model_listed's answer, "" until asked
         self.standins = [s for s in standins or () if isinstance(s, dict) and s.get("model")]   # ranked, best first
         self.served = [str(d) for d in served or ()]   # state dirs whose served list (route.MODELS_FILE) is read
         self.mid_run: list[dict] = []   # each swap: {from, to, at, why}
@@ -615,6 +638,9 @@ class Bridge:
         # Passed-through OpenAI calls' usage (relay): their agents report none Claude-style, so the bridge counts.
         self.usage = {"calls": 0, "input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0}
         self.busy = {"waits": 0, "waited_s": 0.0, "gave_up": 0}   # capacity waits (busy_wait), for stats()
+        # After this many model_missing answers, later calls get the 404 here, never upstream (0: no cap; a
+        # bench row sets it so a withdrawn model's agents stop calling the endpoint: tbcycle.MISSING_MAX).
+        self.missing_max, self.missing_local = 0, 0
         self.calls = serverhealth.Calls()   # per call: server wait, output tokens, tokens/s (stats()["server"])
         self._sleep = time.sleep
         self.server: http.server.ThreadingHTTPServer | None = None
@@ -689,7 +715,7 @@ class Bridge:
 
     def _fault(self, status: int, detail: str = "") -> None:
         kind = fault_of(status, detail)
-        if kind == "error" and status == 404 and self._model_listed() is False:
+        if kind == "error" and status == 404 and self.model_listed() is False:
             kind = "model_missing"   # a bare 404, and the endpoint's /models leaves the model out
         self.last_fault = kind
         self.upstream = upstream_of(status, detail, self._key)
@@ -698,7 +724,7 @@ class Bridge:
         if kind:
             self.faults[kind] = self.faults.get(kind, 0) + 1
 
-    def _model_listed(self) -> bool | None:
+    def model_listed(self) -> bool | None:
         """Whether GET <base>/models lists this run's model (asked once per bridge), or None when the
         answer lists none or the check failed."""
         if self._listed == "":
@@ -786,6 +812,7 @@ class Bridge:
                 **({"busy": {**self.busy, "waited_s": round(self.busy["waited_s"], 1)}} if self.busy["waits"]
                    or self.busy["gave_up"] else {}),
                 **({"usage": dict(self.usage)} if self.usage["calls"] else {}),
+                **({"missing_local": self.missing_local} if self.missing_local else {}),
                 **({"server": self.calls.export()} if self.calls.rows else {})}
 
     def server_wait_s(self) -> float:
@@ -838,6 +865,12 @@ class Bridge:
                 used, fields, rejected = self.model, dict(self.fields), self.rejected
             if self._errs >= SWAP_ERRORS and self._swapped(used):   # e.g. a stream that broke 3 times
                 continue
+            if self.missing_max and self.faults.get("model_missing", 0) >= self.missing_max:
+                with self._swap_lock:
+                    self.missing_local += 1
+                h._reply(*error_for(404, f"the endpoint does not serve {used} (answered by the bridge after "
+                                         f"{self.missing_max} upstream answers said so)"))
+                return None
             req = make(used)
             try:
                 try:
@@ -916,7 +949,7 @@ class Bridge:
             h.send_header("Cache-Control", "no-cache")
             h.send_header("Transfer-Encoding", "chunked")
             h.end_headers()
-            usage, seen, broke = None, 0, False
+            usage, seen, status = None, 0, "ok"
             try:
                 for raw in resp:
                     if getattr(h, "ttp_call", None) is not None:
@@ -930,16 +963,15 @@ class Bridge:
                             pass
                     if line.startswith("data:"):   # no `event:` or comment lines: an OpenAI client reads them as broken data
                         data = (line + "\n\n").encode()
-                        h.wfile.write(b"%x\r\n%s\r\n" % (len(data), data))
-                        h.wfile.flush()
-                h.wfile.write(b"0\r\n\r\n")
-                h.wfile.flush()
+                        h._write(b"%x\r\n%s\r\n" % (len(data), data))
+                h._write(b"0\r\n\r\n")
                 self._ok()
-            except OSError:
+            except OSError:   # the upstream stream broke (a client hang-up is _ClientGone: handle_one_request)
                 self._fault(0)
-                broke = True
-            self._count(usage)
-            self._end_call(h, usage_of(usage)["output_tokens"] or seen // 120, "stream" if broke else "ok")
+                status = "stream"
+            finally:
+                self._count(usage)
+                self._end_call(h, usage_of(usage)["output_tokens"] or seen // 120, status)
 
     def _count(self, u) -> None:
         if not isinstance(u, dict):
@@ -980,8 +1012,7 @@ class Bridge:
 
         def send(data: bytes) -> None:
             if data:
-                h.wfile.write(b"%x\r\n%s\r\n" % (len(data), data))
-                h.wfile.flush()
+                h._write(b"%x\r\n%s\r\n" % (len(data), data))
 
         errored, seen = "", 0   # the failed call's kind (serverhealth.FAILED_KINDS) once the stream fails
         try:
@@ -1016,19 +1047,23 @@ class Bridge:
             if not errored:
                 self._ok()
                 send(st.end())
+        except _ClientGone:   # the client hung up: no upstream fault; handle_one_request logs it
             self._count(st.usage or None)
-            self._end_call(h, usage_of(st.usage)["output_tokens"] or seen // 120, errored or "ok")
-            h.wfile.write(b"0\r\n\r\n")
-            h.wfile.flush()
+            self._end_call(h, usage_of(st.usage)["output_tokens"] or seen // 120)
+            raise
         except (OSError, socket.timeout) as e:
             self._end_call(h, 0, "stream")
             self._fault(0)
             try:   # the upstream stream broke: say so in the stream, as the API does
                 send(_sse("error", error_for(0, self._scrub(str(e)))[1]))
-                h.wfile.write(b"0\r\n\r\n")
-            except OSError:
+                h._write(b"0\r\n\r\n")
+            except (OSError, _ClientGone):
                 pass
             h.close_connection = True
+            return
+        self._count(st.usage or None)
+        self._end_call(h, usage_of(st.usage)["output_tokens"] or seen // 120, errored or "ok")
+        h._write(b"0\r\n\r\n")
 
 
 def _chunk_error(data: dict, scrub) -> tuple[int, dict]:

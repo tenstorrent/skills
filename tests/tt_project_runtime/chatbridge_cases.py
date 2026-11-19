@@ -243,6 +243,98 @@ def test_chatbridge_unreachable_upstream_and_stream_error_chunk(mock_chat):
     assert ev[-1]["type"] == "error" and ev[-1]["error"]["type"] == "rate_limit_error"
 
 
+def test_chatbridge_answers_a_withdrawn_model_itself_after_missing_max_upstream_answers_say_so(mock_chat):
+    from ttp.chatbridge import Bridge
+    gone = {"error": {"message": "The model `m` does not exist", "type": "invalid_request_error"}}
+    up = mock_chat(*[(404, gone)] * 4)
+    with Bridge(up.url, _CB_KEY, "m") as b:
+        b.missing_max = 2
+        got = [_post(b, {"model": "m", "messages": [{"role": "user", "content": "hi"}]}, path="/v1/chat/completions")
+               for _ in range(4)]
+        st = b.stats()
+    assert [code for code, _ in got] == [404] * 4 and "does not serve m" in got[-1][1]
+    assert [x["path"] for x in up.seen if "body" in x] == ["/v1/chat/completions"] * 2, "only 2 calls went upstream"
+    assert st["faults"] == {"model_missing": 2} and st["missing_local"] == 2
+
+
+class _SlowChat:
+    """An upstream that answers after `delay_s`: a 400 error, or SSE chunks spaced `delay_s` apart."""
+
+    def __init__(self, delay_s, chunks=None):
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                time.sleep(delay_s)
+                if chunks is None:
+                    data = json.dumps({"error": {"message": "bad request", "type": "invalid_request_error"}}).encode()
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                try:
+                    for c in chunks:
+                        self.wfile.write(b"data: " + json.dumps(c).encode() + b"\n\n")
+                        self.wfile.flush()
+                        time.sleep(delay_s)
+                    self.wfile.write(b"data: [DONE]\n\n")
+                except OSError:
+                    pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}/v1"
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def _hang_up(bridge, path, body, after=b""):
+    """POST `body`, read until `after` arrives (nothing: read nothing), then close with a reset (SO_LINGER 0)."""
+    import struct
+    data = json.dumps(body).encode()
+    c = socket.create_connection(bridge.server.server_address, timeout=10)
+    c.sendall(b"POST %s HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nx-api-key: %s\r\n"
+              b"Content-Length: %d\r\n\r\n%s" % (path.encode(), bridge.token.encode(), len(data), data))
+    got = b""
+    while after and after not in got:
+        got += c.recv(4096)
+    c.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    c.close()
+
+
+@pytest.mark.parametrize("path, stream", [("/v1/chat/completions", False), ("/v1/messages", False),
+                                          ("/v1/chat/completions", True), ("/v1/messages", True)])
+def test_chatbridge_logs_one_line_without_a_traceback_when_the_client_hangs_up_mid_answer(path, stream, capfd):
+    from ttp.chatbridge import Bridge
+    chunk = {"choices": [{"delta": {"content": "part"}}]}
+    up = _SlowChat(0.3, [chunk] * 5 if stream else None)
+    try:
+        with Bridge(up.url, _CB_KEY, "m") as b:
+            body = {"model": "m", "max_tokens": 5, "messages": [{"role": "user", "content": "hi"}],
+                    **({"stream": True} if stream else {})}
+            _hang_up(b, path, body, after=b"part" if stream else b"")
+            time.sleep(1.5 if stream else 0.8)   # the bridge writes to the reset socket once upstream answers
+            st = b.stats()
+            code, _ = _post(b, {"messages": []}, path="/v1/messages/count_tokens")
+        err = capfd.readouterr().err
+    finally:
+        up.close()
+    assert err.count("the client hung up before its answer was written") == 1, err
+    assert "Traceback" not in err and "Exception occurred" not in err, err
+    assert code == 200, "the bridge still answers the next client"
+    if stream:
+        assert st["faults"] == {}, "the client leaving mid-stream is no upstream fault"
+
+
 def test_chatbridge_serves_only_the_run_token_on_loopback(mock_chat):
     from ttp.chatbridge import Bridge
     up = mock_chat()
