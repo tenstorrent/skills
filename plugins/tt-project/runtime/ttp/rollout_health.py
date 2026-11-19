@@ -19,6 +19,7 @@ import re
 import statistics
 import subprocess
 import time
+from pathlib import Path
 
 from . import postland, pushq, rollout
 
@@ -128,19 +129,58 @@ def _reverted_files(repo: str | None, spec: str) -> set[str] | None:
     return set(got.stdout.split()) if got.returncode == 0 else None
 
 
+def _by_arm(db, title: str, arm: str) -> bool:
+    """Whether the change a revert task's title names (`Revert #<review> ttp/t<task>-...`) ran on `arm`: a
+    worker run of its review or of the branch's task on that model (only "glm" so far)."""
+    from . import glmshare
+    ids = {int(x) for x in re.findall(r"#(\d+)", title)} | {int(x) for x in re.findall(r"\bttp/t(\d+)-", title)}
+    if arm != "glm" or not ids:
+        return False
+    rows = db.q(f"SELECT provider, model, note FROM runs WHERE task IN ({','.join('?' * len(ids))})", tuple(ids))
+    return any(glmshare.on_glm(r["provider"], r["model"], r["note"]) for r in rows)
+
+
+def _tests_hit(db, repo: str | None, title: str, meta: dict) -> bool:
+    """Whether a test whose failure caused the revert exercises the flag's gated code: it lies in a gated
+    module's case file (tests/tt_project_runtime/<module>_cases.py) or its body names the flag's key. The
+    failing tests are read from the revert's fix task (postland.apply)."""
+    fix = db.q("SELECT spec FROM tasks WHERE title=? ORDER BY id DESC LIMIT 1", ("Fix " + title[len("Revert "):],))
+    m = re.search(r"Its failing tests, the only ones to rerun: (.*)", fix[0]["spec"] if fix else "")
+    names = {i.split("::")[-1].split("[")[0] for i in (m.group(1).split() if m else ())}
+    if not names or not repo:
+        return False
+    cases = {f"{c.rsplit('/', 1)[-1][:-3]}_cases.py" for c in meta.get("code") or ()}
+    for f in (Path(repo) / "tests").rglob("*.py"):
+        try:
+            text = f.read_text(errors="replace")
+        except OSError:
+            continue
+        for n in names:
+            at = text.find(f"def {n}(")
+            if at < 0:
+                continue
+            end = text.find("\ndef ", at + 1)
+            if f.name in cases or meta["key"] in text[at:end if end > 0 else None]:
+                return True
+    return False
+
+
 def _reverts(db, since: float, now: float, flag: str | None, repo: str | None) -> tuple[list[str], list[str]]:
     """(the revert tasks that count against `flag`, those whose reverted commit cannot be resolved). A revert
     counts only when the commit it reverted changed a file of the flag's gated code (rollout.FLAGS[flag]["code"]);
-    an unresolved one counts against no flag."""
+    an unresolved one counts against no flag. A model-route flag (its `arm`) also needs the change to have run
+    on that arm (_by_arm) or a failing test to exercise its gated code (_tests_hit): a change made on another
+    arm that only touched its files never counts."""
     meta = rollout.FLAGS.get(flag or "", {})
     code = set(meta.get("code") or ())
     hit, unknown = [], []
-    for r in db.q("SELECT id, spec FROM tasks WHERE title LIKE ? ESCAPE '\\' AND created>=? AND created<?",
+    for r in db.q("SELECT id, title, spec FROM tasks WHERE title LIKE ? ESCAPE '\\' AND created>=? AND created<?",
                   ("Revert %" + postland.REVERT_TITLE_TAIL.replace("%", "\\%").replace("_", "\\_"), since, now)):
         files = _reverted_files(repo, r["spec"])
         if files is None:
             unknown.append(f"#{r['id']}")
-        elif code and files & code:
+        elif code and files & code and (not meta.get("arm") or _by_arm(db, r["title"], meta["arm"])
+                                         or _tests_hit(db, repo, r["title"], meta)):
             hit.append(f"#{r['id']}")
     return hit, unknown
 

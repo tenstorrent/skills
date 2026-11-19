@@ -5340,7 +5340,10 @@ alerts the router acts on itself by demoting the model; they never reach the ale
 on the generic signals alone); landing-path alerts do
 not roll back a flag of another area, whose landing health the generic signals already cover; a forward revert by the
 post-landing checks of a landed change that touched a file the flag gates (its `code` list; a member reverted
-before landing is routine and not counted, and a revert whose commit cannot be read counts against no flag); or a task running with no run and no change for 2 h. A shadow flag (`shadow` in `ttp rollout status`: it only
+before landing is routine and not counted, and a revert whose commit cannot be read counts against no flag; a
+model-route flag such as `glm_code`, `glm_work` or `glm_coord` counts it only when the change ran on its model, by
+the run records of its task and review, or when a failing test lies in a gated module's case file or names the
+flag's key, so a change made on another model that only touched those files never freezes it); or a task running with no run and no change for 2 h. A shadow flag (`shadow` in `ttp rollout status`: it only
 records beside the normal path, posts nothing, changes no run and makes no model call; `eta_history` is one) is
 judged on none of these: the watch never rolls it back, and `ttp rollout rollback` by hand still does. The
 limits are settings (`rollout.thresholds`: `failed_runs_pts`, `min_runs`, `land_time_x`, `cost_x`,

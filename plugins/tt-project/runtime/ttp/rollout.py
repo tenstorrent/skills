@@ -37,6 +37,8 @@ OVERRIDE_KV = "rollout_override_told"   # a project's {flag: day} of the last ov
 # name: the feature's existing config key it gates, its area, and `code`: the files holding its on() call sites
 # and the code reading its key, relative to the repo root. The health watch counts a post-landing revert against a
 # flag only when the reverted commit touched one of them (rollout_health); a flag with no wiring yet has none.
+# `arm`: a model-route flag's model; such a revert also counts only when the change ran on it or a failing test
+# exercises the flag's code (rollout_health._reverts).
 # `shadow` marks a flag that only records beside the real behaviour (it posts nothing, changes no run and makes no
 # model call), so no health signal judges it (rollout_health.signals). A flag whose feature already runs for every
 # project graduates (leaves this list), never gating it off: push_isolation, the push batch survival (a reliability
@@ -49,13 +51,15 @@ def _code(*names: str) -> tuple[str, ...]:
 
 
 FLAGS: dict[str, dict[str, Any]] = {
-    "glm_code": {"key": "route.code_sonnet.glm_share", "area": "route", "code": _code("codearm.py"), "waves": True},
+    "glm_code": {"key": "route.code_sonnet.glm_share", "area": "route", "code": _code("codearm.py"), "waves": True,
+                 "arm": "glm"},
     # The project's routed work on GLM (glmwork.py); `waves`: it may run at auto, judged by glmshare.judge.
     "glm_work": {"key": "route.glm_work.on", "area": "route", "code": _code("glmwork.py", "codearm.py", "daemon.py"),
-                 "waves": True},
+                 "waves": True, "arm": "glm"},
     # Routine coordinator wakes on the chat model (coordroute.py): a ring runs them in shadow only (a read-only
     # lane turn beside the coordinator's own, nothing applied); live mode is the project's own setting.
-    "glm_coord": {"key": "coordinator.routine.mode", "area": "coordinator", "code": _code("coordroute.py", "daemon.py")},
+    "glm_coord": {"key": "coordinator.routine.mode", "area": "coordinator", "code": _code("coordroute.py", "daemon.py"),
+                  "arm": "glm"},
     "eta_history": {"key": "eta.history", "area": "eta", "shadow": True,
                     "code": _code("etaledger.py", "costlevers.py", "cli.py")},
     "device_prewarm": {"key": "device.prewarm", "area": "device", "code": ()},

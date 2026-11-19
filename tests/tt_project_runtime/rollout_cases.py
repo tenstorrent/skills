@@ -558,7 +558,7 @@ def _ro_repo(tmp_path, *changed):
     repo = tmp_path / "repo"
     (repo / _RT).mkdir(parents=True)
     _git(tmp_path, "init", "-q", str(repo))
-    for n in ("etaledger.py", "deslop.py", "daemon.py", "sched.py", "costlevers.py"):
+    for n in ("etaledger.py", "deslop.py", "daemon.py", "sched.py", "costlevers.py", "codearm.py"):
         (repo / _RT / n).write_text("x = 0\n")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-qm", "base")
@@ -595,6 +595,46 @@ def test_a_revert_counts_only_against_a_flag_whose_gated_code_the_reverted_commi
     got = _revert_count(p, "deslop", repo)
     assert len(got["failing"]) == 1 and "1 forward revert(s) of a landed change" in got["failing"][0]
     assert _revert_count(p, "output_trim", repo)["failing"] == [], "another flag's code is not this one's"
+
+
+def _ro_authored(p, spec, provider, model, failing=""):
+    """A code task run on `provider`/`model`, the post-landing revert of its landing and the revert's fix task
+    naming the failing tests (postland.apply)."""
+    import json
+    t = p.db.add_task("code: x", "s", kind="code", status="done")
+    p.db.x("INSERT INTO runs(task,role,provider,model,started,status,cost_usd,note) VALUES(?,?,?,?,?,?,?,?)",
+           (t, "worker", provider, model, time.time(), "done", 0.0, json.dumps({})))
+    who = f"#{t + 100} ttp/t{t}-x"
+    p.db.add_task(f"Revert {who}: post-landing tests fail", spec, kind="review", status="pushing")
+    p.db.add_task(f"Fix {who}: post-landing tests fail", f"Its failing tests, the only ones to rerun: {failing}\n",
+                  kind="code")
+
+
+def test_a_revert_freezes_a_model_route_flag_only_when_its_arm_made_the_change_or_its_tests_failed(env, tmp_path):
+    # cells: other_arm_revert, glm_arm_revert, gated_test_revert
+    from pathlib import Path
+    p = make(env)
+    repo, spec = _ro_repo(tmp_path, "codearm.py", "deslop.py", "sched.py")
+    (Path(repo) / "tests" / "tt_project_runtime").mkdir(parents=True)
+    (Path(repo) / "tests" / "tt_project_runtime" / "codearm_cases.py").write_text("def test_arm(env):\n    pass\n")
+    (Path(repo) / "tests" / "test_other.py").write_text(
+        "def test_unrelated(env):\n    pass\n\n\ndef test_share(env):\n    set_('route.code_sonnet.glm_share')\n")
+    _ro_authored(p, spec, "claude", "claude-opus-5-5", "tests/test_other.py::test_unrelated tests/x.py::test_gone[a]")
+    got = _revert_count(p, "glm_code", repo)
+    assert got["failing"] == [] and got["unattributed"] == [], "a claude-arm change touching codearm.py: no freeze"
+    assert len(_revert_count(p, "deslop", repo)["failing"]) == 1, "a flag with no arm still counts touched files"
+    for failing in ("tests/test_tt_project_runtime.py::test_arm", "tests/test_other.py::test_share[x]"):
+        p.db.x("DELETE FROM tasks WHERE title LIKE 'Revert %' OR title LIKE 'Fix %'")
+        _ro_authored(p, spec, "claude", "claude-opus-5-5", failing)
+        assert len(_revert_count(p, "glm_code", repo)["failing"]) == 1, f"{failing} exercises the flag's code"
+    p.db.x("DELETE FROM tasks WHERE title LIKE 'Revert %' OR title LIKE 'Fix %'")
+    _ro_authored(p, spec, "chat", "glm-5.3", "tests/test_other.py::test_unrelated")
+    got = _revert_count(p, "glm_code", repo)
+    assert len(got["failing"]) == 1 and "forward revert(s) of a landed change" in got["failing"][0]
+    repo2, spec2 = _ro_repo(tmp_path / "b", "sched.py")
+    p.db.x("DELETE FROM tasks WHERE title LIKE 'Revert %' OR title LIKE 'Fix %'")
+    _ro_authored(p, spec2, "chat", "glm-5.3")
+    assert _revert_count(p, "glm_code", repo2)["failing"] == [], "a GLM change outside the flag's code: as before"
 
 
 def test_a_revert_of_a_run_schedules_change_does_not_trip_the_eta_flag_in_shadow(env, tmp_path):
