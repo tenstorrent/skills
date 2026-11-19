@@ -177,11 +177,11 @@ def _ready_followups(db, now: float) -> list[dict]:
         later = db.q("SELECT id, title, spec FROM tasks WHERE id>?", (src["id"],))
         for i, title in enumerate(titles):
             out.append({"key": f"f{src['id']}.{i}", "what": f"follow-up {title[:160]!r} of #{src['id']}",
-                        "created": float(src["ended"]), "owners": _owners(later, title)})
+                        "created": float(src["ended"]), "owners": _taken_by(later, title)})
     return out
 
 
-def _owners(later, title: str) -> list[int]:
+def _taken_by(later, title: str) -> list[int]:
     """The tasks of `later` titled as follow-up `title` (with or without a `ready:` prefix) or whose spec quotes it."""
     step = READY_TITLE.sub("", title).strip().lower()
     quotes = [title.lower()] + ([step] if len(step) >= 20 else [])   # a short step text matches by chance
@@ -191,7 +191,7 @@ def _owners(later, title: str) -> list[int]:
 
 def open_followups(db, now: float) -> list[dict]:
     """Each follow-up a hand-off proposed (any task kind) in the last MAX_AGE_S whose followup_proposed event a
-    turn or gate has handled, that no later task took up (_owners) and the coordinator did not drop
+    turn or gate has handled, that no later task took up (_taken_by) and the coordinator did not drop
     (drop_followup): {id (the event), task, title}. A folded one, a `continue:` one (check_unqueued_continues)
     and an `upstream:` one (filed by the daemon) are left out: each has its own owner."""
     out = []
@@ -203,7 +203,7 @@ def open_followups(db, now: float) -> list[dict]:
                       and str(f["title"])[:200] in e["text"]), None) if isinstance(fups, list) else None
         if not title or re.match(r"(?i)\s*(continue|upstream)\s*:", title):
             continue
-        if not _owners(db.q("SELECT id, title, spec FROM tasks WHERE id>?", (e["task"],)), title):
+        if not _taken_by(db.q("SELECT id, title, spec FROM tasks WHERE id>?", (e["task"],)), title):
             out.append({"id": e["id"], "task": e["task"], "title": title})
     return out
 
