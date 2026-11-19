@@ -10,6 +10,9 @@ Completion requirements:
 - Assemble the complete inference graph declared by the contract.
 - Preserve advertised input shapes and raw output semantics.
 - Compare every declared raw output against PyTorch.
+- For outputs downstream of top-k selection, run both normal selectors and align their outputs by
+  upstream candidate index before PCC. Record shared and unmatched candidates; validate selection
+  coverage and order semantics separately. Never inject reference indices into TTNN acceptance runs.
 - Run full-model parity for every declared configuration.
 - Reject checkpoint-specific hardcoded dimensions or layer counts.
 - Test representative real weights and inputs.

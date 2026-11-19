@@ -11,6 +11,9 @@ Completion requirements:
 - Validate task postprocessing separately.
 - Run every metric declared by the contract.
 - Run task metrics for every declared configuration.
+- If the pinned dataset is absent locally, check its authoritative source, access terms and storage;
+  download and verify it in ignored local artifacts when obtainable, then run the full metric.
+  Record the exact access failure if it cannot be obtained; local absence alone is not a blocker.
 - Compare TTNN and upstream results using identical samples.
 - Record sample counts, seeds, preprocessing and thresholds.
 - Update MODEL_DIR/README.md with final structure and evidence.

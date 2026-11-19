@@ -31,6 +31,23 @@ parallelize, serve or release the model.
 11. Run the contract's task metric.
 12. Run `$stage-review` and repair every finding.
 
+When top-k selection determines a downstream tensor's query axis, run the reference and TTNN
+selectors independently and retain each selected candidate's upstream index. Always align the
+downstream tensors by those indices before computing PCC; comparing rank positions can pair
+different candidates. Do not supply reference indices to the TTNN inference path for an
+acceptance test. Report the shared count, each selected count, and unmatched candidates
+separately. Aligned PCC on shared candidates alone does not establish end-to-end correctness:
+assess selection coverage, run the contract's task metric at its stage, and check rank order
+separately if it is part of the declared output semantics.
+
+When a required source, checkpoint, or evaluation dataset is missing locally, look for an
+existing copy and then check the contract's authoritative source, access terms, download size,
+and available storage. If it can be fetched, download it into an ignored local artifact directory,
+verify its integrity and expected contents, record its source and version, and continue the
+declared validation. Do not stop at "not available locally" or substitute a smaller sample for
+the required metric. Record a blocked metric with the exact failed access or download attempt
+only when the asset cannot be obtained; never commit downloaded weights or datasets.
+
 ## Required boundaries
 
 - Default to batch one and single-chip.

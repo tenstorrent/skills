@@ -76,6 +76,8 @@ and asks for approval to install them.
 The entrypoint first routes text, vision, multimodal and unsupported categories. Text retains its
 existing stage workflow. Vision uses a pinned model contract and supports functional-only
 single-chip bring-up without mandatory optimization, multichip or serving work.
+For top-k-driven vision outputs, parity aligns downstream tensors by selected candidate index
+and reports selection coverage separately.
 
 The stage skills support Codex and Claude Code; automated multi-goal execution uses Codex.
 See the [Agentic Research guide](docs/agentic-research/getting-started.md#model-bring-up) for how to
