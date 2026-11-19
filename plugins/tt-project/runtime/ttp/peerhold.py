@@ -41,12 +41,13 @@ def state(p, now: float | None = None) -> dict | None:
     """{"held": bool, "why": str, "until": epoch or None} of project `p` (a Project), or None when its
     records cannot be read here. `until` None while held: no known end (the user or a cap lifts it)."""
     from . import budget as bud, projpause
+    from .globalcap import connect_ro
     now = time.time() if now is None else now
     path = Path(p.state) / "project.db"
     if not path.is_file():
         return None
     try:
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
+        conn = connect_ro(path, timeout=2)
     except sqlite3.Error:
         return None
     try:

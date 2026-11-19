@@ -17,12 +17,12 @@ usual pattern to go by and the answer is "now" (`fallback`).
 """
 from __future__ import annotations
 
-import sqlite3
 import time
 from datetime import datetime
 from pathlib import Path
 
 from . import timefmt
+from .globalcap import connect_ro
 
 DAYS = 14
 MIN_MESSAGES = 20
@@ -37,7 +37,7 @@ USER_SQL = ("SELECT ts FROM messages WHERE direction='in' AND kind='user' AND ts
 
 def user_times(db_path: Path, since: float) -> list[float]:
     """Timestamps of the user's messages since `since`, read-only (a run may not write the database)."""
-    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10)
+    con = connect_ro(db_path, timeout=10)
     try:
         return [r[0] for r in con.execute(USER_SQL, (since,))]
     finally:
@@ -46,7 +46,7 @@ def user_times(db_path: Path, since: float) -> list[float]:
 
 def last_user_time(db_path: Path) -> float | None:
     """When the user last wrote in the project's chat (any time back), read-only; None if never."""
-    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10)
+    con = connect_ro(db_path, timeout=10)
     try:
         return con.execute(USER_SQL.replace("SELECT ts", "SELECT MAX(ts)", 1), (0,)).fetchone()[0]
     finally:

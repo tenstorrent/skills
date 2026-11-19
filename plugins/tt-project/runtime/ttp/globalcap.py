@@ -55,8 +55,10 @@ import math
 import os
 import re
 import shlex
+import shutil
 import sqlite3
 import subprocess
+import tempfile
 import threading
 import time
 from datetime import date, datetime, timedelta
@@ -191,13 +193,79 @@ def _rows(conn: sqlite3.Connection, start: float, end: float, memo: dict | None 
     return [{"provider": p, "key": k, "usd": round(u, 4)} for (p, k), u in out.items()]
 
 
+SNAPSHOT_KEEP_S = 86400   # a stopped project's read snapshot unused this long is removed
+
+
+def daemon_running(state: Path) -> bool:
+    """The project whose state folder is `state` has its daemon running: its pid file names a live
+    process (a clean stop removes the file)."""
+    try:
+        pid = int((Path(state) / "daemon.pid").read_text().strip())
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except (OSError, ValueError):
+        return False
+    return not project.zombie(pid)
+
+
+def _snapshot(path: Path, wal: Path) -> Path | None:
+    """A private copy of a stopped project's database with its -wal folded in, made in this machine's
+    tt-project folder and reused while neither file changes (the -wal header's salts change on every
+    reset, its size on every commit); None when the files kept changing while copied."""
+    def stamp():
+        with open(wal, "rb") as fh:
+            head = fh.read(32)
+        d, w = path.stat(), wal.stat()
+        return hashlib.sha256(repr((d.st_size, d.st_mtime_ns, w.st_size, w.st_mtime_ns, head)).encode()).hexdigest()[:16]
+    root = project.HOME_DIR / "ro-snapshots"
+    name = hashlib.sha256(str(path).encode()).hexdigest()[:16]
+    before = stamp()
+    snap = root / f"{name}-{before}.db"
+    if snap.is_file():
+        return snap
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(dir=root))
+    try:
+        shutil.copyfile(path, tmp / "s.db")
+        shutil.copyfile(wal, tmp / "s.db-wal")
+        if stamp() != before:
+            return None
+        conn = sqlite3.connect(tmp / "s.db")
+        try:
+            conn.execute("PRAGMA journal_mode=DELETE")   # replays the copied -wal into the copy
+        finally:
+            conn.close()
+        os.replace(tmp / "s.db", snap)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    now = time.time()
+    for old in root.glob("*.db"):
+        try:
+            if old != snap and (old.name.startswith(f"{name}-") or now - old.stat().st_atime > SNAPSHOT_KEEP_S):
+                old.unlink()
+        except OSError:
+            pass
+    return snap
+
+
 def connect_ro(path: Path, timeout: float = 5) -> sqlite3.Connection:
-    """Another project's database, opened without writing a byte of it. While it has a -wal file (its
-    daemon or a command has it open) as an ordinary reader (mode=ro); otherwise as immutable, since
-    even a read-only reader of a WAL database creates its -wal and -shm files."""
+    """Another project's database, read without creating or changing a file in its folder. Its daemon
+    running (daemon_running): an ordinary read-only reader (mode=ro), seeing the newest commits.
+    Stopped: even a read-only reader of a WAL database maps and rewrites its -shm and makes the -wal
+    and -shm files when they are gone, so it is read immutable, and while its -wal holds frames (an
+    unclean stop; immutable would miss those commits) from a private copy with the -wal folded in."""
     path = Path(path).absolute()
-    wal = path.with_name(path.name + "-wal").exists()
-    return sqlite3.connect(f"{path.as_uri()}?{'mode=ro' if wal else 'immutable=1'}", uri=True, timeout=timeout)
+    if not daemon_running(path.parent):
+        wal = path.with_name(path.name + "-wal")
+        snap = None
+        try:
+            if wal.stat().st_size:
+                snap = _snapshot(path, wal)
+        except OSError:
+            pass
+        return sqlite3.connect(f"{(snap or path).as_uri()}?immutable=1", uri=True, timeout=timeout)
+    return sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=timeout)
 
 
 def _read_only(path: Path, start: float, end: float) -> list[dict]:

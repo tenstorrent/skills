@@ -570,7 +570,7 @@ def tt_sessions(since: float) -> tuple[set[str], list[str]]:
     ids, errors = set(), []
     for name, db in gcap.local_projects():
         try:
-            conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+            conn = gcap.connect_ro(db)
         except sqlite3.Error as e:
             errors.append(f"{name}: {e}")
             continue

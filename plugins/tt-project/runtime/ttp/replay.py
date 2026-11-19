@@ -32,6 +32,7 @@ import time
 from pathlib import Path
 
 from . import eventhold, urgent
+from .globalcap import connect_ro
 from .coordinator import batchable
 
 STEP_S = 5.0
@@ -39,7 +40,7 @@ QUIET_KINDS = frozenset({"checks_slot_wait", "task_waiting"})   # with a plain t
 
 
 def load(db_path: Path, days: float, now: float | None = None) -> dict:
-    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    con = connect_ro(db_path)
     con.row_factory = sqlite3.Row
     now = time.time() if now is None else now
     since = now - days * 86400

@@ -21,7 +21,6 @@ from __future__ import annotations
 import re
 import sqlite3
 import time
-from pathlib import Path
 
 from . import reask, timefmt
 
@@ -128,13 +127,10 @@ def open_ro(db_path) -> sqlite3.Connection:
 
 
 def open_foreign(db_path) -> sqlite3.Connection:
-    """Another project's database, read without creating or changing a file in its folder. A plain
-    read-only open of a WAL database whose -wal or -shm file is gone (its daemon closed it cleanly)
-    creates both and leaves them there, so it is opened immutable then; with both present (its
-    daemon runs) it is read as usual, seeing the newest writes."""
-    path = Path(db_path).absolute()
-    live = Path(f"{path}-wal").exists() and Path(f"{path}-shm").exists()
-    return sqlite3.connect(f"{path.as_uri()}?mode=ro{'' if live else '&immutable=1'}", uri=True, timeout=10)
+    """Another project's database, read without creating or changing a file in its folder
+    (globalcap.connect_ro)."""
+    from .globalcap import connect_ro
+    return connect_ro(db_path, timeout=10)
 
 
 def line(m: dict, where) -> str:

@@ -82,7 +82,7 @@ def real_usd(r, run_dir: Path) -> float:
 def project_split(db_path: Path, start: float, end: float) -> dict:
     """{class: {"booked", "real", "runs"}} of the project's runs that ended in [start, end)."""
     out = {k: {"booked": 0.0, "real": 0.0, "runs": 0} for k in CLASSES}
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
+    conn = gcap.connect_ro(db_path)
     conn.row_factory = sqlite3.Row
     try:
         kinds = {t: k for t, k in conn.execute("SELECT id, kind FROM tasks")}

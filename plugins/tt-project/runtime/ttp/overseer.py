@@ -66,7 +66,8 @@ WAKE_TIMEOUT_S = 180
 def _ro_db(path: Path):
     """A db.DB over a read-only connection: its query helpers (ready_tasks, kv) without its writes."""
     from . import db as dbm
-    conn = sqlite3.connect(f"{Path(path).absolute().as_uri()}?mode=ro", uri=True, timeout=BUSY_MS / 1000)
+    from .globalcap import connect_ro
+    conn = connect_ro(path, timeout=BUSY_MS / 1000)
     conn.execute(f"PRAGMA busy_timeout={BUSY_MS}")
     conn.row_factory = sqlite3.Row
     d = dbm.DB.__new__(dbm.DB)
