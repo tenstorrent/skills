@@ -28,7 +28,8 @@ source registered for a box the answer is free and nothing changes.
 
 Readings are shared in ~/.tt-project/occupancy-readings.json (each source read at most every CACHE_S),
 with each source's live spans for the last HISTORY_S, which the daemon's watchdog (watch) intersects
-with this project's own jobs on the box (activity.py): an overlap posts at once at high severity.
+with this project's own jobs on the box (activity.py): an overlap posts at once at high severity. An
+unknown read holds the box but charges no job: an overlap with it is one low line per source.
 
 New starts wait or move (wait_free, wait_here): `ttp lock`, `ttp detach`, checks, Terminal-Bench trials
 and harness A/B cells look again every POLL_S until the box is free, or start on an allowed free host.
@@ -208,6 +209,25 @@ def read_source(src: dict, now: float | None = None) -> tuple[str, str]:
     return _read_file(src, now) if src.get("file") else _read_cmd(src)
 
 
+def _step_spans(spans, on: bool, now: float) -> list:
+    """`spans` ([start, end or None]) after one read: an open span while `on`, closed at the first read off."""
+    spans = [s for s in spans or [] if s[1] is None or now - s[1] < HISTORY_S]
+    if on:
+        if not spans or spans[-1][1] is not None:
+            spans.append([now, None])
+    elif spans and spans[-1][1] is None:
+        spans[-1][1] = now
+    return spans[-200:]
+
+
+def _live_spans(rec: dict) -> list:
+    """The spans the source read live: an unknown read holds the box (spans) but never charges a job to a
+    stream. A record written before live spans were kept counts its spans only when its last hold was live."""
+    if "live_spans" in rec:
+        return rec.get("live_spans") or []
+    return (rec.get("spans") or []) if rec.get("live_state") == "live" else []
+
+
 def _reading(proj: str, alias: str, src: dict, now: float, fresh: bool) -> dict:
     """The source's shared reading, read again when older than CACHE_S (or `fresh`); its live spans kept."""
     key = f"{proj}:{alias}"
@@ -219,13 +239,10 @@ def _reading(proj: str, alias: str, src: dict, now: float, fresh: bool) -> dict:
     with _locked():
         doc = _load(READINGS)
         rec = doc.get(key) or {}
-        spans = [s for s in rec.get("spans") or [] if s[1] is None or now - s[1] < HISTORY_S]
-        if state in ("live", "unknown"):   # unknown counts as live: never a silent pass
-            if not spans or spans[-1][1] is not None:
-                spans.append([now, None])
-        elif spans and spans[-1][1] is None:
-            spans[-1][1] = now
-        rec = {"state": state, "detail": detail, "at": now, "spans": spans[-200:],
+        spans = _step_spans(rec.get("spans"), state in ("live", "unknown"), now)   # unknown holds: never a silent pass
+        live = _step_spans(_live_spans(rec), state == "live", now)   # what the watchdog charges jobs to
+        rec = {"state": state, "detail": detail, "at": now, "spans": spans, "live_spans": live,
+               "real_detail": detail if state == "live" else rec.get("real_detail"),
                "last_live": now if state != "free" else rec.get("last_live"),
                # what the source said at its last live or unknown read (a real clip, or a fail-safe hold)
                "live_state": state if state != "free" else rec.get("live_state"),
@@ -437,14 +454,16 @@ def text(res: dict) -> str:
 
 # --- Watchdog -------------------------------------------------------------------------------------
 
-def _live_windows(rec: dict, now: float) -> list[tuple[float, float]]:
+def _live_windows(rec: dict, now: float, held: bool = False) -> list[tuple[float, float]]:
+    """The source's live spans plus its quiet window; `held`: every span that held the box, unknown too."""
     quiet = float(rec.get("quiet_s", QUIET_S))
-    return [(float(a), (float(b) if b is not None else now) + quiet) for a, b in rec.get("spans") or []]
+    spans = (rec.get("spans") or []) if held else _live_spans(rec)
+    return [(float(a), (float(b) if b is not None else now) + quiet) for a, b in spans]
 
 
 def _open_window(rec: dict, hit: tuple[float, float]) -> bool:
     """The stream of window `hit` has not ended yet (its span has no end): its end is not known."""
-    return any(b is None and abs(float(a) - hit[0]) < 1e-6 for a, b in rec.get("spans") or [])
+    return any(b is None and abs(float(a) - hit[0]) < 1e-6 for a, b in _live_spans(rec))
 
 
 def _job_step(s: dict) -> str:
@@ -455,6 +474,7 @@ def _job_step(s: dict) -> str:
 
 
 EVENTS_KEY = "occupancy_events"   # kv: stream events (box plus window start) already posted (watch)
+UNKNOWN_KEY = "occupancy_unknown_hits"   # kv: sources whose could-not-tell line was posted (watch), per source
 EVENT_LIST = 10                   # jobs an event's post lists; the rest are "+N more"
 DEVICE_STEPS = ("reset",)         # a step that touches the box's devices whatever the lock says
 REMOTE_DEVICE_STEPS = ("bench", "warmup", "reset")   # a remote job's declared step that runs on the box's devices
@@ -501,10 +521,13 @@ def watch(p, db, now: float | None = None, post: Callable[..., None] | None = No
     live or inside its quiet window (a front box: deploys and restarts only). A job that started before
     the stream went live is never flagged, nor is a record whose process is gone (activity.reap closes those
     first, here on every pass); a job whose liveness is unknown (a remote one) counts by its start alone.
+    Only a live reading charges a job: a job that started only while the source could not tell (an unknown
+    read: a timeout or an odd exit, a fail-safe hold that still keeps new work off the box) is not flagged and
+    raises no stay-off alert, only one low line per source (`occupancy-source-unknown:<project>:<stream>`,
+    once per HISTORY_S) saying the source could not tell; the live part of a mixed span still counts.
     Per-job flags are kept in kv for status; one alert per stream event (box plus window, a later hit
-    overlapping it joins it; kept across restarts) lists the jobs and the source's own reason, at high severity
-    when the source reported a real live stream and normal when the box only counted as live because the source
-    could not tell (a fail-safe hold). It closes once its jobs ended, or once the window ended and none is known
+    overlapping it joins it; kept across restarts) lists the jobs and the source's own reason, at high
+    severity. It closes once its jobs ended, or once the window ended and none is known
     to still run there (_close_ended). Aliases of one box (_box) count as one box: a job is flagged and alerted
     once, whichever alias names it. With `occupancy.alerts` off nothing is posted and no event is opened; the
     flags are still kept."""
@@ -512,7 +535,7 @@ def watch(p, db, now: float | None = None, post: Callable[..., None] | None = No
     now = time.time() if now is None else now
     publish(p)
     cov = covered()
-    out = {"read": 0, "flags": [], "unknown": []}
+    out = {"read": 0, "flags": [], "unknown": [], "unknown_hits": []}
     here = project.hostname()
     reaped = activity.reap(p.state, here=here, now=now)   # also with no source: a gone process never reads live
     if reaped:
@@ -538,6 +561,7 @@ def watch(p, db, now: float | None = None, post: Callable[..., None] | None = No
     seen = db.kv(SEEN_KEY, {})
     flags = db.kv(FLAGS_KEY, [])
     events = db.kv(EVENTS_KEY, {})
+    told = db.kv(UNKNOWN_KEY, {})
     new: dict[str, list[dict]] = {}
     fresh: set[str] = set()   # events whose alert this pass posts
     recs = [r for r in activity.entries(p.state) if now - float(r.get("start") or r.get("end") or now) < HISTORY_S]
@@ -565,10 +589,21 @@ def watch(p, db, now: float | None = None, post: Callable[..., None] | None = No
                     continue
                 rec = readings.get(f"{proj}:{stream}") or {}
                 # Only a job that started while the stream was live (or in its quiet tail) counts.
-                hit = next(((a, b) for a, b in _live_windows(rec, now) if a <= start <= b and end >= a), None)
+                inside = lambda wins: next(((a, b) for a, b in wins if a <= start <= b and end >= a), None)   # noqa: E731
+                hit = inside(_live_windows(rec, now))
                 fkey = f"{sid}:{alias}:{proj}:{stream}"
                 bkey = f"{sid}:box={boxes[alias]}:{proj}:{role}"   # the same job on another alias of this box
-                if hit is None or fkey in seen or bkey in seen or (boxes[alias], proj, role) in done:
+                if hit is None:
+                    ukey = f"occupancy-source-unknown:{proj}:{stream}"
+                    if ukey not in told and inside(_live_windows(rec, now, held=True)):
+                        told[ukey] = now   # held only by a could-not-tell read: no violation, one low line
+                        line = {"key": ukey, "alias": alias, "stream": stream, "source": proj, "task": s.get("task"),
+                                "detail": str(rec.get("live_detail") or rec.get("detail") or "")}
+                        out["unknown_hits"].append(line)
+                        if post and alerting:
+                            post(ukey, unknown_text(line), "low")
+                    continue
+                if fkey in seen or bkey in seen or (boxes[alias], proj, role) in done:
                     continue
                 done.add((boxes[alias], proj, role))
                 seen[fkey] = seen[bkey] = now
@@ -577,8 +612,8 @@ def watch(p, db, now: float | None = None, post: Callable[..., None] | None = No
                         "resource": s.get("resource") or s.get("machine"), "cmd": str(s.get("cmd") or "")[:160],
                         "start": start, "end": s.get("end"), "live_from": hit[0], "quiet_to": hit[1], "at": now,
                         "open": _open_window(rec, hit), "quiet_s": float(rec.get("quiet_s", QUIET_S)),
-                        "reason": str(rec.get("live_detail") or rec.get("detail") or ""),
-                        "reading": str(rec.get("live_state") or rec.get("state") or "")}
+                        "reason": str(rec.get("real_detail") or rec.get("live_detail") or rec.get("detail") or ""),
+                        "reading": "live"}
                 flags.append(flag)
                 out["flags"].append(flag)
                 if not alerting:
@@ -593,11 +628,11 @@ def watch(p, db, now: float | None = None, post: Callable[..., None] | None = No
     if post and alerting:
         for ekey, fl in new.items():
             if ekey in fresh:
-                real = all(f.get("reading") == "live" for f in fl)
-                post(f"occupancy:violation:{ekey}", event_text(fl), "high" if real else "normal")
+                post(f"occupancy:violation:{ekey}", event_text(fl), "high")
     _close_ended(db, events, jobs, readings, now, set(new))
     db.set_kv(SEEN_KEY, {k: v for k, v in seen.items() if now - float(v) < HISTORY_S})
     db.set_kv(EVENTS_KEY, {k: v for k, v in events.items() if now - _event_at(v) < HISTORY_S})
+    db.set_kv(UNKNOWN_KEY, {k: v for k, v in told.items() if now - float(v) < HISTORY_S})
     db.set_kv(FLAGS_KEY, flags[-FLAGS_KEPT:])
     return out
 
@@ -673,8 +708,8 @@ def _window_words(fl: list[dict]) -> str:
 
 
 def event_text(fl: list[dict]) -> str:
-    """One alert for a stream event: the box and window, the source's own reason at the hit (a real clip or
-    a fail-safe hold with no owner shown), the first EVENT_LIST jobs and "+N more"."""
+    """One alert for a stream event: the box and window, the source's own reason at its last live read, the
+    first EVENT_LIST jobs and "+N more"."""
     f = fl[0]
     role = f" (front of {f['stream']})" if f["role"] == "front" else ""
     why = f.get("reason") or "no reason given"
@@ -684,6 +719,13 @@ def event_text(fl: list[dict]) -> str:
             f"{_window_words(fl)} (source of {f['source']}, {f.get('reading') or 'live'}: {why}). Jobs: {shown}{more}. "
             f"Every deploy, restart, test, benchmark, warm-up, health check or reset there must ask "
             f"`ttp occupancy {f['alias']}` first and stay off while it says so.")
+
+
+def unknown_text(line: dict) -> str:
+    """The one low line for a job that ran while only a could-not-tell read held the box."""
+    return (f"Task #{line.get('task') or '?'} ran on {line['alias']} while the occupancy source of {line['source']} "
+            f"for {line['stream']} could not tell whether a live stream held it ({line['detail'] or 'no answer'}). "
+            f"The box counted as held, but no live stream was reported: no stay-off alert.")
 
 
 def recent_flags(db, since_s: float = 86400, now: float | None = None) -> list[dict]:

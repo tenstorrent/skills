@@ -379,22 +379,93 @@ def test_occupancy_watchdog_never_flags_a_record_with_no_live_process(env, monke
         live_lock.close()
 
 
-def test_occupancy_alert_is_normal_severity_for_a_failsafe_hold_and_high_for_a_real_stream(env, monkeypatch):
+def test_occupancy_unknown_read_holds_the_box_but_charges_no_job_and_says_so_once_per_source(env, monkeypatch):
+    """A source that cannot tell (an odd exit, a timeout) still holds the box for new work, but a job that ran
+    only while it could not tell gets no flag and no stay-off alert: one low line per source instead. A real
+    live stream flags and alerts at high severity as before."""
     from ttp import occupancy
     p = make(env)
     occ = _occ_home(env["home"], monkeypatch)
-    occ.publish(_OccProj("streamer", p.root, {"box-a": {"cmd": "exit 0"}, "box-b": {"cmd": "exit 3"}}, quiet_s=0))
+    occ.publish(_OccProj("streamer", p.root, {"box-a": {"cmd": "exit 0"}, "box-b": {"cmd": "exit 3"},
+                                              "box-c": {"cmd": "exit 3"}}, quiet_s=0))
     now = time.time()
     posts = []
-    post = lambda key, text, sev="high": posts.append((key, sev))   # noqa: E731
+    post = lambda key, text, sev="high": posts.append((key, text, sev))   # noqa: E731
     mk = lambda i, box: {"id": f"{box}{i}", "kind": "lock", "start": now, "end": None, "resource": f"{box}-device",   # noqa: E731
                          "task": i, "cmd": "bench"}
-    _watch_with(monkeypatch, [mk(i, b) for i in range(30) for b in ("box-a", "box-b")])
-    occupancy.watch(p, p.db, now, post)
-    assert sorted((k.split(":")[2], sev) for k, sev in posts) == [("box-a", "high"), ("box-b", "normal")], posts
-    # the same windows on a later pass (and after a restart, the events being kept in the database) post nothing
-    occupancy.watch(p, p.db, now + 5, post)
-    assert len(posts) == 2
+    _watch_with(monkeypatch, [mk(i, b) for i in range(30) for b in ("box-a", "box-b", "box-c")])
+    out = occupancy.watch(p, p.db, now, post)
+    assert {f["alias"] for f in out["flags"]} == {"box-a"} and all(f["reading"] == "live" for f in out["flags"])
+    keys = sorted((k, sev) for k, _, sev in posts)
+    assert keys == [("occupancy-source-unknown:streamer:box-b", "low"), ("occupancy-source-unknown:streamer:box-c", "low"),
+                    (keys[2][0], "high")] and keys[2][0].startswith("occupancy:violation:box-a"), keys
+    low = dict((k, t) for k, t, _ in posts)["occupancy-source-unknown:streamer:box-b"]
+    assert "could not tell" in low and "box-b" in low and "streamer" in low
+    assert sorted(h["key"] for h in out["unknown_hits"]) == ["occupancy-source-unknown:streamer:box-b",
+                                                             "occupancy-source-unknown:streamer:box-c"]
+    # the fail-safe hold stays: the unknown box still keeps new work off
+    for box in ("box-b", "box-c"):
+        res = occupancy.check(box, "test", now + 1)
+        assert res["blocks"] and res["state"] == "unknown", res
+    # later passes, new jobs in the same unknown span and a restart (kept in the database) post nothing more
+    _watch_with(monkeypatch, [mk(i, b) for i in range(30, 33) for b in ("box-b", "box-c")])
+    out = occupancy.watch(p, p.db, now + 25, post)
+    assert out["flags"] == [] and out["unknown_hits"] == [] and len(posts) == 3
+    assert not any("box-b" in f["alias"] or "box-c" in f["alias"] for f in occupancy.recent_flags(p.db, now=now + 26))
+
+
+def test_occupancy_mixed_live_and_unknown_span_alerts_only_on_its_live_part(env, monkeypatch, tmp_path):
+    """A source that reads live, then cannot tell, then live again: jobs that started in a live part are flagged
+    and alerted; a job that started only while it could not tell is not (one low line), though the box held."""
+    from ttp import occupancy
+    p = make(env)
+    occ = _occ_home(env["home"], monkeypatch)
+    rc = tmp_path / "rc"
+    rc.write_text("0")
+    occ.publish(_OccProj("streamer", p.root, {"box-a": {"cmd": f"exit $(cat {rc})"}}, quiet_s=1))
+    t0 = time.time()
+    posts = []
+    post = lambda key, text, sev="high": posts.append((key, sev))   # noqa: E731
+    mk = lambda name, at: {"id": name, "kind": "lock", "start": at, "end": None, "resource": "box-a-device",   # noqa: E731
+                           "task": 5, "cmd": "bench"}
+    _watch_with(monkeypatch, [])
+    occupancy.watch(p, p.db, t0, post)   # live from t0
+    rc.write_text("3")
+    jobs = [mk("in-live", t0 + 10)]
+    _watch_with(monkeypatch, jobs)
+    out = occupancy.watch(p, p.db, t0 + 30, post)   # the read that cannot tell ends the live part at t0+30
+    assert [f["key"].split(":")[0] for f in out["flags"]] == ["in-live"]
+    jobs.append(mk("in-unknown", t0 + 40))
+    out = occupancy.watch(p, p.db, t0 + 60, post)
+    assert out["flags"] == [] and [h["stream"] for h in out["unknown_hits"]] == ["box-a"]
+    assert occupancy.check("box-a", "test", t0 + 61)["blocks"]   # held all along
+    rc.write_text("0")
+    jobs.append(mk("in-live-again", t0 + 95))
+    occupancy.watch(p, p.db, t0 + 90, post)   # live again from t0+90
+    out = occupancy.watch(p, p.db, t0 + 120, post)
+    assert [f["key"].split(":")[0] for f in out["flags"]] == ["in-live-again"]
+    assert [sev for _, sev in posts] == ["high", "low", "high"], posts
+    assert [k.split(":")[0] for k, _ in posts] == ["occupancy", "occupancy-source-unknown", "occupancy"]
+
+
+def test_occupancy_reading_written_before_live_spans_counts_only_a_live_hold(env, monkeypatch):
+    """A shared reading written by an older release (no live spans) charges jobs only when its last hold was a
+    live read; its next read starts keeping live spans."""
+    from ttp import occupancy
+    p = make(env)
+    occ = _occ_home(env["home"], monkeypatch)
+    occ.publish(_OccProj("streamer", p.root, {"box-a": {"cmd": "exit 3"}, "box-b": {"cmd": "exit 3"}}, quiet_s=0))
+    now = time.time()
+    old = lambda state: {"state": state, "detail": "old", "at": now, "spans": [[now - 100, None]],   # noqa: E731
+                         "last_live": now, "live_state": state, "live_detail": "old", "quiet_s": 0}
+    occ._save(occ.READINGS, {"streamer:box-a": old("live"), "streamer:box-b": old("unknown")})
+    mk = lambda box: {"id": box, "kind": "lock", "start": now - 50, "end": None, "resource": f"{box}-device",   # noqa: E731
+                      "task": 1, "cmd": "bench"}
+    _watch_with(monkeypatch, [mk("box-a"), mk("box-b")])
+    out = occupancy.watch(p, p.db, now, None)
+    assert [f["alias"] for f in out["flags"]] == ["box-a"] and [h["alias"] for h in out["unknown_hits"]] == ["box-b"]
+    rec = occ._reading("streamer", "box-b", {"cmd": "exit 3"}, now + 1, True)
+    assert rec["live_spans"] == [] and rec["spans"] == [[now - 100, None]]
 
 
 def test_occupancy_watchdog_flags_a_remote_job_started_inside_the_window_once(env, monkeypatch):

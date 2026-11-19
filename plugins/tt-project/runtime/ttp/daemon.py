@@ -5350,9 +5350,12 @@ class Daemon:
         db = self.p.db
 
         def post(key: str, text: str, severity: str = "high") -> None:
-            db.post("out", text, chat=None, kind="alert", severity=severity, ref=key)
+            if key.startswith("occupancy:violation:"):
+                db.post("out", text, chat=None, kind="alert", severity=severity, ref=key)
+            # a could-not-tell line (occupancy-source-unknown:...) is a low event only, never a chat alert
+            kind = "occupancy_violation" if key.startswith("occupancy:violation:") else "occupancy_unknown"
             db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
-                 (now, "daemon", "occupancy_violation", severity, text[:1000], "new", None))
+                 (now, "daemon", kind, severity, text[:1000], "new", None))
             log(self.p, text)
 
         out = occupancy.watch(self.p, db, now, post)

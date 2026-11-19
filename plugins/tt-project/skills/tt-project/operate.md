@@ -144,7 +144,9 @@ about every 15 s until the box is free (`--timeout` bounds it, `--also <alias>` 
 - The daemon's watchdog reads every source about once a minute and flags each job of its project
   that ran on a box while a stream (or its quiet window) held it: a high-severity post to the
   project's chat at once, kept for `ttp status` and the daily review. A source of its own that
-  cannot tell raises one event. Only a device job counts: one holding a device resource of that box,
+  cannot tell raises one event. Only a live read counts against a job: a job that ran while the
+  source could not tell (the box still held) gets no flag or alert, only one low event per source.
+  Only a device job counts: one holding a device resource of that box,
   a `ttp detach --remote` job there declaring `--devices`, `--disruptive` or a bench, warm-up or
   reset `--step`, or a reset or disruptive step on the host itself; a process that merely runs on
   the host (a driver or lock waiter for another box, a log read) is never flagged. Aliases of one box
