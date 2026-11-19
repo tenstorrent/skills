@@ -2577,21 +2577,22 @@ def cmd_slop(a) -> None:
         cfg["subsystems"] = [*a.subsystem, *(cfg.get("subsystems") or [])]
     cache = str(p.state / "slop-cache.json")
     try:
+        root = slop.repo(p.root, given=a.repo)
         if a.diff:
             base, sep, head = a.diff.partition("..")
             if not sep or not base or not head:
                 die("--diff: give base..head (two commits or branches)")
-            d = slop.delta(p.root, base, head, cfg, cache)
+            d = slop.delta(root, base, head, cfg, cache)
             if a.json:
                 print(json.dumps(d, indent=1))
                 return
             print("\n".join(slop.delta_lines(d, show=20) or ["the change adds none of what the scan counts"]))
             return
         if a.next:
-            pick = slop.pass_target(slop.scan_files(p.root, a.ref, cfg, a.paths or None, cache), cfg)
+            pick = slop.pass_target(slop.scan_files(root, a.ref, cfg, a.paths or None, cache), cfg)
             print(json.dumps({"subsystem": pick[0], "excess": pick[1]} if pick else {"subsystem": None}))
             return
-        rep = slop.scan(p.root, a.ref, cfg, a.paths or None, cache)
+        rep = slop.scan(root, a.ref, cfg, a.paths or None, cache)
     except RuntimeError as e:
         die(f"slop: {e}")
     print(slop.dump(rep) if a.json else slop.text(rep, cfg))
@@ -16636,6 +16637,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--diff", metavar="BASE..HEAD", help="the numbers a change adds, new duplicates and incident-style comments")
     s.add_argument("--subsystem", nargs="+", metavar="PATH", help="count these directories or files as subsystems "
                                                                   "of their own (a de-slop pass's target)")
+    s.add_argument("--repo", metavar="PATH", help="the git repository to read (default: the one holding the current "
+                                                  "directory, such as a worktree, else the project root)")
     s.add_argument("--next", action="store_true", help="print the subsystem or part a de-slop pass would refactor (JSON)")
     s.add_argument("--json", action="store_true", help="print JSON")
     s.set_defaults(fn=cmd_slop)

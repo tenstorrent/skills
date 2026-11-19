@@ -249,3 +249,27 @@ def test_slop_scan_reports_a_file_it_cannot_parse_with_null_counters_and_the_err
     assert [e["path"] for e in rep["parse_errors"]] == ["pkg/broken.py"]
     sub = rep["subsystems"]["pkg"]
     assert sub["files"] == 2 and sub["unparsed"][0].startswith("pkg/broken.py: SyntaxError")
+
+
+def test_slop_reads_the_repo_holding_the_cwd_such_as_a_worktree_outside_the_project_root(tmp_path, monkeypatch, capsys):
+    """upstream note 37687f67481697c5: `ttp slop --diff` in a worktree outside the project root ran git in the root."""
+    import pytest
+    from ttp import cli, slop
+    src = _slop_repo(tmp_path, {"a.py": "X = 1\n"})
+    root = tmp_path / "project"   # a project root that is no git repository
+    root.mkdir()
+    wt = tmp_path / "elsewhere" / "wt"
+    _git_out(src, "worktree", "add", "-q", "-b", "side", str(wt))
+    base = _git_out(wt, "rev-parse", "HEAD").strip()
+    head = _slop_commit(wt, {"b.py": CHOOSER})
+    assert slop.repo(root, cwd=wt) == wt.resolve()
+    assert slop.repo(root, cwd=tmp_path) == root   # no repo here: the project root
+    assert slop.repo(src, cwd=src / "sub-missing") == src   # git cannot run there: the project root
+    assert slop.repo(src, cwd=src) == src and slop.repo(root, cwd=wt, given=str(src)) == src.resolve()
+    with pytest.raises(RuntimeError, match="not a git repository"):
+        slop.delta(root, base, head, None, str(tmp_path / "cache.json"))   # what the root alone gave
+    monkeypatch.chdir(wt)
+    assert slop.delta(slop.repo(root), base, head, None, str(tmp_path / "cache.json")) is not None
+    with pytest.raises(SystemExit):
+        cli.main(["slop", "--help"])
+    assert "--repo" in capsys.readouterr().out

@@ -27,12 +27,13 @@ import ast
 import hashlib
 import io
 import json
+import os
 import re
 import subprocess
 import time
 import tokenize
 from collections import defaultdict
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 from . import gitmemo
 
@@ -375,6 +376,18 @@ def _git(root, *args, check=True) -> str:
     if r.returncode and check:
         raise RuntimeError(r.stderr.strip() or f"git {args[0]} failed")
     return r.stdout if r.returncode == 0 else ""
+
+
+def repo(project_root, cwd=None, given: str | None = None) -> Path:
+    """The git repository a scan reads: `given` (--repo), else the one holding `cwd` when the project root is not
+    inside it (a worktree, wherever it is), else the project root."""
+    if given:
+        return Path(given).resolve()
+    top = _git(cwd or os.getcwd(), "rev-parse", "--show-toplevel", check=False).strip()
+    root = Path(project_root).resolve()
+    if top and Path(top).resolve() not in (root, *root.parents):
+        return Path(top).resolve()
+    return Path(project_root)
 
 
 def _excluded(path: str, globs: list[str]) -> bool:
