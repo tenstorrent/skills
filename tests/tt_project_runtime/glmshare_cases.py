@@ -1,0 +1,124 @@
+# GLM work share and wave gate (glmshare.py, `ttp stats --glm-share`) tests of tests/test_tt_project_runtime.py,
+# which runs this file in its own namespace (see _include_cases there). Add new glmshare tests here.
+from __future__ import annotations
+
+_GS_GLM = "example-org/GLM-9"
+
+
+def _gs_task(p, kind="code", status="done", labels=()):
+    tid = p.db.add_task(f"t {kind} {len(p.db.q('SELECT id FROM tasks'))}", "Do it.", kind=kind, tier="standard",
+                        origin="coordinator", priority=3, labels=list(labels))
+    p.db.x("UPDATE tasks SET status=? WHERE id=?", (status, tid))
+    return tid
+
+
+def _gs_run(p, task, start, hours, provider="chat", model=_GS_GLM, role="worker", note=None):
+    return p.db.x("INSERT INTO runs(task,role,provider,model,started,ended,status,cost_usd,note) VALUES(?,?,?,?,?,?,?,?,?)",
+                  (task, role, provider, model, start, None if hours is None else start + hours * 3600, "done", 0.0,
+                   json.dumps(note or {})))
+
+
+def _gs_review(p, of, status):
+    return _gs_task(p, kind="review", status=status, labels=[f"auto_review:{of}"])
+
+
+def test_glm_share_counts_model_hours_and_runs_per_role_and_quality_per_arm(env, capsys):
+    from ttp import glmshare
+    p = make(env)
+    now = 1_000_000_000.0 + 30 * 86400
+    t = now - 20 * 3600
+    _gs_run(p, None, t, 1, provider="claude", model="opus", role="coordinator")
+    _gs_run(p, None, t, 1, role="coordinator")                                   # a coordinator turn on GLM
+    a = _gs_task(p)                                                              # glm arm by its record
+    p.db.set_kv(f"glm_work_arm:{a}", {"arm": "glm", "why": "covered", "ts": t})
+    _gs_run(p, a, t, 2)
+    _gs_review(p, a, "done")
+    b = _gs_task(p, status="failed")                                             # holdout: the Claude arm
+    p.db.set_kv(f"glm_work_arm:{b}", {"arm": "holdout", "why": "holdout", "ts": t})
+    _gs_run(p, b, t, 1, provider="claude", model="opus")
+    rb = _gs_review(p, b, "failed")
+    fix = _gs_task(p, labels=[f"review_fix:{rb}", f"continues:{b}"])
+    p.db.x("INSERT INTO events(ts,source,kind,text,task) VALUES(?,?,?,?,?)",
+           (t + 9000, "user", "task_requeued", f"#{b} requeued from failed by the user", b))
+    c = _gs_task(p, kind="work")                                                 # routed, fell back to Claude
+    _gs_run(p, c, t, 0.5, provider="claude", model="opus", note={"route": {"to": "chat", "fallback": "needs_opus"}})
+    d = _gs_task(p, kind="work", labels=["needs_device"])                       # device work on a lower-case glm
+    _gs_run(p, d, t, 1, model="other-org/glm-mini")
+    p.db.x("INSERT INTO events(ts,source,kind,text,task) VALUES(?,?,?,?,?)", (t + 600, "watcher", "device_hang", "hung", d))
+    r = _gs_task(p, kind="review")
+    _gs_run(p, r, t, 0.5, provider="claude", model="opus")
+    _gs_run(p, None, now - 3 * 86400, 5, provider="chat", role="coordinator")   # before the window: not counted
+    _gs_run(p, c, now - 3600, None, provider="claude", model="opus")             # still running: up to now
+    p.db.x("INSERT INTO ledger(ts,provider,usd) VALUES(?,?,?)", (t, "claude", 12.0))
+    p.db.x("INSERT INTO ledger(ts,provider,usd) VALUES(?,?,?)", (t, "chat", 5.0))
+    p.db.set_kv("corrections", [{"msg": "m", "ts": t}, {"msg": "old", "ts": now - 9 * 86400}])
+    s = glmshare.report(p, now - 86400, now)
+    # 8 runs, 8 model-hours; GLM: the coordinator turn 1h, code 2h, device 1h.
+    assert (s["total"]["runs"], s["total"]["glm_runs"], s["total"]["hours"], s["total"]["glm_hours"]) == (8, 3, 8.0, 4.0)
+    assert (s["total"]["hour_pct"], s["total"]["run_pct"]) == (50.0, 37.5)
+    ro = s["roles"]
+    assert (ro["coordinator"]["hours"], ro["coordinator"]["hour_pct"], ro["coordinator"]["run_pct"]) == (2.0, 50.0, 50.0)
+    assert (ro["code"]["hours"], ro["code"]["glm_hours"], ro["code"]["hour_pct"]) == (3.0, 2.0, 66.7)
+    assert (ro["work"]["hours"], ro["work"]["hour_pct"]) == (1.5, 0.0)
+    assert (ro["device"]["hours"], ro["device"]["hour_pct"]) == (1.0, 100.0)
+    assert (ro["review"]["hours"], ro["review"]["hour_pct"]) == (0.5, 0.0)
+    assert ro["plan"]["hour_pct"] is None
+    g, c_ = s["arms"]["glm"], s["arms"]["claude"]
+    assert (g["tasks"], g["done"], g["failed"], g["reviewed"], g["first_pass_pct"], g["incidents"]) == (2, 2, 0, 1, 100.0, 1)
+    assert (c_["tasks"], c_["done"], c_["failed"], c_["reopened"], c_["first_pass_pct"]) == (2, 1, 1, 1, 0.0)
+    assert (c_["fix_rounds_per_reviewed"], c_["bounces"], c_["incidents"], c_["done_per_day"]) == (1.0, 1, 0, 1.0)
+    assert fix not in (a, b, c, d)
+    assert s["claude_usd_per_day"] == 12.0
+    assert s["corrections"]["n"] == 1 and s["corrections"]["per_arm"] is None and s["corrections"]["note"]
+    out = glmshare.text(s)
+    assert "GLM 50% of 8.0 model-h, 37.5% of 8 runs" in out and "Claude $12.00/day" in out
+    # The CLI prints it, one project or each named one.
+    from ttp import cli
+    cli.main(["stats", "demo", "--glm-share", "--since", str(now - 86400), "--until", str(now), "--json"])
+    assert json.loads(capsys.readouterr().out)["total"]["glm_hours"] == 4.0
+    cli.main(["stats", "--glm-share", "--projects", "demo,nope", "--since", str(now - 86400), "--until", str(now)])
+    got = capsys.readouterr().out
+    assert "demo: GLM 50%" in got and "nope: not a project on this machine" in got
+
+
+def _gs_decided(p, start, passed, provider="chat", arm=None, ts=None):
+    tid = _gs_task(p, status="done" if passed else "failed")
+    if arm:
+        p.db.set_kv(f"glm_work_arm:{tid}", {"arm": arm, "why": "x", "ts": ts or start})
+    _gs_run(p, tid, start, 1, provider=provider, model=_GS_GLM if provider == "chat" else "opus")
+    _gs_review(p, tid, "done" if passed else "failed")
+    return tid
+
+
+def test_glm_share_judge_waits_for_enough_glm_tasks_then_compares_with_the_project_s_own_claude_baseline(env):
+    from ttp import glmshare
+    p = make(env)
+    cfg = {"route": {"glm_work": {"min_tasks": 3, "worse_pts": 15}}}
+    now = 1_000_000_000.0 + 60 * 86400
+    t0 = now - 5 * 86400
+    assert glmshare.judge(p, cfg, now)["state"] == "wait"          # no arm records yet
+    assert glmshare.settings({}) == {"min_tasks": 25, "worse_pts": 15.0}
+    # Baseline: 4 of 5 passed in the 14 days before the first arm record, plus a passing holdout task.
+    for ok in (1, 1, 1, 1, 0):
+        _gs_decided(p, t0 - 3 * 86400, ok, provider="claude")
+    _gs_decided(p, t0 - 20 * 86400, 0, provider="claude")           # older than 14 days: not baseline
+    _gs_decided(p, t0 + 3600, 1, provider="claude", arm="holdout")
+    g1 = _gs_decided(p, t0, 1, arm="glm")
+    _gs_decided(p, t0 + 3600, 1, arm="glm")
+    v = glmshare.judge(p, cfg, now)
+    assert (v["state"], v["n"]) == ("wait", 2) and "2 of 3 GLM tasks" in v["why"]
+    _gs_decided(p, t0 + 7200, 1, arm="glm")
+    v = glmshare.judge(p, cfg, now)
+    assert (v["state"], v["n"]) == ("ok", 3), v
+    assert "GLM first review passed 100.0% of 3" in v["why"] and "Claude baseline 83.3% of 6" in v["why"]
+    # Any device incident on a GLM run: worse.
+    p.db.x("INSERT INTO events(ts,source,kind,text,task) VALUES(?,?,?,?,?)", (t0 + 60, "watcher", "device_reset", "x", g1))
+    v = glmshare.judge(p, cfg, now)
+    assert v["state"] == "worse" and "1 device incident" in v["why"]
+    p.db.x("DELETE FROM events WHERE kind='device_reset'")
+    # 3 of 6 GLM passes (50%) against 83.3%: lower by more than 15 points.
+    for _ in range(3):
+        _gs_decided(p, t0 + 9000, 0, arm="glm")
+    v = glmshare.judge(p, cfg, now)
+    assert (v["state"], v["n"]) == ("worse", 6) and "lower by more than 15 points" in v["why"] and "50.0% of 6" in v["why"]
+    assert glmshare.judge(p, {"route": {"glm_work": {"min_tasks": 3, "worse_pts": 40}}}, now)["state"] == "ok"

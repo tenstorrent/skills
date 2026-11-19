@@ -40,6 +40,7 @@ from . import runtimeload   # first of its own: its LOADED_AT is when the daemon
 from . import blindreview
 from . import rolerestore
 from . import codearm
+from . import glmwork
 from . import glmguard
 from . import glmharness, policyfiles
 from . import deviceab
@@ -1906,7 +1907,7 @@ class Daemon:
         established project starts no coordinator turn or worker run (both would route on the
         defaults) and says so in one alert, which clears once the file reads again."""
         raw, status = self.p.read_config()
-        self.cfg = codearm.ring_gate(layered(raw), self.p.name, raw)   # the glm_code release-ring flag
+        self.cfg = glmwork.ring_gate(codearm.ring_gate(layered(raw), self.p.name, raw), self.p.name, raw)   # release flags
         self._raw_cfg = raw   # which tiers the project sets itself (cursortiers.apply)
         # The process sandbox for checks, off unless the project turns it on: this daemon's own check
         # runs read it here, its workers from their environment (start_run).
@@ -2700,6 +2701,29 @@ class Daemon:
                                 f"({moved.get('why')})"[:300])
             except Exception as e:   # never holds the loop
                 log(self.p, f"code arm tick failed: {type(e).__name__}: {e}"[:300])
+        # Release waves (rollout.wave_tick): the account-wide gate, hourly per flag under the rollout lock, then
+        # this project's own wave moves, rollbacks and overrides as coordinator events (rollout.project_events).
+        if now - getattr(self, "_rollout_waves_checked", 0.0) >= 300:
+            self._rollout_waves_checked = now
+            try:
+                for rec in rollout.wave_tick(now, by=f"daemon:{self.p.name}"):
+                    log(self.p, f"rollout: {rec['flag']} {rec['op']} {rec.get('wave', rec.get('project'))}: "
+                                f"{rec.get('why')}"[:300])
+                rollout.project_events(self.p, now)
+            except Exception as e:   # never holds the loop
+                log(self.p, f"rollout wave tick failed: {type(e).__name__}: {e}"[:300])
+        # route.glm_work: the holdout drops from its in-wave share to its held share once this project's own
+        # quality gate (glmshare.judge) says ok, and back while it does not (hourly, model-free).
+        if glmwork.settings(self.cfg) and now - getattr(self, "_glm_work_judged", 0.0) >= 3600:
+            self._glm_work_judged = now
+            try:
+                from . import glmshare
+                got = glmshare.judge(self.p, self.cfg, now)
+                if glmwork.mark_held(self.p.db, got, now):
+                    log(self.p, f"glm_work: holdout {glmwork.holdout(self.p.db, self.cfg):g} "
+                                f"(quality {got.get('state')}: {got.get('why')})"[:300])
+            except Exception as e:   # never holds the loop
+                log(self.p, f"glm_work judge failed: {type(e).__name__}: {e}"[:300])
         # route.device_ab: the test arm's incident stop (one high event) and the masked reviews.
         if now - getattr(self, "_device_ab_checked", 0.0) >= 300:
             self._device_ab_checked = now
@@ -13751,6 +13775,15 @@ class Daemon:
                         note[deviceab.KEY] = dab[deviceab.KEY]
                 except Exception as e:   # the A/B must never hold a task back
                     log(self.p, f"task {task['id']}: device A/B not assigned: {e}"[:300])
+                if routed and routed.get(glmwork.KEY):
+                    try:   # a GLM work run the endpoint could not take starts on its fallback model, named (#1924)
+                        if run_prov == provider and (fb := glmwork.fallback(self.cfg, routed["fallback"])) \
+                                and fb["provider"] == provider:
+                            cheap = {**fb, "class": run_cls, "why": f"glm_work fallback: {routed['fallback']}"}
+                            routed["fallback_model"] = fb["model"]
+                        glmwork.log_hour(db, routed["fallback"], routed.get("waited_s"), now)
+                    except Exception as e:
+                        log(self.p, f"task {task['id']}: glm_work fallback not applied: {e}"[:300])
                 try:   # a code run's note says whether it took Sonnet, else why it stayed (ttp stats --code-guard)
                     if cr := runclass.code_decision(self.cfg, task, run_cls, tier, run_prov, picked, code_state,
                                                     cheap, dab):
@@ -14185,10 +14218,11 @@ class Daemon:
         except Exception as e:   # the label must never cost the run its end
             log(self.p, f"task {tid}: {untrusted.LABEL} label not set: {e}")
 
-    def _floor_keeps_core(self, task: dict, tier: str, picked: dict | None) -> str:
+    def _floor_keeps_core(self, task: dict, tier: str, picked: dict | None, to: dict | None = None) -> str:
         """The routed model (route.py) a floor run (tierfloor.target) skips to run on the core provider,
-        or '' when its tier routes nowhere or it is no floor run."""
-        to = route.match(self.cfg, task, tier)
+        or '' when its tier routes nowhere or it is no floor run. `to`: the route asked for (a rule, tier or
+        class route), else the tier's own."""
+        to = to or route.match(self.cfg, task, tier)
         if not to or not route.eligible(task, picked):
             return ""
         try:
@@ -14248,24 +14282,29 @@ class Daemon:
         other run of a code task under the arm (Claude, Sonnet, a bounce) stays on core, whatever its tier."""
         arm = arm if arm is not None else self._code_arm(task, tier, picked, peek=True)
         if arm and arm["run"] == "glm" and (s := codearm.settings(self.cfg)):
-            e = self._route_entry(task, tier, s["provider"], s["model"], now, cls=cls, arm=True)
-            return {**e, codearm.KEY: "glm", **({"pick_effort": s["effort"]} if s["effort"] else {})}
+            e = self._route_entry(task, tier, s["provider"], s["model"], now, cls=cls, arm=True, glm=s["glm_work"])
+            return {**e, codearm.KEY: "glm", **({glmwork.KEY: "glm"} if s["glm_work"] else {}),
+                    **({"pick_effort": s["effort"]} if s["effort"] else {})}
         if arm:   # the arm owns every run of its code task: the tier route never moves one (light wakes included)
             return None
+        if glmwork.settings(self.cfg):   # a covered project: the GLM work route decides every run
+            return self._glm_route(task, tier, picked, now, cls, peek)
         dp = self._model_pick(task, tier, peek=peek)
         if dp is not None:   # the model pick (modelpick.py) decides this tier's route
             got = modelpick.target(self.cfg, dp)
             to = {"to": got["provider"], "model": got["model"], "rule": None} if got else None
         else:
             to = route.match(self.cfg, task, tier)
+        klass = False
         if not to and dp is None and cls:
             to = runclass.target(self.cfg, task, tier, cls, picked)
-            if to:
-                return self._route_entry(task, tier, to["to"], to["model"], now, to["rule"], cls)
-        if not to or not route.eligible(task, picked) or (dp is None and self._floor_keeps_core(task, tier, picked)):
+            klass = bool(to)
+        # Every keep-core check runs before any route returns, the class route included: no review, pin,
+        # retry or outside text (eligible), no floor run, no protected class.
+        if not to or not route.eligible(task, picked) or (dp is None and self._floor_keeps_core(task, tier, picked, to)):
             return None
         name, model = to["to"], to["model"]
-        why = route.protected(self.p.db, self.cfg, task, tier)
+        why = route.protected(self.p.db, self.cfg, task, tier, urgency=not (klass and cls in runclass.ORDER_ONLY))
         if why:   # the guard: a protected class stays on core, whoever asked for the route
             if (got_e := self._route_entry(task, tier, name, model, now, to["rule"], cls, core_only=True)):
                 return got_e   # it starts on core anyway (escalated, or a rerun after a fallback): the note says why
@@ -14277,6 +14316,24 @@ class Daemon:
             return {**self._route_entry(task, tier, name, model, now, pick=True), "model_pick": True,
                     **({"pick_effort": got["effort"]} if got["effort"] else {})}
         return self._route_entry(task, tier, name, model, now, to["rule"], cls)
+
+    def _glm_route(self, task: dict, tier: str, picked: dict | None, now: float, cls: str | None,
+                   peek: bool = False) -> dict | None:
+        """A covered project's route (glmwork.py) for a run that is not a code arm's: the work model at its
+        effort, or None (core) for a run the keep-core checks hold or the task's Claude holdout. The floor keeps
+        the run's tier and effort; only a verdict or a person-facing run stays on core for it (keeps_core)."""
+        s = glmwork.settings(self.cfg)
+        try:
+            why = glmwork.keeps_core(self.p.db, self.cfg, task, tier, cls, picked)
+        except Exception as e:   # in doubt, core
+            why = f"unchecked: {type(e).__name__}"
+        if why or not s:
+            return None
+        a = glmwork.arm(self.p.db, self.cfg, task, peek=peek)
+        if not a or a["arm"] != "glm":
+            return None
+        e = self._route_entry(task, tier, s["provider"], s["model"], now, glmwork.KEY, cls, glm=True)
+        return {**e, glmwork.KEY: "glm", **({"pick_effort": s["effort"]} if s["effort"] else {})} if e else None
 
     def _model_pick(self, task: dict, tier: str, peek: bool = False) -> dict | None:
         """This start's model pick (modelpick.pick), or None: the tier's own route decides. `peek`
@@ -14295,7 +14352,7 @@ class Daemon:
 
     def _route_entry(self, task: dict, tier: str, name: str, model: str, now: float, rule_i: int | str | None = None,
                      cls: str | None = None, pick: bool = False, core_only: bool = False,
-                     arm: bool = False) -> dict | None:
+                     arm: bool = False, glm: bool = False) -> dict | None:
         """The route entry; `core_only` returns it only when the run starts on core anyway (a rerun after
         a fallback, or escalated), else None. `arm`: a code arm run (codearm.py), whose review and checks fixes
         keep their lineage's arm."""
@@ -14310,6 +14367,8 @@ class Daemon:
             esc = {}
         if arm and esc.get("escalated") in ("review fix", "checks fix"):
             esc = {}   # a follow-up fix keeps its parent's arm (codearm.choose)
+        if glm and esc.get("escalated") in ("review fix", "checks fix", "user-ordered", "urgent"):
+            esc = {}   # the GLM work route keeps these on its arm; its keep-core checks decided (glmwork.keeps_core)
         if esc:   # urgent, user-ordered, a fix of a routed change or a lineage's misses: the core provider
             return {"tier": tier, "to": name, "model": model, **rule, "fallback": route.ESCALATED, **esc}
         if core_only:
@@ -15648,7 +15707,7 @@ class Daemon:
         with the project's own trailing 7 days (rollout_health). A failing signal rolls the flag back for
         every project (rollout.rollback: off and frozen until `ttp rollout arm`), alerts this project's
         coordinator and tells the user; a clean window with enough samples votes for promotion, and the
-        vote that completes a ring's list promotes the flag one ring."""
+        vote that completes a ring's list promotes the flag one ring. A flag at auto is the wave gate's (rollout.wave_tick)."""
         now = time.time()
         if now - self._last_rolloutwatch < every_s:
             return []
@@ -15657,7 +15716,7 @@ class Daemon:
         recs = rollout.ledger()
         for flag in rollout.FLAGS:
             ring, lv = rollout.ring_of(name, cfg), rollout.level(flag, cfg)
-            if lv == rollout.OFF or ring is None or ring > lv or rollout.frozen(flag) \
+            if lv in (rollout.OFF, rollout.AUTO) or ring is None or ring > lv or rollout.frozen(flag) \
                     or rollout.own_setting(self.p.raw_config(), rollout.FLAGS[flag]["key"]):
                 continue
             v = rollout_health.verdict(self.p.db, flag, ring, recs, cfg, now, str(self.p.root))

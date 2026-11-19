@@ -3255,16 +3255,21 @@ def test_fast_takes_the_fastest_model_within_the_margin_and_above_the_floor(env,
     _rank_home(env, monkeypatch)
     q = {"best": 80.0, "near": 76.0, "far": 70.0}
     wall = {"best": 300.0, "near": 100.0, "far": 10.0}
-    bd = {m: {c: {"quality": q[m], "wall_s": wall[m], "tok_s": None} for c in modelscore.CLASSES} for m in q}
-    bd["new"] = {c: {"quality": None, "wall_s": None, "tok_s": None} for c in modelscore.CLASSES}
-    assert modelscore.order(bd, "light", "smart", known=["new"]) == ["best", "near", "far", "new"]
-    assert modelscore.order(bd, "light", "fast", known=["new"]) == ["near", "best", "far", "new"]
-    assert modelscore.order(bd, "light", "fast", margin=2.0) == ["best", "near", "far", "new"]
-    assert modelscore.order(bd, "light", "fast", margin=50.0, floor=75.0) == ["near", "best", "far", "new"]
+    bd = {m: {c: {"quality": q[m], "fair": q[m], "wall_s": wall[m], "tok_s": None} for c in modelscore.CLASSES} for m in q}
+    bd["new"] = {c: {"quality": 99.0, "fair": None, "wall_s": 1.0, "tok_s": None} for c in modelscore.CLASSES}
+    assert modelscore.order(bd, "light", "smart") == ["best", "near", "far"], "no fair score: left out"
+    assert modelscore.order(bd, "light", "fast") == ["near", "best", "far"]
+    assert modelscore.order(bd, "light", "fast", margin=2.0) == ["best", "near", "far"]
+    assert modelscore.order(bd, "light", "fast", margin=50.0, floor=75.0) == ["near", "best", "far"]
     # auto: fast for babysit, smart elsewhere; a class's own prefer wins.
     assert modelscore.prefs("light", {})["prefer"] == "auto"
     assert modelscore.prefs("light", {"light": {"prefer": "fast", "margin_pts": 3, "floor": -1}}) == {
         "prefer": "fast", "margin_pts": 3.0, "floor": modelscore.FLOOR}
+
+
+def _tb_row(model, rate, trials, at):
+    return json.dumps({"model": model, "class": "terminalbench", "suite": "terminalbench", "score": rate,
+                       "trials": trials, "at": at}) + "\n"
 
 
 def test_a_new_higher_scoring_model_tops_the_rankings_and_model_ranking_stays_the_standard_class(env, monkeypatch):
@@ -3276,12 +3281,13 @@ def test_a_new_higher_scoring_model_tops_the_rankings_and_model_ranking_stays_th
     (d / "2026-01-01.json").write_text(json.dumps({"at": 1.0, "results": {
         "m-old": {"score": 0.5, "cells": {"inject": True}}, "m-two": {"score": 0.6, "cells": {"inject": True}},
         "m-off": {"score": 1.0, "inconclusive": True}}}))
-    res = modelscore.publish(["m-old", "m-two"], 1000.0)
+    (d / "tb.jsonl").write_text(_tb_row("m-old", 0.5, 20, 1.0) + _tb_row("m-two", 0.6, 20, 1.0) + _tb_row("m-few", 1.0, 3, 1.0))
+    res = modelscore.publish(["m-old", "m-two", "m-few"], 1000.0)
     assert res["changed"] and res["new"] == ["m-two", "m-old"] and modelrank.ranking({}) == ["m-two", "m-old"]
     cls = project.account_value(modelscore.KEY)
-    assert set(cls) == set(modelscore.CLASSES) and cls["standard"] == ["m-two", "m-old"]
-    # A newly served model with a better bench (a jsonl suite) becomes every class's first.
-    (d / "extra.jsonl").write_text(json.dumps({"model": "m-new", "score": 95, "suite": "extra", "at": 2.0}) + "\n")
+    assert set(cls) == set(modelscore.CLASSES) and cls["standard"] == ["m-two", "m-old"], "too few trials: left out"
+    # A newly served model with a better fair score becomes every class's first.
+    (d / "extra.jsonl").write_text(_tb_row("m-new", 0.95, 40, 2.0))
     res = modelscore.publish(["m-old", "m-two", "m-new"], 2000.0)
     assert res["new"][0] == "m-new" and modelrank.ranking({})[0] == "m-new"
     assert all(v[0] == "m-new" for v in project.account_value(modelscore.KEY).values())
@@ -3294,6 +3300,32 @@ def test_a_new_higher_scoring_model_tops_the_rankings_and_model_ranking_stays_th
     assert modelscore.fast_order("light")[0] == "m-new"
 
 
+def test_only_models_with_a_fair_score_are_ranked_best_first_so_a_weak_tb_rate_never_leads(env, monkeypatch):
+    from ttp import modelscore, project
+    home = _rank_home(env, monkeypatch)
+    d = home / "model-bench"
+    d.mkdir(parents=True)
+    # m-weak: 4 of 89 TB tasks; m-live: 131 good of 142 live tasks, no TB; m-bench: a bench mean, no sample size;
+    # m-thin: 5 of 6 live tasks.
+    (d / "tb.jsonl").write_text(_tb_row("m-weak", 4 / 89, 89, 1.0)
+                                + json.dumps({"model": "m-bench", "score": 1.0, "suite": "suite", "at": 1.0}) + "\n")
+    modelscore.record("one", {"m-live": {"standard": _score_row(142, 131)}, "m-thin": {"standard": _score_row(6, 5)}}, 10.0)
+    got = modelscore.build(["m-weak", "m-live", "m-bench", "m-thin"], {})
+    bd = got["board"]
+    assert bd["m-live"]["standard"]["fair"] == round(100 * 131 / 142, 2) and bd["m-weak"]["standard"]["fair"] == round(400 / 89, 2)
+    assert bd["m-bench"]["standard"]["fair"] is None and bd["m-thin"]["standard"]["fair"] is None
+    assert got["ranking"]["standard"] == ["m-live", "m-weak"], "best fair score first; no score or too few samples: left out"
+    assert got["ranking"]["light"] == ["m-weak"], "live tasks count in their own class only"
+    assert "left out (no fair score" in modelscore.text(got) and "m-bench, m-thin" in modelscore.text(got)
+    # The minimum is a setting; with no fair model anywhere publish leaves the last rankings alone.
+    assert modelscore.build(["m-thin"], {"min_samples": 5})["ranking"]["standard"] == ["m-live", "m-thin", "m-weak"]
+    project.set_account_setting(modelscore.KEY, {"standard": ["m-keep"]})
+    (d / "tb.jsonl").write_text("")
+    modelscore.record("one", {}, 20.0)
+    modelscore.publish(["m-bench"], 30.0)
+    assert project.account_value(modelscore.KEY) == {"standard": ["m-keep"]}
+
+
 def test_a_failed_injection_bench_bars_a_model_from_babysit(env, monkeypatch):
     from ttp import modelscore
     home = _rank_home(env, monkeypatch)
@@ -3301,6 +3333,7 @@ def test_a_failed_injection_bench_bars_a_model_from_babysit(env, monkeypatch):
     d.mkdir(parents=True)
     (d / "2026-01-01.json").write_text(json.dumps({"at": 1.0, "results": {
         "m-leaky": {"score": 1.0, "cells": {"inject": False}}, "m-safe": {"score": 0.5, "cells": {"inject": True}}}}))
+    (d / "tb.jsonl").write_text(_tb_row("m-leaky", 0.9, 20, 1.0) + _tb_row("m-safe", 0.5, 20, 1.0))
     got = modelscore.build(["m-leaky", "m-safe"], {})
     assert got["barred"] == ["m-leaky"] and got["ranking"]["babysit"] == ["m-safe"]
     assert got["ranking"]["standard"] == ["m-leaky", "m-safe"]

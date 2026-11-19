@@ -1312,6 +1312,31 @@ changes, the reason is recorded and one normal event goes out. Concurrent runs o
 refusals lowers it by one. `pricing.<provider>` rows `[$/M input, cached input, output]` price its tokens,
 cached ones at the cache-read rate.
 
+GLM work route (`glmwork.py`, off by default). `route.glm_work` (a project and account key) moves most of a
+project's model-hours to one chat model: `{"on": true, "model": "<chat model>", "effort": "max", "holdout": 0.1,
+"holdout_held": 0.05, "kinds": ["code", "work", "question", "harness"], "fallback": {"provider": "claude", "model":
+"sonnet", "effort": "high"}}` (the values shown are the defaults; `model` falls back to `route.code_sonnet.glm.model`).
+The `glm_work` release flag sets `on` per project (Waves and auto below); a project's own `on` wins. On a covered
+project every run of a kind on the list goes to the model at its effort, worker wakes and conclusion runs included
+(the conclusion floor keeps the run's tier and effort, not its provider), and code tasks take the code arm above
+with the arm's share at `1 - holdout`, its policy-file bounce and switch-back guard, and no Sonnet quality hold.
+These stay on the core provider, checked before any route returns: coordinator turns, plan and review tasks and
+verdict runs, the deep tier, a provider or model pin, outside text (`untrusted_input`), a tier-up retry, a run a
+chat model bounced (needs Opus or deep), a run that answers a chat or posts to a person (`reply_chat`, or a spec
+naming a post, reply or comment to a person, a channel, an issue or a PR), optimization or design work (a spec
+naming optimize, redesign, architecture, design a/the/how, or propose a plan, design or approach, plus the model
+pick's hard and the code arm's judgment patterns), and device work. Urgent work stays only with `keep_urgent`.
+A seeded coin per task keeps the holdout on core for the quality baseline: `holdout` while the project's wave is
+judged, `holdout_held` once the hourly wave gate says its quality holds (back to `holdout` if it turns worse);
+each task's arm is recorded once (`glm_work_arm:<task>`) and follow-ups keep their lineage's arm. A start the
+endpoint refuses (down, rate limit, over capacity, the busy wait run out) starts on `fallback`, and the run note
+names that model (`fallback_model`); each hour's starts, fallbacks by reason and waits are kept for 48 h
+(`glm_work_hour:<hour>`). A run class route on any project now runs the same keep-core checks before it returns:
+a review, a floor run, a pin or a protected run stays on core.
+`providers.chat.rank_exclude` (a project or account list of model ids) keeps those models off every ranking, class
+ranking, stand-in list and down-model pick, e.g. a small variant that should never take work:
+`ttp config --account providers.chat.rank_exclude '["<model id>"]'`.
+
 A device A/B compares two Claude models on device tasks; it is off by default. `route.device_ab` (a project
 and account key, the project's value over the account's) takes `{"projects": [...], "arms": {"sonnet":
 {"model": "sonnet", "effort": "high"}, "opus": {"model": "opus", "effort": "high"}}, "share": 0.5, "days": 3,
@@ -1727,7 +1752,10 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    `providers.chat.class_prefs.<class>.prefer`: `smart` (highest quality first), `fast` (the fastest
    model, by median wall time then tokens per second, within `margin_pts`, default 5, of the best and
    at or above the class `floor`, default 0) or `auto` (the default: fast for `babysit`, smart
-   elsewhere). Unscored models go last in the account ranking's order. The result is the account value
+   elsewhere), both on the model's fair score: its pass share over its Terminal-Bench trials and its live
+   tasks pooled, once they number at least `providers.chat.class_prefs.min_samples` (default 20). A model
+   with no fair score (a bench mean or prior alone, or too few samples) is left out of the class and listed
+   apart by `ttp model-bench scores`. The result is the account value
    `providers.chat.class_ranking.<class>`, and `providers.chat.model_ranking` is kept equal to the
    `standard` class, so everything above reads it unchanged; each change is one line in
    `model-ranking.jsonl`. Once the scoreboard ranks, the Artificial Analysis refresh stops writing
@@ -1794,8 +1822,7 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    task, each (model, task) its own Harbor job that resumes after a restart; HTTP 429 answers are waited
    out and never scored, and a setup error reruns once, then counts as a fault. A host-wide trial cap is
    sized to free cores. Its `terminalbench` row (passed/trials, median minutes per trial) is the main
-   ranking input: served models rank by Terminal-Bench pass rate first, then live outcomes, the 6-cell
-   bench and the public index. It decides the verdict: under `floor_share` of the best served model's
+   ranking input: its trials pool with live outcomes into the fair score above. It decides the verdict: under `floor_share` of the best served model's
    rate parks the model, a pass frees it, and endpoint faults leave it inconclusive. Settings live under
    `model_bench.terminalbench` (`on`, `tasks_file`, `agent`, `limit_s` default 900, `concurrency` 0 =
    free cores / 4, `floor_share` default 0.5, `dataset` default `terminal-bench@2.0`, `compose`: the docker
@@ -5202,6 +5229,28 @@ only records its passed probe (the wake-tools line counts 8+ call wakes with or 
 shows the 7-day error of both; no shown ETA changes. A flag whose feature already runs for every project graduates and leaves the
 list instead of being gated off: `push_isolation` (push batches that survive one failing entry or a remote
 outage). `device_prewarm` and `deslop` gate nothing yet.
+
+Waves and auto. A flag with a wave gate (`glm_work`, a project's routed work on GLM, and `glm_code`) can widen by
+named projects instead of rings: `ttp rollout waves <flag> <p1,p2> <p3> ...` sets its ordered waves (each argument
+one wave, comma-separated projects, a project in one wave only; `waves <flag> clear` removes them, refused while
+the flag is at auto), and `ttp rollout set <flag> auto --reason ...` (refused without waves) hands it to the gate.
+At auto a project is on when it is in waves 0 to the flag's current wave (from 0) and not rolled back for that
+flag; an excluded project never, and a project's own setting still wins. The state is account settings beside
+the rings (`rollout.waves`, `rollout.wave_at`, `rollout.project_rollback`), as user-only as they are: a run may
+not set them, and the waves and the level change only from the terminal. The gate runs from the daemons without
+a model, at most once an hour per flag across the account: it judges each project of the covered waves against
+its own Claude baseline (`ok`, `worse`, or `wait` with too few reviewed tasks). A `worse` project is rolled back
+for that flag alone, the others keep it; it stays off until `ttp rollout arm <flag> <project>`. When every project
+left in the current wave is `ok`, and none went worse in that pass, the next wave opens; `wait` holds it. Each
+move and rollback is in the ledger (`advance`, `project_rollback`, `project_arm`) and raises one event for the
+coordinator of the project it concerns (`rollout_wave`). The 15-minute health watch leaves a flag at auto to the
+gate; `rollback <flag>` still turns it off for everyone.
+
+Overrides. For each flag that is on, `ttp rollout status` lists every project whose own project.json sets the
+flag's key, which wins over the rollout: `overridden in <project> by its own setting since <time>`, the time from
+the project's config change log, else project.json's modification time (a leftover
+`route.code_sonnet.glm_share 0` under `glm_code` is the usual case). That project's coordinator also gets one
+`rollout_override` event a day per flag, naming the key and how to clear it.
 
 Scratch projects. A project listed in ring 0 has a soft daily spend cap, $25 by default
 (`rollout.scratch_cap_usd`, the project's own value first, 0 turns it off). Past it, routine tasks wait in the

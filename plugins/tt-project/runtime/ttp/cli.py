@@ -2224,6 +2224,8 @@ def cmd_stats(a) -> None:
         return _stats_ready_wait_all(a)
     if getattr(a, "device_ab", False) and (a.all or a.projects):
         return _stats_device_ab_all(a)
+    if getattr(a, "glm_share", False) and (a.all or a.projects):
+        return _stats_glm_share_all(a)
     p = need(a.name, sys.argv[1:]) if a.name else here()
     if not p:
         die("no tt-project project here; name one: `ttp stats <name>`")
@@ -2234,6 +2236,13 @@ def cmd_stats(a) -> None:
         since = _stats_time(a.since, tz, "--since") or until - a.days * 86400
         s = {p.name: readywait.report(p.db.q, since, until, p.state)}
         print(json.dumps(s, indent=1) if a.json else readywait.text(s))
+        return
+    if getattr(a, "glm_share", False):
+        from . import glmshare
+        tz = timefmt.home(p)
+        until = _stats_time(a.until, tz, "--until") or time.time()
+        s = glmshare.report(p, _stats_time(a.since, tz, "--since") or until - a.days * 86400, until)
+        print(json.dumps(s, indent=1) if a.json else glmshare.text(s))
         return
     if a.effort_ab:
         from . import effortab
@@ -2369,6 +2378,30 @@ def _stats_device_ab_all(a) -> None:
         return
     print("\n".join(f"{n}: {r['error']}" if "error" in r else deviceab.report_text(r, n) for n, r in out.items())
           or "no projects")
+
+
+def _stats_glm_share_all(a) -> None:
+    """`ttp stats --glm-share --all` (or --projects a,b): each project on this machine through its Project, as
+    `ttp stats NAME` reads it; a project on another host or not found is listed with an error."""
+    from . import glmshare
+    reg = load_registry().get("projects") or {}
+    names = [n.strip() for n in a.projects.split(",") if n.strip()] if a.projects else sorted(reg)
+    out: dict = {}
+    for name in names:
+        p = local_project(name)
+        if p is None or not p.exists():
+            out[name] = {"error": "not a project on this machine"}
+            continue
+        try:
+            tz = timefmt.home(p)
+            until = _stats_time(a.until, tz, "--until") or time.time()
+            out[name] = glmshare.report(p, _stats_time(a.since, tz, "--since") or until - a.days * 86400, until)
+        except Exception as err:   # one unreadable project never hides the others
+            out[name] = {"error": f"{type(err).__name__}: {err}"[:200]}
+    if a.json:
+        print(json.dumps(out, indent=1))
+        return
+    print("\n".join(f"{n}: {r['error']}" if "error" in r else glmshare.text(r) for n, r in out.items()) or "no projects")
 
 
 def _stats_ready_wait_all(a) -> None:
@@ -16453,8 +16486,15 @@ def main(argv: list[str] | None = None) -> None:
                    help="how long ready tasks waited for their run to start instead: median, p90, max, by hold "
                         "cause (project cap, machine-wide limit, own checks, budget gate, resource, dispatch with a "
                         "free place), and the host checks slot waits (readywait.py; --since/--until, else --days)")
-    s.add_argument("--all", action="store_true", help="with --ready-wait or --device-ab: every project on this machine, read only")
-    s.add_argument("--projects", help="with --ready-wait or --device-ab: these projects (comma-separated), read only")
+    s.add_argument("--all", action="store_true",
+                   help="with --ready-wait, --device-ab or --glm-share: every project on this machine, read only")
+    s.add_argument("--projects", help="with --ready-wait, --device-ab or --glm-share: these projects (comma-separated), "
+                                      "read only")
+    s.add_argument("--glm-share", action="store_true",
+                   help="the GLM work route instead (glmshare.py): per role, the share of model-hours and runs on the "
+                        "chat provider's GLM model, then per arm (glm, claude) review first-pass rate, fix rounds, "
+                        "failed and reopened tasks, bounces, device incidents and tasks done per day, Claude $/day "
+                        "and user corrections (--since/--until, else --days; --all or --projects: every project)")
     s.add_argument("--babysit", action="store_true",
                    help="the chat watcher instead: decisions it settled and fallbacks, per purpose, model and hour "
                         "(read-only; --since/--until, else the last --days)")
@@ -17767,11 +17807,13 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_alerts)
 
     s = sub.add_parser("rollout", help="release rings: show or change which projects a flagged change is on for")
-    s.add_argument("action", choices=["status", "ring", "set", "promote", "rollback", "arm"],
-                   help="status; ring PROJECT 0|1|2|exclude|include; set FLAG off|0|1|2; promote FLAG (one ring wider); "
-                        "rollback FLAG (off and frozen); arm FLAG (a fix landed: unfreeze)")
+    s.add_argument("action", choices=["status", "ring", "set", "promote", "rollback", "arm", "waves"],
+                   help="status; ring PROJECT 0|1|2|exclude|include; set FLAG off|0|1|2|auto; promote FLAG (one ring "
+                        "wider); rollback FLAG (off and frozen); arm FLAG [PROJECT] (a fix landed: unfreeze, or re-arm "
+                        "one project the wave gate rolled back); waves FLAG <p1,p2> <p3> ... | clear (auto's waves)")
     s.add_argument("target", nargs="?", help="the project (ring) or the flag")
-    s.add_argument("value", nargs="?", help="the ring (ring) or the level (set)")
+    s.add_argument("value", nargs="?", help="the ring (ring), the level (set), the project (arm) or the first wave")
+    s.add_argument("more", nargs="*", help="the further waves (waves)")
     s.add_argument("--reason", help="why (kept in the rollout ledger)")
     s.add_argument("--json", action="store_true", help="status as JSON")
     s.set_defaults(fn=cmd_rollout)

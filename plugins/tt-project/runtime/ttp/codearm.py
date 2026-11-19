@@ -70,7 +70,7 @@ GUARD_PTS = 10.0
 GUARD_MIN = 15
 GUARD_EVERY_S = 23 * 3600.0
 GUARD_KEEP = 90
-CAP = {"start": 4, "min": 1, "max": 8}
+CAP = {"start": 4, "min": 1, "max": 16}   # glm_cap {"start", "min", "max"} sets them (1-64)
 CAP_EVERY_S = 3600.0
 WAIT_LOW_S = 10.0                   # mean server wait per call (chatbridge per_call wait_s) that still counts as low
 
@@ -90,14 +90,19 @@ def _labels(task: dict) -> list[str]:
 def settings(cfg: dict, policy: list | None = None) -> dict | None:
     """The arm's settings, or None when it is off: the code route off (runclass.code_settings), `glm_share` unset
     or 0, no `glm.model`, or an empty policy list (`policy` is the project's policyfiles.load; None: not checked)."""
-    from . import runclass
-    if not runclass.code_settings(cfg) or policy is not None and not policy:
-        return None
+    from . import glmwork, runclass
     got = (cfg.get("route") or {}).get("code_sonnet")
     got = got if isinstance(got, dict) else {}
-    share = _num(got.get("glm_share"), 0, 1, 0.0)
-    arm = got.get("glm") if isinstance(got.get("glm"), dict) else {}
-    model = str(arm.get("model") or "").strip()
+    if w := glmwork.settings(cfg):   # a project the GLM work route covers: its settings drive the arm
+        if policy is not None and not policy or w["harness"] not in HARNESSES:
+            return None
+        share, arm, model = 1 - w["holdout"], {**w, "harness": w["harness"]}, w["model"]
+    else:
+        if not runclass.code_settings(cfg) or policy is not None and not policy:
+            return None
+        share = _num(got.get("glm_share"), 0, 1, 0.0)
+        arm = got.get("glm") if isinstance(got.get("glm"), dict) else {}
+        model = str(arm.get("model") or "").strip()
     if share <= 0 or not model or str(arm.get("harness") or "claude-code") not in HARNESSES:
         return None   # a share on a harness that is not guarded is 0 for a live run (refusal says why)
     c = got.get("glm_cap") if isinstance(got.get("glm_cap"), dict) else {}
@@ -105,7 +110,7 @@ def settings(cfg: dict, policy: list | None = None) -> dict | None:
     hi = max(lo, int(_num(c.get("max"), 1, 64, CAP["max"])))
     return {"share": share, "provider": str(arm.get("provider") or "chat"), "model": model,
             "effort": str(arm.get("effort") or "max"), "harness": str(arm.get("harness") or "claude-code"),
-            "seed": str(got.get("glm_seed") or ""),
+            "seed": str(arm.get("seed") or got.get("glm_seed") or ""), "glm_work": bool(glmwork.settings(cfg)),
             "cap": {"start": min(hi, max(lo, int(_num(c.get("start"), 1, 64, CAP["start"])))), "min": lo, "max": hi},
             "pts": _num(got.get("glm_guard_pts"), 0, 100, GUARD_PTS),
             "min_tasks": int(_num(got.get("glm_guard_min"), 1, 10000, GUARD_MIN))}
@@ -152,15 +157,18 @@ def refusal(cfg: dict, policy: list | None = None) -> str:
     """Why a live `glm_share` > 0 is treated as 0, '' when it is not: its `glm.harness` is not a guarded harness
     (HARNESSES), or the project has no policy list (`policy` empty: fail closed), so no run takes the arm and
     every code task keeps its normal route."""
-    from . import policyfiles, runclass
-    if not runclass.code_settings(cfg):
-        return ""
-    got = (cfg.get("route") or {}).get("code_sonnet")
-    got = got if isinstance(got, dict) else {}
-    arm = got.get("glm") if isinstance(got.get("glm"), dict) else {}
-    if _num(got.get("glm_share"), 0, 1, 0.0) <= 0 or not str(arm.get("model") or "").strip():
-        return ""
-    harness = str(arm.get("harness") or "claude-code")
+    from . import glmwork, policyfiles, runclass
+    if w := glmwork.settings(cfg):
+        harness = w["harness"]
+    else:
+        if not runclass.code_settings(cfg):
+            return ""
+        got = (cfg.get("route") or {}).get("code_sonnet")
+        got = got if isinstance(got, dict) else {}
+        arm = got.get("glm") if isinstance(got.get("glm"), dict) else {}
+        if _num(got.get("glm_share"), 0, 1, 0.0) <= 0 or not str(arm.get("model") or "").strip():
+            return ""
+        harness = str(arm.get("harness") or "claude-code")
     if harness in HARNESSES:
         if policy is not None and not policy:
             return (f"route.code_sonnet glm_share is treated as 0: this project has no policy file list "
@@ -186,7 +194,9 @@ def log_refusal(db, cfg: dict, log=None, policy: list | None = None) -> str:
 
 
 def setting_mark(cfg: dict) -> str:
-    return json.dumps((cfg.get("route") or {}).get("code_sonnet"), sort_keys=True, default=str)
+    r = cfg.get("route") or {}
+    return json.dumps(r.get("code_sonnet"), sort_keys=True, default=str) + (
+        f"|glm_work:{r['glm_work'].get('model')}" if isinstance(r.get("glm_work"), dict) and r["glm_work"].get("on") is True else "")
 
 
 def held(db, cfg: dict) -> bool:
@@ -229,9 +239,21 @@ def stays(db, cfg: dict, task: dict, tier: str, picked: dict | None = None, poli
     (runclass.code_route), a resource, a protected class, a `conclusion:` line, the force line, a user order,
     a policy-class spec (policyfiles.task_reason against the project's list `policy`, model-free), an unsupported
     harness."""
-    from . import policyfiles, route, runclass, urgent
+    from . import glmwork, policyfiles, route, runclass, urgent
     if (task.get("kind") or "") != "code":
         return "not_code"
+    if glmwork.settings(cfg):   # covered: the GLM work route's keep-core checks, not the Sonnet route's stays
+        if why := glmwork.keeps_core(db, cfg, task, tier, None, picked):
+            return why
+        if str(tier or task.get("tier") or "standard") not in ("standard", "light"):
+            return "tier"
+        if any(lb.startswith(("resource:", "exclusive:", "read:")) for lb in _labels(task)):
+            return "resources"
+        if FORCE.search(str(task.get("spec") or "")):
+            return "forced_claude"
+        if policy and (why := policyfiles.task_reason(policy, task)):
+            return f"policy: {why}"
+        return ""
     if str(tier or task.get("tier") or "standard") != "standard":
         return "tier"
     if any(lb.startswith(("resource:", "exclusive:", "read:")) for lb in _labels(task)):
@@ -277,6 +299,13 @@ def choose(db, cfg: dict, task: dict | None, tier: str, picked: dict | None = No
         if len(ch) > 1:
             got = {"arm": parent["arm"] if parent else "claude", "why": f"lineage of #{ch[0]['id']}"
                    + ("" if parent else " (no arm)"), "seed": s["seed"], "ts": time.time()}
+        elif s.get("glm_work"):   # covered: a kept task stays on Claude; else the work route's holdout coin
+            from . import glmwork
+            why = stays(db, cfg, task, tier, picked, policy)
+            w = None if why else glmwork.arm(db, cfg, task, peek=peek)
+            arm = "glm" if w and w["arm"] == "glm" else "claude"
+            got = {"arm": arm, "why": why or ("holdout: " if arm == "claude" else "") + str(w["why"]),
+                   "seed": s["seed"], "ts": time.time()}
         else:
             why = stays(db, cfg, task, tier, picked, policy)
             arm = "claude" if why else "glm" if coin(tid, s["share"], s["seed"]) else "sonnet"

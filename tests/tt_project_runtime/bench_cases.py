@@ -1459,17 +1459,17 @@ def test_terminalbench_429_is_waited_out_and_a_setup_error_reruns_once(tmp_path)
 def test_terminalbench_ranks_first_and_decides_the_verdict(env, monkeypatch):
     from ttp import modelscore, modelsuite
     d = _suite_home(env, monkeypatch)
-    rows = [{"model": "m-a", "class": "terminalbench", "suite": "terminalbench", "score": 0.4, "at": 1},
-            {"model": "m-b", "class": "terminalbench", "suite": "terminalbench", "score": 0.6, "at": 1},
-            {"model": "m-c", "class": "terminalbench", "suite": "terminalbench", "score": 0.4, "at": 1},
+    rows = [{"model": "m-a", "class": "terminalbench", "suite": "terminalbench", "score": 0.4, "trials": 20, "at": 1},
+            {"model": "m-b", "class": "terminalbench", "suite": "terminalbench", "score": 0.6, "trials": 20, "at": 1},
+            {"model": "m-c", "class": "terminalbench", "suite": "terminalbench", "score": 0.4, "trials": 20, "at": 1},
             {"model": "m-a", "class": "standard", "suite": "suite", "score": 0.9, "at": 1},
             {"model": "m-c", "class": "standard", "suite": "suite", "score": 0.5, "at": 1},
             {"model": "m-d", "class": "standard", "suite": "suite", "score": 1.0, "at": 1}]
     (d / "2026-11-12.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
     bd = modelscore.board({}, modelscore.bench(), {}, ["m-a", "m-b", "m-c", "m-d", "m-e"])
     assert bd["m-a"]["standard"]["tb"] == 40.0 and bd["m-a"]["standard"]["bench"] == 90.0, "TB stays out of the mean"
-    assert modelscore.order(bd, "standard", "smart") == ["m-b", "m-a", "m-c", "m-d", "m-e"], \
-        "TB rate first; a tie goes to quality; models without TB after; unscored last"
+    assert modelscore.order(bd, "standard", "smart") == ["m-b", "m-a", "m-c"], \
+        "the TB trials give a fair score, a tie goes to quality; a bench mean alone has no sample size: left out"
     tb = lambda m, rate, faults=0: {"model": m, "class": "terminalbench", "pass_rate": rate, "faults": faults}
     day = [tb("m-a", 0.6), tb("m-b", 0.2), tb("m-c", 0.5, faults=1)]
     assert modelsuite.verdict(day, "m-a", "daily") == (0.6, False, "daily"), "the best passes: freed"

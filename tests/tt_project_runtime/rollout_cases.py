@@ -55,7 +55,7 @@ def test_promote_walks_off_0_1_2_and_every_change_is_ledgered(env, capsys):
     assert _roll(capsys, "set", "glm_code", "2")[1].endswith("already; nothing changed\n")
     assert len(rollout.ledger("glm_code")) == 3, "a no-op writes nothing"
     code, out = _roll(capsys, "set", "glm_code", "7")
-    assert code == 2 and "off, 0, 1 or 2" in out
+    assert code == 2 and "off, 0, 1, 2 or auto" in out
     code, out = _roll(capsys, "promote", "nope")
     assert code == 2 and "unknown flag" in out
 
@@ -677,3 +677,159 @@ def test_every_flag_call_site_lies_in_the_files_the_flags_code_list_names():
         assert files <= set(rollout.FLAGS[flag]["code"]), f"{flag}: on() outside its code list: {sorted(files - set(rollout.FLAGS[flag]['code']))}"
     for flag, meta in rollout.FLAGS.items():
         assert all((rt.parent.parent.parent.parent / c).is_file() for c in meta["code"]), f"{flag}: a listed code file does not exist"
+
+
+# Waves: auto's ordered project lists and the model-free wave gate (rollout.wave_tick).
+
+def _judge(states):
+    """A judge answering `states[name]` (ok, worse or wait) for the project of that name."""
+    def judge(p, cfg, now):
+        return {"state": states[p.name], "why": f"{p.name} {states[p.name]}", "n": 12}
+    return judge
+
+
+def _wave_projects(tmp_path, *names):
+    from types import SimpleNamespace
+    return {n: SimpleNamespace(name=n, config_path=tmp_path / "none" / "project.json") for n in names}
+
+
+def test_waves_are_set_and_cleared_only_from_the_terminal(env, capsys, monkeypatch):
+    from ttp import project, rollout
+    assert _roll(capsys, "waves", "glm_work", "alpha,beta", "gamma")[0] == 0
+    assert rollout.waves("glm_work") == [["alpha", "beta"], ["gamma"]] and rollout.wave_at("glm_work") == 0
+    assert rollout.ledger("glm_work")[-1]["kind"] == "waves"
+    code, out = _roll(capsys, "waves", "glm_work", "alpha", "alpha,beta")
+    assert code == 2 and "one wave only" in out
+    code, out = _roll(capsys, "waves", "deslop", "alpha")
+    assert code == 2 and "no wave gate" in out
+    monkeypatch.setenv("TTP_RUN_DIR", "/nonexistent")
+    for argv in (("waves", "glm_work", "clear"), ("set", "glm_work", "auto"), ("arm", "glm_work", "alpha")):
+        code, out = _roll(capsys, *argv)
+        assert code == 2 and "only the user's terminal" in out
+    monkeypatch.delenv("TTP_RUN_DIR")
+    assert _roll(capsys, "set", "glm_work", "auto")[0] == 0
+    code, out = _roll(capsys, "waves", "glm_work", "clear")
+    assert code == 2 and "another level" in out
+    _roll(capsys, "set", "glm_work", "off")
+    assert _roll(capsys, "waves", "glm_work", "clear")[0] == 0 and rollout.waves("glm_work") == []
+    for key in ("waves", "wave_at", "project_rollback"):
+        assert f"rollout.{key}" in project.ACCOUNT_USER_ONLY and key in project.ACCOUNT_KEYS["rollout"]
+
+
+def test_auto_needs_waves_and_covers_the_waves_up_to_the_current_one(env, capsys):
+    from ttp import rollout
+    code, out = _roll(capsys, "set", "glm_work", "auto")
+    assert code == 2 and "no waves" in out and rollout.level("glm_work") == rollout.OFF
+    code, out = _roll(capsys, "set", "deslop", "auto")
+    assert code == 2 and "no wave gate" in out
+    _roll(capsys, "waves", "glm_work", "alpha,beta", "gamma")
+    assert _roll(capsys, "set", "glm_work", "auto")[0] == 0 and rollout.level("glm_work") == rollout.AUTO
+    assert {n for n in ("alpha", "beta", "gamma", "delta") if rollout.on("glm_work", n)} == {"alpha", "beta"}
+    rollout._put("wave_at", "glm_work", 1)
+    assert {n for n in ("alpha", "beta", "gamma", "delta") if rollout.on("glm_work", n)} == {"alpha", "beta", "gamma"}
+    rollout.set_ring("beta", "exclude")
+    assert not rollout.on("glm_work", "beta"), "an excluded project never takes a flag"
+    assert rollout.on("glm_work", "delta", {"route": {"glm_work": {"on": False}}}), "its own setting wins"
+    assert "auto" in _roll(capsys, "promote", "glm_work")[1] and rollout.level("glm_work") == rollout.AUTO
+
+
+def test_the_one_paste_rollout_is_harmless_to_paste_again_and_keeps_the_current_wave(env, capsys):
+    from ttp import rollout
+    paste = (("waves", "glm_work", "alpha,beta", "gamma", "delta"), ("set", "glm_work", "auto", "--reason", "go"))
+    for argv in paste:
+        assert _roll(capsys, *argv)[0] == 0
+    rollout._put("wave_at", "glm_work", 1)
+    entries = len(rollout.ledger("glm_work"))
+    outs = [_roll(capsys, *argv) for argv in paste]
+    assert [c for c, _ in outs] == [0, 0] and "unchanged" in outs[0][1] and "already" in outs[1][1]
+    assert rollout.level("glm_work") == rollout.AUTO and rollout.wave_at("glm_work") == 1
+    assert len(rollout.ledger("glm_work")) == entries, "a second paste records nothing"
+
+
+def test_the_wave_gate_waits_then_advances_once_every_project_of_the_wave_is_ok_once_an_hour(env, capsys, tmp_path):
+    from ttp import rollout
+    _roll(capsys, "waves", "glm_work", "alpha,beta", "gamma")
+    _roll(capsys, "set", "glm_work", "auto")
+    projs, now = _wave_projects(tmp_path, "alpha", "beta", "gamma"), time.time()
+    states = {"alpha": "ok", "beta": "wait", "gamma": "ok"}
+    assert rollout.wave_tick(now, _judge(states), projs) == [] and rollout.wave_at("glm_work") == 0
+    states["beta"] = "ok"
+    assert rollout.wave_tick(now + 1800, _judge(states), projs) == [], "once an hour per flag"
+    recs = rollout.wave_tick(now + 3600, _judge(states), projs)
+    assert [(r["op"], r["wave"], r["projects"]) for r in recs] == [("advance", 1, ["gamma"])]
+    assert rollout.wave_at("glm_work") == 1 and rollout.on("glm_work", "gamma")
+    last = rollout.ledger("glm_work")[-1]
+    assert last["op"] == "advance" and last["flag"] == "glm_work" and "alpha ok" in last["why"]
+    assert rollout.wave_tick(now + 7200, _judge(states), projs) == [], "the last wave: nothing more to open"
+    assert rollout.wave_tick(now + 9000, _judge(states), {}) == [] and rollout.wave_at("glm_work") == 1
+
+
+def test_a_worse_project_is_rolled_back_alone_and_the_terminal_rearms_it(env, capsys, tmp_path):
+    from ttp import rollout
+    _roll(capsys, "waves", "glm_work", "alpha,beta", "gamma")
+    _roll(capsys, "set", "glm_work", "auto")
+    projs, now = _wave_projects(tmp_path, "alpha", "beta", "gamma"), time.time()
+    states = {"alpha": "worse", "beta": "ok", "gamma": "ok"}
+    recs = rollout.wave_tick(now, _judge(states), projs)
+    assert [(r["op"], r["project"]) for r in recs] == [("project_rollback", "alpha")], "no advance in a tick that rolled back"
+    assert not rollout.on("glm_work", "alpha") and rollout.on("glm_work", "beta") and rollout.level("glm_work") == "auto"
+    assert rollout.rolled_back("glm_work")["alpha"]["why"] == "alpha worse"
+    assert "rolled back in alpha alone" in _roll(capsys, "status")[1]
+    recs = rollout.wave_tick(now + 3600, _judge(states), projs)
+    assert [r["op"] for r in recs] == ["advance"], "a rolled-back project no longer holds its wave"
+    assert "re-armed in alpha" in _roll(capsys, "arm", "glm_work", "alpha")[1]
+    assert rollout.on("glm_work", "alpha") and rollout.ledger("glm_work")[-1]["op"] == "project_arm"
+    assert "not rolled back" in _roll(capsys, "arm", "glm_work", "alpha")[1]
+    assert rollout.frozen("glm_work") is None
+
+
+def test_each_wave_move_or_rollback_raises_one_event_in_the_project_it_concerns(env, capsys, tmp_path):
+    from ttp import rollout
+    g = make(env, "gamma")
+    projs = {**_wave_projects(tmp_path, "alpha", "delta"), "gamma": g}
+    _roll(capsys, "waves", "glm_work", "alpha", "gamma", "delta")
+    _roll(capsys, "set", "glm_work", "auto")
+    now = time.time()
+    states = {"alpha": "ok", "gamma": "ok", "delta": "ok"}
+    assert [r["projects"] for r in rollout.wave_tick(now, _judge(states), projs)] == [["gamma"]]
+    assert [r["projects"] for r in rollout.wave_tick(now + 3600, _judge(states), projs)] == [["delta"]]
+    states["gamma"] = "worse"
+    assert [r["op"] for r in rollout.wave_tick(now + 7200, _judge(states), projs)] == ["project_rollback"]
+    assert rollout.project_events(g, now) == ["rollout_wave", "rollout_wave"], "wave 2 is not about it"
+    assert rollout.project_events(g, now) == [], "reported once"
+    texts = [r["text"] for r in g.db.q("SELECT text FROM events WHERE kind='rollout_wave' ORDER BY id")]
+    assert "opened wave 1" in texts[0] and "ttp rollout arm glm_work gamma" in texts[1]
+
+
+def test_status_shows_a_projects_overriding_own_setting_since_it_was_set(env, capsys):
+    from ttp import rollout, timefmt
+    p = make(env, "alpha")
+    p.set_config("route.code_sonnet.glm_share", 0)
+    _roll(capsys, "set", "glm_code", "2")
+    o = rollout.status()["flags"]["glm_code"]["overrides"]
+    assert [(x["project"], x["value"]) for x in o] == [("alpha", 0)]
+    assert o[0]["since"] == rollout.override_since(p, "route.code_sonnet.glm_share") and o[0]["since"] <= time.time()
+    out = _roll(capsys, "status")[1]
+    assert f"overridden in alpha by its own setting since {timefmt.long(o[0]['since'], p.raw_config())}" in out
+    raw = p.read_config()[0]
+    raw.setdefault("deslop", {})["enabled"] = True
+    p.config_path.write_text(json.dumps(raw))
+    _roll(capsys, "set", "deslop", "0")
+    assert rollout.status()["flags"]["deslop"]["overrides"][0]["since"] == p.config_path.stat().st_mtime, \
+        "no recorded set: project.json's time"
+    _roll(capsys, "set", "glm_code", "off")
+    assert rollout.status()["flags"]["glm_code"]["overrides"] == [], "only for a flag the user turned on"
+
+
+def test_an_overriding_own_setting_raises_one_event_a_day(env, capsys):
+    from ttp import rollout
+    p = make(env, "alpha")
+    p.set_config("route.code_sonnet.glm_share", 0)
+    now = time.time()
+    assert rollout.project_events(p, now) == [], "the flag is off: nothing overridden"
+    _roll(capsys, "set", "glm_code", "1")
+    assert rollout.project_events(p, now) == ["rollout_override"]
+    assert rollout.project_events(p, now + 60) == []
+    assert rollout.project_events(p, now + 86400) == ["rollout_override"]
+    text = p.db.one("SELECT text FROM events WHERE kind='rollout_override'")["text"]
+    assert "route.code_sonnet.glm_share = 0 overrides it" in text and "ttp config alpha" in text

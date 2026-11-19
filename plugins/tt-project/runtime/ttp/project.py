@@ -747,10 +747,12 @@ EXTRA_KEYS = {
     "model_bench": {"terminalbench"},
     # route: run-class routing (runclass.py). code_sonnet: {"share", "kinds", "guard", "guard_pts", "alarm_p"} or false, the code
     # route and its daily guard (runclass.guard_run), plus its GLM arm (codearm.py: "glm_share", "glm" {"provider",
-    # "model", "effort", "harness"}, "glm_seed", "glm_cap" {"start", "min", "max"}, "glm_guard_pts", "glm_guard_min"); core_cheap: {class: {"model", "effort"} | false} or false. Both
+    # "model", "effort", "harness"}, "glm_seed", "glm_cap" {"start", "min", "max"}, "glm_guard_pts", "glm_guard_min"); glm_work: the GLM work route (glmwork.py: "on", "model", "provider",
+    # "effort", "harness", "holdout", "holdout_held", "seed", "kinds", "keep_urgent", "fallback" {"provider", "model", "effort"},
+    # "min_tasks", "worse_pts"); core_cheap: {class: {"model", "effort"} | false} or false. Both
     # are account keys too (ACCOUNT_KEYS): the account's value first, the project's own over it. classes,
     # review_small_lines, review_medium_lines: the run classes' map and review sizes; host_max: host-wide (HOST_WIDE_KEYS).
-    "route": {"code_sonnet", "core_cheap", "device_ab", "device_ab_shadow", "classes", "review_small_lines", "review_medium_lines", "host_max"},
+    "route": {"code_sonnet", "core_cheap", "device_ab", "device_ab_shadow", "classes", "review_small_lines", "review_medium_lines", "host_max", "glm_work"},
     "budget": {"max_waits", "hourly_floor_usd", "estimate_weights", "hourly_waste_usd", "hourly_waste_runs",
                "hourly_coordinator_turns", "hourly_coordinator_repeats", "max_pace_hold_s",
                "cap_yellow_pct"},   # max_pace_hold_s: deprecated and ignored; accepted so old configs stay quiet
@@ -902,6 +904,9 @@ PROVIDER_KEYS = {"billing", "tiers", "plugin_dirs", "worker_isolation", "write_f
                  # demotion detector's thresholds (modeldemote.DEFAULTS).
                  "endpoint", "base_url", "max_tokens", "context_window", "route_cooldown_s", "effort_fields",
                  "route_wait_s", "routes", "model_ranking", "models_every_s", "demote",
+                 # rank_exclude: model ids kept off every ranking, stand-in list and fallback pick
+                 # (modelrank.excluded), e.g. a small variant that must never take work.
+                 "rank_exclude",
                  # busy_retries, busy_wait_s: how often and how long in all a call to a model at capacity
                  # (HTTP 429) is waited out and sent again (chatbridge.busy_wait).
                  "busy_retries", "busy_wait_s",
@@ -1904,9 +1909,9 @@ class Project:
         return (self.state / "project.db").is_file()
 
     def config(self) -> dict:
-        from . import codearm
+        from . import codearm, glmwork
         raw = self.raw_config()
-        return codearm.ring_gate(layered(raw), self.name, raw)
+        return glmwork.ring_gate(codearm.ring_gate(layered(raw), self.name, raw), self.name, raw)
 
     def set_config(self, dotted: str, value: Any, by: dict | None = None) -> None:
         """Write one key into project.json and record who set it (`by`, configwho.by; none: unknown)."""
@@ -3299,7 +3304,7 @@ CPU_GROUP_KEYS = {"cpu_quota", "busy_cpu_quota", "busy_probe", "busy_probe_s", "
 # project's own project.json, so the projects on a machine agree unless one overrides a key.
 ACCOUNT_KEYS = {"budget": {"global_daily_usd", "daily_target_usd", "day_start", "timezone", "push_spend_to"}, "pricing": {"claude", "codex"},
                 "guards": {"protected_paths"},   # paths no run on the host writes (pathguard)
-                "route": {"host_max", "classes", "review_small_lines", "review_medium_lines", "code_sonnet", "core_cheap", "device_ab", "device_ab_shadow"},   # route.host_limit; run-class routing (runclass.py); route.device_ab (deviceab.py)
+                "route": {"host_max", "classes", "review_small_lines", "review_medium_lines", "code_sonnet", "core_cheap", "device_ab", "device_ab_shadow", "glm_work"},   # route.host_limit; run-class routing (runclass.py); route.device_ab (deviceab.py)
                 "checks": {"host_max", "bare_slots", "idle_hold_s", "load_extra", "live_cores", "nice", "ionice", "priority_turns", "urgent_slots", "preempt_after_s", "test_pool", "test_run_max",
                            "test_run_min", "test_project_max", "test_project_slots", "test_project_workers", "load_guard", "load_sustain_s", "build_pool", "build_run_max", "build_project_max", "wall_cap_s",
                            "slots", "light_cmds", "max_wait_s", "wait_event_s", "priority_age_s",
@@ -3314,24 +3319,28 @@ ACCOUNT_KEYS = {"budget": {"global_daily_usd", "daily_target_usd", "day_start", 
                            "smoke_max_s",
                            *CPU_GROUP_KEYS},   # the landing check time limit (gatetime.max_s), project first
                 # release rings (rollout.py): flags {flag: off|0|1|2}, rings {"0": [names], "1": [names]}, excluded [names],
-                # thresholds (the health watch's limits), scratch_cap_usd (a ring-0 scratch project's daily spend cap)
-                "rollout": {"flags", "rings", "excluded", "thresholds", "scratch_cap_usd"}}
+                # thresholds (the health watch's limits), scratch_cap_usd (a ring-0 scratch project's daily spend cap),
+                # waves {flag: [[names]]}, wave_at {flag: k} and project_rollback {flag: {name: {ts, why}}} (auto's wave gate)
+                "rollout": {"flags", "rings", "excluded", "thresholds", "scratch_cap_usd", "waves", "wave_at",
+                            "project_rollback"}}
 # Account keys a run may only clear (ttp config --account refuses setting them inside a run): remove them
 # ('') or set them to their off value (ACCOUNT_OFF_VALUE), which only reduces their reach.
 # The ranking's source and key file too: the key goes to that source, so only the user names either.
 ACCOUNT_USER_ONLY = {"checks.spill_hosts", "checks.slurm_overflow", "providers.chat.ranking_source",
                      "providers.chat.ranking_key_file", "rollout.flags", "rollout.rings", "rollout.excluded",
-                     "rollout.thresholds", "rollout.scratch_cap_usd"}
+                     "rollout.thresholds", "rollout.scratch_cap_usd", "rollout.waves", "rollout.wave_at",
+                     "rollout.project_rollback"}
 ACCOUNT_OFF_VALUE = {"checks.spill_hosts": [], "checks.slurm_overflow": {}, "rollout.flags": {}}
 # Host-wide account keys the runtime reads only from the account settings: a project's own copy would
 # show a value nothing uses, so layered() shows the account's in every project and set_config refuses one.
 # Account keys three deep, below a provider: never merged into a project's settings (a project that does not
 # use the provider gets no providers.<name> entry); their reader asks for them (account_value).
-# providers.chat.model_ranking: read under the project's own (modelrank.ranking), kept current by rankfresh.py
+# providers.chat.model_ranking: read under the project's own (modelrank.ranking), kept current by rankfresh.py;
+# providers.chat.rank_exclude: model ids no ranking lists (modelrank.excluded);
 # with its source, interval and key file; providers.chat.class_ranking and class_prefs: the model scoreboard's
 # per-class orders and their prefer settings (modelscore.py). providers.chat.served_every_s and served_idle_s: the
 # host's shared /models poll interval while any project routes to chat, and else (served.every_s).
-ACCOUNT_NESTED_KEYS = {"providers.chat.model_ranking", "providers.chat.class_ranking", "providers.chat.class_prefs", "providers.chat.ranking_source", "providers.chat.ranking_every_s",
+ACCOUNT_NESTED_KEYS = {"providers.chat.model_ranking", "providers.chat.rank_exclude", "providers.chat.class_ranking", "providers.chat.class_prefs", "providers.chat.ranking_source", "providers.chat.ranking_every_s",
                        "providers.chat.ranking_key_file", "providers.chat.served_every_s", "providers.chat.served_idle_s"}
 HOST_WIDE_KEYS = {"checks.host_max", "route.host_max", "checks.spill_hosts", "checks.no_spill_hosts", "checks.slurm_overflow", "checks.dirty_max_mb", "checks.io_full_max",
                   "checks.push_priority_wait_s"}

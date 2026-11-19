@@ -18,13 +18,16 @@ prompt-injection cell}); a model's bench score is the mean of its latest score p
 row names one. A failed injection cell bars the model from babysit (and from untrusted_input work: barred).
 Prior: the Artificial Analysis index (rankfresh.py's state), only for a model with no bench score.
 
-Terminal-Bench (board's "tb"): a model's latest suite TB pass rate (harborslice.py), kept out of the bench
-mean. Order (order): models with a TB rate first, highest first; ties, and models without one, by quality.
-Quality (board) = the bench score (else the prior) weighted against the live good share (first-try done and
-not bad) by sample count: live weighs n / (n + live_k) (providers.chat.class_prefs.live_k, default LIVE_K);
-with neither bench nor prior, live alone. Orders per class (order): smart, highest quality first; fast, the
-models within margin_pts of the best and at or above the class floor, fastest first (median wall time, then
-tokens/s), then the rest as smart. Unscored models go last, in the account ranking's order.
+Terminal-Bench (board's "tb", "tb_n"): a model's latest suite TB pass rate and its trial count (harborslice.py),
+kept out of the bench mean. Quality (board) = the bench score (else the prior) weighted against the live good
+share (first-try done and not bad) by sample count: live weighs n / (n + live_k) (providers.chat.class_prefs.live_k,
+default LIVE_K); with neither bench nor prior, live alone. Fair score (board's "fair"): the pass share over every
+counted sample, the TB trials and the class's live tasks pooled, once they number at least min_samples
+(providers.chat.class_prefs.min_samples, default FAIR_N); bench rows without a trial count and the prior have no
+sample size and give none. Orders per class (order) hold only models with a fair score: smart, highest fair score
+first (ties by quality); fast, the models within margin_pts of the best and at or above the class floor, fastest
+first (median wall time, then tokens/s), then the rest as smart. A model with no fair score is left out of the
+work lists (a class with none falls back to model_ranking) and listed apart by text.
 
 publish writes providers.chat.class_ranking.<class> (account values: each class's
 providers.chat.class_prefs.<class>.prefer, smart, fast or auto; auto is fast for FAST_CLASSES, else smart)
@@ -49,7 +52,7 @@ PREFS = ("smart", "fast", "auto")
 FILE, LOCK = "model-scores.json", "model-scores.lock"   # under project.HOME_DIR
 KEY = "providers.chat.class_ranking"
 PREFS_KEY = "providers.chat.class_prefs"
-DAYS, EVERY_S, LIVE_K = 14, 3600, 10
+DAYS, EVERY_S, LIVE_K, FAIR_N = 14, 3600, 10, 20
 MARGIN_PTS, FLOOR = 5.0, 0.0
 OWN = ("none", "malformed", "timeout", "failed", "no_handoff")   # a run end that is the model's own (else the endpoint's)
 COUNTS = ("n", "first_done", "good", "bad", "failed", "checks_failed", "review_failed", "rework", "runs", "fallback",
@@ -162,14 +165,14 @@ def merged(data: dict) -> dict[str, dict[str, dict]]:
 
 
 def bench() -> dict[str, dict]:
-    """{model: {"scores": {class or "*": {suite: (at, score 0-100)}}, "injection_failed": bool}}."""
+    """{model: {"scores": {class or "*": {suite: (at, score 0-100, trials or 0)}}, "injection_failed": bool}}."""
     out: dict[str, dict] = {}
 
-    def add(m, cls, suite, at, score, inject_ok) -> None:
+    def add(m, cls, suite, at, score, inject_ok, trials=0) -> None:
         b = out.setdefault(m, {"scores": {}, "injection_failed": False, "_inj_at": -1.0})
         cur = b["scores"].setdefault(cls or "*", {}).get(suite)
         if score is not None and (cur is None or at >= cur[0]):
-            b["scores"][cls or "*"][suite] = (at, score * 100 if score <= 1 else score)
+            b["scores"][cls or "*"][suite] = (at, score * 100 if score <= 1 else score, trials)
         if inject_ok is not None and (at > b["_inj_at"] or (at == b["_inj_at"] and not inject_ok)):   # a tie: failure wins
             b["injection_failed"], b["_inj_at"] = not inject_ok, at
     d = _home() / "model-bench"
@@ -197,8 +200,9 @@ def bench() -> dict[str, dict]:
                 continue
             sc = r.get("score") if isinstance(r.get("score"), (int, float)) and not isinstance(r.get("score"), bool) else None
             inj = r.get("inject_ok") if isinstance(r.get("inject_ok"), bool) else None
+            tr = r.get("trials") if isinstance(r.get("trials"), int) and not isinstance(r.get("trials"), bool) else 0
             add(r["model"], r.get("class") if r.get("class") in CLASSES else None, str(r.get("suite") or f.stem),
-                float(r.get("at") or 0), None if sc is None else float(sc), inj)
+                float(r.get("at") or 0), None if sc is None else float(sc), inj, max(0, tr))
     for b in out.values():
         b.pop("_inj_at")
     return out
@@ -216,8 +220,9 @@ def prefs(cls: str, raw: dict | None = None) -> dict:
             "margin_pts": num(c.get("margin_pts"), MARGIN_PTS), "floor": num(c.get("floor"), FLOOR)}
 
 
-def board(live: dict, benched: dict, prior: dict[str, float], models, live_k: float = LIVE_K) -> dict:
-    """{model: {class: {"quality", "n", "good", "bench", "prior", "wall_s", "tok_s"}}} for `models`."""
+def board(live: dict, benched: dict, prior: dict[str, float], models, live_k: float = LIVE_K,
+          min_n: int = FAIR_N) -> dict:
+    """{model: {class: {"quality", "fair", "n", "good", "bench", "prior", "tb", "tb_n", "wall_s", "tok_s"}}}."""
     out = {}
     for m in models:
         b = benched.get(m) or {}
@@ -228,38 +233,37 @@ def board(live: dict, benched: dict, prior: dict[str, float], models, live_k: fl
             bs = statistics.fmean(v[1] for v in suites.values()) if suites else None
             tbs = [v for c in sc.values() for k, v in c.items() if k == TB]
             tb = max(tbs)[1] if tbs else None   # the latest Terminal-Bench pass rate, any class
+            tb_n = int(max(tbs)[2]) if tbs and len(max(tbs)) > 2 else 0
             base = bs if bs is not None else prior.get(m)
             n, good = int(s.get("n") or 0), int(s.get("good") or 0)
             lq = 100.0 * good / n if n else None
             w = n / (n + live_k) if n else 0.0
             q = lq if base is None else base if lq is None else (1 - w) * base + w * lq
             tok = float(s.get("out_tokens") or 0) / float(s["tok_wall_s"]) if s.get("tok_wall_s") else None
-            out.setdefault(m, {})[cls] = {"quality": None if q is None else round(q, 2), "n": n, "good": good,
+            pool = tb_n + n   # TB trials and live tasks, each one sample
+            fair = 100.0 * ((tb or 0) * tb_n / 100 + good) / pool if pool >= max(1, min_n) else None
+            out.setdefault(m, {})[cls] = {"quality": None if q is None else round(q, 2),
+                                          "fair": None if fair is None else round(fair, 2), "n": n, "good": good,
                                           "bench": None if bs is None else round(bs, 1), "prior": prior.get(m),
-                                          "tb": None if tb is None else round(tb, 1),
+                                          "tb": None if tb is None else round(tb, 1), "tb_n": tb_n,
                                           "wall_s": s.get("wall_med_s"), "tok_s": None if tok is None else round(tok, 1)}
     return out
 
 
-def order(bd: dict, cls: str, prefer: str, margin: float = MARGIN_PTS, floor: float = FLOOR,
-          known: list[str] | None = None, barred=()) -> list[str]:
-    """`cls`'s models, best first by `prefer` (smart or fast); unscored ones last in `known`'s order."""
-    pos = {m: i for i, m in enumerate(known or [])}
-    ms = [m for m in bd if not (cls == "babysit" and m in barred)]
-    has = lambda m: bd[m][cls]["quality"] is not None or bd[m][cls].get("tb") is not None
-    scored = sorted((m for m in ms if has(m)), key=lambda m: (bd[m][cls].get("tb") is None, -(bd[m][cls].get("tb") or 0),
-                                                              -(bd[m][cls]["quality"] or 0), m))
-    rest = sorted((m for m in ms if not has(m)), key=lambda m: (pos.get(m, len(pos)), m))
+def order(bd: dict, cls: str, prefer: str, margin: float = MARGIN_PTS, floor: float = FLOOR, barred=()) -> list[str]:
+    """`cls`'s models with a fair score, best first by `prefer` (smart or fast); the rest are left out."""
+    ms = [m for m in bd if bd[m][cls].get("fair") is not None and not (cls == "babysit" and m in barred)]
+    scored = sorted(ms, key=lambda m: (-bd[m][cls]["fair"], -(bd[m][cls]["quality"] or 0), m))
     if prefer != "fast" or not scored:
-        return scored + rest
-    best = bd[scored[0]][cls]["quality"] or 0
-    elig = [m for m in scored if (bd[m][cls]["quality"] or 0) >= max(best - margin, floor)]
+        return scored
+    best = bd[scored[0]][cls]["fair"]
+    elig = [m for m in scored if bd[m][cls]["fair"] >= max(best - margin, floor)]
 
     def speed(m):
         r = bd[m][cls]
         return (r["wall_s"] is None, r["wall_s"] or 0, -(r["tok_s"] or 0), scored.index(m))
     elig.sort(key=speed)
-    return elig + [m for m in scored if m not in elig] + rest
+    return elig + [m for m in scored if m not in elig]
 
 
 def barred(benched: dict | None = None) -> list[str]:
@@ -283,12 +287,17 @@ def build(served: list[str] | None = None, raw_prefs: dict | None = None) -> dic
     models = dict.fromkeys([*known, *(served or []), *(rankfresh.read_state().get("seen") or []), *live, *benched])
     raw = account_value(PREFS_KEY) if raw_prefs is None else raw_prefs
     lk = (raw or {}).get("live_k") if isinstance(raw, dict) else None
-    bd = board(live, benched, prior, models, float(lk) if isinstance(lk, (int, float)) and lk > 0 else LIVE_K)
+    mn = (raw or {}).get("min_samples") if isinstance(raw, dict) else None
+    bd = board(live, benched, prior, models, float(lk) if isinstance(lk, (int, float)) and lk > 0 else LIVE_K,
+               int(mn) if isinstance(mn, (int, float)) and not isinstance(mn, bool) and mn >= 1 else FAIR_N)
     bar = barred(benched)
+    from .modelrank import excluded
+    off = excluded()
     orders, ranking = {}, {}
     for cls in CLASSES:
         pf = prefs(cls, raw)
-        orders[cls] = {k: order(bd, cls, k, pf["margin_pts"], pf["floor"], known, bar) for k in ("smart", "fast")}
+        orders[cls] = {k: [m for m in order(bd, cls, k, pf["margin_pts"], pf["floor"], bar) if m not in off]
+                       for k in ("smart", "fast")}
         pick = pf["prefer"] if pf["prefer"] != "auto" else "fast" if cls in FAST_CLASSES else "smart"
         ranking[cls] = orders[cls][pick]
     return {"board": bd, "orders": orders, "ranking": ranking, "barred": bar}
@@ -332,9 +341,13 @@ def text(got: dict) -> str:
         for i, m in enumerate(got["ranking"][cls], 1):
             r = got["board"][m][cls]
             q = "-" if r["quality"] is None else f"{r['quality']:.1f}"
-            lines.append(f"  {i}. {m:<32} quality {q:>5}  live {r['good']}/{r['n']}  bench {r['bench'] if r['bench'] is not None else '-'}"
+            lines.append(f"  {i}. {m:<32} fair {r['fair']:>5.1f}  quality {q:>5}  tb {r['tb'] if r['tb'] is not None else '-'}"
+                         f"/{r.get('tb_n') or 0}  live {r['good']}/{r['n']}  bench {r['bench'] if r['bench'] is not None else '-'}"
                          f"  prior {r['prior'] if r['prior'] is not None else '-'}  wall {r['wall_s'] if r['wall_s'] is not None else '-'}s"
                          f"  tok/s {r['tok_s'] if r['tok_s'] is not None else '-'}")
+    left = sorted(m for m in got["board"] if all(m not in got["ranking"][c] for c in CLASSES))
+    if left:
+        lines.append(f"left out (no fair score: fewer samples than the minimum): {', '.join(left)}")
     if got["barred"]:
         lines.append(f"barred from babysit and untrusted_input (failed the injection cell): {', '.join(got['barred'])}")
     from .tbcycle import reference_lines   # beside the ranking, never in it

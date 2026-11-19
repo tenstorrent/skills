@@ -69,17 +69,32 @@ def ranking_of(v: Any) -> list[str]:
     return list(dict.fromkeys(n.strip() for n in names if n.strip()))
 
 
+def excluded(cfg: dict | None = None) -> set[str]:
+    """providers.chat.rank_exclude: model ids no ranking, stand-in list or fallback pick ever lists, the
+    project's own list, else the account's; empty when unset or malformed."""
+    v = ((((cfg or {}).get("providers") or {}).get(route.TO) or {}).get("rank_exclude"))
+    if v is None:
+        from .project import account_value
+        v = account_value(f"providers.{route.TO}.rank_exclude")
+    try:
+        return set(ranking_of(v))
+    except ValueError:
+        return set()
+
+
 def ranking(cfg: dict) -> list[str]:
     """The project's own ranking, else the account's (`ttp config --account`, kept current by rankfresh.py),
-    or [] (unset or malformed: config_problems names it)."""
+    less rank_exclude, or [] (unset or malformed: config_problems names it)."""
     v = ((cfg.get("providers") or {}).get(route.TO) or {}).get("model_ranking")
     if v is None:
         from .project import account_value
         v = account_value(f"providers.{route.TO}.model_ranking")
     try:
-        return ranking_of(v)
+        out = ranking_of(v)
     except ValueError:
         return []
+    off = excluded(cfg) if out else set()
+    return [m for m in out if m not in off]
 
 
 STALE_S = watch.STALE_POLLS * watch.EVERY_S   # a list with no poll interval recorded this old is unknown: no swap or hold rests on it

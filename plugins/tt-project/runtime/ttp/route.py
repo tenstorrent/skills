@@ -127,7 +127,7 @@ REASONS = ("none", *FAULTS, *RUN_CAUSES, "busy", "busy_wait_expired", "rerun", E
 CHECKS_WOKE = "its checks failed"   # how the daemon's wake text after a task's failed checks starts
 LINEAGE_MISSES = 2          # routed misses (misses) that keep a lineage on the core provider
 WAIT_S = 90.0               # providers.chat.route_wait_s: how long a routed start waits for a slot
-HOST_MAX = 6                # route.host_max unset: the most routed runs seen at once on one key without a 429
+HOST_MAX = 12               # route.host_max unset (configurable): an over-capacity start falls back, never waits forever
 HOST_ENV = "TTP_ROUTE_HOST_MAX"
 HOST_DIR = "route-slots"    # under ~/.tt-project: <provider>.json (the leases) and <provider>.lock
 LEASE_GRACE_S = 900         # a lease outlives its run's time limit by this much at most
@@ -242,17 +242,17 @@ def models(cfg: dict, tier: str) -> set[str]:
     return {*([own[1]] if own else []), *(r["model"] for _, r in rules(cfg) if not r["tiers"] or tier in r["tiers"])}
 
 
-def protected(db, cfg: dict, task: dict, tier: str) -> str:
+def protected(db, cfg: dict, task: dict, tier: str, urgency: bool = True) -> str:
     """Why a worker run stays on the core provider whatever a rule, escalation or Jev pick says, or ''.
     Model-free and always on: a deep tier, device, urgent, optimization, conclusion or untrusted-input
     run is never sent to a routed provider or model. (Coordinator and review runs are never routed:
-    see eligible.)"""
+    see eligible.) `urgency` False skips urgency: a cheap run class (runclass.ORDER_ONLY) is ordered by it."""
     from . import effort, modelpick, tierfloor, urgent
     if tier == "deep":
         return "deep"
     if effort.device_task(task):
         return "device"
-    if urgent.is_urgent(task):
+    if urgency and urgent.is_urgent(task):
         return "urgent"
     if modelpick.UNTRUSTED in modelpick._labels(task):
         return "untrusted"

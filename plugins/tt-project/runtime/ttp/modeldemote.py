@@ -68,9 +68,11 @@ def class_ranking(cfg: dict, cls: str) -> list[str]:
         acct = account_value(f"providers.{route.TO}.class_ranking")
         v = acct.get(cls) if isinstance(acct, dict) else None
     try:
-        return modelrank.ranking_of(v) or modelrank.ranking(cfg)
+        own = modelrank.ranking_of(v)
     except ValueError:
-        return modelrank.ranking(cfg)
+        own = []
+    off = modelrank.excluded(cfg) if own else set()
+    return [m for m in own if m not in off] or modelrank.ranking(cfg)
 
 
 def _rank(setter: dict | None) -> int:

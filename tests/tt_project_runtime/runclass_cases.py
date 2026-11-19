@@ -306,7 +306,7 @@ def test_a_cheap_class_falls_back_to_a_cheap_claude_model_at_low_effort_and_back
     assert runclass.cheap_run(note, "claude") == c and runclass.cheap_run(note, "chat") is None
 
 
-def test_a_question_with_no_tt_model_dispatches_to_sonnet_low_and_to_the_tt_model_once_configured(env, monkeypatch):
+def test_a_question_with_no_tt_model_dispatches_to_sonnet_low_and_to_the_tt_model_once_glm_work_covers_it(env, monkeypatch):
     from ttp import route, runclass
     from ttp.daemon import Daemon
     p = make(env)
@@ -315,11 +315,18 @@ def test_a_question_with_no_tt_model_dispatches_to_sonnet_low_and_to_the_tt_mode
     prov, tier, note = _route_dispatch(p, d, monkeypatch, title="why is it slow", kind="question", tier="standard")
     assert prov == "claude" and note[runclass.KEY] == "status_report"
     assert note[runclass.CHEAP_KEY]["model"] == "sonnet" and note[runclass.CHEAP_KEY]["effort"] == "low"
-    # A tt model appears: the next run goes there, with no edit to the class routes.
+    # A tt model appears: a question is a conclusion floor run, so the class route keeps it on core (every
+    # keep-core check runs before a class route); on a project the GLM work route covers, it goes to the model.
+    from ttp import configwho, glmwork
     _route_config(p, route=None)
     d = Daemon(p.base)
     prov, tier, note = _route_dispatch(p, d, monkeypatch, title="why is it slower", kind="question", tier="standard")
+    assert prov == "claude" and route.KEY not in note
+    p.set_config("route.glm_work", {"on": True, "model": _RT_MODEL, "holdout": 0}, by=configwho.by("user", via="cli"))
+    d = Daemon(p.base)
+    prov, tier, note = _route_dispatch(p, d, monkeypatch, title="why is it slowest", kind="question", tier="standard")
     assert prov == "chat" and runclass.CHEAP_KEY not in note and note[route.KEY]["model"] == _RT_MODEL
+    assert note[route.KEY][glmwork.KEY] == "glm"
 
 
 def test_cheap_core_runs_keep_the_alarm_quiet_and_tt_unavailable_is_told_once(env, monkeypatch):

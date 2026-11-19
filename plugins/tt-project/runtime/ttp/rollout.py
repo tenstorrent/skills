@@ -12,6 +12,10 @@ config or state.
 - Precedence (on): a project's own explicit value for the flag's config key (the user's word) wins, else the
   account's ring rule, else off. A feature calls on() at its entry point and then reads its normal config.
 - A rolled-back flag stays off and frozen until `ttp rollout arm` (a fix landed).
+- Waves (a flag marked `waves`): rollout.waves {flag: [[names], ...]}, the user's ordered project lists, and the
+  level `auto`: a project is on when it is in waves 0..k (rollout.wave_at {flag: k}, from 0) and not rolled back
+  for that flag alone (rollout.project_rollback {flag: {name: {ts, why}}}). wave_tick, model-free and hourly,
+  judges the covered projects: a worse one is rolled back alone, a wave whose projects are all ok opens the next.
 """
 from __future__ import annotations
 
@@ -24,7 +28,12 @@ from typing import Any, Iterator
 
 LEDGER = "rollout.jsonl"
 OFF = "off"
-LEVELS = (OFF, 0, 1, 2)
+AUTO = "auto"
+LEVELS = (OFF, 0, 1, 2, AUTO)
+WAVE_EVERY_S = 3600.0   # the wave gate judges a flag at most once an hour (account-wide, WAVE_STATE)
+WAVE_STATE = "rollout-waves.json"   # {flag: when the gate last judged it}, in the account home
+WAVE_SEEN_KV = "rollout_wave_seen"   # a project's cursor: the ledger time of the last wave record it reported
+OVERRIDE_KV = "rollout_override_told"   # a project's {flag: day} of the last override event
 # name: the feature's existing config key it gates, its area, and `code`: the files holding its on() call sites
 # and the code reading its key, relative to the repo root. The health watch counts a post-landing revert against a
 # flag only when the reverted commit touched one of them (rollout_health); a flag with no wiring yet has none.
@@ -40,7 +49,10 @@ def _code(*names: str) -> tuple[str, ...]:
 
 
 FLAGS: dict[str, dict[str, Any]] = {
-    "glm_code": {"key": "route.code_sonnet.glm_share", "area": "route", "code": _code("codearm.py")},
+    "glm_code": {"key": "route.code_sonnet.glm_share", "area": "route", "code": _code("codearm.py"), "waves": True},
+    # The project's routed work on GLM (glmwork.py); `waves`: it may run at auto, judged by glmshare.judge.
+    "glm_work": {"key": "route.glm_work.on", "area": "route", "code": _code("glmwork.py", "codearm.py", "daemon.py"),
+                 "waves": True},
     "eta_history": {"key": "eta.history", "area": "eta", "shadow": True,
                     "code": _code("etaledger.py", "costlevers.py", "cli.py")},
     "device_prewarm": {"key": "device.prewarm", "area": "device", "code": ()},
@@ -65,6 +77,8 @@ def settings() -> dict:
 
 def level(flag: str, cfg: dict | None = None) -> Any:
     v = ((cfg if cfg is not None else settings()).get("flags") or {}).get(flag, OFF)
+    if v == AUTO:
+        return AUTO
     return v if v in (0, 1, 2) and not isinstance(v, bool) else OFF
 
 
@@ -92,8 +106,32 @@ def on(flag: str, project: str, raw: dict | None = None, cfg: dict | None = None
         return False
     if own_setting(raw, FLAGS[flag]["key"]):
         return True
+    cfg = settings() if cfg is None else cfg
     lv, ring = level(flag, cfg), ring_of(project, cfg)
+    if lv == AUTO:
+        return ring is not None and project not in rolled_back(flag, cfg) \
+            and any(project in w for w in waves(flag, cfg)[:wave_at(flag, cfg) + 1])
     return lv != OFF and ring is not None and ring <= lv
+
+
+def waves(flag: str, cfg: dict | None = None) -> list[list[str]]:
+    """The flag's ordered project lists (`ttp rollout waves`); [] without any."""
+    got = ((cfg if cfg is not None else settings()).get("waves") or {}).get(flag)
+    return [[str(n) for n in w] for w in got if isinstance(w, list)] if isinstance(got, list) else []
+
+
+def wave_at(flag: str, cfg: dict | None = None) -> int:
+    """The flag's current wave: waves 0..it are covered under auto (0 to start)."""
+    cfg = settings() if cfg is None else cfg
+    k = (cfg.get("wave_at") or {}).get(flag, 0)
+    k = k if isinstance(k, int) and not isinstance(k, bool) else 0
+    return max(0, min(k, len(waves(flag, cfg)) - 1))
+
+
+def rolled_back(flag: str, cfg: dict | None = None) -> dict:
+    """{project: {ts, why}}: the projects the wave gate rolled back for `flag` alone (until `arm FLAG PROJECT`)."""
+    got = ((cfg if cfg is not None else settings()).get("project_rollback") or {}).get(flag)
+    return dict(got) if isinstance(got, dict) else {}
 
 
 def ledger(flag: str | None = None) -> list[dict]:
@@ -148,6 +186,14 @@ def _put(section: str, key: str, value: Any) -> None:
     set_account_setting(f"rollout.{section}", cur or None)
 
 
+def _op(op: str, flag: str, why: str, by: str, **extra: Any) -> dict:
+    """A wave record in the ledger ({ts, op, flag, why, by, ...}; `kind` too, so ledger readers list it)."""
+    from .project import durable_append
+    rec = {"ts": round(time.time(), 3), "op": op, "kind": op, "flag": flag, "why": why, "by": by, **extra}
+    durable_append(_home() / LEDGER, json.dumps(rec, sort_keys=True, default=str) + "\n")
+    return rec
+
+
 def _check(flag: str) -> None:
     if flag not in FLAGS:
         raise ValueError(f"unknown flag {flag!r}; flags: {', '.join(sorted(FLAGS))}")
@@ -155,11 +201,11 @@ def _check(flag: str) -> None:
 
 def parse_level(text: Any) -> Any:
     t = str(text).strip().lower()
-    if t == OFF:
-        return OFF
+    if t in (OFF, AUTO):
+        return t
     if t in ("0", "1", "2"):
         return int(t)
-    raise ValueError(f"a flag level is off, 0, 1 or 2, not {text!r}")
+    raise ValueError(f"a flag level is off, 0, 1, 2 or auto, not {text!r}")
 
 
 def set_level(flag: str, to: Any, reason: str, by: str = "user", kind: str = "set", snapshot: dict | None = None) -> str:
@@ -173,6 +219,10 @@ def set_level(flag: str, to: Any, reason: str, by: str = "user", kind: str = "se
                              f"`ttp rollout arm {flag}` once a fix landed")
         if old == to:
             return f"{flag} is {to} already; nothing changed"
+        if to == AUTO and not FLAGS[flag].get("waves"):
+            raise ValueError(f"{flag} has no wave gate; auto is for {', '.join(f for f in FLAGS if FLAGS[f].get('waves'))}")
+        if to == AUTO and not waves(flag):
+            raise ValueError(f"{flag} has no waves: set them first (`ttp rollout waves {flag} <p1,p2> <p3> ...`)")
         _put("flags", flag, None if to == OFF else to)
         _record(kind, flag, old, to, reason, by, snapshot)
     return f"{flag}: {old} -> {to}"
@@ -181,6 +231,8 @@ def set_level(flag: str, to: Any, reason: str, by: str = "user", kind: str = "se
 def promote(flag: str, reason: str = "", by: str = "user") -> str:
     """One ring wider: off -> 0 -> 1 -> 2."""
     cur = level(flag)
+    if cur == AUTO:
+        return f"{flag} is at auto: its waves widen it (`ttp rollout status`)"
     nxt = 0 if cur == OFF else cur + 1
     if nxt > 2:
         return f"{flag} is on in every ring already"
@@ -210,8 +262,18 @@ def vote(flag: str, project: str, snapshot: dict) -> None:
             _record("clean", flag, level(flag), level(flag), f"{project} clean", f"daemon:{project}", snapshot)
 
 
-def arm(flag: str, reason: str = "", by: str = "user") -> str:
+def arm(flag: str, reason: str = "", by: str = "user", project: str = "") -> str:
+    """Unfreeze a rolled-back flag; with `project`, re-arm that project's own wave rollback."""
     _check(flag)
+    if project:
+        with _locked():
+            back = rolled_back(flag)
+            if project not in back:
+                return f"{flag} is not rolled back in {project}; nothing changed"
+            back.pop(project)
+            _put("project_rollback", flag, back or None)
+            _op("project_arm", flag, reason or "fix landed", by, project=project)
+        return f"{flag} re-armed in {project}: its wave covers it again"
     with _locked():
         if not frozen(flag):
             return f"{flag} is not frozen; nothing changed"
@@ -239,6 +301,213 @@ def set_ring(project: str, ring: str, by: str = "user") -> str:
     return f"{project}: ring {before} -> {ring_of(project)}"
 
 
+def set_waves(flag: str, args: list[str], by: str = "user") -> str:
+    """The flag's waves from `args` (each one wave, comma-separated project names), or `clear`. A project is in
+    one wave only. The current wave stays (cut to the last wave); clearing resets it and is refused at auto."""
+    _check(flag)
+    if not FLAGS[flag].get("waves"):
+        raise ValueError(f"{flag} has no wave gate; waves are for {', '.join(f for f in FLAGS if FLAGS[f].get('waves'))}")
+    new = [] if [a.strip().lower() for a in args] == ["clear"] else \
+        [[n.strip() for n in a.split(",") if n.strip()] for a in args]
+    if not args or any(not w for w in new):
+        raise ValueError("each wave names one or more projects, comma-separated: <p1,p2> <p3> ... (or clear)")
+    names = [n for w in new for n in w]
+    if len(names) != len(set(names)):
+        raise ValueError(f"a project is in one wave only: {', '.join(sorted({n for n in names if names.count(n) > 1}))}")
+    with _locked():
+        cfg = settings()
+        if not new and level(flag, cfg) == AUTO:
+            raise ValueError(f"{flag} is at auto: set it to another level before clearing its waves")
+        old, k = waves(flag, cfg), wave_at(flag, cfg)
+        if old == new:
+            return f"{flag}: waves unchanged"
+        _put("waves", flag, new or None)
+        _put("wave_at", flag, (min(k, len(new) - 1) or None) if new else None)
+        _record("waves", flag, old, new, " | ".join(",".join(w) for w in new) or "cleared", by)
+    return f"{flag}: waves " + (" | ".join(",".join(w) for w in new) or "cleared")
+
+
+def local_projects() -> dict:
+    """{name: Project} of the projects `ttp list` shows on this host (the registry); opened, never written."""
+    from pathlib import Path
+    from .project import Project, hostname, load_registry
+    out = {}
+    for name, e in sorted((load_registry().get("projects") or {}).items()):
+        if isinstance(e, dict) and e.get("host") in (None, hostname()) and e.get("dir") and Path(e["dir"]).is_dir():
+            p = Project(e["dir"])
+            if p.exists():
+                out[name] = p
+    return out
+
+
+def _raw(p) -> dict:
+    """A project's own project.json, read only ({} when unreadable)."""
+    from . import statcache
+    try:
+        data = statcache.load_json(p.config_path)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _wave_state() -> dict:
+    try:
+        data = json.loads((_home() / WAVE_STATE).read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def wave_tick(now: float | None = None, judge=None, projects: dict | None = None, by: str = "daemon") -> list[dict]:
+    """The wave gate, model-free: for each flag at auto not judged in the last hour, judge each project of its
+    covered waves (`judge(p, cfg, now)`: glmshare.judge, ok | worse | wait). A worse one is rolled back for that
+    flag alone (the others stay); when every project left in the current wave is ok (and none went worse), the
+    next wave opens. The ledger records each move; returns those records. The hour limit and the lock make a
+    call from every project's daemon safe; judging runs outside the lock."""
+    from .project import write_json
+    now = time.time() if now is None else now
+    flags = [f for f in FLAGS if level(f) == AUTO]
+    if not flags:
+        return []
+    if judge is None:
+        try:
+            from .glmshare import judge
+        except ImportError:
+            return []
+    with _locked():
+        seen = _wave_state()
+        due = [f for f in flags if not 0 <= now - float(seen.get(f) or 0) < WAVE_EVERY_S]
+        if not due:
+            return []
+        seen.update({f: now for f in due})
+        write_json(_home() / WAVE_STATE, seen, mode=0o600)
+    projs = local_projects() if projects is None else projects
+    out: list[dict] = []
+    for flag in due:
+        cfg = settings()
+        ws, k, back = waves(flag, cfg), wave_at(flag, cfg), rolled_back(flag, cfg)
+        excl = set(cfg.get("excluded") or [])
+        verdicts: dict[str, dict] = {}
+        for name in (n for w in ws[:k + 1] for n in w if n not in excl and n not in back):
+            p = projs.get(name)
+            if p is None:
+                verdicts[name] = {"state": "wait", "why": "not a project on this host", "n": 0}
+                continue
+            try:
+                from .project import layered
+                v = judge(p, layered(_raw(p)), now)
+            except Exception as e:   # a judge that fails waits; it never rolls back or widens
+                v = {"state": "wait", "why": f"judge failed: {type(e).__name__}: {e}"[:200], "n": 0}
+            verdicts[name] = v if isinstance(v, dict) else {"state": "wait", "why": "no verdict", "n": 0}
+        with _locked():
+            cfg = settings()
+            if level(flag, cfg) != AUTO or waves(flag, cfg) != ws or wave_at(flag, cfg) != k:
+                continue   # the user changed it meanwhile: the next hour judges the new state
+            back, worse = rolled_back(flag, cfg), []
+            for name, v in verdicts.items():
+                if v.get("state") == "worse" and name not in back:
+                    why = str(v.get("why") or "worse than its own baseline")[:300]
+                    back[name] = {"ts": round(now, 3), "why": why}
+                    worse.append(name)
+                    out.append(_op("project_rollback", flag, why, by, project=name, n=v.get("n")))
+            if worse:
+                _put("project_rollback", flag, back)
+            left = [n for n in ws[k] if n not in excl and n not in back]
+            if not worse and k + 1 < len(ws) and left and all(verdicts.get(n, {}).get("state") == "ok" for n in left):
+                _put("wave_at", flag, k + 1)
+                why = f"wave {k} no worse: " + "; ".join(f"{n}: {verdicts[n].get('why') or 'ok'}" for n in left)
+                out.append(_op("advance", flag, why[:600], by, wave=k + 1,
+                               projects=[n for n in ws[k + 1] if n not in excl]))
+    return out
+
+
+def override_since(p, key: str) -> float | None:
+    """When the project's own `key` was last set: its config change log (configwho), else project.json's mtime."""
+    from . import configwho
+    rows = [r for r in configwho.history(p, key) if not r.get("refused") and "new" in r]
+    if rows:
+        try:
+            return float(rows[-1]["ts"])
+        except (TypeError, ValueError):
+            pass
+    try:
+        return p.config_path.stat().st_mtime
+    except OSError:
+        return None
+
+
+def overrides(projects: dict | None = None, cfg: dict | None = None) -> dict[str, list[dict]]:
+    """{flag: [{project, value, since, at}]}: for each flag the user turned on, the projects whose own project.json
+    sets its key, which wins over the rollout (e.g. a leftover glm_share 0 under glm_code)."""
+    from . import configwho, timefmt
+    cfg = settings() if cfg is None else cfg
+    on_flags = [f for f in FLAGS if level(f, cfg) != OFF]
+    out: dict[str, list[dict]] = {}
+    if not on_flags:
+        return out
+    for name, p in sorted((local_projects() if projects is None else projects).items()):
+        raw = _raw(p)
+        for f in on_flags:
+            key = FLAGS[f]["key"]
+            if own_setting(raw, key):
+                since = override_since(p, key)
+                out.setdefault(f, []).append({"project": name, "value": configwho.at(raw, key), "since": since,
+                                              "at": timefmt.long(since, raw) if since else "an unknown time"})
+    return out
+
+
+def project_events(p, now: float | None = None) -> list[str]:
+    """This project's rollout events for its coordinator, model-free, from its own daemon (its own db only):
+    one per wave record about it not yet reported (WAVE_SEEN_KV), and one a day per flag the user turned on
+    that its own setting overrides (OVERRIDE_KV). Returns the event kinds added."""
+    from . import configwho, timefmt
+    now = time.time() if now is None else now
+    db, name, done = p.db, p.name, []
+
+    def add(kind: str, fp: str, text: str) -> None:
+        db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
+             (now, "daemon", kind, fp, "normal", text[:1500], "queued"))
+        done.append(kind)
+
+    try:
+        seen = float(db.kv(WAVE_SEEN_KV, 0) or 0)
+    except (TypeError, ValueError):
+        seen = 0.0
+    last = seen
+    for r in ledger():
+        ts = r.get("ts") or 0
+        if not isinstance(ts, (int, float)) or ts <= seen or r.get("op") not in ("advance", "project_rollback"):
+            continue
+        last = max(last, ts)
+        flag = r.get("flag")
+        if r["op"] == "advance" and name in (r.get("projects") or []):
+            add("rollout_wave", f"rollout_wave:{flag}:{r.get('wave')}",
+                f"Release flag {flag} opened wave {r.get('wave')}, which holds this project: it is on here now "
+                f"(its own setting for {FLAGS.get(flag, {}).get('key')} still wins). Why: {r.get('why')}")
+        elif r["op"] == "project_rollback" and r.get("project") == name:
+            add("rollout_wave", f"rollout_wave_rollback:{flag}",
+                f"Release flag {flag} was rolled back for this project alone ({r.get('why')}); the other projects "
+                f"keep it. It stays off here until `ttp rollout arm {flag} {name}` once a fix landed.")
+    if last > seen:
+        db.set_kv(WAVE_SEEN_KV, last)
+    told = db.kv(OVERRIDE_KV, {}) or {}
+    told = told if isinstance(told, dict) else {}
+    raw, cfg = _raw(p), settings()
+    day = timefmt.today(now, raw)
+    for f, m in FLAGS.items():
+        if level(f, cfg) == OFF or not own_setting(raw, m["key"]) or told.get(f) == day:
+            continue
+        since = override_since(p, m["key"])
+        add("rollout_override", f"rollout_override:{f}",
+            f"Release flag {f} is on for the account ({level(f, cfg)}), but this project's own {m['key']} = "
+            f"{json.dumps(configwho.at(raw, m['key']))} overrides it (set {timefmt.long(since, raw) if since else 'at an unknown time'}). "
+            f"Clear it (`ttp config {name} {m['key']} ''`) to follow the rollout, or keep it if it is deliberate.")
+        told[f] = day
+    if told != (db.kv(OVERRIDE_KV, {}) or {}):
+        db.set_kv(OVERRIDE_KV, told)
+    return done
+
+
 SCRATCH_CAP_USD = 25.0
 SCRATCH_NOTE = "held: scratch project's daily spend cap,"
 
@@ -263,21 +532,25 @@ def scratch_hold(state: tuple[float, float] | None, task: dict, owners=()) -> st
     return f"{SCRATCH_NOTE} ${state[1]:.2f} of ${state[0]:g} used; it starts when the day's spend drops under it"
 
 
-def status() -> dict:
+def status(projects: dict | None = None) -> dict:
+    """The rings, each flag's level and, per flag: its waves, current wave and per-project rollbacks, and the
+    projects whose own setting overrides it while it is on (overrides)."""
     cfg = settings()
+    over = overrides(projects, cfg)
     return {"rings": cfg.get("rings") or {}, "excluded": cfg.get("excluded") or [],
             "flags": {f: {"level": level(f, cfg), "key": m["key"], "frozen": bool(frozen(f)),
-                          "shadow": bool(m.get("shadow"))}
+                          "shadow": bool(m.get("shadow")), "waves": waves(f, cfg), "wave": wave_at(f, cfg),
+                          "rolled_back": rolled_back(f, cfg), "overrides": over.get(f, [])}
                       for f, m in sorted(FLAGS.items())}}
 
 
 def run(a) -> int:
     """`ttp rollout ACTION ...`: the terminal's (the user's) edit of the rollout state. A run's own call may
-    only read it or roll a flag back (that only reduces a flag's reach); promotion is the watcher's and the
-    ring lists are the user's."""
+    only read it or roll a flag back (that only reduces a flag's reach); promotion is the watcher's, the wave
+    moves the gate's, and the ring and wave lists are the user's."""
     in_run = bool(os.environ.get("TTP_RUN_DIR"))
     act = a.action
-    if in_run and act not in ("status", "rollback"):
+    if in_run and act not in ("status", "rollback"):   # waves and arm too: the user's terminal only
         print(f"ttp rollout {act}: only the user's terminal changes the rollout state; a run may read it "
               "(status) or roll a flag back", flush=True)
         return 2
@@ -292,11 +565,25 @@ def run(a) -> int:
             for f, e in st["flags"].items():
                 print(f"{f}: {e['level']}{' (frozen)' if e['frozen'] else ''}  gates {e['key']}"
                       + ("  (shadow: the health watch never rolls it back)" if e["shadow"] else ""))
+                if e["waves"]:
+                    print("  waves: " + " | ".join(("> " if i == e["wave"] else "") + ",".join(w)
+                                                    for i, w in enumerate(e["waves"]))
+                          + (f"  (auto: waves 0..{e['wave']} on)" if e["level"] == AUTO else ""))
+                for n, r in sorted(e["rolled_back"].items()):
+                    print(f"  rolled back in {n} alone: {r.get('why')}  (`ttp rollout arm {f} {n}`)")
+                for o in e["overrides"]:
+                    print(f"  overridden in {o['project']} by its own setting since {o['at']} "
+                          f"({e['key']} = {json.dumps(o['value'])})")
             return 0
         reason = (a.reason or "").strip()
-        if not a.target or (act in ("ring", "set") and a.value is None):
-            print(f"ttp rollout {act}: needs " + {"ring": "PROJECT 0|1|2|exclude|include", "set": "FLAG off|0|1|2"}
+        more = [a.value, *(getattr(a, "more", None) or [])] if a.value is not None else []
+        if not a.target or (act in ("ring", "set", "waves") and a.value is None):
+            print(f"ttp rollout {act}: needs " + {"ring": "PROJECT 0|1|2|exclude|include", "set": "FLAG off|0|1|2|auto",
+                                                   "waves": "FLAG <p1,p2> <p3> ... | clear"}
                   .get(act, "FLAG"), flush=True)
+            return 2
+        if act != "waves" and len(more) > 1:
+            print(f"ttp rollout {act}: one value, not {' '.join(more)}", flush=True)
             return 2
         if act == "ring":
             print(set_ring(a.target, a.value))
@@ -307,7 +594,9 @@ def run(a) -> int:
         elif act == "rollback":
             print(rollback(a.target, reason or "rolled back by hand", "run" if in_run else "user"))
         elif act == "arm":
-            print(arm(a.target, reason))
+            print(arm(a.target, reason, project=a.value or ""))
+        elif act == "waves":
+            print(set_waves(a.target, more))
     except ValueError as e:
         print(f"ttp rollout {act}: {e}", flush=True)
         return 2
