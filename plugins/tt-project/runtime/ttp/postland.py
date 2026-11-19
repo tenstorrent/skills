@@ -47,6 +47,8 @@ DEAD_RETRIES = 2  # reruns of a landing whose driver died without a result (a re
 
 # A forward revert task's title is "Revert <who>" + this tail; the release-ring health watch counts them.
 REVERT_TITLE_TAIL = ": post-landing tests fail"
+# Its fix task is "Fix <who>" + the same tail; its spec names the failing tests on one line after this.
+FAILING_TESTS = "Its failing tests, the only ones to rerun: "
 
 
 def driver_argv(job: Path) -> list[str]:
@@ -228,6 +230,15 @@ def spawn(p: Project, job: Path) -> int:
     return child.pid
 
 
+def failing_tests(db, revert_title: str) -> list[str]:
+    """The failing test ids the fix task of a forward revert (by the revert task's title) names (apply)."""
+    fix = db.q("SELECT spec FROM tasks WHERE title=? ORDER BY id DESC LIMIT 1",
+               ("Fix " + revert_title.removeprefix("Revert "),))
+    spec = fix[0]["spec"] if fix else ""
+    at = spec.find(FAILING_TESTS)
+    return spec[at + len(FAILING_TESTS):].split("\n", 1)[0].split() if at >= 0 else []
+
+
 def apply(p: Project, job: dict, got: dict) -> str:
     """Act on the driver's result: a guilty change's revert approved into the push queue and one fix task."""
     from . import pushq
@@ -257,7 +268,7 @@ def apply(p: Project, job: dict, got: dict) -> str:
     e = got["entry"]
     who = f"#{e['task']} {e.get('branch') or '?'}" if e.get("task") else f"commit {e['sha'][:10]}"
     span = f"{str(e.get('base') or '')[:10]}..{e['sha'][:10]}"
-    tail = (f"Its failing tests, the only ones to rerun: {ids}\nCommand: {got.get('cmd')}\n"
+    tail = (f"{FAILING_TESTS}{ids}\nCommand: {got.get('cmd')}\n"
             + (f"Also failing, quarantined and their deflake task's, not this task's: {named}\n" if owned else "") +
             f"Output tail:\n{str(got.get('tail') or '')[-2000:]}")
     if got.get("revert_head"):   # the revert first; the fix starts once it has landed, on top of it
@@ -266,7 +277,7 @@ def apply(p: Project, job: dict, got: dict) -> str:
                               spec=f"Forward revert of {span} by the post-landing checks.")
             pushq.approve(p, tid, None, {"entries": [{"branch": got["revert_branch"], "head": got["revert_head"]}],
                                          "target": job["target"]})
-        fix = db.add_task(f"Fix {who}: post-landing tests fail", kind="code", labels=[
+        fix = db.add_task(f"Fix {who}{REVERT_TITLE_TAIL}", kind="code", labels=[
             f"start_when:landed:#{tid}", f"start_why:revert #{tid} lands", f"deferred_since:{time.time():.0f}"],
             spec=(f"Post-landing checks (delivery.post_land_checks) failed after {who} landed as {e['sha'][:10]}. "
                   f"Revert #{tid} (commit {got['revert_head'][:10]}, branch {got['revert_branch']}) takes {span} "
@@ -275,7 +286,7 @@ def apply(p: Project, job: dict, got: dict) -> str:
         text = (f"Post-landing checks on {sha}: {who} fails {ids}; revert #{tid} ({got['revert_head'][:10]}) "
                 f"approved for {job['target']}; fix task #{fix} starts once it lands")
     else:
-        fix = db.add_task(f"Fix {who}: post-landing tests fail", kind="code", spec=(
+        fix = db.add_task(f"Fix {who}{REVERT_TITLE_TAIL}", kind="code", spec=(
             f"Post-landing checks (delivery.post_land_checks) failed after {who} landed as {e['sha'][:10]} "
             f"({span}). It is not reverted ({got.get('why')}): the change is still on {job['target']}; fix it "
             f"forward. {tail}"))

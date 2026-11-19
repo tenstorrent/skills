@@ -143,10 +143,8 @@ def _by_arm(db, title: str, arm: str) -> bool:
 def _tests_hit(db, repo: str | None, title: str, meta: dict) -> bool:
     """Whether a test whose failure caused the revert exercises the flag's gated code: it lies in a gated
     module's case file (tests/tt_project_runtime/<module>_cases.py) or its body names the flag's key. The
-    failing tests are read from the revert's fix task (postland.apply)."""
-    fix = db.q("SELECT spec FROM tasks WHERE title=? ORDER BY id DESC LIMIT 1", ("Fix " + title[len("Revert "):],))
-    m = re.search(r"Its failing tests, the only ones to rerun: (.*)", fix[0]["spec"] if fix else "")
-    names = {i.split("::")[-1].split("[")[0] for i in (m.group(1).split() if m else ())}
+    failing tests are read from the revert's fix task (postland.failing_tests)."""
+    names = {i.split("::")[-1].split("[")[0] for i in postland.failing_tests(db, title)}
     if not names or not repo:
         return False
     cases = {f"{c.rsplit('/', 1)[-1][:-3]}_cases.py" for c in meta.get("code") or ()}

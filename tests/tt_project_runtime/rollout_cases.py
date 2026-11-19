@@ -597,20 +597,24 @@ def test_a_revert_counts_only_against_a_flag_whose_gated_code_the_reverted_commi
     assert _revert_count(p, "output_trim", repo)["failing"] == [], "another flag's code is not this one's"
 
 
-def _ro_authored(p, spec, provider, model, failing=""):
-    """A code task run on `provider`/`model`, the post-landing revert of its landing and the revert's fix task
-    naming the failing tests (postland.apply)."""
+def _ro_authored(p, monkeypatch, spec, provider, model, failing=""):
+    """A code task run on `provider`/`model`, then the post-landing revert of its landing (the span `spec`
+    names) and the revert's fix task naming the failing tests, both written by postland.apply."""
     import json
+    from ttp import postland, pushq
     t = p.db.add_task("code: x", "s", kind="code", status="done")
     p.db.x("INSERT INTO runs(task,role,provider,model,started,status,cost_usd,note) VALUES(?,?,?,?,?,?,?,?)",
            (t, "worker", provider, model, time.time(), "done", 0.0, json.dumps({})))
-    who = f"#{t + 100} ttp/t{t}-x"
-    p.db.add_task(f"Revert {who}: post-landing tests fail", spec, kind="review", status="pushing")
-    p.db.add_task(f"Fix {who}: post-landing tests fail", f"Its failing tests, the only ones to rerun: {failing}\n",
-                  kind="code")
+    base, sha = spec.split()[3].split("..")
+    monkeypatch.setattr(pushq, "approve", lambda *a, **k: [])   # the queue row is not what is counted
+    assert postland.apply(p, {"sha": sha, "target": "up/main"}, {
+        "outcome": "guilty", "ids": failing.split(), "cmd": "pytest", "tail": "",
+        "entry": {"task": t + 100, "branch": f"ttp/t{t}-x", "sha": sha, "base": base},
+        "revert_head": "c" * 40, "revert_branch": "revert/x"}) == "guilty"
 
 
-def test_a_revert_freezes_a_model_route_flag_only_when_its_arm_made_the_change_or_its_tests_failed(env, tmp_path):
+def test_a_revert_freezes_a_model_route_flag_only_when_its_arm_made_the_change_or_its_tests_failed(env, tmp_path,
+                                                                                                    monkeypatch):
     # cells: other_arm_revert, glm_arm_revert, gated_test_revert
     from pathlib import Path
     p = make(env)
@@ -619,21 +623,21 @@ def test_a_revert_freezes_a_model_route_flag_only_when_its_arm_made_the_change_o
     (Path(repo) / "tests" / "tt_project_runtime" / "codearm_cases.py").write_text("def test_arm(env):\n    pass\n")
     (Path(repo) / "tests" / "test_other.py").write_text(
         "def test_unrelated(env):\n    pass\n\n\ndef test_share(env):\n    set_('route.code_sonnet.glm_share')\n")
-    _ro_authored(p, spec, "claude", "claude-opus-5-5", "tests/test_other.py::test_unrelated tests/x.py::test_gone[a]")
+    _ro_authored(p, monkeypatch, spec, "claude", "claude-opus-5-5", "tests/test_other.py::test_unrelated tests/x.py::test_gone[a]")
     got = _revert_count(p, "glm_code", repo)
     assert got["failing"] == [] and got["unattributed"] == [], "a claude-arm change touching codearm.py: no freeze"
     assert len(_revert_count(p, "deslop", repo)["failing"]) == 1, "a flag with no arm still counts touched files"
     for failing in ("tests/test_tt_project_runtime.py::test_arm", "tests/test_other.py::test_share[x]"):
         p.db.x("DELETE FROM tasks WHERE title LIKE 'Revert %' OR title LIKE 'Fix %'")
-        _ro_authored(p, spec, "claude", "claude-opus-5-5", failing)
+        _ro_authored(p, monkeypatch, spec, "claude", "claude-opus-5-5", failing)
         assert len(_revert_count(p, "glm_code", repo)["failing"]) == 1, f"{failing} exercises the flag's code"
     p.db.x("DELETE FROM tasks WHERE title LIKE 'Revert %' OR title LIKE 'Fix %'")
-    _ro_authored(p, spec, "chat", "glm-5.3", "tests/test_other.py::test_unrelated")
+    _ro_authored(p, monkeypatch, spec, "chat", "glm-5.3", "tests/test_other.py::test_unrelated")
     got = _revert_count(p, "glm_code", repo)
     assert len(got["failing"]) == 1 and "forward revert(s) of a landed change" in got["failing"][0]
     repo2, spec2 = _ro_repo(tmp_path / "b", "sched.py")
     p.db.x("DELETE FROM tasks WHERE title LIKE 'Revert %' OR title LIKE 'Fix %'")
-    _ro_authored(p, spec2, "chat", "glm-5.3")
+    _ro_authored(p, monkeypatch, spec2, "chat", "glm-5.3")
     assert _revert_count(p, "glm_code", repo2)["failing"] == [], "a GLM change outside the flag's code: as before"
 
 
