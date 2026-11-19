@@ -522,42 +522,84 @@ def test_a_say_without_a_chat_replies_to_one_chat_per_caller_that_counts_as_a_re
     assert (u["asks"], u["alerts"]) == (0, 1), u
     p.db.x("UPDATE chats SET last_read=? WHERE id=?", (reply["id"], chat))
     assert health(p, p.db)["undelivered"] is None
-    # A reply to an ordinary chat is still not counted, and the say chat reads broadcasts too.
+    # A reply to an ordinary chat is still not counted. The say chat is reply-only: reading past a
+    # broadcast alert is not reading it, so it still reached nobody.
     p.db.post("out", "for c9", chat="c9", kind="reply")
     alert = p.db.post("out", "a service restarted twice", kind="alert", severity="normal")
     p.db.x("UPDATE messages SET ts=? WHERE id>?", (time.time() - 3600, reply["id"]))
     assert health(p, p.db)["undelivered"]["alerts"] == 1
     p.db.x("UPDATE chats SET last_read=? WHERE id=?", (alert, chat))
-    assert health(p, p.db)["undelivered"] is None
+    assert health(p, p.db)["undelivered"]["alerts"] == 1
 
 
-def test_a_new_say_chat_has_not_read_older_broadcasts_until_its_listen_reads_past_them(env, monkeypatch, capsys):
-    """Making a say chat puts its cursor at the newest message: that is no read. An older unread
-    broadcast alert stays counted until that chat's `ttp listen` reads past it."""
-    from ttp import chatgone, cli
+def test_a_say_chat_gets_replies_to_its_own_messages_never_the_projects_alerts_or_status(env, monkeypatch, capsys):
+    """A one-off `ttp say` (a hand-off, a question, a finding from another project) subscribes its
+    caller's chat to the reply, not to the project's alerts: its listen prints the reply and no broadcast,
+    it is never the chat the hourly status goes to, and a followed chat still gets every alert."""
+    from ttp import cli, hourly
+    from ttp import coordinator as coord
+    from ttp.db import REPLIES_ONLY
     from ttp.web import health
     p = make(env)
     _relay_chat(p)
-    alert = p.db.post("out", "a service restarted twice", kind="alert", severity="normal")
-    p.db.x("UPDATE messages SET ts=? WHERE id=?", (time.time() - 3600, alert))
-    assert health(p, p.db)["undelivered"]["alerts"] == 1
     monkeypatch.setattr(cli, "here", lambda: None)
-    cli.main(["say", "demo", "--", "hello"])
+    cli.main(["say", "demo", "--caller", "project other", "--", "a finding for you"])
     chat = p.db.one("SELECT chat FROM messages WHERE direction='in' ORDER BY id DESC LIMIT 1")["chat"]
-    assert chat.startswith(cli.SAY_CHAT_PREFIX) and chatgone.read_from(p.db, chat) >= alert
-    assert health(p, p.db)["undelivered"]["alerts"] == 1, "making the chat read nothing"
-    cli.main(["say", "demo", "--", "again"])   # reusing it keeps its creation cursor
-    assert health(p, p.db)["undelivered"]["alerts"] == 1
-    # An alert after the chat was made counts as read once its listen reads past it.
-    later = p.db.post("out", "a disk filled up", kind="alert", severity="normal")
-    p.db.x("UPDATE messages SET ts=? WHERE id=?", (time.time() - 3600, later))
-    assert health(p, p.db)["undelivered"]["alerts"] == 2
+    assert p.db.one("SELECT min_severity FROM chats WHERE id=?", (chat,))["min_severity"] == REPLIES_ONLY
+    alert = p.db.post("out", "a service restarted twice", kind="alert", severity="critical")
+    p.db.post("out", "status: 3 tasks running", kind="info", severity="normal")
+    p.db.post("out", "should I drop the old branch?", kind="ask", severity="high")
+    assert coord.apply(p, [{"type": "reply", "text": "thanks, queued a fix"}], default_chat=chat) == []
+    p.db.x("UPDATE messages SET ts=? WHERE id>=?", (time.time() - 3600, alert))
+    assert hourly.main_chat(p.db) == "c1", "the hourly status never goes to a say chat"
     capsys.readouterr()
     cli.main(["listen", "demo", "--chat", chat, "--once"])
-    assert p.db.one("SELECT last_read FROM chats WHERE id=?", (chat,))["last_read"] >= later
-    assert health(p, p.db)["undelivered"]["alerts"] == 1, "only the alert from before the chat stays counted"
-    p.db.x("UPDATE chats SET last_read=? WHERE id='c1'", (alert,))
+    out = capsys.readouterr().out
+    assert "thanks, queued a fix" in out and not any(
+        x in out for x in ("restarted twice", "3 tasks running", "old branch")), out
+    u = health(p, p.db)["undelivered"]
+    assert (u["asks"], u["alerts"]) == (1, 2), ("the say chat read nothing meant for the user", u)
+    cli.main(["listen", "demo", "--chat", "c1", "--once", "--all"])
+    out = capsys.readouterr().out
+    assert "restarted twice" in out and "old branch" in out and "thanks, queued a fix" not in out, out
     assert health(p, p.db)["undelivered"] is None
+
+
+def test_older_say_chats_become_reply_only_and_connect_follows_or_unfollows_a_chat(env, monkeypatch, capsys):
+    """The one-off migration makes every say chat reply-only and leaves chats made by `ttp connect`
+    following. `ttp connect --unfollow` stops a chat's alerts and keeps its replies; connecting the
+    chat again follows again."""
+    from ttp import cli, weblink
+    from ttp.db import CHAT_RANK, REPLIES_ONLY, SAY_REPLIES_MIGRATION, chat_floor
+    p = make(env)
+    monkeypatch.setattr(weblink, "local", lambda p, url: ("web app: checked", 0))
+    for cid in ("say-0123abcd", "c1", "c2"):
+        _relay_chat(p, cid)
+    p.db.x("UPDATE chats SET min_severity='high' WHERE id='c2'")
+    p.db.x("DELETE FROM meta WHERE key=?", (SAY_REPLIES_MIGRATION,))
+    p.db._migrate()
+    floors = {r["id"]: r["min_severity"] for r in p.db.q("SELECT id, min_severity FROM chats")}
+    assert floors == {"say-0123abcd": REPLIES_ONLY, "c1": "normal", "c2": "high"}, floors
+    assert chat_floor(REPLIES_ONLY, "high") == REPLIES_ONLY and CHAT_RANK[chat_floor("normal", "high")] == 2
+    alert = p.db.post("out", "a service restarted twice", kind="alert", severity="critical")
+    mine = p.db.post("out", "answer to c1", chat="c1", kind="reply")
+
+    def unread(cid):
+        return [m["id"] for m in p.db.unread_for_chat(cid, 0, p.db.one("SELECT min_severity FROM chats WHERE id=?",
+                                                                       (cid,))["min_severity"])]
+    assert unread("c1") == [alert, mine] and unread("say-0123abcd") == []
+    cli.main(["connect", "demo", "--chat", "c1", "--unfollow"])
+    assert "unfollowed demo" in capsys.readouterr().out
+    assert unread("c1") == [mine], "an unfollowed chat keeps its replies, never the alerts"
+    with pytest.raises(SystemExit):
+        cli.main(["connect", "demo", "--chat", "nosuch", "--unfollow"])
+    assert "no chat nosuch" in capsys.readouterr().err
+    cli.main(["connect", "demo", "--chat", "say-0123abcd"])
+    assert unread("say-0123abcd") == [alert], "connecting a chat follows the project"
+    cli.main(["connect", "demo", "--chat", "c2"])
+    assert p.db.one("SELECT min_severity FROM chats WHERE id='c2'")["min_severity"] == "high", "its own floor stays"
+    p.db._migrate()
+    assert unread("say-0123abcd") == [alert], "the migration runs once: a say chat connected later keeps following"
 
 
 def test_a_remote_say_sends_the_callers_label_and_drops_it_for_an_older_runtime(env, monkeypatch):

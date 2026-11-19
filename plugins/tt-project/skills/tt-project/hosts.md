@@ -1,7 +1,8 @@
 # Listening for replies, per host
 
 The listener prints each message for this chat and exits (with `--once`) or streams.
-Replies to this chat plus broadcast alerts arrive. Others' replies never do.
+Replies to this chat plus broadcast alerts arrive (alerts only in a chat `ttp connect` attached; a
+`ttp say` caller's chat gets replies only). Others' replies never do.
 Each line starts with the message id: `[#<id> coordinator] <text>`.
 
 ## Acknowledge what you showed

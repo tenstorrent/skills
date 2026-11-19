@@ -441,6 +441,15 @@ class DB:
         self._migrate_tier_source()
         self._migrate_run_cost_basis()
         self._migrate_push_check_cpu()
+        self._migrate_say_replies()
+
+    def _migrate_say_replies(self) -> None:
+        # Chats `ttp say` registered before say chats were reply-only took every alert of the project told.
+        if self.meta(SAY_REPLIES_MIGRATION):
+            return
+        with self.tx():
+            self.x("UPDATE chats SET min_severity=? WHERE id LIKE 'say-%'", (REPLIES_ONLY,))
+            self.set_meta(SAY_REPLIES_MIGRATION, "1")
 
     def _migrate_tier_source(self) -> None:
         # The tier a task was queued at and why its current tier is what it is (TIER_SOURCES). Older
@@ -1091,7 +1100,7 @@ END""")
         """Outbound messages this chat has not seen: its own replies plus broadcasts at or above
         its severity floor. Replies addressed to another chat are never shown here, nor quiet
         broadcasts (a machine-wide alert another project already sent)."""
-        floor = SEVERITY_RANK.get(min_severity, 1)
+        floor = CHAT_RANK.get(min_severity, 1)
         rows = self.q("SELECT * FROM messages WHERE direction='out' AND id>? AND id<=? AND (chat=? OR chat IS NULL) "
                       "ORDER BY id", (after, upto if upto is not None else 2**62, chat))
         return [r for r in rows if r["chat"] == chat
@@ -1350,6 +1359,11 @@ def counted_spend(since_ts: float, until_ts: float | None = None, provider: str 
 
 
 SEVERITY_RANK = {"info": 0, "low": 0, "normal": 1, "high": 2, "critical": 3}
+# A chat's floor that takes no broadcast at all, only replies to its own messages and asks: the chat a
+# one-off `ttp say` registers for its caller. `ttp connect` follows a project (every alert at the floor).
+REPLIES_ONLY = "replies"
+CHAT_RANK = {**SEVERITY_RANK, REPLIES_ONLY: 99}
+SAY_REPLIES_MIGRATION = "say_chats_replies_only"   # meta: set once older say chats were made reply-only
 
 
 def unplanned_abrupt(boot: dict) -> bool:
@@ -1393,8 +1407,8 @@ def host_line(boots: list[dict], where=None) -> str:
 
 def chat_floor(chat_min: str | None, project_min: str | None) -> str:
     """A chat's severity floor: the project floor (notify.chat_min_severity) applies to every chat,
-    and a chat can only raise it."""
-    return max((chat_min or "normal", project_min or "normal"), key=lambda n: SEVERITY_RANK.get(n, -1))
+    and a chat can only raise it (to REPLIES_ONLY: no broadcasts)."""
+    return max((chat_min or "normal", project_min or "normal"), key=lambda n: CHAT_RANK.get(n, -1))
 RESULT_MAX_CHARS = 20000
 
 

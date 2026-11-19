@@ -46,7 +46,7 @@ from pathlib import Path
 from typing import Any
 
 from . import anchors, chatgone, reviewcap
-from .db import DB, SEVERITY_RANK, chat_floor
+from .db import CHAT_RANK, DB, SEVERITY_RANK, chat_floor
 from .util import loads_dict
 
 WINDOWS = (("24 h", 86400), ("7 d", 7 * 86400))
@@ -734,7 +734,7 @@ def asks(db: DB, since: float, now: float | None = None, chat_min: str | None = 
     # The web app's visible tab reads every message (web.web_seen).
     # A say chat reads only broadcasts after it was made (chatgone.read_from): making it is no read.
     readers = {r["id"]: (int(r["last_read"] or 0), 0 if r["id"] == "web" else
-                         SEVERITY_RANK.get(chat_floor(r["min_severity"], chat_min), 1), chatgone.read_from(db, r["id"]))
+                         CHAT_RANK.get(chat_floor(r["min_severity"], chat_min), 1), chatgone.read_from(db, r["id"]))
                for r in db.q("SELECT id, last_read, min_severity FROM chats")}
     rows = {a["id"]: {"id": a["id"], "blocking": (a["ref"] or "").split(":", 1)[1]
                       if (a["ref"] or "").startswith("blocking:") else "unset",

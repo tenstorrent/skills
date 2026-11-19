@@ -9,7 +9,7 @@ The web app is a reader too: each poll from a visible tab moves the 'web' chat's
 """
 from __future__ import annotations
 
-from .db import SEVERITY_RANK, chat_floor
+from .db import CHAT_RANK, chat_floor
 from .project import zombie
 
 KEY = "chat-silent"        # alert key prefix: chat-silent:<chat id>
@@ -47,8 +47,8 @@ def chats(p, db, cfg: dict, now: float) -> list[dict]:
     after = float((cfg.get("relay") or {}).get("gone_after_s", GONE_AFTER_S) or 0)   # 0: never gone
     out = []
     for c in db.q("SELECT id, label, created, last_read, min_severity FROM chats WHERE id!='web' ORDER BY id"):
-        floor = SEVERITY_RANK.get(chat_floor(c["min_severity"], cfg["notify"].get("chat_min_severity")), 1)
-        sevs = [s for s, r in SEVERITY_RANK.items() if r >= floor]
+        floor = CHAT_RANK.get(chat_floor(c["min_severity"], cfg["notify"].get("chat_min_severity")), 1)
+        sevs = [s for s, r in CHAT_RANK.items() if r >= floor]
         alive = listener_alive(p, c["id"])
         # Silent: a message it should read has waited longer than gone_after_s.
         old = None if alive or after <= 0 else db.one(

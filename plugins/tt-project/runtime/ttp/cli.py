@@ -33,7 +33,7 @@ from pathlib import Path
 _STARTED_BY = (os.getpid(), os.getppid())
 
 from . import __version__, poll_s  # noqa: E402
-from .db import CHANGES_NEEDED, SUPERSEDED, chat_floor, task_outcome
+from .db import CHANGES_NEEDED, REPLIES_ONLY, SUPERSEDED, chat_floor, task_outcome
 from . import outbox, redact
 from .devq import unmask_devices
 from .detach import VERDICT_SH as _DETACH_VERDICT_SH
@@ -1117,9 +1117,18 @@ def cmd_connect(a) -> None:
         from .relayers import holder_id
         who = getattr(a, "holder", None) or holder_id()
         argv = ["connect", a.name, *(["--chat", a.chat] if a.chat else []), *(["--label", a.label] if a.label else []),
-                *(["--holder", who] if who else [])]
+                *(["--holder", who] if who else []), *(["--unfollow"] if getattr(a, "unfollow", False) else [])]
         sys.exit(connect_remote(a.name, entry, argv))
     p = need(a.name, sys.argv[1:])
+    if getattr(a, "unfollow", False):
+        if not a.chat:
+            die("--unfollow names the chat: ttp connect <project> --chat <id> --unfollow")
+        if not p.db.one("SELECT 1 FROM chats WHERE id=?", (a.chat,)):
+            die(f"no chat {a.chat} in {p.name}")
+        p.db.x("UPDATE chats SET min_severity=? WHERE id=?", (REPLIES_ONLY, a.chat))
+        print(f"chat {a.chat} unfollowed {p.name}: it gets only replies to its own messages and asks now "
+              f"(`ttp connect {p.name} --chat {a.chat}` follows it again)")
+        return
     # The home zone follows the user: the zone a workstation sent, or this machine's own when the
     # user types here (an ssh login here is a server's zone, not the user's).
     tz, src = a.home_tz, a.home_from or ""
@@ -1139,8 +1148,9 @@ def cmd_connect(a) -> None:
     if refused:
         die(refused)
     p.db.x("INSERT INTO chats(id,created,label,host,last_active,last_read) VALUES(?,?,?,?,?,"
-           "(SELECT COALESCE(MAX(id),0) FROM messages)) ON CONFLICT(id) DO UPDATE SET last_active=excluded.last_active",
-           (chat, time.time(), a.label or "", os.environ.get("TTP_CLIENT_HOST", ""), time.time()))
+           "(SELECT COALESCE(MAX(id),0) FROM messages)) ON CONFLICT(id) DO UPDATE SET last_active=excluded.last_active, "
+           "min_severity=CASE WHEN min_severity=? THEN 'normal' ELSE min_severity END",
+           (chat, time.time(), a.label or "", os.environ.get("TTP_CLIENT_HOST", ""), time.time(), REPLIES_ONLY))
     print(MARKER.format(name=p.name, host=hostname(), dir=p.root))
     print(f"chat: {chat}")
     print(status_text(p))
@@ -1535,12 +1545,13 @@ def _say_local(p: Project, a, text: str, context: str, bid: str | None = None,
 
 def _register_say_chat(db, chat: str, label: str, caller: str) -> None:
     """Create the caller's reply chat, unread from the message about to be posted; reuse it after.
-    Its creation cursor is kept (chatgone.read_from): older broadcasts are not read by making it."""
+    Its creation cursor is kept (chatgone.read_from): older broadcasts are not read by making it. It is
+    reply-only: a one-off message never subscribes its sender to the project's alerts (`ttp connect` does)."""
     if db.one("SELECT 1 FROM chats WHERE id=?", (chat,)):
         return
     top = int(db.one("SELECT COALESCE(MAX(id),0) n FROM messages")["n"])
-    db.x("INSERT INTO chats(id,created,label,host,last_active,last_read) VALUES(?,?,?,?,?,?)",
-         (chat, time.time(), label, caller, time.time(), top))
+    db.x("INSERT INTO chats(id,created,label,host,last_active,last_read,min_severity) VALUES(?,?,?,?,?,?,?)",
+         (chat, time.time(), label, caller, time.time(), top, REPLIES_ONLY))
     db.set_kv(chatgone.SAY_FROM + chat, top)
 
 
@@ -16208,7 +16219,7 @@ def main(argv: list[str] | None = None) -> None:
                    "and reboots (adopts or replaces an existing com.tt-project.tunnel.<name> service)")
     s.add_argument("--unkeep", action="store_true", help="stop and remove the kept tunnel")
     s.set_defaults(fn=cmd_web)
-    for name, fn, hlp in (("connect", cmd_connect, "attach this chat to a project; ends with its checked web app link "
+    for name, fn, hlp in (("connect", cmd_connect, "attach this chat to a project and follow its alerts (--unfollow stops them); ends with its checked web app link "
                            "(exit 3: the link did not answer and the line says what is broken)"),
                           ("status", cmd_status, "one-screen status"),
                           ("paths", cmd_paths, "the project's folders (state, runs, prechecks, pushes, worktrees, "
@@ -16227,6 +16238,9 @@ def main(argv: list[str] | None = None) -> None:
             s.add_argument("--home-tz", help=argparse.SUPPRESS)     # the connecting workstation's zone
             s.add_argument("--home-from", help=argparse.SUPPRESS)   # and its name
             s.add_argument("--holder", help=argparse.SUPPRESS)      # the relayer connecting (relayers.holder_id)
+            s.add_argument("--unfollow", action="store_true",
+                           help="with --chat: stop that chat's alerts and status from this project; it keeps "
+                           "replies to its own messages and asks (connecting it again follows again)")
         if name in ("status", "paths"):
             s.add_argument("--json", action="store_true", help=f"print the {name} as JSON")
         if name == "status":

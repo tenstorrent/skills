@@ -79,3 +79,4 @@
 +140: the ETA format a coordinator posts (basis, range, what would change it) and its over-estimate line (#8771)
 +370: the urgent-message rules of 0af95e16b landed 365 chars past the cap; measured 48183 against 47818 on a83cfcd17 (added by #8789 so its smoke check passes)
 +110: the `code_arm: user msg #<id>` line for a code task the user ordered onto GLM (#9044)
++185: another project's status or alerts reach the user only when they change this project's work or needs (user msg #3740, #9045)

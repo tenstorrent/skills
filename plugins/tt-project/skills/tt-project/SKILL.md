@@ -60,7 +60,13 @@ description: "Start, connect to, and talk with a long-running tt-project: a loca
 - `ttp say` replies "queued on this machine": the project is unreachable right now and the message
   is safe. It goes out by itself, in order and once, when the project is reachable. Tell the user;
   do not resend it.
-- Alerts arrive in every attached chat. Replies arrive only in the chat that asked.
+- Alerts arrive in every chat that `ttp connect` attached (it follows the project). Replies arrive
+  only in the chat that asked.
+- Relay only the projects the user asked this chat to follow, plus replies to this chat's own
+  messages and asks. Never show the user another project's alerts or status unless they asked for
+  that project. A one-off message to another project (a hand-off, a question, a finding) goes by
+  `ttp say <name>` without `--chat`, whose chat gets only the replies, never `ttp connect`. A chat
+  getting alerts it should not → `ttp connect <name> --chat <id> --unfollow` (replies still come).
 - A project posts to a chat at once only for results, decisions you may override, outages and asks.
   Acknowledgements, progress and new ETAs come as one digest per chat, at most every
   `coordinator.chat_digest_h` hours (default 3; 0 sends everything at once). Show each as it arrives;

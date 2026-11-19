@@ -42,6 +42,7 @@ import time
 from pathlib import Path
 
 from . import ctxfork, timefmt
+from .db import REPLIES_ONLY
 from .project import durable_append, durable_write
 
 SAMPLES = "host-load.jsonl"     # in the state folder: {"ts", "load1", "cores"} per line
@@ -267,9 +268,12 @@ def changes(old: dict, new: dict) -> list[str]:
 
 
 def main_chat(db) -> str | None:
-    """The chat the user wrote in last, else the one active last."""
-    r = (db.one("SELECT chat FROM messages WHERE direction='in' AND chat IS NOT NULL ORDER BY id DESC LIMIT 1")
-         or db.one("SELECT id chat FROM chats ORDER BY COALESCE(last_active, created) DESC LIMIT 1"))
+    """The chat the user wrote in last, else the one active last; never a reply-only chat (a one-off
+    `ttp say` caller's), which gets no status."""
+    r = (db.one("SELECT m.chat FROM messages m LEFT JOIN chats c ON c.id=m.chat WHERE m.direction='in' "
+                "AND m.chat IS NOT NULL AND c.min_severity IS NOT ? ORDER BY m.id DESC LIMIT 1", (REPLIES_ONLY,))
+         or db.one("SELECT id chat FROM chats WHERE min_severity IS NOT ? ORDER BY COALESCE(last_active, created) DESC "
+                   "LIMIT 1", (REPLIES_ONLY,)))
     return r["chat"] if r else None
 
 

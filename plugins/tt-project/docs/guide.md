@@ -8,7 +8,7 @@ Install details, updates and uninstall: [install.md](install.md).
 | You say | What happens |
 |---|---|
 | "Start a tt-project called X on box B: <brief>" | the project is created on B and starts working |
-| "Connect to project X" | this chat attaches; replies and alerts arrive here |
+| "Connect to project X" | this chat attaches and follows it; replies and alerts arrive here |
 | anything addressed to the project | relayed to the coordinator verbatim (the chat's own context goes apart, in `ttp say --context`, or alone in `ttp say --finding`, and counts as your word only in a project where you turned on `coordinator.agent_orders_as_user`, never for a PR's ready or merge, money, credentials, a step that could affect other people or speaking as you; a Restrictions change it orders is cited relayer-ordered and listed in the daily review); its answer comes back to this chat |
 | "Tell all projects: <words>" | `ttp say --all`: every project in `ttp list` gets your words once, marked as a broadcast, so none relays them on; a resend within 24 h reaches only the ones that missed it |
 | "What is X doing?" | `ttp status X`: running work, blockers, spend, why idle |
@@ -20,11 +20,15 @@ and preferences you add later become part of the project's charter and memory.
 From a shell inside a git repository, `ttp new demo --describe "Keep the README accurate."` creates a
 project and ends with a link to its web app, `http://127.0.0.1:<port>/#token=<token>`; `ttp web demo`
 prints it again. `ttp say demo "<your words>"` and `ttp status demo` talk to it without a chat: a
-`ttp say` without `--chat` keeps one reply chat per caller (the calling project, else the host). Each
+`ttp say` without `--chat` keeps one reply chat per caller (the calling project, else the host). That
+chat is reply-only: it gets replies to its own messages and asks, never the project's alerts, status or
+digests, so a one-off message to another project subscribes its sender to nothing. Each
 such say first prints that chat's unread replies (up to 20, oldest first) and marks read only the ones
 it printed, then sends; `--wait <seconds>` (at most 300) also waits for the answer to the message just
 sent. A failure to read replies is reported on stderr and never stops the message. `ttp listen demo
---chat <id> --once`, printed after each say, reads the chat without sending.
+--chat <id> --once`, printed after each say, reads the chat without sending. `ttp connect` follows a
+project: its chat gets every alert at its floor too; `ttp connect demo --chat <id> --unfollow` makes a chat
+reply-only again, and connecting it again follows again.
 
 A project never sits inside another project's folder: `ttp new` refuses such a `--dir` (and a name already
 registered for another live project) and names `~/.tt-project/scratch/<name>` as the place for scratch and
@@ -4545,7 +4549,7 @@ the user's commands are not checked.
 
 ## Notifications
 
-Alerts go to every attached chat, to the web app, and, if you
+Alerts go to every chat `ttp connect` attached (not to a `ttp say` caller's reply-only chat), to the web app, and, if you
 install it, to a desktop notifier on your workstation that covers all your projects
 (`ttp notifier install`; asked once per user, recorded with `ttp consent notifier yes|no`). Only decisions, reviews, merges, funds and outages notify by default.
 `ttp notifier test` checks that desktop notifications show (with sound) and prints the fix if not.
