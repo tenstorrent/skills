@@ -250,14 +250,13 @@ def test_a_slow_dispatch_step_names_the_task_it_was_on(env, monkeypatch):
     d = dmod.Daemon(p.base)
     tid = p.db.add_task("slow to gate", "s", kind="work", tier="light", origin="user")
     monkeypatch.setattr(dmod, "STEP_BUDGET_S", 0.05)
-    real = d.lease_held
 
-    def slow_lease():
-        if d._step_holder == f"task #{tid}":
+    def slow_gate(db, task):
+        if d._step_holder == f"task #{tid}'s start":
             time.sleep(0.1)
-            return False   # start nothing: only the record is under test
-        return real()
-    monkeypatch.setattr(d, "lease_held", slow_lease)
+        return "held"   # start nothing: only the record is under test
+    monkeypatch.setattr(dmod.dispatchguard, "refusal", slow_gate)
+    monkeypatch.setattr(dmod.dispatchguard, "refuse", lambda *a, **k: None)
     d._run_step(d.dispatch, "dispatch")
     [ev] = p.db.q("SELECT * FROM events WHERE kind='tick_step_slow'")
     assert f"held longest by task #{tid}" in ev["text"] and ev["task"] == tid, ev["text"]
@@ -2221,7 +2220,7 @@ def test_the_tick_runs_every_step_through_run_step():
               for x in ast.walk(c)}
     direct = {c.func.attr for c in ast.walk(tick) if isinstance(c, ast.Call) and id(c) not in inside
               and isinstance(c.func, ast.Attribute) and isinstance(c.func.value, ast.Name) and c.func.value.id == "self"}
-    assert direct <= {"_check_sleep", "_load_config", "lease_held", "tend_lease"}, direct
+    assert direct <= {"_check_sleep", "_load_config"}, direct
     assert "stepclock.install()" in pathlib.Path(dmod.__file__).read_text().split("def main()")[1][:300]
 
 

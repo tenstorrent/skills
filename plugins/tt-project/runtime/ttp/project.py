@@ -714,12 +714,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # decision and fact entries, never standing ones, that every prompt has left out for at least
     # archive_hidden_days days (0 = off). `ttp memory <name> --search <words>` still finds them.
     "memory": {"archive_hidden_days": 7},
-    # Standby snapshots (replica.py), off until failover.standby names a machine alias or an absolute
-    # directory: every snapshot_every_s seconds (and soon after a task finishes) the daemon ships a
-    # consistent copy of the database, harness and open tasks' branches there, keeping snapshot_keep.
-    # The project lease across hosts (lease.py; keys in EXTRA_KEYS) is off, a single host, while
-    # failover.lease_remote is unset.
-    "failover": {"snapshot_every_s": 900, "snapshot_keep": 3},
     # A new code task whose spec names files another open or unlanded code task adds or changes gets a
     # warning at task_add, and its worker the list of those branches (overlap.py). Never counted: the
     # `ignore` globs, hubs (tracked files over hub_bytes), folders and the files delivery.push_checks
@@ -890,11 +884,6 @@ EXTRA_KEYS = {
     # hold_mute_escalate_h: the longest a mute covering a device hold stays silent (screen.hold_cap; 1).
     # throughput_mute_max_h: the longest a throughput-class mute lasts before renewal (throughmute.max_h; 12).
     "screen": {"hold_mute_escalate_h", "throughput_mute_max_h"},
-    # standby: where state snapshots go (off: unset); fleet: the identity projects driving one fleet share
-    # (also the shared lease identity). The project lease (lease.py), off while lease_remote is unset:
-    # lease_remote, a git remote (URL or a code-repo remote name) for refs/ttp/lease/<identity>, never the
-    # plugin's own repository and not the delivery remote unless allow_delivery_remote; lease_ttl_s (300).
-    "failover": {"standby", "fleet", "lease_remote", "lease_ttl_s", "allow_delivery_remote"},
 }
 OPEN_SECTIONS = {"resources", "resources_tasks"}           # any name below is fine
 # write_fence: true runs the provider's workers in its optional write fence (Claude's Bash sandbox, Codex's

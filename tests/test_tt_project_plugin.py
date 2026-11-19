@@ -5353,25 +5353,6 @@ def test_guide_documents_the_product_defaults():
     assert "sends log and alert text" in jev and "outside paid service" in jev
 
 
-def test_guide_documents_standby_snapshots():
-    """Every standby snapshot key and each `ttp replicate` flag is in the guide's standby section."""
-    sys.path.insert(0, str(RUNTIME.parent))
-    try:
-        from ttp import project
-    finally:
-        sys.path.remove(str(RUNTIME.parent))
-    text = (PLUGIN / "docs" / "guide.md").read_text(encoding="utf-8")
-    assert "\n## Standby snapshots\n" in text
-    section = " ".join(text.split("\n## Standby snapshots\n", 1)[1].split("\n## ", 1)[0].split())
-    keys = {"standby", "fleet", "snapshot_every_s", "snapshot_keep"}
-    assert keys <= set(project.DEFAULT_CONFIG["failover"]) | project.EXTRA_KEYS["failover"]
-    for k in keys:
-        assert f"`failover.{k}`" in section, k
-    for flag in ("`ttp replicate", "--now", "--verify", "--restore DIR --into PATH", "--seq N"):
-        assert flag in section, flag
-    assert "Off by default" in section and "Run folders" in section
-
-
 def _fake_slurm(tmp_path, node="State=IDLE LastBusyTime=2000-01-01T00:00:00", res="", queue=""):
     """A bin dir whose ssh runs the remote command locally, with fake Slurm tools reading files."""
     fake = tmp_path / "fake"

@@ -130,7 +130,6 @@ from . import selfblock
 from . import bursthold
 from . import audit
 from . import redact
-from . import replica
 from . import schedlog
 from . import throughmute
 from . import probespawn
@@ -212,7 +211,6 @@ from . import land
 from . import landed
 from . import loadcaps
 from .loadcaps import REVIEW_STALL_S, SWEEP_AFTER_S
-from . import lease as leasemod
 from . import localspend
 from . import lockprobe
 from . import locks
@@ -733,11 +731,6 @@ ROOT_HEAD_KEY = "root_head"   # kv: the open alert on a project root left detach
 # Task kinds whose commits left on a detached HEAD get a rescue branch recorded as their branch (_rescue_detached).
 RESCUE_KINDS = ("code", "work")
 MEMORY_ARCHIVED_KEY = "memory_archived_at"   # kv: when the daemon last archived hidden memory (archive_hidden_memory)
-LEASE_STATE_KEY = "lease_state"   # kv: the lease state last announced (lease.py), one event per change
-# Steps a host that does not hold the project lease skips: they start model work, push, or answer
-# people, which only the one live coordinator may do. Maintenance steps go on.
-LEASE_STEPS = ("dispatch", "maybe_coordinate", "run_schedules", "start_pushes", "poll_slack", "deliver_outbound",
-               "route_machines", "backup_branches", "retry_rejected", "post_held_notifies")
 HOST_CYCLE_SEEN_KEY = "host_cycle_seen"   # kv: power-cycle intent id -> held or lapsed, each logged or posted once
 ROOT_RECHECK_S = 300   # an open root-checkout alert's condition is looked at again this often
 PAGED_KEY = "watch_paged:"   # kv per command schedule: {"<project>\t<line key>": {at, first, n, seen}} (pageto)
@@ -1399,7 +1392,6 @@ class Daemon:
         self._local_only_ok: dict[str, str] = {}   # branch -> head found on a remote: not looked at again
         self._local_only_job: dict | None = None   # the check running in its thread, applied by a later tick
         self._backup_job: dict | None = None   # the backup pushes running in their thread (backup_branches)
-        self._replica_job: threading.Thread | None = None   # the state snapshot being taken (replicate_state)
         self._mcp_probe: threading.Thread | None = None   # `claude mcp list` in flight (probe_mcp)
         self._mcp_tried = 0.0   # when it last started: an unwritable answer is not retried every tick
         self._models_probe: threading.Thread | None = None   # the routed endpoint's /models check (check_route_models)
@@ -1412,10 +1404,6 @@ class Daemon:
         self._deslop_tried = 0.0   # the last hourly check of the deslop schedule (keep_deslop)
         self._cli_watch: threading.Thread | None = None   # CLI versions being read (watch_cli_versions)
         self._cli_watched = 0.0   # when that last started
-        self._replica_checked = 0.0
-        self._replica_stale: bool | None = None   # None: not looked since start
-        self._replica_held_from = 0.0   # when this host took the project lease back (0: held since start)
-        self._replica_unheld = False    # the last look found another host holding the lease
         if not isinstance(self.p.db.kv(KV_LOCAL_ONLY_FROM), (int, float)):
             self.p.db.set_kv(KV_LOCAL_ONLY_FROM, time.time())   # work done before the check existed is not flagged
         self._kept: dict[int, tuple[float, float, str]] = {}   # task id -> (task updated, checked, why kept)
@@ -1499,8 +1487,6 @@ class Daemon:
         self._tick_wall, self._tick_mono = time.time(), time.monotonic()
         self._awake = runner.AwakeClock()   # the daemon's own awake time: a hung run's stale lease counts in it
         self._stale_since: dict[int, float] = {}   # run -> awake time its lease was first seen stale from
-        self._lease: leasemod.Lease | None = None   # the project lease, when failover.lease_remote is set
-        self._lease_key: tuple | None = None
         self._settle_until = 0.0   # monotonic time before which nothing new starts (the host just woke)
         # provider -> {host, since, checked, checking, up, probe}: its API host must resolve before
         # new runs start on it (net_held). Kept in kv NET_HOLDS_KEY too, so a restart, and the overseer's
@@ -2463,25 +2449,19 @@ class Daemon:
             self._last_cfg = now
             self.jev = babysit.wrap(self.cfg, Jev(self.cfg, db=self.p.db, pause=self._jev_pause), self.p.db,
                                     self._chat_pause, log=lambda m: log(self.p, m))
-        self.tend_lease()
-        # Compared as callables, not by name, so a step replaced on the instance is gated the same way.
-        lease_off = [] if self.lease_held() else [getattr(self, n) for n in LEASE_STEPS]
         for step in (self.lift_boot_pause, self.reap_runs, self.reap_waiting_checks, self.wake_after_reboot, self.meter_running, self.rebook_per_call_step, self.rebook_no_call_step, self.rebook_no_usage_step, self.watch_runs, self.watch_urgent_messages, self.check_steer_reads, self.relay_escalations, self.post_held_notifies, self.reconcile_tasks, self.retry_workspaces, self.tend_pushes,
                      self.sweep_sandbox_trees,
                      self.verify_pushes,
-                     self.tick_prune_worktrees, self.prune_leftovers, self.branch_cap, self.rollout_watch, self.land_harness_worktrees, self.backup_branches, self.replicate_state, self.check_local_only, self.check_disk,
+                     self.tick_prune_worktrees, self.prune_leftovers, self.branch_cap, self.rollout_watch, self.land_harness_worktrees, self.backup_branches, self.check_local_only, self.check_disk,
                      self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends, self.check_move, self.track_outages,
                      self.check_integrity, self.heal_harness_git,
                      self.sync_schedules, self.lint_charter, self.lint_worker_prompt, self.tend_holds, self.record_ttr, self.alert_long_pause, self.reclassify_alerts,
                      self.check_linger, self.check_notifier, self.check_overseer, self.alert_slurm_paused, self.check_gh_auth, self.check_reach, self.check_spill_health, self.watch_occupancy, self.check_chats,
                      self.probe_mcp):
-            if step in lease_off:
-                continue
             self._run_step(step)
         self._idle.update(self.cfg, self._work_seen)
         if self.p.db.kv("paused", False):
-            if not lease_off:
-                self._run_step(self.deliver_outbound)   # the long-pause alert, and what was posted before, still reach Slack
+            self._run_step(self.deliver_outbound)   # the long-pause alert, and what was posted before, still reach Slack
             return
         self._run_step(self._refresh_meters)
         self._run_step(self.update_gates)
@@ -2598,8 +2578,6 @@ class Daemon:
                     and not self.p.db.one("SELECT id FROM messages WHERE direction='in' AND handled=0"):
                 continue
             if cycle and step in (self.dispatch, self.start_pushes):   # the coordinator still runs
-                continue
-            if step in lease_off:   # another host holds the project lease
                 continue
             self._run_step(step)
 
@@ -3504,71 +3482,8 @@ class Daemon:
             except Exception:
                 log(self.p, "push queue: closing shipped code tasks failed\n" + traceback.format_exc())
 
-    def lease_held(self) -> bool:
-        """The per-call lease check: no lease configured is today's single host, always the holder."""
-        if not leasemod.configured(self.cfg):
-            return True
-        return bool(self._lease and self._lease.held())
-
-    def tend_lease(self) -> None:
-        """Take or renew the project lease (lease.py) before this tick's coordinator turn and dispatch,
-        when failover.lease_remote is set. A store it may not use, or one that does not answer, holds
-        dispatch (fail-closed). One log line, event and alert per change of state."""
-        cfg = self.cfg
-        if not leasemod.configured(cfg):
-            if self._lease_key is not None:
-                self._lease, self._lease_key = None, None
-                self._lease_announce("off", "project lease switched off: single-host behaviour")
-            return
-        key = (str(leasemod.settings(cfg).get("lease_remote")), leasemod.identity(self.p, cfg), leasemod.ttl_s(cfg),
-               bool(leasemod.settings(cfg).get("allow_delivery_remote")))
-        if key != self._lease_key:
-            self._lease_key = key
-            try:
-                self._lease = leasemod.for_project(self.p, cfg)
-            except leasemod.Refused as e:
-                self._lease = None
-                leasemod.save_refused(self.p, cfg, str(e))
-                self._lease_announce("refused", f"project lease: {e}. No dispatch, coordinator turns or pushes "
-                                                f"until failover.lease_remote names an allowed store.")
-                return
-        if not self._lease:
-            return
-        try:
-            what = self._lease.step()
-        except Exception:
-            log(self.p, "project lease: step failed\n" + traceback.format_exc())
-            return
-        s = self._lease.snapshot()
-        if self._lease.held():
-            self._lease_announce("held", f"project lease held here (epoch {s['epoch']}, {what})", severity="low")
-        elif what == "rejected":
-            self._lease_announce("rejected", f"project lease store rejected the lease write ({s['error']}): this "
-                                             f"host does not dispatch until the store accepts {leasemod.REF_PREFIX}*")
-        elif what == "unreachable":
-            self._lease_announce("unreachable", f"project lease store does not answer ({s['error']}): this host "
-                                                f"does not dispatch until a renewal succeeds")
-        elif what != "kept":
-            holder = s.get("holder_host") if not s.get("released") else None
-            self._lease_announce(f"other:{holder}", f"lease held by {holder or 'nobody (released)'} "
-                                                     f"({s.get('role') or 'primary'}, epoch {s['epoch']}): "
-                                                     f"this host does not dispatch")
-
-    def _lease_announce(self, state: str, text: str, severity: str = "normal") -> None:
-        db = self.p.db
-        if db.kv(LEASE_STATE_KEY) == state:
-            return
-        db.set_kv(LEASE_STATE_KEY, state)
-        log(self.p, text)
-        db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
-             (time.time(), "daemon", "lease", severity, text[:500], "handled"))
-        if severity != "low":
-            self.alert(f"lease:{state}", text, severity="normal", every_s=0)
-
     def start_pushes(self) -> None:
         """Start a push batch when one is due (pushq.schedule): local checks only, no model."""
-        if not self.lease_held():
-            return
         pushq.schedule(self.p, self.cfg, log=lambda m: log(self.p, m))
 
     def _check_sleep(self) -> None:
@@ -3584,8 +3499,6 @@ class Daemon:
         if jump < SLEPT_MIN_S:
             return
         self._stale_since.clear()   # every supervisor slept too: its lease gets a fresh look once it renews
-        if self._lease:
-            self._lease.lapse()   # the project lease's monotonic deadline stood still too: held again once renewed
         settle = float(self.cfg["budget"].get("wake_settle_s", 300))
         self._settle_until = mono + settle
         db = self.p.db
@@ -3880,8 +3793,6 @@ class Daemon:
             raise ValueError("start_run takes `system` or `append_system`, not both")
         if self.cfg_status == "unavailable":
             raise RuntimeError("project.json is unreadable with no last good copy: no model work starts")
-        if not self.lease_held():
-            raise RuntimeError("this host does not hold the project lease: no model work starts")
         if provider in self._net_holds:
             self._net_holds[provider]["probe"] = time.monotonic()   # the one run that tries the network
         cfg = self.cfg
@@ -4481,7 +4392,6 @@ class Daemon:
                    **glmguard.env_for(note),  # a run on the code arm's GLM side runs under glmguard (every provider)
                    **coordroute.guard_env(note),   # so does a routine coordinator lane or shadow turn
                    **glm_env,   # every run on the chat model, whatever route sent it there
-                   **({"TTP_LEASE_EPOCH": str(self._lease.epoch)} if self._lease else {}),
                    "TTP_PYTHON": sys.executable,   # `ttp` runs under this, not the venv's python3
                    "TTP_SANDBOX_CHECKS": os.environ.get("TTP_SANDBOX_CHECKS", "0"),   # sandbox.opted_in
                    "TTP_REFUSE_SUDO": os.environ.get("TTP_REFUSE_SUDO", "0"),   # sudowatch.refusing
@@ -11875,8 +11785,8 @@ class Daemon:
 
     def _kick_dispatch(self, ids: list[int], now: float) -> None:
         """Run dispatch now for urgent tasks check_unstarted found ready past READY_P1_S with nothing holding
-        them, under the tick's own guards for dispatch (the project lease, a host power cycle, a stop)."""
-        if self.stopping or not self.lease_held() or self.host_cycle_held(now):
+        them, under the tick's own guards for dispatch (a host power cycle, a stop)."""
+        if self.stopping or self.host_cycle_held(now):
             return
         log(self.p, f"dispatch kick: urgent task(s) {', '.join(f'#{i}' for i in ids)} ready with a free slot "
                     f"over {unstarted.READY_P1_S // 60} min")
@@ -12958,8 +12868,6 @@ class Daemon:
                 self._maybe_coordinate()
 
     def _maybe_coordinate(self) -> None:
-        if not self.lease_held():
-            return
         core = self.cfg.get("core_provider") or "claude"
         if self.net_held(core) and not self._net_may_probe(core):
             return   # its API host does not resolve: the turn that gets through folds in what waits
@@ -13578,8 +13486,6 @@ class Daemon:
         db, signs = self.p.db, set()
         if db.kv("paused", False):
             signs.add("pause")
-        if not self.lease_held():
-            signs.add("lease")
         for r in db.q("SELECT key FROM kv WHERE key LIKE ?", (alerts.BREAKER + "%",)):
             if (db.kv(r["key"]) or {}).get("open"):
                 signs.add("login:" + r["key"][len(alerts.BREAKER):])
@@ -13655,8 +13561,6 @@ class Daemon:
         scratch = rollout.scratch_state(db, self.p.name, self.cfg.get("rollout")) if ready else None
         scratch_owners = _owner_due(db) if scratch else {}
         for i, task in enumerate(ready):
-            if not self.lease_held():   # lapsed during this tick (a slow start or store): start nothing more
-                break
             # Stopped between tasks at the step budget: the ones not reached go first next tick (a stop
             # instead lets dispatch finish what it began: _run_step).
             if self._step_over(f"task #{task['id']}'s start", task["id"]) and i and not self._stopping:
@@ -15612,59 +15516,6 @@ class Daemon:
             job["done"].set()
         self._backup_job = job
         threading.Thread(target=work, daemon=True).start()
-
-    def replicate_state(self, check_every_s: float = 60) -> None:
-        """Ship a state snapshot to failover.standby when one is due (replica.py): in a thread, one at
-        a time, with a project of its own (the database connection stays in this thread). While the
-        newest snapshot is stale, one keyed observation; closed once a fresh one ships. Nothing is read
-        while failover.standby is unset. With failover.lease_remote set only the lease holder snapshots:
-        another host's snapshots are the standby's, so this one's stale view raises nothing, and after
-        taking the lease back staleness counts from then."""
-        if self._replica_job is not None and not self._replica_job.is_alive():
-            self._replica_job = None
-        s = replica.settings(self.cfg)
-        now = time.time()
-        if not s:
-            return
-        if not self.lease_held():
-            if self._replica_stale:
-                scr.close_watcher_issues(self.p.db, replica.OBS_SOURCE, why="another host holds the project lease")
-            self._replica_stale, self._replica_unheld = None, True
-            return
-        if self._replica_unheld:
-            self._replica_unheld, self._replica_held_from, self._replica_checked = False, now, 0.0
-        if now - self._replica_checked < check_every_s:
-            return
-        self._replica_checked = now
-        st = replica.load_state(self.p)
-        if self._replica_job is None and not st.get("since"):
-            st["since"] = now   # when it was turned on: a snapshot that never ships goes stale from here
-            replica._save_state(self.p, st)
-        stale = replica.stale_text(self.p, self.cfg, now) if now - self._replica_held_from >= s["stale_s"] else ""
-        if stale and not self._replica_stale:
-            self.observe(replica.OBS_SOURCE, stale, "normal", key=replica.OBS_KEY, whole=True)
-        elif not stale and self._replica_stale is not False:
-            # an unchanged check (nothing new, standby still current) also lands here; it does not contact the standby
-            scr.close_watcher_issues(self.p.db, replica.OBS_SOURCE, why="the standby holds the current state")
-        self._replica_stale = bool(stale)
-        if self._replica_job is not None:
-            return
-        mark = (self.p.db.one("SELECT COUNT(*) n FROM tasks WHERE status='done'") or {}).get("n")
-        if not replica.due(st, s, now, mark):
-            return
-        cfg, base = copy.deepcopy(self.cfg), self.p.base
-
-        def work() -> None:
-            try:
-                r = replica.snapshot(Project(base), cfg, mark=mark)
-            except Exception:
-                r = {"outcome": "failed", "error": traceback.format_exc().replace("\n", " | ")[-300:]}
-            if r.get("outcome") in ("ok", "failed"):
-                log(self.p, f"standby snapshot #{r.get('seq')}: {r['outcome']}"
-                            + (f" ({r.get('size', 0) / 1e6:.1f} MB, kept {r.get('kept')})" if r["outcome"] == "ok"
-                               else f": {r.get('error')}"))
-        self._replica_job = threading.Thread(target=work, daemon=True, name="replica")
-        self._replica_job.start()
 
     def _apply_backup(self, job: dict) -> None:
         """Record what a finished backup_branches pass did: drop pushed, skipped and refused branches

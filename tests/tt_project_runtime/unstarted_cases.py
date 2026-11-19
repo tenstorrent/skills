@@ -556,10 +556,6 @@ def test_an_urgent_task_ready_with_a_free_slot_kicks_dispatch_and_routine_work_d
     p.db.update_task(p1, status="running")
     d.kicks.clear()
     assert routine not in [e["task"] for e in check(start + 300)] and d.kicks == [], "priority 3 never kicks"
-    p.db.update_task(p1, status="queued")
-    monkeypatch.setattr(d, "lease_held", lambda: False)
-    check(start + 400)
-    assert d.kicks == [], "no kick without the project lease"
 
 
 def test_a_deadline_task_held_only_by_full_slots_raises_at_60_s_naming_what_fills_them(env, monkeypatch):

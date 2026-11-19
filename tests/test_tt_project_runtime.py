@@ -27702,9 +27702,6 @@ DURABLE_EXEMPT = {
     ("notifier.py", "plist.write_bytes("): "inside the staged .new app, signed then renamed into place; a torn one is rebuilt",
     ("notifier.py", '"applet.icns").write_bytes('): "inside the staged .new app, signed then renamed into place",
     ("db.py", 'with log.open("a") as fh'): "logs/slow-tx.log, a diagnostic report line",
-    ("replica.py", "with open(dst,'wb') as f:"): "the standby receiver, a command string run there: it syncs each file, its folders and the parent itself before renaming <seq>.partial into place",
-    ("replica.py", 'open(out, "wb") as g'): "the gzipped database copy in state/replica-stage, a scratch folder removed after each snapshot and never read after a crash",
-    ("replica.py", 'open(state / "project.db", "wb")'): "restore writes into a new, empty project folder; one cut off leaves the folder non-empty, which a rerun refuses, saying to remove it",
     ("conflictfix.py", 'with open(path, "w", encoding="utf-8", newline="") as f'): "git merge-file's inputs for the model-free conflict settler, in a temporary directory removed after",
     ("cursorhook.py", 'with open(path, "a") as f:'): "info/exclude lines for a Cursor run's hooks file, re-added by the next run that finds them missing; never state",
     ("cursorhook.py", "tmp.write_text(text)"): "a Cursor run's hooks file or its sidecar in the run's cwd, rewritten by each run that joins or leaves; never state",
@@ -47618,7 +47615,7 @@ def _slow_tick_around(d, monkeypatch, delay_s=1.0):
     take longer than the test's short overrun or stall limit plus a slow stack dump (_slow_stack_dump),
     so that limit must hold only in the test's own step."""
     import functools
-    for name in ("tend_lease", "reap_runs"):   # before the steps; the step after lift_boot_pause
+    for name in ("_check_sleep", "reap_runs"):   # before the steps; the step after lift_boot_pause
         real = getattr(d, name)
 
         @functools.wraps(real)

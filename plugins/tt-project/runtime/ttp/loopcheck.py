@@ -43,7 +43,7 @@ DONE = "ttp-loop-tick:"   # the tick process's answer line
 STOP_WAIT_S = 30          # for stopped runs to end before the project is removed
 STUBBED = ("maybe_coordinate", "run_schedules", "review_jev", "check_release", "poll_slack", "deliver_outbound",
            "read_upstream", "wake_upstream_fixes", "forward_upstream", "drain_note_outbox", "remind_logouts",
-           "relay_when_blocked", "replicate_state", "backup_branches", "check_notifier", "check_linger",
+           "relay_when_blocked", "backup_branches", "check_notifier", "check_linger",
            "route_machines", "check_unreachable", "sync_shared_pauses")
 ENDED = ("failed", "blocked", "cancelled")
 # A run's identity, when the check itself runs inside one: the scratch project's runs get their own.

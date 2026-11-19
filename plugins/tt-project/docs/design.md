@@ -240,12 +240,6 @@ disk untouched, with no migration; nothing else is reclaimed by check recovery.
   raises one `wait_stale` event. A daemon-side version was dropped: it moved the end on every
   re-wait, sent the note again each time and matched project names too loosely.
 
-- The project lease (lease.py) only refuses dispatch on a host that does not hold it. Shared
-  effects of workers already running there (pushes, device jobs, `ttp lock`, ledger writes) are not
-  yet fenced by `TTP_LEASE_EPOCH`, there is no ssh-file store, and a stand-in or hand-back needs
-  later steps. A planned move without the lease is `ttp move` (projmove.py, guide "Moving a project"). "Failover" in lease docs means moving a project between hosts; provider
-  failover (failover.py) moves a task between model providers.
-
 - A pause's health end cannot be tuned. A coordinator pause of a resource with an enabled heal
   check is lifted after 3 consecutive healthy results over 30 min (`pauseends.HEALTHY_N`,
   `CLEAN_S`), also when it has an `until`, which stays the deadline reported to the coordinator.

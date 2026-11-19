@@ -280,7 +280,7 @@ def test_a_guard_test_each_change_fails_on_its_own_code_is_not_shared(env, monke
     p = make(env)
     d, _ = _shared_daemon(p, monkeypatch)
     now = time.time()
-    for k, line in enumerate(['lease.py:88: open(dst, "wb")', 'replica.py:301: open(out, "wb")']):
+    for k, line in enumerate(['push.py:88: open(dst, "wb")', 'backup.py:301: open(out, "wb")']):
         sharedchecks.record(p.db, 9000 + k, f"{k:040x}", [_GUARD], now - 600,
                             sharedchecks.failure_sigs(_guard_out(line), [_GUARD]))
     tid, _ = _shared_fail_task(p, tmp_path, _guard_out('heal.py:690: (d / "detached.json").write_text(x)'))

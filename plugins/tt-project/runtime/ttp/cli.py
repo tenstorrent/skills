@@ -1845,9 +1845,6 @@ def status_text(p: Project, verbose: bool = False) -> str:
         lines.append(f"undelivered machine pages: not read ({type(e).__name__})")
     if h["runtime"]["line"]:
         lines.append(h["runtime"]["line"])
-    from . import lease
-    if lease_line := lease.status_line(p, p.config(), now):
-        lines.append(lease_line)
     from . import overseer   # the tick loop judged by its results, read from the overseer's file
     lines.append(overseer.line(overseer.read(p), now))
     lines.append("budget: " + h["spend"]["headline"])
@@ -1888,10 +1885,6 @@ def status_text(p: Project, verbose: bool = False) -> str:
     from . import route
     lines += route.model_lines(db, p.config(), p.state, now, lambda ts: at(ts, now, tz))   # holds, served ids
     from . import loadcaps, pushq
-    from . import replica
-    rl = replica.status_line(p, p.config(), now)
-    if rl:
-        lines.append(rl)
     # Routine diagnostics print only with --verbose; a line that reports an anomaly always prints.
     from . import checkcap, checkjoin, checklane, checkspill, heal, locks, shared, slurmcheck, testslots
     if verbose:
@@ -2480,46 +2473,6 @@ def _stats_time(v: str | None, tz: str, flag: str) -> float | None:
     except ValueError:
         die(f"{flag}: {v!r} is not a time; give epoch seconds or an ISO date, e.g. 2026-10-12 14:00")
     return (d if d.tzinfo else d.replace(tzinfo=timefmt.tzinfo(tz))).timestamp()
-
-
-def cmd_replicate(a) -> None:
-    """Standby state snapshots (replica.py)."""
-    from . import replica
-    if a.restore:
-        if not a.into:
-            die("--restore needs --into PATH: where the project folder is made")
-        try:
-            r = replica.restore(a.restore, a.into, a.seq)
-        except replica.SnapshotError as e:
-            die(f"not restored: {e}")
-        print(json.dumps(r, indent=1) if a.json else
-              f"restored snapshot #{r['seq']} into {r['project_dir']} (harness at {r['harness_head'][:10]}; "
-              f"to apply next: {r['import']})")
-        return
-    p = need(a.name, sys.argv[1:]) if a.name else here()
-    if not p:
-        die("no tt-project project here; name one: `ttp replicate <name>`")
-    cfg = p.config()
-    if not replica.settings(cfg):
-        print("standby snapshots are off: set failover.standby to a machine alias or an absolute directory")
-        return
-    if a.verify:
-        v = replica.verify(cfg, replica.identity(p, cfg))
-        if a.json:
-            print(json.dumps(v, indent=1))
-        elif "error" in v:
-            print(f"could not verify: {v['error']}")
-        else:
-            for x in v["snapshots"] or [{"seq": None}]:
-                print("no snapshots" if x["seq"] is None else f"#{x['seq']}: " + ("ok" if x["ok"] else f"BAD: {x['why']}"))
-        snaps = v.get("snapshots") or []
-        sys.exit(0 if snaps and snaps[-1]["ok"] else 1)
-    if a.now:
-        r = replica.snapshot(p, cfg)
-        print(json.dumps(r, indent=1) if a.json else f"snapshot: {r['outcome']}" + (
-            f" ({r.get('error')})" if r.get("error") else f" #{r['seq']}" if r["outcome"] == "ok" else ""))
-        sys.exit(1 if r["outcome"] == "failed" else 0)
-    print(json.dumps(replica.load_state(p), indent=1) if a.json else replica.status_line(p, cfg, time.time()))
 
 
 def cmd_audit(a) -> None:
@@ -12834,22 +12787,6 @@ def _draining_runs(p: Project) -> list[dict]:
                    for t in p.db.q("SELECT id FROM tasks WHERE status='pushing' AND COALESCE(result,'') NOT LIKE '%\"push_verify\"%' ORDER BY id")]
 
 
-def cmd_lease(a) -> None:
-    """`ttp lease check`: whether the configured lease store may be used and answers (lease.py).
-    `ttp lease show`: this host's last view of the lease (state/lease.json)."""
-    from . import lease
-    p = need(a.name, sys.argv[1:]) if a.name else here()
-    if not p:
-        die("no tt-project project here; name one: `ttp lease check <name>`")
-    if a.action == "show":
-        print(lease.status_line(p, p.config()) or "no lease configured (failover.lease_remote unset)")
-        return
-    ok, text = lease.check(p, p.config())
-    print(f"ttp lease check: {text}")
-    if not ok:
-        sys.exit(1)
-
-
 def cmd_drain(a) -> None:
     """Pause the project (no new runs) and wait until the runs in flight end; running workers are kept.
     Its `ttp detach` jobs still running here are listed (a reboot ends them); with --jobs it waits for
@@ -16108,7 +16045,7 @@ COMMAND_GROUPS = (
     ("probes (retry_when, start_when)", ("landed", "alive", "eta", "ci", "ack-wait", "ssh-preflight", "broker-released",
                                          "deployed", "goal", "hours")),
     ("admin", ("setup", "upgrade", "start", "stop", "restart", "remove", "adopt", "prune", "secret", "consent",
-               "notifier", "schedules", "heal", "upstream", "lease", "replicate", "check-plan", "stats", "audit",
+               "notifier", "schedules", "heal", "upstream", "check-plan", "stats", "audit",
                "push-audit", "ttr", "selfchange", "chat-load", "spend-today", "throughput", "model-trip", "echoes", "course",
                "uninstall", "bench", "model-bench", "model", "waste", "slop", "bridge", "gh-queue", "move", "landings")),
 )
@@ -16699,22 +16636,6 @@ def main(argv: list[str] | None = None) -> None:
                    help="acknowledge one phrase of one retirement as no echo at every place it matches (a name the "
                         "project still uses rightly), while that retirement lives")
     s.set_defaults(fn=cmd_echoes)
-
-    s = sub.add_parser("replicate", help="backup copies of the project's state on a standby machine "
-                                         "(failover.standby): status, take one now, verify them, or restore one "
-                                         "into a project folder", description=(
-        "Without flags: the snapshot status. --now: take and ship one now. --verify: check every snapshot at "
-        "the standby (checksums and chains). --restore DIR --into PATH: on the standby, make PATH/tt-project "
-        "from the newest complete snapshot in DIR (or --seq N)."))
-    s.add_argument("name", nargs="?", help="the project (default: the one here)")
-    g = s.add_mutually_exclusive_group()
-    g.add_argument("--now", action="store_true", help="take a snapshot and send it to the standby now")
-    g.add_argument("--verify", action="store_true", help="check every snapshot at the standby (checksums and chains)")
-    g.add_argument("--restore", metavar="DIR", help="on the standby: restore from the snapshots in DIR")
-    s.add_argument("--into", metavar="PATH", help="with --restore: make the project folder PATH/tt-project")
-    s.add_argument("--seq", type=int, help="with --restore: this snapshot number instead of the newest complete one")
-    s.add_argument("--json", action="store_true", help="print JSON")
-    s.set_defaults(fn=cmd_replicate)
 
     s = sub.add_parser("push-audit", help="find done tasks that say they pushed a commit the remote does not have")
     s.add_argument("name", nargs="?", help="the project (default: the one here)")
@@ -17756,12 +17677,6 @@ def main(argv: list[str] | None = None) -> None:
                            help="from a run: the user message, newer than the user's own resume, that asks for "
                                 "this pause (a pause the user lifted is never re-applied without one)")
         s.set_defaults(fn=cmd_pause)
-    s = sub.add_parser("lease", help="the lock that keeps a project running on one machine at a time (failover): "
-                                     "check where it is kept, or show this machine's view of it")
-    s.add_argument("action", choices=["check", "show"],
-                   help="check: whether the lease store answers; show: this machine's last view")
-    s.add_argument("name", nargs="?", help="the project (default: the one here)")
-    s.set_defaults(fn=cmd_lease)
     s = sub.add_parser("advise", help="inside a GLM-arm run with route.glm_work.advisor or plan_first on: ask Opus a "
                                        "read-only question (--plan: the plan to follow), within the run's limits")
     s.add_argument("question", nargs="+", help="the question, or with --plan the task in your own words")

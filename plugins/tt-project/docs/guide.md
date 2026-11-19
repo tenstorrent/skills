@@ -3967,23 +3967,6 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   user's word. Separately, a hand-off that finds uncommitted changes to tracked paths in the
   project's main checkout records one observation naming them (once per set of paths); nothing
   there is committed or changed.
-- Project lease (`failover.lease_remote`, off by default): one live coordinator per project across
-  hosts, so a project restored on a second host while the first is down cannot double-dispatch once
-  the first comes back. The lease is the ref `refs/ttp/lease/<identity>` on that git remote (a URL or
-  a remote name of the code repository); `<identity>` is `failover.fleet` when set (projects driving
-  one fleet share one lease), else the project id. Each write is a compare-and-swap push. Its epoch
-  goes up by one per change of holder and reaches runs as `TTP_LEASE_EPOCH`. The daemon takes or
-  renews it every `lease_ttl_s`/5 (300 s ttl) before coordinator turns and dispatch; a host that does
-  not hold it starts no coordinator turn, worker run, schedule or push, polls and posts nothing to
-  chat, and says so in one event, while maintenance and running workers go on. No wall clocks are
-  compared: the holder stops at 0.8 ttl after its last renewal, another host takes the lease only
-  after seeing it unchanged for 1.25 ttl on its own clock, a restarted daemon on the holder's host
-  renews at once, and after a sleep the lease counts as lapsed until renewed. A store that does not
-  answer stops dispatch (fail-closed). The remote must be a separate one: the plugin's own
-  repository is always refused, and the project's delivery remote unless
-  `failover.allow_delivery_remote` is set (only where its rules allow such refs). `ttp lease check`
-  says whether the store may be used and answers; `ttp status` shows one `lease:` line. Not to be
-  confused with provider failover (`coordinator.provider_failover_*`).
 - `delivery.own_push_remote` (unset by default) names where own-branch publishes go: a git remote's
   name, a URL, or a map from a repo (its path, or its main checkout's folder name; `"*"` for any
   other) to one. Unset, it is the remote of `delivery.push_branch`, else `origin`, and
@@ -4367,38 +4350,6 @@ naming the key and the safety rule that holds it. With none, the item comes back
 mark. At most 3 new items are raised a minute, longest waits first. It clears once the wait ends. The daily review's Unblocking quality section shows
 `queue_wait_over`: waits over the threshold in 24 h by queue, max and p95 wait, and minutes from the
 mark to the first unblock action.
-
-## Standby snapshots
-
-Off by default: with `failover.standby` unset, nothing is written or shipped and `ttp status` shows
-no standby line. Set it to keep a copy of the project's state on another machine:
-
-- `failover.standby`: an ssh machine alias (snapshots go to `~/.tt-project/standby/<identity>/`
-  there) or an absolute directory, such as a mounted share. `<identity>` is `failover.fleet` when
-  set, else the project's id.
-- `failover.snapshot_every_s` (900, at least 60): how often the daemon takes one; it also takes
-  one soon after a task finishes. A check that finds nothing changed ships nothing.
-- `failover.snapshot_keep` (3): how many of the newest snapshots stay.
-
-A snapshot holds a consistent copy of the database (secrets in its key-value table removed and
-zeroed), the harness repo as a git bundle, open tasks' branches, the latest run's result, prompt and
-run record of each open task, and this project's open machine-ledger changes and pauses. Run
-folders, logs, worktrees, `web.token` and credentials stay behind.
-
-Each one arrives in a temporary folder, is checked file by file against its manifest's checksums,
-synced, then renamed into place, so a reader never sees a half-written snapshot. The harness bundle
-is full at least daily; the others carry only what is new since that full one, so retention keeps
-the newest `snapshot_keep` plus the full one they build on.
-
-`ttp status` shows the newest snapshot's age. When the standby has not been known to hold the
-current state for `max(1 h, 3 x snapshot_every_s)`, the line says STALE and the daemon raises one
-`replica-stale` observation, closed by the next snapshot or check that finds the standby current.
-
-`ttp replicate [--now | --verify | --restore DIR --into PATH [--seq N]]`: without a flag, the
-status; `--now` takes and ships one; `--verify` checks every snapshot at the standby (checksums and
-chains); `--restore`, run on the standby, makes `PATH/tt-project` from the newest complete snapshot
-in `DIR` (or snapshot N). A restore refuses a non-empty target: if one is cut off, remove its folder
-and run it again.
 
 ## Push batches that survive failing entries and remote outages
 

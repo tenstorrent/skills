@@ -600,8 +600,14 @@ def local_names() -> set[str]:
 
 def ssh_hostname(alias: str) -> str:
     """The host `ssh -G` resolves `alias` to (no connection; `alias` itself when it cannot say)."""
-    from .lease import ssh_hostname as resolve
-    return resolve(alias)
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", alias):
+        return alias
+    try:
+        r = subprocess.run(["ssh", "-G", alias], capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return alias
+    m = re.search(r"^hostname\s+(\S+)\s*$", r.stdout, re.M | re.I) if r.returncode == 0 else None
+    return m.group(1).lower() if m else alias
 
 
 def _resolves(name: str, timeout: float) -> bool | None:

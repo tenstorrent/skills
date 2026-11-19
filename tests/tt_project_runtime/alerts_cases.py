@@ -4415,7 +4415,6 @@ def test_a_step_that_used_to_catch_its_own_error_now_reaches_the_step_failure_al
               "start_pushes": (dm.pushq, "schedule"), "lint_worker_prompt": (promptdrift, "check"),
               "tend_mitigations": (dm.mitigate, "tend")}[step]
     monkeypatch.setattr(*target, boom)
-    monkeypatch.setattr(d, "lease_held", lambda: True)
     for n in range(1, dm.STEP_FAILS_ALERT + 1):
         assert d._run_step(getattr(d, step), default="x") == "x"
         assert d._step_fails[step][0] == n

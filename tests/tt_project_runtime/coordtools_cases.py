@@ -1208,9 +1208,9 @@ def test_coordinator_bash_guard_only_reports_a_file_no_ttp_writer_logs(env, tmp_
 _TREE_GIT = {"merge", "checkout", "reset", "restore", "stash", "revert", "cherry-pick", "pull", "rebase", "switch",
              "am", "apply", "clean", "rm", "mv", "read-tree"}
 _HARNESS_EXPR = {"p.harness", "h", "harness", "self.harness", "self.p.harness", "project.harness"}
-# Not a git writer on a live harness checkout: a snapshot restore into a new folder no coordinator runs
-# on yet, and a landing's fast-forward of a branch in the project's own repo (its `h` is that checkout).
-_TREE_GIT_EXEMPT = {("replica.py", "restore"), ("landff.py", "_why_not")}
+# Not a git writer on a live harness checkout: a landing's fast-forward of a branch in the project's own
+# repo (its `h` is that checkout).
+_TREE_GIT_EXEMPT = {("landff.py", "_why_not")}
 
 
 def _harness_git_writers(source: str):
