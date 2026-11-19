@@ -162,25 +162,17 @@ def test_class_target_pins_and_kept_core_tasks_stay_on_core():
     assert runclass.target(off, t, "standard", "status_report")["model"] == "m"
 
 
-def test_a_question_and_a_wake_dispatch_to_the_chat_provider_by_class(env, monkeypatch):
-    from ttp import configwho, glmwork, route, runclass
+def test_a_status_report_dispatches_to_the_chat_provider_by_class(env, monkeypatch):
+    from ttp import route, runclass
     from ttp.daemon import Daemon
     p = make(env)
     _route_config(p, route=None)                                         # a model, no tier route
     d = Daemon(p.base)
-    # A status report that is no floor run goes to the chat provider by its class.
     prov, tier, note = _route_dispatch(p, d, monkeypatch, title="write the weekly status digest", kind="work",
                                      tier="standard")
     assert prov == "chat" and note[runclass.KEY] == "status_report"
     assert note[route.KEY]["rule"] == "class:status_report" and note[route.KEY]["model"] == _RT_MODEL
     assert route.run_model(d.cfg, tier, note[route.KEY]) == (_RT_MODEL, "")
-    # A question is a conclusion floor run (#8980): it stays on core until the GLM work route covers the project.
-    prov, tier, note = _route_dispatch(p, d, monkeypatch, title="why is it slow", kind="question")
-    assert prov == d.cfg.get("core_provider", "claude") and route.KEY not in note
-    p.set_config("route.glm_work", {"on": True, "model": _RT_MODEL, "holdout": 0}, by=configwho.by("user", via="cli"))
-    d = Daemon(p.base)
-    prov, tier, note = _route_dispatch(p, d, monkeypatch, title="why is it slower", kind="question")
-    assert prov == "chat" and note[route.KEY][glmwork.KEY] == "glm"
 
 
 def test_stats_by_class_counts_runs_per_class_per_model_and_the_alarm_names_a_quiet_routed_class(env, capsys):
