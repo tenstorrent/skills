@@ -80,7 +80,7 @@ SCRATCH = "tmp"               # in the run folder: the run's own scratch folder,
 SCRATCH_VARS = ("TMPDIR", "TMP", "TEMP")
 SCRATCH_LINE = ("Keep scratch files in $TMPDIR (a folder of your own in your run folder) or your worktree, never in"
                 " /tmp: the guard refuses writes anywhere else.")
-_SCRATCH_REF = re.compile(r"\$(?:\{(?:TMPDIR|TMP|TEMP)\}|(?:TMPDIR|TMP|TEMP)(?!\w))")
+_SCRATCH_REF = re.compile(r"\$(?:\{(TMPDIR|TMP|TEMP)\}|(TMPDIR|TMP|TEMP)(?!\w))")
 _SCRATCH_SET = re.compile(r"(?<![\w${])(?:TMPDIR|TMP|TEMP)(?!\w)")   # the command names one itself (sets it)
 RUN_ENV = "TTP_GLM_RUN"       # "1", or DEVICE for a run on a device task
 RUN_MARK = "glm_run.json"     # in the run folder: {"device", "gates"}, read where the variable is gone
@@ -294,8 +294,9 @@ def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None) -> str | None
             return f"`{name}` reaches another host, person or database: not for a run on the GLM arm"
     home, tmp = os.path.expanduser("~"), _scratch(run_dir, e)
     roots = _roots(cwd, run_dir, tmp)
-    # $TMPDIR is the run's scratch folder, unless the command sets it itself: then it is read as /tmp
-    paths = _SCRATCH_REF.sub(lambda m: "/tmp" if _SCRATCH_SET.search(cmd) or not tmp else tmp, cmd)
+    # $TMPDIR (TMP, TEMP) is read as its value in the run's environment, or as /tmp where the command sets it itself
+    told = bool(_SCRATCH_SET.search(cmd))
+    paths = _SCRATCH_REF.sub(lambda m: "/tmp" if told else str(e.get(m.group(1) or m.group(2)) or "/tmp"), cmd)
     for path, (cls, why) in sidefx.classify_paths(paths, home, cwd or os.getcwd(), run_dir).items():
         if cls == "write" and not sidefx._inside(path, roots):
             return f"it writes outside its worktree: {path} ({why})"

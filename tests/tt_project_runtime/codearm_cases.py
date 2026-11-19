@@ -593,8 +593,9 @@ def test_glm_guard_allows_writes_to_the_runs_own_scratch_folder(cmd, tmp_path):
     """cell scratch_allowed: $TMPDIR (TMP, TEMP) is the run folder's scratch folder, by name or by path."""
     from ttp import glmguard
     wt, rd = _gg_run(tmp_path)
-    tmp = glmguard.scratch_env(rd)["TMPDIR"]
-    env_ = {"TTP_PROJECT": str(tmp_path / "proj"), "TTP_RUN_DIR": str(rd), "TMPDIR": tmp, **_GG_RUN_ENV}
+    scratch = glmguard.scratch_env(rd)
+    tmp = scratch["TMPDIR"]
+    env_ = {"TTP_PROJECT": str(tmp_path / "proj"), "TTP_RUN_DIR": str(rd), **scratch, **_GG_RUN_ENV}
     assert glmguard.shell_refusal(cmd.replace("{scratch}", tmp), str(wt), str(rd), env_) is None, cmd
     assert glmguard.tool_refusal({"tool_name": "Bash", "tool_input": {"command": cmd.replace("{scratch}", tmp)},
                                   "cwd": str(wt)}, env_) is None, cmd
@@ -602,7 +603,7 @@ def test_glm_guard_allows_writes_to_the_runs_own_scratch_folder(cmd, tmp_path):
 
 @_pytest.mark.parametrize("cmd", [
     "git diff > /tmp/daemon_diff.txt", "cp src/a.py /tmp/a.orig.py", "echo x > /tmp/x", "TMPDIR=/tmp; cp a $TMPDIR/x",
-    "export TMPDIR=/var/tmp && echo x > $TMPDIR/y", "TMP=/tmp cp a ${TMP}/x"])
+    "export TMPDIR=/var/tmp && echo x > $TMPDIR/y", "TMP=/tmp cp a ${TMP}/x", "echo x > $TMPDIR/../../../escape"])
 def test_glm_guard_still_refuses_writes_to_tmp_and_to_a_tmpdir_the_command_set_itself(cmd, tmp_path):
     """cell scratch_tmp_refused: the scratch folder opens no other part of /tmp."""
     from ttp import glmguard
@@ -610,6 +611,9 @@ def test_glm_guard_still_refuses_writes_to_tmp_and_to_a_tmpdir_the_command_set_i
     tmp = glmguard.scratch_env(rd)["TMPDIR"]
     env_ = {"TTP_PROJECT": str(tmp_path / "proj"), "TTP_RUN_DIR": str(rd), "TMPDIR": tmp, **_GG_RUN_ENV}
     assert "outside its worktree" in (glmguard.shell_refusal(cmd, str(wt), str(rd), env_) or ""), cmd
+    other = {**env_, "TMPDIR": "/tmp", "TMP": "", "TEMP": "/var/tmp"}   # a run whose TMPDIR is not its own
+    assert all(glmguard.shell_refusal(c, str(wt), str(rd), other) for c in ("cp a $TMPDIR/x", "echo > $TMP/x",
+                                                                          "tee ${TEMP}/x"))
 
 
 def test_a_glm_runs_scratch_folder_is_in_its_run_folder_or_its_own_short_temp_dir_and_its_prompt_names_it(tmp_path):
