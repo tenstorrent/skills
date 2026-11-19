@@ -357,10 +357,6 @@ RED_CLEAR_RATIO = 0.8
 RED_REPEAT_S = 3600
 # A red only the user can clear is alerted only once it still holds new work this long after it began.
 BUDGET_SETTLE_S = 120.0
-
-
-def budget_settle_s() -> float:
-    return float(os.environ.get("TTP_TEST_BUDGET_SETTLE_S") or BUDGET_SETTLE_S)   # tests of other alerts: 0
 CLEAN_STOP_KEY = "clean_stop"   # kv: {boot, ts} of the daemon's last clean stop
 SCHEDULE_BUDGET_KEY = "schedule_budget_raised"   # kv: schedule -> when its own-budget skip last raised (_schedule_skip)
 SCHEDULE_BUDGET_SOURCE = "daemon:schedule-budget"
@@ -1047,8 +1043,6 @@ def _du(args: list[str], timeout: float) -> tuple[dict[str, int], bool]:
 
 
 def _mount_of(path: Path) -> Path:
-    if os.environ.get("TTP_TEST_DISK_MOUNT"):   # tests measure a small folder, not the real disk
-        return Path(os.environ["TTP_TEST_DISK_MOUNT"])
     p = path.resolve()
     while not os.path.ismount(p) and p.parent != p:
         p = p.parent
@@ -3126,10 +3120,7 @@ class Daemon:
 
     def retire_ended(self) -> None:
         """Retire memory entries and charter sections whose end condition passed (see ends)."""
-        try:
-            self._ends.tick(over=lambda what: self._step_over(f"the end probe of {what}"))
-        except Exception:
-            log(self.p, "retiring ended instructions failed\n" + traceback.format_exc())
+        self._ends.tick(over=lambda what: self._step_over(f"the end probe of {what}"))
 
     def archive_hidden_memory(self) -> None:
         """Once a day, model-free: archive the decisions and facts every prompt has left out for
@@ -3404,10 +3395,7 @@ class Daemon:
 
     def check_mute_ends(self) -> None:
         """Observation mutes with an end_when probe: a pass ends the mute (pauseends.MuteEnds). Model-free."""
-        try:
-            self._mute_ends.tick()
-        except Exception:
-            log(self.p, "checking observation mute ends failed\n" + traceback.format_exc())
+        self._mute_ends.tick()
 
     def record_refused_appends(self) -> None:
         """Each append durable_append refused this daemon (a symlink or special file planted where a
@@ -3581,10 +3569,7 @@ class Daemon:
         """Start a push batch when one is due (pushq.schedule): local checks only, no model."""
         if not self.lease_held():
             return
-        try:
-            pushq.schedule(self.p, self.cfg, log=lambda m: log(self.p, m))
-        except Exception:
-            log(self.p, "push queue: starting a batch failed\n" + traceback.format_exc())
+        pushq.schedule(self.p, self.cfg, log=lambda m: log(self.p, m))
 
     def _check_sleep(self) -> None:
         """Notice that the host slept: the wall clock jumped ahead of the monotonic one, which stands
@@ -5259,9 +5244,8 @@ class Daemon:
         bridge.agent_alert_after_min, cleared once it answers steadily (bridgewatch.py)."""
         from . import bridgewatch
         now = time.time()
-        if now - getattr(self, "_bridge_watched", 0.0) < bridgewatch.EVERY_S or (
-                os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get("TTP_TEST_BRIDGE_WATCH")):
-            return   # daemons under test never read the real ssh config
+        if now - getattr(self, "_bridge_watched", 0.0) < bridgewatch.EVERY_S:
+            return
         self._bridge_watched = now
         bridgewatch.check(self, now)
 
@@ -9893,7 +9877,7 @@ class Daemon:
             # The alert clears itself once no such reason holds (alerts.holds).
             episodes[prov] = self._red_episodes(prov, g, now)
             held = [] if provider_paused else bud.user_held(g)   # a pause has its own alert
-            settle = budget_settle_s()
+            settle = BUDGET_SETTLE_S
             due = {c for c in map(bud.red_class, held) if not episodes[prov][c].get("alerted", True)
                    and now - float(episodes[prov][c].get("red_since", now)) >= settle}
             if held and not due and prev and prev.level != "red":
@@ -15061,11 +15045,8 @@ class Daemon:
         """Flag this project's own harness/prompts/worker.md once per changed copy when it is much larger
         than the template's or has drifted from its sections (promptdrift.check): a stat call per tick,
         the compare at most hourly. Its coordinator merges it; the harness never edits it."""
-        try:
-            from . import promptdrift
-            promptdrift.check(self.p)
-        except Exception:
-            log(self.p, "worker prompt drift: " + traceback.format_exc().replace("\n", " | ")[:1000])
+        from . import promptdrift
+        promptdrift.check(self.p)
 
     def lint_charter(self) -> None:
         """Flag dated charter sections that contradict a standing restriction (coord.charter_lint);
@@ -20342,11 +20323,8 @@ class Daemon:
 
     def tend_mitigations(self) -> None:
         """Model-free: an overdue mitigation wakes the coordinator, a done fix lists its measures for undo."""
-        try:
-            for line in mitigate.tend(self.p.db, self.p.name, where=self.p):
-                log(self.p, line)
-        except Exception:
-            log(self.p, "mitigations: " + traceback.format_exc().replace("\n", " | ")[:1500])
+        for line in mitigate.tend(self.p.db, self.p.name, where=self.p):
+            log(self.p, line)
 
     def sweep_reviews(self) -> None:
         """Model-free retry of reviews left to the coordinator: a code task (or a work task whose branch

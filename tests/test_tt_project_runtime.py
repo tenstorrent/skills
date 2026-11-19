@@ -486,6 +486,10 @@ CHECK_RUNNER_ENV = ("TTP_CHECKS_HOME_FILES", "TTP_CHECKS_PYTHON_LOCK", "TTP_CHEC
                     "TTP_PUSH_MODE", "TTP_PUSH_TIP", "TTP_PUSH_BRANCH")
 
 
+def _no_bridge_watch(self) -> None:
+    """Daemon.watch_bridge_agents under test: no ssh config read (bridge_cases calls bridgewatch.check itself)."""
+
+
 @pytest.fixture()
 def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     home = tmp_path / "home"
@@ -496,12 +500,10 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)   # a password manager's agent here never changes a timeout test
     monkeypatch.setenv("TTP_TEST_LOCAL_TZ", "UTC")   # home zones: never the zone of the machine running the tests
     monkeypatch.setenv("TTP_TEST_CLEAR_HOLD_S", "0")   # alerts clear on the first healthy sweep (alerts_cases tests the window)
-    monkeypatch.setenv("TTP_TEST_BUDGET_SETTLE_S", "0")   # a budget red alerts on its first read (budget_cases tests the settle)
     monkeypatch.setenv("TTP_TEST_POLL_S", "0.05")   # wait loops (runner, ttp lock, listen) check often
     monkeypatch.setenv("TTP_CHECKS_LOAD_GUARD", "0")   # suites never wait on the load of the host running the tests (loadguard tests set it)
     monkeypatch.setenv("TTP_TEST_REMOTE_ONLY", "0")   # a busy spill pool never holds checks on a laptop running the tests (checkspill.remote_only)
     monkeypatch.setenv("TTP_CHECKS_POOL_DIRS", str(tmp_path / "pool"))   # never this host's real pool runs (the suite's own run folder among them)
-    monkeypatch.setenv("TTP_TEST_DISK_MOUNT", str(tmp_path))   # the disk guard's du stays in the test folder
     monkeypatch.setenv("TTP_TEST_SSH_CONFIG", str(tmp_path / "ssh_config"))   # never the user's own ssh config
     monkeypatch.setenv("TTP_TEST_DEVICE_NODES", str(tmp_path / "no-device" / "tenstorrent*"))   # spill probes never scan the host's devices
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))   # `ttp setup` never writes the user's own skills
@@ -572,6 +574,10 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     sys.path.insert(0, str(RUNTIME))
     for mod in [m for m in list(sys.modules) if m == "ttp" or m.startswith("ttp.")]:
         del sys.modules[mod]
+    from ttp import daemon
+    monkeypatch.setattr(daemon, "BUDGET_SETTLE_S", 0.0)   # a budget red alerts on its first read (budget_cases tests the settle)
+    monkeypatch.setattr(daemon, "_mount_of", lambda path: tmp_path)   # the disk guard's du stays in the test folder
+    monkeypatch.setattr(daemon.Daemon, "watch_bridge_agents", _no_bridge_watch)   # daemons never read an ssh config
     from ttp import benchrun   # bench cells run isolated (cellns.py), which needs a mount namespace: the isolation
     monkeypatch.setattr(benchrun, "ISOLATE", False)   # tests (bench_cases) turn it on; the rest run cells as before
     from ttp import codearm   # the arm's tests run a live arm on a stand-in guarded harness (codearm_cases tests the refusal)
@@ -14902,7 +14908,7 @@ def test_disk_scans_never_walk_root_home_or_network_mounts(env, monkeypatch, tmp
     b = dm.disk_breakdown(p, p.base)
     assert b["top_skipped"] and not b["top"] and all(c[-1] != str(env["tmp"]) for c in ran), ran
     assert "top-level directories unknown" in dm.disk_usage_line(b, 1e9)
-    monkeypatch.setenv("TTP_TEST_DISK_MOUNT", "/")
+    monkeypatch.setattr(dm, "_mount_of", lambda path: Path("/"))
     ran.clear()
     dm.disk_breakdown(p, p.base)
     assert all(c[-1] != "/" for c in ran), "never du from /"
