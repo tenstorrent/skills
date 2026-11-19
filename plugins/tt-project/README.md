@@ -7,7 +7,7 @@ Example 1:
 
 ``` 
 new tt-project named vidgen to manage all of my video-model related work in the Metal repo. The project should run
-on box-a, and can use box-a, box-b and exabox box-c for device work. Research and implement
+on box-a, and can use box-a, box-b and the Slurm cluster box-c for device work. Research and implement
 optimizations. Integrate relevant optimizations from other DIT models, and explore novel optimization ideas.
 Use profilers and profiling skills to pinpoint bottlenecks and address them. Babysit all of my video-model related PRs.
 Any PR you open must stay in draft form until I review and move it out of draft. Only I'm allowed to merge.
@@ -59,8 +59,9 @@ Features:
 Needs Python 3.9+, `git`, and Claude Code, Codex or Cursor. In a terminal:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/tenstorrent/skills/smartonTT/tt-project/plugins/tt-project/install.sh | TT_PROJECT_REF=smartonTT/tt-project sh
+curl -fsSL https://raw.githubusercontent.com/tenstorrent/skills/HEAD/plugins/tt-project/install.sh | sh
 ```
+This installs from the default branch; for another branch or tag, put it in place of `HEAD` and pass `TT_PROJECT_REF=<ref>`.
 Or just tell your agent "install tt-project from https://github.com/tenstorrent/skills".
 
 Then reload your agent session. 

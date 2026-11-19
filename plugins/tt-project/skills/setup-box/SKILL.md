@@ -1,6 +1,6 @@
 ---
 name: setup-box
-description: "Get a Tenstorrent device box and work on it over ssh: pick a route (bare metal, IRD reservation, Slurm or exabox), keep a checkout or git worktree on the box, edit, build and run there, and report host, path, commit and job ids back. Use when a tt-project task needs a device box, or the user asks to set one up."
+description: "Get a Tenstorrent device box and work on it over ssh: pick a route (bare metal, IRD reservation or a Slurm cluster), keep a checkout or git worktree on the box, edit, build and run there, and report host, path, commit and job ids back. Use when a tt-project task needs a device box, or the user asks to set one up."
 ---
 
 # tt-project: setup-box
@@ -41,7 +41,6 @@ with `<plugin-root>/skills/setup-box/scripts/box.py site check`. Its `route` pic
 | A machine you can ssh to and own for now | `bare` | `bare-metal.md` |
 | A reservation system with a management host | `ird` | `ird.md` |
 | A Slurm cluster (1-chip, 4-chip or whole-node jobs) | `slurm` | `slurm.md` |
-| A Slurm cluster with whole-node exclusive partitions | `slurm` | `exabox.md` |
 | No entry yet | ask the user for the route and aliases, write the entry | `site.md` |
 | A fresh box to set up | questionnaire, then each answer as an action and its check | `new-box.md` |
 

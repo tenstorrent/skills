@@ -714,7 +714,7 @@ def test_gh_workstation_push_reaches_github_over_ssh_and_never_asks_the_credenti
     this host; `gh auth git-credential` and other gh commands off the allowlist are still refused."""
     from ttp import ghqueue, ghroute, gitmemo
     _cfg, repo, _gh, _ws_calls = _workstation(env, monkeypatch)
-    monkeypatch.setattr(ghroute, "_ssh_agent", lambda: True)   # Quad's case: the forwarded agent answers
+    monkeypatch.setattr(ghroute, "_ssh_agent", lambda: True)   # the forwarded agent answers
     d = env["tmp"] / "cred"
     d.mkdir()
     asked, dialed = d / "asked", d / "dialed"
@@ -1103,3 +1103,47 @@ def test_a_gh_logout_is_not_cleared_by_another_routes_answer_and_a_re_raise_neve
     tick(dp)   # raised again: still never in chat
     assert p.db.kv(ghauth.KV) and p.db.unread_for_chat("c1", 0) == []
     assert not alerts.needs_you(p.db, time.time())
+
+
+def test_gh_workstation_forks_only_to_a_fresh_name_with_the_exact_form(env, tmp_path):
+    """`gh repo fork <owner>/<repo> --fork-name <name> --clone=false` is the one fork form the workstation
+    runs, a write held like any other; it reads first and refuses when <its gh user>/<name> exists."""
+    from ttp import ghqueue, ghroute
+    ok = ["repo", "fork", "acme/widgets", "--fork-name", "widgets-pr2", "--clone=false"]
+    assert ghqueue.allowed(ok) == "" and ghroute.is_write(ok)
+    assert ghqueue.allowed(["repo", "fork", "acme/widgets", "--fork-name=widgets-pr2", "--clone=false"]) == ""
+    for bad in (["repo", "fork", "acme/widgets"], ["repo", "fork", "acme/widgets", "--clone=false"],
+                ["repo", "fork", "acme/widgets", "--fork-name", "w2"],
+                ["repo", "fork", "acme/widgets", "--fork-name", "w2", "--clone"],
+                ["repo", "fork", "acme/widgets", "--fork-name", "w2", "--clone=false", "--org", "acme"],
+                ["repo", "fork", "acme/widgets", "--fork-name", "w2", "--clone=false", "--remote"],
+                ["repo", "fork", "acme/widgets", "--fork-name", "w2", "--clone=false", "--default-branch-only"],
+                ["repo", "fork", "--fork-name", "w2", "--clone=false"],
+                ["repo", "fork", "acme/widgets", "x", "--fork-name", "w2", "--clone=false"],
+                ["repo", "fork", "acme/../x", "--fork-name", "w2", "--clone=false"],
+                ["repo", "fork", "acme/widgets", "--fork-name", "../w2", "--clone=false"],
+                ["repo", "fork", "acme/widgets", "--fork-name", "w2", "--fork-name", "w3", "--clone=false"],
+                ["repo", "fork", "acme/widgets", "--fork-name", "w2", "--clone=false", "--clone=false"],
+                ["api", "-X", "POST", "repos/acme/widgets/forks", "-f", "name=w2"]):
+        assert ghqueue.allowed(bad), bad
+    calls = tmp_path / "calls"
+    stub = tmp_path / "gh"
+    stub.write_text("#!/bin/sh\n"
+                    f'printf "%s\\n" "$*" >> "{calls}"\n'
+                    'case "$1 $2" in\n'
+                    '  "api user") echo octo-test;;\n'
+                    '  "api repos/octo-test/widgets-taken") echo octo-test/widgets-taken;;\n'
+                    '  "api repos/octo-test/widgets-pr2") echo "gh: Not Found (HTTP 404)" >&2; exit 1;;\n'
+                    '  "api repos/octo-test/widgets-down") echo "connection reset" >&2; exit 1;;\n'
+                    '  *) echo "forked: $*";;\n'
+                    'esac\n')
+    stub.chmod(0o755)
+    key = "0" * 32
+    out = ghqueue.answer({"key": key, "argv": ok}, gh=str(stub))
+    assert out["rc"] == 0 and "forked: repo fork acme/widgets --fork-name widgets-pr2 --clone=false" in out["stdout"], out
+    for name, why in (("widgets-taken", "`octo-test/widgets-taken` already exists"),
+                      ("widgets-down", "could not check that `octo-test/widgets-down` is free")):
+        calls.write_text("")
+        out = ghqueue.answer({"key": key, "argv": [*ok[:4], name, "--clone=false"]}, gh=str(stub))
+        assert out["rc"] == 1 and why in out["stderr"], out
+        assert "repo fork" not in calls.read_text(), calls.read_text()   # read only, never forked

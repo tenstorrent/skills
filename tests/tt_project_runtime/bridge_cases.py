@@ -204,7 +204,7 @@ def test_bridge_example_config_parses_with_placeholder_hosts_only():
     for box in cfg["boxes"]:
         bridge.render_block(cfg, box)
         for h in [h for a in cfg["boxes"][box]["agents"].values() for h in a["forward"]]:
-            assert h["target"].endswith(".example.com") or h["target"].startswith("10.0.0.")
+            assert h["target"].endswith(".example.com") or h["target"].startswith("192.0.2.")
 
 
 def test_bridge_service_runs_the_session_and_restarts_it(tmp_path, monkeypatch):

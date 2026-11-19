@@ -3,7 +3,6 @@
 tt-ponytail, tt-ponytail-review and tt-ponytail-audit are vendored from
 https://github.com/DietrichGebert/ponytail at revision 96608e078b2d5ea607c5c3b8b5a54d1c1fba6846,
 text unchanged apart from their names (tt- prefix) and frontmatter.
-vendored: user msg #3706
 
 Not vendored: the hooks, install scripts and manifests for other agent hosts, the benchmarks (they
 call model APIs), assets, tests, and the ponytail-debt, ponytail-gain and ponytail-help skills.

@@ -2702,7 +2702,7 @@ def test_setup_box_links_tt_buddy_instead_of_copying():
     for ref in ("recipes/developer-setup.md", "recipes/workspace.md", "recipes/tt-metal/build.md",
                 "recipes/tt-metal/env.md", "recipes/tt-metal/test.md", "tt-buddy:run", "skills/run/mcp.md"):
         assert ref in agents, ref
-    for page in ("ird", "slurm", "exabox", "bare-metal", "migrate-off-sync", "device-runs"):
+    for page in ("ird", "slurm", "bare-metal", "migrate-off-sync", "device-runs"):
         assert (SKILLS / "setup-box" / f"{page}.md").is_file(), page
     runs = (SKILLS / "setup-box" / "device-runs.md").read_text(encoding="utf-8")
     for ref in ("recipes/tt-metal/build.md", "tt-buddy:run", "skills/run/mcp.md", "ttp devq submit",
@@ -5931,11 +5931,10 @@ def test_setup_box_slurm_batch_script_cleans_up_on_term(tmp_path):
     assert rc == "143" and not alive
 
 
-def test_setup_box_exabox_agrees_with_worker_shared_clusters():
+def test_setup_box_slurm_agrees_with_worker_shared_clusters():
     worker = (PLUGIN / "template/prompts/worker.md").read_text(encoding="utf-8")
     shared = worker[worker.index("## Shared clusters"):worker.index("<!-- /ttp:if clusters -->")]
-    pages = {name: (SKILLS / "setup-box" / name).read_text(encoding="utf-8")
-             for name in ("exabox.md", "slurm.md")}
+    pages = {"slurm.md": (SKILLS / "setup-box" / "slurm.md").read_text(encoding="utf-8")}
     for text in (shared, *pages.values()):
         flat = " ".join(text.split())
         assert "sbatch" in flat

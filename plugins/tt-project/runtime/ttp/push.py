@@ -4643,12 +4643,17 @@ def leak_step(repo: Path, tip: str, say: Callable[[str], None]) -> str | None:
     rebase and the checks: a literal in the outgoing history fails in seconds, not after the smoke run
     when the pre-push hook refuses it. A scan that cannot run is said and left to that hook."""
     started = time.time()
+    p = outscan._project()
     try:
-        why = outscan.history_problem(repo, tip, "HEAD", outscan._project())
+        why = outscan.history_problem(repo, tip, "HEAD", p)
     except Exception as e:
         say(f"leak scan of the outgoing commits could not run ({type(e).__name__}: {str(e)[:200]}); "
             "the pre-push hook still scans them")
-        return None
+        why = None
+    try:   # no hook backs the public scan: one that cannot run refuses
+        why = why or outscan.public_problem(repo, tip, "HEAD", (p.config().get("delivery") or {}) if p else {}, p)
+    except Exception as e:
+        why = f"public scan of the outgoing commits could not run ({type(e).__name__}: {str(e)[:200]}); not pushing"
     if why:
         outscan.record("ttp push", why)
         return why

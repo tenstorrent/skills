@@ -208,7 +208,7 @@ NT = "; next try 07:10 PST"   # the tail the daemon puts on every waiting task's
     ("echo ttp checks", "waiting for checks" + NT, None),
     ("landed:#12", "waiting for landed:#12" + NT, None),
     ("ttp ci --repo o/r --branch b", "waiting for ttp ci on o/r" + NT, None),
-    ("ttp ack-wait probe --from quad --hash ab12", "waiting for quad's reply" + NT, None),
+    ("ttp ack-wait probe --from proj-b --hash ab12", "waiting for proj-b's reply" + NT, None),
     ("ttp notify --check true", "waiting for the user's sign-in" + NT, None),
     ("", "waiting for the user" + NT, None),
 ])

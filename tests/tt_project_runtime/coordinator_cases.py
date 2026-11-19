@@ -20325,7 +20325,7 @@ def test_a_refused_none_needs_the_same_first_message_task_or_key_and_not_a_corre
                           now + at)
         return mid
 
-    quad = settle("Why didn't Quad keep to its queue limits at low effort on haiku?", "phrase 'why didn't'")
+    limits = settle("Why didn't the project keep to its queue limits at low effort on haiku?", "phrase 'why didn't'")
     bench = settle("Why didn't the benchmark run sonnet at low effort?", "phrase 'why didn't'", at=1)
     also = settle("Why didn't you also benchmark sonnet?", "phrase 'why didn't'", at=2)
     first = _said(p, "Use the queue wrapper for checks.", days=2)
@@ -20336,7 +20336,7 @@ def test_a_refused_none_needs_the_same_first_message_task_or_key_and_not_a_corre
     n1 = settle("Why didn't #4300 use budget.daily_usd?", "phrase 'why didn't'", "not a correction, a new ask", at=7)
     n2 = settle("You missed budget.daily_usd on #4300", "phrase 'you missed'", at=8)
     recs = {r["msg"]: r for r in p.db.kv(correction.KEY)}
-    assert [recs[m]["fix"] for m in (quad, bench, also, r1, k1, n1, n2)] == \
+    assert [recs[m]["fix"] for m in (limits, bench, also, r1, k1, n1, n2)] == \
         ["reason", "reason", "reason", "reason", "reason", "not", "reason"]
     assert (recs[r2]["fix"], recs[r2]["refused"], recs[k2]["fix"], recs[k2]["refused"]) == ("", f"#{r1}", "", f"#{k1}")
     assert "none (not a correction)" in correction.audit_line(p.db, now - 60)
@@ -23471,7 +23471,7 @@ def _claude_turn(tmp_path, texts, final, sub=None):
 
 
 def test_a_coordinator_turn_ending_on_prose_applies_the_actions_of_its_newest_earlier_message(env, tmp_path):
-    """A turn that put its actions JSON in an earlier assistant message and ended on prose (Quad run
+    """A turn that put its actions JSON in an earlier assistant message and ended on prose (a project's run
     26296): the newest main-agent message holding an actions list is applied, not the batch lost.
     A subagent's text, an older message and a JSON without an actions list never count."""
     p = make(env)

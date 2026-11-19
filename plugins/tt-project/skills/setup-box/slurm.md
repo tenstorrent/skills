@@ -71,6 +71,21 @@ count the rows of its "All available boards" table, not the `/dev/tenstorrent` e
 Verify a recorded mapping the same way in the first job on each partition, and fix the site file
 if it differs.
 
+## Whole-node exclusive partitions
+
+Some clusters lend whole Tenstorrent boards through exclusive partitions (`OverSubscribe=EXCLUSIVE`):
+a job gets a whole node, nodes report placeholder CPU and memory and no GRES, and the partition's
+board type decides the chips (the table above).
+
+- `box.py slurm submit` without `--node` lets Slurm place the job on a free node of the partition.
+  Set `"exclusive": true` on such partitions in the site file; `submit` adds `--exclusive` only when
+  the partition does not already enforce it.
+- The default time limit may be short and the maximum unlimited: always pass `--time`. Preemption
+  may cancel a job: resubmit it, or run a long set of tests as `box.py slurm cases`, which resubmits
+  itself without a bad node and carries on where it stopped.
+- Accounting may be disabled ("Status after a job ends") and node-local disk wiped around each job
+  ("Storage").
+
 ## box.py slurm
 
 `<plugin-root>/skills/setup-box/scripts/box.py slurm ...` runs every Slurm command on the box's
@@ -173,8 +188,8 @@ prints the same lines once a job ended. Workers read the verdict and open `job.l
 only for what it does not answer. A failed check that ran as a Slurm job prints the same verdict line.
 
 Credit: the build-once and parallel-test flow follows the tt-sbatch workflow; resumable cases, the
-node check, the bad-node list and resubmits follow the idea of tenstorrent/tt-blaze's exabox-slurm
-job script; the model-free verdict follows the idea of tenstorrent/tt-slurm-cluster-mcp's log
+node check, the bad-node list and resubmits follow the idea of tenstorrent/tt-blaze's Slurm job
+script; the model-free verdict follows the idea of tenstorrent/tt-slurm-cluster-mcp's log
 parser. Neither repository grants a licence we could find, so no code was copied: these are our own
 implementations of the ideas.
 
@@ -199,3 +214,11 @@ implementations of the ideas.
   `verify-clean` can check only that no job of yours remains; it says it cannot check processes.
   Say so in the hand-off.
 - Where ssh to nodes is always allowed, `verify-clean --ssh` also lists your processes there.
+
+## Reaching the login node
+
+- The login route may run through a tunnel from the user's laptop, which is down while the laptop
+  sleeps or is offline. Then ssh exits 255.
+- Do not wait or retry in a loop: hand off `waiting` with a `retry_when` that probes ssh, for
+  example `ssh -o BatchMode=yes -o ConnectTimeout=15 <login-alias> true`. A job already submitted
+  keeps running; its `retry_when` also returns 255 (still asleep) until the route is back.

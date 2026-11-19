@@ -441,11 +441,11 @@ def test_a_related_worker_task_resumes_a_recent_runs_session_one_lane_at_a_time_
     coord = str(uuid.uuid4())
     _fork_transcript(cfg_dir, p.base, coord)
     p.db.set_kv(coordsession.KEY, {"id": coord, "provider": "claude", "context_tokens": 5000})
-    a = p.db.add_task("measure f101", "do it", kind="work", origin="coordinator")
+    a = p.db.add_task("measure box-a", "do it", kind="work", origin="coordinator")
     s_a = str(uuid.uuid4())
-    _worker_session(cfg_dir, tmp_path / "wt-a", s_a, "f101 measured")
+    _worker_session(cfg_dir, tmp_path / "wt-a", s_a, "box-a measured")
     r_a = _ok_run(p, a, s_a, ended=time.time() - 30)
-    b = p.db.add_task("act on f101's numbers", "then this", kind="work", origin="coordinator", depends_on=[a])
+    b = p.db.add_task("act on box-a's numbers", "then this", kind="work", origin="coordinator", depends_on=[a])
     rid_b, argv, prompt, got, session = _start(p, d, b)
     assert got["how"] == "resume" and got["run"] == r_a and got["lane"] == 1, got
     assert "waits on it" in got["why"] and argv[argv.index("--resume") + 1] == session != s_a
@@ -453,7 +453,7 @@ def test_a_related_worker_task_resumes_a_recent_runs_session_one_lane_at_a_time_
     assert prompt.rstrip().endswith("TASK PROMPT")
     other = p.db.add_task("unrelated", "x", kind="work", origin="coordinator")
     assert _start(p, d, other)[3]["how"] == "fork"
-    twin = p.db.add_task("also after f101", "x", kind="work", origin="coordinator", depends_on=[a])
+    twin = p.db.add_task("also after box-a", "x", kind="work", origin="coordinator", depends_on=[a])
     assert _start(p, d, twin)[3]["how"] == "fork", "a source already carried on feeds one lane only"
     review = p.db.add_task("Review #x", "review it", kind="review", origin="daemon", depends_on=[a])
     assert "run" not in _start(p, d, review, "reviewer")[3], "a review never takes a lane"

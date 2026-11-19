@@ -735,3 +735,100 @@ def test_ttp_push_scans_the_outgoing_history_first_and_runs_no_check_on_a_leak(e
     said.clear()
     assert push.push(repo, "origin", "proj", checks, 1, say=said.append) == 0, said
     assert ran.exists() and any("leak scan: the outgoing commits hold no secret shape" in m for m in said), said
+
+
+def _pcommit(repo, name, text):
+    (repo / name).parent.mkdir(parents=True, exist_ok=True)
+    _commit(repo, name, text)
+
+
+def _public_repo(tmp_path, monkeypatch):
+    """A repository whose base commit names `zz-sharedbox` in another plugin, with two made-up machines
+    registered (`zz-fakebox7` at a made-up domain and `zz-sharedbox`): (repo, base sha)."""
+    from ttp import machines
+    monkeypatch.setattr(machines, "load", lambda *a, **k: {
+        "zz-fakebox7": {"hostname": "zz-fakebox7.lab.example-corp.test"}, "zz-sharedbox": {}})
+    repo = tmp_path / "public-repo"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    for k, v in (("user.name", "Test"), ("user.email", "test@example.com"), ("commit.gpgsign", "false")):
+        _git_out(repo, "config", k, v)
+    _pcommit(repo, "plugins/other/README.md", "run it on zz-sharedbox\n")
+    return repo, _git_out(repo, "rev-parse", "HEAD")
+
+
+def test_public_scan_refuses_local_names_and_chat_references_only_in_its_paths(env, tmp_path, monkeypatch):
+    """With delivery.public_scan_paths set, an added line there naming a registered machine alias, its
+    hostname's domain or a user's chat message is refused; a term another plugin already names, a
+    longer word containing an alias, and paths outside the setting pass; unset, the scan is off."""
+    from ttp import outscan
+    repo, base = _public_repo(tmp_path, monkeypatch)
+    on = {"public_scan_paths": ["plugins/mine"]}
+    _pcommit(repo, "plugins/mine/notes.md", "Try zz-sharedbox, never zz-fakebox70 or zz-fakebox7-b.\n")
+    assert outscan.public_problem(repo, base, "HEAD", on) is None
+    _pcommit(repo, "plugins/elsewhere/notes.md", "zz-fakebox7 holds the build\n")
+    assert outscan.public_problem(repo, base, "HEAD", on) is None
+    _git_out(repo, "reset", "-q", "--hard", "HEAD~1")   # else the alias is a term the repository uses
+    _pcommit(repo, "plugins/mine/notes.md", "Build on zz-fakebox7 first.\n")
+    why = outscan.public_problem(repo, base, "HEAD", on)
+    assert why.startswith("public scan refused: commit ") and "plugins/mine/notes.md" in why, why
+    assert "adds a machine alias ('zz-fakebox7')" in why and outscan.REWRITE_TIP in why, why
+    assert outscan.public_problem(repo, base, "HEAD", {}) is None   # unset: off
+    assert outscan.public_problem(repo, base, "HEAD", {"public_scan_paths": []}) is None
+    head = _git_out(repo, "rev-parse", "HEAD")
+    _pcommit(repo, "plugins/mine/notes.md", "See docs at example-corp.test.\n")
+    assert "a machine's domain ('example-corp.test')" in outscan.public_problem(repo, head, "HEAD", on)
+    head = _git_out(repo, "rev-parse", "HEAD")
+    _pcommit(repo, "plugins/mine/rule.md", f"Keep the rule (user msg #{40 + 2}).\n")
+    why = outscan.public_problem(repo, head, "HEAD", on)
+    assert "adds a reference to a user's chat message" in why and str(42) not in why, why
+    head = _git_out(repo, "rev-parse", "HEAD")
+    _pcommit(repo, "plugins/mine/done.md", f"Landed in task #{40 + 3}.\n")
+    why = outscan.public_problem(repo, head, "HEAD", on)
+    assert "adds a reference to one of the project's tasks (task #<digits>)" in why and str(43) not in why, why
+
+
+def test_public_scan_reads_only_comments_and_docstrings_of_python_for_task_and_message_ids(env, tmp_path,
+                                                                                          monkeypatch):
+    """In a .py file the harness's own output (`task #<n>` in a string a test asserts on) passes; the same
+    id in a comment or a docstring is refused."""
+    from ttp import outscan
+    repo, base = _public_repo(tmp_path, monkeypatch)
+    on = {"public_scan_paths": ["plugins/mine"]}
+    n = 40 + 4
+    _pcommit(repo, "plugins/mine/t.py", f'def f():\n    """Says done."""\n    return "task #{n} done"\n')
+    assert outscan.public_problem(repo, base, "HEAD", on) is None
+    head = _git_out(repo, "rev-parse", "HEAD")
+    _pcommit(repo, "plugins/mine/t.py", f'def f():\n    """Says done."""\n    return "task #{n} done"  # task #{n}\n')
+    assert "one of the project's tasks" in outscan.public_problem(repo, head, "HEAD", on)
+    _pcommit(repo, "plugins/mine/t.py", f'def f():\n    """Says done (user msg #{n})."""\n    return 1\n')
+    assert "a user's chat message" in outscan.public_problem(repo, head, "HEAD", on)
+    _pcommit(repo, "plugins/mine/t.py", f'def f(:\n    return "task #{n}"\n')   # does not parse: whole lines
+    assert "one of the project's tasks" in outscan.public_problem(repo, head, "HEAD", on)
+
+
+def test_public_scan_runs_in_ttp_push_and_the_push_queue_and_its_setting_is_a_list(env, tmp_path, monkeypatch):
+    """`ttp push`'s first step and a push queue entry refuse what the public scan refuses; a scalar
+    delivery.public_scan_paths is a config problem (it would turn the scan off)."""
+    from ttp import push
+    from ttp.project import config_problems
+    p, repo, _ = _push_run(env, tmp_path, monkeypatch)
+    from ttp import machines
+    monkeypatch.setattr(machines, "load", lambda *a, **k: {"zz-fakebox7": {}})
+    p.set_config("delivery.public_scan_paths", ["docs"])
+    _git_out(repo, "push", "-q", "origin", "main:proj")
+    _git_out(repo, "checkout", "-q", "-B", "work", "main")
+    _pcommit(repo, "docs/run.md", "Run on zz-fakebox7.\n")
+    said: list[str] = []
+    before = _remote_refs(repo)
+    assert push.push(repo, "origin", "proj", push.check_list(["true"]), 1, say=said.append) == push.CHECKS_FAILED
+    assert _remote_refs(repo) == before and any("public scan refused" in m for m in said), said
+    monkeypatch.delenv("TTP_TASK", raising=False)
+    q, qrepo, origin, _ = _push_setup(env, monkeypatch, ["true"])
+    q.set_config("delivery.public_scan_paths", ["docs"])
+    before = _git_out(origin, "rev-parse", "proj")
+    rc, m = _run_batch(q, _batch_marker(q, [_entry(qrepo, "e1", {"docs/run.md": "Run on zz-fakebox7.\n"})]),
+                       monkeypatch)
+    assert _statuses(m) == ["refused"] and _git_out(origin, "rev-parse", "proj") == before, m
+    assert "public scan refused" in m["results"][0]["detail"]["message"], m
+    assert config_problems({"delivery": {"public_scan_paths": 5}}) == ["delivery.public_scan_paths: 5: not a list"]
+    assert config_problems({"delivery": {"public_scan_paths": ["plugins/x", "tests/*.py"]}}) == []

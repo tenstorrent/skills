@@ -209,7 +209,7 @@ def test_a_cluster_named_only_in_goals_turns_on_no_cluster_rules_but_a_slurm_tas
     p = _rules_project(env, monkeypatch)
     monkeypatch.setattr(machines, "load", lambda: {"hpc-a": {"tags": ["slurm"]}})
     head = "## Shared clusters"
-    charter = _BIG_CHARTER.replace("Success: the widget's", "Later: try hpc-a and the exabox cluster.\n\nSuccess: the widget's")
+    charter = _BIG_CHARTER.replace("Success: the widget's", "Later: try hpc-a and the Slurm cluster.\n\nSuccess: the widget's")
     p.charter_path.write_text(charter)
     plain = p.db.task(p.db.add_task("fix the parser", "Fix it.", kind="code", tier="standard", origin="user"))
     slurm = p.db.task(p.db.add_task("run on the cluster", "Submit the benchmark with sbatch on Slurm.",

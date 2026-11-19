@@ -1641,10 +1641,10 @@ def test_spill_device_gate_sees_every_device_lock_of_the_host_and_only_that_host
         assert "reserved for task #5" in checkspill.device_busy(p, cfg, "check-host-a")
     finally:
         locks.unreserve(locks.reserve_path(d, "check-host-a-device"), "task #5 (run 3)")
-    p.set_config("device.locks", ["check-host-a:board", "check-host-a:chip0", "check-host-ab-device"])
+    p.set_config("device.locks", ["check-host-a:board", "check-host-a:chip1", "check-host-ab-device"])
     cfg = p.config()
     assert checkspill.device_locks_of(cfg, "check-host-a") == \
-        ["check-host-a-device", "check-host-a:board", "check-host-a:chip0"]
+        ["check-host-a-device", "check-host-a:board", "check-host-a:chip1"]
     h = _device_hold(p, "check-host-a:board")
     try:
         assert "check-host-a:board: busy" in checkspill.device_busy(p, cfg, "check-host-a")
@@ -2551,7 +2551,7 @@ def test_an_agent_cli_or_host_local_check_splits_off_to_run_here_while_the_rest_
 
 
 def test_a_check_naming_a_path_of_this_machine_never_spills_and_splits_off_to_run_here(env):
-    """A check running a script of this machine by absolute path (a project's harness/bin scanner: exabox jobs
+    """A check running a script of this machine by absolute path (a project's harness/bin scanner: Slurm cluster jobs
     exited 127 on it, #7451), or naming a `~`/`$HOME` path, an input file or a `VAR=`/`--opt=` path outside the
     system folders, never goes to a spill host or a Slurm node, which get a copy of the commit only, not even
     with `"spill": true`. A cheap one splits off to run here beside the spilled suite; a suite naming one keeps

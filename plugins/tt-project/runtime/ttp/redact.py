@@ -6,7 +6,7 @@ The values come from the per-user secrets store (project.load_secrets): in a bui
 jev, slack, endpoint/<alias>) each field whose name says it holds a credential (key, token, secret,
 password), in a custom one (`ttp secret set` or `generate`) every string; each at least MIN_LEN
 characters long. Each
-becomes `[secret:<slot>]`, e.g. `[secret:endpoint/tt-cloud]`. One helper for every route:
+becomes `[secret:<slot>]`, e.g. `[secret:endpoint/my-endpoint]`. One helper for every route:
 
 - the database (Db.x): event, note, notify, message and hand-off text, so every `ttp` command and the
   chat relay that read it back never show a value;

@@ -480,7 +480,7 @@ def cmd_verify_clean(args) -> int:
 
 # build, test, cases and verdict (slurm.md "Build once, test in parallel", "Resumable case jobs",
 # "Job verdict"). The build-once and resumable-cases designs follow ideas from
-# tenstorrent/tt-slurm-cluster-mcp and tenstorrent/tt-blaze's exabox-slurm job script; neither
+# tenstorrent/tt-slurm-cluster-mcp and tenstorrent/tt-blaze's Slurm job script; neither
 # repository carries a licence, so this is our own implementation and no code is copied.
 
 BAD_DAYS = 7  # a node the cases job found bad stays excluded this long

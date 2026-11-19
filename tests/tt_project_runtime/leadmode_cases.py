@@ -61,7 +61,7 @@ def test_lead_mode_wakes_the_coordinator_while_its_list_has_work_and_backs_off_w
         assert _turn_within(d, clock, turns, 4000, step=10)
         gaps.append(turns[-1][0] - t0)
     assert gaps[0] < gaps[1] < gaps[2], gaps
-    p.db.update_task(tid, spec="s\nprogress: f101 measured, f202 next")
+    p.db.update_task(tid, spec="s\nprogress: box-a measured, box-b next")
     assert _turn_within(d, clock, turns, 120, step=10), "progress did not reset the back-off"
     p.db.update_task(tid, status="done")
     assert not _turn_within(d, clock, turns, 3600, step=30), "a lead wake with nothing on its list"

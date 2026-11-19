@@ -837,9 +837,12 @@ EXTRA_KEYS = {
     # task's local branch once its worktree is gone, its tip saved as refs/ttp-archive/<branch> and
     # recorded in state/branch-deletions.jsonl. dead_branch_days (branchcap.DEAD_DAYS, 0: off): the same for
     # a branch whose tasks all ended that long ago, never approved and needed by no unfinished task.
+    # public_scan_paths: repo globs a public repository publishes; every push refuses a commit adding a line
+    # there that names a local-state term (machine, project, user, remote host, chat id) nothing else in the
+    # repository names, or a `msg #<digits>` reference (outscan.public_problem; unset, the default: off).
     # push_retries: how often a detached push retries a cause it clears itself, a non-fast-forward
     # (--own) or a reboot that cut it short (push.retries_of; default 2, 0: never).
-    "delivery": {"base_ref", "push_branch", "landed_probe", "push_checks", "post_land_checks", "push_checks_by_repo", "push_exclude_paths", "push_rounds", "push_wait_s",
+    "delivery": {"base_ref", "push_branch", "landed_probe", "push_checks", "post_land_checks", "push_checks_by_repo", "push_exclude_paths", "public_scan_paths", "push_rounds", "push_wait_s",
                  "push_checks_timeout_s", "push_pool_wait_s", "push_retries",
                  "version_bump", "push_queue", "push_batch_s", "push_batch_max", "push_min_gap_s", "push_age_s", "push_landing_alert_h", "push_script_torn_escalate_after",
                  "push_setup_fault_escalate_after", "after_push",
@@ -1448,7 +1451,8 @@ def config_problems(raw: dict, root: Path | None = None, fetch: bool = False) ->
         v = delivery.get(k)
         if v is not None and not (isinstance(v, list) and all(isinstance(x, str) for x in v)):
             out.append(f"delivery.{k}: not a list of " + ("path strings" if k == "checks_targeted_always" else "glob strings"))
-    out += [f"delivery.push_exclude_paths: {p}" for p in [scalar_problem(delivery.get("push_exclude_paths"))] if p]
+    out += [f"delivery.{k}: {p}" for k in ("push_exclude_paths", "public_scan_paths")
+            for p in [scalar_problem(delivery.get(k))] if p]
     from .checkprestage import problems as prestage_problems
     out += prestage_problems(delivery.get("check_prestage"))
     from .prbody import problems as pr_body_problems

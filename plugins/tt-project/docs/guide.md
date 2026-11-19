@@ -2154,7 +2154,7 @@ for the user's word. Nothing else does: a project's own gates (test-gate scope, 
 landing order, which settings the coordinator changes) are the coordinator's to decide and record,
 never held for "the user's word".
 
-- An open ask is shown in full wherever it waits on the user (user msg #2424): `ttp status`,
+- An open ask is shown in full wherever it waits on the user: `ttp status`,
   `ttp overview`, the web board's waiting-on-you column, a task's "waits on you" text, the daily
   review and the ask-timeout notice all carry its whole text (question, options, recommendation,
   command), never only its id. A model-free check on each outgoing coordinator reply and notify
@@ -4058,7 +4058,7 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   oldest stalled one. Runs never mark a PR ready, merge it or request reviewers.
 - Every project's worker `gh` refuses a PR body (`gh pr create`, `gh pr edit` that sets it, a `gh api`
   POST or PATCH to a pulls endpoint, GraphQL `createPullRequest`/`updatePullRequest`) that names
-  internal references (`run 250`, `task #29`, `review #45`, obligation ids, `ttp/t<id>` branches,
+  internal references (`run <n>`, `task #<n>`, `review #<n>`, obligation ids, `ttp/t<id>` branches,
   paths into `state/` or `worktrees/`; a count such as `run 3 times` is prose) or holds more than
   `delivery.pr_body_max_words` (default 300) words of prose; HTML comments, fenced code and lines
   unchanged from the repo's PR template do not count. Nothing is sent and the run rewrites the body:

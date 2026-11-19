@@ -37,7 +37,7 @@ fails `box.py site check` with `missing version/boxes wrapper`.
 | Field | Needed | What |
 |---|---|---|
 | `boxes` key | yes | the box's `ttp machines` alias, also its ssh config alias |
-| `route` | yes | `bare`, `ird` or `slurm` (exabox is `slurm`: `exabox.md`) |
+| `route` | yes | `bare`, `ird` or `slurm` |
 | `jump` | no | ssh alias of the jump host; the box's ssh config uses it as `ProxyJump` |
 | `workdir_root` | yes | absolute path on the box for checkouts and build trees (shared storage on a cluster) |
 | `user` | no | the user's own login on the box, written by `box.py account entry`; `workdir_root` must then be under its home (`account.md`) |

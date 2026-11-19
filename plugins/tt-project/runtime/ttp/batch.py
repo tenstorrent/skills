@@ -58,7 +58,7 @@ from . import (checkcap, checkdirs, checklane, checkspill, cleantree, conflictfi
                setupfault, syntaxfault, testslots, workerloss, urgent,
                sharedchecks, slowtests, suitecost, testpick, verdictcarry, worktree)
 from .project import Project, command_env, durable_write, write_json
-from . import ghroute, gatetime, gitmemo, hoststate
+from . import ghroute, gatetime, gitmemo, hoststate, outscan
 from .util import read_dict
 from .liveness import pid_alive
 
@@ -2147,6 +2147,13 @@ class Batch:
             return h
         if bad := push.excluded(self.repo, tip, top, push.exclude_list(self.d.get("push_exclude_paths"))):
             self._set(i, "refused", message=push.excluded_refusal(bad, self.target))
+            return h
+        try:
+            public = outscan.public_problem(self.repo, base, top, self.d, self.p)
+        except ValueError as e:
+            public = f"public scan could not read the entry's commits: {e}"
+        if public:
+            self._set(i, "refused", message=public)
             return h
         self._settling = ([], set(), [])
         resolved: dict[str, list[str]] = {}

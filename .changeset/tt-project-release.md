@@ -57,5 +57,5 @@ keeps going when the chat closes, and any later chat reconnects to it by name.
 - `tt-project`: start, connect to and talk with a project.
 - `tt-project-harness`: improve a project's own prompts, schedules, watchers and budgets from
   measured friction, and take template updates.
-- `setup-box`: get a Tenstorrent device box (bare metal, reservation, Slurm or exabox) and work on
+- `setup-box`: get a Tenstorrent device box (bare metal, reservation or a Slurm cluster) and work on
   it over ssh in a checkout on the box.

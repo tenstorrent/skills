@@ -59,6 +59,10 @@ _DELETE_PATH = re.compile(r"/?repos/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/git/refs
 _REF_SEG = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*")
 _DELETE_FLAGS = {"-X": "method", "--method": "method"}
 _PROTECTED = {"main", "master"}
+# `gh repo fork <owner>/<repo> --fork-name <name> --clone=false`: a fresh fork under the gh user, for a PR head
+# whose old fork left the upstream fork network; never one that already exists (the workstation reads first)
+_REPO = re.compile(r"([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)")
+_NAME = re.compile(r"[A-Za-z0-9_.-]+")
 
 
 def _body(argv: list[str], stdin: bytes) -> str | None:
@@ -215,6 +219,48 @@ def own_branch(gh: str, argv: list[str]) -> tuple[str, str]:
     return "", tip
 
 
+def _fork(argv: list[str]) -> tuple[str, str, str]:
+    """(why `gh repo fork argv` is refused or "", the upstream owner/repo, the fork's name): only
+    `repo fork <owner>/<repo> --fork-name <name> --clone=false`, nothing else."""
+    pos, name, clone, rest = [], [], [], argv[2:]
+    for i, a in enumerate(rest):
+        if a == "--clone=false":
+            clone.append(a)
+        elif a.startswith("--fork-name="):
+            name.append(a.split("=", 1)[1])
+        elif a == "--fork-name":
+            name.append(rest[i + 1] if i + 1 < len(rest) else "")
+        elif not (i and rest[i - 1] == "--fork-name"):
+            pos.append(a)
+    if any(a.startswith("-") for a in pos) or len(pos) != 1 or len(name) != 1 or clone != ["--clone=false"]:
+        return ("`gh repo fork` runs only as `repo fork <owner>/<repo> --fork-name <name> --clone=false`, "
+                "no other flags"), "", ""
+    m = _REPO.fullmatch(pos[0])
+    if not m or {m.group(1), m.group(2)} & {".", ".."} or not _NAME.fullmatch(name[0]) or name[0] in (".", ".."):
+        return "`gh repo fork` names one repo as <owner>/<repo> and a plain --fork-name", "", ""
+    return "", pos[0], name[0]
+
+
+def fork_free(gh: str, argv: list[str]) -> str:
+    """Why the workstation must not run the fork `gh repo fork argv` asks for, or "": read just before it,
+    <this gh user>/<name> must not exist yet (gh would hand back an old fork instead of a fresh one)."""
+    name = _fork(argv)[2]
+    try:
+        me = subprocess.run([gh, "api", "user", "--jq", ".login"], capture_output=True, timeout=GH_TIMEOUT_S)
+        login = me.stdout.decode().strip()
+        if me.returncode or not _NAME.fullmatch(login):
+            return "could not read this gh user to check the fork's name is free"
+        there = subprocess.run([gh, "api", f"repos/{login}/{name}", "--jq", ".full_name"], capture_output=True,
+                               timeout=GH_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired):
+        return "could not check the fork's name is free"
+    if there.returncode == 0:
+        return f"`{login}/{name}` already exists; pick another --fork-name"
+    if "404" not in there.stderr.decode("utf-8", "replace") + there.stdout.decode("utf-8", "replace"):
+        return f"could not check that `{login}/{name}` is free"
+    return ""
+
+
 def allowed(argv, stdin: bytes = b"") -> str:
     """Why the workstation must not run `gh argv`, or "": the allowlist, checked on both sides. `gh api`
     GET reads, pr view/list/checks, issue view/list, pr and issue comments, `pr create --draft`, a reply
@@ -222,8 +268,9 @@ def allowed(argv, stdin: bytes = b"") -> str:
     of the project's own ttp/ branches (`gh api -X DELETE repos/<o>/<r>/git/refs/heads/ttp/...`; the
     workstation also reads its tip first and refuses the default branch), `pr edit`
     of the title or body only and `pr close` (the workstation also checks the PR is its own draft), each
-    post, body or comment ending with the AI-authorship tag; never `pr ready`, a merge, a reviewer, a
-    label or anything else."""
+    post, body or comment ending with the AI-authorship tag, and `repo fork <owner>/<repo> --fork-name
+    <name> --clone=false` (the workstation also checks <its gh user>/<name> does not exist yet); never
+    `pr ready`, a merge, a reviewer, a label or anything else."""
     if not isinstance(argv, list) or not argv or not all(isinstance(a, str) and "\0" not in a for a in argv):
         return "not a list of plain arguments"
     if bad := next((a for a in argv if _BUNDLED.fullmatch(a)), None):
@@ -249,6 +296,8 @@ def allowed(argv, stdin: bytes = b"") -> str:
         return ""
     if pair in (("pr", "edit"), ("pr", "close")):
         return _upkeep(argv, stdin)
+    if pair == ("repo", "fork"):
+        return _fork(argv)[0]
     if pair not in _POSTS:
         return f"`gh {' '.join(argv[:2])}` is not on the workstation's allowlist"
     if pair == ("pr", "create") and not any(a in ("--draft", "-d") for a in argv):
@@ -418,6 +467,8 @@ def answer(entry: dict, gh: str | None = None) -> dict | None:
         return {"key": key, "rc": 1, "stdout": "", "stderr": f"refused on the workstation: {why}"}
     gh = gh or shutil.which("gh", path=os.environ.get("PATH", "") + ":/opt/homebrew/bin:/usr/local/bin") or "gh"
     if argv[:2] == ["pr", "close"] and (why := own_draft(gh, argv)):
+        return {"key": key, "rc": 1, "stdout": "", "stderr": f"refused on the workstation: {why}"}
+    if argv[:2] == ["repo", "fork"] and (why := fork_free(gh, argv)):
         return {"key": key, "rc": 1, "stdout": "", "stderr": f"refused on the workstation: {why}"}
     tip = ""
     if argv[0] == "api" and _delete(argv) == "":

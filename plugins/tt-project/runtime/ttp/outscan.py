@@ -541,6 +541,157 @@ def history_problem(repo, base: str, head: str = "HEAD", p=None) -> str | None:
     return _log_problem(f"{head}\n^{base}\n", matcher(p), cwd=str(repo), what="ttp push")
 
 
+PUBLIC_KEY = "public_scan_paths"   # delivery.<key>: repo globs a public repository publishes; unset: off
+# A reference to one of this user's chat messages or to one of the project's tasks. In Python only its
+# comments and docstrings are read: the harness's own output says `task #<n>` and tests assert on it.
+PROVENANCE = re.compile(r"\b(?:(?:user )?msg|task) #\d+")
+_EDGE = r"[\w-]"   # a term matches only whole: no word character or hyphen on either side
+
+
+def local_terms(p=None) -> dict[str, str]:
+    """{term: what it is} for the names only this host's setup knows: machine aliases and hostnames
+    (and a hostname's domain), project names, the user's login and name, git remote hosts and this
+    project's chat ids. Read at check time and never written anywhere."""
+    import getpass
+    import json
+    import pwd
+    from urllib.parse import urlsplit
+    from . import machines, project
+    terms: dict[str, str] = {}
+
+    def add(t, what: str) -> None:
+        t = str(t or "").strip()
+        if len(t) >= 3 and not t.isdigit():
+            terms.setdefault(t, what)
+    for alias, m in machines.load().items():
+        add(alias, "a machine alias")
+        host = str(m.get("hostname") or "")
+        add(host, "a machine's hostname")
+        if host.count(".") >= 2:
+            add(".".join(host.split(".")[-2:]), "a machine's domain")
+    for name in (project.load_registry().get("projects") or {}):
+        add(name, "a project name")
+    try:
+        add(getpass.getuser(), "the user's login")
+        gecos = pwd.getpwuid(os.getuid()).pw_gecos.split(",")[0]
+        add(gecos, "the user's name")
+        for part in gecos.split():
+            add(part, "the user's name")
+    except (OSError, KeyError):
+        pass
+    cwd = str(p.root) if p is not None else None
+    for key in ("user.name", "user.email"):
+        out = subprocess.run(["git", "config", key], capture_output=True, text=True, cwd=cwd).stdout.strip()
+        add(out, "the user's name" if key == "user.name" else "the user's email")
+    for line in subprocess.run(["git", "remote", "-v"], capture_output=True, text=True, cwd=cwd).stdout.splitlines():
+        url = (line.split() + ["", ""])[1]
+        host = urlsplit(url).hostname if "://" in url else url.partition("@")[2].partition(":")[0]
+        add(host, "a git remote host")
+    if p is not None:
+        try:
+            for (cid,) in p.db.q("SELECT id FROM chats"):
+                add(cid, "a chat id")
+        except Exception:
+            pass
+    return terms
+
+
+def _term_rx(terms) -> re.Pattern | None:
+    """One pattern for `terms`: letters-only terms match as written, others (digits, hyphens, dots) in any case."""
+    exact = sorted((t for t in terms if t.isalpha()), key=len, reverse=True)
+    loose = sorted((t for t in terms if not t.isalpha()), key=len, reverse=True)
+    alts = [re.escape(t) for t in exact] + [f"(?i:{re.escape(t)})" for t in loose]
+    return re.compile(f"(?<!{_EDGE})(?:{'|'.join(alts)})(?!{_EDGE})") if alts else None
+
+
+def _used_elsewhere(repo, head: str, term: str, globs: list[str]) -> bool:
+    """Whether `term` appears, whole, in `head`'s tree outside `globs`: another plugin names it already."""
+    from .push import matches
+    out = _git("grep", "-l", "-w", "-F", *([] if term.isalpha() else ["-i"]), "-e", term, head,
+               cwd=str(repo)).stdout
+    return any(not any(matches([f], g) for g in globs)
+               for f in (line.partition(":")[2] for line in out.splitlines()))
+
+
+def _py_prose(text: str) -> dict[int, str] | None:
+    """{line number: its comment text, or the whole line inside a docstring} of Python `text`, or None
+    when it does not parse."""
+    import ast
+    import io
+    import tokenize
+    prose: dict[int, str] = {}
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(text).readline):
+            if tok.type == tokenize.COMMENT:
+                prose[tok.start[0]] = tok.string
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, tokenize.TokenError):
+        return None
+    lines = text.splitlines()
+    for node in ast.walk(tree):
+        body = getattr(node, "body", None)
+        if isinstance(body, list) and body and isinstance(doc := body[0], ast.Expr) \
+                and isinstance(doc.value, ast.Constant) and isinstance(doc.value.value, str):
+            for n in range(doc.lineno, (doc.end_lineno or doc.lineno) + 1):
+                prose[n] = lines[n - 1]
+    return prose
+
+
+def public_problem(repo, base: str, head: str = "HEAD", delivery: dict | None = None, p=None) -> str | None:
+    """Why the commits `base..head` of `repo` must not go to a public repository, or None: an added line
+    under delivery.public_scan_paths (repo globs; unset: off) names a local-state term (local_terms)
+    that nothing else in the repository names, or cites a user's chat message or a task (PROVENANCE; in
+    Python only in comments and docstrings).
+    Model-free; raises ValueError when the commits cannot be read."""
+    from .push import exclude_list, matches
+    globs = exclude_list((delivery or {}).get(PUBLIC_KEY))
+    if not globs:
+        return None
+    terms = local_terms(p)
+    rx = _term_rx(terms)
+    allowed: dict[str, bool] = {}
+    proc = subprocess.run(["git", "log", "-p", "-U0", "--root", "--cc", "--text", "--no-renames", "--no-color",
+                           "--no-ext-diff", "--no-textconv", "--format=%x00commit %h", f"{base}..{head}"],
+                          capture_output=True, text=True, errors="replace", cwd=str(repo),
+                          env={**os.environ, **_GIT_ENV})
+    if proc.returncode:
+        raise ValueError(f"could not read the commits it sends (git log exited {proc.returncode})")
+    commit, path, scoped, header, at = "", "", False, False, 0
+    proses: dict[tuple[str, str], dict[int, str] | None] = {}
+    for line in proc.stdout.splitlines():
+        if line.startswith("\0commit "):
+            commit, path, scoped = line[8:].strip(), "", False
+        elif line.startswith("--- "):
+            header = True
+        elif header and line.startswith("+++ "):
+            path, header = line[4:].strip().removeprefix("b/"), False
+            scoped = any(matches([path], g) for g in globs)
+        elif line.startswith("@@"):
+            header, at = False, int((re.findall(r"\+(\d+)", line.split("@@")[-2]) or ["0"])[-1])
+        elif scoped and line.startswith("+"):
+            at += 1
+            where = f"commit {commit} ({path})"
+            if (ref := PROVENANCE.search(line)) and path.endswith(".py"):
+                if (commit, path) not in proses:
+                    shown = _git("show", f"{commit}:{path}", cwd=str(repo))
+                    proses[commit, path] = _py_prose(shown.stdout) if shown.returncode == 0 else None
+                prose = proses[commit, path]
+                ref = PROVENANCE.search(prose.get(at - 1, "")) if prose is not None else ref
+            if ref:
+                what = "one of the project's tasks" if ref[0].startswith("task") else "a user's chat message"
+                return (f"public scan refused: {where} adds a reference to {what} ({ref[0].split('#')[0]}#<digits>); "
+                        "keep the rule and its reason and drop the reference" + REWRITE_TIP)
+            for m in (rx.finditer(line) if rx else ()):
+                term = next((t for t in terms if (t == m[0] if t.isalpha() else t.lower() == m[0].lower())), m[0])
+                if term not in allowed:
+                    allowed[term] = _used_elsewhere(repo, head, term, globs)
+                if not allowed[term]:
+                    return (f"public scan refused: {where} adds {terms.get(term, 'a local name')} ({term!r}), "
+                            f"which only this host's setup knows; write a generic name instead "
+                            f"(delivery.{PUBLIC_KEY} lists the public paths)" + REWRITE_TIP)
+    return None
+
+
 def _log_problem(revs_text: str, hit: Callable[[str], str | None], cwd: str | None = None,
                  what: str = "git push") -> str | None:
     """The refusal for the first leak `git log --stdin` (fed `revs_text`) shows, else None."""

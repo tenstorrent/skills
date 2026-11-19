@@ -45,7 +45,7 @@ _REPO_FLAG = {"pr", "run", "issue", "workflow", "release", "cache", "label", "se
 _GH_URL = re.compile(r"^https://github\.com/([\w.-]+)/([\w.-]+?)(?:\.git)?/?$")
 _SSH_URL = re.compile(r"^(?:ssh://)?git@github\.com[:/]([\w.-]+)/([\w.-]+?)(?:\.git)?/?$")
 _WRITE_SUBS = {"create", "edit", "comment", "ready", "close", "reopen", "merge", "review", "rerun", "cancel",
-               "delete", "lock", "unlock", "update-branch", "run", "enable", "disable", "set", "upload"}
+               "delete", "lock", "unlock", "update-branch", "run", "enable", "disable", "set", "upload", "fork"}
 _memo: dict = {}
 
 

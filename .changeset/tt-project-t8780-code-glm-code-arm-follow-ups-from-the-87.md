@@ -14,6 +14,6 @@
 - review fix: continues the task the review depends on, never one its spec only mentions
 - docs and changeset: the code arm's guarded harness, policy files, digest, ttp remove, deploy check and review-fix lineage
 - smoke list: the ttp remove case file's fastest tests
-- test: a claude-code model-lookup line on stderr is not a refused model when the run worked (Quad's light-route report)
+- test: a claude-code model-lookup line on stderr is not a refused model when the run worked
 - policyfiles: git through gitmemo.run (the git-helper guard); remove test registers its second project without a second clone
 - tests: the live arm tests use the guarded harness and a policy list; remove and deploy-check tests fit one project per repo; glmenv exempt from the stdlib-only rule
