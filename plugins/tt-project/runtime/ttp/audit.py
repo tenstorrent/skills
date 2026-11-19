@@ -642,7 +642,7 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
         out.append(settled)
     if decided := wakesettle.audit_line(db, since):
         out.append(decided)
-    if p is not None:   # the cost levers' fresh-continue and output metrics (costlevers.py)
+    if p is not None:   # the cost levers' wake-tools and output metrics (costlevers.py)
         from . import costlevers
         out.extend(costlevers.audit_lines(p, since))
     sweeps = sweepskip.counts(db, since, now)
