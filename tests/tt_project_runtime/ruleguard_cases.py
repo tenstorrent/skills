@@ -6,7 +6,10 @@ from __future__ import annotations
 
 
 RG_FAKE_SSH = '#!/bin/bash\necho "$@" >> "$FAKE_SLURM/ssh.log"\neval "${@: -1}"\n'
-RG_FAKE_SQUEUE = '#!/bin/sh\ncase "$*" in *" -j "*) cat "$FAKE_SLURM/job" ;; *) cat "$FAKE_SLURM/nodes" ;; esac\n'
+RG_FAKE_SQUEUE = ('#!/bin/sh\ncase "$*" in *" -j "*)\n'
+                  '  [ -e "$FAKE_SLURM/gone" ] && { echo "slurm_load_jobs error: Invalid job id specified" >&2; exit 1; }\n'
+                  '  [ -e "$FAKE_SLURM/jobs-broken" ] && { echo "slurm_load_jobs error: Unable to contact slurm controller" >&2; exit 1; }\n'
+                  '  cat "$FAKE_SLURM/job" ;; *) cat "$FAKE_SLURM/nodes" ;; esac\n')
 RG_FAKE_SINFO = '#!/bin/sh\n[ -e "$FAKE_SLURM/broken" ] && exit 1\ncat "$FAKE_SLURM/sinfo"\n'
 
 
@@ -125,6 +128,32 @@ def test_slurm_nodes_refuses_scancel_of_another_users_job_and_node_state_updates
         assert "node's state" in _rg_deny(cmd, rule_home.work), cmd
     assert _rg_deny("scontrol show node node8", rule_home.work) is None
     assert _rg_deny("scontrol update JobId=4412 TimeLimit=30", rule_home.work) is None
+
+
+def test_slurm_nodes_reads_user_variables_as_the_caller_and_an_ended_job_as_held_by_nobody(rule_home):
+    """`scancel -u $USER` (also over ssh, also ${USER}, $LOGNAME, $(whoami)) names the caller; scancel or a
+    --dependency of a job squeue no longer lists ('Invalid job id') has no live holder and runs. Another
+    user's live job, another user by name and a queue that cannot be read are still refused."""
+    rule_home.cfg["guards"] = {"slurm": True}
+    for cmd in ("scancel -u $USER --name x", "ssh login 'scancel -u $USER --name x'", 'scancel -u "${USER}" -s 9',
+                "scancel --user=$LOGNAME", "scancel -u $(whoami)", 'scancel -u "$(id -un)"', "scancel -u `whoami`"):
+        assert _rg_deny(cmd, rule_home.work) is None, cmd
+    assert "someone-else" in _rg_deny("scancel -u someone-else --name x", rule_home.work)
+    # the caller's own substitution must sit in the scancel's own text, not in another command's
+    for cmd in ("scancel -u $(cat f); squeue -u $(whoami)", "squeue -u $(whoami) && scancel -u $(cat f)",
+                "ssh login 'scancel -u $(cat f)'; echo $(whoami) | squeue -u $(id -un)",
+                "scancel -u $(whoami) -u $(cat f)", "scancel --user=$(cat f) -u $(whoami)",
+                "scancel --name $(echo x) -u $(cat f)", "echo scancel -u $(whoami); scancel -u $(cat f)"):
+        assert _rg_deny(cmd, rule_home.work), cmd
+    assert _rg_deny("squeue -u $(whoami); scancel -u $(whoami) --name x", rule_home.work) is None
+    (rule_home.fake / "gone").write_text("")
+    for cmd in ("scancel 7001", "ssh login 'scancel 7001'", "sbatch --dependency=afterany:7001 job.sh"):
+        assert _rg_deny(cmd, rule_home.work) is None, cmd
+    (rule_home.fake / "gone").unlink()
+    (rule_home.fake / "job").write_text("someone-else 5150\n")
+    assert "5150" in _rg_deny("scancel 5150", rule_home.work)
+    (rule_home.fake / "jobs-broken").write_text("")
+    assert "could not tell who holds 7001" in _rg_deny("scancel 7001", rule_home.work)
 
 
 def test_slurm_nodes_refuses_when_the_queue_cannot_be_read(rule_home):
