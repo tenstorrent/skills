@@ -5,8 +5,7 @@
 ops-perf CSV come from tt-npe, a separate NoC performance estimator that
 replays recorded NoC events. A default profile does not fill them.
 
-Blank means not measured, not idle. Do not read a blank column as "no
-traffic".
+Blank means not measured, not idle.
 
 ## Fill them
 
@@ -32,7 +31,3 @@ step later on existing logs, source `ENV_SETUP` and run
 
 NoC tracing recompiles kernels with event instrumentation and adds capture
 overhead. Turn it on for a bandwidth question, not for every profile.
-
-Measured math-engine counters: `perf-counters.md`; per-RISC durations:
-`op-report.md`. `PM` columns are perf-model estimates; never decide a bound on
-them.

@@ -1,8 +1,6 @@
 # Math-engine counters and `PM FPU UTIL`
 
-The ops-perf CSV (`op-report.md`) carries two kinds of utilisation column. One
-is a model estimate, the other is measured. Reading the estimate as a
-measurement sends optimisation the wrong way.
+The ops-perf CSV (`op-report.md`) has an estimated and a measured utilisation column.
 
 ## `PM FPU UTIL (%)` is an estimate
 
@@ -16,8 +14,7 @@ model; nothing measured the FPU. It fails both ways:
   72.3%, `Transpose` over 100% on Blackhole).
 
 Do not call an op compute- or bandwidth-bound from it. Use the measured
-counters below, or the per-RISC split in `op-report.md`. For NoC, DRAM and
-Ethernet bandwidth, which are blank without tt-npe: `noc-bandwidth.md`.
+counters below, or the per-RISC split in `op-report.md`.
 
 ## Capture the counters
 

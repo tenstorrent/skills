@@ -123,8 +123,6 @@ data collected".
 **Results are read at device close.** Nothing lands until `CloseDevice`, and past
 roughly 1000 kernel runs the buffer needs draining sooner —
 `detail::ReadDeviceProfilerResults(device)` after the program of interest.
-A run that logs `markers were dropped` produced a partial report: the missing
-ops read as zero. Discard it and re-capture (`references/long-runs.md`).
 
 **`DeviceZoneScopedN` costs time.** Timings from heavily annotated code include
 the annotation overhead. Instrument selectively, and do not compare an annotated

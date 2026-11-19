@@ -2,9 +2,9 @@
 
 ## Dropped markers make a partial report
 
-The on-device buffer holds `TT_METAL_PROFILER_PROGRAM_SUPPORT_COUNT` programs
-per device (1000 by default). The host drains it between dispatches; outrun the
-drain and markers are lost. The run log says `Profiler DRAM buffers were full,
+The on-device buffer holds `TT_METAL_PROFILER_PROGRAM_SUPPORT_COUNT` (set by
+`--op-support-count`) programs per device (1000 by default). The host drains it
+between dispatches; outrun the drain and markers are lost. The run log says `Profiler DRAM buffers were full,
 markers were dropped!`, and `process_ops_logs` may then stop with `Device data
 missing: Op <N> not present in ...`.
 
