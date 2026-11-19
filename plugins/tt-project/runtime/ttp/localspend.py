@@ -711,12 +711,6 @@ def _session_priced(session_id: str, root: Path | None = None) -> tuple[float, d
     return usd, by_key, unknown
 
 
-def session_cost(session_id: str, root: Path | None = None) -> tuple[float, bool] | None:
-    """The list price of one session's log (its subagents too), or None when there is no log."""
-    got = _session_priced(session_id, root)
-    return None if got is None else (got[0], bool(got[2]))
-
-
 def calibration_path() -> Path:
     return project.HOME_DIR / "price-calibration.json"
 

@@ -106,10 +106,6 @@ def _take(d: Path, cap: int) -> bool:
     return _budget(d, take)
 
 
-def calls_last_hour(home: Path | None = None) -> int:
-    return _budget(_dir(home), lambda b: len([t for t in b.get("calls") or [] if time.time() - float(t) < 3600]))
-
-
 def _note_limit(d: Path, headers) -> None:
     try:
         rem, reset = int(headers.get("X-RateLimit-Remaining")), int(headers.get("X-RateLimit-Reset"))

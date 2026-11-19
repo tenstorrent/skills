@@ -20,10 +20,10 @@ files on that pool and prints one line per file done (DONE_RE, or --done-re). It
   the push log shows it, and it counts against the check's pool-wait bound (delivery.push_pool_wait_s) and
   the stall window, not as run time against its time limit (delivery.push_checks_timeout_s).
 
-The window: `checks.pool_shard_stall_s` (account settings, or TTP_POOL_SHARD_STALL_S) when set, else
+The window: `checks.pool_shard_stall_s` (account settings) when set, else
 STALL_FACTOR times the median seconds per file this machine measured (the time between two files of one
-shard, the newest KEEP per --what), at least the floor `checks.pool_shard_stall_floor_s` (or
-TTP_POOL_SHARD_STALL_FLOOR_S; default STALL_FLOOR_S)."""
+shard, the newest KEEP per --what), at least the floor `checks.pool_shard_stall_floor_s` (default
+STALL_FLOOR_S)."""
 from __future__ import annotations
 
 import contextlib
@@ -69,15 +69,13 @@ def _num(v) -> float | None:
     return f if math.isfinite(f) and f > 0 else None
 
 
-def _setting(env: str, key: str) -> float | None:
+def _setting(key: str) -> float | None:
     try:
         checks = project.load_account_settings().get("checks") or {}
     except Exception:   # unreadable settings only lose the override
         checks = {}
-    for v in (os.environ.get(env), checks.get(key)):
-        if v not in (None, "") and (n := _num(v)) is not None:
-            return n
-    return None
+    v = checks.get(key)
+    return _num(v) if v not in (None, "") else None
 
 
 @contextlib.contextmanager
@@ -121,10 +119,10 @@ def record(seconds: list[float], what: str = "") -> None:
 
 
 def window(what: str = "") -> float:
-    fixed = _setting("TTP_POOL_SHARD_STALL_S", "pool_shard_stall_s")
+    fixed = _setting("pool_shard_stall_s")
     if fixed:
         return fixed
-    floor = _setting("TTP_POOL_SHARD_STALL_FLOOR_S", "pool_shard_stall_floor_s") or STALL_FLOOR_S
+    floor = _setting("pool_shard_stall_floor_s") or STALL_FLOOR_S
     med = per_file(what)
     return max(floor, STALL_FACTOR * med) if med else floor
 

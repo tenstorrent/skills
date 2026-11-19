@@ -124,16 +124,6 @@ def alerts_on(v: Any) -> bool:
     return v is None or str(v).strip().lower() not in ("false", "off", "no", "0")
 
 
-def source_problem(value: Any) -> str | None:
-    """Why an `occupancy.sources` value cannot be used, or None."""
-    if not isinstance(value, dict):
-        return "occupancy.sources is an object of machine alias -> {cmd | file, timeout_s, fronts}"
-    for alias, src in value.items():
-        if not isinstance(src, dict) or not (src.get("cmd") or src.get("file")):
-            return f"occupancy.sources.{alias} needs a read-only `cmd` (exit 0 live, 1 free) or a `file`"
-    return None
-
-
 def publish(p, cfg: dict | None = None) -> dict:
     """Write this project's registrations into the shared registry (removed when it has none)."""
     mine = settings(p.config() if cfg is None else cfg)

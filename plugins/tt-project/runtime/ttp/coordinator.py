@@ -3103,7 +3103,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 onto = pub["branch"] if pub else given.group("branch") if given else ""
                 # A rebase of that branch cannot fast-forward it: it works on its own branch and delivers
                 # there (delivery.rebase_replace new_branch), or `ttp push --own` replaces that branch
-                # under a lease (lease; push.own_lease).
+                # under a lease (lease; push.own_rebase).
                 rebase = bool(onto and REBASE_TITLE.search(title))
                 if onto:
                     labels.append(f"{'rebases' if rebase else 'pr_branch'}:{onto}")
@@ -9159,8 +9159,3 @@ def _has_line(path: Path, ending: str) -> bool:
         return any(line.endswith(ending) for line in path.read_text().splitlines())
     except FileNotFoundError:
         return False
-
-
-def open_task_count(p: Project) -> int:
-    return len(p.db.q("SELECT id FROM tasks WHERE status NOT IN (%s)" % ",".join("?" * len(TERMINAL_TASK_STATES)),
-                      TERMINAL_TASK_STATES))

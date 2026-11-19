@@ -1346,14 +1346,6 @@ def _yields(db, r: dict) -> bool:
     return urgent.covers_urgent(db, db.task(r["task"]))
 
 
-def yields_to(p: Project, name: str) -> list[int]:
-    """The approved rows for target `name` (none of them in a running batch) that a batch searching for
-    the entry that broke its checks stops for (batch.Batch._yield_now): urgent ones (urgent.covers_urgent:
-    priority 1 or better, an `urgent:` line, or a review of such a task). The next batch takes them
-    alone (due)."""
-    return urgent.approvals_waiting(p.db, name)
-
-
 def _approved(db, name: str, now: float | None = None, age_s: float = DEFAULT_AGE_S) -> list[dict]:
     """The approved rows for target `name`, best aged priority first; within it an approval an earlier
     batch sent back as a conflict leads, then by age. A re-approved head would otherwise queue behind

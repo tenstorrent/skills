@@ -1412,7 +1412,7 @@ def test_a_detached_push_returns_at_once_and_its_marker_reports_the_pushed_sha_a
         p.set_config("delivery.push_wait_s", 0)   # it has kept the turn past the push wait
         assert _ttp("push", "--free") == 1, "the detached push holds the branch's turn"
         from ttp import release
-        assert release.push_in_flight(p), "an upgrade must not swap the runtime under a detached push"
+        assert release.live_pushes(p), "an upgrade must not swap the runtime under a detached push"
         gate.touch()
         r = _probe_until_done(p, probe)
         pushed = _git_out(origin, "rev-parse", "proj")
@@ -1421,7 +1421,7 @@ def test_a_detached_push_returns_at_once_and_its_marker_reports_the_pushed_sha_a
         assert (m["status"], m["exit"], m["sha"], m["version"]) == ("pushed", 0, pushed, "0.1.1")
         assert m["ended"] >= m["started"] and "bumped" in pathlib.Path(m["log"]).read_text()
         _wait_gone(m["pid"], time.time() + 10)   # the outcome is written a moment before the lock goes
-        assert _ttp("push", "--free") == 0 and not release.push_in_flight(p)
+        assert _ttp("push", "--free") == 0 and not release.live_pushes(p)
         from ttp import push
         assert not push._run_lock(marker).exists(), "a finished push leaves no lock file behind"
         # A month later the next detached push tidies the finished marker and its log away.
@@ -2345,7 +2345,7 @@ def test_an_urgent_approval_mid_search_waits_for_a_near_verdict_and_leads_the_ne
     """delivery.push_yield_wait_s (default 900 s): an urgent approval arriving mid-search, with the
     search's verdict expected that soon, does not stop it. No entry loses its checks: entry 1 is blamed,
     the rest land, nothing is requeued, and the urgent one, still approved, goes in the next batch."""
-    from ttp import pushq
+    from ttp import pushq, urgent
     p, repo, origin, heads = _bad_first(env, monkeypatch, wait_s=None)
     ran = _approved_mid_search(p, monkeypatch, 2, 1)
     rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
@@ -2353,7 +2353,7 @@ def test_an_urgent_approval_mid_search_waits_for_a_near_verdict_and_leads_the_ne
     assert not m.get("yielded_to") and len(ran) == m["checks"]["runs"] == 6, m
     assert "urgent approval 99 joins this batch's next split" in (out := capsys.readouterr().out), out
     assert "after its verdict, expected in about 0 min" in out, out
-    assert pushq.yields_to(p, "origin/proj") == [99], "the urgent one still waits, approved"
+    assert urgent.approvals_waiting(p.db, "origin/proj") == [99], "the urgent one still waits, approved"
     hot = _entry(repo, "hot", {"plugins/p/hot.txt": "h\n"})
     rc, m = _run_batch(p, _batch_marker(p, [hot], bid="b2"), monkeypatch)
     assert rc == 0 and _statuses(m) == ["pushed"] and _git_out(origin, "show", "proj:plugins/p/hot.txt") == "h", m
@@ -2364,7 +2364,7 @@ def test_an_urgent_approval_joins_a_long_search_instead_of_stopping_it(env, monk
     delivery.push_yield_restarts, an urgent approval arriving after the full head failed does not stop
     the search: every check runs once, entry 1 is blamed, the rest land, and the urgent one, still
     approved, lands first in the next batch."""
-    from ttp import batch, pushq
+    from ttp import batch, pushq, urgent
     monkeypatch.setattr(batch.Batch, "_verdict_s", lambda self, left: left * 1800.0)
     p, repo, origin, heads = _bad_first(env, monkeypatch, wait_s=None, restarts=None)
     ran = _approved_mid_search(p, monkeypatch, 1, 1)
@@ -2372,7 +2372,7 @@ def test_an_urgent_approval_joins_a_long_search_instead_of_stopping_it(env, monk
     assert rc == 0 and _statuses(m) == ["check_failed"] + ["pushed"] * 7, m
     assert not m.get("yielded_to") and len(ran) == m["checks"]["runs"] == 6, m
     assert "after its next check once the search ends" in capsys.readouterr().out
-    assert pushq.yields_to(p, "origin/proj") == [99], "the urgent one leads the next batch"
+    assert urgent.approvals_waiting(p.db, "origin/proj") == [99], "the urgent one leads the next batch"
     hot = _entry(repo, "hot", {"plugins/p/hot.txt": "h\n"})
     rc, m = _run_batch(p, _batch_marker(p, [hot], bid="b2"), monkeypatch)
     assert rc == 0 and _statuses(m) == ["pushed"] and _git_out(origin, "show", "proj:plugins/p/hot.txt") == "h", m
@@ -2587,7 +2587,7 @@ def test_a_batch_marker_records_what_its_search_must_not_yield_to(env, monkeypat
 
 
 def test_after_a_batch_stopped_its_search_the_urgent_approval_goes_alone_then_the_requeued_ones(env, monkeypatch):
-    from ttp import pushq
+    from ttp import pushq, urgent
     s = _pq(env, monkeypatch, push_batch_s=10 ** 6, push_batch_max=5)
     _pq_earlier(s)
     rows = [_pq_review(s)[1], _pq_review(s)[1]]
@@ -2596,7 +2596,7 @@ def test_after_a_batch_stopped_its_search_the_urgent_approval_goes_alone_then_th
     s.p.db.x("UPDATE push_queue SET status='batched', batch='b1' WHERE id IN (?,?)", tuple(rows))
     hot = _pq_review(s, priority=1)[1]
     calm = _pq_review(s, priority=3)[1]
-    assert pushq.yields_to(s.p, "origin/proj") == [hot], "only the urgent approval stops a search"
+    assert urgent.approvals_waiting(s.p.db, "origin/proj") == [hot], "only the urgent approval stops a search"
     m = {"outcome": "yielded", "ended": now, "yielded_to": [hot],
          "results": [{"id": r, "status": "requeued", "detail": {"yielded": True}} for r in rows]}
     pushq._apply(s.p, {"id": "b1", "target": "origin/proj"}, m, lambda *a, **k: None, now)
@@ -15832,7 +15832,7 @@ def test_a_rebase_delivers_on_its_own_new_branch_by_default_and_never_leases(env
     t = p.db.task(tid)
     own = t["branch"]
     assert worktree.delivery_branch(t) == (old, True) and push.delivery_source(p, t)[1:] == (own, False)
-    assert push.own_target(p, repo) == ("origin", own) and not push.own_lease(p, own)
+    assert push.own_target(p, repo) == ("origin", own) and push.own_rebase(p, own) is None
     head = _git_out(repo, "rev-parse", "HEAD")
     assert _ttp("push", "--own") == 0, capsys.readouterr().err
     assert _git_out(origin, "rev-parse", own) == head and _git_out(origin, "rev-parse", old) == theirs
@@ -15860,7 +15860,7 @@ def test_rebase_replace_lease_replaces_the_rebased_branch_as_before(env, monkeyp
     assert project.config_problems(p.raw_config(), p.root) == [] or not any(
         "rebase_replace" in x for x in project.config_problems(p.raw_config(), p.root))
     t = p.db.task(tid)
-    assert push.delivery_source(p, t)[1:] == (old, True) and push.own_lease(p, old)
+    assert push.delivery_source(p, t)[1:] == (old, True) and push.own_rebase(p, old) is not None
     head = _git_out(repo, "rev-parse", "HEAD")
     assert _ttp("push", "--own") == 0, capsys.readouterr().err
     assert _git_out(origin, "rev-parse", old) == head and "under a lease" in capsys.readouterr().err
@@ -16108,7 +16108,7 @@ def test_an_upgraded_project_without_the_setting_rebases_onto_a_new_branch(env, 
     assert project.rebase_replace(p.config()) == "new_branch" and not project.never_force(p.config())
     assert not any("rebase_replace" in x or "never_force" in x for x in project.config_problems(p.raw_config(), p.root))
     t = p.db.task(tid)
-    assert push.delivery_source(p, t) == (t, t["branch"], False) and not push.own_lease(p, old)
+    assert push.delivery_source(p, t) == (t, t["branch"], False) and push.own_rebase(p, old) is None
 
 
 @pytest.mark.parametrize("spec_line", ["pr_branch: {old}", "`pr_branch: {old}`", "pr_branch: `{old}`"])
@@ -16122,7 +16122,7 @@ def test_own_push_publishes_a_rebase_onto_the_branch_it_rebases_under_a_lease(en
     t = p.db.task(tid)
     assert worktree.delivery_branch(t) == (old, True) and push.delivery_source(p, t)[1:] == (old, True)
     assert worktree.carried_head(p, t) == theirs   # what the dispatcher builds it on
-    assert push.own_target(p, repo) == ("origin", old) and push.own_lease(p, old)
+    assert push.own_target(p, repo) == ("origin", old) and push.own_rebase(p, old) is not None
     head = _git_out(repo, "rev-parse", "HEAD")
     assert _ttp("push", "--own") == 0, capsys.readouterr().err
     assert _git_out(origin, "rev-parse", old) == head
@@ -16142,7 +16142,7 @@ def test_own_push_publishes_a_rebase_onto_the_branch_it_rebases_under_a_lease(en
     assert "under a lease" in capsys.readouterr().err
     # A pr_branch task (no rebase) still only fast-forwards.
     p.db.update_task(tid, labels=json.dumps([f"pr_branch:{old}"]))
-    assert not push.own_lease(p, old)
+    assert push.own_rebase(p, old) is None
 
 
 def test_own_push_lease_keeps_a_branch_that_moved_during_the_checks(env, monkeypatch, tmp_path):
@@ -16210,12 +16210,12 @@ def test_a_continuation_of_a_rebase_task_publishes_onto_the_same_branch(env, mon
     monkeypatch.setenv("TTP_TASK", str(nxt))
     _git_out(repo, "checkout", "-q", "-B", own)
     assert push.delivery_source(p, p.db.task(nxt))[1:] == (old, True)
-    assert push.own_target(p, repo) == ("origin", old) and push.own_lease(p, old)
+    assert push.own_target(p, repo) == ("origin", old) and push.own_rebase(p, old) is not None
     assert _ttp("push", "--own") == 0, capsys.readouterr().err
     assert _git_out(origin, "rev-parse", old) == _git_out(repo, "rev-parse", "HEAD")
     # A cleared record (pr_branch "") stops the chain: it lands on the push branch, --own has no target.
     p.db.update_task(nxt, labels=json.dumps([f"continues:{tid}", "no_pr_branch"]))
-    assert push.delivery_source(p, p.db.task(nxt)) == (None, "", False) and not push.own_lease(p, old)
+    assert push.delivery_source(p, p.db.task(nxt)) == (None, "", False) and push.own_rebase(p, old) is None
     _git_out(repo, "checkout", "-q", "-B", old)
     with pytest.raises(ValueError, match="publishes only this task's own branch"):
         push.own_target(p, repo)
@@ -16232,7 +16232,7 @@ def test_own_push_refuses_a_rebase_branch_no_record_names_or_a_shared_one(env, m
     _git_out(repo, "checkout", "-q", "-B", old)
     with pytest.raises(ValueError, match="publishes only this task's own branch"):
         push.own_target(p, repo)
-    assert not push.own_lease(p, old)
+    assert push.own_rebase(p, old) is None
     assert _ttp("push", "--own") != 0 and _git_out(origin, "rev-parse", old) == theirs
     monkeypatch.setenv("TTP_TASK", str(tid))
     _git_out(repo, "checkout", "-q", f"ttp/t{tid}-rebase-the-example")

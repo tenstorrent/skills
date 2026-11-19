@@ -784,15 +784,6 @@ def run_horizon(db: DB, provider: str, now: float) -> float:
     return max(lengths[len(lengths) // 2], 300.0) / HOUR
 
 
-def burn_rate(db: DB, provider: str, window: str, resets_at: float | None, now: float,
-              account: str | None = None) -> float | None:
-    """Points of the window used per hour, from this project's readings in the current period.
-
-    None until two readings at least five minutes apart exist: no reading, no guess.
-    """
-    return _slope(_readings(db, provider, window, resets_at, now, account))
-
-
 def _readings(db: DB, provider: str, window: str, resets_at: float | None, now: float,
               account: str | None = None) -> list:
     # Only readings of the current period count (same reset), so the span stops at its start; with
@@ -1096,15 +1087,6 @@ def review_pick(changes: dict[str, int | None], cfg: dict) -> tuple[str, str]:
 
 def review_tier(changes: dict[str, int | None], cfg: dict) -> str:
     return review_pick(changes, cfg)[0]
-
-
-def windows_from_snapshots(db: DB, now: float | None = None) -> list[Window]:
-    """Latest reading per (provider, window) of the provider's current account, ignoring readings too
-    old to trust."""
-    now = now or time.time()
-    rows = live_readings(db, _latest_readings(db, now - SNAPSHOT_FRESH_S))
-    return [Window(r["provider"], r["window"], float(r["utilization"] or 0), r["resets_at"], r["account"] or "")
-            for r in rows]
 
 
 def plan_providers(db: DB, now: float | None = None) -> dict[str, float]:

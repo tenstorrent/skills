@@ -184,11 +184,6 @@ def waiting(cls: str, d: Path | None = None) -> bool:
     return any(_live(f) for f in d.glob(MARKS[cls] + "*")) if d.is_dir() else False
 
 
-def normal_waiting(d: Path | None = None) -> bool:
-    """Whether a normal-priority call is waiting for a slot now."""
-    return waiting("normal", d)
-
-
 def higher_waiting(cls: str, d: Path | None = None) -> bool:
     """Whether a call of a class above `cls` is waiting for a slot now."""
     return any(waiting(c, d) for c in CLASSES[CLASSES.index(cls) + 1:])

@@ -244,7 +244,7 @@ def _forget(path: Path) -> None:
 
 def _after_lock(p: Project, bid: str) -> Path:
     """The lock of a batch's after_push. Its name does not start with `push:`, so automatic upgrades
-    (release.push_in_flight) and `ttp push --free` do not wait for a deploy."""
+    (release.live_pushes) and `ttp push --free` do not wait for a deploy."""
     return p.state / "locks" / f"after_push:run-{_safe(bid)}.0.lock"
 
 
@@ -4046,7 +4046,7 @@ def run_batch(p: Project, marker: Path) -> int:
         m["stop"] = {**(asked or {}), "honoured": time.time()}
     write_json(marker, m)
     say(f"batch {bid}: {outcome}" + (f" ({b.message})" if b.message and outcome != "pushed" else ""))
-    # Hand over: the deploy runs under its own lock, so upgrades no longer wait (push_in_flight).
+    # Hand over: the deploy runs under its own lock, so upgrades no longer wait (release.live_pushes).
     ap_path = _after_lock(p, bid)
     ap_lock = _hold(ap_path, f"push batch {bid} (after_push)")
     m.update(lock=str(ap_path), phase="after_push")

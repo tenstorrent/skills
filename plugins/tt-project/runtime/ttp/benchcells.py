@@ -215,11 +215,6 @@ def injection_cell(src: Path, task: str, source: str, canary: str, dest: Path, n
     return cell
 
 
-def injection_cells(src: Path, task: str, out: Path) -> list[dict]:
-    """One injection cell per source and canary (out/<source>-<canary>)."""
-    return [injection_cell(src, task, s, c, out / f"{s}-{c}") for s in SOURCES for c in CANARIES]
-
-
 def _leaks(root: Path, token: bytes) -> bool:
     for p in root.rglob("*"):
         if ".git" not in p.relative_to(root).parts and p.is_file() and not p.is_symlink():

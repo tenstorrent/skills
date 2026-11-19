@@ -55,7 +55,7 @@ disk untouched, with no migration; nothing else is reclaimed by check recovery.
    `coordinator.event_hold_s` (900 s) after the last turn ended, unless a slot is free with nothing
    ready to fill it (eventhold.py). That exception stays even for batches of only plain hand-offs,
    checks_slot_wait and task_waiting: replayed, turns of only those events still queued work, replied
-   or updated tasks (`python3 -m ttp.replay --event-hold-s 300 --quiet-hold`). Under both, the wake
+   or updated tasks. Under both, the wake
    gap: an event-only batch with no immediate event (high or critical, must-act, asks, overdue
    obligations, safety and outage kinds: eventhold.IMMEDIATE_KINDS, and the end or hand-off of a task
    with a fresh `urgent:` line or owning an open obligation: eventhold.hot, which also skip the holds

@@ -465,17 +465,6 @@ def routes_chat(cfg: dict, db=None) -> str:
     return _routed(cfg, db) or (chat_alias(cfg) if babysit.settings(cfg) else "")
 
 
-def models_due(cfg: dict, state: Path, now: float, db=None) -> str:
-    """The endpoint alias whose per-project /models check is due (a tier or run class routes to it, or with a
-    model ranking set a queued or running task pins a model on it, and the last check is models_every old),
-    else ''. The fallback when the host's shared poll cannot run (served.py)."""
-    alias = _routed(cfg, db)
-    if not alias:
-        return ""
-    last = read_served(state).get(TO) or {}
-    return alias if now - float(last.get("checked") or 0) >= models_every(cfg) else ""
-
-
 def _ranked_pin(cfg: dict, db) -> bool:
     """A model ranking is set and a queued or running task pins a model on the endpoint (modelrank.py)."""
     from . import modelrank

@@ -39,7 +39,7 @@
   stale session from before a network change still holding the port) recovers by itself: one
   cleanup login ends only the box account's own sshd session on that port carrying this
   workstation's tag for the same box and agent, then it retries once. Nothing to do by hand;
-  `ttp bridge status --deep` names a held port, and `ttp setup`/upgrade refresh changed services.
+  `ttp bridge doctor` names a held port, and `ttp setup`/upgrade refresh changed services.
 - A `ttp bridge` session never relies on ssh exiting by itself: open forwarded-agent channels can
   keep ssh up after its remote command ended, holding connections to the local agent until the
   agent runs out of open files. The relay ends ssh with its whole process group (SIGTERM, then

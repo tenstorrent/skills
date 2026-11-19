@@ -3459,18 +3459,12 @@ def delivery_source(p: Project, task: dict | None) -> tuple[dict | None, str, bo
     return None, "", False
 
 
-def own_lease(p: Project, branch: str) -> bool:
-    """Whether `ttp push --own` publishes onto `branch` as a rebase: the running task, or a code task
-    the running review covers, delivers onto it by a `rebases:` record (delivery_source). Such a push
-    replaces the branch only when every commit it has beyond the tip the rebase started from is in
-    HEAD, and then under a lease on the tip it read (publish); never as a plain force push, and it
-    never creates the branch. Never outside a run, never for `--own-branch`."""
-    return own_rebase(p, branch) is not None
-
-
 def own_rebase(p: Project, branch: str) -> dict | None:
-    """The task whose `rebases:` record makes `ttp push --own` publish onto `branch` as a rebase
-    (own_lease), or None."""
+    """The task whose `rebases:` record makes `ttp push --own` publish onto `branch` as a rebase, or None:
+    the running task, or a code task the running review covers, delivers onto it (delivery_source). Such a
+    push replaces the branch only when every commit it has beyond the tip the rebase started from is in
+    HEAD, and then under a lease on the tip it read (publish); never as a plain force push, and it never
+    creates the branch. Never outside a run, never for `--own-branch`."""
     task = os.environ.get("TTP_TASK")
     if not task or os.environ.get(OWN_BRANCH_ENV):
         return None
@@ -4281,7 +4275,7 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
     or gives "": with one, nothing runs again.
     `host` (delivery.checks_host) is where those recorded commands run, as the project's checks do;
     ones run here go behind `cfg`'s checks.wrap_cmd (wrap_of), as `ttp checks` ran them.
-    `lease` (own_lease: a rebase of `branch`) replaces the remote branch instead of fast-forwarding it.
+    `lease` (own_rebase: a rebase of `branch`) replaces the remote branch instead of fast-forwarding it.
     It is refused when the remote tip has a commit HEAD lacks (by patch) beyond `start`, the tip the
     rebase started from (worktree.rebase_start, kept at `start_ref`; without one, any such commit):
     work pushed to the branch after the rebase began is never lost; the task rebases again onto the
@@ -5578,7 +5572,7 @@ NON_FF, REBOOT = "non_fast_forward", "reboot"
 
 def _run_lock(marker: Path) -> Path:
     """The run lock of a detached push. Its name starts with `push:`, so an upgrade waits for it
-    (release.push_in_flight) and `ttp push --free` counts it, except while it only waits for its turn (free)."""
+    (release.live_pushes) and `ttp push --free` counts it, except while it only waits for its turn (free)."""
     return marker.parent.parent / "locks" / f"push:run-{marker.stem}.0.lock"
 
 

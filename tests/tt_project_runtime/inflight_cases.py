@@ -417,10 +417,10 @@ def test_inflight_low_priority_calls_wait_while_a_normal_call_waits(env):
     held = inflight.acquire(1, low=False)
     ticks = iter(range(100))
     seen = []
-    got = inflight.acquire(2, low=False, sleep=lambda s: seen.append(inflight.normal_waiting()),
+    got = inflight.acquire(2, low=False, sleep=lambda s: seen.append(inflight.waiting("normal")),
                            clock=lambda: next(ticks))
     assert got is None and seen and all(seen), "a normal call marks itself while it waits"
-    assert not inflight.normal_waiting(), "and unmarks once it stops waiting"
+    assert not inflight.waiting("normal"), "and unmarks once it stops waiting"
     mark = inflight._mark_waiting(inflight.folder())   # a normal call waiting elsewhere
     held.release()
     assert inflight.acquire(0, low=True) is None, "a low call yields the free slot"
@@ -430,7 +430,7 @@ def test_inflight_low_priority_calls_wait_while_a_normal_call_waits(env):
     with inflight.acquire(0, low=True) as s:
         assert s.index == 0, "no normal call waits: the low call goes"
     (inflight.folder() / "wait.999999.dead").write_text("")   # a waiter that died: no flock on it
-    assert not inflight.normal_waiting() and not (inflight.folder() / "wait.999999.dead").exists()
+    assert not inflight.waiting("normal") and not (inflight.folder() / "wait.999999.dead").exists()
 
 
 def test_inflight_a_mid_call_waits_behind_a_waiting_normal_call_and_ahead_of_a_waiting_low_call(env):
@@ -445,7 +445,7 @@ def test_inflight_a_mid_call_waits_behind_a_waiting_normal_call_and_ahead_of_a_w
     assert inflight.acquire(0, cls="low") is None, "and so does a low call"
     inflight._unmark(normal)
     mid = inflight._mark_waiting(d, "mid")
-    assert inflight.waiting("mid") and not inflight.normal_waiting()
+    assert inflight.waiting("mid") and not inflight.waiting("normal")
     assert inflight.acquire(0, cls="low") is None, "a low call yields to a waiting mid call"
     with inflight.acquire(0, cls="normal") as s:
         assert s.index == 0, "a normal call goes ahead of a waiting mid call"
