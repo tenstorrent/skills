@@ -2951,3 +2951,24 @@ def test_a_step_stop_in_a_worker_start_never_leaves_its_task_running_with_no_run
     finally:
         drain(d)
         assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def test_a_queued_template_merge_task_waits_while_a_release_hold_stands(env, monkeypatch, tmp_path,
+                                                                         reap_tmp_processes):
+    """A hold set after the conflict queued its finish task: dispatch spends no run on an --apply the hold
+    refuses; the task stays queued with the hold as its reason and starts once the hold is lifted."""
+    from ttp import release
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=2)
+    try:
+        merge = _merge_task(p)
+        release.set_hold(p.name, "demo running", time.time() + 3600)
+        d.dispatch()
+        task = p.db.task(merge)
+        assert _slot_tasks(p) == [] and task["status"] == "queued"
+        assert task["blocked_reason"].startswith("release held: demo running")
+        release.lift_hold(p.name)
+        d.dispatch()
+        assert _slot_tasks(p) == [merge]
+    finally:
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"

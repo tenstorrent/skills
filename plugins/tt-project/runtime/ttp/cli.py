@@ -13855,6 +13855,61 @@ def _release_hold(p: Project, a) -> None:
           f"skip it until then; `ttp upgrade {p.name} --release` lifts it, --override-hold upgrades once anyway")
 
 
+def _invoking_task() -> str:
+    return (os.environ.get("TTP_TASK") or os.environ.get("TTP_TASK_ID") or "").strip()
+
+
+def _upgrade_invoker() -> str:
+    """Who runs this `ttp upgrade`: the invoking run, task and project the runtime's env names
+    (TTP_RUN_ID, TTP_TASK or TTP_TASK_ID, TTP_PROJECT; a coordinator turn has no task), else 'terminal'."""
+    parts = [f"{k} {v}" for k, v in (("project", Path(os.environ["TTP_PROJECT"]).name
+                                       if os.environ.get("TTP_PROJECT") else ""),
+                                      ("task", _invoking_task()),
+                                      ("run", os.environ.get("TTP_RUN_ID", ""))) if v]
+    return " ".join(parts) or "terminal"
+
+
+def _parent_command() -> str:
+    """The caller's parent command line, scrubbed of known secrets and cut short ("" when unreadable)."""
+    ppid = os.getppid()
+    try:
+        cmd = " ".join(Path(f"/proc/{ppid}/cmdline").read_bytes().decode(errors="replace").split("\0")).strip()
+    except OSError:
+        try:
+            cmd = subprocess.run(["ps", "-o", "command=", "-p", str(ppid)], capture_output=True, text=True,
+                                 timeout=5).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            cmd = ""
+    return f"{ppid} {redact.scrub(cmd)[:200]}".strip()
+
+
+def _upgrade_mode(a) -> str:
+    mode = ("auto" if a.auto else "apply" if a.apply is not None else "takeover" if a.take_over_from else
+            "hold" if (a.hold or a.release or a.until or a.until_probe or a.why) else "plain")
+    return mode + ("+override-hold" if a.override_hold else "")
+
+
+def _log_upgrade_invoker(p: Project, a) -> None:
+    """One line in the project's logs/upgrade.log at the start of every `ttp upgrade`: the time, the mode,
+    the caller's pid and parent command, and who ran it (the run, task and project the env names, else
+    'terminal'), so any upgrade can be traced to its caller."""
+    append_text(p.logs / "upgrade.log",
+                f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} ttp upgrade {p.name} mode={_upgrade_mode(a)} "
+                f"pid={os.getpid()} parent={_parent_command() or '?'} by={_upgrade_invoker()}\n", p)
+
+
+def _upgrade_origin(auto: bool) -> str:
+    """The origin of a finish task this upgrade queues: 'daemon' for the daemon's own --auto, else the
+    invoking task or run the env names, else 'cli'. Never 'user': no user asked for it."""
+    if auto:
+        return "daemon"
+    if tid := _invoking_task():
+        return f"task {tid}"
+    if rid := os.environ.get("TTP_RUN_ID"):
+        return f"run {rid}"
+    return "cli"
+
+
 def _upgrade_held(p: Project, a) -> None:
     """Exit 75 (busy), changing nothing, while the project has a release hold (release.upgrade_hold);
     --override-hold goes on, logged in its logs/upgrade.log. The daemon's own upgrade is recorded as held."""
@@ -14085,6 +14140,7 @@ def cmd_upgrade(a) -> None:
             print(mm.push(entry.get("ssh") or entry["host"]))
             sys.exit(forward(entry, sys.argv[1:]))
         p = need(a.name, sys.argv[1:])
+    _log_upgrade_invoker(p, a)
     if a.hold or a.release or a.until or a.until_probe or a.why:
         return _release_hold(p, a)
     _upgrade_held(p, a)
@@ -14301,12 +14357,23 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
             print(took + f"{why}, so nothing retries it: rerun `ttp upgrade {p.name}` after such a change.")
             sys.exit(1)
         target = f"{new_v} ({new_c})"
+        if not tid and (hold := release.upgrade_hold(p.name)):
+            # A held release gets no finish task, even past --override-hold: that task's --apply would be refused.
+            why = release.hold_text(hold, p)
+            append_text(p.logs / "upgrade.log", f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} conflict under release "
+                                                f"{why}: no finish task queued\n", p)
+            if auto:
+                release.finish(p, "held", why=f"release {why}")
+            print(f"upgrade not applied; the running harness is unchanged. {problem}\n{p.name}'s release is {why}, "
+                  f"so no harness task was queued to finish it. `ttp upgrade {p.name} --release` lifts the hold; "
+                  f"then rerun `ttp upgrade {p.name}`.")
+            sys.exit(75)
         if not tid:
             _refuse_unappliable_task(p, auto, problem)
         tid = tid or p.db.add_task(
             release.UPGRADE_TASK_TITLE, _UPGRADE_TASK.format(problem=problem, name=p.name, target=target,
                                                              state=shlex.quote(str(p.state))),
-            kind="harness", tier="standard", priority=2, origin="user")
+            kind="harness", tier="standard", priority=2, origin=_upgrade_origin(auto))
         if not holder:
             p.db.set_kv(release.KV_MERGE_BASIS, {"task": int(tid), "files": files})
         release.take_finish_lock(p, tid, f"{new_v} {new_c}", target)     # it holds the live harness until it ends

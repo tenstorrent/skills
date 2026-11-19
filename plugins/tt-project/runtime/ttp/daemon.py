@@ -13373,6 +13373,13 @@ class Daemon:
             return len(rows)
         return sum(1 for t in rows if coord.task_resources(dict(t)) & set(scope))
 
+    def _release_hold_why(self) -> str:
+        """'release held: ...' while the user's release hold stands on this project (release.upgrade_hold),
+        else "". A finish task queued before the hold waits on it: no run is spent on an --apply the hold
+        refuses."""
+        hold = release.upgrade_hold(self.p.name)
+        return f"release {release.hold_text(hold, self.p)}" if hold else ""
+
     def _dispatch(self, busy: dict) -> None:
         db = self.p.db
         if held := projmove.dispatch_hold(db):   # the old copy may still start workers: none here yet
@@ -13451,6 +13458,11 @@ class Daemon:
                 fate[task["id"]] = "other"
                 continue
             if why := rollout.scratch_hold(scratch, task, scratch_owners):   # a soft cap; ordered work never waits
+                if task["blocked_reason"] != why[:500]:
+                    db.update_task(task["id"], blocked_reason=why[:500])
+                fate[task["id"]] = "hold"
+                continue
+            if urgent.leads(task) and (why := self._release_hold_why()):   # its --apply would be refused
                 if task["blocked_reason"] != why[:500]:
                     db.update_task(task["id"], blocked_reason=why[:500])
                 fate[task["id"]] = "hold"

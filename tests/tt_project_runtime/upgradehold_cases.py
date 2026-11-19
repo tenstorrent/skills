@@ -639,3 +639,86 @@ def test_ttp_deployed_lists_a_held_project_with_its_version_and_lag(env, tmp_pat
     assert 'alpha\theld: demo running until ' in held['text']
     assert 'left out of this deploy; runs 0.5.3, 9 releases behind 0.5.12' in held['text']
     assert release.releases_behind('0.4.9', '0.5.0') is None and release.releases_behind('', '0.5.0') is None
+
+
+def _upgrade_log_lines(p):
+    log = p.logs / "upgrade.log"
+    return [ln for ln in (log.read_text().splitlines() if log.exists() else []) if " ttp upgrade " in ln]
+
+
+def _run_upgrade(cli, argv):
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            cli.main(argv)
+    except SystemExit as e:
+        return e.code
+    return 0
+
+
+def test_every_ttp_upgrade_mode_logs_who_ran_it_at_its_start(env, monkeypatch, tmp_path):
+    """A manual upgrade on a held project restarted it and no log said who ran it: each mode now writes
+    one line to the target's logs/upgrade.log first, naming the mode, pid, parent and the invoking run."""
+    from ttp import cli, release
+    p, d, launches = _release_daemon(env, monkeypatch)
+    for var in ("TTP_TASK", "TTP_TASK_ID", "TTP_RUN_ID", "TTP_PROJECT"):
+        monkeypatch.delenv(var, raising=False)
+    release.set_hold(p.name, "demo running", time.time() + 3600)
+    before = len(_upgrade_log_lines(p))     # the fixture's own setup upgrade
+    modes = [(["--apply", "deadbeef"], "apply"), (["--take-over-from", "99"], "takeover"), ([], "plain")]
+    for argv, mode in modes:
+        assert _run_upgrade(cli, ["upgrade", p.name, *argv]) == 75, mode     # refused by the hold, still logged
+    other = tmp_path / "otherproj"
+    monkeypatch.setenv("TTP_PROJECT", str(other))
+    monkeypatch.setenv("TTP_TASK", "42")
+    monkeypatch.setenv("TTP_RUN_ID", "7")
+    _run_upgrade(cli, ["upgrade", p.name, "--override-hold"])
+    lines = _upgrade_log_lines(p)[before:]
+    assert [ln.split(" mode=")[1].split()[0] for ln in lines] == ["apply", "takeover", "plain", "plain+override-hold"]
+    for ln in lines:
+        assert f"ttp upgrade {p.name} " in ln and f"pid={os.getpid()} " in ln and f"parent={os.getppid()}" in ln
+    assert all(ln.endswith("by=terminal") for ln in lines[:3])
+    assert lines[3].endswith("by=project otherproj task 42 run 7")
+
+
+def test_the_conflict_paths_finish_task_records_who_queued_it_never_user(env, monkeypatch):
+    from ttp import cli, release
+    p, restarts = _conflicting_upgrade(env, monkeypatch)
+    for var in ("TTP_TASK", "TTP_TASK_ID", "TTP_RUN_ID", "TTP_PROJECT"):
+        monkeypatch.delenv(var, raising=False)
+    assert _run_upgrade(cli, ["upgrade", "demo"]) == 75
+    task = p.db.one("SELECT * FROM tasks WHERE title=?", (release.UPGRADE_TASK_TITLE,))
+    assert task["origin"] == "cli"
+    assert " mode=plain " in _upgrade_log_lines(p)[-1]
+    monkeypatch.setenv("TTP_TASK", "42")
+    monkeypatch.setenv("TTP_RUN_ID", "7")
+    assert cli._upgrade_origin(False) == "task 42" and cli._upgrade_origin(True) == "daemon"
+    monkeypatch.delenv("TTP_TASK")
+    assert cli._upgrade_origin(False) == "run 7"
+
+
+def test_a_held_project_gets_no_finish_task_even_past_override_hold(env, monkeypatch):
+    from ttp import cli, release
+    p, restarts = _conflicting_upgrade(env, monkeypatch)
+    release.set_hold(p.name, "demo running", time.time() + 3600)
+    assert _run_upgrade(cli, ["upgrade", "demo", "--override-hold"]) == 75
+    assert not p.db.q("SELECT id FROM tasks WHERE title=?", (release.UPGRADE_TASK_TITLE,))
+    assert release.finish_holder(p) is None and not restarts
+    assert "conflict under release held: demo running" in (p.logs / "upgrade.log").read_text()
+
+
+def test_a_finish_task_queued_before_a_hold_cannot_apply_without_override_hold(env, monkeypatch):
+    """The hold set after the conflict queued its finish task: the task's `ttp upgrade --apply` is refused,
+    changing nothing, until --override-hold (logged)."""
+    from ttp import cli, release
+    p, restarts = _conflicting_upgrade(env, monkeypatch)
+    assert _run_upgrade(cli, ["upgrade", "demo"]) == 75
+    tid = p.db.one("SELECT id FROM tasks WHERE title=?", (release.UPGRADE_TASK_TITLE,))["id"]
+    head = _git_out(p.harness, "rev-parse", "HEAD")
+    release.set_hold(p.name, "demo running", time.time() + 3600)
+    monkeypatch.setenv("TTP_TASK", str(tid))
+    assert _run_upgrade(cli, ["upgrade", "demo", "--apply", head]) == 75
+    assert _git_out(p.harness, "rev-parse", "HEAD") == head and not restarts
+    _run_upgrade(cli, ["upgrade", "demo", "--apply", head, "--override-hold"])
+    text = (p.logs / "upgrade.log").read_text()
+    assert "release hold overridden by `ttp upgrade demo --override-hold`" in text
+    assert [ln.split(" mode=")[1].split()[0] for ln in _upgrade_log_lines(p)][-2:] == ["apply", "apply+override-hold"]
