@@ -95,9 +95,9 @@ def refused(now: float | None = None) -> int:
         fcntl.flock(fd, fcntl.LOCK_EX)
         now = time.time() if now is None else now
         level = max(1, allowed(now, c) // 2)
-        tmp = d / f"level.json.{os.getpid()}.tmp"
-        tmp.write_text(json.dumps({"level": level, "at": round(now, 3)}))
-        os.replace(tmp, d / "level.json")
+        from .project import durable_write
+        # A lost level after a power cut only restarts the backoff at the full cap: no sync needed.
+        durable_write(d / "level.json", json.dumps({"level": level, "at": round(now, 3)}), sync=False)
         return level
     except OSError:
         return 0
