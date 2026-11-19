@@ -2756,13 +2756,13 @@ def test_a_queue_incident_calls_a_holder_still_printing_slow_with_the_host_load_
         tmp_path):
     """A holder past the hang factor that still prints is slow: kept in the incident's "slow", named with
     the host load in the next wake's text, and wakes nobody itself. One whose log stopped growing past its
-    stall threshold (checkstall) is a likely hang; one naming no log is neither: nothing shows it working."""
-    from ttp import checklane, checkstall
+    stall threshold is a likely hang; one naming no log is neither: nothing shows it working."""
+    from ttp import checklane
     now = time.time()
     printing, silent = tmp_path / "printing.log", tmp_path / "silent.log"
     printing.write_text("..... [ 80%]\n")
     silent.write_text("..... [ 40%]\n")
-    os.utime(silent, (now - checkstall.STALL_MIN_S - 60,) * 2)
+    os.utime(silent, (now - checklane.HANG_LOG_MIN_S - 60,) * 2)
     busy = {"task": "21", "pid": 4242, "run_since": now - 5000, "command": "pytest -q", "log": str(printing)}
     hung = {"task": "22", "pid": 4243, "run_since": now - 5000, "command": "pytest -q", "log": str(silent)}
     nolog = {"task": "23", "pid": 4244, "run_since": now - 5000, "command": "make check"}
@@ -2774,7 +2774,7 @@ def test_a_queue_incident_calls_a_holder_still_printing_slow_with_the_host_load_
     why, inc = checklane.wait_wake(evs, {"start": 1.0}, cfg, now, 300.0)
     assert why == ["hang"] and len(inc["hang"]) == 1 and len(inc["slow"]) == 1, (why, inc)
     text = checklane.wake_text(why, evs, inc, cfg, now, 300.0, load=lambda: "1-minute load 92.0 on 64 cores")
-    assert "its log stopped growing, its CPU idle: a likely hang" in text, text
+    assert "its log stopped growing: a likely hang" in text, text
     assert "1 holder ran over 3x" in text and "slow under load (1-minute load 92.0 on 64 cores), not hung" in text, text
     # Not over the factor: neither.
     assert checklane.wait_wake(evs, {"start": 1.0}, {"checks": {"wait_hang_factor": 100}}, now, 300.0)[0] == []
@@ -4582,12 +4582,11 @@ def test_waiters_behind_the_free_lanes_wait_on_the_lane_not_on_nothing(env, monk
             g and g.close()
 
 
-def test_a_long_holder_is_a_likely_hang_only_when_its_log_and_cpu_stalled_else_slow_under_load(monkeypatch):
-    """checks.wait_hang_factor x the median alone says a holder is long, not hung: a likely hang needs
-    checkstall's stalled view (its log not grown for its threshold) and, where the daemon's CPU reading
-    of its tree is known, that CPU idle. A long holder still progressing is named slow under load, with
-    the host's load and cores, and wakes nobody."""
-    from ttp import checkcap, checklane, checkstall
+def test_a_long_holder_is_a_likely_hang_only_when_its_log_stalled_else_slow_under_load(monkeypatch):
+    """checks.wait_hang_factor x the median alone says a holder is long, not hung: a likely hang needs its
+    log not grown for its threshold (checklane._hung). A long holder still printing is named slow under
+    load, with the host's load and cores, and wakes nobody."""
+    from ttp import checkcap, checklane
     monkeypatch.setattr(checkcap, "_load", lambda: 63.0)
     monkeypatch.setattr(checkcap, "cores", lambda: 64)
     t0 = 1_000_000.0
@@ -4597,28 +4596,24 @@ def test_a_long_holder_is_a_likely_hang_only_when_its_log_and_cpu_stalled_else_s
     evs = _queue_events(1, holders=[h])
     grew = {"at": now - 5}
     stat = lambda path: (grew["at"], 1000)   # noqa: E731 - the log's mtime and size
-    moving = {checkstall.key(h): {"cpu": 2000.0, "at": now - 30}}   # its tree used CPU in the last reading
-    idle = {checkstall.key(h): {"cpu": 2000.0, "at": t0 + 100}}
 
-    why, inc = checklane.wait_wake(evs, None, cfg, now, 600.0, marks=moving, stat=stat)
+    why, inc = checklane.wait_wake(evs, None, cfg, now, 600.0, stat=stat)
     assert why == ["new"] and inc["slow"] and not inc["hang"], (why, inc)
     text = checklane.wake_text(why, evs, inc, cfg, now, 600.0)
     assert "slow under load (CPU demand 63.0 cores on 64 cores), not hung" in text and "likely hang" not in text, text
-    assert checklane.wait_wake(evs, inc, cfg, now + 60, 600.0, marks=moving, stat=stat)[0] == [], "slow: no wake"
-    # bypasses: its log stalled but its tree busy (left to the wall-time cap); stall watch off; no log named
+    assert checklane.wait_wake(evs, inc, cfg, now + 60, 600.0, stat=stat)[0] == [], "slow: no wake"
+    # bypasses: stall watch off; no log named
     grew["at"] = t0 + 100
-    assert checklane.wait_wake(evs, {"start": 1.0}, cfg, now, 600.0, marks=moving, stat=stat)[0] == []
     off = {"checks": {"wait_hang_factor": 3, "stall_s": 0}}
-    assert checklane.wait_wake(evs, {"start": 1.0}, off, now, 600.0, marks=idle, stat=stat)[0] == []
+    assert checklane.wait_wake(evs, {"start": 1.0}, off, now, 600.0, stat=stat)[0] == []
     nolog = _queue_events(1, holders=[{k: v for k, v in h.items() if k != "log"}])
-    assert checklane.wait_wake(nolog, {"start": 1.0}, cfg, now, 600.0, marks=idle, stat=stat)[0] == []
-    # stalled: log still for 58 min and the tree idle as long, or the log alone where no reading is known
-    for marks in (idle, {}, None):
-        why, inc = checklane.wait_wake(evs, {"start": 1.0}, cfg, now, 600.0, marks=marks, stat=stat)
-        assert why == ["hang"] and not inc["slow"], (marks, why, inc)
-    assert "its log stopped growing, its CPU idle: a likely hang" in checklane.wake_text(why, evs, inc, cfg, now, 600.0)
+    assert checklane.wait_wake(nolog, {"start": 1.0}, cfg, now, 600.0, stat=stat)[0] == []
+    # stalled: log still for 58 min
+    why, inc = checklane.wait_wake(evs, {"start": 1.0}, cfg, now, 600.0, stat=stat)
+    assert why == ["hang"] and not inc["slow"], (why, inc)
+    assert "its log stopped growing: a likely hang" in checklane.wake_text(why, evs, inc, cfg, now, 600.0)
     # short of the factor: neither hung nor slow, however still its log
-    assert checklane.wait_wake(evs, {"start": 1.0}, cfg, t0 + 1700, 600.0, marks=idle, stat=stat)[0] == []
+    assert checklane.wait_wake(evs, {"start": 1.0}, cfg, t0 + 1700, 600.0, stat=stat)[0] == []
 
 
 def test_urgent_and_p1_runs_reach_the_host_queue_past_lanes_held_by_runs_only_queued_for_a_host_slot(
@@ -5709,7 +5704,7 @@ def test_a_checks_queue_incident_rewakes_for_a_likely_hung_holder_and_for_an_own
         d.check_checks_wait(every_s=0)
         assert len(_queue_wakes(p)) == 1, "a holder at the median: no hang"
         d.cfg.setdefault("checks", {})["wait_hang_factor"] = 1e-6   # its run is now far over the median
-        d.cfg["checks"]["stall_s"] = 60   # and its log stalled (checkstall.view)
+        d.cfg["checks"]["stall_s"] = 60   # and its log stalled (checklane._hung)
         for _ in range(2):
             d.check_checks_wait(every_s=0)
         wakes = _queue_wakes(p)
@@ -6686,7 +6681,7 @@ def test_a_holder_waiting_for_test_slots_says_so_and_is_no_likely_hang(env, tmp_
         evs = _queue_events(1, holders=[rec])
         assert checklane.wait_wake(evs, {"start": 1.0}, cfg, float(rec["granted_at"]) + 60, 300.0)[0] == [], \
             "its clock starts at its grant, not when it took the lane"
-        log = tmp_path / "checks.log"   # its commands' log, never grown since its grant: stalled (checkstall)
+        log = tmp_path / "checks.log"   # its commands' log, never grown since its grant: stalled (checklane._hung)
         log.write_text("")
         os.utime(log, (float(rec["granted_at"]),) * 2)
         evs = _queue_events(1, holders=[{**rec, "log": str(log), "run_since": float(rec["granted_at"])}])
@@ -7113,117 +7108,6 @@ def test_cancelling_a_task_whose_checks_group_already_ended_is_no_error(env, tmp
     r = jobstop.end_cancelled_checks(p, tid, "test")
     assert time.monotonic() - began < jobstop.FREE_WAIT_S + 1
     assert len(r) == 1 and "already ended" in r[0]["text"], r
-
-
-def test_checks_stall_threshold_scales_with_the_checks_median_never_under_15_min_and_reads_cpu_with_slack():
-    from ttp import checkstall
-    assert checkstall.stall_s({}, {}) == 900 == checkstall.STALL_MIN_S
-    assert checkstall.stall_s({}, {"cost": {"est_s": 300}}) == 900, "a short check: the floor"
-    assert checkstall.stall_s({}, {"cost": {"est_s": 1800}}) == 1800, "a long check: one usual run"
-    assert checkstall.stall_s({"checks": {"stall_s": 60}}, {"cost": {"est_s": 1800}}) == 60, "checks.stall_s sets it"
-    assert checkstall.stall_s({"checks": {"stall_s": 0}}, {}) == 0, "0 turns it off"
-    assert checkstall.stall_s({"checks": {"stall_s": "x"}}, {}) == 900
-    mark = {"cpu": 10.0, "at": 1000.0}
-    assert checkstall.read_cpu(mark, 10.4, 1010.0) is mark, "under the slack: still idle since 1000"
-    assert checkstall.read_cpu(mark, 18.0, 1900.0) is mark, "under 1% of one core over 900 s: idle"
-    assert checkstall.read_cpu(mark, 20.0, 1900.0) == {"cpu": 20.0, "at": 1900.0}, "it used CPU: moved"
-    assert checkstall.read_cpu(mark, 5.0, 1900.0) == {"cpu": 5.0, "at": 1900.0}, "a smaller reading: a new tree"
-    assert checkstall.read_cpu(mark, None, 1900.0) == {"cpu": None, "at": 1900.0}, "unreadable: counts as moving"
-    assert checkstall.read_cpu(None, 3.0, 50.0) == {"cpu": 3.0, "at": 50.0}
-
-
-def test_daemon_marks_a_silent_checks_run_stalled_once_and_stops_it_only_when_its_processes_are_idle_too(
-        env, tmp_path, monkeypatch, capsys):
-    # Injected clock and CPU readings; the lane label comes from the real writers (suite_hold, suite_running).
-    from ttp import checklane, checkstall, cli, jobstop, testslots
-    from ttp.daemon import Daemon
-    from ttp.runner import proc_start
-    p = make(env)
-    _lane_env(monkeypatch)
-    run = tmp_path / "run"
-    run.mkdir()
-    log = run / "checks.log"
-    log.write_text("$ pytest -q\n")
-    me = os.getpid()
-    (run / cli.CHECKS_PID).write_text(json.dumps({"pid": me, "started": proc_start(me)}))
-    monkeypatch.setenv("TTP_TASK", "12")
-    g = testslots.suite_hold(p.name, repo=_LANE_REPO, slots=1, priority=2, name="alpha")
-    testslots.suite_running(g, 3600, str(log))
-    monkeypatch.delenv("TTP_TASK")
-    stops, cpu = [], {"v": 10.0}
-    monkeypatch.setattr(jobstop, "end_checks", lambda p, rd, why, task: stops.append((rd, why, task)) or {"text": "stopped"})
-
-    def tick(at, d=None):
-        (d or daemon).check_checks_stall(every_s=0, now=at, cpu=lambda pid: cpu["v"])
-
-    def events():
-        return p.db.q("SELECT status, text FROM events WHERE kind=?", (checkstall.EVENT,))
-
-    try:
-        [rec] = checkstall.holders(p.name)
-        assert rec["log"] == str(log) and rec["pid"] == me
-        t0 = float(rec["run_since"])
-        os.utime(log, (t0, t0))
-        daemon = Daemon(p.base)
-        tick(t0 + 300)
-        with log.open("a") as f:
-            f.write("tests/a.py ....\n")
-        os.utime(log, (t0 + 1000, t0 + 1000))
-        tick(t0 + 1800)   # CPU flat for 1500 s, but the log grew 800 s ago: slow, never touched
-        assert not events() and not stops and "STALLED" not in checklane.holder_text(rec, t0 + 1800, p.config())
-
-        cpu["v"] = 200.0   # its processes still work
-        tick(t0 + 1960)
-        cpu["v"] = 400.0
-        tick(t0 + 2020)
-        [ev] = events()
-        assert ev["status"] == "handled" and "Checks run stalled" in ev["text"] and "#12" in ev["text"], ev
-        assert "has not grown for 16 min (threshold 15 min, checks.stall_s), its processes still use CPU" in ev["text"]
-        assert not stops, "a stalled log with a busy tree is left to the wall-time cap"
-        now = t0 + 2020
-        assert "STALLED: its log has not grown for 18 min" in checklane.holder_text(rec, now + 60, p.config())
-        assert any("STALLED" in ln for ln in checklane.lane_lines(p.name, p.config(), now)), "the lane wait lines"
-        assert "STALLED" in checklane.status_text(p.name, p.config(), now=now), "`ttp checks status`"
-        assert cli._checks_result(run) == 1
-        out = capsys.readouterr().out
-        assert "running (pid" in out and "stalled: the log had not grown" in out and "left running" in out, out
-
-        daemon = Daemon(p.base)   # a restart keeps each run's CPU clock (kv)
-        assert checkstall.key(rec) in p.db.kv_dict(checkstall.KV)[0]
-        tick(t0 + 2020 + 600)
-        assert not stops, "idle 600 s of a 900 s threshold"
-        (run / cli.CHECKS_PID).write_text(json.dumps({"pid": me + 1, "started": "x"}))
-        tick(t0 + 2020 + 900)
-        assert not stops, "checks.pid names another run: never stopped"
-        (run / cli.CHECKS_PID).write_text(json.dumps({"pid": me, "started": proc_start(me)}))
-        tick(t0 + 2020 + 960)
-        [(rd, why, task)] = stops
-        assert rd == run and task == 12 and why.startswith("stalled: its log had not grown"), why
-        assert len(events()) == 1, "one event per stall, not one per tick"
-        assert json.loads((run / checkstall.MARKER).read_text())["stopped"] is True
-        (run / cli.CHECKS_RC).write_text("143\n")
-        assert cli._checks_result(run) == 0
-        out = capsys.readouterr().out
-        assert "finished with exit code 143" in out and "reason stalled, retryable), never a pass" in out, out
-        (run / cli.CHECKS_RC).write_text("0\n")
-        cli._checks_result(run)
-        assert "stalled" not in capsys.readouterr().out, "a pass that beat the stop stays a pass"
-        (run / cli.CHECKS_RC).unlink()
-
-        with log.open("a") as f:   # it moved again: a new episode, a new event
-            f.write("tests/b.py ....\n")
-        os.utime(log, (t0 + 5000, t0 + 5000))
-        cpu["v"] = 900.0
-        tick(t0 + 5950)
-        assert len(events()) == 2 and len(stops) == 1
-
-        p.set_config("checks.stall_s", 0)
-        with log.open("a") as f:
-            f.write("tests/c.py ....\n")
-        tick(t0 + 99999, Daemon(p.base))
-        assert len(events()) == 2 and len(stops) == 1, "checks.stall_s 0 turns it off"
-    finally:
-        g.close()
 
 
 def test_check_commands_start_at_nice_19_and_idle_io_by_default_and_skip_a_missing_ionice(env, monkeypatch):
@@ -12887,7 +12771,7 @@ def test_a_queue_incident_times_a_holder_against_runs_of_its_own_command_list_an
     own command list's median is 35 min is neither slow nor hung, though it is far over the mixed median; past
     the factor of its own median it is a likely hang only once its log stopped growing, else slow. A command
     list with no passing run yet has no baseline: its wall time alone flags nothing."""
-    from ttp import checklane, checkstall, checkwall, locks, testslots
+    from ttp import checklane, checkwall, locks, testslots
     _lane_env(monkeypatch)
     state = tmp_path / "state"
     state.mkdir()
@@ -12920,7 +12804,7 @@ def test_a_queue_incident_times_a_holder_against_runs_of_its_own_command_list_an
                     "over 3x its own median but still printing: slow, never a hang"
                 text = checklane.wake_text(why, evs, inc, cfg, start + 110 * 60, mixed, load=lambda: "1 on 8 cores")
                 assert "its own command list (35 min)" in text and "likely hang" not in text, text
-                silent = start + 110 * 60 + checkstall.stall_s(cfg, rec) + 60
+                silent = start + 110 * 60 + max(checklane.HANG_LOG_MIN_S, 35 * 60) + 60
                 why, inc = checklane.wait_wake(evs, {"start": 1.0}, cfg, silent, mixed)
                 assert why == ["hang"], "no output for the stall window: a likely hang"
                 text = checklane.wake_text(why, evs, inc, cfg, silent, mixed)

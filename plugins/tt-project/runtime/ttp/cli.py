@@ -8009,9 +8009,6 @@ def _checks_result(run_dir: Path) -> int:
                   + (checkcap.line() or "they start once one is free"))
         else:
             print(f"ttp checks: running (pid {info['pid']})")
-        from . import checkstall
-        if stall := checkstall.marker(run_dir, info.get("pid")):
-            print(f"ttp checks: {checkstall.line(stall)}")
         return 1
     if rc_file.exists() and rc_file.read_text().strip() == "75" and (fault := envfault.marker_open(run_dir)):
         # Stopped at a runner the host lacks: asleep until it is back, then the task runs them again.
@@ -8036,10 +8033,6 @@ def _checks_result(run_dir: Path) -> int:
         durable_write(rc_file, "killed\n")
         print(f"ttp checks: the detached checks (pid {info.get('pid')}) ended without an exit code: something "
               "killed them; run `ttp checks --detach` again")
-    from . import checkstall
-    if (stall := checkstall.marker(run_dir, info.get("pid"))) and stall.get("stopped") \
-            and not (rc_file.exists() and rc_file.read_text().strip() == "0"):   # a pass that beat the stop stays one
-        print(f"ttp checks: {checkstall.line(stall)}")
     try:
         tail = (run_dir / CHECKS_OUT).read_text(errors="replace").splitlines()[-20:]
     except OSError:

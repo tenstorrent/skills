@@ -70,7 +70,7 @@ per queue incident (wait_wake: from the first waiter past the threshold until no
 again only when a decision is due: its longest waiter past `checks.wait_escalate_s` (default WAIT_ESCALATE_S,
 then once per as long again; 0: never), a holder running `checks.wait_hang_factor` (default WAIT_HANG_FACTOR;
 0: never) times the median run of its own command list (scope_median_s: a full suite is never timed against
-targeted runs) whose log has also stopped growing (checkstall; a likely hang: one still printing results is
+targeted runs) whose log has also stopped growing (_hung; a likely hang: one still printing results is
 named slow under load, with the host's load, and wakes nobody), or a holder whose task has ended (no owner
 to fix it).
 """
@@ -103,7 +103,7 @@ MAX_WAIT_S = 300.0
 WAIT_EVENT_S = 900.0
 WAIT_ESCALATE_S = 7200.0  # a queue incident wakes the coordinator again once its longest wait passes this
 WAIT_HANG_FACTOR = 3.0    # a holder running this many times the recent median checks run is a likely hang if stalled
-HANG_CPU_IDLE_S = 300.0   # ... and, where the daemon reads its tree's CPU, idle this long (five readings)
+HANG_LOG_MIN_S = 900.0    # ... its log silent this long, or one usual passing run of its commands if longer
 INCIDENT_KEY = "checks_wait_incident"   # kv: the open queue incident (wait_wake)
 LONG_WAIT_S = 600.0       # ttp status and the digest list a wait longer than this
 TELL_S = 60.0             # a waiter says who holds the lanes this often
@@ -908,14 +908,7 @@ def holder_text(rec: dict, now: float, cfg: dict | None = None) -> str:
            + (f" (waiting for {rec['waits']})" if rec.get("waits") else ""))
     over = " (priority-1 run in the urgent extra lane over the lane cap)" if rec.get("urgent") else ""
     return (f"{who}{f' {cmd!r}' if cmd else ''}{over} queued {mins(t['queued_s'])}, {run}, "
-            f"{_kids(t['children'], t['running_s'] is not None)}{_stalled(rec, now, cfg)}")
-
-
-def _stalled(rec: dict, now: float, cfg: dict | None = None) -> str:
-    """", STALLED: its log has not grown for ..." for a running holder whose log stopped growing (checkstall)."""
-    from . import checkstall
-    v = checkstall.view(rec, now, cfg)
-    return f", {checkstall.text(v)}" if v and v["stalled"] else ""
+            f"{_kids(t['children'], t['running_s'] is not None)}")
 
 
 def _ticket_batch(t: Path) -> str:
@@ -1123,28 +1116,42 @@ def _holder_key(rec: dict) -> str:
     return f"{rec.get('task') or rec.get('holder') or 'run'}:{rec.get('pid')}:{rec.get('run_since') or rec.get('since')}"
 
 
-def _hung(h: dict, now: float, cfg: dict | None, marks: dict | None, stat=None) -> bool | None:
-    """Whether lane holder `h` looks hung by checkstall's view: its log has not grown for its stall
-    threshold and, where the daemon's CPU reading of its tree (`marks`, kv checkstall.KV) is known, the
-    tree has used no CPU for HANG_CPU_IDLE_S. A stall watch that is off (checks.stall_s 0) never says
-    hung: elapsed time alone says slow, not hung. None for a holder that names no log: nothing shows it
-    either hung or working."""
-    from . import checkstall
-    v = checkstall.view(h, now, cfg, (marks or {}).get(checkstall.key(h)), **({"stat": stat} if stat else {}))
-    if v is None:
+def _log_mtime(path: str) -> tuple[float, int] | None:
+    try:
+        st = os.stat(path)
+    except OSError:
         return None
-    return bool(v["stalled"] and (v["cpu_idle_s"] is None or v["cpu_idle_s"] >= HANG_CPU_IDLE_S))
+    return st.st_mtime, st.st_size
+
+
+def _hung(h: dict, now: float, cfg: dict | None, stat=None) -> bool | None:
+    """Whether lane holder `h` looks hung: its log has not grown since it started its commands for
+    checks.stall_s, else one usual passing run of them (cost.est_s), at least HANG_LOG_MIN_S. checks.stall_s
+    0 never says hung: elapsed time alone says slow, not hung. None for a holder that names no log or is
+    not running its commands yet: nothing shows it either hung or working. `stat` is for tests."""
+    log, since = h.get("log"), h.get("run_since")
+    if not log or not isinstance(since, (int, float)):
+        return None
+    st = (stat or _log_mtime)(str(log))
+    limit = ((cfg or {}).get("checks") or {}).get("stall_s") if isinstance((cfg or {}).get("checks"), dict) else None
+    try:
+        limit = float(limit) if limit is not None and float(limit) >= 0 else None
+    except (TypeError, ValueError):
+        limit = None
+    if limit is None:
+        est = (h.get("cost") or {}).get("est_s") if isinstance(h.get("cost"), dict) else None
+        limit = max(HANG_LOG_MIN_S, float(est) if isinstance(est, (int, float)) and est > 0 else 0.0)
+    return bool(limit > 0 and now - max(float(since), st[0] if st else 0.0) >= limit)
 
 
 def wait_wake(events: list[dict], incident: dict | None, cfg: dict | None, now: float,
-              median_s: float | None = None, ended=lambda holder: False, marks: dict | None = None,
-              stat=None) -> tuple[list[str], dict | None]:
+              median_s: float | None = None, ended=lambda holder: False, stat=None) -> tuple[list[str], dict | None]:
     """Whether this tick's `checks_slot_wait` events (wait_events) wake the coordinator: (the reasons, none
     when they do not, and the queue incident to keep). An incident opens with the first waiter past
     checks.wait_event_s (reason "new") and closes once no waiter is past it (None). Within it, a wake again
     only for: "escalate" (its longest wait past checks.wait_escalate_s, then once per as long again), "hang"
     (a holder running checks.wait_hang_factor times its scope_median_s (`median_s` only without a cost label), that is also
-    stalled (_hung: its log still, its CPU idle where `marks` knows it; `stat` is for tests), once per
+    stalled (_hung: its log still; `stat` is for tests), once per
     holder; such a holder whose log still grows is only kept in the incident's "slow", for wake_text) and "ownerless" (a holder whose task has ended (`ended(holder record)`; a review precheck
     only once no review reading it is open, open_precheck) or whose hold is stale, once per holder). Every other waiter shows in the digest and ttp status only."""
     if not events:
@@ -1169,8 +1176,8 @@ def wait_wake(events: list[dict], incident: dict | None, cfg: dict | None, now: 
                     and now - float(h.get("run_since") or h.get("granted_at") or h.get("since") or now)
                     > factor * base)
 
-    inc["slow"] = [k for k, h in holders.items() if long(h) and _hung(h, now, cfg, marks, stat) is False][-20:]
-    for name, test in (("hang", lambda h: long(h) and bool(_hung(h, now, cfg, marks, stat))),
+    inc["slow"] = [k for k, h in holders.items() if long(h) and _hung(h, now, cfg, stat) is False][-20:]
+    for name, test in (("hang", lambda h: long(h) and bool(_hung(h, now, cfg, stat))),
                        ("ownerless", lambda h: h.get("stale") or (h.get("task") and ended(h)))):
         seen = list(inc.get(name) or [])
         for k, h in holders.items():
@@ -1206,7 +1213,7 @@ def wake_text(why: list[str], events: list[dict], inc: dict, cfg: dict | None, n
     over = f"over {wait_hang_factor(cfg):g}x the median run of its own command list ({mins(base or 0)})"
     say = {"new": f"a checks queue incident started ({len(events)} waiting past {mins(wait_event_s(cfg))})",
            "escalate": f"its longest wait passed {mins(wait_escalate_s(cfg))}",
-           "hang": f"a holder has run {over} and its log stopped growing, its CPU idle: a likely hang",
+           "hang": f"a holder has run {over} and its log stopped growing: a likely hang",
            "ownerless": "a holder's task has ended: nobody owns its fix"}
     slow = len(inc.get("slow") or [])
     return (f"Checks queue: {'; '.join(say[w] for w in why)}. "
@@ -1307,7 +1314,6 @@ def lane_status(project_name: str, now: float | None = None, cfg: dict | None = 
                           "running_s": running, "cap_s": float(r.get("cap_s") or 0),
                           "command": str(r.get("command") or ""), "overflow": bool(r.get("overflow")), "urgent": bool(r.get("urgent")),
                           "cost": r.get("cost") or {}, "why": _why(r.get("holder")), **_task_state(db, r),
-                          "stalled": _stalled(r, now, cfg),
                           **({} if running is not None else {"waits_on": _pid_queued(r.get("pid"), project_name) or _parked(r)
                                                                 or "no host queue (starting, or an older runtime)"})})
             # Parked outside the host queue for its test slots (_parked): a waiter that keeps its lane.
@@ -1387,7 +1393,7 @@ def lane_lines(project_name: str, cfg: dict | None = None, now: float | None = N
             kids = _kids(h["children"], h["running_s"] is not None)
             if h["running_s"] is not None:
                 parts.append(f"{who} queued {mins(h['queued_s'])}, running {mins(h['running_s'])}"
-                             + (f" of its {mins(h['cap_s'])} cap" if h["cap_s"] else " (no cap)") + f", {kids}{h['stalled']}")
+                             + (f" of its {mins(h['cap_s'])} cap" if h["cap_s"] else " (no cap)") + f", {kids}")
             else:
                 parts.append(f"{who} queued {mins(h['queued_s'])}, has a lane {mins(h['age_s'])}, not running yet: "
                              f"waits on {h['waits_on']}, {kids}")
@@ -1439,7 +1445,7 @@ def status_text(project_name: str, cfg: dict | None, here_repo: str = "", now: f
             extra = " (urgent extra lane, priority 1)" if h.get("urgent") else " (extra lane)" if h["overflow"] else ""
             lines.append(f"    holder{extra}: {_who(h)}{why}, {alive}, "
                          f"queued {mins(h['queued_s'])}, held {mins(h['age_s'])}{run}, "
-                         f"{_kids(h['children'], h['running_s'] is not None)}{h['stalled']}{ended}")
+                         f"{_kids(h['children'], h['running_s'] is not None)}{ended}")
         if len(parked) == len(r["lanes"]):
             lines.append("    holder: none (the parked waiters below keep their lanes while they wait)" if parked
                          else "    holder: none (a waiter is about to start)")

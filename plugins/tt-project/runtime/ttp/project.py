@@ -976,7 +976,7 @@ def _known_keys(path: list[str]) -> set[str] | None:
         # its ceiling on test workers over all its suites (testslots.project_workers); test_run_max: one
         # suite's most workers, only lowering the account's (testslots.sizes); test_run_min: a full run's
         # fewest workers (testslots.run_min);
-        # stall_s: a running check's log silence that makes it stalled (checkstall.stall_s);
+        # stall_s: a running check's log silence that makes a long lane holder hung (checklane._hung; 0: never);
         # push_load_wait_s: push checks' longest wait under the load guard (testslots.push_load_wait_s).
         # wrap_needs_device: false says the commands behind wrap_cmd need no device, so they may spill (checkspill).
         # spill_wrap_cmd: the wrapper a check runs behind on a spill host (push.spill_wrap_of; default "", none).

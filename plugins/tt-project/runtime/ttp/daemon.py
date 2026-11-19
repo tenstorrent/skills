@@ -2478,7 +2478,6 @@ class Daemon:
                 self.check_checks_owner,
                 self.reap_leftover_checks,
                 self.reap_orphan_checks,
-                self.check_checks_stall,
                 self.check_gate_time,
                 self.check_cap_wait,
                 self.check_progress,
@@ -11433,8 +11432,8 @@ class Daemon:
         checks lane longer than checks.wait_event_s (default 900, 0: off) raises one `checks_slot_wait`
         event naming the waiter and the holders (checklane.wait_events); one per wait episode (keyed on the
         waiter's task and arrival), never for a short wait. Those events are recorded 'coalesced': only
-        checklane.wait_wake's one per queue incident, and its re-wakes (escalation, a long holder that is stalled
-        by check_checks_stall's readings (a likely hang), an ownerless
+        checklane.wait_wake's one per queue incident, and its re-wakes (escalation, a long holder whose log is
+        silent (a likely hang), an ownerless
         holder), wake the coordinator. An active `daemon:checks_slot_wait` observation_mute covering one
         records it 'muted' instead."""
         now = time.time()
@@ -11442,7 +11441,7 @@ class Daemon:
             return
         self._checks_wait_checked = now
         import statistics
-        from . import checklane, checkstall, checkwall
+        from . import checklane, checkwall
         db = self.p.db
         events = checklane.wait_events(self.p.name, self.cfg, now)
         recent = checkwall.recent(self.p.state, now)
@@ -11455,7 +11454,7 @@ class Daemon:
                 and not checklane.open_precheck(db, task, h.get("holder"))
 
         was = db.kv(checklane.INCIDENT_KEY)
-        why, inc = checklane.wait_wake(events, was, self.cfg, now, median, ended, db.kv_dict(checkstall.KV)[0])
+        why, inc = checklane.wait_wake(events, was, self.cfg, now, median, ended)
         if inc != was:
             db.set_kv(checklane.INCIDENT_KEY, inc)
 
@@ -11739,38 +11738,6 @@ class Daemon:
             log(self.p, text[:300])
         if text := gatetime.subset_flag(self.p.db, self.cfg, now, self.p.name):
             log(self.p, text[:300])
-
-    def check_checks_stall(self, every_s: float = 60, now: float | None = None, cpu=None) -> None:
-        """Model-free: a running `ttp checks` whose log has not grown for its stall threshold
-        (checkstall.stall_s) raises one `checks_stalled` event per stall and marks its run folder; it is
-        stopped (checkstall.stop) only once its process tree has also used no CPU that long. The event is
-        a record (handled), never a coordinator wake: a busy hang ends at its wall-time cap. Each run's
-        CPU reading is kept in kv checkstall.KV; `cpu` (pid -> seconds) is for tests."""
-        now = time.time() if now is None else now
-        if now - getattr(self, "_checks_stall_checked", 0.0) < every_s:
-            return
-        self._checks_stall_checked = now
-        from . import checkstall
-        db = self.p.db
-        marks, _ = db.kv_dict(checkstall.KV)
-        rows, keep = checkstall.scan(self.p.name, self.cfg, marks, now, **({"cpu": cpu} if cpu else {}))
-        if keep != marks:
-            db.set_kv(checkstall.KV, keep)
-        for v in rows:
-            if not v["stalled"]:
-                continue
-            task = int(v["task"]) if v["task"].isdigit() else None
-            fp = checkstall.fingerprint(v)
-            if not db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
-                text = (f"Checks run stalled: pid {v['pid']}" + (f" of task #{task}" if task else "")
-                        + f" ({v['log']}): {checkstall.text(v)}.")
-                db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
-                     (now, "daemon", checkstall.EVENT, fp, "low", text[:4000], "handled", task))
-                log(self.p, text[:300])
-                if not v["stop"]:
-                    checkstall.mark_run(v, False, now)
-            if v["stop"] and (r := checkstall.stop(self.p, v)):
-                log(self.p, r["text"])
 
     def _log_resource_wait(self, task: dict, held: dict | None) -> None:
         """Log once per wait that dispatch skips ready `task` because a resource it needs is held, with
@@ -16687,9 +16654,8 @@ class Daemon:
     def _relaunch_dead(self, tid: int, what: str, out: Path, run_id: str, own: bool) -> None:
         """relaunch_dead_checks for one run folder `out`: start its checks again when checks.pid names a
         process of this boot that is gone, no checks.rc was written, tt-project did not stop them
-        (jobstop.end_checks, a stall stop) and they were not restarted on this head before. `own`: the
+        (jobstop.end_checks) and they were not restarted on this head before. `own`: the
         folder must be one of task tid's runs."""
-        from . import checkstall
         from .cli import CHECKS_RC, _checks_alive, _checks_elsewhere, _read_checks_pid
         rc = out / CHECKS_RC
         if rc.exists() or detach.pending(rc) or detach.lost(rc).exists():
@@ -16704,8 +16670,7 @@ class Daemon:
         db = self.p.db
         fp = f"checks_crash_relaunched:{out}:{head[:12]}"
         if db.one("SELECT id FROM events WHERE fingerprint=? OR fingerprint=?",
-                  (fp, f"checks_stopped:{out}:{pid}:{info.get('started')}")) \
-                or ((checkstall.marker(out, pid) or {}).get("stopped")):
+                  (fp, f"checks_stopped:{out}:{pid}:{info.get('started')}")):
             return   # restarted once on this head already, or tt-project stopped them: the probe reports it
         if own and not db.one("SELECT id FROM runs WHERE task=? AND dir=?", (tid, str(out))):
             return
