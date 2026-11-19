@@ -117,7 +117,7 @@ def test_selfwatch_never_acts_on_churn_it_cannot_attribute_or_on_a_burst_shorter
     _sw_proc(root, 120000, procs, load="158")
     snap = w.step(s, 30.0)
     assert snap["churn"] == "unattributed" and not snap["breach"] and snap["runaway"] == []
-    assert snap["churn_new"] and "unattributed churn: 4000 new processes/s" in selfwatch.line(snap, 30.0)
+    assert "unattributed churn: 4000 new processes/s" in selfwatch.line(snap, 30.0)
     # This project's run bursts past the process limit for less than the window, then drops back.
     s2 = {**s, "procs": 50}
     base, procs = _sw_world(tmp_path, 60)
@@ -202,7 +202,6 @@ def test_selfwatch_never_puts_a_storm_it_does_not_see_its_run_make_on_that_run(t
         assert snap["host"]["forks_s"] == 3000.0
         assert not snap["breach"] and snap["runaway"] == [], (k, snap["breach"])
         assert snap["tree"]["spawn_s"] < 1 and snap["churn"] == "unattributed", snap
-        assert snap["churn_new"] == (k == 1), "reported once per episode"
     line = selfwatch.line(snap, 120.0)
     assert "unattributed churn" in line and "past a limit" not in line, line
 

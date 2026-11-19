@@ -3359,7 +3359,7 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   with any process not this project's gets only the owned members), their flock locks go with them, the task
   gets one `selfwatch_runaway` event with the numbers and the user one notify. 0 turns a limit off;
   `selfwatch.act: false` only reports. Host churn at or above the spawn limit that the runs' own counted rates do not
-  explain is reported once per episode as unattributed churn, never acted on. Known gap: a run's storm of processes
+  explain is shown as unattributed churn in the status line, never acted on. Known gap: a run's storm of processes
   that each live shorter than the gap between two pid listings (about 50 ms) may be under-counted and then shows
   only as unattributed churn. The reaper sweeps right after a stop, and the stop text says how many of the run's
   locks were released. The same line also shows (selfaudit.py) a read-only ssh probe about every 2 min of each

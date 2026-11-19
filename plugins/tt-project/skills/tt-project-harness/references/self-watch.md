@@ -29,8 +29,8 @@ STOP, each of the run's process groups whose members are all this project's gets
 with any other process gets only the owned members), the kernel drops their flock locks, the task gets one
 `selfwatch_runaway` event with the reason and numbers, and the user one notify. The daemon's own processes are
 never signalled; a process with another project's or no readable environment (another user's) is never ours.
-Host churn at or above `spawn_s` that the runs' own counted rates do not explain is reported once per episode
-as unattributed churn (in the line and the daemon log), a warning, never a stop. Known gap, accepted: a run's
+Host churn at or above `spawn_s` that the runs' own counted rates do not explain is shown
+as unattributed churn in the status line, a warning, never a stop. Known gap, accepted: a run's
 storm of processes that each live shorter than the gap between two pid listings (about 50 ms) may be
 under-counted, and then shows only as unattributed churn; a storm whose processes live 2 s, or that is still
 running at a sample, is counted and stopped at the default limits.

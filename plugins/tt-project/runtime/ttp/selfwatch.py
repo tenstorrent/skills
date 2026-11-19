@@ -14,7 +14,7 @@ is at or above the spawn limit, the watch also takes BURST_N quick pid listings 
 read only for new pids); a run's rate is the higher of its new pids per second since the last sample
 and its pids first seen in the burst per second of the burst. The host's fork rate is never shared
 out to a run: host churn at or above the spawn limit that the runs' own counted rates do not explain
-is reported once as unattributed churn, a warning, never a stop. Known gap: a run's storm of
+is shown as unattributed churn in the status line, a warning, never a stop. Known gap: a run's storm of
 processes that each live shorter than the gap between two listings (BURST_S / BURST_N) may be
 under-counted, and then shows only as unattributed churn.
 A run runs away when, at every sample for WINDOW_S, one limit holds: its spawn rate is at or above
@@ -132,7 +132,6 @@ class Watch:
         self.cores = cores or os.cpu_count() or 1
         self.env: dict[tuple[int, int], tuple] = {}     # (pid, start) -> (owned, run, task)
         self.last: dict | None = None                   # previous sample: ts, forks, procs {(pid, start): ticks}
-        self.churn = False                              # unattributed churn reported in this episode
         self.since: dict[str, float] = {}               # run -> first sample past a limit
         self.acted: set[str] = set()
         self.procs: dict[int, tuple] = {}               # the last scan (see scan())
@@ -230,11 +229,10 @@ class Watch:
                 "cpu": round(sum(r["cpu"] for r in runs.values()), 2), "rss_gb": round(sum(r["rss"] for r in runs.values()) / 2**30, 2),
                 "runs": len([r for r in runs if r not in ("daemon", "other")])}
         churn = round(forks_s - mine, 1) if storm and forks_s - mine >= s["spawn_s"] else None
-        first_churn, self.churn = bool(churn and not self.churn), bool(churn)
         top = max(runs.values(), key=lambda r: (r["spawn_s"], r["procs"]), default=None)
         return {"ts": now, "host": {**h, "forks_s": None if forks_s is None else round(forks_s, 1)}, "tree": tree,
                 "top": _public(top) if top else None, "breach": [_public(r) for r in runs.values() if r["why"]],
-                "churn": "unattributed" if churn else None, "churn_s": churn, "churn_new": first_churn,
+                "churn": "unattributed" if churn else None, "churn_s": churn,
                 "runaway": runaway, "sampled": bool(procs)}
 
 
