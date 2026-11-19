@@ -86,6 +86,36 @@ def settings(cfg: dict) -> dict | None:
             "fallback": {k: str(fb.get(k) or v) for k, v in FALLBACK.items()}}
 
 
+def bounce_on(cfg: dict) -> bool:
+    """Whether a GLM run's hand-off asking for Opus or deep thinking sends its task back (`route.glm_work.bounce`,
+    default on; false keeps the old way: such a hand-off stands as the run's end, and only later runs keep core)."""
+    return _raw(cfg).get("bounce") is not False
+
+
+def bounce_reason(res, cfg: dict) -> str:
+    """Why a GLM run's hand-off `res` sends its task back to Opus, '' when it does not: `needs_opus` as on the
+    code arm (codearm.bounce_reason), or `needs_deep` on any end but done. Model-free; '' with bounce off."""
+    from . import codearm, effort
+    if not bounce_on(cfg) or not isinstance(res, dict):
+        return ""
+    if got := codearm.bounce_reason(res):
+        return got
+    if str(res.get("status") or "") != "done" and effort.wants_deep(res):
+        return f"needs deep thinking: {str(res.get(effort.NEEDS_DEEP)).strip()}"[:300]
+    return ""
+
+
+def contract() -> str:
+    """The prompt block a non-code GLM run gets while bounce_on: how to hand its task back (code arm runs get
+    codearm.contract)."""
+    return ("\n\n## Needs Opus or deep thinking (your exit)\n"
+            "You run on the cheaper model. If the task needs a choice its spec does not settle, a root cause you cannot "
+            "find, or deeper thinking than you can give, stop and hand it back: write result.json with "
+            '`{"status": "blocked", "needs_opus": "<one-line reason>", "summary": "<what you found and did>"}` '
+            "(or `needs_deep` in place of `needs_opus`). The task restarts fresh on Opus with your summary as its "
+            "previous attempt; no attempt is spent. On that exit never run `ttp push`, `git push` or publish anything.")
+
+
 def ring_gate(cfg: dict, project: str, raw: dict | None) -> dict:
     """Apply the `glm_work` release flag (rollout.py) to `cfg`, in place, and return it. The project's own
     `route.glm_work.on` in its project.json wins as written; else the flag decides (off in doubt)."""

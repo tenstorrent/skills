@@ -750,7 +750,7 @@ EXTRA_KEYS = {
     # route and its daily guard (runclass.guard_run), plus its GLM arm (codearm.py: "glm_share", "glm" {"provider",
     # "model", "effort", "harness"}, "glm_seed", "glm_cap" {"start", "min", "max"}, "glm_guard_pts", "glm_guard_min"); glm_work: the GLM work route (glmwork.py: "on", "model", "provider",
     # "effort", "harness", "holdout", "holdout_held", "seed", "kinds", "keep_urgent", "fallback" {"provider", "model", "effort"},
-    # "min_tasks", "worse_pts"); core_cheap: {class: {"model", "effort"} | false} or false. Both
+    # "min_tasks", "worse_pts", "bounce" (false: a GLM hand-off asking for Opus or deep stands, glmwork.bounce_reason)); core_cheap: {class: {"model", "effort"} | false} or false. Both
     # are account keys too (ACCOUNT_KEYS): the account's value first, the project's own over it. classes,
     # review_small_lines, review_medium_lines: the run classes' map and review sizes; host_max: host-wide (HOST_WIDE_KEYS).
     "route": {"code_sonnet", "core_cheap", "device_ab", "device_ab_shadow", "classes", "review_small_lines", "review_medium_lines", "host_max", "glm_work"},

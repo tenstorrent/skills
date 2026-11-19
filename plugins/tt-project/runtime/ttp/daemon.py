@@ -7110,6 +7110,11 @@ class Daemon:
         # provider at Opus, with no attempt spent, no route cooling and no fault counted for the arm.
         bounce = codearm.bounce_reason(_read_result(run_dir / RESULT_FILE)) \
             if on_route and routed and routed.get(codearm.KEY) and refused != "instructions_missing" else ""
+        if not bounce and on_route and routed and "glm" in (routed.get(codearm.KEY), routed.get(glmwork.KEY)) \
+                and r["task"] and r["role"] != "coordinator" and refused != "instructions_missing":
+            # A GLM run that asks for Opus or deep thinking, on either route: a fresh run on Opus with its hand-off
+            # (route.glm_work.bounce false: the old way, its hand-off stands).
+            bounce = glmwork.bounce_reason(_read_result(run_dir / RESULT_FILE), self.cfg)
         if not bounce and on_route and routed and routed.get(codearm.KEY) == "glm" and r["task"] \
                 and r["role"] != "coordinator" and refused != "instructions_missing":
             bounce = self._policy_bounce(r)   # a run on the arm that changed a policy file hands nothing off
@@ -7153,9 +7158,13 @@ class Daemon:
             # (FREE_ENDS) instead of blocking it.
             try:
                 got = _read_result(run_dir / RESULT_FILE) or {}
+                said = str(got.get("summary") or "").strip()
+                said = "" if said.lower().startswith("needs opus:") else said
                 durable_write(run_dir / RESULT_FILE, json.dumps(
                     {**got, "status": route.BOUNCE, "handoff_status": got.get("status"), "needs_opus": bounce,
-                     "summary": f"needs Opus: {bounce}"}, indent=1))
+                     # the next run (fresh, on Opus) reads the bounced run's own hand-off as its previous attempt
+                     "summary": f"needs Opus: {bounce}" + (f"; its hand-off said: {said}"[:1200] if said else "")},
+                    indent=1))
             except OSError as e:
                 log(p, f"run {r['id']}: its bounce was not recorded in {RESULT_FILE}: {e}")
             log(p, f"run {r['id']} of task {r['task']} bounced to Opus: {bounce}")
@@ -13959,6 +13968,9 @@ class Daemon:
                 on_arm = bool(routed and routed.get(codearm.KEY) and run_prov == routed["to"])
                 if on_arm:   # the arm's run may hand the task back to Opus (codearm.BOUNCE)
                     prompt += codearm.contract()
+                elif routed and routed.get(glmwork.KEY) == "glm" and run_prov == routed["to"] \
+                        and glmwork.bounce_on(self.cfg):
+                    prompt += glmwork.contract()   # so may a GLM work run (glmwork.bounce_reason)
                 on_glm = on_arm or bool(routed and routed.get(glmwork.KEY) and run_prov == routed.get("to")
                                         and not routed.get("fallback_model"))
                 if on_glm and (assist := glmassist.for_run(self.cfg)):   # ask-Opus switches, logged per run

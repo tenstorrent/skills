@@ -1333,6 +1333,13 @@ endpoint refuses (down, rate limit, over capacity, the busy wait run out) starts
 names that model (`fallback_model`); each hour's starts, fallbacks by reason and waits are kept for 48 h
 (`glm_work_hour:<hour>`). A run class route on any project now runs the same keep-core checks before it returns:
 a review, a floor run, a pin or a protected run stays on core.
+GLM bounce (`route.glm_work.bounce`, on by default; a project or account key). A GLM run on either route (the
+code arm or the work route) whose hand-off sets `needs_opus`, or `needs_deep` on any end but done, is a bounce:
+the task requeues on the core provider at Opus with no attempt spent, the next run starts fresh (no session
+resume) and reads the GLM run's own summary as its previous attempt, and later runs of the task stay on core.
+Work-route runs are told how to bounce in their prompt. `false` keeps the old way for both keys on the work
+route and for `needs_deep` on the code arm: such a hand-off stands as the run's end (the code arm's `needs_opus`
+bounce is unchanged).
 `providers.chat.rank_exclude` (a project or account list of model ids) keeps those models off every ranking, class
 ranking, stand-in list and down-model pick, e.g. a small variant that should never take work:
 `ttp config --account providers.chat.rank_exclude '["<model id>"]'`.

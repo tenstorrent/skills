@@ -463,7 +463,7 @@ def test_the_glm_prompt_names_only_commands_its_guard_allows_and_says_where_note
     text = codearm.contract()
     told, never = text.split("Never use", 1)
     named = set(re.findall(r"`ttp ([a-z][\w-]*)", told))
-    assert named >= glmguard.SUBS_ALLOWED and "note" in named
+    assert named >= glmguard.SUBS_ALLOWED - {"advise"} and "note" in named   # advise: told only when on
     for cmd in named:
         assert glmguard.cli_refusal(cmd, "show") is None, cmd
     assert "goes only to your task's own log" in told and "coordinator decides what reaches a chat" in told

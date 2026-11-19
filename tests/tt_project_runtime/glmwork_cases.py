@@ -213,3 +213,27 @@ def test_a_glm_work_start_the_endpoint_refuses_runs_on_sonnet_high_and_its_note_
     assert note[route.KEY]["fallback_model"] == "sonnet"
     assert note[runclass.CHEAP_KEY]["model"] == "sonnet" and note[runclass.CHEAP_KEY]["effort"] == "high"
     assert glmwork.hours(p.db)[0]["fallbacks"] == {"rate_limit": 1}
+
+
+def test_a_glm_hand_off_asking_for_opus_or_deep_bounces_fresh_to_opus_with_its_summary_and_the_switch_restores_the_old_way():
+    """Lever 8 (user msg #3643): a GLM run on either route whose hand-off has needs_opus, or needs_deep on any end
+    but done, is a bounce (requeued fresh on Opus, no attempt); route.glm_work.bounce false keeps the old way."""
+    import inspect
+    from ttp import daemon, glmwork
+    on, off = _gw_cfg(), _gw_cfg(bounce=False)
+    assert glmwork.bounce_on(on) and glmwork.bounce_on({}) and not glmwork.bounce_on(off)
+    deep = {"status": "failed", "needs_deep": "the race needs a trace I cannot read", "summary": "found two writers"}
+    assert glmwork.bounce_reason(deep, on) == "needs deep thinking: the race needs a trace I cannot read"
+    assert glmwork.bounce_reason({**deep, "status": "done"}, on) == ""   # done work stands
+    opus = {"status": "blocked", "needs_opus": "the spec leaves the default open", "summary": "read both"}
+    assert glmwork.bounce_reason(opus, on) == "the spec leaves the default open"
+    assert glmwork.bounce_reason({"status": "blocked", "summary": "waiting on a lock"}, on) == ""
+    assert glmwork.bounce_reason(deep, off) == "" and glmwork.bounce_reason(opus, off) == ""
+    assert glmwork.bounce_reason(None, on) == "" and glmwork.bounce_reason("x", on) == ""
+    c = glmwork.contract()
+    assert "needs_opus" in c and "needs_deep" in c and "restarts fresh on Opus" in c and "ttp push" in c
+    fin = inspect.getsource(daemon.Daemon.finish_run)
+    assert 'glmwork.bounce_reason(_read_result(run_dir / RESULT_FILE), self.cfg)' in fin
+    assert '"glm" in (routed.get(codearm.KEY), routed.get(glmwork.KEY))' in fin
+    assert "its hand-off said: " in fin   # the bounced run's own summary reaches the fresh run's prompt
+    assert "glmwork.contract()" in inspect.getsource(daemon.Daemon)
