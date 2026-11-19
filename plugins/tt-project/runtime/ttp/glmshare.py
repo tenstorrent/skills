@@ -30,7 +30,7 @@ from __future__ import annotations
 import bisect
 import json
 
-from . import route
+from . import glmassist, route
 
 ROLES = ("coordinator", "plan", "review", "code", "work", "question", "harness", "device", "other")
 KINDS = ("plan", "review", "code", "work", "question", "harness")
@@ -222,10 +222,12 @@ def report(p, since: float, now: float) -> dict:
         v = roles[role_of(r, tasks.get(r["task"]), cfg, dev)]
         h = max(0.0, min(float(r["ended"] or now), now) - float(r["started"] or now)) / 3600
         g = on_glm(r["provider"], r["model"], r["note"])
+        # A GLM run's ask-Opus minutes (glmassist.py) count on the Claude side.
+        adv = min(h, glmassist.hours(p.runs / str(r["id"]))) if g and '"glm_assist"' in (r["note"] or "") else 0.0
         v["runs"] += 1
         v["glm_runs"] += g
         v["hours"] += h
-        v["glm_hours"] += h * g
+        v["glm_hours"] += (h - adv) * g
     total = {k: sum(v[k] for v in roles.values()) for k in ("runs", "glm_runs", "hours", "glm_hours")}
     for v in (*roles.values(), total):
         v["hours"], v["glm_hours"] = round(v["hours"], 3), round(v["glm_hours"], 3)

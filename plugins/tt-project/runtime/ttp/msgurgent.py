@@ -31,7 +31,7 @@ import re
 import time
 from pathlib import Path
 
-from . import timefmt
+from . import coordroute, timefmt   # coordroute: a lane or shadow turn reads no messages
 
 KV = "urgent_msgs"             # {message id: record}: the deadlines, kept on disk
 CURSOR = "urgent_msg_cursor"   # the last inbound message id looked at
@@ -253,7 +253,7 @@ def deliver_running(p, text: str, key: str) -> bool:
     """Append `text` to the steer.md of a running coordinator turn (its hook hands it over after the next
     tool call); True when a turn is running to take it."""
     from .coordinator import _append_update
-    r = p.db.one("SELECT dir FROM runs WHERE role='coordinator' AND status='running' ORDER BY id DESC LIMIT 1")
+    r = p.db.one("SELECT dir FROM runs WHERE role='coordinator' AND status='running' AND " + coordroute.OWN_SQL + " ORDER BY id DESC LIMIT 1")
     if not r or not r["dir"]:
         return False
     _append_update(Path(r["dir"]) / "steer.md", text, key)
@@ -278,7 +278,7 @@ def first(db, cfg: dict | None, msgs: list) -> tuple[list, set]:
 
 def _running(db):
     return db.one("SELECT id, dir, provider, started, note FROM runs WHERE role='coordinator' AND "
-                  "status='running' ORDER BY id DESC LIMIT 1")
+                  "status='running' AND " + coordroute.OWN_SQL + " ORDER BY id DESC LIMIT 1")
 
 
 def _in_turn(run, mid: int) -> bool:

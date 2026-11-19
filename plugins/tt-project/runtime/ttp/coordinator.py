@@ -1952,6 +1952,9 @@ NEEDS_USER.update(dict.fromkeys(SANDBOX_KEYS, "restriction"))
 # restrictions.no_internet also turns sandboxing on (Codex workspace-write and read-only, Cursor --sandbox) and
 # is a Restriction: a run changes it in neither direction, as clearing it loosens one (not SAFE_WHEN_OFF).
 NEEDS_USER["restrictions.no_internet"] = "restriction"
+# Routine coordinator wakes on the chat model (coordroute.py) start only on the user's own word (`ttp config` in
+# their shell); turning them off ("" or false) is anyone's.
+NEEDS_USER["coordinator.routine.mode"] = "restriction"
 
 
 def sandbox_on(value) -> bool:
@@ -1970,7 +1973,7 @@ NEEDS_USER["coordinator.session.tools"] = "restriction"   # read_only, its safe 
 SAFE_WHEN_OFF = {*SANDBOX_KEYS, "coordinator.session.tools", relay.AGENT_KEY, "delivery.code_tasks_may_push", "budget.reset_credits_auto", "delivery.backup_remote", "delivery.fast_forward_also",
                  "delivery.mirror_remotes",
                  "delivery.allow_protected_push_branch", "delivery.own_push", "delivery.rebase_replace",
-                 "delivery.never_force"}
+                 "delivery.never_force", "coordinator.routine.mode"}
 # The relay.HELD class of each NEEDS_USER setting the owner's own agent cannot set (relay.agent_orders):
 # spend and access are hard gates, the merge list speaks as the owner, the rest change what may land on or
 # overwrite a branch other people use. The agent-orders trust itself is the owner's to turn on.

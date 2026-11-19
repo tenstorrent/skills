@@ -1337,6 +1337,32 @@ a review, a floor run, a pin or a protected run stays on core.
 ranking, stand-in list and down-model pick, e.g. a small variant that should never take work:
 `ttp config --account providers.chat.rank_exclude '["<model id>"]'`.
 
+Routine coordinator lane (`coordroute.py`, off by default). `coordinator.routine` (`{"mode": "off", "provider":
+"chat", "model": "<chat model>", "effort": "max", "heartbeat_h": 4, "max_turns": 12}`; `model` falls back to
+`route.glm_work.model`) sends routine coordinator wakes to the chat model. A model-free, conservative check sends a
+wake to the coordinator's own session on any user or relayed message, ask or answer, failed review, plan hand-off,
+must-act item tied to an order or promise, urgent or high-severity item, charter or Restrictions change, its first,
+heartbeat or compaction wake, or any event kind it cannot place. `mode` is set only from the user's own terminal
+(`ttp config <project> coordinator.routine.mode shadow|on|off`); the `glm_coord` release flag may only turn shadow
+on. In `shadow` every wake stays the coordinator's own and a routine one also runs a lane turn on the chat model
+whose actions are only recorded (`state/coord-shadow/<run>.json`); `ttp stats <project> --coord-routine` compares
+the two (same actions, would escalate, refused, cost). In `on` a routine wake runs as a stateless lane turn under
+the GLM run guard: only `task_add`, `task_update`, `look`, `sweep`, `noop` and owner-only `obligation` apply (no
+pins, deep tier, cancels, wakes, replies, notifies, asks, charter, memory or config changes). Any other action, an
+`escalate:` noop, a guard hit or a failed turn applies nothing and hands the wake, with its notes, to the
+coordinator's own session. The coordinator's next own wake lists every lane turn since its last one with each
+action's why. The lane suspends itself when it leaves a must-act item or its escalations or refused actions run
+high; `ttp stats <project> --coord-routine --resume-lane` (the user's terminal) lifts it.
+
+GLM worker escalation switches (`glmassist.py`, both off by default, for runs on the GLM work route or code arm).
+`route.glm_work.plan_first: true`: the run's first step is `ttp advise --plan "<the task>"`, a read-only Opus call
+that returns the plan it follows; `ttp push` refuses on that run until a plan is on record. `route.glm_work.advisor`
+(`true`, or `{"on": true, "max_calls": 3, "max_minutes": 10, "model": "opus", "effort": "high", "max_usd": 3}`):
+the run may ask Opus a read-only question with `ttp advise "<question>"` within those limits. Each call runs the
+Claude CLI with read-only tools in the run's folder, no session; its cost is booked on the Claude side and its
+minutes come off the run's GLM hours. The run note records the switches (`glm_assist`) and each call is logged in
+the run folder (`advisor.jsonl`).
+
 A device A/B compares two Claude models on device tasks; it is off by default. `route.device_ab` (a project
 and account key, the project's value over the account's) takes `{"projects": [...], "arms": {"sonnet":
 {"model": "sonnet", "effort": "high"}, "opus": {"model": "opus", "effort": "high"}}, "share": 0.5, "days": 3,

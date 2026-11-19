@@ -53,6 +53,9 @@ FLAGS: dict[str, dict[str, Any]] = {
     # The project's routed work on GLM (glmwork.py); `waves`: it may run at auto, judged by glmshare.judge.
     "glm_work": {"key": "route.glm_work.on", "area": "route", "code": _code("glmwork.py", "codearm.py", "daemon.py"),
                  "waves": True},
+    # Routine coordinator wakes on the chat model (coordroute.py): a ring runs them in shadow only (a read-only
+    # lane turn beside the coordinator's own, nothing applied); live mode is the project's own setting.
+    "glm_coord": {"key": "coordinator.routine.mode", "area": "coordinator", "code": _code("coordroute.py", "daemon.py")},
     "eta_history": {"key": "eta.history", "area": "eta", "shadow": True,
                     "code": _code("etaledger.py", "costlevers.py", "cli.py")},
     "device_prewarm": {"key": "device.prewarm", "area": "device", "code": ()},

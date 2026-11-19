@@ -37,10 +37,11 @@ import uuid
 from pathlib import Path
 
 from . import runtimeload   # first of its own: its LOADED_AT is when the daemon imported its code
-from . import blindreview
+from . import blindreview, glmassist
 from . import rolerestore
 from . import codearm
 from . import glmwork
+from . import coordroute
 from . import glmguard
 from . import glmharness, policyfiles
 from . import deviceab
@@ -1907,7 +1908,8 @@ class Daemon:
         established project starts no coordinator turn or worker run (both would route on the
         defaults) and says so in one alert, which clears once the file reads again."""
         raw, status = self.p.read_config()
-        self.cfg = glmwork.ring_gate(codearm.ring_gate(layered(raw), self.p.name, raw), self.p.name, raw)   # release flags
+        self.cfg = coordroute.ring_gate(glmwork.ring_gate(codearm.ring_gate(layered(raw), self.p.name, raw),
+                                                          self.p.name, raw), self.p.name, raw)   # release flags
         self._raw_cfg = raw   # which tiers the project sets itself (cursortiers.apply)
         # The process sandbox for checks, off unless the project turns it on: this daemon's own check
         # runs read it here, its workers from their environment (start_run).
@@ -3912,11 +3914,13 @@ class Daemon:
             # one for workers) does not move the coordinator with it. Read from the config as it is now.
             route = coord.coordinator_route(cfg, provider)
             model, effort = route["model"], route["effort"]
+            if lane := coordroute.route_of(note):   # a routine lane or shadow turn: the chat model (coordroute.py)
+                model, effort = lane["model"] or model, lane["effort"] or effort
             prompt_bytes = sum(len(text.encode("utf-8")) for text in (prompt, system or "", context or "", append_system or ""))
             timeout_s = coordlimits.turn_timeout(self.cfg, provider, effort, prompt_bytes)
             note = {**(note or {}), "turn": {"prompt_bytes": prompt_bytes, "provider": provider,
                     "model": model, "effort": effort, "timeout_s": timeout_s}}
-            if coordtools.session_on(self.cfg, provider):
+            if coordtools.session_on(self.cfg, provider) and not coordroute.lane_of(note):
                 # A session wake stops at its dollar or time limit, whichever comes first (coordtools),
                 # the dollar one sized to the session's measured wakes within the dollar caps (seedcap).
                 measured = None
@@ -4016,7 +4020,8 @@ class Daemon:
                                       sandboxstate.state(self.p, self.cfg, sandboxstate.CHECKS_KEY)[2])
         if read_only:   # a decision-only turn, unsandboxed unless opted in: its output goes through the action gates
             argv = prov.read_only_args(argv, on=fence_on, restrictions=restrictions)
-        session_on = role == "coordinator" and not resume   # every coordinator wake is a session wake
+        # Every coordinator wake is a session wake, but a routine lane or shadow turn (coordroute.py): stateless.
+        session_on = role == "coordinator" and not resume and not coordroute.lane_of(note)
         session_mode = ""   # this wake's coordsession.decide()
         if session_on:   # first: a session wake's cache lifetime follows the session's own writes
             sp = session_prompt or {}
@@ -4455,7 +4460,8 @@ class Daemon:
                             prompt = append_system + "\n\n" + prompt
             argv = _before_stdin(argv, resume_extra)
             (run_dir / "prompt.md").write_text(prompt)
-            if glmguard.env_for(note):   # a run on the code arm's GLM side: guarded even where its variable is unset
+            glmassist.arm(run_dir, (note or {}).get(glmassist.KEY))   # its ask-Opus limits, when switched on
+            if glmguard.env_for(note) or coordroute.guard_env(note):   # a GLM run: guarded even where its variable is unset
                 glmguard.mark(run_dir)
             if task and role in ctxfork.ROLES:   # restated after each compaction (rolerestore.py)
                 rolerestore.write(run_dir, role, task, self.p.name)
@@ -4470,6 +4476,7 @@ class Daemon:
                    "TTP_RUN_ID": str(run_id), **task_env(task["id"] if task else ""), "PYTHONPATH": runtime_dir,
                    **blindreview.env(task),   # a blind review's `ttp` masks the model (every provider)
                    **glmguard.env_for(note),  # a run on the code arm's GLM side runs under glmguard (every provider)
+                   **coordroute.guard_env(note),   # so does a routine coordinator lane or shadow turn
                    **({"TTP_LEASE_EPOCH": str(self._lease.epoch)} if self._lease else {}),
                    "TTP_PYTHON": sys.executable,   # `ttp` runs under this, not the venv's python3
                    "TTP_SANDBOX_CHECKS": os.environ.get("TTP_SANDBOX_CHECKS", "0"),   # sandbox.opted_in
@@ -5568,7 +5575,9 @@ class Daemon:
                     if r["task"]:
                         db.x("UPDATE tasks SET spent_usd=COALESCE(spent_usd,0)+? WHERE id=?", (cost, r["task"]))
                         batchrun.book(db, r["task"], cost)
-                if r["role"] == "coordinator":
+                if r["role"] == "coordinator" and coordroute.lane_of_row(r):
+                    log(self.p, f"routine lane turn {r['id']} abandoned: {why}")   # no coordinator backoff
+                elif r["role"] == "coordinator":
                     self._coordinator_failed(why)
                 elif r["task"] and (db.task(r["task"]) or {}).get("status") == "running":
                     db.update_task(r["task"], status="failed", blocked_reason=why)
@@ -7525,6 +7534,18 @@ class Daemon:
                         f"{len(early['actions'])} in its newest earlier message that held them")
             out = early
         actions = (out or {}).get("actions")
+        lane = coordroute.lane_of(note)
+        try:
+            if not lane and coordroute.shadow_path(self.p.state, r["id"]).exists():   # a shadowed turn's side
+                coordroute.shadow_side(self.p.state, r["id"], "opus", actions, status,
+                                       float(getattr(usage, "cost_usd", 0) or 0),
+                                       max(0.0, time.time() - float(r.get("started") or time.time())))
+            if lane and self._finish_lane(r, usage, status, note, lane, actions):
+                return
+        except Exception:   # a lane turn that cannot be judged applies nothing
+            log(self.p, "routine lane finish failed: " + traceback.format_exc().replace("\n", " | ")[:1500])
+            if lane:
+                return
         lost_to = "sleep" if note.get("lost_to_sleep") else "network" if note.get("lost_to_network") else \
             "reboot" if note.get("lost_to_reboot") and status == "lost" else ""
         if (status == "lost" and not r["dir"]) or status == "shutdown" or lost_to:
@@ -7577,9 +7598,11 @@ class Daemon:
         evs = note.get("events", [])
         if evs:
             db.x(f"UPDATE events SET status='handled' WHERE id IN ({','.join('?' * len(evs))})", evs)
+        left: list = []
         try:
             # A must-act item no applied action touched wakes once more, then goes in its chat's digest.
             for key, text in mustact.settle(self.p, evs, actions, applied):
+                left.append(key)
                 self.observe("daemon:must-act", text, "normal", whole=True, key=key)
         except Exception:   # bookkeeping: the turn is settled either way
             log(self.p, "must-act settle failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
@@ -7591,6 +7614,12 @@ class Daemon:
             self._stale_turn_done(evs, r.get("id"))
         except Exception:   # bookkeeping: without it the next wait_stale raises a turn as before
             log(self.p, "wait_stale turn record failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
+        if lane:
+            try:   # the coordinator's next digest reads it back (coordroute.digest_lines)
+                coordroute.record_turn(db, r["id"], note, actions, applied, [], "", problems=problems,
+                                       left_must=len(left), summary=str((out or {}).get("summary") or ""))
+            except Exception:
+                log(self.p, "routine lane turn record failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
         decided = len(_decisions(actions))
         try:   # the per-wake record the daily review measures self-changes by (selfimprove)
             from . import selfimprove
@@ -12888,8 +12917,8 @@ class Daemon:
         if self.net_held(core) and not self._net_may_probe(core):
             return   # its API host does not resolve: the turn that gets through folds in what waits
         db, c = self.p.db, self.cfg["coordinator"]
-        if db.one("SELECT id FROM runs WHERE role='coordinator' AND status='running'"):
-            return
+        if db.one("SELECT id FROM runs WHERE role='coordinator' AND status='running' AND " + coordroute.NOT_SHADOW_SQL):
+            return   # a shadow turn (coordroute.py) holds no wake back
         now = time.time()
         if now < float(db.kv("coordinator_backoff_until", 0)):
             return
@@ -13138,10 +13167,31 @@ class Daemon:
             parts += seen_looks
             lead_part = [("lead", leadmode.digest(db, lead))] if lead else []
             parts += lead_part
+            lane, routine, routine_why = coordroute.settings(self.cfg), False, []
+            if lane["mode"] != "off":   # a routine wake may go to the routine lane (coordroute.py)
+                try:
+                    routine, routine_why = coordroute.classify(
+                        db, self.cfg, msgs=msgs, evs=evs, triggers=triggers, due=due, rerun=rerun,
+                        urgent=urgent_msgs, lead=lead, sweep_event=sweep_event, hot=hot, must=must, parts=parts, now=now)
+                except Exception as e:   # what it cannot place goes to the coordinator's own session
+                    routine, routine_why = False, [f"classifier failed: {type(e).__name__}"]
+                    log(self.p, "routine lane classifier failed: " + traceback.format_exc().replace("\n", " | ")[:1500])
+            if routine and lane["mode"] == "on" and self._start_lane(prompt_parts=parts, evs=evs, budget=budget, c=c,
+                                                                     lane=lane, fire=fire, why=routine_why):
+                db.set_kv("last_coordinator_turn", now)
+                looks.settle(db, [x["id"] for x in fire], "woken", None, now)
+                quietgate.started(db)
+                bursthold.started(db, evs, None, now)
+                db.set_kv("idle_wake", wake)
+                return   # the digest stays unacknowledged: the coordinator's next wake still sees it whole
+            # What the routine lane did since the coordinator's last wake, each action with its why.
+            read_back = coordroute.digest_lines(db, lambda t: timefmt.short(t, self.p))
+            parts += [("routine_lane", read_back)] if read_back else []
             prompt = "\n".join(text for _, text in parts)
             # A session wake may send only what changed.
             full = (([(mustact.SECTION, must)] if must else []) + coord.split_cached(whole)[1]
-                    + ([(slowcomplaint.SECTION, speed)] if speed else []) + seen_looks + lead_part)
+                    + ([(slowcomplaint.SECTION, speed)] if speed else []) + seen_looks + lead_part
+                    + ([("routine_lane", read_back)] if read_back else []))
             session_digest = {"parts": parts, "full": full, "seen": coordsession.fingerprint(baseline),
                               "shown": coordsession.fingerprint(shown)}
             head, context = coord.prompt_parts(self.p)
@@ -13171,6 +13221,12 @@ class Daemon:
             self._coordinator_failed(f"could not start: {type(e).__name__}: {e}"[:250])
             return
         db.set_kv("last_coordinator_turn", now)
+        try:   # the lane's read-back and any escalation are the coordinator's own session's now
+            coordroute.opus_started(db, rid, now)
+            if routine and lane["mode"] == "shadow":
+                self._start_shadow(rid, prompt_parts=parts, budget=budget, c=c, lane=lane, why=routine_why)
+        except Exception:   # bookkeeping: the coordinator's wake runs either way
+            log(self.p, "routine lane record failed: " + traceback.format_exc().replace("\n", " | ")[:1500])
         if lead:
             leadmode.started(db, lead, now)
         looks.settle(db, [x["id"] for x in fire], "woken", rid, now)
@@ -13181,6 +13237,77 @@ class Daemon:
         db.set_kv("idle_wake", wake)
         if logged_out:
             db.set_kv(f"auth_probe:{provider}", now)
+
+    def _lane_prompt(self, prompt_parts: list) -> tuple[str, str, str]:
+        """(prompt, system, context) of a routine lane or shadow turn: the digest without the read-back."""
+        head, context = coord.prompt_parts(self.p)
+        prompt = "\n".join(text for name, text in prompt_parts if name != "routine_lane")
+        return prompt, head + "\n\n" + coordroute.LANE_PROMPT, context
+
+    def _start_lane(self, *, prompt_parts: list, evs: list, budget, c: dict, lane: dict, fire: list,
+                    why: list) -> int | None:
+        """Starts a live routine lane turn (coordroute.py) on the lane's provider and model; None when it could
+        not start, so the coordinator's own session takes the wake."""
+        db = self.p.db
+        try:
+            prompt, system, context = self._lane_prompt(prompt_parts)
+            rid = self.start_run("coordinator", prompt, lane["provider"], c.get("tier", "light"), str(self.p.base),
+                                 read_only=True, schema=coordsession.schema(), system=system, context=context,
+                                 budget_usd=budget,
+                                 note={coordroute.LANE: "routine", "route": {"model": lane["model"], "effort": lane["effort"]},
+                                       "messages": [], "events": [e["id"] for e in evs],
+                                       "event_kinds": [e["kind"] for e in evs], "budget_usd": budget,
+                                       "default_chat": None, "triggers": [], "routine_why": why,
+                                       **({"looks": [x["id"] for x in fire]} if fire else {})})
+            log(self.p, f"run {rid}: routine lane turn on {lane['provider']} ({lane['model']})")
+            return rid
+        except Exception as e:   # the coordinator's own session takes it, the lane cooling off
+            log(self.p, "routine lane start failed: " + traceback.format_exc().replace("\n", " | ")[:1500])
+            st = coordroute.state(db)
+            st["failed_at"] = time.time()
+            coordroute._save(db, st)
+            return None
+
+    def _start_shadow(self, opus_run: int, *, prompt_parts: list, budget, c: dict, lane: dict, why: list) -> None:
+        """Starts a shadow lane turn beside coordinator turn `opus_run`: its answer is compared, never applied."""
+        if self.p.db.one("SELECT id FROM runs WHERE role='coordinator' AND status='running' AND NOT ("
+                         + coordroute.NOT_SHADOW_SQL + ")"):
+            return   # one shadow at a time
+        prompt, system, context = self._lane_prompt(prompt_parts)
+        srid = self.start_run("coordinator", prompt, lane["provider"], c.get("tier", "light"), str(self.p.base),
+                              read_only=True, schema=coordsession.schema(), system=system, context=context,
+                              budget_usd=budget,
+                              note={coordroute.SHADOW: {"of": opus_run},
+                                    "route": {"model": lane["model"], "effort": lane["effort"]},
+                                    "messages": [], "events": [], "default_chat": None})
+        coordroute.shadow_started(self.p.state, opus_run, srid, why)
+
+    def _finish_lane(self, r: dict, usage, status: str, note: dict, lane: str, actions) -> bool:
+        """A shadow turn's answer is recorded, never applied; a live lane turn that failed, escalated or
+        tried an action off its allow-list applies nothing and leaves its events for the coordinator's own
+        session (coordroute.py). True when the turn is settled here."""
+        db = self.p.db
+        cost = float(getattr(usage, "cost_usd", 0) or 0)
+        dur = max(0.0, time.time() - float(r.get("started") or time.time()))
+        if lane == "shadow":
+            coordroute.shadow_side(self.p.state, (note.get(coordroute.SHADOW) or {}).get("of"), "glm", actions,
+                                   status, cost, dur)
+            return True
+        if status in ("lost", "shutdown") or note.get("lost_to_sleep") or note.get("lost_to_network"):
+            return True   # its events stay queued for the next wake
+        guard = glmguard.hit_reason(self._run_dir(r))
+        summary = ""
+        if not isinstance(actions, list) or status != "ok" or guard:
+            failed = f"guard: {guard}" if guard else f"{status} {str(getattr(usage, 'error', '') or '')[:150]}"
+            coordroute.record_turn(db, r["id"], note, actions, [], [], "", failed=failed)
+            log(self.p, f"routine lane turn {r['id']} failed ({failed[:200]}): the coordinator's own session takes it")
+            return True
+        ok, refused, esc = coordroute.filter_actions(actions)
+        if refused or esc:
+            coordroute.record_turn(db, r["id"], note, actions, [], refused, esc, summary=summary)
+            log(self.p, f"routine lane turn {r['id']} escalated: {(esc or '; '.join(w for _, w in refused))[:200]}")
+            return True
+        return False
 
     def _relay_hold(self, msgs: list, now: float) -> bool:
         """Unhandled relayed messages with no order or question wait up to coordinator.relay_window_s after
@@ -13824,6 +13951,11 @@ class Daemon:
                 on_arm = bool(routed and routed.get(codearm.KEY) and run_prov == routed["to"])
                 if on_arm:   # the arm's run may hand the task back to Opus (codearm.BOUNCE)
                     prompt += codearm.contract()
+                on_glm = on_arm or bool(routed and routed.get(glmwork.KEY) and run_prov == routed.get("to")
+                                        and not routed.get("fallback_model"))
+                if on_glm and (assist := glmassist.for_run(self.cfg)):   # ask-Opus switches, logged per run
+                    note[glmassist.KEY] = assist
+                    prompt += glmassist.prompt_lines(assist)
                 members = [] if note.get("wake") or note.get("resumes") or on_arm else \
                     self._batch_members(task, ready, batched | set(fate), live)
                 if members:

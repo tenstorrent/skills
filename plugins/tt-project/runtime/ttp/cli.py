@@ -2237,6 +2237,16 @@ def cmd_stats(a) -> None:
         s = {p.name: readywait.report(p.db.q, since, until, p.state)}
         print(json.dumps(s, indent=1) if a.json else readywait.text(s))
         return
+    if getattr(a, "coord_routine", False):
+        from . import coordroute
+        if getattr(a, "resume_lane", False):
+            if os.environ.get("TTP_RUN_ID"):   # the user's word: never a run's own
+                die("a suspended routine lane resumes on the user's word: run this from your own terminal")
+            print("routine lane resumed" if coordroute.resume(p.db) else "routine lane was not suspended")
+            return
+        rep = coordroute.report(p.db, p.state, a.days)
+        print(json.dumps(rep, indent=1) if a.json else coordroute.text(rep, p.name))
+        return
     if getattr(a, "glm_share", False):
         from . import glmshare
         tz = timefmt.home(p)
@@ -3560,6 +3570,9 @@ def _cmd_push(a, push) -> None:
         if why := codearm.handed_back(os.environ["TTP_RUN_DIR"]):
             die(f"ttp push: this run handed its task back to Opus (needs_opus: {why}): it pushes and publishes "
                 f"nothing; its commits stay local", push.REFUSED)
+        from . import glmassist   # a plan-first GLM run pushes once its Opus plan is on record
+        if why := glmassist.push_refusal(os.environ["TTP_RUN_DIR"]):
+            die(f"ttp push: {why}", push.REFUSED)
     if coord and (why := push.approved_landing(p, Path.cwd())[1]):   # only a head a review approved
         die(f"ttp push: {coordtools.PUSH_REFUSAL}: {why}")
     if a.queue:
@@ -12639,6 +12652,25 @@ def _pause_by(p: Project) -> str:
     return "coordinator" if _coord_turn(p) is not None else "worker"
 
 
+def cmd_advise(a) -> None:
+    """Ask Opus from a GLM-arm run (glmassist.py): a read-only one-shot call in the run's own folder,
+    within the run's limits; `--plan` asks for the plan a plan-first run follows. Prints the answer."""
+    from . import glmassist
+    run_dir = os.environ.get("TTP_RUN_DIR") or ""
+    if not run_dir:
+        die("ttp advise: runs only inside a GLM-arm run")
+    p = Project(os.environ["TTP_PROJECT"]) if os.environ.get("TTP_PROJECT") else None
+    task = os.environ.get("TTP_TASK") or ""
+    try:
+        row = glmassist.ask(run_dir, " ".join(a.question), cwd=os.getcwd(), plan=a.plan,
+                            db=p.db if p and p.exists() else None, source=f"advisor:{task or 'run'}")
+    except ValueError as e:
+        die(f"ttp advise: {e}")
+    if not row.get("ok"):
+        die(f"ttp advise: the call failed ({row.get('error') or 'no answer'}); decide yourself or hand the task back")
+    print(row["answer"])
+
+
 def cmd_alive(a) -> None:
     """`ttp alive <name>`: a running daemon is no proof the project works (its CLI may be logged out)."""
     from . import projmove, projpause
@@ -16023,7 +16055,7 @@ COMMAND_GROUPS = (
     ("everyday", ("new", "connect", "web", "status", "say", "listen", "list", "overview", "find", "task",
                   "memory", "obligation", "config", "pause", "resume", "drain", "alerts", "rollout", "issues", "mute",
                   "quarantine", "machines", "runs", "logs", "doctor")),
-    ("inside a run", ("note", "steer", "urgent-reply", "notify", "progress", "checks", "checks-shard", "checks-yield", "lock",
+    ("inside a run", ("note", "advise", "steer", "urgent-reply", "notify", "progress", "checks", "checks-shard", "checks-yield", "lock",
                       "occupancy", "host-run", "detach", "devq", "push", "install-check", "land", "express", "clip", "sandbox", "pool-wait", "pool-admit",
                       "pool-shard", "skill", "killscan", "svcscan", "leftover-procs", "said", "hostcheck", "paths")),
     ("probes (retry_when, start_when)", ("landed", "alive", "eta", "ci", "ack-wait", "ssh-preflight", "broker-released",
@@ -16504,6 +16536,11 @@ def main(argv: list[str] | None = None) -> None:
                         "chat provider's GLM model, then per arm (glm, claude) review first-pass rate, fix rounds, "
                         "failed and reopened tasks, bounces, device incidents and tasks done per day, Claude $/day "
                         "and user corrections (--since/--until, else --days; --all or --projects: every project)")
+    s.add_argument("--coord-routine", action="store_true",
+                   help="the coordinator's routine lane instead (coordroute.py): shadow pairs compared (agreement, "
+                        "escalations, refusals, cost per side) and live lane turns over the last --days")
+    s.add_argument("--resume-lane", action="store_true",
+                   help="with --coord-routine: lift the routine lane's own suspension (from your own terminal)")
     s.add_argument("--babysit", action="store_true",
                    help="the chat watcher instead: decisions it settled and fallbacks, per purpose, model and hour "
                         "(read-only; --since/--until, else the last --days)")
@@ -17672,6 +17709,11 @@ def main(argv: list[str] | None = None) -> None:
                    help="check: whether the lease store answers; show: this machine's last view")
     s.add_argument("name", nargs="?", help="the project (default: the one here)")
     s.set_defaults(fn=cmd_lease)
+    s = sub.add_parser("advise", help="inside a GLM-arm run with route.glm_work.advisor or plan_first on: ask Opus a "
+                                       "read-only question (--plan: the plan to follow), within the run's limits")
+    s.add_argument("question", nargs="+", help="the question, or with --plan the task in your own words")
+    s.add_argument("--plan", action="store_true", help="ask for the plan a plan-first run follows")
+    s.set_defaults(fn=cmd_advise)
     s = sub.add_parser("alive", help="whether the project really works now (for hand-back and takeover checks): exit 0 "
                                       "live; 1 not: a provider logged out, paused, or no successful model run lately")
     s.add_argument("name", help="the project")

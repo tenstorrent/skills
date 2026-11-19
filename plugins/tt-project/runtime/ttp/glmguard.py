@@ -41,7 +41,7 @@ KEPT = "result.pre-guard.json"   # a hand-off the run wrote before the guard rep
 SUBS_ALLOWED = frozenset({
     "push", "checks", "checks-shard", "checks-yield", "pool-wait", "pool-admit", "pool-shard", "install-check",
     "clip", "hours", "alive", "landed", "lock", "detach", "eta", "list", "find", "overview", "said", "runs", "task",
-    "paths", "note"})
+    "paths", "note", "advise"})   # advise: refused unless the run's glmassist switches are on
 TASK_ACTIONS = frozenset({"show", "list"})
 # `ttp note` flags that send a note on, or change a record beyond the run's own log: refused on the GLM arm.
 NOTE_ROUTES = ("--to", "--reply", "--urgent", "--severity", "--confirms", "--status")

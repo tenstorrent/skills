@@ -1092,7 +1092,8 @@ def _reown(p, o: dict, now: float, raised: list[str]) -> bool:
     first = (o.get("answered") or {}).get("episode") != o["episode"]
     if first:   # first seen answered: only a turn already running then can have answered it
         o["answered"] = {"episode": o["episode"], "at": now}
-    if db.one("SELECT id FROM runs WHERE role='coordinator' AND status='running' AND started<=?",
+    from .coordroute import OWN_SQL   # a lane or shadow turn answers no order
+    if db.one("SELECT id FROM runs WHERE role='coordinator' AND status='running' AND started<=? AND " + OWN_SQL,
               (o["answered"]["at"],)):
         return first   # the turn that answered it may still attach an owner
     label = f"{REOWN_LABEL}{oid}"
