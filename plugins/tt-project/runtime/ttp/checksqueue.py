@@ -25,6 +25,8 @@ import sys
 import time
 from pathlib import Path
 
+from .util import read_dict
+
 PARK = "checks-slot.park"   # in the run dir: {pid, started, who, why, until, at}
 LOG = "checks-queue.jsonl"   # in the run dir: one line per park, cancel and resume
 EVENT = "checks_queue"
@@ -44,18 +46,10 @@ class Parked(Exception):
     """Raised in a checks wait whose run was parked: the wait lets go of all it holds."""
 
 
-def _json(path: Path) -> dict:
-    try:
-        d = json.loads(path.read_text())
-    except (OSError, ValueError):
-        return {}
-    return d if isinstance(d, dict) else {}
-
-
 def request(run_dir: Path) -> dict:
     """The park request for this process (PARK naming its pid and start), else {}."""
     from .runner import proc_start
-    req = _json(Path(run_dir) / PARK)
+    req = read_dict(Path(run_dir) / PARK)
     if req.get("pid") != os.getpid() or req.get("started") != proc_start(os.getpid()):
         return {}
     return req
@@ -153,7 +147,7 @@ def waiter(run_dir: Path) -> dict:
     from .cli import CHECKS_SLOT_WAIT, _checks_alive, _read_checks_pid
     from .runner import proc_start
     info = _read_checks_pid(run_dir)
-    wait = _json(Path(run_dir) / CHECKS_SLOT_WAIT)
+    wait = read_dict(Path(run_dir) / CHECKS_SLOT_WAIT)
     if not _checks_alive(info):
         pid = wait.get("pid")
         started = proc_start(pid) if isinstance(pid, int) else None
@@ -223,7 +217,7 @@ def act(p, d: Path, action: str, who: str, why: str, until: str) -> tuple[int, s
     kind, task = _kind(p, d)
     info = waiter(d)
     if action == "resume":
-        req = _json(d / PARK)
+        req = read_dict(d / PARK)
         if not req:
             return 3, f"run {d.name}: not parked"
         (d / PARK).unlink(missing_ok=True)

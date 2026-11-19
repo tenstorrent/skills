@@ -35,6 +35,8 @@ import json
 import time
 from typing import Any
 
+from .util import task_labels
+
 LABEL = "outage:"   # task label: outage:<alias>:<condition>@<episode start>
 DUE = "due:"        # task label: due:<epoch>
 KIND = "machine_outage_task"          # the page that creates the task; the inbox note's `outage` record
@@ -146,17 +148,9 @@ def ensure(db, rec: Any, where=None, now: float | None = None) -> int | None:
                            kind="work", priority=1, origin="daemon", labels=[rec["label"], f"{DUE}{int(rec['due'])}"])
 
 
-def _labels(t: dict) -> list[str]:
-    try:
-        got = json.loads(t.get("labels") or "[]")
-    except ValueError:
-        return []
-    return [str(x) for x in got] if isinstance(got, list) else []
-
-
 def info(t: dict) -> dict | None:
     """{label, alias, condition, first, due} of an outage task, else None."""
-    labs = _labels(t)
+    labs = task_labels(t)
     lab = next((x for x in labs if x.startswith(LABEL)), None)
     if not lab:
         return None

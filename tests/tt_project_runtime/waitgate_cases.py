@@ -64,7 +64,7 @@ def test_the_wake_gate_rules_skip_only_what_is_mechanically_still_pending(env, m
     """A job still running, a lock held by a live holder, checks or a push still pending: a skip by
     rule. Once over, no rule skips: with no Jev the model wakes (fallback)."""
     p = make(env)
-    from ttp import cli, lockprobe, push
+    from ttp import cli, lockprobe, waitgate
     rc, lk = _running_job(tmp_path)
     tid = _gate_task(p, tmp_path, f"ttp detach --check {rc}")
     d = _gate_decide(p, tid)
@@ -97,7 +97,7 @@ def test_the_wake_gate_rules_skip_only_what_is_mechanically_still_pending(env, m
     assert _gate_decide(p, tid).wake
 
     marker = {"status": "queued"}
-    monkeypatch.setattr(push, "_read", lambda path: marker)
+    monkeypatch.setattr(waitgate, "read_dict", lambda path: marker)
     tid = _gate_task(p, tmp_path, f"ttp push --result {tmp_path / 'push.json'}")
     d = _gate_decide(p, tid)
     assert not d.wake and d.reason == "its push is queued", d

@@ -20,6 +20,7 @@ import re
 import time
 
 from . import obligations
+from .util import as_int
 
 REWAKE_KIND = "must_act_rewake"
 QUEUE_KIND = "queue_wait"   # queuewait.KIND: a wait on a queue or cap past its threshold, re-raised on a new cause or a doubled wait
@@ -91,13 +92,6 @@ def _names(text, key: str) -> bool:
     return bool(re.search(rf"(?<![\w./-]){re.escape(key)}(?![\w-]|\.\d)", str(text or "")))
 
 
-def _id(v) -> int | None:
-    try:
-        return int(v)
-    except (TypeError, ValueError):
-        return None
-
-
 def acted(it: dict, actions: list, applied) -> str | None:
     """How an applied action of the turn acted on must-act item `it`; None when none did."""
     key, chat, owners = it["key"], obligations._chat(it.get("chat")), set(it.get("tasks") or [])
@@ -110,9 +104,9 @@ def acted(it: dict, actions: list, applied) -> str | None:
         if t in ("task_add", "task_update"):
             if any(_names(v, key) for v in a.values() if isinstance(v, str)):
                 return f"{t} names {key}"
-            if t == "task_update" and _id(a.get("id")) in owners:
+            if t == "task_update" and as_int(a.get("id")) in owners:
                 return f"task_update of owner #{a['id']}"
-            if t == "task_add" and _id(a.get("continues")) in owners:
+            if t == "task_add" and as_int(a.get("continues")) in owners:
                 return f"task_add continues owner #{a['continues']}"
         elif t == "obligation" and str(a.get("key") or "").strip() == key:
             return f"obligation action on {key}"

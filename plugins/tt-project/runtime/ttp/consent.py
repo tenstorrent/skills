@@ -12,12 +12,12 @@ expose this computer to others (reverse forwards, public binds) still need their
 """
 from __future__ import annotations
 
-import json
 import sys
 import time
 from pathlib import Path
 
 from . import project
+from .util import read_dict
 
 TOPICS = {
     "notifier": "Install the tt-project desktop notifier on this computer (native alerts for all your projects)?",
@@ -30,14 +30,6 @@ NEEDS_ANSWER = 3   # exit code: not done, the user's one answer is missing or wa
 
 def path() -> Path:
     return project.HOME_DIR / "consent.json"
-
-
-def _load() -> dict:
-    try:
-        data = json.loads(path().read_text())
-    except (OSError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
 
 
 def _already(topic: str) -> str | None:
@@ -58,7 +50,7 @@ def _already(topic: str) -> str | None:
 def record(topic: str, answer: str, how: str = "the user's answer") -> dict:
     if topic not in TOPICS or answer not in ANSWERS:
         raise ValueError(f"consent: topic is one of {', '.join(TOPICS)} and the answer yes or no")
-    data = _load()
+    data = read_dict(path())
     data[topic] = {"answer": answer, "ts": time.time(), "how": how}
     project.HOME_DIR.mkdir(parents=True, exist_ok=True)
     project.write_json(path(), data)
@@ -67,7 +59,7 @@ def record(topic: str, answer: str, how: str = "the user's answer") -> dict:
 
 def answer(topic: str) -> str:
     """'yes', 'no' or 'ask' (never asked). Something the user already has counts as a recorded yes."""
-    got = _load().get(topic) or {}
+    got = read_dict(path()).get(topic) or {}
     if got.get("answer") in ANSWERS:
         return got["answer"]
     why = _already(topic)

@@ -2699,7 +2699,7 @@ def test_this_machine_pushes_its_spend_in_the_background_and_a_failed_push_never
     monkeypatch.setattr(upstream, "ssh_pipe", lambda *a: (None, "exit 255: no route"))
     t1 = now + gcap.REFRESH_S
     assert gcap.push(b, t1) == 0
-    st = gcap._json(gcap.push_state_path())["targets"]["server"]
+    st = read_dict(gcap.push_state_path())["targets"]["server"]
     assert st["ok"] is False and st["fails"] == 1 and st["next"] == t1 + gcap.PUSH_BACKOFF_S[0], st
     assert not gcap._push_due(t1 + 60)
     # `none` turns pushing off; a list names the targets.

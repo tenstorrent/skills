@@ -273,7 +273,7 @@ def test_a_push_queued_from_a_sandbox_runs_its_checks_in_a_short_temp_dir(env, t
     assert _ttp("push", "--detach") == 0
     marker = pathlib.Path(next(ln.split(": ", 1)[1] for ln in capsys.readouterr().out.splitlines()
                                if ln.startswith("marker: ")))
-    output = pathlib.Path(push._read(marker)["check_run_dir"])
+    output = pathlib.Path(read_dict(marker)["check_run_dir"])
     queued = json.loads((output / checkdirs.OWNER).read_text())["tmp"]
     assert shorttmp.owned(queued) and pathlib.Path(queued).is_dir()
     if recorded != "reused":

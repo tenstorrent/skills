@@ -68,6 +68,7 @@ from typing import Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from . import billing, project
+from .util import read_dict
 
 DAY = 86400.0
 REFRESH_S = 600            # each other machine is asked again this long after the last try
@@ -525,14 +526,6 @@ def push_state_path() -> Path:
     return project.HOME_DIR / "global-spend-push.json"
 
 
-def _json(path: Path) -> dict:
-    try:
-        data = json.loads(path.read_text())
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
-
-
 def _flock(name: str, wait: bool) -> int | None:
     """A guard file in ~/.tt-project held with flock: its descriptor, or None when another process
     holds it and `wait` is off. The caller closes it."""
@@ -590,7 +583,7 @@ def _valid_push(rec, now: float) -> dict | None:
 def load_pushed(now: float | None = None) -> dict:
     """Pushed answers by the pushing machine's host name, those heard from within PUSHED_KEEP_S."""
     now = now or time.time()
-    got = _json(pushed_path()).get("machines") or {}
+    got = read_dict(pushed_path()).get("machines") or {}
     return {h: m for h, m in got.items() if isinstance(m, dict) and isinstance(m.get("windows"), dict)
             and -REFRESH_S <= now - float(m.get("ts") or 0) <= PUSHED_KEEP_S}
 
@@ -614,7 +607,7 @@ def receive(stream: bytes, via: str, now: float | None = None) -> tuple[dict, in
         return {"error": "not a spend record; nothing was kept"}, 2
     fd = _flock("global-spend-pushed.lock", wait=True)
     try:
-        doc = _json(pushed_path())
+        doc = read_dict(pushed_path())
         machines = {h: m for h, m in (doc.get("machines") or {}).items() if isinstance(m, dict)}
         old = machines.get(got["host"]) or {}
         wins = {k: w for k, w in (old.get("windows") or {}).items()
@@ -645,7 +638,7 @@ def push_targets() -> list[str]:
 
 
 def _push_due(now: float) -> bool:
-    st = _json(push_state_path()).get("targets") or {}
+    st = read_dict(push_state_path()).get("targets") or {}
     return any(not 0 <= float((st.get(t) or {}).get("tried") or 0) <= now
                or now >= float((st.get(t) or {}).get("next") or 0) for t in push_targets())
 
@@ -674,7 +667,7 @@ def push(budget: dict, now: float | None = None) -> int:
     if fd is None:
         return 0
     try:
-        st = {t: s for t, s in (_json(push_state_path()).get("targets") or {}).items() if isinstance(s, dict)}
+        st = {t: s for t, s in (read_dict(push_state_path()).get("targets") or {}).items() if isinstance(s, dict)}
         names = push_targets()
         data, sent = b"", 0
         for t in names:

@@ -27,11 +27,11 @@ its last event, never less than an undeclined one. An open task naming the resou
 """
 from __future__ import annotations
 
-import json
 import re
 
 from . import locks
 from .machines import retired
+from .util import task_labels
 
 KIND = "idle_capacity"
 STATE_KEY = "idle_capacity"   # kv: {resource: {"since", "fired", "n"}} of the open idle stretches
@@ -89,21 +89,13 @@ def judge(declined: dict, fired: dict, named: set[str], at: float) -> dict:
     return out
 
 
-def labels(task: dict) -> list[str]:
-    try:
-        v = json.loads(task.get("labels") or "[]")
-    except ValueError:
-        return []
-    return [lb for lb in v if isinstance(lb, str)] if isinstance(v, list) else []
-
-
 def task_names(task: dict, cfg: dict) -> set[str]:
     """The resources a task names (`resource:`, `exclusive:`), device-lock aliases as their lock;
     `needs_device` as the configured device lock."""
-    out = {locks.canonical(cfg, lb.split(":", 1)[1]) for lb in labels(task)
+    out = {locks.canonical(cfg, lb.split(":", 1)[1]) for lb in task_labels(task)
            if lb.split(":", 1)[0] in ("resource", "exclusive") and ":" in lb}
     dev = (cfg.get("device") or {}).get("locks") or []
-    if dev and "needs_device" in labels(task):
+    if dev and "needs_device" in task_labels(task):
         out.add(str(dev[0]))
     return out - {""}
 

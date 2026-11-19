@@ -28,6 +28,8 @@ import time
 import uuid
 from pathlib import Path
 
+from .leftoverprocs import _ancestors
+
 MARKER = "TTP_CHECK_SANDBOX"
 FOLDER = "check-sandboxes"
 RECORD, EXIT = "sandbox.json", "exit.json"
@@ -56,17 +58,6 @@ def _start(pid: int) -> int | None:
         return int((PROC / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()[19])
     except (OSError, IndexError, ValueError):
         return None
-
-
-def _ancestors() -> set[int]:
-    out, pid = set(), os.getpid()
-    while pid > 1 and pid not in out:
-        out.add(pid)
-        try:
-            pid = int((PROC / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()[1])
-        except (OSError, IndexError, ValueError):
-            break
-    return out
 
 
 def _inside(path: str, root: str) -> bool:

@@ -27,7 +27,6 @@ STALL_FLOOR_S)."""
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import json
 import math
 import os
@@ -43,6 +42,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import checkwait, project
+from .util import flocked, read_dict
 
 STALLED = 124
 DONE_RE = r"^(PASS|FAIL)\b|\[\s*\d+%\]\s*$"   # a PASS/FAIL line per file, or pytest's per-file progress line
@@ -81,22 +81,12 @@ def _setting(key: str) -> float | None:
 @contextlib.contextmanager
 def _locked():
     d = _dir()
-    d.mkdir(parents=True, exist_ok=True)
-    with open(d / "pool-shards.lock", "a") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
+    with flocked(d / "pool-shards.lock", 0o666):
         yield d
 
 
 def _history_path() -> Path:
     return _dir() / "pool-shard-files.json"
-
-
-def _read(path: Path) -> dict:
-    try:
-        v = json.loads(path.read_text())
-    except (OSError, ValueError):
-        return {}
-    return v if isinstance(v, dict) else {}
 
 
 def _secs(v) -> list[float]:
@@ -105,7 +95,7 @@ def _secs(v) -> list[float]:
 
 def per_file(what: str = "") -> float | None:
     """The median seconds per file measured for `what`, None before any."""
-    got = _secs(_read(_history_path()).get(what or "-"))
+    got = _secs(read_dict(_history_path()).get(what or "-"))
     return statistics.median(got) if got else None
 
 
@@ -113,7 +103,7 @@ def record(seconds: list[float], what: str = "") -> None:
     if not seconds:
         return
     with _locked():
-        h = _read(_history_path())
+        h = read_dict(_history_path())
         h[what or "-"] = (_secs(h.get(what or "-")) + [round(s, 2) for s in seconds])[-KEEP:]
         project.durable_write(_history_path(), json.dumps(h, sort_keys=True))
 
@@ -141,7 +131,7 @@ def mark(pool: str, shard: str, why: str, now: float | None = None) -> None:
 
 def marked(pool: str, now: float | None = None) -> dict | None:
     """The pool's stall mark while it is fresh (younger than MARK_TTL_S), else None."""
-    m = _read(_mark_path(pool))
+    m = read_dict(_mark_path(pool))
     since = _num(m.get("since"))
     now = time.time() if now is None else now
     return m if since and now - since < MARK_TTL_S else None

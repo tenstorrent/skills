@@ -20,16 +20,14 @@ the machine's recovery owner does. A pause asked for a resource a hold already c
 """
 from __future__ import annotations
 
-import contextlib
-import fcntl
 import json
-import os
 import time
 import uuid
 from pathlib import Path
 from typing import Any
 
 from . import project
+from .util import flocked
 
 FILE = "fleet-holds.json"
 LOCK = "fleet-holds.lock"
@@ -44,15 +42,8 @@ def _path(name: str) -> Path:
     return project.HOME_DIR / name
 
 
-@contextlib.contextmanager
 def _locked():
-    project.HOME_DIR.mkdir(parents=True, exist_ok=True)
-    fd = os.open(_path(LOCK), os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
-    finally:
-        os.close(fd)
+    return flocked(_path(LOCK))
 
 
 def _read() -> dict:

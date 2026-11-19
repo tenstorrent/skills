@@ -51,6 +51,8 @@ from typing import Any
 from . import budget as bud
 from . import jevuse, locks, probematch
 from .db import DB
+from .util import read_dict
+from .liveness import pid_alive
 
 USE = "wake_gate"
 DEFAULTS = {"enabled": True,
@@ -160,11 +162,10 @@ def pending(p, cfg: dict, probe: Any) -> str | None:
             return "its checks are queued for the daemon"
         return "its checks still run" if _checks_alive(_read_checks_pid(d)) else None
     if got and got[0] == "push":
-        from . import push
-        m = push._read(Path(got[1])) or {}
+        m = read_dict(Path(got[1])) or {}
         if m.get("status") == "queued":
             return "its push is queued"
-        if m.get("status") == "running" and push._pid_alive(m.get("pid")):
+        if m.get("status") == "running" and pid_alive(m.get("pid")):
             return "its push still runs"
         return None
     from .daemon import _waited_jobs

@@ -37,6 +37,7 @@ from pathlib import Path
 
 from . import gitmemo
 from .project import Project, durable_write
+from .liveness import pid_alive
 
 KEY = "post_land"
 FOLDER = "post-land"
@@ -91,7 +92,7 @@ def tend(p: Project, cfg: dict, now: float | None = None) -> str:
                 got = json.loads(res.read_text())
             except ValueError:
                 got = {"outcome": "error", "why": f"{res} is not JSON"}
-        elif _alive(job.get("pid")):
+        elif pid_alive(job.get("pid")):
             return ""
         else:
             dead = int(st.get("dead") or 0) + 1
@@ -214,14 +215,6 @@ def retry(p: Project, job: dict, attempt: int | str) -> dict:
     durable_write(path, json.dumps(again))
     again["pid"] = spawn(p, path)
     return again
-
-
-def _alive(pid) -> bool:
-    try:
-        os.kill(int(pid), 0)
-        return True
-    except (OSError, TypeError, ValueError):
-        return False
 
 
 def spawn(p: Project, job: Path) -> int:

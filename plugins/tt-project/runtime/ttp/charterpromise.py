@@ -31,6 +31,7 @@ import re
 import time
 
 from .db import DB
+from .causefix import _sentences
 
 EVENT = "charter_unsent"
 NEAR = 6   # words at most between the change verb and the charter object, in its clause
@@ -66,10 +67,6 @@ CONDITIONAL = re.compile(r"\b(?:if|once|when|after|should|unless)\s+(?:you|the\s
                          r"(?:ok|okay|yes|go[-\s]ahead|approval|confirmation|sign[-\s]?off)\b", re.I)
 QUOTED = re.compile(r"\"[^\"\n]*\"|“[^”\n]*”|`[^`\n]*`|^\s*>.*$", re.M)
 WORD = re.compile(r"[\w'’-]+")
-
-
-def _sentences(text: str) -> list[str]:
-    return [s for s in re.split(r"(?<=[.!?])\s+|\n+", text or "") if s.strip()]
 
 
 def announces(text: str) -> str:

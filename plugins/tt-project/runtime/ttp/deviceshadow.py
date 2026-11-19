@@ -53,6 +53,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import blindreview, deviceab, gitmemo
+from .util import num_in, task_labels
 
 KEY = "device_ab_shadow"                  # under route
 KV_PREFIX = "device_shadow:"              # device_shadow:<task id>:<arm> -> the run's record
@@ -99,10 +100,10 @@ def settings(cfg: dict) -> dict | None:
     if not arms:
         return None
     return {"arms": arms, "version": str(got.get("version") or ""),
-            "timeout_s": deviceab._num(got.get("timeout_s"), 60, 7200, 1800),
-            "budget_usd": deviceab._num(got.get("budget_usd"), 0.1, 50, 3.0),
-            "stall_s": deviceab._num(got.get("stall_s"), 60, 3600, 600),
-            "code_mb": deviceab._num(got.get("code_mb"), 1, 2000, 200)}
+            "timeout_s": num_in(got.get("timeout_s"), 60, 7200, 1800),
+            "budget_usd": num_in(got.get("budget_usd"), 0.1, 50, 3.0),
+            "stall_s": num_in(got.get("stall_s"), 60, 3600, 600),
+            "code_mb": num_in(got.get("code_mb"), 1, 2000, 200)}
 
 
 def scrub(text: Any, paths: dict[str, str] | None = None) -> str:
@@ -582,7 +583,7 @@ def queue_reviews(db, limit: int = 12, second: dict | None = None) -> list[int]:
     `second` reviewer one more by it, same spec, unless it is marked `skip`: deviceab.reviewers); returns the new task ids. A shadow still running, or without a
     hand-off, waits (or is never reviewed)."""
     have = {lb for r in db.q("SELECT labels FROM tasks WHERE labels LIKE ? OR labels LIKE ?",
-                             (f'%"{REVIEW_LABEL}%', f'%"{REVIEW2_LABEL}%')) for lb in deviceab._labels(r)}
+                             (f'%"{REVIEW_LABEL}%', f'%"{REVIEW2_LABEL}%')) for lb in task_labels(r)}
     reviewers = deviceab.reviewers(deviceab.REVIEW_MODEL, REVIEW_LABEL, REVIEW2_LABEL, second)
     out = []
     for (tid, arm), rec in sorted(shadows(db.q).items()):
@@ -655,7 +656,7 @@ def report(q: Callable[..., list[dict]]) -> dict | None:
     review_usd = 0.0
     for r in q("SELECT id, labels, result, spent_usd FROM tasks WHERE labels LIKE ? OR labels LIKE ?",
                (f'%"{REVIEW_LABEL}%', f'%"{REVIEW2_LABEL}%')):
-        for lb in deviceab._labels(r):
+        for lb in task_labels(r):
             for label, which in ((REVIEW_LABEL, "first"), (REVIEW2_LABEL, "second")):
                 tid, _, arm = lb[len(label):].partition(":")
                 if lb.startswith(label) and tid.isdigit() and arm:

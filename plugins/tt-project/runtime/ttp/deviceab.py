@@ -45,6 +45,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import blindreview, provallow
+from .util import num_in, task_labels
 
 KEY = "device_ab"
 LABEL = "device_ab:"                    # device_ab:<arm>, on the task before its first run
@@ -101,17 +102,6 @@ def skip_labels(second: dict | None) -> list[str]:
     return [f"{SKIP2_LABEL}{second['skip']}"] if second and second.get("skip") else []
 
 
-def _labels(task: dict) -> list[str]:
-    try:
-        return [str(x) for x in json.loads(task.get("labels") or "[]")]
-    except (TypeError, ValueError):
-        return []
-
-
-def _num(v: Any, lo: float, hi: float, default: float) -> float:
-    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and lo <= v <= hi else default
-
-
 def settings(cfg: dict) -> dict | None:
     """The A/B's settings, or None when it is off (unset, not an object, no projects or not two arms)."""
     got = (cfg.get("route") or {}).get(KEY)
@@ -136,8 +126,8 @@ def settings(cfg: dict) -> dict | None:
     sig = hashlib.sha256(json.dumps(parts).encode()).hexdigest()[:12]
     return {"projects": projects, "arms": arms, "test": test, "control": next(n for n in names if n != test),
             "start": begin,
-            "share": _num(got.get("share"), 0, 1, 0.5), "days": _num(got.get("days"), 0.01, 365, 3.0),
-            "max_tasks": int(_num(got.get("max_tasks"), 1, 100000, 60)), "seed": seed, "sig": sig}
+            "share": num_in(got.get("share"), 0, 1, 0.5), "days": num_in(got.get("days"), 0.01, 365, 3.0),
+            "max_tasks": int(num_in(got.get("max_tasks"), 1, 100000, 60)), "seed": seed, "sig": sig}
 
 
 def start_ts(v: Any) -> float | None:
@@ -205,7 +195,7 @@ def outage_work(db, task: dict) -> bool:
     resource machine with an open known outage or machine condition (machine_ledger); or a high-severity
     outage event (kind or key naming an outage, outagemsg.OUTAGE_KEYS) whose text names the task (#<id>)."""
     from . import effort
-    if OUTAGE_LINE.search(str(task.get("spec") or "")) or any(lb.startswith("outage:") for lb in _labels(task)):
+    if OUTAGE_LINE.search(str(task.get("spec") or "")) or any(lb.startswith("outage:") for lb in task_labels(task)):
         return True
     names = set(effort._resource_names(task))
     if names:
@@ -234,7 +224,7 @@ def exclusion(task: dict, picked: dict | None = None, db=None) -> str:
         return kind
     if kind not in KINDS:
         return "kind"
-    labels = _labels(task)
+    labels = task_labels(task)
     if str(task.get("tier") or "") == "deep" or str(task.get("assigned_tier") or "") == "deep" \
             or "user_deep" in labels or "needs_deep" in labels:
         return "deep"
@@ -257,7 +247,7 @@ def enrolled(db, since: float) -> int:
 
 
 def _label(db, task: dict, label: str) -> None:
-    labels = _labels(task)
+    labels = task_labels(task)
     if label not in labels:
         db.update_task(int(task["id"]), labels=[*labels, label])
         task["labels"] = json.dumps([*labels, label])
@@ -271,7 +261,7 @@ def assign(db, cfg: dict, project: str, task: dict, provider: str, cls: str = "h
     s = settings(cfg)
     if not s or not in_project(s, project) or provider != "claude" or (cfg.get("core_provider") or "claude") != provider:
         return None
-    labels = _labels(task)
+    labels = task_labels(task)
     arm = next((lb[len(LABEL):] for lb in labels if lb.startswith(LABEL)), "")
     stop = stopped(db)
     if not arm:
@@ -466,7 +456,7 @@ def queue_reviews(db, s: dict, since: float, limit: int = 10, second: dict | Non
     done = db.q("SELECT * FROM tasks WHERE created>=? AND labels LIKE ? AND status IN ('done','failed') "
                 "ORDER BY id", (since, f'%"{LABEL}%'))
     have = {lb for r in db.q("SELECT labels FROM tasks WHERE labels LIKE ? OR labels LIKE ?",
-                             (f'%"{REVIEW_LABEL}%', f'%"{REVIEW2_LABEL}%')) for lb in _labels(r)}
+                             (f'%"{REVIEW_LABEL}%', f'%"{REVIEW2_LABEL}%')) for lb in task_labels(r)}
     queue = reviewers(REVIEW_MODEL, REVIEW_LABEL, REVIEW2_LABEL, second)
     out = []
     for t in done:
@@ -541,7 +531,7 @@ def share_check(db, cfg: dict, now: float | None = None) -> dict | None:
     n = test_n = 0
     why: dict = {}
     for t in db.q("SELECT labels FROM tasks WHERE created>=? AND labels LIKE ?", (since, '%"device_ab%')):
-        labels = _labels(t)
+        labels = task_labels(t)
         ex = next((lb[len(EXCLUDED):] for lb in labels if lb.startswith(EXCLUDED)), "")
         arm = next((lb[len(LABEL):] for lb in labels if lb.startswith(LABEL)), "")
         if ex:
@@ -576,19 +566,19 @@ def report(q: Callable[..., list[dict]], kv: Callable[[str], Any], cfg: dict | N
     reviews2: dict[int, dict] = {}
     for r in q("SELECT labels, result, status FROM tasks WHERE labels LIKE ? OR labels LIKE ?",
                (f'%"{REVIEW_LABEL}%', f'%"{REVIEW2_LABEL}%')):
-        for lb in _labels(r):
+        for lb in task_labels(r):
             for label, into in ((REVIEW_LABEL, reviews), (REVIEW2_LABEL, reviews2)):
                 if lb.startswith(label) and lb[len(label):].isdigit() and (sc := _scores(r.get("result"))):
                     into[int(lb[len(label):])] = sc
     fixes: dict[int, int] = {}
     for r in q("SELECT labels FROM tasks WHERE created>=? AND (labels LIKE '%\"continues:%' OR labels LIKE "
                "'%\"review_fix:%')", (since,)):
-        for lb in _labels(r):
+        for lb in task_labels(r):
             head, _, rest = lb.partition(":")
             if head in ("continues", "review_fix") and rest.isdigit():
                 fixes[int(rest)] = fixes.get(int(rest), 0) + 1
     for t in tasks:
-        labels = _labels(t)
+        labels = task_labels(t)
         ex = next((lb[len(EXCLUDED):] for lb in labels if lb.startswith(EXCLUDED)), "")
         if ex:
             out["excluded"][ex] = out["excluded"].get(ex, 0) + 1

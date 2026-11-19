@@ -38,7 +38,6 @@ HANDBACK, a short phrase list of answers that give the decision back to the proj
 """
 from __future__ import annotations
 
-import json
 import os
 import re
 import shlex
@@ -48,6 +47,7 @@ from typing import Any
 
 from . import anchors, chatgone, reviewcap
 from .db import DB, SEVERITY_RANK, chat_floor
+from .util import loads_dict
 
 WINDOWS = (("24 h", 86400), ("7 d", 7 * 86400))
 STUCK = {"task_blocked": "blocked", "task_waiting": "waiting", "task_review": "review"}
@@ -160,7 +160,7 @@ def classify_wait(result: dict | None) -> tuple[str, str]:
 
 def wait_data(raw: Any) -> dict:
     """A task_waiting event's `data`: {"wait": self|external, "why": ...}; {} for older events."""
-    d = _note(raw)
+    d = loads_dict(raw)
     return d if d.get("wait") in WAIT_KINDS else {}
 
 
@@ -245,12 +245,12 @@ def live_routine(ev: Any, older: Any = (), live_max: int = LIVE_WAITS_MAX) -> bo
     the same work was waited on more than `live_max` times in the 24 h before it (`older`: the
     task's earlier events, newest first; 0 makes none routine) or its jobs' log did not grow since
     the previous wait on them. None for any other wait."""
-    live = _note(ev["data"]).get("live")
+    live = loads_dict(ev["data"]).get("live")
     if not isinstance(live, dict) or not live.get("alive") or not live.get("key"):
         return None
     if not live_max:
         return False
-    same = [_note(o["data"]).get("live") or {} for o in older
+    same = [loads_dict(o["data"]).get("live") or {} for o in older
             if o["kind"] == "task_waiting" and o["ts"] > ev["ts"] - 86400]
     same = [o for o in same if isinstance(o, dict) and o.get("key") == live["key"]]
     if len(same) + 1 > live_max:
@@ -262,7 +262,7 @@ def live_routine(ev: Any, older: Any = (), live_max: int = LIVE_WAITS_MAX) -> bo
 def wait_reason(ev: Any) -> str:
     """What a task_waiting event waits for, normalized so waits differing only in times, shas, run
     ids or counts compare equal: its `data.for`, else its text after "#id title: "."""
-    raw = str(_note(ev["data"]).get("for") or (ev["text"] or "").split(": ", 1)[-1])
+    raw = str(loads_dict(ev["data"]).get("for") or (ev["text"] or "").split(": ", 1)[-1])
     return _denoise(re.sub(r"^waiting for\s+", "", raw.strip(), flags=re.I))
 
 
@@ -291,7 +291,7 @@ def wait_marks(ev: Any) -> dict:
     """What a task_waiting event's wait compares on (coordinator.wait_raises): its `reason`
     (wait_reason), `probe` (its retry_when with times, shas, ids and counts as noise, as in reasons)
     and `owner` (wait_owner); `probe` and `owner` are None for events recorded before they were."""
-    d = _note(ev["data"])
+    d = loads_dict(ev["data"])
     probe = d.get("probe")
     return {"reason": wait_reason(ev), "probe": _denoise(probe, 300) if isinstance(probe, str) else None,
             "owner": d.get("owner") if isinstance(d.get("owner"), str) else None}
@@ -864,20 +864,12 @@ def turns_line(db: DB, since: float) -> str:
     why: dict[str, int] = {}
     for r in rows:
         split[r["effort"] or "default"] = split.get(r["effort"] or "default", 0) + 1
-        for t in _triggers(_note(r["note"])):
+        for t in _triggers(loads_dict(r["note"])):
             why[t] = why.get(t, 0) + 1
     line = f"{len(rows)} turns: " + ", ".join(f"{n} {k}" for k, n in sorted(split.items(), key=lambda kv: -kv[1]))
     if why:
         line += "; triggers: " + ", ".join(f"{k} {n}" for k, n in sorted(why.items(), key=lambda kv: -kv[1])[:5])
     return line
-
-
-def _note(raw: Any) -> dict:
-    try:
-        note: Any = json.loads(raw or "{}")
-    except ValueError:
-        return {}
-    return note if isinstance(note, dict) else {}
 
 
 def _triggers(note: dict) -> list[str]:
@@ -899,7 +891,7 @@ def triggers_line(db: DB, since: float) -> str:
     raised = [0, 0.0]
     routine = [0, 0.0]
     for r in rows:
-        trigs = _triggers(_note(r["note"]))
+        trigs = _triggers(loads_dict(r["note"]))
         side = raised if trigs else routine
         side[0] += 1
         side[1] += float(r["cost_usd"] or 0)
@@ -927,7 +919,7 @@ def triggers_by_day(db: DB, now: float, days: int = TRIGGER_DAYS) -> str:
         per: dict[str, int] = {}
         rode: dict[str, int] = {}
         for r in rows:
-            note = _note(r["note"])
+            note = loads_dict(r["note"])
             for t in _triggers(note):
                 per[t] = per.get(t, 0) + 1
             carried = note.get("carried")

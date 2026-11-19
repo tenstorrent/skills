@@ -54,13 +54,14 @@ from . import (checkcap, checkdirs, checkspill, checkwait, checklane, cleantree,
 from . import __version__
 from .budget import DOC_SUFFIXES, task_default_usd
 from .db import continues_id, dependency_ids, load_result
-from .liveness import pid_ns
+from .liveness import pid_alive, pid_ns
 from .project import (Project, approved_heads_may_push, code_tasks_may_push, durable_append, durable_write, git_fsync_env, hostname,
                       load_registry, nice_level, open_append_or_null, own_creates_pr_branch, own_push, push_queue_on,
                       rebase_replace, renice, write_json)
 from .project import never_force as never_force_on
 from .release import UPGRADE_RESOURCE, _taken as _lock_taken
 from .testpick import TASK_KEY
+from .util import read_dict, task_labels
 
 # Exit codes, distinct so a worker can say why it did not push. BUSY: another push to the same
 # branch kept the lock past `delivery.push_wait_s`; the task hands back `waiting`.
@@ -2669,7 +2670,7 @@ def foreign_owner(p: Project, row: dict | None, branch: str) -> int | None:
     owner, seen, t = int(m.group(1)), set(), row
     while t and t.get("id") not in seen:
         seen.add(t.get("id"))
-        labels = _labels(t)
+        labels = task_labels(t)
         if t.get("id") == owner or worktree.spec_names_pr_branch(str(t.get("spec") or ""), branch) \
                 or (f"pr_branch:{branch}" in labels and any(x.startswith("pr_fix:") for x in labels)) \
                 or {f"pr_branch:{branch}", f"continues:{owner}"} <= set(labels):
@@ -2832,13 +2833,6 @@ def _task_row(p: Project, task: str | None) -> dict | None:
         return None
 
 
-def _labels(t: dict | None) -> list[str]:
-    try:
-        return [str(x) for x in json.loads((t or {}).get("labels") or "[]")]
-    except (ValueError, TypeError):
-        return []
-
-
 def _recorded_pr_branch(p: Project, task: str | None) -> str:
     """The branch task `task` is recorded as delivering onto (worktree.recorded_pr_branch: its label or
     the latest `pr_branch:` line an update appended to its spec), as written, or ""."""
@@ -2890,7 +2884,7 @@ def _fresh_own_branch(p: Project, task: str, branch: str) -> bool:
     onto = _recorded_pr_branch(p, task)
     spec = str(t.get("spec") or "")
     return not any(b and worktree.spec_names_pr_branch(spec, b) for b in (given, onto)) \
-        and not any(x.startswith("pr_fix:") for x in _labels(t))
+        and not any(x.startswith("pr_fix:") for x in task_labels(t))
 
 
 def _carries(p: Project, task: str, owner: str, branch: str) -> bool:
@@ -2899,7 +2893,7 @@ def _carries(p: Project, task: str, owner: str, branch: str) -> bool:
     t = _task_row(p, task)
     if not t:
         return False
-    labels = _labels(t)
+    labels = task_labels(t)
     return str(t.get("branch") or "") == branch or worktree.recorded_pr_branch(t) == branch \
         or f"continues:{owner}" in labels
 
@@ -3329,7 +3323,7 @@ def delivered_pr(p: Project, task: dict, head: str) -> str | None:
         return url if seen == head else None
     folder = p.state / DETACHED
     for marker in sorted(folder.glob("*.json")) if folder.is_dir() else []:
-        m = _read(marker)
+        m = read_dict(marker)
         if (m.get("own") and m.get("status") == "pushed" and m.get("sha") == head
                 and str(m.get("task") or "") == str(task.get("id"))):
             return url
@@ -3548,7 +3542,7 @@ def _reviewed(p: Project, task: str | None) -> list[dict]:
     if not t or t.get("kind") != "review":
         return []
     ids = [i for i in dependency_ids(t) if i is not None]
-    ids += [int(x[12:]) for x in _labels(t) if x.startswith("auto_review:") and x[12:].isdigit()]
+    ids += [int(x[12:]) for x in task_labels(t) if x.startswith("auto_review:") and x[12:].isdigit()]
     ids += [int(m.group(1))] if (m := REVIEW_TITLE.match(str(t.get("title") or ""))) else []
     return [r for r in (_task_row(p, str(i)) for i in dict.fromkeys(ids)) if r]
 
@@ -5589,14 +5583,6 @@ def result_probe(marker: Path, p: Project | None = None) -> str:
     return f"{_own_ttp(p)} push --result {shlex.quote(str(marker))}"
 
 
-def _read(marker: Path) -> dict:
-    try:
-        m = json.loads(marker.read_text())
-    except (OSError, ValueError):
-        return {}
-    return m if isinstance(m, dict) else {}
-
-
 def _forget_lock(marker: Path) -> None:
     """Remove a finished push's run lock file; the probe reads a missing one as free."""
     try:
@@ -5613,7 +5599,7 @@ def _prune(folder: Path, now: float) -> int:
             old = now - marker.stat().st_mtime > KEEP_S
         except OSError:
             continue
-        if old and _read(marker).get("status") not in ("running", "queued"):
+        if old and read_dict(marker).get("status") not in ("running", "queued"):
             n += 1
             for f in (marker, marker.with_suffix(".log"), marker.with_suffix(POOL_STATUS_SUFFIX),
                       marker.with_suffix(GIT_PUSH_SUFFIX), _run_lock(marker)):
@@ -5929,7 +5915,7 @@ def run_detached(p: Project, repo: Path, marker: Path, own: bool = False) -> int
     global pool_status, _marker_here, _wait_since, _wait_first
     pool_status = marker.with_suffix(POOL_STATUS_SUFFIX)
     _marker_here = marker
-    m = _read(marker)
+    m = read_dict(marker)
     if m.get("status") == "running":
         m["alive"] = time.time()   # it began: a death from here on is not one at startup
         write_json(marker, m)
@@ -5967,7 +5953,7 @@ def run_detached(p: Project, repo: Path, marker: Path, own: bool = False) -> int
         os.fsync(sys.stdout.fileno())
     except (OSError, ValueError):
         pass
-    m = _read(marker) or {"id": marker.stem, "pid": os.getpid(), "log": str(marker.with_suffix(".log"))}
+    m = read_dict(marker) or {"id": marker.stem, "pid": os.getpid(), "log": str(marker.with_suffix(".log"))}
     m.update(status="pushed" if rc == 0 else "failed", exit=rc, sha=sha, version=version, ended=time.time())
     if rc == 0 and not own and last_ff:
         m["fast_forward"] = last_ff
@@ -5986,7 +5972,7 @@ def run_detached(p: Project, repo: Path, marker: Path, own: bool = False) -> int
         for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
             signal.signal(sig, signal.SIG_DFL)   # its receipt records a kill (pushq.tend_receipts)
         a = run_after(p, repo) or {"status": "skipped", "reason": "delivery.after_push is not set"}
-        m = _read(marker) or m
+        m = read_dict(marker) or m
         m["after_push"] = a
         write_json(marker, m)
     if output is not None:
@@ -6000,7 +5986,7 @@ def _run_retrying(p: Project, repo: Path, marker: Path, own: bool, rec: dict | N
     commit before it pushes. The push branch's own rounds (_rounds) already do this for a move during
     the checks; this covers `--own`, whose publish never rebases. At most the marker's retry_max
     retries, counting a reboot's requeue. (exit code, the reason to record or None)."""
-    m = _read(marker)
+    m = read_dict(marker)
     remote, branch = str(m.get("remote") or ""), str(m.get("branch") or "")
     done = _retries(m)
     if done and done[-1].get("cause") == REBOOT and _rebase_in_progress(repo):
@@ -6012,7 +5998,7 @@ def _run_retrying(p: Project, repo: Path, marker: Path, own: bool, rec: dict | N
         tip = moved_on(p, repo, remote, branch, start) if rc == REJECTED and own else ""
         if not tip:
             return rc, None
-        m = _read(marker)
+        m = read_dict(marker)
         n, limit = len(_retries(m)), retries_of(m.get("retry_max"))
         if n >= limit:
             why = (f"{NON_FF}: {remote}/{branch} moved on to {tip[:10]}; already retried {n} time(s), "
@@ -6027,7 +6013,7 @@ def _run_retrying(p: Project, repo: Path, marker: Path, own: bool, rec: dict | N
             return CONFLICT, why
         _note_retry(marker, m, NON_FF, f"{remote}/{branch} moved from {start[:10]} to {tip[:10]}")
         print(f"ttp push: {remote}/{branch} moved on to {tip[:10]} during the push: rebased onto it, "
-              f"retrying ({retry_words(_read(marker))})", file=sys.stderr, flush=True)
+              f"retrying ({retry_words(read_dict(marker))})", file=sys.stderr, flush=True)
 
 
 def moved_on(p: Project, repo: Path, remote: str, branch: str, start: str) -> str:
@@ -6096,7 +6082,7 @@ def _requeue_rebooted(marker: Path, m: dict) -> bool:
     if lock is None:
         return True
     with lock:
-        m = _read(marker)
+        m = read_dict(marker)
         if m.get("status") != "running" or not _rebooted(m):
             return True
         for k in ("pid", "alive", "started"):
@@ -6116,13 +6102,13 @@ def _settle(marker: Path) -> dict:
     lock free died; one queued longer than QUEUED_S was never started. Others come back as read, and
     so does a push queue batch's (batch.py): it lets go of its run lock before its after_push and
     writes its marker after, so only the push queue judges it (pushq.finalize), never this."""
-    m = _read(marker)
+    m = read_dict(marker)
     if m.get("kind") == "batch":
         return m
     if m.get("status") == "running" and locks.any_free([_run_lock(marker)]):
-        m = _read(marker)      # read after the lock: the push writes its outcome before letting go
+        m = read_dict(marker)      # read after the lock: the push writes its outcome before letting go
         if m.get("status") == "running" and _requeue_rebooted(marker, m):
-            return _read(marker)
+            return read_dict(marker)
         if m.get("status") == "running":
             m.update(status="failed", exit=None, ended=time.time(), reason=_dead_reason(m) + _retries_spent(m))
             write_json(marker, m)
@@ -6131,7 +6117,7 @@ def _settle(marker: Path) -> dict:
         lock = locks.try_take([_run_lock(marker)], f"detached push {m.get('id')}", "expire")
         if lock is not None:   # taken: the daemon is starting it right now
             with lock:
-                m = _read(marker)
+                m = read_dict(marker)
                 if m.get("status") == "queued":
                     m.update(status="failed", exit=None, ended=time.time(),
                              reason=f"the daemon did not start the queued push within {QUEUED_S // 60} min")
@@ -6149,12 +6135,12 @@ def tend(p: Project) -> list[str]:
     folder = p.state / DETACHED
     cleared: list[str] = []
     for marker in sorted(folder.glob("*.json")) if folder.is_dir() else []:
-        before = _read(marker)
+        before = read_dict(marker)
         try:
             m = _tend_one(p, marker)
         except Exception as e:   # a malformed marker: recorded as failed, never aborts the daemon's tick
             _malformed(marker, e)
-            m = _read(marker)
+            m = read_dict(marker)
         if len(_retries(m)) > len(_retries(before)):
             cleared.append(f"requeued push marker {marker.name} after a host reboot ({retry_words(m)})")
         before = before.get("status")
@@ -6178,7 +6164,7 @@ def _tend_one(p: Project, marker: Path) -> dict:
     if lock is None:
         return m
     try:
-        m = _read(marker)
+        m = read_dict(marker)
         if m.get("status") != "queued":
             return m
         env = {**os.environ, **(m.get("env") or {})}
@@ -6192,12 +6178,12 @@ def _tend_one(p: Project, marker: Path) -> dict:
             write_json(marker, m)
     finally:
         lock.close()
-    return _read(marker)
+    return read_dict(marker)
 
 
 def _malformed(marker: Path, e: Exception) -> None:
     """Record a queued push the daemon could not handle as failed, so it is skipped from now on."""
-    m = _read(marker)
+    m = read_dict(marker)
     if m.get("status") != "queued":
         return
     m.update(status="failed", exit=None, ended=time.time(),
@@ -6219,10 +6205,10 @@ def result(marker: Path, pushed_only: bool = False) -> int:
     With `pushed_only` (`--pushed`): 0 only when the push landed, 1 while it runs, 3 when it finished
     without pushing, so an on_pass_cmd tests the exit code and needs no grep."""
     marker = Path(marker)
-    if not _read(marker):
+    if not read_dict(marker):
         print(f"ttp push: no detached push marker at {marker}", file=sys.stderr)
         return REFUSED
-    if _read(marker).get("kind") == "batch":     # the push queue's batch process (batch.py)
+    if read_dict(marker).get("kind") == "batch":     # the push queue's batch process (batch.py)
         return batch.summary(marker, pushed_only)
     try:
         m = _settle(marker)
@@ -6230,7 +6216,7 @@ def result(marker: Path, pushed_only: bool = False) -> int:
         took = time.time() - float(m.get(since) or time.time()) if since else 0
     except (TypeError, ValueError) as e:   # a malformed marker: a clear verdict, not a traceback
         _malformed(marker, e)   # best effort: the verdict does not depend on the rewrite
-        m = {**_read(marker), "status": "failed", "exit": None,
+        m = {**read_dict(marker), "status": "failed", "exit": None,
              "reason": f"malformed marker ({type(e).__name__}: {e})"}
         took = 0
     retried = f"; {retry_words(m)}" if retry_words(m) else ""
@@ -6249,7 +6235,7 @@ def result(marker: Path, pushed_only: bool = False) -> int:
         for line in m.get("fast_forward") or []:
             print(f"ttp push: {'warning: ' if line in ff_warnings([line]) else ''}{line}")
         a = m.get("after_push") if isinstance(m.get("after_push"), dict) else {}
-        if a.get("status") == "running" and _pid_alive(a.get("pid")):
+        if a.get("status") == "running" and pid_alive(a.get("pid")):
             print("ttp push: after_push is still running; the daemon reports how it ends")
         elif a.get("status") == "running":
             print("ttp push: warning: after_push stopped before it finished; the push stands")
@@ -6346,7 +6332,7 @@ def cancel(p: Project, marker: Path) -> int:
     pushing, 1 when it pushed before the cancel took effect (or could not be stopped), REFUSED for a
     missing marker or a push the caller may not cancel (_cancel_refusal)."""
     marker = Path(marker)
-    m = _read(marker)
+    m = read_dict(marker)
     if not m:
         print(f"ttp push: no detached push marker at {marker}", file=sys.stderr)
         return REFUSED
@@ -6360,14 +6346,14 @@ def cancel(p: Project, marker: Path) -> int:
     lock = locks.try_take([_run_lock(marker)], f"detached push {m.get('id')}", "ttp push --cancel")
     if lock is not None:   # queued, or its process is gone: nothing runs it now, and nothing starts it
         with lock:
-            m = _read(marker)
+            m = read_dict(marker)
             if m.get("status") in ("queued", "running"):
                 m.update(status="cancelled", exit=None, ended=time.time(), reason=f"cancelled by {by}")
                 write_json(marker, m)
                 did = True
         _forget_lock(marker)
     else:
-        m = _read(marker)
+        m = read_dict(marker)
         pid = m.get("pid")
         if m.get("status") == "running" and isinstance(pid, int) and pid > 1:
             did = True
@@ -6377,12 +6363,12 @@ def cancel(p: Project, marker: Path) -> int:
             if not _end_cancelled_group(marker, pid, say):
                 say(f"ttp push: the push of {marker.name} is still running; it was not cancelled")
                 return 1
-        m = _read(marker)
+        m = read_dict(marker)
         if did and m.get("status") in ("queued", "running", "failed") and not m.get("sha"):
             m.update(status="cancelled", ended=m.get("ended") or time.time(), reason=f"cancelled by {by}")
             write_json(marker, m)
         _forget_lock(marker)
-    m = _read(marker)
+    m = read_dict(marker)
     if out := m.get("check_run_dir"):
         try:   # a group ended by KILL never let go of its check scratch itself
             checkdirs.finish(checkdirs.restore(p.state, out))
@@ -6409,10 +6395,10 @@ def unpushed(marker: Path) -> str:
     still runs, finished with nothing to push or its marker cannot be read: the daemon then wakes a
     task waiting on it at its own tier, as for failed checks. A batch whose process ended without an
     outcome (killed, crashed or rebooted) did not land."""
-    m = _read(Path(marker))
+    m = read_dict(Path(marker))
     if m.get("kind") == "batch":
         if not m.get("outcome") and not batch.alive(Path(marker)):
-            m = _read(Path(marker))   # it may have finished between the two reads
+            m = read_dict(Path(marker))   # it may have finished between the two reads
             if not m.get("outcome"):
                 return "batch ended without an outcome (killed, crashed or rebooted)"
         out = m.get("outcome")
@@ -6427,20 +6413,10 @@ def pushed(marker: Path) -> bool:
     """Whether the finished push of `marker` landed its commits: a batch whose outcome is pushed or
     landed, or a single push with status pushed. Running, queued, nothing to push, failed, refused or
     an unreadable marker: False."""
-    m = _read(Path(marker))
+    m = read_dict(Path(marker))
     if m.get("kind") == "batch":
         return m.get("outcome") in ("pushed", "landed")
     return m.get("status") == "pushed"
-
-
-def _pid_alive(pid: Any) -> bool:
-    try:
-        os.kill(int(pid), 0)
-    except (TypeError, ValueError, ProcessLookupError):
-        return False
-    except PermissionError:
-        return True
-    return True
 
 
 _ENDED: dict[str, dict[str, tuple]] = {}   # running(): per pushes folder, marker name -> stat key of an ended one
@@ -6468,7 +6444,7 @@ def running(p: Project) -> list[dict]:
         if key is not None and ended.get(marker.name) == key:
             seen[marker.name] = key
             continue
-        m = _read(marker)
+        m = read_dict(marker)
         if key is not None and isinstance(m.get("status"), str) and m["status"] not in ("running", "queued"):
             seen[marker.name] = key
         free = locks.free_state(_run_lock(marker)) if m.get("status") == "running" else True
@@ -6502,7 +6478,7 @@ def stop_own(p: Project, marker: Path, why: str = "") -> int:
     if marker.parent != folder or marker.suffix != ".json":
         say(f"refused: {marker} is not a detached push marker of this project ({folder}/<id>.json)")
         return REFUSED
-    m = _read(marker)
+    m = read_dict(marker)
     if not m:
         say(f"no detached push marker at {marker}")
         return REFUSED
@@ -6525,7 +6501,7 @@ def stop_own(p: Project, marker: Path, why: str = "") -> int:
             f"its outcome comes from {result_probe(marker, p)}")
         return NOT_STOPPED
     if m.get("status") == "queued":
-        if jobstop.end_push(p, marker, why, int(me)) is None and _read(marker).get("status") in ("queued", "running"):
+        if jobstop.end_push(p, marker, why, int(me)) is None and read_dict(marker).get("status") in ("queued", "running"):
             say(f"not stopped: the daemon is starting the push {marker.stem} right now; run this again")
             return NOT_STOPPED
     elif (rc := _stop_running(p, marker, m, me, why, say)) is not None:
@@ -6568,7 +6544,7 @@ def _stop_running(p: Project, marker: Path, m: dict, me: str, why: str, say: Cal
         say(f"not stopped: the push {marker.stem} " + ("began its git push, which is never interrupted"
             if side.exists() else f"did not end within {STOP_TERM_S:.0f} s of SIGTERM"))
         return NOT_STOPPED
-    if _read(marker).get("status") == "pushed":
+    if read_dict(marker).get("status") == "pushed":
         say(f"not removed: the push {marker.stem} pushed before it ended; its marker stays for its result")
         return NOT_STOPPED
     return None
@@ -6604,7 +6580,7 @@ def stop_batch(p: Project, marker: Path, why: str) -> int:
     if marker.parent != folder or marker.suffix != ".json":
         say(f"refused: {marker} is not a push batch marker of this project ({folder}/<id>.json)")
         return REFUSED
-    m = _read(marker)
+    m = read_dict(marker)
     if not m or m.get("kind") != "batch":
         say(f"refused: no push queue batch at {marker}" + (" (a task's own push stops with `ttp push --stop`)"
                                                           if m else ""))
@@ -6636,7 +6612,7 @@ def stop_batch(p: Project, marker: Path, why: str) -> int:
                   why, by=by, group=False, state=p.state, task=int(task) if task.isdigit() else None)
     deadline = time.monotonic() + STOP_BATCH_WAIT_S
     while time.monotonic() < deadline:
-        now = _read(marker)
+        now = read_dict(marker)
         if now.get("outcome"):
             break
         if now.get("pushing"):
@@ -6644,7 +6620,7 @@ def stop_batch(p: Project, marker: Path, why: str) -> int:
                 "it is never interrupted")
             return NOT_STOPPED
         time.sleep(0.2)
-    now = _read(marker)
+    now = read_dict(marker)
     bid = m.get("id") or marker.stem
     if now.get("outcome") == "stopped":
         print(f"ttp push: stopped the batch {bid}; its entries go back to approved: {why}")

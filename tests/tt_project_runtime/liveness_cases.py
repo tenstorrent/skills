@@ -281,3 +281,17 @@ def test_devq_waits_names_a_holder_pid_it_cannot_place_as_of_another_pid_namespa
         assert (h["state"], h["why"]) == ("unknown", f"its pid {gone_pid} is {liveness.FOREIGN}")
     else:
         assert (h["state"], h["why"]) == ("dead", f"its pid {gone_pid} is gone")
+
+
+def test_pid_alive_counts_a_pid_it_may_not_signal(monkeypatch, gone_pid):
+    from ttp import liveness
+
+    assert liveness.pid_alive(os.getpid()) and liveness.pid_alive(str(os.getpid()))
+    assert not liveness.pid_alive(gone_pid)
+    for junk in (None, "x", 0, -1, 2**80):
+        assert not liveness.pid_alive(junk)
+
+    def denied(pid, sig):
+        raise PermissionError
+    monkeypatch.setattr(liveness.os, "kill", denied)
+    assert liveness.pid_alive(1)

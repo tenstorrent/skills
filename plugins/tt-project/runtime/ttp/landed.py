@@ -29,6 +29,7 @@ from pathlib import Path
 
 from . import gitcache, gitmemo, repoid
 from .db import TERMINAL_TASK_STATES, dependency_ids, load_result, review_subject
+from .util import read_dict
 
 LANDED_PROBE = re.compile(r"\s*landed:\s*#?(\d+)\s*")
 ANCESTOR_PROBE = re.compile(r"\s*git\s+merge-base\s+--is-ancestor\s+([0-9a-f]{7,64})\s+([\w./@{}^~-]+)\s*")
@@ -253,7 +254,7 @@ def reconcile_pushes(p, tid: int) -> None:
     """A worker can finish before the daemon tends its detached pushes, regardless of its handoff."""
     from . import push   # late: push loads pushq, whose imports reach this module
     for marker in sorted((p.state / push.DETACHED).glob(f"t{tid}-*.json")):
-        record_push(p, marker, push._read(marker))
+        record_push(p, marker, read_dict(marker))
 
 
 # A task title that redoes another task's change on a new branch: "rebase #12 onto ...", "rebased #12".

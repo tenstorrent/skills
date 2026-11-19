@@ -2637,7 +2637,7 @@ def test_a_step_stop_during_the_push_batch_spawn_waits_until_its_pid_is_on_the_m
             stepclock.end()
     finally:
         stepclock.uninstall()
-    m = push._read(s.p.state / push.DETACHED / f"{bid}.json")
+    m = read_dict(s.p.state / push.DETACHED / f"{bid}.json")
     child = pushq._children.pop(bid)
     assert m["pid"] == child.pid
     assert child.wait(timeout=30) == 0, "its go was given"

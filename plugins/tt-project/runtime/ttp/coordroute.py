@@ -31,6 +31,8 @@ import re
 import time
 from pathlib import Path
 
+from .util import num_in, read_dict
+
 KEY = "coord_routine"          # kv: {"last_opus", "turns": [...], "escalate", "suspended", "shadows": [run ids]}
 LANE = "coord_lane"            # a run note's field: "routine" on a live lane turn
 SHADOW = "coord_shadow"        # a run note's field on a shadow turn: {"of": the coordinator run it shadows}
@@ -105,10 +107,6 @@ def guard_env(note) -> dict:
     return {glmguard.ENV: "1"} if lane_of(note) else {}
 
 
-def _num(v, lo: float, hi: float, default: float) -> float:
-    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and lo <= v <= hi else default
-
-
 def _raw(cfg: dict) -> dict:
     got = (cfg.get("coordinator") or {}).get("routine")
     return got if isinstance(got, dict) else {}
@@ -142,8 +140,8 @@ def settings(cfg: dict) -> dict:
         mode, why = "off", "no lane model (coordinator.routine.model or route.glm_work.model)"
     return {"mode": mode, "provider": str(r.get("provider") or "chat"), "model": model,
             "effort": str(r.get("effort") or "max"),
-            "heartbeat_h": _num(r.get("heartbeat_h"), 0.25, 48, HEARTBEAT_H),
-            "max_turns": int(_num(r.get("max_turns"), 1, 200, MAX_TURNS)), "why": why}
+            "heartbeat_h": num_in(r.get("heartbeat_h"), 0.25, 48, HEARTBEAT_H),
+            "max_turns": int(num_in(r.get("max_turns"), 1, 200, MAX_TURNS)), "why": why}
 
 
 def state(db) -> dict:
@@ -396,14 +394,6 @@ def shadow_path(state_dir, opus_run) -> Path:
     return Path(state_dir) / SHADOW_DIR / f"{int(opus_run)}.json"
 
 
-def _read(path: Path) -> dict:
-    try:
-        got = json.loads(path.read_text())
-        return got if isinstance(got, dict) else {}
-    except (OSError, ValueError):
-        return {}
-
-
 def _write(path: Path, rec: dict) -> None:
     from .project import durable_write
     durable_write(path, json.dumps(rec, indent=1))
@@ -412,7 +402,7 @@ def _write(path: Path, rec: dict) -> None:
 def shadow_started(state_dir, opus_run, shadow_run, why_routine, now: float | None = None) -> None:
     path = shadow_path(state_dir, opus_run)
     path.parent.mkdir(parents=True, exist_ok=True)
-    rec = _read(path)
+    rec = read_dict(path)
     rec.update({"opus_run": int(opus_run), "shadow_run": shadow_run, "ts": time.time() if now is None else now,
                 "routine_why": why_routine})
     _write(path, rec)
@@ -423,7 +413,7 @@ def shadow_side(state_dir, opus_run, side: str, actions, status: str, cost: floa
     """Records one side ("opus" or "glm") of a shadow pair; with both in, the comparison. Returns the record."""
     path = shadow_path(state_dir, opus_run)
     path.parent.mkdir(parents=True, exist_ok=True)
-    rec = _read(path)
+    rec = read_dict(path)
     acts = actions if isinstance(actions, list) else []
     side_rec = {"status": status, "cost_usd": round(float(cost or 0), 4), "duration_s": round(float(duration_s or 0), 1),
                 "actions": [_brief(a) for a in acts]}
@@ -459,7 +449,7 @@ def report(db, state_dir, days: float = 7.0, now: float | None = None) -> dict:
     pairs = []
     folder = Path(state_dir) / SHADOW_DIR
     for path in sorted(folder.glob("*.json")) if folder.is_dir() else []:
-        rec = _read(path)
+        rec = read_dict(path)
         if float(rec.get("ts") or 0) >= since:
             pairs.append(rec)
     done = [r for r in pairs if r.get("compare")]

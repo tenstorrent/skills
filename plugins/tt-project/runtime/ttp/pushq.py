@@ -74,6 +74,7 @@ from .project import (
     write_json,
 )
 from .worktree import FORK_POINT_REF, fix_branches, named_refs
+from .util import read_dict, task_labels
 
 REF_PREFIX = "refs/ttp/push/"   # + row id: pins the approved commit until its row is settled
 LANDED_REF = "refs/ttp/landed/"   # + row id: a landed row's head, kept once its pin goes so a replay can rebuild its range
@@ -595,7 +596,7 @@ def _batch_reach(db, batch: str | None, b: dict | None = None, m: dict | None = 
         r = m.get("reach")
     else:
         row = db.one("SELECT marker FROM push_batches WHERE id=?", (batch,)) if batch else None
-        r = push._read(Path(row["marker"])).get("reach") if row else None
+        r = read_dict(Path(row["marker"])).get("reach") if row else None
     return r if isinstance(r, dict) else None
 
 
@@ -856,7 +857,7 @@ def _push_conflict(p: Project, task: dict, rows: list[dict]) -> str:
     stopped on a rebase conflict and no push queue row of the task came after it, else ""."""
     last, at = {}, 0.0
     for marker in (p.state / push.DETACHED).glob(f"t{task['id']}-*.json"):
-        m = push._read(marker)
+        m = read_dict(marker)
         started = m.get("started") if isinstance(m.get("started"), (int, float)) else 0.0
         if str(m.get("task")) == str(task["id"]) and started >= at:
             last, at = m, started
@@ -945,7 +946,7 @@ def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None
     d = _delivery(p, cfg)
     if not push_allowed(d):
         return {"ignored": "this project does not allow pushing (delivery.push_allowed)"}
-    if push.REVIEW_ONLY_LABEL in push._labels(task):
+    if push.REVIEW_ONLY_LABEL in task_labels(task):
         return {"ignored": "this review is review only: its change must not reach the push branch"}
     if d.get("push_queue") is not True:
         # An approval in any form (a list, one entry, "branch at sha") is never dropped: the review
@@ -1780,7 +1781,7 @@ def _start_why(db, d: dict, rows: list[dict], last: dict | None, untested: list[
 
 def _marker_ids(marker) -> list[int]:
     """The entry ids of a batch marker, in its order."""
-    return [e["id"] for e in (push._read(Path(marker)).get("entries") or []) if isinstance(e, dict)
+    return [e["id"] for e in (read_dict(Path(marker)).get("entries") or []) if isinstance(e, dict)
             and isinstance(e.get("id"), int)] if marker else []
 
 
@@ -1944,7 +1945,7 @@ def _spawn(p: Project, bid: str, marker: Path, lock) -> subprocess.Popen:
     push.detach does), in a session of its own so a daemon restart leaves it running. It starts once
     its stdin closes: the go, given after the marker is complete. It runs niced like the workers
     (runner.nice), checks and after_push commands included."""
-    output = checkdirs.restore(p.state, push._read(marker).get("check_run_dir"))
+    output = checkdirs.restore(p.state, read_dict(marker).get("check_run_dir"))
     guard = checkdirs.take(output)
     if guard is None:
         raise OSError("check scratch is busy")
@@ -2019,7 +2020,7 @@ def start(p: Project, rows: list[dict], name: str, now: float | None = None, ext
             child.stdin.close()      # the go
         prev = db.one("SELECT * FROM push_batches WHERE outcome='rebooted' AND id!=? ORDER BY started DESC LIMIT 1",
                       (bid,))
-        if prev and push._read(Path(prev["marker"])).get("rerun_by") is None:
+        if prev and read_dict(Path(prev["marker"])).get("rerun_by") is None:
             _close_marker(prev, {"rerun_by": bid})
     except _Changed:
         marker.unlink(missing_ok=True)
@@ -2048,7 +2049,7 @@ def _batch_notes(db, rows: list[dict]) -> dict:
     if iso := _setup_isolate(db):
         m["setup_isolate"] = iso    # alerted setup_fault checks: their next setup fault isolates an entry
     last = db.one("SELECT id, outcome, marker FROM push_batches ORDER BY started DESC LIMIT 1")
-    if last and last["outcome"] == "rebooted" and last["marker"] and not push._read(Path(last["marker"])).get("rerun_by"):
+    if last and last["outcome"] == "rebooted" and last["marker"] and not read_dict(Path(last["marker"])).get("rerun_by"):
         was, ids = _marker_ids(last["marker"]), [r["id"] for r in rows]
         m["resumes"] = {"batch": last["id"], "kept": [i for i in was if i in ids],
                         "left_out": [i for i in was if i not in ids], "added": [i for i in ids if i not in was]}
@@ -2268,11 +2269,11 @@ def alive(marker: Path) -> tuple[bool, dict]:
     the order push.result uses: read the marker, test the lock it names, read it again. A lock field
     that changed meanwhile (the batch moved to its after_push lock) is tested again. A batch is dead
     when it is not finished and its current lock is free; a missing marker is a dead batch."""
-    m = push._read(marker)
+    m = read_dict(marker)
     for _ in range(MARKER_READS):
         lock = m.get("lock")
         free = locks.any_free([Path(lock)]) if lock else True
-        again = push._read(marker)
+        again = read_dict(marker)
         if again.get("lock") == lock:
             return not free and again.get("phase") != "finished", again
         m = again
@@ -2331,7 +2332,7 @@ def _close_marker(b: dict, extra: dict | None = None) -> None:
     """Rewrite the batch's marker as finished with the DB row's outcome and end (atomic, never inside a
     transaction), so a file never stays `running` once its row is final. A live batch is left alone."""
     marker = Path(b["marker"])
-    m = push._read(marker)
+    m = read_dict(marker)
     if not m or m.get("kind") != "batch" or not b.get("finalized"):
         return
     if m.get("status") == "finished" and m.get("outcome") and not extra:
@@ -2350,7 +2351,7 @@ def close_strays(p: Project) -> list[str]:
     done = []
     rows = p.db.q("SELECT * FROM push_batches WHERE finalized IS NOT NULL ORDER BY started")
     for i, b in enumerate(rows):
-        m = push._read(Path(b["marker"]))
+        m = read_dict(Path(b["marker"]))
         if m and m.get("kind") == "batch" and m.get("status") == "running" and not m.get("outcome"):
             nxt = next((r["id"] for r in rows[i + 1:]), None) if b["outcome"] == "rebooted" else None
             _close_marker(b, {"rerun_by": nxt} if nxt else None)
@@ -2488,7 +2489,7 @@ def _recover_batch(p: Project, b: dict, marker: Path, m: dict, now: float) -> di
             since = float(pg["first_checked"])
         except (KeyError, TypeError, ValueError):
             since = now                                 # counted from the first look, kept across restarts
-            fresh = dict(push._read(marker) or m)
+            fresh = dict(read_dict(marker) or m)
             fresh["pushing"] = {**(fresh.get("pushing") if isinstance(fresh.get("pushing"), dict) else pg),
                                 "first_checked": now}
             write_json(marker, fresh)
@@ -2500,7 +2501,7 @@ def _recover_batch(p: Project, b: dict, marker: Path, m: dict, now: float) -> di
     if not on:
         return m
     also = push.fast_forward_list(_delivery(p).get("fast_forward_also"))
-    m = dict(push._read(marker) or m)
+    m = dict(read_dict(marker) or m)
     m.update(outcome="pushed", pushed_sha=sha, tip=pg.get("tip"), version=pg.get("version"),
              results=pg.get("results") or [], checks=pg.get("checks") or {}, rounds=pg.get("rounds"),
              message=None, recovered=now)
@@ -3266,7 +3267,7 @@ def _resume_after_push(p: Project, b: dict, marker: Path, now: float, free: bool
                                "AND after_finalized IS NULL", (0 if free else 1, b["id"], MAX_RESUMES,
                                                                int(free))).rowcount:
             return False
-        m = push._read(marker)
+        m = read_dict(marker)
         for k in ("after_held", "held_said"):
             m.pop(k, None)
         if deferred:     # its deferred outcome goes, so the batch runs after_push again (batch._resume)
@@ -3374,7 +3375,7 @@ def tend_receipts(p: Project, alert: Callable = lambda *a, **k: None, now: float
     folder = p.state / batch.RECEIPTS
     done = []
     for receipt in sorted(folder.glob("*.json")) if folder.is_dir() else []:
-        m = push._read(receipt)
+        m = read_dict(receipt)
         if not m:
             continue
         if m.get("reported"):
@@ -3391,9 +3392,9 @@ def tend_receipts(p: Project, alert: Callable = lambda *a, **k: None, now: float
             m["status"] = "running"     # its rerun never got going: reported below as stopped
             write_json(receipt, m)
         cut = m.get("status") == "running" and locks.any_free([batch._after_lock(p, rid)]) \
-            and push._read(receipt).get("status") == "running"    # read after the lock: the outcome is written before it goes
+            and read_dict(receipt).get("status") == "running"    # read after the lock: the outcome is written before it goes
         if cut and (newer := _newer_deploy(p, folder, m)):
-            m = push._read(receipt)     # a newer deploy of the same branch replaced it: recorded, never run again
+            m = read_dict(receipt)     # a newer deploy of the same branch replaced it: recorded, never run again
             m.update(status="finished", ended=now, after_push={
                 "status": "superseded", "exit": None, "started": m.get("started"), "by": newer,
                 "tail": f"stopped before it finished; {newer}'s after_push deploys a newer push of {m.get('target')}"})
@@ -3409,7 +3410,7 @@ def tend_receipts(p: Project, alert: Callable = lambda *a, **k: None, now: float
         if m.get("status") == "running":
             if not cut:
                 continue
-            m = push._read(receipt)
+            m = read_dict(receipt)
             if m.get("status") == "running":
                 m.update(status="finished", ended=now, after_push={
                     "status": "killed", "exit": None, "started": m.get("started"),
@@ -3451,7 +3452,7 @@ def _newer_deploy(p: Project, folder: Path, m: dict, batch: str | None = None) -
     if not target or not started:
         return ""
     for other in sorted(folder.glob("*.json"), reverse=True):
-        o = push._read(other)
+        o = read_dict(other)
         if o and o.get("id") != m.get("id") and o.get("target") == target and o.get("status") != "held" \
                 and float(o.get("started") or 0) > started:
             return f"push {_short(o.get('pushed_sha'))}"
@@ -3466,7 +3467,7 @@ def _newer_deploy(p: Project, folder: Path, m: dict, batch: str | None = None) -
 def _rerun_receipt(p: Project, receipt: Path, rid: str, now: float) -> None:
     """An ordinary push's after_push that waited for a power-cycle notice (no resume spent) or that a reboot
     cut short (once, MAX_RESUMES): run it again, detached (batch.rerun_receipt), once no notice holds."""
-    m = push._read(receipt)
+    m = read_dict(receipt)
     if _cycle_held(p, None):
         return
     if m.get("status") == "rerun" and float(m.get("rerun_at") or 0) > now - RERUN_START_S:
@@ -3833,7 +3834,7 @@ def summary(p: Project, now: float | None = None, last: int = SUMMARY_LAST, db=N
     live = None
     b = db.one("SELECT * FROM push_batches WHERE after_finalized IS NULL ORDER BY started DESC LIMIT 1")
     if b:
-        m = push._read(Path(b["marker"]))
+        m = read_dict(Path(b["marker"]))
         live = {"id": b["id"], "target": b["target"], "age_s": round(now - b["started"], 1),
                 "phase": m.get("phase") or ("after_push" if b["finalized"] else "push"),
                 "rows": db.one("SELECT COUNT(*) n FROM push_queue WHERE batch=?", (b["id"],))["n"]}

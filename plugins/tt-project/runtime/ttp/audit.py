@@ -62,19 +62,12 @@ from typing import Any
 from . import budget, chaincap, dailyspend, checkprestage, coordfix, coordmodel, correction, ends, gatejudge, gatetime, landed, obligations, outscan, plainreply, planuse, quietgate, relay, replan, reviewstats, routinedefault, route, rulecite, schedule, settlehook, sharedchecks, stalegate, suitecost, sweepskip, timefmt, turngate, unblock, upstream, wakesettle
 from .db import DB, continues_id, load_result
 from .project import Project
+from .util import loads_dict
 
 WINDOW_S = 86400
 BLOCKED_H = 12.0   # review.blocked_long_h: a task blocked this long is listed
 NOTHING = "nothing to grade"
 TOP = 5   # rows listed per section; the rest are counted
-
-
-def _note(raw: Any) -> dict:
-    try:
-        note: Any = json.loads(raw or "{}")
-    except ValueError:
-        return {}
-    return note if isinstance(note, dict) else {}
 
 
 def _short(text: str, n: int = 160) -> str:
@@ -197,7 +190,7 @@ def lost_runs(db: DB, since: float) -> dict[str, dict]:
                 f"({','.join('?' * len(budget.WASTED))})", (since, *budget.WASTED))
     kept = db.resumed_run_ids(min(int(r["id"]) for r in rows)) if rows else set()
     for r in rows:
-        cause = _note(r["note"]).get("not_waste")
+        cause = loads_dict(r["note"]).get("not_waste")
         if cause and cause != "handoff":   # a hand-off that stood is an outcome
             c = out.setdefault(str(cause), {"n": 0, "usd": 0.0, "kept_n": 0, "kept_usd": 0.0})
             c["n"] += 1
@@ -232,7 +225,7 @@ def coordinator_turns(db: DB, since: float) -> dict:
     out = {"n": len(rows), "usd": 0.0, "noop": 0, "noop_usd": 0.0, "idle": 0, "idle_usd": 0.0,
            "starve": 0, "starve_usd": 0.0, "logged": 0}
     for r in rows:
-        note, usd = _note(r["note"]), float(r["cost_usd"] or 0)
+        note, usd = loads_dict(r["note"]), float(r["cost_usd"] or 0)
         out["usd"] += usd
         due = "starve" if note.get("wake_due") == "starve" else "idle" if note.get("wake_due") else None
         if due and not note.get("messages") and not note.get("events"):
@@ -300,7 +293,7 @@ def no_change_code(db: DB, since: float) -> dict:
     left = [t for t in rows if t["id"] not in covered]
     seen = landed.Rows(db, [t["id"] for t in left]) if left else None
     for t in left:
-        res = _note(t["result"])
+        res = loads_dict(t["result"])
         if res.get("pr") or res.get("published") or landed.recorded(db, t["id"], rows=seen)[0]:
             continue
         out.append({"id": t["id"], "title": t["title"], "usd": float(t["spent_usd"] or 0)})

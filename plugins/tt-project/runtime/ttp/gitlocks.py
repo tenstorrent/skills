@@ -36,6 +36,8 @@ import subprocess
 import time
 from pathlib import Path
 
+from .liveness import pid_alive
+
 STALE_S = 600.0
 ROOT_STALE_S = 3600.0
 KEEP_DIR = "ttp-stale-locks"
@@ -113,16 +115,6 @@ def _is_git(args: str) -> bool:
     return name == "git" or name.startswith("git-")
 
 
-def _alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except OSError:
-        return True
-    return True
-
-
 def _cwd(pid: int) -> Path | None:
     try:
         return Path(os.readlink(f"/proc/{pid}/cwd"))
@@ -170,7 +162,7 @@ def holders(repo: Path, gdir: Path, locks: list[Path], procs: list[tuple[int, st
             out.append(pid)
             continue
         cwd = _cwd(pid)
-        if cwd is None and not _alive(pid):
+        if cwd is None and not pid_alive(pid):
             continue   # ended since ps listed it
         if cwd is None or _within(cwd.resolve(), roots):
             out.append(pid)
