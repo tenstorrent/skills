@@ -8454,6 +8454,23 @@ def _said_in(p: Project, query: str, limit: int, since: float = 0.0) -> list[dic
         con.close()
 
 
+def cmd_chat_load(a) -> None:
+    """`ttp chat-load`: the host's chat-call outcomes over the trailing minutes (inflight.load)."""
+    from . import inflight
+    got = inflight.load(max(0.0, float(a.minutes)))
+    if a.json:
+        print(json.dumps(got, indent=2))
+        return
+    def line(name: str, t: dict) -> str:
+        return f"{name}: {t['calls']} calls, {t['refusals']} refusals ({t['refusal_pct']}%), {t['errors']} errors"
+    print(line(f"last {got['minutes']:g} min", got))
+    for c in reversed(inflight.CLASSES):
+        if got["by_class"][c]["calls"]:
+            print("  " + line(f"class {c}", got["by_class"][c]))
+    for p_, t in got["by_project"].items():
+        print("  " + line(f"project {p_ or '(none)'}", t))
+
+
 def cmd_said(a) -> None:
     """`ttp said <words>`: the newest of the user's own recorded messages on a topic (every word, or
     its ids, aliases and keys with half the words), read-only, with id, date and the verbatim quote
@@ -16062,7 +16079,7 @@ COMMAND_GROUPS = (
                                          "deployed", "goal", "hours")),
     ("admin", ("setup", "upgrade", "start", "stop", "restart", "remove", "adopt", "prune", "secret", "consent",
                "notifier", "schedules", "heal", "upstream", "lease", "replicate", "check-plan", "stats", "audit",
-               "push-audit", "ttr", "selfchange", "spend-today", "throughput", "model-trip", "echoes", "course",
+               "push-audit", "ttr", "selfchange", "chat-load", "spend-today", "throughput", "model-trip", "echoes", "course",
                "uninstall", "bench", "model-bench", "model", "waste", "slop", "bridge", "gh-queue", "move", "landings")),
 )
 
@@ -16809,6 +16826,12 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--all-projects", action="store_true",
                    help="read every project's messages on this host (read-only), each labelled `<project> msg #N`")
     s.set_defaults(fn=cmd_said)
+    s = sub.add_parser("chat-load", help="this host's finished chat-provider calls over the trailing minutes: calls, "
+                                         "refusals (429, 503, 529), errors and refusal rate, in total, by priority "
+                                         "class and by project (read-only)")
+    s.add_argument("--minutes", type=float, default=60.0, help="the window, in minutes (default 60; at most 120 are kept)")
+    s.add_argument("--json", action="store_true", help="print the counts as JSON")
+    s.set_defaults(fn=cmd_chat_load)
 
     s = sub.add_parser("model-trip", help="strata the model-pick tripwire sent back to the core model; --h2h "
                                           "records a head-to-head result (a passing one re-enables routing)")

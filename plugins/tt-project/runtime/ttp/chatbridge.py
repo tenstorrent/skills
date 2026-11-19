@@ -1310,6 +1310,7 @@ class Bridge:
             if code in inflight.REFUSALS and inflight.refused():   # the host backs off at once
                 with self._swap_lock:
                     self.inflight.refusals += 1
+            inflight.record_call(code if isinstance(code, int) else 0)
             call.end(0, "capacity" if code in (429, 503) else "other")
             raise
         h.ttp_call, h.ttp_slot = call, slot
@@ -1322,6 +1323,7 @@ class Bridge:
             slot.release()
         if call is not None:
             call.end(out, status)
+            inflight.record("ok" if status == "ok" else "error")
 
     def _open(self, req: dict):
         r = urllib.request.Request(f"{self.base_url}/chat/completions", data=json.dumps(req).encode(), headers={

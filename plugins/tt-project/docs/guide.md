@@ -1989,9 +1989,15 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    `tool_choice` `auto` (some endpoints refuse a forced choice), validates each call with
    jsonschema from a virtual environment (the checks env), never the user's site-packages, and
    prints the valid, invalid, wrong-tool, refused and junk counts as JSON.
-   Calls from a process with `TTP_CHAT_PRIORITY=low` in its environment (`ttp bench`, `ttp
-   model-bench` and the probe set it, and their children inherit it) take no free slot while a
-   project's call is waiting for one.
+   Calls take a priority class from `TTP_CHAT_PRIORITY` in their environment: `low` (`ttp bench`,
+   `ttp model-bench` and the probe set it, and their children inherit it), `mid`, or normal (unset
+   or anything else). A call takes no free slot while a call of a higher class (normal, then mid,
+   then low) is waiting for one. Every finished call's outcome (ok, refusal for 429, 503 or 529, or
+   error) is kept for 2 hours in the host's record beside the slots, with its class and project;
+   `ttp chat-load [--minutes 60] [--json]` prints the trailing window's calls, refusals, errors and
+   refusal rate in total, by class and by project, so a project's own watcher can act on the rate.
+   A bench runner that calls the endpoint itself records its calls with
+   `inflight.record_call(status, project)`.
 8. Vendor defaults, off by default: `"vendor_defaults": true` under `providers.chat` applies a
    model family's published settings, each a lever you can also turn on alone with an object such
    as `{"sampling": true, "effort_map": true}`. The levers: `sampling` (GLM: temperature 1.0 and

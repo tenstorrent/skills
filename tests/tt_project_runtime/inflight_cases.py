@@ -431,3 +431,100 @@ def test_inflight_low_priority_calls_wait_while_a_normal_call_waits(env):
         assert s.index == 0, "no normal call waits: the low call goes"
     (inflight.folder() / "wait.999999.dead").write_text("")   # a waiter that died: no flock on it
     assert not inflight.normal_waiting() and not (inflight.folder() / "wait.999999.dead").exists()
+
+
+def test_inflight_a_mid_call_waits_behind_a_waiting_normal_call_and_ahead_of_a_waiting_low_call(env):
+    from ttp import inflight
+    _cap(1)
+    assert [inflight.priority({"TTP_CHAT_PRIORITY": v}) for v in ("mid", " LOW ", "high", "")] == \
+        ["mid", "low", "normal", "normal"]
+    d = inflight.folder()
+    d.mkdir(parents=True, exist_ok=True)
+    normal = inflight._mark_waiting(d, "normal")
+    assert inflight.acquire(0, cls="mid") is None, "a mid call yields to a waiting normal call"
+    assert inflight.acquire(0, cls="low") is None, "and so does a low call"
+    inflight._unmark(normal)
+    mid = inflight._mark_waiting(d, "mid")
+    assert inflight.waiting("mid") and not inflight.normal_waiting()
+    assert inflight.acquire(0, cls="low") is None, "a low call yields to a waiting mid call"
+    with inflight.acquire(0, cls="normal") as s:
+        assert s.index == 0, "a normal call goes ahead of a waiting mid call"
+    with inflight.acquire(0, cls="mid") as s:
+        assert s.index == 0
+    inflight._unmark(mid)
+    ticks, seen = iter(range(100)), []
+    held = inflight.acquire(0, cls="mid")
+    assert inflight.acquire(2, cls="mid", sleep=lambda s: seen.append(inflight.waiting("mid")),
+                            clock=lambda: next(ticks)) is None and seen and all(seen), "a mid call marks itself while it waits"
+    assert not inflight.waiting("mid")
+    held.release()
+    with inflight.acquire(0, cls="low") as s:
+        assert s.index == 0, "nothing waits: the low call goes"
+
+
+def test_inflight_call_outcomes_are_counted_by_class_and_project_over_the_trailing_window(env):
+    from ttp import inflight
+    now = 100_000.0
+    assert [inflight.outcome(c) for c in (None, 200, 429, 503, 529, 500, 0)] == \
+        ["ok", "ok", "refusal", "refusal", "refusal", "error", "error"]
+    for i, (st, cls, proj) in enumerate([(200, "normal", "a"), (429, "normal", "a"), (200, "mid", "b"),
+                                         (529, "low", None), (500, "low", None)]):
+        assert inflight.record_call(st, proj, cls, now=now - 60 * i)
+    assert inflight.record_call(200, "a", "normal", now=now - 3600)   # outside a 30-minute window
+    got = inflight.load(30, now=now)
+    assert (got["calls"], got["refusals"], got["errors"], got["refusal_pct"]) == (5, 2, 1, 40.0)
+    assert got["by_class"]["normal"] == {"calls": 2, "refusals": 1, "errors": 0, "refusal_pct": 50.0}
+    assert got["by_class"]["low"]["refusals"] == 1 and got["by_class"]["mid"]["calls"] == 1
+    assert set(got["by_project"]) == {"a", "b", ""} and got["by_project"][""]["calls"] == 2
+    assert inflight.load(120, now=now)["calls"] == 6
+
+
+def test_inflight_call_outcomes_older_than_two_hours_are_pruned(env):
+    from ttp import inflight
+    now = 100_000.0
+    inflight.record("ok", "normal", "a", now=now - inflight.KEEP_S - 5)
+    inflight.record("refusal", "normal", "a", now=now - 10)
+    assert inflight.prune(now) == 1
+    rows = inflight._rows(inflight.folder())
+    assert [r["outcome"] for r in rows] == ["refusal"]
+    inflight.record("ok", "normal", "a", now=now + 1)   # pruned just now: no second prune yet
+    assert len(inflight._rows(inflight.folder())) == 2
+
+
+def test_inflight_concurrent_outcome_records_keep_every_line(env):
+    from ttp import inflight
+    script = _tw.dedent("""
+        import sys
+        sys.path.insert(0, sys.argv[1])
+        from ttp import inflight
+        for _ in range(int(sys.argv[2])):
+            assert inflight.record("ok", "low", "p")
+    """)
+    procs = [_sp.Popen([_sys.executable, "-c", script, str(RUNTIME), "60"], env={**os.environ}) for _ in range(6)]
+    assert all(p.wait(60) == 0 for p in procs)
+    assert inflight.load(60)["calls"] == 360
+
+
+def test_chatbridge_records_each_call_outcome_with_its_class(env, mock_chat, monkeypatch):
+    from ttp import inflight
+    from ttp.chatbridge import Bridge
+    monkeypatch.setenv("TTP_CHAT_PRIORITY", "mid")
+    ok = (200, {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]})
+    up = mock_chat(ok, (429, {"error": {"message": "slow down"}}), ok)
+    hi = {"max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]}
+    with Bridge(up.url, _CB_KEY, "example/model") as b:
+        b._sleep, b._jitter = (lambda s: None), (lambda w: w)
+        assert _post(b, hi)[0] == 200 and _post(b, hi)[0] == 200
+    got = inflight.load(5)
+    assert (got["calls"], got["refusals"]) == (3, 1) and got["by_class"]["mid"]["calls"] == 3
+
+
+def test_chat_load_cli_prints_the_window_counts_as_json(env):
+    from ttp import inflight
+    inflight.record("refusal", "normal", "a")
+    inflight.record("ok", "normal", "a")
+    r = _sp.run([_sys.executable, "-m", "ttp", "chat-load", "--minutes", "10", "--json"], cwd=str(RUNTIME),
+                env={**os.environ}, capture_output=True, text=True, timeout=60)
+    got = json.loads(r.stdout)
+    assert r.returncode == 0 and got["minutes"] == 10 and (got["calls"], got["refusal_pct"]) == (2, 50.0)
+    assert set(got) >= {"since", "refusals", "errors", "by_class", "by_project"}
