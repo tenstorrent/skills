@@ -382,7 +382,7 @@ def test_eta_a_task_waiting_on_another_tasks_landing_starts_after_that_landing(e
             assert e["why"] is None and e["end"] == pytest.approx(max(n_end, now) + 600 if n_end > now else own), state
             assert e["path"] == ([t, n] if n_end > now else [t]), state
         assert eta.obligation_estimate(p.db, o, now)["end"] == pytest.approx(eta.estimate(p.db, w, now)["end"]), state
-        assert eta.estimate(p.db, other, now)["end"] == pytest.approx(own), state   # a mixed probe is not judged
+        assert eta.estimate(p.db, other, now)["gated"], state   # a mixed probe is a start gate: no clock time
     check(now + 100 + 1000 + 1700 + 600, "queued")   # before the fix: deploy it showed now + 600
     p.db.update_task(n, status="running")
     p.db.x("INSERT INTO runs(task, role, started, status) VALUES(?, 'worker', ?, 'running')", (n, now - 400))
@@ -551,6 +551,45 @@ def test_eta_time_and_landing_waits_keep_their_estimates(env):
     d = p.db.add_task("deferred", "s", kind="work", labels=["start_when:ssh box true"])
     p.db.update_task(d, result=json.dumps({"status": "waiting", "retry_when": "ssh box true"}))
     assert eta.outside_wait(p.db.task(d), now) is None
+
+
+def test_eta_a_start_gated_task_has_no_estimate_and_a_start_after_is_its_earliest_start(env):
+    """An unmet start_when gives 'no estimate (gated: ...)' for the task, its dependants and a promise it
+    alone owns, never 'queue 0m, run 2m' from now; a start_after or clock start_when is the earliest start,
+    the measured run on top; an ungated task is unchanged."""
+    from ttp import eta
+    p = make(env)
+    now = time.time()
+    _eta_history(p, now)                                   # run median 1200, queue wait median 300
+    plain = p.db.add_task("ungated", "s", kind="work")
+    assert eta.estimate(p.db, plain, now)["end"] == pytest.approx(now + 300 + 1200)
+    assert "gated" not in eta.estimate(p.db, plain, now)
+    g = p.db.add_task("after the box", "s", kind="work", labels=["start_when:ssh box-a true", "start_why:box-a is back up"])
+    e = eta.estimate(p.db, g, now)
+    assert e["end"] is None and e["gated"] and e["legs"] == []
+    assert eta.field(e, "UTC", now) == f"ETA: no estimate (gated: #{g} starts when box-a is back up)"
+    assert eta.text(e, "UTC", now) == eta.field(e, "UTC", now)
+    w = p.db.add_task("after the demo", "s", kind="work", labels=["start_when:test -e state/user-demo-over"])
+    assert eta.field(eta.estimate(p.db, w, now), "UTC", now) == \
+        f"ETA: no estimate (gated: #{w} starts when `test -e state/user-demo-over` passes)"
+    d = p.db.add_task("after it", "s", kind="work", depends_on=[g])
+    e = eta.estimate(p.db, d, now)
+    assert e["gated"] and e["path"] == [d, g] and eta.field(e, "UTC", now).startswith("ETA: no estimate (gated: #")
+    o = _eta_promise(p, w, "c1", "I'll post here when the demo is over.", now)
+    assert eta.obligation_estimate(p.db, o, now)["gated"]
+    u = [p.db.add_task(f"urgent {i}", "urgent: x", kind="work", priority=1,
+                       labels=["start_when:test -e state/user-x", "start_why:the user says go"]) for i in range(2)]
+    lines = eta.state_lines(p.db, "UTC", now)
+    assert f"- #{u[0]}, #{u[1]}: ETA: no estimate (gated: starts when the user says go)" in lines, lines
+    assert any(x.startswith(f"- promise {o['id']}: ETA: no estimate (gated: #{w} ") for x in lines), lines
+    # A start_after, or a clock start_when, is the earliest start: waited out in the queue leg, the run on top.
+    a = p.db.add_task("later", "s", kind="work", labels=[f"start_after:{now + 5000}"])
+    p.db.x("UPDATE tasks SET not_before=? WHERE id=?", (now + 5000, a))
+    e = eta.estimate(p.db, a, now)
+    assert e["deferred"] == now + 5000 and e["end"] == pytest.approx(now + 5000 + 300 + 1200) and "gated" not in e
+    c = p.db.add_task("at a time", "s", kind="work", labels=[f'start_when:test "$(date +%s)" -ge {int(now) + 4000}'])
+    e = eta.estimate(p.db, c, now)
+    assert e["deferred"] == int(now) + 4000 and e["end"] == pytest.approx(int(now) + 4000 + 300 + 1200)
 
 
 def test_eta_a_woken_outside_wait_is_due_and_keeps_the_queue_and_run_legs(env):

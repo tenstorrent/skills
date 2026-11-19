@@ -1996,7 +1996,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
         est = None
     for t in hot[:8]:   # the urgent lane: each waiting urgent task, with how long it has waited and its ETA
         try:
-            fin = f", {eta.field(e, p, now)}" if est and ((e := est.task(t["id"]))["end"] or e.get("after")) else ""
+            fin = f", {eta.field(e, p, now)}" if est and ((e := est.task(t["id"]))["end"] or e.get("after") or e.get("gated")) else ""
         except Exception:
             fin = ""
         # A future not_before (start_after, the tests gate) is when it can start at all: say so, never

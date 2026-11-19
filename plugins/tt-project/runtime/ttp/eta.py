@@ -33,15 +33,21 @@ last WINDOW_S days), never a worst case or padding:
   only of landing waits counts the same, never as its next probe time. A gated task with no live owner
   (done but not landed, with no open review, fix, rebase or push row carrying it on: deadwait.path; or
   failed, cancelled or abandoned), or one whose own estimate has none, gives no clock time: the estimate
-  carries `after` ('landed:#N') and field() reads 'ETA: after landed:#N (why)'. Any other probe is not
-  judged, except a merge gate (merge_gate: `gh pr view <n>` or `gh api .../pulls/<n>` reading the
-  PR's state or merge), which reads 'after PR #<n> merges or closes' unless the hand-off measured an eta.
+  carries `after` ('landed:#N') and field() reads 'ETA: after landed:#N (why)'. A merge gate (merge_gate:
+  `gh pr view <n>` or `gh api .../pulls/<n>` reading the PR's state or merge) reads 'after PR #<n> merges
+  or closes' unless the hand-off measured an eta.
+- start gate: a queued or waiting task's unmet start_when (the daemon drops it once it passes) that is
+  no landing wait or merge gate has no estimate: it may never pass, so it is never a run starting now.
+  The estimate carries `gated` and field() reads 'ETA: no estimate (gated: #N starts when <start_why, else
+  the probe> ...)', for every task and promise whose path reaches it. A bare clock gate (daemon.time_gate)
+  is a start_after instead: a queued task's not_before (start_after) or clock gate is its earliest start,
+  waited out in its queue leg, with the measured run of its kind and tier on top.
 - outside work: a waiting task whose retry_when watches work outside the harness (outside_wait: any
   probe but a bare clock gate or a landing wait, such as a Slurm job, a detached run or a peer's ack) has
   no measured finish yet, unless its hand-off gives `eta` (epoch, or ISO time with offset, still ahead)
   with `eta_basis` (the measurement behind it), or a `ttp progress report --eta --eta-basis` of the task
   since it began waiting does (the newest valid one wins): then it finishes at that eta, plus the median
-  run only when no on_pass_cmd ends it. Its next probe time is never taken for its finish. A wait the
+  run only when no on_pass_cmd ends it. Its next probe time is never taken for its finish; with no measured eta it is gated like a start gate. A wait the
   daemon already woke (`woke` in its hand-off) is due and keeps the usual queue and run legs.
 - hold: a queued or waiting task whose provider's spend gate (kv `gates`) allows no new work starts no
   earlier than the gate's known reset (budget.hold_clears: a cap's period end, a plan window's reset,
@@ -417,7 +423,10 @@ class _Est:
     def _from(self, tid, e: dict) -> dict:
         """No estimate for `tid` because the task `e` estimates on its path has none: its why and gate."""
         return {**self._none(tid, e["why"]), "path": [tid] + e["path"],
-                **({"after": e["after"]} if e.get("after") else {})}
+                **{k: e[k] for k in ("after", "gated") if e.get(k)}}
+
+    def _gated(self, tid: int, why: str, path: list) -> dict:
+        return {**self._none(tid, why), "path": path, "gated": True}
 
     def _gate_dead(self, n: int, waiter: int) -> str | None:
         """Why gated task `n`, not landed, has no live owner to land it ('' -> None: it has one): failed,
@@ -485,7 +494,8 @@ class _Est:
                 legs.append(("review", left))
             done = now + sum(x for _, x in legs)
         else:
-            from .db import dependency_ids
+            from .daemon import time_gate
+            from .db import deferral, dependency_ids
             crit = None
             for d in dependency_ids(t):
                 if d is None:
@@ -516,6 +526,11 @@ class _Est:
                     return self._after(tid, e.get("after") or f"landed:#{n}", e["why"], [tid] + e["path"])
                 if e["end"] > start:   # its own finish, review and landing: the probe passes then
                     start, path = e["end"], [tid] + e["path"]
+            tg = None
+            if st != "running" and (when := deferral(t).get("when")) and not landing_waits(t) \
+                    and merge_gate(when) is None and (tg := time_gate(when)) is None:
+                why = deferral(t).get("why")
+                return self._gated(tid, f"#{tid} starts when " + (why or f"`{when.strip()[:120]}` passes"), path)
             runs = self._run(t)
             lx = self._loadx() if not (long_job(t) is not None) else 1.0   # a long job runs on its own host
             if lx > 1.0:
@@ -531,7 +546,7 @@ class _Est:
             if st != "running" and (pr := merge_gate(gate_probe(t))) is not None and not (ow and ow["at"]):
                 return self._after(tid, f"PR #{pr} merges or closes", "a merge gate has no measured finish", path)
             if ow and ow["at"] is None:
-                return {**self._none(tid, f"#{tid} waits on outside work: no measured finish yet"), "path": path}
+                return self._gated(tid, f"#{tid} waits on outside work: no measured finish yet", path)
             if not runs and not (ow and ow["follows"]):
                 return {**self._none(tid, f"no measured {t['kind']} run yet"), "path": path}
             if ow:   # its hand-off's measured eta; a median run after it unless an on_pass_cmd ends the task
@@ -549,7 +564,7 @@ class _Est:
                 left, over = self._left(runs, now - float(r["started"])) if r and r["started"] else (self._m(runs), False)
                 legs.append(("run", left * lx))
             else:
-                nb = float(t.get("not_before") or 0)
+                nb = max(float(t.get("not_before") or 0), tg or 0)   # a clock start_when: its time
                 if st != "queued":
                     start = max(start, nb)
                 if hold := self._held(t):
@@ -663,6 +678,8 @@ def field(e: dict, where, now: float | None = None) -> str:
     from . import timefmt
     if e.get("after"):   # a landing or merge gate with no live owner or estimate: no clock time
         return f"ETA: after {e['after']} ({e['why']})"
+    if e.get("gated"):
+        return f"ETA: no estimate (gated: {e['why']})"
     if e["why"]:
         return f"ETA: no estimate yet ({e['why']})"
     path = "→".join(f"#{i}" for i in e["path"])
@@ -798,22 +815,22 @@ def state_lines(db, where, now: float | None = None, host=None, skip=()) -> list
     given: list = []
     out = ["## Expected finish (critical path: likely = measured median p50, conservative = p90; quote these, never padded worst cases)"]
     # no estimate for one gate and reason: one line (titles in Open tasks); the gate ('after') is kept
-    same: dict[tuple[str, str], list[tuple[dict, dict]]] = {}
+    same: dict[tuple[str, str, bool], list[tuple[dict, dict]]] = {}
     for t in hot[:10]:
         on = host(t) if host else ""
         e = corrected(db, with_p90(est, est.task(t['id']), t['id']), now)
         given.append((f"t{t['id']}", etaledger.kind_of(db, e), e))
         why = str(e["why"] or "").removeprefix(f"#{t['id']} ")
         if why and not on:
-            same.setdefault((str(e.get("after") or ""), why), []).append((t, e))
+            same.setdefault((str(e.get("after") or ""), why, bool(e.get("gated"))), []).append((t, e))
             continue
         out.append(f"- #{t['id']} {t['title'][:80]}: {field(e, where, now)}" + (f"; {on}" if on else ""))
-    for (after, why), got in same.items():
+    for (after, why, gated), got in same.items():
         ids = ", ".join(f"#{t['id']}" for t, _ in got)
         if len(got) == 1:
             out.append(f"- #{got[0][0]['id']} {got[0][0]['title'][:80]}: {field(got[0][1], where, now)}")
         else:
-            out.append(f"- {ids}: ETA: after {after} ({why})" if after else f"- {ids}: ETA: no estimate yet ({why})")
+            out.append(f"- {ids}: " + field({**got[0][1], "after": after, "why": why, "gated": gated}, where, now))
     due = {}
     for o in proms[:10]:
         e = obligation_estimate(db, o, now, est)

@@ -98,7 +98,7 @@ def test_the_daemon_refuses_a_code_hand_off_that_waits_on_its_own_landing(env, t
 
 
 def test_a_code_task_waiting_on_its_own_detached_push_waits_on_that_push(env, tmp_path):
-    # Review #8943's note: `ttp push --detach`, then a wait on its own landing, was refused while that push ran.
+    # A code task's wait on its own landing is taken on its own running or queued detached push; another task's push does not count.
     from ttp import ownwait
     from ttp.daemon import Daemon
     p = make(env)
