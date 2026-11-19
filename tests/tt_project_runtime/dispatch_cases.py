@@ -2449,7 +2449,8 @@ def test_slow_git_dispatch_starts_every_ready_task_in_one_step(env, monkeypatch,
         said = [" ".join(line.split()[1:]) for line in calls.read_text().splitlines()]
         root = f"-C {p.root} "
         for read in ("fetch --quiet origin", "status --porcelain=v1", "symbolic-ref --quiet --short refs/remotes/origin/HEAD"):
-            assert sum(c.startswith(root + read) for c in said) == 1, (read, said)
+            # `in`, not startswith: a fetch may carry `-c` options before `-C` (ghroute.push_argv)
+            assert sum(root + read in c for c in said) == 1, (read, said)
     finally:
         drain(d)
 
