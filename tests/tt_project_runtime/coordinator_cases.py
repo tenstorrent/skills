@@ -861,7 +861,7 @@ def test_a_hold_mute_never_stays_silent_past_its_cap(env):
                       (src, f"%{scr.MUTE_PERSISTS}%"))
 
     # escalate_after_h 0 (or over the cap) on a match naming a hold is capped, and the ack says so.
-    notes = coord.apply(p, [{"type": "observation_mute", "source": "watcher:hw", "match": "held", "hours": 48,
+    notes = coord.apply(p, [{"type": "observation_mute", "source": "watcher:hw", "match": "held by", "hours": 48,
                              "escalate_after_h": 0, "why": "the repair team has it"},
                             {"type": "observation_mute", "source": "watcher:sm", "match": "hold state", "hours": 48,
                              "escalate_after_h": 24},
@@ -878,7 +878,7 @@ def test_a_hold_mute_never_stays_silent_past_its_cap(env):
     scr.mute(p.db, "watcher:kk", "chip lines", 48, why="the vendor has it", escalate_after_h=0)
     t0 = time.time()
     for at in (t0 + i * 1800 for i in range(15)):   # every 30 min for 7 h
-        scr.count_muted(p.db, "watcher:hw", "box-a: held with no tenant", "high", now=at)
+        scr.count_muted(p.db, "watcher:hw", "box-a: held by the broker with no tenant", "high", now=at)
         scr.count_muted(p.db, "watcher:st", "box-a: state machine stuck in hold", "high", now=at)
         scr.count_muted(p.db, "watcher:kk", "box-a: chip lines low", "high", now=at, key="device_held")
         assert at - t0 >= scr.MUTE_HOLD_ESCALATE_H * 3600 or not asks("watcher:hw")
@@ -889,6 +889,14 @@ def test_a_hold_mute_never_stays_silent_past_its_cap(env):
     for at in (t0 + i * 1800 for i in range(17)):
         scr.count_muted(p.db, "watcher:x", "box-a: tray dropped", "high", now=at)
     assert asks("watcher:x") == []
+    # Nor does one whose text only uses the verb: 'holds' there is no device hold.
+    sock = "the socket dir holds files that are not sockets or links"
+    assert coord.apply(p, [{"type": "observation_mute", "source": "watcher:so", "match": "socket dir", "hours": 48,
+                            "escalate_after_h": 0, "why": "cleanup task owns it"}]) == []
+    assert not next(m for m in scr.mutes(p.db) if m["source"] == "watcher:so").get("hold")
+    for at in (t0 + i * 1800 for i in range(17)):
+        scr.count_muted(p.db, "watcher:so", f"host-a: {sock}", "high", now=at, key="socket_dir_junk")
+    assert asks("watcher:so") == []
 
 
 

@@ -115,7 +115,8 @@ def factor(db, kind: str) -> float:
 
 def shown(db, e: dict, now: float, kind: str = "") -> dict:
     """`e` (an eta.py estimate) with its time left scaled by the kind's factor: `end`, plus `raw_end`,
-    `factor`, `kind`, `conservative`. An estimate with no time left or none is returned as it is."""
+    `factor`, `kind`, `conservative`, and `p90_end` scaled alike (`raw_p90_end`: before). Neither of the
+    conservative times is ever before `end`. An estimate with no time left or none is returned as it is."""
     if e.get("why") or not e.get("end"):
         return e
     f = factor(db, kind)
@@ -132,7 +133,10 @@ def shown(db, e: dict, now: float, kind: str = "") -> dict:
             cons = max(cons, now + conservative_x(db) * (end - now))
     else:
         cons = now + conservative_x(db) * (end - now)
-    return {**e, "end": end, "raw_end": raw, "factor": f, "kind": kind, "conservative": max(cons, end)}
+    out = {**e, "end": end, "raw_end": raw, "factor": f, "kind": kind, "conservative": max(cons, end)}
+    if isinstance(p90, (int, float)):
+        out.update(p90_end=max(now + f * (p90 - now) if p90 > now else p90, end), raw_p90_end=p90)
+    return out
 
 
 def kind_of(db, e: dict) -> str:
@@ -204,7 +208,7 @@ def record(db, where, items: list[tuple[str, str, dict]], now: float, src: str =
             if src != "cli":
                 continue
         row = {"ts": round(now, 1), "ref": ref, "kind": kind, "src": src, "likely": e.get("raw_end", e["end"]),
-               "shown": e["end"], "conservative": e.get("conservative") or e["end"]}
+               "shown": e["end"], "conservative": max(e.get("conservative") or e["end"], e["end"])}
         if due and due.get(ref):
             row["due"] = due[ref]
         if shadow_on:

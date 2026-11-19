@@ -160,8 +160,8 @@ def answers(alias: str, env: dict | None = None) -> bool | str:
 
 def _pm_agent(alias: str, env: dict | None) -> bool:
     """A password manager's agent serves ssh to `alias`: its IdentityAgent (read through `ssh -G` only)
-    or else SSH_AUTH_SOCK."""
-    agent = _ssh_config(alias).get("identityagent", "")
+    or else SSH_AUTH_SOCK. `env`: the confirm ssh's, so both read the same ssh and config."""
+    agent = _ssh_config(alias, env).get("identityagent", "")
     if agent and agent.lower() not in ("none", "ssh_auth_sock", "$ssh_auth_sock"):
         return sshagent.password_manager(agent)
     import os
@@ -224,10 +224,10 @@ def loopback(host: str) -> bool:
         return False
 
 
-def _ssh_config(alias: str) -> dict:
+def _ssh_config(alias: str, env: dict | None = None) -> dict:
     """`ssh -G <alias>`: the options ssh would use for it ({} when ssh cannot say)."""
     try:
-        r = subprocess.run(["ssh", "-G", alias], capture_output=True, text=True, timeout=10)
+        r = subprocess.run(["ssh", "-G", alias], env=env, capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
         return {}
     if r.returncode != 0:

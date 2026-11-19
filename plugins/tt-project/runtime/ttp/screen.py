@@ -551,12 +551,15 @@ MUTE_SLOTS_NEAR = 5   # the digest names the first mute to end once this few or 
 MUTE_BELOW = ("normal", "high", "critical")
 MUTE_ESCALATE_H = 2.0   # default escalate_after_h; 0 never escalates (needs a `why` naming who handles it)
 MUTE_ESCALATE_MIN_H = 0.5
-# A device hold never stays silent long: a mute whose match (or a condition it covers) names a hold asks
-# after at most this long, whatever escalate_after_h says (0 included). A hold with no tenant blocks work.
-# screen.hold_mute_escalate_h overrides it, within MUTE_ESCALATE_MIN_H..MUTE_HOLD_ESCALATE_MAX_H (hold_cap).
+# A device hold never stays silent long: a mute flagged `hold`, a watcher key naming one, or a match (or a
+# condition it covers) in a device-hold phrase (MUTE_HOLD_RE; never the bare verb, as in 'the dir holds
+# files') asks after at most this long, whatever escalate_after_h says (0 included). A hold with no tenant
+# blocks work. screen.hold_mute_escalate_h overrides it, within MUTE_ESCALATE_MIN_H..MUTE_HOLD_ESCALATE_MAX_H.
 MUTE_HOLD_ESCALATE_H = 1.0
 MUTE_HOLD_ESCALATE_MAX_H = 6.0
-MUTE_HOLD_RE = re.compile(r"\b(hold|holds|held|holder|holding)\b", re.I)
+MUTE_HOLD_RE = re.compile(r"\b(?:(?:device|box|chip|board|machine|node|host|reservation)(?:s|[-_]\w+)?\s+(?:hold|held)"
+                          r"|held\s+by|(?:on|in|under)\s+(?:a\s+)?hold|hold\s+state)\b", re.I)
+MUTE_HOLD_KEY_RE = re.compile(r"\b(hold|held|holder)\b", re.I)   # a watcher's key is a name, not prose
 # A muted condition not seen for this long has cleared: its next sighting starts a new clock. The
 # fallback for runs that never settle (failed or killed ones, sources other than command watchers).
 MUTE_CLEAR_GAP_S = 3 * 3600
@@ -628,7 +631,7 @@ def mute(db: DB, source: Any, match: Any, hours: Any, below: Any = None, why: An
             raise ValueError(f"observation_mute rejected: {MUTE_MAX} mutes are already active; let one end first")
         if esc is None:
             esc = float(old.get("escalate_after_h", MUTE_ESCALATE_H)) if old else MUTE_ESCALATE_H
-        held = holds_mute(match, old)
+        held = bool((old or {}).get("hold")) or holds_mute(match, old)
         if held and not 0 < esc <= cap_h:
             esc = cap_h
         probe = probe or (old or {}).get("end_when") or None
@@ -771,7 +774,7 @@ def _track(db: DB, m: dict, source: str, text: str, now: float, whole: bool = Fa
     armed = float(m.get("armed_at") or m["since"])
     esc_h = float(m.get("escalate_after_h", MUTE_ESCALATE_H))
     cap_h = _hold_cap_h(m)
-    named = bool(key and MUTE_HOLD_RE.search(key.replace("_", " ").replace("-", " ")))   # the watcher's own key
+    named = bool(m.get("hold")) or bool(key and MUTE_HOLD_KEY_RE.search(key.replace("_", " ").replace("-", " ")))
     for key, item, cleared in _mute_conditions(m, source, text, whole, key):
         held = named or MUTE_HOLD_RE.search(item)
         esc_c = cap_h if held and not 0 < esc_h <= cap_h else esc_h

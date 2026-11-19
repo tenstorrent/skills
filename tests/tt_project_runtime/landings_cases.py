@@ -156,6 +156,17 @@ def test_eta_factor_is_bounded_needs_samples_and_has_an_off_switch(env):
     got = etaledger.shown(p.db, e, now, "code")
     assert got["end"] == pytest.approx(now + 3000) and got["raw_end"] == e["end"] and got["factor"] == 3.0
     assert got["conservative"] > got["end"]
+    # A long outside-work leg whose p90 walk ends before the x3 likely time: neither conservative time
+    # is earlier than the likely one, in `ttp eta`, its --json, STATE's line or the ledger row.
+    leg = {"end": now + 10.4 * 3600, "p90_end": now + 18.8 * 3600, "why": None, "overrun": False,
+           "path": [7], "legs": [("outside work", 10.35 * 3600)]}
+    got = etaledger.shown(p.db, leg, now, "code")
+    assert got["end"] == pytest.approx(now + 31.2 * 3600) and got["raw_p90_end"] == leg["p90_end"]
+    assert got["conservative"] >= got["end"] and got["p90_end"] >= got["end"]
+    assert "conservative" in eta.field(got, p, now) and "corrected x3" in eta.text(got, p, now)
+    etaledger.record(p.db, p, [("t7", "code", got), ("t8", "code", {**got, "conservative": now})], now, src="cli")
+    rows = [r for r in etaledger.read(p.db) if r.get("ref") in ("t7", "t8")]
+    assert len(rows) == 2 and all(r["conservative"] >= r["shown"] for r in rows), rows
     assert etaledger.shown(p.db, e, now, "work")["end"] == e["end"]                  # no samples: untouched
     off = etaledger.factors(p.db, {"eta": {"correction": False}}, now)
     p.db.set_kv("eta_factors", off)
