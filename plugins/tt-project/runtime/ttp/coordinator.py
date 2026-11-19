@@ -4671,10 +4671,6 @@ def _words(text: str) -> frozenset[str]:
                      if w not in _STOP)
 
 
-def _jaccard(a: set, b: set) -> float:
-    return len(a & b) / len(a | b) if a | b else 0.0
-
-
 def looks_same(title1: str, spec1: str, title2: str, spec2: str) -> bool:
     """Same work under a near-identical title and spec. Titles that both name numbers (task ids,
     iterations, candidates) and name different ones are different work, however alike they read."""
@@ -4683,12 +4679,12 @@ def looks_same(title1: str, spec1: str, title2: str, spec2: str) -> bool:
     n1, n2 = (set(re.findall(r"\d[\w.-]*", t.lower())) for t in (title1, title2))
     if n1 and n2 and n1 != n2:
         return False
-    tj = _jaccard(_words(title1), _words(title2))
+    tj = tried._jaccard(_words(title1), _words(title2))
     if tj < 0.4:   # both verdicts below need this much: the specs' words are not built
         return False
     s1, s2 = _words(spec1), _words(spec2)
     # A spec of a word or two says nothing about the work; judge by the title alone then.
-    sj = _jaccard(s1, s2) if s1 and s2 and len(s1 | s2) >= 4 else tj
+    sj = tried._jaccard(s1, s2) if s1 and s2 and len(s1 | s2) >= 4 else tj
     return (tj >= 0.7 and sj >= 0.45) or (tj >= 0.4 and sj >= 0.7)
 
 

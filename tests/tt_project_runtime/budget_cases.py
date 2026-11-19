@@ -3,6 +3,8 @@
 # these tests under its name. Add new budget tests here, not there.
 from __future__ import annotations
 
+from ttp.daemon import BUDGET_SETTLE_S as _REAL_BUDGET_SETTLE_S   # read before the env fixture sets it to 0
+
 
 def test_caps_gate_escalates_and_blocks_new_work(env):
     p = make(env)
@@ -672,7 +674,8 @@ def _settling_gates(p, monkeypatch):
     makes a red gate from the reasons (green when none); age(s) moves every red class's start back."""
     from ttp import budget as bud
     from ttp.daemon import Daemon
-    monkeypatch.delenv("TTP_TEST_BUDGET_SETTLE_S")
+    from ttp import daemon as dm
+    monkeypatch.setattr(dm, "BUDGET_SETTLE_S", _REAL_BUDGET_SETTLE_S)
     d = Daemon(p.base)
 
     def settle(reasons: list[str], holds: bool = True, lane: bool = False) -> bud.Gate:
@@ -709,7 +712,7 @@ def test_a_provider_that_stops_reporting_plan_windows_is_a_status_line_not_a_red
     """A plan provider moving to the dollar caps, red only for the coordinator turn guard that move
     brings (urgent work still starts), is the gate's status line: no alert however long it lasts."""
     from ttp import alerts as al
-    from ttp.daemon import BUDGET_SETTLE_S
+    BUDGET_SETTLE_S = _REAL_BUDGET_SETTLE_S
     p = make(env)
     _, settle, age = _settling_gates(p, monkeypatch)
     lapsed = "fake stopped reporting plan windows; its spend counts toward the dollar caps"
@@ -727,7 +730,7 @@ def test_a_provider_that_stops_reporting_plan_windows_is_a_status_line_not_a_red
 
 
 def test_a_cap_red_alerts_once_only_after_it_still_holds_work_past_the_settle(env, monkeypatch):
-    from ttp.daemon import BUDGET_SETTLE_S
+    BUDGET_SETTLE_S = _REAL_BUDGET_SETTLE_S
     p = make(env)
     _, settle, age = _settling_gates(p, monkeypatch)
     cap = "cap reached: $120.00/24h of $100"
@@ -756,7 +759,7 @@ def test_a_cap_red_alerts_once_only_after_it_still_holds_work_past_the_settle(en
 def test_a_one_tick_cap_flap_is_no_alert(env, monkeypatch):
     """Red, green, red: each red is one read, so neither still holds after the settle. The start
     of a run of red reads resets at each break, however old the episode."""
-    from ttp.daemon import BUDGET_SETTLE_S
+    BUDGET_SETTLE_S = _REAL_BUDGET_SETTLE_S
     p = make(env)
     _, settle, age = _settling_gates(p, monkeypatch)
     cap = "cap reached: $120.00/24h of $100"
@@ -772,7 +775,7 @@ def test_a_cap_alert_is_withdrawn_once_only_a_self_lifting_red_holds(env, monkey
     """Once no cap or funds reason holds work, readers drop the alert at once and the sweep closes it
     with one cleared line, though the gate stays red for the runaway guard."""
     from ttp import alerts as al
-    from ttp.daemon import BUDGET_SETTLE_S
+    BUDGET_SETTLE_S = _REAL_BUDGET_SETTLE_S
     p = make(env)
     d, settle, age = _settling_gates(p, monkeypatch)
     cap = "cap reached: $120.00/24h of $100"
