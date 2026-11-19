@@ -92,8 +92,6 @@ TT_METAL_DISPATCH_TIMEOUT_COMMAND_TO_EXECUTE='"<workspace>/tt-metal/tools/tt-tri
 - NEVER leave it at the backend maximum.
 - Bound every wait or poll on the job by the same envelope.
 - Past it: load `recovery.md`.
-- NEVER loop on a marker a hung job won't print.
-- Profiler / tracy runs: keep the timeout especially tight.
 
 ## Failure handling
 

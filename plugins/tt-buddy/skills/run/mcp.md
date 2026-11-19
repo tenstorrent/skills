@@ -83,7 +83,8 @@ Mode-agnostic rows: `execution.md` § Failure handling.
 - The gate probes the device and resets until healthy.
 - Reset steps depend on platform and privileges.
 - The broker kills jobs on timeout or 300s silence.
-- Queue held: the gate is recovering. Wait. Confirm: `tt_device_queue_status` shows the queue not held.
+- Queue held: the gate is recovering. Wait.
+- Confirm: `tt_device_queue_status` shows the queue not held.
 
 ## Recovery substitutions
 

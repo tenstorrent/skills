@@ -7,7 +7,6 @@
 
 - `timeout_sec` is a ceiling, not a hang detector.
 - A wedged board prints a fatal marker, then hangs.
-- One incident: marker printed 23 min before the timeout fired.
 - Supervising a run: watch its live log for these signatures.
 - On a match, start recovery now. Don't wait for the exit code.
 
@@ -16,8 +15,7 @@ Fatal-wedge signatures (none recover on their own):
 
 - NOT a wedge: `TT_FATAL: Index N ...`. Benign; don't kill on it.
 - On a match: § Order from step 1. Triage while the process lives.
-- Kill per the backend's § Recovery substitutions. NEVER a shell `kill`.
-- tt-device-mcp: kill your own job without asking (`mcp.md` § Tools, wedge-kill rule).
+- Kill per the backend's § Recovery substitutions.
 
 ## Order
 
@@ -45,13 +43,12 @@ triage → kill → reset (only if the backend needs one) → verify → cache (
 | Caller | Kill per mode's substitution table. |
 | Foreign | STOP. Report owner. NEVER kill another agent's job. |
 
-- NEVER shell-kill a device process (`kill`, `kill -9`, `pkill`, any signal). It skips the graceful stop and can force a full reboot. Full rule: `mcp.md` § Failure handling.
+- NEVER shell-kill a device process: `mcp.md` § Failure handling.
 
 ## Step 3 — Reset the device
 
 - Reset per mode's substitution table, only when it calls for one.
 - The backend resets automatically after a hang.
-- tt-device-mcp: reset only per `mcp.md` § After a kill.
 - Confirm it in step 4.
 - **ALL device processes MUST be dead before any reset.**
 - Reset with a live handle can wedge the machine.
@@ -63,8 +60,6 @@ triage → kill → reset (only if the backend needs one) → verify → cache (
 - The backend reports the device healthy, all expected devices present.
 - Not healthy or a device missing: report and escalate.
 - NEVER reboot, reset or power-cycle anything by hand.
-- tt-device-mcp escalates on its own.
-- It holds the device until the full health check passes.
 
 ## Step 5 — Clear cache (conditional)
 
@@ -94,7 +89,7 @@ rm -rf -- "$HOME/.cache/tt-metal-cache/" "<workspace>/.tt-metal-cache/"
 
 | Thought | Reality |
 |---|---|
-| "I'll `pkill -f pytest` (or `kill`)" | NEVER. Any shell kill, not just `-9`. Use the backend's kill command. |
+| "I'll `pkill -f pytest` (or `kill`)" | NEVER. Use the backend's kill command. |
 | "I'll `tt-smi -r` via Bash" | NEVER. Reset goes through the backend. |
 | "I'll kill first, triage after" | NEVER. Triage needs the inspector RPC alive. |
 | "I'll reset while the process holds the device" | NEVER. Confirm dead in step 2 first. |

@@ -54,7 +54,7 @@ detect workspace → load recipe → research target → route → execute → r
 
 - **Compile is not a wedge.** New log lines and growing caches are progress. Cold JIT and trace capture can run for minutes: NEVER kill them.
 - Wedge: output flat for minutes past the job-timeout envelope. The envelope comes from history (`tt-buddy:note`, `tt-buddy:learn`), not a guess.
-- Past the envelope with flat output: triage while the process lives, then follow `recovery.md`. NEVER kill a foreign job.
+- Past the envelope with flat output: follow `recovery.md`.
 - Layer details: `execution.md` § Job-timeout envelope, `recovery.md` § Detect the wedge early.
 
 ## Low contention
@@ -75,5 +75,3 @@ detect workspace → load recipe → research target → route → execute → r
 | Benchmark (vllm-tt-plugin only) | `<plugin-root>/recipes/vllm-tt-plugin/benchmark.md` |
 | Environment variables | `<plugin-root>/recipes/<repo>/env.md` |
 | Target env vars, constraints, config params | invoke `tt-buddy:learn("<target> env vars and config params")` |
-| Job running long: compile or wedge, when to act | this file § Long-run watchdog |
-| Cut device contention: keep compile off the job | this file § Low contention |
