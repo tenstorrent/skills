@@ -905,6 +905,8 @@ PROVIDER_KEYS = {"billing", "tiers", "plugin_dirs", "worker_isolation", "write_f
                  # busy_retries, busy_wait_s: how often and how long in all a call to a model at capacity
                  # (HTTP 429) is waited out and sent again (chatbridge.busy_wait).
                  "busy_retries", "busy_wait_s",
+                 # preserve_thinking: the model's reasoning kept across turns (chatbridge.thinking_of), off by default.
+                 "preserve_thinking",
                  # providers.chat only: the rules-first model pick (modelpick.py); its keys (enabled, min_p,
                  # options) are checked by modelpick.config_problems.
                  "dispatch"}

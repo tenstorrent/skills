@@ -4263,3 +4263,143 @@ def test_claude_codes_model_lookup_line_on_stderr_is_not_a_refused_model_when_th
         assert route.fell_back(status, {"bridge": {"last_fault": "", "usage": {"calls": 33}}}, got.error) == ""
     refused = '[claude-code:unrecognized_model] {"model":"%s"}' % _RT_MODEL
     assert route.fell_back("failed", {"bridge": {"last_fault": "error"}}, refused) == "model_missing"
+
+
+# Preserved thinking (providers.chat.preserve_thinking, chatbridge.thinking_of): off by default.
+
+_THINK = {"field": "reasoning", "max_turns": 0, "skip_models": ["flash"]}
+
+
+def _think_history(turns):
+    """A Messages request whose assistant turns each carry a thinking block ("why <i>") and a tool call."""
+    msgs = [{"role": "user", "content": "go"}]
+    for i in range(turns):
+        msgs += [{"role": "assistant", "content": [
+                     {"type": "thinking", "thinking": f"why {i}", "signature": f"sig{i}"},
+                     {"type": "tool_use", "id": f"call_{i}", "name": "Bash", "input": {"command": "ls"}}]},
+                 {"role": "user", "content": [{"type": "tool_result", "tool_use_id": f"call_{i}", "content": "ok"}]}]
+    return {"max_tokens": 50, "messages": msgs}
+
+
+def test_chatbridge_preserve_thinking_settings_env_override_and_config_problems(monkeypatch):
+    from ttp import chatbridge, project
+    monkeypatch.delenv("TTP_CHAT_PRESERVE_THINKING", raising=False)
+    cfg = {"providers": {"chat": {"endpoint": "cloud", "tiers": {"light": {"model": "m"}}}}}
+    assert "thinking" not in chatbridge.settings(cfg, "light", "m"), "off by default"
+    monkeypatch.setenv("TTP_CHAT_PRESERVE_THINKING", "1")
+    assert chatbridge.settings(cfg, "light", "m")["thinking"] == _THINK, "one run turns it on, no config change"
+    on = {"providers": {"chat": {**cfg["providers"]["chat"],
+                                 "preserve_thinking": {"field": "reasoning_content", "max_turns": 3}}}}
+    assert chatbridge.settings(on, "light", "m")["thinking"] == {"field": "reasoning_content", "max_turns": 3,
+                                                                 "skip_models": ["flash"]}
+    monkeypatch.setenv("TTP_CHAT_PRESERVE_THINKING", "0")
+    assert "thinking" not in chatbridge.settings(on, "light", "m"), "0 forces it off"
+    monkeypatch.delenv("TTP_CHAT_PRESERVE_THINKING")
+    assert chatbridge.settings(on, "light", "m")["thinking"]["field"] == "reasoning_content"
+    assert chatbridge.config_problems(on) == [] and project.unknown_key_hint("providers.chat.preserve_thinking") is None
+    for bad in ("yes", {"field": "both"}, {"max_turns": -1}, {"skip_models": "flash"}, {"keep": 1}):
+        got = chatbridge.config_problems({"providers": {"chat": {"endpoint": "cloud", "preserve_thinking": bad}}})
+        assert len(got) == 1 and "preserve_thinking" in got[0], bad
+        assert chatbridge.thinking_of({"preserve_thinking": bad}) == {}, "an invalid entry stays off"
+
+
+def test_chatbridge_preserved_thinking_round_trips_non_streamed(mock_chat):
+    from ttp.chatbridge import Bridge
+    reply = {"choices": [{"message": {"role": "assistant", "content": "done", "reasoning_content": "my plan"},
+                          "finish_reason": "stop"}]}
+    up = mock_chat((200, reply), (200, reply))
+    with Bridge(up.url, _CB_KEY, "glm-x", thinking=_THINK) as b:
+        _, got = _post(b, _think_history(2))
+        st = b.stats()
+    got = json.loads(got)
+    assert got["content"][0]["type"] == "thinking" and got["content"][0]["thinking"] == "my plan"
+    assert got["content"][0]["signature"].startswith("ttp-"), "Claude Code sends back only signed blocks"
+    assert got["content"][1] == {"type": "text", "text": "done"}
+    sent = [m for m in up.seen[0]["body"]["messages"] if m["role"] == "assistant"]
+    assert [m["reasoning"] for m in sent] == ["why 0", "why 1"], "each turn's own, in order"
+    assert not any("reasoning_content" in m for m in sent), "one field only: an endpoint may refuse both"
+    assert up.seen[0]["body"]["chat_template_kwargs"] == {"clear_thinking": False}
+    assert st["thinking"] == {"field": "reasoning", "returned": 1, "sent": 2}
+
+
+def test_chatbridge_preserved_thinking_alternate_field_max_turns_and_off(mock_chat):
+    from ttp.chatbridge import Bridge, to_chat
+    req = to_chat(_think_history(3), "glm-x", think={**_THINK, "field": "reasoning_content", "max_turns": 2})
+    turns = [m for m in req["messages"] if m["role"] == "assistant"]
+    assert [m.get("reasoning_content") for m in turns] == [None, "why 1", "why 2"], "only the last 2 turns keep it"
+    assert not any("reasoning" in m or "_reasoning" in m for m in turns)
+    plain = to_chat(_think_history(2), "glm-x")
+    assert "chat_template_kwargs" not in plain
+    assert not any(k in m for m in plain["messages"] for k in ("reasoning", "reasoning_content", "_reasoning"))
+    up = mock_chat((200, {"choices": [{"message": {"content": "done", "reasoning_content": "my plan"},
+                                       "finish_reason": "stop"}]}))
+    with Bridge(up.url, _CB_KEY, "glm-x") as b:   # off: reasoning dropped both ways, as before
+        _, got = _post(b, _think_history(1))
+        assert "thinking" not in b.stats()
+    assert json.loads(got)["content"] == [{"type": "text", "text": "done"}]
+    assert "reasoning_content" not in json.dumps(up.seen[0]["body"])
+
+
+def test_chatbridge_preserved_thinking_never_reaches_a_flash_model(mock_chat):
+    from ttp.chatbridge import Bridge, to_chat
+    req = to_chat(_think_history(2), "GLM-4.7-Flash", think=_THINK)
+    assert not any(k in m for m in req["messages"] for k in ("reasoning_content", "reasoning", "_reasoning"))
+    assert "chat_template_kwargs" not in req
+    up = mock_chat((200, {"choices": [{"message": {"content": "done", "reasoning_content": "x"},
+                                       "finish_reason": "stop"}]}),
+                   (200, {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}))
+    with Bridge(up.url, _CB_KEY, "glm-4.7-flash", thinking=_THINK) as b:
+        _, got = _post(b, _think_history(1))
+        relay = {"model": "m", "messages": [{"role": "user", "content": "hi"},
+                                            {"role": "assistant", "content": "a", "reasoning_content": "r"}]}
+        assert _post(b, relay, path="/v1/chat/completions")[0] == 200
+        assert b.stats()["thinking"] == {"field": "reasoning", "returned": 0, "sent": 0}
+    assert json.loads(got)["content"] == [{"type": "text", "text": "done"}], "no thinking block from a skipped model"
+    assert up.seen[1]["body"]["messages"][1] == {"role": "assistant", "content": "a"}, "relay strips it too"
+
+
+def test_chatbridge_preserved_thinking_streams_a_signed_thinking_block_before_text_and_tools(mock_chat):
+    from ttp.chatbridge import Bridge
+    chunks = [{"choices": [{"delta": {"role": "assistant", "reasoning_content": "step "}}]},
+              {"choices": [{"delta": {"reasoning": "one"}}]},
+              {"choices": [{"delta": {"content": "hi"}}]},
+              {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_a",
+                                                      "function": {"name": "Bash", "arguments": "{}"}}]}}]},
+              {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}]
+    up = mock_chat((200, chunks), (200, chunks))
+    with Bridge(up.url, _CB_KEY, "glm-x", thinking=_THINK) as b:
+        _, sse = _post(b, {"max_tokens": 50, "stream": True, "messages": [{"role": "user", "content": "go"}]})
+        assert b.stats()["thinking"]["returned"] == 1
+    with Bridge(up.url, _CB_KEY, "glm-x") as b:
+        _, off = _post(b, {"max_tokens": 50, "stream": True, "messages": [{"role": "user", "content": "go"}]})
+    ev = _cb_events(sse)
+    starts = [(e["index"], e["content_block"]["type"]) for e in ev if e["type"] == "content_block_start"]
+    assert starts == [(0, "thinking"), (1, "text"), (2, "tool_use")]
+    deltas = [e["delta"] for e in ev if e["type"] == "content_block_delta" and e["index"] == 0]
+    assert [d.get("thinking") for d in deltas if d["type"] == "thinking_delta"] == ["step ", "one"]
+    assert deltas[-1]["type"] == "signature_delta" and deltas[-1]["signature"].startswith("ttp-")
+    stops = [e["index"] for e in ev if e["type"] == "content_block_stop"]
+    assert stops == [0, 1, 2], "each block ends before the next starts"
+    assert [e["content_block"]["type"] for e in _cb_events(off) if e["type"] == "content_block_start"] == [
+        "text", "tool_use"], "off: no thinking block"
+
+
+def test_chatbridge_relay_moves_reasoning_to_one_field_in_order(mock_chat):
+    from ttp.chatbridge import Bridge
+    up = mock_chat((200, {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}),
+                   (200, {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}))
+    msgs = [{"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "a", "reasoning": "r0"},
+            {"role": "user", "content": "more"},
+            {"role": "assistant", "content": "b", "reasoning_content": "r1", "reasoning": "dup"},
+            {"role": "user", "content": "go"}]
+    with Bridge(up.url, _CB_KEY, "glm-x", thinking=_THINK) as b:
+        assert _post(b, {"model": "m", "messages": msgs}, path="/v1/chat/completions")[0] == 200
+        assert b.stats()["thinking"]["sent"] == 2
+    with Bridge(up.url, _CB_KEY, "glm-x") as b:   # off: passed through unchanged
+        assert _post(b, {"model": "m", "messages": msgs}, path="/v1/chat/completions")[0] == 200
+    sent = [m for m in up.seen[0]["body"]["messages"] if m["role"] == "assistant"]
+    assert sent == [{"role": "assistant", "content": "a", "reasoning": "r0"},
+                    {"role": "assistant", "content": "b", "reasoning": "r1"}], "reasoning_content first, one field"
+    assert up.seen[0]["body"]["chat_template_kwargs"] == {"clear_thinking": False}
+    assert up.seen[1]["body"]["messages"] == msgs and "chat_template_kwargs" not in up.seen[1]["body"]

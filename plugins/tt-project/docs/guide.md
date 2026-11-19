@@ -1897,10 +1897,25 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    routed with `"effort": "low"` and `"effort_fields": {"<model id>": {"low": {"reasoning_effort": "low"}}}`
    sends `reasoning_effort: low` on every request. `ttp doctor` names a routed tier whose requests
    would carry no effort fields.
+6. Preserved thinking, off by default: `"preserve_thinking": true` under `providers.chat` gives a
+   model its own earlier reasoning back. Use it for models whose chat template keeps past reasoning
+   (GLM-5.x renders an assistant turn sent without it as an empty think block). The endpoint's
+   reasoning reaches Claude Code as a signed thinking block, Claude Code sends it back with the
+   turn, and the bridge sends each assistant turn's reasoning upstream again unchanged and in order
+   in one field, with `chat_template_kwargs` `clear_thinking: false` so the template keeps it. On
+   the `/v1/chat/completions` relay, a turn's reasoning in either field is moved to that field. An
+   object sets the details: `{"field": "reasoning"}` (the default, which vLLM 0.20 and later reads;
+   or `"reasoning_content"`: one only, as an endpoint may refuse a turn carrying both),
+   `"max_turns": 50` (keep reasoning on the last 50 assistant turns only; 0, the default, keeps all)
+   and `"skip_models": ["flash"]` (the default: no reasoning goes back to a model whose id holds one
+   of these words, in any case). To try it on one run without changing any project's config, set
+   `TTP_CHAT_PRESERVE_THINKING=1` (or `0` to force it off) in the environment of the process that
+   starts the run, such as a bench or A/B command; config keys still set the details. The run's exit
+   record counts the turns returned and sent back under `bridge.thinking`.
 
 The key stays in the per-user secrets store and the bridge's upstream requests: the agent gets
-only the bridge's address and a per-run token. Reasoning text from the endpoint is dropped,
-tool calls are matched by id, and upstream errors come back as the errors Claude Code already
+only the bridge's address and a per-run token. Reasoning text from the endpoint is dropped
+unless preserved thinking is on (item 6), tool calls are matched by id, and upstream errors come back as the errors Claude Code already
 reports: a refused key holds the provider as logged out until the key is saved again, 402 and
 429 count as limits, and 5xx answers are retried. Measure a model on a few recorded tasks before
 moving real work to it.

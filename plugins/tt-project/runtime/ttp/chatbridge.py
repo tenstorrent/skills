@@ -14,8 +14,8 @@ environment. The agent gets a per-run bridge token instead, which the bridge che
 local process can spend the key through the port.
 
 Mapping: system text, user and assistant text, tool definitions and choice, tool_use and
-tool_result blocks (parallel calls matched by id), stop reasons and usage. Reasoning (thinking
-blocks out, reasoning_content in) is dropped. The client's own max_tokens is dropped too: only a cap
+tool_result blocks (parallel calls matched by id), stop reasons and usage. Reasoning is dropped
+both ways unless preserved thinking is on (below). The client's own max_tokens is dropped too: only a cap
 the user set (providers.chat max_tokens, or a tier's) is sent, else none; calls are bounded by time.
 Upstream errors come back as Messages errors the runner already classifies: 401/403 as an
 authentication error (the auth gate), 402 as a funds limit, 429 as a rate limit, 503/529 as
@@ -30,6 +30,18 @@ fields for the effort the daemon launched the run at (low, medium, high, xhigh, 
 replace a field that carries the conversation (CONVERSATION). Unset, a request goes out as it is. An
 endpoint that rejects one (a 400 naming it) gets the request again without them, and the rest of the
 run goes without them; stats() records it for the run's meter.
+
+Preserved thinking (`providers.chat.preserve_thinking`, default off; TTP_CHAT_PRESERVE_THINKING=1 or 0
+in the environment of the process that calls settings() turns it on or off for that run alone, such as
+one bench or A/B run): a model whose chat template keeps past reasoning (GLM-5.x renders a turn sent
+without it as an empty <think></think>) gets its own reasoning back. The upstream's reasoning
+(`reasoning_content`, else `reasoning`) reaches Claude Code as a thinking block with a signature, which
+Claude Code sends back with the turn; each assistant turn's thinking goes upstream again unchanged and
+in order, in one field (`field`, default reasoning: an endpoint may refuse a turn carrying both), with
+chat_template_kwargs clear_thinking=false so the template keeps it whatever its default. On the /v1
+relay an assistant turn's reasoning, in either field, is moved to that field. Guards: no
+reasoning goes upstream for a model whose id contains a `skip_models` word (default "flash", any case),
+and `max_turns` (0 = all) keeps it on only the last N assistant turns; stats() counts the turns sent.
 
 Mid-run model swap: a run whose launch named ranked stand-ins (`standins`, modelrank.standins: the
 ranking's other models, none for a required pin) keeps going when its model goes away. When the
@@ -46,9 +58,11 @@ low alert per swap. No stand-in served (or the lists unknown): the error goes ba
 from __future__ import annotations
 
 import email.utils
+import hashlib
 import hmac
 import http.server
 import json
+import os
 import re
 import secrets
 import socket
@@ -89,6 +103,10 @@ SWAP_ERRORS = 3   # 5xx or no-answer calls in a row that swap a model the served
 BUSY_RETRIES, BUSY_WAIT_S, BUSY_WAIT_MAX_S = 4, 180.0, 60.0
 RETRY_AFTER_RE = re.compile(r"retry\s+(?:after|in)\s+(\d+(?:\.\d+)?)\s*s", re.I)
 NEVER_FITS_RE = re.compile(r"request too large|insufficient.{0,20}(?:credit|quota|balance)", re.I)   # waiting cannot help
+REASONING_FIELDS = ("reasoning", "reasoning_content")   # where Chat Completions servers put a turn's reasoning
+# (vLLM 0.20 and later reads only `reasoning` on input, vllm issue 38488: the default field sent back)
+THINKING_ENV = "TTP_CHAT_PRESERVE_THINKING"   # 1 or 0: preserved thinking on or off for one run (settings)
+THINKING_SKIP = ("flash",)   # model id words whose runs never get reasoning back (preserve_thinking.skip_models)
 
 
 class _ClientGone(Exception):
@@ -117,13 +135,14 @@ def settings(cfg: dict, tier: str, model: str, effort: str = "", standins=(), se
     cap = row.get("max_tokens") or entry.get("max_tokens") or 0
     window = window_of(entry, model, row)
     fields = effort_fields(entry, model, effort)
+    think = thinking_of(entry)
     alts = [{"model": m, **({"fields": f} if (f := effort_fields(entry, m, effort)) else {}),
              **({"context_window": w} if (w := window_of(entry, m)) else {})} for m in standins if m != model]
     return {"endpoint": str(entry.get("endpoint") or ""), "base_url": str(entry.get("base_url") or ""),
             "model": model, "max_tokens": int(cap or 0), **({"context_window": int(window)} if window else {}),
             **({"effort": effort, "fields": fields} if fields else {}),
             **({"effort": effort, "standins": alts, "served": [str(d) for d in served]} if alts and served else {}),
-            **busy}
+            **({"thinking": think} if think else {}), **busy}
 
 
 def _count_ok(v) -> bool:
@@ -164,6 +183,98 @@ def window_of(entry: dict, model: str, row: dict | None = None) -> int:
     return int((entry or {}).get("context_window") or 0)
 
 
+def thinking_of(entry: dict, environ=None) -> dict:
+    """The run's preserved-thinking settings ({field, max_turns, skip_models}), or {} when off:
+    providers.chat.preserve_thinking (true, or an object of those keys), overridden by THINKING_ENV
+    ("1" on with the config's keys or the defaults, "0" off). An invalid entry is off."""
+    raw = (entry or {}).get("preserve_thinking") if isinstance(entry, dict) else None
+    flag = str((os.environ if environ is None else environ).get(THINKING_ENV) or "").strip().lower()
+    on = flag in ("1", "true", "on", "yes") or (flag not in ("0", "false", "off", "no") and bool(raw))
+    if not on or _thinking_problems(raw):
+        return {}
+    got = raw if isinstance(raw, dict) else {}
+    return {"field": str(got.get("field") or REASONING_FIELDS[0]), "max_turns": int(got.get("max_turns") or 0),
+            "skip_models": [str(w) for w in got.get("skip_models", THINKING_SKIP)]}
+
+
+def _thinking_problems(raw) -> list[str]:
+    where = "providers.chat.preserve_thinking"
+    if raw is None or isinstance(raw, bool):
+        return []
+    if not isinstance(raw, dict):
+        return [f"{where}: give true, false or an object of field, max_turns and skip_models; it stays off"]
+    out = []
+    if unknown := sorted(set(raw) - {"field", "max_turns", "skip_models"}):
+        out.append(f"{where}: unknown key {', '.join(unknown)}; give field, max_turns or skip_models; it stays off")
+    if raw.get("field") is not None and raw["field"] not in REASONING_FIELDS:
+        out.append(f"{where}.field: give {' or '.join(REASONING_FIELDS)}; it stays off")
+    if raw.get("max_turns") is not None and not (isinstance(raw["max_turns"], int) and not isinstance(raw["max_turns"], bool)
+                                                 and raw["max_turns"] >= 0):
+        out.append(f"{where}.max_turns: give a whole number of assistant turns (0 = all); it stays off")
+    if raw.get("skip_models") is not None and not (isinstance(raw["skip_models"], list)
+                                                   and all(isinstance(w, str) and w.strip() for w in raw["skip_models"])):
+        out.append(f'{where}.skip_models: give a list of model id words, such as ["flash"]; it stays off')
+    return out
+
+
+def skips_thinking(think: dict, model: str) -> bool:
+    """Whether `model` gets no reasoning back under `think` (off, or its id holds a skip_models word)."""
+    low = str(model or "").lower()
+    return not think or any(w.lower() in low for w in think.get("skip_models") or ())
+
+
+def keep_reasoning(think: dict, model: str, msgs: list[dict]) -> int:
+    """Set each assistant turn's reasoning (its "_reasoning", always removed) in think's field on the turns
+    that keep it: none for a skipped model, else the last max_turns (0 = all). Returns the turns that did."""
+    turns = [m for m in msgs if m.get("role") == "assistant"]
+    on = not skips_thinking(think, model)
+    cap = int((think or {}).get("max_turns") or 0)
+    kept = 0
+    for i, m in enumerate(turns):
+        text = m.pop("_reasoning", None)
+        if on and text and (not cap or i >= len(turns) - cap):
+            m[think["field"]] = text
+            kept += 1
+    return kept
+
+
+def _signature(text: str) -> str:
+    """A thinking block's signature: Claude Code sends the block back only with one. Opaque to it;
+    the bridge reads the text, never the signature, when the turn comes back."""
+    return "ttp-" + hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:32]
+
+
+def keep_template_thinking(think: dict, model: str, req: dict) -> dict:
+    """`req` asking the chat template to keep past reasoning (chat_template_kwargs clear_thinking=false,
+    unless the request sets clear_thinking itself) when `model` gets reasoning back."""
+    if skips_thinking(think, model):
+        return req
+    kw = req.get("chat_template_kwargs") if isinstance(req.get("chat_template_kwargs"), dict) else {}
+    return {**req, "chat_template_kwargs": {"clear_thinking": False, **kw}}
+
+
+def reasoning_of(obj: dict) -> str:
+    """A Chat Completions message's or stream delta's reasoning text (reasoning_content, else reasoning)."""
+    for k in ("reasoning_content", "reasoning"):
+        if isinstance(obj.get(k), str) and obj[k]:
+            return obj[k]
+    return ""
+
+
+def relay_reasoning(think: dict, model: str, msgs: list) -> list:
+    """A relayed (/v1) call's messages, copied, each assistant turn's reasoning (either field) moved to
+    think's field, kept as keep_reasoning says; other messages unchanged."""
+    out = []
+    for m in msgs:
+        if isinstance(m, dict) and m.get("role") == "assistant":
+            text, m = reasoning_of(m), {k: v for k, v in m.items() if k not in REASONING_FIELDS}
+            if text:
+                m["_reasoning"] = text
+        out.append(m)
+    keep_reasoning(think, model, [m for m in out if isinstance(m, dict)])
+    return out
+
+
 def effort_fields(entry: dict, model: str, effort: str) -> dict:
     """The request fields providers.chat.effort_fields gives `model` at `effort` (its `*` entry when
     the effort has none), or {}: unset or invalid, the request goes out unchanged."""
@@ -198,8 +309,12 @@ def _effort_problems(table) -> list[str]:
 
 
 def with_fields(req: dict, fields: dict) -> dict:
-    """`req` with the effort fields set over its own (Claude Code's), never a CONVERSATION field."""
-    return {**req, **{k: v for k, v in (fields or {}).items() if k not in CONVERSATION}}
+    """`req` with the effort fields set over its own (Claude Code's), never a CONVERSATION field; a
+    chat_template_kwargs object in both is merged, the fields' keys winning."""
+    out = {**req, **{k: v for k, v in (fields or {}).items() if k not in CONVERSATION}}
+    if isinstance(req.get("chat_template_kwargs"), dict) and isinstance(out.get("chat_template_kwargs"), dict):
+        out["chat_template_kwargs"] = {**req["chat_template_kwargs"], **out["chat_template_kwargs"]}
+    return out
 
 
 def rejects(status: int, detail: str, fields: dict) -> bool:
@@ -218,6 +333,7 @@ def config_problems(raw: dict) -> list[str]:
     if not isinstance(entry, dict):
         return ["providers.chat: not an object; chat runs cannot start"]
     out = _effort_problems(entry["effort_fields"]) if entry.get("effort_fields") is not None else []
+    out += _thinking_problems(entry.get("preserve_thinking"))
     try:
         endpoint.slot(str(entry.get("endpoint") or ""))
     except ValueError:
@@ -271,9 +387,10 @@ def _image_part(b: dict) -> dict | None:
     return None
 
 
-def to_chat(body: dict, model: str, cap: int = 0) -> dict:
+def to_chat(body: dict, model: str, cap: int = 0, think: dict | None = None) -> dict:
     """A Chat Completions request for a Messages request, sent to `model`. Only `cap`, the user's own
-    max_tokens setting, is sent: the client's max_tokens is dropped, so a reasoning model is never cut off."""
+    max_tokens setting, is sent: the client's max_tokens is dropped, so a reasoning model is never cut off.
+    With `think` (thinking_of), assistant turns carry their thinking blocks' text (keep_reasoning)."""
     msgs: list[dict] = []
     system = _text(body.get("system") or "")
     if system:
@@ -289,6 +406,10 @@ def to_chat(body: dict, model: str, cap: int = 0) -> dict:
             msg: dict = {"role": "assistant", "content": text or None}
             if calls:
                 msg["tool_calls"] = calls
+            thought = "\n".join(str(b.get("thinking") or "") for b in blocks
+                                if b.get("type") == "thinking" and b.get("thinking"))
+            if thought and think:
+                msg["_reasoning"] = thought   # placed (or dropped) by keep_reasoning below
             if text or calls:
                 msgs.append(msg)
             continue
@@ -307,7 +428,10 @@ def to_chat(body: dict, model: str, cap: int = 0) -> dict:
         if parts:
             only_text = all(p["type"] == "text" for p in parts)
             msgs.append({"role": "user", "content": "\n".join(p["text"] for p in parts) if only_text else parts})
-    req: dict = {"model": model, "messages": msgs}
+    if think:
+        keep_reasoning(think, model, msgs)
+    req: dict = keep_template_thinking(think, model, {"model": model, "messages": msgs}) if think else {
+        "model": model, "messages": msgs}
     if cap:
         req["max_tokens"] = int(cap)
     tools = [{"type": "function", "function": {"name": t["name"], "description": t.get("description") or "",
@@ -361,11 +485,14 @@ def _msg_id() -> str:
     return "msg_" + uuid.uuid4().hex[:24]
 
 
-def from_chat(resp: dict, model: str) -> dict:
-    """The Messages response for a non-streamed Chat Completions response (reasoning dropped)."""
+def from_chat(resp: dict, model: str, thinking: bool = False) -> dict:
+    """The Messages response for a non-streamed Chat Completions response: its reasoning a thinking
+    block first when `thinking` (preserved thinking), else dropped."""
     choice = (resp.get("choices") or [{}])[0]
     msg = choice.get("message") or {}
     content: list[dict] = []
+    if thinking and (thought := reasoning_of(msg)):
+        content.append({"type": "thinking", "thinking": thought, "signature": _signature(thought)})
     if msg.get("content"):
         content.append({"type": "text", "text": msg["content"]})
     for c in msg.get("tool_calls") or []:
@@ -386,8 +513,9 @@ class Stream:
     tool calls are gathered by their index (ids matched, arguments joined, interleaved calls kept
     apart) and sent whole, in index order, when the upstream stream ends."""
 
-    def __init__(self, model: str):
+    def __init__(self, model: str, thinking: bool = False):
         self.model, self.index, self.text_open, self.started = model, 0, False, False
+        self.thinking, self.thought, self.thoughts = thinking, None, 0   # preserved thinking: open block's text, blocks
         self.calls: dict[int, dict] = {}
         self.finish, self.usage = "", {}
 
@@ -403,7 +531,20 @@ class Stream:
             self.usage = chunk["usage"]
         for choice in chunk.get("choices") or []:
             delta = choice.get("delta") or {}
+            thought = reasoning_of(delta) if self.thinking else ""
+            if thought:
+                if self.thought is None:
+                    out += self._close_text()
+                    out += _sse("content_block_start", {"type": "content_block_start", "index": self.index,
+                                                        "content_block": {"type": "thinking", "thinking": "",
+                                                                          "signature": ""}})
+                    self.thought = ""
+                self.thought += thought
+                out += _sse("content_block_delta", {"type": "content_block_delta", "index": self.index,
+                                                    "delta": {"type": "thinking_delta", "thinking": thought}})
             text = delta.get("content")
+            if text or delta.get("tool_calls"):
+                out += self._close_thinking()
             if text:
                 if not self.text_open:
                     out += _sse("content_block_start", {"type": "content_block_start", "index": self.index,
@@ -422,6 +563,16 @@ class Stream:
                 self.finish = choice["finish_reason"]
         return out
 
+    def _close_thinking(self) -> bytes:
+        """The open thinking block's signature and end (Claude Code keeps a signed block to send back)."""
+        if self.thought is None:
+            return b""
+        sig, self.thought = _signature(self.thought), None
+        self.index, self.thoughts = self.index + 1, self.thoughts + 1
+        return (_sse("content_block_delta", {"type": "content_block_delta", "index": self.index - 1,
+                                             "delta": {"type": "signature_delta", "signature": sig}})
+                + _sse("content_block_stop", {"type": "content_block_stop", "index": self.index - 1}))
+
     def _close_text(self) -> bytes:
         if not self.text_open:
             return b""
@@ -430,7 +581,7 @@ class Stream:
         return _sse("content_block_stop", {"type": "content_block_stop", "index": self.index - 1})
 
     def end(self) -> bytes:
-        out = (b"" if self.started else self.start()) + self._close_text()
+        out = (b"" if self.started else self.start()) + self._close_thinking() + self._close_text()
         for i in sorted(self.calls):
             c = self.calls[i]
             out += _sse("content_block_start", {"type": "content_block_start", "index": self.index, "content_block": {
@@ -619,8 +770,10 @@ class Bridge:
     def __init__(self, base_url: str, key: str, model: str, max_tokens: int = 0,
                  timeout: float = UPSTREAM_TIMEOUT_S, context_window: int = 0, effort: str = "",
                  fields: dict | None = None, standins: list | None = None, served: list | None = None,
-                 busy_retries: int | None = None, busy_wait_s: float | None = None):
+                 busy_retries: int | None = None, busy_wait_s: float | None = None, thinking: dict | None = None):
         self.base_url, self._key, self.model = endpoint.base_url(base_url), key, model
+        self.thinking = dict(thinking or {})   # preserved thinking (thinking_of), {} when off
+        self.thought = {"returned": 0, "sent": 0}   # reasoning turns given to the client / sent back upstream
         self.max_tokens, self.timeout = int(max_tokens or 0), timeout
         self.context_window = int(context_window or 0)
         self.effort, self.fields, self.rejected = effort, dict(fields or {}), False   # effort_fields
@@ -670,7 +823,7 @@ class Bridge:
         return cls(url or saved, key, s["model"], s.get("max_tokens") or 0,
                    **{"context_window": s.get("context_window") or 0, "effort": s.get("effort") or "",
                       "fields": s.get("fields") or {}, "standins": s.get("standins") or [],
-                      "served": s.get("served") or [],
+                      "served": s.get("served") or [], "thinking": s.get("thinking") or {},
                       **{k: s[k] for k in ("busy_retries", "busy_wait_s") if _count_ok(s.get(k))}, **kw})
 
     @property
@@ -813,6 +966,7 @@ class Bridge:
                    or self.busy["gave_up"] else {}),
                 **({"usage": dict(self.usage)} if self.usage["calls"] else {}),
                 **({"missing_local": self.missing_local} if self.missing_local else {}),
+                **({"thinking": {"field": self.thinking.get("field"), **self.thought}} if self.thinking else {}),
                 **({"server": self.calls.export()} if self.calls.rows else {})}
 
     def server_wait_s(self) -> float:
@@ -923,6 +1077,9 @@ class Bridge:
         is counted (self.usage), a stream asking the endpoint to report it."""
         def make(used: str) -> dict:
             req = {**body, "model": used}
+            if self.thinking and isinstance(body.get("messages"), list):
+                req = keep_template_thinking(self.thinking, used, {
+                    **req, "messages": relay_reasoning(self.thinking, used, body["messages"])})
             if req.get("stream"):
                 req["stream_options"] = {**(req.get("stream_options") or {}), "include_usage": True}
             return req
@@ -930,6 +1087,7 @@ class Bridge:
         if got is None:
             return
         resp, req = got
+        self._sent_back(req)
         with resp:
             if not req.get("stream"):
                 try:
@@ -982,11 +1140,26 @@ class Bridge:
             for k in ("input_tokens", "output_tokens", "cache_read_input_tokens"):
                 self.usage[k] += int(got.get(k) or 0)
 
+    def _sent_back(self, req: dict) -> None:
+        """Count the assistant turns whose reasoning went upstream (preserved thinking, stats())."""
+        if self.thinking:
+            n = sum(1 for m in req.get("messages") or () if isinstance(m, dict) and m.get("role") == "assistant"
+                    and m.get(self.thinking["field"]))
+            with self._swap_lock:
+                self.thought["sent"] += n
+
+    def _returned(self, n: int) -> None:
+        if n:
+            with self._swap_lock:
+                self.thought["returned"] += n
+
     def forward(self, h: _Handler, body: dict) -> None:
-        got = self._send(h, lambda used: to_chat(body, used, self.max_tokens))
+        got = self._send(h, lambda used: to_chat(body, used, self.max_tokens, self.thinking))
         if got is None:
             return
         resp, req = got
+        self._sent_back(req)
+        think = not skips_thinking(self.thinking, req.get("model") or self.model)   # inbound: same guard
         with resp:
             if not req.get("stream"):
                 try:
@@ -1000,8 +1173,14 @@ class Bridge:
                 self._ok()
                 self._count(data.get("usage"))   # a translated call is counted too (cached apart: usage_of)
                 self._end_call(h, usage_of(data.get("usage"))["output_tokens"])
-                return h._reply(200, from_chat(data, body.get("model") or self.model))
-            self._stream(h, resp, Stream(body.get("model") or self.model))
+                out = from_chat(data, body.get("model") or self.model, think)
+                self._returned(sum(1 for b in out["content"] if b.get("type") == "thinking"))
+                return h._reply(200, out)
+            st = Stream(body.get("model") or self.model, think)
+            try:
+                self._stream(h, resp, st)
+            finally:
+                self._returned(st.thoughts)
 
     def _stream(self, h: _Handler, resp, st: Stream) -> None:
         h.send_response(200)
