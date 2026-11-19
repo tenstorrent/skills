@@ -7,10 +7,17 @@ settle itself.
   push", "record the result and finish") asks a model for nothing, so that wait settles model-free
   (daemon.push_on_pass, daemon.checks_settle_fill, checksettle.settle) as one with no next_step does.
   Anything else in the step (a rebase, a PR, a retry, a second action) keeps the model wake.
+- own_landing_wait: a code task's waiting hand-off whose own wait is its own landing (`landed:#<id>`
+  or `ttp landed --task <id>` of itself) can never end by itself: nothing lands the task before it
+  finishes, because its review queues only then. The daemon refuses it (Daemon._finish_worker) with
+  the way out: land with `ttp push` when delivery.code_tasks_may_push is on, else finish.
 """
 from __future__ import annotations
 
 import re
+
+from .chaincap import waits_landing
+from .project import code_tasks_may_push
 
 # One short report-only sentence: a verb to report, what is reported, and nothing after it.
 _VERB = r"(?:report|record|post|note|confirm|summari[sz]e|state|say)"
@@ -38,3 +45,19 @@ def names_step(result: dict) -> bool:
     step = result.get("next_step") if isinstance(result, dict) else None
     return bool(step) and not report_only(step)
 
+
+
+def own_landing_wait(task: dict, result: dict, cfg: dict, job_in_flight: bool = False) -> str:
+    """Why a waiting hand-off is refused: a code task whose retry_when or waiting_for is its own landing.
+    '' when it is fine (another task's landing, a push or checks probe, a detached job in flight, or
+    not a code task). A later step of `then` may name the landing: it follows the task's own push."""
+    if job_in_flight or not isinstance(result, dict) or not isinstance(task, dict) or task.get("kind") != "code":
+        return ""
+    if not any(waits_landing(result.get(k), task["id"]) for k in ("retry_when", "waiting_for")):
+        return ""
+    way = ("land it now with `ttp push --detach` (delivery.code_tasks_may_push is on) and wait on the `retry_when` "
+           "it prints" if code_tasks_may_push(cfg) else
+           "hand off `done` or `needs_review` so its review queues and lands it")
+    return (f"hand-off refused: it waits on its own landing (task #{task['id']}), which cannot happen before it "
+            f"finishes: the review that lands a change queues only once the task ends, so the wait never ends. "
+            f"Instead {way}.")

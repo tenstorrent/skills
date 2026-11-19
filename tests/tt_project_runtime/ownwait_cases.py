@@ -57,3 +57,41 @@ def test_checks_settle_accepts_a_report_only_next_step_and_refuses_any_other(env
         (run_dir / "result.json").write_text(json.dumps({**hand, "next_step": step, "on_pass": on_pass}))
         rc, what, out = checksettle.settle(run_dir, head)
         assert rc == 1 and out is None and "next_step" in what, (step, what)
+
+
+def test_a_code_task_waiting_on_its_own_landing_is_refused_with_the_way_out():
+    from ttp import ownwait
+    on = {"delivery": {"push_branch": "relay/x/main", "code_tasks_may_push": True}}
+    off = {"delivery": {"push_branch": "relay/x/main", "code_tasks_may_push": False}}
+    task = {"id": 42, "kind": "code"}
+    for key, probe in (("retry_when", "ttp landed --task 42"), ("retry_when", "landed:#42"),
+                       ("retry_when", "ttp landed #42"), ("waiting_for", "task #42 landing: ttp landed --task 42")):
+        got = ownwait.own_landing_wait(task, {"status": "waiting", key: probe}, on)
+        assert got.startswith("hand-off refused") and "ttp push --detach" in got, (probe, got)
+        got = ownwait.own_landing_wait(task, {"status": "waiting", key: probe}, off)
+        assert "ttp push" not in got and "`done`" in got, (probe, got)
+    # Not refused: another task's landing (also one sharing a digit prefix), a push or checks probe, a later
+    # `then` step, a detached job in flight, a task that is not code, a non-dict hand-off.
+    wait = {"status": "waiting", "retry_when": "ttp landed --task 421"}
+    assert not ownwait.own_landing_wait(task, wait, on)
+    assert not ownwait.own_landing_wait(task, {**wait, "retry_when": "landed:#4"}, on)
+    assert not ownwait.own_landing_wait(task, {**wait, "retry_when": "ttp push --result /x/p.json"}, on)
+    assert not ownwait.own_landing_wait(task, {**wait, "retry_when": "ttp checks --result /x",
+                                               "then": [{"retry_when": "ttp landed --task 42"}]}, on)
+    assert not ownwait.own_landing_wait(task, {**wait, "retry_when": "ttp landed --task 42"}, on, job_in_flight=True)
+    assert not ownwait.own_landing_wait({"id": 42, "kind": "work"}, {**wait, "retry_when": "ttp landed --task 42"}, on)
+    assert not ownwait.own_landing_wait(task, None, on) and not ownwait.own_landing_wait(None, wait, on)
+
+
+def test_the_daemon_refuses_a_code_hand_off_that_waits_on_its_own_landing(env, tmp_path):
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    tid = p.db.add_task("feature", "s", kind="code", tier="standard", origin="user")
+    t = _reply_wait_hand_off(p, d, tmp_path, tid, waiting_for="my own landing",
+                             retry_when=f"ttp landed --task {tid}")
+    res = json.loads(t["result"])
+    assert res["status"] == "failed" and "waits on its own landing" in res["summary"], res
+    other = p.db.add_task("other", "s", kind="code", tier="standard", origin="user")
+    t = _reply_wait_hand_off(p, d, tmp_path, other, waiting_for="task landing", retry_when=f"ttp landed --task {tid}")
+    assert json.loads(t["result"])["status"] == "waiting"
