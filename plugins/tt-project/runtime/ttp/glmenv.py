@@ -66,6 +66,9 @@ def refusal(command: str, cwd: str = "", run_dir: str = "", env=None) -> str | N
         segs = hook._all_segments(commands) + hook._segments(commands, strip=False)
         if hook.secret_read(command, segs, cwd) or credguard.bash_refusal(command, segs, cwd=cwd):
             return "a run on the GLM arm may not read stored secrets or credential files"
+        from . import aitag, ruleguard
+        if why := ruleguard.bash_refusal(command, hook._all_segments(commands), aitag.project_config(), cwd, e):
+            return why
     except Exception:
         return None   # a checker that cannot run never refuses on its own; the rules above already held
     return None

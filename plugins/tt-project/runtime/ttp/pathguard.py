@@ -150,6 +150,10 @@ WHY = ("a run never creates, changes, moves, chmods or deletes anything under th
        "(H=$(mktemp -d); ... \"$H/.ssh/...\"), and leave logins and keys to the user")
 # `ttp note|notify|say`: their message words are sent, not run
 MESSAGE_CMDS = {"note", "notify", "say"}
+PROJECT_WHY = ("protected_paths (guards.protected_paths): a run never writes under {hit}, which the project protects "
+               "beside the account's credential folders (a served tree, a forbidden directory); write somewhere else")
+# The project's own protected paths, as ssh's remote command sees them (refusal sets it per call)
+_REMOTE_EXTRA: list[str] = []
 LEAK_WHY = ("a ttp message must not carry a credential: a command substitution in its text runs, and what it "
             "prints from the account's credential folders ({hit} is one) is sent to others. Describe the file "
             "in words, or name its path as plain text")
@@ -162,6 +166,9 @@ def paths(cfg: dict | None = None) -> list[str]:
     if cfg is None:
         from .aitag import project_config
         cfg = project_config()
+    from .ruleguard import off
+    if "protected_paths" in off(cfg or {}):   # the user turned the project's rule off: the credential folders stay
+        return out
     for src in (load_account_settings(), cfg or {}):
         extra = (src.get("guards") or {}).get("protected_paths") if isinstance(src.get("guards"), dict) else None
         out += [p for p in extra if isinstance(p, str) and p.strip()] if isinstance(extra, list) else []
@@ -746,6 +753,7 @@ def _remote_refusal(cmd: str, env, cwd: str, depth: int, copied: dict) -> str | 
     feeds a remote shell or interpreter, checked with the remote home against REMOTE_PATHS."""
     rhome = REMOTE_HOMES[0]
     renv, rts = {"HOME": rhome}, [os.path.join(h, p) for h in REMOTE_HOMES for p in REMOTE_PATHS]
+    rts += _remote_extra()
     calls, sent = _ssh_calls(cmd, env, cwd)
     copied = {**copied, **sent}
     for words, stdin in calls:
@@ -760,6 +768,17 @@ def _remote_refusal(cmd: str, env, cwd: str, depth: int, copied: dict) -> str | 
             h = "~" + h[len(rhome):] if h.startswith(rhome + "/") else h
             return h if h.endswith(" on the remote host") else h + " on the remote host"
     return None
+
+
+def _remote_extra() -> list[str]:
+    """The project's protected paths on another host: absolute ones as written, ~ ones under each remote home."""
+    out = []
+    for x in _REMOTE_EXTRA:
+        if x.startswith("/"):
+            out.append(os.path.normpath(x))
+        elif x == "~" or x.startswith("~/"):
+            out += [os.path.normpath(h + x[1:]) for h in REMOTE_HOMES]
+    return out
 
 
 def _segments_of(text: str) -> list[list[str]]:
@@ -970,10 +989,12 @@ def refusal(payload: dict, env=None, cfg: dict | None = None) -> str | None:
     """Why this tool call may not run (it writes under a protected path), or None. Any error refuses
     when the call names a protected path."""
     env = os.environ if env is None else env
+    global _REMOTE_EXTRA
     try:
+        _REMOTE_EXTRA = [x for x in paths(cfg) if x not in DEFAULT_PATHS]
         rts = roots(env, cfg)
     except Exception:
-        rts = roots(env, {})
+        _REMOTE_EXTRA, rts = [], roots(env, {})
     try:
         hit = _refusal(payload, env, rts)
     except Exception:
@@ -987,6 +1008,9 @@ def refusal(payload: dict, env=None, cfg: dict | None = None) -> str | None:
                 f"outside a plain ssh key use). {KEY_ROUTE}")
     if isinstance(hit, _Leak):
         return LEAK_WHY.format(hit=hit)
+    plain = str(hit).removesuffix(" on the remote host")
+    if plain in _REMOTE_EXTRA or plain in set(rts) - set(roots(env, {})):
+        return PROJECT_WHY.format(hit=hit)
     # A key used as an ssh or git identity: name the route that passes
     route = re.search(r"(?<![\w./-])(?:ssh|scp|sftp)(?![\w.-])|GIT_SSH_COMMAND", json.dumps(payload.get("tool_input") or {}))
     return WHY.format(hit=hit) + (". " + KEY_ROUTE if route else "")

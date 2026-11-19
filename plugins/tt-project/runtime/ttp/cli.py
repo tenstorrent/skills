@@ -2247,6 +2247,13 @@ def cmd_stats(a) -> None:
         rep = coordroute.report(p.db, p.state, a.days)
         print(json.dumps(rep, indent=1) if a.json else coordroute.text(rep, p.name))
         return
+    if getattr(a, "guards", False):
+        from . import ruleguard
+        tz = timefmt.home(p)
+        until = _stats_time(a.until, tz, "--until") or time.time()
+        c = ruleguard.counts(p, _stats_time(a.since, tz, "--since") or until - a.days * 86400, until)
+        print(json.dumps(c, indent=1) if a.json else ruleguard.counts_text(c))
+        return
     if getattr(a, "glm_share", False):
         from . import glmshare
         tz = timefmt.home(p)
@@ -2562,6 +2569,15 @@ def cmd_waste(a) -> None:
         print(json.dumps(rep, indent=1))
         return
     print("\n".join([waste.line(p.name, rep)] + [f"- {x}" for x in waste.lines(rep)]))
+
+
+def cmd_guards(a) -> None:
+    """`ttp guards [<project>]`: the project's rule checks, on or off, and the settings each reads."""
+    from . import ruleguard
+    p = need(a.name, sys.argv[1:]) if a.name else here()
+    if not p:
+        die("no tt-project project here; name one: `ttp guards <name>`")
+    print("\n".join(ruleguard.listing(p.config())))
 
 
 def cmd_slop(a) -> None:
@@ -12573,6 +12589,7 @@ def _machine_change(a) -> None:
             ml.add_change(a.alias, a.what, a.undo, by, a.expires, a.until_probe, tid, expects=a.expect,
                           until_task=a.until_task, queue=queue, test=a.test, since=since, where=p,
                           auto_undo=a.auto_undo, allow_met_probe=a.allow_met_probe,
+                          extra={"user_msg": a.user_msg} if a.user_msg else None,
                           project=p if p and p.name == by else local_project(by) or p)
     except ValueError as e:
         die(str(e))
@@ -16549,6 +16566,9 @@ def main(argv: list[str] | None = None) -> None:
                    help="with --ready-wait, --device-ab or --glm-share: every project on this machine, read only")
     s.add_argument("--projects", help="with --ready-wait, --device-ab or --glm-share: these projects (comma-separated), "
                                       "read only")
+    s.add_argument("--guards", action="store_true",
+                   help="the project's rule checks instead (ruleguard.py): refusals per rule and model (--since/--until, "
+                        "else --days)")
     s.add_argument("--glm-share", action="store_true",
                    help="the GLM work route instead (glmshare.py): per role, the share of model-hours and runs on the "
                         "chat provider's GLM model, then per arm (glm, claude) review first-pass rate, fix rounds, "
@@ -16629,6 +16649,10 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--json", action="store_true", help="print JSON")
     s.set_defaults(fn=cmd_waste)
 
+    s = sub.add_parser("guards", help="read-only: the project's rule checks (protected paths, Slurm nodes, landing "
+                                      "pushes, user-ordered undos), on or off, and the settings each reads")
+    s.add_argument("name", nargs="?", help="the project (default: the one here)")
+    s.set_defaults(fn=cmd_guards)
     s = sub.add_parser("slop", help="read-only: code scan per subsystem (duplicate rules, mutable globals, magic "
                                     "numbers, function length, comment noise); --diff base..head: what a change adds")
     s.add_argument("name", nargs="?", help="the project (default: the one here)")
@@ -17641,6 +17665,8 @@ def main(argv: list[str] | None = None) -> None:
                           "names one): running workers on the machine are "
                           "told to commit and hand off shortly before; the entry closes itself after")
     c.add_argument("--by", help="the project that owns the change (default: the project you are in)")
+    c.add_argument("--user-msg", dest="user_msg", type=int, metavar="ID",
+                   help="the user's message that ordered the change: no run replays its undo (ruleguard user_undo)")
     c.add_argument("--expect", action="append", metavar="FINGERPRINT|CONDITION",
                    help="an alert the change is known to cause (an event fingerprint, or down/held on this "
                         "machine): it keeps the coordinator's turn routine while the change is open; repeatable")

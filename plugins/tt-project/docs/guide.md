@@ -5039,6 +5039,22 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   `GH_CONFIG_DIR` instead. Not caught: a path the code builds at run time from parts no word of
   the command names, and a git hook, git config or ssh config an earlier, separate command
   planted that a later key use runs: a write those make is not blocked. Which tools each provider covers is in providers.md.
+- A project's own rule checks (ruleguard.py) run in the same hook, for every provider and model,
+  GLM runs included. They read settings only, never charter wording, and all ship empty or off:
+  - `protected_paths`: the paths in `guards.protected_paths` above (a served tree, a forbidden
+    directory; `*` globs work), also inside an ssh remote command.
+  - `slurm_nodes`: with `guards.slurm` true, an `srun`, `sbatch` or `salloc` (also over ssh) naming
+    nodes (`-w`, `--nodelist`) or a job (`--jobid`) asks `squeue` and `sinfo` there who holds them;
+    another user's job, or a drained, down, reserved or maintenance node, is refused, and so is a
+    query that fails.
+  - `landing_push`: a raw `git push` to `delivery.push_branch`, a `delivery.fast_forward_also` or
+    `delivery.mirror_remotes` branch, or a `delivery.channel_tags` tag (also by `--all`, `--mirror`,
+    `--tags` or the current branch) is refused: `ttp push` lands it after its review.
+  - `user_undo`: a command that replays the undo of a machine change recorded with
+    `ttp machines change add ... --user-msg <id>` (a change the user ordered) is refused.
+  Each refusal is one line naming the rule and its setting. `ttp guards [project]` lists the rules
+  and their settings, and `ttp stats --guards` counts fires per rule and model (from each run's
+  `ruleguard.jsonl`). `guards.off` (a list of rule names) turns rules off; only the user may set it.
 - No `ttp` command prints a saved key. `ttp secret check [alias]` tests one (reachable, auth ok or
   auth failed), lists the model ids it serves and marks each `providers.<p>.tiers.*.model` of the
   current project it does not serve, with no key, URL or host in its output, and `ttp secret env <alias> -- <command>` gives it to a command in `OPENAI_API_KEY`

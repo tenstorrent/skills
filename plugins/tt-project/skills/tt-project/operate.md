@@ -110,6 +110,11 @@
   commands, so a worker that tries hard (a process that leaves its agent's process tree, a script
   that reads the token another way) can still read what that user can. For a hard boundary, run
   workers under a separate OS account or in a sandbox that cannot read the project's `state/`.
+- Rule checks: the worker hook refuses, for every model, writes under `guards.protected_paths`,
+  Slurm calls onto nodes or jobs another user holds (`guards.slurm` true), raw `git push` to the
+  push branch, its landing branches or channel tags, and replaying the undo of a machine change
+  recorded with `--user-msg`. `ttp guards` lists them; `ttp stats --guards` counts fires per rule
+  and model; only the user sets `guards.off`. Details in the guide.
 
 ## Boxes real users share
 

@@ -1411,7 +1411,9 @@ def _pre_tool_use(payload: dict) -> tuple[dict | None, None]:
         return _deny(f"{why}; the run ends and its task goes back to Opus"), None
     if why := _provenance(untrusted.mark_refusal(str(payload.get("tool_name") or ""), payload.get("tool_input") or {})):
         return _deny(why), None   # the run's untrusted-input mark, marked or not
-    if why := pathguard.refusal(payload):   # a write into a credential folder, on any tool
+    if why := pathguard.refusal(payload):   # a write into a credential folder or a protected path, on any tool
+        from . import ruleguard
+        ruleguard.fire("protected_paths", why)
         return _deny(why), None
     if why := harness_tool(str(payload.get("tool_name") or "")):
         return _deny(why), None
@@ -1472,6 +1474,10 @@ def _pre_tool_use(payload: dict) -> tuple[dict | None, None]:
                                                  str(payload.get("cwd") or os.getcwd())))
     if not why:
         why = git_push_bypass(segments)
+    if not why:   # the project's own rules: Slurm nodes, landing pushes, user-ordered undos (ruleguard.py)
+        from . import aitag, ruleguard
+        why = ruleguard.bash_refusal(cmd, _all_segments(commands), aitag.project_config(),
+                                     str(payload.get("cwd") or os.getcwd()))
     if not why:
         why = fenced_ssh(segments, commands) or fenced_git(segments, str(payload.get("cwd") or os.getcwd()))
     if not why:
