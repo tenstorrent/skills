@@ -8582,7 +8582,9 @@ class Daemon:
         if rejects:
             rstatus, result = "failed", dict(result, status=CHANGES_NEEDED)
         elif rstatus == "done" and task["kind"] == "review" and own and (
-                lane := ponytail.gate(self.cfg, task, run_dir, result))[0]:
+                lane := ponytail.gate(self.cfg, task, run_dir, result,
+                                      push._reviewed(self.p, str(task["id"])) if ponytail.labelled(task) is not None
+                                      else []))[0]:
             # The ponytail lane failed it, or the change is over the size limit with no reason: its fixes
             # follow as for any failed review. No verdict at all is a form failure: nothing to fix.
             why, fix = lane
@@ -8985,6 +8987,8 @@ class Daemon:
                          else {"ignored": "only a review task approves pushes"})
             except subprocess.TimeoutExpired as e:   # gitmemo.TX_GIT_S ran out: invalid, so the review runs again
                 check = {"invalid": f"local git timed out checking it (after {e.timeout:.0f} s)"}
+            if check.get("entries") and (why := self._ponytail_approval(task, check, result, run_dir)):
+                check = {"invalid": why}
             if member_vs and (check.get("ignored") or check.get("invalid")):
                 # The passing members' approval is refused: the review stays failed and its fix and
                 # re-review carry every member, as for any failed review.
@@ -22249,6 +22253,34 @@ class Daemon:
             base, name = worktree.own_base(self.p, task, branch)
             return worktree.diff_lines(self.p, [branch], base=base), name
         return gitmemo.cached(("splitgate.size", branch), read)
+
+    def _ponytail_approval(self, task: dict, check: dict, result: dict, run_dir) -> str:
+        """Why the push queue may not take review `task`'s approval `check` (pushq.check_approval), or '':
+        for a code change (sa50: _code_change), labelled or not, each approved head needs the ponytail
+        lane's pass on that head and, over review.ponytail_land_lines measured here against the change's
+        own base, its reason (ponytail.reason_text). A refused unlabelled review is labelled, so its rerun
+        runs the lane and its hand-off needs the verdict."""
+        cfg = self.cfg
+        codes = [t for t in push._reviewed(self.p, str(task["id"])) if self._code_change(t)]
+        if not codes or not (ponytail.on(cfg) or ponytail.limit(cfg)):
+            return ""
+        exclude = push.exclude_list((cfg.get("delivery") or {}).get("push_exclude_paths"))
+        for e in check.get("entries") or []:
+            head, added = e["head"], None
+            try:
+                if ponytail.limit(cfg):
+                    added = ponytail.added_lines(self.p.root, worktree.own_base(self.p, codes[0], head)[0],
+                                                 head, exclude)
+            except Exception as ex:   # fail closed: the review runs again
+                return f"{head[:12]}: its added lines were not read ({ex})"
+            why = (ponytail.lane_problem(run_dir, head) if ponytail.on(cfg) else "") or ponytail.size_problem(
+                cfg, added, ponytail.reason_text(task, result, codes), run_dir, head)
+            if why:
+                if ponytail.on(cfg) and ponytail.labelled(task) is None:
+                    labels = json.loads(task.get("labels") or "[]")
+                    self.p.db.update_task(task["id"], labels=[*labels, ponytail.label(added)])
+                return f"{head[:12]}: {why}. {ponytail.spec_line(cfg, added)}"
+        return ""
 
     def _branch_tip(self, branch: str) -> tuple[str, str]:
         """(head, its subject) of `branch`, ('', '') when it is missing; read once within a gitmemo scope."""

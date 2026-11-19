@@ -123,7 +123,7 @@ def test_code_plan_and_coordinator_prompts_use_the_vendored_ponytail_skill():
     """Code workers write in ponytail mode; planners and coordinators ask whether a task needs to exist
     (user msg #3706). Each names the vendored skill, which ships with the plugin."""
     prompts = PLUGIN / "template" / "prompts"
-    for name, words in (("kind-code.md", "ponytail mode"), ("kind-plan.md", "needs to exist at all"),
+    for name, words in (("kind-code.md", "Ponytail mode"), ("kind-plan.md", "needs to exist at all"),
                         ("coordinator.md", "needs to exist at all")):
         text = " ".join((prompts / name).read_text(encoding="utf-8").split())
         assert "skill `tt-ponytail`" in text and words in text, name

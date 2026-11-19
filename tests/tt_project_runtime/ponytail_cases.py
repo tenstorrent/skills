@@ -159,3 +159,42 @@ def test_a_lane_reviews_own_push_lands_only_on_its_pass_and_within_the_size(env,
     p.set_config("review.ponytail_land_lines", 50)
     assert "why this size" in push.ponytail_landing(p, str(rid), base, {}, repo)
     assert push.ponytail_landing(p, str(rid), base, {"push_exclude_paths": ["docs/**"]}, repo) == ""
+
+
+def _pony_pq_hand_off(env, s, verdict=None, **more):
+    """As _pq_hand_off, the review's lane having written `verdict` in its run dir."""
+    from ttp import ponytail
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage as Usage
+    s.p.db.update_task(s.review, status="running")
+    run_dir = env["tmp"] / f"run-{s.review}-{time.monotonic_ns()}"
+    run_dir.mkdir()
+    if verdict is not None:
+        (run_dir / ponytail.FILE).write_text(json.dumps(verdict))
+    (run_dir / "result.json").write_text(json.dumps(
+        {"status": "done", "summary": "looks good", "push": [{"branch": s.branch, "head": s.head}], **more}))
+    Daemon(s.p.base)._finish_worker({"task": s.review, "id": 7, "note": "{}"}, Usage(cost_usd=1.0), "ok", run_dir)
+    return s.p.db.task(s.review)
+
+
+def test_an_unlabelled_review_of_an_oversized_code_change_enters_the_push_queue_only_with_its_reason_and_lane(env, monkeypatch):
+    """The push queue measures each approved head of a code change itself, so a review queued with no
+    ponytail label (a coordinator's, an external branch's) cannot skip the size gate or the lane."""
+    from ttp import ponytail
+    monkeypatch.delenv("TTP_TEST_PONYTAIL", raising=False)
+    s = _pq(env, monkeypatch)
+    s.p.set_config("review.ponytail_land_lines", 5)
+    _commit(s.path, "big.txt", "".join(f"{i}\n" for i in range(20)))
+    s.head = _git_out(s.path, "rev-parse", "HEAD").strip()
+    assert ponytail.labelled(s.p.db.task(s.review)) is None
+    t = _pony_pq_hand_off(env, s, {"verdict": "pass", "head": s.head})
+    assert t["status"] == "queued" and not s.p.db.q("SELECT * FROM push_queue")
+    assert json.loads(t["result"])["push_invalid"] == 1
+    assert ponytail.labelled(t) is not None                 # its rerun runs the lane
+    t = _pony_pq_hand_off(env, s, {"verdict": "pass", "head": "0" * 40},
+                          summary="looks good\nwhy this size: one generated table")   # a pass on another head
+    assert t["status"] != "pushing" and not s.p.db.q("SELECT * FROM push_queue")
+    s.p.db.update_task(s.review, result=json.dumps({}))
+    t = _pony_pq_hand_off(env, s, {"verdict": "pass", "head": s.head},
+                          summary="looks good\nwhy this size: one generated table")
+    assert t["status"] == "pushing", t["result"]

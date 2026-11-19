@@ -2733,10 +2733,11 @@ _NUMSTAT: dict[tuple[str, str, str], str] = {}
 NUMSTAT_KEEP = 512
 
 
-def diff_lines(p: Project, refs: list[str], base: str = "", root: Path | None = None) -> dict[str, int | None] | None:
-    """Lines changed per file by `refs` since they left the base branch (or `base`; in repo `root`,
-    default the project root) (None for a binary file), or None when they change nothing measurable,
-    such as a commit already on the base."""
+def diff_lines(p: Project | None, refs: list[str], base: str = "", root: Path | None = None,
+               added: bool = False) -> dict[str, int | None] | None:
+    """Lines changed (with `added`, only added) per file by `refs` since they left the base branch (or
+    `base`; in repo `root`, default the project root) (None for a binary file), or None when they change
+    nothing measurable, such as a commit already on the base."""
     root = root or p.root
     base = base or resolve_base(p)
     out: dict[str, int | None] = {}
@@ -2754,9 +2755,9 @@ def diff_lines(p: Project, refs: list[str], base: str = "", root: Path | None = 
                 while len(_NUMSTAT) > NUMSTAT_KEEP:
                     del _NUMSTAT[next(iter(_NUMSTAT))]
         for line in stat.splitlines():
-            added, deleted, path = line.split("\t", 2)
+            plus, minus, path = line.split("\t", 2)
             prev = out.get(path, 0)
-            n = None if added == "-" else int(added) + int(deleted)
+            n = None if plus == "-" else int(plus) + (0 if added else int(minus))
             out[path] = None if n is None or prev is None else max(n, prev)
     return out or None
 

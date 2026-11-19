@@ -465,9 +465,12 @@ coordinator with that evidence.
   size gate counts added lines (`git diff --numstat`, binaries and `delivery.push_exclude_paths` left
   out): over `review.ponytail_land_lines` (400) before landing, or `review.ponytail_pr_lines` (200, for
   repos reached only by pull request, such as another team's tt-metal) before `gh pr create --draft`, a
-  change needs a `why this size: <reason>` line in its spec, hand-off or PR body and a passed lane.
-  The defaults sit near the 95th and 90th percentiles of this repository's own landed changes; 0 turns
-  the gate off.
+  change needs a `why this size: <reason>` line in its spec, hand-off or PR body (or the code task's
+  `no_split` hand-off field) and a passed lane. The push queue checks every approval of a code change
+  the same way, labelled or not: it measures each approved head against the change's own base and
+  needs the lane's pass on that head; a refused review without the lane is labelled and runs it on its
+  rerun. The defaults come from this repository's landed commits (5643 at the time of writing: 90%
+  added at most 288 lines, 95% at most 383); 0 turns the gate off.
 - A review judges the diff plus the gate results that already exist for the head it reviews, and
   never starts or waits on a repeat of a test that passed on that head: a further test it wants is a
   finding, and its verdict still goes out. Only the required checks (the suite and any smoke test)

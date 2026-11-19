@@ -494,7 +494,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
                # ponytail.py: a code change's review also runs the ponytail lane on ponytail_model; a change
                # adding more lines than ponytail_land_lines (landing) or ponytail_pr_lines (a draft PR, the
                # stricter: other teams' repos) needs a `why this size:` line and a passed lane (0: off).
-               # Defaults from landed history: about p95 of own changes (400), under own p90 for PRs (200).
+               # Defaults from this repo's landed commits (n=5643 at 0.2.1379, added lines per commit:
+               # p90 288, p95 383): landing about p95 (400), PRs under p90 (200).
                "ponytail_lane": True, "ponytail_model": "opus", "ponytail_land_lines": 400,
                "ponytail_pr_lines": 200},
     # Continue chains (chaincap): a task_add that continues a lineage past max_hops hops, max_stalls
