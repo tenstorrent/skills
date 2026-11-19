@@ -917,6 +917,9 @@ PROVIDER_KEYS = {"billing", "tiers", "plugin_dirs", "worker_isolation", "write_f
                  "preserve_thinking",
                  # junk_patterns: name -> regex for the bad-output count (chatbridge.JUNK_PATTERNS replaced).
                  "junk_patterns",
+                 # vendor_defaults, vendor_values: a model family's published settings (sampling, effort map,
+                 # context window, timeout, attribution header), off by default (chatbridge.vendor_levers).
+                 "vendor_defaults", "vendor_values",
                  # providers.chat only: the rules-first model pick (modelpick.py); its keys (enabled, min_p,
                  # options) are checked by modelpick.config_problems.
                  "dispatch"}

@@ -4440,3 +4440,88 @@ def test_chatbridge_relay_moves_reasoning_to_one_field_in_order(mock_chat):
                     {"role": "assistant", "content": "b", "reasoning": "r1"}], "reasoning_content first, one field"
     assert up.seen[0]["body"]["chat_template_kwargs"] == {"clear_thinking": False}
     assert up.seen[1]["body"]["messages"] == msgs and "chat_template_kwargs" not in up.seen[1]["body"]
+
+
+# Vendor defaults (providers.chat.vendor_defaults, chatbridge.vendor_levers): off by default, all levers
+# or each alone, per run by TTP_CHAT_VENDOR_DEFAULTS.
+
+def test_chatbridge_vendor_defaults_off_by_default_and_all_on_for_one_run(monkeypatch):
+    from ttp import chatbridge
+    monkeypatch.delenv("TTP_CHAT_VENDOR_DEFAULTS", raising=False)
+    cfg = {"providers": {"chat": {"endpoint": "cloud", "tiers": {"standard": {"model": "zai/GLM-5.3",
+                                                                              "context_window": 110000}}}}}
+    plain = chatbridge.settings(cfg, "standard", "zai/GLM-5.3", "medium")
+    assert plain["context_window"] == 110000 and "fields" not in plain and "vendor" not in plain, "off by default"
+    assert "client_timeout_ms" not in plain and "attribution_header" not in plain
+    monkeypatch.setenv("TTP_CHAT_VENDOR_DEFAULTS", "1")
+    got = chatbridge.settings(cfg, "standard", "zai/GLM-5.3", "medium")
+    assert got["vendor"] == list(chatbridge.VENDOR_LEVERS)
+    assert got["fields"] == {"temperature": 1.0, "top_p": 0.95, "reasoning_effort": "high"}
+    assert got["context_window"] == 1_000_000, "the real window replaces the tier's compact window"
+    assert got["client_timeout_ms"] == 3_000_000 and got["attribution_header"] is False
+    assert "fields" not in chatbridge.settings(cfg, "standard", "other-model", "medium"), "no family: nothing"
+    monkeypatch.setenv("TTP_CHAT_VENDOR_DEFAULTS", "0")
+    on = {"providers": {"chat": {**cfg["providers"]["chat"], "vendor_defaults": True}}}
+    assert "vendor" not in chatbridge.settings(on, "standard", "zai/GLM-5.3", "high"), "0 forces it off"
+
+
+def test_chatbridge_vendor_effort_map_never_leaves_an_effort_to_the_endpoint_default(monkeypatch):
+    from ttp import chatbridge
+    monkeypatch.delenv("TTP_CHAT_VENDOR_DEFAULTS", raising=False)
+    cfg = {"providers": {"chat": {"endpoint": "cloud", "vendor_defaults": {"effort_map": True}}}}
+    got = {e: chatbridge.settings(cfg, "light", "glm-5.3", e)["fields"] for e in (*chatbridge.EFFORTS, "")}
+    assert got == {"low": {"reasoning_effort": "low"}, "medium": {"reasoning_effort": "high"},
+                   "high": {"reasoning_effort": "high"}, "xhigh": {"reasoning_effort": "max"},
+                   "max": {"reasoning_effort": "max"}, "": {"reasoning_effort": "high"}}, "no silent max"
+    s = chatbridge.settings(cfg, "light", "glm-5.3", "low")
+    assert "context_window" not in s and "client_timeout_ms" not in s and "attribution_header" not in s, "one lever only"
+    pinned = {"providers": {"chat": {**cfg["providers"]["chat"],
+                                     "effort_fields": {"glm-5.3": {"low": {"reasoning_effort": "max"}}}}}}
+    assert chatbridge.settings(pinned, "light", "glm-5.3", "low")["fields"] == {"reasoning_effort": "max"}, \
+        "effort_fields win"
+
+
+def test_chatbridge_vendor_levers_by_name_values_override_standins_and_config_problems(monkeypatch):
+    from ttp import chatbridge, project
+    monkeypatch.setenv("TTP_CHAT_VENDOR_DEFAULTS", "sampling, timeout")
+    cfg = {"providers": {"chat": {"endpoint": "cloud",
+                                  "vendor_values": {"GLM": {"sampling": {"temperature": 0.7}, "timeout_ms": 900000},
+                                                    "kimi": {"context_window": 256000}}}}}
+    s = chatbridge.settings(cfg, "light", "glm-5.3", "high", standins=["kimi-k2"], served=["/x"])
+    assert s["vendor"] == ["sampling", "timeout"] and s["fields"] == {"temperature": 0.7}
+    assert s["client_timeout_ms"] == 900000 and "context_window" not in s
+    monkeypatch.setenv("TTP_CHAT_VENDOR_DEFAULTS", "context_window")
+    s = chatbridge.settings(cfg, "light", "glm-5.3", "high", standins=["kimi-k2"], served=["/x"])
+    assert s["context_window"] == 1_000_000 and s["standins"] == [{"model": "kimi-k2", "context_window": 256000}]
+    monkeypatch.delenv("TTP_CHAT_VENDOR_DEFAULTS")
+    assert chatbridge.config_problems(cfg) == [] and project.unknown_key_hint("providers.chat.vendor_defaults") is None
+    for bad in ({"vendor_defaults": "yes"}, {"vendor_defaults": {"speed": True}}, {"vendor_defaults": {"sampling": 1}},
+                {"vendor_values": {"glm": 3}}, {"vendor_values": {"glm": {"effort_map": {"huge": "max"}}}},
+                {"vendor_values": {"glm": {"sampling": {"model": "x"}}}},
+                {"vendor_values": {"glm": {"timeout_ms": -1}}}):
+        entry = {"endpoint": "cloud", "vendor_defaults": True, **bad}
+        got = chatbridge.config_problems({"providers": {"chat": entry}})
+        assert len(got) == 1 and "vendor_" in got[0], bad
+        assert chatbridge.vendor_levers(entry, environ={}) == [], "an invalid entry stays off"
+
+
+def test_chatbridge_vendor_defaults_reach_the_request_and_the_agent_env(mock_chat, monkeypatch):
+    from ttp import chatbridge
+    monkeypatch.setenv("TTP_CHAT_VENDOR_DEFAULTS", "1")
+    s = chatbridge.settings({"providers": {"chat": {"endpoint": "cloud"}}}, "light", "glm-5.3", "xhigh")
+    reply = {"choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]}
+    up = mock_chat((200, reply))
+    b = chatbridge.Bridge(up.url, _CB_KEY, "glm-5.3", effort=s["effort"], fields=s["fields"],
+                          context_window=s["context_window"], client_timeout_ms=s["client_timeout_ms"],
+                          attribution_header=s["attribution_header"], vendor=s["vendor"])
+    with b:
+        _post(b, {"max_tokens": 50, "temperature": 0.2, "messages": [{"role": "user", "content": "hi"}]})
+        env, st = b.env(), b.stats()
+    body = up.seen[0]["body"]
+    assert body["temperature"] == 1.0 and body["top_p"] == 0.95 and body["reasoning_effort"] == "max"
+    assert env["API_TIMEOUT_MS"] == "3000000" and env["CLAUDE_CODE_ATTRIBUTION_HEADER"] == "0"
+    assert env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
+    assert b.timeout >= 3000, "the bridge waits upstream as long as the agent does"
+    assert st["vendor"] == list(chatbridge.VENDOR_LEVERS)
+    off = chatbridge.Bridge(up.url, _CB_KEY, "glm-5.3")
+    assert "API_TIMEOUT_MS" not in off.env() and "CLAUDE_CODE_ATTRIBUTION_HEADER" not in off.env()

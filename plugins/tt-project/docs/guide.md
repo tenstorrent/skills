@@ -1985,6 +1985,21 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    Calls from a process with `TTP_CHAT_PRIORITY=low` in its environment (`ttp bench`, `ttp
    model-bench` and the probe set it, and their children inherit it) take no free slot while a
    project's call is waiting for one.
+8. Vendor defaults, off by default: `"vendor_defaults": true` under `providers.chat` applies a
+   model family's published settings, each a lever you can also turn on alone with an object such
+   as `{"sampling": true, "effort_map": true}`. The levers: `sampling` (GLM: temperature 1.0 and
+   top_p 0.95 on every request), `effort_map` (the run's effort sent as the model's own level;
+   GLM knows low, high and max and runs at max when none is sent, so low goes as low, medium and
+   high as high, xhigh and max as max), `context_window` (the model's real window, about 1M tokens
+   for GLM, replaces the tier's compact window), `timeout` (Claude Code's `API_TIMEOUT_MS`, 3,000,000
+   ms for GLM, and the bridge waits upstream as long) and `attribution_header`
+   (`CLAUDE_CODE_ATTRIBUTION_HEADER=0`, which keeps the system prompt the same on every call so the
+   endpoint's prefix cache holds). `effort_fields` still win over sampling and the effort map.
+   `"vendor_values": {"glm": {"sampling": {"temperature": 0.7}}}` replaces a family's value (a key
+   replaces that whole value), and adds a family under any word its model ids contain. For one run
+   without a config change, set `TTP_CHAT_VENDOR_DEFAULTS=1` (all levers), `0` (none) or lever names
+   separated by commas in the environment of the process that starts it. The run's exit record lists
+   the levers that were on under `bridge.vendor`.
 
 The key stays in the per-user secrets store and the bridge's upstream requests: the agent gets
 only the bridge's address and a per-run token. Reasoning text from the endpoint is dropped

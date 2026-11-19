@@ -43,6 +43,17 @@ relay an assistant turn's reasoning, in either field, is moved to that field. Gu
 reasoning goes upstream for a model whose id contains a `skip_models` word (default "flash", any case),
 and `max_turns` (0 = all) keeps it on only the last N assistant turns; stats() counts the turns sent.
 
+Vendor defaults (`providers.chat.vendor_defaults`, default off; true for every lever, or an object
+of lever: true; TTP_CHAT_VENDOR_DEFAULTS=1, 0 or lever names separated by commas sets them for one run,
+like TTP_CHAT_PRESERVE_THINKING): a model family's published settings (VENDOR, by a word its model id
+contains; `providers.chat.vendor_values.<word>` replaces any of them). Levers: `sampling` (request fields
+such as temperature and top_p), `effort_map` (the run's effort sent as the model's own reasoning_effort
+level, so no effort falls to the endpoint's default, which for GLM-5.x is max), `context_window` (the
+model's real window replaces the tier's compact window), `timeout` (the agent's API_TIMEOUT_MS, and the
+bridge waits upstream as long) and `attribution_header` (CLAUDE_CODE_ATTRIBUTION_HEADER=0: a header that
+changes each call defeats the server's prefix cache). effort_fields win over sampling and effort_map;
+stats() lists the levers on (`vendor`).
+
 Mid-run model swap: a run whose launch named ranked stand-ins (`standins`, modelrank.standins: the
 ranking's other models, none for a required pin) keeps going when its model goes away. When the
 upstream refuses the model (model_missing: a 404 naming it or one /models leaves out; or the error
@@ -124,6 +135,15 @@ TOOL_INPUT_RE = re.compile(
     r"|invalid (?:tool )?(?:parameters?|input|arguments?)|missing required (?:parameter|argument|field)"
     r"|could not be parsed|not valid JSON|invalid JSON|JSON\.?parse|unparseable|Unexpected token"
     r"|Unterminated string|Expected property name", re.I)
+VENDOR_ENV = "TTP_CHAT_VENDOR_DEFAULTS"   # 1, 0 or lever names: the vendor defaults on or off for one run (settings)
+VENDOR_LEVERS = ("sampling", "effort_map", "context_window", "timeout", "attribution_header")
+# A model family's published settings, by a word its model id contains (any case); vendor_values overrides them.
+# GLM-5.x (its vendor's docs): temperature 1.0, top_p 0.95; reasoning_effort low, high or max, max when none is
+# sent; a 1,048,576-token window (measured: a 1,008,026-token prompt accepted); a 3,000,000 ms client timeout.
+VENDOR = {"glm": {"sampling": {"temperature": 1.0, "top_p": 0.95},
+                  "effort_map": {"low": "low", "medium": "high", "high": "high", "xhigh": "max", "max": "max",
+                                 "*": "high"},
+                  "context_window": 1_000_000, "timeout_ms": 3_000_000}}
 
 
 class _ClientGone(Exception):
@@ -150,16 +170,19 @@ def settings(cfg: dict, tier: str, model: str, effort: str = "", standins=(), se
     row = (entry.get("tiers") or {}).get(tier) or {}
     busy = {k: entry[k] for k in ("busy_retries", "busy_wait_s") if _count_ok(entry.get(k))}
     cap = row.get("max_tokens") or entry.get("max_tokens") or 0
-    window = window_of(entry, model, row)
-    fields = effort_fields(entry, model, effort)
+    levers = vendor_levers(entry)
+    window = vendor_window(entry, model, levers) or window_of(entry, model, row)
+    fields = run_fields(entry, model, effort, levers)
     think = thinking_of(entry)
-    alts = [{"model": m, **({"fields": f} if (f := effort_fields(entry, m, effort)) else {}),
-             **({"context_window": w} if (w := window_of(entry, m)) else {})} for m in standins if m != model]
+    alts = [{"model": m, **({"fields": f} if (f := run_fields(entry, m, effort, levers)) else {}),
+             **({"context_window": w} if (w := vendor_window(entry, m, levers) or window_of(entry, m)) else {})}
+            for m in standins if m != model]
+    client = vendor_client(entry, model, levers)
     return {"endpoint": str(entry.get("endpoint") or ""), "base_url": str(entry.get("base_url") or ""),
             "model": model, "max_tokens": int(cap or 0), **({"context_window": int(window)} if window else {}),
             **({"effort": effort, "fields": fields} if fields else {}),
             **({"effort": effort, "standins": alts, "served": [str(d) for d in served]} if alts and served else {}),
-            **({"thinking": think} if think else {}), **busy,
+            **({"thinking": think} if think else {}), **({"vendor": levers} if levers else {}), **client, **busy,
             **({"junk_patterns": dict(entry["junk_patterns"])}
                if isinstance(entry.get("junk_patterns"), dict) and not _junk_problems(entry["junk_patterns"]) else {})}
 
@@ -272,6 +295,88 @@ def thinking_of(entry: dict, environ=None) -> dict:
     got = raw if isinstance(raw, dict) else {}
     return {"field": str(got.get("field") or REASONING_FIELDS[0]), "max_turns": int(got.get("max_turns") or 0),
             "skip_models": [str(w) for w in got.get("skip_models", THINKING_SKIP)]}
+
+
+def vendor_levers(entry: dict, environ=None) -> list[str]:
+    """The vendor-default levers on for a run (VENDOR_LEVERS order), [] when none: providers.chat.vendor_defaults
+    (true for all, or an object of lever: true), overridden by VENDOR_ENV ("1" all, "0" none, or lever names
+    separated by commas, for one run). An invalid entry is off."""
+    raw = (entry or {}).get("vendor_defaults") if isinstance(entry, dict) else None
+    flag = str((os.environ if environ is None else environ).get(VENDOR_ENV) or "").strip().lower()
+    if flag in ("1", "true", "on", "yes", "all"):
+        return list(VENDOR_LEVERS)
+    if flag in ("0", "false", "off", "no", "none"):
+        return []
+    if flag:
+        named = {w.strip() for w in flag.split(",")}
+        return [k for k in VENDOR_LEVERS if k in named]
+    if _vendor_problems(raw, (entry or {}).get("vendor_values")):
+        return []
+    if raw is True:
+        return list(VENDOR_LEVERS)
+    return [k for k in VENDOR_LEVERS if isinstance(raw, dict) and raw.get(k) is True]
+
+
+def vendor_values(entry: dict, model: str) -> dict:
+    """The published settings of `model`'s family (VENDOR, by the first word its id contains), with
+    providers.chat.vendor_values.<word> over them; {} for a model no entry names."""
+    over = (entry or {}).get("vendor_values") if isinstance(entry, dict) else None
+    over = over if isinstance(over, dict) else {}
+    low = str(model or "").lower()
+    for word in [*over, *(w for w in VENDOR if w not in over)]:
+        if str(word).lower() in low:
+            return {**VENDOR.get(str(word).lower(), {}), **(over.get(word) or {})}
+    return {}
+
+
+def vendor_window(entry: dict, model: str, levers) -> int:
+    """The model's real context window when the context_window lever is on, else 0 (the tier's own)."""
+    return int(vendor_values(entry, model).get("context_window") or 0) if "context_window" in levers else 0
+
+
+def vendor_client(entry: dict, model: str, levers) -> dict:
+    """The run.json keys for the agent's own settings: its client timeout and the attribution header."""
+    vals = vendor_values(entry, model)
+    timeout = int(vals.get("timeout_ms") or 0) if "timeout" in levers else 0
+    return {**({"client_timeout_ms": timeout} if timeout else {}),
+            **({"attribution_header": False} if "attribution_header" in levers else {})}
+
+
+def run_fields(entry: dict, model: str, effort: str, levers=()) -> dict:
+    """The request fields for `model` at `effort`: the vendor's sampling and its effort mapped onto the
+    levels the model knows (an effort the map lacks takes its `*`), under providers.chat.effort_fields,
+    which win."""
+    vals = vendor_values(entry, model) if levers else {}
+    out = dict(vals.get("sampling") or {}) if "sampling" in levers else {}
+    emap = (vals.get("effort_map") or {}) if "effort_map" in levers else {}
+    if level := emap.get(effort) or emap.get("*"):
+        out["reasoning_effort"] = level
+    return {**out, **effort_fields(entry, model, effort)}
+
+
+def _vendor_problems(raw, values=None) -> list[str]:
+    out = []
+    if raw is not None and not isinstance(raw, bool) and not (
+            isinstance(raw, dict) and all(k in VENDOR_LEVERS and isinstance(v, bool) for k, v in raw.items())):
+        out.append(f"providers.chat.vendor_defaults: give true, false or an object of levers ({', '.join(VENDOR_LEVERS)}) "
+                   "set to true or false; vendor defaults are off")
+    if values is not None and not (isinstance(values, dict) and all(isinstance(v, dict) for v in values.values())):
+        out.append("providers.chat.vendor_values: give an object of model id words, each an object of settings "
+                   "(sampling, effort_map, context_window, timeout_ms); vendor defaults are off")
+    elif isinstance(values, dict):
+        for word, row in values.items():
+            emap = row.get("effort_map")
+            if emap is not None and not (isinstance(emap, dict) and set(emap) <= {*EFFORTS, "*"}
+                                         and all(isinstance(v, str) for v in emap.values())):
+                out.append(f"providers.chat.vendor_values.{word}.effort_map: give an object of efforts "
+                           f"({', '.join(EFFORTS)} or *) to the model's own level names; vendor defaults are off")
+            if (samp := row.get("sampling")) is not None and not (isinstance(samp, dict) and not CONVERSATION & set(samp)):
+                out.append(f"providers.chat.vendor_values.{word}.sampling: give an object of request fields such as "
+                           '{"temperature": 1.0}; vendor defaults are off')
+            for key in ("context_window", "timeout_ms"):
+                if (v := row.get(key)) is not None and (isinstance(v, bool) or not isinstance(v, int) or v < 0):
+                    out.append(f"providers.chat.vendor_values.{word}.{key}: give a whole number; vendor defaults are off")
+    return out
 
 
 def _thinking_problems(raw) -> list[str]:
@@ -412,6 +517,7 @@ def config_problems(raw: dict) -> list[str]:
     out = _effort_problems(entry["effort_fields"]) if entry.get("effort_fields") is not None else []
     out += _thinking_problems(entry.get("preserve_thinking"))
     out += _junk_problems(entry.get("junk_patterns"))
+    out += _vendor_problems(entry.get("vendor_defaults"), entry.get("vendor_values"))
     try:
         endpoint.slot(str(entry.get("endpoint") or ""))
     except ValueError:
@@ -865,8 +971,13 @@ class Bridge:
                  timeout: float = UPSTREAM_TIMEOUT_S, context_window: int = 0, effort: str = "",
                  fields: dict | None = None, standins: list | None = None, served: list | None = None,
                  busy_retries: int | None = None, busy_wait_s: float | None = None, thinking: dict | None = None,
-                 junk_patterns: dict | None = None):
+                 junk_patterns: dict | None = None, client_timeout_ms: int = 0, attribution_header: bool = True,
+                 vendor: list | None = None):
         self.base_url, self._key, self.model = endpoint.base_url(base_url), key, model
+        self.vendor = list(vendor or [])   # the vendor-default levers on (vendor_levers), for stats()
+        # The agent's own call timeout (API_TIMEOUT_MS); the bridge waits upstream at least as long.
+        self.client_timeout_ms, self.attribution_header = int(client_timeout_ms or 0), bool(attribution_header)
+        timeout = max(timeout, self.client_timeout_ms / 1000.0)
         self.thinking = dict(thinking or {})   # preserved thinking (thinking_of), {} when off
         self.thought = {"returned": 0, "sent": 0}   # reasoning turns given to the client / sent back upstream
         self.max_tokens, self.timeout = int(max_tokens or 0), timeout
@@ -928,6 +1039,8 @@ class Bridge:
                       "fields": s.get("fields") or {}, "standins": s.get("standins") or [],
                       "served": s.get("served") or [], "thinking": s.get("thinking") or {},
                       "junk_patterns": s.get("junk_patterns"),
+                      "client_timeout_ms": s.get("client_timeout_ms") or 0, "vendor": s.get("vendor") or [],
+                      "attribution_header": s.get("attribution_header", True) is not False,
                       **{k: s[k] for k in ("busy_retries", "busy_wait_s") if _count_ok(s.get(k))}, **kw})
 
     @property
@@ -939,7 +1052,11 @@ class Bridge:
         return {"ANTHROPIC_BASE_URL": self.url, "ANTHROPIC_AUTH_TOKEN": self.token, "ANTHROPIC_API_KEY": "",
                 "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
                 # Claude Code takes 200k for a model it does not know: compact within the tier's window.
-                **({"CLAUDE_CODE_AUTO_COMPACT_WINDOW": str(self.context_window)} if self.context_window else {})}
+                **({"CLAUDE_CODE_AUTO_COMPACT_WINDOW": str(self.context_window)} if self.context_window else {}),
+                # The vendor defaults (vendor_client): a long call timeout, and no per-request attribution
+                # header, which changes the system prompt each call and so defeats the server's prefix cache.
+                **({"API_TIMEOUT_MS": str(self.client_timeout_ms)} if self.client_timeout_ms else {}),
+                **({} if self.attribution_header else {"CLAUDE_CODE_ATTRIBUTION_HEADER": "0"})}
 
     def openai_env(self) -> dict[str, str]:
         """What an OpenAI-compatible agent (a bench harness arm) gets: the bridge's /v1 relay and the run token."""
@@ -1074,7 +1191,8 @@ class Bridge:
                 **({"server": self.calls.export()} if self.calls.rows else {}),
                 **({"inflight": self.inflight.export()} if self.inflight else {}),
                 **({"bad_output": {**self.bad, "junk_hits": dict(self.bad["junk_hits"])}}
-                   if any(v for k, v in self.bad.items() if k != "junk_hits") else {})}
+                   if any(v for k, v in self.bad.items() if k != "junk_hits") else {}),
+                **({"vendor": list(self.vendor)} if self.vendor else {})}
 
     def server_wait_s(self) -> float:
         """The time spent waiting on the server so far (in-flight calls included): the cell limit does not count it."""
