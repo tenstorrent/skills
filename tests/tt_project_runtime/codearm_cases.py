@@ -1218,3 +1218,62 @@ def test_glm_share_counts_the_guards_fires_per_day(env, tmp_path):
     day = glmshare.bad_output(p, [row])[0]
     assert (day["outward_drafts"], day["gate_stops"], day["runs"]) == (2, 1, 0)
     assert "outward drafts 2, gate stops 1" in glmshare.bad_lines([day])[0]
+
+
+def _ua_cfgs():
+    covered = {"providers": {"chat": {"endpoint": "placeholder", "base_url": "https://chat.example.invalid/v1"}},
+               "route": {"glm_work": {"on": True, "model": "example-org/work-model", "holdout": 0.999}}}
+    return covered, _ca_cfg(glm={**_CA_GLM, "harness": "mini-swe-agent"}, glm_share=0.0001)
+
+
+def test_a_code_task_the_user_ordered_onto_the_arm_runs_there_though_it_names_a_policy_file(env):
+    from ttp import codearm
+    p = make(env)
+    mid = p.db.post("in", "Run the delete batches on the cheaper code arm.", chat="c1")
+    for cfg in _ua_cfgs():   # the holdout coin (covered) and the share coin (not) would both keep it off
+        ordered = _ca_task(p, f"delete the dead helpers in src/rt/daemon.py\ncode_arm: user msg #{mid}")
+        got = codearm.choose(p.db, cfg, ordered, "standard", policy=_PF_LIST)
+        assert (got["arm"], got["run"], got["why"]) == ("glm", "glm", f"user msg #{mid}")
+        assert codearm.show_line(codearm.recorded(p.db, ordered["id"])) == f"code route arm: glm (user msg #{mid})"
+        assert codearm.choose(p.db, cfg, p.db.task(ordered["id"]), "standard", policy=_PF_LIST)["run"] == "glm"
+        plain = _ca_task(p, "delete the dead helpers in src/rt/daemon.py")
+        got = codearm.choose(p.db, cfg, plain, "standard", policy=_PF_LIST)
+        assert got["run"] == "claude" and got["why"].startswith("policy: names src/rt/daemon.py")
+        pinned = _ca_task(p, f"delete the dead helpers\ncode_arm: user msg #{mid}", provider="claude")
+        assert codearm.choose(p.db, cfg, pinned, "standard", policy=_PF_LIST)["run"] == "claude"   # other stays hold
+
+
+def test_a_code_arm_user_line_from_a_follow_up_or_citing_no_user_message_is_ignored(env):
+    from ttp import chaincap, codearm
+    p = make(env)
+    mid = p.db.post("in", "Run the delete batches on the cheaper code arm.", chat="c1")
+    out = p.db.post("out", "On it.", chat="c1")
+    cfg = _ua_cfgs()[1]
+    spec = "delete the dead helpers in src/rt/daemon.py\ncode_arm: user msg #{}"
+    for task, why in ((_ca_task(p, spec.format(mid), origin="daemon"), "task made by daemon"),
+                      (_ca_task(p, spec.format(99999)), "#99999 is no user message"),
+                      (_ca_task(p, spec.format(out)), f"#{out} is no user message")):
+        mid_, ignored = codearm.user_arm(p.db, task)
+        assert mid_ == 0 and ignored.startswith(f"code_arm line ignored: {why}")
+        got = codearm.choose(p.db, cfg, task, "standard", policy=_PF_LIST)
+        assert got["run"] == "claude" and why in got["why"]   # a policy reason, or a daemon task's own stay
+    # a worker's follow-up queued by the daemon (auto hop) drops the line, so it never reaches the new task
+    parent = _ca_task(p, spec.format(mid))
+    hop = chaincap.hop_spec(p, parent, {"title": "next batch", "spec": spec.format(mid) + "\nthen run the tests"})
+    assert "code_arm" not in hop and "then run the tests" in hop
+    assert codearm.user_arm(p.db, parent)[0] == mid
+
+
+def test_a_user_ordered_task_is_not_bounced_for_touching_a_policy_file(env, tmp_path):
+    from types import SimpleNamespace
+    from ttp import policyfiles
+    p = make(env)
+    mid = p.db.post("in", "Run the delete batches on the cheaper code arm.", chat="c1")
+    pp = SimpleNamespace(db=p.db, root=tmp_path, worktrees=tmp_path / "no-worktrees")
+    changed = {"src/rt/daemon.py": 4}
+    ordered = _ca_task(p, f"delete the dead helpers\ncode_arm: user msg #{mid}")
+    assert policyfiles.bounce_diff(pp, ordered, _PF_LIST, changed) == ""
+    plain = _ca_task(p, "delete the dead helpers")
+    assert policyfiles.bounce_diff(pp, plain, _PF_LIST, changed) == "policy files touched: src/rt/daemon.py"
+    worker = _ca_task(p, f"delete the dead helpers\ncode_arm: user msg #{mid}", origin="daemon")
+    assert policyfiles.bounce_diff(pp, worker, _PF_LIST, changed) == "policy files touched: src/rt/daemon.py"

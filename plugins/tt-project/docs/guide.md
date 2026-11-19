@@ -1313,7 +1313,11 @@ decides what needs an audit record, review, approval, budget or push, in `harnes
 line relative to the code repo root, `#` starts a comment, `**` crosses directories, a pattern without `/` matches
 that name at any depth; the plugin ships no list). Before the coin, a task whose title, spec or `Where:` line
 names a listed file or a policy term stays on Opus; after a run, a branch that changes a listed file is refused
-(its tip saved under `refs/ttp/policy-bounce/t<id>`) and the task goes to Opus. A project with no list cannot run
+(its tip saved under `refs/ttp/policy-bounce/t<id>`) and the task goes to Opus. A code task the user ordered onto
+the arm carries the coordinator's spec line `code_arm: user msg #<id>`: it skips the policy checks and the coin and
+runs on the arm while it is live (`ttp task show`: `glm (user msg #<id>)`); the line counts only on a task from the
+coordinator's own task_add citing a user message, never on a worker follow-up or daemon task, and its Opus review
+still reads the whole diff. A project with no list cannot run
 the arm live. The daily review shows one line per arm (glm, sonnet, claude): first-try review
 fails, fix rounds and median time to land, bounces, reverts within 3 days, server waits and refusals, tokens
 in (uncached and cached apart) and out, and $. A model-free guard runs daily over the last 7 days: when the

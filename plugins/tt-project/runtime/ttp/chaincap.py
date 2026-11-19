@@ -747,8 +747,10 @@ def _brief(p, branch: str, head: str) -> str:
 
 
 def hop_spec(p, task: dict, fup: dict) -> str:
-    """The spec auto_hop queues `fup` with: its own, then `task`'s branch_brief."""
-    spec = str(fup.get("spec") or "")
+    """The spec auto_hop queues `fup` with: its own, then `task`'s branch_brief. A hand-off's `code_arm: user msg`
+    line is dropped: only the coordinator's own task_add marks a user's order (codearm.user_arm)."""
+    from .codearm import USER_ARM
+    spec = "\n".join(ln for ln in str(fup.get("spec") or "").splitlines() if not USER_ARM.match(ln))
     if brief := branch_brief(p, task):
         spec = f"{spec.rstrip()}\n\n{brief}" if spec.strip() else brief
     return spec

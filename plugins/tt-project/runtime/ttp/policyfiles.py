@@ -10,7 +10,8 @@ empty) cannot run the arm live (codearm.refusal): the share is 0 until it has on
 
 Two model-free uses (codearm): before the coin, a task is policy-class when its title, spec or `Where:` line names
 a listed file or uses a policy term (TERMS); after a run on the arm, a branch that changes a listed file is refused
-(bounce_diff) and the task goes to Opus.
+(bounce_diff) and the task goes to Opus. A task the user ordered onto the arm (codearm.user_arm) skips both; its
+Opus review still reads the whole diff.
 """
 from __future__ import annotations
 
@@ -135,10 +136,12 @@ def bounce_diff(p, task: dict, patterns: list[str], changed: dict | None) -> str
     """After a run on the arm: the reason to bounce its task to Opus ('' when its branch touches no policy file).
     `changed` is the branch's paths against its base (worktree.diff_lines). The branch tip is saved first
     (EVIDENCE_REF) and the task's branch goes back to its fork point, so the Opus run starts clean."""
+    from . import codearm, worktree
     found = hits(patterns, changed or {})
     if not found:
         return ""
-    from . import worktree
+    if codearm.USER_ARM.search(str(task.get("spec") or "")) and codearm.user_arm(p.db, task)[0]:
+        return ""   # the user ordered it onto the arm
     tid, branch = task["id"], task.get("branch") or ""
     path = Path(p.worktrees) / f"t{tid}"
     root = path if path.is_dir() else p.root   # the task's own repository: a worktree shares its repo's refs

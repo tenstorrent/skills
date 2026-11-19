@@ -16,7 +16,9 @@ Who takes the coin (choose): a new standard-tier code task that the Sonnet route
 no pin, no outside input, no deep ask, not a retry), with no resource of any kind (device, machine, lock, read),
 no protected class (route.protected: urgent, device, optimization or performance, conclusion), no `conclusion:`
 line, not user-ordered and no `code_arm: claude` line (the coordinator's force). Anything else, or anything in
-doubt, is the `claude` arm: the code route as before. The coin is sha256 of the seed and task id, recorded once per
+doubt, is the `claude` arm: the code route as before. A task the user ordered onto the arm, marked by the
+coordinator's `code_arm: user msg #<id>` line (user_arm), skips the user-order and policy-class checks and the coin
+and runs on the arm while it is live; its other stays hold, and reviews stay on Opus. The coin is sha256 of the seed and task id, recorded once per
 task (kv `code_arm:<id>`) with its seed and why, so every run of the task reads the same arm. A follow-up (a
 continue or a review fix) takes its lineage's arm (chaincap.chain), never a new coin.
 
@@ -60,6 +62,7 @@ HARNESSES: tuple = ("mini-swe-agent",)
 KNOWN_HARNESSES = ("claude-code", "mini-swe-agent", "codex")   # named in a setting; only HARNESSES run live
 REFUSED_KV = "code_arm_refused"     # {"mark", "why", "ts"}: the setting a live refusal was logged for
 FORCE = re.compile(r"(?mi)^\s*code_arm:\s*(claude|opus|sonnet)\b")
+USER_ARM = re.compile(r"(?mi)^\s*code_arm:\s*user msg #(\d+)\b")   # the coordinator's mark of a user's order
 CONCLUSION = re.compile(r"(?mi)^\s*conclusion:")
 # A spec that leaves a design or policy choice open (weigh options, a trade-off, no data settles it) is Opus's
 # deep thinking (user's rollout rule): kept off the arm model-free, since a dry-run GLM run decided one itself.
@@ -224,12 +227,29 @@ def bounced(db, task_id) -> str:
     return ""
 
 
+def user_arm(db, task: dict) -> tuple[int, str]:
+    """(message id, '') when `task` carries the line `code_arm: user msg #<id>` from the coordinator's own task_add
+    and #id is a user message here: the user ordered it onto the arm, so neither the policy-class check nor the
+    holdout coin keeps it off. (0, why it is ignored) for any other task with the line; (0, '') without one. A
+    daemon task or a worker follow-up (chaincap.hop_spec drops the line from a hand-off's text) never counts."""
+    m = USER_ARM.search(str(task.get("spec") or ""))
+    if not m:
+        return 0, ""
+    mid = int(m.group(1))
+    if task.get("origin") != "coordinator":
+        return 0, f"code_arm line ignored: task made by {task.get('origin') or 'unknown'}, not the coordinator"
+    if not db.one("SELECT 1 FROM messages WHERE id=? AND direction='in' AND kind='user'", (mid,)):
+        return 0, f"code_arm line ignored: #{mid} is no user message"
+    return mid, ""
+
+
 def stays(db, cfg: dict, task: dict, tier: str, picked: dict | None = None, policy: list | None = None) -> str:
     """Why `task` stays on Claude now ('' when the arm may take it): the Sonnet route's own stays
     (runclass.code_route), a resource, a protected class, a `conclusion:` line, the force line, a user order,
     a policy-class spec (policyfiles.task_reason against the project's list `policy`, model-free), an unsupported
-    harness."""
+    harness. A task the user ordered onto the arm (user_arm) skips the user-order and policy-class checks."""
     from . import glmwork, policyfiles, route, runclass, urgent
+    ordered = user_arm(db, task)[0]
     if (task.get("kind") or "") != "code":
         return "not_code"
     if glmwork.settings(cfg):   # covered: the GLM work route's keep-core checks, not the Sonnet route's stays
@@ -241,7 +261,7 @@ def stays(db, cfg: dict, task: dict, tier: str, picked: dict | None = None, poli
             return "resources"
         if FORCE.search(str(task.get("spec") or "")):
             return "forced_claude"
-        if policy and (why := policyfiles.task_reason(policy, task)):
+        if policy and not ordered and (why := policyfiles.task_reason(policy, task)):
             return f"policy: {why}"
         return ""
     if str(tier or task.get("tier") or "standard") != "standard":
@@ -257,14 +277,14 @@ def stays(db, cfg: dict, task: dict, tier: str, picked: dict | None = None, poli
         return "conclusion"
     if JUDGMENT.search(str(task.get("spec") or "")):
         return "judgment"
-    if task.get("origin") == "user" or urgent.user_ordered(task):
+    if not ordered and (task.get("origin") == "user" or urgent.user_ordered(task)):
         return "user_ordered"
     try:
         if why := route.protected(db, cfg, task, tier):
             return why
     except Exception:   # in doubt, Claude
         return "unchecked"
-    if policy and (why := policyfiles.task_reason(policy, task)):
+    if policy and not ordered and (why := policyfiles.task_reason(policy, task)):
         return f"policy: {why}"
     s = settings(cfg) or {}
     if s.get("harness") not in HARNESSES:
@@ -286,7 +306,10 @@ def choose(db, cfg: dict, task: dict | None, tier: str, picked: dict | None = No
         from . import chaincap
         ch = chaincap.chain(db, tid) or [task]
         parent = next((a for t in reversed(ch[:-1]) if (a := recorded(db, t["id"]))), None)
-        if len(ch) > 1:
+        mid, ignored = user_arm(db, task)
+        if mid and not (why := stays(db, cfg, task, tier, picked, policy)):   # the user's order: no coin, no lineage
+            got = {"arm": "glm", "why": f"user msg #{mid}", "seed": s["seed"], "ts": time.time()}
+        elif len(ch) > 1:
             got = {"arm": parent["arm"] if parent else "claude", "why": f"lineage of #{ch[0]['id']}"
                    + ("" if parent else " (no arm)"), "seed": s["seed"], "ts": time.time()}
         elif s.get("glm_work"):   # covered: a kept task stays on Claude; else the work route's holdout coin
@@ -300,6 +323,8 @@ def choose(db, cfg: dict, task: dict | None, tier: str, picked: dict | None = No
             why = stays(db, cfg, task, tier, picked, policy)
             arm = "claude" if why else "glm" if coin(tid, s["share"], s["seed"]) else "sonnet"
             got = {"arm": arm, "why": why or f"coin at share {s['share']:g}", "seed": s["seed"], "ts": time.time()}
+        if ignored:
+            got["why"] = f"{got['why']}; {ignored}"
         if not peek:
             db.set_kv(f"{ARM_KV}{tid}", got)
     arm, run, why = got["arm"], got["arm"], ""
