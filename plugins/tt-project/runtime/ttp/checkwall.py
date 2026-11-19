@@ -23,8 +23,6 @@ exits 75 with infra_fault QUEUED_INFRA).
 A hang need not wait for the cap: a command whose output has not grown for its silence limit (SILENT_S,
 10 min; a check object's `"silent_s"` sets it, 0 turns it off) is stopped the same way and recorded as a
 timeout with "silent_s" (wait, said_silent). A check that is silent longer by design raises its silent_s.
-One still printing whose pytest progress lines (`[ NN%]`) stay at 0% for ZERO_S (15 min) has done no test
-(every host it could use held, say): it is stopped then too (Stalled, said_stalled), not left to the cap.
 Any line counts as output: a check that waits for a lane, lock or slot is not hung as long as it says so
 (a line at least every few minutes). The plugin's own waits do (`ttp lock`, the checks lanes and slots,
 the test-worker pool: each tells at least every 5 min); a project's own wrapper that queues must too.
@@ -73,7 +71,6 @@ EXTEND_FRAC = 0.5      # a run's cap is extended by at most half of it in all (E
 EXTEND_SLACK = 1.25    # an extension is the projected time left times this
 EXTEND_MIN_S = 120.0   # and at least this (a run at 100% still writes its summary)
 RATE_WINDOW_S = 900.0  # progress is measured over this much of the run before the cap and after
-ZERO_S = 900.0         # a run whose progress lines stay at 0% this long is stalled (Stalled; with the silence stop)
 TAIL_BYTES = 8192      # how much of the output's end is read for the last `[ NN%]`
 _PERCENT = re.compile(rb"\[\s*(\d{1,3})%\]")
 
@@ -179,11 +176,6 @@ class Silent(subprocess.TimeoutExpired):
     """A command stopped by wait() for no output for its silence limit (`timeout`)."""
 
 
-class Stalled(Silent):
-    """A command stopped by wait() whose progress lines stayed at 0% for ZERO_S (`timeout`): printing, but no
-    test done (every host it could use held or paused, say); stopped then, not at the wall-time cap."""
-
-
 def silent_limit(check) -> float:
     """The silence limit in seconds of `check` (a push.Check or plain command): its silent_s, else SILENT_S."""
     v = getattr(check, "silent_s", None)
@@ -265,8 +257,7 @@ def wait(proc: subprocess.Popen, out, timeout: float | None, silent_s: float, st
     start = clock()
     end = None if timeout is None else start + timeout
     last, quiet_since = size(), start
-    base, samples, zero_at = max(0, last), [], None
-    watch_zero = fd is not None and silent_s > 0 and ZERO_S > 0   # off with the silence stop
+    base, samples = max(0, last), []
     name = getattr(out, "name", None)   # a log opened by descriptor (open_append): through /proc (none: no extension)
     src = name if isinstance(name, (str, bytes, os.PathLike)) else f"/proc/self/fd/{fd}"
     while True:
@@ -298,11 +289,6 @@ def wait(proc: subprocess.Popen, out, timeout: float | None, silent_s: float, st
             continue
         if stop is not None:
             stop()
-        if watch_zero and (pct := _percent(src, base)) is not None:
-            if pct > 0:
-                watch_zero = False   # it progressed once: a slow run, left to the cap and Extension
-            elif now - (zero_at := zero_at if zero_at is not None else now) >= ZERO_S:
-                raise Stalled(proc.args, ZERO_S)
         if fd is not None and silent_s > 0 and now - quiet_since >= silent_s:
             raise Silent(proc.args, silent_s)
 
@@ -341,16 +327,8 @@ def said_silent(check: str, silent_s: float, head: str) -> str:
             f"least every few minutes; a check that is silent longer by design: raise its \"silent_s\", 0 turns it off)")
 
 
-def said_stalled(check: str, stall_s: float, head: str) -> str:
-    return (f"{check!r} was stopped on {head[:12]} after its progress stayed at 0% for {span(stall_s)}: printing, "
-            f"but no test done (no usable host, every one it could use held or paused, or a wait that never "
-            f"ends); not a pass and not a test failure; its process group was ended and the checks slot released")
-
-
 def said_for(rec: dict) -> str:
-    """What a timed-out run's record (checks.json "timed_out") says: stalled at 0%, no output, else the cap."""
-    if rec.get("stall_s"):
-        return said_stalled(str(rec.get("check")), float(rec["stall_s"]), str(rec.get("head") or ""))
+    """What a timed-out run's record (checks.json "timed_out") says: no output, else the wall-time cap."""
     if rec.get("silent_s"):
         return said_silent(str(rec.get("check")), float(rec["silent_s"]), str(rec.get("head") or ""))
     return said(str(rec.get("check")), float(rec.get("cap_s") or 0), str(rec.get("how") or ""), str(rec.get("head") or ""),

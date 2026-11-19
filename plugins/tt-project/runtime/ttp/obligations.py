@@ -1962,9 +1962,11 @@ LANDING_STUCK_KIND = "order_landing_stuck"
 MUST_ACT_KINDS = (PROMISE_KIND, ORDER_LATE_KIND, ORDER_KIND, CLAIM_KIND, LANDING_STUCK_KIND)
 ORDER_CLASSES = ("read", "change", "device")
 ORDER_START_S = 1800          # an order with no start_by: its owner's run starts within this after the message
-# Words asking for it the same day: such an order is due by the end of the message's home-zone day (or
-# SAME_DAY_MIN_S after it, sent late), never later, so an urgent ask is not promised for tomorrow.
-SAME_DAY = re.compile(r"\b(today|tonight|asap|right (now|away)|immediately|urgent(ly)?)\b|(?<!\bfor )\bnow\b(?=\s*[!.?]|\s*$)",
+# Words asking for it the same day: an order given no due is due by the end of the message's home-zone day
+# (or SAME_DAY_MIN_S after it, sent late), so an urgent ask is not promised for tomorrow. Negated ('not
+# urgent') never counts; an explicit due always wins.
+SAME_DAY = re.compile(r"(?<!\bnot )(?<!\bno )(?<!n't )(?<!\bnever )"
+                      r"(\b(today|tonight|asap|right (now|away)|immediately|urgent(ly)?)\b|(?<!\bfor )\bnow\b(?=\s*[!.?]|\s*$))",
                       re.I | re.M)
 SAME_DAY_MIN_S = 4 * 3600
 CLAIM_WAIT_S = 1800           # a claim's probe that cannot answer (75, timeout) past its due: failed after this
@@ -2094,7 +2096,7 @@ def add_order(p, text: str, message: int, owners=(), due=None, start_by=None, ac
         raise ValueError(f"order: #{message} is not a user message")
     due_at = _when(due, "order due", p) if due not in (None, "") else None
     cap, note_cap = None, ""   # 'today', 'now', 'asap': a new order is due the same day, not the next
-    if SAME_DAY.search(row["text"] or ""):
+    if due_at is None and SAME_DAY.search(row["text"] or ""):
         sent = datetime.fromtimestamp(float(row["ts"]), timefmt.zone(p))
         cap = max(sent.replace(hour=23, minute=59, second=0, microsecond=0).timestamp(),
                   float(row["ts"]) + SAME_DAY_MIN_S, now + 1800)
@@ -2123,7 +2125,7 @@ def add_order(p, text: str, message: int, owners=(), due=None, start_by=None, ac
                 pr.update(start_by=start_at, late=None)
             note = f"order {o['id']} (message #{message}) updated"
         else:
-            if cap is not None and (due_at is None or due_at > cap):
+            if cap is not None:
                 due_at, note_cap = cap, " (its message asks for it today)"
             oid = f"o{st['next']}"
             st["next"] += 1

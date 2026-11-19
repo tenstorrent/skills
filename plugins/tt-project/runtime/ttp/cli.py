@@ -2007,7 +2007,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
         # only that it is queued.
         nb = f", deferred until {at(t['not_before'], now, tz)}" if float(t.get("not_before") or 0) > now else ""
         if own := handoff_wait(t, now):   # its own wait's age (its waiting row names what), no bare ETA
-            nb, fin = f", {own.split(' for ')[0]}", fin if "no estimate" not in fin else ""
+            nb, fin = f", {own}", fin if "no estimate" not in fin else ""
         row(t, f"{t['status']} ({urgent.mark(db, t, now)}{nb}{fin})", f"urgent: {urgent.shown_why(db, t, now)}"
             + (f"; {topup.words(topped[t['id']])}" if t["id"] in topped else ""))
     for t in h["waiting"][:5]:
@@ -4958,8 +4958,7 @@ def _cmd_checks(a) -> None:
                     said_last = (f"this task's last checks run (run {last.get('run') or '?'} on "
                                  f"{str(last.get('head') or '')[:12]}) was stopped "
                                  + (f"after no output for {checkwall.span(float(last['silent_s']))}"
-                                    if last.get("silent_s") else "at 0% progress (no test done)" if last.get("stall_s")
-                                    else "behind checks.wrap_cmd at the wall-time cap before "
+                                    if last.get("silent_s") else "behind checks.wrap_cmd at the wall-time cap before "
                                     "any test started" if last.get("queued") else "at the wall-time cap")
                                  + ": a timeout, not a pass")
                     print(f"ttp checks: {said_last}", flush=True)
@@ -5084,9 +5083,7 @@ def _cmd_checks(a) -> None:
                     # No output for its silence limit: a hang, stopped as at the wall-time cap; never a pass.
                     passed, failed, rc = False, c, checkwall.RC
                     timed_out = {"check": str(c), "cap_s": wall, "how": wall_how, "head": head,
-                                 # stalled at 0%: no usable host, never read as a hang of the change's
-                                 ("stall_s" if isinstance(e, checkwall.Stalled) else "silent_s"): e.timeout,
-                                 "run": os.environ.get("TTP_RUN_ID") or "?"}
+                                 "silent_s": e.timeout, "run": os.environ.get("TTP_RUN_ID") or "?"}
                     out.write(f"ttp checks: {checkwall.said_for(timed_out)}\n")
                     out.write(_check_took(c, rc, began))
                     break

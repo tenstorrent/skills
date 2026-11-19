@@ -122,6 +122,7 @@ from pathlib import Path
 
 from . import gatetime, loadcaps, replacegap
 from .db import DB, START_PASSED, deferral
+from .timefmt import dur as _dur
 from .util import task_labels
 
 KV = "throughput_changes"   # kv: [{"id", "ts", "key", "old", "new", "why", "undo", "trigger", "undone"}], newest last
@@ -1424,11 +1425,6 @@ def _grant_wait(r: dict) -> float:
     if isinstance(w, (int, float)) and not isinstance(w, bool) and w >= 0:
         return float(w)
     return max(0.0, float(r["ts"]) - float(r["since"]))
-
-
-def _dur(s: float) -> str:
-    s = int(s)
-    return f"{s // 3600}h{s % 3600 // 60:02d}m" if s >= 3600 else f"{s // 60}m" if s >= 60 else f"{s}s"
 
 
 def text(rep: dict) -> str:

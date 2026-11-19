@@ -291,7 +291,7 @@ def test_status_digest_and_web_name_an_urgent_hand_off_wait_and_its_age_not_defe
     line = next(x for x in cli.status_text(p).splitlines() if f"#{hot} " in x)
     assert "waiting 2h13m" in line and "PENDING (Resources)" in line, line
     assert "deferred until" not in line and "no estimate" not in line, line
-    assert coord.handoff_wait(p.db.task(hot), now).startswith("waiting 2h13m for its smoke job; its probe says")
+    assert coord.handoff_wait(p.db.task(hot), now) == "waiting 2h13m"
     digest = next(x for x in coord.digest(p, {}, [], []).splitlines() if x.startswith(f"- #{hot} |"))
     assert "queued (waiting 2h13m)" in digest, digest
     rows = {t["id"]: t for t in web.state_payload(p, p.db)["tasks"]}
