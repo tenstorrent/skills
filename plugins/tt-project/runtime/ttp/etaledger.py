@@ -178,6 +178,11 @@ def hist_end(db, ref: str, now: float, h: dict | None = None) -> float | None:
     return end
 
 
+def rowable(e: dict, now: float) -> bool:
+    """Whether an estimate gets a ledger row: it has an end still ahead and no reason ('why') for none."""
+    return not e.get("why") and bool(e.get("end")) and e["end"] > now
+
+
 def record(db, where, items: list[tuple[str, str, dict]], now: float, src: str = "state",
            due: dict | None = None) -> int:
     """Append the ETAs given: items are (ref, kind, shown estimate); a ref already recorded in the last
@@ -192,7 +197,7 @@ def record(db, where, items: list[tuple[str, str, dict]], now: float, src: str =
     hist = None
     shadow_on = _hist_on(where)
     for ref, kind, e in items:
-        if e.get("why") or not e.get("end") or e["end"] <= now:
+        if not rowable(e, now):
             continue
         prev = last.get(ref)
         if prev and (now - prev["ts"] < REPEAT_S or abs(prev["shown"] - e["end"]) < MOVE_S):
@@ -228,9 +233,8 @@ def missing_rows(db, where, now: float) -> list[dict]:
         win = ROW_ALARM_H * 3600
     if c.get("ledger") is False or win <= 0:
         return []
-    from . import eta, urgent
-    hot = [t for t in db.q("SELECT * FROM tasks WHERE status NOT IN ('done','failed','cancelled') "
-                           "ORDER BY priority, id LIMIT 60") if urgent.is_urgent(t)][:10]
+    from . import eta
+    hot = eta.row_tasks(db)
     if not hot:
         return []
     have: dict[str, float] = {}
@@ -248,8 +252,7 @@ def missing_rows(db, where, now: float) -> list[dict]:
             continue   # no digest since its dispatch: the writer has not had its chance yet
         if est is None:
             est = eta._Est(db, now, core=eta.core_of(where), delivery=eta.delivery_of(where))
-        e = est.task(t["id"])
-        if not e.get("why") and e.get("end") and e["end"] > now:
+        if rowable(eta.row_estimate(db, est, t, now), now):
             out.append({"id": t["id"], "title": t["title"], "dispatched": s})
     return out
 

@@ -257,3 +257,21 @@ def test_eta_row_alarm_flags_only_a_covered_task_with_no_row_and_clears_once_wri
     eta.state_lines(p.db, p, now)
     assert any(r.get("ref") == f"t{hot}" for r in etaledger.read(p.db))
     assert etaledger.missing_rows(p.db, p, now) == []
+
+
+def test_eta_row_alarm_follows_the_writer_when_the_corrected_estimate_disagrees(env, monkeypatch):
+    from ttp import eta, etaledger
+    p = make(env)
+    now = time.time()
+    _eh_runs(p, now, "work", [600] * 6)
+    tid = p.db.add_task("urgent", "s", kind="work", priority=1, status="running")
+    p.db.x("UPDATE tasks SET created=? WHERE id=?", (now - 70, tid))
+    p.db.x("INSERT INTO runs(task, role, started, status) VALUES(?, 'worker', ?, 'running')", (tid, now - 60))
+    p.db.x("INSERT INTO runs(task, role, started, status) VALUES(NULL, 'coordinator', ?, 'ok')", (now - 30,))
+    assert [t["id"] for t in etaledger.missing_rows(p.db, p, now)] == [tid]
+    # The correction the writer records through gives no end: no row is due, so the alarm stays quiet.
+    real = etaledger.shown
+    monkeypatch.setattr(etaledger, "shown", lambda db, e, n, kind: {**real(db, e, n, kind), "why": "waits on outside work"})
+    assert etaledger.missing_rows(p.db, p, now) == []
+    eta.state_lines(p.db, p, now)
+    assert not any(r.get("ref") == f"t{tid}" for r in etaledger.read(p.db))

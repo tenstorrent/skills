@@ -804,15 +804,25 @@ def justify(p, oid: str, why: str, now: float | None = None) -> str:
     return f"obligation {oid}: long due justified ({why[:120]})"
 
 
+def row_tasks(db, skip=()) -> list[dict]:
+    """The urgent open tasks STATE estimates (the first ten, `skip` ids left out): the ones that get task ETA rows."""
+    from . import urgent
+    return [t for t in db.q("SELECT * FROM tasks WHERE status NOT IN ('done','failed','cancelled') "
+                            "ORDER BY priority, id LIMIT 60") if urgent.is_urgent(t) and t["id"] not in skip][:10]
+
+
+def row_estimate(db, est: _Est, t: dict, now: float) -> dict:
+    """The estimate STATE shows for task `t` and the ledger records."""
+    return corrected(db, with_p90(est, est.task(t["id"]), t["id"]), now)
+
+
 def state_lines(db, where, now: float | None = None, host=None, skip=()) -> list[str]:
     """The STATE section: each urgent open task and each open promise with its expected finish. `host`:
     a task's started-on-host state (onhost.line), shown after its estimate. `skip`: task ids shown
     elsewhere, left out before tasks with one reason share a line."""
-    from . import urgent
     from .obligations import open_promises
     now = time.time() if now is None else now
-    hot = [t for t in db.q("SELECT * FROM tasks WHERE status NOT IN ('done','failed','cancelled') "
-                           "ORDER BY priority, id LIMIT 60") if urgent.is_urgent(t) and t["id"] not in skip]
+    hot = row_tasks(db, skip)
     proms = open_promises(db)
     if not hot and not proms:
         return []
@@ -823,9 +833,9 @@ def state_lines(db, where, now: float | None = None, host=None, skip=()) -> list
     out = ["## Expected finish (critical path: likely = measured median p50, conservative = p90; quote these, never padded worst cases)"]
     # no estimate for one gate and reason: one line (titles in Open tasks); the gate ('after') is kept
     same: dict[tuple[str, str, bool], list[tuple[dict, dict]]] = {}
-    for t in hot[:10]:
+    for t in hot:
         on = host(t) if host else ""
-        e = corrected(db, with_p90(est, est.task(t['id']), t['id']), now)
+        e = row_estimate(db, est, t, now)
         given.append((f"t{t['id']}", etaledger.kind_of(db, e), e))
         why = str(e["why"] or "").removeprefix(f"#{t['id']} ")
         if why and not on:
