@@ -89,9 +89,8 @@ peers names the bound.
 | `under-parallelized` | Low `CORE COUNT` versus device grid, high per-core duration. Reach for sharding or a wider dispatch grid. |
 | `host-dominated` | `FW` short but `HOST DURATION [ns]` large past the first iteration. Points to Python or dispatch overhead, not the kernel. |
 
-`PM FPU UTIL (%)` cannot settle compute-bound versus bandwidth-bound: it is a
-perf-model estimate, ~0 on ops with no model and high on some data-movement
-ops. Measured per-engine counters: `perf-counters.md`.
+`PM FPU UTIL (%)` is a perf-model estimate, not a measurement; see
+`perf-counters.md` for the measured per-engine counters.
 
 ## Matmul: op-level DRAM% × FLOPs%
 

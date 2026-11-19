@@ -33,11 +33,6 @@ step later on existing logs, source `ENV_SETUP` and run
 NoC tracing recompiles kernels with event instrumentation and adds capture
 overhead. Turn it on for a bandwidth question, not for every profile.
 
-## Which column answers what
-
-| Question | Column | Kind |
-|---|---|---|
-| Was the matrix or vector engine busy? | `Avg FPU / SFPU / Math util on full grid (%)` | measured counters (`perf-counters.md`) |
-| Which RISC bounds the op? | per-RISC kernel durations | measured (`op-report.md`) |
-| Is the NoC, DRAM or Ethernet saturated? | the columns above | tt-npe, from recorded NoC traffic |
-| What did the op's perf model predict? | `PM FPU UTIL (%)` and other `PM` columns | estimate; never decide a bound on it |
+Measured math-engine counters: `perf-counters.md`; per-RISC durations:
+`op-report.md`. `PM` columns are perf-model estimates; never decide a bound on
+them.

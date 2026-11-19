@@ -83,11 +83,8 @@ tt::tt_metal::detail::ReadDeviceProfilerResults(device);
 Place it after the program you care about. It signals the device to sync results,
 which then reach both the CSV and the Tracy client.
 
-Under `python -m tracy`, raise `--op-support-count` first (it sets
-`TT_METAL_PROFILER_PROGRAM_SUPPORT_COUNT`). From Python, drain with
-`ttnn.ReadDeviceProfiler(device)` at a coarse cadence, never after every op. A
-traced replay cannot be drained mid-trace. Dropped markers, traced replay and
-many-chip meshes: `long-runs.md`.
+Raising `--op-support-count`, draining from Python, dropped markers, traced
+replay and many-chip meshes: `long-runs.md`.
 
 `TT_METAL_PROFILER_MID_RUN_DUMP` is the environment-variable equivalent for a
 long-lived process — a serving job that never closes its device otherwise never
