@@ -11,10 +11,16 @@ The correction: per task kind, the median of actual / raw-estimated time over th
 (CLAMP) and used only from MIN_SAMPLES deliveries on, multiplies the time left in eta.py's estimates. It is
 kept in the project's kv (`eta_factors`) so every estimate reads the same one. Config `eta`: `correction`
 (false: off), `min_samples`, `clamp` [low, high], `conservative_x` (the conservative time's multiple of
-the time left when too few deliveries give a measured one), `ledger` (false: record nothing).
+the time left when too few deliveries give a measured one), `ledger` (false: record nothing),
+`row_alarm_h` (missing_rows' window, default 2; 0: off).
+Which tasks get a row: eta.state_lines' rule, run at each coordinator digest and by `ttp eta`: each open
+urgent task (urgent.is_urgent) whose estimate has an end (one with `why`, such as 'waits on outside
+work', gets none), plus each open promise. A non-urgent task gets no task row; its promise's row
+carries it. `missing_rows` is the model-free alarm for a task that rule covers yet has no row.
 Shadow (rings.eta_history, key eta.history, off by default): with the flag on, a task's ETA row also carries
-`hist`, the end the measured history gives on its own (eta.history: the median first-start wait plus the
-median run time of the task's kind and tier, else of its kind). Nothing users see changes. `shadow` and
+`hist`, the end the measured history gives on its own (hist_end: the median first-start wait, the
+median run time of the task's kind and tier (else of its kind) times its expected runs, and for a code
+task the median review and landing). Nothing users see changes. `shadow` and
 `shadow_line` give the baseline: ETAs compared, and each method's median and p90 absolute error against
 the actual finish.
 Target (docs): 80% delivered by the conservative time, median actual / promised between 0.7 and 1.3.
@@ -36,6 +42,7 @@ WEEK_S = 7 * 86400
 MOVE_S = 900
 REPEAT_S = 3600
 REFRESH_S = 600
+ROW_ALARM_H = 2.0
 TARGET_SHARE = 0.8
 TARGET_RATIO = (0.7, 1.3)
 
@@ -146,8 +153,10 @@ def _hist_on(where) -> bool:
 
 
 def hist_end(db, ref: str, now: float, h: dict | None = None) -> float | None:
-    """The finish the measured history gives a task ref (`t12`) at `now`: the median first-start wait plus the
-    median run time of its kind and tier, else of its kind; None for a promise or without samples.
+    """The finish the measured history gives a task ref (`t12`) at `now`: the median first-start wait, plus
+    the median run time of its kind and tier (else of its kind) times the mean runs a done task of that
+    kind and tier took (retries), plus for a code task the median review and the median landing (the push
+    queue's approval-to-push time, else a push batch's); None for a promise or without samples.
     `h` is eta.history's result, read once per caller."""
     if not (ref.startswith("t") and ref[1:].isdigit()):
         return None
@@ -156,10 +165,17 @@ def hist_end(db, ref: str, now: float, h: dict | None = None) -> float | None:
         return None
     from . import eta
     h = eta.history(db, now) if h is None else h
-    runs = h["run"].get((t["kind"], t.get("tier"))) or h["kind"].get(t["kind"])
+    kt = (t["kind"], t.get("tier"))
+    runs = h["run"].get(kt) or h["kind"].get(t["kind"])
     if not runs:
         return None
-    return now + (statistics.median(h["wait"]) if h["wait"] else 0.0) + statistics.median(runs)
+    tries = (h.get("tries") or {}).get(kt) or (h.get("tries_kind") or {}).get(t["kind"]) or [1]
+    end = now + (statistics.median(h["wait"]) if h["wait"] else 0.0) + \
+        statistics.median(runs) * max(1.0, statistics.mean(tries))
+    if t["kind"] == "code":
+        land = h.get("land") or h.get("batch")
+        end += (statistics.median(h["review"]) if h.get("review") else 0.0) + (statistics.median(land) if land else 0.0)
+    return end
 
 
 def record(db, where, items: list[tuple[str, str, dict]], now: float, src: str = "state",
@@ -199,6 +215,43 @@ def record(db, where, items: list[tuple[str, str, dict]], now: float, src: str =
         last[ref] = row
     _append(db, rows)
     return len(rows)
+
+
+def missing_rows(db, where, now: float) -> list[dict]:
+    """The open tasks the row rule covers that have no ETA row: urgent (the first ten, as state_lines takes
+    them), first dispatched within `row_alarm_h` hours, seen by a coordinator wake since, with an estimate
+    that has an end, and no row since they were created. Read-only; [] with the ledger or the alarm off."""
+    c = cfg(where)
+    try:
+        win = float(c.get("row_alarm_h", ROW_ALARM_H)) * 3600
+    except (TypeError, ValueError):
+        win = ROW_ALARM_H * 3600
+    if c.get("ledger") is False or win <= 0:
+        return []
+    from . import eta, urgent
+    hot = [t for t in db.q("SELECT * FROM tasks WHERE status NOT IN ('done','failed','cancelled') "
+                           "ORDER BY priority, id LIMIT 60") if urgent.is_urgent(t)][:10]
+    if not hot:
+        return []
+    have: dict[str, float] = {}
+    for r in read(db):
+        if "shown" in r:
+            have[r["ref"]] = max(have.get(r["ref"], 0.0), float(r["ts"]))
+    out, est = [], None
+    for t in hot:
+        first = db.one("SELECT MIN(started) s FROM runs WHERE task=? AND role!='coordinator' AND started IS NOT NULL",
+                       (t["id"],))
+        s = float(first["s"]) if first and first["s"] else None
+        if s is None or s < now - win or have.get(f"t{t['id']}", 0.0) >= float(t["created"] or 0):
+            continue
+        if not db.one("SELECT 1 x FROM runs WHERE role='coordinator' AND started>? LIMIT 1", (s,)):
+            continue   # no digest since its dispatch: the writer has not had its chance yet
+        if est is None:
+            est = eta._Est(db, now, core=eta.core_of(where), delivery=eta.delivery_of(where))
+        e = est.task(t["id"])
+        if not e.get("why") and e.get("end") and e["end"] > now:
+            out.append({"id": t["id"], "title": t["title"], "dispatched": s})
+    return out
 
 
 def backfill(db, now: float) -> int:
@@ -260,7 +313,8 @@ def settle(db, now: float) -> int:
 
 def pairs(rows: list[dict], since: float) -> list[dict]:
     """One entry per delivered ref whose first ETA is at or after `since`: its `kind`, `promised` and
-    `raw` seconds from that ETA, `conservative` seconds, `actual` seconds, and the `due` seconds for a promise."""
+    `raw` seconds from that ETA, `conservative` seconds, `actual` seconds, the `due` seconds for a promise,
+    and `early`: it was delivered before that ETA was written (actual 0, nothing was predicted)."""
     first: dict[str, dict] = {}
     done: dict[str, float] = {}
     for r in rows:
@@ -278,7 +332,7 @@ def pairs(rows: list[dict], since: float) -> list[dict]:
         out.append({"ref": ref, "kind": r.get("kind") or "", "promised": p, "raw": max(r["likely"] - r["ts"], 60.0),
                     "conservative": (r.get("conservative") or r["shown"]) - r["ts"],
                     "due": (r["due"] - r["ts"]) if r.get("due") else None, "actual": max(done[ref] - r["ts"], 0.0),
-                    "hist": max(r["hist"] - r["ts"], 0.0) if r.get("hist") else None})
+                    "hist": max(r["hist"] - r["ts"], 0.0) if r.get("hist") else None, "early": done[ref] < r["ts"]})
     return out
 
 
@@ -315,8 +369,9 @@ def _p90(xs: list[float]) -> float:
 
 def shadow(db, since: float) -> dict:
     """{"count", "current": {"median", "p90"}, "hist": {...}} of the delivered ETAs since `since` that carry a
-    shadow `hist`: each method's absolute error (seconds) against the actual finish."""
-    ps = [p for p in pairs(read(db), since) if p.get("hist")]
+    shadow `hist`: each method's absolute error (seconds) against the actual finish. A pair delivered before
+    its ETA was written is left out."""
+    ps = [p for p in pairs(read(db), since) if p.get("hist") and not p["early"]]
     if not ps:
         return {"count": 0}
     cur = [abs(p["actual"] - p["promised"]) for p in ps]

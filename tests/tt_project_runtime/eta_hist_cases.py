@@ -185,3 +185,75 @@ def test_progress_report_carries_an_expected_wait_only_when_valid(env, capsys):
         assert progress.record("result", "k", "r", env={}, expected_wait_s=good)["expected_wait_s"] == float(good)
     for bad in (0, -1, True, "9", None, float("nan"), float("inf"), 10 ** 9):
         assert "expected_wait_s" not in progress.record("result", "k", "r", env={}, expected_wait_s=bad), bad
+
+
+def test_eta_history_shadow_adds_retries_and_a_code_tasks_review_and_landing(env):
+    from ttp import eta, etaledger
+    p = make(env)
+    now = time.time()
+    code = p.db.add_task("c", "s", kind="code", tier="standard")
+    work = p.db.add_task("w", "s", kind="work", tier="standard")
+    h = {"wait": [100.0], "run": {("code", "standard"): [600.0], ("work", "standard"): [600.0]}, "kind": {},
+         "tries": {("code", "standard"): [1, 3]}, "tries_kind": {}, "review": [300.0], "land": [900.0], "batch": [5000.0]}
+    # wait + run x mean runs (2) + review + landing; a work task has no review or landing and one run.
+    assert etaledger.hist_end(p.db, f"t{code}", now, h) == pytest.approx(now + 100 + 1200 + 300 + 900)
+    assert etaledger.hist_end(p.db, f"t{work}", now, h) == pytest.approx(now + 100 + 600)
+    # No push-queue landings measured: a push batch's time stands in.
+    assert etaledger.hist_end(p.db, f"t{code}", now, {**h, "land": []}) == pytest.approx(now + 100 + 1200 + 300 + 5000)
+    # eta.history counts runs per done task by kind and tier.
+    _eh_runs(p, now, "work", [600, 600])
+    retried = p.db.add_task("retried", "s", kind="work", status="done")
+    p.db.x("INSERT INTO runs(task, role, started, ended, status) VALUES(?, 'worker', ?, ?, 'failed'), "
+           "(?, 'worker', ?, ?, 'ok')", (retried, now - 900, now - 800, retried, now - 700, now - 600))
+    got = eta.history(p.db, now)
+    assert sorted(got["tries_kind"]["work"]) == [1, 1, 2]
+
+
+def test_eta_shadow_leaves_out_a_pair_delivered_before_its_eta_was_written(env):
+    from ttp import etaledger
+    p = make(env)
+    now = time.time()
+    etaledger._append(p.db, [
+        {"ts": now - 3000, "ref": "t1", "kind": "work", "src": "state", "likely": now - 2000, "shown": now - 2000,
+         "conservative": now - 1000, "hist": now - 2500},
+        {"ts": now - 2900, "ref": "t1", "delivered": now - 2100},
+        {"ts": now - 3000, "ref": "t2", "kind": "work", "src": "state", "likely": now - 2000, "shown": now - 2000,
+         "conservative": now - 1000, "hist": now - 2500},
+        {"ts": now - 2900, "ref": "t2", "delivered": now - 3500}])      # landed before its ETA row
+    ps = {x["ref"]: x for x in etaledger.pairs(etaledger.read(p.db), now - 86400)}
+    assert ps["t2"]["early"] and not ps["t1"]["early"]
+    sh = etaledger.shadow(p.db, now - 86400)
+    assert sh["count"] == 1 and sh["hist"]["median"] == pytest.approx(400)
+
+
+def test_eta_row_alarm_flags_only_a_covered_task_with_no_row_and_clears_once_written(env):
+    import types
+    from ttp import daemon, eta, etaledger
+    p = make(env)
+    now = time.time()
+    _eh_runs(p, now, "work", [600] * 6)
+
+    def dispatched(title, priority, at):
+        tid = p.db.add_task(title, "s", kind="work", priority=priority, status="running")
+        p.db.x("UPDATE tasks SET created=? WHERE id=?", (at - 10, tid))
+        p.db.x("INSERT INTO runs(task, role, started, status) VALUES(?, 'worker', ?, 'running')", (tid, at))
+        return tid
+    hot = dispatched("urgent", 1, now - 60)
+    dispatched("routine", 3, now - 60)                         # not urgent: the rule gives it no task row
+    dispatched("urgent long ago", 1, now - 3 * 3600)           # dispatched before the window
+    # No coordinator wake since the dispatch: the writer has not had its chance, so no alarm yet.
+    assert etaledger.missing_rows(p.db, p, now) == []
+    p.db.x("INSERT INTO runs(task, role, started, status) VALUES(NULL, 'coordinator', ?, 'ok')", (now - 30,))
+    assert [t["id"] for t in etaledger.missing_rows(p.db, p, now)] == [hot]
+    seen = []
+    fake = types.SimpleNamespace(p=p, observe=lambda *a, **k: seen.append((a, k)))
+    daemon.Daemon.check_eta_rows(fake)
+    assert len(seen) == 1 and seen[0][0][0] == "daemon:eta-rows" and f"#{hot}" in seen[0][0][1]
+    assert seen[0][0][2] == "normal" and seen[0][1]["key"] == "eta-rows-missing"
+    p.set_config("eta.row_alarm_h", 0)
+    assert etaledger.missing_rows(p.db, p, now) == []
+    p.set_config("eta.row_alarm_h", 2)
+    # The writer records it at the next digest; the alarm clears.
+    eta.state_lines(p.db, p, now)
+    assert any(r.get("ref") == f"t{hot}" for r in etaledger.read(p.db))
+    assert etaledger.missing_rows(p.db, p, now) == []

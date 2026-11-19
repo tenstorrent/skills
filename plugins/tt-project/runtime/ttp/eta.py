@@ -139,10 +139,12 @@ def landing_waits(t: dict) -> list[int]:
 def history(db, now: float | None = None) -> dict:
     """The measured samples of the window: run times by (kind, tier) and kind, seconds per cell by kind
     (a done task's worker run time over the cells its `cells:` lines request), first-start waits by
-    lock label and overall, review and landing times."""
+    lock label and overall, review and landing times, and runs per done task by (kind, tier) and kind
+    (`tries`, `tries_kind`: its retries)."""
     now = time.time() if now is None else now
     t0 = now - WINDOW_S
-    h = {"run": {}, "kind": {}, "size": {}, "cell": {}, "queue": {}, "wait": [], "review": [], "land": [], "batch": []}
+    h = {"run": {}, "kind": {}, "size": {}, "cell": {}, "queue": {}, "wait": [], "review": [], "land": [], "batch": [],
+         "tries": {}, "tries_kind": {}}
     for r in db.q("SELECT r.started s, r.ended e, t.kind k, t.tier tr, LENGTH(t.spec) n FROM runs r JOIN tasks t ON t.id=r.task "
                   "WHERE r.role!='coordinator' AND r.ended>? AND r.started IS NOT NULL AND r.ended>r.started "
                   "ORDER BY r.id DESC LIMIT ?", (t0, ROWS)):
@@ -156,6 +158,11 @@ def history(db, now: float | None = None) -> dict:
                   (t0, ROWS)):
         if n := len(cells.requested(r["spec"])):
             h["cell"].setdefault(r["k"], []).append(float(r["d"]) / n)
+    for r in db.q("SELECT t.kind k, t.tier tr, COUNT(r.id) n FROM runs r JOIN tasks t ON t.id=r.task "
+                  "WHERE r.role!='coordinator' AND r.ended>? AND r.started IS NOT NULL AND t.status='done' "
+                  "GROUP BY t.id ORDER BY t.id DESC LIMIT ?", (t0, ROWS)):
+        h["tries"].setdefault((r["k"], r["tr"]), []).append(int(r["n"]))
+        h["tries_kind"].setdefault(r["k"], []).append(int(r["n"]))
     for r in db.q("SELECT t.created c, t.not_before nb, t.labels labels, t.depends_on deps, MIN(r.started) s "
                   "FROM tasks t JOIN runs r ON r.task=t.id WHERE t.created>? AND r.role!='coordinator' "
                   "GROUP BY t.id ORDER BY t.id DESC LIMIT ?", (t0, ROWS)):

@@ -2542,6 +2542,7 @@ class Daemon:
                 self.check_progress,
                 self.post_hourly_status,
                 self.check_churn,
+                self.check_eta_rows,
                 self.check_self_watch,
                 self.check_host_load,
                 self.check_idle_capacity,
@@ -11041,6 +11042,25 @@ class Daemon:
             churnwatch.record(self.p.logs / churnwatch.FILE, obs, now, self.__dict__.setdefault("_churn_log", {}),
                               lambda m: log(self.p, m))
             self.observe("daemon:process-churn", obs["text"], obs["severity"], whole=True, key=obs["key"])
+
+    def check_eta_rows(self, every_s: float = 600) -> None:
+        """Model-free ETA ledger watch (etaledger.missing_rows): an urgent task dispatched within `eta.row_alarm_h`
+        hours that a coordinator wake has seen, with an estimate, yet no ETA row raises one normal observation."""
+        now = time.time()
+        if now - getattr(self, "_eta_rows_checked", 0.0) < every_s:
+            return
+        self._eta_rows_checked = now
+        from . import etaledger
+        try:
+            gone = etaledger.missing_rows(self.p.db, self.p, now)
+        except Exception as e:   # a broken estimate never stops the loop
+            log(self.p, f"eta rows check failed: {e}")
+            return
+        if gone:
+            ids = ", ".join(f"#{t['id']}" for t in gone)
+            self.observe("daemon:eta-rows", f"ETA ledger: urgent task(s) {ids} were dispatched and have an estimate, "
+                         f"but no task ETA row was written since; the ETA writer (eta.state_lines) is not recording "
+                         f"them.", "normal", key="eta-rows-missing")
 
     def check_self_watch(self) -> None:
         """Model-free watch on this host and this project's own process tree (selfwatch): one snapshot
