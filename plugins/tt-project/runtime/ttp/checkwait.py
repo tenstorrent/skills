@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import locks
+from .liveness import pid_alive
 
 ENV = "TTP_CHECK_WAITS"
 POOL = "pool"   # the subfolder of a check's waits for a test-pool slot (pool())
@@ -87,16 +88,6 @@ def _records(d: Path) -> dict:
     return waits if isinstance(waits, dict) else {}
 
 
-def _alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except OSError:
-        return True   # someone else's process: it exists
-    return True
-
-
 def _live_prefix(what: str, owner: str) -> str:
     return f"{LIVE}{owner}:{what}:"[:150]
 
@@ -146,7 +137,7 @@ def start(what: str = "", owner: str = "", watch: int = 0) -> bool:
             if end_ is not None:   # stopped: release the flock, the record stays as stop() wrote it
                 locks.record_wait(d, key, t0, float(end_))
                 break
-            if (watch and not _alive(watch)) or time.time() - t0 >= LIVE_MAX_S:
+            if (watch and not pid_alive(watch)) or time.time() - t0 >= LIVE_MAX_S:
                 locks.record_wait(d, key, t0, time.time())   # its script ended while it waited: until then
                 break
     finally:

@@ -37,6 +37,8 @@ import subprocess
 import time
 from typing import Any
 
+from .util import task_labels
+
 TRIM_KEY = "output_trim"     # run note: {"effort", "from", "why"} of an effort pick
 STATUS_KEY = "cost_levers_status"   # kv: {"at", "lines"}, the status lines cached
 STATUS_TTL_S = 1800.0
@@ -81,17 +83,9 @@ def lever_on(p, flag: str) -> bool:
 
 # --- lever a: fresh continue -------------------------------------------------------------------------
 
-def _labels(task: dict) -> list[str]:
-    try:
-        got = json.loads(task.get("labels") or "[]")
-    except (TypeError, ValueError):
-        return []
-    return [x for x in got if isinstance(x, str)] if isinstance(got, list) else []
-
-
 def review_fixed(task: dict) -> int | None:
     """The review a fix task fixes (its `review_fix:<id>` label), or None."""
-    return next((int(x[11:]) for x in _labels(task) if x.startswith("review_fix:") and x[11:].isdigit()), None)
+    return next((int(x[11:]) for x in task_labels(task) if x.startswith("review_fix:") and x[11:].isdigit()), None)
 
 
 def _result_text(res: dict) -> str:

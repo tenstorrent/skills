@@ -3711,6 +3711,12 @@ def _proc_state(pid):
         return None
 
 
+def read_dict(path) -> dict:
+    """ttp.util.read_dict, imported when called (ttp loads after the env fixture)."""
+    from ttp.util import read_dict
+    return read_dict(path)
+
+
 def _wait_for(pred, timeout=30.0) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -19301,8 +19307,8 @@ def _run_batch(p, marker, monkeypatch):
     """`ttp push --batch <marker>` in this process, its go given: (exit code, the marker after it)."""
     from ttp import batch, push
     monkeypatch.setattr(sys, "stdin", io.StringIO(""))
-    monkeypatch.setenv("TTP_RUN_DIR", push._read(marker)["check_report_dir"])
-    return batch.run_batch(p, marker), push._read(marker)
+    monkeypatch.setenv("TTP_RUN_DIR", read_dict(marker)["check_report_dir"])
+    return batch.run_batch(p, marker), read_dict(marker)
 
 
 def test_a_push_batch_runs_its_checks_on_the_priority_slot_while_task_checks_queue(env, monkeypatch, capsys):
@@ -27656,7 +27662,6 @@ DURABLE_EXEMPT = {
     ("shared.py", '.guard", "a")'): "a flock guard file, never written",
     ("globalcap.py", 'global-spend.lock", "a")'): "a flock guard file, never written",
     ("globalcap.py", 'os.replace(tmp / "s.db", snap)'): "a stopped project's read snapshot, a cache rebuilt from its source; sqlite's checkpoint syncs the copy before the rename",
-    ("poolshard.py", 'pool-shards.lock", "a")'): "a flock guard file, never written",
     ("harborslice.py", 'f = open(d / f"{i}.lock", "w")'): "an empty flock file holding one of the host's trial slots; only the lock is used, its contents never read",
     ("poolshard.py", "open(d / LOG, \"a\")"): "the pool stall log, one line per stall or clear, read only by people; the marks and history it describes are written durably",
     ("localspend.py", 'session-spend.lock", "a")'): "a flock guard file, never written",
@@ -46503,9 +46508,9 @@ def test_after_push_and_git_hooks_receive_no_managed_scratch(env, tmp_path, monk
         out = capsys.readouterr().out
         marker = pathlib.Path(next(ln.split(': ', 1)[1] for ln in out.splitlines() if ln.startswith('marker: ')))
         assert 'pushed' in _probe_until_done(p, push.result_probe(marker, p)).stdout
-        assert _wait_for(lambda: push._read(marker).get('after_push', {}).get('ended'))
+        assert _wait_for(lambda: read_dict(marker).get('after_push', {}).get('ended'))
         # It still releases its scratch after writing that; on a loaded host it outlives the test.
-        assert _wait_for(lambda: _pid_gone(int(push._read(marker)['pid'])), timeout=_load_scaled(30))
+        assert _wait_for(lambda: _pid_gone(int(read_dict(marker)['pid'])), timeout=_load_scaled(30))
     for path in (seen, hook_seen):
         recorded = json.loads(path.read_text())
         assert all(recorded.get(k) == str(normal) for k in ('TMPDIR', 'TMP', 'TEMP')), recorded

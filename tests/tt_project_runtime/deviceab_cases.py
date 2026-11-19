@@ -111,6 +111,7 @@ def test_device_ab_excludes_and_counts_pinned_deep_plan_review_tasks_and_ends(en
 
 
 def test_device_ab_flips_urgent_device_tasks(env):
+    from ttp.util import task_labels
     from ttp import deviceab
     p = make(env)
     cfg = _dab_cfg(p)
@@ -120,7 +121,7 @@ def test_device_ab_flips_urgent_device_tasks(env):
         tid = p.db.add_task("Fix the box's hang", "urgent: the user asked today.\nRun it.", kind="work",
                             tier="standard", origin="coordinator", priority=1, labels=["needs_device"])
         got = deviceab.assign(p.db, cfg, p.name, p.db.task(tid), "claude", now=2000.0)
-        assert got and not any(lb.startswith(deviceab.EXCLUDED) for lb in deviceab._labels(p.db.task(tid)))
+        assert got and not any(lb.startswith(deviceab.EXCLUDED) for lb in task_labels(p.db.task(tid)))
         arms.add(got[deviceab.KEY]["arm"])
     assert arms == {"sonnet", "opus"}
 

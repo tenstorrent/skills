@@ -50,6 +50,7 @@ from typing import NamedTuple
 from . import register
 from ..budget import Window
 from .. import fencefree
+from ..util import read_dict
 from .base import (LIMIT_RE, auth_error, challenged, MAX_ARG_BYTES, MAX_CACHE_BREAKPOINTS, Provider, RunUsage, cap_cache_breakpoints,
                    cli_output, find_binary, last_json_object, request_rejected, status_check, strict_schema,
                    drop_nulls, head80, input_hash, isolated_module_argv, jsonl_from, CMD_MAX)
@@ -378,9 +379,9 @@ class Claude(Provider):
     def _scopes(self, dirs: list[str]) -> list:
         # Claude Code's own scopes, most specific first: local (per directory, in the user's
         # config), project (`.mcp.json`), user. `claude mcp get` has no machine-readable output.
-        user_cfg = _read_json(claude_config_path())
+        user_cfg = read_dict(claude_config_path())
         scopes = [((user_cfg.get("projects") or {}).get(d) or {}).get("mcpServers") for d in dirs]
-        scopes += [_read_json(Path(d) / ".mcp.json").get("mcpServers") for d in dirs]
+        scopes += [read_dict(Path(d) / ".mcp.json").get("mcpServers") for d in dirs]
         scopes.append(user_cfg.get("mcpServers"))
         return scopes
 
@@ -994,14 +995,6 @@ def claude_config_path() -> Path:
     """Where Claude Code keeps user- and local-scope MCP servers."""
     base = os.environ.get("CLAUDE_CONFIG_DIR")
     return Path(base).expanduser() / ".claude.json" if base else Path.home() / ".claude.json"
-
-
-def _read_json(path: Path) -> dict:
-    try:
-        data = json.loads(path.read_text())
-    except (OSError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
 
 
 STOP_HOOK_TIMEOUT_S = 150   # over handoffcheck.STOP_BUDGET_S: the hook ends the checks itself

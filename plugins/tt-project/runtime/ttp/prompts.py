@@ -1257,10 +1257,10 @@ def no_commit_line(p: Project, task: dict) -> str:
     target is an external artifact or a hash-pinned report) is told `ttp checks` has no target there,
     so it never runs candidate checks at an unrelated HEAD. "" for a review of a commit, or on error."""
     from . import extchange
-    from .push import _labels
+    from .util import task_labels
     from .worktree import reviewed_head
     try:
-        if extchange.heads(_labels(dict(task))) or reviewed_head(p, dict(task)):
+        if extchange.heads(task_labels(dict(task))) or reviewed_head(p, dict(task)):
             return ""
     except Exception:
         return ""

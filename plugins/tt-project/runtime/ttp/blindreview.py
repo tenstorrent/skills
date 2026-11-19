@@ -18,6 +18,8 @@ import re
 import secrets
 from pathlib import Path
 
+from .util import task_labels
+
 BLIND_LABEL = "blind_review"
 GRADER_EFFORT = "high"   # the most effort a grader runs at (a grader is not an action: max only costs)
 # Labels of the reviews the daemon queues for device work (deviceab and deviceshadow: first and second
@@ -114,20 +116,13 @@ def mask(v, key: str = "", names: dict | None = None):
     return v
 
 
-def _labels(raw) -> list[str]:
-    try:
-        return [str(x) for x in (json.loads(raw or "[]") if isinstance(raw, str) else raw or [])]
-    except ValueError:
-        return []
-
-
 def review_slots(task: dict | None) -> set[str]:
     """The daemon review labels `task` carries (its reviewer slot and subject); empty for any other task."""
-    return {lb for lb in _labels((task or {}).get("labels")) if lb.startswith(DAEMON_REVIEW_PREFIXES)}
+    return {lb for lb in task_labels((task or {}).get("labels")) if lb.startswith(DAEMON_REVIEW_PREFIXES)}
 
 
 def is_blind_task(task: dict | None) -> bool:
-    return bool(task) and BLIND_LABEL in _labels(task.get("labels"))
+    return bool(task) and BLIND_LABEL in task_labels(task.get("labels"))
 
 
 def cap_effort(effort: str | None) -> str:

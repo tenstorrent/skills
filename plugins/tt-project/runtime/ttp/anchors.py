@@ -20,10 +20,10 @@ message may be what it waited for). A stale set with a member not in the last on
 """
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from . import timefmt
+from .util import task_labels
 
 PREFIX = "waits:"
 KINDS = ("ask", "resource", "until", "when")
@@ -37,17 +37,9 @@ HOLD_MAX_H = 12.0
 LIST_MAX = 20
 
 
-def _labels(task: dict) -> list:
-    try:
-        v = json.loads(task.get("labels") or "[]")
-    except (TypeError, ValueError):
-        return []
-    return v if isinstance(v, list) else []
-
-
 def anchor(task: dict) -> tuple[str, str] | None:
     """The task's (kind, value) anchor, or None."""
-    for lb in _labels(task):
+    for lb in task_labels(task):
         if isinstance(lb, str) and lb.startswith(PREFIX):
             kind, _, value = lb[len(PREFIX):].partition(":")
             if kind in KINDS and value:

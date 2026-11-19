@@ -42,6 +42,7 @@ from typing import Callable
 from . import push, reviewreuse
 from .project import Project, push_allowed
 from . import applyff, gitmemo, landff, repoid
+from .util import task_labels
 
 LANDED, FAILED, REFUSED, CONFLICT, CHECKS_FAILED, MOVED, DIRTY, BUSY = 0, 1, push.REFUSED, push.CONFLICT, \
     push.CHECKS_FAILED, push.KEPT_MOVING, push.REJECTED, push.BUSY
@@ -253,7 +254,7 @@ def record(p: Project, tid: int | None, head: str, new: str, branch: str, dry: b
         p.db.x("INSERT INTO task_landings(marker, task, sha, target, ts) VALUES(?,?,?,?,?) "
                "ON CONFLICT(marker) DO NOTHING", (f"land-t{tid}-{new}", tid, new, f"{push.LOCAL}/{branch}", time.time()))
     if task.get("kind") == "review" and new != head and (rec := reviewreuse.recorded(task)) and rec[0] == head:
-        labels = push._labels(task)
+        labels = task_labels(task)
         lines.append(f"review #{tid}'s verdict on {head[:10]} also for {new[:10]} (reviewreuse)")
         if not dry and (lb := reviewreuse.head_label(new, rec[1])) not in labels:
             p.db.update_task(tid, labels=labels + [lb])

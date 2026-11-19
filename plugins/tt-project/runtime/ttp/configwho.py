@@ -31,6 +31,8 @@ import os
 import re
 import time
 
+from .util import read_dict
+
 KEY = "config_provenance"
 ROLES = ("user", "coordinator", "worker", "harness", "default", "upgrade", "migration", "unknown")
 
@@ -489,7 +491,7 @@ def _known_failures(p, r: dict, now: float) -> bool:
     from . import gatejudge
     flaky = gatejudge.active(p.state, now)
     where = r["host"] or gatejudge.host()
-    bases = {k.split("|", 2)[-1] for k, e in gatejudge._load(p.state / gatejudge.BASE_FILE).items()
+    bases = {k.split("|", 2)[-1] for k, e in read_dict(p.state / gatejudge.BASE_FILE).items()
              if isinstance(e, dict) and e.get("failed") and e.get("host") == where
              and now - float(e.get("ts") or 0) < gatejudge.BASE_KEEP_S}
     return all(i in flaky or i in bases for i in ids)

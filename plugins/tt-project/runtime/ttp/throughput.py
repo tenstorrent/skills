@@ -122,6 +122,7 @@ from pathlib import Path
 
 from . import gatetime, loadcaps, replacegap
 from .db import DB, START_PASSED, deferral
+from .util import task_labels
 
 KV = "throughput_changes"   # kv: [{"id", "ts", "key", "old", "new", "why", "undo", "trigger", "undone"}], newest last
 LAST_KV = "throughput_last"  # kv: the last measured review: {"ts", "trigger", "lanes", "changes", "kept"}
@@ -208,14 +209,6 @@ def _pct(xs: list[float], q: float) -> float:
     return s[min(len(s) - 1, max(0, int(round(q * len(s) + 0.5)) - 1))] if s else 0.0
 
 
-def _labels(t: dict) -> list:
-    try:
-        v = json.loads(t.get("labels") or "[]")
-        return v if isinstance(v, list) else []
-    except ValueError:
-        return []
-
-
 def _deps(t: dict) -> list[int]:
     try:
         return [int(d) for d in json.loads(t.get("depends_on") or "[]") if str(d).isdigit()]
@@ -227,7 +220,7 @@ def _reviewed(t: dict) -> int | None:
     """The task a review task reviews: its parent, its `auto_review:<id>` label or its one dependency."""
     if t.get("parent"):
         return int(t["parent"])
-    for lb in _labels(t):
+    for lb in task_labels(t):
         if isinstance(lb, str) and lb.startswith("auto_review:") and lb[12:].isdigit():
             return int(lb[12:])
     deps = _deps(t)
@@ -539,7 +532,7 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
         resource's wait starts at the latest of its first hold dispatch in the wait, the last start_when
         gate that passed in it and `ready` (the task's ready record): before that the gate held it (deferral)
         or its own retry condition did (retry_wait), never the resource."""
-        res = sorted({lb.split(":", 1)[1] for lb in _labels(t) if isinstance(lb, str) and ":" in lb
+        res = sorted({lb.split(":", 1)[1] for lb in task_labels(t) if isinstance(lb, str) and ":" in lb
                       and lb.split(":", 1)[0] in ("resource", "exclusive")})
         when = str(d.get("when") or "")
         if when:
@@ -831,7 +824,7 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
         when they began running on a host to their end, at most precheck_hold_s (Daemon._precheck_holds)."""
         from .cli import CHECKS_RC, CHECKS_RUNNING
         from .daemon import PRECHECK_LABEL, PRECHECKS_DIR, precheck_hold_s
-        name = next((lb[len(PRECHECK_LABEL):] for lb in _labels(t) if isinstance(lb, str)
+        name = next((lb[len(PRECHECK_LABEL):] for lb in task_labels(t) if isinstance(lb, str)
                      and lb.startswith(PRECHECK_LABEL)), "")
         if not name or "/" in name:
             return []
@@ -866,7 +859,7 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
         # Whether a slot alone kept it from starting is on record: not for a task blocked now, nor for one
         # whose resource label dispatch recorded no hold for (by_rule fell through).
         known = not (start is None and t["status"] == "blocked") and not any(
-            isinstance(lb, str) and lb.split(":", 1)[0] in ("resource", "exclusive") and ":" in lb for lb in _labels(t))
+            isinstance(lb, str) and lb.split(":", 1)[0] in ("resource", "exclusive") and ":" in lb for lb in task_labels(t))
         if (start is not None or (t["status"] in ("queued", "blocked") and t["id"] not in last_run)) \
                 and not (start is not None and start < t0):
             base = max(float(t["created"] or now), float(d.get("after") or 0), float(t.get("not_before") or 0))

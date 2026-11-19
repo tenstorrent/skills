@@ -14,7 +14,6 @@
   a branch of its own with the conflict that put it there."""
 from __future__ import annotations
 
-import json
 import re
 import shutil
 import subprocess
@@ -23,6 +22,7 @@ from pathlib import Path
 
 from . import worktree
 from .db import dependency_ids
+from .util import task_labels
 
 INTEGRATION_DEFAULT = "ttp/integration"
 MEMBER_HEAD_REF = "refs/ttp/member-head/t"   # + task id: the head a member of a shared branch handed off
@@ -348,14 +348,6 @@ def own_branch_label(decision: dict) -> str:
     return f"{OWN_BRANCH_LABEL}{decision.get('why') or 'conflict'}" + (f" in {files}" if files else "")
 
 
-def _labels(task: dict) -> list[str]:
-    try:
-        v = json.loads(task.get("labels") or "[]")
-    except ValueError:
-        return []
-    return [str(x) for x in v] if isinstance(v, list) else []
-
-
 def status_lines(db, cfg: dict, repo_name: str = "", quiet: bool = False) -> list[str]:
     """Status lines for the integration branch of the project's repo: what open reviews of a shared
     branch cover and is not landed yet, and each change kept on a branch of its own with why. `quiet`:
@@ -372,7 +364,7 @@ def status_lines(db, cfg: dict, repo_name: str = "", quiet: bool = False) -> lis
     kept = []
     for t in db.q("SELECT * FROM tasks WHERE kind='code' AND status NOT IN ('failed','cancelled') AND labels LIKE ? "
                   "ORDER BY id", (f'%"{OWN_BRANCH_LABEL}%',)):
-        why = next((x[len(OWN_BRANCH_LABEL):] for x in _labels(t) if x.startswith(OWN_BRANCH_LABEL)), "")
+        why = next((x[len(OWN_BRANCH_LABEL):] for x in task_labels(t) if x.startswith(OWN_BRANCH_LABEL)), "")
         kept.append(f"#{t['id']} on {t.get('branch') or '?'} ({why})")
     if quiet and not shared and not kept:
         return []

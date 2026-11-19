@@ -35,6 +35,7 @@ import time
 
 from . import jevuse
 from .db import DB
+from .util import task_labels
 
 JEV_USE = "model"
 KEY = "dispatch"          # the run note's entry
@@ -150,13 +151,6 @@ def run_model(note: dict | None, provider: str, model: str, effort: str) -> tupl
     return model, effort
 
 
-def _labels(task: dict) -> list[str]:
-    try:
-        return [str(x) for x in json.loads(task.get("labels") or "[]")]
-    except (TypeError, ValueError):
-        return []
-
-
 def rules(db: DB, cfg: dict, task: dict, tier: str) -> str | None:
     """Why the rules send this start to core, '' when they leave it open, or None when no pick applies
     (a light tier follows its own route; a pin keeps its provider or model)."""
@@ -174,7 +168,7 @@ def rules(db: DB, cfg: dict, task: dict, tier: str) -> str | None:
         return "device"
     if urgent.is_urgent(task):
         return "urgent"
-    if UNTRUSTED in _labels(task):
+    if UNTRUSTED in task_labels(task):
         return "untrusted"
     if HARD.search(f"{task.get('title') or ''}\n{task.get('spec') or ''}"):
         return "hard"
@@ -191,7 +185,7 @@ def rules(db: DB, cfg: dict, task: dict, tier: str) -> str | None:
 
 def _parents(db: DB, task: dict) -> list[dict]:
     out = []
-    for label in _labels(task):
+    for label in task_labels(task):
         if label.startswith("continues:") and label[10:].isdigit() and (t := db.task(int(label[10:]))):
             out.append(t)
     return out
@@ -229,7 +223,7 @@ def state(db: DB, task: dict, tier: str, now: float, parent_diff=None) -> str:
     paths = list(dict.fromkeys(PATHS.findall(spec)))
     ok, n = success_rate(db, task.get("kind") or "", now)
     parents = _parents(db, task)
-    lines = [f"kind: {task.get('kind')}", f"tier: {tier}", f"labels: {', '.join(_labels(task)) or '-'}",
+    lines = [f"kind: {task.get('kind')}", f"tier: {tier}", f"labels: {', '.join(task_labels(task)) or '-'}",
              f"title: {task.get('title') or ''}",
              f"routed success ({SUCCESS_DAYS} d, this kind): {ok}/{n}" if n else "routed success: no data",
              f"paths named: {len(paths)}: {', '.join(paths[:8])}"]

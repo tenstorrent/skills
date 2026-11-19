@@ -191,7 +191,7 @@ def test_repeated_setup_fault_holds_of_one_check_raise_one_alert_until_that_chec
     [msg] = alerted(a)
     assert a in msg["text"] and "/srv/gate/head" in msg["text"] and "tar archive" in msg["text"], msg
     assert all(str(r) in msg["text"] for r in runs) and holds(a) and not holds(b)
-    isolate = lambda bid: push._read(s.p.state / push.DETACHED / f"{bid}.json").get("setup_isolate")
+    isolate = lambda bid: read_dict(s.p.state / push.DETACHED / f"{bid}.json").get("setup_isolate")
     assert isolate(runs[-1]) is None, "the batch before the alert holds as before"
     assert isolate(held(a)) == [a], "after the alert, the next batch isolates on that check's setup fault"
     assert count(a) == 4 and len(alerted(a)) == 1, "one alert, not one per hold"
@@ -237,7 +237,7 @@ def test_after_the_setup_fault_alert_the_batch_isolates_the_entry_whose_check_hi
     rc, m = _run_batch(p, _batch_marker(p, heads, bid="b1"), monkeypatch)
     assert rc == push.BUSY and m["outcome"] == "setup_fault" and _statuses(m) == ["requeued"] * 3, m
     marker = _batch_marker(p, heads, bid="b2")
-    m = push._read(marker)
+    m = read_dict(marker)
     m["setup_isolate"] = [cmd]
     marker.write_text(json.dumps(m))
     capsys.readouterr()
@@ -268,7 +268,7 @@ def test_after_the_setup_fault_alert_a_fault_on_every_head_or_a_pool_still_holds
             p.set_config("delivery.push_checks", [cmd])
         before = _git_out(origin, "rev-parse", "proj")
         marker = _batch_marker(p, heads, bid=name)
-        m = push._read(marker)
+        m = read_dict(marker)
         m["setup_isolate"] = [cmd]
         marker.write_text(json.dumps(m))
         rc, m = _run_batch(p, marker, monkeypatch)

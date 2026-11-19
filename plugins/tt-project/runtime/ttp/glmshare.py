@@ -54,6 +54,7 @@ import json
 from pathlib import Path
 
 from . import glmassist, route, runclass
+from .util import task_labels
 
 ROLES = ("coordinator", "plan", "review", "code", "work", "question", "harness", "device", "other")
 KINDS = ("plan", "review", "code", "work", "question", "harness")
@@ -89,14 +90,6 @@ def _note(raw) -> dict:
     except ValueError:
         return {}
     return v if isinstance(v, dict) else {}
-
-
-def _labels(task: dict) -> list[str]:
-    try:
-        v = json.loads(task.get("labels") or "[]")
-    except (TypeError, ValueError):
-        return []
-    return [x for x in v if isinstance(x, str)] if isinstance(v, list) else []
 
 
 def role_of(run: dict, task: dict | None, cfg: dict, cache: dict) -> str:
@@ -157,7 +150,7 @@ def _reviews(db, since: float) -> dict[int, dict]:
     out: dict[int, dict] = {}
     for r in db.q("SELECT id, status, labels FROM tasks WHERE kind='review' AND labels LIKE '%\"auto_review:%' "
                   "AND created>=? ORDER BY id", (since,)):
-        for lb in _labels(r):
+        for lb in task_labels(r):
             if lb.startswith("auto_review:") and lb[12:].isdigit():
                 v = out.setdefault(int(lb[12:]), {"first": None, "open": False})
                 if r["status"] in ("done", "failed") and v["first"] is None:

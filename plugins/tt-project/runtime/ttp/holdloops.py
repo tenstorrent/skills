@@ -33,6 +33,7 @@ import json
 
 from . import anchors, timefmt
 from .db import DB, OPEN_TASKS, _first_dead, deferral, dependency_ids, load_result
+from .util import task_labels
 
 LOOPS_KEY = "hold_loops"        # kv {key: {"since", "raised", "task", "text", "kind"}}
 TIME_KEY = "hold_time_only"     # kv {task id: {"since", "ends": [...], "flag": ts, "why"}}
@@ -54,7 +55,7 @@ def _reviewed(db: DB) -> set[int]:
     out: set[int] = set()
     for r in db.q("SELECT depends_on, labels FROM tasks WHERE kind='review' AND status='done'"):
         out.update(d for d in dependency_ids(r) if isinstance(d, int))
-        for lb in anchors._labels(r):
+        for lb in task_labels(r):
             if isinstance(lb, str) and lb.startswith("auto_review:") and lb[12:].isdigit():
                 out.add(int(lb[12:]))
     return out

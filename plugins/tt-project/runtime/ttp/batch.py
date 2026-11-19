@@ -59,6 +59,8 @@ from . import (checkcap, checkdirs, checklane, checkspill, cleantree, conflictfi
                sharedchecks, slowtests, suitecost, testpick, verdictcarry, worktree)
 from .project import Project, command_env, durable_write, write_json
 from . import ghroute, gatetime, gitmemo, hoststate
+from .util import read_dict
+from .liveness import pid_alive
 
 WORKTREE = "push"             # the batch's own checkout under the project's worktrees (never t<id>)
 AFTER_PUSH = "after_push-"    # + batch id: the temporary checkout after_push runs in
@@ -121,7 +123,7 @@ class Stopped(BaseException):
 def stop_request(marker: Path) -> dict | None:
     """The stop request beside `marker` ({why, by, at}), or None."""
     try:
-        r = push._read(Path(marker).with_suffix(STOP_SUFFIX))
+        r = read_dict(Path(marker).with_suffix(STOP_SUFFIX))
     except Exception:
         return None
     return r if isinstance(r, dict) and r else None
@@ -270,7 +272,7 @@ def _deploy(p: Project, marker: Path, m: dict, poll_s: float | None = None) -> d
     waited, t0 = False, time.monotonic()
 
     def newer() -> dict | None:
-        cur = push._read(nxt)
+        cur = read_dict(nxt)
         if cur.get("id") and cur["id"] != bid and float(cur.get("started") or 0) > me["started"]:
             return cur
         if cur.get("id") != bid and waited:   # absent or older: name this batch (a race converges here)
@@ -292,7 +294,7 @@ def _deploy(p: Project, marker: Path, m: dict, poll_s: float | None = None) -> d
             if cur := newer():
                 say(f"after_push skipped: batch {cur['id']}'s deploy of {str(cur.get('sha'))[:10]} includes this push")
                 return {"status": "skipped", "reason": f"superseded by batch {cur['id']}'s deploy", "ended": time.time()}
-            if push._read(nxt).get("id") == bid:
+            if read_dict(nxt).get("id") == bid:
                 _forget(nxt)
         return after_push(p, marker, m)
     finally:
@@ -358,16 +360,8 @@ def _kill_tree(proc: subprocess.Popen) -> None:
         except subprocess.TimeoutExpired:
             pass
         deadline = time.monotonic() + 5
-        while sig == signal.SIGTERM and time.monotonic() < deadline and any(_alive(x) for x in pids[1:]):
+        while sig == signal.SIGTERM and time.monotonic() < deadline and any(pid_alive(x) for x in pids[1:]):
             time.sleep(0.1)
-
-
-def _alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    return True
 
 
 def _here(cmd):
@@ -1882,7 +1876,7 @@ class Batch:
                "why": list(lines),
                "head": str(self.entries[0].get("head") or "") if self.entries else ""}
         try:
-            m = push._read(self.marker) or self.m
+            m = read_dict(self.marker) or self.m
             m["check_override"] = rec
             write_json(self.marker, m)
             self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,data) VALUES(?,?,?,?,?,?,?)",
@@ -2013,7 +2007,7 @@ class Batch:
             version = self._version(head)
         except Exception:
             version = None
-        m = push._read(self.marker) or self.m
+        m = read_dict(self.marker) or self.m
         m["pushing"] = {"sha": head, "tip": tip, "version": version, "results": results, "at": time.time(),
                         "checks": self.checks, "rounds": self.rounds}
         write_json(self.marker, m)
@@ -3883,7 +3877,7 @@ def _run_detached(p: Project, receipt: Path, log: Path, lock) -> dict | None:
                 time.sleep(AFTER_POLL_S)
     except OSError:
         proc.wait()
-    m = push._read(receipt)
+    m = read_dict(receipt)
     if m.get("status") in ("finished", "deferred") and isinstance(m.get("after_push"), dict):
         return m["after_push"]
     return {"status": "killed", "exit": proc.returncode, "cmd": None, "started": m.get("started"), "ended": time.time(),
@@ -3925,14 +3919,14 @@ def rerun_receipt(p: Project, receipt, first: bool = False) -> int:
     is the one after_ordinary_push passed down), or once more (pushq.tend_receipts started this): held
     again while a power cycle is still announced."""
     receipt = Path(receipt)
-    m = push._read(receipt)
+    m = read_dict(receipt)
     rid = str(m.get("id") or receipt.stem)
     lock = _hold(_after_lock(p, rid), f"after_push of {str(m.get('pushed_sha') or '')[:10]}"
                  + ("" if first else " (again)"))
     if lock is None:
         return push.BUSY
     try:
-        m = push._read(receipt) or m
+        m = read_dict(receipt) or m
         if m.get("status") not in (("running",) if first else ("held", "rerun")):
             return 0      # another process ran it meanwhile
         if not first and (why := _notice_hold(p)):
@@ -3974,7 +3968,7 @@ def run_batch(p: Project, marker: Path) -> int:
     (steps 1-11), then run after_push (12). A marker that has an outcome runs only after_push (13)."""
     marker = Path(marker)
     _wait_for_go()
-    m = push._read(marker)
+    m = read_dict(marker)
     if m.get("kind") != "batch":
         print(f"ttp push: no push batch marker at {marker}", file=sys.stderr)
         return push.REFUSED
@@ -4022,7 +4016,7 @@ def run_batch(p: Project, marker: Path) -> int:
         if b.reach:
             say(push.landing(b.pushed_sha or b.tip, b.target, b.reach)
                 if b.pushed_sha else f"already on {b.target}{push.reach_words(b.reach)}")
-    m = push._read(marker) or m
+    m = read_dict(marker) or m
     conflicts = b.conflicts()
     m.update(outcome=outcome, tip=b.tip, pushed_sha=b.pushed_sha, version=b.version, results=b.results(),
              checks=b.checks, rounds=b.rounds, message=b.message or None, conflicts=conflicts,
@@ -4077,7 +4071,7 @@ def _arm_stop(marker: Path):
         old = signal.signal(STOP_SIGNAL, _on_stop)
     except ValueError:
         return None
-    m = push._read(marker) or {}
+    m = read_dict(marker) or {}
     m["stop_signal"] = STOP_SIGNAL.name
     write_json(marker, m)
     return old
@@ -4125,7 +4119,7 @@ def _resume(p: Project, marker: Path, m: dict, bid: str) -> int:
 def alive(marker: Path) -> bool:
     """Whether the batch process of `marker` still runs: the lock the marker names is held. The
     marker is read again after the test, as the process moves to another lock after the push."""
-    m = push._read(marker)
+    m = read_dict(marker)
     if m.get("phase") == "finished":
         return False
     seen = set()
@@ -4133,7 +4127,7 @@ def alive(marker: Path) -> bool:
         seen.add(m["lock"])
         if not locks.any_free([Path(m["lock"])]):
             return True
-        m = push._read(marker)
+        m = read_dict(marker)
         if m.get("phase") == "finished":
             return False
     return False
@@ -4142,10 +4136,10 @@ def alive(marker: Path) -> bool:
 def summary(marker: Path, pushed_only: bool = False) -> int:
     """`ttp push --result <marker>` for a batch marker: 0 once it finished (or died), 1 while it runs.
     With `pushed_only`: 0 only when it pushed or landed, `push.NOT_PUSHED` when it finished without."""
-    m = push._read(marker)
+    m = read_dict(marker)
     bid = m.get("id") or Path(marker).stem
     live = alive(Path(marker))
-    m = push._read(marker) or m
+    m = read_dict(marker) or m
     if live:
         took = time.time() - float(m.get("started") or time.time())
         print(f"ttp push: batch {bid} still running ({m.get('phase')}, pid {m.get('pid')}, {took:.0f} s); "

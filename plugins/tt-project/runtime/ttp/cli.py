@@ -6017,6 +6017,19 @@ def _checks_yield(p: Project | None, me: Path | None) -> str:
     return ""
 
 
+def _checks_teller(out, run_dir: Path):
+    """tell(line) for a checks wait: the line goes to `out`, stdout and the run's progress.md."""
+    def tell(line: str) -> None:
+        out.write(f"ttp checks: {line}\n")
+        out.flush()
+        print(f"ttp checks: {line}", flush=True)
+        try:
+            durable_append(run_dir / "progress.md", f"{timefmt.clock()} checks: {line}\n")
+        except OSError:
+            pass
+    return tell
+
+
 def _checks_follow(p: Project, run_dir: Path, out, head: str, me: Path | None, y, detached: bool = False):
     """Follow the run this one yielded to (checkjoin.Yield `y`) until it ends: (how, the record with its
     outcome); None once it ended without one (queue again); ("handover", None) once a foreground wait
@@ -6027,14 +6040,7 @@ def _checks_follow(p: Project, run_dir: Path, out, head: str, me: Path | None, y
     how, lead, start = y.how, y.target, time.time()
     key = f"checks-join:{os.getpid()}:{start}"
 
-    def tell(line: str) -> None:
-        out.write(f"ttp checks: {line}\n")
-        out.flush()
-        print(f"ttp checks: {line}", flush=True)
-        try:
-            durable_append(run_dir / "progress.md", f"{timefmt.clock()} checks: {line}\n")
-        except OSError:
-            pass
+    tell = _checks_teller(out, run_dir)
 
     line = checkjoin.said(how, head, lead)
     mine = str((checkjoin.read(me) or {}).get("key") or "")
@@ -6237,14 +6243,7 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     foreground = not detached and not os.environ.get("TTP_DETACHED")
     key = f"checks:{os.getpid()}:{time.time()}"
 
-    def tell(line: str) -> None:
-        out.write(f"ttp checks: {line}\n")
-        out.flush()
-        print(f"ttp checks: {line}", flush=True)
-        try:
-            durable_append(run_dir / "progress.md", f"{timefmt.clock()} checks: {line}\n")
-        except OSError:
-            pass
+    tell = _checks_teller(out, run_dir)
 
     def waiting(on: bool, suite: str = "", limit: int = 0, limit_from: str = "", spill: str = "") -> None:
         # The wait is recorded before the marker shows it, so whoever sees the marker sees both. `suite`:

@@ -41,6 +41,7 @@ import time
 from pathlib import Path
 
 from .providers.base import binary_stamp, cli_output, find_binary, status_check
+from .util import read_dict
 
 TIERS = ("light", "standard", "deep")
 FALLBACK = "auto"
@@ -116,14 +117,6 @@ def stamp(binary: str, credentials: str = "") -> str:
     return f"{binary_stamp(binary) or binary + ':-'}|{credentials}"
 
 
-def _read(path: Path) -> dict:
-    try:
-        data = json.loads(path.read_text())
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
-
-
 def _write(path: Path, data: dict) -> None:
     from .project import durable_write
     try:
@@ -171,7 +164,7 @@ def resolve(binary: str | None = None, credentials: str | None = None, now: floa
         from .providers import get_provider
         credentials = get_provider("cursor").credentials_stamp()
     key = stamp(binary, credentials)
-    have = _read(path)
+    have = read_dict(path)
     same = not force and have.get("stamp") == key and isinstance(have.get("tiers"), dict) and not have.get("rejected")
     if same and (now - float(have.get("at") or 0) < (LISTED_MAX_S if have.get("source") == "listed" else RETRY_S)
                  or have.get("source") == "listed" and now - float(have.get("tried") or 0) < RETRY_S):
@@ -212,7 +205,7 @@ def drop_rejected(model: str, text: str, path: Path | None = None) -> bool:
     """After a failed run: when the CLI refused `model` and the kept listed map names it, mark the map
     so the next run lists the models again. True when it did."""
     path = path or cache_path()
-    have = _read(path)
+    have = read_dict(path)
     if have.get("source") != "listed" or model not in (have.get("tiers") or {}).values() or \
             not model_rejected(text, model):
         return False

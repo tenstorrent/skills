@@ -587,12 +587,7 @@ class MuteEnds:
     semantics as a pause's. Its pass ends the mute with its summary event, with no model; a broken or
     timed-out probe is reported once and the mute keeps its time."""
 
-    def __init__(self, p: Project, log=lambda msg: None):
-        self.p, self.log = p, log
-        self._checked = 0.0
-        self._procs: dict[str, tuple[subprocess.Popen, float, str]] = {}
-        self._errs: dict[int, Any] = {}
-        self._probed: dict[str, float] = {}
+    __init__ = PauseEnds.__init__
 
     def tick(self, now: float | None = None) -> list[str]:
         """Returns the mutes ("source 'match'") their probe ended this time."""

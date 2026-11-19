@@ -11,6 +11,7 @@ coordinator.apply), with no free-text classifier over what the user or the coord
   (check_cites, record_cites). A reply that cites nothing is not checked: nothing reads its words.
 """
 from __future__ import annotations
+from .util import as_int
 
 NO_ORDER_REFUSED_KEY = "turnrules_no_order_refused"   # user message ids refused once for no order
 NO_ORDER_KEPT = 200
@@ -20,19 +21,12 @@ CITES_KEY = "turnrules_cites"   # {chat: {run id: reply message id}}
 CITES_KEPT = 500                # runs remembered per chat
 
 
-def _int(v) -> int | None:
-    try:
-        return int(v)
-    except (TypeError, ValueError):
-        return None
-
-
 def order_gap(db, covered: set[int], actions: list, failed: set[int], messages, held=()) -> str | None:
     """The refusal for the user messages of this turn (`messages`, a relayer's findings aside) with no
     order on the ledger (`covered`: obligations.order_messages after the turn) and no `no_order` on an
     applied reply or noop; None when each has one, or each was refused once already. A reply the chat
     digest held (`held`: action indexes) never reached the chat, so its `no_order` answers nothing."""
-    ids = [m for m in (_int(x) for x in messages or []) if m is not None]
+    ids = [m for m in (as_int(x) for x in messages or []) if m is not None]
     if not ids:
         return None
     users = [r["id"] for r in db.q(f"SELECT id FROM messages WHERE id IN ({','.join('?' * len(ids))}) "
@@ -44,16 +38,16 @@ def order_gap(db, covered: set[int], actions: list, failed: set[int], messages, 
             continue
         if a.get("order") in (None, ""):
             return None
-        if (m := _int(a.get("order"))) is not None:
+        if (m := as_int(a.get("order"))) is not None:
             covered.add(m)
-    refused = [m for m in (_int(x) for x in db.kv(NO_ORDER_REFUSED_KEY, []) or []) if m is not None]
+    refused = [m for m in (as_int(x) for x in db.kv(NO_ORDER_REFUSED_KEY, []) or []) if m is not None]
     new = [m for m in users if m not in covered and m not in refused]
     if not new:
         return None
     db.set_kv(NO_ORDER_REFUSED_KEY, (refused + new)[-NO_ORDER_KEPT:])
     shown = ", ".join(f"#{m}" for m in new)
     kept = sorted({m for i in held if i < len(actions or []) and isinstance(actions[i], dict)
-                   and (m := _int(actions[i].get("order"))) in new})
+                   and (m := as_int(actions[i].get("order"))) in new})
     if kept:   # the reply naming it was held for the digest: the user has not got it
         return (f"{PREFIX}user message {', '.join(f'#{m}' for m in kept)}: your reply answering it was held for "
                 f"the chat digest and NOT delivered to the chat, so it answers nothing yet: send what they asked "
@@ -77,7 +71,7 @@ def check_cites(db, a: dict, chat) -> list[int]:
     raw = a.get("cites")
     if raw in (None, []):
         return []
-    if not isinstance(raw, list) or any(_int(x) is None or isinstance(x, bool) for x in raw):
+    if not isinstance(raw, list) or any(as_int(x) is None or isinstance(x, bool) for x in raw):
         raise ValueError("`cites` is a list of run ids (the runs whose results the reply reports)")
     runs = sorted({int(x) for x in raw})
     known = {r["id"] for r in db.q(f"SELECT id FROM runs WHERE id IN ({','.join('?' * len(runs))})", runs)}

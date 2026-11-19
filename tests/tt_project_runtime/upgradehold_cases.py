@@ -315,9 +315,9 @@ def test_a_push_queue_batch_past_the_bound_holds_the_upgrade_only_inside_its_ste
             return _real(*a, **kw)
         monkeypatch.setattr(cls_or_mod, name, wrapped)
     monkeypatch.setattr(sys, "stdin", io.StringIO(""))
-    monkeypatch.setenv("TTP_RUN_DIR", push._read(marker)["check_report_dir"])
+    monkeypatch.setenv("TTP_RUN_DIR", read_dict(marker)["check_report_dir"])
     assert batch.run_batch(s.p, marker) == 0
-    assert push._read(marker)["outcome"] == "pushed"
+    assert read_dict(marker)["outcome"] == "pushed"
     assert set(seen) == {"rebase", "slot wait", "checks", "push"}, seen
     for step in ("rebase", "checks", "push"):
         assert seen[step].startswith(f"{release.PUSH_HELD}in its {step} step since"), seen

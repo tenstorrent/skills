@@ -69,13 +69,13 @@ later promise to the same chat with an earlier due) or justified on record (the 
 `obligation` action with `key` and `justify`, kept for that due). It never pages the user."""
 from __future__ import annotations
 
-import json
 import re
 import statistics
 import time
 from pathlib import Path
 
 from . import cells, etahist
+from .util import task_labels
 
 WINDOW_S = 14 * 86400
 LONG_H = 2.0
@@ -94,16 +94,8 @@ def _med(xs: list[float]) -> float | None:
     return statistics.median(xs) if xs else None
 
 
-def _labels(t: dict) -> list:
-    try:
-        v = json.loads(t.get("labels") or "[]")
-        return [x for x in v if isinstance(x, str)] if isinstance(v, list) else []
-    except ValueError:
-        return []
-
-
 def _locks(t: dict) -> list[str]:
-    return sorted(lb for lb in _labels(t) if lb.startswith(("resource:", "exclusive:")))
+    return sorted(lb for lb in task_labels(t) if lb.startswith(("resource:", "exclusive:")))
 
 
 def gate_probe(t: dict) -> str:
