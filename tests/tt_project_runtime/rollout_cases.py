@@ -594,7 +594,7 @@ def test_a_revert_counts_only_against_a_flag_whose_gated_code_the_reverted_commi
     _ro_revert(p, spec)
     got = _revert_count(p, "deslop", repo)
     assert len(got["failing"]) == 1 and "1 forward revert(s) of a landed change" in got["failing"][0]
-    assert _revert_count(p, "fresh_continue", repo)["failing"] == [], "another flag's code is not this one's"
+    assert _revert_count(p, "output_trim", repo)["failing"] == [], "another flag's code is not this one's"
 
 
 def test_a_revert_of_a_run_schedules_change_does_not_trip_the_eta_flag_in_shadow(env, tmp_path):

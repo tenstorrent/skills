@@ -406,25 +406,6 @@ def role_misses(p, task: int, before: int | None = None) -> int:
 
 def prepare(p, cfg: dict, prov, provider: str, cwd: str, env: dict | None, now: float | None = None,
             task: int | None = None, model: str | None = None) -> dict:
-    """_prepare's answer; with rings.fresh_continue on (costlevers), a run that would resume an earlier
-    worker session starts fresh instead (the coordinator fork or the disk block, as before), and every run of a
-    task in fork mode gets the compact hand-off (costlevers.handoff_block) after its lead, noted "fresh"."""
-    from . import costlevers
-    fresh = bool(task) and mode(cfg) == "fork" and costlevers.lever_on(p, "fresh_continue")
-    got = _prepare(p, cfg, prov, provider, cwd, env, now, task, model, fresh)
-    if not fresh or got.get("how") not in ("fork", "disk"):
-        return got
-    try:
-        block = costlevers.handoff_block(p, int(task), cwd)
-    except Exception as e:   # the run still starts, without the block
-        block = ""
-        got = {**got, "why": f"{got.get('why') or ''}; hand-off block failed: {type(e).__name__}: {e}"[:400]}
-    lead = got.get("lead") or ""
-    return {**got, "fresh": True, "lead": f"{lead}\n\n{block}" if lead and block else lead or block}
-
-
-def _prepare(p, cfg: dict, prov, provider: str, cwd: str, env: dict | None, now: float | None = None,
-             task: int | None = None, model: str | None = None, fresh: bool = False) -> dict:
     """What a new worker or reviewer run starts with: {"how", "why", "session" (a fork: the run's own
     new session id, to resume), "lead" (text before its prompt; a fork's goes after the copied
     history), "tokens"}. Never raises: a failure falls back to the disk block. When the task's last run
@@ -444,11 +425,8 @@ def _prepare(p, cfg: dict, prov, provider: str, cwd: str, env: dict | None, now:
     elif m == "fork":
         try:
             src = follow_source(p, task) or own_source(p, cfg, task, now) or lane_source(p, cfg, task, now)
-            if src and fresh:   # costlevers: the run starts fresh with a compact hand-off instead
-                gap = f"fresh continue (rings.fresh_continue), not run {src['run']}'s session"
-            else:
-                gap = _resume_gap(src, prov, provider) or _cross_model(src, model) or _fork_rejected(p, task, "resume") \
-                    or _hop_capped(p, cfg, src, task) if src else ""
+            gap = _resume_gap(src, prov, provider) or _cross_model(src, model) or _fork_rejected(p, task, "resume") \
+                or _hop_capped(p, cfg, src, task) if src else ""
             if src and not gap:
                 new = str(uuid.uuid4())
                 gap = prov.start_from_session(src["provider"] or provider, src["session"], cwd, env, new)

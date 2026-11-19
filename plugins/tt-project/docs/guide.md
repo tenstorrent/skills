@@ -5347,7 +5347,7 @@ Wired flags. `glm_code` gates the code route's GLM coin flip (codearm.py): a pro
 `route.code_sonnet.glm_share` wins as written, 0 included; without one, the flag on gives the account's share,
 else 0.5 (`codearm.RING_SHARE`), and the flag off makes it 0, so no coin flip runs. The arm still needs a
 `route.code_sonnet.glm` model, and Claude review, the policy-file bounce and the switch-back guard are
-unchanged. `fresh_continue` (`worker.fresh_continue`), `coord_wake_settle` (`coordinator.wake_settle`) and
+unchanged. `coord_wake_settle` (`coordinator.wake_settle`) and
 `output_trim` (`output.trim`) gate the cost levers of costlevers.py and wakesettle.py; `ttp status` and the
 daily review show their numbers. `coord_wake_settle` also runs the daemon's daily waste check without a model,
 steers the wake after one that made 8+ tool calls to batch its reads, and settles a waiting task's spec edit that
