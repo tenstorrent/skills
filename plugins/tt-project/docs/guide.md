@@ -2007,6 +2007,17 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    without a config change, set `TTP_CHAT_VENDOR_DEFAULTS=1` (all levers), `0` (none) or lever names
    separated by commas in the environment of the process that starts it. The run's exit record lists
    the levers that were on under `bridge.vendor`.
+9. Emission and loop guards, on by default (`"emission_guard": false` or `"loop_guard": false`
+   under `providers.chat` turns one off). The emission guard mends tool arguments that do not
+   parse, once and without a model call: a code fence around them, a trailing comma, or closing
+   brackets cut off after a whole value. It never mends a string, number or word cut short (it
+   may be a cut-off command or value); such arguments go on as `{}`, which Claude Code rejects, so
+   the model sends the call again. Mended calls count as `args_repaired`. The loop guard watches tool results: when the same
+   tool call with the same input has failed 3 times in a row, the bridge adds one note telling the
+   model to change its approach; if that call fails once more, the bridge stops the run. On a
+   GLM route that stop is a bounce to Opus (`route.glm_work.bounce`), with no attempt spent. The
+   exit record counts nudges and stops under `bridge.loop`, and `ttp stats --glm-share` and the
+   daily review show them by day.
 
 The key stays in the per-user secrets store and the bridge's upstream requests: the agent gets
 only the bridge's address and a per-run token. Reasoning text from the endpoint is dropped

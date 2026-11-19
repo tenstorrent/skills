@@ -155,6 +155,6 @@ def test_glm_share_counts_bad_output_per_day_from_glm_runs_exit_records(env):
     assert (days[0]["tool_input_errors"], days[0]["args_unparsed"], days[0]["junk_responses"], days[0]["runs_hit"]) == (1, 1, 2, 1)
     assert days[0]["pct"]["junk_responses"] == 2.0 and days[1]["pct"]["empty_content"] == 2.0
     out = glmshare.text(s)
-    assert "GLM bad output by day" in out and "junk 2 (2%); runs hit 1" in out
+    assert "GLM bad output by day" in out and "junk 2 (2%); loop nudges 0, loop stops 0; runs hit 1" in out
     lines = glmshare.daily_lines(p, now)
     assert len(lines) == 2 and "reasoning-only 1 (2%)" in lines[1]

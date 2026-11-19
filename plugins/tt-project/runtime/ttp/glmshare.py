@@ -46,7 +46,8 @@ ARM_KV = "glm_work_arm:"          # kv glm_work_arm:<task id>: {"arm": "glm" | "
 CODE_ARM_KV = "code_arm:"         # codearm.ARM_KV
 MIN_TASKS, WORSE_PTS, BASE_DAYS, BASE_MIN = 25, 15.0, 14, 5
 CHUNK = 500
-BAD_KEYS = ("tool_input_errors", "args_unparsed", "empty_content", "junk_responses")   # chatbridge stats bad_output
+BAD_KEYS = ("tool_input_errors", "args_unparsed", "args_repaired", "empty_content", "junk_responses")
+LOOP_KEYS = {"loop_nudges": "nudges", "loop_stops": "stops"}   # chatbridge stats loop (the loop guard)   # chatbridge stats bad_output
 BAD_DAYS = 7
 
 
@@ -283,13 +284,16 @@ def bad_output(p, rows) -> list[dict]:
         if not isinstance(scanned, int):
             continue   # no exit record, or a bridge from before the counters: not measured, never a zero
         day = datetime.datetime.fromtimestamp(float(r["started"] or 0), tz).strftime("%Y-%m-%d")
-        v = days.setdefault(day, {"day": day, "runs": 0, "answers": 0, "runs_hit": 0, **{k: 0 for k in BAD_KEYS}})
+        v = days.setdefault(day, {"day": day, "runs": 0, "answers": 0, "runs_hit": 0,
+                                  **{k: 0 for k in (*BAD_KEYS, *LOOP_KEYS)}})
         bad = b.get("bad_output") if isinstance(b.get("bad_output"), dict) else {}
         n = {k: int(bad.get(k) or 0) for k in BAD_KEYS}
+        loop = b.get("loop") if isinstance(b.get("loop"), dict) else {}
+        n.update({k: int(loop.get(f) or 0) for k, f in LOOP_KEYS.items()})
         v["runs"] += 1
         v["answers"] += scanned
         v["runs_hit"] += any(n.values())
-        for k in BAD_KEYS:
+        for k in n:
             v[k] += n[k]
     for v in days.values():
         v["pct"] = {k: round(100.0 * v[k] / v["answers"], 2) if v["answers"] else None for k in BAD_KEYS}
@@ -300,9 +304,11 @@ def bad_lines(got: list[dict]) -> list[str]:
     """One line per day of bad_output's list."""
     pct = lambda v: "-" if v is None else f"{v:g}%"   # noqa: E731
     return [f"{v['day']}: {v['runs']} GLM runs, {v['answers']} answers; tool input errors {v['tool_input_errors']} "
-            f"({pct(v['pct']['tool_input_errors'])}), args unparsed {v['args_unparsed']} ({pct(v['pct']['args_unparsed'])}), "
+            f"({pct(v['pct']['tool_input_errors'])}), args unparsed {v['args_unparsed']} ({pct(v['pct']['args_unparsed'])}, "
+            f"mended {v['args_repaired']}), "
             f"reasoning-only {v['empty_content']} ({pct(v['pct']['empty_content'])}), junk {v['junk_responses']} "
-            f"({pct(v['pct']['junk_responses'])}); runs hit {v['runs_hit']}" for v in got]
+            f"({pct(v['pct']['junk_responses'])}); loop nudges {v.get('loop_nudges', 0)}, loop stops "
+            f"{v.get('loop_stops', 0)}; runs hit {v['runs_hit']}" for v in got]
 
 
 def daily_lines(p, now: float) -> list[str]:

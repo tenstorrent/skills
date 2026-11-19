@@ -7114,7 +7114,9 @@ class Daemon:
                 and r["task"] and r["role"] != "coordinator" and refused != "instructions_missing":
             # A GLM run that asks for Opus or deep thinking, on either route: a fresh run on Opus with its hand-off
             # (route.glm_work.bounce false: the old way, its hand-off stands).
-            bounce = glmwork.bounce_reason(_read_result(run_dir / RESULT_FILE), self.cfg)
+            bounce = glmwork.bounce_reason(_read_result(run_dir / RESULT_FILE), self.cfg) \
+                or (str(((exit_info.get("bridge") or {}).get("loop") or {}).get("bounce") or "")[:300]
+                    if glmwork.bounce_on(self.cfg) else "")   # the bridge's loop guard stopped it (chatbridge)
         if not bounce and on_route and routed and routed.get(codearm.KEY) == "glm" and r["task"] \
                 and r["role"] != "coordinator" and refused != "instructions_missing":
             bounce = self._policy_bounce(r)   # a run on the arm that changed a policy file hands nothing off

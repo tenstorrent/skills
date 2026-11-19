@@ -188,6 +188,81 @@ def test_chatbridge_counts_tool_input_errors_once_and_junk_per_answer(mock_chat)
     assert not chatbridge.args_unparsed('{"a": 1}{"b": 2}'), "two objects back to back: the first is sent"
 
 
+def test_chatbridge_emission_guard_mends_unparsed_tool_arguments_once_and_never_a_cut_string(mock_chat):
+    from ttp import chatbridge
+    from ttp.chatbridge import Bridge
+    r = chatbridge.repair_args
+    assert r('{"a": 1,}') == {"a": 1} and r('```json\n{"a": [1, 2,]}\n```') == {"a": [1, 2]}
+    assert r('{"a": {"b": 1}') == {"a": {"b": 1}}, "closers cut off after a whole value"
+    assert r('{"command": "rm -rf /tm') is None, "a string cut short may be a cut-off command: never mended"
+    assert r('{"timeout": 12') is None and r('{"a": [1, 2') is None, "nor a number or word cut short"
+    assert r('{"a": [1, 2],') == {"a": [1, 2]}, "closers after a whole value"
+    assert r('{"s": "x,}"') == {"s": "x,}"} and r('{"q": "a\\"",}') == {"q": 'a"'}, "string text kept as sent"
+    assert r("[1]") is None and r("") is None
+    call = lambda args: (200, {"choices": [{"message": {"content": "", "tool_calls": [   # noqa: E731
+        {"id": "c", "type": "function", "function": {"name": "Bash", "arguments": args}}]},
+        "finish_reason": "tool_calls"}]})
+    streamed = (200, [{"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "s", "type": "function", "function": {
+        "name": "Bash", "arguments": '{"command": "ls",'}}]}}]},
+        {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}])
+    hi = {"max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]}
+    up = mock_chat(call('{"command": "ls",}'), call('{"command": "l'), streamed, call('{"command": "ls",}'))
+    with Bridge(up.url, _CB_KEY, "example/model") as b:
+        assert json.loads(_post(b, hi)[1])["content"][0]["input"] == {"command": "ls"}
+        assert json.loads(_post(b, hi)[1])["content"][0]["input"] == {}, "unmendable: {} goes on, Claude Code makes the model resend"
+        assert '{\\"command\\": \\"ls\\"}' in _post(b, {**hi, "stream": True})[1], "the stream's call mended too"
+        bad = b.stats()["bad_output"]
+    assert (bad["args_unparsed"], bad["args_repaired"]) == (3, 2)
+    with Bridge(up.url, _CB_KEY, "example/model", emission_guard=False) as b:
+        assert json.loads(_post(b, hi)[1])["content"][0]["input"] == {}, "the switch off: the old way"
+        assert b.stats()["bad_output"]["args_repaired"] == 0
+    cfg = {"providers": {"chat": {"emission_guard": False}}}
+    assert chatbridge.settings(cfg, "standard", "m")["emission_guard"] is False
+    assert "emission_guard" not in chatbridge.settings({"providers": {"chat": {}}}, "standard", "m")
+    assert any("emission_guard" in x for x in chatbridge.config_problems({"providers": {"chat": {"emission_guard": "no"}}}))
+
+
+def test_chatbridge_loop_guard_nudges_once_then_stops_a_failing_loop_for_a_bounce_and_the_switch_restores_it(mock_chat):
+    import inspect
+    from ttp import chatbridge, daemon, glmshare
+    from ttp.chatbridge import Bridge
+
+    def turn(n, inp=None, ok_last=False):
+        msgs = [{"role": "user", "content": "go"}]
+        for i in range(n):
+            msgs += [{"role": "assistant", "content": [{"type": "tool_use", "id": f"t{i}", "name": "Bash",
+                                                        "input": inp or {"command": "make"}}]},
+                     {"role": "user", "content": [{"type": "tool_result", "tool_use_id": f"t{i}", "content": "exit 2",
+                                                   "is_error": not (ok_last and i == n - 1)}]}]
+        return {"max_tokens": 5, "messages": msgs}
+    assert chatbridge.failing_streak(turn(3)) == ('Bash {"command": "make"}', 3)
+    assert chatbridge.failing_streak(turn(3, ok_last=True))[1] == 0, "the last call worked"
+    mixed = turn(2)
+    mixed["messages"] += turn(1, {"command": "make -j2"})["messages"][1:]
+    assert chatbridge.failing_streak(mixed)[1] == 1, "a changed input starts a new streak"
+    ok = (200, {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]})
+    up = mock_chat(ok, ok, ok, ok)
+    with Bridge(up.url, _CB_KEY, "example/model") as b:
+        assert _post(b, turn(2))[0] == 200
+        assert _post(b, turn(3))[0] == 200
+        assert _post(b, turn(3))[0] == 200, "the same history sent again (a retry, a side call) is no new failure"
+        code, text = _post(b, turn(4))
+        st = b.stats()
+    sent = [json.dumps(x) for x in up.seen]
+    assert "[harness]" not in sent[0] and "failed 3 times in a row" in sent[1], "one nudge, on the third failure"
+    assert "[harness]" not in sent[2], "the nudge goes once"
+    assert code == 400 and "loop guard" in text and len(up.seen) == 3, "the repeat after the nudge never goes upstream"
+    assert st["loop"]["nudges"] == 1 and st["loop"]["stops"] == 1 and st["loop"]["bounce"].startswith("loop:")
+    with Bridge(up.url, _CB_KEY, "example/model", loop_guard=False) as b:
+        assert _post(b, turn(4))[0] == 200 and "loop" not in b.stats(), "the switch off: the old way"
+    assert chatbridge.settings({"providers": {"chat": {"loop_guard": False}}}, "standard", "m")["loop_guard"] is False
+    src = inspect.getsource(daemon.Daemon.finish_run)
+    assert '.get("loop")' in src and "glmwork.bounce_on(self.cfg)" in src, "a loop stop on a GLM route bounces to Opus"
+    line = glmshare.bad_lines([{"day": "d", "runs": 1, "answers": 2, "runs_hit": 1, "loop_nudges": 1, "loop_stops": 1,
+                                **{k: 0 for k in glmshare.BAD_KEYS}, "pct": {k: 0 for k in glmshare.BAD_KEYS}}])[0]
+    assert "loop nudges 1, loop stops 1" in line
+
+
 def test_chatbridge_junk_patterns_are_configurable_and_checked():
     from ttp import chatbridge
     assert chatbridge.re.compile(chatbridge.JUNK_PATTERNS["ById"]).search("x ById y")

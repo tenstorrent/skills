@@ -128,6 +128,21 @@ THINKING_SKIP = ("flash",)   # model id words whose runs never get reasoning bac
 # answers with no text and no tool call, only reasoning (empty_content); and answers whose reasoning, text
 # or tool arguments match a junk pattern (providers.chat.junk_patterns, an object of name -> regex that
 # replaces these; {} turns the junk scan off).
+# Emission guard (providers.chat.emission_guard, default on; false: off): a tool call whose arguments do
+# not parse is mended once, model-free, before Claude Code gets it (repair_args: a code fence around them,
+# a trailing comma, closers cut off after a whole value; never a string, number or word cut short, which
+# may be a cut-off command or value). One it cannot mend goes on as {}, which Claude Code rejects, so the
+# model sends the call again.
+# bad_output counts the mended ones (args_repaired) beside args_unparsed.
+# Loop guard (providers.chat.loop_guard, default on; false: off): when the request's history ends with the
+# same tool call failing LOOP_REPEATS times in a row (failing_streak: the same tool and input, each result
+# is_error), the bridge adds one nudge to that request (LOOP_NUDGE). If that call then fails once more
+# (the history sent again as it was, a retry or a side call, is not a new failure), the bridge answers
+# that request with an error that ends the run and stats()["loop"] says why (`bounce`): on a GLM route the daemon restarts the task fresh on Opus, counted as a bounce, with
+# no attempt spent (glmwork). stats()["loop"] counts nudges and stops for the run's meter.
+LOOP_REPEATS = 3
+LOOP_NUDGE = ("[harness] The same tool call has now failed {n} times in a row with the same input. Do not "
+              "send it again: read the error, change the approach, or end with status needs_opus and say why.")
 JUNK_PATTERNS = {"U+FFFD": "\ufffd", "AMEAME": "AMEAME", "paren_run": r"(?:\(\s){5,}",
                  "ById": r"(?<![A-Za-z0-9_.$])ById(?![A-Za-z0-9_])"}
 TOOL_INPUT_RE = re.compile(
@@ -183,6 +198,7 @@ def settings(cfg: dict, tier: str, model: str, effort: str = "", standins=(), se
             **({"effort": effort, "fields": fields} if fields else {}),
             **({"effort": effort, "standins": alts, "served": [str(d) for d in served]} if alts and served else {}),
             **({"thinking": think} if think else {}), **({"vendor": levers} if levers else {}), **client, **busy,
+            **({k: False for k in ("emission_guard", "loop_guard") if entry.get(k) is False}),
             **({"junk_patterns": dict(entry["junk_patterns"])}
                if isinstance(entry.get("junk_patterns"), dict) and not _junk_problems(entry["junk_patterns"]) else {})}
 
@@ -238,6 +254,29 @@ def tool_input_errors(body: dict) -> list[str]:
             if "<tool_use_error>" in text and TOOL_INPUT_RE.search(text):
                 out.append(str(b.get("tool_use_id") or text[:200]))
     return out
+
+
+def failing_streak(body: dict) -> tuple[str, int]:
+    """The tool call the request's history ends on, as `name input` (input JSON, keys sorted), and how many
+    times in a row it was sent and failed (is_error) at the end of that history; ("", 0) when the last call
+    did not fail."""
+    calls, failed = [], set()
+    for m in (body.get("messages") or ()) if isinstance(body, dict) else ():
+        if not isinstance(m, dict) or not isinstance(m.get("content"), list):
+            continue
+        for b in m["content"]:
+            if not isinstance(b, dict):
+                continue
+            if m.get("role") == "assistant" and b.get("type") == "tool_use":
+                calls.append((str(b.get("id")), f"{b.get('name')} {json.dumps(b.get('input'), sort_keys=True)}"))
+            elif m.get("role") == "user" and b.get("type") == "tool_result" and b.get("is_error"):
+                failed.add(str(b.get("tool_use_id")))
+    n, key = 0, ""
+    for i, k in reversed(calls):
+        if i not in failed or (key and k != key):
+            break
+        key, n = k, n + 1
+    return key, n
 
 
 def _count_ok(v) -> bool:
@@ -517,6 +556,9 @@ def config_problems(raw: dict) -> list[str]:
     out = _effort_problems(entry["effort_fields"]) if entry.get("effort_fields") is not None else []
     out += _thinking_problems(entry.get("preserve_thinking"))
     out += _junk_problems(entry.get("junk_patterns"))
+    for k, what in (("emission_guard", "mend unparsed tool arguments"), ("loop_guard", "nudge, then stop, a failing loop")):
+        if entry.get(k) not in (None, True, False):
+            out.append(f"providers.chat.{k}: give true or false (default true: {what})")
     out += _vendor_problems(entry.get("vendor_defaults"), entry.get("vendor_values"))
     try:
         endpoint.slot(str(entry.get("endpoint") or ""))
@@ -654,9 +696,45 @@ def args_unparsed(text: str) -> bool:
     return not isinstance(got, dict)
 
 
-def tool_input(arguments) -> dict:
+def repair_args(text) -> dict | None:
+    """The emission guard's mend of tool arguments that do not parse (the module doc), or None when
+    none gives an object: strings are copied untouched, a trailing comma outside them is dropped, and
+    missing closers are added only when the text ends after a whole value (never inside a string, a
+    number or a word, which may have been cut short)."""
+    t = str(text or "").strip()
+    if (m := re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", t, re.S)):
+        t = m.group(1)
+    out, closers, in_str, esc = [], [], False, False
+    for ch in t:
+        if in_str:
+            esc, in_str = (False, True) if esc else (ch == "\\", ch != '"')
+        elif ch == '"':
+            in_str = True
+        elif ch in "{[":
+            closers.append("}" if ch == "{" else "]")
+        elif ch in "}]":
+            if closers:
+                closers.pop()
+            while out and out[-1].isspace():
+                out.pop()
+            if out and out[-1] == ",":
+                out.pop()
+        out.append(ch)
+    body = "".join(out).rstrip()
+    if in_str or (closers and body[-1:] not in ('"', "}", "]", ",", "{", "[")):
+        return None   # cut inside a string, a number or a word: the value may be short
+    text = body.rstrip(",") + "".join(reversed(closers))
+    try:
+        got, _ = json.JSONDecoder().raw_decode(text)
+    except ValueError:
+        return None
+    return got if isinstance(got, dict) else None
+
+
+def tool_input(arguments, repair: bool = False) -> dict:
     """A tool call's arguments as an object. A model that sends two JSON objects back to back gets
-    the first one; text that is no object at all gives {}."""
+    the first one; text that is no object at all gives {}, or with `repair` (the emission guard)
+    repair_args's mend when it has one."""
     if isinstance(arguments, dict):
         return arguments
     text = str(arguments or "").strip()
@@ -665,7 +743,9 @@ def tool_input(arguments) -> dict:
     try:
         got, _ = json.JSONDecoder().raw_decode(text)
     except ValueError:
-        return {}
+        got = None
+    if not isinstance(got, dict) and repair:
+        got = repair_args(text)
     return got if isinstance(got, dict) else {}
 
 
@@ -681,7 +761,7 @@ def _msg_id() -> str:
     return "msg_" + uuid.uuid4().hex[:24]
 
 
-def from_chat(resp: dict, model: str, thinking: bool = False) -> dict:
+def from_chat(resp: dict, model: str, thinking: bool = False, repair: bool = False) -> dict:
     """The Messages response for a non-streamed Chat Completions response: its reasoning a thinking
     block first when `thinking` (preserved thinking), else dropped."""
     choice = (resp.get("choices") or [{}])[0]
@@ -694,7 +774,7 @@ def from_chat(resp: dict, model: str, thinking: bool = False) -> dict:
     for c in msg.get("tool_calls") or []:
         fn = c.get("function") or {}
         content.append({"type": "tool_use", "id": c.get("id") or "toolu_" + uuid.uuid4().hex[:24],
-                        "name": fn.get("name"), "input": tool_input(fn.get("arguments"))})
+                        "name": fn.get("name"), "input": tool_input(fn.get("arguments"), repair)})
     stop = "tool_use" if msg.get("tool_calls") else STOP_REASONS.get(choice.get("finish_reason") or "stop", "end_turn")
     return {"id": _msg_id(), "type": "message", "role": "assistant", "model": model, "content": content,
             "stop_reason": stop, "stop_sequence": None, "usage": usage_of(resp.get("usage"))}
@@ -710,6 +790,7 @@ class Stream:
     apart) and sent whole, in index order, when the upstream stream ends."""
 
     def __init__(self, model: str, thinking: bool = False):
+        self.repair = False   # the emission guard (Bridge.emission_guard)
         self.model, self.index, self.text_open, self.started = model, 0, False, False
         self.thinking, self.thought, self.thoughts = thinking, None, 0   # preserved thinking: open block's text, blocks
         self.calls: dict[int, dict] = {}
@@ -783,7 +864,7 @@ class Stream:
             out += _sse("content_block_start", {"type": "content_block_start", "index": self.index, "content_block": {
                 "type": "tool_use", "id": c["id"] or "toolu_" + uuid.uuid4().hex[:24], "name": c["name"], "input": {}}})
             out += _sse("content_block_delta", {"type": "content_block_delta", "index": self.index, "delta": {
-                "type": "input_json_delta", "partial_json": json.dumps(tool_input(c["args"]))}})
+                "type": "input_json_delta", "partial_json": json.dumps(tool_input(c["args"], self.repair))}})
             out += _sse("content_block_stop", {"type": "content_block_stop", "index": self.index})
             self.index += 1
         stop = "tool_use" if self.calls else STOP_REASONS.get(self.finish or "stop", "end_turn")
@@ -972,8 +1053,11 @@ class Bridge:
                  fields: dict | None = None, standins: list | None = None, served: list | None = None,
                  busy_retries: int | None = None, busy_wait_s: float | None = None, thinking: dict | None = None,
                  junk_patterns: dict | None = None, client_timeout_ms: int = 0, attribution_header: bool = True,
-                 vendor: list | None = None):
+                 vendor: list | None = None, emission_guard: bool = True, loop_guard: bool = True):
         self.base_url, self._key, self.model = endpoint.base_url(base_url), key, model
+        self.emission_guard = bool(emission_guard)   # mend unparsed tool arguments (repair_args)
+        self.loop_guard, self._nudged = bool(loop_guard), {}   # the loop guard; each call it nudged: failures then
+        self.loop = {"nudges": 0, "stops": 0, "bounce": ""}   # stats()["loop"]
         self.vendor = list(vendor or [])   # the vendor-default levers on (vendor_levers), for stats()
         # The agent's own call timeout (API_TIMEOUT_MS); the bridge waits upstream at least as long.
         self.client_timeout_ms, self.attribution_header = int(client_timeout_ms or 0), bool(attribution_header)
@@ -1007,7 +1091,7 @@ class Bridge:
         jp = JUNK_PATTERNS if junk_patterns is None or _junk_problems(junk_patterns) else junk_patterns
         self.junk = {k: re.compile(v) for k, v in jp.items()}
         self.bad = {"tool_input_errors": 0, "args_unparsed": 0, "empty_content": 0, "junk_responses": 0,
-                    "junk_hits": {}}   # stats()["bad_output"]
+                    "args_repaired": 0, "junk_hits": {}}   # stats()["bad_output"]
         self._bad_seen: set[str] = set()   # tool_use ids counted (Claude Code resends the whole history)
         self._sleep = time.sleep
         self.server: http.server.ThreadingHTTPServer | None = None
@@ -1041,6 +1125,8 @@ class Bridge:
                       "junk_patterns": s.get("junk_patterns"),
                       "client_timeout_ms": s.get("client_timeout_ms") or 0, "vendor": s.get("vendor") or [],
                       "attribution_header": s.get("attribution_header", True) is not False,
+                      "emission_guard": s.get("emission_guard", True) is not False,
+                      "loop_guard": s.get("loop_guard", True) is not False,
                       **{k: s[k] for k in ("busy_retries", "busy_wait_s") if _count_ok(s.get(k))}, **kw})
 
     @property
@@ -1192,7 +1278,8 @@ class Bridge:
                 **({"inflight": self.inflight.export()} if self.inflight else {}),
                 **({"bad_output": {**self.bad, "junk_hits": dict(self.bad["junk_hits"])}}
                    if any(v for k, v in self.bad.items() if k != "junk_hits") else {}),
-                **({"vendor": list(self.vendor)} if self.vendor else {})}
+                **({"vendor": list(self.vendor)} if self.vendor else {}),
+                **({"loop": dict(self.loop)} if self.loop["nudges"] or self.loop["stops"] else {})}
 
     def server_wait_s(self) -> float:
         """The time spent waiting on the server so far (in-flight calls included): the cell limit does not count it."""
@@ -1418,12 +1505,15 @@ class Bridge:
         for kind, text in parts:
             by.setdefault(kind, []).append(text)
         texts = {k: "".join(v) for k, v in by.items()}
-        unparsed = sum(1 for k, t in texts.items() if k.startswith("args:") and args_unparsed(t))
+        bad_args = [t for k, t in texts.items() if k.startswith("args:") and args_unparsed(t)]
+        unparsed = len(bad_args)
+        repaired = sum(1 for t in bad_args if repair_args(t) is not None) if self.emission_guard else 0
         empty = not any(k == "content" or k.startswith("args:") for k in texts)
         hits = [k for k, rx in self.junk.items() if any(rx.search(t) for t in texts.values())]
         if hits or unparsed or empty:
             with self._swap_lock:
                 self.bad["args_unparsed"] += unparsed
+                self.bad["args_repaired"] += repaired
                 self.bad["empty_content"] += int(empty)
                 self.bad["junk_responses"] += int(bool(hits))
                 for k in hits:
@@ -1434,8 +1524,33 @@ class Bridge:
             with self._swap_lock:
                 self.thought["returned"] += n
 
+    def _looped(self, h: _Handler, body: dict) -> bool:
+        """The loop guard (the module doc): nudge `body` once per looping call; True when it answered `h`
+        with the stop instead."""
+        key, n = failing_streak(body) if self.loop_guard else ("", 0)
+        if n < LOOP_REPEATS:
+            return False
+        if key in self._nudged:
+            if n <= self._nudged[key]:   # the history the nudge went with, sent again (a retry, a side call)
+                return False
+            why = f"loop: the same tool call failed {n} times in a row, again after a nudge: {key[:200]}"
+            with self._swap_lock:
+                self.loop["stops"] += 1
+                self.loop["bounce"] = why
+            h._reply(*error_for(400, f"stopped by the harness loop guard: {why}"))
+            return True
+        self._nudged[key] = n
+        with self._swap_lock:
+            self.loop["nudges"] += 1
+        last = (body.get("messages") or [None])[-1]
+        if isinstance(last, dict) and isinstance(last.get("content"), list):
+            last["content"] = [*last["content"], {"type": "text", "text": LOOP_NUDGE.format(n=n)}]
+        return False
+
     def forward(self, h: _Handler, body: dict) -> None:
         self._rejected(body)
+        if self._looped(h, body):
+            return
         got = self._send(h, lambda used: to_chat(body, used, self.max_tokens, self.thinking))
         if got is None:
             return
@@ -1456,10 +1571,11 @@ class Bridge:
                 self._count(data.get("usage"))   # a translated call is counted too (cached apart: usage_of)
                 self._end_call(h, usage_of(data.get("usage"))["output_tokens"])
                 self._scan(output_parts(data))
-                out = from_chat(data, body.get("model") or self.model, think)
+                out = from_chat(data, body.get("model") or self.model, think, self.emission_guard)
                 self._returned(sum(1 for b in out["content"] if b.get("type") == "thinking"))
                 return h._reply(200, out)
             st = Stream(body.get("model") or self.model, think)
+            st.repair = self.emission_guard
             try:
                 self._stream(h, resp, st)
             finally:
@@ -1528,6 +1644,8 @@ class Bridge:
         self._count(st.usage or None)
         self._scan(parts)
         self._end_call(h, usage_of(st.usage)["output_tokens"] or seen // 120, errored or "ok")
+        self._returned(st.thoughts)   # counted before the stream's end reaches the client (forward adds the rest)
+        st.thoughts = 0
         h._write(b"0\r\n\r\n")
 
 
