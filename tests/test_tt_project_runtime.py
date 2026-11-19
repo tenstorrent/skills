@@ -33671,9 +33671,10 @@ def _other_project(tmp_path, name, host="testhost"):
     return db
 
 
-def test_the_global_daily_total_sums_this_machines_projects_on_the_same_account(env, tmp_path):
+def test_the_global_daily_total_sums_this_machines_projects_on_the_same_account(env, tmp_path, monkeypatch):
     p = make(env)
     from ttp import globalcap as gcap
+    monkeypatch.setattr(gcap, "OTHER_SOURCES", [])   # the env fixture's daemon import registers localspend's source
     now = time.time()
     start, end = now - 3600, now + 3600
     p.db.spend("claude", 1.0, "task:1", account="acct-a")

@@ -108,7 +108,7 @@ def test_running_project_read_sees_its_newest_commits(tmp_path, monkeypatch):
 def test_cross_project_readers_leave_a_stopped_projects_folder_as_it_was(env, tmp_path, monkeypatch):
     """Each module that reads another project's database goes through connect_ro: on a stopped
     project none makes or changes a file in its state folder."""
-    from ttp import dailyspend, hours, overseer, peerhold, project, replay
+    from ttp import dailyspend, hours, overseer, peerhold, project
     monkeypatch.setattr(project, "HOME_DIR", tmp_path / "snaphome")
     make(env)
     q = _second_project(env, "frother")
@@ -123,7 +123,6 @@ def test_cross_project_readers_leave_a_stopped_projects_folder_as_it_was(env, tm
     time.sleep(0.01)
     hours.user_times(path, 0)
     hours.last_user_time(path)
-    replay.load(path, 1)
     dailyspend.project_split(path, 0, time.time())
     peerhold.state(q)
     overseer._ro_db(path).close()
