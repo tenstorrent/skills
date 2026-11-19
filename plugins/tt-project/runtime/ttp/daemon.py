@@ -8633,6 +8633,10 @@ class Daemon:
         if waiting and not refusal and (refusal := ownwait.own_landing_wait(task, result, self.cfg, bool(jobs))):
             if landed.check(self.p, self.p.root, tid=task["id"], fetch=False)[0] == 0:
                 refusal = ""   # already on the push branch: its wait passes at once
+            elif probe := ownwait.own_push_probe(self.p, task["id"]):
+                refusal = ""   # its own detached push is under way: wait on that push's outcome
+                if chaincap.waits_landing(result.get("retry_when"), task["id"]):
+                    result = {**result, "retry_when": probe}
         both = on_pass_both_warning(result) if waiting else ""
         if both:
             log(self.p, f"task {r['task']} hand-off: {both}")

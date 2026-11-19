@@ -680,7 +680,8 @@ def test_the_daemon_logs_its_spawns_per_window_by_step_and_program(env, monkeypa
     from ttp import daemon as dmod, gitmemo, stepclock
     p = make(env)
     d = dmod.Daemon(p.base)
-    t0 = d._spawn_logged
+    # A test clock: with the host's monotonic time, (t0 + 600) - t0 can round to just under 600.
+    t0 = d._spawn_logged = 1000.0
     assert d._log_spawns(t0 + 10) is None
     monkeypatch.setattr(stepclock, "spawns", lambda: {("reap_runs", "ps"): 30, ("dispatch", "git"): 20,
                                                       ("reap_runs", "git"): 10})

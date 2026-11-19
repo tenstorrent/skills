@@ -95,3 +95,40 @@ def test_the_daemon_refuses_a_code_hand_off_that_waits_on_its_own_landing(env, t
     other = p.db.add_task("other", "s", kind="code", tier="standard", origin="user")
     t = _reply_wait_hand_off(p, d, tmp_path, other, waiting_for="task landing", retry_when=f"ttp landed --task {tid}")
     assert json.loads(t["result"])["status"] == "waiting"
+
+
+def test_a_code_task_waiting_on_its_own_detached_push_waits_on_that_push(env, tmp_path):
+    # Review #8943's note: `ttp push --detach`, then a wait on its own landing, was refused while that push ran.
+    from ttp import ownwait
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    tid = p.db.add_task("feature", "s", kind="code", tier="standard", origin="user")
+    other = p.db.add_task("other", "s", kind="code", tier="standard", origin="user")
+    pushes = p.state / "pushes"
+    pushes.mkdir(parents=True, exist_ok=True)
+    (pushes / f"t{other}-1-1.json").write_text(json.dumps({"task": str(other), "status": "queued"}))
+    assert ownwait.own_push_probe(p, tid) == ""
+    t = _reply_wait_hand_off(p, d, tmp_path, tid, waiting_for="my own landing", retry_when=f"ttp landed --task {tid}")
+    assert json.loads(t["result"])["status"] == "failed"   # another task's push does not count
+    marker = pushes / f"t{tid}-2-1.json"
+    marker.write_text(json.dumps({"task": str(tid), "status": "queued"}))
+    probe = ownwait.own_push_probe(p, tid)
+    assert "push --result" in probe and marker.name in probe, probe
+    t = _reply_wait_hand_off(p, d, tmp_path, tid, waiting_for="my own landing", retry_when=f"ttp landed --task {tid}")
+    res = json.loads(t["result"])
+    assert res["status"] == "waiting" and res["retry_when"] == probe, res
+    marker.write_text(json.dumps({"task": str(tid), "status": "pushed"}))   # done: no longer under way
+    assert ownwait.own_push_probe(p, tid) == ""
+
+
+def test_a_code_task_already_landed_may_wait_on_its_own_landing(env, tmp_path, monkeypatch):
+    from ttp import landed
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    tid = p.db.add_task("feature", "s", kind="code", tier="standard", origin="user")
+    monkeypatch.setattr(landed, "check", lambda *a, **k: (0, "landed"))
+    t = _reply_wait_hand_off(p, d, tmp_path, tid, waiting_for="my own landing", retry_when=f"ttp landed --task {tid}")
+    res = json.loads(t["result"])
+    assert res["status"] == "waiting" and res["retry_when"] == f"ttp landed --task {tid}", res

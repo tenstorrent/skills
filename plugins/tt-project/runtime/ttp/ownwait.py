@@ -10,11 +10,14 @@ settle itself.
 - own_landing_wait: a code task's waiting hand-off whose own wait is its own landing (`landed:#<id>`
   or `ttp landed --task <id>` of itself) can never end by itself: nothing lands the task before it
   finishes, because its review queues only then. The daemon refuses it (Daemon._finish_worker) with
-  the way out: land with `ttp push` when delivery.code_tasks_may_push is on, else finish.
+  the way out: land with `ttp push` when delivery.code_tasks_may_push is on, else finish. While the
+  task's own `ttp push --detach` is still running or queued, its wait is taken on that push instead
+  (own_push_probe): the landing it waits for is under way.
 """
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 from .chaincap import waits_landing
 from .project import code_tasks_may_push
@@ -61,3 +64,12 @@ def own_landing_wait(task: dict, result: dict, cfg: dict, job_in_flight: bool = 
     return (f"hand-off refused: it waits on its own landing (task #{task['id']}), which cannot happen before it "
             f"finishes: the review that lands a change queues only once the task ends, so the wait never ends. "
             f"Instead {way}.")
+
+
+def own_push_probe(p, task_id: int) -> str:
+    """The `ttp push --result` probe of task `task_id`'s newest detached push still running or queued,
+    '' with none: a code task that ran `ttp push --detach` and then waits on its own landing waits on
+    that push, which ends (pushed or not) by itself."""
+    from . import push
+    mine = [m for m in push.running(p) if str(m.get("task") or "") == str(task_id)]
+    return push.result_probe(Path(mine[-1]["marker"]), p) if mine else ""
