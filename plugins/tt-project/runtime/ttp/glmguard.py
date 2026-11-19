@@ -53,6 +53,10 @@ SUBS_ALLOWED = frozenset({
     "clip", "hours", "alive", "landed", "lock", "detach", "eta", "list", "find", "overview", "said", "runs", "task",
     "paths", "note", "advise"})   # advise: refused unless the run's glmassist switches are on
 TASK_ACTIONS = frozenset({"show", "list"})
+# every other `ttp task` action (cli.py's choices): a write, refused wherever it sits among the words, since
+# the project name is optional and an option's value may stand before it
+TASK_WRITES = frozenset({"add", "cancel", "requeue", "restart", "set-when", "superseded", "abandon",
+                         "adopt-branch", "rejudge", "relink-fix"})
 # `ttp note` flags that send a note on, or change a record beyond the run's own log: refused on the GLM arm.
 NOTE_ROUTES = ("--to", "--reply", "--urgent", "--severity", "--confirms", "--status")
 GH_READS = frozenset({"view", "list", "diff", "status", "checks"})
@@ -274,7 +278,10 @@ def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None) -> str | None
     plain, _ = hook._split(REDIRECT.sub(" ", cmd))   # `ttp checks 2>&1`: the 2 is no word of the call
     for seg in hook._all_segments(plain) + hook._segments(plain, strip=False):
         words = _ttp_args(seg, project)
-        act = words[2:3] if words and words[0] == "task" else (words or [])[1:2]   # `ttp task <project> <action>`
+        act = (words or [])[1:2]
+        if words and words[0] == "task":   # `ttp task [<project>] <action>`: a write anywhere wins
+            acts = [w for w in words[1:] if w in TASK_WRITES or w in TASK_ACTIONS]
+            act = [next((w for w in acts if w in TASK_WRITES), acts[0] if acts else "")]
         if words and (why := cli_refusal(words[0], act[0] if act else "", [w for w in seg if w.startswith("--")])):
             return why
     for seg in segs:
