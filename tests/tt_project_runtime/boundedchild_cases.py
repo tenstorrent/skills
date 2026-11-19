@@ -192,7 +192,7 @@ OWN_SESSION_ALLOWED = {
     "runner.py::_start_watchdog": "the watchdog that ends the agent's group when the runner dies",
     "runner.py::supervise": "the agent process, owned and stopped by its runner",
     "sandbox_init.py::main": "the sandbox's init puts its command in a session of its own",
-    "schedrun.py::_run_group": "daemon schedules: schedrun.run_group owns and kills its groups",
+    "schedrun.py::run_group": "daemon schedules: schedrun.run_group owns and kills its groups",
     "service.py::_spawn": "starts the daemon service, meant to outlive the command",
     "service.py::take_restart_request": "the service restart helper, meant to outlive the daemon",
     "upstream.py::spawn_fallback": "background notes forwarder, meant to outlive the caller",
