@@ -39,13 +39,15 @@ launch paths and test discovery together; rerun affected serving checks and meas
 A dependency upgrade is not a passed gate. Do not restart completed goals or overwrite their
 historical results just to migrate serving.
 
-Register the new adapter using the pinned plugin's supported extension mechanism. Read its
-current registration docs/source first. The standalone plugin currently supports
+Register the new adapter using the pinned plugin's supported extension mechanism. Read the
+pinned revision's registration source first (its platform module) and record which mechanism it
+offers; the set is revision-dependent. Recent revisions offer
 `TT_MODEL_CLASS_OVERRIDES="TT<Arch>=models.autoports.<model>.tt.generator_vllm:<Class>"`
 for a per-launch selection, or `EXTRA_MODELS_DIR` bundles containing `vllm_metadata.json`
-with `arch` and `main_class`. A built-in registration in the plugin source is a plugin change.
-Verify the resolved registry target is the new autoport adapter, especially when the
-architecture already has a built-in implementation. Record the registration and propagate it
-to every engine subprocess. Model implementation belongs in TT-Metal, not in the plugin or
+with `arch` and `main_class`; some pins have only the bundle. A built-in registration in the
+plugin source is a plugin change. Verify the resolved registry target is the new autoport
+adapter in the API server and in every engine subprocess, especially when the architecture
+already has a built-in implementation. Record the registration and propagate it to every
+engine subprocess. Model implementation belongs in TT-Metal, not in the plugin or
 upstream vLLM core. Changes to the plugin or vLLM checkouts follow
 [plugin changes](plugin-changes.md).

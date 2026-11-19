@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from readiness_check.generate import (
+    _chat_or_plain_prompt_tokens,
     _generation_stop_ids,
     _normal_token_ids,
     _resolve_prompt_text,
@@ -90,3 +91,18 @@ def test_resolve_prompt_text_requires_source_specific_argument(tmp_path):
             aime24_prompts_file=tmp_path / "aime.json",
             aime24_prompt_index=0,
         )
+
+
+class _Encoding(dict):
+    @property
+    def input_ids(self):
+        return self["input_ids"]
+
+
+@pytest.mark.parametrize(
+    "rendered",
+    [[5, 6, 7], _Encoding(input_ids=[5, 6, 7], attention_mask=[1, 1, 1]), [[5, 6, 7]]],
+)
+def test_chat_template_tokens_accept_list_and_batch_encoding_returns(rendered):
+    tokenizer = SimpleNamespace(apply_chat_template=lambda *_args, **_kwargs: rendered)
+    assert _chat_or_plain_prompt_tokens(tokenizer, "hi", chat_template=True) == [5, 6, 7]

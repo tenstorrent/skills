@@ -58,7 +58,7 @@ If `next_input is None`, the generator feeds its own prediction back
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, List, Optional, Sequence
 
 import torch
 
@@ -116,6 +116,7 @@ class Generator(ABC):
         page_table: torch.Tensor,
         kv_cache: Any,
         prompt_lens: List[int],
+        start_pos: Optional[torch.Tensor] = None,
         return_all_logits: bool = False,
         **kwargs: Any,
     ) -> torch.Tensor:
@@ -134,7 +135,19 @@ class Generator(ABC):
         - Accept `kv_cache` as the list-of-lists of TT tensors allocated
           by the caller (one ``[K, V]`` pair per decoder layer).
         - Accept `prompt_lens` as the **real** (unpadded) prompt length
-          per user.
+          per user. Under vLLM, `prompt_lens[i]` is the absolute end of the
+          chunk scheduled for row ``i``, not the chunk length.
+        - Accept `start_pos` as ``[batch]`` absolute start positions, or
+          ``None`` meaning position 0 for every row. Row ``i`` computes
+          ``tokens[i, start_pos[i]:prompt_lens[i]]``, writes K/V at those
+          absolute positions, and uses absolute RoPE positions. Prefix-cache
+          hits, chunked continuations, and preemption resumes all arrive as
+          nonzero `start_pos`. An implementation without continuation support
+          must raise ``NotImplementedError`` for any nonzero `start_pos`
+          instead of ignoring it.
+        - Accept more than one row per call. A prefill step can carry every
+          request the scheduler admitted, each with its own `start_pos` and
+          `prompt_lens` entry.
         - Accept `return_all_logits` to optionally return logits at all
           positions instead of just the last (for batch prefill readiness checks).
         - Return logits at the final prompt position with shape
@@ -188,6 +201,34 @@ class Generator(ABC):
         readiness code must not invent placeholder cache tensors or page tables
         for the low-level ``prefill_forward`` API.
         """
+
+    def prefill_logits_continuation(
+        self,
+        prompt_token_ids: List[int],
+        start: int,
+        *,
+        positions: Optional[Sequence[int]] = None,
+        prefill_prefix: bool = True,
+    ) -> torch.Tensor:
+        """
+        High-level resumed-prefill driver used by the prefill resume check.
+
+        Reset the generator-owned cache and page table. When `prefill_prefix`
+        is true, prefill ``prompt_token_ids[:start]`` as a fresh request, then
+        prefill ``prompt_token_ids[start:]`` as a continuation of the same
+        request with absolute start position `start` over the same cache and
+        page table. Return logits for the absolute positions in `positions`
+        (default: every position from `start` to the end) with shape
+        ``[1, len(positions), vocab]``.
+
+        ``start=0`` is the full-prefill reference. ``prefill_prefix=False``
+        skips the prefix prefill so the continuation runs over an empty cache;
+        the resume check uses it as a negative control that must fail.
+
+        The default raises ``NotImplementedError``; the resume check then
+        reports the generator as not supporting resumed prefill.
+        """
+        raise NotImplementedError("prefill_logits_continuation is not implemented for this generator")
 
     @abstractmethod
     def generate(

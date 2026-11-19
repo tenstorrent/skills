@@ -17,6 +17,7 @@ Goal completion requirements:
 - Before token-out sampling, compare both common samplers, choose the best fit, and record the rejected alternative. Write custom sampler code only if neither common path fits.
 - Decode satisfies the $full-model/$tt-enable-tracing split-sampling contract. Greedy decode stays on device with no host argmax, full-logits readback, untraced sampling, or Python token-feedback loop.
 - Greedy split-sampling comparison must be semantically greedy. If split greedy fails on shape/layout/tiling, fix that contract or leave the stage incomplete with a minimal repro.
+- Resumed-prefill check passes and serving_contract.json records prefix caching per $full-model.
 - Trace evidence proves token feedback, position coherence, and changed/unchanged page-table handling with no per-token host rebuilds.
 - Top of README.md reports full-model TTFT and trace-verified batch-1 decode t/s/u, separating teacher-forcing and token-out decode when they differ.
 - Runtime fallback audit covers model/generator paths, cache ownership, host-logit boundaries, sampling, and reset behavior.
