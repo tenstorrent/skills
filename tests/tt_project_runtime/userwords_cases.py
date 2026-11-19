@@ -234,7 +234,7 @@ def _stopped_foreign_project(env, monkeypatch, last_good: str):
     return q, said
 
 
-def _tree(folder):
+def _file_stamps(folder):
     """Every path under `folder` with its size and mtime: any file made or changed there shows."""
     return {str(f.relative_to(folder)): (f.stat().st_size, f.stat().st_mtime_ns)
             for f in sorted(folder.rglob("*"))}
@@ -248,7 +248,7 @@ def test_reading_another_projects_words_creates_or_changes_no_file_in_its_folder
     p = make(env)
     for last_good in ("stale", "none"):
         q, said = _stopped_foreign_project(env, monkeypatch, last_good)
-        before = _tree(q.base)
+        before = _file_stamps(q.base)
         for where in ("here", "outside"):
             if where == "here":
                 monkeypatch.setenv("TTP_PROJECT", str(p.base))
@@ -262,7 +262,7 @@ def test_reading_another_projects_words_creates_or_changes_no_file_in_its_folder
                 assert f"otherproj msg #{said} " in out and "freeze is lifted" in out, (where, flags, out)
             words = cli._hold_words(q)
             assert words and words[0].startswith(f"otherproj msg #{said} "), words
-            assert _tree(q.base) == before, (last_good, where)
+            assert _file_stamps(q.base) == before, (last_good, where)
         shutil.rmtree(q.root)
         from ttp.project import unregister
         unregister("otherproj")
