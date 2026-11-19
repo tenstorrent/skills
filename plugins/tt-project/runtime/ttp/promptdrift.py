@@ -6,7 +6,7 @@ than the template (coordinator.prompt_drift_ratio, default 1.5; 0: off), lacks a
 template has, or still has a section the template dropped. `line` feeds `ttp doctor` and the daily
 review; `check` (daemon tick) queues one low event to the project's own coordinator per changed copy,
 suggesting it merge its copy toward the template. The harness never edits a project's prompts: each
-coordinator owns its own (user msg #1653)."""
+coordinator owns its own."""
 from __future__ import annotations
 
 import hashlib

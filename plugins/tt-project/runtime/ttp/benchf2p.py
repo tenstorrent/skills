@@ -1,4 +1,4 @@
-"""Fail-to-pass test writing and selection (bench v2, user msg #3111 c).
+"""Fail-to-pass test writing and selection.
 
 A model that has seen no arm's diff writes tests from the task's spec: the writer prompt asks
 for one test per acceptance criterion. A written test is kept only when it fails on the

@@ -473,7 +473,7 @@ def test_the_daily_review_reports_the_wake_gate(env):
 
 # Deferred device tasks (coordinator.lull_note): a broker serializes device jobs, so a deferral that
 # waits for a lull, an ack or a pause to end gets advice on its result note, never a rejection.
-# User msg #1571: a reset, reboot or power cycle of a held box runs when needed, never after a lull.
+# A reset, reboot or power cycle of a held box runs when needed, never after a lull.
 def test_the_coordinator_prompt_enqueues_device_jobs_now_and_endorses_no_lull_for_reboots():
     rule = " ".join((RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text().split())
     assert "Device jobs: enqueue now; reset, reboot, power-cycle held boxes as needed." in rule
@@ -493,7 +493,7 @@ def test_a_deferred_device_task_waiting_for_a_lull_or_ack_gets_the_enqueue_now_a
     assert t["not_before"]   # applied as usual
     note = next(n for n in p.db.kv(coord.NOTES_KEY) if n.startswith(f"task_add: #{t['id']} deferred"))
     assert "device jobs behind a broker are enqueued now" in note and "no reason to wait" in note
-    assert "lull is only for" not in note and not re.search(r"reboot|power cycle|restart", note), note   # user msg #1571
+    assert "lull is only for" not in note and not re.search(r"reboot|power cycle|restart", note), note
     # The same deferral set by task_update advises too.
     tid = p.db.add_task("run the bench", "Bench it.", kind="work", labels=["resource:board-device"])
     assert coord.apply(p, [{"type": "task_update", "id": tid, "start_after": "3h", "why": why}]) == []

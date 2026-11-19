@@ -41,9 +41,9 @@ BEAT_EVERY_S = 30   # how often a keeper touches BEAT while it holds
 LABEL = "detached jobs"
 WHOLE_RUN = "whole run"
 
-# Every hold label is built by label() and read by parse(): a `ttp lock` command's "task #7 (run 3)",
-# a run supervisor's "task #7 (run 3), whole run" and a keeper's "task #7 (run 3), detached jobs". On a
-# shared resource the holder names the project first (shared.holder): "demo task #7 (run 3)".
+# Every hold label is built by label() and read by parse(): a `ttp lock` command's "task #N (run 3)",
+# a run supervisor's "task #N (run 3), whole run" and a keeper's "(run 3), detached jobs". On a
+# shared resource the holder names the project first (shared.holder): "demo task #N (run 3)".
 _LABEL_RE = re.compile(r"(?P<holder>(?:(?P<project>[A-Za-z0-9][A-Za-z0-9._-]*) )?task #(?P<task>\d+))"
                        rf" \(run (?P<run>[^()]*)\)(?:, (?P<kind>{WHOLE_RUN}|{LABEL}))?")
 

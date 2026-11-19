@@ -1,4 +1,4 @@
-"""The spec a worker reads, with a long tail of appended `## Update` blocks folded (user msg #2271).
+"""The spec a worker reads, with a long tail of appended `## Update` blocks folded.
 
 A task_update appends its text after a `## Update` line, so a task steered many times carries every
 update whole into each run's first call. Past SPEC_FOLD_CHARS and SPEC_FOLD_KEEP updates, the worker's

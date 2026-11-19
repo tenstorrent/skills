@@ -180,7 +180,7 @@ def test_a_push_queue_project_narrows_a_wide_modules_module_level_and_checks_fun
      ["tests/r/bar_cases.py"]),
 ])
 def test_a_push_queue_project_runs_only_what_a_whole_suite_change_reaches(tmp_path, rel, text, reason, extra):
-    """User msg #2220: with the push queue on, a task's checks never run the whole suite; a conftest, shared
+    """With the push queue on, a task's checks never run the whole suite; a conftest, shared
     helper, runner, manifest, config or module-level change widens only to the units importing or naming it
     (or naming a function or fixture it changes), and the push train runs the rest. Without the push queue
     the same change still runs in full."""
@@ -198,7 +198,7 @@ def test_a_push_queue_project_runs_only_what_a_whole_suite_change_reaches(tmp_pa
 
 def test_a_tasks_ttp_checks_full_is_refused_with_the_push_queue_on_unless_the_user_allows_it(env, tmp_path,
                                                                                            monkeypatch, capsys):
-    """User msg #2220: the push train is the only full run; `ttp checks --full` from a task or review is
+    """The push train is the only full run; `ttp checks --full` from a task or review is
     refused with one line, unless the user set delivery.checks_task_full; the push queue off keeps it."""
     from ttp import cli, testpick
     assert testpick.full_refusal(None) == "" and testpick.full_refusal({"delivery": {"push_queue": False}}) == ""
@@ -552,7 +552,7 @@ def test_only_a_tasks_ttp_checks_narrows_so_every_push_batch_runs_the_full_suite
 
 def test_a_tasks_ttp_checks_runs_delivery_task_checks_while_the_push_train_keeps_the_push_checks(env, tmp_path,
                                                                                                monkeypatch):
-    """#7854 (user msg #2407): a task's own `ttp checks` runs the project's quick per-task set,
+    """#7854: a task's own `ttp checks` runs the project's quick per-task set,
     delivery.task_checks, else the push checks (the smoke set gating a landing); a release run and the
     push train keep the push checks, so nothing lands without them."""
     from ttp import cli, project, push, testpick

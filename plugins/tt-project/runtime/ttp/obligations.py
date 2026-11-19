@@ -142,7 +142,7 @@ def spec_check(db, text: str, tid: int | None = None, attaching=(), adopt: bool 
     """For a coordinator task_add (`tid` None) or task_update spec: the open obligations it names that a new
     task is to be attached to. Raises ValueError for a key that does not exist, or one an updated task does
     not own and no `(key, tid)` in `attaching` (the same batch's obligation actions) attaches; with `adopt`,
-    returns those instead, for the caller to attach (user msg #2116: the meaning is clear)."""
+    returns those instead, for the caller to attach (the meaning is clear)."""
     st, attach, unknown, unowned = _load(db), [], [], []
     for oid in named(text):
         o = st["items"].get(oid)
@@ -2004,7 +2004,7 @@ def _when(value, what: str, p=None) -> float:
 def _home_time(value, p):
     """A due given without a zone (an ISO date and time, or a bare clock time such as '18:05') read in
     project `p`'s home zone, as the coordinator prompt says a time it sets without one is: a mechanical
-    fill from the project's settings (task #8429). A clock time is its next one there. Any other value,
+    fill from the project's settings. A clock time is its next one there. Any other value,
     a date alone among them, comes back unchanged for _due to judge."""
     if p is None or not isinstance(value, str):
         return value
@@ -2032,7 +2032,7 @@ def _hours(p) -> float:
 
 class DueNote(ValueError):
     """A due move that changes nothing owed (the obligation is closed, or has no due to move): the
-    coordinator records it as a note, never a rejection (user msg #2116); the CLI still refuses it."""
+    coordinator records it as a note, never a rejection; the CLI still refuses it."""
 
 
 def fit_owners(db, tids, cls: str | None, owned=()) -> tuple[list[int], list[str]]:

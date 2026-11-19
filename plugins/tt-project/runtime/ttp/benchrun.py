@@ -669,7 +669,7 @@ def hard_flags(flags: list[str]) -> list[str]:
 
 
 def saw_change(output: str, task: dict, secret: dict | None, own: str = "") -> list[str]:
-    """Evidence that the cell's tools showed it the landed change or later history (user msg #3538): `output`
+    """Evidence that the cell's tools showed it the landed change or later history: `output`
     (what they printed, failed lookups' error lines taken out) names the task's landed commit or a later one
     (task `later`; 7+ hex characters), or holds lines only the original change has (secret_lines, at the
     quote threshold) that the agent did not write itself (`own`). [] when it saw none."""
@@ -694,8 +694,7 @@ def audit(transcript: str, task: dict, hidden: list[Path], secret: dict | None =
     `session` folders aside), its tools' output shows the landed change or later history (saw_change), or
     what the agent wrote (agent_text) or the candidate's diff shows lines only the held-out tests have
     (secret_lines; bench.QUOTE_LINES of them, or all when fewer: a note). A history or forge lookup the agent
-    ran (CHEAT) is flagged only beside such evidence; otherwise it is a note, `probed, nothing found: <cmd>`
-    (user msg #3538). Only commands the agent ran count (decision #3128): a workspace file it read or an
+    ran (CHEAT) is flagged only beside such evidence; otherwise it is a note, `probed, nothing found: <cmd>`. Only commands the agent ran count (decision #3128): a workspace file it read or an
     `env` it printed is never its own call. `outputs`: what the tools printed when the transcript holds only
     the agent's calls (a mini-swe-agent trajectory); else read from the transcript. [] when clean."""
     inputs = agent_text(transcript, messages=False)   # what its tool calls asked for, never what they printed
@@ -1386,7 +1385,7 @@ def _finish(row: dict, bench_dir: Path, task: dict, ws: Path, run: Path, keep: P
     diff = gitmemo.run(["git", "-C", str(ws), "diff", "--cached", start], capture_output=True, timeout=None).stdout
     row["diff_sha256"] = _sha(diff)
     if ended.get("stopped") in ("timeout", "stalled"):
-        # The wall-time hang guard ended the agent (user msg #2898: the limit is only a hang guard). The
+        # The wall-time hang guard ended the agent (the limit is only a hang guard). The
         # cell still grades what the agent committed, so it scores as the held-out tests say; the row
         # names the guard so a reader sees the cell was cut short.
         row["hang_guard"] = ended["stopped"]

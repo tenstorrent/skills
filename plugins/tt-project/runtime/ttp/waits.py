@@ -151,7 +151,7 @@ def wait_kind(task: dict, open_asks: list[dict], now: float | None = None, where
     elif kind in ("resource", "time") and detail:
         text = f"waits on {_clip(detail)}"
     elif kind == "user" and (mine := [a for a in linked if a.get("text")]):
-        from .pendingask import full   # the ask in full, never clipped to its id (user msg #2424)
+        from .pendingask import full   # the ask in full, never clipped to its id
         text = f"waits on {_WHO[kind]}: " + "; ".join(full(a) for a in mine)
     else:
         text = f"waits on {_WHO[kind]}" + (f": {_clip(detail)}" if detail else "")

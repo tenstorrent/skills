@@ -1272,7 +1272,7 @@ def test_a_cut_off_key_block_is_masked_to_the_end_of_its_string_and_two_in_a_lin
 
 
 def test_lone_marker_lines_and_a_block_trimmed_at_its_start_are_masked(env, monkeypatch):
-    """Regression (user msg #1904): a transcript that held only the BEGIN and END lines of a key, with no
+    """Regression: a transcript that held only the BEGIN and END lines of a key, with no
     body between them, and a block whose start output trimming cut off."""
     from ttp import project, redact
     monkeypatch.setattr(project, "HOME_DIR", env["tmp"] / "empty-home")
@@ -1331,7 +1331,7 @@ def test_scrub_run_masks_private_keys_with_no_stored_secret_and_keeps_jsonl_vali
 
 
 def test_a_run_that_prints_a_private_key_keeps_it_out_of_every_copy(env, monkeypatch):
-    """Regression (user msg #1901): a worker that prints a key file into its transcript leaves the key in no
+    """Regression: a worker that prints a key file into its transcript leaves the key in no
     stored or shown copy: run files, hand-off, database rows, outbox, the web app's run and state views."""
     p = make(env)
     from ttp import outbox, project
@@ -1544,7 +1544,7 @@ class _TrackedRead:
 
 
 def test_ending_a_run_with_a_large_output_file_reads_it_capped_and_a_detached_job_masks_its_key(env, monkeypatch):
-    """User msg #1918: the daemon's run-end masking (reap_runs, finish_run) reads each run file within a
+    """The daemon's run-end masking (reap_runs, finish_run) reads each run file within a
     fixed cap and each run within a time limit; a file over the cap is masked by a detached job, every
     line kept, and so is a big detached-job log the sweep closes (detach.close)."""
     import builtins

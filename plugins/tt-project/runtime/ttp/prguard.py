@@ -620,7 +620,7 @@ FORM_HOW = ("Rewrite the body and retry: 2-3 sentences of why on top, then what 
 
 def internal_refs(body: str) -> list[str]:
     """The internal tt-project references a PR body names, in order: run, task, review, ask and user
-    message ids (`run 250`, `task #29`, `review #45`; a bare number followed by a counted noun, as in
+    message ids (`run 250`, `task #N`, `review #45`; a bare number followed by a counted noun, as in
     `run 3 times`, is prose), obligation ids (o1084), task branches (ttp/t12-x, t8900-x), and
     paths into a project's state/ or worktrees/, read with invisible characters (zero-width, soft hyphen)
     dropped. GitHub refs (#12, owner/repo#12, URLs), shas, versions and hardware names (t3000) are not."""

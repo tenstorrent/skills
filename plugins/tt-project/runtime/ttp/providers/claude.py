@@ -78,7 +78,7 @@ BUNDLED_SKILLS = ("dataviz", "update-config", "keybindings-help", "code-review",
                   "batch", "doctor", "run-skill-generator", "plugin-authoring",
                   *(f"anthropic-skills:{name}" for name in ("docs", "docx", "google-workspace", "import-memory",
                                                             "morning", "pdf", "pptx", "skill-creator", "xlsx")))
-# A CLI flag that limits the built-in tools. Workers and reviewers no longer get it (user msg #2302):
+# A CLI flag that limits the built-in tools. Workers and reviewers no longer get it:
 # they run on Claude Code's full standard tool set, Agent included, so they can start subagents. The
 # harness's rules hold through ttp.hook's PreToolUse on every tool (subagents' calls included: their
 # payload carries `agent_id`, checked live, CLI 2.1.296) and through permission rules, never by
@@ -114,7 +114,7 @@ def _prompt_row(row: dict) -> bool:
 
 def _tail(rows: list[dict], cap: int) -> list[dict]:
     """The session's last turns, at most about `cap` tokens (4 characters each), opening on a user turn:
-    the copy a run on another model starts from (ctxfork, task #8308). Its start moves only in steps
+    the copy a run on another model starts from. Its start moves only in steps
     of half the cap as the session grows, so every fork between two steps sends the same history and
     reads the one cache entry the first wrote. The last turn alone when it is longer than the cap."""
     sizes = [len(json.dumps(r["message"])) // 4 if "message" in r else 0 for r in rows]

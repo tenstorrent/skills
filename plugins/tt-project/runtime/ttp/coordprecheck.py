@@ -31,7 +31,7 @@ import os
 import time
 from pathlib import Path
 
-MAX_DENIALS = 1   # denied answers per run; past it every answer goes through (task #8429)
+MAX_DENIALS = 1   # denied answers per run; past it every answer goes through
 STATE_FILE = "answer-precheck.json"   # in the run dir: {"denials": n, "seen": [action hashes], "caught": [reasons]}
 SWITCH = "answer_precheck"   # coordinator.<SWITCH>: false turns the check off
 REQUEUE = ("queued", "blocked", "cancelled", "done")   # the statuses a task_update sets (coord.apply)

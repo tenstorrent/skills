@@ -247,7 +247,7 @@ def budget_line(db: DB, now: float | None = None, core: str = "claude", gate: di
 
 def other_plans(db: DB, shown: str, now: float, credit: list[str]) -> list[str]:
     """Every other provider on plan windows, with its windows' share used: 'codex plan 5h 4%, 7d 21%'
-    (user msg #140: a prepaid plan's windows are the usage that counts, not its virtual dollars). A
+    (a prepaid plan's windows are the usage that counts, not its virtual dollars). A
     provider credit_parts already named is left out."""
     out, by = [], {}
     for w in bud.plan_windows(db, now):

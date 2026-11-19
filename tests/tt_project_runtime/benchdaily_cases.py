@@ -705,7 +705,7 @@ def test_daily_table_marks_arms_that_ran_other_tasks_or_another_limit_not_compar
 
 def test_daily_a_cheat_flagged_cell_is_never_landed_and_is_listed_apart(tmp_path):
     """A cell with outcome 'flagged' counts as not landed in the day's record and in the running table, even in a
-    day file written before landed() knew it, and the table lists it under its own heading (user msg #3107)."""
+    day file written before landed() knew it, and the table lists it under its own heading."""
     from ttp import benchdaily
     assert not benchdaily.landed({"scores": {"criteria": 4, "correctness": 4}}, {"outcome": "flagged"})
     assert benchdaily.landed({"scores": {"criteria": 4, "correctness": 4}}, {"outcome": "done"})

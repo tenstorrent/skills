@@ -3,8 +3,8 @@
 """Where a charter Restrictions item came from, and whether it binds.
 
 The rule, one line per item (a bullet with its continuation lines, or a paragraph):
-- sourced: its text cites a user message id ("user msg #12", "user messages #3, #4", "user #5/#6"), or the
-  owner's own agent's message in agent mode ("(relayer-ordered, msg #12)", relay.agent_orders), or carries an
+- sourced: its text cites a user message id ("user msg #N", "user messages #3, #4", "user #5/#6"), or the
+  owner's own agent's message in agent mode ("the owner's order", relay.agent_orders), or carries an
   origin marker, "(origin: Brief)" or "(origin: harness gate)". The Brief is the user's own words and
   is never a Restrictions section, so everything in it is sourced by definition.
 - recorded: CHARTER.history.md (ends.CHARTER_HISTORY) logs it as added to or replaced in Restrictions in a

@@ -87,7 +87,7 @@ def test_chain_priority_ignores_unrelated_chains_and_bad_labels(env):
 
 
 def test_a_failed_review_outside_the_fix_chain_counts_toward_the_round_cap(env):
-    """Upstream user msg #2495 (2b): rounds count per change, not only along the continues chain. A
+    """Upstream (2b): rounds count per change, not only along the continues chain. A
     coordinator's review of the same change that failed earlier makes the daemon review's failure the
     second round: no fix or re-review is queued (review.auto_fix_rounds 1) and the coordinator decides.
     A failed review of another change, or one carried over with no run, does not count."""

@@ -501,7 +501,7 @@ def test_every_model_cut_off_is_an_unparsed_fallback_naming_the_cut(env):
 
 
 def test_console_calls_send_no_token_cap_and_the_bridge_sends_only_the_users(env, monkeypatch):
-    # User msg #2809: no output-token cap on console calls; they are bounded by time.
+    # No output-token cap on console calls; they are bounded by time.
     import io
     import urllib.request
     from ttp import babysit, chatbridge, modelbench

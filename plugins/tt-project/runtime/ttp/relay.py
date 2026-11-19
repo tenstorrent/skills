@@ -123,7 +123,7 @@ _HELD_RE = {
 
 def held_match(text: str, skip: tuple[str, ...] = ()) -> tuple[str, str]:
     """(the HELD class `text` (what a change lifts or permits) falls in, checked (c), (b), (a), and the
-    words that matched its rule), else ("", ""). A record cite ("user msg #12", "message #40") is no
+    words that matched its rule), else ("", ""). A record cite ("user msg #N", "message #40") is no
     message sent: it is read as blank. `skip`: classes not checked."""
     text = _RECORD.sub(" ", text or "")
     for k in ("gate", "speaks", "people"):

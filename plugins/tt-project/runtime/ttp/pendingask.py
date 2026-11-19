@@ -1,4 +1,4 @@
-"""A reminder of a pending user action quotes it in full (user msg #2424): the user should never have to
+"""A reminder of a pending user action quotes it in full: the user should never have to
 scroll back for what 'ask 297' or 'the command above' meant.
 
 `full` renders an open ask as the user reads it: its id and its stored text verbatim (the question, the

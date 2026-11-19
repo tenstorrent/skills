@@ -9,7 +9,7 @@ change the user wrote in chat is still theirs, though, and should not wait for s
 not posted by the harness), from the last MAX_AGE_S, and its verbatim words (relay.split: never a
 relayer's context) carry the setting itself, the cap's full key and that one value (`budget.weekly_usd
 400`, `budget.weekly_usd=$400`, as `ttp config` takes it; grants()). Prose about a cap ('raise the
-weekly cap to $400') grants nothing: no gate reads the meaning of the user's wording (user msg #2116),
+weekly cap to $400') grants nothing: no gate reads the meaning of the user's wording,
 so such an order goes to the coordinator, which sets the cap in a turn that carries the user's yes. A
 later recorded set of the same key by the user or the coordinator, or a later message of the user's
 giving the key another value, wins: an older message never overwrites the user's newest word. The setter is recorded as the user, with that message id. Every other user-only key

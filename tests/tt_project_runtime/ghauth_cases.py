@@ -93,7 +93,7 @@ def test_a_gh_logout_raises_one_alert_per_host_that_names_the_users_step_and_cle
         x.db.x("INSERT INTO tasks(title,kind,status,pr_url,created) VALUES('t','code','waiting',?,?)",
                ("https://github.com/acme/widgets/pull/3", time.time()))
     dp, dq = Daemon(p.base), Daemon(q.base)
-    for d in (dp, dq):   # a route that is down: unset would be the workstation queue (user msg #2679)
+    for d in (dp, dq):   # a route that is down: unset would be the workstation queue
         d.cfg.setdefault("delivery", {})["gh_route"] = "gh-box"
 
     def tick(*ds):
@@ -179,7 +179,7 @@ def _two_gh_projects(env, monkeypatch):
         x.db.x("INSERT INTO tasks(title,kind,status,pr_url,created) VALUES('t','code','waiting',?,?)",
                ("https://github.com/acme/widgets/pull/3", time.time()))
     dp, dq = Daemon(p.base), Daemon(q.base)
-    for d in (dp, dq):   # a route that is down: unset would be the workstation queue (user msg #2679)
+    for d in (dp, dq):   # a route that is down: unset would be the workstation queue
         d.cfg.setdefault("delivery", {})["gh_route"] = "gh-box"
 
     def tick(*ds):
@@ -1079,7 +1079,7 @@ def test_no_login_hint_while_gh_is_logged_out_and_a_private_repo_is_observed_onc
 
 
 def test_a_gh_logout_is_not_cleared_by_another_routes_answer_and_a_re_raise_never_reaches_chat(env, monkeypatch):
-    """The flap (user msg #2688): a logout alert cleared for a minute because the host-wide route record
+    """The flap: a logout alert cleared for a minute because the host-wide route record
     said ok (the workstation queue, or another project's route, answered), then raised again to chat.
     Only a real login or this project's own live route clears it, and a re-raise stays a status line."""
     from ttp import alerts, ghauth, ghroute

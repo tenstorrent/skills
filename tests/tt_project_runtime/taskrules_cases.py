@@ -29,7 +29,7 @@ def _rules_tasks(p):
 def test_every_worker_and_reviewer_of_a_project_gets_a_byte_identical_system_prompt(env, monkeypatch):
     """A code task with PR delivery, one without, a review, a device task, a question and a harness task
     get the same system.md for the same charter: concurrent runs share its cache. It still carries every
-    restriction verbatim; a memory change leaves it as it was (memory leads the task prompt, task #51)
+    restriction verbatim; a memory change leaves it as it was
     and a charter change changes it."""
     from ttp.prompts import charter_restrictions, worker_memory_block, worker_system
     p = _rules_project(env, monkeypatch)

@@ -317,7 +317,7 @@ def differs(spec: str, entry: dict) -> bool:
 
 
 def describe(entry: dict, where=None, now: float | None = None) -> str:
-    """'task #12 'title' was shelved today at 12:00 UTC (result: ...)'."""
+    """''title' was shelved today at 12:00 UTC (result: ...)'."""
     when = (f"today at {timefmt.short(entry['ts'], where, now if now is not None else entry['ts'])}"
             if same_day(entry, where, now) else f"on {entry['date']}")
     title = entry["title"] if len(entry["title"]) <= TITLE_CHARS else entry["title"][: TITLE_CHARS - 1] + "…"

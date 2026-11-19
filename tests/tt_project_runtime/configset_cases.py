@@ -473,7 +473,7 @@ def test_a_run_sets_a_dollar_cap_only_on_the_users_own_message_carrying_the_sett
 
 
 def test_capword_wording_alone_never_grants_a_cap_only_the_setting_itself(env):
-    """No gate reads the meaning of the user's words (user msg #2116): prose that plainly orders a cap
+    """No gate reads the meaning of the user's words: prose that plainly orders a cap
     ('raise the weekly cap to $400') grants nothing in a run; only the setting itself, the cap's full key
     with one plain value, grants it. A key inside another key, a short key name, two values, a '#' id,
     a number that runs on (400,000, 400k, 400.5.1) and an outbound copy are refused."""

@@ -473,7 +473,7 @@ def test_a_change_or_device_order_is_never_owned_by_a_question_plan_or_review_ta
     note = ob.add_order(p, "change it", mid, [kinds["code"], tid], action_class="change")
     oid = note.split()[1]
     # A later attach through the coordinator's action, and a task_add whose spec names the order.
-    # The coordinator leaves the unfit owner out with a note, never rejecting the action (user msg #2116).
+    # The coordinator leaves the unfit owner out with a note, never rejecting the action.
     assert coord.apply(p, [{"type": "obligation", "key": oid, "owners": [kinds["plan"]]}]) == []
     assert "is a plan task, which cannot carry a change order" in " ".join(p.db.kv(coord.NOTES_KEY) or [])
     assert str(kinds["plan"]) not in ob.get(p.db, oid)["owners"]
@@ -1121,7 +1121,7 @@ def test_obligation_actions_that_change_nothing_owed_are_notes_and_kept_gates_st
 
 
 def test_a_worker_receipt_closes_only_its_own_part_and_reopen_undoes_a_mistaken_receipt(env, monkeypatch):
-    """Worker #297 filed a receipt for the before numbers alone and closed the user's whole order (msg #329):
+    """Worker #297 filed a receipt for the before numbers alone and closed the user's whole order:
     a worker's receipt delivers its own task's part; the order stays owed while another open owner has
     none. An ended owner's part was carried on by a later owner. `reopen` undoes a receipt."""
     from ttp import obligations as ob

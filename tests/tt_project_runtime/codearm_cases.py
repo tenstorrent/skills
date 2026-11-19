@@ -393,7 +393,7 @@ def _gg_env(env, monkeypatch, tmp_path):
 
 
 def test_a_glm_runs_plain_note_goes_only_to_its_own_task_log(env, monkeypatch, tmp_path):
-    """cells: glm_note_plain, glm_note_log_only (user msg #3512: ttp note goes only to the task's own log)."""
+    """cells: glm_note_plain, glm_note_log_only (ttp note goes only to the task's own log)."""
     from ttp import cli, glmguard, upstream
     p, wt, rd = _gg_env(env, monkeypatch, tmp_path)
     before = p.db.one("SELECT COUNT(*) n FROM messages")["n"]

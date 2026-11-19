@@ -8986,7 +8986,7 @@ def _fake_mac(monkeypatch, tmp_path, idle, mem, load, cores=14):
 
 
 def test_a_mac_load_of_40_with_two_thirds_of_its_cpu_idle_and_free_memory_holds_nothing(env, tmp_path, monkeypatch):
-    """Owner's agent msg #164: a Mac whose load average reads 40 on 14 cores (threads blocked on I/O) while
+    """A Mac whose load average reads 40 on 14 cores (threads blocked on I/O) while
     67% of its CPU sits idle and 45% of its memory is free paces on the measured CPU and memory: the load
     guard, the checks host watch, extra check slots and the daily review's worker slots hold nothing."""
     from ttp import checkcap, hostcpu, hostload, testslots, throughput
@@ -13111,7 +13111,7 @@ def test_a_push_batch_waiter_shows_as_push_batch_id_in_the_wait_event_and_slot_s
     monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "2")
     monkeypatch.setenv(checkcap.PRIORITY_WAIT_ENV, "0.3")
     key = testslots.repo_key(repo)
-    holder = _lane_holder(tmp_path, p.name, key)   # task #12 holds the lane
+    holder = _lane_holder(tmp_path, p.name, key)   # holds the lane
     monkeypatch.delenv("TTP_TASK", raising=False)
     monkeypatch.setenv(checkcap.BATCH_ENV, _BATCH_ID)
     seen = {}

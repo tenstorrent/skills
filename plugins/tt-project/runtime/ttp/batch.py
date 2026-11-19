@@ -3202,7 +3202,7 @@ class Batch:
         prefixes (each prefix: entries 1..k plus a bump), checking the tip alone only when prefix 1
         fails. Returns (entries to push, head to push or None, (cmd, tail) of the blamed entry's
         failure or None). The first prefix that passes every check in full pushes at once (_lands, user
-        msg #2317): the later entries go untested and unblamed to the next train, and no entry joins or
+        ): the later entries go untested and unblamed to the next train, and no entry joins or
         rejoins a head that passed, so a search blames only entry 1 of the entries it searches. A failing check none of whose failing pytest ids is new at its head
         (gatejudge: flaky, pre-existing on the tip or quarantined) passes there (_judged). When the full
         head's failure names new ids, every entry they point at that fails them alone on the tip is sent
@@ -3354,8 +3354,7 @@ class Batch:
         return hi - 1, heads[hi - 1], fails[hi]
 
     def _lands(self, k: int, heads: dict, m: int):
-        """A prefix of `k` of the `m` carried entries passed every push check: it pushes at once
-        (user msg #2317). The later entries are requeued untested and unblamed for the next train on the
+        """A prefix of `k` of the `m` carried entries passed every push check: it pushes at once. The later entries are requeued untested and unblamed for the next train on the
         new tip; no entry joins this head and it is not checked again."""
         say(f"{heads[k][:10]} passed every push check: pushing its {k} entr{'y' if k == 1 else 'ies'} now; "
             f"the other {m - k} go in the next train")
@@ -3468,7 +3467,7 @@ class Batch:
         """After _judge blamed carried entry 1 (k 0): replay the later carried entries in order onto the
         tip and check that head, in this batch. With k entries before the blamed one that passed
         (k > 0), none: their head pushes at once and the later entries go to the next train, as no
-        entry joins a head that passed (user msg #2317). An entry built on a blamed one (it would
+        entry joins a head that passed. An entry built on a blamed one (it would
         replay its commits) or whose replay conflicts or adds nothing without it is skipped and requeued;
         the others still go.
         The first round checks the head on the tests the full head's failure named (self.new_ids,

@@ -1778,7 +1778,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
     head += " · tasks: " + (", ".join(f"{k} {v}" for k, v in sorted(counts.items())) if counts else "none yet")
     head += " · " + timefmt.long(now, p)
     lines = [head]
-    whole = set()   # lines quoting an open ask: wrapped at STATUS_WIDTH, never cut (user msg #2424)
+    whole = set()   # lines quoting an open ask: wrapped at STATUS_WIDTH, never cut
     seen = attention(db, now, p)
     for m in [m for m in seen if m["kind"] == "ask"] + [m for m in seen if m["kind"] != "ask"][:6]:
         text = " ".join(m["text"].split())   # an open ask in full, every one: the user acts on it (#2424)
@@ -3213,7 +3213,7 @@ def _note_to(a, run_dir: str) -> None:
     from . import taskfacts
     # The tasks it names, as the records show them now: what it states of them may be stale.
     from . import peerhold
-    # The target's pause or spend gate and resume time, before anyone waits on it (user msg #3496).
+    # The target's pause or spend gate and resume time, before anyone waits on it.
     held = "" if routed or far else peerhold.line(a.to, peerhold.of(a.to), me)
     if held:
         print(f"{held}: work waiting on its answer waits at least until then")

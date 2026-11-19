@@ -804,7 +804,7 @@ def make(env, name="demo"):
 
 
 def _worker_text(p, task=None):
-    """The shared system prompt and the memory block that leads each run's own prompt (task #51), as one
+    """The shared system prompt and the memory block that leads each run's own prompt, as one
     text: what worker_system returned while it carried memory."""
     from ttp.prompts import worker_memory_block, worker_system
     return "\n\n".join(x for x in (worker_system(p, task), worker_memory_block(p)) if x)
@@ -1897,7 +1897,7 @@ def test_unblock_answer_part_splits_a_message_by_the_asks_it_names(env):
     assert unblock.answer_part(text, 7, {7, 8, 9}).startswith("#7: yes") and "your call" not in \
         unblock.answer_part(text, 7, {7, 8, 9})
     assert "your call" in unblock.answer_part(text, 9, {7, 8, 9})
-    assert unblock.answer_part(text, 8, {7, 8, 9}) is None   # "task #8" names a task
+    assert unblock.answer_part(text, 8, {7, 8, 9}) is None   # "task #N" names a task
     assert unblock.answer_part("nothing here", 7, {7}) is None
     # The user-facing form "ask N" (and "ask #N") names an ask too.
     text = "Ask 7: yes. ask #9: your call."
@@ -5692,7 +5692,7 @@ def test_claude_workers_get_a_lean_context_but_keep_plugin_skills(env, monkeypat
     assert settings["autoMemoryEnabled"] is False
     assert worker.count("--disallowedTools") == 1, "a second flag would hide part of the deny list"
     i = worker.index("--disallowedTools") + 1
-    # The full tool set (user msg #2302): no_internet withholds only the web tools.
+    # The full tool set: no_internet withholds only the web tools.
     assert worker[i:worker.index("--settings", i)] == ["WebFetch", "WebSearch"] and "--tools" not in worker
     online, _ = build(role="worker", model="opus", effort="low", cwd=".", budget_usd=None, read_only=False,
                       schema=None, restrictions={})
@@ -5905,7 +5905,7 @@ def test_worker_and_reviewer_context_is_compacted_per_tier_and_the_coordinators_
         assert run_env("reviewer", tier)["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == tokens
     crid = d.start_run("coordinator", "decide", "claude", "light", str(p.base), read_only=True)
     (p.runs / str(crid) / "STOP").touch()
-    # The coordinator's session compacts in place at its own limit (coordsession.limit, user msg #2043).
+    # The coordinator's session compacts in place at its own limit.
     assert int(json.loads((p.runs / str(crid) / "run.json").read_text())["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"]) >= 100000
     # 0 turns it off, per tier or for every tier.
     p.set_config("budget.compact_window_tokens", {"light": 0, "standard": 150000, "deep": 200000})
@@ -6404,7 +6404,7 @@ def test_claude_workers_get_the_stable_prompt_as_a_cacheable_system_prompt(env, 
     system = (run_dir / "system.md").read_text()
     assert system.startswith("# BINDING RESTRICTIONS")
     assert "Go fast." in system and "MEMORY-MARKER" not in system and "TASK-SPEC-MARKER" not in system
-    # memory changes far more often than the charter: it leads the run's own prompt (task #51)
+    # memory changes far more often than the charter: it leads the run's own prompt
     assert "TASK-SPEC-MARKER" in prompt and "Go fast." not in prompt and "MEMORY-MARKER" in prompt
     assert prompt.rstrip().endswith(restrictions_pointer(p)), "a pointer at the restrictions closes the prompt"
     assert "Never merge to main (user msg #1)." not in prompt, "the restrictions are in the system prompt only"
@@ -9569,7 +9569,7 @@ def test_status_cuts_long_lines_at_words_and_keeps_diagnostics_for_verbose(env, 
     moved = ("coordinator cache:", "checks slot waits", "upstream fix")
     plain = cli.status_text(p)
     assert not any(m in plain for m in moved) and "sending upstream notes on to x has failed" in plain
-    rows = plain.splitlines()   # an open ask is never cut: it wraps onto indented lines (user msg #2424)
+    rows = plain.splitlines()   # an open ask is never cut: it wraps onto indented lines
     at = next(i for i, ln in enumerate(rows) if "word0 " in ln)
     assert rows[at + 1].startswith("    word") and rows[at + 1].rstrip().endswith("word79"), rows[at:at + 2]
     p.db.post("out", "note " + words, kind="alert")   # the recent feed's quoted texts end at a word too
@@ -17643,7 +17643,7 @@ def test_a_charter_and_memory_heavy_project_keeps_the_worker_prompt_under_its_ca
     mem_chars = sum(len(e["line"]) + 1 for e in p._memory_entries())
     assert len(charter) > 11_000 and mem_chars > 9_000, (len(charter), mem_chars)
     spec = "SPEC-MARKER: follow up on fact-03 and fact-07"
-    for kind, cap in (("code", 31_825 + 875 + 115 + 101 + 78 + 95 + 100 + 40 + 220 + 215), ("question", 24_670 + 875 + 101 + 78)):   # +875 both: the KNOWN PATHS block (user msg #212); code: +45 for where the harness hook runs; code: +128 for `probe_match` waits; code: +120 for the hand-off's measured `eta`; code: +135 for the `context_gaps` hand-off field; code: +265 for `then` wait stages; +155 both: a wake at the `ttp eta` expected finish; code: +20 for `ttp checks --result --passed`; +55 both: a fix confirmed by its ack alone; +265 both: relayed findings citing records; +30 both: the charter's source cites; code: +50 for the Galaxy reset rescan and recount, +15 for wait_kind user, +100 for `ttp detach --lock`, +150 for atomic script writes, +175 for `published`, +35 for the $TTP_TEST_SLOTS cap, +80 for the home-zone date, +400 for paid-model-API job guards, +125 for its spend cap, +110 for evidence manifests naming only immutable artifacts, +30 for the root .ignore line, +150 for one standing item per user step (`ttp notify --step`); +162 both: the Threads line (parallel subagents); code: +25 for the pytest -n clip and sandbox wrap; code: +115 for remote tests and slow polls run detached, freeing the slot (msg #223); +78 both: ack a mid-run update with a `ttp note "update: ..."` (#6313); code: +95 for the split gate's `no_split` line; code: +100 for the de-slop line; code: +40 for the PR body form gh checks; code: +220 for ponytail mode (user msg #3706); code: +215 for an urgent hand-off beside its smoke
+    for kind, cap in (("code", 31_825 + 875 + 115 + 101 + 78 + 95 + 100 + 40 + 220 + 215), ("question", 24_670 + 875 + 101 + 78)):   # +875 both: the KNOWN PATHS block; code: +45 for where the harness hook runs; code: +128 for `probe_match` waits; code: +120 for the hand-off's measured `eta`; code: +135 for the `context_gaps` hand-off field; code: +265 for `then` wait stages; +155 both: a wake at the `ttp eta` expected finish; code: +20 for `ttp checks --result --passed`; +55 both: a fix confirmed by its ack alone; +265 both: relayed findings citing records; +30 both: the charter's source cites; code: +50 for the Galaxy reset rescan and recount, +15 for wait_kind user, +100 for `ttp detach --lock`, +150 for atomic script writes, +175 for `published`, +35 for the $TTP_TEST_SLOTS cap, +80 for the home-zone date, +400 for paid-model-API job guards, +125 for its spend cap, +110 for evidence manifests naming only immutable artifacts, +30 for the root .ignore line, +150 for one standing item per user step (`ttp notify --step`); +162 both: the Threads line (parallel subagents); code: +25 for the pytest -n clip and sandbox wrap; code: +115 for remote tests and slow polls run detached, freeing the slot; +78 both: ack a mid-run update with a `ttp note "update: ..."`; code: +95 for the split gate's `no_split` line; code: +100 for the de-slop line; code: +40 for the PR body form gh checks; code: +220 for ponytail mode; code: +215 for an urgent hand-off beside its smoke
         tid = p.db.add_task(f"{kind} task", spec, kind=kind, tier="light", origin="user")
         prompt = worker_prompt(p, p.db.task(tid), str(p.root), "ttp/t1-x" if kind == "code" else None)
         assert spec in prompt and str(tmp_path) in prompt
@@ -19777,7 +19777,7 @@ def test_a_push_batch_sends_back_an_entry_whose_merged_changes_fail_the_checks(e
     """The checks fail only on the result of taking both sides' changes of different lines: the entry
     whose replay merged them goes back as a conflict (the merge may be the cause), not check_failed,
     and counts as sent back, not as resolved. Entry 1 passed alone: it pushes at once and entry 2 goes
-    to the next train (user msg #2317), where it is judged on its own."""
+    to the next train, where it is judged on its own."""
     p, repo, origin, other = _push_setup(env, monkeypatch, ["! grep -q A1 notes.txt || ! grep -q B2 notes.txt"])
     _commit(other, "notes.txt", "a\nb\nc\n")
     _git_out(other, "push", "-q", "origin", "HEAD:proj")
@@ -19797,7 +19797,7 @@ def test_a_push_batch_keeps_parallel_test_additions_only_when_the_checks_pass(en
     """Two changes each append a new test function at the end of one test file: a conflict to git
     that the batch settles without a model by keeping both. With checks that pass on the result both
     land; when the checks fail only on the merged file, the first lands alone at once and the second
-    goes to the next train (user msg #2317), where it goes back as a conflict (for a rebase), not
+    goes to the next train, where it goes back as a conflict (for a rebase), not
     check_failed."""
     check = "true" if passes else "! (grep -q test_one test_x.py && grep -q test_two test_x.py)"
     p, repo, origin, other = _push_setup(env, monkeypatch, [check])
@@ -19873,7 +19873,7 @@ def test_a_push_batch_blames_the_first_failing_entry_and_pushes_the_ones_before_
     """Four entries, one of which breaks the checks. Entry 1 breaking them: the search finds it in at
     most three more check runs and the later ones go after one more check of them replayed without it.
     A later one: the first prefix that passes (entries 1-2) pushes at once, no further check runs, and
-    the rest go untested and unblamed to the next train (user msg #2317)."""
+    the rest go untested and unblamed to the next train."""
     log = env["tmp"] / "checks.log"
     p, repo, origin, other = _bump_setup(env, monkeypatch, [f"echo run >> {log}", "test ! -e plugins/p/bad.txt"])
     heads = [_entry(repo, f"e{n}", {f"plugins/p/{'bad' if n == bad else f'f{n}'}.txt": f"{n}\n"}) for n in (1, 2, 3, 4)]
@@ -25200,7 +25200,7 @@ def test_codex_gets_its_system_text_and_compact_window_as_config_overrides(env, 
     assert prompt == "PROMPT-MARKER", "the system text still leads the prompt"
     assert argv[-3:] == ["resume", THREAD, "-"], "options after the resume subcommand"
     # The coordinator's system text goes the same way; its session compacts in place at its own limit
-    # (coordsession.limit, user msg #2043), not at a tier's window.
+    #, not at a tier's window.
     argv, prompt = start("coordinator", system=system, read_only=True)
     assert overrides(argv)["developer_instructions"] == system and _unmoded(prompt) == "PROMPT-MARKER"
     assert overrides(argv)["model_auto_compact_token_limit"] >= 100000 and argv[-1] == "-"
@@ -38115,7 +38115,7 @@ class _FakeCaffeinate:
         return 0
 
 
-ON = {"runner": {"prevent_idle_sleep": "on"}}   # keep-awake is off by default (user msg #2295): these tests turn it on
+ON = {"runner": {"prevent_idle_sleep": "on"}}   # keep-awake is off by default: these tests turn it on
 
 
 def _idle_hold(platform="darwin", ac=True, lid=None):
@@ -38419,7 +38419,7 @@ def test_host_slept_alert_says_why_keep_awake_did_not_stop_the_sleep(env, state,
 
 
 def test_idle_sleep_off_by_default_and_explicit_on_or_auto_still_holds(env):
-    """User msg #2295: tt-project never keeps a Mac awake unless the user sets the key; an explicit
+    """Tt-project never keeps a Mac awake unless the user sets the key; an explicit
     value set before an upgrade keeps working."""
     from ttp import awake, project as pj
     assert awake.mode({}) == awake.mode(pj.DEFAULT_CONFIG) == "off"
@@ -39352,7 +39352,7 @@ def test_a_task_an_open_ask_names_waits_on_the_user(env):
     ask = p.db.post("out", f"#{tid}: vendor A or B? (not #{tid}0)", chat=None, kind="ask", severity="high")
     st = state_payload(p, p.db)
     w = next(t for t in st["tasks"] if t["id"] == tid)["wait"]
-    # The ask in full, never only its id (user msg #2424).
+    # The ask in full, never only its id.
     full = f"waits on you: ask {ask}: #{tid}: vendor A or B? (not #{tid}0)"
     assert w["kind"] == "user" and w["text"] == full and w["asks"] == [ask], w
     assert next(t for t in st["tasks"] if t["id"] == other)["wait"]["kind"] == "coordinator"

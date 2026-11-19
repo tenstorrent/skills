@@ -142,7 +142,7 @@ def project_status(name: str, entry: dict, now: float, here: str, lib_v: str, wi
         row["waiting_on_user"] = w["count"]
         row["wait_asks"] = len(w["asks"])
         from .pendingask import full
-        row["open_asks"] = [full(a) for a in w["asks"]]   # each in full, never only its id (user msg #2424)
+        row["open_asks"] = [full(a) for a in w["asks"]]   # each in full, never only its id
         row["wait_tasks"] = len(w["tasks"]) + len(w["gated"])
         row["running"] = conn.execute("SELECT COUNT(*) FROM runs WHERE status='running'").fetchone()[0]
         from . import billing

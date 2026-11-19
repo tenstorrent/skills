@@ -27,7 +27,7 @@ def test_a_push_batch_takes_every_failing_entry_out_and_lands_the_rest(env, monk
 
 def test_a_push_batch_lands_a_passing_prefix_of_the_rest_and_requeues_the_others_untested(env, monkeypatch):
     """Entry 1 fails; the entries after it fail too, at entry 6 only. The search of those finds the
-    prefix before it passing and pushes it at once (user msg #2317); the entries after the passed
+    prefix before it passing and pushes it at once; the entries after the passed
     prefix are requeued untested, no try counted, for the next batch to take at once."""
     p, repo, origin, other = _bump_setup(env, monkeypatch, ["test ! -e plugins/p/bad.txt",
                                                             "test ! -e plugins/p/bad2.txt"])

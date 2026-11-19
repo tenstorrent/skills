@@ -581,7 +581,7 @@ def test_bench_run_cell_cannot_reach_the_landed_commit_later_history_or_the_held
     out = tmp_path / "h2h"
     rows = benchrun.run(tmp_path / "bench", out, arms, 1, 1, _bench_opts(tmp_path), p.config())
     # The hunt's history command is in its transcript (as a real agent's tool call is), but its output never
-    # showed the landed commit: a probe that found nothing is a note, not a flag (user msg #3538), and the cell
+    # showed the landed commit: a probe that found nothing is a note, not a flag, and the cell
     # is graded (it fails: no fix); isolation is what the found files below show.
     assert [(r["outcome"], r["flagged"], r["passed"]) for r in rows] == \
         [("fail", ["probed, nothing found: 'git log --all'"], False)] * 2
@@ -610,7 +610,7 @@ def test_bench_run_cell_cannot_reach_the_landed_commit_later_history_or_the_held
     found = benchrun.leaks(ws, task)
     assert f"commit {task['head'][:12]}" in found and any(f.endswith("objects HEAD does not reach") for f in found), found
     # The transcript audit flags a candidate that names a hidden path; history and forge lookups whose output
-    # showed nothing of the landed change are notes, not flags (user msg #3538), and a failed lookup's error
+    # showed nothing of the landed change are notes, not flags, and a failed lookup's error
     # naming the sha it asked for is not a sighting.
     asked = f"cat {tmp_path / 'bench'}/x; git show {task['head']}; git fetch origin; gh api x"
     failed = f"fatal: bad object {task['head']}\nerror: Not a valid object name {task['head'][:12]}\n"
@@ -1908,7 +1908,7 @@ def test_bench_audit_flags_only_distinctive_held_out_lines_and_what_the_agent_it
 def test_mini_trajectory_audit_reads_only_the_agents_own_calls(tmp_path):
     """A mini-swe-agent cell is audited on its assistant tool calls: a `git ls-remote` or `git fetch` that a tool
     printed (a file the agent read, the plain-text log, a wrapped log line) is not the agent's call and flags
-    nothing; the same command in a tool call does (t8715, user msg #3107)."""
+    nothing; the same command in a tool call does."""
     from ttp import benchrun
     task = {"task": 7, "head": "f" * 40, "heldout": []}
     def traj(*msgs):
@@ -1924,7 +1924,7 @@ def test_mini_trajectory_audit_reads_only_the_agents_own_calls(tmp_path):
     cheat = benchrun.agent_records(traj(call("git ls-remote origin && git fetch origin"), read))
     flags = benchrun.audit(cheat.decode(), task, [])
     assert flags == ["probed, nothing found: 'git fetch'", "probed, nothing found: 'git ls-remote'"]
-    # The same calls whose replies show the landed commit are flagged (user msg #3538).
+    # The same calls whose replies show the landed commit are flagged.
     saw = traj(call("git ls-remote origin && git fetch origin"), {"role": "tool", "content": f"{task['head']}\tHEAD"})
     flags = benchrun.audit(benchrun.agent_records(saw).decode(), task, [], outputs=benchrun.trajectory_output(saw))
     assert "runs 'git ls-remote'" in flags and "runs 'git fetch'" in flags
@@ -2100,7 +2100,7 @@ def test_bench_flagged_cell_is_still_graded_and_the_prompt_names_a_focused_test_
     import shlex
     shown = json.dumps({"type": "user", "message": {"content": [{"type": "tool_result", "content": f"commit {task['head']}"}]}})
     arms = {"a": {"provider": "claude", "model": "", "effort": ""}, "b": {"provider": "claude", "model": "", "effort": ""}}
-    # The same hunt with nothing found is a note: the cell is scored (user msg #3538).
+    # The same hunt with nothing found is a note: the cell is scored.
     monkeypatch.setenv("TTP_FAKE_SHELL", "git log --all >/dev/null; " + _BENCH_FIX)
     for r in benchrun.run(tmp_path / "bench", tmp_path / "h2h-probe", arms, 1, 1, _bench_opts(tmp_path), p.config()):
         assert r["outcome"] == "pass" and r["flagged"] == ["probed, nothing found: 'git log --all'"], r
@@ -2281,7 +2281,7 @@ def test_bench_grade_runs_the_held_out_tests_in_parallel_where_xdist_is_availabl
 
 
 def test_model_suite_refresh_widens_the_draw_until_enough_tasks_are_fair_and_stops_at_its_widest(tmp_path, monkeypatch):
-    """user msg #2898 item 1: the daily prep draws past landed tasks until at least PREP_LIMIT are fair
+    """item 1: the daily prep draws past landed tasks until at least PREP_LIMIT are fair
     (unfair ones are dropped, never counted); the lookback doubles from 14 days and stops at WIDEN_MAX_S."""
     import hashlib
     from ttp import bench, modelsuite
@@ -2314,7 +2314,7 @@ def test_model_suite_refresh_widens_the_draw_until_enough_tasks_are_fair_and_sto
 
 
 def test_model_suite_refresh_rebuilds_a_pair_a_tightened_filter_left_thin_at_most_daily(tmp_path, monkeypatch):
-    """user msg #2914: a pair built under an older fair filter keeps only the tasks bench.fair still passes;
+    """A pair built under an older fair filter keeps only the tasks bench.fair still passes;
     under PREP_LIMIT of them, a pair over THIN_S old is rebuilt before its week is up; a fresh one is kept
     (no rebuild per run), and a pair with enough fair tasks stays until it is FRESH_S old."""
     import hashlib

@@ -1059,7 +1059,7 @@ def flock_pids(paths: list[Path], read: Callable[[], list[str]] | None = None) -
 
 
 def held(locks_dir: Path, where=None) -> list[str]:
-    """Who holds each resource right now, and who has one reserved: "device: task #3 (run 9) since
+    """Who holds each resource right now, and who has one reserved: "device: task #N (run 9) since
     10:02 UTC" (in the zone of `where`, the project). A slot file keeps its label after release, so only slots whose lock is taken count;
     testing takes a free one for an instant, which a `ttp lock` trying then just retries."""
     out, locks_dir = [], Path(locks_dir)

@@ -784,7 +784,7 @@ def _occ_two_aliases(env, monkeypatch, alerts=None):
 
 
 def test_occupancy_replay_host_processes_on_a_held_box_are_never_flagged(env, monkeypatch):
-    """Replay of a false-alert burst (user msg #3518): a live stream on box-a, whose host also runs this
+    """Replay of a false-alert burst: a live stream on box-a, whose host also runs this
     project. Bench drivers and lock holders for another box's work, a waiter with no resource, an ssh log read
     on another box and on box-a itself, and a span started 2 days earlier all run on box-a's host. No broker job
     is on box-a: nothing is flagged and nothing is posted."""

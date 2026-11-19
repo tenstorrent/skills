@@ -185,7 +185,7 @@ def test_an_express_landing_gets_the_full_checks_after_it_lands_and_a_failure_re
 
 
 def test_the_push_queue_lands_a_priority_1_approval_express_while_a_regular_batch_runs(env, monkeypatch):
-    """User msg #2482: a priority-1 approved head lands alone, ahead of a push batch that is running, with
+    """A priority-1 approved head lands alone, ahead of a push batch that is running, with
     only its targeted checks; the running batch is neither waited for nor stopped."""
     from ttp import express, push, pushq
     s = _pq(env, monkeypatch)

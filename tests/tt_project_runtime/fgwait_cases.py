@@ -1,7 +1,7 @@
 # Foreground-wait tests of tests/test_tt_project_runtime.py, which runs this file in its own namespace
 # (see _include_cases there): helpers, fixtures and imports come from that file, and pytest collects
 # these tests under its name. A worker waiting on a remote run or a slow poll runs it detached and
-# hands off `waiting`, freeing its slot (owner's agent msg #223); ttp.fgwait reminds and steers it.
+# hands off `waiting`, freeing its slot; ttp.fgwait reminds and steers it.
 from __future__ import annotations
 
 

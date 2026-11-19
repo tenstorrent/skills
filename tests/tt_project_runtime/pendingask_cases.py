@@ -1,4 +1,4 @@
-# A reminder of what waits on the user quotes it in full (runtime/ttp/pendingask.py, user msg #2424) of
+# A reminder of what waits on the user quotes it in full of
 # tests/test_tt_project_runtime.py, which runs this file in its own namespace (see _include_cases there).
 from __future__ import annotations
 

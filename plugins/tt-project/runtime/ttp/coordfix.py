@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""The session coordinator's hands-on fixes, on the record (user msg #1776: it fixes the work, the
+"""The session coordinator's hands-on fixes, on the record (it fixes the work, the
 workers and the project's own prompts, scripts, charter notes and config itself).
 
 A full-tools coordinator's mutating calls are logged to its run's AUDIT file (coordtools.post_tool_use).
@@ -34,8 +34,8 @@ SHOWN = 8   # entries per group in one line
 
 
 def serves(raw: str) -> str:
-    """The order or task a fix serves, normalised: `o171` (an obligation), `user msg #1776` or
-    `task #6302`. ValueError for anything else."""
+    """The order or task a fix serves, normalised: `o171` (an obligation), `user msg #N` or
+    `task #N`. ValueError for anything else."""
     s = re.sub(r"\s+", "", str(raw or "")).lower()
     if m := re.fullmatch(r"o(\d+)", s):
         return f"o{int(m[1])}"

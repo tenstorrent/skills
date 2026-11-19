@@ -9,7 +9,7 @@ dependencies are met starts now. Its start gate (a `start_after` delay, a `start
 owner's order, agent or quiet window, _OWNER_CITE, or a `test -e <dir>/user-<x>` probe; a bare "until
 the user's ok" cites none); a charter Restriction (a guard, Restriction or charter rule); data loss; a
 spend cap or provider window; a shared device or machine (a lock, hold or pause, a restart, upgrade,
-reboot or power cycle; a lull, live traffic or a neighbour alone is a convenience: user msg #1571);
+reboot or power cycle; a lull, live traffic or a neighbour alone is a convenience);
 another person's work; a real dependency on another task's new file or symbol. The user's word and a Restriction come first, so a gate citing either is filed
 under it before any device word. A probe made only of `landed:#<id>` and `ttp landed --task <id>`
 terms joined by && (`landed_only`) is a dependency on other tasks' landed work (LANDED), read from

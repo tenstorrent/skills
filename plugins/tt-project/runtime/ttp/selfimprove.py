@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""The coordinator's self-improvement loop (user msg #1653: each project improves its own rules itself;
+"""The coordinator's self-improvement loop (each project improves its own rules itself;
 only general fixes go upstream to tt-project). Model-free throughout:
 
 - wake(): the per-wake record, kept on the coordinator run's row (runs.note "wake"): cost, tool calls,

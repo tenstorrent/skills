@@ -1177,7 +1177,7 @@ HELD_TIMES_SHOWN = 6   # reboot times listed for one repeated entry, the latest 
 
 
 def _held_entry(times: list[float], shown: str, where) -> str:
-    """'16:23 PDT board: task #7' for one reboot; 'push batch held at 4 reboots (23:26, 08:20,
+    """'16:23 PDT board: ' for one reboot; 'push batch held at 4 reboots (23:26, 08:20,
     15:40, 16:23 PDT), latest batch-<id>' for an entry held at several."""
     if len(times) == 1:
         return f"{timefmt.short(times[0], where)} {shown}"
@@ -2075,7 +2075,7 @@ def parse_start_after(raw: Any, now: float | None = None, tz: str | None = None)
         day = datetime.fromtimestamp(now, zone).date().isoformat()
         s = f"{day}T{int(clock[1]):02d}:{clock[2]}{clock[3] or ''}"
     if isinstance(raw, str) and (hm := re.fullmatch(r"([0-9]{1,2}):([0-9]{2})( [A-Za-z]{2,5})?", s)):
-        # A clock time alone (user msg #2116: the meaning is clear): its next time in the home zone.
+        # A clock time alone (the meaning is clear): its next time in the home zone.
         zone = ZoneInfo(timefmt.valid(tz)) if timefmt.valid(tz) else None
         day = datetime.fromtimestamp(now, zone).date()
         for d in (day, day + timedelta(days=1)):
@@ -2773,7 +2773,7 @@ def _wakemode_checked(p: Project, text: str, notes: list) -> str:
 
 def _pending_checked(p: Project, text: str, notes: list, what: str) -> str:
     """A reply or notify as pendingask.expand sends it: an open ask it names only by id goes with its full
-    text appended (user msg #2424). Any fault posts the text unchanged: a message is never lost to this check."""
+    text appended. Any fault posts the text unchanged: a message is never lost to this check."""
     try:
         from . import pendingask, waits
         text, why = pendingask.expand(text, waits.open_asks(p.db), what)
@@ -4306,7 +4306,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                      f"without the user's-words label")
                 oid, owners = str(a.get("key") or "").strip(), [int(x) for x in a.get("owners") or []]
                 if oid and a.get("order") is not None and (o := obligations.get(db, oid)) \
-                        and not obligations._open(o):   # closed: the order is a new one (user msg #2116)
+                        and not obligations._open(o):   # closed: the order is a new one
                     notes.append(f"obligation {oid} is closed: the order of message #{a['order']} is recorded "
                                  f"as a new one")
                     a = {**a, "text": a.get("text") or o["text"],
@@ -7766,7 +7766,7 @@ def _held_route_ask(cfg: dict, a: dict, text: str) -> str:
 # a user-only step, another person's request, a post, merge or other one-way step; sent too for an unnamed or
 # unknown target, a paused or held one, a live lock or reservation on it, or one the user's own rules name (a charter
 # Restriction naming it: a hold or an allowlist, or an allowlist ("only") of machines leaving it out). A serving,
-# shared or production tag, neighbours, live traffic or a site is no reason to ask (user msg #1571). Accepted gaps:
+# shared or production tag, neighbours, live traffic or a site is no reason to ask. Accepted gaps:
 # - an idle-reset ask that does not say it is idle, or adds any word outside _PLAIN_WORDS (a cause, a duration), is sent;
 # - least_disruptive and recommendation get only the tenant word lists, not the clause check;
 # - an idle statement about a different machine than the reset's target counts for it.
@@ -7780,7 +7780,7 @@ _CLAUSE_RE = re.compile(r"[,;:!?\n()\[\]—–]+|\s-+\s|\.(?=\s|$)|\b(?:and|but|
                         r"unless|until|except|apart|besides|than|that|which|who|whom|whose|where|when|as|if|with|"
                         r"without|for)\b", re.I)
 # Someone on the target: a tenant (an open device handle or tenant process), a person, a user. Serving state
-# (serving, production, live traffic, shared) is no tenant: the harness never asks on it (user msg #1571).
+# (serving, production, live traffic, shared) is no tenant: the harness never asks on it.
 _TENANT_RE = re.compile(r"\b(?:tenants?|customers?|someone|somebody|"
                         r"(?:other|another)\s+(?:users?|people|persons?|teams?|projects?)|in\s+use|being\s+used|"
                         r"logged[- ]in|users?\s+(?:on|of)\s+it)\b", re.I)
@@ -8155,7 +8155,7 @@ _USER_MSG_ID = re.compile(r"\buser(?:'s)?\s+(?:msgs?|messages?)\s+#?\d+(?:\s*(?:
 
 def _user_msg_ids(text: str) -> set[str]:
     """Every user message id `text` cites, a cite list included ('user msgs #A, #B and #C'). A later
-    list item needs its '#', so a date after a cite ('user msg #5, 2026-10-13') is no id."""
+    list item needs its '#', so a date after a cite is no id."""
     return {i for m in _USER_MSG_ID.finditer(text) for i in re.findall(r"\d+", m.group())}
 
 
@@ -8240,7 +8240,7 @@ def _apply_due_moves(p: Project, actions: list, moves: list, failed: set, proble
             notes.append(obligations.set_due(p, oid, a["due"], plan=plans.get(oid) or own, user=user))
             if str(a.get("justify") or "").strip():
                 notes.append(eta.justify(p, oid, str(a["justify"])))
-        except obligations.DueNote as e:   # nothing owed changes: a note, not a rejection (user msg #2116)
+        except obligations.DueNote as e:   # nothing owed changes: a note, not a rejection
             notes.append(f"obligation: {e}")
         except Exception as e:
             failed.add(i)

@@ -460,8 +460,7 @@ def _uses_devices(cfg: dict, alias: str, s: dict, step: str) -> bool:
     declared device use (`ttp detach --remote --devices N` or a bench, warm-up or reset step), or a device or
     reset step with no resource of another machine. Read from the span's structured fields, never its command:
     a CPU check, a test suite, a lock waiter, a log read over ssh or a host process driving other hosts (ssh, a
-    Slurm cluster, docker over ssh) is not device use, nor is any process that merely runs on the box's host
-    (user msg #3518)."""
+    Slurm cluster, docker over ssh) is not device use, nor is any process that merely runs on the box's host."""
     from . import checkspill, responsibilities
     if s.get("machine"):
         if s["machine"] != alias:
@@ -640,7 +639,7 @@ def _event_for(events: dict, alias: str, proj: str, stream: str, hit: tuple[floa
 
 
 def _close_ended(db, events: dict, jobs: dict[str, str], readings: dict, now: float, joined: set[str]) -> None:
-    """Close each open stay-off alert whose condition is over (user msg #904: alerts clear with their
+    """Close each open stay-off alert whose condition is over (alerts clear with their
     condition): every job it flagged ended (or its record is gone), or the stream's window ended and none of
     them is known to still run there (a remote job's end is known only on its host). An event a job joined
     this pass waits for the next one."""
@@ -671,7 +670,7 @@ def _job_line(f: dict) -> str:
 
 def _window_words(fl: list[dict]) -> str:
     """When the stream held the box: a stream still running has no known end, so its clear time is never
-    given as a clock time (user msg #3518: "quiet until" while it was still live was false)."""
+    given as a clock time ("quiet until" while it was still live was false)."""
     f = fl[0]
     if any(x.get("open") for x in fl):
         q = float(f.get("quiet_s", QUIET_S))

@@ -6,7 +6,7 @@ whole-wake guard (wake_snapshot, wake_guard) puts back protected files after any
 coordsession.keeps_session) runs a stateless turn with no tools.
 
 Full tools (coordinator.session.tools "full", the default): a session wake (a new or resumed session)
-gets a worker's tools under a worker's guards (user msg #2302). On Claude that is Claude Code's whole
+gets a worker's tools under a worker's guards. On Claude that is Claude Code's whole
 standard set, whatever the build ships (its subagent tool, Agent or Task, among them): no --tools list, no --restricted,
 bypassPermissions as a worker (full_argv), and its text appended to Claude Code's own system prompt
 (daemon._with_system_prompt). Withheld: the web tools under no_internet and the project's
@@ -212,7 +212,7 @@ def full_argv(argv: list[str]) -> list[str]:
     Edit/Write deny, no --restricted (it drops Bash and the other code-running tools unless --tools names
     them, and confines the file tools to the working directory), and bypassPermissions for dontAsk (which
     refuses every tool no allow rule names). The rules hold through the hook on every tool and the deny
-    rules in --settings, which the CLI applies in every permission mode (user msg #2302)."""
+    rules in --settings, which the CLI applies in every permission mode."""
     out = [a for a in without_edit_deny(argv) if a != "--restricted"]
     for i in range(len(out) - 1):
         if out[i] == "--permission-mode":
@@ -228,7 +228,7 @@ def session_tool_args(cfg: dict, *, project: str = "", root: str = "", denied_re
         return []
     deny = [f"Read(/{p})" for p in denied_reads if os.path.isabs(p)]
     if full_tools(cfg, session_mode):
-        # Claude Code's full standard tool set, Agent included, as a worker's (user msg #2302): no --tools
+        # Claude Code's full standard tool set, Agent included, as a worker's: no --tools
         # list. Withheld only: the web tools where the project may not use the web, and the project's
         # own providers.claude.disallowed_tools. The hook (pre_tool_use) and the deny rules hold the rest.
         from .providers.claude import WEB_TOOLS, lean_settings

@@ -35,14 +35,14 @@ FALLBACK = {"provider": "claude", "model": "sonnet", "effort": "high"}
 FALLBACK_ON = ("down", "error", "rate_limit", "auth", "malformed", "model_missing", "busy", "slots",
                "busy_wait_expired")
 
-# A run that talks to a person (user msg #3512: GLM never does): a reply, post or comment to a person or a
+# A run that talks to a person (GLM never does): a reply, post or comment to a person or a
 # channel, or the commands that post.
 PERSON = re.compile(
     r"(?i)\b(?:post|send|reply|respond|comment|message|e-?mail|answer)(?:s|ed|ing)?\b[^\n]{0,40}?"
     r"\b(?:slack|jira|github|gh|e-?mail|the user|the requester|the reviewer|the author|a person|people|"
     r"channel|thread|pr comment|issue comment)\b"
     r"|\bgh\s+(?:pr|issue)\s+(?:comment|review)\b|\bttp\s+(?:notify|urgent-reply)\b")
-# Optimization or design work (user msg #3643: Opus keeps it): besides modelpick.HARD and codearm.JUDGMENT.
+# Optimization or design work (Opus keeps it): besides modelpick.HARD and codearm.JUDGMENT.
 DESIGN = re.compile(
     r"(?i)\boptimi[sz](?:e|es|ed|ing|ation|ations)\b|\bre-?design\w*|\bdesign\s+(?:a|an|the|how|which)\b"
     r"|\barchitect\w*|\bpropose\b[^\n.]{0,40}\b(?:plan|design|approach)\b")

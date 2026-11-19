@@ -1637,7 +1637,7 @@ def test_a_snapshot_from_before_recent_memory_was_cached_shows_it_all_in_the_dig
 @pytest.mark.parametrize("provider", ["claude", "codex"])
 def test_user_corrections_are_read_from_the_cached_prompt_and_new_ones_show_in_the_digest(env, monkeypatch, provider):
     # Claude Code's cache reads only the system prompt, never a shared start of the user prompt (measured,
-    # task #5172): the corrections (6 changes in 1,000 turns) were rewritten with every digest.
+    # ): the corrections (6 changes in 1,000 turns) were rewritten with every digest.
     from ttp import coordinator as coord
     from ttp.project import CORRECTIONS_HEADER
     p, turn = _coordinator_turns(env, monkeypatch, provider, step=60)
@@ -6826,7 +6826,7 @@ def test_a_user_rule_naming_a_machine_covers_its_device_lock_and_no_other(env):
     ("dev-h", _RESET_LEAST),                                         # a shared device lock
 ])
 def test_a_reset_ask_is_refused_whatever_the_serving_tag_neighbours_or_site(env, target, least):
-    """User msg #1571: serving or shared tags, neighbours, live traffic and site rules never make a reset the
+    """Serving or shared tags, neighbours, live traffic and site rules never make a reset the
     user's to decide; only the user's own holds and allowlists do (the THROUGH cases fleet-hold and charter-*)."""
     from ttp import coordinator as coord, machines
     p = make(env)
@@ -11942,7 +11942,7 @@ def test_code_tasks_land_their_own_work_only_when_the_project_opts_in(env):
     from ttp import coordinator as coord
     from ttp.project import DEFAULT_CONFIG, code_tasks_may_push, config_problems, unknown_key_hint
     from ttp.prompts import worker_task
-    # Default "approved" (user msg #2484): a code task lands only a head a review approved (push.py).
+    # Default "approved": a code task lands only a head a review approved (push.py).
     assert DEFAULT_CONFIG["delivery"]["code_tasks_may_push"] == "approved"
     assert unknown_key_hint("delivery.code_tasks_may_push") is None
     code = p.db.add_task("fix it", "s", kind="code", tier="light", origin="user")
@@ -20904,7 +20904,7 @@ def test_every_worker_prompt_carries_every_standing_entry_for_workers(env, kind,
 
 
 def test_standing_worker_memory_past_its_room_is_pointed_to_and_alerts_once(env):
-    """Standing entries for workers that outgrow the workers' pinned room (user msg #2271: memory within
+    """Standing entries for workers that outgrow the workers' pinned room (memory within
     its budget, pinned ones included) are shown whole, oldest first, while they fit; each of the rest is
     a pointer (its name, first sentence and where it is in full), never dropped; the coordinator is
     told once."""
@@ -21209,7 +21209,7 @@ def test_every_worker_prompt_carries_a_resource_entry_that_is_not_standing(env, 
 def test_the_reported_light_harness_run_carries_every_restriction_resource_and_standing_entry(env):
     """The reported case: 14 entries, a light-tier harness run. Every restriction and resource entry is
     there, whole; the standing entries and the one tagged for workers have only the room left
-    (user msg #2271: memory within its budget, pinned ones included), so those past it are pointed to,
+    (memory within its budget, pinned ones included), so those past it are pointed to,
     never dropped silently, and the coordinator and `ttp doctor` are told."""
     p, pins, tagged = _pinned_kinds_project(env)
     from ttp import coordinator as coord
@@ -24202,7 +24202,7 @@ def test_state_shows_the_24h_task_caps_near_and_at_the_limit(env):
 
 
 def test_every_run_kind_carries_the_no_drive_search_rule_and_the_known_paths(env, monkeypatch, capsys):
-    """User msg #212: a run searched / for the push lock and popped dozens of macOS privacy dialogs.
+    """A run searched / for the push lock and popped dozens of macOS privacy dialogs.
     Every worker, review and coordinator prompt (both coordinator modes, either provider: the worker's
     system prompt is provider-independent) leads with the rule and the paths, from the code's own functions."""
     import json as _json
@@ -24254,7 +24254,7 @@ def test_runtime_walks_never_start_at_the_drive_root_or_the_home_folder(tmp_path
 
 
 def test_a_review_of_a_head_already_failed_keeps_that_verdict_with_no_run_and_no_fix_round(env, monkeypatch):
-    """Upstream user msg #2495 (2b): a second review of an unchanged head an earlier review failed with a
+    """Upstream (2b): a second review of an unchanged head an earlier review failed with a
     finding does not run: it closes failed with the earlier verdict and no follow-ups (no fix round
     starts from it), and the coordinator gets one review_nofix event. A forced review still runs."""
     from ttp import coordinator as coord, deadwait, reviewreuse
@@ -24303,7 +24303,7 @@ def _push_conflicted_review(p, tid, d, head):
 
 def test_a_push_conflict_rebase_task_runs_even_on_a_head_an_earlier_review_failed(env, monkeypatch):
     """Cell rebase_not_short_circuited: a push-conflict rebase review (pushq.REBASE_LABEL) makes the new
-    head, so the unchanged-head rule (user msg #2495) never closes it at dispatch, even when an earlier
+    head, so the unchanged-head rule never closes it at dispatch, even when an earlier
     review of that head failed with a finding."""
     from ttp import deadwait, pushq
     p = make(env)

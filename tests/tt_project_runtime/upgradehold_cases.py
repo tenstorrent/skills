@@ -628,7 +628,7 @@ def test_ttp_deployed_shows_a_release_hold_and_the_deploy_loop_skips_it(env, tmp
 
 def test_ttp_deployed_lists_a_held_project_with_its_version_and_lag(env, tmp_path):
     """A project a release hold keeps off the deploy is listed with the version it runs and how many
-    releases it is behind, so a stale project is visible (user msg #3518)."""
+    releases it is behind, so a stale project is visible."""
     from ttp import overview, release
     make(env)
     _deploy_lib('0.5.12')

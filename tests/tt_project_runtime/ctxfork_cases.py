@@ -289,7 +289,7 @@ def _start(p, d, tid, role="worker", provider="claude"):
 
 
 def test_follow_ups_resume_the_session_of_the_run_they_carry_on(env, monkeypatch, tmp_path):
-    """Owner's order (user msg #2210): continue hops, review fixes, rebases and re-reviews start from a copy
+    """Owner's order: continue hops, review fixes, rebases and re-reviews start from a copy
     of the session of the last ok run of the task they carry on, never writing into it, with the
     coordinator's newer context as a delta. A first review stays independent of its author's session."""
     from ttp import coordsession, ctxfork, obligations
@@ -583,7 +583,7 @@ def test_a_review_fix_past_the_hop_cap_starts_fresh_and_raises_one_event(env, mo
 
 def test_a_review_fix_on_a_provider_without_resume_falls_back_and_a_fresh_start_resets_the_count(
         env, monkeypatch, tmp_path):
-    """Provider parity (user msg #1828): a fix on a provider that cannot resume the code task's session
+    """Provider parity: a fix on a provider that cannot resume the code task's session
     (Cursor, or another session format) takes the coordinator fork, else disk, like any follow-up; a fix
     that started fresh ends its lineage's count, so the next round's fix resumes it as hop 1."""
     from ttp import coordsession, ctxfork
@@ -942,7 +942,7 @@ def test_forked_runs_send_the_coordinator_prefix_and_keep_their_own_text_after_i
     (coord_dir / "run.json").write_text(json.dumps({"argv": other}))
     argv, prompt, system, ctx = start(p.root)
     assert system.startswith("# WORKER RULES") and "--json-schema" not in argv
-    if "--model" in argv:   # task #74: it takes the disk block, not a fork it would write again
+    if "--model" in argv:   # it takes the disk block, not a fork it would write again
         assert ctx["how"] == "disk" and "is not the coordinator's other-model" in ctx["why"], ctx
         assert prompt.startswith(ctxfork.DISK_HEAD)
     else:
@@ -989,7 +989,7 @@ def test_sonnet_workers_and_reviewers_share_one_system_prompt_while_memory_chang
 
 
 def test_a_run_on_another_claude_model_forks_the_coordinators_last_turns_else_takes_the_disk_block(env, monkeypatch, tmp_path):
-    """Task #8308 (before: task #74): the prompt cache is per model, so a Sonnet fork of an Opus
+    """Task #8308: the prompt cache is per model, so a Sonnet fork of an Opus
     coordinator cannot read its cache. It forks only the session's last turns (worker_fork_other_model_tokens,
     "tail"), the same copy for every such run, so they share one cache entry; a model outside the Claude
     families, or the setting at 0, takes the disk block. A run on the coordinator's model forks it whole."""
@@ -1082,9 +1082,9 @@ def test_a_fork_of_the_last_turns_sends_the_coordinators_prefix_on_its_own_model
 
 
 def test_a_follow_up_on_another_model_starts_fresh_never_resuming_the_other_models_session(env, monkeypatch, tmp_path):
-    """Owner's order (msg #188, task #175): the prompt cache is per model, so a follow-up that resumed a
+    """Owner's order: the prompt cache is per model, so a follow-up that resumed a
     session another model made (Sonnet resuming an Opus run or the reverse) wrote its whole history again
-    and never read it (task #53: 4 of 10 cold resumes). It starts as a fresh run of its model does (the
+    and never read it. It starts as a fresh run of its model does (the
     coordinator fork, shaped, or the disk block), with the task it continues and that task's last
     hand-off in its prompt and none of the other run's history. A same-model follow-up still resumes."""
     from ttp import coordsession, ctxfork
@@ -1119,7 +1119,7 @@ def test_a_follow_up_on_another_model_starts_fresh_never_resuming_the_other_mode
         assert f"no resume: run {r_code} ran on {run_model}, this run on {model}" in got["why"], got
         assert not got["lead"].startswith(ctxfork.RESUME_HEAD)
     # A coordinator on Opus: a Sonnet follow-up of an Opus run forks the coordinator's last turns, as a fresh
-    # Sonnet run does (task #8308); a non-Claude model, or the setting at 0, takes the disk block.
+    # Sonnet run does; a non-Claude model, or the setting at 0, takes the disk block.
     coord_dir = tmp_path / "coord-run"
     coord_dir.mkdir()
     (coord_dir / "run.json").write_text(json.dumps({"argv": ["claude", "-p", "--model", "claude-opus-5-5"]}))
@@ -1187,7 +1187,7 @@ def _codex_rollout_with_instructions(home, sid, cwd="/coord"):
 
 
 def test_codex_own_instructions_replace_the_sessions_harness_text_everywhere(monkeypatch, tmp_path):
-    """Task #198 (user msg #208): `codex exec resume` keeps the rollout's developer messages and takes no new
+    """Task #198: `codex exec resume` keeps the rollout's developer messages and takes no new
     developer_instructions, so a worker forked from a coordinator without tools ran under "This session has
     no tools". The run's own text replaces the harness's blocks (top level and inside compactions); Codex's
     own <...> blocks, user messages and the source session stay; Claude takes each launch's system prompt."""
@@ -1210,7 +1210,7 @@ def test_codex_own_instructions_replace_the_sessions_harness_text_everywhere(mon
     rows = [json.loads(x) for x in text.splitlines()]
     assert rows[-1]["payload"]["type"] == "task_complete"
     # Twice is the same; a message holding the harness text twice keeps the run's text once, and its
-    # other parts stay (task #210).
+    # other parts stay.
     assert codex.own_instructions(new, "/run", own, worker) == "" and copy.read_text().count("WORKER RULES") == 3
     two = str(uuid.uuid4())
     path = _fork_codex_rollout(home, two)
@@ -1297,7 +1297,7 @@ def test_codex_worker_runs_start_with_their_own_instructions_and_the_coordinator
     assert got["how"] == "fork" and argv[argv.index("resume") + 1] == got["session"], (got, argv)
     assert "no tools" not in text and "WORKER RULES" in text and "<multi_agent_role>" in text
     assert "This session has no tools" in coord_src.read_text()   # the coordinator's session is untouched
-    # Task #299 (user msg #329): the prompt overrides the coordinator's rules the copy may still hold and
+    # Task #299: the prompt overrides the coordinator's rules the copy may still hold and
     # carries the worker's own, once, as a shaped Claude fork's does (forks without it wrote no result).
     lead, rest = start.prompt.split("TASK PROMPT", 1)[0], start.prompt.split("TASK PROMPT", 1)[1]
     assert lead.startswith(ctxfork.FORK_HEAD) and "are the coordinator's and do not apply" in lead

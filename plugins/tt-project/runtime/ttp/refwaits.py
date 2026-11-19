@@ -3,7 +3,7 @@
 """Queued waits that name an ask or a task, kept current, model-free (Daemon.refresh_ref_waits).
 
 A queued task's wait note (its hand-off's `waiting_for`, its `blocked_reason`, a start_when's `start_why`)
-may name what it waits on: `ask #12`, `task #34` or `#34`. Once that ask is resolved or that task is
+may name what it waits on: `ask #12`, `task #N` or `#34`. Once that ask is resolved or that task is
 done, the note is stale. The daemon then rewrites the note to say so, drops the cached probe verdicts
 and reruns the task's probe at once (its retry_when or start_when). Its retry_when, dependencies,
 start_when, start_after, not_before and attempts stay as they were. A done task is only a reason to check
@@ -18,7 +18,7 @@ continues a list such a word starts (`PRs #8 and #16`). Any other bare `#N` that
 may still be read as a task; that only refreshes text or reruns a model-free probe.
 
 A ref is another project's, never this one's, when a known peer's name stands right before it
-(`<peer> task #8`, `<peer> #8`, `<peer>'s #8`, `<peer>#8`) or before the list it continues
+ or before the list it continues
 (`<peer> #8, #9 and #12`). The peers (peer_names) are the registry's projects (`ttp list`), the projects
 whose notes reached this one and the project's PEERS_FILE, read without a model call; this project's own
 name and names that are plain words a note uses before a ref (`needs #12`) never count. Facts a note

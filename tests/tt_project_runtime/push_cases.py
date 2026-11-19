@@ -2241,7 +2241,7 @@ def test_entries_after_a_blamed_one_are_requeued_untested_without_an_extra_round
 
 def test_a_push_batch_pushes_the_first_prefix_that_passes_at_once_and_sends_the_rest_to_the_next_train(env, monkeypatch,
                                                                                                          capsys):
-    """User msg #2317: a batch that passed every check lands at once. Eight entries, the seventh breaks the
+    """A batch that passed every check lands at once. Eight entries, the seventh breaks the
     checks: the full head fails and the first prefix tried (4) passes, so it pushes with no further
     check (2 runs). Entries 5-8 are requeued untested and unblamed for the next train on the new tip; no
     entry joins the passed head and it is not checked again."""
@@ -2260,7 +2260,7 @@ def test_a_push_batch_pushes_the_first_prefix_that_passes_at_once_and_sends_the_
 
 
 def test_a_push_batch_never_rescues_after_a_blamed_entry_once_a_prefix_passed(env, monkeypatch, capsys):
-    """User msg #2317, the rescue path: five entries, the third breaks the checks. Prefix 2 passes and
+    """The rescue path: five entries, the third breaks the checks. Prefix 2 passes and
     pushes at once: prefix 3 is never checked, no entry is blamed, and entries 3-5 are never checked
     without one ("checking the 3 entries after ... without it" built a bigger head after a pass). With
     a blamed entry after a passed prefix (the cap probes' verdict), _rescue checks nothing."""
@@ -2300,7 +2300,7 @@ def _approved_mid_search(p, monkeypatch, after, priority):
 
 def _bad_first(env, monkeypatch, wait_s=0, restarts=1):
     """Eight entries, the first breaks the checks, so the search runs prefixes 4, 2 and 1 (none passes:
-    a prefix that passed would push at once, user msg #2317) and then the rescue checks 2-8 without it. `wait_s` sets delivery.push_yield_wait_s (0: an urgent
+    a prefix that passed would push at once, ) and then the rescue checks 2-8 without it. `wait_s` sets delivery.push_yield_wait_s (0: an urgent
     approval never waits for the search's verdict; None: the default, which these millisecond checks meet),
     `restarts` delivery.push_yield_restarts (1: a search may stop once; None: the default, never)."""
     p, repo, origin, other = _bump_setup(env, monkeypatch, ["test ! -e plugins/p/bad.txt"])
@@ -2502,7 +2502,7 @@ def test_a_rescue_requeues_only_the_entries_that_build_on_the_blamed_one_and_lan
 
 
 def test_a_rescue_lands_a_later_entry_not_built_on_the_blamed_one(env, monkeypatch):
-    """The blamed entry is the first (a prefix that passed would have pushed at once, user msg #2317):
+    """The blamed entry is the first:
     a later entry built on the tip only goes, alone or built on another such entry; one built on the
     blamed one is requeued."""
     p, repo, origin, other = _bump_setup(env, monkeypatch, ["test ! -e plugins/p/bad.txt"])
@@ -3729,7 +3729,7 @@ def test_a_push_batch_on_a_known_failing_tip_never_checks_it_alone_and_pushes_a_
                                                                                      fresh, want, runs, tried):
     """A tip the queue knows fails on its own (marker "bad_tip") is not checked alone again. The tip with
     the batch, and the tip with the entries not yet tried on it, are; an entry that fixes the tip goes
-    as the first prefix that passes, at once (user msg #2317), the rest in the next train. A batch that
+    as the first prefix that passes, at once, the rest in the next train. A batch that
     ends at prefix 1 failing names only the entries it showed do not fix the tip ("tip_tried"): a fix after them stays untried."""
     from ttp.project import write_json
     from ttp import push
@@ -4002,9 +4002,9 @@ def _pq_alone(s, name, priority=3, text=None):
 
 
 def test_an_independent_approval_starts_a_train_at_once_through_the_gap_and_the_window(env, monkeypatch):
-    """user msg #1221: an approval sharing no file with an earlier unlanded one, or of priority 1-2, starts a
+    """An approval sharing no file with an earlier unlanded one, or of priority 1-2, starts a
     train at once through the gap (here 1200 s) and the window, and leads it; every routine approval rides in
-    it (one train, user msg #2220). With no fast one the routine ones still wait the gap."""
+    it. With no fast one the routine ones still wait the gap."""
     from ttp import pushq
     s = _pq(env, monkeypatch, push_batch_s=900)
     s.p.db.update_task(s.review, status="running")   # a review is at work: routine approvals wait for it
@@ -4172,7 +4172,7 @@ def test_approvals_that_waited_out_the_last_batch_start_the_next_at_once(env, mo
 
 
 def test_one_train_takes_every_approval_and_push_batch_max_only_starts_one(env, monkeypatch):
-    """Rule 1 of the one train (user msg #2220): every approval due at a train's start is in it;
+    """Rule 1 of the one train: every approval due at a train's start is in it;
     delivery.push_batch_max (kept for compatibility) starts one at once and caps nothing."""
     from ttp import pushq
     s = _pq(env, monkeypatch, push_batch_max=2, push_batch_s=10 ** 6)
@@ -4915,7 +4915,7 @@ def test_a_tip_failing_only_where_the_queue_checks_it_stops_being_retried_and_a_
 def test_a_fix_behind_an_entry_that_does_not_fix_a_known_failing_tip_lands_in_the_next_batch(env, monkeypatch):
     """On a known-bad tip, a batch [e1, fix, bad] fails at prefix 1 and ends tip_failed. Only e1 is then
     tried on that tip: fix and bad stay untried, go first in the next batch at once (not held), and that
-    batch pushes fix as soon as it passes (user msg #2317); e1 and bad go at once in the train after it,
+    batch pushes fix as soon as it passes; e1 and bad go at once in the train after it,
     which pushes e1 as it passes on the fixed tip, and the train after that blames bad."""
     from ttp import pushq
     s = _pq_real(env, monkeypatch, push_min_gap_s=0, push_batch_max=3,
@@ -8064,7 +8064,7 @@ def test_a_held_review_is_released_once_the_carried_fix_lands(env, monkeypatch):
 
 
 def test_a_held_stacked_review_starts_once_its_base_is_approved_at_a_head_it_contains(env, monkeypatch):
-    """user msg #1221: a review of a head stacked on a change whose fix is open waits for the fix's
+    """A review of a head stacked on a change whose fix is open waits for the fix's
     approval, not its landing; a base approved at a head this one does not contain (it changed) keeps it held."""
     from ttp import pushq, reviewhold
     s, d, x, fix, rid = _held_review(env, monkeypatch)
@@ -8648,7 +8648,7 @@ def test_batch_inherited_takes_only_the_named_fd(env, tmp_path, monkeypatch):
 
 
 def test_ttp_checks_records_its_wall_and_cpu_seconds(env, tmp_path, monkeypatch, capsys):
-    """User msg #2220 (#2221): each checks run records its wall and CPU seconds (its check commands' CPU
+    """Each checks run records its wall and CPU seconds (its check commands' CPU
     included) in checks.json, so `ttp stats` can show CPU-hours per landed change."""
     from ttp import cli
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
@@ -11154,7 +11154,7 @@ def _derived_on_base(env, tmp_path, monkeypatch, head_seed: str):
 
 def test_a_derived_check_prestage_failure_the_base_shares_starts_the_full_checks(env, tmp_path, monkeypatch, capsys):
     """A broken push-branch tip: its failures fill every task's derived pre-stage. Each fails on the
-    change's base too, so none is the change's and the detached checks start (user msg #1635)."""
+    change's base too, so none is the change's and the detached checks start."""
     from ttp import checkprestage, cli
     seed = ("def test_static_guard():\n    assert 0, 'seeded-static-failure'\n\n\n"
             "def test_fine():\n    pass\n\n\ndef test_added_by_head():\n    pass\n")
@@ -13925,7 +13925,7 @@ def test_a_batch_that_breaks_only_a_cap_finds_the_entry_on_cap_probes_and_runs_o
     """A 5-entry batch that fails only a prompt size cap test: cap probes (only the cap tests) of the
     full head and each prefix find entry 4, one full suite runs on entries 1..3, which push; entry 4
     is check_failed with a cap-only tail (pushq sends it back to be trimmed), and entry 5 is requeued
-    untested for the next train: a prefix passed, so no probe or check runs after it (user msg #2317).
+    untested for the next train: a prefix passed, so no probe or check runs after it.
     Before, each of those heads ran the full suite: five full runs."""
     from ttp import conflictfix, pushpass
     p, origin, heads, log = _cap_suite_batch(env, monkeypatch)
@@ -13947,7 +13947,7 @@ def test_a_batch_rerun_after_a_reboot_reuses_the_cap_probes_it_already_ran(env, 
     """A batch dies in its full suite after the cap probes found the entry that breaks the cap (a
     reboot); the rerun, a new batch of the same entries on the same tip, reads the probes of those
     prefixes back, failing ones included, and runs only the full suite: no probe is left to run, since a
-    passed prefix sends the entry after the culprit to the next train unchecked (user msg #2317)."""
+    passed prefix sends the entry after the culprit to the next train unchecked."""
     from ttp import batch
     p, origin, heads, log = _cap_suite_batch(env, monkeypatch)
 
@@ -17010,9 +17010,8 @@ def _full_runs(monkeypatch):
 def test_a_push_batch_split_runs_only_the_new_failing_tests_at_the_prefix_heads(env, monkeypatch):
     """Cell split_failing_ids_only: entry 3 of 4 breaks one test of the first check. The search probes the
     prefixes with only that test, never their whole suite. The prefix the probes showed passing runs only
-    the check that never ran on the full head, not a second full run (task #7758: the first check passed
-    there but for that test), and then pushes at once; entries 3 and 4 go untested to the next train
-    (user msg #2317)."""
+    the check that never ran on the full head, not a second full run (the first check passed
+    there but for that test), and then pushes at once; entries 3 and 4 go untested to the next train."""
     p, repo, origin, other = _push_setup(env, monkeypatch, [_FLAKY_CHECK, _SECOND_CHECK])
     tip = _git_out(origin, "rev-parse", "proj")
     calls = _ids_stub(monkeypatch, tip, lambda tree, sel: {_NEW_ID} if (tree / "e3.txt").exists() else set())
@@ -19664,7 +19663,7 @@ def test_a_push_batch_settles_tests_both_sides_append_to_one_case_file_and_keeps
         assert got.index("def test_tip") < got.index("def test_change") and got.count("@pytest.mark.slow") == 2
         __import__("ast").parse(got)
     elif case == "check_fails":
-        # e1 passed alone and pushed at once (user msg #2317); e2 meets it in the next train, where its
+        # e1 passed alone and pushed at once; e2 meets it in the next train, where its
         # detail names the failing checks: pushq._settle sends it to a standard conflict fix (no kept approval)
         assert _statuses(m) == ["pushed", "requeued"], m
         rc, m = _run_batch(p, _batch_marker(p, heads[1:], bid="b2"), monkeypatch)
@@ -21056,7 +21055,7 @@ def test_a_first_conflict_or_a_capped_rebase_keeps_the_conflict_fix(env, monkeyp
 
 
 def test_ttp_stats_landing_shows_runs_cpu_hours_and_dollars_per_landed_change(env):
-    """User msg #2220 (#2221): `ttp stats --landing` shows per day test runs and full suites, CPU-hours and $
+    """User `ttp stats --landing` shows per day test runs and full suites, CPU-hours and $
     per landed change, and approved to landed median and p90."""
     import datetime as dt
     from ttp import timefmt, trainstats
@@ -21278,7 +21277,7 @@ def test_own_push_from_another_repository_compares_with_its_own_default_branch(e
 
 
 def _stoppable_push(p, monkeypatch, task=7, status="queued", **more):
-    """A detached push marker of task #`task` in project `p`, with this run as task #7 of `p`."""
+    """A detached push marker of task #`task` in project `p`, with this run as of `p`."""
     from ttp import push
     monkeypatch.setenv("TTP_TASK", "7")
     monkeypatch.setenv("TTP_PROJECT", str(p.base))
@@ -22160,7 +22159,7 @@ def test_push_cancel_of_a_queued_push_keeps_the_daemon_from_starting_it(env, mon
 
 def test_a_reviewed_head_lands_from_a_code_task_or_the_coordinator_by_default_and_an_unreviewed_one_does_not(
         env, monkeypatch, capsys):
-    # User msg #2484: the coordinator fixes problems itself, landing its own reviewed fix. By default
+    # The coordinator fixes problems itself, landing its own reviewed fix. By default
     # (delivery.code_tasks_may_push "approved") a code task's or the coordinator's `ttp push` lands a HEAD
     # an independent review approved (an approved push queue row at exactly that commit); an unreviewed
     # head is refused, and a raw `git push` stays refused in both runs.

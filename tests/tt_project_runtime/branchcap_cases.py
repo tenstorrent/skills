@@ -61,7 +61,7 @@ def test_landed_task_branches_are_deleted_once_their_worktree_is_gone_with_a_rec
     local branch once its worktree is gone, and writes branch and sha to state/branch-deletions.jsonl. It
     keeps a branch whose worktree is still there, one not landed, one with a commit by another author,
     one on a remote (it may carry a PR), one whose task has a PR, and one an unfinished task shares
-    (user msg #402's conditions); a dry run deletes nothing."""
+; a dry run deletes nothing."""
     import json
     from ttp import branchcap, worktree
     from ttp.daemon import Daemon

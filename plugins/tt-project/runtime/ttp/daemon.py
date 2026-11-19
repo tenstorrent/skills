@@ -3880,7 +3880,7 @@ class Daemon:
         argv, env = prov.build(role=role, model=model, effort=effort, cwd=cwd, budget_usd=budget_usd,
                                read_only=read_only, schema=schema, restrictions=restrictions,
                                disallowed_tools=denied, denied_reads=no_reads,
-                               web=True)   # every kind, reviews too (user msg #2302); no_internet still wins
+                               web=True)   # every kind, reviews too; no_internet still wins
         # The write fence counts only on the user's own word since runs went unsandboxed (sandboxstate): a
         # leftover true is ignored and told to the coordinator once, never rewritten in project.json.
         fence_on, fence_why, superseded = sandboxstate.fence(self.p, self.cfg, provider)
@@ -4975,7 +4975,7 @@ class Daemon:
 
     def needs_ranking_key(self, fallback: bool) -> None:
         """No ranking key: one low feed line, never a user item, whether a ranking stays in use
-        (`fallback`) or not (user msg #2681); an open item raised before is lowered to it quietly. The
+        (`fallback`) or not; an open item raised before is lowered to it quietly. The
         refresh retries every few minutes, so a saved key resumes the ranking by itself and the line
         clears (alerts.holds)."""
         from . import rankfresh
@@ -12203,7 +12203,7 @@ class Daemon:
         except Exception:
             no_key = False
         if no_key and not coordinator:
-            # No key saved yet (user msg #2681): a status line only; a saved key resumes it (check_logins).
+            # No key saved yet: a status line only; a saved key resumes it (check_logins).
             self.alert(f"auth:{prov}", self._key_status(prov, w.get("to") or []), "low", quiet=True)
         elif coordinator or w["need"]:
             self.alert(f"auth:{prov}", text, "high")

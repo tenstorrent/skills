@@ -605,7 +605,7 @@ def _dispatch_one(p, monkeypatch, flags, **kw):
 
 
 def test_claude_workers_and_reviewers_get_the_full_tool_set(env, monkeypatch, tmp_path):
-    """Workers and reviewers on Claude run on the full Claude Code harness (user msg #2302): no --tools
+    """Workers and reviewers on Claude run on the full Claude Code harness: no --tools
     allowlist, Agent included; ttp.hook holds the rules. Only the web tools under no_internet and the
     project's own denylist are withheld."""
     from ttp.providers import claude
@@ -2578,7 +2578,7 @@ def test_dispatch_pass_memo_keeps_root_reads_until_a_move(tmp_path, monkeypatch)
 
 def test_dispatch_holds_a_duplicate_of_an_open_or_recently_done_task_once(
         env, monkeypatch, tmp_path, reap_tmp_processes):
-    """User msg #2495 (waste): one project ran 27 runs on duplicate same-title tasks. Just before dispatch, a
+    """User (waste): one project ran 27 runs on duplicate same-title tasks. Just before dispatch, a
     task repeating an earlier open task, or one done in the last 14 days (same title, or task_add's
     looks_same), is blocked with one dispatch_held event and nothing runs; the original starts. Its own
     continue lineage, a `differs from #<id>` spec and an explicit requeue after the hold all run."""
@@ -2793,7 +2793,7 @@ def _ended_runs(p, tid, n, cost=0.5, status="error", handoff=None):
 
 
 def test_a_task_at_its_run_cap_is_blocked_and_the_coordinator_told_once(env, monkeypatch):
-    """Upstream user msg #2495 (2a): a task the daemon re-ran 4 times (tier-up retries, restarts) is not
+    """Upstream (2a): a task the daemon re-ran 4 times (tier-up retries, restarts) is not
     dispatched a fifth time. It is blocked, with one run_cap event carrying a model-free summary of each
     run and the last error; an explicit requeue starts the count again, and chains.max_task_runs 0 turns
     the cap off. Runs that never reached the model do not count."""
@@ -2851,7 +2851,7 @@ def test_the_daemons_and_push_queues_own_requeues_never_restart_the_run_count(en
 
 
 def test_a_task_whose_last_runs_spent_money_with_no_progress_is_blocked(env):
-    """Upstream user msg #2495 (2a): two runs in a row that each spent money and handed off neither done
+    """Upstream (2a): two runs in a row that each spent money and handed off neither done
     nor waiting (and, for code, committed nothing) stop the task under the run cap; a waiting hand-off is
     progress, and chains.max_idle_runs 0 turns the check off."""
     from ttp import runcap

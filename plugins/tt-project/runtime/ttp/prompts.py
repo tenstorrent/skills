@@ -807,7 +807,7 @@ def worker_system(p: Project, task: dict | None = None) -> str:
 def worker_memory_block(p: Project) -> str:
     """The user's corrections and the project memory for workers (worker_context's task-free choice),
     leading a run's own prompt: one new entry must not change the system prompt every worker and
-    reviewer shares, which would make each one's first call write the cache afresh (task #51)."""
+    reviewer shares, which would make each one's first call write the cache afresh."""
     _, mem, use = worker_context(p, reserve=WORKER_RANKED_MIN_CHARS)   # the task's own: worker_rules
     # The user's corrections come before the rest of memory, outside its budget (Project.user_corrections).
     fixed = worker_corrections(p)

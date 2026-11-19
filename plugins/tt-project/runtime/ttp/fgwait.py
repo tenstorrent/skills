@@ -1,4 +1,4 @@
-"""A worker's foreground wait holds its worker slot (owner's agent msg #223, "make it efficient").
+"""A worker's foreground wait holds its worker slot.
 
 A worker that runs a remote test in the foreground (`ttp lock <box> -- ...`, a test script over ssh)
 or polls something slow keeps its worker slot for as long as it waits, and on a workstation those

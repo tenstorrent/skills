@@ -28,7 +28,7 @@ def _coord_argv(env, monkeypatch, session=None, budget=1.0):
 
 
 def test_no_session_setting_takes_the_coordinators_tools_away(env, monkeypatch):
-    # User msg #2040: the session is always on; a leftover "mode" of any value keeps its tools.
+    # The session is always on; a leftover "mode" of any value keeps its tools.
     base = _coord_argv(env, monkeypatch, None)[0]
     # The full set: no --tools list (Claude Code's own standard set), hooks on.
     assert "--tools" not in base and "--safe-mode" not in base
@@ -460,7 +460,7 @@ def _coord_settings(argv):
 def test_full_session_coordinator_gets_a_workers_tools_and_guards(env, monkeypatch):
     from ttp import coordsession
     argv, _, _, p = _coord_argv(env, monkeypatch, {"mode": "on"})
-    # Claude Code's full standard tool set, Agent included, as a worker's (user msg #2302): no --tools list,
+    # Claude Code's full standard tool set, Agent included, as a worker's: no --tools list,
     # no --restricted (it drops Bash unless --tools names it), no dontAsk (it refuses what no rule allows).
     assert "--tools" not in argv and "--allowedTools" not in argv
     assert "--safe-mode" not in argv and "--restricted" not in argv
@@ -567,7 +567,7 @@ def test_a_long_foreground_coordinator_command_is_cut_at_its_time_limit(tmp_path
 
 
 def test_full_tools_hook_takes_agent_and_refuses_harness_tools_and_wide_searches(tmp_path, monkeypatch):
-    # User msg #2302: the coordinator has Claude Code's full set; the hook holds a worker's rules on it.
+    # The coordinator has Claude Code's full set; the hook holds a worker's rules on it.
     harness, state, _ = _full_env(tmp_path, monkeypatch)
     for tool, args in (("Agent", {"description": "look", "prompt": "find x", "subagent_type": "general-purpose"}),
                        ("Task", {"description": "look", "prompt": "find x", "subagent_type": "general-purpose"}),
@@ -1303,7 +1303,7 @@ def test_session_on_with_a_provider_is_off_for_one_that_runs_no_session():
     from ttp import coordtools
     assert all(coordtools.session_on({}, n) for n in (None, "claude", "codex", "cursor", "fake"))
     assert not coordtools.session_on({}, "chat") and not coordtools.session_on({}, "no-such-provider")
-    # No setting turns it off (user msg #2040): a leftover "mode": "off" is ignored.
+    # No setting turns it off: a leftover "mode": "off" is ignored.
     assert coordtools.session_on({"coordinator": {"session": {"mode": "off"}}}, "claude")
 
 

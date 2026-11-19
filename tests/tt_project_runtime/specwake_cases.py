@@ -796,7 +796,7 @@ class _TierJev:
 
 @pytest.mark.parametrize("judgment, tier", [(0.1, "light"), (0.9, "standard")])
 def test_a_spec_change_wake_runs_light_when_jev_finds_no_judgment_needed(env, monkeypatch, tmp_path, judgment, tier):
-    """User msg #2230: an escalated wake for a spec change that slept with the wait asks Jev for its tier:
+    """An escalated wake for a spec change that slept with the wait asks Jev for its tier:
     light unless Jev finds judgment is needed. The run note keeps the reason and who chose the tier, and
     a light run that asks for more settles Jev's call as wrong."""
     p = make(env)

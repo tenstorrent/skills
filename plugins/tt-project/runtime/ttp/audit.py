@@ -22,7 +22,7 @@ the project could have saved. Model-free; the review grades it.
 - spend per finished task: the workers' own, and the coordinator's day spread over them; $ per
   done task by kind and tier;
 - plan-billed providers (planuse.py): their dollars are virtual list price, shown apart with the points
-  their plan's windows rose in the window (user msg #140);
+  their plan's windows rose in the window;
 - tasks blocked or waiting longer than `blocked_h` hours now, longest first;
 - push queue: approval to landed per entry that landed in the window, median and p90 (pushq.landing_times);
 - $ per landed change over the last 24 h and 7 d (trainstats.per_landed): booked spend over the commits
@@ -104,7 +104,7 @@ def asks(db: DB, since: float, now: float, p: Project | None = None) -> list[dic
         m = msgs.get(r["id"]) or {"ts": now, "text": ""}
         rec = m["text"].split(_REC_NOTE, 1)[1].split("\n\n")[0] if _REC_NOTE in m["text"] else ""
         out.append({**r, "question": _short(_ask_question(m["text"])), "recommendation": _short(rec, 100),
-                    "full": " ".join(m["text"].split()),   # an ask still open is quoted whole (user msg #2424)
+                    "full": " ".join(m["text"].split()),   # an ask still open is quoted whole
                     "wait_s": (r["answered_at"] - m["ts"]) if r.get("answered_at") else None,
                     "open_s": None if r.get("answered_at") else _closed_at(r, now) - m["ts"]})
     return out

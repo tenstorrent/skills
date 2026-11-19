@@ -1,4 +1,4 @@
-# Runs on Claude Code's full tool set (user msg #2302): the rules once kept by withholding a tool,
+# Runs on Claude Code's full tool set: the rules once kept by withholding a tool,
 # held by ttp.hook instead (harness tools, search scope, a review's writes, subagents' calls), of
 # tests/test_tt_project_runtime.py, which runs this file in its own namespace (see _include_cases
 # there): helpers, fixtures and imports come from that file. Add new full-harness tests here.
@@ -218,7 +218,7 @@ def test_daily_audit_shows_dollars_per_landed_change_over_24h_and_7d(env, monkey
     assert not any(x.startswith("$ per landed change") for x in audit.lines(p.db, now=now, p=p))
 
 
-# The same rules on the other providers (user msg #1828): chat runs Claude Code itself; Codex edits
+# The same rules on the other providers: chat runs Claude Code itself; Codex edits
 # through apply_patch (its reads go through its shell, the Bash rules); Cursor's hook translates its tools.
 def test_chat_workers_and_reviews_get_claudes_full_tool_set_and_hook(env, monkeypatch):
     from ttp.providers import get_provider

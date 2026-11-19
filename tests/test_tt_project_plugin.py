@@ -63,7 +63,7 @@ def load_leak_patterns(path: pathlib.Path) -> list:
 # the branch owner's handle, which local leak patterns may list; only these exact refs are exempt.
 PUBLISHED_REFS = ("smartonTT/tt-project-dogfood-1", "smartonTT/tt-project")
 # The notice lines of a vendored third-party skill pack (NOTICE, skills/tt-ponytail/SOURCE.md): its
-# upstream copyright line and public source URL stay with it (user msg #3706); only these exact lines.
+# upstream copyright line and public source URL stay with it; only these exact lines.
 VENDORED_NOTICE_LINES = ("https://github.com/DietrichGebert/ponytail", "Copyright (c) 2026 DietrichGebert")
 
 
@@ -120,8 +120,7 @@ def test_worker_prompt_publishes_task_branches_with_push_own():
 
 
 def test_code_plan_and_coordinator_prompts_use_the_vendored_ponytail_skill():
-    """Code workers write in ponytail mode; planners and coordinators ask whether a task needs to exist
-    (user msg #3706). Each names the vendored skill, which ships with the plugin."""
+    """Code workers write in ponytail mode; planners and coordinators ask whether a task needs to exist. Each names the vendored skill, which ships with the plugin."""
     prompts = PLUGIN / "template" / "prompts"
     for name, words in (("kind-code.md", "Ponytail mode"), ("kind-plan.md", "needs to exist at all"),
                         ("coordinator.md", "needs to exist at all")):
@@ -147,7 +146,7 @@ def test_skills_are_discoverable_and_self_contained():
     for path in skills:
         fm = frontmatter(path)
         assert fm["name"] == path.parent.name
-        # The one exception: setup-box, shown as tt-project:setup-box (charter Policies, user msg #548).
+        # The one exception: setup-box, shown as tt-project:setup-box.
         assert fm["name"].startswith("tt-") or fm["name"] == "setup-box", f"{path}: skill names start with tt-"
         assert len(fm["description"]) > 40
     for md in SKILLS.rglob("*.md"):
@@ -2843,7 +2842,7 @@ def test_device_docs_say_broker_jobs_are_preemptable_within_the_cap():
 
 
 def test_setup_box_states_company_etiquette_without_personal_policy():
-    # Company-wide practice only; a user's own limits belong in their charter (user msg #554).
+    # Company-wide practice only; a user's own limits belong in their charter.
     skill = (SKILLS / "setup-box" / "SKILL.md").read_text(encoding="utf-8")
     for part in ("allocated, drained, reserved or down", "release right after it",
                  "Never\n  auto-extend", "hold nothing idle", "charter can narrow these rules"):
@@ -7747,7 +7746,7 @@ def test_worker_prompt_guards_paid_model_api_spend_in_detached_jobs():
     assert not re.search(r"\$\d", raw.split("calling a paid model API", 1)[1].split("\n- ", 1)[0])
 
 
-# Device and ask claims the user corrected (user msg #1171). No shipped skill, prompt, doc, default,
+# Device and ask claims the user corrected. No shipped skill, prompt, doc, default,
 # script or changeset may state one again. The true practice, per claim:
 #  1. Some clusters grant passwordless sudo only for specific reset and diagnostic commands: check
 #     with `sudo -n -l <command>`, never `sudo -n true`; "no sudo, so no glx_reset" is false.
@@ -7762,7 +7761,7 @@ def test_worker_prompt_guards_paid_model_api_spend_in_detached_jobs():
 #     container, never a power reading; fabric-manager and DRA agents are plumbing.
 #  9. A cable short keeps a tray off from power-on; a bus bar drops it under load.
 # 10. Act on answers the user already gave: never re-ask one because it was relayed.
-# 11. (user msg #1571) Neighbours, serving state or site rules the harness infers never hold a
+# 11. Neighbours, serving state or site rules the harness infers never hold a
 #     reset, power cycle, run or install: only the user's own holds and allowlists, a lock, a pause,
 #     a spend cap, a Restriction or a live tenant on that box do.
 # Text that quotes a claim only to call it false carries CLAIM_OK within 300 characters before it;
@@ -7801,7 +7800,7 @@ CORRECTED_CLAIMS = {
 }
 CLAIM_SUFFIXES = {".md", ".json", ".toml", ".yaml", ".yml", ".txt", ".py", ".sh", ""}
 
-# The true practice that replaces the claims (user msg #1171), per point: phrases the shipped
+# The true practice that replaces the claims, per point: phrases the shipped
 # setup-box page `recovery.md` states.
 TRUE_PRACTICE = {
     "glx_reset is the reset": ["The reset is `tt-smi -glx_reset` (with its root-port rescan and a "
@@ -7905,7 +7904,7 @@ def test_setup_box_states_the_true_galaxy_reset_practice():
 
 
 def test_setup_box_blackhole_galaxy_page_states_the_parts_and_paths_and_is_linked():
-    """The Galaxy hardware basics live once in the plugin (user msg #2894): parts, the per-chip PCIe
+    """The Galaxy hardware basics live once in the plugin: parts, the per-chip PCIe
     path with the retimers on the PDB, and the power path through the PDB's DC-DC modules. Device and
     recovery guidance point to the page."""
     box = SKILLS / "setup-box"
@@ -7968,7 +7967,7 @@ def test_worker_prompt_and_harness_skill_state_the_glx_reset_only_practice():
 
 
 def test_prompts_and_harness_skill_run_host_reaching_commands_bare_or_from_a_model_free_pre_step():
-    """Runs are unsandboxed by default (user msg #1663), so the worker, daily-review and coordinator
+    """Runs are unsandboxed by default, so the worker, daily-review and coordinator
     prompts no longer say host names do not resolve. The bare-command rule (upstream note
     fd7ddf9490b3ed3c) lives only in the harness reference, scoped to a project that turned its
     provider's write fence on; a recurring report still comes from a model-free pre-step."""

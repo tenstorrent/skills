@@ -1712,7 +1712,7 @@ def _hold_on_window(p, resets_at: float) -> None:
 
 def test_peer_hold_reads_another_projects_pause_and_spend_gate_with_its_resume_time(env):
     """peerhold.state reads a project on this machine read-only: a spend gate holding new work gives its window's
-    reset, a pause gives its end, and a project that runs or is not here is never reported held (user msg #3496)."""
+    reset, a pause gives its end, and a project that runs or is not here is never reported held."""
     from ttp import peerhold, projpause
     other = make(env, "other")
     assert peerhold.state(other) == {"held": False, "why": "", "until": None}

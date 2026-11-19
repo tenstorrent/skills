@@ -304,7 +304,7 @@ def refusal_limit(row: dict, default: float | None = None) -> float:
 
 
 def over_refused(row: dict, limit: float | None = None) -> bool:
-    """Mark `row` not run (server) when over `limit` of its calls were capacity refusals (user msg #3538): out of
+    """Mark `row` not run (server) when over `limit` of its calls were capacity refusals: out of
     every denominator, unscored and unflagged (its audit flags move to `unscored_flags`), whatever it scored. A
     cell already not run (no model ran) stays as it is. True when it is such a cell."""
     from . import benchnotrun

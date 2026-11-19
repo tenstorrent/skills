@@ -1,5 +1,4 @@
-"""`ttp stats --landing`: what each landed change cost in tests, CPU and dollars, per day in the home zone
-(user msg #2220, #2221: one push train tested once; report test runs, CPU-hours and $ per landed change).
+"""`ttp stats --landing`: what each landed change cost in tests, CPU and dollars, per day in the home zone: one push train tested once; report test runs, CPU-hours and $ per landed change.
 
 Per day: the changes the push queue landed (a queue entry pushed or landed, on its batch's end) and the tasks
 that landed by a direct `ttp push` (task_landings, on their first landing; no approval wait), the task and
@@ -8,7 +7,7 @@ check was narrowed), the push trains that ran checks and their check runs, the C
 recorded (cpu_s, from #2220 on; older runs recorded none), the train check hours (wall), the dollars every
 run that started that day cost, and approval to landed (median, p90 by nearest rank) of the day's landings.
 Dollars are billed dollars only: a plan-billed run's list price is `virtual_usd`, shown apart, and its
-plan's window points are shown per landed change instead (planuse.py; user msg #140).
+plan's window points are shown per landed change instead.
 
 Tests are CPU work: no model spend is counted as test cost. What the checks do cost in model calls is apart
 (checkwait): the worker and review runs that started while their task waited on its own `ttp checks` (the task's

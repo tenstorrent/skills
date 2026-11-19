@@ -125,7 +125,7 @@ def test_chatbridge_maps_a_messages_request_to_chat_completions():
     assert m[3] == {"role": "tool", "tool_call_id": "call_a", "content": "a.py"}
     assert m[4] == {"role": "tool", "tool_call_id": "call_b", "content": "Error: boom"}
     assert m[5] == {"role": "user", "content": "go on"}
-    # Only the user's cap is sent: the client's own max_tokens is dropped, with or without one (user msg #2809).
+    # Only the user's cap is sent: the client's own max_tokens is dropped, with or without one.
     assert chatbridge.to_chat({"max_tokens": 100, "messages": []}, "m", cap=4096)["max_tokens"] == 4096
     assert "max_tokens" not in chatbridge.to_chat({"max_tokens": 9000, "messages": []}, "m")
     assert chatbridge.to_chat({"tools": body["tools"], "tool_choice": {"type": "tool", "name": "Bash"},
@@ -3386,7 +3386,7 @@ def test_live_rows_count_a_tasks_first_chat_run_and_skip_endpoint_faults(env, mo
 
 def test_a_newly_served_model_refreshes_the_ranking_through_the_daemon(env, monkeypatch):
     """The served-models check lists a new model: the daemon refreshes at once; no key, one status line (no
-    user item, user msg #2681), and a saved key resumes the ranking on its next try with no coordinator turn."""
+    user item, ), and a saved key resumes the ranking on its next try with no coordinator turn."""
     from ttp import alerts, modelrank, rankfresh, route
     from ttp.daemon import Daemon
     home = _rank_home(env, monkeypatch)
@@ -3992,7 +3992,7 @@ def test_the_launch_arms_stand_ins_except_for_a_required_pin_and_the_end_keeps_t
 
 
 def test_a_run_a_stand_in_finished_is_the_stand_ins_everywhere_never_the_asked_for_models(env, monkeypatch):
-    """Task #7923 (user msg #1924): a stand-in's work never shows as the asked-for model's: the run's model,
+    """Task #7923: a stand-in's work never shows as the asked-for model's: the run's model,
     ttp stats --runs and the web app's runs, the scoreboard and the demotion samples all name the stand-in."""
     from ttp import modeldemote, modelrank, modelscore, route, web
     from ttp.daemon import Daemon

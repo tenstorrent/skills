@@ -1,6 +1,6 @@
 # Spec-fold tests of tests/test_tt_project_runtime.py, which runs this file in its own namespace (see
 # _include_cases there): helpers, fixtures and imports come from that file. Add new tests of specfold (a
-# worker prompt's spec with its older `## Update` blocks folded, user msg #2271) here.
+# worker prompt's spec with its older `## Update` blocks folded, ) here.
 from __future__ import annotations
 
 

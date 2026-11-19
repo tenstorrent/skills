@@ -59,8 +59,8 @@ def locks_dir(p, res: str, cfg: dict | None = None) -> Path:
 
 
 def holder(p, res: str, who: str, cfg: dict | None = None) -> str:
-    """A holder label: on a shared resource it names the project too, so `task #3` of one project
-    is told apart from `task #3` of another."""
+    """A holder label: on a shared resource it names the project too, so `task #N` of one project
+    is told apart from `task #N` of another."""
     return f"{p.name} {who}" if is_shared(p, res, cfg) else who
 
 

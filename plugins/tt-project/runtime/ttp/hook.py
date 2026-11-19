@@ -1042,7 +1042,7 @@ HARNESS_GH_WHY = ("the harness's gh wrapper (bin/gh) and the project's gh pre-ho
                   "refused (call gh by its name; read them with the Read tool)")
 
 
-# Tools of Claude Code's full standard set (every run has it, user msg #2302) that would step outside
+# Tools of Claude Code's full standard set that would step outside
 # the harness: refused by name, inside subagents too, with the harness's own way instead.
 _WAIT_WAY = ("a headless run ends when its task does, so the CLI's own schedule never wakes it: hand off "
              "`waiting` with a `retry_when`, start long work with `ttp detach`, and ask for a recurring job "

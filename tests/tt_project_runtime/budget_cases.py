@@ -2351,7 +2351,7 @@ def test_a_worker_that_rereads_too_much_context_is_told_once_to_split_where_a_pr
     p = make(env)
     from ttp.daemon import Daemon
     from ttp.project import DEFAULT_CONFIG
-    # Off by default (user msg #2043): a worker compacts its context in place instead of ending its run.
+    # Off by default: a worker compacts its context in place instead of ending its run.
     assert DEFAULT_CONFIG["budget"]["split_reread_tokens"] == {"light": 0, "standard": 0, "deep": 0}
     p.set_config("budget.split_reread_tokens", {"light": 2_000_000, "standard": 4_000_000, "deep": 8_000_000})
     tid = p.db.add_task("long one", "spec", kind="code", tier="standard", origin="user")
@@ -5338,7 +5338,7 @@ def _codex_plan_day(p, now):
 
 
 def test_plan_billed_provider_reports_window_points_not_dollars(env):
-    """User msg #140: on a prepaid Codex plan (or Claude Max) the plan's windows are the usage that counts.
+    """On a prepaid Codex plan (or Claude Max) the plan's windows are the usage that counts.
     ttp stats --landing, the efficiency audit and the status line show its window share; its list-price
     dollars are virtual and stay out of the billed dollars per landed change. Billed by use keeps dollars."""
     p = make(env)

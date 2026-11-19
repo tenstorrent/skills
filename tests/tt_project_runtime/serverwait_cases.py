@@ -599,7 +599,7 @@ def _cap_refused_row(pct, outcome="pass", **kw):
 
 
 def test_serverhealth_a_cell_over_the_capacity_refusal_threshold_is_not_run_server(tmp_path):
-    """User msg #3538: a cell with over 20% capacity refusals is 'not run (server)', not scored and not flagged;
+    """A cell with over 20% capacity refusals is 'not run (server)', not scored and not flagged;
     the threshold is the config key bench.server.capacity_refusal_max (default 20%)."""
     from ttp import benchdaily, benchrun, cli, serverhealth
     hist = serverhealth.History(tmp_path / "h.json")

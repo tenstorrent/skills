@@ -260,7 +260,7 @@ def test_onhost_claims_tell_claims_from_plans():
 
 
 # The shape of a reply that marked plain facts as plans: past and present facts about other work around one
-# line about the work the same batch queues (user msg #1924).
+# line about the work the same batch queues.
 _OH_FACTS = ("The cut passed its review and is in the current push batch (24 changes, started 16:42 PST).",
              "That batch failed its first two check passes and is now working out which change broke them, "
              "so there is no landing time yet.",

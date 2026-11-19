@@ -694,7 +694,7 @@ def test_coord_session_stats_without_session_wakes_say_so(env, capsys):
 
 # The session role's own room over the stateless coordinator role budget (coordinator_role_budget.txt,
 # which stays the stateless role's cap): the order-ledger block the session always carries plus
-# prompts/coordinator-session.md (2900, +100 for its Context-block line, user msg #1785), plus the
+# prompts/coordinator-session.md, plus the
 # session-only `self_change` row of coordinator.md's action table (1300, selfimprove.py), plus the
 # session prompt's Tools section (800, coordtools.py), plus its Running workers line (140, #6311),
 # plus handover item 5's verbatim-check rule (130, #6502), plus the workers' start-context line (270,
@@ -730,7 +730,7 @@ def _cs_session_project(env, monkeypatch):
 
 
 def test_coordsession_compacts_in_place_with_its_summary_and_restores_the_pinned_record(env, monkeypatch):
-    """User msg #2043: a full context compacts inside the running session, never a new one. Where the
+    """A full context compacts inside the running session, never a new one. Where the
     agent has no compaction switch (the fake without TTP_FAKE_AGENT_COMPACTS, like Cursor) the wake asks
     for its session_note; the next wake restores the ledger, the note and the chat from disk."""
     from ttp import coordsession, obligations
@@ -1004,7 +1004,7 @@ def test_coordsession_decide_names_a_transcript_gone_since_a_daemon_restart():
 
 
 def test_both_coordinator_modes_and_the_planner_pass_the_worker_the_context_it_cannot_see(env):
-    """User msg #1785: a worker or planner sees none of the coordinator's context, so each spec, plan
+    """A worker or planner sees none of the coordinator's context, so each spec, plan
     brief and mid-run correction carries a Context block; a plan gives its own tasks the same block."""
     from ttp.prompts import coordinator_role, coordinator_session_role
     p = make(env)
@@ -2378,7 +2378,7 @@ def test_coordsession_wakes_pick_their_cache_ttl_from_the_session_and_a_sessionl
 
 
 def test_coordinator_and_worker_prompts_follow_intent_ask_rarely_and_frame_the_session_as_manager(env):
-    # User msg #1776: read orders by intent (a Restriction binds as written, stricter reading in doubt),
+    # Read orders by intent (a Restriction binds as written, stricter reading in doubt),
     # ask rarely without waiting, decide unless a step could hurt people or speak or pass as a human.
     # The session coordinator is the hands-on manager; the tool-less turn keeps its own role line.
     from ttp.prompts import coordinator_role, coordinator_session_role, worker_system
@@ -3232,7 +3232,7 @@ def test_coordsession_changed_block_tells_a_resumed_session_what_changed_model_f
 
 
 def test_every_session_provider_resumes_with_a_changed_prompt_and_stats_name_each_reason():
-    """Provider parity (user msg #1828): every provider that keeps a session resumes on a prompt change."""
+    """Provider parity: every provider that keeps a session resumes on a prompt change."""
     from ttp import coordsession, coordstats
     from ttp.providers import get_provider
     want = {"claude": "reread", "codex": "diff", "cursor": "reread"}

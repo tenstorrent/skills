@@ -38,7 +38,7 @@ can show the share of each and the fork rate per provider.
 
 The prompt cache matches a request's tools, then its system prompt, then its messages. A fork whose tools
 or system prompt differ from the coordinator's writes the whole copied history to the cache again
-(task #49, measured: Claude Code reported tools_changed; a forked Opus worker wrote about 50k tokens on
+(measured: Claude Code reported tools_changed; a forked Opus worker wrote about 50k tokens on
 its first call and read none). So a fork on the coordinator's model sends the coordinator's last launch's
 prefix (coord_shape, shape_argv): its system prompt and the settings that change the tools' text; the
 run's own system prompt leads its prompt instead (shared_lead). The coordinator's answer schema is never
@@ -49,7 +49,7 @@ history is written to the cache again — the price of a run that answers in its
 model (a Sonnet worker of an Opus coordinator) cannot read that cache, so it forks only the session's last
 turns (about coordinator.session.worker_fork_other_model_tokens, default 8000; "tail" in its note) with the
 same shaped prefix: every such run sends the same tools, system prompt and copied turns, so the first
-after a coordinator wake writes that one cache entry and the rest read it (task #8308: before, all of
+after a coordinator wake writes that one cache entry and the rest read it (before, all of
 them took the disk block, which wrote about 32k tokens per run and counted as no fork). A model outside
 the Claude families, a provider that cannot copy only the last turns, or the setting at 0 takes the disk
 block instead (_model_gap, _other_model_tail). For the same reason a follow-up never resumes a session another model
@@ -493,7 +493,7 @@ def _resume_gap(src: dict, prov, provider: str) -> str:
 def _cross_model(src: dict, model: str | None) -> str:
     """Why a follow-up on another model than the run it would resume starts fresh; "" otherwise. The
     prompt cache is per model, so the copied history was written again in full on its first call and
-    never read (task #53: 4 of 10 cold resumes crossed models). A run or source with no known model
+    never read. A run or source with no known model
     resumes as before."""
     if model and src.get("model") and not same_model(model, src["model"]):
         return f"run {src['run']} ran on {src['model']}, this run on {model}, whose cache cannot read its history"
@@ -613,8 +613,8 @@ def _other_model_tail(p, cfg: dict, prov, model: str | None) -> int:
 def _model_gap(p, model: str | None) -> str:
     """Why a run on another model than the coordinator's takes the disk block, not a fork; "" otherwise.
     The prompt cache is per model: the copied history was cached under the coordinator's model, so a
-    Sonnet fork wrote it again on its first call and read it on every later one (task #51 measured
-    10-69k tokens written per fork; task #74: about $0.025 per run at the median, $0.08 on average,
+    Sonnet fork wrote it again on its first call and read it on every later one (measured
+    10-69k tokens written per fork; about $0.025 per run at the median, $0.08 on average,
     up to $0.40, against the ~7k token disk block). A run with no --model, or a coordinator whose
     model is unknown, forks as before; one _other_model_tail gives a size forks only the last turns."""
     cm = coord_model(p) if model else ""

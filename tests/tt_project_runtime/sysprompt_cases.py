@@ -45,7 +45,7 @@ def test_a_large_coordinator_system_prompt_goes_by_file_and_execs(env, monkeypat
     spec, run = _start_coordinator(env, monkeypatch, {claude.APPEND_SYSTEM_FILE: True,
                                                       claude.SYSTEM_PROMPT_FILE: True}, head)
     argv = spec["argv"]
-    # A full-tools session keeps Claude Code's own system prompt and appends ours (user msg #2302).
+    # A full-tools session keeps Claude Code's own system prompt and appends ours.
     assert argv[argv.index("--append-system-prompt-file") + 1] == str(run / "system.md")
     assert not [a for a in argv if a.startswith("--system-prompt")] and (run / "system.md").read_text() == head
     assert max(len(os.fsencode(a)) for a in argv) < ARG_STRLEN

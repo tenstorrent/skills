@@ -219,7 +219,7 @@ def test_a_glm_work_start_the_endpoint_refuses_runs_on_sonnet_high_and_its_note_
 
 
 def test_a_glm_hand_off_asking_for_opus_or_deep_bounces_fresh_to_opus_with_its_summary_and_the_switch_restores_the_old_way():
-    """Lever 8 (user msg #3643): a GLM run on either route whose hand-off has needs_opus, or needs_deep on any end
+    """Lever 8: a GLM run on either route whose hand-off has needs_opus, or needs_deep on any end
     but done, is a bounce (requeued fresh on Opus, no attempt); route.glm_work.bounce false keeps the old way."""
     import inspect
     from ttp import daemon, glmwork

@@ -2985,7 +2985,7 @@ def _spill_hosts_read(monkeypatch, loads: dict, cores=64, mem_gib=200):
 
 
 def test_spill_never_starts_a_check_on_a_host_whose_load_is_near_its_cores(env, tmp_path, monkeypatch):
-    """#8016 (user msg #2469: runs kept choking one box): a host whose 1-minute load is at or above
+    """#8016 (runs kept choking one box): a host whose 1-minute load is at or above
     checkspill.LOAD_NEAR x its cores gets no new check, whatever its slots; this machine's runs started there
     within LOAD_LAG_S count as load already (the 1-minute load shows them late), so a burst of picks fills a
     host only to the gate and then waits, never piling on."""
@@ -4002,7 +4002,7 @@ def test_a_queued_run_spills_to_the_most_free_host_with_workers_sized_to_its_fre
 
 
 def test_the_spill_pick_spreads_counting_claims_not_yet_running_against_free_slots(env, tmp_path, monkeypatch):
-    """#7996 (spill_pick_spreads, user msg #2469): the pick goes to the host with the most free slots less this
+    """#7996: the pick goes to the host with the most free slots less this
     machine's claims there that its probe did not see running yet, not the first host with any slot."""
     from ttp import checkspill
     p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"])
@@ -4026,7 +4026,7 @@ def test_the_spill_pick_spreads_counting_claims_not_yet_running_against_free_slo
 
 
 def test_a_host_wide_checks_wait_names_its_cap_and_where_the_cap_comes_from(monkeypatch):
-    """#7996 (user msg #2469): the host-wide cap in a wait line says its number and source: the setting, or the
+    """#7996: the host-wide cap in a wait line says its number and source: the setting, or the
     free-core fit while checks.host_max is unset."""
     from ttp import checkcap
     monkeypatch.delenv("TTP_CHECKS_HOST_MAX", raising=False)
@@ -5003,7 +5003,7 @@ def test_on_a_workstation_a_heavy_run_waits_for_a_busy_spill_host_and_never_runs
 
 def test_a_workstations_wait_for_a_busy_spill_host_says_so_and_holds_no_checks_slot(env, tmp_path, monkeypatch,
                                                                                      capsys):
-    """Owner's msg #303 (checks waited an hour as "queued for a host-wide checks slot ... 0 running, 0 queued"):
+    """Owner's (checks waited an hour as "queued for a host-wide checks slot ... 0 running, 0 queued"):
     a workstation's wait for a busy spill host holds no checks slot here, so its `--result` probe says it waits
     for the spill host and the queue report files it under busy spill hosts, never offering a raise of the
     host-wide checks cap."""
@@ -5044,7 +5044,7 @@ def test_a_workstations_wait_for_a_busy_spill_host_says_so_and_holds_no_checks_s
 
 @_LINUX_TMP
 def test_on_a_workstation_checks_that_fail_on_two_spill_hosts_fail_without_another_run(env, tmp_path, monkeypatch):
-    """Owner's msg #303: a workstation never runs heavy checks here while a spill host is busy, so a change that
+    """A workstation never runs heavy checks here while a spill host is busy, so a change that
     fails everywhere went from host to host, then waited for the last one for hours. Failing alike on
     checkspill.FAIL_VERDICT_HOSTS spill hosts is its verdict: it fails at once, never runs here or again."""
     from ttp import checkspill, cli

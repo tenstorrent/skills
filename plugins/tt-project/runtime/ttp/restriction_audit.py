@@ -128,7 +128,7 @@ def tool_terms(old: str, new: str, charter: str = "",
 COMMON_SHARE = 0.005
 COMMON_MIN = 20       # ... and on more than this many lines: on a small tool tree 0.5% is a line or two,
                       # and the harness's own scripts alone name 'reset' or 'host' on ten
-# Whole words (clause_words) of a citation rather than a rule: "(user msg #12)", "the user's word, October 5".
+# Whole words (clause_words) of a citation rather than a rule: "(user msg)", "the user's word, October 5".
 CITE_WORDS = frozenset({"user", "users", "word", "words", "message", "messages", "msgs", "january", "february", "march",
                         "april", "june", "july", "august", "september", "october", "november", "december"})
 
@@ -407,7 +407,7 @@ FIX_KINDS = ("code", "harness")   # task kinds that change tools
 
 def landed_fix(p: Project, over: str, end: float | None = None) -> str:
     """What `over` (the retirement note of a Restrictions item) names that already updated the tools: a done
-    or landed code or harness task ("task #12", "#12"; a user-message cite is no task), or a commit on HEAD of
+    or landed code or harness task ("task #N", "#12"; a user-message cite is no task), or a commit on HEAD of
     the project root's or the harness's git repo (its first 4 hashes, each git call bounded by the time left
     before `end`, a monotonic deadline). "" when it names none."""
     from .restriction_source import CITE_RE

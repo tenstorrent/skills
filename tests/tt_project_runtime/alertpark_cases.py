@@ -114,7 +114,7 @@ def test_a_logout_whose_work_fails_over_is_a_feed_line_only(env, monkeypatch):
 
 
 def test_a_missing_ranking_key_is_a_status_line_with_or_without_a_ranking(env):
-    # Until the user saves a ranking key, nothing alerts or asks about it (user msg #2681).
+    # Until the user saves a ranking key, nothing alerts or asks about it.
     from ttp import alerts, rankfresh
     from ttp.daemon import Daemon
     p = make(env)
@@ -130,7 +130,7 @@ def test_a_missing_ranking_key_is_a_status_line_with_or_without_a_ranking(env):
 def test_a_missing_chat_key_is_a_status_line_and_a_saved_key_resumes_its_work_unprompted(env, monkeypatch):
     # The chat endpoint's key is not saved yet: its logout is a status line, never a sign-in ask, even
     # for work pinned to it. Saving the key resumes routing on the next check_logins tick, with no
-    # coordinator turn, and the pinned task may start (user msg #2681).
+    # coordinator turn, and the pinned task may start.
     from ttp import alerts, endpoint, project
     from ttp.daemon import Daemon
     from ttp.providers import get_provider

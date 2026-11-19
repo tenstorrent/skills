@@ -1296,7 +1296,7 @@ def test_a_charter_retirements_phrase_a_current_item_or_a_later_memory_entry_sta
 
 
 def test_a_retired_phrase_that_only_cites_user_messages_still_cited_is_advisory(env):
-    """A retired entry's citation header ("owner's order, user msg #41") quoted in a task is advisory while live
+    """A retired entry's citation header quoted in a task is advisory while live
     memory or the charter still cites every message it names, for memory and charter retirements alike; a
     header citing a message nothing live cites, and a real retired rule phrase, keep their fix orders."""
     from ttp import echoes

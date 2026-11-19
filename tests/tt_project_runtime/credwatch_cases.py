@@ -140,7 +140,7 @@ def test_credwatch_covers_every_file_under_the_write_guards_protected_paths_by_s
             str(home / ".ssh" / "known_hosts.d" / "id_site2"),
             str(home / ".config" / "example-missing"), str(home / ".netrc")} <= set(watched), sorted(watched)
     assert not any(p.endswith(("known_hosts", "hosts_site2", "state.yml", "c.json", "/config")) for p in watched), \
-        sorted(watched)   # ssh's client config holds settings, not keys (owner's agent, msg #131)
+        sorted(watched)   # ssh's client config holds settings, not keys
     assert credwatch.changes(before, credwatch.snapshot(watched)) == [], "an unchanged run passes"
     time.sleep(0.05)   # past the kernel's coarse ctime tick
     tok = access / "token"
