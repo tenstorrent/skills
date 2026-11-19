@@ -2735,6 +2735,25 @@ def test_wall_cap_extends_a_run_still_progressing_and_stops_a_silent_or_stalled_
     assert checkwall.Extension(3600).room == 1800
 
 
+def test_a_check_printing_but_stuck_at_0_percent_is_stopped_after_15_min_not_left_to_the_cap(tmp_path, monkeypatch):
+    # #9048: shards skipped every held pool host and printed `[0%] 0/273` for 2 h until the wall-time cap.
+    from ttp import checkwall
+    now = _test_clock(monkeypatch)
+    with open(tmp_path / "checks.log", "a") as out:
+        with pytest.raises(checkwall.Stalled) as e:
+            checkwall.wait(_ProgressProc(out, lambda n: 0), out, 7200, 600, extend=checkwall.Extension(7200))
+        assert isinstance(e.value, checkwall.Silent) and e.value.timeout == checkwall.ZERO_S == 900
+        assert 900 <= now[0] <= 960, now
+        now[0] = 0.0   # slow but past 0% once: left to the cap and Extension, as before
+        assert checkwall.wait(_ProgressProc(out, lambda n: 0 if n < 30 else min(100, n - 29)), out, 7200, 600) == 0
+        assert now[0] > 900, now
+        now[0] = 0.0   # the silence stop off (silent_s 0): so is this one
+        assert checkwall.wait(_ProgressProc(out, lambda n: 0 if n < 60 else 100), out, 7200, 0,
+                              extend=checkwall.Extension(7200)) == 0
+    said = checkwall.said_for({"check": "pytest -q", "stall_s": 900, "silent_s": None, "head": "ab" * 20})
+    assert "progress stayed at 0% for 15 min" in said and "not a pass" in said
+
+
 def test_wall_cap_progress_reads_never_close_the_check_log_the_run_still_writes(tmp_path, monkeypatch):
     # The checks log is opened by descriptor (open_append: its name is a number); reading its progress at
     # the cap, extended or stopped, leaves it open for the lines the run writes after.
