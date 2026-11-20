@@ -3409,9 +3409,9 @@ def test_wakecost_daemon_alarms_once_and_asks_the_same_session_to_shrink(env, mo
     assert p.db.kv("alerts_sent")["coord-wake-cost"] == sent   # one alarm per episode, not one per wake
 
 
-def test_wakecost_alarm_stays_in_the_web_app_unless_opted_in_or_it_needs_the_user(env, monkeypatch):
-    """#8356: the cost-per-wake alarm is recorded for the web app only (no chat, the quiet channel); with
-    notify.chat_cost_alarm, or a text that needs the user, it goes to the chats too."""
+def test_wakecost_alarm_stays_in_the_web_app_unless_it_needs_the_user(env, monkeypatch):
+    """#8356: the cost-per-wake alarm is recorded for the web app only (no chat, the quiet channel); a
+    text that needs the user goes to the chats too."""
     from ttp import alerts, wakecost
     from ttp.daemon import Daemon
     p = make(env)
@@ -3428,9 +3428,6 @@ def test_wakecost_alarm_stays_in_the_web_app_unless_opted_in_or_it_needs_the_use
     m = alarm()
     assert m["chat"] is None and m["channel"] == alerts.QUIET
     said["text"] = "Coordinator cost per wake is high and needs your approval to raise the cap."
-    assert alarm()["channel"] != alerts.QUIET
-    said["text"] = "Coordinator cost per wake is high: the median of the last 5 wakes is $1.50."
-    p.set_config("notify.chat_cost_alarm", True)
     assert alarm()["channel"] != alerts.QUIET
 
 

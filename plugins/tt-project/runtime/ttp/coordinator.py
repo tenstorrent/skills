@@ -114,7 +114,6 @@ from . import (   # one name per line: two changes adding names merge without a 
     startbreaker,
     sweep,
     throughmute,
-    throughput,
     tierfloor,
     timefmt,
     tried,
@@ -146,7 +145,6 @@ from . import wakecost
 from . import spans
 from . import coordtools
 from . import pointers
-from . import settlehook
 from . import ctxblock
 from . import overlap as file_overlap   # apply() has a local `overlap`
 from . import screen as scr
@@ -424,20 +422,6 @@ def _connect_timeout(key: str, v) -> int:
     return n
 
 
-def _max_workers(v):
-    """machine.max_workers: a whole number of at least 1, or null, none or auto for unset (half the
-    cores, machinecap.BASE_MIN..BASE_MAX)."""
-    if v is None or str(v).strip().lower() in ("null", "none", "auto"):
-        return None
-    try:
-        n = int(v) if not isinstance(v, bool) and float(v) == int(float(v)) else 0
-    except (TypeError, ValueError, OverflowError):
-        n = 0
-    if n < 1:
-        raise ValueError("machine.max_workers: give a whole number of at least 1, or null for the default")
-    return n
-
-
 def _pace_from(v):
     """machine.pace_from: moderate or heavy."""
     w = str(v).strip().lower()
@@ -448,8 +432,8 @@ def _pace_from(v):
 
 USER_SETTABLE = {
     "budget.daily_usd": float, "budget.weekly_usd": float, "budget.reserve_pct": float,
-    "budget.global_daily_usd": float, "budget.daily_target_usd": float, "budget.day_start": str, "budget.timezone": str,
-    "budget.max_parallel_workers": int, "machine.worker_limit": str, "machine.max_workers": _max_workers, "machine.pace_from": _pace_from, "budget.urgent_extra_slots": int, "budget.urgent_preempt": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
+    "budget.global_daily_usd": float, "budget.day_start": str, "budget.timezone": str,
+    "budget.max_parallel_workers": int, "machine.worker_limit": str, "machine.pace_from": _pace_from, "budget.urgent_extra_slots": int, "budget.urgent_preempt": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     "coordinator.urgent_start_wait_min": int,
     "coordinator.status_footer": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     "budget.urgent_topup": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
@@ -457,8 +441,6 @@ USER_SETTABLE = {
     "budget.reset_credit_min_hours": float, "budget.reset_credit_expiry_hours": float,
     "budget.reset_credit_expiry_use_pct": float, "notify.slack": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     "notify.slack_min_severity": str, "notify.chat_min_severity": str, "core_provider": str,
-    "notify.chat_status": lambda v: str(v).lower() in ("1", "true", "yes", "on"),   # chatdigest.to_chat
-    "notify.chat_cost_alarm": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     "coordinator.tier": str, "coordinator.model": str, "coordinator.model_tier": str, "coordinator.effort": str,
     "jev.enabled": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     # The stay-off watchdog's alert switch (occupancy.settings): off keeps flags for status, posts nothing.
@@ -616,8 +598,6 @@ USER_SETTABLE = {
     # The median cost of the last 5 session wakes at which one alarm goes out and the session shrinks
     # itself in place (wakecost.py): dollars, 0 or off for no check.
     "coordinator.wake_cost_alarm_usd": lambda v: wakecost.threshold_of(v),
-    # The project's own model-free settle hook for routine event batches (settlehook.py): "" is off.
-    "coordinator.settle_cmd": settlehook.cmd_of,
     # The in-turn dry run of a session coordinator's answer (coordprecheck.py): true (default) or false.
     "coordinator.answer_precheck": lambda v: v is True or str(v).strip().lower() in ("1", "true", "yes", "on"),
 }
@@ -1616,8 +1596,6 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     prog_lines, prog_id = progress.digest_lines(db, now)
     section("progress", prog_lines, prog_id,
             f"## Progress: {len(prog_lines) - 1} stuck (as last turn; act on each or say why it is fine)")
-    if daily := throughput.daily_line(db, p.config(), now):
-        section("daily_tasks", [daily])
     mem = memory_budget_line(p)
     if mem:
         section("memory_budget", [mem], mem, mem.split(";")[0] + " (as last turn)")

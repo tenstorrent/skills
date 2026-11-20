@@ -897,19 +897,15 @@ LINK_PATHS = [".venv"]   # worktree.link_paths: the default
 NEVER_OWN_KINDS = ("review", "harness")   # reviews work in the change's worktree, harness tasks in the harness
 
 
-def gets_worktree(p: Project, kind: str) -> bool:
-    """Whether a task of this kind runs in a worktree of its own: code always; another kind when
-    `worktree.kinds` lists it (off by default: a fresh worktree lacks the root's untracked build
-    trees, outputs and submodule checkouts that such tasks often use, which no check can tell from
-    disposable ones; the root's HEAD is guarded instead: Daemon.guard_root_head). Never review or harness."""
-    if kind == "code":
-        return True
-    kinds = (p.config().get("worktree") or {}).get("kinds")
-    return kind not in NEVER_OWN_KINDS and isinstance(kinds, list) and kind in kinds
+def gets_worktree(kind: str) -> bool:
+    """Whether a task of this kind runs in a worktree of its own: code only (a fresh worktree lacks the
+    root's untracked build trees, outputs and submodule checkouts other kinds often use; the root's
+    HEAD is guarded instead: Daemon.guard_root_head)."""
+    return kind == "code"
 
 
 # The tasks that ran in a worktree of their own, as SQL over tasks: code, and another kind
-# gets_worktree gave one (its branch is ttp/t<id>-...). Their commits are on that branch only.
+# that had one (its branch is ttp/t<id>-...). Their commits are on that branch only.
 OWN_WORKTREE_SQL = "(kind='code' OR (kind NOT IN ('review','harness') AND branch LIKE 'ttp/t' || id || '-%'))"
 
 
@@ -1321,7 +1317,7 @@ def branches_early(p: Project, task: dict) -> bool:
     another repository and continues no task whose head it would take instead. Any other task runs on
     the code as it is, so it must wait for the real landing."""
     t = dict(task)
-    if t.get("kind") in NEVER_OWN_KINDS or not gets_worktree(p, t.get("kind") or ""):
+    if not gets_worktree(t.get("kind") or ""):
         return False
     if carried_branch(t) or pr_repo(p, t) or not is_git(p.root):
         return False
@@ -1979,10 +1975,10 @@ def needed_by(task: dict, open_tasks: list[dict]) -> dict | None:
 def may_work_in(p: Project, task: dict, user: dict) -> bool:
     """Whether `user`, an unfinished task that needs `task`, may work in task's worktree rather than
     only read its commits: a code task (it may branch from it), a review (it runs `ttp push` there),
-    a kind gets_worktree gives a worktree of its own, a task continuing it, one whose spec names the
-    worktree's path, and a row whose kind is not known."""
+    a task continuing it, one whose spec names the worktree's path, and a row whose kind is not
+    known."""
     kind = user.get("kind")
-    return (not kind or kind in ("code", "review") or gets_worktree(p, kind) or continues_id(user) == task["id"]
+    return (not kind or kind in ("code", "review") or continues_id(user) == task["id"]
             or task["id"] in worktree_refs(user.get("spec")))
 
 

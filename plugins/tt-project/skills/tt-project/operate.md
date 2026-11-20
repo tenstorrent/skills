@@ -410,11 +410,9 @@ Every project cuts its queue times with the resources its charter allows (the te
   detached HEAD; with neither known they wait with that reason.
   Code tasks always get their own worktree (a project root that is no git repo: the worker makes
   one named after its task id; two live tasks never share a branch or worktree: dispatch holds the
-  later one until the other ends); `worktree.kinds` (default `[]`) gives other kinds one
-  too (say `["work"]`; never harness). A review runs in the worktree holding the branch it reviews,
-  else in a detached worktree of its own at the reviewed head (`worktrees/t<id>`), never the root. Off by default because a fresh worktree lacks the
+  later one until the other ends); other kinds work in the root. A review runs in the worktree holding the branch it reviews,
+  else in a detached worktree of its own at the reviewed head (`worktrees/t<id>`), never the root. Other kinds get none because a fresh worktree lacks the
   root's untracked build trees, outputs and submodule checkouts that work tasks often use (no check
-  tells them from disposable ones); work tasks in the root must leave its HEAD alone. Such a
-  task's branch gets the local-only, backup and integrity checks of a code task, but no review.
+  tells them from disposable ones); work tasks in the root must leave its HEAD alone.
 - Coordinator failing repeatedly → an alert says so; messages are kept, not lost.
 - A worker that produces nothing for too long is stopped and retried (stall guard).

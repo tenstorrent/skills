@@ -77,7 +77,6 @@ def test_the_digest_goes_at_most_every_n_hours_and_only_with_content(env, monkey
     monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
     p = make(env)
     p.set_config("coordinator.chat_digest_h", 2)
-    p.set_config("notify.chat_status", True)   # the opt-in: the digest goes to the chat
     cfg, t0 = p.config(), 1_800_000_000.0
     assert chatdigest.flush(p, cfg, t0) == []   # nothing held: no digest
     chatdigest.hold(p.db, "c1", "#12 is queued for a worker.", "progress", t0)
@@ -85,7 +84,7 @@ def test_the_digest_goes_at_most_every_n_hours_and_only_with_content(env, monkey
     assert chatdigest.flush(p, cfg, t0 + 3600) == []   # the oldest waited 1 h of 2
     [mid] = chatdigest.flush(p, cfg, t0 + 2 * 3600)
     text = p.db.one("SELECT text, chat FROM messages WHERE id=?", (mid,))
-    assert text["chat"] == "c1" and text["text"].startswith("Digest: 2 routine updates since ")
+    assert text["chat"] is None and text["text"].startswith("Digest: 2 routine updates since ")
     assert "#12 is queued for a worker." in text["text"] and "Got it." in text["text"]
     chatdigest.hold(p.db, "c1", "#13 is queued.", "progress", t0 + 2 * 3600 + 60)
     assert chatdigest.flush(p, cfg, t0 + 3 * 3600 + 120) == []   # 2 h since the last digest not yet passed
@@ -93,8 +92,8 @@ def test_the_digest_goes_at_most_every_n_hours_and_only_with_content(env, monkey
     assert chatdigest.counts(p.db)["c1"] == {"sent": 0, "held": 3, "digests": 2, "waiting": 0, "deduped": 0}
 
 
-def test_the_digest_stays_in_the_web_app_by_default(env, monkeypatch):
-    """#8356: without notify.chat_status the digest is recorded for the web app only: no chat, the quiet
+def test_the_digest_stays_in_the_web_app(env, monkeypatch):
+    """#8356: the digest is recorded for the web app only: no chat, the quiet
     channel, so no relay delivers it; it names the chat it was for."""
     from ttp import alerts, chatdigest
     monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
@@ -329,7 +328,6 @@ def test_a_routine_hand_off_within_the_hour_is_folded_into_the_next_status(env, 
     from ttp import chatdigest, hourly, obligations, pushq
     monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
     p = make(env)
-    p.set_config("notify.chat_status", True)   # the opt-in: status posts go to the chat
     p.db.post("in", "hello", chat="main")
     now = time.time()
     chatdigest.mark_status(p.db, "main", now - 600)   # a status went out 10 minutes ago
@@ -348,6 +346,7 @@ def test_a_routine_hand_off_within_the_hour_is_folded_into_the_next_status(env, 
     assert f"- #{a['id']} tidy the docs: done: Docs tidied." in text and f"#{b['id']} speed up a check: done" in text
     assert not [i for i in p.db.kv(chatdigest.KV)["held"]["main"] if i["why"] == chatdigest.HANDOFF]
     # With no table due, status_flush posts the held lines alone once the gap allows.
+    chatdigest.mark_status(p.db, "main", now + 3650)   # a status reply reached the chat
     c = _cd_task(p, "one more")
     pushq._reply(p.db, c, "done", "Done.")
     assert chatdigest.status_flush(p, p.config(), now + 3700) == []
@@ -355,8 +354,8 @@ def test_a_routine_hand_off_within_the_hour_is_folded_into_the_next_status(env, 
     assert got and f"#{c['id']} one more: done" in p.db.one("SELECT text FROM messages WHERE id=?", (got[0],))["text"]
 
 
-def test_held_hand_off_lines_stay_in_the_web_app_without_chat_status(env, monkeypatch):
-    """#8356 with #8341: by default the status post carrying the held hand-off lines is recorded for the web
+def test_held_hand_off_lines_stay_in_the_web_app(env, monkeypatch):
+    """#8356 with #8341: the status post carrying the held hand-off lines is recorded for the web
     app only (no chat, the quiet channel); nothing is lost and no chat gets it."""
     from ttp import alerts, chatdigest, pushq
     monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
@@ -607,9 +606,9 @@ def test_a_reply_the_user_asked_for_goes_at_once_after_a_status_and_a_late_repea
 
 def test_a_held_reply_answers_no_order_and_its_note_says_the_chat_never_got_it(env, monkeypatch):
     """cells: held_order, digest_line. A reply the status gap held never reached the chat: its `no_order`
-    covers nothing (order_gap refuses naming the message), and with notify.chat_status off the coordinator's
+    covers nothing (order_gap refuses naming the message), and the coordinator's
     note on it says it went to the web app only, with the order id."""
-    from ttp import chatdigest, coordinator as coord, turnrules
+    from ttp import coordinator as coord, turnrules
     monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
     p = make(env)
     coord.apply(p, [{"type": "reply", "chat": "c1", "text": "Backlog: 12 tasks open, 3 queued; #40 done."}], turn=1)
@@ -625,13 +624,11 @@ def test_a_held_reply_answers_no_order_and_its_note_says_the_chat_never_got_it(e
     assert gap and gap.startswith(turnrules.PREFIX) and f"#{m}" in gap and "NOT delivered" in gap
     p.db.set_kv(turnrules.NO_ORDER_REFUSED_KEY, [])
     assert turnrules.order_gap(p.db, set(), actions, set(), [m]) is None   # sent: its no_order covers it
-    p.set_config("notify.chat_status", True)
-    assert chatdigest._unseen(p.config(), "c1", actions[0]) == ""
 
 
 def test_a_web_app_only_digest_does_not_start_the_chats_status_gap(env, monkeypatch):
-    """Upstream note d12a28e292fd1e82: a digest the chat never got (notify.chat_status off) leaves its status
-    gap alone; one posted to the chat starts it."""
+    """Upstream note d12a28e292fd1e82: a digest the chat never got (the web app only) leaves its status
+    gap alone."""
     from ttp import chatdigest
     monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
     p = make(env)
@@ -640,7 +637,3 @@ def test_a_web_app_only_digest_does_not_start_the_chats_status_gap(env, monkeypa
     chatdigest.hold(p.db, "c1", "#12 is queued for a worker.", "progress", t0)
     assert chatdigest.flush(p, p.config(), t0 + 2 * 3600)
     assert chatdigest.status_wait(p.db, p.config(), "c1", t0 + 2 * 3600 + 1) == 0
-    p.set_config("notify.chat_status", True)
-    chatdigest.hold(p.db, "c1", "#13 is queued for a worker.", "progress", t0 + 2 * 3600)
-    assert chatdigest.flush(p, p.config(), t0 + 4 * 3600 + 1)
-    assert chatdigest.status_wait(p.db, p.config(), "c1", t0 + 4 * 3600 + 2) > 0

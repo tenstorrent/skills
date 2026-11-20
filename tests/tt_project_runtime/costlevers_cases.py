@@ -1,10 +1,44 @@
 # Cost lever tests of tests/test_tt_project_runtime.py (costlevers.py, wakesettle.py: the cost levers
 # behind rings.coord_wake_settle and rings.output_trim, both off by default), which runs this file
 # in its own namespace (see _include_cases there): helpers, fixtures and imports come from that file
-# and the other case files (_roll, _sh_setup, _ev_x, _drive).
+# and the other case files (_roll, _batch_setup).
 from __future__ import annotations
 
 _LEVERS = ("coord_wake_settle", "output_trim")
+
+
+def _sh_setup(env, monkeypatch):
+    p, d, clock, starts = _batch_setup(env, monkeypatch, busy=0)
+    p.set_config("coordinator.batch_s", 0)
+    p.set_config("coordinator.event_hold_s", 0)
+    p.set_config("coordinator.plain_done_hold_max_s", 0)
+    d.cfg = p.config()
+    p.db.set_kv("last_coordinator_turn", clock[0] + 60)   # no idle or starve wake inside a test's ticks
+    turns = []
+
+    def turn(*a, **k):   # a turn that handles its events
+        starts.append(clock[0])
+        turns.append(k["note"]["events"])
+        p.db.x("UPDATE events SET status='handled' WHERE id IN (%s)" % ",".join(map(str, turns[-1] or [0])))
+    monkeypatch.setattr(d, "start_run", turn)
+    return p, d, clock, starts, turns
+
+
+def _ev_x(p, clock, kind, text, severity, source, task):
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
+           (clock[0], source, kind, severity, text, None, "queued", task))
+    return p.db.one("SELECT MAX(id) i FROM events")["i"]
+
+
+def _drive(d, clock, starts, ticks=12):
+    """Ticks 20 s apart until a turn starts."""
+    n = len(starts)
+    for _ in range(ticks):
+        d.maybe_coordinate()
+        clock[0] += 20
+        if len(starts) > n:
+            return True
+    return False
 
 
 def test_cost_levers_are_off_by_default_and_a_ring_or_the_projects_own_key_turns_each_on(env, capsys):
@@ -47,42 +81,45 @@ def test_wake_decisions_count_every_skip_and_rule_settles_only_whole_routine_bat
     assert "1 settled without a model (quiet 1)" in wakesettle.line(p.db, now - 60, now + 1)
     plain = lambda e: True   # noqa: E731
     # An upstream note alone is settled by rule.
-    up = _ev_x(p, clock, "upstream_note", "a note for the maintainers", "normal", "upstream", None, None)
+    up = _ev_x(p, clock, "upstream_note", "a note for the maintainers", "normal", "upstream", None)
     ids, line = wakesettle.settle(p.db, p.config(), _settle_evs(p, [up]), now, plain)
     assert ids == [up] and "settled by rule" in line
     assert p.db.one("SELECT status FROM events WHERE id=?", (up,))["status"] == "handled"
     # A batch with one event a turn must see settles nothing (all or nothing).
-    up2 = _ev_x(p, clock, "upstream_note", "another note", "normal", "upstream", None, None)
-    hot = _ev_x(p, clock, "observation", "box down", "high", "watcher:x", None, None)
+    up2 = _ev_x(p, clock, "upstream_note", "another note", "normal", "upstream", None)
+    hot = _ev_x(p, clock, "observation", "box down", "high", "watcher:x", None)
     assert wakesettle.settle(p.db, p.config(), _settle_evs(p, [up2, hot]), now, plain) == ([], "")
     assert p.db.one("SELECT status FROM events WHERE id=?", (up2,))["status"] == "queued"
     # A task_done whose hand-off asks for a follow-up, or that is not plain, waits for a turn.
     tid = p.db.add_task("tidy docs", "tidy the docs", kind="work", origin="user")
     p.db.x("UPDATE tasks SET status='done', result=? WHERE id=?",
            (json.dumps({"status": "done", "summary": "ok", "followups": ["continue: the rest"]}), tid))
-    done = _ev_x(p, clock, "task_done", f"#{tid} tidy docs → done: ok", "normal", f"task:{tid}", tid, None)
+    done = _ev_x(p, clock, "task_done", f"#{tid} tidy docs → done: ok", "normal", f"task:{tid}", tid)
     assert wakesettle.settle(p.db, p.config(), _settle_evs(p, [done]), now, plain) == ([], "")
     p.db.x("UPDATE tasks SET result=? WHERE id=?", (json.dumps({"status": "done", "summary": "ok"}), tid))
     assert wakesettle.settle(p.db, p.config(), _settle_evs(p, [done]), now, lambda e: False) == ([], "")
     assert wakesettle.settle(p.db, p.config(), _settle_evs(p, [done]), now, plain)[0] == [done]
     # A re-check observation settles only once a turn met the same one.
-    o1 = _ev_x(p, clock, "observation", "docs index is stale", "normal", "watcher:docs", None, None)
+    o1 = _ev_x(p, clock, "observation", "docs index is stale", "normal", "watcher:docs", None)
     assert wakesettle.settle(p.db, p.config(), _settle_evs(p, [o1]), now, plain) == ([], "")
     p.db.x("UPDATE events SET status='handled' WHERE id=?", (o1,))
-    o2 = _ev_x(p, clock, "observation", "docs index is stale", "normal", "watcher:docs", None, None)
+    o2 = _ev_x(p, clock, "observation", "docs index is stale", "normal", "watcher:docs", None)
     assert wakesettle.settle(p.db, p.config(), _settle_evs(p, [o2]), now, plain)[0] == [o2]
+    # A plain low-severity watcher observation is never held back by never_reason.
+    obs = {"kind": "observation", "severity": "low", "source": "watcher:docs", "text": "docs index is stale"}
+    assert wakesettle.never_reason(obs, None, set()) is None
     # A later turn handling the same task's events counts the settle as reopened.
     assert wakesettle.reopened(p.db, now - 60, now + 10) == (3, 0)
-    _ev_x(p, clock, "task_failed", f"#{tid} broke", "normal", f"task:{tid}", tid, None)
+    _ev_x(p, clock, "task_failed", f"#{tid} broke", "normal", f"task:{tid}", tid)
     p.db.x("UPDATE events SET status='handled' WHERE task=? AND kind='task_failed'", (tid,))
     assert wakesettle.reopened(p.db, now - 60, now + 10) == (3, 1)
     assert "reopened 1/3" in wakesettle.line(p.db, now - 60, now + 10)
 
 
-def test_wake_settle_flag_keeps_the_daemon_from_waking_on_a_routine_batch(env, monkeypatch, tmp_path):
-    p, d, clock, starts, turns = _sh_setup(env, monkeypatch, tmp_path, hook=False)
+def test_wake_settle_flag_keeps_the_daemon_from_waking_on_a_routine_batch(env, monkeypatch):
+    p, d, clock, starts, turns = _sh_setup(env, monkeypatch)
     clock[0] += 60
-    i = _ev_x(p, clock, "upstream_note", "a note for the maintainers", "normal", "upstream", None, None)
+    i = _ev_x(p, clock, "upstream_note", "a note for the maintainers", "normal", "upstream", None)
     assert _drive(d, clock, starts), "off by default: the batch wakes a turn"
     assert i in turns[-1]
     rows = p.db.q("SELECT gate, verb FROM wake_decisions")
@@ -90,14 +127,14 @@ def test_wake_settle_flag_keeps_the_daemon_from_waking_on_a_routine_batch(env, m
     p.set_config("coordinator.wake_settle", True)
     d.cfg = p.config()
     p.db.set_kv("last_coordinator_turn", clock[0] + 60)
-    j = _ev_x(p, clock, "upstream_note", "a second note", "normal", "upstream", None, None)
+    j = _ev_x(p, clock, "upstream_note", "a second note", "normal", "upstream", None)
     assert not _drive(d, clock, starts, ticks=4), "the rule settled it: no turn"
     assert p.db.one("SELECT status FROM events WHERE id=?", (j,))["status"] == "handled"
     assert p.db.one("SELECT COUNT(*) n FROM wake_decisions WHERE gate='rule' AND verb='skip'")["n"] == 1
     # A user message is never held by the rule.
     p.db.x("INSERT INTO messages(ts,direction,chat,kind,text,handled) VALUES(?,?,?,?,?,0)",
            (clock[0], "in", "web", "user", "status?"))
-    _ev_x(p, clock, "upstream_note", "a third note", "normal", "upstream", None, None)
+    _ev_x(p, clock, "upstream_note", "a third note", "normal", "upstream", None)
     assert _drive(d, clock, starts), "a user message wakes a turn"
 
 

@@ -2347,13 +2347,9 @@ def test_idle_slot_wake_backs_off_to_long_waits_while_every_queued_task_is_gated
 
 
 
-def test_a_worker_that_rereads_too_much_context_is_told_once_to_split_where_a_project_sets_the_line(env, tmp_path):
+def test_a_workers_context_re_reads_are_metered_per_run_and_kept_when_it_finishes(env, tmp_path):
     p = make(env)
     from ttp.daemon import Daemon
-    from ttp.project import DEFAULT_CONFIG
-    # Off by default: a worker compacts its context in place instead of ending its run.
-    assert DEFAULT_CONFIG["budget"]["split_reread_tokens"] == {"light": 0, "standard": 0, "deep": 0}
-    p.set_config("budget.split_reread_tokens", {"light": 2_000_000, "standard": 4_000_000, "deep": 8_000_000})
     tid = p.db.add_task("long one", "spec", kind="code", tier="standard", origin="user")
     run_dir = tmp_path / "run"
     run_dir.mkdir()
@@ -2371,47 +2367,19 @@ def test_a_worker_that_rereads_too_much_context_is_told_once_to_split_where_a_pr
     turn(2, 1_000_000)
     d.meter_running()
     assert p.db.one("SELECT cache_read_tokens FROM runs WHERE id=?", (rid,))["cache_read_tokens"] == 2_500_000
-    assert not (run_dir / "steer.md").exists(), "below the standard tier's 4 M line"
-    assert "split" not in json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (rid,))["note"] or "{}")
+    assert not (run_dir / "steer.md").exists(), "a worker is never told to end its run for its re-reads"
     stale = p.db.one("SELECT * FROM runs WHERE id=?", (rid,))
-    turn(3, 1_000_000)
-    d._metered.clear()
-    d.meter_running()
-    assert not (run_dir / "steer.md").exists(), "3.5 M is still below the standard tier's 4 M line"
-    turn(4, 1_000_000)
-    d._metered.clear()
-    d.meter_running()
-    steer = (run_dir / "steer.md").read_text()
-    assert "re-read about 4.5 M tokens" in steer and "`continue:`" in steer and "commit" in steer
-    # The hand-off it asks for names what a fresh hop would otherwise look up: tests and the next command.
-    assert "the test ids you added or touched" in steer and "the exact next command to run" in steer, steer
-    split = json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (rid,))["note"])["split"]
-    assert split["cache_read"] == 4_500_000 and split["limit"] == 4_000_000 and split["ts"] > 0, split
-    turn(5, 2_000_000)
-    d._metered.clear()
-    d.meter_running()
-    assert (run_dir / "steer.md").read_text() == steer, "told once per run"
-    assert json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (rid,))["note"])["split"] == split, "recorded once"
-    # The run ends with a hand-off: its note keeps the steer (even from a row read before it) and adds how.
-    (run_dir / "result.json").write_text(json.dumps({"status": "done", "summary": "half, continue: the rest"}))
+    for n in (3, 4, 5):
+        turn(n, 1_000_000 if n < 5 else 2_000_000)
+        d._metered.clear()
+        d.meter_running()
+    assert p.db.one("SELECT cache_read_tokens FROM runs WHERE id=?", (rid,))["cache_read_tokens"] == 6_500_000
+    assert not (run_dir / "steer.md").exists()
+    (run_dir / "result.json").write_text(json.dumps({"status": "done", "summary": "all of it"}))
     d.finish_run(stale, {"rc": 0})
     row = p.db.one("SELECT note, cache_read_tokens FROM runs WHERE id=?", (rid,))
-    assert json.loads(row["note"])["split"] == {**split, "handoff": "done"}
     assert row["cache_read_tokens"] == 6_500_000
-    from ttp import budget as bud
-    st = bud.reread_stats(p.db, 7)["steered"]
-    assert st == {"runs": 1, "after_avg": 2_000_000, "after_max": 2_000_000, "handoffs": {"done": 1}}, st
-    p.db.x("UPDATE runs SET status='running' WHERE id=?", (rid,))
-    from ttp import hook
-    assert "split line" in hook.unread_update(run_dir)[0], "the worker's hook hands it over"
-    p.set_config("budget.split_reread_tokens", 0)
-    d.cfg = p.config()
-    (run_dir / "steer.md").unlink()
-    d._metered.clear()
-    turn(6, 1)
-    d.meter_running()
-    assert not (run_dir / "steer.md").exists(), "0 turns it off"
-
+    assert "split" not in json.loads(row["note"] or "{}")
 
 
 def test_ttp_stats_reports_reread_tokens_per_run_and_per_dollar_by_kind_and_tier(env, capsys):
@@ -2448,20 +2416,8 @@ def test_ttp_stats_reports_reread_tokens_per_run_and_per_dollar_by_kind_and_tier
     assert cli_rc is None and "Context re-reads, last 7 days: 4 runs, $9.10, 12.52 M cache-read tokens" in out
     assert "worker/code/deep/max: 2 runs, $8.00, 12.00 M (6.00 M per run, median 6.00 M, max 9.00 M)" in out
     assert "big code change" in out
-    assert "Split steer: no run steered" in out
-    for cr, at, how in ((9_000_000, 4_000_000, "done"), (3_000_000, 2_800_000, "waiting")):
-        p.db.x("INSERT INTO runs(task,role,provider,effort,started,ended,status,cost_usd,cache_read_tokens,note) "
-               "VALUES(?,?,?,?,?,?,?,?,?,?)", (code, "worker", "claude", "high", now - 60, now, "ok", 1.0, cr,
-                                              json.dumps({"split": {"ts": now - 30, "cache_read": at, "handoff": how}})))
-    p.db.x("INSERT INTO runs(task,role,provider,effort,started,status,cache_read_tokens,note) VALUES(?,?,?,?,?,?,?,?)",
-           (code, "worker", "claude", "high", now - 60, "running", 4_000_000,
-            json.dumps({"split": {"ts": now - 30, "cache_read": 3_100_000}})))
-    s = bud.reread_stats(p.db, 7, now=now)
-    assert s["steered"] == {"runs": 3, "after_avg": 2_033_333, "after_max": 5_000_000,
-                            "handoffs": {"done": 1, "waiting": 1, "running": 1}}, s["steered"]
-    assert ("Split steer: 3 runs steered, re-read after it 2.03 M avg (max 5.00 M); handed off: done 1, "
-            "waiting 1, running 1") in bud.reread_text(s)
-
+    assert "Split steer" not in out
+    assert "steered" not in s and "Split steer" not in bud.reread_text(s)
 
 
 def test_ttp_stats_leaves_runs_with_no_model_call_out_of_per_run_averages(env, capsys):

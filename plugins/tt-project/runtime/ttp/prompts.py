@@ -179,25 +179,12 @@ REVIEW_PUSH_SECTIONS = ("## Pushing a reviewed change", "## Approving into the p
 OWN_SECTION = "## Publishing onto its own PR branch"   # kind-review.md's `ttp push --own` section
 
 
-SPLIT_MARK = "{{split_lines}}"   # kind-code.md's split threshold, filled in from chains.split_lines
-
-
-def split_lines(cfg: dict) -> int:
-    """chains.split_lines: the non-test lines past which a code worker splits its change; 0 when off or unreadable."""
-    try:
-        return max(0, int((cfg.get("chains") or {}).get("split_lines") or 0))
-    except (TypeError, ValueError):
-        return 0
-
-
 def _sections(text: str, cfg: dict) -> str:
     """A kind prompt without the push section that does not apply: the plain push's or the queue's,
     the `ttp push --own` advice while own pushes are off (delivery.own_push), its upstream note
-    rules while this project does not read the upstream inbox (upstream.ingest), and its split rule
-    while chains.split_lines is off (else with that threshold filled in)."""
-    n = split_lines(cfg)
-    on = ({"upstream_ingest"} if (cfg.get("upstream") or {}).get("ingest") else set()) | ({"split_lines"} if n else set())
-    text = feature_blocks(text, on).replace(SPLIT_MARK, str(n))
+    rules while this project does not read the upstream inbox (upstream.ingest)."""
+    on = {"upstream_ingest"} if (cfg.get("upstream") or {}).get("ingest") else set()
+    text = feature_blocks(text, on)
     text = drop_section(text, REVIEW_PUSH_SECTIONS[0 if push_queue_on(cfg) else 1])
     return own_off(drop_section(text, OWN_SECTION)) if own_push(cfg) == "off" else text
 
@@ -953,7 +940,7 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
                ctxblock._span(old["blocked_reason"], 1500, f"blocked reason of #{old['id']}", tag)
                if old["blocked_reason"] else "")
         history += (f"\nThis task continues #{old['id']} {old['title']} ({old['status']}){on}"
-                    + (", and starts from that branch's head" if on and (branch or gets_worktree(p, kind)) else "")
+                    + (", and starts from that branch's head" if on and (branch or gets_worktree(kind)) else "")
                     + (", and starts from the head of what it reviewed" if old["kind"] == "review" and branch else "")
                     + (f". Its last summary: {was}" if was else "") + "\n")
     if kind == "code" and not branch:
@@ -1004,8 +991,6 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
         + f" · attempt {int(task['attempts'] or 0) + 1} of "
         f"{task['max_attempts']} · budget ${task['budget_usd'] or 0:.2f} (spent ${task['spent_usd'] or 0:.2f})\n"
         f"working directory: {cwd}" + (f" · branch: {branch}" if branch else "") + "\n"
-        + (f"This is a git worktree of your own (worktree.kinds): commit changes to tracked files on {branch}; "
-           "it is not merged anywhere by itself.\n" if branch and kind != "code" else "")
         + f"run dir: {RUN_DIR_MARK} ($TTP_RUN_DIR): the hand-off goes only to its result.json, never to a run "
         "dir named in earlier context\n"
         + _resource_line(task)

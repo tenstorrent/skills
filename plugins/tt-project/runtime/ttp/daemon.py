@@ -73,7 +73,6 @@ from . import runcap
 from . import runclass
 from . import configwho
 from . import integrate
-from . import settlehook
 from . import actdefer
 from . import sidefx
 from . import looks
@@ -240,7 +239,6 @@ from . import reviewhold
 from . import carryback
 from . import reviewreuse
 from . import reviewstats
-from . import splitgate
 from . import reviewsup
 from . import runner
 from . import schedule as sched
@@ -832,11 +830,6 @@ KV_UNREVIEWED_COUNTED = "unreviewed_counted"   # kv: the runtime version whose f
 KV_REVIEW_UNREAD = "review_unread"   # kv: task ids whose review a timed-out git read left unqueued (retry_unread_reviews)
 KV_REVIEW_RETRY = "review_read_retry"   # kv: {task id: first failure} of code tasks whose review's diff read failed
 REVIEW_RETRY_KEEP_S = 7 * 86400   # a read retry the sweep has not settled by then is dropped (logged)
-KV_SPLIT_UNREAD = "split_unread"   # kv: {task id: timed-out split reads} of reviews the split gate deferred
-SPLIT_UNREAD_TRIES = 3   # a split read that times out this often is given up: the review is queued unjudged (logged)
-SPLIT_UNREAD_LINE = ("Review deferred to the next tick: the split check's diff read timed out, so the size of "
-                     "this change is checked again before its review is queued.")
-dbmod.DICT_KV.add(KV_SPLIT_UNREAD)
 PUSH_REFS_EVERY_S = 600   # how often the push queue's pins (refs/ttp/push/<id>) of settled rows are pruned
 
 
@@ -5826,7 +5819,6 @@ class Daemon:
                         "cache_read_tokens=? WHERE id=? AND status='running'",
                         (cost, basis, usage.input_tokens or 0, usage.output_tokens or 0, usage.cache_read_tokens or 0,
                          r["id"]))
-            self._suggest_split(r, usage.cache_read_tokens or 0)
             self._record_running_windows(r, out)
 
     def watch_urgent_messages(self) -> None:
@@ -5881,43 +5873,6 @@ class Daemon:
         acct = self._reading_account(r, wins)
         bud.record_windows(self.p.db, [bud.Window(r["provider"], w["window"], w["utilization"], w.get("resets_at"),
                                                   acct) for w in wins], ts=read_at)
-
-    def _suggest_split(self, r: dict, reread: int) -> None:
-        """Once a worker's run has re-read more context than `budget.split_reread_tokens` allows for
-        its tier, tell it (through steer.md, once) to finish the step it is on and hand the rest on
-        as a follow-up: a fresh run starts from a small context instead of re-reading a huge one on
-        every call."""
-        if r["role"] == "coordinator" or not r["task"] or not r["dir"]:
-            return
-        limit = self.cfg["budget"].get("split_reread_tokens") or 0   # 0: off for every tier
-        task = self.p.db.task(r["task"]) or {}
-        if isinstance(limit, dict):
-            limit = limit.get(task.get("tier") or "standard") or 0
-        if not limit or reread < int(limit):
-            return
-        head = (f"This run has re-read about {reread / 1e6:.1f} M tokens of context (the split line for its tier "
-                f"is {int(limit) / 1e6:.1f} M); every further call re-reads it all again. ")
-        if r["role"] == "reviewer" or task.get("kind") == "review":
-            # A review's `done` approves and its followups are blocking findings: it cannot hand half on.
-            text = head + ("A review does not split: finish it in as few further calls as you can, reading "
-                           "only what is still unchecked. If you already have blocking findings, hand off "
-                           "`failed` with them now. Never hand off `done` without having checked the whole change.")
-        else:
-            text = head + ("Finish the step you are on, commit, and hand off: `done` with a `followups` entry "
-                           "(title starting `continue:`) whose spec is self-contained (what is done, the branch "
-                           "and head, the test ids you added or touched, what is left and the exact next "
-                           "command to run), or `waiting` if that fits. A hop the daemon queues gets the "
-                           "branch's changed files and line ranges added to its spec. Do not start "
-                           "new large steps in this run.")
-        coord._append_update(Path(r["dir"]) / "steer.md", text, f"split-{r['id']}")
-        # When the steer fired and the re-read then, once: `ttp stats` reports what the run re-read
-        # after it and how it handed off (finish_run adds that).
-        row = self.p.db.one("SELECT note FROM runs WHERE id=?", (r["id"],)) or {}
-        note = json.loads(row.get("note") or "{}")
-        if "split" not in note:
-            note["split"] = {"ts": time.time(), "cache_read": reread, "limit": int(limit)}
-            self.p.db.x("UPDATE runs SET note=? WHERE id=?", (json.dumps(note), r["id"]))
-            r["note"] = json.dumps(note)
 
     def _priced(self, r: dict, usage) -> float:
         if usage.estimated and not usage.cost_usd:
@@ -6684,12 +6639,6 @@ class Daemon:
             # A preference pin's ranked stand-in (start_run) refused, as a routed one: skip it
             modelrank.refused(db, r["model"], r["id"], time.time())
             log(self.p, f"model ranking: {r['provider']} refused {r['model']} (run {r['id']})")
-        if "split" not in note:   # the split steer may have fired after `r` was read
-            split = json.loads((db.one("SELECT note FROM runs WHERE id=?", (r["id"],)) or {}).get("note") or "{}")
-            if isinstance(split.get("split"), dict):
-                note["split"] = split["split"]
-        if isinstance(note.get("split"), dict):
-            note["split"]["handoff"] = (_read_result(run_dir / RESULT_FILE) or {}).get("status") or "none"
         if stopped in HUNG_STOPS:
             note["stopped"] = stopped
         if usage.session_id:
@@ -7219,9 +7168,8 @@ class Daemon:
             return state
         if text:
             log(self.p, f"coordinator run {r['id']}: {text}")
-            from . import chatdigest as _chatdigest   # the web app only, unless notify.chat_cost_alarm or it needs the user
-            self.alert("coord-wake-cost", text, "normal", every_s=0,
-                       quiet=not (_chatdigest.to_chat(self.cfg, "cost_alarm") or _chatdigest.urgent(text)))
+            from . import chatdigest as _chatdigest   # the web app only, unless it needs the user
+            self.alert("coord-wake-cost", text, "normal", every_s=0, quiet=not _chatdigest.urgent(text))
         return state
 
     def _session_context(self, r: dict, usage) -> dict | None:
@@ -7756,8 +7704,6 @@ class Daemon:
             head, _ = self._branch_tip(branch)
             if head:
                 self._has_changes(task)
-                if task.get("kind") == "code" and splitgate.split_lines(self.cfg):   # _split_back, _auto_review's size line
-                    self._split_size(task, branch)
                 if (self.cfg.get("delivery") or {}).get("push_branch"):
                     gitmemo.cached(("landed.equivalent", branch), lambda: landed.equivalent(
                         self.p, branch, (self.cfg.get("delivery") or {}).get("version_bump")))
@@ -8803,33 +8749,22 @@ class Daemon:
         reviewable = new == "done" or new == "review" and (urgent.is_urgent(task)
                                                           or bool(obligations.owned_open(db, task["id"]))
                                                           or reviewnow.at_once(self.cfg, new, plain, result))
-        # A change over chains.split_lines goes back to its worker once with a split order, before the review
-        # it would get: only a hand-off that review would follow, so a needs_review request is never swallowed.
-        resplit = self._split_back(task, result, int(task["attempts"] or 0)) \
-            if reviewable and not split and not requeued and self._code_change(task) else ""
-        # A split read that timed out defers the review to the next tick (retry_unread_reviews), which judges
-        # the size again first: the change is neither returned nor reviewed unsplit on this hand-off.
-        unread = resplit == SPLIT_UNREAD_LINE
-        if resplit:
-            text += f"\n{resplit}"
-        if unread:
-            resplit = ""
         # Accepted gap: _auto_review (and _fix_without_commits below) still run a few local ref-metadata git
         # reads inside this transaction (rev-parse, the diff base, rev-list --count), each milliseconds; they
         # are not warmed by gitmemo. All git in this transaction ends within gitmemo.TX_GIT_S (_finish_tx).
-        # One predicate, _code_change, gates the split above, this review, the fix check below and the
+        # One predicate, _code_change, gates this review, the fix check below and the
         # `changes` line: a code task, or a work task whose branch changes anything.
         # Its git reads get a short timeout of their own (gitmemo.FINISH_REVIEW_GIT_S): a slow one marks the
         # review pending for the next tick (retry_unread_reviews), never the transaction's whole budget.
         with gitmemo.bounded(gitmemo.FINISH_REVIEW_GIT_S):
             review = self._auto_review(dict(task, **upd), summary) \
-                if reviewable and not split and not requeued and not resplit and not unread \
+                if reviewable and not split and not requeued \
                 and self._code_change(task) else None
         # A fix of a failed review that adds no commit to the head that review saw leaves its re-review
         # nothing new to check: the re-review is blocked, never run on the same head, and the coordinator
         # decides.
         stale = self._fix_without_commits(dict(task, **upd)) \
-            if new in ("done", "review") and self._code_change(task) and not requeued and not resplit else []
+            if new in ("done", "review") and self._code_change(task) and not requeued else []
         for r in stale:
             why = (f"fix #{task['id']} ended with no new commits on {task['branch']} after the head "
                    f"{r['base']} its review saw: nothing new to re-review")
@@ -8843,7 +8778,7 @@ class Daemon:
                                                  known["status"] == "done" else "was already queued.")
         if reply_text is not None:
             self._hold_reply(task, reply_text, bool(
-                split or resplit or unread or review and (review[1] or not known or known["status"] != "done")))
+                split or review and (review[1] or not known or known["status"] != "done")))
         # A review that failed with fix specs gets its fix and re-review from the daemon, and what waited
         # on it waits on the re-review instead of being blocked. A failure without them still blocks.
         # Upstream notes (also those rerouted to this project) and deferred follow-ups are not fixes:
@@ -8914,7 +8849,7 @@ class Daemon:
         landed_now = changes and bool(db.one("SELECT 1 FROM task_superseded WHERE task=?", (task["id"],)))
         refused: list[str] = []
         hop = self._auto_continue(db.task(task["id"]) or dict(task, **upd), fups, ready, refused) \
-            if ready and not requeued and not resplit and not fix and (review or split or not changes or landed_now) else None
+            if ready and not requeued and not fix and (review or split or not changes or landed_now) else None
         # A follow-up on an open task's branch, files or lineage goes into that task, not a new one (fupfold).
         hopped = {id(fups[0])} if hop or requeued else set()
         folds = fupfold.fold(self.p, self.cfg, db.task(task["id"]) or dict(task, **upd), fups, hopped,
@@ -8962,8 +8897,7 @@ class Daemon:
         # Every proposal queued as an urgent next step and nothing else to read: no turn either.
         settled = bool(quick or folds) and len(fups) <= MAX_FOLLOWUPS and all(id(f) in folded for f in fups) \
             and not notes and sev == "normal" and not hcheck_text
-        routine = ((review is not None and plain) or fix is not None or hop is not None or requeued or resplit
-                   or settled) \
+        routine = ((review is not None and plain) or fix is not None or hop is not None or requeued or settled) \
             and not stale
         # The summary takes what the digest's cap leaves after the header, push note and daemon lines.
         room = min(1200, coord.EVENT_CHARS - len(head) - len(push_note) - len(text))
@@ -12487,17 +12421,6 @@ class Daemon:
                 return
             if lead:
                 w = {"due": "lead"}
-        if evs and not msgs and not rerun and settlehook.command(self.cfg):
-            # The project's own hook settles routine events model-free (settlehook.py).
-            own_n = len([e for e in evs if not alerts.rides_along(e)])
-            evs, hold = self._settle_hook(evs, now)
-            if hold:
-                return
-            # The hook settled every event that would start a turn: what is left waits, unless a wake was
-            # due anyway (w) or a ride-along left is past its hour.
-            if own_n and w is None and not [e for e in evs if not alerts.rides_along(e)] and (
-                    not evs or now - min(e["ts"] for e in evs) < alerts.RIDE_ALONG_MAX_S):
-                return
         if evs and not msgs and not rerun and not lead and not hot and wakesettle.on(self.p):
             try:   # rings.coord_wake_settle: a batch of only routine events is settled by rule (wakesettle.py)
                 ids, line = wakesettle.settle(db, self.cfg, evs, now, self._plain_done)
@@ -12820,45 +12743,6 @@ class Daemon:
             return True   # a plain hand-off leaves the turn nothing to queue: it waits for company
         return busy + self._runnable_count(now) >= slots
 
-    def _settle_hook(self, evs: list[dict], now: float) -> tuple[list[dict], bool]:
-        """Run coordinator.settle_cmd on a routine batch (settlehook.py): (the events left, whether to
-        wait for the hook's answer). A fault settles nothing and raises one low, deduplicated observation."""
-        db = self.p.db
-        tried = self.__dict__.setdefault("_settle_tried", {})
-        run = getattr(self, "_settle_run", None)
-        try:
-            if run is None:
-                cands = settlehook.candidates(db, evs, tried)
-                if not cands:
-                    return evs, False
-                self._settle_run = settlehook.Run(settlehook.command(self.cfg), str(self.p.root), cands)
-                return evs, True
-            if not run.done:   # wait for it while nothing else in the batch needs a turn
-                return evs, settlehook.candidates(db, evs) is not None
-            self._settle_run = None
-            for i in run.ids:
-                tried[i] = now
-            while len(tried) > settlehook.TRIED_MAX:
-                tried.pop(next(iter(tried)))
-            if run.fault:
-                settlehook.fault(db, run.fault, now)
-                log(self.p, f"settle hook: events {sorted(run.ids)}: {run.fault}; none settled")
-                self.observe(settlehook.FAULT_SOURCE, settlehook.fault_text(run.fault), "low",
-                             key=settlehook.FAULT_KEY, pin=True)
-                return evs, False
-            done = settlehook.apply(db, run, now)
-            left = [e for e in evs if e["id"] not in done]
-            if done:
-                log(self.p, "settle hook settled " + "; ".join(f"event {i}: {run.settle[i]}" for i in done))
-                # a turn is avoided only when no event that starts one is left
-                wakesettle.record(db, "hook", "skip", [e for e in evs if e["id"] in done], now,
-                                  None if not [e for e in left if not alerts.rides_along(e)] else 0.0)
-            return left, False
-        except Exception:   # the hook only saves turns: a failure runs the turn
-            self._settle_run = None
-            log(self.p, "settle hook failed: " + traceback.format_exc().replace("\n", " | ")[:1500])
-            return evs, False
-
     def _event_hold(self, evs: list[dict], now: float) -> bool:
         """Routine event-only batches wait until coordinator.event_hold_s after the last turn ended, so
         one turn reads the events that arrive meanwhile (eventhold.py), unless a worker slot is free with
@@ -12958,7 +12842,7 @@ class Daemon:
                        "GROUP BY provider")
         busy = {r["provider"]: r["n"] for r in running}
         try:   # the other projects on this machine count this project's workers (machinecap.py)
-            machinecap.publish(self.p.name, self.cfg, sum(busy.values()))
+            machinecap.publish(self.p.name, sum(busy.values()))
         except Exception as e:
             log(self.p, f"machine-wide worker count not published: {e}")
         self.check_disk()
@@ -19981,10 +19865,6 @@ class Daemon:
             t = db.task(tid) if isinstance(tid, int) else None
             if not t or t["status"] not in ("done", "review") or not self._code_change(t):
                 continue
-            # The split gate judges it first: a read that times out again keeps it pending (bounded,
-            # SPLIT_UNREAD_TRIES); a change over chains.split_lines goes back to its worker, unreviewed.
-            if self._split_back(t, load_result(t["result"]), int(t["attempts"] or 0)):
-                continue
             review = self._auto_review(t, str(load_result(t["result"]).get("summary") or ""), add=True)
             if review and review[1]:
                 queued.append(review[0])
@@ -20218,7 +20098,7 @@ class Daemon:
         # as its continuation, a head no review lands would hold it forever.
         # Nor does one that stalls on the user or a long deferral (chaincap.hop_stall): the head is reviewed now.
         # Nor a continuer working in the project root (_continuation_owner's rule): its review never covers this branch.
-        if any(x["id"] != tid and (continues_id(x) == tid and (worktree.gets_worktree(self.p, x.get("kind") or "")
+        if any(x["id"] != tid and (continues_id(x) == tid and (worktree.gets_worktree(x.get("kind") or "")
                                                                or worktree.carried_branch(db.task(x["id"]) or x))
                                    or x["branch"] == t["branch"])
                and not self._waits_landing(x, tid) and not chaincap.hop_stall(db.task(x["id"]), now) for x in live):
@@ -20350,7 +20230,7 @@ class Daemon:
             "SELECT * FROM tasks WHERE kind!='review' AND status NOT IN (?,?,?) AND id!=? AND labels LIKE ? ORDER BY id",
             (*TERMINAL_TASK_STATES, tid, f'%"continues:{tid}"%'))
             if continues_id(x) == tid and not self._waits_landing(x, tid) and not chaincap.hop_stall(x, now)
-            and (worktree.gets_worktree(self.p, x["kind"]) or worktree.carried_branch(x))
+            and (worktree.gets_worktree(x["kind"]) or worktree.carried_branch(x))
             and (fixes or not any(lb.startswith(("review_fix:", "pr_fix:")) for lb in task_labels(x)))), None)
 
     def _stale_source(self, task: dict) -> str:
@@ -20498,14 +20378,6 @@ class Daemon:
         tag = spans.new_tag()   # this spec's delimiter: the worker's own text is enclosed with it as data
         lines += [f"Its spec: {coord.clip(task.get('spec'), AUTO_REVIEW_SPEC_CHARS)}",
                   f"Its hand-off: {spans.wrap(coord.clip(summary, AUTO_REVIEW_SUMMARY_CHARS), _handoff_of(task), tag)}"]
-        if not ext and not published and branch and splitgate.check(cfg, task, changes):
-            based = ""
-            try:   # over the limit against the default base: read it again against the change's own base
-                changes, based = self._split_size(task, branch)
-            except Exception as e:
-                log(self.p, f"task {task['id']}: its size against its own base was not read: {e}")
-            if size := splitgate.review_line(cfg, task, changes, base=based):
-                lines.append(size)
         if not ext and not published and branch and self._code_change(task) \
                 and (note := policyfiles.review_line(self.p, task, branch)):
             lines.append(note)
@@ -21543,71 +21415,6 @@ class Daemon:
         db.update_task(task["id"], result=dump_result({**stored, replymsg.HELD: text}))
         log(self.p, f"task {task['id']}: its chat reply is held until its review passes and the change lands")
 
-    def _split_back(self, task: dict, result, attempts: int) -> str:
-        """splitgate at the hand-off of task `task` (its row before this hand-off; `result` the new one):
-        the line for its event when its change went back once for a split, else '' (its review is queued
-        as before). A change already approved, landed or superseded is not returned; a miss never stops
-        the hand-off. A diff read that times out returns SPLIT_UNREAD_LINE with the review pending for the
-        next tick (KV_REVIEW_UNREAD, retry_unread_reviews); after SPLIT_UNREAD_TRIES such reads it returns ''
-        and logs that the split gate could not judge the change, so its review is queued unsplit."""
-        branch = task.get("branch")
-        if not branch or not splitgate.split_lines(self.cfg) or task.get("kind") != "code":
-            return ""
-        db, key = self.p.db, str(task["id"])
-        try:
-            changes, based = self._split_size(task, branch)
-        except subprocess.TimeoutExpired as e:
-            tries, _ = db.kv_dict(KV_SPLIT_UNREAD)
-            n = int(tries.pop(key, 0) or 0) + 1
-            if n < SPLIT_UNREAD_TRIES:
-                db.set_kv(KV_SPLIT_UNREAD, {**tries, key: n})
-                self._review_pending(task["id"])
-                log(self.p, f"task {task['id']}: split check's diff read timed out ({e}): review deferred to the "
-                            f"next tick ({n}/{SPLIT_UNREAD_TRIES})")
-                return SPLIT_UNREAD_LINE
-            db.set_kv(KV_SPLIT_UNREAD, tries)
-            log(self.p, f"task {task['id']}: the split gate could not judge it, its diff read timed out {n} times: "
-                        f"reviewed unsplit")
-            return ""
-        except Exception:
-            log(self.p, f"split check of #{task['id']}: " + traceback.format_exc().replace("\n", " | ")[:1000])
-            return ""
-        tries, _ = db.kv_dict(KV_SPLIT_UNREAD)
-        if tries.pop(key, None) is not None:
-            db.set_kv(KV_SPLIT_UNREAD, tries)
-        try:
-            hit = splitgate.check(self.cfg, task, changes, result, load_result(task.get("result")))
-            if hit is None:
-                return ""
-            why, n, limit = hit
-            if why != "return":
-                log(self.p, f"task {task['id']}: {n} non-test lines over chains.split_lines ({limit}), reviewed "
-                            f"unsplit: {why}")
-                return ""
-            if chaincap.approved_or_landed(self.p.db, task["id"]) or self._landed_elsewhere(task):
-                return ""
-            head, _ = self._branch_tip(branch)
-            if not splitgate.send_back(self.p.db, self.cfg, self.p.db.task(task["id"]) or task, n, limit, head,
-                                       attempts, base=based):
-                return ""
-        except Exception:
-            log(self.p, f"split check of #{task['id']}: " + traceback.format_exc().replace("\n", " | ")[:1000])
-            return ""
-        log(self.p, f"task {task['id']}: {n} non-test lines{splitgate.against(based)} over chains.split_lines "
-                    f"({limit}): back to its worker once for a split")
-        return (f"Returned once to its worker for a split ({n} non-test lines{splitgate.against(based)}, over "
-                f"chains.split_lines {limit}): "
-                f"the same task, branch and worktree; no review yet. Its next hand-off is reviewed whatever its size.")
-
-    def _split_size(self, task: dict, branch: str) -> tuple[dict | None, str]:
-        """(lines changed per file, the base they were measured against) of task `task`'s change on `branch`
-        for the split check: against its own base (worktree.own_base), never the gap between another base
-        and the push branch. Read once within a gitmemo scope (warmed by _prefetch_hop)."""
-        def read() -> tuple[dict | None, str]:
-            base, name = worktree.own_base(self.p, task, branch)
-            return worktree.diff_lines(self.p, [branch], base=base), name
-        return gitmemo.cached(("splitgate.size", branch), read)
-
     def _ponytail_approval(self, task: dict, check: dict, result: dict, run_dir) -> str:
         """Why the push queue may not take review `task`'s approval `check` (pushq.check_approval), or '':
         for a code change (sa50: _code_change), labelled or not, each approved head needs the ponytail
@@ -22380,10 +22187,10 @@ class Daemon:
                 return str(self.p.root), None
         # A task carrying a branch (pr_branch:) works on it in a worktree, whatever its kind.
         carries = worktree.carried_branch(task) and task["kind"] not in worktree.NEVER_OWN_KINDS
-        if (worktree.gets_worktree(self.p, task["kind"]) or carries) and worktree.unbare_root(self.p):
+        if (worktree.gets_worktree(task["kind"]) or carries) and worktree.unbare_root(self.p):
             log(self.p, f"task {task['id']}: the project root's .git said core.bare=true, so git saw no work "
                         f"tree there; set it back to false (undo: git config core.bare true)")
-        if (worktree.gets_worktree(self.p, task["kind"]) or carries) and worktree.is_git(self.p.root):
+        if (worktree.gets_worktree(task["kind"]) or carries) and worktree.is_git(self.p.root):
             self.guard_root_head()   # never a worktree branched from a HEAD a task moved the root to
             path, branch = worktree.ensure(self.p, task)
             worktree.keep(path)   # no partial-view `git worktree prune` can orphan it

@@ -67,9 +67,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # Usually set once per machine for every project: `ttp config --account KEY VALUE`. $200 and
         # rolling by default; plan windows never count toward it.
         "global_daily_usd": 200.0,
-        # A spend goal, not a cap: ttp status and the daily review show today's Claude spend against it
-        # (0 = unset, the default; `ttp config --account budget.daily_target_usd <usd>`).
-        "daily_target_usd": 0.0,
         "day_start": "",
         "timezone": "",
         "hourly_alarm_x": 4.0,          # spend rate this many times the 7-day hourly norm = runaway
@@ -94,10 +91,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # own default). Long runs otherwise re-read a huge context on every call. Claude Code
         # accepts 100k to 1M (smaller values become 100k) and compacts about 33k below the window.
         "compact_window_tokens": {"light": 100000, "standard": 150000, "deep": 200000},
-        # A worker whose run has re-read this many context tokens (cache reads, summed over its calls)
-        # is told once to finish its step and hand the rest on as a follow-up (0 = never, the default:
-        # a worker compacts its own context in place instead of ending its run as it grows).
-        "split_reread_tokens": {"light": 0, "standard": 0, "deep": 0},
         # Claude Code keeps a Bash command's output inline up to this many characters (it accepts
         # 4000-128000; its own default is 30000); longer output goes to a file, and the worker gets a
         # short preview and the path. 0 leaves the agent's default.
@@ -278,9 +271,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # turn, is settled without a model run; one runs once the last turn started
                     # quiet_held_max_s ago (0: no limit; quietgate.py; quiet_held false: off).
                     "quiet_held": True, "quiet_held_kinds": ["idle_capacity"], "quiet_held_max_s": 86400,
-                    # A command run on a batch of only routine events (task_done, upstream_note,
-                    # observation) that may settle them without a model; "" is off (settlehook.py).
-                    "settle_cmd": "",
                     # No worker run started for this long while dispatch would start a queued task:
                     # one high observation per stall lists those tasks (Daemon.check_stall; 0: off).
                     "stall_wake_h": 3,
@@ -440,10 +430,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # on the chat provider ('standard/high'; 'off' turns the floor off).
                     "conclusion_floor": {"tier": "standard", "effort": "high"}},
     "notify": {"slack": False, "slack_min_severity": "high", "chat_min_severity": "normal",
-               "hourly_status": True,   # hourly.py: the hourly status table (web app; main chat with chat_status)
-               # chat_status: the chat digest and the hourly table go to chats too; chat_cost_alarm: the
-               # coordinator's cost-per-wake alarm too. Off: the web app only (chatdigest.to_chat).
-               "chat_status": False, "chat_cost_alarm": False},
+               "hourly_status": True},   # hourly.py: the hourly status table (web app)
     # gone_after_s: a relay chat with no `ttp listen` running that left a message unread this long
     # stops counting as a reader of asks and alerts until it reads again (chatgone.py). batch_s:
     # `ttp listen` holds broadcast alerts this long to print them together; lease_s: another relayer
@@ -502,17 +489,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # obligation owner's) continue and next-step follow-ups are queued at once under the same caps (urgentfup).
     # With requeue, a code task whose change is neither approved nor landed is re-queued for that hop
     # itself (chaincap.requeue: same id, worktree and branch) instead of a new task.
-    # split_lines (0 off, the default since user 11-12: do much more work per task): kind-code.md asks a
-    # worker whose change would pass about this many non-test
-    # lines to hand it off in parts, each reviewed and landed on its own (prompts.split_lines); the daemon
-    # sends a larger change back once for a split before its review (splitgate).
     # A task that ran max_task_runs times since its last explicit requeue, or whose last max_idle_runs
     # runs spent money with no hand-off and no commit, is not started again (0 turns one off): it is
     # blocked and the coordinator gets one run_cap event summing up its runs (runcap). A run that handed off
     # waiting on its own checks or job counts toward max_self_waits instead of max_task_runs.
     "chains": {"max_hops": 8, "max_stalls": 2, "max_usd": 40.0, "auto": True, "urgent_followups": True,
                "fold_followups": True,
-               "requeue": True, "split_lines": 0, "max_task_runs": 4, "max_idle_runs": 2, "max_self_waits": 12},
+               "requeue": True, "max_task_runs": 4, "max_idle_runs": 2, "max_self_waits": 12},
     # Each Jev use (e.g. "screen") is switched off once its net saving over window_days is not
     # positive, judged after min_calls calls or once its first call is a window old, or once idle_calls
     # calls in the window changed none of the rules' decisions; uses.<use> = "on" or "off" forces it
@@ -547,8 +530,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # (a task's, a reviewer's, the push queue's; worktree.prepare) gets a symlink to each
     # link_paths entry (relative to the project root) that exists and is git-ignored there and is
     # missing in the worktree, so checks naming `.venv/bin/python` work; [] turns it off. Code tasks
-    # always run in a worktree of their own; `kinds` adds other task kinds (say ["work"]) so they
-    # do not edit the project root's checkout (never review or harness). Making a task's worktree:
+    # always run in a worktree of their own; other kinds work in the project root's checkout. Making a task's worktree:
     # each git command gets git_timeout_s, scaled by the host's load per CPU (at most
     # git_timeout_max_s); create_attempts tries in one go (a whole worktree a timed-out one left is
     # reused, a half-made one remade); then the task is queued again create_retries times, after
@@ -557,7 +539,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # detached or off it is put back when clean, else alerted, and never branched from. shared_branches:
     # more branches many tasks start from (beside main, master, the push branch and delivery.base_ref),
     # which no task claims as its own.
-    "worktree": {"venv": "auto", "link_paths": [".venv"], "kinds": [], "root_branch": "", "shared_branches": [],
+    "worktree": {"venv": "auto", "link_paths": [".venv"], "root_branch": "", "shared_branches": [],
                  "git_timeout_s": 120,
                  "git_timeout_max_s": 900, "create_attempts": 2, "create_retries": 3, "retry_backoff_s": 120},
     # Commits of the harness's own files (charter, memory, schedules): each git command gets timeout_s.
@@ -578,9 +560,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # dead_dep_h blocked on a failed or cancelled dependency (0: off). Urgent, user-ordered, review and
     # obligation-owner tasks never expire.
     "queue": {"expire_h": 48, "dead_dep_h": 24},
-    # Tasks created per day (throughput.daily_line): with daily_target set, `ttp throughput` and the
-    # coordinator's STATE show the tasks created in the last 24 h against it (0: unset, no line).
-    "tasks": {"daily_target": 0},
     # A code task's `premise_cmd:` (premise.py) runs model-free before each dispatch, killed after
     # cmd_timeout_s; an exit 0 lets the task dispatch for recheck_min minutes, then it runs again.
     # landed_guard: a never-run rebase or carry code task whose named commits are all on the push
@@ -679,11 +658,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # One limit on concurrent workers across all projects on this machine (machinecap.py), cut only when
     # the machine is truly short: sustained low CPU idle, memory pressure or swapping, a call with low
     # CPU idle, heat. worker_limit: auto (on for laptops and workstations: macOS or a battery present;
-    # off on lab and build servers), on, off. max_workers: the base before pacing; null holds nothing
-    # while nothing is short and is the cores under pressure. pace_from: moderate, or heavy (only heavy
-    # CPU or memory cut the limit, and this project holds to its own base, not the lowest another set).
+    # off on lab and build servers), on, off. Under pressure the base is the cores. pace_from: moderate,
+    # or heavy (only heavy CPU or memory cut the limit).
     # budget.max_parallel_workers stays each project's own ceiling.
-    "machine": {"worker_limit": "auto", "max_workers": None, "pace_from": "moderate"},
+    "machine": {"worker_limit": "auto", "pace_from": "moderate"},
     # reuse: every ssh the project starts (probes, checks, workers, git over ssh) shares one connection per
     # host for 10 minutes (OpenSSH ControlMaster through the harness's bin/ssh; sockets in ~/.tt-project/cm),
     # so an ssh agent signs once, not per command. Off: each ssh opens its own connection (sshmux.py).
@@ -1036,7 +1014,6 @@ PROVIDER_KEY_TYPES: dict[str, type] = {"write_dirs": list}
 # string, "string" one string, "floor" a string tierfloor.floor_of reads. Nothing else is taken.
 KEY_EXTRA_FORMS: dict[str, tuple[str, ...]] = {
     "budget.compact_window_tokens": ("number",),   # daemon worker start: one window, 0 off
-    "budget.split_reread_tokens": ("number",),     # daemon split check: one split line, 0 off
     "budget.resume_lost": ("false",),              # daemon lost-run resume: not an object, starts fresh
     "waiting.wake_gate": ("false",),               # waitgate.settings: false, every wake starts a turn
     "coordinator.conclusion_floor": ("floor",),    # tierfloor.floor: 'standard/high', 'off'
@@ -1115,6 +1092,15 @@ def _without_bad_sections(raw: dict) -> dict:
 # to set them (unknown_key_hint); `ttp upgrade` drops them from project.json (cli._drop_retired_keys), and
 # `ttp config NAME KEY ''` removes any unknown key present.
 RETIRED_KEYS = {
+    "coordinator.settle_cmd": "removed: off by default and unused",
+    "budget.daily_target_usd": "removed: off by default and unused",
+    "chains.split_lines": "removed: off by default and unused",
+    "notify.chat_status": "removed: off by default and unused; the status digest and hourly table stay in the web app",
+    "notify.chat_cost_alarm": "removed: off by default and unused; a costly wake alerts quietly unless it is urgent",
+    "budget.split_reread_tokens": "removed: off by default and unused",
+    "worktree.kinds": "removed: off by default and unused; only code tasks get a worktree of their own",
+    "tasks.daily_target": "removed: off by default and unused",
+    "machine.max_workers": "removed: off by default and unused; under pressure the base is the cores",
     "coordinator.session.mode": "the coordinator session is always on, with no off switch",
     "coordinator.session.pause_h": "the session spend guard is gone: the dollar caps are the cost limits",
     "budget.hourly_coordinator_usd": "the coordinator's hourly dollar guard is gone: the dollar caps are the cost limits",
@@ -1140,6 +1126,9 @@ def unknown_key_hint(dotted: str) -> str | None:
         if known is None:
             return None
         if part not in known:
+            gone = sorted(k for k in RETIRED_KEYS if k.startswith(".".join(parts[:i + 1]) + "."))
+            if gone and i == len(parts) - 1:   # a whole section of retired keys (tasks after daily_target)
+                return f"{dotted} is retired: {RETIRED_KEYS[gone[0]]}"
             near = difflib.get_close_matches(part, sorted(known), n=1, cutoff=0.6)
             guess = ".".join(parts[:i] + near[:1])
             return f"unknown key {dotted}" + (f" (did you mean {guess}?)" if near else "")
@@ -1520,11 +1509,6 @@ def config_problems(raw: dict, root: Path | None = None, fetch: bool = False) ->
     out += _disk_problems(raw.get("disk"))
     from .outagetask import config_problems as outage_problems
     out += outage_problems(raw)
-    kinds = (raw.get("worktree") or {}).get("kinds") if isinstance(raw.get("worktree"), dict) else None
-    if kinds is not None and (not isinstance(kinds, list) or not all(isinstance(k, str) for k in kinds)):
-        out.append(f"worktree.kinds: {kinds!r} is not a list of task kinds; only code tasks get worktrees")
-    elif kinds and set(kinds) & {"review", "harness"}:
-        out.append("worktree.kinds: review and harness tasks never get a worktree of their own; they are skipped")
     from .coordinator import tool_list   # coordinator imports this module
     for prov, pcfg in (raw.get("providers") or {}).items() if isinstance(raw.get("providers"), dict) else ():
         denied = pcfg.get("disallowed_tools") if isinstance(pcfg, dict) else None
@@ -1556,9 +1540,6 @@ def config_problems(raw: dict, root: Path | None = None, fetch: bool = False) ->
     v = m.get("worker_limit")
     if v is not None and str(v).strip().lower() not in ("auto", "on", "off", "true", "false"):
         out.append(f"machine.worker_limit: {v!r} is not auto, on or off; auto is used")
-    v = m.get("max_workers")
-    if v is not None and (isinstance(v, bool) or not isinstance(v, int) or v < 1):
-        out.append(f"machine.max_workers: {v!r} is not a whole number of at least 1 (or null)")
     v = m.get("pace_from")
     if v is not None and str(v).strip().lower() not in ("moderate", "heavy"):
         out.append(f"machine.pace_from: {v!r} is not moderate or heavy; moderate is used")
@@ -3313,7 +3294,7 @@ def unregister(name: str) -> None:
 CPU_GROUP_KEYS = {"cpu_quota", "busy_cpu_quota", "busy_probe", "busy_probe_s", "cpu_cgroup"}
 # Account-level settings: one file per user and machine that every project reads, below the
 # project's own project.json, so the projects on a machine agree unless one overrides a key.
-ACCOUNT_KEYS = {"budget": {"global_daily_usd", "daily_target_usd", "day_start", "timezone", "push_spend_to"}, "pricing": {"claude", "codex"},
+ACCOUNT_KEYS = {"budget": {"global_daily_usd", "day_start", "timezone", "push_spend_to"}, "pricing": {"claude", "codex"},
                 "guards": {"protected_paths"},   # paths no run on the host writes (pathguard)
                 "route": {"host_max", "classes", "review_small_lines", "code_sonnet", "core_cheap", "device_ab", "device_ab_shadow", "glm_work"},   # route.host_limit; run-class routing (runclass.py); route.device_ab (deviceab.py)
                 "checks": {"host_max", "bare_slots", "idle_hold_s", "load_extra", "live_cores", "nice", "ionice", "priority_turns", "urgent_slots", "preempt_after_s", "test_pool", "test_run_max",

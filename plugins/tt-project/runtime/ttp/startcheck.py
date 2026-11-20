@@ -170,7 +170,7 @@ def check(p: Project, task: dict, now: float | None = None) -> list[str]:
                 f"and the worktree is made again; uncommitted changes are only in {dest}.")
         _observe(p, f"dangling:{task['id']}:{d['gitdir']}", "normal", text, task, now)
         found.append(text)
-    makes = worktree.gets_worktree(p, task["kind"]) or bool(worktree.carried_branch(task))
+    makes = worktree.gets_worktree(task["kind"]) or bool(worktree.carried_branch(task))
     if makes:
         found += _check_base(p, task, now)
     found += _check_known_hosts(p, task, now)

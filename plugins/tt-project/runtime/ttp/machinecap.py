@@ -23,26 +23,19 @@ machine and shared through the state file (the load average and short spikes nev
 Each busy signal multiplies the base by its factor (FACTORS); the limit never drops below 1. An
 unreadable signal counts as not busy, so the limit holds at its base.
 
-While no signal is busy, only a base someone set (machine.max_workers, in any live project) caps the
-machine; with none set, each project's own caps alone apply. Under pressure the default base is the
-cores, so a project left at null never drags the machine below another project's setting.
+While no signal is busy, nothing caps the machine: each project's own caps alone apply. Under
+pressure the base is the cores (BASE_MIN to BASE_MAX).
 
 Config (provenance as any key: a value the user or coordinator set is kept across upgrades):
   machine.worker_limit: auto (default; on for laptops and workstations: macOS or a battery present,
     off on lab and build servers), on, off.
-  machine.max_workers: the base before pacing; null (default) holds nothing while no signal is busy
-    and is the cores (BASE_MIN to BASE_MAX) under pressure.
   machine.pace_from: moderate (default) or heavy. heavy, for a host whose projects only run agents:
-    only heavy CPU or heavy memory cut this project's limit (a call and heat count as before), and the
-    project holds the machine's running workers to its own base, not to the lowest base another
-    project set (that project still holds itself to its own).
+    only heavy CPU or heavy memory cut this project's limit (a call and heat count as before).
 Undo: `ttp config <project> machine.worker_limit off` (each project).
 
 State: TTP_HOME/machine-workers.json, under an fcntl lock (.lock beside it), shared by all projects:
-each project's daemon pid, running workers, the base it set (null: none) and its limit, and the
-last signal reading with the CPU's low-idle start and swap growth carried between readings. The base
-in force is the lowest one a live project set; an older daemon's entry without one counts by its
-published limit. A daemon publishes its running count each dispatch
+each project's daemon pid and running workers, and the last signal reading with the CPU's low-idle
+start and swap growth carried between readings. A daemon publishes its running count each dispatch
 pass and claims a place atomically before each start (claim), so two projects starting in the same
 second cannot both take the last place, and one tick starting all ready work stays under it.
 """
@@ -103,21 +96,9 @@ def enabled(cfg: dict, darwin: bool | None = None, battery=None) -> bool:
     return (DARWIN if darwin is None else darwin) or (battery or has_battery)()
 
 
-def set_base(cfg: dict) -> int | None:
-    """machine.max_workers when set to a number (at least 1), else None."""
-    v = ((cfg or {}).get("machine") or {}).get("max_workers")
-    if v is not None and not isinstance(v, bool):
-        try:
-            return max(1, int(v))
-        except (TypeError, ValueError):
-            pass
-    return None
-
-
-def base(cfg: dict, cpus: int | None = None) -> int:
-    """machine.max_workers when set (at least 1), else the cores within BASE_MIN..BASE_MAX."""
-    v = set_base(cfg)
-    return v if v is not None else max(BASE_MIN, min(BASE_MAX, cpus or hostcpu.cores()))
+def base(cpus: int | None = None) -> int:
+    """The base before pacing: the cores within BASE_MIN..BASE_MAX."""
+    return max(BASE_MIN, min(BASE_MAX, cpus or hostcpu.cores()))
 
 
 def pace_from(cfg: dict) -> str:
@@ -183,15 +164,11 @@ def words(sig: dict, pace: str = "moderate") -> str:
     return ", ".join(f"{k} {v}" for k, v in lv.items()) or "nothing busy"
 
 
-def in_force(own: int | None, lims: list[int], sig: dict, cpus: int | None = None,
-             pace: str = "moderate") -> int | None:
-    """The machine-wide limit from this project's set base `own`, the bases other live projects set
-    (`lims`; ignored with `pace` heavy) and a reading: None (no machine hold) while nothing is busy
-    and no base is set."""
-    bases = [x for x in (own, *(lims if pace != "heavy" else ())) if x]
+def in_force(sig: dict, cpus: int | None = None, pace: str = "moderate") -> int | None:
+    """The machine-wide limit from a reading: None (no machine hold) while nothing is busy."""
     if not levels(sig, pace):
-        return min(bases) if bases else None
-    return limit(min(bases) if bases else base({}, cpus), sig, pace)
+        return None
+    return limit(base(cpus), sig, pace)
 
 
 # -- signal readers (each returns None where it cannot read) --------------------------------------
@@ -314,7 +291,7 @@ def _locked(home: Path | None = None):
 
 
 def forget(project: str, home: Path | None = None) -> bool:
-    """Drop `project`'s row from the shared machine record (a removed project: its pid, running count and base
+    """Drop `project`'s row from the shared machine record (a removed project: its pid and running count
     no longer count toward the machine-wide worker limit); True when it had one. Nothing is created when the
     record does not exist."""
     home = home or _home()
@@ -334,36 +311,25 @@ def _alive(pid) -> bool:
     return True
 
 
-def _others(data: dict, project: str, now: float) -> tuple[int, list[int]]:
-    """(running workers of the other live projects, the bases they set; an older daemon's entry
-    without a base counts by its published limit)."""
-    n, lims = 0, []
+def _others(data: dict, project: str, now: float) -> int:
+    """The running workers of the other live projects."""
+    n = 0
     for name, e in list(data["projects"].items()):
         if not isinstance(e, dict) or now - float(e.get("at") or 0) > STALE_S or not _alive(e.get("pid")):
             data["projects"].pop(name, None)
             continue
         if name != project:
             n += int(e.get("running") or 0)
-            got = e.get("base") if "base" in e else e.get("limit")
-            if got:
-                lims.append(int(got))
-    return n, lims
+    return n
 
 
-def publish(project: str, cfg: dict, running: int, now: float | None = None, home: Path | None = None,
+def publish(project: str, running: int, now: float | None = None, home: Path | None = None,
             pid: int | None = None) -> None:
-    """Record this project's running workers (each dispatch pass, the limit on or off). A project with
-    the limit on also records its set base and its limit now (from the stored reading, none read here),
-    so a lower machine.max_workers binds the others before it starts anything; with it off, neither."""
+    """Record this project's running workers (each dispatch pass, the limit on or off), which the
+    other projects' checks count."""
     now = time.time() if now is None else now
-    on = enabled(cfg)
     with _locked(home) as data:
-        own = {}
-        if on:
-            sig = data.get("signals") if isinstance(data.get("signals"), dict) else {}
-            mine = set_base(cfg)
-            own = {"base": mine, "limit": in_force(mine, [], sig, pace=pace_from(cfg))}
-        data["projects"][project] = {"pid": pid or os.getpid(), "at": now, "running": running, **own}
+        data["projects"][project] = {"pid": pid or os.getpid(), "at": now, "running": running}
 
 
 def check(project: str, cfg: dict, running: int, claim: bool = False, now: float | None = None,
@@ -380,20 +346,19 @@ def check(project: str, cfg: dict, running: int, claim: bool = False, now: float
     if fresh:
         sig = (read or read_signals)()   # outside the lock: the CPU sample may take a second
     with _locked(home) as data:
-        others, lims = _others(data, project, now)
+        others = _others(data, project, now)
         if fresh:
             prev = data.get("signals")
             if isinstance(prev, dict) and float(prev.get("at") or 0) >= float(sig.get("at") or 0):
                 sig = prev   # another project stored a newer reading meanwhile
             else:
                 data["signals"] = sig = advance(prev, sig)
-        mine, pace = set_base(cfg), pace_from(cfg)
-        top = in_force(mine, lims, sig, pace=pace)
+        pace = pace_from(cfg)
+        top = in_force(sig, pace=pace)
         if top is not None and others + running >= top:
             return (f"the machine-wide worker limit: {others + running} of {top} running across all projects "
                     f"({words(sig, pace)}; machine.worker_limit"
                     f"{', machine.pace_from heavy' if pace == 'heavy' else ''})")
         if claim:
-            data["projects"][project] = {"pid": pid or os.getpid(), "at": now, "running": running + 1,
-                                         "base": mine, "limit": top}
+            data["projects"][project] = {"pid": pid or os.getpid(), "at": now, "running": running + 1}
         return None

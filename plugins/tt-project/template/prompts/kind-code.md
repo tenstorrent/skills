@@ -29,14 +29,6 @@
   Below the project root run pytest as `PYTHONPATH=$PWD python3 -m pytest --rootdir=. --confcutdir=.`.
 - Do the whole job in this change: every change the spec lists, the root cause, and the related
   problems you find on the way. No unrelated rewrites.
-<!-- ttp:if split_lines -->
-- A change that would pass about {{split_lines}} non-test lines goes in parts, each reviewed on its own:
-  finish a first part that stands alone and passes the checks, and hand it off `done` with one
-  follow-up `code: part 2 of <topic>` (no `continue:` title, no `continues`) whose spec says what is
-  left and whose `start_when` is `landed:#<your task id>`, so it builds on the reviewed part. Never
-  mark a part `split` or `wip`: an unfinished head skips its review and the last part reviews them all.
-  A larger change comes back once to split; if it cannot be: `"no_split": "<why>"` in result.json.
-<!-- /ttp:if split_lines -->
 - Before the hand-off, try to break it (tt-project-harness self-check.md): tick each spec step;
   a guard or parser: test 3+ bypasses (feed hooks and guards under HOME, XDG_CONFIG_HOME and
   GH_CONFIG_DIR at a fresh `mktemp -d`); exit codes: an unexpected one, an interrupted run; no

@@ -4068,12 +4068,12 @@ def test_config_defaults_to_the_runs_project_and_prints_effective_sections(env, 
     p = make(env)
     monkeypatch.setenv("TTP_PROJECT", str(p.root))
     monkeypatch.setenv("TTP_RUN_ID", "7")
-    cli.main(["config", "budget.split_reread_tokens"])
-    assert json.loads(capsys.readouterr().out) == DEFAULT_CONFIG["budget"]["split_reread_tokens"]
+    cli.main(["config", "budget.compact_window_tokens"])
+    assert json.loads(capsys.readouterr().out) == DEFAULT_CONFIG["budget"]["compact_window_tokens"]
     monkeypatch.delenv("TTP_RUN_ID")
     cli.main(["config", "demo", "budget"])
     budget = json.loads(capsys.readouterr().out)
-    for k in ("split_reread_tokens", "bash_output_max_chars", "compact_window_tokens"):
+    for k in ("bash_output_max_chars", "compact_window_tokens"):
         assert budget[k] == DEFAULT_CONFIG["budget"][k], k
     cli.main(["config", "demo"])
     assert "budget" in json.loads(capsys.readouterr().out)
@@ -32337,7 +32337,6 @@ def test_the_unreviewed_invariant_queues_at_most_its_cap_per_pass(env):
 def test_the_daemons_re_review_continues_the_failed_review(env):
     p = make(env)
     from ttp.db import continues_id, dump_result
-    p.set_config("chains.split_lines", 0)   # reviewed unsplit, not sent back for a split (splitgate)
     first, _, _, (rev,) = _finish_code(env, p, "stack", {"app.py": 300})
     p.db.update_task(rev["id"], status="failed", result=dump_result({"summary": "missing test", "status": "failed"}))
     fix, _, done, (re_rev,) = _finish_code(env, p, "fix it", {"fix.py": 5}, labels=[f"continues:{rev['id']}"])
@@ -33597,25 +33596,6 @@ def test_claude_workers_keep_long_command_output_in_a_file(env):
     d.cfg = p.config()
     assert "bashOutputMaxChars" not in settings("worker")
     assert settings("coordinator", read_only=True) is None
-
-
-def test_a_review_past_the_split_line_is_told_to_finish_its_verdict_not_to_hand_off_done(env, tmp_path):
-    p = make(env)
-    from ttp.daemon import Daemon
-    p.set_config("budget.split_reread_tokens", {"light": 2_000_000, "standard": 4_000_000, "deep": 8_000_000})
-    tid = p.db.add_task("review it", "spec", kind="review", tier="standard", origin="user")
-    run_dir = tmp_path / "run"
-    run_dir.mkdir()
-    msg = {"type": "assistant", "message": {"id": "m1", "content": [],
-                                            "usage": {"input_tokens": 10, "cache_read_input_tokens": 5_000_000}}}
-    (run_dir / "output.jsonl").write_text(json.dumps(msg) + "\n")
-    p.db.x("INSERT INTO runs(task,role,provider,model,started,status,dir,boot_id) VALUES(?,?,?,?,?,?,?,?)",
-           (tid, "reviewer", "claude", "opus", time.time(), "running", str(run_dir), "x"))
-    Daemon(p.base).meter_running()
-    steer = (run_dir / "steer.md").read_text()
-    assert "re-read about 5.0 M tokens" in steer and "A review does not split" in steer
-    assert "`failed`" in steer and "Never hand off `done` without" in steer
-    assert "continue:" not in steer and "`waiting`" not in steer, steer
 
 
 def _ttp_main(*args):
@@ -38648,41 +38628,6 @@ def test_no_test_resolves_or_starts_a_real_agent_cli(env, tmp_path_factory):
     env["real_agents"].clear()   # caught on purpose
 
 
-def test_work_tasks_get_their_own_worktree_only_when_worktree_kinds_lists_them(env, monkeypatch):
-    p = make(env)
-    from ttp import daemon as dm
-    from ttp.project import config_problems
-    from ttp.prompts import worker_task
-    work = p.db.add_task("tidy notes", "s", kind="work", tier="light", origin="user")
-    review = p.db.add_task("review it", "s", kind="review", tier="light", origin="user")
-    # The default: only code tasks get a worktree; a work task runs in the project root.
-    assert dm.Daemon(p.base)._workdir_for(p.db.task(work)) == (str(p.root), None)
-    p.set_config("worktree.kinds", ["work", "review"])
-    d = dm.Daemon(p.base)
-    cwd, branch = d._workdir_for(p.db.task(work))
-    assert cwd == str(p.worktrees / f"t{work}") and branch.startswith(f"ttp/t{work}-"), (cwd, branch)
-    assert _git_out(cwd, "rev-parse", "--abbrev-ref", "HEAD") == branch
-    assert d._workdir_for(p.db.task(review)) == (str(p.root), None), "a review never gets one"
-    prompt = worker_task(p, p.db.task(work), cwd, branch)
-    assert f"commit changes to tracked files on {branch}" in prompt
-    assert "worktree of your own" not in worker_task(p, p.db.task(work), str(p.root), None)
-    # Dispatch puts the run there, with the branch on the task.
-    p.db.update_task(review, status="cancelled")
-    class Proc:
-        pid = 4242
-    real = subprocess.Popen
-    monkeypatch.setattr(dm.subprocess, "Popen",
-                        lambda argv, *a, **k: Proc() if "ttp.runner" in argv else real(argv, *a, **k))
-    p.set_config("core_provider", "claude")
-    dm.Daemon(p.base).dispatch()
-    run = p.db.one("SELECT dir FROM runs WHERE task=?", (work,))
-    assert run, p.db.task(work)["blocked_reason"]
-    assert json.loads((pathlib.Path(run["dir"]) / "run.json").read_text())["cwd"] == cwd
-    assert p.db.task(work)["branch"] == branch
-    assert config_problems({"worktree": {"kinds": "work"}}) and config_problems({"worktree": {"kinds": ["review"]}})
-    assert not config_problems({"worktree": {"kinds": ["work"]}})
-
-
 def _root_run(p, d, tid):
     """A worker run of `tid` started through the daemon (its runner not launched), as the reaper sees it."""
     rid = d.start_run("worker", "go", "claude", "light", str(p.root), task=p.db.task(tid))
@@ -39017,7 +38962,6 @@ def test_a_work_task_with_its_own_worktree_is_guarded_like_a_code_task(env, monk
     p = make(env)
     from ttp import daemon as dm, integrity, worktree
     _with_origin(env)
-    p.set_config("worktree.kinds", ["work"])
     work = p.db.add_task("work in a worktree", "s", kind="work", tier="light", origin="user")
     path, branch = worktree.ensure(p, p.db.task(work))
     p.db.update_task(work, status="done", branch=branch)
@@ -39032,9 +38976,9 @@ def test_a_work_task_with_its_own_worktree_is_guarded_like_a_code_task(env, monk
     review = p.db.add_task("review", "s", kind="review", tier="light", origin="user")
     p.db.update_task(review, branch=f"ttp/t{review}-x")
     assert not worktree.own_worktree(p.db.task(review)), "a review works in the change's worktree"
-    # A task that continues it starts from its branch.
+    # A code task that continues it starts from its branch.
     head = _git_out(path, "rev-parse", "HEAD")
-    more = p.db.add_task("more", "s", kind="work", tier="light", origin="user", labels=[f"continues:{work}"])
+    more = p.db.add_task("more", "s", kind="code", tier="light", origin="user", labels=[f"continues:{work}"])
     assert worktree.continued_head(p, p.db.task(more)) == head
     # While open it owns the work, as for a code task (Daemon._stale_source); cancelled, it owns nothing.
     assert d._stale_source(p.db.task(work)) == f"open task #{more} continues it"
@@ -39061,7 +39005,6 @@ def test_a_work_task_with_its_own_worktree_is_guarded_like_a_code_task(env, monk
 def test_a_continued_own_worktree_work_task_starts_from_the_old_branch(env):
     p = make(env)
     from ttp.prompts import worker_task
-    p.set_config("worktree.kinds", ["work"])
     old = p.db.add_task("tidy notes", "s", kind="work", tier="light", origin="user")
     p.db.update_task(old, branch=f"ttp/t{old}-tidy-notes", status="done")
     new = p.db.add_task("continue: tidy notes", "s", kind="work", tier="light", origin="user",
@@ -39075,7 +39018,6 @@ def test_a_continued_own_worktree_work_task_starts_from_the_old_branch(env):
     assert f"on branch ttp/t{oc}-fix, and starts from that branch's head" in worker_task(
         p, p.db.task(nc), str(p.root), f"ttp/t{oc}-fix")
     # A work task without a worktree of its own: no branch claim.
-    p.set_config("worktree.kinds", [])
     o2 = p.db.add_task("plain", "s", kind="work", tier="light", origin="user")
     p.db.update_task(o2, branch="feature-x", status="done")
     n2 = p.db.add_task("continue: plain", "s", kind="work", tier="light", origin="user", labels=[f"continues:{o2}"])

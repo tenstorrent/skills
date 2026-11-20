@@ -186,15 +186,26 @@ def test_a_short_external_wait_keeps_its_unfinished_head_unreviewed_while_review
 _IDLE = {"cpu_busy": 0.1, "mem_free": 0.6, "pressure": 1, "compressor": 0.05, "call": False, "thermal": 0}
 
 
-def _mcap_cfg(on="on", top=4):
-    return {"machine": {"worker_limit": on, "max_workers": top}}
+_HOT = {**_IDLE, "thermal": 2}   # thermal heavy: the limit is half the base, at either pace
 
 
-def test_machine_limit_sum_over_two_projects_never_passes_it(env, tmp_path):
-    """Two projects claiming starts in turn: the sum stops at the limit, whichever project asks."""
+def _mcap_cfg(on="on"):
+    return {"machine": {"worker_limit": on}}
+
+
+def _mcap_cores(monkeypatch, n):
+    """The machine's cores, so the base under pressure (machinecap.base) is `n`."""
     from ttp import machinecap as mc
-    home, cfg, now = tmp_path / "mhome", _mcap_cfg(top=5), time.time()
-    sig = dict(_IDLE, at=now)
+    monkeypatch.setattr(mc.hostcpu, "cores", lambda: n)
+
+
+def test_machine_limit_sum_over_two_projects_never_passes_it(env, monkeypatch, tmp_path):
+    """Two projects claiming starts in turn under pressure: the sum stops at the limit, whichever
+    project asks."""
+    from ttp import machinecap as mc
+    _mcap_cores(monkeypatch, 10)
+    home, cfg, now = tmp_path / "mhome", _mcap_cfg(), time.time()
+    sig = dict(_HOT, at=now)
     running = {"a": 0, "b": 0}
     for _ in range(10):
         for name in running:
@@ -205,7 +216,8 @@ def test_machine_limit_sum_over_two_projects_never_passes_it(env, tmp_path):
     why = mc.check("b", cfg, running["b"], now=now, home=home, read=lambda: sig)
     assert why and "5 of 5 running across all projects" in why and "machine.worker_limit" in why
     # a finished worker (published each dispatch pass) frees a place for the other project
-    mc.publish("a", cfg, running["a"] - 1, now=now, home=home)
+    mc.publish("a", running["a"] - 1, now=now, home=home)
+    assert set(json.loads((home / mc.STATE).read_text())["projects"]["a"]) == {"pid", "at", "running"}
     assert mc.check("b", cfg, running["b"], now=now, home=home, read=lambda: sig) is None
     # a dead daemon's entry no longer counts
     data = json.loads((home / mc.STATE).read_text())
@@ -214,21 +226,22 @@ def test_machine_limit_sum_over_two_projects_never_passes_it(env, tmp_path):
     assert mc.check("b", cfg, 4, now=now, home=home, read=lambda: sig) is None
 
 
-def test_machine_limit_project_cap_above_it_is_clipped(env, tmp_path):
-    """A project whose own cap (6) is above the machine limit (3) gets only the limit's places, and the
-    lowest limit a live project publishes binds the others."""
+def test_machine_limit_project_cap_above_it_is_clipped(env, monkeypatch, tmp_path):
+    """A project whose own cap (6) is above the machine limit (3: 6 cores, thermal heavy) gets only the
+    limit's places, and another project's running workers count toward it."""
     from ttp import machinecap as mc
+    _mcap_cores(monkeypatch, 6)
     home, now = tmp_path / "mhome", time.time()
-    sig = dict(_IDLE, at=now)
+    sig = dict(_HOT, at=now)
     started = 0
     for _ in range(6):   # budget.max_parallel_workers 6
-        if mc.check("big", _mcap_cfg(top=3), started, claim=True, now=now, home=home, read=lambda: sig) is None:
+        if mc.check("big", _mcap_cfg(), started, claim=True, now=now, home=home, read=lambda: sig) is None:
             started += 1
     assert started == 3
-    mc.publish("big", _mcap_cfg(top=3), 0, now=now, home=home)
-    mc.check("small", _mcap_cfg(top=2), 0, claim=True, now=now, home=home, read=lambda: sig)
-    assert mc.check("big", _mcap_cfg(top=8), 1, now=now, home=home, read=lambda: sig), \
-        "small's limit of 2 caps the machine: 1 + 1 running"
+    mc.publish("big", 2, now=now, home=home)
+    assert mc.check("small", _mcap_cfg(), 0, claim=True, now=now, home=home, read=lambda: sig) is None
+    assert mc.check("big", _mcap_cfg(), 2, now=now, home=home, read=lambda: sig), \
+        "small's 1 counts: 1 + 2 running of 3"
 
 
 def _sustained(mc, sig, n=3, step=30.0, start=1000.0):
@@ -256,19 +269,18 @@ def test_machine_limit_each_signal_lowers_it():
 
 def test_machine_limit_load_and_moderate_memory_with_idle_cpu_do_not_lower_it(env, tmp_path):
     """(a) A load average of 40 with 70% CPU idle and macOS memory 'moderate' (compressing, 38% free,
-    pressure normal) is not short: no machine hold for null-base projects, a set base stays whole."""
+    pressure normal) is not short: no machine hold."""
     from ttp import machinecap as mc
     sig = _sustained(mc, {**_IDLE, "load": 40.0, "cpu_busy": 0.3, "mem_free": 0.38, "pressure": 1,
                           "compressor": 0.45})
     assert mc.levels(sig) == {} and mc.limit(8, sig) == 8
-    assert mc.in_force(None, [], sig) is None, "healthy, nothing set: only the projects' own caps"
+    assert mc.in_force(sig) is None, "healthy: only the projects' own caps"
     home, now = tmp_path / "mhome", time.time()
-    null_cfg = {"machine": {"worker_limit": "on", "max_workers": None}}
-    assert all(mc.check("a", null_cfg, n, claim=True, now=now, home=home, read=lambda: {**sig, "at": now}) is None
+    assert all(mc.check("a", _mcap_cfg(), n, claim=True, now=now, home=home, read=lambda: {**sig, "at": now}) is None
                for n in range(20))
 
 
-def test_machine_limit_needs_cpu_idle_low_for_a_minute(env, tmp_path):
+def test_machine_limit_needs_cpu_idle_low_for_a_minute(env, monkeypatch, tmp_path):
     """(b) One low-idle sample does not lower the limit; idle under 15% in every reading for 60 s does;
     a reading with idle back up, or a gap in readings, starts the window again."""
     from ttp import machinecap as mc
@@ -283,7 +295,8 @@ def test_machine_limit_needs_cpu_idle_low_for_a_minute(env, tmp_path):
     gap = mc.advance(mc.advance(None, {**hot, "at": 1000.0}), {**hot, "at": 1000.0 + mc.SUSTAIN_GAP_S + 1})
     assert mc.levels(gap) == {}, "readings too far apart prove nothing"
     # through check(): the shared reading is advanced once per SIGNAL_S across calls
-    home, cfg, t0 = tmp_path / "mhome", _mcap_cfg(top=8), time.time()
+    _mcap_cores(monkeypatch, 8)
+    home, cfg, t0 = tmp_path / "mhome", _mcap_cfg(), time.time()
     for i in range(3):
         now = t0 + i * mc.SIGNAL_S
         why = mc.check("a", cfg, 6, now=now, home=home, read=lambda: {**hot, "at": now})
@@ -314,7 +327,7 @@ def test_machine_limit_thermal_serious_lowers_it():
     from ttp import machinecap as mc
     assert mc.limit(8, {**_IDLE, "thermal": 1}) == 8
     assert mc.limit(8, {**_IDLE, "thermal": 2}) == 4 and mc.words({**_IDLE, "thermal": 2}) == "thermal heavy"
-    assert mc.in_force(None, [], {**_IDLE, "thermal": 2}, cpus=12) == 6, "under pressure a null base is the cores"
+    assert mc.in_force({**_IDLE, "thermal": 2}, cpus=12) == 6, "under pressure the base is the cores"
 
 
 def test_machine_limit_call_counts_only_with_low_cpu_idle():
@@ -328,16 +341,14 @@ def test_machine_limit_call_counts_only_with_low_cpu_idle():
 
 
 def test_machine_limit_unreadable_signals_hold_it_at_base(env, tmp_path):
-    """(f) Unreadable signals count as not short: the limit stays at its base, never 1."""
+    """(f) Unreadable signals count as not short: no machine hold, never a limit of 1."""
     from ttp import machinecap as mc
     blind = {"cpu_busy": None, "mem_free": None, "pressure": None, "compressor": None, "call": None,
              "thermal": None, "swap": None}
     assert mc.levels(blind) == {} and mc.levels(mc.advance(None, blind)) == {}
     assert mc.limit(8, blind) == 8 and mc.limit(8, {}) == 8
-    assert mc.in_force(5, [], blind) == 5 and mc.in_force(None, [], blind) is None
-    assert mc.base({}, cpus=64) == mc.BASE_MAX and mc.base({}, cpus=1) == mc.BASE_MIN
-    assert mc.base({"machine": {"max_workers": 0}}) == 1 and mc.base({"machine": {"max_workers": "x"}}, cpus=8) == 8
-    assert mc.set_base({"machine": {"max_workers": None}}) is None and mc.set_base(_mcap_cfg(top=3)) == 3
+    assert mc.in_force(blind) is None and mc.in_force(blind, cpus=8) is None
+    assert mc.base(cpus=64) == mc.BASE_MAX and mc.base(cpus=1) == mc.BASE_MIN and mc.base(cpus=8) == 8
     assert mc.psi(tmp_path / "none") is None and mc.linux_thermal(tmp_path / "none") is None
     zone = tmp_path / "thermal" / "thermal_zone0"
     zone.mkdir(parents=True)
@@ -345,33 +356,13 @@ def test_machine_limit_unreadable_signals_hold_it_at_base(env, tmp_path):
     assert mc.linux_thermal(tmp_path / "thermal") == 1
     (tmp_path / "vmstat").write_text("pgpgin 10\npswpout 3\n")
     assert mc.linux_swap(tmp_path / "vmstat") == 3 * 4096
-    # a corrupt state file is replaced, never trusted; blind readings hold a set base of 2 at 2
+    # a corrupt state file is replaced, never trusted; blind readings hold nothing
     home = tmp_path / "mhome"
     home.mkdir()
     (home / mc.STATE).write_text("{not json")
-    assert mc.check("a", _mcap_cfg(top=2), 0, claim=True, home=home, read=lambda: dict(blind, at=time.time())) is None
-    assert mc.check("a", _mcap_cfg(top=2), 1, claim=True, home=home, read=lambda: dict(blind, at=time.time())) is None
-    assert mc.check("a", _mcap_cfg(top=2), 2, home=home, read=lambda: dict(blind, at=time.time()))
-    assert json.loads((home / mc.STATE).read_text())["projects"]["a"]["running"] == 2
-
-
-def test_machine_limit_null_project_does_not_drag_the_others_down(env, tmp_path):
-    """A project left at null publishes no base, so it never pulls the machine limit under another's;
-    an older daemon's entry without a base still counts by its published limit."""
-    from ttp import machinecap as mc
-    home, now = tmp_path / "mhome", time.time()
-    sig = dict(_IDLE, at=now)
-    null_cfg = {"machine": {"worker_limit": "on", "max_workers": None}}
-    mc.publish("nul", null_cfg, 1, now=now, home=home)
-    assert json.loads((home / mc.STATE).read_text())["projects"]["nul"]["base"] is None
-    assert mc.check("set", _mcap_cfg(top=6), 4, now=now, home=home, read=lambda: sig) is None, "1 + 4 < 6"
-    assert mc.check("set", _mcap_cfg(top=6), 5, now=now, home=home, read=lambda: sig), "1 + 5 = 6"
-    assert mc.check("nul", null_cfg, 30, now=now, home=home, read=lambda: sig) is None, "healthy: no machine hold"
-    data = json.loads((home / mc.STATE).read_text())
-    data["projects"]["old"] = {"pid": os.getpid(), "at": now, "running": 0, "limit": 3}
-    (home / mc.STATE).write_text(json.dumps(data))
-    assert mc.check("nul", null_cfg, 2, now=now, home=home, read=lambda: sig) is None
-    assert mc.check("nul", null_cfg, 3, now=now, home=home, read=lambda: sig), "the old entry's 3 binds"
+    for n in range(3):
+        assert mc.check("a", _mcap_cfg(), n, claim=True, home=home, read=lambda: dict(blind, at=time.time())) is None
+    assert json.loads((home / mc.STATE).read_text())["projects"]["a"]["running"] == 3
 
 
 def test_machine_limit_is_on_for_laptops_and_off_for_servers(tmp_path):
@@ -384,7 +375,7 @@ def test_machine_limit_is_on_for_laptops_and_off_for_servers(tmp_path):
     bat.mkdir(parents=True)
     (bat / "type").write_text("Battery\n")
     assert mc.has_battery(tmp_path / "ps") and not mc.has_battery(tmp_path / "missing")
-    assert mc.check("a", _mcap_cfg("off", 1), 50, read=lambda: {}) is None, "off holds nothing"
+    assert mc.check("a", _mcap_cfg("off"), 50, read=lambda: dict(_HOT, at=time.time())) is None, "off holds nothing"
 
 
 def test_machine_limit_reads_a_call_from_power_assertions():
@@ -404,8 +395,8 @@ def test_machine_limit_holds_a_dispatch_start_with_its_words(env, monkeypatch):
     from ttp.daemon import Daemon
     p = make(env)
     p.set_config("machine.worker_limit", "on")
-    p.set_config("machine.max_workers", 2)
-    monkeypatch.setattr(mc, "read_signals", lambda darwin=None: dict(_IDLE, at=time.time()))
+    _mcap_cores(monkeypatch, 4)   # thermal heavy: a limit of 2
+    monkeypatch.setattr(mc, "read_signals", lambda darwin=None: dict(_HOT, at=time.time()))
     d = Daemon(p.base)
     core = d.cfg.get("core_provider", "claude")
     t = p.db.task(p.db.add_task("light work", "s", kind="work", tier="light", origin="user", priority=2))
@@ -418,98 +409,19 @@ def test_machine_limit_holds_a_dispatch_start_with_its_words(env, monkeypatch):
     assert d._start_hold(t, core, ctx(1)) is None
     assert d._start_hold(t, core, ctx(1), reserve=True) is None
     entry = json.loads((mc._home() / mc.STATE).read_text())["projects"][p.name]
-    assert entry["running"] == 2 and entry["limit"] == 2, "a start claims its place"
+    assert entry["running"] == 2, "a start claims its place"
     p.set_config("machine.worker_limit", "off")
     assert Daemon(p.base)._start_hold(t, core, ctx(5)) is None, "off: only the project's own cap"
 
 
-@pytest.mark.parametrize("word", ["null", "none", "auto", "Auto", None])
-def test_machine_max_workers_can_be_unset_back_to_its_default(env, monkeypatch, word):
-    """machine.max_workers null, none or auto (config_set or ttp config) is unset: the default base (half
-    the cores, 2 to 8) applies again; 0, -1, 1.5, true and words stay refused."""
-    from ttp import cli
-    from ttp import coordinator as coord
-    from ttp import machinecap as mc
-    p = make(env)
-    _config_clear_run_env(monkeypatch)
-    assert coord.apply(p, [{"type": "config_set", "key": "machine.max_workers", "value": 3}]) == []
-    assert p.raw_config()["machine"]["max_workers"] == 3
-    assert coord.apply(p, [{"type": "config_set", "key": "machine.max_workers", "value": word}]) == []
-    assert p.raw_config()["machine"]["max_workers"] is None and mc.set_base(p.config()) is None
-    cli.main(["config", p.name, "machine.max_workers", "2"])
-    assert p.raw_config()["machine"]["max_workers"] == 2
-    cli.main(["config", p.name, "machine.max_workers", word or "null"])
-    assert p.raw_config()["machine"]["max_workers"] is None
-    for bad in (0, -1, 1.5, True, "lots"):
-        assert coord.apply(p, [{"type": "config_set", "key": "machine.max_workers", "value": bad}]), bad
-        with pytest.raises(SystemExit):
-            cli.main(["config", p.name, "machine.max_workers", json.dumps(bad) if bad != "lots" else bad])
-    assert p.raw_config()["machine"]["max_workers"] is None
-
-
-def test_machine_limit_publish_alone_binds_a_lower_base_and_records_its_limit(tmp_path):
-    """Each dispatch pass publishes a limit-on project's base and its limit from the stored reading, so a
-    lower machine.max_workers binds the others before that project starts anything (its entry dropped or
-    never claimed); with the limit off it publishes neither."""
-    from ttp import machinecap as mc
-    home, now = tmp_path / "mhome", time.time()
-    sig = dict(_IDLE, at=now)
-    assert mc.check("big", _mcap_cfg(top=8), 3, now=now, home=home, read=lambda: sig) is None, "alone: 3 < 8"
-    mc.publish("small", _mcap_cfg(top=2), 0, now=now, home=home)   # no claim, nothing started
-    entry = json.loads((home / mc.STATE).read_text())["projects"]["small"]
-    assert entry["base"] == 2 and entry["limit"] == 2, entry
-    assert mc.check("big", _mcap_cfg(top=8), 1, now=now, home=home, read=lambda: sig) is None
-    assert mc.check("big", _mcap_cfg(top=8), 2, now=now, home=home, read=lambda: sig), "small's 2 binds"
-    data = json.loads((home / mc.STATE).read_text())   # a heavy reading stored: the limit published is cut
-    data["signals"] = _sustained(mc, dict(_IDLE, cpu_busy=0.99))
-    (home / mc.STATE).write_text(json.dumps(data))
-    mc.publish("small", _mcap_cfg(top=4), 0, now=now, home=home)
-    stored = json.loads((home / mc.STATE).read_text())
-    assert stored["projects"]["small"]["limit"] == mc.limit(4, stored["signals"]) < 4
-    mc.publish("small", _mcap_cfg(on="off", top=2), 0, now=now, home=home)
-    entry = json.loads((home / mc.STATE).read_text())["projects"]["small"]
-    assert "base" not in entry and "limit" not in entry and entry["running"] == 0
-
-
-def test_machine_limit_publish_follows_a_changed_max_workers_without_a_new_claim(tmp_path):
-    """A project whose last claim published a low limit (14 x 0.75 = 10 under moderate memory pressure)
-    publishes the limit from its current machine.max_workers on its next dispatch pass, with no new claim:
-    raised to 20 it publishes 15 and no longer holds the others at 10; lowered to 8 it publishes 6 and binds
-    them at once; a dead daemon's entry still counts for nothing."""
-    from ttp import machinecap as mc
-    home, now = tmp_path / "mhome", time.time()
-    sig = dict(_IDLE, psi=6, at=now)   # memory moderate: x0.75
-    assert mc.levels(sig) == {"memory": "moderate"}
-    assert mc.check("a", _mcap_cfg(top=14), 2, claim=True, now=now, home=home, read=lambda: sig) is None
-    entry = json.loads((home / mc.STATE).read_text())["projects"]["a"]
-    assert entry["base"] == 14 and entry["limit"] == 10, entry
-    mc.publish("a", _mcap_cfg(top=20), 3, now=now, home=home)   # raised, nothing started
-    entry = json.loads((home / mc.STATE).read_text())["projects"]["a"]
-    assert entry["base"] == 20 and entry["limit"] == 15 and entry["running"] == 3, entry
-    assert mc.check("b", _mcap_cfg(top=20), 9, now=now, home=home, read=lambda: sig) is None, "12 of 15"
-    why = mc.check("b", _mcap_cfg(top=20), 12, now=now, home=home, read=lambda: sig)
-    assert why and "15 of 15" in why, why
-    mc.publish("a", _mcap_cfg(top=8), 3, now=now, home=home)    # lowered, nothing started
-    entry = json.loads((home / mc.STATE).read_text())["projects"]["a"]
-    assert entry["base"] == 8 and entry["limit"] == 6, entry
-    why = mc.check("b", _mcap_cfg(top=20), 3, now=now, home=home, read=lambda: sig)
-    assert why and "6 of 6" in why, why
-    data = json.loads((home / mc.STATE).read_text())
-    data["projects"]["a"]["pid"] = 2 ** 22 + 12345   # a's daemon is gone: its low base binds nobody
-    (home / mc.STATE).write_text(json.dumps(data))
-    assert mc.check("b", _mcap_cfg(top=20), 14, now=now, home=home, read=lambda: sig) is None, "14 of 15"
-    assert "a" not in json.loads((home / mc.STATE).read_text())["projects"]
-
-
-def test_machine_pace_from_heavy_ignores_moderate_readings_and_other_projects_bases(env, tmp_path):
+def test_machine_pace_from_heavy_ignores_moderate_readings(env, monkeypatch, tmp_path):
     """machine.pace_from heavy: moderate CPU or memory no longer cut the project's limit (heavy ones, a
-    call and heat still do), and it holds the machine to its own base, not the lowest another project
-    set; moderate (the default) keeps today's behaviour for the same readings and bases."""
+    call and heat still do); moderate (the default) keeps today's behaviour for the same readings."""
     from ttp import machinecap as mc
-    heavy = lambda top: {"machine": {"worker_limit": "on", "max_workers": top, "pace_from": "heavy"}}
+    heavy = {"machine": {"worker_limit": "on", "pace_from": "heavy"}}
     assert mc.pace_from({}) == "moderate" and mc.pace_from(_mcap_cfg()) == "moderate"
     assert mc.pace_from({"machine": {"pace_from": "bogus"}}) == "moderate"
-    assert mc.pace_from(heavy(4)) == "heavy" and mc.pace_from({"machine": {"pace_from": " Heavy "}}) == "heavy"
+    assert mc.pace_from(heavy) == "heavy" and mc.pace_from({"machine": {"pace_from": " Heavy "}}) == "heavy"
     cpu_mod = _sustained(mc, dict(_IDLE, cpu_busy=0.90))       # idle 10%: moderate
     cpu_heavy = _sustained(mc, dict(_IDLE, cpu_busy=0.99))     # idle 1%: heavy
     for sig, mod, hvy in [(cpu_mod, 10, 14), ({**_IDLE, "mem_free": 0.08}, 10, 14), ({**_IDLE, "swapping": True}, 10, 14),
@@ -517,25 +429,26 @@ def test_machine_pace_from_heavy_ignores_moderate_readings_and_other_projects_ba
                           ({**_IDLE, "thermal": 2}, 7, 7), ({**cpu_mod, "call": True}, 5, 7)]:
         assert mc.limit(14, sig) == mod and mc.limit(14, sig, "heavy") == hvy, sig
     assert mc.words(cpu_mod, "heavy") == "nothing busy" and mc.words(cpu_mod) == "cpu moderate"
-    assert mc.in_force(None, [], cpu_mod, pace="heavy") is None, "no base set and nothing heavy: no hold"
-    assert mc.in_force(14, [10], _IDLE) == 10 and mc.in_force(14, [10], _IDLE, pace="heavy") == 14
+    assert mc.in_force(cpu_mod, cpus=14, pace="heavy") is None, "nothing heavy: no hold"
+    assert mc.in_force(cpu_mod, cpus=14) == 10 and mc.in_force(cpu_heavy, cpus=14, pace="heavy") == 7
 
+    _mcap_cores(monkeypatch, 14)
     home, now = tmp_path / "mhome", 1060.0
     sig = dict(cpu_mod, at=now)
-    mc.publish("mod", _mcap_cfg(top=10), 3, now=now, home=home)   # another project's lower base
+    mc.publish("mod", 3, now=now, home=home)   # another project's running workers
     data = json.loads((home / mc.STATE).read_text())
     data["signals"] = sig   # the stored machine reading: CPU idle 10% for a minute
     (home / mc.STATE).write_text(json.dumps(data))
-    assert mc.check("agents", _mcap_cfg(top=14), 6, now=now, home=home, read=lambda: sig), \
-        "moderate: 3 + 6 >= the other's 10 cut to 7 by moderate CPU"
-    assert mc.check("agents", heavy(14), 10, now=now, home=home, read=lambda: sig) is None, "heavy: 3 + 10 < 14"
-    why = mc.check("agents", heavy(14), 11, now=now, home=home, read=lambda: sig)
-    assert why and "14 of 14 running" in why and "machine.pace_from heavy" in why and "nothing busy" in why
-    mc.publish("agents", heavy(14), 2, now=now, home=home)
-    assert json.loads((home / mc.STATE).read_text())["projects"]["agents"]["limit"] == 14, "heavy: moderate CPU uncut"
-    assert mc.check("mod", _mcap_cfg(top=10), 4, now=now, home=home, read=lambda: sig) is None, "2 + 4 < 7"
-    assert mc.check("mod", _mcap_cfg(top=10), 5, now=now, home=home, read=lambda: sig), \
-        "the moderate project still holds itself to its own paced limit: 2 + 5 >= 7"
+    assert mc.check("agents", _mcap_cfg(), 6, now=now, home=home, read=lambda: sig) is None, "moderate: 3 + 6 < 10"
+    why = mc.check("agents", _mcap_cfg(), 7, now=now, home=home, read=lambda: sig)
+    assert why and "10 of 10 running" in why and "cpu moderate" in why, why
+    assert mc.check("agents", heavy, 30, now=now, home=home, read=lambda: sig) is None, "heavy: moderate CPU holds nothing"
+    data = json.loads((home / mc.STATE).read_text())
+    data["signals"] = sig = dict(cpu_heavy, at=now)   # CPU idle 1% for a minute: heavy
+    (home / mc.STATE).write_text(json.dumps(data))
+    assert mc.check("agents", heavy, 3, now=now, home=home, read=lambda: sig) is None, "heavy: 3 + 3 < 7"
+    why = mc.check("agents", heavy, 4, now=now, home=home, read=lambda: sig)
+    assert why and "7 of 7 running" in why and "machine.pace_from heavy" in why and "cpu heavy" in why, why
 
 
 def test_machine_pace_from_is_settable_and_checked(env):

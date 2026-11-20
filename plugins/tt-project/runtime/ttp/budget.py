@@ -571,22 +571,7 @@ def caps_line(db: DB, gates: dict, b: dict, now: float, where=None) -> str:
                                m.get("global_resets_at"), now, where)
         parts.append(f"{prov} ${float(m['global_today']):.2f} of ${float(m.get('global_cap') or 0):.0f} today "
                      f"({m.get('global_includes') or 'this account'}{stale})" + (f", {ahead}" if ahead else ""))
-    return out + " · global daily cap (whole account, per provider): " + "; ".join(parts) + target_text(b, dict(totals))
-
-
-def target_text(b: dict, totals: dict) -> str:
-    """' · daily target $T: Claude $X today, $D over|under' against budget.daily_target_usd, from the
-    gate's whole-account count (`totals`: provider -> gate numbers); '' when unset or uncounted."""
-    try:
-        t = float(b.get("daily_target_usd") or 0)
-    except (TypeError, ValueError):
-        return ""
-    m = totals.get("claude") or {}
-    if t <= 0 or "global_today" not in m:
-        return ""
-    usd = float(m.get("global_today") or 0)
-    return (f" · daily target ${t:.0f}: Claude ${usd:.2f} today, "
-            + (f"${usd - t:.2f} over" if usd > t else f"${t - usd:.2f} under"))
+    return out + " · global daily cap (whole account, per provider): " + "; ".join(parts)
 
 
 def _caps(db: DB, g: Gate, b: dict, provider: str, windows: list[Window], last: dict, now: float,
@@ -1220,19 +1205,8 @@ def reread_stats(db: DB, days: float = 7, now: float | None = None, top: int = 1
     by = [{"role": k[0], "kind": k[1], "tier": k[2], "effort": k[3], **summary(v)} for k, v in groups.items()]
     by.sort(key=lambda g: (-g["cache_read"], -g["no_work"]))
     worst = sorted((r for r in rows if not no_work(r)), key=lambda r: -(r["cache_read_tokens"] or 0))[:top]
-    # Runs the split steer reached (daemon._suggest_split): what they re-read after it, how they handed off.
-    after, handoffs = [], {}
-    for r in rows:
-        split = _note(r["note"]).get("split")
-        if not isinstance(split, dict):
-            continue
-        after.append(max(0, (r["cache_read_tokens"] or 0) - int(split.get("cache_read") or 0)))
-        how = split.get("handoff") or ("running" if r["status"] == "running" else "none")
-        handoffs[how] = handoffs.get(how, 0) + 1
-    steered = {"runs": len(after), "after_avg": round(sum(after) / len(after)) if after else 0,
-               "after_max": max(after, default=0), "handoffs": dict(sorted(handoffs.items(), key=lambda kv: -kv[1]))}
     return {"days": round((until - since) / 86400, 2), "since": since, "until": until, **summary(rows), "groups": by,
-            "steered": steered, "cold_starts": cold_starts(rows),
+            "cold_starts": cold_starts(rows),
             "top": [{"run": r["id"], "task": r["task"], "role": r["role"], "kind": r["kind"], "tier": r["tier"],
                      "effort": r["effort"], "usd": round(r["cost_usd"] or 0, 2), "cache_read": r["cache_read_tokens"] or 0,
                      "minutes": round(((r["ended"] or now) - (r["started"] or now)) / 60),
@@ -1276,13 +1250,6 @@ def reread_text(s: dict, tz=None) -> str:
     lines += [f"  {g['role']}/{g['kind']}/{g['tier']}/{g['effort']}: {g['runs']} runs, ${g['usd']:.2f}, "
               f"{m(g['cache_read'])} ({m(g['per_run'])} per run, median {m(g['median'])}, max {m(g['max'])}{extra(g)})"
               for g in s["groups"]]
-    st = s.get("steered") or {}
-    if st.get("runs"):
-        lines.append(f"Split steer: {st['runs']} runs steered, re-read after it {m(st['after_avg'])} avg (max "
-                     f"{m(st['after_max'])}); handed off: "
-                     + ", ".join(f"{k} {v}" for k, v in st["handoffs"].items()))
-    else:
-        lines.append("Split steer: no run steered")
     cs = s.get("cold_starts") or {}
     lines.append(f"Cold starts: {cs['cold']} of {cs['runs']} worker and reviewer runs ({cs['share']:.0%}) read under "
                  f"{COLD_START_TOKENS / 1e3:g} k cached tokens on their first call" if cs.get("runs") else

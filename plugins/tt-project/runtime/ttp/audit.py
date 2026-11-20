@@ -13,8 +13,7 @@ the project could have saved. Model-free; the review grades it.
 - coordinator turns that decided nothing (no action but `noop`), and idle and
   starve wakes (woken by the idle or idle-slot timer alone, with no message or event), with their cost,
   and turns the daemon skipped as repeats of one that decided nothing (turngate.py) or as quiet while
-  every open task was held (quietgate.py), with the saving, events the project's settle hook settled
-  (settlehook.py, coordinator.settle_cmd) with their top reasons and its faults, and per wait the wait_stale
+  every open task was held (quietgate.py), with the saving, and per wait the wait_stale
   turns skipped as unchanged since a turn that decided nothing on it (stalegate.py); blocker sweeps the model ran and those
   skipped model-free (sweepskip.py), with the saving;
 - code runs with no code change: code tasks done after a worker run with no review, PR, published
@@ -45,8 +44,6 @@ the project could have saved. Model-free; the review grades it.
   and the failures it caught before detaching (each a worker wake saved).
 - context gaps: what workers' hand-offs (`context_gaps`) said they needed and their spec and context
   block (ctxblock) lacked, counted per task.
-- with budget.daily_target_usd set: each local project's spend by class, real beside booked, and the
-  account total against the target (dailyspend.py);
 - the outward leak scan's refusals (outscan.record), counted by route: gh, git push, ttp note --to,
   ttp notify.
 
@@ -59,7 +56,7 @@ import statistics
 import time
 from typing import Any
 
-from . import budget, chaincap, dailyspend, checkprestage, coordfix, coordmodel, correction, ends, gatejudge, gatetime, landed, obligations, outscan, plainreply, planuse, quietgate, relay, replan, reviewstats, routinedefault, route, rulecite, schedule, settlehook, sharedchecks, stalegate, suitecost, sweepskip, timefmt, turngate, unblock, upstream, wakesettle
+from . import budget, chaincap, checkprestage, coordfix, coordmodel, correction, ends, gatejudge, gatetime, landed, obligations, outscan, plainreply, planuse, quietgate, relay, replan, reviewstats, routinedefault, route, rulecite, schedule, sharedchecks, stalegate, suitecost, sweepskip, timefmt, turngate, unblock, upstream, wakesettle
 from .db import DB, continues_id, load_result
 from .project import Project
 from .util import loads_dict
@@ -460,19 +457,6 @@ def _more(rows: list, shown: int = TOP) -> str:
     return f"; and {len(rows) - shown} more" if len(rows) > shown else ""
 
 
-def target_line(db: DB, cfg: dict) -> str:
-    """Today's whole-account Claude spend against budget.daily_target_usd, from the daemon's last gate
-    count (kv 'gates'); '' when no target is set or nothing was counted."""
-    from . import budget as bud
-    from .overview import _gate_global
-    try:
-        _, totals = _gate_global(db.conn)
-    except Exception:   # a busy or older database: the review goes on without the line
-        return ""
-    t = bud.target_text((cfg or {}).get("budget") or {}, totals)
-    return t.removeprefix(" · ") if t else ""
-
-
 def per_landed(p: Project | None, db: DB, now: float) -> dict:
     """trainstats.per_landed's 24 h and 7 d rows and the push ref they count on; {} without a project or
     when the push branch cannot be read (the review goes on without the line)."""
@@ -503,13 +487,6 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
     now = time.time() if now is None else now
     since = now - window_s
     out: list[str] = []
-    if p is not None and (tl := target_line(db, p.config())):
-        out.append(tl)
-    if p is not None:
-        try:
-            out += dailyspend.lines(p.config().get("budget"), since, now)
-        except Exception:   # a busy or unreadable database: the review goes on without the split
-            pass
     sent = asks(db, since, now, p)
     for a in sent:
         rec = f"; recommended: {a['recommendation']}" if a["recommendation"] else ""
@@ -638,8 +615,6 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
     quiet = quietgate.skipped(db, since)
     if quiet["n"]:
         out.append(f"coordinator turns skipped ({quietgate.QUIET}): {quiet['n']}, ~${quiet['usd']:.2f} saved")
-    if settled := settlehook.audit_line(db, since):
-        out.append(settled)
     if decided := wakesettle.audit_line(db, since):
         out.append(decided)
     if p is not None:   # the cost levers' wake-tools and output metrics (costlevers.py)
@@ -784,7 +759,7 @@ def report(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked
             "retried_tasks": retried_tasks(db, since), "continued_tasks": continued_tasks(db, since),
             "review_fix_tasks": continued_tasks(db, since, fixes=True),
             "coordinator_turns": coordinator_turns(db, since),
-            "coordinator_cache": budget.coordinator_cache(db, now, window_s)["window"], "turns_skipped": turngate.skipped(db, since), "turns_quiet": quietgate.skipped(db, since), "settle_hook": settlehook.summary(db, since), "wake_decisions": wakesettle.summary(db, since), "sweeps": sweepskip.counts(db, since, now),
+            "coordinator_cache": budget.coordinator_cache(db, now, window_s)["window"], "turns_skipped": turngate.skipped(db, since), "turns_quiet": quietgate.skipped(db, since), "wake_decisions": wakesettle.summary(db, since), "sweeps": sweepskip.counts(db, since, now),
             "finished": done, "per_outcome": per_outcome(done, unpriced), "cost_bases": cost_bases(db, done),
             "plan_usage": planuse.summary(db, since, now, p.config() if p is not None else None),
             "no_change_code": no_change_code(db, since), "stuck": stuck_long(db, now, blocked_h), "review_loops": review_loops(db, since),

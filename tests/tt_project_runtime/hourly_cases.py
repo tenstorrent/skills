@@ -74,7 +74,6 @@ def _block(p, title="stuck"):
 def test_the_table_posts_only_when_something_important_changed(env):
     from ttp import hourly
     p = make(env)
-    p.set_config("notify.chat_status", True)   # the opt-in: the table goes to the main chat
     p.db.post("in", "hello", chat="main")
     now = time.time() - 3600
     assert hourly.post(p, now - 3700) is None, "the first pass only sets the baseline"
@@ -83,7 +82,7 @@ def test_the_table_posts_only_when_something_important_changed(env):
     t = _block(p)
     first = hourly.post(p, now + hourly.CHECK_S + 1)
     msg = p.db.one("SELECT * FROM messages WHERE id=?", (first,))
-    assert msg["chat"] == "main" and msg["ref"] == hourly.REF and msg["text"].startswith("Status at ")
+    assert msg["chat"] is None and msg["ref"] == hourly.REF and msg["text"].startswith("Status at ")
     assert "(a blocker appeared)" in msg["text"] and "Queue: 2 open tasks" in msg["text"]
     assert hourly.post(p, now + hourly.CHECK_S + 60) is None, "nothing new"
     p.db.x("UPDATE tasks SET status='queued' WHERE id=?", (t,))
@@ -108,11 +107,10 @@ def test_counts_times_loads_or_a_landed_batch_alone_post_nothing(env, monkeypatc
     assert not p.db.q("SELECT id FROM messages WHERE ref=?", (hourly.REF,))
 
 
-def test_two_milestones_minutes_apart_post_once_and_the_next_names_both(env, monkeypatch):
+def test_two_milestones_since_the_last_post_are_named_in_one_post(env, monkeypatch):
     from ttp import hourly, obligations
     monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
     p = make(env)
-    p.set_config("notify.chat_status", True)   # the chat's status gap applies only when the chat gets the table
     p.db.post("in", "hello", chat="main")
     now = time.time() - 3 * 3600
     a, b = obligations.add(p, "first order", now=now), obligations.add(p, "second order", now=now)
@@ -123,17 +121,16 @@ def test_two_milestones_minutes_apart_post_once_and_the_next_names_both(env, mon
     assert "(an order closed)" in p.db.one("SELECT text FROM messages WHERE id=?", (first,))["text"]
     obligations.record(p, b, "receipt", "commit def5678", None, now=now + hourly.CHECK_S + 200)
     _block(p, "another")
-    assert hourly.post(p, now + hourly.CHECK_S + 301) is None, "5 minutes later: the chat's status gap holds it"
-    assert hourly.post(p, now + 2 * hourly.CHECK_S + 2) is None, "still inside the hour"
-    second = hourly.post(p, now + hourly.CHECK_S + 3602)
-    assert second, "after the gap, the held change posts"
+    second = hourly.post(p, now + hourly.CHECK_S + 301)
+    assert second, "the next pass posts both changes"
     assert "(an order closed, a blocker appeared)" in p.db.one("SELECT text FROM messages WHERE id=?", (second,))["text"]
+    assert hourly.post(p, now + hourly.CHECK_S + 302) is None, "nothing new"
     assert p.db.one("SELECT COUNT(*) n FROM messages WHERE ref=?", (hourly.REF,))["n"] == 2
 
 
-def test_the_table_stays_in_the_web_app_by_default_and_its_test_line_has_no_dollars(env):
-    """#8356: without notify.chat_status the hourly table is recorded for the web app only (no chat, the
-    quiet channel), with no main chat too; its test runs are CPU work, with no $ figure."""
+def test_the_table_stays_in_the_web_app_and_its_test_line_has_no_dollars(env):
+    """#8356: the hourly table is recorded for the web app only (no chat, the quiet channel), with no
+    main chat too; its test runs are CPU work, with no $ figure."""
     from ttp import alerts, hourly
     p = make(env)
     now = time.time() - 3600

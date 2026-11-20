@@ -2,7 +2,7 @@
 
 Counter (always on: it changes no behaviour). Every pre-screen decision on a coordinator wake is one row
 in the project DB's wake_decisions table: the gate (`triage` for waketriage, `quiet` for quietgate,
-`turn` for turngate, `hook` for settlehook, `rule` for this module), its verb (`skip` or `wake`), the
+`turn` for turngate, `hook` for the retired settle hook, `rule` for this module), its verb (`skip` or `wake`), the
 event kinds and ids, and the dollars a skip avoided at the median coordinator wake cost of the last 7
 days. `summary` and `audit_line` read it for `ttp status` and the daily review.
 
@@ -17,7 +17,7 @@ every event is one of these is settled without a model run, the events marked ha
   already met within coordinator.wake_settle_recheck_s (default 6 h), and that was rule-settled fewer
   than RECHECK_MAX times since, so a condition that persists still reaches a turn.
 Never settled: a user or chat source, high or critical severity, a must-act item, promise or obligation
-text, a review, failure, restriction or outage (settlehook.never_reason, kinds aside). One event that
+text, a review, failure, restriction or outage (never_reason, kinds aside). One event that
 does not qualify sends the whole batch to the turn, as it is. Urgent user messages never pass here.
 
 Probe-pass spec edit (same flag, gate `probe`): a waiting task whose start_when or retry_when probe passed and
@@ -37,7 +37,49 @@ import re
 import statistics
 import time
 
-from . import settlehook
+from .eventhold import SEVERITIES
+
+
+# A routine batch the rules may settle; never_reason keeps out what a turn must see.
+ROUTINE_KINDS = ("task_done", "upstream_note", "observation")
+_FAIL = re.compile(r"\bfail(?:s|ed|ure|ures|ing)?\b|\berror(?:s|ed)?\b|\bcrash(?:ed|es)?\b", re.I)
+_RESTRICT = re.compile(r"\brestrict", re.I)
+_PROMISE = re.compile(r"\bpromis(?:e|es|ed)\b|\bobligation|\bmust[- ]act", re.I)
+_REVIEW = re.compile(r"\bverdict\b|\breview (?:result|passed|failed|finding)", re.I)
+_OUTAGE = re.compile(r"\boutage|\boffline\b|\bunreachable\b|\bunhealthy\b|\bis down\b|\bwent down\b|\breboot", re.I)
+_MACHINE_SRC = re.compile(r"machine|host|outage|health|broker|device|disk|ssh|reboot|net", re.I)
+_MACHINE = re.compile(r"\b(?:machine|host|node|device|broker|disk)s?\b", re.I)
+
+
+def never_reason(e: dict, task: dict | None, owners) -> str | None:
+    """Why the runtime keeps event `e` (with its text) from being settled, or None."""
+    text = str(e.get("text") or "")
+    source = str(e.get("source") or "")
+    if e.get("kind") not in ROUTINE_KINDS:
+        return "not a routine kind"
+    if e.get("severity") not in SEVERITIES:
+        return "high or critical severity"
+    if source.startswith(("user", "chat")):
+        return "a user message"
+    try:
+        if (json.loads(e.get("data") or "{}") or {}).get("must_act"):
+            return "a Must-act-now item"
+    except (TypeError, ValueError, AttributeError):
+        pass
+    if _PROMISE.search(text):
+        return "a promise or obligation"
+    if e.get("task") is not None and int(e["task"]) in owners:
+        return "its task owns an open obligation"
+    if (task or {}).get("kind") == "review" or _REVIEW.search(text):
+        return "a review result"
+    if _FAIL.search(text):
+        return "a failure"
+    if _RESTRICT.search(text):
+        return "names a Restriction"
+    if _OUTAGE.search(text) or (e.get("kind") == "observation" and (_MACHINE_SRC.search(source) or _MACHINE.search(text))):
+        return "an outage or machine condition"
+    return None
+
 
 TABLE = "wake_decisions"
 GATES = ("triage", "quiet", "turn", "hook", "rule", "probe")
@@ -49,7 +91,6 @@ RECHECK_S = 6 * 3600.0
 RECHECK_MAX = 3
 REOPEN_S = 86400.0
 TASK_KINDS = ("code", "work", "harness")
-ROUTINE_KINDS = ("task_done", "upstream_note")
 RECHECK_KINDS = ("observation", "idle_capacity", "steer_unread", "ready_not_started", "machine_change_overdue",
                  "charter_retry", "stale_holds")
 _OPEN_RESULT = re.compile(r"\bcontinue:|\bpartial:|\bcells unreported\b", re.I)
@@ -163,7 +204,7 @@ def settle_reason(db, e: dict, task: dict | None, owners, plain_done, now: float
     if kind in ("charter_retry", "machine_change_overdue", "stale_holds", "steer_unread", "ready_not_started",
                 "idle_capacity"):
         # their own text names restrictions, machines or failures by design: only the hard guards apply
-        if e.get("severity") not in settlehook.SEVERITIES or str(e.get("source") or "").startswith(("user", "chat")):
+        if e.get("severity") not in SEVERITIES or str(e.get("source") or "").startswith(("user", "chat")):
             return None
         if e.get("task") is not None and int(e["task"]) in owners:
             return None
@@ -172,7 +213,7 @@ def settle_reason(db, e: dict, task: dict | None, owners, plain_done, now: float
                 return None
         except (TypeError, ValueError, AttributeError):
             pass
-    elif settlehook.never_reason(base if kind == "observation" else e, task, owners):
+    elif never_reason(base if kind == "observation" else e, task, owners):
         return None
     if kind in RECHECK_KINDS:
         return _recheck(db, e, now, window, ruled)

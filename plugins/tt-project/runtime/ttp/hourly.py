@@ -1,11 +1,10 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""One model-free status table, `ttp status --hourly`, which the daemon posts to the project's main chat
+"""One model-free status table, `ttp status --hourly`, which the daemon records for the web app
 (Daemon.post_hourly_status) only when something important changed since the last post (important, changes:
 an order or promise closed or went overdue, a blocker or outage appeared or cleared, the spend gate changed
-level), and never sooner than the chat's status gap (chatdigest.status_wait, `coordinator.chat_status_gap_h`).
-Counts, times, loads or versions moving alone never post it; nor does a batch landing or a deploy by itself.
-The changes since the last post add up across the gap, so the next post names them all. The post folds the
+level). Counts, times, loads or versions moving alone never post it; nor does a batch landing or a deploy by itself.
+The changes since the last post add up, so the next post names them all. The post folds the
 main chat's held hand-off lines (chatdigest.handoff), one per finished task. No model call builds or posts it.
 
 Rows, in order:
@@ -277,9 +276,9 @@ def main_chat(db) -> str | None:
     return r["chat"] if r else None
 
 
-def due(p, now: float | None = None, chat: str | None = None) -> tuple[str, str] | None:
+def due(p, now: float | None = None) -> tuple[str, str] | None:
     """(table, why) when a post is due (module doc), else None; records only the first pass's baseline and
-    the time of an unchanged check. With `chat`, a change waits while that chat's status gap runs."""
+    the time of an unchanged check."""
     now = time.time() if now is None else now
     try:
         st = json.loads((p.state / STATE_FILE).read_text())
@@ -293,10 +292,6 @@ def due(p, now: float | None = None, chat: str | None = None) -> tuple[str, str]
     fixed = mark_corrected(p, st, now)
     if not fixed and 0 <= now - float(st.get("checked") or -1e18) < CHECK_S:
         return None
-    if chat is not None:   # a correction too waits for the gap: it is marked now and named in the next post
-        from . import chatdigest
-        if chatdigest.status_wait(p.db, p.config(), chat, now) > 0:
-            return None
     why = ", ".join((["a correction"] if fixed else []) + changes(st.get("sig") or {}, important(p, now)))
     if not why:
         durable_write(p.state / STATE_FILE, json.dumps({**st, "checked": now}))
@@ -344,26 +339,19 @@ def corrected(p) -> dict:
 
 
 def post(p, now: float | None = None) -> int | None:
-    """Record the table for the web app when due, and post it to the main chat too with notify.chat_status,
-    its held hand-off lines folded in; the message id, else None."""
+    """Record the table for the web app when due, the main chat's held hand-off lines folded in; the
+    message id, else None."""
     now = time.time() if now is None else now
     if not (p.config().get("notify") or {}).get("hourly_status", True):
         return None
     from . import alerts, chatdigest
-    to_chats = chatdigest.to_chat(p.config(), "status")   # the web app only (notify.chat_status: chats too)
     chat = main_chat(p.db)
-    if to_chats and not chat:
-        return None
-    if not (got := due(p, now, chat if to_chats else None)):   # the chat's status pace: waits, never stacks
+    if not (got := due(p, now)):
         return None
     sig = important(p, now)
     with p.db.tx():
         text = "\n".join([got[0], *chatdigest.handoff_lines(chatdigest.take_handoffs(p.db, chat))])
-        if to_chats:
-            mid = p.db.post("out", text, chat=chat, kind="info", severity="low", ref=REF)
-            chatdigest.mark_status(p.db, chat, now)
-        else:
-            mid = p.db.post("out", text, chat=None, channel=alerts.QUIET, kind="info", severity="low", ref=REF)
+        mid = p.db.post("out", text, chat=None, channel=alerts.QUIET, kind="info", severity="low", ref=REF)
     try:
         st = json.loads((p.state / STATE_FILE).read_text())
     except (OSError, ValueError):

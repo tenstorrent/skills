@@ -197,12 +197,6 @@ coordinator with that evidence.
   in but names none. While the status says logged out or cannot be read, the last label seen
   stands; before any is seen (after a restart) the account is unknown, so neither is an account
   switch.
-- Daily spend target (a goal, not a cap; unset by default): with `ttp config --account
-  budget.daily_target_usd <usd>`, `ttp status` shows today's Claude spend against it, and the daily
-  review's self-efficiency audit (`ttp audit`) lists each project on this machine with the last 24 h's
-  spend by class (coordinator, reviews, worker runs that ended waiting, other workers), then the total
-  against the target. Each figure is real spend (a Claude run's own tokens priced at the model it
-  actually used) with the booked figure beside it where they differ.
 - Global daily cap (usage-billed, $200/day by default): `budget.global_daily_usd` stops new work in
   every usage-billed project on the account once the whole account's tt-project spend today reaches
   it. "Today" is the rolling 24 hours unless `budget.day_start` is set. Change it for every project
@@ -278,7 +272,7 @@ coordinator with that evidence.
   a value for one, or removing one not there, is refused as unknown or retired; `ttp upgrade` drops the keys the
   plugin retired, such as `coordinator.unblock_effort`, by itself), and a key whose default is a list or an object
   refuses a value of another type without writing it, except the plain forms its reader takes
-  (`budget.compact_window_tokens` and `budget.split_reread_tokens`: one non-negative number for every tier;
+  (`budget.compact_window_tokens`: one non-negative number for every tier;
   `budget.resume_lost` and `waiting.wake_gate`: `false`, off; `coordinator.conclusion_floor`: a string such
   as `standard/high` or `off`; `providers_allowed`: a comma-separated string; `coordinator.provider_failover_to`
   and `ack_wait.probe_commands`: one string). The coordinator's `config_set` and the web app's
@@ -664,8 +658,8 @@ coordinator with that evidence.
   age is resent whole too.
   `wake_cost_alarm_usd` (default 1.0; 0 or `off`: no check) checks cost per wake without a model
   call after each session wake (wakecost.py): when the median of the last 5 new or resumed wakes is
-  above it, one alarm is recorded for the episode in the web app (in chats too only when it needs you,
-  or with `notify.chat_cost_alarm` `true`) naming its cause (context tokens, digest size or tool
+  above it, one alarm is recorded for the episode in the web app (in chats too only when it needs you)
+  naming its cause (context tokens, digest size or tool
   calls), the same session compacts in place on its next wake (once; again only after a further 5
   wakes still over, and only once its context is at least 100k tokens and 20k over its seed), and the
   digest sends any section whose only change is an age as unchanged. Never a new or stateless
@@ -1006,8 +1000,7 @@ coordinator with that evidence.
   conservative time (target 80%) and the median actual over promised (0.7 to 1.3).
 - Task-to-task waits (model-free, lanewait.py): a queued task whose start_when is exactly
   `landed:#<id>` starts as soon as that change is approved or batched in the push queue, branching
-  from its approved head instead of the base, when the task gets a worktree of its own (code, or a
-  kind `worktree.kinds` lists; no carried branch or continued head). Any other task waits for the
+  from its approved head instead of the base, when the task gets a worktree of its own (code; no carried branch or continued head). Any other task waits for the
   real landing, as it would run on code without that change. If the batch later sends it back, the task gets a
   rebase note (its spec and a running run's steer.md), never a cancel. A queued code or work task
   that has waited on another task (`landed:#`, depends_on, a lineage hold) longer than
@@ -1075,9 +1068,7 @@ coordinator with that evidence.
   Only queued tasks that can start now and match its urgency take one (an urgent or owed task's next
   steps fold only into urgent or same-obligation work, else they are queued at once; routine ones never
   into urgent work); upstream notes, deferred, `continue:`, `mechanical:` and post-landing follow-ups
-  never fold. `chains.fold_followups` false turns it off. With
-  `tasks.daily_target` set (default 0, off), `ttp throughput` and the coordinator's state show tasks
-  created in the last 24 h against that target.
+  never fold. `chains.fold_followups` false turns it off.
 - Ready, not started (model-free): a queued task with no unmet dependency, deferral, pause or
   resource hold, while a worker slot of its provider is free, that has not started 10 min after it
   became ready (2 min at priority 1) raises one `ready_not_started` event naming what holds it. Full
@@ -2375,9 +2366,8 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   `budget.max_parallel_workers` stays its own ceiling; a project cap above the machine limit is
   clipped to it. Workers are agents that send suites, builds and device jobs to other boxes, so
   the limit binds only when the machine itself is truly short; the load average and short spikes
-  never count. While nothing is short, only a `machine.max_workers` some project set caps the
-  machine (unset everywhere: each project's own caps alone apply). Under pressure the base is the
-  lowest `machine.max_workers` set (unset: the cores, 2 to 32), cut while CPU idle stays under 15%
+  never count. While nothing is short, each project's own caps alone apply. Under pressure the base
+  is the cores (2 to 32), cut while CPU idle stays under 15%
   in every reading for 60 s (x0.75; also under 5% now: x0.5; one low sample counts for nothing),
   memory is short (macOS memory pressure warn, swap growing 64 MiB between readings, under 10%
   free, or Linux memory PSI at 5: x0.75; critical, under 5% free or PSI 20: x0.5; macOS compressing
@@ -2393,9 +2383,7 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   `ttp config <name> machine.worker_limit off`. `machine.pace_from` is `moderate` (the default, as
   above) or `heavy`, for a host whose projects only run agents: then only heavy CPU (idle under 5%)
   or heavy memory (critical, under 5% free or PSI 20) cut that project's limit, a call and heat
-  count as before, and the project holds the machine's running workers to its own base rather than
-  the lowest base another project set (each other project still holds itself to its own). Set it
-  with `ttp config <name> machine.pace_from heavy`. Set values stay across upgrades.
+  count as before. Set it with `ttp config <name> machine.pace_from heavy`. Set values stay across upgrades.
 - Workers, reviewers, everything they start (detached checks, tests, reference models) and the
   daemon's pushes run at low CPU priority, 10 nice levels below the daemon (`runner.nice`, 0-19;
   0 = normal priority), so they never slow the machine's own work. The daemon and the coordinator
@@ -2723,8 +2711,7 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   (`delivery.allow_protected_push_branch` off) sends one low-severity proposal per setting state naming
   the setting, the held tasks and the `ttp config` change that would release them; other ready work keeps
   dispatching.
-  Other kinds run in the project root unless `worktree.kinds` lists them (say `["work"]`); they
-  must not move its HEAD. A run that leaves the root on another branch or with new uncommitted
+  Other kinds run in the project root; they must not move its HEAD. A run that leaves the root on another branch or with new uncommitted
   changes raises an alert naming it. Before a worktree is made, a root left detached or off its
   branch (`worktree.root_branch`, else the one it was last seen on) is put back when it has no
   uncommitted changes, else alerted; worktrees never start from such a HEAD.
@@ -4311,8 +4298,8 @@ is open raises one `cap_wait` event naming the key.
 | `checks.host_max` | from the host's cores and load | suites on one host | safety |
 | `delivery.push_min_gap_s` | 1800 s, only after a batch that did not end clean | the next push | safety |
 | `budget.max_parallel_workers` | 6 | worker runs at once | safety (spend) |
-| `machine.worker_limit` / `machine.max_workers` | auto (laptops and workstations) / null: binds only under real pressure (then the cores, 2-32), paced down | worker runs at once across all projects on the machine | safety (host) |
-| `machine.pace_from` | moderate: moderate and heavy readings cut the limit and the lowest base any project set binds; heavy: only heavy CPU or memory (plus a call or heat) cut it and the project keeps its own base | which readings and bases pace this project's machine-wide limit | safety (host) |
+| `machine.worker_limit` | auto (laptops and workstations): binds only under real pressure (then the cores, 2-32), paced down | worker runs at once across all projects on the machine | safety (host) |
+| `machine.pace_from` | moderate: moderate and heavy readings cut the limit; heavy: only heavy CPU or memory (plus a call or heat) cut it | which readings pace this project's machine-wide limit | safety (host) |
 
 ### Queue waits over 30 minutes
 
@@ -4485,8 +4472,7 @@ corrected forecast waits, whole, for one digest per chat, posted at most every
 content. The 'Status now' line the harness adds to a post naming unstarted work goes in the
 digest too, and so does the harness's own update on a late item the coordinator did not act on.
 A reminder of a step waiting on you keeps its full command and options in the digest.
-The digest stays in the web app by default (it names the chat it was for);
-`ttp config <name> notify.chat_status true` sends it to the chats too, and the hourly status table with it.
+The digest stays in the web app (it names the chat it was for), as does the hourly status table.
 `ttp stats --chat` counts per chat the posts sent at once, held, digests posted, repeats not sent and held now.
 
 Status pace. A status post (progress, counts, ETAs) goes to a chat at most once per
@@ -4506,7 +4492,7 @@ against `review.fork_target`, default 0.9), the project host's load per core and
 in 24 h (by machines-list alias), test runs and CPU-hours per landed change (CPU work, no model
 spend; only runs woken while waiting on their checks show a $ figure), the queue (open tasks,
 push queue entries, oldest approval) and the approved-to-landed median with tasks created in 24 h. The
-daemon records it in the web app (in the main chat too with `notify.chat_status` `true`) at most once an hour, sooner when a batch lands, a deploy finishes or
+daemon records it in the web app at most once an hour, sooner when a batch lands, a deploy finishes or
 an order closes, and only when a row changed (the load reading alone does not count).
 `ttp config <name> notify.hourly_status false` turns the post off.
 
@@ -5145,8 +5131,6 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   it in a file and show a test run's failures (else head and tail). On Claude Code, Bash output
   past `budget.bash_output_max_chars` also goes to a file. A worker compacts its own context inside
   its run (`budget.compact_window_tokens`) and is never ended or restarted because its context grew.
-  `budget.split_reread_tokens` is off (0) by default; a project that sets it tells a worker whose
-  run re-reads more than that once to hand the rest on as a follow-up; its run note records when, and `ttp stats` shows what steered runs re-read after it and how they handed off.
 - Every worker and reviewer run starts from the coordinator's context (`coordinator.session.worker_context`,
   default `fork`). It continues a copy of the coordinator's saved session (written within
   `worker_fork_max_age_h` hours) at any size, with its own prompt as the first new turn, and compacts in

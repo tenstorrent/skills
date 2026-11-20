@@ -102,5 +102,3 @@ def test_may_work_in_reads_the_dependent_kind_and_spec(env):
     assert not worktree.may_work_in(p, task, row(kind="question", spec="see worktrees/t70"))
     assert worktree.may_work_in(p, task, row(kind="question", spec="cd worktrees/t7 && ls"))
     assert worktree.may_work_in(p, task, row(kind="work", labels='["continues:7"]'))
-    p.set_config("worktree.kinds", ["work"])
-    assert worktree.may_work_in(p, task, row(kind="work"))

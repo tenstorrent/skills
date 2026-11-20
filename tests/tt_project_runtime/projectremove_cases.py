@@ -7,8 +7,8 @@ def _pr_shared(env, name, base):
     """Rows of `name` (and of another project) in the shared per-machine records."""
     import json
     from ttp import alerts, machinecap
-    machinecap.publish(name, {}, 1)
-    machinecap.publish("other", {}, 2)
+    machinecap.publish(name, 1)
+    machinecap.publish("other", 2)
     alerts.claims_path().write_text(json.dumps({
         "host|a": {"alert": "a", "owner": str(base), "ts": 1.0}, "host|b": {"alert": "b", "owner": "/elsewhere/tt-project", "ts": 1.0}}))
 
@@ -18,8 +18,8 @@ def test_machinecap_forget_drops_only_that_projects_row_and_creates_nothing(env)
     from ttp import machinecap
     assert machinecap.forget("gone", env["home"]) is False
     assert not (env["home"] / machinecap.STATE).exists()
-    machinecap.publish("gone", {}, 1, home=env["home"])
-    machinecap.publish("kept", {}, 2, home=env["home"])
+    machinecap.publish("gone", 1, home=env["home"])
+    machinecap.publish("kept", 2, home=env["home"])
     assert machinecap.forget("gone", env["home"]) is True and machinecap.forget("gone", env["home"]) is False
     assert list(json.loads((env["home"] / machinecap.STATE).read_text())["projects"]) == ["kept"]
 

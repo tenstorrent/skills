@@ -151,19 +151,16 @@ def test_a_failed_review_with_no_cancel_still_queues_one_fix_and_one_re_review_p
 
 
 def test_an_open_continuation_in_the_project_root_owns_nothing_so_the_done_task_is_reviewed(env):
-    """A continuation that gets no worktree of its own (a work task while worktree.kinds lists no
-    'work') runs in the project root, never on the done task's branch: its review would not cover
-    that work, so the done task gets its own review. Once work tasks get worktrees, it owns the work."""
+    """A continuation that gets no worktree of its own (a work task) runs in the project root, never on
+    the done task's branch: its review would not cover that work, so the done task gets its own review."""
     from ttp.daemon import Daemon
     p = _owner_project(env)
     d = Daemon(p.base)
     a, _ = _owner_unreviewed(env, p, "rooted")
-    w = p.db.add_task("carry rooted on", "s", kind="work", origin="coordinator", labels=[f"continues:{a}"])
+    p.db.add_task("carry rooted on", "s", kind="work", origin="coordinator", labels=[f"continues:{a}"])
     assert d._continuation_owner(p.db.task(a)) is None and d._stale_source(p.db.task(a)) == ""
     rid, added = d._auto_review(p.db.task(a), "made it")
     assert added and [r["id"] for r in _owner_reviews_of(p, a)] == [rid]
-    p.set_config("worktree.kinds", ["work"])
-    assert d._continuation_owner(p.db.task(a))["id"] == w
 
 
 def test_o424_a_done_code_task_whose_review_enqueue_timed_out_gets_its_review_from_the_backstop(env, monkeypatch):
@@ -201,8 +198,6 @@ def test_7144_a_failed_review_read_is_retried_first_by_the_sweep_outside_its_cap
     from ttp import daemon as dm
     p = _owner_project(env)
     p.set_config("review.unreviewed_per_pass", 1)
-    # The review's own read: a timed-out split read defers the review first (reviewsweep_cases).
-    p.set_config("chains.split_lines", 0)
     older, _ = _owner_unreviewed(env, p, "older backlog")
     real = worktree.diff_lines
     def expired(*a, **k):
