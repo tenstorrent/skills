@@ -1809,6 +1809,14 @@ def test_glm_guard_reads_text_piped_into_a_shell_as_commands(cmd, monkeypatch, t
         is None
 
 
+@pytest.mark.parametrize("rest", ["", " | bash", "; echo $BASH_COMMAND", "; history | tail -1 | sh", '; eval "$_"'])
+def test_a_ttp_message_is_data_only_as_pathguard_decides(rest):
+    """cells: guard_message_data"""
+    from ttp import hook, pathguard
+    cmd = 'ttp note "systemctl restart x"' + rest
+    assert ("systemctl" in hook._split(cmd)[0]) == ("systemctl" in pathguard._blank_messages(cmd)) == bool(rest)
+
+
 def test_glm_guard_lets_a_run_read_a_rollout_and_refuses_changing_one(monkeypatch, tmp_path):
     """cells: guard_rollout_read"""
     from ttp import glmguard
