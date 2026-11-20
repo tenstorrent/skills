@@ -19,12 +19,12 @@ sentence of filler words must not match a topic on generic words alone).
 """
 from __future__ import annotations
 
-import json
 import re
 import sqlite3
 import time
 
 from . import reask, timefmt
+from .db import load_result
 
 USER_SQL = ("SELECT id, ts, text, context FROM messages WHERE direction='in' AND kind='user' AND ts>=? "
             "AND COALESCE(provenance,'')!='system' AND COALESCE(channel,'')!='system' ORDER BY id DESC LIMIT ?")
@@ -125,10 +125,7 @@ def search_notes(con, query: str, limit: int = 5, since: float = 0.0) -> list[di
         return []
     sender, rows = {}, []
     for mid, ts, text, data in con.execute(NOTES_SQL, (since, SCAN)).fetchall():
-        try:
-            sender[mid] = str(json.loads(data or "{}").get("from") or "?")   # the event's own sender (upstream._note_data)
-        except (ValueError, AttributeError):
-            sender[mid] = "?"
+        sender[mid] = str(load_result(data).get("from") or "?")   # the event's own sender (upstream._note_data)
         rows.append((mid, ts, (text or "").partition("): ")[2], None))   # the note's own words, not the header
     return [{**m, "sender": sender[m["id"]]} for m in _match(rows, lambda s: _query_hit(qw, qa, s), limit)]
 

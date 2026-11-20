@@ -1712,7 +1712,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
             f"SELECT text FROM messages WHERE id IN ({','.join('?' * len(msg_ids))})", list(msg_ids)))
     lines = tried.digest_lines(db, p, now, said)
     section("tried", lines, "\n".join(lines[1:]), f"## Tried work: {len(lines) - 1} ledger lines (as last turn)")
-    section("followups", unstarted.followup_lines(p))
+    section("followups", unstarted.followup_lines(p, now))
     recurring = sched.with_costs(db)
     lines = ["## Recurring"] if recurring else []
     for s in recurring:

@@ -189,15 +189,16 @@ def _taken_by(later, title: str) -> list[int]:
             or any(q in (t["spec"] or "").lower() for q in quotes)]
 
 
-def open_followups(db) -> list[dict]:
-    """Each follow-up a hand-off proposed (any task kind), however old, whose followup_proposed event a
+def open_followups(db, now: float) -> list[dict]:
+    """Each follow-up a hand-off proposed (any task kind) in the last MAX_AGE_S whose followup_proposed event a
     turn or gate has handled, that no later task took up (_taken_by) and the coordinator did not drop
     (drop_followup): {id (the event), task, title}. A folded one, a `continue:` one (check_unqueued_continues)
-    and an `upstream:` one (filed by the daemon) are left out: each has its own owner."""
+    and an `upstream:` one (filed by the daemon) are left out: each has its own owner. A follow-up not taken
+    up within 24 h leaves the digest list (no full-history scan per digest build)."""
     out = []
-    for e in db.q("SELECT id, task, text FROM events WHERE kind='followup_proposed' AND status='handled' "
+    for e in db.q("SELECT id, task, text FROM events WHERE kind='followup_proposed' AND status='handled' AND ts>=? "
                   "AND task IS NOT NULL AND text NOT LIKE '%(folded into #%' "
-                  "AND COALESCE(data,'') NOT LIKE '%\"dropped\"%' ORDER BY id"):
+                  "AND COALESCE(data,'') NOT LIKE '%\"dropped\"%' ORDER BY id", (now - MAX_AGE_S,)):
         fups = load_result((db.task(e["task"]) or {}).get("result")).get("followups")
         title = next((str(f["title"]).strip() for f in fups if isinstance(f, dict) and f.get("title")
                       and str(f["title"])[:200] in e["text"]), None) if isinstance(fups, list) else None
@@ -208,9 +209,9 @@ def open_followups(db) -> list[dict]:
     return out
 
 
-def followup_lines(p) -> list[str]:
+def followup_lines(p, now: float) -> list[str]:
     """The digest's open follow-ups (open_followups), at most FOLLOWUPS_SHOWN, under a header saying how to settle each."""
-    fups = open_followups(p.db)
+    fups = open_followups(p.db, now)
     if not fups:
         return []
     more = f" ({len(fups) - FOLLOWUPS_SHOWN} older not shown)" if len(fups) > FOLLOWUPS_SHOWN else ""
@@ -227,7 +228,7 @@ def drop_followup(db, event_id: int, why: str) -> str:
     e = db.one("SELECT id, task, data FROM events WHERE id=? AND kind='followup_proposed'", (event_id,))
     if not e:
         raise ValueError(f"no proposed follow-up {event_id}")
-    data = load_result(e["data"]) if e["data"] else {}
+    data = load_result(e["data"])
     db.x("UPDATE events SET status='handled', data=? WHERE id=?",
          (json.dumps({**data, "dropped": why.strip()[:300]}), event_id))
     return f"follow-up {event_id} of #{e['task']} dropped"
