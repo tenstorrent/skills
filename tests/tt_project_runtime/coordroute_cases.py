@@ -267,6 +267,142 @@ def test_coordroute_shadow_mode_records_the_lane_beside_the_coordinator_and_appl
     assert coordroute.report(p.db, p.state)["shadow"]["compared"] == 1
 
 
+def _cr_opus_fix(p, tid, run=900):
+    """A tt-buddy-modelled turn: the coordinator's own session already made the harness fix and queued the audit."""
+    from ttp import coordroute
+    coordroute.record_opus_turn(
+        p.db, run, {"event_kinds": ["task_done"]},
+        [{"type": "task_add", "title": "harness: fix the stale resource probe", "why": "the probe held work past its end"},
+         {"type": "task_update", "id": tid, "priority": 1, "why": "the fix landed"},
+         {"type": "task_update", "id": 4242, "status": "queued", "why": "no such task"}, {"type": "noop"}],
+        applied=[0, 1], problems=["task 4242 does not exist"], summary="queued the probe fix")
+
+
+def test_coordroute_recent_actions_list_the_coordinators_fix_with_outcomes_and_honour_the_setting(env):
+    from ttp import coordroute
+    p = make(env)
+    assert coordroute.recent_actions(p.db, 20) == "", "nothing recorded: no section"
+    assert coordroute.settings(_cr_cfg())["recent_actions"] == coordroute.RECENT_ACTIONS == 20
+    assert coordroute.settings(_cr_cfg(recent_actions=3))["recent_actions"] == 3
+    _cr_opus_fix(p, 7)
+    text = coordroute.recent_actions(p.db, 20)
+    assert "## Recent coordinator actions (the last 3, oldest first)" in text and "Already done" in text
+    assert "coordinator run 900: task_add harness fix the stale resource probe" in text
+    assert text.count("-> applied") == 2 and text.count("-> rejected") == 1, text
+    assert "had rejected: task 4242 does not exist" in text
+    assert "noop" not in text, "a noop is no action"
+    assert "task_update #7" in text
+    last = coordroute.recent_actions(p.db, 1)
+    assert "(the last 1, oldest first)" in last and "task_update #4242" in last and "task_update #7" not in last
+    assert coordroute.recent_actions(p.db, 0) == "", "recent_actions 0 turns the view off"
+    # An applied turn with nothing to show records nothing.
+    n = len(coordroute.state(p.db)["turns"])
+    coordroute.record_opus_turn(p.db, 901, {}, [{"type": "noop"}], [0])
+    assert len(coordroute.state(p.db)["turns"]) == n
+
+
+def test_coordroute_the_coordinators_turns_never_judge_the_lane_or_push_its_turns_out(env):
+    from ttp import coordroute
+    p = make(env)
+    for i in range(coordroute.KEEP_TURNS + 5):
+        _cr_opus_fix(p, 7, run=1000 + i)
+    note = {"events": [], "event_kinds": ["task_done"]}
+    st = coordroute.record_turn(p.db, 5, note, [{"type": "task_update", "id": 7, "why": "w"}], [0], [], "")
+    for i in range(coordroute.KEEP_TURNS + 5):
+        _cr_opus_fix(p, 7, run=2000 + i)
+    turns = coordroute.state(p.db)["turns"]
+    assert [t for t in turns if t.get("by") != coordroute.OPUS] and \
+        sum(1 for t in turns if t.get("by") == coordroute.OPUS) == coordroute.KEEP_TURNS
+    assert [t["run"] for t in coordroute._lane_turns(coordroute.state(p.db))] == [5]
+    assert coordroute.check_suspend(coordroute.state(p.db)) == "", "rejected coordinator actions are not the lane's"
+    assert coordroute.report(p.db, p.state)["live"]["turns"] == 1
+    assert "lane run 5: task_update #7" in coordroute.recent_actions(p.db, 1000)
+    coordroute._save(p.db, {**st, "suspended": {"why": "x"}})
+    assert coordroute.resume(p.db)
+    assert [t.get("by") for t in coordroute.state(p.db)["turns"]] == [coordroute.OPUS] * coordroute.KEEP_TURNS
+
+
+def test_coordroute_lane_digest_swaps_the_collapsed_views_for_the_whole_ones(env):
+    from ttp import coordroute
+    p = make(env)
+    _cr_opus_fix(p, 7)
+    parts = [("charter", "## Charter"), ("tasks", "## Open tasks: (as last turn)"), ("asks", "(as last turn)"),
+             ("routine_lane", "## Routine lane turns since your last wake"), ("events", "## New events")]
+    whole = [("tasks", "## Open tasks\n- #7 queued"), ("asks", "## Open questions\n- ask #3"),
+             ("finished", "## Recently finished\n- #8 done"), ("results", "## Results\n- #8 passed")]
+    got = coordroute.lane_digest(parts, whole, p.db, 20)
+    keys = [k for k, _ in got]
+    assert "routine_lane" not in keys and keys[0] == "charter" and keys[-1] == "recent_actions"
+    text = "\n".join(t for _, t in got)
+    assert "(as last turn)" not in text and "- #7 queued" in text and "- ask #3" in text
+    assert "- #8 done" in text and "- #8 passed" in text and "harness fix the stale resource probe" in text
+    assert "recent_actions" not in [k for k, _ in coordroute.lane_digest(parts, whole, p.db, 0)]
+
+
+def test_coordroute_the_lane_prompt_carries_tasks_actions_hand_offs_and_asks(env, monkeypatch):
+    from ttp import coordroute
+    p, d = _cr_project(env, monkeypatch, "shadow")
+    tid = p.db.add_task("harness: stale resource probe", "fix the probe", kind="harness", tier="standard")
+    p.db.x("UPDATE tasks SET blocked_reason=? WHERE id=?", ("probe still reads the old marker", tid))
+    done = p.db.add_task("audit the idle wakes", "audit", kind="work", tier="light")
+    p.db.x("UPDATE tasks SET status='done', updated=?, result=? WHERE id=?",
+           (time.time(), json.dumps({"summary": "idle wakes audited: three were avoidable"}), done))
+    p.db.x("INSERT INTO messages(ts,direction,kind,text,handled) VALUES(?,?,?,?,0)",
+           (time.time(), "out", "ask", "Should the nightly job keep its old schedule?"))
+    _cr_opus_fix(p, tid)
+    _cr_event(p)
+    monkeypatch.setenv("TTP_FAKE_ACTIONS", json.dumps([{"type": "noop"}]))
+    shadow_id = _cs_wake(p, d)
+    assert coordroute.lane_of(_cr_note(p, shadow_id)) == "shadow"
+    prompt = (p.runs / str(shadow_id) / "prompt.md").read_text()
+    assert "harness: stale resource probe" in prompt and "probe still reads the old marker" in prompt, \
+        "open tasks with their last note"
+    assert "## Recent coordinator actions" in prompt and "harness fix the stale resource probe" in prompt, \
+        "the coordinator's fix is in the lane's view of what was done"
+    assert "idle wakes audited: three were avoidable" in prompt, "recent hand-offs and results"
+    assert "Should the nightly job keep its old schedule?" in prompt, "pending asks"
+    assert "## Routine lane turns since your last wake" not in prompt
+    _finish_runs(p, d)
+    # recent_actions 0: the section is gone and the rest of the prompt stays.
+    p.set_config("coordinator.routine", {"mode": "shadow", "provider": "fake", "model": "lane-model", "recent_actions": 0})
+    _cr_event(p)
+    rid = _cs_wake(p, d)
+    prompt = (p.runs / str(rid) / "prompt.md").read_text()
+    assert "## Recent coordinator actions" not in prompt and "Should the nightly job keep its old schedule?" in prompt
+
+
+def test_coordroute_applied_coordinator_turns_are_recorded_for_the_lane(env, monkeypatch):
+    from ttp import coordroute
+    p, d = _cr_project(env, monkeypatch, "shadow")
+    tid = p.db.add_task("later", "do it later", kind="work", tier="light")
+    _cr_event(p)
+    monkeypatch.setenv("TTP_FAKE_ACTIONS", json.dumps(
+        [{"type": "task_update", "id": tid, "priority": 3, "why": "the dependency finished"}]))
+    _cs_wake(p, d)
+    _finish_runs(p, d)
+    opus = [t for t in coordroute.state(p.db)["turns"] if t.get("by") == coordroute.OPUS]
+    assert opus and opus[-1]["actions"][0]["target"] == f"#{tid}" and "outcome" not in opus[-1]["actions"][0]
+    assert f"task_update #{tid} (the dependency finished) -> applied" in coordroute.recent_actions(p.db, 20)
+
+
+def test_coordroute_report_covers_a_since_until_window(env, capsys):
+    from ttp import coordroute
+    p = make(env)
+    folder = p.state / coordroute.SHADOW_DIR
+    folder.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    for i, age in enumerate((5, 3, 1)):
+        (folder / f"{i + 1}.json").write_text(json.dumps(
+            {"ts": now - age * 86400, "compare": {"agree": i == 2, "glm_ok": True, "opus_only": [], "glm_only": []}, "opus": {}, "glm": {}}))
+    assert coordroute.report(p.db, p.state, days=7, now=now)["shadow"]["compared"] == 3
+    assert coordroute.report(p.db, p.state, now=now, since=now - 2 * 86400)["shadow"]["compared"] == 1
+    assert coordroute.report(p.db, p.state, now=now, since=now - 4 * 86400, until=now - 2 * 86400)["shadow"]["compared"] == 1
+    assert _cr_main("stats", "demo", "--coord-routine", "--since", "2000-01-01") == 0
+    assert "3 compared" in capsys.readouterr().out
+    assert _cr_main("stats", "demo", "--coord-routine", "--since", "2999-01-01") == 0
+    assert "3 compared" not in capsys.readouterr().out
+
+
 def test_coordroute_lane_rows_never_count_as_the_coordinators_own_turn(env):
     from ttp import coordroute
     p = make(env)

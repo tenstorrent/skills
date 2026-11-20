@@ -1347,7 +1347,7 @@ ranking, stand-in list and down-model pick, e.g. a small variant that should nev
 `ttp config --account providers.chat.rank_exclude '["<model id>"]'`.
 
 Routine coordinator lane (`coordroute.py`, off by default). `coordinator.routine` (`{"mode": "off", "provider":
-"chat", "model": "<chat model>", "effort": "max", "heartbeat_h": 4, "max_turns": 12}`; `model` falls back to
+"chat", "model": "<chat model>", "effort": "max", "heartbeat_h": 4, "max_turns": 12, "recent_actions": 20}`; `model` falls back to
 `route.glm_work.model`) sends routine coordinator wakes to the chat model. A model-free, conservative check sends a
 wake to the coordinator's own session on any user or relayed message, ask or answer, failed review, plan hand-off,
 must-act item tied to an order or promise, urgent or high-severity item, charter or Restrictions change, its first,
@@ -1361,7 +1361,12 @@ pins, deep tier, cancels, wakes, replies, notifies, asks, charter, memory or con
 `escalate:` noop, a guard hit or a failed turn applies nothing and hands the wake, with its notes, to the
 coordinator's own session. The coordinator's next own wake lists every lane turn since its last one with each
 action's why. The lane suspends itself when it leaves a must-act item or its escalations or refused actions run
-high; `ttp stats <project> --coord-routine --resume-lane` (the user's terminal) lifts it.
+high; `ttp stats <project> --coord-routine --resume-lane` (the user's terminal) lifts it. A lane or shadow turn
+sees what the coordinator's digest shows, built by the same code: open tasks, hand-offs and results, and pending asks
+whole (not as "as last turn" lines, since the lane has no earlier turn), plus the last `recent_actions` (default 20, 0
+off) actions of the coordinator and the lane, each with whether it applied, so it does not queue again a fix already
+made. They are recorded beside the lane's turns in the same state. `ttp stats <project> --coord-routine` takes
+`--since` and `--until`, else `--days`.
 
 GLM worker escalation switches (`glmassist.py`, both off by default, for runs on the GLM work route or code arm).
 `route.glm_work.plan_first: true`: the run's first step is `ttp advise --plan "<the task>"`, a read-only Opus call

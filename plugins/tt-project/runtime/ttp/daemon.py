@@ -6956,6 +6956,12 @@ class Daemon:
                                        left_must=len(left), summary=str((out or {}).get("summary") or ""))
             except Exception:
                 log(self.p, "routine lane turn record failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
+        elif coordroute.settings(self.cfg)["mode"] != "off":
+            try:   # what the routine lane is shown of the coordinator's recent actions (coordroute.recent_actions)
+                coordroute.record_opus_turn(db, r["id"], note, actions, applied, problems=problems,
+                                            summary=str((out or {}).get("summary") or ""))
+            except Exception:
+                log(self.p, "coordinator turn record failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
         decided = len(_decisions(actions))
         try:   # the per-wake record the daily review measures self-changes by (selfimprove)
             from . import selfimprove
@@ -12503,7 +12509,7 @@ class Daemon:
                 except Exception as e:   # what it cannot place goes to the coordinator's own session
                     routine, routine_why = False, [f"classifier failed: {type(e).__name__}"]
                     log(self.p, "routine lane classifier failed: " + traceback.format_exc().replace("\n", " | ")[:1500])
-            if routine and lane["mode"] == "on" and self._start_lane(prompt_parts=parts, evs=evs, budget=budget, c=c,
+            if routine and lane["mode"] == "on" and self._start_lane(prompt_parts=parts, whole=whole, evs=evs, budget=budget, c=c,
                                                                      lane=lane, fire=fire, why=routine_why):
                 db.set_kv("last_coordinator_turn", now)
                 looks.settle(db, [x["id"] for x in fire], "woken", None, now)
@@ -12551,7 +12557,7 @@ class Daemon:
         try:   # the lane's read-back and any escalation are the coordinator's own session's now
             coordroute.opus_started(db, rid, now)
             if routine and lane["mode"] == "shadow":
-                self._start_shadow(rid, prompt_parts=parts, budget=budget, c=c, lane=lane, why=routine_why)
+                self._start_shadow(rid, prompt_parts=parts, whole=whole, budget=budget, c=c, lane=lane, why=routine_why)
         except Exception:   # bookkeeping: the coordinator's wake runs either way
             log(self.p, "routine lane record failed: " + traceback.format_exc().replace("\n", " | ")[:1500])
         if lead:
@@ -12565,19 +12571,23 @@ class Daemon:
         if logged_out:
             db.set_kv(f"auth_probe:{provider}", now)
 
-    def _lane_prompt(self, prompt_parts: list) -> tuple[str, str, str]:
-        """(prompt, system, context) of a routine lane or shadow turn: the digest without the read-back."""
+    def _lane_prompt(self, prompt_parts: list, whole: list, lane: dict) -> tuple[str, str, str]:
+        """(prompt, system, context) of a routine lane or shadow turn: the coordinator's digest without the
+        read-back, with the views the lane has no session to remember (coordroute.lane_digest): open tasks,
+        hand-offs and results and pending asks whole, and the last coordinator actions with their outcomes."""
         head, context = coord.prompt_parts(self.p)
-        prompt = "\n".join(text for name, text in prompt_parts if name != "routine_lane")
+        parts = coordroute.lane_digest(prompt_parts, whole, self.p.db, lane.get("recent_actions", coordroute.RECENT_ACTIONS),
+                                       lambda t: timefmt.short(t, self.p))
+        prompt = "\n".join(text for _, text in parts)
         return prompt, head + "\n\n" + coordroute.LANE_PROMPT, context
 
-    def _start_lane(self, *, prompt_parts: list, evs: list, budget, c: dict, lane: dict, fire: list,
+    def _start_lane(self, *, prompt_parts: list, whole: list, evs: list, budget, c: dict, lane: dict, fire: list,
                     why: list) -> int | None:
         """Starts a live routine lane turn (coordroute.py) on the lane's provider and model; None when it could
         not start, so the coordinator's own session takes the wake."""
         db = self.p.db
         try:
-            prompt, system, context = self._lane_prompt(prompt_parts)
+            prompt, system, context = self._lane_prompt(prompt_parts, whole, lane)
             rid = self.start_run("coordinator", prompt, lane["provider"], c.get("tier", "light"), str(self.p.base),
                                  read_only=True, schema=coordsession.schema(), system=system, context=context,
                                  budget_usd=budget,
@@ -12595,12 +12605,12 @@ class Daemon:
             coordroute._save(db, st)
             return None
 
-    def _start_shadow(self, opus_run: int, *, prompt_parts: list, budget, c: dict, lane: dict, why: list) -> None:
+    def _start_shadow(self, opus_run: int, *, prompt_parts: list, whole: list, budget, c: dict, lane: dict, why: list) -> None:
         """Starts a shadow lane turn beside coordinator turn `opus_run`: its answer is compared, never applied."""
         if self.p.db.one("SELECT id FROM runs WHERE role='coordinator' AND status='running' AND NOT ("
                          + coordroute.NOT_SHADOW_SQL + ")"):
             return   # one shadow at a time
-        prompt, system, context = self._lane_prompt(prompt_parts)
+        prompt, system, context = self._lane_prompt(prompt_parts, whole, lane)
         srid = self.start_run("coordinator", prompt, lane["provider"], c.get("tier", "light"), str(self.p.base),
                               read_only=True, schema=coordsession.schema(), system=system, context=context,
                               budget_usd=budget,

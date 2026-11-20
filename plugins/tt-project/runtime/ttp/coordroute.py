@@ -43,6 +43,11 @@ ESCALATE = "escalate:"         # a lane noop whose `why` starts with it hands th
 HEARTBEAT_H = 4.0
 MAX_TURNS = 12
 KEEP_TURNS = 60
+RECENT_ACTIONS = 20            # the coordinator's last actions a lane turn is shown (`coordinator.routine.recent_actions`)
+OPUS = "opus"                  # a turn record's `by` for the coordinator's own session; lane turns carry none
+# Digest sections the lane sees whole, not as the "as last turn" lines the coordinator's session gets: it has no
+# earlier turn to have seen them in. Open tasks and workers' notes, hand-offs and task results, and pending asks.
+LANE_VIEWS = ("tasks", "finished", "results", "followups", "asks")
 FAIL_COOL_S = 1800             # a lane turn the endpoint failed: the coordinator's own session for this long
 SUSPEND_MIN = 10               # lane turns before the rates below judge it
 SUSPEND_ESCALATE = 0.40
@@ -128,7 +133,7 @@ def ring_gate(cfg: dict, project: str, raw: dict | None) -> dict:
 
 
 def settings(cfg: dict) -> dict:
-    """{"mode", "provider", "model", "effort", "heartbeat_h", "max_turns", "why"}: mode off when unset, unknown
+    """{"mode", "provider", "model", "effort", "heartbeat_h", "recent_actions", "max_turns", "why"}: mode off when unset, unknown
     or with no lane model (`coordinator.routine.model`, else the GLM work route's model)."""
     from . import glmwork
     r = _raw(cfg)
@@ -141,6 +146,7 @@ def settings(cfg: dict) -> dict:
     return {"mode": mode, "provider": str(r.get("provider") or "chat"), "model": model,
             "effort": str(r.get("effort") or "max"),
             "heartbeat_h": num_in(r.get("heartbeat_h"), 0.25, 48, HEARTBEAT_H),
+            "recent_actions": int(num_in(r.get("recent_actions"), 0, 100, RECENT_ACTIONS)),
             "max_turns": int(num_in(r.get("max_turns"), 1, 200, MAX_TURNS)), "why": why}
 
 
@@ -291,6 +297,81 @@ def _brief(a) -> dict:
     return {"type": str(a.get("type") or ""), "target": _target(a), "why": str(why)[:200]}
 
 
+def _lane_turns(st: dict) -> list:
+    """The lane's own turns in the state's record, which also holds the coordinator's (recent_actions)."""
+    return [t for t in st.get("turns") or [] if t.get("by") != OPUS]
+
+
+def _kept(turns: list) -> list:
+    """The newest KEEP_TURNS of each kind, in order: the coordinator's turns never push the lane's out."""
+    n = {OPUS: 0, "": 0}
+    out = []
+    for t in reversed(turns):
+        k = OPUS if t.get("by") == OPUS else ""
+        n[k] += 1
+        if n[k] <= KEEP_TURNS:
+            out.append(t)
+    return out[::-1]
+
+
+def record_opus_turn(db, run_id, note: dict, actions, applied, problems=(), summary: str = "",
+                     now: float | None = None) -> None:
+    """Records an applied turn of the coordinator's own session in the same turn record the lane keeps: each
+    action with whether it applied, and what the apply rejected. recent_actions() reads it back for the lane,
+    which has no session to remember them in. Judges nothing and never suspends the lane."""
+    now = time.time() if now is None else now
+    acts = [a for a in actions if isinstance(a, dict)] if isinstance(actions, list) else []
+    done = set(applied or [])
+    st = state(db)
+    turn = {"run": run_id, "ts": now, "by": OPUS, "events": list(note.get("event_kinds") or [])[:20],
+            "actions": [{**_brief(a), **({} if i in done else {"outcome": "rejected"})}
+                        for i, a in enumerate(actions if isinstance(actions, list) else [])
+                        if isinstance(a, dict) and a.get("type") != "noop"],
+            "rejected": [str(x)[:200] for x in list(problems or [])[:5]], "summary": summary[:300]}
+    if not turn["actions"] and not turn["rejected"]:
+        return
+    st["turns"] = _kept(list(st.get("turns") or []) + [turn])
+    _save(db, st)
+
+
+def recent_actions(db, n: int = RECENT_ACTIONS, fmt=None) -> str:
+    """The last `n` actions of the coordinator and the lane, oldest first, each with its outcome: the lane's view
+    of what was already done (a fix queued, a task updated, an ask answered), so it does not do it again.
+    Empty when `n` is 0 or nothing was recorded."""
+    if n <= 0:
+        return ""
+    st = state(db)
+    fmt = fmt or (lambda t: time.strftime("%H:%M", time.localtime(t)))
+    rows = []
+    for t in st.get("turns") or []:
+        who = "coordinator" if t.get("by") == OPUS else "lane"
+        for a in t.get("actions") or []:
+            rows.append((float(t.get("ts") or 0), who, t.get("run"), a))
+    rows.sort(key=lambda r: r[0])
+    last_turn = {r[2] for r in rows[-n:]}
+    out = [f"## Recent coordinator actions (the last {min(n, len(rows))}, oldest first)",
+           "Already done: do not queue the same fix, task or update again; check these before you add one."]
+    for ts, who, run, a in rows[-n:]:
+        out.append((f"- {fmt(ts)} {who} run {run}: {a.get('type')} {a.get('target') or ''}".rstrip()
+                    + (f" ({a['why']})" if a.get("why") else "") + f" -> {a.get('outcome') or 'applied'}")[:400])
+    for t in st.get("turns") or []:
+        if t.get("run") in last_turn and t.get("rejected"):
+            out.append(f"- run {t.get('run')} had rejected: " + "; ".join(t["rejected"])[:400])
+    return "\n".join(out) if rows else ""
+
+
+def lane_digest(parts: list, whole: list, db, n: int = RECENT_ACTIONS, fmt=None) -> list:
+    """The digest parts for a lane or shadow turn: the coordinator's parts without the lane's read-back, the
+    LANE_VIEWS sections whole, and the recent actions. The same section builders as the coordinator's digest
+    (coordinator.digest_parts): nothing here is a second copy."""
+    full = dict(whole or [])
+    out = [(k, full.get(k, text) if k in LANE_VIEWS else text) for k, text in parts if k != "routine_lane"]
+    have = {k for k, _ in out}
+    out += [(k, full[k]) for k in LANE_VIEWS if k in full and k not in have]
+    acts = recent_actions(db, n, fmt)
+    return out + ([("recent_actions", acts)] if acts else [])
+
+
 def record_turn(db, run_id, note: dict, actions, applied, refused, esc: str, failed: str = "",
                 problems=(), left_must: int = 0, summary: str = "", now: float | None = None) -> dict:
     """Records a live lane turn (and an escalation), then applies the suspend check. Returns the state."""
@@ -302,7 +383,7 @@ def record_turn(db, run_id, note: dict, actions, applied, refused, esc: str, fai
             "refused": [{**_brief(acts[i] if 0 <= i < len(acts) else None), "refused": w} for i, w in refused],
             "escalated": esc, "failed": failed[:200], "problems": len(list(problems or [])),
             "left_must": int(left_must), "summary": summary[:300]}
-    st["turns"] = (list(st.get("turns") or []) + [turn])[-KEEP_TURNS:]
+    st["turns"] = _kept(list(st.get("turns") or []) + [turn])
     if esc or refused or failed:
         st["escalate"] = {"run": run_id, "ts": now, "why": esc or failed or "; ".join(w for _, w in refused)[:300],
                           "refused": turn["refused"], "summary": summary[:300]}
@@ -317,7 +398,7 @@ def record_turn(db, run_id, note: dict, actions, applied, refused, esc: str, fai
 def check_suspend(st: dict, db=None) -> str:
     """Why the lane suspends itself, or "": it left a must-act item, or over its last turns its escalations
     passed SUSPEND_ESCALATE or its refused-action rate passed the coordinator's own by SUSPEND_REFUSED_PTS."""
-    turns = list(st.get("turns") or [])
+    turns = _lane_turns(st)
     if turns and turns[-1].get("left_must"):
         return f"lane turn {turns[-1].get('run')} left a must-act item"
     recent = turns[-20:]
@@ -351,7 +432,7 @@ def resume(db) -> bool:
     if not st.get("suspended"):
         return False
     st.pop("suspended", None)
-    st["turns"] = []
+    st["turns"] = [t for t in st.get("turns") or [] if t.get("by") == OPUS]
     _save(db, st)
     return True
 
@@ -361,7 +442,7 @@ def digest_lines(db, fmt=None) -> str:
     why, any escalation and any suspension. Empty when there is nothing to read."""
     st = state(db)
     last = float(st.get("last_opus") or 0)
-    turns = [t for t in st.get("turns") or [] if float(t.get("ts") or 0) > last]
+    turns = [t for t in _lane_turns(st) if float(t.get("ts") or 0) > last]
     esc, sus = st.get("escalate"), st.get("suspended")
     if not turns and not esc and not sus:
         return ""
@@ -442,15 +523,18 @@ def compare(opus: dict, glm: dict) -> dict:
             "glm_ok": glm.get("status") == "ok"}
 
 
-def report(db, state_dir, days: float = 7.0, now: float | None = None) -> dict:
-    """`ttp stats --coord-routine`: the shadow comparison and the live lane's record over `days`."""
+def report(db, state_dir, days: float = 7.0, now: float | None = None, since: float | None = None,
+           until: float | None = None) -> dict:
+    """`ttp stats --coord-routine`: the shadow comparison and the live lane's record over `days`, or from
+    `since` (to `until`, default now)."""
     now = time.time() if now is None else now
-    since = now - days * 86400
+    until = now if until is None else until
+    since = now - days * 86400 if since is None else since
     pairs = []
     folder = Path(state_dir) / SHADOW_DIR
     for path in sorted(folder.glob("*.json")) if folder.is_dir() else []:
         rec = read_dict(path)
-        if float(rec.get("ts") or 0) >= since:
+        if since <= float(rec.get("ts") or 0) <= until:
             pairs.append(rec)
     done = [r for r in pairs if r.get("compare")]
     cmp = [r["compare"] for r in done]
@@ -460,7 +544,7 @@ def report(db, state_dir, days: float = 7.0, now: float | None = None) -> dict:
         return round(sum(1 for c in cmp if c.get(k)) / n, 3) if n else None
     cost = {s: round(sum(float((r.get(s) or {}).get("cost_usd") or 0) for r in done), 2) for s in ("opus", "glm")}
     st = state(db)
-    turns = [t for t in st.get("turns") or [] if float(t.get("ts") or 0) >= since]
+    turns = [t for t in _lane_turns(st) if since <= float(t.get("ts") or 0) <= until]
     live = {"turns": len(turns), "escalated": sum(1 for t in turns if t.get("escalated") or t.get("refused")),
             "failed": sum(1 for t in turns if t.get("failed")),
             "actions": sum(len(t.get("actions") or []) for t in turns),

@@ -783,7 +783,10 @@ def test_speed_complaint_detector_matches_complaints_not_plain_messages():
         assert sc.detect(text), text
     for text in ("Approved, go ahead", "Queue a task for the docs", "What is the status of the build?",
                  "Thanks, looks good", "Use the slowtests report", "",
-                 "The PR is now waiting on human review; keep the comment watch on."):
+                 "The PR is now waiting on human review; keep the comment watch on.",
+                 # Bare 'hours' and 'waiting' name a schedule or another person's step, not the project's pace.
+                 "The lab is booked by hours held per team", "Hours of operation are 9 to 5",
+                 "Waiting for the vendor to answer"):
         assert not sc.detect(text), text
 
 

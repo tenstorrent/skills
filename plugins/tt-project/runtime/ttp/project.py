@@ -764,7 +764,7 @@ EXTRA_KEYS = {
     # drift: thresholds of the running-run drift flags (drift.py; each 0: off): repeat_fail 3, loop 4,
     # outside_spec 3, quiet_s 900, pace 1.5, and raise_s 600 before a still-flagged run reaches the coordinator.
     # routine: routine wakes on the chat model (coordroute.py): {"mode" off|shadow|on, "provider", "model",
-    # "effort", "heartbeat_h", "max_turns"}; mode is the user's alone (coordinator.NEEDS_USER).
+    # "effort", "heartbeat_h", "max_turns", "recent_actions"}; mode is the user's alone (coordinator.NEEDS_USER).
     "coordinator": {"routine", "lead_base_gap_s", "lead_max_gap_s", "lead_list_max", "charter_max_chars", "session", "status_footer", "agent_orders_as_user", "owner_identities", "max_review_tasks_per_day", "charter_approval_days", "approval_lookback_days", "reask_window_days", "blocker_sweep_h", "blocker_sweep_min_gap_h",
                     "blocker_sweep_recheck_skip_h", "review_backlog_h", "user_pause_marker", "promise_default_h", "mitigation_due_h", "course_check",
                     "progress_check", "probe_stall_dispose_h", "routine_defaults", "echo_paths", "drift",

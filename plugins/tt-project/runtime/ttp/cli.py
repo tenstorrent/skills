@@ -2262,7 +2262,9 @@ def cmd_stats(a) -> None:
                 die("a suspended routine lane resumes on the user's word: run this from your own terminal")
             print("routine lane resumed" if coordroute.resume(p.db) else "routine lane was not suspended")
             return
-        rep = coordroute.report(p.db, p.state, a.days)
+        tz = timefmt.home(p)
+        rep = coordroute.report(p.db, p.state, a.days, since=_stats_time(a.since, tz, "--since"),
+                                until=_stats_time(a.until, tz, "--until"))
         print(json.dumps(rep, indent=1) if a.json else coordroute.text(rep, p.name))
         return
     if getattr(a, "guards", False):
@@ -16375,7 +16377,7 @@ def main(argv: list[str] | None = None) -> None:
                         "and user corrections (--since/--until, else --days; --all or --projects: every project)")
     s.add_argument("--coord-routine", action="store_true",
                    help="the coordinator's routine lane instead (coordroute.py): shadow pairs compared (agreement, "
-                        "escalations, refusals, cost per side) and live lane turns over the last --days")
+                        "escalations, refusals, cost per side) and live lane turns (--since/--until, else the last --days)")
     s.add_argument("--resume-lane", action="store_true",
                    help="with --coord-routine: lift the routine lane's own suspension (from your own terminal)")
     s.add_argument("--babysit", action="store_true",
