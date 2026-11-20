@@ -105,8 +105,11 @@ The streaming CSVs carry no op names. To get them (tested as of 2026-11-19):
 
 ```bash
 ./build/tools/profiler/bin/tracy-capture -o run.tracy -f -p <port> &   # headless
+capture_pid=$!
+trap 'kill "$capture_pid" 2>/dev/null' EXIT   # no capture left holding the port
 TTNN_OP_PROFILER=1 TRACY_PORT=<port> TT_METAL_STREAMING_PROFILER=1 \
-  TT_METAL_STREAMING_PROFILER_OPS_CSV=ops.csv pytest <test id>
+  TT_METAL_STREAMING_PROFILER_OPS_CSV=ops.csv pytest <test id> || exit 1
+wait "$capture_pid" || exit 1   # run.tracy is complete only once it exits
 ./build/tools/profiler/bin/tracy-csvexport -m -s ";" run.tracy
 ```
 

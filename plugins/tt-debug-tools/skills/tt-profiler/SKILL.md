@@ -62,10 +62,12 @@ headless Tracy capture, see `references/op-report.md`.
 
 What it fixes compared with the device profiler:
 
-- **No fixed buffer that fills up.** Records stream off each core through a
-  small L1 ring to the host as they happen; there is no per-core buffer to size
-  or drain, and no ~1000-run limit. A full ring stalls the producer (a
-  `PROFILER-STALL` zone) instead of losing records.
+- **No device-profiler buffer or drain limit.** Records stream off each core
+  through small rings to the host as they happen, so the device profiler's
+  fixed per-core buffer, its drain calls and its ~1000-run limit go away. The
+  rings are still finite: a full ring stalls the producer (a `PROFILER-STALL`
+  zone), and a host callback that falls behind drops records, counted by
+  `dropped_bytes()`.
 - **No stop at kernel or program boundaries.** Capture runs continuously.
 - **Better cross-device sync.** Every record lands on one host-clock timeline,
   synced across chips over Ethernet.
