@@ -278,7 +278,9 @@ Each gate applies when its pattern is material in the measured path. The why and
 
 ### Working Through Limitations
 
-A TTNN limitation or bug is a problem to solve, not a reason to drop the optimization. When L1 buffers overlap,
+A TTNN limitation or bug is a problem to solve, not a reason to drop the optimization. Whether the fix may change
+the op itself depends on the run's `scope` (`model-bringup`): under `release`, solve it inside the model; under
+`open`, changing or copying the op is allowed, with a test at model shapes. When L1 buffers overlap,
 read the op, its shapes and configs and reduce the L1 need ([memory](../ttnn-knowledge/topics/memory.md)); when a
 shape is unsupported, find another op; when an op cannot pad, change the model contract so tensors are padded at
 setup or on device (never with torch in the runtime path). If a failure crosses several ops, kernels, layouts or

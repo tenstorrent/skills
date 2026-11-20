@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 TT_MODEL_BRINGUP_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_scope.py" --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}"; scope_rc=$?
+[ "$scope_rc" -ge 2 ] && exit "$scope_rc"
 # Runner-side gate for the vLLM integration stage: served qualitative outputs
 # (greedy and sampled) must exist and must not be mechanically degenerate. A
 # serving path that doubles tokens or collapses to one token is a serving bug,

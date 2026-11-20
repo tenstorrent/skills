@@ -53,8 +53,9 @@ paths without evidence they run on the target. MoE behaviour by batch: [MoE](../
 
 When PCC is low, narrow it down: split into components, check HF parity, raise fidelity, simplify the shape. PCC
 near 1 can still hide a uniform gain error or a flipped discrete choice: [numerics](../ttnn-knowledge/topics/numerics.md).
-If narrowing stalls, use `$autofix`. If the cause is a tt-metal bug, keep a reproducer or an on-branch
-workaround with evidence.
+If narrowing stalls, use `$autofix`. If the cause is a tt-metal bug, keep a minimal reproducer, then work around
+it in the model (`scope` `release`) or fix the op with a test (`scope` `open`; see `model-bringup`), and record
+the evidence.
 
 ## Context, Length And Batch Contract
 

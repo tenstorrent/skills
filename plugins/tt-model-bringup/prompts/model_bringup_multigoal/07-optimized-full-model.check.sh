@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 TT_MODEL_BRINGUP_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_scope.py" --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}"; scope_rc=$?
+[ "$scope_rc" -ge 2 ] && exit "$scope_rc"
 # Runner-side gate for the optimized-full-model stage: optimization must not
 # have removed or degraded free-running TT generation evidence. Scoped to this
 # run's model. Exit 0 pass, 1 advisory, 2 critical, 3 error.
