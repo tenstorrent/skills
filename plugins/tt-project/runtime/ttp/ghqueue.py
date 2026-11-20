@@ -154,6 +154,29 @@ def _reply(argv: list[str]) -> str | None:
     return ""
 
 
+def _gh_login(gh: str) -> str | None:
+    """This workstation's gh user's login (`gh api user --jq .login`), or None when the read fails."""
+    try:
+        me = subprocess.run([gh, "api", "user", "--jq", ".login"], capture_output=True, timeout=GH_TIMEOUT_S)
+        return None if me.returncode else me.stdout.decode().strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def _own_draft_reason(pr: object, login: str, act: str) -> str:
+    """Why the PR record `pr` is not an open draft this workstation's gh user opened, or "": the author's
+    login must match `login` without regard to case and isDraft must be True; `act` opens the refusal
+    ("`gh pr close` closes only" / "`gh run rerun` reruns only a run of")."""
+    if not isinstance(pr, dict):
+        pr = {}
+    author = pr.get("author") if isinstance(pr.get("author"), dict) else {}
+    if not login or str(author.get("login") or "").lower() != login.lower():
+        return f"{act} a draft this workstation's gh user opened, and this PR is someone else's"
+    if pr.get("isDraft") is not True:
+        return f"{act} a draft PR, and this one is not a draft"
+    return ""
+
+
 def own_draft(gh: str, argv: list[str]) -> str:
     """Why the workstation must not close the PR `gh pr close argv` names, or "": only a draft its own gh
     user opened, read just before the close."""
@@ -161,22 +184,17 @@ def own_draft(gh: str, argv: list[str]) -> str:
     if why or len(pos) != 1:
         return why or "no single PR named"
     repo = [f"--repo={opts['--repo'][0]}"] if "--repo" in opts else []
+    unread = "could not read the PR or this gh user to check it is our own draft"
     try:
         pr = subprocess.run([gh, "pr", "view", pos[0], *repo, "--json", "isDraft,author"], capture_output=True,
                             timeout=GH_TIMEOUT_S)
-        me = subprocess.run([gh, "api", "user", "--jq", ".login"], capture_output=True, timeout=GH_TIMEOUT_S)
-        if pr.returncode or me.returncode:
-            return "could not read the PR or this gh user to check it is our own draft"
+        login = _gh_login(gh)
+        if pr.returncode or login is None:
+            return unread
         v = json.loads(pr.stdout)
-        login = me.stdout.decode().strip()
     except (OSError, subprocess.TimeoutExpired, ValueError):
-        return "could not read the PR or this gh user to check it is our own draft"
-    if not isinstance(v, dict) or v.get("isDraft") is not True:
-        return "`gh pr close` closes only a draft PR, and this one is not a draft"
-    author = v.get("author") if isinstance(v.get("author"), dict) else {}
-    if not login or str(author.get("login") or "").lower() != login.lower():
-        return "`gh pr close` closes only a draft this workstation's gh user opened, and this PR is someone else's"
-    return ""
+        return unread
+    return _own_draft_reason(v, login, "`gh pr close` closes only")
 
 
 def _rerun(argv: list[str]) -> tuple[str, str, str]:
@@ -214,24 +232,21 @@ def own_draft_run(gh: str, argv: list[str]) -> str:
             return f"the run is on `{branch}`, the repo's default branch, and is never rerun from here"
         prs = subprocess.run([gh, "pr", "list", f"--repo={repo}", "--head", branch, "--state", "open", "--json",
                               "isDraft,author,headRefOid"], capture_output=True, timeout=GH_TIMEOUT_S)
-        me = subprocess.run([gh, "api", "user", "--jq", ".login"], capture_output=True, timeout=GH_TIMEOUT_S)
-        if prs.returncode or me.returncode:
+        if prs.returncode:
             return unread
         found = json.loads(prs.stdout)
-        login = me.stdout.decode().strip()
     except (OSError, subprocess.TimeoutExpired, ValueError):
+        return unread
+    login = _gh_login(gh)
+    if login is None:
         return unread
     found = [p for p in found if isinstance(p, dict) and p.get("headRefOid") == sha] if isinstance(found, list) else []
     if not found:
         return "the run is not on the head of an open PR"
-    mine = [p for p in found if login and str((p.get("author") if isinstance(p.get("author"), dict) else {})
-                                              .get("login") or "").lower() == login.lower()]
-    if not mine:
-        return ("`gh run rerun` reruns only a run of a draft this workstation's gh user opened, and this PR is "
-                "someone else's")
-    if not any(p.get("isDraft") is True for p in mine):
-        return "`gh run rerun` reruns only a run of a draft PR, and this one is not a draft"
-    return ""
+    for p in found:
+        if not (why := _own_draft_reason(p, login, "`gh run rerun` reruns only a run of")):
+            return ""
+    return why
 
 
 def branch_problem(branch, prefixes=()) -> str:
@@ -337,11 +352,10 @@ def fork_free(gh: str, argv: list[str]) -> str:
     """Why the workstation must not run the fork `gh repo fork argv` asks for, or "": read just before it,
     <this gh user>/<name> must not exist yet (gh would hand back an old fork instead of a fresh one)."""
     name = _fork(argv)[2]
+    login = _gh_login(gh)
+    if login is None or not _NAME.fullmatch(login):
+        return "could not read this gh user to check the fork's name is free"
     try:
-        me = subprocess.run([gh, "api", "user", "--jq", ".login"], capture_output=True, timeout=GH_TIMEOUT_S)
-        login = me.stdout.decode().strip()
-        if me.returncode or not _NAME.fullmatch(login):
-            return "could not read this gh user to check the fork's name is free"
         there = subprocess.run([gh, "api", f"repos/{login}/{name}", "--jq", ".full_name"], capture_output=True,
                                timeout=GH_TIMEOUT_S)
     except (OSError, subprocess.TimeoutExpired):
