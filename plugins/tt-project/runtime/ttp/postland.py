@@ -363,6 +363,10 @@ class Busy(Exception):
     """A run the test lock admitted nowhere after its backoff: nothing ran, nothing is known."""
 
 
+class Undecided(Exception):
+    """A rerun at the sha in its message could not tell which tests fail there."""
+
+
 def _drive(p: Project, job: dict, checks: list, run) -> dict:
     """_judge's result, with `owned` ({id: deflake task}) when quarantined tests with an open fix owner failed
     again: those are their owner's, never reverted nor a fix task's (outcome 'owned' when nothing else failed)."""
@@ -422,19 +426,22 @@ def _judge(p: Project, job: dict, checks: list, run, owned: dict) -> dict:
             return {"outcome": "pre_existing" if pre else "undecided", "ids": ids, "cmd": str(cmd),
                     "why": "they fail before this landing too" if pre else
                     f"the rerun before this landing ({str(job.get('good'))[:10] or 'none'}) could not tell"}
-        ids = _failing_at_tip(job, run, cmd, sha, sorted(set(ids) - pre))
-        if not ids:   # the target's tip passes them: fixed since, nobody's to revert
-            return {"outcome": "fixed", "ids": sorted(again), "cmd": str(cmd), "why": "they pass at the current tip of the target"}
+        landed = sorted(set(ids) - pre)   # failing here, not before the range
+        ids = _failing_at_tip(job, run, cmd, sha, landed)
+        fixed = sorted(set(landed) - set(ids))   # the target's tip passes them: fixed since, nobody's to revert
+        if not ids:
+            return {"outcome": "fixed", "ids": fixed, "cmd": str(cmd), "why": "they pass at the current tip of the target"}
         try:
             blame = _blame(points, ids, lambda at, sel: gatejudge.failed_of(*run(at, cmd, sel), sel))
-        except LookupError as ex:
+        except Undecided as ex:
             return {"outcome": "undecided", "why": f"the rerun at {str(ex)[:10]} could not tell", "ids": ids,
                     "cmd": str(cmd)}
         culprits = []
         for at, group in sorted(blame.items()):
             e = points[at]
             culprits.append({"entry": e, "ids": group} | revert(p, Path(job["repo"]), job, e, cmd, group, run))
-        out = {"outcome": "guilty", "ids": ids, "cmd": str(cmd), "culprits": culprits, "tail": text[-3000:]}
+        out = {"outcome": "guilty", "ids": ids, "fixed": fixed, "cmd": str(cmd), "culprits": culprits,
+               "tail": text[-3000:]}
         return out
     if after:   # the change's tests pass; what failed the session is named, never reverted
         return {"outcome": "session_failed", "ids": flaky, "why": "; ".join(after) + "; no test fails and nothing "
@@ -467,7 +474,7 @@ def _failing_at_tip(job: dict, run, cmd, sha: str, ids: list[str]) -> list[str]:
 
 def _blame(points: list, ids: list[str], failed) -> dict[int, list[str]]:
     """{index of a point: the ids that first fail at it}: every id passes before the range and fails at its last
-    point, and `failed(sha, ids)` is the subset failing at a sha (None: it could not tell, raises LookupError(sha)).
+    point, and `failed(sha, ids)` is the subset failing at a sha (None: it could not tell, raises Undecided(sha)).
     The ids failing at the middle point go on in the first half, the rest in the second."""
     def split(lo: int, hi: int, ids: list[str]) -> dict[int, list[str]]:
         if hi - lo == 1:
@@ -475,7 +482,7 @@ def _blame(points: list, ids: list[str], failed) -> dict[int, list[str]]:
         mid = (lo + hi) // 2
         bad = failed(points[mid]["sha"], ids)
         if bad is None:
-            raise LookupError(points[mid]["sha"])
+            raise Undecided(points[mid]["sha"])
         out = split(lo, mid, [i for i in ids if i in bad]) if bad else {}
         for at, group in (split(mid, hi, [i for i in ids if i not in bad]) if len(bad) < len(ids) else {}).items():
             out[at] = out.get(at, []) + group

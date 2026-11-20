@@ -843,7 +843,7 @@ CLAIMS_KEEP = 200
 CLAIM_DAYS = 30
 TOPIC_MIN = 2
 CLAIM_WRONG_WORDS = 4   # a wrong part with more words than this is prose, not a value
-CLAIM_SPAN = 4   # consecutive words of a wrong phrase a text restates (all of a shorter one, never fewer than 2)
+CLAIM_SPAN = 4   # consecutive words of a wrong phrase a text restates (all of a shorter one; a one-word phrase never matches, it is a common word)
 _EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 _WRONG = re.compile(r"\b(?:not|never|instead of|rather than|no longer|isn't|aren't|wasn't|weren't|retires)\s+"
                     r"([^.;:,()\n]+)", re.I)
@@ -874,8 +874,9 @@ def _anchors(text: str, spans: list[tuple[int, int]] = ()) -> tuple[set[str], se
 
 
 def claim(text: str) -> dict | None:
-    """A Correction entry's key claim: {"msg", "topic", "right", "wrong", "wrong_words"}, or None when
-    `text` is no Correction or names no wrong value."""
+    """A Correction entry's key claim: {"msg", "topic", "right", "wrong", "wrong_words", "phrases"}, or None when
+    `text` is no Correction (`phrases`: the wrong phrases as lowercase words; `wrong_words` only marks a claim that
+    names no anchored value, for claims stored before `phrases`) or names no wrong value."""
     from . import reask
     head = _HEAD.match(text or "")
     if not head:

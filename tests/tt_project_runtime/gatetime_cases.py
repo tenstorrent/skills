@@ -502,8 +502,8 @@ def test_post_land_second_of_two_changes_breaking_a_test_is_reverted_not_the_fir
 
 
 def test_post_land_test_the_tip_already_passes_is_blamed_on_nobody_the_others_still_are(env, tmp_path, monkeypatch):
-    """The 2026-11 case: one test broken by the first change, another by a later change that a landing since
-    fixed. The first change is reverted for its own test only; the fixed test reverts and fixes nothing."""
+    """A test a later landing fixed is nobody's, however many changes came before it: the change that broke
+    another test is reverted for that test only, and the fixed one is recorded without a revert or fix task."""
     from ttp import postland
     p, g, pushed, entries = _pl_land(env, tmp_path, monkeypatch, _pl_abc(tmp_path), n=3,
                                      bad_at={0: "bad_a\n", 2: "bad_b\n"})
@@ -516,6 +516,7 @@ def test_post_land_test_the_tip_already_passes_is_blamed_on_nobody_the_others_st
     (rev,) = p.db.q("SELECT * FROM push_queue WHERE status='approved'")
     assert g("diff", "--name-only", f"{rev['head']}^", rev["head"]) == "pl0.txt", "only the first change comes out"
     assert p.db.kv(postland.KEY)["last"]["ids"] == ["tests/t.py::test_a"]
+    assert p.db.kv(postland.KEY)["last"]["fixed"] == ["tests/t.py::test_b"]
 
 
 def test_post_land_failure_every_test_of_which_the_tip_passes_reverts_and_fixes_nothing(env, tmp_path, monkeypatch):
