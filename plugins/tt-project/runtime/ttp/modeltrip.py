@@ -105,12 +105,11 @@ def checks_failed(p, run_id: int) -> bool:
 def mark_reworked(db: DB, out: dict[int, dict], since: float) -> dict[int, dict]:
     """Mark bad each sample {task id: {"bad", ...}} a review since `since` failed (review_failed) or that got
     rework (a review fix or a continuation of it: rework)."""
-    from .effortab import FAILED_REVIEWS
     if not out:
         return out
     for rv in db.q("SELECT t.labels, t.title, s.outcome FROM review_stats s JOIN tasks t ON t.id=s.task WHERE s.ts>=?",
                    (since,)):
-        if rv["outcome"] in FAILED_REVIEWS and (i := review_subject(dict(rv))) in out:
+        if rv["outcome"] in ("failed", "changes_needed") and (i := review_subject(dict(rv))) in out:
             out[i]["bad"] = out[i]["review_failed"] = True
     for t in db.q("SELECT id, kind, title, labels, parent FROM tasks WHERE created>=? AND kind!='review'", (since,)):
         t = dict(t)

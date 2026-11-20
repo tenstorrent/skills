@@ -2438,7 +2438,6 @@ class Daemon:
         self._run_step(self.sweep_watcher_issues)
         self._run_step(self.sweep_schedule_gaps)
         self._run_step(self.review_jev)
-        self._run_step(self.end_effort_ab)
         self._run_step(self.trip_model_routing)
         self._run_step(self.watch_run_classes)
         self._run_step(self.watch_cli_versions)
@@ -2552,19 +2551,6 @@ class Daemon:
         scr.settle_jev(self.p.db, now)
         for use, s in jevuse.review(self.p.db, self.cfg, now):
             self.alert(f"jev-off:{use}", jevuse.off_text(use, s, self.cfg), severity="low", every_s=0)
-
-    def end_effort_ab(self, every_s: float = 6 * 3600) -> None:
-        """Apply the effort A/B's end rule (effortab.conclude): once it decides, the winner becomes the
-        project's standard effort for code tasks, the split stops, and the user hears it once."""
-        now = time.time()
-        if now - getattr(self, "_effort_ab_checked", 0.0) < every_s:
-            return
-        self._effort_ab_checked = now
-        got = effortab.conclude(self.p, self.cfg, now)
-        if got:
-            self._load_config()
-            self.alert("effort-ab-decided", f"Effort A/B ended: {got} effort is now the standard for code tasks "
-                       f"(`ttp stats --effort-ab`).", severity="low", every_s=0)
 
     def _code_state(self) -> dict:
         """runclass.CODE_STATE_KV: {code kind: "full" | "canary" | "off"}; {} (all canary) when unset or bad. A
@@ -3825,7 +3811,7 @@ class Daemon:
                 note = {**(note or {}), modelrank.KEY: got[1]}
             ab = (note or {}).get(effortab.KEY)
             if not pin.get("effort") and isinstance(ab, dict) and ab.get("effort"):
-                effort = str(ab["effort"])   # the task's effort A/B arm or Jev's pick (effortab.assign)
+                effort = str(ab["effort"])   # Jev's effort pick (effortab.assign)
             elif not pin.get("effort") and isinstance(ot := (note or {}).get(costlevers.TRIM_KEY), dict) \
                     and ot.get("effort"):
                 effort = str(ot["effort"])   # rings.output_trim's pick for a mechanical spec (costlevers)
@@ -6737,7 +6723,7 @@ class Daemon:
             note["session"] = {k: session[k] for k in ("model", "effort", "error", "verification", "pin_verify", "checked")
                                if k in session}
         note["cache_telemetry"] = usage.extra.get("cache_telemetry", {"complete": False, "requests": None})
-        if isinstance(usage.extra.get("thinking_tokens"), int):   # the output's thinking share (effortab.report)
+        if isinstance(usage.extra.get("thinking_tokens"), int):   # the output's thinking share
             note["thinking_tokens"] = usage.extra["thinking_tokens"]
         if usage.extra.get("model"):   # the model the agent's session reported, beside the requested one
             note["model_used"] = str(usage.extra["model"])[:120]
@@ -13389,7 +13375,7 @@ class Daemon:
                         effortab.assign(db, self.cfg, task, tier, run_prov, jev=self.jev)
                 except Exception as e:   # the A/B must never hold a task back
                     ab = None
-                    log(self.p, f"task {task['id']}: effort A/B not assigned: {e}")
+                    log(self.p, f"task {task['id']}: effort pick not assigned: {e}")
                 if ab:
                     note[effortab.KEY] = ab
                 elif not cheap and not ((routed or {}).get("model_pick") and run_prov == (routed or {}).get("to")):

@@ -831,7 +831,7 @@ class Codex(Provider):
                      estimated=True)
         u.cost_usd = self._price(inp, cached, out)
         if (reasoning := self._reasoning(output_path)) is not None:
-            u.extra["thinking_tokens"] = reasoning   # part of output_tokens (effortab.report)
+            u.extra["thinking_tokens"] = reasoning   # part of output_tokens
         events, errors = 0, []
         cache_reports = []
         for ev in self._events(output_path):

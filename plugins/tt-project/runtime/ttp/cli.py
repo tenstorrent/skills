@@ -2267,13 +2267,6 @@ def cmd_stats(a) -> None:
         s = glmshare.report(p, _stats_time(a.since, tz, "--since") or until - a.days * 86400, until)
         print(json.dumps(s, indent=1) if a.json else glmshare.text(s))
         return
-    if a.effort_ab:
-        from . import effortab
-        tz = timefmt.home(p)
-        s = effortab.report(p, a.days, _stats_time(a.since, tz, "--since"), _stats_time(a.until, tz, "--until"))
-        s["winner"] = effortab.winner(p.config())
-        print(json.dumps(s, indent=1) if a.json else effortab.report_text(s))
-        return
     if a.landing:
         from . import trainstats
         from . import landed
@@ -16554,9 +16547,6 @@ def main(argv: list[str] | None = None) -> None:
                         "in-turn dry run and refused after the turn, over --days")
     s.add_argument("--wakes", action="store_true",
                    help="task wakes per day by reason instead: runs, $, re-waits and who chose the tier")
-    s.add_argument("--effort-ab", action="store_true",
-                   help="the effort A/B instead (effort_ab.enabled): per arm, $ per landed change, output tokens and "
-                        "calls per run, review and checks fail rates, fix-review hops, tier-up retries, end rule")
     s.add_argument("--chat", action="store_true",
                    help="coordinator chat posts instead, per chat: sent at once, held for the digest, digests "
                         "posted and held now (coordinator.chat_digest_h)")

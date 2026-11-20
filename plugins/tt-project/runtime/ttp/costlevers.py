@@ -11,7 +11,7 @@
   the shown one; nothing users see changes; eta_shadow_line gives the baseline.
 - rings.output_trim (key output.trim): workers are asked for short hand-offs and reports (no output cap),
   and an unpinned work or harness task whose spec is mechanical runs at medium effort (effort_pick). Code
-  tasks keep effortab's A/B and Jev's pick; reviews and graders are never picked here, and a conclusion
+  tasks keep Jev's pick (effortab); reviews and graders are never picked here, and a conclusion
   run's effort floor still lifts it.
 
 Precedence (rollout.on): a project's own explicit value for the flag's key wins, else the ring rule, else off.

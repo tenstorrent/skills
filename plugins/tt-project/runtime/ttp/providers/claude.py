@@ -605,7 +605,7 @@ class Claude(Provider):
                     u.extra["model_usage"] = ids
                 thinking = (usage.get("output_tokens_details") or {}).get("thinking_tokens")
                 if isinstance(thinking, int) and not isinstance(thinking, bool):
-                    u.extra["thinking_tokens"] = thinking   # part of output_tokens (effortab.report)
+                    u.extra["thinking_tokens"] = thinking   # part of output_tokens
                 u.final_text = ev.get("result") if isinstance(ev.get("result"), str) else json.dumps(ev.get("result"))
                 u.structured = drop_nulls(ev.get("structured_output"), sparse=True)
                 if ev.get("is_error"):

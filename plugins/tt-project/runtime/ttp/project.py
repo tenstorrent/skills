@@ -518,10 +518,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # calls in the window changed none of the rules' decisions; uses.<use> = "on" or "off" forces it
     # (see jevuse.py).
     "jev": {"enabled": "auto", "window_days": 7, "min_calls": 30, "idle_calls": 20, "uses": {}},
-    # Effort A/B (effortab.py): enabled puts each standard-tier code task in a high or medium effort arm
-    # by its lineage's root id (on by default; the end rule turns it off once it records a winner);
-    # jev_pick lets Jev choose medium or high from the spec (off by default).
-    "effort_ab": {"enabled": True, "jev_pick": False},
+    # jev_pick lets Jev choose medium or high effort for a standard-tier code task from its spec
+    # (effortab.py; off by default).
+    "effort_ab": {"jev_pick": False},
     "web": {"bind": "127.0.0.1", "port": 0},
     "detach": {},                       # launcher_stops: see EXTRA_KEYS
     "power": {},                        # keep_awake: replaced by runner.prevent_idle_sleep; "off" still turns it off
@@ -863,7 +862,7 @@ EXTRA_KEYS = {
                  "channel_tags",   # release-channel tags a forward move may update under never_force (channeltag)
                  "express", "express_max_lines", "express_max_files"},   # `ttp express`: one small urgent head lands alone (express)
     "jev": {"via", "url", "model"},
-    "effort_ab": {"winner", "decided_at"},   # the end rule's result, written by effortab.conclude
+    "effort_ab": {"enabled", "winner", "decided_at"},   # the ended effort A/B's keys, still in some projects; read by nothing
     # launcher_stops: {glob of a project launcher's job folders: stop command} `ttp detach --stop <job
     # folder>` runs when the job has no detached.json entry and no pid file (launcherstop.registered_stop).
     "detach": {"launcher_stops"},
