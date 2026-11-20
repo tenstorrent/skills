@@ -302,7 +302,7 @@ def _lane_turns(st: dict) -> list:
     return [t for t in st.get("turns") or [] if t.get("by") != OPUS]
 
 
-def _kept(turns: list) -> list:
+def _newest_turns(turns: list) -> list:
     """The newest KEEP_TURNS of each kind, in order: the coordinator's turns never push the lane's out."""
     n = {OPUS: 0, "": 0}
     out = []
@@ -330,7 +330,7 @@ def record_opus_turn(db, run_id, note: dict, actions, applied, problems=(), summ
             "rejected": [str(x)[:200] for x in list(problems or [])[:5]], "summary": summary[:300]}
     if not turn["actions"] and not turn["rejected"]:
         return
-    st["turns"] = _kept(list(st.get("turns") or []) + [turn])
+    st["turns"] = _newest_turns(list(st.get("turns") or []) + [turn])
     _save(db, st)
 
 
@@ -383,7 +383,7 @@ def record_turn(db, run_id, note: dict, actions, applied, refused, esc: str, fai
             "refused": [{**_brief(acts[i] if 0 <= i < len(acts) else None), "refused": w} for i, w in refused],
             "escalated": esc, "failed": failed[:200], "problems": len(list(problems or [])),
             "left_must": int(left_must), "summary": summary[:300]}
-    st["turns"] = _kept(list(st.get("turns") or []) + [turn])
+    st["turns"] = _newest_turns(list(st.get("turns") or []) + [turn])
     if esc or refused or failed:
         st["escalate"] = {"run": run_id, "ts": now, "why": esc or failed or "; ".join(w for _, w in refused)[:300],
                           "refused": turn["refused"], "summary": summary[:300]}
