@@ -105,8 +105,8 @@ def candidates(db, evs: list[dict], tried=frozenset()) -> list[dict] | None:
     """The batch's events for the hook, with their text, or None when the batch does not go to it: an
     event that is not a ride-along and may not be settled starts the turn as it is. `tried`: ids the
     hook already met."""
-    from . import obligations, pagesev
-    own = [e for e in evs if not pagesev.rides_along(e)]
+    from . import obligations, alerts
+    own = [e for e in evs if not alerts.rides_along(e)]
     if not own or any(e["id"] in tried for e in own):
         return None
     ids = [e["id"] for e in own]

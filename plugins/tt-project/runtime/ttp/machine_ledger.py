@@ -55,8 +55,8 @@ itself only if it cannot decide. Only an entry no project could ever take reache
 or for every project (change_quiet, quiet_reason's cross-project reasons), the project that made it still gets
 its first page, but nothing escalates past it; the page records the reason (`quiet`), and once it ends the
 steps resume from that moment. Unlike a condition's page, an overdue entry's page is normal: high only on a live serving machine
-(tagged serving, live or server) past its end with no passing until-probe (pagesev.change_severity). Each page
-carries one fingerprint per entry and episode (pagesev.change_fingerprint), so a project files its own event
+(tagged serving, live or server) past its end with no passing until-probe (alerts.change_severity). Each page
+carries one fingerprint per entry and episode (alerts.change_fingerprint), so a project files its own event
 and copies relayed by other projects' daemons once. Nothing is undone automatically unless asked (Auto-undo): whoever is paged runs the undo and closes the entry
 (`ttp machines change close <id>`). An entry whose undo is a no-op (noop_undo: empty, `true`, `:`, or
 `none` as a word, as in `none: <why>`) is never paged: once its until-probe passed PROBE_PASSES times in a row
@@ -152,7 +152,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from . import detach, ends, machines, netwait, outagetask, pagesev, project
+from . import detach, ends, machines, netwait, outagetask, alerts, project
 from .db import TERMINAL_TASK_STATES
 from .util import flocked
 
@@ -174,7 +174,7 @@ USER_AFTER_S = 86400         # a risky expired change still open this long after
 # pause, a reservation or drain, firewall, network, ssh or credential matters, mounts, kernel or driver settings
 # (_RISKY_RE; a dotted unit name such as x.service counts), or its undo starts, enables, restarts or reloads a
 # service (_UNDO_RISKY_RE); a change on a live serving machine
-# (pagesev.serving_machine); and an unclassified change (neither list matches) on a machine whose recovery owner
+# (alerts.serving_machine); and an unclassified change (neither list matches) on a machine whose recovery owner
 # or fallback is another project. Harmless, re-paged at its usual severity: a no-op undo, and test or scratch dirs, helper
 # scripts, soak runs and restarts, logs, caches, worktrees and ledger edits (_HARMLESS_RE) on a machine that
 # serves nothing. A risky word wins over a harmless one.
@@ -872,7 +872,7 @@ def change_risk(c: dict, m: dict | None = None) -> str:
         return f"it touches {' '.join(hit.group(0).split())}"
     if _UNDO_RISKY_RE.search(undo):
         return "its undo starts or restarts a service"
-    if pagesev.serving_machine(m):
+    if alerts.serving_machine(m):
         return "its machine serves live traffic"
     if _HARMLESS_RE.search(f"{what} {undo}"):
         return ""
@@ -1768,13 +1768,13 @@ def route(now: float | None = None, able: Callable[[str], tuple[bool, str]] | No
                 page["pending"]["id"] += suffix
                 page["pending"].update(line=line, by=c.get("by"), change=c["id"])
                 # Normal unless a live serving machine's change is past its end unconfirmed; one
-                # fingerprint per change, episode and daily repeat, so each project hears of it once a day (pagesev.py).
+                # fingerprint per change, episode and daily repeat, so each project hears of it once a day (alerts.py).
                 m_entry = machines.load().get(c["alias"]) or {}
-                severity = pagesev.change_severity(c, now, pagesev.serving_machine(m_entry))
+                severity = alerts.change_severity(c, now, alerts.serving_machine(m_entry))
                 if repeat and now - float(page["first"]) >= USER_AFTER_S and change_risk(c, m_entry):
                     severity = "high"   # a risky change its projects left a day: its coordinator hears it high
                 page["pending"].update(
-                    severity=severity, fp=pagesev.change_fingerprint(f"machine-change:{c['id']}", episode) + suffix)
+                    severity=severity, fp=alerts.change_fingerprint(f"machine-change:{c['id']}", episode) + suffix)
             claim(page, makers)
         if changed:
             _write(LEDGER, ledger)

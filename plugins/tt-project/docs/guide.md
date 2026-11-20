@@ -539,7 +539,7 @@ coordinator with that evidence.
   change add ... --expect <fingerprint|down|held>`); and a review's failed hand-off counts once, as
   "failed review". `coordinator.effort_skip_triggers` (none by default) lists trigger labels, as
   recorded in the note, that never count.
-  Three daemon events that rarely need a decision are high only when it matters (pagesev.py). A
+  Three daemon events that rarely need a decision are high only when it matters (alerts.py). A
   done task's `continue:` follow-up no task took up (`continue_unqueued`) is normal and rides
   along with the next turn due anyway, at most an hour later. A task the daemon or the push queue
   blocks (`task_blocked`) is normal; the same task blocked again for the same reason within 6 h is

@@ -34,7 +34,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     locks,
     msgparts,
     overlap,
-    pagesev,
+    alerts,
     prhead,
     push,
     pushclaim,
@@ -2558,7 +2558,7 @@ def _settle(p: Project, tid: int, b: dict, m: dict, now: float) -> None:
         reason = f"push refused: {why}"[:500]
         db.update_task(tid, status="blocked", blocked_reason=reason,
                        result=dump_result({**prev, "status": "blocked", "summary": summary}))
-        pagesev.raise_blocked(db, task, reason, f"#{tid} {task['title']} → blocked: {reason}")
+        alerts.raise_blocked(db, task, reason, f"#{tid} {task['title']} → blocked: {reason}")
         _reply(db, task, "blocked", summary, need=reason)
     elif "conflict" in states:
         _settle_conflict(*args, current)

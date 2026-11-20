@@ -404,23 +404,23 @@ def test_wakegap_a_relayed_order_or_question_or_the_users_own_message_still_wake
 
 def test_wakegap_a_slow_tick_step_never_forces_a_coordinator_turn(env, monkeypatch):
     """#7778: a slow tick step's reports (slow, degraded, incident) ride along and never age into a turn."""
-    from ttp import pagesev
+    from ttp import alerts
     p, d, clock, starts, _ = _wg_setup(env, monkeypatch)
     for kind, status in (("tick_step_slow", "handled"), ("tick_step_degraded", "queued"),
                          ("tick_step_incident", "queued")):
         p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,data) VALUES(?,?,?,?,?,?,?)",
-               (clock[0] - pagesev.RIDE_ALONG_MAX_S - 600, "daemon", kind, "low", "slow", status,
-                json.dumps({pagesev.RIDE_ALONG: True})))
+               (clock[0] - alerts.RIDE_ALONG_MAX_S - 600, "daemon", kind, "low", "slow", status,
+                json.dumps({alerts.RIDE_ALONG: True})))
     assert not _turn_within(d, clock, starts, 120), "a slow tick step's report started a turn"
     # Another ride-along that old still starts its own turn, as before.
     p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,data) VALUES(?,?,?,?,?,?,?)",
-           (clock[0] - pagesev.RIDE_ALONG_MAX_S - 600, "daemon", "note", "low", "x", "queued",
-            json.dumps({pagesev.RIDE_ALONG: True})))
+           (clock[0] - alerts.RIDE_ALONG_MAX_S - 600, "daemon", "note", "low", "x", "queued",
+            json.dumps({alerts.RIDE_ALONG: True})))
     assert _turn_within(d, clock, starts, 120)
 
 
 def test_a_tick_step_incident_rides_along(env, monkeypatch):
-    from ttp import pagesev
+    from ttp import alerts
     from ttp.daemon import Daemon
     d = Daemon(make(env).base)
     from ttp import daemon as dmod
@@ -428,7 +428,7 @@ def test_a_tick_step_incident_rides_along(env, monkeypatch):
     for i in range(dmod.STEP_INCIDENT_N):
         d._step_incident("probe", time.time() + i)
     (ev,) = d.p.db.q("SELECT severity, data FROM events WHERE kind='tick_step_incident'")
-    assert pagesev.rides_along(dict(ev)) and json.loads(ev["data"])["step"] == "probe"
+    assert alerts.rides_along(dict(ev)) and json.loads(ev["data"])["step"] == "probe"
 
 
 def test_look_default_check_skips_an_unchanged_look_and_fires_a_changed_one(env):
