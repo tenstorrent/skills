@@ -38,7 +38,7 @@ def test_lean_prompt_fits_and_names_existing_skills(path):
 
 
 def record():
-    return {'mode': 'port', 'budget_hours': 30,
+    return {'budget_hours': 30,
             'targets': {f'decode_ms_b{b}': 10.0 * (1 + b / 32) for b in (1, 8, 16, 32)},
             'floors': {f'decode_ms_b{b}': 5.0 * (1 + b / 32) for b in (1, 8, 16, 32)},
             'measured': {**{f'decode_ms_b{b}': 12.0 * (1 + b / 32) for b in (1, 8, 16, 32)},

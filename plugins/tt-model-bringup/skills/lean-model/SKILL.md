@@ -1,6 +1,6 @@
 ---
 name: lean-model
-description: Bring a Hugging Face model to a correct, fast TTNN full model on the target mesh in one goal, led by a coordinator with subagents, judged by outputs and tests rather than by a fixed stage order. Use for the lean pipeline's model goal, and for speedup work on an existing model.
+description: Bring a Hugging Face model to a correct, fast TTNN full model on the target mesh in one goal, led by a coordinator with subagents, judged by outputs and tests rather than by a fixed stage order. Use for the lean pipeline's model goal, including making an existing correct model faster.
 ---
 
 # Lean model
@@ -26,7 +26,7 @@ here.
   advertised context (or a hard physical limit with evidence).
 - The `reference-accuracy` suite with verdict match at full precision (the implementation is right). The served
   precision may differ from HF by design; it is chosen on the reference tiers as a speed and accuracy tradeoff.
-- `doc/model/model.json` and `REPORT.md`: mode, targets, floors, measured, precision, KV pool, ops added or
+- `doc/model/model.json` and `REPORT.md`: scope, targets, floors, measured, precision, KV pool, ops added or
   changed, tier commands, the perf ledger (change, before, after, tier result), hours and tokens spent, and
   what was not done; for a mixture-of-experts model, `moe` with experts, top-k, layout, distinct experts per
   step and decode against its floor at batch 1 and the largest batch.
@@ -93,11 +93,12 @@ throwaway prototypes on side branches (another layout, a fused op, a different p
 and judged only by measurement. Land the
 winner, drop the rest. Scope risky work as "measure and report before building", bugs as "root cause before fix".
 
-## Modes (`inputs.json` `mode`)
+## Starting point and scope
 
-`port` (default, a model close to one in tt-metal), `fresh` (a new architecture: spec, captures and per-module
-ports first), `speedup` (an existing correct model: start at the perf loop, gated by the reference suite),
-`quick` (existing ops only, speed secondary, to reach serving and evals soon).
+Where to start is decided in the plan: how much to reuse from similar tt-metal models, or from an existing
+correct implementation of this model, and why. The one run setting that changes what you may do is `scope` in
+`inputs.json` (`model-bringup`): `release` keeps every change inside the model folder and `bringup/`; `open` lets
+the model carry its own versions of ops and shared code. [ops](references/ops.md) has the ladder for each.
 
 ## Devices and budget
 

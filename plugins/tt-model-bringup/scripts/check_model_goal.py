@@ -16,7 +16,6 @@ from pathlib import Path
 
 RECORD = Path("doc/model/model.json")
 INPUTS = Path("bringup/agentic_evals/inputs.json")
-MODES = ("port", "fresh", "speedup", "quick")
 TIERS = ("T0", "T1", "T2")
 OP_KINDS = ("fusion", "op_change", "new_op")
 DEFAULT_BATCHES = (1, 8, 16, 32)
@@ -27,8 +26,6 @@ def number(value) -> bool:
 
 
 def check(record: dict, batches, problems: list) -> None:
-    if record.get("mode") not in MODES:
-        problems.append((1, f"mode must be one of {', '.join(MODES)}"))
     if not number(record.get("budget_hours")):
         problems.append((1, "budget_hours is missing"))
     targets, floors = record.get("targets") or {}, record.get("floors") or {}
