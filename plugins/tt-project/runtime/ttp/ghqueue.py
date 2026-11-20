@@ -616,8 +616,9 @@ def queue_argv(args: list[str]) -> list[str]:
 # --- the box: publish and retire one branch through the workstation ----------------------------------
 
 def _git(cwd, *a, binary: bool = False) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", *a], cwd=cwd or None, capture_output=True, text=not binary, timeout=120,
-                          stdin=subprocess.DEVNULL)
+    from . import gitmemo
+    return gitmemo.run(["git", *a], cwd=cwd or None, capture_output=True, text=not binary, timeout=120,
+                       stdin=subprocess.DEVNULL)
 
 
 def _branch_call(cwd: str | None, branch: str) -> tuple[str, str, list, object]:
