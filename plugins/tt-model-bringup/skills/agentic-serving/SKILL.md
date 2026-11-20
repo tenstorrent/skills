@@ -211,12 +211,14 @@ each list and its rule in `results.json` before any score on it.
 
 This is iteration on the phase's failing tasks inside its time, never growth of the list.
 
-Reference check, for every failed task whatever its cause (not infrastructure, not a task rerun because it was cut
-off while progressing): run `reference-accuracy`'s check on the host CPU while the list runs. Take the task's
+Reference check, for every failed task whatever its cause (not infrastructure, not a fetched solution, not a task
+rerun because it was cut off while progressing): run `reference-accuracy`'s check on the host CPU while the list runs. Take the task's
 decisive point (wrong: the answer span, or the first wrong SWE action; loop: the loop's first token; malformed
 tool call: that call; stalled: the first repeated call; anomaly: the first stray token), teacher-force TT's own
-tokens over that window plus up to 4K tokens of context through HF and the served model, and compare with the
-same measurement on tasks this run solved. Verdict `model` when HF follows TT's path as closely as on the
+tokens through HF over the full prefix (shorten it only when that would take more than ~15 min of CPU, and label
+the result approximate) and take TT's log-probabilities for the same tokens from the running server
+(`prompt_logprobs`, one request), else from the model runner between waves. Compare with the same measurement
+on tasks this run solved. Pause these CPU checks while host memory available is below ~20 GB. Verdict `model` when HF follows TT's path as closely as on the
 controls, `implementation` when the divergence is well outside them (KL p95 above 3× the controls', or HF top-1
 differs at the decisive token and gives TT's token p < 0.1), else `inconclusive`. Record it as the row's
 `reference`; an `implementation` verdict goes to datatype-sweep's Anomalies procedure.

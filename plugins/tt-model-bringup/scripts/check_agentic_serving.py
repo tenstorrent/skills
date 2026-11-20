@@ -43,7 +43,7 @@ DEFAULT_EXTENDED_SUITES = ("r1_gpqa_diamond", "swe_bench_verified")
 DEFAULT_RUN_TIMEOUT_HOURS = 12
 DEFAULT_EXPLAIN_TOLERANCE = 0.25
 VERDICTS = ("model", "implementation", "inconclusive")
-UNCHECKED_CAUSES = ("infrastructure", "cutoff_progressing")
+UNCHECKED_CAUSES = ("infrastructure", "cutoff_progressing", "fetched_solution")
 CAUSES = ("wrong", "anomaly", "loop_cap", "malformed_tool_call", "cutoff_progressing", "stalled",
           "infrastructure", "fetched_solution")
 LIMIT_CAUSES = ("loop_cap", "cutoff_progressing", "stalled")

@@ -559,10 +559,11 @@ def test_every_failed_task_needs_a_reference_check(tmp_path):
     del run['failures'][0]['reference']
     code, stderr = goal12(tmp_path, runs=[run])
     assert code == 2 and 'needs a reference check' in stderr
-    run = scored_run()
-    run['failures'][0]['cause'] = 'infrastructure'
-    del run['failures'][0]['reference']
-    assert goal12(tmp_path, runs=[run])[0] == 0
+    for cause in ('infrastructure', 'fetched_solution'):
+        run = scored_run()
+        run['failures'][0]['cause'] = cause
+        del run['failures'][0]['reference']
+        assert goal12(tmp_path, runs=[run])[0] == 0, cause
 
 
 def test_an_implementation_verdict_needs_a_fix_attempt(tmp_path):
