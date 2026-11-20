@@ -185,6 +185,24 @@ def test_course_self_review_flags_a_corrected_mistake_that_comes_back(env):
     assert _cc(p, now)[0] == []   # no fix was recorded, so none failed: correction.py covers it
 
 
+def test_a_stored_repeat_class_today_s_detector_no_longer_finds_names_no_recurring_mistake(env):
+    """A 'msg#<id>' class an older, looser repeat detector stored for two messages sharing only one word stem
+    pairs nothing; a true repeat of the same message still does."""
+    from ttp import correction
+    p = make(env)
+    now = time.time()
+    a = _cc_msg(p, "in", "user", "Stop retrying the flaky upload job on every wake.", now - 7200)
+    b = _cc_msg(p, "in", "user", "The nightly report uploads twice, please dedupe the summary table.", now - 60)
+    first = {"msg": a, "ts": now - 7200, "why": "phrase", "class": [], "fix": "#50", "shown": True}
+    stale = {"msg": b, "ts": now - 60, "why": f"repeats #{a}", "class": [f"msg#{a}"], "fix": "", "shown": False}
+    p.db.set_kv(correction.KEY, [first, stale])
+    assert _cc(p, now)[0] == []
+    c = _cc_msg(p, "in", "user", "Stop retrying the flaky upload job on every wake.", now - 30)
+    p.db.set_kv(correction.KEY, [first, stale, {**stale, "msg": c, "ts": now - 30}])
+    lines = _cc(p, now)[0]
+    assert len(lines) == 1 and f"correction #{c} repeats the class (msg#{a}) of correction #{a}" in lines[0], lines
+
+
 def test_course_self_review_lines_are_capped_and_join_the_digest_course_check(env):
     from ttp import coordinator as coord, coursecheck, obligations as ob
     p = make(env)

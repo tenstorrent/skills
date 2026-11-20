@@ -231,6 +231,15 @@ def recurring(db: DB, at: float) -> list[dict]:
     said = {int(r["id"]): float(r["ts"] or 0) for r in db.q(
         "SELECT id, ts FROM messages WHERE id IN (SELECT value FROM json_each(?))",
         (json.dumps([int(r["msg"]) for r in recs]),))} if recs else {}
+    memo: dict = {}
+
+    def live(rec: dict, cls: set) -> set:   # only a pair that would match pays for the re-check
+        if not any(a.startswith("msg#") for a in cls):
+            return cls
+        if int(rec["msg"]) not in memo:
+            memo[int(rec["msg"])] = _live_class(db, rec)
+        return cls & memo[int(rec["msg"])]
+
     out, seen = [], set()
     for i, later in enumerate(recs):
         cls = correction._specific(later.get("class"))
@@ -239,13 +248,27 @@ def recurring(db: DB, at: float) -> list[dict]:
             continue
         for prior in recs[:i]:
             fix = str(prior.get("fix") or "")
-            same = cls & correction._specific(prior.get("class")) or f"msg#{prior['msg']}" in cls
-            if (fix.startswith("#") and same and later["msg"] not in seen and not _relinked(db, fix)
-                    and _after_fix(db, fix, ts)):
+            if not fix.startswith("#") or later["msg"] in seen:
+                continue
+            shared, direct = cls & correction._specific(prior.get("class")), {f"msg#{prior['msg']}"} & cls
+            same = (shared and live(later, live(prior, shared))) or (direct and live(later, direct))
+            if same and not _relinked(db, fix) and _after_fix(db, fix, ts):
                 seen.add(later["msg"])
-                out.append({"msg": later["msg"], "prior": prior["msg"], "fix": fix,
-                            "cls": sorted(same)[0] if isinstance(same, set) else f"msg#{prior['msg']}"})
+                out.append({"msg": later["msg"], "prior": prior["msg"], "fix": fix, "cls": sorted(same)[0]})
     return out
+
+
+def _live_class(db: DB, rec: dict) -> set:
+    """`rec`'s specific class, less a 'msg#<id>' that today's repeat detector no longer finds its message
+    repeating: one stored by an older, looser detector (one shared word stem) names no recurring mistake."""
+    from . import correction
+    cls = correction._specific(rec.get("class"))
+    if not any(a.startswith("msg#") for a in cls):
+        return cls
+    mid = int(rec["msg"])
+    m = [dict(r) for r in db.q("SELECT id, ts, text, chat, direction, kind FROM messages WHERE id=?", (mid,))]
+    got = correction.repeats(db, m, now=float(m[0]["ts"] or 0) + 1).get(mid) if m else None
+    return {a for a in cls if not a.startswith("msg#") or got and a == f"msg#{got[0]}"}
 
 
 def _after_fix(db: DB, fix: str, ts: float) -> bool:
