@@ -1281,3 +1281,65 @@ def test_gh_workstation_publishes_one_own_branch_from_a_bundle_and_retires_it_wi
     assert ghqueue.retire(branch, str(repo)) == 0
     rows = [json.loads(x) for x in (ghqueue.outbox() / ghqueue.DELETED).read_text().splitlines()]
     assert (rows[-1]["branch"], rows[-1]["tip"]) == (branch, head)
+
+
+def test_gh_workstation_retire_runs_again_after_a_failed_delete_and_finds_a_tip_with_no_local_branch(
+        env, monkeypatch, capsys):
+    """A failed delete's receipt (refused or not run on the workstation) answered every later retire before
+    its checks ran, so the branch could never be retired; only a delete that succeeded answers now, and the
+    receipt stays as it was. With no local branch and no publish record, the tip comes from origin's
+    remote-tracking ref, else the head its task handed off on a shared branch."""
+    from ttp import ghqueue, ghroute
+    from ttp.integrate import MEMBER_HEAD_REF
+    p, repo, _origin, _other = _push_setup(env, monkeypatch, ["true"])
+    _workstation(env, monkeypatch)
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(ghroute, "_value", lambda cfg=None, cwd=None: ghroute.WORKSTATION)
+    monkeypatch.setattr(ghqueue, "repo_of", lambda cwd: "acme/widgets")
+    sent = []
+
+    def enqueue(args, input=None, cwd=None, home=None, prefixes=(), key=""):
+        sent.append((args[0], key))
+        if args[0] == "pr":
+            print("[]")   # no open PR
+            return 0
+        return ghroute.HELD_RC
+    monkeypatch.setattr(ghqueue, "enqueue", enqueue)
+    branch = "ttp/t8-gone"
+    delete = ["api", "-X", "DELETE", f"repos/acme/widgets/git/refs/heads/{branch}"]
+    (p.state / "pushes").mkdir(parents=True, exist_ok=True)
+    (p.state / "pushes" / "r.json").write_text(json.dumps({"outcome": "pushed", "target": f"origin/{branch}"}))
+    out = ghqueue.outbox()
+    out.mkdir(parents=True, exist_ok=True)
+    key0 = ghqueue._key("acme/widgets", delete, b"")
+    receipt = out / f"{key0}.done"
+    receipt.write_text(json.dumps({"rc": 1, "write": True, "stdout": "", "at": time.time(),
+                                   "stderr": "refused on the workstation: not run"}))
+    before = receipt.read_bytes()
+    capsys.readouterr()
+    # the checks run: no tip here to save yet
+    assert ghqueue.retire(branch, str(repo)) == 1
+    err = capsys.readouterr().err
+    assert "the last delete" in err and "runs it again" in err and "tip is not here to save first" in err, err
+    # origin's remote-tracking ref gives the tip; the new attempt takes its own key, the receipt untouched
+    head = _git_out(repo, "rev-parse", "HEAD").strip()
+    _git_out(repo, "update-ref", f"refs/remotes/origin/{branch}", head)
+    assert ghqueue.retire(branch, str(repo)) == ghroute.HELD_RC
+    assert _git_out(repo, "rev-parse", f"refs/ttp-private/retired/{branch}").strip() == head
+    key1 = sent[-1][1]
+    assert sent[-1][0] == "api" and key1 and key1 != key0 and receipt.read_bytes() == before, sent
+    # no remote-tracking ref: the head its task handed off on a shared branch
+    _git_out(repo, "update-ref", "-d", f"refs/remotes/origin/{branch}")
+    member = _git_out(repo, "commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "member").strip()
+    t = p.db.add_task("member", "s", kind="code", origin="daemon")
+    p.db.update_task(t, status="done", branch=branch)
+    _git_out(repo, "update-ref", f"{MEMBER_HEAD_REF}{t}", member)
+    assert ghqueue.retire(branch, str(repo)) == ghroute.HELD_RC
+    assert _git_out(repo, "rev-parse", f"refs/ttp-private/retired/{branch}").strip() == member
+    assert sent[-1] == ("api", key1)   # the same attempt, not yet answered
+    # a delete that succeeded answers a new request at once, with no checks
+    (out / f"{key1}.done").write_text(json.dumps({"rc": 0, "write": True, "stdout": "", "stderr": "",
+                                                  "at": time.time()}))
+    (p.state / "pushes" / "r.json").unlink()
+    n = len(sent)
+    assert ghqueue.retire(branch, str(repo)) == 0 and len(sent) == n

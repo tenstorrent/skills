@@ -396,9 +396,10 @@ def _project(cwd: str | None) -> str:
         return Path(env).name if env else ""
 
 
-def enqueue(args: list[str], input: bytes | None = None, cwd: str | None = None, home=None, prefixes=()) -> int:
+def enqueue(args: list[str], input: bytes | None = None, cwd: str | None = None, home=None, prefixes=(),
+            key: str = "") -> int:
     """`gh args` here with no login: the workstation's answer if it is in (its output on ours), else the
-    call queued once (HELD_RC)."""
+    call queued once (HELD_RC). `key`: this attempt's own key (a retry of a write whose answer failed)."""
     sent, data, why = local_inputs(args, input, cwd)
     if why:
         print(f"gh (tt-project): held: {why}; it was not queued for the workstation (exit {HELD_RC}).", file=sys.stderr)
@@ -408,16 +409,16 @@ def enqueue(args: list[str], input: bytes | None = None, cwd: str | None = None,
     if why := allowed(sent, data, prefixes):
         print(f"gh (tt-project): refused: {why} ({SETTING} is {WORKSTATION}).", file=sys.stderr)
         return 1
-    return _queued(sent, data, repo, cwd, home, f"gh {' '.join(args[:2])}")
+    return _queued(sent, data, repo, cwd, home, f"gh {' '.join(args[:2])}", key)
 
 
 def _key(repo: str, sent: list[str], data: bytes) -> str:
     return hashlib.sha256(json.dumps([repo, sent, base64.b64encode(data).decode()]).encode()).hexdigest()[:32]
 
 
-def _queued(sent: list[str], data: bytes, repo: str, cwd: str | None, home, what: str) -> int:
+def _queued(sent: list[str], data: bytes, repo: str, cwd: str | None, home, what: str, key: str = "") -> int:
     """The answer to an allowed call if it is in (its output on ours), else the call queued once (HELD_RC)."""
-    key = _key(repo, sent, data)
+    key = key or _key(repo, sent, data)
     d = outbox(home)
     d.mkdir(parents=True, exist_ok=True, mode=0o700)
     prune(d)
@@ -671,8 +672,16 @@ def retire(branch: str, cwd: str | None = None, home=None) -> int:
     workstation reads the tip again and refuses the default branch."""
     why, repo, grants, p = _branch_call(cwd, branch)
     delete = ["api", "-X", "DELETE", f"repos/{repo}/git/refs/heads/{branch}"]
-    if not why and (outbox(home) / f"{_key(repo, delete, b'')}.done").exists():
-        return _queued(delete, b"", repo, cwd, home, f"gh api -X DELETE {branch}")   # already answered
+    # Only a delete that succeeded answers a new request. A failed one (refused or not run on the
+    # workstation) keeps its receipt as it is; the next attempt takes a key chained from it.
+    key, failed = _key(repo, delete, b""), None
+    while not why and (got := _load(outbox(home) / f"{key}.done")) is not None:
+        if got.get("rc") == 0:
+            return _queued(delete, b"", repo, cwd, home, f"gh api -X DELETE {branch}", key)   # already done
+        key, failed = _key(repo, [*delete, key], b""), got
+    if failed:
+        print(f"ttp push --retire: the last delete of `{branch}` failed (exit {failed.get('rc')}): "
+              f"{str(failed.get('stderr') or '').strip()[-300:]}; this request runs it again.", file=sys.stderr)
     if why:
         print(f"ttp push --retire: refused: {why}.", file=sys.stderr)
         return 1
@@ -682,8 +691,14 @@ def retire(branch: str, cwd: str | None = None, home=None) -> int:
     pushed = p is not None and any(
         (v := _load(f)) and v.get("outcome") == "pushed" and str(v.get("target") or "").endswith("/" + branch)
         for f in (p.state / "pushes").glob("*.json"))
-    tip = (published[-1].get("sha") if published else "") or \
-        _git(cwd, "rev-parse", "--verify", "-q", f"refs/heads/{branch}^{{commit}}").stdout.strip()
+    # No publish record: the local branch, else origin's remote-tracking ref, else the head its newest
+    # task handed off on a shared branch.
+    from .integrate import MEMBER_HEAD_REF
+    refs = [f"refs/heads/{branch}", f"refs/remotes/origin/{branch}"] + ([] if p is None else [
+        f"{MEMBER_HEAD_REF}{r['id']}" for r in p.db.q("SELECT id FROM tasks WHERE branch=? ORDER BY id DESC LIMIT 1",
+                                                      (branch,))])
+    tip = (published[-1].get("sha") if published else "") or next(
+        (sha for r in refs if (sha := _git(cwd, "rev-parse", "--verify", "-q", f"{r}^{{commit}}").stdout.strip())), "")
     worktrees = _git(cwd, "worktree", "list", "--porcelain").stdout.splitlines()
     tasks = [] if p is None else [r["id"] for r in p.db.q(
         "SELECT id FROM tasks WHERE branch=? AND status NOT IN ('done','cancelled','failed') AND id!=?",
@@ -724,4 +739,4 @@ def retire(branch: str, cwd: str | None = None, home=None) -> int:
         print(f"ttp push --retire: refused: could not save `{branch}`'s tip {tip} first.", file=sys.stderr)
         return 1
     print(f"ttp push --retire: saved {tip} as {ref} and {saved}.", file=sys.stderr)
-    return enqueue(delete, None, cwd, home, grants)
+    return enqueue(delete, None, cwd, home, grants, key)
