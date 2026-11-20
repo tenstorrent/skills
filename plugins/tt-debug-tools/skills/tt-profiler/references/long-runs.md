@@ -2,6 +2,8 @@
 
 ## Dropped markers make a partial report
 
+This is the DRAM profiler's limit; the streaming profiler (see `SKILL.md`) drains continuously instead.
+
 The on-device buffer holds `TT_METAL_PROFILER_PROGRAM_SUPPORT_COUNT` (set by
 `--op-support-count`) programs per device (1000 by default). The host drains it
 between dispatches; outrun the drain and markers are lost. The run log says `Profiler DRAM buffers were full,
