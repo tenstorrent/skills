@@ -1,6 +1,6 @@
 ---
 name: tt-profiler
-description: Measure where device time goes on a Tenstorrent part — per-zone kernel timings from the Device Program Profiler, and host-plus-device traces through Tracy. Use when a kernel or op is slower than expected and you need cycles attributed to named scopes, when you want a profile_log_device.csv read, or when you need to instrument a kernel with DeviceZoneScopedN.
+description: Measure where device time goes on a Tenstorrent part — the streaming profiler (default where the checkout has it), per-zone kernel timings from the Device Program Profiler (fallback for older checkouts), and host-plus-device traces through Tracy. Use when a kernel or op is slower than expected and you need cycles attributed to named scopes, when you want a profile_log_device.csv read, when you want your own callback on profiler records, or when you need to instrument a kernel with DeviceZoneScopedN.
 metadata:
   tier: kernel
   upstream:
@@ -22,11 +22,12 @@ metadata:
 
 Scope-based timing on the device, the same shape as Tracy on the host. Zones are
 compiled into the kernel; the runtime reads their timestamps off the device and
-writes a CSV, and optionally streams the whole thing — host and device — into
-Tracy.
+hands them to the host.
 
-Built by default. **Off at runtime**, so the overhead only arrives when you ask
-for it.
+Two profilers exist. Use the **streaming profiler** when the checkout has it;
+fall back to the **device profiler** (`TT_METAL_DEVICE_PROFILER`, `tracy -r`)
+on older checkouts. They are mutually exclusive: setting both is a `TT_FATAL`.
+Both are **off at runtime** until you ask.
 
 ## When to invoke
 
@@ -35,8 +36,83 @@ for it.
 - You have a `profile_log_device.csv` and need it read.
 - You want to instrument a kernel with `DeviceZoneScopedN`.
 - You want host and device on one timeline.
+- You want your own code to consume profiler records (a callback).
 
-## Surface
+## Which one this checkout has
+
+The streaming profiler is there if either exists:
+
+```bash
+ls tt_metal/api/tt-metalium/experimental/streaming_profiler.hpp \
+   tt_metal/tools/profiler/STREAMING_PROFILER.md
+```
+
+Neither: skip to "Device profiler" below.
+
+## Streaming profiler (default)
+
+```bash
+TT_METAL_STREAMING_PROFILER=1 ./your_program          # capture, decode, no output yet
+TT_METAL_STREAMING_PROFILER=1 TT_METAL_STREAMING_PROFILER_TRACY=1 ./your_program  # Tracy GUI
+```
+
+What it fixes compared with the device profiler:
+
+- **No fixed buffer that fills up.** Records stream off each core through a
+  small L1 ring to the host as they happen; there is no per-core buffer to size
+  or drain, and no ~1000-run limit. A full ring stalls the producer (a
+  `PROFILER-STALL` zone) instead of losing records.
+- **No stop at kernel or program boundaries.** Capture runs continuously.
+- **Better cross-device sync.** Every record lands on one host-clock timeline,
+  synced across chips over Ethernet.
+
+A plain `=1` run writes nothing: output comes from a consumer — the Tracy sink,
+the CSV sinks (`references/capture.md`), or your own callback.
+
+**Host API** (`#include <tt-metalium/experimental/streaming_profiler.hpp>`,
+namespace `tt::tt_metal::experimental::streaming_profiler`). An agent can write
+its own callback to compute exactly the numbers it needs:
+
+```c++
+using namespace tt::tt_metal::experimental::streaming_profiler;
+Callback zones = RegisterCallback([](const Batch<Zone>& batch) {
+    for (const Zone& z : batch.records<Zone>()) { /* z.core(), z.descriptor() ... */ }
+}, "my-tool");
+// destroying `zones`, or zones.reset(), unregisters it
+```
+
+`Batch<Ts...>` also carries `TimestampedData` (with `payload()`) and `Event`
+records, plus `dropped_bytes()` (a callback that fell behind) and
+`stall_count()`. Callbacks must not block and must not register or unregister
+callbacks.
+
+**Device markers**, after `#include "api/debug/kernel_profiler.hpp"` (one header for
+both profilers; the streaming example kernel notes DPRINT cannot share the run):
+
+```c++
+DeviceZoneScopedN("NAME");                 // a timed scope
+DeviceTimestampedData("NAME", uint64_value);  // a value at a point in time
+DeviceRecordEvent("NAME");                 // an event; the name is compile-time
+```
+
+Docs in the checkout: `tt_metal/tools/profiler/STREAMING_PROFILER.md` and
+`STREAMING_PROFILER_DETAILED.md`. As written there: Blackhole only, a
+Tracy-enabled build, and idle Ethernet cores for the sync.
+
+Known gaps as of 2026-11-19 (check their current status):
+
+- tt-metal #64832 — the ops and zone CSVs carry per-chip cycles, not synced times.
+- tt-metal #64712 — perf-test timing through the streaming profiler; instrumented
+  kernels can overflow the kernel-config buffer.
+- tt-metal #61277 — on a non-Tracy build, setting `TT_METAL_STREAMING_PROFILER`
+  or `TT_METAL_DEVICE_PROFILER` to any value, even `0`, is a `TT_FATAL`.
+
+## Device profiler (fallback for older checkouts)
+
+Built by default; nothing is collected until `TT_METAL_DEVICE_PROFILER=1`.
+Results go to a CSV, and optionally — host and device — into Tracy.
+
+### Surface
 
 ```bash
 TT_METAL_DEVICE_PROFILER=1 ./build/programming_examples/profiler/test_full_buffer
@@ -59,7 +135,8 @@ For the workflow question "which op dominates?" the answer is the ranked
 `generated/profiler/reports/<timestamp>/`. Recipe, pandas fallback and the
 per-RISC bottleneck tags: `references/op-report.md`.
 
-In-kernel, after `#include <tools/profiler/kernel_profiler.hpp>`:
+In-kernel, after `#include <tools/profiler/kernel_profiler.hpp>` (older checkouts;
+current ones use `"api/debug/kernel_profiler.hpp"`):
 
 ```c++
 void kernel_main() {
@@ -68,7 +145,7 @@ void kernel_main() {
 }
 ```
 
-## Force the state
+### Force the state
 
 ```bash
 TT_METAL_DEVICE_PROFILER=1 ./build/programming_examples/profiler/test_full_buffer
@@ -77,7 +154,7 @@ TT_METAL_DEVICE_PROFILER=1 ./build/programming_examples/profiler/test_full_buffe
 Its kernel wraps a `nop` loop in `DeviceZoneScopedN("TEST-FULL")`, so the CSV
 comes back with a user zone next to the firmware ones.
 
-## Output
+### Output
 
 `$TT_METAL_HOME/generated/profiler/.logs/profile_log_device.csv` — note
 `TT_METAL_HOME`, unlike watcher, DPRINT and Inspector, which follow
@@ -96,7 +173,7 @@ Times are **cycles since reset**, so a duration is the difference between a
 matched `ZONE_START` and `ZONE_END`, converted with the `CHIP_FREQ[MHz]` from
 line 1. Column meanings and how to pair rows: `references/csv-format.md`.
 
-## Traps
+## Traps (device profiler)
 
 **It cannot share a run with watcher or kernel prints.** All three consume
 significant on-chip SRAM and conflict. Upstream is explicit that
