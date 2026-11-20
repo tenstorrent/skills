@@ -7,7 +7,10 @@ queue, cap or admission: a host-wide checks slot (checkcap.state, queued or park
 it polls while queued (`ttp checks --result`, or a reason saying so), the push queue (`ttp push`), worker capacity (the next ready
 task dispatch holds only because its provider's live worker runs fill every slot it may take; a review held by
 its daemon pre-checks waiting for a host slot is a checks wait), a device or other `ttp lock` resource, an outside
-batch pool (`ttp pool-wait`, Slurm) or CPU admission (a reason naming admission and CPU or load). Each task and queue
+batch pool (`ttp pool-wait`, Slurm) or CPU admission (a reason naming admission and CPU or load). An urgent task
+waiting on any other probe (its own retry_when or start_when: a detached job, a smoke, a cluster job) is queue
+"own": raised after URGENT_OWN_S (15 min), at once while a user pause holds one of its resources, naming the
+probe's last words and its resources, with routes around it. Each task and queue
 waiting past the threshold raises one must-act event (KIND, mustact.py): the queue, its cap and occupancy,
 who holds and waits for each place (rewritten each scan while the item is unread, so it names the holders of
 the moment it is read), the wait so far, and options() computed from config and host state,
@@ -43,6 +46,7 @@ KIND = "queue_wait"
 KV = "queue_wait"   # {"open": {episode: {task, queue, since, opened, seen, acted, raise, ans}}, "hist": [ended], "told": [episode],
 #                     "answers": {"<queue>:<res>": {key, cause, depth, wait, at, keys}}}
 DEFAULT_MIN = 30.0
+URGENT_OWN_S = 900.0   # an urgent task's own wait (queue "own": a probe no queue explains) is raised after this
 GRACE_S = 1800.0   # a wait not seen this long ends its episode; a shorter gap is the same wait
 HIST_KEEP_S = 7 * 86400.0
 HIST_MAX = 300
@@ -51,7 +55,7 @@ COVER_X = 3   # a covered wait past this many times the answered one is raised o
 FOLD = "fold"   # in event data: {"group", "item", "ctx", "opts"} (coordinator.fold_events)
 NAMES = {"checks": "checks queue", "push": "push queue", "workers": "worker slots", "device": "device queue",
          "lock": "lock", "pool": "outside batch pool", "cpu": "CPU admission",
-         "spill": "busy spill hosts"}
+         "spill": "busy spill hosts", "own": "its own wait"}
 # Words other observations use for a queue, so a mute of one (screen.mutes) matches its waits.
 ALIASES = {"checks": ("host-wide checks slot", "checks slot", "checks queue")}
 
@@ -141,11 +145,27 @@ def collect(p, cfg: dict, now: float, host: dict | None = None, device: set | No
     for h, at in [*zip(host.get("queued") or [], host.get("queued_at") or []), *(host.get("parked") or [])]:
         if (tid := _task_of(h, name)) is not None and at:
             add(tid, "checks", "", at, checks)
-    for t in db.q("SELECT id, blocked_reason, result FROM tasks WHERE status='queued' AND not_before IS NOT NULL"):
+    from . import progress, urgent
+    from .coordinator import task_resources
+    probes = progress.load(db).get("probes") or {}
+
+    def own(t, since):   # an urgent task's wait no queue explains: its probe's last words and its resources
+        add(t["id"], "own", ",".join(sorted(task_resources(t))), since,
+            {"cap": None, "running": [], "queued": [],
+             "says": str((probes.get(str(t["id"])) or {}).get("reason") or "")[:200]})
+
+    for t in map(dict, db.q("SELECT * FROM tasks WHERE status='queued'")):
         prev = load_result(t["result"])
-        if prev.get("status") != "waiting" or not isinstance(prev.get("waiting_since"), (int, float)):
+        if prev.get("status") != "waiting" or not isinstance(prev.get("waiting_since"), (int, float)) \
+                or t["not_before"] is None:
+            if urgent.is_urgent(t) and (rec := probes.get(str(t["id"]))) and now - float(rec.get("last") or 0) < 900:
+                # its start_when probe still says not yet
+                own(t, float(rec.get("first") or now))
             continue
         got = classify(prev.get("retry_when") or "", t["blocked_reason"] or "", device)
+        if got is None and urgent.is_urgent(t):
+            own(t, prev["waiting_since"])
+            continue
         if got and got[0] == "checks" and not (queued and _checks_waiting(p, prev.get("retry_when"))):
             continue   # its checks finished, run or never queued, or the host queue is empty: no slot to wait for
         since = prev["waiting_since"]
@@ -237,7 +257,7 @@ def _began(p, rec: dict, host: dict) -> bool:
     not after GRACE_S."""
     from . import cli
     db, tid, q, since = p.db, rec["task"], rec.get("queue"), float(rec.get("since") or 0)
-    if q == "workers":
+    if q in ("workers", "own"):
         return bool(db.one("SELECT 1 FROM runs WHERE task=? AND role!='coordinator' AND started>=?", (tid, since)))
     if q == "checks":
         held = list(host["held"]) if "held" in host else [
@@ -373,6 +393,12 @@ def options(db, w: dict, cfg: dict, paused: dict, device: set | None = None, cor
     from . import configwho
     t = db.one("SELECT priority, origin FROM tasks WHERE id=?", (w["task"],)) or {}
     res = [r for r in str(w.get("res") or "").split(",") if r]
+    if w["queue"] == "own":   # its own probe: a user-held resource is routed around, never waited out
+        other = sorted(set(device or ()) - set(res) - {k for k, v in paused.items() if v})
+        return ([f"route to another allowed resource ({', '.join(other[:3])}): task_update resources"] if other
+                else []) + ["hand it off for review now and run its smoke or outside job beside the review: "
+                            "task_update spec", "check its probe still tracks a live job (one that ended, or failed, "
+                            "may read as still running): task_update spec, or cancel the wait"]
     if any((paused.get(r) or {}).get("by") == "user" for r in res):
         return []
     user_set = lambda key: configwho.role(configwho.get(db, key)) == "user"   # noqa: E731
@@ -421,6 +447,10 @@ def _parts(w: dict, now: float, note: str = "") -> tuple[str, str, str]:
     run, que = list(w.get("running") or []), list(w.get("queued") or [])
     some = lambda xs: "; ".join(xs[:4]) + ("; ..." if len(xs) > 4 else "") or "none seen"   # noqa: E731
     name = f"{NAMES.get(w['queue'], w['queue'])}{' ' + w['res'] if w.get('res') else ''}"
+    if w["queue"] == "own":
+        return name, f"{key(w)}: urgent #{w['task']} has waited {(now - w['since']) / 60:.0f} min", (
+            f"Its probe last said: {w.get('says') or 'nothing yet'}. Its resources: {w.get('res') or 'none'}"
+            + (f" ({w['held']})" if w.get("held") else "") + "." + (f" {note}" if note else ""))
     ctx = (f"{len(run)} running (cap {cap if cap else 'unknown'}{', ' + w['cap_why'] if w.get('cap_why') else ''}),"
            f" {len(que)} queued. Holding: {some(run)}. Waiting: {some(que)}." + (f" {note}" if note else ""))
     return name, f"{key(w)}: #{w['task']} has waited {(now - w['since']) / 60:.0f} min", ctx
@@ -484,6 +514,7 @@ def scan(p, cfg: dict, now: float | None = None, host: dict | None = None, devic
     opened, told = st.setdefault("open", {}), st.setdefault("told", [])
     _rekey(opened)
     waits, live = [], set()
+    paused = db.paused_resources()
     for w in collect(p, cfg, now, host, device, hold):
         ep = episode(w)
         if (rec := opened.get(ep)) is not None:   # the same wait: its earliest start, seen now
@@ -494,10 +525,12 @@ def scan(p, cfg: dict, now: float | None = None, host: dict | None = None, devic
             if parked := rec.pop("parked", None):   # back within the grace: its unread item is queued again
                 db.x("UPDATE events SET status='queued' WHERE id=? AND status='handled'", (parked,))
             w = {**w, "since": rec["since"]}
-        if now - w["since"] >= thr:
+        if w["queue"] == "own":   # urgent: after URGENT_OWN_S, at once on a resource a user pause holds
+            held = [r for r in w["res"].split(",") if (paused.get(r) or {}).get("by") == "user"]
+            w["held"] = f"held by a user pause: {', '.join(held)}" if held else ""
+        if now - w["since"] >= (thr if w["queue"] != "own" else 0 if w["held"] else min(thr, URGENT_OWN_S)):
             waits.append(w)
     waits.sort(key=lambda w: w["since"])
-    paused = db.paused_resources()
     raised, spill = [], None
     for w in waits:
         ep = episode(w)

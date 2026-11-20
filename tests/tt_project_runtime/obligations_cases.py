@@ -278,6 +278,30 @@ def test_order_late_and_overdue_raise_once_with_must_act_and_survive_restart(env
     assert ob.get(p.db, oid)["promise"]["order"] == mid
 
 
+def test_an_order_asked_for_today_or_now_is_due_the_same_day(env, monkeypatch):
+    """A message asking for it today or now, given no due, records its order due by the end of that
+    home-zone day (at least 4 h after it, sent late); an explicit due wins, and 'not urgent' never counts."""
+    from datetime import datetime, timezone
+    from ttp import obligations as ob
+    p, d, now, tid, check, mid, raised = _order_setup(env, monkeypatch)
+    at = datetime(2026, 11, 19, 10, 0, tzinfo=timezone.utc).timestamp()
+    late = datetime(2026, 11, 19, 22, 30, tzinfo=timezone.utc).timestamp()
+    week = at + 7 * 86400
+    cases = (("fix the queue today", at, None), ("do it now!", late, None), ("asap please", at, None),
+             ("please build the deliverable", at, at + 26 * 3600), ("fix it now", at, at + 26 * 3600),
+             ("not urgent, next week", at, week))
+    notes = []
+    for text, ts, due in cases:
+        m = p.db.post("in", text, chat="c1")
+        p.db.x("UPDATE messages SET ts=? WHERE id=?", (ts, m))
+        notes.append(ob.add_order(p, "x", m, [tid], due=due, action_class="change", now=ts))
+    dues = [ob.get(p.db, n.split()[1])["promise"]["due"] for n in notes]
+    day = datetime(2026, 11, 19, 23, 59, tzinfo=timezone.utc).timestamp()
+    assert dues == [day, late + 4 * 3600, day, at + 26 * 3600, at + 26 * 3600, week]
+    assert "asks for it today" in notes[0] and not any("asks for it today" in n for n in notes[3:])
+    assert not ob.SAME_DAY.search("not urgent, next week") and not ob.SAME_DAY.search("this isn't urgent")
+
+
 def test_order_started_owner_retires_the_late_event(env, monkeypatch):
     from ttp import obligations as ob
     p, d, now, tid, check, mid, raised = _order_setup(env, monkeypatch)

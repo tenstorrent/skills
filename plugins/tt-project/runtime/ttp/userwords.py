@@ -5,7 +5,8 @@
 `search` returns the newest of the user's own messages (inbound, kind user, never a system row;
 only the verbatim part of a relayed one, never the relayer's context) matching a topic, with the
 message id, time and the quoted sentence. `ttp said <words>` runs it read-only for the coordinator and
-workers. `digest_lines` adds, for each blocked task, open ask and refused action of the last turn,
+workers; `search_notes` (`ttp said --notes`) also reads the project's notes from other projects, which are
+data, never the user's words. `digest_lines` adds, for each blocked task, open ask and refused action of the last turn,
 at most PER_ITEM lines 'User's latest words on this: #id date "quote"', so a turn sees what the user
 said later before it refuses, blocks or asks again on an older rule. Nothing matches, nothing shown.
 
@@ -23,9 +24,13 @@ import sqlite3
 import time
 
 from . import reask, timefmt
+from .db import load_result
 
 USER_SQL = ("SELECT id, ts, text, context FROM messages WHERE direction='in' AND kind='user' AND ts>=? "
             "AND COALESCE(provenance,'')!='system' AND COALESCE(channel,'')!='system' ORDER BY id DESC LIMIT ?")
+# Notes from other projects (upstream._event_text): data, never the user's words (`ttp said --notes`).
+NOTES_SQL = ("SELECT id, ts, text, data FROM events WHERE kind='upstream_note' AND text LIKE 'note to this project from %' "
+             "AND ts>=? ORDER BY id DESC LIMIT ?")
 SCAN = 3000          # newest user messages read per lookup
 DAYS = 120.0         # the digest's look-back
 PER_ITEM = 3         # lines per blocked item
@@ -111,6 +116,18 @@ def search(con, query: str, limit: int = 5, since: float = 0.0) -> list[dict]:
     if not qw and not qa:
         return []
     return _match(_rows(con, since), lambda s: _query_hit(qw, qa, s), limit)
+
+
+def search_notes(con, query: str, limit: int = 5, since: float = 0.0) -> list[dict]:
+    """The newest notes from other projects matching `query`, as `search` does, each with `sender`."""
+    qw, qa = reask.words(query), reask.anchors(query)
+    if not qw and not qa:
+        return []
+    sender, rows = {}, []
+    for mid, ts, text, data in con.execute(NOTES_SQL, (since, SCAN)).fetchall():
+        sender[mid] = str(load_result(data).get("from") or "?")   # the event's own sender (upstream._note_data)
+        rows.append((mid, ts, (text or "").partition("): ")[2], None))   # the note's own words, not the header
+    return [{**m, "sender": sender[m["id"]]} for m in _match(rows, lambda s: _query_hit(qw, qa, s), limit)]
 
 
 def on_topic(con, topic: str, limit: int = PER_ITEM, since: float = 0.0, skip=frozenset(), rows=None) -> list[dict]:

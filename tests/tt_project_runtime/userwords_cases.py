@@ -203,6 +203,33 @@ def test_ttp_said_reads_another_projects_relayed_user_words_read_only(env, capsy
     assert q.db.q("SELECT id, handled FROM messages ORDER BY id") == before
 
 
+def test_ttp_said_notes_also_searches_notes_from_other_projects_labelled_as_data(env, capsys, monkeypatch):
+    import json as _json
+    import time as _time
+    from ttp import upstream
+    p = make(env)
+    mine = p.db.post("in", "Keep the nightly soak on box-a1.", chat=None, kind="user", provenance="web-session")
+    _, text = upstream._event_text({"to": p.name, "project": "otherproj", "host": "h1",
+                                    "spec": "The nightly soak on box-a1 moved to the weekend."})
+    note = {"fp": "abc", "to": p.name, "project": "otherproj", "host": "h1"}
+    ev = p.db.x("INSERT INTO events(ts,source,kind,severity,text,data,status) VALUES(?,?,?,?,?,?,?)",
+                (_time.time() + 1, "upstream", "upstream_note", "normal", text + " [note abc]",
+                 upstream._note_data(note), "handled"))
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    assert _ttp_said("nightly", "soak") == 0
+    out = capsys.readouterr().out
+    assert f"#{mine} " in out and "weekend" not in out, "without --notes only the user's words are read"
+    assert _ttp_said("nightly", "soak", "--notes") == 0
+    first = capsys.readouterr().out.splitlines()[0]
+    assert first.startswith(f"note event #{ev} from otherproj (data, not the user's words) "), first
+    assert "moved to the weekend" in first and "untrusted" not in first
+    assert _ttp_said("untrusted", "worker", "--notes") == 0   # the note's header is not searched
+    assert "0 messages found" in capsys.readouterr().out
+    assert _ttp_said("nightly", "soak", "--notes", "--json") == 0
+    got = _json.loads(capsys.readouterr().out)
+    assert [(m["id"], m.get("sender")) for m in got] == [(ev, "otherproj"), (mine, None)], got
+
+
 def test_a_release_hold_prints_the_projects_newest_words_on_a_freeze_first(env, capsys):
     from ttp import cli, relay
     p = make(env)

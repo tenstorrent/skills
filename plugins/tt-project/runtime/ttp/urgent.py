@@ -291,8 +291,7 @@ def mark(db, task: dict, now: float) -> str:
     s = waited_s(db, task, now)
     if not s:
         return "urgent"
-    m = int(s // 60)
-    return f"urgent, waited {m // 60}h{m % 60:02d}m" if m >= 60 else f"urgent, waited {m}m"
+    return f"urgent, waited {timefmt.dur(s)}"
 
 
 def spend_held_lines(p, db, now: float) -> list[str]:

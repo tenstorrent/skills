@@ -149,6 +149,22 @@ def test_eta_host_load_and_queue_depth_only_lengthen_and_are_named(env):
     assert dep
 
 
+def test_eta_a_wait_on_its_own_checks_ends_at_their_measured_wall_time_not_outside_work(env):
+    from ttp import checkwall, eta
+    p = make(env)
+    now = time.time()
+    _eh_runs(p, now, "code", [1200] * 6)
+    own = _eta_waiting(p, now, kind="code", retry_when=f"ttp checks --result {p.state}/runs/7", waiting_since=now - 1000)
+    gated = eta.estimate(p.db, own, now)
+    assert "waits on its own checks" in eta.field(gated, p, now) and "outside work" not in eta.field(gated, p, now)
+    for s in (1500, 1800, 2400):
+        checkwall.record_run(p.state, s, True)
+    e = eta.estimate(p.db, own, now)
+    assert e["end"] == pytest.approx(now + 800 + 1200) and [k for k, _ in e["legs"]] == ["own checks", "run"]
+    other = _eta_waiting(p, now, kind="code", retry_when="ttp detach --check /runs/7/job", waiting_since=now - 1000)
+    assert "waits on outside work" in eta.field(eta.estimate(p.db, other, now), p, now)
+
+
 def test_eta_outside_wait_uses_an_expected_wait_from_the_handoff_and_reports(env):
     from ttp import eta
     p = make(env)
