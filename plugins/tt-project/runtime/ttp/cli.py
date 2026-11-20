@@ -50,6 +50,11 @@ from . import gitmemo
 RUNTIME = Path(__file__).resolve().parent.parent              # .../runtime (plugin or project copy)
 PLUGIN_ROOT = RUNTIME.parent                                   # plugin root, or a project's harness/
 MARKER = "tt-project://{name}@{host}:{dir}"
+EX_BUSY = 75          # busy, held or deferred: nothing changed, try again later (EX_TEMPFAIL)
+SSH_FAILED = 255      # ssh's own exit code: it could not reach or run on the host
+SIGNAL_RC_BASE = 128  # a shell reports a death by signal N as 128 + N
+HOUR_S = 3600
+DAY_S = 86400
 
 
 def die(msg: str, code: int = 2) -> None:
@@ -133,7 +138,7 @@ def _dropped(rc: int) -> bool:
     ssh exits 255 when it fails. A status of 128 or more is a signal ending the session (the far
     side's shell, a shared ssh connection, the network stack): `ttp listen` itself exits only
     0, 1, 2 or LISTEN_REPLACED. Below 0, ssh here was killed by a signal."""
-    return rc == 255 or rc >= 128 or rc < 0
+    return rc == SSH_FAILED or rc >= SIGNAL_RC_BASE or rc < 0
 
 
 def _listen_timeout(argv: list[str]) -> float:
@@ -188,8 +193,8 @@ def forward_listen(entry: dict, argv: list[str], name: str | None = None) -> int
         start = time.time()
         failed = flush_outbox(name, entry, quiet=held) if name else None
         held = held or failed is not None
-        if failed is not None and failed.returncode == 255:
-            rc, err = 255, failed.stderr
+        if failed is not None and failed.returncode == SSH_FAILED:
+            rc, err = SSH_FAILED, failed.stderr
         else:
             left = deadline - time.time() if deadline else 0
             errs: list[str] = []
@@ -202,7 +207,7 @@ def forward_listen(entry: dict, argv: list[str], name: str | None = None) -> int
         if once and shown:
             return 0        # the batch got here before the drop; --ack picks up from it
         now = time.time()
-        if now - start >= LISTEN_CONNECTED_S or (rc != 255 and rc >= 128):
+        if now - start >= LISTEN_CONNECTED_S or (rc != SSH_FAILED and rc >= SIGNAL_RC_BASE):
             connected, down_since, told, delay = True, None, False, 5.0   # it was up: a new outage starts now
         if down_since is None:   # the error that started this outage, if a working session dropped
             down_since, drop = now, ((err, rc) if connected else None)
@@ -258,7 +263,7 @@ def _ssh_relay(entry: dict, argv: list[str], shown: set[int]) -> subprocess.Comp
         return subprocess.CompletedProcess(proc.args, rc, None, err.read())
 
 
-def _unreachable(entry: dict, stderr: str | None, rc: int = 255, connected: bool = False,
+def _unreachable(entry: dict, stderr: str | None, rc: int = SSH_FAILED, connected: bool = False,
                  retrying: str | None = None) -> None:
     """Say why ssh to the project's host failed, from the user's side (sshfail.kind), naming the ssh
     alias and never an address. `retrying`: the listener keeps retrying (the text after "retrying")."""
@@ -311,7 +316,7 @@ def forward(entry: dict, argv: list[str], quiet: bool = False, shown: set[int] |
         return forward(entry, _drop_holder(argv), quiet, shown, failure)
     if failure is not None and _dropped(r.returncode):   # the caller explains the drop, if it lasts
         failure.append(r.stderr or "")
-    elif r.returncode == 255:   # ssh itself failed: the project's state is kept there
+    elif r.returncode == SSH_FAILED:   # ssh itself failed: the project's state is kept there
         if not quiet:
             _unreachable(entry, r.stderr)
     elif r.stderr:
@@ -411,7 +416,7 @@ def flush_outbox(name: str, entry: dict, quiet: bool = False) -> subprocess.Comp
                       f"{outbox.folder() / (name + '.rejected.jsonl')}", file=sys.stderr)
                 continue
             failed = r
-            if r.returncode != 255 and not quiet:
+            if r.returncode != SSH_FAILED and not quiet:
                 print(f"ttp: queued messages for {name} stay queued ({why})", file=sys.stderr)
             break
     if sent:
@@ -441,7 +446,7 @@ def _say_remote(name: str, entry: dict, text: str, chat: str | None, context: st
     cid = broadcast or outbox.new_id()
     if flush_outbox(name, entry) is None and not outbox.entries(name):
         r = _send_say(entry, argv, cid)
-        if r.returncode != 255:
+        if r.returncode != SSH_FAILED:
             if r.stderr:
                 sys.stderr.write(r.stderr)
             return r.returncode, f"client:{cid}"
@@ -609,11 +614,11 @@ def need(name: str, argv: list[str]) -> Project:
             who = [] if "--holder" in argv or not holder_id() else ["--holder", holder_id()]
             sys.exit(forward_listen(entry, [*argv, *who], name))
         failed = flush_outbox(name, entry)
-        if failed is None or failed.returncode != 255:   # a message stuck for its own reason: run the command anyway
+        if failed is None or failed.returncode != SSH_FAILED:   # a message stuck for its own reason: run the command anyway
             rc = forward(entry, argv)
         else:
             _unreachable(entry, failed.stderr)
-            rc = 255
+            rc = SSH_FAILED
         n = outbox.count(name)
         if n and argv[:1] == ["status"] and "--json" not in argv:
             print(f"{n} message(s) queued here for {name}; they go out once it is reachable")
@@ -754,23 +759,8 @@ def _runtime_version(runtime: Path) -> str:
     return m.group(1) if m else "unknown"
 
 
-def bootstrap(root: Path, name: str, brief: str, provider: str, home_tz: str | None = None,
-              home_from: str = "", relayer: bool = False) -> Project:
-    p = Project(root)
-    if p.exists():
-        if p.name != name:
-            die(f"{p.base} already holds project {p.name!r}")
-        return p
-    p.base.mkdir(parents=True, exist_ok=True)
-    # The folder ignores itself, so no enclosing repository can ever commit project state.
-    durable_write(p.base / ".gitignore", "*\n")
-    from . import indexignore, noindex
-    indexignore.ensure(p)
-    noindex.ensure(p.base)     # macOS: state/ and worktrees/ under .noindex, out of Spotlight
-    p = Project(p.base)
-    for d in (p.state, p.runs, p.logs, p.worktrees, p.memory_dir):
-        d.mkdir(parents=True, exist_ok=True)
-    template = PLUGIN_ROOT / "template"
+def _new_harness(p: Project, template: Path) -> None:
+    """Copy the runtime, prompts and template files into a new project's harness/ and commit them."""
     _copy_tree(RUNTIME, p.harness / "runtime")
     # Every harness file is renamed into place, never rewritten: a shell running the old one keeps reading it whole.
     durable_write(p.harness / "runtime" / "ttp" / SOURCE_FILE, source_commit() + "\n", sync=False)
@@ -789,10 +779,11 @@ def bootstrap(root: Path, name: str, brief: str, provider: str, home_tz: str | N
     _ensure_git_ident(p.harness)
     from . import release
     release.guard_harness(p.harness)
-    charter = (template / "CHARTER.md").read_text().replace("{{NAME}}", name).replace(
-        "{{DATE}}", time.strftime("%Y-%m-%d")).replace("{{BRIEF}}", brief.strip() or "(no description given yet)")
-    durable_write(p.charter_path, charter)
-    durable_write(p.memory_index, "# Memory index\n")
+
+
+def _new_config(p: Project, name: str, provider: str, home_tz: str | None, home_from: str,
+                relayer: bool) -> dict:
+    """A new project's project.json."""
     cfg = {"name": name, "created": time.time(), "root": str(p.root), "host": hostname(),
            "core_provider": provider, "tt_project_version": __version__,
            "id": pysecrets.token_hex(4),
@@ -815,6 +806,33 @@ def bootstrap(root: Path, name: str, brief: str, provider: str, home_tz: str | N
     from . import relay
     if relayer:
         cfg["coordinator"] = {**cfg.get("coordinator", {}), relay.AGENT_KEY.split(".", 1)[1]: True}
+    return cfg
+
+
+def bootstrap(root: Path, name: str, brief: str, provider: str, home_tz: str | None = None,
+              home_from: str = "", relayer: bool = False) -> Project:
+    p = Project(root)
+    if p.exists():
+        if p.name != name:
+            die(f"{p.base} already holds project {p.name!r}")
+        return p
+    p.base.mkdir(parents=True, exist_ok=True)
+    # The folder ignores itself, so no enclosing repository can ever commit project state.
+    durable_write(p.base / ".gitignore", "*\n")
+    from . import indexignore, noindex
+    indexignore.ensure(p)
+    noindex.ensure(p.base)     # macOS: state/ and worktrees/ under .noindex, out of Spotlight
+    p = Project(p.base)
+    for d in (p.state, p.runs, p.logs, p.worktrees, p.memory_dir):
+        d.mkdir(parents=True, exist_ok=True)
+    template = PLUGIN_ROOT / "template"
+    _new_harness(p, template)
+    charter = (template / "CHARTER.md").read_text().replace("{{NAME}}", name).replace(
+        "{{DATE}}", time.strftime("%Y-%m-%d")).replace("{{BRIEF}}", brief.strip() or "(no description given yet)")
+    durable_write(p.charter_path, charter)
+    durable_write(p.memory_index, "# Memory index\n")
+    cfg = _new_config(p, name, provider, home_tz, home_from, relayer)
+    from . import relay
     write_json(p.config_path, cfg)
     _git(p.harness, "add", "-A")
     _git(p.harness, "-c", "user.name=tt-project", "-c", "user.email=tt-project@localhost", "commit", "-q",
@@ -841,15 +859,15 @@ def bootstrap(root: Path, name: str, brief: str, provider: str, home_tz: str | N
     return p
 
 
-def _usd(v) -> str:
+def _cap_usd(v) -> str:
     return f"${float(v):g}"
 
 
 def defaults_lines(budget: dict, jev_key: bool, name: str = "<name>") -> list[str]:
     """The spending and Jev defaults `ttp setup` and `ttp new` state, from the budget they apply."""
     b, reserve = budget, float(budget.get("reserve_pct", 10))
-    out = [f"spending caps (usage-billed accounts): {_usd(b.get('daily_usd'))}/day and {_usd(b.get('weekly_usd'))}/week "
-           f"per project, {_usd(b.get('global_daily_usd'))}/day across all projects "
+    out = [f"spending caps (usage-billed accounts): {_cap_usd(b.get('daily_usd'))}/day and {_cap_usd(b.get('weekly_usd'))}/week "
+           f"per project, {_cap_usd(b.get('global_daily_usd'))}/day across all projects "
            f"(budget.daily_usd, budget.weekly_usd, budget.global_daily_usd; 0 turns the global cap off)",
            f"subscription plans: used up to {100 - reserve:g}% of each window (budget.reserve_pct {reserve:g}); "
            f"if you share the plan with your own chats, only that {reserve:g}% is left for them: raise "
@@ -1165,9 +1183,9 @@ def connect_remote(name: str, entry: dict, argv: list[str]) -> int:
     """`ttp connect` on the project's machine, then the checked link through the kept local forward."""
     from . import weblink
     failed = flush_outbox(name, entry)
-    if failed is not None and failed.returncode == 255:
+    if failed is not None and failed.returncode == SSH_FAILED:
         _unreachable(entry, failed.stderr)
-        return 255
+        return SSH_FAILED
     # The user's zone only from their workstation: in an ssh login here it is a server's, so none.
     home = [] if timefmt.in_ssh_login() else ["--home-tz", timefmt.detect_local(), "--home-from", hostname()]
     r = _ssh(entry, [*argv, *home], capture=True)
@@ -1178,9 +1196,9 @@ def connect_remote(name: str, entry: dict, argv: list[str]) -> int:
         home = [] if old_tz else home
         argv = _drop_holder(argv) if old_holder else argv
         r = _ssh(entry, [*argv, *home], capture=True)
-    if r.returncode == 255:
+    if r.returncode == SSH_FAILED:
         _unreachable(entry, r.stderr)
-        return 255
+        return SSH_FAILED
     if r.stderr:
         sys.stderr.write(r.stderr)
     _echo_without_web(r.stdout)
@@ -1353,7 +1371,7 @@ def _say_local_or_die(p: Project, a, text: str, context: str, bid: str | None = 
         if not is_busy(e):
             raise
         die(f"the database stayed busy ({e}); the message was not saved. Send it again"
-            + (f" with the same --client-id {a.client_id}" if a.client_id else ""), 75)
+            + (f" with the same --client-id {a.client_id}" if a.client_id else ""), EX_BUSY)
     except OSError as e:   # creating the state dir or opening the database
         if e.errno != errno.ENOSPC:
             raise
@@ -2025,7 +2043,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
     # Landing: one line for the review and push stages, naming only a task stalled past its stage's bound.
     in_review = db.review_since()
     stall = {"review": pushq._num((cfg.get("coordinator") or {}).get("review_stall_s"), loadcaps.REVIEW_STALL_S, float, 0),
-             "pushing": 3600 * pushq._num(pushq._delivery(p, cfg).get("push_landing_alert_h"),
+             "pushing": HOUR_S * pushq._num(pushq._delivery(p, cfg).get("push_landing_alert_h"),
                                           pushq.DEFAULT_LANDING_ALERT_H, float, 0)}
     land = db.q("SELECT t.id, t.status, t.title, t.updated, (SELECT MIN(q.created) FROM push_queue q WHERE q.task=t.id "
                 "AND q.status IN ('approved','batched','held')) AS queued FROM tasks t "
@@ -2081,7 +2099,7 @@ def daemon_state(p: Project) -> str:
     return "NOT RUNNING"
 
 
-def _log_tail(log: Path, n: int = 65536) -> str:
+def _checks_log_tail(log: Path, n: int = 65536) -> str:
     """The last `n` bytes of a checks log, as text ("" when it does not read)."""
     try:
         with open(log, "rb") as f:
@@ -2101,7 +2119,7 @@ PROJECT_CMDS = frozenset({"web", "connect", "logs", "prune", "say", "listen", "t
                           "resume", "drain", "start", "stop", "restart", "config", "upgrade", "alerts"})
 
 
-def _positionals(sp: argparse.ArgumentParser, args: list[str]) -> list[str]:
+def _sub_positionals(sp: argparse.ArgumentParser, args: list[str]) -> list[str]:
     """The positional words of `args` for subcommand parser `sp`, skipping its options and their values."""
     out, i = [], 0
     while i < len(args):
@@ -2141,7 +2159,7 @@ def _project_name_argv(sub, argv: list[str]) -> list[str]:
     if not slots or slots[0].dest != "name":
         return argv
     room = sum(1 if x.nargs in (None, "?") else x.nargs if isinstance(x.nargs, int) else 99 for x in slots)
-    pos = _positionals(sp, argv[1:])
+    pos = _sub_positionals(sp, argv[1:])
     if pos and (len(pos) >= room or local_project(pos[0]) or remote_entry(pos[0])
                 or (slots[1].choices and pos[0] not in slots[1].choices)):
         return argv
@@ -2235,7 +2253,7 @@ def cmd_stats(a) -> None:
         from . import readywait
         tz = timefmt.home(p)
         until = _stats_time(a.until, tz, "--until") or time.time()
-        since = _stats_time(a.since, tz, "--since") or until - a.days * 86400
+        since = _stats_time(a.since, tz, "--since") or until - a.days * DAY_S
         s = {p.name: readywait.report(p.db.q, since, until, p.state)}
         print(json.dumps(s, indent=1) if a.json else readywait.text(s))
         return
@@ -2253,14 +2271,14 @@ def cmd_stats(a) -> None:
         from . import ruleguard
         tz = timefmt.home(p)
         until = _stats_time(a.until, tz, "--until") or time.time()
-        c = ruleguard.counts(p, _stats_time(a.since, tz, "--since") or until - a.days * 86400, until)
+        c = ruleguard.counts(p, _stats_time(a.since, tz, "--since") or until - a.days * DAY_S, until)
         print(json.dumps(c, indent=1) if a.json else ruleguard.counts_text(c))
         return
     if getattr(a, "glm_share", False):
         from . import glmshare
         tz = timefmt.home(p)
         until = _stats_time(a.until, tz, "--until") or time.time()
-        s = glmshare.report(p, _stats_time(a.since, tz, "--since") or until - a.days * 86400, until)
+        s = glmshare.report(p, _stats_time(a.since, tz, "--since") or until - a.days * DAY_S, until)
         print(json.dumps(s, indent=1) if a.json else glmshare.text(s))
         return
     if a.landing:
@@ -2290,7 +2308,7 @@ def cmd_stats(a) -> None:
         from . import babysit
         tz = timefmt.home(p)
         until = _stats_time(a.until, tz, "--until") or time.time()
-        since = _stats_time(a.since, tz, "--since") or until - a.days * 86400
+        since = _stats_time(a.since, tz, "--since") or until - a.days * DAY_S
         s = babysit.stats(p.db, since, until)
         print(json.dumps(s, indent=1) if a.json else babysit.stats_text(s, p.name, tz))
         return
@@ -2310,7 +2328,7 @@ def cmd_stats(a) -> None:
         from . import runclass
         tz = timefmt.home(p)
         since = _stats_time(a.since, tz, "--since") if a.since and not re.fullmatch(r"\d+(\.\d+)?h", a.since) \
-            else time.time() - float((a.since or "24h")[:-1]) * 3600
+            else time.time() - float((a.since or "24h")[:-1]) * HOUR_S
         s = runclass.by_class(p.db, p.config(), since, _stats_time(a.until, tz, "--until"))
         print(json.dumps(s, indent=1) if a.json else runclass.text(s))
         return
@@ -2321,7 +2339,7 @@ def cmd_stats(a) -> None:
         return
     if getattr(a, "code_routes", False):
         from . import runclass
-        s = runclass.code_routes(p.db, time.time() - 86400)
+        s = runclass.code_routes(p.db, time.time() - DAY_S)
         print(json.dumps(s, indent=1) if a.json else runclass.code_routes_text(s, p.name))
         return
     if getattr(a, "code_guard", False):
@@ -2338,11 +2356,11 @@ def cmd_stats(a) -> None:
                                                                  (a.split_at, "--split-at")))
     if a.runs or a.tier:
         from . import route
-        rows = route.runs(p.db, a.tier, since if since is not None else time.time() - a.days * 86400, until)
+        rows = route.runs(p.db, a.tier, since if since is not None else time.time() - a.days * DAY_S, until)
         print(json.dumps(rows, indent=1) if a.json else route.runs_text(rows))
         return
     if at is not None:
-        span = a.days * 86400
+        span = a.days * DAY_S
         s = bud.reread_split(p.db, at, since if since is not None else at - span,
                              until if until is not None else min(time.time(), at + span), top=a.top)
         print(json.dumps(s, indent=1) if a.json else bud.reread_split_text(s, tz))
@@ -2407,7 +2425,7 @@ def _stats_glm_share_all(a) -> None:
         try:
             tz = timefmt.home(p)
             until = _stats_time(a.until, tz, "--until") or time.time()
-            out[name] = glmshare.report(p, _stats_time(a.since, tz, "--since") or until - a.days * 86400, until)
+            out[name] = glmshare.report(p, _stats_time(a.since, tz, "--since") or until - a.days * DAY_S, until)
         except Exception as err:   # one unreadable project never hides the others
             out[name] = {"error": f"{type(err).__name__}: {err}"[:200]}
     if a.json:
@@ -2426,7 +2444,7 @@ def _stats_ready_wait_all(a) -> None:
     reg = load_registry().get("projects") or {}
     names = [n.strip() for n in a.projects.split(",") if n.strip()] if a.projects else sorted(reg)
     until = _stats_time(a.until, "UTC", "--until") or time.time()
-    since = _stats_time(a.since, "UTC", "--since") or until - a.days * 86400
+    since = _stats_time(a.since, "UTC", "--since") or until - a.days * DAY_S
     out: dict = {}
     for name in names:
         e = reg.get(name)
@@ -2492,7 +2510,7 @@ def cmd_audit(a) -> None:
         from .activity import parse_since
         now = time.time()
         try:
-            since = parse_since(a.since, now, a.hours * 3600, p)
+            since = parse_since(a.since, now, a.hours * HOUR_S, p)
         except ValueError as e:
             die(str(e))
         rows = coordfix.entries(p.db, since, now)
@@ -2502,9 +2520,9 @@ def cmd_audit(a) -> None:
         return
     hours = float((p.config().get("review") or {}).get("blocked_long_h", audit.BLOCKED_H))
     if a.json:
-        print(json.dumps(audit.report(p.db, window_s=a.hours * 3600, blocked_h=hours, p=p), indent=1, default=str))
+        print(json.dumps(audit.report(p.db, window_s=a.hours * HOUR_S, blocked_h=hours, p=p), indent=1, default=str))
     else:
-        print("\n".join(f"- {line}" for line in audit.lines(p.db, window_s=a.hours * 3600, blocked_h=hours, p=p)))
+        print("\n".join(f"- {line}" for line in audit.lines(p.db, window_s=a.hours * HOUR_S, blocked_h=hours, p=p)))
 
 
 def cmd_waste(a) -> None:
@@ -2516,7 +2534,7 @@ def cmd_waste(a) -> None:
         die("no tt-project project here; name one: `ttp waste <name>`")
     now = time.time()
     try:
-        since = parse_since(a.since, now, 86400, p)
+        since = parse_since(a.since, now, DAY_S, p)
     except ValueError as e:
         die(str(e))
     rep = waste.report(p.db, since, now, p.config())
@@ -2679,7 +2697,7 @@ def cmd_eta(a) -> None:
     if a.calibration:
         etaledger.refresh(p.db, p, now, force=True)
         cal = etaledger.calibration(p.db, now, etaledger.cfg(p), days=a.days)
-        sh = etaledger.shadow(p.db, now - a.days * 86400) if costlevers.lever_on(p, "eta_history") else None
+        sh = etaledger.shadow(p.db, now - a.days * DAY_S) if costlevers.lever_on(p, "eta_history") else None
         print(json.dumps({**cal, "factors": (p.db.kv(etaledger.KEY) or {}).get("factors", {}),
                           **({"shadow": sh} if sh else {})}, indent=1)
               if a.json else "\n".join([etaledger.line(cal)] + ([etaledger.shadow_line(sh)] if sh else [])))
@@ -2712,7 +2730,7 @@ def cmd_landings(a) -> None:
     if not p:
         die("no tt-project project here; name one: `ttp landings <name>`")
     now = time.time()
-    since = now - a.days * 86400
+    since = now - a.days * DAY_S
     if a.since:   # a date or time in this machine's zone, or an epoch
         try:
             since = float(a.since)
@@ -2721,7 +2739,7 @@ def cmd_landings(a) -> None:
                 since = _dt.datetime.fromisoformat(a.since).timestamp()
             except ValueError:
                 die(f"--from: not a date, time or epoch: {a.since}")
-        a.days = (now - since) / 86400
+        a.days = (now - since) / DAY_S
     rows = landings.landed(p.db, since, now)
     sm = landings.summary(rows, top=a.top)
     sm["push_batch_died"] = landings.push_batch_deaths(p.db, since)
@@ -2918,9 +2936,9 @@ def cmd_web(a) -> None:
         die(str(e))
     r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", "--", host, sshcmd.remote_cmd(entry, ["web", a.name])],
                        capture_output=True, text=True)
-    if r.returncode == 255:
+    if r.returncode == SSH_FAILED:
         _unreachable(entry, r.stderr)
-        sys.exit(255)
+        sys.exit(SSH_FAILED)
     m = weblink.LINK.search(r.stdout)
     if not m:
         die(f"could not read the web address from {host}: {(r.stderr or r.stdout).strip()[-200:]}")
@@ -2963,7 +2981,7 @@ def cmd_note(a) -> None:
     # Model-free completion commands get only note context, never a full worker context.
     run_dir = os.environ.get("TTP_RUN_DIR") or os.environ.get(NOTE_RUN_ENV)
     if getattr(a, "status", None) is not None:
-        return _note_status(a, run_dir)
+        return _cmd_note_status(a, run_dir)
     if a.text is None:
         die("ttp note: the note's text is required", 2)
     if not run_dir:
@@ -3259,7 +3277,7 @@ def _note_to(a, run_dir: str) -> None:
               f"reached; this run also tries to send it. Nothing to wait for: keep working")
 
 
-def _note_status(a, run_dir: str | None) -> None:
+def _cmd_note_status(a, run_dir: str | None) -> None:
     """`ttp note --status <id>`: where a `ttp note --to` note stands (upstream.note_status). Exit 0 once
     the project it is for read it, 1 while it is on its way, 2 when it cannot tell: a retry_when."""
     from . import upstream
@@ -3701,7 +3719,7 @@ def _covered_by(c, checks: list, py: str = "", top: str = ""):
 _NORECURSE = re.compile(r"\..+|_darcs|build|CVS|dist|node_modules|venv|\{arch\}|.+\.egg")
 
 
-def _pytest_args(key: str) -> list[str] | None:
+def _key_pytest_args(key: str) -> list[str] | None:
     """The words after `pytest` of a _same_run_key that is one plain pytest run, else None."""
     try:
         words = shlex.split(key)
@@ -3715,7 +3733,7 @@ def _wrapped_pytest_args(o, py: str = "", top: str = "") -> list[str] | None:
     (push._PYTEST_WRAPPED: `throttle.py -- shards.py -- .venv/bin/python -m pytest -q tests/`), without `-q`,
     when that run's program is one _same_run_key makes `pytest` or the venv python `py` (by its path in the
     worktree `top` or its main checkout), and its words are plain ones. None otherwise, and for a check that
-    says `"pytest": false`. Only for _within, whose drop stands only when that check runs in full."""
+    says `"pytest": false`. Only for _check_covering, whose drop stands only when that check runs in full."""
     from . import push
     if not isinstance(o, str) or getattr(o, "pytest", None) is False or push.pytest_runs(o) != 1:
         return None
@@ -3742,7 +3760,7 @@ def _wrapped_pytest_args(o, py: str = "", top: str = "") -> list[str] | None:
     return [x for x in rest if not _PYTEST_QUIET.fullmatch(x)]
 
 
-def _inside(path: str, root: str, top: str) -> bool:
+def _path_inside(path: str, root: str, top: str) -> bool:
     """Whether a pytest run given `root` (a directory or file of the worktree `top`) already runs every test
     of `path` (a file, a directory or a node id) given alone: it lies inside `root`, a file is named as
     pytest collects it by default (test_*.py, *_test.py) and no top-level config sets python_files, no
@@ -3776,12 +3794,12 @@ def _inside(path: str, root: str, top: str) -> bool:
     return True
 
 
-def _within(c, checks: list, py: str = "", top: str = ""):
+def _check_covering(c, checks: list, py: str = "", top: str = ""):
     """The first of `checks` (unscoped, one plain pytest run of named paths) whose run already runs every
     test of the extra command `c`: `c` is a plain pytest run with the same options (_same_run_key) and only
-    paths (files, directories or node ids) that lie inside that check's paths (_inside). None otherwise:
+    paths (files, directories or node ids) that lie inside that check's paths (_path_inside). None otherwise:
     any other option, a path outside, or a command that is not plain pytest stays."""
-    if not isinstance(c, str) or not top or (mine := _pytest_args(_same_run_key(c, py, top))) is None:
+    if not isinstance(c, str) or not top or (mine := _key_pytest_args(_same_run_key(c, py, top))) is None:
         return None
     flags, paths = sorted(w for w in mine if w.startswith("-")), [w for w in mine if not w.startswith("-")]
     if not paths or not set(flags) <= set(_TOP_FLAGS):
@@ -3789,7 +3807,7 @@ def _within(c, checks: list, py: str = "", top: str = ""):
     for o in checks:
         if getattr(o, "if_exists", "") or getattr(o, "if_changed", ()) or not _plain_check(o):
             continue
-        theirs = _pytest_args(_same_run_key(o, py, top))
+        theirs = _key_pytest_args(_same_run_key(o, py, top))
         if theirs is None:
             theirs = _wrapped_pytest_args(o, py, top)
             if theirs is not None and _top_flags_noop(top, [w for w in theirs if not w.startswith("-")]):
@@ -3798,7 +3816,7 @@ def _within(c, checks: list, py: str = "", top: str = ""):
             continue
         roots = [w for w in theirs if not w.startswith("-")]
         if roots and sorted(w for w in theirs if w.startswith("-")) == flags \
-                and all(any(_inside(w, r, top) for r in roots) for w in paths):
+                and all(any(_path_inside(w, r, top) for r in roots) for w in paths):
             return o
     return None
 
@@ -4135,7 +4153,7 @@ def _extra_checks(extra: list[str], own: list, py: str = "", top: str = "") -> t
     project's checks that runs on every head (no `if_exists`/`if_changed`), or as an earlier one
     here, is dropped: it would run twice (a pytest run in any spelling the venv `py` runs alike in
     the worktree `top`, _same_run_key), and so is a plain pytest run of paths inside such a check's
-    (_within: `pytest -q tests/a.py` after `pytest -q tests`), so the run keeps that check set's
+    (_check_covering: `pytest -q tests/a.py` after `pytest -q tests`), so the run keeps that check set's
     command hash and can reuse or share its pass; cmd_checks runs it after all when that check does
     not run in full there (_held_extras). One that
     only a scoped check matches stays, as that check may be skipped on this head (_ran_again drops
@@ -4150,7 +4168,7 @@ def _extra_checks(extra: list[str], own: list, py: str = "", top: str = "") -> t
     mine, dropped = [], []
     for c in given:
         key = _same_run_key(c, py, top)
-        (dropped if key in seen or _within(c, own, py, top) is not None else mine).append(c)
+        (dropped if key in seen or _check_covering(c, own, py, top) is not None else mine).append(c)
         seen.add(key)
     return mine, dropped
 
@@ -4158,14 +4176,14 @@ def _extra_checks(extra: list[str], own: list, py: str = "", top: str = "") -> t
 def _held_extras(held: list, own: list, py: str, top: str, source: str, todo: list,
                  passed_full: list) -> tuple[list, list[str]]:
     """(the held extras to run after all, the notice lines). `held` pairs each extra dropped as inside a
-    project check's paths (_within) with its command as this run would run it. It stands only when that
+    project check's paths (_check_covering) with its command as this run would run it. It stands only when that
     check runs (or passed) in full on this tree: in `todo` (or its recorded pass) not narrowed by testpick,
     or in `passed_full` (the push queue's pass). A narrowed check (testpick) or one the fast path skipped
     may leave out its tests, so it runs."""
     full = {str(c) for c in passed_full} | {str(c) for c in todo if not getattr(c, "targeted", False)}
     more, lines = [], []
     for c, cmd in held:
-        o = _within(c, own, py, top)
+        o = _check_covering(c, own, py, top)
         if str(o) in full:
             lines.append(f"not running {c!r} after `--`: {source} already runs its tests in {str(o)!r}")
         else:
@@ -4389,7 +4407,7 @@ def _cmd_checks(a) -> None:
     if cyc := hostcycle.hold(p):   # a planned cycle of this host would cut them short
         print(f"ttp checks: not started, {hostcycle.hold_line(cyc, p)}. Commit and hand off `waiting` with a "
               "`retry_when` that exits 0 once this host is back, and run them after the cycle", file=sys.stderr)
-        sys.exit(75)
+        sys.exit(EX_BUSY)
     purpose = getattr(a, "purpose", None) or "candidate"
     if a.full and purpose == "candidate" and not getattr(a, "release", False):
         from . import testpick   # a release run (the release cut's required suite) always runs in full
@@ -4475,7 +4493,7 @@ def _cmd_checks(a) -> None:
         envfault.write_marker(run_dir, fault)
         print(f"ttp checks: {envfault.line(fault)}. Hand off `waiting`; retry_when: "
               f"{envfault.retry_when(p, fault)}", file=sys.stderr)
-        sys.exit(75)
+        sys.exit(EX_BUSY)
     print(f"ttp checks: {runnerenv.describe(pyenv)}", flush=True)
     venv_vars = {}
     if p and not os.environ.get("VIRTUAL_ENV") and (pv := worktree.project_venv(p, top)):
@@ -4483,11 +4501,11 @@ def _cmd_checks(a) -> None:
     # The python a bare pytest runs with (push.venv_cmd): an extra spelled with it runs the same tests.
     vpy = str(push.venv_python(top, {**os.environ, **venv_vars}) or "")
     mine, dropped = _extra_checks(a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd, own, vpy, top)
-    # An extra dropped as inside a project check's paths (_within) is held, ready to run: it stands only
+    # An extra dropped as inside a project check's paths (_check_covering) is held, ready to run: it stands only
     # when that check runs in full here, never when testpick narrows it or the fast path skips it.
     held_at = {}   # each held run's key: its first place in `dropped`
     for i, c in enumerate(dropped):
-        if _covered_by(c, own, vpy, top) is None and _within(c, own, vpy, top) is not None:
+        if _covered_by(c, own, vpy, top) is None and _check_covering(c, own, vpy, top) is not None:
             held_at.setdefault(_same_run_key(c, vpy, top), i)
     held_s = [dropped[i] for i in held_at.values()]
     mine = push.with_host(mine + held_s, checks_host)
@@ -4768,7 +4786,7 @@ def _cmd_checks(a) -> None:
                                                              "commands": todo, "skipped": skipped, "ts": time.time(),
                                                              "purpose": purpose, "env_fault": fault["sig"]})
             print(f"ttp checks: {said}", file=sys.stderr)
-            sys.exit(75)
+            sys.exit(EX_BUSY)
         if p:
             envfault.recheck(p)   # a runner back: its open fault closes
         arrived = _checks_arrived()
@@ -5016,7 +5034,7 @@ def _cmd_checks(a) -> None:
                         rc = run_once()
                         # The wrapper's lock refused it as paused: it and the other wrapped commands run on
                         # checks.fallback_lane once, never on the paused resource (a paused fallback waits).
-                        if (rc == 75 and fallback[0] and not fallback[2] and not fell_back and str(c) in wrapped
+                        if (rc == EX_BUSY and fallback[0] and not fallback[2] and not fell_back and str(c) in wrapped
                                 and (on := _pause_hold(_log_since(out, log, check_start)))):
                             fell_back = {"lane": fallback[0], "paused": on,
                                          "commands": push.to_fallback(todo[len(executed) - 1:], wrapped, fallback[1],
@@ -5033,7 +5051,7 @@ def _cmd_checks(a) -> None:
                             continue
                         # Failed before any test ran (its work dir gone, a bad archive, no free pool slot):
                         # again up to setupfault.RERUNS times, a starved pool not at all (setupfault).
-                        if (rc not in (0, 75) and not push.remote_host(c)
+                        if (rc not in (0, EX_BUSY) and not push.remote_host(c)
                                 and (fault := setupfault.found(setupfault.scan(_log_since(out, log, check_start)), cwd))):
                             if fault["kind"] == "pool" or setup_reruns >= setupfault.RERUNS:
                                 setup = {"check": str(c), **fault}
@@ -5280,7 +5298,7 @@ def _cmd_checks(a) -> None:
                 # Its tree copy timed out: that host is kept off now, never a second full timeout there.
                 from . import remotecheck
                 slow = rc == remotecheck.FAULT_RC and not env_why and remotecheck.COPY_TIMEOUT in ran_out
-            if rc == 75 and not timed_out:   # its spill wrapper refused it or is missing: status names it (a limit line)
+            if rc == EX_BUSY and not timed_out:   # its spill wrapper refused it or is missing: status names it (a limit line)
                 from . import checklane, checkspill, remotecheck
                 if (wrapped := remotecheck.wrap_fault(ran_out))[1]:   # every host refusing alike: one event (wrap_refused)
                     checkspill.wrap_refused(p, wrapped[0] or spilled.host, wrapped[1], checklane.scope_text(todo)[:300],
@@ -5288,7 +5306,7 @@ def _cmd_checks(a) -> None:
             env_cfg = p.config() if env_why and not real else None
             key = _commands_hash(todo)
             spent = bool(env_cfg) and checkspill.env_rerun_spent(checkspill.fails(p.state, head, key), env_cfg)
-            if not timed_out and rc != 75:   # a host fault or timeout is the host's: never this head's record
+            if not timed_out and rc != EX_BUSY:   # a host fault or timeout is the host's: never this head's record
                 from . import sharedchecks
                 ids = sharedchecks.failing_ids(ran_out)[0]
                 checkspill.fail_add(p.state, head, key, spilled.host,
@@ -5310,19 +5328,19 @@ def _cmd_checks(a) -> None:
                 out.flush()
                 print(f"ttp checks: {said}", flush=True)
             else:
-                no_spill = checkspill.spill_off_add(no_spill, spilled.host, rc == 75 and not timed_out,
+                no_spill = checkspill.spill_off_add(no_spill, spilled.host, rc == EX_BUSY and not timed_out,
                                                     env_cfg, cfg=p.config(), slow=slow, hang=hang)
                 if slow:
                     how += f": {remotecheck.COPY_TIMEOUT}, so that host is kept off this run"
                 if env_why:
                     checkspill.env_event(p.db, no_spill, env_cfg)
-                elif executed and not timed_out and rc != 75:   # a strike there if the head then passes elsewhere
+                elif executed and not timed_out and rc != EX_BUSY:   # a strike there if the head then passes elsewhere
                     out.flush()
-                    checkspill.strike_fail(p, spilled.host, head, remotecheck.fail_sig(_log_tail(log), rc))
+                    checkspill.strike_fail(p, spilled.host, head, remotecheck.fail_sig(_checks_log_tail(log), rc))
                 # Tests that failed there (no host fault, timeout or env fault) run once more, only here, and that
                 # result counts: never on from spill host to spill host. A workstation, which runs nothing here
                 # while a host is busy, takes the verdict of FAIL_VERDICT_HOSTS hosts instead (_spill_fail_verdict).
-                here_only = (bool(executed) and not timed_out and rc != 75 and not env_why and not slow
+                here_only = (bool(executed) and not timed_out and rc != EX_BUSY and not env_why and not slow
                              and not checkspill.remote_only(p.config()))
                 if here_only:
                     no_spill = "1"
@@ -5333,7 +5351,7 @@ def _cmd_checks(a) -> None:
                         + "); running them again on this machine, whose result counts, or on a free spill host "
                         + (("they did not fail on" + (f" (that one again once the checks config changes or in "
                             f"{checkspill.FAULT_RETRY_S // 60} min: the host's own fault ended them there)"
-                            if rc == 75 and not timed_out and not slow else ""))
+                            if rc == EX_BUSY and not timed_out and not slow else ""))
                            if spilled.host in checkspill.kept_off(no_spill, p.config())
                            else "(that one again once free: the fault was the host's)" if not env_why
                            else "(once: an import failure runs again once per head)"))
@@ -5357,7 +5375,7 @@ def _cmd_checks(a) -> None:
                                                              "commands": todo, "skipped": skipped, "ts": time.time(),
                                                              "purpose": purpose, "killed": tree_gone})
             print(f"ttp checks: {tree_gone}", file=sys.stderr)
-            raise ChecksKilled(75)
+            raise ChecksKilled(EX_BUSY)
         # Test workers lost again on the rerun: the host, never a failure of the change (workerloss).
         if worker_loss is None:
             workerloss.clear(run_dir)
@@ -5370,7 +5388,7 @@ def _cmd_checks(a) -> None:
                                                              "commands": todo, "skipped": skipped, "ts": time.time(),
                                                              "purpose": purpose, "infra_fault": "test-worker-lost"})
             print(f"ttp checks: {said}", file=sys.stderr)
-            sys.exit(75)
+            sys.exit(EX_BUSY)
         # A script outside the change rewritten in place as the check ran it, again on the rerun: no verdict.
         if torn is not None and not passed and not _CHECK_STOP.get("stopped"):
             said = f"{syntaxfault.line(torn['scripts'], torn['check'])}. Run the checks again later; the change is neither passed nor failed"
@@ -5379,7 +5397,7 @@ def _cmd_checks(a) -> None:
                                                              "commands": todo, "skipped": skipped, "ts": time.time(),
                                                              "purpose": purpose, "infra_fault": syntaxfault.INFRA})
             print(f"ttp checks: {said}", file=sys.stderr)
-            sys.exit(75)
+            sys.exit(EX_BUSY)
         # Failed before any test ran, again on its reruns (or no free pool slot): no verdict (setupfault).
         if setup is not None and not passed and not _CHECK_STOP.get("stopped"):
             said = f"{setupfault.line(setup, setup['check'])}. Run the checks again later"
@@ -5388,7 +5406,7 @@ def _cmd_checks(a) -> None:
                                                              "commands": todo, "skipped": skipped, "ts": time.time(),
                                                              "purpose": purpose, "infra_fault": setupfault.INFRA})
             print(f"ttp checks: {said}", file=sys.stderr)
-            sys.exit(75)
+            sys.exit(EX_BUSY)
         # Behind checks.wrap_cmd, stopped at the wall-time cap before any test started: no verdict (checkwall).
         if timed_out and timed_out.get("queued") and not passed and not _CHECK_STOP.get("stopped"):
             said = checkwall.said_for(timed_out)
@@ -5397,7 +5415,7 @@ def _cmd_checks(a) -> None:
                                                              "purpose": purpose, "timed_out": timed_out,
                                                              "infra_fault": checkwall.QUEUED_INFRA})
             print(f"ttp checks: {said} (full output: {log})", file=sys.stderr)
-            sys.exit(75)
+            sys.exit(EX_BUSY)
         # The gate's rerun found no slot (an admission timeout): no verdict, never a failure of the head.
         if gate_busy is not None and not passed and not _CHECK_STOP.get("stopped"):
             said = (f"{failed!r}: the tests gate could not judge {', '.join(gate_busy['busy'])}: their rerun found no "
@@ -5408,7 +5426,7 @@ def _cmd_checks(a) -> None:
                                                              "commands": todo, "skipped": skipped, "ts": time.time(),
                                                              "purpose": purpose, "infra_fault": "gate-rerun-busy"})
             print(f"ttp checks: {said}", file=sys.stderr)
-            sys.exit(75)
+            sys.exit(EX_BUSY)
         # A check host ssh could not reach (or that could not take the tree) is the environment, as a
         # missing runner is: wait for it, counting nothing against the change (envfault).
         if not passed and (fault := push.remote_fault(failed, rc, top, _log_since(out, log, check_start))):
@@ -5421,11 +5439,11 @@ def _cmd_checks(a) -> None:
                                                              "purpose": purpose, "env_fault": fault["sig"],
                                                              "hosts": push.hosts_of(todo)})
             print(f"ttp checks: {said}", file=sys.stderr)
-            sys.exit(75)
+            sys.exit(EX_BUSY)
         # The wrapper's lock refused it as paused (`ttp lock`: "held by pause on <resource>"): the pause, never
         # a failure of the change nor a busy lock; it says so and what to wait on.
         # With checks.fallback_lane paused too (or unable to serve), the wait names both; it never fails.
-        if not passed and rc == 75 and str(failed) in wrapped and (held := _pause_hold(_log_since(out, log, check_start))):
+        if not passed and rc == EX_BUSY and str(failed) in wrapped and (held := _pause_hold(_log_since(out, log, check_start))):
             first = fell_back.get("paused") or held
             also_on = (f"; {push.FALLBACK_KEY} {fallback[0]!r} is paused too (held by pause on {held})" if fell_back
                        else f"; {push.FALLBACK_KEY} {fallback[0]!r} cannot serve: {fallback[2]}" if fallback[0] else "")
@@ -5441,7 +5459,7 @@ def _cmd_checks(a) -> None:
                                                                     "lane": fallback[0], "problem": fallback[2]}}
                                                                 if fallback[0] else {})})
             print(f"ttp checks: {said}", file=sys.stderr)
-            sys.exit(75)
+            sys.exit(EX_BUSY)
     if handover and temp:
         die(f"{checktree.temp_refusal(top, temp, run_dir)} (with --detach: every checks slot stayed busy)")
     if handover:
@@ -5452,7 +5470,7 @@ def _cmd_checks(a) -> None:
         # Told only once they were started: a failed start says so, never that they run.
         append_text(log, f"ttp checks: {CHECKS_HANDOVER}\n", p)
         print(f"ttp checks: {CHECKS_HANDOVER}", flush=True)
-        sys.exit(75)
+        sys.exit(EX_BUSY)
     env_problem, also, not_executed = None, False, []
     # The checks that ran (or whose recorded pass came) from this worktree, not a clean checkout.
     in_authoring = [str(c) for c in todo if cleantree.authoring(c) and not push.remote_host(c)]
@@ -6405,7 +6423,7 @@ def _spill_fail_verdict(spilled, passed, executed, timed_out, rc, failed, todo, 
     timed out, the host's own fault (exit 75), its env (push.env_problem), stopped, a check split off to run here,
     or not a workstation."""
     from . import checkspill, push
-    if not spilled or passed or not executed or timed_out or rc == 75 or _CHECK_STOP.get("stopped") \
+    if not spilled or passed or not executed or timed_out or rc == EX_BUSY or _CHECK_STOP.get("stopped") \
             or (failed in todo and not getattr(failed, "spill_host", "")) or not checkspill.remote_only(p.config()):
         return []
     hosts = checkspill.fail_hosts(checkspill.spill_off_add(no_spill, spilled.host, False))
@@ -6498,8 +6516,8 @@ class _HeadMoved:
     def __init__(self, top: str, head: str):
         self.top, self.head, self.at = top, head, 0.0
         self.ref, self.queued = "", None   # queued: a _QueuedHead asked first
-        if top and head and _git_out(top, "rev-parse", "HEAD") == head:
-            self.ref = _git_out(top, "symbolic-ref", "-q", "HEAD")
+        if top and head and _git_or_empty(top, "rev-parse", "HEAD") == head:
+            self.ref = _git_or_empty(top, "symbolic-ref", "-q", "HEAD")
 
     def __call__(self) -> str:
         if self.queued and (why := self.queued()):
@@ -6507,7 +6525,7 @@ class _HeadMoved:
         if not self.ref or time.time() - self.at < self.HEAD_MOVED_S:
             return ""
         self.at = time.time()
-        tip = _git_out(self.top, "rev-parse", "-q", "--verify", self.ref)
+        tip = _git_or_empty(self.top, "rev-parse", "-q", "--verify", self.ref)
         if not tip or tip == self.head:
             return ""
         return (f"its task replaced head {self.head[:12]} with {tip[:12]} on {self.ref.removeprefix('refs/heads/')} "
@@ -6543,7 +6561,7 @@ class _TaskEnded:
         return f"task #{self.task} ended ({t['status']})"
 
 
-def _git_out(top: str, *args: str) -> str:
+def _git_or_empty(top: str, *args: str) -> str:
     try:
         return _git(Path(top), *args)
     except (OSError, subprocess.SubprocessError):
@@ -7009,7 +7027,7 @@ def _checks_forwarded(_sig, frame) -> None:
         sig = _CHECK_NAMER["queue"].pop(0)
         handler = signal.getsignal(sig)
         if not callable(handler):
-            raise SystemExit(128 + sig)
+            raise SystemExit(SIGNAL_RC_BASE + sig)
         handler(sig, frame)
 
 
@@ -7128,11 +7146,22 @@ def _checks_slot_told(out):
 
 def _checks_stop(sig, _frame):
     """The detached checks' stop handler: exit 128+sig, deferred while a check starts or is ended."""
-    _CHECK_STOP["stopped"] = _CHECK_STOP["stopped"] or 128 + sig
+    _CHECK_STOP["stopped"] = _CHECK_STOP["stopped"] or SIGNAL_RC_BASE + sig
     if _CHECK_STOP["defer"]:
-        _CHECK_STOP["pending"] = 128 + sig
+        _CHECK_STOP["pending"] = SIGNAL_RC_BASE + sig
         return
-    raise SystemExit(128 + sig)
+    raise SystemExit(SIGNAL_RC_BASE + sig)
+
+
+def _checks_quarantine(p: Project, cfg: dict, v: dict, c, head: str, now: float, days) -> None:
+    """Quarantine a verdict's flaky tests (those not already fixed since) and file the new ones."""
+    from . import budget as bud, gatejudge, pushq
+    seen = {"head": head, "check": str(c), "host": v["host"], "task": os.environ.get("TTP_TASK") or ""}
+    new = gatejudge.quarantine(p.state, [i for i in v["flaky"] if i not in gatejudge.before_fix(p, v["flaky"], head)],
+                               seen, now, days)
+    if new:   # into the day's deflake task of each module, model-free: a feed line, no coordinator turn
+        tasks = gatejudge.deflake(p.db, new, seen, now, p, bud.task_default_usd(cfg, "standard"))
+        pushq._event(p.db, None, gatejudge.EVENT, gatejudge.note_text(new, head, str(c), tasks), queued=False)
 
 
 def _checks_judge(a, p: Project | None, c, rc: int, output: str, cwd: str, env: dict, head: str, base: str,
@@ -7145,7 +7174,7 @@ def _checks_judge(a, p: Project | None, c, rc: int, output: str, cwd: str, env: 
     new (gatejudge.proven) is appended to `proven` and saved for the head's tree (gatejudge.save_new); one
     the reruns could not tell leaves the failure as it was. Never for a release check
     (`--release`), a harness run or a command that is not one plain pytest run."""
-    from . import cleantree, gatejudge, push, pushpass, pushq, worktree
+    from . import cleantree, gatejudge, push, pushpass, worktree
     if not p or getattr(a, "release", False) or getattr(a, "purpose", None) not in (None, "candidate") \
             or not pushpass.resumable(c):
         return None
@@ -7199,13 +7228,7 @@ def _checks_judge(a, p: Project | None, c, rc: int, output: str, cwd: str, env: 
         print(f"ttp checks: {line}", flush=True)
         out.write(f"ttp checks: {line}\n")
     if v["flaky"]:
-        seen = {"head": head, "check": str(c), "host": v["host"], "task": os.environ.get("TTP_TASK") or ""}
-        new = gatejudge.quarantine(p.state, [i for i in v["flaky"] if i not in gatejudge.before_fix(p, v["flaky"], head)],
-                                   seen, now, s["days"])
-        if new:   # into the day's deflake task of each module, model-free: a feed line, no coordinator turn
-            from . import budget as bud
-            tasks = gatejudge.deflake(p.db, new, seen, now, p, bud.task_default_usd(cfg, "standard"))
-            pushq._event(p.db, None, gatejudge.EVENT, gatejudge.note_text(new, head, str(c), tasks), queued=False)
+        _checks_quarantine(p, cfg, v, c, head, now, s["days"])
     if gatejudge.blocks(v):
         if not gatejudge.proven(v):
             return None
@@ -7517,7 +7540,7 @@ def _checks_detach(a, run_dir: Path, p: Project | None, top: str = "", head: str
         # purpose's checks would lose them without a word. Wait for them instead.
         print(f"retry_when: {push._own_ttp(p)} checks --result {shlex.quote(str(run_dir))}")
         die(f"ttp checks: not started: this run's detached checks for {owner} still own {run_dir} "
-            "(exit 75): hand off waiting with the retry_when above, then run these checks again", 75)
+            "(exit 75): hand off waiting with the retry_when above, then run these checks again", EX_BUSY)
     env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1]))
     if arrived is not None:
         env[checkcap.ARRIVED_ENV] = repr(arrived)
@@ -7724,7 +7747,7 @@ def _checks_child(a) -> int:
         code = "killed"   # the probe answers and the waits run them again, no failed attempt counted
     except SystemExit as e:
         code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
-        if code > 128:
+        if code > SIGNAL_RC_BASE:
             append_text(rc_file.parent / "checks.log", f"ttp checks: stopped by signal {code - 128}\n")
     finally:
         stopped = _CHECK_STOP["stopped"]
@@ -8046,7 +8069,7 @@ def cmd_pool_wait(a) -> None:
         rc = 130
     finally:
         checkwait.end(token)
-    sys.exit(128 - rc if rc < 0 else rc)
+    sys.exit(SIGNAL_RC_BASE - rc if rc < 0 else rc)
 
 
 def cmd_pool_admit(a) -> None:
@@ -8225,7 +8248,7 @@ def _since_s(v: str) -> float:
     m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([smhd]?)\s*", str(v))
     if not m or float(m.group(1)) <= 0:
         die(f"--since: give a duration such as 24h, 90m or 2d, not {v!r}")
-    return float(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+    return float(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": HOUR_S, "d": DAY_S}[m.group(2)]
 
 
 def cmd_model_trip(a) -> None:
@@ -8308,9 +8331,9 @@ def cmd_hours(a) -> None:
         die("ttp hours: no project here (run it in a project or its run)")
     now = time.time()
     try:
-        times = hours.user_times(p.state / "project.db", now - a.days * 86400)
+        times = hours.user_times(p.state / "project.db", now - a.days * DAY_S)
     except sqlite3.Error as e:
-        die(f"ttp hours: cannot read the project's messages ({e})", 75)
+        die(f"ttp hours: cannot read the project's messages ({e})", EX_BUSY)
     r = hours.assess(times, timefmt.home(p), now=now, need_s=a.need)
     lines = [hours.describe(r, now)]
     ok = r["ok"]
@@ -8318,7 +8341,7 @@ def cmd_hours(a) -> None:
         try:
             last = hours.last_user_time(p.state / "project.db")
         except sqlite3.Error as e:
-            die(f"ttp hours: cannot read the project's messages ({e})", 75)
+            die(f"ttp hours: cannot read the project's messages ({e})", EX_BUSY)
         pr = hours.presence(last, r["zone"], a.present, now)
         ok = ok and pr["ok"]
         # Absent: the line that matters is when they last wrote (the window's "start now" would mislead).
@@ -8418,7 +8441,7 @@ def cmd_said(a) -> None:
             die("ttp said: no project here (run it in a project or its run)")
         targets = [p]
     where = p or (_foreign_view(targets[0])[1] if targets else None)
-    since = time.time() - a.days * 86400 if a.days else 0.0
+    since = time.time() - a.days * DAY_S if a.days else 0.0
     found = []
     for t in targets:
         name = t.name if _is_here(t) else _foreign_view(t)[0]
@@ -8426,7 +8449,7 @@ def cmd_said(a) -> None:
             found += [{**m, "project": name} for m in _said_in(t, " ".join(a.words), a.limit, since, a.notes)]
         except sqlite3.Error as e:
             if len(targets) == 1:
-                die(f"ttp said: cannot read {name}'s messages ({e})", 75)
+                die(f"ttp said: cannot read {name}'s messages ({e})", EX_BUSY)
             print(f"ttp said: skipped {name}: cannot read its messages ({e})", file=sys.stderr)
     found = sorted(found, key=lambda m: -m["ts"])[:a.limit]
     labelled = bool(a.project or a.all_projects)
@@ -8459,7 +8482,7 @@ def cmd_checks_shard(a) -> None:
         die(f"ttp checks-shard: {e}")
     except OSError as e:
         die(f"ttp checks-shard: could not start {cmd[0]!r}: {e}")
-    sys.exit(128 - rc if rc < 0 else rc)
+    sys.exit(SIGNAL_RC_BASE - rc if rc < 0 else rc)
 
 
 def cmd_checks_yield(a) -> None:
@@ -8672,12 +8695,12 @@ def _machine_lock_answer(resource: str, shared_mode: bool, as_json: bool = False
     held = shared.read_pause(resource) or (fleethold.entry(hold) if hold else None)
     if held is not None:
         said = f"{resource}: paused" + (f" ({held['reason']})" if held.get("reason") else "")
-        return 75, lockprobe.report(resource, said, False, paused=held) if as_json else said
+        return EX_BUSY, lockprobe.report(resource, said, False, paused=held) if as_json else said
     where = shared.root() / resource
     paths = lk.slot_paths(where, resource, shared.machine_slots(resource))
     free = lk.probe(where, resource, paths, shared=shared_mode and not resource.endswith("-device"))
     said = lockprobe.line(resource, free, where, resource, paths)
-    return (0 if free else 75), lockprobe.report(resource, said, free, where, resource, paths) if as_json else said
+    return (0 if free else EX_BUSY), lockprobe.report(resource, said, free, where, resource, paths) if as_json else said
 
 
 def _probe_machine_lock(resource: str, shared_mode: bool, as_json: bool = False) -> None:
@@ -8701,7 +8724,7 @@ def _lock_answers(a, answers: list[tuple[str, int, str | dict]]) -> None:
         for _, _, said in answers:
             print(said)
     rcs = {rc for _, rc, _ in answers}
-    sys.exit(75 if 75 in rcs else LOCK_NA if LOCK_NA in rcs else 0)
+    sys.exit(EX_BUSY if EX_BUSY in rcs else LOCK_NA if LOCK_NA in rcs else 0)
 
 
 def _urgent_priority(p, task: str) -> int | None:
@@ -8740,7 +8763,7 @@ def _lock_alternative(p, cfg: dict, names: list[str], a) -> str:
     if not live:
         said = "; ".join(f"{x}" + (f" ({h['reason']})" if h.get("reason") else "") for x, h in paused.items())
         die(f"held by pause on {', '.join(paused)}: every alternative is paused ({said}); hand the task back as "
-            f"waiting until one is resumed (retry_when: ttp lock --probe {shlex.quote(names[0])})", 75)
+            f"waiting until one is resumed (retry_when: ttp lock --probe {shlex.quote(names[0])})", EX_BUSY)
     pick = next((x for x in live if lockprobe.answer(p, cfg, x, bool(getattr(a, "shared", False)))[0] == 0), live[0])
     if paused:
         print(f"ttp lock: {', '.join(paused)} paused; taking {pick}", file=sys.stderr, flush=True)
@@ -8824,7 +8847,7 @@ def cmd_occupancy(a) -> None:
     if also:
         res = {**res, "blocks": True, "why": also}
     print(json.dumps(res, indent=1, sort_keys=True) if a.json else (also or occupancy.text(res)))
-    sys.exit(75 if res["blocks"] else 0)
+    sys.exit(EX_BUSY if res["blocks"] else 0)
 
 
 def _lock_step(a) -> str:
@@ -8935,11 +8958,11 @@ def cmd_lock(a) -> None:
                     _end_wait()
                 why = f" ({held['reason']})" if held.get("reason") else ""
                 die(f"held by pause on {L['name']}: {L['name']} is paused{why}; hand the task back as waiting "
-                    "until it is resumed", 75)
+                    "until it is resumed", EX_BUSY)
         if held_by := _ordered():
             if waiting:
                 _end_wait()
-            die(f"refused: {held_by[1]}", 75)
+            die(f"refused: {held_by[1]}", EX_BUSY)
 
     detached = bool(os.environ.get("TTP_DETACHED"))
     run_dir = Path(os.environ["TTP_RUN_DIR"]) if os.environ.get("TTP_RUN_DIR") else None
@@ -8974,7 +8997,7 @@ def cmd_lock(a) -> None:
             if waiting:
                 _end_wait()
             die(f"{got['why']}; waited {got['waited_s']:.0f} s. Hand the task back now: result.json status "
-                f"`waiting`, retry_when `ttp lock --probe {' '.join(L['name'] for L in todo)}`", 75)
+                f"`waiting`, retry_when `ttp lock --probe {' '.join(L['name'] for L in todo)}`", EX_BUSY)
 
     from . import shared
     cfg = p.config()
@@ -9007,13 +9030,13 @@ def cmd_lock(a) -> None:
         if a.probe:
             print(json.dumps({"name": held_by[0][0], "free": False, "line": held_by[1], "user_order": held_by[0][2]})
                   if a.json else held_by[1])
-            sys.exit(75)
-        die(f"refused: {held_by[1]}", 75)
+            sys.exit(EX_BUSY)
+        die(f"refused: {held_by[1]}", EX_BUSY)
     if live := _occupied():
         if a.probe:
             print(json.dumps({"name": todo[0]["name"], "free": False, "line": live, "occupancy": True})
                   if a.json else live)
-            sys.exit(75)
+            sys.exit(EX_BUSY)
         _wait_occupied()
 
     def _unwritable(e: OSError, L: dict) -> None:
@@ -9056,7 +9079,7 @@ def cmd_lock(a) -> None:
             got = pregrant.check(check, p.root, name, ptask, p.state, pregrant.timeout_s(cfg))
             if got.granted:
                 return rc, said
-            return 75, ({**said, "free": False, "line": got.line, "pre_grant": got.line} if a.json else got.line)
+            return EX_BUSY, ({**said, "free": False, "line": got.line, "pre_grant": got.line} if a.json else got.line)
         if len(names) == 1:
             rc, said = _answer(names[0])
             print(json.dumps(said) if a.json else said)
@@ -9145,7 +9168,7 @@ def cmd_lock(a) -> None:
                         f"`ttp lock --probe {what}{f' --task {own}' if own.strip() else ''}`")
         return None
     if check and (why := _pre_grant_refusal()):
-        die(why, 75)   # asked before queueing, so nothing waits on a held lock
+        die(why, EX_BUSY)   # asked before queueing, so nothing waits on a held lock
     # A waiter that holds locks already never waits behind one for several resources at once: that one
     # may wait for a lock this waiter's holder has, and neither would ever go on.
     past_multi = bool(held_locks or shared_locks or whole)
@@ -9275,7 +9298,7 @@ def cmd_lock(a) -> None:
             for t in tickets:
                 lk.dequeue(t)
             tickets.clear()
-            die(why, 75)
+            die(why, EX_BUSY)
         if fs:
             _end_wait()
             for t in tickets:
@@ -9338,7 +9361,7 @@ def cmd_lock(a) -> None:
             sys.exit(_logged("shared" if a.shared else "lock", todo, _wait))
         if any(lk.dropped(t) for t in tickets):   # its run ended: a reader took its place out of the queue
             _end_wait()
-            die(f"the run this waited for has ended, so its place in the queue for {what} was dropped", 75)
+            die(f"the run this waited for has ended, so its place in the queue for {what} was dropped", EX_BUSY)
         if check_wait is None:
             check_wait = checkwait.begin(f"ttp lock {what}") or ()
         if wait_dir and not waiting:
@@ -9347,7 +9370,7 @@ def cmd_lock(a) -> None:
             lk.record_wait(wait_dir, wait_key, started, None, [L["res"] for L in todo])
             waiting = True
             for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-                signal.signal(sig, lambda signum, _f: (_end_wait(), sys.exit(128 + signum)))
+                signal.signal(sig, lambda signum, _f: (_end_wait(), sys.exit(SIGNAL_RC_BASE + signum)))
         if capped and timeout and time.time() - started > timeout and not lk.in_run(run_dir):
             # A driver started in the background (`nohup ... &`) outlives the run: the run's cap is not its own,
             # and its wait is no longer the run's.
@@ -9380,7 +9403,7 @@ def cmd_lock(a) -> None:
             _end_wait()
             die(f"{what} stayed busy for {timeout:.0f} s. Hand the task back now: result.json status "
                 f"`waiting`, waiting_for `{what}`, retry_when "
-                f"`ttp lock --probe{' --shared' if a.shared else ''} {what}`", 75)
+                f"`ttp lock --probe{' --shared' if a.shared else ''} {what}`", EX_BUSY)
         # Each try also reaps what keeps a lock whose holder is dead (lockreap: the daemon does it too).
         try:
             got = reaper.sweep([x for L, _by in blocked for x in L.get("paths") or []])
@@ -9798,6 +9821,17 @@ def _server_opts(p, conf: dict) -> dict:
     return o
 
 
+def _bench_day_lock(day: str, a, conf: dict):
+    """This host's lock on `day`'s bench run (the caller keeps it while it runs) and the per-cell options."""
+    from . import benchdaily
+    held = benchdaily.lock(day)
+    if held is None:
+        die(f"bench daily: a run for {day} is already running on this host")
+    opts = {k: v for k, v in (("budget_usd", a.cell_budget or conf.get("cell_budget_usd")),
+                              ("timeout_s", conf.get("timeout_s"))) if v}
+    return held, opts
+
+
 def _bench_daily(p, a) -> None:
     """`ttp bench daily [--day YYYY-MM-DD] [--cap-usd N]`: the day's landed code tasks from every project on
     this host through Sonnet, Opus and an open model, blind-reviewed, into the running table (benchdaily.py).
@@ -9815,11 +9849,7 @@ def _bench_daily(p, a) -> None:
     cap = a.cap_usd if a.cap_usd is not None else float(conf.get("cap_usd", benchdaily.CAP_USD) or 0)
     cells = {p: max(1, int((conf.get("cells") or {}).get(p) or 0)) for p in ("claude", "glm") if (conf.get("cells") or {}).get(p)}
     if a.fix_round:   # in this shell: one fix run per cell the day's first review did not land, then a blind regrade
-        held = benchdaily.lock(day)
-        if held is None:
-            die(f"bench daily: a run for {day} is already running on this host")
-        opts = {k: v for k, v in (("budget_usd", a.cell_budget or conf.get("cell_budget_usd")),
-                                  ("timeout_s", conf.get("timeout_s"))) if v}
+        held, opts = _bench_day_lock(day, a, conf)
         bconf = p.config().get("bench") or {}
         try:
             rec = benchdaily.fix_day(day, cfg=p.config(), opts={**opts, **_server_opts(p, bconf)})
@@ -9831,11 +9861,7 @@ def _bench_daily(p, a) -> None:
               f"{sum(1 for c in cells if c['landed_fixed'])}/{len(cells)}; table {benchdaily.home() / 'table.md'}")
         return
     if a.rerun_stops:   # in this shell: it waits for a healthy server and runs one cell at a time
-        held = benchdaily.lock(day)
-        if held is None:
-            die(f"bench daily: a run for {day} is already running on this host")
-        opts = {k: v for k, v in (("budget_usd", a.cell_budget or conf.get("cell_budget_usd")),
-                                  ("timeout_s", conf.get("timeout_s"))) if v}
+        held, opts = _bench_day_lock(day, a, conf)
         if not a.arm_name:
             die("bench daily --rerun-stops: name the arm(s) with --arm-name")
         bconf = p.config().get("bench") or {}
@@ -9863,11 +9889,7 @@ def _bench_daily(p, a) -> None:
         for line in benchdaily.wait_skips(day, wait_s=float(conf.get("pick_wait_s", benchdaily.PICK_WAIT_S))):
             print(line)
         return
-    held = benchdaily.lock(day)
-    if held is None:
-        die(f"bench daily: a run for {day} is already running on this host")
-    opts = {k: v for k, v in (("budget_usd", a.cell_budget or conf.get("cell_budget_usd")),
-                              ("timeout_s", conf.get("timeout_s"))) if v}
+    held, opts = _bench_day_lock(day, a, conf)
     try:
         rec = benchdaily.run_day(day, start, end, arms, p.config(), cap=cap,
                                  parallel=a.parallel or cells or int(conf.get("parallel", benchdaily.PARALLEL)),
@@ -9993,7 +10015,7 @@ def _bench_run(p, a) -> None:
         if not a.bench:
             raise benchrun.BenchError("--bench <dir> (a `ttp bench prep` folder) is required")
         seed = a.seed if a.seed is not None else int.from_bytes(os.urandom(4), "big")
-        opts = {"timeout_s": a.timeout or conf.get("timeout_s", 3600), "stall_s": conf.get("stall_s", 900),
+        opts = {"timeout_s": a.timeout or conf.get("timeout_s", HOUR_S), "stall_s": conf.get("stall_s", 900),
                 "budget_usd": a.budget or conf.get("budget_usd", 8.0), "test_cmd": a.test_cmd or benchrun.TEST_CMD,
                 "test_timeout_s": conf.get("test_timeout_s", 900), "dry_run": a.dry_run,
                 "scratch_home": conf.get("scratch_home", True), "repo": Path(a.repo or p.root).expanduser().resolve(), "state": p.state}
@@ -10809,7 +10831,7 @@ def _lock_job(names: list, cmd: list) -> list:
         if (held := lockprobe.pause(p, cfg, n)) is not None:
             why = f" ({held['reason']})" if held.get("reason") else ""
             die(f"{n} is paused{why}, so the job did not start; hand the task back as waiting, retry_when "
-                f"`ttp lock --probe {','.join(names)}`", 75)
+                f"`ttp lock --probe {','.join(names)}`", EX_BUSY)
     return [sys.executable, str(Path(__file__).resolve().parents[2] / "bin" / "ttp"), "lock", ",".join(names), "--", *cmd]
 
 
@@ -11039,8 +11061,8 @@ def _detach_remote(a, ttp: str) -> None:
     run = Path(os.environ.get("TTP_RUN_DIR") or "").name or time.strftime("manual-%Y%m%d-%H%M%S")
     rdir = (a.dir or f"~/.ttp-detach/{run}").rstrip("/") or "/"
     r = _ssh_sh(a.remote, _REMOTE_START, [rdir, a.name, *cmd], here=False)
-    if r is None or r.returncode == 255:
-        die(f"ssh to {a.remote} failed{': ' + r.stderr.strip()[-300:] if r and r.stderr.strip() else ''}", 255)
+    if r is None or r.returncode == SSH_FAILED:
+        die(f"ssh to {a.remote} failed{': ' + r.stderr.strip()[-300:] if r and r.stderr.strip() else ''}", SSH_FAILED)
     out = (r.stdout.strip().splitlines() or [""])[-1].split(" ", 2)
     if r.returncode == 4:
         die(f"a detached job named {a.name} already ran in {rdir} on {a.remote}; pick another name")
@@ -11093,14 +11115,14 @@ def _detach_check_remote(host: str, prefixes: list, rows: str | None = None, aft
         name = mirror_name(pre)
         count = rows is not None and i == 0   # the rows file is read once, in the first job's ssh call
         r, lines = mirror_probe(host, pre, mirror, rows if count else None)
-        if r is None or r.returncode == 255:
+        if r is None or r.returncode == SSH_FAILED:
             print(f"{name}: ssh to {host} failed{': ' + r.stderr.strip()[-200:] if r and r.stderr.strip() else ''}")
             kept = mirror_read(mirror, name, host, pre) if mirror else None
             end = (kept or {}).get("end") or {}
             if not end:
                 if kept and (Path(mirror) / f"{name}.remote.log").exists():
                     print(f"{name}: its last log tail mirrored here: {Path(mirror) / f'{name}.remote.log'}")
-                return 255
+                return SSH_FAILED
             failed = failed or end.get("rc") != "0"
             one_ended = True
             print(f"{name}: " + (f"job finished rc={end['rc']}" if "rc" in end else f"gone without an exit code ({end.get('gone')})")
@@ -11258,7 +11280,7 @@ def cmd_devq(a) -> None:
         r = subprocess.run(argv, input=devq.source(), text=True, timeout=limit)
     except subprocess.TimeoutExpired:
         print(f"ttp devq: the runner's host did not answer within {limit} s", file=sys.stderr)
-        sys.exit(75 if a.op == "probe" else 1)
+        sys.exit(EX_BUSY if a.op == "probe" else 1)
     if a.op == "submit" and r.returncode == 0:
         from . import taskreap
         taskreap.record_job(p, a.runner, spec)   # dropped once its task ends (taskreap.sweep)
@@ -11659,6 +11681,29 @@ def set_when(db, tid: int, probe: str | None, p=None, on_pass_cmd: str | None = 
         raise ValueError(str(e)) from None
 
 
+def _retry_probe(db, tid: int, probe: str, prev: dict, p, on_pass_cmd: str | None) -> str:
+    """A waiting task's new retry_when, checked and pinned as _set_when stores it; ValueError if refused."""
+    from .coordinator import check_probe, check_task_refs
+    check_probe(probe, "retry_when")
+    from .probevars import pin
+    probe = pin(probe, "retry_when")   # a run's own $TTP_RUN_DIR is unset where probes run
+    check_task_refs(db, probe, "retry_when")
+    from . import upstream
+    if p and (unfiled := upstream.unfiled_waits(probe, p.state)):
+        raise ValueError(f"retry_when refused: {upstream.unfiled_words(unfiled)}")
+    from .waitheal import always_passes
+    if on_pass_cmd is None and prev.get("on_pass_cmd") is not None and always_passes(probe):
+        # A caller acting on an older view of the task (a watcher that read the hand-off before
+        # the latest one) would run the hand-off's on_pass_cmd before the wait it was written for.
+        raise _ProbeRefused(
+            f"task #{tid} rejected: its hand-off's on_pass_cmd runs once its retry_when "
+            f"`{str(prev.get('retry_when') or '')[:200]}` passes; `{probe.strip()}` passes at once, "
+            f"so it would run now, before that wait ended. The probe stays. To run it now anyway, "
+            f"also give --on-pass-cmd with that command; to wake the task for a run instead, "
+            f"give --on-pass-cmd \"\"", f"{tid}:{prev.get('waiting_since')}")
+    return probe
+
+
 def _set_when(db, tid: int, probe: str | None, p=None, on_pass_cmd: str | None = None,
               start_after: str | None = None) -> str:
     """Re-point the probe of a task that has not started: a waiting task's `retry_when`, else its
@@ -11671,7 +11716,7 @@ def _set_when(db, tid: int, probe: str | None, p=None, on_pass_cmd: str | None =
     takes that result.json as the hand-off the task waits on (daemon._same_probe). An always-passing
     probe (`true`) while the hand-off's on_pass_cmd stays is refused: that command was written to run
     only once the hand-off's own wait ended."""
-    from .coordinator import check_probe, check_task_refs, deferral_update, marker_only_probe, missing_file_probe
+    from .coordinator import check_probe, deferral_update, marker_only_probe, missing_file_probe
     from .db import TERMINAL_TASK_STATES, deferral, dump_result, load_result
     if probe is None and on_pass_cmd is None and start_after is None:
         raise ValueError("set-when needs the probe command (\"\" clears it), --start-after or --on-pass-cmd")
@@ -11704,23 +11749,7 @@ def _set_when(db, tid: int, probe: str | None, p=None, on_pass_cmd: str | None =
                 said.append("start_after " + (f"set: {timefmt.long(after, p)}" if after else "cleared"))
         if retry and (probe is not None or on_pass_cmd is not None):
             if probe is not None:
-                check_probe(probe, "retry_when")
-                from .probevars import pin
-                probe = pin(probe, "retry_when")   # a run's own $TTP_RUN_DIR is unset where probes run
-                check_task_refs(db, probe, "retry_when")
-                from . import upstream
-                if p and (unfiled := upstream.unfiled_waits(probe, p.state)):
-                    raise ValueError(f"retry_when refused: {upstream.unfiled_words(unfiled)}")
-                from .waitheal import always_passes
-                if on_pass_cmd is None and prev.get("on_pass_cmd") is not None and always_passes(probe):
-                    # A caller acting on an older view of the task (a watcher that read the hand-off before
-                    # the latest one) would run the hand-off's on_pass_cmd before the wait it was written for.
-                    raise _ProbeRefused(
-                        f"task #{tid} rejected: its hand-off's on_pass_cmd runs once its retry_when "
-                        f"`{str(prev.get('retry_when') or '')[:200]}` passes; `{probe.strip()}` passes at once, "
-                        f"so it would run now, before that wait ended. The probe stays. To run it now anyway, "
-                        f"also give --on-pass-cmd with that command; to wake the task for a run instead, "
-                        f"give --on-pass-cmd \"\"", f"{tid}:{prev.get('waiting_since')}")
+                probe = _retry_probe(db, tid, probe, prev, p, on_pass_cmd)
             if on_pass_cmd is not None:
                 check_probe(on_pass_cmd, "on_pass_cmd")
             for key, value in (("retry_when", probe), ("on_pass_cmd", on_pass_cmd)):
@@ -11846,6 +11875,26 @@ def _memory_room(p, dry: str = "", added: bool = True) -> None:
             print(f"{dry}warning: {over}", file=sys.stderr)
 
 
+def _memory_settle(p: Project, a) -> None:
+    """`ttp memory --settle [names]`: review-area settlements move from memory to settled.FILE."""
+    from .coordinator import memory_budget_check
+    from . import settled
+    if a.text or a.forget or a.supersedes:
+        sys.exit("--settle takes only entry names (or none: every review-area settlement in memory)")
+    try:
+        recs, errors = settled.migrate(p, a.settle, dry_run=a.dry_run)
+    except ValueError as e:
+        sys.exit(str(e))
+    for r in recs:
+        print(f"{'would move' if a.dry_run else 'moved'} [{r['source']}] -> {settled.record_text(r, False)}")
+    print(f"{len(recs)} entr{'y' if len(recs) == 1 else 'ies'} {'would move' if a.dry_run else 'moved'} to "
+          f"{settled.FILE}" + ("" if a.dry_run or not recs else " and archived from memory"))
+    if not a.dry_run:
+        memory_budget_check(p)
+    if errors:
+        sys.exit("\n".join(errors))
+
+
 def cmd_memory(a) -> None:
     from .coordinator import memory_budget_check, plan_memory_audience, worker_room_after
     p = need(a.name, sys.argv[1:])
@@ -11857,21 +11906,7 @@ def cmd_memory(a) -> None:
         print(f"{len(found)} entr{'y' if len(found) == 1 else 'ies'} found")
         return
     if a.settle is not None:
-        from . import settled
-        if a.text or a.forget or a.supersedes:
-            sys.exit("--settle takes only entry names (or none: every review-area settlement in memory)")
-        try:
-            recs, errors = settled.migrate(p, a.settle, dry_run=a.dry_run)
-        except ValueError as e:
-            sys.exit(str(e))
-        for r in recs:
-            print(f"{'would move' if a.dry_run else 'moved'} [{r['source']}] -> {settled.record_text(r, False)}")
-        print(f"{len(recs)} entr{'y' if len(recs) == 1 else 'ies'} {'would move' if a.dry_run else 'moved'} to "
-              f"{settled.FILE}" + ("" if a.dry_run or not recs else " and archived from memory"))
-        if not a.dry_run:
-            memory_budget_check(p)
-        if errors:
-            sys.exit("\n".join(errors))
+        _memory_settle(p, a)
         return
     if not a.text and not a.forget:
         sys.exit("give the memory's text, or --forget <entry>, or --search <words>")
@@ -11946,7 +11981,7 @@ def _schedule_run(p, name: str | None) -> int:
     res = schednow.wait(p, schednow.request(p, name, os.environ.get("TTP_TASK")))
     if res.get("error"):
         print(f"ttp schedules run: {res['error']}", file=sys.stderr)
-        return 75
+        return EX_BUSY
     status = str(res.get("status") or "")
     if status.startswith("refused: "):
         print(f"ttp schedules run: {status[9:]}", file=sys.stderr)
@@ -12146,7 +12181,7 @@ def cmd_heal(a) -> None:
     rc, out = heal.check(spec, dict(heal.state(p.db, r["name"])), str(p.root), command_env(p))
     word = heal.classify(rc, out)
     print(f"{r['name']}: {word} (exit {rc})" + (f"\n{out}" if out else ""))
-    sys.exit(1 if heal.recovery_off(out) else 0 if rc == 0 or heal.known_run(rc, out) else 1 if rc == 1 or heal.finding(rc, out) else 75)
+    sys.exit(1 if heal.recovery_off(out) else 0 if rc == 0 or heal.known_run(rc, out) else 1 if rc == 1 or heal.finding(rc, out) else EX_BUSY)
 
 
 def cmd_obligation(a) -> None:
@@ -13344,6 +13379,47 @@ def cmd_secret_store(a) -> None:
         print(ln)
 
 
+def _secret_endpoint(a) -> None:
+    """`ttp secret endpoint <alias> --url <base url>`: save an API key for an endpoint once it works there."""
+    from . import endpoint
+    try:
+        name = endpoint.slot(a.alias or "")
+        url = endpoint.base_url(a.url or "")
+    except ValueError as e:
+        die(str(e) if a.alias else "give an alias: `ttp secret endpoint <alias> --url <base url>`")
+    key = sys.stdin.readline().strip() if not sys.stdin.isatty() else getpass.getpass(f"API key for {a.alias}: ")
+    if not key:
+        die("no key given; not saved")
+    ok, msg = endpoint.verify(url, key)
+    if not ok and not a.force:
+        die(f"the key did not work at {url}/models ({msg}); not saved. Use --force to save anyway.")
+    endpoint.save(a.alias, url, key, ok, msg)
+    print(f"saved {name} for this user ({url}; check: {msg})")
+
+
+def _secret_check(a) -> None:
+    """`ttp secret check [alias]`: exit 0 when every saved endpoint key checks out, else 1."""
+    # Tests a saved key without ever showing it, its URL or host: reachable / auth ok / auth failed,
+    # the model ids it serves, and the project's tier models (the one here()) it does not.
+    from . import endpoint
+    aliases = [a.alias] if a.alias else sorted(endpoint.saved())
+    if not aliases:
+        die("no endpoint key saved: `ttp secret endpoint <alias> --url <base url>`")
+    try:
+        cfg = here_p.config() if (here_p := here()) else None
+    except Exception:   # an unreadable project.json: the key check still runs
+        cfg = None
+    bad = 0
+    for alias in aliases:
+        try:
+            ok, msg = endpoint.check(alias, cfg)
+        except ValueError as e:
+            die(str(e))
+        print(msg)
+        bad += not ok
+    sys.exit(1 if bad else 0)
+
+
 def _cmd_secret(a) -> None:
     if a.kind == "store":
         return cmd_secret_store(a)
@@ -13381,44 +13457,13 @@ def _cmd_secret(a) -> None:
         save_secret("slack", {"bot_token": tok, "user_id": uid, "user_email": a.email})
         print(f"saved Slack bot for user {uid}")
     elif a.kind == "endpoint":
-        from . import endpoint
-        try:
-            name = endpoint.slot(a.alias or "")
-            url = endpoint.base_url(a.url or "")
-        except ValueError as e:
-            die(str(e) if a.alias else "give an alias: `ttp secret endpoint <alias> --url <base url>`")
-        key = sys.stdin.readline().strip() if not sys.stdin.isatty() else getpass.getpass(f"API key for {a.alias}: ")
-        if not key:
-            die("no key given; not saved")
-        ok, msg = endpoint.verify(url, key)
-        if not ok and not a.force:
-            die(f"the key did not work at {url}/models ({msg}); not saved. Use --force to save anyway.")
-        endpoint.save(a.alias, url, key, ok, msg)
-        print(f"saved {name} for this user ({url}; check: {msg})")
+        _secret_endpoint(a)
     elif a.kind == "push":
         if not a.host:
             die("--host is required")
         print(push_secrets(a.host))
     elif a.kind == "check":
-        # Tests a saved key without ever showing it, its URL or host: reachable / auth ok / auth failed,
-        # the model ids it serves, and the project's tier models (the one here()) it does not.
-        from . import endpoint
-        aliases = [a.alias] if a.alias else sorted(endpoint.saved())
-        if not aliases:
-            die("no endpoint key saved: `ttp secret endpoint <alias> --url <base url>`")
-        try:
-            cfg = here_p.config() if (here_p := here()) else None
-        except Exception:   # an unreadable project.json: the key check still runs
-            cfg = None
-        bad = 0
-        for alias in aliases:
-            try:
-                ok, msg = endpoint.check(alias, cfg)
-            except ValueError as e:
-                die(str(e))
-            print(msg)
-            bad += not ok
-        sys.exit(1 if bad else 0)
+        _secret_check(a)
     elif a.kind == "env":
         cmd_secret_env(a)
     elif a.kind == "show":
@@ -13597,7 +13642,7 @@ def cmd_secret_env(a) -> None:
     except KeyboardInterrupt:
         child.terminate()
     rc = child.wait()
-    sys.exit(128 - rc if rc < 0 else rc)
+    sys.exit(SIGNAL_RC_BASE - rc if rc < 0 else rc)
 
 
 def log_tail(logs: Path, n: int) -> str | None:
@@ -13708,6 +13753,32 @@ def cmd_install_check(a) -> None:
     release.install_command(a)
 
 
+def _setup_refresh(a, cur: Path) -> int:
+    """After `ttp setup` installs: the shortcut, marketplaces, notifier and access bridge pick up the new
+    release, and the defaults for new projects are listed. The bridge's exit code (0: up)."""
+    from . import shortcut
+    line = shortcut.remove() if a.no_shortcut else shortcut.install()
+    if line:
+        print(line)
+    from . import claudemarket
+    for ln in claudemarket.reconcile(cur, __version__):
+        print(ln)
+    from . import codexmarket
+    for ln in codexmarket.reconcile(cur, __version__):
+        print(ln)
+    from . import notifier
+    for ln in notifier.refresh(send_test=True, always=True):   # an installed notifier runs this code from now on
+        print(ln)
+    from . import bridge
+    bridge_out, bridge_rc = bridge.refresh_checked()   # installed bridge sessions run the current wrapper from now on
+    for ln in bridge_out:
+        print(ln)
+    print("defaults for new projects:")
+    for ln in new_project_defaults_lines():
+        print("  " + ln)
+    return bridge_rc
+
+
 def cmd_setup(a) -> None:
     """Install this runtime as the user's stable `ttp` (plugin caches move on every update), and the plain
     `/tt-project` command for Claude Code (shortcut.py)."""
@@ -13767,27 +13838,7 @@ def cmd_setup(a) -> None:
     print(f"daemon service for new projects here: {plan()}")
     if before and before != commit:
         print(f"replaced ttp {__version__} from commit {before} with commit {commit}")
-    from . import shortcut
-    line = shortcut.remove() if a.no_shortcut else shortcut.install()
-    if line:
-        print(line)
-    from . import claudemarket
-    for ln in claudemarket.reconcile(cur, __version__):
-        print(ln)
-    from . import codexmarket
-    for ln in codexmarket.reconcile(cur, __version__):
-        print(ln)
-    from . import notifier
-    for ln in notifier.refresh(send_test=True, always=True):   # an installed notifier runs this code from now on
-        print(ln)
-    from . import bridge
-    bridge_out, bridge_rc = bridge.refresh_checked()   # installed bridge sessions run the current wrapper from now on
-    for ln in bridge_out:
-        print(ln)
-    from .project import DEFAULT_CONFIG
-    print("defaults for new projects:")
-    for ln in new_project_defaults_lines():
-        print("  " + ln)
+    bridge_rc = _setup_refresh(a, cur)
     if bridge_rc:
         die("ttp setup: the access bridge is still down after its restart (above); the rest is set up", 1)
 
@@ -14298,7 +14349,7 @@ def cmd_upgrade(a) -> None:
             if a.auto:
                 release.finish(p, "held", why=f"harness task #{tid} finishes an earlier upgrade")
             die(f"upgrade refused: harness task #{tid} is finishing an earlier template upgrade of {p.name}; "
-                f"nothing was changed ({release.holder_line(p, holder)}).", 75)
+                f"nothing was changed ({release.holder_line(p, holder)}).", EX_BUSY)
         if a.apply is None and mine:
             die(f"task #{tid} finishes the merge in its own worktree and applies it with "
                 f"`ttp upgrade {p.name} --apply <commit>`", 2)
@@ -14403,14 +14454,14 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
             raise
         held = release.copy_failed(p, e)
         die(f"upgrade {'held' if held else 'failed'}: copying the release onto upstream failed: "
-            f"{type(e).__name__}: {e}" + ("; the daemon retries" if held else ""), 75 if held else 1)
+            f"{type(e).__name__}: {e}" + ("; the daemon retries" if held else ""), EX_BUSY if held else 1)
     kept: dict[str, str] = {}
     merged, problem = _merge_upstream(h, p.state / "upgrade-merge", ident, base, kept)
     if problem and parked:      # the open task is retargeted (exit 75); nothing is queued while paused
         print(f"{p.name} paused; upgrades when resumed: the merge needs harness task #{parked['task']}, which "
               f"runs once {p.name} is resumed. Nothing else was changed.")
         _retarget_upgrade_task(p, parked, False)
-        sys.exit(75)
+        sys.exit(EX_BUSY)
     if problem:
         holder = release.finish_holder(p)
         tid = holder["task"] if holder else None
@@ -14434,10 +14485,10 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
             if release.retried({"newer": release.is_newer(new_v, old_v)}, p.config()):
                 print(took + f"upgrade deferred: owner: this project's daemon (upgrade.auto), which looks again "
                              f"at {timefmt.long(until, p)}.")
-                sys.exit(75)
+                sys.exit(EX_BUSY)
             if p.db.kv("paused", False):
                 print(took + f"{p.name} paused; upgrades when resumed.")
-                sys.exit(75)
+                sys.exit(EX_BUSY)
             why = ("upgrade.auto is off" if release.is_newer(new_v, old_v)
                    else f"the daemon retries only a newer version, and this is {new_v} again from another commit")
             print(took + f"{why}, so nothing retries it: rerun `ttp upgrade {p.name}` after such a change.")
@@ -14453,7 +14504,7 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
             print(f"upgrade not applied; the running harness is unchanged. {problem}\n{p.name}'s release is {why}, "
                   f"so no harness task was queued to finish it. `ttp upgrade {p.name} --release` lifts the hold; "
                   f"then rerun `ttp upgrade {p.name}`.")
-            sys.exit(75)
+            sys.exit(EX_BUSY)
         if not tid:
             _refuse_unappliable_task(p, auto, problem)
         tid = tid or p.db.add_task(
@@ -14470,13 +14521,13 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
               f"finishes it (upgrade deferred to that task)."
               + (f"\n{p.name} paused; upgrades when resumed: task #{tid} runs once {p.name} is resumed "
                  f"(the pause was left as it is)." if p.db.kv("paused", False) else ""))
-        sys.exit(75)        # deferred: the project's own harness task takes it on
+        sys.exit(EX_BUSY)        # deferred: the project's own harness task takes it on
     # A push started while this merged, or one inside a step (push.Steps waits for this lock before
     # a step, which it marks first): never swap under it.
     if auto and (pushing := release.push_hold(p, (p.db.kv(release.KV_AUTO) or {}).get("key", ""))):
         release.finish(p, "held", why=pushing)
         print(f"upgrade held: {pushing}; the running harness is unchanged and the daemon retries later")
-        sys.exit(75)
+        sys.exit(EX_BUSY)
     moved = _moved_template(h, base)
     if moved:
         if auto:
@@ -14789,7 +14840,7 @@ def _untrack_placeholders(p: Project, ident: list[str]) -> str:
         git("read-tree", head)
         git("--literal-pathspecs", "rm", "-r", "-q", "--cached", "--", *drop)
         body = (f"Empty files the worker sandbox leaves at paths it mounts over; tracked, they fail checkouts and "
-                f"rebases in task worktrees. Untracked ({len(drop)}):\n{_listed(drop)}")
+                f"rebases in task worktrees. Untracked ({len(drop)}):\n{_capped_list(drop)}")
         sha = git(*ident, "commit-tree", git("write-tree"), "-p", head,
                   "-m", "untrack sandbox placeholder files", "-m", body)
     finally:
@@ -14882,7 +14933,7 @@ def _keep_out_runtime_data(h: Path, since: float | None) -> list[str]:
     return data
 
 
-def _listed(names: list[str], cap: int = 40) -> str:
+def _capped_list(names: list[str], cap: int = 40) -> str:
     return "\n".join(f"  {n}" for n in names[:cap]) + (f"\n  ... and {len(names) - cap} more" if len(names) > cap else "")
 
 
@@ -14891,10 +14942,10 @@ def _commit_listing(p: Project, ident: list[str], msg: str, files: list[str], ke
     """Commit `files` (what is staged, or `post`'s paths) with a message that lists them and the runtime
     data kept out, then tell the open harness tasks that may own those edits. Returns the sha."""
     h = p.harness
-    body = f"Files committed ({len(files)}):\n{_listed(files)}"
+    body = f"Files committed ({len(files)}):\n{_capped_list(files)}"
     if kept_out:
         body += (f"\n\nRuntime data kept out (in .git/info/exclude; `git add -f` to commit one):\n"
-                 f"{_listed(kept_out)}")
+                 f"{_capped_list(kept_out)}")
     _git(h, *(pre or []), *ident, "commit", "-q", *(post or []), "-m", msg, "-m", body)
     sha = _git(h, "rev-parse", "HEAD")
     print(f"committed the harness's local changes as {sha[:12]} ({len(files)} file(s): "
@@ -15016,7 +15067,7 @@ def _retarget_upgrade_task(p: Project, holder: dict, auto: bool) -> None:
     print(f"upgrade not applied; the running harness is unchanged. Harness task #{tid} is finishing the "
           f"template merge" + (f" and now targets {target}" if moved or holder.get("key") != key else "")
           + f" (upgrade deferred to that task; {release.holder_line(p, holder)}).")
-    sys.exit(75)
+    sys.exit(EX_BUSY)
 
 
 def _refuse_unappliable_task(p: Project, auto: bool, problem: str) -> None:
@@ -15186,7 +15237,7 @@ def _refuse_unfinished_merge(p: Project, auto: bool) -> None:
     if harnesstree.landing_merge(h):
         if auto:
             release.finish(p, "held", why="a harness worktree merge is in progress; the daemon retries")
-        die(f"upgrade deferred: harness merge in progress in {h}, daemon retries; nothing was changed", 75)
+        die(f"upgrade deferred: harness merge in progress in {h}, daemon retries; nothing was changed", EX_BUSY)
     sha = release.merge_head(h)
     if not sha:
         return
@@ -15201,7 +15252,7 @@ def _refuse_unfinished_merge(p: Project, auto: bool) -> None:
     except Exception as e:      # a read-only state (a sandbox) records nothing; the refusal stands
         print(f"could not record the hold in {p.name}'s state: {type(e).__name__}: {e}", file=sys.stderr)
     if auto:            # stderr already goes to logs/upgrade.log; the status line shows the reason
-        die(msg, 75)
+        die(msg, EX_BUSY)
     p.logs.mkdir(parents=True, exist_ok=True)
     append_text(p.logs / "upgrade.log", f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} ttp upgrade\n{msg}\n", p)
     die(msg, 1)
@@ -16839,7 +16890,7 @@ def main(argv: list[str] | None = None) -> None:
     g.add_argument("--min-tests", type=int, default=0, help="fail unless at least this many tests ran")
     g.add_argument("--count-regex", help="regex whose first group is the test count (default: pytest, "
                                          "unittest and ctest summaries)")
-    g.add_argument("--timeout", type=float, default=3600, help="seconds; past it the check could not run")
+    g.add_argument("--timeout", type=float, default=HOUR_S, help="seconds; past it the check could not run")
     g.add_argument("cmd", nargs=argparse.REMAINDER, help="the command, after --")
     g = gs.add_parser("artifact_fresh", help="a file or glob's newest match exists, is not trivially small "
                                              "and is newer than the bounds given")
@@ -17890,7 +17941,7 @@ def dry_run_stub(a, name: str | None = None) -> None:
     if cmd == "lock" or (cmd == "devq" and a.op in ("submit", "start", "clear")) \
             or (cmd == "detach" and a.check is None):
         print(f"ttp {cmd}: refused in an on_pass_cmd dry run ({ENV}=1)", file=sys.stderr)
-        sys.exit(75)
+        sys.exit(EX_BUSY)
     if cmd in ("note", "notify", "push", "land", "express"):
         print(f"ttp {cmd}: skipped in an on_pass_cmd dry run ({ENV}=1)", file=sys.stderr)
         sys.exit(0)
