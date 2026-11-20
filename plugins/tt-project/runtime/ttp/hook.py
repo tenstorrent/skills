@@ -80,7 +80,9 @@ Otherwise it fails open: any error prints nothing, and the run goes on unchanged
 from __future__ import annotations
 
 import functools
+import itertools
 import json
+import operator
 import os
 import posixpath
 import re
@@ -617,6 +619,23 @@ def _quoting(line: str) -> list[tuple[bool, int]]:
     return out
 
 
+# A character that can start a quoted, escaped or comment run (_quoting)
+QUOTE_START_RE = re.compile(r"['\"\\\\#]")
+
+
+def _quoted_runs(text: str) -> list[tuple[int, int, bool]]:
+    """(start, end, quoted) of each run of `text` that is all quoted or all unquoted (_quoting), found
+    without a per-character Python loop."""
+    if not QUOTE_START_RE.search(text):
+        return [(0, len(text), False)] if text else []
+    out, i = [], 0
+    for quoted, run in itertools.groupby(_quoting(text), key=operator.itemgetter(0)):
+        n = len(list(run))
+        out.append((i, i + n, quoted))
+        i += n
+    return out
+
+
 SEPARATOR_RE = re.compile(r"[;&|\n]")
 
 
@@ -643,9 +662,15 @@ def _piece_at(line: str, pos: int) -> tuple[str, str]:
     return next((line[s:e], sep) for s, e, sep in _pieces(line) if s <= pos <= e)
 
 
+@functools.lru_cache(maxsize=64)
+def _first_argv(piece: str) -> tuple[str, ...]:
+    """The first simple command of `piece` (_segments), cached: tokenizing a long quoted word is slow."""
+    return tuple(next(iter(_segments(piece)), []))
+
+
 def _first_word(piece: str) -> str:
-    segs = _segments(piece)
-    return os.path.basename(segs[0][0]) if segs else ""
+    argv = _first_argv(piece)
+    return os.path.basename(argv[0]) if argv else ""
 
 
 @functools.lru_cache(maxsize=4)
@@ -691,13 +716,13 @@ def _runs_inside(piece: str) -> bool:
     """`piece` runs a command of its own: a `$(...)` or backtick outside single quotes, `<(`/`>(`, or `rg --pre`."""
     from . import pathguard
     return bool(pathguard._substitutions(piece) or re.search(r"[<>]\(", re.sub(r"'[^']*'", "", piece))
-                or _first_word(piece) == "rg" and re.search(r"(?:^|\s)--pre(?:=|\s|$)", piece))
+                or re.search(r"(?:^|\s)--pre(?:=|\s|$)", piece) and _first_word(piece) == "rg")
 
 
 @functools.lru_cache(maxsize=64)
 def _unquoted(text: str) -> str:
     """`text` with its quoted (and escaped, and comment) characters as spaces."""
-    return "".join(" " if f[0] else c for c, f in zip(text, _quoting(text)))
+    return "".join(" " * (e - b) if q else text[b:e] for b, e, q in _quoted_runs(text))
 
 
 def _data_only(piece: str, sep: str, commands: str, after: list[str] | tuple = ()) -> bool:
@@ -705,16 +730,16 @@ def _data_only(piece: str, sep: str, commands: str, after: list[str] | tuple = (
     inside, pipes on (`after`) only into READERS, and writes no file that `commands` runs afterwards. Fail closed:
     a variable set before it (`GIT_EDITOR=...`), or a PATH, alias or function `commands` sets, may make it run."""
     from . import pathguard
-    argv = next(iter(_segments(piece)), [])
+    argv = list(_first_argv(piece))
     name = _first_word(piece)
-    if re.match(r"\s*[A-Za-z_]\w*\+?=", piece) or re.search(
-            rf"\bPATH\+?=|\balias\b|\bfunction\s+{re.escape(name)}\b|(?<![\w-]){re.escape(name)}\s*\(\s*\)",
-            _unquoted(commands)):
-        return False
     if not (name in INERT or name == "git" and argv[1:2] == ["commit"] or name == "ttp"
             and pathguard._message_pieces(piece + sep) and pathguard._blank_messages(commands) != commands) \
             or _runs_inside(piece) or sep in ("|", "|&") and not (
                 after and all(_first_word(p) in READERS and not _runs_inside(p) for p in after)):
+        return False
+    unquoted = _unquoted(commands)
+    if re.match(r"\s*[A-Za-z_]\w*\+?=", piece) or any(w in unquoted for w in ("PATH", "alias", "function", "(")) and re.search(
+            rf"\bPATH\+?=|\balias\b|\bfunction\s+{re.escape(name)}\b|(?<![\w-]){re.escape(name)}\s*\(\s*\)", unquoted):
         return False
     return not any(os.path.basename(m[2]) in _ran(commands) for m in REDIRECT_RE.finditer(piece))
 
@@ -738,15 +763,11 @@ def _into_shell(line: str, pieces: list[tuple[int, int, str]], k: int) -> bool:
 def _blank(piece: str) -> str:
     """`piece` with each quoted span holding whitespace (text, not a word) replaced by `''`; a one-word span (a
     path, a flag) and a redirection's target stay."""
-    flags, out, j = _quoting(piece), [], 0
-    while j < len(piece):
-        k = j
-        while k < len(piece) and flags[k][0] == flags[j][0]:
-            k += 1
+    out = []
+    for j, k, quoted in _quoted_runs(piece):
         span = piece[j:k]
-        text = flags[j][0] and re.search(r"\s", span) and not piece[:j].rstrip(" \t").endswith(("<", ">"))
+        text = quoted and re.search(r"\s", span) and not piece[:j].rstrip(" \t").endswith(("<", ">"))
         out.append("''" if text else span)
-        j = k
     return "".join(out)
 
 

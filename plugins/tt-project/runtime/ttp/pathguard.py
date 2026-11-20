@@ -910,11 +910,18 @@ def _message_pieces(text: str) -> list[tuple[int, int]]:
     return out
 
 
+# Per _substitutions quoting state: a run of characters that neither quotes nor starts a substitution
+SUBSTITUTION_RUNS = {"": re.compile(r"[^\\'\"`$]+"), '"': re.compile(r'[^\\"`$]+'), "'": re.compile(r"[^']+")}
+
+
 def _substitutions(text: str) -> list[str]:
     """The bodies of the command substitutions in `text`, $(...) and backticks, outside single quotes
     (inside double quotes they run too); $((...)) is arithmetic."""
     out, i, q = [], 0, ""
     while i < len(text):
+        if m := SUBSTITUTION_RUNS[q].match(text, i):   # a long word costs no per-character loop
+            i = m.end()
+            continue
         c = text[i]
         if q == "'":
             q = "" if c == "'" else q
