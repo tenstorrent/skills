@@ -1,4 +1,4 @@
-"""Scope gate: release blocks changes outside the model folder, open records them."""
+"""Scope gate: contained blocks changes outside the model folder, open records them."""
 from __future__ import annotations
 
 import json
@@ -39,13 +39,13 @@ def run(repo):
     return r.returncode, r.stderr
 
 
-def test_release_blocks_outside_changes(tmp_path):
-    code, err = run(repo_with_change(tmp_path, 'release'))
+def test_contained_blocks_outside_changes(tmp_path):
+    code, err = run(repo_with_change(tmp_path, 'contained'))
     assert code == 2 and 'ttnn/op.cpp' in err
 
 
-def test_release_allows_model_only_changes(tmp_path):
-    assert run(repo_with_change(tmp_path, 'release', outside=False))[0] == 0
+def test_contained_allows_model_only_changes(tmp_path):
+    assert run(repo_with_change(tmp_path, 'contained', outside=False))[0] == 0
 
 
 def test_open_records_outside_changes(tmp_path):
@@ -54,5 +54,5 @@ def test_open_records_outside_changes(tmp_path):
 
 
 def test_missing_base_is_advisory_and_unknown_scope_critical(tmp_path):
-    assert run(repo_with_change(tmp_path, 'release', outside=False, base=False))[0] == 1
+    assert run(repo_with_change(tmp_path, 'contained', outside=False, base=False))[0] == 1
     assert run(repo_with_change(tmp_path / 'x', 'loose'))[0] == 2

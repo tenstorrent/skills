@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Check which files a bringup changed outside its model folder, against the run's scope.
 
-`scope` in the model's bringup/agentic_evals/inputs.json is `release` (default) or `open`:
-- release: the model ships through tt-metal with no changes outside models/autoports/<model>/ and bringup/.
+`scope` in the model's bringup/agentic_evals/inputs.json is `contained` (default) or `open`:
+- contained: no changes outside models/autoports/<model>/ and bringup/.
   Any other changed file is critical (exit 2).
 - open: the model may carry its own versions of ops, kernels and shared code; changed files outside the model
   folder are listed for the record (exit 0).
@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 
 INPUTS = Path("bringup/agentic_evals/inputs.json")
-SCOPES = ("release", "open")
+SCOPES = ("contained", "open")
 
 
 def git(*args: str) -> str:
@@ -48,7 +48,7 @@ def main() -> int:
         except json.JSONDecodeError as exc:
             print(f"CRITICAL: {model_dir / INPUTS} is not valid JSON: {exc}", file=sys.stderr)
             return 2
-    scope = inputs.get("scope", "release")
+    scope = inputs.get("scope", "contained")
     if scope not in SCOPES:
         print(f"CRITICAL: scope {scope!r} must be one of {', '.join(SCOPES)}", file=sys.stderr)
         return 2
@@ -69,8 +69,8 @@ def main() -> int:
     outside = sorted(p for p in changed if not p.startswith(allowed) and not p.startswith(str(model_rel) + "/"))
     if not outside:
         return rc
-    if scope == "release":
-        print(f"CRITICAL: scope is release, but {len(outside)} file(s) outside {model_rel}/ changed since {base}: "
+    if scope == "contained":
+        print(f"CRITICAL: scope is contained, but {len(outside)} file(s) outside {model_rel}/ changed since {base}: "
               + ", ".join(outside[:20]) + (" ..." if len(outside) > 20 else "")
               + ". Work around the op inside the model, keep a minimal repro, or set scope open.", file=sys.stderr)
         return 2

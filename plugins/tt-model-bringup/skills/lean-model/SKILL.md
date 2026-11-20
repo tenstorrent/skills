@@ -97,7 +97,7 @@ winner, drop the rest. Scope risky work as "measure and report before building",
 
 Where to start is decided in the plan: how much to reuse from similar tt-metal models, or from an existing
 correct implementation of this model, and why. The one run setting that changes what you may do is `scope` in
-`inputs.json` (`model-bringup`): `release` keeps every change inside the model folder and `bringup/`; `open` lets
+`inputs.json` (`model-bringup`): `contained` keeps every change inside the model folder and `bringup/`; `open` lets
 the model carry its own versions of ops and shared code. [ops](references/ops.md) has the ladder for each.
 
 ## Devices and budget

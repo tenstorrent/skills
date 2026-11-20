@@ -13,16 +13,16 @@ order, is your call.
    fused floor.
 4. **Changing tt-metal code outside the model** (an op's C++ or kernels, CCL setup, allocator or L1 defaults,
    trace and dispatch, fabric configuration) or **a new ttnn op**: only under `scope` `open` (`model-bringup`).
-   Under `release`, steps 1-3 are the whole ladder.
+   Under `contained`, steps 1-3 are the whole ladder.
 
 Making an op work is a different question from making it fast: when an op is wrong or rejects the model's
-shapes, adapt the inputs to its contract or work around it inside the model under `release`, or fix the op with
+shapes, adapt the inputs to its contract or work around it inside the model under `contained`, or fix the op with
 a test under `open`; keep a minimal repro either way.
 
 Debugging is not limited by scope: to find a cause, instrument or patch anything on a side branch or worktree
-and revert it before the gate. Under `release`, a patch that proved the cause becomes the repro for the issue.
+and revert it before the gate. Under `contained`, a patch that proved the cause becomes the repro for the issue.
 
-Under `release`, if an op change looks worth a lot, a brief measurement on a side branch and a line in the report
+Under `contained`, if an op change looks worth a lot, a brief measurement on a side branch and a line in the report
 help tt-metal maintainers. Optional; keep it short.
 
 ## Every new or changed path
