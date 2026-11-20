@@ -21,6 +21,9 @@ Read a topic when the work reaches it:
 | [MoE](topics/moe.md) | routed experts |
 | [performance work](topics/perf.md) | profiling, comparing measurements, kernel edits, host-side cost |
 | [serving and evals](topics/serving-evals.md) | the vLLM plugin, sampling, eval harnesses and their infrastructure |
+| [reference code](topics/reference-code.md) | before designing a module: working implementations in tt-metal |
+| [correctness](topics/correctness.md) | TTNN defaults while proving semantics, HF reference layers, synthetic weights |
+| [profiling](topics/profiling.md) | measuring traced runs, `tt-perf-report`, watcher |
 | [environment](topics/environment.md) | containers, sandboxes, caches, small API traps |
 
 Device handling (timeouts, resets, shared boards) is in [tt-device-usage](../tt-device-usage/SKILL.md).

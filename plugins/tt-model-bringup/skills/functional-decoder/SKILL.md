@@ -91,54 +91,19 @@ Use `PCC >= 0.995` as the default acceptance bar for prefill and decode unless t
 
 # Decoder Bringup Knowledge
 
-Use this reference while bringing up a TTNN decoder layer. It folds in relevant local knowledge from personal skills and repo reading so the repo-local skill is portable.
+The knowledge for this stage lives in [`ttnn-knowledge`](../ttnn-knowledge/SKILL.md); each step below says which topic to read when.
 
 ## Repo Paths Worth Reading
 
-- `models/common/modules/attention/attention_1d.py`: general config-first attention with prefill/decode split, paged KV cache, trace-friendly current-position tensors, Q/K norm hooks, and CCL integration.
-- `models/common/modules/mlp/mlp_1d.py`, `models/common/modules/rmsnorm/rmsnorm_1d.py`, and `models/common/modules/rope/rope_1d.py`: common patterns for decode-vs-prefill memory layout, on-device RoPE embedding, and local/distributed norm paths.
-- `models/common/modules/lazy_weight.py`: setup-time TTNN tensor conversion and deterministic cache-key pattern without runtime torch imports.
-- `models/tt_transformers/tt/decoder.py`: standard transformer block composition and residual order.
-- `models/tt_transformers/tt/generator.py` and `models/tt_transformers/tt/model.py`: production trace capture/replay, stable trace input tensors, decode preparation, and vLLM-facing contracts.
-- `models/tt_transformers/tt/generator_vllm.py`: paged KV-cache allocation, per-layer page-table routing, and hybrid attention contracts.
-- `models/demos/gpt_oss/tt/layer.py` and `models/demos/gpt_oss/tt/attention/`: model-specific standard attention with paged prefill/decode and MoE-adjacent tests.
-- `models/demos/gpt_oss/tt/experts/README.md`, `models/demos/gpt_oss/tt/experts/decode.py`, `models/demos/gpt_oss/tt/experts/prefill.py`, `models/demos/gpt_oss/tt/experts/weights.py`, `models/demos/gpt_oss/tt/experts/config.py`, and `models/demos/gpt_oss/tt/topk.py`: default MoE active-expert pattern using `ttnn.sparse_matmul`.
-- `models/demos/gemma4/tt/layer.py` and `models/demos/gemma4/tt/attention/`: strong examples for many norms, layer scales, sliding/full layer types, shared KV, and model-specific RoPE.
-- `models/demos/deepseek_v3/tt/decoder_block/` and `models/demos/deepseek_v3/tt/mla/`: examples for dense-vs-MoE decoder kinds, MLA, row-sharded behavior, and specialized paged-cache updates.
-- `tech_reports/LLMs/llms.md` and `tech_reports/LLMs/vLLM_integration.md`: TTNN LLM conventions for paged cache, prefill/decode shape differences, tracing, and vLLM integration.
+Before designing a module, read the working implementations listed in [reference code](../ttnn-knowledge/topics/reference-code.md) that match the model's attention, MLP or MoE, norms and RoPE.
 
-## TTNN Correctness Defaults
+## TTNN Correctness Defaults And HF Reference
 
-- Start with `ttnn.bfloat16`, `ttnn.TILE_LAYOUT`, and `ttnn.DRAM_MEMORY_CONFIG` where that simplifies correctness; optimize memory layout after PCC is stable.
-- Transpose 2D PyTorch linear weights before `ttnn.linear` unless the local TTNN helper already does it.
-- Reshape norm weights so they broadcast over hidden width.
-- Derive Q/K/V head reshapes from config, including GQA/MQA KV expansion, before optimizing.
-- In `models/common` attention, Q/K weights may need HF-to-TTNN RoPE permutation handling such as `reverse_permute`; inspect the module contract and tests.
-
-## HF Reference And Synthetic Weights
-
-- Prefer a layer-only HF reference over full causal LM loading.
-- Inspect the decoder layer constructor, rotary/position embedding inputs, attention mask semantics, and cache API before writing the test.
-- Use real weights to record tensor stats and to validate that `from_state_dict` can load a real checkpoint path when available. Treat the real HF state dict as the canonical key and shape contract. Normal CI tests should use synthetic weights generated from those stats so they do not require HF weight downloads.
-- For each tensor used by the TTNN layer, store at least name, shape, dtype, mean, and std.
-- Generate synthetic weights deterministically from those stats in pytest.
-- Synthetic input activations should approximate the distribution entering the decoder layer after embeddings/norms, not arbitrary huge random values.
-- Do not create smaller configs - replicate the real config of the reference.
-- If full HF weight download is necessary to collect stats, record why partial shard loading was not practical.
-- Always use real shapes even with synthetic weights.
-- You must include a test with real weights and show it passes PCC >= 0.995 for each of the layer kinds.
+Before writing the layer and its tests, read [correctness](../ttnn-knowledge/topics/correctness.md): TTNN defaults while proving semantics, layer-only HF references, real-weight statistics and synthetic weights. You must include a test with real weights and show it passes PCC >= 0.995 for each of the layer kinds.
 
 ## Paged KV Cache Checks
 
-- Use paged prefill and paged decode as the final path. Non-paged cache is not worth spending time on for this bringup.
-- Paged prefill usually uses `ttnn.experimental.paged_fill_cache`; decode uses `ttnn.experimental.paged_update_cache` and `ttnn.transformer.paged_scaled_dot_product_attention_decode`.
-- Treat prefill fill-cache and decode update-cache as different dtype contracts. When the cache is lower precision such as `ttnn.bfloat8_b`, prefill should cast the K/V tensors passed to `paged_fill_cache` to the destination cache dtype before filling. Do not blindly apply the same cast to decode: `paged_update_cache` update tensors must remain a supported compute dtype such as BF16/FLOAT32, even when the destination cache is BFP8.
-- Decode should use tensor current positions when tracing; Python lists or scalar host state tend to break traceability.
-- Use page-table permutations, nonzero slots, and random current positions to catch address and indexing bugs.
-- Chunked prefill SDPA and paged decode SDPA pad their key window to the chunk size and follow the page table past the row's end; non-finite data in those pages corrupts every masked query row, nondeterministically. Keep `chunk_start + round_up(q_len, chunk)` inside the page-table extent and choose a decode key chunk that divides the extent. The paged decode SDPA also reads the sharded query from the core its program grid assigns to each user, so the user shard rectangle must match that grid (8 wide or a single row on Blackhole); derive the physical decode batch from it instead of a divisor search.
-- For hybrid attention, inspect per-layer page-table routing and cache specs instead of assuming one page table shape covers every layer.
-- Gemma-style shared-KV layers may skip K/V projection and cache update; tests must still prove the consumer layer reads the intended source cache.
-- DeepSeek-style MLA cache updates can have aliasing hazards between prompt/speculative lanes; inspect masks and lane routing when validating cache correctness.
+Use paged prefill and paged decode as the final path. Before writing the cache tests, read the paged KV basics and the failure mechanisms in [prefill and KV](../ttnn-knowledge/topics/prefill-kv.md): fill and update dtype contracts, tensor current positions, page-table permutations, read windows past the row's end, and the decode query grid.
 
 ## Prefill And Decode Shapes
 
@@ -157,74 +122,9 @@ Use this reference while bringing up a TTNN decoder layer. It folds in relevant 
 ## Trace And Profiling
 
 - The final decode pass must use traced TTNN execution. If trace capture, replay, stale inputs, event synchronization, or trace-safe input setup becomes tricky, use `$tt-enable-tracing` before accepting an eager-only decode path.
-- Open the device with a zero trace region, for example `trace_region_size=0`, TTNN can auto-detect the right size these days.
-- Use the pattern: compile/warmup, synchronize, signpost start, execute warmed trace or warmed measured path, synchronize once, signpost end.
-- Copy the newest Tracy ops CSV to the git-ignored `bringup/artifacts/<stage>/` and run `tt-perf-report` with start/end signposts for the measured window; only its report goes into the evidence directory.
-- `tt-perf-report --csv` may expose filtered kernel time as `Device Time` in microseconds rather than raw nanoseconds; convert accordingly and note the column used.
-- Profiling should capture warmed prefill and warmed decode separately.
 - Decode PCC should be measured from replay output, not only from an uncaptured forward pass.
-- Tensor allocation after trace capture is a red flag. Trace capture should bake stable buffer addresses and replay should only update allowed input tensor contents before `execute_trace`. Before accepting the traced decoder, run representative repeated replay with `TT_METAL_TRACE_ALLOC_TRACKING=1`, cover every captured control-flow path, and resolve every unsafe allocation under the target tt-metal checkout's `tech_reports/AdvancedPerformanceOptimizationsForModels/TraceCorrectness.md`.
-  Common causes (lazily created buffers, shapes the warmup skipped, a retained eager output, capture not ended on an exception): [tracing](../ttnn-knowledge/topics/tracing.md).
-
-## `tt-perf-report`
-
-`tt-perf-report` is a Python CLI published separately from tt-metal. Install it in the active tt-metal Python environment, not in a random system Python:
-
-```bash
-python -m pip install tt-perf-report
-tt-perf-report --help
-```
-
-The input is the post-processed Tracy ops CSV, usually named like `ops_perf_results_YYYY_MM_DD_HH_MM_SS.csv`. Generate that CSV with the normal Tracy profiler flow, for example:
-
-```bash
-python -m tracy -r -p -v -m pytest <test-path> -k "<selector>"
-```
-
-If Tracy collection fails, the LLM tech report notes a device-only fallback:
-
-```bash
-TT_METAL_DEVICE_PROFILER=1 pytest <test-path> -k "<selector>"
-python tools/tracy/process_ops_logs.py --date
-```
-
-For functional-decoder artifacts, copy the relevant ops CSV to the raw directory (not committed) and write the reports into the artifact directory:
-
-```bash
-export ARTIFACT_DIR="models/autoports/<model>/doc/functional_decoder"
-export RAW_DIR="bringup/artifacts/$(basename "$ARTIFACT_DIR")/tracy/<layer_kind_id>"   # git-ignored
-mkdir -p "$RAW_DIR" && cp <ops_perf_results_*.csv> "$RAW_DIR/decode_ops.csv"
-tt-perf-report "$RAW_DIR/decode_ops.csv" \
-  --start-signpost PERF_DECODE \
-  --end-signpost PERF_DECODE_END \
-  --csv "$ARTIFACT_DIR/tracy/<layer_kind_id>/decode_perf_report.csv" \
-  --no-advice \
-  > "$ARTIFACT_DIR/tracy/<layer_kind_id>/decode_perf_report.console.log"
-tt-perf-report "$RAW_DIR/decode_ops.csv" \
-  --start-signpost PERF_DECODE \
-  --end-signpost PERF_DECODE_END \
-  --no-summary \
-  --no-advice \
-  > "$ARTIFACT_DIR/tracy/<layer_kind_id>/decode_perf_report.txt"
-```
-
-Use the same shape for prefill, with `PREFILL` signpost names and `prefill_*` filenames. If the installed `tt-perf-report` version does not support one of these flags, run `tt-perf-report --help`, use the closest supported flag set, and record the exact command in the bringup log.
-
-The `*_perf_report.txt` file is for the human-readable table. Do not redirect the stdout from a `--csv` run into that filename; `--csv` mode prints command/status boilerplate such as "Writing CSV output..." rather than the rendered report table. Keep that chatter in `*_perf_report.console.log` if it is useful for provenance.
-
-When calculating latency from the report, prefer the filtered `tt-perf-report` CSV for the signposted window. Check the time column units. Some versions expose `Device Time` in microseconds; raw Tracy ops CSVs often expose `DEVICE KERNEL DURATION [ns]`. Record which column and unit you used in `functional_decoder.md`.
-
-## Watcher Notes
-
-- Watcher is fully supported on source builds; wheel-only environments may not have the same debug coverage.
-- `TT_METAL_WATCHER=<n>` enables watcher and sets the polling interval in seconds unless the value has an `ms` suffix.
-- `TT_METAL_LOGS_PATH=<dir>` redirects generated logs; watcher writes under `<dir>/generated/watcher/`.
-- CI commonly uses `TT_METAL_WATCHER=2`, `TT_METAL_WATCHER_APPEND=1`, `TT_METAL_WATCHER_NOINLINE=1`, and `TT_METAL_WATCHER_DISABLE_ETH=1`.
-- For decoder-layer artifact runs, prefer a unique `TT_METAL_LOGS_PATH` per command over appending unrelated runs into one log.
-- Watcher and device profiler/debug-print should be separate runs because they use overlapping debug resources.
-- Watcher detects asserts, invalid NOC coordinates or addresses, CB out-of-bounds NOC transactions, L1 address overflow, stack overflow, hardware faults on supported targets, waypoint state, and active kernel ids.
-- A watcher-clean run still may contain normal attach, dump, kernel id, and detach lines. It must not contain fatal watcher exceptions or suspicious stack/L1/NOC/CB/sanitize messages.
-- Good false-positive evidence includes the exact watcher log line, why the address/core/state is benign, the commit or issue proving it is known, and a separate correctness/profiling run showing the decoder path is otherwise sound.
+- Tensor allocation after trace capture is a red flag. Before accepting the traced decoder, run representative repeated replay with `TT_METAL_TRACE_ALLOC_TRACKING=1`, cover every captured control-flow path, and resolve every unsafe allocation under the target tt-metal checkout's `tech_reports/AdvancedPerformanceOptimizationsForModels/TraceCorrectness.md`. Common causes: [tracing](../ttnn-knowledge/topics/tracing.md).
+- Measure warmed prefill and decode separately, with signposts, and report them with `tt-perf-report`; how, and the watcher run that is part of done, are in [profiling](../ttnn-knowledge/topics/profiling.md).
 
 ## Fallback And Watcher Audit
 
