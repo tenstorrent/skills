@@ -7805,7 +7805,19 @@ class Daemon:
         if (stop := streamguard.take(run_dir)) is not None:
             # The runner stopped a run the harness hook does not reach at a call the hook refuses
             # (streamguard): queued once more with the refusal on top, no attempt spent; twice in a row, blocked.
+            # A blocked or needs_review hand-off it saved first is its outcome instead (below).
             why, prev = str(stop["why"])[:500], load_result(task["result"])
+            if own and isinstance(handoff, dict) and handoff.get("status") in ("blocked", "needs_review"):
+                # It had already saved a refusal hand-off: that stands as its outcome, with the stop beside
+                # it, and goes to the coordinator; a rerun would only repeat the refusal.
+                result = handoff = {**handoff, streamguard.KEY: {**stop, "why": why, "run": r["id"]}}
+                text = (f"#{task['id']} {task['title']}: run {r['id']} stopped by the stream guard after it saved "
+                        f"a {handoff['status']} hand-off, which stands: {why}")
+                db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                     (time.time(), f"task:{task['id']}", "guard_stop", "low", text[:1500], "handled", task["id"]))
+                log(self.p, text)
+                stop = None
+        if stop is not None:
             again = isinstance(prev.get(streamguard.KEY), dict)
             text = (f"#{task['id']} {task['title']}: run {r['id']} stopped by the stream guard at a "
                     f"{stop.get('tool') or 'tool'} call: {why}"

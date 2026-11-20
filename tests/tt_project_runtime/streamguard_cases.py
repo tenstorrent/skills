@@ -287,6 +287,26 @@ def test_a_guard_stop_requeues_once_with_the_reason_then_blocks(env, tmp_path, m
     assert t["status"] == "blocked" and t["attempts"] == 1 and "twice" in t["blocked_reason"]
 
 
+def test_a_guard_stop_after_a_saved_refusal_keeps_that_hand_off_and_does_not_requeue(env, tmp_path, monkeypatch):
+    from ttp import streamguard
+    from ttp.daemon import Daemon
+    p = make(env)
+    _rs_live(monkeypatch)
+    tid, rid, run_dir = _rs_running(p, tmp_path, attempts=1)
+    need = "needs the release owner's signed approval file before it can tag"
+    (run_dir / "result.json").write_text(json.dumps({"status": "blocked", "summary": f"refused: {need}"}))
+    streamguard.record(run_dir, "tt-project: the web token is the user's credential.", "Bash")
+    (run_dir / "exit.json").write_text(json.dumps({"rc": 143, "stopped": "guard", "ended": time.time()}))
+    Daemon(p.base).reap_runs()
+    t = p.db.task(tid)
+    assert t["status"] == "blocked", "kept as the outcome, not queued again"
+    res = json.loads(t["result"])
+    assert need in res["summary"] and "web token" in res[streamguard.KEY]["why"]
+    assert p.db.q("SELECT 1 FROM events WHERE kind='guard_stop' AND task=? AND text LIKE '%stands%'", (tid,))
+    told = p.db.q("SELECT text FROM events WHERE kind='task_blocked' AND task=? AND status='queued'", (tid,))
+    assert told and need in told[0]["text"], "its prerequisite reaches the coordinator"
+
+
 def test_a_run_without_a_guard_stop_gets_no_guard_block(env, tmp_path):
     from ttp.prompts import worker_task
     p = make(env)
