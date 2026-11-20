@@ -14,6 +14,8 @@ this plugin is copied into the target tt-metal checkout.
 This is a correctness-preserving transform. Every rewrite must be proven numerically equivalent to the graph it replaces — see **Verify every rewrite** below. Do not land a rewrite you have not PCC-checked on real shapes and dtypes.
 
 
+Fused paths can change rounding and L1 use; known fused-op failure modes are in [numerics](../ttnn-knowledge/topics/numerics.md), [memory](../ttnn-knowledge/topics/memory.md) and [multi-chip and CCL](../ttnn-knowledge/topics/multichip.md).
+
 ## Steps to execute graph fusion
 
 ### Step 1

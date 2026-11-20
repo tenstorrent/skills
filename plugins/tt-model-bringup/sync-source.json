@@ -127,7 +127,7 @@
       "destination": "skills/datatype-sweep/SKILL.md",
       "blob": "457749253d5a2a220e7545c02f4e433cc984af12",
       "source_sha256": "25b874a7b6cf277e4e11d28c06c84056790b4ff61064defb24216ec1844d5764",
-      "packaged_sha256": "63cff47dc8078b2481f60907b5bf5b975d3844bcb1b2d5577fdd20d22dd57bc5"
+      "packaged_sha256": "6ad4fc94cbf368bfa46d8c057b5a6ab4e2a0bdc8cea58fbf9fd14adfa17ac23f"
     },
     {
       "source": ".agents/skills/datatype-sweep/agents/openai.yaml",
@@ -141,7 +141,7 @@
       "destination": "skills/full-model/SKILL.md",
       "blob": "de994d5552a74b4f1cdcaf64f6ba364178b8d5a4",
       "source_sha256": "0618a7bd6ee01f995cb98dd73a9b2c46d8fd3daab9fcecdafde67501c529d2f8",
-      "packaged_sha256": "5ed7798edb4731d18785723877f2555a317fa37977f7998625d8d59447d2b241"
+      "packaged_sha256": "6a69c55ad612e526795aba4811eead928cbf785b1e97d64e25e1860e83a3dc47"
     },
     {
       "source": ".agents/skills/full-model/agents/openai.yaml",
@@ -155,7 +155,7 @@
       "destination": "skills/functional-decoder/SKILL.md",
       "blob": "5ea84505c81347d6773fc8325c3115d31094e5d8",
       "source_sha256": "133caffc050d9bb0343a37509ce09a6b2a4e640294761e7226e52f8f82037b71",
-      "packaged_sha256": "d7b8a0233acf2d619dbe02257fdb406e717edf0550f67752fa9b843ce1d2618f"
+      "packaged_sha256": "2a67d8f0193f04b0855c37cb71ca902448b47db64e7545217660450ed1a838a7"
     },
     {
       "source": ".agents/skills/functional-decoder/agents/openai.yaml",
@@ -169,7 +169,7 @@
       "destination": "skills/graph-fusing/SKILL.md",
       "blob": "dfdc9e58fe3dc32637a06f28b6fa4da7a393a42b",
       "source_sha256": "4b487b8032b056b83b9bb099b51464044561919b773295d8c563ffcacb014602",
-      "packaged_sha256": "d7b00f48b6ac2ccaa28edc2e166680f1fa0af0605302b6b6008b426df87db7bc"
+      "packaged_sha256": "6cb627170ab4fd905a434408c4f9c47ab6c4e13822cef6f01c1bc872ed068f77"
     },
     {
       "source": ".agents/skills/graph-fusing/agents/openai.yaml",
@@ -183,7 +183,7 @@
       "destination": "skills/multichip/SKILL.md",
       "blob": "664b6e6b1383d948226185bfa7ba139b9ff1c9b2",
       "source_sha256": "a7430e0f96204dfcd0b70aa689ee88d8ddf61e37a9260ffdfae6ca799f6e6494",
-      "packaged_sha256": "ebbd90d2e4c82bbfb1fb0222d5b46a29049ec5a448cd65bf84a353e91e0ab25c"
+      "packaged_sha256": "4e62e48f45c90220f94b35b57a8f8a5d658fa28a5bc191c9db0fa1bb32ee77b7"
     },
     {
       "source": ".agents/skills/multichip/agents/openai.yaml",
@@ -197,7 +197,7 @@
       "destination": "skills/optimize/SKILL.md",
       "blob": "280abb027d839f1f076ab8a524fc6f61ed6df587",
       "source_sha256": "c4b4015ed198c305ed19f73c2ef6a539923212457588319767d08489a5331c8b",
-      "packaged_sha256": "757b01693bfebc8d0b86a277c72f383177097987f00e11c1c977bf8e7e806617"
+      "packaged_sha256": "947a68d52c08c447e2dada57ef6eed3b71594775f2837f65ef8ab293412669f5"
     },
     {
       "source": ".agents/skills/optimize/agents/openai.yaml",
@@ -239,7 +239,7 @@
       "destination": "skills/tt-device-usage/SKILL.md",
       "blob": "273f20c58cbd80640677004635e43ce47d759891",
       "source_sha256": "b32b5685e47932e1356762c96f70f2ee5cc226ce23d5e1781f9a6bfe26a66502",
-      "packaged_sha256": "9d7ebeddeff62f8c8fde6f9ae5afb9e8ff4009b4f55a0cad2043ece997e1a982"
+      "packaged_sha256": "fd9441fb2a868b59918b5c27dc1c80afa32a0fb5f2b791279e7603049c2a6c8b"
     },
     {
       "source": ".agents/skills/tt-device-usage/agents/openai.yaml",
@@ -253,7 +253,7 @@
       "destination": "skills/tt-enable-tracing/SKILL.md",
       "blob": "379f135ff209af802207532f5ad1dc1a88a70627",
       "source_sha256": "2b708c499a67a0fccd6618d6f0c2956f532605b5643c6d70e18a5c70f5bbb1da",
-      "packaged_sha256": "b5bc74494a6e06ec6defef0dd7edec1bcc46e7f7e196f42a93171f319e693418"
+      "packaged_sha256": "ae1ef9a8b5718079189cef615677b5a7ba7add6f8bdf7e43d3bd33ad39b9a875"
     },
     {
       "source": ".agents/skills/tt-enable-tracing/advanced_perf_optimizations.md",

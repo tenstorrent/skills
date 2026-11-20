@@ -93,6 +93,8 @@ Note sometimes different datatypes require small semantic changes to the code. K
 
 ## MoE Policy
 
+Geometry tuned for one precision rarely fits another; a candidate that fails on L1 is not yet rejected on accuracy ([memory](../ttnn-knowledge/topics/memory.md)). Expert layers differ in how much low precision they tolerate ([MoE](../ttnn-knowledge/topics/moe.md)).
+
 Treat expert matmuls like MLP matmuls:
 
 - expert gate/up projections follow the FF1+FF3 policy;

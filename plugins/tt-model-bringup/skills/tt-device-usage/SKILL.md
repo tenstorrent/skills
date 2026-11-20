@@ -22,6 +22,9 @@ Use this skill for the hardware-facing parts of model bringup. It covers only no
 - Launch device jobs detached, with their own lifetime; a job tied to a short-lived remote session dies with it and leaves the device open.
 - Do not reproduce a known hang on a board nobody can power-cycle remotely. Before any reset or health check, copy the debug dumps it may overwrite.
 - Record firmware and driver versions per machine. When results differ between machines, suspect the machine before the model.
+- On QB2 the two dies of a p300c card share a reset: resetting one die alone has broken the Ethernet links to the others. Pause the other die's job and reset the card or the board.
+- `tt-smi -r` inherits `TT_VISIBLE_DEVICES`: run from a die-scoped shell, a "whole-board" reset touches only that die.
+- Importing ttnn or converting tensors to block-float formats on the host opens the devices and takes their locks; do it under the device lock too.
 - Host-wall numbers from concurrent one-process-per-chip runs are not same-regime: report device time, or serialize the runs that back a host-wall or TTFT claim, and say which. A chip released or added mid-stage splits the regime: label every measurement with its regime (`serial` or `concurrent` and the chips in use) in its sidecar, and re-measure the selected configuration serially before ranking it against measurements from the other regime.
 - A chain driver that serializes device jobs is stopped between jobs with its own mechanism (a stop file or a queue flag it checks before each launch), so the running job finishes and releases the chip; killing the driver or the job mid-dispatch leaves the chip wedged.
 - Keep watcher and profiler evidence in separate runs. Do not combine `TT_METAL_WATCHER` with device-profiler or Tracy collection.

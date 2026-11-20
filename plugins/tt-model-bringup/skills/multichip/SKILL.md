@@ -141,7 +141,7 @@ Do not phrase distributed RMSNorm as always mandatory. Correct RMSNorm is mandat
 
 ## MoE And Expert Replication
 
-For TP up to 8 devices, the default is to run each active expert selected by the gate with tensor parallelism. Keep the gate-selected active-expert path from the single-chip baseline; do not run every expert densely as the final path unless there is no practical alternative.
+For TP up to 8 devices, a common starting point is to run each active expert selected by the gate with tensor parallelism; expert-parallel placement can be faster at large batch, so measure both on full-model step time (see [MoE](../ttnn-knowledge/topics/moe.md)). Keep the gate-selected active-expert path from the single-chip baseline; do not run every expert densely as the final path unless there is no practical alternative.
 
 For routed MoE decode on non-Galaxy systems, use the GPT-OSS generic experts path as the first reference. The important pattern is router/top-k scores as a sparsity tensor, `ttnn.sparse_matmul` for gate/up/down active-expert projections, score weighting, `ttnn.sum` or the model-appropriate reduce over experts, and only then any required TP/EP collective. Read these files first:
 

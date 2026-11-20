@@ -94,7 +94,7 @@ operator in the run record and the full-model goal starts from `tt/optimized_dec
 single-chip is then the target topology, not a fallback, and the later stages say so.
 
 `tt-device-usage`, `tt-enable-tracing`, `qualitative-check`, `stage-review` and `agentic-serving`
-provide shared requirements. AutoDebug/AutoTriage/AutoFix come from the explicit dependency. Implementation
+provide shared requirements; [`ttnn-knowledge`](../ttnn-knowledge/SKILL.md) holds what earlier bringups learned, by topic. AutoDebug/AutoTriage/AutoFix come from the explicit dependency. Implementation
 stages 1–10 require independent review with `clean-pass`; findings require repairs and rereview.
 The benchmark stage (11) measures serving rates and checks measurement completeness without an
 accuracy acceptance review; goal 12 then runs the agentic evals on those rates. Preserve original goal

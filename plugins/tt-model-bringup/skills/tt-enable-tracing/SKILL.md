@@ -191,6 +191,8 @@ Exercise every trace variant and the real replay ordering, including alternating
 
 First fix late compilation and unintended persistent allocations. For deliberately shared buffers that remain, use `trace_allocation_tracker.acknowledge_corruptible(tensor)` whenever possible. Acknowledge only the exact tensors whose lifetimes have been reviewed. If a known output is created during capture, identify it after capture and acknowledge that output before replay, rather than exempting the capture window:
 
+Causes seen in earlier bringups, and what helped: [tracing](../ttnn-knowledge/topics/tracing.md).
+
 ```python
 from ttnn.tools import trace_allocation_tracker
 

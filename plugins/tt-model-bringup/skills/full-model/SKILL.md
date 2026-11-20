@@ -211,6 +211,8 @@ When an accuracy failure appears to follow a dtype, cache dtype, math fidelity, 
 
 For paged decode, validate the cache/page-table allocation contract against the attention op's rounded read window, not just the requested token count rounded to page size. Record the first top-k miss index, absolute sequence position, page/block id, and dynamic attention chunk boundary before blaming dtype drift. If misses cliff at a page, tile, power-of-two, or chunk boundary, run an over-allocation control where the cache/page table covers the next SDPA decode rounded read window. A passing over-allocation control is an allocation/attention-window bug, even if BF16 happened to mask the shorter allocation.
 
+A chunk that does not divide the page-table capacity reads page ids past the request's pages, and uninitialized table tails then read garbage: [prefill and KV](../ttnn-knowledge/topics/prefill-kv.md).
+
 ## Performance
 
 Measure warmed full-model prefill and decode behavior, not just block latency. Include generator overhead, cache management, final norm, LM head, logits, and sampling in the reported numbers unless the project specifically asks for device-only timing. Use the $optimize skill to ensure on-device performance is as high as you can get it, but in addition now we care about the end-to-end time as measured from the host. Section 4.5 of `tech_reports/LLMs/llms.md` has great advice on this that you should read, understand and follow.
