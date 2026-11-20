@@ -167,7 +167,7 @@ def refusal(cfg: dict, policy: list | None = None) -> str:
             return ""
         harness = str(arm.get("harness") or "claude-code")
     if harness in HARNESSES:
-        if policy is not None and not policy and not glmwork.settings(cfg):   # a covered project needs no list
+        if policy is not None and not policy and not w:   # a covered project needs no list
             return (f"route.code_sonnet glm_share is treated as 0: this project has no policy file list "
                     f"(harness/{policyfiles.FILE}); the arm never takes a task before the project names the "
                     f"files that decide its audit, review, approval, budget and push rules")

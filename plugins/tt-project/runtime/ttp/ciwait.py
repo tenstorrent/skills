@@ -186,7 +186,27 @@ def probe(repo: str | None = None, branch: str | None = None, sha: str | None = 
                                 f"routes it"]
 
 
+def pr_checks(repo: str | None, branch: str | None, sha: str | None) -> tuple[int, list[str]]:
+    """The workstation route allows no `gh run list`: read the PR's head and checks with `gh pr view`
+    instead. 0 once every check on the head completed, 75 while one is queued or running (or gh cannot answer)."""
+    view = _gh(["pr", "view", *([branch] if branch else []), *_repo(repo), "--json", "headRefOid,statusCheckRollup"])
+    if not isinstance(view, dict):
+        return 75, ["not yet: gh could not read the pull request"]
+    head, checks = str(view.get("headRefOid") or ""), view.get("statusCheckRollup") or []
+    if sha and not head.startswith(sha):
+        return 75, [f"not yet: the pull request head is {head[:12] or '?'}, not {sha[:12]}"]
+    if not checks:
+        return 75, [f"not yet: no checks on {head[:12]}"]
+    live = [c for c in checks if (c.get("status") or "COMPLETED") != "COMPLETED"
+            or (c.get("state") or "SUCCESS") in ("PENDING", "EXPECTED")]
+    if live:
+        return 75, [f"running: {len(live)} of {len(checks)} checks on {head[:12]} not completed"]
+    return 0, [f"done: {len(checks)} checks on {head[:12]} completed"]
+
+
 def _probe(repo, branch, sha, workflow, run, hang, **kw) -> tuple[int, list[str]]:
+    if not run and ghroute.route() == ghroute.WORKSTATION:
+        return pr_checks(repo, branch, sha)
     if run:
         one = _gh(["run", "view", str(run), *_repo(repo), "--json", RUN_FIELDS + ",headBranch"])
         if one is None:

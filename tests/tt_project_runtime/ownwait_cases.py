@@ -151,6 +151,10 @@ def test_a_fix_on_an_unlanded_stack_that_waits_on_its_ancestors_landing_is_hande
     # The same wait with `|| exit 1`, or as landed:#A, is the same shape.
     t = _reply_wait_hand_off(p, d, tmp_path, b, waiting_for="x", retry_when=f"landed:#{a}")
     assert json.loads(t["result"])["status"] == "done"
+    t = _reply_wait_hand_off(p, d, tmp_path, b, waiting_for="x", retry_when=f"ttp landed --task {a} || exit 1",
+                             wake_tier="light", survives_reboot=True)
+    res = json.loads(t["result"])
+    assert res["status"] == "done" and not {"wake_tier", "survives_reboot", "retry_when_orig"} & set(res), res
     # A task outside the stack keeps its wait; so does a stack wait with a second condition.
     other = p.db.add_task("other", "s", kind="code", tier="standard", origin="user")
     t = _reply_wait_hand_off(p, d, tmp_path, other, waiting_for="x", retry_when=f"ttp landed --task {a}")

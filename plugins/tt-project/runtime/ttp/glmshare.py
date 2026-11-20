@@ -251,7 +251,6 @@ def _requeued(db, since: float) -> set[int]:
 # What keeps eligible work on Claude: the user's own rule (True: deep thinking, optimization or design, a run that
 # talks to a person, a review or plan, the Claude holdout, outside text, an explicit pin or a bounce back for Opus)
 # or a rule that is not (False).
-ELIGIBLE = ("code", "work", "question", "harness")
 KEEPERS = {"coordinator turn": True, "review": True, "plan": True, "deep": True, "needs_opus bounce": True,
            "design or optimization": True, "person": True, "holdout": True, "untrusted": True, "pin": True,
            "bounced": True, "device": True, "policy files": False, "lineage misses": False, "rerun after a fallback": False,
@@ -266,6 +265,7 @@ _WHY = (("policy", "policy files"), ("lineage", "lineage misses"), ("needs opus"
 
 def keeper(p, cfg: dict, run: dict, task: dict | None, dev: dict) -> str:
     """The rule that kept a Claude run off GLM (KEEPERS' names, else the raw reason)."""
+    from . import glmwork
     if run.get("role") == "coordinator":
         return "coordinator turn"
     if not task:
@@ -273,7 +273,7 @@ def keeper(p, cfg: dict, run: dict, task: dict | None, dev: dict) -> str:
     kind = str(task.get("kind") or "")
     if kind in ("plan", "review"):
         return kind
-    if kind not in ELIGIBLE:
+    if kind not in glmwork.KINDS:
         return "kind off the list"
     if role_of(run, task, cfg, dev) == "device":
         return "device"
@@ -289,7 +289,6 @@ def keeper(p, cfg: dict, run: dict, task: dict | None, dev: dict) -> str:
     if not why and "conclusion_floor" in note:
         why = "conclusion"
     if not why:
-        from . import glmwork
         try:
             why = glmwork.keeps_core(p.db, cfg, task, str((note.get("pick") or {}).get("tier") or task.get("tier") or "standard"),
                                      None, {"by": "retry"} if (note.get("pick") or {}).get("by") == "retry" else None).lower()

@@ -1147,3 +1147,26 @@ def test_gh_workstation_forks_only_to_a_fresh_name_with_the_exact_form(env, tmp_
         out = ghqueue.answer({"key": key, "argv": [*ok[:4], name, "--clone=false"]}, gh=str(stub))
         assert out["rc"] == 1 and why in out["stderr"], out
         assert "repo fork" not in calls.read_text(), calls.read_text()   # read only, never forked
+
+
+def test_ci_wait_on_the_workstation_route_reads_the_pr_not_the_run_list(env, monkeypatch):
+    """`gh run list` is not on the workstation allowlist, so a branch CI wait never ended; `gh pr view` is."""
+    from ttp import ciwait, ghroute
+    monkeypatch.setattr(ghroute, "route", lambda cfg=None, cwd=None: ghroute.WORKSTATION)
+    calls, view = [], {}
+    monkeypatch.setattr(ciwait, "_gh", lambda args: calls.append(args) or view.get("v"))
+    done = {"name": "t", "status": "COMPLETED", "conclusion": "FAILURE"}
+    view["v"] = {"headRefOid": "a" * 40, "statusCheckRollup": [done, {"name": "u", "status": "IN_PROGRESS"}]}
+    rc, lines = ciwait.probe(repo="o/r", branch="b")
+    assert rc == 75 and "1 of 2" in lines[0], (rc, lines)
+    assert calls == [["pr", "view", "b", "-R", "o/r", "--json", "headRefOid,statusCheckRollup"]], calls
+    view["v"]["statusCheckRollup"][1] = {"context": "ci", "state": "PENDING"}   # a status context, not a check run
+    assert ciwait.probe(repo="o/r", branch="b")[0] == 75
+    view["v"]["statusCheckRollup"][1] = {"context": "ci", "state": "SUCCESS"}
+    assert ciwait.probe(repo="o/r", branch="b")[0] == 0, "every check completed, whatever its result"
+    assert ciwait.probe(repo="o/r", branch="b", sha="b" * 12)[0] == 75, "another head than the one asked for"
+    assert ciwait.probe(repo="o/r", branch="b", sha="a" * 12)[0] == 0
+    view["v"]["statusCheckRollup"] = []
+    assert ciwait.probe(repo="o/r", branch="b")[0] == 75, "no checks yet"
+    view["v"] = None
+    assert ciwait.probe(repo="o/r", branch="b")[0] == 75, "gh cannot answer"

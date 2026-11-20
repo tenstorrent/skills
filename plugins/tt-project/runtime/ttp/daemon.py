@@ -8174,8 +8174,7 @@ class Daemon:
             # through the head's review, so waiting on an ancestor's landing never ends. Done instead.
             summary = (f"{summary} (handed off done: it sat on the landing of #{anc}, a task in its own stack; "
                        f"the head's review approves the stack)")[:1500]
-            result = {**{k: v for k, v in result.items() if k not in (
-                "retry_when", "retry_when_orig", "waiting_for", "then", "retry_after_s", "next_step", "on_pass_cmd")},
+            result = {**{k: v for k, v in result.items() if k not in WAIT_KEYS + ("retry_when_orig",)},
                 "status": "done", "summary": summary}
             waiting, rstatus = False, "done"
             log(self.p, f"task {task['id']} hand-off: its wait on #{anc}'s landing is in its own stack: taken as done")
