@@ -42,9 +42,9 @@ def run(argv: list[str]) -> int:
     this process (a `timeout`, a closed terminal) is passed on to the command."""
     from . import hoststate, leakfile, sudowatch, testslots
     run_dir = os.environ.get("TTP_RUN_DIR")
-    env = hoststate.fake_env(leakfile.with_path(dict(os.environ)),
-                             Path(run_dir) / "hoststate" if run_dir and os.path.isdir(run_dir) else None)
-    temp = not os.environ.get(hoststate.MARKER) and not (run_dir and os.path.isdir(run_dir))
+    store = Path(run_dir) / "hoststate" if run_dir and os.path.isdir(run_dir) else None
+    env = hoststate.fake_env(leakfile.with_path(dict(os.environ)), store)
+    temp = not os.environ.get(hoststate.MARKER) and store is None
     argv, dropped = testslots.drop_xdist(argv)
     if dropped:
         print(f"ttp sandbox: {dropped}", file=sys.stderr, flush=True)
@@ -60,8 +60,6 @@ def run(argv: list[str]) -> int:
             proc = subprocess.Popen(argv, env=env, pass_fds=grant.fds() if grant else ())
         except OSError as e:
             print(f"ttp sandbox: {argv[0]}: {e.strerror}", file=sys.stderr)
-            if temp and env.get(hoststate.MARKER):
-                shutil.rmtree(env[hoststate.MARKER], ignore_errors=True)
             return 127 if isinstance(e, FileNotFoundError) else 126
 
         def end(*_):
@@ -77,8 +75,6 @@ def run(argv: list[str]) -> int:
         changed, said = guard.end()
         for line in said:
             print(f"ttp sandbox: {line}", file=sys.stderr, flush=True)
-        if temp and env.get(hoststate.MARKER):
-            shutil.rmtree(env[hoststate.MARKER], ignore_errors=True)
         rc = rc if rc >= 0 else 128 - rc
         return 1 if changed and rc == 0 else rc
     finally:
@@ -90,3 +86,5 @@ def run(argv: list[str]) -> int:
                 sudowatch.observe(lines, f"{os.environ.get('TTP_RUN_ID') or os.getpid()}:{watch.started}")
             finally:
                 watch.close()
+        if temp and env.get(hoststate.MARKER):
+            shutil.rmtree(env[hoststate.MARKER], ignore_errors=True)
