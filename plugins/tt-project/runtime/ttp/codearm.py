@@ -249,11 +249,11 @@ def user_arm(db, task: dict) -> tuple[int, str]:
 
 def stays(db, cfg: dict, task: dict, tier: str, picked: dict | None = None, policy: list | None = None) -> str:
     """Why `task` stays on Claude now ('' when the arm may take it): the Sonnet route's own stays
-    (runclass.code_route), a resource, a protected class, a `conclusion:` line, the force line, a user order,
+    (runclass.code_route), a resource (not on device work the glm_device route takes), a protected class, a `conclusion:` line, the force line, a user order,
     a policy-class spec (policyfiles.task_reason against the project's list `policy`, model-free), an unsupported
     harness. A task the user ordered onto the arm (user_arm) skips the user-order and policy-class checks. A project
     the GLM work route covers has no policy-class stay: GLM writes those files too and the review checks them."""
-    from . import glmwork, policyfiles, route, runclass, urgent
+    from . import deviceplan, glmwork, policyfiles, route, runclass, urgent
     ordered = user_arm(db, task)[0]
     if (task.get("kind") or "") != "code":
         return "not_code"
@@ -262,8 +262,9 @@ def stays(db, cfg: dict, task: dict, tier: str, picked: dict | None = None, poli
             return why
         if str(tier or task.get("tier") or "standard") not in ("standard", "light"):
             return "tier"
-        if any(lb.startswith(("resource:", "exclusive:", "read:")) for lb in task_labels(task)):
-            return "resources"
+        if any(lb.startswith(("resource:", "exclusive:", "read:")) for lb in task_labels(task)) and not (
+                deviceplan.device(task, cfg) and deviceplan.on(cfg)):
+            return "resources"   # device work takes the GLM device route whatever its kind (deviceplan.py)
         if FORCE.search(str(task.get("spec") or "")):
             return "forced_claude"
         return ""   # no policy-file stay here: GLM writes those files too, and Opus reviews them (review notes name them)

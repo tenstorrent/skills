@@ -144,6 +144,31 @@ def test_glm_work_takes_code_tasks_through_the_guarded_code_arm(env):
     assert codearm.choose(p.db, cfg, person, "standard")["run"] == "claude"
 
 
+def test_glm_device_routes_device_work_by_its_need_whatever_its_kind(env):
+    """A task that needs a device takes the GLM device route on a glm_device project, filed as code or as work;
+    off glm_device, a review naming a device, and code with no device need route as before."""
+    from ttp import codearm, deviceplan, glmwork, policyfiles
+    p = make(env)
+    (p.harness / policyfiles.FILE).write_text("src/policy_module.py\n")
+    dev, off = _gw_cfg(holdout=0, device=True), _gw_cfg(holdout=0)
+    box = ["resource:box-a-device"]
+    route = lambda cfg, t: _gw_daemon(p, cfg)._route(t, "standard", None, 1.0, cls="routine")   # noqa: E731
+    code = _gw_task(p, "Rebuild the driver and run the box test.", kind="code", labels=box)
+    assert deviceplan.device(code, dev) and deviceplan.on(dev) and not deviceplan.on(off)
+    assert codearm.stays(p.db, dev, code, "standard") == ""
+    got = route(dev, code)
+    assert got and got["to"] == "chat" and got[codearm.KEY] == "glm" and got[glmwork.KEY] == "glm"
+    assert codearm.stays(p.db, off, code, "standard") == "device" and route(off, code) is None
+    work = _gw_task(p, "Rebuild the driver and run the box test.", labels=box)
+    got = route(dev, work)
+    assert got and got[glmwork.KEY] == "glm" and codearm.KEY not in got and route(off, work) is None
+    review = _gw_task(p, "Review the box test change.", kind="review", labels=box)
+    assert route(dev, review) is None and glmwork.keeps_core(p.db, dev, review, "standard") == "review"
+    plain = _gw_task(p, kind="code")
+    for cfg in (dev, off):
+        assert codearm.stays(p.db, cfg, plain, "standard") == "" and route(cfg, plain)[codearm.KEY] == "glm"
+
+
 def test_glm_work_fallback_names_sonnet_for_endpoint_refusals_only(env):
     from ttp import glmwork
     cfg = _gw_cfg()
