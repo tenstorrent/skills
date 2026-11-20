@@ -5160,8 +5160,11 @@ flag back. The command writes only the account settings and the ledger, never a 
 config or state. The shipped defaults list no project: which projects are in ring 1 is the account's setting.
 
 Health watch. Every 15 minutes the daemon compares each project that has a flag on with its own trailing 7 days
-before the flag reached its ring, with no model call. A flag turns off for everyone, is frozen and writes the
-ledger (the daemon's rollback) on: failed runs up 5 points (at least 20 runs, login failures excluded); median
+before the flag reached its ring, with no model call. A failing signal switches the flag off for that project
+alone and writes the ledger (`project_rollback`); the other projects keep it, and only `ttp rollout rollback`
+from the terminal freezes a flag for everyone. A model-route flag (`glm_code`, `glm_work`, `glm_device`) counts
+only the work its route ran: a task's runs and landings count when its latest worker run was on GLM and form the
+baseline otherwise; `glm_coord` counts only coordinator turns on GLM. The signals are: failed runs up 5 points (at least 20 runs, login failures excluded); median
 time to land over 1.5x or cost per landing over 1.3x (at least 20 landings). These compare like for like: each run
 or landing is set against the baseline of its own task kind and tier, kinds the baseline lacks are left out of
 both the sample and the comparison, and the rollback names the metric, the sample and each kind's figures, so a
@@ -5176,12 +5179,16 @@ post-landing checks of a landed change that touched a file the flag gates (its `
 before landing is routine and not counted, and a revert whose commit cannot be read counts against no flag; a
 model-route flag such as `glm_code`, `glm_work` or `glm_coord` counts it only when the change ran on its model, by
 the run records of its task and review, or when a failing test lies in a gated module's case file or names the
-flag's key, so a change made on another model that only touched those files never freezes it); or a task running with no run and no change for 2 h. A shadow flag (`shadow` in `ttp rollout status`: it only
+flag's key, so a change made on another model that only touched those files never switches it off); or a task running with no run and no change for 2 h.
+A task waiting in a live batch never counts as stuck. For a model-route flag, a task counts only when its own
+latest worker run was on the route, so one that bounced off GLM and stalled elsewhere is only listed under
+`reported`. A coordinator-turn flag runs no task. A shadow flag (`shadow` in `ttp rollout status`: it only
 records beside the normal path, posts nothing, changes no run and makes no model call; `eta_history` is one) is
 judged on none of these: the watch never rolls it back, and `ttp rollout rollback` by hand still does. The
 limits are settings (`rollout.thresholds`: `failed_runs_pts`, `min_runs`, `land_time_x`, `cost_x`,
 `min_landings`, `stuck_h`, `baseline_days`, `soak_h_0`, `soak_h_1`, `max_window_h`). A rollback raises a normal
-alert for the project's coordinator; the flag stays off until `ttp rollout arm <flag>`. A flag promotes one ring
+alert for the project's coordinator; the flag stays off there until `ttp rollout arm <flag> <project>`, which
+restarts that project's judging window at the re-arm. A flag promotes one ring
 only when every project listed in its current ring has voted clean (enough samples, no failing signal) after the
 ring's soak (1 h in ring 0, 24 h in ring 1). Too few samples never promote: after 72 h a low note says so.
 `promote` by hand ignores health, as the user's own word. A project's own explicit setting for the feature's key
