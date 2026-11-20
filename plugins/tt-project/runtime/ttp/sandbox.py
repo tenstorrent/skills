@@ -4,14 +4,17 @@ It is a pass-through that keeps existing configs and worker habits working. A py
 xdist workers from the host's test slots (testslots.direct), and its xdist options are dropped where
 xdist is not installed. The command gets the account's leak-pattern file by path (leakfile), as checks
 do, and the sudo wrapper (sudowatch): once it ends, stderr says what sudo it ran and which root
-processes that left running."""
+processes that left running. The host's real crontab, systemd user units and power state stay out of
+its reach (hoststate): it sees stand-ins, and the run fails if it still changed the real host."""
 from __future__ import annotations
 
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
+from pathlib import Path
 
 
 def _test_slots(argv: list[str], env: dict):
@@ -37,8 +40,11 @@ def _test_slots(argv: list[str], env: dict):
 def run(argv: list[str]) -> int:
     """`ttp sandbox -- <cmd...>`: run `argv` as it is and return its exit code. A SIGTERM or SIGHUP to
     this process (a `timeout`, a closed terminal) is passed on to the command."""
-    from . import leakfile, sudowatch, testslots
-    env = leakfile.with_path(dict(os.environ))
+    from . import hoststate, leakfile, sudowatch, testslots
+    run_dir = os.environ.get("TTP_RUN_DIR")
+    env = hoststate.fake_env(leakfile.with_path(dict(os.environ)),
+                             Path(run_dir) / "hoststate" if run_dir and os.path.isdir(run_dir) else None)
+    temp = not os.environ.get(hoststate.MARKER) and not (run_dir and os.path.isdir(run_dir))
     argv, dropped = testslots.drop_xdist(argv)
     if dropped:
         print(f"ttp sandbox: {dropped}", file=sys.stderr, flush=True)
@@ -49,10 +55,13 @@ def run(argv: list[str]) -> int:
     except OSError:
         watch = None
     try:
+        guard = hoststate.Guard(env)
         try:
             proc = subprocess.Popen(argv, env=env, pass_fds=grant.fds() if grant else ())
         except OSError as e:
             print(f"ttp sandbox: {argv[0]}: {e.strerror}", file=sys.stderr)
+            if temp and env.get(hoststate.MARKER):
+                shutil.rmtree(env[hoststate.MARKER], ignore_errors=True)
             return 127 if isinstance(e, FileNotFoundError) else 126
 
         def end(*_):
@@ -65,7 +74,13 @@ def run(argv: list[str]) -> int:
         signal.signal(signal.SIGHUP, end)
         signal.signal(signal.SIGINT, signal.SIG_IGN)   # a terminal's Ctrl-C reaches the command
         rc = proc.wait()
-        return rc if rc >= 0 else 128 - rc
+        changed, said = guard.end()
+        for line in said:
+            print(f"ttp sandbox: {line}", file=sys.stderr, flush=True)
+        if temp and env.get(hoststate.MARKER):
+            shutil.rmtree(env[hoststate.MARKER], ignore_errors=True)
+        rc = rc if rc >= 0 else 128 - rc
+        return 1 if changed and rc == 0 else rc
     finally:
         if watch is not None:
             try:

@@ -282,12 +282,11 @@ def _proc_table(proc: str) -> list[dict]:
     return out
 
 
-def ref_lock_holder(lock: Path, mtime: float, roots: list[Path], table: list[dict], git_only: bool = False) -> str:
+def ref_lock_holder(lock: Path, mtime: float, roots: list[Path], table: list[dict]) -> str:
     """Why a ref lock may still be owned ("" when nothing holds it): a process has it open, or a live
     process that started before the lock was written (2 s slack for the clock's rounding) has its
     working directory or GIT_DIR inside the repository. A git process of this user whose working
-    directory cannot be read counts as one; any other process that cannot be read does not. git_only:
-    only git processes count for the working-in-the-repository check (any opener still counts)."""
+    directory cannot be read counts as one; any other process that cannot be read does not."""
     names = {str(lock), os.path.realpath(lock)}
     mine = os.getuid()
     for row in table:
@@ -296,8 +295,6 @@ def ref_lock_holder(lock: Path, mtime: float, roots: list[Path], table: list[dic
     for row in table:
         start = row["start"]
         if start is not None and start > mtime + 2.0:
-            continue
-        if git_only and not _is_git(row["comm"]):
             continue
         paths = ([row["cwd"]] if row["cwd"] else []) + row["gitdirs"]
         if any(_within(Path(os.path.realpath(x)), roots) for x in paths):

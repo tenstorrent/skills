@@ -514,7 +514,7 @@ class Codex(Provider):
     def launch_sandbox(self, argv):
         i = next((k for k, w in enumerate(argv) if w in ("-s", "--sandbox")), None)
         mode = argv[i + 1] if i is not None and i + 1 < len(argv) else ""
-        return super().launch_sandbox(argv) or ("" if mode in ("", "danger-full-access") else f"codex-{mode}")
+        return "" if mode in ("", "danger-full-access") else f"codex-{mode}"
 
     def fenced(self, restrictions=None):
         return bool((restrictions or {}).get("no_internet"))

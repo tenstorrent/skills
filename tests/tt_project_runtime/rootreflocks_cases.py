@@ -156,22 +156,3 @@ def test_root_ref_lock_holder_counts_unreadable_git_of_this_user_only_and_resolv
     assert check(row(7, cwd=str(repo / "a" / "b"), start=None)).startswith("pid 7 works"), "unknown start: may own it"
     assert check(row(8, cwd=str(repo / "a"), start=201.5)).startswith("pid 8 works"), "clock slack"
     assert check(row(9, fds={str(lock)}, start=900.0)) == "pid 9 has it open"
-
-
-def test_root_lock_holder_git_only_counts_only_git_working_in_the_repository(tmp_path):
-    sys.path.insert(0, str(RUNTIME))
-    from ttp import gitlocks
-    repo = tmp_path / "root"
-    roots, lock, me = [repo, repo / ".git"], repo / ".git" / "config.lock", os.getuid()
-
-    def row(pid, **kw):
-        return {"pid": pid, "uid": me, "start": 100.0, "comm": "claude", "cwd": str(repo), "gitdirs": [],
-                "fds": set(), **kw}
-
-    check = lambda *rows: gitlocks.ref_lock_holder(lock, 200.0, roots, list(rows), git_only=True)
-    assert check(row(1), row(2, gitdirs=[str(repo / ".git")])) == ""
-    assert check(row(3, comm="git")).startswith("pid 3 works in the repository")
-    assert check(row(4, comm="git-upload-pack", start=None)).startswith("pid 4 works")
-    assert check(row(5, comm="git", start=500.0)) == "", "started after the lock"
-    assert check(row(6, comm="git", cwd=None)) == "pid 6 cannot be checked"
-    assert check(row(7, fds={str(lock)})) == "pid 7 has it open", "any opener counts"
