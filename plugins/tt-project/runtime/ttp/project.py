@@ -726,10 +726,7 @@ EXTRA_KEYS = {
     # "min_tasks", "worse_pts", "bounce" (false: a GLM hand-off asking for Opus or deep stands, glmwork.bounce_reason)); core_cheap: {class: {"model", "effort"} | false} or false. Both
     # are account keys too (ACCOUNT_KEYS): the account's value first, the project's own over it. classes,
     # review_small_lines: the run classes' map and the small-review size; host_max: host-wide (HOST_WIDE_KEYS).
-    # glm_refusals: the GLM guard's refusals (glmguard.refused): {"hand_back_after": the refusal count in one run that
-    # hands the task back to Opus (default 3), "redirect": false hands it back on the first refusal}.
-    "route": {"code_sonnet", "core_cheap", "device_ab", "device_ab_shadow", "classes", "review_small_lines", "host_max", "glm_work",
-              "glm_refusals"},
+    "route": {"code_sonnet", "core_cheap", "device_ab", "device_ab_shadow", "classes", "review_small_lines", "host_max", "glm_work"},
     "budget": {"max_waits", "hourly_floor_usd", "estimate_weights", "hourly_waste_usd", "hourly_waste_runs",
                "hourly_coordinator_turns", "hourly_coordinator_repeats", "max_pace_hold_s",
                "cap_yellow_pct"},   # max_pace_hold_s: deprecated and ignored; accepted so old configs stay quiet
@@ -3311,7 +3308,7 @@ CPU_GROUP_KEYS = {"cpu_quota", "busy_cpu_quota", "busy_probe", "busy_probe_s", "
 # project's own project.json, so the projects on a machine agree unless one overrides a key.
 ACCOUNT_KEYS = {"budget": {"global_daily_usd", "day_start", "timezone", "push_spend_to"}, "pricing": {"claude", "codex"},
                 "guards": {"protected_paths"},   # paths no run on the host writes (pathguard)
-                "route": {"host_max", "classes", "review_small_lines", "code_sonnet", "core_cheap", "device_ab", "device_ab_shadow", "glm_work", "glm_refusals"},   # route.host_limit; run-class routing (runclass.py); route.device_ab (deviceab.py)
+                "route": {"host_max", "classes", "review_small_lines", "code_sonnet", "core_cheap", "device_ab", "device_ab_shadow", "glm_work"},   # route.host_limit; run-class routing (runclass.py); route.device_ab (deviceab.py)
                 "checks": {"host_max", "bare_slots", "idle_hold_s", "load_extra", "live_cores", "nice", "ionice", "priority_turns", "urgent_slots", "preempt_after_s", "test_pool", "test_run_max",
                            "test_run_min", "test_project_max", "test_project_slots", "test_project_workers", "load_guard", "load_sustain_s", "build_pool", "build_run_max", "build_project_max", "wall_cap_s",
                            "slots", "light_cmds", "max_wait_s", "wait_event_s", "priority_age_s",

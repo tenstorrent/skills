@@ -189,10 +189,7 @@ def test_the_hook_passes_device_reads_and_refuses_writes_outside_the_worktree_in
     for c in ("echo x > /tmp/f", "cmd 2> /tmp/f"):
         out = pre(c)
         assert out and out["hookSpecificOutput"]["permissionDecision"] == "deny", c
-        assert "Instead:" in out["hookSpecificOutput"]["permissionDecisionReason"], c
-    assert not (run / "glm_guard.json").exists(), "a scratch write is a redirect: the run goes on"
-    pre("cmd > /tmp/g")
-    assert (run / "glm_guard.json").exists(), "the third refusal in one run hands it back to Opus"
+    assert (run / "glm_guard.json").exists(), "a refusal hands the run back to Opus"
 
 
 def test_the_guarded_runner_passes_device_reads_and_refuses_writes_outside_the_worktree_in_a_plan_run(tmp_path, monkeypatch):
@@ -211,10 +208,8 @@ def test_the_guarded_runner_passes_device_reads_and_refuses_writes_outside_the_w
     for c in reads:
         assert env.execute({"command": c}, ws)["returncode"] == 0, c
     for c in ("echo x > /tmp/f", "cmd 2> /tmp/f"):
-        got = env.execute({"command": c}, ws)
-        assert got["returncode"] == 2 and "Instead:" in got["output"], c
-    with pytest.raises(glmenv.Submitted):
-        env.execute({"command": "cmd > /tmp/g"}, ws)
+        with pytest.raises(glmenv.Submitted):
+            env.execute({"command": c}, ws)
     assert ran == reads, "a refused command never ran"
 
 

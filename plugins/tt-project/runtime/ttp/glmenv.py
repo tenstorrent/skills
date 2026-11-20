@@ -3,10 +3,9 @@
 """The command layer of a live mini-swe-agent run on the code arm's GLM side (glmguard.py, glmharness.py).
 
 mini-swe-agent has no tool hooks, so its environment class is the guard: `GuardedEnvironment` asks refusal()
-before every command the model proposes. A refused command never runs: glmguard.refused decides it, so a
-redirect returns the reason and the allowed way and the run goes on, and a hand-back to Opus (a harmful attempt,
-the run's third refusal) writes the `needs_opus` hand-off and ends the agent loop. What it checks, with no model
-call:
+before every command the model proposes, and a refused one ends the run as a hand-back to Opus (glmguard.hit
+writes the `needs_opus` hand-off; the command never runs and the agent loop is ended). What it checks, with
+no model call:
 
 - the side-effect rules of glmguard.shell_refusal (a `ttp` command outside the allowed set, a raw `git push`,
   a GitHub write, an HTTP post, ssh or mail, a state or database write, a write outside the worktree);
@@ -116,14 +115,13 @@ class GuardedEnvironment(LocalEnvironment):
         if draft := glmguard.outward_shell(command):   # an outward post: a draft for Opus, the run goes on
             return {"output": glmguard.drafted(run_dir, draft), "returncode": 2, "exception_info": ""}
         here = cwd or getattr(getattr(self, "config", None), "cwd", "") or os.getcwd()
-        if (text := deviceplan.hook_refusal(command, here)) and text.endswith(" first"):   # take the plan or check first
-            return {"output": f"refused: {text}", "returncode": 2, "exception_info": ""}
-        if not text and (why := refusal(command, here, run_dir)):
-            text = glmguard.refused(run_dir, why)[1]   # the command is never run
-        if text and glmguard.hit_reason(run_dir):   # a hand-back to Opus ends the agent loop
-            raise Submitted({"role": "exit", "content": text, "extra": {"exit_status": "GuardRefused", "submission": ""}})
-        if text:   # a redirect: the reason and the allowed way, and the run goes on
-            return {"output": text, "returncode": 2, "exception_info": ""}
+        if (why := deviceplan.hook_refusal(command, here)) and why.endswith(" first"):   # take the plan or check first
+            return {"output": f"refused: {why}", "returncode": 2, "exception_info": ""}
+        if not why and (why := refusal(command, here, run_dir)):
+            glmguard.hit(run_dir, why)   # the hand-back to Opus; the command is never run
+        if why:
+            raise Submitted({"role": "exit", "content": f"refused by the guard: {why}",
+                             "extra": {"exit_status": "GuardRefused", "submission": ""}})
         got = super().execute(action, cwd, timeout=timeout)
         if isinstance(got, dict):
             deviceplan.log_step(run_dir, command, got.get("returncode"), str(got.get("output") or ""))

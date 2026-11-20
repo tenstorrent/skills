@@ -371,8 +371,21 @@ def contract(reason_hint: str = "") -> str:
             "even if you could. Build only what the spec already decided. To hand it back, write result.json with "
             '`{"status": "blocked", "needs_opus": "<one-line reason>", "summary": "needs Opus: <reason>"}` '
             "and stop (the `needs_opus` field makes it a hand-back, not a block). On that exit never run `ttp push`, `git push` or publish a branch; commits you made stay local. "
-            "It spends no attempt and does not count as a failure."
+            "It spends no attempt and does not count as a failure." + _guard_lines()
             + (f"\n{reason_hint}" if reason_hint else ""))
+
+
+def _guard_lines() -> str:
+    """What the arm's guard (glmguard) refuses, built from its own lists so the prompt cannot drift."""
+    from .glmguard import LANDING, OUT_TTP
+    outs = ", ".join(f"`ttp {c}`" for c in sorted(OUT_TTP))
+    lands = ", ".join(f"`ttp {c}`" for c in sorted(LANDING))
+    return ("\n\nOn this arm everything runs except a short list the harness refuses (the task then goes back to "
+            f"Opus): {outs}, `ttp note --to` or `--reply`, `git push`, {lands} or `ttp push --land`, GitHub writes, "
+            "HTTP posts and mail, `ttp machines` writes, writes or deletes outside your worktree and run folder "
+            "(and on another host), protected paths, and resets, power cycles or flashes outside the project's "
+            'approved routes. Use `ttp note "<text>"` for progress and to ack updates: it goes only to your task\'s '
+            "own log, and the coordinator decides what reaches a chat.")
 
 
 def bounce_reason(res: dict | None) -> str:

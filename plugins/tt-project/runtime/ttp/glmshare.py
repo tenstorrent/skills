@@ -86,9 +86,7 @@ GATED = (("first review pass rate", "first_pass_pct", False, "advance_pts", "rol
 REVIEW_KEYS = ("first_pass_pct", "fix_rounds_per_reviewed")   # need min_base reviewed tasks in each arm
 CHUNK = 500
 BAD_KEYS = ("tool_input_errors", "args_unparsed", "args_repaired", "empty_content", "junk_responses")
-# glmguard's fires, read from the run folder: guard_bounces are refusals that handed the run back to Opus (HIT), the
-# bounces the rollout judges count; guard_redirects are refusals the run was told the allowed way for and went on.
-FIRE_KEYS = ("outward_drafts", "gate_stops", "guard_bounces", "guard_redirects")
+FIRE_KEYS = ("outward_drafts", "gate_stops", "guard_bounces")   # glmguard's fires, read from the run folder
 LOOP_KEYS = {"loop_nudges": "nudges", "loop_stops": "stops"}   # chatbridge stats loop (the loop guard)
 BAD_DAYS = 7
 
@@ -388,8 +386,7 @@ def _bridge_of(p, r) -> dict | None:
 
 
 def guard_fires(d: Path) -> dict:
-    """glmguard's fires in one run folder: outward posts it drafted, the gate stop or other bounce it ended on, and
-    the refusals it was redirected on and went on (glmguard.REFUSALS)."""
+    """glmguard's fires in one run folder: outward posts it drafted, the gate stop or other bounce it ended on."""
     from . import glmguard
     n = {k: 0 for k in FIRE_KEYS}
     for name in (glmguard.DRAFTS, glmguard.DRAFTS + ".sent"):
@@ -403,7 +400,6 @@ def guard_fires(d: Path) -> dict:
         hit = None
     if isinstance(hit, dict):
         n["gate_stops" if hit.get("kind") == glmguard.GATE else "guard_bounces"] += 1
-    n["guard_redirects"] = sum(1 for r in glmguard.refusals(d) if not r.get("back"))
     return n
 
 
@@ -455,8 +451,7 @@ def bad_lines(got: list[dict]) -> list[str]:
             f"reasoning-only {v['empty_content']} ({pct(v['pct']['empty_content'])}), junk {v['junk_responses']} "
             f"({pct(v['pct']['junk_responses'])}); loop nudges {v.get('loop_nudges', 0)}, loop stops "
             f"{v.get('loop_stops', 0)}; runs hit {v['runs_hit']}; outward drafts {v.get('outward_drafts', 0)}, "
-            f"gate stops {v.get('gate_stops', 0)}, guard bounces {v.get('guard_bounces', 0)}, "
-            f"guard redirects {v.get('guard_redirects', 0)}" for v in got]
+            f"gate stops {v.get('gate_stops', 0)}, guard bounces {v.get('guard_bounces', 0)}" for v in got]
 
 
 def daily_lines(p, now: float) -> list[str]:

@@ -377,8 +377,8 @@ def _device_plan(payload: dict) -> str:
     """A GLM device run under an Opus plan (deviceplan.py): why this command may not run, '' when it may."""
     from . import deviceplan
     cmd = str((payload.get("tool_input") or {}).get("command") or "")
-    # a step to take first, a redirect or a hand-back to Opus, as deviceplan.hook_refusal decided it
-    return deviceplan.hook_refusal(cmd, str(payload.get("cwd") or "")) or ""
+    why = deviceplan.hook_refusal(cmd, str(payload.get("cwd") or ""))
+    return "" if not why else why if why.endswith(" first") else f"{why}; the run ends and its task goes back to Opus"
 
 
 def _gate_stop(payload: dict, run_dir: str) -> str:
@@ -1226,8 +1226,8 @@ def _pre_tool_use(payload: dict) -> tuple[dict | None, None]:
     if glmguard.glm_run() is not None and (d := glmguard.outward(payload)):   # a draft for Opus, the run goes on
         return _deny(glmguard.drafted(os.environ.get("TTP_RUN_DIR"), d)), None
     if glmguard.active() and (why := glmguard.tool_refusal(payload)):
-        # a redirect (the reason and the allowed way; the run goes on) or a hand-back to Opus (no model call)
-        return _deny(glmguard.refused(os.environ.get("TTP_RUN_DIR"), why)[1]), None
+        glmguard.hit(os.environ.get("TTP_RUN_DIR"), why)   # the run ends as a hand-back to Opus (no model call)
+        return _deny(f"{why}; the run ends and its task goes back to Opus"), None
     if payload.get("tool_name") == "Bash" and (why := _device_plan(payload)):
         return _deny(why), None
     if why := _provenance(untrusted.mark_refusal(str(payload.get("tool_name") or ""), payload.get("tool_input") or {})):
