@@ -1,8 +1,35 @@
 # Capture paths and post-processing
 
+## Streaming profiler (default where the checkout has it)
+
+`TT_METAL_STREAMING_PROFILER=1` is the only switch:
+`MeshDevice` bring-up starts the relays, the host receiver and the clock sync, and kernels compile
+with `-DPROFILE_STREAMING`. It cannot be combined with
+`TT_METAL_DEVICE_PROFILER` (a `TT_FATAL`). On its own it decodes records and
+writes nothing; pick one or more consumers:
+
+| Variable | Effect |
+|---|---|
+| `TT_METAL_STREAMING_PROFILER_TRACY=1` | Feed the Tracy GUI (off by default: costly) |
+| `TT_METAL_STREAMING_PROFILER_OPS_CSV=<path>` | Per-op CSV at that path |
+| `TT_METAL_STREAMING_PROFILER_ZONE_CSV=<path>` | Per-zone CSV at that path |
+| `TT_METAL_STREAMING_PROFILER_DRAM_MB` | Per-relay spool ring in device DRAM, MiB (default 128; 0 pushes directly) |
+| `TT_METAL_STREAMING_PROFILER_FIFO_MB` | Host FIFO per device-to-host socket, MiB (default 128): slack for a slow callback |
+| `TT_METAL_STREAMING_PROFILER_INLINE_ENABLED=0` | For kernels with too many zones to inline |
+
+Or register a callback in the host program (SKILL.md, "Host API"); batches
+arrive while the program runs, with no drain call. A callback that cannot keep up shows as `dropped_bytes()` on its
+batches; a device that waits on the host shows as `PROFILER-STALL` zones.
+
+The CSV columns are per-chip device cycles for now, so compare times across
+chips in the Tracy timeline or a callback (tt-metal #64832, as of 2026-11-19).
+Full option list: `tt_metal/tools/profiler/STREAMING_PROFILER_DETAILED.md`.
+
+## Device profiler (older checkouts)
+
 Three ways in, and they are not alternatives so much as layers.
 
-## 1. The environment variable alone
+### 1. The environment variable alone
 
 ```bash
 TT_METAL_DEVICE_PROFILER=1 ./your_program
@@ -12,7 +39,7 @@ Device zones only, written to the CSV at device close. No host-side timeline, no
 GUI, nothing to install. This is the one to reach for when you want numbers
 rather than a picture.
 
-## 2. `python -m tracy`
+### 2. `python -m tracy`
 
 The Python wrapper. It sets `TT_METAL_DEVICE_PROFILER=1` itself and captures host
 and device together, so you get one timeline rather than two artifacts.
@@ -28,7 +55,7 @@ Viewing that from another machine needs **both** ports forwarded — 8080 for HT
 and 8081 for the WebSocket — to the same ports on the remote loopback interface.
 Forwarding only 8080 gives a page that loads and never connects.
 
-## 3. `tracy-capture`
+### 3. `tracy-capture`
 
 The client that writes a `.tracy` file for later, rather than serving a viewer.
 Built with Tracy enabled, and it must be started **before** the application.
@@ -39,7 +66,7 @@ Built with Tracy enabled, and it must be started **before** the application.
 
 The output compresses well; compress before copying it anywhere.
 
-## Post-processing knobs
+### Post-processing knobs
 
 All read at runtime, all optional:
 
@@ -60,7 +87,7 @@ All read at runtime, all optional:
 instrumentation running and no output anywhere — a combination worth
 double-checking if a profiled run produces nothing.
 
-## Reading results early
+### Reading results early
 
 Results are collected when the device closes. Past roughly a thousand kernel
 runs the on-device buffer needs draining sooner:
