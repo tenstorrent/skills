@@ -800,6 +800,10 @@ def _sandboxed_run(env, monkeypatch, capfd, *argv, p=None, run="9001"):
         stop.set()
         t.join(10)
     assert not errors, errors
+    # the wrapper writes the job's rc, then removes its temp dirs: a scan of the state waits for it to exit
+    for f in rd.glob("secret-env-*.started"):
+        stat = pathlib.Path(f"/proc/{f.read_text().strip()}/stat")
+        assert _wait_for(lambda: not stat.exists() or stat.read_text().rsplit(")", 1)[1].split()[0] == "Z")
     return code, out, rd, p
 
 
