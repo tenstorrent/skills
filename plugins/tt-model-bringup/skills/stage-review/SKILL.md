@@ -123,7 +123,8 @@ Return `more-work-needed` when evidence shows one of these:
 - a release or serving stage has failed accuracy, API conformance, benchmark
   target, or missing/incomparable metric rows that are only disclosed, not
   fixed or supported by a row-specific current issue waiver (stage 11 grid rows
-  its budget left, listed in `missing_rows` with a reason, are allowed);
+  left unmeasured when its budget ended, listed in `missing_rows` with a reason,
+  are allowed);
 - a text LLM release has failed `meta_ifeval` or `meta_gpqa_cot` without a
   current linked issue proving the correct canonical implementation fails the
   same eval in the same way;
@@ -168,9 +169,10 @@ owner to set the Codex goal to terminal `blocked`. The stage owner must treat
 each finding as work: fix it directly when the cause is obvious, or use
 `$autofix` when the fix is not obvious or the first direct fix does not close
 the gate. Only a later, explicit `$autofix` failure, an unrecoverable external
-dependency, or a required serving-plugin change that needs human authorization
+dependency, a required serving-plugin change that needs human authorization
 under [plugin changes](../vllm-integration/references/plugin-changes.md), with its
-proposal recorded, can justify terminal goal `blocked`.
+proposal recorded, or a served-default change that needs an operator decision,
+with its work-log record (see What To Inspect), can justify terminal goal `blocked`.
 
 ## What To Inspect
 
@@ -452,10 +454,6 @@ recorded verdict stays `more-work-needed`; a P2 that the stage then fixes with
 device evidence is recorded as fixed under that unchanged verdict, with the
 evidence path. The next stage's review checks that carried items were closed.
 
-If the main agent could not obtain an independent review, report
-`not-independent` as a fallback status outside the reviewer verdict. Do not use
-it to complete the stage.
-
 ## Main-Agent Follow-Up
 
 After the reviewer returns:
@@ -463,8 +461,9 @@ After the reviewer returns:
 1. Read the findings and verify that the cited artifacts exist.
 2. If the verdict is `more-work-needed`, do not mark the stage complete. Set the
    goal to terminal `blocked` only when every remaining Required Work item has
-   `Required next step: human authorization` and its `proposed` record exists;
-   name the record paths as the concrete blocker. Otherwise treat the findings
+   `Required next step: human authorization` with its `proposed` record, or
+   `Required next step: operator decision` with its work-log record; name the
+   record paths as the concrete blocker. Otherwise treat the findings
    as the next stage work item. Use the relevant debugging skill or `$autofix`
    to resolve it, then rerun `$stage-review`.
 3. If the verdict is `clean-pass`, record the review artifact or subagent final

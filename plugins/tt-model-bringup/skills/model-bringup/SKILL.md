@@ -105,10 +105,10 @@ operator in the run record and the full-model goal starts from `tt/optimized_dec
 single-chip is then the target topology, not a fallback, and the later stages say so.
 
 `tt-device-usage`, `tt-enable-tracing`, `qualitative-check`, `stage-review` and `agentic-serving`
-provide shared requirements; [`ttnn-knowledge`](../ttnn-knowledge/SKILL.md) holds what earlier bringups learned, by topic. AutoDebug/AutoTriage/AutoFix come from the explicit dependency. Implementation
-stages 1–10 require independent review with `clean-pass`; findings require repairs and rereview.
-The benchmark stage (11) measures serving rates and checks measurement completeness without an
-accuracy acceptance review; goal 12 then runs the agentic evals on those rates. Preserve original goal
+provide shared requirements; [`ttnn-knowledge`](../ttnn-knowledge/SKILL.md) holds what earlier bringups learned, by topic. AutoDebug/AutoTriage/AutoFix come from the explicit dependency. Every stage
+goal (1–12 and 6b) requires independent `stage-review` with `clean-pass`; findings require repairs and
+rereview. The benchmark stage (11) measures serving rates and checks measurement completeness, with no
+accuracy acceptance bar; goal 12 then runs the agentic evals on those rates. Preserve original goal
 criteria, local commit boundaries and the prohibition on pushing stage changes automatically.
 
 ### Validate changed paths
@@ -176,7 +176,7 @@ The [hook API](../../telemetry-hooks.md) contains no endpoint or upload implemen
 
 ## Evidence gates
 
-Stages 6, 7, 9, 10, 11 and 12 have sibling `.check.sh` scripts. Run from the target checkout with
+Stages 6, 6b, 7, 9, 10, 11 and 12 have sibling `.check.sh` scripts. Run from the target checkout with
 `MODEL_DIR` set to its exact autoport path. They resolve their own package resources. Exit 0 passes;
 1 is advisory; 2 is critical; other exits mean checker/environment failure. The runner retries
 checker errors once and stops by default; it runs bounded remediation goals for failed checks.
