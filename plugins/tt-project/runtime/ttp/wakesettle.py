@@ -189,8 +189,8 @@ def settle_reason(db, e: dict, task: dict | None, owners, plain_done, now: float
 
 def settle(db, cfg: dict, evs: list[dict], now: float, plain_done) -> tuple[list[int], str]:
     """Settle the batch by rule when every event qualifies: (settled ids, log line), else ([], "")."""
-    from . import obligations, alerts
-    own = [e for e in evs if not alerts.rides_along(e)]
+    from . import obligations, pagesev
+    own = [e for e in evs if not pagesev.rides_along(e)]
     if not own:
         return [], ""
     ids = [int(e["id"]) for e in own]

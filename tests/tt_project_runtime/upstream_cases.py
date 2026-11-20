@@ -991,7 +991,7 @@ def test_a_confirmation_is_the_senders_ack_and_closes_on_the_fixing_project_with
 def _page_pair(env, monkeypatch):
     """A paging project, a second one that made three changes on made-up machines, and a page from the
     first one's daemon to the second about each, read by the second."""
-    from ttp import machine_ledger as ml, machines, alerts, upstream
+    from ttp import machine_ledger as ml, machines, pagesev, upstream
     src, dst, _ = _confirm_pair(env)
     now = time.time()
     pages = {}
@@ -1000,7 +1000,7 @@ def _page_pair(env, monkeypatch):
         c = ml.add_change(alias, "lowered the clock", "reset the clock", "second", expires="1h", now=now - 7200)
         text = f"Machine change #{c['id']} on {alias} is overdue: lowered the clock (by second). Page 1."
         assert upstream.send(src.name, None, "second", text, "normal", sender="daemon",
-                             extra={"page_fp": alerts.change_fingerprint(f"machine-change:{c['id']}", c["added"])}) == "sent"
+                             extra={"page_fp": pagesev.change_fingerprint(f"machine-change:{c['id']}", c["added"])}) == "sent"
         pages[c["id"]] = upstream._inbox()[-1]["fp"]
     upstream.ingest(dst, dst.config())
     return src, dst, pages

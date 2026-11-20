@@ -4,7 +4,7 @@
 (`ttp model-bench terminalbench`), the ranking's first key (modelscore.TB) and each model's verdict.
 
 A cycle is one pass of a model over the task list (harborslice.tasks). step() (the bench owner's
-hourly command schedule modelbench.TB_SCHEDULE, or by hand) books every complete cycle and starts one
+hourly command schedule benchowner.TB_SCHEDULE, or by hand) books every complete cycle and starts one
 detached runner per served model that has work and none running; it calls no model. A runner holds
 the model's lock (one trial per model at once), runs its cycle's next unrun task through
 harborslice.trial (the host-wide trial cap, 429 waits, resume), appends the result to the cycle's
@@ -55,9 +55,9 @@ benchparity.section (same task set, limit and rerun rule, and how each arm was c
 
 Pre-flight (preflight): a cycle that cannot start (no working endpoint key, no harbor venv, no docker
 compose) used to fail only in terminalbench.log. Each failure is counted in the bench owner's streak of
-TB_SCHEDULE (modelbench.streak, which also counts a step that crashed) and a pass resets it; the
-PREFLIGHT_FAILS-th (modelbench.STREAK_FAILS) failure in a row raises one observation
-event (source "model-bench", one per streak, modelbench.streak) naming the cause, so the owner fixes it the
+TB_SCHEDULE (benchowner.streak, which also counts a step that crashed) and a pass resets it; the
+PREFLIGHT_FAILS-th (benchowner.STREAK_FAILS) failure in a row raises one observation
+event (source "model-bench", one per streak, benchowner.streak) naming the cause, so the owner fixes it the
 same day.
 """
 from __future__ import annotations
@@ -89,7 +89,7 @@ KIND = {BRIDGE_ROUTE: "bridge: the logged-in claude CLI (claude -p) through a lo
 PROVIDER = {BRIDGE_ROUTE: "claude", CHAT_ROUTE: "chat", ENDPOINT_ROUTE: "endpoint"}
 ROUNDS, PROBE_EVERY_S, PROBE_MAX_S, HISTORY = 3, 120.0, 3600.0, "server-history.json"
 RESERVED = {REF, "cycles", "harbor", "compose"}
-PREFLIGHT_FAILS = 3   # modelbench.STREAK_FAILS
+PREFLIGHT_FAILS = 3   # benchowner.STREAK_FAILS
 SUBSET_NOTE = "20-task subset (2026-10-27, low effort, 900 s per task)"
 
 
@@ -129,11 +129,11 @@ def settings(cfg: dict) -> dict:
 
 
 def preflight(p, cause: str = "", now: float | None = None) -> int:
-    """Count a cycle's pre-flight in modelbench.streak (schedule TB_SCHEDULE): a failure
+    """Count a cycle's pre-flight in benchowner.streak (schedule TB_SCHEDULE): a failure
     (`cause`, one line) adds one, a pass (empty cause) resets the count; the PREFLIGHT_FAILS-th failure in a row
     queues one observation event naming the cause (one per streak). Returns the streak length."""
-    from . import modelbench
-    return modelbench.streak(p, modelbench.TB_SCHEDULE, cause, now, what="Terminal-Bench cycles failed their pre-flight")
+    from . import benchowner
+    return benchowner.streak(p, benchowner.TB_SCHEDULE, cause, now, what="Terminal-Bench cycles failed their pre-flight")
 
 def folder() -> Path:
     from . import modelbench
@@ -287,7 +287,7 @@ def runner(cfg: dict, model: str, env: dict, *, trial: Callable | None = None, s
            clock: Callable = time.time, stop: Callable[[], str] | None = None,
            gate: Callable | None = None) -> int:
     """Run `model`'s cycle to its end, one paced trial at a time (module doc); returns trials run. `stop`
-    (modelbench.trial_stop) is asked before each trial: a reason ends the run there, the cycle kept. Each real
+    (benchowner.trial_stop) is asked before each trial: a reason ends the run there, the cycle kept. Each real
     trial first asks `ttp occupancy` for this host and waits while a live stream holds it (`gate`; an
     injected `trial` runs nothing here, so it is gated only when `gate` is given)."""
     from . import harborslice, modelbench, modelsuite, occupancy
@@ -494,7 +494,7 @@ def ref_runner(cfg: dict, model: str, env: dict, *, trial: Callable | None = Non
     builds it), a chat model the chat endpoint's relay (chat(model)), one per trial so its server wait and
     tokens/s are the trial's own; reference.parallel tasks run at once. A trial cut while the server ran slow
     is `server` (serverhealth.judge): not scored, rerun one at a time once a probe shows the server healthy.
-    `stop` (modelbench.trial_stop) is asked before each trial: a reason starts no more, nothing is booked.
+    `stop` (benchowner.trial_stop) is asked before each trial: a reason starts no more, nothing is booked.
     Capacity refusals over 20% lower the trials at once (benchbackoff). `rerun_server` N first reruns every
     task whose latest row is `server` (not scored), N at once, its new row replacing the old one.
     An endpoint or chat model takes reference.lock itself (EndpointLock, `lock` in tests) before each trial
@@ -887,6 +887,6 @@ def runner_sessions(p, live: list[dict] | None = None) -> list[dict]:
 
 def stop_runners(p, why: str, live: list[dict] | None = None) -> list[dict]:
     """End each runner_sessions() runner (schedjobs._end_session, audited) because `why`
-    (modelbench.trial_stop): a runner that predates trial_stop never asks it."""
+    (benchowner.trial_stop): a runner that predates trial_stop never asks it."""
     return [r for s in runner_sessions(p, live)
             if (r := schedjobs._end_session(p, "terminalbench", s, why, reason=STOP_REASON, of=RUNNER))]

@@ -23,7 +23,7 @@ holding the queue. Each daemon pass (tend()):
   failing ids, goes in as ttp/postland-revert-<sha>. The daemon approves it into the push queue (it lands
   with the next batch, after the smoke checks) and queues one code task to fix the change on its failing
   tests alone. Anything it cannot tell or attribute goes to the coordinator as one observation.
-- An express landing (pushq.py's express path, batch id express-*) checked only its smoke and touched tests: its job
+- An express landing (express.py, batch id express-*) checked only its smoke and touched tests: its job
   runs the full push checks and the post-landing checks, also where post_land_checks is unset.
 """
 from __future__ import annotations
@@ -74,7 +74,7 @@ def _event(db, text: str, kind: str = "observation", queued: bool = True) -> Non
 def tend(p: Project, cfg: dict, now: float | None = None) -> str:
     """One daemon pass: settle a finished run, else start one for what landed since the last. Returns
     what it did ('' when nothing)."""
-    from . import push, pushq
+    from . import express, push
     now = time.time() if now is None else now
     d = cfg.get("delivery") or {}
     plc = push.check_list(d.get("post_land_checks"))
@@ -83,7 +83,7 @@ def tend(p: Project, cfg: dict, now: float | None = None) -> str:
     job = st.get("job")
     # An express landing ran only its smoke and touched tests: its full push checks run here even in a
     # project with no post-landing checks of its own.
-    only = "" if plc else f" AND id LIKE '{pushq.EXPRESS_PREFIX}%'"
+    only = "" if plc else f" AND id LIKE '{express.PREFIX}%'"
     if not plc and not job and not db.one(f"SELECT 1 FROM push_batches WHERE outcome='pushed' AND finalized IS NOT "
                                           f"NULL AND ended>?{only}", (st.get("since") or 0,)):
         return ""
@@ -163,7 +163,7 @@ def tend(p: Project, cfg: dict, now: float | None = None) -> str:
     job = {"path": str(path), "batch": name, "sha": sha, "good": good,
            "points": points, "target": last["target"], "ended": ended, "repo": str(p.root)}
     batches = [u[3] for u in units if u[0] == "batch"]
-    if any(pushq.is_express(b["id"]) for b in batches):
+    if any(express.is_express(b["id"]) for b in batches):
         full = push.check_list(push.repo_checks(d, p.root, p)[0])
         job["checks"] = [c.config() for c in full + plc]
     durable_write(path, json.dumps(job))

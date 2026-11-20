@@ -439,7 +439,7 @@ def test_a_code_run_on_sonnet_starts_at_high_by_every_route_and_a_non_code_run_k
     # A routed model pick (route.KEY with model_pick) on core: Jev's or the A/B choice of Sonnet low.
     pick = {route.KEY: {"to": "claude", "model_pick": True, "model": "sonnet", "pick_effort": "low"}}
     assert argv(note=pick) == ("sonnet", "high") and argv(kind="question", note=pick) == ("sonnet", "low")
-    # Jev's effort pick on a tier whose model is Sonnet.
+    # An effort A/B arm or Jev's effort pick on a tier whose model is Sonnet.
     p.set_config("providers.claude.tiers.standard", {"model": "sonnet", "effort": "medium"})
     d._load_config()
     assert argv() == ("sonnet", "high") and argv(kind="question") == ("sonnet", "medium")

@@ -588,6 +588,18 @@ TASK_LABEL = "restriction_tools:"   # + a 12-hex key per change: the queued upda
 ITEM_LABEL = "restriction_tools_item:"   # + a 12-hex key of the old item alone: its tools were checked
 
 
+def digest_lines(p: Project) -> list[str]:
+    """One line per open restriction_tools update task (at most 3): a guard is behind its charter."""
+    from .db import OPEN_TASKS
+    rows = p.db.q(f"SELECT id, status, spec FROM tasks WHERE {OPEN_TASKS} AND labels LIKE ? ORDER BY id",
+                  (f'%"{TASK_LABEL}%',))
+    out = [f"- #{r['id']} ({r['status']}): " + (r["spec"] or "").split(" Update each tool")[0][:400] for r in rows[:3]]
+    if len(rows) > 3:
+        out.append(f"- and {len(rows) - 3} more open")
+    return (["## Guards behind the charter (project tools still enforce a Restrictions item the user changed; "
+             "their update task is open: keep it first in line)"] + out) if out else []
+
+
 # The daily review's 7-day count per Restrictions item: evidence for the coordinator's one-time ask
 # to drop or loosen a rule that only blocks work. Model-free; it never edits the charter or asks.
 CITE_WINDOW_S = 7 * 86400

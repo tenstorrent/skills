@@ -123,6 +123,7 @@ from . import rankinherit
 from . import waitpoll
 from . import workernotify
 from . import anchors
+from . import pagesev
 from . import askrethink
 from . import provallow
 from . import selfblock
@@ -2252,7 +2253,7 @@ class Daemon:
     def _step_degrade(self, name: str) -> None:
         """Degrade a DEGRADE_OK step that keeps overrunning: one at a time, it sits out DEGRADE_TICKS ticks.
         Once per condition (kv DEGRADE_KV, so a restart does not raise it again) it is one overseer incident
-        with this daemon's stacks and one low ride-along event (alerts.RIDE_ALONG) that joins the next
+        with this daemon's stacks and one low ride-along event (pagesev.RIDE_ALONG) that joins the next
         coordinator turn and starts none. DEGRADE_WINDOW clean runs in a row end the condition."""
         took = 0.0 if self._step_began is None else time.monotonic() - self._step_began
         runs = self._overruns[name] = (self._overruns.get(name, []) + [took >= self._step_budget()])[-DEGRADE_WINDOW:]
@@ -2290,7 +2291,7 @@ class Daemon:
             db.x("INSERT INTO events(ts,source,kind,severity,text,status,data) VALUES(?,?,?,?,?,?,?)",
                  (now, "daemon", "tick_step_degraded", "low",
                   f"Degraded: {why}. Overruns per step: {counts}. Stacks: {stacks}. Fix the step or change "
-                  f"its budget.", "queued", json.dumps({alerts.RIDE_ALONG: True, "step": name})))
+                  f"its budget.", "queued", json.dumps({pagesev.RIDE_ALONG: True, "step": name})))
 
     def _step_slow(self, name: str) -> None:
         """One handled tick_step_slow event when step `name` ran past STEP_BUDGET_S, naming the item that
@@ -2340,7 +2341,7 @@ class Daemon:
         # A ride-along like tick_step_degraded: a slow tick step never starts a coordinator turn by itself.
         self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task,data) VALUES(?,?,?,?,?,?,?,?)",
                     (now, "daemon", "tick_step_incident", "normal", text[:1500], "queued", task,
-                     json.dumps({alerts.RIDE_ALONG: True, "step": name})))
+                     json.dumps({pagesev.RIDE_ALONG: True, "step": name})))
 
     def _log_step_error(self, label: str, err: Exception, limit: int = 2000) -> None:
         """Log `label error:` and the traceback of `err` (call it in its except block) once per step and
@@ -2437,6 +2438,7 @@ class Daemon:
         self._run_step(self.sweep_watcher_issues)
         self._run_step(self.sweep_schedule_gaps)
         self._run_step(self.review_jev)
+        self._run_step(self.end_effort_ab)
         self._run_step(self.trip_model_routing)
         self._run_step(self.watch_run_classes)
         self._run_step(self.watch_cli_versions)
@@ -2550,6 +2552,19 @@ class Daemon:
         scr.settle_jev(self.p.db, now)
         for use, s in jevuse.review(self.p.db, self.cfg, now):
             self.alert(f"jev-off:{use}", jevuse.off_text(use, s, self.cfg), severity="low", every_s=0)
+
+    def end_effort_ab(self, every_s: float = 6 * 3600) -> None:
+        """Apply the effort A/B's end rule (effortab.conclude): once it decides, the winner becomes the
+        project's standard effort for code tasks, the split stops, and the user hears it once."""
+        now = time.time()
+        if now - getattr(self, "_effort_ab_checked", 0.0) < every_s:
+            return
+        self._effort_ab_checked = now
+        got = effortab.conclude(self.p, self.cfg, now)
+        if got:
+            self._load_config()
+            self.alert("effort-ab-decided", f"Effort A/B ended: {got} effort is now the standard for code tasks "
+                       f"(`ttp stats --effort-ab`).", severity="low", every_s=0)
 
     def _code_state(self) -> dict:
         """runclass.CODE_STATE_KV: {code kind: "full" | "canary" | "off"}; {} (all canary) when unset or bad. A
@@ -3221,7 +3236,7 @@ class Daemon:
 
     def _change_batch(self, pages: list[dict], now: float) -> bool:
         """A project's expired machine changes as one item: one queued event (one coordinator wake) here, or one
-        note to the project that has them. Each record keeps its own fingerprint (alerts.change_fingerprint):
+        note to the project that has them. Each record keeps its own fingerprint (pagesev.change_fingerprint):
         one already filed, by this daemon or a copy another project's daemon relayed, is left out, and the rest
         get handled marker rows, so a resend of the same records neither wakes nor pages again."""
         target = pages[0]["target"]
@@ -3810,7 +3825,7 @@ class Daemon:
                 note = {**(note or {}), modelrank.KEY: got[1]}
             ab = (note or {}).get(effortab.KEY)
             if not pin.get("effort") and isinstance(ab, dict) and ab.get("effort"):
-                effort = str(ab["effort"])   # Jev's effort pick (effortab.assign)
+                effort = str(ab["effort"])   # the task's effort A/B arm or Jev's pick (effortab.assign)
             elif not pin.get("effort") and isinstance(ot := (note or {}).get(costlevers.TRIM_KEY), dict) \
                     and ot.get("effort"):
                 effort = str(ot["effort"])   # rings.output_trim's pick for a mechanical spec (costlevers)
@@ -5018,11 +5033,11 @@ class Daemon:
             log(self.p, f"deslop: schedule {did} (deslop.enabled {'on' if c['enabled'] else 'off'})")
 
     def run_model_bench(self) -> None:
-        """The machine's shared daily model bench (modelbench.py), model-free, hourly: check the owner
+        """The machine's shared daily model bench (benchowner.py), model-free, hourly: check the owner
         lease (take it over or poke its owner when stale), keep this project's bench and Terminal-Bench
         schedules on only while it owns the lease and model_bench.hold does not hold it, run it now on a poke, and report the owner's newest bench once: a
         keyless skip is one low alert per outage, a bench one log line."""
-        from . import modelbench, harborslice, rankfresh, schednow
+        from . import benchowner, harborslice, modelbench, rankfresh, schednow
         if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get("TTP_TEST_MODEL_BENCH"):
             return   # daemons under test never bench, unless a test asks
         now, db = time.time(), self.p.db
@@ -5032,7 +5047,7 @@ class Daemon:
         me, cfg = self.p.name, self.cfg
         if not rankfresh.configured(cfg):
             return
-        got = modelbench.check(me, cfg, now)
+        got = benchowner.check(me, cfg, now)
         lease = read_dict(modelbench.home() / modelbench.OWNER)
         if got.get("took") is not None:
             self.alert("model-bench-owner", f"This project now runs the machine's daily chat model bench "
@@ -5040,16 +5055,16 @@ class Daemon:
         if got.get("poked"):
             db.post("out", f"The machine's daily chat model bench has no recent result; poked its owner "
                     f"{got['poked']} to run it now.", chat=None, kind="info", severity="low")
-        owner, hold = lease.get("project") == me, modelbench.held(cfg, now)
+        owner, hold = lease.get("project") == me, benchowner.held(cfg, now)
         try:
-            modelbench.ensure(self.p, db, owner, modelbench.settings(cfg)["at"], hold)
-            modelbench.ensure_tb(self.p, db, owner, harborslice.settings(cfg)["on"], hold)
+            benchowner.ensure(self.p, db, owner, benchowner.settings(cfg)["at"], hold)
+            benchowner.ensure_tb(self.p, db, owner, harborslice.settings(cfg)["on"], hold)
         except ValueError as e:   # a broken schedules file: the next check tries again
             log(self.p, f"model bench: schedule not changed: {e}")
-        seen = db.kv(modelbench.SEEN, {}) or {}
+        seen = db.kv(benchowner.SEEN, {}) or {}
         poke = lease.get("poke") or {}
         if owner and not hold and float(poke.get("at") or 0) > float(seen.get("poke") or 0):
-            schednow.request(self.p, modelbench.SCHEDULE, "model-bench-poke")
+            schednow.request(self.p, benchowner.SCHEDULE, "model-bench-poke")
             db.post("out", f"{poke.get('by') or 'Another project'} poked this project to run the machine's "
                     "daily chat model bench; running it now.", chat=None, kind="info", severity="low")
             seen["poke"] = poke["at"]
@@ -5062,7 +5077,7 @@ class Daemon:
             elif rec.get("results") is not None:
                 log(self.p, f"model bench {rec['date']}: {len(rec['results'])} model(s); weak: "
                     f"{', '.join(rec['weak']) or 'none'}")
-        db.set_kv(modelbench.SEEN, seen)
+        db.set_kv(benchowner.SEEN, seen)
 
     def probe_mcp(self) -> None:
         """Refresh this host's connected MCP servers for the status feed (mcpgap.py): `claude mcp list` in
@@ -6722,6 +6737,8 @@ class Daemon:
             note["session"] = {k: session[k] for k in ("model", "effort", "error", "verification", "pin_verify", "checked")
                                if k in session}
         note["cache_telemetry"] = usage.extra.get("cache_telemetry", {"complete": False, "requests": None})
+        if isinstance(usage.extra.get("thinking_tokens"), int):   # the output's thinking share (effortab.report)
+            note["thinking_tokens"] = usage.extra["thinking_tokens"]
         if usage.extra.get("model"):   # the model the agent's session reported, beside the requested one
             note["model_used"] = str(usage.extra["model"])[:120]
         if isinstance(usage.extra.get("subagents_spawned"), int):   # Agent calls (providers/claude.parse)
@@ -9410,15 +9427,15 @@ class Daemon:
 
     # schedules and watchers ------------------------------------------------------------------------
     def _stop_off_schedule_jobs(self) -> None:
-        """tbcycle.stop_runners while modelbench.trial_stop says stop (runners older than trial_stop never ask it),
+        """tbcycle.stop_runners while benchowner.trial_stop says stop (runners older than trial_stop never ask it),
         and schedjobs.sweep: the jobs turned-off schedules left running are stopped, at once on the tick after
         a schedule is turned off (the set of schedules that are off changed), else every schedjobs.SWEEP_S."""
-        from . import modelbench, tbcycle
+        from . import benchowner, tbcycle
         try:
-            bench = modelbench.trial_stop(self.p) if tbcycle.configured(self.p) else ""
+            bench = benchowner.trial_stop(self.p) if tbcycle.configured(self.p) else ""
         except (OSError, ValueError) as e:
             bench = ""
-            log(self.p, f"turned-off schedules' jobs: modelbench.trial_stop could not be read ({e})")
+            log(self.p, f"turned-off schedules' jobs: benchowner.trial_stop could not be read ({e})")
         off = (tuple(r["name"] for r in self.p.db.q("SELECT name FROM schedules WHERE enabled=0 ORDER BY name")),
                bool(bench))
         now = time.monotonic()
@@ -12426,18 +12443,18 @@ class Daemon:
         evs = [e for e in evs if e["kind"] != sweep.SWEEP_KIND or e["id"] == sweep_event]
         wake: dict = {}
         w: dict | None = None
-        # Ride-along events (alerts.rides_along) start no turn: they join the next one something else
+        # Ride-along events (pagesev.rides_along) start no turn: they join the next one something else
         # starts, or start one themselves RIDE_ALONG_MAX_S after the oldest was raised.
-        rides = [e for e in evs if alerts.rides_along(e)]
+        rides = [e for e in evs if pagesev.rides_along(e)]
         # An event of a task a deadline hangs on (eventhold.hot) skips every hold below and the triage.
-        hot = not msgs and not rerun and eventhold.hot(db, [e for e in evs if not alerts.rides_along(e)], now)
+        hot = not msgs and not rerun and eventhold.hot(db, [e for e in evs if not pagesev.rides_along(e)], now)
         # So do plain hand-offs (_plain_done_held), up to coordinator.plain_done_hold_max_s.
         held = [] if msgs or unsized[0] or rerun or hot or lead or len(rides) == len(evs) else \
             self._plain_done_held(evs, now, unsized[1])
-        # A slow tick step's report (alerts.TICK_KINDS) never ages into a turn of its own.
-        aging = [e for e in rides if e["kind"] not in alerts.TICK_KINDS]
+        # A slow tick step's report (pagesev.TICK_KINDS) never ages into a turn of its own.
+        aging = [e for e in rides if e["kind"] not in pagesev.TICK_KINDS]
         if not msgs and len(rides) + len(held) == len(evs) and (
-                not aging or now - min(e["ts"] for e in aging) < alerts.RIDE_ALONG_MAX_S):
+                not aging or now - min(e["ts"] for e in aging) < pagesev.RIDE_ALONG_MAX_S):
             if fire:
                 w, wake = {"due": "look"}, db.kv("idle_wake", {}) or {}
             elif lead:
@@ -12461,10 +12478,10 @@ class Daemon:
             debounce = float(c.get("debounce_s", 15))
             if now - newest < debounce and now - oldest < 4 * debounce and not urgent_msgs:
                 return
-            own = [e for e in queued if not alerts.rides_along(e)]   # ride-alongs neither hold nor start a turn
+            own = [e for e in queued if not pagesev.rides_along(e)]   # ride-alongs neither hold nor start a turn
             # An overdue promise or order, or a failed claim, wakes the coordinator at once (mustact.py);
             # a must-act item that rides along (a host-held queue wait) holds like any other ride-along.
-            urgent = hot or bool(lead) or any(e["kind"] in mustact.KINDS and not alerts.rides_along(e) for e in evs)
+            urgent = hot or bool(lead) or any(e["kind"] in mustact.KINDS and not pagesev.rides_along(e) for e in evs)
             # Relayed messages with no order or question wait out the relay window, so a burst is one turn.
             if msgs and not rerun and not urgent_msgs and not any(eventhold.immediate(e) for e in evs) \
                     and self._relay_hold(msgs, now):
@@ -12479,14 +12496,14 @@ class Daemon:
                 w = {"due": "lead"}
         if evs and not msgs and not rerun and settlehook.command(self.cfg):
             # The project's own hook settles routine events model-free (settlehook.py).
-            own_n = len([e for e in evs if not alerts.rides_along(e)])
+            own_n = len([e for e in evs if not pagesev.rides_along(e)])
             evs, hold = self._settle_hook(evs, now)
             if hold:
                 return
             # The hook settled every event that would start a turn: what is left waits, unless a wake was
             # due anyway (w) or a ride-along left is past its hour.
-            if own_n and w is None and not [e for e in evs if not alerts.rides_along(e)] and (
-                    not evs or now - min(e["ts"] for e in evs) < alerts.RIDE_ALONG_MAX_S):
+            if own_n and w is None and not [e for e in evs if not pagesev.rides_along(e)] and (
+                    not evs or now - min(e["ts"] for e in evs) < pagesev.RIDE_ALONG_MAX_S):
                 return
         if evs and not msgs and not rerun and not lead and not hot and wakesettle.on(self.p):
             try:   # rings.coord_wake_settle: a batch of only routine events is settled by rule (wakesettle.py)
@@ -12497,8 +12514,8 @@ class Daemon:
                 log(self.p, line)
             if ids:
                 evs = [e for e in evs if e["id"] not in ids]
-                if w is None and not [e for e in evs if not alerts.rides_along(e)] and (
-                        not evs or now - min(e["ts"] for e in evs) < alerts.RIDE_ALONG_MAX_S):
+                if w is None and not [e for e in evs if not pagesev.rides_along(e)] and (
+                        not evs or now - min(e["ts"] for e in evs) < pagesev.RIDE_ALONG_MAX_S):
                     return
         if not msgs and not rerun and not fire and not lead:
             try:
@@ -12548,7 +12565,7 @@ class Daemon:
             except Exception:   # the gate only saves money: a failure runs the turn
                 log(self.p, "coordinator turn gate failed: " + traceback.format_exc().replace("\n", " | ")[:1500])
                 seen_now = {}
-        triage = [e for e in evs if not alerts.rides_along(e)]
+        triage = [e for e in evs if not pagesev.rides_along(e)]
         if triage and not msgs and not rerun and not hot and w is None and waketriage.on(self.cfg) and \
                 eventhold.can_wait(triage) and not any(e["kind"] in coord.UNBLOCK_KINDS for e in triage):
             try:   # the watcher model decides whether this routine batch needs the coordinator now
@@ -12572,7 +12589,7 @@ class Daemon:
         # or a must-act item wakes it at once; worker dispatch is not held by it.
         hold = (getattr(gate, "coord_hold", None) or {}) if gate else {}
         if hold and not msgs and not lead and now < float(hold.get("until") or 0) \
-                and not any(e["kind"] in mustact.KINDS and not alerts.rides_along(e) for e in evs):
+                and not any(e["kind"] in mustact.KINDS and not pagesev.rides_along(e) for e in evs):
             if getattr(self, "_coord_hold_logged", None) != hold.get("until"):
                 self._coord_hold_logged = hold.get("until")
                 log(self.p, f"coordinator turn held {(float(hold['until']) - now) / 60:.0f} min by the turn guard "
@@ -12842,7 +12859,7 @@ class Daemon:
                 log(self.p, "settle hook settled " + "; ".join(f"event {i}: {run.settle[i]}" for i in done))
                 # a turn is avoided only when no event that starts one is left
                 wakesettle.record(db, "hook", "skip", [e for e in evs if e["id"] in done], now,
-                                  None if not [e for e in left if not alerts.rides_along(e)] else 0.0)
+                                  None if not [e for e in left if not pagesev.rides_along(e)] else 0.0)
             return left, False
         except Exception:   # the hook only saves turns: a failure runs the turn
             self._settle_run = None
@@ -12903,8 +12920,8 @@ class Daemon:
         event, even one turn sizing set aside or parked, releases the hold (the batch_s wake as before)."""
         try:
             cap = float(self.cfg["coordinator"].get("plain_done_hold_max_s", 3000) or 0)
-            own = [e for e in queued if not alerts.rides_along(e)]
-            mine = [e for e in evs if not alerts.rides_along(e)]
+            own = [e for e in queued if not pagesev.rides_along(e)]
+            mine = [e for e in evs if not pagesev.rides_along(e)]
             ids_all = {e.get("id") for e in own}
             if cap <= 0 or not own or not mine or any(e.get("id") not in ids_all for e in mine) \
                     or now - min(e["ts"] for e in own) >= cap:
@@ -13372,7 +13389,7 @@ class Daemon:
                         effortab.assign(db, self.cfg, task, tier, run_prov, jev=self.jev)
                 except Exception as e:   # the A/B must never hold a task back
                     ab = None
-                    log(self.p, f"task {task['id']}: effort pick not assigned: {e}")
+                    log(self.p, f"task {task['id']}: effort A/B not assigned: {e}")
                 if ab:
                     note[effortab.KEY] = ab
                 elif not cheap and not ((routed or {}).get("model_pick") and run_prov == (routed or {}).get("to")):
@@ -16552,12 +16569,12 @@ class Daemon:
 
     def _block_after_reboot(self, t: dict, prev: dict, reason: str) -> None:
         """Block waiting task t at boot for `reason`, with a task_blocked event for the coordinator
-        (its severity and repeat folding: alerts.raise_blocked)."""
+        (its severity and repeat folding: pagesev.raise_blocked)."""
         db = self.p.db
         prev.pop("reboot_wakes", None)
         with db.tx():
             db.update_task(t["id"], status="blocked", blocked_reason=reason[:500], result=dump_result(prev))
-            alerts.raise_blocked(db, t, reason, f"#{t['id']} {t['title']} → blocked: {reason}")
+            pagesev.raise_blocked(db, t, reason, f"#{t['id']} {t['title']} → blocked: {reason}")
         log(self.p, f"task {t['id']} blocked: {reason}")
 
     def _relaunch_checks(self, t: dict, prev: dict) -> tuple[bool, int]:
@@ -17656,7 +17673,7 @@ class Daemon:
         'coalesced' under its fingerprint (once per wait) and folded into the one queued
         `checks_backlog` event, which names each such wait, the oldest and who holds the host checks
         slots. One coordinator line per wake for the backlog, never one page per task. The line rides
-        along (alerts.RIDE_ALONG): it starts no turn by itself and joins the next one something else
+        along (pagesev.RIDE_ALONG): it starts no turn by itself and joins the next one something else
         starts, at the latest RIDE_ALONG_MAX_S after its first fold (a fold keeps its ts)."""
         from . import checkcap
         db, now = self.p.db, time.time()
@@ -17678,7 +17695,7 @@ class Daemon:
                 + f". Oldest: #{old['task']}, waiting {(now - float(old['since'])) / 3600:.1f} h. {slots}. "
                 f"Not a fault: each wakes once its checks end, and a dead or lost run still pages on its own. "
                 f"Act only if the backlog itself is wrong.")
-        data = json.dumps({"checks_backlog": waits, alerts.RIDE_ALONG: True})
+        data = json.dumps({"checks_backlog": waits, pagesev.RIDE_ALONG: True})
         with db.tx():
             db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task,data) VALUES(?,?,?,?,?,?,?,?,?)",
                  (now, "daemon", "wait_stale", fp, "normal",
@@ -19545,7 +19562,7 @@ class Daemon:
         """Model-free, every CONTINUE_CHECK_EVERY_S: a task done CONTINUE_UNQUEUED_AFTER_S ago (within
         CONTINUE_UNQUEUED_WINDOW_S) whose hand-off proposed a `continue:` follow-up that no task has
         taken up yet raises one CONTINUE_UNQUEUED event, so a hop no turn queued is not lost (normal and
-        riding along with the next turn, high for an urgent task: alerts.py). A
+        riding along with the next turn, high for an urgent task: pagesev.py). A
         continuing task is any later task that continues it (chaincap.prev_of), has the follow-up's
         title or, for a post-landing deploy step only (chaincap.deploy_proposal), waits on its
         landing (a start_when); every `continue:` follow-up must be taken up. One event per task, ever."""
@@ -19577,8 +19594,8 @@ class Daemon:
                     if not (hop or c.lower() in titles or (waiter and chaincap.deploy_proposal(f, task["id"])))]
             if not left:
                 continue
-            # Normal, riding along with the next turn due anyway; high for an urgent task (alerts.py).
-            sev = alerts.continue_severity(db, task)
+            # Normal, riding along with the next turn due anyway; high for an urgent task (pagesev.py).
+            sev = pagesev.continue_severity(db, task)
             db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
                  (now, f"task:{task['id']}", CONTINUE_UNQUEUED, sev,
                   f"#{task['id']} {headline.clip(task['title'], 160)}: its follow-up {left[0][0][:200]!r} is {UNQUEUED_TAG} and no "
@@ -19586,7 +19603,7 @@ class Daemon:
                       f"{deploy[0].upper()}{deploy[1:]} on purpose." if (
                           deploy := chaincap.deploy_proposal(left[0][1], task["id"])) else
                       f"Add it with task_add continues #{task['id']}, or drop it on purpose."),
-                  json.dumps({"followups": conts, **({alerts.RIDE_ALONG: True} if sev != "high" else {})}),
+                  json.dumps({"followups": conts, **({pagesev.RIDE_ALONG: True} if sev != "high" else {})}),
                   "queued", task["id"]))
             log(self.p, f"task {task['id']}: continue follow-up not taken up; {CONTINUE_UNQUEUED} raised ({sev})")
 

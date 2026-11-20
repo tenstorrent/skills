@@ -152,7 +152,7 @@ def _dr_tick(p, now):
 
 
 def test_drift_ladder_steers_once_then_one_ride_along_event_and_never_repeats(env, tmp_path):
-    from ttp import alerts
+    from ttp import pagesev
     p, run_dir, t, rid = _dr_project(env, tmp_path, quiet=False)
     (run_dir / "output.jsonl").write_text("".join(_rw_claude_call(f"c{i}", "Bash", command="make all")
                                                   + _rw_claude_result(f"c{i}", error=True) for i in range(3)))
@@ -167,7 +167,7 @@ def test_drift_ladder_steers_once_then_one_ride_along_event_and_never_repeats(en
     data, ids = _dr_tick(p, now + 600)
     assert len(ids) == 1
     ev = p.db.one("SELECT * FROM events WHERE id=?", (ids[0],))
-    assert ev["kind"] == "worker_drift" and ev["task"] == t and alerts.rides_along(ev)
+    assert ev["kind"] == "worker_drift" and ev["task"] == t and pagesev.rides_along(ev)
     assert "`make all` failed 3 times" in ev["text"]
     for later in (1200, 5000):
         assert _dr_tick(p, now + later)[1] == []
@@ -209,7 +209,7 @@ def runwatch_path(p):
 
 
 def test_drift_step_three_wakes_the_coordinator_once_for_six_failures(env, tmp_path):
-    from ttp import alerts
+    from ttp import pagesev
     p, run_dir, t, rid = _dr_project(env, tmp_path, quiet=False)
     out = run_dir / "output.jsonl"
     out.write_text("".join(_rw_claude_call(f"c{i}", "Bash", command="make all")
@@ -222,7 +222,7 @@ def test_drift_step_three_wakes_the_coordinator_once_for_six_failures(env, tmp_p
     ids = _dr_tick(p, now + 60)[1]
     assert len(ids) == 1
     ev = p.db.one("SELECT * FROM events WHERE id=?", (ids[0],))
-    assert ev["severity"] == "normal" and not alerts.rides_along(ev), "step 3 wakes the coordinator"
+    assert ev["severity"] == "normal" and not pagesev.rides_along(ev), "step 3 wakes the coordinator"
     assert _dr_tick(p, now + 2000)[1] == [], "no ride-along after the wake, and no second wake"
     assert (run_dir / "steer.md").read_text().count("## Update") == 1
 

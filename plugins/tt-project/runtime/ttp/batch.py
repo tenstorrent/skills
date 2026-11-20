@@ -1621,7 +1621,7 @@ class Batch:
         self.d = p.config().get("delivery") or {}
         self.mechanical = mechanical_paths(self.d)   # shared docs settle_union may settle
         self.entries = [e for e in m.get("entries") or [] if isinstance(e, dict)]
-        self.express = isinstance(m.get("express"), dict)   # pushq.express_start: one urgent head, ahead of the queue
+        self.express = isinstance(m.get("express"), dict)   # express.start: one urgent head, ahead of the queue
         self.wt = p.worktrees / (f"{WORKTREE}-express" if self.express else WORKTREE)
         self.status: dict[int, str] = {}       # entry index -> status
         self.detail: dict[int, dict] = {}

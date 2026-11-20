@@ -22559,7 +22559,7 @@ def test_three_boot_time_wakes_of_a_waiting_task_block_it(env):
     assert t["blocked_reason"] == "lost to a host reboot 3 times; it may be causing them"
     assert "reboot_wakes" not in json.loads(t["result"]), "a block kept the old count"
     ev = p.db.q("SELECT severity, status FROM events WHERE kind='task_blocked' AND task=?", (tid,))
-    # a plain task's block is normal (alerts.raise_blocked); urgent ones page high
+    # a plain task's block is normal (pagesev.raise_blocked); urgent ones page high
     assert ev and ev[-1]["severity"] == "normal" and ev[-1]["status"] == "queued", ev
 
 
@@ -27728,8 +27728,8 @@ DURABLE_EXEMPT = {
     ("release.py", 'with open(HOME_DIR / ".upgrade-holds.lock", "a") as lk:'): "the release holds' flock guard file, never written",
     ("untrusted.py", 'with open(path, "a") as f:'): "a run's untrusted-source marks in its own run dir, read when that run ends; a crash that loses one ends the run too; never project state",
     ("remotecheck.py", 'Path(scratch, "objects", "info", "alternates").write_text('): "points a scratch repository in a TemporaryDirectory at this one's objects for one bundle; it is gone when the bundle is sent, never project state",
-    ("release.py", "dest.write_bytes(r.read())"): "the downloaded installer script in the install check's own folder, fetched again by each check; never state",
-    ("release.py", 'with open(rec["log"], "wb") as log:'): "the installer's output log in the install check's own folder, rewritten by each check; the result it gives is written durably",
+    ("installcheck.py", "dest.write_bytes(r.read())"): "the downloaded installer script in the install check's own folder, fetched again by each check; never state",
+    ("installcheck.py", 'with open(rec["log"], "wb") as log:'): "the installer's output log in the install check's own folder, rewritten by each check; the result it gives is written durably",
     ("slop.py", 'with open(tmp, "w") as f:'): "the scan's cache of per-blob numbers, rebuilt by the next scan if cut or lost; never state",
     ("slop.py", "os.replace(tmp, cache)"): "the scan's cache of per-blob numbers, rebuilt by the next scan if cut or lost; never state",
     ("streamguard.py", "with open(run_dir / WARN_FILE, \"a\") as f:"): "appends one fsync'd warning line per refused call that had already finished; a cut last line is skipped on read (take_warnings), a lost one costs only that warning",
@@ -38456,24 +38456,24 @@ KILLING_SCRIPT = "\n".join([
 
 
 def test_killscan_flags_every_kill_by_name_or_pattern_and_nothing_else(env):
-    from ttp import svcscan
-    hits = {n: reason for n, reason, _ in svcscan.kill_scan(KILLING_SCRIPT)}
+    from ttp import killscan
+    hits = {n: reason for n, reason, _ in killscan.scan(KILLING_SCRIPT)}
     # pgrep's pids reach kill through a variable, a later line, a loop or a pipe: the pgrep is flagged
     assert sorted(hits) == [*range(3, 14), 15, 16], hits
     assert all("pkill -f" in hits[n] for n in (3, 4, 5, 11)), hits
     assert "killall" in hits[6] and all("pgrep/pidof" in hits[n] for n in (7, 8, 9, 12, 13, 15, 16)), hits
     assert "pkill kills every process with that name" in hits[10]
     assert "absolute path" in hits[11] and "absolute path" not in hits[3]
-    assert svcscan.kill_scan("kill \"$pid\"\nwait \"$pid\"\n") == []
+    assert killscan.scan("kill \"$pid\"\nwait \"$pid\"\n") == []
     # `pkill -P <pid>` kills only that process's children; a pattern kill after it on the line still counts
-    assert svcscan.kill_scan("pkill -P $$\npkill --parent \"$pid\" -f srv\n") == []
-    assert [n for n, _, _ in svcscan.kill_scan("pkill -P $$; pkill -f srv\n")] == [1]
+    assert killscan.scan("pkill -P $$\npkill --parent \"$pid\" -f srv\n") == []
+    assert [n for n, _, _ in killscan.scan("pkill -P $$; pkill -f srv\n")] == [1]
     # ps | grep feeding kill: a PATH shim cannot stop it, so the worker is told to edit it out
-    ps = svcscan.kill_scan("kill -9 $(ps aux | grep srv | awk '{print $2}')\n"
+    ps = killscan.scan("kill -9 $(ps aux | grep srv | awk '{print $2}')\n"
                        "ps -ef | grep srv | grep -v grep | awk '{print $2}' | xargs kill\n"
                        "pids=$(/bin/ps -eo pid,args | grep srv)\nkill $pids\n")
     assert [n for n, _, _ in ps] == [1, 2, 3] and all("edit it out" in r for _, r, _ in ps), ps
-    assert svcscan.kill_scan("ps aux | grep srv\n") == [], "a ps | grep in a script that kills nothing is fine"
+    assert killscan.scan("ps aux | grep srv\n") == [], "a ps | grep in a script that kills nothing is fine"
 
 
 def test_ttp_killscan_exits_1_on_a_hit_and_its_shims_kill_nothing(env, tmp_path):

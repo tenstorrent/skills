@@ -1617,20 +1617,20 @@ def test_model_suite_takes_the_newest_complete_folder_pair_and_says_plainly_when
 
 
 def test_the_bench_owner_keeps_a_daily_model_suite_schedule_an_hour_after_the_bench_and_others_keep_it_off(env):
-    from ttp import modelbench
+    from ttp import benchowner
     p = make(env)
-    assert modelbench.ensure(p, p.db, False, "23:30") == "", "not the owner: nothing to turn off"
-    assert not p.db.q("SELECT 1 FROM schedules WHERE name IN (?, ?)", (modelbench.SCHEDULE, modelbench.SUITE_SCHEDULE))
-    assert modelbench.ensure(p, p.db, True, "23:30") == "on"
+    assert benchowner.ensure(p, p.db, False, "23:30") == "", "not the owner: nothing to turn off"
+    assert not p.db.q("SELECT 1 FROM schedules WHERE name IN (?, ?)", (benchowner.SCHEDULE, benchowner.SUITE_SCHEDULE))
+    assert benchowner.ensure(p, p.db, True, "23:30") == "on"
     rows = {r["name"]: r for r in p.db.q("SELECT name, kind, at, enabled, payload FROM schedules")}
-    suite = rows[modelbench.SUITE_SCHEDULE]
+    suite = rows[benchowner.SUITE_SCHEDULE]
     assert (suite["kind"], suite["at"], suite["enabled"]) == ("command", "00:30", 1), "bench_at + 1 h, wrapped"
     assert json.loads(suite["payload"])["command"] == "ttp model-bench suite --detach"
-    assert rows[modelbench.SCHEDULE]["at"] == "23:30"
-    assert modelbench.ensure(p, p.db, True, "23:30") == "", "already right: nothing changes"
-    assert modelbench.ensure(p, p.db, False, "23:30") == "off"
+    assert rows[benchowner.SCHEDULE]["at"] == "23:30"
+    assert benchowner.ensure(p, p.db, True, "23:30") == "", "already right: nothing changes"
+    assert benchowner.ensure(p, p.db, False, "23:30") == "off"
     on = {r["name"]: r["enabled"] for r in p.db.q("SELECT name, enabled FROM schedules WHERE name LIKE 'model-%'")}
-    assert on == {modelbench.SCHEDULE: 0, modelbench.SUITE_SCHEDULE: 0}, "the lease lost: both off"
+    assert on == {benchowner.SCHEDULE: 0, benchowner.SUITE_SCHEDULE: 0}, "the lease lost: both off"
 
 
 def test_model_suite_rebuilds_a_missing_or_stale_folder_pair_keeping_the_old_until_the_new_is_complete(env, tmp_path,
@@ -2807,45 +2807,45 @@ def test_harbor_trial_slots_keep_the_floor_grow_only_past_the_host_gate_and_coun
 
 def test_model_bench_hold_reads_on_off_and_an_end_and_keeps_both_schedules_off_until_it_ends(env):
     import datetime as dt
-    from ttp import modelbench
+    from ttp import benchowner
     now = 1_800_000_000.0
-    assert modelbench.held({}, now) == "" and modelbench.held({"model_bench": {"hold": "false"}}, now) == ""
-    assert modelbench.held({"model_bench": {"hold": True}}, now) == "model_bench.hold is on"
-    assert modelbench.held({"model_bench": {"hold": now + 60}}, now).startswith("model_bench.hold is on until")
-    assert modelbench.held({"model_bench": {"hold": now - 60}}, now) == "", "its end passed"
+    assert benchowner.held({}, now) == "" and benchowner.held({"model_bench": {"hold": "false"}}, now) == ""
+    assert benchowner.held({"model_bench": {"hold": True}}, now) == "model_bench.hold is on"
+    assert benchowner.held({"model_bench": {"hold": now + 60}}, now).startswith("model_bench.hold is on until")
+    assert benchowner.held({"model_bench": {"hold": now - 60}}, now) == "", "its end passed"
     iso = dt.datetime.fromtimestamp(now + 3600, dt.timezone.utc).isoformat()
-    assert modelbench.held({"model_bench": {"hold": iso}}, now)
-    assert modelbench.held({"model_bench": {"hold": iso}}, now + 7200) == ""
-    assert modelbench.held({"model_bench": {"hold": "soon-ish"}}, now).endswith("held until it is removed)"), \
+    assert benchowner.held({"model_bench": {"hold": iso}}, now)
+    assert benchowner.held({"model_bench": {"hold": iso}}, now + 7200) == ""
+    assert benchowner.held({"model_bench": {"hold": "soon-ish"}}, now).endswith("held until it is removed)"), \
         "an end it cannot read holds until the setting is removed"
     p = make(env)
     on = lambda: {r["name"]: r["enabled"] for r in p.db.q("SELECT name, enabled FROM schedules WHERE name LIKE 'model-%'")}
-    assert modelbench.ensure(p, p.db, True, "23:30") == "on"
-    assert modelbench.ensure(p, p.db, True, "23:30", hold="model_bench.hold is on") == "off"
+    assert benchowner.ensure(p, p.db, True, "23:30") == "on"
+    assert benchowner.ensure(p, p.db, True, "23:30", hold="model_bench.hold is on") == "off"
     assert set(on().values()) == {0}, "held: both off though this project holds the lease"
-    assert modelbench.ensure(p, p.db, True, "23:30", hold="model_bench.hold is on") == ""
-    assert modelbench.ensure(p, p.db, True, "23:30") == "on" and set(on().values()) == {1}, "the hold ended"
+    assert benchowner.ensure(p, p.db, True, "23:30", hold="model_bench.hold is on") == ""
+    assert benchowner.ensure(p, p.db, True, "23:30") == "on" and set(on().values()) == {1}, "the hold ended"
 
 
 def test_bench_owner_never_re_enables_a_schedule_turned_off_on_purpose(env):
-    from ttp import modelbench, schedule
+    from ttp import benchowner, schedule
     p = make(env)
-    assert modelbench.ensure(p, p.db, True, "23:30") == "on"
-    schedule.set_enabled(p.db, modelbench.SUITE_SCHEDULE, False)   # turned off by hand
-    assert modelbench.ensure(p, p.db, True, "23:30") == ""
+    assert benchowner.ensure(p, p.db, True, "23:30") == "on"
+    schedule.set_enabled(p.db, benchowner.SUITE_SCHEDULE, False)   # turned off by hand
+    assert benchowner.ensure(p, p.db, True, "23:30") == ""
     on = {r["name"]: r["enabled"] for r in p.db.q("SELECT name, enabled FROM schedules WHERE name LIKE 'model-%'")}
-    assert on == {modelbench.SCHEDULE: 1, modelbench.SUITE_SCHEDULE: 0}, "the other stays the owner's"
+    assert on == {benchowner.SCHEDULE: 1, benchowner.SUITE_SCHEDULE: 0}, "the other stays the owner's"
 
 
 def test_terminalbench_trial_stop_reads_the_hold_the_on_setting_and_the_stop_switch_live(env):
-    from ttp import modelbench, occupancy
+    from ttp import benchowner, occupancy
     p = make(env)
-    assert modelbench.trial_stop(p) == ""
+    assert benchowner.trial_stop(p) == ""
     p.set_config("model_bench.terminalbench.on", False)
-    assert "terminalbench.on" in modelbench.trial_stop(p)
+    assert "terminalbench.on" in benchowner.trial_stop(p)
     p.set_config("model_bench.terminalbench.on", True)
-    occupancy.request_stop(p, modelbench.STOP_NAME, "drain for a demo")
-    assert "drain for a demo" in modelbench.trial_stop(p)
-    occupancy.clear_stop(p, modelbench.STOP_NAME)
+    occupancy.request_stop(p, benchowner.STOP_NAME, "drain for a demo")
+    assert "drain for a demo" in benchowner.trial_stop(p)
+    occupancy.clear_stop(p, benchowner.STOP_NAME)
     p.set_config("model_bench.hold", True)
-    assert modelbench.trial_stop(p) == "model_bench.hold is on"
+    assert benchowner.trial_stop(p) == "model_bench.hold is on"

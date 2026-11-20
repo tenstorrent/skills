@@ -606,26 +606,3 @@ def test_config_add_appends_one_item_to_a_list_key_dedupes_and_refuses_other_key
             cli.main(["config", "demo", key, "--add", "x"])
         assert "not a list key" in capsys.readouterr().err
     assert p.config_path.read_text() == before
-
-
-def test_config_account_add_is_a_usage_error(env, capsys):
-    """`ttp config --account KEY --add V` refuses --add instead of silently dropping it (the account
-    branch returns before the --add guard), and it changes nothing."""
-    from ttp import accountset, cli
-    make(env)
-    before = accountset.current("checks.host_max")
-    with pytest.raises(SystemExit):
-        cli.main(["config", "--account", "checks.host_max", "--add", "5"])
-    assert "usage: ttp config --account KEY [VALUE]" in capsys.readouterr().err
-    assert accountset.current("checks.host_max") == before
-
-
-def test_upgrade_drops_the_retired_effort_ab_keys_and_keeps_jev_pick(env):
-    from ttp import cli
-    from ttp.project import unknown_key_hint
-    p = make(env)
-    _with_raw(p, effort_ab={"enabled": True, "winner": "high", "decided_at": 1, "jev_pick": True})
-    assert "retired" in unknown_key_hint("effort_ab.enabled") and unknown_key_hint("effort_ab.jev_pick") is None
-    notes = cli._drop_retired_keys(p)
-    assert len(notes) == 3 and not any("removed effort_ab.jev_pick" in n for n in notes), notes
-    assert p.raw_config()["effort_ab"] == {"jev_pick": True}

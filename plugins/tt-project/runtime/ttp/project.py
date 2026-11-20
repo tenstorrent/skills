@@ -518,9 +518,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # calls in the window changed none of the rules' decisions; uses.<use> = "on" or "off" forces it
     # (see jevuse.py).
     "jev": {"enabled": "auto", "window_days": 7, "min_calls": 30, "idle_calls": 20, "uses": {}},
-    # jev_pick lets Jev choose medium or high effort for a standard-tier code task from its spec
-    # (effortab.py; off by default).
-    "effort_ab": {"jev_pick": False},
+    # Effort A/B (effortab.py): enabled puts each standard-tier code task in a high or medium effort arm
+    # by its lineage's root id (on by default; the end rule turns it off once it records a winner);
+    # jev_pick lets Jev choose medium or high from the spec (off by default).
+    "effort_ab": {"enabled": True, "jev_pick": False},
     "web": {"bind": "127.0.0.1", "port": 0},
     "detach": {},                       # launcher_stops: see EXTRA_KEYS
     "power": {},                        # keep_awake: replaced by runner.prevent_idle_sleep; "off" still turns it off
@@ -700,7 +701,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
               # The daily bench's second grader (benchdaily.py): {"provider", "model", "effort"}; unset:
               # the chat provider's default model at max effort.
               "second_reviewer": None},
-    # The machine's shared daily chat model bench (modelbench.py): one project owns it and runs it at
+    # The machine's shared daily chat model bench (benchowner.py): one project owns it and runs it at
     # bench_at home time; poke_after_h without a result pokes the owner once, take_over_after_h hands it
     # to the next project by name. opt_out: this project never owns it.
     "model_bench": {"opt_out": False, "poke_after_h": 48, "take_over_after_h": 72, "bench_at": "02:00",
@@ -860,8 +861,9 @@ EXTRA_KEYS = {
                  "rebase_replace", "never_force",   # whether a rebase replaces its branch (rebase_replace)
                  "integration_branch",   # where reviewed changes land on a project with no push branch (integrate)
                  "channel_tags",   # release-channel tags a forward move may update under never_force (channeltag)
-                 "express", "express_max_lines", "express_max_files"},   # `ttp express`: one small urgent head lands alone (pushq)
+                 "express", "express_max_lines", "express_max_files"},   # `ttp express`: one small urgent head lands alone (express)
     "jev": {"via", "url", "model"},
+    "effort_ab": {"winner", "decided_at"},   # the end rule's result, written by effortab.conclude
     # launcher_stops: {glob of a project launcher's job folders: stop command} `ttp detach --stop <job
     # folder>` runs when the job has no detached.json entry and no pid file (launcherstop.registered_stop).
     "detach": {"launcher_stops"},
@@ -1119,9 +1121,6 @@ RETIRED_KEYS = {
     "upgrade.task_every_h": "a conflicting upgrade queues its merge task at once, never on a timer",
     "coordinator.unblock_effort": "every coordinator runs at one effort level, coordinator.effort",
     "route.review_medium_lines": "every review runs on Opus, so no review is sized into the routine class",
-    "effort_ab.enabled": "the effort A/B ended; Jev's pick (effort_ab.jev_pick) is all that is left",
-    "effort_ab.winner": "the effort A/B ended; Jev's pick (effort_ab.jev_pick) is all that is left",
-    "effort_ab.decided_at": "the effort A/B ended; Jev's pick (effort_ab.jev_pick) is all that is left",
     "bridge.agent_alert_grace_min": "replaced by bridge.agent_alert_after_min (when the user is told) and "
                                     "bridge.agent_steady_min (when an outage ends)",
 }

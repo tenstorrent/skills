@@ -237,7 +237,7 @@ def flag(cmd: str, now: float | None = None) -> str | None:
     event once the coordinator has read the last one. Returns "raised", "counted" or None (no project)."""
     if not os.environ.get("TTP_PROJECT"):
         return None
-    from .alerts import RIDE_ALONG
+    from .pagesev import RIDE_ALONG
     from .project import Project
     now = time.time() if now is None else now
     run = os.environ.get("TTP_RUN_ID") or os.path.basename(os.environ.get("TTP_RUN_DIR", "").rstrip("/"))

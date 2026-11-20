@@ -310,9 +310,9 @@ def test_ttp_hostcheck_cli_runs_a_local_check(env):
 
 
 def test_coordtools_and_hostcheck_are_killscan_clean():
-    from ttp import svcscan
+    from ttp import killscan
     for name in ("coordtools.py", "hostcheck.py"):
-        assert not svcscan.kill_scan((RUNTIME / "ttp" / name).read_text()), name
+        assert not killscan.scan((RUNTIME / "ttp" / name).read_text()), name
 
 
 def _answer(p, tmp_path, monkeypatch, actions, run="run"):

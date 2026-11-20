@@ -130,19 +130,19 @@ def test_settlehook_settles_a_routine_batch_with_its_logged_reason(env, monkeypa
 
 
 def _sh_ride(p, clock):
-    from ttp import alerts
+    from ttp import pagesev
     return _ev_x(p, clock, "observation", "a watcher line", "low", "cli-watch", None,
-                 json.dumps({alerts.RIDE_ALONG: True}))
+                 json.dumps({pagesev.RIDE_ALONG: True}))
 
 
 def test_settlehook_a_ride_along_only_batch_past_its_hour_still_starts_a_turn(env, monkeypatch, tmp_path):
-    from ttp import alerts
+    from ttp import pagesev
     p, d, clock, starts, turns = _sh_setup(env, monkeypatch, tmp_path, mode="none")
     p.set_config("coordinator.idle_wake_s", 6 * 3600)
     p.set_config("coordinator.starve_wake_s", 6 * 3600)
     d.cfg = p.config()
     i = _sh_ride(p, clock)
-    clock[0] += alerts.RIDE_ALONG_MAX_S + 60
+    clock[0] += pagesev.RIDE_ALONG_MAX_S + 60
     assert _drive(d, clock, starts), "a ride-along past RIDE_ALONG_MAX_S never woke with the hook on"
     assert i in turns[-1]
 

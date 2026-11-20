@@ -307,7 +307,7 @@ def test_a_scoped_exception_is_an_addition_and_queues_no_update_task(env):
     """An `excepts` exception on the user's words adds a scoped item and leaves the item it excepts word
     for word: no tool-update task, no restriction_tools event and no digest line, though a guard script
     still cites and enforces the excepted item."""
-    from ttp import coordinator as coord
+    from ttp import coordinator as coord, restriction_audit
     p, tasks = _soak_guard(env)
     mids, src = _turn_said(p, "the soak test may run on rack-a with soak_leg.sh")
     act = {"type": "charter_update", "section": "Restrictions", "excepts": _GUARD_SOAK,
@@ -317,12 +317,13 @@ def test_a_scoped_exception_is_an_addition_and_queues_no_update_task(env):
     assert "Exception to \"Never run the soak test on a shared rack.\"" in charter
     assert charter.count(_GUARD_SOAK + " (user msg #7)") == 1, charter
     assert tasks() == [] and not p.db.q("SELECT 1 FROM events WHERE kind='restriction_tools'"), tasks()
+    assert restriction_audit.digest_lines(p) == []
 
 
-def test_a_narrowed_item_queues_one_update_task_naming_the_guard(env):
+def test_a_narrowed_item_queues_one_update_task_naming_the_guard_and_the_digest_shows_it(env):
     """A quoted edit on the user's words that narrows the ban, and a guard script citing it still
     refusing what the new text allows: one priority-1 harness task names the file, line, old item and
-    new text, and one restriction_tools event says so. The guard is
+    new text, one restriction_tools event says so, and the digest shows it while it is open. The guard is
     never edited; the same change again queues no second task."""
     from ttp import coordinator as coord, restriction_audit
     p, tasks = _soak_guard(env)
@@ -340,9 +341,15 @@ def test_a_narrowed_item_queues_one_update_task_naming_the_guard(env):
     ev = [r["text"] for r in p.db.q("SELECT text FROM events WHERE kind='restriction_tools'")]
     assert len(ev) == 1 and f"task #{t['id']}" in ev[0], ev
     assert "exit 1" in (p.root / "bin" / "soak-guard.sh").read_text(), "the check never edits a tool"
+    lines = restriction_audit.digest_lines(p)
+    assert len(lines) == 2 and lines[0].startswith("## Guards behind the charter") and f"#{t['id']}" in lines[1]
+    assert "Guards behind the charter" in dict(coord.digest_parts(p, {}, [], [])[0]).get("guards_behind", "")
     # The same change again: no second task, no second event.
     restriction_audit.restriction_tools(p, [(act["quote"], act["text"], "")], [])
     assert len(tasks()) == 1 and len(p.db.q("SELECT 1 FROM events WHERE kind='restriction_tools'")) == 1
+    # Once its task is done, the digest line goes.
+    p.db.update_task(t["id"], status="done")
+    assert restriction_audit.digest_lines(p) == []
 
 
 def test_restriction_tools_queues_no_task_without_a_matching_tool_or_for_an_unrelated_addition(env):

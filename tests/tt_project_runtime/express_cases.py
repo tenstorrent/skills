@@ -1,11 +1,11 @@
-# Express landing tests (ttp express, pushq.py) of tests/test_tt_project_runtime.py, which runs this
+# Express landing tests (ttp express, express.py) of tests/test_tt_project_runtime.py, which runs this
 # file in its own namespace (see _include_cases there): helpers, fixtures and imports come from that file
 # and the other case files, and pytest collects these tests under its name.
 from __future__ import annotations
 
 
 def _express_marker(p, heads, bid="express-1"):
-    """_batch_marker for an express landing (express_start's marker)."""
+    """_batch_marker for an express landing (express.start's marker)."""
     from ttp import push
     from ttp.project import write_json
     marker = _batch_marker(p, heads, bid=bid)
@@ -113,48 +113,48 @@ def _express_row(s, review=None):
 def test_express_refuses_an_unreviewed_routine_or_oversized_head_with_its_reasons(env, monkeypatch):
     """(d) Eligibility is model-free and every failing reason is named: no passing review, not urgent,
     over the size limits, or express turned off."""
-    from ttp import pushq
+    from ttp import express
     s = _pq(env, monkeypatch)
     said: list[str] = []
-    assert pushq.express_main(s.p, str(s.code), "urgent", say=said.append) == 2
+    assert express.main(s.p, str(s.code), "urgent", say=said.append) == 2
     assert "no approved head for" in said[-1] and "independent review must pass" in said[-1]
     row = _express_row(s)
-    assert pushq.express_main(s.p, str(s.code), "", say=said.append) == 2 and "--why is required" in said[-1]
-    assert pushq.express_main(s.p, str(s.code), "fix", dry_run=True, say=said.append) == 2
+    assert express.main(s.p, str(s.code), "", say=said.append) == 2 and "--why is required" in said[-1]
+    assert express.main(s.p, str(s.code), "fix", dry_run=True, say=said.append) == 2
     assert f"task #{s.review} is not urgent" in said[-1]
     s.p.db.update_task(s.code, priority=1)
     s.p.db.x("UPDATE push_queue SET head=? WHERE id=?", ("12345678" + s.head[8:], row))   # an all-digit prefix
-    assert pushq.express_find(s.p.db, "12345678")["id"] == row
+    assert express.find(s.p.db, "12345678")["id"] == row
     s.p.db.x("UPDATE push_queue SET head=? WHERE id=?", (s.head, row))
     for ref in (str(s.code), str(s.review), f"#{s.code}", s.head[:8]):
-        got, why = pushq.express_eligible(s.p, ref)
+        got, why = express.eligible(s.p, ref)
         assert got["id"] == row and why == [], (ref, why)
     s.p.set_config("delivery.express_max_lines", 0)
-    assert pushq.express_main(s.p, str(s.code), "fix", dry_run=True, say=said.append) == 2
+    assert express.main(s.p, str(s.code), "fix", dry_run=True, say=said.append) == 2
     assert "1 changed lines in 1 files is over delivery.express_max_lines 0" in said[-1]
     s.p.set_config("delivery.express_max_lines", 200)
     s.p.set_config("delivery.express_max_files", 0)
     assert "over delivery.express_max_lines 200 or delivery.express_max_files 0" in \
-        "; ".join(pushq.express_eligible(s.p, str(s.code))[1])
+        "; ".join(express.eligible(s.p, str(s.code))[1])
     s.p.set_config("delivery.express_max_files", 8)
     s.p.set_config("delivery.express", False)
-    assert pushq.express_eligible(s.p, str(s.code))[1] == ["delivery.express is off"]
+    assert express.eligible(s.p, str(s.code))[1] == ["delivery.express is off"]
     s.p.set_config("delivery.express", True)
-    assert pushq.express_main(s.p, str(s.code), "fix", dry_run=True, say=said.append) == 0 and "may land express" in said[-1]
+    assert express.main(s.p, str(s.code), "fix", dry_run=True, say=said.append) == 0 and "may land express" in said[-1]
 
 
 def test_express_starts_a_one_entry_batch_ahead_of_the_queued_approvals(env, monkeypatch):
     """(a) Another approval waits in the queue: express starts a batch of its own head alone, marked
     express, and leaves the other row for the next regular batch."""
-    from ttp import push, pushq
+    from ttp import express, push
     s = _pq(env, monkeypatch)
     other = _pq_review(s)[1]
     s.p.db.update_task(s.code, priority=1)
     row = _express_row(s)
     said: list[str] = []
-    assert pushq.express_main(s.p, str(s.review), "urgent: the user is waiting", wait_s=30, say=said.append) == 0, said
+    assert express.main(s.p, str(s.review), "urgent: the user is waiting", wait_s=30, say=said.append) == 0, said
     bid = said[0].split()[2]
-    assert pushq.is_express(bid) and "alone on origin/proj" in said[0] and ": pushed" in said[-1], said
+    assert express.is_express(bid) and "alone on origin/proj" in said[0] and ": pushed" in said[-1], said
     m = read_dict(s.p.state / push.DETACHED / f"{bid}.json")
     assert [e["id"] for e in m["entries"]] == [row] and m["express"]["why"] == "urgent: the user is waiting"
     assert s.p.db.one("SELECT status FROM push_queue WHERE id=?", (other,))["status"] == "approved"
@@ -187,7 +187,7 @@ def test_an_express_landing_gets_the_full_checks_after_it_lands_and_a_failure_re
 def test_the_push_queue_lands_a_priority_1_approval_express_while_a_regular_batch_runs(env, monkeypatch):
     """User msg #2482: a priority-1 approved head lands alone, ahead of a push batch that is running, with
     only its targeted checks; the running batch is neither waited for nor stopped."""
-    from ttp import push, pushq
+    from ttp import express, push, pushq
     s = _pq(env, monkeypatch)
     s.p.db.update_task(s.code, priority=1)
     row = _express_row(s)
@@ -199,8 +199,8 @@ def test_the_push_queue_lands_a_priority_1_approval_express_while_a_regular_batc
     monkeypatch.setattr(pushq, "alive", lambda m: (True, read_dict(m)) if Path(m) == running else real(m))
     logs: list[str] = []
     bid = pushq.schedule(s.p, log=logs.append)
-    assert bid and pushq.is_express(bid) and "alone, ahead of any running or queued batch" in logs[-1], logs
-    m = pushq.express_wait(s.p, bid, 60)
+    assert bid and express.is_express(bid) and "alone, ahead of any running or queued batch" in logs[-1], logs
+    m = express.wait(s.p, bid, 60)
     assert m.get("outcome") == "pushed", m
     assert [e["id"] for e in m["entries"]] == [row]
     assert read_dict(running)["phase"] == "checking", "the running batch was left alone"

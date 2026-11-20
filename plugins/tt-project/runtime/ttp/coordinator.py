@@ -461,9 +461,10 @@ USER_SETTABLE = {
     "notify.chat_cost_alarm": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     "coordinator.tier": str, "coordinator.model": str, "coordinator.model_tier": str, "coordinator.effort": str,
     "jev.enabled": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
+    # The effort A/B of standard-tier code tasks and Jev's effort pick (effortab.py).
+    "effort_ab.enabled": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     # The stay-off watchdog's alert switch (occupancy.settings): off keeps flags for status, posts nothing.
     "occupancy.alerts": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
-    # Jev's effort pick for standard-tier code tasks (effortab.py).
     "effort_ab.jev_pick": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     "runner.pin_verify": pin_verify_mode,
     # What `ttp host-run` may run on the host outside the sandbox: stored only as a list hostrun accepts.
@@ -1574,6 +1575,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     section("memory_recent_added", delta)
     section("charter_conflicts", charter_conflict_lines(charter_conflicts(p)))
     section("retired_echoes", echoes.digest_lines(p, now))
+    section("guards_behind", restriction_audit.digest_lines(p))
     section("ends", ends.digest_lines(p, float(db.kv("last_coordinator_turn", 0) or 0), now))
     section("old_orders", safe_eta(lambda: oldorders.digest_lines(p, event_ids, now), []))
     section("heal", heal.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0), now))

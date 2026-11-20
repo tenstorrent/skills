@@ -1,4 +1,4 @@
-# ETA numbers from history (the p90, size, load and queue-depth parts of eta.py,
+# ETA numbers from history (runtime/ttp/etahist.py and the p90, size, load and queue-depth parts of eta.py,
 # etaledger.shown, `ttp progress report --expected-wait-s`) of tests/test_tt_project_runtime.py, which runs
 # this file in its own namespace (see _include_cases there). Fake records only.
 from __future__ import annotations
@@ -14,48 +14,48 @@ def _eh_runs(p, now, kind, runs, spec="s", wait=100):
 
 
 def test_eta_percentile_is_the_median_at_half_and_survives_bad_input():
-    from ttp import eta
+    from ttp import etahist
     import statistics
     for xs in ([5.0], [1.0, 9.0], [3.0, 1.0, 2.0], [4.0, 1.0, 3.0, 2.0, 10.0, 7.0]):
-        assert eta.pct(xs, 0.5) == statistics.median(xs)
+        assert etahist.pct(xs, 0.5) == statistics.median(xs)
     xs = list(range(1, 11))
-    assert eta.pct(xs, 0.9) == pytest.approx(9.1) and eta.pct(xs, 1.0) == 10 and eta.pct(xs, 0) == 1
+    assert etahist.pct(xs, 0.9) == pytest.approx(9.1) and etahist.pct(xs, 1.0) == 10 and etahist.pct(xs, 0) == 1
     # Out of range, NaN and non-numbers never raise: clamped or skipped.
-    assert eta.pct(xs, 7) == 10 and eta.pct(xs, -1) == 1 and eta.pct(xs, float("nan")) == 1
-    assert eta.pct([1.0, float("inf"), float("nan"), True, "x", None, 3.0], 0.5) == 2.0
-    assert eta.pct([], 0.9) is None and eta.pct(None, 0.9) is None
+    assert etahist.pct(xs, 7) == 10 and etahist.pct(xs, -1) == 1 and etahist.pct(xs, float("nan")) == 1
+    assert etahist.pct([1.0, float("inf"), float("nan"), True, "x", None, 3.0], 0.5) == 2.0
+    assert etahist.pct([], 0.9) is None and etahist.pct(None, 0.9) is None
 
 
 def test_eta_size_load_and_depth_factors_are_bounded_and_never_shrink():
-    from ttp import eta
-    assert [eta.size_of(n) for n in (0, 1499, 1500, 3999, 4000, 99999)] == [
+    from ttp import etahist
+    assert [etahist.size_of(n) for n in (0, 1499, 1500, 3999, 4000, 99999)] == [
         "short", "short", "medium", "medium", "long", "long"]
-    assert eta.size_of("x" * 5000) == "long"
+    assert etahist.size_of("x" * 5000) == "long"
     for bad in (None, -5, float("nan"), True, "", [], {}):
-        assert eta.size_of(bad) in ("short", "medium"), bad   # a bad length is medium, text counts its characters
-    assert eta.load_factor(0.3) == 1.0 and eta.load_factor(1.0) == 1.0
-    assert eta.load_factor(2.0) == pytest.approx(1.25) and eta.load_factor(500) == eta.MAX_LOAD_X
+        assert etahist.size_of(bad) in ("short", "medium"), bad   # a bad length is medium, text counts its characters
+    assert etahist.load_factor(0.3) == 1.0 and etahist.load_factor(1.0) == 1.0
+    assert etahist.load_factor(2.0) == pytest.approx(1.25) and etahist.load_factor(500) == etahist.MAX_LOAD_X
     for bad in (None, float("nan"), True, "9"):
-        assert eta.load_factor(bad) == 1.0, bad
-    assert eta.depth_factor(0, 4) == 1.0 and eta.depth_factor(4, 4) == 1.0
-    assert eta.depth_factor(6, 4) == pytest.approx(1.5) and eta.depth_factor(999, 4) == eta.MAX_DEPTH_X
-    assert eta.depth_factor(3, 0) == eta.depth_factor(3, 1) == eta.MAX_DEPTH_X and eta.depth_factor("x", 2) == 1.0
-    assert eta.depth_factor(None, None) == 1.0
+        assert etahist.load_factor(bad) == 1.0, bad
+    assert etahist.depth_factor(0, 4) == 1.0 and etahist.depth_factor(4, 4) == 1.0
+    assert etahist.depth_factor(6, 4) == pytest.approx(1.5) and etahist.depth_factor(999, 4) == etahist.MAX_DEPTH_X
+    assert etahist.depth_factor(3, 0) == etahist.depth_factor(3, 1) == etahist.MAX_DEPTH_X and etahist.depth_factor("x", 2) == 1.0
+    assert etahist.depth_factor(None, None) == 1.0
 
 
 def test_eta_host_load_reads_the_override_and_never_raises(monkeypatch):
-    from ttp import eta, hostload
+    from ttp import etahist, hostload
     monkeypatch.setenv("TTP_ETA_LOAD", "1.75")
-    assert eta.host_load() == 1.75
+    assert etahist.host_load() == 1.75
     for bad in ("off", "", "x", "nan", "inf", "-2"):
         monkeypatch.setenv("TTP_ETA_LOAD", bad)
-        assert eta.host_load() is None, bad
+        assert etahist.host_load() is None, bad
     monkeypatch.delenv("TTP_ETA_LOAD")
     monkeypatch.setattr(hostload, "loads", lambda: (8.0, 4.0, 2.0))
     monkeypatch.setattr(os, "cpu_count", lambda: 4)
-    assert eta.host_load() == 2.0
+    assert etahist.host_load() == 2.0
     monkeypatch.setattr(hostload, "loads", lambda: None)
-    assert eta.host_load() is None
+    assert etahist.host_load() is None
 
 
 def test_eta_conservative_time_is_the_p90_walk_and_never_before_the_likely_one(env):
@@ -121,7 +121,7 @@ def test_eta_run_samples_are_by_kind_and_size_once_there_are_enough(env):
     mid = p.db.add_task("m", "s" * 2000, kind="work")
     _eh_runs(p, now, "work", [9000] * 2, spec="s" * 2000)
     e = eta.estimate(p.db, mid, now)
-    assert e["end"] == pytest.approx(now + 100 + eta.pct([100] * 5 + [1000] * 6 + [9000] * 2, 0.5))
+    assert e["end"] == pytest.approx(now + 100 + eta.etahist.pct([100] * 5 + [1000] * 6 + [9000] * 2, 0.5))
 
 
 def test_eta_host_load_and_queue_depth_only_lengthen_and_are_named(env):

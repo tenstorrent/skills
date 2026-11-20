@@ -32,7 +32,7 @@ import re
 from collections import Counter
 from pathlib import Path
 
-from . import alerts
+from . import pagesev
 
 KIND = "worker_drift"
 DEFAULTS = {"repeat_fail": 3, "loop": 4, "outside_spec": 3, "quiet_s": 900, "pace": 1.5, "raise_s": 600}
@@ -152,7 +152,7 @@ def _event(db, e: dict, flag: str, evidence: str, step: int, now: float) -> int 
            + " Decide: correct it with a task update, or cancel and requeue the task with a sharper spec.")
     data = {"run": e["run"], "task": e.get("task"), "flag": flag, "evidence": evidence, "step": step}
     if step == 2:
-        data[alerts.RIDE_ALONG] = True
+        data[pagesev.RIDE_ALONG] = True
     return db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status,task) "
                 "VALUES(?,?,?,?,?,?,?,?,?)",
                 (now, "daemon", KIND, fp, "normal", msg, json.dumps(data), "queued", e.get("task")))

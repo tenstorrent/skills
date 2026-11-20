@@ -358,7 +358,7 @@ def _degraded_events(p):
 
 
 def test_a_step_that_keeps_overrunning_sits_out_ticks_is_one_incident_and_one_ride_along_event(env, monkeypatch):
-    from ttp import looks, alerts
+    from ttp import looks, pagesev
     from ttp import overseer as ov
     from ttp.daemon import DEGRADE_AFTER, DEGRADE_TICKS
     p = make(env)
@@ -375,7 +375,7 @@ def test_a_step_that_keeps_overrunning_sits_out_ticks_is_one_incident_and_one_ri
     assert [i["step"] for i in incs] == ["sweep_unreviewed"], incs
     assert incs[0]["overruns"]["sweep_unreviewed"] == DEGRADE_AFTER and Path(incs[0]["stacks"]).read_text()
     [ev] = _degraded_events(p)
-    assert ev["severity"] == "low" and ev["status"] == "queued" and alerts.rides_along(ev), ev
+    assert ev["severity"] == "low" and ev["status"] == "queued" and pagesev.rides_along(ev), ev
     assert looks.pending(p.db) == [], "a degraded step forced a coordinator turn"
 
 

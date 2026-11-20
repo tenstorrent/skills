@@ -118,7 +118,7 @@ def test_user_site_refusal_binds_every_provider_path_and_flags_the_coordinator(e
     """Claude Code and Codex run `python -m ttp.hook PreToolUse`, Cursor its cursorhook, a hookless run the
     stream guard and the coordinator coordtools: each refuses, and every refusal is counted on one queued
     ride-along event of the run, a flag for the coordinator (normal, never a user alert)."""
-    from ttp import coordtools, cursorhook, hook, alerts, streamguard
+    from ttp import coordtools, cursorhook, hook, pagesev, streamguard
     p, run = _us_run(env, monkeypatch, tmp_path)
     cmd = "pip install --user pytest==9.2.0"
     bash = {"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(tmp_path)}
@@ -136,7 +136,7 @@ def test_user_site_refusal_binds_every_provider_path_and_flags_the_coordinator(e
     ev = _us_events(p)
     assert len(ev) == 1 and ev[0]["status"] == "queued" and ev[0]["severity"] == "normal" and ev[0]["task"] == 9
     data = json.loads(ev[0]["data"])
-    assert data["count"] == 4 and data[alerts.RIDE_ALONG] is True and "4 installs" in ev[0]["text"]
+    assert data["count"] == 4 and data[pagesev.RIDE_ALONG] is True and "4 installs" in ev[0]["text"]
     assert [x["kind"] for x in map(json.loads, (run / hook.REFUSALS_FILE).read_text().splitlines())].count("user_site") >= 3
     # Once the coordinator has read it, the next refusal raises a new one.
     p.db.x("UPDATE events SET status='handled' WHERE id=?", (ev[0]["id"],))

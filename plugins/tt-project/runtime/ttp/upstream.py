@@ -809,7 +809,7 @@ def _file(p: project.Project, sources, offsets: dict, known: set, seen: list, no
             sev, text = _event(n, cap)
             if n.get("project") and (n["project"], n.get("host")) != me:
                 routes[n["fp"]] = _route(n, src, now)
-            # A daemon's page with a fingerprint (an overdue machine change, alerts.change_fingerprint)
+            # A daemon's page with a fingerprint (an overdue machine change, pagesev.change_fingerprint)
             # reaches the coordinator once: a copy of one this project already has is kept, handled.
             page_fp = str(n.get("page_fp") or "") if to and n.get("from") == "daemon" else ""
             # A batch of a project's expired changes (page_fps): queued while any of them is new here; each new
