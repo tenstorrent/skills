@@ -446,6 +446,13 @@ LOCAL_TIMEOUT_S = 10.0   # an `ssh-add -l` that takes longer is a hung agent
 LOCAL_RECHECK_S = 2.0  # a failed check is confirmed by one more this soon after
 ENV_AGENT = "TTP_BRIDGE_AGENT"   # bridge.py's name for the service's own agent in its ssh wrapper
 
+# `ok <socket>`: the agent there answers (ssh-add -l exits 0, or 1 with no keys); 2, a timeout or a
+# failed exchange is a dead agent. A session whose workstation agent died keeps its socket file, so
+# `-S` alone never notices.
+AGENT_OK = ("ok() { t=; command -v timeout >/dev/null 2>&1 && t='timeout 10'; "
+            'o=$(SSH_AUTH_SOCK="$1" $t ssh-add -l 2>&1); r=$?; [ $r -eq 0 ] || { [ $r -eq 1 ] && '
+            "! printf '%s' \"$o\" | grep -qiE 'error fetching|communication with agent'; }; }")
+
 # On the box (POSIX sh; ss, else /proc): $1 the tag prefix, $2 the record name prefix, $3 the agent
 # link (a '~/' path, or empty), then the ports. Prints `ended <port> <pid> <age s>` per session it ends,
 # `kept <port> <pid> <why>` per one it leaves and, last, `held <port> <pid or ?>` per port still held;
@@ -475,11 +482,7 @@ held() {   # the port has a listener, whether or not this account can see its pr
 }
 any_held() { for q in $ports; do held "$q" && return 0; done; return 1; }
 alive() { kill -0 "$1" 2>/dev/null && case "$(ps -o stat= -p "$1" 2>/dev/null)" in *Z*) false;; esac; }   # a zombie has ended
-answers() {   # the agent behind a socket gives its keys (ssh-add -l exits 0, or 1 with none)
-  t=; command -v timeout >/dev/null 2>&1 && t="timeout 10"
-  o=$(SSH_AUTH_SOCK="$1" $t ssh-add -l 2>&1); r=$?
-  [ $r -eq 0 ] || { [ $r -eq 1 ] && ! printf '%s' "$o" | grep -qiE 'error fetching|communication with agent'; }
-}
+""" + AGENT_OK + r"""
 end_one() {   # $1 the port (or link, rec), $2 the pid
   case " $seen " in *" $2 "*) return;; esac; seen="$seen $2"
   case " $mine " in *" $2 "*) echo "kept $1 $2 the cleanup's own session"; return;; esac
@@ -502,7 +505,7 @@ if [ -n "$link" ] && [ -L "$link" ]; then   # the agent link of the stale sessio
   case "$pid" in ''|*[!0-9]*) ;; *)
     if ! [ -S "$sock" ] || case "$(ps -o stat= -p "$pid" 2>/dev/null)" in ''|*Z*) true;; *) false;; esac; then :
     elif ! command -v ssh-add >/dev/null 2>&1; then echo "kept link $pid no ssh-add to ask its agent"
-    elif answers "$link"; then echo "kept link $pid its agent answers"
+    elif ok "$link"; then echo "kept link $pid its agent answers"
     else end_one link "$pid"; fi;;
   esac
 fi
@@ -858,6 +861,8 @@ def run(ssh: list[str], tag: str, d: str, state: dict, link: str = "") -> int:
             print(f"ttp bridge: cleaning up again in {CLEAN_RETRY_S[tries]}s before reconnecting",
                   file=sys.stderr, flush=True)
             wait(CLEAN_RETRY_S[tries], state)
+            if state["stop"]:
+                return rc
             tries += 1
         cleaned = True
 

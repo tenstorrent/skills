@@ -73,6 +73,7 @@ import time
 from pathlib import Path
 
 from . import sshcmd
+from .bridge_relay import AGENT_OK
 from .project import HOME_DIR, durable_write
 
 CONFIG = Path.home() / ".config" / "tt-project" / "bridge.json"
@@ -240,12 +241,6 @@ def _opt(key: str, value: str) -> str:
 
 CHECK_S = 30     # how often the box-side loop asks the agent behind the link for its keys
 AGENT_DEAD = 5   # its exit after two checks in a row found its own forwarded agent dead: the wrapper reconnects
-# `ok <socket>`: the agent there answers (ssh-add -l exits 0, or 1 with no keys); 2, a timeout or a
-# failed exchange is a dead agent. A session whose workstation agent died keeps its socket file, so
-# `-S` alone never notices.
-AGENT_OK = ("ok() { t=; command -v timeout >/dev/null 2>&1 && t='timeout 10'; "
-            'o=$(SSH_AUTH_SOCK="$1" $t ssh-add -l 2>&1); r=$?; [ $r -eq 0 ] || { [ $r -eq 1 ] && '
-            "! printf '%s' \"$o\" | grep -qiE 'error fetching|communication with agent'; }; }")
 
 
 def remote_command(cfg: dict, agent: str) -> str:
