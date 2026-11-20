@@ -2,8 +2,9 @@
 
 It is a pass-through that keeps existing configs and worker habits working. A pytest run takes its
 xdist workers from the host's test slots (testslots.direct), and its xdist options are dropped where
-xdist is not installed. The command gets the account's leak-pattern file by path (leakfile), as checks
-do, and the sudo wrapper (sudowatch): once it ends, stderr says what sudo it ran and which root
+xdist is not installed. Where checks.cpu_quota or a busy probe is set, it runs in a CPU-quota group
+(cpuquota.wrap), as checks do. The command gets the account's leak-pattern file by path (leakfile), as
+checks do, and the sudo wrapper (sudowatch): once it ends, stderr says what sudo it ran and which root
 processes that left running. The host's real crontab, systemd user units and power state stay out of
 its reach (hoststate): it sees stand-ins, and the run fails if it still changed the real host."""
 from __future__ import annotations
@@ -40,7 +41,7 @@ def _test_slots(argv: list[str], env: dict):
 def run(argv: list[str]) -> int:
     """`ttp sandbox -- <cmd...>`: run `argv` as it is and return its exit code. A SIGTERM or SIGHUP to
     this process (a `timeout`, a closed terminal) is passed on to the command."""
-    from . import hoststate, leakfile, sudowatch, testslots
+    from . import cpuquota, hoststate, leakfile, project, sudowatch, testslots
     run_dir = os.environ.get("TTP_RUN_DIR")
     store = Path(run_dir) / "hoststate" if run_dir and os.path.isdir(run_dir) else None
     env = hoststate.fake_env(leakfile.with_path(dict(os.environ)), store)
@@ -49,6 +50,8 @@ def run(argv: list[str]) -> int:
     if dropped:
         print(f"ttp sandbox: {dropped}", file=sys.stderr, flush=True)
     argv, grant = _test_slots(list(argv), env)
+    if grant is None:   # a grant's run is already in the group (testslots.low_priority)
+        argv = cpuquota.wrap(argv, cpuquota.settings(testslots._cfg(), project.load_account_settings()))
     try:
         watch = sudowatch.Watch(env)
         env = watch.env
