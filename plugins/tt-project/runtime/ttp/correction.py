@@ -38,6 +38,7 @@ A worker's result rows that name an LLM model (`llm_model`, or `model` when it n
 flagged in the result and the hand-off's digest notes."""
 from __future__ import annotations
 
+from collections import Counter
 import json
 import re
 import time
@@ -104,6 +105,7 @@ _NOT_TASK = re.compile(r"(?:\b(?:prs?|pulls?|pull\s+requests?|issues?|repos?|rep
                        r"(?:\s*(?:,\s*(?:and|or)\b|,|&|/|\band\b|\bor\b)\s*#\d+\b)*")
 ANCHOR_SHARE = 0.5
 ANCHOR_MIN = 2
+COMMON_DF = 10   # a word in this many earlier clauses is common talk, not what a clause is about
 STOP = frozenset("a an the to of for on in at and or is are be it its this that these those with by from as "
                  "please pls now just again also do does you we i me my our your all any then than so but if "
                  "can could would should will it's that's".split())
@@ -237,6 +239,17 @@ def _near(a: frozenset, b: frozenset) -> bool:
     return len(a & b) >= REPEAT_J * len(a | b)
 
 
+def _evidence(said: frozenset, prior: tuple, anc: frozenset, df: Counter) -> int:
+    """How strongly a clause with words `said` and anchors `anc` repeats the earlier clause `prior` (by_anchor's
+    row): a clause of only anchors counts the anchors it shares; else the words it shares that are not common
+    talk (df) plus the task and key anchors it shares, less one when no such anchor is shared (a model or
+    effort level alone names no subject)."""
+    shared, specific = anc & prior[4], _specific(anc & prior[4])
+    if not said:
+        return len(shared)
+    return len([w for w in said & prior[2] if df[w] < COMMON_DF]) + len(specific) - (not specific)
+
+
 def repeats(db: DB, msgs: list[dict], now: float | None = None) -> dict[int, tuple[int, str]]:
     """{message id: (first id, sentence)} for the inbound messages in `msgs` with a sentence an earlier
     inbound message of the last REPEAT_S already had (or an anchored instruction of any length one
@@ -254,6 +267,7 @@ def repeats(db: DB, msgs: list[dict], now: float | None = None) -> dict[int, tup
     last: dict[tuple, float] = {}              # normalized sentence: when it was last said
     recent: list[tuple[frozenset, tuple]] = []
     by_anchor: dict[str, list[tuple]] = {}   # anchor: (id, ts, non-anchor content, clause, anchors)
+    df: Counter = Counter()   # content word: how many earlier clauses had it
     out, i = {}, 0
     for m in new:
         mid = int(m["id"])
@@ -264,6 +278,7 @@ def repeats(db: DB, msgs: list[dict], now: float | None = None) -> dict[int, tup
                     recent.append((frozenset(s), s))
                 last[s] = float(rows[i]["ts"] or 0)
             for words, anc, ask, rest in clauses(rows[i]["text"], cited.get(rows[i]["chat"], ())):
+                df.update(rest)
                 for a in anc if not ask else ():
                     got = by_anchor.setdefault(a, [])
                     got.append((int(rows[i]["id"]), float(rows[i]["ts"] or 0), rest, " ".join(words), anc))
@@ -287,7 +302,7 @@ def repeats(db: DB, msgs: list[dict], now: float | None = None) -> dict[int, tup
             cands = sorted({c for a in anc for c in by_anchor.get(a, ())},
                            key=lambda c: (c[0], c[3]))   # oldest first
             hit = next((c for c in cands if len(said & c[2]) >= ANCHOR_SHARE * len(said) and ts - c[1] > RESEND_S
-                        and max(len(said & c[2]) - (not _specific(anc & c[4])), len(anc & c[4])) >= ANCHOR_MIN), None)
+                        and _evidence(said, c, anc, df) >= ANCHOR_MIN), None)
             if hit:
                 out[mid] = (hit[0], hit[3])
                 break
@@ -828,6 +843,7 @@ CLAIMS_KEEP = 200
 CLAIM_DAYS = 30
 TOPIC_MIN = 2
 CLAIM_WRONG_WORDS = 4   # a wrong part with more words than this is prose, not a value
+CLAIM_SPAN = 4   # consecutive words of a wrong phrase a text restates (all of a shorter one, never fewer than 2)
 _EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 _WRONG = re.compile(r"\b(?:not|never|instead of|rather than|no longer|isn't|aren't|wasn't|weren't|retires)\s+"
                     r"([^.;:,()\n]+)", re.I)
@@ -865,10 +881,11 @@ def claim(text: str) -> dict | None:
     if not head:
         return None
     body = text[head.end():]
-    spans = []
+    spans, phrases = [], []
     for m in _WRONG.finditer(body):
         part = _WRONG_END.split(m.group(1))[0]
         spans.append((m.start(), m.start(1) + len(part)))
+        phrases.append(" ".join(_TOK.findall(part.lower())))
     if not spans:
         return None
     right, wrong = _anchors(body, spans)
@@ -883,7 +900,7 @@ def claim(text: str) -> dict | None:
     if not wrong and not 0 < len(wrong_words) <= CLAIM_WRONG_WORDS:
         return None
     return {"msg": int(head.group(1)), "topic": sorted(topic), "right": sorted(right), "wrong": sorted(wrong),
-            "wrong_words": [] if wrong else sorted(wrong_words)}
+            "wrong_words": [] if wrong else sorted(wrong_words), "phrases": [] if wrong else phrases}
 
 
 def remember(db: DB, name: str, text: str, now: float | None = None) -> dict | None:
@@ -914,8 +931,15 @@ def contradicts(c: dict, text: str) -> str:
         if right and right <= have:   # names the right value too: about the change
             return ""
         return ", ".join(sorted(w.split(":", 1)[1] for w in wrong))
-    ww = set(c.get("wrong_words") or ())
-    return " ".join(sorted(ww)) if ww and ww <= words else ""
+    have_text = " " + " ".join(_TOK.findall((text or "").lower())) + " "
+    for phrase in c.get("phrases") or ():   # the wrong phrase itself or a span of it, never one common word
+        toks = phrase.split()
+        size = min(CLAIM_SPAN, len(toks))
+        for at in range(len(toks) - size + 1) if size > 1 else ():
+            span = " ".join(toks[at:at + size])
+            if f" {span} " in have_text:
+                return span
+    return ""
 
 
 def repeated(p, text: str, now: float | None = None) -> str:
@@ -929,7 +953,9 @@ def repeated(p, text: str, now: float | None = None) -> str:
     for e in reversed(p._memory_entries()):
         if not e["body"].startswith(CORRECTION_PREFIX) or _stamp_ts(e["created"]) < since:
             continue
-        c = stored.get(e["name"]) or claim(e["body"])
+        c = stored.get(e["name"])
+        if not c or (c.get("wrong_words") and "phrases" not in c):   # kept before claims stored their phrases
+            c = claim(e["body"])
         hit = contradicts(c, text) if c else ""
         if hit:
             line = " ".join(e["body"].split())

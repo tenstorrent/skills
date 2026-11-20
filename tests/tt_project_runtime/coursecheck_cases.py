@@ -611,6 +611,28 @@ def test_relink_fix_repoints_a_corrections_fix_to_any_task_with_its_reason(env, 
     assert [r["to"] for r in correction._records(p.db)[0]["relinked"]] == [f"#{real}", f"#{wrong}"]
 
 
+def test_two_models_named_in_both_clauses_or_words_everyone_uses_make_no_repeat(env):
+    """Two model names and one shared word are no class match; words that fill the recent talk (common
+    words) do not count as shared, while the same words in a quiet project still repeat."""
+    from ttp import correction
+    p = make(env)
+    now = time.time()
+    rows = lambda *ids: p.db.q(f"SELECT * FROM messages WHERE id IN ({','.join('?' * len(ids))})", ids)
+    _cc_msg(p, "in", "user", "Put the fail-to-pass table first in the bench report, then the blind reviews; "
+                             "show the GLM and Opus numbers side by side.", now - 3 * 86400)
+    order = _cc_msg(p, "in", "user", "Run the delete batches on GLM and Opus keeps the reviews.", now - 60)
+    assert correction.flag(p.db, p.config(), rows(order), now) == {}
+    old = _cc_msg(p, "in", "user", "Opus: keep the review notes, the report format and the batch plan as agreed.",
+                  now - 2 * 86400)
+    quiet = _cc_msg(p, "in", "user", "Opus: keep the review notes and the report format.", now - 60)
+    assert correction.flag(p.db, p.config(), rows(quiet), now) == {quiet: f"repeats #{old}"}
+    for i in range(correction.COMMON_DF):
+        _cc_msg(p, "in", "user", f"Round {i}: keep the review notes and the report format for batch {i}.",
+                now - 86400 + i)
+    busy = _cc_msg(p, "in", "user", "Opus: keep the review notes and the report format.", now - 30)
+    assert correction.flag(p.db, p.config(), rows(busy), now) == {}
+
+
 def test_a_plain_order_sharing_only_a_model_name_and_two_words_with_an_earlier_clause_is_no_repeat(env):
     """An order saying 'Opus keeps the reviews' shares the model anchor and 'keep', 'review' with a long
     earlier clause naming Opus: no repeat, so no likely correction to pair with an earlier one. Three shared

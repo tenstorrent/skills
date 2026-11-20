@@ -157,7 +157,7 @@ _PL_PASS = "echo '= 1 passed in 0.1s ='"
 
 def _pl_land(env, tmp_path, monkeypatch, check, n=3, bad_at=None, rows_reversed=False):
     """A project whose push branch up/main got one batch of `n` entries (entry `bad_at` adds a file named bad)
-    plus a version bump, recorded as pushed; post_land_checks = [check]; the driver runs inline. rows_reversed:
+    plus a version bump, recorded as pushed (`bad_at` may be {entry: file content}); post_land_checks = [check]; the driver runs inline. rows_reversed:
     the queue rows are added last entry first (a batch replays in priority order, not id order)."""
     import json as _json
     import subprocess as sp
@@ -169,7 +169,8 @@ def _pl_land(env, tmp_path, monkeypatch, check, n=3, bad_at=None, rows_reversed=
     g("remote", "add", "up", str(tmp_path / "up.git"))
     tip, entries = g("rev-parse", "HEAD"), []
     for i in range(n):
-        (p.root / f"pl{i}.txt").write_text("bad\n" if i == bad_at else "ok\n")
+        (p.root / f"pl{i}.txt").write_text(bad_at[i] if isinstance(bad_at, dict) and i in bad_at else
+                                           "bad\n" if i == bad_at else "ok\n")
         g("add", f"pl{i}.txt"); g("commit", "-qm", f"entry {i}")
         entries.append(g("rev-parse", "HEAD"))
     (p.root / "PLVERSION").write_text("2\n"); g("add", "PLVERSION"); g("commit", "-qm", "bump")
@@ -450,6 +451,83 @@ def test_post_land_run_whose_tests_all_pass_but_a_session_guard_fails_is_named_s
     assert "tests wrote outside their temp folders: | tree/stray.log: created" in ev["text"]
     assert "cut short" not in ev["text"] and ev["kind"] == "observation" and ev["status"] == "queued"
     assert not p.db.q("SELECT id FROM tasks WHERE title LIKE 'Revert%' OR title LIKE 'Fix%'")
+
+
+def _pl_abc(tmp_path):
+    """A check of three tests: test_a fails while a pl file holds bad_a, test_b likewise (bad_b), test_c always."""
+    script = tmp_path / "abc.sh"
+    script.write_text(
+        "n=1; echo 'FAILED tests/t.py::test_c - boom'\n"
+        "grep -qs bad_a pl*.txt && { n=$((n+1)); echo 'FAILED tests/t.py::test_a - boom'; }\n"
+        "grep -qs bad_b pl*.txt && { n=$((n+1)); echo 'FAILED tests/t.py::test_b - boom'; }\n"
+        "echo \"= $n failed, $((3-n)) passed in 0.1s =\"; exit 1\n")
+    return f"sh {script}"
+
+
+def _pl_fix_at_tip(p, g, name):
+    """A commit on up/main after the landing that removes `name`: what a fix landing later looks like."""
+    g("rm", "-q", name); g("commit", "-qm", f"drop {name}")
+    g("push", "-q", "up", "HEAD:refs/heads/main")
+
+
+def test_post_land_blames_each_failing_test_on_the_change_that_broke_it_one_revert_and_fix_each(
+        env, tmp_path, monkeypatch):
+    from ttp import postland
+    p, g, pushed, entries = _pl_land(env, tmp_path, monkeypatch, _pl_abc(tmp_path), n=4,
+                                     bad_at={0: "bad_a\n", 2: "bad_b\n"})
+    postland.tend(p, p.config())
+    assert postland.tend(p, p.config()) == "guilty"
+    last = p.db.kv(postland.KEY)["last"]
+    assert last["ids"] == ["tests/t.py::test_a", "tests/t.py::test_b"], "test_c fails before the range: no one's"
+    fixes = {f["title"]: f for f in p.db.q("SELECT * FROM tasks WHERE title LIKE 'Fix #%'")}
+    assert len(fixes) == 2 and len(p.db.q("SELECT id FROM push_queue WHERE status='approved'")) == 2
+    for i, test, other in ((0, "test_a", "test_b"), (2, "test_b", "test_a")):
+        (fix,) = [f for f in fixes.values() if f"ch{i}" in f["title"]]
+        assert f"the only ones to rerun: tests/t.py::{test}\n" in fix["spec"], fix["spec"]
+        assert "test_c" not in fix["spec"].split("Command:")[0] and f"{other}\nCommand" not in fix["spec"]
+        (rev,) = p.db.q("SELECT * FROM push_queue WHERE branch=?", (f"ttp/postland-revert-{entries[i][:10]}",))
+        assert g("diff", "--name-only", pushed, rev["head"]) == f"pl{i}.txt", "each revert takes out only its change"
+        assert f"failing: tests/t.py::{test}" in g("log", "-1", "--format=%B", rev["head"])
+
+
+def test_post_land_second_of_two_changes_breaking_a_test_is_reverted_not_the_first(env, tmp_path, monkeypatch):
+    from ttp import postland
+    p, g, pushed, entries = _pl_land(env, tmp_path, monkeypatch, _pl_abc(tmp_path), n=2, bad_at={1: "bad_a\n"})
+    postland.tend(p, p.config())
+    assert postland.tend(p, p.config()) == "guilty"
+    (fix,) = p.db.q("SELECT * FROM tasks WHERE title LIKE 'Fix #%'")
+    assert "ch1" in fix["title"] and "ch0" not in fix["title"]
+    (rev,) = p.db.q("SELECT * FROM push_queue WHERE status='approved'")
+    assert g("diff", "--name-only", pushed, rev["head"]) == "pl1.txt"
+
+
+def test_post_land_test_the_tip_already_passes_is_blamed_on_nobody_the_others_still_are(env, tmp_path, monkeypatch):
+    """The 2026-11 case: one test broken by the first change, another by a later change that a landing since
+    fixed. The first change is reverted for its own test only; the fixed test reverts and fixes nothing."""
+    from ttp import postland
+    p, g, pushed, entries = _pl_land(env, tmp_path, monkeypatch, _pl_abc(tmp_path), n=3,
+                                     bad_at={0: "bad_a\n", 2: "bad_b\n"})
+    _pl_fix_at_tip(p, g, "pl2.txt")
+    postland.tend(p, p.config())
+    assert postland.tend(p, p.config()) == "guilty"
+    (fix,) = p.db.q("SELECT * FROM tasks WHERE title LIKE 'Fix #%'")
+    assert "ch0" in fix["title"] and "the only ones to rerun: tests/t.py::test_a\n" in fix["spec"], fix
+    assert "test_b" not in fix["spec"].split("Command:")[0]
+    (rev,) = p.db.q("SELECT * FROM push_queue WHERE status='approved'")
+    assert g("diff", "--name-only", f"{rev['head']}^", rev["head"]) == "pl0.txt", "only the first change comes out"
+    assert p.db.kv(postland.KEY)["last"]["ids"] == ["tests/t.py::test_a"]
+
+
+def test_post_land_failure_every_test_of_which_the_tip_passes_reverts_and_fixes_nothing(env, tmp_path, monkeypatch):
+    from ttp import postland
+    p, g, pushed, entries = _pl_land(env, tmp_path, monkeypatch, _pl_abc(tmp_path), n=3, bad_at={2: "bad_b\n"})
+    _pl_fix_at_tip(p, g, "pl2.txt")
+    postland.tend(p, p.config())
+    assert postland.tend(p, p.config()) == "fixed"
+    assert not p.db.q("SELECT id FROM tasks WHERE title LIKE 'Revert%' OR title LIKE 'Fix%'")
+    assert not p.db.q("SELECT id FROM push_queue WHERE status='approved'")
+    (ev,) = p.db.q("SELECT * FROM events WHERE text LIKE ?", (f"Post-landing checks on {pushed[:10]}: fixed:%",))
+    assert "pass at the current tip" in ev["text"] and ev["status"] == "handled"
 
 
 _PL_X = "tests/t.py::test_x"

@@ -17,12 +17,13 @@ holding the queue. Each daemon pass (tend()):
   pass are flaky (quarantined, never reverted). Those failing again that are already quarantined with an
   open deflake task (gatejudge.owned) are that task's: a line naming the sha and the tests goes on its spec,
   and no revert or fix task covers them (a quarantined test with no open owner counts as any other failure).
-  The rest rerun at the range's start: failing there too, they were not this landing's. The others bisect
-  over the entries' landed shas to the first that fails them: the guilty change.
-- Guilty: a revert of that entry's commits on the current tip (never a force push), checked to pass the
-  failing ids, goes in as ttp/postland-revert-<sha>. The daemon approves it into the push queue (it lands
-  with the next batch, after the smoke checks) and queues one code task to fix the change on its failing
-  tests alone. Anything it cannot tell or attribute goes to the coordinator as one observation.
+  The rest rerun at the range's start: failing there too, they were not this landing's. Of the others, those that
+  pass at the target's current tip were fixed since (recorded, never reverted); each of the rest bisects over
+  the entries' landed shas to the first that fails it: the guilty change of that test.
+- Guilty: for each guilty change, a revert of its commits on the current tip (never a force push), checked to
+  pass the ids it broke, goes in as ttp/postland-revert-<sha>. The daemon approves it into the push queue (it
+  lands with the next batch, after the smoke checks) and queues one code task to fix the change on its own
+  failing tests alone. Anything it cannot tell or attribute goes to the coordinator as one observation.
 - An express landing (pushq.py's express path, batch id express-*) checked only its smoke and touched tests: its job
   runs the full push checks and the post-landing checks, also where post_land_checks is unset.
 """
@@ -261,37 +262,40 @@ def apply(p: Project, job: dict, got: dict) -> str:
         _event(db, f"Post-landing checks on {sha}: failed, then passed on a rerun (flaky, quarantined, not "
                    f"reverted): {ids}" + (f"; deflake task {owners}" if owners else "") + mine, kind=EVENT, queued=False)
         return "flaky"
-    if out != "guilty":   # not this landing's (pre_existing) is only recorded; the rest is the coordinator's
+    if out != "guilty":   # not this landing's (pre_existing, fixed) is only recorded; the rest is the coordinator's
+        own = out in ("pre_existing", "fixed")
         _event(db, f"Post-landing checks on {sha}: {out}: {got.get('why') or ''} {ids}".strip() + mine,
-               kind=EVENT if out == "pre_existing" else "observation", queued=out != "pre_existing")
+               kind=EVENT if own else "observation", queued=not own)
         return str(out)
-    e = got["entry"]
-    who = f"#{e['task']} {e.get('branch') or '?'}" if e.get("task") else f"commit {e['sha'][:10]}"
-    span = f"{str(e.get('base') or '')[:10]}..{e['sha'][:10]}"
-    tail = (f"{FAILING_TESTS}{ids}\nCommand: {got.get('cmd')}\n"
-            + (f"Also failing, quarantined and their deflake task's, not this task's: {named}\n" if owned else "") +
-            f"Output tail:\n{str(got.get('tail') or '')[-2000:]}")
-    if got.get("revert_head"):   # the revert first; the fix starts once it has landed, on top of it
-        with db.tx():
-            tid = db.add_task(f"Revert {who}{REVERT_TITLE_TAIL}", kind="review", status="pushing",
-                              spec=f"Forward revert of {span} by the post-landing checks.")
-            pushq.approve(p, tid, None, {"entries": [{"branch": got["revert_branch"], "head": got["revert_head"]}],
-                                         "target": job["target"]})
-        fix = db.add_task(f"Fix {who}{REVERT_TITLE_TAIL}", kind="code", labels=[
-            f"start_when:landed:#{tid}", f"start_why:revert #{tid} lands", f"deferred_since:{time.time():.0f}"],
-            spec=(f"Post-landing checks (delivery.post_land_checks) failed after {who} landed as {e['sha'][:10]}. "
-                  f"Revert #{tid} (commit {got['revert_head'][:10]}, branch {got['revert_branch']}) takes {span} "
-                  f"off {job['target']}; this starts once it has landed. Re-apply {span} on top of the revert "
-                  f"with its fix. {tail}"))
-        text = (f"Post-landing checks on {sha}: {who} fails {ids}; revert #{tid} ({got['revert_head'][:10]}) "
-                f"approved for {job['target']}; fix task #{fix} starts once it lands")
-    else:
-        fix = db.add_task(f"Fix {who}{REVERT_TITLE_TAIL}", kind="code", spec=(
-            f"Post-landing checks (delivery.post_land_checks) failed after {who} landed as {e['sha'][:10]} "
-            f"({span}). It is not reverted ({got.get('why')}): the change is still on {job['target']}; fix it "
-            f"forward. {tail}"))
-        text = f"Post-landing checks on {sha}: {who} fails {ids}; fix task #{fix}; not reverted: {got.get('why')}"
-    _event(db, text + mine)
+    texts = []
+    for c in got.get("culprits") or [got]:   # one revert and one fix task per change that broke tests
+        e, ids = c["entry"], " ".join(c["ids"])
+        who = f"#{e['task']} {e.get('branch') or '?'}" if e.get("task") else f"commit {e['sha'][:10]}"
+        span = f"{str(e.get('base') or '')[:10]}..{e['sha'][:10]}"
+        tail = (f"{FAILING_TESTS}{ids}\nCommand: {got.get('cmd')}\n"
+                + (f"Also failing, quarantined and their deflake task's, not this task's: {named}\n" if owned else "") +
+                f"Output tail:\n{str(got.get('tail') or '')[-2000:]}")
+        if c.get("revert_head"):   # the revert first; the fix starts once it has landed, on top of it
+            with db.tx():
+                tid = db.add_task(f"Revert {who}{REVERT_TITLE_TAIL}", kind="review", status="pushing",
+                                  spec=f"Forward revert of {span} by the post-landing checks.")
+                pushq.approve(p, tid, None, {"entries": [{"branch": c["revert_branch"], "head": c["revert_head"]}],
+                                             "target": job["target"]})
+            fix = db.add_task(f"Fix {who}{REVERT_TITLE_TAIL}", kind="code", labels=[
+                f"start_when:landed:#{tid}", f"start_why:revert #{tid} lands", f"deferred_since:{time.time():.0f}"],
+                spec=(f"Post-landing checks (delivery.post_land_checks) failed after {who} landed as {e['sha'][:10]}. "
+                      f"Revert #{tid} (commit {c['revert_head'][:10]}, branch {c['revert_branch']}) takes {span} "
+                      f"off {job['target']}; this starts once it has landed. Re-apply {span} on top of the revert "
+                      f"with its fix. {tail}"))
+            texts.append(f"Post-landing checks on {sha}: {who} fails {ids}; revert #{tid} ({c['revert_head'][:10]}) "
+                         f"approved for {job['target']}; fix task #{fix} starts once it lands")
+        else:
+            fix = db.add_task(f"Fix {who}{REVERT_TITLE_TAIL}", kind="code", spec=(
+                f"Post-landing checks (delivery.post_land_checks) failed after {who} landed as {e['sha'][:10]} "
+                f"({span}). It is not reverted ({c.get('why')}): the change is still on {job['target']}; fix it "
+                f"forward. {tail}"))
+            texts.append(f"Post-landing checks on {sha}: {who} fails {ids}; fix task #{fix}; not reverted: {c.get('why')}")
+    _event(db, "; ".join(texts) + mine)
     return "guilty"
 
 
@@ -419,17 +423,24 @@ def _judge(p: Project, job: dict, checks: list, run, owned: dict) -> dict:
                     "why": "they fail before this landing too" if pre else
                     f"the rerun before this landing ({str(job.get('good'))[:10] or 'none'}) could not tell"}
         ids = sorted(set(ids) - pre)
-        lo, hi = -1, len(points) - 1   # lo passes (the range's start), hi fails
-        while hi - lo > 1:
-            mid = (lo + hi) // 2
-            f = gatejudge.failed_of(*run(points[mid]["sha"], cmd, ids), ids)
-            if f is None:
-                return {"outcome": "undecided", "why": f"the rerun at {points[mid]['sha'][:10]} could not tell",
-                        "ids": ids, "cmd": str(cmd)}
-            lo, hi = (lo, mid) if f else (mid, hi)
-        e = points[hi]
-        out = {"outcome": "guilty", "ids": ids, "cmd": str(cmd), "entry": e, "tail": text[-3000:]}
-        out.update(revert(p, Path(job["repo"]), job, e, cmd, ids, run))
+        tip = _tip(Path(job["repo"]), job)
+        if tip and tip != sha:   # a test the target's tip passes was fixed since: nobody's to revert
+            at_tip = gatejudge.failed_of(*run(tip, cmd, ids), ids)
+            if at_tip is not None:
+                ids = [i for i in ids if i in at_tip]
+                if not ids:
+                    return {"outcome": "fixed", "ids": sorted(again), "cmd": str(cmd),
+                            "why": f"they pass at the current tip {tip[:10]}"}
+        try:
+            blame = _blame(points, ids, lambda at, sel: gatejudge.failed_of(*run(at, cmd, sel), sel))
+        except LookupError as ex:
+            return {"outcome": "undecided", "why": f"the rerun at {str(ex)[:10]} could not tell", "ids": ids,
+                    "cmd": str(cmd)}
+        culprits = []
+        for at, group in sorted(blame.items()):
+            e = points[at]
+            culprits.append({"entry": e, "ids": group} | revert(p, Path(job["repo"]), job, e, cmd, group, run))
+        out = {"outcome": "guilty", "ids": ids, "cmd": str(cmd), "culprits": culprits, "tail": text[-3000:]}
         return out
     if after:   # the change's tests pass; what failed the session is named, never reverted
         return {"outcome": "session_failed", "ids": flaky, "why": "; ".join(after) + "; no test fails and nothing "
@@ -445,6 +456,34 @@ def _judge(p: Project, job: dict, checks: list, run, owned: dict) -> dict:
         tasks = gatejudge.deflake(p.db, new, seen, now, p, task_default_usd(cfg, "standard")) if new else []
         return {"outcome": "flaky" if flaky else "pass", "ids": flaky, "deflake": tasks, "before_fix": early}
     return {"outcome": "pass"} | ({"rerun": cut} if cut else {})
+
+
+def _tip(repo: Path, job: dict) -> str:
+    """The target's current tip, fetched ('' when it cannot be read)."""
+    from . import push
+    remote, _, branch = str(job["target"]).partition("/")
+    try:
+        return push._fetch(repo, remote, branch)
+    except Exception:
+        return ""
+
+
+def _blame(points: list, ids: list[str], failed) -> dict[int, list[str]]:
+    """{index of a point: the ids that first fail at it}: every id passes before the range and fails at its last
+    point, and `failed(sha, ids)` is the subset failing at a sha (None: it could not tell, raises LookupError(sha)).
+    The ids failing at the middle point go on in the first half, the rest in the second."""
+    def split(lo: int, hi: int, ids: list[str]) -> dict[int, list[str]]:
+        if hi - lo == 1:
+            return {hi: ids}
+        mid = (lo + hi) // 2
+        bad = failed(points[mid]["sha"], ids)
+        if bad is None:
+            raise LookupError(points[mid]["sha"])
+        out = split(lo, mid, [i for i in ids if i in bad]) if bad else {}
+        for at, group in (split(mid, hi, [i for i in ids if i not in bad]) if len(bad) < len(ids) else {}).items():
+            out[at] = out.get(at, []) + group
+        return out
+    return split(-1, len(points) - 1, ids)
 
 
 def revert(p: Project, repo: Path, job: dict, e: dict, cmd, ids: list[str], run) -> dict:

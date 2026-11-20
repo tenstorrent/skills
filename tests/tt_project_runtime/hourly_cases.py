@@ -172,7 +172,7 @@ def test_a_correction_marks_the_hourly_post_that_stated_the_wrong_value_and_the_
     second = hourly.post(p, now + 60)
     assert second, "a new correction posts at once, rows unchanged or not"
     text = p.db.one("SELECT text FROM messages WHERE id=?", (second,))["text"]
-    assert "(a correction" in text and "said 'below' in its Fork rate row; user msg #42 corrected it" in text
+    assert "(a correction" in text and "said 'below target' in its Fork rate row; user msg #42 corrected it" in text
     mark = hourly.corrected(p)[str(first)]
     assert mark["msg"] == 42 and mark["entry"] == "corr-1" and str(second) not in hourly.corrected(p)
     assert hourly.post(p, now + 120) is None, "one post per correction"

@@ -22100,6 +22100,32 @@ def test_no_false_correction_hits_on_an_unrelated_spec_or_ask(env):
     assert problems == [] and coord._ask_question(sent["text"]) == ask, problems
 
 
+def test_a_correction_is_repeated_only_by_its_wrong_phrase_never_by_one_common_word_or_stem(env):
+    from ttp import coordinator as coord, correction
+    p = make(env)
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    said = p.db.post("in", "No, that count is wrong.", chat="cli", provenance="cli-legacy")
+    texts = (
+        f"Correction (user msg #{said}): from 04:00 to about 10:00, code workers ran on Opus high, not "
+        "'code runs on Sonnet high since the 04:00 setting'. The cause was the pick bypass.",
+        f"Correction (user msg #{said}): the demo is still serving, not 'the demo is retired and over'.")
+    for text in texts:
+        assert coord.apply(p, [{"type": "memory_add", "memory_kind": "fact", "text": text}],
+                           user_turn=True, messages=[said]) == []
+    for spec in ("Count only the wakes since 02:00 and report the total.",
+                 "Retire the stale queue entries and retire the old schedule.",
+                 "Retired runs keep their results; the demo schedule stays."):
+        assert not correction.repeated(p, spec), spec
+    assert correction.repeated(p, "Note that code runs on Sonnet high since the 04:00 setting."), "phrase"
+    assert correction.repeated(p, "The demo is retired and over, so stop serving it."), "phrase"
+    claims = p.db.kv(correction.CLAIMS_KEY, {})
+    assert claims and all(c.get("phrases") for c in claims.values()), claims
+    p.db.set_kv(correction.CLAIMS_KEY, {n: {k: v for k, v in c.items() if k != "phrases"}
+                                        for n, c in claims.items()})   # claims stored before phrases: recomputed
+    assert not correction.repeated(p, "Count only the wakes since 02:00 and report the total.")
+    assert correction.repeated(p, "Note that code runs on Sonnet high since the 04:00 setting.")
+
+
 def test_an_off_topic_answer_leaves_the_ask_open_and_is_linked_as_a_new_instruction(env):
     from ttp import coordinator as coord, unblock
     p = make(env)
