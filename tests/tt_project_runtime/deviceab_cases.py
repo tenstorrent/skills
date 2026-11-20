@@ -13,6 +13,15 @@ def _dab_cfg(p, **extra):
     return cfg
 
 
+def _dab_log(p, cmds=("tt-smi -r 0",)):
+    """A run folder whose tool log (the fake provider's `_shell` lines) holds `cmds`; by default a device reset."""
+    import json
+    d = p.root / "runlogs" / str(len(list((p.root / "runlogs").glob("*"))) if (p.root / "runlogs").exists() else 0)
+    d.mkdir(parents=True)
+    (d / "output.jsonl").write_text("".join(json.dumps({"_shell": c}) + "\n" for c in cmds))
+    return str(d)
+
+
 def _dab_task(p, kind="work", labels=("needs_device", "resource:box1-device"), **kw):
     return p.db.add_task(f"Run the soak on the box {kind} {len(p.db.q('SELECT id FROM tasks'))}", "Run it.",
                          kind=kind, tier="standard", origin="coordinator", priority=3, labels=list(labels), **kw)
@@ -228,9 +237,10 @@ def test_device_ab_stops_the_test_arm_on_a_device_incident_with_one_high_alert_a
     son = next(t for t, a in tasks.items() if a == "sonnet")
     opus = next(t for t, a in tasks.items() if a == "opus")
     for tid, arm in ((son, "sonnet"), (opus, "opus")):
-        p.db.x("INSERT INTO runs(task, role, provider, model, effort, started, ended, status, cost_usd, note) "
-               "VALUES(?,?,?,?,?,?,?,?,?,?)", (tid, "worker", "claude", arm, "high", 2000.0, 2600.0, "done", 1.5,
-                                              json.dumps({deviceab.KEY: {"arm": arm, "ran": arm, "kind": "work"}})))
+        p.db.x("INSERT INTO runs(task, role, provider, model, effort, started, ended, status, cost_usd, note, dir) "
+               "VALUES(?,?,?,?,?,?,?,?,?,?,?)", (tid, "worker", "claude", arm, "high", 2000.0, 2600.0, "done", 1.5,
+                                                json.dumps({deviceab.KEY: {"arm": arm, "ran": arm, "kind": "work"}}),
+                                                _dab_log(p)))
         p.db.update_task(tid, status="done", result=json.dumps({"summary": "ok"}))
     # An incident on an Opus-arm run's box, or a quiet event, stops nothing.
     p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
@@ -298,8 +308,9 @@ def test_device_ab_dispatch_runs_the_recorded_arm_model_at_its_effort(env, monke
     assert (cheap["model"], cheap["effort"]) == (arm, "high")   # the default arms: sonnet and opus at high
 
 
-def _dab_sonnet_run(p, cfg, labels, started=2000.0, ended=2600.0):
-    """A finished Sonnet-arm run of a fresh task with `labels`; returns (task id, run id)."""
+def _dab_sonnet_run(p, cfg, labels, started=2000.0, ended=2600.0, cmds=("tt-smi -r 0",)):
+    """A finished Sonnet-arm run of a fresh task with `labels` whose tool log holds `cmds` (None: no log);
+    returns (task id, run id)."""
     import json
     from ttp import deviceab
     s = deviceab.settings(cfg)
@@ -309,9 +320,10 @@ def _dab_sonnet_run(p, cfg, labels, started=2000.0, ended=2600.0):
         if deviceab.arm_of(s, p.name, tid) == "sonnet":
             break
     note = deviceab.assign(p.db, cfg, p.name, p.db.task(tid), "claude", now=started)
-    rid = p.db.x("INSERT INTO runs(task, role, provider, model, effort, started, ended, status, cost_usd, note) "
-                 "VALUES(?,?,?,?,?,?,?,?,?,?)", (tid, "worker", "claude", "sonnet", "high", started, ended, "done",
-                                                1.0, json.dumps({deviceab.KEY: note[deviceab.KEY]})))
+    rid = p.db.x("INSERT INTO runs(task, role, provider, model, effort, started, ended, status, cost_usd, note, dir) "
+                 "VALUES(?,?,?,?,?,?,?,?,?,?,?)", (tid, "worker", "claude", "sonnet", "high", started, ended, "done",
+                                                  1.0, json.dumps({deviceab.KEY: note[deviceab.KEY]}),
+                                                  None if cmds is None else _dab_log(p, cmds)))
     return tid, p.db.q("SELECT id FROM runs WHERE task=?", (tid,))[0]["id"]
 
 
@@ -509,3 +521,90 @@ def test_device_ab_a_state_changing_run_stops_only_within_the_window_and_a_re_ar
     tid2, _ = _dab_sonnet_run(p, re, ["resource:box-a-device", "needs_device"], started=9400.0, ended=9500.0)
     new = _dab_event(p, "machine_condition", "box-a-device: chip hang", ts=9450.0)
     assert deviceab.tick(p.db, re, 9600.0)["stop"]["event"] == new
+
+
+def test_device_ab_a_test_arm_run_that_changed_no_host_state_is_never_charged(env):
+    from ttp import deviceab
+    p = make(env)
+    cfg = _dab_cfg(p)
+    # Modeled on a run that only read state: reads, a read under the device lock and a reset a guard refused.
+    tid, rid = _dab_sonnet_run(p, cfg, ["resource:box-a-device", "needs_device"],
+                               cmds=("tt-smi -s", "ttp machines activity", "ttp lock box-a-device -- tt-smi -ls",
+                                     "grep reset /var/log/syslog", "ipmitool power status", "git reset --hard"))
+    _dab_event(p, "machine_condition", "box-a-device: chip hang, reset needed")
+    assert deviceab.tick(p.db, cfg, 2700.0)["stop"] is None and not deviceab.stopped(p.db)
+    assert not deviceab.changed_state(p.db.q("SELECT dir FROM runs WHERE id=?", (rid,))[0]["dir"])
+    # No readable log: not charged either.
+    _dab_sonnet_run(p, cfg, ["resource:box-a-device", "needs_device"], cmds=None)
+    assert deviceab.tick(p.db, cfg, 2800.0)["stop"] is None
+    assert not deviceab.changed_state(None) and not deviceab.changed_state(str(p.root / "nowhere"))
+    # The run's own reset, reboot or service change stops the arm.
+    for cmd in ("tt-smi -r 0", "ssh box-a sudo reboot", "sudo systemctl restart the-broker"):
+        assert deviceab.changed_state(_dab_log(p, ("tt-smi -s", cmd))), cmd
+    tid2, rid2 = _dab_sonnet_run(p, cfg, ["resource:box-a-device", "needs_device"], cmds=("tt-smi -r 0",))
+    got = deviceab.tick(p.db, cfg, 2900.0)["stop"]
+    assert (got["task"], got["run"]) == (tid2, rid2)
+
+
+def test_device_ab_an_incident_in_another_tasks_recorded_machine_change_is_not_charged(env):
+    from ttp import deviceab, machine_ledger, machines
+    p = make(env)
+    cfg = _dab_cfg(p)
+    machines.add("box-a")
+    tid, rid = _dab_sonnet_run(p, cfg, ["resource:box-a-device", "needs_device"])
+    # Modeled on a planned reboot of the machine another project's task recorded before it ran.
+    machine_ledger.add_power_cycle("box-a", "5m", by="other-project", task=tid, now=2000.0)   # at 2300
+    _dab_event(p, "machine_condition", "box-a-device: chip hang after the machine went down", ts=2350.0)
+    assert deviceab.tick(p.db, cfg, 2700.0)["stop"] is None
+    # Outside that window, the run's own reset is still charged.
+    real = _dab_event(p, "machine_condition", "box-a-device: chip hang, reset needed", ts=2950.0)
+    assert deviceab.tick(p.db, cfg, 3000.0)["stop"]["event"] == real
+    # A change this project recorded for the run's own task excuses nothing; one for another of its tasks does.
+    entry = machine_ledger.add_change("box-a", "deploy the broker", "undo it", by=cfg.get("name"), task=tid,
+                                      expires="1h", now=4000.0)
+    assert deviceab.others_change(cfg, ["box-a-device"], tid, 4100.0) is None
+    assert deviceab.others_change(cfg, ["box-a-device"], tid + 1, 4100.0)["id"] == entry["id"]
+    assert deviceab.others_change(cfg, ["box-b-device"], tid + 1, 4100.0) is None
+
+
+def test_device_ab_the_next_tick_lifts_a_stop_the_old_rule_charged_to_a_run_that_changed_nothing(env):
+    from ttp import deviceab, machine_ledger, machines
+    p = make(env)
+    cfg = _dab_cfg(p)
+    tid, rid = _dab_sonnet_run(p, cfg, ["resource:box-a-device", "needs_device"], cmds=("tt-smi -s",))
+    eid = _dab_event(p, "machine_condition", "box-a-device: chip hang, reset needed")
+    p.db.set_kv(deviceab.STOP_KV, {"ts": 2700.0, "arm": "sonnet", "task": tid, "run": rid, "event": eid,
+                                   "text": "box-a-device: chip hang"})
+    got = deviceab.tick(p.db, cfg, 3000.0)
+    assert "no command that changed a host's state" in got["lifted"] and got["stop"] is None
+    assert not deviceab.stopped(p.db)
+    # A stop inside another task's planned power cycle is lifted too.
+    machines.add("box-a")
+    tid2, rid2 = _dab_sonnet_run(p, cfg, ["resource:box-a-device", "needs_device"], started=5000.0, ended=5600.0)
+    machine_ledger.add_power_cycle("box-a", "5m", by="other-project", now=5000.0)
+    eid2 = _dab_event(p, "machine_condition", "box-a-device: chip hang", ts=5300.0)
+    p.db.set_kv(deviceab.STOP_KV, {"ts": 5700.0, "arm": "sonnet", "task": tid2, "run": rid2, "event": eid2,
+                                   "text": "box-a-device: chip hang"})
+    got = deviceab.tick(p.db, cfg, 5800.0)
+    assert "another task's recorded change on box-a" in got["lifted"] and not deviceab.stopped(p.db)
+
+
+def test_device_ab_a_re_arm_never_counts_a_run_from_before_it(env):
+    from ttp import deviceab
+    p = make(env)
+    cfg = _dab_cfg(p)
+    tid, rid = _dab_sonnet_run(p, cfg, ["resource:box-a-device", "needs_device"])
+    # Re-armed (a new setting, same window start) after the old run, before any stop: its later hang is not counted.
+    re = _dab_cfg(p, max_tasks=135, start=1000)
+    assert deviceab.tick(p.db, re, 2650.0)["stop"] is None
+    _dab_event(p, "machine_condition", "box-a-device: chip hang, reset needed", ts=2700.0)
+    assert deviceab.tick(p.db, re, 2750.0)["stop"] is None and not deviceab.stopped(p.db)
+    # A stop the old rule charged to that run after the re-arm is lifted.
+    eid = p.db.q("SELECT max(id) AS i FROM events WHERE kind='machine_condition'")[0]["i"]
+    p.db.set_kv(deviceab.STOP_KV, {"ts": 2760.0, "arm": "sonnet", "task": tid, "run": rid, "event": eid,
+                                   "text": "box-a-device: chip hang"})
+    assert "before the A/B was re-armed" in deviceab.tick(p.db, re, 2800.0)["lifted"]
+    # A run after the re-arm still stops it.
+    tid2, rid2 = _dab_sonnet_run(p, re, ["resource:box-a-device", "needs_device"], started=2900.0, ended=3000.0)
+    new = _dab_event(p, "machine_condition", "box-a-device: chip hang", ts=2950.0)
+    assert deviceab.tick(p.db, re, 3100.0)["stop"]["event"] == new

@@ -28,8 +28,10 @@ or serving-again report, an event about another device, a coordinator action, au
 or within INCIDENT_AFTER_S after it stops the test arm at once
 (STOP_KV; each tick re-tests a recorded stop against this rule and lifts one that no longer qualifies, with a
 device_ab event): its open tasks run on the control arm, new tasks are excluded, and the daemon raises one high event to
-the project's coordinator. A run that only read state (a question or report task, `read:` resources) is never
-charged. A re-armed start skips events at or before the stop it cleared.
+the project's coordinator. A run that only read state (a question or report task, `read:` resources, or no
+state-changing command in its own log: changed_state) is never charged, nor is one for an incident inside another
+task's machine-change ledger entry on that machine (a planned reboot, deploy or power cycle: others_change). A
+re-armed start counts only runs started after the re-arm and skips events at or before the stop it cleared.
 
 Review: each finished A/B task gets one masked review task (Opus at high effort, REVIEW_LABEL) that scores
 answered-what-was-asked and conclusions-supported-by-logs, 0-4 each; the spec never names the arm or model.
@@ -160,14 +162,17 @@ def _kv(db, key: str) -> dict:
 
 def start(db, s: dict, now: float | None = None) -> dict:
     """The A/B's start {"ts", "sig"}: recorded the first time this setting is seen; a new setting (other
-    projects, arms or seed) starts a new A/B and lifts an old stop; events at or before that stop ("after") stay
-    spent and never stop the new one."""
+    projects, arms or seed) re-arms it: a new A/B that lifts an old stop and counts only runs started at or after
+    the re-arm ("armed"), so an old run never stops the new one; events at or before that stop ("after") stay
+    spent too."""
     got = _kv(db, START_KV)
     if got.get("sig") == s["sig"] and isinstance(got.get("ts"), (int, float)):
         return got
+    now = float(now if now is not None else time.time())
     old = stopped(db).get("ts")
-    got = {"ts": float(s["start"] if s.get("start") is not None else now if now is not None else time.time()),
-           "sig": s["sig"], **({"after": float(old)} if isinstance(old, (int, float)) else {})}
+    got = {"ts": float(s["start"] if s.get("start") is not None else now), "sig": s["sig"],
+           **({"armed": now} if got.get("sig") else {}),
+           **({"after": float(old)} if isinstance(old, (int, float)) else {})}
     db.set_kv(START_KV, got)
     db.set_kv(STOP_KV, {})
     return got
@@ -375,11 +380,53 @@ def incident_event(e: dict, run_task: Any, names: list[str], run_id: Any = None)
     return any(names_affected(report, n) for n in names)
 
 
+# A run is charged an incident only when its own commands changed a host's state: a reset, power cycle, flash or
+# reboot (deviceplan.risky), a service start or stop (glmguard.SERVICE_RE) or a recorded machine change.
+MACHINE_CHANGE = re.compile(r"\bttp\s+(?:machines\s+change\s+add|deploy|restart)\b")
+
+
+def changed_state(run_dir) -> bool:
+    """Whether the run's own recorded commands (sidefx.items) include one that changed a host's state; one a guard
+    refused never ran. A run with no readable log is not charged: False."""
+    from . import deviceplan, glmguard, sidefx
+    try:
+        calls = sidefx.items(Path(run_dir), own_only=True) if run_dir else []
+        return any(it.get("kind") == "shell" and it.get("status") != "refused"
+                   and (deviceplan.risky(w := str(it.get("what") or "")) or glmguard.SERVICE_RE.search(w)
+                        or MACHINE_CHANGE.search(w)) for it in calls)
+    except Exception:   # noqa: BLE001 - an unreadable log charges nothing
+        return False
+
+
+def others_change(cfg: dict, names: list[str], run_task, ts) -> dict | None:
+    """The shared machine-change ledger's entry, open or recently closed, on a machine of `names` (a `<alias>-device`
+    lock names machine <alias>) whose window covers `ts`, made by another task: another project's, or this
+    project's for a task other than `run_task`. A planned reboot, deploy or power cycle there is not the run's."""
+    from . import machine_ledger
+    aliases = set(names) | {n[:-len("-device")] for n in names if n.endswith("-device")}
+    try:
+        entries = machine_ledger.changes(aliases, open_only=False)
+    except Exception:   # noqa: BLE001 - an unreadable ledger excuses nothing
+        return None
+    for c in entries:
+        if c.get("by") == cfg.get("name") and str(c.get("task")) == str(run_task):
+            continue
+        if c.get("kind") == machine_ledger.POWER_CYCLE:
+            start, end = machine_ledger.cycle_window(c)
+        else:
+            start = float(c.get("since") or c.get("added") or 0)
+            end = float(c.get("closed") or c.get("expires") or 0)
+        if start <= float(ts or 0) <= end:
+            return c
+    return None
+
+
 def find_incident(db, cfg: dict, s: dict, since: float, now: float, after: float = 0.0) -> dict | None:
     """A device incident on a test-arm run that started after `since`: {"task", "run", "event", "text"}, else None.
     Only real incident events after `after` (a cleared stop) tied to a device the run changed count
-    (incident_event)."""
-    runs = db.q("SELECT id, task, started, ended, note FROM runs WHERE started>=? AND note LIKE ? ORDER BY id",
+    (incident_event), and only on a run whose own commands changed a host's state (changed_state), outside another
+    task's machine change there (others_change)."""
+    runs = db.q("SELECT id, task, started, ended, note, dir FROM runs WHERE started>=? AND note LIKE ? ORDER BY id",
                 (since, f'%"{KEY}"%'))
     for r in runs:
         ab = _note(r).get(KEY) or {}
@@ -388,11 +435,11 @@ def find_incident(db, cfg: dict, s: dict, since: float, now: float, after: float
         task = db.task(int(r["task"])) if r.get("task") else None
         names = device_names(task or {}, cfg)
         until = (float(r["ended"]) if r.get("ended") else now) + INCIDENT_AFTER_S
-        if not names:
+        if not names or not changed_state(r.get("dir")):
             continue
-        for e in db.q("SELECT id, source, kind, text, data, task FROM events WHERE ts>=? AND ts>? AND ts<=? "
+        for e in db.q("SELECT id, ts, source, kind, text, data, task FROM events WHERE ts>=? AND ts>? AND ts<=? "
                       "AND kind NOT LIKE 'device_ab%'", (float(r["started"] or 0), after, until)):
-            if incident_event(e, r["task"], names, r["id"]):
+            if incident_event(e, r["task"], names, r["id"]) and not others_change(cfg, names, r["task"], e["ts"]):
                 return {"task": r["task"], "run": r["id"], "event": e["id"], "text": str(e.get("text") or "")[:300]}
     return None
 
@@ -401,18 +448,27 @@ def recheck_stop(db, cfg: dict, s: dict, stop: dict, now: float) -> str:
     """Re-test a recorded stop against the current rule. When its event no longer qualifies, lift the stop, log a
     device_ab event saying why and return that text; "" when the stop stands (or cannot be re-read)."""
     try:
-        e = db.q("SELECT id, source, kind, text, data, task FROM events WHERE id=?", (int(stop["event"]),))
-        run = db.q("SELECT id, task FROM runs WHERE id=?", (int(stop["run"]),))
+        e = db.q("SELECT id, ts, source, kind, text, data, task FROM events WHERE id=?", (int(stop["event"]),))
+        run = db.q("SELECT id, task, started, dir FROM runs WHERE id=?", (int(stop["run"]),))
     except (KeyError, TypeError, ValueError):
         return ""
     if not e or not run:
         return ""
-    task = db.task(int(run[0]["task"])) if run[0].get("task") else None
-    if incident_event(e[0], run[0]["task"], device_names(task or {}, cfg), run[0]["id"]):
+    r = run[0]
+    task = db.task(int(r["task"])) if r.get("task") else None
+    names = device_names(task or {}, cfg)
+    if float(r.get("started") or 0) < float(_kv(db, START_KV).get("armed") or 0):
+        cause = "the run started before the A/B was re-armed"
+    elif not incident_event(e[0], r["task"], names, r["id"]):
+        cause = "it is not a device incident tied to the run's own device"
+    elif not changed_state(r.get("dir")):
+        cause = "the run recorded no command that changed a host's state"
+    elif c := others_change(cfg, names, r["task"], e[0]["ts"]):
+        cause = f"it fell in another task's recorded change on {c.get('alias')} ({c.get('what')})"
+    else:
         return ""
     why = (f"Device A/B: lifted the {stop.get('arm') or s['test']} arm's stop (task #{stop.get('task')}, event "
-           f"{stop.get('event')}, kind {e[0].get('kind')}): it is not a device incident tied to the run's own "
-           "device, so it must not stop the test.")
+           f"{stop.get('event')}, kind {e[0].get('kind')}): {cause}, so it must not stop the test.")
     db.set_kv(STOP_KV, {})
     db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
          (now, "daemon", "device_ab", "low", why, "handled"))
@@ -478,7 +534,8 @@ def tick(db, cfg: dict, now: float | None = None) -> dict:
     new_stop = lifted = None
     if stop := stopped(db):
         lifted = recheck_stop(db, cfg, s, stop, now) or None
-    if not stopped(db) and (hit := find_incident(db, cfg, s, st["ts"], now, float(st.get("after") or 0))):
+    if not stopped(db) and (hit := find_incident(db, cfg, s, max(st["ts"], float(st.get("armed") or 0)), now,
+                                                 float(st.get("after") or 0))):
         new_stop = {"ts": now, "arm": s["test"], **hit}
         db.set_kv(STOP_KV, new_stop)
     return {"stop": new_stop, "lifted": lifted, "reviews": queue_reviews(db, s, st["ts"], second=second_reviewer(cfg))}
