@@ -162,6 +162,33 @@ def test_a_waiting_hand_offs_cells_reach_the_final_hand_off_so_the_completeness_
     assert with_waiting_followups(done, {"self_check": ["x"]}) == done, "a self_check stays a string"
 
 
+def test_a_waiting_hand_offs_published_change_reaches_the_final_hand_off_so_its_review_is_of_that_change(
+        env, monkeypatch, tmp_path):
+    """A waiting hand-off's `published` change (with `pr` and `no_push`) survives an on_pass that lacks
+    them, so the daemon still reads the change once its checks pass and the on_pass is recorded."""
+    from ttp import daemon as dmod
+    from ttp.daemon import with_waiting_followups
+    sha = "cd" * 20
+    pub = {"repo": "example-org/example-widgets", "branch": "ttp/t1-example", "head": sha}
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    p = make(env)
+    tid, _ = _checks_wait_task(p, tmp_path, DONE_ON_PASS)
+    hand = {**json.loads(p.db.task(tid)["result"]), "published": pub}
+    p.db.update_task(tid, result=json.dumps(hand))
+    (tmp_path / f"run-{tid}" / "result.json").write_text(json.dumps(hand))
+    d = dmod.Daemon(p.base)
+    _settle_probe(d, tid)
+    task = p.db.task(tid)
+    assert task["status"] == "done" and json.loads(task["result"])["published"] == pub, task["result"]
+    assert d._external_change(task) == pub and p.db.q("SELECT id FROM tasks WHERE kind='review'")
+    done = {"status": "done", "summary": "works"}
+    waited = {"status": "waiting", "published": pub, "pr": "https://example.com/o/r/pull/7", "no_push": "elsewhere"}
+    assert with_waiting_followups(done, waited) == {**done, **{k: waited[k] for k in ("published", "pr", "no_push")}}
+    own = {**done, "published": {**pub, "head": "ef" * 20}, "pr": "mine", "no_push": "mine"}
+    assert with_waiting_followups(own, waited) == own, "never overwritten"
+    assert with_waiting_followups(done, {**waited, "published": {"branch": "x"}, "pr": "", "no_push": None}) == done
+
+
 def test_each_review_row_records_whether_the_reviewed_hand_off_carried_a_self_check(env):
     from ttp import audit, reviewstats
     p = make(env)

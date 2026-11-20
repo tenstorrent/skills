@@ -23299,11 +23299,17 @@ def with_waiting_followups(final: dict, waited: dict) -> dict:
     waiting hand-off's own top-level followups added, so they are filed as a normal hand-off's are.
     One already in `final` (same title and spec) is not added twice. The waiting hand-off's
     `self_check` line, `cells` and `cells_unrunnable` are each carried over when `final` has none,
-    so review stats and the cells completeness check still see them."""
+    so review stats and the cells completeness check still see them; so are a valid `published`
+    change, a `pr` and a `no_push` line, so the change is still reviewed where it lives."""
     if not isinstance(final, dict) or not isinstance(waited, dict):
         return final
     for key in ("self_check", cells.FIELD, cells.UNRUNNABLE):
         if _handoff_value(waited.get(key), key) and not _handoff_value(final.get(key), key):
+            final = {**final, key: waited[key]}
+    if extchange.parse(waited.get(extchange.FIELD))[0] and extchange.parse(final.get(extchange.FIELD)) == (None, ""):
+        final = {**final, extchange.FIELD: waited[extchange.FIELD]}
+    for key in ("pr", "no_push"):
+        if waited.get(key) and not final.get(key):
             final = {**final, key: waited[key]}
     extra = waited.get("followups")
     if not isinstance(extra, list) or not extra:
