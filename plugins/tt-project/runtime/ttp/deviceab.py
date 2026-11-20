@@ -31,7 +31,8 @@ device_ab event): its open tasks run on the control arm, new tasks are excluded,
 the project's coordinator. A run that only read state (a question or report task, `read:` resources, or no
 state-changing command in its own log: changed_state) is never charged, nor is one for an incident inside another
 task's machine-change ledger entry on that machine (a planned reboot, deploy or power cycle: others_change). A
-re-armed start counts only runs started after the re-arm and skips events at or before the stop it cleared.
+re-armed start skips events from before the re-arm (at or before the stop it cleared); a run started earlier is still
+charged for an incident after it.
 
 Review: each finished A/B task gets one masked review task (Opus at high effort, REVIEW_LABEL) that scores
 answered-what-was-asked and conclusions-supported-by-logs, 0-4 each; the spec never names the arm or model.
@@ -162,9 +163,9 @@ def _kv(db, key: str) -> dict:
 
 def start(db, s: dict, now: float | None = None) -> dict:
     """The A/B's start {"ts", "sig"}: recorded the first time this setting is seen; a new setting (other
-    projects, arms or seed) re-arms it: a new A/B that lifts an old stop and counts only runs started at or after
-    the re-arm ("armed"), so an old run never stops the new one; events at or before that stop ("after") stay
-    spent too."""
+    projects, arms or seed) re-arms it: a new A/B that lifts an old stop; events from before the re-arm ("armed", never
+    before the stop it cleared, "after") stay spent and never stop the new one, while a run started earlier is still
+    charged for an incident after it."""
     got = _kv(db, START_KV)
     if got.get("sig") == s["sig"] and isinstance(got.get("ts"), (int, float)):
         return got
@@ -382,7 +383,7 @@ def incident_event(e: dict, run_task: Any, names: list[str], run_id: Any = None)
 
 # A run is charged an incident only when its own commands changed a host's state: a reset, power cycle, flash or
 # reboot (deviceplan.risky), a service start or stop (glmguard.SERVICE_RE) or a recorded machine change.
-MACHINE_CHANGE = re.compile(r"\bttp\s+(?:machines\s+change\s+add|deploy|restart)\b")
+MACHINE_CHANGE = re.compile(r"\bttp\s+machines\s+change\s+add\b")
 
 
 def changed_state(run_dir) -> bool:
@@ -449,7 +450,7 @@ def recheck_stop(db, cfg: dict, s: dict, stop: dict, now: float) -> str:
     device_ab event saying why and return that text; "" when the stop stands (or cannot be re-read)."""
     try:
         e = db.q("SELECT id, ts, source, kind, text, data, task FROM events WHERE id=?", (int(stop["event"]),))
-        run = db.q("SELECT id, task, started, dir FROM runs WHERE id=?", (int(stop["run"]),))
+        run = db.q("SELECT id, task, dir FROM runs WHERE id=?", (int(stop["run"]),))
     except (KeyError, TypeError, ValueError):
         return ""
     if not e or not run:
@@ -457,8 +458,8 @@ def recheck_stop(db, cfg: dict, s: dict, stop: dict, now: float) -> str:
     r = run[0]
     task = db.task(int(r["task"])) if r.get("task") else None
     names = device_names(task or {}, cfg)
-    if float(r.get("started") or 0) < float(_kv(db, START_KV).get("armed") or 0):
-        cause = "the run started before the A/B was re-armed"
+    if float(e[0].get("ts") or 0) <= float(_kv(db, START_KV).get("armed") or 0):
+        cause = "the incident came before the A/B was re-armed"
     elif not incident_event(e[0], r["task"], names, r["id"]):
         cause = "it is not a device incident tied to the run's own device"
     elif not changed_state(r.get("dir")):
@@ -534,8 +535,8 @@ def tick(db, cfg: dict, now: float | None = None) -> dict:
     new_stop = lifted = None
     if stop := stopped(db):
         lifted = recheck_stop(db, cfg, s, stop, now) or None
-    if not stopped(db) and (hit := find_incident(db, cfg, s, max(st["ts"], float(st.get("armed") or 0)), now,
-                                                 float(st.get("after") or 0))):
+    if not stopped(db) and (hit := find_incident(db, cfg, s, st["ts"], now,
+                                                 max(float(st.get("after") or 0), float(st.get("armed") or 0)))):
         new_stop = {"ts": now, "arm": s["test"], **hit}
         db.set_kv(STOP_KV, new_stop)
     return {"stop": new_stop, "lifted": lifted, "reviews": queue_reviews(db, s, st["ts"], second=second_reviewer(cfg))}
