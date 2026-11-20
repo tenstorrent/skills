@@ -34,6 +34,7 @@ from pathlib import Path
 
 from .project import MEMORY_PATHS, Project, durable_write, git_fsync_args, tree_writes
 from . import gitmemo
+from .gitlocks import git_dir
 
 DIR = "harness-worktrees"
 IDENT = ["-c", "user.name=tt-project", "-c", "user.email=tt-project@localhost"]
@@ -634,12 +635,7 @@ def _stamp(p: Project, tid: int) -> tuple:
     the task's run folders (a detached job's end writes its rc there: held). Not the index: `git
     status` refreshes it, so land's own look would move it."""
     task = p.db.task(int(tid))
-    own = path(p, tid)
-    try:
-        gd = Path((own / ".git").read_text().split("gitdir:", 1)[1].strip())
-    except (OSError, IndexError):
-        gd = own / ".git"
-    files = [d / n for d in (gd, p.harness / ".git") for n in ("HEAD", "logs/HEAD")]
+    files = [d / n for d in (git_dir(path(p, tid)), git_dir(p.harness)) if d for n in ("HEAD", "logs/HEAD")]
     files += [Path(r["dir"]) for r in p.db.q("SELECT dir FROM runs WHERE task=? AND dir IS NOT NULL", (int(tid),))]
     times = []
     for f in files:
@@ -659,8 +655,8 @@ def sweep(p: Project, running: set[int]) -> dict[int, str]:
     root = p.state / DIR
     if not root.is_dir():
         return {}
-    gd = p.harness / ".git"   # read first: no git a tick while no merge is under way
-    if ((gd / "MERGE_HEAD").exists() or gd.is_file()) and _is_repo(p) and landing_merge(p.harness):
+    # MERGE_HEAD read first: no git a tick while no merge is under way
+    if (g := git_dir(p.harness)) and (g / "MERGE_HEAD").exists() and _is_repo(p) and landing_merge(p.harness):
         # a merge of ours a killed daemon left: undo it first
         with tree_writes(p.harness):
             _git(p.harness, "merge", "--abort")

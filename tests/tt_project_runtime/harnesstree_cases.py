@@ -895,3 +895,19 @@ def test_a_kept_worktree_that_changed_is_landed_on_the_next_sweep(env):
     p.db.update_task(b, status="done")                  # its task row moved
     assert harnesstree.sweep(p, set()) == {b: "merged"} and not own.exists()
     assert harnesstree.sweep(p, set()) == {} and not harnesstree._SETTLED.get(str(p.harness))
+
+
+def test_a_harness_checkout_that_is_a_linked_worktree_still_moves_the_sweep_stamp(env, tmp_path):
+    """A `.git` file (linked worktree) is followed to its git dir, so a commit there is seen."""
+    p = make(env)
+    from types import SimpleNamespace
+    from ttp import harnesstree
+    b, own = _ht_kept_worktree(p)
+    linked = tmp_path / "linked"
+    _hgit(p.harness, "worktree", "add", "-q", "-b", "linked-main", str(linked))
+    q = SimpleNamespace(db=p.db, state=p.state, harness=linked)
+    before = harnesstree._stamp(q, b)
+    assert None not in before[1:5]   # the worktree's and the checkout's HEAD and HEAD log were found
+    time.sleep(0.01)
+    _commit_in_harness_tree(linked, "prompts/x.md", "x\n", "moves the linked checkout's HEAD")
+    assert harnesstree._stamp(q, b) != before
