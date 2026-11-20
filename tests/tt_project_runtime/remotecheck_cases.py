@@ -154,7 +154,6 @@ def test_a_remote_check_runs_on_a_git_checkout_of_exactly_head_and_cleans_up(tmp
     assert _rc_left(tmp_path) == []
 
 
-
 def test_a_remote_check_s_python_output_is_unbuffered_unless_its_env_says_otherwise(tmp_path):
     """Over ssh stdout is a pipe: Python there runs unbuffered, so pytest's progress streams back and a
     passing run longer than the silence limit (checkwall.SILENT_S) is not stopped as a hang (live: about 30
@@ -2064,7 +2063,6 @@ def test_ttp_config_account_sets_the_spill_pool_validated_and_a_run_may_only_cle
     assert checkspill.account_hosts() == [] and "spill_hosts" not in (project.load_account_settings().get("checks") or {})
 
 
-
 def test_the_account_ban_list_keeps_a_spill_host_out_by_alias_or_host_name_and_an_unlisted_host_still_spills(
         env, tmp_path, monkeypatch):
     """checks.no_spill_hosts in the account settings: a host it names, by alias or by the machines list's host
@@ -2960,7 +2958,6 @@ def test_spill_host_slots_follow_idle_cores_and_memory_and_the_probe_reads_its_l
     assert checkspill.probe("h")[0] == 0 and "probe failed" in checkspill.probe("h")[1]
 
 
-
 def _spill_hosts_read(monkeypatch, loads: dict, cores=64, mem_gib=200):
     """The spill probe over ssh answers per host from `loads` ({alias: 1-minute load, or None: ssh cannot
     reach it}); every other command runs as before. Returns the probes run per host."""
@@ -3036,69 +3033,6 @@ def test_an_unreachable_spill_host_backs_off_and_its_share_spreads_over_the_othe
     finally:
         for c in got:
             c and c.close()
-
-
-@pytest.mark.parametrize("run_env", ["TTP_RUN_ID", "TTP_RUN_DIR", "TTP_NOTE_RUN_DIR"])
-@pytest.mark.parametrize("task", ["42", ""])   # a worker's run, or a coordinator's (the session's own shell)
-@pytest.mark.parametrize("argv_tail", [["sandbox.checks", "true"], ["sandbox.checks", "1"], ["sandbox.checks", "9"],
-                                       ["sandbox.checks", "enabled"], ["sandbox", json.dumps({"checks": True})]])
-def test_a_run_cannot_turn_the_checks_sandbox_on(env, capsys, monkeypatch, run_env, task, argv_tail):
-    """sandbox.checks (the checks' PID namespace) is user-only: a `ttp config`
-    inside any run, a worker's or a coordinator's, refuses turning it on, directly or through its parent;
-    the message says only the user's own word does."""
-    from ttp import cli
-    p = make(env)
-    monkeypatch.setenv(run_env, "7")
-    if task:
-        monkeypatch.setenv("TTP_TASK", task)
-    before = p.raw_config()
-    with pytest.raises(SystemExit) as e:
-        cli.main(["config", "demo", *argv_tail])
-    err = capsys.readouterr().err
-    assert e.value.code == 2 and "only the user may change" in err and "user's own word" in err, err
-    assert p.raw_config() == before and p.config()["sandbox"]["checks"] is False
-
-
-@pytest.mark.parametrize("argv_tail", [["sandbox.checks", "false"], ["sandbox.checks", ""],
-                                       ["sandbox", json.dumps({"fence_freed_commands": []})]])
-def test_a_run_may_turn_the_checks_sandbox_off_and_the_user_turns_it_on(env, capsys, monkeypatch, argv_tail):
-    """The off value (false, unset, dropped through the parent) follows the user's unsandboxed-runs order:
-    a run may write it. The user's own `ttp config` (no run) turns it on."""
-    from ttp import cli
-    p = make(env)
-    cli.main(["config", "demo", "sandbox.checks", "true"])
-    assert p.config()["sandbox"]["checks"] is True
-    monkeypatch.setenv("TTP_RUN_ID", "7")
-    monkeypatch.setenv("TTP_TASK", "42")
-    cli.main(["config", "demo", *argv_tail])
-    assert p.config()["sandbox"]["checks"] is False
-    cli.main(["config", "demo", "sandbox.checks", "false"])   # already off: a no-op write stays allowed
-
-
-def test_the_coordinator_never_turns_the_checks_sandbox_on(env, capsys):
-    """A coordinator config_set of sandbox.checks on is refused with the reason, in a turn carrying a user
-    message too; false and unset are applied. `ttp config --chat-settable` says the same."""
-    from ttp import cli, coordinator as coord
-    p = make(env)
-    for value in (True, "true", "on", 1):
-        for user_turn in (False, True):
-            out = coord.apply(p, [{"type": "config_set", "key": "sandbox.checks", "value": value}], user_turn=user_turn)
-            assert any("only the user may change" in x and "user's own word" in x for x in out), (value, out)
-            assert p.config()["sandbox"]["checks"] is False
-    p.set_config("sandbox.checks", True)
-    assert coord.apply(p, [{"type": "config_set", "key": "sandbox.checks", "value": False}]) == []
-    assert p.raw_config()["sandbox"]["checks"] is False
-    p.set_config("sandbox.checks", True)
-    assert coord.apply(p, [{"type": "config_set", "key": "sandbox.checks", "value": ""}]) == []
-    assert p.config()["sandbox"]["checks"] is False
-    for args in (["sandbox.checks"], ["sandbox.checks", "true"]):
-        with pytest.raises(SystemExit) as e:
-            cli.main(["config", "--chat-settable", *args])
-        out = capsys.readouterr().out
-        assert e.value.code == 1 and out.startswith("refused: sandbox.checks") and "user's own word" in out, out
-    cli.main(["config", "--chat-settable", "sandbox.checks", "false"])
-    assert "sandbox.checks: accepted as false" in capsys.readouterr().out
-    assert coord.SANDBOX_KEYS >= {"sandbox.checks", *(f"providers.{n}.write_fence" for n in ("claude", "codex", "cursor", "chat"))}
 
 
 def test_a_remote_check_ships_python_files_out_of_its_tree_and_exports_literals_unexpanded(tmp_path):
@@ -3560,8 +3494,6 @@ def test_a_tasks_checks_never_start_anyway_on_an_overloaded_pinned_host(env, tmp
     assert slot is not None and len(slot.pinned) == 1 and "holding 1 check slot(s) there" in out.getvalue()
     slot.close()
     assert slot.pinned == [] and checkspill._ours("check-host-a") == 0
-
-
 
 
 def test_spill_host_entries_take_their_own_max_runs_and_jobs_and_plain_aliases_still_work(env, capsys):
@@ -4127,7 +4059,6 @@ def test_push_own_spills_its_checks_first_too(env, tmp_path, monkeypatch):
     assert checkspill.holders(p.name) == []
 
 
-
 @pytest.mark.parametrize("route", ["push", "own"])
 @pytest.mark.parametrize("kind", ["pre_existing", "new"])
 def test_a_spilled_push_check_that_fails_goes_through_the_tests_gate_as_its_local_original(
@@ -4193,7 +4124,6 @@ def test_a_spilled_push_batch_suite_is_judged_as_its_local_original(env, tmp_pat
     assert got["ids"] == ["test_g.py::test_g"], got
     if kind == "flaky":
         assert count.read_text() == "xx", "the spilled run failed it and its one rerun here passed"
-
 
 
 def test_a_spilled_push_batch_check_reruns_only_here_with_its_selection(env, tmp_path, monkeypatch):
@@ -4493,7 +4423,6 @@ def test_workers_on_a_remote_only_workstation_are_told_to_run_tests_through_ttp_
     assert prompts.remote_only_line({}) == ""
 
 
-
 def _mac_full(monkeypatch):
     """This host reads overloaded (its load guard) and its host-wide checks cap is full: a local heavy
     check could not start here now."""
@@ -4767,7 +4696,6 @@ def test_a_spill_host_whose_runs_fail_where_the_head_passes_elsewhere_is_quarant
         checkspill.quarantine_after_of("x")
 
 
-
 def _quarantine(p, host="check-host-a", sig="OSError: no space left on device"):
     from ttp import checkspill
     p.set_config("checks.spill_quarantine_after", 1)
@@ -5039,7 +4967,6 @@ def test_spill_strikes_read_malformed_state_as_none(env, tmp_path, monkeypatch):
     for bad in ([1], {"hosts": [1]}, {"hosts": {"check-host-a": "x"}}, {"hosts": {"check-host-a": {"off": "x"}}}):
         p.db.set_kv(checkspill.STRIKES_KV, bad)
         assert checkspill.quarantined(p, "check-host-a") == "" and checkspill.lift(p, "check-host-a") is False
-
 
 
 @_GNU_FIND

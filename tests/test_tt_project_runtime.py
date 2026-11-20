@@ -617,10 +617,6 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     monkeypatch.setattr(os, "sync", lambda: None)   # setup and upgrade sync the whole disk
     # And for the harness's own commits, which pass the fsync settings per command; it doubles their
     # cost. Tests of those settings set TTP_TEST_GIT_FSYNC to get them back.
-    # Tests may run in a `ttp sandbox` (`ttp checks`), where `ttp say` is refused: tests that check
-    # the sandbox set it.
-    from ttp import sandbox
-    monkeypatch.setattr(sandbox, "inside", lambda: False)
     from ttp import project
     # TMPDIR may be a run folder inside a real repository and project. Test directories must
     # not discover either ancestor; keep the temporary files in the sandbox's writable TMPDIR.
@@ -6834,30 +6830,10 @@ def test_doctor_loop_flushes_each_step_and_sweeps_a_killed_checks_scratch_projec
     assert stopped == [old.resolve() / "repo"], "the killed check's runs are stopped first"
 
 
-def test_doctor_names_unfenced_providers(env, monkeypatch, capsys):
-    p = make(env)
-    from ttp import cli
-    from ttp.providers import base, claude, codex, cursor
-    monkeypatch.setattr(cli, "need", lambda *a: p)
-    monkeypatch.setattr(base.Provider, "available", lambda self: True)
-    monkeypatch.setattr(base.Provider, "binary", lambda self: "/bin/" + self.name)
-    monkeypatch.setattr(claude.sys, "platform", "linux")
-    monkeypatch.setattr(claude, "find_binary", lambda name: None if name == "bwrap" else "/usr/bin/" + name)
-    assert codex.Codex().write_fence() == "", "workspace-write is a write fence"
-    cli.cmd_doctor(types.SimpleNamespace(name="demo"))
-    line = next(l for l in capsys.readouterr().out.splitlines() if l.startswith("unfenced providers"))
-    assert "claude (bypassPermissions without the Bash sandbox, which needs bwrap)" in line
-    assert "cursor (--force without --sandbox enabled: this build's `--help` lists no --sandbox or --add-dir)" in line
-    assert "codex" not in line and "fake" not in line
-    monkeypatch.setattr(base.Provider, "available", lambda self: False)
-    cli.cmd_doctor(types.SimpleNamespace(name="demo"))
-    assert "unfenced providers" not in capsys.readouterr().out, "uninstalled providers are not named"
-
-
 def _live_ev(**kw):
     """Evidence from a live check whose runs all went right; `kw` overrides parts of it."""
     worker = {"exit": {"rc": 0, "launched": True}, "error": "", "session_id": "s1", "assigned_session": "s1",
-              "cost_usd": 0.02, "estimated": False, "tokens": 900, "result": {"status": "done", "fence": "refused"},
+              "cost_usd": 0.02, "estimated": False, "tokens": 900, "result": {"status": "done"},
               "steer_word_seen": True}
     ev = {"login": True, "worker": {**worker, **kw.pop("worker", {})}, "probe_written": False,
           "steer_delivered": True, "windows": ["5h"], "resume": {"recalled": True},
@@ -6872,9 +6848,6 @@ def test_live_check_judges_every_check_pass_fail_and_unsupported(env):
     class Full(Fake):   # every feature the checks look for
         steer_hook = True
 
-        def write_fence(self):
-            return ""
-
         def meter(self):
             return []
 
@@ -6887,8 +6860,8 @@ def test_live_check_judges_every_check_pass_fail_and_unsupported(env):
 
     full, bare = Full(), Bare()
     assert set(st(full).values()) == {"pass"} and list(st(full)) == list(live.CHECKS)
-    assert {k for k, v in st(bare).items() if v == "unsupported"} == {"fence", "resume", "steer"}, \
-        "a bare adapter: no fence, resume or hook"
+    assert {k for k, v in st(bare).items() if v == "unsupported"} == {"resume", "steer"}, \
+        "a bare adapter: no resume or hook"
     assert st(bare, windows=[])["meter"] == "unsupported" and st(full, windows=[])["meter"] == "fail"
     # launch
     assert st(full, worker={"exit": {"rc": 1, "launched": True}})["launch"] == "fail"
@@ -6908,12 +6881,6 @@ def test_live_check_judges_every_check_pass_fail_and_unsupported(env):
     assert st(full, coordinator={"structured": None, "from_text": {"actions": []}})["structured"] == "pass"
     assert st(full, coordinator={"structured": {"x": 1}, "from_text": None})["structured"] == "fail"
     assert st(full, coordinator={"skipped": "over budget"})["structured"] == "fail"
-    # fence
-    assert st(full, probe_written=True)["fence"] == "fail"
-    assert st(full, inside_written=False)["fence"] == "fail", "a fence must let the worker write its worktree"
-    assert st(full, inside_written=True)["fence"] == "pass"
-    assert st(full, worker={"result": None})["fence"] == "fail"
-    assert st(full, worker={"exit": {"rc": 2}})["fence"] == "fail"
     # resume
     assert st(full, resume={"recalled": False})["resume"] == "fail"
     assert st(full, resume={"skipped": "no session"})["resume"] == "fail"
@@ -6933,7 +6900,7 @@ def test_live_check_runs_through_the_real_launch_path_with_the_fake(env, monkeyp
     assert r["available"] and r["spend_usd"] == 0.03, r
     got = {k: v["status"] for k, v in r["checks"].items()}
     assert got == {"launch": "pass", "login": "unsupported", "session": "pass", "usage": "pass",
-                   "structured": "pass", "fence": "unsupported", "resume": "fail", "steer": "unsupported",
+                   "structured": "pass", "resume": "fail", "steer": "unsupported",
                    "meter": "unsupported"}, r
     assert "did not recall" in r["checks"]["resume"]["note"], "the fake resumes but echoes no word"
     assert list((env["tmp"] / "live").iterdir()) == [], "the scratch project is removed"
@@ -7895,33 +7862,11 @@ def test_remote_listen_exit_of_its_own_is_passed_through_not_retried(env, monkey
     assert "unknown chat c9" in err and "retrying" not in err and len(calls) == 1
 
 
-# A sitecustomize for a ttp that runs on "another machine": its sandbox.inside() answers False.
-_OUTSIDE_SANDBOX = """
-import importlib.abc, importlib.util, sys
-class _Hook(importlib.abc.MetaPathFinder):
-    def find_spec(self, name, path, target=None):
-        if name != "ttp.sandbox":
-            return None
-        sys.meta_path.remove(self)
-        spec = importlib.util.find_spec(name)
-        run = spec.loader.exec_module
-        def exec_module(module):
-            run(module)
-            module.inside = lambda: False
-        spec.loader.exec_module = exec_module
-        return spec
-sys.meta_path.insert(0, _Hook())
-"""
-
-
 def _flaky_ssh(monkeypatch, cwd, codes, calls):
     """ssh HOST CMD: 255 = unreachable (nothing runs); "drop" = CMD runs, then the connection drops
-    before its answer arrives (255); anything else, or no codes left = CMD runs here in `cwd`, which
-    is another machine: outside the `ttp sandbox` the suite may run in, where `ttp say` is refused."""
+    before its answer arrives (255); anything else, or no codes left = CMD runs here in `cwd`,
+    which is another machine."""
     real = subprocess.run
-    site = cwd.parent / "far-site"
-    site.mkdir(exist_ok=True)
-    (site / "sitecustomize.py").write_text(_OUTSIDE_SANDBOX)
 
     def run(args, **kw):
         if args[0] != "ssh":
@@ -7931,9 +7876,7 @@ def _flaky_ssh(monkeypatch, cwd, codes, calls):
         if code == 255:
             return subprocess.CompletedProcess(args, 255, "" if kw.get("stdout") else None,
                                                "ssh: connect to host far port 22: Network is unreachable")
-        env = dict(kw.pop("env", None) or os.environ)
-        env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(site), env.get("PYTHONPATH")]))
-        r = real(["bash", "-c", args[-1]], cwd=cwd, env=env, **kw)
+        r = real(["bash", "-c", args[-1]], cwd=cwd, env=kw.pop("env", None) or os.environ, **kw)
         return subprocess.CompletedProcess(args, 255 if code == "drop" else r.returncode, r.stdout, r.stderr)
     monkeypatch.setattr(subprocess, "run", run)
 
@@ -15621,56 +15564,12 @@ def test_idle_capacity_device_candidates():
     assert idlecap.task_names({"labels": '["needs_device", "exclusive:board-device"]'}, cfg) == {"board"}
 
 
-def test_codex_workers_may_write_run_state_and_git_metadata(env, monkeypatch):
-    from ttp.providers import codex as codex_provider
-    monkeypatch.setattr(codex_provider.Codex, "binary", lambda self: "/usr/bin/true")  # never a real agent
-    p = make(env)
-    p.set_config("pricing", {"codex": {"some-model": [1.0, 0.1, 2.0]}})
-    _write_fence("codex")(p)   # writable roots exist only under the opt-in fence
-    from ttp.daemon import Daemon
-    wt = env["tmp"] / "wt"
-    subprocess.run(["git", "-C", str(env["repo"]), "worktree", "add", "-q", str(wt)], check=True)
-    d = Daemon(p.base)
-    tid = p.db.add_task("t", "s", kind="work", tier="light", origin="user")
-    rid = d.start_run("worker", "go", "codex", "light", str(wt), task=p.db.task(tid))
-    spec = json.loads((p.runs / str(rid) / "run.json").read_text())
-    argv = spec["argv"]
-    assert argv[-1] == "-", "the prompt on stdin must stay the last argument"
-    roots = next(a for a in argv if a.startswith("sandbox_workspace_write.writable_roots="))
-    roots = json.loads(roots.split("=", 1)[1])
-    assert str(p.state) in roots and str((env["repo"] / ".git").resolve()) in roots
-    assert str((env["repo"] / ".git" / "worktrees" / "wt").resolve()) in roots, "the worktree's own gitdir"
-    assert spec["prices"] == {"some-model": [1.0, 0.1, 2.0]}, "the runner's budget check must use project prices"
-    (p.runs / str(rid) / "STOP").touch()
-    crid = d.start_run("coordinator", "decide", "codex", "light", str(p.base), read_only=True)
-    assert not any("writable_roots" in a for a in json.loads((p.runs / str(crid) / "run.json").read_text())["argv"])
-    (p.runs / str(crid) / "STOP").touch()
-
-
-def _write_fence(name):
-    """A `before` hook (or a call on a project) that turns provider `name`'s opt-in write fence on, as the
-    user's own word does (configwho: runs honour it only from the user, sandboxstate)."""
-    def on(p):
-        from ttp import configwho
-        providers = p.config().get("providers") or {}
-        p.set_config("providers", {**providers, name: {**(providers.get(name) or {}), "write_fence": True}},
-                     by=configwho.by("user", via="cli"))
-    return on
-
-
-def _codex_worker_roots(env, p, cwd):
-    """The writable roots the daemon gives a Codex worker in cwd."""
-    return _codex_worker_launch(env, p, cwd)[0]
-
-
 def _codex_worker_launch(env, p, cwd):
-    """The writable roots and the environment (as the runner hands it to the agent) the daemon gives
-    a Codex worker in cwd."""
+    """The environment (as the runner hands it to the agent) the daemon gives a Codex worker in cwd."""
     from ttp.providers import codex as codex_provider
     from ttp.daemon import Daemon
     real = codex_provider.Codex.binary
     codex_provider.Codex.binary = lambda self: "/usr/bin/true"   # never a real agent
-    _write_fence("codex")(p)   # writable roots exist only under the opt-in fence
     try:
         d = Daemon(p.base)
         tid = p.db.add_task("t", "s", kind="work", tier="light", origin="user")
@@ -15685,8 +15584,7 @@ def _codex_worker_launch(env, p, cwd):
     if spec.get("tmp_dir"):
         # The runner removed it when the stand-in agent ended; a live worker has it.
         pathlib.Path(spec["tmp_dir"]).mkdir(exist_ok=True)
-    roots = next(a for a in spec["argv"] if a.startswith("sandbox_workspace_write.writable_roots="))
-    return json.loads(roots.split("=", 1)[1]), {**os.environ, **spec["env"]}
+    return {**os.environ, **spec["env"]}
 
 
 def test_plugin_dirs_a_provider_cannot_load_alert_once_per_value_and_show_in_doctor(env, monkeypatch, tmp_path,
@@ -15731,140 +15629,6 @@ def test_plugin_dirs_a_provider_cannot_load_alert_once_per_value_and_show_in_doc
     assert "codex" not in (p.db.kv(PLUGINS_DROPPED_KEY) or {}), "unset: the record clears"
     assert len(dropped("codex")) == 2
 
-
-def test_sandboxed_workers_get_a_private_writable_temp_dir(env):
-    # On macOS git is an xcrun shim; in Codex's sandbox xcrun could not write its cache under /tmp
-    # (`couldn't create cache file /tmp/xcrun_db-...`), so git failed. A fenced worker gets its own
-    # temp dir, a short one (shorttmp: AF_UNIX path limit), inside its writable roots and outside
-    # the worktree; run.json records it, and the run's end removes it.
-    from ttp import runner, shorttmp
-    p = make(env)
-    repo = env["repo"]
-    roots, run_env = _codex_worker_launch(env, p, repo)
-    tmp = pathlib.Path(run_env["TMPDIR"])
-    assert run_env["TMP"] == run_env["TEMP"] == str(tmp) and tmp.is_dir()
-    assert shorttmp.owned(tmp), "a short dir of its own"
-    assert any(tmp.is_relative_to(r) for r in roots), roots
-    assert str(shorttmp.root()) in roots, "the worker may make the short dirs of its checks and jobs"
-    (tmp / "scratch").write_text("x")
-    assert subprocess.run(["git", "-C", str(repo), "status", "--porcelain"],
-                          capture_output=True, text=True).stdout == "", "never committed with the work"
-    run_dir = next(d for d in p.runs.iterdir()
-                   if json.loads((d / "run.json").read_text()).get("tmp_dir") == str(tmp))
-    runner.remove_private(run_dir)   # also what the daemon does for a runner that died
-    assert not tmp.exists()
-    # An unfenced provider (no writable roots) keeps the caller's temp dir. Claude is fenced where
-    # bwrap and socat exist (Provider.fence_args), so turn its fence off here.
-    from ttp.providers import claude as claude_provider
-    from ttp.daemon import Daemon
-    p.set_config("providers", {**p.config()["providers"], "claude": {"write_fence": False}})
-    real = claude_provider.Claude.binary
-    claude_provider.Claude.binary = lambda self: "/usr/bin/true"   # never a real agent
-    try:
-        tid = p.db.add_task("t", "s", kind="work", tier="light", origin="user")
-        rid = Daemon(p.base).start_run("worker", "go", "claude", "light", str(repo), task=p.db.task(tid))
-    finally:
-        claude_provider.Claude.binary = real
-    (p.runs / str(rid) / "STOP").touch()
-    assert "TMPDIR" not in json.loads((p.runs / str(rid) / "run.json").read_text())["env"]
-    assert not (p.runs / str(rid) / "tmp").exists()
-
-
-def test_codex_workers_may_write_the_shared_lock_root_only(env):
-    # `ttp lock <machine>` on a machine shared across projects takes ~/.tt-project/locks/<machine>/
-    # <machine>.0.lock; a workspace-write sandbox made that read-only, so the lock failed.
-    p = make(env)
-    p.set_config("shared_resources", ["box1"])
-    from ttp import locks as lk
-    from ttp import shared
-    roots = _codex_worker_roots(env, p, p.base)
-    slot = lk.slot_paths(shared.locks_dir(p, "box1"), "box1", 1)[0]
-    assert slot == env["home"] / "locks" / "box1" / "box1.0.lock", "the shared lock root must not move"
-    assert any(slot.is_relative_to(r) for r in roots), roots
-    assert str(env["home"] / "locks") in roots and (env["home"] / "locks").is_dir()
-    assert str(env["home"]) not in roots, "only the lock root, not the rest of the user's tt-project home"
-
-
-def _codex_sandbox(cwd, roots):
-    """argv prefix that runs a command in Codex's workspace-write sandbox writing only cwd and
-    roots (not the temp dir the test lives in); None when no Codex sandbox works here. /tmp stays
-    writable, as for a real worker, when the test is elsewhere (macOS: under $TMPDIR): xcrun, which
-    git calls there, falls back to /tmp for its cache."""
-    import shutil
-    exe = shutil.which("codex")
-    if not exe:
-        return None
-    in_tmp = pathlib.Path(cwd).resolve().is_relative_to(pathlib.Path("/tmp").resolve())
-    argv = [exe, "sandbox", "-c", 'sandbox_mode="workspace-write"',
-            "-c", f"sandbox_workspace_write.exclude_slash_tmp={'true' if in_tmp else 'false'}",
-            "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
-            "-c", "sandbox_workspace_write.writable_roots=" + json.dumps([str(r) for r in roots]), "--"]
-    probe = pathlib.Path(cwd) / "probe"
-    try:
-        r = subprocess.run(argv + ["sh", "-c", f"touch {probe} && ! touch {pathlib.Path(cwd).parent}/outside"],
-                           cwd=cwd, capture_output=True, timeout=60)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    return argv if r.returncode == 0 and probe.exists() else None
-
-
-def test_sandboxed_codex_worker_can_git_add_in_a_linked_worktree(env):
-    # Codex makes the gitdir a worktree's `.git` file points to (<common>/worktrees/<name>) read-only
-    # even inside a writable common .git, so `git add` failed creating index.lock there (EROFS).
-    p = make(env)
-    wt = env["tmp"] / "wt-add"
-    subprocess.run(["git", "-C", str(env["repo"]), "worktree", "add", "-q", str(wt)], check=True)
-    gitdir = (env["repo"] / ".git" / "worktrees" / "wt-add").resolve()
-    roots, run_env = _codex_worker_launch(env, p, wt)
-    assert str(gitdir) in roots and str(p.state) in roots, roots
-    assert not any(pathlib.Path(r) != p.state and p.state.is_relative_to(r) for r in roots), \
-        "nothing above state/ becomes writable"
-    sandbox = _codex_sandbox(wt, roots)
-    if sandbox is None:
-        pytest.skip("no working Codex sandbox on this machine")
-    (wt / "new.txt").write_text("x")
-    add = subprocess.run(sandbox + ["git", "add", "new.txt"], cwd=wt, env=run_env, capture_output=True, text=True)
-    assert add.returncode == 0, add.stderr
-    assert "new.txt" in subprocess.run(["git", "-C", str(wt), "diff", "--cached", "--name-only"],
-                                       capture_output=True, text=True).stdout
-    # Without the gitdir root, as before the fix, the same add fails on index.lock.
-    old = _codex_sandbox(wt, [r for r in roots if r != str(gitdir)])
-    (wt / "other.txt").write_text("y")
-    add = subprocess.run(old + ["git", "add", "other.txt"], cwd=wt, env=run_env, capture_output=True, text=True)
-    assert add.returncode != 0 and "index.lock" in add.stderr, add.stderr
-
-
-def test_sandboxed_codex_worker_writes_all_git_metadata_of_a_task_worktree(env, monkeypatch):
-    # A task worktree under the project (<root>/tt-project/worktrees/tN) failed `git merge --ff-only`
-    # with EROFS on <root>/.git/worktrees/tN/ORIG_HEAD.lock. Every metadata write a worker makes
-    # there (ORIG_HEAD, index, HEAD's reflog, branches, tags, packed-refs) must go through.
-    for var, val in (("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"),
-                     ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t")):
-        monkeypatch.setenv(var, val)
-    p = make(env)
-    repo = env["repo"]
-    _commit(repo, "ahead.txt", "x\n")
-    wt = p.worktrees / "t30"
-    subprocess.run(["git", "-C", str(repo), "worktree", "add", "-q", "-b", "ttp/t30-x", str(wt), "HEAD~1"],
-                   check=True, capture_output=True)
-    roots, run_env = _codex_worker_launch(env, p, wt)
-    sandbox = _codex_sandbox(wt, roots)
-    if sandbox is None:
-        pytest.skip("no working Codex sandbox on this machine")
-    target = _git_out(repo, "rev-parse", "HEAD")
-    script = ("set -e; git merge -q --ff-only " + target + "; echo y > y.txt; git add y.txt; "
-              "git commit -qm y; git branch side; git tag t1; git reset -q --soft HEAD~1; "
-              "git commit -qm again; git pack-refs --all; git reflog -1")
-    r = subprocess.run(sandbox + ["sh", "-c", script], cwd=wt, env=run_env, capture_output=True, text=True)
-    assert r.returncode == 0, r.stderr
-    assert _git_out(wt, "rev-parse", "HEAD~1") == target and _git_out(wt, "log", "-1", "--format=%s") == "again"
-    assert _git_out(repo, "rev-parse", "side", "t1").count("\n") == 1
-    # Without the worktree's own gitdir, as before 0.2.101, the merge fails exactly as reported.
-    gitdir = _git_out(wt, "rev-parse", "--absolute-git-dir")
-    _git_out(wt, "reset", "-q", "--hard", "HEAD~2")
-    old = _codex_sandbox(wt, [r for r in roots if r != gitdir])
-    r = subprocess.run(old + ["git", "merge", "--ff-only", target], cwd=wt, env=run_env, capture_output=True, text=True)
-    assert r.returncode != 0 and "ORIG_HEAD.lock" in r.stderr, r.stderr
 
 def test_ttp_lock_says_plainly_when_the_shared_lock_is_not_writable(env):
     if os.geteuid() == 0:
@@ -16042,35 +15806,18 @@ def _codex_turn(text, inp=1000, cached=0, out=500):
 def test_codex_worker_launches_on_stdin_and_hands_off(env, monkeypatch):
     done = {"status": "done", "summary": "changed the README"}
     p, run, task, argv, stdin = _cli_run(env, monkeypatch, "codex", _codex_events(*_codex_turn("all done")),
-                                         result=done, before=_write_fence("codex"))
+                                         result=done)
     cwd = str(env["repo"])
     assert argv[1:3] == ["exec", "--json"] and argv[argv.index("-C") + 1] == cwd
-    assert argv[argv.index("-s") + 1] == "workspace-write" and "approval_policy=never" in argv
+    assert argv[argv.index("-s") + 1] == "danger-full-access" and "approval_policy=never" in argv
     assert "allow_login_shell=false" in argv, "a login shell's profile could put the real gh before the shim"
-    assert "model_reasoning_effort=low" in argv and "sandbox_workspace_write.network_access=true" in argv
-    assert any(a.startswith("sandbox_workspace_write.writable_roots=") for a in argv)
+    assert "model_reasoning_effort=low" in argv
     assert "--output-schema" not in argv and argv[-1] == "-", "the prompt must arrive on stdin"
     assert "PROMPT-MARKER" in stdin
     assert run["status"] == "ok" and run["exit_code"] == 0 and run["cost_estimated"] == 1
     assert run["input_tokens"] == 1000 and run["output_tokens"] == 500
     assert run["cost_usd"] == pytest.approx((1000 * 4.0 + 500 * 20.0) / 1e6), "priced from the default row"
     assert task["status"] == "done" and task["spent_usd"] == pytest.approx(run["cost_usd"])
-
-
-def test_sandboxed_worker_temp_dir_is_removed_when_the_run_ends(env, monkeypatch):
-    # Run dirs are kept, so a fenced worker's temp files (pytest basetemps, build scratch) that the
-    # OS used to clean from /tmp must not pile up in state/: the runner removes the dir at the end.
-    done = {"status": "done", "summary": "ok"}
-    p, run, task, _, _ = _cli_run(env, monkeypatch, "codex", _codex_events(*_codex_turn("all done")), result=done,
-                                  before=_write_fence("codex"))
-    run_dir = p.runs / str(run["id"])
-    from ttp import shorttmp
-    tmp = pathlib.Path((env["tmp"] / "fakecli" / "tmpdir.txt").read_text())
-    assert shorttmp.owned(tmp), "the agent wrote its scratch into its own (short) temp dir"
-    assert json.loads((run_dir / "run.json").read_text())["tmp_dir"] == str(tmp)
-    assert not tmp.exists(), "the run's temp dir outlived the run"
-    assert (run_dir / "run.json").exists() and (run_dir / "result.json").exists() and (run_dir / "exit.json").exists()
-    assert run["status"] == "ok" and task["status"] == "done"
 
 
 def test_remove_private_removes_only_the_run_temp_dir(env):
@@ -25154,10 +24901,9 @@ def test_codex_keeps_its_thread_id_and_resumes_it(env, tmp_path, monkeypatch):
 def test_codex_resume_puts_the_subcommand_after_its_options(env, monkeypatch):
     _, run, task, argv, stdin = _cli_run(env, monkeypatch, "codex", _codex_events(*_codex_turn("all done")),
                                          result={"status": "done", "summary": "ok"}, help_text=CODEX_EXEC_HELP,
-                                         resume=THREAD, before=_write_fence("codex"))
+                                         resume=THREAD)
     assert argv[-3:] == ["resume", THREAD, "-"], argv
     assert argv.index("-C") < argv.index("resume") and argv.index("-s") < argv.index("resume")
-    assert any(a.startswith("sandbox_workspace_write.writable_roots=") for a in argv[:argv.index("resume")])
     assert "PROMPT-MARKER" in stdin and run["status"] == "ok" and task["status"] == "done"
 
 
@@ -28477,8 +28223,8 @@ def _gone_pid(pid):
 
 
 def _host_pid(argv, timeout=10.0):
-    """The host pid of this user's process running exactly `argv`: a check runs in a PID namespace
-    (sandbox.py), where its `$$` or os.getpid() is not the pid this test can see or signal."""
+    """The host pid of this user's process running exactly `argv`: a check may run in another PID
+    namespace, where its `$$` or os.getpid() is not the pid this test can see or signal."""
     want = "\0".join(map(str, argv)).encode() + b"\0"
     deadline = time.time() + timeout
     while True:
@@ -49721,18 +49467,6 @@ def test_a_push_batch_does_not_check_uncapped_when_the_slot_root_is_read_only(en
     assert m["outcome"] != "pushed", m
     assert not log.exists(), "no check ran without the cap"
     assert str(d) in json.dumps(m) + capsys.readouterr().out
-
-
-def test_workers_may_write_the_host_wide_check_slots(env):
-    # A worker's `ttp checks` takes ~/.tt-project/check-slots/checks.N.lock; a sandbox that left it
-    # read-only made the checks run without the host-wide cap.
-    from ttp import checkcap
-    p = make(env)
-    roots = _codex_worker_roots(env, p, p.base)
-    slot = checkcap.paths(1)[0]
-    assert slot.parent == env["home"] / "check-slots", "the slot root must not move"
-    assert any(slot.is_relative_to(r) for r in roots), roots
-    assert checkcap.slot_dir().is_dir() and str(env["home"]) not in roots
 
 
 def test_task_show_and_list_json_print_start_when_and_retry_when_only_when_set(env, capsys):

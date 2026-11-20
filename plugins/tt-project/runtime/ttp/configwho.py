@@ -316,12 +316,9 @@ def cli_route(key: str, project: str = "<project>") -> str:
 
 def _safe_way(key: str, new) -> bool:
     """Whether writing `new` at `key` turns a switch its safe way, which any setter may (as the
-    coordinator's and `ttp config`'s own gates read it): a sandbox key to anything but on, removing it
-    too, or a SAFE_WHEN_OFF switch to false, '' or []."""
-    from .coordinator import SAFE_WHEN_OFF, SANDBOX_KEYS, sandbox_on
+    coordinator's and `ttp config`'s own gates read it): a SAFE_WHEN_OFF switch to false, '' or []."""
+    from .coordinator import SAFE_WHEN_OFF
     value = None if new is _ABSENT else new
-    if key in SANDBOX_KEYS:
-        return not sandbox_on(value)
     return key in SAFE_WHEN_OFF and new is not _ABSENT and value in (False, "", [])
 
 

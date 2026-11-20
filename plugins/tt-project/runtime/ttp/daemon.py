@@ -100,7 +100,6 @@ from . import drift
 from . import resumefirst
 from . import rejcool
 from . import stalegate
-from . import sandboxstate
 from . import indexignore
 from . import plangate
 from . import lanewait
@@ -270,7 +269,6 @@ from . import schedrun
 from . import screen as scr
 from . import shared
 from . import shorttmp
-from . import fencefree
 from . import worktree
 from . import db as dbmod
 from .db import (
@@ -756,8 +754,8 @@ CHAT_FALLBACK_CAP_KEY = "chat_fallback_cap_seen"   # kv: when Daemon._chat_fallb
 CHAT_FALLBACK_CAP_EVERY_S = 86400
 PLUGINS_DROPPED_KEY = "plugin_dirs_dropped"   # kv: provider -> [dirs, isolated] alerted as not loaded (Daemon._alert_plugins_dropped)
 WORKSPACE_RETRY_NOTE = "workspace retry"   # a queued task's note while its workspace is retried
-# A workspace refused on a held git lock file (.git/config.lock: a sandbox's empty placeholder, another
-# worktree being made) is contention, not a failure: retried after CONFIG_LOCK_BACKOFF_S without using
+# A workspace refused on a held git lock file (.git/config.lock: another worktree being
+# made) is contention, not a failure: retried after CONFIG_LOCK_BACKOFF_S without using
 # a worktree.create_retries try, at most CONFIG_LOCK_RETRIES times in a row (a stale lock still ends blocked).
 CONFIG_LOCK_ERRORS = ("could not lock config file", ".lock': File exists")
 CONFIG_LOCK_BACKOFF_S = 30
@@ -1332,7 +1330,6 @@ class Daemon:
         self._step_mark = 0.0   # and when its current item did
         self._step_holder, self._step_task = "", None   # the item it works on now (_step_over)
         self._step_worst: tuple[float, str, int | None] = (0.0, "", None)   # its slowest item so far
-        self._sandbox_due = 0.0   # sweep_sandbox_trees: its first pass is at start
         self._step_cursor: dict[str, object] = {}   # step -> the last item done before its budget ran out
         self._step_at: dict[str, object] = {}   # step -> the _resume_order item it is on now
         self._overseer_kicked = 0.0   # when check_overseer last started the overseer
@@ -1441,8 +1438,6 @@ class Daemon:
         self._spec_coalesced: set[int] = set()   # tasks whose wake_now waits for the coalesce window (logged once)
         self._spec_held: set[int] = set()   # tasks whose spec wakes a same-wait hand-back holds (logged once)
         self._wait_what_errs: set[str] = set()   # causes of lock-probe errors already logged (_wait_what)
-        self._fence_freed_said: set[str] = set()   # sandbox.fence_freed_commands entries left out, logged
-        self._sandbox_said: set[str] = set()   # superseded sandbox settings told once (sandboxstate)
         # Exclusive slot reservations (_slot_reservations): canonical lock -> {"task", "holder", "free_since"},
         # the (lock, task) pairs whose reservation timed out, and the pass's reservers while dispatch runs.
         self._slot_resv: dict[str, dict] = {}
@@ -1832,14 +1827,6 @@ class Daemon:
         except OSError:
             pass
 
-    def _tell_sandbox_superseded(self, key: str, text: str) -> None:
-        """Log and tell the coordinator, once per daemon and setting (one keyed low issue), that a
-        sandbox setting is superseded (sandboxstate); its project.json is left as it is."""
-        if text and key not in self._sandbox_said:
-            self._sandbox_said.add(key)
-            log(self.p, f"sandbox: {text}")
-            self.observe("daemon:sandbox-superseded", text, "low", whole=True, key=f"sandbox-superseded:{key}")
-
     def _load_config(self) -> None:
         """Reload project.json. Missing or broken, its last good copy stays in force; with none, an
         established project starts no coordinator turn or worker run (both would route on the
@@ -1848,12 +1835,6 @@ class Daemon:
         self.cfg = coordroute.ring_gate(glmwork.ring_gate(codearm.ring_gate(layered(raw), self.p.name, raw),
                                                           self.p.name, raw), self.p.name, raw)   # release flags
         self._raw_cfg = raw   # which tiers the project sets itself (cursortiers.apply)
-        # The process sandbox for checks, off unless the project turns it on: this daemon's own check
-        # runs read it here, its workers from their environment (start_run).
-        from . import sandbox as process_sandbox
-        # sandbox.checks true counts only on the user's own word since runs went unsandboxed (sandboxstate).
-        # start_run tells the coordinator about a superseded one.
-        os.environ[process_sandbox.ENV] = "1" if sandboxstate.state(self.p, self.cfg, sandboxstate.CHECKS_KEY)[0] else "0"
         # ssh.reuse for this daemon's own ssh calls too: stepclock routes a bare `ssh` with no env= by
         # this process's environment, which launchd and systemd start without the variable.
         os.environ.update(sshmux.env(self.cfg))
@@ -2404,7 +2385,6 @@ class Daemon:
             self.jev = babysit.wrap(self.cfg, Jev(self.cfg, db=self.p.db, pause=self._jev_pause), self.p.db,
                                     self._chat_pause, log=lambda m: log(self.p, m))
         for step in (self.lift_boot_pause, self.reap_runs, self.reap_waiting_checks, self.wake_after_reboot, self.meter_running, self.watch_runs, self.watch_urgent_messages, self.check_steer_reads, self.relay_escalations, self.post_held_notifies, self.reconcile_tasks, self.retry_workspaces, self.tend_pushes,
-                     self.sweep_sandbox_trees,
                      self.verify_pushes,
                      self.tick_prune_worktrees, self.prune_leftovers, self.branch_cap, self.rollout_watch, self.land_harness_worktrees, self.backup_branches, self.check_local_only, self.check_disk,
                      self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends, self.check_move, self.track_outages,
@@ -3325,21 +3305,6 @@ class Daemon:
             self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,data,status) VALUES(?,?,?,?,?,?,?)",
                         (r["ts"], "daemon", "append_refused", "normal", text[:500], json.dumps(r), "handled"))
 
-    def sweep_sandbox_trees(self) -> None:
-        """End the sandbox trees (bwrap and its proxy listeners) that outlived their runs (sandboxreap): the
-        first pass at start, then each jobstop.SWEEP_EVERY_S. It keeps STEP_BUDGET_S, stopping between
-        trees, and the next tick resumes after the last tree done; a walk past its time is left for a
-        later pass and logged once."""
-        from . import jobstop, sandboxreap
-        if time.monotonic() < self._sandbox_due and "sandbox_sweep" not in self._step_cursor:
-            return
-        self._sandbox_due = time.monotonic() + jobstop.SWEEP_EVERY_S
-        found = sandboxreap.sweep(
-            self.p, over=self._step_over, order=lambda rows: self._resume_order("sandbox_sweep", rows),
-            stop=lambda at: self._step_cursor.__setitem__("sandbox_sweep", at), say=lambda text: log(self.p, text))
-        if found:
-            log(self.p, sandboxreap.summary(found))
-
     def tend_pushes(self) -> None:
         """Start the detached pushes and jobs queued from inside a sandbox; record the dead pushes as failed. Then
         the push queue's bookkeeping, also while paused: approvals whose review moved on, a queue
@@ -3861,14 +3826,8 @@ class Daemon:
                                web=True)   # every kind, reviews too; no_internet still wins
         if pin.get("model") and (var := prov.subagent_model_env) and var not in env and var not in os.environ:
             env = {**env, var: pin["model"]}   # a pinned task's subagents run its model; an explicit setting wins
-        # The write fence counts only on the user's own word since runs went unsandboxed (sandboxstate): a
-        # leftover true is ignored and told to the coordinator once, never rewritten in project.json.
-        fence_on, fence_why, superseded = sandboxstate.fence(self.p, self.cfg, provider)
-        self._tell_sandbox_superseded(sandboxstate.fence_key(provider), superseded)
-        self._tell_sandbox_superseded(sandboxstate.CHECKS_KEY,
-                                      sandboxstate.state(self.p, self.cfg, sandboxstate.CHECKS_KEY)[2])
-        if read_only:   # a decision-only turn, unsandboxed unless opted in: its output goes through the action gates
-            argv = prov.read_only_args(argv, on=fence_on, restrictions=restrictions)
+        if read_only:   # a decision-only turn, unsandboxed outside no_internet: its output goes through the action gates
+            argv = prov.read_only_args(argv, restrictions=restrictions)
         # Every coordinator wake is a session wake, but a routine lane or shadow turn (coordroute.py): stateless.
         session_on = role == "coordinator" and not resume and not coordroute.lane_of(note)
         session_mode = ""   # this wake's coordsession.decide()
@@ -4046,13 +4005,13 @@ class Daemon:
                            severity="normal", every_s=86400)
             roots = [str(self.p.state)] + worktree.git_dirs(Path(cwd))
             # Short temp dirs (shorttmp): the worker's own, and those of the checks and detached
-            # jobs it starts. The root must exist for the sandbox to grant it.
+            # jobs it starts. The root must exist for a no_internet sandbox to grant it.
             for top in (shorttmp.root(), shorttmp.tmpfs_root()):   # the RAM disk's: checks' scratch
                 if top is not None and shorttmp.ready(top):
                     roots += list(dict.fromkeys([str(top), str(top.resolve())]))
             # `ttp lock` on a resource shared across projects takes its slot under the user's shared
             # lock root, outside the project: only that directory, not the rest of the user's
-            # tt-project home. It must exist for the sandbox to grant it.
+            # tt-project home. It must exist for a no_internet sandbox to grant it.
             try:
                 shared.root().mkdir(parents=True, exist_ok=True)
                 roots += list(dict.fromkeys([str(shared.root()), str(shared.root().resolve())]))
@@ -4076,26 +4035,7 @@ class Daemon:
                 self.alert(f"write_dirs_missing:{provider}",
                            f"Skipped providers.{provider}.write_dirs entries (not created): {'; '.join(absent)}.",
                            severity="low", every_s=86400)
-            # The project's own host-reaching commands, freed by name like ssh (fencefree).
-            freed, left_out = fencefree.commands(self.p.base, (self.cfg.get("sandbox") or {}).get("fence_freed_commands"))
-            for why in left_out:
-                if why not in self._fence_freed_said:
-                    self._fence_freed_said.add(why)
-                    log(self.p, f"sandbox.fence_freed_commands: left out {why}")
-            argv, sandboxed = prov.fence_args(argv, roots, cwd=str(cwd), on=fence_on,
-                                            restrictions=restrictions, freed=freed)
-            if sandboxed and prov.fence_by_name and freed:
-                env = {**env, fencefree.ENV: " ".join(freed)}   # the hook checks them as ssh
-            if fence_on and not sandboxed and prov.fence_optional and prov.write_fence(restrictions):
-                # One keyed issue per provider (screen.py), never a wake per run. Only an optional fence
-                # (one a missing dependency stops): Cursor runs unfenced by design outside no_internet.
-                self.observe("daemon:write-fence", f"{provider} workers run unfenced: {prov.write_fence(restrictions)}; install "
-                             f"it or set providers.{provider}.write_fence false", "low", whole=True,
-                             key=f"write-fence:{provider}")
-            if sandboxed and prov.loopback_forward:
-                # Host loopback ports stay reachable from the sandbox's own network namespace (loopproxy).
-                from .loopproxy import ports_env
-                env = {**env, **ports_env(self.cfg["providers"].get(provider, {}).get("loopback_ports"))}
+            argv, sandboxed = prov.fence_args(argv, roots, cwd=str(cwd), restrictions=restrictions)
             loaded = prov.plugin_args([d for d in dirs if d not in missing])
             self._alert_plugins_dropped(prov, provider, [d for d in dirs if d not in missing], loaded)
             extra = loaded
@@ -4225,9 +4165,6 @@ class Daemon:
                     tmp = run_dir / "tmp"
                     tmp.mkdir(exist_ok=True)
                 tmp_env = {var: str(tmp) for var in ("TMPDIR", "TMP", "TEMP")}
-                tmp_env["TTP_SANDBOXED"] = "1"   # privlock.sandboxed_run
-                if prov.fence_by_name:
-                    tmp_env["TTP_FENCE_BY_NAME"] = "1"
             glm_env = glmguard.run_env(provider, note, glmguard.device_task(task, self.cfg))
             if glm_env:   # a run under the GLM guards writes scratch files where its guard lets it (glmguard.scratch_env)
                 tmp_env.update(glmguard.scratch_env(run_dir, tmp_env))
@@ -4335,7 +4272,6 @@ class Daemon:
                    **coordroute.guard_env(note),   # so does a routine coordinator lane or shadow turn
                    **glm_env,   # every run on the chat model, whatever route sent it there
                    "TTP_PYTHON": sys.executable,   # `ttp` runs under this, not the venv's python3
-                   "TTP_SANDBOX_CHECKS": os.environ.get("TTP_SANDBOX_CHECKS", "0"),   # sandbox.opted_in
                    "TTP_REFUSE_SUDO": os.environ.get("TTP_REFUSE_SUDO", "0"),   # sudowatch.refusing
                    # Tests run straight in its shell take at most one run's share of the host's test slots.
                    **(testslots.worker_env(self.cfg) if role in ("worker", "reviewer") else {}),
@@ -4388,8 +4324,6 @@ class Daemon:
             stall = self.cfg["budget"].get("stall_s", {}).get(tier) if role != "coordinator" else None
             spec = {"argv": argv, "env": env, "cwd": cwd, "timeout_s": tout, "provider": provider, "stall_s": stall,
                     "sandbox": prov.launch_sandbox(argv) or "none",   # read from argv: what a verifier checks
-                    "sandbox_state": sandboxstate.run_summary(prov.launch_sandbox(argv), fence_on, fence_why,
-                                                              restrictions),
                     "model": model, "effort": effort,
                     **({"pin": pin, "pin_verify": (task or {}).get("pin_verify")
                         or self.cfg["runner"]["pin_verify"]} if pin else {}),
@@ -4474,8 +4408,7 @@ class Daemon:
                          f"(run class {(note or {}).get(runclass.KEY) or '-'}): reviews must run on the core provider",
                          "high", whole=True, key="review-on-glm")
         log(self.p, f"run {run_id} start role={role} provider={provider} tier={tier} task={task and task['id']} "
-                    f"sandbox={prov.launch_sandbox(argv) or 'none'} "
-                    f"({sandboxstate.run_summary(prov.launch_sandbox(argv), fence_on, fence_why, restrictions)})")
+                    f"sandbox={prov.launch_sandbox(argv) or 'none'}")
         return run_id
 
     def _run_dir(self, r: dict) -> Path:

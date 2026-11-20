@@ -9,11 +9,11 @@ The same events carry the account's plan windows (`rate_limits`), so a running r
 with each model call; the app-server meter, read every few minutes, covers the time between.
 
 Write fence (from the docs; Codex was not installed where this was probed). Workers run in
-`danger-full-access` by default: no sandbox. A project that sets `providers.codex.write_fence: true`, or
-has the no_internet restriction, runs them in `workspace-write` (fence_args): they write their cwd, temp
-dirs and `writable_args` roots. Coordinator turns likewise drop `-s read-only` for `danger-full-access`
-unless the same key is on (read_only_args); the daemon applies their output only through its action gates
-and logs a turn that changed files (coordwrites).
+`danger-full-access` by default: no sandbox. A project that has the no_internet restriction runs them
+in `workspace-write` (fence_args): they write their cwd, temp dirs and `writable_args` roots. Coordinator
+turns likewise drop `-s read-only` for `danger-full-access` unless no_internet is set (read_only_args);
+the daemon applies their output only through its action gates and logs a turn that changed files
+(coordwrites).
 
 | Question | Linux | macOS |
 | :- | :- | :- |
@@ -491,11 +491,10 @@ class Codex(Provider):
     def write_fence(self, restrictions=None) -> str:
         return ""   # workspace-write: Seatbelt on macOS, bubblewrap or the bundled helper on Linux
 
-    fence_optional = True   # workspace-write only on request (providers.codex.write_fence) or under no_internet
-
-    def fence_args(self, argv, dirs, cwd="", on=True, restrictions=None, freed=()):
-        if on or (restrictions or {}).get("no_internet"):
-            return super().fence_args(argv, dirs, cwd, on, restrictions, freed)
+    def fence_args(self, argv, dirs, cwd="", restrictions=None):
+        # workspace-write only under no_internet
+        if (restrictions or {}).get("no_internet"):
+            return super().fence_args(argv, dirs, cwd, restrictions)
         if "workspace-write" not in argv:
             return argv, False
         argv = list(argv)
@@ -505,10 +504,10 @@ class Codex(Provider):
             del argv[i - 1:i + 1]
         return argv, False
 
-    def read_only_args(self, argv, on=False, restrictions=None):
-        # `-s read-only` only with the opt-in fence or no_internet; the daemon's action gates apply the output.
+    def read_only_args(self, argv, restrictions=None):
+        # `-s read-only` only under no_internet; the daemon's action gates apply the output.
         i = next((k for k in range(1, len(argv)) if argv[k] == "read-only" and argv[k - 1] == "-s"), None)
-        if on or (restrictions or {}).get("no_internet") or i is None:
+        if (restrictions or {}).get("no_internet") or i is None:
             return argv
         return argv[:i] + ["danger-full-access"] + argv[i + 1:]
 
@@ -517,8 +516,8 @@ class Codex(Provider):
         mode = argv[i + 1] if i is not None and i + 1 < len(argv) else ""
         return super().launch_sandbox(argv) or ("" if mode in ("", "danger-full-access") else f"codex-{mode}")
 
-    def fenced(self, on=True, restrictions=None):
-        return on or bool((restrictions or {}).get("no_internet"))
+    def fenced(self, restrictions=None):
+        return bool((restrictions or {}).get("no_internet"))
 
     def _events(self, output_path: Path):
         try:

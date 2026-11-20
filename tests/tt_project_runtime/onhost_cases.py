@@ -78,14 +78,13 @@ def test_a_notify_keeps_held_worker_notifies_only_its_status_line_names(env):
 
 
 def test_the_same_claim_after_the_lock_grant_is_sent_unchanged(env, monkeypatch):
-    from ttp import cli, coordinator as coord, onhost, privlock
+    from ttp import cli, coordinator as coord, onhost
     p = make(env)
     tid = _oh_task(p, status="running")
     d = _oh_run(p, tid, env)
     # A running worker that holds no lock yet is waiting, not on the host.
     assert onhost.state(p, p.db.task(tid))["line"].startswith("worker running, waiting for box1-device since ")
     # The grant itself writes the record: `ttp lock` inside the task's run.
-    monkeypatch.setattr(privlock, "no_new_privs", lambda: None)
     monkeypatch.setenv("TTP_PROJECT", str(p.base))
     monkeypatch.setenv("TTP_TASK", str(tid))
     monkeypatch.setenv("TTP_RUN_DIR", str(d))

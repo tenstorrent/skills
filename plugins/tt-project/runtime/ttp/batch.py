@@ -2676,8 +2676,6 @@ class Batch:
         if slow:
             slow.unlink(missing_ok=True)   # this head's run only
         try:
-            for line in push.sandbox_lines([cmd for cmd, _, _ in run]):
-                say(line)
             for n, (cmd, eid, parts) in enumerate(run):
                 resume = (pushpass.resume_file(self.p, tree, str(cmd), eid)
                           if tree and pushpass.resumable(cmd) and not push.remote_host(cmd) else None)

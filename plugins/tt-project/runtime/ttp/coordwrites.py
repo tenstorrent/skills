@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Whether a coordinator turn changed files: a model-free detector in place of a sandbox.
 
-Coordinator turns run unsandboxed by default (no Codex `-s read-only` unless providers.<name>.write_fence
-is true); the daemon applies their output only through its action gates. The daemon takes a cheap
+Coordinator turns run unsandboxed by default (no Codex `-s read-only` unless the no_internet restriction
+is set); the daemon applies their output only through its action gates. The daemon takes a cheap
 snapshot of the project's harness folder and its repo checkout before each coordinator turn and again
 when the turn ends, before it applies the turn's output, and logs a warning when they differ. A folder
 that is the top of a git work tree is read as `git status --porcelain`, any other as the mtimes of its

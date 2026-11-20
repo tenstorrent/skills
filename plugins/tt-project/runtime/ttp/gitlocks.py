@@ -21,11 +21,6 @@ live process that started before the lock was written works in the repository (i
 or GIT_DIR inside it): git may close a ref lock before renaming it into place, so an open-file check
 alone does not prove a lock abandoned, while a process started after the lock cannot own it. Without
 /proc it does nothing. Moved locks go to `<common dir>/ttp-stale-locks/<stamp>/`, never deleted.
-One config.lock is also swept there: the empty read-only placeholder a sandbox (bwrap) bind-mounts for
-each sandboxed command, which a killed run leaves behind and which then blocks every `git config` write.
-It counts as stale only when it is empty, has no write bits, is older than root_ref_lock_s, no process has
-it open and no live git process working in the repository started before it. git itself writes
-config.lock writable, so a non-empty, writable, young or open one is never touched.
 Beyond the harness, only these ref locks are ever touched, never a user's checkout or a task's worktree.
 """
 from __future__ import annotations
@@ -231,20 +226,6 @@ def ref_locks(cdir: Path, now: float, min_age_s: float) -> list[tuple[Path, floa
     return sorted(out)
 
 
-def config_placeholder(cdir: Path, now: float, min_age_s: float) -> list[tuple[Path, float]]:
-    """[(path, age s)] of the common dir's config.lock when it is a sandbox's leftover placeholder: a
-    regular empty file with no write bits older than min_age_s; else []."""
-    path = Path(cdir) / "config.lock"
-    try:
-        st = path.lstat()
-    except OSError:
-        return []
-    if (stat.S_ISREG(st.st_mode) and st.st_size == 0 and not st.st_mode & 0o222
-            and now - st.st_mtime > min_age_s):
-        return [(path, now - st.st_mtime)]
-    return []
-
-
 def _boot_time(proc: str) -> float | None:
     try:
         line = next(x for x in Path(f"{proc}/stat").read_text().splitlines() if x.startswith("btime "))
@@ -328,7 +309,7 @@ def ref_lock_holder(lock: Path, mtime: float, roots: list[Path], table: list[dic
 
 def clear_root_refs(repo: Path, min_age_s: float = ROOT_STALE_S, now: float | None = None,
                     proc: str = "/proc") -> tuple[list[tuple[Path, float, Path]], list[tuple[Path, float, str]]]:
-    """Move the stale ref locks and a stale config.lock placeholder (config_placeholder) of the repository
+    """Move the stale ref locks of the repository
     at `repo` (its common git dir when it is a linked worktree) aside to keep_dir() of that dir: (moved as
     (old path, age s, new path), kept as (path, age s, holder-check result)) for locks past min_age_s.
     Without `proc` (/proc) nothing is checked or moved."""
@@ -339,22 +320,19 @@ def clear_root_refs(repo: Path, min_age_s: float = ROOT_STALE_S, now: float | No
         return [], []
     cdir = common_dir(gdir)
     now = time.time() if now is None else now
-    locks = ref_locks(cdir, now, min_age_s) + config_placeholder(cdir, now, min_age_s)
+    locks = ref_locks(cdir, now, min_age_s)
     if not locks:
         return [], []
     roots = [Path(repo).resolve(), cdir.resolve()]
     table = _proc_table(proc)
     dest, moved, kept = keep_dir(cdir, now), [], []
     for path, age in locks:
-        config = path.name == "config.lock" and path.parent == cdir
-        why = ref_lock_holder(path, now - age, roots, table, git_only=config)
+        why = ref_lock_holder(path, now - age, roots, table)
         if why:
             kept.append((path, age, why))
             continue
         try:
             if now - path.lstat().st_mtime <= min_age_s:   # written again since: a live holder
-                continue
-            if config and not config_placeholder(cdir, now, min_age_s):   # git took it over since
                 continue
             to = dest / path.relative_to(cdir)
             to.parent.mkdir(parents=True, exist_ok=True)

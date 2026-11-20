@@ -751,7 +751,6 @@ _PRINT_JEV = ("import os, sys; v = os.environ['JK']; print('jk=' + v); print('er
 
 def test_secret_env_gives_a_built_in_secret_only_by_its_field(env, monkeypatch, capfd):
     _jev_store(env, monkeypatch, capfd)
-    monkeypatch.delenv("SANDBOX_RUNTIME", raising=False)
     code, out = _env_run(monkeypatch, capfd, "--secret", "jev:key=JK", "--", sys.executable, "-c", _PRINT_JEV)
     assert code == 5 and "jk=[secret:jev]" in out and "err=[secret:jev]" in out, out
     assert f"len {len(_JEV_KEY)}" in out and _JEV_KEY not in out
@@ -766,15 +765,16 @@ def test_secret_env_gives_a_built_in_secret_only_by_its_field(env, monkeypatch, 
 
 
 def _sandboxed_run(env, monkeypatch, capfd, *argv, p=None, run="9001"):
-    """`ttp secret env ...` as a sandboxed worker of a project runs it, the daemon's tick (detach.tend)
-    running beside it: (exit code, output, run folder, project)."""
+    """`ttp secret env ...` as a worker of a project that cannot read the secrets store runs it, the
+    daemon's tick (detach.tend) running beside it: (exit code, output, run folder, project)."""
     import threading
     from ttp import detach, secretroute
     p = p or make(env)
     rd = p.runs / run
     rd.mkdir(parents=True)
-    for k, v in (("TTP_RUN_DIR", str(rd)), ("SANDBOX_RUNTIME", "1"), ("TTP_TASK_ID", "77"), ("TTP_RUN_ID", run)):
+    for k, v in (("TTP_RUN_DIR", str(rd)), ("TTP_TASK_ID", "77"), ("TTP_RUN_ID", run)):
         monkeypatch.setenv(k, v)
+    monkeypatch.setattr(secretroute, "_store_denied", lambda: True)   # the served copy reads it
     monkeypatch.delenv(secretroute.SERVED_ENV, raising=False)
     monkeypatch.setattr(secretroute, "POLL_S", 0.05)
     monkeypatch.setattr(secretroute, "START_WAIT_S", 30)   # a broken tick fails, never hangs
@@ -852,22 +852,21 @@ def test_secret_env_outside_a_sandbox_runs_the_command_itself(env, monkeypatch, 
     rd = p.runs / "9002"
     rd.mkdir(parents=True)
     monkeypatch.setenv("TTP_RUN_DIR", str(rd))
-    monkeypatch.delenv("SANDBOX_RUNTIME", raising=False)
-    monkeypatch.setattr(detach, "enqueue", lambda *a, **k: pytest.fail("queued outside a sandbox"))
+    monkeypatch.setattr(detach, "enqueue", lambda *a, **k: pytest.fail("queued with a readable store"))
     code, out = _env_run(monkeypatch, capfd, "--secret", "jev:key=JK", "--", sys.executable, "-c", _PRINT_JEV)
     assert code == 5 and "jk=[secret:jev]" in out and "daemon" not in out and not (rd / "detached.json").exists()
     assert not (p.state / "secret-uses.jsonl").exists()
 
 
 def _queued_route(env, monkeypatch, capfd, run):
-    """A sandboxed worker's run folder with no daemon running: (project, run folder)."""
+    """The run folder of a worker that cannot read the secrets store, with no daemon running: (project, run folder)."""
     from ttp import secretroute
     _jev_store(env, monkeypatch, capfd)
     p = make(env)
     rd = p.runs / run
     rd.mkdir(parents=True)
     monkeypatch.setenv("TTP_RUN_DIR", str(rd))
-    monkeypatch.setenv("SANDBOX_RUNTIME", "1")
+    monkeypatch.setattr(secretroute, "_store_denied", lambda: True)
     monkeypatch.delenv(secretroute.SERVED_ENV, raising=False)
     monkeypatch.setattr(secretroute, "POLL_S", 0.01)
     return p, rd
@@ -1220,7 +1219,7 @@ def test_doctor_reports_an_unreadable_secret_store_in_one_line_and_runs_its_late
     assert len(lines) == 1 and lines[0].startswith(f"jev: key unknown, cannot read the secrets store at {store}: "), out
     assert _EP_KEY not in out, out
     assert "host-run: runner.host_commands entry 1" in out, "doctor runs on to the host-run checks"
-    assert "process sandbox for checks:" in out, "and on to the checks after them"
+    assert "pinned memory: " in out, "and on to the checks after them"
 
 
 # Private-key blocks never reach a run's files, records, outbox or views (redact.KEY_RE). Every key here is
@@ -1846,11 +1845,10 @@ def test_hook_refuses_runs_that_read_the_run_time_store_directly(env, monkeypatc
 
 
 def _fresh_masking(monkeypatch):
-    """A process that never read the store (a run, a hook), outside a sandboxed run."""
+    """A process that never read the store (a run, a hook)."""
     from ttp import redact
     monkeypatch.setattr(redact, "_cache", {"sig": None, "pairs": [], "error": None, "ever": False})
-    for var in ("TTP_RUN_DIR", "SANDBOX_RUNTIME"):
-        monkeypatch.delenv(var, raising=False)
+    monkeypatch.delenv("TTP_RUN_DIR", raising=False)
     return redact
 
 

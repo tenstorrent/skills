@@ -102,7 +102,6 @@ from . import (   # one name per line: two changes adding names merge without a 
     routinedefault,
     rulecite,
     runcap,
-    sandboxstate,
     selfreview,
     reviewreuse,
     selfblock,
@@ -382,27 +381,6 @@ def _checks_slots(v):
     return n
 
 
-def _loopback_ports(key: str, v) -> list[int] | bool:
-    """False for "false", "off", "no" or "0"; else ports from 1 to 65535, comma or space separated."""
-    if isinstance(v, bool):
-        if v:
-            raise ValueError(f"{key}: give ports (e.g. 8080,9000) or false")
-        return False
-    if isinstance(v, list):
-        items = v
-    elif str(v).strip().lower() in ("false", "off", "no", "0"):
-        return False
-    else:
-        items = str(v).replace(",", " ").split()
-    try:
-        ports = [int(p) for p in items if not isinstance(p, bool)]
-    except (TypeError, ValueError):
-        ports = []
-    if not ports or len(ports) != len(items) or any(not 0 < p < 65536 for p in ports):
-        raise ValueError(f"{key}: give ports from 1 to 65535 (e.g. 8080,9000) or false")
-    return list(dict.fromkeys(ports))
-
-
 def _count(key: str, v, top: int) -> int:
     """A whole number from 0 to `top` (seconds or a count)."""
     try:
@@ -552,10 +530,6 @@ USER_SETTABLE = {
     "providers.codex.worker_isolation": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     # Unset, chat takes the claude value (project.CHAT_INHERITS); set, it wins.
     "providers.chat.worker_isolation": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
-    # The worker sandbox and the checks' process sandbox: false (unsandboxed) is anyone's; true only the user's
-    # own (SANDBOX_KEYS): config_set refuses it, the web settings page the user drives sets it.
-    **{f"providers.{n}.write_fence": lambda v: str(v).lower() in ("1", "true", "yes", "on") for n in chatset.PROVIDERS},
-    "sandbox.checks": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     # MCP servers from the user's own Claude config that isolated workers still get, by name.
     "providers.claude.mcp_servers": lambda v: name_list(v, strict=True),
     # Connected MCP servers kept from workers on purpose: ttp status no longer names them (mcpgap.py).
@@ -563,10 +537,6 @@ USER_SETTABLE = {
     # Milliseconds a run that keeps the claude.ai connectors waits for them at start (unset: 20000).
     **{f"providers.{n}.connect_timeout_ms": (lambda k: lambda v: _connect_timeout(k, v))(f"providers.{n}.connect_timeout_ms")
        for n in ("claude", "chat")},
-    # Host loopback ports fenced workers reach besides the host's listeners and ssh tunnel ends, or
-    # false to forward none (loopproxy.ports_env). Unset, chat takes the claude value.
-    "providers.claude.loopback_ports": lambda v: _loopback_ports("providers.claude.loopback_ports", v),
-    "providers.chat.loopback_ports": lambda v: _loopback_ports("providers.chat.loopback_ports", v),
     # Tools workers and reviewers may not call, on top of the built-in denylist (mcp__<server>__*).
     "providers.claude.disallowed_tools": lambda v: tool_list(v, strict=True),
     # Hours before an unanswered ask resolves to its default (askauto.py, expire_asks); 0 turns it off.
@@ -1919,15 +1889,8 @@ NEEDS_USER = {"budget.daily_usd": "spend", "budget.weekly_usd": "spend", "budget
               "delivery.allow_protected_push_branch": "restriction", "delivery.own_push": "restriction",
               "delivery.rebase_replace": "restriction", "delivery.never_force": "restriction",
               MERGE_KEY: "merge", relay.AGENT_KEY: "restriction", restriction_source.OWNER_IDS_KEY: "restriction"}
-# The keys that turn namespace sandboxing on (the worker write fence, providers.<name>.write_fence, and the
-# checks' process sandbox, sandbox.checks) are the user's: their harness-wide order runs everything
-# unsandboxed and no project turns it back on by its own decision. Only the user's own word turns one on
-# (`ttp config` in their own shell, the web settings page): a run's `ttp config` and every coordinator
-# config_set refuse the on value, also in a turn carrying a user message; false or unset is anyone's.
-SANDBOX_KEYS = {f"providers.{n}.write_fence" for n in chatset.PROVIDERS} | {"sandbox.checks"}
-NEEDS_USER.update(dict.fromkeys(SANDBOX_KEYS, "restriction"))
-# restrictions.no_internet also turns sandboxing on (Codex workspace-write and read-only, Cursor --sandbox) and
-# is a Restriction: a run changes it in neither direction, as clearing it loosens one (not SAFE_WHEN_OFF).
+# restrictions.no_internet turns the Codex/Cursor sandbox on (Codex workspace-write and read-only, Cursor --sandbox)
+# and is a Restriction: a run changes it in neither direction, as clearing it loosens one (not SAFE_WHEN_OFF).
 NEEDS_USER["restrictions.no_internet"] = "restriction"
 # Routine coordinator wakes on the chat model (coordroute.py) start only on the user's own word (`ttp config` in
 # their shell); turning them off ("" or false) is anyone's.
@@ -1936,20 +1899,8 @@ NEEDS_USER["coordinator.routine.mode"] = "restriction"
 NEEDS_USER["guards.off"] = "restriction"
 
 
-def sandbox_on(value) -> bool:
-    """Whether a value written at a SANDBOX_KEYS key may turn the sandbox on: anything but a plain off value
-    (None or '' unset it; a reader such as the write fence counts only `false` as off, so 9 is on)."""
-    return not (value is None or value is False or str(value).strip().lower() in ("", "0", "false", "no", "off"))
-
-
-def sandbox_refusal(key: str) -> str:
-    return (f"{key} turns namespace sandboxing on, a setting only the user may change: only the user's own word "
-            f"turns it on (`ttp config` in their own shell, or the web settings page), never a run or the "
-            f"coordinator; its off value (false, or '' to unset) may be set by anyone")
-
-
 NEEDS_USER["coordinator.session.tools"] = "restriction"   # read_only, its safe side, needs no word
-SAFE_WHEN_OFF = {*SANDBOX_KEYS, "coordinator.session.tools", relay.AGENT_KEY, "delivery.code_tasks_may_push", "budget.reset_credits_auto", "delivery.backup_remote", "delivery.fast_forward_also",
+SAFE_WHEN_OFF = {"coordinator.session.tools", relay.AGENT_KEY, "delivery.code_tasks_may_push", "budget.reset_credits_auto", "delivery.backup_remote", "delivery.fast_forward_also",
                  "delivery.mirror_remotes",
                  "delivery.allow_protected_push_branch", "delivery.own_push", "delivery.rebase_replace",
                  "delivery.never_force", "coordinator.routine.mode", "guards.off"}
@@ -1957,8 +1908,7 @@ SAFE_WHEN_OFF = {*SANDBOX_KEYS, "coordinator.session.tools", relay.AGENT_KEY, "d
 # spend and access are hard gates, the merge list speaks as the owner, the rest change what may land on or
 # overwrite a branch other people use. The agent-orders trust itself is the owner's to turn on.
 HELD_SETTING = {k: {"spend": "gate", "access": "gate", "merge": "speaks"}.get(v, "people")
-                for k, v in NEEDS_USER.items() if k != relay.AGENT_KEY and k not in SANDBOX_KEYS
-                and k != "sandbox.checks"}
+                for k, v in NEEDS_USER.items() if k != relay.AGENT_KEY}
 # The value that turns a SAFE_WHEN_OFF key off (the safe side), where it is not False, "" or [].
 OFF_VALUE = {"coordinator.session.tools": "read_only", "delivery.own_push": "off", "delivery.rebase_replace": "new_branch", "delivery.never_force": True}
 
@@ -4207,8 +4157,6 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 # routing key (chatset) its own check, so no routed tier loses its model or endpoint.
                 remove = a.get("value") == "" and key in USER_SETTABLE and key not in accountset.KEYS
                 value = None if remove else conv(a.get("value"))
-                if key in SANDBOX_KEYS and sandbox_on(value):
-                    raise ValueError(sandbox_refusal(key))
                 chatset.route_ready(cfg, key, value)
                 if key == "delivery.backup_remote" and (why := push.backup_problem({**(cfg.get("delivery") or {}),
                                                                                     "backup_remote": value})):
@@ -4236,9 +4184,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 # Removing a user-only key is safe only where its default is off (none of OFF_VALUE's keys).
                 off = (key not in OFF_VALUE and _default_of(key) in (None, False, "", [])) if remove else (
                     (value == OFF_VALUE[key]) if key in OFF_VALUE else value in (False, "", []))
-                # A superseded sandbox value (sandboxstate) is ignored by runs already: clearing it changes nothing.
-                if key in NEEDS_USER and not by_user and not (key in SAFE_WHEN_OFF and off) and not (
-                        (remove or value is False) and sandboxstate.clears_superseded(p, key, None if remove else False)):
+                if key in NEEDS_USER and not by_user and not (key in SAFE_WHEN_OFF and off):
                     if key in HELD_SETTING and relay.agent_orders(cfg) and messages and relay.recent(db, messages):
                         raise ValueError(relay.held_refusal(f"config_set {key}", HELD_SETTING[key], key,
                                                             "the setting name (HELD_SETTING)"))
@@ -7897,7 +7843,7 @@ _MONEY_RE = re.compile(r"\$|\b(?:budget|spend\w*|usd|dollars?|funds?|billing|pai
 
 def _names_needs_user(said: str) -> bool:
     """True when the text names a setting only the user may change (NEEDS_USER), by key or by its last part. A
-    last part that is a plain word (off, mode, checks) counts only after its parent ("guards off", "sandbox checks"),
+    last part that is a plain word (off, mode, checks) counts only after its parent ("guards off"),
     so "turn it off" names no setting."""
     low = said.lower()
     for k in NEEDS_USER:

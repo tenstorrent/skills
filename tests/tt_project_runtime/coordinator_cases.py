@@ -18,7 +18,6 @@ def test_coordinator_actions_are_validated(env):
     assert any("unknown action" in x for x in probs)
 
 
-
 def test_digest_lists_tasks_held_on_one_ask_or_resource_on_one_line(env):
     """Blocked tasks held on the same ask or resource are one digest line listing their ids, not one
     line each; a lone hold keeps its own line."""
@@ -42,7 +41,6 @@ def test_digest_lists_tasks_held_on_one_ask_or_resource_on_one_line(env):
     assert f"- #{alone} | blocked | " in d and "lone hold" in d, d
 
 
-
 def test_unblock_with_several_open_asks_the_resolve_record_links_the_reply(env):
     from ttp import coordinator as coord, unblock
     p, now, msg = _ask_db(env)
@@ -60,7 +58,6 @@ def test_unblock_with_several_open_asks_the_resolve_record_links_the_reply(env):
     msg("in", "later chat", -10)
     rows = {r["id"]: r for r in unblock.asks(p.db, now - 86400, now + 60)}
     assert not rows[a2]["answered"], "a reply after the ask was resolved was linked to it"
-
 
 
 def test_many_self_waits_keep_the_turn_routine_and_repeated_external_waits_raise_it(env):
@@ -98,7 +95,6 @@ def test_many_self_waits_keep_the_turn_routine_and_repeated_external_waits_raise
     for n in range(8):
         wait(loop, {"waiting_for": f"board-a (try {n})", "retry_when": "ttp lock --probe board-a"})
         assert coord.effort_triggers(db, cfg, [], None)[0] == ([] if n < 7 else ["repeated waits"])
-
 
 
 def test_repeated_waits_raise_on_a_new_reason_an_old_stint_or_the_count_not_on_wakes_or_noise(env):
@@ -172,7 +168,6 @@ def test_repeated_waits_raise_on_a_new_reason_an_old_stint_or_the_count_not_on_w
     assert str(t) not in trig()[1]["waits"]
 
 
-
 def test_repeated_waits_raise_once_on_a_changed_probe_or_owner_and_the_backstop_once_per_stint(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -242,7 +237,6 @@ def test_repeated_waits_raise_once_on_a_changed_probe_or_owner_and_the_backstop_
     assert turn() == ["repeated waits"]
     wait(loop, "test -e /m", "")
     assert turn() == []
-
 
 
 def test_waits_on_live_detach_jobs_or_locks_stay_routine_until_capped_or_stalled(env):
@@ -316,7 +310,6 @@ def test_waits_on_live_detach_jobs_or_locks_stay_routine_until_capped_or_stalled
     assert coord.wait_stint(db, ended, now, 2)[1] == []
 
 
-
 def test_the_turn_gate_never_skips_a_batch_that_raises_the_coordinators_effort(env, monkeypatch):
     """A cost gate must not bypass a safety trigger: a batch with an event of an effort kind
     (coordinator.UNBLOCK_KINDS), or one coordinator.effort_triggers finds tricky (a task failing again),
@@ -382,7 +375,6 @@ def test_the_turn_gate_never_skips_a_batch_that_raises_the_coordinators_effort(e
     assert turngate.skipped(p.db, 0)["n"] == 1
 
 
-
 def test_a_watcher_opening_many_issues_on_one_subject_is_warned_about_without_a_wake(env, monkeypatch):
     from ttp import coordinator as coord
     from ttp import daemon as dm
@@ -438,7 +430,6 @@ def test_a_watcher_opening_many_issues_on_one_subject_is_warned_about_without_a_
     assert "Noisy command watchers" in prompt
 
 
-
 def test_observation_mute_counts_without_waking_and_ends_with_one_summary(env, monkeypatch):
     p = make(env)
     from ttp import coordinator as coord
@@ -484,7 +475,6 @@ def test_observation_mute_counts_without_waking_and_ends_with_one_summary(env, m
     assert len(wakes()) == 5
 
 
-
 def test_observation_mute_rejects_bad_input(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -501,7 +491,6 @@ def test_observation_mute_rejects_bad_input(env):
     assert coord.apply(p, [ok, {**ok, "match": "DROPPED", "hours": 8, "below": "high"}]) == []
     [m] = scr.mutes(p.db)
     assert m["below"] == "high" and m["until"] > time.time() + 7 * 3600
-
 
 
 def test_a_throughput_class_mute_needs_an_owner_and_is_bounded(env):
@@ -668,7 +657,6 @@ def test_a_mute_with_an_end_when_probe_ends_on_its_pass_and_reports_a_broken_pro
     d._mute_ends.stop()
 
 
-
 def test_a_mute_whose_match_names_one_open_task_with_a_probe_takes_it_as_its_owner(env):
     p = make(env)
     from ttp import screen as scr
@@ -807,7 +795,6 @@ def test_mute_escalates_once_when_a_muted_condition_persists(env):
     assert len(asks()) == 3 and "box-b" in asks()[-1]["text"]
 
 
-
 def test_mute_escalation_skips_cleared_conditions_and_honours_never(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -848,7 +835,6 @@ def test_mute_escalation_skips_cleared_conditions_and_honours_never(env):
         scr.count_muted(p.db, "watcher:y", "box-a: tray dropped", "high", now=at)
     assert len(asks()) == 2 and "watcher:y" in asks()[-1]["text"]
     assert "never asks" in scr.mute_line(never, t1 + 8 * 3600)
-
 
 
 def test_a_hold_mute_never_stays_silent_past_its_cap(env):
@@ -897,7 +883,6 @@ def test_a_hold_mute_never_stays_silent_past_its_cap(env):
     for at in (t0 + i * 1800 for i in range(17)):
         scr.count_muted(p.db, "watcher:so", f"host-a: {sock}", "high", now=at, key="socket_dir_junk")
     assert asks("watcher:so") == []
-
 
 
 def test_mute_replay_of_a_held_box_wakes_the_coordinator_an_hour_in(env, monkeypatch):
@@ -973,7 +958,6 @@ def test_a_muted_hold_asks_within_its_cap_and_never_stops_the_outage_task(env, m
     assert tasks == [(60, "beta")], tasks
 
 
-
 @pytest.mark.parametrize("var", ["TTP_RUN_ID", "TTP_RUN_DIR"])
 def test_config_refuses_user_only_keys_inside_a_run(env, capsys, monkeypatch, var):
     """A run can be steered by text it reads, so `ttp config` inside one refuses every setting only
@@ -1039,7 +1023,6 @@ def test_account_config_reads_and_sets_a_key(env, capsys, tmp_path):
     assert json.loads(capsys.readouterr().out) == [path]
 
 
-
 @pytest.mark.parametrize("text", [
     "claude's OAuth token is stale; please log in again.",
     "Please run /login in claude again.",
@@ -1060,7 +1043,6 @@ def test_an_agent_cli_login_ask_without_metering_is_still_refused(env, text):
     from ttp import coordinator as coord
     p = make(env)
     assert "no agent CLI here is logged out" in coord._false_login_ask(p.db, text, p.config())
-
 
 
 def test_wakes_that_hand_back_the_same_wait_run_light_then_go_to_the_coordinator(env, monkeypatch):
@@ -1111,7 +1093,6 @@ def test_wakes_that_hand_back_the_same_wait_run_light_then_go_to_the_coordinator
     assert "no progress after 3 wakes" in p.db.task(tid)["blocked_reason"]
 
 
-
 def test_update_reaches_a_running_worker_once(env, tmp_path):
     p = make(env)
     from ttp import coordinator as coord
@@ -1135,7 +1116,6 @@ def test_update_reaches_a_running_worker_once(env, tmp_path):
     coord.apply(p, [{"type": "task_update", "id": tid, "spec": "and label every number with its board"}])
     second = hook()
     assert "label every number" in second and "use any free board" not in second
-
 
 
 def test_an_update_skips_subagents_and_waits_for_the_worker(env, tmp_path):
@@ -1168,7 +1148,6 @@ def test_an_update_skips_subagents_and_waits_for_the_worker(env, tmp_path):
     assert hook({"hook_event_name": "PostToolUse", "tool_name": "Bash"}) == ""
 
 
-
 def test_coordinator_prompt_prefix_is_byte_stable_across_turns_with_different_events(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -1182,7 +1161,6 @@ def test_coordinator_prompt_prefix_is_byte_stable_across_turns_with_different_ev
     assert coord.system_prompt(p) == coord.join_prompt(head, context)
     assert "# Role" in head and "# CHARTER" not in head, "the charter churns more than the rules"
     assert context.startswith("# CHARTER") and "builds run on box-a" in context
-
 
 
 def test_the_standing_sections_lead_the_cached_prompt_in_a_fixed_order_and_leave_the_digest(env):
@@ -1208,7 +1186,6 @@ def test_the_standing_sections_lead_the_cached_prompt_in_a_fixed_order_and_leave
     assert coord.digest(p, {}, [], []) != first and coord.prompt_parts(p) == (head, context)
     for d in (first, coord.digest(p, {}, [], [])):
         assert not any(x in d for x in ("## Charter sections", "## Delivery", "## Machines", "main board")), d
-
 
 
 def test_a_routine_digest_collapses_unchanged_background_and_keeps_what_decides_whole(env):
@@ -1280,7 +1257,6 @@ def test_a_routine_digest_collapses_unchanged_background_and_keeps_what_decides_
     size = coord.digest_size(short)
     assert size["chars"] == len(body) and size["tokens"] == (len(body) + 3) // 4
     assert set(size["sections"]) == set(keys)
-
 
 
 def _rows_fixture(p):
@@ -1415,7 +1391,6 @@ def test_a_coordinator_turn_records_its_digest_size_and_routine_turns_collapse(e
     assert k["note"]["triggers"] and "## Recurring\n" in prompt, "a triggered turn must see a changed section whole"
 
 
-
 def test_an_unchanged_machine_ledger_is_one_line_unless_a_machine_event_or_a_ledger_change(env, monkeypatch):
     p = make(env)
     from ttp.daemon import Daemon
@@ -1457,7 +1432,6 @@ def test_an_unchanged_machine_ledger_is_one_line_unless_a_machine_event_or_a_led
     assert "a second change" in prompt, "a changed ledger is shown whole"
     prompt, _ = turn("observation", "box-c is slow")
     assert "a second change" not in prompt and "2 open (as last turn)" in prompt
-
 
 
 def test_a_machine_ledger_turn_without_a_machine_event_shows_only_new_or_reworded_lines(env):
@@ -1521,7 +1495,6 @@ def test_a_machine_ledger_turn_without_a_machine_event_shows_only_new_or_reworde
     assert ledger(old)[0].endswith("(as last turn)")
 
 
-
 def test_a_whole_machine_ledger_view_is_capped_to_open_changes_and_a_count(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -1546,7 +1519,6 @@ def test_a_whole_machine_ledger_view_is_capped_to_open_changes_and_a_count(env):
     seen = {coord.LEDGER_SEEN_KEY: coord.ledger_section(p, p.db, None, True, time.time())[1]}
     assert coord.ledger_section(p, p.db, seen, False, time.time())[0] == [
         f"## Shared machines in your Resources: {n + 5 + 1 + 1 + 1} open (as last turn)"]
-
 
 
 def _coordinator_turns(env, monkeypatch, provider, step=600):
@@ -1620,7 +1592,6 @@ def test_a_release_or_memory_edit_keeps_the_cached_prompt_bytes_and_shows_in_the
     assert coord.RECENT_ADDED_HEADER not in sixth and coord.MEMORY_DIGEST_HEADER not in sixth
 
 
-
 def test_a_snapshot_from_before_recent_memory_was_cached_shows_it_all_in_the_digest(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -1631,7 +1602,6 @@ def test_a_snapshot_from_before_recent_memory_was_cached_shows_it_all_in_the_dig
     cached, delta = coord.recent_memory(p)
     assert cached == [] and delta[0] == coord.RECENT_ADDED_HEADER and "Picked the cheaper runner." in delta[1]
     assert "recent" not in p.db.kv(coord.PROMPT_SNAPSHOT_KEY), "an old snapshot is kept, not re-rendered"
-
 
 
 @pytest.mark.parametrize("provider", ["claude", "codex"])
@@ -1698,7 +1668,6 @@ def test_split_cached_keeps_a_fixed_order_and_the_rest_of_the_digest():
     assert coord.with_cached("CTX\n", "") == "CTX\n" and coord.with_cached("CTX\n", "R") == "CTX\n\nR\n"
 
 
-
 def test_the_host_line_names_each_reboot_a_lock_was_held_at_and_merges_one_holders_locks(env):
     p = make(env)
     from ttp import coordinator as coord, timefmt
@@ -1729,7 +1698,6 @@ def test_the_host_line_names_each_reboot_a_lock_was_held_at_and_merges_one_holde
     # Many reboots: only the latest times are listed.
     many = coord.held_at_reboots([{"ts": t0 + i * 60, "held": batch(i % 10)} for i in range(9)], p)
     assert many.startswith("push batch held at 9 reboots (…, ") and many.count(":") == coord.HELD_TIMES_SHOWN, many
-
 
 
 def test_auto_cache_ttl_goes_1h_when_the_prefix_changed(env, monkeypatch, tmp_path):
@@ -1878,7 +1846,6 @@ def test_cache_ttl_replay_of_recorded_gaps_cuts_unread_1h_writes_without_new_mis
     assert got == {"quiet": (66, 26, 21, 0), "busy": (204, 3, 3, 0)}, got
 
 
-
 def _turn_said(p, words: str) -> tuple[list[int], dict]:
     """A user message of this turn saying `words`, and a `source` quoting it: what a user turn that removes
     or replaces a cited Restrictions item carries (restriction_source.turn_quote)."""
@@ -1936,7 +1903,6 @@ def test_a_refused_charter_update_with_replaces_marks_its_own_action_refused(env
     assert applied == [1, 2, 3], applied
 
 
-
 def test_charter_update_merges_into_the_one_existing_section(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -1959,7 +1925,6 @@ def test_charter_update_merges_into_the_one_existing_section(env):
     # A retried turn adds nothing twice.
     assert coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": "Review first."}], turn=2) == []
     assert p.charter_path.read_text() == charter
-
 
 
 def test_charter_update_base_heading_goes_to_one_of_several_legacy_dated_sections(env):
@@ -1995,7 +1960,6 @@ def test_charter_update_base_heading_goes_to_one_of_several_legacy_dated_section
     assert "Push daily." in (p.harness / coord.CHARTER_HISTORY).read_text()
     assert "never replaced" in coord.apply(p, [{"type": "charter_update", "text": "x", "replaces": "1"}], turn=10)[0]
     assert "matches 0" in coord.apply(p, [{"type": "charter_update", "text": "x", "replaces": "9"}], turn=11)[0]
-
 
 
 def test_charter_update_quote_removes_or_replaces_one_item(env):
@@ -2038,7 +2002,6 @@ def test_charter_update_quote_removes_or_replaces_one_item(env):
     assert p.charter_path.read_text() == before
 
 
-
 def test_charter_update_quote_matches_whole_words_only(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -2051,7 +2014,6 @@ def test_charter_update_quote_matches_whole_words_only(env):
     assert p.charter_path.read_text() == before, "a quote inside a word was cut"
     assert coord.apply(p, [{**act, "quote": "Never merge", "text": "Never merge to main"}], turn=4) == []
     assert "## Policies\nNever merge to main.\nPush daily.\n" in p.charter_path.read_text()
-
 
 
 def test_charter_update_quote_finds_its_item_in_a_legacy_dated_section(env):
@@ -2083,7 +2045,6 @@ def test_charter_update_quote_finds_its_item_in_a_legacy_dated_section(env):
     assert "### Removed from Restrictions (added 2026-09-03) (" in hist.read_text()
 
 
-
 def test_charter_update_retried_turn_still_retires_the_first_section(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -2096,7 +2057,6 @@ def test_charter_update_retried_turn_still_retires_the_first_section(env):
     assert coord.apply(p, [act], turn=1) == []
     assert p.charter_path.read_text() == "## Goals\nShip v1.\n", "the retry took index 0 as already replaced"
     assert (p.harness / coord.CHARTER_HISTORY).read_text().count("Push daily.") == 1
-
 
 
 def test_charter_update_restriction_items_change_only_on_the_users_word(env, tmp_path):
@@ -2126,7 +2086,6 @@ def test_charter_update_restriction_items_change_only_on_the_users_word(env, tmp
     assert "Binding restriction retired: Never touch box A (user msg #1)." in (run_dir / "steer.md").read_text()
 
 
-
 def test_a_users_change_to_a_restriction_rewrites_the_item_in_place(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -2147,7 +2106,6 @@ def test_a_users_change_to_a_restriction_rewrites_the_item_in_place(env):
     assert "### Replaced in Restrictions (binding on every task) (" in hist
     assert "turn 4.0)\nNever push to the main branch.\nNow: Never push" in hist
     assert not p.db.q("SELECT id FROM events WHERE kind='charter_conflict'"), "an in-place edit is not a conflict"
-
 
 
 def test_a_users_loosening_of_a_restriction_names_the_tools_still_enforcing_the_old_item(env):
@@ -2430,7 +2388,6 @@ def test_an_append_that_contradicts_a_standing_restriction_is_rejected_quoting_i
     assert "three fixes" in err[0] and "Never drop a restriction the user did not change" in err[0], err
 
 
-
 _SELF_HEALING = ("Self-healing (prime directive): keep the project stable without the user. Keep checking "
                  "everything the project is responsible for (its workers, daemon, schedules, watchers and the "
                  "resources it manages) for anomalies, such as a dead worker, a disabled auto power cycle or a hold "
@@ -2439,11 +2396,9 @@ _SELF_HEALING = ("Self-healing (prime directive): keep the project stable withou
                  "dead, what should I do?' never reach the user.")
 
 
-
 _BANS = ("# demo\n\n## Restrictions\n- Push only to branch work/x of the repo. Never push to main.\n"
          "- Every change keeps the test suite green and the plugin validator passing.\n"
          "- Never disturb the other project's running jobs.\n- Never use a paused device.\n\n## Policies\nReview first.\n")
-
 
 
 def test_a_user_turn_duty_that_shares_words_with_bans_goes_in_with_its_source(env):
@@ -2482,7 +2437,6 @@ def test_a_user_turn_duty_that_shares_words_with_bans_goes_in_with_its_source(en
     assert "Every change keeps" not in err[0], "only the items the lifting sentence overlaps are named"
 
 
-
 def test_a_user_turn_loosening_via_quote_still_replaces_the_ban(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -2499,7 +2453,6 @@ def test_a_user_turn_loosening_via_quote_still_replaces_the_ban(env):
     assert "Never use a paused device." not in charter and "Use the device even when paused" in charter
     hist = (p.harness / coord.CHARTER_HISTORY).read_text()
     assert f"### Replaced in Restrictions (" in hist and f"user message #{said}, turn 2.0)" in hist, hist
-
 
 
 def test_charter_quote_names_one_whole_item_or_text_inside_one(env):
@@ -2538,7 +2491,6 @@ def test_charter_quote_names_one_whole_item_or_text_inside_one(env):
     assert "closest" not in coord.apply(p, [{**act, "quote": "Completely unrelated words here."}], turn=10)[0]
 
 
-
 def test_charter_item_quote_hits_take_one_item_and_nothing_across_items():
     from ttp.coordinator import _item_quote_hits, _quote_hits
     body = ("- Never push to main.\n- Keep content generic.\n- Never push to main.\n"
@@ -2555,7 +2507,6 @@ def test_charter_item_quote_hits_take_one_item_and_nothing_across_items():
         assert _item_quote_hits(body, quote) == [], quote
 
 
-
 def test_a_loose_charter_quote_across_two_items_is_refused_in_and_out_of_user_turns(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -2569,7 +2520,6 @@ def test_a_loose_charter_quote_across_two_items_is_refused_in_and_out_of_user_tu
         err = coord.apply(p, [a], turn=11 if kw else 12, **kw)
         assert len(err) == 1 and "matches 0 times" in err[0] and "closest: " in err[0], err
         assert p.charter_path.read_text() == before, p.charter_path.read_text()   # was "- Never push to zzz generic."
-
 
 
 def test_text_put_into_a_bullet_item_keeps_one_bullet_in_and_out_of_user_turns(env):
@@ -2601,11 +2551,9 @@ def test_text_put_into_a_bullet_item_keeps_one_bullet_in_and_out_of_user_turns(e
     assert f"\n- Keep content generic and safe. (user msg #{said})\n" in p.charter_path.read_text(), p.charter_path.read_text()
 
 
-
 def _retries(db):
     return [r["text"] for r in db.q("SELECT text FROM events WHERE kind='charter_retry' "
                                     "AND text NOT LIKE '%immediate retry%'")]
-
 
 
 def test_a_guard_refused_charter_change_is_never_raised_again(env):
@@ -2640,7 +2588,6 @@ def test_a_guard_refused_charter_change_is_never_raised_again(env):
         db.x("UPDATE events SET status='handled' WHERE kind='charter_retry'")
     db.set_kv(coord.CHARTER_RERAISE_KEY, {"version": coord.CHARTER_GUARD_VERSION - 1, "ts": t})
     assert coord.reraise_charter_changes(p, now=t + 3 * 86400) == [] and _retries(db) == []
-
 
 
 def test_another_failed_charter_change_is_raised_once(env):
@@ -2682,7 +2629,6 @@ def test_another_failed_charter_change_is_raised_once(env):
     assert coord.reraise_charter_changes(p, now=time.time() + 8 * 86400) == [] and len(_retries(db)) == 2
 
 
-
 def test_a_charter_guard_source_change_needs_a_version_bump():
     import hashlib
     import inspect
@@ -2693,7 +2639,6 @@ def test_a_charter_guard_source_change_needs_a_version_bump():
     want = (coord.CHARTER_GUARD_VERSION + (version == coord.CHARTER_GUARD_VERSION), sha)
     assert (version, pinned) == (coord.CHARTER_GUARD_VERSION, sha), (
         f"the charter guard's source changed: set CHARTER_GUARD_VERSION = {want[0]} and CHARTER_GUARD_PIN = {want!r}")
-
 
 
 def test_restriction_pairs_flags_contradicting_restrictions_items_and_only_those(env):
@@ -2777,7 +2722,6 @@ def test_restriction_pairs_never_takes_a_scoped_exception_as_the_permitting_side
     assert sorted(pairs(f"{body}- {allow}\n")) == [(b, allow) for b in sorted(bans)]
 
 
-
 def test_only_or_alone_is_a_limit_only_when_it_names_an_actor_so_a_scoped_lift_is_flagged(env):
     """Neither the guard (_append_conflicts) nor the lint (restriction_pairs) reads "only"/"alone": a
     scoped lift, a conditional one and one reserved to who may act are all about what the ban is
@@ -2832,7 +2776,6 @@ def test_only_or_alone_is_a_limit_only_when_it_names_an_actor_so_a_scoped_lift_i
         assert lint(ban, text) == ([(ban, text)] if "push" in ban else []), text
 
 
-
 def test_guard_flags_lifts_with_an_inverted_modal_a_passive_verb_is_fine_ok_or_no_action(env):
     """The guard finds the action of a lift whose actor stands after the modal ("may workers push",
     "may let workers push"), whose verb is a passive helper ("may be done"), whose permission is
@@ -2858,7 +2801,6 @@ def test_guard_flags_lifts_with_an_inverted_modal_a_passive_verb_is_fine_ok_or_n
     for k, text in enumerate(("Workers may run the tests.", "Release tags are OK once CI passes.",
                               "The docs folder is no longer off-limits.", "Workers may run the tests.")):
         assert guard(text, 90 + k) == [], text
-
 
 
 def test_actor_words_are_no_rule_target_and_an_inverted_may_skips_any_actor(env):
@@ -2897,7 +2839,6 @@ def test_actor_words_are_no_rule_target_and_an_inverted_may_skips_any_actor(env)
         assert lint(ban, text) == [(ban, text)], text
         err = guard(ban, text, 20 + k)
         assert len(err) == 1 and f"\"{ban}\" (section 'Restrictions')" in err[0], (text, err)
-
 
 
 def test_guard_and_lint_flag_every_rule_about_what_a_ban_is_about_whatever_its_stance(env):
@@ -2962,7 +2903,6 @@ def test_guard_and_lint_flag_every_rule_about_what_a_ban_is_about_whatever_its_s
     assert len(err) == 1 and "\"Never push to main.\" (section 'Restrictions')" in err[0], err
 
 
-
 def test_guard_flags_a_conditional_lift_and_another_verb_on_the_same_target(env):
     """The guard (a false hit costs one `both_hold` resend) takes the same action on a rule that names
     no target ("once CI passes" names none) and a shared target unless they name two different verbs.
@@ -2985,7 +2925,6 @@ def test_guard_flags_a_conditional_lift_and_another_verb_on_the_same_target(env)
         p.charter_path.write_text(f"# demo\n\n## Restrictions\n- {ban}\n")
         assert coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": text}],
                            turn=20 + k, user_turn=True) == [], (ban, text)
-
 
 
 def test_guard_keeps_a_ban_on_every_item_of_a_listed_restriction(env):
@@ -3059,7 +2998,6 @@ _REPLAY_RESTRICTIONS = (
     "- The shared reports folder is read-only.\n")
 
 
-
 def test_guard_replays_the_exception_refusals_and_still_refuses_a_real_contradiction(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -3097,7 +3035,6 @@ def test_guard_replays_the_exception_refusals_and_still_refuses_a_real_contradic
         assert text not in p.charter_path.read_text()
 
 
-
 def test_a_quote_edit_outside_a_user_turn_is_guarded_unless_it_is_refused_anyway(env):
     """A quote edit in Policies or Goals is guarded in any turn; only an unapproved edit of a
     Restrictions item skips the guard, since it is refused anyway."""
@@ -3115,7 +3052,6 @@ def test_a_quote_edit_outside_a_user_turn_is_guarded_unless_it_is_refused_anyway
     p.charter_path.write_text("# demo\n\n## Restrictions\n- Never push to main. (user msg #1)\n- Keep it generic. (user msg #1)\n")
     err = coord.apply(p, [{**lift, "section": "Restrictions"}], turn=3, user_turn=False)
     assert len(err) == 1 and "needs the user's word" in err[0] and "contradicts" not in err[0], err
-
 
 
 def test_a_charter_conflicts_pair_settles_as_both_holding_by_its_key(env):
@@ -3170,7 +3106,6 @@ def test_a_charter_conflicts_pair_settles_as_both_holding_by_its_key(env):
     assert coord.charter_conflicts(p) == [] and first["key"] not in db.kv(coord.CHARTER_SETTLED_KEY)
 
 
-
 def test_charter_conflicts_show_in_the_digest_trigger_a_turn_once_and_reach_the_daily_review(env):
     p = make(env)
     from ttp import coordinator as coord, daemon as dm
@@ -3202,7 +3137,6 @@ def test_charter_conflicts_show_in_the_digest_trigger_a_turn_once_and_reach_the_
     db.x("DELETE FROM tasks")
     assert d._schedule_llm(s, {}) == "queued"
     assert "Charter conflicts" not in db.one("SELECT spec FROM tasks WHERE origin='schedule'")["spec"]
-
 
 
 def test_charter_lint_flags_a_dated_section_that_contradicts_a_restriction(env):
@@ -3249,7 +3183,6 @@ def test_charter_lint_flags_a_dated_section_that_contradicts_a_restriction(env):
     assert len(conflicts()) == 1 and "Never delete release tags" in conflicts()[0]
 
 
-
 def test_charter_lint_leaves_sections_that_keep_a_restrictions_limit(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -3274,7 +3207,6 @@ def test_charter_lint_leaves_sections_that_keep_a_restrictions_limit(env):
     assert len(found) == 1 and "Never push to main" in found[0] and conflicts() == found, found
 
 
-
 def test_charter_lint_flags_an_exception_worded_with_only(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -3286,14 +3218,12 @@ def test_charter_lint_flags_an_exception_worded_with_only(env):
     assert len(found) == 1 and "Never push to main" in found[0] and events == found, found
 
 
-
 G = {"origin": "gate"}   # a harness-gate source for a test's new Restrictions item
 
 RESTR_CHARTER = ("# demo\n\n## Restrictions (binding on every task)\n- Never push to the main branch. (user msg #1)\n"
                  "- Never merge. (user msg #1)\n\n## Goals\nShip v1.\n\n## Restrictions (added 2026-10-01, turn 3.0)\n"
                  "Keep the docs generic.\n(user msg #1)\n\n## Restrictions (added 2026-10-02, turn 5.0)\n"
                  "- Never delete release tags. (user msg #1)\n- Never merge. (user msg #1)\n")
-
 
 
 def test_a_restrictions_item_without_a_valid_source_is_rejected_with_the_memory_add_hint(env):
@@ -3743,7 +3673,6 @@ def test_an_ask_about_an_unsourced_restriction_is_refused_and_a_sourced_one_is_s
     assert problems == [] and sent and sent["text"].startswith(text), problems
 
 
-
 def test_a_users_yes_to_a_charter_change_stays_valid_until_it_is_applied(env):
     p = make(env)
     from ttp import coordinator as coord, prguard
@@ -3892,10 +3821,8 @@ def test_a_resolved_ask_is_no_approval_without_the_users_clear_yes_to_that_chang
     assert "Never merge pull requests." not in p.charter_path.read_text()
 
 
-
 # A permanent push rule, an unrelated sibling that shares words with it, and other bans.
 _PUSH_ITEM = "Push only to branch work/x of the demo repo. Never push to main. Never open pull requests."
-
 
 
 _EXC_CHARTER = ("# demo\n\n## Restrictions\n- " + _PUSH_ITEM + "\n  (user msg #1)\n"
@@ -3904,22 +3831,18 @@ _EXC_CHARTER = ("# demo\n\n## Restrictions\n- " + _PUSH_ITEM + "\n  (user msg #1
                 "- User-set device pauses are lifted only on the user's explicit word.\n\n## Policies\nReview first.\n")
 
 
-
 _EXCEPTION = ("One-time exception (user, ask {ask}): stray tmp/* branches on the demo repo that this project's runs "
               "created may be deleted (a deletion only; nothing is pushed to them).")
-
 
 
 _COMPANION = ("Push only to branch work/x of the demo repo, except the stray branch deletions the temporary "
               "one-time exception (ask {ask}) allows while it lasts. Never push to main. Never open pull requests.")
 
 
-
 def _exception_section(ask: int, turn: str = "1.0") -> str:
     """_EXCEPTION as charter_update writes it with its end: a dated Restrictions section."""
     return (f"\n## Restrictions (added 2026-10-12, turn {turn})\n{_EXCEPTION.format(ask=ask)}\n"
             "Until: the branch cleanup task is done\n")
-
 
 
 def test_a_companion_edit_naming_an_approved_temporary_exception_is_covered_by_its_yes(env):
@@ -3971,7 +3894,6 @@ def test_a_companion_edit_naming_an_approved_temporary_exception_is_covered_by_i
     assert not db.kv(coord.CHARTER_APPROVALS_KEY)[0]["used"], "the exception's own yes is left to it"
 
 
-
 def test_a_companion_edit_counts_only_for_a_standing_exception_it_names_and_adds_nothing_to(env):
     """Replays review probes: after the user's yes to the stray-branch exception, a turn with no user
     message got 'Never push to main, except temporary hotfixes.' and an exception clause on an item the
@@ -4020,7 +3942,6 @@ def test_a_companion_edit_counts_only_for_a_standing_exception_it_names_and_adds
     assert _COMPANION.format(ask=ask) in p.charter_path.read_text()
 
 
-
 def test_the_guard_still_refuses_a_removal_or_real_loosening_without_the_users_word(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -4060,13 +3981,11 @@ def test_the_guard_still_refuses_a_removal_or_real_loosening_without_the_users_w
     assert len(err) == 1 and "Never push to main" in err[0], err
 
 
-
 _SWEEP = ("Blocker sweep (user, high priority): at least once every 6 hours the coordinator re-evaluates every "
           "blocked, waiting and paused item. Each item gets exactly one recorded outcome: unblocked, rerouted "
           "(another box or account the charter allows), retired, or still blocked. Box health comes from the "
           "broker, and pauses the coordinator set itself are lifted once the box is healthy. A harness upgrade "
           "can never be blocked by the project's own task machinery.")
-
 
 
 def test_a_duty_that_shares_words_with_bans_and_loosens_nothing_is_not_refused(env):
@@ -4090,7 +4009,6 @@ def test_a_duty_that_shares_words_with_bans_and_loosens_nothing_is_not_refused(e
         assert text in " ".join(p.charter_path.read_text().split())
     assert not coord._may_lift("A harness upgrade can never be blocked.")
     assert coord._may_lift("Workers may push to main.")
-
 
 
 _HOLD_CHARTER = ("# demo\n\n## Goals\nShip it.\n\n## Restrictions\n"
@@ -4314,15 +4232,12 @@ def test_a_cited_restrictions_change_in_an_agent_mode_findings_turn_is_queued_no
     assert merge in p.charter_path.read_text() and not db.kv(coord.CHARTER_APPROVALS_KEY, [])
 
 
-
 _LANDING = ("Code lands on the work branch, new task branches, or main (main moves forward only by "
             "fast-forward merges after review).")
 
 
-
 _LAND_CHARTER = ("# demo\n\n## Goals\nShip it.\n\n## Restrictions\n- " + _LANDING + "\n"
                  "- Never disturb the other project's running jobs.\n\n## Policies\nReview first.\n")
-
 
 
 def test_a_user_goal_with_permit_words_on_another_subject_is_not_taken_for_a_lift(env):
@@ -4358,7 +4273,6 @@ def test_a_user_goal_with_permit_words_on_another_subject_is_not_taken_for_a_lif
     assert not coord._lifts_item(_LANDING, "Any view set may be reordered and cached results used.")
 
 
-
 def test_a_fixable_charter_refusal_raises_a_capped_immediate_retry(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -4377,7 +4291,6 @@ def test_a_fixable_charter_refusal_raises_a_capped_immediate_retry(env):
     err = coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "quote": _PUSH_ITEM, "text": ""}],
                       turn=4)
     assert len(err) == 1 and "needs the user's word" in err[0] and len(now()) == 2, err
-
 
 
 def test_only_the_users_own_turn_records_a_charter_approval(env):
@@ -4404,7 +4317,6 @@ def test_only_the_users_own_turn_records_a_charter_approval(env):
     assert len(db.kv(coord.CHARTER_APPROVALS_KEY)) == 1
 
 
-
 def test_charter_update_replaces_takes_full_headings_and_the_digest_lists_them(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -4429,7 +4341,6 @@ def test_charter_update_replaces_takes_full_headings_and_the_digest_lists_them(e
                            "3. Restrictions (added 2026-10-02, turn 5.0)", "text": "Never delete tags."}],
                       turn=40, user_turn=True)
     assert len(err) == 1 and "matches 0 charter sections" in err[0], err
-
 
 
 def test_lifting_a_restriction_merges_the_restrictions_sections_into_one_block(env):
@@ -4465,7 +4376,6 @@ def test_lifting_a_restriction_merges_the_restrictions_sections_into_one_block(e
     assert p.charter_path.read_text().count("## Restrictions") == 3
 
 
-
 def test_temporary_memory_retires_itself_at_expiry_and_the_digest_says_so(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -4491,7 +4401,6 @@ def test_temporary_memory_retires_itself_at_expiry_and_the_digest_says_so(env):
     lines = ends.digest_lines(p, now, now + 3 * 3600 + 1)
     assert len(lines) == 1 and lines[0].startswith("## Retired (end condition passed") and f"[{name}]" in lines[0]
     assert ends.digest_lines(p, now + 4 * 3600, now + 4 * 3600) == [], "shown again after the turn that saw it"
-
 
 
 def test_temporary_charter_section_retires_when_its_probe_passes(env, tmp_path):
@@ -4527,7 +4436,6 @@ def test_temporary_charter_section_retires_when_its_probe_passes(env, tmp_path):
     assert "Quiet hours." not in p.charter_path.read_text() and "Keep the README friendly." in p.charter_path.read_text()
 
 
-
 def test_an_end_only_a_model_can_judge_is_listed_as_possibly_over_once_a_day(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -4541,7 +4449,6 @@ def test_an_end_only_a_model_can_judge_is_listed_as_possibly_over_once_a_day(env
     assert lines[0].startswith("## Temporary instructions possibly over") and "until the freeze is lifted" in lines[1]
     assert ends.digest_lines(p, now, now + ends.RECHECK_S + 60) == [], "listed again within the day"
     assert "possibly over" in "\n".join(ends.digest_lines(p, now, now + 2 * ends.RECHECK_S + 1))
-
 
 
 def test_a_pull_request_or_issue_number_in_an_until_is_not_read_as_a_task(env):
@@ -4670,7 +4577,6 @@ def test_a_compound_task_end_keeps_model_judgment_and_the_digest_and_audit_show_
     assert any(f"until #{gone} has landed (now #{gone}: cancelled)" in x for x in lines), lines
 
 
-
 def test_a_clearly_over_restriction_is_retired_without_asking(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -4685,7 +4591,6 @@ def test_a_clearly_over_restriction_is_retired_without_asking(env):
     assert f"over: {over})" in (p.harness / coord.CHARTER_HISTORY).read_text()
     told = p.db.one("SELECT * FROM messages WHERE kind='alert' ORDER BY id DESC LIMIT 1")
     assert told["severity"] == "low" and over in told["text"] and "No restriction on box A" in told["text"]
-
 
 
 def test_a_temporary_charter_update_keeps_its_own_section_and_over_retires_a_quoted_restriction(env):
@@ -4724,7 +4629,6 @@ def test_a_temporary_charter_update_keeps_its_own_section_and_over_retires_a_quo
     assert told["severity"] == "low" and over in told["text"] and "Stay off box A" in told["text"]
 
 
-
 def test_worker_isolation_is_on_for_new_projects_only_and_keeps_the_hook_and_approved_plugins(
         env, monkeypatch, tmp_path):
     p = make(env)
@@ -4748,7 +4652,6 @@ def test_worker_isolation_is_on_for_new_projects_only_and_keeps_the_hook_and_app
     assert argv[argv.index("--plugin-dir") + 1] == str(plug), "approved plugins no longer load"
 
 
-
 def test_codex_worker_isolation_is_a_user_settable_bool(env):
     from ttp import coordinator as coord
     p = make(env)
@@ -4757,7 +4660,6 @@ def test_codex_worker_isolation_is_a_user_settable_bool(env):
                                 "value": value}]) == []
         assert p.config()["providers"]["codex"]["worker_isolation"] is want, value
         assert json.loads(p.config_path.read_text())["providers"]["codex"]["worker_isolation"] is want
-
 
 
 def test_isolated_workers_get_only_the_listed_mcp_servers_in_a_private_file(env, monkeypatch, tmp_path):
@@ -4783,7 +4685,6 @@ def test_isolated_workers_get_only_the_listed_mcp_servers_in_a_private_file(env,
     assert not path.exists()
 
 
-
 def test_an_unknown_mcp_server_is_named_and_the_run_still_starts(env, monkeypatch, tmp_path, capsys):
     p = make(env)
     _claude_mcp_config(tmp_path, monkeypatch, p)
@@ -4801,7 +4702,6 @@ def test_an_unknown_mcp_server_is_named_and_the_run_still_starts(env, monkeypatc
     from ttp import coordinator as coord
     assert coord.apply(p, [{"type": "config_set", "key": "providers.claude.mcp_servers",
                             "value": "bad name!"}]), "a malformed name must be rejected"
-
 
 
 def test_disallowed_tools_are_validated_and_reach_dispatched_workers(env, monkeypatch, capsys):
@@ -4828,7 +4728,6 @@ def test_disallowed_tools_are_validated_and_reach_dispatched_workers(env, monkey
     assert not any("disallowed_tools" in l for l in config_problems({"providers": {"claude": {}}}))
 
 
-
 def test_charter_and_memory_changes_are_committed_alone(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -4844,7 +4743,6 @@ def test_charter_and_memory_changes_are_committed_alone(env):
                             text=True).stdout
     assert "prompts/scratch.md" in status, "someone else's unfinished edit was swept into the commit"
     assert "CHARTER.md" not in status and "MEMORY.md" not in status
-
 
 
 def test_a_cancelled_task_stays_cancelled_when_its_run_ends(env, tmp_path):
@@ -4865,7 +4763,6 @@ def test_a_cancelled_task_stays_cancelled_when_its_run_ends(env, tmp_path):
     assert p.db.task(tid)["status"] == "cancelled"
     assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == "killed"
     assert not p.db.q("SELECT id FROM events WHERE kind='task_failed'"), "a cancel was reported as a failure"
-
 
 
 def test_a_task_note_never_outlives_the_state_it_described(env, tmp_path):
@@ -4895,7 +4792,6 @@ def test_a_task_note_never_outlives_the_state_it_described(env, tmp_path):
     assert p.db.task(tid2)["blocked_reason"] == "needs a board"
 
 
-
 def test_coordinator_can_point_code_tasks_at_the_working_branch(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -4903,7 +4799,6 @@ def test_coordinator_can_point_code_tasks_at_the_working_branch(env):
     subprocess.run(["git", "-C", str(env["repo"]), "branch", "work/fast"], check=True)
     assert coord.apply(p, [{"type": "config_set", "key": "delivery.base_ref", "value": "work/fast"}]) == []
     assert base_ref(p) == "work/fast"
-
 
 
 def test_a_long_handoff_stays_valid_json_and_the_next_turn_runs(env, monkeypatch):
@@ -4940,7 +4835,6 @@ def test_a_long_handoff_stays_valid_json_and_the_next_turn_runs(env, monkeypatch
     assert "old news" in coord.digest(p, {}, [], [])
 
 
-
 def test_a_blocked_task_can_be_repointed_and_stays_queued(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -4963,7 +4857,6 @@ def test_a_blocked_task_can_be_repointed_and_stays_queued(env):
         d.tick()
         assert p.db.task(child)["status"] == "queued", "an accepted re-point was undone by the daemon"
         assert p.db.task(other)["status"] != "blocked", "a cleared dependency was blocked again"
-
 
 
 def test_a_user_turns_task_add_with_a_null_title_or_spec_keeps_its_message_once(env):
@@ -5000,7 +4893,6 @@ def test_a_user_turns_task_add_with_a_null_title_or_spec_keeps_its_message_once(
                           error="", final_text="")
     d._finish_coordinator({"id": 3, "dir": "x"}, dup, "ok", {"messages": [mid2]})
     assert p.db.one("SELECT handled FROM messages WHERE id=?", (mid2,))["handled"] == 1
-
 
 
 def test_a_user_turns_task_add_rejected_for_a_fixable_reason_keeps_its_message(env):
@@ -5049,7 +4941,6 @@ def test_a_user_turns_task_add_rejected_for_a_fixable_reason_keeps_its_message(e
     assert dup.startswith("task_add: duplicate of") and res.startswith("task_add: resource") and "cap" in cap
 
 
-
 def test_a_requeue_onto_a_dead_dependency_is_rejected_and_reported(env):
     p = make(env)
     from types import SimpleNamespace
@@ -5072,7 +4963,6 @@ def test_a_requeue_onto_a_dead_dependency_is_rejected_and_reported(env):
     assert problems and "which is failed" in problems[0] and p.db.task(child)["status"] == "blocked"
 
 
-
 def test_depends_on_must_name_real_tasks_without_a_cycle(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -5084,7 +4974,6 @@ def test_depends_on_must_name_real_tasks_without_a_cycle(env):
         assert len(problems) == 1 and why in problems[0], (deps, problems)
     assert json.loads(p.db.task(a)["depends_on"]) == [] and p.db.task(a)["priority"] == 3, "a rejected update was applied"
     assert json.loads(p.db.task(b)["depends_on"]) == [a]
-
 
 
 def test_task_add_rejects_unknown_or_dead_dependencies(env):
@@ -5100,7 +4989,6 @@ def test_task_add_rejects_unknown_or_dead_dependencies(env):
     assert p.db.one("SELECT COUNT(*) n FROM tasks")["n"] == before, "a rejected task_add created a task"
     assert not coord.apply(p, [{"type": "task_add", "spec": "s", "title": "fine", "depends_on": [ok, ok]}])
     assert json.loads(p.db.one("SELECT depends_on FROM tasks WHERE title='fine'")["depends_on"]) == [ok]
-
 
 
 def test_task_add_continues_takes_over_the_dead_tasks_dependents(env):
@@ -5133,7 +5021,6 @@ def test_task_add_continues_takes_over_the_dead_tasks_dependents(env):
     assert f"continues #{old}" in coord.digest(p, {}, [], [])
 
 
-
 @pytest.mark.parametrize("status", ["queued", "running", "waiting"])
 def test_task_add_continues_only_a_failed_cancelled_or_blocked_task(env, status):
     p = make(env)
@@ -5151,7 +5038,6 @@ def test_task_add_continues_only_a_failed_cancelled_or_blocked_task(env, status)
         assert len(problems) == 1 and why in problems[0], problems
 
 
-
 def test_task_add_continues_rejects_a_dependency_on_its_own_dependents(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -5166,7 +5052,6 @@ def test_task_add_continues_rejects_a_dependency_on_its_own_dependents(env):
     assert json.loads(p.db.task(child)["depends_on"]) == [old]
 
 
-
 def test_continuing_a_blocked_task_cancels_it_and_may_reuse_its_title(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -5179,7 +5064,6 @@ def test_continuing_a_blocked_task_cancels_it_and_may_reuse_its_title(env):
     new = p.db.one("SELECT id FROM tasks WHERE title='stuck' AND id!=?", (old,))["id"]
     assert p.db.task(old)["status"] == "cancelled" and f"#{new}" in p.db.task(old)["blocked_reason"]
     assert p.db.task(other)["status"] == "blocked"
-
 
 
 def test_task_add_rejects_a_near_duplicate_naming_the_task(env):
@@ -5204,7 +5088,6 @@ def test_task_add_rejects_a_near_duplicate_naming_the_task(env):
     # force: true adds it deliberately.
     assert coord.apply(p, [{**near, "force": True}]) == []
     assert p.db.one("SELECT id FROM tasks WHERE title=?", (near["title"],))
-
 
 
 def test_the_duplicate_scan_builds_each_tasks_words_once_not_on_every_task_add(env):
@@ -5295,7 +5178,6 @@ def test_task_add_rejects_a_reworded_repeat_of_work_shelved_or_landed_the_same_d
     section = text.split("## Tried work")[1].split("\n## ")[0]
     assert f"#{shelved} shelved" in section and f"#{kept} landed" in section and "1.05x" in section, section
     assert len(section.splitlines()) <= tried.DIGEST_ROWS + 1
-
 
 
 def test_tried_ledger_labels_a_landed_task_landed_whatever_its_summary_says_and_shows_its_landing_time(env, monkeypatch):
@@ -5413,7 +5295,6 @@ def test_tried_work_ledger_does_not_match_unrelated_work_sharing_numbered_steps_
     assert tried.params("Llama-3.1 e2e timing with the Llama 3.2 tokenizer, Python 3.12") == set()
 
 
-
 def test_actions_schema_lists_every_action_key_apply_reads():
     # A provider that enforces the schema strictly drops a key it does not list, so every key apply()
     # (or a helper it hands the action to) reads must be a property of ACTIONS_SCHEMA's action items.
@@ -5457,7 +5338,6 @@ def test_actions_schema_lists_every_action_key_apply_reads():
     assert sorted(read - listed - set(read_under_another_name)) == []
 
 
-
 def test_task_add_near_duplicate_skips_the_continued_task_and_old_done_work(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -5483,7 +5363,6 @@ def test_task_add_near_duplicate_skips_the_continued_task_and_old_done_work(env)
     assert coord.apply(p, [redo]) == []
 
 
-
 def test_a_code_task_continues_from_the_dead_tasks_branch(env):
     p = make(env)
     from ttp import coordinator as coord, prompts, worktree
@@ -5502,7 +5381,6 @@ def test_a_code_task_continues_from_the_dead_tasks_branch(env):
     assert _git_out(new_path, "rev-parse", "HEAD") == head
     text = prompts.worker_task(p, new, str(new_path), new_branch)
     assert f"#{old}" in text and branch in text and "ran out of budget at step 3" in text
-
 
 
 def test_task_add_continues_on_a_done_task_adds_a_follow_up_from_the_base(env):
@@ -5528,7 +5406,6 @@ def test_task_add_continues_on_a_done_task_adds_a_follow_up_from_the_base(env):
     assert _git_out(new_path, "rev-parse", "HEAD") != old_head
 
 
-
 def test_schedule_set_takes_a_bare_integer_interval_as_seconds(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -5537,7 +5414,6 @@ def test_schedule_set_takes_a_bare_integer_interval_as_seconds(env):
                                     "command": "true", "every": every}])
         assert problems == [] and p.db.kv(coord.NOTES_KEY) == ["schedule_set 'probe': every 900 s"], problems
         assert p.db.one("SELECT every_s FROM schedules WHERE name='probe'")["every_s"] == 900
-
 
 
 def test_follow_up_and_bare_seconds_notes_are_information_not_rejections(env):
@@ -5569,7 +5445,6 @@ def test_follow_up_and_bare_seconds_notes_are_information_not_rejections(env):
     assert "every 900 s" not in coord.digest(p, {}, [], []), "a note outlived the turn after"
 
 
-
 def test_a_queued_task_on_a_blocked_dependency_raises_one_event_after_a_turn(env):
     p = make(env)
     from ttp import coordinator as coord, holdloops
@@ -5597,7 +5472,6 @@ def test_a_queued_task_on_a_blocked_dependency_raises_one_event_after_a_turn(env
     assert coord.apply(p, [{"type": "task_update", "id": a, "depends_on": []}]) == []
     d._raise_hold_loops(now + 20)
     assert not any(k.startswith("blocked-dependency:") for k in p.db.kv(holdloops.LOOPS_KEY, {}))
-
 
 
 def test_a_dependency_cycle_is_rejected_at_creation_and_an_existing_one_is_flagged(env):
@@ -5676,7 +5550,6 @@ def test_a_planned_start_after_raises_no_time_only_hold_until_it_is_re_armed_or_
     assert planned not in [e["task"] for e in evs] and reviewed not in [e["task"] for e in evs]
 
 
-
 def test_an_overdue_start_after_is_raised_only_when_it_never_started_and_nothing_else_holds_it(env):
     p = make(env)
     from ttp import holdloops
@@ -5724,7 +5597,6 @@ def test_an_overdue_start_after_is_raised_only_when_it_never_started_and_nothing
     assert f"time-only:{fresh}" not in holdloops.current(p.db, p.config(), late_t + 10)
 
 
-
 def test_a_dependency_left_in_review_too_long_is_raised_once_and_its_age_shown(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -5767,7 +5639,6 @@ def test_a_dependency_left_in_review_too_long_is_raised_once_and_its_age_shown(e
     d.cfg["coordinator"]["review_stall_s"] = 4 * 3600
     d.tick()
     assert len(raised()) == 2
-
 
 
 def test_a_task_in_review_whose_latest_review_failed_with_no_fix_is_raised_once_after_an_hour(env):
@@ -5904,7 +5775,6 @@ def test_a_review_that_depends_on_the_task_it_reviews_runs_while_that_task_waits
     assert p.db.unmet_dependencies([p.db.task(named)]) == {named: [impl]}
 
 
-
 def test_a_review_waits_on_tasks_its_spec_mentions_and_matches_only_its_titled_or_labelled_subject(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -5932,7 +5802,6 @@ def test_a_review_waits_on_tasks_its_spec_mentions_and_matches_only_its_titled_o
     assert review_subject({"title": f"Review #{top}", "labels": f'["auto_review:{base}"]'}) == base
     assert review_subject({"title": f"review t{top}: x", "labels": "[]"}) == top
     assert review_subject({"title": f"Re-check Review #{top}", "labels": "[]"}) is None
-
 
 
 def test_status_json_exposes_each_tasks_dependencies_and_start_and_retry_conditions(env):
@@ -5963,9 +5832,7 @@ def test_status_json_exposes_each_tasks_dependencies_and_start_and_retry_conditi
                           "waits": 2, "next_try": retry_at}
 
 
-
 _RQ = "Never restart a shared service without the user's yes."
-
 
 
 def _restricted(p, item=_RQ):
@@ -5978,7 +5845,6 @@ def _restricted(p, item=_RQ):
     end = len(text) if end < 0 else end
     body = text[head:end].replace("(none stated yet)", "").rstrip()
     p.charter_path.write_text(f"{text[:head]}{body}\n- {item} (user msg #1)\n{text[end:]}")
-
 
 
 # An access ask the re-ask gate judges; it names no access, so it says why only the user can decide it.
@@ -6005,21 +5871,17 @@ def test_an_ask_needs_a_blocking_reason_and_stores_its_default(env):
         assert _ask(p, f"Question on {reason}?", blocking=reason, **extra)[0] == [], reason
 
 
-
 _SOAK = dict(blocking="restriction", classify="restriction_change",
              least_disruptive="run the soak with the default setting; it breaks no restriction but tests less")
-
 
 
 # Refusals the old free-text approval match counted as a yes, and a plain yes: none may hold back an ask.
 _SUBJECT = "delete the stale nightly cache bucket"
 
 
-
 _NOT_APPROVALS = [f"No, do not {_SUBJECT}. Do not proceed.", f"Not approved: {_SUBJECT}", "Don't do it",
                   "I never approved deleting the stale nightly cache bucket", f"no, do not go ahead with {_SUBJECT}",
                   "yes, go ahead"]
-
 
 
 def test_the_users_words_on_a_subject_flag_a_re_ask_by_quoting_them_never_as_an_approval(env):
@@ -6055,7 +5917,6 @@ def test_the_users_words_on_a_subject_flag_a_re_ask_by_quoting_them_never_as_an_
             assert problems == [] and again["id"] != sent["id"], (said, kind, problems)
             p.db.x("UPDATE messages SET handled=1 WHERE kind='ask'")
             assert coord._prior_approval(p, f"May I {_SUBJECT}?") is None
-
 
 
 _TIMEOUT = dict(_SOAK, least_disruptive="keep the soak at the default timeout; it breaks no restriction but "
@@ -6232,7 +6093,6 @@ def test_a_review_or_merge_ask_with_a_pr_approve_record_is_refused_once_naming_i
     assert _ask(p, ask, blocking="human", requester="a maintainer")[0] == []
 
 
-
 def test_a_re_ask_of_an_answered_question_in_other_words_and_other_context_is_flagged(env):
     p = make(env)
     from ttp import coordinator as coord, reask
@@ -6284,7 +6144,6 @@ def test_a_restriction_ask_must_name_the_least_disruptive_way_forward(env):
     assert problems == [] and coord._ask_question(ask["text"]) == "Approve the spend?"
 
 
-
 def test_an_ask_granting_money_shows_its_recommendation_but_never_applies_it(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -6300,7 +6159,6 @@ def test_an_ask_granting_money_shows_its_recommendation_but_never_applies_it(env
     assert p.db.one("SELECT handled FROM messages WHERE id=?", (ask["id"],))["handled"] == 0
     problems, _ = _ask(p, " option a or b? ", blocking="spend", recommendation="something else")
     assert problems and "already asked" in problems[0]
-
 
 
 def test_an_unanswered_ask_resolves_to_its_recommendation_at_the_deadline(env):
@@ -6518,7 +6376,6 @@ def test_a_reversible_ask_is_rejected_and_the_rejection_reaches_the_next_digest(
     assert "decide it yourself" in coord.digest(p, {}, [], []).split("# NEW EVENTS")[1]
 
 
-
 def test_a_legacy_ask_with_a_default_still_drains_after_the_timeout(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -6538,7 +6395,6 @@ def test_a_legacy_ask_with_a_default_still_drains_after_the_timeout(env):
     assert p.db.kv(coord.ASK_DEFAULTS_KEY) == {}
 
 
-
 def test_the_untried_host_gate_only_checks_access_asks_and_counts_refusals(env):
     from ttp import coordinator as coord, unblock
     env["tmp"].joinpath("ssh_config").write_text("Host host-a\n")
@@ -6552,7 +6408,6 @@ def test_the_untried_host_gate_only_checks_access_asks_and_counts_refusals(env):
     assert "untried host 1" in line, line
     env["tmp"].joinpath("ssh_config").unlink()
     assert coord._untried_host_ask(p, {"blocking": "access"}, "Please check host-a.") == ""
-
 
 
 def _gateway_cfg():
@@ -6645,7 +6500,6 @@ _OWNED_FIX_NOTIFIES = [
 ]
 
 
-
 @pytest.mark.parametrize("text,refused", _OWNED_FIX_NOTIFIES)
 def test_a_notify_never_hands_an_owned_override_back_as_a_question(env, text, refused):
     from ttp import coordinator as coord
@@ -6656,7 +6510,6 @@ def test_a_notify_never_hands_an_owned_override_back_as_a_question(env, text, re
         assert problems == [] and sent is not None, problems
         return
     assert problems and "notify rejected" in problems[0] and "is yours" in problems[0] and sent is None, problems
-
 
 
 def test_the_self_health_gate_by_reason_and_its_refusal_count(env):
@@ -6683,7 +6536,6 @@ def test_the_self_health_gate_by_reason_and_its_refusal_count(env):
     coord.apply(p, [{"type": "ask_user", "text": "the worker is dead, restart?", "blocking": "human"}], turn=9)
     coord.apply(p, [{"type": "ask_user", "text": "the worker is dead, restart?", "blocking": "human"}], turn=9)
     assert "3 refused (self-health 3)" in next(x for x in unblock.lines(p.db) if x.startswith("asks refused"))
-
 
 
 _RESET_LEAST = "wait for the software reset to recover it; it did not, twice"
@@ -6879,21 +6731,16 @@ def test_a_reset_ask_naming_a_tenant_is_sent(env):
     assert problems == [] and ask is not None, problems
 
 
-
 _QUO = "leave the config as it is for now; that breaks nothing and nobody waits on it"
-
 
 
 _COSTLY_QUO = "leave the config as it is; but then the nightly job keeps failing until it changes"
 
 
-
 _R = {"blocking": "restriction", "classify": "restriction_change"}
 
 
-
 _I = {"blocking": "irreversible", "classify": "irreversible"}
-
 
 
 # (fields, flag label, or None for no flag, or "sent" when only sending matters). Every case is sent:
@@ -6948,7 +6795,6 @@ _REVERSIBLE_CASES = [
 ]
 
 
-
 @pytest.mark.parametrize("fields,label", _REVERSIBLE_CASES)
 def test_the_ask_gate_flags_status_quo_and_reversible_step_asks_but_sends_them(env, fields, label):
     p = make(env)
@@ -6969,16 +6815,13 @@ def test_the_ask_gate_flags_status_quo_and_reversible_step_asks_but_sends_them(e
     assert "nothing to do" in notes[0]   # a flag never asks for what the ask already gave
 
 
-
 # Asks a review found sent though they were the coordinator's own call (synthetic).
 _OWN_CALL_ASKS = ("Use an already-approved setting for the next build?",
                   "Rerun the soak test after the failed config?",
                   "Extend my deadline to Friday?")
 
 
-
 _WAY = "keep the current plan; it waits on the restriction quoted here and stalls the work"
-
 
 
 def test_a_restriction_ask_about_a_memory_or_charter_restriction_is_sent(env):
@@ -6996,7 +6839,6 @@ def test_a_restriction_ask_about_a_memory_or_charter_restriction_is_sent(env):
         assert problems == [] and ask is not None and ask["text"].startswith(text), (text, problems)
         assert "Restriction: " not in ask["text"]
     assert "restriction_quote" not in coord.ACTIONS_SCHEMA["properties"]["actions"]["items"]["properties"]
-
 
 
 def test_a_human_ask_needs_another_human(env):
@@ -7026,7 +6868,6 @@ def test_a_human_ask_needs_another_human(env):
         assert problems and "the user is not another human" in problems[0] and "colour" not in ask["text"], who
     line = next(x for x in unblock.lines(p.db) if x.startswith("asks refused by the gate, 24 h"))
     assert "no other human 9" in line, line
-
 
 
 def test_a_rerun_or_a_later_deadline_is_the_coordinators_call(env):
@@ -7066,7 +6907,6 @@ def test_a_rerun_or_a_later_deadline_is_the_coordinators_call(env):
     flagged = next(x for x in lines if x.startswith("asks sent but flagged by the gate, 24 h"))
     assert "1 flagged (own call (not_own_call) 1)" in flagged, flagged
     assert "not_own_call" in coord.ACTIONS_SCHEMA["properties"]["actions"]["items"]["properties"]
-
 
 
 _RF_R = {"blocking": "restriction", "classify": "restriction_change"}
@@ -7146,7 +6986,6 @@ _RESOLVE_FIRST_CASES = [
 ]
 
 
-
 @pytest.mark.parametrize("fields,label", _RESOLVE_FIRST_CASES)
 def test_the_ask_gate_refuses_asks_that_name_no_harm_and_no_routes_tried(env, fields, label):
     p = make(env)
@@ -7169,7 +7008,6 @@ def test_the_ask_gate_refuses_asks_that_name_no_harm_and_no_routes_tried(env, fi
     assert f"{label} (not_own_call) 1" in flagged, flagged
 
 
-
 def test_the_resolve_first_gate_leaves_review_merge_money_and_human_asks_alone(env):
     from ttp import coordinator as coord
     for blocking in ("review", "merge", "funds", "spend", "human"):
@@ -7178,12 +7016,10 @@ def test_the_resolve_first_gate_leaves_review_merge_money_and_human_asks_alone(e
             assert coord._resolve_first_ask({"blocking": blocking}, text) is None, (blocking, text)
 
 
-
 def test_review_merge_funds_spend_access_and_human_asks_skip_the_reversible_flag(env):
     from ttp import coordinator as coord
     for blocking in ("review", "merge", "funds", "spend", "access", "human"):
         assert coord._reversible_ask({"blocking": blocking}, "Raise the disk quota?", _QUO) is None, blocking
-
 
 
 def test_the_gates_kept_by_2116_still_refuse_a_restrictions_change_and_a_relayed_rule(env):
@@ -7249,7 +7085,6 @@ def test_an_irreversible_or_restriction_ask_is_classified_and_a_wrong_class_corr
     assert "classify mismatch" not in line and "unclassified" not in line, line
 
 
-
 def test_exempt_asks_stay_open_past_the_timeout(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -7286,7 +7121,6 @@ def test_exempt_asks_stay_open_past_the_timeout(env):
                for a in (worded, loosen))
 
 
-
 def test_an_ask_waits_while_an_answer_is_pending_over_a_cap_or_turned_off(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -7298,7 +7132,6 @@ def test_an_ask_waits_while_an_answer_is_pending_over_a_cap_or_turned_off(env):
     assert coord.apply(p, [{"type": "config_set", "key": "coordinator.ask_timeout_h", "value": "24"}]) == []
     assert coord.expire_asks(p, now=late) == []
     assert coord.expire_asks(p, now=ask["ts"] + 24 * 3600) == [ask["id"]]
-
 
 
 def test_a_user_reply_after_an_ask_blocks_its_default_even_once_handled(env):
@@ -7321,7 +7154,6 @@ def test_a_user_reply_after_an_ask_blocks_its_default_even_once_handled(env):
     assert f"ask #{ask['id']} (waits for the user)" in coord.digest(p, {}, [], [])
 
 
-
 def test_a_fallback_notice_is_never_below_the_chat_floor(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -7338,7 +7170,6 @@ def test_a_fallback_notice_is_never_below_the_chat_floor(env):
     assert coord.expire_asks(p, now=ask2["ts"] + 12 * 3600 + 1) == [ask2["id"]]
     told = p.db.one("SELECT * FROM messages WHERE kind='alert' ORDER BY id DESC LIMIT 1")
     assert "use option C" in told["text"] and told["severity"] == "critical"
-
 
 
 def test_schedule_set_command_makes_a_runnable_schedule(env):
@@ -7359,7 +7190,6 @@ def test_schedule_set_command_makes_a_runnable_schedule(env):
     assert p.db.one("SELECT last_status FROM schedules WHERE name='probe'")["last_status"].startswith("ok")
 
 
-
 def test_schedule_set_command_without_a_command_is_rejected(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -7367,7 +7197,6 @@ def test_schedule_set_command_without_a_command_is_rejected(env):
                            "spec": "python3 check.py"}])
     assert len(out) == 1 and "needs `command`" in out[0], out
     assert not p.db.one("SELECT name FROM schedules WHERE name='probe'")
-
 
 
 def test_schedule_set_keeps_fields_the_action_leaves_out(env):
@@ -7390,7 +7219,6 @@ def test_schedule_set_keeps_fields_the_action_leaves_out(env):
     assert coord.apply(p, [{"type": "schedule_set", "name": "fresh", "kind": "llm", "spec": "look"}]) == []
     fresh = p.db.one("SELECT * FROM schedules WHERE name='fresh'")
     assert fresh["every_s"] == 86400 and fresh["enabled"] and fresh["description"] == ""
-
 
 
 def test_a_daily_receipt_watcher_keeps_its_pending_item_quiet_until_it_changes(env, tmp_path):
@@ -7450,7 +7278,6 @@ def test_a_daily_receipt_watcher_keeps_its_pending_item_quiet_until_it_changes(e
         == {"not seen for 72 h"}
 
 
-
 def test_command_errors_have_their_own_source_beside_explicit_clear_receipts(env, tmp_path):
     from ttp import coordinator as coord
     from ttp import screen as scr
@@ -7489,7 +7316,6 @@ def test_command_errors_have_their_own_source_beside_explicit_clear_receipts(env
     assert open_errors() == [] and r["open_titles"]() == set()
 
 
-
 def test_command_errors_clear_on_success_and_expire_while_receipts_wait_for_acknowledgement(env, tmp_path):
     from ttp import coordinator as coord
     r = _receipt_rig(env, tmp_path)
@@ -7513,7 +7339,6 @@ def test_command_errors_clear_on_success_and_expire_while_receipts_wait_for_ackn
     assert coord.apply(r["p"], [{"type": "schedule_set", "name": "receipts", "issue_lifecycle": None}]) == []
     r["age"](73)
     assert r["d"].sweep_watcher_issues() == 2 and r["open_titles"]() == set()
-
 
 
 def test_watcher_sweep_before_its_schedule_exists_then_its_first_run(env, tmp_path):
@@ -7550,7 +7375,6 @@ def test_watcher_sweep_before_its_schedule_exists_then_its_first_run(env, tmp_pa
                       "AND fingerprint NOT IN ('old','recent')")["n"] == 1
 
 
-
 def test_ordinary_expiry_stays_for_sources_that_did_not_opt_in(env, tmp_path):
     from ttp import coordinator as coord
     r = _receipt_rig(env, tmp_path, name="plain", lifecycle=None)
@@ -7579,7 +7403,6 @@ def test_ordinary_expiry_stays_for_sources_that_did_not_opt_in(env, tmp_path):
     assert errs and "issue_lifecycle" in str(errs[0])
 
 
-
 def test_schedule_set_takes_rewake_and_debounce_hours_or_null(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -7593,7 +7416,6 @@ def test_schedule_set_takes_rewake_and_debounce_hours_or_null(env):
     assert pay("probe")["rewake_after_h"] == 48, "a field left out keeps its value"
     problems = coord.apply(p, [{"type": "schedule_set", "name": "probe", "kind": "command", "rewake_after_h": "soon"}])
     assert problems and "rewake_after_h" in problems[0]
-
 
 
 def test_only_exclusive_resources_serialize_whole_tasks(env):
@@ -7613,7 +7435,6 @@ def test_only_exclusive_resources_serialize_whole_tasks(env):
     p.db.update_task(tasks["reflash"]["id"], status="running")
     assert not d._resources_free(p.db.task(tasks["reconfigure"]["id"])), "two exclusive holders at once"
     assert d._resources_free(p.db.task(tasks["measure a"]["id"])), "a shared user waited for the whole task"
-
 
 
 def test_a_resources_dispatch_cap_is_set_apart_from_its_lock_slots(env):
@@ -7688,7 +7509,6 @@ def test_a_read_only_resource_counts_for_pauses_and_activity_never_for_dispatch_
     assert json.loads(p.db.task(tasks["read 2"]["id"])["labels"]) == ["read:other"]
 
 
-
 def test_a_new_restriction_reaches_workers_already_running(env, tmp_path):
     p = make(env)
     from ttp import coordinator as coord
@@ -7702,7 +7522,6 @@ def test_a_new_restriction_reaches_workers_already_running(env, tmp_path):
     assert "Never push to main. (origin: harness gate)" in (run_dir / "steer.md").read_text()
     assert coord.apply(p, [{"type": "charter_update", "section": "Goals", "text": "Go faster."}]) == []
     assert "Go faster." not in (run_dir / "steer.md").read_text(), "only restrictions interrupt running work"
-
 
 
 def test_the_disk_guard_alerts_once_per_episode_holds_heavy_tasks_and_resumes(env, monkeypatch):
@@ -7740,7 +7559,6 @@ def test_the_disk_guard_alerts_once_per_episode_holds_heavy_tasks_and_resumes(en
     free["gb"] = 30
     d.dispatch()
     assert len(alerts()) == 2, "a new episode must alert again"
-
 
 
 def test_the_disk_guard_alert_says_what_fills_the_disk_and_the_projects_share(env, monkeypatch):
@@ -7784,7 +7602,6 @@ def test_the_disk_guard_alert_says_what_fills_the_disk_and_the_projects_share(en
     assert "This project's own data" in coord.digest(p, {}, [], [])
 
 
-
 def test_only_money_waits_for_the_user(env):
     """The project runs unattended: it may raise its own task valve, never spend past a cap."""
     p = make(env)
@@ -7794,7 +7611,6 @@ def test_only_money_waits_for_the_user(env):
     for key, value in (("budget.daily_usd", "500"), ("budget.reserve_pct", "2")):
         assert "approval" in coord.apply(p, [{"type": "config_set", "key": key, "value": value}])[0], key
         assert coord.apply(p, [{"type": "config_set", "key": key, "value": value}], user_turn=True) == []
-
 
 
 def test_config_set_applies_before_task_add_in_the_same_turn(env):
@@ -7807,7 +7623,6 @@ def test_config_set_applies_before_task_add_in_the_same_turn(env):
                             {"type": "config_set", "key": "coordinator.max_new_tasks_per_day", "value": "5"}])
     assert notes == [], notes
     assert p.db.one("SELECT id FROM tasks WHERE title='second'")
-
 
 
 def test_a_rejected_action_waits_for_the_next_turn_instead_of_starting_one(env, monkeypatch):
@@ -7834,7 +7649,6 @@ def test_a_rejected_action_waits_for_the_next_turn_instead_of_starting_one(env, 
     ok = SimpleNamespace(structured={"actions": [{"type": "noop"}], "summary": ""}, error="", final_text="")
     d._finish_coordinator({"dir": "x"}, ok, "ok", {})
     assert "no task #999" not in coord.digest(p, {}, [], []), "a fixed rejection kept being shown"
-
 
 
 def test_a_rejection_goes_back_to_the_coordinator_not_into_the_users_reply(env, monkeypatch):
@@ -7872,7 +7686,6 @@ def test_a_rejection_goes_back_to_the_coordinator_not_into_the_users_reply(env, 
     d._finish_coordinator({"dir": "x"}, quiet, "ok", {})
     text = coord.digest(p, {}, [], [])
     assert "no task #999" in text and "Your reply already went out" not in text and "rejected again" not in text
-
 
 
 def test_the_task_cap_names_its_next_slot_and_wakes_then(env, monkeypatch):
@@ -7925,7 +7738,6 @@ def test_the_task_cap_names_its_next_slot_and_wakes_then(env, monkeypatch):
     assert len(starts) == 1, "the freed slot did not wake the coordinator"
 
 
-
 def test_a_task_cap_of_0_stops_new_tasks_without_a_wake_loop(env, monkeypatch):
     """Cap 0 means no new tasks (it once meant no cap); the retry wake waits for the cap to be raised."""
     p = make(env)
@@ -7954,7 +7766,6 @@ def test_a_task_cap_of_0_stops_new_tasks_without_a_wake_loop(env, monkeypatch):
     assert p.db.kv(coord.RETRY_WAKE_KEY) is None
 
 
-
 def test_review_tasks_have_their_own_higher_cap(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -7971,7 +7782,6 @@ def test_review_tasks_have_their_own_higher_cap(env):
     assert coord.task_cap(p.config(), review=True) == 3
 
 
-
 def test_an_identical_open_ask_is_not_posted_twice(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -7980,7 +7790,6 @@ def test_an_identical_open_ask_is_not_posted_twice(env):
     assert problems and "already asked" in problems[0]
     assert len(p.db.q("SELECT id FROM messages WHERE kind='ask'")) == 1
     assert "Ship it now or wait?" in coord.digest(p, {}, [], []).split("## Recently sent to the user")[1]
-
 
 
 def test_the_digest_cuts_background_rows_but_keeps_new_events_whole(env):
@@ -8016,7 +7825,6 @@ def test_the_digest_cuts_background_rows_but_keeps_new_events_whole(env):
     assert f"#{done} done: fresh task — fresh word" in spans.strip(coord.digest(p, {}, [fup], []))
 
 
-
 def test_a_plan_hand_off_reaches_the_coordinator_whole(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -8032,7 +7840,6 @@ def test_a_plan_hand_off_reaches_the_coordinator_whole(env):
         assert f["fact"].strip() in new and f["source"] in new, "a finding was cut"
     assert plugs[0]["why"].strip() in new
     assert "result.json" not in new, "nothing was cut, yet the digest says so"
-
 
 
 def test_a_cut_hand_off_says_so_and_names_its_result_file(env):
@@ -8053,7 +7860,6 @@ def test_a_cut_hand_off_says_so_and_names_its_result_file(env):
     assert all(t.endswith(f"[cut; the whole text is in {where}]") for t in cut), "a cut does not say so"
 
 
-
 @pytest.mark.parametrize("words, before", [(60, 784), (300, 1324)])
 def test_a_plain_hand_off_digest_does_not_grow(env, words, before):
     # `before`: the NEW EVENTS section for the same hand-off before plans got their own events.
@@ -8065,14 +7871,12 @@ def test_a_plain_hand_off_digest_does_not_grow(env, words, before):
     assert len(new) <= before * 1.05 + 40   # + the hand-off's provenance delimiters (spans.wrap)
 
 
-
 def test_clip_cuts_at_a_word_and_marks_the_cut(env):
     from ttp.coordinator import clip
     assert clip("short\n  text", 50) == "short text"
     assert clip(None, 10) == ""
     assert clip("alpha beta gamma delta", 18) == "alpha beta gamma…"
     assert clip("x" * 30, 10) == "x" * 9 + "…"
-
 
 
 def _hold_exclusive(p, tmp_path, release, run_env=None):
@@ -8092,7 +7896,6 @@ def _hold_exclusive(p, tmp_path, release, run_env=None):
     while time.time() < deadline and not (run_dir / "child.pid").exists():
         time.sleep(0.05)
     return proc, run_dir
-
 
 
 def test_an_exclusive_task_and_ttp_lock_exclude_each_other(env, tmp_path):
@@ -8139,7 +7942,6 @@ def test_an_exclusive_task_and_ttp_lock_exclude_each_other(env, tmp_path):
         release.touch()
         holder.wait(timeout=30)
     assert d._resources_free(task)
-
 
 
 def _lock_cmd(*args):
@@ -8260,7 +8062,6 @@ def test_a_nested_ttp_lock_runs_under_its_outer_one_unless_it_upgrades_a_shared_
     assert out.returncode == 0 and "held already by an enclosing ttp lock (exclusive)" in out.stderr, out
 
 
-
 def test_a_shared_ttp_lock_of_a_device_lock_is_refused_and_runs_nothing(env, tmp_path):
     p = make(env)
     p.set_config("device.locks", ["board-a", "board-b"])
@@ -8361,7 +8162,6 @@ def test_a_waiting_exclusive_task_reserves_its_resource(env, tmp_path):
     assert not mark.exists(), "the run kept the reservation after taking its slot"
 
 
-
 def test_an_exclusive_run_that_loses_the_race_requeues_without_an_attempt(env, monkeypatch):
     p = make(env)
     from ttp import coordinator as coord
@@ -8403,7 +8203,6 @@ def test_an_exclusive_run_that_loses_the_race_requeues_without_an_attempt(env, m
     assert t["status"] == "queued" and not t["attempts"] and t["not_before"], dict(t)
 
 
-
 def test_stall_check_raises_once_for_a_task_dispatch_would_start_and_lists_no_held_task(env, monkeypatch):
     from ttp import coordinator as coord
     p, d, now, check = _stall_setup(env, monkeypatch)
@@ -8433,7 +8232,6 @@ def test_stall_check_raises_once_for_a_task_dispatch_would_start_and_lists_no_he
     evs = check(now + 7.5 * 3600)
     assert len(evs) == 2 and evs[0]["fingerprint"] != evs[1]["fingerprint"], \
         "a new stall past stall_wake_h after that run is raised once more"
-
 
 
 def test_idle_capacity_backs_off_per_resource_after_a_declined_event_and_survives_a_restart(env, monkeypatch):
@@ -8492,7 +8290,6 @@ def test_idle_capacity_backs_off_per_resource_after_a_declined_event_and_survive
     assert idlecap.step(st, {"rig-device"}, now + 11 * 3600, 1500, 21600, True, recent)[1] == ["rig-device"]
 
 
-
 def _objects(schema):
     if isinstance(schema, dict):
         if schema.get("type") == "object" or "properties" in schema:
@@ -8502,7 +8299,6 @@ def _objects(schema):
     elif isinstance(schema, list):
         for v in schema:
             yield from _objects(v)
-
 
 
 def test_codex_coordinator_schema_is_strict_and_its_nulls_are_dropped(env, tmp_path):
@@ -8539,46 +8335,13 @@ def test_codex_coordinator_schema_is_strict_and_its_nulls_are_dropped(env, tmp_p
     assert codex.parse(out).structured == {"actions": [{"type": "reply", "chat": "c1", "text": "hi"}]}
 
 
-
-def test_sandboxed_codex_worker_takes_a_shared_lock_and_sees_its_pause(env):
-    p = make(env)
-    p.set_config("shared_resources", ["box1"])
-    cwd = env["tmp"] / "sandbox-cwd"
-    cwd.mkdir()
-    roots = _codex_worker_roots(env, p, cwd)
-    sandbox = _codex_sandbox(cwd, roots)
-    if sandbox is None:
-        pytest.skip("no working Codex sandbox on this machine")
-    run_env = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost", TTP_PROJECT=str(p.base),
-                   PYTHONDONTWRITEBYTECODE="1")
-    lock = [sys.executable, str(TTP), "lock", "--timeout", "5", "box1", "--"]
-    slot = env["home"] / "locks" / "box1" / "box1.0.lock"
-    out = subprocess.run(sandbox + lock + ["true"], cwd=cwd, env=run_env, capture_output=True, text=True)
-    assert out.returncode == 0, out.stderr
-    assert json.loads(slot.read_text())["holder"].startswith(p.name + " "), "a shared holder names its project"
-    assert not (p.state / "locks").exists() or not list((p.state / "locks").glob("box1*")), "no private lock"
-    from ttp import coordinator as coord
-    coord.pause_resource(p, "box1", True, reason="maintenance", by="user")
-    out = subprocess.run(sandbox + lock + ["true"], cwd=cwd, env=run_env, capture_output=True, text=True)
-    assert out.returncode == 75 and "box1 is paused (maintenance)" in out.stderr, out.stderr
-    # A sandbox without the lock root fails loudly, and never falls back to a private lock.
-    coord.pause_resource(p, "box1", False, by="user")
-    narrow = _codex_sandbox(cwd, [r for r in roots if not pathlib.Path(r).is_relative_to(env["home"])])
-    import shutil
-    shutil.rmtree(env["home"] / "locks" / "box1")
-    out = subprocess.run(narrow + lock + ["true"], cwd=cwd, env=run_env, capture_output=True, text=True)
-    assert out.returncode == 2 and "not writable" in out.stderr and "Traceback" not in out.stderr, out.stderr
-    assert not (p.state / "locks").exists() or not list((p.state / "locks").glob("box1*")), "no private lock"
-
-
-
 def test_codex_coordinator_turn_is_read_only_and_its_actions_apply(env, monkeypatch):
     from ttp import coordinator as coord
 
     def chat(p):
         p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)",
                (time.time(), "t", time.time()))
-        _write_fence("codex")(p)   # read-only is opt-in; the default is covered in writefence_cases
+        p.set_config("restrictions.no_internet", True)   # Codex's read-only sandbox applies only then
     reply = {"actions": [{"type": "reply", "chat": "c1", "text": "hello from codex", "title": None}],
              "summary": None}
     p, run, _, argv, stdin = _cli_run(env, monkeypatch, "codex", _codex_events(*_codex_turn(json.dumps(reply))),
@@ -8589,7 +8352,6 @@ def test_codex_coordinator_turn_is_read_only_and_its_actions_apply(env, monkeypa
     assert argv[-1] == "-" and "PROMPT-MARKER" in stdin
     assert run["status"] == "ok"
     assert p.db.one("SELECT text FROM messages WHERE direction='out' AND chat='c1'")["text"] == "hello from codex"
-
 
 
 def test_a_gated_task_drops_its_reservation(env):
@@ -8610,7 +8372,6 @@ def test_a_gated_task_drops_its_reservation(env):
     assert locks.reserved_by(mark) is None, "a task a gate kept out still held its reservation"
 
 
-
 def test_the_same_update_from_a_later_turn_is_still_written(env, tmp_path):
     p = make(env)
     from ttp import coordinator as coord
@@ -8628,7 +8389,6 @@ def test_the_same_update_from_a_later_turn_is_still_written(env, tmp_path):
     assert steer.count("Use board 1 only.") == 2 and steer.rstrip().endswith("Use board 1 only.")
     assert p.charter_path.read_text().count("Use board 1 only.") == 2
     assert len(list(p.memory_dir.glob("fact-use-board-1-only*.md"))) == 2
-
 
 
 def test_pinned_memory_overflow_is_marked_in_the_prompt_and_alerts_the_coordinator_once(env):
@@ -8653,7 +8413,6 @@ def test_pinned_memory_overflow_is_marked_in_the_prompt_and_alerts_the_coordinat
     assert len(alerts()) == 1, "the alert repeats"
     digest = coord.digest(p, {}, [], [])
     assert "## Memory over budget: 13 entries" in digest and f"workers see {10 - n}" in digest
-
 
 
 def test_workers_get_a_charter_and_memory_digest_with_every_restriction_verbatim(env):
@@ -8700,7 +8459,6 @@ def test_workers_get_a_charter_and_memory_digest_with_every_restriction_verbatim
     assert "workers see" in coord.memory_budget_line(p)
 
 
-
 def test_memory_forget_archives_the_entry_and_is_idempotent_on_replay(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -8725,7 +8483,6 @@ def test_memory_forget_archives_the_entry_and_is_idempotent_on_replay(env):
     assert coord.apply(p, [{"type": "memory_forget", "name": "no-such-entry"}], turn=8)
 
 
-
 def test_a_replayed_forget_then_add_of_the_same_title_keeps_both_entries(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -8741,7 +8498,6 @@ def test_a_replayed_forget_then_add_of_the_same_title_keeps_both_entries(env):
     text = p.memory_text()
     assert "Box A is taken." in text and "Box A is free." not in text
     assert p.memory_index.read_text().count("Box A status") == 1
-
 
 
 def test_a_standing_entry_is_refused_retirement_without_a_why(env):
@@ -8761,7 +8517,6 @@ def test_a_standing_entry_is_refused_retirement_without_a_why(env):
     with pytest.raises(SystemExit, match="standing instruction"), contextlib.redirect_stdout(io.StringIO()):
         cli.main(["memory", "demo", "--forget", duty.stem])
     assert duty.exists() and "repower it" in p.memory_text()
-
 
 
 def test_a_standing_entry_retires_with_a_why_and_is_shortened_by_a_standing_supersede(env):
@@ -8788,7 +8543,6 @@ def test_a_standing_entry_retires_with_a_why_and_is_shortened_by_a_standing_supe
     assert not timed.exists() and (p.memory_dir / "archive" / timed.name).exists()
 
 
-
 def test_memory_budget_keeps_standing_entries_whole(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -8802,7 +8556,6 @@ def test_memory_budget_keeps_standing_entries_whole(env):
     assert "never retired for space" in coord.memory_budget_line(p)
 
 
-
 def _memory_section(digest):
     """The digest's 'Memory added since the snapshot' lines, or [] when it has none."""
     lines = digest.splitlines()
@@ -8811,7 +8564,6 @@ def _memory_section(digest):
         return []
     end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("#")), len(lines))
     return lines[start + 1:end]
-
 
 
 def test_memory_added_between_turns_waits_in_the_digest_and_keeps_the_system_prompt(env):
@@ -8831,7 +8583,6 @@ def test_memory_added_between_turns_waits_in_the_digest_and_keeps_the_system_pro
     assert "[fact-" in recent and "Builds need a quiet window." in recent and "Builds need" not in before
 
 
-
 def test_memory_retired_between_turns_is_named_in_the_digest_and_keeps_the_system_prompt(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -8843,7 +8594,6 @@ def test_memory_retired_between_turns_is_named_in_the_digest_and_keeps_the_syste
     assert coord.system_prompt(p) == before
     assert _memory_section(digest) == [f"[{stale.stem}] retired, ignore"]
     assert "host01 is ours until Friday." not in digest
-
 
 
 def test_the_system_memory_block_carries_only_standing_entries_in_stable_order(env):
@@ -8864,7 +8614,6 @@ def test_the_system_memory_block_carries_only_standing_entries_in_stable_order(e
     assert "Keep replies short." not in recent
 
 
-
 def _deploy(p, version: str) -> None:
     """A release installed into the project: new role rules and a new runtime version."""
     role = p.harness / "prompts" / "coordinator.md"
@@ -8872,7 +8621,6 @@ def _deploy(p, version: str) -> None:
     init = p.harness / "runtime" / "ttp" / "__init__.py"
     init.parent.mkdir(parents=True, exist_ok=True)
     init.write_text(f'__version__ = "{version}"\n')
-
 
 
 def test_memory_deploys_and_charter_edits_keep_the_prompt_byte_identical_within_the_cache_window(env):
@@ -8902,7 +8650,6 @@ def test_memory_deploys_and_charter_edits_keep_the_prompt_byte_identical_within_
     assert coord.prompt_delta_lines(p, now=start + 14401) == []
 
 
-
 def test_a_gap_longer_than_the_cache_lifetime_re_renders_the_prompt(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -8919,7 +8666,6 @@ def test_a_gap_longer_than_the_cache_lifetime_re_renders_the_prompt(env):
     p.db.set_kv("last_coordinator_turn", start + 3700)
     assert coord.system_prompt(p, now=start + 3900) == cold
     assert "Box E joined the pool." in coord.system_prompt(p, now=start + 4100)
-
 
 
 def test_a_restrictions_change_or_a_users_charter_edit_re_renders_the_prompt_at_once(env):
@@ -8949,7 +8695,6 @@ def test_a_restrictions_change_or_a_users_charter_edit_re_renders_the_prompt_at_
     assert coord.system_prompt(p, now=start + 6) == users and p.db.kv(coord.PROMPT_REFRESH_KEY) is None
 
 
-
 def test_memory_order_follows_created_not_mtime(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -8970,7 +8715,6 @@ def test_memory_order_follows_created_not_mtime(env):
     assert coord.system_prompt(p) == coord.system_prompt(p)
 
 
-
 def test_a_restriction_memory_reaches_running_workers_and_new_prompts(env, tmp_path):
     p = make(env)
     from ttp import coordinator as coord
@@ -8984,7 +8728,6 @@ def test_a_restriction_memory_reaches_running_workers_and_new_prompts(env, tmp_p
                             "memory_kind": "restriction"}], turn=1) == []
     assert "Never reboot box A." in (run_dir / "steer.md").read_text()
     assert "Never reboot box A." in _worker_text(p)
-
 
 
 def test_the_review_prompt_approves_into_the_push_queue_only_when_it_is_on(env):
@@ -9036,7 +8779,6 @@ def test_the_review_prompt_approves_into_the_push_queue_only_when_it_is_on(env):
     assert "## Delivery: push queue on for work (delivery.push_queue)" in coord.system_prompt(p)
 
 
-
 def test_a_reboot_is_recorded_with_the_runs_it_cut_and_the_locks_held(env, tmp_path, monkeypatch):
     p = make(env)
     from ttp import coordinator as coord
@@ -9077,7 +8819,6 @@ def test_a_reboot_is_recorded_with_the_runs_it_cut_and_the_locks_held(env, tmp_p
     assert len(p.db.boots(0)) == 1
 
 
-
 def test_no_host_line_without_a_reboot_in_the_last_day(env, tmp_path, monkeypatch):
     p = make(env)
     from ttp import coordinator as coord
@@ -9095,7 +8836,6 @@ def test_no_host_line_without_a_reboot_in_the_last_day(env, tmp_path, monkeypatc
     assert "## Host" not in coord.digest(p, {}, [], [])
 
 
-
 def test_a_failed_detached_job_retires_a_charter_until_probe(env, tmp_path):
     p = make(env)
     from ttp import coordinator as coord
@@ -9110,7 +8850,6 @@ def test_a_failed_detached_job_retires_a_charter_until_probe(env, tmp_path):
     assert len(retired) == 1 and "ended but failed or left no exit code (job rc=3)" in retired[0], retired
     assert "Leave the queue alone." not in p.charter_path.read_text()
     assert not p.db.kv(ends.BROKEN_KEY), "a failed job is not a broken probe"
-
 
 
 def test_a_failed_detached_job_ends_a_pause_and_a_mute_not_as_a_broken_probe(env, tmp_path):
@@ -9137,7 +8876,6 @@ def test_a_failed_detached_job_ends_a_pause_and_a_mute_not_as_a_broken_probe(env
     assert not any("broken" in t for t in ended), ended
 
 
-
 def test_a_failed_detached_job_releases_a_when_hold_saying_it_failed(env, tmp_path):
     p = make(env)
     from ttp import coordinator as coord
@@ -9159,7 +8897,6 @@ def test_a_failed_detached_job_releases_a_when_hold_saying_it_failed(env, tmp_pa
     assert not p.db.q("SELECT id FROM events WHERE kind='hold_probe_broken'")
 
 
-
 def test_a_start_when_on_a_failed_detached_job_raises_job_failed_not_broken(env, monkeypatch, tmp_path):
     p = make(env)
     from ttp import coordinator as coord
@@ -9178,7 +8915,6 @@ def test_a_start_when_on_a_failed_detached_job_raises_job_failed_not_broken(env,
     assert len(ev) == 1 and "failed or left no exit code" in ev[0]["text"], ev
     assert not _events(p, tid, "deferral_probe_broken") and not _ready(p, tid)
     assert coord.EFFORT_EVENT_TRIGGERS["deferral_job_failed"] == "stuck"
-
 
 
 @pytest.mark.parametrize("unrelated", [False, True])
@@ -9211,7 +8947,6 @@ def test_an_on_pass_cmd_still_runs_model_free_after_a_resource_move_rewrites_its
     assert len(p.db.q("SELECT id FROM runs WHERE task=?", (tid,))) == 1
 
 
-
 def test_passed_checks_still_record_on_pass_after_a_resource_move_rewrites_the_probe(env, monkeypatch, tmp_path):
     p = make(env)
     from ttp import coordinator as coord, daemon as dmod
@@ -9232,7 +8967,6 @@ def test_passed_checks_still_record_on_pass_after_a_resource_move_rewrites_the_p
     assert task["status"] == "done" and res["summary"] == DONE_ON_PASS["summary"], (task["status"], res)
     assert res["run_status"] == "model-free"
     assert len(p.db.q("SELECT id FROM runs WHERE task=?", (tid,))) == 1
-
 
 
 @pytest.mark.parametrize("probe", ["exit 1", "exit 75", "unreachable", "end marker"])
@@ -9279,7 +9013,6 @@ def test_past_the_hold_cap_a_not_yet_probe_keeps_the_task_asleep_and_asks_the_co
     assert len(p.db.q("SELECT id FROM events WHERE task=? AND kind='wait_stale'", (tid,))) == 2
 
 
-
 def test_requeuing_a_blocked_waiting_task_runs_it_without_the_probe_hold(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -9290,7 +9023,6 @@ def test_requeuing_a_blocked_waiting_task_runs_it_without_the_probe_hold(env):
     assert coord.apply(p, [{"type": "task_update", "id": tid, "status": "queued"}]) == []
     d.probe_waiting()
     assert _ready(p, tid) and not d._probes
-
 
 
 def test_a_requeued_task_is_not_blocked_again_by_one_later_reboot_loss(env, tmp_path):
@@ -9305,7 +9037,6 @@ def test_a_requeued_task_is_not_blocked_again_by_one_later_reboot_loss(env, tmp_
     assert coord.apply(p, [{"type": "task_update", "id": tid, "status": "queued"}]) == []
     _lost_to_reboot(p, d, tmp_path, tid, name="after")
     assert p.db.task(tid)["status"] == "queued", "a requeue did not start the reboot count over"
-
 
 
 def test_relaunched_checks_count_toward_reboot_losses(env, tmp_path):
@@ -9345,7 +9076,6 @@ def test_relaunched_checks_count_toward_reboot_losses(env, tmp_path):
     assert coord.apply(p, [{"type": "task_update", "id": tid, "status": "queued"}]) == []
     reboot(tid, "boot-after")
     assert len(_relaunches(p, tid)) == 3 and p.db.task(tid)["status"] == "queued"
-
 
 
 def test_resumable_job_relaunches_count_toward_max_reboot_losses(env, tmp_path, monkeypatch):
@@ -9389,7 +9119,6 @@ def test_resumable_job_relaunches_count_toward_max_reboot_losses(env, tmp_path, 
     assert p.db.task(calm)["status"] == "queued"
 
 
-
 def _paused_dispatch(p, monkeypatch):
     from ttp import budget as bud
     from ttp.daemon import Daemon
@@ -9401,7 +9130,6 @@ def _paused_dispatch(p, monkeypatch):
     d.gates[provider] = bud.Gate(provider, regime="windows", max_parallel=6)
     d.dispatch()
     return d, started
-
 
 
 def test_a_paused_resource_holds_its_tasks_across_restarts_until_resumed(env, monkeypatch):
@@ -9431,7 +9159,6 @@ def test_a_paused_resource_holds_its_tasks_across_restarts_until_resumed(env, mo
     assert p.db.paused_resources() == {}
 
 
-
 def test_a_resource_pause_reaches_only_workers_that_use_it(env, tmp_path):
     p = make(env)
     from ttp import coordinator as coord
@@ -9455,7 +9182,6 @@ def test_a_resource_pause_reaches_only_workers_that_use_it(env, tmp_path):
     assert "no longer paused" in (dirs["on board"] / "steer.md").read_text()
 
 
-
 def test_resource_pause_actions_are_validated_and_a_user_pause_needs_the_user(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -9477,7 +9203,6 @@ def test_resource_pause_actions_are_validated_and_a_user_pause_needs_the_user(en
     # A pause the coordinator set, it may lift itself.
     assert coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": True, "end_when": "false"}]) == []
     assert coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": False}]) == []
-
 
 
 def test_a_resource_pause_without_an_end_is_refused(env, capsys):
@@ -9511,7 +9236,6 @@ def test_a_resource_pause_without_an_end_is_refused(env, capsys):
     coord.pause_resource(p, "board", True, reason="from before ends", by="user")
     Daemon(p.base).check_pause_ends()
     assert p.db.paused_resources()["board"]["end_default"] is True
-
 
 
 def test_every_stored_probe_must_parse_as_posix_sh(env, capsys):
@@ -9560,7 +9284,6 @@ def test_every_stored_probe_must_parse_as_posix_sh(env, capsys):
     assert json.loads(p.db.task(tid)["result"])["retry_when"] == "exit 1"
 
 
-
 @pytest.mark.parametrize("role", ["worker", "coordinator"])
 def test_a_pause_set_inside_a_run_is_not_the_users_and_the_coordinator_may_lift_it(env, monkeypatch, capsys, role):
     p = make(env)
@@ -9580,7 +9303,6 @@ def test_a_pause_set_inside_a_run_is_not_the_users_and_the_coordinator_may_lift_
     cli.main(["pause", "demo", "--resource", "board", "--until", "1d"])
     assert p.db.paused_resources()["board"]["by"] == "user"
     assert coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": False}])
-
 
 
 def test_a_pause_without_an_end_gets_a_default_end_and_one_info_message(env):
@@ -9609,7 +9331,6 @@ def test_a_pause_without_an_end_gets_a_default_end_and_one_info_message(env):
     assert coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": True, "until": "1d",
                             "reason": "firmware still flashing"}]) == []
     assert "end_default" not in p.db.paused_resources()["board"]
-
 
 
 def test_an_end_when_probe_prompts_the_coordinator_and_a_user_pause_is_left_alone(env):
@@ -9644,7 +9365,6 @@ def test_an_end_when_probe_prompts_the_coordinator_and_a_user_pause_is_left_alon
     assert coord.apply(p, [{"type": "resource_pause", "resource": "box", "paused": True, "end_when": "exit 7"}]) == []
     assert settle(now + 3 * pauseends.PROBE_EVERY_S) == ["box"]
     assert "broken (exit 7)" in p.db.q("SELECT text FROM events WHERE kind='pause_end_due'")[-1]["text"]
-
 
 
 def test_a_user_pause_end_when_is_a_signal_status_says_so_and_the_coordinator_is_told_once(env):
@@ -9821,7 +9541,6 @@ def _settle_end_probes(owner, now):
     return got
 
 
-
 def test_an_end_when_255_is_not_yet_only_when_ssh_cannot_reach_its_host(env, monkeypatch):
     """A pause's end_when 255 counts as "host unreachable" only once ssh confirms each host it names is
     silent (netwait.confirm, off the daemon's thread); one whose host answers is a broken probe."""
@@ -9843,7 +9562,6 @@ def test_an_end_when_255_is_not_yet_only_when_ssh_cannot_reach_its_host(env, mon
     (ev,) = p.db.q("SELECT text FROM events WHERE kind='pause_end_due'")
     assert "broken (exit 255 though ssh reaches boxa" in ev["text"], ev["text"]
     assert set(p.db.paused_resources()) == {"board"}
-
 
 
 def test_a_note_from_the_project_a_pause_waits_on_re_prompts_its_owner(env, monkeypatch, capsys):
@@ -9869,7 +9587,6 @@ def test_a_note_from_the_project_a_pause_waits_on_re_prompts_its_owner(env, monk
     assert set(dst.db.paused_resources()) == {"board", "rig"}
 
 
-
 def test_a_machine_note_past_its_until_is_marked_stale_in_the_digest(env):
     p = make(env)
     from ttp import cli, coordinator as coord, machines as mm
@@ -9889,7 +9606,6 @@ def test_a_machine_note_past_its_until_is_marked_stale_in_the_digest(env):
     assert "note_until" not in mm.load()["box-a"] and not mm.digest_lines(p.db, {}, later)
 
 
-
 def test_paused_resources_show_in_the_digest_status_and_web_state(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -9907,7 +9623,6 @@ def test_paused_resources_show_in_the_digest_status_and_web_state(env):
     assert "Paused resources" not in coord.digest(p, {}, [], [])
 
 
-
 def test_an_unrecorded_project_pause_shows_paused_by_unknown(env):
     p = make(env)
     from ttp import coordinator as coord, projpause
@@ -9923,7 +9638,6 @@ def test_an_unrecorded_project_pause_shows_paused_by_unknown(env):
     Daemon(p.base).tick()
     assert len(_pause_events(p)) == 1   # recorded once
     assert "## Project paused by unknown since " in coord.digest(p, {}, [], [])
-
 
 
 def test_resuming_a_resource_wakes_the_tasks_that_waited_on_its_pause(env):
@@ -9956,7 +9670,6 @@ def test_resuming_a_resource_wakes_the_tasks_that_waited_on_its_pause(env):
         assert p.db.task(tid)["not_before"] > time.time() + 3600 and tid not in due, p.db.task(tid)
 
 
-
 def test_health_does_not_count_a_task_on_a_paused_resource_as_ready(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -9971,7 +9684,6 @@ def test_health_does_not_count_a_task_on_a_paused_resource_as_ready(env):
     p.db.x("UPDATE tasks SET status='done' WHERE title='docs'")
     why = state_payload(p, p.db)["health"]["why_idle"]
     assert "ready to start" not in why and "board is paused" in why, why
-
 
 
 def test_ttp_lock_refuses_a_paused_resource_with_75(env, tmp_path):
@@ -9994,7 +9706,6 @@ def test_ttp_lock_refuses_a_paused_resource_with_75(env, tmp_path):
     assert subprocess.run(cmd, env=run_env).returncode == 0 and marker.exists()
 
 
-
 def test_a_pause_set_while_ttp_lock_waits_ends_the_wait_with_75(env, tmp_path):
     p = make(env)
     from ttp import coordinator as coord
@@ -10015,7 +9726,6 @@ def test_a_pause_set_while_ttp_lock_waits_ends_the_wait_with_75(env, tmp_path):
     finally:
         os.killpg(holder.pid, signal.SIGTERM)
         holder.wait(timeout=30)
-
 
 
 def test_the_digest_lists_machines_and_resources_that_keep_failing(env):
@@ -10051,7 +9761,6 @@ def test_the_digest_lists_machines_and_resources_that_keep_failing(env):
     assert "no other machine shares its tags" in coord.digest(p, {}, [], []), "a paused machine was offered"
 
 
-
 def test_task_update_moves_a_task_to_another_resource(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -10072,7 +9781,6 @@ def test_task_update_moves_a_task_to_another_resource(env):
     assert json.loads(p.db.task(tid)["labels"]) == ["continues:3", "exclusive:box-b"]
 
 
-
 def _waiting_on(p, labels, **result):
     tid = p.db.add_task("soak test", "s", kind="work", tier="light", origin="user", labels=labels)
     p.db.update_task(tid, status="queued", not_before=time.time() + 7200, blocked_reason="waiting",
@@ -10080,11 +9788,9 @@ def _waiting_on(p, labels, **result):
     return tid
 
 
-
 def _still_waits(t, probe=None):
     res = json.loads(t["result"])
     return t["not_before"] and "waiting_since" in res and (probe is None or res.get("retry_when") == probe)
-
 
 
 def test_task_update_resources_keeps_waits_that_are_not_on_the_old_resource(env):
@@ -10116,7 +9822,6 @@ def test_task_update_resources_keeps_waits_that_are_not_on_the_old_resource(env)
     assert move(tid) == [] and _still_waits(p.db.task(tid), "ttp lock --probe box-a || test -e /tmp/x")
 
 
-
 def test_task_update_resources_clears_a_wait_on_the_old_resource_only(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -10140,7 +9845,6 @@ def test_task_update_resources_clears_a_wait_on_the_old_resource_only(env):
     assert d._start_hold(t, "claude", ctx) == "paused"
 
 
-
 def test_task_update_resources_with_an_explicit_start_still_applies_it(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -10159,7 +9863,6 @@ def test_task_update_resources_with_an_explicit_start_still_applies_it(env):
     assert coord.apply(p, [{"type": "task_update", "id": tid, "resources": ["box-b"], "start_after": "now"}]) == []
     t = p.db.task(tid)   # still waiting on its retry_when: its retry timer keeps the probe gating it
     assert t["not_before"] is not None and json.loads(t["labels"])[0] == "resource:box-b"
-
 
 
 def test_waits_and_dependency_blocks_alone_do_not_start_a_trouble_episode_and_episodes_do_not_flap(env):
@@ -10193,7 +9896,6 @@ def test_waits_and_dependency_blocks_alone_do_not_start_a_trouble_episode_and_ep
     assert len(events()) == 1, "a count hovering at the threshold started a second episode"
 
 
-
 def test_invalid_resource_names_are_reported_not_silently_dropped(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -10205,7 +9907,6 @@ def test_invalid_resource_names_are_reported_not_silently_dropped(env):
     assert len(problems) == 1 and "'-bad' dropped" in problems[0] and problems[0].startswith("task_add")
     new = p.db.one("SELECT labels FROM tasks WHERE title='new'")
     assert json.loads(new["labels"]) == ["resource:ok1"]
-
 
 
 def test_top_section_lists_open_asks_first_and_never_caps_them(env):
@@ -10231,7 +9932,6 @@ def test_top_section_lists_open_asks_first_and_never_caps_them(env):
     assert "Question 0?" in coord.digest(p, {}, [], [])
 
 
-
 def test_web_why_names_cap_zero_and_review_cap(env):
     p = make(env)
     from ttp import coordinator as coord, web
@@ -10242,7 +9942,6 @@ def test_web_why_names_cap_zero_and_review_cap(env):
     assert "24 h cap on review tasks is full" in web.health(p, p.db, alive=True)["why_idle"]
     p.db.set_kv(coord.RETRY_WAKE_KEY, {"at": now + coord.NO_SLOT_S, "review": False})
     assert "cap on new tasks is 0: none are added until it is raised" in web.health(p, p.db, alive=True)["why_idle"]
-
 
 
 def test_two_projects_take_turns_on_a_shared_resource(env, tmp_path):
@@ -10278,7 +9977,6 @@ def test_two_projects_take_turns_on_a_shared_resource(env, tmp_path):
     assert subprocess.run([sys.executable, str(TTP), "lock", "--timeout", "5", "board", "--", "true"],
                           env=env_b).returncode == 0
     assert "shared board: free" in status_text(a, verbose=True) and "shared board" not in status_text(a)
-
 
 
 def test_a_pause_of_a_shared_resource_holds_in_every_project(env, tmp_path):
@@ -10326,7 +10024,6 @@ def test_a_pause_of_a_shared_resource_holds_in_every_project(env, tmp_path):
     coord.sync_shared_pauses(a)
     assert ta in {t["id"] for t in a.db.ready_tasks()}, "a resume from another project did not wake the task"
     assert "no longer paused" in (run_dir / "steer.md").read_text()
-
 
 
 @pytest.mark.parametrize("how", ["unshare", "remove", "config", "list-merge"])
@@ -10384,7 +10081,6 @@ def test_a_user_pause_outlives_the_resource_leaving_the_share(env, tmp_path, cap
     assert "no longer paused" not in (run_dir / "steer.md").read_text()
 
 
-
 def test_projects_that_give_a_shared_resource_different_slot_counts_use_the_smallest(env, tmp_path):
     a = make(env)
     b = _second_project(env)
@@ -10423,7 +10119,6 @@ def test_projects_that_give_a_shared_resource_different_slot_counts_use_the_smal
     assert "different slot counts" not in status_text(a)
 
 
-
 def test_project_scoped_resources_stay_per_project(env, tmp_path):
     a = make(env)
     b = _second_project(env)
@@ -10439,7 +10134,6 @@ def test_project_scoped_resources_stay_per_project(env, tmp_path):
     assert subprocess.run([sys.executable, str(TTP), "lock", "--timeout", "5", "board", "--", "true"],
                           env=env_b).returncode == 0
     assert coord.pause_resource(a, "board", False) == "board resumed"
-
 
 
 def test_the_coordinator_model_and_effort_override_its_tier_and_leave_workers_alone(env):
@@ -10488,7 +10182,6 @@ def test_the_coordinator_model_and_effort_override_its_tier_and_leave_workers_al
     d = Daemon(p.base)
     row = run(d, "coordinator")
     assert (row["model"], row["effort"]) == ("pinned-model", "xhigh")
-
 
 
 def test_coordinator_route_defaults_to_xhigh_and_an_explicit_effort_wins_as_each_provider_takes_it():
@@ -10641,7 +10334,6 @@ def test_unblocking_turns_name_their_trigger_and_routine_turns_do_not(env, monke
     assert calls[-1]["note"]["unblock"] == "stalled on blocked tasks"
 
 
-
 def test_effort_triggers_raise_every_tricky_turn_and_leave_routine_ones_low(env):
     """One table of rules: each trigger class raises the turn, a quiet batch does not."""
     p = make(env)
@@ -10741,7 +10433,6 @@ def test_effort_triggers_raise_every_tricky_turn_and_leave_routine_ones_low(env)
     db.set_kv(coord.EFFORT_SEEN_KEY, {})
 
 
-
 def test_idle_slot_trigger_treats_dependencies_on_deferrals_as_deferred_and_fires_only_on_new_held_ids(env):
     """A task waiting only on queued deferrals (directly or down a chain) is deferred, not held.
     The trigger raises only when an id not held before joins the held set: never when the set
@@ -10794,7 +10485,6 @@ def test_idle_slot_trigger_treats_dependencies_on_deferrals_as_deferred_and_fire
     assert grandchild not in seen["held"] and child not in seen["held"]
 
 
-
 def test_planned_deferrals_do_not_count_as_held_work_but_real_holds_still_raise(env):
     """'idle slots, queued work held' is for work that cannot start, not for work deferred on
     purpose: a queue of start_after/start_when tasks raises nothing; a paused resource still does,
@@ -10838,7 +10528,6 @@ def test_planned_deferrals_do_not_count_as_held_work_but_real_holds_still_raise(
     d.tick()
     evs = [r["id"] for r in db.q("SELECT id FROM events WHERE kind='dead_dependency' AND task=?", (child,))]
     assert evs and "dead_dependency" in coord.effort_triggers(db, cfg, evs, None)[0]
-
 
 
 def test_effort_lowering_rules_keep_routine_events_low_and_log_the_rule(env, monkeypatch):
@@ -10929,7 +10618,6 @@ def test_effort_lowering_rules_keep_routine_events_low_and_log_the_rule(env, mon
         assert trig([ev(kind, "high", "fp-old")])[0][0] == kind
 
 
-
 def test_a_plain_needs_review_hand_off_the_daemon_reviews_raises_no_effort(env, monkeypatch):
     """1) A code task's needs_review hand-off with nothing else to decide is marked plain, and since the
     daemon reviews it (a review it queued, or its sweep), it raises no trigger and logs the rule. One
@@ -10971,7 +10659,6 @@ def test_a_plain_needs_review_hand_off_the_daemon_reviews_raises_no_effort(env, 
     assert coord.effort_triggers(p.db, p.config(), [noted["id"]], None)[0] == ["task_review"]
 
 
-
 def test_memory_supersedes_never_retires_the_entry_it_adds(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -10982,7 +10669,6 @@ def test_memory_supersedes_never_retires_the_entry_it_adds(env):
     errors = coord.apply(p, act, turn=3)
     assert errors and "supersedes" in errors[0] and "no memory entry" in errors[0]
     assert (p.memory_dir / "fact-box-a-status-now.md").exists()
-
 
 
 def test_task_add_start_after_keeps_the_task_queued_until_then(env, host_tz):
@@ -11007,7 +10693,6 @@ def test_task_add_start_after_keeps_the_task_queued_until_then(env, host_tz):
     assert _ready(p, three), "a start_after alone needs no probe once its time has come"
 
 
-
 @pytest.mark.parametrize("action, why", [
     ({"start_after": "tomorrow"}, "start_after 'tomorrow'"),
     ({"start_after": "2026-13-40"}, "start_after '2026-13-40'"),
@@ -11022,7 +10707,6 @@ def test_task_add_rejects_bad_start_values(env, action, why):
     problems = coord.apply(p, [{"type": "task_add", "title": "deferred", "spec": "s", **action}])
     assert len(problems) == 1 and why in problems[0], problems
     assert not p.db.one("SELECT id FROM tasks WHERE title='deferred'")
-
 
 
 def test_actions_schema_validates_start_after_and_start_when(env):
@@ -11047,7 +10731,6 @@ def test_actions_schema_validates_start_after_and_start_when(env):
     assert ok(start_when="test -f out/done") and not ok(start_when=1) and not ok(start_when=["true"])
 
 
-
 def test_a_start_when_task_starts_only_once_its_probe_passes(env, monkeypatch):
     p = make(env)
     from ttp import coordinator as coord
@@ -11070,7 +10753,6 @@ def test_a_start_when_task_starts_only_once_its_probe_passes(env, monkeypatch):
     assert f"task {tid} start_when passed" in (p.logs / "daemon.log").read_text()
 
 
-
 @pytest.mark.parametrize("clear", ["now", "", " NOW ", "  "])
 def test_task_update_start_when_now_or_empty_clears_the_probe(env, clear):
     p = make(env)
@@ -11084,14 +10766,12 @@ def test_task_update_start_when_now_or_empty_clears_the_probe(env, clear):
     assert _ready(p, tid)
 
 
-
 def test_task_add_start_when_now_adds_a_task_with_no_probe(env):
     p = make(env)
     from ttp import coordinator as coord
     assert coord.apply(p, [{"type": "task_add", "title": "go", "spec": "s", "start_when": "Now"}]) == []
     tid = _added(p, "go")
     assert _ready(p, tid) and not any(lb.startswith("start_when:") for lb in _labels(p, tid))
-
 
 
 def test_task_add_start_when_now_with_newlines_and_a_stored_now_label_are_no_probe(env):
@@ -11103,7 +10783,6 @@ def test_task_add_start_when_now_with_newlines_and_a_stored_now_label_are_no_pro
     assert _ready(p, tid) and not any(lb.startswith("start_when:") for lb in _labels(p, tid))
     # A `now` stored before it was cleared at add time is no probe either: the task starts.
     assert deferral({"labels": json.dumps(["start_when: Now ", "deferred_since:1"])}) == {"since": 1.0}
-
 
 
 def test_a_new_start_when_is_never_run_at_defer_time(env, monkeypatch):
@@ -11134,7 +10813,6 @@ def test_a_new_start_when_is_never_run_at_defer_time(env, monkeypatch):
     assert f"start_when:{slow}" in _labels(p, _added(p, "slow")) and f"start_when:{broken}" in _labels(p, tid)
 
 
-
 @pytest.mark.parametrize("probe", ["landed:#12 || exit 1", "landed:12x", "landed:#", "Landed:#12"])
 def test_a_start_when_that_is_not_exactly_landed_id_is_refused(env, probe):
     p = make(env)
@@ -11151,7 +10829,6 @@ def test_a_start_when_that_is_not_exactly_landed_id_is_refused(env, probe):
         cli.set_when(p.db, tid, probe, p)
     for ok in (" landed: 12 ", "landed:12", "ttp landed --task 12 && test -f out/x"):
         assert coord.apply(p, [{"type": "task_update", "id": tid, "start_when": ok}]) == [], ok
-
 
 
 @pytest.mark.parametrize("probe", [
@@ -11184,7 +10861,6 @@ def test_start_when_grepping_the_push_branch_log_is_refused_for_landed(env, prob
     assert coord.apply(p, [{"type": "task_add", "title": "l", "spec": "s", "start_when": "landed:#4"}]) == []
 
 
-
 @pytest.mark.parametrize("probe", [
     "git show origin/work:file | grep -q x",
     "git fetch -q origin work && git show origin/work:docs/log.md | grep -q 'x' || exit 1",
@@ -11199,7 +10875,6 @@ def test_start_when_grepping_a_file_or_another_log_is_no_push_branch_log_grep(en
     assert f"start_when:{probe}" in _labels(p, _added(p, "ok"))
 
 
-
 def test_task_update_start_when_real_probe_is_still_stored(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -11207,7 +10882,6 @@ def test_task_update_start_when_real_probe_is_still_stored(env):
     tid = _added(p, "t")
     assert coord.apply(p, [{"type": "task_update", "id": tid, "start_when": "test -f out/now"}]) == []
     assert "start_when:test -f out/now" in _labels(p, tid) and not _ready(p, tid)
-
 
 
 @pytest.mark.parametrize("probe", [
@@ -11236,7 +10910,6 @@ def test_a_start_when_that_only_tests_a_ready_marker_is_flagged_not_refused(env,
     assert "; flagged: " in cli.set_when(p.db, t2, probe, p)
 
 
-
 @pytest.mark.parametrize("probe", [
     "test -f out/now",                                          # a marker, but no readiness marker
     "test -f state/ready/box1.READY && broker-status --healthy",  # a live check alongside it
@@ -11247,7 +10920,6 @@ def test_a_start_when_with_a_live_check_or_no_ready_marker_is_not_flagged(env, p
     from ttp import coordinator as coord
     assert coord.apply(p, [{"type": "task_add", "title": "ok", "spec": "s", "start_when": probe}]) == []
     assert p.db.kv(coord.NOTES_KEY) == [] and coord.marker_only_probe(probe) is None
-
 
 
 @pytest.mark.parametrize("probe,flagged", [
@@ -11280,7 +10952,6 @@ def test_parse_start_after_now_any_case_or_empty_clears(env):
         assert coord.parse_start_after(v) is None, v
 
 
-
 def test_a_start_when_probe_waits_for_start_after(env, monkeypatch):
     p = make(env)
     from ttp import coordinator as coord
@@ -11294,7 +10965,6 @@ def test_a_start_when_probe_waits_for_start_after(env, monkeypatch):
     p.db.update_task(tid, not_before=time.time() - 1)
     _settle_deferred(d, tid)
     assert _ready(p, tid)
-
 
 
 # Defer time does not run the probe (check_start_when): one that cannot work (127, a bare `git
@@ -11323,7 +10993,6 @@ def test_a_broken_start_when_raises_one_event_and_never_a_worker_run(env, monkey
     assert not p.db.q("SELECT id FROM runs WHERE task=?", (tid,))
 
 
-
 @pytest.mark.parametrize("probe, why", [("grep -q ready no-such-dir/status.md", "exit 2"),
                                         ("no-such-command-here", "exit 127")])
 def test_a_broken_waits_on_when_probe_raises_one_event_and_a_log_line(env, monkeypatch, probe, why):
@@ -11344,7 +11013,6 @@ def test_a_broken_waits_on_when_probe_raises_one_event_and_a_log_line(env, monke
     assert p.db.task(tid)["status"] == "blocked"
     log_text = (p.logs / "daemon.log").read_text()
     assert log_text.count(f"task {tid} hold_probe_broken ({why})") == 1, log_text[-2000:]
-
 
 
 @pytest.mark.parametrize("probe, flagged", [
@@ -11386,7 +11054,6 @@ def test_a_probe_reading_a_missing_project_relative_file_is_flagged(env, probe, 
     assert "; flagged: retry_when" in cli.set_when(p.db, waiting, probe, p)
 
 
-
 def test_a_start_when_probe_exiting_255_means_not_yet(env, monkeypatch):
     p = make(env)
     from ttp import coordinator as coord
@@ -11401,7 +11068,6 @@ def test_a_start_when_probe_exiting_255_means_not_yet(env, monkeypatch):
     assert not _ready(p, tid) and p.db.task(tid)["status"] == "queued"
 
 
-
 def test_a_start_when_probe_exiting_75_means_not_yet(env, monkeypatch):
     p = make(env)
     from ttp import coordinator as coord
@@ -11414,7 +11080,6 @@ def test_a_start_when_probe_exiting_75_means_not_yet(env, monkeypatch):
         _settle_deferred(d, tid)
     assert not _events(p, tid, "deferral_probe_broken"), "a busy lock (EX_TEMPFAIL) is not a broken probe"
     assert not _ready(p, tid) and p.db.task(tid)["status"] == "queued"
-
 
 
 def test_a_start_when_probe_that_cannot_start_raises_an_event(env, monkeypatch):
@@ -11433,7 +11098,6 @@ def test_a_start_when_probe_that_cannot_start_raises_an_event(env, monkeypatch):
         assert proc.started.wait(10)
     d.probe_waiting()
     assert len(_events(p, tid, "deferral_probe_broken")) == 1 and not _ready(p, tid)
-
 
 
 def test_a_start_when_not_met_after_defer_max_days_raises_one_event(env, monkeypatch):
@@ -11459,7 +11123,6 @@ def test_a_start_when_not_met_after_defer_max_days_raises_one_event(env, monkeyp
     assert len(_events(p, tid, "deferral_expired")) == 1
 
 
-
 def _landed_setup(env, monkeypatch):
     """A code task whose one commit (`head`) another clone landed on origin/proj as a rebased copy:
     a new sha with the same patch, author, date and subject."""
@@ -11473,7 +11136,6 @@ def _landed_setup(env, monkeypatch):
     _git_out(other, "push", "-q", "origin", "HEAD:proj")
     _git_out(repo, "fetch", "-q", "origin")
     return p, repo, other, tid, path, branch, head
-
 
 
 def test_a_start_when_landed_task_starts_once_its_rebased_landing_is_on_the_branch(env, monkeypatch):
@@ -11504,7 +11166,6 @@ def test_a_start_when_landed_task_starts_once_its_rebased_landing_is_on_the_bran
     assert not [e for i in ids for e in _events(p, i, "deferral_probe_broken")]
 
 
-
 def test_ttp_task_set_when_sets_and_clears_a_queued_tasks_start_when(env, capsys):
     p = make(env)
     from ttp import cli
@@ -11520,7 +11181,6 @@ def test_ttp_task_set_when_sets_and_clears_a_queued_tasks_start_when(env, capsys
     cli.main(["task", "demo", "set-when", str(tid), ""])
     assert not any(lb.startswith("start_when:") for lb in _labels(p, tid))
     assert "resource:board" in _labels(p, tid) and abs(p.db.task(tid)["not_before"] - after) < 1
-
 
 
 def test_task_update_changes_or_clears_a_deferral(env):
@@ -11802,7 +11462,6 @@ def test_ttp_task_requeue_names_a_deferral_it_keeps_and_how_to_clear_it(env, cap
     assert capsys.readouterr().out.strip() == f"task #{other} queued"
 
 
-
 def test_deferred_tasks_show_in_rows_not_alerts(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -11825,7 +11484,6 @@ def test_deferred_tasks_show_in_rows_not_alerts(env):
     assert "| queued (starts when: test -f out/done) |" in dg
 
 
-
 def test_config_set_rejects_sentence_push_checks_and_unknown_keys(env):
     p = make(env)
     from ttp.coordinator import apply
@@ -11836,7 +11494,6 @@ def test_config_set_rejects_sentence_push_checks_and_unknown_keys(env):
     assert any("'Run' is not a program on PATH" in x for x in probs)
     assert any("unknown key budget.daly_usd (did you mean budget.daily_usd?)" in x for x in probs)
     assert p.config()["delivery"]["push_checks"] == ["true", "./run.sh -q", "X=1 sh -c :"]
-
 
 
 def test_config_set_accepts_the_push_queue_keys_and_rejects_a_sentence_after_push(env):
@@ -11857,7 +11514,6 @@ def test_config_set_accepts_the_push_queue_keys_and_rejects_a_sentence_after_pus
     assert p.config()["delivery"]["after_push"] == ["./deploy.sh --all"] and p.config()["delivery"]["push_batch_max"] == 4
 
 
-
 def test_every_key_the_code_reads_is_known(env):
     from ttp.coordinator import USER_SETTABLE
     from ttp.project import unknown_key_hint
@@ -11865,7 +11521,6 @@ def test_every_key_the_code_reads_is_known(env):
              "budget.max_pace_hold_s", "jev.via", "jev.url", "jev.model"]
     for key in [*USER_SETTABLE, *extra]:
         assert unknown_key_hint(key) is None, key
-
 
 
 def test_schedule_set_writes_back_to_the_schedules_file_with_a_commit(env):
@@ -11879,7 +11534,6 @@ def test_schedule_set_writes_back_to_the_schedules_file_with_a_commit(env):
     assert coord.apply(p, [{"type": "schedule_set", "name": "probe", "enabled": False}]) == []
     assert next(e for e in _sched_file(p) if e["name"] == "probe")["enabled"] is False
     assert _harness_log(p)[:2] == ["schedule probe: changed", "schedule probe: added"]
-
 
 
 def test_a_broken_schedules_file_is_reported_and_left_unapplied(env):
@@ -11910,7 +11564,6 @@ def test_a_broken_schedules_file_is_reported_and_left_unapplied(env):
     assert [r["name"] for r in p.db.q("SELECT name FROM schedules")] == [entries[0]["name"]]
 
 
-
 def test_schedule_set_keeps_a_hand_edit_the_daemon_has_not_applied_yet(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -11920,7 +11573,6 @@ def test_schedule_set_keeps_a_hand_edit_the_daemon_has_not_applied_yet(env):
                             "command": "true"}]) == []
     assert [e["name"] for e in _sched_file(p)] == ["daily-review", "nightly", "pr-watch", "probe"]
     assert p.db.one("SELECT name FROM schedules WHERE name='nightly'")
-
 
 
 def test_without_a_schedules_file_the_database_holds_them_until_exported(env, capsys):
@@ -11953,7 +11605,6 @@ def test_without_a_schedules_file_the_database_holds_them_until_exported(env, ca
     assert _harness_log(p)[0] == "schedules: exported from the database"
     with pytest.raises(SystemExit):
         cli.main(["schedules", "demo", "--export", "--yes"])
-
 
 
 def test_code_tasks_land_their_own_work_only_when_the_project_opts_in(env):
@@ -11997,7 +11648,6 @@ def test_code_tasks_land_their_own_work_only_when_the_project_opts_in(env):
     assert coord.USER_SETTABLE["delivery.code_tasks_may_push"]("false") is False
 
 
-
 def test_code_tasks_may_push_is_turned_on_only_on_the_users_word(env):
     """Text from outside must not let code tasks skip review; turning the flag off is always allowed."""
     p = make(env)
@@ -12014,7 +11664,6 @@ def test_code_tasks_may_push_is_turned_on_only_on_the_users_word(env):
     # The budget keys still name spend.
     assert "ask_user (blocking spend)" in coord.apply(
         p, [{"type": "config_set", "key": "budget.daily_usd", "value": "0"}])[0]
-
 
 
 def _role_budget() -> int:
@@ -12087,10 +11736,8 @@ def test_the_coordinator_role_prompt_carries_only_the_rules_of_features_that_are
     assert feature_blocks(text, {"x", "y"}) == "a\nb\nc\n"
 
 
-
 READY_7 = ("query=mutation{markPullRequestReadyForReview(input:{pullRequestId:\"PR_kwDOabc123\"})"
            "{clientMutationId}}")
-
 
 
 def test_workers_gh_keeps_prs_in_draft_until_the_user_approves(env, tmp_path):
@@ -12160,7 +11807,6 @@ def test_workers_gh_keeps_prs_in_draft_until_the_user_approves(env, tmp_path):
     assert rc == 1, "an approval let a PR be opened as non-draft"
 
 
-
 def test_pr_approve_needs_the_users_answer_naming_the_pr(env):
     p = make(env)
     from ttp import coordinator as coord, prguard
@@ -12195,7 +11841,6 @@ def test_pr_approve_needs_the_users_answer_naming_the_pr(env):
     said = p.db.post("in", "please mark acme/widgets#9 ready for review", chat="web", provenance="web-session")
     assert approve(said, "https://github.com/acme/widgets/pull/9", "mark acme/widgets#9 ready") == []
     assert prguard.approved(p.db, "acme/widgets#9") and not prguard.approved(p.db, "acme/widgets#8")
-
 
 
 def test_pr_approve_counts_only_channels_a_run_cannot_write(env):
@@ -12233,7 +11878,6 @@ def test_pr_approve_counts_only_channels_a_run_cannot_write(env):
     assert "does not count" in " ".join(coord.apply(p, [{"type": "pr_approve", "id": ask, "text": url,
                                                          "quote": "yes"}]))
     assert not prguard.approved(p.db, "acme/widgets#7")
-
 
 
 def test_pr_approve_reads_a_slack_approval_back_from_slack(env, monkeypatch):
@@ -12311,7 +11955,6 @@ def test_pr_approve_reads_a_slack_approval_back_from_slack(env, monkeypatch):
     ask = asked("Mark acme/widgets#10 ready?")
     answer(ask, 0.5)                    # a top-level yes in the DM after the ask counts too
     assert approve(ask["id"], "acme/widgets#10") == ""
-
 
 
 def test_pr_approve_reads_the_ask_back_from_slack(env, monkeypatch):
@@ -12400,7 +12043,6 @@ def test_pr_approve_reads_the_ask_back_from_slack(env, monkeypatch):
     assert prguard.approved(p.db, "acme/widgets#7") and not prguard.approved(p.db, "acme/widgets#8")
 
 
-
 def test_rules_and_pins_from_a_relayers_context_are_refused_or_marked(env):
     """The incident: a relayer added a provider/model requirement in its own text; the coordinator stored it
     as the user's rule and pinned tasks to it. Model-free, a user rule or charter text that quotes only the
@@ -12435,7 +12077,6 @@ def test_rules_and_pins_from_a_relayers_context_are_refused_or_marked(env):
     # Unrelated rules in the same turn are not touched.
     assert coord.apply(p, [{"type": "charter_update", "section": "Goals", "text": "Fix the flaky test."}],
                        user_turn=True, messages=[mid]) == []
-
 
 
 def test_relay_tag_names_a_typo_of_the_users_word_and_keeps_pins_exact(env):
@@ -12500,7 +12141,6 @@ def test_relay_tag_names_a_typo_of_the_users_word_and_keeps_pins_exact(env):
                                    ("use mira-5x", "use mira-5", "use mira-5", {"mira-5", "mira-5x"})):
         why, _ = relay.guard(fact, [{"id": 7, "text": said, "context": ctx}], terms, typos=(t := []))
         assert why and not t, (said, why, t)
-
 
 
 def test_relay_rejection_hands_back_the_users_own_words(env):
@@ -12817,7 +12457,6 @@ def test_agent_mode_applies_the_owners_agents_order_and_refuses_each_held_class(
     assert chat in p.charter_path.read_text()
 
 
-
 def test_agent_mode_a_relayer_ordered_restrictions_change_in_a_later_turn_runs_the_held_check(env):
     """In agent mode a Restrictions change cited relayer-ordered runs the held check in a later turn with no
     messages too, not only in the agent's own turn: a scoped exception (`excepts`) or a `both_hold` item that
@@ -12973,7 +12612,6 @@ def test_relay_guard_reads_only_this_turns_context_and_counts_what_the_user_back
     assert problems and "gpt-9-test" in problems[0]
 
 
-
 def test_pr_approve_counts_only_a_clear_yes_in_the_users_own_words(env):
     """An answer that is not a yes, words the user never wrote, a reply the harness posted and an
     answer already used once never let a PR out of draft."""
@@ -13011,7 +12649,6 @@ def test_pr_approve_counts_only_a_clear_yes_in_the_users_own_words(env):
     assert "fresh yes" in approve(yes, "yes, go ahead")
 
 
-
 def test_an_approval_is_spent_and_a_pr_back_in_draft_needs_a_fresh_yes(env, tmp_path, monkeypatch):
     from ttp import coordinator as coord, prguard, watchers
     from ttp.daemon import Daemon
@@ -13036,7 +12673,6 @@ def test_an_approval_is_spent_and_a_pr_back_in_draft_needs_a_fresh_yes(env, tmp_
     assert rc == 1 and "hand off `blocked`" in err and "PR's URL" in err
     assert "fresh yes" in " ".join(coord.apply(p, [{"type": "pr_approve", "id": said, "text": url,
                                                     "quote": "yes"}]))
-
 
 
 def test_task_specs_that_take_a_pr_out_of_draft_need_the_users_approval(env):
@@ -13099,7 +12735,6 @@ def test_a_draft_gate_rejection_keeps_the_whole_action_for_the_next_turn(env):
     # other rejections keep their short form
     out = coord.apply(p, [{"type": "task_add", "title": "", "kind": "code", "spec": "x"}])
     assert out and coord.GATE_MARK not in out[0]
-
 
 
 def test_a_code_spec_without_a_where_line_gets_a_hint_never_a_rejection(env):
@@ -13191,7 +12826,6 @@ def test_a_task_asked_to_deliver_a_pr_runs_as_code(env):
     assert f"#{busy} asks for PR delivery but is running as `work`" in note and "continues" in note, note
 
 
-
 def test_an_approval_covers_only_the_commit_the_user_said_yes_to(env, tmp_path, monkeypatch):
     """A yes was recorded, then more commits were pushed and the PR was marked ready with them. The
     approval is bound to the PR's head as pr-watch last read it: a moved head is refused (and the
@@ -13239,7 +12873,6 @@ def test_an_approval_covers_only_the_commit_the_user_said_yes_to(env, tmp_path, 
     p.db.set_kv(prguard.APPROVALS_KEY, {"acme/widgets#7": {"answer": 1, "spent": None}})
     rc, err, ran = gh("pr", "ready", "7")
     assert rc == 1 and ran == [] and "could not check that its head commit" in err
-
 
 
 def test_pr_watch_turns_ci_failures_and_bot_comments_into_work_before_the_review_ask(env, monkeypatch):
@@ -13421,7 +13054,6 @@ def test_pr_watch_counts_a_bots_reposted_finding_once_and_skips_empty_review_wra
     assert len(events("pr_findings")) == n and "bot_keys" in p.db.kv(prguard.FINDINGS_KEY)["acme/widgets#9"]
 
 
-
 def test_pr_watch_reads_inline_comments_only_for_open_prs(env, monkeypatch):
     """A closed or merged PR with an empty COMMENTED wrapper makes no GraphQL call and keeps its
     recorded activity; an open one still does."""
@@ -13512,7 +13144,6 @@ def test_task_add_naming_a_finished_tasks_branch_carries_it_only_with_a_pr_branc
         assert not [x for x in labels(title) if x.startswith(("pr_branch:", "continues:"))], title
 
 
-
 def test_task_add_naming_a_live_tasks_branch_without_a_pr_branch_line_says_it_delivers_nothing_there(env):
     """A reported case, replayed: a work task whose spec said to push a queued code task's branch
     (ttp/t<id>-...) got no label and no word that it would not deliver there, so its push was refused
@@ -13583,7 +13214,6 @@ def test_a_pr_branch_line_labels_its_first_token_with_text_after_it(env):
     assert worktree.carried_branch({"labels": json.dumps(["pr_branch:feature/x"])}) == "feature/x"
 
 
-
 def test_a_coordinator_review_replaces_the_daemons_until_it_starts(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -13607,7 +13237,6 @@ def test_a_coordinator_review_replaces_the_daemons_until_it_starts(env):
     assert coord.apply(p, [{"type": "task_add", "title": "Review b and c", "kind": "review",
                             "spec": "Review both.", "depends_on": [b, c]}]) == []
     assert p.db.task(auto_b["id"])["status"] == "running" and p.db.task(auto_c["id"])["status"] == "cancelled"
-
 
 
 def test_an_unqueued_continue_follow_up_says_so_and_raises_continue_unqueued_once(env):
@@ -13645,7 +13274,6 @@ def test_an_unqueued_continue_follow_up_says_so_and_raises_continue_unqueued_onc
     # Older than the window: not checked at all.
     third, _, _, _ = _finish_code(env, p, "doohickey", {"d.py": 10}, result=_cont("doohickey"))
     assert [e["task"] for e in check(dm.CONTINUE_UNQUEUED_WINDOW_S + 60)] == [tid]
-
 
 
 def test_a_review_that_asks_for_changes_is_its_own_outcome_not_a_failure(env):
@@ -13699,7 +13327,6 @@ def test_a_review_that_asks_for_changes_is_its_own_outcome_not_a_failure(env):
     assert p.db.task(bad["id"])["attempts"] == 1 and machines.stats(p.db)["box"]["handoffs"] == 1
 
 
-
 def test_lock_probe_reports_a_pause_of_any_device_name_as_busy(env):
     p = _device_project(env)
     from ttp import coordinator
@@ -13710,7 +13337,6 @@ def test_lock_probe_reports_a_pause_of_any_device_name_as_busy(env):
     coordinator.pause_resource(p, "device-a", False)
     for name in ("device-a", "device-b"):
         assert _ttp_run(p, "lock", "--probe", name).returncode == 0, name
-
 
 
 @pytest.mark.parametrize("probe, flagged", [
@@ -13733,14 +13359,11 @@ def test_a_probe_waiting_over_ssh_only_for_an_end_marker_is_flagged(env, probe, 
     assert "; flagged: it waits over ssh only for an end marker" in cli.set_when(p.db, tid, probe, p)
 
 
-
 # A device broker's status always prints its section headers, with or without a job under them.
 _STATUS_EMPTY_RUNNING = "device OK\nRUNNING\nQUEUED\n  #12 tenant pytest -k smoke\n"
 
 
-
 _ROWS_UNDER_RUNNING = "awk '/^RUNNING/{f=1;next} /^[A-Z]/{f=0} f&&NF{n++} END{exit !n}'"   # 0: a job runs
-
 
 
 @pytest.mark.parametrize("busy, flagged", [
@@ -13783,14 +13406,12 @@ def test_a_probe_grepping_an_always_printed_status_header_is_flagged(env, busy, 
         assert "; flagged: it greps `" in cli.set_when(p.db, tid, probe, p)
 
 
-
 def test_task_add_tags_device_tasks(env):
     p = _device_project(env)
     from ttp import coordinator as coord
     assert not coord.apply(p, [{"type": "task_add", "title": "bench", "spec": "x", "resources": ["device-b"]}])
     t = p.db.one("SELECT labels FROM tasks WHERE title='bench'")
     assert "needs_device" in json.loads(t["labels"])
-
 
 
 def test_daemon_lines_after_a_long_summary_stay_inside_the_digest_cap(env):
@@ -13804,7 +13425,6 @@ def test_daemon_lines_after_a_long_summary_stay_inside_the_digest_cap(env):
     tail = ", ".join(f"#{w}" for w in waiters) + f" now wait on #{re_rev['id']}."
     assert len(failed["text"]) <= coord.EVENT_CHARS, len(failed["text"])
     assert failed["text"].endswith(tail) and "[cut; the whole text is in" in failed["text"]
-
 
 
 @pytest.mark.parametrize("why", [None, "the build lands on the branch"])
@@ -13842,7 +13462,6 @@ def test_a_deferred_task_shows_plain_words_never_its_probe(env, why):
     assert coord.starts_text(p.db.task(tid), plain=True) == f"starts when #{other} lands"
 
 
-
 def test_a_hold_without_an_anchor_is_rejected_and_a_bad_anchor_too(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -13867,7 +13486,6 @@ def test_a_hold_without_an_anchor_is_rejected_and_a_bad_anchor_too(env):
     # Leaving blocked drops the anchor.
     assert coord.apply(p, [{"type": "task_update", "id": tid, "status": "queued"}]) == []
     assert "waits:" not in p.db.task(tid)["labels"]
-
 
 
 def test_a_hold_on_only_a_time_or_a_probe_is_stored_as_a_deferral(env, tmp_path):
@@ -13918,7 +13536,6 @@ def test_a_hold_on_only_a_time_or_a_probe_is_stored_as_a_deferral(env, tmp_path)
     assert p.db.task(bad_t)["status"] == "running"
 
 
-
 def test_a_hold_on_this_turns_ask_points_at_it_and_is_undone_when_the_ask_is_rejected(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -13939,7 +13556,6 @@ def test_a_hold_on_this_turns_ask_points_at_it_and_is_undone_when_the_ask_is_rej
     assert any("no ask_user of this turn went through" in x for x in got)
     t3 = p.db.task(tid3)
     assert t3["status"] == "queued" and t3["blocked_reason"] is None and "waits:" not in t3["labels"]
-
 
 
 def test_each_hold_anchor_releases_its_task_once_it_is_over(env, tmp_path):
@@ -13978,7 +13594,6 @@ def test_each_hold_anchor_releases_its_task_once_it_is_over(env, tmp_path):
         assert task["status"] == "queued" and "waits:" not in task["labels"], task["title"]
     why = [e["text"] for e in p.db.q("SELECT text FROM events WHERE kind='hold_released' ORDER BY id")]
     assert len(why) == 4 and any("ask #" in w for w in why) and any("when probe passed" in w for w in why)
-
 
 
 def test_a_hold_anchor_never_outlives_its_hold(env):
@@ -14027,7 +13642,6 @@ def test_a_hold_anchor_never_outlives_its_hold(env):
     assert json.loads(p.db.task(new)["labels"]) == ["resource:board-a"]
 
 
-
 def test_an_expired_ask_releases_its_hold(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -14040,7 +13654,6 @@ def test_an_expired_ask_releases_its_hold(env):
     p.db.x("UPDATE messages SET handled=1 WHERE kind='ask'")   # what expire_asks does to a due ask
     Daemon(p.base).sweep_holds()
     assert p.db.task(tid)["status"] == "queued"
-
 
 
 def test_a_setting_hold_keeps_landing_tasks_off_workers_until_the_setting_is_on(env, monkeypatch):
@@ -14095,7 +13708,6 @@ def test_a_setting_hold_keeps_landing_tasks_off_workers_until_the_setting_is_on(
     assert sorted(started) == ["Land the fix", "Push the batch"]
 
 
-
 def test_a_setting_hold_ends_when_its_ask_is_resolved_and_follows_a_newer_ask(env, monkeypatch):
     from ttp import coordinator as coord
     from ttp import settinghold
@@ -14130,7 +13742,6 @@ def test_a_setting_hold_ends_when_its_ask_is_resolved_and_follows_a_newer_ask(en
     p.set_config("delivery.allow_protected_push_branch", False)
     p.set_config("delivery.push_branch", "")
     assert settinghold.active(p.db, p.config()) == {} and third
-
 
 
 def test_setting_setup_question_fires_once_per_setting_state(env):
@@ -14186,7 +13797,6 @@ def test_setting_setup_question_fires_once_per_setting_state(env):
     assert len(asked()) == 2
 
 
-
 @pytest.mark.parametrize("user_text,provenance", [("auto-merge acme/widgets", None), (None, None), ("hi", "system")])
 def test_auto_merge_line_from_any_source_is_never_read_or_applied(env, user_text, provenance):
     """A Policies auto-merge line, however it got there, changes nothing and raises nothing: the daemon
@@ -14203,7 +13813,6 @@ def test_auto_merge_line_from_any_source_is_never_read_or_applied(env, user_text
                                              "AND text LIKE '%auto_merge_repos%'") == []
 
 
-
 def test_rejected_config_set_points_at_the_open_setup_ask(env):
     """A coordinator config_set of the setting outside a user turn is still rejected, and names the open
     ask instead of telling the coordinator to ask again."""
@@ -14215,13 +13824,10 @@ def test_rejected_config_set_points_at_the_open_setup_ask(env):
     assert not p.config()["delivery"].get("allow_protected_push_branch")
 
 
-
 _MERGE_LINE = "Auto-merge (user, 2026-10-09): PRs in acme/widgets may be merged once CI is green."
 
 
-
 _ONLY_USER_MERGES = "PR flow (user, 2026-10-04): only the user merges PRs in acme/widgets."
-
 
 
 def _merge_set(value, quote=None):
@@ -14229,10 +13835,8 @@ def _merge_set(value, quote=None):
     return {**a, "quote": quote} if quote is not None else a
 
 
-
 def _config_grant_events(p):
     return p.db.q("SELECT text, data, status FROM events WHERE kind='config_grant' ORDER BY id")
-
 
 
 def test_auto_merge_repos_never_set_outside_the_user_turn(env):
@@ -14261,7 +13865,6 @@ def test_auto_merge_repos_never_set_outside_the_user_turn(env):
     assert not _config_grant_events(p)
 
 
-
 def test_auto_merge_repos_not_opened_by_a_grant_line_the_coordinator_wrote(env):
     """A coordinator turn without the user can append a dated '(user, date)' auto-merge line to Policies;
     quoting it in a later turn without the user still changes nothing."""
@@ -14273,7 +13876,6 @@ def test_auto_merge_repos_not_opened_by_a_grant_line_the_coordinator_wrote(env):
     assert probs and "needs the user's approval" in probs[0], probs
     assert not p.config()["delivery"]["auto_merge_repos"]
     assert not _config_grant_events(p)
-
 
 
 def test_auto_merge_repos_set_in_the_user_turn_is_logged(env):
@@ -14303,7 +13905,6 @@ def test_auto_merge_repos_set_in_the_user_turn_is_logged(env):
     assert probs and "not an owner/repo name" in probs[0], probs
 
 
-
 def test_auto_merge_repos_config_set_only_adds_in_the_user_turn(env):
     """Even in the user's turn a value that drops a listed repo is refused, naming it, and nothing changes."""
     from ttp import coordinator as coord
@@ -14316,7 +13917,6 @@ def test_auto_merge_repos_config_set_only_adds_in_the_user_turn(env):
         assert probs and f"config_set only adds repos, and this value drops {gone}" in probs[0], (value, probs)
         assert p.config()["delivery"]["auto_merge_repos"] == ["acme/kept", "acme/also"], value
     assert not _config_grant_events(p)
-
 
 
 def test_memory_never_claims_a_rejected_config_change(env):
@@ -14343,7 +13943,6 @@ def test_memory_never_claims_a_rejected_config_change(env):
                      "title": "user turned it on"}], user_turn=True, turn=8)
     assert p.config()["delivery"]["allow_protected_push_branch"] is True
     assert "Not in effect" not in next(f for f in p.memory_dir.glob("*user-turned-it-on*.md")).read_text()
-
 
 
 def test_tasks_a_worker_handed_off_blocked_on_the_setting_join_its_hold_and_are_released_with_it(env):
@@ -14402,7 +14001,6 @@ def test_tasks_a_worker_handed_off_blocked_on_the_setting_join_its_hold_and_are_
         block()
 
 
-
 def test_probes_that_can_never_pass_are_flagged_once_per_wait(env, tmp_path):
     from ttp import coordinator as coord
     from ttp.daemon import Daemon
@@ -14427,7 +14025,6 @@ def test_probes_that_can_never_pass_are_flagged_once_per_wait(env, tmp_path):
     assert len(_never(p, unknown)) == 1 and "unknown to its runner" in _never(p, unknown)[0]["text"]
 
 
-
 def test_a_start_when_that_waits_for_hours_on_a_device_resource_raises_one_event(env):
     from ttp import coordinator as coord
     from ttp.daemon import Daemon
@@ -14449,7 +14046,6 @@ def test_a_start_when_that_waits_for_hours_on_a_device_resource_raises_one_event
     d.cfg["waiting"]["start_resource_stale_s"] = 0
     d._start_verdict(p.db.task(fresh), 1, time.time() + 5 * 3600)
     assert len(p.db.q("SELECT * FROM events WHERE kind='start_resource_stale'")) == 1, "0 turns it off"
-
 
 
 def test_a_false_start_when_shows_its_last_result_and_age_and_warns_only_past_the_threshold(env):
@@ -14707,7 +14303,6 @@ def test_check_probe_rejects_a_malformed_landed_probe(probe):
         coord.check_probe(ok)
 
 
-
 def test_a_power_cycle_intent_quiets_a_down_only_in_its_window(env):
     """A power-cycle intent expects its machine down only from POWER_CYCLE_LEAD_S before T until its end:
     days before the cycle, or after it when nobody closed the entry, a down pages as usual (quiet_reason)
@@ -14738,7 +14333,6 @@ def test_a_power_cycle_intent_quiets_a_down_only_in_its_window(env):
     assert not ml.changes(), "a daemon of another project closes the intent once it is past"
 
 
-
 def test_the_digest_lists_shared_machine_changes_only_for_machines_in_resources(env):
     from ttp import coordinator as coord
     from ttp import machine_ledger as ml
@@ -14759,7 +14353,6 @@ def test_the_digest_lists_shared_machine_changes_only_for_machines_in_resources(
     assert "No recovery owner set" not in coord.digest(p, {}, [], []), "the gap is named once"
     ml.report("other", "box-a", "held", "hold never recovers")
     assert "box-a held since" in coord.digest(p, {}, [], [])
-
 
 
 def test_the_digest_clips_machine_changes_and_counts_other_projects_self_ending_ones(env):
@@ -14804,7 +14397,6 @@ def test_the_digest_clips_machine_changes_and_counts_other_projects_self_ending_
     assert len(sec) < 2500 < whole
 
 
-
 def test_heal_list_and_schedule_set_show_what_a_heal_check_covers(env, capsys, monkeypatch):
     from ttp import cli
     from ttp import coordinator as coord
@@ -14840,7 +14432,6 @@ def test_heal_list_and_schedule_set_show_what_a_heal_check_covers(env, capsys, m
     assert p.db.kv(coord.NOTES_KEY, []) == []
 
 
-
 def test_the_coordinator_may_turn_own_pushes_off_but_only_the_user_turns_them_on(env):
     from ttp import coordinator as coord
     p = make(env)
@@ -14850,7 +14441,6 @@ def test_the_coordinator_may_turn_own_pushes_off_but_only_the_user_turns_them_on
         out = coord.apply(p, [{"type": "config_set", "key": "delivery.own_push", "value": v}])
         assert any("needs the user's approval" in x for x in out), out
     assert p.config()["delivery"]["own_push"] == "off"
-
 
 
 def test_network_outage_ignores_neutral_holds_and_honours_off_and_self_heal(env, monkeypatch):
@@ -14871,7 +14461,6 @@ def test_network_outage_ignores_neutral_holds_and_honours_off_and_self_heal(env,
     assert len(check(now + 2500, rc=None)) == 1 and not p.db.kv("network_outage"), "the outage ended"
     d.cfg = {**d.cfg, "waiting": {**(d.cfg.get("waiting") or {}), "unreachable_alert_s": 0}}
     assert len(check(now + 6000)) == 1 and not p.db.kv("network_outage"), "0 turns the alert off"
-
 
 
 def test_a_model_pinned_task_pins_its_subagents_unless_set_explicitly(env, monkeypatch):
@@ -14955,7 +14544,6 @@ def test_a_task_pinned_to_a_codex_model_and_effort_runs_on_them_and_keeps_the_pi
     assert migrated.task(migrated.add_task("new", model="m", effort="high"))["model"] == "m"
 
 
-
 def test_the_coordinator_pins_a_task_and_its_continuation_keeps_the_pin(env):
     from ttp import coordinator as coord
     p = make(env)
@@ -14997,7 +14585,6 @@ def test_the_coordinator_pins_a_task_and_its_continuation_keeps_the_pin(env):
     assert "is running" in " ".join(coord.apply(p, [{"type": "task_update", "id": moved["id"], "pin_verify": "strict"}]))
 
 
-
 def test_blocker_sweep_lists_every_kind_of_stuck_item_with_age_reason_and_last_check(env):
     p = make(env)
     from ttp import coordinator as coord, settinghold, sweep
@@ -15033,14 +14620,12 @@ def test_blocker_sweep_lists_every_kind_of_stuck_item_with_age_reason_and_last_c
     assert "## Blocker sweep" not in coord.digest(p, {}, [], [])     # only the sweep's own turn shows it
 
 
-
 def test_blocker_sweep_turn_is_a_tricky_turn(env, monkeypatch):
     p = make(env)
     from ttp import coordinator as coord, sweep
     assert coord.EFFORT_EVENT_TRIGGERS[sweep.SWEEP_KIND] == "stuck"
     assert "sweep" in coord.ACTION_TYPES
     assert coord.ACTIONS_SCHEMA["properties"]["actions"]["items"]["properties"]["outcome"]["enum"] == list(sweep.OUTCOMES)
-
 
 
 def test_sweep_action_records_one_validated_outcome_per_item(env):
@@ -15066,7 +14651,6 @@ def test_sweep_action_records_one_validated_outcome_per_item(env):
     outs = db.kv(sweep.OUTCOMES_KEY)
     assert outs[f"task:{t}"]["outcome"] == "still_blocked" and outs[f"task:{t}"]["next"] > time.time() + 5 * 3600
     assert outs["resource:rig"]["why"] == "only the owner can reseat the card"
-
 
 
 def test_blocker_sweep_leaves_out_finished_tasks_and_drops_outcomes_on_them(env):
@@ -15154,7 +14738,6 @@ def test_blocker_sweep_carries_and_flags_items_left_without_an_outcome(env):
     assert "last re-check" in next(ln for ln in lines if ln.startswith(f"- #{b} ")) and "until test -e /x" in text
 
 
-
 def test_the_daily_review_lists_items_stuck_over_6h_with_their_sweep_outcome(env):
     p = make(env)
     from ttp import coordinator as coord, sweep
@@ -15178,7 +14761,6 @@ def test_the_daily_review_lists_items_stuck_over_6h_with_their_sweep_outcome(env
     assert f"Stuck longer than 6h, with the blocker sweep's outcome:\n- #{old} old block: blocked 10.0h" in spec
     db.x("DELETE FROM tasks")
     assert sweep.review_lines(db, now) == ["nothing stuck longer than 6h"]
-
 
 
 def test_blocker_sweep_age_of_a_coordinator_block_survives_a_spec_addendum(env):
@@ -15210,7 +14792,6 @@ def test_blocker_sweep_age_of_a_coordinator_block_survives_a_spec_addendum(env):
     assert i["age_s"] is None and sweep._dur(i["age_s"]) == "unknown"
 
 
-
 def test_project_pin_verification_config_accepts_only_supported_modes(env, capsys):
     from ttp import cli, coordinator as coord
     from ttp.project import config_problems
@@ -15229,7 +14810,6 @@ def test_project_pin_verification_config_accepts_only_supported_modes(env, capsy
         cli.main(["config", "demo", "runner.pin_verify", "strcit"])
     assert "pin_verify" in capsys.readouterr().err
     assert p.config()["runner"]["pin_verify"] == "strict"
-
 
 
 def test_obligation_add_with_a_refused_owner_leaves_nothing_and_drop_withdraws(env, monkeypatch):
@@ -15262,7 +14842,6 @@ def test_obligation_add_with_a_refused_owner_leaves_nothing_and_drop_withdraws(e
     assert ob.get(p.db, o3)["dropped"]["by"] == "coordinator"
 
 
-
 def test_coordinator_obligation_action_records_attaches_and_receipts(env, monkeypatch):
     from ttp import coordinator as coord
     from ttp import obligations as ob
@@ -15274,7 +14853,6 @@ def test_coordinator_obligation_action_records_attaches_and_receipts(env, monkey
     assert coord.apply(p, [{"type": "obligation", "key": "o1", "evidence": "docs/report.md (owner checked)"}]) == []
     assert ob.get(p.db, "o1")["receipt"]["evidence"] == "docs/report.md (owner checked)"
     assert coord.apply(p, [{"type": "obligation", "key": "o1"}]) != [], "an action with nothing to do is rejected"
-
 
 
 def test_task_spec_naming_an_obligation_needs_it_to_exist_and_be_owned(env, monkeypatch):
@@ -15319,7 +14897,6 @@ def test_task_spec_naming_an_obligation_needs_it_to_exist_and_be_owned(env, monk
     assert ob.named("obligation o3-mini o3.5 path/o4 (o5), o07; see o8") == ["o5", "o7", "o8"]
 
 
-
 def test_obligation_milestone_validation_atomic_and_receipt_scoped(env, monkeypatch):
     from ttp import coordinator as coord
     from ttp import obligations as ob
@@ -15348,7 +14925,6 @@ def test_obligation_milestone_validation_atomic_and_receipt_scoped(env, monkeypa
     ob.drop(p, oid, "no longer owed")
     check(now + 3600)
     assert not p.db.q("SELECT * FROM events WHERE fingerprint LIKE 'obligation:%'")
-
 
 
 @pytest.mark.parametrize('provider', ['codex', 'claude', 'cursor'])
@@ -15391,7 +14967,6 @@ def test_coordinator_padded_nulls_keep_schedule_defaults_and_explicit_off(env, t
     assert json.loads(p.db.one("SELECT payload FROM schedules WHERE name='llm-check'")['payload'])['debounce_h'] is None
 
 
-
 @pytest.mark.parametrize('action', [ {'type': 'noop', 'clear_fields': ['heal']},
                                     {'type': 'schedule_set', 'name': 'probe', 'clear_fields': ['enabled']},
                                     {'type': 'schedule_set', 'name': 'probe', 'clear_fields': ['heal'],
@@ -15404,10 +14979,8 @@ def test_invalid_clear_operations_are_rejected_without_schedule_mutation(env, ac
     assert p.db.q('SELECT * FROM schedules') == before
 
 
-
 # Health evidence ends coordinator pauses, fenced against a changed pause.
 HEALTH_END = {"heal": "svc", "healthy_n": 3, "clean_s": 1800}   # the end health_end() gives check `svc`
-
 
 
 def _health_pause(env, *, shared=False, by="coordinator", every_s=900, end=None):
@@ -15424,7 +14997,6 @@ def _health_pause(env, *, shared=False, by="coordinator", every_s=900, end=None)
     return p, d, up
 
 
-
 @pytest.mark.parametrize("end", [dict(HEALTH_END), {"heal": "svc"}, {"heal": "svc", "healthy_n": 1, "clean_s": 0},
                                  {}, ["true"], 1])
 def test_resource_pause_end_when_is_only_a_probe(env, end):
@@ -15438,7 +15010,6 @@ def test_resource_pause_end_when_is_only_a_probe(env, end):
     assert "board" not in p.db.paused_resources()
     with pytest.raises(ValueError, match="one shell command"):
         pauseends.from_action({"until": "1d", "end_when": end})
-
 
 
 @pytest.mark.parametrize("given", [True, False])
@@ -15467,7 +15038,6 @@ def test_resource_pause_end_fields_ride_the_strict_wire_schema(env, given):
     assert 86400 - 60 < held["until"] - time.time() <= 86400
 
 
-
 @pytest.mark.parametrize("words,context,flag,users", [
     ("Pause board until I explicitly allow it again.", None, False, True),
     ("Take it offline for now, please.", None, True, True),   # the coordinator marks the user's own ask
@@ -15490,7 +15060,6 @@ def test_resource_pause_origin_follows_the_users_own_words(env, words, context, 
     assert p.db.paused_resources()["board"]["by"] == "coordinator"
 
 
-
 @pytest.mark.parametrize("flag,users", [(None, True), (False, False), (True, True)])
 def test_resource_pause_in_a_turn_asking_to_pause_fails_safe_to_the_user(env, flag, users):
     from ttp import coordinator as coord
@@ -15502,7 +15071,6 @@ def test_resource_pause_in_a_turn_asking_to_pause_fails_safe_to_the_user(env, fl
     assert coord.apply(p, [action], user_turn=True, messages=[msg]) == []
     # Unflagged, words that ask to pause make it theirs; only an explicit `user_asked: false` keeps it ours.
     assert p.db.paused_resources()["board"]["by"] == ("user" if users else "coordinator")
-
 
 
 def test_a_task_reference_to_a_missing_task_is_rejected_and_reaches_the_coordinator(env, monkeypatch):
@@ -15566,7 +15134,6 @@ def test_a_task_reference_to_a_missing_task_is_rejected_and_reaches_the_coordina
     assert "ttp landed --task" in set_when(p.db, waiting, f"ttp landed --task {ok}", p)
 
 
-
 def test_snapshot_memory_edits_and_retirements_stay_live_during_batching(env):
     from ttp import coordinator as coord
     p = make(env)
@@ -15585,7 +15152,6 @@ def test_snapshot_memory_edits_and_retirements_stay_live_during_batching(env):
     coord.system_prompt(p, now=start + 3)
     rule.write_text(rule.read_text().replace('shared branches.', 'shared state.'))
     assert 'Never change shared state.' in coord.system_prompt(p, now=start + 4)
-
 
 
 def test_start_after_accepts_a_space_and_the_home_zone_abbreviation(env):
@@ -15623,7 +15189,6 @@ def test_a_bare_clock_time_is_read_in_the_home_zone_never_refused(env):
     assert len(looks.pending(p.db)) == 1
 
 
-
 def test_start_after_reads_a_bare_clock_time_as_its_next_time_in_the_home_zone(env):
     """Two `look` actions in a day were refused for '15:17': a clock time alone means its next time in the
     home zone (#2116), today if still ahead, else tomorrow; a wrong zone or a bad time still refuses."""
@@ -15638,7 +15203,6 @@ def test_start_after_reads_a_bare_clock_time_as_its_next_time_in_the_home_zone(e
         coordinator.parse_start_after("15:17 EDT", now=now, tz=tz)
     with pytest.raises(ValueError):
         coordinator.parse_start_after("25:99", now=now, tz=tz)
-
 
 
 def test_a_passing_review_marks_the_reviewed_head_for_the_tasks_that_continue_it(env, tmp_path, monkeypatch):
@@ -15671,7 +15235,6 @@ def test_a_passing_review_marks_the_reviewed_head_for_the_tasks_that_continue_it
     assert d._verified_review_line(p.db.task(code), head) == ""
     p.db.update_task(review, status="done", result=json.dumps({"summary": "passed", **extra}))
     assert f"verified through {reviewed[:12]}" in coord.digest(p, {}, [], []).split("## Recently finished")[1]
-
 
 
 def test_a_plain_task_done_waits_for_company_even_with_an_idle_slot(env):
@@ -15896,7 +15459,6 @@ def test_the_plain_done_hold_judges_every_queued_event_not_only_the_sized_batch(
     assert p.db.kv("plain_done_held") is None
 
 
-
 def test_blocker_sweep_carries_a_valid_not_yet_due_still_blocked_forward_until_the_item_changes(env):
     p = make(env)
     from ttp import coordinator as coord, sweep
@@ -15937,7 +15499,6 @@ def test_blocker_sweep_carries_a_valid_not_yet_due_still_blocked_forward_until_t
     assert db.kv(sweep.STATE_KEY)["flags"] == {f"task:{a}": "no outcome at the last sweep"}
 
 
-
 def test_blocker_sweep_interval_with_every_item_carried_still_starts_on_a_pending_signal(env):
     p = make(env)
     from ttp import coordinator as coord, sweep
@@ -15956,7 +15517,6 @@ def test_blocker_sweep_interval_with_every_item_carried_still_starts_on_a_pendin
     db.x("UPDATE events SET status='handled' WHERE id=?", (eid,))
     sweep.prepare(db, eid, cfg, now)
     assert "for each item not marked CARRIED" in db.one("SELECT text FROM events WHERE id=?", (eid,))["text"]
-
 
 
 def test_blocker_sweep_carries_user_pause_holds_without_an_outcome_and_starts_no_sweep_for_them(env):
@@ -16007,7 +15567,6 @@ def test_blocker_sweep_carries_user_pause_holds_without_an_outcome_and_starts_no
     assert any(f"#{blocked} " in r and "user-pause" in r and "none needed (ends by user)" in r for r in rows), rows
 
 
-
 def test_blocker_sweep_leaves_out_planned_deferrals(env):
     """A queued task whose `start_after` is ahead is planned, not stuck: no item, no sweep, one count line.
     Past `start_after` with a probe it counts from start_after; a probe-only deferral counts as before."""
@@ -16056,7 +15615,6 @@ def test_blocker_sweep_carries_a_user_set_resource_pause_and_still_sweeps_a_coor
     sweep.start(db, cfg, "every 6h", now + 7 * 3600)
     assert db.kv(sweep.STATE_KEY)["flags"] == {"resource:board-b": "no outcome at the last sweep"}
     assert "board-a" in db.paused_resources(), "the sweep never lifts the user's pause"
-
 
 
 def _board_work(p, now, n=2):
@@ -16630,7 +16188,6 @@ def test_blocker_sweep_replay_of_a_day_of_signals_over_probe_watched_holds(env):
     assert len(sweeps) == 1 and 24 < sweeps[0] <= 30, sweeps
 
 
-
 def _held_sweep(p, monkeypatch, before=None):
     """A daemon whose stuck items each end without a turn: a user-set resource pause, a task blocked until
     a time ahead, a wait on a retry_when probe and a deferral on a start_when probe whose last answers are
@@ -17173,7 +16730,6 @@ def test_task_add_of_a_review_of_an_accepted_head_is_refused_unless_forced_with_
     assert started == [first, forced["id"]], "a forced review runs"
 
 
-
 def test_a_refused_resend_carries_the_whole_approved_charter_text_to_the_next_turn(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -17203,7 +16759,6 @@ def test_a_refused_resend_carries_the_whole_approved_charter_text_to_the_next_tu
     assert approved in p.charter_path.read_text()
 
 
-
 def test_empty_cache_ttl_is_auto_flagged_by_doctor_and_set_to_auto_by_upgrade(env):
     from ttp import cli, coordinator
     from ttp.project import config_problems
@@ -17220,7 +16775,6 @@ def test_empty_cache_ttl_is_auto_flagged_by_doctor_and_set_to_auto_by_upgrade(en
     p.set_config("coordinator.cache_ttl", "5m")         # the project's own choice stays
     assert cli._auto_cache_ttl(p) == ""
     assert p.raw_config()["coordinator"]["cache_ttl"] == "5m"
-
 
 
 def test_promise_due_reads_only_real_month_names_and_bounds_dates():
@@ -17241,7 +16795,6 @@ def test_promise_due_reads_only_real_month_names_and_bounds_dates():
     assert ob.promise_due("I'll deliver it Dec 2 at 15:00", now, tz) == at_15, "a date weeks out is a misread"
     for offer in ("Shall I report it by 15:00?", "Want me to share the sha by 15:00", "Should I deliver it by 3pm?"):
         assert ob.commitments(offer) == [], offer
-
 
 
 def test_promise_is_recorded_beside_an_unrelated_obligation_and_linked_to_its_own(env, monkeypatch):
@@ -17267,7 +16820,6 @@ def test_promise_is_recorded_beside_an_unrelated_obligation_and_linked_to_its_ow
     check(now + 60)
     assert ob.get(p.db, linked["id"])["receipt"], "the promise closes with its linked obligation"
     assert not ob.get(p.db, promise["id"])["receipt"], "the unlinked promise stays open"
-
 
 
 def _pdt(h, m=0, day=15):
@@ -18080,7 +17632,6 @@ def test_quiet_idle_wake_skips_back_off_over_days_and_never_overflow(env, monkey
     d.maybe_coordinate()
 
 
-
 def test_forbidden_data_patterns_refuse_memory_and_charter_writes_and_never_reach_git(env):
     """A project that keeps its data out of git declares forbidden-data patterns (a charter section, config
     regexes, a pattern file outside the harness). Every memory and charter write path refuses matching text
@@ -18152,7 +17703,6 @@ def test_forbidden_data_patterns_refuse_memory_and_charter_writes_and_never_reac
     probs = coord.apply(p, [{"type": "memory_add", "text": "Anything at all."}], turn=7)
     assert probs and "cannot be read" in probs[0]
     assert not list(p.memory_dir.glob("*anything*.md"))
-
 
 
 def test_the_grant_line_names_only_keys_config_set_accepts_and_the_user_only_ones_as_refused():
@@ -18977,7 +18527,6 @@ def test_a_spec_that_states_another_tasks_status_gets_its_live_record_at_dispatc
     assert "## Facts at send time" not in worker_task(p, p.db.task(plain), str(p.root), None)
 
 
-
 def test_a_notes_facts_suffix_names_only_the_numbers_it_means_as_tasks(env):
     """`ttp note --to` appends the live record of each task the note names. A number led by another
     noun (a ledger entry, a message, a hold) is not a task, and every number of a run like `#1, #2 and
@@ -19770,7 +19319,6 @@ def test_prompts_carry_the_user_correction_rules(env):
     assert CORRECTIONS_HEADER.upper().startswith("USER CORRECTIONS")
 
 
-
 def _course_run(db, task, status="failed", ago=60.0, cost=0.5, role="worker", note=None):
     now = time.time()
     db.x("INSERT INTO runs(task, role, started, ended, status, cost_usd, note) VALUES(?,?,?,?,?,?,?)",
@@ -20116,7 +19664,6 @@ def test_correction_audit_lists_each_correction_of_the_day_with_its_class_fix(en
     assert line in audit.lines(p.db, now)
     p.db.set_kv(correction.KEY, [])
     assert not any("corrections from" in x for x in audit.lines(p.db, now))
-
 
 
 def _said(p, text, days=0.0, direction="in"):
@@ -20896,7 +20443,6 @@ def test_connector_rule_leaves_isolation_no_internet_and_the_tool_set_alone(env,
     assert run_env.get("ENABLE_CLAUDEAI_MCP_SERVERS") == "false"
 
 
-
 def _standing_memory_project(env):
     """A project with 14 memory entries: standing preferences (for workers, unaddressed, one that
     speaks of workers, and two for the coordinator), large pinned restrictions, resources and entries
@@ -20977,7 +20523,6 @@ def test_standing_worker_memory_past_its_room_is_pointed_to_and_alerts_once(env)
         p.forget_memory(d.stem, why="test")
     coord.memory_budget_check(p)
     assert len(alerts()) == 1 and not p.db.kv(coord.MEMORY_ALERT_KEY)
-
 
 
 def test_an_oversized_charter_is_named_once_until_it_grows_a_quarter_and_re_arms_when_it_fits(env):
@@ -21927,7 +21472,6 @@ def test_a_user_end_shared_pause_lifts_once_through_the_shared_file(env):
     assert t in {x["id"] for x in p.db.ready_tasks()}
     assert [k for k, _ in _pause_end_events(p)] == [pauseends.USER_END_KIND]
     assert not p.db.kv(pauseends.RELEASE_KEY)
-
 
 
 _CS_KEY = "sk-chatset-placeholder-5a4b3c2d1e"
@@ -23495,7 +23039,6 @@ def test_agent_mode_flags_a_permission_ask_for_what_was_already_ordered(env):
               {**restr, "not_covered": "the order named box-q7 only, this needs box-q8 as well for the run"},
               {**restr, "text": "May I lift 'Never run device tests on box-q7 during the soak run' for good?"}):
         assert not ordered(ask(a)), a
-
 
 
 def _claude_turn(tmp_path, texts, final, sub=None):

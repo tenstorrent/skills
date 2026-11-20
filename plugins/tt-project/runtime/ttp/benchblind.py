@@ -345,7 +345,7 @@ def provider_ask(provider: str, model: str, effort: str, budget_usd: float, cfg:
         with tempfile.TemporaryDirectory() as tmp:
             argv, env = prov.build(role="review", model=model, effort=effort, cwd=tmp, budget_usd=budget_usd,
                                    read_only=True, schema=schema or SCHEMA, restrictions={})
-            argv = prov.read_only_args(argv)   # decision-only: unsandboxed, as the daemon's
+            argv = prov.read_only_args(argv)   # decision-only: no restrictions, so no OS sandbox
             out = Path(tmp) / "output.jsonl"
             if provider == "chat":
                 # A chat reviewer runs through the chat bridge: either one the caller holds open for

@@ -132,25 +132,6 @@ def test_a_failing_check_keeps_its_exit_code_when_it_also_changed_the_host(tmp_p
     assert rc == 3 and not tabf.exists()   # there was no crontab before: removed again
 
 
-def test_ttp_sandbox_fails_a_command_that_changed_the_host_and_restores_it(tmp_path, monkeypatch, capsys):
-    from ttp import sandbox
-    cron, tabf, _ = _fake_host(tmp_path, monkeypatch, "a\n")
-    _ledger(monkeypatch)
-    monkeypatch.setattr(sandbox, "wrap", lambda argv, *a, **kw: list(argv))
-    monkeypatch.setattr(sandbox, "notice", lambda *a: "")
-    old = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
-    try:
-        assert sandbox.run(["sh", "-c", "crontab -r && reboot"]) == 0   # stand-ins: the real one untouched
-        assert tabf.read_text() == "a\n"
-        assert "went to the run's fake store" in capsys.readouterr().err
-        assert sandbox.run(["sh", "-c", _append(cron, "b $TTP_HOSTSTATE_FAKE", "$TTP_HOSTSTATE_FAKE")]) == 1
-    finally:
-        for s, h in old.items():
-            signal.signal(s, h)
-    assert tabf.read_text() == "a\n"
-    assert "host guard: FAILED" in capsys.readouterr().err
-
-
 def test_sudo_running_a_host_write_under_ttp_checks_is_refused_and_reported_and_other_sudo_calls_pass(
         tmp_path, monkeypatch, leaked_tmp_processes):
     # sudo resets PATH (secure_path): the stand-ins never see what it runs, so the sudo stand-in refuses
