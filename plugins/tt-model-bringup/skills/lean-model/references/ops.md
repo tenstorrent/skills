@@ -34,3 +34,6 @@ Write the change so it could go upstream as its own pull request.
 ## Check kernels against main
 
 Kernel APIs move. Before writing a kernel, read a current example on main that does something similar.
+
+The catalogue of what was tried before, with its gates, is in [performance advice](../../ttnn-knowledge/topics/perf-advice.md),
+[matmul and precision](../../ttnn-knowledge/topics/matmul-precision.md) and [fusion](../../ttnn-knowledge/topics/fusion.md).

@@ -22,6 +22,9 @@ Use this skill for the hardware-facing parts of model bringup. It covers only no
 - Launch device jobs detached, with their own lifetime; a job tied to a short-lived remote session dies with it and leaves the device open.
 - Do not reproduce a known hang on a board nobody can power-cycle remotely. Before any reset or health check, copy the debug dumps it may overwrite.
 - Record firmware and driver versions per machine. When results differ between machines, suspect the machine before the model.
+- On QB2 the two dies of a p300c card share a reset: resetting one die alone has broken the Ethernet links to the others. Pause the other die's job and reset the card or the board.
+- `tt-smi -r` inherits `TT_VISIBLE_DEVICES`: run from a die-scoped shell, a "whole-board" reset touches only that die.
+- Importing ttnn or converting tensors to block-float formats on the host opens the devices and takes their locks; do it under the device lock too.
 - Host-wall numbers from concurrent one-process-per-chip runs are not same-regime: report device time, or serialize the runs that back a host-wall or TTFT claim, and say which. A chip released or added mid-stage splits the regime: label every measurement with its regime (`serial` or `concurrent` and the chips in use) in its sidecar, and re-measure the selected configuration serially before ranking it against measurements from the other regime.
 - A chain driver that serializes device jobs is stopped between jobs with its own mechanism (a stop file or a queue flag it checks before each launch), so the running job finishes and releases the chip; killing the driver or the job mid-dispatch leaves the chip wedged.
 - Keep watcher and profiler evidence in separate runs. Do not combine `TT_METAL_WATCHER` with device-profiler or Tracy collection.
@@ -79,6 +82,18 @@ Recovery sequence:
 6. If reset, listing, or mesh smoke still fails, ask the monitor/operator for a physical Docker-host reboot and reservation re-acquire. If the current agent explicitly owns experiment monitoring or machine recovery, reboot the host directly and repeat list/reset/list plus mesh smoke after reconnecting.
 7. Resume the same stage from preserved state. In the multigoal flow, use `--resume-stage <stage_number> --log-dir <preserved_run_directory>` with the same Codex home recorded in the manifest instead of restarting completed earlier stages.
 8. Record this as infrastructure recovery, not a model correctness or performance result.
+
+### Profiler runs that wedged a T3K
+
+Seen on T3K during optimization: after a serving profiler or watcher failure, a full in-process 32-layer
+serving-adapter profile under device-profiler settings (`TT_METAL_DEVICE_PROFILER=1`,
+`TT_METAL_PROFILER_CPP_POST_PROCESS=1`, `TT_METAL_PROFILER_MID_RUN_DUMP=1`, `TT_METAL_PROFILER_TRACE_TRACKING=1`,
+`TT_METAL_PROFILER_PROGRAM_SUPPORT_COUNT=5000`) followed by `ttnn.ReadDeviceProfiler(mesh)` produced the signatures
+above and left the board undiscoverable (`tt-smi -ls --local` and `tt-smi -r` hung). Do not run that pattern. If
+these signatures appear during profiling: stop profiler collection, keep the logs, mark the evidence
+`hardware-profiler-limited`, and run the recovery sequence above before calling the stage blocked. A
+device-profiler-enabled serving process should not exist (serving stages do not profile); stop leftover
+`EngineCore` or server processes from this run and run at most one bounded health check.
 
 Do not mark a model stage blocked because a board briefly became undiscoverable. A model stage may block on hardware only after this recovery path fails or requires operator intervention the agent cannot perform.
 

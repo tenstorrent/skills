@@ -18,7 +18,8 @@ this plugin's `runtime/benchmark_stage`, since the working directory can shadow
 `PYTHONPATH`.
 
 For performance, select a working upstream **vLLM 0.26** client with
-`vllm bench serve --help`. Set `vllm_cli` to its executable. An older TT server can
+`vllm bench serve --help`. This pin is for the HTTP benchmark client only; the server's vLLM follows
+[serving stack setup](../../vllm-integration/references/serving-stack.md). Set `vllm_cli` to its executable. An older TT server can
 stay running while a separate client sends requests. If no compatible client is
 installed, use a dedicated venv and the [vLLM installation instructions](https://docs.vllm.ai/en/v0.26.0/getting_started/installation/gpu/).
 For a host without GPU build tools, the documented `VLLM_TARGET_DEVICE=empty`
@@ -118,8 +119,8 @@ budgets and sampling options for the model you are benchmarking:
 ```
 
 The `generation` overrides also accept upstream options such as
-`chat_template_kwargs`. Check textual stop strings for reasoning models: a
-benchmark's `Question:` stop can occur within reasoning. If it cuts off native
+`chat_template_kwargs`. Check textual stop strings for reasoning models
+([serving and evals](../../ttnn-knowledge/topics/serving-evals.md#eval-infrastructure)). If one cuts off native
 reasoning, explicitly use `until: []` and retain the declared token cap and EOS.
 Record the setting as a protocol difference. The API must expose final-answer
 content separately from reasoning.
@@ -184,9 +185,7 @@ protocol limitation without hand-correcting scores.
 
 ## Server profiles per batch
 
-The headline rows use different server configurations:
-
-One row per configured batch size, default 1, 8, 16 and 32:
+One headline row per configured batch size (default 1, 8, 16 and 32), each on its own server configuration:
 
 | Profile | Concurrent requests | Server `max_num_seqs` | Input / output tokens |
 |---|---:|---:|---:|
@@ -295,8 +294,8 @@ Prepare an implementation-specific collector before the timed run:
    run. Missing instrumentation is setup work to complete, not a reason to omit
    the figures.
 
-Follow the serving skill's profiler restrictions: do not use Tracy, the live
-device profiler or `ReadDeviceProfiler` to obtain these host wall times.
+Follow the [serving profiler restrictions](../../vllm-integration/SKILL.md#no-tracy-or-perf-report-in-vllm-stages):
+do not use Tracy, the live device profiler or `ReadDeviceProfiler` to obtain these host wall times.
 
 Configure `roofline_command` as an argument array. The runner calls it for each batch while the
 corresponding server is still running:

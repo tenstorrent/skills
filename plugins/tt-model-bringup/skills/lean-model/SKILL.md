@@ -9,25 +9,15 @@ The outcome and its tests are fixed; the path is yours. What follows is what ear
 and the bad, offered as defaults. Where your measurements say otherwise, follow them and write down why.
 
 Load the references when you reach them, not up front: [ops and kernels](references/ops.md),
-[mixture of experts](references/moe.md), [one or two machines](references/machines.md).
+[one or two machines](references/machines.md); for routed experts, [MoE](../ttnn-knowledge/topics/moe.md).
 
-## Knowledge in the stage skills
+## Knowledge
 
-The staged pipeline's skills hold most of what is known about TTNN model work. Read the one that matches the
-work in front of you. Use their technical advice; their stage procedure (stage order, evidence lists, per-stage
-review and gates) is for the staged pipeline and does not apply here. Where their advice and your measurements
-disagree, the measurements win.
-
-| Work | Skill |
-|---|---|
-| decoder correctness, chunked prefill, TTNN correctness defaults | [functional-decoder](../functional-decoder/SKILL.md) |
-| fusing op chains | [graph-fusing](../graph-fusing/SKILL.md) |
-| profiling, perf accounting, prefill and TTFT, decode closure | [optimize](../optimize/SKILL.md) |
-| sharding, collectives, multi-chip layouts, expert placement | [multichip](../multichip/SKILL.md) |
-| generator contract, context, validation | [full-model](../full-model/SKILL.md) |
-| trace capture, program-cache warmup, split sampling | [tt-enable-tracing](../tt-enable-tracing/SKILL.md) |
-| precision groups, fidelity, MoE precision | [datatype-sweep](../datatype-sweep/SKILL.md) |
-| free-running output checks | [qualitative-check](../qualitative-check/SKILL.md) |
+What earlier bringups learned about TTNN, by topic, is in [`ttnn-knowledge`](../ttnn-knowledge/SKILL.md): memory,
+numerics, prefill and KV, tracing, multi-chip and CCL, fusion, MoE, performance and profiling, matmul and
+precision, serving and evals, reference code. Read a topic when the work reaches it. The generator and context
+contract the outcome refers to is defined in [full-model](../full-model/SKILL.md); its stage procedure does not apply
+here.
 
 ## Outcome
 
@@ -38,7 +28,8 @@ disagree, the measurements win.
   precision may differ from HF by design; it is chosen on the reference tiers as a speed and accuracy tradeoff.
 - `doc/model/model.json` and `REPORT.md`: mode, targets, floors, measured, precision, KV pool, ops added or
   changed, tier commands, the perf ledger (change, before, after, tier result), hours and tokens spent, and
-  what was not done.
+  what was not done; for a mixture-of-experts model, `moe` with experts, top-k, layout, distinct experts per
+  step and decode against its floor at batch 1 and the largest batch.
 
 ## What tends to work
 

@@ -86,20 +86,11 @@ time spent generating bounds what any serving change can save.
 
 ## Stage 11: serving rates
 
-Stage 11 is benchmarks only. It measures, on the route goal 12 will use and with the sampling settings
-its harness sends, a batch × input-length grid
-(each validated batch, and above batch 1 also at request concurrency 1; inputs of 4096,
-`typical_context_tokens`, `working_set_tokens`, ≥ 28K, and the longest context the evals reach: their prompt
-plus output cap, at most the served max context, where the pool holds the batch) plus every benchmark row
-the release spec lists for this model. Goal 12 interpolates between lengths and concurrencies and
-extrapolates past the longest length, so a row at the top of the range removes the largest error, and rows at
-request concurrency 1 keep a server with a few requests in flight from being priced as a full batch. Every row completes; a row the budget leaves
-unmeasured goes in `missing_rows` (batch, input_tokens, reason) and the stage completes. Each row is compared with its
-predicted rate; a slowdown beyond the prediction's range is explained. It writes
-`doc/benchmark/serving_rates.json`: the server config, `validated_batches`, the `workload` lengths the grid
-used, and per batch, concurrency and input length
-`prefill_tok_s`, `decode_tok_s_user`, `ttft_s` and `step_ms`. Goal 12 reads these rates and does not
-re-measure them, except the rows it uses after a precision fix (Failure analysis 3).
+Stage 11 is benchmarks only: on the route goal 12 will use and with the sampling settings its harness sends, it
+measures a batch × input-length grid at request concurrency equal to the batch and at 1, plus the release rows, and
+writes `doc/benchmark/serving_rates.json` ([benchmark-model](../benchmark-model/SKILL.md#serving-rates-for-goal-12)
+defines the grid, the fields and `missing_rows`). Goal 12 reads these rates and does not re-measure them, except the
+rows it uses after a precision fix (Failure analysis 3).
 
 ## Goal 12: agentic evals
 
@@ -211,8 +202,8 @@ each list and its rule in `results.json` before any score on it.
 
 This is iteration on the phase's failing tasks inside its time, never growth of the list.
 
-Reference check, for every failed task whatever its cause (not infrastructure, not a fetched solution, not a task
-rerun because it was cut off while progressing): run `reference-accuracy`'s check on the host CPU while the list runs. Take the task's
+Reference check, for every failed task except infrastructure failures, fetched solutions and tasks rerun because
+they were cut off while progressing: run `reference-accuracy`'s check on the host CPU while the list runs. Take the task's
 decisive point (wrong: the answer span, or the first wrong SWE action; loop: the loop's first token; malformed
 tool call: that call; stalled: the first repeated call; anomaly: the first stray token), teacher-force TT's own
 tokens through HF over the full prefix (shorten it only when that would take more than ~15 min of CPU, and label
@@ -247,8 +238,8 @@ differs at the decisive token and gives TT's token p < 0.1), else `inconclusive`
 Triage: script, then sub-agent, then the coordinator.
 
 - **Digest** (measures, never judges). As each run or wave finishes, make the model's own replies readable
-  per task. The server's response log is the one place every reply survives (lm_eval keeps only the final
-  answer, mini-swe-agent drops capped replies). `scripts/reply_digest.py` (Helpers) writes per task one line
+  per task. The server's response log is the one place every reply survives
+  ([serving and evals](../ttnn-knowledge/topics/serving-evals.md#eval-infrastructure)). `scripts/reply_digest.py` (Helpers) writes per task one line
   per model call (tokens, finish, tail compression and distinct characters, action, repeats) plus the tail
   of each flagged or capped reply; `flag` marks a degenerate tail. Every capped or flagged reply should map
   to a task.
@@ -265,8 +256,8 @@ Triage: script, then sub-agent, then the coordinator.
 Before the first eval run, at stage 12's start once its server is up, send one short request through the served
 route and check that the server's log holds its body, token counts and finish reason
 (`reply_digest.py --check-log --log <server log> --id <its id> --record doc/agentic_evals/logging_check.json`
-does it and records `pass`). If it fails, fix response logging (a flag value the server does not parse is enough to lose every reply) before any
-eval run.
+does it and records `pass`). If it fails, fix response logging before any eval run
+([serving and evals](../ttnn-knowledge/topics/serving-evals.md#eval-infrastructure)).
 
 How reruns run. A task here is one eval task (one SWE instance, one GPQA question). Failed tasks are rerun
 together as one harness run per setting (the list run's command with only the failed task IDs), all started
@@ -285,8 +276,8 @@ Name what each cause would need to fix and whether it is the model, the serving 
 
 The multigoal runner starts and checks stages; it does not watch eval runs. Start each list run and rerun
 wave so that it survives the tool call (`scripts/eval_runs.py start`, Helpers, does this and records the
-run), and wait without model calls: each look in a short turn resends the whole context, and agent-built
-supervisors have crashed mid-run. Use waits of tens of minutes, and do other analysis between them. Score the run from the harness output and mark it `collected` in
+run), and wait without model calls, in waits of tens of minutes with other analysis between them
+([serving and evals](../ttnn-knowledge/topics/serving-evals.md#eval-infrastructure) says why). Score the run from the harness output and mark it `collected` in
 `results.json`. Sub-agents run at low effort for
 profiling, log triage and tests; the coordinator decides. Sub-agents share findings within the run through
 its own records (`results.json`, the digests and triage files).

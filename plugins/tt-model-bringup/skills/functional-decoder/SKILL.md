@@ -10,22 +10,16 @@ Before using this workflow, follow the dependency and environment setup in
 Resolve its package root from this installed skill's location; do not assume
 this plugin is copied into the target tt-metal checkout.
 
-
 ## Mission Context
 
-If this skill is used as part of `$model-bringup`, follow that skill's mission, workspace, and reporting contract. This stage turns the HF decoder layer (or multiple layers if there are different kinds in the HF model) into complete, working, tested TTNN code. It's called "functional" because it should be functionally complete and ready to ship - this is not a minimal prototype, it's the heart of everything else that follows. You should bring up the decoder on a single 1x1 device mesh. No need to use multiple devices at this stage.
+If this skill is used as part of `$model-bringup`, follow that skill's mission, workspace, and reporting
+contract. This stage turns the HF decoder layer, or each layer kind, into complete, tested TTNN code on a single
+1x1 device mesh. "Functional" means complete and ready to ship, not a prototype: every later stage builds on it.
 
 ## Your Part
 
-Implement:
-
-```text
-models/autoports/<model>/tt/functional_decoder.py
-```
-
-Derive `<model>` from the HF model id: lowercase it and replace every non-alphanumeric character with an underscore, for example `org/Model-1.2B-Instruct` becomes `org_model_1_2b_instruct`. Downstream verification gates and tooling resolve the autoport directory from the HF model id, so do not add extra qualifiers such as hardware or experiment names.
-
-with a model-appropriate `FunctionalDecoder` that subclasses `models.common.lightweightmodule.LightweightModule` and exposes a real weight-loading boundary:
+Implement `models/autoports/<model>/tt/functional_decoder.py` with a `FunctionalDecoder` that subclasses
+`models.common.lightweightmodule.LightweightModule` and loads real weights:
 
 ```python
 class FunctionalDecoder(LightweightModule):
@@ -36,207 +30,137 @@ class FunctionalDecoder(LightweightModule):
     def decode_forward(self, ...): ...
 ```
 
-Implement forward signatures that fit the model. Keep them keyword-friendly. Record the signatures in the README.
+`<model>` is the HF model id lowercased with every non-alphanumeric character replaced by an underscore
+(`org/Model-1.2B-Instruct` becomes `org_model_1_2b_instruct`); gates find the directory by this name, so add no
+other qualifiers. Choose keyword-friendly forward signatures that fit the model and record them in the README.
 
 ## How To Approach It
 
-Start by understanding the HF model. Load `AutoConfig`, inspect the installed `configuration_*.py` and `modeling_*.py`, and identify the decoder layer, attention, RoPE, cache API, MLP/MoE path, residual order, norm behavior, activation, bias flags, head shapes, and layer-kind differences. Trace through the model's execution line by line to make sure you understand it.
+Understand the HF model first: load `AutoConfig`, read the installed `configuration_*.py` and `modeling_*.py`,
+and trace the decoder line by line (attention, RoPE, cache API, MLP or MoE, residual order, norms, activation,
+biases, head shapes, layer-kind differences). Read the matching working implementations in
+[reference code](../ttnn-knowledge/topics/reference-code.md) before designing.
 
-Before writing final tests, derive the model capability contract from the HF config and model code. For decoder-layer bringup this includes the target context/sequence length, cache and position semantics, layer kinds, mode switches such as sliding vs full attention, and the externally visible prefill/decode behavior later stages must preserve. Small shapes are useful for debugging, but stage completion requires evidence for the advertised contract or a hard physical device limit reason for the largest feasible reduction.
+Implement correctness first: BF16, tile layout and DRAM are fine while proving semantics. Weight conversion,
+dtype choice, `ttnn.as_tensor` and cache construction belong in `from_state_dict` or setup helpers; runtime
+prefill and decode have no hidden `torch`, `from_torch`, `to_torch` or host fallback. Defaults and HF-reference
+practice: [correctness](../ttnn-knowledge/topics/correctness.md).
 
-Support logical sequence lengths, not only friendly aligned lengths. If the implementation chunks, pads, or tiles prefill internally, public prefill inputs should still accept any valid `seq_len <= supported_context` unless the HF model itself has a real semantic restriction. Round or pad internally, mask padded tokens, and slice outputs back to the logical length. Do not leave checks such as `seq_len % 1024 == 0` on the public model path just because the current chunking helper wants that shape.
+For MoE models, validate the real router and the gate-selected experts end to end, not only gate and experts
+separately. On non-Galaxy hardware start from the GPT-OSS active-expert pattern (top-k scores as a sparsity
+tensor, `ttnn.sparse_matmul` for gate/up/down, score weighting, reduce over experts); not from Galaxy-only fused
+paths without evidence they run on the target. MoE behaviour by batch: [MoE](../ttnn-knowledge/topics/moe.md).
 
-Implement correctness first. BF16, tile layout, and DRAM memory are fine while proving semantics. Move weight conversion, reshaping, dtype selection, `ttnn.as_tensor`, and cache construction into `from_state_dict` or setup helpers. Keep runtime prefill/decode free of hidden `torch`, `from_torch`, `to_torch`, or host fallback except explicit test boundaries.
+When PCC is low, narrow it down: split into components, check HF parity, raise fidelity, simplify the shape. PCC
+near 1 can still hide a uniform gain error or a flipped discrete choice: [numerics](../ttnn-knowledge/topics/numerics.md).
+If narrowing stalls, use `$autofix`. If the cause is a tt-metal bug, keep a reproducer or an on-branch
+workaround with evidence.
 
-For MoE models, validate the real router/gate and active experts end-to-end. Component tests for gate or experts are useful diagnostics, but the decoder result should include the gate-selected expert path a real model run would use. For non-Galaxy bringup, use the GPT-OSS active-expert pattern as the default: router/top-k scores as a sparsity tensor, `ttnn.sparse_matmul` for gate/up/down projections, score weighting, and a model-appropriate reduce over experts. Do not start from Galaxy-only fused MoE paths unless you have direct evidence that the target hardware and ops support them.
+## Context, Length And Batch Contract
 
-When PCC is low, debug it. Split the decoder into components, check HF parity, raise fidelity where useful, simplify the failing shape, and keep narrowing until the cause is understood. If a bug is tricky enough that ordinary narrowing stalls, use `$autofix`; it will run `$autodebug` if needed, then verify or refute each proposed bug before keeping any fix. If the cause is a tt-metal bug, make a reproducer or an on-branch workaround and record the evidence.
+Derive the capability contract from the HF config and code before writing final tests: context length, cache and
+position semantics, layer kinds, mode switches such as sliding vs full attention, and the prefill/decode
+behaviour later stages must preserve.
+
+- The target context is the full value the HF config advertises (usually `max_position_embeddings`). Do not
+  create a smaller config or hide a smaller implementation behind a smaller `max_model_len`.
+- Reduce it only for a hard physical device limit (for example device DRAM for weights, KV and persistent
+  buffers). Record the byte calculation or failed probe, the largest feasible value and the setting that uses it.
+  Runtime, profiling or watcher cost is not capacity evidence.
+- Prefill and decode tests include the full supported length, or the largest feasible one with that evidence.
+- Public prefill accepts any valid logical length up to the supported context. Pad or chunk internally, mask
+  padded tokens, slice outputs back; no `seq_len % chunk == 0` checks on the public path unless the HF model
+  itself has the restriction. Tests include non-aligned lengths, and window boundaries for sliding-window models.
+- Prefill commonly uses `(1, batch, seq_len, hidden)` and decode `(1, 1, batch, hidden)`. Start at batch 1 but
+  hard-code it nowhere (masks, page tables, positions, cache indexing, residuals, outputs). After batch 1 passes,
+  test up to the largest batch in `batch_sizes` (default 32) when hardware allows; otherwise record the largest
+  tested batch and the limit.
+- Full and sliding attention that differ only by mask or window share one parameterized implementation and tests.
 
 ## Implement Chunked Prefill
 
-Implement chunked prefill during functional bringup. A bounded physical chunk size can reuse working shapes while preserving arbitrary logical prompt lengths, it plays nicely with tracing and makes it easier to optimize L1 usage.
+Implement chunked prefill now: a bounded physical chunk reuses working shapes for any logical length, traces
+well, and keeps L1 use manageable. Read how existing code does it, without copying its restrictions:
 
-Read existing implementations before designing the path:
+- [TT-Transformers generator](https://github.com/tenstorrent/tt-metal/blob/fc7777ceca4a2360667dbb193b28fedcccc89866/models/tt_transformers/tt/generator.py): tokens sliced relative to the new input, cache pages and RoPE/attention positions absolute; its divisibility restrictions are internal, not API.
+- [TT-Transformers attention](https://github.com/tenstorrent/tt-metal/blob/fc7777ceca4a2360667dbb193b28fedcccc89866/models/tt_transformers/tt/attention.py): chunk-local page tables drive cache writes; `chunked_scaled_dot_product_attention` reads the accumulated cache with a causal offset. It rejects sliding-window attention.
+- [Gemma4 generator](https://github.com/tenstorrent/tt-metal/blob/fc7777ceca4a2360667dbb193b28fedcccc89866/models/demos/gemma4/tt/generator.py): last-token indices, intermediate chunks, per-layer page-table routing and sliding-cache tails; its traced-chunk path excludes bounded sliding KV.
 
-- [TT-Transformers generator](https://github.com/tenstorrent/tt-metal/blob/fc7777ceca4a2360667dbb193b28fedcccc89866/models/tt_transformers/tt/generator.py): `prefill_forward_single_user_text` slices tokens relative to the new input, but selects cache pages and sets RoPE/attention positions using absolute offsets. Its helpers operate on padded physical lengths; do not copy their divisibility restrictions into the public API.
-- [TT-Transformers attention](https://github.com/tenstorrent/tt-metal/blob/fc7777ceca4a2360667dbb193b28fedcccc89866/models/tt_transformers/tt/attention.py): chunk-local page tables drive cache writes, while `chunked_scaled_dot_product_attention` reads the accumulated cache with a causal chunk offset. This path explicitly rejects sliding-window attention.
-- [Gemma4 generator](https://github.com/tenstorrent/tt-metal/blob/fc7777ceca4a2360667dbb193b28fedcccc89866/models/demos/gemma4/tt/generator.py): true last-token indices, intermediate-chunk handling, per-layer page-table routing, and bounded sliding-cache tails need model-specific treatment. Its traced-chunk path excludes bounded sliding KV. Inspect the target revision and layer contracts rather than transplanting these exceptions.
+Requirements:
+- Keep chunk start, valid token count and padded physical length distinct. Absolute position is the cached prefix
+  length plus the offset in the new input. Prior K/V is preserved, new K/V goes to the request's own pages, each
+  query sees the valid prefix and the causal current chunk, and padding never reaches attention or live cache.
+- Every intermediate chunk fills its K/V. Generation logits come from the last logical token, not a padded row;
+  all logical outputs are kept when a caller asks for them. The generator orchestrates; the decoder exposes the cache and position inputs it needs.
+- One prefill call can carry several rows with different lengths and starts, with independent cache writes,
+  positions and last-token selection. A per-row loop is the functional baseline; running dense work once across
+  rows is the later target.
+- Test increasing lengths on one loaded instance (below, at and above a chunk boundary; several chunks plus a
+  tail; then a short request again) against HF and an unchunked control, including decode after the fill. Keep
+  fresh requests and explicit continuation apart, and change tokens and page ownership to expose stale state.
+- Test continuation at the starts that a prefix-cache hit, a chunk continuation and a preemption resume produce:
+  the smallest block, the least common multiple of the block sizes, a tile-unaligned start, the sliding window and
+  one past it, and the last token. Compare the layer's contribution (output minus residual input) per row with the
+  full-prefill run; whole-output PCC hides attention errors behind the residual. A negative control that drops
+  the prefix history must fail the same check. The full-model and serving stages reuse this path
+  ([prefill features](../vllm-integration/references/prefill-features.md)); known causes of mismatches at
+  unaligned starts: [prefill and KV](../ttnn-knowledge/topics/prefill-kv.md).
 
-- Keep chunk start, valid token count, and padded physical length distinct. For continuation, absolute position is cached-prefix length plus the offset in the new input. Preserve prior K/V, write new K/V to the intended request's pages, and let each query attend to the valid prefix and causal current chunk. Padding must not become visible to attention or overwrite live cache entries.
-- Fill the required K/V for every intermediate chunk. Select generation logits from the final logical token, not a padded row; preserve all logical outputs when the layer or readiness caller requests them. The generator owns orchestration; the decoder exposes the cache/position inputs it needs.
-- Exercise increasing lengths on the same loaded instance, including just below/at/above a chunk boundary and multiple chunks plus a tail, then reuse a short request. Compare with HF and a feasible unchunked control, including follow-on decode that consumes the filled cache. Distinguish fresh requests, which reset request state, from explicit prefix continuation. Change tokens and page ownership to expose stale state; check each supported layer kind and sliding-window boundary.
-- Test explicit continuation at the starts a vLLM prefix-cache hit, a chunk continuation, and a preemption resume produce: the smallest block, the least common multiple of the block sizes, a tile-unaligned start, the sliding window and one past it, and the last token. At the layer level compare the layer's contribution (output minus residual input) per row over a window of resumed rows against the full-prefill run; whole-output PCC on one layer hides attention errors behind the residual passthrough (a no-history control still scored 0.9997 on it). Add a negative control that drops the prefix history or zeroes the sliding-window snapshot and confirm it fails the same per-row gate; a control that still agrees means the test cannot see a broken resume. The full-model stage reuses this path for `prefill_logits_continuation`, and the serving stages depend on it for prefix caching; see [prefill features](../vllm-integration/references/prefill-features.md).
-- Let one prefill call carry several rows with different lengths and starts. Keep per-row cache writes, positions, and last-token selection independent, and plan for running the dense work once across rows; the per-row full-decoder loop is a functional baseline, not the optimized target.
+For tracing later: keep host chunk planning separate from device execution, and prepare every physical shape and
+op path (first chunk, continuation, tails) before the first capture (`$tt-enable-tracing`). Refresh positions, valid
+lengths and page tables before replay, and restore cache state after warmup and capture. A new logical length
+inside a prepared bucket reuses its trace. A fixed-input replay passing does not prove increasing lengths work.
 
-Keep later tracing straightforward: separate host chunk planning from device execution, and follow `$tt-enable-tracing` for stable buffers and input refresh. Prepare/compile all supported physical shapes and op paths before recording the first trace; the first chunk, continuation chunks, and tails may need different traces or an eager path, whose persistent setup must also precede capture. Tensor-valued offsets only permit reuse when the op supports them and the remaining program signature is unchanged. Refresh positions, valid lengths and page tables before replay, and restore cache state after warmup/capture. A new logical length within a prepared physical bucket must reuse its trace, not trigger recapture. A passing fixed-input replay does not prove increasing-length requests work.
+If you find strong evidence that a non-chunked prefill is faster and still trace-safe with interleaved prefill
+and decode of varied lengths, present it before switching.
 
-If after working on a chunked prefill implementation you have strong evidence that it would still produce a more performant model whilst still remaining trace-safe when interleaving prefill and decode with a variety of sequence lengths, then present that evidence clearly before proceeding with the alternative path.
+## Paged KV Cache
 
-## Evidence To Leave
-
-Use `PCC >= 0.995` as the default acceptance bar for prefill and decode unless the model gives a concrete reason to choose a different bar. Done means all of these are true and recorded:
-
-- HF-vs-TTNN prefill and decode PCC and performance for each meaningful layer kind.
-- Prefill and decode on-device performance measured from warmed runs (using traced execution for decode) - these should have perf report outputs to prove it.
-- Paged KV-cache behavior, including page table and current-position handling.
-- A short capability-contract evidence table: claim, evidence, and remaining risk for the advertised context/sequence length, cache behavior, layer kinds, and mode switches.
-- Full advertised prefill/decode sequence length, or the largest feasible value when a hard physical device limit prevents the advertised value from fitting or running.
-- Sequence-length coverage for valid non-aligned logical lengths: at least one small smoke length, one length exactly at a relevant tile/page/chunk boundary, one just across a boundary, and one long non-divisible length near the supported context. Use a reduced layer-level harness if the long test would otherwise be too slow, but do not treat aligned-only coverage as complete.
-- `models/autoports/<model>/doc/context_contract.json` records the HF-advertised context, the current supported context, the largest context tested in prefill and decode, and any hard-physical-limit reduction with byte/probe evidence.
-- Determinism for repeated identical inputs tested.
-- Evidence there are no torch or host calls required within a single prefill or decode pass - everything runs and stays on device.
-- Watcher-clean run with `TT_METAL_WATCHER=10`. If the command cannot run in the environment, record the exact environment failure and replacement evidence; do not skip asserts or weaken the test.
-
-
-# Decoder Bringup Knowledge
-
-Use this reference while bringing up a TTNN decoder layer. It folds in relevant local knowledge from personal skills and repo reading so the repo-local skill is portable.
-
-## Repo Paths Worth Reading
-
-- `models/common/modules/attention/attention_1d.py`: general config-first attention with prefill/decode split, paged KV cache, trace-friendly current-position tensors, Q/K norm hooks, and CCL integration.
-- `models/common/modules/mlp/mlp_1d.py`, `models/common/modules/rmsnorm/rmsnorm_1d.py`, and `models/common/modules/rope/rope_1d.py`: common patterns for decode-vs-prefill memory layout, on-device RoPE embedding, and local/distributed norm paths.
-- `models/common/modules/lazy_weight.py`: setup-time TTNN tensor conversion and deterministic cache-key pattern without runtime torch imports.
-- `models/tt_transformers/tt/decoder.py`: standard transformer block composition and residual order.
-- `models/tt_transformers/tt/generator.py` and `models/tt_transformers/tt/model.py`: production trace capture/replay, stable trace input tensors, decode preparation, and vLLM-facing contracts.
-- `models/tt_transformers/tt/generator_vllm.py`: paged KV-cache allocation, per-layer page-table routing, and hybrid attention contracts.
-- `models/demos/gpt_oss/tt/layer.py` and `models/demos/gpt_oss/tt/attention/`: model-specific standard attention with paged prefill/decode and MoE-adjacent tests.
-- `models/demos/gpt_oss/tt/experts/README.md`, `models/demos/gpt_oss/tt/experts/decode.py`, `models/demos/gpt_oss/tt/experts/prefill.py`, `models/demos/gpt_oss/tt/experts/weights.py`, `models/demos/gpt_oss/tt/experts/config.py`, and `models/demos/gpt_oss/tt/topk.py`: default MoE active-expert pattern using `ttnn.sparse_matmul`.
-- `models/demos/gemma4/tt/layer.py` and `models/demos/gemma4/tt/attention/`: strong examples for many norms, layer scales, sliding/full layer types, shared KV, and model-specific RoPE.
-- `models/demos/deepseek_v3/tt/decoder_block/` and `models/demos/deepseek_v3/tt/mla/`: examples for dense-vs-MoE decoder kinds, MLA, row-sharded behavior, and specialized paged-cache updates.
-- `tech_reports/LLMs/llms.md` and `tech_reports/LLMs/vLLM_integration.md`: TTNN LLM conventions for paged cache, prefill/decode shape differences, tracing, and vLLM integration.
-
-## TTNN Correctness Defaults
-
-- Start with `ttnn.bfloat16`, `ttnn.TILE_LAYOUT`, and `ttnn.DRAM_MEMORY_CONFIG` where that simplifies correctness; optimize memory layout after PCC is stable.
-- Transpose 2D PyTorch linear weights before `ttnn.linear` unless the local TTNN helper already does it.
-- Reshape norm weights so they broadcast over hidden width.
-- Derive Q/K/V head reshapes from config, including GQA/MQA KV expansion, before optimizing.
-- In `models/common` attention, Q/K weights may need HF-to-TTNN RoPE permutation handling such as `reverse_permute`; inspect the module contract and tests.
-
-## HF Reference And Synthetic Weights
-
-- Prefer a layer-only HF reference over full causal LM loading.
-- Inspect the decoder layer constructor, rotary/position embedding inputs, attention mask semantics, and cache API before writing the test.
-- Use real weights to record tensor stats and to validate that `from_state_dict` can load a real checkpoint path when available. Treat the real HF state dict as the canonical key and shape contract. Normal CI tests should use synthetic weights generated from those stats so they do not require HF weight downloads.
-- For each tensor used by the TTNN layer, store at least name, shape, dtype, mean, and std.
-- Generate synthetic weights deterministically from those stats in pytest.
-- Synthetic input activations should approximate the distribution entering the decoder layer after embeddings/norms, not arbitrary huge random values.
-- Do not create smaller configs - replicate the real config of the reference.
-- If full HF weight download is necessary to collect stats, record why partial shard loading was not practical.
-- Always use real shapes even with synthetic weights.
-- You must include a test with real weights and show it passes PCC >= 0.995 for each of the layer kinds.
-
-## Paged KV Cache Checks
-
-- Use paged prefill and paged decode as the final path. Non-paged cache is not worth spending time on for this bringup.
-- Paged prefill usually uses `ttnn.experimental.paged_fill_cache`; decode uses `ttnn.experimental.paged_update_cache` and `ttnn.transformer.paged_scaled_dot_product_attention_decode`.
-- Treat prefill fill-cache and decode update-cache as different dtype contracts. When the cache is lower precision such as `ttnn.bfloat8_b`, prefill should cast the K/V tensors passed to `paged_fill_cache` to the destination cache dtype before filling. Do not blindly apply the same cast to decode: `paged_update_cache` update tensors must remain a supported compute dtype such as BF16/FLOAT32, even when the destination cache is BFP8.
-- Decode should use tensor current positions when tracing; Python lists or scalar host state tend to break traceability.
-- Use page-table permutations, nonzero slots, and random current positions to catch address and indexing bugs.
-- Chunked prefill SDPA and paged decode SDPA pad their key window to the chunk size and follow the page table past the row's end; non-finite data in those pages corrupts every masked query row, nondeterministically. Keep `chunk_start + round_up(q_len, chunk)` inside the page-table extent and choose a decode key chunk that divides the extent. The paged decode SDPA also reads the sharded query from the core its program grid assigns to each user, so the user shard rectangle must match that grid (8 wide or a single row on Blackhole); derive the physical decode batch from it instead of a divisor search.
-- For hybrid attention, inspect per-layer page-table routing and cache specs instead of assuming one page table shape covers every layer.
-- Gemma-style shared-KV layers may skip K/V projection and cache update; tests must still prove the consumer layer reads the intended source cache.
-- DeepSeek-style MLA cache updates can have aliasing hazards between prompt/speculative lanes; inspect masks and lane routing when validating cache correctness.
-
-## Prefill And Decode Shapes
-
-- Prefill commonly uses `(1, batch, seq_len, hidden)` style tensor shapes; decode commonly uses `(1, seq_len=1, batch, hidden)`.
-- Use batch 1 as the first smoke/performance target, but do not hard-code batch 1 into masks, page tables, current positions, cache indexing, residual shapes, or output handling.
-- After batch-1 PCC passes, add at least one batch >1 prefill/decode correctness test. Test up to the largest batch in `batch_sizes` (default 32) when the target hardware, memory, and harness allow it. If batch 32 cannot run, record the largest tested batch and the hard limit.
-- The target sequence/context length is the full value advertised by the HF config, usually `max_position_embeddings` or the model's equivalent field. Do not create a smaller model config. Do not hide a smaller implementation behind a smaller `max_model_len`.
-- Do not reduce the advertised model capability to make bringup, tests, profiling, or serving easier. A reduction is acceptable only when a hard physical device limit prevents the advertised capability from fitting or running, such as device DRAM capacity for weights + KV/cache/state + required persistent buffers. If reduced, record the byte calculation or failed capacity probe, the largest feasible supported value, and the exact construction/serving setting that uses it.
-- Decode tests must include the full supported context length unless measured KV-cache DRAM capacity forces a reduction. If reduced, record the attempted full-length or capacity-probe command, log, failure signature or byte calculation, and largest feasible tested context.
-- Prefill tests must include the full supported sequence length unless measured L1/DRAM capacity forces a reduction. If reduced, record the attempted full-length or capacity-probe command, log, failure signature or byte calculation, and largest feasible tested sequence.
-- Prefill and decode tests must also include valid logical lengths that are not divisible by the implementation's preferred chunk, tile, block, page, or trace length. A TTNN kernel may require padded physical shapes internally; the decoder API should own that padding and masking rather than rejecting the logical length.
-- Do not accept "tractability", profiling/watcher cost, runtime, or small synthetic proof scope as sequence-capacity evidence.
-- Sliding-window models should include lengths around window boundaries, not only tiny smoke shapes.
-- If a model has both full and sliding attention but identical decoder computation except mask/window configuration, use one parameterized implementation and tests for both modes.
+Paged prefill and paged decode are the final path. Read the paged KV basics and failure modes in
+[prefill and KV](../ttnn-knowledge/topics/prefill-kv.md) before writing the cache tests (fill and update dtype
+contracts, tensor current positions, page-table permutations, read windows past the row's end, the decode
+query grid).
 
 ## Trace And Profiling
 
-- The final decode pass must use traced TTNN execution. If trace capture, replay, stale inputs, event synchronization, or trace-safe input setup becomes tricky, use `$tt-enable-tracing` before accepting an eager-only decode path.
-- Open the device with a zero trace region, for example `trace_region_size=0`, TTNN can auto-detect the right size these days.
-- Use the pattern: compile/warmup, synchronize, signpost start, execute warmed trace or warmed measured path, synchronize once, signpost end.
-- Copy the newest Tracy ops CSV to the git-ignored `bringup/artifacts/<stage>/` and run `tt-perf-report` with start/end signposts for the measured window; only its report goes into the evidence directory.
-- `tt-perf-report --csv` may expose filtered kernel time as `Device Time` in microseconds rather than raw nanoseconds; convert accordingly and note the column used.
-- Profiling should capture warmed prefill and warmed decode separately.
-- Decode PCC should be measured from replay output, not only from an uncaptured forward pass.
-- Tensor allocation after trace capture is a red flag. Trace capture should bake stable buffer addresses and replay should only update allowed input tensor contents before `execute_trace`. Before accepting the traced decoder, run representative repeated replay with `TT_METAL_TRACE_ALLOC_TRACKING=1`, cover every captured control-flow path, and resolve every unsafe allocation under the target tt-metal checkout's `tech_reports/AdvancedPerformanceOptimizationsForModels/TraceCorrectness.md`.
+- The final decode pass is traced; if capture or replay gets tricky, use `$tt-enable-tracing` rather than accepting
+  eager decode. Measure decode PCC from replay output.
+- Allocation after capture is a defect: run repeated replay with `TT_METAL_TRACE_ALLOC_TRACKING=1` over every
+  captured path and resolve each unsafe allocation per the checkout's
+  `tech_reports/AdvancedPerformanceOptimizationsForModels/TraceCorrectness.md`. Common causes:
+  [tracing](../ttnn-knowledge/topics/tracing.md).
+- Measure warmed prefill and decode separately with signposts and `tt-perf-report`
+  ([profiling](../ttnn-knowledge/topics/profiling.md)).
 
-## `tt-perf-report`
+## Fallback Audit
 
-`tt-perf-report` is a Python CLI published separately from tt-metal. Install it in the active tt-metal Python environment, not in a random system Python:
+- Runtime prefill and decode call no torch, `ttnn.from_torch` or `ttnn.to_torch`. Allowed in tests: setup inside
+  `from_state_dict`, input construction, the final PCC comparison, and a named prefill-to-decode boundary.
+- Fallback hidden in helpers counts; read wrappers as well as the layer file. The host-side last-token extraction
+  in `models/tt_transformers/tt/model.py` is a production compromise, not a pattern to copy.
+- Device commands follow `tt-device-usage`. If a wheel-installed `ttnn` hits SFPI/JIT mismatches, use a
+  source-built tt-metal whose headers and compiler match.
 
-```bash
-python -m pip install tt-perf-report
-tt-perf-report --help
-```
+## Code Quality
 
-The input is the post-processed Tracy ops CSV, usually named like `ops_perf_results_YYYY_MM_DD_HH_MM_SS.csv`. Generate that CSV with the normal Tracy profiler flow, for example:
+Explicit model contracts over permissive fallbacks; invalid config values fail rather than being patched; no
+generality for shapes the model does not have; no debug fallbacks or shims in the final code without a reason.
 
-```bash
-python -m tracy -r -p -v -m pytest <test-path> -k "<selector>"
-```
+## Evidence To Leave
 
-If Tracy collection fails, the LLM tech report notes a device-only fallback:
+`PCC >= 0.995` is the default bar for prefill and decode unless the model gives a concrete reason for another.
+Done means all of these are recorded:
 
-```bash
-TT_METAL_DEVICE_PROFILER=1 pytest <test-path> -k "<selector>"
-python tools/tracy/process_ops_logs.py --date
-```
-
-For functional-decoder artifacts, copy the relevant ops CSV to the raw directory (not committed) and write the reports into the artifact directory:
-
-```bash
-export ARTIFACT_DIR="models/autoports/<model>/doc/functional_decoder"
-export RAW_DIR="bringup/artifacts/$(basename "$ARTIFACT_DIR")/tracy/<layer_kind_id>"   # git-ignored
-mkdir -p "$RAW_DIR" && cp <ops_perf_results_*.csv> "$RAW_DIR/decode_ops.csv"
-tt-perf-report "$RAW_DIR/decode_ops.csv" \
-  --start-signpost PERF_DECODE \
-  --end-signpost PERF_DECODE_END \
-  --csv "$ARTIFACT_DIR/tracy/<layer_kind_id>/decode_perf_report.csv" \
-  --no-advice \
-  > "$ARTIFACT_DIR/tracy/<layer_kind_id>/decode_perf_report.console.log"
-tt-perf-report "$RAW_DIR/decode_ops.csv" \
-  --start-signpost PERF_DECODE \
-  --end-signpost PERF_DECODE_END \
-  --no-summary \
-  --no-advice \
-  > "$ARTIFACT_DIR/tracy/<layer_kind_id>/decode_perf_report.txt"
-```
-
-Use the same shape for prefill, with `PREFILL` signpost names and `prefill_*` filenames. If the installed `tt-perf-report` version does not support one of these flags, run `tt-perf-report --help`, use the closest supported flag set, and record the exact command in the bringup log.
-
-The `*_perf_report.txt` file is for the human-readable table. Do not redirect the stdout from a `--csv` run into that filename; `--csv` mode prints command/status boilerplate such as "Writing CSV output..." rather than the rendered report table. Keep that chatter in `*_perf_report.console.log` if it is useful for provenance.
-
-When calculating latency from the report, prefer the filtered `tt-perf-report` CSV for the signposted window. Check the time column units. Some versions expose `Device Time` in microseconds; raw Tracy ops CSVs often expose `DEVICE KERNEL DURATION [ns]`. Record which column and unit you used in `functional_decoder.md`.
-
-## Watcher Notes
-
-- Watcher is fully supported on source builds; wheel-only environments may not have the same debug coverage.
-- `TT_METAL_WATCHER=<n>` enables watcher and sets the polling interval in seconds unless the value has an `ms` suffix.
-- `TT_METAL_LOGS_PATH=<dir>` redirects generated logs; watcher writes under `<dir>/generated/watcher/`.
-- CI commonly uses `TT_METAL_WATCHER=2`, `TT_METAL_WATCHER_APPEND=1`, `TT_METAL_WATCHER_NOINLINE=1`, and `TT_METAL_WATCHER_DISABLE_ETH=1`.
-- For decoder-layer artifact runs, prefer a unique `TT_METAL_LOGS_PATH` per command over appending unrelated runs into one log.
-- Watcher and device profiler/debug-print should be separate runs because they use overlapping debug resources.
-- Watcher detects asserts, invalid NOC coordinates or addresses, CB out-of-bounds NOC transactions, L1 address overflow, stack overflow, hardware faults on supported targets, waypoint state, and active kernel ids.
-- A watcher-clean run still may contain normal attach, dump, kernel id, and detach lines. It must not contain fatal watcher exceptions or suspicious stack/L1/NOC/CB/sanitize messages.
-- Good false-positive evidence includes the exact watcher log line, why the address/core/state is benign, the commit or issue proving it is known, and a separate correctness/profiling run showing the decoder path is otherwise sound.
-
-## Fallback And Watcher Audit
-
-- Runtime prefill/decode should not call torch, `ttnn.from_torch`, or `ttnn.to_torch` except at explicit boundaries.
-- Setup-time conversion inside `from_state_dict`, input construction, final PCC comparison, and a named temporary prefill-to-decode boundary are allowed in the test harness.
-- Host fallback hidden in helpers is still fallback; inspect wrappers as well as the layer file.
-- `models/tt_transformers/tt/model.py` contains host-side last-token extraction patterns for batched prefill. Treat that as an existing production compromise, not as a pattern to copy silently.
-- Run watcher-enabled tests. A clean watcher run is part of done; a suspected false positive needs evidence.
-- Run TT hardware-facing commands one at a time: resets, `tt-smi`, import/open-device probes, Tracy/profile runs, and tests that touch the device.
-- If wheel-installed `ttnn` hits SFPI/JIT mismatches, prefer a source-built tt-metal environment whose headers and compiler match.
-
-## Code Quality Defaults
-
-- Prefer explicit model contracts over permissive fallback logic.
-- Do not silently infer or patch invalid config values in internal paths; fail directly.
-- Do not add fake generality for one supported HF config shape.
-- Keep debug-only fallback, logging, and compatibility shims out of final bringup code unless they are explicitly justified.
+- HF-vs-TTNN prefill and decode PCC and performance for each layer kind, and a real-weight test that passes the
+  bar for every layer kind.
+- Warmed prefill and traced decode performance with `tt-perf-report` output.
+- Paged KV-cache behaviour, including page-table and current-position handling.
+- A capability-contract table (claim, evidence, remaining risk) for context length, cache behaviour, layer kinds
+  and mode switches, and `models/autoports/<model>/doc/context_contract.json` with the HF-advertised context,
+  the supported context, the largest tested prefill and decode contexts, and any reduction with its evidence.
+- Length coverage: a small smoke length, a length exactly at a tile, page or chunk boundary, one just across it,
+  and a long non-divisible length near the supported context (a reduced layer harness is fine for the long one).
+- Determinism for repeated identical inputs.
+- No torch or host calls inside a single prefill or decode pass.
+- A watcher-clean run with `TT_METAL_WATCHER=10`; if it cannot run, the exact environment failure and replacement
+  evidence. A suspected false positive needs evidence; never skip asserts or weaken the test.

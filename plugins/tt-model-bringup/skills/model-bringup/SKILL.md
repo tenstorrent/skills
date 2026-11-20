@@ -58,6 +58,11 @@ or replace acceptance criteria with a review plugin's criteria.
    with path, size and sha256 in the work log; commit the `tt-perf-report` tables and small JSON. Never
    split a file to fit the size limit. Tag each stage's last checkpoint locally as
    `bringup/<model>/stage-NN`, so a later run can start from any stage.
+6. When something took long to understand and is now solved, add a few lines to the run's
+   `bringup/lessons.md`: what was seen, the cause, what fixed it, how you know (measured, fixed and
+   retested, or still a guess) and roughly how long it took. Write it while it is fresh; a later
+   consolidation pass decides what goes into [`ttnn-knowledge`](../ttnn-knowledge/SKILL.md), which run
+   agents do not edit.
 
 ## Dependency selection
 
@@ -97,7 +102,7 @@ operator in the run record and the full-model goal starts from `tt/optimized_dec
 single-chip is then the target topology, not a fallback, and the later stages say so.
 
 `tt-device-usage`, `tt-enable-tracing`, `qualitative-check`, `stage-review` and `agentic-serving`
-provide shared requirements. AutoDebug/AutoTriage/AutoFix come from the explicit dependency. Implementation
+provide shared requirements; [`ttnn-knowledge`](../ttnn-knowledge/SKILL.md) holds what earlier bringups learned, by topic. AutoDebug/AutoTriage/AutoFix come from the explicit dependency. Implementation
 stages 1–10 require independent review with `clean-pass`; findings require repairs and rereview.
 The benchmark stage (11) measures serving rates and checks measurement completeness without an
 accuracy acceptance review; goal 12 then runs the agentic evals on those rates. Preserve original goal
