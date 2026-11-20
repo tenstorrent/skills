@@ -583,15 +583,6 @@ class Codex(Provider):
                 tuple(a + b for a, b in zip(ref, summed))
         return summed, "unverified", None
 
-    def _reasoning(self, output_path: Path) -> int | None:
-        """The reasoning share of the run's output tokens, or None when no turn reported one."""
-        got = None
-        for ev in self._events(output_path):
-            r = (ev.get("usage") or {}).get("reasoning_output_tokens") if ev.get("type") == "turn.completed" else None
-            if isinstance(r, int) and not isinstance(r, bool):
-                got = (got or 0) + r
-        return got
-
     def _price(self, inp: int, cached: int, out: int) -> float:
         pin, pcached, pout = price_row(PRICES, self.prices, self.model)
         return ((inp - cached) * pin + cached * pcached + out * pout) / 1e6
@@ -757,8 +748,6 @@ class Codex(Provider):
                 usage.extra["reported_turn_usd"] = round(reported, 6)   # what the running totals priced
             usage.input_tokens, usage.cache_read_tokens, usage.output_tokens = own[0] - own[1], own[1], own[2]
             usage.cost_usd = self._price(*own)
-            if (usage.extra.get("thinking_tokens") or 0) > own[2]:
-                usage.extra.pop("thinking_tokens")   # the session's running reasoning count, not the run's
 
     def add_subagent_usage(self, usage, output_path, since=None, env=None) -> None:
         sub = self._subagent_tokens(output_path, since, env)
@@ -830,8 +819,6 @@ class Codex(Provider):
         u = RunUsage(input_tokens=inp - cached, cache_read_tokens=cached, output_tokens=out, final_text=last,
                      estimated=True)
         u.cost_usd = self._price(inp, cached, out)
-        if (reasoning := self._reasoning(output_path)) is not None:
-            u.extra["thinking_tokens"] = reasoning   # part of output_tokens
         events, errors = 0, []
         cache_reports = []
         for ev in self._events(output_path):

@@ -6722,8 +6722,6 @@ class Daemon:
             note["session"] = {k: session[k] for k in ("model", "effort", "error", "verification", "pin_verify", "checked")
                                if k in session}
         note["cache_telemetry"] = usage.extra.get("cache_telemetry", {"complete": False, "requests": None})
-        if isinstance(usage.extra.get("thinking_tokens"), int):   # the output's thinking share
-            note["thinking_tokens"] = usage.extra["thinking_tokens"]
         if usage.extra.get("model"):   # the model the agent's session reported, beside the requested one
             note["model_used"] = str(usage.extra["model"])[:120]
         if isinstance(usage.extra.get("subagents_spawned"), int):   # Agent calls (providers/claude.parse)

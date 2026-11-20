@@ -1248,7 +1248,7 @@ per code task queued at standard with no effort pin of its own, from its spec (o
 tier's effort when Jev is off or does not answer). The pick changes only standard-tier runs whose tier
 effort is high; a deep retry still runs at max. Its pick goes in the run note (`effort_ab`) and in
 Jev's call log, which records the task's outcome. It is off by default; a coordinator may set it from
-chat. (An earlier high-versus-medium effort A/B ended with high.)
+chat.
 
 Standard code tasks take Sonnet at high effort by kind (`route.code_sonnet`; a canary share of 0.2 by
 default, `share 1` for all). Set it for every project with `ttp config --account route.code_sonnet

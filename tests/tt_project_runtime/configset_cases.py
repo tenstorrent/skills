@@ -618,3 +618,14 @@ def test_config_account_add_is_a_usage_error(env, capsys):
         cli.main(["config", "--account", "checks.host_max", "--add", "5"])
     assert "usage: ttp config --account KEY [VALUE]" in capsys.readouterr().err
     assert accountset.current("checks.host_max") == before
+
+
+def test_upgrade_drops_the_retired_effort_ab_keys_and_keeps_jev_pick(env):
+    from ttp import cli
+    from ttp.project import unknown_key_hint
+    p = make(env)
+    _with_raw(p, effort_ab={"enabled": True, "winner": "high", "decided_at": 1, "jev_pick": True})
+    assert "retired" in unknown_key_hint("effort_ab.enabled") and unknown_key_hint("effort_ab.jev_pick") is None
+    notes = cli._drop_retired_keys(p)
+    assert len(notes) == 3 and not any("removed effort_ab.jev_pick" in n for n in notes), notes
+    assert p.raw_config()["effort_ab"] == {"jev_pick": True}

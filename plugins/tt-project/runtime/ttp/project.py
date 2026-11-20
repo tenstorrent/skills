@@ -860,9 +860,8 @@ EXTRA_KEYS = {
                  "rebase_replace", "never_force",   # whether a rebase replaces its branch (rebase_replace)
                  "integration_branch",   # where reviewed changes land on a project with no push branch (integrate)
                  "channel_tags",   # release-channel tags a forward move may update under never_force (channeltag)
-                 "express", "express_max_lines", "express_max_files"},   # `ttp express`: one small urgent head lands alone (express)
+                 "express", "express_max_lines", "express_max_files"},   # `ttp express`: one small urgent head lands alone (pushq)
     "jev": {"via", "url", "model"},
-    "effort_ab": {"enabled", "winner", "decided_at"},   # the ended effort A/B's keys, still in some projects; read by nothing
     # launcher_stops: {glob of a project launcher's job folders: stop command} `ttp detach --stop <job
     # folder>` runs when the job has no detached.json entry and no pid file (launcherstop.registered_stop).
     "detach": {"launcher_stops"},
@@ -1120,6 +1119,9 @@ RETIRED_KEYS = {
     "upgrade.task_every_h": "a conflicting upgrade queues its merge task at once, never on a timer",
     "coordinator.unblock_effort": "every coordinator runs at one effort level, coordinator.effort",
     "route.review_medium_lines": "every review runs on Opus, so no review is sized into the routine class",
+    "effort_ab.enabled": "the effort A/B ended; Jev's pick (effort_ab.jev_pick) is all that is left",
+    "effort_ab.winner": "the effort A/B ended; Jev's pick (effort_ab.jev_pick) is all that is left",
+    "effort_ab.decided_at": "the effort A/B ended; Jev's pick (effort_ab.jev_pick) is all that is left",
     "bridge.agent_alert_grace_min": "replaced by bridge.agent_alert_after_min (when the user is told) and "
                                     "bridge.agent_steady_min (when an outage ends)",
 }

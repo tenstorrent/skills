@@ -164,23 +164,3 @@ def test_jev_effort_pick_is_off_by_default_picks_once_per_lineage_and_logs_the_p
     other = p.db.add_task("Other", "s", kind="code", tier="standard", origin="coordinator")
     assert effortab.assign(p.db, cfg, p.db.task(other), "standard", "claude", None) == \
         {"by": "tier", "root": other, "effort": "high"}
-
-
-def test_providers_put_the_result_usage_thinking_tokens_in_the_run_note(env, tmp_path):
-    from ttp.providers import get_provider
-    out = tmp_path / "claude.jsonl"
-    result = {"type": "result", "subtype": "success", "total_cost_usd": 1.0, "result": "ok",
-              "usage": {"input_tokens": 10, "output_tokens": 900, "output_tokens_details": {"thinking_tokens": 700}}}
-    out.write_text(json.dumps(result) + "\n")
-    assert get_provider("claude").parse(out).extra["thinking_tokens"] == 700
-    del result["usage"]["output_tokens_details"]
-    out.write_text(json.dumps(result) + "\n")
-    assert "thinking_tokens" not in get_provider("claude").parse(out).extra   # none given: n/a, never 0
-    cx = tmp_path / "codex.jsonl"
-    turn = {"type": "turn.completed", "usage": {"input_tokens": 50, "cached_input_tokens": 0, "output_tokens": 300,
-                                                "reasoning_output_tokens": 200}}
-    cx.write_text(json.dumps(turn) + "\n" + json.dumps(turn) + "\n")
-    assert get_provider("codex").parse(cx).extra["thinking_tokens"] == 400
-    del turn["usage"]["reasoning_output_tokens"]
-    cx.write_text(json.dumps(turn) + "\n")
-    assert "thinking_tokens" not in get_provider("codex").parse(cx).extra
