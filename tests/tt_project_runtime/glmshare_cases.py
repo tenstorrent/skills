@@ -120,7 +120,6 @@ def test_glm_share_judge_waits_for_enough_glm_tasks_then_compares_with_the_proje
     v = glmshare.judge(p, cfg, now)
     assert v["state"] == "worse" and "1 device incident" in v["why"]
     p.db.x("DELETE FROM events WHERE kind='device_reset'")
-    # A device task counts only for its incident, so 2 of the 5 other GLM tasks passed.
     for _ in range(3):
         _gs_decided(p, t0 + 9000, 0, arm="glm")
     v = glmshare.judge(p, cfg, now)
