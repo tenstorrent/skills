@@ -539,10 +539,6 @@ def base_window(cand, tasks: dict, runs: dict, reviews: dict, w0: float, floor: 
     return [t for t in cand if t in at and at[t] >= lo], lo
 
 
-def _utc(ts: float) -> str:
-    return datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-
-
 def signals(g: dict, b: dict, before: dict, after: dict, corrections: int, st: dict) -> list[dict]:
     """Each wave-gate signal (module doc): the GLM arm `g` against the baseline `b`, the project's throughput
     `after` its first arm record against `before`, and the user corrections; verdict ok | hold | worse | unmeasured."""
@@ -615,7 +611,7 @@ def judge(p, cfg: dict, now: float) -> dict:
     n = g["decided"]
     fmt = lambda v: "-" if v is None else f"{v:g}"   # noqa: E731
     nums = (f"GLM {n} tasks with an outcome, first review pass {fmt(g['first_pass_pct'])}%; Claude baseline "
-            f"{b['decided']} with an outcome since {_utc(lo)}, first review pass {fmt(b['first_pass_pct'])}%; "
+            f"{b['decided']} with an outcome since {datetime.datetime.fromtimestamp(lo, datetime.timezone.utc):%Y-%m-%d %H:%M} UTC, first review pass {fmt(b['first_pass_pct'])}%; "
             + "; ".join(_says(s) for s in sig))
     out = lambda state, why: {"state": state, "why": f"{why}; {nums}", "n": n, "signals": sig,   # noqa: E731
                               "glm_pct": g["first_pass_pct"], "base_pct": b["first_pass_pct"],
