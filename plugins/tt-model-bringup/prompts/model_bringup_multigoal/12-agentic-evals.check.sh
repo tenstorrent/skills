@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 TT_MODEL_BRINGUP_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_scope.py" --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}"; scope_rc=$?
+[ "$scope_rc" -ge 2 ] && exit "$scope_rc"
 # Runner-side gate for the agentic-evals stage. It reads the records the agent writes (results.json,
 # agentic_serving.json), never a helper script's output, and reports every missing or short record. It blocks
 # (critical) only where a score or a failure could be hidden: a phase with no scored run, an uncollected run, a

@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 TT_MODEL_BRINGUP_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_scope.py" --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}"; scope_rc=$?
+[ "$scope_rc" -ge 2 ] && exit "$scope_rc"
 # Runner-side gate for the full-model stage: free-running TT generation must
 # exist and must not be mechanically degenerate (doubled tokens, single-token
 # collapse). Scoped to this run's model so stale artifacts from another model

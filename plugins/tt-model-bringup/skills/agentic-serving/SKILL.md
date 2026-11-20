@@ -105,6 +105,8 @@ rates explain. It runs on the local machine; no CI is needed.
 |---|---|
 | `mode` | `quick` (phase 1, no task containers), `agentic` (phases 1–2; needs Docker, RAM and disk for task containers), `extended` (agentic plus the extended phase). Each mode includes the one before. Default `agentic` |
 | `batch_sizes` | `[1, 8, 16, 32]`; replaces the default decode batch set for every stage |
+| `scope` | `release`: no changes outside the model folder and `bringup/`; `open`: the model may carry its own op versions (`model-bringup`) |
+| `base_commit` | the commit the run started from; the scope check diffs against it |
 | `phase1` | `{"suite": "r1_gpqa_diamond", "tasks": 10}` |
 | `phase2` | `{"suite": "swe_bench_verified", "tasks": 10}` |
 | `extended_suites` | `["r1_gpqa_diamond", "swe_bench_verified"]`; add `terminal_bench_2_1` to run it |

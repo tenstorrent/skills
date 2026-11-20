@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -uo pipefail
 TT_MODEL_BRINGUP_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_scope.py" --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}"; scope_rc=$?
+[ "$scope_rc" -ge 2 ] && exit "$scope_rc"
 if [ -n "${MODEL_DIR:-}" ]; then
   model_dir="$MODEL_DIR"
 elif [ -n "${HF_MODEL:-}" ]; then

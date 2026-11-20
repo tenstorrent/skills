@@ -40,7 +40,7 @@ Run two TT configurations:
 
 A divergence is a slice outside tolerance, or a cluster of positions, that localises to a layer or op;
 isolated near-tie top-1 flips are not. A divergence at full precision is an implementation defect.
-Localise it by layer, then op, with HF activations; fix the model code, or the tt-metal op when a minimal repro proves the op wrong (fix it there and run its tests);
+Localise it by layer, then op, with HF activations; fix the model code, or, when a minimal repro proves a tt-metal op wrong, work around it in the model under `scope` `release` or fix the op and run its tests under `open` (`model-bringup`);
 then rerun the affected slices and the stage's own tests. A reference problem (tokenizer, chat
 template, config) is fixed in the corpus. `current` far from HF while `full` matches is quantization:
 record the per-group attribution if cheap and leave it to `datatype-sweep`.
