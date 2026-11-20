@@ -158,7 +158,7 @@ Use this reference while bringing up a TTNN decoder layer. It folds in relevant 
 - The final decode pass must use traced TTNN execution. If trace capture, replay, stale inputs, event synchronization, or trace-safe input setup becomes tricky, use `$tt-enable-tracing` before accepting an eager-only decode path.
 - Open the device with a zero trace region, for example `trace_region_size=0`, TTNN can auto-detect the right size these days.
 - Use the pattern: compile/warmup, synchronize, signpost start, execute warmed trace or warmed measured path, synchronize once, signpost end.
-- Copy the newest Tracy ops CSV into the evidence directory and run `tt-perf-report` with start/end signposts for the measured window.
+- Copy the newest Tracy ops CSV to the git-ignored `bringup/artifacts/<stage>/` and run `tt-perf-report` with start/end signposts for the measured window; only its report goes into the evidence directory.
 - `tt-perf-report --csv` may expose filtered kernel time as `Device Time` in microseconds rather than raw nanoseconds; convert accordingly and note the column used.
 - Profiling should capture warmed prefill and warmed decode separately.
 - Decode PCC should be measured from replay output, not only from an uncaptured forward pass.
@@ -186,18 +186,19 @@ TT_METAL_DEVICE_PROFILER=1 pytest <test-path> -k "<selector>"
 python tools/tracy/process_ops_logs.py --date
 ```
 
-For functional-decoder artifacts, copy the relevant ops CSV into the artifact directory before running `tt-perf-report`:
+For functional-decoder artifacts, copy the relevant ops CSV to the raw directory (not committed) and write the reports into the artifact directory:
 
 ```bash
 export ARTIFACT_DIR="models/autoports/<model>/doc/functional_decoder"
-cp <ops_perf_results_*.csv> "$ARTIFACT_DIR/tracy/<layer_kind_id>/decode_ops.csv"
-tt-perf-report "$ARTIFACT_DIR/tracy/<layer_kind_id>/decode_ops.csv" \
+export RAW_DIR="bringup/artifacts/$(basename "$ARTIFACT_DIR")/tracy/<layer_kind_id>"   # git-ignored
+mkdir -p "$RAW_DIR" && cp <ops_perf_results_*.csv> "$RAW_DIR/decode_ops.csv"
+tt-perf-report "$RAW_DIR/decode_ops.csv" \
   --start-signpost PERF_DECODE \
   --end-signpost PERF_DECODE_END \
   --csv "$ARTIFACT_DIR/tracy/<layer_kind_id>/decode_perf_report.csv" \
   --no-advice \
   > "$ARTIFACT_DIR/tracy/<layer_kind_id>/decode_perf_report.console.log"
-tt-perf-report "$ARTIFACT_DIR/tracy/<layer_kind_id>/decode_ops.csv" \
+tt-perf-report "$RAW_DIR/decode_ops.csv" \
   --start-signpost PERF_DECODE \
   --end-signpost PERF_DECODE_END \
   --no-summary \

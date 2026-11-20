@@ -543,17 +543,18 @@ Known tooling-failure signatures and prescribed actions - do not burn hours redi
 - Watcher overflowing the ACTIVE_ETH kernel config buffer: retry with `TT_METAL_WATCHER_DISABLE_ETH=1` and record the scoped limitation.
 - Transient CCL/fabric link errors immediately after a failed multi-device run: reset devices and retry once before treating it as hardware evidence.
 
-Copy the final CSV into the artifact directory and run:
+Copy the final CSV to the raw directory (git-ignored) and write the reports into the artifact directory:
 
 ```bash
 export ARTIFACT_DIR="models/autoports/<model>/doc/optimized_decoder"
-cp <ops_perf_results_*.csv> "$ARTIFACT_DIR/tracy/<layer_kind_id>/decode_ops.csv"
-tt-perf-report "$ARTIFACT_DIR/tracy/<layer_kind_id>/decode_ops.csv" \
+export RAW_DIR="bringup/artifacts/$(basename "$ARTIFACT_DIR")/tracy/<layer_kind_id>"   # git-ignored
+mkdir -p "$RAW_DIR" && cp <ops_perf_results_*.csv> "$RAW_DIR/decode_ops.csv"
+tt-perf-report "$RAW_DIR/decode_ops.csv" \
   --start-signpost PERF_DECODE \
   --end-signpost PERF_DECODE_END \
   --csv "$ARTIFACT_DIR/tracy/<layer_kind_id>/decode_perf_report.csv" \
   > "$ARTIFACT_DIR/tracy/<layer_kind_id>/decode_perf_report.console.log"
-tt-perf-report "$ARTIFACT_DIR/tracy/<layer_kind_id>/decode_ops.csv" \
+tt-perf-report "$RAW_DIR/decode_ops.csv" \
   --start-signpost PERF_DECODE \
   --end-signpost PERF_DECODE_END \
   --no-summary \

@@ -53,7 +53,11 @@ or replace acceptance criteria with a review plugin's criteria.
    Record exact commands, commits, hardware identity and evidence. Keep weights, credentials and
    private logs out of published commits. Run the repository's commit hooks (formatters, file-size
    limit) before the first device run of each commit so the evidence SHA is the shipped code;
-   server logs over the size limit go in gzipped.
+   server logs over the size limit go in gzipped. Commit summaries, not raw output: Tracy ops CSVs and
+   large raw logs or archives that no gate reads go under the git-ignored `bringup/artifacts/<stage>/`,
+   with path, size and sha256 in the work log; commit the `tt-perf-report` tables and small JSON. Never
+   split a file to fit the size limit. Tag each stage's last checkpoint locally as
+   `bringup/<model>/stage-NN`, so a later run can start from any stage.
 
 ## Dependency selection
 
