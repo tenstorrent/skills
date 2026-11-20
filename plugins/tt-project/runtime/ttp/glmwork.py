@@ -35,13 +35,16 @@ FALLBACK = {"provider": "claude", "model": "sonnet", "effort": "high"}
 FALLBACK_ON = ("down", "error", "rate_limit", "auth", "malformed", "model_missing", "busy", "slots",
                "busy_wait_expired")
 
-# A run that talks to a person (GLM never does): a reply, post or comment to a person or a
-# channel, or the commands that post.
+# A run told to talk to a person (GLM never does): an instruction to post, comment, reply, send or notify (a
+# sentence or list item that opens with the verb, `then`/`also`/`please` and the like aside) to a person or a channel,
+# or to run the command that posts. A spec that only mentions such words (a task about the comment handler, a
+# `gh pr comment` bug) is no instruction: only `reply_chat` or an instruction keeps a run on core.
 PERSON = re.compile(
-    r"(?i)\b(?:post|send|reply|respond|comment|message|e-?mail|answer)(?:s|ed|ing)?\b[^\n]{0,40}?"
-    r"\b(?:slack|jira|github|gh|e-?mail|the user|the requester|the reviewer|the author|a person|people|"
-    r"channel|thread|pr comment|issue comment)\b"
-    r"|\bgh\s+(?:pr|issue)\s+(?:comment|review)\b|\bttp\s+(?:notify|urgent-reply)\b")
+    r"(?im)(?:^|[.,;:!?]\s+)[ \t>*#\d.)-]*(?:(?:then|also|and|finally|next|please|you\s+(?:must|should|will)|must|should)\s+)*"
+    r"(?:post|send|reply|respond|comment|message|e-?mail|answer|notify)(?:\s+back)?\b[^\n.]{0,60}?"
+    r"\b(?:to|on|in|at)\s+(?:the\s+|a\s+|an\s+)?(?:slack|jira|github|gh|e-?mail|user|requester|reviewer|author|person|"
+    r"people|channel|thread|pr|pull\s+request|issue|chat)\b"
+    r"|(?i:\b(?:run|use|call|via)\s+`?(?:gh\s+(?:pr|issue)\s+(?:comment|review)|ttp\s+(?:notify|urgent-reply))\b)")
 # Optimization or design work (Opus keeps it): besides modelpick.HARD and codearm.JUDGMENT.
 DESIGN = re.compile(
     r"(?i)\boptimi[sz](?:e|es|ed|ing|ation|ations)\b|\bre-?design\w*|\bdesign\s+(?:a|an|the|how|which)\b"
@@ -185,29 +188,46 @@ def arm(db, cfg: dict, task: dict, peek: bool = False) -> dict | None:
     return got
 
 
+INFRA_CAUSES = ("timeout", "failed")   # route.RUN_CAUSES that are the infrastructure's: a rerun stays on GLM
+INFRA_ENDS = ("failed", "timeout", "stalled", "lost", "request_error", "killed")   # a run row's ends with no hand-off
+
+
+def infra_failed(db, task: dict) -> bool:
+    """Whether the task's last worker run ended on the infrastructure (an endpoint error, a crash, a timeout, a
+    stall, a kill) with no hand-off: a retry of it is no GLM miss. A run that handed off (even `failed`) or
+    ended clean without a hand-off finished its attempt, so its retry is a tier-up on Opus."""
+    from .db import load_result
+    if not task.get("id") or str(load_result(task.get("result")).get("status") or "") in ("failed", "done", "blocked"):
+        return False
+    try:
+        row = db.one("SELECT status FROM runs WHERE task=? AND role='worker' ORDER BY id DESC LIMIT 1", (task["id"],))
+    except Exception:   # in doubt, the old way: core
+        return False
+    return bool(row) and str(row["status"] or "") in INFRA_ENDS
+
+
 def keeps_core(db, cfg: dict, task: dict, tier: str, cls: str | None = None, picked: dict | None = None) -> str:
     """Why a run of `task` stays on the core provider on a covered project ('' when GLM may take it). Model-free,
-    in order: coordinator, plan and review runs and verdicts (#3205), deep, a provider or model pin, outside
-    text (untrusted_input), a tier-up retry, a GLM bounce (needs Opus or deep), a run that talks to a person
-    (#3512), optimization or design work, device work (#3324; with glm_device on it runs on GLM under an Opus
+    in order: coordinator, plan and review runs (#3205), deep, a provider or model pin, outside text
+    (untrusted_input), a tier-up retry after a finished attempt (infra_failed: a crash, timeout or endpoint error
+    retries on GLM), a GLM bounce (needs Opus or deep), a run that talks to a person (#3512: `reply_chat` or an
+    instruction to post, comment or notify), optimization or design work, device work (#3324; with glm_device on it runs on GLM under an Opus
     plan, deviceplan.py), urgent (only with keep_urgent), a kind off the
     list."""
-    from . import codearm, deviceplan, effort, modelpick, tierfloor, untrusted, urgent
+    from . import codearm, deviceplan, effort, modelpick, untrusted, urgent
     kind = str(task.get("kind") or "")
     text = f"{task.get('title') or ''}\n{task.get('spec') or ''}"
     if cls == "coordinator" or kind in ("plan", "review"):
         return kind if kind in ("plan", "review") else "coordinator"
     labels = task_labels(task)
-    if "verdict" in tierfloor.reasons(task, cfg):
-        return "verdict"
     if tier == "deep" or any(lb in ("user_deep", "needs_deep") for lb in labels) or effort.wants_deep(task.get("result")):
         return "deep"
     if str(task.get("provider") or "") or str(task.get("model") or ""):
         return "pin"
     if untrusted.labelled(task) or modelpick.UNTRUSTED in labels:
         return "untrusted"
-    if (picked or {}).get("by") == "retry":
-        return "retry"
+    if (picked or {}).get("by") == "retry" and not infra_failed(db, task):
+        return "retry"   # GLM finished and the work failed: Opus; a crash, timeout or endpoint error retries on GLM
     if task.get("id") and codearm.bounced(db, task["id"]):
         return "bounced"
     if task.get("reply_chat") or PERSON.search(text):

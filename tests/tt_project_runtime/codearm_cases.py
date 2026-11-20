@@ -1237,7 +1237,7 @@ def _ua_cfgs():
 
 
 def test_a_code_task_the_user_ordered_onto_the_arm_runs_there_though_it_names_a_policy_file(env):
-    from ttp import codearm
+    from ttp import codearm, glmwork
     p = make(env)
     mid = p.db.post("in", "Run the delete batches on the cheaper code arm.", chat="c1")
     for cfg in _ua_cfgs():   # the holdout coin (covered) and the share coin (not) would both keep it off
@@ -1248,7 +1248,10 @@ def test_a_code_task_the_user_ordered_onto_the_arm_runs_there_though_it_names_a_
         assert codearm.choose(p.db, cfg, p.db.task(ordered["id"]), "standard", policy=_PF_LIST)["run"] == "glm"
         plain = _ca_task(p, "delete the dead helpers in src/rt/daemon.py")
         got = codearm.choose(p.db, cfg, plain, "standard", policy=_PF_LIST)
-        assert got["run"] == "claude" and got["why"].startswith("policy: names src/rt/daemon.py")
+        if glmwork.settings(cfg):   # covered: no policy-file stay (GLM writes those files too)
+            assert not got["why"].startswith("policy:")
+        else:
+            assert got["run"] == "claude" and got["why"].startswith("policy: names src/rt/daemon.py")
         pinned = _ca_task(p, f"delete the dead helpers\ncode_arm: user msg #{mid}", provider="claude")
         assert codearm.choose(p.db, cfg, pinned, "standard", policy=_PF_LIST)["run"] == "claude"   # other stays hold
 
@@ -1287,3 +1290,19 @@ def test_a_user_ordered_task_is_not_bounced_for_touching_a_policy_file(env, tmp_
     assert policyfiles.bounce_diff(pp, plain, _PF_LIST, changed) == "policy files touched: src/rt/daemon.py"
     worker = _ca_task(p, f"delete the dead helpers\ncode_arm: user msg #{mid}", origin="daemon")
     assert policyfiles.bounce_diff(pp, worker, _PF_LIST, changed) == "policy files touched: src/rt/daemon.py"
+
+
+def test_a_project_the_glm_work_route_covers_has_no_policy_file_stay_or_refusal_but_others_keep_both(env):
+    """GLM writes policy files too on a covered project: no `policy:` stay, an empty policy list is no refusal and
+    no share 0; a project outside the work route keeps all three."""
+    from ttp import codearm
+    p = make(env)
+    covered, plain = _ua_cfgs()
+    named = _ca_task(p, "rewrite coordfix._python_reads so a write is never labelled a read")
+    assert codearm.stays(p.db, covered, named, "standard", policy=_PF_LIST) == ""
+    assert codearm.stays(p.db, plain, named, "standard", policy=_PF_LIST).startswith("policy: names coordfix")
+    assert codearm.settings(covered, policy=[]) and not codearm.settings(plain, policy=[])
+    assert codearm.refusal(covered, policy=[]) == "" and "policy file list" in codearm.refusal(plain, policy=[])
+    covered["route"]["glm_work"]["harness"] = "codex"
+    assert codearm.settings(covered) is None   # an unguarded harness still turns it off
+

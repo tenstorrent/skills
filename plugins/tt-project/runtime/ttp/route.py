@@ -565,13 +565,13 @@ def own_cause(status: str) -> str:
             "ok": "no_handoff"}.get(status, "")
 
 
-def fell_back_before(db, task_id: int) -> int | None:
+def fell_back_before(db, task_id: int, skip: tuple = ()) -> int | None:
     """The task's routed run that fell back on its own (RUN_CAUSES), or None: its later runs start on
-    the core provider."""
+    the core provider. `skip`: causes that do not count (the GLM work route's infrastructure ends, glmwork)."""
     for r in db.q("SELECT id, provider, note FROM runs WHERE task=? AND role='worker' AND note LIKE ? "
                   "ORDER BY id DESC", (task_id, f'%"{KEY}"%')):
         e = of(r["note"]) or {}
-        if e.get("fallback") in (*RUN_CAUSES, BOUNCE) and r["provider"] == e.get("to"):
+        if e.get("fallback") in (*RUN_CAUSES, BOUNCE) and e.get("fallback") not in skip and r["provider"] == e.get("to"):
             return int(r["id"])
     return None
 

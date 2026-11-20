@@ -28,6 +28,10 @@ guard, a protected class or pin added since. Opus keeps every judgment run: revi
 conclusions and coordinators never take this route (route.eligible keeps reviews off it; kinds other than
 code never reach it). A `sonnet` task runs the Sonnet code route without its canary share.
 
+Policy files (harness/policy_files.txt): outside the GLM work route a spec naming a listed file stays on Claude and a
+branch that changes one is bounced to Opus. A project the work route covers has neither: GLM writes those files, Opus's
+review (with the ponytail lane) checks them, and its notes name the listed files the diff touched.
+
 Bounce: a run on the arm that cannot do the task (deep thinking, design, a root cause, people) hands off
 `{"status": "needs_opus", "needs_opus": "<reason>"}`, pushes nothing and publishes no branch. The daemon requeues
 it on Claude at Opus (no attempt spent, no fallback counted against the provider) and logs the reason.
@@ -87,7 +91,7 @@ def settings(cfg: dict, policy: list | None = None) -> dict | None:
     got = (cfg.get("route") or {}).get("code_sonnet")
     got = got if isinstance(got, dict) else {}
     if w := glmwork.settings(cfg):   # a project the GLM work route covers: its settings drive the arm
-        if policy is not None and not policy or w["harness"] not in HARNESSES:
+        if w["harness"] not in HARNESSES:   # the policy list does not gate a covered project: GLM writes those files too
             return None
         share, arm, model = 1 - w["holdout"], {**w, "harness": w["harness"]}, w["model"]
     else:
@@ -116,7 +120,7 @@ def ring_gate(cfg: dict, project: str, raw: dict | None) -> dict:
     """Apply the `glm_code` release-ring flag (rollout.py) to `cfg`'s code route, in place, and return `cfg`.
     The project's own `route.code_sonnet.glm_share` in its project.json wins as written. Without one, the
     flag on gives a share from the account settings, else RING_SHARE; the flag off makes it 0, so no coin
-    flip runs. Claude review, the policy-file bounce and the switch-back guard are unchanged."""
+    flip runs. Claude review and the switch-back guard are unchanged; the policy-file bounce applies outside the GLM work route."""
     got = (cfg.get("route") or {}).get("code_sonnet")
     if not isinstance(got, dict):
         return cfg
@@ -163,7 +167,7 @@ def refusal(cfg: dict, policy: list | None = None) -> str:
             return ""
         harness = str(arm.get("harness") or "claude-code")
     if harness in HARNESSES:
-        if policy is not None and not policy:
+        if policy is not None and not policy and not glmwork.settings(cfg):   # a covered project needs no list
             return (f"route.code_sonnet glm_share is treated as 0: this project has no policy file list "
                     f"(harness/{policyfiles.FILE}); the arm never takes a task before the project names the "
                     f"files that decide its audit, review, approval, budget and push rules")
@@ -247,7 +251,8 @@ def stays(db, cfg: dict, task: dict, tier: str, picked: dict | None = None, poli
     """Why `task` stays on Claude now ('' when the arm may take it): the Sonnet route's own stays
     (runclass.code_route), a resource, a protected class, a `conclusion:` line, the force line, a user order,
     a policy-class spec (policyfiles.task_reason against the project's list `policy`, model-free), an unsupported
-    harness. A task the user ordered onto the arm (user_arm) skips the user-order and policy-class checks."""
+    harness. A task the user ordered onto the arm (user_arm) skips the user-order and policy-class checks. A project
+    the GLM work route covers has no policy-class stay: GLM writes those files too and the review checks them."""
     from . import glmwork, policyfiles, route, runclass, urgent
     ordered = user_arm(db, task)[0]
     if (task.get("kind") or "") != "code":
@@ -261,9 +266,7 @@ def stays(db, cfg: dict, task: dict, tier: str, picked: dict | None = None, poli
             return "resources"
         if FORCE.search(str(task.get("spec") or "")):
             return "forced_claude"
-        if policy and not ordered and (why := policyfiles.task_reason(policy, task)):
-            return f"policy: {why}"
-        return ""
+        return ""   # no policy-file stay here: GLM writes those files too, and Opus reviews them (review notes name them)
     if str(tier or task.get("tier") or "standard") != "standard":
         return "tier"
     if any(lb.startswith(("resource:", "exclusive:", "read:")) for lb in task_labels(task)):

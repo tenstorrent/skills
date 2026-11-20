@@ -59,7 +59,7 @@ def test_glm_work_keeps_every_protected_run_on_core(env):
     assert kc(_gw_task(p), cls="coordinator") == "coordinator"
     assert kc(_gw_task(p, kind="plan")) == "plan"
     assert kc(_gw_task(p, kind="review")) == "review"
-    assert kc(_gw_task(p, "Say whether the fix holds and return a verdict: pass or fail.")) == "verdict"
+    assert kc(_gw_task(p, "Say whether the fix holds and return a verdict: pass or fail.")) == ""   # only a review keeps one
     assert kc(_gw_task(p), tier="deep") == "deep"
     assert kc(_gw_task(p, labels=["user_deep"])) == "deep"
     assert kc(_gw_task(p, provider="claude")) == "pin"
@@ -69,6 +69,7 @@ def test_glm_work_keeps_every_protected_run_on_core(env):
     assert kc(_gw_task(p, reply_chat="chat-1")) == "person"
     assert kc(_gw_task(p, "Post a comment on the GitHub issue saying it is fixed.")) == "person"
     assert kc(_gw_task(p, "Run gh pr comment with the summary.")) == "person"
+    assert kc(_gw_task(p, "Fix the comment handler so github threads render.")) == ""   # a mention is no instruction
     assert kc(_gw_task(p, "Optimize the scheduler's queue scan.")) == "design"
     assert kc(_gw_task(p, "Redesign the push queue.")) == "design"
     assert kc(_gw_task(p, "Propose a plan for the new cache layer.")) == "design"
@@ -240,3 +241,62 @@ def test_a_glm_hand_off_asking_for_opus_or_deep_bounces_fresh_to_opus_with_its_s
     assert '"glm" in (routed.get(codearm.KEY), routed.get(glmwork.KEY))' in fin
     assert "its hand-off said: " in fin   # the bounced run's own summary reaches the fresh run's prompt
     assert "glmwork.contract()" in inspect.getsource(daemon.Daemon)
+
+
+def _gw_run(p, task, status):
+    p.db.x("INSERT INTO runs(task,role,dir,status) VALUES(?,'worker','d',?)", (task["id"], status))
+
+
+def test_glm_work_retry_after_an_infrastructure_failure_stays_on_glm_but_one_after_a_finished_attempt_goes_to_core(env):
+    from ttp import glmwork
+    p = make(env)
+    cfg = _gw_cfg()
+    retry = {"by": "retry"}
+    for end in ("failed", "timeout", "stalled", "lost", "request_error", "killed"):
+        t = _gw_task(p)
+        _gw_run(p, t, end)
+        assert glmwork.keeps_core(p.db, cfg, p.db.task(t["id"]), "standard", None, retry) == "", end
+    done = _gw_task(p)
+    _gw_run(p, done, "ok")   # ended clean with no hand-off: a finished attempt
+    assert glmwork.keeps_core(p.db, cfg, p.db.task(done["id"]), "standard", None, retry) == "retry"
+    handed = _gw_task(p)
+    _gw_run(p, handed, "failed")
+    p.db.x("UPDATE tasks SET result=? WHERE id=?", ('{"status": "failed"}', handed["id"]))
+    assert glmwork.keeps_core(p.db, cfg, p.db.task(handed["id"]), "standard", None, retry) == "retry"   # GLM finished and failed
+
+
+def test_glm_work_only_an_instruction_to_a_person_keeps_a_run_on_core(env):
+    from ttp import glmwork
+    p = make(env)
+    cfg = _gw_cfg()
+    kc = lambda spec, **kw: glmwork.keeps_core(p.db, cfg, _gw_task(p, spec, **kw), "standard")
+    for spec in ("Fix the comment handler so github threads render.",
+                 "The code posts a message to slack on failure; fix its retry.",
+                 "Refactor ttp notify output.", "Add a test for the Jira client's reply parsing."):
+        assert kc(spec) == "", spec
+    for spec in ("Then post a summary to the Slack channel.", "Please reply to the user with the numbers.",
+                 "Run gh pr comment with the summary.", "Notify the user in chat when it lands."):
+        assert kc(spec) == "person", spec
+    assert kc("Fix the helper.", reply_chat="chat-1") == "person"
+
+
+def test_glm_work_a_verdict_wording_outside_a_review_goes_to_glm_and_a_review_stays_on_core(env):
+    from ttp import glmwork
+    p = make(env)
+    cfg = _gw_cfg()
+    spec = "Say whether the fix holds and return a verdict: pass or fail."
+    assert glmwork.keeps_core(p.db, cfg, _gw_task(p, spec), "standard") == ""
+    assert glmwork.keeps_core(p.db, cfg, _gw_task(p, spec, kind="review"), "standard") == "review"
+
+
+def test_glm_work_a_timeout_or_crash_fallback_does_not_pin_the_next_run_to_core_but_a_bounce_does(env):
+    import json
+    from ttp import glmwork, route
+    p = make(env)
+    for cause, skipped in (("timeout", True), ("failed", True), ("no_handoff", False), (route.BOUNCE, False)):
+        t = _gw_task(p)
+        note = json.dumps({route.KEY: {"to": "chat", "fallback": cause}})
+        p.db.x("INSERT INTO runs(task,role,dir,status,provider,note) VALUES(?,'worker','d','failed','chat',?)",
+               (t["id"], note))
+        assert route.fell_back_before(p.db, t["id"]) is not None, cause
+        assert (route.fell_back_before(p.db, t["id"], glmwork.INFRA_CAUSES) is None) is skipped, cause

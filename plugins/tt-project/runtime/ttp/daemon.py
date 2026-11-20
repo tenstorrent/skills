@@ -6559,7 +6559,8 @@ class Daemon:
                 or (str(((exit_info.get("bridge") or {}).get("loop") or {}).get("bounce") or "")[:300]
                     if glmwork.bounce_on(self.cfg) else "")   # the bridge's loop guard stopped it (chatbridge)
         if not bounce and on_route and routed and routed.get(codearm.KEY) == "glm" and r["task"] \
-                and r["role"] != "coordinator" and refused != "instructions_missing":
+                and r["role"] != "coordinator" and refused != "instructions_missing" \
+                and not glmwork.settings(self.cfg):   # a covered project's GLM runs write policy files too: review checks them
             bounce = self._policy_bounce(r)   # a run on the arm that changed a policy file hands nothing off
         handed_off = r["role"] != "coordinator" and refused != "instructions_missing" and not bounce and \
             (_read_result(run_dir / RESULT_FILE) or {}).get("status") in HANDOFF_STATES
@@ -13946,7 +13947,8 @@ class Daemon:
         a fallback, or escalated), else None. `arm`: a code arm run (codearm.py), whose review and checks fixes
         keep their lineage's arm."""
         rule = {} if rule_i is None else {"rule": rule_i}   # the providers.chat.routes rule it matched
-        after = route.fell_back_before(self.p.db, task["id"]) if task.get("id") else None
+        after = route.fell_back_before(self.p.db, task["id"], glmwork.INFRA_CAUSES if glm else ()) \
+            if task.get("id") else None   # a covered run's timeout or crash is no reason to leave GLM
         if after:   # the task fell back on its own once: the rest of its runs stay on the core provider
             return {"tier": tier, "to": name, "model": model, **rule, "fallback": "rerun", "after": after}
         try:
