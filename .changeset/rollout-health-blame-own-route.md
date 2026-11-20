@@ -1,0 +1,5 @@
+---
+"tt-project": patch
+---
+
+`tt-project`: the release-ring health watch blames a flag only for work its own route ran, and switches it off for that project alone. For a model-route flag (glm_code, glm_work, glm_device), failed runs, time to land and cost per landing count only the tasks whose latest worker run was on that route, against a baseline of the tasks off it; glm_coord counts only coordinator turns on GLM. A stalled task counts only when its own last run was on the route. One that bounced off it and stalled elsewhere is listed under `reported`. A task waiting in a live batch is never counted as stuck, for any flag. Flags without a model route still judge the whole project. A failing signal no longer rolls the flag back and freezes it for every project: the daemon switches it off in its own project (as the wave gate does), the other projects keep it, and `ttp rollout arm FLAG PROJECT` re-enables it there, with a fresh judging window from the re-arm. `rollout.on` honours a project's switch-off at every level. Only `ttp rollout rollback FLAG` from the terminal still freezes a flag fleet-wide.

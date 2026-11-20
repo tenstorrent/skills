@@ -249,8 +249,8 @@ def test_a_real_per_kind_regression_over_20_landings_still_rolls_the_flag_back_a
     for i in range(20):
         _ro_landed(p, 1, 2.0, 100 + i)
         _ro_landed(p, 1, 4.0, 1 + i / 10)
-    assert d.rollout_watch() == ["deslop"] and rollout.level("deslop") == rollout.OFF
-    why = rollout.frozen("deslop")["reason"]
+    assert d.rollout_watch() == ["deslop"] and not rollout.on("deslop", p.name)
+    why = rollout.rolled_back("deslop")[p.name]["why"]
     assert "cost per landing $4.00 against $2.00 for the same task kinds (20 landings: code/standard 20 at $4.00 " \
            "against $2.00)" in why, why
     note = p.db.one("SELECT text FROM messages WHERE ref='rollout_rollback:deslop'")["text"]
@@ -319,22 +319,31 @@ def _watch(env, name="demo"):
     return p, Daemon(p.base)
 
 
-def test_the_daemon_rolls_a_flag_back_for_everyone_on_a_failing_signal_without_a_model(env):
+def test_the_daemon_switches_a_flag_off_for_its_own_project_alone_on_a_failing_signal_without_a_model(env):
+    # cells: watch_project_off, watch_rearm_window
     from ttp import rollout
     p, d = _watch(env)
     rollout.set_ring(p.name, "1")
+    rollout.set_ring("other", "1")
     _ro_flag("deslop", 1, 3)
     _ro_runs(p, 40, 4, 100)
     _ro_runs(p, 20, 20, 1)
     assert d.rollout_watch() == ["deslop"]
-    assert rollout.level("deslop") == rollout.OFF and rollout.frozen("deslop")["by"] == f"daemon:{p.name}"
-    assert "failed runs" in rollout.frozen("deslop")["reason"] and rollout.frozen("deslop")["snapshot"]["failing"]
+    assert rollout.level("deslop") == 1 and rollout.frozen("deslop") is None, "the fleet keeps the flag"
+    assert not rollout.on("deslop", p.name) and rollout.on("deslop", "other")
+    back = rollout.rolled_back("deslop")[p.name]
+    assert "failed runs" in back["why"] and rollout.ledger("deslop")[-1]["by"] == f"daemon:{p.name}"
     note = p.db.one("SELECT text, severity FROM messages WHERE ref='rollout_rollback:deslop'")
-    assert note["severity"] == "normal" and "rolled back for every project" in note["text"] and "rollout arm deslop" in note["text"]
+    assert note["severity"] == "normal" and f"switched off in {p.name} alone" in note["text"]
+    assert f"rollout arm deslop {p.name}" in note["text"]
     d._last_rolloutwatch = 0
-    assert d.rollout_watch() == [], "frozen: nothing more to do"
-    assert [r["kind"] for r in rollout.ledger("deslop")] == ["set", "rollback"]
-    assert rollout.rollback("deslop", "again", f"daemon:other").endswith("already")
+    assert d.rollout_watch() == [], "switched off here: nothing more to do"
+    assert [r["kind"] for r in rollout.ledger("deslop")] == ["set", "project_rollback"]
+    assert "re-armed in" in rollout.arm("deslop", "fix landed", "user", p.name) and rollout.on("deslop", p.name)
+    d._last_rolloutwatch = 0
+    d.rollout_watch()
+    assert p.name not in rollout.rolled_back("deslop"), "the runs that switched it off never count again"
+    assert "-> off" in rollout.rollback("deslop", "by hand", "user") and rollout.frozen("deslop"), "the terminal's freeze stays"
 
 
 def test_the_daemon_leaves_a_projects_own_setting_and_unlisted_rings_alone_and_runs_every_15_minutes(env):
@@ -699,7 +708,7 @@ def test_the_daemon_passes_its_project_root_so_a_gated_revert_rolls_the_flag_bac
     p.db.x("DELETE FROM tasks WHERE title LIKE 'Revert %'")
     _ro_revert(p, spec)
     d._last_rolloutwatch = 0
-    assert d.rollout_watch() == ["deslop"] and "forward revert" in rollout.frozen("deslop")["reason"]
+    assert d.rollout_watch() == ["deslop"] and "forward revert" in rollout.rolled_back("deslop")[p.name]["why"]
 
 
 def test_every_flag_call_site_lies_in_the_files_the_flags_code_list_names():
@@ -891,3 +900,137 @@ def test_an_overriding_own_setting_raises_one_event_a_day(env, capsys):
     assert rollout.project_events(p, now + 86400) == ["rollout_override"]
     text = p.db.one("SELECT text FROM events WHERE kind='rollout_override'")["text"]
     assert "route.code_sonnet.glm_share = 0 overrides it" in text and "ttp config alpha" in text
+
+
+def _ro_task_runs(p, n, failed, ago_h, glm, role="worker", kind="code"):
+    """`n` runs ending `ago_h` hours back on one task of `kind`, the first `failed` failed; on GLM or Claude."""
+    tid = p.db.add_task("r", "s", kind=kind, tier="standard")
+    end = time.time() - ago_h * _RH
+    for i in range(n):
+        p.db.x("INSERT INTO runs(task,role,provider,model,status,started,ended,note) VALUES(?,?,?,?,?,?,?,'{}')",
+               (tid, role, "chat" if glm else "claude", "glm-5.3" if glm else "opus",
+                "failed" if i < failed else "done", end - 5, end))
+    return tid
+
+
+_ARMS = ("glm_code", "glm_work", "glm_device")
+
+
+def _flag_health(p, flag):
+    from ttp import rollout, rollout_health as rh
+    now = time.time() + 60
+    return rh.signals(p.db, now - 24 * _RH, now, rh.thresholds(None), rollout.FLAGS[flag]["area"], flag)
+
+
+def test_a_model_route_flag_is_blamed_for_failed_runs_only_on_its_arm(env):
+    # cells: failed_runs_off_arm, failed_runs_on_arm, coord_turns
+    p = make(env)
+    _ro_task_runs(p, 40, 4, 100, glm=False)
+    _ro_task_runs(p, 20, 20, 1, glm=False)            # Claude runs fail: the GLM route ran none of them
+    for flag in _ARMS + ("glm_coord",):
+        got = _flag_health(p, flag)
+        assert got["failing"] == [] and got["runs"] == 0, flag
+    assert any(s.startswith("failed runs") for s in _flag_health(p, "deslop")["failing"]), "no arm: project-wide"
+    _ro_task_runs(p, 20, 20, 1, glm=True)
+    for flag in _ARMS:
+        got = _flag_health(p, flag)
+        assert got["runs"] == 20 and any(s.startswith("failed runs 100% against 10%") for s in got["failing"]), flag
+    assert _flag_health(p, "glm_coord")["failing"] == [], "worker runs are not coordinator turns"
+    _ro_task_runs(p, 40, 4, 100, glm=False, role="coordinator")
+    _ro_task_runs(p, 20, 20, 1, glm=True, role="coordinator")
+    assert any(s.startswith("failed runs") for s in _flag_health(p, "glm_coord")["failing"])
+
+
+def test_a_model_route_flag_is_blamed_for_landings_only_when_its_arm_ran_the_task(env):
+    # cells: landings_off_arm, landings_on_arm
+    p = make(env)
+
+    def landed(took_h, cost, ago_h, glm):
+        _ro_landed(p, took_h, cost, ago_h)
+        tid = p.db.one("SELECT MAX(id) id FROM tasks")["id"]
+        p.db.x("INSERT INTO runs(task,role,provider,model,status,started,ended,note) VALUES(?,?,?,?,?,?,?,'{}')",
+               (tid, "worker", "chat" if glm else "claude", "glm-5.3" if glm else "opus", "done", 1, 2))
+    for i in range(20):
+        landed(1, 2.0, 100 + i, glm=False)
+        landed(3, 9.0, 1 + i / 10, glm=False)          # slow and dear, all on Claude
+    for flag in _ARMS + ("glm_coord",):
+        assert not [s for s in _flag_health(p, flag)["failing"] if "landing" in s], flag
+    assert len([s for s in _flag_health(p, "deslop")["failing"] if "landing" in s]) == 2, "no arm: project-wide"
+    for i in range(20):
+        landed(3, 9.0, 1 + i / 10, glm=True)
+    for flag in _ARMS:
+        failing = _flag_health(p, flag)["failing"]
+        assert any("median time to land 3.0 h against 1.0 h" in s for s in failing), flag
+        assert any("cost per landing $9.00 against $2.00" in s for s in failing), flag
+
+
+def test_a_stuck_task_counts_against_a_glm_flag_only_when_its_own_glm_run_stalled(env):
+    # cells: stuck_off_arm, stuck_on_arm, stuck_batch_member
+    import json
+    from ttp import batchrun
+    p = make(env)
+    stale = time.time() - 3 * _RH
+
+    def stuck(*glm):
+        tid = p.db.add_task("s", "s", kind="code")
+        for i, g in enumerate(glm):
+            p.db.x("INSERT INTO runs(task,role,provider,model,status,started,ended,note) VALUES(?,?,?,?,?,?,?,'{}')",
+                   (tid, "worker", "chat" if g else "claude", "glm-5.3" if g else "opus",
+                    "fallback" if g else "done", stale - 100 + i, stale - 50 + i))
+        p.db.x("UPDATE tasks SET status='running', updated=? WHERE id=?", (stale, tid))
+        return tid
+    bounced = stuck(True, False)                       # a GLM run bounced to Claude, which ran last
+    for flag in _ARMS + ("glm_coord",):
+        got = _flag_health(p, flag)
+        assert got["failing"] == [] and got["reported"] == [f"#{bounced}"], flag
+    assert any(f"#{bounced}" in s for s in _flag_health(p, "deslop")["failing"]), "no arm: project-wide"
+    own = stuck(False, True)                           # its own GLM run was the last one
+    for flag in _ARMS:
+        got = _flag_health(p, flag)
+        assert any(f"#{own}" in s for s in got["failing"]) and got["reported"] == [f"#{bounced}"], flag
+    assert not _flag_health(p, "glm_coord")["failing"], "a coordinator-turn arm runs no task"
+    lead = p.db.add_task("lead", "s", kind="code", status="queued")
+    p.db.x("UPDATE tasks SET result=? WHERE id=?", (json.dumps({"status": "waiting"}), lead))
+    p.db.set_kv(batchrun.KV + str(lead), {"id": f"b{lead}", "lead": lead, "members": [bounced, own]})
+    for flag in _ARMS + ("glm_coord", "deslop", "coord_wake_settle"):
+        got = _flag_health(p, flag)
+        assert not any("no run and no change" in s for s in got["failing"]) and got["reported"] == [], \
+            f"{flag}: a task waiting in a live batch is not stuck"
+
+
+@pytest.mark.parametrize("flag", ["glm_code", "glm_work", "glm_device", "glm_coord", "eta_history", "deslop",
+                                  "coord_wake_settle"])
+def test_every_flag_s_health_watch_switches_off_only_its_own_project(env, flag):
+    # cells: glm_code, glm_work, glm_device, glm_coord, eta_history, deslop, coord_wake_settle
+    from ttp import rollout
+    assert set(rollout.FLAGS) == {"glm_code", "glm_work", "glm_device", "glm_coord", "eta_history", "deslop",
+                                  "coord_wake_settle"}, "a new flag gets a cell here"
+    p, d = _watch(env)
+    rollout.set_ring(p.name, "1")
+    rollout.set_ring("other", "1")
+    _ro_flag(flag, 1, 3)
+    role = "coordinator" if flag == "glm_coord" else "worker"
+    _ro_task_runs(p, 40, 4, 100, glm=False, role=role)
+    _ro_task_runs(p, 40, 4, 100, glm=True, role=role)
+    _ro_task_runs(p, 20, 20, 1, glm=True, role=role)
+    if rollout.FLAGS[flag].get("shadow"):
+        assert d.rollout_watch() == [] and rollout.on(flag, p.name), "a shadow flag changes no run: never switched off"
+        return
+    assert d.rollout_watch() == [flag]
+    assert rollout.level(flag) == 1 and rollout.frozen(flag) is None
+    assert not rollout.on(flag, p.name) and rollout.on(flag, "other")
+    assert [r["kind"] for r in rollout.ledger(flag)][-1] == "project_rollback"
+
+
+def test_a_project_switched_off_stays_off_at_a_numeric_level_until_re_armed(env):
+    # cells: on_numeric, on_full, rearm
+    from ttp import rollout
+    make(env)
+    rollout.set_ring("a", "0")
+    rollout.set_ring("b", "0")
+    _ro_flag("deslop", 2, 1)
+    assert rollout.on("deslop", "a") and rollout.on("deslop", "b")
+    assert rollout.stop_project("deslop", "a", "its runs failed", "daemon:a")
+    assert not rollout.on("deslop", "a") and rollout.on("deslop", "b")
+    rollout.arm("deslop", "fixed", "user", "a")
+    assert rollout.on("deslop", "a")

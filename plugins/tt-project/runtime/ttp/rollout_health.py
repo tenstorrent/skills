@@ -12,6 +12,14 @@ Rates and costs are compared like for like: work is grouped by task kind and tie
 against the baseline of its own group (groups the baseline lacks are left out), and a check judges only once
 its matched sample reaches its minimum. A shadow flag (rollout.FLAGS[flag]["shadow"]) changes no run, so no
 signal judges it: the watch never rolls it back; `ttp rollout rollback` by hand still does.
+
+A model-route flag (rollout.FLAGS[flag]["arm"]) is blamed only for work its route ran (_Scope): the window's
+failed runs are its runs on the arm, against the baseline's runs off it; a landing or a stuck task counts only
+when the task's latest run was on the arm. Work it never ran is left out, and a stuck task left out is listed
+under "reported", never "failing". A flag whose arm runs are coordinator turns (FLAGS "runs": "coordinator")
+is judged on those turns; no landing or stuck task is its. A flag with no arm changes how every task runs, so
+its signals stay project-wide. A task waiting in a live batch run (batchrun.held) is never stuck: its lead
+runs for it.
 """
 from __future__ import annotations
 
@@ -76,24 +84,56 @@ def _group(r) -> str:
     return f"{r['kind'] or '?'}/{r['tier'] or '?'}"
 
 
-def _runs(db, a: float, b: float) -> dict[str, list[int]]:
-    """{kind/tier: [runs, failed]} of the worker runs that ended in [a, b), login failures left out."""
+class _Scope:
+    """Which work counts against a flag (module doc): `arm` None counts all of it; else `on` picks the arm's
+    work (the window) or the rest (the baseline), and `coord` says the arm's runs are coordinator turns."""
+
+    def __init__(self, flag: str | None, on: bool = True):
+        meta = rollout.FLAGS.get(flag or "", {})
+        self.arm, self.on, self.coord = meta.get("arm"), on, meta.get("runs") == "coordinator"
+
+    def run(self, r) -> bool:
+        if not self.arm:
+            return True
+        from . import glmshare
+        return (self.arm == "glm" and glmshare.on_glm(r["provider"], r["model"], r["note"])) == self.on
+
+    def task(self, db, tid: int) -> bool:
+        """The task's latest worker run is in scope; a coordinator-turn arm runs no task."""
+        if not self.arm:
+            return True
+        if self.coord:
+            return not self.on
+        last = db.one("SELECT provider, model, note FROM runs WHERE task=? AND role!='coordinator' "
+                      "ORDER BY started DESC, id DESC LIMIT 1", (tid,))
+        return self.run(last) if last else not self.on
+
+
+def _runs(db, a: float, b: float, scope: _Scope | None = None) -> dict[str, list[int]]:
+    """{kind/tier: [runs, failed]} of the worker runs that ended in [a, b) in `scope` (a coordinator-turn arm:
+    its coordinator turns), login failures left out."""
+    scope = scope or _Scope(None)
+    role = "r.role='coordinator'" if scope.arm and scope.coord else "r.role!='coordinator'"
     out: dict[str, list[int]] = {}
-    for r in db.q("SELECT r.status, t.kind, COALESCE(t.assigned_tier, t.tier) tier FROM runs r LEFT JOIN tasks t "
-                  "ON t.id=r.task WHERE r.role!='coordinator' AND r.ended>=? AND r.ended<? AND r.status NOT IN "
-                  "('running','auth')", (a, b)):
+    for r in db.q("SELECT r.status, r.provider, r.model, r.note, t.kind, COALESCE(t.assigned_tier, t.tier) tier "
+                  f"FROM runs r LEFT JOIN tasks t ON t.id=r.task WHERE {role} AND r.ended>=? AND r.ended<? AND "
+                  "r.status NOT IN ('running','auth')", (a, b)):
+        if not scope.run(r):
+            continue
         n = out.setdefault(_group(r), [0, 0])
         n[0] += 1
         n[1] += r["status"] in ("failed", "lost")
     return out
 
 
-def _landings(db, a: float, b: float) -> list[tuple[float, float, str]]:
-    """(seconds from task creation to its first landing, the task's spend, its kind/tier) per task landed in [a, b)."""
-    rows = db.q("SELECT t.created c, t.spent_usd s, t.kind, COALESCE(t.assigned_tier, t.tier) tier, MIN(l.ts) l "
+def _landings(db, a: float, b: float, scope: _Scope | None = None) -> list[tuple[float, float, str]]:
+    """(seconds from task creation to its first landing, the task's spend, its kind/tier) per task in `scope`
+    landed in [a, b)."""
+    scope = scope or _Scope(None)
+    rows = db.q("SELECT t.id, t.created c, t.spent_usd s, t.kind, COALESCE(t.assigned_tier, t.tier) tier, MIN(l.ts) l "
                 "FROM task_landings l JOIN tasks t ON t.id=l.task WHERE t.kind='code' GROUP BY t.id "
                 "HAVING MIN(l.ts)>=? AND MIN(l.ts)<?", (a, b))
-    return [(r["l"] - (r["c"] or r["l"]), float(r["s"] or 0), _group(r)) for r in rows]
+    return [(r["l"] - (r["c"] or r["l"]), float(r["s"] or 0), _group(r)) for r in rows if scope.task(db, r["id"])]
 
 
 def _per_kind(window: list[tuple[float, float, str]], base: list[tuple[float, float, str]]) -> dict[str, dict]:
@@ -188,13 +228,15 @@ def signals(db, since: float, now: float, th: dict, area: str | None = None, fla
     """The window [since, now) against the baseline before `since`: the measures and the failing signals.
     `area` is the flag's area: a new high alert counts only if its key starts with one of ALERT_AREAS[area].
     `flag` and `repo` (the project's git root) attribute forward reverts: see _reverts; "unattributed" lists
-    the reverts whose commit could not be read, shown and never failing. A shadow flag's would-be signals are
-    listed under "exempt" and never under "failing"."""
+    the reverts whose commit could not be read, shown and never failing. `flag` also scopes the other signals to
+    the work its route ran (module doc); "reported" lists the stuck tasks it never ran, shown and never failing.
+    A shadow flag's would-be signals are listed under "exempt" and never under "failing"."""
     base_a = since - th["baseline_days"] * 86400
-    rb, rw = _runs(db, base_a, since), _runs(db, since, now)
+    mine, rest = _Scope(flag), _Scope(flag, on=False)
+    rb, rw = _runs(db, base_a, since, rest), _runs(db, since, now, mine)
     nw, fw = sum(v[0] for v in rw.values()), sum(v[1] for v in rw.values())
     nb = sum(v[0] for v in rb.values())
-    lb, lw = _landings(db, base_a, since), _landings(db, since, now)
+    lb, lw = _landings(db, base_a, since, rest), _landings(db, since, now, mine)
     fail: list[str] = []
     # Failed runs: the window's rate against the baseline's rate re-weighted to the window's mix of kinds.
     both = [g for g in rw if rb.get(g, [0])[0]]
@@ -228,26 +270,35 @@ def signals(db, since: float, now: float, th: dict, area: str | None = None, fla
     rev, unattributed = _reverts(db, since, now, flag, repo)
     if rev:
         fail.append(f"{len(rev)} forward revert(s) of a landed change touching this flag's code: {', '.join(rev[:5])}")
-    stuck = db.q("SELECT id FROM tasks WHERE status='running' AND updated<? AND NOT EXISTS "
-                 "(SELECT 1 FROM runs WHERE runs.task=tasks.id AND runs.status='running')", (now - th["stuck_h"] * H,))
+    from . import batchrun
+    batched = batchrun.held(db)
+    stuck, reported = [], []
+    for r in db.q("SELECT id FROM tasks WHERE status='running' AND updated<? AND NOT EXISTS "
+                  "(SELECT 1 FROM runs WHERE runs.task=tasks.id AND runs.status='running')", (now - th["stuck_h"] * H,)):
+        if r["id"] not in batched:
+            (stuck if mine.task(db, r["id"]) else reported).append(f"#{r['id']}")
     if stuck:
-        fail.append("tasks with no run and no change for " + f"{th['stuck_h']:g} h: " + ", ".join(f"#{r['id']}" for r in stuck[:5]))
+        fail.append("tasks with no run and no change for " + f"{th['stuck_h']:g} h: " + ", ".join(stuck[:5]))
     enough = nm >= th["min_runs"] or len(matched) >= th["min_landings"]
     out = {"runs": nw, "failed": fw, "landings": len(lw), "base_runs": nb, "base_landings": len(lb),
            "matched_runs": nm, "matched_landings": len(matched), "kinds": per,
-           "failing": fail, "enough": enough, "unattributed": unattributed}
+           "failing": fail, "enough": enough, "unattributed": unattributed, "reported": reported}
     if rollout.FLAGS.get(flag or "", {}).get("shadow"):
         out.update(failing=[], exempt=fail, shadow=True)
     return out
 
 
 def verdict(db, flag: str, ring: int, recs: list[dict], cfg: dict, now: float | None = None,
-            repo: str | None = None) -> dict | None:
-    """None when `flag` does not cover `ring`; else signals() plus 'since' and 'level' (the ring entered)."""
+            repo: str | None = None, project: str = "") -> dict | None:
+    """None when `flag` does not cover `ring`; else signals() plus 'since' and 'level' (the ring entered, or
+    `project`'s last re-arm after a switch-off of its own, so the work that switched it off never counts again)."""
     now = now or time.time()
     since = entered(flag, ring, recs)
     if since is None:
         return None
+    if project:
+        since = max(since, max((float(r.get("ts") or 0) for r in recs if r.get("flag") == flag
+                                and r.get("op") == "project_arm" and r.get("project") == project), default=0.0))
     v = signals(db, since, now, thresholds(cfg), rollout.FLAGS.get(flag, {}).get("area"), flag, repo)
     v["since"] = since
     return v

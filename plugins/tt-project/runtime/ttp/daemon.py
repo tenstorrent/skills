@@ -15106,9 +15106,9 @@ class Daemon:
     def rollout_watch(self, every_s: float = 900) -> list[str]:
         """Every 15 min, no model call: for each release-ring flag this project has on through the account's
         rings (its own explicit setting is left alone), compare the window since the flag reached its ring
-        with the project's own trailing 7 days (rollout_health). A failing signal rolls the flag back for
-        every project (rollout.rollback: off and frozen until `ttp rollout arm`), alerts this project's
-        coordinator and tells the user; a clean window with enough samples votes for promotion, and the
+        with the project's own trailing 7 days (rollout_health). A failing signal switches the flag off for this
+        project alone (rollout.stop_project: until `ttp rollout arm FLAG PROJECT`; the other projects keep it), alerts
+        this project's coordinator and tells the user; a clean window with enough samples votes for promotion, and the
         vote that completes a ring's list promotes the flag one ring. A flag at auto is the wave gate's (rollout.wave_tick)."""
         now = time.time()
         if now - self._last_rolloutwatch < every_s:
@@ -15119,17 +15119,19 @@ class Daemon:
         for flag in rollout.FLAGS:
             ring, lv = rollout.ring_of(name, cfg), rollout.level(flag, cfg)
             if lv in (rollout.OFF, rollout.AUTO) or ring is None or ring > lv or rollout.frozen(flag) \
+                    or name in rollout.rolled_back(flag, cfg) \
                     or rollout.own_setting(self.p.raw_config(), rollout.FLAGS[flag]["key"]):
                 continue
-            v = rollout_health.verdict(self.p.db, flag, ring, recs, cfg, now, str(self.p.root))
+            v = rollout_health.verdict(self.p.db, flag, ring, recs, cfg, now, str(self.p.root), name)
             if v is None:
                 continue
             if v["failing"]:
                 why = "; ".join(v["failing"])
-                log(self.p, f"rollout: {rollout.rollback(flag, why, f'daemon:{name}', v)}: {why}")
-                self.alert(f"rollout_rollback:{flag}", f"Release flag {flag} was rolled back for every project "
-                           f"(health in {name}: {why}). It stays off until `ttp rollout arm {flag}` once a fix landed.",
-                           severity="normal", every_s=0)
+                rollout.stop_project(flag, name, why, f"daemon:{name}")
+                log(self.p, f"rollout: {flag} switched off in {name} alone: {why}")
+                self.alert(f"rollout_rollback:{flag}", f"Release flag {flag} was switched off in {name} alone "
+                           f"(its health: {why}); the other projects keep it. It stays off here until "
+                           f"`ttp rollout arm {flag} {name}` once a fix landed.", severity="normal", every_s=0)
                 done.append(flag)
             elif v["enough"] and ring == lv and lv in (0, 1):
                 rollout.vote(flag, name, v)

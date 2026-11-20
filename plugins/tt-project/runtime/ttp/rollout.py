@@ -38,7 +38,8 @@ OVERRIDE_KV = "rollout_override_told"   # a project's {flag: day} of the last ov
 # and the code reading its key, relative to the repo root. The health watch counts a post-landing revert against a
 # flag only when the reverted commit touched one of them (rollout_health); a flag with no wiring yet has none.
 # `arm`: a model-route flag's model; such a revert also counts only when the change ran on it or a failing test
-# exercises the flag's code (rollout_health._reverts).
+# exercises the flag's code (rollout_health._reverts), and its other health signals count only the work its route
+# ran (rollout_health._Scope). `runs`: "coordinator" when the arm's runs are coordinator turns, not task runs.
 # `shadow` marks a flag that only records beside the real behaviour (it posts nothing, changes no run and makes no
 # model call), so no health signal judges it (rollout_health.signals). A flag whose feature already runs for every
 # project graduates (leaves this list), never gating it off: push_isolation, the push batch survival (a reliability
@@ -63,7 +64,7 @@ FLAGS: dict[str, dict[str, Any]] = {
     # Routine coordinator wakes on the chat model (coordroute.py): a ring runs them in shadow only (a read-only
     # lane turn beside the coordinator's own, nothing applied); live mode is the project's own setting.
     "glm_coord": {"key": "coordinator.routine.mode", "area": "coordinator", "code": _code("coordroute.py", "daemon.py"),
-                  "arm": "glm"},
+                  "arm": "glm", "runs": "coordinator"},
     "eta_history": {"key": "eta.history", "area": "eta", "shadow": True,
                     "code": _code("etaledger.py", "costlevers.py", "cli.py")},
     "deslop": {"key": "deslop.enabled", "area": "review", "code": _code("deslop.py")},
@@ -116,10 +117,11 @@ def on(flag: str, project: str, raw: dict | None = None, cfg: dict | None = None
         return True
     cfg = settings() if cfg is None else cfg
     lv, ring = level(flag, cfg), ring_of(project, cfg)
+    if ring is None or project in rolled_back(flag, cfg):
+        return False
     if lv == AUTO:
-        return ring is not None and project not in rolled_back(flag, cfg) \
-            and any(project in w for w in waves(flag, cfg)[:wave_at(flag, cfg) + 1])
-    return lv != OFF and ring is not None and ring <= lv
+        return any(project in w for w in waves(flag, cfg)[:wave_at(flag, cfg) + 1])
+    return lv != OFF and ring <= lv
 
 
 def waves(flag: str, cfg: dict | None = None) -> list[list[str]]:
@@ -137,14 +139,16 @@ def wave_at(flag: str, cfg: dict | None = None) -> int:
 
 
 def rolled_back(flag: str, cfg: dict | None = None) -> dict:
-    """{project: {ts, why}}: the projects the wave gate rolled back for `flag` alone (until `arm FLAG PROJECT`)."""
+    """{project: {ts, why}}: the projects rolled back for `flag` alone, by the wave gate or the health watch, at
+    any level (until `arm FLAG PROJECT`)."""
     got = ((cfg if cfg is not None else settings()).get("project_rollback") or {}).get(flag)
     return dict(got) if isinstance(got, dict) else {}
 
 
 def stop_project(flag: str, project: str, why: str, by: str = "daemon") -> bool:
-    """Roll `flag` back in `project` now, outside the hourly wave gate (deviceplan's stop); True when it was not
-    yet. It stays off there until `ttp rollout arm FLAG PROJECT`."""
+    """Roll `flag` back in `project` alone now, outside the hourly wave gate (deviceplan's stop, the daemon's health
+    watch); True when it was not yet. It stays off there until `ttp rollout arm FLAG PROJECT`; the other projects
+    keep it."""
     _check(flag)
     with _locked():
         back = rolled_back(flag)
@@ -262,7 +266,8 @@ def promote(flag: str, reason: str = "", by: str = "user") -> str:
 
 
 def rollback(flag: str, reason: str, by: str = "user", snapshot: dict | None = None) -> str:
-    """Turn `flag` off and freeze it until `arm`; the daemon calls this on a health failure, no model."""
+    """Turn `flag` off for every project and freeze it until `arm`: `ttp rollout rollback` from the user's
+    terminal. A health failure in one project switches the flag off there alone (stop_project)."""
     _check(flag)
     with _locked():
         if by.startswith("daemon") and frozen(flag):   # another project's daemon got there first
@@ -302,7 +307,7 @@ def arm(flag: str, reason: str = "", by: str = "user", project: str = "") -> str
             back.pop(project)
             _put("project_rollback", flag, back or None)
             _op("project_arm", flag, reason or "fix landed", by, project=project)
-        return f"{flag} re-armed in {project}: its wave covers it again"
+        return f"{flag} re-armed in {project}: its ring or wave covers it again"
     with _locked():
         if not frozen(flag):
             return f"{flag} is not frozen; nothing changed"
