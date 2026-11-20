@@ -4437,6 +4437,8 @@ def _cmd_checks(a) -> None:
     if not top or not head:
         die("ttp checks: run it in the change's git worktree (or pass --worktree <path>)")
     print(checktree.line(head, top), flush=True)
+    if why := _checks_public_scan(p, top, head, d):
+        die(f"ttp checks: {why}", 1)
     # A tree in the run's temporary folder is gone after the hand-off: detached checks would die with it.
     temp = checktree.temp_root(top, run_dir) if not getattr(a, "own_group", False) else ""
     if temp and a.detach:
@@ -6919,6 +6921,34 @@ def _checks_base(p: Project | None, top: Path, cmds: list) -> str:
         return base
     r = subprocess.run(["git", "-C", str(top), "remote"], capture_output=True, text=True)
     return rev(f"refs/heads/{branch}") if r.returncode == 0 and not r.stdout.strip() else ""
+
+
+def _checks_public_scan(p: Project | None, top: str, head: str, d: dict) -> str:
+    """Why a code task's commits must not reach the push branch, or "": the push queue's own scans
+    (outscan.history_problem: a secret shape; outscan.public_problem: a local-state term or a chat-message
+    or task reference under delivery.public_scan_paths) run here on the commits the head adds to the push
+    target, so a change the queue would refuse fails in seconds, before its checks and its review. Only a
+    code task's run, and only where the push target is known here. A scan that cannot run is said and
+    left to the push queue, which refuses then."""
+    if not p or not (tid := os.environ.get("TTP_TASK", "")).isdigit():
+        return ""
+    t = p.db.task(int(tid))
+    if not t or t.get("kind") != "code":
+        return ""
+    base = _checks_base(p, Path(top), [])
+    if not base:
+        return ""
+    from . import outscan
+    try:
+        fork = subprocess.run(["git", "-C", top, "merge-base", base, head], capture_output=True, text=True)
+        if fork.returncode or not fork.stdout.strip() or fork.stdout.strip() == head:
+            return ""
+        fork = fork.stdout.strip()
+        return outscan.history_problem(Path(top), fork, head, p) or outscan.public_problem(Path(top), fork, head, d, p) or ""
+    except Exception as e:
+        print(f"ttp checks: the push scan of the change's commits could not run ({type(e).__name__}: "
+              f"{str(e)[:200]}); the push queue still runs it", flush=True)
+        return ""
 
 
 def _checks_judge_base(p: Project, top: str, head: str, base: str) -> tuple[str, str]:

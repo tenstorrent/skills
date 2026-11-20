@@ -14491,6 +14491,55 @@ def test_a_code_tasks_run_never_pushes_to_the_push_branch_while_code_tasks_may_p
     assert _git_out(origin, "rev-parse", "proj") == _git_out(repo, "rev-parse", "HEAD")
 
 
+def test_a_glm_arm_code_task_never_lands_itself_under_code_tasks_may_push_but_a_claude_arm_one_does(
+        env, monkeypatch, capsys):
+    # A GLM-arm code run passed its checks and landed itself with `ttp push` because
+    # delivery.code_tasks_may_push was true, so no review ever ran on it. Its recorded code route arm now
+    # holds the landing until an independent review approves its head (whichever provider a bounced run
+    # used); a Claude-arm task under the same setting lands as before.
+    from ttp import prompts, push
+    p, repo, origin, _ = _push_setup(env, monkeypatch, ["true"])
+    shared = _git_out(origin, "rev-parse", "proj")
+    p.set_config("delivery.code_tasks_may_push", True)
+    glm = p.db.add_task("glm", kind="code", spec="Add a line to NOTES.md, commit it and land it.")
+    claude = p.db.add_task("claude", kind="code", spec="Add a line to NOTES.md, commit it and land it.")
+    p.db.set_kv(f"code_arm:{glm}", {"arm": "glm", "why": "test"})
+    p.db.set_kv(f"code_arm:{claude}", {"arm": "claude", "why": "test"})
+    _git_out(repo, "checkout", "-q", "-b", f"ttp/t{glm}-glm")
+    _commit(repo, "NOTES.md", "glm line\n")
+    _record_checks_pass(p, glm, repo)
+    run_dir = env["tmp"] / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("TTP_TASK", str(glm))
+    monkeypatch.setenv("TTP_RUN_DIR", str(run_dir))
+    from ttp.project import task_may_self_land
+    assert not task_may_self_land(p, glm) and task_may_self_land(p, claude)
+    for args in (["push"], ["push", "--detach"], ["push", "--land"], ["push", "--land", "--detach"]):
+        assert _ttp(*args) == 2, args
+        assert "no independent review approved HEAD" in capsys.readouterr().err, args
+        monkeypatch.delenv(push.LAND_ENV, raising=False)
+    assert not (p.state / "pushes").exists() and _git_out(origin, "rev-parse", "proj") == shared
+    # The raw `git push` through the run's git wrapper is refused too, naming the GLM arm.
+    wrapper = RUNTIME.parent / "template" / "bin" / "git"
+    run_env = {**os.environ, "TTP_PYTHON": sys.executable}
+    out = subprocess.run([str(wrapper), "push", "origin", "HEAD:proj"], cwd=repo, env=run_env,
+                         capture_output=True, text=True, timeout=60)
+    assert out.returncode != 0 and "GLM-arm code task" in out.stderr, out.stderr
+    assert _git_out(origin, "rev-parse", "proj") == shared
+    # The worker's prompt tells only the Claude-arm worker that code tasks may land.
+    policy = lambda t: next(x for x in prompts.worker_task(p, p.db.task(t), str(repo), None).splitlines()
+                            if x.startswith("delivery policy:"))
+    assert "may land on" not in policy(glm)
+    assert "code tasks may land on" in policy(claude)
+    # The Claude-arm task, under the same setting, lands as before.
+    monkeypatch.setenv("TTP_TASK", str(claude))
+    run_env["TTP_TASK"] = str(claude)
+    out = subprocess.run([str(wrapper), "push", "origin", "HEAD:proj"], cwd=repo, env=run_env,
+                         capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    assert _git_out(origin, "rev-parse", "proj") == _git_out(repo, "rev-parse", "HEAD")
+
+
 def test_the_run_git_wrapper_skips_other_wrappers_on_path_and_keeps_its_hook(env, monkeypatch):
     # Two harnesses' bin/ on one PATH (a scratch project's daemon started from a run, as
     # `ttp doctor --loop` does) made each wrapper exec the other forever: every git call hung.

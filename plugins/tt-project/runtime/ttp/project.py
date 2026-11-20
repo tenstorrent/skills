@@ -1161,6 +1161,20 @@ def code_tasks_may_push(cfg: dict) -> bool:
     return d.get("code_tasks_may_push") is True and bool(str(d.get("push_branch") or "").strip())
 
 
+def task_may_self_land(p, task_id, cfg: dict | None = None) -> bool:
+    """Whether code task `task_id` may land its own work with `ttp push`: code_tasks_may_push, and its
+    code route arm is not GLM. A GLM-arm task (whichever provider a run took after a bounce) lands only
+    a head an independent Opus review approved, so its review is queued and lands it."""
+    cfg = cfg if cfg is not None else p.config()
+    if not code_tasks_may_push(cfg):
+        return False
+    from . import codearm
+    try:
+        return (codearm.recorded(p.db, int(task_id)) or {}).get("arm") != "glm"
+    except (ValueError, TypeError):
+        return True
+
+
 APPROVED_PUSH = "approved"   # delivery.code_tasks_may_push: only heads an independent review approved
 
 

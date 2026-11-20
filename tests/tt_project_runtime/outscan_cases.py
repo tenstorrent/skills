@@ -842,3 +842,52 @@ def test_public_scan_runs_in_ttp_push_and_the_push_queue_and_its_setting_is_a_li
     assert _statuses(m) == ["refused"] and "could not run; not pushing: corrupt registry" in m["results"][0]["detail"]["message"], m
     assert config_problems({"delivery": {"public_scan_paths": 5}}) == ["delivery.public_scan_paths: 5: not a list"]
     assert config_problems({"delivery": {"public_scan_paths": ["plugins/x", "tests/*.py"]}}) == []
+
+
+def test_ttp_checks_runs_the_push_scan_on_a_code_tasks_commits_before_its_checks(env, tmp_path, monkeypatch, capsys):
+    """The push queue refuses a commit adding a chat-message reference under delivery.public_scan_paths;
+    `ttp checks` of a code task runs that scan (and the secret-shape one) on the commits its head adds to
+    the push branch, so the change fails there, naming the scan's message, before any check runs and
+    before a review. A clean branch passes; a task of another kind and a project without the setting
+    are not scanned."""
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    trunk = subprocess.run([*git, "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True).stdout.strip()
+    p.set_config("delivery.push_branch", trunk)
+    p.set_config("delivery.public_scan_paths", [".changeset"])
+    tid = p.db.add_task("scan", kind="code", spec="Change something.")
+    monkeypatch.setenv("TTP_TASK", str(tid))
+    subprocess.run([*git, "checkout", "-q", "-b", f"ttp/t{tid}-scan"], check=True)
+    ran = tmp_path / "ran"
+    check = ["sh", "-c", f"echo x >> {ran}"]
+
+    def commit(path, text, msg):
+        (repo / path).parent.mkdir(parents=True, exist_ok=True)
+        (repo / path).write_text(text)
+        subprocess.run([*git, "add", path], check=True)
+        subprocess.run([*git, "commit", "-qm", msg], check=True)
+
+    commit(".changeset/clean.md", "Fix a landing bug.\n", "fix a landing bug")
+    cli.main(["checks", "--", *check])   # a clean branch passes and its checks run
+    assert ran.exists() and "push scan" not in capsys.readouterr().err
+    ran.unlink()
+    (run / "checks.json").unlink()
+    commit(".changeset/cites.md", f"Keep the rule (user msg #{40 + 2}).\n", "keep the rule")
+    for _ in range(2):   # fresh and again: a failure is never served from a record
+        with pytest.raises(SystemExit) as stop:
+            cli.main(["checks", "--", *check])
+        err = capsys.readouterr().err
+        assert stop.value.code == 1 and "adds a reference to a user's chat message" in err, err
+        assert "public scan refused" in err and f"#{40 + 2}" not in err, err
+        assert not ran.exists()   # nothing ran
+    # Another kind of task, or the setting unset, is not scanned.
+    other = p.db.add_task("other", kind="work", spec="x")
+    monkeypatch.setenv("TTP_TASK", str(other))
+    cli.main(["checks", "--", *check])
+    assert ran.exists()
+    ran.unlink()
+    (run / "checks.json").unlink()
+    monkeypatch.setenv("TTP_TASK", str(tid))
+    p.set_config("delivery.public_scan_paths", [])
+    cli.main(["checks", "--fresh", "--", *check])
+    assert ran.exists()

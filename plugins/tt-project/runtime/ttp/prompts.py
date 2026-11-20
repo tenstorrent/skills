@@ -17,7 +17,7 @@ from .db import continues_id, load_result
 from .hook import unread_update
 from .project import rebase_replace
 from .project import (CORRECTIONS_HEADER, OWN_FLAG, WORKER_MEMORY_CHARS, WORKER_PINNED_MIN_CHARS, WORKER_RANKED_MIN_CHARS,
-                      Project, code_tasks_may_push, own_push, push_allowed, push_queue_on, worker_memory,
+                      Project, code_tasks_may_push, own_push, push_allowed, push_queue_on, task_may_self_land, worker_memory,
                       WORKER_POLICY_MIN_CHARS)
 from .worktree import carried_branch, gets_worktree, own_worktree, project_venv, rebased_branch, recovery_note
 
@@ -1005,7 +1005,7 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
         f"{delivery.get('review_before_pr', True)}, auto-merge repos={delivery.get('auto_merge_repos') or 'none'}, "
         f"push allowed={delivery.get('push_allowed', True)}"
         + (f", code tasks may land on {delivery['push_branch']} with ttp push=True"
-           if kind == "code" and code_tasks_may_push(cfg) else "")
+           if kind == "code" and task_may_self_land(p, task["id"], cfg) else "")
         + (", push queue=True" if kind == "review" and push_queue_on(cfg) else "")
         + (f", own pushes={own_push(cfg)} (delivery.own_push: "
            + ("refused; never push any branch but the push branch)" if own_off else

@@ -298,6 +298,7 @@ from .db import (
 from .project import ps_snapshot, rebase_replace, write_dirs
 from .project import (
     Project,
+    task_may_self_land,
     bad_sections,
     command_env,
     deep_merge,
@@ -8049,7 +8050,8 @@ class Daemon:
                     _task_note(run_dir, f"blocked question kept: {summary}")
         waiting = status == "ok" and rstatus == "waiting"
         refusal = ackwait.unmanaged_wait(result, self._other_projects(), bool(jobs), self.cfg, self.p.harness) if waiting else ""
-        if waiting and not refusal and (refusal := ownwait.own_landing_wait(task, result, self.cfg, bool(jobs))):
+        if waiting and not refusal and (refusal := ownwait.own_landing_wait(
+                task, result, self.cfg, bool(jobs), task_may_self_land(self.p, task["id"], self.cfg))):
             if landed.check(self.p, self.p.root, tid=task["id"], fetch=False)[0] == 0:
                 refusal = ""   # already on the push branch: its wait passes at once
             elif probe := ownwait.own_push_probe(self.p, task["id"]):

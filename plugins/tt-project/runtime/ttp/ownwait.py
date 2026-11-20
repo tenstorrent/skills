@@ -54,7 +54,8 @@ def names_step(result: dict) -> bool:
 
 
 
-def own_landing_wait(task: dict, result: dict, cfg: dict, job_in_flight: bool = False) -> str:
+def own_landing_wait(task: dict, result: dict, cfg: dict, job_in_flight: bool = False,
+                     self_land: bool | None = None) -> str:
     """Why a waiting hand-off is refused: a code task whose retry_when or waiting_for is its own landing.
     '' when it is fine (another task's landing, a push or checks probe, a detached job in flight, or
     not a code task). A later step of `then` may name the landing: it follows the task's own push."""
@@ -63,7 +64,7 @@ def own_landing_wait(task: dict, result: dict, cfg: dict, job_in_flight: bool = 
     if not any(waits_landing(result.get(k), task["id"]) for k in ("retry_when", "waiting_for")):
         return ""
     way = ("land it now with `ttp push --detach` (delivery.code_tasks_may_push is on) and wait on the `retry_when` "
-           "it prints" if code_tasks_may_push(cfg) else
+           "it prints" if (code_tasks_may_push(cfg) if self_land is None else self_land) else
            "hand off `done` or `needs_review` so its review queues and lands it")
     return (f"hand-off refused: it waits on its own landing (task #{task['id']}), which cannot happen before it "
             f"finishes: the review that lands a change queues only once the task ends, so the wait never ends. "

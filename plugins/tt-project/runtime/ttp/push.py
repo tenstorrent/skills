@@ -57,7 +57,7 @@ from .db import continues_id, dependency_ids, load_result
 from .liveness import pid_alive, pid_ns
 from .project import (Project, approved_heads_may_push, code_tasks_may_push, durable_append, durable_write, git_fsync_env, hostname,
                       load_registry, nice_level, open_append_or_null, own_creates_pr_branch, own_push, push_queue_on,
-                      rebase_replace, renice, write_json)
+                      rebase_replace, renice, task_may_self_land, write_json)
 from .project import never_force as never_force_on
 from .release import UPGRADE_RESOURCE, _taken as _lock_taken
 from .testpick import TASK_KEY
@@ -3057,7 +3057,7 @@ def _resolve(p: Project, repo: Path, own: bool = False) -> tuple[str, str, bool]
     if task and (why := ponytail_landing(p, task, f"{remote}/{push_to}", d, repo)):
         raise ValueError(why)
     if m and task and m.group(1) == task:
-        if (approved := (approval_marker(p, os.getpid()) or {}).get("sha")) and not code_tasks_may_push(p.config()) \
+        if (approved := (approval_marker(p, os.getpid()) or {}).get("sha")) and not task_may_self_land(p, task, p.config()) \
                 and approved == _git(repo, "rev-parse", "HEAD").stdout.strip() and approved_head(p, approved):
             say = (f"ttp push: task #{task} lands its own branch {branch} on {remote}/{push_to}: an independent "
                    f"review approved its head {approved[:10]}")
@@ -3110,7 +3110,7 @@ def code_run_landing(p: Project, task: str, upstream: str, d: dict, repo: Path |
         t = p.db.task(int(task))
     except (ValueError, TypeError):
         return ""
-    if not t or t.get("kind") != "code" or code_tasks_may_push(p.config()):
+    if not t or t.get("kind") != "code" or task_may_self_land(p, task):
         return ""
     if repo is not None and approved_heads_may_push(p.config()):
         head, why = approved_landing(p, repo)

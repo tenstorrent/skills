@@ -70,6 +70,9 @@ def test_a_code_task_waiting_on_its_own_landing_is_refused_with_the_way_out():
         assert got.startswith("hand-off refused") and "ttp push --detach" in got, (probe, got)
         got = ownwait.own_landing_wait(task, {"status": "waiting", key: probe}, off)
         assert "ttp push" not in got and "`done`" in got, (probe, got)
+        # A GLM-arm task (self_land False) under code_tasks_may_push is told the same: its review lands it.
+        got = ownwait.own_landing_wait(task, {"status": "waiting", key: probe}, on, self_land=False)
+        assert "ttp push" not in got and "`done`" in got, (probe, got)
     # Not refused: another task's landing (also one sharing a digit prefix), a push or checks probe, a later
     # `then` step, a detached job in flight, a task that is not code, a non-dict hand-off.
     wait = {"status": "waiting", "retry_when": "ttp landed --task 421"}
