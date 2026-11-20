@@ -208,10 +208,10 @@ def infra_failed(db, task: dict) -> bool:
 
 def keeps_core(db, cfg: dict, task: dict, tier: str, cls: str | None = None, picked: dict | None = None) -> str:
     """Why a run of `task` stays on the core provider on a covered project ('' when GLM may take it). Model-free,
-    in order: coordinator, plan and review runs (#3205), deep, a provider or model pin, outside text
+    in order: coordinator, plan and review runs, deep, a provider or model pin, outside text
     (untrusted_input), a tier-up retry after a finished attempt (infra_failed: a crash, timeout or endpoint error
-    retries on GLM), a GLM bounce (needs Opus or deep), a run that talks to a person (#3512: `reply_chat` or an
-    instruction to post, comment or notify), optimization or design work, device work (#3324; with glm_device on it runs on GLM under an Opus
+    retries on GLM), a GLM bounce (needs Opus or deep), a run that talks to a person (`reply_chat` or an
+    instruction to post, comment or notify), optimization or design work, device work (with glm_device on it runs on GLM under an Opus
     plan, deviceplan.py), urgent (only with keep_urgent), a kind off the
     list."""
     from . import codearm, deviceplan, effort, modelpick, untrusted, urgent
