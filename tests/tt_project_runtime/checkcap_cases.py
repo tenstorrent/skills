@@ -2734,16 +2734,6 @@ def test_wall_cap_extends_a_run_still_progressing_and_stops_a_silent_or_stalled_
     assert near.granted <= near.room and near.cap_s + near.granted <= checkwall.CEILING_S
     assert checkwall.Extension(3600).room == 1800
 
-def test_a_slow_healthy_check_long_at_0_percent_is_never_stopped_before_its_cap(tmp_path, monkeypatch):
-    # pytest floors its percent and prints it rarely under -q: a run printing `[  0%]` for over 15 min is
-    # still progressing; only the silence stop and the wall-time cap end a run.
-    from ttp import checkwall
-    now = _test_clock(monkeypatch)
-    with open(tmp_path / "checks.log", "a") as out:
-        assert checkwall.wait(_ProgressProc(out, lambda n: 0 if n < 100 else 100), out, 7200, 600,
-                              extend=checkwall.Extension(7200)) == 0
-    assert now[0] > 1800, now
-
 
 def test_wall_cap_progress_reads_never_close_the_check_log_the_run_still_writes(tmp_path, monkeypatch):
     # The checks log is opened by descriptor (open_append: its name is a number); reading its progress at

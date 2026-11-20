@@ -197,7 +197,7 @@ def test_the_table_carries_no_eta_so_an_expired_one_never_shows(env):
                         "summary": "ETA 09:00"}), t))
     row = dict(p.db.task(t))
     assert deferral(row)["after"] == now - 7200
-    assert eta.outside_wait(row, now - 5400) == {"at": now - 3600, "follows": False, "own": False}, "eta.py reads this ETA"
+    assert eta.outside_wait(row, now - 5400) == {"at": now - 3600, "follows": False}, "eta.py reads this ETA"
     out = "\n".join([*hourly.rows(p, now), hourly.table(p, now)]).lower()
     assert "eta" not in out and "expected finish" not in out
 

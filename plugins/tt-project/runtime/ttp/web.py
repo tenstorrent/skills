@@ -787,7 +787,6 @@ def state_payload(p: Project, db: DB) -> dict:
         except Exception:
             t["eta"] = None
         t.pop("spec", None)
-        t["waiting"] = coord.handoff_wait(t, now) or None   # 'waiting 2h13m': its own wait's age
         t["outcome"] = task_outcome(t)   # changes_needed for a review that asked for changes
         result = load_result(t["result"])
         t["result"] = str(result.get("summary") or "")[:600]

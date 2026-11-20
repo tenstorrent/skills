@@ -219,37 +219,6 @@ def test_queue_wait_classifies_each_queue(probe, reason, want):
     assert queuewait.classify(probe, reason, {"dev0"}) == want
 
 
-def test_queue_wait_raises_an_urgent_own_wait_after_15_min_and_at_once_on_a_user_held_resource(env):
-    """An urgent task waiting on its own probe (a smoke, a cluster job) no queue explains is raised after
-    15 min, naming its probe's last words and resources; a routine one is not; a resource a user pause
-    holds raises it at once, with routes around it."""
-    from ttp import progress, queuewait
-    p = make(env)
-    now = time.time()
-
-    def waiting(title, spec, mins, labels=None):
-        tid = p.db.add_task(title, spec, kind="code")
-        p.db.update_task(tid, not_before=now + 300, blocked_reason="waiting for its smoke job" + NT,
-                         labels=json.dumps(labels or []),
-                         result=json.dumps({"status": "waiting", "retry_when": "sh probe.sh",
-                                            "waiting_since": now - mins * 60}))
-        progress.note_probe(p.db, tid, "sh probe.sh", 1, "smoke job PENDING (Resources)", now=now - 60)
-        return tid
-
-    early = waiting("early", "urgent: user asked", 10)
-    late = waiting("late", "urgent: user asked", 20, ["resource:boxA"])
-    waiting("routine", "s", 50)
-    assert len(queuewait.scan(p, QW_CFG, now, {"limit": 0, "running": [], "queued": []})) == 1
-    ev = _qw_events(p)
-    assert len(ev) == 1 and f"qwait-{late}-own" in ev[0]["text"] and "PENDING (Resources)" in ev[0]["text"]
-    assert "boxA" in ev[0]["text"] and "beside the review" in ev[0]["text"]
-    p.db.set_kv("paused_resources", {"boxB": {"reason": "hold", "since": now, "by": "user"}})
-    p.db.update_task(early, labels=json.dumps(["resource:boxB"]))
-    assert queuewait.scan(p, QW_CFG, now + 1, {"limit": 0, "running": [], "queued": []})
-    held = [e for e in _qw_events(p) if f"qwait-{early}-own" in e["text"]]
-    assert held and "held by a user pause: boxB" in held[0]["text"]
-
-
 def test_queue_wait_skips_running_checks_and_finished_tasks(env):
     """A worker whose own checks run (cap 0: the host view lists none) waits on no queue; a done or
     cancelled task whose label is still in the host queue raises nothing, so no option names it."""

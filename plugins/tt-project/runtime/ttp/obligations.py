@@ -1962,13 +1962,6 @@ LANDING_STUCK_KIND = "order_landing_stuck"
 MUST_ACT_KINDS = (PROMISE_KIND, ORDER_LATE_KIND, ORDER_KIND, CLAIM_KIND, LANDING_STUCK_KIND)
 ORDER_CLASSES = ("read", "change", "device")
 ORDER_START_S = 1800          # an order with no start_by: its owner's run starts within this after the message
-# Words asking for it the same day: an order given no due is due by the end of the message's home-zone day
-# (or SAME_DAY_MIN_S after it, sent late), so an urgent ask is not promised for tomorrow. Negated ('not
-# urgent') never counts; an explicit due always wins.
-SAME_DAY = re.compile(r"(?<!\bnot )(?<!\bno )(?<!n't )(?<!\bnever )"
-                      r"(\b(today|tonight|asap|right (now|away)|immediately|urgent(ly)?)\b|(?<!\bfor )\bnow\b(?=\s*[!.?]|\s*$))",
-                      re.I | re.M)
-SAME_DAY_MIN_S = 4 * 3600
 CLAIM_WAIT_S = 1800           # a claim's probe that cannot answer (75, timeout) past its due: failed after this
 CLAIM_UNREACHABLE = 255       # ssh's own exit: the probe's host did not answer; the claim stays unchecked and is retried
 CLAIM_HOPS_MAX = 50           # continuation hops a task claim's check walks from its named task (_continuations)
@@ -2091,15 +2084,10 @@ def add_order(p, text: str, message: int, owners=(), due=None, start_by=None, ac
         raise ValueError("an order needs `text`: what the user asked for")
     if action_class not in ORDER_CLASSES:
         raise ValueError(f"an order needs `action_class`: one of {', '.join(ORDER_CLASSES)}")
-    row = p.db.one("SELECT ts, chat, text FROM messages WHERE id=? AND direction='in'", (int(message),))
+    row = p.db.one("SELECT ts, chat FROM messages WHERE id=? AND direction='in'", (int(message),))
     if not row:
         raise ValueError(f"order: #{message} is not a user message")
     due_at = _when(due, "order due", p) if due not in (None, "") else None
-    cap, note_cap = None, ""   # 'today', 'now', 'asap': a new order is due the same day, not the next
-    if due_at is None and SAME_DAY.search(row["text"] or ""):
-        sent = datetime.fromtimestamp(float(row["ts"]), timefmt.zone(p))
-        cap = max(sent.replace(hour=23, minute=59, second=0, microsecond=0).timestamp(),
-                  float(row["ts"]) + SAME_DAY_MIN_S, now + 1800)
     start_at = _when(start_by, "order start_by", p) if start_by not in (None, "") else float(row["ts"]) + ORDER_START_S
     with p.db.tx():
         ids = _owners_known(p.db, owners)
@@ -2125,8 +2113,6 @@ def add_order(p, text: str, message: int, owners=(), due=None, start_by=None, ac
                 pr.update(start_by=start_at, late=None)
             note = f"order {o['id']} (message #{message}) updated"
         else:
-            if cap is not None:
-                due_at, note_cap = cap, " (its message asks for it today)"
             oid = f"o{st['next']}"
             st["next"] += 1
             o = st["items"][oid] = {
@@ -2138,7 +2124,7 @@ def add_order(p, text: str, message: int, owners=(), due=None, start_by=None, ac
                             "set_at": now, "order": int(message), "class": action_class, "start_by": start_at,
                             "started": None, "late": None, "reason": oldorders.one_line(reason),
                             "context": oldorders.clean_context(p, oldorders.context_for(p.db, "", int(message)))}}
-            note = f"order {oid} recorded from message #{message}" + note_cap
+            note = f"order {oid} recorded from message #{message}"
         pr = o["promise"]
         p.db.set_kv(KV, st)
     return (note + f": due {timefmt.long(pr['due'], p)}, start by {timefmt.long(pr['start_by'], p)}, "

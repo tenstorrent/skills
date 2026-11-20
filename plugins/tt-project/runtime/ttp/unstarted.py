@@ -26,10 +26,6 @@ recorded hold raises no alarm while the queue drains (a run of its provider star
 threshold and after the gate cleared; free slots with no such start still raise it); one BACKLOG_KIND record per episode (handled: it wakes nothing) gives the
 queue depth, when the gate cleared or that it still holds, the live runs and the free slots (backlog_words).
 
-open_followups() and followup_lines(): each follow-up a hand-off of any task kind proposed that a turn or
-gate has handled but no later task took up stays listed in the digest until one does or the coordinator
-drops it (`ttp task <project> drop-followup`, drop_followup: marked on its own followup_proposed event).
-
 parked_nudge() is the coordinator's advice for a deferral that names no external fact: it never
 refuses, it counts (NUDGE_KV)."""
 from __future__ import annotations
@@ -52,7 +48,6 @@ BACKLOG_KV = "ready_backlog"   # kv: {provider: {"stopped": bool, "why": str, "c
 CLEARED_WAIT_S = 300    # a task the spend gate held until this recently waits for one dispatch pass first
 DEFER_S = 600           # task_update adding spec to a task deferred further than this gets the nudge
 MAX_AGE_S = 86400
-FOLLOWUPS_SHOWN = 8   # open follow-ups listed per digest
 READY_TITLE = re.compile(r"(?i)^\s*ready\s*:\s*")   # a hand-off follow-up whose inputs are ready now
 START_SLACK_S = 60      # a run started just before the reply that announced it counts
 NUDGE_KV = "parked_work_nudges"   # kv: {"n": total, "day": "YYYY-MM-DD", "today": n, "at": ts}
@@ -176,62 +171,13 @@ def _ready_followups(db, now: float) -> list[dict]:
             continue
         later = db.q("SELECT id, title, spec FROM tasks WHERE id>?", (src["id"],))
         for i, title in enumerate(titles):
+            step = READY_TITLE.sub("", title).strip().lower()
+            quotes = [title.lower()] + ([step] if len(step) >= 20 else [])   # a short step text matches by chance
+            owners = [t["id"] for t in later if (t["title"] or "").strip().lower() in (title.lower(), step)
+                      or any(q in (t["spec"] or "").lower() for q in quotes)]
             out.append({"key": f"f{src['id']}.{i}", "what": f"follow-up {title[:160]!r} of #{src['id']}",
-                        "created": float(src["ended"]), "owners": _taken_by(later, title)})
+                        "created": float(src["ended"]), "owners": owners})
     return out
-
-
-def _taken_by(later, title: str) -> list[int]:
-    """The tasks of `later` titled as follow-up `title` (with or without a `ready:` prefix) or whose spec quotes it."""
-    step = READY_TITLE.sub("", title).strip().lower()
-    quotes = [title.lower()] + ([step] if len(step) >= 20 else [])   # a short step text matches by chance
-    return [t["id"] for t in later if (t["title"] or "").strip().lower() in (title.lower(), step)
-            or any(q in (t["spec"] or "").lower() for q in quotes)]
-
-
-def open_followups(db, now: float) -> list[dict]:
-    """Each follow-up a hand-off proposed (any task kind) in the last MAX_AGE_S whose followup_proposed event a
-    turn or gate has handled, that no later task took up (_taken_by) and the coordinator did not drop
-    (drop_followup): {id (the event), task, title}. A folded one, a `continue:` one (check_unqueued_continues)
-    and an `upstream:` one (filed by the daemon) are left out: each has its own owner. A follow-up not taken
-    up within 24 h leaves the digest list (no full-history scan per digest build)."""
-    out = []
-    for e in db.q("SELECT id, task, text FROM events WHERE kind='followup_proposed' AND status='handled' AND ts>=? "
-                  "AND task IS NOT NULL AND text NOT LIKE '%(folded into #%' "
-                  "AND COALESCE(data,'') NOT LIKE '%\"dropped\"%' ORDER BY id", (now - MAX_AGE_S,)):
-        fups = load_result((db.task(e["task"]) or {}).get("result")).get("followups")
-        title = next((str(f["title"]).strip() for f in fups if isinstance(f, dict) and f.get("title")
-                      and str(f["title"])[:200] in e["text"]), None) if isinstance(fups, list) else None
-        if not title or re.match(r"(?i)\s*(continue|upstream)\s*:", title):
-            continue
-        if not _taken_by(db.q("SELECT id, title, spec FROM tasks WHERE id>?", (e["task"],)), title):
-            out.append({"id": e["id"], "task": e["task"], "title": title})
-    return out
-
-
-def followup_lines(p, now: float) -> list[str]:
-    """The digest's open follow-ups (open_followups), at most FOLLOWUPS_SHOWN, under a header saying how to settle each."""
-    fups = open_followups(p.db, now)
-    if not fups:
-        return []
-    more = f" ({len(fups) - FOLLOWUPS_SHOWN} older not shown)" if len(fups) > FOLLOWUPS_SHOWN else ""
-    return ([f"## Open follow-ups{more}: handed off, no task took them up; add each (task_add with its title) or drop "
-             f"it: `ttp task {p.name} drop-followup <id> \"<why>\"`"]
-            + [f"- {f['id']}: {f['title'][:200]} (from #{f['task']})" for f in fups[-FOLLOWUPS_SHOWN:]])
-
-
-def drop_followup(db, event_id: int, why: str) -> str:
-    """Record the coordinator's drop of open follow-up `event_id` on its own event (no second store)."""
-    import json
-    if not why.strip():
-        raise ValueError("say why the follow-up is dropped")
-    e = db.one("SELECT id, task, data FROM events WHERE id=? AND kind='followup_proposed'", (event_id,))
-    if not e:
-        raise ValueError(f"no proposed follow-up {event_id}")
-    data = load_result(e["data"])
-    db.x("UPDATE events SET status='handled', data=? WHERE id=?",
-         (json.dumps({**data, "dropped": why.strip()[:300]}), event_id))
-    return f"follow-up {event_id} of #{e['task']} dropped"
 
 
 def announced(p, now: float | None = None, paused: dict | None = None) -> list[str]:

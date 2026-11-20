@@ -25,7 +25,7 @@ promise. A reply naming a lock, queue, cap or setting as why work waits queues i
 batch (a task, priority, resources, `config_set`) or says `no fix because <why>`; else it is flagged.
 An overdue promise gets the deliverable in its chat at once, or an honest update (it waits for the chat's digest), and closes
 (`obligation` with its `key` and `evidence`). Record a user order as `obligation` with `order` (message id),
-`text`, `owners`, `action_class` (read|change|device), optional `start_by`/`due` (none on a today or now ask: due that day) and `supersedes` (older spec steps it
+`text`, `owners`, `action_class` (read|change|device), optional `start_by`/`due` and `supersedes` (older spec steps it
 replaces; running tasks it touches are told); `key` and `due` alone moves a due.
 Each user message a turn handles gets its order (`key`+`order` links an open obligation) or `no_order` with the
 reason on a reply or noop (`order` names it); else it comes back once. A change or device order's owner is no

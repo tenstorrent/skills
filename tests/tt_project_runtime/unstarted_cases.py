@@ -512,44 +512,6 @@ def test_ready_followup_of_a_hand_off_is_announced_work_owned_by_the_task_that_t
                     (f"announced_not_started:f{src2}.0",))["status"] == "handled", "its owner started"
 
 
-def test_a_handed_off_follow_up_of_any_kind_stays_in_the_digest_until_taken_up_or_dropped(env, capsys):
-    from ttp import cli, unstarted
-    from ttp import coordinator as coord
-
-    def drop(*args):
-        try:
-            cli.main(["task", p.name, "drop-followup", *args])
-        except SystemExit as e:
-            return e.code or 0
-        return 0
-    p = make(env)
-    src = p.db.add_task("review the soak change", "s", kind="review", tier="light", origin="coordinator", priority=3)
-    fups = [{"title": "Add a soak timeout to the nightly config", "spec": "x"},
-            {"title": "Document the soak flags", "spec": "y"},
-            {"title": "continue: read the soak result", "spec": "z"},
-            {"title": "upstream: soak timeouts for every project", "spec": "w"},
-            {"title": "Fold me", "spec": "v"}]
-    p.db.update_task(src, status="done", result=json.dumps({"status": "done", "followups": fups}))
-    now = time.time()
-    ids = [p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
-                  (now, f"task:{src}", "followup_proposed", "normal",
-                   f"proposed follow-up{' (folded into #1: same file)' if f['title'] == 'Fold me' else ''}: "
-                   f"{f['title']} — {f['spec']}", status, src))
-           for f, status in zip(fups, ("queued", "handled", "handled", "handled", "handled"))]
-    assert [f["id"] for f in unstarted.open_followups(p.db, now)] == [ids[1]], \
-        "the queued one is in this turn's events; continue:, upstream: and folded ones have their own owner"
-    assert unstarted.open_followups(p.db, now + unstarted.MAX_AGE_S + 1) == [], "one not taken up within 24 h leaves the list"
-    p.db.x("UPDATE events SET status='handled' WHERE id=?", (ids[0],))   # a turn or gate handled it
-    digest = coord.digest(p, {}, [], [])
-    assert "## Open follow-ups" in digest and f"- {ids[0]}: Add a soak timeout" in digest \
-        and f"- {ids[1]}: Document the soak flags (from #{src})" in digest
-    p.db.add_task("Add a soak timeout to the nightly config", "s", kind="code", tier="light", origin="coordinator")
-    assert drop(str(ids[1]), "") != 0
-    assert drop(str(ids[1]), "covered by the existing docs") == 0
-    assert f"follow-up {ids[1]} of #{src} dropped" in capsys.readouterr().out
-    assert unstarted.open_followups(p.db, now) == [] and "## Open follow-ups" not in coord.digest(p, {}, [], [])
-
-
 def test_status_and_web_name_the_dependency_a_queued_task_waits_on(env):
     """A queued task held by an unfinished dependency is not ready, so no ready check names it: ttp status
     and the web app's task row say what it waits on and that task's state."""

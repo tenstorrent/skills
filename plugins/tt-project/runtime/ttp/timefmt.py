@@ -127,12 +127,6 @@ def tzinfo(where) -> ZoneInfo:
 
 
 # formatting ---------------------------------------------------------------------------------------
-def dur(s: float) -> str:
-    """A span as '2h13m', '45m' or '30s'."""
-    s = int(s)
-    return f"{s // 3600}h{s % 3600 // 60:02d}m" if s >= 3600 else f"{s // 60}m" if s >= 60 else f"{s}s"
-
-
 def long(ts: float, where) -> str:
     """'2026-10-09 23:32 UTC': `ts` in the zone of `where` (a zone name, ZoneInfo, Project or settings)."""
     return datetime.fromtimestamp(ts, _tz(where)).strftime("%Y-%m-%d %H:%M %Z")
