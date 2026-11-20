@@ -405,8 +405,6 @@ def device_task(task: dict | None, cfg: dict | None = None) -> bool:
     if "needs_device" in task_labels(t):
         return True
     names = task_resources(t)
-    if not names:
-        return False
     return bool(effort.device_resources(names, cfg, unreadable_is_device=True))
 
 

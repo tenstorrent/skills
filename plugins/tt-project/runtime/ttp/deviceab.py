@@ -313,7 +313,7 @@ def device_names(task: dict, cfg: dict | None) -> list[str]:
     from . import effort
     if task.get("kind") == "question" or READ_ONLY_TITLE.match(str(task.get("title") or "")):
         return []
-    return sorted(set(effort.device_resources([n for n in effort._resource_names(task) if n], cfg)))
+    return sorted(set(effort.device_resources(effort._resource_names(task), cfg)))
 
 
 WATCHER = re.compile(r"(?i)(device|machine|broker|hardware|power|chip|board|box|health)")

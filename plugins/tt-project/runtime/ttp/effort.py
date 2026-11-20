@@ -77,7 +77,8 @@ def _resource_names(task: dict) -> list[str]:
 def device_resources(names, cfg: dict | None = None, unreadable_is_device: bool = False) -> list[str]:
     """The names in `names` that name a device: a `*-device` lock, one of `cfg`'s device locks, or a
     machine the machine list tags `device`. An unreadable machine list makes every name a device when
-    `unreadable_is_device` (the stricter guard holds), else it names none."""
+    `unreadable_is_device` (the stricter guard holds), else it keeps the `*-device` and configured
+    device-lock names already found."""
     from . import locks
     names = [n for n in names if str(n).strip()]
     if not names:
