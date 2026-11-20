@@ -4228,7 +4228,7 @@ class Daemon:
                 tmp_env["TTP_SANDBOXED"] = "1"   # privlock.sandboxed_run
                 if prov.fence_by_name:
                     tmp_env["TTP_FENCE_BY_NAME"] = "1"
-            glm_env = glmguard.run_env(provider, note, glmguard.device_task(task))
+            glm_env = glmguard.run_env(provider, note, glmguard.device_task(task, self.cfg))
             if glm_env:   # a run under the GLM guards writes scratch files where its guard lets it (glmguard.scratch_env)
                 tmp_env.update(glmguard.scratch_env(run_dir, tmp_env))
             if mcp_servers:

@@ -372,11 +372,9 @@ _GG_WRITES = [
     "ttp task requeue 5", "ttp obligation progress o1 x"]
 
 
-def test_glm_guard_reads_are_the_coordinators_reads_without_the_queue_listing():
+def test_glm_guard_reads_include_the_coordinators_reads():
     from ttp import coordtools, glmguard
-    assert set(coordtools.READ_COMMANDS) - set(glmguard.READS) == {("task", "*", "show"), ("task", "*", "list"),
-                                                                    ("checks", "queue")}
-    assert set(glmguard.READS) - set(coordtools.READ_COMMANDS) == {("machines", "change", "list"), ("occupancy",)}
+    assert set(glmguard.READS) >= set(coordtools.READ_COMMANDS)
 
 
 @_pytest.mark.parametrize("cmd", _GG_READS)
@@ -391,6 +389,42 @@ def test_glm_guard_still_refuses_every_ttp_write_and_an_unknown_machines_subcomm
     from ttp import glmguard
     wt, rd = _gg_run(tmp_path)
     assert glmguard.shell_refusal(cmd, str(wt), str(rd), {"TTP_PROJECT": str(tmp_path / "proj"), **_GG_RUN_ENV}), cmd
+
+
+@_pytest.mark.parametrize("cmd", ['echo "$(ttp task add t s)"', 'echo "`ttp task cancel 5`"', 'x="a $(git push) b"',
+                                 'echo "$(gh pr comment 1 -b hi)"', 'echo "ok `ssh h ls`"', 'echo "$(echo "$(ttp notify hi)")"',
+                                 'echo "it\'s $(ttp note --to p hi)"', 'echo "$(printf ")"; ttp notify hi)"'])
+def test_glm_guard_checks_a_substitution_inside_double_quotes_like_an_unquoted_one(cmd, tmp_path):
+    from ttp import glmguard
+    wt, rd = _gg_run(tmp_path)
+    assert glmguard.shell_refusal(cmd, str(wt), str(rd), {"TTP_PROJECT": str(tmp_path / "proj"), **_GG_RUN_ENV}), cmd
+
+
+@_pytest.mark.parametrize("cmd", ["echo '$(ttp task add t s)'", "echo '`ttp notify hi`'", 'echo "$(ttp task proj show 5)"',
+                                 'echo "\\$(ttp notify hi)"', 'echo "`ttp machines list`"'])
+def test_glm_guard_leaves_single_quoted_text_escaped_dollars_and_quoted_reads_alone(cmd, tmp_path):
+    from ttp import glmguard
+    wt, rd = _gg_run(tmp_path)
+    assert glmguard.shell_refusal(cmd, str(wt), str(rd), {"TTP_PROJECT": str(tmp_path / "proj"), **_GG_RUN_ENV}) is None, cmd
+
+
+def test_glm_guard_device_task_is_a_device_lock_or_a_machine_tagged_device(monkeypatch):
+    from ttp import glmguard, machines
+    monkeypatch.setattr(machines, "load", lambda: {"box-a": {"tags": ["device"]}, "cpu-1": {"tags": ["cpu", "x86"]}})
+    cfg = {"device": {"locks": ["chip"]}}
+    lab = lambda *names: {"labels": json.dumps(list(names))}  # noqa: E731
+    for task in (lab("resource:box-a"), lab("exclusive:box-a"), lab("read:box-a"), lab("resource:x-device"),
+                 {"resources": ["box-a"]}, {"resources": '["cpu-1", "box-a"]'}, {"labels": '["needs_device"]'}):
+        assert glmguard.device_task(task, cfg), task
+    assert glmguard.device_task(lab("resource:chip"), cfg) and not glmguard.device_task(lab("resource:chip"))
+    for task in (lab("resource:cpu-1"), lab("resource:build-cache"), {"resources": '["cpu-1"]'}, {"resources": []},
+                 {"labels": "[]"}, {}, None):
+        assert not glmguard.device_task(task, cfg), task
+
+    def broken():
+        raise ValueError("unreadable")
+    monkeypatch.setattr(machines, "load", broken)   # an unreadable list keeps the stricter device guard
+    assert glmguard.device_task(lab("resource:cpu-1"), cfg) and not glmguard.device_task(lab(), cfg)
 
 
 @_pytest.mark.parametrize("write", ["ttp machines change add x y", "ttp machines set x", "ttp note --to p hi", "ttp task add t s"])
@@ -1283,7 +1317,7 @@ def test_every_route_to_the_chat_model_starts_under_the_outward_guard(name):
     assert glmguard.run_env(route.TO, None) == {glmguard.RUN_ENV: "1"}   # a bench launched as a task
     assert glmguard.run_env("claude", None) == {} and glmguard.run_env("claude", {route.KEY: {"to": "claude"}}) == {}
     src = inspect.getsource(daemon)
-    assert "glmguard.run_env(provider, note, glmguard.device_task(task))" in src and "**glm_env," in src
+    assert "glmguard.run_env(provider, note, glmguard.device_task(task, self.cfg))" in src and "**glm_env," in src
     assert "relay_glm_drafts(self.p, task, run_dir)" in src
 
 

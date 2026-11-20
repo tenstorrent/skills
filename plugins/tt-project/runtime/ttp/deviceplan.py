@@ -105,7 +105,7 @@ def device(task: dict | None, cfg: dict) -> bool:
     """Device work, as glmwork.keeps_core reads it: its resources or its spec name a device or machine."""
     from . import glmguard, tierfloor
     t = task or {}
-    return glmguard.device_task(t) or tierfloor.device_run(t, cfg) or \
+    return glmguard.device_task(t, cfg) or tierfloor.device_run(t, cfg) or \
         bool(tierfloor.DEVICE_SPEC.search(f"{t.get('title') or ''}\n{t.get('spec') or ''}"))
 
 
