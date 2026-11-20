@@ -217,6 +217,61 @@ def test_missed_update_counts_a_codex_or_cursor_run_whose_hook_ran_as_hooked(env
     assert d._missed_update(cl, task, cl_dir)["text"].endswith("new order"), "Claude changed"
 
 
+def _drift_note_setup(env, tmp_path, update):
+    """A code task whose run ends done while `update` sits unread in its steer.md, and the task's
+    spec moved on after the run started (so the run's spec_sha is stale): the state a finish with an
+    unread update is judged on."""
+    from ttp.daemon import Daemon
+    from ttp.prompts import spec_digest
+    from ttp.providers.base import RunUsage as Usage
+    from ttp import worktree
+    p = make(env)
+    d = Daemon(p.base)
+    tid = p.db.add_task("land the fix", "Land the fix.", kind="code", tier="standard", origin="coordinator")
+    p.db.update_task(tid, status="running")
+    path, branch = worktree.ensure(p, p.db.task(tid))   # the change its review reads
+    (path / "fix.py").write_text("fixed\n")
+    _git_out(path, "add", ".")
+    _git_out(path, *_IDENT, "commit", "-qm", "the fix")
+    p.db.update_task(tid, branch=branch)
+    started = spec_digest(p.db.task(tid))
+    p.db.update_task(tid, spec="Land the fix. Cover the edge case too.")
+    run_dir = tmp_path / f"drift-finish-{tid}"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps({"status": "done", "summary": "landed"}))
+    (run_dir / "steer.md").write_text(update)
+    d._finish_worker({"task": tid, "note": json.dumps({"spec_sha": started})}, Usage(cost_usd=1.0),
+                     "ok", run_dir)
+    return p, tid
+
+
+def test_a_done_run_whose_only_unread_update_is_a_drift_note_is_accepted(env, tmp_path):
+    """A drift note is the harness's own model-free health check, never an instruction from the
+    coordinator or the user: a run that ends done with one unread is accepted as if nothing was
+    unread, not requeued to redo finished work."""
+    update = ("\n## Update Thu 12:45 PST (turn drift-7-quiet)\nDrift check (harness, model-free), "
+              "quiet: no tool call, note or commit for 16 min. Fix the cause, or say with `ttp note` "
+              "why this is right.\n")
+    p, tid = _drift_note_setup(env, tmp_path, update)
+    t = p.db.task(tid)
+    assert t["status"] == "done", (t["status"], "the drift note must not send the finished run back")
+    assert p.db.one("SELECT id FROM tasks WHERE kind='review' AND labels LIKE ?", (f"%auto_review:{tid}%",)), \
+        "its review is queued"
+
+
+def test_a_done_run_with_an_unread_real_spec_update_is_sent_back(env, tmp_path):
+    """A real unread update still sends the run back, alone or beside a drift note: only a stretch
+    that is nothing but drift notes is accepted."""
+    updates = ("\n## Update Thu 12:45 PST\nAdd the leak scan to the checks before you hand off.\n",
+               "\n## Update Thu 12:45 PST (turn drift-9-quiet)\nDrift check (harness, model-free), quiet: "
+               "no tool call, note or commit for 16 min.\n"
+               "\n## Update Thu 12:46 PST\nAdd the leak scan to the checks before you hand off.\n")
+    for update in updates:
+        p, tid = _drift_note_setup(env, tmp_path, update)
+        t = p.db.task(tid)
+        assert t["status"] == "queued" and "reached your last run" in str(t["result"]), (update[:40], t["result"])
+
+
 def test_runwatch_keeps_the_last_call_when_a_result_arrives_for_a_call_it_never_saw(env, tmp_path):
     from ttp import runwatch
     p = make(env)

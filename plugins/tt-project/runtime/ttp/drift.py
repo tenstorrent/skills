@@ -11,7 +11,8 @@ Flags, each with its threshold under coordinator.drift.<name> (0 turns that flag
   outside the paths the task spec names and their folders, only for a worker on an EDIT_KINDS task whose
   spec names some; tests, changesets and docs never count;
 - quiet_s (900): no tool call or result, note or commit for this long while no `ttp lock`, `ttp checks`
-  or detach wait is pending (the runner's stall_s still ends a stalled run later);
+  or detach wait is pending, and the run's own detached checks are neither queued nor running (they
+  count as activity: the run is waiting on them) (the runner's stall_s still ends a stalled run later);
 - pace (1.5): past PACE_FLOOR of the budget, the run's share of the task budget is over this times the
   share of its wall limit used; or over PACE_NO_COMMIT of the budget is spent with no commit.
 
@@ -46,7 +47,22 @@ EDIT_KINDS = ("code", "harness")   # task kinds whose worker changes files: only
 # a pending call that waits on purpose: a lock, the checks, a detached job or another queue
 WAIT_RE = re.compile(r"\bttp\s+(?:lock|checks|detach|devq|pool-wait|push|land|ci|ack-wait|host-run)\b")
 _PATH_RE = re.compile(r"(?<![\w/:.-])(?:[\w.-]+/)+[\w.-]*|(?<![\w/.-])[\w-]+\.(?:py|md|js|ts|json|sh|toml|ya?ml|txt|cfg)\b")
+_DRIFT_TURN_RE = re.compile(r"\(turn drift-[0-9]+-[A-Za-z0-9_]+\)\s*$")   # a steer.md header of our own note
 _FREE_RE = re.compile(r"(?:^|/)(?:tests?|docs?|\.changeset)/|(?:^|/)(?:test_[^/]*|[^/]*_test\.py|README[^/]*|CHANGELOG[^/]*)$")
+
+
+def notes_only(text: str) -> bool:
+    """Whether an unread steer.md stretch holds only the harness's own drift-check notes (each
+    headed `## Update ... (turn drift-<run>-<flag>)`): no update from the coordinator or the user."""
+    seen = False
+    for line in (text or "").splitlines():
+        if line.startswith("## Update "):
+            seen = True
+            if not _DRIFT_TURN_RE.search(line):
+                return False
+        elif not seen and line.strip():
+            return False   # a block whose header was read before the stretch: not ours to judge
+    return True
 
 
 def settings(cfg: dict) -> dict:
@@ -92,8 +108,10 @@ def outside(files: list[str], named: list[str]) -> list[str]:
     return out
 
 
-def detect(e: dict, s: dict, named: list[str], waiting: bool, now: float) -> dict[str, str]:
-    """{flag: evidence} for runwatch entry `e` under settings `s`; `waiting`: a lock wait is open."""
+def detect(e: dict, s: dict, named: list[str], waiting: bool, now: float,
+          checks_live: bool = False) -> dict[str, str]:
+    """{flag: evidence} for runwatch entry `e` under settings `s`; `waiting`: a lock wait is open;
+    `checks_live`: the run's own detached checks are queued or running, so it is not idle."""
     flags: dict[str, str] = {}
     streak = e.get("fail_streak") or {}   # failures since each command's last success
     if s["repeat_fail"] > 0 and streak:
@@ -116,7 +134,7 @@ def detect(e: dict, s: dict, named: list[str], waiting: bool, now: float) -> dic
             flags["outside_spec"] = f"{len(out)} changed files outside the spec's paths: {', '.join(out[:5])}"
     last = e.get("last_tool") or {}
     pending_wait = bool(last and not last.get("done") and WAIT_RE.search(last.get("input_head") or ""))
-    if s["quiet_s"] > 0 and not waiting and not pending_wait:
+    if s["quiet_s"] > 0 and not waiting and not pending_wait and not checks_live:
         idle = now - max(float(e.get("active_at") or 0), float((e.get("drift") or {}).get("head_at") or 0),
                          float(e.get("started") or now))
         if idle >= s["quiet_s"]:
@@ -160,6 +178,7 @@ def _event(db, e: dict, flag: str, evidence: str, step: int, now: float) -> int 
 
 def check(p, cfg: dict, data: dict, now: float) -> list[int]:
     """Flag each run in runwatch `data` (in place) and take each flag one ladder step; the new event ids."""
+    from . import checksgone
     from .coordinator import _append_update
     from .hook import STEER_FILE
     from .locks import wait_spans
@@ -190,7 +209,8 @@ def check(p, cfg: dict, data: dict, now: float) -> list[int]:
         run_dir = Path(dirs.get(e["run"]) or Path(p.runs) / str(e["run"]))
         waiting = any(end is None for _, end in wait_spans(run_dir))
         named = specs.get(e.get("task")) or [] if e.get("role") == "worker" else []
-        flags = detect(e, s, named, waiting, now)
+        checks_live = checksgone.state(run_dir) in ("queued", "running")
+        flags = detect(e, s, named, waiting, now, checks_live)
         e["flags"] = flags
         fired = st.setdefault("fired", {})
         for flag in FLAGS:

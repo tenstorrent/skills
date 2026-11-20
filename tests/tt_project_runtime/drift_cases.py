@@ -120,6 +120,25 @@ def test_drift_quiet_fires_after_quiet_s_unless_a_lock_checks_or_detach_wait_is_
     assert "quiet" in _dr_flags(e, now), "a wait that already ended does not count"
 
 
+def test_drift_quiet_never_fires_while_the_runs_own_detached_checks_run(env, tmp_path):
+    """A worker whose only activity is waiting on its own detached `ttp checks` (its checks process
+    alive in its run dir) is not quiet: the quiet clock restarts once the checks end."""
+    from ttp import runner
+    p, run_dir, t, rid = _dr_project(env, tmp_path)
+    (run_dir / "output.jsonl").write_text(
+        _rw_claude_call("a", "Bash", command="ttp checks --detach -- 'pytest -q tests/a.py'")
+        + _rw_claude_result("a"))
+    (run_dir / "checks.pid").write_text(json.dumps({"pid": os.getpid(), "started": runner.proc_start(os.getpid())}))
+    now = time.time()
+    _dr_tick(p, now)
+    for later in (900, 1800):
+        data, _ = _dr_tick(p, now + later)
+        assert "quiet" not in data["runs"][str(rid)]["flags"], f"its checks still run at +{later}s"
+    (run_dir / "checks.rc").write_text("0\n")
+    data, _ = _dr_tick(p, now + 2400)
+    assert "quiet" in data["runs"][str(rid)]["flags"], "once the checks end, the quiet clock counts"
+
+
 def test_drift_pace_fires_on_spend_ahead_of_wall_or_most_of_the_budget_with_no_commit():
     now = time.time()
     spend = lambda run, task: {"run_usd": run * 8, "task_usd": task * 8, "budget_usd": 8.0, "share": task}  # noqa: E731

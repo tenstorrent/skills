@@ -17796,7 +17796,8 @@ class Daemon:
     def _missed_update(self, r: dict, task: dict, run_dir: Path) -> dict | None:
         """{"started": spec digest the run started on, "text": its unread updates} when the task's spec
         changed after the run started and the steer.md update carrying the change was not read before
-        the run ended; else None. A worker with the update hook (provider steer_hook, or the run's
+        the run ended; else None. A stretch of the harness's own drift notes carries no instruction, so
+        it is not a missed update. A worker with the update hook (provider steer_hook, or the run's
         HOOKED_FILE: Codex and Cursor workers may run it) has read up to its steer.offset; one without gets it from `ttp note` or `ttp steer` (which advance
         that offset too) or reads steer.md itself, so only an update newer than its
         result.json is surely unread. A model-free on_pass is checked in _probe_passed instead."""
@@ -17806,8 +17807,8 @@ class Daemon:
         if not isinstance(started, str) or started == spec_digest(task):
             return None
         text = unread_update(run_dir)[0]
-        if not text:
-            return None
+        if not text or drift.notes_only(text):
+            return None   # a stretch the harness itself wrote (drift notes) carries no instruction
         try:
             hooked = run_hooked(run_dir) or bool(getattr(get_provider(r["provider"]), "steer_hook", False))
         except Exception:
