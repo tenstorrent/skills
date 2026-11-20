@@ -45,7 +45,7 @@ def record():
                          'batched_equals_alone': True},
             'precision': 'tt/selected_precision_config.json',
             'perf_ledger': [{'change': 'all cores for decode matmuls', 'before': 30.0, 'after': 12.0, 'tier': 'T1 pass'}],
-            'tiers': {t: {'command': f'pytest -m {t}'} for t in ('T0', 'T1', 'T2')}}
+            'tiers': {t: {'command': f'pytest -m {t}'} for t in ('T0', 'T1', 'T2')}, 'moe': None, 'ops': []}
 
 
 def run(tmp_path, data, inputs=None):
@@ -90,3 +90,24 @@ def test_far_from_target_needs_a_reason(tmp_path):
     assert code == 1 and 'over 2x its target' in stderr
     data['reasons'] = {'decode_ms_b1': 'host n-gram lookup per step, measured 9 ms'}
     assert run(tmp_path, data) == (0, '')
+
+
+def test_new_ops_need_a_test_and_a_switch(tmp_path):
+    data = record()
+    data['ops'] = [{'name': 'fused_moe_decode', 'kind': 'fusion', 'test': 'tests/test_fused_moe.py'}]
+    code, stderr = run(tmp_path, data)
+    assert code == 2 and 'switch' in stderr
+    data['ops'][0]['switch'] = 'FUSED_MOE=0'
+    assert run(tmp_path, data) == (0, '')
+
+
+def test_moe_needs_per_batch_numbers(tmp_path):
+    data = record()
+    data['moe'] = {'experts': 128, 'top_k': 8, 'layout': 'expert-parallel, 32 per die'}
+    code, stderr = run(tmp_path, data)
+    assert code == 2 and 'moe.per_batch.b1' in stderr and 'moe.per_batch.b32' in stderr
+    data['moe']['per_batch'] = {f'b{b}': {'distinct_experts': e, 'decode_ms': 9.0, 'floor_ms': 4.0}
+                                for b, e in ((1, 8), (32, 110))}
+    assert run(tmp_path, data) == (0, '')
+    del data['moe']
+    assert run(tmp_path, data)[0] == 1

@@ -2,7 +2,8 @@
 """Check the lean model goal's record, doc/model/model.json (see the lean-model skill).
 
 Critical (exit 2): the record is missing, a batch in batch_sizes has no measured decode, batched does not equal
-alone, or there is no perf ledger. Advisory (exit 1): a measured decode more than 2x its target without a reason,
+alone, there is no perf ledger, a new or changed op has no test or switch back, or a mixture-of-experts record
+lacks its per-batch numbers. Advisory (exit 1): a measured decode more than 2x its target without a reason,
 a missing floor, tier command or budget. Exit 0 pass, 1 advisory, 2 critical, 3 error.
 """
 from __future__ import annotations
@@ -17,6 +18,7 @@ RECORD = Path("doc/model/model.json")
 INPUTS = Path("bringup/agentic_evals/inputs.json")
 MODES = ("port", "fresh", "speedup", "quick")
 TIERS = ("T0", "T1", "T2")
+OP_KINDS = ("fusion", "op_change", "new_op")
 DEFAULT_BATCHES = (1, 8, 16, 32)
 
 
@@ -50,6 +52,21 @@ def check(record: dict, batches, problems: list) -> None:
     for tier in TIERS:
         if not (isinstance(tiers.get(tier), dict) and tiers[tier].get("command")):
             problems.append((1, f"tier {tier} needs a command"))
+    for op in record.get("ops") or []:
+        if not (isinstance(op, dict) and op.get("name") and op.get("kind") in OP_KINDS and op.get("test")
+                and op.get("switch")):
+            problems.append((2, f"ops row {op!r} needs name, kind ({', '.join(OP_KINDS)}), test and switch"))
+    if "moe" not in record:
+        problems.append((1, "moe is missing; record the MoE numbers, or null for a dense model"))
+    elif record["moe"] is not None:
+        moe, largest = record["moe"] if isinstance(record["moe"], dict) else {}, max(batches)
+        for key in ("experts", "top_k", "layout"):
+            if not moe.get(key):
+                problems.append((2, f"moe.{key} is missing"))
+        for batch in sorted({1, largest}):
+            row = (moe.get("per_batch") or {}).get(f"b{batch}") or {}
+            if not (number(row.get("distinct_experts")) and number(row.get("decode_ms")) and number(row.get("floor_ms"))):
+                problems.append((2, f"moe.per_batch.b{batch} needs distinct_experts, decode_ms and floor_ms"))
     if not record.get("precision"):
         problems.append((2, "precision (the served config, chosen on the reference tiers) is missing"))
 

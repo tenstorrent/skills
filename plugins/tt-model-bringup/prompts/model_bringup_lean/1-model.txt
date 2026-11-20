@@ -10,6 +10,7 @@ Goal completion requirements:
 - The $reference-accuracy suite exists with verdict match at full precision; the served precision is chosen on its tiers and is the recorded baseline.
 - Batched equals alone at the largest batch; short greedy prompts are coherent (no repetition, collapse or drift).
 - The KV pool is the largest that fits, tested at the largest batch growing to the working set; doc/agentic_serving.json records workload and ledger.
+- New or changed ops each have a unit test at model shapes and a switch back. A mixture-of-experts model records experts touched and decode against its floor at batch 1 and the largest batch.
 - doc/model/model.json records mode, targets, floors, measured decode ms/step and TTFT per batch, precision, pool, tier commands and the perf ledger; REPORT.md leads with measured against target.
 - $stage-review returns `clean-pass` once, at the end. Local commits on one branch, never push, tag the result bringup/<model>/model; log SHAs.
 
