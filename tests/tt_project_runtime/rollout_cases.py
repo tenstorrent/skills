@@ -818,6 +818,7 @@ def test_a_worse_project_is_rolled_back_alone_and_the_terminal_rearms_it(env, ca
     assert [(r["op"], r["project"]) for r in recs] == [("project_rollback", "alpha")], "no advance in a tick that rolled back"
     assert not rollout.on("glm_work", "alpha") and rollout.on("glm_work", "beta") and rollout.level("glm_work") == "auto"
     assert rollout.rolled_back("glm_work")["alpha"]["why"] == "alpha worse"
+    assert "glm_pct" not in recs[0], "a verdict without the comparison writes none"
     assert "rolled back in alpha alone" in _roll(capsys, "status")[1]
     recs = rollout.wave_tick(now + 3600, _judge(states), projs)
     assert [r["op"] for r in recs] == ["advance"], "a rolled-back project no longer holds its wave"
@@ -825,6 +826,19 @@ def test_a_worse_project_is_rolled_back_alone_and_the_terminal_rearms_it(env, ca
     assert rollout.on("glm_work", "alpha") and rollout.ledger("glm_work")[-1]["op"] == "project_arm"
     assert "not rolled back" in _roll(capsys, "arm", "glm_work", "alpha")[1]
     assert rollout.frozen("glm_work") is None
+
+
+def test_a_rollback_record_carries_both_pass_rates_and_the_baseline_window(env, capsys, tmp_path):
+    from ttp import rollout
+    _roll(capsys, "waves", "glm_work", "alpha")
+    _roll(capsys, "set", "glm_work", "auto")
+    projs, now = _wave_projects(tmp_path, "alpha"), time.time()
+    v = {"state": "worse", "why": "worse; " + "x" * 400, "n": 25, "glm_pct": 40.0, "base_pct": 60.0,
+         "base_window": [now - 86400, now]}
+    rollout.wave_tick(now, lambda p, cfg, at: v, projs)
+    last = rollout.ledger("glm_work")[-1]
+    assert last["op"] == "project_rollback" and len(last["why"]) == 300, "the reason is cut, the numbers are not"
+    assert (last["glm_pct"], last["base_pct"], last["base_window"]) == (40.0, 60.0, [now - 86400, now])
 
 
 def test_each_wave_move_or_rollback_raises_one_event_in_the_project_it_concerns(env, capsys, tmp_path):

@@ -5209,7 +5209,12 @@ flag; an excluded project never, and a project's own setting still wins. The sta
 the rings (`rollout.waves`, `rollout.wave_at`, `rollout.project_rollback`), as user-only as they are: a run may
 not set them, and the waves and the level change only from the terminal. The gate runs from the daemons without
 a model, at most once an hour per flag across the account: it judges each project of the covered waves against
-its own Claude baseline: `ok`, `worse` or `wait`. Below the minimum sample (`route.glm_work.min_tasks` GLM tasks,
+its own Claude baseline: `ok`, `worse` or `wait`. The baseline comes from the same period as the GLM outcomes
+it judges: Claude tasks whose outcome (the first auto review, else the end of the task) fell after the GLM window
+opened (its first arm record or last re-arm), reaching back only as far as it takes to hold `min_window` reviewed
+outcomes (default 20), so a review rule that got stricter partway through weighs on both arms alike. The verdict
+and its `project_rollback` ledger line carry both first review pass rates (`glm_pct`, `base_pct`) and the
+baseline window (`base_window`). Below the minimum sample (`route.glm_work.min_tasks` GLM tasks,
 default 25, and `min_base` baseline tasks with an outcome, default 10; the review signals need that many
 reviewed tasks in each arm) the verdict is `wait` with "not enough data". A device incident on a GLM run is
 `worse` at once. Four signals gate both ways, each with a tight advance margin and a wider rollback margin, so

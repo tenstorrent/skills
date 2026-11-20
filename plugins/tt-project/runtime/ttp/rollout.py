@@ -387,6 +387,11 @@ def _wave_state() -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _rates(v: dict) -> dict:
+    """The verdict's comparison for its ledger line: both first review pass rates and the baseline window."""
+    return {k: v[k] for k in ("glm_pct", "base_pct", "base_window") if k in v}
+
+
 def wave_tick(now: float | None = None, judge=None, projects: dict | None = None, by: str = "daemon") -> list[dict]:
     """The wave gate, model-free: for each flag at auto not judged in the last hour, judge each project of its
     covered waves (`judge(p, cfg, now)`: glmshare.judge, ok | worse | wait). A worse one is rolled back for that
@@ -438,7 +443,7 @@ def wave_tick(now: float | None = None, judge=None, projects: dict | None = None
                     why = str(v.get("why") or "worse than its own baseline")[:300]
                     back[name] = {"ts": round(now, 3), "why": why}
                     worse.append(name)
-                    out.append(_op("project_rollback", flag, why, by, project=name, n=v.get("n")))
+                    out.append(_op("project_rollback", flag, why, by, project=name, n=v.get("n"), **_rates(v)))
             if worse:
                 _put("project_rollback", flag, back)
             left = [n for n in ws[k] if n not in excl and n not in back]

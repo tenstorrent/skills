@@ -25,8 +25,13 @@ on the arm's GLM runs (deviceab.incident_event) and tasks done per day. Beside t
 claude spend) and user corrections (correction.py's kv, kept 7 days): a correction names no task, so it is a
 project count, not per arm.
 
-Wave gate (judge): the project's GLM arm (kv glm_work_arm arm glm) against its own Claude baseline: its holdout
-tasks plus the tasks whose first worker run started in the BASE_DAYS before its first arm record, off GLM. It
+Wave gate (judge): the project's GLM arm (kv glm_work_arm arm glm, armed since its last re-arm) against its own
+Claude baseline from the same period: its holdout tasks and the tasks off GLM whose first worker run started since
+BASE_DAYS before its first arm record, counted only when their outcome (the first auto review's queue time, else
+the end of their last run) falls in the GLM window being judged; with fewer than `min_window` (BASE_WINDOW_MIN)
+reviewed ones there, the window reaches back only to the newest `min_window` reviewed outcomes. A review rule
+that got stricter partway through then weighs on both arms alike. The verdict carries both first review pass
+rates ("glm_pct", "base_pct") and the baseline window ("base_window": [from, to]). It
 answers "worse" (roll the project back), "ok" (it may advance) or "wait" (hold the wave where it is). Every
 setting is under `route.glm_work` (settings()); a signal is "worse by" the gap in the direction that hurts.
 - Any device incident on a GLM run: "worse" at once, whatever the sample (a safety stop, not a statistic).
@@ -68,6 +73,7 @@ KINDS = ("plan", "review", "code", "work", "question", "harness")
 ARM_KV = "glm_work_arm:"          # kv glm_work_arm:<task id>: {"arm": "glm" | "holdout", "why", "ts"}
 CODE_ARM_KV = "code_arm:"         # codearm.ARM_KV
 MIN_TASKS, BASE_DAYS, BASE_MIN = 25, 14, 10
+BASE_WINDOW_MIN = 20   # reviewed Claude outcomes the same-period baseline holds before it reaches back further
 ADVANCE_PTS, ROLLBACK_PTS = 5.0, 15.0
 ADVANCE_ROUNDS, ROLLBACK_ROUNDS = 0.25, 0.5
 ADVANCE_BOUNCE_PTS, ROLLBACK_BOUNCE_PTS = 10.0, 25.0
@@ -153,15 +159,16 @@ def arm_of(tid: int, runs: list[dict], work: dict, code: dict) -> str:
 
 
 def _reviews(db, since: float) -> dict[int, dict]:
-    """{task id: {"first": done | failed | None, "open": bool}} from its auto reviews created since `since`."""
+    """{task id: {"first": done | failed | None, "at": the first deciding review's created time, "open": bool}}
+    from its auto reviews created since `since`."""
     out: dict[int, dict] = {}
-    for r in db.q("SELECT id, status, labels FROM tasks WHERE kind='review' AND labels LIKE '%\"auto_review:%' "
+    for r in db.q("SELECT id, status, labels, created FROM tasks WHERE kind='review' AND labels LIKE '%\"auto_review:%' "
                   "AND created>=? ORDER BY id", (since,)):
         for lb in task_labels(r):
             if lb.startswith("auto_review:") and lb[12:].isdigit():
-                v = out.setdefault(int(lb[12:]), {"first": None, "open": False})
+                v = out.setdefault(int(lb[12:]), {"first": None, "at": None, "open": False})
                 if r["status"] in ("done", "failed") and v["first"] is None:
-                    v["first"] = r["status"]
+                    v["first"], v["at"] = r["status"], float(r["created"] or 0)
                 v["open"] |= r["status"] not in ("done", "failed", "cancelled")
     return out
 
@@ -491,6 +498,7 @@ def settings(cfg: dict) -> dict:
     num = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0   # noqa: E731
     got = lambda k, d: type(d)(raw[k]) if num(raw.get(k)) else d   # noqa: E731
     return {"min_tasks": got("min_tasks", MIN_TASKS), "min_base": got("min_base", BASE_MIN),
+            "min_window": got("min_window", BASE_WINDOW_MIN),
             "advance_pts": got("advance_pts", ADVANCE_PTS),
             "rollback_pts": got("rollback_pts", got("worse_pts", ROLLBACK_PTS)),
             "advance_rounds": got("advance_rounds", ADVANCE_ROUNDS),
@@ -505,6 +513,34 @@ def _first_runs(db, lo: float, hi: float) -> set[int]:
     """Tasks whose first worker run started in [lo, hi)."""
     return {r["task"] for r in db.q("SELECT task, MIN(started) s FROM runs WHERE role='worker' AND task IS NOT NULL "
                                     "GROUP BY task HAVING s>=? AND s<?", (lo, hi))}
+
+
+def _outcome_at(t: dict | None, rv: dict, rs: list[dict]) -> float | None:
+    """When a task's outcome fell: its first auto review's created time, else (ended with no review open) the end
+    of its last worker run, else its last update; None while it has none."""
+    if rv.get("first"):
+        return rv.get("at")
+    if t and t["status"] in ("done", "failed") and not rv.get("open"):
+        ends = [float(r["ended"]) for r in rs if r["ended"]]
+        return max(ends) if ends else float(t.get("updated") or 0)
+    return None
+
+
+def base_window(cand, tasks: dict, runs: dict, reviews: dict, w0: float, floor: float, need: int) -> tuple:
+    """(baseline task ids, window start): the Claude candidates whose outcome fell from w0 on, the GLM window's
+    start; with fewer than `need` reviewed ones there, from the newest `need` reviewed outcomes' oldest (never
+    before `floor`)."""
+    at = {t: x for t in cand if (x := _outcome_at(tasks.get(t), reviews.get(t) or {}, runs.get(t) or [])) is not None}
+    rev = sorted((at[t] for t in at if (reviews.get(t) or {}).get("first")), reverse=True)
+    if need <= 0 or sum(x >= w0 for x in rev) >= need:
+        lo = w0
+    else:
+        lo = min(w0, max(floor, rev[need - 1]) if len(rev) >= need else floor)
+    return [t for t in cand if t in at and at[t] >= lo], lo
+
+
+def _utc(ts: float) -> str:
+    return datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
 def signals(g: dict, b: dict, before: dict, after: dict, corrections: int, st: dict) -> list[dict]:
@@ -560,10 +596,12 @@ def judge(p, cfg: dict, now: float) -> dict:
     glm = [t for t, r in recs.items() if r.get("arm") == "glm" and float(r.get("ts") or now) >= armed]
     dev_glm = [t for t in glm if device(t)]   # device runs are judged by glm_device's own judge: only incidents count here
     glm = [t for t in glm if t not in dev_glm]
-    base = [t for t, r in recs.items() if r.get("arm") == "holdout" and not device(t)] + [
-        t for t in work(pre) if t not in recs and runs.get(t) and not device(t)
+    cand = [t for t, r in recs.items() if r.get("arm") == "holdout" and not device(t)] + [
+        t for t in work(pre | post) if t not in recs and runs.get(t) and not device(t)
         and not on_glm(runs[t][0]["provider"], runs[t][0]["model"], runs[t][0]["note"])]
     ctx = (_reviews(db, since), _fix_rounds(db, since), _requeued(db, since))
+    w0 = max(t0, armed)   # the GLM window being judged: the baseline is Claude's outcomes from the same period
+    base, lo = base_window(cand, tasks, runs, ctx[0], w0, since, st["min_window"])
     days = max((now - t0) / 86400, 1e-9)
     g = quality(db, cfg, glm, tasks, runs, *ctx, days, now)
     g["incidents"] += _incidents(db, cfg, [r for t in dev_glm for r in runs.get(t, [])
@@ -575,8 +613,13 @@ def judge(p, cfg: dict, now: float) -> dict:
                if isinstance(c, dict) and now - CORR_DAYS * 86400 <= float(c.get("ts") or 0) < now)
     sig = signals(g, b, before, after, corr, st)
     n = g["decided"]
-    nums = (f"GLM {n} tasks with an outcome, Claude baseline {b['decided']}; " + "; ".join(_says(s) for s in sig))
-    out = lambda state, why: {"state": state, "why": f"{why}; {nums}", "n": n, "signals": sig}   # noqa: E731
+    fmt = lambda v: "-" if v is None else f"{v:g}"   # noqa: E731
+    nums = (f"GLM {n} tasks with an outcome, first review pass {fmt(g['first_pass_pct'])}%; Claude baseline "
+            f"{b['decided']} with an outcome since {_utc(lo)}, first review pass {fmt(b['first_pass_pct'])}%; "
+            + "; ".join(_says(s) for s in sig))
+    out = lambda state, why: {"state": state, "why": f"{why}; {nums}", "n": n, "signals": sig,   # noqa: E731
+                              "glm_pct": g["first_pass_pct"], "base_pct": b["first_pass_pct"],
+                              "base_window": [round(lo, 3), round(now, 3)]}
     if g["incidents"]:
         return out("worse", f"{g['incidents']} device incident(s) on GLM runs")
     if n < st["min_tasks"] or b["decided"] < st["min_base"]:

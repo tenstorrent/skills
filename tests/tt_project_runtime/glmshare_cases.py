@@ -112,7 +112,7 @@ def test_glm_share_judge_waits_for_enough_glm_tasks_then_compares_with_the_proje
     _gs_decided(p, t0 + 7200, 1, arm="glm")
     v = glmshare.judge(p, cfg, now)
     assert (v["state"], v["n"]) == ("ok", 3), v
-    assert "GLM 3 tasks with an outcome, Claude baseline 6" in v["why"]
+    assert "GLM 3 tasks with an outcome, first review pass 100%; Claude baseline 6 with an outcome" in v["why"]
     # Any device incident on a GLM run (on a device it changed): worse.
     p.db.update_task(g1, labels=["resource:box-a-device"])
     p.db.x("INSERT INTO events(ts,source,kind,text,task) VALUES(?,?,?,?,?)",
@@ -317,3 +317,62 @@ def test_glm_share_held_groups_claude_runs_by_the_rule_that_kept_them_and_marks_
     s = glmshare.report(p, now - 86400, now)
     assert s["held"] == got
     assert "held off GLM by rule" in glmshare.text(s) and "policy files" in glmshare.text(s)
+
+
+def _gs_outcome(p, start, passed, reviewed_at, provider="chat", arm=None, ts=None):
+    """A decided task whose first auto review was queued at `reviewed_at`."""
+    tid = _gs_decided(p, start, passed, provider=provider, arm=arm, ts=ts)
+    p.db.x("UPDATE tasks SET created=? WHERE kind='review' AND labels LIKE ?", (reviewed_at, f'%"auto_review:{tid}"%'))
+    return tid
+
+
+_GS_SAME = {"route": {"glm_work": {"min_tasks": 20, "min_base": 10, "min_window": 20}}}
+
+
+def _gs_period(p, t0, claude_after, glm_passed, claude_before=(1,) * 16 + (0,) * 4):
+    """Claude reviewed before t0 (`claude_before`) and after it (`claude_after`), GLM armed at t0 and reviewed after."""
+    for i, ok in enumerate(claude_before):
+        _gs_outcome(p, t0 - 3 * 86400, ok, t0 - (i + 1) * 3600, provider="claude")
+    for i, ok in enumerate(claude_after):
+        _gs_outcome(p, t0 + 3600, ok, t0 + 86400 + i * 600, provider="claude")
+    for i, ok in enumerate(glm_passed):
+        _gs_outcome(p, t0 + 3600, ok, t0 + 86400 + i * 600, arm="glm", ts=t0)
+
+
+def test_glm_share_judge_compares_glm_with_claude_reviewed_in_the_same_period_not_before_a_stricter_review(env):
+    from ttp import glmshare
+    p = make(env)
+    now = 1_000_000_000.0 + 60 * 86400
+    t0 = now - 5 * 86400
+    # Claude passed 80% before t0 and 60% after; GLM 55% after: no worse than Claude in its own period.
+    _gs_period(p, t0, (1,) * 12 + (0,) * 8, (1,) * 11 + (0,) * 9)
+    v = glmshare.judge(p, _GS_SAME, now)
+    assert v["state"] != "worse", v["why"]
+    assert (v["glm_pct"], v["base_pct"], v["base_window"]) == (55.0, 60.0, [t0, now])
+    assert "Claude baseline 20 with an outcome since" in v["why"]
+
+
+def test_glm_share_judge_rolls_back_glm_clearly_worse_than_claude_in_the_same_period(env):
+    from ttp import glmshare
+    p = make(env)
+    now = 1_000_000_000.0 + 60 * 86400
+    t0 = now - 5 * 86400
+    _gs_period(p, t0, (1,) * 12 + (0,) * 8, (1,) * 8 + (0,) * 12)
+    v = glmshare.judge(p, _GS_SAME, now)
+    assert v["state"] == "worse" and "first review pass rate GLM 40 vs Claude 60" in v["why"], v["why"]
+    assert (v["glm_pct"], v["base_pct"], v["base_window"][0]) == (40.0, 60.0, t0)
+
+
+def test_glm_share_judge_reaches_back_only_as_far_as_the_minimum_reviewed_claude_outcomes(env):
+    from ttp import glmshare
+    p = make(env)
+    now = 1_000_000_000.0 + 60 * 86400
+    t0 = now - 5 * 86400
+    # 5 Claude outcomes after t0; the 20 before it were reviewed one an hour back from t0: the newest 15 fill the window.
+    _gs_period(p, t0, (1, 1, 1, 0, 0), (1,) * 20)
+    v = glmshare.judge(p, _GS_SAME, now)
+    assert v["base_window"] == [t0 - 15 * 3600, now]
+    assert "Claude baseline 20 with an outcome" in v["why"] and v["base_pct"] == 90.0   # 3 of 5 + 15 of 15
+    # Fewer than the minimum in all: the whole lookback, never further.
+    v = glmshare.judge(p, {"route": {"glm_work": dict(_GS_SAME["route"]["glm_work"], min_window=40)}}, now)
+    assert v["base_window"][0] == t0 - glmshare.BASE_DAYS * 86400 and "Claude baseline 25 with an outcome" in v["why"]
