@@ -613,11 +613,10 @@ def _changed_paths(root, base: str, head: str) -> list[str] | None:
 def delta(root, base: str, head: str, cfg: dict | None = None, cache: str | None = None,
           budget_s: float | None = None) -> dict:
     """What the change base..head adds: per-subsystem differences of the counted numbers (changed ones
-    only), the duplicate groups new at head and the incident-style comment lines new at head. The counted
-    numbers come from the changed files alone (an unchanged file adds the same to both sides), so a
-    small diff in a large repository needs no whole-tree read for them; the duplicate groups need both
-    whole trees, which is read only while the budget lasts: a large repo with a cold cache then keeps
-    the change's own duplicates and says the check is partial rather than reading for minutes."""
+    only), the duplicate groups new at head and the incident-style comment lines new at head.
+    The counted numbers come from the changed files alone, since an unchanged file adds the same to both
+    sides. The duplicate groups need both whole trees, read only while the budget lasts: past it the
+    change's own duplicates are kept and the result says the check is partial."""
     c = {**DEFAULTS, **(cfg or {})}
     maxl, ex = int(c["max_function_lines"]), list(c["exclude"] or [])
     budget = float(budget_s if budget_s is not None else c["budget_s"])
