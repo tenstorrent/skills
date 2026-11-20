@@ -610,8 +610,10 @@ def judge(p, cfg: dict, now: float) -> dict:
     sig = signals(g, b, before, after, corr, st)
     n = g["decided"]
     fmt = lambda v: "-" if v is None else f"{v:g}"   # noqa: E731
+    frm = datetime.datetime.fromtimestamp(lo, datetime.timezone.utc)
     nums = (f"GLM {n} tasks with an outcome, first review pass {fmt(g['first_pass_pct'])}%; Claude baseline "
-            f"{b['decided']} with an outcome since {datetime.datetime.fromtimestamp(lo, datetime.timezone.utc):%Y-%m-%d %H:%M} UTC, first review pass {fmt(b['first_pass_pct'])}%; "
+            f"{b['decided']} with an outcome since {frm:%Y-%m-%d %H:%M} UTC, first review pass "
+            f"{fmt(b['first_pass_pct'])}%; "
             + "; ".join(_says(s) for s in sig))
     out = lambda state, why: {"state": state, "why": f"{why}; {nums}", "n": n, "signals": sig,   # noqa: E731
                               "glm_pct": g["first_pass_pct"], "base_pct": b["first_pass_pct"],
