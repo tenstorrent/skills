@@ -422,15 +422,9 @@ def _judge(p: Project, job: dict, checks: list, run, owned: dict) -> dict:
             return {"outcome": "pre_existing" if pre else "undecided", "ids": ids, "cmd": str(cmd),
                     "why": "they fail before this landing too" if pre else
                     f"the rerun before this landing ({str(job.get('good'))[:10] or 'none'}) could not tell"}
-        ids = sorted(set(ids) - pre)
-        tip = _tip_of_target(Path(job["repo"]), job)
-        if tip and tip != sha:   # a test the target's tip passes was fixed since: nobody's to revert
-            at_tip = gatejudge.failed_of(*run(tip, cmd, ids), ids)
-            if at_tip is not None:
-                ids = [i for i in ids if i in at_tip]
-                if not ids:
-                    return {"outcome": "fixed", "ids": sorted(again), "cmd": str(cmd),
-                            "why": f"they pass at the current tip {tip[:10]}"}
+        ids = _failing_at_tip(job, run, cmd, sha, sorted(set(ids) - pre))
+        if not ids:   # the target's tip passes them: fixed since, nobody's to revert
+            return {"outcome": "fixed", "ids": sorted(again), "cmd": str(cmd), "why": "they pass at the current tip of the target"}
         try:
             blame = _blame(points, ids, lambda at, sel: gatejudge.failed_of(*run(at, cmd, sel), sel))
         except LookupError as ex:
@@ -458,14 +452,17 @@ def _judge(p: Project, job: dict, checks: list, run, owned: dict) -> dict:
     return {"outcome": "pass"} | ({"rerun": cut} if cut else {})
 
 
-def _tip_of_target(repo: Path, job: dict) -> str:
-    """The target's current tip, fetched ('' when it cannot be read)."""
-    from . import push
+def _failing_at_tip(job: dict, run, cmd, sha: str, ids: list[str]) -> list[str]:
+    """The `ids` that still fail at the target's current tip, fetched (all of them when the tip is `sha` or cannot be
+    read or judged)."""
+    from . import gatejudge, push
     remote, _, branch = str(job["target"]).partition("/")
     try:
-        return push._fetch(repo, remote, branch)
+        tip = push._fetch(Path(job["repo"]), remote, branch)
     except Exception:
-        return ""
+        return ids
+    got = gatejudge.failed_of(*run(tip, cmd, ids), ids) if tip and tip != sha else None
+    return ids if got is None else [i for i in ids if i in got]
 
 
 def _blame(points: list, ids: list[str], failed) -> dict[int, list[str]]:
