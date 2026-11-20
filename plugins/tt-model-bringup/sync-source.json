@@ -155,7 +155,7 @@
       "destination": "skills/functional-decoder/SKILL.md",
       "blob": "5ea84505c81347d6773fc8325c3115d31094e5d8",
       "source_sha256": "133caffc050d9bb0343a37509ce09a6b2a4e640294761e7226e52f8f82037b71",
-      "packaged_sha256": "0a9ffe80374dee6fa20de4439b8f9abd8b3502dc35f5d21f17193b786fcca54c"
+      "packaged_sha256": "55fc6b32cd9e0d3313dc69d4c627e0b8e0bc140d1f4884e373389b5225533dc0"
     },
     {
       "source": ".agents/skills/functional-decoder/agents/openai.yaml",
