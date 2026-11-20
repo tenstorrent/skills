@@ -1244,6 +1244,20 @@ def test_a_readers_probe_never_makes_a_dead_takers_slot_held_however_long_it_las
     assert seen == {"slot_taken": False, "_held": "free", "free_state": True, "state": []}, seen
 
 
+def test_an_ungated_probe_of_an_older_reader_never_makes_a_dead_takers_slot_held(env, monkeypatch, tmp_path):
+    """Daemons of an older release run beside this one until each upgrades, and they probe slot files
+    without the probe gate: slot_taken still retries a slot whose label names no live holder, so such a
+    probe's momentary lock does not make a dead taker its holder again."""
+    import fcntl
+    from ttp import locks
+    path = tmp_path / "slot-1.lock"
+    h = _taken_by_a_dead_process(path)
+    old = open(path)
+    fcntl.flock(old, fcntl.LOCK_EX | fcntl.LOCK_NB)    # an older reader's ungated probe, mid-flight
+    monkeypatch.setattr(locks.time, "sleep", lambda s: old.close())    # it lets go before the retry
+    assert locks.slot_taken(path) == (False, h)
+
+
 def test_each_probe_lets_go_of_the_slot_inside_the_probe_gate(env, monkeypatch, tmp_path):
     """A probe that let go of the gate before its own lock on the slot let another reader find the free
     slot taken by it, the race the gate is there to stop: each probe goes through its gate once and lets

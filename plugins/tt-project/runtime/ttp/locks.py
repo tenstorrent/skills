@@ -893,6 +893,8 @@ def read_label(path: Path) -> dict:
     return {}
 
 
+PROBE_TRIES = 4      # slot_taken's probes of a slot whose label names no live holder
+PROBE_GAP_S = 0.015  # between them: an ungated reader's probe holds a free slot for microseconds
 PROBE_GATE = ".probe.gate"   # in a lock file's folder: the momentary probes of its lock files take it
 
 
@@ -969,17 +971,27 @@ def _probe_taken(path: Path) -> bool | None:
 def slot_taken(path: Path) -> tuple[bool | None, dict | None]:
     """(taken, label) for slot file `path`: taken when its lock is held right now (None when it cannot be
     opened), with the label read once (None while not read; {} when it does not parse). A slot keeps its
-    last label after release, and every daemon on the host probes the same files under probe_gate, so a
-    lock seen taken is a real holder's: a dead taker's lock kept by a process it left counts."""
-    got = _probe_taken(path)
-    if not got:
-        return got, None
-    try:
-        return True, read_label(path)
-    except ValueError:
-        return True, {}
-    except OSError:
-        return None, None
+    last label after release. Readers of this release probe under probe_gate, so their probes never make
+    a free slot look taken; a reader of an older release probes ungated, so a failed probe on a slot whose
+    label names no live holder (holder_live) is retried PROBE_TRIES times: one free in any of them is
+    free. A lock that stays taken is held (a dead taker's lock kept by a process it left counts)."""
+    h = None
+    for i in range(PROBE_TRIES):
+        got = _probe_taken(path)
+        if not got:
+            return got, h
+        if h is None:
+            try:
+                h = read_label(path)
+            except ValueError:
+                h = {}
+            except OSError:
+                return None, None
+            if holder_live(h):
+                return True, h
+        if i < PROBE_TRIES - 1:
+            time.sleep(PROBE_GAP_S)
+    return True, h
 
 
 def _slot_labels(paths: list[Path]) -> list[str]:
