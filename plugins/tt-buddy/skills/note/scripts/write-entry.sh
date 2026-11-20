@@ -32,10 +32,11 @@ fi
 
 mkdir -p "$(dirname "$notes")"
 
-# mkdir is atomic on every POSIX filesystem, so it serializes writers without flock.
+# A noclobber redirect is an O_EXCL create done by bash itself, so it serializes writers
+# without flock. mkdir is not enough: some mkdir builds exit 0 when a racing writer made it.
 locked=0
 for _ in $(seq 1 300); do
-    if mkdir "$lock" 2>/dev/null; then
+    if (set -C; : > "$lock") 2>/dev/null; then
         locked=1
         break
     fi
@@ -45,7 +46,7 @@ if [ "$locked" -ne 1 ]; then
     echo "write-entry: $lock held for 30s; remove it if no writer is running" >&2
     exit 1
 fi
-trap 'rmdir "$lock"' EXIT
+trap 'rm -f "$lock"' EXIT
 
 mkdir -p "$notes"
 if ! git -C "$notes" rev-parse --git-dir >/dev/null 2>&1; then

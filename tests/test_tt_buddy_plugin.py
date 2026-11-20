@@ -6,7 +6,9 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import subprocess
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 
@@ -124,7 +126,7 @@ def test_writer_waits_for_a_held_lock(tmp_path):
     src, notes = _source_repo(tmp_path), tmp_path / "notes"
     _write(src, notes, "topic", "first")
     lock = tmp_path / "notes.lock"
-    lock.mkdir()
+    lock.touch()
     env = dict(os.environ, TT_BUDDY_NOTES=str(notes), GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
                GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
     writer = subprocess.Popen([str(WRITE_ENTRY), "topic", "second"], cwd=src, env=env,
@@ -137,6 +139,59 @@ def test_writer_waits_for_a_held_lock(tmp_path):
         pass
     assert writer.poll() is None, "writer did not wait for the held lock"
     assert _subjects(notes)[0] == "topic: first"
-    lock.rmdir()
+    lock.unlink()
     assert writer.wait(timeout=10) == 0
     assert _subjects(notes)[0] == "topic: second"
+
+
+def test_lock_does_not_trust_mkdir_exit_status(tmp_path):
+    # Some mkdir builds exit 0 when a racing process created the directory first.
+    src, notes = _source_repo(tmp_path), tmp_path / "notes"
+    _write(src, notes, "topic", "seed")
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    (shim / "mkdir").write_text(
+        "#!/bin/sh\n"
+        'for a in "$@"; do last=$a; done\n'
+        'case " $* " in *" -p "*) ;; *) [ -d "$last" ] && exit 0 ;; esac\n'
+        f'exec {shutil.which("mkdir")} "$@"\n')
+    (shim / "mkdir").chmod(0o755)
+    entered, release = tmp_path / "entered", tmp_path / "release"
+    hook = notes / ".git" / "hooks" / "pre-commit"
+    hook.write_text(f"#!/bin/sh\ntouch '{entered}'\ni=0\n"
+                    f"while [ ! -e '{release}' ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done\n")
+    hook.chmod(0o755)
+    env = dict(os.environ, TT_BUDDY_NOTES=str(notes), PATH=f"{shim}{os.pathsep}{os.environ['PATH']}",
+               GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+
+    def start(title):
+        writer = subprocess.Popen([str(WRITE_ENTRY), "topic", title], cwd=src, env=env, stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        writer.stdin.write("- entry")
+        writer.stdin.close()
+        return writer
+
+    first = start("first")
+    second = None
+    try:
+        for _ in range(200):
+            if entered.exists() or first.poll() is not None:
+                break
+            time.sleep(0.05)
+        assert entered.exists(), "first writer never reached its commit"
+        second = start("second")
+        try:
+            second.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+        assert second.poll() is None, f"second writer did not wait for the lock: {second.stderr.read()}"
+        release.touch()
+        assert first.wait(timeout=10) == 0, first.stderr.read()
+        assert second.wait(timeout=10) == 0, second.stderr.read()
+    finally:
+        release.touch()
+        for writer in (first, second):
+            if writer and writer.poll() is None:
+                writer.kill()
+    text = (notes / "topic.md").read_text()
+    assert all(text.count(f"## {title}\n") == 1 for title in ("seed", "first", "second"))
