@@ -751,6 +751,11 @@ def _public_repo(tmp_path, monkeypatch):
     return repo, _git_out(repo, "rev-parse", "HEAD")
 
 
+def _no_sha(why):
+    """The refusal without its commit's short hash, which may hold any digits."""
+    return re.sub(r"commit [0-9a-f]{7,}", "commit", why)
+
+
 def test_public_scan_refuses_local_names_and_chat_references_only_in_its_paths(env, tmp_path, monkeypatch):
     """With delivery.public_scan_paths set, an added line there naming a registered machine alias, its
     hostname's domain or a user's chat message is refused; a term another plugin already names, a
@@ -775,11 +780,11 @@ def test_public_scan_refuses_local_names_and_chat_references_only_in_its_paths(e
     head = _git_out(repo, "rev-parse", "HEAD")
     _commit_in_harness_tree(repo, "plugins/mine/rule.md", f"Keep the rule (user msg #{40 + 2}).\n")
     why = outscan.public_problem(repo, head, "HEAD", on)
-    assert "adds a reference to a user's chat message" in why and str(42) not in why, why
+    assert "adds a reference to a user's chat message" in why and str(42) not in _no_sha(why), why
     head = _git_out(repo, "rev-parse", "HEAD")
     _commit_in_harness_tree(repo, "plugins/mine/done.md", f"Landed in task #{40 + 3}.\n")
     why = outscan.public_problem(repo, head, "HEAD", on)
-    assert "adds a reference to one of the project's tasks (task #<digits>)" in why and str(43) not in why, why
+    assert "adds a reference to one of the project's tasks (task #<digits>)" in why and str(43) not in _no_sha(why), why
     for at, line, kind in (("plural-msgs.md", f"Both rules (user msgs #{40 + 5}, #{40 + 6}).\n", "a user's chat message"),
                            ("plural-tasks.md", f"Landed in tasks #{40 + 7}.\n", "one of the project's tasks"),
                            ("caps-task.md", f"Task #{40 + 8} landed it.\n", "one of the project's tasks"),
