@@ -286,8 +286,7 @@ def risky(cmd: str, routes=tuple(DEFAULTS["power_routes"])) -> bool:
     from .hook import DEVICE_TOOLS
     for x in _words(cmd):
         if x is None:
-            from .glmguard import text_blanked   # a commit message naming a reset resets nothing
-            return bool(RISKY.search(hook._split(text_blanked(cmd))[0]))
+            return bool(RISKY.search(hook._split(cmd)[0]))   # a commit message naming a reset resets nothing
         w = x[0]
         prog, args = os.path.basename(w[0]), w[1:]
         if prog == "git":
@@ -526,7 +525,7 @@ def hook_refusal(cmd: str, cwd: str = "", env=None) -> str | None:
     if why and not why.endswith(" first"):
         from . import glmguard
         kind = "out_of_plan" if why.startswith("out of plan") else "power" if power_refusal(cmd, ()) else "guard"
-        return glmguard.refused(e.get("TTP_RUN_DIR"), why, kind=kind)[1]
+        return glmguard.refused(e.get("TTP_RUN_DIR"), why, kind=kind)
     return why
 
 

@@ -376,11 +376,11 @@ EXIT_CODE = re.compile(r"(?i)\bexit(?:ed)?(?: with)? (?:code|status) (\d+)")
 
 def _device_plan(payload: dict) -> str:
     """A GLM device run under an Opus plan (deviceplan.py): why this command may not run, '' when it may."""
-    from . import deviceplan
+    from . import deviceplan, sidefx
     args = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else {}
     cmd = str(args.get("command") or "")
     if payload.get("tool_name") != "Bash":   # a tool reading a device file reads it as `cat` would
-        paths = [str(args[k]) for k in ("file_path", "path", "notebook_path") if args.get(k)]
+        paths = [str(args[k]) for k in sidefx.PATH_KEYS if args.get(k)]
         if payload.get("tool_name") in ("Glob", "LS") or not deviceplan.DEVICE_PATH.search(" ".join(paths)):
             return ""
         cmd = shlex.join(["cat", *paths])
@@ -511,9 +511,11 @@ REDIRECT_RE = re.compile(r"(?<![<>&])>>?(?![&>(])\s*([\"']?)([^\s\"';&|<>()]+)\1
 # A script fed to an interpreter's stdin: `bash < x.sh`
 STDIN_SCRIPT_RE = re.compile(r"(?:^|[\s;&|(])(?:python[\d.]*|[a-z]*sh|node|ruby|perl|source|\.)\s[^;&|\n<]*"
                              r"(?<!<)<(?![<(])\s*[\"']?([^\s\"';&|<>()]+)")
-# Commands whose quoted arguments are only data (printed or read), never run
-INERT = {"echo", "printf", "cat"}
-INERT_RE = re.compile(r"\b(?:echo|printf|cat)\b")
+# Commands whose quoted arguments are only data (printed, searched for or recorded), never run; also
+# `git commit` and ttp's message calls (pathguard.MESSAGE_CMDS). Their output may go on only into READERS.
+INERT = {"echo", "printf", "cat", "grep", "egrep", "fgrep", "rg"}
+INERT_RE = re.compile(r"\b(?:echo|printf|cat|e?grep|fgrep|rg|git|ttp)\b")
+READERS = INERT - {"echo", "printf"} | {"head", "tail", "sort", "uniq", "wc", "cut", "less", "more"}
 GH_WORD_RE = re.compile(r"(?<![\w./-])gh(?![\w.-])")
 GUARDED_RE = re.compile(r"(?<![\w./-])" + GUARDED)
 # A variable in command position running a guarded gh command: `G=...; $G pr ready 7`
@@ -614,18 +616,19 @@ def _quoting(line: str) -> list[tuple[bool, int]]:
     return out
 
 
-SEPARATOR_RE = re.compile(r"[;&|]")
+SEPARATOR_RE = re.compile(r"[;&|\n]")
 
 
 def _pieces(line: str) -> list[tuple[int, int, str]]:
-    """The top-level simple commands of one line: (start, end, the separator after it)."""
+    """The top-level simple commands of `line` (a line break outside quotes ends one too): (start, end, the
+    separator after it)."""
     flags, out, start, i = _quoting(line), [], 0, 0
     while m := SEPARATOR_RE.search(line, i):   # only a separator character can end a command
         i = m.start()
         c = line[i]
-        if not flags[i][0] and flags[i][1] == 0 and c in ";&|" and line[i - 1:i] not in ("<", ">") \
+        if not flags[i][0] and flags[i][1] == 0 and c in ";&|\n" and line[i - 1:i] not in ("<", ">") \
                 and line[i + 1:i + 2] != ">":
-            sep = line[i:i + 2] if line[i + 1:i + 2] in (c, "&") and c != ";" else c
+            sep = line[i:i + 2] if line[i + 1:i + 2] in (c, "&") and c not in ";\n" else c
             out.append((start, i, sep))
             i = start = i + len(sep)
             continue
@@ -674,13 +677,76 @@ def _ran(commands: str) -> frozenset[str]:
     return frozenset(names)
 
 
-def _data_only(piece: str, sep: str, commands: str) -> bool:
-    """`piece` is an echo/printf/cat whose output is shown or written to a file that `commands`
-    does not run afterwards, and that runs nothing inside."""
-    if _first_word(piece) not in INERT or sep.startswith("|") \
-            or re.search(r"\$\(|`|[<>]\(", re.sub(r"'[^']*'", "", piece)):
+def _chain(line: str, pieces: list[tuple[int, int, str]], k: int) -> list[str]:
+    """The commands `pieces[k]` of `line` pipes its output into (`|` or `|&`, never `||`)."""
+    out = []
+    while pieces[k][2] in ("|", "|&") and k + 1 < len(pieces):
+        k += 1
+        out.append(line[pieces[k][0]:pieces[k][1]])
+    return out
+
+
+def _runs_inside(piece: str) -> bool:
+    """`piece` runs a command of its own: a `$(...)` or backtick outside single quotes, `<(`/`>(`, or `rg --pre`."""
+    from . import pathguard
+    return bool(pathguard._substitutions(piece) or re.search(r"[<>]\(", re.sub(r"'[^']*'", "", piece))
+                or _first_word(piece) == "rg" and re.search(r"(?:^|\s)--pre(?:=|\s|$)", piece))
+
+
+@functools.lru_cache(maxsize=64)
+def _unquoted(text: str) -> str:
+    """`text` with its quoted (and escaped, and comment) characters as spaces."""
+    return "".join(" " if f[0] else c for c, f in zip(text, _quoting(text)))
+
+
+def _data_only(piece: str, sep: str, commands: str, after: list[str] | tuple = ()) -> bool:
+    """`piece` only prints, searches for or records text (INERT, `git commit`, ttp's message calls), runs nothing
+    inside, pipes on (`after`) only into READERS, and writes no file that `commands` runs afterwards. Fail closed:
+    a variable set before it (`GIT_EDITOR=...`), or a PATH, alias or function `commands` sets, may make it run."""
+    from . import pathguard
+    argv = next(iter(_segments(piece)), [])
+    name, words = _first_word(piece), [w for w in argv[1:] if not w.startswith("-")]
+    if re.match(r"\s*[A-Za-z_]\w*\+?=", piece) or re.search(
+            rf"\bPATH\+?=|\balias\b|\bfunction\s+{re.escape(name)}\b|(?<![\w-]){re.escape(name)}\s*\(\s*\)",
+            _unquoted(commands)):
+        return False
+    if not (name in INERT or name == "git" and argv[1:2] == ["commit"]
+            or name == "ttp" and bool(set(words[:2]) & pathguard.MESSAGE_CMDS)) or _runs_inside(piece) \
+            or sep in ("|", "|&") and not (after and all(_first_word(p) in READERS and not _runs_inside(p)
+                                                         for p in after)):
         return False
     return not any(os.path.basename(m[2]) in _ran(commands) for m in REDIRECT_RE.finditer(piece))
+
+
+def _data_body(lines: list[str], i: int, pos: int) -> bool:
+    """The heredoc at `pos` of `lines[i]` is only data: a quoted delimiter (no expansion) on a _data_only piece
+    (`cat > t.md <<'EOF'`, `git commit -F - <<'EOF'`)."""
+    line = lines[i]
+    pieces = _pieces(line)
+    k = next(k for k, (s, e, _) in enumerate(pieces) if s <= pos <= e)
+    return bool(HEREDOC_RE.match(line, pos)[2]) and _data_only(line[pieces[k][0]:pieces[k][1]], pieces[k][2],
+                                                                "\n".join(lines), _chain(line, pieces, k))
+
+
+def _into_shell(line: str, pieces: list[tuple[int, int, str]], k: int) -> bool:
+    """`pieces[k]` of `line` pipes into a shell (`echo 'tt-smi -r 0' | bash`): what it prints runs."""
+    return pieces[k][2] in ("|", "|&") and k + 1 < len(pieces) \
+        and _first_word(line[pieces[k + 1][0]:pieces[k + 1][1]]) in SHELLS
+
+
+def _blank(piece: str) -> str:
+    """`piece` with each quoted span holding whitespace (text, not a word) replaced by `''`; a one-word span (a
+    path, a flag) and a redirection's target stay."""
+    flags, out, j = _quoting(piece), [], 0
+    while j < len(piece):
+        k = j
+        while k < len(piece) and flags[k][0] == flags[j][0]:
+            k += 1
+        span = piece[j:k]
+        text = flags[j][0] and re.search(r"\s", span) and not piece[:j].rstrip(" \t").endswith(("<", ">"))
+        out.append("''" if text else span)
+        j = k
+    return "".join(out)
 
 
 def _heredocs(text: str) -> tuple[list[str], list[tuple[int, list[str], int]]]:
@@ -705,28 +771,32 @@ def _heredocs(text: str) -> tuple[list[str], list[tuple[int, list[str], int]]]:
 
 def _split(text: str, strip: bool = True) -> tuple[str, str]:
     """(what runs as shell commands, what to scan) for a command line or a script. Heredoc bodies
-    are commands only when a shell reads them; bodies an echo/cat only writes to a file are
-    dropped from both, and so are the quoted arguments of echo, printf and cat: data, not run.
+    are commands only when a shell reads them; bodies only data (_data_only) are dropped from both,
+    and so are the quoted text arguments of _data_only commands (a commit message, a grep pattern,
+    an echo naming a command runs none). What echo or printf pipes into a shell runs.
     With `strip` False those arguments stay in what runs, so a quote spanning lines stays whole."""
     lines, bodies = _heredocs(text)
     commands = "\n".join(lines)
-    scan = list(lines)
-    for i, line in enumerate(lines):
-        stripped = line
-        for s, e, sep in reversed(_pieces(line) if INERT_RE.search(line) else []):
-            piece = line[s:e]
-            if _data_only(piece, sep, commands):
-                flags = _quoting(piece)
-                kept = "".join(c if not flags[j][0] else "''" if j == 0 or not flags[j - 1][0] else ""
-                               for j, c in enumerate(piece))
-                stripped = stripped[:s] + kept + stripped[e:]
-        scan[i] = stripped
-    run = list(scan if strip else lines)
+    pieces = _pieces(commands) if INERT_RE.search(commands) else []
+    stripped, fed = commands, []
+    for k in reversed(range(len(pieces))):
+        s, e, sep = pieces[k]
+        piece = commands[s:e]
+        if _data_only(piece, sep, commands, _chain(commands, pieces, k)):
+            stripped = stripped[:s] + _blank(piece) + stripped[e:]
+        elif _first_word(piece) in ("echo", "printf") and _into_shell(commands, pieces, k):
+            argv = next(iter(_segments(piece)), [])
+            fed.append(" ".join(w for w in argv[1:] if not w.startswith("-")).replace("\\n", "\n"))
+    scan = [stripped]
+    run = [stripped if strip else commands] + fed
     for i, body, pos in bodies:
-        piece, sep = _piece_at(lines[i], pos)
-        if _first_word(piece) in SHELLS:
+        line = lines[i]
+        ps = _pieces(line)
+        k = next(k for k, (s, e, _) in enumerate(ps) if s <= pos <= e)
+        piece, sep = line[ps[k][0]:ps[k][1]], ps[k][2]
+        if _first_word(piece) in SHELLS or _into_shell(line, ps, k):
             run += body
-        if not _data_only(piece, sep, commands):
+        if not _data_only(piece, sep, commands, _chain(line, ps, k)):
             scan += body
     return "\n".join(run), "\n".join(scan)
 
@@ -1234,7 +1304,7 @@ def _pre_tool_use(payload: dict) -> tuple[dict | None, None]:
         return _deny(glmguard.drafted(os.environ.get("TTP_RUN_DIR"), d)), None
     if glmguard.glm_run() is not None and (why := glmguard.tool_refusal(payload)):   # every route to the chat model
         # a redirect (the reason and the allowed way; the run goes on) or a hand-back to Opus (no model call)
-        return _deny(glmguard.refused(os.environ.get("TTP_RUN_DIR"), why)[1]), None
+        return _deny(glmguard.refused(os.environ.get("TTP_RUN_DIR"), why)), None
     if why := _device_plan(payload):
         return _deny(why), None
     if why := _provenance(untrusted.mark_refusal(str(payload.get("tool_name") or ""), payload.get("tool_input") or {})):

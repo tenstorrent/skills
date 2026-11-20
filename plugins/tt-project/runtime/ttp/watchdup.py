@@ -20,9 +20,11 @@ while 'outage ended', 'drop-in', 'recovered' and '<watcher>:<box>:reboot' next t
 are distinct. A keyed issue counts once each time it opens: when it is new and each time it reopens
 after a close (the reopen churn of one key), so a condition that keeps clearing and coming back warns
 too. A new episode of one key (screen._supersede) counts only when the episode before it was still open
-when it came, i.e. the watcher starts a new episode on every run while the condition never clears: a
-new episode after the previous one closed (cleared, or closed after a quiet run) is a distinct real
-occurrence, as references/watchers.md asks watchers to report, and is not churn. The supersede itself is
+when it came and was seen on one run only, i.e. the watcher starts a new episode on every run while the
+condition never clears: a new episode after the previous one closed (cleared, or closed after a quiet run)
+is a distinct real occurrence, as references/watchers.md asks watchers to report, and so is one after an
+episode reported on several runs (a changing set, such as queued requests, whose episode names its newest
+member): neither is churn. The supersede itself is
 not a reopen. The warning lists the keys it counted (the first STORED_KEYS are kept), so a reader can tell
 duplicates from distinct conditions."""
 from __future__ import annotations
@@ -96,16 +98,17 @@ def groups(db: DB, source: str, now: float, window_s: float = WINDOW_S) -> list[
 
 
 def _real_episode(db: DB, source: str, r) -> bool:
-    """Whether keyed issue `r` is a new episode that came after the key's previous episode closed (a real
-    new occurrence, never churn): the issue before it under the key was closed before this one opened. A
-    supersede closes a still-open issue at the very time its successor opens (screen._supersede), and
-    keeps an earlier close time."""
+    """Whether keyed issue `r` is a new episode that is a real new occurrence, never churn: the issue before
+    it under the key was closed before this one opened, or was reported on more than one run before this
+    episode replaced it (a changing set whose episode names its newest member). A supersede closes a
+    still-open issue at the very time its successor opens (screen._supersede), and keeps an earlier close
+    time."""
     if not r["k"] or not r["episode"]:
         return False
-    prev = db.one("SELECT episode, closed FROM issues WHERE source=? AND watch_key=? AND id<? "
+    prev = db.one("SELECT episode, closed, count FROM issues WHERE source=? AND watch_key=? AND id<? "
                   "ORDER BY id DESC LIMIT 1", (source, r["k"], r["id"]))
-    return bool(prev and prev["episode"] and prev["closed"] is not None
-                and float(prev["closed"]) < float(r["first_seen"] or 0))
+    return bool(prev and prev["episode"] and (int(prev["count"] or 0) > 1 or prev["closed"] is not None
+                                              and float(prev["closed"]) < float(r["first_seen"] or 0)))
 
 
 def reopen_times(raw) -> list[float]:

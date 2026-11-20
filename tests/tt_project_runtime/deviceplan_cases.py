@@ -796,7 +796,7 @@ def test_a_device_plan_still_unsourced_after_its_re_plan_never_reaches_the_run(t
     assert deviceplan.plan(cur) is None and not glmassist.planned(cur)
 
 
-# A host-side loop reading each chip's attributes with no plan (the replay), and other direct device reads
+# A host-side loop reading each chip's attributes with no plan, and other direct device reads
 _DP_SYS_LOOP = ('ls /sys/class/tenstorrent/ | head -40; echo ---; for d in /sys/class/tenstorrent/tenstorrent*; do'
                 ' c=$(cat "$d/chip_id" 2>/dev/null); hb=$(timeout 10 cat "$d/tt_heartbeat" 2>&1); echo "$d $c $hb";'
                 ' done 2>&1 | head -40')

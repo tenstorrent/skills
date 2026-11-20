@@ -110,6 +110,14 @@ TAMPER = re.compile(
 # A shell redirection (`2>&1`, `>out.log`, `<in`): its fd digit and target are no words of a ttp call.
 # the target stops at a quote: `ssh h "ls > f"` keeps its closing quote, so the remote command stays one word
 REDIRECT = re.compile(r"(?<![\w$])\d*(?:&>>?|>>?|<<?<?|>&|<&)\s*(?:&?\d+-?|[^\s;|&<>()'\"]+)?")
+# A program name, a variable's name or a `sleep` time the guard cannot read: a command word that is an expansion
+# (`$S 2`, `$(printf sleep)`, a backtick), `eval` of one, an indirect `${!n}` or `${${S}EC}`, `sleep $I`. Matched on
+# the command-word view only (shell_refusal), so a quoted string or a quoted heredoc body naming one is text.
+_CMD_AT = r"(?:[;&|(]|\b(?:do|then|else)\s)\s*"
+HIDDEN = re.compile(rf"""(?m)(?:^\s*|{_CMD_AT})(?:["']?\\?\$(?:\{{\w+\}}|[A-Za-z_]\w*)["']?(?=[\s;&|)]|$)|\\?\$\()"""
+                    rf"""|(?:^\s*|{_CMD_AT})["']?(?:[\w-]+\\?\$[{{A-Za-z_]|\\?\$\{{\w+\}}[\w-])"""
+                    rf"""|{_CMD_AT}`|(?:^\s*|{_CMD_AT})eval\s+["'$\\]|\$\{{(?:\\?\$|!\w+\}})|(?<![\w.-])sleep\s+["']?\\?\$""")
+HIDDEN_WHY = "a program name or a checked operand comes from an expansion the guard cannot read"
 STATE_DB = re.compile(r"\bproject\.db\b|\bmachine-workers\.json\b|\b\.tt-project/(?:locks|machines)\b")
 # Every run on the chat model (the code arm, a GLM work route, a routine coordinator lane, a bench run as a task):
 # human interaction stays on Opus, so its outward posts become drafts an Opus step reviews and sends.
@@ -241,6 +249,8 @@ _OUTSIDE = "outside its worktree"
 _OWN_TREE = ("change only files in your worktree and `$TMPDIR`, and say in your hand-off "
              "what else should change")
 RULES = (
+    ("expansion", REDIRECTED, re.escape(HIDDEN_WHY), "build a program name, a variable's name or a `sleep` time "
+     "from a variable, `$(...)` or `eval`", "write the program and its operands literally"),
     ("db_read", REDIRECTED, r"database or machine records by hand",
      "open the project's database or machine records (sqlite or any other tool)",
      "read them with `ttp status`, `ttp task <project> show <id>` (or `list`), `ttp machines list` and the run "
@@ -321,8 +331,8 @@ def refusals(run_dir) -> list[dict]:
     return glmassist.rows(Path(run_dir) / REFUSALS) if run_dir else []
 
 
-def refused(run_dir, why: str, kind: str = "guard", cfg: dict | None = None) -> tuple[bool, str]:
-    """Record a refusal (REFUSALS) and decide it: (handed back, the text the run reads). A redirect's text is the
+def refused(run_dir, why: str, kind: str = "guard", cfg: dict | None = None) -> str:
+    """Record a refusal (REFUSALS) and decide it: the text the run reads (hit_reason() tells a hand-back). A redirect's text is the
     reason and the allowed way, and the run goes on; a harmful attempt, the run's hand_back_after-th refusal, or
     redirects switched off end the run as a hand-back to Opus (hit()). The refused command never runs either way."""
     why = (why or "").strip()
@@ -340,9 +350,9 @@ def refused(run_dir, why: str, kind: str = "guard", cfg: dict | None = None) -> 
             pass
     if back:
         hit(run_dir, why if cls == HARMFUL or n == 1 else f"refusal {n} in one run: {why}", kind)
-        return True, f"refused: {why}; the run ends and its task goes back to Opus"
+        return f"refused: {why}; the run ends and its task goes back to Opus"
     left = s["hand_back_after"] - n
-    return False, (f"refused, not run: {why}.\nInstead: {instead}. Carry on with the task; "
+    return (f"refused, not run: {why}.\nInstead: {instead}. Carry on with the task; "
                    f"{left} more refusal{'s' if left > 1 else ''} in this run hand{'' if left > 1 else 's'} it "
                    "back to Opus.")
 
@@ -383,6 +393,9 @@ def cli_refusal(cmd: str, action: str = "", flags=(), words=()) -> str | None:
                 f"and the coordinator decides what reaches a person, a chat or another project")
     if cmd in LANDING or cmd == "push" and any(str(f).split("=", 1)[0] in ("--land", "--express") for f in flags):
         return f"`ttp {cmd}` lands a head: a run on the GLM arm publishes only with `ttp push`, after review"
+    if cmd == "rollout" and action not in ("", "status") and not {"-h", "--help"} & set(flags):
+        return ("`ttp rollout " + action + "` changes a rollout: not for a run on the GLM arm; read it with "
+                "`ttp rollout status`")
     if cmd == "remove":
         return "`ttp remove` deletes a project, outside the run's worktree and run folder: not for a run on the GLM arm"
     if cmd == "machines" and not {"-h", "--help"} & set(flags) and not read_only(list(words) or [cmd, action], flags):
@@ -495,87 +508,6 @@ def remote_writes(cmd: str, cwd: str = "") -> list[tuple[str, str]]:
             if cls == "write" and "inline code" not in why and not p.startswith((there,) + sidefx.HARMLESS)]
 
 
-# Programs whose quoted words are text no shell runs: what they print, search for or record (`git commit -m`), and
-# what they send on through a pipe only to these readers (`grep "a|b" tests/ | head`)
-TEXT_ARGS = frozenset({"echo", "printf", "cat", "grep", "egrep", "fgrep", "rg"})
-TEXT_READERS = frozenset({"head", "tail", "sort", "uniq", "wc", "cut", "less", "more"}) | TEXT_ARGS - {"echo", "printf"}
-REDIRECT_OP = re.compile(r"(?<![<>])(?:&>>?|>>?|<<<|<(?![<(])|[<>]&)\s*")
-TEXT_TTP = frozenset({"advise", "note", "notify", "say", "ask"})   # `ttp advise --plan "..."`: the text is for Opus
-
-
-def _runs_inside(piece: str) -> bool:
-    """`piece` runs a command of its own: a `$(...)` or an unescaped backtick outside single quotes, or `<(`/`>(`."""
-    q, esc = "", False
-    for i, c in enumerate(piece):
-        if esc:
-            esc = False
-        elif q == "'":
-            q = "" if c == "'" else q
-        elif c == "\\":
-            esc = True
-        elif c == '"':
-            q = "" if q else '"'
-        elif c == "'" and not q:
-            q = "'"
-        elif c == "`" or c == "$" and piece[i + 1:i + 2] == "(" or not q and c in "<>" and piece[i + 1:i + 2] == "(":
-            return True
-    return False
-
-
-def text_blanked(cmd: str) -> str:
-    """`cmd` with the quoted words of commands that only print, search for or record text blanked (TEXT_ARGS,
-    `git commit`, the text subcommands of ttp) and the quoted heredoc bodies they read dropped: a commit message,
-    a grep pattern or an echo naming `systemctl restart` or `tt-flash` runs neither. Fail closed: a piece that runs
-    a command inside, pipes into anything but a reader, writes a file the command runs later or runs `rg --pre`
-    keeps its words."""
-    from . import hook
-    lines, bodies = hook._heredocs(cmd)
-    text = "\n".join(lines)
-    flags = hook._quoting(text)
-    cuts, start = [], 0
-    for i, c in enumerate(text):   # top-level commands, a line break ending one too (a quote may span lines)
-        if c in ";&|\n" and not flags[i][0] and flags[i][1] == 0 and text[i - 1:i] not in ("<", ">") \
-                and (c != "&" or text[i + 1:i + 2] != ">") and i >= start:
-            sep = text[i:i + 2] if c in "&|" and text[i + 1:i + 2] in (c, "&") else c
-            cuts.append((start, i, sep))
-            start = i + len(sep)
-    cuts.append((start, len(text), ""))
-    names = [hook._first_word(text[s:e]) for s, e, _ in cuts]
-
-    def inert(k: int) -> bool:
-        s, e, sep = cuts[k]
-        piece, name = text[s:e], names[k]
-        argv = next(iter(hook._segments(piece)), [])
-        if not (name in TEXT_ARGS or name == "git" and argv[1:2] == ["commit"]
-                or name == "ttp" and argv[1:2] and argv[1] in TEXT_TTP) or _runs_inside(piece) \
-                or name == "rg" and any(w == "--pre" or w.startswith("--pre=") for w in argv):
-            return False
-        j = k
-        while cuts[j][2] in ("|", "|&"):
-            j += 1
-            if names[j] not in TEXT_READERS or _runs_inside(text[cuts[j][0]:cuts[j][1]]):
-                return False
-        return not any(os.path.basename(m[2]) in hook._ran(text) for m in hook.REDIRECT_RE.finditer(piece))
-
-    keep = set()   # a redirection's target stays (`echo x > "$TTP_RUN_DIR/glm_guard.json"` writes that file)
-    for m in REDIRECT_OP.finditer(text):
-        j = m.end()
-        while j < len(text) and (flags[j][0] or text[j] not in " \t\n;&|<>()"):
-            keep.add(j)
-            j += 1
-    out, last = [], 0
-    for k, (s, e, _) in enumerate(cuts):
-        if inert(k):
-            out.append(text[last:s] + "".join(c if not flags[j][0] or j in keep else "''" if j == s or not flags[j - 1][0]
-                                              or j - 1 in keep else "" for j, c in enumerate(text[s:e], s)))
-            last = e
-    out.append(text[last:])
-    starts = [sum(len(x) + 1 for x in lines[:i]) for i in range(len(lines))]
-    kept = [ln for i, body, pos in bodies if not (hook.HEREDOC_RE.match(lines[i], pos)[2] and inert(
-        next(k for k, (s, e, _) in enumerate(cuts) if s <= starts[i] + pos <= e))) for ln in body]
-    return "\n".join(["".join(out)] + kept)
-
-
 def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None, remote: bool = False, writes: bool = True,
                   power: bool = True, services: bool = True) -> str | None:
     """Why a shell command of a GLM-arm run is refused (before it runs), else None. The denylist: writes or
@@ -589,17 +521,23 @@ def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None, remote: bool 
     lines, bodies = hook._heredocs(cmd)
     # a quoted heredoc body (`<<'EOF'`, no expansion) only written to a file (`cat > t.py <<'EOF' ... project.db ...`)
     # is data that opens nothing; an unquoted one runs its `$(...)` and backticks, so it stays checked
-    named = "\n".join(lines + [ln for i, body, pos in bodies
-                               if not (hook.HEREDOC_RE.match(lines[i], pos)[2]
-                                       and hook._data_only(*hook._piece_at(lines[i], pos), "\n".join(lines)))
-                               for ln in body])
-    text = text_blanked(cmd)   # a commit message, a grep pattern or an echo naming a command runs none
-    if TAMPER.search(text):
+    named = "\n".join(lines + [ln for i, body, pos in bodies if not hook._data_body(lines, i, pos) for ln in body])
+    # the command words: the quoted text of commands that only print, search for or record it, and their quoted
+    # heredoc bodies, gone (a commit message, a grep pattern or an echo naming a command runs none), and so is a
+    # quoted body a script interpreter reads (`python3 - <<'EOF'`: its code, not shell); every other body stays
+    view = "\n".join([hook._split(cmd)[0]] + [
+        ln for i, body, pos in bodies if not hook._data_body(lines, i, pos) and not (
+            hook.HEREDOC_RE.match(lines[i], pos)[2]
+            and pathguard.INTERPRETER_RE.match(hook._first_word(hook._piece_at(lines[i], pos)[0])))
+        for ln in body])
+    if TAMPER.search(view):
         return GUARD_WHY
     if STATE_DB.search(named):
         return "a run on the GLM arm may not read or write the project's database or machine records by hand"
-    if services and (svc := SERVICE_RE.search(text)):
+    if services and (svc := SERVICE_RE.search(view)):
         return f"{SERVICE_WHY}: {svc.group(0)[:120]}"
+    if writes and (m := HIDDEN.search(view)):
+        return f"{HIDDEN_WHY}: {m.group(0).strip()[:80]}"
     commands, _ = hook._split(cmd)   # heredoc bodies a program, not a shell, reads are its input
     for sub in pathguard._substitutions(commands):   # "$(...)" runs a command too
         if why := shell_refusal(sub, cwd, run_dir, e, remote, writes, power, services):
@@ -782,7 +720,7 @@ def outward_shell(cmd: str, env=None) -> dict | None:
     from . import hook
     e = os.environ if env is None else env
     project = _own_name(e)
-    plain, _ = hook._split(REDIRECT.sub(" ", cmd))
+    plain, _ = hook._split(REDIRECT.sub(" ", cmd), strip=False)   # a message's text stays
     for seg in hook._all_segments(plain) + hook._segments(plain, strip=False):
         if seg and (d := _outward_seg(seg, project)):
             return {**d, "command": cmd[:OUTPUT_TAIL]}
@@ -847,7 +785,7 @@ def is_gate(cmd: str, gates=(), env=None) -> bool:
     if BROKER.search(cmd):
         return True
     project = _own_name(os.environ if env is None else env)
-    plain, _ = hook._split(REDIRECT.sub(" ", cmd))
+    plain, _ = hook._split(REDIRECT.sub(" ", cmd), strip=False)   # a message's text stays
     return any((w := _ttp_args(seg, project)) and w[0] in GATE_SUBS
                for seg in hook._all_segments(plain) + hook._segments(plain, strip=False) if seg)
 

@@ -114,6 +114,29 @@ def test_watcher_real_episodes_of_one_stable_key_are_not_churn(env, monkeypatch)
     assert watchdup.counts(p.db, "watcher:perval", time.time()) == [("box-a", 5)]
 
 
+def test_a_changing_set_names_its_newest_member_as_the_episode_and_wakes_on_each_new_one(env, monkeypatch):
+    """A watcher listing a set that grows (queued requests) under one stable key: without an episode a new
+    member waits for the next reminder; with the newest member as its episode it wakes at once, the same set
+    stays quiet, and members that each stay listed for a while are no churn."""
+    from ttp import watchdup
+    run, issues, p = _json_watcher(env, monkeypatch)
+    wakes = lambda: p.db.one("SELECT COUNT(*) AS n FROM events WHERE kind='observation'")["n"]
+    line = lambda ids, **kw: {"text": f"requests: {len(ids)} waiting ({', '.join(ids)})", "severity": "normal",
+                              "key": "push requests", "whole": True, **kw}
+    run("plain", line(["r1"]))
+    n = wakes()
+    run("plain", line(["r1", "r2"]))
+    assert wakes() == n   # the stable key hides the new member until the reminder
+    n = wakes()
+    for k in range(1, 6):
+        ids = [f"r{i}" for i in range(1, k + 1)]
+        run("set", line(ids, episode=ids[-1]))
+        assert wakes() == n + 1, ids   # a new member wakes at once
+        run("set", line(ids, episode=ids[-1]))
+        assert wakes() == n + 1, ids   # the same set does not
+        n = wakes()
+    assert watchdup.counts(p.db, "watcher:set", time.time()) == [("requests", 1)]
+
 def test_machines_list_shows_tag_notes_with_no_machines_and_in_json(env, capsys):
     import json
     from ttp import machines as mm

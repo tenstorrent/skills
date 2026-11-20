@@ -148,8 +148,8 @@ WHY = ("a run never creates, changes, moves, chmods or deletes anything under th
        "({hit} is one; guards.protected_paths lists them): a login a run overwrote is gone for every project on "
        "the host. Read it as before, test against a scratch copy under `mktemp -d` named by another variable "
        "(H=$(mktemp -d); ... \"$H/.ssh/...\"), and leave logins and keys to the user")
-# `ttp note|notify|say`: their message words are sent, not run
-MESSAGE_CMDS = {"note", "notify", "say"}
+# `ttp note|notify|say|ask|advise`: their message words are sent (to a log, a person or Opus), not run
+MESSAGE_CMDS = {"note", "notify", "say", "ask", "advise"}
 PROJECT_WHY = ("protected_paths (guards.protected_paths): a run never writes under {hit}, which the project protects "
                "beside the account's credential folders (a served tree, a forbidden directory); write somewhere else")
 # The project's own protected paths, as ssh's remote command sees them (refusal sets it per call)

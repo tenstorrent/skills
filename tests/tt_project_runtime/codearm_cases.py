@@ -604,7 +604,7 @@ def test_the_glm_prompt_deny_list_is_the_rule_table_with_each_allowed_way():
     assert all(r[4] for r in glmguard.RULES), "every rule has an allowed way"
     assert [ln for ln in text.splitlines() if ln.startswith("- ")] == [
         f"- Never {r[3]}: {r[4]}." + (" (harmful)" if r[1] == glmguard.HARMFUL else "") for r in glmguard.RULES if r[3]]
-    assert 8 <= text.count("\n- ") <= 10 and "goes to your task's own log" in text
+    assert 8 <= text.count("\n- ") <= 11 and "goes to your task's own log" in text
     for name in ("notify", "say", "upstream", "land", "express"):
         assert f"`ttp {name}`" in text and glmguard.cli_refusal(name), name
     assert "`ask`" in text and glmguard.cli_refusal("ask"), "ask is a post kind, not a ttp subcommand"
@@ -889,13 +889,14 @@ def test_glm_guard_hands_back_a_harmful_attempt_at_once_and_off_restores_the_fir
     """cells: guard_harmful_hands_back, guard_redirect_off"""
     from ttp import glmguard
     _wt, rd = _gg_run(tmp_path)
-    back, text = glmguard.refused(rd, "`ttp upstream` is not allowed", cfg={})
-    assert not back and "`upstream: ...`" in text and not glmguard.hit_reason(rd)
-    back, text = glmguard.refused(rd, "a run on the GLM arm never `git push`", cfg={})
-    assert back and "goes back to Opus" in text and glmguard.hit_reason(rd).endswith("never `git push`")
+    text = glmguard.refused(rd, "`ttp upstream` is not allowed", cfg={})
+    assert "`upstream: ...`" in text and not glmguard.hit_reason(rd)
+    text = glmguard.refused(rd, "a run on the GLM arm never `git push`", cfg={})
+    assert "goes back to Opus" in text and glmguard.hit_reason(rd).endswith("never `git push`")
     off = tmp_path / "off"
     off.mkdir()
-    assert glmguard.refused(off, "`ttp upstream` is not allowed", cfg={"route": {"glm_refusals": {"redirect": False}}})[0]
+    assert "goes back to Opus" in glmguard.refused(off, "`ttp upstream` is not allowed",
+                                                   cfg={"route": {"glm_refusals": {"redirect": False}}})
     assert glmguard.hit_reason(off)
 
 
@@ -1676,8 +1677,8 @@ def test_glm_guard_reads_scratch_as_tmp_where_the_command_names_tmpdir(cmd, tmp_
     assert glmguard.shell_refusal(cmd, str(wt), str(rd), e), cmd
 
 
-# Commands GLM runs bounced on for words only in text: a grep for the service rule, commit messages (heredoc, -m)
-# naming a service change or a reset, an Opus plan request naming device reads, and printed text
+# Words only in text are no command: a grep pattern, a commit message (heredoc, -m) naming a service change or a
+# reset, an Opus plan request naming device reads, and printed text
 _GG_TEXT_ONLY = {
     "grep": 'cd {wt} && grep -rn "SERVICE_RE\\|systemctl restart" tests/ | head -20; ls tests/ | head -50',
     "commit_heredoc": "cd {wt} && git add -A && git commit -q -F - <<'EOF'\nguard: read systemctl start/stop/restart"
@@ -1741,3 +1742,103 @@ def test_glm_guard_refuses_writes_to_the_run_folders_own_records_and_hands_them_
                 glmguard.tool_refusal({"tool_name": "Write", "tool_input": {"file_path": f"{rd}/{name}"},
                                        "cwd": str(wt)}, e)):
         assert why and glmguard.classify(why)[1] == glmguard.HARMFUL, why
+
+
+# A program name, a variable's name or a `sleep` time built from an expansion: the variable holds `SEC`, the loop
+# body sleeps on it, and the script is written by an unquoted heredoc inside `bash -c`
+_GG_HIDDEN_SLEEP = ("ttp lock box-a -- bash -c '\nset -e\nmkdir -p /tmp/ttp-1\nS=S; I=2\n"
+                    "cat > /tmp/ttp-1/hb.sh <<EOF\n#!/bin/bash\nfor d in /sys/class/tenstorrent/*; do\n"
+                    "  v1=\\$(cat \"\\$d/tt_heartbeat\" 2>/dev/null || echo unreadable)\n    \\${${S}EC} \\$I\n"
+                    "  v2=\\$(cat \"\\$d/tt_heartbeat\" 2>/dev/null || echo unreadable)\ndone\nEOF\n"
+                    "chmod +x /tmp/ttp-1/hb.sh\n' 2>&1")
+# Quoted text naming an expansion runs none: a table row, a commit message, a grep pattern, printed text, python code
+# and a script written for later (a quoted heredoc written to a file and run in a later call passes: an accepted gap)
+_GG_HIDDEN_TEXT = {
+    "table": "cat > notes.md <<'EOF'\n| step | how |\n| a | `ttp push` |\nEOF",
+    "commit_m": "git commit -q -m 'docs: name the step (`ttp push`) plainly'",
+    "commit_heredoc": "git commit -F - <<'EOF'\nguard: run the suite (`pytest -q`) first\nEOF",
+    "grep": "grep -n '; $(' file.py",
+    "echo": "echo 'use; $(date)'",
+    "python": "python3 - <<'EOF'\nimport os\nx = 'a | `b`'\nprint(os.path.expandvars(\"$HOME\"))\nEOF",
+    "script": "cat > s.sh <<'EOF'\n#!/bin/bash\nsleep \"$DELAY\"\nEOF",
+}
+
+
+@pytest.mark.parametrize("name", sorted(_GG_HIDDEN_TEXT))
+def test_glm_guard_reads_a_hidden_program_name_only_in_command_words(name, monkeypatch, tmp_path):
+    """cells: guard_hidden_text"""
+    from ttp import glmguard
+    wt, rd = _glm_run_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("TMPDIR", str(rd / "tmp"))
+    assert glmguard.shell_refusal(_GG_HIDDEN_TEXT[name], str(wt), str(rd)) is None
+
+
+def test_a_glm_run_may_not_hide_a_program_name_or_sleep_time_and_it_is_a_redirect(monkeypatch, tmp_path):
+    """cells: guard_hidden_redirect"""
+    import json
+    from ttp import glmguard, hook
+    wt, rd = _glm_run_env(monkeypatch, tmp_path)
+    glmguard.mark_run(rd, False, cwd=str(wt))
+    for cmd in ('"$TMPDIR/venv/bin/python" -m pytest -q', "ls ${TMPDIR:-x}/b", "for f in *; do echo $f; done",
+                "sleep 2", "x=$(date); echo $x", "cat > a.md <<'EOF'\n`ttp push` lands it\neval the result\nEOF"):
+        assert glmguard.shell_refusal(cmd, str(wt), str(rd)) is None, cmd
+    for cmd in ("S=sleep; $S 2", "sleep $I", "x; `printf sleep` 2", "x && $(printf sleep) 2", 'eval "$x"',
+                "echo ${!n}", "S=sl; ${S}eep 2", "x && sl${E} 2", _GG_HIDDEN_SLEEP):
+        assert (glmguard.shell_refusal(cmd, str(wt), str(rd)) or "").startswith(glmguard.HIDDEN_WHY), cmd
+    assert glmguard.classify(glmguard.HIDDEN_WHY)[:2] == ("expansion", glmguard.REDIRECTED)
+    call = lambda: json.dumps(hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": _GG_HIDDEN_SLEEP},
+                                                 "cwd": str(wt)})[0])
+    # a repeat is a redirect too, and an unrelated earlier refusal never turns one into a hand-back: only the
+    # third refusal in one run (glm_refusals.hand_back_after) does
+    (rd / hook.REFUSALS_FILE).write_text('{"kind": "worker_role", "command": "sleep 2"}\n')
+    for _ in range(2):
+        assert glmguard.HIDDEN_WHY in call() and not (rd / glmguard.HIT).exists()
+    assert "back to Opus" in call() and (rd / glmguard.HIT).exists()
+
+
+@pytest.mark.parametrize("cmd", ["echo 'tt-smi -r 0' | bash", "printf 'tt-flash fw' | sh", "echo 'tt-smi -r 0' | zsh",
+                                 "echo -e 'ls\\ntt-smi -r 0' |& dash", "printf '%s\\n' 'tt-flash fw' | bash -s"])
+def test_glm_guard_reads_text_piped_into_a_shell_as_commands(cmd, monkeypatch, tmp_path):
+    """cells: guard_piped_shell"""
+    from ttp import deviceplan, glmguard
+    wt, rd = _glm_run_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("TMPDIR", str(rd / "tmp"))
+    assert deviceplan.risky(cmd), cmd
+    assert glmguard.shell_refusal(cmd, str(wt), str(rd)), cmd
+    assert glmguard.shell_refusal(cmd.replace("tt-smi -r 0", "ls").replace("tt-flash fw", "ls"), str(wt), str(rd)) \
+        is None
+
+
+def test_glm_guard_lets_a_run_read_a_rollout_and_refuses_changing_one(monkeypatch, tmp_path):
+    """cells: guard_rollout_read"""
+    from ttp import glmguard
+    wt, rd = _glm_run_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("TMPDIR", str(rd / "tmp"))
+    home = '"$TMPDIR/smoke/home"'
+    cmd = (f"cd {wt} && mkdir -p {home}/.tt-project && cat > {home}/.tt-project/settings.json <<'EOF'\n"
+           '{"rollout": {"flags": {"a": 1}}}\nEOF\n'
+           f"cd {wt} && TTP_HOME={home} PYTHONPATH=$PWD/runtime python3 -m ttp rollout status; echo \"rc=$?\"; "
+           f"TTP_HOME={home} ttp rollout status --json | head -20")
+    assert glmguard.shell_refusal(cmd, str(wt), str(rd)) is None
+    assert glmguard.cli_refusal("rollout", "status") is None and glmguard.cli_refusal("rollout") is None
+    assert glmguard.cli_refusal("rollout", "arm", ["--help"]) is None
+    for act in ("arm", "set", "waves", "rollback"):
+        why = glmguard.cli_refusal("rollout", act)
+        assert why, act
+        assert glmguard.shell_refusal(f"ttp rollout {act} x 1", str(wt), str(rd)), act
+
+
+def test_glm_guard_lets_python_code_in_a_quoted_heredoc_name_the_run_variables(monkeypatch, tmp_path):
+    """cells: guard_python_body"""
+    from ttp import glmguard
+    wt, rd = _glm_run_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("TMPDIR", str(rd / "tmp"))
+    cmd = (f"cd {wt} && python3 - <<'EOF'\np = 'tests/test_x.py'\ns = open(p).read()\n"
+           's = s.replace("x = 1", """env = {**os.environ, "TTP_RUN_DIR": str(d), "TTP_PROJECT": str(p), '
+           '"TTP_RUN_ID": "dbg", "TTP_TASK": "1"}""")\nopen(p, "w").write(s)\nEOF')
+    assert glmguard.shell_refusal(cmd, str(wt), str(rd)) is None
+    for bad in ("export TTP_RUN_DIR=/x", f'echo x > "{rd}/glm_guard.json"'):
+        assert (glmguard.shell_refusal(bad, str(wt), str(rd)) or "").startswith(glmguard.GUARD_WHY), bad
+    # the run folder stays writable: a note or a scratch file there is no record of the guard's
+    for ok in (f'echo "step 1 done" >> "{rd}/notes.md"', f"cat > {rd}/scratch.txt <<'EOF'\nx\nEOF"):
+        assert glmguard.shell_refusal(ok, str(wt), str(rd)) is None, ok

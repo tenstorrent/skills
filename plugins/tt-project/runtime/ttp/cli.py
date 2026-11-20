@@ -17856,7 +17856,7 @@ def glm_gate(a, name: str | None = None) -> None:
         flags += [f"--{k}" for k in ("owner", "expires", "by", "covers", "clear") if getattr(a, k, None)]
     why = glmguard.cli_refusal(cmd, action, flags, words)
     if why:
-        die(glmguard.refused(os.environ.get("TTP_RUN_DIR"), why)[1], 2)
+        die(glmguard.refused(os.environ.get("TTP_RUN_DIR"), why), 2)
 
 
 def dry_run_stub(a, name: str | None = None) -> None:

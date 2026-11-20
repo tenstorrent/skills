@@ -119,7 +119,7 @@ class GuardedEnvironment(LocalEnvironment):
         if (text := deviceplan.hook_refusal(command, here)) and text.endswith(" first"):   # take the plan or check first
             return {"output": f"refused: {text}", "returncode": 2, "exception_info": ""}
         if not text and (why := refusal(command, here, run_dir)):
-            text = glmguard.refused(run_dir, why)[1]   # the command is never run
+            text = glmguard.refused(run_dir, why)   # the command is never run
         if text and glmguard.hit_reason(run_dir):   # a hand-back to Opus ends the agent loop
             raise Submitted({"role": "exit", "content": text, "extra": {"exit_status": "GuardRefused", "submission": ""}})
         if text:   # a redirect: the reason and the allowed way, and the run goes on
