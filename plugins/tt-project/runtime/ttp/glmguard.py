@@ -56,7 +56,7 @@ TASK_ACTIONS = frozenset({"show", "list"})
 # every other `ttp task` action (cli.py's choices): a write, refused wherever it sits among the words, since
 # the project name is optional and an option's value may stand before it
 TASK_WRITES = frozenset({"add", "cancel", "requeue", "restart", "set-when", "superseded", "abandon",
-                         "adopt-branch", "rejudge", "relink-fix"})
+                         "adopt-branch", "rejudge", "relink-fix", "drop-followup"})
 # `ttp note` flags that send a note on, or change a record beyond the run's own log: refused on the GLM arm.
 NOTE_ROUTES = ("--to", "--reply", "--urgent", "--severity", "--confirms", "--status")
 GH_READS = frozenset({"view", "list", "diff", "status", "checks"})
