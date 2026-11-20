@@ -13749,9 +13749,9 @@ def shim_text(python: str, launcher: Path, pinned_ok: bool = True) -> str:
 
 def cmd_install_check(a) -> None:
     """`ttp install-check [<commit>]`: a release cut's fresh one-line install, run model-free by ttp so the
-    run that reads the result stays unmarked and may move its channel tag (installcheck.py)."""
-    from . import installcheck
-    installcheck.command(a)
+    run that reads the result stays unmarked and may move its channel tag (release.py)."""
+    from . import release
+    release.install_command(a)
 
 
 def cmd_setup(a) -> None:
@@ -16417,7 +16417,7 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=checkplan.command)
 
     s = sub.add_parser("install-check", help="a release candidate's fresh one-line install, run by ttp itself in a "
-                                             "temporary HOME at a commit; records pass or fail (installcheck.py)")
+                                             "temporary HOME at a commit; records pass or fail (release.py)")
     s.add_argument("commit", nargs="?", default="HEAD", help="the candidate commit (default HEAD)")
     s.add_argument("--out", help="folder for the result, log and temp HOME (default: the run folder, else a temp dir)")
     s.set_defaults(fn=cmd_install_check)
