@@ -3410,7 +3410,7 @@ def test_wakecost_daemon_alarms_once_and_asks_the_same_session_to_shrink(env, mo
 
 
 def test_wakecost_alarm_stays_in_the_web_app_unless_it_needs_the_user(env, monkeypatch):
-    """#8356: the cost-per-wake alarm is recorded for the web app only (no chat, the quiet channel); a
+    """The cost-per-wake alarm is recorded for the web app only (no chat, the quiet channel); a
     text that needs the user goes to the chats too."""
     from ttp import alerts, wakecost
     from ttp.daemon import Daemon

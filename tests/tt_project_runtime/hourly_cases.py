@@ -129,13 +129,13 @@ def test_two_milestones_since_the_last_post_are_named_in_one_post(env, monkeypat
 
 
 def test_the_table_stays_in_the_web_app_and_its_test_line_has_no_dollars(env):
-    """#8356: the hourly table is recorded for the web app only (no chat, the quiet channel), with no
+    """The hourly table is recorded for the web app only (no chat, the quiet channel), with no
     main chat too; its test runs are CPU work, with no $ figure."""
     from ttp import alerts, hourly
     p = make(env)
     now = time.time() - 3600
     assert hourly.post(p, now - 3700) is None, "baseline"
-    _block(p, "first")   # an important change (#8341) makes the table due
+    _block(p, "first")   # an important change makes the table due
     m = p.db.one("SELECT * FROM messages WHERE id=?", (hourly.post(p, now),))
     assert m["chat"] is None and m["channel"] == alerts.QUIET and m["ref"] == hourly.REF
     (tests,) = [r for r in m["text"].split("\n") if r.startswith("Tests in 24 h")]
