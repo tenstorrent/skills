@@ -157,7 +157,8 @@ def test_device_runs_are_told_the_planner_rules_and_glm_runs_the_plan_route(env)
 
 def test_the_plan_prompt_asks_for_exact_check_and_complete_submit_commands():
     from ttp import deviceplan
-    assert "runs exactly as written" in deviceplan.DEVICE_PLAN and "--help" in deviceplan.DEVICE_PLAN
+    assert "runs exactly as written" in deviceplan.DEVICE_PLAN and "leave out any option you cannot confirm" in deviceplan.DEVICE_PLAN
+    assert "--help" not in deviceplan.DEVICE_PLAN
     assert "job-submit step is the complete command line" in deviceplan.DEVICE_PLAN
     assert "`ttp machines change list <alias>`" in deviceplan.DEVICE_PLAN
 

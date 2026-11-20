@@ -80,7 +80,8 @@ DEVICE_PLAN = (
     '{"steps": [{"command": "<the exact shell command>", "host": "<alias or local>", "check": true}]}, the steps '
     "in run order. Every command that changes state must be a step (reads need none); `check` true for a step "
     "whose failure must stop the run. Each check or gate command runs exactly as written, so use only options it "
-    "takes (check them with its --help). Each job-submit step is the complete command line, with every option the "
+    "takes: confirm them in its documentation or source, which you can read, and leave out any option you "
+    "cannot confirm. Each job-submit step is the complete command line, with every option the "
     "project's tooling needs (working directory, env file and the like). The block must be valid JSON: escape each \\\" and \\\\ inside a command. "
     "Use <placeholders> only for values the run reads first. If the task should not run on this model, answer "
     "with one line starting 'needs_opus:' and why.")
