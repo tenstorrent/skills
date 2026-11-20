@@ -41,7 +41,8 @@ On Blackhole, where your tt-metal has it, prefer the
 [streaming profiler](https://github.com/tenstorrent/tt-metal/blob/main/tt_metal/tools/profiler/STREAMING_PROFILER.md)
 (`TT_METAL_STREAMING_PROFILER=1`): capture does not stop at program boundaries. It takes idle
 eth cores and links, is fatal with `TT_METAL_DEVICE_PROFILER`, and writes nothing without
-`TT_METAL_STREAMING_PROFILER_OPS_CSV=<path>`, `TT_METAL_STREAMING_PROFILER_TRACY=1` or a host callback.
+`TT_METAL_STREAMING_PROFILER_OPS_CSV=<path>`, `TT_METAL_STREAMING_PROFILER_ZONE_CSV=<path>`,
+`TT_METAL_STREAMING_PROFILER_TRACY=1` or a host callback.
 
 ## When to invoke
 
