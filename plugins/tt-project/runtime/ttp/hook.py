@@ -84,6 +84,7 @@ import json
 import os
 import posixpath
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -376,7 +377,13 @@ EXIT_CODE = re.compile(r"(?i)\bexit(?:ed)?(?: with)? (?:code|status) (\d+)")
 def _device_plan(payload: dict) -> str:
     """A GLM device run under an Opus plan (deviceplan.py): why this command may not run, '' when it may."""
     from . import deviceplan
-    cmd = str((payload.get("tool_input") or {}).get("command") or "")
+    args = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else {}
+    cmd = str(args.get("command") or "")
+    if payload.get("tool_name") != "Bash":   # a tool reading a device file reads it as `cat` would
+        paths = [str(args[k]) for k in ("file_path", "path", "notebook_path") if args.get(k)]
+        if payload.get("tool_name") in ("Glob", "LS") or not deviceplan.DEVICE_PATH.search(" ".join(paths)):
+            return ""
+        cmd = shlex.join(["cat", *paths])
     # a step to take first, a redirect or a hand-back to Opus, as deviceplan.hook_refusal decided it
     return deviceplan.hook_refusal(cmd, str(payload.get("cwd") or "")) or ""
 
@@ -1228,7 +1235,7 @@ def _pre_tool_use(payload: dict) -> tuple[dict | None, None]:
     if glmguard.glm_run() is not None and (why := glmguard.tool_refusal(payload)):   # every route to the chat model
         # a redirect (the reason and the allowed way; the run goes on) or a hand-back to Opus (no model call)
         return _deny(glmguard.refused(os.environ.get("TTP_RUN_DIR"), why)[1]), None
-    if payload.get("tool_name") == "Bash" and (why := _device_plan(payload)):
+    if why := _device_plan(payload):
         return _deny(why), None
     if why := _provenance(untrusted.mark_refusal(str(payload.get("tool_name") or ""), payload.get("tool_input") or {})):
         return _deny(why), None   # the run's untrusted-input mark, marked or not

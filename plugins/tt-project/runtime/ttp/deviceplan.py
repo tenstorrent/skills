@@ -212,6 +212,32 @@ def _words(cmd: str, depth: int = 0):
             yield x and (x[0], True)
 
 
+# A device's own files: reading one reads the chip, which can bring the host down on a chip off the bus, so in a
+# device run it is a step of Opus's plan. Listing them reads nothing (LISTERS); a commit message only names them.
+DEVICE_PATH = re.compile(r"/sys/class/tenstorrent\b|/dev/tenstorrent")
+LISTERS = frozenset({"ls", "dir", "vdir", "tree", "stat", "test", "[", "readlink", "realpath", "echo", "printf"})
+
+
+def device_read(cmd: str) -> bool:
+    """Whether `cmd` reads a device file (DEVICE_PATH) here or on another host: any use but a listing, a commit
+    message or text it prints; one that cannot be read counts."""
+    if not DEVICE_PATH.search(cmd):
+        return False
+    if re.search(r"<\s*['\"]?(?:" + DEVICE_PATH.pattern + ")", cmd):   # `< /sys/...`: _segs drops the redirect
+        return True
+    from . import hook
+    named = 0   # the mentions a listing, a commit message or printed text holds
+    for x in _words(cmd):
+        if x is None:
+            return True
+        n = sum(len(DEVICE_PATH.findall(a)) for a in x[0])
+        if n and os.path.basename(x[0][0]) not in LISTERS and x[0][:2] != ["git", "commit"]:
+            return True
+        named += n
+    # a mention the parser did not show as a word (`d=/dev/tenstorrent/0; xxd $d`) counts as a read
+    return len(DEVICE_PATH.findall(hook._split(cmd)[0])) > named
+
+
 def _matches(prog: str, entries) -> bool:
     """`prog` is one of `entries`: a bare name only as an unqualified program of that name (`/tmp/x/run.sh` is not
     `run.sh`), a path as that path or a program under it, and never through `..`."""
@@ -260,7 +286,8 @@ def risky(cmd: str, routes=tuple(DEFAULTS["power_routes"])) -> bool:
     from .hook import DEVICE_TOOLS
     for x in _words(cmd):
         if x is None:
-            return bool(RISKY.search(hook._split(cmd)[0]))
+            from .glmguard import text_blanked   # a commit message naming a reset resets nothing
+            return bool(RISKY.search(hook._split(text_blanked(cmd))[0]))
         w = x[0]
         prog, args = os.path.basename(w[0]), w[1:]
         if prog == "git":
@@ -465,6 +492,8 @@ def refusal(cmd: str, cwd: str = "", env=None, cfg: dict | None = None) -> str |
     from . import glmguard
     got = plan(run_dir)
     steps = (got or {}).get("steps") or []
+    if device_read(cmd) and not step_match(cmd, steps):   # never a redirect: the read itself is the harm
+        return f"out of plan: it reads a device file directly, which runs only as a step of Opus's plan: {cmd[:120]}"
     if why := glmguard.shell_refusal(cmd, ws, run_dir, e, power=False):
         if not why.startswith((glmguard.REMOTE_WHY, glmguard.SERVICE_WHY)):
             return why

@@ -794,3 +794,70 @@ def test_a_device_plan_still_unsourced_after_its_re_plan_never_reaches_the_run(t
     assert len(seen) == 2 and not row["ok"] and row["handed_back"] and "marked unsourced" in row["error"]
     assert json.loads((cur / "glm_guard.json").read_text())["kind"] == "plan"
     assert deviceplan.plan(cur) is None and not glmassist.planned(cur)
+
+
+# A host-side loop reading each chip's attributes with no plan (the replay), and other direct device reads
+_DP_SYS_LOOP = ('ls /sys/class/tenstorrent/ | head -40; echo ---; for d in /sys/class/tenstorrent/tenstorrent*; do'
+                ' c=$(cat "$d/chip_id" 2>/dev/null); hb=$(timeout 10 cat "$d/tt_heartbeat" 2>&1); echo "$d $c $hb";'
+                ' done 2>&1 | head -40')
+_DP_DEVICE_READS = [_DP_SYS_LOOP, "cat /sys/class/tenstorrent/tenstorrent0/tt_heartbeat",
+                    "head -c4 < /sys/class/tenstorrent/tenstorrent0/chip_id", "cd /sys/class/tenstorrent && cat x/chip_id",
+                    "d=/dev/tenstorrent/0; xxd $d", "ssh box-a 'cat /sys/class/tenstorrent/tenstorrent0/chip_id'",
+                    "python3 -c 'open(\"/dev/tenstorrent/0\").read()'", "echo `cat /sys/class/tenstorrent/x/chip_id`"]
+
+
+@pytest.mark.parametrize("cmd", _DP_DEVICE_READS)
+def test_a_direct_device_read_with_no_plan_is_out_of_plan_and_hands_back(cmd, tmp_path):
+    from ttp import deviceplan, glmguard
+    run, e = _dp_run(tmp_path)
+    why = deviceplan.refusal(cmd, str(tmp_path), e, {})
+    assert why and glmguard.classify(why)[1] == glmguard.HARMFUL, why
+    deviceplan.hook_refusal(cmd, str(tmp_path), e)
+    assert (run / glmguard.HIT).exists(), "never a redirect: the read itself can bring the host down"
+
+
+@pytest.mark.parametrize("cmd", ["ls /sys/class/tenstorrent/", "ls -l /dev/tenstorrent/",
+                                 "git commit -m 'read /sys/class/tenstorrent attributes'"])
+def test_listing_or_naming_device_files_is_no_device_read(cmd, tmp_path):
+    from ttp import deviceplan
+    run, e = _dp_run(tmp_path)
+    assert deviceplan.refusal(cmd, str(tmp_path), e, {}) is None
+
+
+def test_a_device_read_runs_as_a_step_of_opus_plan_and_only_that_step(tmp_path):
+    from ttp import deviceplan
+    run, e = _dp_run(tmp_path)
+    step = "cat /sys/class/tenstorrent/tenstorrent0/tt_heartbeat"
+    (run / deviceplan.PLAN_FILE).write_text(json.dumps({"steps": [{"n": 1, "command": step}]}))
+    assert deviceplan.refusal(step, str(tmp_path), e, {}) is None
+    assert deviceplan.refusal("cat /sys/class/tenstorrent/tenstorrent1/chip_id", str(tmp_path), e, {})
+
+
+@pytest.mark.parametrize("tool,args", [("Bash", {"command": _DP_SYS_LOOP}),
+                                       ("Read", {"file_path": "/sys/class/tenstorrent/tenstorrent0/chip_id"}),
+                                       ("Grep", {"pattern": ".", "path": "/dev/tenstorrent/0"})])
+def test_the_hook_hands_back_a_device_read_with_no_plan_from_any_tool(tool, args, tmp_path, monkeypatch):
+    from ttp import glmguard, hook
+    run, e = _dp_run(tmp_path)
+    monkeypatch.setenv("TTP_RUN_DIR", str(run))
+    out = hook._pre_tool_use({"tool_name": tool, "tool_input": args, "cwd": str(tmp_path)})[0]
+    assert out and out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert (run / glmguard.HIT).exists()
+
+
+def test_the_guarded_runner_hands_back_a_device_read_with_no_plan(tmp_path, monkeypatch):
+    from ttp import glmenv
+    run, e = _dp_run(tmp_path)
+    monkeypatch.setenv("TTP_RUN_DIR", str(run))
+    ran: list = []
+
+    class Base:
+        def execute(self, action, cwd="", *, timeout=None):
+            ran.append(action["command"])
+            return {"output": "ok", "returncode": 0}
+    if glmenv.LocalEnvironment is not object:
+        pytest.skip("minisweagent is importable here: its own environment class is the base")
+    env = type("Env", (glmenv.GuardedEnvironment, Base), {})()
+    with pytest.raises(glmenv.Submitted):
+        env.execute({"command": _DP_SYS_LOOP}, str(tmp_path))
+    assert ran == []

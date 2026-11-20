@@ -226,6 +226,15 @@ def hit_reason(run_dir) -> str:
 # match wins; a reason no rule names is harmful.
 HARMFUL, REDIRECTED = "harmful", "redirect"
 REFUSALS = "glm_refusals.jsonl"   # in the run folder: one {ts, rule, class, why, n, back} per refusal
+# The run folder's own records: the rest of it is the run's to write (`> "$TTP_RUN_DIR/advise.out"`)
+RUN_RECORDS = frozenset({"run.json", "refusals.jsonl", RUN_MARK, MARK, HIT, REFUSALS})
+GUARD_WHY = "a command may not edit the run's identity or the guard's own files"
+
+
+def _run_record(path: str, run_dir: str) -> bool:
+    """Whether `path` is one of the run folder's own records (RUN_RECORDS)."""
+    return bool(run_dir) and os.path.basename(path) in RUN_RECORDS \
+        and os.path.realpath(os.path.dirname(path)) == os.path.realpath(run_dir)
 REFUSAL_KEY = "glm_refusals"      # route.glm_refusals: {"hand_back_after": 3, "redirect": true}
 HAND_BACK_AFTER = 3
 _OUTSIDE = "outside its worktree"
@@ -473,7 +482,7 @@ def writes_outside(cmd: str, cwd: str, run_dir: str = "", env=None, inline: bool
     return [(p, why) for p, (cls, why) in sidefx.classify_paths(paths, os.path.expanduser("~"), cwd or os.getcwd(),
                                                                  run_dir).items()
             if cls == "write" and (inline or "inline code" not in why) and not p.startswith(sidefx.HARMLESS)
-            and not sidefx._inside(p, roots)]
+            and (not sidefx._inside(p, roots) or _run_record(p, run_dir))]
 
 
 def remote_writes(cmd: str, cwd: str = "") -> list[tuple[str, str]]:
@@ -484,6 +493,87 @@ def remote_writes(cmd: str, cwd: str = "") -> list[tuple[str, str]]:
     return [("~" + p[len(home):] if p == home or p.startswith(home + "/") else p, why)
             for p, (cls, why) in sidefx.classify_paths(cmd, home, there, "").items()
             if cls == "write" and "inline code" not in why and not p.startswith((there,) + sidefx.HARMLESS)]
+
+
+# Programs whose quoted words are text no shell runs: what they print, search for or record (`git commit -m`), and
+# what they send on through a pipe only to these readers (`grep "a|b" tests/ | head`)
+TEXT_ARGS = frozenset({"echo", "printf", "cat", "grep", "egrep", "fgrep", "rg"})
+TEXT_READERS = frozenset({"head", "tail", "sort", "uniq", "wc", "cut", "less", "more"}) | TEXT_ARGS - {"echo", "printf"}
+REDIRECT_OP = re.compile(r"(?<![<>])(?:&>>?|>>?|<<<|<(?![<(])|[<>]&)\s*")
+TEXT_TTP = frozenset({"advise", "note", "notify", "say", "ask"})   # `ttp advise --plan "..."`: the text is for Opus
+
+
+def _runs_inside(piece: str) -> bool:
+    """`piece` runs a command of its own: a `$(...)` or an unescaped backtick outside single quotes, or `<(`/`>(`."""
+    q, esc = "", False
+    for i, c in enumerate(piece):
+        if esc:
+            esc = False
+        elif q == "'":
+            q = "" if c == "'" else q
+        elif c == "\\":
+            esc = True
+        elif c == '"':
+            q = "" if q else '"'
+        elif c == "'" and not q:
+            q = "'"
+        elif c == "`" or c == "$" and piece[i + 1:i + 2] == "(" or not q and c in "<>" and piece[i + 1:i + 2] == "(":
+            return True
+    return False
+
+
+def text_blanked(cmd: str) -> str:
+    """`cmd` with the quoted words of commands that only print, search for or record text blanked (TEXT_ARGS,
+    `git commit`, the text subcommands of ttp) and the quoted heredoc bodies they read dropped: a commit message,
+    a grep pattern or an echo naming `systemctl restart` or `tt-flash` runs neither. Fail closed: a piece that runs
+    a command inside, pipes into anything but a reader, writes a file the command runs later or runs `rg --pre`
+    keeps its words."""
+    from . import hook
+    lines, bodies = hook._heredocs(cmd)
+    text = "\n".join(lines)
+    flags = hook._quoting(text)
+    cuts, start = [], 0
+    for i, c in enumerate(text):   # top-level commands, a line break ending one too (a quote may span lines)
+        if c in ";&|\n" and not flags[i][0] and flags[i][1] == 0 and text[i - 1:i] not in ("<", ">") \
+                and (c != "&" or text[i + 1:i + 2] != ">") and i >= start:
+            sep = text[i:i + 2] if c in "&|" and text[i + 1:i + 2] in (c, "&") else c
+            cuts.append((start, i, sep))
+            start = i + len(sep)
+    cuts.append((start, len(text), ""))
+    names = [hook._first_word(text[s:e]) for s, e, _ in cuts]
+
+    def inert(k: int) -> bool:
+        s, e, sep = cuts[k]
+        piece, name = text[s:e], names[k]
+        argv = next(iter(hook._segments(piece)), [])
+        if not (name in TEXT_ARGS or name == "git" and argv[1:2] == ["commit"]
+                or name == "ttp" and argv[1:2] and argv[1] in TEXT_TTP) or _runs_inside(piece) \
+                or name == "rg" and any(w == "--pre" or w.startswith("--pre=") for w in argv):
+            return False
+        j = k
+        while cuts[j][2] in ("|", "|&"):
+            j += 1
+            if names[j] not in TEXT_READERS or _runs_inside(text[cuts[j][0]:cuts[j][1]]):
+                return False
+        return not any(os.path.basename(m[2]) in hook._ran(text) for m in hook.REDIRECT_RE.finditer(piece))
+
+    keep = set()   # a redirection's target stays (`echo x > "$TTP_RUN_DIR/glm_guard.json"` writes that file)
+    for m in REDIRECT_OP.finditer(text):
+        j = m.end()
+        while j < len(text) and (flags[j][0] or text[j] not in " \t\n;&|<>()"):
+            keep.add(j)
+            j += 1
+    out, last = [], 0
+    for k, (s, e, _) in enumerate(cuts):
+        if inert(k):
+            out.append(text[last:s] + "".join(c if not flags[j][0] or j in keep else "''" if j == s or not flags[j - 1][0]
+                                              or j - 1 in keep else "" for j, c in enumerate(text[s:e], s)))
+            last = e
+    out.append(text[last:])
+    starts = [sum(len(x) + 1 for x in lines[:i]) for i in range(len(lines))]
+    kept = [ln for i, body, pos in bodies if not (hook.HEREDOC_RE.match(lines[i], pos)[2] and inert(
+        next(k for k, (s, e, _) in enumerate(cuts) if s <= starts[i] + pos <= e))) for ln in body]
+    return "\n".join(["".join(out)] + kept)
 
 
 def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None, remote: bool = False, writes: bool = True,
@@ -503,11 +593,12 @@ def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None, remote: bool 
                                if not (hook.HEREDOC_RE.match(lines[i], pos)[2]
                                        and hook._data_only(*hook._piece_at(lines[i], pos), "\n".join(lines)))
                                for ln in body])
-    if TAMPER.search(named):
-        return "a command may not edit the run's identity or the guard's own files"
+    text = text_blanked(cmd)   # a commit message, a grep pattern or an echo naming a command runs none
+    if TAMPER.search(text):
+        return GUARD_WHY
     if STATE_DB.search(named):
         return "a run on the GLM arm may not read or write the project's database or machine records by hand"
-    if services and (svc := SERVICE_RE.search(cmd)):
+    if services and (svc := SERVICE_RE.search(text)):
         return f"{SERVICE_WHY}: {svc.group(0)[:120]}"
     commands, _ = hook._split(cmd)   # heredoc bodies a program, not a shell, reads are its input
     for sub in pathguard._substitutions(commands):   # "$(...)" runs a command too
@@ -561,6 +652,8 @@ def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None, remote: bool 
         got = remote_writes(cmd)
         return f"{REMOTE_WHY}: {got[0][0]} ({got[0][1]})" if got else None
     got = writes_outside(cmd, cwd, run_dir, e)
+    if rec := next((p for p, _ in got if _run_record(p, run_dir)), None):
+        return f"{GUARD_WHY}: {rec}"
     return f"it writes outside its worktree: {got[0][0]} ({got[0][1]})" if got else None
 
 
@@ -582,6 +675,8 @@ def tool_refusal(payload: dict, env=None) -> str | None:
                                                               str(args.get("input") or args.get("patch") or ""))
         for p in paths:
             full = sidefx._expand(p, home, cwd, run_dir)
+            if _run_record(full, run_dir):
+                return f"{GUARD_WHY}: {full}"
             if not sidefx._inside(full, roots):
                 return f"it writes outside its worktree: {full}"
     return None

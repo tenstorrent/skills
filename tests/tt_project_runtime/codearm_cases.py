@@ -1674,3 +1674,70 @@ def test_glm_guard_reads_scratch_as_tmp_where_the_command_names_tmpdir(cmd, tmp_
     wt, rd = _gg_run(tmp_path)
     e = {"TTP_PROJECT": str(tmp_path / "proj"), "TMPDIR": str(rd / "tmp"), **_GG_RUN_ENV}
     assert glmguard.shell_refusal(cmd, str(wt), str(rd), e), cmd
+
+
+# Commands GLM runs bounced on for words only in text: a grep for the service rule, commit messages (heredoc, -m)
+# naming a service change or a reset, an Opus plan request naming device reads, and printed text
+_GG_TEXT_ONLY = {
+    "grep": 'cd {wt} && grep -rn "SERVICE_RE\\|systemctl restart" tests/ | head -20; ls tests/ | head -50',
+    "commit_heredoc": "cd {wt} && git add -A && git commit -q -F - <<'EOF'\nguard: read systemctl start/stop/restart"
+                      " as a service change\n\nA plan step may run it.\nEOF\ngit log --oneline -2",
+    "commit_m": 'cd {wt} && git commit -q -m "configwho: blame the newest change\n\nrows with a reset and an unknown'
+                ' setter named \\`ttp ask\\`." && git log --oneline -3',
+    "advise_plan": 'ttp advise --plan "one broker job on box-a that reads the chips from /sys/class/tenstorrent, then'
+                   ' systemctl restart svc-a" > "$TTP_RUN_DIR/advise.out" 2>&1 &\necho "advise pid $!"',
+    "rg": "rg -n 'tt-flash|systemctl stop' src/",
+    "echo": "echo 'then systemctl restart svc-a and tt-flash'",
+    "printf": 'printf "%s\\n" "reboot the box"',
+}
+
+
+@pytest.mark.parametrize("case", sorted(_GG_TEXT_ONLY))
+def test_glm_guard_lets_service_and_device_words_in_quoted_text_run(case, tmp_path):
+    from ttp import deviceplan, glmguard
+    wt, rd = _gg_run(tmp_path)
+    cmd = _GG_TEXT_ONLY[case].format(wt=wt)
+    e = {"TTP_PROJECT": str(tmp_path / "proj"), "TTP_RUN_DIR": str(rd), **_GG_RUN_ENV}
+    assert glmguard.shell_refusal(cmd, str(wt), str(rd), e) is None
+    assert not deviceplan.risky(cmd)
+
+
+@pytest.mark.parametrize("cmd", [
+    "sh -c 'systemctl restart svc-a'", "eval 'systemctl restart svc-a'", "echo 'systemctl restart svc-a' > r.sh; sh r.sh",
+    "printf '%s\\n' 'systemctl restart svc-a' |& sh", "cat <<'EOF' | sh\nsystemctl restart svc-a\nEOF",
+    "git commit -m \"$(systemctl restart svc-a)\"", "rg --pre 'systemctl restart svc-a' x .",
+    "echo x; tt-smi -r 0", "git commit -m 'x' && tt-flash fw.bin", "grep -q x f || reboot",
+    'echo x > "$TTP_RUN_DIR/glm_guard.json"',
+])
+def test_glm_guard_still_refuses_a_real_service_reset_or_guard_step_beside_quoted_text(cmd, tmp_path):
+    from ttp import glmguard
+    wt, rd = _gg_run(tmp_path)
+    e = {"TTP_PROJECT": str(tmp_path / "proj"), "TTP_RUN_DIR": str(rd), **_GG_RUN_ENV}
+    assert glmguard.shell_refusal(cmd, str(wt), str(rd), e), cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    'ttp advise --plan "check it; for each chip read it" > "$TTP_RUN_DIR/advise.out" 2>&1 &',
+    'echo x > "$TTP_RUN_DIR/notes/a.txt"',
+    'cp a "$TTP_RUN_DIR/b.txt"',
+])
+def test_glm_guard_lets_a_run_write_scratch_files_in_its_own_run_folder(cmd, tmp_path):
+    from ttp import glmguard
+    wt, rd = _gg_run(tmp_path)
+    e = {"TTP_PROJECT": str(tmp_path / "proj"), "TTP_RUN_DIR": str(rd), **_GG_RUN_ENV}
+    assert glmguard.shell_refusal(cmd, str(wt), str(rd), e) is None
+    assert glmguard.tool_refusal({"tool_name": "Write", "tool_input": {"file_path": f"{rd}/notes/b.md"},
+                                  "cwd": str(wt)}, e) is None
+
+
+@pytest.mark.parametrize("name", ["run.json", "glm_run.json", "glm_guard.json", "glm_guard.on", "refusals.jsonl",
+                                  "glm_refusals.jsonl"])
+def test_glm_guard_refuses_writes_to_the_run_folders_own_records_and_hands_them_back(name, tmp_path):
+    from ttp import glmguard
+    wt, rd = _gg_run(tmp_path)
+    e = {"TTP_PROJECT": str(tmp_path / "proj"), "TTP_RUN_DIR": str(rd), **_GG_RUN_ENV}
+    for why in (glmguard.shell_refusal(f'cp a "$TTP_RUN_DIR/{name}"', str(wt), str(rd), e),
+                glmguard.shell_refusal(f"ttp note hi > {rd}/{name} 2>&1 &", str(wt), str(rd), e),
+                glmguard.tool_refusal({"tool_name": "Write", "tool_input": {"file_path": f"{rd}/{name}"},
+                                       "cwd": str(wt)}, e)):
+        assert why and glmguard.classify(why)[1] == glmguard.HARMFUL, why
