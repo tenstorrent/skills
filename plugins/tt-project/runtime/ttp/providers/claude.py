@@ -4,35 +4,12 @@
 plan windows (utilization as a 0..1 fraction plus reset times), per-message usage, and a final
 `result` with the reported cost, the last message and any schema-validated output.
 
-Write fence (probed on CLI 2.1.285 and 2.1.296; Linux measured, macOS from the docs). Workers run
-with bypassPermissions and no sandbox by default. A project that sets `providers.claude.write_fence: true`
-gets, where the sandbox can start (Linux with bubblewrap and socat, macOS), the Bash sandbox (fence_args,
-sandbox_settings): Bash writes only its cwd, the CLI's own temp dir and the `filesystem.allowWrite` roots.
-Without a dependency that run goes unfenced and the daemon raises one observation.
-
-Measured on CLI 2.1.296 (Linux): only one `--settings` flag counts (a second replaced the first, sandbox
-and all), so the sandbox goes into the worker's settings JSON. Under bypassPermissions in `-p` the
-sandbox refused writes outside its roots from `touch` and `python3` (read-only file system) while
-HTTPS through its proxy, a Unix socket outside its roots, TMPDIR (set to the CLI's own temp dir) and
-`git commit` in the cwd worked; `ssh` could not resolve a host name (the sandbox has no network but
-its proxy), so the commands that reach other hosts are excluded by name (FENCE_EXCLUDED).
-
-| Question | Linux | macOS |
-| :- | :- | :- |
-| Fence Bash writes to a list of dirs | yes, `sandbox.enabled` + `sandbox.filesystem.allowWrite`; needs `bubblewrap` and `socat` | yes, Seatbelt, nothing to install |
-| Sandbox missing a dependency | runs unsandboxed with a warning (measured); `sandbox.failIfUnavailable` refuses to start instead (measured, exit 1) | n/a |
-| `allowUnsandboxedCommands: false` | drops the `dangerouslyDisableSandbox` retry (docs); no help when the sandbox could not start (measured) | same (docs) |
-| Edit deny rules under bypassPermissions | hold for Write/Edit and plain shell redirects and `cp` (measured), but a write from `python3 -c` passed (measured): a check, not a fence | same rules (docs) |
-| Unix socket under `state/` from the sandbox | allowed unless the optional seccomp filter is installed, then `network.allowAllUnixSockets` (docs) | only paths in `network.allowUnixSockets` (docs) |
-
-File tools (Read, Edit, Write) run outside the sandbox and follow permission rules only, so a fence
-needs both the sandbox and Edit deny rules. `--setting-sources` drops a source's sandbox and Edit
-entries; `--settings` keeps them.
+Workers run with bypassPermissions and the Bash sandbox off (worker_settings).
 
 Credential reads: a worker's `--settings` denies `Read(//<project>/tt-project/state/web.token)`
 (worker_settings); under bypassPermissions it refused both the Read tool and a plain `cat` of the
 file (measured, CLI 2.1.296). The Bash hook also refuses a command naming `state/web.token`. Like
-the Edit rules (a `python3 -c` write passed those), a check and not a fence; reads from an
+the Edit deny rules (a `python3 -c` write passed those), a check and not a fence; reads from an
 interpreter were not probed."""
 from __future__ import annotations
 
@@ -42,17 +19,15 @@ import os
 import re
 import shlex
 import subprocess
-import sys
 from collections import Counter
 from pathlib import Path
 from typing import NamedTuple
 
 from . import register
 from ..budget import Window
-from .. import fencefree
 from ..util import read_dict
 from .base import (LIMIT_RE, auth_error, challenged, MAX_ARG_BYTES, MAX_CACHE_BREAKPOINTS, Provider, RunUsage, cap_cache_breakpoints,
-                   cli_output, find_binary, last_json_object, request_rejected, status_check, strict_schema,
+                   cli_output, last_json_object, request_rejected, status_check, strict_schema,
                    drop_nulls, head80, input_hash, isolated_module_argv, jsonl_from, CMD_MAX)
 
 EXCLUDE_DYNAMIC = "--exclude-dynamic-system-prompt-sections"
@@ -180,7 +155,6 @@ class Claude(Provider):
     session_format = "claude-code"   # projects/<cwd slug>/<id>.jsonl (fork_session); the chat provider's too
     tool_hooks = True
     subagent_model_env = "CLAUDE_CODE_SUBAGENT_MODEL"
-    fence_optional = True   # the Bash sandbox (fence_args)
 
     def coord_tool_set(self, cwd):
         # The session tools come only with ttp's tool hooks (coordtools.session_tool_args); a subclass
@@ -222,8 +196,7 @@ class Claude(Provider):
         # A headless run kills its background tasks when it exits, so a job started that way dies
         # with the worker and the run ends with no hand-off. Without them, long jobs are detached.
         env = {"CLAUDE_CODE_ENABLE_CFC": "0", "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1"}
-        # The Bash sandbox's proxy host `localhost` does not resolve inside it: each command first
-        # makes it 127.0.0.1 (loopproxy).
+        # Each command first puts the harness bin back first on PATH (loopproxy).
         from ..loopproxy import env_file
         env.update(env_file(os.environ))
         return argv, env
@@ -311,37 +284,6 @@ class Claude(Provider):
         # 128 KiB (E2BIG: the agent never starts), so longer text leads the prompt instead.
         text = Path(path).read_text()
         return [flag, text] if len(text.encode()) <= MAX_ARG_BYTES else []
-
-    fence_by_name = True   # FENCE_EXCLUDED
-    loopback_forward = True   # loopproxy.sh forwards the host's loopback ports into each command
-
-    def write_fence(self, restrictions=None) -> str:
-        missing = fence_missing()
-        return f"bypassPermissions without the Bash sandbox, which needs {' and '.join(missing)}" if missing else ""
-
-    def fence_args(self, argv, dirs, cwd="", on=True, restrictions=None, freed=()):
-        # The sandbox goes into the worker's one --settings JSON: a second --settings flag replaces it.
-        if not on or fence_missing() or "--settings" not in argv:
-            return list(argv), False
-        argv = list(argv)
-        i = argv.index("--settings") + 1
-        try:
-            settings = json.loads(argv[i])
-        except (IndexError, ValueError):
-            return argv, False   # a settings file, not JSON: leave it as it is
-        argv[i] = json.dumps({**settings, "sandbox": sandbox_settings([cwd, *dirs] if cwd else list(dirs), freed)})
-        return argv, True
-
-    def launch_sandbox(self, argv):
-        if out := super().launch_sandbox(argv):
-            return out
-        i = argv.index("--settings") + 1 if "--settings" in argv else 0
-        try:
-            settings = json.loads(argv[i]) if i else {}
-        except (IndexError, ValueError):
-            return ""
-        on = isinstance(settings, dict) and (settings.get("sandbox") or {}).get("enabled")
-        return "claude-bash-sandbox" if on else ""
 
     def isolation_args(self) -> list[str]:
         # Flag settings (the harness hook) and --plugin-dir load whatever the sources are.
@@ -1009,7 +951,7 @@ def hook_settings() -> dict:
     cmd = shlex.join(isolated_module_argv("ttp.hook", runtime))   # never imports from the worktree
     return {"hooks": {"PostToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": f"{cmd} PostToolUse",
                                                                   "timeout": 20}]}],
-                      # A failed call gets no PostToolUse: the same updates, plus the sandbox mount race hint.
+                      # A failed call gets no PostToolUse: the same updates.
                       "PostToolUseFailure": [{"matcher": "*", "hooks": [{"type": "command",
                                                                          "command": f"{cmd} PostToolUseFailure",
                                                                          "timeout": 20}]}],
@@ -1031,67 +973,6 @@ def hook_settings() -> dict:
             "env": {"PYTHONPATH": runtime}}
 
 
-# Commands that run outside the Bash sandbox: inside it only its HTTP proxy is reachable (measured: ssh
-# could not resolve a host name), so whatever reaches another host or a local service directly would
-# fail there. They write as the worker does without a fence. Measured (CLI 2.1.296): a pattern frees a
-# command run on its own (also under `timeout N`, and `ttp lock <res> -- ssh ...` by its own pattern),
-# never one inside `&&`, `;` or a pipe, nor one a script runs. git starts ssh for an SSH remote, so its
-# network commands are freed by name too (measured: an excluded `git ls-remote git@host:...` resolved;
-# `X *` also frees a bare `X`; `git -C dir fetch` is not matched). The run's bin/git still runs them.
-# `ttp lock` is freed for its lock only: it runs a worker's command with no_new_privs and refuses sudo
-# and the like there (privlock.py); a privileged command goes through `ttp host-run`. A root-owned
-# service's unix socket (docker, system systemd) is another way around host-run: ttp lock refuses the
-# known clients by name so a worker does not use it this way by accident, but any program could still
-# open the socket. Accepted gap: the sandbox is the fence.
-FENCE_EXCLUDED = ("ssh *", "scp *", "sftp *", "rsync *", "ttp lock *", "ttp machines *", "ttp devq *",
-                  "ttp detach --remote *", "git fetch *", "git pull *", "git push *", "git ls-remote *",
-                  "git clone *", "git remote update *", "git submodule update *")
-# A project frees its own such commands in project.json (sandbox.fence_freed_commands, fencefree), never here.
-
-# Paths the Bash sandbox mounts over in its cwd so that no command writes them (shell and git start-up
-# files, editor and agent config), relative to the cwd. Where one does not exist, bubblewrap first
-# creates an empty file as the mount point, and it stays after the command ends: an untracked empty file
-# that `git add -A` commits, after which a checkout or rebase in a sandboxed worktree fails on it.
-# Measured on CLI 2.1.296 (Linux) from a worker's mounts. The plugin's one list of them: the pre-upgrade
-# commit stages none, and an upgrade untracks the empty ones a harness committed (cli._upgrade).
-SANDBOX_PLACEHOLDERS = (".bash_profile", ".bashrc", ".profile", ".zprofile", ".zshrc", ".gitconfig", ".gitmodules",
-                        ".idea", ".mcp.json", ".ripgreprc", ".vscode", ".claude/agents", ".claude/.cc-writes",
-                        ".claude/commands", ".claude/hooks", ".claude/launch.json", ".claude/loop.md",
-                        ".claude/output-styles", ".claude/routines", ".claude/scheduled_tasks.json",
-                        ".claude/settings.json", ".claude/settings.local.json", ".claude/skills", ".claude/workflows")
-
-
-def fence_missing() -> list[str]:
-    """What this host lacks for the Bash sandbox ([] when it can start): bubblewrap and socat on Linux,
-    nothing on macOS (Seatbelt); the CLI has no sandbox elsewhere."""
-    if sys.platform == "darwin":
-        return []
-    if sys.platform.startswith("linux"):
-        return [b for b in ("bwrap", "socat") if not find_binary(b)]
-    return ["Linux or macOS"]
-
-
-def tool_caches() -> list[str]:
-    """Per-user download and build caches that package managers and compilers write (pip, uv, ccache,
-    pre-commit and the like under the cache dir; npm; cargo's registry), those that exist."""
-    home = Path.home()
-    dirs = [Path(os.environ.get("XDG_CACHE_HOME") or home / ".cache"), home / ".npm",
-            home / ".cargo" / "registry", home / ".cargo" / "git"]
-    return [str(d) for d in dirs if d.is_dir()]
-
-
-def sandbox_settings(dirs, freed=()) -> dict:
-    """The worker's `sandbox` settings: Bash runs sandboxed without a prompt and never retries outside
-    it (allowUnsandboxedCommands false drops the dangerouslyDisableSandbox retry); it writes its cwd,
-    the CLI's temp dir, `dirs` and the tool caches. `freed`: the project's own commands run outside it
-    too (fencefree.commands). The network stays as bypassPermissions leaves it
-    (every host through the proxy); every Unix socket stays open (the harness's under state/)."""
-    return {"enabled": True, "autoAllowBashIfSandboxed": True, "allowUnsandboxedCommands": False,
-            "excludedCommands": list(dict.fromkeys([*FENCE_EXCLUDED, *fencefree.patterns(freed)])),
-            "filesystem": {"allowWrite": list(dict.fromkeys(d for d in [*dirs, *tool_caches()] if d))},
-            "network": {"allowAllUnixSockets": True}}
-
-
 def lean_settings() -> dict:
     """Bundled skills by name only, no auto-memory: a worker's, and a full-tools coordinator's, so a
     fork of its session lists the same skills (ctxfork.shape_argv)."""
@@ -1104,8 +985,7 @@ def worker_settings(denied_reads=()) -> dict:
     `denied_reads` gets a Read deny rule (`//` starts an absolute path in a rule); deny rules hold
     under bypassPermissions."""
     out = {**hook_settings(), **lean_settings(),
-           # No Bash sandbox, even one the user's own settings turn on; fence_args replaces this when the
-           # project turns the write fence on (providers.claude.write_fence).
+           # No Bash sandbox, even one the user's own settings turn on.
            "sandbox": {"enabled": False}}
     if denied_reads:
         out["permissions"] = {"deny": [f"Read(/{p})" for p in denied_reads if os.path.isabs(p)]}

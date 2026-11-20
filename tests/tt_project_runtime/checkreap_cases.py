@@ -39,7 +39,6 @@ def test_a_check_s_background_child_ends_with_it_and_leaves_no_sandbox_tree(env,
     """With no process sandbox to end them, what a check started in the background (still in its
     group) is ended once its exit code is known, the clean tree goes, and the log says so."""
     from ttp import checkreap, cli
-    _no_sandbox_tools(monkeypatch)
     tmp = _reap_tmp(tmp_path, monkeypatch)
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
     pidf = tmp_path / "bg.pid"
@@ -63,7 +62,6 @@ def test_an_orphaned_grandchild_in_the_run_s_own_scratch_ends_with_the_run(env, 
     from ttp import checkreap
     if not checkreap.PROC.exists() or not shutil.which("setsid"):
         pytest.skip("needs /proc and setsid")
-    _no_sandbox_tools(monkeypatch)
     _reap_tmp(tmp_path, monkeypatch)
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
     own = tmp_path / "scratch"   # what the checks supervisor makes the run's TMPDIR (checkdirs.scratch)
@@ -85,7 +83,7 @@ def test_an_orphaned_grandchild_in_the_run_s_own_scratch_ends_with_the_run(env, 
         _reap_kill(outside)
 
 
-def test_the_sweep_reaps_a_stale_sandbox_with_exit_json_or_a_dead_runner(env, tmp_path, monkeypatch):
+def test_the_sweep_reaps_a_stale_check_tree_with_exit_json_or_a_dead_runner(env, tmp_path, monkeypatch):
     """An earlier run's record that has ended (exit.json) or whose runner died: the processes in its
     recorded group with a working directory in its tree are ended, then the tree and record go."""
     from ttp import checkreap

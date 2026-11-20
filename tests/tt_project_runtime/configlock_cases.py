@@ -1,4 +1,4 @@
-# A held .git/config.lock (a sandbox's empty placeholder, another worktree being made) never refuses a
+# A held .git/config.lock (an empty leftover lock, another worktree being made) never refuses a
 # task's workspace: worktree add writes no config (--no-track), and a lock refusal is retried as
 # contention, not a counted try. tests/test_tt_project_runtime.py runs this file in its own namespace
 # (see _include_cases there): helpers, fixtures and imports come from that file.
@@ -9,7 +9,7 @@ LOCK_ERROR = ("Command 'git worktree add -B ttp/t7-x /w origin/main' failed: err
 
 
 def _held_config_lock(repo):
-    """An empty, read-only .git/config.lock, as the sandbox leaves it."""
+    """An empty, read-only .git/config.lock, as a killed process may leave it."""
     lock = pathlib.Path(subprocess.run(["git", "-C", str(repo), "rev-parse", "--git-common-dir"], capture_output=True,
                                        text=True, check=True).stdout.strip())
     lock = (lock if lock.is_absolute() else repo / lock) / "config.lock"

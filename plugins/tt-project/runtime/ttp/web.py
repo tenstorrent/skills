@@ -308,15 +308,6 @@ def usage_line(n: dict, now: float, where=None) -> str:
     return line
 
 
-def run_sandbox(run_dir: str | None) -> str:
-    """A run's sandbox state as run.json records it at launch (sandboxstate.run_summary), "" if unread."""
-    try:
-        rec = json.loads((Path(run_dir) / "run.json").read_text()) if run_dir else {}
-    except (OSError, ValueError):
-        return ""
-    return str(rec.get("sandbox_state") or "") if isinstance(rec, dict) else ""
-
-
 def last_note(run_dir: str | None) -> str:
     """The run's latest `ttp note`: what a worker says it is doing, without opening its log."""
     f = Path(run_dir) / "progress.md" if run_dir else None
@@ -515,7 +506,6 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
     live = runwatch.load(p)["runs"] if working else {}
     for w in working:
         rw = live.get(str(w["run"])) or {}
-        w["sandbox"] = run_sandbox(w["dir"])
         w["model"] = modelrank.label(w["model"], w["run_note"], w["dir"])   # a stand-in shows as one
         w["note"] = rw.get("note") or last_note(w.pop("dir"))
         w.pop("dir", None)

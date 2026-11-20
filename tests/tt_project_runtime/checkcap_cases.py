@@ -926,9 +926,9 @@ def test_test_slots_clamp_only_lowers_pytest_worker_counts_above_the_grant(env):
     assert c('pytest -k "x -n 64" -n 64 2>&1 | tail -n 99', 4) == 'pytest -k "x -n 64" -n 4 2>&1 | tail -n 99'
     assert c("cd tests/pytest && head -n 64 f", 4) == "cd tests/pytest && head -n 64 f", "not pytest's -n"
     assert testslots.over("pytest -k 'a; b' -n 64", 4) == [64]
-    argv = push.check_argv("pytest -n 64 tests", None, {**os.environ, testslots.HELD_ENV: "3"}, isolate=False)
+    argv = push.check_argv("pytest -n 64 tests", None, {**os.environ, testslots.HELD_ENV: "3"})
     assert argv[-1].endswith("pytest -n 3 tests")
-    assert push.check_argv("pytest -n 64 tests", None, {}, isolate=False)[-1].endswith("pytest -n 64 tests")
+    assert push.check_argv("pytest -n 64 tests", None, {})[-1].endswith("pytest -n 64 tests")
 
 
 def test_ttp_checks_passes_its_test_slot_grant_runs_without_nice_and_clamps_n(env, tmp_path, monkeypatch, capsys):
@@ -1430,7 +1430,7 @@ def test_a_pytest_n_above_the_budget_is_lowered_with_a_line_saying_so_and_refuse
     assert out.splitlines()[0].startswith("echo ") and "pytest -n 64 lowered to -n 4" in out
     assert out.splitlines()[1] == "cd x && pytest -n 4 tests"
     assert testslots.clamped("pytest -n 4 tests", 4) == "pytest -n 4 tests", "within it: as it is, no line"
-    argv = push.check_argv("pytest -n 64 tests", None, {**os.environ, testslots.HELD_ENV: "3"}, isolate=False)
+    argv = push.check_argv("pytest -n 64 tests", None, {**os.environ, testslots.HELD_ENV: "3"})
     r = subprocess.run(["bash", "-c", argv[-1].replace("pytest -n 3 tests", "true")], capture_output=True, text=True)
     assert "lowered to -n 3" in r.stderr and r.returncode == 0
     monkeypatch.setenv("TTP_TEST_SLOTS", "4")
@@ -4263,12 +4263,12 @@ def test_checks_wrap_lane_setting_and_where_the_lane_step_goes_in_a_checks_argv(
     lane = checklane.lane_argv("pa", "aaaaaaaaaaaa", "flock dev.lock")
     assert lane[:2] == (sys.executable, "-I") and lane[-1] == "--" and "aaaaaaaaaaaa" in lane
     wrapped = push.with_wrap(["pytest -q", push.Check("make test")], ("flock", "/tmp/dev.lock"), lane)
-    argv = push.check_argv(wrapped[0], isolate=False)
+    argv = push.check_argv(wrapped[0])
     assert argv[:2] == ["flock", "/tmp/dev.lock"] and tuple(argv[2:2 + len(lane)]) == lane, argv
     assert argv[2 + len(lane)].endswith(("bash", "sh")), "the command itself runs after the step"
-    plain = push.check_argv(push.with_wrap(["pytest -q"], ())[0], isolate=False)
+    plain = push.check_argv(push.with_wrap(["pytest -q"], ())[0])
     assert not any("wraplane" in w for w in plain), "no wrapper: no lane step"
-    before = push.check_argv(push.with_wrap(["pytest -q"], ("flock", "/tmp/dev.lock"))[0], isolate=False)
+    before = push.check_argv(push.with_wrap(["pytest -q"], ("flock", "/tmp/dev.lock"))[0])
     assert not any("wraplane" in w for w in before), "checks.wrap_lane before: no step inside the wrapper"
 
 

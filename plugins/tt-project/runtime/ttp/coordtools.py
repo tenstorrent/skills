@@ -336,7 +336,7 @@ def _protected_why(f: str) -> str:
            if name.startswith("CHARTER") else
            "change memory with the `memory_add` and `memory_forget` actions" if name in ("MEMORY.md", "memory") else
            "change settings with the `config_set` action or `ttp config KEY VALUE` (both refuse the user-only "
-           "keys: spend caps, providers.<name>.write_fence and the rest; ask the user for those)"
+           "keys: spend caps and the rest; ask the user for those)"
            if name == "project.json" else
            "the state database (tasks, kv) changes only through actions and the ttp CLI (task_add, task_update, "
            "`ttp task ...`)")

@@ -1,7 +1,7 @@
 """The first process of a bench cell's `unshare` namespace (cellns.py): standalone (run with `python3 -I -S`,
 inside `unshare --user --map-current-user --keep-caps --mount --pid --fork --kill-child`; it imports nothing
-from the runtime). It builds the cell's root from nothing, then runs the agent as its child, the way
-sandbox_init.py does: its exit code is the namespace's.
+from the runtime). It builds the cell's root from nothing, then runs the agent as its child: its exit code is
+the namespace's.
 
 Arguments, before `--`: `--root=<dir>` (an existing folder: the new root is a tmpfs mounted there) and the
 plan, one word each: `--ro=<src>:<dst>`, `--bind=<src>:<dst>` (a folder or a file), `--tmpfs=<dst>`,

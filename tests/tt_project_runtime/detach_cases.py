@@ -2480,108 +2480,10 @@ def test_a_detached_jobs_lock_is_kept_by_a_process_it_left_running_until_that_en
     detach.reap_children()
 
 
-_PROXY_URL = "http://user:s3cr3t@127.0.0.1:41234"
-
-
-def test_sandbox_only_names_loopback_proxies_in_either_case_and_keeps_others():
-    from ttp import loopproxy
-    env = {"HTTPS_PROXY": _PROXY_URL, "https_proxy": "http://localhost:3128", "HTTP_PROXY": "127.8.9.10:80",
-           "http_proxy": "http://[::1]:3128/", "ALL_PROXY": "socks5h://LOCALHOST:1080",
-           "all_proxy": "http://[::ffff:127.0.0.1]:8080", "NO_PROXY": "127.0.0.1,localhost"}
-    assert sorted(loopproxy.sandbox_only(env)) == sorted(k for k in env if k != "NO_PROXY")
-    others = {"HTTPS_PROXY": "http://proxy.example.com:3128", "https_proxy": "http://127.0.0.1.example.com:1",
-              "HTTP_PROXY": "http://localhost.example.com:1", "http_proxy": "http://10.0.0.1:3128",
-              "ALL_PROXY": "http://user:127.0.0.1@proxy.example.com:1", "all_proxy": "",
-              "no_proxy": "localhost", "FTP_PROXY": _PROXY_URL}
-    assert loopproxy.sandbox_only(others) == []
-    assert loopproxy.sandbox_only({"HTTPS_PROXY": "http://[bad"}) == []
-
-
-def test_a_queued_job_leaves_loopback_proxies_out_and_never_logs_their_url(env, tmp_path, monkeypatch, capsys):
-    """A job queued from a sandboxed command starts at the daemon without the sandbox's loopback proxy
-    variables (upper and lower case), with the daemon's own proxy, a non-loopback one and NO_PROXY kept;
-    the URL appears in no output and no queue file. A record queued before the fix is cleaned too."""
-    from ttp import detach
-    p = make(env)
-    run_dir = p.runs / "proxy"
-    run_dir.mkdir(parents=True)
-    job = {"HTTPS_PROXY": _PROXY_URL, "https_proxy": _PROXY_URL, "ALL_PROXY": _PROXY_URL,
-           "http_proxy": "http://proxy.example.com:3128", "NO_PROXY": "127.0.0.1,localhost", "no_proxy": "x"}
-    for k in ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy", "NO_PROXY",
-              "no_proxy"):
-        monkeypatch.delenv(k, raising=False)
-    monkeypatch.setenv("all_proxy", "http://daemon-proxy.example.com:1")
-    rcs = []
-    for name in ("new", "old"):
-        rc, out = run_dir / f"{name}.rc", run_dir / f"{name}.env"
-        q = detach.enqueue(p.state, rc, run_dir / f"{name}.log", ["sh", "-c", f"env >{out}"], str(tmp_path), job)
-        if name == "old":   # as queued before loopback proxies were dropped
-            m = json.loads(q.read_text())
-            m["env"] = {**m["env"], **job}
-            q.write_text(json.dumps(m))
-        else:
-            assert _PROXY_URL not in q.read_text()
-        rcs.append((rc, out))
-    err = capsys.readouterr().err
-    assert "HTTPS_PROXY" in err and "https_proxy" in err and "ALL_PROXY" in err
-    assert "127.0.0.1" not in err and "s3cr3t" not in err and "proxy.example.com" not in err
-    detach.tend(p)
-    for rc, out in rcs:
-        assert _wait_for_path(rc) and rc.read_text().strip() == "0"
-        got = dict(line.split("=", 1) for line in out.read_text().splitlines() if "=" in line)
-        assert not {"HTTPS_PROXY", "https_proxy", "ALL_PROXY"} & set(got)
-        assert got["http_proxy"] == "http://proxy.example.com:3128"
-        assert got["all_proxy"] == "http://daemon-proxy.example.com:1"
-        assert got["NO_PROXY"] == "127.0.0.1,localhost" and got["no_proxy"] == "x"
-    out = capsys.readouterr()
-    assert "s3cr3t" not in out.out + out.err
-
-
-def test_a_resumable_job_relaunched_by_the_daemon_leaves_loopback_proxies_out(env, tmp_path):
-    from ttp import detach
-    p = make(env)
-    run_dir = p.runs / "proxyresume"
-    run_dir.mkdir(parents=True)
-    rc, out = run_dir / "job.rc", run_dir / "job.env"
-    detach.save_resume(rc, run_dir / "job.log", ["sh", "-c", f"env >{out}"], str(tmp_path),
-                       {"HTTPS_PROXY": _PROXY_URL, "http_proxy": "http://proxy.example.com:3128"}, "boot-a")
-    assert _PROXY_URL not in detach.resume_file(rc).read_text()
-    why, pid = detach.relaunch(rc, "boot-b")
-    assert not why and pid > 1 and _wait_for_path(rc)
-    got = out.read_text()
-    assert "s3cr3t" not in got and "http_proxy=http://proxy.example.com:3128" in got
-
-
-@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="no_new_privs is Linux only")
-def test_a_detached_job_runs_with_no_new_privs_so_sudo_cannot_gain_privileges(tmp_path, monkeypatch):
-    """Every start path (a worker's direct start, the daemon's queued, relaunched and heal fix starts)
-    goes through detach.start, which fences the job of a run the daemon sandboxed. A sandboxed test
-    runner has the flag already, so the spy shows the start asks for the fence itself."""
-    from ttp import detach, locks, privlock
-    asked, real = [], privlock.no_new_privs_preexec
-    monkeypatch.setattr(privlock, "no_new_privs_preexec", lambda: asked.append(1) or real())
-    monkeypatch.setenv("TTP_RUN_ID", "71")
-    monkeypatch.setenv(privlock.SANDBOXED_ENV, "1")   # a run the daemon sandboxed (write fence on)
-    rc = tmp_path / "run" / "job.rc"
-    rc.parent.mkdir()
-    lock = locks.try_take([locks.job_lock(rc)], "detached job job", "read its own flag")
-    try:
-        detach.start(rc, rc.with_suffix(".log"), ["sh", "-c", "grep NoNewPrivs /proc/self/status"],
-                     str(tmp_path), dict(os.environ), lock)
-    finally:
-        lock.close()
-    assert _wait_for_path(rc) and rc.read_text().strip() == "0"
-    assert re.search(r"NoNewPrivs:\s*1", rc.with_suffix(".log").read_text())
-    assert asked == [1]
-    detach.reap_children()
-
-
-def test_a_detached_job_of_an_unsandboxed_run_keeps_its_privileges(tmp_path, monkeypatch):
-    """By default runs are unsandboxed (no write fence): detach.start sets no no_new_privs, so sudo works."""
-    from ttp import detach, locks, privlock
-    asked, seen = [], {}
-    monkeypatch.setattr(privlock, "no_new_privs_preexec", lambda: asked.append(1))
-    monkeypatch.delenv(privlock.SANDBOXED_ENV, raising=False)
+def test_a_detached_job_keeps_its_privileges(tmp_path, monkeypatch):
+    """detach.start sets no no_new_privs (no preexec_fn), so sudo works in the job."""
+    from ttp import detach, locks
+    seen = {}
     real_popen = detach.subprocess.Popen
 
     def popen(*a, **k):
@@ -2596,7 +2498,7 @@ def test_a_detached_job_of_an_unsandboxed_run_keeps_its_privileges(tmp_path, mon
     finally:
         lock.close()
     assert _wait_for_path(rc) and rc.read_text().strip() == "0"
-    assert asked == [] and seen == {"preexec_fn": None}
+    assert seen == {"preexec_fn": None}
     detach.reap_children()
 
 
@@ -2620,12 +2522,6 @@ def test_the_wrapper_writes_its_started_file_by_rename_so_no_reader_sees_it_empt
     assert view.read_text() == "stale\n", "the wrapper truncated .started in place"
     assert not [f.name for f in rc.parent.iterdir() if f.name.endswith(".tmp")], "a temp file was left"
     detach.reap_children()
-
-
-def test_the_no_new_privs_preexec_is_none_off_linux(monkeypatch):
-    from ttp import privlock
-    monkeypatch.setattr(privlock.os, "uname", lambda: os.uname_result(("Darwin", "h", "r", "v", "m")))
-    assert privlock.no_new_privs_preexec() is None and privlock.no_new_privs() is False
 
 
 def test_detach_check_host_on_the_own_machine_reads_it_here_with_no_ssh(env, tmp_path, monkeypatch):
@@ -3011,81 +2907,12 @@ def _check_report(p, marker=None):
     return report
 
 
-def _sandbox_verdict(sandbox, tries=5):
-    """sandbox.status() once its probe answered: on a loaded host a probe can time out, which is no
-    verdict (status probes again on the next call) and makes sandbox.wrap run the command unsandboxed."""
-    for _ in range(tries):
-        pre, why = sandbox.status()
-        if pre or sandbox.TIMED_OUT not in why:
-            return pre, why
-    pytest.fail(f"the sandbox probe timed out {tries} times: {why}")
-
-
-def test_sandbox_verdict_asks_again_after_a_probe_that_timed_out(monkeypatch):
-    """A timed-out probe makes sandbox.wrap run a command as it is (the flake of the sandboxed checks test:
-    its check ran unsandboxed, so `ttp detach` started the job itself); _sandbox_verdict waits for an answer."""
-    from ttp import sandbox
-    answers = iter([(None, f"unshare: {sandbox.TIMED_OUT}"), (None, f"bwrap: {sandbox.TIMED_OUT}"), (["/sb"], "")])
-    monkeypatch.setattr(sandbox, "_STATE", {})
-    monkeypatch.setattr(sandbox, "_probe", lambda: next(answers))
-    monkeypatch.setattr(sandbox, "inside", lambda: False)
-    on = {sandbox.ENV: "1", "TTP_NO_DEVICE": ""}
-    assert sandbox.wrap(["true"], True, on) == ["true"]
-    assert _sandbox_verdict(sandbox) == (["/sb"], "")
-    assert sandbox.wrap(["true"], True, on)[0] == "/sb"
-    monkeypatch.setattr(sandbox, "_STATE", {})
-    monkeypatch.setattr(sandbox, "_probe", lambda: (None, "bwrap: exit 1"))
-    assert _sandbox_verdict(sandbox) == (None, "bwrap: exit 1")   # a real verdict: no sandbox here
-
-
-def test_a_sandboxed_checks_detached_job_is_started_by_the_daemon_and_outlives_the_check(env, tmp_path, monkeypatch):
-    """A push check run in the process sandbox (TTP_SANDBOX_CHECKS=1) starts `ttp detach gate -- ...` and
-    exits 75. The job is queued (the sandbox would end it with the check), the daemon starts it outside,
-    and it runs to its end and writes its .rc. It keeps the check's device masking, never the check's
-    own fd and reaper variables."""
-    from ttp import detach, sandbox
-    monkeypatch.setenv("TTP_DEVICE_NODES", "")
-    monkeypatch.setenv("TTP_CHECKS_TMP_FD", "8")      # the daemon's own, as one started from a check has:
-    monkeypatch.setenv("TTP_CHECK_SANDBOX", "outer")  # never passed on to the job
-    p = make(env)
-    marker = p.state / "pushes" / "m1.json"
-    marker.parent.mkdir(parents=True)
-    marker.write_text(json.dumps({"status": "running"}))
-    report = _check_report(p, marker)
-    hb, go, seen = tmp_path / "hb", tmp_path / "go", tmp_path / "env"
-    job = f"env >{shlex.quote(str(seen))}; while [ ! -e {shlex.quote(str(go))} ]; do echo beat >>{shlex.quote(str(hb))}; sleep 0.05; done"
-    check = f"{shlex.quote(sys.executable)} {shlex.quote(str(TTP))} detach gate -- sh -c {shlex.quote(job)}; exit 75"
-    e = {**os.environ, "TTP_PROJECT": str(p.base), "TTP_RUN_DIR": str(report), "TTP_SANDBOX_CHECKS": "1",
-         "TTP_NO_DEVICE": "1", "TT_VISIBLE_DEVICES": "", "TTP_CHECKS_TMP_FD": "9", "TTP_CHECK_SANDBOX": "tok"}
-    for k in ("TTP_PIDNS", "TTP_CGROUP", "TTP_DETACHED"):
-        e.pop(k, None)
-    if not sandbox.inside():   # else the check runs in this one, which `ttp detach` sees
-        pre, why = _sandbox_verdict(sandbox)
-        if pre is None:
-            pytest.skip(f"no process sandbox works on this host: {why}")
-    cmd = sandbox.wrap(["sh", "-c", check], True, e)
-    assert sandbox.inside() or cmd[:len(pre)] == pre, "the check must run in the sandbox"
-    r = subprocess.run(cmd, env=e, cwd=str(tmp_path), capture_output=True, text=True, timeout=60)
-    assert r.returncode == 75 and "queued" in r.stdout, r
-    rc = report / "gate.rc"
-    detach.tend(p)   # the daemon's tick
-    assert _wait_for_path(hb), "the job never ran outside the check"
-    go.touch()
-    assert _wait_for_path(rc) and rc.read_text().strip() == "0", (r.stdout, r.stderr)
-    got = dict(line.split("=", 1) for line in seen.read_text().splitlines() if "=" in line)
-    assert got.get("TTP_NO_DEVICE") == "1" and got.get("TT_VISIBLE_DEVICES") == ""
-    assert "TTP_CHECKS_TMP_FD" not in got and "TTP_CHECK_SANDBOX" not in got
-    assert _ttp_run(p, "detach", "--check", str(rc)).returncode == 0
-    detach.tend(p)   # the next tick
-    assert not list((p.state / detach.BOUND).glob("*.json")), "an ended job's bound record goes"
-
-
 def test_an_unsandboxed_checks_detached_job_is_queued_so_the_checks_reaper_never_ends_it(env, tmp_path, monkeypatch):
     """A push check or `ttp checks` command run with no process sandbox (none works on the host, or none is
     asked for) starts `ttp detach gate -- ...`. Started there, the job would carry the check's reaper token
     and die once the check ended (checkreap): it is queued instead, the daemon starts it without the token,
     and a reap of the check's token leaves it running to its end."""
-    from ttp import checkreap, cli, detach, push, sandbox
+    from ttp import checkreap, cli, detach, push
     monkeypatch.setenv("TTP_DEVICE_NODES", "")
     p = make(env)
     report = _check_report(p)
@@ -3093,11 +2920,10 @@ def test_an_unsandboxed_checks_detached_job_is_queued_so_the_checks_reaper_never
     tok = checkreap.token()
     for k, v in {"TTP_PROJECT": str(p.base), "TTP_RUN_DIR": str(report), checkreap.MARKER: tok}.items():
         monkeypatch.setenv(k, v)
-    for k in ("TTP_PIDNS", "TTP_CGROUP", "TTP_DETACHED", "TTP_LOCKS_HELD", "TTP_SANDBOX_CHECKS"):
+    for k in ("TTP_PIDNS", "TTP_CGROUP", "TTP_DETACHED", "TTP_LOCKS_HELD"):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setattr(push, "_boxed", lambda: False)
     monkeypatch.setattr(detach, "foreign_pidns", lambda: False)
-    monkeypatch.setattr(sandbox, "inside", lambda: False)
     monkeypatch.chdir(tmp_path)
     rc = report / "gate.rc"
     try:
@@ -3156,7 +2982,7 @@ def test_a_checks_queued_job_ends_at_its_bound_or_once_its_owner_marker_is_gone(
 def test_a_cpu_only_checks_queued_job_starts_in_no_namespace(env, tmp_path, monkeypatch):
     """A check that holds no device (TTP_NO_DEVICE=1) queues a job: the daemon starts it as it is, in no
     namespace (it sees what the host sees), with the check's TTP_NO_DEVICE and device mask kept."""
-    from ttp import detach, locks, sandbox
+    from ttp import detach, locks
     dev = tmp_path / "dev-tt"
     dev.mkdir()
     (dev / "0").write_text("")
@@ -3165,7 +2991,7 @@ def test_a_cpu_only_checks_queued_job_starts_in_no_namespace(env, tmp_path, monk
     report = _check_report(p)
     out, rc = tmp_path / "seen", report / "plain.rc"
     job = f"ls -A {shlex.quote(str(dev))} >{shlex.quote(str(out))}; echo \"$TTP_NO_DEVICE:$TT_VISIBLE_DEVICES:\" >>{shlex.quote(str(out))}"
-    e = {k: v for k, v in os.environ.items() if k != sandbox.ENV}
+    e = dict(os.environ)
     detach.enqueue(p.state, rc, report / "plain.log", ["sh", "-c", job], str(tmp_path),
                    {**e, "TTP_NO_DEVICE": "1", "TT_VISIBLE_DEVICES": ""}, bound=detach.check_bound(None))
     detach.tend(p)
@@ -3244,14 +3070,8 @@ def test_a_checks_detached_job_keeps_its_files_after_the_push_exits_busy_and_its
     exits 75; its check scratch goes before the daemon starts the job. The job still starts, in its own
     work dir under the project's state ($TTP_JOB_DIR, its cwd once the check's is gone), with a TMPDIR of its
     own outside the check's: it writes files there and finds them later. Both go once it ends."""
-    from ttp import detach, sandbox
+    from ttp import detach
     monkeypatch.setenv("TTP_DEVICE_NODES", "")
-    # The check must run sandboxed, so its `ttp detach` queues the job: a probe slowed by a loaded host
-    # is waited out, never read as "no sandbox here" (the job would then start at once, in the scratch).
-    monkeypatch.setattr(sandbox, "PROBE_S", 600)
-    monkeypatch.setattr(sandbox, "_STATE", {})
-    if not (sandbox.inside() or sandbox.status()[0]):
-        pytest.skip(f"no PID-namespace sandbox here: {sandbox.status()[1]}")
     p = make(env)
     marker = p.state / "pushes" / "m1.json"
     marker.parent.mkdir(parents=True)
@@ -3267,12 +3087,13 @@ def test_a_checks_detached_job_keeps_its_files_after_the_push_exits_busy_and_its
            + shlex.quote(str(seen)) + '; printf "%s\\n%s\\n%s\\n" "$s" "$TTP_JOB_DIR" "$TMPDIR" >>'
            + shlex.quote(str(seen)))
     check = f"{shlex.quote(sys.executable)} {shlex.quote(str(TTP))} detach gate -- sh -c {shlex.quote(job)}; exit 75"
-    e = {**os.environ, "TTP_PROJECT": str(p.base), "TTP_RUN_DIR": str(report), "TTP_SANDBOX_CHECKS": "1",
-         "TTP_NO_DEVICE": "1", "TT_VISIBLE_DEVICES": "", "TTP_CHECK_SANDBOX": "tok",
+    e = {**os.environ, "TTP_PROJECT": str(p.base), "TTP_RUN_DIR": str(report),
+         "TTP_NO_DEVICE": "1", "TT_VISIBLE_DEVICES": "",
          **dict.fromkeys(("TMPDIR", "TMP", "TEMP"), str(check_tmp))}
     for k in ("TTP_PIDNS", "TTP_CGROUP", "TTP_DETACHED"):
         e.pop(k, None)
-    r = subprocess.run(sandbox.wrap(["sh", "-c", check], True, e), env=e, cwd=str(head),
+    e["TTP_PIDNS"] = "pid:[other]"   # a namespace other than the run's: its `ttp detach` queues the job
+    r = subprocess.run(["sh", "-c", check], env=e, cwd=str(head),
                        capture_output=True, text=True, timeout=60)
     assert r.returncode == 75 and "queued" in r.stdout, r
     shutil.rmtree(check_tmp)   # the push that exited busy removes its check scratch

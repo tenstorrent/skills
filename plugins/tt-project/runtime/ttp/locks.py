@@ -197,8 +197,8 @@ def _pgid(pid: int) -> int | None:
 
 def taker(env=None) -> dict:
     """The fields a take gives the process that owns its hold (a slot label, the activity log): pid,
-    pgid, node and pidns. That is this process, except in a PID namespace other than its run's (TTP_PIDNS;
-    a `ttp sandbox`), where its own pid (often 2 or 13: a kernel thread's on the host) means nothing to a
+    pgid, node and pidns. That is this process, except in a PID namespace other than its run's (TTP_PIDNS),
+    where its own pid (often 2 or 13: a kernel thread's on the host) means nothing to a
     reader there: it names the run's agent instead (child.pid in TTP_RUN_DIR, the leader of its own
     process group, with the start time the runner recorded there as pid_start) and keeps its own as ns_pid and ns_pidns. A candidate that is a kernel thread is never
     named: the fields fall back to this process and say so in owner_fallback."""
@@ -1177,7 +1177,7 @@ def record_wait(run_dir: Path, key: str, start: float, end: float | None,
     Several commands of one run may wait at once; the flock keeps their updates from overwriting
     each other, and the rename keeps readers from seeing half a file. While open, the waiter holds an
     exclusive flock on a live file of its own, which ends with its process: readers test that, never
-    its pid, which inside a PID-namespace sandbox (ttp sandbox, bwrap) names another process outside.
+    its pid, which inside a PID namespace other than the run's names another process outside.
     `locks`: the canonical locks it waits on (wait_rows), kept when the closing call leaves them out;
     none for a wait that is not on a resource lock (a checks lane, a push)."""
     run_dir = Path(run_dir)
@@ -1912,12 +1912,9 @@ def in_run(run_dir: Path | None) -> bool:
 
 
 def other_pid_ns() -> bool:
-    """Whether this process may run in a PID namespace other than its run's agent's: inside a `ttp
-    sandbox`, in another namespace than TTP_PIDNS, under a /proc of another namespace, or where it
-    cannot tell. Hosts other than Linux have no PID namespaces."""
-    from . import sandbox
-    if sandbox.inside():
-        return True
+    """Whether this process may run in a PID namespace other than its run's agent's: in another
+    namespace than TTP_PIDNS, under a /proc of another namespace, or where it cannot tell. Hosts other
+    than Linux have no PID namespaces."""
     if not sys.platform.startswith("linux"):
         return False
     try:
@@ -1931,7 +1928,7 @@ def other_pid_ns() -> bool:
 
 def _ancestors() -> set[int]:
     """The pids above this process, up to and with init (this process too): an agent may be its PID
-    namespace's init (a container's first process, or a test's parent right under `ttp sandbox`)."""
+    namespace's init (a container's first process, or a test's parent in a PID namespace other than the run's)."""
     out, pid = set(), os.getpid()
     while pid > 0 and pid not in out and len(out) < 256:
         out.add(pid)
@@ -1944,7 +1941,7 @@ def under_run_agent(dbs: list[Path] | None = None) -> bool:
     this machine's projects (or of `dbs`, project databases), with the start token it recorded. A
     worker can unset TTP_RUN_ID and the like, but not change which process started it. A run whose
     agent's tools were re-parented (`nohup ... &` after its shell exited) is not seen. In a PID
-    namespace of its own (`ttp sandbox`, or another than the run's TTP_PIDNS) the walk stops at the
+    namespace other than the run's (TTP_PIDNS) the walk stops at the
     namespace's init and cannot see the agent: True there, and whenever the namespace cannot be read."""
     if other_pid_ns():
         return True

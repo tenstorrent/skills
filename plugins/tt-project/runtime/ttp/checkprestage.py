@@ -133,7 +133,7 @@ def run_derived(p, ids: list[str], checks: list, top: str, env: dict, say, run_d
                 base: str = "") -> int:
     """Run the derived pre-stage `ids` as `run` does (0: start the full checks, 1: start nothing),
     the way the project's pytest check among `checks` runs (push.check_argv: its venv, its "env"
-    exports, and its process sandbox unless it opts out). No test selected passes, and a pytest internal or usage error never
+    exports). No test selected passes, and a pytest internal or usage error never
     holds the full checks back; a failure is
     recorded for the daily audit (CAUGHT_KEY). Its test times go to DURATIONS in `run_dir`, so a
     test found slow there is left out next time; on a timeout, from each test's end as it happened,
@@ -169,12 +169,10 @@ def run_derived(p, ids: list[str], checks: list, top: str, env: dict, say, run_d
 
 
 def _check(cmd: str, checks: list):
-    """`cmd` as a check run the way the project's pytest check among `checks` runs: with its exports
-    and its sandbox opt-out."""
+    """`cmd` as a check run the way the project's pytest check among `checks` runs: with its exports."""
     from . import push
     check = push.Check(cmd)
     check.env = tuple(getattr(pytest_check(checks), "env", ()) or ())
-    check.sandbox = getattr(pytest_check(checks), "sandbox", True) is not False
     return check
 
 

@@ -630,11 +630,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # coordinator, a second one (second_s later) notifies the user at high. markers: extra words that
     # count as urgent; enabled false: off. Such a message also skips the relay window and debounce.
     "urgent_msg": {"enabled": True, "ack_s": 60, "first_s": 300, "second_s": 300, "markers": [], "keep_h": 24, "stale_s": 900, "cut_after_s": 30, "read_s": 90},
-    # The project's own host-reaching commands (a script in its harness bin/ that wraps ssh), which a
-    # fenced Claude worker runs outside the Bash sandbox as a simple command, as it runs ssh (fencefree.py):
-    # each a name in bin/ or {command, env: [VAR, ...]} (also frees `VAR=... name ...`).
-    # checks: run check and test commands in their own PID namespace (sandbox.py); off by default.
-    "sandbox": {"fence_freed_commands": [], "checks": False},
     # Paths no run writes (pathguard): added to its built-in credential folders, never replacing them;
     # also an account setting (ttp config --account), which every project on the host adds.
     # user_site: "auto" refuses installs into the shared ~/.local while `ttp list` shows several projects
@@ -849,8 +844,8 @@ EXTRA_KEYS = {
     "detach": {"launcher_stops"},
     "power": {"keep_awake"},
     # device_timeout_max_s: a ceiling on device-job timeouts (off: unset); see device_timeout_max.
-    # host_commands, host_command_timeout_s: what `ttp host-run` may run outside a worker's sandbox and
-    # for how long (hostrun.py; none, 120 s).
+    # host_commands, host_command_timeout_s: what `ttp host-run` may run on the host through the daemon
+    # and for how long (hostrun.py; none, 120 s).
     "runner": {"device_timeout_max_s", "host_commands", "host_command_timeout_s"},
     # forbidden_patterns, forbidden_patterns_file: text memory and charter writes refuse (forbidden.py).
     "memory": {"forbidden_patterns", "forbidden_patterns_file"},
@@ -862,12 +857,9 @@ EXTRA_KEYS = {
     "screen": {"hold_mute_escalate_h", "throughput_mute_max_h"},
 }
 OPEN_SECTIONS = {"resources", "resources_tasks"}           # any name below is fine
-# write_fence: true runs the provider's workers in its optional write fence (Claude's Bash sandbox, Codex's
-# workspace-write, Provider.fence_args) where the host can run it; off by default (providers.fence_on).
-# loopback_ports: extra host loopback ports fenced workers reach (loopproxy.ports_env), or false for none.
 # write_dirs: extra directories inside the project root fenced workers may write (write_dirs below).
-PROVIDER_KEYS = {"billing", "tiers", "plugin_dirs", "worker_isolation", "write_fence", "mcp_servers", "mcp_withheld",
-                 "disallowed_tools", "loopback_ports", "write_dirs",
+PROVIDER_KEYS = {"billing", "tiers", "plugin_dirs", "worker_isolation", "mcp_servers", "mcp_withheld",
+                 "disallowed_tools", "write_dirs",
                  # connect_timeout_ms: how long a run that keeps the account connectors waits for them at
                  # start (Claude's MCP_CONNECT_TIMEOUT_MS; Daemon._with_connector_wait).
                  "connect_timeout_ms",
@@ -1044,7 +1036,7 @@ def _extra_form(form: str, value: Any) -> bool:
 
 def key_type_problem(dotted: str, value: Any) -> str | None:
     """Why `value` cannot be saved at `dotted`: a key whose default is a list or an object (or a provider
-    key in PROVIDER_KEY_TYPES) given another JSON type, e.g. "" turning sandbox.fence_freed_commands
+    key in PROVIDER_KEY_TYPES) given another JSON type, e.g. "" turning a list
     into a string, other than a plain form its reader takes (KEY_EXTRA_FORMS). Sections are
     section_value_problem's. None when fine or the key has no such type. Project.set_config applies it,
     so `ttp config`, the coordinator's config_set and the web app refuse alike."""
@@ -1114,6 +1106,10 @@ RETIRED_KEYS = {
     "effort_ab.decided_at": "the effort A/B ended; Jev's pick (effort_ab.jev_pick) is all that is left",
     "bridge.agent_alert_grace_min": "replaced by bridge.agent_alert_after_min (when the user is told) and "
                                     "bridge.agent_steady_min (when an outage ends)",
+    **dict.fromkeys(("sandbox", "sandbox.checks", "sandbox.fence_freed_commands",
+                     *(f"providers.{n}.write_fence" for n in ("claude", "codex", "cursor", "chat")),
+                     "providers.claude.loopback_ports", "providers.chat.loopback_ports"),
+                    "workers and checks always run unsandboxed: the sandbox is gone"),
 }
 
 
@@ -3389,7 +3385,7 @@ def layered(raw: dict) -> dict:
 
 # A chat worker is Claude Code too: unset, these keys take claude's value, so a routed model never
 # gets the user's plugins, MCP servers or withheld connectors that claude workers are kept from.
-CHAT_INHERITS = ("worker_isolation", "mcp_withheld", "loopback_ports", "connect_timeout_ms")
+CHAT_INHERITS = ("worker_isolation", "mcp_withheld", "connect_timeout_ms")
 
 
 def _chat_inherits(cfg: dict) -> None:

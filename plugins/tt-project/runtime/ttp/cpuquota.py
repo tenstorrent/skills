@@ -4,7 +4,7 @@
 
 nice and ionice do not protect a live service in another cgroup: cgroup v2 splits CPU between slices
 by cpu.weight, so a suite niced to 19 in user.slice still takes its slice's share from a service in
-system.slice. This runs every check command (testslots.low_priority) and every `ttp sandbox` test run
+system.slice. This runs every check command and every pooled `ttp sandbox` pytest run (testslots.low_priority)
 inside a group with a hard CPU limit: a systemd --user scope with CPUQuota, else the delegated cgroup v2
 directory checks.cpu_cgroup names (a child group per run, with cpu.max).
 

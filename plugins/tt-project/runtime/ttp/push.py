@@ -50,7 +50,7 @@ from typing import Any, Callable
 from urllib.parse import quote, unquote
 
 from . import (checkcap, checkdirs, checkspill, checkwait, checklane, cleantree, coordtools, envfault, gatejudge, gatetime, gitcache, ghroute, gitmemo, hoststate, landed, landmark, leakfile, locks, machines, outscan, ponytail, pooladmit, prguard, prhead, remotecheck, remoteload, repoid, runner, runnerenv, scratchhome,
-               sandbox, settinghold, setupfault, sharedchecks, shorttmp, syntaxfault, testslots, timefmt, verified, workerloss, worktree)
+               settinghold, setupfault, sharedchecks, shorttmp, syntaxfault, testslots, timefmt, verified, workerloss, worktree)
 from . import __version__
 from .budget import DOC_SUFFIXES, task_default_usd
 from .db import continues_id, dependency_ids, load_result
@@ -107,9 +107,8 @@ class Check(str):
     `ttp checks --purpose` runs it (untagged: both; `ttp push --own` is candidate); `ttp push` and the
     push queue run every entry. `"host": "<ssh alias>"` runs it on that machine (remotecheck), with
     `"env": {...}` exported where it runs; `"host": "local"` keeps it here when `delivery.checks_host` sets a
-    default host (`default_host`, never part of the config form). A local check runs in a process
-    sandbox (sandbox.py); `"sandbox": false` runs it without, for a check that needs the host's
-    process table. A local check runs in a clean checkout of the commit (cleantree); `"cwd": "authoring"`
+    default host (`default_host`, never part of the config form). `"sandbox"` is accepted and ignored
+    (old configs). A local check runs in a clean checkout of the commit (cleantree); `"cwd": "authoring"`
     runs it in the worktree being checked instead, for a check that needs build outputs or a venv made
     there, and `ttp checks` labels its pass as not run from a clean tree. `"silent_s": <seconds>` is how long
     `ttp checks` lets it run with no new output before stopping it as hung (checkwall.SILENT_S by default; 0
@@ -133,7 +132,6 @@ class Check(str):
     env: tuple[tuple[str, str], ...] = ()
     default_host = ""
     wrap: tuple[str, ...] = ()
-    sandbox = True
     cwd = ""
     silent_s: float | None = None
     pytest: bool | None = None
@@ -145,7 +143,7 @@ class Check(str):
 
     def config(self) -> str | dict:
         """The form project.json keeps."""
-        if not (self.if_exists or self.if_changed or self.purpose or self.host or self.env or not self.sandbox
+        if not (self.if_exists or self.if_changed or self.purpose or self.host or self.env
                 or self.cwd or self.silent_s is not None or self.ignore_paths or self.pytest is not None
                 or self.spill is not None or self.spill_wrap_cmd):
             return str(self)
@@ -160,8 +158,6 @@ class Check(str):
             out["host"] = self.host
         if self.env:
             out["env"] = dict(self.env)
-        if not self.sandbox:
-            out["sandbox"] = False
         if self.cwd:
             out["cwd"] = self.cwd
         if self.silent_s is not None:
@@ -177,6 +173,7 @@ class Check(str):
         return out
 
 
+# "sandbox" is ignored: checks no longer run in a sandbox; old configs that set it stay valid.
 CHECK_KEYS = {"run", "if_exists", "if_changed", "purpose", "host", "env", "sandbox", "cwd", "silent_s", "ignore_paths",
               "pytest", "spill", "spill_wrap_cmd"}
 PURPOSES = ("candidate", "harness")   # `ttp checks --purpose`; candidate is the default and publication evidence
@@ -211,7 +208,6 @@ def _check(c: Any) -> Check | None:
         out.purpose = c.get("purpose") or ""
         out.host = str(c.get("host") or "").strip()
         out.env = tuple(sorted((c.get("env") or {}).items()))
-        out.sandbox = c.get("sandbox") is not False
         out.cwd = "" if c.get("cwd") in (None, "clean") else c["cwd"]
         out.silent_s = c.get("silent_s")
         out.ignore_paths = _globs(c.get("ignore_paths"))
@@ -620,19 +616,15 @@ def outside_scope(checks: list[Check], skipped: list[str]) -> bool:
             and all(getattr(s, "scoped", False) for s in own))
 
 
-def check_argv(cmd: str, top: str | Path | None = None, env: dict | None = None, isolate: bool = True,
-               commit: str = "") -> list[str]:
+def check_argv(cmd: str, top: str | Path | None = None, env: dict | None = None, commit: str = "") -> list[str]:
     """How a check command runs: first-failure semantics, so `a; b` fails when `a` fails and a
     pipeline fails when any stage does (bash `-e -o pipefail`; plain `sh -e` where bash is missing).
     With `top` (the worktree it runs in), a bare pytest runs with the repository's venv, else the one
     `env` (the check's environment; default this process's) has active (venv_cmd). A check with a host
-    (remote_host) runs there instead, on a copy of `commit`, else of the checkout's HEAD (remotecheck).
-    A local check runs in a process sandbox (sandbox.wrap) unless it opts out or `isolate` is false;
-    sandbox_lines says when one cannot."""
+    (remote_host) runs there instead, on a copy of `commit`, else of the checkout's HEAD (remotecheck)."""
     exports = dict(getattr(cmd, "env", ()) or ())
     wrap = tuple(getattr(cmd, "wrap", ()) or ())
     lane = tuple(getattr(cmd, "lane", ()) or ()) if wrap else ()
-    isolate = isolate and getattr(cmd, "sandbox", True) is not False
     if host := remote_host(cmd):
         there, py = _ship_plugins(exports, tuple(getattr(cmd, "ship_py", ()) or ()))
         # A spill host is checked against the project's spill list again as the check starts (remotecheck.main)
@@ -644,18 +636,9 @@ def check_argv(cmd: str, top: str | Path | None = None, env: dict | None = None,
     cmd = remotecheck.exports(exports) + testslots.clamp_for(cmd, env)
     bash = shutil.which("bash")
     argv = [bash, "-e", "-o", "pipefail", "-c", cmd] if bash else ["sh", "-e", "-c", cmd]
-    # checks.wrap_cmd goes outside the sandbox: a lock or queue script sees the host as it does elsewhere.
+    # checks.wrap_cmd: a lock or queue script sees the host as it does elsewhere.
     # With checks.wrap_lane "after", the lane step runs inside the wrapper, before the command.
-    return [*wrap, *lane, *sandbox.wrap(argv, isolate, env)]
-
-
-def sandbox_lines(checks: list) -> list[str]:
-    """What a run of `checks` says about its process sandbox: why there is none (once), and each
-    local check that opted out. Nothing when every local check runs in one."""
-    local = [c for c in checks if not remote_host(c)]
-    off = [c for c in local if getattr(c, "sandbox", True) is False] if sandbox.opted_in() else []
-    lines = [notice for notice in [sandbox.notice()] if notice and len(off) < len(local)]
-    return lines + [f"{c}: {sandbox.notice(False)}" for c in off]
+    return [*wrap, *lane, *argv]
 
 
 VENV_DIRS = (".venv", "venv")
@@ -1690,7 +1673,7 @@ def _form_problem(c: dict) -> str | None:
     extra = sorted(set(map(str, c)) - CHECK_KEYS)
     if extra:
         return (f"{c!r}: unknown key(s) {', '.join(extra)}; a check object takes only run, if_exists, if_changed, "
-                "purpose, host, env, sandbox, cwd, silent_s, ignore_paths, pytest, spill and spill_wrap_cmd")
+                "purpose, host, env, cwd, silent_s, ignore_paths, pytest, spill and spill_wrap_cmd")
     cond = c.get("if_exists")
     if cond is not None and not _repo_relative(cond):
         return f"{c!r}: if_exists must be a path or glob inside the repository"
@@ -4403,8 +4386,6 @@ def _own_checks(repo: Path, remote: str, branch: str, head: str, base: str | Non
     with slot:
         started = time.time()
         env = {**check_env("own", tip, check_run_dir, branch), **slot.env()}
-        for line in sandbox_lines(todo):
-            say(line)
         excused = False
         for cmd in todo:
             cmd, rc = _run_or_here(cmd, repo, env, say, seen := {},
@@ -4792,8 +4773,6 @@ def _round_checks(repo: Path, remote: str, branch: str, run: list, head: str, ti
         steps.go("checks")
         started = time.time()
         env = {**check_env("target", tip, check_run_dir, branch), **slot.env()}
-        for line in sandbox_lines(run):
-            say(line)
         excused = set()
         for cmd in run:
             cmd, rc = _run_or_here(cmd, repo, env, say, seen := {},
@@ -4837,7 +4816,7 @@ CHECK_GROUP = (sys.executable, "-I", str(Path(__file__).with_name("checkgroup.py
 
 def _end_group(pgid: int) -> None:
     """SIGKILL what is left of an ended check's process group `pgid` (its pid, started in a session of its
-    own): a background process it left behind ends with it, as no namespace reaps it (sandbox.py)."""
+    own): a background process it left behind ends with it, as no namespace reaps it."""
     try:
         os.killpg(pgid, signal.SIGKILL)
     except OSError:   # nothing left, or not allowed: nothing of the check's to end

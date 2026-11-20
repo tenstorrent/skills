@@ -4,26 +4,26 @@
 
 
 def test_config_empty_value_removes_a_list_key_and_its_default_applies(env, capsys):
-    """`ttp config NAME sandbox.fence_freed_commands ''` once wrote "" over the list; now it removes the
+    """`ttp config NAME overlap.ignore ''` once wrote "" over the list; now it removes the
     key, prunes the section it leaves empty and the effective value is the default list again. A provider
     list key with no built-in default (providers.claude.write_dirs) is removed alike; a key never set is
     reported, nothing written."""
     from ttp import cli
     from ttp.project import DEFAULT_CONFIG
     p = make(env)
-    cli.main(["config", "demo", "sandbox.fence_freed_commands", '["make"]'])
+    cli.main(["config", "demo", "overlap.ignore", '["make"]'])
     cli.main(["config", "demo", "providers.claude.write_dirs", '["out"]'])
-    assert p.raw_config()["sandbox"]["fence_freed_commands"] == ["make"]
+    assert p.raw_config()["overlap"]["ignore"] == ["make"]
     capsys.readouterr()
-    cli.main(["config", "demo", "sandbox.fence_freed_commands", ""])
+    cli.main(["config", "demo", "overlap.ignore", ""])
     assert "removed" in capsys.readouterr().out
-    assert "fence_freed_commands" not in (p.raw_config().get("sandbox") or {})
-    assert p.config()["sandbox"]["fence_freed_commands"] == DEFAULT_CONFIG["sandbox"]["fence_freed_commands"]
+    assert "ignore" not in (p.raw_config().get("overlap") or {})
+    assert p.config()["overlap"]["ignore"] == DEFAULT_CONFIG["overlap"]["ignore"]
     cli.main(["config", "demo", "providers.claude.write_dirs", ""])
     assert "write_dirs" not in p.raw_config()["providers"].get("claude", {})
     assert isinstance(p.raw_config()["providers"], dict), "a section still holding other keys stays"
     before = p.config_path.read_text()
-    cli.main(["config", "demo", "sandbox.fence_freed_commands", ""])
+    cli.main(["config", "demo", "overlap.ignore", ""])
     assert "was not set" in capsys.readouterr().out
     assert p.config_path.read_text() == before
 
@@ -35,10 +35,10 @@ def test_config_refuses_a_mistyped_list_or_object_value_and_writes_nothing(env, 
     from ttp import cli
     p = make(env)
     before = p.config_path.read_text()
-    for key, val, want in (("sandbox.fence_freed_commands", "make", "a JSON list"),
-                           ("sandbox.fence_freed_commands", '""', "a JSON list"),
-                           ("sandbox.fence_freed_commands", "3", "a JSON list"),
-                           ("sandbox.fence_freed_commands", "null", "a JSON list"),
+    for key, val, want in (("overlap.ignore", "make", "a JSON list"),
+                           ("overlap.ignore", '""', "a JSON list"),
+                           ("overlap.ignore", "3", "a JSON list"),
+                           ("overlap.ignore", "null", "a JSON list"),
                            ("review.risky_paths", '{"a": 1}', "a JSON list"),
                            ("providers.claude.write_dirs", "out", "a JSON list"),
                            ("coordinator.turn_timeouts_s", "[1]", "a JSON object")):
@@ -135,8 +135,8 @@ def test_config_set_and_the_web_settings_path_run_the_same_type_check(env, monke
     /api/config (both call it after their own per-key validator) refuse a mistyped value alike."""
     from ttp import coordinator as coord
     p = make(env)
-    with pytest.raises(ValueError, match="sandbox.fence_freed_commands needs a JSON list"):
-        p.set_config("sandbox.fence_freed_commands", "")
+    with pytest.raises(ValueError, match="overlap.ignore needs a JSON list"):
+        p.set_config("overlap.ignore", "")
     with pytest.raises(ValueError, match="waiting.wake_gate needs a JSON object"):
         p.set_config("waiting.wake_gate", "off")
     assert "wake_gate" not in (p.raw_config().get("waiting") or {})
@@ -217,12 +217,12 @@ def test_coordinator_config_set_refuses_a_mistyped_list_or_object_value(env, mon
     when the key's own converter lets it through; the right type still sets."""
     from ttp import coordinator as coord
     p = make(env)
-    monkeypatch.setitem(coord.USER_SETTABLE, "sandbox.fence_freed_commands", lambda v: v)
+    monkeypatch.setitem(coord.USER_SETTABLE, "overlap.ignore", lambda v: v)
     monkeypatch.setitem(coord.USER_SETTABLE, "coordinator.turn_timeouts_s", lambda v: v)
     before = p.config_path.read_text()
-    for key, val, want in (("sandbox.fence_freed_commands", "make", "a JSON list"),
-                           ("sandbox.fence_freed_commands", 3, "a JSON list"),
-                           ("sandbox.fence_freed_commands", None, "a JSON list"),
+    for key, val, want in (("overlap.ignore", "make", "a JSON list"),
+                           ("overlap.ignore", 3, "a JSON list"),
+                           ("overlap.ignore", None, "a JSON list"),
                            ("coordinator.turn_timeouts_s", [1], "a JSON object")):
         probs = coord.apply(p, [{"type": "config_set", "key": key, "value": val}], user_turn=True)
         assert probs and f"{key} needs {want}" in probs[0] and "nothing was written" in probs[0], (key, val, probs)
@@ -587,12 +587,12 @@ def test_config_add_appends_one_item_to_a_list_key_dedupes_and_refuses_other_key
     from ttp import cli
     from ttp.project import DEFAULT_CONFIG
     p = make(env)
-    default = list(DEFAULT_CONFIG["sandbox"]["fence_freed_commands"])
-    cli.main(["config", "demo", "sandbox.fence_freed_commands", "--add", "make"])
-    assert p.config()["sandbox"]["fence_freed_commands"] == default + ["make"]
-    cli.main(["config", "demo", "sandbox.fence_freed_commands", "--add", "make"])
+    default = list(DEFAULT_CONFIG["overlap"]["ignore"])
+    cli.main(["config", "demo", "overlap.ignore", "--add", "make"])
+    assert p.config()["overlap"]["ignore"] == default + ["make"]
+    cli.main(["config", "demo", "overlap.ignore", "--add", "make"])
     assert "already has" in capsys.readouterr().out
-    assert p.config()["sandbox"]["fence_freed_commands"] == default + ["make"]
+    assert p.config()["overlap"]["ignore"] == default + ["make"]
     cli.main(["config", "demo", "providers.claude.write_dirs", "--add", "out"])   # a list key with no default
     assert p.config()["providers"]["claude"]["write_dirs"] == ["out"]
     before = p.config_path.read_text()

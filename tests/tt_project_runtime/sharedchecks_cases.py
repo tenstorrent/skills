@@ -821,14 +821,11 @@ def test_the_tip_rerun_runs_only_the_failing_ids_in_its_own_worktree_and_removes
     assert str(d._tip_dir(key)) not in wts
 
 
-def test_the_tip_rerun_runs_its_tests_in_the_process_sandbox_like_every_check(env, monkeypatch):
-    # Push-branch test code run by the daemon gets its own PID namespace (sandbox.wrap via
-    # push.check_argv), so it cannot see or signal the daemon or other workers; still niced.
-    from ttp import daemon as dmod, sandbox, sharedchecks, worktree
+def test_the_tip_rerun_runs_its_tests_niced(env, monkeypatch):
+    # Push-branch test code run by the daemon runs as a check (push.check_argv), niced like workers.
+    from ttp import daemon as dmod, sharedchecks, worktree
     p = make(env)
     tip = subprocess.run(["git", "-C", str(p.root), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
-    monkeypatch.setattr(sandbox, "status", lambda: (["/sb/unshare", "--pid"], ""))
-    monkeypatch.setattr(sandbox, "inside", lambda: False)
     real, started = subprocess.Popen, []
 
     def popen(argv, *a, **kw):
@@ -837,9 +834,6 @@ def test_the_tip_rerun_runs_its_tests_in_the_process_sandbox_like_every_check(en
             return None
         return real(argv, *a, **kw)
     monkeypatch.setattr(subprocess, "Popen", popen)
-    monkeypatch.setenv(sandbox.ENV, "0")   # restored after the test: the daemon sets it from the config
-    from ttp import configwho
-    p.set_config("sandbox", {"checks": True}, by=configwho.by("user", via="cli"))   # opt-in, on the user's word
     d = dmod.Daemon(p.base)
     d.cfg = {**d.cfg, "runner": {**(d.cfg.get("runner") or {}), "nice": 7}}
     ids = ["tests/test_a.py::test_x", "tests/test_b.py::test_y[1 2]"]
@@ -848,7 +842,6 @@ def test_the_tip_rerun_runs_its_tests_in_the_process_sandbox_like_every_check(en
     (argv, kw), = started
     child = argv[7:]
     assert child[:3] == ["nice", "-n", "7"]
-    assert child[3:5] == ["/sb/unshare", "--pid"]
     assert child[-1].endswith("tests/test_a.py::test_x 'tests/test_b.py::test_y[1 2]'") and "-m pytest -q" in child[-1]
     assert kw["env"]["TTP_NO_DEVICE"] == "1"
     worktree._git(p.root, "worktree", "remove", "--force", str(d._tip_dir(key) / "wt"), check=False)

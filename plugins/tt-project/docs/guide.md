@@ -357,7 +357,7 @@ coordinator with that evidence.
   no-change hand-off) or `refused` (no harness commit named, one on neither line, a `none:` hand-off
   whose branch still holds unmerged commits, or a branch that does not fast-forward),
   with `TTP_HARNESS_LANDING_WHY` saying what the worker can do. A harness-landed check should fail only
-  on `refused`: a worker's sandbox cannot write the harness checkout, so it can never merge there itself.
+  on `refused`: the worker never merges into the harness checkout itself.
   The merge is made in a scratch worktree; the harness checkout then only moves forward to it, the
   ref first (a refusal, such as the template guard's, writes no file), and git updates only files that
   still match the old HEAD. Land never runs `checkout --`, reset, stash or merge --abort there. An
@@ -1497,8 +1497,7 @@ in, and one the CLI refreshes there is written back to the real file only while 
 since the cell began (`bench.scratch_home` false keeps the CLIs' own folders). A cell whose runner hangs keeps its spend so far. The agent's environment carries no `PYTHONPATH` to the
 harness runtime. A transcript that names a denied path or the landed commit, or runs history or
 forge commands (`git fetch`, `git log --all`, `gh api`), flags the cell as failed. Otherwise the
-held-out files are copied in and the held-out tests run (`--test-cmd`, default `python3 -m pytest`;
-wrap it in `ttp sandbox --` to run candidate code sandboxed). The agent, with everything it starts,
+held-out files are copied in and the held-out tests run (`--test-cmd`, default `python3 -m pytest`). The agent, with everything it starts,
 and then the grade each run in a fresh virtualenv in the cell's own temporary folder, never shared
 between cells: its bin first on `PATH`, `VIRTUAL_ENV` set, `PYTHONNOUSERSITE=1` and
 `PIP_REQUIRE_VIRTUALENV=1`, `PIP_USER` unset and `PYTHONUSERBASE` in the cell. So no cell installs
@@ -2062,8 +2061,7 @@ counts, with budget caps checked on that figure. Without it, chat spend is booke
 Isolation: chat workers are Claude Code workers, so `providers.chat.worker_isolation` and
 `providers.chat.mcp_withheld` work as the `providers.claude` keys do (below). Unset, each takes
 the claude value: a routed model gets none of your MCP servers, plugins or withheld connectors
-that claude workers are kept from. `providers.chat.loopback_ports` likewise takes
-claude's value while unset. Set any for chat to differ; `ttp doctor` prints isolation
+that claude workers are kept from. Set any for chat to differ; `ttp doctor` prints isolation
 per provider, marking chat's when it comes from claude.
 
 ## Jev (optional add-on)
@@ -2499,8 +2497,7 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   holder; it clears when the wait ends. A `ttp checks` slot waiter alerts only while a holder is not
   judged alive (dead, reused pid, or one the daemon cannot judge): a queue behind live checks is normal.
   A task waiting on `ttp devq probe <runner> <job>` alerts as `lock-wait:devq:<runner>`, naming the
-  running job, its task and pid. The daemon's tick is what releases a dead holder's lock: waiters in a
-  sandbox may not judge holders, and check-slot and devq waiters do not sweep, so a lock only its dead
+  running job, its task and pid. The daemon's tick is what releases a dead holder's lock: check-slot and devq waiters do not sweep, so a lock only its dead
   holder's run keeps is freed within about 2 min. One global lock order: take narrower locks (one host,
   device or machine) before wider ones (site- or cluster-wide, such as a power-cycle or maintenance lock),
   never wait for a narrower lock while holding a wider one; a script that needs both takes them in that
@@ -2551,10 +2548,9 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   one; `ttp detach --check` prints `stopped on purpose rc=137 (<why>)` and the closed record is `ended`
   with `stopped` and the why.
   anyone else is refused (exit 3). A stopped job is never relaunched at boot.
-  A push check or `ttp checks` command that runs `ttp detach` has its job queued, sandboxed or not (the
-  check's process sandbox, a PID namespace, or else its leftover reaper would end it with the check): the daemon starts it outside within
-  seconds, with the check's device masking (`TTP_NO_DEVICE`, `TT_VISIBLE_DEVICES`, hidden device
-  nodes) and without the check's own fds and reaper token, and its .rc and .log stay in the check's
+  A push check or `ttp checks` command that runs `ttp detach` has its job queued (else the check's leftover
+  reaper would end it with the check): the daemon starts it outside within seconds, with the check's
+  device masking (`TTP_NO_DEVICE`, `TT_VISIBLE_DEVICES`) and without the check's own fds and reaper token, and its .rc and .log stay in the check's
   report folder. No task owns such a job, so the task sweep and leftover stops never end it; its
   owner is the push or checks run named in the check allocation's `owner.json`. The daemon ends it
   6 hours after it was queued or once that owner's marker file is gone, whichever comes first, with
@@ -2577,9 +2573,8 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   queued the same way, so the pid in a job's record (detached.json) is the host's, stored with that
   pid's start time: every pid check (stops, bounds, remote verdicts) takes a pid whose start time
   differs as gone, and liveness itself reads the job's lock, never a pid. A check that needs a job
-  to outlive it uses `ttp detach`, never `setsid`, `nohup` or a `$$` pid file: those die with the
-  check's sandbox, and the pid they record is the namespace's, which names an unrelated process (or
-  none) on the host.
+  to outlive it uses `ttp detach`, never `setsid`, `nohup` or a `$$` pid file: the check's leftover
+  reaper ends those with the check.
   `ttp detach --stop <name>` with no job recorded stops a driver
   the project's own launcher started: NAME.pid in the path's folder, $TTP_RUN_DIR or the task's t<id>
   folder, once its pid is verified (start time, user, project), gets a STOP file beside it, then SIGTERM and
@@ -2614,7 +2609,7 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   exits 0 also once that file (on that host) has more than n lines, and 0 once the job ended or its driver
   is gone, else 1. A retry_when that tests only an end marker over ssh is flagged. `ttp ssh-preflight <host>` exits 0 once the host answers over ssh
   and 255 while not (12 with `--classified`), 10 when its host key does not verify, 11 when
-  authentication fails and 13 when this process cannot gain privileges (no_new_privs, a sandboxed run)
+  authentication fails and 13 when this process cannot gain privileges (no_new_privs)
   and the host's ProxyCommand runs sudo, which ssh reports as `kex_exchange_identification` (ssh runs
   with strict host-key checking and no connection sharing);
   `ttp ssh-preflight @<resource>` looks the host up in config `device.hosts`
@@ -2966,8 +2961,7 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   `--result` probe; it never fails the checks. A foreground `ttp checks` (a tool call) waits a
   minute at most: then it starts the same checks detached, in the same place in the queue, prints
   their `retry_when` and exits 75 (with no project it waits on in the foreground).
-  Slots are OS file locks, so a crash or reboot frees them. Workers' sandboxes may write the slot
-  directory; where it cannot be written, the checks stop with an error naming it (exit 2; a push
+  Slots are OS file locks, so a crash or reboot frees them. Where the slot directory cannot be written, the checks stop with an error naming it (exit 2; a push
   does not go) instead of running uncapped. Unset, the cap follows the load: as many checks as the
   cores left over the 1-minute load average hold at an assumed load of 4 each, at least one slot
   per 16 cores (and at least one), at most one per 8. Running checks count in that load, so the cap
@@ -2989,7 +2983,7 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   `ttp checks status` flags a holder that has held its slot `checks.idle_hold_s` (default 600) with no test
   using CPU and names `ttp checks-yield`; it stops nothing. While
   the 1-minute load average is under half the cores, up to `checks.load_extra` more slots open (default 2,
-  0 turns them off); check commands (`ttp checks`, push checks, pool shards, and on a remote or spill check host too, where it has the tools) run under `nice -n 19`/`ionice -c3` (idle IO), while the daemon, coordinator and workers keep their normal priority; `checks.nice` false, per project (`ttp config <project> checks.nice false`) or account, runs them at normal priority (`checks.nice` N, 0-19, sets the level; `checks.ionice` `idle` or `best-effort[:0-7]`; both per project or account). nice does not protect a live service in another cgroup (cgroup v2 splits CPU between slices by weight), so local check commands and `ttp sandbox` test runs can also run in a CPU-quota group: a systemd --user scope with CPUQuota, else a child of the delegated cgroup v2 directory `checks.cpu_cgroup`. `checks.cpu_quota` caps it at N cores; `checks.busy_probe`, a shell command run every `checks.busy_probe_s` seconds (default 30; exit 0 busy, 1 idle, anything else busy), tightens it to `checks.busy_cpu_quota` cores while a live service is busy and relaxes it when idle (per project or account; the smaller quota wins). Unset (the default) there is no group; where systemd --user has no cpu controller (it needs Delegate=cpu on user@.service) and no `checks.cpu_cgroup` works, commands run as before and one line says why. Each check
+  0 turns them off); check commands (`ttp checks`, push checks, pool shards, and on a remote or spill check host too, where it has the tools) run under `nice -n 19`/`ionice -c3` (idle IO), while the daemon, coordinator and workers keep their normal priority; `checks.nice` false, per project (`ttp config <project> checks.nice false`) or account, runs them at normal priority (`checks.nice` N, 0-19, sets the level; `checks.ionice` `idle` or `best-effort[:0-7]`; both per project or account). nice does not protect a live service in another cgroup (cgroup v2 splits CPU between slices by weight), so local check commands can also run in a CPU-quota group: a systemd --user scope with CPUQuota, else a child of the delegated cgroup v2 directory `checks.cpu_cgroup`. `checks.cpu_quota` caps it at N cores; `checks.busy_probe`, a shell command run every `checks.busy_probe_s` seconds (default 30; exit 0 busy, 1 idle, anything else busy), tightens it to `checks.busy_cpu_quota` cores while a live service is busy and relaxes it when idle (per project or account; the smaller quota wins). Unset (the default) there is no group; where systemd --user has no cpu controller (it needs Delegate=cpu on user@.service) and no `checks.cpu_cgroup` works, commands run as before and one line says why. Each check
   run also takes test-worker slots from a host pool shared by all projects (testslots: default half the cores, at
   least 2; at most min(8, half the pool) per run; `checks.test_pool`, `checks.test_run_max`, 0 pool turns it off;
   a project may only lower them; a full `ttp checks` run waits until `checks.test_run_min` are free, default
@@ -3407,7 +3401,7 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   `checks.shared_backoff_h` (default 2); after 3 such reruns it wakes as before. Each shared failure
   is one incident with one fix task and one low feed line. While that fix is open, in review or
   waiting in the push queue, a new failure of the same ids joins its incident and adds no task. A
-  failure no fix owns first reruns only its failing ids on the push-branch tip, model-free, in the process sandbox like any check, and bounded
+  failure no fix owns first reruns only its failing ids on the push-branch tip, model-free, and bounded
   by `checks.shared_tip_timeout_s` (default 900): when they pass there, no fix task is added and the
   held tasks wake to rebase onto the tip; when they fail there too, or the rerun proves nothing, the
   incident opens as above. The daily audit lists the tasks held and
@@ -3673,7 +3667,7 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   printing `ttp push: pushed <sha> to <branch>` (and version) or `ttp push: not pushed (...)` and the log tail. For an `on_pass_cmd`, add `--pushed`: exit 0 only if the push landed, 1 while it runs, 3 if it finished without pushing; no grep needed. A push killed by a
   crash or a reboot frees its locks; the probe (or the daemon) then records it as failed, saying
   whether it died at startup, in a reboot or later, instead of waiting. From a sandbox that runs
-  each command in a PID namespace of its own (Codex on Linux), which kills a background process
+  each command in a PID namespace of its own (Codex on Linux under `no_internet`), which kills a background process
   when the command ends, the push is queued and the daemon starts it; the probe exits 1 meanwhile.
 - `ttp push --cancel <marker>` stops a detached push before it lands: a queued one is never
   started, and a running one has its process group (the push, its checks and git) ended, TERM then
@@ -4187,45 +4181,13 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   servers (your own, or the project's `mcp_servers`) stay usable. Claude Code's bundled skills are
   listed by name only and stay callable; plugin skills stay fully listed. A Claude Code without
   `--tools` gets a denylist instead. Coordinator turns, Codex and Cursor are not changed by this.
-- Host loopback is reachable from Claude workers by default. With `providers.claude.write_fence:
-  true`, on Linux the Bash sandbox (the write fence) runs each command in a network namespace of its own, so the host's 127.0.0.1 ports (an ssh
-  `HostName 127.0.0.1` with a `Port`, a `LocalForward` end, a reverse tunnel's listening port, a
-  local web server) would refuse connections. Each fenced command therefore gets forwarders on its
-  own 127.0.0.1, through the sandbox's proxy, for the host's loopback listeners at run start and the
-  loopback ports in `~/.ssh/config` (up to 32 ports), for the command's whole life, compound
-  commands and scripts included. `providers.claude.loopback_ports: [<port>, ...]` adds ports opened
-  after the run starts; `false` keeps the sandbox's own namespace with no forwarders. Limits: ports
-  below 1024 are not forwarded, the name `localhost` does not resolve inside the sandbox (use
-  127.0.0.1), and macOS gets no forwarders. For anything still blocked, a bare `ssh` or `ttp lock`
-  command runs outside the sandbox, and so do daemon-run command schedules. Codex workers are
-  unchanged: their workspace-write sandbox runs with network access on.
-- `sandbox.fence_freed_commands: ["my-ssh", ...]` frees a project's own host-reaching commands (an
-  executable in its harness `bin/`, such as a script that wraps ssh) by name, as ssh is freed: the
-  Claude sandbox runs `my-ssh ...` (also after `timeout N`) outside the fence as a simple command,
-  and the hook refuses it beside `&&`, `;`, a pipe, a file redirect or a substitution. The sandbox
-  never frees a line that starts with an assignment (`VAR=x my-ssh ...` stays fenced; measured on
-  Claude Code 2.1.296, also with a literal `VAR=x my-ssh *` pattern): set such a variable inside the
-  script instead.
-  An older entry `{"command": "my-ssh", "env": ["VAR"]}` still loads: the name is freed, the env
-  part is ignored with one daemon log line. A name that is
-  not an executable file in the harness's `bin/`, or is a shell, a wrapper, `ttp`, `git` or `gh`, is
-  left out with one daemon log line saying why. Set it here, never by editing the template's
-  FENCE_FREED (hook.py) or FENCE_EXCLUDED (providers/claude.py): those edits make upgrades conflict.
 - `providers.<name>.write_dirs: ["notes", ...]` adds directories inside the project root to the
-  write fence's writable roots for that provider's workers, while the fence stays on for everything
-  else. Each entry is relative to the project root or an absolute path inside it, symlinks resolved.
+  writable roots of that provider's sandbox (Codex and Cursor under `no_internet`), while the sandbox
+  stays on for everything else. Each entry is relative to the project root or an absolute path inside it, symlinks resolved.
   An entry that resolves outside the project root, is the project root itself, or covers the
   tt-project folder (charter, memory, config, state) is skipped with an alert naming it and why; a
   directory that does not exist is skipped with a low alert, never created. Unset, the roots are
   unchanged.
-- Landing from inside the sandbox needs no setup. The Bash sandbox writes the project's `.git` but not
-  the project root's working tree, so a land or review task cannot fast-forward the push branch where
-  the project's main checkout has it checked out. `ttp land` then hands that fast-forward to the
-  running daemon (state/land-ff/), which does it on the host and reports back within 2 minutes. The
-  daemon checks again first: the checkout must belong to the project's repo, have the branch checked
-  out at the tip the landing started from, have no uncommitted changes, and the landed commit must
-  contain that tip. Otherwise nothing moves, nothing is overwritten and `ttp land` exits 5 (the
-  branch moved), 6 (uncommitted changes) or 1 (no daemon took the request, which is then withdrawn).
 - `providers.claude.disallowed_tools: ["mcp__<server>__<tool>", "mcp__<server>__*", ...]` lists tools
   Claude workers and reviewers may not call, on top of the tools the harness always denies them; a
   trailing `*` covers every tool whose name starts so, e.g. every tool of one server. Use it to keep
@@ -4815,12 +4777,7 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   JSON object (`--force` replaces one). Neither prints a value; both are masked like the others.
   `ttp secret env --secret <name>[:<key>]=<VAR> -- <command>` (repeatable) runs a command with one in
   `VAR`, its output masked and its exit code passed on; the command line carries only names.
-  A built-in secret goes only by a field (`--secret jev:key=<VAR>`); `jev=<VAR>` is refused. From a
-  sandboxed worker, which cannot read the secrets store, the daemon runs the command outside the
-  sandbox and the worker gets its masked output and exit code; `state/secret-uses.jsonl` records
-  only the secret names, the task and the time. A request the daemon has not started within 90 s, or
-  when the worker's call is stopped (SIGINT or SIGTERM), is withdrawn and never runs later; one
-  already started keeps running.
+  A built-in secret goes only by a field (`--secret jev:key=<VAR>`); `jev=<VAR>` is refused.
 - Where keys live is chosen per machine with `ttp secret store <backend>` (no argument: show it). It
   writes `~/.tt-project/secret-store.json`, which holds no secret:
   - `file` (the default): `secrets.json` in the ttp home, mode 0600.
@@ -4841,8 +4798,7 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   run's last masking step prints `runner: could not mask stored secrets in the run: <cause>` in its
   log and records `unmasked` (the cause, never a value) in `exit.json`; if the daemon cannot read it
   either, it logs that and raises one `secrets_unmasked` event per cause. Outbound posts (`ttp notify`,
-  `ttp note --to`, `gh` from a run) and the pre-push scan are refused while the store cannot be read,
-  except in a run whose sandbox hides the store by design (the write fence), which is scanned as before.
+  `ttp note --to`, `gh` from a run) and the pre-push scan are refused while the store cannot be read.
 - A shared or build host keeps no plaintext keys: `ttp secret store <keychain|command|env> --shared`
   marks it. There the file store refuses to save, `ttp new --host --copy-secrets` and `ttp secret push`
   to it are refused on the far side (exit 3), and a `secrets.json` already there is reported by
@@ -4859,27 +4815,10 @@ Workers can read Slack links you paste, using your Slack connector if you have o
 - Pushes go out from a trusted machine (the owner's workstation) over HTTPS with the forge's own
   credential helper (for GitHub: `git -c credential.helper='!gh auth git-credential' push`), so no
   build box needs a push key; a build box's project hands its commits to that machine to push.
-- Workers run without a sandbox by default (no bwrap, no network or PID namespace; sudo works).
-  When the agent ends, the runner ends what it left in its process group (but a pid the hand-off lists
-  in `leftover_procs` with how and when it stops) and the run's own sandbox trees nothing owns any more:
-  a `bwrap` (a write fence's, or one from a run before the unsandboxed default) runs in its own session
-  with its proxy listeners (1080, 3128, loopback ports) and outlives the agent otherwise. The daemon's
-  sweep, at start and then each pass, ends the project's orphaned sandbox trees of ended runs and writes
-  a `sandbox_trees_stopped` receipt; a `ttp detach` job's tree, a live run's and any with a protected,
-  device or foreign member stay. The sweep keeps the daemon's step budget (the next tick goes on after
-  the last tree it ended), and a tree whose `/proc` reads hang is left for a later pass and logged once;
-  the runner's part waits at most a minute. `ttp leftover-procs --sandboxes [--dry-run]` does the same
-  on request (exit 2 when it kept a tree or stopped after its 30 s). A project runs unsandboxed once its run lines say `sandbox=none` and
-  that command finds no tree.
-  `providers.<name>.write_fence: true` turns the provider's write fence on (Claude's Bash sandbox,
-  Codex's workspace-write), and `sandbox.checks: true` the process sandbox for checks. Both are
-  user-only: only the user's own word turns one on (`ttp config` in their own shell, or the web
-  settings page); `ttp config` inside a run (a worker's or a coordinator's) and the coordinator's
-  `config_set` refuse the on value on every provider, and allow false or unset.
-  `restrictions.no_internet`, which also turns Codex's and Cursor's sandbox on, is a Restriction:
-  a run's `ttp config` refuses it in both directions and the coordinator cannot set it. A sandboxed
-  worker cannot gain privileges (sudo fails with 'no new privileges'). A privileged
-  command the project allows runs on the host through the daemon: `ttp host-run -- <command...>`
+- Workers run without a sandbox (no bwrap, no network or PID namespace; sudo works).
+  `restrictions.no_internet`, which turns Codex's and Cursor's sandbox on, is a Restriction:
+  a run's `ttp config` refuses it in both directions and the coordinator cannot set it. A privileged
+  command the project allows can also run on the host through the daemon: `ttp host-run -- <command...>`
   prints its output and exits with its code (126 refused, 124 timed out, 75 no answer from the
   daemon). Only commands in config `runner.host_commands` run, set by the user or the coordinator
   (`ttp config`, or chat's `config_set`), never a worker; both store only a JSON list of entries
@@ -5037,12 +4976,12 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   books its own tokens at list price instead. Its subagents (Agent or Task tool) count as its own:
   their calls, which the result's usage leaves out, are read from the stream and the session's
   subagent transcripts and priced each at its own model (the note's `subagent_usd`).
-- Codex workers run in `danger-full-access` (no sandbox) by default. With `providers.codex.write_fence:
-  true` or the `no_internet` restriction they run in Codex's workspace-write sandbox, with the
+- Codex workers run in `danger-full-access` (no sandbox). Under the `no_internet` restriction they
+  run in Codex's workspace-write sandbox, with the
   project's state folder, the repository's git folder and the shared lock folder
   (`~/.tt-project/locks`, for `ttp lock` on resources shared across projects) added as writable
   roots. Codex coordinator turns run with `danger-full-access` too, and in its read-only sandbox
-  only under the same opt-in. The daemon snapshots the harness folder and the repository checkout
+  only under `no_internet`. The daemon snapshots the harness folder and the repository checkout
   before each coordinator turn and logs `run N: warning: coordinator turn changed files in ...`
   when the turn changed any (a log line only: no alert, no model call).
 - Codex and Cursor coordinator turns run from an empty scratch directory, so the project's
