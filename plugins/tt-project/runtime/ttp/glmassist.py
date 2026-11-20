@@ -171,6 +171,19 @@ def _run(argv: list[str], text: str, timeout: float, cwd: str) -> dict:
     return data
 
 
+def _opus_call(run, argv: list[str], text: str, timeout: float, cwd: str, model: str, usage: dict) -> tuple[str, float]:
+    """One CLI call: its answer and dollars; its token counts add into `usage`."""
+    data = run(argv, text, timeout, cwd)
+    got = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    for k in ("input_tokens", "output_tokens"):
+        usage[k] = int(usage.get(k) or 0) + int(got.get(k) or 0)
+    usd = float(data.get("total_cost_usd") or 0)
+    if not usd and got:
+        from . import localspend
+        usd = localspend.price(model, got)[0]
+    return str(data.get("result") or "").strip(), usd
+
+
 def _binary() -> str:
     if got := os.environ.get(BIN_ENV):
         return got
@@ -204,28 +217,32 @@ def ask(run_dir, question: str, *, cwd: str, plan: bool = False, db=None, source
             raise ValueError(f"the plan has no step {step}")
     t0 = now()
     row = {"kind": "check" if step is not None else "plan" if plan else "ask", "q": question.strip()[:500]}
+    answer, usd, usage = "", 0.0, {}
     try:
         if not exe:
             raise RuntimeError("no claude binary on this host")
-        data = (run or _run)(argv, text, timeout, cwd)
-        answer = str(data.get("result") or "").strip()
+        answer, usd = _opus_call(run or _run, argv, text, timeout, cwd, model, usage)
+        left = timeout - (now() - t0)   # the fix-up never runs past max_minutes
+        if device and answer and not answer.lower().startswith("needs_opus:") \
+                and (why := deviceplan.parse_why(answer)[1]):
+            # A bad plan never reaches GLM: Opus fixes its own block once, in this plan step.
+            row.update(plan_error=why[:300])
+            if left < 30.0:
+                raise RuntimeError(f"the plan does not parse ({why[:200]}) and no time is left to fix it")
+            got, more = _opus_call(run or _run, argv, deviceplan.FIX.format(why=why) + answer, left, cwd, model, usage)
+            answer, usd = got or answer, usd + more
         row.update(ok=bool(answer), answer=answer[:4000])
         if step is not None:
             row.update(step=str(step), verdict="ok" if answer.lower().startswith("ok") else "stop")
-    except Exception as e:   # a failed call still spends its minutes
-        data, answer = {}, ""
+    except Exception as e:   # a failed call still spends its minutes; a failed fix-up keeps the first plan
         row.update(ok=False, error=f"{type(e).__name__}: {e}"[:300])
-    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
-    usd = float(data.get("total_cost_usd") or 0)
-    if not usd and usage:
-        from . import localspend
-        usd = localspend.price(model, usage)[0]
+    if device and answer:
+        if why := deviceplan.store(run_dir, answer, cwd):   # it hands the run back to Opus
+            row.update(ok=False, error=row.get("error") or f"the plan fails a check: {why}"[:300], handed_back=True)
     row.update(ts=round(t0, 1), minutes=round(max(0.0, now() - t0) / 60, 3), cost_usd=round(usd, 4), model=model)
     with open(Path(run_dir) / LOG, "a") as f:
         f.write(json.dumps(row, sort_keys=True) + "\n")
-    if device and row.get("ok"):
-        deviceplan.store(run_dir, answer, cwd)
-    elif row.get("verdict") == "stop":
+    if row.get("verdict") == "stop":
         from . import glmguard
         glmguard.hit(run_dir, f"Opus's check stopped step {step}: {answer[:240]}", kind="check")
     if db is not None and usd:

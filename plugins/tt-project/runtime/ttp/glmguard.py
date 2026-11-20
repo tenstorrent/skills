@@ -7,17 +7,31 @@ person or another project, write the project's records or touch anything outside
 rule cannot hold that for a cheaper model, so the harness enforces it in code, with no model call, on
 every harness the arm runs:
 
-- `ttp` (cli.glm_gate) runs only the commands in SUBS_ALLOWED: checks, push, reads of its own task, the
-  lock and detach it needs, the read-only queries of READS (machine lists and status, occupancy;
-  a write form of any of them, or an unknown subcommand, is refused) and a plain `ttp note "<text>"`, which goes only to the run's own task log
-  (progress.md); the coordinator decides what reaches a chat. Every route from a note to a person or
-  another project (NOTE_ROUTES: --to, --reply and the flags that go with them), `say`, `ask`, `notify`,
-  `upstream`, task, obligation, memory and config writes, and every other command are refused.
-- The hook (hook.pre_tool_use, Claude Code and any provider with hooks) and the command layer of a harness
-  without hooks (glmenv, for mini-swe-agent) ask tool_refusal() before each call: a `ttp` command the
-  list does not allow, a raw `git push`, a `gh` write, an HTTP post, ssh or mail, a database or state
-  write, a command that edits the guard's own environment, a file write outside the worktree and run
-  folder, and every connector tool.
+The guard is a short explicit denylist of the harmful kinds measured on real GLM runs;
+everything else runs, with Opus's plan and the post-run audit as the backstop (deviceplan.py):
+- writes or deletes outside the run's worktree, run folder and scratch folder (a redirect, tee, a writing
+  verb's target, a copy's destination; never inferred from interpreter code), any write an ssh call makes on
+  another host (REMOTE_WHY: a device plan's own step may), and the guard's own files, its identity variables
+  and the project's database and machine records (TAMPER, STATE_DB); protected and served paths are
+  pathguard's (guards.protected_paths), on every run;
+- srun, sbatch or salloc on held nodes and recorded undos of user-ordered changes: ruleguard's (slurm_nodes,
+  user_undo), on every run;
+- pushes and landing before review: a raw `git push`, `ttp land`, `ttp express`, `ttp push --land` (`ttp push`
+  keeps its own checks and review gates);
+- outward posts: `ttp notify`, `say`, `ask`, `upstream`, a note routed past the run's own log (NOTE_ROUTES),
+  a `gh` write, an HTTP post, mail and raw sockets (nc, telnet);
+- resets, power cycles and flashes outside the approved routes (deviceplan.power_refusal, and deviceplan.risky
+  outside a device plan, whose steps need an Opus step check);
+- machine-ledger writes: any `ttp machines` call but its reads;
+- service state changes: `systemctl` start, stop, restart, enable, disable or mask and `service <name>` start,
+  stop or restart anywhere in the command's text, heredoc bodies and ssh commands included (SERVICE_RE; a device
+  plan's own step may);
+- every connector tool, and a Write or Edit outside the run's folders (tool_refusal).
+A script file run by its path (`bash s.sh`, `bash < s.sh`, `ssh box bash < s.sh`) is opaque to the guard: its
+contents are not read, and neither is a `$(...)` in a heredoc body a program other than a shell reads. Opus's
+plan and the post-run audit are the backstop there.
+The hook (hook.pre_tool_use, Claude Code and any provider with hooks), `ttp` itself (cli.glm_gate) and the
+command layer of a harness without hooks (glmenv, for mini-swe-agent) ask it before each call.
 
 A refused attempt ends the run as a hand-back to Opus: hit() writes the run's glm_guard.json and a
 `needs_opus` result.json (reason `guard: <what>`), the runner stops the agent at its next look and the
@@ -49,26 +63,24 @@ MARK = "glm_guard.on"        # in the run folder: the daemon wrote it before lau
 HIT = "glm_guard.json"       # in the run folder: {"why", "ts"}; the runner stops the agent when it exists
 KEPT = "result.pre-guard.json"   # a hand-off the run wrote before the guard replaced it
 
-# What a GLM-arm run may run: its checks and push, reads of its own task, and the lock and detach commands
-# a build or test needs. Everything else changes state or reaches someone outside the hand-off.
-SUBS_ALLOWED = frozenset({
-    "push", "checks", "checks-shard", "checks-yield", "pool-wait", "pool-admit", "pool-shard", "install-check",
-    "clip", "hours", "alive", "landed", "lock", "detach", "eta", "list", "find", "overview", "said", "runs", "task",
-    "paths", "note", "advise"})   # advise: refused unless the run's glmassist switches are on
-TASK_ACTIONS = frozenset({"show", "list"})
-# every other `ttp task` action (cli.py's choices): a write, refused wherever it sits among the words, since
-# the project name is optional and an option's value may stand before it
-TASK_WRITES = frozenset({"add", "cancel", "requeue", "restart", "set-when", "superseded", "abandon",
-                         "adopt-branch", "rejudge", "relink-fix", "drop-followup"})
+# The ttp commands the denylist refuses outright: those that post outward or land a head (a `ttp machines`
+# write is refused by read_only).
+OUT_TTP = frozenset({"notify", "say", "ask", "upstream"})
+LANDING = frozenset({"land", "express"})
 # `ttp note` flags that send a note on, or change a record beyond the run's own log: refused on the GLM arm.
-NOTE_ROUTES = ("--to", "--reply", "--urgent", "--severity", "--confirms", "--status")
+NOTE_ROUTES = ("--to", "--reply", "--urgent", "--severity", "--confirms")   # --status ID only reads
 GH_READS = frozenset({"view", "list", "diff", "status", "checks"})
-# read-only ttp queries, by word prefix: the coordinator's reads and two more. Its `task * show|list` entries match no
-# real call ("*" is a literal word here); SUBS_ALLOWED allows those, and `checks`, itself.
-READS = READ_COMMANDS + (("machines", "change", "list"), ("occupancy",))
-PLAN_BOOKKEEPING = (("machines", "change", "add"), ("machines", "change", "edit"), ("obligation", "progress"),
-                    ("occupancy",))
-REACH = frozenset({"ssh", "scp", "sftp", "mail", "mailx", "sendmail", "mutt", "nc", "ncat", "telnet", "sqlite3"})
+# read-only ttp queries, by word prefix: the coordinator's reads and the machine ledger's list
+READS = READ_COMMANDS + (("machines", "change", "list"), ("machines", "change", "show"), ("occupancy",))
+NET = frozenset({"nc", "ncat", "netcat", "telnet"})
+COPIERS = frozenset({"scp", "rsync", "sftp"})
+REMOTE_WHY = "it writes on another host"   # a device plan's own step may (deviceplan.refusal)
+# A service started, stopped or switched on a box can take its devices from others: only a step of Opus's device
+# plan may (deviceplan.refusal); a run with no plan never does. Read on the raw text, so a heredoc body or an ssh
+# command is covered without parsing either.
+SERVICE_WHY = "it changes a service's state"
+SERVICE_RE = re.compile(r"\bsystemctl(?:\s+--?[\w-]+(?:=\S+)?)*\s+(?:start|stop|restart|enable|disable|mask)\b"
+                        r"|\bservice\s+[\w@.-]+\s+(?:start|stop|restart)\b")
 HTTP = frozenset({"curl", "wget", "http", "https", "httpie"})
 HTTP_DATA = re.compile(r"(?:^|\s)(?:-X\s*(?:POST|PUT|PATCH|DELETE)|--request\s+(?:POST|PUT|PATCH|DELETE)|-d\b|--data\S*|"
                        r"-F\b|--form\S*|-T\b|--upload-file|--post-\S+)", re.I)
@@ -121,7 +133,7 @@ def active(env=None) -> bool:
     return bool(rd) and (Path(rd) / MARK).exists()
 
 
-def env_for(note: dict | None) -> dict[str, str]:
+def arm_env(note: dict | None) -> dict[str, str]:
     """The run environment's flag for a run whose arm is glm (empty otherwise): `note` is the run note."""
     from . import codearm
     arm = (note or {}).get(codearm.KEY)
@@ -208,23 +220,19 @@ def read_only(words: list[str], flags=()) -> bool:
 
 def cli_refusal(cmd: str, action: str = "", flags=(), words=()) -> str | None:
     """Why a GLM-arm run may not run `ttp <cmd> [<action>]` with option words `flags` (and the call's positional
-    `words` from the command on, where known), else None."""
-    if cmd == "note" and (route := note_route(flags)):
-        return (f"`ttp note {route}` is not allowed to a run on the GLM arm: its notes go only to its own task log, "
+    `words` from the command on, where known), else None: the denylist's ttp kinds only."""
+    if cmd in OUT_TTP or cmd == "note" and note_route(flags):
+        what = f"`ttp {cmd}" + (f" {note_route(flags)}" if cmd == "note" else "") + "`"
+        return (f"{what} is not allowed to a run on the GLM arm: its notes go only to its own task log, "
                 f"and the coordinator decides what reaches a person, a chat or another project")
-    if cmd in SUBS_ALLOWED and (cmd != "task" or action in TASK_ACTIONS):
-        return None
-    if words and read_only(list(words), flags):
-        return None
-    what = f"`ttp {cmd}" + (f" {action}" if cmd == "task" and action else "") + "`" if cmd else "a ttp call naming no command"
-    return (f"{what} is not allowed to a run on the GLM arm (it changes records or reaches a person or another "
-            f"project outside the hand-off); hand the task back to Opus")
-
-
-def plan_bookkeeping(words: list[str]) -> bool:
-    """A device run's own records under an Opus plan (its machine ledger entries, its obligation progress) and the
-    device occupancy read. They stay in the project's records and reach no person."""
-    return any(words[:len(b)] == list(b) for b in PLAN_BOOKKEEPING)
+    if cmd in LANDING or cmd == "push" and any(str(f).split("=", 1)[0] in ("--land", "--express") for f in flags):
+        return f"`ttp {cmd}` lands a head: a run on the GLM arm publishes only with `ttp push`, after review"
+    if cmd == "remove":
+        return "`ttp remove` deletes a project, outside the run's worktree and run folder: not for a run on the GLM arm"
+    if cmd == "machines" and not {"-h", "--help"} & set(flags) and not read_only(list(words) or [cmd, action], flags):
+        return ("a run on the GLM arm does not write the machine ledger (`ttp machines` writes): say in the "
+                "hand-off what it changed on a machine, and Opus records it")
+    return None
 
 
 def _ttp_args(seg: list[str], project: str) -> list[str] | None:
@@ -238,9 +246,14 @@ def _ttp_args(seg: list[str], project: str) -> list[str] | None:
     if args is None:
         return None
     words = [w for w in args if not w.startswith("-")]
-    if len(words) > 1 and words[0] not in SUBS_ALLOWED and project and words[0] == project:
-        words = words[1:]   # `ttp <this project> <command>`: any other project's name is refused as a command
+    if len(words) > 1 and (project and words[0] == project or words[0] not in _ARG_TAKERS and cli_refusal(words[1])):
+        words = words[1:]   # `ttp <project> <command>`: the command after a project's name
     return words
+
+
+# Commands a run uses whose next word is an argument, never a command (`ttp memory --search notify`)
+_ARG_TAKERS = frozenset({c[0] for c in READ_COMMANDS} | {"checks", "lock", "detach", "push", "landed", "task"}
+                        | {"memory", "obligation", "config", "slop", "clip", "sandbox", "advise", "audit", "note"})
 
 
 def _own_name(env) -> str:
@@ -291,71 +304,107 @@ def _roots(cwd: str, run_dir: str, scratch: str = "") -> list[str]:
     return out
 
 
-def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None, remote: bool = False) -> str | None:
-    """Why a shell command of a GLM-arm run is refused (before it runs), else None. `remote`: the command an
-    ssh call runs on another host, whose paths are not this host's."""
-    from . import hook, pathguard, sidefx
+def _remote_dest(seg: list[str]) -> str:
+    """The remote destination of a copy (`scp`/`rsync` last argument, `sftp` host), '' for a local one."""
+    args = [a for a in seg[1:] if not a.startswith("-")]
+    if os.path.basename(seg[0]) == "sftp":
+        return args[0] if args else ""
+    return args[-1] if len(args) > 1 and re.match(r"^[^/:]+:", args[-1]) else ""
+
+
+def writes_outside(cmd: str, cwd: str, run_dir: str = "", env=None, inline: bool = False) -> list[tuple[str, str]]:
+    """(path, why) for each file `cmd` writes or deletes outside the run's worktree, run folder and scratch folder
+    (a device and an fd aside). Writes read from interpreter code count only with `inline` (the post-run scan)."""
+    from . import sidefx
+    e = os.environ if env is None else env
+    roots = _roots(cwd, run_dir, _scratch(run_dir, e))
+    # $TMPDIR (TMP, TEMP) is read as its value in the run's environment, or as /tmp where the command sets it itself
+    told = bool(_SCRATCH_SET.search(cmd))
+    paths = _SCRATCH_REF.sub(lambda m: "/tmp" if told else str(e.get(m.group(1) or m.group(2)) or "/tmp"), cmd)
+    return [(p, why) for p, (cls, why) in sidefx.classify_paths(paths, os.path.expanduser("~"), cwd or os.getcwd(),
+                                                                 run_dir).items()
+            if cls == "write" and (inline or "inline code" not in why) and not p.startswith(sidefx.HARMLESS)
+            and not sidefx._inside(p, roots)]
+
+
+def remote_writes(cmd: str, cwd: str = "") -> list[tuple[str, str]]:
+    """(path, why) for each file a command run on another host writes there by an absolute or home path (a device,
+    an fd and a path relative to the run's folder there aside)."""
+    from . import sidefx
+    there = "/@remote-cwd"   # a relative path there is under the run's own folder on that host
+    return [(p, why) for p, (cls, why) in sidefx.classify_paths(cmd, "~", there, "").items()
+            if cls == "write" and "inline code" not in why and not p.startswith((there,) + sidefx.HARMLESS)]
+
+
+def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None, remote: bool = False, writes: bool = True,
+                  power: bool = True, services: bool = True) -> str | None:
+    """Why a shell command of a GLM-arm run is refused (before it runs), else None. The denylist: writes or
+    deletes outside the run's worktree and run folder (and on another host), pushes and landing, outward
+    posts, machine-ledger writes, service starts and stops (SERVICE_RE) and, with `power`, resets,
+    power cycles and flashes outside the approved routes; the hook adds protected paths, held Slurm nodes and
+    replayed undos (pathguard, ruleguard). Everything else runs. `remote`: the command an ssh call runs on another
+    host. `writes` and `services`: False skips those checks (a step of Opus's plan, deviceplan._static)."""
+    from . import credguard, hook, pathguard
     e = os.environ if env is None else env
     if TAMPER.search(cmd):
         return "a command may not edit the run's identity or the guard's own files"
     if STATE_DB.search(cmd):
         return "a run on the GLM arm may not read or write the project's database or machine records by hand"
-    for sub in pathguard._substitutions(cmd):   # "$(...)" runs a command too: checked like the command line itself
-        if why := shell_refusal(sub, cwd, run_dir, e, remote):
+    if services and (svc := SERVICE_RE.search(cmd)):
+        return f"{SERVICE_WHY}: {svc.group(0)[:120]}"
+    commands, _ = hook._split(cmd)   # heredoc bodies a program, not a shell, reads are its input
+    for sub in pathguard._substitutions(commands):   # "$(...)" runs a command too
+        if why := shell_refusal(sub, cwd, run_dir, e, remote, writes, power, services):
             return why
-    commands, _ = hook._split(cmd)
     segs = hook._all_segments(commands) + hook._segments(commands, strip=False)
     project = _own_name(e)
     # `ttp checks 2>&1`: the 2 is no word of the call; a backtick substitution runs a command of its own, like `$(...)`
-    plain, _ = hook._split(REDIRECT.sub(" ", cmd).replace("`", ";"))
-    plan = bool((glm_run(e) or {}).get("plan"))   # a device run under an Opus plan (deviceplan.py)
+    plain, _ = hook._split(REDIRECT.sub(" ", commands).replace("`", ";"))   # heredoc bodies no shell reads: gone
     for seg in hook._all_segments(plain) + hook._segments(plain, strip=False):
         words = _ttp_args(seg, project)
-        act = (words or [])[1:2]
-        if words and words[0] == "task":   # `ttp task [<project>] <action>`: a write anywhere wins
-            acts = [w for w in words[1:] if w in TASK_WRITES or w in TASK_ACTIONS]
-            act = [next((w for w in acts if w in TASK_WRITES), acts[0] if acts else "")]
-        if words and not (plan and plan_bookkeeping(words)) and (
-                why := cli_refusal(words[0], act[0] if act else "", [w for w in seg if w.startswith("--")], words)):
+        if words and (why := cli_refusal(words[0], (words[1:2] or [""])[0], [w for w in seg if w.startswith("-")],
+                                         words)):
             return why
     for seg in segs:
         if not seg:
             continue
         name = os.path.basename(seg[0])
-        words = _ttp_args(seg, project)
-        if words is not None:
+        if _ttp_args(seg, project) is not None:
             continue   # read above, without its redirections
         elif name == "git" and _git_word(seg[1:]) == "push":
             return "a run on the GLM arm publishes only with `ttp push` (after its checks), never `git push`"
         elif name == "gh" and _gh_posts(seg):
             return "a run on the GLM arm does not post to GitHub (comments, reviews, PRs, issues)"
-        elif name in HTTP and HTTP_DATA.search(" ".join(seg[1:])):
-            return "a run on the GLM arm does not send data to a service (an HTTP post)"
-        elif name in REACH:
-            rest = None
-            if plan and name == "ssh":   # the host is one the plan's steps name (strict ssh, no jump or local command)
-                from . import deviceplan
-                got = deviceplan.ssh_target(seg, strict=True)
-                hosts = {h for st in (deviceplan.plan(run_dir) or {}).get("steps") or []
-                         for h in (str(st.get("host") or "").split("@")[-1].lower(),
-                                   deviceplan.split_host(deviceplan.norm(str(st.get("command") or "")))[0])}
-                if got and got[1].strip() and got[0] in hosts - {"", "local", "localhost", "this machine", "the project host"}:
-                    rest = got[1]
-            if rest is None:
-                return f"`{name}` reaches another host, person or database: not for a run on the GLM arm"
-            if why := shell_refusal(rest, cwd, run_dir, e, remote=True):
+        elif name in HTTP and HTTP_DATA.search(" ".join(seg[1:])) and not any(
+                w.split("=", 1)[0] in ("--unix-socket", "--abstract-unix-socket") for w in seg):
+            return "a run on the GLM arm does not send data to a service (an HTTP post)"   # a local socket's API: no
+        elif name in MAIL or name in NET:
+            return f"`{name}` reaches a person or another service: not for a run on the GLM arm"
+        elif name in ("ssh", "scp", "sftp") and credguard.ssh_runs_local(seg):
+            return f"`{name}` options that run a local program (ProxyCommand and the like) would get past this guard"
+        elif name in COPIERS and writes and (dest := _remote_dest(seg)):
+            return f"{REMOTE_WHY}: {dest} (a copy)"
+        elif name == "ssh":
+            from . import deviceplan
+            got = deviceplan.ssh_target(seg)
+            if got and got[1].strip() and (why := shell_refusal(got[1], cwd, run_dir, e, True, writes, power, services)):
                 return why
-    if remote:
+    if power:
+        from . import deviceplan
+        s = deviceplan.settings(deviceplan._cfg())
+        if why := deviceplan.power_refusal(cmd, s["power_routes"]):
+            return why
+        if deviceplan.risky(cmd) and not any(deviceplan._matches(w[0], s["power_routes"]) for w in
+                                             (x[0] for x in deviceplan._words(cmd) if x)):
+            return ("a reset, power cycle, flash or firmware step runs only through the project's approved routes "
+                    "or as a checked step of an Opus device plan: " + cmd[:120])
+    if not writes:
         return None
-    home, tmp = os.path.expanduser("~"), _scratch(run_dir, e)
-    roots = _roots(cwd, run_dir, tmp)
-    # $TMPDIR (TMP, TEMP) is read as its value in the run's environment, or as /tmp where the command sets it itself
-    told = bool(_SCRATCH_SET.search(cmd))
-    paths = _SCRATCH_REF.sub(lambda m: "/tmp" if told else str(e.get(m.group(1) or m.group(2)) or "/tmp"), cmd)
-    for path, (cls, why) in sidefx.classify_paths(paths, home, cwd or os.getcwd(), run_dir).items():
-        if cls == "write" and not sidefx._inside(path, roots):
-            return f"it writes outside its worktree: {path} ({why})"
-    return None
+    if remote:
+        got = remote_writes(cmd)
+        return f"{REMOTE_WHY}: {got[0][0]} ({got[0][1]})" if got else None
+    got = writes_outside(cmd, cwd, run_dir, e)
+    return f"it writes outside its worktree: {got[0][0]} ({got[0][1]})" if got else None
 
 
 def tool_refusal(payload: dict, env=None) -> str | None:
@@ -389,7 +438,7 @@ def run_env(provider: str, note, device: bool = False) -> dict[str, str]:
     from . import coordroute, route
     routed = note.get(route.KEY) if isinstance(note, dict) else None
     on = (provider == route.TO or (isinstance(routed, dict) and routed.get("to") == route.TO)
-          or bool(env_for(note)) or bool(coordroute.guard_env(note)))
+          or bool(arm_env(note)) or bool(coordroute.guard_env(note)))
     return {RUN_ENV: DEVICE if device else "1"} if on else {}
 
 

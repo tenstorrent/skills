@@ -1286,7 +1286,9 @@ nothing: the daemon requeues the task on Opus with no attempt spent and no fault
 provider, and logs the reason. `mini-swe-agent` is the only live harness: its command layer is a model-free
 guard that refuses a side effect outside the run's own hand-off (a `ttp` command outside the allowed set, a raw
 `git push`, a GitHub write, an HTTP post, ssh or mail, a state or database write, a write outside the worktree, a
-read of stored secrets) and ends the run as a hand-back to Opus. A plain `ttp note "<text>"` is allowed and goes
+read of stored secrets) and ends the run as a hand-back to Opus. A script file run by its path (`bash s.sh`, `bash < s.sh`,
+`ssh box bash < s.sh`) and a `$(...)` in a heredoc body a program other than a shell reads are opaque to the GLM
+guards; Opus's device plan and the post-run audit are the backstop there. A plain `ttp note "<text>"` is allowed and goes
 only to the run's own task log; every route from a note to a person, a chat or another project (`--to`, `--reply`,
 `--urgent`, `--severity`, `--confirms`, `--status`) and `ttp notify` stay refused, so the coordinator decides what
 reaches a chat. The arm's prompt lists the commands its guard allows. A live share on any other harness (Claude Code

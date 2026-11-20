@@ -56,6 +56,7 @@ def _one_step(host, rest, s):
 KEY = "device"                 # route.glm_work.device: the project's own switch (else the rollout flag FLAG)
 FLAG = "glm_device"
 PLAN_FILE = "device_plan.json"   # in the run folder: Opus's plan, its steps and their hash
+OUTSIDE = "device_outside_writes.json"   # in the run folder: the post-run scan's list (outside_writes)
 STEPS = "device_steps.jsonl"     # in the run folder: each command the run ran, its exit code and output tail
 KV = "glm_device"                # the project's counters (counters())
 AUDIT_LABEL = "device_audit"
@@ -74,11 +75,16 @@ PLAN_RULES = (
     "raw IPMI bytes or `tt-smi -glx_reset` outside them. Stop at the first failed check and hand back; post nothing "
     "to a person.")
 DEVICE_PLAN = (
-    "Write the plan for the device task below as numbered steps. " + PLAN_RULES + " End with one fenced JSON block "
-    '{"steps": [{"n": 1, "host": "<alias or local>", "command": "<the exact shell command>", "check": true|false}]}: '
-    "every command that changes state must be a step (reads need none), `check` true for a step whose failure "
-    "must stop the run. Use <placeholders> only for values the run reads first. If the task should not run on "
-    "this model, answer with one line starting 'needs_opus:' and why.")
+    "Write the plan for the device task below: your reasoning first, as short prose. " + PLAN_RULES + " End with "
+    "one fenced ```json block, nothing after it: "
+    '{"steps": [{"command": "<the exact shell command>", "host": "<alias or local>", "check": true}]}, the steps '
+    "in run order. Every command that changes state must be a step (reads need none); `check` true for a step "
+    "whose failure must stop the run. The block must be valid JSON: escape each \\\" and \\\\ inside a command. "
+    "Use <placeholders> only for values the run reads first. If the task should not run on this model, answer "
+    "with one line starting 'needs_opus:' and why.")
+FIX = ("Your plan fails its format check: {why}. Answer with the whole plan again, the same steps, ending in "
+       "one fenced ```json block of valid JSON (quotes and backslashes in commands escaped).\n\n--- your plan ---\n")
+NO_BLOCK = "the plan has no fenced JSON block of command steps"
 CHECK = ("The agent is about to run step {n} of the plan below on a device. From the plan and the steps it ran so "
          "far, answer with one line: `ok` when the step is safe to run now (its holder, change and gate checks "
          "passed and the outputs show no failure), else `stop: <why>`.")
@@ -157,6 +163,7 @@ def _segs(cmd: str):
     """hook's simple commands of `cmd` (wrappers dropped, `bash -c` and `$( )` read, file redirects gone), None
     when it cannot be read: a backquote hides a command from that parser."""
     from . import glmguard, hook
+    cmd = hook._split(cmd)[0]   # heredoc bodies no shell reads: gone, before REDIRECT takes their `<<`
     if "`" in cmd:
         return None
     try:
@@ -182,28 +189,6 @@ def _words(cmd: str, depth: int = 0):
             yield x and (x[0], True)
 
 
-def _redirect_writes(cmd: str, cwd: str, roots, run_dir: str = "") -> list[str]:
-    """Files `cmd` writes, but a device, an fd, or for a local command a file under the run's own folders
-    (glmguard refuses a local write anywhere else); a remote command's redirect is always a change."""
-    from .sidefx import HARMLESS, _inside, classify_paths
-    remote = any(ssh_target(w) for w in (_segs(cmd) or []))
-    return [p for p, (cls, _) in classify_paths(cmd, os.path.expanduser("~"), cwd, run_dir).items()
-            if cls == "write" and (not _inside(p, roots) or remote and not p.startswith(HARMLESS))]
-
-
-def _free(w, project: str = "") -> bool:
-    """A command a device run runs without a plan step: a read (coordfix's shared table), a prose line, `ttp
-    advise`, a plain `ttp note` progress line or the run's own bookkeeping (glmguard.plan_bookkeeping)."""
-    from . import coordfix, glmguard
-    args = glmguard._ttp_args(w, project)
-    if args is not None and (args[:1] == ["advise"] or glmguard.plan_bookkeeping(args)
-                             or args[:1] == ["note"] and not glmguard.note_route(w[1:])):
-        return True
-    if PROSE.fullmatch(" ".join(w)):
-        return True
-    return coordfix.reads_only(shlex.join([a if "$" not in a else "SUB" for a in w]))   # each `$( )` is its own segment
-
-
 def _matches(prog: str, entries) -> bool:
     """`prog` is one of `entries`: a bare name only as an unqualified program of that name (`/tmp/x/run.sh` is not
     `run.sh`), a path as that path or a program under it, and never through `..`."""
@@ -223,13 +208,15 @@ def power_refusal(cmd: str, routes=("broker",)) -> str | None:
     """The seventh check: a power cycle or reset only through the project's approved routes (its broker
     or the scripts route.glm_work.power_routes names), never raw `ipmitool` power or raw bytes, or
     `tt-smi` resets outside them."""
+    from . import hook
     from .hook import DEVICE_TOOLS
     why = ("power cycles and resets go only through the project's approved routes "
            f"({', '.join(routes) or 'none set'}), never raw ipmitool power or raw bytes, or tt-smi resets: ")
     from .coordfix import _ipmi_words
     for x in _words(cmd):
         if x is None:
-            if re.search(r"\bipmitool\b.*\b(?:power\s+(?!status)|raw\b)|\btt-smi\b.*(?:\s-r\b|--reset|glx_reset)", cmd):
+            if re.search(r"\bipmitool\b.*\b(?:power\s+(?!status)|raw\b)|\btt-smi\b.*(?:\s-r\b|--reset|glx_reset)",
+                         hook._split(cmd)[0]):
                 return why + cmd[:120]
             continue
         w = x[0]
@@ -242,41 +229,52 @@ def power_refusal(cmd: str, routes=("broker",)) -> str | None:
     return None
 
 
-def risky(cmd: str) -> bool:
-    """A reset, power cycle, flash or firmware step: it needs an Opus check before it runs."""
+def risky(cmd: str, routes=tuple(DEFAULTS["power_routes"])) -> bool:
+    """A reset, power cycle, flash or firmware step: it needs an Opus check before it runs. Read on the program's
+    name (`grep reset log` is a read), and for a route on its words (`broker reset box-a`). A script run by its
+    path is not read: the plan's step check and the post-run audit cover it."""
+    from . import hook
     from .hook import DEVICE_TOOLS
     for x in _words(cmd):
         if x is None:
-            return bool(RISKY.search(cmd))
+            return bool(RISKY.search(hook._split(cmd)[0]))
         w = x[0]
         prog, args = os.path.basename(w[0]), w[1:]
         if prog == "git":
             continue   # `git reset` is no device reset
+        if prog == "ipmitool":
+            if IPMI_POWER.search(" ".join(args)):
+                return True
+            continue   # `ipmitool power status`, `sdr`, `sensor`: reads
         rx = DEVICE_TOOLS.get(prog)
         hit = rx.fullmatch if prog == "tt-smi" else rx.search if rx else None
         if prog in DEVICE_TOOLS and (hit is None or any(hit(a) for a in args)) \
-                or prog in ("reboot", "shutdown", "poweroff") or RISKY.search(" ".join(w)):
+                or prog in ("reboot", "shutdown", "poweroff") or RISKY.search(prog) \
+                or _matches(w[0], routes) and RISKY.search(" ".join(args)):
             return True
     return False
 
 
-def parse(text: str) -> list[dict]:
-    """The plan's command steps: its last fenced JSON block; prose lines are notes, never commands."""
-    for m in reversed(FENCE.findall(text or "")):
-        try:
-            got = json.loads(m)
-        except ValueError:
-            continue
-        rows = got.get("steps") if isinstance(got, dict) else None
-        if isinstance(rows, list):
-            out = []
-            for i, r in enumerate(rows, 1):
-                c = " ".join(str((r or {}).get("command") or "").split()) if isinstance(r, dict) else ""
-                if c and not PROSE.fullmatch(c):
-                    out.append({"n": r.get("n") or i, "host": str(r.get("host") or "local"), "command": c,
-                                "check": r.get("check") is True})
-            return out
-    return []
+def parse_why(text: str) -> tuple[list[dict], str]:
+    """The plan's command steps from its last fenced JSON block, and why there are none ("" when there are):
+    a block that does not parse names the JSON error's line and column in the block. Prose is never a command."""
+    blocks = FENCE.findall(text or "")
+    if not blocks:
+        return [], NO_BLOCK
+    try:
+        got = json.loads(blocks[-1])
+    except json.JSONDecodeError as e:
+        return [], f"its JSON block is not valid JSON: {e.msg} at line {e.lineno} column {e.colno} of the block"
+    rows = got.get("steps") if isinstance(got, dict) else None
+    if not isinstance(rows, list):
+        return [], 'its JSON block has no "steps" list'
+    out = []
+    for i, r in enumerate(rows, 1):
+        c = " ".join(str(r.get("command") or "").split()) if isinstance(r, dict) else ""
+        if c and not PROSE.fullmatch(c):
+            out.append({"n": i, "host": str(r.get("host") or "local"), "command": c,
+                        "check": r.get("check") is True})
+    return out, "" if out else "its JSON block has no command steps"
 
 
 def _read(path):
@@ -308,8 +306,7 @@ def store(run_dir, text: str, cwd: str = "", cfg: dict | None = None) -> str | N
         glmguard.hit(run_dir, text[:280], kind="plan")
         return text
     s = settings(cfg if cfg is not None else _cfg())
-    steps = parse(text)
-    why = "" if steps else "the plan has no fenced JSON block of command steps"
+    steps, why = parse_why(text)
     for st in steps:
         if why:
             break
@@ -344,7 +341,8 @@ def _static(cmd: str, s: dict, cwd: str, run_dir: str = "") -> str | None:
         from . import aitag, glmguard, hook, pathguard, ruleguard
         # a step runs under glmguard too: one naming mail, a database or a routed note is no plan step
         if why := glmguard.shell_refusal(split_host(cmd)[1], cwd or os.getcwd(), run_dir,
-                                         {"TTP_RUN_DIR": run_dir}, remote=True):
+                                         {"TTP_RUN_DIR": run_dir}, remote=True, writes=False, power=False,
+                                         services=False):
             return why
         if why := ruleguard.bash_refusal(cmd, hook._all_segments(hook._split(cmd)[0]), aitag.project_config(), cwd):
             return why
@@ -361,19 +359,31 @@ def _cfg() -> dict:
         return {}
 
 
-def _plain(cmd: str, cwd: str, env) -> tuple[list, list[str]]:
-    """`cmd`'s commands (_words) that are not _free, and the files it redirects into outside the run's folders."""
+def _approved(cmd: str, steps, scripts, cwd: str, run_dir: str, env) -> bool:
+    """`cmd` writes on another host only through Opus's plan: it is a step, or each part of it that writes there
+    is a step or runs a script on the project's list."""
     from . import glmguard
-    run_dir = str(env.get("TTP_RUN_DIR") or "")
-    roots = glmguard._roots(cwd, run_dir, glmguard._scratch(run_dir, env))
-    project = glmguard._own_name(env)
-    return [x for x in _words(cmd) if x is None or not _free(x[0], project)], _redirect_writes(cmd, cwd, roots, run_dir)
+    if step_match(cmd, steps):
+        return True
+    for w in _segs(cmd) or [None]:
+        if w is None:
+            return False
+        one = shlex.join(w)
+        why = glmguard.shell_refusal(one, cwd, run_dir, env, power=False)
+        if not why or step_match(one, steps):
+            continue
+        got = ssh_target(w)
+        there = (_segs(got[1]) or [[""]])[0] if got and got[1].strip() else [""]
+        if not (why.startswith(glmguard.REMOTE_WHY) and there and _matches(there[0], scripts)):
+            return False
+    return True
 
 
 def refusal(cmd: str, cwd: str = "", env=None, cfg: dict | None = None) -> str | None:
-    """Why a GLM device run may not run `cmd` now (it then goes back to Opus), else None. Reads run freely; a
-    change must be a step of Opus's plan or a script on the project's list; a reset, power cycle, flash or
-    firmware step needs an `ok` from `ttp advise --check-step N` since the last change."""
+    """Why a GLM device run may not run `cmd` now (it then goes back to Opus), else None. The denylist runs as for
+    any GLM run (glmguard.shell_refusal); a write on another host must be a step of Opus's plan or a script on the
+    project's list; a reset, power cycle, flash or firmware step goes through the approved routes and needs an `ok`
+    from `ttp advise --check-step N` since the last change. Everything else runs."""
     e = os.environ if env is None else env
     run_dir = str(e.get("TTP_RUN_DIR") or "")
     if not marked(run_dir):
@@ -383,28 +393,20 @@ def refusal(cmd: str, cwd: str = "", env=None, cfg: dict | None = None) -> str |
         return why
     ws = cwd or os.getcwd()
     from . import glmguard
-    # the hook runs glmguard only on a code-arm run: a plan run keeps its person-contact rules here
-    if why := glmguard.shell_refusal(cmd, ws, run_dir, e, remote=True):
-        return why
-    changes, writes = _plain(cmd, ws, e)
-    if not changes and not writes:
-        return None
     got = plan(run_dir)
-    if got is None:
-        return "a command that changes state runs only under Opus's plan: run `ttp advise --plan \"<the task>\"` first"
-    steps = got.get("steps") or []
-    if not step_match(cmd, steps):
-        if writes:
-            return f"out of plan: writes {writes[0][:120]} (not a step of Opus's plan)"
-        for seg in _segs(cmd) or [None]:
-            if seg is None:
-                return f"out of plan: {cmd[:120]} (cannot be read; not a step of Opus's plan)"
-            if step_match(shlex.join(seg), steps):
-                continue
-            bad = [x for x in _plain(shlex.join(seg), ws, e)[0] if x is None or not _matches(x[0][0], s["device_scripts"])]
-            if bad:
-                return f"out of plan: {shlex.join(seg)[:120]} (not a step of Opus's plan)"
-    if risky(cmd):
+    steps = (got or {}).get("steps") or []
+    if why := glmguard.shell_refusal(cmd, ws, run_dir, e, power=False):
+        if not why.startswith((glmguard.REMOTE_WHY, glmguard.SERVICE_WHY)):
+            return why
+        if got is None:
+            what = "a write on another host" if why.startswith(glmguard.REMOTE_WHY) else "a service start or stop"
+            return f"{why}: {what} runs only under Opus's plan: run `ttp advise --plan \"<the task>\"` first"
+        if not (step_match(cmd, steps) if why.startswith(glmguard.SERVICE_WHY)   # a service change: a whole step
+                else _approved(cmd, steps, s["device_scripts"], ws, run_dir, e)):
+            return f"out of plan: {why} (not a step of Opus's plan)"
+    if risky(cmd, s["power_routes"]):
+        if got is None:
+            return "a reset, power cycle, flash or firmware step runs only under Opus's plan: run `ttp advise --plan \"<the task>\"` first"
         n = next((st["n"] for st in steps if step_match(cmd, [st])), None)
         if n is None:
             return "out of plan: a reset, power cycle, flash or firmware step must be a step of Opus's plan"
@@ -432,9 +434,13 @@ def log_step(run_dir, cmd: str, rc, output: str = "") -> None:
     """One line per command the run ran (STEPS): the context of an Opus step check and of the post-run audit."""
     if not marked(run_dir) or re.match(r"\s*ttp\s+advise\b", cmd or ""):
         return
-    changes, writes = _plain(cmd or "", os.getcwd(), {**os.environ, "TTP_RUN_DIR": str(run_dir)})
+    from . import glmguard
+    cwd = os.getcwd()
+    e = {**os.environ, "TTP_RUN_DIR": str(run_dir)}
+    change = risky(cmd or "") or bool(glmguard.shell_refusal(cmd or "", cwd, str(run_dir), e, power=False)
+                                      or glmguard.writes_outside(cmd or "", cwd, str(run_dir), e, inline=True))
     row = {"ts": round(time.time(), 3), "cmd": cmd[:2000], "rc": rc, "tail": (output or "")[-800:],
-           "change": bool(changes or writes)}
+           "change": change, "cwd": cwd}
     try:
         from .project import durable_append
         durable_append(Path(run_dir) / STEPS, json.dumps(row, sort_keys=True) + "\n")
@@ -506,12 +512,44 @@ def run_end(db, cfg: dict, project: str, task: dict | None, run_id, run_dir, bou
                                  "bounce": kind}])[-200:]
     if kind:
         st["bounces"][kind] = st["bounces"].get(kind, 0) + 1
+    if out := outside_writes(run_dir):   # the backstop past the first audits: model-free, every run
+        st["outside_runs"] = st.get("outside_runs", 0) + 1
+        db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+             (time.time(), "deviceplan", "glm_device_outside_writes", "normal",
+              f"GLM device run {run_id} of task #{(task or {}).get('id')} ran {len(out)} command(s) that wrote "
+              f"outside its worktree and run folder and were no step of Opus's plan (list in {Path(run_dir) / OUTSIDE}): "
+              + "; ".join(r["cmd"][:100] for r in out[:3]), "new"))
     if st["audits_queued"] < settings(cfg)["device_audits"] and not st["stopped"]:
         st["audits_queued"] += 1
         db.add_task(f"Audit GLM device run {run_id} of task #{(task or {}).get('id')}", _audit_spec(run_id, task, run_dir),
                     kind="question", priority=2, tier="standard", model="opus", labels=[AUDIT_LABEL])
     db.set_kv(KV, st)
     return st
+
+
+def outside_writes(run_dir) -> list[dict]:
+    """The post-run scan (model-free): each logged command of the run that wrote or deleted outside its worktree
+    and run folder, interpreter code included, or wrote on another host, and was no step of Opus's plan. Kept in
+    OUTSIDE in the run folder."""
+    from . import glmguard
+    steps = (plan(run_dir) or {}).get("steps") or []
+    e = {"TTP_RUN_DIR": str(run_dir)}
+    out = []
+    for r in glmassist.rows(Path(run_dir) / STEPS):
+        cmd, cwd = str(r.get("cmd") or ""), str(r.get("cwd") or run_dir)
+        if not cmd or step_match(cmd, steps):
+            continue
+        why = glmguard.shell_refusal(cmd, cwd, str(run_dir), e, power=False) or ""
+        got = glmguard.writes_outside(cmd, cwd, str(run_dir), e, inline=True)
+        if why.startswith((glmguard.REMOTE_WHY, glmguard.SERVICE_WHY, "it writes outside")) or got:
+            out.append({"cmd": cmd[:500], "ts": r.get("ts"), "why": why or f"{got[0][0]} ({got[0][1]})"})
+    if out:
+        from .project import durable_write
+        try:
+            durable_write(Path(run_dir) / OUTSIDE, json.dumps(out, indent=1, sort_keys=True))
+        except OSError:
+            pass
+    return out
 
 
 def _audit_spec(run_id, task, run_dir) -> str:

@@ -299,9 +299,9 @@ def _gg_run(tmp_path):
 def test_glm_guard_is_on_for_an_arm_run_by_its_variable_or_its_marker_and_off_for_other_runs(tmp_path):
     from ttp import codearm, glmguard
     glm = {codearm.KEY: {"arm": "glm", "run": "glm"}}
-    assert glmguard.env_for(glm) == _GG_RUN_ENV
+    assert glmguard.arm_env(glm) == _GG_RUN_ENV
     for note in (None, {}, {codearm.KEY: {"arm": "glm", "run": "opus"}}, {codearm.KEY: {"arm": "sonnet", "run": "sonnet"}}):
-        assert glmguard.env_for(note) == {}, note
+        assert glmguard.arm_env(note) == {}, note
     wt, rd = _gg_run(tmp_path)
     assert not glmguard.active({}) and not glmguard.active({"TTP_RUN_DIR": str(rd)})
     assert glmguard.active(_GG_RUN_ENV)
@@ -312,8 +312,8 @@ def test_glm_guard_is_on_for_an_arm_run_by_its_variable_or_its_marker_and_off_fo
 @_pytest.mark.parametrize("cmd,action,refused", [
     ("push", "", False), ("checks", "", False), ("lock", "", False), ("detach", "", False), ("task", "show", False),
     ("task", "list", False), ("note", "", False), ("say", "", True), ("ask", "", True), ("notify", "", True),
-    ("upstream", "", True), ("task", "add", True), ("task", "steer-me", True), ("obligation", "", True),
-    ("memory", "", True), ("config", "", True), ("secret", "", True), ("issues", "", True)])
+    ("upstream", "", True), ("land", "", True), ("express", "", True), ("remove", "", True), ("machines", "set", True),
+    ("task", "add", False), ("obligation", "", False), ("memory", "", False), ("config", "", False), ("slop", "", False)])
 def test_glm_guard_cli_allows_checks_and_push_and_refuses_everything_that_reaches_someone(cmd, action, refused):
     from ttp import glmguard
     assert bool(glmguard.cli_refusal(cmd, action)) is refused, (cmd, action)
@@ -332,11 +332,11 @@ def test_glm_guard_cli_gate_ends_the_run_as_a_bounce_to_opus_and_a_normal_run_is
     monkeypatch.setenv("TTP_CODE_ARM_GUARD", "1")
     cli.glm_gate(type("A", (), {"cmd": "checks", "action": ""})())   # an allowed command passes
     with _pytest.raises(SystemExit) as e:
-        cli.glm_gate(type("A", (), {"cmd": "task", "action": "add"})())
+        cli.glm_gate(type("A", (), {"cmd": "land", "action": ""})())
     assert e.value.code == 2 and "GLM arm" in capsys.readouterr().err
     res = json.loads((rd / "result.json").read_text())
     assert codearm.bounce_reason(res).startswith("guard: ") and res["status"] == "blocked"
-    assert glmguard.hit_reason(rd).startswith("`ttp task add`")
+    assert glmguard.hit_reason(rd).startswith("`ttp land`")
 
 
 @_pytest.mark.parametrize("argv", [["checks"], ["checks", "--dry-run"], ["checks", "--fresh", "--", "true"],
@@ -368,8 +368,7 @@ _GG_WRITES = [
     "ttp machines set x --tag a", "ttp machines add x", "ttp machines remove x", "ttp machines push", "ttp machines tag-note a 'text'",
     "ttp machines outage x 'why' --expires 1d", "ttp machines outage x --clear", "ttp machines outage x why", "ttp machines outage --by p",
     "ttp machines outage --owner o x", "ttp machines outage --cl x", "ttp machines frobnicate", "ttp machines show x", "ttp machines", "ttp machines change",
-    "ttp machines change frobnicate", "ttp note --to p hi", "ttp notify hi", "ttp task add t s", "ttp task cancel 5",
-    "ttp task requeue 5", "ttp obligation progress o1 x"]
+    "ttp machines change frobnicate", "ttp note --to p hi", "ttp notify hi", "ttp land 5", "ttp push --land"]
 
 
 @_pytest.mark.parametrize("cmd", _GG_READS)
@@ -386,8 +385,8 @@ def test_glm_guard_still_refuses_every_ttp_write_and_an_unknown_machines_subcomm
     assert glmguard.shell_refusal(cmd, str(wt), str(rd), {"TTP_PROJECT": str(tmp_path / "proj"), **_GG_RUN_ENV}), cmd
 
 
-@_pytest.mark.parametrize("cmd", ['echo "$(ttp task add t s)"', 'echo "`ttp task cancel 5`"', 'x="a $(git push) b"',
-                                 'echo "$(gh pr comment 1 -b hi)"', 'echo "ok `ssh h ls`"', 'echo "$(echo "$(ttp notify hi)")"',
+@_pytest.mark.parametrize("cmd", ['echo "$(ttp land 5)"', 'echo "`ttp machines set x`"', 'x="a $(git push) b"',
+                                 'echo "$(gh pr comment 1 -b hi)"', 'echo "ok `ssh h \'ls > /srv/x\'`"', 'echo "$(echo "$(ttp notify hi)")"',
                                  'echo "it\'s $(ttp note --to p hi)"', 'echo "$(printf ")"; ttp notify hi)"',
                                  'echo "$(echo "\\")"; ttp notify hi)"'])
 def test_glm_guard_checks_a_substitution_inside_double_quotes_like_an_unquoted_one(cmd, tmp_path):
@@ -425,7 +424,7 @@ def test_glm_guard_device_task_is_a_device_lock_or_a_machine_tagged_device(monke
     assert effort.device_resources([], cfg, True) == [] and effort.device_resources(["", "  "], cfg, True) == []
 
 
-@_pytest.mark.parametrize("write", ["ttp machines change add x y", "ttp machines set x", "ttp note --to p hi", "ttp task add t s"])
+@_pytest.mark.parametrize("write", ["ttp machines change add x y", "ttp machines set x", "ttp note --to p hi", "ttp land 5"])
 @_pytest.mark.parametrize("chain", ["ttp machines list; {w}", "ttp machines list && {w}", "ttp machines list | {w}",
                                     "ttp machines list || {w}", "echo $({w})", "echo `{w}`", "ttp status & {w}",
                                     "ttp machines change list\n{w}", "bash -c 'ttp machines list; {w}'"])
@@ -467,7 +466,7 @@ class _GatesPassed(BaseException):
     pass
 
 
-@_pytest.mark.parametrize("name", sorted(__import__("ttp.glmguard", fromlist=["x"]).SUBS_ALLOWED))
+@_pytest.mark.parametrize("name", ["checks", "lock", "detach", "task", "config", "slop"])
 def test_glm_guard_passes_every_allowed_command_with_and_without_arguments(name, env, monkeypatch, tmp_path):
     """cell guard_checks: `checks`, `clip`, `lock`, `detach` and `pool-*` keep the commands after -- in a.cmd."""
     from ttp import cli, glmguard
@@ -517,7 +516,7 @@ def test_a_glm_runs_plain_note_goes_only_to_its_own_task_log(env, monkeypatch, t
     (["note", "--to", "other", "hi"], "--to"), (["note", "--to=other", "hi"], "--to"),
     (["note", "--reply", "abc123", "hi"], "--reply"), (["note", "--rep", "abc123", "hi"], "--reply"),
     (["note", "--to", "other", "--urgent", "hi"], "--to"), (["note", "--confirms", "abc123", "works"], "--confirms"),
-    (["note", "--severity", "high", "hi"], "--severity"), (["note", "--status", "7"], "--status")])
+    (["note", "--severity", "high", "hi"], "--severity")])
 def test_glm_guard_refuses_every_route_from_a_note_to_a_person_or_another_project(argv, route, env, monkeypatch,
                                                                                 tmp_path, capsys):
     """cells: glm_note_to_refused, glm_note_routes_refused: a note to someone becomes a draft, other routes bounce."""
@@ -532,15 +531,8 @@ def test_glm_guard_refuses_every_route_from_a_note_to_a_person_or_another_projec
         assert glmguard.hit_reason(rd).startswith(f"`ttp note {route}`")
     words = " ".join(f"'{w}'" if " " in w else w for w in argv)
     assert glmguard.shell_refusal(f"ttp {words}", str(wt), str(rd), {"TTP_PROJECT": str(p.base), **_GG_RUN_ENV})
-    assert set(glmguard.NOTE_ROUTES) >= {"--" + x.dest for x in _note_options() if x.dest != "text"}, \
+    assert set(glmguard.NOTE_ROUTES) | {"--status"} >= {"--" + x.dest for x in _note_options() if x.dest != "text"}, \
         "a new `ttp note` flag is refused on the GLM arm until it is judged"
-
-
-def test_glm_guard_knows_every_ttp_task_action():
-    """cell guard_task_actions: each `ttp task` action is a read the GLM arm may run or a write it refuses."""
-    from ttp import glmguard
-    acts = [x for x in _note_options("task") if x.dest == "action"][0].choices
-    assert set(acts) == glmguard.TASK_ACTIONS | glmguard.TASK_WRITES and not glmguard.TASK_ACTIONS & glmguard.TASK_WRITES
 
 
 def _note_options(sub="note"):
@@ -572,24 +564,21 @@ def test_glm_guard_turns_notify_into_a_draft_and_sends_nothing(env, monkeypatch,
     assert not (rd / glmguard.HIT).exists() and not (rd / "notify.jsonl").exists()
 
 
-def test_the_glm_prompt_names_only_commands_its_guard_allows_and_says_where_notes_go():
-    """cells: prompt_commands_allowed, glm_prompt_note_rule: the prompt's list is built from the guard's own."""
-    import re
+def test_the_glm_prompt_lists_the_denylist_and_says_where_notes_go():
+    """cells: prompt_denylist, glm_prompt_note_rule: the prompt names what the guard refuses, and nothing it allows."""
     from ttp import codearm, glmguard
     text = codearm.contract()
-    told, never = text.split("Never use", 1)
-    named = set(re.findall(r"`ttp ([a-z][\w-]*)", told))
-    assert named >= glmguard.SUBS_ALLOWED - {"advise"} and "note" in named   # advise: told only when on
-    for cmd in named:
-        assert glmguard.cli_refusal(cmd, "show") is None, cmd
-    assert "goes only to your task's own log" in told and "coordinator decides what reaches a chat" in told
-    assert "`ttp notify`" in never and "`ttp note --to`" in never and "--reply" in never and "refused" in never
-    assert glmguard.cli_refusal("notify") and glmguard.cli_refusal("note", "", ["--to"])
-    assert glmguard.cli_refusal("note", "", ["--reply"])
+    assert "everything runs except" in text and "goes only to your task's own log" in text
+    for name in ("ask", "notify", "say", "upstream", "land", "express"):
+        assert f"`ttp {name}`" in text and glmguard.cli_refusal(name), name
+    assert "`ttp note --to`" in text and glmguard.cli_refusal("note", "", ["--to"])
+    assert glmguard.cli_refusal("note", "", ["--reply"]) and "`ttp machines` writes" in text
+    for name in ("checks", "lock", "detach", "push", "landed", "task", "slop", "config"):
+        assert glmguard.cli_refusal(name, "show") is None, name
 
 
 @_pytest.mark.parametrize("argv,name", [(["note", "--to", "other", "hi"], "note --to"), (["notify", "hi"], "notify"),
-                                         (["task", "add", "x"], "task add"), (["say", "hi"], "say")])
+                                         (["land", "x"], "land"), (["say", "hi"], "say")])
 def test_glm_guard_refusal_names_the_command_it_refused(argv, name, env, monkeypatch, tmp_path, capsys):
     from ttp import cli, glmguard
     p = make(env)
@@ -601,7 +590,6 @@ def test_glm_guard_refusal_names_the_command_it_refused(argv, name, env, monkeyp
         cli.main(argv)
     assert e.value.code == 2 and f"`ttp {name}`" in capsys.readouterr().err
     assert glmguard.hit_reason(rd).startswith(f"`ttp {name}`") or glmguard.drafts(rd)
-    assert glmguard.cli_refusal("", "").startswith("a ttp call naming no command")
 
 
 def test_glm_guard_keeps_a_hand_off_the_run_wrote_before_it_was_stopped(tmp_path):
@@ -618,12 +606,11 @@ def test_glm_guard_keeps_a_hand_off_the_run_wrote_before_it_was_stopped(tmp_path
 
 
 @_pytest.mark.parametrize("cmd", [
-    "ttp note --to other 'hi'", "ttp ask 'ok?'", "ttp notify 'x'", "ttp some-project note hi", "ttp other-project checks", "ttp task add t s",
-    "ttp task p superseded 1 abc", "ttp task proj add t s", "ttp task show add t", "ttp task add show x",
-    "ttp task --why list p add t", "ttp task list restart 5 x",
+    "ttp note --to other 'hi'", "ttp ask 'ok?'", "ttp notify 'x'", "ttp land 5", "ttp p express 5 --why x",
+    "ttp push --land", "ttp remove p", "ttp machines change add box 'w' --undo true",
     "ttp upstream 'x'", "git push origin HEAD", "git -C . push --force", "gh pr comment 1 --body x",
     "gh issue create -t x", "gh api repos/o/r/issues -f title=x", "curl -X POST https://x.invalid -d a=b",
-    "curl --data a=b https://x.invalid", "ssh host true", "mail -s x a@b", "sqlite3 $TTP_PROJECT/state/project.db 'x'",
+    "curl --data a=b https://x.invalid", "ssh host 'ls > /srv/x'", "mail -s x a@b", "sqlite3 $TTP_PROJECT/state/project.db 'x'",
     "unset TTP_CODE_ARM_GUARD; ttp notify x", "TTP_CODE_ARM_GUARD=0 ttp notify x", "env -i ttp notify x",
     "rm $TTP_RUN_DIR/glm_guard.on", "echo x > /etc/hosts-copy", "cd /tmp/elsewhere-x && echo x > ~/note.txt",
     "bash -c 'ttp notify x'", "bash -c 'ttp note --to other x'", "ttp note --reply abc x",
@@ -776,7 +763,7 @@ def test_glm_guard_hook_denies_a_refused_call_and_ends_the_run_as_a_bounce(monke
     monkeypatch.setenv("TTP_RUN_DIR", str(rd))
     monkeypatch.setenv("TTP_PROJECT", str(tmp_path / "proj"))
     monkeypatch.setenv("TTP_CODE_ARM_GUARD", "1")
-    out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "ttp task add x"}, "cwd": str(wt)})
+    out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "ttp land 5"}, "cwd": str(wt)})
     assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert "goes back to Opus" in out["hookSpecificOutput"]["permissionDecisionReason"]
     assert codearm.bounce_reason(json.loads((rd / "result.json").read_text())).startswith("guard: ")
@@ -1448,3 +1435,37 @@ def test_a_review_of_a_change_touching_a_listed_file_names_it_on_a_covered_proje
     assert "touches policy files" in rev["spec"] and "src/policy_module.py" in rev["spec"] and "line by line" in rev["spec"]
     _, _, _, (rev,) = _finish_code(env, p, "plain again", {"src/other.py": 3})
     assert "touches policy files" not in rev["spec"]
+
+
+# The denylist: only the harmful kinds measured on real runs are refused; everything else runs.
+_GG_DENIED = [
+    "echo hi > /tmp/a", "rm -rf /srv/x", "ssh box-a rm -rf /srv/x", "curl -X POST -d a=b https://x.invalid",
+    "ttp land 5", "ttp express 5", "ttp push --land", "ttp p express 5 --why x", "git push", "ttp remove p",
+    "ttp machines change add box-a 'w' --undo true", "ttp machines set box-a --tag a", "ttp notify x",
+    "bash <<'EOF'\nttp notify x\nEOF", 'echo "<<EOF"; ttp notify x',
+    "sudo systemctl restart svc-a", "ssh box-a sudo -n systemctl stop svc-a", "service svc-a start",
+    "bash -c 'systemctl --user enable svc-a'", "ssh box-a bash -s <<'EOF'\nls\nsudo systemctl restart svc-a\nEOF",
+    "bash -s <<EOF\nsystemctl --now mask svc-a\nEOF"]
+_GG_ALLOWED = [
+    "echo hi > $TMPDIR/a", "echo hi > out.txt", "ssh box-a mkdir -p out", "curl --unix-socket /run/b.sock -X POST http://l/x",
+    "ttp machines change show 3", "ttp machines --help", "python3 <<'EOF'\nprint('`ttp notify x`')\nEOF",
+    "grep -o x f", "ssh -o BatchMode=yes box-a ls", "journalctl -o cat -n 5", "ttp lock b -- ssh -o x box-a ls",
+    "ttp note --status 5", "ttp slop", "ttp memory --search notify", "ttp task add t s", "ttp obligation progress o1 x",
+    "systemctl status svc-a", "ssh box-a systemctl is-active svc-a", "service --status-all",
+    "ttp quarantine still 5"]
+
+
+@_pytest.mark.parametrize("cmd", _GG_DENIED)
+def test_glm_guard_refuses_each_kind_on_the_denylist(cmd, tmp_path):
+    from ttp import glmguard
+    wt, rd = _gg_run(tmp_path)
+    e = {**_GG_RUN_ENV, "TMPDIR": str(rd / "tmp")}
+    assert glmguard.shell_refusal(cmd, str(wt), str(rd), e), cmd
+
+
+@_pytest.mark.parametrize("cmd", _GG_ALLOWED)
+def test_glm_guard_runs_everything_off_the_denylist(cmd, tmp_path):
+    from ttp import glmguard
+    wt, rd = _gg_run(tmp_path)
+    e = {**_GG_RUN_ENV, "TMPDIR": str(rd / "tmp")}
+    assert glmguard.shell_refusal(cmd, str(wt), str(rd), e) is None, cmd

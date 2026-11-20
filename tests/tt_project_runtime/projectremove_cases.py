@@ -96,7 +96,7 @@ def test_a_run_cannot_remove_its_own_project_but_can_remove_a_scratch_one(env, m
 def test_remove_is_listed_among_the_admin_commands_and_a_glm_run_cannot_run_it():
     from ttp import cli, glmguard
     assert "remove" in dict(cli.COMMAND_GROUPS)["admin"]
-    assert "remove" not in glmguard.SUBS_ALLOWED
+    assert glmguard.cli_refusal("remove")
 
 
 def test_a_deploy_check_follows_only_projects_registered_here_and_never_alerts_for_a_scratch_one(env, tmp_path):

@@ -458,7 +458,7 @@ READERS = {"cat", "head", "tail", "less", "more", "ls", "stat", "wc", "diff", "c
            "find", "test", "[", "jq", "sort", "uniq", "cut", "readlink", "realpath", "du", "tree"} | GREPS | PROGS
 INTERPS = {"python", "python3", "node", "perl", "ruby", "php"}
 OUTPUT_OPTS = {"-o", "--output", "--output-file", "--output-document", "--out"}
-NO_OUTPUT_OPTS = {"ps", "pgrep", "ss", "lsof"}   # their -o is a format or a plain flag, never a file written
+NO_OUTPUT_OPTS = {"ps", "pgrep", "ss", "lsof", "ssh", "scp", "sftp", "journalctl", "grep", "ttp"}   # their -o: a format or an option
 CODE_WRITE_RE = re.compile(r"""open\([^)]*['"][wax]|\.write(?:_text|_bytes)?\(|unlink|remove\(|rmtree|rename\(|"""
                            r"""replace\(|mkdir|chmod|writeFile|appendFile|copyfile|shutil\.(?:copy|move)""")
 

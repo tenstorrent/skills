@@ -12601,6 +12601,8 @@ def cmd_advise(a) -> None:
                             step=a.check_step)
     except ValueError as e:
         die(f"ttp advise: {e}")
+    if row.get("handed_back"):
+        die(f"ttp advise: {row.get('error')}; the task goes back to Opus, stop here")
     if not row.get("ok"):
         die(f"ttp advise: the call failed ({row.get('error') or 'no answer'}); decide yourself or hand the task back")
     print(row["answer"])

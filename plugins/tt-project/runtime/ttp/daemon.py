@@ -4248,7 +4248,7 @@ class Daemon:
             argv = _before_stdin(argv, resume_extra)
             (run_dir / "prompt.md").write_text(prompt)
             glmassist.arm(run_dir, (note or {}).get(glmassist.KEY))   # its ask-Opus limits, when switched on
-            if glmguard.env_for(note) or coordroute.guard_env(note):   # a GLM run: guarded even where its variable is unset
+            if glmguard.arm_env(note) or coordroute.guard_env(note):   # a GLM run: guarded even where its variable is unset
                 glmguard.mark(run_dir)
             if glm_env:   # a run on the chat model: outward posts become drafts, a device run stops at a failed gate
                 plan = bool((note or {}).get(deviceplan.KEY))
@@ -4266,7 +4266,7 @@ class Daemon:
             env = {**env, **venv_vars, **tmp_env, "TTP_RUN_DIR": str(run_dir), "TTP_PROJECT": str(self.p.base),
                    "TTP_RUN_ID": str(run_id), **task_env(task["id"] if task else ""), "PYTHONPATH": runtime_dir,
                    **blindreview.env(task),   # a blind review's `ttp` masks the model (every provider)
-                   **glmguard.env_for(note),  # a run on the code arm's GLM side runs under glmguard (every provider)
+                   **glmguard.arm_env(note),  # a run on the code arm's GLM side runs under glmguard (every provider)
                    **coordroute.guard_env(note),   # so does a routine coordinator lane or shadow turn
                    **glm_env,   # every run on the chat model, whatever route sent it there
                    "TTP_PYTHON": sys.executable,   # `ttp` runs under this, not the venv's python3
@@ -4352,7 +4352,7 @@ class Daemon:
                     **({"env_files": env_files} if env_files else {}),   # the runner adds them to env
                     # Workers and reviewers run niced, and all they start with them; the coordinator not.
                     "nice": nice_level(self.cfg.get("runner"))[0] if role != "coordinator" else 0}
-            if task and glmguard.env_for(note) and codearm.harness(self.cfg) == glmharness.HARNESS:
+            if task and glmguard.arm_env(note) and codearm.harness(self.cfg) == glmharness.HARNESS:
                 # The arm's live harness: mini-swe-agent, its command layer the side-effect guard. A harness that
                 # cannot be had ends the run as a hand-back to Opus (apply wrote it), never a failed attempt.
                 if why := glmharness.apply(spec, run_dir, self.cfg, runtime_dir, budget_usd=budget_usd):

@@ -6,10 +6,10 @@ from __future__ import annotations
 _DP_MODEL = "example-org/work-model"
 _DP_PLAN = """1. Check who holds box-a. 2. Reset it through the broker.
 ```json
-{"steps": [{"n": 1, "host": "box-a", "command": "mkdir -p /srv/out", "check": false},
-           {"n": 2, "host": "local", "command": "broker reset box-a", "check": true},
-           {"n": 4, "host": "box-a", "command": "test -e /srv/out", "check": true},
-           {"n": 3, "host": "local", "command": "Check the holder first.", "check": false}]}
+{"steps": [{"host": "box-a", "command": "mkdir -p /srv/out", "check": false},
+           {"host": "local", "command": "broker reset box-a", "check": true},
+           {"n": 7, "host": "box-a", "command": "test -e /srv/out", "check": true},
+           {"host": "local", "command": "Check the holder first.", "check": false}]}
 ```"""
 
 
@@ -35,7 +35,7 @@ def test_device_plan_reads_misfire_no_more_and_writes_outside_still_change(tmp_p
         assert deviceplan.refusal(c, str(tmp_path), e, {}) is None, c
     for c in ("ipmitool sdr", "ttp occupancy", "ls 2>&1 | tail -5", "tt-smi -s"):
         assert coordfix.reads_only(c), f"one shared read table: {c}"
-    for c in ("ls > /srv/x", "ls 2> /srv/x", "ssh box-a 'ls > /srv/x'", "dmesg -c", "tt-smi -r 0"):
+    for c in ("ls > /srv/x", "ls 2> /srv/x", "ssh box-a 'ls > /srv/x'", "tt-smi -r 0"):
         assert deviceplan.refusal(c, str(tmp_path), e, {}), c
         assert not coordfix.reads_only(c), c
 
@@ -82,17 +82,21 @@ def test_a_glm_device_run_runs_reads_bookkeeping_and_plan_steps_and_checks_risky
     run, e = _dp_run(tmp_path)
     ws = str(tmp_path)
     ref = lambda c, cfg=None: deviceplan.refusal(c, ws, e, cfg or {})
-    assert ref("mkdir -p /srv/out").endswith(" first"), "no plan yet: take it first"
-    for c in ("ipmitool sdr", "ttp machines change add box-a 'drop-in' --undo 'rm it' --expires 2h",
+    assert ref("ssh box-a mkdir -p /srv/out").endswith(" first"), "no plan yet: take it first"
+    assert ref("mkdir -p /srv/out").startswith("it writes outside"), "a local write outside: refused, plan or not"
+    assert ref("ttp machines change add box-a 'drop-in' --undo 'rm it' --expires 2h"), "machine-ledger writes"
+    for c in ("ipmitool sdr", "dmesg -c", "ttp machines change show 3", "ttp machines change add --help",
               "ttp obligation progress o1 'step 2 done'", "ttp note 'update: ok'", "ttp advise --plan 'x'"):
         assert ref(c) is None, c
     assert deviceplan.store(run, _DP_PLAN, ws, {}) is None
     got = deviceplan.plan(run)
-    assert [s["n"] for s in got["steps"]] == [1, 2, 4] and len(got["sha256"]) == 64, "prose is no step"
+    assert [s["n"] for s in got["steps"]] == [1, 2, 3] and len(got["sha256"]) == 64, \
+        "a step is its place in the list, whatever n the plan wrote; prose is no step"
     gates = json.loads((run / "glm_run.json").read_text())["gates"]
     assert "broker reset box-a" in gates and "ssh box-a test -e /srv/out" in gates
-    assert ref("ssh box-a mkdir -p /srv/out") is None and ref("mkdir -p /srv/out").startswith("out of plan"), "on its host"
-    assert ref("rm -rf /srv/other").startswith("out of plan")
+    assert ref("ssh box-a mkdir -p /srv/out") is None and ref("ssh box-a rm -rf /srv/other").startswith("out of plan")
+    assert ref("ssh box-a mkdir -p out") is None, "a relative path on the box is the run's own folder there"
+    assert ref("rm -rf /srv/other").startswith("it writes outside")
     assert ref("./scripts/site-fan.sh box-a", {"route": {"glm_work": {"device_scripts": ["./scripts/site-fan.sh"]}}}) is None
     assert ref("broker reset box-a") == ("check: step 2 is a reset, power cycle, flash or firmware step: run "
                                          "`ttp advise --check-step 2` first")
@@ -101,7 +105,7 @@ def test_a_glm_device_run_runs_reads_bookkeeping_and_plan_steps_and_checks_risky
     deviceplan.log_step(run, "ssh box-a mkdir -p /srv/out", 0, "")
     assert ref("broker reset box-a").endswith(" first"), "a change since the check needs a fresh one"
     assert ref("ipmitool chassis power cycle").startswith("power cycles and resets")
-    assert deviceplan.hook_refusal("rm -rf /srv/other", ws, e)
+    assert deviceplan.hook_refusal("ssh box-a rm -rf /srv/other", ws, e)
     assert deviceplan.bounce_kind(run, "x") == "out_of_plan"
     assert deviceplan.refusal("rm -rf /srv/other", ws, {"TTP_RUN_DIR": str(tmp_path / "none")}) is None, "other runs"
 
@@ -233,20 +237,21 @@ def test_a_plan_run_keeps_the_person_contact_guard_in_the_hook_and_the_runner(tm
     """Mail, raw sockets, databases and routed notes are refused in a plan run, even when Opus's plan names them."""
     from ttp import glmenv, hook
     run, ws = _dp_planned_run(tmp_path, monkeypatch)
-    named = ["mail -s x a@b", "sendmail x", "nc host 25", "sqlite3 x.db", "ttp note --urg hi", "ttp note --to P hi",
+    named = ["mail -s x a@b", "sendmail x", "nc host 25", "ttp note --urg hi", "ttp note --to P hi",
              "ttp note --t=P hi", "ssh box-a ttp note --urgent x", "ssh box-a 'sendmail a@b < /dev/null'"]
-    # a host no step names, a jump, and a local command through an ssh option, before or after the host
-    bad = named + ["ssh -J jump box-a ls", "ssh box-z ls", "ssh box-a -o ProxyCommand=sendmail true",
+    # a local command through an ssh option, before or after the host (reads on any host run)
+    bad = named + ["ssh box-a -o ProxyCommand=sendmail true",
                    "ssh box-a -oProxyCommand=nc ls", "ssh -o ProxyCommand=sendmail box-a true",
-                   "ssh -oLocalCommand=x -o PermitLocalCommand=yes box-a true", "ssh box-a -- ls", "ssh box-a -p 22 ls",
-                   "ssh -o 'KnownHostsCommand x' box-a true", "ttp obligation receipt o1 --evidence done"]
+                   "ssh -oLocalCommand=x -o PermitLocalCommand=yes box-a true", "ssh -o 'KnownHostsCommand x' box-a true"]
     plan = json.loads((run / "device_plan.json").read_text())
     plan["steps"] += [{"n": 9 + i, "host": "local", "command": c, "check": False} for i, c in enumerate(named)]
     (run / "device_plan.json").write_text(json.dumps(plan))
     pre = lambda c: hook._pre_tool_use({"tool_name": "Bash", "tool_input": {"command": c}, "cwd": ws})[0]
-    for c in bad:
-        out = pre(c)
-        assert out and out["hookSpecificOutput"]["permissionDecision"] == "deny", c
+    let = [c for c in bad if not ((out := pre(c)) and out["hookSpecificOutput"]["permissionDecision"] == "deny")]
+    assert let == [], let
+    for c in ("sqlite3 x.db", "ssh -J jump box-a ls", "ssh box-z ls", "ssh box-a -- ls", "ssh box-a -p 22 ls",
+              "ttp obligation receipt o1 --evidence done"):
+        assert pre(c) is None, c
     assert pre("ssh box-a test -e /srv/out") is None, "ssh to a host the plan's steps name, running a step"
     assert pre("ssh box-a ls -la /srv/out") is None, "flags after the remote command's first word are its own"
 
@@ -286,7 +291,7 @@ def test_deviceplan_and_glmguard_read_ttp_note_flags_alike(tmp_path):
                       ("ttp note --sev high hi", True), ("ttp note hi", False), ("ttp note 'update: ok'", False)):
         g = glmguard.shell_refusal(c, str(tmp_path), str(run), e)
         assert bool(g) is routed, c
-        assert deviceplan._free(c.split()) is not routed, c
+        assert bool(deviceplan.refusal(c, str(tmp_path), e, {})) is routed, c
 
 
 def test_scripts_and_routes_match_strictly(tmp_path):
@@ -301,3 +306,104 @@ def test_scripts_and_routes_match_strictly(tmp_path):
     assert deviceplan.power_refusal("./scripts/cycle.sh box-a", ["./scripts/"]) is None
     assert deviceplan.step_match("git reset --hard", [{"command": "git reset --hard"}])
     assert not deviceplan.step_match("git -C /other/repo reset --hard", [{"command": "git reset --hard"}]), "a plan step matches exactly"
+
+
+def _dp_asker(tmp_path, answers, seen):
+    """A device plan run armed for `ttp advise --plan`, and a fake CLI giving `answers` in turn."""
+    from ttp import deviceplan, glmassist
+    run, _ = _dp_run(tmp_path)
+    glmassist.arm(run, deviceplan.assist(None, {}, {"title": "reset box-a", "spec": "reset it"}))
+    left = list(answers)
+
+    def call(argv, text, timeout, cwd):
+        seen.append(text)
+        return {"result": left.pop(0), "total_cost_usd": 0.5, "usage": {"input_tokens": 10, "output_tokens": 5}}
+    return run, call
+
+
+_DP_BAD = _DP_PLAN.replace('"command": "mkdir -p /srv/out"', '"command": "echo "hi" > /srv/out"')
+
+
+def test_a_plan_whose_json_does_not_parse_names_the_error_line_and_column():
+    from ttp import deviceplan
+    steps, why = deviceplan.parse_why(_DP_BAD)
+    assert steps == [] and "not valid JSON" in why and "line 1 column" in why, why
+    assert deviceplan.parse_why("no block")[1] == deviceplan.NO_BLOCK
+    assert "steps" in deviceplan.parse_why('```json\n{"plan": []}\n```')[1]
+    assert len(deviceplan.parse_why(_DP_PLAN)[0]) == 3 and deviceplan.parse_why(_DP_BAD)[0] == []
+
+
+def test_opus_fixes_a_bad_plan_block_once_inside_the_plan_step_and_the_full_plan_is_kept(tmp_path):
+    from ttp import deviceplan, glmassist
+    seen = []
+    long_plan = "x" * 5000 + "\n" + _DP_PLAN
+    run, call = _dp_asker(tmp_path, [_DP_BAD, long_plan], seen)
+    row = glmassist.ask(run, "reset box-a", cwd=str(tmp_path), plan=True, run=call, binary="claude")
+    assert len(seen) == 2 and "line 1 column" in seen[1] and _DP_BAD in seen[1], "one fix-up turn with its error"
+    assert row["ok"] and "not valid JSON" in row["plan_error"] and row["cost_usd"] == 1.0
+    assert len(deviceplan.plan(run)["steps"]) == 3 and glmassist.planned(run)
+    assert len(glmassist.calls(run)[-1]["answer"]) == 4000
+
+
+def test_a_plan_still_bad_after_its_fix_up_fails_the_plan_step_and_glm_never_starts(tmp_path):
+    from ttp import deviceplan, glmassist
+    seen = []
+    run, call = _dp_asker(tmp_path, [_DP_BAD, _DP_BAD], seen)
+    row = glmassist.ask(run, "reset box-a", cwd=str(tmp_path), plan=True, run=call, binary="claude")
+    assert len(seen) == 2 and not row["ok"] and row["handed_back"] and "line 1 column" in row["error"]
+    guard = json.loads((run / "glm_guard.json").read_text())
+    assert guard["kind"] == "plan" and "line 1 column" in guard["why"], guard
+    assert deviceplan.plan(run) is None and not glmassist.planned(run)
+    assert "line 1 column" in glmassist.calls(run)[-1]["error"]
+
+
+def test_device_plan_reads_inline_code_as_text_and_a_route_verb_as_a_step():
+    from ttp import deviceplan
+    assert not deviceplan.risky("python3 -c \"print('reset')\"") and not deviceplan.risky("grep reset log")
+    assert not deviceplan.risky("ipmitool power status") and deviceplan.risky("ipmitool chassis power cycle")
+    assert deviceplan.risky("bash -c 'tt-smi -r 0'") and deviceplan.risky("broker reset box-a")
+
+
+def test_the_post_run_scan_lists_writes_outside_that_were_no_plan_step(tmp_path):
+    from ttp import deviceplan
+    run, e = _dp_run(tmp_path)
+    assert deviceplan.store(run, _DP_PLAN, str(tmp_path), {}) is None
+    for c in ("ls /srv", "ssh box-a mkdir -p /srv/out", "python3 -c \"open('/srv/y', 'w').write('x')\""):
+        deviceplan.log_step(run, c, 0)
+    got = deviceplan.outside_writes(run)
+    assert [r["cmd"] for r in got] == ["python3 -c \"open('/srv/y', 'w').write('x')\""], got
+    assert (run / deviceplan.OUTSIDE).exists()
+
+
+def test_a_service_start_or_stop_runs_only_as_a_step_of_opus_plan(tmp_path):
+    # starting or stopping a service on a shared box can take devices from others
+    from ttp import deviceplan
+    run, e = _dp_run(tmp_path)
+    ws = str(tmp_path)
+    ref = lambda c: deviceplan.refusal(c, ws, e, {})
+    assert ref("ssh box-a sudo systemctl restart svc-a").endswith(" first"), "no plan yet: take it first"
+    plan = _DP_PLAN.replace('"command": "mkdir -p /srv/out"', '"command": "sudo systemctl restart svc-a"')
+    assert deviceplan.store(run, plan, ws, {}) is None
+    assert ref("ssh box-a sudo systemctl restart svc-a") is None, "a step of the plan"
+    for c in ("ssh box-a sudo systemctl stop svc-b", "systemctl --user restart svc-a", "sudo service svc-a stop"):
+        assert ref(c).startswith("out of plan: it changes a service's state"), c
+    assert ref("ssh box-a systemctl status svc-a") is None, "a read"
+    from ttp import glmguard
+    sub = "out=$(sudo systemctl restart svc-a)"
+    assert deviceplan._static(sub, deviceplan.settings({}), ws, run) is None and \
+        glmguard.shell_refusal(sub, ws, str(run), e) is not None, "a plan step's $(...) service change"
+
+
+def test_a_service_change_in_a_heredoc_over_ssh_runs_only_as_a_plan_step(tmp_path):
+    import json
+    from ttp import deviceplan
+    run, e = _dp_run(tmp_path)
+    ws = str(tmp_path)
+    ref = lambda c: deviceplan.refusal(c, ws, e, {})
+    step = "ssh box-a bash -s <<'EOF'\nsudo systemctl restart svc-a\nEOF"
+    other = "ssh box-a bash -s <<'EOF'\nsudo systemctl stop svc-b\nEOF"
+    plan = _DP_PLAN.replace('{"host": "box-a", "command": "mkdir -p /srv/out", "check": false}',
+                            '{"host": "local", "command": %s, "check": false}' % json.dumps(step))
+    assert deviceplan.store(run, plan, ws, {}) is None
+    assert ref(step) is None, "a step of the plan"
+    assert "it changes a service's state" in (ref(other) or ""), other

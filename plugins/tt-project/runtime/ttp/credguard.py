@@ -511,19 +511,22 @@ def _cwds(segments: list[list[str]], cwd: str, home: str) -> list[str]:
     another user's shell runs (ssh, su, sudo)."""
     home = os.path.realpath(home)
     cwds = [home, os.path.realpath(cwd)]
+
+    def add(*places):   # each folder once: a long command (a heredoc's many words) never grows the list per word
+        cwds.extend(p for p in dict.fromkeys(places) if p not in cwds[1:])
     for argv in segments:
         name = os.path.basename(argv[0])
         targets = [w for w in argv[1:] if not w.startswith("-")] if name in ("cd", "pushd") else []
         if name in SSH_FAMILY | {"su", "sudo", "doas", "runuser", "popd"} or name in ("cd", "pushd") and not targets:
-            cwds.append(home)
+            add(home)
         for w in argv[1:]:
             for v in {w.split("=", 1)[-1], w[2:] if re.match(r"-\w.", w) else ""} - {""}:
                 places = _resolve(v, cwds[1:], home)
                 if places is None and v[0] in "$~`" or places and home in places:
-                    cwds.append(home)
+                    add(home)
                 elif places and w in targets:
-                    cwds += places
-    return [home] + list(dict.fromkeys(cwds[1:]))
+                    add(*places)
+    return cwds
 
 
 def ssh_secret(path: str, search: bool = False, home: str | Path | None = None) -> bool:

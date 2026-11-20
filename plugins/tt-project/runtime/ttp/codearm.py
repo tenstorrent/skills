@@ -375,14 +375,16 @@ def contract(reason_hint: str = "") -> str:
 
 
 def _guard_lines() -> str:
-    """What the arm's guard (glmguard) lets a run use, built from its own lists so the prompt cannot drift."""
-    from .glmguard import SUBS_ALLOWED
-    cmds = ", ".join(f"`ttp {c}`" for c in sorted(SUBS_ALLOWED - {"note", "advise"}))   # advise: told only when on
-    return ("\n\nOn this arm the harness runs only these ttp commands: " + cmds + " (task: show and list only), "
-            "and `ttp note`. Any other ttp command this prompt names is refused and hands the task back to Opus. "
-            'Use `ttp note "<text>"` for progress and to ack updates: it goes only to your task\'s own log, and '
-            "the coordinator decides what reaches a chat. Never use `ttp notify`, `ttp note --to` or `--reply`: "
-            "they are refused.")
+    """What the arm's guard (glmguard) refuses, built from its own lists so the prompt cannot drift."""
+    from .glmguard import LANDING, OUT_TTP
+    outs = ", ".join(f"`ttp {c}`" for c in sorted(OUT_TTP))
+    lands = ", ".join(f"`ttp {c}`" for c in sorted(LANDING))
+    return ("\n\nOn this arm everything runs except a short list the harness refuses (the task then goes back to "
+            f"Opus): {outs}, `ttp note --to` or `--reply`, `git push`, {lands} or `ttp push --land`, GitHub writes, "
+            "HTTP posts and mail, `ttp machines` writes, writes or deletes outside your worktree and run folder "
+            "(and on another host), protected paths, and resets, power cycles or flashes outside the project's "
+            'approved routes. Use `ttp note "<text>"` for progress and to ack updates: it goes only to your task\'s '
+            "own log, and the coordinator decides what reaches a chat.")
 
 
 def bounce_reason(res: dict | None) -> str:
