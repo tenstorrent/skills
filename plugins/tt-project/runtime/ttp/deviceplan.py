@@ -105,9 +105,9 @@ def settings(cfg: dict) -> dict:
 
 
 def on(cfg: dict) -> bool:
-    """Device tasks of this project may run on GLM under an Opus plan (glm_work on too)."""
+    """Device tasks of this project may run on GLM under an Opus plan: glm_work on, or rolled back to device_only."""
     from . import glmwork
-    return glmwork.covered(cfg) and settings(cfg)["on"]
+    return (glmwork.covered(cfg) or glmwork.device_only(cfg)) and settings(cfg)["on"]
 
 
 def device(task: dict | None, cfg: dict) -> bool:

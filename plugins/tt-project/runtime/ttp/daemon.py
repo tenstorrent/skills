@@ -13736,8 +13736,8 @@ class Daemon:
                     **({"pick_effort": s["effort"]} if s["effort"] else {})}
         if arm:   # the arm owns every run of its code task: the tier route never moves one (light wakes included)
             return None
-        if glmwork.settings(self.cfg):   # a covered project: the GLM work route decides every run
-            return self._glm_route(task, tier, picked, now, cls, peek)
+        if glmwork.settings(self.cfg) or glmwork.device_only(self.cfg) and deviceplan.device(task, self.cfg):
+            return self._glm_route(task, tier, picked, now, cls, peek)   # the GLM work route decides every run (device_only: device runs)
         dp = self._model_pick(task, tier, peek=peek)
         if dp is not None:   # the model pick (modelpick.py) decides this tier's route
             got = modelpick.target(self.cfg, dp)
@@ -13771,7 +13771,7 @@ class Daemon:
         """A covered project's route (glmwork.py) for a run that is not a code arm's: the work model at its
         effort, or None (core) for a run the keep-core checks hold or the task's Claude holdout. The floor keeps
         the run's tier and effort; only a verdict or a person-facing run stays on core for it (keeps_core)."""
-        s = glmwork.settings(self.cfg)
+        s = glmwork.settings(self.cfg, device=True)
         try:
             why = glmwork.keeps_core(self.p.db, self.cfg, task, tier, cls, picked)
         except Exception as e:   # in doubt, core

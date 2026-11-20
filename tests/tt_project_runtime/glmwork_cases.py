@@ -63,14 +63,19 @@ def test_a_glm_work_rollback_leaves_the_device_route_on_where_glm_device_covers_
     assert glmwork.keeps_core(p.db, cfg, plain, "standard") == ""
     assert rollout.stop_project("glm_work", "alpha", "worse")
     cfg = gate()
-    assert glmwork.device_only(cfg) and deviceplan.on(cfg) and glmwork.settings(cfg)["model"] == _GW_MODEL
+    assert glmwork.device_only(cfg) and deviceplan.on(cfg) and glmwork.settings(cfg, device=True)["model"] == _GW_MODEL
     assert glmwork.keeps_core(p.db, cfg, dev, "standard") == "", "the device task keeps the GLM route"
-    assert glmwork.keeps_core(p.db, cfg, plain, "standard") == "glm_work off", "everything else is back on core"
+    assert not glmwork.covered(cfg) and glmwork.settings(cfg) is None, "only the device path reads device_only"
     got = _gw_daemon(p, cfg)._route(dev, "standard", None, 1.0, cls="routine")
-    assert got and got[glmwork.KEY] == "glm" and _gw_daemon(p, cfg)._route(plain, "standard", None, 1.0, cls="routine") is None
+    assert got and got[glmwork.KEY] == "glm"
+    chat = {"endpoint": "placeholder", "base_url": "https://chat.example.invalid/v1", "routes": [{"model": "m-rule"}]}
+    cfg["providers"] = {"chat": chat}
+    off = lambda c: _gw_daemon(p, c)._route(plain, "standard", None, 1.0, cls="routine")   # noqa: E731
+    without = {**cfg, "route": {k: v for k, v in cfg["route"].items() if k != "glm_work"}}
+    assert off(cfg) and off(cfg) == off(without), "a plain run routes as it did before the rollback (its rule route)"
     rollout.stop_project("glm_device", "alpha", "device harm")   # glm_device's own stop still turns the route off
     cfg = gate()
-    assert not glmwork.covered(cfg) and not deviceplan.on(cfg) and glmwork.settings(cfg) is None
+    assert not glmwork.covered(cfg) and not deviceplan.on(cfg) and glmwork.settings(cfg, device=True) is None
     rollout.arm("glm_device", project="alpha")
     own = glmwork.ring_gate(base(), "alpha", {"route": {"glm_work": {"on": False}}})
     assert not glmwork.device_only(own), "a project's own glm_work setting still wins"

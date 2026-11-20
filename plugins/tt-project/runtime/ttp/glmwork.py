@@ -64,7 +64,7 @@ def device_only(cfg: dict) -> bool:
 
 
 def covered(cfg: dict) -> bool:
-    return _raw(cfg).get("on") is True or device_only(cfg)
+    return _raw(cfg).get("on") is True
 
 
 def model(cfg: dict) -> str:
@@ -77,10 +77,11 @@ def model(cfg: dict) -> str:
     return str(arm.get("model") or "").strip()
 
 
-def settings(cfg: dict) -> dict | None:
-    """The route's settings on a covered project with a work model, else None."""
+def settings(cfg: dict, device: bool = False) -> dict | None:
+    """The route's settings on a covered project with a work model, else None. `device`: the device path's read,
+    which also covers a device_only project."""
     g = _raw(cfg)
-    if not covered(cfg) or not (m := model(cfg)):
+    if not (covered(cfg) or device and device_only(cfg)) or not (m := model(cfg)):
         return None
     fb = g.get("fallback") if isinstance(g.get("fallback"), dict) else {}
     kinds = g.get("kinds")
@@ -192,7 +193,7 @@ def recorded(db, task_id) -> dict | None:
 def arm(db, cfg: dict, task: dict, peek: bool = False) -> dict | None:
     """The task's arm: {"arm": "glm" or "holdout", "why", "share", "ts"}, recorded on its first call (unless
     `peek`); a follow-up takes its lineage's arm. None when the route is off."""
-    s = settings(cfg)
+    s = settings(cfg, device=True)
     if not s or not task or not task.get("id"):
         return None
     tid = int(task["id"])
@@ -247,8 +248,6 @@ def keeps_core(db, cfg: dict, task: dict, tier: str, cls: str | None = None, pic
     text = f"{task.get('title') or ''}\n{task.get('spec') or ''}"
     if cls == "coordinator" or kind in ("plan", "review"):
         return kind if kind in ("plan", "review") else "coordinator"
-    if device_only(cfg) and not deviceplan.device(task, cfg):
-        return "glm_work off"   # rolled back: the GLM route stays for device tasks only (glm_device's own flag)
     labels = task_labels(task)
     if tier == "deep" or any(lb in ("user_deep", "needs_deep") for lb in labels) or effort.wants_deep(task.get("result")):
         return "deep"

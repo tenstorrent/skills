@@ -544,8 +544,7 @@ def _says(s: dict) -> str:
 def judge(p, cfg: dict, now: float) -> dict:
     """{"state": "ok" | "worse" | "wait", "why", "n", "signals"}: the project's GLM arm against its own Claude
     baseline (the module doc); n is the GLM tasks with an outcome."""
-    from . import correction, rollout
-    from .tierfloor import device_run
+    from . import correction, deviceplan, rollout
     db, st = p.db, settings(cfg)
     recs = arm_records(db)
     if not recs:
@@ -557,7 +556,7 @@ def judge(p, cfg: dict, now: float) -> dict:
     tasks, runs = _tasks(db, ids), _worker_runs(db, ids)
     work = lambda ts: [t for t in ts if (tasks.get(t) or {}).get("kind") != "review"]   # noqa: E731
     armed = rollout.armed_at(getattr(p, "name", ""), "glm_work", "glm_code")   # a re-arm starts a new window
-    device = lambda t: device_run(tasks.get(t) or {}, cfg)   # noqa: E731
+    device = lambda t: deviceplan.device(tasks.get(t) or {}, cfg)   # noqa: E731
     glm = [t for t, r in recs.items() if r.get("arm") == "glm" and float(r.get("ts") or now) >= armed]
     dev_glm = [t for t in glm if device(t)]   # device runs are judged by glm_device's own judge: only incidents count here
     glm = [t for t in glm if t not in dev_glm]

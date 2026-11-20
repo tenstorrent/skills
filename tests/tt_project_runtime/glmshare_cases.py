@@ -219,6 +219,10 @@ def test_glm_device_runs_leave_the_glm_work_judgment_but_a_device_incident_after
         p.db.update_task(tid, labels=box)
     v = glmshare.judge(p, _GS_CFG, now)
     assert (v["state"], v["n"]) == ("ok", 4), "failed device tasks are not glm_work outcomes"
+    for _ in range(2):   # no device mark: the spec names the device work, and the device route runs it on GLM
+        p.db.x("UPDATE tasks SET spec=? WHERE id=?", ("Run the soak on the box.", _gs_decided(p, t0 + 7200, 0, arm="glm")))
+    v = glmshare.judge(p, _GS_CFG, now)
+    assert (v["state"], v["n"]) == ("ok", 4), "a device task by its spec text is no glm_work outcome either"
     rollout.stop_project("glm_work", p.name, "worse")
     rollout.arm("glm_work", project=p.name)
     later = time.time() + 600
