@@ -148,6 +148,19 @@ def test_only_the_user_turns_a_provider_route_off(env):
     assert p.raw_config()["providers"]["chat"]["tiers"]["light"]["route"] is False
 
 
+class _BsTypedJev(_BsJev):
+    """Answers each question in its own type's shape, as the live Jev does."""
+
+    def decide(self, state, questions, purpose="decide", timeout=20.0):
+        self.calls += 1
+        out = {}
+        for k, q in questions.items():
+            t = q.get("type")
+            out[k] = ({"noul": 0.9} if t == "noul" else {"score": 3.0} if t == "score"
+                      else {"choice": next(iter(q["criteria"])), "probabilities": {}})
+        return out
+
+
 def _bs_counting(text):
     seen = []
 
