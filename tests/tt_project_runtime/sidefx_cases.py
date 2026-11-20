@@ -586,3 +586,23 @@ def test_a_peer_change_another_run_made_in_the_same_window_is_never_this_runs_ef
     assert effects("ttp peer stop") == ["project peer's daemon was stopped"]
     assert len(effects(str(project.registry_path()), tool="Write")) == 2
     assert effects(f"rm -rf {tmp_path}/scratchx") == ["project scratchx's registry row was removed"]
+
+
+def test_sed_in_place_counts_only_its_file_operands_as_targets_never_its_script(tmp_path):
+    """A sed script such as `s/_fmt(/_rate_str(/g` was read as the write target /_rate_str; -e, -f, -E, -i.bak,
+    other s delimiters and `--` are parsed, a `w file` command still counts, and a relative target after a cd too."""
+    from ttp import sidefx
+    wt = str(tmp_path / "wt")
+
+    def writes(cmd):   # the writes outside the worktree
+        return {k: v[1] for k, v in sidefx.classify_paths(cmd, "/home/u", wt, "").items()
+                if v[0] == "write" and not k.startswith(wt + "/")}
+    assert writes("sed -i 's/def _fmt(v) -> str:/def _rate_str(v) -> str:/; s/_fmt(/_rate_str(/g' src/m.py") == {}
+    assert writes("sed -i -e 's|a|/b|' -e 's,/c,d,' src/m.py /tmp/out") == {"/tmp/out": "sed -i target"}
+    assert writes("sed -Ei.bak 's/x/\\/y/' /srv/a") == {"/srv/a": "sed -i target"}
+    assert writes("sed --in-place --expression=s/a/b/ -- /srv/b") == {"/srv/b": "sed -i target"}
+    assert writes("sed -i '/stage-task.sh/d' f.py") == {}
+    assert writes("sed -i 's/a/b/w /etc/x' f.py") == {"/etc/x": "sed -i script with a w command"}
+    assert sidefx.classify_paths("sed -i -f /tmp/s.sed f.py", "/home/u", wt, "")["/tmp/s.sed"][0] == "executed"
+    assert writes("cd /srv/o && sed -i s/a/b/ rel.txt") == {"/srv/o/rel.txt": "sed -i target"}
+    assert writes("sed 's/a/b/' /srv/c > /srv/d") == {"/srv/d": "redirect target"}   # no -i: reads /srv/c

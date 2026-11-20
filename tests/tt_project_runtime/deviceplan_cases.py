@@ -429,3 +429,44 @@ def test_a_service_change_in_a_heredoc_over_ssh_runs_only_as_a_plan_step(tmp_pat
     assert deviceplan.store(run, plan, ws, {}) is None
     assert ref(step) is None, "a step of the plan"
     assert "it changes a service's state" in (ref(other) or ""), other
+
+
+def test_device_planner_is_told_to_publish_with_ttp_push_and_to_name_remote_scratch_from_its_task_id():
+    """A plan stepped `git push` and failed its own check; another named its remote scratch folder with a made-up
+    task number the GLM run then corrected, so the run went out of plan. The planner gets the task id."""
+    from ttp import deviceplan
+    assert "never `git push`" in deviceplan.DEVICE_PLAN and "named from the task id" in deviceplan.DEVICE_PLAN
+    assert deviceplan.assist(None, {}, {"id": 42, "title": "stage a venv", "spec": "on box-a"})["task"].startswith(
+        "task id 42\nstage a venv")
+    assert deviceplan.assist(None, {}, {"title": "t", "spec": "s"})["task"] == "t\ns"
+    assert "paths and names exactly" in deviceplan.glm_lines()
+
+
+def test_glm_device_bounce_rule_counts_only_runs_after_the_projects_latest_re_arm(env, tmp_path, monkeypatch):
+    """Rolled back on mostly-bounced runs from before a fix, a re-armed project waits for 10 new runs; the
+    harmful-step rule stays immediate."""
+    from ttp import deviceplan, rollout
+    p = make(env)
+    cfg = _dp_cfg(device=True, device_audits=2)
+    t = p.db.task(p.db.add_task("soak", "Run the soak on the box.", kind="work", tier="standard", priority=3))
+    clock = [1_000_000.0]
+
+    def tick():
+        clock[0] += 60
+        return clock[0]
+    monkeypatch.setattr(time, "time", tick)
+
+    def runs(bounces):
+        for b in bounces:
+            n = int(clock[0])
+            (tmp_path / f"r{n}").mkdir()
+            run, _ = _dp_run(tmp_path / f"r{n}")
+            deviceplan.run_end(p.db, cfg, p.name, t, n, run, b)
+    runs(["x"] * 6 + [""])
+    assert rollout.stop_project(deviceplan.FLAG, p.name, "most went back") and "re-armed" in rollout.arm(
+        deviceplan.FLAG, project=p.name)
+    runs(["", "", ""])
+    v = deviceplan.judge(p, cfg, clock[0])
+    assert v["state"] == "wait", ("7 old runs, 6 bounced, then a re-arm and 3 clean runs", v)
+    runs(["x"] * 6 + [""])
+    assert deviceplan.judge(p, cfg, clock[0])["state"] == "worse", "10 runs after the arm, 6 bounced"

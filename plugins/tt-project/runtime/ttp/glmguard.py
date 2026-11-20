@@ -119,7 +119,7 @@ HANDOFF_LINE = ("Before you hand off done, check your own diff as the independen
 _SCRATCH_REF = re.compile(r"\$(?:\{(TMPDIR|TMP|TEMP)\}|(TMPDIR|TMP|TEMP)(?!\w))")
 _SCRATCH_SET = re.compile(r"(?<![\w${])(?:TMPDIR|TMP|TEMP)(?!\w)")   # the command names one itself (sets it)
 RUN_ENV = "TTP_GLM_RUN"       # "1", or DEVICE for a run on a device task
-RUN_MARK = "glm_run.json"     # in the run folder: {"device", "gates"}, read where the variable is gone
+RUN_MARK = "glm_run.json"     # in the run folder: {"device", "gates", "plan", "cwd"}, read where the variable is gone
 DEVICE = "device"
 DRAFTS = "outbound.jsonl"     # in the run folder: one {channel, target, text, why, command, ts} per refused post
 GATE = "gate"
@@ -307,9 +307,11 @@ def _scratch(run_dir: str, env) -> str:
     return tmp if _own_tmp(tmp, run_dir) else (str(Path(run_dir) / SCRATCH) if run_dir else "")
 
 
-def _roots(cwd: str, run_dir: str, scratch: str = "") -> list[str]:
+def _roots(cwd: str, run_dir: str, scratch: str = "", env=None) -> list[str]:
+    """The folders a GLM run may write in: its shell's cwd, run folder, scratch and the folder it started in (a
+    `cd` into a sibling folder moves the shell's cwd, never that start)."""
     out = []
-    for x in (cwd, run_dir, scratch):
+    for x in (cwd, run_dir, scratch, ((glm_run(env) if env is not None else None) or {}).get("cwd", "")):
         if x:
             out += [os.path.normpath(x), os.path.realpath(x)]
     return out
@@ -328,7 +330,7 @@ def writes_outside(cmd: str, cwd: str, run_dir: str = "", env=None, inline: bool
     (a device and an fd aside). Writes read from interpreter code count only with `inline` (the post-run scan)."""
     from . import sidefx
     e = os.environ if env is None else env
-    roots = _roots(cwd, run_dir, _scratch(run_dir, e))
+    roots = _roots(cwd, run_dir, _scratch(run_dir, e), e)
     # $TMPDIR (TMP, TEMP) is read as its value in the run's environment, or as /tmp where the command sets it itself
     told = bool(_SCRATCH_SET.search(cmd))
     paths = _SCRATCH_REF.sub(lambda m: "/tmp" if told else str(e.get(m.group(1) or m.group(2)) or "/tmp"), cmd)
@@ -342,8 +344,9 @@ def remote_writes(cmd: str, cwd: str = "") -> list[tuple[str, str]]:
     """(path, why) for each file a command run on another host writes there by an absolute or home path (a device,
     an fd and a path relative to the run's folder there aside)."""
     from . import sidefx
-    there = "/@remote-cwd"   # a relative path there is under the run's own folder on that host
-    return [(p, why) for p, (cls, why) in sidefx.classify_paths(cmd, "~", there, "").items()
+    there, home = "/@remote-cwd", "/@remote-home"   # a relative path there is under the run's own folder on that host
+    return [("~" + p[len(home):] if p == home or p.startswith(home + "/") else p, why)
+            for p, (cls, why) in sidefx.classify_paths(cmd, home, there, "").items()
             if cls == "write" and "inline code" not in why and not p.startswith((there,) + sidefx.HARMLESS)]
 
 
@@ -438,7 +441,7 @@ def tool_refusal(payload: dict, env=None) -> str | None:
     if tool.startswith("mcp__"):
         return "a connector tool reaches a person or a service outside the hand-off"
     if tool in WRITE_TOOLS:
-        home, roots = os.path.expanduser("~"), _roots(cwd, run_dir, _scratch(run_dir, e))
+        home, roots = os.path.expanduser("~"), _roots(cwd, run_dir, _scratch(run_dir, e), e)
         paths = sidefx._arg_paths(args) + sidefx._patch_paths(json.dumps(args) if tool == "apply_patch" else
                                                               str(args.get("input") or args.get("patch") or ""))
         for p in paths:
@@ -480,16 +483,16 @@ def gate_lines(spec: str) -> list[str]:
     return [" ".join(m.split()) for m in GATE_LINE.findall(spec or "")][:20]
 
 
-def mark_run(run_dir, device: bool, gates=(), plan: bool = False) -> None:
+def mark_run(run_dir, device: bool, gates=(), plan: bool = False, cwd: str = "") -> None:
     """The daemon's marker for a run on the chat model (read by glm_run() where the variable is gone); `plan`: a
-    device run under an Opus plan (deviceplan.py)."""
+    device run under an Opus plan (deviceplan.py); `cwd`: the folder it starts in, a root of its writes (_roots)."""
     from .project import durable_write
     durable_write(Path(run_dir) / RUN_MARK, json.dumps({"device": bool(device), "gates": list(gates),
-                                                       **({"plan": True} if plan else {})}))
+                                                       **({"plan": True} if plan else {}), **({"cwd": cwd} if cwd else {})}))
 
 
 def glm_run(env=None) -> dict | None:
-    """{"device", "gates"} for a run on the chat model, None for any other run."""
+    """{"device", "gates", "plan", "cwd"} for a run on the chat model, None for any other run."""
     e = os.environ if env is None else env
     rd = str(e.get("TTP_RUN_DIR") or "")
     try:
@@ -499,7 +502,7 @@ def glm_run(env=None) -> dict | None:
     if isinstance(got, dict):
         gates = got.get("gates") if isinstance(got.get("gates"), list) else []
         return {"device": bool(got.get("device")) or e.get(RUN_ENV) == DEVICE, "gates": [str(g) for g in gates],
-                "plan": got.get("plan") is True}
+                "plan": got.get("plan") is True, "cwd": str(got.get("cwd") or "")}
     if e.get(RUN_ENV) in ("1", DEVICE) or active(e):
         return {"device": e.get(RUN_ENV) == DEVICE, "gates": [], "plan": False}
     return None

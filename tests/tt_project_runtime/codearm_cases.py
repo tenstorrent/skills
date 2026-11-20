@@ -615,7 +615,8 @@ def test_glm_guard_keeps_a_hand_off_the_run_wrote_before_it_was_stopped(tmp_path
     "unset TTP_CODE_ARM_GUARD; ttp notify x", "TTP_CODE_ARM_GUARD=0 ttp notify x", "env -i ttp notify x",
     "rm $TTP_RUN_DIR/glm_guard.on", "echo x > /etc/hosts-copy", "cd /tmp/elsewhere-x && echo x > ~/note.txt",
     "bash -c 'ttp notify x'", "bash -c 'ttp note --to other x'", "ttp note --reply abc x",
-    "cat > ~/.tt-project/machine-workers.json"])
+    "cat > ~/.tt-project/machine-workers.json", "ssh host 'echo hi >> ~/.bashrc'", "ssh host 'run.sh > $HOME/out.log'",
+    "ssh host 'cd ~/wt && make > b.log'", "sed -i 's/a/b/w /etc/x-copy' src/mod.py", "cd /tmp/elsewhere-x && sed -i s/a/b/ rel.py"])
 def test_glm_guard_refuses_a_shell_command_that_reaches_a_person_a_project_or_something_outside_the_worktree(cmd, tmp_path):
     from ttp import glmguard
     wt, rd = _gg_run(tmp_path)
@@ -627,7 +628,10 @@ def test_glm_guard_refuses_a_shell_command_that_reaches_a_person_a_project_or_so
     "python3 -m pytest -q tests", "echo hi > out.txt", "cat a | grep b > $TTP_RUN_DIR/notes.txt", "gh pr view 1",
     "gh api repos/o/r/pulls/1", "curl -s https://x.invalid/doc", "ttp task p show 1", "ttp task proj list", "ttp task show 5", "ttp task list",
     "ttp task --limit 5 list", "ttp lock acquire x -- true",
-    "ls /tmp", "sed -i s/a/b/ src/mod.py"])
+    "ls /tmp", "sed -i s/a/b/ src/mod.py", "ssh host 'mkdir -p out && make > out/b.log'",
+    "sed -i 's/def _fmt(v) -> str:/def _rate_str(v) -> str:/; s/_fmt(/_rate_str(/g' src/mod.py",
+    "sed -i -e 's|a|/b|' -e 's,/c,d,' src/mod.py", "sed -Ei.bak 's/x/\\/y/' src/mod.py", "sed -i '/stage-task.sh/d' src/mod.py",
+    "sed -i -f $TTP_RUN_DIR/fix.sed src/mod.py"])
 def test_glm_guard_allows_the_commands_a_build_needs(cmd, tmp_path):
     from ttp import glmguard
     wt, rd = _gg_run(tmp_path)
@@ -706,6 +710,24 @@ def test_glm_guard_refuses_a_file_write_outside_the_worktree_and_any_connector_t
     assert ask("mcp__slack__post_message", {"text": "x"}) and ask("Read", {"file_path": "/etc/hostname"}) is None
     assert ask("Bash", {"command": "ttp notify hi"}) and ask("Bash", {"command": "ttp checks"}) is None
     assert ask("Bash", {"command": "ttp note hi"}) is None and ask("Bash", {"command": "ttp note --to x hi"})
+
+
+def test_glm_guard_keeps_the_folder_a_run_started_in_as_a_write_root_after_its_shell_cd_elsewhere(tmp_path):
+    """A run that started in its worktree and `cd`ed to a sibling folder still edits its worktree (an Edit there
+    was refused as outside it); a write outside both stays refused, and the daemon marks the start folder."""
+    import inspect, json
+    from ttp import daemon, glmguard
+    wt, rd = _gg_run(tmp_path)
+    (tmp_path / "sib").mkdir()
+    glmguard.mark_run(rd, False, cwd=str(wt))
+    assert json.loads((rd / glmguard.RUN_MARK).read_text())["cwd"] == str(wt)
+    env_ = {"TTP_RUN_DIR": str(rd), **_GG_RUN_ENV}
+
+    def edit(path):
+        return glmguard.tool_refusal({"tool_name": "Edit", "tool_input": {"file_path": path}, "cwd": str(tmp_path / "sib")}, env_)
+    assert edit(str(wt / "src" / "m.py")) is None
+    assert "outside its worktree" in edit(str(tmp_path / "other" / "m.py"))
+    assert "plan=plan, cwd=str(cwd))" in inspect.getsource(daemon)
 
 
 @_pytest.mark.parametrize("cmd", [

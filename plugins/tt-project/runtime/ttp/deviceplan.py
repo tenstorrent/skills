@@ -79,7 +79,10 @@ DEVICE_PLAN = (
     "one fenced ```json block, nothing after it: "
     '{"steps": [{"command": "<the exact shell command>", "host": "<alias or local>", "check": true}]}, the steps '
     "in run order. Every command that changes state must be a step (reads need none); `check` true for a step "
-    "whose failure must stop the run. Each check or gate command runs exactly as written, so use only options it "
+    "whose failure must stop the run. A change is published only with `ttp push` (after its checks), never "
+    "`git push`. A scratch folder on another host is made by its own step, named from the task id given with the "
+    "task (never another number), and every later step uses that exact path. Each check or gate command runs "
+    "exactly as written, so use only options it "
     "takes: confirm them in its documentation or source, which you can read, and leave out any option you "
     "cannot confirm. Each job-submit step is the complete command line, with every option the "
     "project's tooling needs (working directory, env file and the like). The block must be valid JSON: escape each \\\" and \\\\ inside a command. "
@@ -123,7 +126,8 @@ def assist(s: dict | None, cfg: dict, task: dict | None) -> dict:
     task (glmassist.ask), at least the default advisor minutes."""
     s = dict(s or glmassist.settings(cfg))
     t = task or {}
-    return {**s, "plan_first": True, "device": True, "task": f"{t.get('title') or ''}\n{t.get('spec') or ''}"[:6000],
+    head = f"task id {t['id']}\n" if t.get("id") else ""
+    return {**s, "plan_first": True, "device": True, "task": f"{head}{t.get('title') or ''}\n{t.get('spec') or ''}"[:6000],
             "max_minutes": max(float(s.get("max_minutes") or 0), glmassist.DEFAULTS["max_minutes"])}
 
 
@@ -492,7 +496,8 @@ def glm_lines() -> str:
             "steps, as written (fill only its <placeholders>); a reset, power cycle, flash or firmware step needs "
             "`ttp advise --check-step N` to answer ok first. A check step that exits nonzero or prints an error has "
             "failed: stop there, run no later step and hand the task back to Opus. Anything else outside the plan "
-            "also hands it back: never work around a refusal.")
+            "also hands it back: never work around a refusal. Use the plan's paths and names exactly, even one that "
+            "looks like a typo.")
 
 
 # --- live safety: Opus audits, the stop, the counters ---------------------------------------------------------
@@ -655,9 +660,11 @@ def daily_line(db) -> str:
 
 def judge(p, cfg: dict, now: float) -> dict:
     """The wave gate's verdict for FLAG (rollout.wave_tick): worse on a GLM-own harmful step or most of the last
-    10 runs bounced; ok after `device_audits` clean audits; else wait."""
+    10 runs since the project's latest re-arm bounced; ok after `device_audits` clean audits; else wait."""
+    from . import rollout
     c, need = counters(p.db), settings(cfg)["device_audits"]
-    last = _state(p.db)["runs"][-10:]
+    armed = rollout.armed_at(getattr(p, "name", ""), FLAG)   # the runs that led to a rollback never count against the fix
+    last = [r for r in _state(p.db)["runs"] if float(r.get("ts") or 0) > armed][-10:]
     if c["glm_harm"]:
         return {"state": "worse", "why": f"{c['glm_harm']} harmful step(s) GLM took on its own", "n": c["runs"]}
     if len(last) >= 10 and sum(1 for r in last if r.get("bounce")) > 5:

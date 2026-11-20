@@ -496,6 +496,47 @@ def commands(cmd: str, depth: int = 0) -> list[str]:
     return out
 
 
+SED_WRITE_RE = re.compile(r"(?:^|[;{}\n/\d$])\s*[wW]")
+
+
+def _sed_operands(args: list[str]) -> tuple[bool, list[str], list[str], list[str]]:
+    """(in place, scripts, -f script files, file operands) of sed's arguments: its script is no file."""
+    inplace, scripts, sfiles, files, k = False, [], [], [], 0
+    while k < len(args):
+        a = args[k]
+        if a == "--":
+            files += args[k + 1:]
+            break
+        if a.startswith("--"):
+            opt, eq, val = a.partition("=")
+            inplace = inplace or opt == "--in-place"
+            if opt in ("--expression", "--file", "--line-length"):
+                if not eq:
+                    k += 1
+                    val = args[k] if k < len(args) else ""
+                if opt != "--line-length":
+                    (scripts if opt == "--expression" else sfiles).append(val)
+        elif a.startswith("-") and a != "-":
+            for n, c in enumerate(a[1:], 2):
+                if c == "i":
+                    inplace = True
+                    break   # the rest is its backup suffix
+                if c in "efl":
+                    val = a[n:]
+                    if not val:
+                        k += 1
+                        val = args[k] if k < len(args) else ""
+                    if c != "l":
+                        (scripts if c == "e" else sfiles).append(val)
+                    break
+        elif not scripts and not sfiles:
+            scripts.append(a)
+        else:
+            files.append(a)
+        k += 1
+    return inplace, scripts, sfiles, files
+
+
 def classify_paths(cmd: str, home: str, cwd: str, run_dir: str, depth: int = 0) -> dict[str, tuple[str, str]]:
     """{path: (class, why)} for the paths a shell command names: `write` (a redirect, tee or output-flag
     target, a writing verb's target, a copy's destination, inline code that writes), `executed` (the
@@ -586,9 +627,15 @@ def classify_paths(cmd: str, home: str, cwd: str, run_dir: str, depth: int = 0) 
                 put(paths.pop(), "write", f"{name} destination", True)
             for a in paths:
                 put(a, "write" if name == "mv" else "read", f"{name} source")
-        elif name == "sed" and any(re.fullmatch(r"-\w*i\S*|--in-place\S*", a) for a in args):
-            for a in paths:
-                put(a, "write", "sed -i target")
+        elif name == "sed" and (sed := _sed_operands(args))[0]:
+            _, scripts, sfiles, files = sed
+            for a in files:
+                put(a, "write", "sed -i target", True)
+            for a in sfiles:
+                put(a, "executed", "sed -f script")
+            for a in scripts:   # a `w file` command may write: the script stays a target, as before
+                if SED_WRITE_RE.search(a):
+                    put(a, "write", "sed -i script with a w command")
         elif name in ("source", "."):
             for a in paths[:1]:
                 put(a, "executed", f"{name} runs it")
