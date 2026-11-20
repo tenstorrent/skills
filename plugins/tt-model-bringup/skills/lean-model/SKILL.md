@@ -5,8 +5,8 @@ description: Bring a Hugging Face model to a correct, fast TTNN full model on th
 
 # Lean model
 
-The outcome and its tests are fixed; the path is yours. What follows is what earlier bringups learned, offered
-as defaults. Where your measurements say otherwise, follow them and write down why.
+The outcome and its tests are fixed; the path is yours. What follows is what earlier bringups learned, the good
+and the bad, offered as defaults. Where your measurements say otherwise, follow them and write down why.
 
 Load the references when you reach them, not up front: [ops and kernels](references/ops.md),
 [mixture of experts](references/moe.md), [one or two machines](references/machines.md).
@@ -18,7 +18,8 @@ Load the references when you reach them, not up front: [ops and kernels](referen
   advertised context (or a hard physical limit with evidence).
 - The `reference-accuracy` suite with verdict match; the served precision chosen on its tiers.
 - `doc/model/model.json` and `REPORT.md`: mode, targets, floors, measured, precision, KV pool, ops added or
-  changed, tier commands, and the perf ledger (change, before, after, tier result).
+  changed, tier commands, the perf ledger (change, before, after, tier result), hours and tokens spent, and
+  what was not done.
 
 ## What tends to work
 
@@ -39,6 +40,29 @@ Load the references when you reach them, not up front: [ops and kernels](referen
 
 A workable order: plan (no device) → correct skeleton at B1 → design-shaping features → speed and precision →
 hardening. Overlap them wherever the work is independent.
+
+## What tends to go wrong
+
+- **Speed never gets its turn.** Correctness, serving and fixes absorb the budget and the model ends far from its
+  floor. Keep at least one agent on the top perf item from the skeleton on, and report measured against floor
+  at every milestone.
+- **Checks too coarse to see the bug.** A PCC of 0.99999 can hide a difference that flips a discrete choice
+  (routing, top-k, sampling) many layers later. Batched against alone is checked bit for bit; teacher-forced
+  checks use enough positions to resolve the difference that matters (64 positions cannot resolve 0.2 points).
+- **Late discoveries.** Programs compiled after warmup, host work per step, on-chip memory collisions between
+  modules, and prompt lengths nobody tried (very short, odd, at chunk edges) surface only under real traffic.
+  Test them on purpose: program-cache count after warmup, host time per step, every prefill size in warmup.
+- **The coordinator as bottleneck.** More agents than it can review means unreviewed merges or idle agents.
+  Batch landings behind T1; keep briefs short and exact; let agents report in one line and a notes file.
+- **Breaking the machine.** Parallel agents on one board interfere: killed jobs, overlapping meshes, resets.
+  Follow `tt-device-usage` from the first device run; it is cheaper than a lost host.
+- **Blaming the model for the machine.** Different firmware gives different results; compare machines before
+  debugging numerics.
+- **Silent scope cuts.** When the budget forces a cut (an eval, a feature, a precision study), the report says
+  what was not done and why.
+
+The staged pipeline's strengths are worth keeping here too: fixed, checkable outputs; one independent review
+by a fresh agent; summaries a reviewer can audit; tokens and hours recorded per goal so runs can be compared.
 
 ## Tests
 

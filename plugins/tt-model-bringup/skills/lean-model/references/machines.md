@@ -1,5 +1,9 @@
 # One or two machines
 
+Device rules (`tt-device-usage`) apply from the first run: interrupt-then-kill timeouts that start once the
+chips are held, reset and health check after any unclean exit, a pause on mesh changes, detached jobs, no
+deliberate hangs on boards nobody can power-cycle.
+
 ## One machine
 
 - **Dies as slots.** Single-die work (module ports, op tests, microbenchmarks) runs one agent per die with its
