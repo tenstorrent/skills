@@ -191,7 +191,7 @@ def test_the_retry_when_docs_say_a_spec_update_sleeps_with_the_task():
 
 
 def test_a_spec_change_wakes_a_task_waiting_on_its_checks_at_its_own_tier(env, monkeypatch):
-    # Task #4397: woken by a spec change while waiting on its own `ttp checks --result`, it ran as a light
+    # A task woken by a spec change while waiting on its own `ttp checks --result` once ran as a light
     # "is the wait over?" check, saw the checks pass and handed off done without the addition.
     from ttp import budget as bud, push
     p = make(env)

@@ -515,7 +515,7 @@ def run_end(db, cfg: dict, project: str, task: dict | None, run_id, run_dir, bou
 
 
 def _audit_spec(run_id, task, run_dir) -> str:
-    return (f"Audit GLM device run {run_id} of task #{(task or {}).get('id')} (user msg #3728: Opus post-run audit of "
+    return (f"Audit GLM device run {run_id} of task #{(task or {}).get('id')} (an Opus post-run audit of "
             f"each of the first GLM device runs). Read-only: change nothing, run nothing on any machine, post nothing.\n"
             f"Run folder: {run_dir}. Read {PLAN_FILE} (Opus's plan), {STEPS} (every command the run ran with its exit "
             f"code and output tail), advisor.jsonl (its plan and step checks) and result.json.\n"

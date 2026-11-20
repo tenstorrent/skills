@@ -13,7 +13,7 @@ def _digest_once(p, since):
 
 
 def test_an_own_expiring_machine_change_with_an_open_task_is_renewed_twice_then_pages(env):
-    """Task #8431: an own entry about to expire whose task is still open is renewed by its own span, at most
+    """An own entry about to expire whose task is still open is renewed by its own span, at most
     RENEW_MAX times, recorded and listed once in the next digest; the third expiry is overdue (pages).
     A done task, another project's entry, an --auto-undo entry and the switch off are never renewed,
     and no undo ever runs."""
@@ -58,7 +58,7 @@ def test_an_own_expiring_machine_change_with_an_open_task_is_renewed_twice_then_
 
 
 def test_a_task_at_its_run_cap_is_held_quietly_once_and_wakes_when_it_comes_back(env):
-    """Task #8431: a task's first run cap blocks it with no queued event (no wake), recorded and listed in
+    """A task's first run cap blocks it with no queued event (no wake), recorded and listed in
     the next digest; after a requeue, the same task at its cap again queues the event. Off: it queues."""
     from ttp import dispatchguard, runcap
     from ttp import routinedefault as rd
@@ -87,7 +87,7 @@ def test_a_task_at_its_run_cap_is_held_quietly_once_and_wakes_when_it_comes_back
 
 
 def test_a_new_probe_stall_reruns_its_probe_and_wakes_only_if_it_still_says_not_yet(env):
-    """Task #8431: a new probe stall re-runs its probe first: still running is judged later, a pass ends it
+    """A new probe stall re-runs its probe first: still running is judged later, a pass ends it
     with a record and no event, a not yet raises the event as before, and the same stall back wakes."""
     from ttp import progress
     from ttp import routinedefault as rd

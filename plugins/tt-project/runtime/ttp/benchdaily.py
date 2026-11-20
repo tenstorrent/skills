@@ -854,7 +854,7 @@ def table_md(cum: dict) -> str:
     two = any(a.get("second_n") for a in cum["models"].values())
     head = HEAD.format("model", " second grader: landed (req/corr) |" if two else "", "---|" if two else "")
     lines = [f"# Daily model bench: cumulative ({len(cum['days'])} day(s): {', '.join(cum['days']) or 'none'})", "",
-             "v1: cannot separate the models (user msg #3111).", "",
+             "v1: cannot separate the models.", "",
              "Landed = requirements and correctness each at least 3 of 4 by the blind Opus review; a 60-minute stop is "
              "a fail, and so is a model that worked and left no diff. Not run = no model ran in the cell (never launched, "
              "zero model calls, or the server broke it): its own count, outside N and every rate. $ per task is each arm's own spend (an open model's is GLM spend, not Claude spend).", "",

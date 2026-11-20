@@ -1,7 +1,7 @@
 # What a task that answers a chat posts there (runtime/ttp/replymsg.py, Daemon._finish_worker, pushq._reply).
 # Run from test_tt_project_runtime.py.
 
-# Task #3304's hand-off: the steps it was asked to send were only in its tool output.
+# A task's hand-off: the steps it was asked to send were only in its tool output.
 _SELF_DESCRIBED = ("Extracted the MAC RERUN steps from run 7021 result.json and returned them as the message for "
                    "the user. No code, branch or state changed.")
 

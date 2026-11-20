@@ -881,7 +881,7 @@ def test_a_resumed_runs_delta_shows_only_triaged_chat_and_none_when_chat_is_off(
 
 
 def test_forked_runs_send_the_coordinator_prefix_and_keep_their_own_text_after_it(env, monkeypatch, tmp_path):
-    """Task #49: the cache matches tools, then the system prompt, then the history. Two forks with a
+    """The cache matches tools, then the system prompt, then the history. Two forks with a
     different task, run id and worktree send the coordinator's last launch's system prompt, answer
     schema and Bash timeouts byte for byte; their own system prompt and task follow in the prompt."""
     from ttp import coordsession, ctxfork
@@ -947,7 +947,7 @@ def test_forked_runs_send_the_coordinator_prefix_and_keep_their_own_text_after_i
         assert prompt.startswith(ctxfork.DISK_HEAD)
     else:
         assert "differs" in ctx["prefix"]
-    # Task #7824: a coordinator system prompt holding its no-tools or read-only rule is never a worker's,
+    # A coordinator system prompt holding its no-tools or read-only rule is never a worker's,
     # cache or not: the fork keeps the run's own system prompt and answer format.
     for rule in ctxfork.COORD_TOOL_RULES:
         (coord_dir / "run.json").write_text(json.dumps({"argv": coord}))
@@ -958,7 +958,7 @@ def test_forked_runs_send_the_coordinator_prefix_and_keep_their_own_text_after_i
 
 
 def test_sonnet_workers_and_reviewers_share_one_system_prompt_while_memory_changes(env, monkeypatch, tmp_path):
-    """Task #51: the cache matches tools, then the system prompt. A worker and a reviewer run on the same
+    """The cache matches tools, then the system prompt. A worker and a reviewer run on the same
     model, with a different task, run id and worktree, and a memory entry added between them, send the
     same settings and system prompt byte for byte; memory, which changes most often, leads each run's
     own prompt after it."""
@@ -1026,7 +1026,7 @@ def test_a_run_on_another_claude_model_forks_the_coordinators_last_turns_else_ta
 
 
 def test_a_last_turns_copy_opens_on_a_user_turn_and_its_start_moves_only_in_steps(monkeypatch, tmp_path):
-    """Task #8308: the copy a run on another model starts from holds about tail_tokens of the session's
+    """The copy a run on another model starts from holds about tail_tokens of the session's
     last turns, opens on a user turn (never a tool's result) with no parent, and keeps its start while the
     session grows by less than half the cap, so the forks in between share one cache entry. A provider
     that cannot copy only the last turns says so, and the caller takes the disk block."""
@@ -1064,7 +1064,7 @@ def test_a_last_turns_copy_opens_on_a_user_turn_and_its_start_moves_only_in_step
 
 
 def test_a_fork_of_the_last_turns_sends_the_coordinators_prefix_on_its_own_model():
-    """Task #8308: every Sonnet fork of an Opus coordinator sends the coordinator's tools, answer schema
+    """Every Sonnet fork of an Opus coordinator sends the coordinator's tools, answer schema
     and system prompt on its own model, so all of them share one prefix; a whole-session fork on another
     model is still refused the shape."""
     from ttp import ctxfork
@@ -1227,7 +1227,7 @@ def test_codex_own_instructions_replace_the_sessions_harness_text_everywhere(mon
 
 
 def test_codex_own_instructions_keep_codexs_memory_block(monkeypatch, tmp_path):
-    """Task #210 (review #203 of #198): Codex appends its own "## Memory" block (no "<") to the developer
+    """Codex appends its own "## Memory" block (no "<") to the developer
     message after the harness text. The swap replaces only the harness text, at top level and inside
     compactions; the Memory block, Codex's <...> blocks and their order stay exactly as they were."""
     from ttp.providers import get_provider as get
@@ -1270,7 +1270,7 @@ def test_codex_own_instructions_keep_codexs_memory_block(monkeypatch, tmp_path):
 
 
 def test_codex_worker_runs_start_with_their_own_instructions_and_the_coordinator_keeps_its(env, monkeypatch, tmp_path):
-    """Task #198: a Codex worker forked from a Codex coordinator, a follow-up resuming that worker's
+    """A Codex worker forked from a Codex coordinator, a follow-up resuming that worker's
     session and the worker's own continued session all run under the worker's system prompt with none
     of the coordinator-only text; a Codex coordinator run keeps its own."""
     from ttp import coordsession, ctxfork
@@ -1320,7 +1320,7 @@ def test_codex_worker_runs_start_with_their_own_instructions_and_the_coordinator
 
 
 def test_the_launch_role_check_knows_the_coordinators_own_rules_and_no_worker_prompt_has_one():
-    """Task #7824: the model-free launch-role check matches the coordinator prompts' own tool and answer
+    """The model-free launch-role check matches the coordinator prompts' own tool and answer
     rules, so a template edit cannot silently disarm it; no worker, reviewer or other prompt carries one."""
     from ttp import ctxfork
     prompts = pathlib.Path(ctxfork.__file__).resolve().parents[2] / "template" / "prompts"
@@ -1333,7 +1333,7 @@ def test_the_launch_role_check_knows_the_coordinators_own_rules_and_no_worker_pr
 
 
 def test_a_codex_worker_fork_that_keeps_the_coordinators_rules_starts_from_the_disk_block(env, monkeypatch, tmp_path):
-    """Task #7824: two workers forked from a Codex coordinator session without tools handed off having run
+    """Two workers forked from a Codex coordinator session without tools handed off having run
     nothing, under its "This session has no tools". Where the copied rollout still carries a coordinator-only
     rule after the run's own instructions went in, the launch takes the disk block, checked model-free
     before the agent starts: no resume, the run's own developer instructions, the reason in its note."""
@@ -1360,7 +1360,7 @@ def test_a_codex_worker_fork_that_keeps_the_coordinators_rules_starts_from_the_d
 
 
 def test_every_providers_worker_launch_from_the_coordinators_session_carries_the_worker_role(env, monkeypatch, tmp_path):
-    """Task #7824, on each provider path the harness ships: a worker started while the coordinator has a
+    """On each provider path the harness ships: a worker started while the coordinator has a
     session gets either a copy it can run its own role in or the disk block, and the launch-role check
     refuses a copy whose instructions carry a coordinator-only rule on every provider."""
     from ttp import coordsession, ctxfork
@@ -1385,7 +1385,7 @@ def test_every_providers_worker_launch_from_the_coordinators_session_carries_the
 
 
 def test_a_run_that_did_no_work_under_the_coordinators_role_is_not_retried_the_same_way(env, monkeypatch, tmp_path):
-    """Task #7824: a worker that handed off having run nothing because it got the coordinator's role
+    """A worker that handed off having run nothing because it got the coordinator's role
     (no tools, its {"actions"} answer) is marked; a copied session's task restarts from the disk block, and
     a run with no copy, which would start the same way again, is not retried or topped up."""
     from ttp import coordsession, ctxfork

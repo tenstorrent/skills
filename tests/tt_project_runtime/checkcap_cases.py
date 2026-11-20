@@ -11317,7 +11317,7 @@ def test_preemption_asks_a_run_never_preempted_before_over_one_already_preempted
 
 
 def test_project_max_from_names_the_setting_that_binds_the_test_worker_budget(env, monkeypatch):
-    """Task #7176: testslots.project_max_from names what project_max() took its value from, in its order: the
+    """testslots.project_max_from names what project_max() took its value from, in its order: the
     environment variable over the account's, a project's own only lowering either, then the pool and the
     host's per-project worker ceiling bounding all; the value always matches project_max()."""
     from ttp import project, testslots

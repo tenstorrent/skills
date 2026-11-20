@@ -17026,7 +17026,7 @@ def test_a_push_batch_split_runs_only_the_new_failing_tests_at_the_prefix_heads(
 
 
 def test_a_rescue_runs_only_the_blamed_entrys_new_failing_tests_and_the_checks_left_not_a_second_full_run(env, monkeypatch):
-    """Task #7758: entry 1 of 4 breaks one test of the first check and is blamed. The later entries,
+    """Entry 1 of 4 breaks one test of the first check and is blamed. The later entries,
     replayed without it, are checked on that test alone and on the check that never ran on the full head;
     they land as those pass, with no second full run of the first check."""
     p, repo, origin, other = _push_setup(env, monkeypatch, [_FLAKY_CHECK, _SECOND_CHECK])
@@ -21086,7 +21086,7 @@ def test_ttp_stats_landing_shows_runs_cpu_hours_and_dollars_per_landed_change(en
 
 
 def test_a_push_train_records_its_check_cpu_seconds_and_ttp_stats_landing_shows_them(env, monkeypatch):
-    """Task #7758: a train tallies the CPU seconds of the check runs it waited for (Batch._spent), the
+    """A train tallies the CPU seconds of the check runs it waited for (Batch._spent), the
     queue writes them to push_batches.check_cpu_s, and `ttp stats --landing` counts them in CPU-h per
     landed change and shows them beside the trains' wall hours."""
     from ttp import batch, pushq, timefmt, trainstats

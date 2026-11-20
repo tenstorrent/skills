@@ -282,7 +282,7 @@ def _push_row(p, task, head, landed_sha, branch="ttp/t-lead"):
 
 
 def test_batch_member_left_out_of_the_approved_head_is_not_landed_and_gets_its_review(env, monkeypatch):
-    # Task #8504: a review approved only the lead's commit of a two-member batch and the push queue landed
+    # A review approved only the lead's commit of a two-member batch and the push queue landed
     # it. The member shares the branch, but its own commit is not on the push branch: it is not landed
     # (`ttp landed --task` and deadwait read landed.recorded), its record says so, and its review is queued.
     from ttp import landed

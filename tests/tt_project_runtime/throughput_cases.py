@@ -1577,11 +1577,11 @@ def test_throughput_a_checks_wait_counts_against_the_limit_its_event_names_cap_h
                                                 (8, "account_over", True), (8, "workers", True)])
 def test_throughput_checks_waits_under_a_small_test_worker_budget_name_that_budget(env, monkeypatch, tmp_path,
                                                                                    budget, where, holds):
-    """Task #5710: a set test-worker budget (checks.test_project_slots 8) with full runs of at least 4 workers
+    """A set test-worker budget (checks.test_project_slots 8) with full runs of at least 4 workers
     (checks.test_run_min, half of a run's 8) admits 2 runs at once, fewer than checks.slots 3 and the cap 4,
     so it held the lane: the lane names it and says raising checks.slots changes nothing. One that fits as
     many runs as both limits (24), or none set (the default follows the host's spare cores), keeps checks.slots.
-    Task #7176: the lane names where the binding budget comes from (budget_from): the account's 8 holds a
+    The lane names where the binding budget comes from (budget_from): the account's 8 holds a
     project whose own 32 only lowers it, so it names the account setting, never raising the project's; the
     host's per-project worker ceiling (testslots.project_workers, 8 here) under a project budget of 32 is named
     as that ceiling, not as checks.test_project_slots."""

@@ -720,7 +720,7 @@ def test_daily_a_cheat_flagged_cell_is_never_landed_and_is_listed_apart(tmp_path
     assert (g["n"], g["landed"], g["flagged"]) == (2, 1, 1)
     md = (root / "table.md").read_text()
     assert "## Flagged by the cheat audit" in md and "A-1 glm: runs 'git fetch'" in md
-    assert "v1: cannot separate the models (user msg #3111)." in md
+    assert "v1: cannot separate the models." in md
 
 
 def test_daily_a_flagged_cell_is_not_counted_landed_by_the_second_grader_either(tmp_path):

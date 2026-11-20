@@ -1609,7 +1609,7 @@ def test_a_routed_run_refused_its_model_by_claude_code_holds_the_tier_with_one_n
 
 
 def test_missing_rule_models_hold_apart_and_name_their_rule(env, monkeypatch):
-    """Task #6561: a held model a providers.chat.routes rule set names that rule in the status line and
+    """A held model a providers.chat.routes rule set names that rule in the status line and
     the alert (a tier's own model keeps its wording), and two missing rule models on one tier hold
     together, one alert each, instead of each new hold replacing the other."""
     from ttp import route
@@ -4091,7 +4091,7 @@ def _bench_lease():
 
 
 def test_one_project_per_machine_owns_the_model_bench_and_a_paused_or_opted_out_one_never_does(env):
-    """Task #7699: the first eligible project by name owns the bench; a paused owner is replaced at once
+    """The first eligible project by name owns the bench; a paused owner is replaced at once
     and an opted-out project is never chosen."""
     from ttp import modelbench, configwho
     ps = _bench_owners(env)
@@ -4111,7 +4111,7 @@ def test_one_project_per_machine_owns_the_model_bench_and_a_paused_or_opted_out_
 
 
 def test_a_stale_model_bench_pokes_its_owner_once_then_the_next_project_takes_it_over(env):
-    """Task #7699: 49 h without a result pokes the owner exactly once per episode; 73 h hands the lease to
+    """49 h without a result pokes the owner exactly once per episode; 73 h hands the lease to
     the next project by name, with exactly one winner among concurrent daemons."""
     from concurrent.futures import ThreadPoolExecutor
     from ttp import modelbench
@@ -4135,7 +4135,7 @@ def test_a_stale_model_bench_pokes_its_owner_once_then_the_next_project_takes_it
 
 
 def test_the_bench_owners_daemon_keeps_a_daily_command_schedule_and_runs_it_on_a_poke(env, monkeypatch):
-    """Task #7699: the owner's daemon keeps a model-free command schedule at bench_at and turns a poke into
+    """The owner's daemon keeps a model-free command schedule at bench_at and turns a poke into
     one run now and one feed line; a project that loses the lease turns its schedule off."""
     from ttp import modelbench, schednow
     from ttp.daemon import Daemon
