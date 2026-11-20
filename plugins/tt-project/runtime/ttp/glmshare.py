@@ -233,7 +233,7 @@ def quality(db, cfg: dict, tids, tasks: dict, runs: dict, reviews: dict, fixes: 
             q["reviewed"] += 1
             q["first_pass"] += rv["first"] == "done"
             q["fix_rounds"] += fixes.get(tid, 0)
-        q["decided"] += bool(rv.get("first")) or (t["status"] in ("done", "failed") and not rv.get("open"))
+        q["decided"] += _outcome_at(t, rv, rs) is not None
         q["bounces"] += any(((_note(r["note"]).get(route.KEY) or {}).get("fallback")) == route.BOUNCE for r in rs) \
             or effort.wants_deep(t.get("result"))
         glm_runs += [r for r in rs if on_glm(r["provider"], r["model"], r["note"])]
@@ -532,10 +532,10 @@ def base_window(cand, tasks: dict, runs: dict, reviews: dict, w0: float, floor: 
     before `floor`)."""
     at = {t: x for t in cand if (x := _outcome_at(tasks.get(t), reviews.get(t) or {}, runs.get(t) or [])) is not None}
     rev = sorted((at[t] for t in at if (reviews.get(t) or {}).get("first")), reverse=True)
-    if need <= 0 or sum(x >= w0 for x in rev) >= need:
+    if sum(x >= w0 for x in rev) >= need:
         lo = w0
     else:
-        lo = min(w0, max(floor, rev[need - 1]) if len(rev) >= need else floor)
+        lo = max(floor, rev[need - 1]) if len(rev) >= need else floor
     return [t for t in cand if t in at and at[t] >= lo], lo
 
 
@@ -565,12 +565,16 @@ def signals(g: dict, b: dict, before: dict, after: dict, corrections: int, st: d
     return out
 
 
+def _fmt(v) -> str:
+    """A rate for a why line: '-' when unmeasured."""
+    return "-" if v is None else f"{v:g}"
+
+
 def _says(s: dict) -> str:
-    fmt = lambda v: "-" if v is None else f"{v:g}"   # noqa: E731
     if s["signal"] == "user corrections":
-        return f"user corrections {s['glm']} in {CORR_DAYS} days (holds above {fmt(s['advance'])})"
-    tail = "" if s["verdict"] == "unmeasured" else f", worse by {fmt(s['worse_by'])}"
-    return f"{s['signal']} GLM {fmt(s['glm'])} vs Claude {fmt(s['base'])}{tail} ({s['verdict']})"
+        return f"user corrections {s['glm']} in {CORR_DAYS} days (holds above {_fmt(s['advance'])})"
+    tail = "" if s["verdict"] == "unmeasured" else f", worse by {_fmt(s['worse_by'])}"
+    return f"{s['signal']} GLM {_fmt(s['glm'])} vs Claude {_fmt(s['base'])}{tail} ({s['verdict']})"
 
 
 def judge(p, cfg: dict, now: float) -> dict:
@@ -609,11 +613,10 @@ def judge(p, cfg: dict, now: float) -> dict:
                if isinstance(c, dict) and now - CORR_DAYS * 86400 <= float(c.get("ts") or 0) < now)
     sig = signals(g, b, before, after, corr, st)
     n = g["decided"]
-    fmt = lambda v: "-" if v is None else f"{v:g}"   # noqa: E731
     frm = datetime.datetime.fromtimestamp(lo, datetime.timezone.utc)
-    nums = (f"GLM {n} tasks with an outcome, first review pass {fmt(g['first_pass_pct'])}%; Claude baseline "
+    nums = (f"GLM {n} tasks with an outcome, first review pass {_fmt(g['first_pass_pct'])}%; Claude baseline "
             f"{b['decided']} with an outcome since {frm:%Y-%m-%d %H:%M} UTC, first review pass "
-            f"{fmt(b['first_pass_pct'])}%; "
+            f"{_fmt(b['first_pass_pct'])}%; "
             + "; ".join(_says(s) for s in sig))
     out = lambda state, why: {"state": state, "why": f"{why}; {nums}", "n": n, "signals": sig,   # noqa: E731
                               "glm_pct": g["first_pass_pct"], "base_pct": b["first_pass_pct"],
