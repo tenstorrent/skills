@@ -50,7 +50,6 @@ from . import gitmemo
 RUNTIME = Path(__file__).resolve().parent.parent              # .../runtime (plugin or project copy)
 PLUGIN_ROOT = RUNTIME.parent                                   # plugin root, or a project's harness/
 MARKER = "tt-project://{name}@{host}:{dir}"
-EX_BUSY = 75          # busy, held or deferred: nothing changed, try again later (EX_TEMPFAIL)
 SSH_FAILED = 255      # ssh's own exit code: it could not reach or run on the host
 SIGNAL_RC_BASE = 128  # a shell reports a death by signal N as 128 + N
 HOUR_S = 3600
@@ -1371,7 +1370,7 @@ def _say_local_or_die(p: Project, a, text: str, context: str, bid: str | None = 
         if not is_busy(e):
             raise
         die(f"the database stayed busy ({e}); the message was not saved. Send it again"
-            + (f" with the same --client-id {a.client_id}" if a.client_id else ""), EX_BUSY)
+            + (f" with the same --client-id {a.client_id}" if a.client_id else ""), UPGRADE_BUSY)
     except OSError as e:   # creating the state dir or opening the database
         if e.errno != errno.ENOSPC:
             raise
@@ -4407,7 +4406,7 @@ def _cmd_checks(a) -> None:
     if cyc := hostcycle.hold(p):   # a planned cycle of this host would cut them short
         print(f"ttp checks: not started, {hostcycle.hold_line(cyc, p)}. Commit and hand off `waiting` with a "
               "`retry_when` that exits 0 once this host is back, and run them after the cycle", file=sys.stderr)
-        sys.exit(EX_BUSY)
+        sys.exit(UPGRADE_BUSY)
     purpose = getattr(a, "purpose", None) or "candidate"
     if a.full and purpose == "candidate" and not getattr(a, "release", False):
         from . import testpick   # a release run (the release cut's required suite) always runs in full
@@ -4493,7 +4492,7 @@ def _cmd_checks(a) -> None:
         envfault.write_marker(run_dir, fault)
         print(f"ttp checks: {envfault.line(fault)}. Hand off `waiting`; retry_when: "
               f"{envfault.retry_when(p, fault)}", file=sys.stderr)
-        sys.exit(EX_BUSY)
+        sys.exit(UPGRADE_BUSY)
     print(f"ttp checks: {runnerenv.describe(pyenv)}", flush=True)
     venv_vars = {}
     if p and not os.environ.get("VIRTUAL_ENV") and (pv := worktree.project_venv(p, top)):
@@ -4786,7 +4785,7 @@ def _cmd_checks(a) -> None:
                                                              "commands": todo, "skipped": skipped, "ts": time.time(),
                                                              "purpose": purpose, "env_fault": fault["sig"]})
             print(f"ttp checks: {said}", file=sys.stderr)
-            sys.exit(EX_BUSY)
+            sys.exit(UPGRADE_BUSY)
         if p:
             envfault.recheck(p)   # a runner back: its open fault closes
         arrived = _checks_arrived()
@@ -5034,7 +5033,7 @@ def _cmd_checks(a) -> None:
                         rc = run_once()
                         # The wrapper's lock refused it as paused: it and the other wrapped commands run on
                         # checks.fallback_lane once, never on the paused resource (a paused fallback waits).
-                        if (rc == EX_BUSY and fallback[0] and not fallback[2] and not fell_back and str(c) in wrapped
+                        if (rc == UPGRADE_BUSY and fallback[0] and not fallback[2] and not fell_back and str(c) in wrapped
                                 and (on := _pause_hold(_log_since(out, log, check_start)))):
                             fell_back = {"lane": fallback[0], "paused": on,
                                          "commands": push.to_fallback(todo[len(executed) - 1:], wrapped, fallback[1],
@@ -5051,7 +5050,7 @@ def _cmd_checks(a) -> None:
                             continue
                         # Failed before any test ran (its work dir gone, a bad archive, no free pool slot):
                         # again up to setupfault.RERUNS times, a starved pool not at all (setupfault).
-                        if (rc not in (0, EX_BUSY) and not push.remote_host(c)
+                        if (rc not in (0, UPGRADE_BUSY) and not push.remote_host(c)
                                 and (fault := setupfault.found(setupfault.scan(_log_since(out, log, check_start)), cwd))):
                             if fault["kind"] == "pool" or setup_reruns >= setupfault.RERUNS:
                                 setup = {"check": str(c), **fault}
@@ -5298,7 +5297,7 @@ def _cmd_checks(a) -> None:
                 # Its tree copy timed out: that host is kept off now, never a second full timeout there.
                 from . import remotecheck
                 slow = rc == remotecheck.FAULT_RC and not env_why and remotecheck.COPY_TIMEOUT in ran_out
-            if rc == EX_BUSY and not timed_out:   # its spill wrapper refused it or is missing: status names it (a limit line)
+            if rc == UPGRADE_BUSY and not timed_out:   # its spill wrapper refused it or is missing: status names it (a limit line)
                 from . import checklane, checkspill, remotecheck
                 if (wrapped := remotecheck.wrap_fault(ran_out))[1]:   # every host refusing alike: one event (wrap_refused)
                     checkspill.wrap_refused(p, wrapped[0] or spilled.host, wrapped[1], checklane.scope_text(todo)[:300],
@@ -5306,7 +5305,7 @@ def _cmd_checks(a) -> None:
             env_cfg = p.config() if env_why and not real else None
             key = _commands_hash(todo)
             spent = bool(env_cfg) and checkspill.env_rerun_spent(checkspill.fails(p.state, head, key), env_cfg)
-            if not timed_out and rc != EX_BUSY:   # a host fault or timeout is the host's: never this head's record
+            if not timed_out and rc != UPGRADE_BUSY:   # a host fault or timeout is the host's: never this head's record
                 from . import sharedchecks
                 ids = sharedchecks.failing_ids(ran_out)[0]
                 checkspill.fail_add(p.state, head, key, spilled.host,
@@ -5328,19 +5327,19 @@ def _cmd_checks(a) -> None:
                 out.flush()
                 print(f"ttp checks: {said}", flush=True)
             else:
-                no_spill = checkspill.spill_off_add(no_spill, spilled.host, rc == EX_BUSY and not timed_out,
+                no_spill = checkspill.spill_off_add(no_spill, spilled.host, rc == UPGRADE_BUSY and not timed_out,
                                                     env_cfg, cfg=p.config(), slow=slow, hang=hang)
                 if slow:
                     how += f": {remotecheck.COPY_TIMEOUT}, so that host is kept off this run"
                 if env_why:
                     checkspill.env_event(p.db, no_spill, env_cfg)
-                elif executed and not timed_out and rc != EX_BUSY:   # a strike there if the head then passes elsewhere
+                elif executed and not timed_out and rc != UPGRADE_BUSY:   # a strike there if the head then passes elsewhere
                     out.flush()
                     checkspill.strike_fail(p, spilled.host, head, remotecheck.fail_sig(_checks_log_tail(log), rc))
                 # Tests that failed there (no host fault, timeout or env fault) run once more, only here, and that
                 # result counts: never on from spill host to spill host. A workstation, which runs nothing here
                 # while a host is busy, takes the verdict of FAIL_VERDICT_HOSTS hosts instead (_spill_fail_verdict).
-                here_only = (bool(executed) and not timed_out and rc != EX_BUSY and not env_why and not slow
+                here_only = (bool(executed) and not timed_out and rc != UPGRADE_BUSY and not env_why and not slow
                              and not checkspill.remote_only(p.config()))
                 if here_only:
                     no_spill = "1"
@@ -5351,7 +5350,7 @@ def _cmd_checks(a) -> None:
                         + "); running them again on this machine, whose result counts, or on a free spill host "
                         + (("they did not fail on" + (f" (that one again once the checks config changes or in "
                             f"{checkspill.FAULT_RETRY_S // 60} min: the host's own fault ended them there)"
-                            if rc == EX_BUSY and not timed_out and not slow else ""))
+                            if rc == UPGRADE_BUSY and not timed_out and not slow else ""))
                            if spilled.host in checkspill.kept_off(no_spill, p.config())
                            else "(that one again once free: the fault was the host's)" if not env_why
                            else "(once: an import failure runs again once per head)"))
@@ -5375,7 +5374,7 @@ def _cmd_checks(a) -> None:
                                                              "commands": todo, "skipped": skipped, "ts": time.time(),
                                                              "purpose": purpose, "killed": tree_gone})
             print(f"ttp checks: {tree_gone}", file=sys.stderr)
-            raise ChecksKilled(EX_BUSY)
+            raise ChecksKilled(UPGRADE_BUSY)
         # Test workers lost again on the rerun: the host, never a failure of the change (workerloss).
         if worker_loss is None:
             workerloss.clear(run_dir)
@@ -5388,7 +5387,7 @@ def _cmd_checks(a) -> None:
                                                              "commands": todo, "skipped": skipped, "ts": time.time(),
                                                              "purpose": purpose, "infra_fault": "test-worker-lost"})
             print(f"ttp checks: {said}", file=sys.stderr)
-            sys.exit(EX_BUSY)
+            sys.exit(UPGRADE_BUSY)
         # A script outside the change rewritten in place as the check ran it, again on the rerun: no verdict.
         if torn is not None and not passed and not _CHECK_STOP.get("stopped"):
             said = f"{syntaxfault.line(torn['scripts'], torn['check'])}. Run the checks again later; the change is neither passed nor failed"
@@ -5397,7 +5396,7 @@ def _cmd_checks(a) -> None:
                                                              "commands": todo, "skipped": skipped, "ts": time.time(),
                                                              "purpose": purpose, "infra_fault": syntaxfault.INFRA})
             print(f"ttp checks: {said}", file=sys.stderr)
-            sys.exit(EX_BUSY)
+            sys.exit(UPGRADE_BUSY)
         # Failed before any test ran, again on its reruns (or no free pool slot): no verdict (setupfault).
         if setup is not None and not passed and not _CHECK_STOP.get("stopped"):
             said = f"{setupfault.line(setup, setup['check'])}. Run the checks again later"
@@ -5406,7 +5405,7 @@ def _cmd_checks(a) -> None:
                                                              "commands": todo, "skipped": skipped, "ts": time.time(),
                                                              "purpose": purpose, "infra_fault": setupfault.INFRA})
             print(f"ttp checks: {said}", file=sys.stderr)
-            sys.exit(EX_BUSY)
+            sys.exit(UPGRADE_BUSY)
         # Behind checks.wrap_cmd, stopped at the wall-time cap before any test started: no verdict (checkwall).
         if timed_out and timed_out.get("queued") and not passed and not _CHECK_STOP.get("stopped"):
             said = checkwall.said_for(timed_out)
@@ -5415,7 +5414,7 @@ def _cmd_checks(a) -> None:
                                                              "purpose": purpose, "timed_out": timed_out,
                                                              "infra_fault": checkwall.QUEUED_INFRA})
             print(f"ttp checks: {said} (full output: {log})", file=sys.stderr)
-            sys.exit(EX_BUSY)
+            sys.exit(UPGRADE_BUSY)
         # The gate's rerun found no slot (an admission timeout): no verdict, never a failure of the head.
         if gate_busy is not None and not passed and not _CHECK_STOP.get("stopped"):
             said = (f"{failed!r}: the tests gate could not judge {', '.join(gate_busy['busy'])}: their rerun found no "
@@ -5426,7 +5425,7 @@ def _cmd_checks(a) -> None:
                                                              "commands": todo, "skipped": skipped, "ts": time.time(),
                                                              "purpose": purpose, "infra_fault": "gate-rerun-busy"})
             print(f"ttp checks: {said}", file=sys.stderr)
-            sys.exit(EX_BUSY)
+            sys.exit(UPGRADE_BUSY)
         # A check host ssh could not reach (or that could not take the tree) is the environment, as a
         # missing runner is: wait for it, counting nothing against the change (envfault).
         if not passed and (fault := push.remote_fault(failed, rc, top, _log_since(out, log, check_start))):
@@ -5439,11 +5438,11 @@ def _cmd_checks(a) -> None:
                                                              "purpose": purpose, "env_fault": fault["sig"],
                                                              "hosts": push.hosts_of(todo)})
             print(f"ttp checks: {said}", file=sys.stderr)
-            sys.exit(EX_BUSY)
+            sys.exit(UPGRADE_BUSY)
         # The wrapper's lock refused it as paused (`ttp lock`: "held by pause on <resource>"): the pause, never
         # a failure of the change nor a busy lock; it says so and what to wait on.
         # With checks.fallback_lane paused too (or unable to serve), the wait names both; it never fails.
-        if not passed and rc == EX_BUSY and str(failed) in wrapped and (held := _pause_hold(_log_since(out, log, check_start))):
+        if not passed and rc == UPGRADE_BUSY and str(failed) in wrapped and (held := _pause_hold(_log_since(out, log, check_start))):
             first = fell_back.get("paused") or held
             also_on = (f"; {push.FALLBACK_KEY} {fallback[0]!r} is paused too (held by pause on {held})" if fell_back
                        else f"; {push.FALLBACK_KEY} {fallback[0]!r} cannot serve: {fallback[2]}" if fallback[0] else "")
@@ -5459,7 +5458,7 @@ def _cmd_checks(a) -> None:
                                                                     "lane": fallback[0], "problem": fallback[2]}}
                                                                 if fallback[0] else {})})
             print(f"ttp checks: {said}", file=sys.stderr)
-            sys.exit(EX_BUSY)
+            sys.exit(UPGRADE_BUSY)
     if handover and temp:
         die(f"{checktree.temp_refusal(top, temp, run_dir)} (with --detach: every checks slot stayed busy)")
     if handover:
@@ -5470,7 +5469,7 @@ def _cmd_checks(a) -> None:
         # Told only once they were started: a failed start says so, never that they run.
         append_text(log, f"ttp checks: {CHECKS_HANDOVER}\n", p)
         print(f"ttp checks: {CHECKS_HANDOVER}", flush=True)
-        sys.exit(EX_BUSY)
+        sys.exit(UPGRADE_BUSY)
     env_problem, also, not_executed = None, False, []
     # The checks that ran (or whose recorded pass came) from this worktree, not a clean checkout.
     in_authoring = [str(c) for c in todo if cleantree.authoring(c) and not push.remote_host(c)]
@@ -6423,7 +6422,7 @@ def _spill_fail_verdict(spilled, passed, executed, timed_out, rc, failed, todo, 
     timed out, the host's own fault (exit 75), its env (push.env_problem), stopped, a check split off to run here,
     or not a workstation."""
     from . import checkspill, push
-    if not spilled or passed or not executed or timed_out or rc == EX_BUSY or _CHECK_STOP.get("stopped") \
+    if not spilled or passed or not executed or timed_out or rc == UPGRADE_BUSY or _CHECK_STOP.get("stopped") \
             or (failed in todo and not getattr(failed, "spill_host", "")) or not checkspill.remote_only(p.config()):
         return []
     hosts = checkspill.fail_hosts(checkspill.spill_off_add(no_spill, spilled.host, False))
@@ -7540,7 +7539,7 @@ def _checks_detach(a, run_dir: Path, p: Project | None, top: str = "", head: str
         # purpose's checks would lose them without a word. Wait for them instead.
         print(f"retry_when: {push._own_ttp(p)} checks --result {shlex.quote(str(run_dir))}")
         die(f"ttp checks: not started: this run's detached checks for {owner} still own {run_dir} "
-            "(exit 75): hand off waiting with the retry_when above, then run these checks again", EX_BUSY)
+            "(exit 75): hand off waiting with the retry_when above, then run these checks again", UPGRADE_BUSY)
     env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1]))
     if arrived is not None:
         env[checkcap.ARRIVED_ENV] = repr(arrived)
@@ -8333,7 +8332,7 @@ def cmd_hours(a) -> None:
     try:
         times = hours.user_times(p.state / "project.db", now - a.days * DAY_S)
     except sqlite3.Error as e:
-        die(f"ttp hours: cannot read the project's messages ({e})", EX_BUSY)
+        die(f"ttp hours: cannot read the project's messages ({e})", UPGRADE_BUSY)
     r = hours.assess(times, timefmt.home(p), now=now, need_s=a.need)
     lines = [hours.describe(r, now)]
     ok = r["ok"]
@@ -8341,7 +8340,7 @@ def cmd_hours(a) -> None:
         try:
             last = hours.last_user_time(p.state / "project.db")
         except sqlite3.Error as e:
-            die(f"ttp hours: cannot read the project's messages ({e})", EX_BUSY)
+            die(f"ttp hours: cannot read the project's messages ({e})", UPGRADE_BUSY)
         pr = hours.presence(last, r["zone"], a.present, now)
         ok = ok and pr["ok"]
         # Absent: the line that matters is when they last wrote (the window's "start now" would mislead).
@@ -8449,7 +8448,7 @@ def cmd_said(a) -> None:
             found += [{**m, "project": name} for m in _said_in(t, " ".join(a.words), a.limit, since, a.notes)]
         except sqlite3.Error as e:
             if len(targets) == 1:
-                die(f"ttp said: cannot read {name}'s messages ({e})", EX_BUSY)
+                die(f"ttp said: cannot read {name}'s messages ({e})", UPGRADE_BUSY)
             print(f"ttp said: skipped {name}: cannot read its messages ({e})", file=sys.stderr)
     found = sorted(found, key=lambda m: -m["ts"])[:a.limit]
     labelled = bool(a.project or a.all_projects)
@@ -8695,12 +8694,12 @@ def _machine_lock_answer(resource: str, shared_mode: bool, as_json: bool = False
     held = shared.read_pause(resource) or (fleethold.entry(hold) if hold else None)
     if held is not None:
         said = f"{resource}: paused" + (f" ({held['reason']})" if held.get("reason") else "")
-        return EX_BUSY, lockprobe.report(resource, said, False, paused=held) if as_json else said
+        return UPGRADE_BUSY, lockprobe.report(resource, said, False, paused=held) if as_json else said
     where = shared.root() / resource
     paths = lk.slot_paths(where, resource, shared.machine_slots(resource))
     free = lk.probe(where, resource, paths, shared=shared_mode and not resource.endswith("-device"))
     said = lockprobe.line(resource, free, where, resource, paths)
-    return (0 if free else EX_BUSY), lockprobe.report(resource, said, free, where, resource, paths) if as_json else said
+    return (0 if free else UPGRADE_BUSY), lockprobe.report(resource, said, free, where, resource, paths) if as_json else said
 
 
 def _probe_machine_lock(resource: str, shared_mode: bool, as_json: bool = False) -> None:
@@ -8724,7 +8723,7 @@ def _lock_answers(a, answers: list[tuple[str, int, str | dict]]) -> None:
         for _, _, said in answers:
             print(said)
     rcs = {rc for _, rc, _ in answers}
-    sys.exit(EX_BUSY if EX_BUSY in rcs else LOCK_NA if LOCK_NA in rcs else 0)
+    sys.exit(UPGRADE_BUSY if UPGRADE_BUSY in rcs else LOCK_NA if LOCK_NA in rcs else 0)
 
 
 def _urgent_priority(p, task: str) -> int | None:
@@ -8763,7 +8762,7 @@ def _lock_alternative(p, cfg: dict, names: list[str], a) -> str:
     if not live:
         said = "; ".join(f"{x}" + (f" ({h['reason']})" if h.get("reason") else "") for x, h in paused.items())
         die(f"held by pause on {', '.join(paused)}: every alternative is paused ({said}); hand the task back as "
-            f"waiting until one is resumed (retry_when: ttp lock --probe {shlex.quote(names[0])})", EX_BUSY)
+            f"waiting until one is resumed (retry_when: ttp lock --probe {shlex.quote(names[0])})", UPGRADE_BUSY)
     pick = next((x for x in live if lockprobe.answer(p, cfg, x, bool(getattr(a, "shared", False)))[0] == 0), live[0])
     if paused:
         print(f"ttp lock: {', '.join(paused)} paused; taking {pick}", file=sys.stderr, flush=True)
@@ -8847,7 +8846,7 @@ def cmd_occupancy(a) -> None:
     if also:
         res = {**res, "blocks": True, "why": also}
     print(json.dumps(res, indent=1, sort_keys=True) if a.json else (also or occupancy.text(res)))
-    sys.exit(EX_BUSY if res["blocks"] else 0)
+    sys.exit(UPGRADE_BUSY if res["blocks"] else 0)
 
 
 def _lock_step(a) -> str:
@@ -8958,11 +8957,11 @@ def cmd_lock(a) -> None:
                     _end_wait()
                 why = f" ({held['reason']})" if held.get("reason") else ""
                 die(f"held by pause on {L['name']}: {L['name']} is paused{why}; hand the task back as waiting "
-                    "until it is resumed", EX_BUSY)
+                    "until it is resumed", UPGRADE_BUSY)
         if held_by := _ordered():
             if waiting:
                 _end_wait()
-            die(f"refused: {held_by[1]}", EX_BUSY)
+            die(f"refused: {held_by[1]}", UPGRADE_BUSY)
 
     detached = bool(os.environ.get("TTP_DETACHED"))
     run_dir = Path(os.environ["TTP_RUN_DIR"]) if os.environ.get("TTP_RUN_DIR") else None
@@ -8997,7 +8996,7 @@ def cmd_lock(a) -> None:
             if waiting:
                 _end_wait()
             die(f"{got['why']}; waited {got['waited_s']:.0f} s. Hand the task back now: result.json status "
-                f"`waiting`, retry_when `ttp lock --probe {' '.join(L['name'] for L in todo)}`", EX_BUSY)
+                f"`waiting`, retry_when `ttp lock --probe {' '.join(L['name'] for L in todo)}`", UPGRADE_BUSY)
 
     from . import shared
     cfg = p.config()
@@ -9030,13 +9029,13 @@ def cmd_lock(a) -> None:
         if a.probe:
             print(json.dumps({"name": held_by[0][0], "free": False, "line": held_by[1], "user_order": held_by[0][2]})
                   if a.json else held_by[1])
-            sys.exit(EX_BUSY)
-        die(f"refused: {held_by[1]}", EX_BUSY)
+            sys.exit(UPGRADE_BUSY)
+        die(f"refused: {held_by[1]}", UPGRADE_BUSY)
     if live := _occupied():
         if a.probe:
             print(json.dumps({"name": todo[0]["name"], "free": False, "line": live, "occupancy": True})
                   if a.json else live)
-            sys.exit(EX_BUSY)
+            sys.exit(UPGRADE_BUSY)
         _wait_occupied()
 
     def _unwritable(e: OSError, L: dict) -> None:
@@ -9079,7 +9078,7 @@ def cmd_lock(a) -> None:
             got = pregrant.check(check, p.root, name, ptask, p.state, pregrant.timeout_s(cfg))
             if got.granted:
                 return rc, said
-            return EX_BUSY, ({**said, "free": False, "line": got.line, "pre_grant": got.line} if a.json else got.line)
+            return UPGRADE_BUSY, ({**said, "free": False, "line": got.line, "pre_grant": got.line} if a.json else got.line)
         if len(names) == 1:
             rc, said = _answer(names[0])
             print(json.dumps(said) if a.json else said)
@@ -9168,7 +9167,7 @@ def cmd_lock(a) -> None:
                         f"`ttp lock --probe {what}{f' --task {own}' if own.strip() else ''}`")
         return None
     if check and (why := _pre_grant_refusal()):
-        die(why, EX_BUSY)   # asked before queueing, so nothing waits on a held lock
+        die(why, UPGRADE_BUSY)   # asked before queueing, so nothing waits on a held lock
     # A waiter that holds locks already never waits behind one for several resources at once: that one
     # may wait for a lock this waiter's holder has, and neither would ever go on.
     past_multi = bool(held_locks or shared_locks or whole)
@@ -9298,7 +9297,7 @@ def cmd_lock(a) -> None:
             for t in tickets:
                 lk.dequeue(t)
             tickets.clear()
-            die(why, EX_BUSY)
+            die(why, UPGRADE_BUSY)
         if fs:
             _end_wait()
             for t in tickets:
@@ -9361,7 +9360,7 @@ def cmd_lock(a) -> None:
             sys.exit(_logged("shared" if a.shared else "lock", todo, _wait))
         if any(lk.dropped(t) for t in tickets):   # its run ended: a reader took its place out of the queue
             _end_wait()
-            die(f"the run this waited for has ended, so its place in the queue for {what} was dropped", EX_BUSY)
+            die(f"the run this waited for has ended, so its place in the queue for {what} was dropped", UPGRADE_BUSY)
         if check_wait is None:
             check_wait = checkwait.begin(f"ttp lock {what}") or ()
         if wait_dir and not waiting:
@@ -9403,7 +9402,7 @@ def cmd_lock(a) -> None:
             _end_wait()
             die(f"{what} stayed busy for {timeout:.0f} s. Hand the task back now: result.json status "
                 f"`waiting`, waiting_for `{what}`, retry_when "
-                f"`ttp lock --probe{' --shared' if a.shared else ''} {what}`", EX_BUSY)
+                f"`ttp lock --probe{' --shared' if a.shared else ''} {what}`", UPGRADE_BUSY)
         # Each try also reaps what keeps a lock whose holder is dead (lockreap: the daemon does it too).
         try:
             got = reaper.sweep([x for L, _by in blocked for x in L.get("paths") or []])
@@ -10831,7 +10830,7 @@ def _lock_job(names: list, cmd: list) -> list:
         if (held := lockprobe.pause(p, cfg, n)) is not None:
             why = f" ({held['reason']})" if held.get("reason") else ""
             die(f"{n} is paused{why}, so the job did not start; hand the task back as waiting, retry_when "
-                f"`ttp lock --probe {','.join(names)}`", EX_BUSY)
+                f"`ttp lock --probe {','.join(names)}`", UPGRADE_BUSY)
     return [sys.executable, str(Path(__file__).resolve().parents[2] / "bin" / "ttp"), "lock", ",".join(names), "--", *cmd]
 
 
@@ -11280,7 +11279,7 @@ def cmd_devq(a) -> None:
         r = subprocess.run(argv, input=devq.source(), text=True, timeout=limit)
     except subprocess.TimeoutExpired:
         print(f"ttp devq: the runner's host did not answer within {limit} s", file=sys.stderr)
-        sys.exit(EX_BUSY if a.op == "probe" else 1)
+        sys.exit(UPGRADE_BUSY if a.op == "probe" else 1)
     if a.op == "submit" and r.returncode == 0:
         from . import taskreap
         taskreap.record_job(p, a.runner, spec)   # dropped once its task ends (taskreap.sweep)
@@ -11981,7 +11980,7 @@ def _schedule_run(p, name: str | None) -> int:
     res = schednow.wait(p, schednow.request(p, name, os.environ.get("TTP_TASK")))
     if res.get("error"):
         print(f"ttp schedules run: {res['error']}", file=sys.stderr)
-        return EX_BUSY
+        return UPGRADE_BUSY
     status = str(res.get("status") or "")
     if status.startswith("refused: "):
         print(f"ttp schedules run: {status[9:]}", file=sys.stderr)
@@ -12181,7 +12180,7 @@ def cmd_heal(a) -> None:
     rc, out = heal.check(spec, dict(heal.state(p.db, r["name"])), str(p.root), command_env(p))
     word = heal.classify(rc, out)
     print(f"{r['name']}: {word} (exit {rc})" + (f"\n{out}" if out else ""))
-    sys.exit(1 if heal.recovery_off(out) else 0 if rc == 0 or heal.known_run(rc, out) else 1 if rc == 1 or heal.finding(rc, out) else EX_BUSY)
+    sys.exit(1 if heal.recovery_off(out) else 0 if rc == 0 or heal.known_run(rc, out) else 1 if rc == 1 or heal.finding(rc, out) else UPGRADE_BUSY)
 
 
 def cmd_obligation(a) -> None:
@@ -14349,7 +14348,7 @@ def cmd_upgrade(a) -> None:
             if a.auto:
                 release.finish(p, "held", why=f"harness task #{tid} finishes an earlier upgrade")
             die(f"upgrade refused: harness task #{tid} is finishing an earlier template upgrade of {p.name}; "
-                f"nothing was changed ({release.holder_line(p, holder)}).", EX_BUSY)
+                f"nothing was changed ({release.holder_line(p, holder)}).", UPGRADE_BUSY)
         if a.apply is None and mine:
             die(f"task #{tid} finishes the merge in its own worktree and applies it with "
                 f"`ttp upgrade {p.name} --apply <commit>`", 2)
@@ -14454,14 +14453,14 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
             raise
         held = release.copy_failed(p, e)
         die(f"upgrade {'held' if held else 'failed'}: copying the release onto upstream failed: "
-            f"{type(e).__name__}: {e}" + ("; the daemon retries" if held else ""), EX_BUSY if held else 1)
+            f"{type(e).__name__}: {e}" + ("; the daemon retries" if held else ""), UPGRADE_BUSY if held else 1)
     kept: dict[str, str] = {}
     merged, problem = _merge_upstream(h, p.state / "upgrade-merge", ident, base, kept)
     if problem and parked:      # the open task is retargeted (exit 75); nothing is queued while paused
         print(f"{p.name} paused; upgrades when resumed: the merge needs harness task #{parked['task']}, which "
               f"runs once {p.name} is resumed. Nothing else was changed.")
         _retarget_upgrade_task(p, parked, False)
-        sys.exit(EX_BUSY)
+        sys.exit(UPGRADE_BUSY)
     if problem:
         holder = release.finish_holder(p)
         tid = holder["task"] if holder else None
@@ -14485,10 +14484,10 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
             if release.retried({"newer": release.is_newer(new_v, old_v)}, p.config()):
                 print(took + f"upgrade deferred: owner: this project's daemon (upgrade.auto), which looks again "
                              f"at {timefmt.long(until, p)}.")
-                sys.exit(EX_BUSY)
+                sys.exit(UPGRADE_BUSY)
             if p.db.kv("paused", False):
                 print(took + f"{p.name} paused; upgrades when resumed.")
-                sys.exit(EX_BUSY)
+                sys.exit(UPGRADE_BUSY)
             why = ("upgrade.auto is off" if release.is_newer(new_v, old_v)
                    else f"the daemon retries only a newer version, and this is {new_v} again from another commit")
             print(took + f"{why}, so nothing retries it: rerun `ttp upgrade {p.name}` after such a change.")
@@ -14504,7 +14503,7 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
             print(f"upgrade not applied; the running harness is unchanged. {problem}\n{p.name}'s release is {why}, "
                   f"so no harness task was queued to finish it. `ttp upgrade {p.name} --release` lifts the hold; "
                   f"then rerun `ttp upgrade {p.name}`.")
-            sys.exit(EX_BUSY)
+            sys.exit(UPGRADE_BUSY)
         if not tid:
             _refuse_unappliable_task(p, auto, problem)
         tid = tid or p.db.add_task(
@@ -14521,13 +14520,13 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
               f"finishes it (upgrade deferred to that task)."
               + (f"\n{p.name} paused; upgrades when resumed: task #{tid} runs once {p.name} is resumed "
                  f"(the pause was left as it is)." if p.db.kv("paused", False) else ""))
-        sys.exit(EX_BUSY)        # deferred: the project's own harness task takes it on
+        sys.exit(UPGRADE_BUSY)        # deferred: the project's own harness task takes it on
     # A push started while this merged, or one inside a step (push.Steps waits for this lock before
     # a step, which it marks first): never swap under it.
     if auto and (pushing := release.push_hold(p, (p.db.kv(release.KV_AUTO) or {}).get("key", ""))):
         release.finish(p, "held", why=pushing)
         print(f"upgrade held: {pushing}; the running harness is unchanged and the daemon retries later")
-        sys.exit(EX_BUSY)
+        sys.exit(UPGRADE_BUSY)
     moved = _moved_template(h, base)
     if moved:
         if auto:
@@ -15067,7 +15066,7 @@ def _retarget_upgrade_task(p: Project, holder: dict, auto: bool) -> None:
     print(f"upgrade not applied; the running harness is unchanged. Harness task #{tid} is finishing the "
           f"template merge" + (f" and now targets {target}" if moved or holder.get("key") != key else "")
           + f" (upgrade deferred to that task; {release.holder_line(p, holder)}).")
-    sys.exit(EX_BUSY)
+    sys.exit(UPGRADE_BUSY)
 
 
 def _refuse_unappliable_task(p: Project, auto: bool, problem: str) -> None:
@@ -15237,7 +15236,7 @@ def _refuse_unfinished_merge(p: Project, auto: bool) -> None:
     if harnesstree.landing_merge(h):
         if auto:
             release.finish(p, "held", why="a harness worktree merge is in progress; the daemon retries")
-        die(f"upgrade deferred: harness merge in progress in {h}, daemon retries; nothing was changed", EX_BUSY)
+        die(f"upgrade deferred: harness merge in progress in {h}, daemon retries; nothing was changed", UPGRADE_BUSY)
     sha = release.merge_head(h)
     if not sha:
         return
@@ -15252,7 +15251,7 @@ def _refuse_unfinished_merge(p: Project, auto: bool) -> None:
     except Exception as e:      # a read-only state (a sandbox) records nothing; the refusal stands
         print(f"could not record the hold in {p.name}'s state: {type(e).__name__}: {e}", file=sys.stderr)
     if auto:            # stderr already goes to logs/upgrade.log; the status line shows the reason
-        die(msg, EX_BUSY)
+        die(msg, UPGRADE_BUSY)
     p.logs.mkdir(parents=True, exist_ok=True)
     append_text(p.logs / "upgrade.log", f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} ttp upgrade\n{msg}\n", p)
     die(msg, 1)
@@ -17941,7 +17940,7 @@ def dry_run_stub(a, name: str | None = None) -> None:
     if cmd == "lock" or (cmd == "devq" and a.op in ("submit", "start", "clear")) \
             or (cmd == "detach" and a.check is None):
         print(f"ttp {cmd}: refused in an on_pass_cmd dry run ({ENV}=1)", file=sys.stderr)
-        sys.exit(EX_BUSY)
+        sys.exit(UPGRADE_BUSY)
     if cmd in ("note", "notify", "push", "land", "express"):
         print(f"ttp {cmd}: skipped in an on_pass_cmd dry run ({ENV}=1)", file=sys.stderr)
         sys.exit(0)
