@@ -2,9 +2,8 @@
 
 ## The ladder
 
-For each item at the top of the profile (time lost against its floor), under `release` try in order and stop at
-the first that reaches the target. Under `open` all four are on the table from the start: pick by expected gain
-against cost from the roofline; a change to the op is often cheaper than a workaround that duplicates it.
+The options for an item at the top of the profile, roughly from cheapest to most work. Which to try, and in what
+order, is your call.
 
 1. **Configuration**: program config, core grid, sharding, layout, dtype, fidelity, trace.
 2. **Another existing op or variant**: a different ttnn op, a fused variant already in ttnn, or a model-local
@@ -20,17 +19,11 @@ Making an op work is a different question from making it fast: when an op is wro
 shapes, adapt the inputs to its contract or work around it inside the model under `release`, or fix the op with
 a test under `open`; keep a minimal repro either way.
 
-Skip ahead when the roofline and a microbenchmark of the existing op at model shapes show it cannot reach the
-target's order of magnitude: start the new op or fusion early, on a side branch, while the plain path keeps the
-model correct.
-
 Debugging is not limited by scope: to find a cause, instrument or patch anything on a side branch or worktree
 and revert it before the gate. Under `release`, a patch that proved the cause becomes the repro for the issue.
 
-Under `release`, when the profile already shows a large gap that only an op change would close, a quick
-measurement of it is worth having: one microbenchmark of a patched op at model shapes on a side branch, no
-integration or polish, then a line in the report (op, change, measured gain) for tt-metal maintainers. Skip it
-when the gain is small or the measurement would take more than an hour or so.
+Under `release`, if an op change looks worth a lot, a brief measurement on a side branch and a line in the report
+help tt-metal maintainers. Optional; keep it short.
 
 ## Every new or changed path
 

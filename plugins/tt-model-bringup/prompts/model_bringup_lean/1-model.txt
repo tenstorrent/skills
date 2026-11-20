@@ -5,7 +5,7 @@ Subagents are authorized and recommended; $lean-model says how to run them.
 This goal brings HF_MODEL to a correct, fast TTNN full model on the target mesh under models/autoports/<model>. The approach is yours: plan, reuse the closest model in tt-metal, port modules in parallel, optimise where the profiler shows lost time. The outputs and tests below are fixed. Read bringup/agentic_evals/inputs.json for scope, batch_sizes and budget_hours (default 24); if it has no base_commit, write the current HEAD there. Do not begin vLLM work.
 
 Goal completion requirements:
-- Before the first device run, doc/model/model.json records started_at (UTC), budget_hours and reset_authorization (whether bounded resets and health checks are allowed on this machine). Check the time left against them when planning each round, leaving enough for T2 and the report.
+- Before the first device run, doc/model/model.json records started_at (UTC), budget_hours and reset_authorization (whether bounded resets and health checks are allowed on this machine).
 - SPEC.md and a roofline with per-batch targets exist before device work; targets are multiples of their floors.
 - The full model implements the $full-model generator contract: chunked prefill at any valid length, traced decode with on-device split sampling, paged KV, fixed slots, every batch in batch_sizes, the advertised context or a hard physical limit with evidence.
 - The $reference-accuracy suite exists with verdict match at full precision; the served precision is chosen on its tiers and is the recorded baseline.

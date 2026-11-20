@@ -108,9 +108,8 @@ before the first device run, not at the first unclean exit. Every device job run
 next job (`tt-device-usage`).
 
 `budget_hours` in `inputs.json` (default 24, wall clock) bounds the goal. Copy it and `started_at` (UTC) into
-`model.json` at startup, and check the time left (`date -u`) whenever you plan the next round; the start time
-survives compaction and resumes only because it is written down. Leave enough at the end for T2, the review and
-the report; how much depends on how long your T2 takes. Use the rest to get closer to the targets. A missed
+`model.json` at startup, so the time left is known after compaction or a resume. The final T2, review and report
+fit inside the budget. A missed
 target is reported with its reason; it is not a reason to stop before the budget is spent. `hours_used` goes in
 `model.json` and the report.
 
