@@ -171,12 +171,11 @@ def judged(db, sha: str, key: str, skip: int | None = None) -> dict | None:
 
 
 def _sized(db, review: dict) -> bool:
-    """Whether a `why this size:` line is in the spec or hand-off of a code task `review` covers or of a
-    fix continuing one (reviewcap.change_codes)."""
+    """Whether a size reason the ponytail lane accepts (ponytail.reason_text) is in the spec or hand-off of a
+    code task `review` covers or of a fix continuing one (reviewcap.change_codes)."""
     from . import ponytail
     from .reviewcap import change_codes
-    return any(ponytail.WHY.search(f"{t['spec'] or ''}\n{_result(t).get('summary') or ''}")
-               for t in change_codes(db, review))
+    return any(ponytail.WHY.search(ponytail.reason_text({}, _result(t), [t])) for t in change_codes(db, review))
 
 
 def conflicted(res: dict) -> bool:

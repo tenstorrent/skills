@@ -919,6 +919,17 @@ def test_bridge_gh_pull_is_a_per_box_switch():
             bridge.parse({"boxes": {"b": {"agents": agents, "gh_branch_prefixes": bad}}})
 
 
+def test_bridge_branch_prefix_grants_follow_the_gh_queue_pattern(monkeypatch):
+    import re
+    from ttp import bridge, ghqueue
+    agents = {"a": {"agent": "env", "direct": [{"name": "h"}]}}
+    cfg = {"boxes": {"b": {"agents": agents, "gh_branch_prefixes": ["team-x/"]}}}
+    assert bridge.parse(cfg)["boxes"]["b"]["gh_branch_prefixes"] == ["team-x/"]
+    monkeypatch.setattr(ghqueue, "_PREFIX", re.compile(r"[a-z]+/"))
+    with pytest.raises(bridge.BadConfig):
+        bridge.parse(cfg)
+
+
 def _anon_github(env, monkeypatch, routes):
     """A local stand-in for GitHub's REST API (TTP_GH_ANON_API) answering `routes` {path: (status, body,
     headers)}; returns the list of (path, request headers) it was asked."""

@@ -229,6 +229,15 @@ def test_a_size_only_failed_verdict_stands_until_a_why_this_size_line_is_given(e
     assert reviewreuse.judged(p.db, head, key, skip=0) is None
 
 
+def test_a_size_only_failed_verdict_does_not_stand_once_the_code_task_hands_off_a_no_split_reason(env, monkeypatch):
+    from ttp import reviewreuse, splitgate
+    p = make(env)
+    tid, rev, head, key = _size_failed_review(env, p, monkeypatch, {"big.py": 45}, {"verdict": "pass"})
+    assert reviewreuse.judged(p.db, head, key)["id"] == rev, "no reason given yet: the verdict stands"
+    p.db.update_task(tid, result=json.dumps({"status": "done", "summary": "done", splitgate.FIELD: "one generated table"}))
+    assert reviewreuse.judged(p.db, head, key) is None, "the lane accepts a no_split reason: the head gets a fresh review"
+
+
 def test_a_failed_verdict_with_another_finding_is_still_reused_on_an_unchanged_head(env, monkeypatch):
     from ttp import reviewreuse
     p = make(env)
