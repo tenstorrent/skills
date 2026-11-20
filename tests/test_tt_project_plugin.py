@@ -7657,7 +7657,7 @@ def test_one_line_install_fails_clearly_when_the_ref_has_no_tt_project(install_e
 
 def test_worker_prompt_waits_on_landed_instead_of_blocking_on_another_task():
     text = " ".join((PLUGIN / "template" / "prompts" / "worker.md").read_text(encoding="utf-8").split())
-    assert "Missing only another task's change landing: `waiting` with `retry_when` `landed:#<id>` (never a sha), never `blocked`." in text
+    assert "Missing only another task's change landing: `waiting` with `retry_when` `landed:#<id>` (never a sha), never `blocked`; never on your own unlanded stack (hand off done)." in text
     assert all(len(line) <= 1000 for line in (PLUGIN / "template" / "prompts" / "worker.md").read_text().splitlines())
 
 

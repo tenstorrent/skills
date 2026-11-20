@@ -16295,8 +16295,9 @@ def test_prune_rebase_starts_removes_a_finished_tasks_ref_and_keeps_a_continued_
 def _split_with_a_landing_hop(env, p, title="abandon"):
     """Today's case through the real writers: a code task hands off done with a `continue:` follow-up
     (the daemon queues its hop and marks it a split), the hop finds nothing to do before the change
-    lands and waits on landed:#<it>, and the coordinator then queues the review of its branch by
-    hand. Returns (code task id, branch, review id, hop id)."""
+    lands and waits on its landing plus a second condition (a plain wait on its own stack's landing is
+    taken as done: ownwait.stack_ancestor_wait), and the coordinator then queues the review of its
+    branch by hand. Returns (code task id, branch, review id, hop id)."""
     root, branch, _, reviews = _finish_code(env, p, title, {"a.py": 10}, result=_cont(title))
     assert not reviews, "a split got a review"
     (hop,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (root,))
@@ -16308,7 +16309,7 @@ def _split_with_a_landing_hop(env, p, title="abandon"):
     run_dir = env["tmp"] / f"run-{hop['id']}"
     run_dir.mkdir()
     (run_dir / "result.json").write_text(json.dumps(
-        {"status": "waiting", "summary": f"nothing to do before #{root} lands", "retry_when": f"landed:#{root}",
+        {"status": "waiting", "summary": f"nothing to do before #{root} lands", "retry_when": f"ttp landed --task {root} && test -e input.ready",
          "waiting_for": f"#{root} landing", "retry_after_s": 1800}))
     Daemon(p.base)._finish_worker({"task": hop["id"], "note": "{}"}, Usage(cost_usd=1.0), "ok", run_dir)
     assert p.db.task(hop["id"])["status"] == "queued"
