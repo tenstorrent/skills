@@ -94,7 +94,7 @@ def limits(run_dir) -> dict | None:
 def rows(path) -> list[dict]:
     """The JSON object lines of a jsonl file, oldest first; unreadable lines are skipped."""
     try:
-        lines = Path(path).read_text().splitlines()
+        lines = Path(path).read_text(errors="replace").splitlines()
     except OSError:
         return []
     out = []

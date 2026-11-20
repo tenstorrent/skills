@@ -66,6 +66,7 @@ import re
 import time
 from pathlib import Path
 
+from . import glmassist
 from .coordtools import READ_COMMANDS
 
 ENV = "TTP_CODE_ARM_GUARD"
@@ -305,26 +306,9 @@ def refusal_settings(cfg: dict | None = None) -> dict:
     return {"redirect": g.get("redirect") is not False, "hand_back_after": n}
 
 
-def _jsonl_rows(run_dir, name) -> list[dict]:
-    """The dicts a run recorded in its `name` jsonl, oldest first; unparsable lines are skipped."""
-    try:
-        lines = (Path(run_dir) / name).read_text(errors="replace").splitlines() if run_dir else []
-    except OSError:
-        return []
-    out = []
-    for ln in lines:
-        try:
-            r = json.loads(ln)
-        except ValueError:
-            continue
-        if isinstance(r, dict):
-            out.append(r)
-    return out
-
-
 def refusals(run_dir) -> list[dict]:
     """The refusals a run recorded (REFUSALS), oldest first."""
-    return _jsonl_rows(run_dir, REFUSALS)
+    return glmassist.rows(Path(run_dir) / REFUSALS) if run_dir else []
 
 
 def refused(run_dir, why: str, kind: str = "guard", cfg: dict | None = None) -> tuple[bool, str]:
@@ -754,7 +738,7 @@ def drafted(run_dir, d: dict) -> str:
 
 def drafts(run_dir) -> list[dict]:
     """The drafts a run recorded."""
-    return _jsonl_rows(run_dir, DRAFTS)
+    return glmassist.rows(Path(run_dir) / DRAFTS)
 
 
 def is_gate(cmd: str, gates=(), env=None) -> bool:

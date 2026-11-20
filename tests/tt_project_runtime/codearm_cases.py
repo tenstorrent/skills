@@ -871,6 +871,16 @@ def test_glm_guard_redirects_a_refusal_with_its_allowed_way_and_hands_back_on_th
         ("db_read", False), ("scratch", False), ("upstream", True)]
 
 
+def test_glm_guard_run_records_skip_bad_lines_and_an_unset_run_dir(tmp_path):
+    """cells: guard_records_read: refusals() and drafts() read the run folder with the shared jsonl reader, which
+    skips undecodable, unparsable and non-object lines; refusals() of an unset run folder is empty."""
+    from ttp import glmguard
+    for name, read in ((glmguard.REFUSALS, glmguard.refusals), (glmguard.DRAFTS, glmguard.drafts)):
+        (tmp_path / name).write_bytes(b'{"rule": "a"}\n\xff\xfe not json\n[1]\n{"rule": "b"}\n')
+        assert [r["rule"] for r in read(tmp_path)] == ["a", "b"]
+    assert glmguard.refusals("") == [] and glmguard.refusals(None) == []
+
+
 def test_glm_guard_hands_back_a_harmful_attempt_at_once_and_off_restores_the_first_refusal(monkeypatch, tmp_path):
     """cells: guard_harmful_hands_back, guard_redirect_off"""
     from ttp import glmguard
