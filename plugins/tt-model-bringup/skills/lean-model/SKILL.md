@@ -11,6 +11,24 @@ and the bad, offered as defaults. Where your measurements say otherwise, follow 
 Load the references when you reach them, not up front: [ops and kernels](references/ops.md),
 [mixture of experts](references/moe.md), [one or two machines](references/machines.md).
 
+## Knowledge in the stage skills
+
+The staged pipeline's skills hold most of what is known about TTNN model work. Read the one that matches the
+work in front of you. Use their technical advice; their stage procedure (stage order, evidence lists, per-stage
+review and gates) is for the staged pipeline and does not apply here. Where their advice and your measurements
+disagree, the measurements win.
+
+| Work | Skill |
+|---|---|
+| decoder correctness, chunked prefill, TTNN correctness defaults | [functional-decoder](../functional-decoder/SKILL.md) |
+| fusing op chains | [graph-fusing](../graph-fusing/SKILL.md) |
+| profiling, perf accounting, prefill and TTFT, decode closure | [optimize](../optimize/SKILL.md) |
+| sharding, collectives, multi-chip layouts, expert placement | [multichip](../multichip/SKILL.md) |
+| generator contract, context, validation | [full-model](../full-model/SKILL.md) |
+| trace capture, program-cache warmup, split sampling | [tt-enable-tracing](../tt-enable-tracing/SKILL.md) |
+| precision groups, fidelity, MoE precision | [datatype-sweep](../datatype-sweep/SKILL.md) |
+| free-running output checks | [qualitative-check](../qualitative-check/SKILL.md) |
+
 ## Outcome
 
 - `models/autoports/<model>/tt/`: the full model and the `full-model` generator contract: chunked prefill,
