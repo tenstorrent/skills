@@ -282,7 +282,7 @@ def _git_stub(bindir, log):
     find this stub on PATH and exec it back, looping."""
     import shutil
     bindir.mkdir(parents=True, exist_ok=True)
-    real = "/usr/bin/git" if (_st := shutil.which("git", path="/usr/bin")) else shutil.which("git")
+    real = shutil.which("git", path="/usr/bin") or shutil.which("git")
     stub = bindir / "git"
     stub.write_text("#!/usr/bin/env python3\n"
                     "import os, sys, time\n"
@@ -295,10 +295,8 @@ def _git_stub(bindir, log):
 
 
 def test_slop_diff_on_a_large_tree_reads_each_ref_as_one_git_batch_not_a_call_per_file(tmp_path, monkeypatch):
-    """upstream note 02d7c6ea58ee7616: `ttp slop --diff` on a one-commit diff in a large worktree
-    printed nothing and was killed at 120 s: the scan read both trees one git call per file. Each
-    ref's blobs now stream from one `git cat-file --batch`, and the counted numbers come from the
-    changed files alone, so a small diff finishes whatever the tree's size."""
+    """A small diff's scan does not grow with the tree's size: each ref's blobs stream from one
+    `git cat-file --batch`, and the counted numbers come from the changed files alone."""
     import os, time
     from ttp import slop
     files = {f"pkg/m{i}.py": f"def f{i}(x):\n    return x + {i + 2}\n" for i in range(300)}
@@ -320,6 +318,26 @@ def test_slop_diff_on_a_large_tree_reads_each_ref_as_one_git_batch_not_a_call_pe
     assert row["globals"] == 1 and row["magic"] >= 1 and row["noisy_lines"] == 1, (row, d)
     assert any(g["name"] == "choose_box" for g in d["new_duplicates"]), d["new_duplicates"]
     assert d.get("duplicates_partial") is None and took < 20, (took, d)
+
+
+def test_slop_reads_every_file_of_a_ref_with_its_own_text_when_the_cache_clears_mid_read(tmp_path, monkeypatch):
+    """A ref's read decides each file's cache hit once, up front: a cache clear part-way through
+    the read must not re-decide an entry, scan one file with another file's text or drop the rest."""
+    from ttp import slop
+    files = {f"pkg/m{i}.py": f"def f{i}(x):\n    return x + {i + 2}\n" for i in range(40)}
+    root = _slop_repo(tmp_path, files)
+    slop._CACHE.clear()
+    slop.read_tree(root, "HEAD")                             # warm the cache with the base tree
+    monkeypatch.setattr(slop, "_CACHE_MAX", len(slop._CACHE))   # the next stored entry clears it
+    head = _slop_commit(root, {"pkg/a_new.py": "def a_new(x):\n    return x\n",
+                               "pkg/zz.py": "def h(x):\n    return x\n"})
+    infos = slop.read_tree(root, head)
+    assert len(infos) == 42, [i.path for i in infos]
+    by_path = {i.path: i for i in infos}
+    assert [n for n, _, _ in by_path["pkg/zz.py"].funcs] == ["h"]
+    assert [n for n, _, _ in by_path["pkg/a_new.py"].funcs] == ["a_new"]
+    for i in range(40):                                      # no file carries another file's text
+        assert [n for n, _, _ in by_path[f"pkg/m{i}.py"].funcs] == [f"f{i}"], by_path[f"pkg/m{i}.py"].funcs
 
 
 def test_slop_delta_keeps_the_numbers_when_the_whole_tree_scan_misses_its_budget(tmp_path, monkeypatch):
@@ -346,6 +364,10 @@ def test_slop_delta_keeps_the_numbers_when_the_whole_tree_scan_misses_its_budget
     assert row["globals"] == 1 and row["magic"] >= 1, row          # exact from the changed files alone
     assert d["duplicates_partial"] is True and not d["new_duplicates"], d
     assert "duplicate check limited to this change's files" in " ".join(slop.delta_lines(d))
+    seen.clear()
+    empty = slop.delta(root, head, head, None, None)      # an empty diff: its pass reads no file
+    assert seen == [False, False, True], seen             # only=set() at both refs, then the whole trees
+    assert empty["subsystems"] == {} and not empty["new_duplicates"] and not empty["new_noisy"], empty
 
     def none_fits(root, ref=None, paths=None, exclude=None, max_lines=80, deadline=None, only=None):
         raise slop.Deadline()

@@ -344,15 +344,13 @@ def _save(cache: str | None) -> None:
         pass
 
 
-def _analyze(path: str, key: str, text_fn, max_lines: int, deadline: float | None = None) -> _Info | None:
+def _analyze(path: str, key: str, text_fn, max_lines: int) -> _Info | None:
     ext = PurePosixPath(path).suffix
     if ext not in PY and ext not in LINE_LANGS:
         return None
     ck = (key, path, max_lines)
     if key and (hit := _CACHE.get(ck)):
         return hit
-    if deadline is not None and time.monotonic() > deadline:
-        raise Deadline()
     try:
         text = text_fn()
     except (OSError, UnicodeDecodeError):
@@ -365,9 +363,13 @@ def _analyze(path: str, key: str, text_fn, max_lines: int, deadline: float | Non
     return info
 
 
+def _git_result(root, *args):
+    return gitmemo.run(["git", "-C", str(root), *args], capture_output=True, text=True, errors="replace",
+                       stdin=subprocess.DEVNULL, timeout=120)
+
+
 def _git(root, *args, check=True) -> str:
-    r = gitmemo.run(["git", "-C", str(root), *args], capture_output=True, text=True, errors="replace",
-                    stdin=subprocess.DEVNULL, timeout=120)
+    r = _git_result(root, *args)
     if r.returncode and check:
         raise RuntimeError(r.stderr.strip() or f"git {args[0]} failed")
     return r.stdout if r.returncode == 0 else ""
@@ -420,16 +422,17 @@ def _batch_texts(root, blobs: list[str]):
 
 
 def _read_blobs(root, entries: list[tuple[str, str]], max_lines: int, deadline: float | None) -> list[_Info]:
-    """Each (path, blob id) entry scanned once: cache hits first, the misses fetched from one
-    `git cat-file --batch` stream. One git process reads a whole ref, not one git call per file,
-    which is what made a large repository's scan take minutes while a small diff sat in it."""
-    infos: list[_Info] = []
+    """Each (path, blob id) entry scanned once: cache hits taken from the cache, the misses fetched
+    from one `git cat-file --batch` stream, so a ref is read by one git process whatever its size.
+    Each entry's hit or miss is decided once, up front: re-deciding it per entry would let a cache
+    clear part-way through the read take the next miss's text for an entry that was a hit."""
     entries = [e for e in entries if PurePosixPath(e[0]).suffix in PY | set(LINE_LANGS)]
-    misses = [e for e in entries if (e[1], e[0], max_lines) not in _CACHE]
-    texts = _batch_texts(root, [blob for _, blob in misses])
+    planned = [(e, _CACHE.get((e[1], e[0], max_lines))) for e in entries]
+    texts = _batch_texts(root, [e[1] for e, hit in planned if hit is None])
+    infos: list[_Info] = []
     try:
-        for path, blob in entries:
-            if (hit := _CACHE.get((blob, path, max_lines))) is not None:
+        for (path, blob), hit in planned:
+            if hit is not None:
                 infos.append(hit)
                 continue
             if deadline is not None and time.monotonic() > deadline:
@@ -604,10 +607,10 @@ def pass_target(infos: list[_Info], cfg: dict | None = None, skip: set[str] | No
 
 def _changed_paths(root, base: str, head: str) -> list[str] | None:
     """The paths base..head touches, both sides of a rename included: what a delta has to read.
-    None when git cannot name them (a ref that does not resolve, a directory that is no repository):
-    the tree read then raises git's own message for it."""
-    out = _git(root, "diff", "--no-renames", "--name-only", "-z", base, head, check=False)
-    return [p for p in out.split("\0") if p] or None
+    [] when the diff is empty. None only when git cannot name them (a ref that does not resolve,
+    a directory that is no repository): the tree read then raises git's own message for it."""
+    r = _git_result(root, "diff", "--no-renames", "--name-only", "-z", base, head)
+    return [p for p in r.stdout.split("\0") if p] if r.returncode == 0 else None
 
 
 def delta(root, base: str, head: str, cfg: dict | None = None, cache: str | None = None,
@@ -632,7 +635,7 @@ def delta(root, base: str, head: str, cfg: dict | None = None, cache: str | None
             fa, fb = read_tree(root, base, None, ex, maxl, end), read_tree(root, head, None, ex, maxl, end)
             whole = (aggregate(fa, c), aggregate(fb, c))
         except Deadline:
-            whole = None
+            pass
         ra, rb = (whole if whole else (aggregate(a, c), aggregate(b, c)))
         rows = {}
         for name, now in rb["subsystems"].items():
