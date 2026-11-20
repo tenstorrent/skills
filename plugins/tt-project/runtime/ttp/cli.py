@@ -1886,7 +1886,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
     lines += route.model_lines(db, p.config(), p.state, now, lambda ts: at(ts, now, tz))   # holds, served ids
     from . import loadcaps, pushq
     # Routine diagnostics print only with --verbose; a line that reports an anomaly always prints.
-    from . import checkcap, checkjoin, checklane, checkspill, heal, locks, shared, slurmcheck, testslots
+    from . import checkcap, checkjoin, checklane, checkspill, heal, locks, shared, testslots
     if verbose:
         if host := checkcap.line(activity=True):
             lines.append(host)
@@ -1895,15 +1895,11 @@ def status_text(p: Project, verbose: bool = False) -> str:
     lines.extend(checklane.long_wait_lines(p.name, p.config(), now))
     lines.extend(checkspill.limit_lines(p.name))   # the limit each live checks run is under: always shown
     lines.extend(checkspill.skip_lines(now))   # a spill host kept off for a device job: always shown
-    if paused := slurmcheck.paused_line(now):   # the Slurm overflow's start-failure breaker: always shown
-        lines.append(paused)
-    lines.extend(slurmcheck.probe_lines(now))   # the Slurm overflow unusable (its workdir probe): always shown
     from . import gatejudge   # tests the gate quarantined as flaky (no release check counts them passed)
     lines.extend(gatejudge.status_lines(p.state, now, lambda ts: at(ts, now, tz),
                                         gatejudge.not_found(p, gatejudge.active(p.state, now))))
     if verbose:
         lines.extend(checkspill.status_lines(p.name, now))
-        lines.extend(slurmcheck.status_lines(p.name, now))
         lines.extend(f"checks {x.strip()}" for x in checkjoin.status_lines(p.state, now))
         if slot_waits := checkcap.wait_line(p.state, now):
             lines.append(slot_waits)
@@ -3846,19 +3842,6 @@ def _spill_to(todo: list, host: str, cfg: dict | None = None, workers: int = 0) 
     return out
 
 
-def _spill_wrapped(cmds: list, cfg: dict | None) -> bool:
-    """Whether a check of `cmds` runs behind a spill wrapper (push.spill_wrap_of; one that does not parse
-    counts): it never runs unwrapped, so its run never overflows to Slurm (slurmcheck), whose job runs none."""
-    from . import push
-    for c in cmds:
-        try:
-            if push.spill_wrap_of(c, cfg):
-                return True
-        except ValueError:
-            return True
-    return False
-
-
 def _recorded_pass(p: Project | None, tree: str, cmds: list, purpose: str = "candidate",
                    envs: list[str] | None = None) -> dict | None:
     """The recorded pass of exactly these commands, in this order, on this tree, for this purpose, or
@@ -3893,7 +3876,7 @@ def _checks_resumes(c) -> bool:
     is off under xdist)."""
     import shlex
     from . import push, pushpass, testslots
-    if not pushpass.resumable(c) or push.remote_host(c) or getattr(c, "slurm", None):
+    if not pushpass.resumable(c) or push.remote_host(c):
         return False
     try:
         words = shlex.split(f"{c} {os.environ.get('PYTEST_ADDOPTS', '')}")
@@ -4843,8 +4826,6 @@ def _cmd_checks(a) -> None:
             # (same arrival time), never run the checks uncapped.
             if slot is None or not slot.served:
                 break
-        from . import slurmcheck
-        slurmcheck.forget()   # this run waits for the Slurm overflow no more
         if joined and joined[0] != "handover":
             _checks_report_joined(join_rec, Path(run_dir), out, joined, head, str(top), todo, skipped, purpose)
             return
@@ -4859,11 +4840,9 @@ def _cmd_checks(a) -> None:
             # Its commands may give the slot up while they wait on an outside pool (ttp checks-yield).
             _CHECK_YIELD["slot"] = slot if slot.allow_yield() else None
         if spilled:
-            if slurm := getattr(spilled, "slurm", None):   # one batch job per check, --time from the run's median
-                minutes = slurmcheck.time_min(checklane.median_s(p.state, _commands_hash(todo)), slurm)
             run_wrap = _spill_wrap_digest(todo, cfg)
             todo = _spill_to(todo, spilled.host, cfg, getattr(spilled, "workers", 0))
-            for c in todo if p and not slurm else []:   # each start checks the host is still listed (checkspill.off_list)
+            for c in todo if p else []:   # each start checks the host is still listed (checkspill.off_list)
                 if getattr(c, "spill_host", "") == spilled.host:
                     c.spill_project = str(p.base)
             for c in todo:   # a check split off to run here says why (checkspill.why_here)
@@ -4871,9 +4850,6 @@ def _cmd_checks(a) -> None:
                     said = f"{str(c)[:120]} runs here, not on {spilled.host}: {why}"
                     print(f"ttp checks: {said}", flush=True)
                     out.write(f"ttp checks: {said}\n")
-            for c in todo if slurm else []:
-                if getattr(c, "spill_host", ""):   # a check split off to run here stays off Slurm
-                    c.slurm, c.time_min = slurm, minutes
             for w in dict.fromkeys(w for c in todo if (w := getattr(c, "remote_wrap", ()))):
                 said = f"on {spilled.host} the checks run behind their spill wrapper {shlex.join(w)}"
                 print(f"ttp checks: {said}", flush=True)
@@ -6111,7 +6087,7 @@ def _checks_lane_status(as_json: bool) -> int:
     top = subprocess.run(["git", "-C", str(Path.cwd()), "rev-parse", "--show-toplevel"], capture_output=True,
                          text=True).stdout.strip()
     here_repo = testslots.repo_key(top) if top else ""
-    from . import checkcap, checkjoin, checkspill, diskgate, hostload, slurmcheck
+    from . import checkcap, checkjoin, checkspill, diskgate, hostload
     followers = checkjoin.status_lines(p.state)
     holders = checkcap.holder_activity()   # whether each host-wide slot holder runs tests now
     slots, parked = checkcap.slot_holders(), checkcap.parked_order()   # who holds each host slot (live), who is parked
@@ -6128,8 +6104,6 @@ def _checks_lane_status(as_json: bool) -> int:
                           "runs": runs, "repos": repos, "spilled": spilled, "push": push_rows,
                           "no_spill_hosts": checkspill.no_spill(),
                           "here": checkspill.here_records(p.name),
-                          "slurm_overflow": slurmcheck.holders(p.name),
-                          "slurm_paused": slurmcheck.tripped(),
                           "hosts": {**load, "overloaded": hostload.overloaded(load)},
                           "disk": disk,
                           "host_holders": holders,
@@ -6142,8 +6116,7 @@ def _checks_lane_status(as_json: bool) -> int:
         if push_rows:
             print("push checks host-wide (push priority slot, or an ordinary turn after it stayed held):")
             print("\n".join(f"  {line}" for line in checkcap.push_lines(rows=push_rows)))
-        for line in [*checkspill.no_spill_lines(), *checkspill.status_lines(p.name), *checkspill.exclude_lines(p.config()), *checkspill.pick_lines(p.name), *checkspill.here_lines(p.name), *checkspill.limit_lines(p.name), *slurmcheck.probe_lines(), *slurmcheck.status_lines(p.name),
-                     *filter(None, [slurmcheck.paused_line()])]:
+        for line in [*checkspill.no_spill_lines(), *checkspill.status_lines(p.name), *checkspill.exclude_lines(p.config()), *checkspill.pick_lines(p.name), *checkspill.here_lines(p.name), *checkspill.limit_lines(p.name)]:
             print(f"  {line}")
         print("check runs per host:")
         print("\n".join(f"  {line}" for line in hostload.lines(s=load)))
@@ -6176,15 +6149,14 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     the holder and the queue position each minute. With `spill` and delivery.checks_spill_hosts set, a
     wait past delivery.checks_spill_after_s (the lane's or the host-wide cap's) tries those hosts
     (checkspill.pick; none `spill_off` keeps off: OFF_ENV of a rerun) and keeps its place here
-    when none can take the run (nor the account's Slurm overflow, slurmcheck.pick, which a rerun after a
-    spill host never takes): a slot whose `spill`
-    claim names the host the checks then run on (with `slurm` set, the cluster's submit host); while
+    when none can take the run: a slot whose `spill`
+    claim names the host the checks then run on; while
     this host's disk is saturated (diskgate) it tries them before it waits here at all. Both
     settings are read again at each bound: hosts set while a run waits take it at its next bound.
     `yielder()`, asked while it waits, raises checkjoin.Yield when the task's same checks run or wait
     ahead, or a newer head's do: the wait ends holding nothing. The branch checked out at `top` moving
     off `head` while it waits (_HeadMoved: its task replaced the head) ends it as a cancel does."""
-    from . import checkcap, checkjoin, checklane, checkspill, diskgate, locks as lk, slurmcheck
+    from . import checkcap, checkjoin, checklane, checkspill, diskgate, locks as lk
     foreground = not detached and not os.environ.get("TTP_DETACHED")
     key = f"checks:{os.getpid()}:{time.time()}"
 
@@ -6296,7 +6268,7 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
         tell(f"no spill host can take these checks: {kept}")   # never blamed on a host's pause
     first = True
     # An urgent run never waits behind routine ones (checkcap: urgent slots): it tries the pool's hosts at once
-    # (a first bound of 0 s here), then, with none free, a reserved urgent slot here, before the Slurm overflow.
+    # (a first bound of 0 s here), then, with none free, a reserved urgent slot here.
     urgent = checkcap.is_urgent(prio) and p is not None   # an adopted task's run never takes an urgent slot
     pool_first = urgent and spill_to and bool(checkspill.hosts(cfg))
     moved = _HeadMoved(top, head)   # its task replacing the head while it waits drops the run
@@ -6419,16 +6391,9 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
             slot = checkcap.Slot()
             slot.spill = claim
             return slot
-        if pool_first:   # no pool host free: an urgent slot here next, the overflow only after it
+        if pool_first:   # no pool host free: an urgent slot here next
             pool_first = False
             continue
-        # No pool host could take it: the account's Slurm overflow (slurmcheck), urgent runs first. Its batch
-        # job runs no spill wrapper and a wrapped check never runs unwrapped, so a wrapped run waits here.
-        if not spill_off and not _spill_wrapped(cmds, spill_cfg) and (claim := slurmcheck.pick(p, spill_cfg, lambda line: line in told or (told.add(line), tell(line)),
-                                     what, prio, start if arrived is None else arrived)) is not None:
-            slot = checkcap.Slot()
-            slot.spill = claim
-            return slot
         if foreground and time.time() - start >= checkcap.FOREGROUND_WAIT_S:
             return None
 
@@ -7179,10 +7144,10 @@ def _checks_judge(a, p: Project | None, c, rc: int, output: str, cwd: str, env: 
     shipped along (remotecheck), and its base results are that host's. A blocking verdict with ids proven
     new (gatejudge.proven) is appended to `proven` and saved for the head's tree (gatejudge.save_new); one
     the reruns could not tell leaves the failure as it was. Never for a release check
-    (`--release`), a harness run, a Slurm batch check or a command that is not one plain pytest run."""
+    (`--release`), a harness run or a command that is not one plain pytest run."""
     from . import cleantree, gatejudge, push, pushpass, pushq, worktree
     if not p or getattr(a, "release", False) or getattr(a, "purpose", None) not in (None, "candidate") \
-            or getattr(c, "slurm", None) or not pushpass.resumable(c):
+            or not pushpass.resumable(c):
         return None
     remote = push.remote_host(c)
     cfg = p.config()
@@ -12966,7 +12931,7 @@ def cmd_account_config(key: str, value: str | None) -> None:
         val = json.loads(value)
     except ValueError:
         val = value
-    from . import checkspill, slurmcheck
+    from . import checkspill
     from .globalcap import setting_problems
     sec, _, k = key.partition(".")
     bad = setting_problems({k: val}) if sec == "budget" and val not in ("", None) else []
@@ -12980,11 +12945,6 @@ def cmd_account_config(key: str, value: str | None) -> None:
     if key == checkspill.NO_SPILL_KEY and val not in ("", None):
         try:
             val = checkspill.no_spill_of(val) or ""   # an empty ban list is none: removed
-        except ValueError as e:
-            bad = [str(e)]
-    if key == slurmcheck.KEY and val not in ("", None, {}):
-        try:
-            slurmcheck.settings_of(val)
         except ValueError as e:
             bad = [str(e)]
     if nested and (why := rankfresh.check_setting(key, val)):
@@ -13007,7 +12967,7 @@ def cmd_account_config(key: str, value: str | None) -> None:
         weekly_default(b, acct)
         if warn := weekly_below_daily(b):
             print(f"warning: {warn} (account-level)", file=sys.stderr)
-    if key in ACCOUNT_USER_ONLY or key == checkspill.NO_SPILL_KEY:   # who changed the pool, overflow or ban, when
+    if key in ACCOUNT_USER_ONLY or key == checkspill.NO_SPILL_KEY:   # who changed the pool or ban, when
         _log_account_change(key, old, None if val == "" else val)
     if key == checkspill.NO_SPILL_KEY and val:
         from .globalcap import local_projects
@@ -13156,8 +13116,8 @@ def cmd_config(a) -> None:
             # A run can be steered by text it reads; spend caps change only on the user's word.
             _refuse_user_only_in_run(a.name)
         if run and a.key not in (None, "") and a.name in ACCOUNT_USER_ONLY and not _account_off(a.name, a.key):
-            # The account's spill pool and Slurm overflow send every project's code to those machines: only
-            # clearing them (removing, or their off value) is a run's.
+            # The account's spill pool sends every project's code to those machines: only
+            # clearing it (removing, or their off value) is a run's.
             _refuse_user_only_in_run(a.name)
         if run and a.key is not None and (why := _no_spill_run_refusal(a.name, a.key)):
             die(why)

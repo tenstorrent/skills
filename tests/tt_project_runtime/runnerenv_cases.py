@@ -285,24 +285,6 @@ def test_a_remote_check_runs_in_the_hosts_pinned_env_and_never_without_it(tmp_pa
     assert "pinned Python env could not be made there" in said and _rc_left(tmp_path) == []
 
 
-def test_a_slurm_check_job_runs_in_the_nodes_pinned_env_and_is_a_fault_without_it(tmp_path):
-    from ttp import slurmcheck
-    repo = _rc_repo(tmp_path)
-    seen = tmp_path / "seen"
-    cmd = f'printf "%s|%s" "$PYTHONNOUSERSITE" "${{PATH%%:*}}" > {seen}'
-    for name, stand_in, rc in (("ok", os.environ["TTP_TEST_CHECKS_PYTHON_ENV"], "0"), ("bad", str(tmp_path / "none"), slurmcheck.NO_ENV)):
-        q = tmp_path / name
-        q.mkdir()
-        subprocess.run(["git", "-C", str(repo), "archive", "--format=tar", "-o", str(q / "tree.tar"), "HEAD"], check=True)
-        (q / "job.sh").write_text(slurmcheck.job_script(shlex.quote(str(q)), "", cmd))
-        subprocess.run(["sh", str(q / "job.sh")], cwd=q, env={**os.environ, "TTP_TEST_CHECKS_PYTHON_ENV": stand_in},
-                       capture_output=True, timeout=120)
-        assert (q / "rc").read_text().strip() == rc
-    nsite, first = seen.read_text().split("|")
-    assert nsite == "1"
-    assert os.path.realpath(first) == os.path.realpath(os.environ["TTP_TEST_CHECKS_PYTHON_ENV"] + "/bin")
-
-
 def test_a_pinned_env_fault_closes_once_its_env_is_made_or_its_lock_is_gone(tmp_path, monkeypatch):
     from ttp import envfault, runnerenv
     lock = tmp_path / "py.lock"

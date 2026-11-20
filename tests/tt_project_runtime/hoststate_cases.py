@@ -687,14 +687,13 @@ def test_the_hop_limit_ends_a_deliberate_stand_in_loop_fast(tmp_path):
 
 
 def test_a_check_run_on_another_machine_leaves_this_hosts_crontab_unjudged(tmp_path, monkeypatch):
-    """A check spilled to another host or a Slurm job runs its tests there: a crontab line another
+    """A check spilled to another host runs its tests there: a crontab line another
     project adds or removes here meanwhile is neither put back nor recorded, and end() says why."""
-    from ttp import hoststate, push, remotecheck, slurmcheck
+    from ttp import hoststate, push, remotecheck
     _, tabf, _ = _fake_host(tmp_path, monkeypatch, "0 1 * * * keep\n@reboot other/resume.sh\n")
     got = _ledger(monkeypatch)
     spill = ["nice", "-n", "10", *remotecheck.argv("pytest -q", "spill-host")]
     assert hoststate.elsewhere(spill) == "spill-host"
-    assert hoststate.elsewhere(slurmcheck.argv("pytest -q", {}, minutes=5)) == "a Slurm batch job"
     assert hoststate.elsewhere(["bash", "-c", "pytest -q"]) == "" == hoststate.elsewhere(None)
     env = push.check_env("checks", run_dir=str(tmp_path / "run"))
     guard = hoststate.Guard(env, argv=spill)

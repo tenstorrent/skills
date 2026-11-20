@@ -2,7 +2,7 @@
 
 Counter (always on: it changes no behaviour). Every pre-screen decision on a coordinator wake is one row
 in the project DB's wake_decisions table: the gate (`triage` for waketriage, `quiet` for quietgate,
-`turn` for turngate, `hook` for the retired settle hook, `rule` for this module), its verb (`skip` or `wake`), the
+`turn` for turngate, `rule` for this module), its verb (`skip` or `wake`), the
 event kinds and ids, and the dollars a skip avoided at the median coordinator wake cost of the last 7
 days. `summary` and `audit_line` read it for `ttp status` and the daily review.
 
@@ -82,7 +82,6 @@ def never_reason(e: dict, task: dict | None, owners) -> str | None:
 
 
 TABLE = "wake_decisions"
-GATES = ("triage", "quiet", "turn", "hook", "rule", "probe")
 MEDIAN_KEY = "wake_settle_median"   # kv: {"at", "usd"}: the median coordinator wake cost, cached an hour
 MEDIAN_TTL_S = 3600.0
 MEDIAN_WINDOW_S = 7 * 86400.0

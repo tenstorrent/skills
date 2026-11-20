@@ -1972,7 +1972,7 @@ def needed_by(task: dict, open_tasks: list[dict]) -> dict | None:
     return next(needers(task, open_tasks), None)
 
 
-def may_work_in(p: Project, task: dict, user: dict) -> bool:
+def may_work_in(task: dict, user: dict) -> bool:
     """Whether `user`, an unfinished task that needs `task`, may work in task's worktree rather than
     only read its commits: a code task (it may branch from it), a review (it runs `ttp push` there),
     a task continuing it, one whose spec names the worktree's path, and a row whose kind is not
@@ -1987,7 +1987,7 @@ def reader_hold(p: Project, task: dict, users: list[dict], path: Path) -> str | 
     work in it (may_work_in) or the task kept no branch; else, all of them only reading its commits
     from its kept branch, a clause saying what removing it would lose (changes not committed, commits
     not landed); None when nothing (it is clean and landed: its branch and the push branch keep them)."""
-    if not task.get("branch") or any(may_work_in(p, task, u) for u in users):
+    if not task.get("branch") or any(may_work_in(task, u) for u in users):
         return ""
     if inspect(path)["why"]:
         return "; it holds work that is not committed"
@@ -2146,7 +2146,7 @@ def held_by(p: Project, task: dict, open_tasks: list[dict], now: float, path: Pa
         return f"task #{user['id']} ({user['status']}) waits on a probe that reads it"
     users = list(needers(task, open_tasks))
     if users and (why := reader_hold(p, task, users, path)) is not None:
-        user = next((u for u in users if may_work_in(p, task, u)), users[0])
+        user = next((u for u in users if may_work_in(task, u)), users[0])
         return f"task #{user['id']} ({user['status']}) may still use it{why}"
     if p.db.one("SELECT id FROM events WHERE task=? AND status='queued' AND kind!=? LIMIT 1",
                 (task["id"], DIRTY_EVENT)):

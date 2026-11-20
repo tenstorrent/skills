@@ -10,8 +10,7 @@ scontrol reports, tells a time limit or a cancel (preemption included) from a fa
 The idea of a model-free verdict follows tenstorrent/tt-slurm-cluster-mcp's log parser; this is our own
 implementation (that repository carries no licence, so none of its code is copied).
 
-Standard library only: setup-box's box_slurm.py loads this file from the plugin's runtime, and the
-runtime's Slurm check spill (slurmcheck) uses it for a failed check.
+Standard library only: setup-box's box_slurm.py loads this file from the plugin's runtime.
 """
 
 from __future__ import annotations
@@ -116,7 +115,3 @@ def lines(v: dict) -> list[str]:
         out.append("failed tests: " + ", ".join(v["failed_tests"]) + (f" (+{more} more)" if more > 0 else ""))
     out += [f"error: {e}" for e in v.get("errors") or []]
     return out
-
-
-def one_line(v: dict) -> str:
-    return " | ".join(lines(v))

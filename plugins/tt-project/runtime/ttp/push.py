@@ -50,7 +50,7 @@ from typing import Any, Callable
 from urllib.parse import quote, unquote
 
 from . import (checkcap, checkdirs, checkspill, checkwait, checklane, cleantree, coordtools, envfault, gatejudge, gatetime, gitcache, ghroute, gitmemo, hoststate, landed, landmark, leakfile, locks, machines, outscan, ponytail, pooladmit, prguard, prhead, remotecheck, remoteload, repoid, runner, runnerenv, scratchhome,
-               sandbox, settinghold, setupfault, sharedchecks, shorttmp, slurmcheck, syntaxfault, testslots, timefmt, verified, workerloss, worktree)
+               sandbox, settinghold, setupfault, sharedchecks, shorttmp, syntaxfault, testslots, timefmt, verified, workerloss, worktree)
 from . import __version__
 from .budget import DOC_SUFFIXES, task_default_usd
 from .db import continues_id, dependency_ids, load_result
@@ -333,7 +333,7 @@ def spill_to(checks: list, host: str, cfg: dict | None) -> list:
 
 
 def _ship_plugins(env: dict, py: tuple[str, ...]) -> tuple[dict, tuple[str, ...]]:
-    """A remote check's exports and shipped files (remotecheck, slurmcheck) when its env puts this runtime's
+    """A remote check's exports and shipped files (remotecheck) when its env puts this runtime's
     pytest plugins (pushpass.PLUGIN_DIR: a narrowed check's select plugin, testpick.narrow) on PYTHONPATH:
     the plugins go with the copy of the commit and the entry names that copy, never this host's folder.
     The check keeps its env, so its pass key (cli._command_key) is a run's here."""
@@ -626,18 +626,13 @@ def check_argv(cmd: str, top: str | Path | None = None, env: dict | None = None,
     pipeline fails when any stage does (bash `-e -o pipefail`; plain `sh -e` where bash is missing).
     With `top` (the worktree it runs in), a bare pytest runs with the repository's venv, else the one
     `env` (the check's environment; default this process's) has active (venv_cmd). A check with a host
-    (remote_host) runs there instead, on a copy of `commit`, else of the checkout's HEAD (remotecheck; one
-    tagged `slurm` as a batch job on that cluster, slurmcheck). A local check runs
-    in a process sandbox (sandbox.wrap) unless it opts out or `isolate` is false; sandbox_lines says
-    when one cannot."""
+    (remote_host) runs there instead, on a copy of `commit`, else of the checkout's HEAD (remotecheck).
+    A local check runs in a process sandbox (sandbox.wrap) unless it opts out or `isolate` is false;
+    sandbox_lines says when one cannot."""
     exports = dict(getattr(cmd, "env", ()) or ())
     wrap = tuple(getattr(cmd, "wrap", ()) or ())
     lane = tuple(getattr(cmd, "lane", ()) or ()) if wrap else ()
     isolate = isolate and getattr(cmd, "sandbox", True) is not False
-    if slurm := getattr(cmd, "slurm", None):   # the account's Slurm overflow: one batch job (slurmcheck)
-        there, py = _ship_plugins(exports, tuple(getattr(cmd, "ship_py", ()) or ()))
-        return slurmcheck.argv(str(cmd), slurm, there, commit, getattr(cmd, "time_min", 0), py,
-                               dict(getattr(cmd, "literal_env", ()) or ()))
     if host := remote_host(cmd):
         there, py = _ship_plugins(exports, tuple(getattr(cmd, "ship_py", ()) or ()))
         # A spill host is checked against the project's spill list again as the check starts (remotecheck.main)
@@ -5154,10 +5149,10 @@ def _host_verdict(cmd: Any, rc: int, repo: Path, text: str, say: Callable[[str],
 
 
 def _gated(cmd: Any) -> bool:
-    """Whether the tests gate (_gate) may judge check `cmd`: a local check that is no Slurm batch and runs
+    """Whether the tests gate (_gate) may judge check `cmd`: a local check that runs
     pytest once (pushpass.resumable), or a script whose pytest runs are not known (no `"pytest"` key, no pytest
     in its words): its output tells, and its reruns select by the select plugin in PYTEST_ADDOPTS."""
-    if remote_host(cmd) or getattr(cmd, "slurm", None):
+    if remote_host(cmd):
         return False
     said = getattr(cmd, "pytest", None)
     return pushpass.resumable(cmd) or (said is None and pytest_runs(cmd) == 0

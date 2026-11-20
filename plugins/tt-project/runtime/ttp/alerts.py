@@ -224,7 +224,6 @@ CLEARED_TEXT = {
     "daemon-hang": "The daemon completes its ticks again after its watchdog restart.",
     "paused": "The project is no longer paused; new runs start again.",
     "user-step": "The user step {arg} (task:step) is no longer needed: its task ended.",
-    "slurm-paused": "The Slurm checks overflow is re-armed: checks.slurm_overflow was set again or cleared.",
     "fleethold": "A machine hold past its expected end was lifted or extended, or no task here waits on it.",
     "coord-budget": "No coordinator item is parked over its per-turn budget any more.",
     "linger-off": "Linger is on again: the daemon starts at boot without a login.",
@@ -241,9 +240,9 @@ CLEARED_TEXT = {
 # notifier: this machine's desktop notifications fail (notifier.py; a system setting or a missing tool).
 # fleethold: a hold the user set is past its expected end while tasks here wait on it (fleethold.passed_alerts).
 USER_BLOCKERS = ("network", "paused", "coord-budget", "linger-off", "notifier", "fleethold", "user-step",
-                 "slurm-paused", "model-ranking-key", "ssh-agent", "gh-auth")   # gh-auth: gh has no login here and no route (ghauth); ssh-agent: a locked or waiting password-manager agent here (sshagent.py); model-ranking-key: no Artificial Analysis key (rankfresh); slurm-paused: the checks overflow's start-failure breaker (slurmcheck); paused: a long project pause (projpause); user-step: userstep.py
+                 "model-ranking-key", "ssh-agent", "gh-auth")   # gh-auth: gh has no login here and no route (ghauth); ssh-agent: a locked or waiting password-manager agent here (sshagent.py); model-ranking-key: no Artificial Analysis key (rankfresh); paused: a long project pause (projpause); user-step: userstep.py
 CLEARED_SEVERITY = {"network": "low", "paused": "low", "fleethold": "low", "coord-budget": "low", "account-mismatch": "low",
-                    "linger-off": "low", "notifier": "low", "user-step": "low", "slurm-paused": "low", "gh-auth": "low",
+                    "linger-off": "low", "notifier": "low", "user-step": "low", "gh-auth": "low",
                     "model-ranking-key": "low", "ssh-agent": "low"}
 # Conditions that lift by themselves: below high they are a self-clearing feed line, never "needs you".
 # account-mismatch: the provider's login has no plan readings of its own yet (budget.evaluate); its next
@@ -355,9 +354,6 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
         # One reopened after the relay is a new stretch, told by a relay of its own.
         return bool(ids) and bool(db.one(f"SELECT id FROM issues WHERE status='open' AND COALESCE(opened,first_seen)<=? "
                                          f"AND id IN ({','.join('?' * len(ids))}) LIMIT 1", [since, *ids]))
-    if key == "slurm-paused":   # until the user sets checks.slurm_overflow again (slurmcheck.tripped)
-        from . import slurmcheck
-        return slurmcheck.tripped() is not None
     if key == "model-ranking-key":   # until the refresher finds a key (rankfresh.api_key)
         from .rankfresh import api_key
         return api_key() is None
@@ -502,7 +498,7 @@ def _checkable(key: str) -> bool:
                                          "push_rejected", "after_push_failed", "push_queue_dying", "push_not_landing", "push_no_batch", "push_tip_failing", "push_target_unreachable", "push_script_torn", "push_setup_fault",
                                          "push_scope", "heal",
                                          "heal-hold", "machine", "machine-change", "network", "deploy", "deploy-behind", "deploy-pending", "redeploy", "daemon-hang", "paused", "fleethold",
-                                         "coord-budget", "account-mismatch", "linger-off", "tick-step", "pause-gone", "notifier", "chat-silent", "user-step", "slurm-paused", "gh-auth", "ssh-agent", "bridge-agent")
+                                         "coord-budget", "account-mismatch", "linger-off", "tick-step", "pause-gone", "notifier", "chat-silent", "user-step", "gh-auth", "ssh-agent", "bridge-agent")
 
 
 def _since(ep: dict) -> float:

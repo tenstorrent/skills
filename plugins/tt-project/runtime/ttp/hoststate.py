@@ -32,7 +32,7 @@ plugin's own test sessions (tests/conftest.py) get three things, with no namespa
 The snapshot leaves out the harness's own entries (crontab lines tagged `# tt-project:`, units named
 tt-project-*), which its daemons rewrite while tests run; under the marker its installers never touch
 the real ones. Only files are compared, not which units run: a unit started (not enabled) by
-absolute path is not seen. A check that runs on another machine (a spill host, a Slurm job) is not
+absolute path is not seen. A check that runs on another machine (a spill host) is not
 judged here at all: its tests touch that machine, guarded by their own session there, and a change to
 this host's crontab meanwhile is another project's."""
 from __future__ import annotations
@@ -405,19 +405,17 @@ def faked_writes(store, since: float) -> list[str]:
 
 def elsewhere(argv) -> str:
     """The machine check command `argv` runs its tests on when that is not this one: a spill or checks
-    host (remotecheck.argv: its `--host`) or a Slurm batch job (slurmcheck.argv), behind any local
+    host (remotecheck.argv: its `--host`), behind any local
     wrapper (low priority); "" for a local command. This host's crontab and units say nothing about a
     run there, and another project may change them meanwhile: the guard leaves them unjudged."""
     if not isinstance(argv, (list, tuple)):
         return ""
-    from . import remotecheck, slurmcheck
+    from . import remotecheck
     args = [str(a) for a in argv]
     for i, a in enumerate(args[:-1]):
         if a == "-c" and args[i + 1] == remotecheck._BOOT:
             rest = args[i + 2:]
             return rest[rest.index("--host") + 1] if "--host" in rest[:-1] else "another host"
-        if a == "-c" and args[i + 1] == slurmcheck._BOOT:
-            return "a Slurm batch job"
     return ""
 
 

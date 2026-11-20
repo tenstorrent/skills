@@ -2410,7 +2410,7 @@ class Daemon:
                      self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends, self.check_move, self.track_outages,
                      self.check_integrity, self.heal_harness_git,
                      self.sync_schedules, self.lint_charter, self.lint_worker_prompt, self.tend_holds, self.record_ttr, self.alert_long_pause, self.reclassify_alerts,
-                     self.check_linger, self.check_notifier, self.check_overseer, self.alert_slurm_paused, self.check_gh_auth, self.check_reach, self.check_spill_health, self.watch_occupancy, self.check_chats,
+                     self.check_linger, self.check_notifier, self.check_overseer, self.check_gh_auth, self.check_reach, self.check_spill_health, self.watch_occupancy, self.check_chats,
                      self.probe_mcp):
             self._run_step(step)
         self._idle.update(self.cfg, self._work_seen)
@@ -5161,13 +5161,6 @@ class Daemon:
         how = service.ensure_overseer(self.p)
         log(self.p, f"overseer heartbeat {'missing' if age is None else f'{age:.0f} s old'}: {how}")
         return how
-
-    def alert_slurm_paused(self) -> None:
-        """One alert per trip of the Slurm checks overflow's start-failure breaker (slurmcheck.alert_due: the
-        first project daemon to see the trip sends it); it clears once the user sets checks.slurm_overflow again."""
-        from . import slurmcheck
-        if b := slurmcheck.alert_due(self.p.name):
-            self.alert(slurmcheck.ALERT_KEY, slurmcheck.alert_text(b), severity="normal")
 
     def check_gh_auth(self) -> None:
         """While this project uses gh: the host-wide gh login check (ghauth.py) in a thread when it is due,

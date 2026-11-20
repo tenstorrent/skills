@@ -387,10 +387,10 @@ def apply(env: dict, lock: Path | None = None) -> dict:
             LOCK_ENV: str(Path(lock or LOCK).resolve())}
 
 
-def remote_lines(lock: Path | str | None, where: str, fail: str, home: str = "") -> str:
-    """Shell lines for another host (remotecheck, slurmcheck): write this file and `lock` into folder
+def remote_lines(lock: Path | str | None, where: str, fail: str) -> str:
+    """Shell lines for another host (remotecheck): write this file and `lock` into folder
     `where` there, make or reuse the pinned env from them with that host's python3 (as ensure does
-    here, under its TTP_HOME, or `home`, a shell word, when given), and put it in force as apply does.
+    here, under its TTP_HOME), and put it in force as apply does.
     Where it cannot be made, they print why and run `fail`: the check never runs with that host's user
     site. A build there that cannot reach its package index (an offline host) fails within a minute, not
     after pip's silent retries: REMOTE_PIP_RETRIES and REMOTE_PIP_TIMEOUT_S unless the host's own PIP_RETRIES
@@ -404,7 +404,7 @@ def remote_lines(lock: Path | str | None, where: str, fail: str, home: str = "")
         end = f"TTP_ENV_{secrets.token_hex(8)}"
         out += f"cat > {w}/{name} <<'{end}'\n{text.rstrip(chr(10))}\n{end}\n"
     pip = f"PIP_RETRIES=${{PIP_RETRIES:-{REMOTE_PIP_RETRIES}}} PIP_DEFAULT_TIMEOUT=${{PIP_DEFAULT_TIMEOUT:-{REMOTE_PIP_TIMEOUT_S}}} "
-    return (out + f'ttp_env=$({pip}{f"TTP_HOME={home} " if home else ""}python3 -I {w}/runnerenv.py "$PWD"/{w}/checks-python.lock) || {{ '
+    return (out + f'ttp_env=$({pip}python3 -I {w}/runnerenv.py "$PWD"/{w}/checks-python.lock) || {{ '
             f"echo 'ttp: the checks pinned Python env could not be made on this host; the check did not run' >&2; {fail}; }}\n"
             'export PATH="$ttp_env/bin${PATH:+:$PATH}" PYTHONNOUSERSITE=1 TTP_CHECKS_ENV_BIN="$ttp_env/bin"\n'
             'unset PIP_USER\n' + scratchhome.remote_lines(where, fail))

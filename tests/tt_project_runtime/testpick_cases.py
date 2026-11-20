@@ -580,11 +580,11 @@ def test_delivery_checks_targeted_settings_are_validated():
     assert "checks_task_full" in project.EXTRA_KEYS["delivery"]
 
 
-def test_a_narrowed_check_spills_and_runs_its_selection_on_a_spill_host_or_the_slurm_overflow(tmp_path, monkeypatch):
+def test_a_narrowed_check_spills_and_runs_its_selection_on_a_spill_host(tmp_path, monkeypatch):
     """A targeted check may spill as a full one does: spill_to ships the select plugin with the copy of
     the commit and points its PYTHONPATH entry there, never at this host's folder, so on a stand-in spill
-    host (fake ssh), and as a Slurm overflow job, only its selection runs."""
-    from ttp import checkspill, cli, push, pushpass, remotecheck, slurmcheck, testpick
+    host (fake ssh), only its selection runs."""
+    from ttp import checkspill, cli, push, pushpass, remotecheck, testpick
     repo, base = _pick_repo(tmp_path)
     head = _pick_change(repo, base, {"plugins/x/runtime/ttp/foo.py": "def foo_one():\n    return 2\n"})
     own = push.check_list([_PICK_CMD])
@@ -604,11 +604,9 @@ def test_a_narrowed_check_spills_and_runs_its_selection_on_a_spill_host_or_the_s
     s.ship_py = ()
     a = push.check_argv(push.spill_to(list(own), "box1", {})[0], commit=head)
     assert "--py" not in a and json.loads(a[a.index("--env") + 1]) == {}, "a full check ships nothing"
-    fake, _ = _slurm_fakes(tmp_path)
+    bin_, remote = _rc_fake_ssh(tmp_path)
+    fake = {"PATH": f"{bin_}{os.pathsep}{os.environ['PATH']}", "FAKE_REMOTE_TMP": str(remote)}
     run = {**os.environ, **fake}
-    r = subprocess.run(push.check_argv(s, commit=head), cwd=repo, env=run, capture_output=True, text=True, timeout=120)
-    assert r.returncode == 0 and "1 passed, 2 deselected" in r.stdout, r.stdout + r.stderr
-    s.slurm, s.time_min = slurmcheck.settings_of({**_SLURM_SET, "workdir": str(tmp_path / "remote")}), 1
     r = subprocess.run(push.check_argv(s, commit=head), cwd=repo, env=run, capture_output=True, text=True, timeout=120)
     assert r.returncode == 0 and "1 passed, 2 deselected" in r.stdout, r.stdout + r.stderr
 

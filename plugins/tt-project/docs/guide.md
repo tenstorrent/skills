@@ -2917,7 +2917,7 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   checks and `ttp sandbox -- <cmd>` get `TTP_LEAK_PATTERNS_FILE` set to its absolute path, so a
   test that runs under a temp HOME (this repository's suite gives every test one) still reads it.
   Only the path is passed: the file is never printed, logged, copied into a worktree or sent to
-  another host, so a check on another host (`host`, Slurm) skips such a test. To gate pushes on it
+  another host, so a check on another host (`host`) skips such a test. To gate pushes on it
   wherever the other checks run, add a check pinned to this host (`"host": "local"`) that runs only
   that test. A pass's `env_id` holds a hash of the file (never its text): a pass from before the
   file existed or changed is not reused.
@@ -3195,39 +3195,6 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   strike, and a host quarantined earlier for that same failure comes back; a failure that is a missing package at import is already the spill env fault above (told once, never
   a strike, and no second event under the same checks config). A failure with neither an error line nor a failing test id matches no other: it is only a strike.
   `checks.json` (`spilled_to`), `ttp status` and `ttp checks status` name the host.
-  `checks.slurm_overflow` (account-level, unset by default: nothing changes) sends a run that no pool host can take
-  (each paused, busy with a device job, full or unreachable, or no pool at all) to a Slurm cluster instead of
-  waiting here: `ttp config --account checks.slurm_overflow '{"host": "<cluster-login>", "partition":
-  "<cpu-partition>", "workdir": "~/ttp-checks"}'` (only the user sets it; a run may only clear it, with `""` or
-  `{}`, and each change is logged in `account-settings.jsonl` under the account folder with who made it and the undo).
-  `host` is the submit host's ssh alias, `partition` a CPU partition, `workdir` a folder on the cluster's shared
-  file system; `max_jobs` (2) caps this machine's jobs there at once, `--time` is the run's median wall time plus
-  `margin_s` (600), at most `max_time_s` (7200, also its value before a median exists), and a job pending past
-  `max_pending_s` (1800) is cancelled. Each check is one batch job (`--nodes=1 --ntasks=1`, no GRES) on a copy
-  of the commit, copied as for a spill host; the submit host only runs sbatch, squeue, sacct (`scontrol show job`
-  when the cluster keeps no accounting) and scancel and serves the job's output and exit code. A job's exit-code
-  file may show late on the submit host (NFS): it counts as missing only `rc_grace_s` (90) after the job left the
-  queue. Before the first job on a (host, partition, workdir) one tiny probe job checks that a marker written from
-  the submit host under `workdir` is readable on the node and that the node's answer shows back; a failure (a
-  `workdir` on a disk only the submit host sees) marks the overflow unusable, with why, in `ttp status` and
-  `ttp checks --slot-status`, and no check job goes there until the settings change or 6 h pass. On the node the
-  job makes the checks' pinned Python env under `workdir` once per lock hash and runs the check in it
-  (PYTHONNOUSERSITE=1, PIP_REQUIRE_VIRTUALENV=1); an env that cannot be made is an environment fault. A run with a spill wrapper (`spill_wrap_cmd`) never overflows: the
-  batch job runs none. Urgent runs take a free job slot first. A cluster ssh does not reach
-  keeps the run waiting here; one whose sbatch refuses the job, or a job that ends for a cluster reason twice
-  (it is submitted again once: never started, node fault, preempted), is an environment fault and the run runs
-  again here, whose result counts. Stopping the run (a stop, a timeout, a newer head) cancels its job; a job
-  whose run died is cancelled by the next overflow pick, and one the submit host stopped answering for still
-  ends at its time limit. Every job (id, project, task, check, submit, start and end times, state, exit code) is
-  logged in `check-slots/slurm/jobs.jsonl` under the account folder; `ttp status`, `ttp checks status` and
-  `checks.json` (`spilled_to`, the submit host) show running ones like a spill host's. A project's own
-  `delivery.checks_spill_hosts: []` keeps its runs here, overflow included. After 3 jobs in a row die at start
-  (Slurm ends them, not completed, within 30 s of their start and with no output; a job that completes or gives
-  output resets the count), the overflow pauses itself: it submits no more jobs, records the trip (when, how
-  many, the last job ids with their state and exit code) in `check-slots/slurm/breaker.json`, and one daemon
-  raises one `slurm-paused` alert. Runs that would overflow stay in the local queue in their place; a run whose
-  job died at start runs again here, whose result counts. Only setting `checks.slurm_overflow` again (or
-  clearing it) re-arms it and clears the alert; `ttp status` and `ttp checks status` show the pause in one line.
   `ttp checks status` (also `--slot-status`, `--json`) prints each repository's lane holders (pid, task, run,
   age, alive or dead, what it checks and whether its task has finished) and its waiters in queue order, the next
   one marked; it is read only and never queues. Every lane group has a name (its repository or wrapper lock, else the project

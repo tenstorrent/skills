@@ -109,8 +109,8 @@ checks it gets run (git and tar, and python3 with the checks environment for pyt
 its sign-in.
 
 A check whose command names a path of this machine (host_path: an absolute, `~` or `$HOME` path outside
-the system folders, such as a project's own harness scripts) cannot run on a spill host or a Slurm node, which
-get a copy of the commit only, so it never spills either; it splits off to run here the same way.
+the system folders, such as a project's own harness scripts) cannot run on a spill host, which
+gets a copy of the commit only, so it never spills either; it splits off to run here the same way.
 """
 from __future__ import annotations
 
@@ -923,8 +923,8 @@ def why_here(c: Any, cfg: dict | None = None) -> str:
         if needs_history(c):
             return "it reads commits with git, which the one-commit copy there lacks"
     if host_path(c):
-        return ("it names a path of this machine (outside the system folders), which a spill host or Slurm "
-                "node, given a copy of the commit only, lacks")
+        return ("it names a path of this machine (outside the system folders), which a spill host, "
+                "given a copy of the commit only, lacks")
     if check_spills(c, cfg):
         return ""
     return "it runs behind a wrapper that has no spill wrapper (checks.spill_wrap_cmd) for spill hosts"
@@ -978,7 +978,7 @@ def _host_word(w: str) -> bool:
 
 def host_path(c: Any) -> bool:
     """Whether check `c` names a path of this machine (_host_word) in any simple command or a shell's -c
-    script, which a spill host or a Slurm node, given a copy of the commit only, lacks; a line that does not
+    script, which a spill host, given a copy of the commit only, lacks; a line that does not
     parse counts (it stays here). A path inside the checkout counts too: the copy there sits elsewhere."""
     from . import testslots
     try:

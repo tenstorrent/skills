@@ -3307,7 +3307,6 @@ ACCOUNT_KEYS = {"budget": {"global_daily_usd", "day_start", "timezone", "push_sp
                            "dirty_max_mb", "io_full_max",   # the disk gate on new local runs (diskgate)
                            "spill_hosts",   # the spill pool every project's checks may use (checkspill.account_hosts)
                            "no_spill_hosts",   # hosts no project's checks spill to (checkspill.no_spill; a run only adds)
-                           "slurm_overflow",   # a Slurm cluster the pool's overflow runs on (slurmcheck)
                            "smoke_max_s",
                            *CPU_GROUP_KEYS},   # the landing check time limit (gatetime.max_s), project first
                 # release rings (rollout.py): flags {flag: off|0|1|2}, rings {"0": [names], "1": [names]}, excluded [names],
@@ -3319,11 +3318,11 @@ ACCOUNT_KEYS = {"budget": {"global_daily_usd", "day_start", "timezone", "push_sp
 # Account keys a run may only clear (ttp config --account refuses setting them inside a run): remove them
 # ('') or set them to their off value (ACCOUNT_OFF_VALUE), which only reduces their reach.
 # The ranking's source and key file too: the key goes to that source, so only the user names either.
-ACCOUNT_USER_ONLY = {"checks.spill_hosts", "checks.slurm_overflow", "providers.chat.ranking_source",
+ACCOUNT_USER_ONLY = {"checks.spill_hosts", "providers.chat.ranking_source",
                      "providers.chat.ranking_key_file", "rollout.flags", "rollout.rings", "rollout.excluded",
                      "rollout.thresholds", "rollout.scratch_cap_usd", "rollout.waves", "rollout.wave_at",
                      "rollout.project_rollback"}
-ACCOUNT_OFF_VALUE = {"checks.spill_hosts": [], "checks.slurm_overflow": {}, "rollout.flags": {}}
+ACCOUNT_OFF_VALUE = {"checks.spill_hosts": [], "rollout.flags": {}}
 # Host-wide account keys the runtime reads only from the account settings: a project's own copy would
 # show a value nothing uses, so layered() shows the account's in every project and set_config refuses one.
 # Account keys three deep, below a provider: never merged into a project's settings (a project that does not
@@ -3335,7 +3334,7 @@ ACCOUNT_OFF_VALUE = {"checks.spill_hosts": [], "checks.slurm_overflow": {}, "rol
 # host's shared /models poll interval while any project routes to chat, and else (served.every_s).
 ACCOUNT_NESTED_KEYS = {"providers.chat.model_ranking", "providers.chat.rank_exclude", "providers.chat.class_ranking", "providers.chat.class_prefs", "providers.chat.ranking_source", "providers.chat.ranking_every_s",
                        "providers.chat.ranking_key_file", "providers.chat.served_every_s", "providers.chat.served_idle_s"}
-HOST_WIDE_KEYS = {"checks.host_max", "route.host_max", "chat.max_inflight", "checks.spill_hosts", "checks.no_spill_hosts", "checks.slurm_overflow", "checks.dirty_max_mb", "checks.io_full_max",
+HOST_WIDE_KEYS = {"checks.host_max", "route.host_max", "chat.max_inflight", "checks.spill_hosts", "checks.no_spill_hosts", "checks.dirty_max_mb", "checks.io_full_max",
                   "checks.push_priority_wait_s"}
 
 

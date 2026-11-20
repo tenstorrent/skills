@@ -166,7 +166,7 @@ def real_home_env() -> list[str]:
 def _ssh(host: str, script: str, direct: bool = False, compress: bool = False) -> list[str]:
     # The login shell parses the command line: hand it one quoted word for sh, whatever that shell is.
     # compress: the tree copy (a plain tar, about 3x smaller compressed) on a slow link.
-    # Every caller (checkspill's probe, slurmcheck) takes this argv, so each ssh runs under the real HOME.
+    # Every caller (checkspill's probe) takes this argv, so each ssh runs under the real HOME.
     return [*real_home_env(), *SSH, *(DIRECT if direct else []), *(["-o", "Compression=yes"] if compress else []),
             host, f"sh -c {shlex.quote(script)}"]
 

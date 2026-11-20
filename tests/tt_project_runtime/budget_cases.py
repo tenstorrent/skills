@@ -2367,19 +2367,16 @@ def test_a_workers_context_re_reads_are_metered_per_run_and_kept_when_it_finishe
     turn(2, 1_000_000)
     d.meter_running()
     assert p.db.one("SELECT cache_read_tokens FROM runs WHERE id=?", (rid,))["cache_read_tokens"] == 2_500_000
-    assert not (run_dir / "steer.md").exists(), "a worker is never told to end its run for its re-reads"
     stale = p.db.one("SELECT * FROM runs WHERE id=?", (rid,))
     for n in (3, 4, 5):
         turn(n, 1_000_000 if n < 5 else 2_000_000)
         d._metered.clear()
         d.meter_running()
     assert p.db.one("SELECT cache_read_tokens FROM runs WHERE id=?", (rid,))["cache_read_tokens"] == 6_500_000
-    assert not (run_dir / "steer.md").exists()
     (run_dir / "result.json").write_text(json.dumps({"status": "done", "summary": "all of it"}))
     d.finish_run(stale, {"rc": 0})
-    row = p.db.one("SELECT note, cache_read_tokens FROM runs WHERE id=?", (rid,))
+    row = p.db.one("SELECT cache_read_tokens FROM runs WHERE id=?", (rid,))
     assert row["cache_read_tokens"] == 6_500_000
-    assert "split" not in json.loads(row["note"] or "{}")
 
 
 def test_ttp_stats_reports_reread_tokens_per_run_and_per_dollar_by_kind_and_tier(env, capsys):
@@ -2416,8 +2413,6 @@ def test_ttp_stats_reports_reread_tokens_per_run_and_per_dollar_by_kind_and_tier
     assert cli_rc is None and "Context re-reads, last 7 days: 4 runs, $9.10, 12.52 M cache-read tokens" in out
     assert "worker/code/deep/max: 2 runs, $8.00, 12.00 M (6.00 M per run, median 6.00 M, max 9.00 M)" in out
     assert "big code change" in out
-    assert "Split steer" not in out
-    assert "steered" not in s and "Split steer" not in bud.reread_text(s)
 
 
 def test_ttp_stats_leaves_runs_with_no_model_call_out_of_per_run_averages(env, capsys):

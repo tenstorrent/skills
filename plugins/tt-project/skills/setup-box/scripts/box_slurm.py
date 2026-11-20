@@ -489,7 +489,7 @@ CASES_EOF = "TTP_CASES_EOF"
 
 
 def _verdict_mod():
-    """runtime/ttp/slurmverdict.py, shared with the runtime's Slurm check spill, loaded by path."""
+    """runtime/ttp/slurmverdict.py, loaded by path."""
     import importlib.util
     import pathlib
     path = pathlib.Path(__file__).resolve().parents[3] / "runtime" / "ttp" / "slurmverdict.py"

@@ -91,14 +91,14 @@ def test_a_reading_task_still_holds_an_unlanded_or_dirty_worktree(env, monkeypat
 
 
 def test_may_work_in_reads_the_dependent_kind_and_spec(env):
-    p = make(env)
+    make(env)
     from ttp import worktree
     task = {"id": 7, "branch": "ttp/t7-x"}
     row = lambda **kw: {"id": 8, "status": "queued", "depends_on": "[7]", "labels": None, "spec": "s", **kw}  # noqa: E731
-    assert worktree.may_work_in(p, task, row(kind="code"))
-    assert worktree.may_work_in(p, task, row(kind="review"))
-    assert worktree.may_work_in(p, task, row())   # a row without its kind is read as one that may
-    assert not worktree.may_work_in(p, task, row(kind="work"))
-    assert not worktree.may_work_in(p, task, row(kind="question", spec="see worktrees/t70"))
-    assert worktree.may_work_in(p, task, row(kind="question", spec="cd worktrees/t7 && ls"))
-    assert worktree.may_work_in(p, task, row(kind="work", labels='["continues:7"]'))
+    assert worktree.may_work_in(task, row(kind="code"))
+    assert worktree.may_work_in(task, row(kind="review"))
+    assert worktree.may_work_in(task, row())   # a row without its kind is read as one that may
+    assert not worktree.may_work_in(task, row(kind="work"))
+    assert not worktree.may_work_in(task, row(kind="question", spec="see worktrees/t70"))
+    assert worktree.may_work_in(task, row(kind="question", spec="cd worktrees/t7 && ls"))
+    assert worktree.may_work_in(task, row(kind="work", labels='["continues:7"]'))
