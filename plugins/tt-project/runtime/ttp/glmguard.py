@@ -227,6 +227,8 @@ REFUSALS = "glm_refusals.jsonl"   # in the run folder: one {ts, rule, class, why
 REFUSAL_KEY = "glm_refusals"      # route.glm_refusals: {"hand_back_after": 3, "redirect": true}
 HAND_BACK_AFTER = 3
 _OUTSIDE = "outside its worktree"
+_OWN_TREE = ("change only files in your worktree and `$TMPDIR`, and say in your hand-off "
+             "what else should change")
 RULES = (
     ("db_read", REDIRECTED, r"database or machine records by hand",
      "open the project's database or machine records (sqlite or any other tool)",
@@ -237,10 +239,8 @@ RULES = (
     ("scratch", REDIRECTED, _OUTSIDE, "write to a literal `/tmp/...` path or create files outside your worktree",
      'write scratch files under `"$TMPDIR"` (a folder of your own) or in your worktree'),
     ("records", HARMFUL, None, "write in a project's `state/` folder, another task's worktree or another project, or "
-     "delete or overwrite a file outside your worktree and `$TMPDIR`",
-     "change only files in your worktree and `$TMPDIR`, and say in your hand-off what else should change"),
-    ("delete", HARMFUL, None, None, "change only files in your worktree and `$TMPDIR`, and say in your hand-off what "
-     "else should change"),
+     "delete or overwrite a file outside your worktree and `$TMPDIR`", _OWN_TREE),
+    ("delete", HARMFUL, None, None, _OWN_TREE),
     ("outward", HARMFUL, r"`ttp (?:notify|say|ask|note)\b", "post outward (`ttp notify`, `ttp say`, "
      "`ask`, `ttp note --to`/`--reply`)", 'put what a person should read in your hand-off summary; a plain `ttp note "<text>"` '
      "goes to your task's own log"),
@@ -305,13 +305,13 @@ def refusal_settings(cfg: dict | None = None) -> dict:
     return {"redirect": g.get("redirect") is not False, "hand_back_after": n}
 
 
-def refusals(run_dir) -> list[dict]:
-    """The refusals a run recorded (REFUSALS), oldest first."""
-    out = []
+def _jsonl_rows(run_dir, name) -> list[dict]:
+    """The dicts a run recorded in its `name` jsonl, oldest first; unparsable lines are skipped."""
     try:
-        lines = (Path(run_dir) / REFUSALS).read_text(errors="replace").splitlines() if run_dir else []
+        lines = (Path(run_dir) / name).read_text(errors="replace").splitlines() if run_dir else []
     except OSError:
-        return out
+        return []
+    out = []
     for ln in lines:
         try:
             r = json.loads(ln)
@@ -320,6 +320,11 @@ def refusals(run_dir) -> list[dict]:
         if isinstance(r, dict):
             out.append(r)
     return out
+
+
+def refusals(run_dir) -> list[dict]:
+    """The refusals a run recorded (REFUSALS), oldest first."""
+    return _jsonl_rows(run_dir, REFUSALS)
 
 
 def refused(run_dir, why: str, kind: str = "guard", cfg: dict | None = None) -> tuple[bool, str]:
@@ -749,19 +754,7 @@ def drafted(run_dir, d: dict) -> str:
 
 def drafts(run_dir) -> list[dict]:
     """The drafts a run recorded."""
-    try:
-        lines = (Path(run_dir) / DRAFTS).read_text(errors="replace").splitlines()
-    except OSError:
-        return []
-    out = []
-    for ln in lines:
-        try:
-            d = json.loads(ln)
-        except ValueError:
-            continue
-        if isinstance(d, dict):
-            out.append(d)
-    return out
+    return _jsonl_rows(run_dir, DRAFTS)
 
 
 def is_gate(cmd: str, gates=(), env=None) -> bool:
