@@ -239,7 +239,7 @@ def _near(a: frozenset, b: frozenset) -> bool:
     return len(a & b) >= REPEAT_J * len(a | b)
 
 
-def _evidence(said: frozenset, prior: tuple, anc: frozenset, df: Counter) -> int:
+def _repeat_evidence(said: frozenset, prior: tuple, anc: frozenset, df: Counter) -> int:
     """How strongly a clause with words `said` and anchors `anc` repeats the earlier clause `prior` (by_anchor's
     row): a clause of only anchors counts the anchors it shares; else the words it shares that are not common
     talk (df) plus the task and key anchors it shares, less one when no such anchor is shared (a model or
@@ -302,7 +302,7 @@ def repeats(db: DB, msgs: list[dict], now: float | None = None) -> dict[int, tup
             cands = sorted({c for a in anc for c in by_anchor.get(a, ())},
                            key=lambda c: (c[0], c[3]))   # oldest first
             hit = next((c for c in cands if len(said & c[2]) >= ANCHOR_SHARE * len(said) and ts - c[1] > RESEND_S
-                        and _evidence(said, c, anc, df) >= ANCHOR_MIN), None)
+                        and _repeat_evidence(said, c, anc, df) >= ANCHOR_MIN), None)
             if hit:
                 out[mid] = (hit[0], hit[3])
                 break
