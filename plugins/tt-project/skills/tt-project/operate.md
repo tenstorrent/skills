@@ -139,7 +139,8 @@ about every 15 s until the box is free (`--timeout` bounds it, `--also <alias>` 
 - A new start on a held box waits rather than failing: `ttp lock` looks again about every 15 s until
   the quiet window passes (past `--timeout`, or half the run's stall limit, it exits 75 and the task
   hands back `waiting` on `ttp lock --probe`); a local `ttp detach` job starts at once and waits
-  inside the job, its log saying why (`--remote` on a held box is still not started); checks spill
+  inside the job, its log saying why (`--remote` on a held box is still not started; `--step none`
+  marks a job that touches no box, a build or a CPU test run, which never waits); checks spill
   to another allowed host whose box is free, else wait; Terminal-Bench trials and harness A/B cells
   wait before each start. A source that cannot tell counts as held, and the wait line says so.
 - Jobs already running on this host while a stream holds it are lowered, never killed or stopped:

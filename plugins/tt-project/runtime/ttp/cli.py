@@ -11019,6 +11019,8 @@ def _detach_occupied(a, rhost: str | None) -> list[str]:
     occupancy.WHERE = Project(os.environ["TTP_PROJECT"]) if os.environ.get("TTP_PROJECT") else None
     locks = [r for v in (getattr(a, "lock", None) or []) for r in str(v).split(",") if r]
     step = getattr(a, "step", None) or "test"
+    if step == "none":   # touches no box: no stream can hold it
+        return []
     if a.remote:
         if why := occupancy.blocks_any([a.remote, *locks], step):
             from . import cyclenotice
@@ -17107,8 +17109,9 @@ def main(argv: list[str] | None = None) -> None:
                    help="repeatable (or A,B): the job runs its command under one `ttp lock` of them all, so it takes "
                    "them all or nothing by ttp lock's rules before the command starts and holds them until it ends "
                    "(its .rc) or its processes are gone; a paused one exits 75 at once and starts nothing")
-    s.add_argument("--step", choices=("deploy", "restart", "test", "bench", "warmup", "health", "reset"), default=None,
-                   help="what the job does on its box (default test): checked against `ttp occupancy` before it starts")
+    s.add_argument("--step", choices=("deploy", "restart", "test", "bench", "warmup", "health", "reset", "none"),
+                   default=None, help="what the job does on its box (default test): checked against `ttp occupancy` "
+                   "before it starts; none: the job touches no box (a build, a CPU test run) and never waits for one")
     s.add_argument("--reap", metavar="NAME|RC",
                    help="close the record of a job that is over now, as the daemon does each minute: ended "
                    "with its exit code, or died when gone without one; refuses (exit 1) while it runs; idempotent")
