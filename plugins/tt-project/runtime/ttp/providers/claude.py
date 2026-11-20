@@ -179,6 +179,7 @@ class Claude(Provider):
     resume_new_prompt = "reread"   # --system-prompt-file and --json-schema are per run, --resume or not
     session_format = "claude-code"   # projects/<cwd slug>/<id>.jsonl (fork_session); the chat provider's too
     tool_hooks = True
+    subagent_model_env = "CLAUDE_CODE_SUBAGENT_MODEL"
     fence_optional = True   # the Bash sandbox (fence_args)
 
     def coord_tool_set(self, cwd):

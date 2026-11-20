@@ -14874,6 +14874,30 @@ def test_network_outage_ignores_neutral_holds_and_honours_off_and_self_heal(env,
 
 
 
+def test_a_model_pinned_task_pins_its_subagents_unless_set_explicitly(env, monkeypatch):
+    from ttp.daemon import Daemon
+    from ttp.providers.claude import Claude
+    from ttp.providers.fake import Fake
+    assert Claude.subagent_model_env == "CLAUDE_CODE_SUBAGENT_MODEL"
+    var = Fake.subagent_model_env
+    monkeypatch.delenv(var, raising=False)
+    p = make(env)
+    pinned = p.db.add_task("pinned", "s", kind="work", tier="light", origin="user", provider="fake",
+                           model="pinned-model-1")
+    plain = p.db.add_task("plain", "s", kind="work", tier="light", origin="user", provider="fake")
+    d = Daemon(p.base)
+
+    def run_env(task_id):
+        rid = d.start_run("worker", "go", "fake", "light", str(p.root), task=p.db.task(task_id))
+        (p.runs / str(rid) / "STOP").touch()
+        return json.loads((p.runs / str(rid) / "run.json").read_text())["env"]
+
+    assert run_env(pinned)[var] == "pinned-model-1"
+    assert var not in run_env(plain)
+    monkeypatch.setenv(var, "explicit-model")   # set explicitly where the daemon runs: it wins
+    assert var not in run_env(pinned)
+
+
 def test_a_task_pinned_to_a_codex_model_and_effort_runs_on_them_and_keeps_the_pin(env, monkeypatch):
     """A task's own model and effort win over its provider's tier, are recorded with the run, and
     survive a restart; an unpinned task keeps its tier's defaults."""

@@ -599,6 +599,10 @@ class Provider:
         optional fence; a missing dependency or a mode without a sandbox (write_fence) leaves it off."""
         return not self.write_fence(restrictions) and (on or not self.fence_optional)
 
+    # The environment variable that sets the model the agent's own subagents run ("": it has none). A task
+    # pinned to a model pins its subagents through it, unless that variable is already set explicitly.
+    subagent_model_env = ""
+
     def compact_env(self, tokens: int) -> dict[str, str]:
         """Environment that makes the agent compact its context near `tokens`; {} when it has no
         such switch or `tokens` is 0."""

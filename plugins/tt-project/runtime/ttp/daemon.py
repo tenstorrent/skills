@@ -3859,6 +3859,8 @@ class Daemon:
                                read_only=read_only, schema=schema, restrictions=restrictions,
                                disallowed_tools=denied, denied_reads=no_reads,
                                web=True)   # every kind, reviews too; no_internet still wins
+        if pin.get("model") and (var := prov.subagent_model_env) and var not in env and var not in os.environ:
+            env = {**env, var: pin["model"]}   # a pinned task's subagents run its model; an explicit setting wins
         # The write fence counts only on the user's own word since runs went unsandboxed (sandboxstate): a
         # leftover true is ignored and told to the coordinator once, never rewritten in project.json.
         fence_on, fence_why, superseded = sandboxstate.fence(self.p, self.cfg, provider)

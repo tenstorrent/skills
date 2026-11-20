@@ -27,6 +27,7 @@ class Fake(Provider):
     coord_session = "agent"
     resume_new_prompt = "reread"
     efforts = ("minimal", "low", "medium", "high", "xhigh", "max")
+    subagent_model_env = "TTP_FAKE_SUBAGENT_MODEL"
 
     def credential_files(self) -> list[str]:
         return [f] if (f := os.environ.get("TTP_FAKE_CREDENTIALS")) else []
