@@ -42,6 +42,8 @@ import re
 import time
 from pathlib import Path
 
+from .coordtools import READ_COMMANDS
+
 ENV = "TTP_CODE_ARM_GUARD"
 MARK = "glm_guard.on"        # in the run folder: the daemon wrote it before launch
 HIT = "glm_guard.json"       # in the run folder: {"why", "ts"}; the runner stops the agent when it exists
@@ -61,8 +63,10 @@ TASK_WRITES = frozenset({"add", "cancel", "requeue", "restart", "set-when", "sup
 # `ttp note` flags that send a note on, or change a record beyond the run's own log: refused on the GLM arm.
 NOTE_ROUTES = ("--to", "--reply", "--urgent", "--severity", "--confirms", "--status")
 GH_READS = frozenset({"view", "list", "diff", "status", "checks"})
-READS = (("machines", "list"), ("machines", "show"), ("machines", "status"), ("machines", "activity"),
-         ("machines", "change", "list"), ("status",), ("occupancy",))   # read-only ttp queries, by word prefix
+# read-only ttp queries, by word prefix: the coordinator's reads (the `task` ones SUBS_ALLOWED covers, and the queue
+# listing, left out) and two more
+READS = tuple(r for r in READ_COMMANDS if "*" not in r and r != ("checks", "queue")) + (
+    ("machines", "change", "list"), ("occupancy",))
 PLAN_BOOKKEEPING = (("machines", "change", "add"), ("machines", "change", "edit"), ("obligation", "progress"),
                     ("occupancy",))
 REACH = frozenset({"ssh", "scp", "sftp", "mail", "mailx", "sendmail", "mutt", "nc", "ncat", "telnet", "sqlite3"})

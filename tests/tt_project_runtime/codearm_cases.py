@@ -359,7 +359,7 @@ def test_glm_guard_lets_a_glm_run_run_its_checks_in_every_form(argv, env, monkey
 
 
 _GG_READS = [
-    "ttp machines list", "ttp machines list --json", "ttp machines show x", "ttp machines status", "ttp machines activity",
+    "ttp machines list", "ttp machines list --json", "ttp machines status", "ttp machines activity",
     "ttp machines change list", "ttp machines change list x --all --json", "ttp machines outage", "ttp machines outage x",
     "ttp machines outage list", "ttp machines outage --json", "ttp status", "ttp status --json --verbose", "ttp occupancy",
     "ttp occupancy --list", "ttp task proj show 5", "ttp proj machines change list", "ttp machines change list 2>&1 | tail -5"]
@@ -367,9 +367,16 @@ _GG_WRITES = [
     "ttp machines change add x 'what' --undo true", "ttp machines change edit 3 --what y", "ttp machines change close 3",
     "ttp machines set x --tag a", "ttp machines add x", "ttp machines remove x", "ttp machines push", "ttp machines tag-note a 'text'",
     "ttp machines outage x 'why' --expires 1d", "ttp machines outage x --clear", "ttp machines outage x why", "ttp machines outage --by p",
-    "ttp machines outage --owner o x", "ttp machines outage --cl x", "ttp machines frobnicate", "ttp machines", "ttp machines change",
+    "ttp machines outage --owner o x", "ttp machines outage --cl x", "ttp machines frobnicate", "ttp machines show x", "ttp machines", "ttp machines change",
     "ttp machines change frobnicate", "ttp note --to p hi", "ttp notify hi", "ttp task add t s", "ttp task cancel 5",
     "ttp task requeue 5", "ttp obligation progress o1 x"]
+
+
+def test_glm_guard_reads_are_the_coordinators_reads_without_the_queue_listing():
+    from ttp import coordtools, glmguard
+    assert set(coordtools.READ_COMMANDS) - set(glmguard.READS) == {("task", "*", "show"), ("task", "*", "list"),
+                                                                    ("checks", "queue")}
+    assert set(glmguard.READS) - set(coordtools.READ_COMMANDS) == {("machines", "change", "list"), ("occupancy",)}
 
 
 @_pytest.mark.parametrize("cmd", _GG_READS)
