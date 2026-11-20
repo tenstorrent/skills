@@ -9,8 +9,7 @@ order, is your call.
 - **Another existing op or variant**: a different ttnn op, a fused variant already in ttnn, or a model-local
   kernel another model already uses.
 - **A model-local fusion**: a `ttnn.generic_op` kernel under the model directory for a chain of small ops,
-  intermediates round-tripping DRAM, or gaps inside a traced step. Gain = the chain's measured time minus the
-  fused floor.
+  intermediates round-tripping DRAM, or gaps inside a traced step.
 - **Changing tt-metal code outside the model** (an op's C++ or kernels, CCL setup, allocator or L1 defaults,
   trace and dispatch, fabric configuration) or **a new ttnn op**: only under `scope` `open` (`model-bringup`).
   Under `contained`, the first three are the options.
@@ -34,9 +33,8 @@ help tt-metal maintainers. Optional; keep it short.
 
 ## Changing tt-metal code (scope `open`)
 
-The model may keep its own version of the op or code; it does not go back to main. Run the op's existing tests where they
-still apply, and note in `model.json` `ops` that the model depends on a changed op. Concurrent rebuilds of one C++
-tree conflict.
+The model may keep its own version of the op or code; it does not go back to main. Run the op's existing tests
+where they still apply, and note in `model.json` `ops` that the model depends on a changed op.
 
 ## Check kernels against main
 

@@ -1,6 +1,6 @@
 /goal Use $vllm-integration, $agentic-serving, $benchmark-model, $reference-accuracy and $tt-device-usage for HF_MODEL.
 
-Subagents are authorized and recommended for independent work (adapter, prefix reuse, benchmark grid).
+Subagents are authorized.
 
 This goal serves the model from the lean model goal through vLLM, fast for agentic traffic, and measures the serving rates goal 12 plans from. The approach is yours; the outputs below are fixed.
 

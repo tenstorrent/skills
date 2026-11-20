@@ -5,115 +5,70 @@ description: Bring a Hugging Face model to a correct, fast TTNN full model on th
 
 # Lean model
 
-The outcome and its tests are fixed; the path is yours. What follows is what earlier bringups learned, the good
-and the bad, offered as defaults. Where your measurements say otherwise, follow them and write down why.
+The outcome and its gate are fixed; how to get there is yours. Below is what earlier bringups learned, good and
+bad. Use it where it fits this run.
 
-Load the references when you reach them, not up front: [ops and kernels](references/ops.md); for routed experts,
-[MoE](../ttnn-knowledge/topics/moe.md).
-
-## Knowledge
-
-What earlier bringups learned about TTNN, by topic, is in [`ttnn-knowledge`](../ttnn-knowledge/SKILL.md): memory,
-numerics, prefill and KV, tracing, multi-chip and CCL, fusion, MoE, performance and profiling, matmul and
-precision, serving and evals, reference code. Read a topic when the work reaches it. The generator and context
-contract the outcome refers to is defined in [full-model](../full-model/SKILL.md); its stage procedure does not apply
-here.
+Read when the work reaches them: [ops and kernels](references/ops.md); [MoE](../ttnn-knowledge/topics/moe.md) for
+routed experts; TTNN knowledge by topic in [`ttnn-knowledge`](../ttnn-knowledge/SKILL.md). The generator and
+context contract is defined in [full-model](../full-model/SKILL.md); its stage procedure does not apply here.
 
 ## Outcome
 
 - `models/autoports/<model>/tt/`: the full model and the `full-model` generator contract: chunked prefill,
   traced decode with on-device split sampling, paged KV, fixed slots, every batch in `batch_sizes`, the
   advertised context (or a hard physical limit with evidence).
-- The `reference-accuracy` suite with verdict match at full precision (the implementation is right). The served
-  precision may differ from HF by design; it is chosen on the reference tiers as a speed and accuracy tradeoff.
-- `doc/model/model.json` and `REPORT.md`: scope, started_at, budget and hours used, reset authorization, targets, floors, measured, precision, KV pool, ops added or
-  changed, tier commands, the perf ledger (change, before, after, tier result), hours and tokens spent, and
-  what was not done; for a mixture-of-experts model, `moe` with experts, top-k, layout, distinct experts per
-  step and decode against its floor at batch 1 and the largest batch.
+- The `reference-accuracy` suite with verdict match at full precision. The served precision may differ from HF
+  by design; it is chosen on the reference tiers.
+- `doc/model/model.json` and `REPORT.md`: scope, `started_at`, `budget_hours`, `hours_used`,
+  `reset_authorization`, targets and floors per batch, measured, precision, KV pool, tier commands, the perf
+  ledger (change, before, after, test result), ops added or changed, and what was not done. For a
+  mixture-of-experts model, `moe`: experts, top-k, layout, and distinct experts per step and decode against its
+  floor at batch 1 and the largest batch.
 
-## What tends to work
+## What earlier bringups learned
 
-- **Design for the target before the first kernel.** The parallel layout and how many cores each step uses
-  decide speed far more than tuning; a wrong structure is not recovered by leaf work. Derive per-batch targets
-  from a roofline (bytes and FLOPs per step against bandwidth and peak) and pick the layout that can reach them.
-  Similar models in tt-metal are worth reading while planning; anything reused from them is checked against the
-  reference rather than assumed to fit.
-- **Whole and thin before deep.** Get the whole model correct end to end early, at any speed. Then add what
-  changes the design: batching with fixed slots, chunked prefill, long context, paged KV, request state. Optimise
-  after those exist; work done before them is often redone.
-- **Measure from the first run, tune once correct.** Record each module's time against its floor from day one;
-  that ranks the work. Do not tune a module that is not yet correct; layout and parallel-structure choices are
-  design, not tuning, and are made in the plan.
-- **The reference decides numerics.** Build the CPU captures and corpus early, in the background. Every
-  precision or kernel change is judged on the reference tiers, not on a few prompts.
-- **Touch the end early.** Once the model is correct, drive it with a small request loop over the generator
-  (several users, mixed lengths, arrivals mid-decode) and a few eval questions. This is a smoke test, not the
-  vLLM adapter, which belongs to the serve goal. Hangs under real traffic, memory exhaustion and routing or state
-  bugs show up there long before unit tests catch them.
-
-A workable order: plan (no device) → correct skeleton at B1 → design-shaping features → speed and precision →
-hardening. Overlap them wherever the work is independent.
-
-## Heads-ups
-
-Things that have cost earlier bringups time. They are not requirements; use them where they apply.
-
-- Speed work tends to get crowded out by correctness and serving fixes. Keeping someone on the top perf item
-  once the model is correct has helped.
-- PCC close to 1 can still hide a small difference that flips a discrete choice (expert routing, top-k) later in
-  the model. Comparing batched against alone on generated tokens, not only PCC, has caught this.
-- A teacher-forced comparison on a few dozen positions cannot separate small top-1 differences; size it to the
-  decision.
-- Some bugs showed up only with real traffic: kernels compiling per request after warmup, host work per step,
-  allocations of different modules colliding, unusual prompt lengths (very short, at chunk edges).
-- Running several agents on one board without the `tt-device-usage` rules has hung boards and lost hosts.
-- Firmware differences between machines have looked like model bugs.
-- With several agents per machine, the device lock became the bottleneck; long jobs held it for hours.
-- Concurrent C++ rebuilds of one tree break each other, and the CPU reference can take much of the host's memory.
+- The parallel layout and how many cores each step uses decided speed more than later tuning did. A roofline
+  (bytes and FLOPs per step against bandwidth and peak) gave targets to plan the layout against.
+- Optimisation done before batching, chunked prefill, long context and paged KV existed was often redone.
+- Similar models in tt-metal helped planning; pieces reused from them sometimes did not fit and were caught only
+  against the reference.
+- A CPU reference built early, in the background, let precision and kernel changes be judged on it rather than on
+  a few prompts.
+- A small request loop over the generator (several users, mixed lengths, arrivals mid-decode) found bugs long
+  before unit tests did: hangs under real traffic, memory exhaustion, per-request compiles after warmup, host
+  work per step, colliding allocations, very short prompts and chunk edges.
+- Speed work got crowded out by correctness and serving fixes.
+- PCC close to 1 hid small differences that flipped routing or top-k later in the model; batched against alone
+  on generated tokens caught them. A teacher-forced comparison on a few dozen positions could not separate small
+  top-1 differences.
+- Devices: agents sharing a board without the `tt-device-usage` rules hung boards and lost hosts; firmware
+  differences between machines looked like model bugs; with several agents per machine the device lock became
+  the bottleneck; concurrent C++ rebuilds of one tree broke each other; the CPU reference can take much of the
+  host's memory.
 
 ## Tests
 
-| Tier | When | What |
-|---|---|---|
-| T0 | every change | the changed module against HF captures (default PCC ≥ 0.999 at bf16; a lower bar is written down with its reason) and its op unit tests |
-| T1 | every landing | full model B1: reference quick tier; a few greedy prompts; batched equals alone |
-| T2 | milestones | reference full and long tiers; every batch; longest context; perf against targets; the request-loop smoke |
-
-Keep T1 near ten minutes so it runs often. Every device run has a timeout. Never loosen a check or delete one
-to pass; a numerics change moves the baseline only after T2.
+Record in `model.json` `tiers` the commands for a per-change check (T0), a quick full-model check on every
+landing (T1), and a full check at milestones (T2: the reference full and long tiers, every batch, the longest
+context, perf against targets). What else goes in each is your call. Every device run has a timeout. Never
+loosen or delete a check to pass; a numerics change moves the baseline only after T2.
 
 ## Working in parallel
 
-One coordinator plans, briefs, lands and reports, and never blocks on a wait. A subagent gets one deliverable,
-the files it owns, the ones it must not touch, its device slot, its tests and how to report. Good units: the
-CPU reference, the op inventory, one module or layer kind each, the integration skeleton, later one perf hotspot
-each. The coordinator's review is the bottleneck, so a handful of live agents is usually the useful limit.
-Landing: cherry-pick onto head, run T1, announce the new head; agents rebase.
+One coordinator; subagents as you see fit, each with its own files, tests and device access. Every landing passes
+T1. Throwaway prototypes on side branches, judged by measurement, are welcome.
 
-Experiment where a measurement can decide. A share of the budget, which you choose and record, can go to
-throwaway prototypes on side branches (another layout, a fused op, a different parallel scheme), run side by side
-and judged only by measurement. Land the
-winner, drop the rest. Scope risky work as "measure and report before building", bugs as "root cause before fix".
+## Run settings
 
-## Starting point and scope
-
-Where to start is decided in the plan: how much to reuse from similar tt-metal models, or from an existing
-correct implementation of this model, and why. The one run setting that changes what you may do is `scope` in
-`inputs.json` (`model-bringup`): `contained` keeps every change inside the model folder and `bringup/`; `open` lets
-the model carry its own versions of ops and shared code. [ops](references/ops.md) lists the options under each.
-
-## Devices and budget
-
-Before the first device run, record in `model.json` `reset_authorization`: whether bounded resets and multi-chip
-health checks are authorized on the run's machines, as the run's brief or launcher says. If nobody has said, ask
-before the first device run, not at the first unclean exit. Every device job runs under a lock with a timeout, and after an unclean exit the board is reset and checked before the
-next job (`tt-device-usage`).
-
-`budget_hours` in `inputs.json` (default 24, wall clock) bounds the goal. Copy it and `started_at` (UTC) into
-`model.json` at startup, so the time left is known after compaction or a resume. The final T2, review and report
-fit inside the budget. A missed
-target is reported with its reason; it is not a reason to stop before the budget is spent. `hours_used` goes in
-`model.json` and the report.
-
-Commit summaries, not raw output, and when something took long to understand and is solved, add a few lines to
-`bringup/lessons.md` (`model-bringup`). One `stage-review`, at the end.
+- Where to start (a similar tt-metal model, an existing implementation of this one, or from scratch) is your
+  call; write down why.
+- `scope` in `inputs.json` (`model-bringup`): `contained` keeps every change inside the model folder and
+  `bringup/`; `open` lets the model carry its own versions of ops and shared code. [ops](references/ops.md) has
+  the options under each.
+- `budget_hours` in `inputs.json` (default 24, wall clock). Copy it and `started_at` (UTC) into `model.json` at
+  startup so the time left survives compaction and resumes. T2, the review and the report fit inside it. A missed
+  target is reported with its reason; it is not a reason to stop early.
+- `reset_authorization` goes in `model.json` before the first device run, from the run's brief; if nobody has
+  said, ask then. Device jobs follow `tt-device-usage`.
+- Commit summaries, not raw output. When something took long to understand and is solved, add a few lines to
+  `bringup/lessons.md` (`model-bringup`). One `stage-review`, at the end.
