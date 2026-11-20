@@ -224,24 +224,32 @@ def delete_target(argv: list[str]) -> tuple[str, str]:
     return f"{m.group(1)}/{m.group(2)}", m.group(3)
 
 
+def _default_branch(gh: str, repo: str) -> str:
+    try:
+        r = subprocess.run([gh, "api", f"repos/{repo}", "--jq", ".default_branch"], capture_output=True,
+                           timeout=GH_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return r.stdout.decode().strip() if r.returncode == 0 else ""
+
+
 def own_branch(gh: str, argv: list[str]) -> tuple[str, str]:
     """(why the workstation must not delete the branch `gh api -X DELETE` names, or "", its tip sha): read
     just before the delete, so the answer records the tip and the branch can be restored; never the repo's
     default branch."""
     repo, branch = delete_target(argv)
-    try:
-        info = subprocess.run([gh, "api", f"repos/{repo}", "--jq", ".default_branch"], capture_output=True,
-                              timeout=GH_TIMEOUT_S)
-        ref = subprocess.run([gh, "api", f"repos/{repo}/git/ref/heads/{branch}", "--jq", ".object.sha"],
-                             capture_output=True, timeout=GH_TIMEOUT_S)
-    except (OSError, subprocess.TimeoutExpired):
-        return "could not read the repo's default branch or the branch's tip before deleting it", ""
-    default, tip = info.stdout.decode().strip(), ref.stdout.decode().strip()
-    if info.returncode or not default:
+    default = _default_branch(gh, repo)
+    if not default:
         return "could not read the repo's default branch before deleting a branch", ""
     if branch == default:
         return f"`{branch}` is the repo's default branch and is never deleted", ""
-    if ref.returncode or not _SHA.fullmatch(tip):
+    try:
+        ref = subprocess.run([gh, "api", f"repos/{repo}/git/ref/heads/{branch}", "--jq", ".object.sha"],
+                             capture_output=True, timeout=GH_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired):
+        ref = None
+    tip = ref.stdout.decode().strip() if ref else ""
+    if not ref or ref.returncode or not _SHA.fullmatch(tip):
         return f"could not read `{branch}`'s tip before deleting it (is it there?)", ""
     return "", tip
 
@@ -498,15 +506,6 @@ def put(results, home=None) -> int:
 
 # --- the workstation --------------------------------------------------------------------------------
 
-def _default_branch(gh: str, repo: str) -> str:
-    try:
-        r = subprocess.run([gh, "api", f"repos/{repo}", "--jq", ".default_branch"], capture_output=True,
-                           timeout=GH_TIMEOUT_S)
-    except (OSError, subprocess.TimeoutExpired):
-        return ""
-    return r.stdout.decode().strip() if r.returncode == 0 else ""
-
-
 def publish_here(gh: str, argv: list[str], bundle: bytes) -> tuple[int, str]:
     """Push a `git-publish`'s commit to its branch with this computer's own login (gh as git's helper for
     github.com): in a scratch repo, fetch the bundle's prerequisites (commits the remote already has),
@@ -664,21 +663,6 @@ def publish(branch: str, cwd: str | None = None, home=None) -> int:
     return _queued(sent, data, repo, cwd, home, f"git push {branch} ({sha[:12]})")
 
 
-def _rows(f: Path) -> list[dict]:
-    try:
-        lines = f.read_text().splitlines()
-    except OSError:
-        return []
-    out = []
-    for x in lines:
-        try:
-            v = json.loads(x)
-        except ValueError:
-            continue
-        out.append(v) if isinstance(v, dict) else None
-    return out
-
-
 def retire(branch: str, cwd: str | None = None, home=None) -> int:
     """`ttp push --retire <branch>`: delete one of the project's own published branches through the
     workstation. Refused unless this project pushed it (a publish here, or its push records), its prefix is
@@ -689,8 +673,12 @@ def retire(branch: str, cwd: str | None = None, home=None) -> int:
     delete = ["api", "-X", "DELETE", f"repos/{repo}/git/refs/heads/{branch}"]
     if not why and (outbox(home) / f"{_key(repo, delete, b'')}.done").exists():
         return _queued(delete, b"", repo, cwd, home, f"gh api -X DELETE {branch}")   # already answered
-    published = [r for r in _rows(outbox(home) / PUBLISHED) if r.get("repo") == repo and r.get("branch") == branch
-                 and r.get("project") == _project(cwd)]
+    if why:
+        print(f"ttp push --retire: refused: {why}.", file=sys.stderr)
+        return 1
+    from .benchrun import json_lines
+    published = [r for r in json_lines(outbox(home) / PUBLISHED) if isinstance(r, dict) and r.get("repo") == repo
+                 and r.get("branch") == branch and r.get("project") == _project(cwd)]
     pushed = p is not None and any(
         (v := _load(f)) and v.get("outcome") == "pushed" and str(v.get("target") or "").endswith("/" + branch)
         for f in (p.state / "pushes").glob("*.json"))
@@ -700,9 +688,7 @@ def retire(branch: str, cwd: str | None = None, home=None) -> int:
     tasks = [] if p is None else [r["id"] for r in p.db.q(
         "SELECT id FROM tasks WHERE branch=? AND status NOT IN ('done','cancelled','failed') AND id!=?",
         (branch, os.environ.get("TTP_TASK") or -1))]
-    if why:
-        pass
-    elif not (published or pushed):
+    if not (published or pushed):
         why = f"no publish or push record shows this project pushed `{branch}`"
     elif f"branch refs/heads/{branch}" in worktrees:
         why = f"a worktree here has `{branch}` checked out"
