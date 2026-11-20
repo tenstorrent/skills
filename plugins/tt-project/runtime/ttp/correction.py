@@ -82,7 +82,9 @@ RESEND_S = 60   # the same words again this soon are one message delivered twice
 # Anchors: what makes a short instruction specific enough that its repeat is one ('yes go ahead' has
 # none). An anchored instruction repeats an earlier one sharing an anchor and at least half its content
 # words other than the anchors' own (ANCHOR_SHARE), and ANCHOR_MIN anchors or ANCHOR_MIN such words
-# ('Review #4151' after 'Push #4151' shares only the anchor: a new instruction), checked against
+# ('Review #4151' after 'Push #4151' shares only the anchor: a new instruction; a model or effort anchor
+# alone names no class, so it needs one more shared word: 'Opus keeps the reviews' is no repeat of
+# 'name Opus as a limitation, keep the review-only tasks'), checked against
 # at most REPEAT_NEAR earlier clauses per anchor.
 EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")
 _LEVEL = r"(minimal|low|medium|high|xhigh|max|extra[- ]high)"
@@ -286,7 +288,7 @@ def repeats(db: DB, msgs: list[dict], now: float | None = None) -> dict[int, tup
             cands = sorted({c for a in anc for c in by_anchor.get(a, ())},
                            key=lambda c: (c[0], c[3]))   # oldest first
             hit = next((c for c in cands if len(said & c[2]) >= ANCHOR_SHARE * len(said) and ts - c[1] > RESEND_S
-                        and max(len(said & c[2]), len(anc & c[4])) >= ANCHOR_MIN), None)
+                        and max(len(said & c[2]) - (not _specific(anc & c[4])), len(anc & c[4])) >= ANCHOR_MIN), None)
             if hit:
                 out[mid] = (hit[0], hit[3])
                 break

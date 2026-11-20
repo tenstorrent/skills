@@ -436,6 +436,7 @@ STACKS_MAX_BYTES = 1 << 20          # a longer one is moved to <name>.1 when the
 RESULT_FILE = "result.json"
 NOTIFY_FILE = "notify.jsonl"      # `ttp notify` lines a run left for the user (relay_worker_notifies)
 NOTIFIES_PER_RUN = 3
+NOTIFY_CHARS = 2000               # a worker alert's longest posted text (clip_notify); `ttp notify` warns past it
 ESCALATE_FILE = "escalate.jsonl"  # `ttp notify --severity high` lines a run wrote (relay_worker_escalations)
 ESCALATIONS_PER_RUN = 2
 ESCALATE_READ_MAX = 1 << 16       # bytes of ESCALATE_FILE read; lines past it count as nothing
@@ -7900,7 +7901,16 @@ class Daemon:
                 result, status=CHANGES_NEEDED if fix else "failed",
                 summary=f"Ponytail lane: {why}. {result.get('summary') or ''}"[:4000],
                 followups=fups + [{"title": f"Fix ponytail finding: {f}"[:200], "spec": f} for f in fix],
+                # Only the size rule failed it (no lane finding, no reviewer follow-up): see reviewreuse.judged.
+                **({reviewreuse.SIZE_ONLY_KEY: True} if fix and not fups and not ponytail.lane_problem(run_dir) else {}),
                 **{REVIEW_FAILURE_KEY: "substantive" if fix else "approval"})
+        if rstatus in ("done", "failed") and task["kind"] == "review" and own and ponytail.labelled(task) is not None \
+                and (notes := ponytail.findings(ponytail.read(run_dir) or {}, note=True)):
+            # Notes (small leftovers that can wait) never fail the change nor become fix tasks: one list on the hand-off.
+            result = dict(result, ponytail_notes=notes)
+            if rstatus == "done":
+                result["summary"] = (f"{result.get('summary') or ''}\n"
+                                     f"Ponytail follow-ups (not blocking): {'; '.join(notes)}")[:4000]
         if own and rstatus in HANDOFF_STATES and rstatus != "failed" and (
                 cred := _cred_changed(run_dir)):
             # The run's own transcript shows it changed a credential file (credwatch.classify, observed
@@ -10003,11 +10013,16 @@ class Daemon:
         if feed := self._review_feed(s, payload):   # marked with when it was read: a late start re-reads it
             spec += sched.wrap_feed(feed, time.time(), timefmt.home(self.p))
         with db.tx():   # the evidence is the state at enqueue: what changes during the run stays new
+            now = time.time()
+            start = sched.window_start(s, now, timefmt.home(self.p))   # one run per period, whoever queues it
+            if taken := sched.window_taken(db, s, start, held):
+                return taken
             tid = db.add_task(picked["title"] if picked else f"[{s['name']}] {s['description'][:120] or 'recurring task'}", spec,
                               kind=payload.get("kind", "work"), tier=payload.get("tier", "standard"),
                               priority=2 if force else int(payload.get("priority", 4)),
                               budget_usd=sched.run_budget(self.cfg, s, payload, spent),
                               origin="schedule", labels=[s["name"]])
+            sched.claim_window(db, s, start, tid)
             if evidence is not None:
                 sched.record_evidence(db, s["name"], tid, evidence)
             if picked:
@@ -20746,7 +20761,8 @@ class Daemon:
             log(self.p, f"review {task['id']}: kept review #{failed['id']}'s failed verdict on {sha[:12]}; no run")
             return True
         if not prior:
-            db.update_task(task["id"], labels=reviewreuse.with_head(labels, sha, key))
+            db.update_task(task["id"], labels=reviewreuse.with_payload(
+                reviewreuse.with_head(labels, sha, key), task["spec"]))
             return False
         with db.tx():
             text = reviewreuse.reuse(db, task, prior, sha, key)
@@ -23491,6 +23507,19 @@ def _release_unqueued(p: Project, task_id: int) -> None:
         log(p, f"task #{task_id}: posting its held worker notify now failed: {e}")
 
 
+def clip_notify(text: str, run_name: str) -> str:
+    """`text` on one line, at most NOTIFY_CHARS: a longer one is cut after its last whole sentence (else
+    at its last space) and names the run's notify file, which keeps the full text."""
+    text = " ".join(text.split())
+    if len(text) <= NOTIFY_CHARS:
+        return text
+    pointer = f" [cut: full text in run {run_name}, {NOTIFY_FILE}.sent]"
+    head = text[:NOTIFY_CHARS - len(pointer) + 1]
+    ends = [m.end() for m in re.finditer(r"[.!?](?= )", head)]
+    cut = head[:ends[-1]] if ends else head[:-1].rsplit(" ", 1)[0] if " " in head[:-1] else head[:-1]
+    return cut + pointer
+
+
 def relay_worker_notifies(p: Project, task: dict, run_dir: Path, handoff: dict | None = None) -> int:
     """Post the `ttp notify` lines a worker run left as alerts, the way the coordinator's `notify`
     action does: at most low or normal severity, the first NOTIFIES_PER_RUN, a text already sent in
@@ -23515,7 +23544,7 @@ def relay_worker_notifies(p: Project, task: dict, run_dir: Path, handoff: dict |
             n = json.loads(line)
         except ValueError:
             continue
-        body = " ".join(str(n.get("text") or "").split())[:2000] if isinstance(n, dict) else ""
+        body = clip_notify(str(n.get("text") or ""), run_dir.name) if isinstance(n, dict) else ""
         if not body:
             continue
         if sent >= NOTIFIES_PER_RUN:

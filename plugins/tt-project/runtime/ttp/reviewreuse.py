@@ -21,7 +21,9 @@ import json
 import re
 
 HEAD_LABEL = "review_head:"     # review_head:<40-hex sha>@<check set key>[+<target scope>]
+PAYLOAD_LABEL = "review_payload:"   # review_payload:<hash of the hand-off body it started on>, beside review_head
 FORCED_LABEL = "review_forced"  # a review task_add forced past an accepted one: it runs
+SIZE_ONLY_KEY = "size_only"     # a failed review's result: the ponytail size rule was its only finding
 SUMMARY_CHARS = 600
 _LABEL = re.compile(r"review_head:([0-9a-f]{40})@([0-9a-f]+(?:\+[0-9a-f]+)?)")
 # A commit id a spec quotes: a full one, or a short one named as a head, commit or sha.
@@ -97,6 +99,13 @@ def with_head(labels: list, sha: str, key: str) -> list:
     return [lb for lb in labels if not (isinstance(lb, str) and lb.startswith(HEAD_LABEL))] + [head_label(sha, key)]
 
 
+def with_payload(labels: list, spec: str) -> list:
+    """`labels` with the identity of the hand-off body (`spec`, whitespace-normalised) a review starts on,
+    replacing an earlier one. waste.py counts a re-review of a head only when this also matches."""
+    ident = hashlib.sha1(" ".join(str(spec or "").split()).encode()).hexdigest()[:16]
+    return [lb for lb in labels if not (isinstance(lb, str) and lb.startswith(PAYLOAD_LABEL))] + [PAYLOAD_LABEL + ident]
+
+
 def pushes(cfg: dict, labels: list | tuple = ()) -> bool:
     """Whether a review with `labels` (a code task's review: no labels) would deliver its head to the
     push branch: the project pushes to one and the review is not labelled review only."""
@@ -143,7 +152,8 @@ def accepted(db, sha: str, key: str, skip: int | None = None, p=None) -> dict | 
 def judged(db, sha: str, key: str, skip: int | None = None) -> dict | None:
     """The newest review that failed `sha` under check set `key` with a finding (a verdict, not a crash or
     a check, precheck or approval failure: reviewcap.unjudged), or None: a later review of the unchanged
-    head would only repeat it."""
+    head would only repeat it. A verdict whose only finding was the size rule does not stand once the code
+    task or a fix hand-off carries a `why this size:` line: that re-review runs."""
     from .reviewcap import unjudged
     if not sha:
         return None
@@ -152,10 +162,21 @@ def judged(db, sha: str, key: str, skip: int | None = None) -> dict | None:
         res = _result(r)
         if conflicted(res):
             continue   # its approval stood and only the push conflicted: no verdict to keep
+        if res.get(SIZE_ONLY_KEY) and _sized(db, r):
+            continue   # the reason the size rule asked for is there now: the head gets a fresh review
         if r["id"] != skip and not unjudged(r) and (res.get("followups") or res.get("status") == "changes_needed"
                                                      or res.get("reused_review")):
             return r
     return None
+
+
+def _sized(db, review: dict) -> bool:
+    """Whether a `why this size:` line is in the spec or hand-off of a code task `review` covers or of a
+    fix continuing one (reviewcap.change_codes)."""
+    from . import ponytail
+    from .reviewcap import change_codes
+    return any(ponytail.WHY.search(f"{t['spec'] or ''}\n{_result(t).get('summary') or ''}")
+               for t in change_codes(db, review))
 
 
 def conflicted(res: dict) -> bool:

@@ -609,3 +609,19 @@ def test_relink_fix_repoints_a_corrections_fix_to_any_task_with_its_reason(env, 
     assert rec["relinked"][0]["why"] == "linked to the probe by mistake"
     assert _cc_task(p, "relink-fix", "#10", str(wrong), "--why", "back again") == 0   # an open or done task
     assert [r["to"] for r in correction._records(p.db)[0]["relinked"]] == [f"#{real}", f"#{wrong}"]
+
+
+def test_a_plain_order_sharing_only_a_model_name_and_two_words_with_an_earlier_clause_is_no_repeat(env):
+    """An order saying 'Opus keeps the reviews' shares the model anchor and 'keep', 'review' with a long
+    earlier clause naming Opus: no repeat, so no likely correction to pair with an earlier one. Three shared
+    words or a task anchor still repeat."""
+    from ttp import correction
+    p = make(env)
+    now = time.time()
+    old = _cc_msg(p, "in", "user", "Name the test writer (Opus) as a limitation, and keep the 8 review-only "
+                                   "tasks named", now - 3 * 86400)
+    rows = lambda *ids: p.db.q(f"SELECT * FROM messages WHERE id IN ({','.join('?' * len(ids))})", ids)
+    order = _cc_msg(p, "in", "user", "Run the delete batches on GLM. Opus keeps the reviews.", now - 60)
+    assert correction.flag(p.db, p.config(), rows(order), now) == {}
+    again = _cc_msg(p, "in", "user", "Name the test writer, Opus; and keep it", now - 30)
+    assert correction.flag(p.db, p.config(), rows(again), now) == {again: f"repeats #{old}"}

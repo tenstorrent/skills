@@ -217,21 +217,27 @@ def unjudged(task: dict) -> bool:
     return load_result(task.get("result")).get("review_failure") in NO_FINDING
 
 
+def change_codes(db: DB, review: dict) -> list[dict]:
+    """The code tasks `review` depends on and their `continues:` stack both ways (a fix continues its code task)."""
+    todo = [i for i in dependency_ids(review) if isinstance(i, int)]
+    codes: dict[int, dict] = {}
+    while todo and len(codes) < MAX_LINEAGE:
+        i = todo.pop()
+        if i in codes or not (t := db.task(i)) or t["kind"] != "code":
+            continue
+        codes[i] = t
+        todo += [c for c in [continues_id(t)] if c is not None]
+        todo += [r["id"] for r in db.q("SELECT id FROM tasks WHERE kind='code' AND labels LIKE ?", (f'%"continues:{i}"%',))]
+    return list(codes.values())
+
+
 def change_fails(db: DB, review: dict, now: float | None = None) -> int:
     """How many reviews of `review`'s change failed with a finding (neither unjudged nor a carried verdict,
     reviewreuse.carry), itself included. The change is the code tasks it depends on and their
     `continues:` stack both ways (a fix continues its code task), so a round outside the review's own
     chain (a coordinator's fix or review, a sweep's review) still counts; reviews of other changes do not."""
     now = time.time() if now is None else now
-    todo = [i for i in dependency_ids(review) if isinstance(i, int)]
-    codes: set[int] = set()
-    while todo and len(codes) < MAX_LINEAGE:
-        i = todo.pop()
-        if i in codes or not (t := db.task(i)) or t["kind"] != "code":
-            continue
-        codes.add(i)
-        todo += [c for c in [continues_id(t)] if c is not None]
-        todo += [r["id"] for r in db.q("SELECT id FROM tasks WHERE kind='code' AND labels LIKE ?", (f'%"continues:{i}"%',))]
+    codes = {t["id"] for t in change_codes(db, review)}
     n = 1
     for r in db.q("SELECT * FROM tasks WHERE kind='review' AND status='failed' AND id!=? AND updated>?",
                   (review["id"], now - LOOKBACK_S)) if codes else []:

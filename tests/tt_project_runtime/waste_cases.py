@@ -43,10 +43,10 @@ def test_waste_ledger_counts_each_run_once_in_its_first_bucket(env):
     sched2 = _waste_task(p, "[daily-review] review", origin="schedule", created=now - 60)
     for t in (old, again, sched, sched2):
         _waste_run(p, t, 0.25, now)                                  # not duplicates
-    r1 = _waste_task(p, "Review #1", kind="review", labels=[f"auto_review:{good}", f"review_head:{sha}@ab"])
-    r2 = _waste_task(p, "Review #2", kind="review", labels=[f"continues:{r1}", f"review_head:{sha}@ab"])
+    r1 = _waste_task(p, "Review #1", kind="review", labels=[f"auto_review:{good}", f"review_head:{sha}@ab", "review_payload:p1"])
+    r2 = _waste_task(p, "Review #2", kind="review", labels=[f"continues:{r1}", f"review_head:{sha}@ab", "review_payload:p1"])
     r3 = _waste_task(p, "Review #3", kind="review", labels=[f"continues:{r2}", f"review_head:{'b' * 40}@ab"])
-    forced = _waste_task(p, "Review #4", kind="review", labels=[f"review_head:{sha}@ab", "review_forced"])
+    forced = _waste_task(p, "Review #4", kind="review", labels=[f"review_head:{sha}@ab", "review_payload:p1", "review_forced"])
     _waste_run(p, r1, 1.0, now)
     _waste_run(p, r2, 1.5, now)                                      # same head as r1: re-review
     _waste_run(p, r3, 2.5, now)                                      # third round
@@ -82,6 +82,26 @@ def test_waste_ledger_counts_each_run_once_in_its_first_bucket(env):
     rep = waste.report(p.db, now - 86400, now, p.config())
     assert rep["buckets"]["stand_in"]["runs"] == 20 and round(rep["buckets"]["stand_in"]["usd"], 2) == round(total - 3, 2)
     assert rep["buckets"]["over_runs"]["runs"] == 2                  # `many` ran before the move: still its own
+
+
+def test_rereview_waste_needs_the_same_head_and_the_same_payload(env):
+    from ttp import waste
+    p = make(env)
+    now = 1_000_000.0
+    head = f"review_head:{'a' * 40}@ab"
+    first = _waste_task(p, "Review A", kind="review", labels=[head, "review_payload:p1"])
+    same = _waste_task(p, "Review B", kind="review", labels=[head, "review_payload:p1"])
+    changed = _waste_task(p, "Review C", kind="review", labels=[head, "review_payload:p2"])
+    unknown = _waste_task(p, "Review D", kind="review", labels=[head])
+    for t in (first, same, changed, unknown):
+        _waste_run(p, t, 1.0, now)
+    rep = waste.report(p.db, now - 86400, now, {"review_rounds": 0, "max_runs": 0})
+    assert rep["buckets"]["rereview"]["tasks"] == [same]   # a changed payload is separate work; none recorded is unknown
+    # The review start records the payload identity next to the head, from the spec it starts on.
+    from ttp import reviewreuse
+    one = reviewreuse.with_payload([head], "the  body\n")
+    assert one[0] == head and reviewreuse.with_payload(one, "the body") == one
+    assert reviewreuse.with_payload(one, "another body") != one
 
 
 def test_waste_ledger_keeps_gross_cancelled_spend_and_shows_what_a_successor_kept_apart(env):

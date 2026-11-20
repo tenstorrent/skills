@@ -8,7 +8,8 @@ its own runs. Each run that ended in the window counts once, in the first bucket
   superseded     work on tasks later cancelled, superseded (task_superseded) or abandoned
   failed_task    work on tasks that failed
   duplicate      a task whose title an earlier task of the last 7 days already had (schedules aside)
-  rereview       a review of a head an earlier review already checked (same review_head label)
+  rereview       a review of a head an earlier review already checked (same review_head label and
+                 same hand-off body: review_payload label; a review without one is unknown, not waste)
   review_rounds  reviews past the `waste.review_rounds`th round of one change's chain
   crashed        crashed, stalled or timed-out runs (budget.wasted) on tasks that later finished
   over_runs      a task's runs past its `waste.max_runs`th
@@ -27,7 +28,7 @@ from __future__ import annotations
 import re
 
 from . import budget
-from .reviewreuse import FORCED_LABEL, HEAD_LABEL
+from .reviewreuse import FORCED_LABEL, HEAD_LABEL, PAYLOAD_LABEL
 from .util import task_labels
 
 BUCKETS = ("stand_in", "superseded", "failed_task", "duplicate", "rereview", "review_rounds", "crashed",
@@ -79,7 +80,7 @@ def _task_sets(db, cfg: dict) -> dict[str, set[int]]:
     kept = {r["task"] for r in db.q("SELECT task FROM task_superseded UNION "
                                     "SELECT task FROM task_class_fix WHERE fix_task IS NOT NULL OR sha != ''")}
     seen: dict[str, float] = {}
-    heads: set[str] = set()
+    heads: set[tuple[str, str]] = set()
     reviews: dict[int, list[str]] = {}
     for i in sorted(tasks):
         t = tasks[i]
@@ -95,10 +96,11 @@ def _task_sets(db, cfg: dict) -> dict[str, set[int]]:
         if t["kind"] == "review":
             reviews[i] = labels
             head = next((v for v in labels if v.startswith(HEAD_LABEL)), "")
-            if head and FORCED_LABEL not in labels:
-                if head in heads:
+            payload = next((v for v in labels if v.startswith(PAYLOAD_LABEL)), "")
+            if head and payload and FORCED_LABEL not in labels:
+                if (head, payload) in heads:
                     out["rereview"].add(i)
-                heads.add(head)
+                heads.add((head, payload))
     limit = int(cfg.get("review_rounds") or 0)
     for i, labels in reviews.items():
         depth, cur, walked = 1, labels, {i}

@@ -458,8 +458,12 @@ coordinator with that evidence.
 - Ponytail lane (`review.ponytail_lane`, on by default): a daemon-queued code review also runs a
   separate ponytail review (skill `tt-ponytail-review`) in a fresh-context subagent on
   `review.ponytail_model` (default `opus`), and writes its verdict to `ponytail.json` in the run dir.
-  The review counts as passed only when both verdicts pass. A finding that code should not exist fails
-  it, and so does a copied or vendored tree unless the spec has a `vendored: <user msg>` line. A model-free
+  The review counts as passed only when both verdicts pass. Each finding carries a `severity`: a `block`
+  finding (code that should not exist, a copied or vendored tree unless the spec has a `vendored: <user msg>`
+  line, the size rule) or one with no severity fails it; `note` findings (small leftovers that can wait)
+  never do, and are listed once on the review's hand-off instead of becoming fix tasks. A review that
+  failed only on the size rule stops standing for a re-review of the unchanged head once the code task's
+  spec or a fix hand-off carries a `why this size:` line. A model-free
   size gate counts added lines (`git diff --numstat`, binaries and `delivery.push_exclude_paths` left
   out): over `review.ponytail_land_lines` (400) before landing, or `review.ponytail_pr_lines` (200, for
   repos reached only by pull request, such as another team's tt-metal) before `gh pr create --draft`, a

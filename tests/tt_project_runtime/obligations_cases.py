@@ -311,6 +311,24 @@ def test_order_started_owner_retires_the_late_event(env, monkeypatch):
     assert raised((ob.ORDER_LATE_KIND,)) == []
 
 
+def test_order_owner_in_a_live_batch_run_is_started_and_late_once_that_run_is_gone(env, monkeypatch):
+    from ttp import batchrun, obligations as ob
+    p, d, now, tid, check, mid, raised = _order_setup(env, monkeypatch)
+    lead = p.db.add_task("lead", "s", kind="work", tier="light", origin="user")
+    p.db.update_task(lead, status="running")
+    t2 = p.db.add_task("other", "s", kind="work", tier="light", origin="user")
+    batchrun.record(p.db, p.db.task(lead), [p.db.task(tid), p.db.task(t2)], "ttp/t-lead", p.config())
+    ob.add_order(p, "build it", mid, [tid], action_class="read", now=now)
+    check(now + ob.ORDER_START_S + 60)
+    assert raised((ob.ORDER_LATE_KIND,)) == []
+    mid2 = p.db.post("in", "build the other thing", chat="c1")
+    p.db.x("UPDATE messages SET ts=? WHERE id=?", (now, mid2))
+    p.db.update_task(lead, status="done")   # the run is gone without having started the second owner
+    ob.add_order(p, "build the other thing", mid2, [t2], action_class="read", now=now)
+    check(now + ob.ORDER_START_S + 120)
+    assert [e["kind"] for e in raised((ob.ORDER_LATE_KIND,))] == [ob.ORDER_LATE_KIND]
+
+
 def test_claim_expect_probe_miss_raises_claim_failed_once(env, monkeypatch):
     from ttp import obligations as ob
     p, d, now, tid, check, mid, raised = _order_setup(env, monkeypatch)

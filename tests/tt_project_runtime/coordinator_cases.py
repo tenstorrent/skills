@@ -23851,6 +23851,7 @@ def test_a_review_of_a_head_already_failed_keeps_that_verdict_with_no_run_and_no
     d, started = _reuse_daemon(p, monkeypatch)
     first = _reuse_review(p, tid)
     d.dispatch()
+    assert any(lb.startswith(reviewreuse.PAYLOAD_LABEL) for lb in json.loads(p.db.task(first)["labels"]))
     p.db.update_task(first, status="failed", result=json.dumps(
         {"status": "changes_needed", "summary": "the loop never ends", "followups": [{"title": "fix", "spec": "x"}]}))
     again = _reuse_review(p, tid, "Review it again")

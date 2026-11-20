@@ -388,7 +388,6 @@ def record(state, usage, session_id: str, turn: dict, ok: bool, now: float, summ
     mode = turn.get("mode")
     st["last_why"] = str(turn.get("why") or "")
     ack = turn.get("digest") if ok and isinstance(turn.get("digest"), dict) else None
-    st.pop(DIGEST, None)   # a failed or unacknowledged wake: the next session wake sends it whole
     pending = st.pop("pending", None)   # this wake's memory_view hashes: sent once it ended ok
     st.pop("rerun", None)   # the failed resume's batch has run
     st.pop("fail_error", None)
@@ -405,6 +404,7 @@ def record(state, usage, session_id: str, turn: dict, ok: bool, now: float, summ
     if mode == "stateless":
         return st
     st = cachettl.session_ended(st, now)   # the next wake judges this one's 5m write on it
+    st.pop(DIGEST, None)   # a failed or unacknowledged wake: the next session wake sends it whole
     if ack:
         st[DIGEST] = ack
     before = int(as_float(st.get("context_tokens"), 0))

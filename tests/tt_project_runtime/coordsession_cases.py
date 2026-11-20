@@ -120,6 +120,16 @@ def test_coordsession_a_failed_resume_reruns_in_the_same_session_and_alerts_with
     assert cs.decide(cfg, _cs_state(), "k1", "m", "high", lambda s: False, 1700.0) == ("new", "session not saved")
 
 
+def test_a_stateless_wake_keeps_the_digest_ack_and_a_failed_session_wake_drops_it():
+    from ttp import coordsession as cs
+    turn = {"mode": "resume", "why": "continued", "key": "k1", "model": "m", "effort": "high", "provider": "fake"}
+    st = {cs.DIGEST: {"sections": {"a": ["h", "A"]}}, "id": "s1"}
+    kept = cs.record(st, None, "", {**turn, "mode": "stateless"}, True, 10.0)
+    assert kept[cs.DIGEST] == st[cs.DIGEST]
+    assert cs.DIGEST not in cs.record(st, None, "s1", turn, False, 11.0)
+    assert cs.record(st, None, "s1", {**turn, "digest": {"sections": {}}}, True, 12.0)[cs.DIGEST] == {"sections": {}}
+
+
 def test_coordsession_record_counts_wakes_and_context_of_its_session():
     from types import SimpleNamespace
     from ttp import coordsession as cs
@@ -1301,8 +1311,8 @@ def test_coordsession_only_an_ok_session_wake_keeps_its_digest_acknowledged():
     assert st[cs.DIGEST] == ack
     assert cs.DIGEST not in cs.record(st, use, "s1", turn, False, 2.0), "a failed wake acknowledges nothing"
     assert cs.DIGEST not in cs.record(st, use, "s1", {"mode": "resume", "why": "continued"}, True, 2.0)
-    assert cs.DIGEST not in cs.record(st, use, "s1", {"mode": "stateless", "why": "spend guard tripped"}, True, 2.0), \
-        "a stateless turn the session did not see: its next wake gets the whole digest"
+    assert cs.record(st, use, "s1", {"mode": "stateless", "why": "spend guard tripped"}, True, 2.0)[cs.DIGEST] == ack, \
+        "a stateless turn leaves the session's acknowledgement as it was"
     assert cs.DIGEST not in cs.fail(_cs_cfg(), st, 3.0)[0]
 
 

@@ -198,3 +198,74 @@ def test_an_unlabelled_review_of_an_oversized_code_change_enters_the_push_queue_
     t = _pony_pq_hand_off(env, s, {"verdict": "pass", "head": s.head},
                           summary="looks good\nwhy this size: one generated table")
     assert t["status"] == "pushing", t["result"]
+
+
+def _size_failed_review(env, p, monkeypatch, files, verdict):
+    """A code change over review.ponytail_land_lines whose lane review failed on `verdict`, labelled with its
+    head as the daemon does: (code task id, review id, head, check key)."""
+    from ttp import reviewreuse
+    monkeypatch.delenv("TTP_TEST_PONYTAIL")
+    p.set_config("review.ponytail_land_lines", 30)
+    tid, branch, _, (rev,) = _finish_code(env, p, "big", files)
+    head, key = _git_out(p.root, "rev-parse", branch).strip(), reviewreuse.check_key(p.config())
+    t = _lane_review(env, p, rev["id"], dict({"head": head, "findings": []}, **verdict))
+    assert t["status"] == "failed"
+    p.db.update_task(rev["id"], labels=reviewreuse.with_head(json.loads(t["labels"]), head, key))
+    return tid, rev["id"], head, key
+
+
+def test_a_size_only_failed_verdict_stands_until_a_why_this_size_line_is_given(env, monkeypatch):
+    """The size rule alone failed the review, so its fix task (decided by Daemon._code_change) rightly makes no
+    commit and adds `why this size:`. The head is unchanged, but the re-review must run (the lane included)."""
+    from ttp import reviewreuse
+    p = make(env)
+    tid, rev, head, key = _size_failed_review(env, p, monkeypatch, {"big.py": 45}, {"verdict": "pass"})
+    assert json.loads(p.db.task(rev)["result"])[reviewreuse.SIZE_ONLY_KEY] is True
+    assert reviewreuse.judged(p.db, head, key)["id"] == rev, "no reason given yet: the verdict stands"
+    (fix,) = p.db.q("SELECT * FROM tasks WHERE kind='code' AND origin='daemon'")
+    p.db.update_task(fix["id"], status="done", result=json.dumps(
+        {"status": "done", "summary": "no change needed\nwhy this size: one generated table"}))
+    assert reviewreuse.judged(p.db, head, key) is None, "the reason is there: the head gets a fresh review"
+    assert reviewreuse.judged(p.db, head, key, skip=0) is None
+
+
+def test_a_failed_verdict_with_another_finding_is_still_reused_on_an_unchanged_head(env, monkeypatch):
+    from ttp import reviewreuse
+    p = make(env)
+    tid, rev, head, key = _size_failed_review(
+        env, p, monkeypatch, {"big.py": 45}, {"verdict": "fail", "findings": ["helper.py should not exist"]})
+    assert reviewreuse.SIZE_ONLY_KEY not in json.loads(p.db.task(rev)["result"])
+    p.db.update_task(tid, spec="why this size: one generated table")
+    assert reviewreuse.judged(p.db, head, key)["id"] == rev, "a lane finding is not answered by a size reason"
+
+
+def test_the_lane_fails_on_a_block_finding_or_one_with_no_severity_and_passes_with_notes_only(env, monkeypatch):
+    from ttp import ponytail
+    monkeypatch.delenv("TTP_TEST_PONYTAIL")
+    p = make(env)
+    block = {"severity": "block", "text": "helper.py should not exist"}
+    note = {"severity": "note", "text": "one unused import"}
+    run = env["tmp"] / "lane-run"
+    run.mkdir()
+    for findings, ok in (([block], False), ([note, block], False), (["bare string"], False),
+                         ([{"text": "no severity"}], False), ([note], True), ([], True)):
+        (run / ponytail.FILE).write_text(json.dumps({"verdict": "pass", "head": "a" * 40, "findings": findings}))
+        assert (ponytail.lane_problem(run, "a" * 40) == "") is ok, findings
+    (run / ponytail.FILE).write_text(json.dumps({"verdict": "fail", "findings": []}))
+    assert ponytail.FAILED in ponytail.lane_problem(run)
+
+    _, branch, _, (rev,) = _finish_code(env, p, "lean", {"c.py": 5})
+    head = _git_out(p.root, "rev-parse", branch).strip()
+    t = _lane_review(env, p, rev["id"], {"verdict": "pass", "head": head, "findings": [note, {"severity": "note", "text": "x"}]})
+    assert t["status"] == "done", t["result"]
+    assert json.loads(t["result"])["ponytail_notes"] == ["one unused import", "x"]
+    assert "Ponytail follow-ups (not blocking): one unused import; x" in json.loads(t["result"])["summary"]
+    assert not p.db.q("SELECT * FROM tasks WHERE kind='code' AND origin='daemon'")
+
+    _, branch, _, (rev,) = _finish_code(env, p, "lean2", {"d.py": 5})
+    head = _git_out(p.root, "rev-parse", branch).strip()
+    t = _lane_review(env, p, rev["id"], {"verdict": "pass", "head": head, "findings": [note, block]})
+    assert t["status"] == "failed"
+    (fix,) = p.db.q("SELECT * FROM tasks WHERE kind='code' AND origin='daemon'")
+    assert "helper.py should not exist" in fix["spec"] and "unused import" not in fix["spec"]
+    assert json.loads(t["result"])["ponytail_notes"] == ["one unused import"]

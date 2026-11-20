@@ -1518,3 +1518,64 @@ def test_an_llm_schedules_slow_plan_step_finishes_and_one_past_its_cap_retries_l
     d._sched_runs["review"].done.wait(30)
     d.run_schedules()
     assert p.db.kv(dmod.SCHEDULE_LLM_RETRY_KEY) == {}   # a run that ended resets the backoff
+
+
+def _window_daemon(p, monkeypatch, barrier=None):
+    """Daemons on their own connections (as schedule runs have) for llm schedule `nightly`; `barrier` holds
+    each one after its open-run check, so both reach the enqueue together."""
+    import copy
+    from ttp import daemon as dmod, schedule as sched
+    sched.upsert(p.db, "nightly", "llm", "1d", at="04:30", payload={"skip_if_idle": False})
+    base = dmod.Daemon(p.base)
+    if barrier is not None:
+        monkeypatch.setattr(dmod.Daemon, "_schedule_precheck", lambda self, s, payload: barrier.wait(10) and "")
+
+    def host():
+        h = copy.copy(base)
+        h.p = copy.copy(p)
+        h.p._db = None
+        return h
+    return host, lambda: p.db.one("SELECT * FROM schedules WHERE name='nightly'")
+
+
+def _window_tasks(p):
+    return p.db.q("SELECT id, status FROM tasks WHERE origin='schedule' ORDER BY id")
+
+
+def test_two_concurrent_admits_of_one_schedule_window_queue_one_run(env, monkeypatch):
+    import threading
+    p = make(env)
+    host, row = _window_daemon(p, monkeypatch, threading.Barrier(2))
+    got, s = [], row()
+    threads = [threading.Thread(target=lambda: got.append(host()._schedule_llm(s, {"skip_if_idle": False})))
+               for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+    assert sorted(got) == ["queued", "skipped: previous run still open"], got
+    assert len(_window_tasks(p)) == 1
+
+
+def test_a_completed_window_is_not_run_again_and_a_failed_one_is_retried_and_the_next_window_admits(env, monkeypatch):
+    from ttp import schedule as sched
+    p = make(env)
+    host, row = _window_daemon(p, monkeypatch)
+    llm = lambda force=False: host()._schedule_llm(row(), {"skip_if_idle": False}, force=force)
+    assert llm() == "queued"
+    [first] = _window_tasks(p)
+    p.db.update_task(first["id"], status="done", result=json.dumps({"summary": "reviewed"}))
+    assert llm(force=True) == "skipped: this period already ran"   # the catch-up finds the window done
+    assert len(_window_tasks(p)) == 1
+    p.db.update_task(first["id"], status="done", result="{}")       # no receipt: incomplete, so retried
+    assert llm(force=True) == "queued"
+    second = _window_tasks(p)[-1]
+    p.db.update_task(second["id"], status="failed")                  # a failed run releases the window
+    assert llm() == "queued"
+    third = _window_tasks(p)[-1]
+    p.db.update_task(third["id"], status="done", result=json.dumps({"summary": "ok"}))
+    assert llm() == "skipped: this period already ran"
+    start = p.db.kv(sched.WINDOW_KEY + "nightly")["start"]          # the next window admits
+    p.db.set_kv(sched.WINDOW_KEY + "nightly", {"start": start - 86400, "task": third["id"]})
+    assert llm() == "queued"
+    assert len(_window_tasks(p)) == 4

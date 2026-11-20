@@ -374,7 +374,8 @@ def _built(bare: str, m, lit: str) -> bool:
 
 
 def _names(code: str, ctx) -> str | None:
-    """The protected path `code` names: as a path, or as the home folder joined with its parts."""
+    """The protected path `code` names: as a path, or as the home folder joined with its parts (a bare
+    identifier is no part: only quoted or slash-bound words are)."""
     for m in re.finditer(r"(?:~|\$\{?(?:HOME|XDG_CONFIG_HOME|GH_CONFIG_DIR)\}?|/)[^\s\"'`;,()\[\]{}<>|&]*", code):
         if m[0] not in ("~", "/") and (h := _hit(m[0], ctx)):
             return h
@@ -383,8 +384,8 @@ def _names(code: str, ctx) -> str | None:
             for r in ctx[2]:
                 rel = os.path.relpath(r, home)
                 parts = rel.split("/")
-                if not rel.startswith("..") and rel != "." and (
-                        rel in code or all(re.search(r"[\"'/]" + re.escape(p) + r"[\"'/]", code) for p in parts)):
+                if not rel.startswith("..") and rel != "." and ("/" in rel and rel in code or all(
+                        re.search(r"[\"'/]" + re.escape(p) + r"[\"'/]", code) for p in parts)):
                     return r
     return None
 

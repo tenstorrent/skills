@@ -23,6 +23,9 @@ earns it, and evidence that changed (a task moved, the user wrote) runs again. S
 also keeps its period owed while its previous run is open or its daily budget is used, and
 retries every half hour instead of a full period on.
 
+An llm schedule queues one run per period (window_taken, kv WINDOW_KEY, claimed in the enqueue's transaction), whether
+the scheduled trigger or the overdue catch-up queues it; a failed, cancelled or receipt-less run releases the period.
+
 An llm schedule may name a `precheck`: a shell command, run off the tick from the project root after
 the budget, open-run, debounce and idle gates (`precheck_timeout_s`, 120, capped like a command
 watcher's `timeout_s`; see over_caps). Exit 0 skips the trigger as "skipped: precheck: <its first output line>"; any other exit,
@@ -664,6 +667,39 @@ def debounce_gate(db: DB, name: str, payload: dict,
     if last.get("evidence") != digests["evidence"] or ended is None or not 0 <= now - ended < window:
         return "", digests, ""
     return f"skipped: last run done {(now - ended) / 3600:.1f} h ago on unchanged evidence", digests, ""
+
+
+WINDOW_KEY = "schedule_window:"   # kv per schedule: {"start", "task"}: the run admitted for its latest window
+
+
+def window_start(row: dict, now: float, home: str | None = None) -> float:
+    """The start of the period `now` falls in: its latest `at` slot, else the epoch-aligned multiple of
+    `every_s`. The scheduled enqueue and the overdue catch-up of one period share it."""
+    every = int(row.get("every_s") or 0)
+    if not every:
+        return now   # no period: every run is its own window
+    if row.get("at") and every >= 86400:
+        return next_run(every, row["at"], now - every, zone_of(row, home))
+    return now - now % every
+
+
+def window_taken(db: DB, row: dict, start: float, held: str = "skipped") -> str:
+    """Why an llm run of `row` must not be queued for the window starting `start`, or "": the run admitted
+    for it is still open, or ended done with a receipt. A failed, cancelled, crashed (no task) or
+    receipt-less run releases the window. Call inside the transaction that queues the run."""
+    got = db.kv(WINDOW_KEY + row["name"]) or {}
+    task = db.task(int(got["task"])) if isinstance(got, dict) and got.get("start") == start \
+        and str(got.get("task", "")).isdigit() else None
+    if task is None or task["status"] in ("failed", "cancelled"):
+        return ""
+    if task["status"] != "done":
+        return f"{held}: previous run still open"
+    from .selfreview import _summary
+    return "skipped: this period already ran" if _summary(task) else ""
+
+
+def claim_window(db: DB, row: dict, start: float, task_id: int) -> None:
+    db.set_kv(WINDOW_KEY + row["name"], {"start": start, "task": task_id})
 
 
 def record_evidence(db: DB, name: str, task_id: int, digests: dict) -> None:

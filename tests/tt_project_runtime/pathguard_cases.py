@@ -651,3 +651,19 @@ def test_pathguard_reads_commands_after_a_comment_line(cred_home):
     (w / "gen.sh").write_text("#!/bin/sh\n# make a key\nssh-keygen -q -N '' -f \"$HOME/.ssh/id_rsa\"\n")
     for cmd in ("bash gen.sh", "# a note\nssh-keygen -f ~/.ssh/id_rsa", "ssh host 'bash -s' < gen.sh"):
         assert pathguard_why(_pg_bash(cmd, w)), cmd
+
+
+PG_BARE = "import os, sys\nrecords = sys.argv[1:]\nhome = os.path.expanduser('~')\ngetattr(sys, 'exit')\n"
+
+
+def test_pathguard_a_variable_named_like_a_protected_folder_is_not_a_path(cred_home):
+    bin_ = cred_home.work / "bin"
+    bin_.mkdir()
+    cfg = {"guards": {"protected_paths": ["~/records"]}}
+    (bin_ / "tool.py").write_text(PG_BARE + "open(os.path.join(os.path.dirname(__file__), 'out.txt'), 'w')\n")
+    assert not pathguard_why(_pg_bash("python3 bin/tool.py --check", cred_home.work), cfg)
+    # the same script holding a real path under the folder is still refused, as is each way to name one
+    for i, hold in enumerate(["p = '%s/records/a'" % cred_home.home, "p = os.path.join(home, 'records', 'a')",
+                              "p = '~/records/a'", "p = '$HOME/records/a'", "p = os.path.join(home, 'records/a')"]):
+        (bin_ / f"tool{i}.py").write_text(PG_BARE + hold + "\nopen(p, 'w')\n")
+        assert pathguard_why(_pg_bash(f"python3 bin/tool{i}.py --check", cred_home.work), cfg), hold

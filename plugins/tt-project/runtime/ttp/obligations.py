@@ -2219,12 +2219,13 @@ def _order_line(o: dict) -> str:
 
 def _check_order(p, o: dict, now: float, raised: list[str]) -> bool:
     """An open order's start and due checks (after _kept found it not done). Returns whether `o` changed."""
-    from . import replan, timefmt
+    from . import batchrun, replan, timefmt
     pr, db, changed = o["promise"], p.db, False
     ids = _owner_ids(o)
     if pr.get("started") is None and ids:
         q = ",".join("?" * len(ids))
-        if db.one(f"SELECT id FROM runs WHERE task IN ({q}) LIMIT 1", ids):
+        # A batch member has no run of its own: the live batch run it is in is its run.
+        if db.one(f"SELECT id FROM runs WHERE task IN ({q}) LIMIT 1", ids) or batchrun.held(db) & set(map(int, ids)):
             pr["started"], changed = now, True
             _retire(db, now, "order started", prefix=f"obligation:{o['id']}:order:late")
     if pr.get("started") is None and now >= pr["start_by"] and pr.get("late") is None:

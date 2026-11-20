@@ -5,8 +5,8 @@
 A daemon-queued review of a code change (LABEL) also runs a separate ponytail review on a pinned model in a
 fresh context: is this the smallest change that solves the task, and should any of it exist? Its verdict
 goes, unedited, to FILE in the run dir. A labelled review hands off `done` only with a valid FILE
-(hook.handoff_problem), passes only when it says pass (lane_problem), and its own `ttp push` lands only
-then (push._resolve). A change over a size threshold (added lines, git numstat, binaries and
+(hook.handoff_problem), passes only when it says pass and has no blocking finding (lane_problem; a `note`
+finding never fails it), and its own `ttp push` lands only then (push._resolve). A change over a size threshold (added lines, git numstat, binaries and
 delivery.push_exclude_paths left out) also needs a reason, a WHY line or the code task's splitgate no_split
 hand-off (reason_text): review.ponytail_land_lines before landing (the push queue's approval measures each
 approved head again, Daemon._ponytail_approval), review.ponytail_pr_lines (stricter: repos reached only by
@@ -20,7 +20,7 @@ import subprocess
 from pathlib import Path
 
 LABEL = "ponytail_lane:"     # ponytail_lane:<added lines at queue time, empty when unknown>: the review runs the lane
-FILE = "ponytail.json"       # {"verdict": "pass"|"fail", "head": <sha>, "findings": [...], "thread": bool}
+FILE = "ponytail.json"       # {"verdict": "pass"|"fail", "head": <sha>, "findings": [{"severity", "text"}], "thread": bool}
 ENV = "TTP_PONYTAIL_LANE"    # 1: this run's hand-off needs FILE (hook.handoff_problem)
 FAILED = "the ponytail lane failed it"   # lane_problem's prefix for a valid fail verdict
 WHY = re.compile(r"(?im)^[ \t>*-]*why this size:[ \t]*\S")
@@ -92,7 +92,7 @@ def lane_problem(run_dir, head: str = "") -> str:
     verdict = str(v.get("verdict") or "").strip().lower()
     if verdict not in ("pass", "fail"):
         return f"{FILE} verdict {v.get('verdict')!r} is neither pass nor fail"
-    if verdict == "fail":
+    if findings(v) or verdict == "fail" and not findings(v, note=True):   # notes alone never fail the lane
         return f"{FAILED}: " + ("; ".join(findings(v)) or "no findings given")[:600]
     seen = str(v.get("head") or "")
     if head and not (seen and (head.startswith(seen) or seen.startswith(head)) and len(seen) >= 7):
@@ -100,9 +100,15 @@ def lane_problem(run_dir, head: str = "") -> str:
     return ""
 
 
-def findings(v: dict) -> list[str]:
-    f = v.get("findings")
-    return [str(x)[:300] for x in f if str(x).strip()] if isinstance(f, list) else []
+def findings(v: dict, note: bool = False) -> list[str]:
+    """The verdict's finding texts: the blocking ones (severity 'block', or none given: a bare string too),
+    or with `note` the 'note' ones (a small leftover that can wait), which never fail the lane."""
+    out = []
+    for x in v.get("findings") if isinstance(v.get("findings"), list) else []:
+        sev, text = (str(x.get("severity") or "").strip().lower(), x.get("text")) if isinstance(x, dict) else ("", x)
+        if str(text or "").strip() and (sev == "note") == note:
+            out.append(str(text)[:300])
+    return out
 
 
 def size_problem(cfg: dict, added: int | None, text: str, run_dir, head: str = "", pr: bool = False) -> str:
@@ -126,10 +132,12 @@ def spec_line(cfg: dict, added: int | None) -> str:
     model = _review(cfg).get("ponytail_model") or "opus"
     line = (f"Ponytail lane (review.ponytail_lane): beside correctness, run a separate ponytail review. Start one "
             f"fresh-context subagent pinned to model `{model}`, given only the change's spec and its diff, and "
-            f"have it apply skill `tt-ponytail-review`. It fails the change on any finding that code should not "
-            f"exist, and on a copied or vendored tree unless the spec has a line `vendored: <user msg>`. Write its "
+            f"have it apply skill `tt-ponytail-review`. It fails the change on any `block` finding (code that should "
+            f"not exist, a copied or vendored tree unless the spec has a line `vendored: <user msg>`); a `note` "
+            f"(a small leftover that can wait) does not. Write its "
             f"verdict unedited to `$TTP_RUN_DIR/{FILE}` as {{\"verdict\": \"pass\" or \"fail\", \"head\": "
-            f"\"<full sha reviewed>\", \"findings\": [...], \"thread\": true}} before any `ttp push` or push list; "
+            f"\"<full sha reviewed>\", \"findings\": [{{\"severity\": \"block\" or \"note\", \"text\": "
+            f"\"...\"}}], \"thread\": true}} before any `ttp push` or push list; "
             f"with no subagent tool, run the lane yourself last and set \"thread\": false. A fail fails this "
             f"review (its findings become the fix follow-ups); landing, the push queue and a draft PR's next "
             f"step need both verdicts to pass.")

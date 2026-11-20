@@ -3075,7 +3075,7 @@ def cmd_notify(a) -> None:
     High goes to the coordinator, not the user: it is synced to the run's escalation file, which the
     daemon reads while the run lives and again at its end (daemon.relay_worker_escalations). Critical
     stays the coordinator's."""
-    from .daemon import ESCALATE_FILE, ESCALATIONS_PER_RUN, NOTIFY_FILE
+    from .daemon import ESCALATE_FILE, ESCALATIONS_PER_RUN, NOTIFY_CHARS, NOTIFY_FILE
     run_dir = os.environ.get("TTP_RUN_DIR")
     if not run_dir:
         die("ttp notify only works inside a tt-project run")
@@ -3111,6 +3111,9 @@ def cmd_notify(a) -> None:
         return
     durable_append(Path(run_dir) / NOTIFY_FILE, json.dumps({"ts": time.time(), "severity": a.severity,
                                                            "text": text, **step}) + "\n")
+    if len(" ".join(text.split())) > NOTIFY_CHARS:
+        print(f"warning: this text is over {NOTIFY_CHARS} characters; the alert is cut after a whole sentence "
+              f"and points to the run's notify file. Send a shorter one")
     durable_append(Path(run_dir) / "progress.md", f"{timefmt.clock()} notify: {text[:200]}\n")
     if step:
         print("queued for the user as this task's one standing item for this step: sent when this run ends, "

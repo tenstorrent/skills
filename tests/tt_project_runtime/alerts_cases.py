@@ -3277,6 +3277,30 @@ def test_worker_low_and_normal_notify_are_unchanged_by_the_escalation_path(env, 
     assert not p.db.one("SELECT id FROM events WHERE fingerprint LIKE 'escalate:%'")
 
 
+def test_a_long_worker_notify_keeps_whole_sentences_and_names_where_the_full_text_is(env, monkeypatch, capsys):
+    """An alert over NOTIFY_CHARS ends after a whole sentence with a pointer to the run's notify file, and
+    `ttp notify` warns the worker; a short one is posted as written with no warning."""
+    from ttp import cli, daemon
+    p = make(env)
+    tid = p.db.add_task("probe", "spec", kind="work", tier="standard", origin="coordinator")
+    run_dir = _note_run(env, monkeypatch, p, task=str(tid))
+    sentence = "The build host needs the new driver before the next run can start. "
+    long_text = sentence * 60
+    cli.main(["notify", "--severity", "low", long_text])
+    assert f"over {daemon.NOTIFY_CHARS} characters" in capsys.readouterr().out
+    cli.main(["notify", "--severity", "low", "short news"])
+    assert "over" not in capsys.readouterr().out
+    assert daemon.relay_worker_notifies(p, p.db.task(tid), run_dir) == 2
+    texts = [r["text"] for r in p.db.q("SELECT text FROM messages WHERE direction='out' AND kind='alert'")]
+    cut = next(t for t in texts if "The build host" in t)
+    assert "[cut: full text in run " in cut and cut.endswith(".sent]")
+    body = cut.split(" [cut:")[0].removeprefix(f"#{tid} probe: ")
+    assert len(body) + len(" [cut: full text in run run-demo-1, notify.jsonl.sent]") <= daemon.NOTIFY_CHARS
+    assert body.endswith("start.") and len(body) % len(sentence.strip() + " ") == len(sentence.strip()), body[-80:]
+    assert daemon.clip_notify("one two three " * 400, "7").split(" [cut:")[0].split()[-1] in ("one", "two", "three")
+    assert daemon.clip_notify("a  b\nc", "7") == "a b c"
+
+
 def _held_notify_run(env, monkeypatch, p, title="sign in", status="blocked", sev="normal", kind="work",
                      priority=3, **extra):
     """A task whose run left one `ttp notify` and then handed off with `status` (plus `extra`); the run
