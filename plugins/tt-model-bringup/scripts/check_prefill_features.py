@@ -223,6 +223,16 @@ def check_burst(
             sink.append(f"prefill burst {label} TTFT ratio {ratio:.3f} exceeds {limit}; batched prefill did not deliver")
 
 
+def check_session_continuation(model_dir: Path, row: dict, critical: list[str]) -> None:
+    """A recurrent_state model reuses prefixes through session continuation, or proves its template cannot."""
+    for key in ("session_continuation", "template_breaks_extension"):
+        path = row.get(key)
+        if isinstance(path, str) and (model_dir / path).is_file():
+            return
+    critical.append("recurrent_state excludes vLLM prefix caching, not reuse: implement session continuation and name "
+                    "its evidence in the row's session_continuation (or prove template_breaks_extension)")
+
+
 def run(model_dir: Path, *, stage: str, require_burst: bool, ratio_max: float, mean_ratio_max: float) -> int:
     contract = load_json(model_dir / CONTRACT_PATH)
     if contract is None:
@@ -244,6 +254,8 @@ def run(model_dir: Path, *, stage: str, require_burst: bool, ratio_max: float, m
             served = load_json(model_dir / PREFIX_CACHE_PATH)
             if served is not None and served.get("status") == "pass":
                 critical.append(f"contract excludes prefix caching ({exclusion}) but the served check passed; fix the contract")
+            if exclusion == "recurrent_state":
+                check_session_continuation(model_dir, row, critical)
     elif row.get("status") == "plugin_owned":
         record = row.get("record")
         if not isinstance(record, str) or not (model_dir / record).is_file():

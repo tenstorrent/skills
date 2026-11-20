@@ -34,7 +34,8 @@ target tt-metal checkout.
 - The benchmark runtime is in `runtime/benchmark_stage`; in the pipeline Stage 11 runs no evals
   (`tasks: []`) and measures performance at each configured batch plus the serving-rate grid.
 - The `agentic-serving` skill, `scripts/check_agentic_serving.py` and the Stage 12 goal are
-  authored in this plugin.
+  authored in this plugin, as are the `reference-accuracy` skill, `scripts/check_reference_accuracy.py`
+  and goal 6b.
 - The standalone TTI release workflow, handoff guidance and artifact checker are in
   `skills/tti-release/`.
 

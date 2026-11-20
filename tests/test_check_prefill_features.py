@@ -176,6 +176,12 @@ def test_documented_exclusion_needs_no_prefix_cache_artifacts(tmp_path):
     write(model / 'doc/full_model/serving_contract.json',
           contract('not_supported', 'recurrent_state: GDN state is not recoverable from KV blocks'))
     result = run(model, '--stage', 'vllm')
+    assert result.returncode == 2 and 'session continuation' in result.stderr
+    row = contract('not_supported', 'recurrent_state: GDN state is not recoverable from KV blocks')
+    row['rows'][0]['session_continuation'] = 'readiness_vllm/session_continuation.json'
+    write(model / 'doc/full_model/serving_contract.json', row)
+    write(model / 'readiness_vllm/session_continuation.json', {'hit_fraction_of_ceiling': 0.95})
+    result = run(model, '--stage', 'vllm')
     assert result.returncode == 1, result.stderr
     assert 'prefill_burst' in result.stderr
     write(model / 'readiness_vllm/vllm_prefill_burst_benchmark.json', burst())

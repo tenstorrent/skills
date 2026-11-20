@@ -132,8 +132,9 @@ If layer-level decode evidence, reduced token-out evidence, or a prior optimized
 ## Anomalies
 
 A degenerate reply (stray or repeated tokens, collapse into a few characters, a token loop) is a precision
-or stack defect until shown otherwise, not a model answer. Goal 12 runs steps 1–5 on each anomaly and on a
-phase below its band, inside the phase's time. A phase below its band with no degenerate reply has nothing
+or stack defect until shown otherwise, not a model answer. Goal 12 runs steps 1–5 on each anomaly, on each
+failed task whose reference check says `implementation` (agentic-serving, Failure analysis; its CPU comparison
+replaces step 3's HF run), and on a phase below its band, inside the phase's time. A phase below its band with no degenerate reply has nothing
 to reproduce in step 2; its attempt is a precision check on its failed tasks: for each, the decisive call
 (GPQA: the answer; SWE: the call whose action first went wrong), teacher-forced at served and at full
 precision (top-1 agreement over the reply, probability of the chosen and of the correct continuation). Full

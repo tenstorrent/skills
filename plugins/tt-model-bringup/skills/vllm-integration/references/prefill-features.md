@@ -41,7 +41,11 @@ Declare `model_capabilities["supports_prefix_caching"] = True` only after the te
 Set `supports_prefix_caching` to `False` and record `status: not_supported` in `doc/full_model/serving_contract.json` only for one of these, and name it in the row's `reason`:
 
 - `block_output`: the model declares `output_tokens_per_step > 1`. The plugin rejects prefix caching with block output.
-- `recurrent_state`: the model carries recurrent or linear-attention state (Mamba, Gated DeltaNet, conv windows) that vLLM-owned KV blocks cannot rebuild at `start_pos`. A hit would resume with stale or zero state.
+- `recurrent_state`: the model carries recurrent or linear-attention state (Mamba, Gated DeltaNet, conv windows) that vLLM-owned KV blocks cannot rebuild at `start_pos`. A hit would resume with stale or zero state. Such a model still reuses prefixes through session continuation (below); the row names its evidence in `session_continuation`, or in `template_breaks_extension` the proof that the chat template does not resend earlier turns token for token.
+
+## Session continuation (recurrent_state)
+
+An agent resends its conversation each turn: the previous prompt, the reply and the tool output, token for token. Keep that in the generator, invisible to vLLM. On release, park the slot (its recurrent and convolution state, KV and token ids) instead of freeing it. On a new prefill whose prompt starts with all of a parked slot's tokens, take that slot and prefill only the suffix (`start_pos` = the parked length); a partial match cannot rewind recurrent state and falls back to a full prefill. Evict parked slots least recently used when admission needs their slots or pages. Prove it like a cache hit: continued output equals a full prefill of the same prompt (logits within the resume-check thresholds), and the stage-10 growing-context replay reports `hit_fraction_of_ceiling` (reused ÷ resent tokens) from the generator's own count, since vLLM's counters stay at 0.
 
 Any other reason is unfinished model work, and `check_serving_contract.py` rejects it.
 
@@ -153,7 +157,7 @@ Stage split: Stage 6 proves the multi-row contract (one call with mixed rows equ
 
 ## Evidence to leave
 
-For an excluded model (`block_output` or `recurrent_state`): the serving contract row naming the exclusion, and the batched-prefill evidence only. The resume check and the `prefix_cache` stage do not apply, and the gate reports their absence as advisory.
+For an excluded model (`block_output` or `recurrent_state`): the serving contract row naming the exclusion, and the batched-prefill evidence. The resume check and the `prefix_cache` stage do not apply, and the gate reports their absence as advisory. A `recurrent_state` row also names its `session_continuation` evidence (or `template_breaks_extension` proof); without either the gate is critical.
 
 - Serving contract rows for `supports_prefix_caching` and batched prefill with the artifact paths.
 - `readiness/prefill_resume_check.json` with controls, and the model-local sliding-window control when applicable.

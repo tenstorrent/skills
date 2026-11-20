@@ -1,4 +1,4 @@
-/goal Use $agentic-serving, $datatype-sweep and $tt-device-usage for HF_MODEL after the benchmark stage in the current tt-metal checkout.
+/goal Use $agentic-serving, $reference-accuracy, $datatype-sweep and $tt-device-usage for HF_MODEL after the benchmark stage in the current tt-metal checkout.
 
 Subagents are authorized when a selected skill requests or recommends them.
 
@@ -8,10 +8,11 @@ Goal completion requirements:
 - Phase 1: GPQA Diamond, 10 tasks, on main's harness, in stage hours 0 to phase1_hours (12). It passes when the score is within ok_band of its reference and measured wall time is at most explain_tolerance above the run replayed on doc/benchmark/serving_rates.json rates (skill's explained hours).
 - Phase 2 (agentic and extended modes): SWE-bench Verified, 10 tasks from the skill's fixed diverse list, same rule. It starts once phase 1 has passed, or is analysed with its fix attempts recorded, and at the latest at phase1_hours; it has the rest of stage_budget_hours.
 - A phase not passed when its time ends is a result: keep and report its score, interval, reference and analysis, "not passed yet" with the reason; never discard it or call it failing.
-- Each run's KV pool is the largest that fits in the memory measured free at launch, agents follow, both recorded; a smaller pool needs a reason.
+- Each run's KV pool is the largest that fits in the memory measured free at launch, agents follow, both recorded; a smaller pool needs a failed test at the larger one.
 - Before any eval run, a request's body, token counts and finish reason are read back from the server's response log.
-- Per-task analysis, inside the phase's time: every failed task has a cause and evidence. A degenerate reply (stray or repeated tokens, collapse into a few characters, loops) is an anomaly, not a model answer. No task fails on the output cap or a time limit unless its trajectory shows a loop or stall; a task cut off while progressing is rerun with a higher limit and that result counts. A rerun changes the score only for infrastructure failures or a limit-cut task that then finishes. A fetched solution is a failure; declared network use is allowed. No list is voided.
-- Every anomaly, and every phase below its band, has proof of an attempt to fix it: a short reproducible test, its result at the served precision and at full TT precision, and what was changed. When a precision change fixes it, the list is rerun at the fastest configuration that passes the test, with the configurations tried and their measured speeds recorded; a speed loss for accuracy is accepted.
+- Per-task analysis, inside the phase's time: every failed task has a cause and evidence. A degenerate reply (stray or repeated tokens, collapse, loops) is an anomaly, not a model answer. No task fails on the output cap or a time limit unless its trajectory shows a loop or stall; a task cut off while progressing is rerun with a higher limit and that result counts. A rerun changes the score only for infrastructure failures or a limit-cut task that then finishes. A fetched solution is a failure; declared network use is allowed. No list is voided.
+- Every other failed task is compared with HF on CPU at its decisive point, against solved tasks: model, implementation or inconclusive.
+- Each implementation verdict, anomaly and phase below its band gets a fix attempt: a short repro, its served and full TT precision results, what changed. If precision fixes it, the list reruns at the fastest passing config, configs and speeds recorded; a speed loss for accuracy is accepted.
 - Extended mode, after both phases pass: full-suite estimates, then per suite in extended_suites a list run projected within run_timeout_hours, same rules. Lists grow only here.
 - doc/agentic_evals/results.json as the skill's Outputs say.
 

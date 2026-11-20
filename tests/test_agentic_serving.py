@@ -97,7 +97,9 @@ def rates(lengths=(4096, 20000, 32768)):
 
 
 def scored_run(run_id='gpqa10', phase='phase1', suite='r1_gpqa_diamond', solved=7, n=10):
-    failures = [{'task': f'{suite}-{i}', 'cause': 'wrong', 'evidence': 'final answer B, key C'}
+    failures = [{'task': f'{suite}-{i}', 'cause': 'wrong', 'evidence': 'final answer B, key C',
+                 'reference': {'window': 'answer span + 4K', 'metrics': {'kl_p95': 0.04, 'top1': 0.97},
+                               'controls': 'solved tasks, kl_p95 0.03', 'verdict': 'model'}}
                 for i in range(n - solved)]
     return {'id': run_id, 'phase': phase, 'suite': suite,
             'tasks': {'rule': 'stratified by domain, fixed list', 'names': [f'{suite}-{i}' for i in range(n)]},
@@ -334,13 +336,15 @@ def small_pool_run():
     return run
 
 
-def test_pool_far_below_free_memory_is_reported_without_a_reason(tmp_path):
+def test_pool_far_below_free_memory_is_critical_without_a_failed_larger_test(tmp_path):
     run = small_pool_run()
     code, stderr = goal12(tmp_path, runs=[run])
-    assert code == 1 and 'below 50% of the 26.0 GB' in stderr and 'exceed the 32768-token pool' in stderr
+    assert code == 2 and 'below 50% of the 26.0 GB' in stderr and 'exceed the 32768-token pool' in stderr
     run['config']['server_size']['reason'] = 'measured: trace region needs the rest'
+    assert goal12(tmp_path, runs=[run])[0] == 2
+    run['config']['server_size']['pool_limit_evidence'] = 'doc/agentic_evals/pool_at_20gb_oom.log'
     code, stderr = goal12(tmp_path, runs=[run])
-    assert code == 1 and 'trace region' in stderr
+    assert code == 1 and 'below 50%' not in stderr
 
 
 def test_pool_at_half_of_free_memory_passes_and_agents_must_fit_it(tmp_path):
@@ -348,7 +352,7 @@ def test_pool_at_half_of_free_memory_passes_and_agents_must_fit_it(tmp_path):
     run['config']['server_size']['pool_gb'] = 13.0
     assert goal12(tmp_path, runs=[run]) == (0, '')
     run['config']['server_size']['pool_gb'] = 12.9
-    assert goal12(tmp_path, runs=[run])[0] == 1
+    assert goal12(tmp_path, runs=[run])[0] == 2
     run = scored_run()
     run['config']['server_size']['working_set_tokens'] = 60000
     code, stderr = goal12(tmp_path, runs=[run])
@@ -540,12 +544,32 @@ def test_benchmark_server_records_prefix_caching_instead_of_rejecting_it():
 
 
 
-def test_fixed_pool_budget_is_a_shortfall(tmp_path):
+def test_fixed_pool_budget_needs_a_failed_larger_test(tmp_path):
     data = evidence()
     data['ledger']['pool_sizing'] = 'fixed'
-    assert check(tmp_path, 'full-model', data)[0] == 1
-    data['ledger']['pool_sizing_reason'] = 'measured: adapter API has no free-DRAM query'
-    assert check(tmp_path, 'full-model', data)[0] == 1
+    assert check(tmp_path, 'full-model', data)[0] == 2
+    data['ledger']['pool_sizing_reason'] = 'retained for paired comparisons'
+    assert check(tmp_path, 'full-model', data)[0] == 2
+    data['ledger']['pool_limit_evidence'] = 'doc/full_model/pool_4m_tokens_oom.log'
+    assert check(tmp_path, 'full-model', data)[0] == 0
+
+
+def test_every_failed_task_needs_a_reference_check(tmp_path):
+    run = scored_run()
+    del run['failures'][0]['reference']
+    code, stderr = goal12(tmp_path, runs=[run])
+    assert code == 2 and 'needs a reference check' in stderr
+    run = scored_run()
+    run['failures'][0]['cause'] = 'infrastructure'
+    del run['failures'][0]['reference']
+    assert goal12(tmp_path, runs=[run])[0] == 0
+
+
+def test_an_implementation_verdict_needs_a_fix_attempt(tmp_path):
+    run = scored_run()
+    run['failures'][0]['reference']['verdict'] = 'implementation'
+    code, stderr = goal12(tmp_path, runs=[run])
+    assert code == 2 and 'no anomalies entry with a fix attempt' in stderr
 
 
 @pytest.mark.parametrize('stage, key', [

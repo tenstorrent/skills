@@ -75,12 +75,13 @@ def test_clean_package_runs_all_goals_without_codex_or_old_framework(installed):
     manifests = list(target.glob('bringup/artifacts/multigoal-runs/*/manifest.txt'))
     assert len(manifests) == 1
     manifest = runner.read_manifest(manifests[0])
-    assert manifest['stage_11_dry_run'] == 'true'
-    assert manifest['stage_11_check_script'].endswith('/11-benchmark.check.sh')
-    assert manifest['stage_12_check_script'].endswith('/12-agentic-evals.check.sh')
+    assert manifest['stage_12_dry_run'] == 'true'
+    assert manifest['stage_7_check_script'].endswith('/06b-reference-accuracy.check.sh')
+    assert manifest['stage_12_check_script'].endswith('/11-benchmark.check.sh')
+    assert manifest['stage_13_check_script'].endswith('/12-agentic-evals.check.sh')
     assert all('tti-release' not in p.read_text() for p in prompts)
     assert manifest['stage_6_check_script'].startswith(str(plugin))
-    assert len(list(manifests[0].parent.glob('*.prompt.txt'))) == 12
+    assert len(list(manifests[0].parent.glob('*.prompt.txt'))) == 13
     assert not (target / '.agents').exists()
 
 
@@ -142,7 +143,8 @@ def valid_serving_contract():
              'evidence': 'doc/full_model/logprobs.log'},
             {'item': 'supports_prefix_caching', 'kind': 'capability', 'status': 'not_supported',
              'declaration': 'documented default',
-             'reason': 'recurrent_state: the GDN state at start_pos is not recoverable from KV blocks'},
+             'reason': 'recurrent_state: the GDN state at start_pos is not recoverable from KV blocks',
+             'session_continuation': 'doc/full_model/logprobs.log'},
         ],
     }
 

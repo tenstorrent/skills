@@ -29,7 +29,10 @@ batch the device cannot hold and why; live users pad up to the next supported ba
 Weights, KV pool, per-request reserves and trace region share DRAM. From stage 06 keep `ledger`: per
 weight family its bytes and `copies` (a second copy needs a `copy_reason`), reserves against measured peak,
 KV bytes per token and `pool_tokens`. Make the pool the largest that fits in the free DRAM measured after weights, reserves and
-trace region (`pool_sizing: measured`); a fixed budget needs `pool_sizing_reason`. The pool should hold
+trace region (`pool_sizing: measured`), and test it once at `target_concurrency` growing to `working_set_tokens`;
+the generator reports that tested size to vLLM, not a constant. A smaller pool needs `pool_limit_evidence`: the
+failed test at the larger size. Estimate `working_set_tokens` from the evals' context lengths (SWE and Terminal
+reach ≥ 28K per agent), never by dividing an existing pool by the agent count. The pool should hold
 `target_concurrency × working_set_tokens`, or record `pool_shortfall_reason`. For hybrid models record
 bytes per cache ID by layer group, allocated against used.
 
@@ -208,6 +211,16 @@ each list and its rule in `results.json` before any score on it.
 
 This is iteration on the phase's failing tasks inside its time, never growth of the list.
 
+Reference check, for every failed task whatever its cause (not infrastructure, not a task rerun because it was cut
+off while progressing): run `reference-accuracy`'s check on the host CPU while the list runs. Take the task's
+decisive point (wrong: the answer span, or the first wrong SWE action; loop: the loop's first token; malformed
+tool call: that call; stalled: the first repeated call; anomaly: the first stray token), teacher-force TT's own
+tokens over that window plus up to 4K tokens of context through HF and the served model, and compare with the
+same measurement on tasks this run solved. Verdict `model` when HF follows TT's path as closely as on the
+controls, `implementation` when the divergence is well outside them (KL p95 above 3× the controls', or HF top-1
+differs at the decisive token and gives TT's token p < 0.1), else `inconclusive`. Record it as the row's
+`reference`; an `implementation` verdict goes to datatype-sweep's Anomalies procedure.
+
 1. Every failed or timed-out task gets a row: cause (wrong answer or patch, anomaly, loop to the cap,
    malformed tool call, cut off while progressing, stalled, infrastructure, fetched solution) and evidence
    (trajectory lines, tokens, time), from the triage below. A degenerate reply is `anomaly`, never `wrong`
@@ -315,7 +328,7 @@ In `doc/agentic_evals/`:
   `reference` (`value`, `source`, `reasoning`), `band_pass`, `predicted_hours`, `explained_hours`,
   `measured_hours`, `explained_reason` when there is no number, `collected`, and `failures`: one row per failed task with `task`, `cause` (`wrong`,
   `anomaly`, `loop_cap`, `malformed_tool_call`, `cutoff_progressing`, `stalled`, `infrastructure`, `fetched_solution`),
-  `evidence` and `rerun` (`tried`: setting, `limits`, result; `counted`); `config.precision` (the
+  `evidence`, `reference` (`window`, `metrics`, `controls`, `verdict`) and `rerun` (`tried`: setting, `limits`, result; `counted`); `config.precision` (the
   precision config file served); `anomalies` (datatype-sweep, Anomalies); `harness_fixes` (branch, defect);
   plus
   `phases`: per phase `run`, `start_hour`, `pass`, and `reason` when not passed.

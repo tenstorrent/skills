@@ -1,0 +1,15 @@
+/goal Use $reference-accuracy and $tt-device-usage for the HF_MODEL full model in the current tt-metal checkout.
+
+Subagents are authorized when a selected skill requests or recommends them.
+
+This goal proves the full model computes what the HF reference computes and leaves the reference suite every later change is gated on. Start from the completed full model. Do not change the model's precision or optimise performance in this goal.
+
+Goal completion requirements:
+- The CPU reference corpus exists with every slice $reference-accuracy lists; slices built in the background since goal 1 are reused, the on-policy slice is generated now.
+- The current precision and the highest-precision configuration that fits are compared with the reference on every slice; what "full" meant and the ops that could not reach it are recorded.
+- Full precision matches the reference within the recorded tolerance on every slice. Each divergence is localised and fixed (model code, or a tt-metal op proven wrong by a minimal repro), then the affected slices and the full-model tests are rerun.
+- The current precision's per-slice numbers are recorded as the baseline; the quick, full, long and served tiers run from one command each.
+- doc/reference/reference.json and REPORT.md as $reference-accuracy says.
+- $stage-review returns `clean-pass`; findings fixed/rereviewed. Local commit stage-owned touched-repo changes; never push; log SHAs.
+
+An open divergence fails the goal. Unmet requirements, review findings, failed gates: work. Stop only after `$autofix` fails.

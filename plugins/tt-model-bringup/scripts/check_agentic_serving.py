@@ -9,6 +9,8 @@ record, and blocks (exit 2) only where a score or a failure could be hidden:
   - a failed task has no cause and evidence, or a task cut off while progressing was not rerun at a higher limit;
   - a rerun changed the score for anything but an infrastructure failure or a limit-cut task, or the
     first-attempt failures do not add up to the score;
+  - a failed task has no reference check, or an `implementation` verdict has no anomalies entry;
+  - the KV pool is a fixed budget, or a run's pool is below half the free memory, without a failed larger test;
   - the operator's inputs.json holds an unknown mode.
 Everything else is advisory (exit 1): serving evidence of stages 06-10 (workload, memory ledger, prefix caching,
 growing contexts, per-batch configurations), stage-11 rates and anomaly check, the server size, the logging check,
@@ -40,6 +42,8 @@ DEFAULT_BATCH_SIZES = (1, 8, 16, 32)
 DEFAULT_EXTENDED_SUITES = ("r1_gpqa_diamond", "swe_bench_verified")
 DEFAULT_RUN_TIMEOUT_HOURS = 12
 DEFAULT_EXPLAIN_TOLERANCE = 0.25
+VERDICTS = ("model", "implementation", "inconclusive")
+UNCHECKED_CAUSES = ("infrastructure", "cutoff_progressing")
 CAUSES = ("wrong", "anomaly", "loop_cap", "malformed_tool_call", "cutoff_progressing", "stalled",
           "infrastructure", "fetched_solution")
 LIMIT_CAUSES = ("loop_cap", "cutoff_progressing", "stalled")
@@ -77,8 +81,9 @@ def check_memory(evidence: dict, problems: list) -> None:
             problems.append((1, "ledger.weights must list every weight family"))
         elif entry.get("copies", 1) > 1:
             shortfall(problems, entry.get("copy_reason"), f"weight family {entry['name']!r} is held more than once")
-    if ledger.get("pool_sizing") == "fixed":
-        shortfall(problems, ledger.get("pool_sizing_reason"), "KV pool is a fixed budget, not sized from free DRAM")
+    if ledger.get("pool_sizing") == "fixed" and not ledger.get("pool_limit_evidence"):
+        problems.append((2, "KV pool is a fixed budget, not the largest tested fit; size it from free DRAM or record "
+                            "pool_limit_evidence (the failed test at the larger size)"))
     pool, need = ledger.get("pool_tokens"), workload["target_concurrency"] * workload["working_set_tokens"]
     if not positive_int(pool):
         problems.append((1, "ledger.pool_tokens is missing"))
@@ -88,6 +93,9 @@ def check_memory(evidence: dict, problems: list) -> None:
 
 def check_serving(evidence: dict, stage: str, problems: list) -> None:
     serving = evidence.get("serving") or {}
+    session = serving.get("session_continuation")
+    if serving.get("prefix_caching") is False and isinstance(session, dict):
+        serving = {**serving, "prefix_caching": True, **session}   # reuse measured by the generator's own count
     if serving.get("prefix_caching") is False:
         shortfall(problems, serving.get("reason"), "prefix caching is disabled for serving")
     elif serving.get("prefix_caching") is not True:
@@ -282,6 +290,12 @@ def check_run(run: dict, inputs: dict, validated: list, item: str, tasks: int, p
         if row.get("cause") not in CAUSES or not row.get("evidence") or not row.get("task"):
             problems.append((2, f"run {name}: failure row {row.get('task')!r} needs task, cause "
                                 f"({', '.join(CAUSES)}) and evidence"))
+        reference = row.get("reference") or {}
+        if row.get("cause") not in UNCHECKED_CAUSES and not (
+                reference.get("verdict") in VERDICTS and reference.get("window") and reference.get("metrics")
+                and reference.get("controls")):
+            problems.append((2, f"run {name}: {row.get('task')!r} needs a reference check (window, metrics, controls, "
+                                f"verdict {', '.join(VERDICTS)}) against HF on CPU"))
         rerun = row.get("rerun") or {}
         tried = rerun.get("tried")
         tried = tried if isinstance(tried, list) else []
@@ -353,6 +367,10 @@ def check_anomalies(results: dict, runs: dict, phases: dict, inputs: dict, probl
             if isinstance(row, dict) and row.get("cause") == "anomaly" and (run.get("phase"), row.get("task")) not in covered:
                 problems.append((1, f"run {run.get('id')}: anomaly {row.get('task')!r} has no anomalies entry "
                                     "(phase, tasks) with a reproducible test"))
+            if isinstance(row, dict) and (row.get("reference") or {}).get("verdict") == "implementation" \
+                    and (run.get("phase"), row.get("task")) not in covered:
+                problems.append((2, f"run {run.get('id')}: {row.get('task')!r} differs from the reference "
+                                    "(implementation) and has no anomalies entry with a fix attempt"))
     for phase, record in phases.items():
         run = runs.get((record or {}).get("run")) or {}
         if run.get("_band_pass", run.get("band_pass")) is False and not any(e.get("phase") == phase for e in entries):
@@ -411,9 +429,10 @@ def check_server_size(run: dict, problems: list) -> None:
         problems.append((1, f"run {name} config needs pool_tokens and server_size free_gb (measured at launch), "
                             "pool_gb and working_set_tokens"))
         return
-    if pool < POOL_FREE_FRACTION * free:
-        shortfall(problems, size.get("reason"), f"run {name}: KV pool {pool} GB is below "
-                  f"{POOL_FREE_FRACTION:.0%} of the {free} GB per device measured free at launch")
+    if pool < POOL_FREE_FRACTION * free and not size.get("pool_limit_evidence"):
+        problems.append((2, f"run {name}: KV pool {pool} GB is below {POOL_FREE_FRACTION:.0%} of the {free} GB per "
+                            "device measured free at launch; enlarge it or record pool_limit_evidence (a failed "
+                            "test at the larger size)"))
     if positive_int(agents) and agents * working > pool_tokens:
         shortfall(problems, size.get("reason"), f"run {name}: {agents} agents x {working} working-set tokens "
                   f"exceed the {pool_tokens}-token pool")

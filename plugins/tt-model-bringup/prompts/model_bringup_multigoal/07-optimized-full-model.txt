@@ -12,7 +12,7 @@ Goal completion requirements:
 - Preserve the decoder stack's selected dtype/fidelity/KV-cache/activation/CCL policy, rejection ledger, and inter-layer residual layout. Do not switch to a faster rejected policy or replicated stream.
 - Preserve or improve doc/context_contract.json. Reduce advertised capability only for a hard physical limit, with evidence and the largest feasible value.
 - Preserve valid non-aligned prompt-length support through the optimized generator path. Faster code that only accepts aligned chunk/page/tile lengths is not complete.
-- Refresh AIME24 chat-template prefill, teacher-forcing decode, and autoregressive evidence. run_prefill_check and run_teacher_forcing meet top-5 >= 98% and top-100 = 100%.
+- Refresh AIME24 chat-template prefill, teacher-forcing decode, and autoregressive evidence. run_prefill_check and run_teacher_forcing meet top-5 >= 98% and top-100 = 100%; every change passes the $reference-accuracy quick tier.
 - Measure before/after warmed TTFT and trace-verified decode t/s/u across the supported batches, batch 1 first then the largest, and report them at the top of README.md. Keep traced teacher-forcing decode and token-out decode as separate numbers when sampling/token feedback/readback are included.
 - Compute the decoder-layer stack lower bound from optimized multichip layer latencies. Token-out decode uses persistent token/position/RoPE/page-table inputs, nonblocking trace replay, no per-token host sync/readback, and enabled persistent-buffer/CCL optimizations.
 - If token-out decode is >10-15% slower than layer-stack lower bound plus terminal work, split and close the largest avoidable gap.

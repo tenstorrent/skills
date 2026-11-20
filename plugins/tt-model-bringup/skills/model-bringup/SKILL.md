@@ -66,7 +66,7 @@ For serving, follow [vLLM stack setup](../vllm-integration/references/serving-st
 
 ## Execution
 
-The twelve [goal templates](../../prompts/model_bringup_multigoal) run in order:
+The [goal templates](../../prompts/model_bringup_multigoal) run in order:
 
 1. Functional decoder — `functional-decoder`
 2. Fused decoder — `graph-fusing`
@@ -74,6 +74,7 @@ The twelve [goal templates](../../prompts/model_bringup_multigoal) run in order:
 4. Multi-chip decoder — `multichip`
 5. Optimized multi-chip decoder — `optimize`
 6. Full model — `full-model`
+6b. Reference accuracy — `reference-accuracy` (its CPU corpus starts in the background at goal 1)
 7. Optimized full model — `optimize`
 8. Datatype sweep — `datatype-sweep`
 9. vLLM integration — `vllm-integration`

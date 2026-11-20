@@ -8,7 +8,7 @@
       "destination": "prompts/model_bringup_multigoal/01-functional-decoder.txt",
       "blob": "960d0a474d572dd7f169938da171311438342295",
       "source_sha256": "afe16e47125b9615fca258965d44c52e7844a0c5e99f31183eb53147aa50d7c8",
-      "packaged_sha256": "7a8d7cc898f358bf21801f19bdd43fcfab296701962fb4e92c75bb703c61b0fd"
+      "packaged_sha256": "43dec601384fc6542d53afb23d31e96fd373c35f767ca542481ecb8d38f4a022"
     },
     {
       "source": ".agents/prompts/model_bringup_multigoal/02-fused-decoder.txt",
@@ -64,14 +64,14 @@
       "destination": "prompts/model_bringup_multigoal/07-optimized-full-model.txt",
       "blob": "84927756cdd3f18bd213adac14014c953767681a",
       "source_sha256": "55dfaf78918a0fa1282cc5d7682418789ad4f95f5db37ff244eeca99e1bf01a0",
-      "packaged_sha256": "b94b40b940af9e7d12578a0cf3405793d86c183b87d3a0ff93251131b5ce21fd"
+      "packaged_sha256": "f2a1a059320dc8fd7026ed535dc8ac4307a430247525015c27ecc3bab514f205"
     },
     {
       "source": ".agents/prompts/model_bringup_multigoal/08-datatype-sweep.txt",
       "destination": "prompts/model_bringup_multigoal/08-datatype-sweep.txt",
       "blob": "29a35149aa4699d19f1a4a938f93d5da24fc02f5",
       "source_sha256": "2f104bfb9a6e777063a2843868ac9fc6351901b0b641a5d3bdcc73cad3310cb4",
-      "packaged_sha256": "2f104bfb9a6e777063a2843868ac9fc6351901b0b641a5d3bdcc73cad3310cb4"
+      "packaged_sha256": "cc1ae31207085a9b30979e69c3775faa3e1bbd983951367e681b9e9acd7e8d2b"
     },
     {
       "source": ".agents/prompts/model_bringup_multigoal/09-vllm.check.sh",
@@ -127,7 +127,7 @@
       "destination": "skills/datatype-sweep/SKILL.md",
       "blob": "457749253d5a2a220e7545c02f4e433cc984af12",
       "source_sha256": "25b874a7b6cf277e4e11d28c06c84056790b4ff61064defb24216ec1844d5764",
-      "packaged_sha256": "624b3cc522924f389c4bd086dff5e92d3fea2e025e9eff2c765ce3bde318e896"
+      "packaged_sha256": "63cff47dc8078b2481f60907b5bf5b975d3844bcb1b2d5577fdd20d22dd57bc5"
     },
     {
       "source": ".agents/skills/datatype-sweep/agents/openai.yaml",
@@ -274,7 +274,7 @@
       "destination": "skills/vllm-integration/SKILL.md",
       "blob": "05d9e19f7cfbb596d209c504cc49e063b9361da1",
       "source_sha256": "a23a516ab0e8afc3a5dd6ddd72a42781997fb454872139e70605ecbd234e114c",
-      "packaged_sha256": "b42f54991bda3ecfb97a1ed7e865740a42d2ca531262f7c31be482ec14804187"
+      "packaged_sha256": "00b4f8205d191c60571a2676d23c3f2463aef99f5f7bc8d7c621a3f3073b3a19"
     },
     {
       "source": ".agents/skills/vllm-integration/agents/openai.yaml",
