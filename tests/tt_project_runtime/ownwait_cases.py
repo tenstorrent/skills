@@ -132,3 +132,56 @@ def test_a_code_task_already_landed_may_wait_on_its_own_landing(env, tmp_path, m
     t = _reply_wait_hand_off(p, d, tmp_path, tid, waiting_for="my own landing", retry_when=f"ttp landed --task {tid}")
     res = json.loads(t["result"])
     assert res["status"] == "waiting" and res["retry_when"] == f"ttp landed --task {tid}", res
+
+
+def test_a_fix_on_an_unlanded_stack_that_waits_on_its_ancestors_landing_is_handed_off_done(env, tmp_path, monkeypatch):
+    # Task B delivers onto task A's unlanded branch and hands off waiting on `ttp landed --task A`: that
+    # wait cannot end (B's review queues only once B ends), so the daemon takes the hand-off as done.
+    from ttp import landed
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    a = p.db.add_task("change", "s", kind="code", tier="standard", origin="user")
+    p.db.update_task(a, branch="ttp/a-change")
+    b = p.db.add_task("fix", "s", kind="code", tier="standard", origin="user", labels=["pr_branch:ttp/a-change"])
+    t = _reply_wait_hand_off(p, d, tmp_path, b, waiting_for="the stack landing", retry_when=f"ttp landed --task {a}")
+    res = json.loads(t["result"])
+    assert t["status"] != "queued" and res["status"] == "done" and "retry_when" not in res, (t["status"], res)
+    assert f"#{a}" in res["summary"]
+    # The same wait with `|| exit 1`, or as landed:#A, is the same shape.
+    t = _reply_wait_hand_off(p, d, tmp_path, b, waiting_for="x", retry_when=f"landed:#{a}")
+    assert json.loads(t["result"])["status"] == "done"
+    # A task outside the stack keeps its wait; so does a stack wait with a second condition.
+    other = p.db.add_task("other", "s", kind="code", tier="standard", origin="user")
+    t = _reply_wait_hand_off(p, d, tmp_path, other, waiting_for="x", retry_when=f"ttp landed --task {a}")
+    assert json.loads(t["result"])["status"] == "waiting"
+    t = _reply_wait_hand_off(p, d, tmp_path, b, waiting_for="x", retry_when=f"ttp landed --task {a} && ttp checks --result /x")
+    assert json.loads(t["result"])["status"] == "waiting"
+    # Once the ancestor has landed, the wait passes by itself: kept.
+    monkeypatch.setattr(landed, "check", lambda *a, **k: (0, "landed"))
+    t = _reply_wait_hand_off(p, d, tmp_path, b, waiting_for="x", retry_when=f"ttp landed --task {a}")
+    assert json.loads(t["result"])["status"] == "waiting"
+
+
+def test_a_branch_holding_an_unlanded_ancestors_head_is_in_its_stack_unless_that_reviews_failed(env, monkeypatch):
+    import subprocess
+    from ttp import ownwait, pushq
+    p = make(env)
+    git = lambda *a: subprocess.run(["git", "-C", str(p.root), *a], check=True, capture_output=True)
+    git("init", "-q")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    git("commit", "-q", "--allow-empty", "-m", "a")
+    git("branch", "-M", "main")
+    git("branch", "ttp/a")
+    git("branch", "ttp/b")
+    git("checkout", "-q", "ttp/b")
+    git("commit", "-q", "--allow-empty", "-m", "b")
+    a = p.db.add_task("change", "s", kind="code", tier="standard", origin="user")
+    p.db.update_task(a, branch="ttp/a")
+    b = p.db.add_task("fix", "s", kind="code", tier="standard", origin="user")
+    p.db.update_task(b, branch="ttp/b")
+    assert ownwait._in_stack(p, p.db.task(b), a)       # ttp/a's head is an ancestor of ttp/b
+    assert not ownwait._in_stack(p, p.db.task(a), b)   # not the other way round
+    monkeypatch.setattr(pushq, "_verdicts", lambda *x, **k: ({a: 99}, set(), {}))
+    assert not ownwait._in_stack(p, p.db.task(b), a)   # a's review failed: the send-back's wait stands

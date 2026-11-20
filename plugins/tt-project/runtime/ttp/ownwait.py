@@ -13,6 +13,10 @@ settle itself.
   the way out: land with `ttp push` when delivery.code_tasks_may_push is on, else finish. While the
   task's own `ttp push --detach` is still running or queued, its wait is taken on that push instead
   (own_push_probe): the landing it waits for is under way.
+- stack_ancestor_wait: a code task whose wait is the landing of an unlanded task in its own stack (it
+  continues or delivers onto that task's branch, or its branch holds that task's head) cannot end either:
+  its review queues only once it hands off, and the stack lands through the head's review. The daemon
+  takes that hand-off as done, so the head's review approves the stack.
 """
 from __future__ import annotations
 
@@ -64,6 +68,49 @@ def own_landing_wait(task: dict, result: dict, cfg: dict, job_in_flight: bool = 
     return (f"hand-off refused: it waits on its own landing (task #{task['id']}), which cannot happen before it "
             f"finishes: the review that lands a change queues only once the task ends, so the wait never ends. "
             f"Instead {way}.")
+
+
+def stack_ancestor_wait(p, task: dict, result: dict, job_in_flight: bool = False) -> int:
+    """The id of the unlanded task in `task`'s own stack that its waiting hand-off waits on, 0 when it
+    does not. Only a plain landing wait counts (`landed:#<id>`, `ttp landed --task <id>`, an `&&` chain
+    of them, a trailing `|| exit 1` aside): another term in it is a real second condition. A task is in
+    the stack when it re-works that task (carryback.reworks) or its branch holds that task's head."""
+    if job_in_flight or not isinstance(result, dict) or not isinstance(task, dict) or task.get("kind") != "code":
+        return 0
+    from . import landed
+    for key in ("retry_when", "waiting_for"):
+        probe = result.get(key)
+        if not isinstance(probe, str) or not probe.strip():
+            continue
+        probe = re.sub(r"\s*\|\|\s*exit\s+1\s*$", "", probe.strip())
+        ids, rest = landed.split_landed(probe)
+        if not ids or rest or task["id"] in ids:
+            continue
+        if all(_in_stack(p, task, tid) and landed.check(p, p.root, tid=tid, fetch=False)[0] != 0 for tid in ids):
+            return ids[0]
+    return 0
+
+
+def _in_stack(p, task: dict, tid: int) -> bool:
+    """Whether `task` re-works task `tid` or its branch contains `tid`'s head commit (not when `tid`'s
+    latest review failed: a branch carrying such commits waits on their landing, as carryback.order says)."""
+    from . import carryback
+    if carryback.reworks(p.db, task, tid):
+        return True
+    other = p.db.task(tid) or {}
+    mine, theirs = task.get("branch"), other.get("branch")
+    if not (mine and theirs):
+        return False
+    import subprocess, time
+    from . import pushq
+    try:
+        if tid in pushq._verdicts(p.db, {"id": -1, "labels": "[]", "depends_on": "[]", "spec": "", "title": ""},
+                                  {mine}, time.time())[0]:
+            return False   # its latest review failed: carryback's send-back, which waits on its landing
+        return subprocess.run(["git", "-C", str(p.root), "merge-base", "--is-ancestor", theirs, mine],
+                              capture_output=True, timeout=30).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def own_push_probe(p, task_id: int) -> str:

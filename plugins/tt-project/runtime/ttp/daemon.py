@@ -8169,6 +8169,16 @@ class Daemon:
                 refusal = ""   # its own detached push is under way: wait on that push's outcome
                 if chaincap.waits_landing(result.get("retry_when"), task["id"]):
                     result = {**result, "retry_when": probe}
+        if waiting and not refusal and (anc := ownwait.stack_ancestor_wait(self.p, task, result, bool(jobs))):
+            # A fix on an unlanded stack: its review queues only once it hands off, and the stack lands
+            # through the head's review, so waiting on an ancestor's landing never ends. Done instead.
+            summary = (f"{summary} (handed off done: it sat on the landing of #{anc}, a task in its own stack; "
+                       f"the head's review approves the stack)")[:1500]
+            result = {**{k: v for k, v in result.items() if k not in (
+                "retry_when", "retry_when_orig", "waiting_for", "then", "retry_after_s", "next_step", "on_pass_cmd")},
+                "status": "done", "summary": summary}
+            waiting, rstatus = False, "done"
+            log(self.p, f"task {task['id']} hand-off: its wait on #{anc}'s landing is in its own stack: taken as done")
         both = on_pass_both_warning(result) if waiting else ""
         if both:
             log(self.p, f"task {r['task']} hand-off: {both}")

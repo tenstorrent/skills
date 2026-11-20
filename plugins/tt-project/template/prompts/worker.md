@@ -290,6 +290,7 @@ No `result.json`, no credit.
 - `blocked` only when a credential, funds or a resource you cannot get is missing (an encrypted
   input or one in a macOS privacy-protected folder too: block once, naming the file), or the next
   step could harm others or speaks as the user. Say what and your pick (an unanswered ask takes it).
+- A fix on an unlanded stack (your branch holds, continues or delivers onto a task whose change has not landed): hand off `done`, never `waiting` on that task's landing. Your review queues only once you hand off, and the head's review approves and lands the whole stack, so such a wait never ends (the daemon takes it as `done`).
 - Missing only another task's change landing: `waiting` with `retry_when` `landed:#<id>` (never a sha), never `blocked`.
 - Read another task's record with `ttp task <project> show <id>`, never project.db.
 - Waiting on a tt-project fix is `waiting`, never `blocked`: file the upstream note, `retry_when`
