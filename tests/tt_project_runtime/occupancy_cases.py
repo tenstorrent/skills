@@ -753,13 +753,14 @@ def test_occupancy_detach_step_none_never_waits_and_the_default_still_does(env, 
     monkeypatch.setattr(occupancy, "blocks_any", lambda targets, step="test", now=None:
                         asked.append(step) or "box-a: a live realtime stream holds it")
     assert cli._detach_occupied(argparse.Namespace(remote=None, lock=["box-a"], step="none"), None) == []
-    assert cli._detach_occupied(argparse.Namespace(remote="box-a", lock=[], step="none"), None) == []
+    with pytest.raises(SystemExit):   # a job on another host touches that host
+        cli._detach_occupied(argparse.Namespace(remote="box-a", lock=[], step="none"), None)
     assert asked == []   # a job that touches no box asks no stream
     assert cli._detach_occupied(argparse.Namespace(remote=None, lock=["box-a"], step=None), None) == \
         [project.hostname(), "box-a"] and asked == ["test"]
     with pytest.raises(SystemExit):
         cli.main(["detach", "--help"])
-    assert "none: the job touches no box" in " ".join(capsys.readouterr().out.split())
+    assert "none: a job that adds no host load" in " ".join(capsys.readouterr().out.split())
 
 
 def test_occupancy_harness_ab_cell_start_waits_for_the_box(monkeypatch, tmp_path):

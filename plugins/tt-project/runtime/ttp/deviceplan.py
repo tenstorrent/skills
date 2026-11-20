@@ -362,20 +362,17 @@ def _cfg() -> dict:
         return {}
 
 
-_HARMLESS_REDIRECT = re.compile(r"\d*(?:>&\s*\d+-?|(?:&>>?|>>?)\s*(?:/dev/null(?![\w/.-])|&\d+-?))")
-
-
 def _remote_redirect(cmd: str, steps) -> bool:
     """Whether an ssh call in `cmd` that is no step writes a file there through a quoted redirect: _segs drops
     redirects, quoted ones too, so neither the script list nor a read-only command vouches for one."""
-    from . import hook
+    from . import glmguard, hook
     try:
         segs = hook._all_segments(hook._split(cmd)[0])
     except Exception:
         return True
     for w in segs:
         got = ssh_target(w) if w else None
-        if got and ">" in _HARMLESS_REDIRECT.sub(" ", got[1]) and not step_match(shlex.join(w), steps):
+        if got and glmguard.remote_writes(got[1]) and not step_match(shlex.join(w), steps):
             return True
     return False
 
