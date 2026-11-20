@@ -682,8 +682,6 @@ def sweep(p: Project, running: set[int]) -> dict[int, str]:
             settled.pop(tid, None)
         if got:
             out[tid] = got
-    for tid in [t for t in settled if not path(p, t).is_dir()]:
-        del settled[tid]
     try:
         root.rmdir()   # only when empty
     except OSError:
