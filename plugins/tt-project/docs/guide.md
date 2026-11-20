@@ -4513,10 +4513,15 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   - Stale sessions recover by themselves. After a network change an earlier session can live on at
     the box's sshd and keep holding its forward ports, so the new one exits with `remote port
     forwarding failed`. The session then makes one short cleanup login (same key, no forwards, no
-    agent) that ends only the box account's own sshd processes listening on that session's own
-    loopback ports and carrying this workstation's tag for the same box and agent (a random id made on
-    the workstation, never a hostname): TERM, then KILL. It logs one line per ended session (port, pid,
-    age) and retries at once; a second forward failure in a row exits for the supervisor to restart.
+    agent) that ends only the box account's own sshd sessions, never its own session or an ancestor:
+    the one the bridge's agent link still names (`agent.<pid>`) when that agent no longer answers
+    (an sshd left half-dead by a sleep hides its ports from `ss`), and those listening on the
+    session's own loopback ports and carrying this workstation's tag for the same box and agent (a
+    random id made on the workstation, never a hostname), or with no session command left at all:
+    TERM, then KILL only while the ports stay held. It logs one line per ended session (port, pid,
+    age) and one per port still held (with its pid), and succeeds only once the ports are free; a
+    failed cleanup runs again after 5 s, 20 s and 60 s, then exits for the supervisor to restart.
+    After a successful cleanup it retries at once; a second forward failure in a row exits.
     No sudo, no other account's process, no sshd config change. `ttp bridge doctor` names a port held by a
     stale session. `ttp setup` and the upgrade re-install bridge services whose command changed, so
     nothing needs running by hand on the workstation.

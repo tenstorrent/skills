@@ -316,7 +316,7 @@ def service_argv(cfg: dict, box: str, agent: str, ssh: str | None = None, platfo
     bound = [h for h in cfg["boxes"][box]["agents"][agent]["forward"] if h["interface"] and not h["adopt"]]
     py = "/usr/bin/python3" if os.path.exists("/usr/bin/python3") else sys.executable
     awake = ["--keep-awake"] if cfg.get("keep_awake", True) and (platform or sys.platform) == "darwin" else []
-    return [py, str(RELAY), "--tag", f"{box}/{agent}", *awake, str(relay_dir(box, agent)),
+    return [py, str(RELAY), "--tag", f"{box}/{agent}", "--link", link(cfg, agent), *awake, str(relay_dir(box, agent)),
             *[f"{h['name']}={h['target']}%{h['interface']}" for h in bound], "--", *argv]
 
 

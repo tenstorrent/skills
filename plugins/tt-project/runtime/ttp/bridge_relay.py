@@ -7,7 +7,7 @@ is used through ssh's BindInterface, say). A reverse forward cannot bind its con
 session forwards such a host's box port to a unix socket here instead, and this relay connects
 each connection to that host's port 22 bound to the interface. Nothing else is carried.
 
-usage: bridge_relay.py [--tag <box>/<agent>] [--keep-awake] <socket dir> [<name>=<host>%<interface> ...] -- <ssh argv...>
+usage: bridge_relay.py [--tag <box>/<agent>] [--link <~/agent link>] [--keep-awake] <socket dir> [<name>=<host>%<interface> ...] -- <ssh argv...>
 
 It listens on <socket dir>/<name>.sock (mode 600, the directory 700), runs the ssh session, and
 exits with it, removing its sockets: the relay lives exactly as long as the session. It exits 4
@@ -20,17 +20,24 @@ use and kept next to the socket dir; the session id is new each run). When a net
 the box's sshd holding an earlier session's reverse-forward ports, ssh exits 255 with 'remote port
 forwarding failed'. The relay then runs one cleanup login to the box (the same login options, no
 forwards, no agent, a short timeout) that ends only sshd processes of the box account itself (by
-their real uid, as ps reads it) whose session carries this computer's tag for the same box and agent
-(this computer's session for them has just failed, so such a session has no live peer here) and that
-either listen on 127.0.0.1 at one of this session's forward ports or are named in a session record:
-SIGTERM, then SIGKILL after 5 s. Each session's remote command writes that record first,
-`${XDG_CACHE_HOME:-~/.cache}/tt-project/bridge-<computer id>+<box>+<agent>+<session id>.pid` (its
-sshd's pid and its own, mode 600), and removes it when it exits; the cleanup reads and removes this
-computer's records for the box and agent. The record is what finds a session sshd made non-dumpable
-(its sockets and /proc entries hidden from ss and from the box account), as after the computer
-rebooted while the box still held its sessions. It never uses sudo and leaves untagged, interactive
-and other accounts' sessions alone. The session then starts again at once; a second forward failure
-in a row exits nonzero, so the service's own restart pacing applies.
+their real uid, as ps reads it), never its own session or an ancestor of it, found three ways:
+- the agent link (--link, the box path bridge.py links the forwarded agent to): it points at
+  `.../agent.<pid>`, the socket of the sshd session that made it; that sshd is ended when its socket
+  is still there and its agent no longer answers (a session whose computer slept or moved: sshd
+  keeps its reverse-forward ports, and hides them from ss, as long as the dead connection lasts);
+- a listener on 127.0.0.1 at one of this session's forward ports, when its session carries this
+  computer's tag for the same box and agent, or its session command already ended;
+- a session record: each session's remote command writes one first,
+  `${XDG_CACHE_HOME:-~/.cache}/tt-project/bridge-<computer id>+<box>+<agent>+<session id>.pid` (its
+  sshd's pid and its own, mode 600), and removes it when it exits; the cleanup reads and removes this
+  computer's records for the box and agent, and ends a recorded sshd only while it carries the tag.
+Each is sent SIGTERM; SIGKILL follows after 5 s only while it lives and a forward port is still held.
+The cleanup then re-checks the ports: it succeeds only once they are free, and otherwise names each
+held port and its owner (when this account can see it). It never uses sudo and leaves untagged
+interactive sessions, live agents and other accounts' sessions alone. A cleanup that left a port
+held runs again after 5, 20 and 60 s before the session reconnects, then the relay exits nonzero so
+the service's own restart pacing applies. Once the ports are free the session starts again at once;
+a second forward failure in a row exits nonzero.
 
 With --keep-awake (macOS only; the service passes it unless the bridge config says `"keep_awake":
 "off"`) it also holds `/usr/bin/caffeinate -s -w <its pid>` for as long as it runs: PreventSystemSleep,
@@ -432,16 +439,21 @@ AGENT_RETRY_S = (5, 20, 60)   # reconnects after a dead agent, then the service'
 AGENT_STEADY_S = 600   # a session that stayed up this long starts a fresh count of dead-agent reconnects
 END = re.compile(r"^ttp-bridge-end (\d+)\s*$")   # the remote command's own last line (tagged's EXIT trap)
 END_GRACE_S = 3.0      # once the remote command ended, ssh gets this long to exit before its group is ended
+CLEAN_RETRY_S = (5, 20, 60)   # cleanups again while the ports stay held, then the service's own restart pacing
 KILL_GRACE_S = 5.0     # SIGTERM to ssh's process group, then SIGKILL this long after
 LOCAL_CHECK_S = 30.0   # how often the local agent the session forwards is asked for its keys
 LOCAL_TIMEOUT_S = 10.0   # an `ssh-add -l` that takes longer is a hung agent
 LOCAL_RECHECK_S = 2.0  # a failed check is confirmed by one more this soon after
 ENV_AGENT = "TTP_BRIDGE_AGENT"   # bridge.py's name for the service's own agent in its ssh wrapper
 
-# On the box (POSIX sh; ss, else /proc): $1 the tag prefix, $2 the record name prefix, then the ports.
-# Prints `ended <port> <pid> <age s>` per session it ends and `kept <port> <pid> <why>` per listener it
-# leaves; <port> is `rec` for a session found by its record.
-CLEANUP = r"""tag=$1; rec=$2; shift 2; me=$(id -u); seen=
+# On the box (POSIX sh; ss, else /proc): $1 the tag prefix, $2 the record name prefix, $3 the agent
+# link (a '~/' path, or empty), then the ports. Prints `ended <port> <pid> <age s>` per session it ends,
+# `kept <port> <pid> <why>` per one it leaves and, last, `held <port> <pid or ?>` per port still held;
+# <port> is `link` or `rec` for a session found by the agent link or its record.
+CLEANUP = r"""tag=$1; rec=$2; link=$3; shift 3; me=$(id -u); ports="$*"; seen=
+case $link in '~/'*) link=$HOME/${link#'~/'};; esac
+mine=$$; p=$$   # this cleanup's own shell, its sshd and their ancestors are never ended
+while p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ') && [ -n "$p" ] && [ "$p" -gt 1 ]; do mine="$mine $p"; done
 listeners() {
   if command -v ss >/dev/null 2>&1; then
     ss -Hltnp 2>/dev/null | awk -v a="127.0.0.1:$1" '$4 == a' | grep -o 'pid=[0-9]*' | cut -d= -f2
@@ -454,20 +466,47 @@ listeners() {
     done
   fi
 }
+held() {   # the port has a listener, whether or not this account can see its process
+  if command -v ss >/dev/null 2>&1; then
+    ss -Hltn 2>/dev/null | awk -v a="127.0.0.1:$1" '$4 == a {f = 1} END {exit !f}'
+  else
+    awk -v a="$(printf '0100007F:%04X' "$1")" '$2 == a && $4 == "0A" {f = 1} END {exit !f}' /proc/net/tcp
+  fi
+}
+any_held() { for q in $ports; do held "$q" && return 0; done; return 1; }
 alive() { kill -0 "$1" 2>/dev/null && case "$(ps -o stat= -p "$1" 2>/dev/null)" in *Z*) false;; esac; }   # a zombie has ended
-end_one() {   # $1 the port (or rec), $2 the pid
+answers() {   # the agent behind a socket gives its keys (ssh-add -l exits 0, or 1 with none)
+  t=; command -v timeout >/dev/null 2>&1 && t="timeout 10"
+  o=$(SSH_AUTH_SOCK="$1" $t ssh-add -l 2>&1); r=$?
+  [ $r -eq 0 ] || { [ $r -eq 1 ] && ! printf '%s' "$o" | grep -qiE 'error fetching|communication with agent'; }
+}
+end_one() {   # $1 the port (or link, rec), $2 the pid
   case " $seen " in *" $2 "*) return;; esac; seen="$seen $2"
+  case " $mine " in *" $2 "*) echo "kept $1 $2 the cleanup's own session"; return;; esac
   [ "$(ps -o uid= -p "$2" 2>/dev/null | tr -d ' ')" = "$me" ] || { echo "kept $1 $2 another account"; return; }
   case "$(tr '\0' ' ' < "/proc/$2/cmdline" 2>/dev/null)" in sshd*) ;; *) echo "kept $1 $2 not an sshd session"; return;; esac
-  ps -o ppid=,args= -e 2>/dev/null | awk -v p="$2" -v t="$tag" '$1 == p && index($0, t) {f = 1} END {exit !f}' \
-    || { echo "kept $1 $2 not this computer's session"; return; }
+  if [ "$1" != link ]; then   # this computer's tagged session; at a port, also one whose session command ended
+    ps -o ppid=,args= -e 2>/dev/null | awk -v p="$2" -v t="$tag" -v r="$1" \
+      '$1 == p {k = 1; if (index($0, t)) f = 1} END {exit !(f || (!k && r != "rec"))}' \
+      || { echo "kept $1 $2 not this computer's session"; return; }
+  fi
   age=$(ps -o etimes= -p "$2" 2>/dev/null | tr -d ' ')
   kill -TERM "$2" 2>/dev/null; n=0
   while alive "$2" && [ $n -lt 5 ]; do sleep 1; n=$((n+1)); done
+  if alive "$2" && ! any_held; then echo "kept $1 $2 still running after SIGTERM, with the ports free"; return; fi
   alive "$2" && kill -KILL "$2" 2>/dev/null
   echo "ended $1 $2 ${age:-?}"
 }
-for port in "$@"; do
+if [ -n "$link" ] && [ -L "$link" ]; then   # the agent link of the stale session: <dir>/agent.<its sshd pid>
+  sock=$(readlink "$link" 2>/dev/null); pid=${sock##*/agent.}
+  case "$pid" in ''|*[!0-9]*) ;; *)
+    if ! [ -S "$sock" ] || case "$(ps -o stat= -p "$pid" 2>/dev/null)" in ''|*Z*) true;; *) false;; esac; then :
+    elif ! command -v ssh-add >/dev/null 2>&1; then echo "kept link $pid no ssh-add to ask its agent"
+    elif answers "$link"; then echo "kept link $pid its agent answers"
+    else end_one link "$pid"; fi;;
+  esac
+fi
+for port in $ports; do
   for pid in $(listeners "$port" | sort -u); do end_one "$port" "$pid"; done
 done
 for f in "${XDG_CACHE_HOME:-$HOME/.cache}/tt-project/$rec"*.pid; do
@@ -475,7 +514,12 @@ for f in "${XDG_CACHE_HOME:-$HOME/.cache}/tt-project/$rec"*.pid; do
   pid=; read -r pid _ < "$f" 2>/dev/null
   case "$pid" in ''|*[!0-9]*) ;; *) case "$(ps -o stat= -p "$pid" 2>/dev/null)" in ''|*Z*) ;; *) end_one rec "$pid";; esac;; esac
   rm -f "$f"
-done"""
+done
+n=0; while any_held && [ $n -lt 3 ]; do sleep 1; n=$((n+1)); done   # a listener ended a moment ago
+for port in $ports; do
+  held "$port" && echo "held $port $(listeners "$port" | head -n 1 | grep . || echo '?')"
+done
+exit 0"""
 
 
 def computer_id(d: str) -> str:
@@ -516,7 +560,7 @@ def tagged(ssh: list[str], tag: str) -> list[str]:
                        f'trap \'ttp_rc=$?; rm -f "$ttp_rec"; echo "ttp-bridge-end $ttp_rc" >&2\' EXIT; ' + ssh[-1]]
 
 
-def cleanup_argv(ssh: list[str], prefix: str, ports: list[int]) -> list[str]:
+def cleanup_argv(ssh: list[str], prefix: str, ports: list[int], link: str = "") -> list[str]:
     """One login to the same box with the session's own login options: no forwards, no agent, a short timeout."""
     cut = ssh.index("--")
     out, skip = [], False
@@ -530,33 +574,44 @@ def cleanup_argv(ssh: list[str], prefix: str, ports: list[int]) -> list[str]:
             continue
         out.append(a)
     script = "sh -c " + shlex.quote(CLEANUP) + " ttp-bridge-clean " + " ".join(
-        shlex.quote(x) for x in [TAG + prefix, rec_name(prefix), *map(str, ports)])
+        shlex.quote(x) for x in [TAG + prefix, rec_name(prefix), link, *map(str, ports)])
     return out + ["-a", "-o", "ForwardAgent=no", "-o", "ClearAllForwardings=yes", "-o", "ConnectTimeout=10",
                   "--", ssh[cut + 1], script]
 
 
-def clean(ssh: list[str], prefix: str, ports: list[int]) -> None:
+def clean(ssh: list[str], prefix: str, ports: list[int], link: str = "") -> bool:
+    """One cleanup login; True once the box reports the session's ports free."""
     box = ssh[ssh.index("--") + 1]
+
+    def say(m: str) -> None:
+        print(f"ttp bridge: {box}: {m}", file=sys.stderr, flush=True)
+
     try:
-        r = subprocess.run(cleanup_argv(ssh, prefix, ports), stdin=subprocess.DEVNULL, capture_output=True,
+        r = subprocess.run(cleanup_argv(ssh, prefix, ports, link), stdin=subprocess.DEVNULL, capture_output=True,
                            text=True, timeout=CLEAN_TIMEOUT)
     except (OSError, subprocess.TimeoutExpired) as e:
-        print(f"ttp bridge: {box}: the stale-session cleanup did not finish ({e})", file=sys.stderr, flush=True)
-        return
-    ended = 0
+        say(f"the stale-session cleanup did not finish ({e})")
+        return False
+    ended, held = 0, []
     for ln in r.stdout.splitlines():
         w = ln.split()
-        what = "found by its record" if w[1:2] == ["rec"] else f"holding port {w[1] if len(w) > 1 else '?'}"
+        what = {"rec": "found by its record", "link": "found by its agent link"}.get(
+            w[1] if len(w) > 1 else "", f"holding port {w[1] if len(w) > 1 else '?'}")
         if w[:1] == ["ended"] and len(w) == 4:
             ended += 1
-            print(f"ttp bridge: {box}: ended a stale session {what} (pid {w[2]}, {w[3]} s old)",
-                  file=sys.stderr, flush=True)
+            say(f"ended a stale session {what} (pid {w[2]}, {w[3]} s old)")
         elif w[:1] == ["kept"] and len(w) >= 3:
-            print(f"ttp bridge: {box}: a session {what} (pid {w[2]}) is left alone: {' '.join(w[3:])}",
-                  file=sys.stderr, flush=True)
-    if r.returncode or not ended:
-        print(f"ttp bridge: {box}: the cleanup ended no session (exit {r.returncode}"
-              f"{': ' + r.stderr.strip()[-200:] if r.stderr.strip() else ''})", file=sys.stderr, flush=True)
+            say(f"a session {what} (pid {w[2]}) is left alone: {' '.join(w[3:])}")
+        elif w[:1] == ["held"] and len(w) == 3:
+            held.append(w[1])
+            say(f"port {w[1]} is still held, " + (f"by pid {w[2]}" if w[2] != "?" else
+                "by a process this account cannot see (an sshd session no record or agent link names)"))
+    if r.returncode:
+        say(f"the cleanup login failed (exit {r.returncode}{': ' + r.stderr.strip()[-200:] if r.stderr.strip() else ''})")
+        return False
+    if not ended and not held:
+        say("the cleanup ended no session; the ports are free")
+    return not held
 
 
 def forwarded_agent(ssh: list[str], env=None) -> str:
@@ -711,12 +766,13 @@ def release_awake(proc) -> None:
 
 
 def main(argv: list[str], platform: str | None = None, awake_spawn=None) -> int:
-    tag, keep = "", False
-    while argv[:1] in (["--tag"], ["--keep-awake"]):
+    tag, keep, link = "", False, ""
+    while argv[:1] in (["--tag"], ["--keep-awake"], ["--link"]):
         if argv[0] == "--keep-awake":
             keep, argv = True, argv[1:]
         elif len(argv) > 1:
-            tag, argv = argv[1], argv[2:]
+            tag, link = (argv[1], link) if argv[0] == "--tag" else (tag, argv[1])
+            argv = argv[2:]
         else:
             break
     if "--" not in argv or len(argv) < 3:
@@ -752,7 +808,7 @@ def main(argv: list[str], platform: str | None = None, awake_spawn=None) -> int:
     if listeners:
         threading.Thread(target=supervise, args=(listeners, stop, lost), daemon=True).start()
     try:
-        rc = run(ssh, tag, d, state)
+        rc = run(ssh, tag, d, state, link)
         return RELAY_LOST if state["lost"] else rc
     finally:
         stop.set()
@@ -761,7 +817,7 @@ def main(argv: list[str], platform: str | None = None, awake_spawn=None) -> int:
             lst.close(unlink=True)
 
 
-def run(ssh: list[str], tag: str, d: str, state: dict) -> int:
+def run(ssh: list[str], tag: str, d: str, state: dict, link: str = "") -> int:
     """The session (with --tag, its stale-session and dead-agent recovery) until it ends or is stopped."""
     if not tag:
         # own session: ssh is ended whole (its group) by end_group() once stopped
@@ -793,7 +849,16 @@ def run(ssh: list[str], tag: str, d: str, state: dict) -> int:
             print("ttp bridge: a reverse forward failed again right after the cleanup; exiting",
                   file=sys.stderr, flush=True)
             return rc
-        clean(ssh, prefix, ports)
+        tries = 0
+        while not clean(ssh, prefix, ports, link):
+            if state["stop"] or tries >= len(CLEAN_RETRY_S):
+                print(f"ttp bridge: the forward ports stay held after {tries + 1} cleanups; exiting (the service "
+                      "restarts the session)", file=sys.stderr, flush=True)
+                return rc
+            print(f"ttp bridge: cleaning up again in {CLEAN_RETRY_S[tries]}s before reconnecting",
+                  file=sys.stderr, flush=True)
+            wait(CLEAN_RETRY_S[tries], state)
+            tries += 1
         cleaned = True
 
 

@@ -36,10 +36,13 @@
 - Supervisor restarts it (`KeepAlive` / `Restart=always`).
 - A tunnel that connects but binds nothing is broken. Verify from the far end.
 - A `ttp bridge` session whose reverse forward fails (`remote port forwarding failed`, usually a
-  stale session from before a network change still holding the port) recovers by itself: one
-  cleanup login ends only the box account's own sshd session on that port carrying this
-  workstation's tag for the same box and agent, then it retries once. Nothing to do by hand;
-  `ttp bridge doctor` names a held port, and `ttp setup`/upgrade refresh changed services.
+  stale session from before a network change or sleep still holding the port) recovers by itself:
+  one cleanup login ends only the box account's own sshd session, found by the `agent.<pid>` its
+  agent link still points to (when that agent no longer answers) or by the port it holds with
+  this workstation's tag for the same box and agent. It counts as done only once the ports are
+  free; else it logs the held port and its pid and cleans again after 5, 20 and 60 s before the
+  supervisor takes over. Nothing to do by hand; `ttp bridge doctor` names a held port, and
+  `ttp setup`/upgrade refresh changed services.
 - A `ttp bridge` session never relies on ssh exiting by itself: open forwarded-agent channels can
   keep ssh up after its remote command ended, holding connections to the local agent until the
   agent runs out of open files. The relay ends ssh with its whole process group (SIGTERM, then

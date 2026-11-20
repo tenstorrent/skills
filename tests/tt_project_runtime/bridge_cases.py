@@ -227,12 +227,13 @@ def test_bridge_interface_hosts_go_through_the_relay_socket(tmp_path, monkeypatc
     sock = tmp_path / "bridge-relay" / "box-1.auto" / "build-a.sock"
     assert argv[argv.index("-R") + 1] == f"127.0.0.1:2301:{sock}"
     svc = bridge.service_argv(cfg, "box-1", "auto", ssh="ssh")
-    assert svc[1:6] == [str(tmp_path / "bridge_relay.py"), "--tag", "box-1/auto", str(sock.parent),
-                        "build-a=build-a.example.com%vpn0"]
+    assert svc[1:8] == [str(tmp_path / "bridge_relay.py"), "--tag", "box-1/auto", "--link", bridge.link(cfg, "auto"),
+                        str(sock.parent), "build-a=build-a.example.com%vpn0"]
     assert svc[svc.index("--") + 1:] == argv
     plain = bridge.service_argv(_bridge_cfg(), "box-1", "auto", ssh="ssh")   # no interface host: still wrapped
-    assert plain[1:5] == [str(tmp_path / "bridge_relay.py"), "--tag", "box-1/auto", str(sock.parent)]
-    assert plain[5] == "--" and plain[6] == "/bin/sh"
+    assert plain[1:7] == [str(tmp_path / "bridge_relay.py"), "--tag", "box-1/auto", "--link", bridge.link(cfg, "auto"),
+                          str(sock.parent)]
+    assert plain[7] == "--" and plain[8] == "/bin/sh"
 
 
 def test_bridge_relay_carries_one_connection_and_exits_with_its_session(monkeypatch, request):
@@ -617,7 +618,7 @@ def test_bridge_relay_raises_its_open_file_limit_before_the_session_starts(monke
     order = []
     monkeypatch.setattr(bridge_relay, "raise_nofile", lambda *a, **k: order.append("raise") or 1024)
 
-    def run(ssh, tag, dd, state):
+    def run(ssh, tag, dd, state, link=""):
         order.append("ssh")
         return 0
 
@@ -1121,6 +1122,8 @@ if 'ttp-bridge-clean' in sys.argv[-1]:
     print('ended 2301 4242 3600')
     print("kept 2302 4343 not this computer's session")
     print('ended rec 4545 7200')
+    if sum(1 for c in calls if 'ttp-bridge-clean' in c[-1]) < int(os.environ.get('FAKE_HELD_N', '0')):
+        print('held 2301 4242')   # this many cleanups in a row leave the port held
     sys.exit(0)
 step = json.load(open(os.path.join(d, 'plan.json')))[sum(1 for c in calls if 'ttp-bridge-clean' not in c[-1])]
 if step == 'fwd':
@@ -1179,7 +1182,7 @@ def test_bridge_forward_failure_cleans_once_and_retries(tmp_path, capfd):
     assert "-R" not in clean and "ForwardAgent=/agents/a.sock" not in clean and "ExitOnForwardFailure=yes" not in clean
     assert {"-a", "ForwardAgent=no", "ClearAllForwardings=yes", "ConnectTimeout=10", "BatchMode=yes",
             "IdentityFile=/keys/login.pub"} <= set(clean)
-    assert clean[clean.index("--") + 1] == "box-a" and clean[-1].endswith(f" {tag} bridge-{cid}+box-a+auto+ 2301 2302")
+    assert clean[clean.index("--") + 1] == "box-a" and clean[-1].endswith(f" {tag} bridge-{cid}+box-a+auto+ '' 2301 2302")
     err = capfd.readouterr().err
     assert "remote port forwarding failed" in err   # passed through to the log
     assert "box-a: ended a stale session holding port 2301 (pid 4242, 3600 s old)" in err
@@ -1233,7 +1236,7 @@ def test_bridge_box_cleanup_ends_only_this_computers_tagged_session(tmp_path):
             f'LISTEN 0 128 127.0.0.1:{p} 0.0.0.0:* users:(("sshd",pid={pid},fd=9))\n' for p, pid in rows) + "X\n")
         (bin_ / "ss").chmod(0o755)
         env = dict(os.environ, PATH=f"{bin_}:{os.environ['PATH']}", XDG_CACHE_HOME=str(tmp_path / "cache"))
-        r = subprocess.run(["sh", "-c", bridge_relay.CLEANUP, "x", tag, "bridge-aaaaaaaaaaaa+box-a+auto+",
+        r = subprocess.run(["sh", "-c", bridge_relay.CLEANUP, "x", tag, "bridge-aaaaaaaaaaaa+box-a+auto+", "",
                             "2301", "2302", "2303", "2304"],
                            capture_output=True, text=True, env=env, timeout=30)
         out = r.stdout.splitlines()
@@ -1900,7 +1903,7 @@ def test_bridge_box_cleanup_reads_session_records_and_spares_reused_pids(tmp_pat
         (bin_ / "ss").write_text("#!/bin/sh\nexit 0\n")
         (bin_ / "ss").chmod(0o755)
         env = dict(os.environ, PATH=f"{bin_}:{os.environ['PATH']}", XDG_CACHE_HOME=str(tmp_path / "cache"))
-        r = subprocess.run(["sh", "-c", bridge_relay.CLEANUP, "x", tag, mine, "2301"],
+        r = subprocess.run(["sh", "-c", bridge_relay.CLEANUP, "x", tag, mine, "", "2301"],
                            capture_output=True, text=True, env=env, timeout=30)
         out = r.stdout.splitlines()
         assert [ln.split()[:3] for ln in out if ln.startswith("ended")] == [["ended", "rec", str(stale.pid)]]
@@ -1915,6 +1918,151 @@ def test_bridge_box_cleanup_reads_session_records_and_spares_reused_pids(tmp_pat
             if p.poll() is None:
                 p.kill()
                 p.wait()
+
+
+_FAKE_SS = """#!/bin/sh
+# Rows of ROWS (port, pid or -, 1 when ss may show the pid) whose pid still runs (a zombie has ended).
+while read -r port pid vis; do
+  [ "$pid" = - ] || case "$(ps -o stat= -p "$pid" 2>/dev/null)" in ''|*Z*) continue;; esac
+  u=; case "$1" in *p*) [ "$vis" = 1 ] && u=" users:((\\"sshd\\",pid=$pid,fd=9))";; esac
+  echo "LISTEN 0 128 127.0.0.1:$port 0.0.0.0:*$u"
+done < ROWS
+"""
+
+
+def _fake_sshd(ignore_term=False):
+    """A process named like an sshd session with no child (its session command already ended)."""
+    import shlex
+    import subprocess
+    import sys
+    code = ("import signal, time; " + ("signal.signal(signal.SIGTERM, signal.SIG_IGN); " if ignore_term else "")
+            + "time.sleep(300)")
+    return subprocess.Popen(["bash", "-c", f'exec -a "sshd: u@notty" {shlex.quote(sys.executable)} -c {shlex.quote(code)}'])
+
+
+def _box_cleanup(tmp_path, rows, link_pid=None, agent_rc=2, ports=("2301",)):
+    """Run the box cleanup with a fake ss (rows), a fake ssh-add (agent_rc) and, when link_pid is set,
+    an agent link under a scratch HOME pointing at a live socket named agent.<link_pid>. Its stdout lines."""
+    import os
+    import shutil
+    import socket
+    import subprocess
+    import tempfile
+    from ttp import bridge_relay
+    bin_ = tmp_path / "bin"
+    bin_.mkdir(exist_ok=True)
+    (tmp_path / "rows").write_text("".join(f"{port} {pid} {vis}\n" for port, pid, vis in rows))
+    (bin_ / "ss").write_text(_FAKE_SS.replace("ROWS", str(tmp_path / "rows")))
+    (bin_ / "ssh-add").write_text(f"#!/bin/sh\necho agent >&2\nexit {agent_rc}\n")
+    for f in ("ss", "ssh-add"):
+        (bin_ / f).chmod(0o755)
+    home, sockdir, srv = tmp_path / "home", tempfile.mkdtemp(prefix="ttb"), None   # a short path: sockets fit
+    (home / "links").mkdir(parents=True, exist_ok=True)
+    try:
+        if link_pid is not None:
+            srv = socket.socket(socket.AF_UNIX)
+            srv.bind(os.path.join(sockdir, f"agent.{link_pid}"))
+            os.symlink(os.path.join(sockdir, f"agent.{link_pid}"), home / "links" / "auto.sock")
+        env = dict(os.environ, PATH=f"{bin_}:{os.environ['PATH']}", HOME=str(home), XDG_CACHE_HOME=str(tmp_path / "cache"))
+        r = subprocess.run(["sh", "-c", bridge_relay.CLEANUP, "x", "ttp-bridge-tag=aaaaaaaaaaaa/box-a/auto/",
+                            "bridge-aaaaaaaaaaaa+box-a+auto+", "~/links/auto.sock", *ports],
+                           capture_output=True, text=True, env=env, timeout=60)
+        assert r.returncode == 0, r.stderr
+        return r.stdout.splitlines()
+    finally:
+        if srv is not None:
+            srv.close()
+        shutil.rmtree(sockdir, ignore_errors=True)
+        (home / "links" / "auto.sock").unlink(missing_ok=True)
+
+
+def test_bridge_box_cleanup_ends_the_session_its_stale_agent_link_names(tmp_path):
+    # cells: link-cleanup
+    # The stale session's sshd is non-dumpable: ss lists its port with no pid, and it left no record.
+    # The agent link still points at agent.<its pid>, whose agent no longer answers: that finds it.
+    import time
+    stale = _fake_sshd()
+    try:
+        time.sleep(0.5)
+        out = _box_cleanup(tmp_path, [(2301, stale.pid, 0)], link_pid=stale.pid, agent_rc=2)
+        assert [ln.split()[:3] for ln in out if ln.startswith("ended")] == [["ended", "link", str(stale.pid)]]
+        assert not [ln for ln in out if ln.startswith("held")]   # the port is free again
+        assert stale.wait(timeout=10) is not None
+    finally:
+        if stale.poll() is None:
+            stale.kill()
+            stale.wait()
+
+
+def test_bridge_box_cleanup_ends_a_childless_port_owner_and_kills_it_while_the_port_stays_held(tmp_path):
+    # cells: port-owner-cleanup, held-after-term
+    # ss shows the pid on the port; the session's command already ended (no child), and it ignores
+    # SIGTERM, so the port is still held after the grace: SIGKILL follows and the port is free.
+    import signal
+    import time
+    stale = _fake_sshd(ignore_term=True)
+    try:
+        time.sleep(0.5)
+        out = _box_cleanup(tmp_path, [(2301, stale.pid, 1)])
+        assert [ln.split()[:3] for ln in out if ln.startswith("ended")] == [["ended", "2301", str(stale.pid)]]
+        assert not [ln for ln in out if ln.startswith("held")]
+        assert stale.wait(timeout=10) == -signal.SIGKILL
+    finally:
+        if stale.poll() is None:
+            stale.kill()
+            stale.wait()
+
+
+def test_bridge_box_cleanup_refuses_live_agents_other_accounts_its_own_session_and_portless_pids(tmp_path):
+    # cells: link-refusals, held-reported
+    import os
+    import subprocess
+    import time
+    live = _fake_sshd()      # the link's agent answers: another computer's live session, say
+    bystander = _fake_sshd()   # an sshd of this account that neither holds a port nor is linked
+    try:
+        time.sleep(0.5)
+        out = _box_cleanup(tmp_path, [(2301, live.pid, 0)], link_pid=live.pid, agent_rc=0)
+        assert f"kept link {live.pid} its agent answers" in out and "held 2301 ?" in out
+        assert not [ln for ln in out if ln.startswith("ended")] and live.poll() is None
+        mine = _box_cleanup(tmp_path, [], link_pid=os.getpid())   # an ancestor of the cleanup
+        assert mine == [f"kept link {os.getpid()} the cleanup's own session"]
+        if os.getuid() != 0:
+            rows = [ln.split() for ln in subprocess.run(["ps", "-eo", "pid=,uid=,ppid="], capture_output=True,
+                                                         text=True).stdout.splitlines() if ln.strip()]
+            parent, up, p = {int(r[0]): int(r[2]) for r in rows}, set(), os.getpid()
+            while p > 1:
+                up.add(p)
+                p = parent.get(p, 0)
+            other = next(int(r[0]) for r in rows if int(r[1]) != os.getuid() and int(r[0]) > 1 and int(r[0]) not in up)
+            assert _box_cleanup(tmp_path, [], link_pid=other) == [f"kept link {other} another account"]
+        assert live.poll() is None and bystander.poll() is None
+    finally:
+        for p in (live, bystander):
+            if p.poll() is None:
+                p.kill()
+                p.wait()
+
+
+def test_bridge_cleanup_that_leaves_a_port_held_is_a_failure_and_runs_again(tmp_path, capfd, monkeypatch):
+    # cells: held-is-failure, held-retries
+    from ttp import bridge_relay
+    monkeypatch.setattr(bridge_relay, "CLEAN_RETRY_S", (0, 0, 0))
+    monkeypatch.setenv("FAKE_HELD_N", "2")   # two cleanups leave the port held, the third frees it
+    argv = _fake_relay_ssh(tmp_path / "s", ["fwd", "ok"])
+    rc = bridge_relay.main(["--tag", "box-a/auto", "--link", "~/links/auto.sock", str(tmp_path / "relay" / "box-a.auto"),
+                            "--", *argv])
+    calls = _calls(tmp_path / "s")
+    assert rc == 0 and [("ttp-bridge-clean" in c[-1]) for c in calls] == [False, True, True, True, False]
+    assert calls[1][-1].endswith(" '~/links/auto.sock' 2301 2302")
+    err = capfd.readouterr().err
+    assert err.count("box-a: port 2301 is still held, by pid 4242") == 2
+    assert err.count("cleaning up again in 0s before reconnecting") == 2
+    monkeypatch.setenv("FAKE_HELD_N", "9")   # held every time: the relay exits for the service to restart it
+    argv = _fake_relay_ssh(tmp_path / "t", ["fwd", "ok"])
+    assert bridge_relay.main(["--tag", "box-a/auto", str(tmp_path / "relay" / "box-a.auto"), "--", *argv]) == 255
+    assert sum("ttp-bridge-clean" in c[-1] for c in _calls(tmp_path / "t")) == 4
+    assert "the forward ports stay held after 4 cleanups; exiting" in capfd.readouterr().err
 
 
 def test_bridge_status_says_could_not_check_when_the_probe_did_not_run(monkeypatch):
