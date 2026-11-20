@@ -956,13 +956,13 @@ def _route_config(p, route=True, **extra):
                                     **extra}, by=configwho.by("user", via="cli"))   # the user's own config
 
 
-def _route_dispatch(p, d, monkeypatch, **task):
-    """Dispatch one queued task; returns (provider, tier, note) of the start, or None."""
+def _route_dispatch(p, d, monkeypatch, prompts=None, **task):
+    """Dispatch one queued task; returns (provider, tier, note) of the start, or None (`prompts` collects its prompt)."""
     from ttp import budget as bud
     from ttp import coordinator as coord
     started = []
     monkeypatch.setattr(d, "start_run", lambda role, prompt, provider, tier, cwd, **k: started.append(
-        (provider, tier, k.get("note") or {})) or 0)
+        (provider, tier, k.get("note") or {})) or (prompts is not None and prompts.append(prompt)) or 0)
     monkeypatch.setattr(d, "_workdir_for", lambda t: (str(p.root), None))
     for prov in (d.cfg.get("core_provider", "claude"), "chat", "codex"):
         d.gates[prov] = bud.Gate(prov, regime="windows", max_parallel=6)

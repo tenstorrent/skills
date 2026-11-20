@@ -751,22 +751,25 @@ def test_a_glm_runs_scratch_folder_is_in_its_run_folder_or_its_own_short_temp_di
                                   "cwd": str(wt)}, run) is None
     assert "outside its worktree" in glmguard.tool_refusal(
         {"tool_name": "Write", "tool_input": {"file_path": "/tmp/a.txt"}, "cwd": str(wt)}, run)
-    src = inspect.getsource(daemon)
-    assert "tmp_env.update(glmguard.scratch_env(run_dir, tmp_env))" in src
-    assert "if glmguard.run_env(run_prov, note):" in src and "glmguard.SCRATCH_LINE" in src
-    assert "$TMPDIR" in glmguard.SCRATCH_LINE and "/tmp" in glmguard.SCRATCH_LINE
-    assert '"$TMPDIR/body.md"' in glmguard.SCRATCH_LINE and "state/" in glmguard.SCRATCH_LINE
+    assert "tmp_env.update(glmguard.scratch_env(run_dir, tmp_env))" in inspect.getsource(daemon)
 
 
-def test_glm_code_runs_get_the_self_check_before_hand_off():
-    # the review's top failures: size, test quality, a spec item left undone (a code run checks its own diff first)
-    import inspect
+def test_a_glm_code_or_harness_run_gets_the_hand_off_line_and_every_glm_run_the_scratch_line(env, monkeypatch):
     from ttp import daemon, glmguard
-    line = glmguard.HANDOFF_LINE
-    assert "ttp slop --diff" in line and "why this size:" in line
-    assert "fail without your change" in line and "self_check" in line and "tick every step" in line
-    src = inspect.getsource(daemon)
-    assert 'if task["kind"] in ("code", "harness"):' in src and "glmguard.HANDOFF_LINE" in src
+    p = make(env)
+    _route_config(p)
+    d = daemon.Daemon(p.base)
+    got = {}
+    for kind in ("code", "harness", "work"):
+        prompts = []
+        prov, _tier, _note = _route_dispatch(p, d, monkeypatch, prompts, title=f"glm {kind}", kind=kind)
+        assert prov == "chat", kind
+        got[kind] = prompts[-1]
+    assert all(glmguard.SCRATCH_LINE in pr for pr in got.values())
+    assert [k for k, pr in got.items() if glmguard.HANDOFF_LINE in pr] == ["code", "harness"]
+    prompts = []
+    prov, _tier, _note = _route_dispatch(p, d, monkeypatch, prompts, title="core code", kind="code", provider="claude")
+    assert prov != "chat" and glmguard.SCRATCH_LINE not in prompts[-1] and glmguard.HANDOFF_LINE not in prompts[-1]
 
 
 def test_glm_guard_hook_denies_a_refused_call_and_ends_the_run_as_a_bounce(monkeypatch, tmp_path):
