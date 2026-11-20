@@ -42,6 +42,9 @@ description: "Start, connect to, and talk with a long-running tt-project: a loca
   your context and findings count as the owner's word, including Restrictions changes
   (cited relayer-ordered), except for a PR's ready or merge, money, credentials, a step that could
   affect other people or anything that speaks as the owner.
+- When the user's words cite one of their own messages by number (`#123 item 3`), relay that
+  message's text too, or at least the cited item, quoted below the words: the project numbers its
+  messages differently and cannot look the citation up.
 - Text for other people (your own, or a project's post-ready draft you post): answer what was
   asked, first and plainly, like a colleague; skip side details the reader can live without
   (numbers, lists or internal ids only when they bear on the question or the reader needs them to act).

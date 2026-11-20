@@ -8043,3 +8043,10 @@ def test_chat_skill_waits_with_one_blocking_listen_and_hands_over_a_long_chat():
     # Generic: no host model names or sizes in the advice.
     for text in (hosts, skill):
         assert not re.search(r"gpt-|claude-|\b\d+ ?[kM] tokens", text)
+
+
+def test_relayer_passes_along_cited_message_text():
+    """The project numbers messages differently from the relayer's chat, so a cited `#N` travels with its text."""
+    skill = " ".join((SKILLS / "tt-project" / "SKILL.md").read_text(encoding="utf-8").split())
+    assert "cite one of their own messages by number" in skill
+    assert "relay that message's text too, or at least the cited item" in skill
