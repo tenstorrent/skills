@@ -16,6 +16,15 @@ metadata:
     - repo: tenstorrent/tt-metal
       ref: 058b93d450f21b9b86a6ddf58f6f8f2c7744f8f1
       path: tt_metal/llrt/rtoptions.cpp
+    - repo: tenstorrent/tt-metal
+      ref: 8b53dfa87b68638895c1f48ad5eef24f62d54808
+      path: tools/tracy/perf_counter_multipass.py
+    - repo: tenstorrent/tt-metal
+      ref: 8b53dfa87b68638895c1f48ad5eef24f62d54808
+      path: tools/tracy/process_ops_logs.py
+    - repo: tenstorrent/tt-metal
+      ref: 5d54be8805315b56cb7d9f5a5050e86b95d5b74a
+      path: tt_metal/tools/profiler/STREAMING_PROFILER_DETAILED.md
 ---
 
 # tt-profiler
@@ -27,6 +36,11 @@ Tracy.
 
 Built by default. **Off at runtime**, so the overhead only arrives when you ask
 for it.
+
+On Blackhole, the [streaming profiler](https://github.com/tenstorrent/tt-metal/blob/main/tt_metal/tools/profiler/STREAMING_PROFILER_DETAILED.md)
+(`TT_METAL_STREAMING_PROFILER=1`, output via `TT_METAL_STREAMING_PROFILER_OPS_CSV` / `_ZONE_CSV`) drains continuously.
+It cannot run under `python -m tracy -p`: `-p` sets `TT_METAL_DEVICE_PROFILER=1`,
+and setting both is a fatal error at startup.
 
 ## When to invoke
 
@@ -51,13 +65,17 @@ TT_METAL_DEVICE_PROFILER=1 ./build/programming_examples/profiler/test_full_buffe
 Post-processing knobs — `_SUM`, `_ACCUMULATE`, `_SYNC`,
 `_DISABLE_DUMP_TO_FILES`, `_DISABLE_PUSH_TO_TRACY`, `_CPP_POST_PROCESS`,
 `_TRACE_TRACKING`, `_PROGRAM_SUPPORT_COUNT` — in `references/capture.md`, along
-with the Tracy entry points (`python -m tracy`, `tracy-capture`).
+with the Tracy entry points (`python -m tracy`, `tracy-capture`) and long runs,
+traced replay and many-chip meshes, where the buffer overflows.
 
 For the workflow question "which op dominates?" the answer is the ranked
 `tt-perf-report` on the ops-perf-results CSV that Tracy writes with
 `-p -r -v -m pytest`, one folder per run under
 `generated/profiler/reports/<timestamp>/`. Recipe, pandas fallback and the
-per-RISC bottleneck tags: `references/op-report.md`.
+per-RISC bottleneck tags, and profiling a warm forward rather than model load:
+`references/op-report.md`. For measured FPU, SFPU and Math utilisation per op
+(not the estimated `PM FPU UTIL (%)`): `references/perf-counters.md`. NoC, DRAM
+and Ethernet bandwidth columns, which need tt-npe: `references/noc-bandwidth.md`.
 
 In-kernel, after `#include <tools/profiler/kernel_profiler.hpp>`:
 
