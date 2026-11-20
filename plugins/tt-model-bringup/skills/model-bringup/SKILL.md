@@ -54,6 +54,8 @@ or replace acceptance criteria with a review plugin's criteria.
    are fine), keep a minimal repro and note it for an issue. `open`: the model may carry its own versions of
    ops, kernels and shared code, never meant for main; each changed op still has a test at model shapes, and
    the stage records what changed. The gates check this against `base_commit`.
+   Scope governs what lands, not how you debug: in either scope, instrumenting or patching code outside the
+   model to find a cause is fine on a side branch or worktree, reverted before the gate.
    Before the first device run, record in the run's brief whether bounded resets and multi-chip health
    checks are authorized on the run's machines (`tt-device-usage`). Without that answer, the first unclean
    exit stops an unattended run until someone replies.
