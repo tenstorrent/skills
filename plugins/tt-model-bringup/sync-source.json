@@ -225,7 +225,7 @@
       "destination": "skills/stage-review/SKILL.md",
       "blob": "7c89b9d281aa1a853a273d3ff4b1c16ad8ccac0d",
       "source_sha256": "b84c344e6a2c0130569dc7e4147ad748d44aa04afa11f181b0711d00afbe3466",
-      "packaged_sha256": "3c97b1a3d17a95d85104d720ddb460e1560a1761d4bab0b8f2e54e60a493fcb1"
+      "packaged_sha256": "afda74acdb851216b59cb3bbd3e3ad1a94a53d78c696b67ecb172c56e68f443d"
     },
     {
       "source": ".agents/skills/stage-review/agents/openai.yaml",
@@ -239,7 +239,7 @@
       "destination": "skills/tt-device-usage/SKILL.md",
       "blob": "273f20c58cbd80640677004635e43ce47d759891",
       "source_sha256": "b32b5685e47932e1356762c96f70f2ee5cc226ce23d5e1781f9a6bfe26a66502",
-      "packaged_sha256": "0290250d1e0f516c577d237740547988e8c7b31e2279b16d1d0d986beb0a3c80"
+      "packaged_sha256": "e6a66debca6a0ef331b276bf3196b95437589b7528925d72ac6f86f1904919aa"
     },
     {
       "source": ".agents/skills/tt-device-usage/agents/openai.yaml",
@@ -442,7 +442,7 @@
       "destination": "skills/tti-release/SKILL.md",
       "blob": "af09c19651cadaceb231edab4de3c9707801bc75",
       "source_sha256": "bec4650d82fd95793652014d078125ee9370528c09a3f95cfb381f4ef1447fef",
-      "packaged_sha256": "be5e772549fbbebc484a933b2cbd2e0470b39bdebae6e59a2ad18bb0d1b310bb"
+      "packaged_sha256": "54968a1a2b0a17f9bc75300edf455a55da355b704a81404d525472b36e1d5d49"
     },
     {
       "source": ".agents/skills/tti-release/agents/openai.yaml",

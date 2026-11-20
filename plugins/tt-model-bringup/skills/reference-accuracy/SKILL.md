@@ -46,14 +46,16 @@ record the per-group attribution if cheap and leave it to `datatype-sweep`.
 
 ## Outputs
 
-`doc/reference/reference.json`:
+`doc/reference/reference.json` (read by `scripts/check_reference_accuracy.py`):
 - `reference`: model, revision, dtype, device;
-- `slices`: per slice `name`, `kind`, `positions`, `tokens_sha256`, `logits_sha256`;
-- `full`: `meaning`, `unreached_ops`, `per_slice` {`kl_mean`, `kl_p95`, `top1`};
-- `current`: `precision`, `per_slice` (same fields); `tolerance` {`kl_p95`, `top1`} with its source;
+- `slices`: per slice `name`, `kind` (one of the six slice names above), `positions`, `tokens_sha256`, `logits_sha256`;
+- `full`: `meaning` (`bf16_hifi4`, `per_group`, `per_layer` or `bfp8_hifi4`, the fallbacks above in order),
+  `unreached_ops` (a list, `[]` when none), `per_slice` {slice name: {`kl_mean`, `kl_p95`, `top1`}};
+- `current`: `precision`, `per_slice` (same fields);
+- `tolerance` (top level): `kl_p95`, `top1`, `source`;
 - `verdict`: `match` or `divergence`; `divergences`: `where`, `cause`, `fix`, `status` (`fixed`, `open`);
-- `tiers`: `quick` (≈1–2K positions, minutes), `full` (all but `held_out`), `long`, `served`, each a
-  command; `baseline`: precision and per-slice numbers later changes are gated on.
+- `tiers`: `quick` (≈1–2K positions, minutes), `full` (all but `held_out`), `long`, `served`, each
+  {`command`}; `baseline`: precision and per-slice numbers later changes are gated on.
 
 `readiness/reference_check` (or the model's equivalent) runs any tier, or a stage-12 trajectory window,
 and writes the same per-position fields. `doc/reference/REPORT.md` leads with the verdict.

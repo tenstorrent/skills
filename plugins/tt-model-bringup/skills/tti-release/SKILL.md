@@ -69,7 +69,7 @@ The model autoport directory is the target implementation. Keep its exact relati
 2. Check devices in the reservation container:
 
 ```bash
-tt-smi -ls --local
+timeout 60 tt-smi -ls --local
 ```
 
 If Docker will be used, also check Docker on the physical host:
@@ -334,7 +334,7 @@ tmux kill-session -t autoport-vllm-<run-name> 2>/dev/null || true
 ssh "$PHYSICAL_HOST" "docker rm -f '$RUN_CONTAINER_ID'"  # only the recorded container created for this run
 ```
 
-2. Follow `$tt-device-usage` reset recovery from the reservation container. At minimum run the bounded list/reset/list sequence, retry reset once if devices or Ethernet links do not all return, and verify a mesh open/close before relaunching:
+2. Follow `$tt-device-usage` reset recovery from the reservation container; reset only when the operator authorized resets, otherwise report the reset as the operator's next step. At minimum run the bounded list/reset/list sequence, retry reset once if devices or Ethernet links do not all return, and verify a mesh open/close before relaunching:
 
 ```bash
 timeout 60 tt-smi -ls --local
@@ -425,7 +425,7 @@ Include:
 - small benchmark JSON files;
 - a `RUN_NOTES.md` with commands, versions, server mode, host/session, reset actions, report path, and pass/fail summary.
 
-Also include the run spec or report data that proves the implementation path. `RUN_NOTES.md` must have an "Autoport implementation check" line showing the target `models/autoports/<model>` path and whether the copied TTI artifacts matched it.
+Also include the run spec or report data that proves the implementation path. `RUN_NOTES.md` must have an "Autoport implementation check" line showing the target `models/autoports/<model>` path and whether the copied TTI artifacts matched it, and must record the release workflow exit, for example `EXIT_CODE=0`. `scripts/check-evidence.sh` reads these lines, a `report_*.md` in a `release/` directory or at most one directory below `doc/tti_release/`, and the JSON under `run_specs/`, `reports_output/release/data/` or named `*model*spec*.json` / `*report*data*.json`.
 
 Do not copy:
 

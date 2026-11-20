@@ -58,7 +58,7 @@ print("MESH_SMOKE_OK")
 PY
 ```
 
-Adjust `MeshShape` for non-T3K targets. Record the final device list and mesh-smoke result.
+Run it under the bounded timeout from Basic Rules and adjust `MeshShape` for non-T3K targets. Record the final device list and mesh-smoke result.
 
 ## ARC / ERISC / Remote Ethernet Recovery
 
@@ -77,9 +77,9 @@ Recovery sequence:
 
 1. Stop only risky or stale processes from this run: `EngineCore`, `vllm.entrypoints`, `run_vllm_server`, model benchmark processes, stale `pytest`, stale Tracy, and stale profiler jobs.
 2. Do not start more profiler, watcher, serving-adapter profiler, or `ttnn.ReadDeviceProfiler(mesh)` work while hardware is unhealthy.
-3. Run the bounded list/reset/list sequence above.
+3. Run the bounded list/reset/list sequence above if the operator's brief authorizes resets; otherwise record the wedged chips and report the reset as the operator's next step.
 4. If listing is incomplete after the first successful reset, run the bounded reset sequence once more.
-5. If devices are visible, clear stale TT UMD locks only after confirming no live process from this run owns the devices. Then run the mesh smoke.
+5. If devices are visible, clear stale TT UMD locks only after confirming no live process owns the devices, from this run or any other (`fuser`). Then run the mesh smoke.
 6. If reset, listing, or mesh smoke still fails, ask the monitor/operator for a physical Docker-host reboot and reservation re-acquire. If the current agent explicitly owns experiment monitoring or machine recovery, reboot the host directly and repeat list/reset/list plus mesh smoke after reconnecting.
 7. Resume the same stage from preserved state. In the multigoal flow, use `--resume-stage <stage_number> --log-dir <preserved_run_directory>` with the same Codex home recorded in the manifest instead of restarting completed earlier stages.
 8. Record this as infrastructure recovery, not a model correctness or performance result.
