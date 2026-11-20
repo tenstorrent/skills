@@ -5203,9 +5203,9 @@ limits are settings (`rollout.thresholds`: `failed_runs_pts`, `min_runs`, `land_
 alert for the project's coordinator; the flag stays off there until `ttp rollout arm <flag> <project>`, which
 restarts that project's judging window at the re-arm. A `ttp rollout rollback` by hand turns the flag off
 everywhere until `ttp rollout arm <flag>`, which puts it back at the level it had before the rollback. A flag
-promotes one ring
-only when every project listed in its current ring has voted clean (enough samples, no failing signal) after the
-ring's soak (1 h in ring 0, 24 h in ring 1). Too few samples never promote: after 72 h a low note says so.
+promotes one ring only when every project listed in its current ring has voted clean (enough samples, no failing
+signal) after the ring's soak (1 h in ring 0, 24 h in ring 1). Too few samples never promote: after 72 h a low
+note says so.
 `promote` by hand ignores health, as the user's own word. A project's own explicit setting for the feature's key
 is never touched by the watch.
 

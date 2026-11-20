@@ -822,6 +822,51 @@ def test_gh_workstation_allows_pr_upkeep_title_body_edits_review_replies_and_clo
     assert ghqueue.pull("lab-box", gh) == "lab-box: no gh calls queued"
 
 
+def test_gh_workstation_reruns_only_a_run_on_its_own_open_draft_prs_head(env, monkeypatch):
+    """`run rerun <id>` (optionally --failed) passes the allowlist; the workstation reads the run's head,
+    the repo's default branch, the open PRs on that branch and its own login just before, and reruns only
+    when the head sha is the head of an open draft its gh user opened. Every other `run` call is refused."""
+    from ttp import ghqueue
+    _cfg, _repo, _gh, ws_calls = _workstation(env, monkeypatch)
+    for ok in (["run", "rerun", "77", "--failed"], ["run", "rerun", "77"],
+               ["run", "rerun", "--failed", "77", "-R", "acme/widgets"], ["run", "rerun", "77", "--repo=acme/widgets"]):
+        assert ghqueue.allowed(ok) == "", ok
+    for bad in (["run", "rerun"], ["run", "rerun", "77", "78"], ["run", "rerun", "abc"],
+                ["run", "rerun", "77", "--job", "5"], ["run", "rerun", "77", "--debug"],
+                ["run", "rerun", "77", "--failed", "--failed"], ["run", "rerun", "77", "--failed=true"],
+                ["run", "cancel", "77"], ["run", "delete", "77"], ["workflow", "run", "ci.yml"]):
+        assert ghqueue.allowed(bad), bad
+
+    ws = ws_calls.parent
+    run, prs = ws / "run.json", ws / "prs.json"
+    stub = ws / "gh-rerun"
+    stub.write_text("#!/bin/sh\n"
+                    f'printf "%s\\n" "$*" >> "{ws_calls}"\n'
+                    f'case "$1 $2" in "run view") cat "{run}";; "pr list") cat "{prs}";; "api user") echo me;;\n'
+                    ' "api repos/acme/widgets") echo main;; *) echo "ws: $*";; esac\n')
+    stub.chmod(0o755)
+    sha, old = "a" * 40, "b" * 40
+    rerun = ["run", "rerun", "77", "--failed", "-R", "acme/widgets"]
+
+    def pr(draft=True, login="ME", head=sha):
+        return {"isDraft": draft, "author": {"login": login}, "headRefOid": head}
+    for branch, open_prs, refused in (("ttp/t1-x", [pr(login="someone-else")], "someone else's"),
+                                      ("ttp/t1-x", [pr(draft=False)], "not a draft"),
+                                      ("ttp/t1-x", [pr(head=old)], "not on the head of an open PR"),
+                                      ("ttp/t1-x", [], "not on the head of an open PR"),
+                                      ("main", [pr()], "default branch"),
+                                      ("", [pr()], "could not resolve the run's head"),
+                                      ("ttp/t1-x", [pr(login="someone-else"), pr()], "")):
+        run.write_text(json.dumps({"headBranch": branch, "headSha": sha}) if branch else "not json")
+        prs.write_text(json.dumps(open_prs))
+        got = ghqueue.answer({"key": "e" * 32, "argv": rerun, "stdin": ""}, str(stub))
+        assert (refused in got["stderr"] and got["rc"] == 1) if refused else (got["rc"] == 0 and not got["stderr"]), got
+    calls = ws_calls.read_text().splitlines()
+    assert sum(c.startswith("run rerun") for c in calls) == 1, calls   # only the run on its own draft's head
+    assert "run view 77 --repo=acme/widgets --json headBranch,headSha" in calls
+    assert ("pr list --repo=acme/widgets --head ttp/t1-x --state open --json isDraft,author,headRefOid" in calls)
+
+
 def test_gh_queue_entries_carry_the_registered_project_name_not_the_tt_project_folder(env, monkeypatch):
     """Every project's folder is tt-project, so a queue entry names the project as `ttp list` shows it
     (its registry entry), else its configured name or root folder; never a path."""

@@ -169,7 +169,6 @@ DIGEST_HEADER = "## Rollout flags (the state is the signal: never hold flag-gate
 
 def state_line(project: str, raw: dict | None = None) -> str:
     """Every flag's state for `project` on one line (its own setting for the flag's key wins)."""
-    raw = raw if raw is not None else {}
     return ", ".join(f"{f}: {'on' if on(f, project, raw) else 'off'}" for f in FLAGS)
 
 
@@ -368,8 +367,10 @@ def arm(flag: str, reason: str = "", by: str = "user", project: str = "") -> str
         _record("arm", flag, OFF, left, reason or "fix landed", by)
         if left not in (OFF, hand):
             _put("flags", flag, left)
-    return f"{flag} re-armed at {restore}, its level before the rollback" if restore != OFF \
-        else f"{flag} re-armed (off); promote it from ring 0"
+    if left == OFF:
+        return f"{flag} re-armed (off); promote it from ring 0"
+    return f"{flag} re-armed at {left}, " + ("its level before the rollback" if left == restore
+                                              else "the level set by hand after the rollback")
 
 
 def set_ring(project: str, ring: str, by: str = "user") -> str:

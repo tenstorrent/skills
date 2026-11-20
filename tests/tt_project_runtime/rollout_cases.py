@@ -1091,49 +1091,41 @@ def test_rollout_on_for_a_project_that_does_not_exist_is_a_broken_probe(env, cap
 
 def test_arm_restores_the_level_the_flag_had_before_the_rollback(env, capsys):
     """`arm` alone puts a rolled-back flag back at the level the rollback took it from: one command,
-    no `set` after it (the user's glm_code case: back at ring 1 after the automatic rollback)."""
+    no `set` after it."""
     from ttp import rollout
     _roll(capsys, "ring", "canary", "1")
     _roll(capsys, "set", "glm_code", "1")
-    rollout.rollback("glm_code", "failed runs up", "daemon:canary")   # an automatic rollback
+    rollout.rollback("glm_code", "failed runs up", "daemon:canary")
     assert rollout.level("glm_code") == rollout.OFF and rollout.frozen("glm_code")
     code, out = _roll(capsys, "arm", "glm_code")
-    assert code == 0 and "re-armed at 1" in out, "the printed line names the restored level"
+    assert code == 0 and "re-armed at 1, its level before the rollback" in out
     assert rollout.level("glm_code") == 1 and rollout.frozen("glm_code") is None
     assert rollout.on("glm_code", "canary") and not rollout.on("glm_code", "everyone")
     last = rollout.ledger("glm_code")[-1]
     assert last["kind"] == "arm" and last["to"] == 1
 
 
-def test_a_level_set_by_hand_after_the_rollback_wins_over_the_restored_one(env, capsys):
-    from ttp import rollout
-    from ttp import project
-    _roll(capsys, "set", "deslop", "1")
-    rollout.rollback("deslop", "failed runs up", "daemon:x")
-    project.set_account_setting("rollout.flags", {"deslop": 2})   # a hand set while frozen
-    assert "re-armed" in _roll(capsys, "arm", "deslop")[1]
-    assert rollout.level("deslop") == 2 and rollout.frozen("deslop") is None
-
-
-def test_arm_ledgers_the_level_it_leaves_in_force(env, capsys):
-    """The arm record's `to` names the level actually left in force, so the digest's change line does too:
-    a hand-set level wins over the restored one, and auto restored onto no waves leaves the flag off."""
+def test_arm_leaves_in_force_a_hand_set_level_or_off_for_auto_without_waves(env, capsys):
+    """The level `arm` leaves in force, printed and ledgered (so the digest's change line names it too):
+    a level set by hand after the rollback wins over the restored one, and auto restored onto no waves
+    leaves the flag off."""
     from ttp import rollout
     from ttp import project
     _roll(capsys, "set", "deslop", "1")
     rollout.rollback("deslop", "failed runs up", "daemon:x")
     project.set_account_setting("rollout.flags", {"deslop": 2})   # a hand set while frozen: it wins
-    assert _roll(capsys, "arm", "deslop")[0] == 0
+    code, out = _roll(capsys, "arm", "deslop")
+    assert code == 0 and "re-armed at 2, the level set by hand" in out, "the hand-set level, not the restored 1"
+    assert rollout.level("deslop") == 2 and rollout.frozen("deslop") is None
     last = rollout.ledger("deslop")[-1]
-    assert last["kind"] == "arm" and last["to"] == 2, "the hand-set level, not the restored 1"
-    assert rollout.level("deslop") == 2
+    assert last["kind"] == "arm" and last["to"] == 2
     _roll(capsys, "waves", "glm_code", "alpha,beta")
     _roll(capsys, "set", "glm_code", "auto")
     rollout.rollback("glm_code", "failed runs up", "daemon:x")
     _roll(capsys, "waves", "glm_code", "clear")   # auto restored onto no waves would turn nothing on
-    assert _roll(capsys, "arm", "glm_code")[0] == 0
+    assert "re-armed (off)" in _roll(capsys, "arm", "glm_code")[1]
     last = rollout.ledger("glm_code")[-1]
-    assert last["kind"] == "arm" and last["to"] == rollout.OFF, "auto with no waves leaves the flag off"
+    assert last["kind"] == "arm" and last["to"] == rollout.OFF
     assert rollout.level("glm_code") == rollout.OFF
 
 

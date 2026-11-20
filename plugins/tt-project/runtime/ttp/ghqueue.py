@@ -51,6 +51,8 @@ _NEVER = {"--web", "-w", "--editor", "-e", "--delete-last"}   # opens a browser 
 _EDIT_FLAGS = {"--title": "--title", "-t": "--title", "--body": "--body", "-b": "--body", "--body-file": "--body",
                "-F": "--body", "--repo": "--repo", "-R": "--repo"}
 _CLOSE_FLAGS = {"--comment": "--comment", "-c": "--comment", "--repo": "--repo", "-R": "--repo"}
+_REPO_FLAGS = {"--repo": "--repo", "-R": "--repo"}
+_RUN_ID = re.compile(r"[0-9]+")
 _REPLY_PATH = re.compile(r"/?repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pulls/[0-9]+/comments/[0-9]+/replies")
 _REPLY_FLAGS = {"-X": "method", "--method": "method", "-f": "field", "--raw-field": "field"}
 # A project's own task branches (worktree's ttp/t<id>-<topic>, harness and revert branches); only these may be
@@ -174,6 +176,61 @@ def own_draft(gh: str, argv: list[str]) -> str:
     author = v.get("author") if isinstance(v.get("author"), dict) else {}
     if not login or str(author.get("login") or "").lower() != login.lower():
         return "`gh pr close` closes only a draft this workstation's gh user opened, and this PR is someone else's"
+    return ""
+
+
+def _rerun(argv: list[str]) -> tuple[str, str, str]:
+    """(why `gh run rerun argv` is refused or "", the run id, the repo or ""): only `run rerun <id>` with
+    an optional --failed and --repo, nothing else (no --job, no --debug)."""
+    rest = [a for a in argv[2:] if a != "--failed"]
+    pos, opts, why = _parse(rest, _REPO_FLAGS)
+    if why or len(argv) - 2 - len(rest) > 1:
+        return f"`gh run rerun`: {why or 'a flag is given twice'} (only an optional --failed)", "", ""
+    if len(pos) != 1 or not _RUN_ID.fullmatch(pos[0]):
+        return "`gh run rerun` names exactly one run by its numeric id", "", ""
+    return "", pos[0], opts.get("--repo", [""])[0]
+
+
+def own_draft_run(gh: str, argv: list[str]) -> str:
+    """Why the workstation must not rerun the run `gh run rerun argv` names, or "": read just before it,
+    the run's head sha must be the head of an open draft PR this workstation's gh user opened, and its
+    branch never the repo's default branch."""
+    why, run, repo = _rerun(argv)
+    if why or not repo:
+        return why or "`gh run rerun` names no repo"
+    unread = "could not resolve the run's head to check it is our own draft PR's"
+    try:
+        view = subprocess.run([gh, "run", "view", run, f"--repo={repo}", "--json", "headBranch,headSha"],
+                              capture_output=True, timeout=GH_TIMEOUT_S)
+        head = json.loads(view.stdout) if view.returncode == 0 else {}
+        head = head if isinstance(head, dict) else {}
+        branch, sha = str(head.get("headBranch") or ""), str(head.get("headSha") or "")
+        if not branch or not _SHA.fullmatch(sha):
+            return unread
+        default = _default_branch(gh, repo)
+        if not default:
+            return "could not read the repo's default branch before a rerun"
+        if branch == default:
+            return f"the run is on `{branch}`, the repo's default branch, and is never rerun from here"
+        prs = subprocess.run([gh, "pr", "list", f"--repo={repo}", "--head", branch, "--state", "open", "--json",
+                              "isDraft,author,headRefOid"], capture_output=True, timeout=GH_TIMEOUT_S)
+        me = subprocess.run([gh, "api", "user", "--jq", ".login"], capture_output=True, timeout=GH_TIMEOUT_S)
+        if prs.returncode or me.returncode:
+            return unread
+        found = json.loads(prs.stdout)
+        login = me.stdout.decode().strip()
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return unread
+    found = [p for p in found if isinstance(p, dict) and p.get("headRefOid") == sha] if isinstance(found, list) else []
+    if not found:
+        return "the run is not on the head of an open PR"
+    mine = [p for p in found if login and str((p.get("author") if isinstance(p.get("author"), dict) else {})
+                                              .get("login") or "").lower() == login.lower()]
+    if not mine:
+        return ("`gh run rerun` reruns only a run of a draft this workstation's gh user opened, and this PR is "
+                "someone else's")
+    if not any(p.get("isDraft") is True for p in mine):
+        return "`gh run rerun` reruns only a run of a draft PR, and this one is not a draft"
     return ""
 
 
@@ -304,10 +361,12 @@ def allowed(argv, stdin: bytes = b"", prefixes=()) -> str:
     workstation also reads its tip first and refuses the default branch), `pr edit`
     of the title or body only and `pr close` (the workstation also checks the PR is its own draft), each
     post, body or comment ending with the AI-authorship tag, and `repo fork <owner>/<repo> --fork-name
-    <name> --clone=false` (the workstation also checks <its gh user>/<name> does not exist yet), and the
+    <name> --clone=false` (the workstation also checks <its gh user>/<name> does not exist yet), `run rerun
+    <id>` with an optional --failed (the workstation also checks the run is on its own open draft PR's
+    head, never the default branch), and the
     queue's own `git-publish` of one such branch (a new branch or a fast-forward); `prefixes` grants branch
     prefixes beyond ttp/ (the workstation's bridge config, the box's delivery.gh_branch_prefixes); never
-    `pr ready`, a merge, a reviewer, a label or anything else."""
+    `pr ready`, a merge, a reviewer, a label, `run cancel`, `workflow run` or anything else."""
     if not isinstance(argv, list) or not argv or not all(isinstance(a, str) and "\0" not in a for a in argv):
         return "not a list of plain arguments"
     if bad := next((a for a in argv if _BUNDLED.fullmatch(a)), None):
@@ -337,6 +396,8 @@ def allowed(argv, stdin: bytes = b"", prefixes=()) -> str:
         return _upkeep(argv, stdin)
     if pair == ("repo", "fork"):
         return _fork(argv)[0]
+    if pair == ("run", "rerun"):
+        return _rerun(argv)[0]
     if pair not in _POSTS:
         return f"`gh {' '.join(argv[:2])}` is not on the workstation's allowlist"
     if pair == ("pr", "create") and not any(a in ("--draft", "-d") for a in argv):
@@ -558,6 +619,8 @@ def answer(entry: dict, gh: str | None = None, prefixes=()) -> dict | None:
         return {"key": key, "rc": rc, "stdout": f"{said}\n" if rc == 0 else "", "stderr": "" if rc == 0 else said,
                 **({"pushed": argv[3]} if rc == 0 else {})}
     if argv[:2] == ["pr", "close"] and (why := own_draft(gh, argv)):
+        return {"key": key, "rc": 1, "stdout": "", "stderr": f"refused on the workstation: {why}"}
+    if argv[:2] == ["run", "rerun"] and (why := own_draft_run(gh, argv)):
         return {"key": key, "rc": 1, "stdout": "", "stderr": f"refused on the workstation: {why}"}
     if argv[:2] == ["repo", "fork"] and (why := fork_free(gh, argv)):
         return {"key": key, "rc": 1, "stdout": "", "stderr": f"refused on the workstation: {why}"}
