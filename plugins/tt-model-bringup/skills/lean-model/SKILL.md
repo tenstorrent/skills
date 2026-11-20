@@ -45,6 +45,21 @@ Load the references when you reach them, not up front: [ops and kernels](referen
 A workable order: plan (no device) → correct skeleton at B1 → design-shaping features → speed and precision →
 hardening. Overlap them wherever the work is independent.
 
+## Heads-ups
+
+Things that have cost earlier bringups time. They are not requirements; use them where they apply.
+
+- Speed work tends to get crowded out by correctness and serving fixes. Keeping someone on the top perf item
+  once the model is correct has helped.
+- PCC close to 1 can still hide a small difference that flips a discrete choice (expert routing, top-k) later in
+  the model. Comparing batched against alone on generated tokens, not only PCC, has caught this.
+- A teacher-forced comparison on a few dozen positions cannot separate small top-1 differences; size it to the
+  decision.
+- Some bugs showed up only with real traffic: kernels compiling per request after warmup, host work per step,
+  allocations of different modules colliding, unusual prompt lengths (very short, at chunk edges).
+- Running several agents on one board without the `tt-device-usage` rules has hung boards and lost hosts.
+- Firmware differences between machines have looked like model bugs.
+
 ## Tests
 
 | Tier | When | What |
@@ -56,34 +71,15 @@ hardening. Overlap them wherever the work is independent.
 Keep T1 near ten minutes so it runs often. Every device run has a timeout. Never loosen a check or delete one
 to pass; a numerics change moves the baseline only after T2.
 
-What the tiers must contain, because these bugs pass weaker checks:
-- **Batched equals alone:** run the largest batch with mixed prompts and compare each user with the same prompt run
-  alone over at least 1,000 generated tokens: identical greedy tokens, and logits bitwise where the ops allow. A
-  PCC near 1 is not enough: a difference of 1e-5 can flip a routing or top-k choice many layers later. Name any op
-  that is not batch-invariant with its largest difference.
-- **Enough positions:** a teacher-forced comparison needs enough positions to resolve the difference it decides
-  on; to tell top-1 apart by 0.5 points, use several thousand positions, not a few dozen.
-- **Warmup covers every shape:** prefill lengths 1, 2, an odd length, chunk size − 1, chunk size and chunk size + 1,
-  and the longest context, at every batch. After warmup, the program-cache count does not change across a
-  mixed-length request loop; a change means something compiles per request.
-- **Host time per step** is measured beside device time in every perf result. Host work that grows with batch,
-  context or table size shows up only there.
-- **Model memory map:** keep one map of persistent on-chip and DRAM allocations per module; T2 runs every module
-  together at the largest batch and longest context, where allocations of different modules collide.
-
 ## Working in parallel
 
 One coordinator plans, briefs, lands and reports, and never blocks on a wait. A subagent gets one deliverable,
 the files it owns, the ones it must not touch, its device slot, its tests and how to report. Good units: the
 CPU reference, the op inventory, one module or layer kind each, the integration skeleton, later one perf hotspot
-each. Run only as many live agents as the coordinator can review: a report should be reviewed and landed or
-answered within about an hour, or the next agent waits. Landing: batch reports, cherry-pick onto head, run T1
-once, announce the new head; agents rebase.
+each. The coordinator's review is the bottleneck, so a handful of live agents is usually the useful limit.
+Landing: cherry-pick onto head, run T1, announce the new head; agents rebase.
 
-From the first correct skeleton on, one agent always owns the top item of the perf ranking, and every milestone
-report gives measured and floor per batch. Speed work is never parked until the end.
-
-Experiment where a measurement can decide. At most about a fifth of the budget goes to throwaway prototypes on side branches (another
+Experiment where a measurement can decide. A share of the budget, which you choose and record, can go to throwaway prototypes on side branches (another
 layout, a fused op, a different parallel scheme), run side by side and judged only by measurement. Land the
 winner, drop the rest. Scope risky work as "measure and report before building", bugs as "root cause before fix".
 
@@ -91,13 +87,11 @@ winner, drop the rest. Scope risky work as "measure and report before building",
 
 `port` (default, a model close to one in tt-metal), `fresh` (a new architecture: spec, captures and per-module
 ports first), `speedup` (an existing correct model: start at the perf loop, gated by the reference suite),
-`quick` (existing ops only, perf within 2× of target, to reach serving and evals soon).
+`quick` (existing ops only, speed secondary, to reach serving and evals soon).
 
 ## Devices and budget
 
 Every device job runs under a lock with a timeout; an unclean exit resets the board and checks it before the
-next job (`tt-device-usage`). Set this up before the first device run, not after the first incident. When two
-machines disagree on a numeric result, compare firmware and driver versions and rerun on the other machine before
-debugging the model. `budget_hours` in `model.json` bounds the goal: use it to get closer to the targets, and when it ends, report
+next job (`tt-device-usage`). `budget_hours` in `model.json` bounds the goal: use it to get closer to the targets, and when it ends, report
 as is. A missed target is reported with its reason; it is not a reason to stop before the budget is spent.
 Commit summaries, not raw output (`model-bringup`). One `stage-review`, at the end.
