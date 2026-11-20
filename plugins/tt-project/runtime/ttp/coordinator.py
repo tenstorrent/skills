@@ -6533,19 +6533,21 @@ def restriction_pairs(charter: str) -> list[dict]:
     (_overlaps), whatever their conditions or scopes. Workers obey both as binding, so the stricter one
     wins and the permitting one may do nothing. Each pair once, with a stable `key`; sentences of one
     item are never paired (an item may state its own exception in a second sentence), nor is a ban
-    that names its own exception (_OWN_EXCEPTION_RE)."""
+    that names its own exception (_OWN_EXCEPTION_RE). A scoped exception (SCOPED_EXCEPTION) is never the
+    permitting side: its scope was checked when it was added (_scoped_exception)."""
     items = _restriction_items(charter)
     whole: dict[int, str] = {}
     for x, _, n in items:
         whole[n] = whole.get(n, "") + " " + _loose(x)
+    head, tail = (_loose(x) for x in (SCOPED_EXCEPTION.split("{clause}")[0], SCOPED_EXCEPTION.split("{section}")[1]))
+    scoped = {n for n, t in whole.items() if t.lstrip().startswith(head) and tail in t}
     out, seen = [], set()
     for f, fsec, fn in items:
         if not _BAN_RE.search(f) or _OWN_EXCEPTION_RE.search(f):
             continue
-        excepted = _loose(SCOPED_EXCEPTION.split("{clause}")[0] + restriction_source.bare(f).strip())
         for a, asec, an in items:
             if (an == fn or not _PERMIT_RE.search(a) or frozenset((f, a)) in seen
-                    or not _overlaps(f, a, strict=True) or excepted in whole[an]):   # a scoped exception to f
+                    or not _overlaps(f, a, strict=True) or an in scoped):
                 continue
             seen.add(frozenset((f, a)))
             key = hashlib.sha256(f"{' '.join(f.split())}\n{' '.join(a.split())}".encode()).hexdigest()[:12]

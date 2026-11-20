@@ -2758,6 +2758,25 @@ def test_restriction_pairs_flags_contradicting_restrictions_items_and_only_those
         assert pairs(body) == [], body
 
 
+def test_restriction_pairs_never_takes_a_scoped_exception_as_the_permitting_side(env):
+    from ttp.coordinator import SCOPED_EXCEPTION, restriction_pairs
+
+    def pairs(body):
+        return [(x["forbid"], x["allow"]) for x in restriction_pairs(f"# demo\n\n## Restrictions\n{body}")]
+
+    def scoped(ban, scope):
+        return SCOPED_EXCEPTION.format(clause=ban, section="Restrictions") + scope
+    bans = ("Never push to main of the docs repo.", "Never push tags to the docs repo.")
+    # Each exception names one ban; both share wording with the other ban, which was paired before.
+    body = "".join(f"- {b}\n" for b in bans) + "".join(
+        f"- {scoped(b, s)}\n" for b, s in zip(bans, ("one hotfix may be pushed to main of the docs repo.",
+                                                     "one release tag may be pushed to the docs repo.")))
+    assert pairs(body) == []
+    # A plain permitting item that contradicts the bans still pairs with each, beside the scoped exceptions.
+    allow = "Pushing tags to the docs repo is allowed."
+    assert sorted(pairs(f"{body}- {allow}\n")) == [(b, allow) for b in sorted(bans)]
+
+
 
 def test_only_or_alone_is_a_limit_only_when_it_names_an_actor_so_a_scoped_lift_is_flagged(env):
     """Neither the guard (_append_conflicts) nor the lint (restriction_pairs) reads "only"/"alone": a
