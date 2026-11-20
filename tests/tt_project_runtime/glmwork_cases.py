@@ -47,6 +47,35 @@ def test_glm_work_ring_gate_keeps_a_projects_own_setting_and_is_off_without_the_
     assert not glmwork.covered(glmwork.ring_gate(cfg, "alpha", {}))   # no ring: off
 
 
+def test_a_glm_work_rollback_leaves_the_device_route_on_where_glm_device_covers_the_project(env):
+    from ttp import deviceplan, glmwork, rollout
+    p = make(env)
+    rollout.set_ring("alpha", "0")
+    rollout.set_waves("glm_work", ["alpha"])
+    rollout.set_level("glm_work", rollout.AUTO, "t")
+    rollout.set_level("glm_device", 0, "t")
+    base = lambda: {"route": {"glm_work": {"model": _GW_MODEL, "holdout": 0}}}   # noqa: E731
+    gate = lambda: glmwork.ring_gate(base(), "alpha", {})   # noqa: E731
+    dev = _gw_task(p, "Rebuild the driver and run the box test.", labels=["resource:box-a-device"])
+    plain = _gw_task(p)
+    cfg = gate()
+    assert glmwork.settings(cfg) and not glmwork.device_only(cfg) and deviceplan.on(cfg)
+    assert glmwork.keeps_core(p.db, cfg, plain, "standard") == ""
+    assert rollout.stop_project("glm_work", "alpha", "worse")
+    cfg = gate()
+    assert glmwork.device_only(cfg) and deviceplan.on(cfg) and glmwork.settings(cfg)["model"] == _GW_MODEL
+    assert glmwork.keeps_core(p.db, cfg, dev, "standard") == "", "the device task keeps the GLM route"
+    assert glmwork.keeps_core(p.db, cfg, plain, "standard") == "glm_work off", "everything else is back on core"
+    got = _gw_daemon(p, cfg)._route(dev, "standard", None, 1.0, cls="routine")
+    assert got and got[glmwork.KEY] == "glm" and _gw_daemon(p, cfg)._route(plain, "standard", None, 1.0, cls="routine") is None
+    rollout.stop_project("glm_device", "alpha", "device harm")   # glm_device's own stop still turns the route off
+    cfg = gate()
+    assert not glmwork.covered(cfg) and not deviceplan.on(cfg) and glmwork.settings(cfg) is None
+    rollout.arm("glm_device", project="alpha")
+    own = glmwork.ring_gate(base(), "alpha", {"route": {"glm_work": {"on": False}}})
+    assert not glmwork.device_only(own), "a project's own glm_work setting still wins"
+
+
 def test_glm_work_keeps_every_protected_run_on_core(env):
     """Coordinator, plan, review, verdict, deep, pins, outside text, retries, GLM bounces, person-facing, design
     or optimization, device and off-list kinds stay on core; a plain work, question, harness or code run may go."""

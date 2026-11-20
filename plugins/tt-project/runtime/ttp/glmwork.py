@@ -56,8 +56,15 @@ def _raw(cfg: dict) -> dict:
     return got if isinstance(got, dict) else {}
 
 
+def device_only(cfg: dict) -> bool:
+    """glm_work is off for the project (rolled back or its flag off) while glm_device covers it: only its device
+    tasks keep the GLM route (ring_gate sets `route.glm_work.device_only`)."""
+    g = _raw(cfg)
+    return g.get("on") is not True and g.get("device_only") is True
+
+
 def covered(cfg: dict) -> bool:
-    return _raw(cfg).get("on") is True
+    return _raw(cfg).get("on") is True or device_only(cfg)
 
 
 def model(cfg: dict) -> str:
@@ -119,7 +126,8 @@ def contract() -> str:
 
 def ring_gate(cfg: dict, project: str, raw: dict | None) -> dict:
     """Apply the `glm_work` release flag (rollout.py) to `cfg`, in place, and return it. The project's own
-    `route.glm_work.on` in its project.json wins as written; else the flag decides (off in doubt)."""
+    `route.glm_work.on` in its project.json wins as written; else the flag decides (off in doubt). With the flag
+    off for the project, the device route still follows glm_device (device_only)."""
     from . import deviceplan, rollout
     try:
         if rollout.own_setting(raw, rollout.FLAGS[KEY]["key"]):
@@ -127,9 +135,13 @@ def ring_gate(cfg: dict, project: str, raw: dict | None) -> dict:
         on = rollout.on(KEY, project, raw)
     except Exception:
         on = False
-    if not (on == covered(cfg) and "on" in _raw(cfg)):
-        cfg["route"] = {**(cfg.get("route") or {}), KEY: {**_raw(cfg), "on": on}}
-    return deviceplan.gate(cfg, project, raw)
+    g = {**_raw(cfg), "on": on}
+    g.pop("device_only", None)
+    cfg["route"] = {**(cfg.get("route") or {}), KEY: g}
+    deviceplan.gate(cfg, project, raw)
+    if not on and deviceplan.settings(cfg)["on"]:
+        cfg["route"][KEY] = {**_raw(cfg), "device_only": True}
+    return cfg
 
 
 def holdout(db, cfg: dict) -> float:
@@ -219,6 +231,8 @@ def keeps_core(db, cfg: dict, task: dict, tier: str, cls: str | None = None, pic
     text = f"{task.get('title') or ''}\n{task.get('spec') or ''}"
     if cls == "coordinator" or kind in ("plan", "review"):
         return kind if kind in ("plan", "review") else "coordinator"
+    if device_only(cfg) and not deviceplan.device(task, cfg):
+        return "glm_work off"   # rolled back: the GLM route stays for device tasks only (glm_device's own flag)
     labels = task_labels(task)
     if tier == "deep" or any(lb in ("user_deep", "needs_deep") for lb in labels) or effort.wants_deep(task.get("result")):
         return "deep"

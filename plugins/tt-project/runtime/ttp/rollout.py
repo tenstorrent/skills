@@ -284,6 +284,13 @@ def vote(flag: str, project: str, snapshot: dict) -> None:
             _record("clean", flag, level(flag), level(flag), f"{project} clean", f"daemon:{project}", snapshot)
 
 
+def armed_at(project: str, *flags: str) -> float:
+    """When the terminal last re-armed `project` for any of `flags` (0: never): the judged window of its outcomes
+    starts there, so the outcomes that led to the rollback never count against the fix."""
+    return max((float(r.get("ts") or 0) for f in flags for r in ledger(f)
+                if r.get("op") == "project_arm" and r.get("project") == project), default=0.0)
+
+
 def arm(flag: str, reason: str = "", by: str = "user", project: str = "") -> str:
     """Unfreeze a rolled-back flag; with `project`, re-arm that project's own wave rollback."""
     _check(flag)

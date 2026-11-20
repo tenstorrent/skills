@@ -190,6 +190,48 @@ def test_glm_share_judge_says_not_enough_data_below_the_minimum_sample_in_either
     v = glmshare.judge(p, {"route": {"glm_work": {"min_tasks": 4, "min_base": 5}}}, now)   # 4 of 5 baseline
     assert v["state"] == "wait" and "4 of 5 baseline tasks" in v["why"], v
 
+def test_a_re_arm_starts_a_new_window_and_a_rolled_back_project_waits_for_new_outcomes(env):
+    from ttp import glmshare, rollout
+    p = make(env)
+    now = time.time()
+    t0, _ = _gs_waved(p, now, glm_passed=(0, 0, 0, 0))
+    assert glmshare.judge(p, _GS_CFG, now)["state"] == "worse"
+    assert rollout.stop_project("glm_work", p.name, "worse") and "re-armed" in rollout.arm("glm_work", project=p.name)
+    later = time.time() + 600
+    v = glmshare.judge(p, _GS_CFG, later)
+    assert (v["state"], v["n"]) == ("wait", 0), "the outcomes before the arm no longer count"
+    for _ in range(3):
+        _gs_decided(p, later, 1, arm="glm")
+    v = glmshare.judge(p, _GS_CFG, later + 3600)
+    assert (v["state"], v["n"]) == ("wait", 3) and "3 of 4 GLM tasks" in v["why"]
+    _gs_decided(p, later, 1, arm="glm")
+    assert glmshare.judge(p, _GS_CFG, later + 3600)["state"] == "ok"
+    assert rollout.armed_at("other", "glm_work") == 0.0, "another project's arm is its own"
+
+
+def test_glm_device_runs_leave_the_glm_work_judgment_but_a_device_incident_after_the_arm_still_rolls_back(env):
+    from ttp import glmshare, rollout
+    p = make(env)
+    now = time.time()
+    t0, _ = _gs_waved(p, now)
+    box = ["needs_device", "resource:box-a-device"]
+    dev = [_gs_decided(p, t0 + 7200, 0, arm="glm") for _ in range(4)]
+    for tid in dev:
+        p.db.update_task(tid, labels=box)
+    v = glmshare.judge(p, _GS_CFG, now)
+    assert (v["state"], v["n"]) == ("ok", 4), "failed device tasks are not glm_work outcomes"
+    rollout.stop_project("glm_work", p.name, "worse")
+    rollout.arm("glm_work", project=p.name)
+    later = time.time() + 600
+    d = _gs_decided(p, later, 1, arm="glm")
+    p.db.update_task(d, labels=box)
+    p.db.x("INSERT INTO events(ts,source,kind,text,task) VALUES(?,?,?,?,?)", (later + 60, "watcher", "device_reset", "box-a-device reset", d))
+    v = glmshare.judge(p, _GS_CFG, later + 3600)
+    assert v["state"] == "worse" and "1 device incident" in v["why"] and v["n"] == 0
+    p.db.x("DELETE FROM events WHERE task=?", (dev[0],))
+    assert glmshare.judge(p, _GS_CFG, later + 3600)["state"] == "worse"
+
+
 def test_glm_share_counts_bad_output_per_day_from_glm_runs_exit_records(env):
     """#3660: the bridge's bad-output counters (tool input errors, unparsed arguments, reasoning-only and junk
     answers) per home-zone day, with a rate per answer and the runs hit; `ttp stats --glm-share` and the daily
