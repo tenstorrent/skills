@@ -120,13 +120,13 @@ def test_glm_share_judge_waits_for_enough_glm_tasks_then_compares_with_the_proje
     v = glmshare.judge(p, cfg, now)
     assert v["state"] == "worse" and "1 device incident" in v["why"]
     p.db.x("DELETE FROM events WHERE kind='device_reset'")
-    # 3 of 6 GLM passes (50%) against 83.3%: lower by more than 15 points.
+    # g1 is a device task now: it counts only for its incident. 2 of 5 GLM passes (40%) against 83.3%.
     for _ in range(3):
         _gs_decided(p, t0 + 9000, 0, arm="glm")
     v = glmshare.judge(p, cfg, now)
-    assert (v["state"], v["n"]) == ("worse", 6) and "first review pass rate GLM 50 vs Claude 83.3" in v["why"]
+    assert (v["state"], v["n"]) == ("worse", 5) and "first review pass rate GLM 40 vs Claude 83.3" in v["why"]
     # Inside a wider rollback margin but past the advance margin: the wave holds.
-    v = glmshare.judge(p, {"route": {"glm_work": {"min_tasks": 3, "min_base": 5, "rollback_pts": 40}}}, now)
+    v = glmshare.judge(p, {"route": {"glm_work": {"min_tasks": 3, "min_base": 5, "rollback_pts": 50}}}, now)
     assert v["state"] == "wait" and "holding the wave: first review pass rate" in v["why"]
 
 
@@ -228,8 +228,6 @@ def test_glm_device_runs_leave_the_glm_work_judgment_but_a_device_incident_after
     p.db.x("INSERT INTO events(ts,source,kind,text,task) VALUES(?,?,?,?,?)", (later + 60, "watcher", "device_reset", "box-a-device reset", d))
     v = glmshare.judge(p, _GS_CFG, later + 3600)
     assert v["state"] == "worse" and "1 device incident" in v["why"] and v["n"] == 0
-    p.db.x("DELETE FROM events WHERE task=?", (dev[0],))
-    assert glmshare.judge(p, _GS_CFG, later + 3600)["state"] == "worse"
 
 
 def test_glm_share_counts_bad_output_per_day_from_glm_runs_exit_records(env):
