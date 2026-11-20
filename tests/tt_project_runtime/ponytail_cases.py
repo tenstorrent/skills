@@ -161,6 +161,45 @@ def test_a_lane_reviews_own_push_lands_only_on_its_pass_and_within_the_size(env,
     assert push.ponytail_landing(p, str(rid), base, {"push_exclude_paths": ["docs/**"]}, repo) == ""
 
 
+def test_a_detached_push_from_a_lane_review_carries_the_lanes_verdict_to_its_push_process(env, tmp_path, monkeypatch):
+    """`ttp push --detach` records the lane's verdict from the review's run dir in its marker, and the push
+    process, whose TTP_RUN_DIR is its check output, puts it there for ponytail_landing; none recorded still refuses."""
+    import io
+    from ttp import checkdirs, ponytail, push
+    monkeypatch.delenv("TTP_TEST_PONYTAIL")
+    p = make(env)
+    repo, base, head = _lean_repo(tmp_path)
+    rid = p.db.add_task("review it", "s", kind="review", origin="daemon", labels=[ponytail.label(80)])
+    p.set_config("delivery.push_checks", ["true"])
+    monkeypatch.setattr(push, "resolve", lambda p, top, own: ("origin", "main", own))
+    monkeypatch.setattr(push, "_boxed", lambda: True)
+    monkeypatch.setattr(checkdirs, "release", lambda output: None)
+    monkeypatch.setattr(push.signal, "signal", lambda *a: None)
+    monkeypatch.setenv("TTP_TASK", str(rid))
+    seen = []
+    monkeypatch.setattr(push, "_run_retrying", lambda *a: (
+        seen.append(push.ponytail_landing(p, str(rid), base, {}, repo)), (1, "stop here"))[1])
+
+    def child(verdict):
+        run = tmp_path / f"run-{len(seen)}"
+        run.mkdir()
+        if verdict:
+            (run / ponytail.FILE).write_text(json.dumps(verdict))
+        monkeypatch.setenv("TTP_RUN_DIR", str(run))
+        before = set((p.state / push.DETACHED).glob("*.json"))
+        assert push.detach(p, repo) == 0
+        marker, = set((p.state / push.DETACHED).glob("*.json")) - before
+        out = checkdirs.reports(Path(json.loads(marker.read_text())["check_run_dir"]))
+        monkeypatch.setenv("TTP_RUN_DIR", str(out))
+        monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+        assert push.run_detached(p, repo, marker) == 1
+        return seen[-1]
+
+    assert child({"verdict": "pass", "head": head}) == ""
+    assert "recorded no verdict" in child(None)
+    assert "not " + head[:12] in child({"verdict": "pass", "head": base})
+
+
 def _pony_pq_hand_off(env, s, verdict=None, **more):
     """As _pq_hand_off, the review's lane having written `verdict` in its run dir."""
     from ttp import ponytail

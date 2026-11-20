@@ -5763,6 +5763,8 @@ def detach(p: Project, repo: Path, own: bool = False) -> int:
         return REFUSED
     if own and (rec := recorded_checks(os.environ.get("TTP_RUN_DIR"))):
         m["recorded_checks"] = rec   # the push process has a different TTP_RUN_DIR
+    if (run := os.environ.get("TTP_RUN_DIR")) and (lane := ponytail.read(run)) is not None:
+        m["ponytail"] = lane   # likewise the lane's verdict, which ponytail_landing reads there
     if _boxed():
         m.update(status="queued", queued=time.time())
         _log_line(log, "queued for the daemon: this command's sandbox would end a push started here")
@@ -5907,6 +5909,8 @@ def run_detached(p: Project, repo: Path, marker: Path, own: bool = False) -> int
         if os.environ.get("TTP_RUN_DIR") != str(checkdirs.reports(output)):
             raise OSError("TTP_RUN_DIR is missing or differs from the queued check output directory")
         rec = m.get("recorded_checks")
+        if isinstance(m.get("ponytail"), dict):
+            write_json(Path(os.environ["TTP_RUN_DIR"]) / ponytail.FILE, m["ponytail"])
         while True:
             try:
                 rc, reason = _run_retrying(p, repo, marker, own, rec if isinstance(rec, dict) else None)
