@@ -698,11 +698,12 @@ def _git(cwd, *a, binary: bool = False) -> subprocess.CompletedProcess:
                        stdin=subprocess.DEVNULL)
 
 
-def _branch_call(cwd: str | None, branch: str) -> tuple[str, str, list, object]:
-    """(why the gh route cannot take this branch call here, or "", owner/repo, granted prefixes, project)."""
+def _branch_call(cwd: str | None, branch: str, local: bool = False) -> tuple[str, str, list, object]:
+    """(why the gh route cannot take this branch call here, or "", owner/repo, granted prefixes, project).
+    `local`: the call may also run with this host's own logged-in gh while the route is unset."""
     from . import ghroute
     from .project import here
-    if ghroute._value(cwd=cwd) != WORKSTATION:
+    if ghroute._value(cwd=cwd) != WORKSTATION and not local:
         return f"publishing and retiring a branch go through {SETTING} \"{WORKSTATION}\"", "", [], None
     if not (repo := repo_of(cwd)):
         return "this checkout's origin is not a GitHub repo", "", [], None
@@ -743,16 +744,36 @@ def publish(branch: str, cwd: str | None = None, home=None) -> int:
 
 def retire(branch: str, cwd: str | None = None, home=None) -> int:
     """`ttp push --retire <branch>`: delete one of the project's own published branches through the
-    workstation. Refused unless this project pushed it (a publish here, or its push records), its prefix is
-    allowed, no open PR uses it (a gh read, held until answered) and no open task or worktree here uses it.
+    workstation, or with this host's own gh while delivery.gh_route is unset and that gh is logged in.
+    Refused unless this project pushed it (a publish here, or its push records), its prefix is allowed, no open PR uses it (a gh read, held until answered) and no open task or worktree here uses it.
     The tip is saved first, as refs/ttp-private/retired/<branch> and a bundle under state/retired/; the
     workstation reads the tip again and refuses the default branch."""
-    why, repo, grants, p = _branch_call(cwd, branch)
+    from . import ghroute
+    here_gh = ghroute._value(cwd=cwd) == "" and ghroute.local_ok()   # unset route, this host's gh logged in
+    why, repo, grants, p = _branch_call(cwd, branch, here_gh)
     delete = ["api", "-X", "DELETE", f"repos/{repo}/git/refs/heads/{branch}"]
+
+    def ask(argv: list[str], key: str = "") -> int:
+        """The gh call through the workstation queue, or with this host's own gh (the same checks)."""
+        if not here_gh:
+            return enqueue(argv, None, cwd, home, grants, key)
+        argv = _with_repo(argv, repo)
+        got = answer({"key": _key(repo, argv, b""), "argv": argv, "stdin": ""}, prefixes=grants) or {}
+        sys.stdout.write(str(got.get("stdout") or ""))
+        sys.stderr.write(str(got.get("stderr") or ""))
+        rc = got.get("rc") if isinstance(got.get("rc"), int) else 1
+        if got.get("tip"):
+            outbox(home).mkdir(parents=True, exist_ok=True, mode=0o700)
+            _durable(outbox(home) / DELETED, {"repo": repo, "branch": branch, "tip": got["tip"], "rc": rc,
+                                              "project": _project(cwd), "task": os.environ.get("TTP_TASK", ""),
+                                              "at": time.time()})
+        return rc
+
     # Only a delete that succeeded answers a new request. A failed one (refused or not run on the
-    # workstation) keeps its receipt as it is; the next attempt takes a key chained from it.
+    # workstation) keeps its receipt as it is; the next attempt takes a key chained from it. This host's own
+    # gh answers at once and keeps no receipt.
     key, failed = _key(repo, delete, b""), None
-    while not why and (got := _load(outbox(home) / f"{key}.done")) is not None:
+    while not why and not here_gh and (got := _load(outbox(home) / f"{key}.done")) is not None:
         if got.get("rc") == 0:
             return _queued(delete, b"", repo, cwd, home, f"gh api -X DELETE {branch}", key)   # already done
         key, failed = _key(repo, [*delete, key], b""), got
@@ -795,7 +816,7 @@ def retire(branch: str, cwd: str | None = None, home=None) -> int:
     import io
     got = io.StringIO()
     with contextlib.redirect_stdout(got):
-        rc = enqueue(["pr", "list", "--head", branch, "--state", "open", "--json", "number"], None, cwd, home)
+        rc = ask(["pr", "list", "--head", branch, "--state", "open", "--json", "number"])
     if rc:
         print(f"ttp push --retire: the open-PR check on `{branch}` is not answered yet (exit {rc}); "
               "run the same call again once it is.", file=sys.stderr)
@@ -816,4 +837,4 @@ def retire(branch: str, cwd: str | None = None, home=None) -> int:
         print(f"ttp push --retire: refused: could not save `{branch}`'s tip {tip} first.", file=sys.stderr)
         return 1
     print(f"ttp push --retire: saved {tip} as {ref} and {saved}.", file=sys.stderr)
-    return enqueue(delete, None, cwd, home, grants, key)
+    return ask(delete, key)

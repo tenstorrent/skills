@@ -1388,3 +1388,46 @@ def test_gh_workstation_retire_runs_again_after_a_failed_delete_and_finds_a_tip_
     (p.state / "pushes" / "r.json").unlink()
     n = len(sent)
     assert ghqueue.retire(branch, str(repo)) == 0 and len(sent) == n
+
+
+def test_gh_retire_runs_with_this_hosts_own_logged_in_gh_while_the_route_is_unset(env, monkeypatch):
+    """`ttp push --retire` with delivery.gh_route unset and this host's gh logged in: the open-PR read and
+    the branch delete run with that gh at once, through answer()'s same checks, nothing queued for a
+    workstation; the tip is saved first and the delete recorded. Logged out, it is refused as before."""
+    from ttp import ghqueue, ghroute
+    p, repo, _origin, _other = _push_setup(env, monkeypatch, ["true"])
+    monkeypatch.setenv("TTP_HOME", str(env["tmp"] / "ttphome"))
+    monkeypatch.setattr(ghroute, "_value", lambda cfg=None, cwd=None: "")
+    monkeypatch.setattr(ghqueue, "repo_of", lambda cwd: "acme/widgets")
+    d = env["tmp"] / "localgh"
+    d.mkdir()
+    calls, prs = d / "calls", d / "prs"
+    prs.write_text('[{"number": 4}]\n')
+    (d / "gh").write_text("#!/bin/sh\n"
+                          f'printf "%s\\n" "$*" >> "{calls}"\n'
+                          f'case "$*" in "pr list"*) cat "{prs}";; *) echo "gh: $*";; esac\n')
+    (d / "gh").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{d}:{os.environ['PATH']}")
+    back = _git_out(repo, "rev-parse", "--abbrev-ref", "HEAD").strip()
+    branch = "ttp/t8-local"
+    _git_out(repo, "checkout", "-q", "-b", branch)
+    _commit(repo, "l.txt", "l\n")
+    head = _git_out(repo, "rev-parse", "HEAD").strip()
+    _git_out(repo, "checkout", "-q", back)
+    (p.state / "pushes").mkdir(parents=True, exist_ok=True)
+    (p.state / "pushes" / "1.json").write_text(json.dumps({"outcome": "pushed", "target": f"origin/{branch}"}))
+    monkeypatch.setattr(ghqueue, "own_branch", lambda gh, argv: ("", head))
+
+    monkeypatch.setattr(ghroute, "local_ok", lambda: False)
+    assert ghqueue.retire(branch, str(repo)) == 1 and not calls.exists()   # logged out: no route here
+    monkeypatch.setattr(ghroute, "local_ok", lambda: True)
+    assert ghqueue.retire(branch, str(repo)) == 1   # an open PR uses it, read at once
+    assert calls.read_text().splitlines() == [f"pr list --head {branch} --state open --json number -R acme/widgets"]
+    prs.write_text("[]\n")
+    assert ghqueue.retire(branch, str(repo)) == 0
+    assert calls.read_text().splitlines()[-1] == f"api -X DELETE repos/acme/widgets/git/refs/heads/{branch}"
+    assert _git_out(repo, "rev-parse", f"refs/ttp-private/retired/{branch}").strip() == head
+    assert (p.state / "retired" / "ttp%2Ft8-local.bundle").is_file()
+    rows = [json.loads(x) for x in (ghqueue.outbox() / ghqueue.DELETED).read_text().splitlines()]
+    assert (rows[-1]["branch"], rows[-1]["tip"], rows[-1]["rc"]) == (branch, head, 0)
+    assert not [f.name for f in ghqueue.outbox().glob("*.q")], "nothing was queued for a workstation"
