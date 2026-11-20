@@ -523,3 +523,26 @@ def test_a_step_stopped_at_its_budget_naming_no_item_names_the_code_line_it_was_
     [ev] = p.db.q("SELECT * FROM events WHERE kind='tick_step_slow'")
     assert "held longest by code at deslop.py:" in ev["text"] and "in plan" in ev["text"], ev["text"]
     assert d._step_stuck["slow_plan"][0].startswith("code at deslop.py:")
+
+
+def test_a_step_stop_python_swallowed_in_a_weakref_callback_fires_again_outside_it():
+    """The case behind it: under load the stop landed in a garbage-collector weakref callback, which
+    swallows exceptions, and the step ran on for 30 s past its budget."""
+    import weakref
+    from ttp import stepclock
+
+    class Obj:
+        pass
+    hook, stopped = sys.unraisablehook, []
+    stepclock.begin("gc_step", 600, 600)
+    stepclock._arm(600)   # begin() arms only on the main thread; a worker thread's test arms the same way
+    try:
+        o = Obj()
+        r = weakref.ref(o, lambda _: stepclock._on_alarm(signal.SIGALRM, None))   # the stop, in the callback
+        del o
+        time.sleep(30)
+    except stepclock.StepBudgetSpent:
+        stopped.append(r)
+    finally:
+        stepclock.end()
+    assert stopped and sys.unraisablehook is hook

@@ -10,6 +10,8 @@ step is open, on the thread that opened it:
 - at budget + slack a step still running is stopped where it is: SIGALRM raises StepBudgetSpent in it
   (main thread only), so a pure Python loop or a blocking wait ends too. Inside critical() (a db
   transaction's commit or rollback, a git write, a child's spawn) the stop waits until the section ends.
+  A stop raised where Python swallows exceptions (a weakref or garbage-collector callback, a __del__)
+  fires again right after it, so the step still ends.
   A caller that starts a detached child holds critical() from the spawn until it has recorded the child,
   so a stop never leaves one running untracked.
 - every child it waits on (subprocess.run, call, check_output, Popen.wait and communicate) waits at
@@ -28,6 +30,7 @@ import contextlib
 import os
 import signal
 import subprocess
+import sys
 import threading
 import time
 from typing import Iterator
@@ -55,7 +58,7 @@ class _State:
     thread: int | None = None
     depth = 0
     pending = fired = armed = False
-    prev = None
+    prev = prev_hook = None
     timer: tuple[float, float] | None = None   # another user's ITIMER_REAL left, and when: put back by end()
 
 
@@ -123,6 +126,7 @@ def _arm(t: float) -> None:
             left_s = signal.getitimer(signal.ITIMER_REAL)[0]
             _s.timer = (left_s, time.monotonic()) if left_s > 0 else None
             _s.prev = signal.signal(signal.SIGALRM, _on_alarm)
+            _s.prev_hook, sys.unraisablehook = sys.unraisablehook, _swallowed
         _s.armed = True
         signal.setitimer(signal.ITIMER_REAL, max(t, 0.001))
     except (ValueError, OSError):
@@ -133,6 +137,8 @@ def _disarm() -> None:
     if not _s.armed:
         return
     _s.armed = False
+    if sys.unraisablehook is _swallowed:
+        sys.unraisablehook = _s.prev_hook or sys.__unraisablehook__
     try:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, _s.prev if _s.prev is not None else signal.SIG_DFL)
@@ -155,6 +161,15 @@ def _on_alarm(signum, frame) -> None:
         return
     _s.fired = True
     raise StepBudgetSpent(_s.step)
+
+
+def _swallowed(u) -> None:
+    """sys.unraisablehook while a step is armed: a stop Python swallowed fires again a moment later."""
+    if isinstance(u.exc_value, StepBudgetSpent) and active() and _s.fired:
+        _s.fired = False
+        _arm(0.001)
+        return
+    (_s.prev_hook or sys.__unraisablehook__)(u)
 
 
 def hold() -> None:
