@@ -266,10 +266,125 @@ def test_slop_reads_the_repo_holding_the_cwd_such_as_a_worktree_outside_the_proj
     assert slop.repo(root, cwd=tmp_path) == root   # no repo here: the project root
     assert slop.repo(src, cwd=src / "sub-missing") == src   # git cannot run there: the project root
     assert slop.repo(src, cwd=src) == src and slop.repo(root, cwd=wt, given=str(src)) == src.resolve()
-    with pytest.raises(RuntimeError, match="not a git repository"):
+    with pytest.raises(RuntimeError, match="fatal:"):   # git's own message wherever the tmp dir sits
         slop.delta(root, base, head, None, str(tmp_path / "cache.json"))   # what the root alone gave
     monkeypatch.chdir(wt)
     assert slop.delta(slop.repo(root), base, head, None, str(tmp_path / "cache.json")) is not None
     with pytest.raises(SystemExit):
         cli.main(["slop", "--help"])
     assert "--repo" in capsys.readouterr().out
+
+
+def _git_stub(bindir, log):
+    """A `git` first on PATH that logs each invocation, sleeping a little per cat-file call, then
+    execs the real binary git: it stands in for a large repository whose cost is one git call per
+    file. A wrapper script (the harness's or another project's) must not be the target: it would
+    find this stub on PATH and exec it back, looping."""
+    import shutil
+    bindir.mkdir(parents=True, exist_ok=True)
+    real = "/usr/bin/git" if (_st := shutil.which("git", path="/usr/bin")) else shutil.which("git")
+    stub = bindir / "git"
+    stub.write_text("#!/usr/bin/env python3\n"
+                    "import os, sys, time\n"
+                    f"with open({str(log)!r}, 'a') as f:\n"
+                    "    f.write('\\0'.join(sys.argv[1:]) + '\\n')\n"
+                    "if 'cat-file' in sys.argv:\n"
+                    "    time.sleep(0.003)\n"
+                    f"os.execv({real!r}, ['git', *sys.argv[1:]])\n")
+    stub.chmod(0o755)
+
+
+def test_slop_diff_on_a_large_tree_reads_each_ref_as_one_git_batch_not_a_call_per_file(tmp_path, monkeypatch):
+    """upstream note 02d7c6ea58ee7616: `ttp slop --diff` on a one-commit diff in a large worktree
+    printed nothing and was killed at 120 s: the scan read both trees one git call per file. Each
+    ref's blobs now stream from one `git cat-file --batch`, and the counted numbers come from the
+    changed files alone, so a small diff finishes whatever the tree's size."""
+    import os, time
+    from ttp import slop
+    files = {f"pkg/m{i}.py": f"def f{i}(x):\n    return x + {i + 2}\n" for i in range(300)}
+    files["pkg/existing.py"] = CHOOSER
+    root = _slop_repo(tmp_path, files)
+    base = _git_out(root, "rev-parse", "HEAD").strip()
+    head = _slop_commit(root, {"pkg/touch.py": CHOOSER.replace("best", "pick")
+                               + "_hits = {}\ndef wait(s):\n    s.settimeout(45)\n# seen on box07 on 2026-11-03\n"})
+    _git_stub(tmp_path / "bin", tmp_path / "git-calls.log")
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}{os.pathsep}{os.environ['PATH']}")
+    t0 = time.monotonic()
+    d = slop.delta(root, base, head, None, str(tmp_path / "cache.json"))
+    took = time.monotonic() - t0
+    calls = [line.split("\0") for line in (tmp_path / "git-calls.log").read_text().splitlines()]
+    cat = [c for c in calls if "cat-file" in c]
+    assert len(cat) <= 4, f"{len(cat)} cat-file calls: a ref is one batch stream, not a call per file"
+    assert len(calls) <= 12, f"{len(calls)} git calls for a two-file diff: {calls}"
+    row = d["subsystems"]["pkg"]
+    assert row["globals"] == 1 and row["magic"] >= 1 and row["noisy_lines"] == 1, (row, d)
+    assert any(g["name"] == "choose_box" for g in d["new_duplicates"]), d["new_duplicates"]
+    assert d.get("duplicates_partial") is None and took < 20, (took, d)
+
+
+def test_slop_delta_keeps_the_numbers_when_the_whole_tree_scan_misses_its_budget(tmp_path, monkeypatch):
+    """The duplicate check needs both whole trees; a cold cache on a large repository cannot fit
+    them in the budget. The numbers still come from the changed files, the duplicate check narrows
+    to them and says so, and a scan that cannot read even those raises Deadline for its caller to
+    name the command, never a silent wait."""
+    from ttp import slop
+    root = _slop_repo(tmp_path, {"pkg/a.py": CHOOSER})
+    base = _git_out(root, "rev-parse", "HEAD").strip()
+    head = _slop_commit(root, {"pkg/b.py": CHOOSER.replace("best", "pick") + "_hits = {}\n"
+                                                        "def wait(s):\n    s.settimeout(45)\n"})
+    real, seen = slop.read_tree, []
+
+    def reads(root, ref=None, paths=None, exclude=None, max_lines=80, deadline=None, only=None):
+        seen.append(only is None)
+        if only is None:
+            raise slop.Deadline()          # the whole-tree pass cannot fit its budget
+        return real(root, ref, paths, exclude, max_lines, None, only=only)
+    monkeypatch.setattr(slop, "read_tree", reads)
+    d = slop.delta(root, base, head, None, None)
+    assert seen == [False, False, True], seen   # the changed files at both refs, then the whole trees
+    row = d["subsystems"]["pkg"]
+    assert row["globals"] == 1 and row["magic"] >= 1, row          # exact from the changed files alone
+    assert d["duplicates_partial"] is True and not d["new_duplicates"], d
+    assert "duplicate check limited to this change's files" in " ".join(slop.delta_lines(d))
+
+    def none_fits(root, ref=None, paths=None, exclude=None, max_lines=80, deadline=None, only=None):
+        raise slop.Deadline()
+    monkeypatch.setattr(slop, "read_tree", none_fits)
+    import pytest
+    with pytest.raises(slop.Deadline):          # even the changed files unreadable: the caller reports it
+        slop.delta(root, base, head, None, None)
+    monkeypatch.setattr(slop, "read_tree", real)
+    d2 = slop.delta(root, base, head, None, None)
+    assert d2.get("duplicates_partial") is None and d2["new_duplicates"], d2   # a full check when it fits
+
+
+def test_ttp_slop_diff_prints_a_small_diff_of_a_large_tree_and_a_clear_message_when_it_cannot_finish(
+        env, monkeypatch, capsys, tmp_path):
+    """The command a worker runs: its numbers print for a small diff in a tree of hundreds of files,
+    and a scan that cannot finish in its budget says so instead of printing nothing until killed."""
+    import os, pytest
+    from ttp import cli, slop
+    p = make(env)
+    for k in ("TTP_PROJECT", "TTP_RUN_ID", "TTP_RUN_DIR", "TTP_TASK"):
+        monkeypatch.delenv(k, raising=False)
+    for i in range(120):
+        (p.root / "pkg").mkdir(exist_ok=True)
+        (p.root / "pkg" / f"m{i}.py").write_text(f"def f{i}(x):\n    return x + {i + 2}\n")
+    ident = ("-c", "user.name=t", "-c", "user.email=t@t")
+    _git_out(p.root, "init", "-q")
+    _git_out(p.root, "add", "pkg")
+    _git_out(p.root, *ident, "commit", "-qm", "base")
+    base = _git_out(p.root, "rev-parse", "HEAD").strip()
+    (p.root / "pkg" / "touch.py").write_text(CHOOSER + "def wait(s):\n    s.settimeout(45)\n"
+                                             "# seen on box07 on 2026-11-03\n")
+    _git_out(p.root, "add", "pkg")
+    _git_out(p.root, *ident, "commit", "-qm", "head")
+    head = _git_out(p.root, "rev-parse", "HEAD").strip()
+    monkeypatch.chdir(p.root)
+    cli.main(["slop", "--diff", f"{base}..{head}"])
+    out = capsys.readouterr().out
+    assert "magic" in out and "pkg" in out and "longest function" in out, out
+    monkeypatch.setattr(slop, "delta", lambda *a, **k: (_ for _ in ()).throw(slop.Deadline()))
+    with pytest.raises(SystemExit) as done:
+        cli.main(["slop", "--diff", f"{base}..{head}"])
+    assert done.value.code == 2 and "time budget" in capsys.readouterr().err

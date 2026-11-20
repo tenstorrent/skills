@@ -48,6 +48,7 @@ DEFAULTS = {
     "thresholds": {"duplicates": 0, "globals": 5, "magic_per_kloc": 15.0, "long_functions": 0,
                    "noise_share": 0.1},
     "exclude": [],               # path globs left out of the scan
+    "budget_s": 20,              # a delta's scan budget: past it the numbers stand, the duplicate check narrows
 }
 CONTAINERS = {"plugins", "packages", "apps", "libs", "services", "modules", "src", "crates"}
 SKIP_DIRS = {"node_modules", "vendor", "third_party", "build", "dist", "target", "__pycache__", "venv", ".venv",
@@ -389,13 +390,69 @@ def _excluded(path: str, globs: list[str]) -> bool:
     return bool(SKIP_DIRS & set(p.parts[:-1])) or any(p.match(g) or path.startswith(g.rstrip("*/") + "/") for g in globs)
 
 
+def _batch_texts(root, blobs: list[str]):
+    """The texts of `blobs`, streamed from one `git cat-file --batch` process: a request is written
+    only after the previous answer is read, so neither pipe ever fills. A missing object yields None."""
+    p = gitmemo.popen(["git", "-C", str(root), "cat-file", "--batch"],
+                      stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    try:
+        for blob in blobs:
+            p.stdin.write(f"{blob}\n".encode())
+            p.stdin.flush()
+            head = p.stdout.readline()
+            if not head:
+                raise RuntimeError("git cat-file --batch ended before answering every blob")
+            parts = head.split()
+            if len(parts) < 3 or parts[1] != b"blob":
+                yield None          # `<oid> missing` or a non-blob: nothing to scan
+                continue
+            yield p.stdout.read(int(parts[2])).decode("utf-8", "replace")
+            p.stdout.read(1)        # the newline that ends the payload
+    finally:
+        for stream in (p.stdin, p.stdout):
+            try:
+                stream.close()
+            except OSError:
+                pass
+        if p.poll() is None:
+            p.kill()
+        p.wait()
+
+
+def _read_blobs(root, entries: list[tuple[str, str]], max_lines: int, deadline: float | None) -> list[_Info]:
+    """Each (path, blob id) entry scanned once: cache hits first, the misses fetched from one
+    `git cat-file --batch` stream. One git process reads a whole ref, not one git call per file,
+    which is what made a large repository's scan take minutes while a small diff sat in it."""
+    infos: list[_Info] = []
+    entries = [e for e in entries if PurePosixPath(e[0]).suffix in PY | set(LINE_LANGS)]
+    misses = [e for e in entries if (e[1], e[0], max_lines) not in _CACHE]
+    texts = _batch_texts(root, [blob for _, blob in misses])
+    try:
+        for path, blob in entries:
+            if (hit := _CACHE.get((blob, path, max_lines))) is not None:
+                infos.append(hit)
+                continue
+            if deadline is not None and time.monotonic() > deadline:
+                raise Deadline()
+            text = next(texts, None)
+            if text is None:
+                continue
+            info = _analyze(path, blob, lambda: text, max_lines)
+            if info:
+                infos.append(info)
+    finally:
+        texts.close()
+    return infos
+
+
 def read_tree(root, ref: str | None = None, paths: list[str] | None = None, exclude: list[str] | None = None,
-              max_lines: int = 80, deadline: float | None = None) -> list[_Info]:
+              max_lines: int = 80, deadline: float | None = None, only: set[str] | None = None) -> list[_Info]:
     """The files of `ref` (a commit, branch or `HEAD`) or, with none, the tracked and untracked-unignored
-    files of the working tree, each scanned once (a ref's by blob id)."""
+    files of the working tree, each scanned once (a ref's by blob id). `only`: read just these paths."""
     exclude = exclude or []
     infos: list[_Info] = []
     if ref:
+        entries: list[tuple[str, str]] = []
         for line in _git(root, "ls-tree", "-r", "-z", ref).split("\0"):
             if not line:
                 continue
@@ -403,12 +460,12 @@ def read_tree(root, ref: str | None = None, paths: list[str] | None = None, excl
             parts = meta.split()
             if len(parts) < 3 or parts[1] != "blob" or _excluded(path, exclude):
                 continue
+            if only is not None and path not in only:
+                continue
             if paths and not any(PurePosixPath(path).match(g) for g in paths):
                 continue
-            blob = parts[2]
-            info = _analyze(path, blob, lambda b=blob: _git(root, "cat-file", "blob", b), max_lines, deadline)
-            if info:
-                infos.append(info)
+            entries.append((path, parts[2]))
+        return _read_blobs(root, entries, max_lines, deadline)
     else:
         from pathlib import Path
         names = _git(root, "ls-files", "-z", "--cached", "--others", "--exclude-standard").split("\0")
@@ -545,33 +602,58 @@ def pass_target(infos: list[_Info], cfg: dict | None = None, skip: set[str] | No
     return (pick[0], pick[1], rep["subsystems"][pick[0]]) if pick else None
 
 
+def _changed_paths(root, base: str, head: str) -> list[str] | None:
+    """The paths base..head touches, both sides of a rename included: what a delta has to read.
+    None when git cannot name them (a ref that does not resolve, a directory that is no repository):
+    the tree read then raises git's own message for it."""
+    out = _git(root, "diff", "--no-renames", "--name-only", "-z", base, head, check=False)
+    return [p for p in out.split("\0") if p] or None
+
+
 def delta(root, base: str, head: str, cfg: dict | None = None, cache: str | None = None,
           budget_s: float | None = None) -> dict:
     """What the change base..head adds: per-subsystem differences of the counted numbers (changed ones
-    only), the duplicate groups new at head and the incident-style comment lines new at head."""
+    only), the duplicate groups new at head and the incident-style comment lines new at head. The counted
+    numbers come from the changed files alone (an unchanged file adds the same to both sides), so a
+    small diff in a large repository needs no whole-tree read for them; the duplicate groups need both
+    whole trees, which is read only while the budget lasts: a large repo with a cold cache then keeps
+    the change's own duplicates and says the check is partial rather than reading for minutes."""
     c = {**DEFAULTS, **(cfg or {})}
     maxl, ex = int(c["max_function_lines"]), list(c["exclude"] or [])
+    budget = float(budget_s if budget_s is not None else c["budget_s"])
     _load(cache)
-    end = time.monotonic() + budget_s if budget_s else None
+    end = time.monotonic() + budget if budget > 0 else None
+    changed = _changed_paths(root, base, head)
+    changed = set(changed) if changed is not None else None
     try:
-        a, b = read_tree(root, base, None, ex, maxl, end), read_tree(root, head, None, ex, maxl, end)
+        a = read_tree(root, base, None, ex, maxl, end, only=changed)
+        b = read_tree(root, head, None, ex, maxl, end, only=changed)
+        whole = None
+        try:
+            fa, fb = read_tree(root, base, None, ex, maxl, end), read_tree(root, head, None, ex, maxl, end)
+            whole = (aggregate(fa, c), aggregate(fb, c))
+        except Deadline:
+            whole = None
+        ra, rb = (whole if whole else (aggregate(a, c), aggregate(b, c)))
+        rows = {}
+        for name, now in rb["subsystems"].items():
+            was = ra["subsystems"].get(name, {})
+            d = {k: now[k] - was.get(k, 0) for k in ("duplicates", "globals", "magic", "magic_timing", "long_functions")}
+            d["noisy_lines"] = now["noisy_lines"] - was.get("noisy_lines", 0)
+            d["fn_max"] = now["fn_max"]
+            if any(v for k, v in d.items() if k != "fn_max"):
+                rows[name] = d
+        key = lambda g: (g["kind"], g["name"], tuple(a.rsplit(":", 1)[0] for a in g["at"]))   # noqa: E731
+        was = {key(g) for g in ra["duplicate_groups"]}
+        new_dups = [g for g in rb["duplicate_groups"] if key(g) not in was]
+        old = {(i.path, t) for i in a for _, t in i.noisy}
+        new_noise = [{"at": f"{i.path}:{ln}", "text": t[:100]} for i in b for ln, t in i.noisy if (i.path, t) not in old]
+        out = {"base": base, "head": head, "subsystems": rows, "new_duplicates": new_dups, "new_noisy": new_noise}
+        if whole is None:
+            out["duplicates_partial"] = True
+        return out
     finally:
         _save(cache)
-    ra, rb = aggregate(a, c), aggregate(b, c)
-    rows = {}
-    for name, now in rb["subsystems"].items():
-        was = ra["subsystems"].get(name, {})
-        d = {k: now[k] - was.get(k, 0) for k in ("duplicates", "globals", "magic", "magic_timing", "long_functions")}
-        d["noisy_lines"] = now["noisy_lines"] - was.get("noisy_lines", 0)
-        d["fn_max"] = now["fn_max"]
-        if any(v for k, v in d.items() if k != "fn_max"):
-            rows[name] = d
-    key = lambda g: (g["kind"], g["name"], tuple(a.rsplit(":", 1)[0] for a in g["at"]))   # noqa: E731
-    was = {key(g) for g in ra["duplicate_groups"]}
-    new_dups = [g for g in rb["duplicate_groups"] if key(g) not in was]
-    old = {(i.path, t) for i in a for _, t in i.noisy}
-    new_noise = [{"at": f"{i.path}:{ln}", "text": t[:100]} for i in b for ln, t in i.noisy if (i.path, t) not in old]
-    return {"base": base, "head": head, "subsystems": rows, "new_duplicates": new_dups, "new_noisy": new_noise}
 
 
 def delta_lines(d: dict, show: int = 5) -> list[str]:
@@ -584,6 +666,9 @@ def delta_lines(d: dict, show: int = 5) -> list[str]:
         out.append(f"- new duplicate {g['kind']} `{g['name']}`: " + ", ".join(g["at"][:4]))
     for n in d["new_noisy"][:show]:
         out.append(f"- new incident-style comment line {n['at']}: {n['text']}")
+    if d.get("duplicates_partial"):
+        out.append("- duplicate check limited to this change's files: the whole-tree scan did not fit "
+                   "its time budget (the cache keeps its progress; rerun this command)")
     more = len(d["new_duplicates"]) - show, len(d["new_noisy"]) - show
     if more[0] > 0 or more[1] > 0:
         out.append(f"- and {max(more[0], 0) + max(more[1], 0)} more (`ttp slop --diff {d['base'][:12]}..{d['head'][:12]}`)")

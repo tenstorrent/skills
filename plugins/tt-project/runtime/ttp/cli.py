@@ -2584,6 +2584,9 @@ def cmd_slop(a) -> None:
         rep = slop.scan(root, a.ref, cfg, a.paths or None, cache)
     except RuntimeError as e:
         die(f"slop: {e}")
+    except slop.Deadline:
+        die("slop: the scan did not finish in its time budget; the cache keeps its progress, "
+            "so rerunning the same command finishes more of it")
     print(slop.dump(rep) if a.json else slop.text(rep, cfg))
 
 

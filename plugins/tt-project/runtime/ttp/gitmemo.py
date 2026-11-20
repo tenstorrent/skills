@@ -302,6 +302,17 @@ def _spawn(argv, t: float | None, kw: dict) -> subprocess.CompletedProcess:
         _own.reset(token)
 
 
+def popen(argv: list, **kw) -> subprocess.Popen:
+    """Popen for a git call whose answers stream back over its pipes (`git cat-file --batch`): the
+    spawn is marked as the runtime's own, so a strict round's raw-spawn audit counts it like any
+    other runtime git call instead of flagging it as a foreign child."""
+    token = _own.set(True)
+    try:
+        return subprocess.Popen(argv, **kw)
+    finally:
+        _own.reset(token)
+
+
 def on_audit(event: str, args: tuple) -> None:
     """From the db audit hook: a raw git spawn inside a strict round counts against its slice (past
     it: GitMiss, or TimeoutExpired after the point of no return); a non-git spawn or a socket
