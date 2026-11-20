@@ -2634,7 +2634,7 @@ class Daemon:
                     log(self.p, "device A/B: test arm stopped after a device incident")
                 if got.get("lifted"):
                     log(self.p, "device A/B: " + str(got["lifted"])[:200])
-                deviceshadow.queue_reviews(self.p.db, second=deviceab.second_reviewer(self.cfg))
+                deviceshadow.queue_reviews(self.p.db, self.cfg, second=deviceab.second_reviewer(self.cfg))
             except Exception as e:   # never holds the loop
                 log(self.p, f"device A/B tick failed: {type(e).__name__}: {e}"[:300])
         # A configured route (the code route, the device A/B) taking under half its share: one event per route a day.

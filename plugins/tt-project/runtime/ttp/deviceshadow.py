@@ -578,10 +578,12 @@ def review_spec(task: dict, handoff: str, run_dir: str) -> str:
         "conclusion: the agreement score, the harmful steps and a one-line reason."])
 
 
-def queue_reviews(db, limit: int = 12, second: dict | None = None) -> list[int]:
+def queue_reviews(db, cfg: dict, limit: int = 12, second: dict | None = None) -> list[int]:
     """One blind review per finished shadow whose live task is done or failed and that has none yet (and with a
     `second` reviewer one more by it, same spec, unless it is marked `skip`: deviceab.reviewers); returns the new task ids. A shadow still running, or without a
-    hand-off, waits (or is never reviewed)."""
+    hand-off, waits (or is never reviewed). None while the shadow is off (`settings(cfg)` None)."""
+    if settings(cfg) is None:
+        return []
     have = {lb for r in db.q("SELECT labels FROM tasks WHERE labels LIKE ? OR labels LIKE ?",
                              (f'%"{REVIEW_LABEL}%', f'%"{REVIEW2_LABEL}%')) for lb in task_labels(r)}
     reviewers = deviceab.reviewers(deviceab.REVIEW_MODEL, REVIEW_LABEL, REVIEW2_LABEL, second)

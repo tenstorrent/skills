@@ -86,13 +86,14 @@ def test_device_shadow_is_out_of_the_live_ab_counts_and_stop_rules(env):
 def test_device_shadow_review_waits_for_the_live_task_and_then_asks_two_blind_reviewers(env):
     from ttp import deviceshadow
     p = make(env)
+    cfg = _shadow_cfg(p)
     tid = _dab_task(p)
     _shadow_done(p, tid, "glm")
     deviceshadow.record(p.db, tid, "sonnet-h", status="running")
     second = {"model": "glm-x", "effort": "max", "provider": "chat"}
-    assert deviceshadow.queue_reviews(p.db, second=second) == [], "the live task has not ended"
+    assert deviceshadow.queue_reviews(p.db, cfg, second=second) == [], "the live task has not ended"
     p.db.x("UPDATE tasks SET status='done' WHERE id=?", (tid,))
-    new = deviceshadow.queue_reviews(p.db, second=second)
+    new = deviceshadow.queue_reviews(p.db, cfg, second=second)
     assert len(new) == 2, "a still running shadow has no review"
     first, sec = (p.db.task(i) for i in new)
     # An opaque code names the arm in the label and title (blindreview), and the report maps it back.
@@ -105,9 +106,9 @@ def test_device_shadow_review_waits_for_the_live_task_and_then_asks_two_blind_re
         low = (t["spec"] + t["title"]).lower()
         assert "glm" not in low and "sonnet" not in low and "device_shadow_scores" in t["spec"]
         assert "## Conclusion" in t["spec"]
-    assert deviceshadow.queue_reviews(p.db, second=second) == [], "once per shadow and reviewer"
+    assert deviceshadow.queue_reviews(p.db, cfg, second=second) == [], "once per shadow and reviewer"
     deviceshadow.record(p.db, tid, "sonnet-h", status="done", handoff="")
-    assert deviceshadow.queue_reviews(p.db, second=second) == [], "no hand-off: never reviewed"
+    assert deviceshadow.queue_reviews(p.db, cfg, second=second) == [], "no hand-off: never reviewed"
 
 
 def test_device_shadow_report_compares_arms_reviewers_and_whether_the_ranking_differs(env):
@@ -388,7 +389,7 @@ def test_device_shadow_empty_code_copy_is_retried_then_a_recorded_skip_not_a_run
     assert got["status"] == "skipped" and len(calls) == 2, got
     assert "empty after a retry" in got["error"] and "git archive of the project repo" in got["error"]
     p.db.x("UPDATE tasks SET status='done' WHERE id=?", (tid,))
-    assert deviceshadow.queue_reviews(p.db) == [], "a skip is never reviewed"
+    assert deviceshadow.queue_reviews(p.db, cfg) == [], "a skip is never reviewed"
     r = deviceshadow.report(p.db.q)
     assert r["arms"]["glm"]["skipped"] == 1 and r["arms"]["glm"]["done"] == 0
     text = "\n".join(deviceshadow.report_text(r))
@@ -523,10 +524,10 @@ def test_a_second_reviewer_whose_provider_is_not_allowed_gets_no_twin_and_the_fi
     assert "second_reviewer_skipped" not in p.db.task(again[0])["labels"]
     # The shadow's reviews.
     _shadow_done(p, tid, "glm")
-    got = deviceshadow.queue_reviews(p.db, second=skip)
+    got = deviceshadow.queue_reviews(p.db, cfg, second=skip)
     assert len(got) == 1 and "second_reviewer_skipped:" in p.db.task(got[0])["labels"]
-    assert deviceshadow.queue_reviews(p.db, second=skip) == []
-    both = deviceshadow.queue_reviews(p.db, second=allowed)
+    assert deviceshadow.queue_reviews(p.db, cfg, second=skip) == []
+    both = deviceshadow.queue_reviews(p.db, cfg, second=allowed)
     assert len(both) == 1 and p.db.task(both[0])["provider"] == "chat"
     # The daemon's path: tick reads the config and queues no twin outside providers_allowed.
     tid2 = _dab_task(p, labels=("device_ab:glm", "needs_device"))
@@ -623,3 +624,24 @@ def test_device_shadow_run_takes_the_hosts_test_slots_for_its_agent_and_never_ru
     got = deviceshadow.run(p, tid, "glm")
     assert got["status"] == "done", got
     assert launches == [{"TTP_TEST_SLOTS": "2"}] and closed == [1], "held while the agent ran, then released"
+
+
+def test_device_shadow_and_ab_queue_no_review_while_switched_off(env):
+    # upstream note 0a8b27dbbacdec8d: the daemon's 5-minute tick queued shadow reviews with the shadow switched
+    # off. Each place that queues A/B or shadow work honours its off switch; this checks the review queuers.
+    from ttp import deviceab, deviceshadow
+    p = make(env)
+    cfg = _shadow_cfg(p)
+    tid = _dab_task(p, labels=("device_ab:glm", "needs_device"))
+    _shadow_done(p, tid, "glm")
+    p.db.x("UPDATE tasks SET status='done' WHERE id=?", (tid,))
+    shadow_off = {**cfg, "route": {**cfg["route"], "device_ab_shadow": {
+        **cfg["route"]["device_ab_shadow"], "enabled": False}}}
+    ab_off = {**cfg, "route": {**cfg["route"], "device_ab": {**cfg["route"]["device_ab"], "enabled": False}}}
+    for off in ({}, {"route": {}}, shadow_off):
+        assert deviceshadow.queue_reviews(p.db, off) == [], off
+    assert deviceab.settings(ab_off) is None and deviceab.settings(cfg) is not None
+    assert deviceab.tick(p.db, ab_off, 1.0) == {}
+    assert deviceab.queue_reviews(p.db, deviceab.settings(ab_off), 0.0) == []
+    assert not p.db.q("SELECT id FROM tasks WHERE title LIKE 'Device %review%'"), "nothing queued while off"
+    assert len(deviceshadow.queue_reviews(p.db, cfg)) == 1 and len(deviceab.queue_reviews(p.db, deviceab.settings(cfg), 0.0)) == 1

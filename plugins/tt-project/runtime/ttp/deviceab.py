@@ -106,9 +106,10 @@ def skip_labels(second: dict | None) -> list[str]:
 
 
 def settings(cfg: dict) -> dict | None:
-    """The A/B's settings, or None when it is off (unset, not an object, no projects or not two arms)."""
+    """The A/B's settings, or None when it is off (unset, not an object, enabled false, no projects or not two
+    arms)."""
     got = (cfg.get("route") or {}).get(KEY)
-    if not isinstance(got, dict):
+    if not isinstance(got, dict) or got.get("enabled") is False:
         return None
     projects = [str(x).strip() for x in got.get("projects") or [] if str(x).strip()] \
         if isinstance(got.get("projects"), list) else []
@@ -501,7 +502,9 @@ def review_spec(task: dict, run_dir: str) -> str:
 def queue_reviews(db, s: dict, since: float, limit: int = 10, second: dict | None = None) -> list[int]:
     """One masked review per finished A/B task that has none yet, and with a `second` reviewer one more by it
     (same inputs, same rubric); returns the new task ids. A second reviewer marked `skip` (its provider is not in
-    providers_allowed) gets no task; the first review's label says why."""
+    providers_allowed) gets no task; the first review's label says why. None while the A/B is off (`s` None)."""
+    if not s:
+        return []
     done = db.q("SELECT * FROM tasks WHERE created>=? AND labels LIKE ? AND status IN ('done','failed') "
                 "ORDER BY id", (since, f'%"{LABEL}%'))
     have = {lb for r in db.q("SELECT labels FROM tasks WHERE labels LIKE ? OR labels LIKE ?",
