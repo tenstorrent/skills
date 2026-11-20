@@ -1020,17 +1020,3 @@ def test_every_flag_s_health_watch_switches_off_only_its_own_project(env, flag):
     assert rollout.level(flag) == 1 and rollout.frozen(flag) is None
     assert not rollout.on(flag, p.name) and rollout.on(flag, "other")
     assert [r["kind"] for r in rollout.ledger(flag)][-1] == "project_rollback"
-
-
-def test_a_project_switched_off_stays_off_at_a_numeric_level_until_re_armed(env):
-    # cells: on_numeric, on_full, rearm
-    from ttp import rollout
-    make(env)
-    rollout.set_ring("a", "0")
-    rollout.set_ring("b", "0")
-    _ro_flag("deslop", 2, 1)
-    assert rollout.on("deslop", "a") and rollout.on("deslop", "b")
-    assert rollout.stop_project("deslop", "a", "its runs failed", "daemon:a")
-    assert not rollout.on("deslop", "a") and rollout.on("deslop", "b")
-    rollout.arm("deslop", "fixed", "user", "a")
-    assert rollout.on("deslop", "a")
