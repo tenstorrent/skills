@@ -26,7 +26,7 @@ here.
   advertised context (or a hard physical limit with evidence).
 - The `reference-accuracy` suite with verdict match at full precision (the implementation is right). The served
   precision may differ from HF by design; it is chosen on the reference tiers as a speed and accuracy tradeoff.
-- `doc/model/model.json` and `REPORT.md`: scope, targets, floors, measured, precision, KV pool, ops added or
+- `doc/model/model.json` and `REPORT.md`: scope, started_at, budget and hours used, reset authorization, targets, floors, measured, precision, KV pool, ops added or
   changed, tier commands, the perf ledger (change, before, after, tier result), hours and tokens spent, and
   what was not done; for a mixture-of-experts model, `moe` with experts, top-k, layout, distinct experts per
   step and decode against its floor at batch 1 and the largest batch.
@@ -102,13 +102,17 @@ the model carry its own versions of ops and shared code. [ops](references/ops.md
 
 ## Devices and budget
 
-Before the first device run, record in `model.json` whether bounded resets and multi-chip health checks are
-authorized on the run's machines; without it, the first unclean exit stops the goal until someone answers. Every
-device job runs under a lock with a timeout, and after an unclean exit the board is reset and checked before the
+Before the first device run, record in `model.json` `reset_authorization`: whether bounded resets and multi-chip
+health checks are authorized on the run's machines, as the run's brief or launcher says. If nobody has said, ask
+before the first device run, not at the first unclean exit. Every device job runs under a lock with a timeout, and after an unclean exit the board is reset and checked before the
 next job (`tt-device-usage`).
 
-`budget_hours` in `model.json` bounds the goal: use it to get closer to the targets, and when it ends, report as
-is. A missed target is reported with its reason; it is not a reason to stop before the budget is spent.
+`budget_hours` in `inputs.json` (default 24, wall clock) bounds the goal. Copy it and `started_at` (UTC) into
+`model.json` at startup, and check the time left (`date -u`) whenever you plan the next round; the start time
+survives compaction and resumes only because it is written down. Leave enough at the end for T2, the review and
+the report; how much depends on how long your T2 takes. Use the rest to get closer to the targets. A missed
+target is reported with its reason; it is not a reason to stop before the budget is spent. `hours_used` goes in
+`model.json` and the report.
 
 Commit summaries, not raw output, and when something took long to understand and is solved, add a few lines to
 `bringup/lessons.md` (`model-bringup`). One `stage-review`, at the end.

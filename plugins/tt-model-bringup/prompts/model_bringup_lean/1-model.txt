@@ -2,16 +2,17 @@
 
 Subagents are authorized and recommended; $lean-model says how to run them.
 
-This goal brings HF_MODEL to a correct, fast TTNN full model on the target mesh under models/autoports/<model>. The approach is yours: plan, reuse the closest model in tt-metal, port modules in parallel, optimise where the profiler shows lost time. The outputs and tests below are fixed. Read bringup/agentic_evals/inputs.json for scope, batch_sizes and budget_hours. Do not begin vLLM work.
+This goal brings HF_MODEL to a correct, fast TTNN full model on the target mesh under models/autoports/<model>. The approach is yours: plan, reuse the closest model in tt-metal, port modules in parallel, optimise where the profiler shows lost time. The outputs and tests below are fixed. Read bringup/agentic_evals/inputs.json for scope, batch_sizes and budget_hours (default 24); if it has no base_commit, write the current HEAD there. Do not begin vLLM work.
 
 Goal completion requirements:
+- Before the first device run, doc/model/model.json records started_at (UTC), budget_hours and reset_authorization (whether bounded resets and health checks are allowed on this machine). Check the time left against them when planning each round, leaving enough for T2 and the report.
 - SPEC.md and a roofline with per-batch targets exist before device work; targets are multiples of their floors.
 - The full model implements the $full-model generator contract: chunked prefill at any valid length, traced decode with on-device split sampling, paged KV, fixed slots, every batch in batch_sizes, the advertised context or a hard physical limit with evidence.
 - The $reference-accuracy suite exists with verdict match at full precision; the served precision is chosen on its tiers and is the recorded baseline.
 - Batched equals alone at the largest batch (identical greedy tokens over long runs; logits bitwise where the ops allow, any exception named); short greedy prompts are coherent (no repetition, collapse or drift).
 - The KV pool is the largest that fits after weights, measured peak activations, the trace region and a margin, tested at the largest batch growing to the working set; doc/agentic_serving.json records workload and ledger.
 - New or changed ops each have a unit test at model shapes and a switch back. A mixture-of-experts model records experts touched and decode against its floor at batch 1 and the largest batch.
-- doc/model/model.json records scope, targets, floors, measured decode ms/step and TTFT per batch, precision, pool, tier commands and the perf ledger; REPORT.md leads with measured against target.
+- doc/model/model.json records scope, targets, floors, measured decode ms/step and TTFT per batch, precision, pool, tier commands the perf ledger and hours_used; REPORT.md leads with measured against target and hours used against budget.
 - $stage-review returns `clean-pass` once, at the end. Local commits on one branch, never push, tag the result bringup/<model>/model; log SHAs.
 
 An open divergence at full precision (an implementation error, not a quantization choice) fails the goal. Speed targets do not: keep improving until budget_hours ends, then report each number far from its target with its reason. Unmet requirements, review findings, failed gates: work. Stop only after `$autofix` fails.

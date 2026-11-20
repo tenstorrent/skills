@@ -47,7 +47,8 @@ or replace acceptance criteria with a review plugin's criteria.
    hardware. Resolve model directory as `models/autoports/<lowercase HF ID with non-alphanumeric
    characters replaced by underscores>`. Do not acquire hardware just because a plugin was installed.
    Record any serving-plugin interface change that the operator authorizes for this run.
-   Record the run's `scope` and `base_commit` in `bringup/agentic_evals/inputs.json` under the model folder.
+   Record the run's `scope` and `base_commit` (the current HEAD if none was given) in
+   `bringup/agentic_evals/inputs.json` under the model folder.
    `release` (default): the model ships through tt-metal, so nothing outside `models/autoports/<model>/` and
    `bringup/` changes; when a ttnn op blocks or is wrong, work around it inside the model (model-local kernels
    are fine), keep a minimal repro and note it for an issue. `open`: the model may carry its own versions of

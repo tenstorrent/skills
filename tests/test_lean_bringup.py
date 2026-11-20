@@ -38,7 +38,8 @@ def test_lean_prompt_fits_and_names_existing_skills(path):
 
 
 def record():
-    return {'budget_hours': 30,
+    return {'budget_hours': 24, 'started_at': '2026-11-21T08:00:00Z', 'hours_used': 23.5,
+            'reset_authorization': 'bounded resets and health checks authorized on this box',
             'targets': {f'decode_ms_b{b}': 10.0 * (1 + b / 32) for b in (1, 8, 16, 32)},
             'floors': {f'decode_ms_b{b}': 5.0 * (1 + b / 32) for b in (1, 8, 16, 32)},
             'measured': {**{f'decode_ms_b{b}': 12.0 * (1 + b / 32) for b in (1, 8, 16, 32)},
@@ -111,3 +112,23 @@ def test_moe_needs_per_batch_numbers(tmp_path):
     assert run(tmp_path, data) == (0, '')
     del data['moe']
     assert run(tmp_path, data)[0] == 1
+
+
+def test_start_budget_and_reset_authorization_are_recorded(tmp_path):
+    for key in ('started_at', 'reset_authorization'):
+        data = record()
+        del data[key]
+        code, stderr = run(tmp_path, data)
+        assert code == 2 and key in stderr
+    code, stderr = run(tmp_path, record(), inputs={'budget_hours': 36})
+    assert code == 2 and '36 h' in stderr
+    data = record()
+    data['budget_hours'] = 36
+    assert run(tmp_path, data, inputs={'budget_hours': 36}) == (0, '')
+
+
+def test_hours_well_over_budget_are_advisory(tmp_path):
+    data = record()
+    data['hours_used'] = 40
+    code, stderr = run(tmp_path, data)
+    assert code == 1 and 'over the 24 h budget' in stderr

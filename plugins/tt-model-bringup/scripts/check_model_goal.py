@@ -3,8 +3,9 @@
 
 Critical (exit 2): the record is missing, a batch in batch_sizes has no measured decode, batched does not equal
 alone, there is no perf ledger, a new or changed op has no test or switch back, or a mixture-of-experts record
-lacks its per-batch numbers. Advisory (exit 1): a measured decode more than 2x its target without a reason,
-a missing floor, tier command or budget. Exit 0 pass, 1 advisory, 2 critical, 3 error.
+lacks its per-batch numbers, or the record lacks started_at, budget_hours or reset_authorization. Advisory
+(exit 1): a measured decode more than 2x its target without a reason, a missing floor or tier command, hours_used
+missing or well over the budget (budget_hours in inputs.json, default 24). Exit 0 pass, 1 advisory, 2 critical, 3 error.
 """
 from __future__ import annotations
 
@@ -19,15 +20,26 @@ INPUTS = Path("bringup/agentic_evals/inputs.json")
 TIERS = ("T0", "T1", "T2")
 OP_KINDS = ("fusion", "op_change", "new_op")
 DEFAULT_BATCHES = (1, 8, 16, 32)
+DEFAULT_BUDGET_HOURS = 24
+OVERRUN = 1.25
 
 
 def number(value) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
 
 
-def check(record: dict, batches, problems: list) -> None:
-    if not number(record.get("budget_hours")):
-        problems.append((1, "budget_hours is missing"))
+def check(record: dict, batches, budget, problems: list) -> None:
+    for key in ("started_at", "reset_authorization"):
+        if not record.get(key):
+            problems.append((2, f"{key} is missing; it is recorded before the first device run"))
+    if record.get("budget_hours") != budget:
+        problems.append((2, f"budget_hours must record the run's budget, {budget} h (inputs.json, default "
+                            f"{DEFAULT_BUDGET_HOURS})"))
+    used = record.get("hours_used")
+    if not number(used):
+        problems.append((1, "hours_used is missing"))
+    elif used > OVERRUN * budget:
+        problems.append((1, f"hours_used {used} is well over the {budget} h budget"))
     targets, floors = record.get("targets") or {}, record.get("floors") or {}
     measured = record.get("measured") or {}
     for batch in batches:
@@ -78,10 +90,12 @@ def main() -> int:
         return 3
     model_dir = Path(args.model_dir or "models/autoports/" + re.sub(r"[^a-z0-9]+", "_", args.hf_model.lower()).strip("_"))
     problems: list = []
-    batches = DEFAULT_BATCHES
+    batches, budget = DEFAULT_BATCHES, DEFAULT_BUDGET_HOURS
     if (model_dir / INPUTS).is_file():
         try:
-            batches = tuple(json.loads((model_dir / INPUTS).read_text()).get("batch_sizes") or DEFAULT_BATCHES)
+            inputs = json.loads((model_dir / INPUTS).read_text()) or {}
+            batches = tuple(inputs.get("batch_sizes") or DEFAULT_BATCHES)
+            budget = inputs.get("budget_hours") or DEFAULT_BUDGET_HOURS
         except json.JSONDecodeError as exc:
             problems.append((2, f"{model_dir / INPUTS} is not valid JSON: {exc}"))
     path = model_dir / RECORD
@@ -93,7 +107,7 @@ def main() -> int:
         except json.JSONDecodeError as exc:
             problems.append((2, f"{path} is not valid JSON: {exc}"))
         else:
-            check(record if isinstance(record, dict) else {}, batches, problems)
+            check(record if isinstance(record, dict) else {}, batches, budget, problems)
     for level, message in problems:
         print(f"{('NOTE', 'ADVISORY', 'CRITICAL')[level]}: {message}", file=sys.stderr)
     return max((level for level, _ in problems), default=0)
