@@ -83,6 +83,18 @@ Recovery sequence:
 7. Resume the same stage from preserved state. In the multigoal flow, use `--resume-stage <stage_number> --log-dir <preserved_run_directory>` with the same Codex home recorded in the manifest instead of restarting completed earlier stages.
 8. Record this as infrastructure recovery, not a model correctness or performance result.
 
+### Profiler runs that wedged a T3K
+
+Seen on T3K during optimization: after a serving profiler or watcher failure, a full in-process 32-layer
+serving-adapter profile under device-profiler settings (`TT_METAL_DEVICE_PROFILER=1`,
+`TT_METAL_PROFILER_CPP_POST_PROCESS=1`, `TT_METAL_PROFILER_MID_RUN_DUMP=1`, `TT_METAL_PROFILER_TRACE_TRACKING=1`,
+`TT_METAL_PROFILER_PROGRAM_SUPPORT_COUNT=5000`) followed by `ttnn.ReadDeviceProfiler(mesh)` produced the signatures
+above and left the board undiscoverable (`tt-smi -ls --local` and `tt-smi -r` hung). Do not run that pattern. If
+these signatures appear during profiling: stop profiler collection, keep the logs, mark the evidence
+`hardware-profiler-limited`, and run the recovery sequence above before calling the stage blocked. A
+device-profiler-enabled serving process should not exist (serving stages do not profile); stop leftover
+`EngineCore` or server processes from this run and run at most one bounded health check.
+
 Do not mark a model stage blocked because a board briefly became undiscoverable. A model stage may block on hardware only after this recovery path fails or requires operator intervention the agent cannot perform.
 
 ## Hangs And tt-triage

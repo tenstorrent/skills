@@ -197,7 +197,7 @@
       "destination": "skills/optimize/SKILL.md",
       "blob": "280abb027d839f1f076ab8a524fc6f61ed6df587",
       "source_sha256": "c4b4015ed198c305ed19f73c2ef6a539923212457588319767d08489a5331c8b",
-      "packaged_sha256": "947a68d52c08c447e2dada57ef6eed3b71594775f2837f65ef8ab293412669f5"
+      "packaged_sha256": "a8769f003b60ca6f13604a8d168eb4be6274ea62b98ce103520c67ae13b95bbb"
     },
     {
       "source": ".agents/skills/optimize/agents/openai.yaml",
@@ -239,7 +239,7 @@
       "destination": "skills/tt-device-usage/SKILL.md",
       "blob": "273f20c58cbd80640677004635e43ce47d759891",
       "source_sha256": "b32b5685e47932e1356762c96f70f2ee5cc226ce23d5e1781f9a6bfe26a66502",
-      "packaged_sha256": "fd9441fb2a868b59918b5c27dc1c80afa32a0fb5f2b791279e7603049c2a6c8b"
+      "packaged_sha256": "59a25cc6fe6a9fc3b84ebf058adc12351d6c0d771fea2e4f72f41b0f5f74b54f"
     },
     {
       "source": ".agents/skills/tt-device-usage/agents/openai.yaml",

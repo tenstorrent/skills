@@ -20,6 +20,8 @@ Read a topic when the work reaches it:
 | [multi-chip and CCL](topics/multichip.md) | sharding over chips, collectives, fused CCL ops, Blackhole grid sizes |
 | [MoE](topics/moe.md) | routed experts |
 | [performance work](topics/perf.md) | profiling, comparing measurements, kernel edits, host-side cost |
+| [performance advice](topics/perf-advice.md) | optimizing a decoder: packing, attention and residual contracts, CCL topology, LM head and sampling (OPT-001 to OPT-015) |
+| [matmul and precision](topics/matmul-precision.md) | matmul program configs and geometry, sparse matmul `nnz`, dtype, fidelity and compute kernel configs |
 | [serving and evals](topics/serving-evals.md) | the vLLM plugin, sampling, eval harnesses and their infrastructure |
 | [reference code](topics/reference-code.md) | before designing a module: working implementations in tt-metal |
 | [correctness](topics/correctness.md) | TTNN defaults while proving semantics, HF reference layers, synthetic weights |

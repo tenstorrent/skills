@@ -26,7 +26,15 @@ row; spreading them over many zero rows removed the bottleneck.
 applied gamma twice; numerics failed only at the fused path.
 
 **Op limits seen:** `moe_compute` handled BFP4 experts but gave NaN with BFP8; `ttnn.sparse_matmul` with a static
-`nnz` must match the actual non-zero count exactly or it can hang (see `optimize`, sparse matmul).
+`nnz` must match the actual non-zero count exactly or it can hang (see [matmul-precision](matmul-precision.md#sparse-matmul-nnz)).
+
+**Tuning the active-expert path.** Dense all-expert execution is a debug baseline. Tune each sparse projection
+role separately ([matmul-precision](matmul-precision.md#sparse-matmul-nnz)). Sparse weights may live in DRAM, but
+decode outputs and elementwise or reduction intermediates belong in L1 or sharded L1 unless L1 capacity is shown
+to block it; an explicit `ttnn.DRAM_MEMORY_CONFIG` on a decode intermediate is a smell. Slow `BinaryNg`, `Unary`,
+`Slice` or `Reduce` rows around MoE usually mean tensors round-trip through DRAM; check that before retuning
+matmuls. A candidate that hangs or fails PCC is rejected on its own; the rest of the sweep continues after device
+recovery ([tt-device-usage](../../tt-device-usage/SKILL.md)).
 
 **Reference implementation:** `models/demos/gpt_oss/tt/experts/` (decode, prefill, weights, config) and
 `models/demos/gpt_oss/tt/topk.py`.
