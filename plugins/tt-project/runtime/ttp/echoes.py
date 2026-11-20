@@ -289,8 +289,10 @@ def record_correction(db, name: str, text: str, now: float | None = None) -> dic
 def places(p, pristine: list[str] | None = None) -> list[tuple[str, str, str]]:
     """Every project-local place retired text can still bind, as (key, label, text): live memory entries
     (the one store both workers' and the coordinator's copies come from), charter sections, schedules'
-    payload strings and descriptions, open tasks' specs and start_when probes, config string values, and
-    the project's files. Harness files equal to the template are no place; their text goes to `pristine`."""
+    payload strings and descriptions, open tasks' live specs (coordinator.live_spec: a replaced or withdrawn
+    step's earlier text is no place) and start_when probes, config string values, and the project's files.
+    Harness files equal to the template are no place; their text goes to `pristine`."""
+    from .coordinator import live_spec
     from .db import TERMINAL_TASK_STATES, deferral
     from .prompts import charter_sections
     out: list[tuple[str, str, str]] = []
@@ -322,7 +324,7 @@ def places(p, pristine: list[str] | None = None) -> list[tuple[str, str, str]]:
                                                                   "payload": payload}, "")
     for t in p.db.q(f"SELECT id, spec, labels FROM tasks WHERE status NOT IN "
                     f"({','.join('?' * len(TERMINAL_TASK_STATES))}) ORDER BY id", TERMINAL_TASK_STATES):
-        out.append((f"task:{t['id']}:spec", f"task #{t['id']} spec", t["spec"] or ""))
+        out.append((f"task:{t['id']}:spec", f"task #{t['id']} spec", live_spec(t["spec"] or "")))
         when = deferral(t).get("when")
         if when:
             out.append((f"task:{t['id']}:start_when", f"task #{t['id']} start_when", when))

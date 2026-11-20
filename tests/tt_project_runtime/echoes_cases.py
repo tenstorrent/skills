@@ -1321,3 +1321,22 @@ def test_a_retired_phrase_that_only_cites_user_messages_still_cited_is_advisory(
         p.forget_memory(e["name"])
     hits = [h for h in echoes.scan(p) if h["key"].split(":", 1)[1] == f"task:{hdr}:spec"]
     assert hits and any(h["class"] == "directive" for h in hits), hits
+
+
+def test_a_step_a_task_update_replaced_or_withdrew_is_no_echo_and_its_live_text_still_is(env):
+    from ttp import coordinator as coord, echoes
+    p = make(env)
+    echoes.record(p.db, "memory [old] withdrawn", "Route builds through the `copper-funnel` host pool.",
+                  kind=echoes.WITHDRAWN)
+    step = "Route builds through the copper-funnel pool."
+    moved = p.db.add_task("build", f"Ship the release.\n\n{step}")
+    dropped = p.db.add_task("other build", f"Ship the patch.\n\n{step}")
+    kept = p.db.add_task("plain", f"Ship the docs.\n\n{step}")
+    new = "Route builds through the fast pool."
+    assert coord.apply(p, [{"type": "task_update", "id": moved, "replace": {"old": step, "new": new}},
+                           {"type": "task_update", "id": dropped, "replace": {"old": step, "new": ""}}]) == []
+    # The update records ("Step replaced ... now reads ...", "Step withdrawn ...") quote the retired step.
+    assert "copper-funnel" in p.db.task(moved)["spec"] and "copper-funnel" in p.db.task(dropped)["spec"]
+    assert coord.live_spec(p.db.task(moved)["spec"]).count("fast pool") == 2
+    hits = {h["key"].split(":", 1)[1] for h in echoes.scan(p)}
+    assert f"task:{kept}:spec" in hits and f"task:{moved}:spec" not in hits and f"task:{dropped}:spec" not in hits, hits

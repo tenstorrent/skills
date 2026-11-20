@@ -7150,6 +7150,28 @@ def replace_step(spec: str, rep) -> tuple[str, str]:
     return spec[:start] + new + spec[start + len(old):], said
 
 
+_STEP_SAID = re.compile(r"^Step (replaced \(the earlier text no longer applies\)|withdrawn \(no longer required\)): (.*)$",
+                        re.M)
+
+
+def live_spec(spec: str) -> str:
+    """The spec as it still binds: each replace_step line withdrawing a step is dropped and each replacing
+    one keeps only its new text, so a scan of live text never reads a step the update retired."""
+    import ast
+
+    def keep(m: re.Match) -> str:
+        if m.group(1).startswith("withdrawn"):
+            return ""
+        for cut in re.finditer(" now reads ", m.group(2)):
+            try:
+                ast.literal_eval(m.group(2)[:cut.start()])
+                return str(ast.literal_eval(m.group(2)[cut.end():]))
+            except (ValueError, SyntaxError):
+                continue
+        return ""
+    return _STEP_SAID.sub(keep, spec)
+
+
 # A task_update `spec` may also edit the live spec by its own lines: `retire: "<exact earlier text>"` drops
 # every copy of that text (a re-sent update repeats it), and a first line `replace:` makes the rest of the
 # update the whole live spec. Both lines are exact forms, so a plain "Replace: the loader" step stays
