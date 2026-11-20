@@ -78,3 +78,13 @@ which then reach both the CSV and the Tracy client.
 `TT_METAL_PROFILER_MID_RUN_DUMP` is the environment-variable equivalent for a
 long-lived process — a serving job that never closes its device otherwise never
 writes a profile.
+
+If the host does not drain in time, the run log says `Profiler DRAM buffers were
+full, markers were dropped!` and `process_ops_logs` may stop with `Device data
+missing: Op <N> not present in ...`. Treat that as a failed capture. Size
+`--op-support-count` (it sets `TT_METAL_PROFILER_PROGRAM_SUPPORT_COUNT`) for the
+whole run — for traced replay, one replay, since the host cannot drain
+mid-trace — and read once at the end. On a mesh, never call `ReadDeviceProfiler`
+after every op: each call is a mesh-wide sync that inflates `OP TO OP LATENCY`
+and can grow the device log to tens of GB. Keep the count fixed between runs: it
+is a build define of every kernel, so a new value recompiles every kernel.

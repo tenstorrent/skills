@@ -16,25 +16,12 @@ counters below, or the per-RISC split in `op-report.md`.
 
 ```bash
 python -m tracy -p -r --profiler-capture-perf-counters fpu -m pytest <test> -k <filter>
-python -m tracy -p -r --profiler-capture-perf-counters fpu,pack,unpack,instrn -m pytest <test> -k <filter>
 python -m tracy -p -r --profiler-capture-perf-counters all --perf-counter-multipass -m pytest <test> -k <filter>
 ```
 
-- Groups: `fpu` (FPU, SFPU and Math counters together), `pack`, `unpack`,
-  `instrn`, `l1_0`..`l1_5` (`l1_2` and up on Blackhole only), and `all` =
-  fpu, pack, unpack, instrn plus every L1 group the arch has. There is no
-  `sfpu` group: tracy warns and ignores it, and `fpu` already captures SFPU.
-- The flag sets `TT_METAL_PROFILE_PERF_COUNTERS`; that variable set without the
-  flag is ignored with a warning.
-- One pass holds one L1 bank and a capped number of groups:
-  `PERF_COUNTER_MAX_GROUPS_PER_PASS` in `tools/tracy/perf_counter_multipass.py`
-  (5). A request that needs more passes fails with the pass plan unless
-  `--perf-counter-multipass` is given, which replays the workload once per pass
-  and merges the device logs. `all` needs one pass per L1 bank.
-- Later-pass rows that match no op of pass 0 are dropped
-  (`Dropped N perf-counter rows`), so every pass must run the same ops. Prefer
-  the one-pass `fpu` unless the other groups are needed.
-- `all` needs the arch: set `ARCH_NAME`, or tracy starts ttnn to detect it.
+`fpu` captures the FPU, SFPU and Math counters in one pass; there is no `sfpu`
+group. `all` needs `--perf-counter-multipass`, which replays the workload once
+per pass, so every pass must run the same ops.
 
 Counters are latched per kernel zone, not sampled over time. There is no
 per-microsecond view.
@@ -53,7 +40,4 @@ reverse.
 
 ## When the columns are blank
 
-- **All blank**: the run captured no counters. Re-run with `fpu`.
-- **Blank on some ops**: op-to-zone matching failed. The raw per-core values are
-  device-log events with zone id `9090`; `tools/tracy/perf_counter_analysis.py`
-  builds the columns from them.
+All columns blank means the run captured no counters. Re-run with `fpu`.

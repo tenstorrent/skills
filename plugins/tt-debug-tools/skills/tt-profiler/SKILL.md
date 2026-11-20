@@ -24,7 +24,7 @@ metadata:
       path: tools/tracy/process_ops_logs.py
     - repo: tenstorrent/tt-metal
       ref: 5d54be8805315b56cb7d9f5a5050e86b95d5b74a
-      path: tt_metal/tools/profiler/STREAMING_PROFILER.md
+      path: tt_metal/tools/profiler/STREAMING_PROFILER_DETAILED.md
 ---
 
 # tt-profiler
@@ -37,8 +37,10 @@ Tracy.
 Built by default. **Off at runtime**, so the overhead only arrives when you ask
 for it.
 
-On Blackhole, the [streaming profiler](https://github.com/tenstorrent/tt-metal/blob/main/tt_metal/tools/profiler/STREAMING_PROFILER.md)
+On Blackhole, the [streaming profiler](https://github.com/tenstorrent/tt-metal/blob/main/tt_metal/tools/profiler/STREAMING_PROFILER_DETAILED.md)
 (`TT_METAL_STREAMING_PROFILER=1`, output via `TT_METAL_STREAMING_PROFILER_OPS_CSV` / `_ZONE_CSV`) drains continuously.
+It cannot run under `python -m tracy -p`: `-p` sets `TT_METAL_DEVICE_PROFILER=1`,
+and setting both is a fatal error at startup.
 
 ## When to invoke
 
@@ -76,7 +78,7 @@ need tt-npe: `references/noc-bandwidth.md`.
 
 Profile a warm forward, not model load: `references/op-report.md`. Long runs,
 traced replay and many-chip meshes, where the buffer overflows:
-`references/long-runs.md`.
+`references/capture.md`.
 
 In-kernel, after `#include <tools/profiler/kernel_profiler.hpp>`:
 
@@ -142,13 +144,3 @@ rather than assuming positions.
 **Volume.** `test_full_buffer` alone produces over 1.6 million rows. Filter by
 zone name and core before reading, and never open it whole in an agent context.
 
-## When the numbers look wrong
-
-| Symptom | Likely cause |
-|---|---|
-| All device durations are 0 | Watcher or DPRINT set in the same run (first trap above) |
-| Only a handful of ops in the report | Buffer overflow; see `references/long-runs.md` |
-| Permutes or weight tilizes lead the ranking | The capture includes model load; profile warm (`references/op-report.md`) |
-| `NOC` / `DRAM` / `ETH BW UTIL` blank | tt-npe did not run; blank is not zero (`references/noc-bandwidth.md`) |
-| `PM FPU UTIL` ≈ 0 on a heavy op | The op has no perf model; capture counters (`references/perf-counters.md`) |
-| Huge `OP TO OP LATENCY`, device log tens of GB | Per-op `ReadDeviceProfiler` flushes on a mesh; drop them, raise `--op-support-count` |
