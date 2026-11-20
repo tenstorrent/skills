@@ -423,7 +423,7 @@ def _judge(p: Project, job: dict, checks: list, run, owned: dict) -> dict:
                     "why": "they fail before this landing too" if pre else
                     f"the rerun before this landing ({str(job.get('good'))[:10] or 'none'}) could not tell"}
         ids = sorted(set(ids) - pre)
-        tip = _target_tip(Path(job["repo"]), job)
+        tip = _tip_of_target(Path(job["repo"]), job)
         if tip and tip != sha:   # a test the target's tip passes was fixed since: nobody's to revert
             at_tip = gatejudge.failed_of(*run(tip, cmd, ids), ids)
             if at_tip is not None:
@@ -458,7 +458,7 @@ def _judge(p: Project, job: dict, checks: list, run, owned: dict) -> dict:
     return {"outcome": "pass"} | ({"rerun": cut} if cut else {})
 
 
-def _target_tip(repo: Path, job: dict) -> str:
+def _tip_of_target(repo: Path, job: dict) -> str:
     """The target's current tip, fetched ('' when it cannot be read)."""
     from . import push
     remote, _, branch = str(job["target"]).partition("/")
