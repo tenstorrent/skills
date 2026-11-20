@@ -911,6 +911,12 @@ def test_bridge_gh_pull_is_a_per_box_switch():
     assert bridge.parse({"boxes": {"b": {"agents": agents}}})["boxes"]["b"]["gh_pull"] is False
     with pytest.raises(bridge.BadConfig):
         bridge.parse({"boxes": {"b": {"agents": agents, "gh_pull": "yes"}}})
+    assert bridge.parse({"boxes": {"b": {"agents": agents}}})["boxes"]["b"]["gh_branch_prefixes"] == []
+    assert bridge.parse({"boxes": {"b": {"agents": agents, "gh_branch_prefixes": ["team/"]}}}
+                        )["boxes"]["b"]["gh_branch_prefixes"] == ["team/"]
+    for bad in ("team/", ["main/"], ["team"], ["a/b/"], [1]):
+        with pytest.raises(bridge.BadConfig):
+            bridge.parse({"boxes": {"b": {"agents": agents, "gh_branch_prefixes": bad}}})
 
 
 def _anon_github(env, monkeypatch, routes):
@@ -1170,3 +1176,97 @@ def test_ci_wait_on_the_workstation_route_reads_the_pr_not_the_run_list(env, mon
     assert ciwait.probe(repo="o/r", branch="b")[0] == 75, "no checks yet"
     view["v"] = None
     assert ciwait.probe(repo="o/r", branch="b")[0] == 75, "gh cannot answer"
+
+
+def test_gh_workstation_publishes_one_own_branch_from_a_bundle_and_retires_it_with_its_tip_saved_first(env, monkeypatch):
+    """`ttp push --publish <branch>` queues a git bundle of the branch's new commits over origin's refs;
+    the workstation repeats allowed(), fetches the bundle's basis, unbundles and pushes `<sha>:<branch>`
+    with no `+` (a new branch or a fast-forward only), never the default branch; the box keeps the pushed
+    sha. `ttp push --retire` saves the tip as a private ref and a bundle, then queues the branch delete."""
+    import base64
+    from ttp import ghqueue, ghroute
+    p, repo, origin, _other = _push_setup(env, monkeypatch, ["true"])
+    cfg, _r, _gh, _calls = _workstation(env, monkeypatch)
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(ghroute, "_value", lambda cfg=None, cwd=None: ghroute.WORKSTATION)
+    monkeypatch.setattr(ghqueue, "repo_of", lambda cwd: "acme/widgets")
+    monkeypatch.setattr(ghqueue, "GIT_URL", f"file://{origin}")
+    ws = env["tmp"] / "ws-publish"
+    ws.mkdir()
+    default, prs = ws / "default", ws / "prs"
+    default.write_text("main\n")
+    prs.write_text("[]\n")
+    gh = ws / "gh"
+    gh.write_text("#!/bin/sh\n"
+                  f'case "$*" in "api repos/acme/widgets --jq .default_branch") cat "{default}";;\n'
+                  f'  "pr list"*) cat "{prs}";; *) echo "ws: $*";; esac\n')
+    gh.chmod(0o755)
+    _git_out(repo, "fetch", "-q", "origin")
+    branch, sha = "ttp/t7-faster", "ab" * 20
+    bundle = b"# v2 git bundle\n" + sha.encode() + b" refs/heads/x\n\n"
+
+    # allowed() on both sides: one repo, one own (or granted) plain branch, a full sha, one capped bundle
+    assert ghqueue.allowed([ghqueue.PUBLISH, "acme/widgets", branch, sha], bundle) == ""
+    for bad, data in (([ghqueue.PUBLISH, "acme/widgets", "main", sha], bundle),
+                      ([ghqueue.PUBLISH, "acme/widgets", "master", sha], bundle),
+                      ([ghqueue.PUBLISH, "acme/widgets", "feature/x", sha], bundle),
+                      ([ghqueue.PUBLISH, "acme/widgets", "ttp/../main", sha], bundle),
+                      ([ghqueue.PUBLISH, "acme/widgets", branch, "HEAD"], bundle),
+                      ([ghqueue.PUBLISH, "acme/../x", branch, sha], bundle),
+                      ([ghqueue.PUBLISH, "acme/widgets", branch, sha, "--force"], bundle),
+                      ([ghqueue.PUBLISH, "acme/widgets", branch, sha], b"not a bundle"),
+                      ([ghqueue.PUBLISH, "acme/widgets", branch, sha], bundle + b"x" * ghqueue.PUBLISH_MAX)):
+        assert ghqueue.allowed(bad, data), bad
+    assert ghqueue.allowed([ghqueue.PUBLISH, "acme/widgets", "team/x", sha], bundle, ["team/"]) == ""
+    assert ghqueue.allowed(["api", "-X", "DELETE", "repos/acme/widgets/git/refs/heads/team/x"], b"", ["team/"]) == ""
+    assert ghqueue.allowed(["api", "-X", "DELETE", "repos/acme/widgets/git/refs/heads/team/x"])
+    default.write_text(branch + "\n")
+    assert "default branch" in ghqueue.answer({"key": "f" * 32, "argv": [ghqueue.PUBLISH, "acme/widgets", branch, sha],
+                                               "stdin": base64.b64encode(bundle).decode()}, str(gh))["stderr"]
+    default.write_text("main\n")
+
+    def remote_tip():
+        return subprocess.run(["git", "-C", str(origin), "rev-parse", "-q", "--verify", f"refs/heads/{branch}"],
+                              capture_output=True, text=True).stdout.strip()
+
+    # a new branch, then a fast-forward: queued once, pushed by the workstation, the sha kept here
+    _git_out(repo, "checkout", "-q", "-b", branch)
+    for n in (1, 2):
+        _commit(repo, f"f{n}.txt", f"{n}\n")
+        head = _git_out(repo, "rev-parse", "HEAD").strip()
+        assert ghqueue.publish(branch, str(repo)) == ghroute.HELD_RC
+        assert ghqueue.pull("lab-box", str(gh)) == "lab-box: answered 1 gh call(s)"
+        assert remote_tip() == head
+        assert ghqueue.publish(branch, str(repo)) == 0
+    rows = [json.loads(x) for x in (ghqueue.outbox() / ghqueue.PUBLISHED).read_text().splitlines()]
+    assert [(r["repo"], r["branch"], r["sha"]) for r in rows][-1] == ("acme/widgets", branch, head)
+    # not a fast-forward: the remote refuses, nothing is forced
+    _git_out(repo, "checkout", "-q", "-B", branch, "HEAD~2")
+    _commit(repo, "g.txt", "g\n")
+    assert ghqueue.publish(branch, str(repo)) == ghroute.HELD_RC
+    ghqueue.pull("lab-box", str(gh))
+    assert ghqueue.publish(branch, str(repo)) != 0 and remote_tip() == head
+    assert ghqueue.publish("main", str(repo)) == 1
+
+    # retire: refused while a worktree or open task uses it, or an open PR does; the tip is saved first
+    _git_out(repo, "checkout", "-q", "proj")
+    t = p.db.add_task("uses it", "s", kind="code", origin="daemon")
+    p.db.update_task(t, status="queued", branch=branch)
+    assert ghqueue.retire(branch, str(repo)) == 1
+    p.db.update_task(t, status="done")
+    assert ghqueue.retire("ttp/never-pushed", str(repo)) == 1
+    prs.write_text('[{"number": 4}]\n')
+    assert ghqueue.retire(branch, str(repo)) == ghroute.HELD_RC   # the open-PR read is queued
+    ghqueue.pull("lab-box", str(gh))
+    assert ghqueue.retire(branch, str(repo)) == 1
+    prs.write_text("[]\n")
+    assert ghqueue.retire(branch, str(repo)) == ghroute.HELD_RC
+    ghqueue.pull("lab-box", str(gh))
+    monkeypatch.setattr(ghqueue, "own_branch", lambda gh, argv: ("", head))
+    assert ghqueue.retire(branch, str(repo)) == ghroute.HELD_RC   # tip saved, the delete queued
+    assert _git_out(repo, "rev-parse", f"refs/ttp-private/retired/{branch}").strip() == head
+    assert (p.state / "retired" / "ttp%2Ft7-faster.bundle").is_file()
+    ghqueue.pull("lab-box", str(gh))
+    assert ghqueue.retire(branch, str(repo)) == 0
+    rows = [json.loads(x) for x in (ghqueue.outbox() / ghqueue.DELETED).read_text().splitlines()]
+    assert (rows[-1]["branch"], rows[-1]["tip"]) == (branch, head)

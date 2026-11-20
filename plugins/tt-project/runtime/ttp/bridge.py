@@ -194,8 +194,14 @@ def parse(data: dict) -> dict:
             raise BadConfig(f"box {box}: hold_check is an absolute path on the box (letters, digits, '_', '.', '-', '/')")
         if not isinstance(b.get("gh_pull", False), bool):
             raise BadConfig(f"box {box}: gh_pull is true or false (this computer runs the box's queued gh calls)")
+        grants = b.get("gh_branch_prefixes", [])
+        if not isinstance(grants, list) or not all(isinstance(x, str) and re.fullmatch(r"[A-Za-z0-9_.-]+/", x)
+                                                   and x.rstrip("/") not in ("main", "master") for x in grants):
+            raise BadConfig(f"box {box}: gh_branch_prefixes is a list of branch prefixes ending in '/' (beyond ttp/, "
+                            "the box's branches this computer publishes or deletes)")
         out["boxes"][box] = {"login": {"agent": login.get("agent", ""), "identity": login.get("identity", "")},
-                             "agents": parsed, "hold_check": hold, "gh_pull": b.get("gh_pull", False)}
+                             "agents": parsed, "hold_check": hold, "gh_pull": b.get("gh_pull", False),
+                             "gh_branch_prefixes": grants}
     if data.get("cert") is not None:
         from . import bridge_cert
         out["cert"] = bridge_cert.parse(data["cert"], out)

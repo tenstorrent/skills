@@ -2853,7 +2853,7 @@ def _bridge_gh_pull(a, cfg: dict, boxes: list[str]) -> None:
         die("no box to pull: name one, or set \"gh_pull\": true on it in the bridge config")
     while True:
         for box in boxes:
-            print(ghqueue.pull(box), flush=True)
+            print(ghqueue.pull(box, prefixes=cfg["boxes"][box].get("gh_branch_prefixes") or []), flush=True)
         if not a.loop:
             return
         time.sleep(max(5, a.every))
@@ -3576,6 +3576,9 @@ def _cmd_push(a, push) -> None:
         sys.exit(push.stop_own(p, Path(a.stop), a.why or ""))
     if a.cancel:
         sys.exit(push.cancel(p, Path(a.cancel)))
+    if a.publish or a.retire:
+        from . import ghqueue
+        sys.exit(ghqueue.publish(a.publish, os.getcwd()) if a.publish else ghqueue.retire(a.retire, os.getcwd()))
     if a.move_tag:
         from . import channeltag
         sys.exit(channeltag.move(p, Path.cwd(), *a.move_tag, say=lambda s: print(s, file=sys.stderr)))
@@ -16242,6 +16245,14 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--move-tag", nargs=2, metavar=("TAG", "COMMIT"),
                    help="move a delivery.channel_tags tag forward to COMMIT (on the push branch) under a lease "
                         "on its current remote value; the one forced push delivery.never_force lets through")
+    s.add_argument("--publish", metavar="BRANCH",
+                   help="delivery.gh_route \"workstation\": queue BRANCH's new commits (a git bundle) for the "
+                        "workstation to push with its own login: a new branch or a fast-forward of the project's own "
+                        "ttp/ (or granted) branch, never main, master or the default branch; rerun for the pushed sha")
+    s.add_argument("--retire", metavar="BRANCH",
+                   help="delivery.gh_route \"workstation\": delete a branch this project pushed, once no open PR, "
+                        "task or worktree uses it; its tip is saved first (refs/ttp-private/retired/BRANCH and a "
+                        "bundle in state/retired/)")
     s.add_argument("--marker", help=argparse.SUPPRESS)   # the detached process itself
     s.add_argument("--batch", metavar="MARKER", help=argparse.SUPPRESS)   # the push queue's batch process (batch.py)
     s.set_defaults(fn=cmd_push)

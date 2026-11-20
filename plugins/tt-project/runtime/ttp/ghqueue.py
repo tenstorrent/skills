@@ -24,6 +24,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -59,6 +60,12 @@ _DELETE_PATH = re.compile(r"/?repos/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/git/refs
 _REF_SEG = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*")
 _DELETE_FLAGS = {"-X": "method", "--method": "method"}
 _PROTECTED = {"main", "master"}
+_PREFIX = re.compile(r"[A-Za-z0-9_.-]+/")   # a granted branch prefix (delivery / bridge gh_branch_prefixes)
+PUBLISH = "git-publish"    # the queue's own call: push one branch from a git bundle (`ttp push --publish`)
+PUBLISH_MAX = 2 << 20      # a publish's bundle cap (bytes)
+PUBLISHED = "published-branches.jsonl"   # each publish's pushed sha, kept past prune (`ttp push --retire` reads it)
+GIT_URL = "https://github.com/{repo}.git"
+_BUNDLE = re.compile(rb"# v[23] git bundle\n")
 # `gh repo fork <owner>/<repo> --fork-name <name> --clone=false`: a fresh fork under the gh user, for a PR head
 # whose old fork left the upstream fork network; never one that already exists (the workstation reads first)
 _REPO = re.compile(r"([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)")
@@ -170,7 +177,31 @@ def own_draft(gh: str, argv: list[str]) -> str:
     return ""
 
 
-def _delete(argv: list[str]) -> str | None:
+def branch_problem(branch, prefixes=()) -> str:
+    """Why the gh route must not publish or delete `branch`, or "": one plain branch under the project's own
+    OWN_PREFIX or a granted prefix (`prefixes`), never main or master."""
+    own = (OWN_PREFIX, *[x for x in prefixes or () if isinstance(x, str) and _PREFIX.fullmatch(x)])
+    if not isinstance(branch, str) or branch in _PROTECTED or not branch.startswith(own):
+        return f"only the project's own {' or '.join(own)} branches, never `{branch}`"
+    if not all(_REF_SEG.fullmatch(seg) and not seg.endswith(".lock") for seg in branch.split("/")) or ".." in branch:
+        return "one plain branch (no `..`, %-encoding or empty segment)"
+    return ""
+
+
+def _publish(argv: list[str], stdin: bytes, prefixes=()) -> str:
+    """Why `git-publish <owner/repo> <branch> <sha>` (stdin: a git bundle holding <sha>) is refused, or ""."""
+    if len(argv) != 4 or not _REPO.fullmatch(argv[1]) or set(argv[1].split("/")) & {".", ".."}:
+        return f"`{PUBLISH}` names <owner>/<repo> <branch> <sha>"
+    if why := branch_problem(argv[2], prefixes):
+        return f"a publish names {why}"
+    if not _SHA.fullmatch(argv[3]):
+        return "a publish names its commit by the full sha"
+    if not _BUNDLE.match(stdin or b"") or len(stdin) > PUBLISH_MAX:
+        return f"a publish carries one git bundle of at most {PUBLISH_MAX >> 20} MiB"
+    return ""
+
+
+def _delete(argv: list[str], prefixes=()) -> str | None:
     """None unless `gh api` names a branch ref under repos/<o>/<r>/git/refs/heads/; then why it is refused,
     or "": exactly one `-X DELETE` of one of the project's own branches (OWN_PREFIX), nothing else."""
     if not any(_DELETE_PATH.fullmatch(a) for a in argv[1:]):
@@ -184,11 +215,7 @@ def _delete(argv: list[str]) -> str | None:
     branch = m.group(3) if m else ""
     if not m or {m.group(1), m.group(2)} & {".", ".."}:
         return "a branch delete names one repo as repos/<owner>/<repo>"
-    if branch in _PROTECTED or not branch.startswith(OWN_PREFIX):
-        return f"a branch delete names only the project's own {OWN_PREFIX} branches, never `{branch}`"
-    if not all(_REF_SEG.fullmatch(seg) and not seg.endswith(".lock") for seg in branch.split("/")) or ".." in branch:
-        return "a branch delete names one plain branch (no `..`, %-encoding or empty segment)"
-    return ""
+    return f"a branch delete names {why}" if (why := branch_problem(branch, prefixes)) else ""
 
 
 def delete_target(argv: list[str]) -> tuple[str, str]:
@@ -261,7 +288,7 @@ def fork_free(gh: str, argv: list[str]) -> str:
     return ""
 
 
-def allowed(argv, stdin: bytes = b"") -> str:
+def allowed(argv, stdin: bytes = b"", prefixes=()) -> str:
     """Why the workstation must not run `gh argv`, or "": the allowlist, checked on both sides. `gh api`
     GET reads, pr view/list/checks, issue view/list, pr and issue comments, `pr create --draft`, a reply
     to a PR review comment (`gh api -X POST .../pulls/<n>/comments/<id>/replies -f body=...`), deleting one
@@ -269,16 +296,20 @@ def allowed(argv, stdin: bytes = b"") -> str:
     workstation also reads its tip first and refuses the default branch), `pr edit`
     of the title or body only and `pr close` (the workstation also checks the PR is its own draft), each
     post, body or comment ending with the AI-authorship tag, and `repo fork <owner>/<repo> --fork-name
-    <name> --clone=false` (the workstation also checks <its gh user>/<name> does not exist yet); never
+    <name> --clone=false` (the workstation also checks <its gh user>/<name> does not exist yet), and the
+    queue's own `git-publish` of one such branch (a new branch or a fast-forward); `prefixes` grants branch
+    prefixes beyond ttp/ (the workstation's bridge config, the box's delivery.gh_branch_prefixes); never
     `pr ready`, a merge, a reviewer, a label or anything else."""
     if not isinstance(argv, list) or not argv or not all(isinstance(a, str) and "\0" not in a for a in argv):
         return "not a list of plain arguments"
     if bad := next((a for a in argv if _BUNDLED.fullmatch(a)), None):
         return f"`{bad}`: short options go one per word, values apart (so none hides a method, field or --web)"
+    if argv[0] == PUBLISH:
+        return _publish(argv, stdin, prefixes)
     if argv[0] == "api":
         if (why := _reply(argv)) is not None:
             return why
-        if (why := _delete(argv)) is not None:
+        if (why := _delete(argv, prefixes)) is not None:
             return why
         get = any(a.upper() == "--METHOD=GET" or (a in ("-X", "--method") and nxt.upper() == "GET")
                   for a, nxt in zip(argv, [*argv[1:], ""]))
@@ -357,7 +388,7 @@ def _project(cwd: str | None) -> str:
         return Path(env).name if env else ""
 
 
-def enqueue(args: list[str], input: bytes | None = None, cwd: str | None = None, home=None) -> int:
+def enqueue(args: list[str], input: bytes | None = None, cwd: str | None = None, home=None, prefixes=()) -> int:
     """`gh args` here with no login: the workstation's answer if it is in (its output on ours), else the
     call queued once (HELD_RC)."""
     sent, data, why = local_inputs(args, input, cwd)
@@ -366,10 +397,19 @@ def enqueue(args: list[str], input: bytes | None = None, cwd: str | None = None,
         return HELD_RC
     repo = repo_of(cwd)
     sent, data = _with_repo(sent, repo), data or b""
-    if why := allowed(sent, data):
+    if why := allowed(sent, data, prefixes):
         print(f"gh (tt-project): refused: {why} ({SETTING} is {WORKSTATION}).", file=sys.stderr)
         return 1
-    key = hashlib.sha256(json.dumps([repo, sent, base64.b64encode(data).decode()]).encode()).hexdigest()[:32]
+    return _queued(sent, data, repo, cwd, home, f"gh {' '.join(args[:2])}")
+
+
+def _key(repo: str, sent: list[str], data: bytes) -> str:
+    return hashlib.sha256(json.dumps([repo, sent, base64.b64encode(data).decode()]).encode()).hexdigest()[:32]
+
+
+def _queued(sent: list[str], data: bytes, repo: str, cwd: str | None, home, what: str) -> int:
+    """The answer to an allowed call if it is in (its output on ours), else the call queued once (HELD_RC)."""
+    key = _key(repo, sent, data)
     d = outbox(home)
     d.mkdir(parents=True, exist_ok=True, mode=0o700)
     prune(d)
@@ -383,9 +423,9 @@ def enqueue(args: list[str], input: bytes | None = None, cwd: str | None = None,
         return int(got.get("rc", 1)) if str(got.get("rc", 1)).lstrip("-").isdigit() else 1
     if not (d / f"{key}.q").exists() and not (d / f"{key}.taken").exists():
         _write(d / f"{key}.q", {"key": key, "argv": sent, "repo": repo, "project": _project(cwd),
-                                "task": os.environ.get("TTP_TASK", ""), "write": is_write(sent),
+                                "task": os.environ.get("TTP_TASK", ""), "write": sent[0] == PUBLISH or is_write(sent),
                                 "stdin": base64.b64encode(data).decode(), "queued_at": time.time()})
-    print(f"gh (tt-project): `gh {' '.join(args[:2])}` is queued for the user's workstation ({SETTING} is "
+    print(f"gh (tt-project): `{what}` is queued for the user's workstation ({SETTING} is "
           f"{WORKSTATION}); the same call again returns its answer once in (exit {HELD_RC}).", file=sys.stderr)
     return HELD_RC
 
@@ -422,9 +462,9 @@ def take(home=None, now: float | None = None) -> list[dict]:
 DELETED = "deleted-branches.jsonl"   # each branch delete's tip, kept past prune, so a branch can be restored
 
 
-def _deleted(d: Path, row: dict) -> None:
+def _durable(f: Path, row: dict) -> None:
     from .project import durable_append
-    durable_append(d / DELETED, json.dumps(row) + "\n")
+    durable_append(f, json.dumps(row) + "\n")
 
 
 def put(results, home=None) -> int:
@@ -439,11 +479,16 @@ def put(results, home=None) -> int:
                 "stdout": str(r.get("stdout") or "")[:OUT_MAX], "stderr": str(r.get("stderr") or "")[:OUT_MAX],
                 "at": time.time()}
         tip = r.get("tip")
-        if isinstance(tip, str) and _SHA.fullmatch(tip) and isinstance(v.get("argv"), list) \
-                and _delete(v["argv"]) == "":
+        argv = v.get("argv") if isinstance(v.get("argv"), list) and v.get("argv") else [""]
+        if argv[0] == PUBLISH and len(argv) == 4 and done["rc"] == 0 and r.get("pushed") == argv[3]:
+            done.update(pushed=argv[3], branch=argv[2])
+            _durable(d / PUBLISHED, {"repo": argv[1], "branch": argv[2], "sha": argv[3],
+                                     "project": v.get("project"), "task": v.get("task"), "at": done["at"]})
+        if isinstance(tip, str) and _SHA.fullmatch(tip) and argv[0] == "api" \
+                and any(_DELETE_PATH.fullmatch(a) for a in argv[1:]):
             repo, branch = delete_target(v["argv"])
             done.update(tip=tip, branch=branch)
-            _deleted(d, {"repo": repo, "branch": branch, "tip": tip, "rc": done["rc"], "project": v.get("project"),
+            _durable(d / DELETED, {"repo": repo, "branch": branch, "tip": tip, "rc": done["rc"], "project": v.get("project"),
                          "task": v.get("task"), "at": done["at"]})
         _write(d / f"{key}.done", done)
         (d / f"{key}.taken").unlink(missing_ok=True)
@@ -453,8 +498,50 @@ def put(results, home=None) -> int:
 
 # --- the workstation --------------------------------------------------------------------------------
 
-def answer(entry: dict, gh: str | None = None) -> dict | None:
-    """Run one taken call with this computer's gh, if allowed() here; its answer."""
+def _default_branch(gh: str, repo: str) -> str:
+    try:
+        r = subprocess.run([gh, "api", f"repos/{repo}", "--jq", ".default_branch"], capture_output=True,
+                           timeout=GH_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return r.stdout.decode().strip() if r.returncode == 0 else ""
+
+
+def publish_here(gh: str, argv: list[str], bundle: bytes) -> tuple[int, str]:
+    """Push a `git-publish`'s commit to its branch with this computer's own login (gh as git's helper for
+    github.com): in a scratch repo, fetch the bundle's prerequisites (commits the remote already has),
+    unbundle, then `git push <url> <sha>:refs/heads/<branch>`, with no `+`, so only a new branch or a
+    fast-forward, never a delete; never the repo's default branch. (rc, what happened)."""
+    repo, branch, sha = argv[1:4]
+    default = _default_branch(gh, repo)
+    if not default or branch == default:
+        return 1, ("refused on the workstation: " + (f"`{branch}` is the repo's default branch" if default else
+                   "could not read the repo's default branch before publishing"))
+    url = GIT_URL.format(repo=repo)
+    head = bundle.split(b"\n\n", 1)[0].decode("utf-8", "replace").splitlines()
+    prereq = [x[1:].split()[0] for x in head if x.startswith("-") and len(x) > 1]
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    helper = "credential.https://github.com.helper"
+    with tempfile.TemporaryDirectory(prefix="ttp-publish-") as t:
+        (Path(t) / "b.bundle").write_bytes(bundle)
+        git = ["git", "-C", f"{t}/r", "-c", f"{helper}=", "-c", f"{helper}=!{gh} auth git-" + "credential"]
+        for step in (["git", "init", "-q", "--bare", f"{t}/r"],
+                     *([[*git, "fetch", "-q", "--depth=1", url, *prereq]] if prereq else []),
+                     [*git, "bundle", "unbundle", f"{t}/b.bundle"], [*git, "cat-file", "-e", f"{sha}^{{commit}}"],
+                     [*git, "push", "-q", url, f"{sha}:refs/heads/{branch}"]):
+            name = next(x for x in step[1:] if x in ("init", "fetch", "bundle", "cat-file", "push"))
+            try:
+                p = subprocess.run(step, capture_output=True, timeout=4 * GH_TIMEOUT_S, env=env, stdin=subprocess.DEVNULL)
+            except (OSError, subprocess.TimeoutExpired) as e:
+                return 1, f"git {name} could not run on the workstation: {e}"
+            if p.returncode:
+                return p.returncode, f"git {name} failed on the workstation: {p.stderr.decode('utf-8', 'replace')[-600:]}"
+    return 0, f"pushed {sha} to {repo} branch {branch}"
+
+
+def answer(entry: dict, gh: str | None = None, prefixes=()) -> dict | None:
+    """Run one taken call with this computer's gh, if allowed() here (`prefixes`: the branch prefixes this
+    computer's bridge config grants beyond ttp/); its answer."""
     key = entry.get("key")
     if not isinstance(key, str) or not _KEY.fullmatch(key):
         return None
@@ -463,15 +550,19 @@ def answer(entry: dict, gh: str | None = None) -> dict | None:
     except (ValueError, TypeError):
         return {"key": key, "rc": 1, "stdout": "", "stderr": "refused on the workstation: stdin is not base64"}
     argv = entry.get("argv")
-    if why := allowed(argv, stdin):
+    if why := allowed(argv, stdin, prefixes):
         return {"key": key, "rc": 1, "stdout": "", "stderr": f"refused on the workstation: {why}"}
     gh = gh or shutil.which("gh", path=os.environ.get("PATH", "") + ":/opt/homebrew/bin:/usr/local/bin") or "gh"
+    if argv[0] == PUBLISH:
+        rc, said = publish_here(gh, argv, stdin)
+        return {"key": key, "rc": rc, "stdout": f"{said}\n" if rc == 0 else "", "stderr": "" if rc == 0 else said,
+                **({"pushed": argv[3]} if rc == 0 else {})}
     if argv[:2] == ["pr", "close"] and (why := own_draft(gh, argv)):
         return {"key": key, "rc": 1, "stdout": "", "stderr": f"refused on the workstation: {why}"}
     if argv[:2] == ["repo", "fork"] and (why := fork_free(gh, argv)):
         return {"key": key, "rc": 1, "stdout": "", "stderr": f"refused on the workstation: {why}"}
     tip = ""
-    if argv[0] == "api" and _delete(argv) == "":
+    if argv[0] == "api" and _delete(argv, prefixes) == "":
         why, tip = own_branch(gh, argv)
         if why:
             return {"key": key, "rc": 1, "stdout": "", "stderr": f"refused on the workstation: {why}"}
@@ -490,7 +581,7 @@ def answer(entry: dict, gh: str | None = None) -> dict | None:
     return out
 
 
-def pull(box: str, gh: str | None = None) -> str:
+def pull(box: str, gh: str | None = None, prefixes=()) -> str:
     """One round on `box`: take its queue, answer each call here, put the answers back."""
     from .bridge import _box
     r = _box(box, f"{REMOTE} take", timeout=60)
@@ -500,7 +591,7 @@ def pull(box: str, gh: str | None = None) -> str:
         entries = json.loads(r.stdout or "[]")
     except ValueError:
         return f"{box}: the gh queue's answer is not JSON"
-    results = [a for e in entries if isinstance(e, dict) and (a := answer(e, gh))] if isinstance(entries, list) else []
+    results = [a for e in entries if isinstance(e, dict) and (a := answer(e, gh, prefixes))] if isinstance(entries, list) else []
     if not results:
         return f"{box}: no gh calls queued"
     p = _box(box, f"{REMOTE} put", timeout=60, inp=json.dumps(results))
@@ -520,3 +611,130 @@ def queue_argv(args: list[str]) -> list[str]:
     """The command a caller runs for `gh args` in workstation mode (ghroute.routed)."""
     return ["/usr/bin/env", f"PYTHONPATH={Path(__file__).resolve().parent.parent}", sys.executable, "-m", "ttp",
             "gh-queue", "run", "--", *args]
+
+
+# --- the box: publish and retire one branch through the workstation ----------------------------------
+
+def _git(cwd, *a, binary: bool = False) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", *a], cwd=cwd or None, capture_output=True, text=not binary, timeout=120,
+                          stdin=subprocess.DEVNULL)
+
+
+def _branch_call(cwd: str | None, branch: str) -> tuple[str, str, list, object]:
+    """(why the gh route cannot take this branch call here, or "", owner/repo, granted prefixes, project)."""
+    from . import ghroute
+    from .project import here
+    if ghroute._value(cwd=cwd) != WORKSTATION:
+        return f"publishing and retiring a branch go through {SETTING} \"{WORKSTATION}\"", "", [], None
+    if not (repo := repo_of(cwd)):
+        return "this checkout's origin is not a GitHub repo", "", [], None
+    try:
+        p = here(cwd)
+    except Exception:
+        p = None
+    grants = ((p.config() if p else {}).get("delivery") or {}).get("gh_branch_prefixes") or []
+    grants = grants if isinstance(grants, list) else []
+    return branch_problem(branch, grants), repo, grants, p
+
+
+def publish(branch: str, cwd: str | None = None, home=None) -> int:
+    """`ttp push --publish <branch>`: queue the branch's commits that origin's refs here do not hold, as a git
+    bundle, for the workstation to push with its own login (a new branch or a fast-forward). The answer,
+    once in, names the pushed sha (rerun the same call); HELD_RC until then."""
+    why, repo, grants, _ = _branch_call(cwd, branch)
+    sha = _git(cwd, "rev-parse", "--verify", "-q", f"refs/heads/{branch}^{{commit}}").stdout.strip() if not why else ""
+    if not why and not _SHA.fullmatch(sha):
+        why = f"no local branch `{branch}` here"
+    if why:
+        print(f"ttp push --publish: refused: {why}.", file=sys.stderr)
+        return 1
+    with tempfile.TemporaryDirectory(prefix="ttp-publish-") as t:
+        b = _git(cwd, "bundle", "create", "-q", f"{t}/b.bundle", f"refs/heads/{branch}", "--not", "--remotes=origin",
+                 binary=True)
+        if b.returncode:
+            print(f"ttp push --publish: refused: no bundle of `{branch}`'s new commits over origin's refs here "
+                  f"({b.stderr.decode('utf-8', 'replace').strip()[-300:]}).", file=sys.stderr)
+            return 1
+        data = (Path(t) / "b.bundle").read_bytes()
+    sent = [PUBLISH, repo, branch, sha]
+    if why := allowed(sent, data, grants):
+        print(f"ttp push --publish: refused: {why}.", file=sys.stderr)
+        return 1
+    return _queued(sent, data, repo, cwd, home, f"git push {branch} ({sha[:12]})")
+
+
+def _rows(f: Path) -> list[dict]:
+    try:
+        lines = f.read_text().splitlines()
+    except OSError:
+        return []
+    out = []
+    for x in lines:
+        try:
+            v = json.loads(x)
+        except ValueError:
+            continue
+        out.append(v) if isinstance(v, dict) else None
+    return out
+
+
+def retire(branch: str, cwd: str | None = None, home=None) -> int:
+    """`ttp push --retire <branch>`: delete one of the project's own published branches through the
+    workstation. Refused unless this project pushed it (a publish here, or its push records), its prefix is
+    allowed, no open PR uses it (a gh read, held until answered) and no open task or worktree here uses it.
+    The tip is saved first, as refs/ttp-private/retired/<branch> and a bundle under state/retired/; the
+    workstation reads the tip again and refuses the default branch."""
+    why, repo, grants, p = _branch_call(cwd, branch)
+    delete = ["api", "-X", "DELETE", f"repos/{repo}/git/refs/heads/{branch}"]
+    if not why and (outbox(home) / f"{_key(repo, delete, b'')}.done").exists():
+        return _queued(delete, b"", repo, cwd, home, f"gh api -X DELETE {branch}")   # already answered
+    published = [r for r in _rows(outbox(home) / PUBLISHED) if r.get("repo") == repo and r.get("branch") == branch
+                 and r.get("project") == _project(cwd)]
+    pushed = p is not None and any(
+        (v := _load(f)) and v.get("outcome") == "pushed" and str(v.get("target") or "").endswith("/" + branch)
+        for f in (p.state / "pushes").glob("*.json"))
+    tip = (published[-1].get("sha") if published else "") or \
+        _git(cwd, "rev-parse", "--verify", "-q", f"refs/heads/{branch}^{{commit}}").stdout.strip()
+    worktrees = _git(cwd, "worktree", "list", "--porcelain").stdout.splitlines()
+    tasks = [] if p is None else [r["id"] for r in p.db.q(
+        "SELECT id FROM tasks WHERE branch=? AND status NOT IN ('done','cancelled','failed') AND id!=?",
+        (branch, os.environ.get("TTP_TASK") or -1))]
+    if why:
+        pass
+    elif not (published or pushed):
+        why = f"no publish or push record shows this project pushed `{branch}`"
+    elif f"branch refs/heads/{branch}" in worktrees:
+        why = f"a worktree here has `{branch}` checked out"
+    elif tasks:
+        why = f"open task(s) {', '.join(f'#{t}' for t in tasks)} use `{branch}`"
+    elif not _SHA.fullmatch(tip or "") or _git(cwd, "cat-file", "-e", f"{tip}^{{commit}}").returncode:
+        why = f"`{branch}`'s tip is not here to save first"
+    if why:
+        print(f"ttp push --retire: refused: {why}.", file=sys.stderr)
+        return 1
+    import contextlib
+    import io
+    got = io.StringIO()
+    with contextlib.redirect_stdout(got):
+        rc = enqueue(["pr", "list", "--head", branch, "--state", "open", "--json", "number"], None, cwd, home)
+    if rc:
+        print(f"ttp push --retire: the open-PR check on `{branch}` is not answered yet (exit {rc}); "
+              "run the same call again once it is.", file=sys.stderr)
+        return rc
+    try:
+        prs = json.loads(got.getvalue() or "[]")
+    except ValueError:
+        prs = None
+    if prs != []:
+        print(f"ttp push --retire: refused: an open PR uses `{branch}` (or the check's answer is unreadable).",
+              file=sys.stderr)
+        return 1
+    ref = f"refs/ttp-private/retired/{branch}"
+    keep = (p.state if p is not None else outbox(home)) / "retired"
+    keep.mkdir(parents=True, exist_ok=True)
+    saved = keep / (branch.replace("/", "%2F") + ".bundle")
+    if _git(cwd, "update-ref", ref, tip).returncode or _git(cwd, "bundle", "create", "-q", str(saved), ref).returncode:
+        print(f"ttp push --retire: refused: could not save `{branch}`'s tip {tip} first.", file=sys.stderr)
+        return 1
+    print(f"ttp push --retire: saved {tip} as {ref} and {saved}.", file=sys.stderr)
+    return enqueue(delete, None, cwd, home, grants)
