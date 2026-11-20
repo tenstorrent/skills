@@ -124,7 +124,7 @@ def test_the_wake_gate_skips_a_probe_pass_its_last_turn_already_saw(env, tmp_pat
     assert _gate_decide(p, tid, probe=(0, out)).wake
 
 
-@pytest.mark.parametrize("case", ["escalated", "woke", "spec", "changed", "answered", "failed_job"])
+@pytest.mark.parametrize("case", ["escalated", "woke", "changed", "answered", "failed_job"])
 def test_the_wake_gate_wakes_at_once_on_an_event_even_when_a_rule_would_skip(env, monkeypatch, tmp_path, case):
     p = make(env)
     from ttp import waitgate
@@ -136,8 +136,6 @@ def test_the_wake_gate_wakes_at_once_on_an_event_even_when_a_rule_would_skip(env
         _gate_set(p, tid, escalated_wake=True)
     elif case == "woke":
         _gate_set(p, tid, woke="its checks failed (exit 1)")
-    elif case == "spec":
-        kw["spec_sha"] = "new"
     elif case == "changed":
         _gate_set(p, tid, wake_gate={"seen": waitgate.evidence(1, "running"), "log": [1]})
         kw["probe"] = (1, "running; 3 of 9 steps done")
@@ -1075,8 +1073,8 @@ def test_running_own_checks_hold_a_timer_spec_change_or_new_progress_line_until_
     old = time.time() - 3600
     os.utime(d / "checks.log", (old, old))
     os.utime(d / "checks.pid", (old, old))
-    r = _gate_decide(p, tid, spec_sha="new")   # stalled: the spec change wakes it as before
-    assert r.wake and r.reason == "its spec changed since the last turn", r
+    r = _gate_decide(p, tid, spec_sha="new")   # stalled: not held
+    assert r.extra.get("hold") != "checks", r
     alive[0] = False   # died: not held either
     assert waitgate.checks_hold(p.config(), f"ttp checks --result {d}", time.time()) is None
 
@@ -1098,3 +1096,35 @@ def test_own_checks_that_ended_under_a_stale_not_yet_answer_re_defer_a_minute_fo
     assert _gate_decide(p, tid, probe=(0, "checks passed")).wake   # the probe answered: no hold
     _gate_set(p, tid, wake_gate={"end_skips": 4, "hold_skips": 4, "log": [1, 2, 3, 4]})
     assert _gate_decide(p, tid, probe=(1, "checks running 7/9")).wake   # at most max_skips such re-defers
+
+
+@pytest.mark.parametrize("plan", [None, "plain", "jev"])
+def test_a_dormant_spec_edit_on_a_still_failing_wait_starts_no_turn_at_its_due_wake(env, tmp_path, plan):
+    """A spec edit with no wake_now or `urgent:` line sleeps with the task: its due wake (a timer, or a
+    planned check) is judged as if the spec had not changed, so a "not yet" the rule or Jev would skip
+    starts no paid turn. The edit applies at the next real wake."""
+    p = make(env)
+    tid = _gate_task(p, tmp_path, note={"spec_sha": "old"}, **({"plan_by": plan} if plan else {}))
+    jev = _GateJev(needed=0.1)
+    d = _gate_decide(p, tid, probe=(1, "not yet"), spec_sha="new", jev=jev)
+    assert not d.wake and "spec" not in d.reason, d
+
+
+@pytest.mark.parametrize("case", ["escalated", "woke_spec_pass", "answered", "failed_job"])
+def test_a_dormant_spec_edit_still_wakes_with_wake_now_an_urgent_line_or_a_changed_result(env, tmp_path, case):
+    # wake_now and an added `urgent:` line wake through the daemon's spec wake (an escalated wake); a probe
+    # pass under a changed spec carries that in its wake reason; a probe that answered wakes on its own path.
+    p = make(env)
+    tid = _gate_task(p, tmp_path, note={"spec_sha": "old"})
+    kw = {"probe": (1, "not yet"), "spec_sha": "new", "jev": _GateJev(needed=0.1)}
+    if case == "escalated":
+        _gate_set(p, tid, escalated_wake=True)
+    elif case == "woke_spec_pass":
+        _gate_set(p, tid, woke="probe passed, but its spec changed: act on what the change adds")
+        kw["probe"] = (0, "done")
+    elif case == "answered":
+        kw["probe"] = (0, "job finished rc=0")
+    else:
+        kw["probe"] = (4, "job finished rc=3")
+    d = _gate_decide(p, tid, **kw)
+    assert d.wake and d.by == "event", (case, d)

@@ -7,12 +7,13 @@ The gate looks at a task that handed off `waiting` and is due again (its timer r
 passed, or another wake path made it due). In this order:
 
 1. Must-wake events always start the turn: an escalated wake, any wake reason other than a plain
-   timer or "probe passed" (failed checks, a broken probe, a reboot, a resumed resource, ...), a spec
-   that changed since the last turn, a probe whose exit or output changed since the gate's last skip,
+   timer or "probe passed" (failed checks, a broken probe, a reboot, a resumed resource, ...), a probe
+   whose exit or output changed since the gate's last skip,
    a probe that answered anything but "not yet" (its pass or failed job keeps its model-free path),
    and the cap (`max_skips` skips in a row, or `max_skip_h` hours since the last real turn). A
    planned check (`waiting.check_plan`) is never capped: past the cap it still takes its plan's rule,
-   so an unchanged "not yet" starts no turn.
+   so an unchanged "not yet" starts no turn. A plain spec change is no event: it applies at the next
+   real wake; its wake_now or `urgent:` line wakes through the daemon's spec wake (escalated).
 2. Model-free rules re-defer what is mechanically still pending: a local detached job (`ttp detach
    --check`) still running with no exit code, a lock (`ttp lock --probe`) still held by a live
    holder, `ttp checks --result` / `ttp push --result` still pending, and a probe that passed with the
@@ -373,8 +374,8 @@ def decide(p, cfg: dict, task: dict, prev: dict, now: float, probe: tuple | None
                      extra={"hold": "checks"})
     elif held and held[0] == "ended" and int(gate.get("end_skips") or 0) < int(s["max_skips"]):
         d = Decision(False, "rule", held[1], extra={"delay_s": 60.0, "hold": "checks", "ended": True})
-    elif spec_sha and last.get("spec_sha") and last["spec_sha"] != spec_sha:
-        d = Decision(True, "event", "its spec changed since the last turn")
+    # A plain spec edit is no event: it sleeps with the task and applies at the next real wake. Its
+    # wake_now or `urgent:` line wakes through the daemon's spec wake (escalated). [note 304aeeb6c165c1df]
     elif gate.get("seen") and seen and gate["seen"] != seen and not matchwait:
         d = Decision(True, "event", "its probe's answer changed since the gate's last skip")
     elif cap and hard:
