@@ -42,7 +42,8 @@ timeout 180 tt-smi -r
 timeout 60 tt-smi -ls --local
 ```
 
-A reset is an operator action. A bringup agent runs it only when the operator's brief authorizes resets; otherwise it records the wedged chips, keeps evidence, and reports the reset as the operator's next step.
+A reset is an operator action. A bringup agent runs it only when the operator's brief authorizes resets (the brief
+says so at startup, see `model-bringup`); otherwise it records the wedged chips, keeps evidence, and reports the reset as the operator's next step.
 
 After reset, check that the expected devices are visible. On a T3K this usually means all eight chips. If reset returns but not all expected devices or Ethernet links come back, run the bounded reset sequence one more time before escalating. A first reset can leave part of the mesh or Ethernet fabric missing.
 
