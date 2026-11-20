@@ -623,26 +623,67 @@ def _report_conflict(p: Project, tid: int, why: str, b: str = "") -> None:
                 f"git said: {why[-400:]}", "queued", tid))
 
 
+RECHECK_S = 300.0   # a worktree sweep left as it was is landed again at least this often
+SETTLES = ("kept", "conflict", "conflict-known")   # outcomes the next pass repeats while nothing moves
+_SETTLED: dict[str, dict[int, tuple[tuple, float]]] = {}   # harness -> task id -> (_stamp, since)
+
+
+def _stamp(p: Project, tid: int) -> tuple:
+    """What land reads, read without git: the task row, and the modification times of the worktree's
+    and the harness checkout's HEAD and HEAD log (a commit, checkout, merge or reset moves one) and of
+    the task's run folders (a detached job's end writes its rc there: held). Not the index: `git
+    status` refreshes it, so land's own look would move it."""
+    task = p.db.task(int(tid))
+    own = path(p, tid)
+    try:
+        gd = Path((own / ".git").read_text().split("gitdir:", 1)[1].strip())
+    except (OSError, IndexError):
+        gd = own / ".git"
+    files = [d / n for d in (gd, p.harness / ".git") for n in ("HEAD", "logs/HEAD")]
+    files += [Path(r["dir"]) for r in p.db.q("SELECT dir FROM runs WHERE task=? AND dir IS NOT NULL", (int(tid),))]
+    times = []
+    for f in files:
+        try:
+            times.append(f.stat().st_mtime_ns)
+        except OSError:
+            times.append(None)
+    return (task and (task["status"], task["updated"]), *times)
+
+
 def sweep(p: Project, running: set[int]) -> dict[int, str]:
     """Land every harness worktree whose task has no live run (`running`: task ids with one); a
     worktree whose task is gone from the database is landed too. Each is removed only once its task
-    ended and nothing holds it (land). Returns task id -> outcome."""
+    ended and nothing holds it (land). A worktree a pass kept, or found conflicting, is skipped
+    without git while its task row and the HEAD and HEAD log of it and the checkout are unchanged
+    (_stamp), and landed again at least every RECHECK_S (an uncommitted edit moves none of them). Returns task id -> outcome."""
     root = p.state / DIR
     if not root.is_dir():
         return {}
-    if _is_repo(p) and landing_merge(p.harness):    # a merge of ours a killed daemon left: undo it first
+    gd = p.harness / ".git"   # read first: no git a tick while no merge is under way
+    if ((gd / "MERGE_HEAD").exists() or gd.is_file()) and _is_repo(p) and landing_merge(p.harness):
+        # a merge of ours a killed daemon left: undo it first
         with tree_writes(p.harness):
             _git(p.harness, "merge", "--abort")
     out = {}
+    settled = _SETTLED.setdefault(str(p.harness), {})
     for d in sorted(root.iterdir()):
         if not (d.is_dir() and d.name.startswith("t") and d.name[1:].isdigit()):
             continue
         tid = int(d.name[1:])
         if tid in running:
             continue
+        mark = _stamp(p, tid)
+        if (last := settled.get(tid)) and last[0] == mark and time.time() - last[1] < RECHECK_S:
+            continue   # nothing it reads moved since a pass that left it: no git this tick
         got = land(p, tid)
+        if got in SETTLES:
+            settled[tid] = (mark, time.time())   # stamped before land: a move during it shows next pass
+        else:
+            settled.pop(tid, None)
         if got:
             out[tid] = got
+    for tid in [t for t in settled if not path(p, t).is_dir()]:
+        del settled[tid]
     try:
         root.rmdir()   # only when empty
     except OSError:

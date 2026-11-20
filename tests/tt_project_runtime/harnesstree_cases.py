@@ -846,3 +846,52 @@ def test_the_checkout_stays_off_main_while_another_harness_run_works_in_it(env):
     assert harnesstree.return_checkout(p) == "busy"
     assert _hgit(p.harness, "symbolic-ref", "--short", "HEAD").strip() == f"ttp/harness-t{a}"
     assert not _ht_off_main_events(p)
+
+
+def _ht_kept_worktree(p):
+    """Harness task b, open, in a worktree of its own with an uncommitted edit: each pass keeps it."""
+    from ttp import harnesstree
+    a, b = _harness_task(p, "a"), _harness_task(p, "b")
+    _harness_run(p, a)
+    own = harnesstree.workdir(p, b)
+    p.db.x("UPDATE runs SET status='done'")
+    (own / "prompts").mkdir(exist_ok=True)
+    (own / "prompts" / "wip.md").write_text("half done\n")
+    return b, own
+
+
+def _ht_count_git(monkeypatch):
+    from ttp import harnesstree
+    calls, git = [], harnesstree._git
+    monkeypatch.setattr(harnesstree, "_git", lambda cwd, *a, **k: calls.append(a) or git(cwd, *a, **k))
+    return calls
+
+
+def test_a_second_sweep_over_an_unchanged_kept_worktree_runs_no_git(env, monkeypatch):
+    """Before: every daemon tick ran rev-parse, symbolic-ref, rev-list and status on each kept worktree."""
+    p = make(env)
+    from ttp import harnesstree
+    b, own = _ht_kept_worktree(p)
+    assert harnesstree.sweep(p, set()) == {b: "kept"}
+    calls = _ht_count_git(monkeypatch)
+    assert harnesstree.sweep(p, set()) == {}
+    assert calls == []
+    calls.clear()
+    monkeypatch.setattr(harnesstree, "RECHECK_S", 0.0)   # the time bound still lands it again
+    assert harnesstree.sweep(p, set()) == {b: "kept"} and ("status", "--porcelain") in calls
+
+
+def test_a_kept_worktree_that_changed_is_landed_on_the_next_sweep(env):
+    p = make(env)
+    from ttp import harnesstree
+    b, own = _ht_kept_worktree(p)
+    assert harnesstree.sweep(p, set()) == {b: "kept"}
+    assert harnesstree.sweep(p, set()) == {}
+    _commit_in_harness_tree(own, "prompts/wip.md", "done\n", "b: done")   # its HEAD moved
+    assert harnesstree.sweep(p, set()) == {b: "kept"}   # merged, kept for the open task
+    assert _hgit(p.harness, "show", "HEAD:prompts/wip.md") == "done\n"
+    assert harnesstree.sweep(p, set()) == {b: "kept"}   # the merge moved the checkout: looked at once more
+    assert harnesstree.sweep(p, set()) == {}
+    p.db.update_task(b, status="done")                  # its task row moved
+    assert harnesstree.sweep(p, set()) == {b: "merged"} and not own.exists()
+    assert harnesstree.sweep(p, set()) == {} and not harnesstree._SETTLED.get(str(p.harness))

@@ -22266,7 +22266,8 @@ class Daemon:
     def land_harness_worktrees(self) -> None:
         """Merge the commits of harness tasks that worked in a worktree of their own, once their run ended
         (harnesstree.sweep); one that git refused is tried again next tick, a conflict once its branch or
-        the harness moved. It holds the upgrade lock meanwhile and waits while `ttp upgrade` holds it:
+        the harness moved. One a pass kept or found conflicting is skipped, with no git, while it and the
+        harness checkout are unchanged, for at most harnesstree.RECHECK_S. It holds the upgrade lock meanwhile and waits while `ttp upgrade` holds it:
         either one's merge in the live checkout would leave MERGE_HEAD in the way of the other. Done harness
         tasks whose commits sit outside the harness HEAD and outside a worktree of their own are landed or
         raised too (_land_stranded_harness). First, once at start and after a harness task ended, a checkout

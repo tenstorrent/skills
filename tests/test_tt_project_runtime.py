@@ -9134,6 +9134,8 @@ def test_a_conflicting_harness_worktree_is_aborted_kept_and_reported_once(env, m
     _commit_in_harness_tree(p.harness, "prompts/clash.md", "from a\n", "a")
     head = _hgit(p.harness, "rev-parse", "HEAD").strip()
     assert harnesstree.sweep(p, set()) == {b: "conflict"}
+    assert harnesstree.sweep(p, set()) == {}   # nothing moved: skipped without git (_stamp)
+    monkeypatch.setattr(harnesstree, "RECHECK_S", 0.0)
     for _ in range(3):   # the same pair is not merged again: each try left MERGE_HEAD in the live checkout
         assert harnesstree.sweep(p, set()) == {b: "conflict-known"}
     assert len(merges) == 1
