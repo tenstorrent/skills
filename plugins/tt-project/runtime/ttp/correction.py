@@ -82,10 +82,9 @@ RESEND_S = 60   # the same words again this soon are one message delivered twice
 # Anchors: what makes a short instruction specific enough that its repeat is one ('yes go ahead' has
 # none). An anchored instruction repeats an earlier one sharing an anchor and at least half its content
 # words other than the anchors' own (ANCHOR_SHARE), and ANCHOR_MIN anchors or ANCHOR_MIN such words
-# ('Review #4151' after 'Push #4151' shares only the anchor: a new instruction; a model or effort anchor
-# alone names no class, so it needs one more shared word: 'Opus keeps the reviews' is no repeat of
-# 'name Opus as a limitation, keep the review-only tasks'), checked against
-# at most REPEAT_NEAR earlier clauses per anchor.
+# ('Review #4151' after 'Push #4151' shares only the anchor: a new instruction), checked against
+# at most REPEAT_NEAR earlier clauses per anchor. A model or effort anchor alone names no class, so it
+# needs one more shared word.
 EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")
 _LEVEL = r"(minimal|low|medium|high|xhigh|max|extra[- ]high)"
 _EFFORT = re.compile(rf"\b{_LEVEL}[- ]effort\b|\beffort\s*(?:[=:]|of|at|to|is)?\s*{_LEVEL}\b")
