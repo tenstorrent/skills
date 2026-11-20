@@ -496,7 +496,8 @@ def commands(cmd: str, depth: int = 0) -> list[str]:
     return out
 
 
-SED_WRITE_RE = re.compile(r"(?:^|[;{}\n/\d$])\s*[wW]")
+SED_WRITE_RE = re.compile(r"(?:^|[;{}\n/\d$])\s*[wW]"   # a `w` command, or an `s` flag after any delimiter
+                          r"|s([^\w\s\\])(?:\\.|(?!\1).)*\1(?:\\.|(?!\1).)*\1[gpiImMe\d]*[wW]")
 
 
 def _sed_operands(args: list[str]) -> tuple[bool, list[str], list[str], list[str]]:

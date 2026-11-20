@@ -603,6 +603,8 @@ def test_sed_in_place_counts_only_its_file_operands_as_targets_never_its_script(
     assert writes("sed --in-place --expression=s/a/b/ -- /srv/b") == {"/srv/b": "sed -i target"}
     assert writes("sed -i '/stage-task.sh/d' f.py") == {}
     assert writes("sed -i 's/a/b/w /etc/x' f.py") == {"/etc/x": "sed -i script with a w command"}
+    assert writes("sed -i 's|a|b|w /etc/x' f.py") == {"/etc/x": "sed -i script with a w command"}   # any s delimiter
+    assert writes("sed -i 's|a w|b|' f.py") == {}   # a w inside the pattern is no command
     assert sidefx.classify_paths("sed -i -f /tmp/s.sed f.py", "/home/u", wt, "")["/tmp/s.sed"][0] == "executed"
     assert writes("cd /srv/o && sed -i s/a/b/ rel.txt") == {"/srv/o/rel.txt": "sed -i target"}
     assert writes("sed 's/a/b/' /srv/c > /srv/d") == {"/srv/d": "redirect target"}   # no -i: reads /srv/c
