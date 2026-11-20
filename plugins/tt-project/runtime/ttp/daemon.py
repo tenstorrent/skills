@@ -5018,11 +5018,11 @@ class Daemon:
             log(self.p, f"deslop: schedule {did} (deslop.enabled {'on' if c['enabled'] else 'off'})")
 
     def run_model_bench(self) -> None:
-        """The machine's shared daily model bench (benchowner.py), model-free, hourly: check the owner
+        """The machine's shared daily model bench (modelbench.py), model-free, hourly: check the owner
         lease (take it over or poke its owner when stale), keep this project's bench and Terminal-Bench
         schedules on only while it owns the lease and model_bench.hold does not hold it, run it now on a poke, and report the owner's newest bench once: a
         keyless skip is one low alert per outage, a bench one log line."""
-        from . import benchowner, harborslice, modelbench, rankfresh, schednow
+        from . import modelbench, harborslice, rankfresh, schednow
         if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get("TTP_TEST_MODEL_BENCH"):
             return   # daemons under test never bench, unless a test asks
         now, db = time.time(), self.p.db
@@ -5032,7 +5032,7 @@ class Daemon:
         me, cfg = self.p.name, self.cfg
         if not rankfresh.configured(cfg):
             return
-        got = benchowner.check(me, cfg, now)
+        got = modelbench.check(me, cfg, now)
         lease = read_dict(modelbench.home() / modelbench.OWNER)
         if got.get("took") is not None:
             self.alert("model-bench-owner", f"This project now runs the machine's daily chat model bench "
@@ -5040,16 +5040,16 @@ class Daemon:
         if got.get("poked"):
             db.post("out", f"The machine's daily chat model bench has no recent result; poked its owner "
                     f"{got['poked']} to run it now.", chat=None, kind="info", severity="low")
-        owner, hold = lease.get("project") == me, benchowner.held(cfg, now)
+        owner, hold = lease.get("project") == me, modelbench.held(cfg, now)
         try:
-            benchowner.ensure(self.p, db, owner, benchowner.settings(cfg)["at"], hold)
-            benchowner.ensure_tb(self.p, db, owner, harborslice.settings(cfg)["on"], hold)
+            modelbench.ensure(self.p, db, owner, modelbench.settings(cfg)["at"], hold)
+            modelbench.ensure_tb(self.p, db, owner, harborslice.settings(cfg)["on"], hold)
         except ValueError as e:   # a broken schedules file: the next check tries again
             log(self.p, f"model bench: schedule not changed: {e}")
-        seen = db.kv(benchowner.SEEN, {}) or {}
+        seen = db.kv(modelbench.SEEN, {}) or {}
         poke = lease.get("poke") or {}
         if owner and not hold and float(poke.get("at") or 0) > float(seen.get("poke") or 0):
-            schednow.request(self.p, benchowner.SCHEDULE, "model-bench-poke")
+            schednow.request(self.p, modelbench.SCHEDULE, "model-bench-poke")
             db.post("out", f"{poke.get('by') or 'Another project'} poked this project to run the machine's "
                     "daily chat model bench; running it now.", chat=None, kind="info", severity="low")
             seen["poke"] = poke["at"]
@@ -5062,7 +5062,7 @@ class Daemon:
             elif rec.get("results") is not None:
                 log(self.p, f"model bench {rec['date']}: {len(rec['results'])} model(s); weak: "
                     f"{', '.join(rec['weak']) or 'none'}")
-        db.set_kv(benchowner.SEEN, seen)
+        db.set_kv(modelbench.SEEN, seen)
 
     def probe_mcp(self) -> None:
         """Refresh this host's connected MCP servers for the status feed (mcpgap.py): `claude mcp list` in
@@ -9412,15 +9412,15 @@ class Daemon:
 
     # schedules and watchers ------------------------------------------------------------------------
     def _stop_off_schedule_jobs(self) -> None:
-        """tbcycle.stop_runners while benchowner.trial_stop says stop (runners older than trial_stop never ask it),
+        """tbcycle.stop_runners while modelbench.trial_stop says stop (runners older than trial_stop never ask it),
         and schedjobs.sweep: the jobs turned-off schedules left running are stopped, at once on the tick after
         a schedule is turned off (the set of schedules that are off changed), else every schedjobs.SWEEP_S."""
-        from . import benchowner, tbcycle
+        from . import modelbench, tbcycle
         try:
-            bench = benchowner.trial_stop(self.p) if tbcycle.configured(self.p) else ""
+            bench = modelbench.trial_stop(self.p) if tbcycle.configured(self.p) else ""
         except (OSError, ValueError) as e:
             bench = ""
-            log(self.p, f"turned-off schedules' jobs: benchowner.trial_stop could not be read ({e})")
+            log(self.p, f"turned-off schedules' jobs: modelbench.trial_stop could not be read ({e})")
         off = (tuple(r["name"] for r in self.p.db.q("SELECT name FROM schedules WHERE enabled=0 ORDER BY name")),
                bool(bench))
         now = time.monotonic()

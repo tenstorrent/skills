@@ -1759,7 +1759,7 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    more runs later, parks it for a week with one low alert; then it is tried again from scratch.
    One shared daily bench per machine (`ttp model-bench run`, `runtime/ttp/modelbench.py`) keeps these
    verdicts current. One project on the machine owns it (`~/.tt-project/model-bench/owner.json`,
-   `runtime/ttp/benchowner.py`): at first the first eligible project by name, where eligible means a live
+   `runtime/ttp/modelbench.py`): at first the first eligible project by name, where eligible means a live
    daemon, a `chat` endpoint, not paused and no `model_bench.opt_out`. The owner keeps a model-free command
    schedule `model-bench` that starts `ttp model-bench run --detach` daily at `model_bench.bench_at`
    (default 02:00 home time); every other project's is off. Every daemon checks the lease hourly without a

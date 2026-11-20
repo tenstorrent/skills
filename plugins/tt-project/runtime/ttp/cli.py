@@ -9478,7 +9478,7 @@ def cmd_model_bench(a) -> None:
         print(f"model {a.action if a.action != 'run' else 'bench'} started (pid {child.pid}; log {log})", file=sys.stderr)
         return
     now = _t.time()
-    from .benchowner import SCHEDULE, SUITE_SCHEDULE, TB_SCHEDULE
+    from .modelbench import SCHEDULE, SUITE_SCHEDULE, TB_SCHEDULE
     if a.action == "suite":
         if a.dry_run or getattr(a, "reaudit", False) or getattr(a, "reference_from", None):
             return _model_suite(p, a, now)
@@ -9512,24 +9512,24 @@ class _LastLine:
 
 
 def _bench_cycle(p, schedule: str, now: float, fn, dies: bool = True):
-    """Run one cycle of the bench owner's `schedule` and count it in benchowner.streak: an exception, a
+    """Run one cycle of the bench owner's `schedule` and count it in modelbench.streak: an exception, a
     non-zero exit (only with `dies`; the cause is the last line it printed to stderr) or a returned cause (a
     string) is a failure, None a pass, and a skip (`fn` returns False) leaves the count alone."""
-    from . import benchowner
+    from . import modelbench
     tee = sys.stderr = _LastLine(sys.stderr)
     try:
         got = fn()
     except SystemExit as e:
         if dies and e.code not in (0, None):
-            benchowner.streak(p, schedule, tee.last.removeprefix("ttp: ") or f"exit {e.code}", now)
+            modelbench.streak(p, schedule, tee.last.removeprefix("ttp: ") or f"exit {e.code}", now)
         raise
     except Exception as e:
-        benchowner.streak(p, schedule, f"{type(e).__name__}: {e}", now)
+        modelbench.streak(p, schedule, f"{type(e).__name__}: {e}", now)
         raise
     finally:
         sys.stderr = tee.inner
     if got is not False:
-        benchowner.streak(p, schedule, got if isinstance(got, str) else "", now)
+        modelbench.streak(p, schedule, got if isinstance(got, str) else "", now)
 
 
 def _model_bench_argv(a) -> list[str]:
@@ -9549,12 +9549,12 @@ def _model_bench_argv(a) -> list[str]:
 
 def _terminalbench(p, a, now: float) -> None:
     """`ttp model-bench terminalbench`: the model-free step, or (--runner) one model's paced runner (tbcycle.py)."""
-    from . import benchowner, endpoint, harborslice, tbcycle
+    from . import modelbench, endpoint, harborslice, tbcycle
     cfg = p.config()
     if not tbcycle.settings(cfg)["on"]:
         die("model-bench terminalbench: off (model_bench.terminalbench.on is false)")
-    if not getattr(a, "reference", False) and (why := benchowner.held(cfg, now)):
-        print(json.dumps({"held": why}))   # a normal run that starts nothing (benchowner.held)
+    if not getattr(a, "reference", False) and (why := modelbench.held(cfg, now)):
+        print(json.dumps({"held": why}))   # a normal run that starts nothing (modelbench.held)
         return
     if getattr(a, "reference", False):
         return _terminalbench_reference(p, a, cfg)
@@ -9576,7 +9576,7 @@ def _terminalbench(p, a, now: float) -> None:
         if extra is None:
             fail(why)
         print(json.dumps({"model": a.runner, "trials": tbcycle.runner(
-            cfg, a.runner, {**env, **extra}, stop=lambda: benchowner.trial_stop(p),
+            cfg, a.runner, {**env, **extra}, stop=lambda: modelbench.trial_stop(p),
             rerun_server=max(0, int(getattr(a, "rerun_server", 0) or 0)))}))
         return
     extra, why = tbcycle.compose(cfg)
@@ -9594,7 +9594,7 @@ def _terminalbench_reference(p, a, cfg: dict) -> None:
     A model in reference.bridge goes through the claude CLI, one in reference.chat through the chat endpoint's
     relay, and neither needs a reference endpoint; any other needs the saved one: none saved, one plain line,
     nothing started."""
-    from . import benchowner, endpoint, harborslice, tbcycle
+    from . import modelbench, endpoint, harborslice, tbcycle
     st = tbcycle.settings(cfg)
     ref = st["reference"]
     alias = ref["endpoint"]
@@ -9613,7 +9613,7 @@ def _terminalbench_reference(p, a, cfg: dict) -> None:
         if extra is None:
             die(f"model-bench terminalbench --reference: {why}")
         print(json.dumps({"model": a.runner, "reference": True, "trials": tbcycle.ref_runner(
-            cfg, a.runner, {**env, **extra}, stop=lambda: benchowner.trial_stop(p))}))
+            cfg, a.runner, {**env, **extra}, stop=lambda: modelbench.trial_stop(p))}))
         return
     ids = None
     if got:
