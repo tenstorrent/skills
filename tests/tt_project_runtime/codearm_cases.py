@@ -150,6 +150,37 @@ def test_code_arm_day_table_guard_and_review_lines(env):
     assert codearm.review_lines(p.db, {}, now) == []
 
 
+def test_code_arm_switch_back_never_counts_the_tasks_that_tripped_it_once_the_setting_changes(env, monkeypatch):
+    """Re-armed by a new route.code_sonnet, the guard judges only tasks dealt after its trip; new bad ones trip it
+    again."""
+    from ttp import codearm
+    p = make(env)
+    cfg = _ca_cfg(glm_share=0.5, glm_guard_min=2)
+    clock = [time.time()]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+
+    def tasks():
+        for arm, land in (("sonnet", True), ("glm", False)) * 2:
+            t = _ca_task(p)
+            p.db.set_kv(f"{codearm.ARM_KV}{t['id']}", {"arm": arm, "why": "coin", "seed": "", "ts": clock[0]})
+            p.db.x("UPDATE tasks SET status=? WHERE id=?", ("done" if land else "failed", t["id"]))
+            if land:
+                p.db.x("INSERT INTO push_queue(task,branch,head,target,status,created,updated,landed_sha) "
+                       "VALUES(?,?,?,?,?,?,?,?)", (t["id"], f"b{t['id']}", "h", "main", "landed", clock[0], clock[0],
+                                                   "abc"))
+    tasks()
+    clock[0] += 60
+    assert codearm.guard_run(p.db, cfg, clock[0])["new_trip"]
+    cfg = _ca_cfg(glm_share=0.4, glm_guard_min=2)   # the re-arm
+    assert not codearm.held(p.db, cfg)
+    clock[0] += codearm.GUARD_EVERY_S
+    row = codearm.guard_run(p.db, cfg, clock[0])
+    assert not row["tripped"] and row["table"]["arms"]["glm"]["tasks"] == 0, "the tripping tasks never count again"
+    tasks()
+    clock[0] += codearm.GUARD_EVERY_S
+    assert codearm.guard_run(p.db, cfg, clock[0])["new_trip"], "new bad tasks after the re-arm trip it again"
+
+
 def test_code_arm_cap_moves_with_refusals_and_waits(env):
     from ttp import codearm
     p = make(env)

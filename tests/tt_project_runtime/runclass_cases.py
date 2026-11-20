@@ -1191,6 +1191,28 @@ def test_code_route_guard_trip_holds_code_on_opus_until_the_setting_changes_and_
     assert d._code_state()["new"] == "full"
 
 
+def test_code_route_guard_never_counts_the_reviews_that_tripped_it_once_the_setting_changes(env, monkeypatch):
+    """Re-armed by a new route.code_sonnet, the next day's guard judges only reviews after its trip; new bad ones
+    trip it again."""
+    from ttp import runclass
+    p = make(env)
+    now = time.time()
+    clock = [now]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    _guard_tasks(p, now, 15, 8, model="sonnet")
+    _guard_tasks(p, now, 15, 0, model="opus")
+    assert runclass.guard_run(p.db, _GUARD_CFG, now)["new_trip"]
+    cfg = {"route": {"code_sonnet": {"share": 0.5}}}   # the re-arm
+    assert not runclass.guard_held(p.db, cfg)
+    now += runclass.GUARD_EVERY_S
+    clock[0] = now
+    row = runclass.guard_run(p.db, cfg, now)
+    assert not row["tripped"] and row["day"]["reviewed"] == 0, "the tripping reviews never count again"
+    _guard_tasks(p, now, 15, 8, ago=600, model="sonnet")
+    _guard_tasks(p, now, 15, 0, ago=600, model="opus")
+    assert runclass.guard_run(p.db, cfg, now + runclass.GUARD_EVERY_S)["new_trip"], "new bad reviews trip it again"
+
+
 def test_code_route_takes_jev_picked_and_urgent_code_and_opus_keeps_only_user_pins_and_outside_input():
     from ttp import runclass
     t = {"id": 7, "kind": "code", "tier": "standard", "title": "add a flag", "labels": "[]", "spec": "add it"}

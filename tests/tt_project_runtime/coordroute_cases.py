@@ -582,3 +582,19 @@ def test_num_in_as_float_as_int():
     assert num_in(True, 0, 10, 2.0) == 2.0 and num_in("5", 1, 10, 2.0) == 2.0
     assert as_float("1.5", 0) == 1.5 and as_float(None, 3) == 3 and as_float("x", 3) == 3
     assert as_int("7") == 7 and as_int(None) is None and as_int("x") is None
+
+
+def test_coordroute_resume_leaves_no_old_escalation_to_suspend_the_lane_again_at_once(env):
+    """The lane's suspend rule judges only turns after a resume: the escalations that suspended it never count
+    again, and new ones suspend it again."""
+    from ttp import coordroute
+    p = _cr_db(env)
+    for i in range(coordroute.SUSPEND_MIN):
+        st = coordroute.record_turn(p.db, i, {}, [], [], [], "needs a judgement call")
+    assert "escalated" in st["suspended"]["why"]
+    assert coordroute.resume(p.db)
+    st = coordroute.record_turn(p.db, 100, {}, [{"type": "noop"}], [0], [], "")
+    assert not st.get("suspended"), "a clean turn after the resume"
+    for i in range(coordroute.SUSPEND_MIN):
+        st = coordroute.record_turn(p.db, 200 + i, {}, [], [], [], "needs a judgement call")
+    assert "escalated" in st["suspended"]["why"], "new escalations suspend it again"

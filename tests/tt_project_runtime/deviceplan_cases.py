@@ -470,3 +470,43 @@ def test_glm_device_bounce_rule_counts_only_runs_after_the_projects_latest_re_ar
     assert v["state"] == "wait", ("7 old runs, 6 bounced, then a re-arm and 3 clean runs", v)
     runs(["x"] * 6 + [""])
     assert deviceplan.judge(p, cfg, clock[0])["state"] == "worse", "10 runs after the arm, 6 bounced"
+
+
+def test_glm_device_harm_rule_counts_only_harms_after_the_projects_latest_re_arm_and_a_new_one_stops_it_again(
+        env, tmp_path, monkeypatch):
+    """A harmful step that rolled the route back never counts against it once re-armed: new runs are audited
+    afresh, the judge waits for them, and a new harmful step stops the route at once again."""
+    from ttp import deviceplan, rollout
+    p = make(env)
+    cfg = _dp_cfg(device=True, device_audits=2)
+    t = p.db.task(p.db.add_task("soak", "Run the soak on the box.", kind="work", tier="standard", priority=3))
+    clock = [1_000_000.0]
+
+    def tick():
+        clock[0] += 60
+        return clock[0]
+    monkeypatch.setattr(time, "time", tick)
+
+    def run_and_audit(harmful):
+        n = int(clock[0])
+        (tmp_path / f"r{n}").mkdir()
+        run, _ = _dp_run(tmp_path / f"r{n}")
+        deviceplan.run_end(p.db, cfg, p.name, t, n, run, "")
+        audit = [x for x in p.db.q("SELECT * FROM tasks WHERE status!='done'")
+                 if deviceplan.AUDIT_LABEL in str(x.get("labels") or "")]
+        assert len(audit) == 1, "each armed stretch audits its first runs afresh"
+        (tmp_path / f"a{n}").mkdir()
+        (tmp_path / f"a{n}" / "result.json").write_text(json.dumps({"device_audit": {"harmful": harmful}}))
+        deviceplan.run_end(p.db, cfg, p.name, p.db.task(audit[0]["id"]), n + 1, tmp_path / f"a{n}")
+        p.db.x("UPDATE tasks SET status='done' WHERE id=?", (audit[0]["id"],))
+    harm = [{"step": "ipmitool raw 0x00", "source": "glm", "why": "raw bytes"}]
+    run_and_audit(harm)
+    assert p.name in rollout.rolled_back(deviceplan.FLAG) and deviceplan.judge(p, cfg, clock[0])["state"] == "worse"
+    assert "re-armed" in rollout.arm(deviceplan.FLAG, project=p.name)
+    assert deviceplan.judge(p, cfg, clock[0])["state"] == "wait", "the harm before the re-arm no longer counts"
+    run_and_audit([])
+    assert deviceplan.judge(p, cfg, clock[0])["why"] == "1 of 2 clean audited runs", "counted since the re-arm"
+    run_and_audit(harm)
+    assert p.name in rollout.rolled_back(deviceplan.FLAG), "a new harmful step stops the re-armed route at once"
+    assert deviceplan.judge(p, cfg, clock[0])["state"] == "worse"
+    assert len(p.db.q("SELECT id FROM events WHERE kind='glm_device_stopped'")) == 2

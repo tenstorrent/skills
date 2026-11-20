@@ -541,7 +541,8 @@ def guard_check(db, cfg: dict, now: float | None = None) -> dict:
     Sonnet's (each with `min_tasks` decided tasks), or GLM has more reverts within 3 days."""
     now = time.time() if now is None else now
     s = settings(cfg) or {"pts": GUARD_PTS, "min_tasks": GUARD_MIN}
-    tab = day_table(db, cfg, now - WINDOW_S, now)
+    off = db.kv(OFF_KV)   # the tasks that tripped it never count again once the setting changes (re-armed)
+    tab = day_table(db, cfg, max(now - WINDOW_S, float(off.get("ts") or 0) if isinstance(off, dict) else 0), now)
     g, so = tab["arms"]["glm"], tab["arms"]["sonnet"]
     enough = min(g["decided"], so["decided"]) >= s["min_tasks"]
     gap = round((so["one_round_rate"] - g["one_round_rate"]) * 100, 1) if enough else None

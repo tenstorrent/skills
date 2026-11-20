@@ -208,6 +208,17 @@ def test_a_re_arm_starts_a_new_window_and_a_rolled_back_project_waits_for_new_ou
     assert rollout.armed_at("other", "glm_work") == 0.0, "another project's arm is its own"
 
 
+def test_a_glm_code_re_arm_alone_starts_a_new_window_for_the_glm_share_judge(env):
+    from ttp import glmshare, rollout
+    p = make(env)
+    now = time.time()
+    _gs_waved(p, now, glm_passed=(0, 0, 0, 0))
+    assert glmshare.judge(p, _GS_CFG, now)["state"] == "worse"
+    assert rollout.stop_project("glm_code", p.name, "worse") and "re-armed" in rollout.arm("glm_code", project=p.name)
+    v = glmshare.judge(p, _GS_CFG, time.time() + 600)
+    assert (v["state"], v["n"]) == ("wait", 0), "the outcomes before the glm_code re-arm no longer count"
+
+
 def test_glm_device_runs_leave_the_glm_work_judgment_but_a_device_incident_after_the_arm_still_rolls_back(env):
     from ttp import glmshare, rollout
     p = make(env)

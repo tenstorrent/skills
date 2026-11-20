@@ -889,7 +889,8 @@ def guard_check(db, cfg: dict, now: float | None = None) -> dict:
     reviews to compare" and it never trips. The prior days are context, never the comparator."""
     now = time.time() if now is None else now
     pts = (guard_settings(cfg) or {}).get("pts", GUARD_PTS)
-    day = guard_day(db, now - GUARD_DAY_S, now)
+    trip = db.kv(GUARD_KV)   # the reviews that tripped it never count again once the setting changes (re-armed)
+    day = guard_day(db, max(now - GUARD_DAY_S, float(trip.get("ts") or 0) if isinstance(trip, dict) else 0), now)
     prior = guard_day(db, now - (1 + GUARD_PRIOR_DAYS) * GUARD_DAY_S, now - GUARD_DAY_S)
     s, o = day["models"]["sonnet_high"], day["models"]["opus_high"]
     enough = min(s["reviewed"], o["reviewed"]) >= GUARD_MIN_REVIEWS
