@@ -314,6 +314,14 @@ def test_scripts_and_routes_match_strictly(tmp_path):
     scripts = {"route": {"glm_work": {"device_scripts": ["run.sh"], "power_routes": ["./scripts/"]}}}
     assert deviceplan.refusal("ssh box-a 'rm -rf /srv/x'", str(tmp_path), e, scripts).startswith("out of plan"), "a remote write"
     assert deviceplan.refusal("run.sh", str(tmp_path), e, scripts) is None
+    # A redirect write is not the listed script's run: a local one is a local write, a quoted one a remote write.
+    assert deviceplan.refusal("ssh box-a /srv/x/run.sh > /srv/out", str(tmp_path), e, scripts)
+    for c in ("ssh box-a '/srv/x/run.sh > /srv/out'", "ssh box-a 'run.sh > /srv/out'", "ssh box-a 'run.sh>/srv/out'",
+              "ssh box-a 'echo hi >> /srv/x/y' 2>&1"):
+        assert not deviceplan._approved(c, [], ["run.sh"], str(tmp_path), str(run), e), c
+        assert deviceplan.refusal(c, str(tmp_path), e, scripts).startswith("out of plan"), c
+    for c in ("ssh box-a 'run.sh'", "ssh box-a 'run.sh 2>&1 >/dev/null'"):
+        assert deviceplan._approved(c, [], ["run.sh"], str(tmp_path), str(run), e), c
     assert deviceplan.power_refusal("./scripts/../../usr/bin/ipmitool chassis power cycle", ["./scripts/"])
     assert deviceplan.power_refusal("ipmitool power cycle", ["./scripts/"])
     assert deviceplan.power_refusal("./scripts/cycle.sh box-a", ["./scripts/"]) is None
