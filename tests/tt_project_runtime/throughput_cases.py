@@ -779,10 +779,11 @@ def test_speed_complaint_detector_matches_complaints_not_plain_messages():
     from ttp import slowcomplaint as sc
     for text in ("This is so slow", "Why is everything stuck?", "Fix your throughput asap", "tasks sit in the queue",
                  "It's taking forever", "the review is still not done after a day", "Again nothing for hours",
-                 "speed up the reviews", "I yelled at it for being slow"):
+                 "speed up the reviews", "I yelled at it for being slow", "why is this still waiting?", "this is too slow"):
         assert sc.detect(text), text
     for text in ("Approved, go ahead", "Queue a task for the docs", "What is the status of the build?",
-                 "Thanks, looks good", "Use the slowtests report", ""):
+                 "Thanks, looks good", "Use the slowtests report", "",
+                 "The PR is now waiting on human review; keep the comment watch on."):
         assert not sc.detect(text), text
 
 

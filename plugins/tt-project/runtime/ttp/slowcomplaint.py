@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Speed complaints: a user message saying work is slow, stuck or waiting starts a measured throughput
+"""Speed complaints: a user message saying work is slow or stuck, or still waiting, starts a measured throughput
 review the same tick, model-free (throughput.py), instead of a prose answer.
 
 `detect` matches a short generic word list (WORDS, whole words) or 'again' with a delay word
-(AGAIN_DELAY). Pace and delay words (stuck, waiting, hours, too long) always count. A word that can also
+(AGAIN_DELAY). Pace and delay words (stuck, hours, too long) always count; 'waiting' counts only as 'still waiting' (AGAIN_DELAY), never alone: it often names another person's step. A word that can also
 describe a built product's speed or ask for it soon (SPEED: slow, faster, throughput, speed up, asap) beside product-speed or
 feature-request wording (PRODUCT: a flag, latency, real time, implement, make X faster) counts only when
 the message also names the project or its work (WORK: your, tasks, reviews, tests, the queue, bringup). At a coordinator turn's start the daemon calls `on_messages` with the turn's new
@@ -23,7 +23,7 @@ from . import throughput
 from .db import DB, TERMINAL_TASK_STATES
 from .lanewait import _tell
 
-WORDS = ("slow", "slower", "slowly", "stuck", "waiting", "taking forever", "takes forever",
+WORDS = ("slow", "slower", "slowly", "stuck", "taking forever", "takes forever",
          "throughput", "asap", "in the queue", "in queue", "queued for", "queue is", "hours", "sitting idle", "idle for", "too long",
          "taking so long", "takes so long", "take so long", "faster", "speed up", "speed it up", "sluggish")
 # Words that may describe the built product's speed rather than the project's pace.
