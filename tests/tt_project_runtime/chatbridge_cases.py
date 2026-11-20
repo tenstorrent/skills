@@ -3992,7 +3992,7 @@ def test_the_launch_arms_stand_ins_except_for_a_required_pin_and_the_end_keeps_t
 
 
 def test_a_run_a_stand_in_finished_is_the_stand_ins_everywhere_never_the_asked_for_models(env, monkeypatch):
-    """Task #7923: a stand-in's work never shows as the asked-for model's: the run's model,
+    """A stand-in's work never shows as the asked-for model's: the run's model,
     ttp stats --runs and the web app's runs, the scoreboard and the demotion samples all name the stand-in."""
     from ttp import modeldemote, modelrank, modelscore, route, web
     from ttp.daemon import Daemon
@@ -4025,7 +4025,7 @@ def test_a_run_a_stand_in_finished_is_the_stand_ins_everywhere_never_the_asked_f
 
 
 def test_a_swap_in_another_call_never_sends_the_stand_ins_fields_with_the_old_model(mock_chat, tmp_path, monkeypatch):
-    """Task #7923: forward() reads model, fields and rejected as one snapshot under the swap lock. A swap by a
+    """forward() reads model, fields and rejected as one snapshot under the swap lock. A swap by a
     parallel call lands between reading the model and sending (here: inside to_chat, deterministically)."""
     from ttp import chatbridge
     up = mock_chat(_MID_OK)
@@ -4042,7 +4042,7 @@ def test_a_swap_in_another_call_never_sends_the_stand_ins_fields_with_the_old_mo
 
 
 def test_a_mid_run_swap_is_written_for_live_views_and_shown_as_a_stand_in(mock_chat, tmp_path):
-    """Task #7923: the runner's on_swap writes chatbridge.SWAP_FILE; a running run shows 'B (stand-in for A)'."""
+    """The runner's on_swap writes chatbridge.SWAP_FILE; a running run shows 'B (stand-in for A)'."""
     from ttp import chatbridge, modelrank
     up = mock_chat((404, {"error": {"message": "The model does not exist", "code": "model_not_found"}}), _MID_OK)
     run_dir = tmp_path / "run"
