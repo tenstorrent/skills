@@ -79,6 +79,8 @@ and build/run recipes on the box).
   sudo rules, tray drops and tenants: `recovery.md`.
 - A Blackhole Galaxy's parts and its PCIe and power paths (what to name in a diagnosis or repair
   step): `blackhole-galaxy.md`.
+- Device performance or profiling work uses the `tt-profiler` skill from the optional
+  tt-debug-tools plugin when it is installed, else tt-metal's own profiler docs.
 - Classifying a chip drop: an empty holder or killed list from the broker when the loss is
   detected does not prove nothing was driving the chip, since short jobs can exit between health
   probes. Decide whether the loss was provoked from the system journal and the run output; use the

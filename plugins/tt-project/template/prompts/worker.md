@@ -83,6 +83,8 @@
 - A broker job runs `--preemptable`, `-t` at most 1500 s, ends cleanly on SIGTERM, and resumes
   from a checkpoint after a preempt (setup-box `device-runs.md`); never hold the device idle.
 - Name Galaxy parts in a diagnosis or repair step as setup-box `blackhole-galaxy.md` does.
+- Device performance or profiling work: use the `tt-profiler` skill (tt-debug-tools plugin) when
+  installed, else tt-metal's own profiler docs.
 <!-- /ttp:if device -->
 - Never release or re-create a machine reservation, or restart a shared service, unless your
   task says to.
