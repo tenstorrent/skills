@@ -69,7 +69,7 @@ RISKY = re.compile(r"(?i)\b(?:reboot|shutdown|poweroff|tt-flash|tt-topology|glx_
 PLAN_RULES = (
     "Before any step that changes a device, a box or a machine, the plan checks, read-only: who holds it now "
     "(the node, the box, the project's lock or the broker's job list) and stops if someone else does; the "
-    "user-ordered changes recorded for it (`ttp machines change list`), whose undo it never runs; and the gates: "
+    "user-ordered changes recorded for it (`ttp machines change list <alias>`), whose undo it never runs; and the gates: "
     "holds and pauses, Slurm nodes held by others, protected paths. Power cycles and resets go only through the "
     "project's approved routes (its broker or the scripts its settings name), never raw `ipmitool chassis power`, "
     "raw IPMI bytes or `tt-smi -glx_reset` outside them. Stop at the first failed check and hand back; post nothing "
@@ -79,7 +79,9 @@ DEVICE_PLAN = (
     "one fenced ```json block, nothing after it: "
     '{"steps": [{"command": "<the exact shell command>", "host": "<alias or local>", "check": true}]}, the steps '
     "in run order. Every command that changes state must be a step (reads need none); `check` true for a step "
-    "whose failure must stop the run. The block must be valid JSON: escape each \\\" and \\\\ inside a command. "
+    "whose failure must stop the run. Each check or gate command runs exactly as written, so use only options it "
+    "takes (check them with its --help). Each job-submit step is the complete command line, with every option the "
+    "project's tooling needs (working directory, env file and the like). The block must be valid JSON: escape each \\\" and \\\\ inside a command. "
     "Use <placeholders> only for values the run reads first. If the task should not run on this model, answer "
     "with one line starting 'needs_opus:' and why.")
 FIX = ("Your plan fails its format check: {why}. Answer with the whole plan again, the same steps, ending in "
@@ -470,8 +472,9 @@ def glm_lines() -> str:
     return (prompt_lines(True) + "\n\nThis is a device run on GLM under an Opus plan. First run `ttp advise --plan \"<the task in your "
             "words>\"`; it prints the plan. Reads run freely; every command that changes state must be one of its "
             "steps, as written (fill only its <placeholders>); a reset, power cycle, flash or firmware step needs "
-            "`ttp advise --check-step N` to answer ok first. Anything else, or a failed check step, hands the task "
-            "back to Opus: never work around a refusal.")
+            "`ttp advise --check-step N` to answer ok first. A check step that exits nonzero or prints an error has "
+            "failed: stop there, run no later step and hand the task back to Opus. Anything else outside the plan "
+            "also hands it back: never work around a refusal.")
 
 
 # --- live safety: Opus audits, the stop, the counters ---------------------------------------------------------

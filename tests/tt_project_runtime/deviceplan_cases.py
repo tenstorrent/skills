@@ -155,6 +155,18 @@ def test_device_runs_are_told_the_planner_rules_and_glm_runs_the_plan_route(env)
     assert "ttp advise --plan" in deviceplan.glm_lines() and "--check-step" in deviceplan.glm_lines()
 
 
+def test_the_plan_prompt_asks_for_exact_check_and_complete_submit_commands():
+    from ttp import deviceplan
+    assert "runs exactly as written" in deviceplan.DEVICE_PLAN and "--help" in deviceplan.DEVICE_PLAN
+    assert "job-submit step is the complete command line" in deviceplan.DEVICE_PLAN
+    assert "`ttp machines change list <alias>`" in deviceplan.DEVICE_PLAN
+
+
+def test_glm_stops_at_a_failed_check_step():
+    from ttp import deviceplan
+    assert "exits nonzero or prints an error has failed: stop there, run no later step" in deviceplan.glm_lines()
+
+
 def _dp_planned_run(tmp_path, monkeypatch):
     """A marked plan run with a stored plan, in the environment the hook and the runner read."""
     from ttp import deviceplan
