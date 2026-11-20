@@ -108,10 +108,14 @@ The streaming CSVs carry no op names. To get them (tested as of 2026-11-19):
 capture_pid=$!
 trap 'kill "$capture_pid" 2>/dev/null' EXIT   # no capture left holding the port
 TTNN_OP_PROFILER=1 TRACY_PORT=<port> TT_METAL_STREAMING_PROFILER=1 \
-  TT_METAL_STREAMING_PROFILER_OPS_CSV=ops.csv pytest <test id> || exit 1
+  TT_METAL_STREAMING_PROFILER_OPS_CSV=ops.csv pytest <test id> || exit 1   # ops.csv: 0 bytes until teardown ends
 wait "$capture_pid" || exit 1   # run.tracy is complete only once it exits
 ./build/tools/profiler/bin/tracy-csvexport -m -s ";" run.tracy
 ```
+
+On a full model run, give teardown about 10 minutes before reading `ops.csv`,
+and check the log for `missed N bytes of frames` (a partial CSV): see the
+streaming-profiler findings in `SKILL.md`.
 
 Read the `TT_DNN_DEVICE_OP` messages. Each one's last number is
 `(GLOBAL CALL COUNT << 10) + DEVICE ID`, which names its ops-CSV row.

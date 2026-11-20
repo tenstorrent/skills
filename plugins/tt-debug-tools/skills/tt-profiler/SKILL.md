@@ -108,11 +108,22 @@ Tracy-enabled build, and idle Ethernet cores for the sync.
 `STREAMING_PROFILER.md` is a GUI primer; the options (including
 `_SYNC_EVENTS` and `_SYNC_CHECK`) are in `STREAMING_PROFILER_DETAILED.md` section 1.
 
-Seen on a first run, tested on a 32-chip Blackhole Galaxy (as of 2026-11-19,
+Seen on device runs, tested on a 32-chip Blackhole Galaxy (as of 2026-11-20,
 check current behaviour):
 
 - The first run recompiles every kernel with `-DPROFILE_STREAMING`; time the second.
-- Read the CSVs only after the mesh closes; they are complete then.
+- Read the CSVs only after the mesh closes; they are written then, in one go.
+  On a full model run (about 37k ops on each of 32 chips) the ops CSV stayed
+  0 bytes until teardown ended, 474 s after the test passed. A job ended early
+  leaves it empty: seen twice, with a hang watchdog stopping the job about
+  5 min after PASSED. Give the job about 10 min for teardown, let the process
+  exit by itself, then read the CSV.
+- `[streaming profiler] consumer "ops-csv" missed N bytes of frames` in the log
+  means the ops CSV is partial. On that full run it missed about 28 GB of the
+  63 GB captured, and each chip's CSV held about 75% of its ops; a 10-op run
+  dropped nothing. Check the log for it; when every op must be counted,
+  profile a shorter span (not tested).
+- The steady step time was the same with the profiler on and off (2.25 s).
 - Too few idle Ethernet cores for the sync is a `TT_FATAL` at bring-up.
 - `python -m tracy` sets `TT_METAL_DEVICE_PROFILER=1` by default, a `TT_FATAL`
   beside the streaming switch; `--no-device` should avoid it (not tested).
