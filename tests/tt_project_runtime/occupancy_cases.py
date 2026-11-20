@@ -66,6 +66,22 @@ def test_occupancy_quiet_window_holds_a_minute_after_the_stream_ends(tmp_path, m
     assert not late["blocks"] and late["state"] == "free"
 
 
+def test_occupancy_quiet_after_an_unknown_read_says_unknown_never_stream_ended(tmp_path, monkeypatch):
+    occ = _occ_home(tmp_path, monkeypatch)
+    flag = _occ_flag_file(tmp_path, "state", "exit 3")
+    occ.publish(_OccProj("streamer", tmp_path, {"box-a": {"cmd": f"exit $(cat {flag})", "timeout_s": 2}}))
+    t0 = time.time()
+    assert occ.check("box-a", "test", now=t0, fresh=True)["state"] == "unknown"
+    flag.write_text("1")
+    why = occ.check("box-a", "test", now=t0 + 5, fresh=True)["why"]
+    assert "unknown (its source could not tell at " in why and "quiet until " in why and "stream ended" not in why, why
+    # a live read then free keeps the stream-ended wording
+    flag.write_text("0")
+    assert occ.check("box-a", "test", now=t0 + 10, fresh=True)["state"] == "live"
+    flag.write_text("1")
+    assert "its stream ended, quiet until " in occ.check("box-a", "test", now=t0 + 15, fresh=True)["why"]
+
+
 def test_occupancy_sources_of_two_projects_for_one_alias_both_count(tmp_path, monkeypatch):
     occ = _occ_home(tmp_path, monkeypatch)
     occ.publish(_OccProj("proj-one", tmp_path, {"box-a": {"cmd": "exit 1"}}))

@@ -250,7 +250,8 @@ def check(target: str, step: str = "test", now: float | None = None, fresh: bool
             applies = role == "stream" or step in FRONT_STEPS
             rows.append({"project": proj, "alias": alias, "stream": stream, "role": role, "state": state,
                          "read": rec["state"], "detail": rec.get("detail", ""), "at": rec.get("at"),
-                         "clear_at": clear_at, "applies": applies})
+                         "clear_at": clear_at, "applies": applies,
+                         "last_live": last, "last_state": rec.get("live_state")})
     holding = [r for r in rows if r["applies"] and r["state"] != "free"]
     out = {"target": target, "step": step, "at": now, "sources": rows, "blocks": bool(holding),
            "state": "free", "why": "", "clear_at": None}
@@ -298,7 +299,10 @@ def why_line(res: dict) -> str:
     for r in res["sources"]:
         if not (r["applies"] and r["state"] != "free"):
             continue
-        what = {"live": "a live realtime stream holds it", "quiet": f"its stream ended, quiet until {_clock(r['clear_at'])}",
+        quiet = f"quiet until {_clock(r['clear_at'])}"
+        ended = (f"unknown (its source could not tell at {_clock(r['last_live'])}), {quiet}"
+                 if r.get("last_state") == "unknown" else f"its stream ended, {quiet}")
+        what = {"live": "a live realtime stream holds it", "quiet": ended,
                 "unknown": f"its source could not tell ({r['detail']}): counted as live"}[r["state"]]
         role = f" (front of {r['stream']})" if r["role"] == "front" else ""
         parts.append(f"{r['alias']}{role}: {what}; source of {r['project']}, read {_clock(r['at'])}")
