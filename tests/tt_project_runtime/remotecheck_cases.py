@@ -932,6 +932,76 @@ def test_a_run_that_does_not_pass_on_a_spill_host_runs_again_here(env, tmp_path,
         assert not any(k.startswith("env:check-host:") for k in envfault.open_faults(p))
 
 
+@_LINUX_TMP
+def test_a_rerun_here_after_a_spill_failure_checks_the_spilled_commit_whatever_the_worktree_holds_now(
+        env, tmp_path, monkeypatch):
+    """The rerun here of checks that failed on a spill host checks the commit the spill host tested, in a clean
+    checkout of it: a newer commit in the worktree and another task's uncommitted edits there (a shared harness
+    worktree) are not that change. Before, the rerun checked the live worktree and stopped with "commit first"."""
+    from ttp import checkspill, cli
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    p.set_config("delivery.checks_remote_only", False)
+    git = ["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=t"]
+    head = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    log = tmp_path / "where.log"
+    p.set_config("delivery.push_checks", [f'cat a.txt >> {log}; test -e b.txt && exit 1; '
+                                          'case "$PWD" in */ttp-check.*) exit 1;; esac; exit 0'])
+    real_off = checkspill.spill_off_add
+    lane = None
+
+    def spill_off_add(*a, **k):   # back from the spill host: another task commits and edits here, then the lane frees
+        (repo / "b.txt").write_text("b\n")
+        subprocess.run([*git, "add", "b.txt"], check=True)
+        subprocess.run([*git, "commit", "-qm", "b"], check=True)
+        (repo / "a.txt").write_text("edited\n")
+        off = real_off(*a, **k)
+        lane.close()
+        return off
+    monkeypatch.setattr(checkspill, "spill_off_add", spill_off_add)
+    lane = _spill_lane(p, repo)
+    try:
+        cli.main(["checks", "--fresh"])
+    finally:
+        lane.close()
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and rec["head"] == head and "spilled_to" not in rec, rec
+    text = (run / "checks.log").read_text()
+    assert "did not pass on spill host check-host-a" in text and "commit first" not in text, text
+    assert log.read_text() == "a\na\n", "both runs checked the spilled commit's a.txt"
+
+
+def test_a_spill_hosts_own_fault_voids_the_failures_recorded_there_just_before(env, tmp_path, monkeypatch):
+    """A run whose spill host ends it with the host's own fault (exit 75: here the ssh session fails) voids the
+    failures recorded on that host in the last FAULT_VOIDS_S, whichever head they were for: they were likely the
+    host's too, so they no longer keep that head off the host or count toward a workstation's verdict. Older
+    records, and those on other hosts, stay."""
+    from ttp import checkspill, cli
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    p.set_config("delivery.checks_remote_only", False)
+    p.set_config("delivery.push_checks", ["true"])
+    now = time.time()
+    checkspill.fail_add(p.state, "earlier", "k", "check-host-a", "ids:abc")
+    checkspill.fail_add(p.state, "earlier", "k", "check-host-b", "ids:abc")
+    checkspill.fail_add(p.state, "older", "k", "check-host-a", "ids:abc")
+    recs = json.loads((p.state / checkspill.FAILS_FILE).read_text())
+    recs[-1]["ts"] = now - checkspill.FAULT_VOIDS_S - 60
+    (p.state / checkspill.FAILS_FILE).write_text(json.dumps(recs))
+    assert [r["host"] for r in checkspill.fails(p.state, "earlier", "k")] == ["check-host-a", "check-host-b"]
+    monkeypatch.setenv("FAKE_SSH_FAIL", "mktemp")
+    lane = _spill_lane(p, repo)
+    _close_when_back(lane, run)
+    try:
+        cli.main(["checks", "--fresh"])
+    finally:
+        lane.close()
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and "spilled_to" not in rec, rec
+    assert "did not pass on spill host check-host-a (exit 75" in (run / "checks.log").read_text()
+    assert [r["host"] for r in checkspill.fails(p.state, "earlier", "k")] == ["check-host-b"]
+    assert [r["host"] for r in checkspill.fails(p.state, "older", "k")] == ["check-host-a"]
+    assert checkspill.fail_void(p.state, "check-host-a") == 0   # nothing recent left to void
+
+
 def test_a_spilled_run_stays_on_its_spill_host_when_the_shared_ssh_connection_refuses_a_session(
         env, tmp_path, monkeypatch):
     """A spill host whose shared ssh connection refuses one session keeps the run: it passes there and

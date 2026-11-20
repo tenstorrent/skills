@@ -4436,7 +4436,11 @@ def _cmd_checks(a) -> None:
                          text=True).stdout.strip()
     top = os.path.realpath(top) if top else top
     git = ["git", "-C", top or where]
-    head = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    # A rerun after a spill failure or a preemption checks the commit its first run checked (set only for that
+    # re-entry, never inherited), never what this worktree holds now: a shared worktree's newer commit or
+    # another task's uncommitted edits are not the change those checks are for.
+    pinned = _rerun_head(git, os.environ.pop(_RERUN_HEAD_ENV, ""))
+    head = pinned or subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     if not top or not head:
         die("ttp checks: run it in the change's git worktree (or pass --worktree <path>)")
     print(checktree.line(head, top), flush=True)
@@ -4575,8 +4579,11 @@ def _cmd_checks(a) -> None:
             "`--`, e.g. ttp checks -- pytest -q")
     own_harness = bool(p) and Path(top).resolve() == p.harness.resolve()
     dirty, runtime_written, state = _checks_dirty(git, purpose == "harness", own_harness)
-    if dirty:
+    if dirty and not pinned:
         die("ttp checks: commit first; the checks are recorded for a commit, and this worktree has changes")
+    if dirty:
+        print(f"ttp checks: this worktree's uncommitted changes are not checked: the rerun runs on a clean checkout "
+              f"of commit {head[:12]}, the one its first run checked")
     if runtime_written:
         print("ttp checks: not counting runtime-written changes to tracked files the repository ignores: "
               + ", ".join(runtime_written))
@@ -4587,7 +4594,7 @@ def _cmd_checks(a) -> None:
         what = "uncommitted changes" if runtime_written or state else f"{untracked} untracked file(s)"
         print(f"ttp checks: {what} in this worktree are not checked: the checks run on a clean checkout of "
               f"commit {head[:12]}")
-    tree = subprocess.run([*git, "rev-parse", "HEAD^{tree}"], capture_output=True, text=True).stdout.strip()
+    tree = subprocess.run([*git, "rev-parse", f"{head}^{{tree}}"], capture_output=True, text=True).stdout.strip()
     _cycle_notice_checks(p, cmds, cfg)   # an announced cycle of this host holds only heavy checks run here
     if a.detach:
         try:
@@ -5230,6 +5237,7 @@ def _cmd_checks(a) -> None:
                 os.environ[_WAIT_KEPT_ENV] = wait_kept
             if no_spill:
                 os.environ[checkspill.OFF_ENV] = no_spill
+            os.environ[_RERUN_HEAD_ENV] = head
             if join_rec:
                 checkjoin.forget(p.state)
             return cmd_checks(a)
@@ -5316,6 +5324,9 @@ def _cmd_checks(a) -> None:
                 if (wrapped := remotecheck.wrap_fault(ran_out))[1]:   # every host refusing alike: one event (wrap_refused)
                     checkspill.wrap_refused(p, wrapped[0] or spilled.host, wrapped[1], checklane.scope_text(todo)[:300],
                                             p.config())
+                # The host's own fault: what failed there just before was likely the host's too, never the change's.
+                if not remotecheck.wrap_busy(ran_out)[1]:
+                    checkspill.fail_void(p.state, spilled.host)
             env_cfg = p.config() if env_why and not real else None
             key = _commands_hash(todo)
             spent = bool(env_cfg) and checkspill.env_rerun_spent(checkspill.fails(p.state, head, key), env_cfg)
@@ -5378,6 +5389,7 @@ def _cmd_checks(a) -> None:
                 os.environ[checkspill.OFF_ENV] = no_spill
                 if not timed_out and not env_why and failed in todo and (ids := _spill_failed_ids(rc, ran_out)):
                     os.environ[_RETRY_IDS_ENV] = json.dumps({"n": todo.index(failed), "ids": ids, "host": spilled.host})
+                os.environ[_RERUN_HEAD_ENV] = head   # the commit the spill host tested, in a clean checkout of it
                 if join_rec:   # the run here registers again; its followers queue again and join that one (checkjoin)
                     checkjoin.forget(p.state)
                 return cmd_checks(a)
@@ -5801,6 +5813,17 @@ _WAIT_KEPT_ENV = "TTP_CHECKS_WAIT_KEPT"   # a rerun's wait is its first run's (c
 # A rerun of checks that failed tests on a spill host runs only those tests (_spill_failed_ids; never inherited).
 _RETRY_IDS_ENV = "TTP_CHECKS_RETRY_IDS"
 _RETRY_IDS_MAX = 1000   # more failed there than this: the whole check runs again
+# A rerun's commit: the one its first run checked (spill failure, preemption; _rerun_head; never inherited).
+_RERUN_HEAD_ENV = "TTP_CHECKS_RERUN_HEAD"
+
+
+def _rerun_head(git: list[str], sha: str) -> str:
+    """Commit `sha` (_RERUN_HEAD_ENV) when it names a commit in the repository `git` runs in, else ""."""
+    if not sha or not re.fullmatch(r"[0-9a-f]{7,64}", sha):
+        return ""
+    got = subprocess.run([*git, "rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}"], capture_output=True,
+                         text=True)
+    return got.stdout.strip() if got.returncode == 0 else ""
 
 
 def _spill_failed_ids(rc: int, output: str) -> list[str]:

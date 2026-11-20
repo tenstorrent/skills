@@ -155,6 +155,7 @@ ENV_FAULT_HOSTS = 2   # the checks failed at import this often on spill hosts: o
 ENV_RETRY_S = 900   # after which (or once the checks config changes) a run tries the spill hosts again
 FAILS_FILE = "checks-spill-fails.json"   # in the project state: where each head's checks failed on a spill host (fails)
 FAILS_KEEP_S = 2 * 86400
+FAULT_VOIDS_S = 3600   # a spill host's own fault (exit 75) voids the failures recorded there this recently (fail_void)
 PROBE_TIMEOUT_S = 30
 LOAD_NEAR = 0.8   # no check starts on a spill host whose 1-minute load (with this machine's runs not yet in it) is this x its cores
 LOAD_LAG_S = 90.0   # a claim this recent may not show in its host's 1-minute load yet: its cores count as load
@@ -1706,13 +1707,13 @@ def kept_off(off: str, cfg: dict | None = None, now: float | None = None) -> set
 def fails(state: Path, head: str, key: str) -> list[dict]:
     """The spill failures FAILS_FILE in project state `state` records for head `head` under the check commands
     whose hash is `key` (cli._commands_hash): {host, sig, env (the checks config key of an import failure, else
-    ""), ts} each."""
+    ""), ts} each; one voided by its host's own fault (fail_void) is left out."""
     try:
         recs = json.loads((Path(state) / FAILS_FILE).read_text())
     except (OSError, ValueError):
         return []
-    return [r for r in recs if isinstance(r, dict) and r.get("head") == head and r.get("key") == key] \
-        if isinstance(recs, list) else []
+    return [r for r in recs if isinstance(r, dict) and r.get("head") == head and r.get("key") == key
+            and not r.get("void")] if isinstance(recs, list) else []
 
 
 def fail_add(state: Path, head: str, key: str, host: str, sig: str, env_cfg: dict | None = None) -> None:
@@ -1734,6 +1735,34 @@ def fail_add(state: Path, head: str, key: str, host: str, sig: str, env_cfg: dic
             project.durable_write(path, json.dumps(recs[-500:]))
     except OSError:   # a record is a bound on reruns: never a reason for the checks run to fail
         pass
+
+
+def fail_void(state: Path, host: str, now: float | None = None) -> int:
+    """Spill host `host`'s own fault (exit 75) ended a run there: each failure FAILS_FILE records on that host
+    in the last FAULT_VOIDS_S is marked void, so it no longer counts against its head (fails): that head may
+    go back to the host once it is fit, and a workstation's verdict leaves it out. Returns how many it voided.
+    Never raises."""
+    path, now = Path(state) / FAILS_FILE, time.time() if now is None else now
+    if not path.exists():
+        return 0
+    n = 0
+    try:
+        with open(path.with_name(path.name + ".lock"), "a") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            try:
+                recs = json.loads(path.read_text())
+            except (OSError, ValueError):
+                return 0
+            for r in recs if isinstance(recs, list) else []:
+                if isinstance(r, dict) and r.get("host") == host and not r.get("void") \
+                        and 0 <= now - float(r.get("ts") or 0) <= FAULT_VOIDS_S:
+                    r["void"], n = f"host fault at {int(now)}", n + 1
+            if n:
+                from . import project
+                project.durable_write(path, json.dumps(recs))
+    except (OSError, ValueError, TypeError):   # a record is a bound on reruns: never a reason for the checks run to fail
+        return 0
+    return n
 
 
 def fails_off(off: str, recs: list[dict], cfg: dict) -> str:
