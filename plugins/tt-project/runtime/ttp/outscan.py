@@ -544,7 +544,7 @@ def history_problem(repo, base: str, head: str = "HEAD", p=None) -> str | None:
 PUBLIC_KEY = "public_scan_paths"   # delivery.<key>: repo globs a public repository publishes; unset: off
 # A reference to one of this user's chat messages or to one of the project's tasks. In Python only its
 # comments and docstrings are read: the harness's own output says `task #<n>` and tests assert on it.
-PROVENANCE = re.compile(r"\b(?:(?:user )?msgs?|tasks?) #\d+")
+PROVENANCE = re.compile(r"\b(?:(?:user )?msgs?|tasks?) #\d+", re.I)
 _EDGE = r"[\w-]"   # a term matches only whole: no word character or hyphen on either side
 
 
@@ -677,7 +677,7 @@ def public_problem(repo, base: str, head: str = "HEAD", delivery: dict | None = 
                 prose = proses[commit, path]
                 ref = PROVENANCE.search(prose.get(at - 1, "")) if prose is not None else ref
             if ref:
-                what = "one of the project's tasks" if ref[0].startswith("task") else "a user's chat message"
+                what = "one of the project's tasks" if ref[0].lower().startswith("task") else "a user's chat message"
                 return (f"public scan refused: {where} adds a reference to {what} ({ref[0].split('#')[0]}#<digits>); "
                         "keep the rule and its reason and drop the reference" + REWRITE_TIP)
             for m in (rx.finditer(line) if rx else ()):

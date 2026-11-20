@@ -2300,7 +2300,7 @@ def _approved_mid_search(p, monkeypatch, after, priority):
 
 def _bad_first(env, monkeypatch, wait_s=0, restarts=1):
     """Eight entries, the first breaks the checks, so the search runs prefixes 4, 2 and 1 (none passes:
-    a prefix that passed would push at once, ) and then the rescue checks 2-8 without it. `wait_s` sets delivery.push_yield_wait_s (0: an urgent
+    a prefix that passed would push at once) and then the rescue checks 2-8 without it. `wait_s` sets delivery.push_yield_wait_s (0: an urgent
     approval never waits for the search's verdict; None: the default, which these millisecond checks meet),
     `restarts` delivery.push_yield_restarts (1: a search may stop once; None: the default, never)."""
     p, repo, origin, other = _bump_setup(env, monkeypatch, ["test ! -e plugins/p/bad.txt"])
@@ -21277,7 +21277,7 @@ def test_own_push_from_another_repository_compares_with_its_own_default_branch(e
 
 
 def _stoppable_push(p, monkeypatch, task=7, status="queued", **more):
-    """A detached push marker of task #`task` in project `p`, with this run as of `p`."""
+    """A detached push marker of task #`task` in project `p`, with this run as task 7 of `p`."""
     from ttp import push
     monkeypatch.setenv("TTP_TASK", "7")
     monkeypatch.setenv("TTP_PROJECT", str(p.base))

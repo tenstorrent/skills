@@ -3386,7 +3386,7 @@ def test_live_rows_count_a_tasks_first_chat_run_and_skip_endpoint_faults(env, mo
 
 def test_a_newly_served_model_refreshes_the_ranking_through_the_daemon(env, monkeypatch):
     """The served-models check lists a new model: the daemon refreshes at once; no key, one status line (no
-    user item, ), and a saved key resumes the ranking on its next try with no coordinator turn."""
+    user item), and a saved key resumes the ranking on its next try with no coordinator turn."""
     from ttp import alerts, modelrank, rankfresh, route
     from ttp.daemon import Daemon
     home = _rank_home(env, monkeypatch)

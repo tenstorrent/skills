@@ -181,11 +181,11 @@ def _weak_token(tok: str) -> bool:
 
 def _weak(ph: str) -> bool:
     """Whether phrase `ph` names no rule alone: each of its words of 4+ characters (all of them when none
-    is) is a file name, path, version, hash, number or evidence reference, or, beside
+    is) is a file name, path, version, hash, number or evidence reference ('msg #N', a commit), or, beside
     at least one such, a word that only says it is in use (_STATE: 'running 0.2.646') or a command's
     interpreter or option flag (_RUNNER, _FLAG: 'bash tests/x.sh --quick')."""
     s = _STATE_GLUED.sub(r"\1 \2", ph.strip("`'\" "))
-    for pair in re.findall(r"(?:msgs?|tasks?|runs?|notes?|pr|issue)\s+#?\d+", s):   # '' is one reference
+    for pair in re.findall(r"(?:msgs?|tasks?|runs?|notes?|pr|issue)\s+#?\d+", s):   # 'msg #N' is one reference
         s = s.replace(pair, pair.replace(" ", ""))
     words = s.split()
     long = [w for w in words if len(w.strip("`'\"()[]{}<>,;:.!?")) >= 4] or words
@@ -663,7 +663,7 @@ def _current(charter: str, recorded: set[str] | frozenset = frozenset()) -> list
 _WORD = re.compile(r"\w+(?:[-.']\w+)*")
 _NAMING = {"a", "an", "the", "of", "in", "on", "and", "or", "to", "for", "per", "under", "item", "items", "rule",
            "rules", "restriction", "restrictions", "heading", "section"}   # words that name an item, not state one
-_CITE = re.compile(r"\([^()]*(?:\b(?:user|msgs?|origin|relayer)\b|#\d)[^()]*\)")   # '(origin: Brief)'
+_CITE = re.compile(r"\([^()]*(?:\b(?:user|msgs?|origin|relayer)\b|#\d)[^()]*\)")   # '(user msg #N)', '(origin: Brief)'
 
 
 def _says(flat: str, ph: str) -> bool:
@@ -730,7 +730,7 @@ def _msgs(text: str) -> set[str]:
 
 def _cite_only(ph: str) -> bool:
     """Whether phrase `ph` only cites user messages, such as an entry's citation header ("owner's order, user
-    msg"): message numbers, cite words and dates, nothing that states a rule."""
+    msg #N"): message numbers, cite words and dates, nothing that states a rule."""
     return bool(_msgs(ph)) and not _CITE_WORDS.sub("", ph).strip()
 
 

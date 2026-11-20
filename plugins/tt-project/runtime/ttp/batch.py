@@ -3201,8 +3201,8 @@ class Batch:
         """Check the full head; when it fails, find the first failing entry by a binary search over
         prefixes (each prefix: entries 1..k plus a bump), checking the tip alone only when prefix 1
         fails. Returns (entries to push, head to push or None, (cmd, tail) of the blamed entry's
-        failure or None). The first prefix that passes every check in full pushes at once (_lands, user
-        ): the later entries go untested and unblamed to the next train, and no entry joins or
+        failure or None). The first prefix that passes every check in full pushes at once (_lands):
+        the later entries go untested and unblamed to the next train, and no entry joins or
         rejoins a head that passed, so a search blames only entry 1 of the entries it searches. A failing check none of whose failing pytest ids is new at its head
         (gatejudge: flaky, pre-existing on the tip or quarantined) passes there (_judged). When the full
         head's failure names new ids, every entry they point at that fails them alone on the tip is sent

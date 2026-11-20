@@ -989,7 +989,7 @@ def test_sonnet_workers_and_reviewers_share_one_system_prompt_while_memory_chang
 
 
 def test_a_run_on_another_claude_model_forks_the_coordinators_last_turns_else_takes_the_disk_block(env, monkeypatch, tmp_path):
-    """Task #8308: the prompt cache is per model, so a Sonnet fork of an Opus
+    """The prompt cache is per model, so a Sonnet fork of an Opus
     coordinator cannot read its cache. It forks only the session's last turns (worker_fork_other_model_tokens,
     "tail"), the same copy for every such run, so they share one cache entry; a model outside the Claude
     families, or the setting at 0, takes the disk block. A run on the coordinator's model forks it whole."""

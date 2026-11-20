@@ -781,7 +781,9 @@ def test_public_scan_refuses_local_names_and_chat_references_only_in_its_paths(e
     why = outscan.public_problem(repo, head, "HEAD", on)
     assert "adds a reference to one of the project's tasks (task #<digits>)" in why and str(43) not in why, why
     for at, line, kind in (("plural-msgs.md", f"Both rules (user msgs #{40 + 5}, #{40 + 6}).\n", "a user's chat message"),
-                           ("plural-tasks.md", f"Landed in tasks #{40 + 7}.\n", "one of the project's tasks")):
+                           ("plural-tasks.md", f"Landed in tasks #{40 + 7}.\n", "one of the project's tasks"),
+                           ("caps-task.md", f"Task #{40 + 8} landed it.\n", "one of the project's tasks"),
+                           ("caps-msg.md", f"As asked (User Msg #{40 + 9}).\n", "a user's chat message")):
         head = _git_out(repo, "rev-parse", "HEAD")
         _commit_in_harness_tree(repo, f"plugins/mine/{at}", line)
         assert kind in outscan.public_problem(repo, head, "HEAD", on), line
@@ -802,6 +804,8 @@ def test_public_scan_reads_only_comments_and_docstrings_of_python_for_task_and_m
     assert "one of the project's tasks" in outscan.public_problem(repo, head, "HEAD", on)
     _commit_in_harness_tree(repo, "plugins/mine/t.py", f'def f():\n    """Says done (user msg #{n})."""\n    return 1\n')
     assert "a user's chat message" in outscan.public_problem(repo, head, "HEAD", on)
+    _commit_in_harness_tree(repo, "plugins/mine/t.py", f'def f():\n    """Task #{n}: says done."""\n    return 1\n')
+    assert "one of the project's tasks" in outscan.public_problem(repo, head, "HEAD", on)   # any case
     _commit_in_harness_tree(repo, "plugins/mine/t.py", f'def f(:\n    return "task #{n}"\n')   # does not parse: whole lines
     assert "one of the project's tasks" in outscan.public_problem(repo, head, "HEAD", on)
 

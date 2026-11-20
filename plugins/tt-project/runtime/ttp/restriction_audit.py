@@ -128,7 +128,7 @@ def tool_terms(old: str, new: str, charter: str = "",
 COMMON_SHARE = 0.005
 COMMON_MIN = 20       # ... and on more than this many lines: on a small tool tree 0.5% is a line or two,
                       # and the harness's own scripts alone name 'reset' or 'host' on ten
-# Whole words (clause_words) of a citation rather than a rule: "(user msg)", "the user's word, October 5".
+# Whole words (clause_words) of a citation rather than a rule: "(user msg #N)", "the user's word, October 5".
 CITE_WORDS = frozenset({"user", "users", "word", "words", "message", "messages", "msgs", "january", "february", "march",
                         "april", "june", "july", "august", "september", "october", "november", "december"})
 

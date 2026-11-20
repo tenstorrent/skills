@@ -1177,7 +1177,7 @@ HELD_TIMES_SHOWN = 6   # reboot times listed for one repeated entry, the latest 
 
 
 def _held_entry(times: list[float], shown: str, where) -> str:
-    """'16:23 PDT board: ' for one reboot; 'push batch held at 4 reboots (23:26, 08:20,
+    """'16:23 PDT board: task #N' for one reboot; 'push batch held at 4 reboots (23:26, 08:20,
     15:40, 16:23 PDT), latest batch-<id>' for an entry held at several."""
     if len(times) == 1:
         return f"{timefmt.short(times[0], where)} {shown}"
@@ -8155,7 +8155,7 @@ _USER_MSG_ID = re.compile(r"\buser(?:'s)?\s+(?:msgs?|messages?)\s+#?\d+(?:\s*(?:
 
 def _user_msg_ids(text: str) -> set[str]:
     """Every user message id `text` cites, a cite list included ('user msgs #A, #B and #C'). A later
-    list item needs its '#', so a date after a cite is no id."""
+    list item needs its '#', so a date after a cite ('user msg #N, 2026-10-13') is no id."""
     return {i for m in _USER_MSG_ID.finditer(text) for i in re.findall(r"\d+", m.group())}
 
 

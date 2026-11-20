@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """A refused Restrictions charter_update that cites a user message: a filled resend, and the chat told.
 
-A coordinator often puts the cite inside `text` ("...") and leaves `source` unset, so the
+A coordinator often puts the cite inside `text` ("... (user msg #N)") and leaves `source` unset, so the
 gate reads the item as unsourced and refuses it with a long error. When a charter_update to Restrictions
 is refused and its `source` names a message, or its `text` cites one (restriction_source.CITE_RE),
 template() reads that message from the chat log and fills the same change ready to resend: the same

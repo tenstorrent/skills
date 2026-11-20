@@ -18,7 +18,7 @@ continues a list such a word starts (`PRs #8 and #16`). Any other bare `#N` that
 may still be read as a task; that only refreshes text or reruns a model-free probe.
 
 A ref is another project's, never this one's, when a known peer's name stands right before it
- or before the list it continues
+(`<peer> task #N`, `<peer> #N`, `<peer>'s #N`, `<peer>#N`) or before the list it continues
 (`<peer> #8, #9 and #12`). The peers (peer_names) are the registry's projects (`ttp list`), the projects
 whose notes reached this one and the project's PEERS_FILE, read without a model call; this project's own
 name and names that are plain words a note uses before a ref (`needs #12`) never count. Facts a note
