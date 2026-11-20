@@ -9,28 +9,20 @@
   more tool calls the next digest carries a steer to batch reads into one call or hand reading to a worker.
 - rings.eta_history (key eta.history), shadow: etaledger.record also stores the ETA from eta.history next to
   the shown one; nothing users see changes; eta_shadow_line gives the baseline.
-- rings.output_trim (key output.trim): workers are asked for short hand-offs and reports (no output cap),
-  and an unpinned work or harness task whose spec is mechanical runs at medium effort (effort_pick). Code
-  tasks keep Jev's pick (effortab); reviews and graders are never picked here, and a conclusion
-  run's effort floor still lifts it.
 
 Precedence (rollout.on): a project's own explicit value for the flag's key wins, else the ring rule, else off.
 
 Metrics (status_lines in `ttp status`, audit_lines in the daily review), last 7 days:
 - wakes: wakesettle.line; wake tools: coordinator wakes with TOOLS_STEER or more tool calls and their $.
 - eta: the shadow baseline (ETAs compared, median and p90 absolute error of each method), flag on only.
-- output: output tokens and $ per worker run by kind, trimmed-effort runs vs the rest.
 """
 from __future__ import annotations
 
 import json
-import re
-import statistics
 import time
 from typing import Any
 
 
-TRIM_KEY = "output_trim"     # run note: {"effort", "from", "why"} of an effort pick
 STATUS_KEY = "cost_levers_status"   # kv: {"at", "lines"}, the status lines cached
 STATUS_TTL_S = 1800.0
 WINDOW_S = 7 * 86400.0
@@ -40,13 +32,6 @@ STEER_KEY = "wake_tools_steer"      # kv: {"run", "tools", "at"} of the wake tha
 STEER_LINE = ("Last wake made {tools} tool calls (run {run}): each call re-reads the whole context. Batch "
               "independent read-only lookups into one shell call (`a; b; c`), and hand reading code or logs "
               "beyond a few short excerpts to a worker or subagent.")
-TRIM_KINDS = ("work", "harness")
-MECHANICAL = re.compile(r"\b(re-?run|rerun|copy|copies|poll|rename|regenerate|bump|mechanical|scripted|"
-                        r"move (?:the )?files?|delete (?:the )?(?:stale|old)|sync)\b", re.I)
-CONCLUSION = re.compile(r"^\s*conclusion\s*:", re.I | re.M)
-TRIM_LINE = ("Output (rings.output_trim): keep the hand-off and any report short and plain: the result, "
-             "the evidence a reader needs to check it, and the follow-ups. No restated spec, no recap of steps, "
-             "no padding. Do not drop facts to save words.")
 
 
 def _dig(d: Any, key: str) -> Any:
@@ -75,66 +60,6 @@ def _note(raw: Any) -> dict:
     except (TypeError, ValueError):
         return {}
     return got if isinstance(got, dict) else {}
-
-
-# --- lever c: output ---------------------------------------------------------------------------------
-
-def effort_pick(p, cfg: dict, task: dict, tier: str, provider: str) -> dict | None:
-    """The run note's TRIM_KEY entry for a start of `task`, or None: medium effort for a work or harness task at
-    the standard tier with no model or effort pin, no `conclusion:` line and a mechanical spec, when its tier
-    runs above medium. Never a code task (effortab), a review, a plan or a question."""
-    from . import blindreview, tierfloor
-    task = dict(task)
-    if task.get("kind") not in TRIM_KINDS or tier != "standard" or str(task.get("effort") or "") \
-            or str(task.get("model") or "") or blindreview.is_blind_task(task):
-        return None
-    spec = str(task.get("spec") or "")
-    if CONCLUSION.search(spec) or not (m := MECHANICAL.search(spec)):
-        return None
-    tier_effort = str((((cfg.get("providers") or {}).get(provider) or {}).get("tiers") or {}).get(tier, {})
-                      .get("effort") or "")
-    if tierfloor._rank(tier_effort) <= tierfloor._rank("medium"):
-        return None
-    if not lever_on(p, "output_trim"):
-        return None
-    return {"effort": "medium", "from": tier_effort, "why": f"mechanical spec ({m.group(0)!r})"}
-
-
-def prompt_line(p, task: dict) -> str:
-    """The worker prompt's output line when the lever is on; '' otherwise (and for blind graders)."""
-    from . import blindreview
-    if blindreview.is_blind_task(dict(task)) or not lever_on(p, "output_trim"):
-        return ""
-    return TRIM_LINE
-
-
-def output_report(p, since: float, until: float | None = None) -> dict:
-    """{kind: {runs, out_tokens (median), usd (mean)}} of worker runs, and "trimmed": the same for runs an
-    effort pick moved."""
-    until = time.time() if until is None else until
-    rows = p.db.q("SELECT r.cost_usd, r.output_tokens, r.note, t.kind FROM runs r JOIN tasks t ON t.id=r.task "
-                  "WHERE r.role!='coordinator' AND r.started>=? AND r.started<? AND r.status!='running'",
-                  (since, until))
-    groups: dict[str, list] = {}
-    for r in rows:
-        groups.setdefault(str(r["kind"] or "?"), []).append(r)
-        if isinstance(_note(r["note"]).get(TRIM_KEY), dict):
-            groups.setdefault("trimmed", []).append(r)
-    return {k: {"runs": len(v), "out_tokens": int(statistics.median([int(r["output_tokens"] or 0) for r in v])),
-                "usd": round(sum(float(r["cost_usd"] or 0) for r in v) / len(v), 2)} for k, v in groups.items()}
-
-
-def output_line(p, since: float, until: float | None = None) -> str:
-    r = output_report(p, since, until)
-    if not r:
-        return ""
-    flag = "on" if lever_on(p, "output_trim") else "off"
-    kinds = ", ".join(f"{k} {v['out_tokens'] / 1000:.1f}k/${v['usd']:.2f}" for k, v in sorted(r.items())
-                      if k != "trimmed")
-    trimmed = r.get("trimmed")
-    return (f"output trim [{flag}]: worker output tokens/run (median) and $/run: " + (kinds or "no runs")
-            + (f"; effort-picked {trimmed['runs']} runs {trimmed['out_tokens'] / 1000:.1f}k/${trimmed['usd']:.2f}"
-               if trimmed else ""))
 
 
 def wake_tools_report(p, since: float, until: float | None = None) -> dict:
@@ -200,7 +125,7 @@ def eta_shadow_line(p, since: float, until: float | None = None) -> str:
 def lines(p, since: float, until: float | None = None) -> list[str]:
     from . import wakesettle
     out = []
-    for fn in (lambda p, s, u: wakesettle.line(p.db, s, u), wake_tools_line, output_line, eta_shadow_line):
+    for fn in (lambda p, s, u: wakesettle.line(p.db, s, u), wake_tools_line, eta_shadow_line):
         try:
             if ln := fn(p, since, until):
                 out.append(ln)
@@ -225,10 +150,10 @@ def status_lines(p, now: float | None = None) -> list[str]:
 
 
 def audit_lines(p, since: float) -> list[str]:
-    """The daily review's lever lines: the wake-tools, output and eta shadow metrics (the wake line has its own
+    """The daily review's lever lines: the wake-tools and eta shadow metrics (the wake line has its own
     audit line)."""
     out = []
-    for fn in (wake_tools_line, output_line, eta_shadow_line):
+    for fn in (wake_tools_line, eta_shadow_line):
         try:
             if ln := fn(p, since):
                 out.append(ln)

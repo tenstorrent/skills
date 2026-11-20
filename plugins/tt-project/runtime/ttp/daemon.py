@@ -3770,9 +3770,6 @@ class Daemon:
             ab = (note or {}).get(effortab.KEY)
             if not pin.get("effort") and isinstance(ab, dict) and ab.get("effort"):
                 effort = str(ab["effort"])   # Jev's effort pick (effortab.assign)
-            elif not pin.get("effort") and isinstance(ot := (note or {}).get(costlevers.TRIM_KEY), dict) \
-                    and ot.get("effort"):
-                effort = str(ot["effort"])   # rings.output_trim's pick for a mechanical spec (costlevers)
         if min_effort and role != "coordinator":
             # A conclusion run's effort floor (tierfloor.py), as this provider takes it.
             lifted = failover.kept_effort(provider, min_effort)
@@ -13222,12 +13219,6 @@ class Daemon:
                     log(self.p, f"task {task['id']}: effort pick not assigned: {e}")
                 if ab:
                     note[effortab.KEY] = ab
-                elif not cheap and not ((routed or {}).get("model_pick") and run_prov == (routed or {}).get("to")):
-                    try:   # rings.output_trim: a mechanical work or harness spec runs at medium effort
-                        if ot := costlevers.effort_pick(self.p, self.cfg, task, tier, run_prov):
-                            note[costlevers.TRIM_KEY] = ot
-                    except Exception as e:   # the pick must never hold a task back
-                        log(self.p, f"task {task['id']}: output trim effort pick failed: {e}"[:300])
                 if review_pick:
                     note["review_tier"] = review_pick
                     if review_pick.get(conflictfix.KEY):

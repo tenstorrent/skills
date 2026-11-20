@@ -370,10 +370,10 @@ def test_a_ring_with_no_samples_for_72_hours_stays_and_leaves_a_low_note(env):
     from ttp import rollout
     p, d = _watch(env)
     rollout.set_ring(p.name, "1")
-    _ro_flag("device_prewarm", 1, 80)
+    _ro_flag("deslop", 1, 80)
     assert d.rollout_watch() == []
-    assert rollout.level("device_prewarm") == 1 and rollout.frozen("device_prewarm") is None
-    note = p.db.one("SELECT text, severity FROM messages WHERE ref='rollout_thin:device_prewarm'")
+    assert rollout.level("deslop") == 1 and rollout.frozen("deslop") is None
+    note = p.db.one("SELECT text, severity FROM messages WHERE ref='rollout_thin:deslop'")
     assert note["severity"] == "low" and "too few runs" in note["text"]
 
 
@@ -445,7 +445,7 @@ def test_a_new_alert_votes_rollback_only_for_the_flag_in_its_own_area_by_the_key
     assert got("glm_code") == ["new alert auth:glm"], "model routing trips are low and never stored: not judged"
     assert rh.signals(p.db, since, now, th, "push")["failing"] == ["new alert after_push_failed", "new alert push_tip_failing"]
     assert "push_isolation" not in rollout.FLAGS, "graduated: the push batch survival runs for every project"
-    for none in ("eta_history", "device_prewarm", "deslop"):
+    for none in ("eta_history", "deslop"):
         assert got(none) == [], none
     assert rh.signals(p.db, since, now, th)["failing"] == [], "no area, no alert votes"
     p.db.x("UPDATE alerts SET raised=? WHERE key='auth:glm'", (now - 100 * _RH,))   # already in the baseline: not new
@@ -586,7 +586,7 @@ def test_a_revert_counts_only_against_a_flag_whose_gated_code_the_reverted_commi
     p = make(env)
     repo, spec = _ro_repo(tmp_path, "sched.py")
     _ro_revert(p, spec)
-    for flag in ("deslop", "output_trim", "glm_code", "coord_wake_settle"):
+    for flag in ("deslop", "glm_code", "coord_wake_settle"):
         got = _revert_count(p, flag, repo)
         assert got["failing"] == [] and got["unattributed"] == [], f"{flag}: a revert of unrelated code is no signal"
     p.db.x("DELETE FROM tasks WHERE title LIKE 'Revert %'")
@@ -594,7 +594,7 @@ def test_a_revert_counts_only_against_a_flag_whose_gated_code_the_reverted_commi
     _ro_revert(p, spec)
     got = _revert_count(p, "deslop", repo)
     assert len(got["failing"]) == 1 and "1 forward revert(s) of a landed change" in got["failing"][0]
-    assert _revert_count(p, "output_trim", repo)["failing"] == [], "another flag's code is not this one's"
+    assert _revert_count(p, "coord_wake_settle", repo)["failing"] == [], "another flag's code is not this one's"
 
 
 def _ro_authored(p, monkeypatch, spec, provider, model, failing=""):

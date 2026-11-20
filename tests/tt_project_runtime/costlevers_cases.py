@@ -1,10 +1,10 @@
-# Cost lever tests of tests/test_tt_project_runtime.py (costlevers.py, wakesettle.py: the cost levers
-# behind rings.coord_wake_settle and rings.output_trim, both off by default), which runs this file
+# Cost lever tests of tests/test_tt_project_runtime.py (costlevers.py, wakesettle.py: the cost lever
+# behind rings.coord_wake_settle, off by default), which runs this file
 # in its own namespace (see _include_cases there): helpers, fixtures and imports come from that file
 # and the other case files (_roll, _batch_setup).
 from __future__ import annotations
 
-_LEVERS = ("coord_wake_settle", "output_trim")
+_LEVERS = ("coord_wake_settle",)
 
 
 def _sh_setup(env, monkeypatch):
@@ -47,17 +47,13 @@ def test_cost_levers_are_off_by_default_and_a_ring_or_the_projects_own_key_turns
     for flag in _LEVERS:
         assert flag in rollout.FLAGS
         assert not costlevers.lever_on(p, flag), flag
-    task = {"kind": "work", "spec": "rerun the tests"}
-    assert costlevers.prompt_line(p, task) == ""
-    # The scratch ring turns one lever on; the others stay off.
+    # The scratch ring turns the lever on.
     assert _roll(capsys, "ring", "demo", "0")[0] == 0
-    assert _roll(capsys, "set", "output_trim", "0")[0] == 0
-    assert costlevers.lever_on(p, "output_trim")
-    assert not costlevers.lever_on(p, "coord_wake_settle")
-    assert costlevers.prompt_line(p, task) == costlevers.TRIM_LINE
+    assert _roll(capsys, "set", "coord_wake_settle", "0")[0] == 0
+    assert costlevers.lever_on(p, "coord_wake_settle")
     # The project's own explicit value wins over the ring, both ways.
-    p.set_config("output.trim", False)
-    assert not costlevers.lever_on(p, "output_trim") and costlevers.prompt_line(p, task) == ""
+    p.set_config("coordinator.wake_settle", False)
+    assert not costlevers.lever_on(p, "coord_wake_settle")
     p.set_config("coordinator.wake_settle", True)
     assert costlevers.lever_on(p, "coord_wake_settle")
 
@@ -138,24 +134,27 @@ def test_wake_settle_flag_keeps_the_daemon_from_waking_on_a_routine_batch(env, m
     assert _drive(d, clock, starts), "a user message wakes a turn"
 
 
-def test_output_trim_picks_medium_effort_only_for_mechanical_unpinned_work(env, capsys):
-    from ttp import costlevers
+def test_retired_output_trim_and_device_prewarm_leave_old_state_and_config_working(env, capsys):
+    # cells: rollout_state, project_config
+    from ttp import cli, rollout
+    from ttp.project import unknown_key_hint
     p = make(env)
-    cfg = p.config()
-    cfg = {**cfg, "providers": {**cfg["providers"], "claude": {
-        **cfg["providers"]["claude"], "tiers": {**cfg["providers"]["claude"]["tiers"], "standard": {
-            **cfg["providers"]["claude"]["tiers"]["standard"], "effort": "high"}}}}}
-    task = {"kind": "work", "spec": "rerun the docs build and copy the output"}
-    assert costlevers.effort_pick(p, cfg, task, "standard", "claude") is None   # off by default
-    p.set_config("output.trim", True)
-    got = costlevers.effort_pick(p, cfg, task, "standard", "claude")
-    assert got["effort"] == "medium" and got["from"] == "high"
-    for t, tier in (({**task, "kind": "code"}, "standard"), ({**task, "kind": "review"}, "standard"),
-                    ({**task, "kind": "question"}, "standard"), (task, "light"),
-                    ({**task, "effort": "xhigh"}, "standard"), ({**task, "model": "opus"}, "standard"),
-                    ({**task, "spec": task["spec"] + "\nconclusion: the verdict"}, "standard"),
-                    ({**task, "spec": "design the new scheduler"}, "standard")):
-        assert costlevers.effort_pick(p, cfg, t, tier, "claude") is None, (t, tier)
+    for flag in ("output_trim", "device_prewarm"):
+        assert flag not in rollout.FLAGS
+        _ro_flag(flag, 1, 1)   # account state written before the flags were retired
+    assert not rollout.on("output_trim", p.name)
+    code, out = _roll(capsys, "status")
+    assert code == 0 and "output_trim" not in out and "device_prewarm" not in out and "eta_history" in out
+    assert _roll(capsys, "status", "--json")[0] == 0
+    assert _roll(capsys, "set", "eta_history", "0")[0] == 0 and _roll(capsys, "status")[0] == 0
+    raw = p.raw_config()
+    raw["output"] = {"trim": True}
+    p.config_path.write_text(json.dumps(raw))
+    assert p.config()
+    assert "output.trim is retired" in unknown_key_hint("output.trim")
+    notes = cli._drop_retired_keys(p)
+    assert len(notes) == 1 and "output.trim" in notes[0]
+    assert not cli._config_has(p.raw_config(), "output.trim")
 
 
 def test_cost_lever_metrics_show_in_status_and_the_daily_review(env, capsys):
@@ -163,18 +162,11 @@ def test_cost_lever_metrics_show_in_status_and_the_daily_review(env, capsys):
     p = make(env)
     now = time.time()
     wakesettle.record(p.db, "rule", "skip", [{"id": 9, "kind": "upstream_note"}], now - 10)
-    assert costlevers.output_line(p, now - 86400, now) == ""
-    tid = p.db.add_task("t", "s", kind="work", origin="user")
-    p.db.x("INSERT INTO runs(role, task, started, ended, status, cost_usd, output_tokens, note) VALUES(?,?,?,?,?,?,?,?)",
-           ("worker", tid, now - 100, now - 50, "ok", 0.5, 4000, json.dumps({"output_trim": {"effort": "medium"}})))
     got = costlevers.status_lines(p, now)
     assert got and all(x.startswith("cost levers (7d): ") for x in got)
-    text = "\n".join(got)
-    assert "settled without a model (rule 1)" in text and "output trim [off]" in text
-    assert "work 4.0k/$0.50" in text and "effort-picked 1 runs" in text
+    assert "settled without a model (rule 1)" in "\n".join(got)
     assert costlevers.status_lines(p, now + 60) == got   # cached
-    out = audit.lines(p.db, now, 86400, 24, p)
-    assert any("output trim" in x for x in out)
+    assert any("settled without a model" in x for x in audit.lines(p.db, now, 86400, 24, p))
 
 
 def _wake_run(p, tools, cost=0.4, ago=100):

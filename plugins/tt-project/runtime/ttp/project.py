@@ -1101,6 +1101,7 @@ RETIRED_KEYS = {
     "upgrade.task_every_h": "a conflicting upgrade queues its merge task at once, never on a timer",
     "coordinator.unblock_effort": "every coordinator runs at one effort level, coordinator.effort",
     "route.review_medium_lines": "every review runs on Opus, so no review is sized into the routine class",
+    "output.trim": "the output-trim cost lever is retired; workers are asked for short hand-offs without it",
     "effort_ab.enabled": "the effort A/B ended; Jev's pick (effort_ab.jev_pick) is all that is left",
     "effort_ab.winner": "the effort A/B ended; Jev's pick (effort_ab.jev_pick) is all that is left",
     "effort_ab.decided_at": "the effort A/B ended; Jev's pick (effort_ab.jev_pick) is all that is left",

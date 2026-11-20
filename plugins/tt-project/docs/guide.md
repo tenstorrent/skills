@@ -5179,15 +5179,14 @@ Wired flags. `glm_code` gates the code route's GLM coin flip (codearm.py): a pro
 `route.code_sonnet.glm_share` wins as written, 0 included; without one, the flag on gives the account's share,
 else 0.5 (`codearm.RING_SHARE`), and the flag off makes it 0, so no coin flip runs. The arm still needs a
 `route.code_sonnet.glm` model, and Claude review, the policy-file bounce and the switch-back guard are
-unchanged. `coord_wake_settle` (`coordinator.wake_settle`) and
-`output_trim` (`output.trim`) gate the cost levers of costlevers.py and wakesettle.py; `ttp status` and the
-daily review show their numbers. `coord_wake_settle` also runs the daemon's daily waste check without a model,
+unchanged. `coord_wake_settle` (`coordinator.wake_settle`) gates the cost lever of costlevers.py and
+wakesettle.py; `ttp status` and the daily review show its numbers. `coord_wake_settle` also runs the daemon's daily waste check without a model,
 steers the wake after one that made 8+ tool calls to batch its reads, and settles a waiting task's spec edit that
 only records its passed probe (the wake-tools line counts 8+ call wakes with or without the flag). `eta_history`
 (`eta.history`) gates a shadow only: each ETA is logged beside a history-based one and `ttp eta --calibration`
 shows the 7-day error of both; no shown ETA changes. A flag whose feature already runs for every project graduates and leaves the
 list instead of being gated off: `push_isolation` (push batches that survive one failing entry or a remote
-outage). `device_prewarm` and `deslop` gate nothing yet.
+outage). `deslop` gates nothing yet.
 
 Waves and auto. A flag with a wave gate (`glm_work`, a project's routed work on GLM, and `glm_code`) can widen by
 named projects instead of rings: `ttp rollout waves <flag> <p1,p2> <p3> ...` sets its ordered waves (each argument
