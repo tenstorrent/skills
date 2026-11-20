@@ -14,7 +14,8 @@ reaches the target:
 4. **A change to a ttnn op**: when the op is the problem for every model, not only this one.
 5. **A new ttnn op**: when nothing in ttnn does the job at model shapes.
 
-Skip ahead when the roofline shows the existing path cannot reach the target's order of magnitude: start the
+Skip ahead when the roofline and a microbenchmark of the existing op at model shapes show it cannot reach the
+target's order of magnitude: start the
 new op or fusion early, on a side branch, while the plain path keeps the model correct.
 
 ## Every new or changed path

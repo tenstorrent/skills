@@ -30,7 +30,8 @@ mean and p95 per slice. Tolerance: the larger of 3× the HF bf16 vs fp32 spread 
 floor (KL p95 0.02, top-1 1 point), so TT's own bf16 accumulation is not read as a defect.
 
 Run two TT configurations:
-- `current`: the precision the model has now. Recorded as the baseline; never changed here.
+- `current`: the precision the model has now, recorded as the baseline. This check does not change precision;
+  the goal that owns precision (`datatype-sweep`, or the lean model goal's perf loop) does, on these tiers.
 - `full`: the highest precision that fits: BF16 weights and activations, HiFi4, BF16 KV cache and head;
   if that does not fit, full precision per group or layer range; else per layer on HF activations;
   else BFP8 weights with HiFi4. Record which, and the ops that could not reach it.

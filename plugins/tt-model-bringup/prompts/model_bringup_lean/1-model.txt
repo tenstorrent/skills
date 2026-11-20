@@ -8,10 +8,10 @@ Goal completion requirements:
 - SPEC.md and a roofline with per-batch targets exist before device work; targets are multiples of their floors.
 - The full model implements the $full-model generator contract: chunked prefill at any valid length, traced decode with on-device split sampling, paged KV, fixed slots, every batch in batch_sizes, the advertised context or a hard physical limit with evidence.
 - The $reference-accuracy suite exists with verdict match at full precision; the served precision is chosen on its tiers and is the recorded baseline.
-- Batched equals alone at the largest batch; short greedy prompts are coherent (no repetition, collapse or drift).
-- The KV pool is the largest that fits, tested at the largest batch growing to the working set; doc/agentic_serving.json records workload and ledger.
+- Batched equals alone at the largest batch (identical greedy tokens over long runs; logits bitwise where the ops allow, any exception named); short greedy prompts are coherent (no repetition, collapse or drift).
+- The KV pool is the largest that fits after weights, measured peak activations, the trace region and a margin, tested at the largest batch growing to the working set; doc/agentic_serving.json records workload and ledger.
 - New or changed ops each have a unit test at model shapes and a switch back. A mixture-of-experts model records experts touched and decode against its floor at batch 1 and the largest batch.
 - doc/model/model.json records mode, targets, floors, measured decode ms/step and TTFT per batch, precision, pool, tier commands and the perf ledger; REPORT.md leads with measured against target.
 - $stage-review returns `clean-pass` once, at the end. Local commits on one branch, never push, tag the result bringup/<model>/model; log SHAs.
 
-An open reference divergence fails the goal. A measured number far from its target is reported with its reason when budget_hours ends. Unmet requirements, review findings, failed gates: work. Stop only after `$autofix` fails.
+An open divergence at full precision (an implementation error, not a quantization choice) fails the goal. Speed targets do not: keep improving until budget_hours ends, then report each number far from its target with its reason. Unmet requirements, review findings, failed gates: work. Stop only after `$autofix` fails.

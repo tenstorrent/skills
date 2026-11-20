@@ -4,8 +4,8 @@ A routed layer behaves differently at every batch: at batch 1 it is a small dens
 many experts with few tokens each, in prefill it touches most experts with many tokens each. Plan and measure
 it per batch, never from one layer at batch 1.
 
-- **Roofline per batch.** Distinct experts touched per step ≈ E·(1 − (1 − k/E)^B) for E experts and top-k, times
-  bytes per expert, plus dispatch and combine traffic. Targets come from this, not from the dense formula.
+- **Roofline per batch.** Distinct experts touched per step ≈ E·(1 − (1 − k/E)^B) for E experts and top-k under
+  uniform routing (real routing usually touches fewer; measure it), times bytes per expert, plus dispatch and combine traffic. Targets come from this, not from the dense formula.
 - **Real routing.** Record router decisions in the HF captures and drive performance tests with them, so hot
   experts and load imbalance are in the measurement. Uniform random routing hides both.
 - **Layout by measurement.** Expert-parallel, tensor-parallel or a mix, chosen on full-model step time at batch 1
