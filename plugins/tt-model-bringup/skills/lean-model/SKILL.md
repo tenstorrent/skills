@@ -8,8 +8,8 @@ description: Bring a Hugging Face model to a correct, fast TTNN full model on th
 The outcome and its tests are fixed; the path is yours. What follows is what earlier bringups learned, the good
 and the bad, offered as defaults. Where your measurements say otherwise, follow them and write down why.
 
-Load the references when you reach them, not up front: [ops and kernels](references/ops.md),
-[one or two machines](references/machines.md); for routed experts, [MoE](../ttnn-knowledge/topics/moe.md).
+Load the references when you reach them, not up front: [ops and kernels](references/ops.md); for routed experts,
+[MoE](../ttnn-knowledge/topics/moe.md).
 
 ## Knowledge
 
@@ -68,6 +68,8 @@ Things that have cost earlier bringups time. They are not requirements; use them
   allocations of different modules colliding, unusual prompt lengths (very short, at chunk edges).
 - Running several agents on one board without the `tt-device-usage` rules has hung boards and lost hosts.
 - Firmware differences between machines have looked like model bugs.
+- With several agents per machine, the device lock became the bottleneck; long jobs held it for hours.
+- Concurrent C++ rebuilds of one tree break each other, and the CPU reference can take much of the host's memory.
 
 ## Tests
 
@@ -98,7 +100,7 @@ winner, drop the rest. Scope risky work as "measure and report before building",
 Where to start is decided in the plan: how much to reuse from similar tt-metal models, or from an existing
 correct implementation of this model, and why. The one run setting that changes what you may do is `scope` in
 `inputs.json` (`model-bringup`): `contained` keeps every change inside the model folder and `bringup/`; `open` lets
-the model carry its own versions of ops and shared code. [ops](references/ops.md) has the ladder for each.
+the model carry its own versions of ops and shared code. [ops](references/ops.md) lists the options under each.
 
 ## Devices and budget
 
