@@ -241,8 +241,8 @@ RULES = (
      "change only files in your worktree and `$TMPDIR`, and say in your hand-off what else should change"),
     ("delete", HARMFUL, None, None, "change only files in your worktree and `$TMPDIR`, and say in your hand-off what "
      "else should change"),
-    ("outward", HARMFUL, r"`ttp (?:notify|say|ask|note)\b", "run `ttp notify`, `ttp say`, `ttp ask` or "
-     "`ttp note --to`/`--reply`", 'put what a person should read in your hand-off summary; a plain `ttp note "<text>"` '
+    ("outward", HARMFUL, r"`ttp (?:notify|say|ask|note)\b", "post outward (`ttp notify`, `ttp say`, "
+     "`ask`, `ttp note --to`/`--reply`)", 'put what a person should read in your hand-off summary; a plain `ttp note "<text>"` '
      "goes to your task's own log"),
     ("publish", HARMFUL, r"lands a head|never `git push`", "run `git push`, `ttp land` or `ttp express`",
      "commit on your branch and hand off done; the review publishes the head"),

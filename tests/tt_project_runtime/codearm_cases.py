@@ -605,8 +605,9 @@ def test_the_glm_prompt_deny_list_is_the_rule_table_with_each_allowed_way():
     assert [ln for ln in text.splitlines() if ln.startswith("- ")] == [
         f"- Never {r[3]}: {r[4]}." + (" (harmful)" if r[1] == glmguard.HARMFUL else "") for r in glmguard.RULES if r[3]]
     assert 8 <= text.count("\n- ") <= 10 and "goes to your task's own log" in text
-    for name in ("ask", "notify", "say", "upstream", "land", "express"):
+    for name in ("notify", "say", "upstream", "land", "express"):
         assert f"`ttp {name}`" in text and glmguard.cli_refusal(name), name
+    assert "`ask`" in text and glmguard.cli_refusal("ask"), "ask is a post kind, not a ttp subcommand"
     assert "`ttp note --to`" in text and glmguard.cli_refusal("note", "", ["--to"])
     assert glmguard.cli_refusal("note", "", ["--reply"]) and "`ttp machines` writes" in text
     for name in ("checks", "lock", "detach", "push", "landed", "task", "slop", "config"):
