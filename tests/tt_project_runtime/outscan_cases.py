@@ -891,3 +891,36 @@ def test_ttp_checks_runs_the_push_scan_on_a_code_tasks_commits_before_its_checks
     p.set_config("delivery.public_scan_paths", [])
     cli.main(["checks", "--fresh", "--", *check])
     assert ran.exists()
+
+
+def test_detached_ttp_checks_scans_in_the_checks_not_in_the_launcher_its_caller_waits_on(env, tmp_path,
+                                                                                         monkeypatch):
+    """The daemon starts a review's pre-checks with `ttp checks --detach` and waits for that launcher
+    while it holds the project's database write turn: the launcher only starts the checks and returns at
+    once, and the push scan (which may write the project's settings) runs in the checks themselves,
+    which then fail on a refused commit before any check runs."""
+    import sqlite3
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    trunk = subprocess.run([*git, "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True).stdout.strip()
+    p.set_config("delivery.push_branch", trunk)
+    p.set_config("delivery.public_scan_paths", [".changeset"])
+    tid = p.db.add_task("scan", kind="code", spec="Change something.")
+    monkeypatch.setenv("TTP_TASK", str(tid))
+    subprocess.run([*git, "checkout", "-q", "-b", f"ttp/t{tid}-scan"], check=True)
+    (repo / ".changeset").mkdir()
+    (repo / ".changeset/cites.md").write_text(f"Keep the rule (user msg #{40 + 2}).\n")
+    subprocess.run([*git, "add", ".changeset/cites.md"], check=True)
+    subprocess.run([*git, "commit", "-qm", "keep the rule"], check=True)
+    ran = tmp_path / "ran"
+    hold = sqlite3.connect(p.db.path, isolation_level=None)
+    hold.execute("BEGIN IMMEDIATE")   # the caller's write turn
+    try:
+        t0 = time.monotonic()
+        cli.main(["checks", "--detach", "--", f"echo x >> {ran}"])
+        assert time.monotonic() - t0 < 15, "the launcher waited on the project's database write turn"
+    finally:
+        hold.rollback()
+        hold.close()
+    assert _wait_precheck(run) == "1" and not ran.exists()
+    assert "adds a reference to a user's chat message" in (run / cli.CHECKS_OUT).read_text()

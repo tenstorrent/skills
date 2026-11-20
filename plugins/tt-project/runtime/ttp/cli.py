@@ -4437,7 +4437,9 @@ def _cmd_checks(a) -> None:
     if not top or not head:
         die("ttp checks: run it in the change's git worktree (or pass --worktree <path>)")
     print(checktree.line(head, top), flush=True)
-    if why := _checks_public_scan(p, top, head, d):
+    # The scan runs in the detached checks, not in their launcher: its caller (the daemon starting a
+    # review's pre-checks) can wait for it holding the project's write turn, which the scan may need.
+    if not getattr(a, "detach", False) and (why := _checks_public_scan(p, top, head, d)):
         die(f"ttp checks: {why}", 1)
     # A tree in the run's temporary folder is gone after the hand-off: detached checks would die with it.
     temp = checktree.temp_root(top, run_dir) if not getattr(a, "own_group", False) else ""
