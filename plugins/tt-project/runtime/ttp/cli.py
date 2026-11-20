@@ -8511,11 +8511,11 @@ def cmd_killscan(a) -> None:
     running them: such a kill can match the worker's own tool shell. Exits 1 when one is found.
     `--shim <dir>` writes logging stand-ins for those commands; put <dir> first on PATH to run the
     script without them killing anything."""
-    from . import killscan
+    from . import svcscan
     if a.shim:
         folder = Path(a.shim).resolve()
-        killscan.write_shims(folder)
-        print(f"shims for {', '.join(killscan.SHIMMED)} in {folder}; calls are logged to "
+        svcscan.write_kill_shims(folder)
+        print(f"shims for {', '.join(svcscan.KILL_SHIMMED)} in {folder}; calls are logged to "
               f"{folder / 'killscan.log'}. Run the script with: PATH={shlex.quote(str(folder))}:\"$PATH\" <script>")
     hits = 0
     for name in a.files:
@@ -8523,7 +8523,7 @@ def cmd_killscan(a) -> None:
             text = Path(name).read_text(errors="replace")
         except OSError as e:
             die(f"ttp killscan: cannot read {name}: {e.strerror or e}")
-        for n, reason, line in killscan.scan(text):
+        for n, reason, line in svcscan.kill_scan(text):
             hits += 1
             print(f"{name}:{n}: {reason}: {line}")
     if a.files:

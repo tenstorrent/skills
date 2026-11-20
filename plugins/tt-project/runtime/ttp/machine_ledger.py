@@ -964,8 +964,8 @@ def check_auto_undo(undo: Any, probe: Any = None, until_task: Any = None) -> Non
     if noop_undo(undo):
         raise ValueError("--auto-undo needs an undo that does something: a no-op undo (empty, `true`, `:` or "
                          "`none: <why>`) already closes itself once its end passes")
-    from . import killscan
-    hits = killscan.scan(str(undo))
+    from . import svcscan
+    hits = svcscan.kill_scan(str(undo))
     if hits:
         raise ValueError(f"--auto-undo refuses an undo that kills by name or pattern ({hits[0][1]}: "
                          f"`{hits[0][2][:120]}`): run unattended, it could end other work; kill by a recorded pid, "

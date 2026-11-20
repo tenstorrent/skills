@@ -38456,24 +38456,24 @@ KILLING_SCRIPT = "\n".join([
 
 
 def test_killscan_flags_every_kill_by_name_or_pattern_and_nothing_else(env):
-    from ttp import killscan
-    hits = {n: reason for n, reason, _ in killscan.scan(KILLING_SCRIPT)}
+    from ttp import svcscan
+    hits = {n: reason for n, reason, _ in svcscan.kill_scan(KILLING_SCRIPT)}
     # pgrep's pids reach kill through a variable, a later line, a loop or a pipe: the pgrep is flagged
     assert sorted(hits) == [*range(3, 14), 15, 16], hits
     assert all("pkill -f" in hits[n] for n in (3, 4, 5, 11)), hits
     assert "killall" in hits[6] and all("pgrep/pidof" in hits[n] for n in (7, 8, 9, 12, 13, 15, 16)), hits
     assert "pkill kills every process with that name" in hits[10]
     assert "absolute path" in hits[11] and "absolute path" not in hits[3]
-    assert killscan.scan("kill \"$pid\"\nwait \"$pid\"\n") == []
+    assert svcscan.kill_scan("kill \"$pid\"\nwait \"$pid\"\n") == []
     # `pkill -P <pid>` kills only that process's children; a pattern kill after it on the line still counts
-    assert killscan.scan("pkill -P $$\npkill --parent \"$pid\" -f srv\n") == []
-    assert [n for n, _, _ in killscan.scan("pkill -P $$; pkill -f srv\n")] == [1]
+    assert svcscan.kill_scan("pkill -P $$\npkill --parent \"$pid\" -f srv\n") == []
+    assert [n for n, _, _ in svcscan.kill_scan("pkill -P $$; pkill -f srv\n")] == [1]
     # ps | grep feeding kill: a PATH shim cannot stop it, so the worker is told to edit it out
-    ps = killscan.scan("kill -9 $(ps aux | grep srv | awk '{print $2}')\n"
+    ps = svcscan.kill_scan("kill -9 $(ps aux | grep srv | awk '{print $2}')\n"
                        "ps -ef | grep srv | grep -v grep | awk '{print $2}' | xargs kill\n"
                        "pids=$(/bin/ps -eo pid,args | grep srv)\nkill $pids\n")
     assert [n for n, _, _ in ps] == [1, 2, 3] and all("edit it out" in r for _, r, _ in ps), ps
-    assert killscan.scan("ps aux | grep srv\n") == [], "a ps | grep in a script that kills nothing is fine"
+    assert svcscan.kill_scan("ps aux | grep srv\n") == [], "a ps | grep in a script that kills nothing is fine"
 
 
 def test_ttp_killscan_exits_1_on_a_hit_and_its_shims_kill_nothing(env, tmp_path):
