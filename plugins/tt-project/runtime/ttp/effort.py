@@ -79,6 +79,9 @@ def device_resources(names, cfg: dict | None = None, unreadable_is_device: bool 
     machine the machine list tags `device`. An unreadable machine list makes every name a device when
     `unreadable_is_device` (the stricter guard holds), else it names none."""
     from . import locks
+    names = [n for n in names if str(n).strip()]
+    if not names:
+        return []
     out = [n for n in names if str(n).endswith("-device")]
     try:
         out += [n for n in names if n in locks.device_locks(cfg or {})]

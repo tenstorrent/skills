@@ -388,7 +388,8 @@ def test_glm_guard_still_refuses_every_ttp_write_and_an_unknown_machines_subcomm
 
 @_pytest.mark.parametrize("cmd", ['echo "$(ttp task add t s)"', 'echo "`ttp task cancel 5`"', 'x="a $(git push) b"',
                                  'echo "$(gh pr comment 1 -b hi)"', 'echo "ok `ssh h ls`"', 'echo "$(echo "$(ttp notify hi)")"',
-                                 'echo "it\'s $(ttp note --to p hi)"', 'echo "$(printf ")"; ttp notify hi)"'])
+                                 'echo "it\'s $(ttp note --to p hi)"', 'echo "$(printf ")"; ttp notify hi)"',
+                                 'echo "$(echo "\\")"; ttp notify hi)"'])
 def test_glm_guard_checks_a_substitution_inside_double_quotes_like_an_unquoted_one(cmd, tmp_path):
     from ttp import glmguard
     wt, rd = _gg_run(tmp_path)
@@ -420,6 +421,8 @@ def test_glm_guard_device_task_is_a_device_lock_or_a_machine_tagged_device(monke
         raise ValueError("unreadable")
     monkeypatch.setattr(machines, "load", broken)   # an unreadable list keeps the stricter device guard
     assert glmguard.device_task(lab("resource:cpu-1"), cfg) and not glmguard.device_task(lab(), cfg)
+    from ttp import effort   # no resource names, or only blank ones, is never device work
+    assert effort.device_resources([], cfg, True) == [] and effort.device_resources(["", "  "], cfg, True) == []
 
 
 @_pytest.mark.parametrize("write", ["ttp machines change add x y", "ttp machines set x", "ttp note --to p hi", "ttp task add t s"])

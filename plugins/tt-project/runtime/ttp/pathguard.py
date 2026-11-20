@@ -933,7 +933,9 @@ def _substitutions(text: str) -> list[str]:
             depth, j, iq = 1, i + 2, ""
             while j < len(text) and depth:
                 d = text[j]
-                if iq:
+                if d == "\\" and iq == '"':
+                    j += 1
+                elif iq:
                     iq = "" if d == iq else iq
                 elif d in "'\"":
                     iq = d
