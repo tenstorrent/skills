@@ -13261,6 +13261,8 @@ class Daemon:
                     prompt += glmwork.contract()   # so may a GLM work run (glmwork.bounce_reason)
                 on_glm = on_arm or bool(routed and routed.get(glmwork.KEY) and run_prov == routed.get("to")
                                         and not routed.get("fallback_model"))
+                if on_glm and task.get("kind") == "code":
+                    prompt += glmwork.size_check()
                 assist = glmassist.for_run(self.cfg) if on_glm else None
                 is_device = deviceplan.device(task, self.cfg)
                 if on_glm and is_device and deviceplan.on(self.cfg):   # Opus plans, GLM runs only that plan (#3728)

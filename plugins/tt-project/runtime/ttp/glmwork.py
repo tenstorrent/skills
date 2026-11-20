@@ -124,6 +124,22 @@ def contract() -> str:
             "previous attempt; no attempt is spent. On that exit never run `ttp push`, `git push` or publish anything.")
 
 
+def size_check() -> str:
+    """The prompt block a GLM run on a code task gets: the size review its change meets before it can land, run
+    by the run itself first. Reviews of GLM changes fail mostly on that lane (extra copies, dead code, tests that
+    only match text), not on correctness."""
+    return ("\n\n## Before you hand off: the size review (your change is failed on these)\n"
+            "A separate reviewer asks whether this is the smallest change that solves the task. Reread your own diff "
+            "as that reviewer before result.json, and fix what it would flag: a helper, string, rule or table that "
+            "exists once already (call it, never copy it); dead code, unused parameters, fields, imports or options; "
+            "a layer or fallback the spec did not ask for; comments that narrate history or an incident; a citation "
+            "of a spec or id that is not defined where you cite it; a test that passes without your change, asserts "
+            "only that some text is present, or repeats a rule another test asserts. Run `ttp slop --diff "
+            "<base>..HEAD` and clear what it lists. Keep every fact and behaviour the task needs: cut size, not "
+            "correctness. Never widen what a change reads or runs on a device or live service beyond what the spec "
+            "names, and bound any new read of one in time.")
+
+
 def ring_gate(cfg: dict, project: str, raw: dict | None) -> dict:
     """Apply the `glm_work` release flag (rollout.py) to `cfg`, in place, and return it. The project's own
     `route.glm_work.on` in its project.json wins as written; else the flag decides (off in doubt). With the flag
