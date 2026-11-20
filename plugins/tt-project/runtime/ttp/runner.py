@@ -352,7 +352,7 @@ def _group_left(pgid: int, keep: set[int]) -> list[dict] | None:
     return out
 
 
-def end_leftovers(pgid: int, run_dir: Path, project: str | None) -> None:
+def end_leftovers(pgid: int, run_dir: Path) -> None:
     """Once the agent ended: what is left of its process group (tools it left running; `ttp detach`
     jobs, detached checks and pushes run in their own sessions and are not in it; a pid its hand-off
     lists in leftover_procs with how and when it stops stays)."""
@@ -376,10 +376,10 @@ def end_leftovers(pgid: int, run_dir: Path, project: str | None) -> None:
         print(f"runner: could not end the run's leftover processes: {type(e).__name__}: {e}", flush=True)
 
 
-def end_leftovers_within(pgid: int, run_dir: Path, project: str | None) -> bool:
+def end_leftovers_within(pgid: int, run_dir: Path) -> bool:
     """end_leftovers in a thread, waited on for at most END_LEFTOVERS_S: a /proc read of a hung process
     never holds the run's exit.json. False when it was left running (it ends with the runner)."""
-    t = threading.Thread(target=end_leftovers, args=(pgid, run_dir, project), name="end leftovers", daemon=True)
+    t = threading.Thread(target=end_leftovers, args=(pgid, run_dir), name="end leftovers", daemon=True)
     t.start()
     t.join(END_LEFTOVERS_S)
     if t.is_alive():
@@ -881,7 +881,7 @@ def supervise(run_dir: Path) -> int:
             watchdog.wait(timeout=10)
         except subprocess.TimeoutExpired:
             pass
-    end_leftovers_within(child.pid, run_dir, env_extra.get("TTP_PROJECT"))
+    end_leftovers_within(child.pid, run_dir)
     remove_files(spec.get("private_files") or [])
     remove_tmp(run_dir, spec)
     if held:

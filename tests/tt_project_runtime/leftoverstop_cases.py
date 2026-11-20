@@ -376,7 +376,7 @@ def test_a_hung_run_end_cleanup_never_holds_the_runner(env, tmp_path, monkeypatc
     monkeypatch.setattr(runner, "END_LEFTOVERS_S", 0.3)
     try:
         t0 = time.monotonic()
-        ok = runner.end_leftovers_within(0, tmp_path, str(p.base))
+        ok = runner.end_leftovers_within(0, tmp_path)
         assert ok is False and time.monotonic() - t0 < 3.0
     finally:
         gate.set()

@@ -13001,7 +13001,7 @@ def _log_account_change(key: str, old, new) -> None:
     print(f"logged in {accountset.log_path()}; undo: {undo}")
 
 
-def _user_only_change(raw: dict, key: str, val, p=None) -> str | None:
+def _user_only_change(raw: dict, key: str, val) -> str | None:
     """The user-only setting (coordinator.NEEDS_USER) that writing `val` at `key` into the project.json
     `raw` would change, or None. A parent key (`budget`, `delivery`) counts through what it holds, and
     turning a SAFE_WHEN_OFF switch off is the safe direction, as in the coordinator's own gate."""
@@ -13208,7 +13208,7 @@ def cmd_config(a) -> None:
             die(str(e), 2)
     from . import configwho
     setter, grant = configwho.from_env(), None
-    if run and (k := _user_only_change(p.raw_config(), a.key, val, p)):
+    if run and (k := _user_only_change(p.raw_config(), a.key, val)):
         # A run can be steered by text it reads; these change only in a coordinator turn that carries
         # the user's yes (coordinator.NEEDS_USER), as `ttp say` is refused inside a run, or for a dollar
         # cap, on the user's own logged message carrying the setting itself (capword).
@@ -13249,7 +13249,7 @@ def _config_remove(p, key: str, run) -> None:
             or key.startswith("runner.host_commands.")) and configwho.from_env()["by"] == "worker":
         die("runner.host_commands (the commands `ttp host-run` may run outside the sandbox) is set only by "
             "the user or the coordinator, never by a worker: name the exact command in your hand-off")
-    if run and (k := _user_only_change(p.raw_config(), key, None, p)):
+    if run and (k := _user_only_change(p.raw_config(), key, None)):
         _refuse_user_only_in_run(k)
     was = configwho.at(p.raw_config(), key)
     try:
