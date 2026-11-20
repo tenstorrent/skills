@@ -1,6 +1,20 @@
-# Advanced Performance Optimizations for Models
+# Trace and multiple command queues (upstream guide)
 
-Note: the upstream Markdown referenced local figure images that are not present in the upstream skill directory. This copy keeps the text and code examples and omits those broken image tags.
+A copy of tt-metal's `tech_reports/AdvancedPerformanceOptimizationsForModels/AdvancedPerformanceOptimizationsForModels.md`,
+without its figures; in a target checkout, prefer the current original. It covers trace APIs, two command queues and
+their combination for fixed-shape models. Generative decode, warmup and the allocation checks a bringup needs are in
+[tracing](tracing.md) and [tt-enable-tracing](../../tt-enable-tracing/SKILL.md). Cautions for bringups:
+
+- The examples run `run_model` once before capture. A model with several shapes, modes or slots must warm every
+  variant before the first capture ([tracing](tracing.md)).
+- Section 1.3.2 and the trace-plus-multi-CQ examples deliberately reuse a non-persistent L1 address for the trace
+  input. Under `TT_METAL_TRACE_ALLOC_TRACKING=1` that buffer is an unsafe live allocation at replay; it needs an
+  exact-tensor acknowledgment with a lifetime proof (tt-enable-tracing, allocation safety gate), or a persistent DRAM
+  input instead.
+- The guide says the trace region size must be found by hand (capture fails and reports the size needed). Newer
+  revisions also accept `trace_region_size=0`: traces then go into dynamic top-down DRAM buffers, and capture fails
+  if one could overlap replay memory, in which case a reserved region is needed (`TraceCorrectness.md` in the same
+  directory).
 
 ## Contents
 

@@ -36,5 +36,24 @@ to block it; an explicit `ttnn.DRAM_MEMORY_CONFIG` on a decode intermediate is a
 matmuls. A candidate that hangs or fails PCC is rejected on its own; the rest of the sweep continues after device
 recovery ([tt-device-usage](../../tt-device-usage/SKILL.md)).
 
-**Reference implementation:** `models/demos/gpt_oss/tt/experts/` (decode, prefill, weights, config) and
-`models/demos/gpt_oss/tt/topk.py`.
+**Reference implementation:** `models/demos/gpt_oss/tt/experts/` (README, decode, prefill, weights, config),
+`models/demos/gpt_oss/tt/topk.py` and `models/demos/gpt_oss/tests/unit/test_modules.py`. The pattern: router top-k
+scores as a sparsity tensor, `ttnn.sparse_matmul` for the gate/up/down active-expert projections, score weighting,
+`ttnn.sum` or the model's reduce over experts, and only then any TP or EP collective. Galaxy-only fused MoE paths
+need evidence that the target hardware and ops support them.
+
+## Experts on a mesh
+
+Placement options: tensor-parallel experts (each active expert split over the devices), expert-parallel placement
+(each device owns some experts), 2D TP, expert replication across device groups, or a hybrid. Which is faster
+depends on batch and routing spread (above), so the choice is measured on full-model step time.
+
+Expert mapping, routing-weight layout, shared-expert placement, sparse weight layout, DRAM/L1 memory configs,
+semaphores and preallocated buffers, and the final residual layout are correctness contracts. Gate and expert MLPs
+passing separately is not enough: validate router, sparse expert projection, score weighting, expert reduce and
+the TP/EP collective as one sequence.
+
+On Galaxy 4x8, GPT-OSS throughput experts (`models/demos/gpt_oss/tt/experts_throughput/`: config, weights,
+decode, fused_decode) dispatch tokens to expert owners along one axis and use the other axis as replicated expert
+groups or TP groups for single-user throughput. Replication multiplies expert memory: it fits only when a memory
+plan for all layers plus the full KV cache at the target maximum sequence length shows it, not one decoder layer.

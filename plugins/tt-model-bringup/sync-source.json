@@ -169,7 +169,7 @@
       "destination": "skills/graph-fusing/SKILL.md",
       "blob": "dfdc9e58fe3dc32637a06f28b6fa4da7a393a42b",
       "source_sha256": "4b487b8032b056b83b9bb099b51464044561919b773295d8c563ffcacb014602",
-      "packaged_sha256": "6cb627170ab4fd905a434408c4f9c47ab6c4e13822cef6f01c1bc872ed068f77"
+      "packaged_sha256": "76e41c1fa73871642e10025e44c731b44cdd302c29c6d4a63483ef6133731009"
     },
     {
       "source": ".agents/skills/graph-fusing/agents/openai.yaml",
@@ -183,7 +183,7 @@
       "destination": "skills/multichip/SKILL.md",
       "blob": "664b6e6b1383d948226185bfa7ba139b9ff1c9b2",
       "source_sha256": "a7430e0f96204dfcd0b70aa689ee88d8ddf61e37a9260ffdfae6ca799f6e6494",
-      "packaged_sha256": "4e62e48f45c90220f94b35b57a8f8a5d658fa28a5bc191c9db0fa1bb32ee77b7"
+      "packaged_sha256": "8d5848fb04259e2b5206def3f4d6b41c10bac1addaef82db30ee0965c2f807a1"
     },
     {
       "source": ".agents/skills/multichip/agents/openai.yaml",
@@ -253,14 +253,14 @@
       "destination": "skills/tt-enable-tracing/SKILL.md",
       "blob": "379f135ff209af802207532f5ad1dc1a88a70627",
       "source_sha256": "2b708c499a67a0fccd6618d6f0c2956f532605b5643c6d70e18a5c70f5bbb1da",
-      "packaged_sha256": "ae1ef9a8b5718079189cef615677b5a7ba7add6f8bdf7e43d3bd33ad39b9a875"
+      "packaged_sha256": "086a76754828cdacc1715cec169a03d5bc3909d742c28a600a3ff9a986d626fe"
     },
     {
       "source": ".agents/skills/tt-enable-tracing/advanced_perf_optimizations.md",
-      "destination": "skills/tt-enable-tracing/advanced_perf_optimizations.md",
+      "destination": "skills/ttnn-knowledge/topics/trace-multi-cq.md",
       "blob": "af91f047ec8e25674935451dc0cafc7d874aeb56",
       "source_sha256": "45c3ccebf9636cf19af8242d5af403ec1a3586cda1edaaa3d74c0d26bcd59a0f",
-      "packaged_sha256": "553f0c236d85da14c7a0ecf7bbff1839defea7917538db72d0a02443cd116282"
+      "packaged_sha256": "0dbf27789360f425e2d3bdee82b8ba26ee95f838dcc62ea7dc9bb7a89d792b78"
     },
     {
       "source": ".agents/skills/tt-enable-tracing/agents/openai.yaml",

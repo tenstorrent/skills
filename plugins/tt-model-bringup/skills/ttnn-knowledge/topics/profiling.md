@@ -2,7 +2,7 @@
 
 ## Measuring traced runs
 
-- Open the device with a zero trace region, for example `trace_region_size=0`, TTNN can auto-detect the right size these days.
+- Open the device with `trace_region_size=0` where the revision supports it: traces then go into dynamic DRAM buffers, and capture fails if one could overlap replay memory, in which case reserve a region ([tracing](tracing.md)).
 - Use the pattern: compile/warmup, synchronize, signpost start, execute warmed trace or warmed measured path, synchronize once, signpost end.
 - Copy the newest Tracy ops CSV to the git-ignored `bringup/artifacts/<stage>/` and run `tt-perf-report` with start/end signposts for the measured window; only its report goes into the evidence directory.
 - `tt-perf-report --csv` may expose filtered kernel time as `Device Time` in microseconds rather than raw nanoseconds; convert accordingly and note the column used.
