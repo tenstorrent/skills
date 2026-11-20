@@ -20,7 +20,8 @@ Everything but `on_policy` needs only the checkpoint: start it in the background
 capped threads, pause it during performance measurements, write results incrementally and its state to
 `doc/reference/corpus_status.json`; any later goal resumes it from there, and goal 6b finishes what is
 missing (each goal is a separate session, so a background process may not survive). If the model
-does not fit in host RAM, use a GPU reference and say so. Token ids are frozen once written.
+does not fit in host RAM, run it one layer at a time over all sequences (load a layer's weights,
+keep the activations), or use a GPU reference, and say which. Token ids are frozen once written.
 
 ## Comparison
 
