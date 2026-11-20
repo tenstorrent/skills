@@ -59,7 +59,7 @@ def main() -> int:
             print(f"NOTE: no commit touches {model_rel} yet; nothing to check", file=sys.stderr)
             return 0
         parents = git("rev-list", "--parents", "-n", "1", first[0]).split()[1:]
-        base = parents[0] if parents else "4b825dc642cb6eb9a060e54bf8d69288fbee4904"  # git's empty tree
+        base = parents[0] if parents else first[0]  # a root commit: count changes after it
         rc = 1
         print(f"ADVISORY: inputs.json has no base_commit; using the parent of the first commit touching {model_rel}",
               file=sys.stderr)
