@@ -62,3 +62,5 @@ code +170: the devq fence says to queue device jobs at task start, that a runner
 question +170: the devq fence says to queue device jobs at task start, that a runner's prewarm builds off the device, and that a broker call over 1500 s is refused (#8778)
 every +265: the ETA format a worker posts and the devq fence's further lines on every-feature prompts (#8771, #8778)
 every +103: device profiling points to the optional tt-profiler skill, else tt-metal's docs (user msg #3783)
+every +45: a fix on an unlanded stack hands off done, never waiting on its own stack landing
+code +40: a fix on an unlanded stack hands off done, never waiting on its own stack landing (the line counts in the code prompt too)

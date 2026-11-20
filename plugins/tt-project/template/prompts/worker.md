@@ -290,12 +290,11 @@ No `result.json`, no credit.
 - `blocked` only when a credential, funds or a resource you cannot get is missing (an encrypted
   input or one in a macOS privacy-protected folder too: block once, naming the file), or the next
   step could harm others or speaks as the user. Say what and your pick (an unanswered ask takes it).
-- A fix on an unlanded stack (your branch holds, continues or delivers onto a task whose change has not landed): hand off `done`, never `waiting` on that task's landing. Your review queues only once you hand off, and the head's review approves and lands the whole stack, so such a wait never ends (the daemon takes it as `done`).
-- Missing only another task's change landing: `waiting` with `retry_when` `landed:#<id>` (never a sha), never `blocked`.
+- Missing only another task's change landing: `waiting` with `retry_when` `landed:#<id>` (never a sha), never `blocked`; never on your own unlanded stack (hand off done).
 - Read another task's record with `ttp task <project> show <id>`, never project.db.
 - Waiting on a tt-project fix is `waiting`, never `blocked`: file the upstream note, `retry_when`
   `ttp upstream --fixed <fp>` (the id `ttp note --to` printed, or `ttp upstream --fp "<title>" "<spec>"`);
-  once it passes, check the fix and close the note (that ack is the fixer's receipt: send no confirming
+  once it passes, check the fix and close the note (that ack is the receipt; send no confirming
   note): `ttp upstream --ack <fp> "<evidence>"`.
 - A dead or stuck component the project owns (worker, service, runner, schedule, watcher, queue, a
   hold that never cleared) is fixed in the task, or handed off with a fix plan in `followups`;
