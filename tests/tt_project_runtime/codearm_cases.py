@@ -1327,3 +1327,19 @@ def test_a_covered_follow_up_of_a_claude_arm_change_is_decided_afresh_except_in_
     again = _ca_task(p)   # outside the work route a lineage always keeps its parent's arm
     p.db.set_kv(f"{codearm.ARM_KV}{again['id']}", {"arm": "claude", "why": "conclusion", "seed": "s", "ts": 1.0})
     assert follow(again, plain)["arm"] == "claude"
+
+
+def test_a_review_of_a_change_touching_a_listed_file_names_it_on_a_covered_project_only(env):
+    from ttp import configwho, policyfiles
+    p = make(env)
+    (p.harness / policyfiles.FILE).write_text("src/policy_module.py\n")
+    p.set_config("core_provider", "claude")
+    _, _, _, (rev,) = _finish_code(env, p, "plain", {"src/other.py": 3})
+    assert "policy files" not in rev["spec"]
+    _, _, _, (rev,) = _finish_code(env, p, "listed", {"src/policy_module.py": 3})
+    assert "policy files" not in rev["spec"]   # not covered: the old pin keeps such a task on Claude, no note
+    p.set_config("route.glm_work", {"on": True, "model": "example-org/GLM-9", "holdout": 0}, by=configwho.by("user", via="cli"))
+    _, _, _, (rev,) = _finish_code(env, p, "listed again", {"src/policy_module.py": 3})
+    assert "touches policy files" in rev["spec"] and "src/policy_module.py" in rev["spec"] and "line by line" in rev["spec"]
+    _, _, _, (rev,) = _finish_code(env, p, "plain again", {"src/other.py": 3})
+    assert "touches policy files" not in rev["spec"]

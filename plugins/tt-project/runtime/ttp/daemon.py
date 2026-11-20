@@ -20497,6 +20497,9 @@ class Daemon:
                 log(self.p, f"task {task['id']}: its size against its own base was not read: {e}")
             if size := splitgate.review_line(cfg, task, changes, base=based):
                 lines.append(size)
+        if not ext and not published and branch and self._code_change(task) \
+                and (note := policyfiles.review_line(self.p, task, branch)):
+            lines.append(note)
         lane = None   # the ponytail lane's label, for a code change (sa50: _code_change is the predicate)
         if ponytail.on(cfg) and self._code_change(task):
             added = None

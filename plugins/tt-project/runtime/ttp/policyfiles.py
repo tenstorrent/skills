@@ -158,3 +158,18 @@ def bounce_diff(p, task: dict, patterns: list[str], changed: dict | None) -> str
     except Exception:   # the evidence and reset are best effort: the refusal stands
         pass
     return "policy files touched: " + ", ".join(found)[:240]
+
+
+def review_line(p, task: dict, branch: str) -> str:
+    """A review note naming the listed policy files a change touches ('' for none, no list or no readable diff): on a
+    project the GLM work route covers they are written on GLM and not bounced, so the reviewer looks at them closely."""
+    from . import glmwork
+    if not branch or not glmwork.settings(p.config()):
+        return ""
+    try:
+        patterns = load(p.harness)
+        found = hits(patterns, task_diff(p, task, branch)[1] or {}) if patterns else []
+    except Exception:   # best effort: the review goes on without the note
+        return ""
+    return ("It touches policy files (harness/" + FILE + "): " + ", ".join(found)[:240] + ". They are written on GLM and "
+            "not bounced to Opus here; review these files line by line.") if found else ""
