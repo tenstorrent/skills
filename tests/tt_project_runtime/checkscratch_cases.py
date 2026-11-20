@@ -171,6 +171,17 @@ def test_only_ram_disk_check_dirs_count_as_ours(env, tmp_path, monkeypatch):
     assert not good.exists() and (victim / "keep").exists()
 
 
+def test_a_fenced_worker_may_write_the_ram_disk_check_dirs_and_its_own_temp_stays_under_tmp(env, tmp_path,
+                                                                                           monkeypatch):
+    """A worker starts checks itself: its sandbox grants the RAM disk's ttp-<uid> beside /tmp's, or its
+    checks could not make their scratch there."""
+    from ttp import shorttmp
+    ram = _ram_disk(tmp_path, monkeypatch)
+    roots, run_env = _codex_worker_launch(env, make(env), env["repo"])
+    assert str(ram) in roots and str(shorttmp.root()) in roots, roots
+    assert pathlib.Path(run_env["TMPDIR"]).parent == shorttmp.root()
+
+
 def _sized_repo(tmp_path, name, files):
     """A committed repo holding `files` (relative path -> bytes)."""
     repo = tmp_path / name

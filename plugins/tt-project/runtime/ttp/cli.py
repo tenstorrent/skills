@@ -1985,6 +1985,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
         lines.append(f"  running {since(w['started'], now)}: {what}" + batchrun.words(w.get("batch"))
                      + (f" ({w['wake']} wake)" if w.get("wake") else "")
                      + (f" [{w['floor']}]" if w.get("floor") else "")
+                     + (f" [sandbox {w['sandbox']}]" if w.get("sandbox") else "")
                      + (f" [on {w['model']}]" if "(stand-in for " in str(w.get("model") or "") else "")
                      + (f" [{topup.words(topped[w['task']])}]" if w["task"] in topped else "")
                      + (f" — {w['note']}" if w["note"] else ""))
@@ -4898,7 +4899,7 @@ def _cmd_checks(a) -> None:
         # The priority its checks run at here, with its settings, once per run (a remote host's: remotecheck).
         from . import testslots
         prio_line = [testslots.priority_line(cfg)] if any(not push.remote_host(c) for c in todo) else []
-        for line in [] if hit or handover else prio_line:
+        for line in [] if hit or handover else [*push.sandbox_lines(todo), *prio_line]:
             print(f"ttp checks: {line}", flush=True)
             out.write(f"ttp checks: {line}\n")
         # Local checks run in a clean checkout of `head` (cleantree), never in this worktree, whose
@@ -8240,9 +8241,9 @@ def cmd_broker_released(a) -> None:
 
 
 def cmd_sandbox(a) -> None:
-    """Run one command as it is (a pass-through; the tool hook's refusals apply to it as to any command):
-    a pytest -n takes its workers from the host's test slots, and sudo is watched (sandbox.py). Exits
-    with the command's code."""
+    """Run one command as it is, by default (a pass-through; the tool hook's refusals apply to it as to
+    any command). Where the project turned the process sandbox on (sandbox.py, sandbox.checks) it runs
+    in its own PID namespace and /proc instead, or as it is with a line why. Exits with the command's code."""
     from . import sandbox
     cmd = a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd
     if not cmd:
@@ -8532,6 +8533,8 @@ def cmd_leftover_procs(a) -> None:
     """A hand-off check (worker.handoff_checks): exit 1 while a done hand-off's task still has live
     processes in its own worktree (leftoverprocs.py), 0 when it has none, 2 when it cannot tell."""
     from . import leftoverprocs
+    if a.sandboxes:
+        sys.exit(_leftover_sandboxes(a))
     if a.stop is not None:
         sys.exit(_leftover_stop(a))
     path = a.result or os.environ.get("TTP_RESULT_JSON") or ""
@@ -8549,6 +8552,36 @@ def cmd_leftover_procs(a) -> None:
     if msg:
         print(msg)
     sys.exit(rc)
+
+
+def _leftover_sandboxes(a) -> int:
+    """`ttp leftover-procs --sandboxes [--dry-run]`: end this project's sandbox trees (bwrap with its proxy
+    listeners) whose runs have ended and that nothing owns any more (sandboxreap). 0 when none is left, 2 when
+    one is kept (a guarded, foreign or device member, or a walk past its time: sandboxreap.reap stops
+    starting trees after RUNNER_S) or this caller cannot see the host's processes."""
+    from . import sandboxreap
+    from .push import _boxed
+    p = Project(os.environ["TTP_PROJECT"]) if os.environ.get("TTP_PROJECT") else here()
+    if p is None:
+        die("ttp leftover-procs --sandboxes: no project here; run it from the project root")
+    if not sandboxreap.ls.PROC.is_dir() or _boxed():
+        print("ttp leftover-procs --sandboxes: this caller cannot see the host's processes (no /proc, or a PID "
+              "namespace); the daemon's sweep ends them", file=sys.stderr)
+        return 2
+    found, kept = sandboxreap.reap(p.base, sandboxreap.run_ended(p), sandboxreap.ls._guarded(p),
+                                   lambda pid, env: sandboxreap.ls._untouchable(p, pid, env), dry=a.dry_run,
+                                   stop=(cut := []).append)
+    for t in found:
+        print(f"{'would end' if a.dry_run else 'ended'} sandbox tree {t['root']} of run {Path(t['run_dir']).name}: "
+              f"{len(t['members'])} process{'es' if len(t['members']) != 1 else ''}")
+    for k in kept:
+        where = f" of run {Path(k['run_dir']).name}" if k['run_dir'] else ""
+        print(f"kept sandbox tree {k['root'] or '(host scan)'}{where}: {k['why']}", file=sys.stderr)
+    if cut:
+        print(f"ttp leftover-procs --sandboxes: stopped after {sandboxreap.RUNNER_S:.0f} s; run it again for the "
+              "rest, or the daemon's sweep ends them", file=sys.stderr)
+    print(sandboxreap.summary(found, "would end" if a.dry_run else "ended"))
+    return 2 if kept or cut else 0
 
 
 def _leftover_stop(a) -> int:
@@ -8872,6 +8905,11 @@ def cmd_lock(a) -> None:
     up exits 75: the task hands back `waiting` with retry_when `ttp lock --probe <resource>`. A paused
     resource exits 75 as well. In a `ttp detach` job, or a background (`nohup ... &`) driver that no longer
     runs under the run's agent, there is no cap.
+    A worker's `ttp lock` (project.in_run) is freed from the sandbox for the lock only (privlock.py): it
+    refuses, exit 2, a command that runs sudo, su, doas, pkexec or run0 on this host, or a root-owned
+    service's client that can change its state (docker, root podman, system-scope systemctl, service,
+    busctl, loginctl, machinectl; `ttp host-run` runs the ones config runner.host_commands allows), and
+    runs any other with no_new_privs set.
     `ttp lock --probe <resource>` exits 0 when the resource is free, not paused, not reserved and
     nobody queues for it, else 75; with --shared, when no exclusive holder or waiter has it and it is
     neither paused nor reserved. Outside any project, `--probe` answers for a resource `ttp machines`
@@ -8897,6 +8935,12 @@ def cmd_lock(a) -> None:
     a.probe = a.probe or a.json
     if not cmd and not a.probe:
         die("usage: ttp lock [--disruptive] <resource> -- <command...>  |  ttp lock --probe <resource>")
+    from . import privlock
+    if cmd and in_run() and privlock.sandboxed_run():
+        # Freed from the sandbox for the lock only: a privileged command goes through `ttp host-run`.
+        if why := privlock.refusal(cmd):
+            die(why, 2)
+        privlock.no_new_privs()
     names = list(dict.fromkeys(n for n in a.resource.split(",") if n))
     if not names:
         die("usage: ttp lock [--disruptive] <resource>[,<resource>...] -- <command...>", 2)
@@ -10704,7 +10748,7 @@ def _launcher_stop(what: str, rc: Path) -> int:
         return 2
     if _boxed():
         print(f"ttp detach --stop: {f} names a launcher's driver, but its process cannot be seen from inside a "
-              "sandbox; run it outside this command's sandbox", file=sys.stderr)
+              "sandbox; run it outside `ttp sandbox`", file=sys.stderr)
         return 3
     try:
         state, pid, detail = launcherstop.identify(f, env.get("TTP_PROJECT"))
@@ -10736,7 +10780,7 @@ def _launcher_registered_stop(p: Project, folder: Path, glob: str, argv: list[st
     from .push import _boxed
     if _boxed():
         print(f"ttp detach --stop: {folder} is a launcher's job, but its processes cannot be seen from inside a "
-              "sandbox; run it outside this command's sandbox", file=sys.stderr)
+              "sandbox; run it outside `ttp sandbox`", file=sys.stderr)
         return 3
     caller = os.environ.get("TTP_TASK") or ""
     r = launcherstop.registered_stop(p, folder, glob, argv, p.root, "stop requested by `ttp detach --stop`"
@@ -13009,12 +13053,15 @@ def _log_account_change(key: str, old, new) -> None:
     print(f"logged in {accountset.log_path()}; undo: {undo}")
 
 
-def _user_only_change(raw: dict, key: str, val) -> str | None:
+def _user_only_change(raw: dict, key: str, val, p=None) -> str | None:
     """The user-only setting (coordinator.NEEDS_USER) that writing `val` at `key` into the project.json
     `raw` would change, or None. A parent key (`budget`, `delivery`) counts through what it holds, and
-    turning a SAFE_WHEN_OFF switch off is the safe direction, as in the coordinator's own gate."""
+    turning a SAFE_WHEN_OFF switch off is the safe direction, as in the coordinator's own gate (a sandbox
+    key, SANDBOX_KEYS: any value but on, removing it too); so is clearing a superseded sandbox value of
+    project `p` (sandboxstate.clears_superseded)."""
     import copy
-    from .coordinator import NEEDS_USER, SAFE_WHEN_OFF
+    from . import sandboxstate
+    from .coordinator import NEEDS_USER, SAFE_WHEN_OFF, SANDBOX_KEYS, sandbox_on
 
     def at(node, dotted):
         for part in dotted.split("."):
@@ -13035,7 +13082,9 @@ def _user_only_change(raw: dict, key: str, val) -> str | None:
         if k != key and not k.startswith(key + ".") and not key.startswith(k + "."):
             continue
         new = at(after, k)
-        if new != at(raw, k) and not (k in SAFE_WHEN_OFF and new in (False, "", [])):
+        if new != at(raw, k) and not (k in SAFE_WHEN_OFF and new in (False, "", [])) \
+                and not (k in SANDBOX_KEYS and not sandbox_on(new)) and not (
+                new in (None, False) and sandboxstate.clears_superseded(p, k, new)):
             return k
     return None
 
@@ -13061,6 +13110,9 @@ def _no_spill_run_refusal(key: str, value: str) -> str:
 
 def _refuse_user_only_in_run(key: str) -> None:
     from . import capword
+    from .coordinator import SANDBOX_KEYS, sandbox_refusal
+    if key in SANDBOX_KEYS:
+        die(sandbox_refusal(key) + "; `ttp config` refuses turning it on inside a run")
     die(f"{key} is a setting only the user may change, and `ttp config` refuses to set it inside a run; "
         f"reading it still works. Name the value you need in the hand-off (a followup or the question) "
         f"so the coordinator can ask the user"
@@ -13073,7 +13125,7 @@ def cmd_chat_settable(key: str, value: str | None) -> None:
     value, checked as config_set checks it), without setting anything; `list` prints every accepted key.
     Exit 0 when accepted, 1 when refused."""
     from . import chatset
-    from .coordinator import USER_SETTABLE, settable
+    from .coordinator import SANDBOX_KEYS, USER_SETTABLE, sandbox_on, sandbox_refusal, settable
     if key == "list":
         from . import accountset
         print("\n".join([*sorted([*USER_SETTABLE, *accountset.KEYS]), *chatset.PATTERNS]))
@@ -13086,6 +13138,8 @@ def cmd_chat_settable(key: str, value: str | None) -> None:
             except ValueError:
                 val = value
             val = conv(val)
+        if key in SANDBOX_KEYS and (value is None or sandbox_on(val)):   # only its off value is chat's
+            raise ValueError(sandbox_refusal(key))
     except (ValueError, TypeError) as e:
         print(f"refused: {e}" if str(e).startswith(key) else f"{key}: refused: {e}")
         sys.exit(1)
@@ -13216,7 +13270,7 @@ def cmd_config(a) -> None:
             die(str(e), 2)
     from . import configwho
     setter, grant = configwho.from_env(), None
-    if run and (k := _user_only_change(p.raw_config(), a.key, val)):
+    if run and (k := _user_only_change(p.raw_config(), a.key, val, p)):
         # A run can be steered by text it reads; these change only in a coordinator turn that carries
         # the user's yes (coordinator.NEEDS_USER), as `ttp say` is refused inside a run, or for a dollar
         # cap, on the user's own logged message carrying the setting itself (capword).
@@ -13257,7 +13311,7 @@ def _config_remove(p, key: str, run) -> None:
             or key.startswith("runner.host_commands.")) and configwho.from_env()["by"] == "worker":
         die("runner.host_commands (the commands `ttp host-run` may run outside the sandbox) is set only by "
             "the user or the coordinator, never by a worker: name the exact command in your hand-off")
-    if run and (k := _user_only_change(p.raw_config(), key, None)):
+    if run and (k := _user_only_change(p.raw_config(), key, None, p)):
         _refuse_user_only_in_run(k)
     was = configwho.at(p.raw_config(), key)
     try:
@@ -14397,6 +14451,7 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
         print(undone)
     _restore_cut_runtime(h)
     left = _commit_local_changes(p, ident)
+    _untrack_placeholders(p, ident)
     base = _git(h, "rev-parse", "HEAD")     # the merge is checked against this; main must not move meanwhile
     upjournal.step(p, "committed", base=base)
     try:
@@ -14671,8 +14726,18 @@ def _commit_local_changes(p: Project, ident: list[str]) -> list[str]:
     running = _running_harness_start(p)
     kept_out = _keep_out_runtime_data(h, running[0] if running else None)
     if not running:
-        _git(h, "add", "-A")
+        # Excluded by name, never added: in a sandboxed run they are device nodes `git add` fails on. An
+        # exclude naming an ignored path fails the add too, so only changed, unignored ones are named.
+        from .providers.claude import SANDBOX_PLACEHOLDERS
+        fenced = names("--literal-pathspecs", "ls-files", "-z", "--others", "--modified", "--deleted",
+                       "--exclude-standard", "--", *SANDBOX_PLACEHOLDERS)
+        _git(h, "add", "-A", "--", ".", *(f":(top,literal,exclude){n}" for n in sorted(fenced)))
         files = sorted(names("diff", "--cached", "--name-only", "--no-renames", "-z", "HEAD"))
+        if staged := [n for n in files if _sandbox_path(n)]:      # a worker's `git add -A` staged them
+            _git(h, "--literal-pathspecs", "reset", "-q", "--", *staged)
+            files = sorted(names("diff", "--cached", "--name-only", "--no-renames", "-z", "HEAD"))
+        if fenced := sorted(fenced | set(staged)):
+            _note_fenced(h, fenced)
         if plans := _refresh_plan_digests(p, files):
             _git(h, "--literal-pathspecs", "add", "--", *plans)
             files = sorted(names("diff", "--cached", "--name-only", "--no-renames", "-z", "HEAD"))
@@ -14683,6 +14748,11 @@ def _commit_local_changes(p: Project, ident: list[str]) -> list[str]:
 
     changed = (names("ls-files", "-z", "--modified", "--others", "--deleted", "--exclude-standard")
                | names("diff", "--cached", "--name-only", "--no-renames", "-z", "HEAD"))
+    if fenced := sorted(n for n in changed if _sandbox_path(n)):
+        _note_fenced(h, fenced)
+        if staged := sorted(set(fenced) & names("diff", "--cached", "--name-only", "--no-renames", "-z", "HEAD")):
+            _git(h, "--literal-pathspecs", "reset", "-q", "--", *staged)     # else the worker's commit takes them
+        changed -= set(fenced)
     old, left = [], []
     for n in sorted(changed):
         try:
@@ -14707,6 +14777,89 @@ def _commit_local_changes(p: Project, ident: list[str]) -> list[str]:
         print(f"left {len(left)} file(s) changed since harness task #{tid}'s run started for it to commit: "
               f"{', '.join(left[:10])}" + (f" and {len(left) - 10} more" if len(left) > 10 else ""))
     return left
+
+
+def _sandbox_path(n: str) -> bool:
+    """Whether repo path `n` is one the worker sandbox mounts over (providers.claude.SANDBOX_PLACEHOLDERS),
+    or lies under one."""
+    from .providers.claude import SANDBOX_PLACEHOLDERS
+    return any(n == s or n.startswith(s + "/") for s in SANDBOX_PLACEHOLDERS)
+
+
+def _placeholder_file(path: Path) -> bool:
+    """An empty regular file, or a directory holding only such files (and empty directories): what the
+    sandbox leaves behind as a mount point. A missing path counts too (a deletion carries no content)."""
+    try:
+        if path.is_symlink():
+            return False
+        if path.is_dir():
+            return all(_placeholder_file(c) for c in path.iterdir())
+        return path.stat().st_size == 0
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+
+
+def _note_fenced(h: Path, fenced: list[str]) -> None:
+    """Changes to sandbox placeholder paths stay out of the pre-upgrade commit: committed, they break every
+    checkout and rebase in a sandboxed task worktree. Ones with real content are named, for their owner."""
+    real = [n for n in fenced if not _placeholder_file(h / n)]
+    if real:
+        print(f"left out of the pre-upgrade commit: {len(real)} change(s) to paths the worker sandbox mounts "
+              f"over, which hold content: {', '.join(real[:10])}" + (f" and {len(real) - 10} more" if len(real) > 10
+                                                                     else "") + "; commit them yourself if wanted")
+
+
+def _untrack_placeholders(p: Project, ident: list[str]) -> str:
+    """A harness whose pre-upgrade commit once swept in the sandbox's placeholder files (empty files at
+    the paths it mounts over) fails every checkout and rebase of a sandboxed task worktree on them. Each
+    such tracked path that is empty (an empty blob, or a tree of only empty blobs) is untracked in one
+    commit, built in a scratch index so nothing else staged goes in; the files stay on disk, untracked
+    (one may be a running worker's mount point). A path with content is kept and named. Nothing to do
+    when none matches. Returns the commit's sha, or ""."""
+    from .providers.claude import SANDBOX_PLACEHOLDERS
+    h = p.harness
+    tree: dict[str, list[tuple[str, str]]] = {}
+    out = gitmemo.run(["git", "-C", str(h), "ls-tree", "-r", "-l", "-z", "HEAD", "--", *SANDBOX_PLACEHOLDERS],
+                      capture_output=True, text=True, check=True,
+                      timeout=gitmemo.timeout(None, ("ls-tree",))).stdout
+    for entry in out.split("\0"):
+        meta, _, path = entry.partition("\t")
+        top = next((s for s in SANDBOX_PLACEHOLDERS if path == s or path.startswith(s + "/")), None) if path else None
+        if top:
+            mode, size = meta.split()[0], meta.split()[-1]
+            tree.setdefault(top, []).append((mode, size))
+    drop = sorted(s for s, ents in tree.items() if all(m in ("100644", "100755") and z == "0" for m, z in ents))
+    if kept := sorted(set(tree) - set(drop)):
+        print(f"kept {len(kept)} tracked path(s) the worker sandbox mounts over, which hold content: "
+              f"{', '.join(kept)}")
+    if not drop:
+        return ""
+    idx = p.state / "upgrade-placeholder-index"
+    env = {**os.environ, "GIT_INDEX_FILE": str(idx)}
+
+    def git(*args: str) -> str:
+        return gitmemo.run(["git", "-C", str(h), *args], capture_output=True, text=True, check=True,
+                           env=env, timeout=gitmemo.timeout(None, args)).stdout.strip()
+    head = _git(h, "rev-parse", "HEAD")
+    try:
+        git("read-tree", head)
+        git("--literal-pathspecs", "rm", "-r", "-q", "--cached", "--", *drop)
+        body = (f"Empty files the worker sandbox leaves at paths it mounts over; tracked, they fail checkouts and "
+                f"rebases in task worktrees. Untracked ({len(drop)}):\n{_capped_list(drop)}")
+        sha = git(*ident, "commit-tree", git("write-tree"), "-p", head,
+                  "-m", "untrack sandbox placeholder files", "-m", body)
+    finally:
+        idx.unlink(missing_ok=True)
+    _git(h, "update-ref", "-m", "ttp upgrade: untrack sandbox placeholder files", "HEAD", sha, head)
+    # The live index still holds them, which a worker's next commit would put back: dropped there too
+    # (-f: whatever the file on disk is, a device node in a sandboxed run, it stays).
+    gitmemo.run(["git", "-C", str(h), "--literal-pathspecs", "rm", "-r", "-q", "-f", "--cached",
+                 "--ignore-unmatch", "--", *drop], capture_output=True, timeout=gitmemo.timeout(None, ("rm",)))
+    print(f"untracked {len(drop)} empty sandbox placeholder path(s) the harness had committed, as {sha[:12]}: "
+          f"{', '.join(drop)}")
+    return sha
 
 
 def _refresh_plan_digests(p: Project, files: list[str], busy: set[str] = frozenset()) -> list[str]:
@@ -14949,7 +15102,8 @@ def _harness_worker_fenced(p: Project) -> bool:
     from . import providers, route
     cfg = p.config()
     names = [cfg.get("core_provider") or "claude"] + [t[0] for t in [route.target(cfg, "standard")] if t]
-    return all(providers.get_provider(n).fenced(cfg.get("restrictions") or {}) for n in names)
+    return all(providers.get_provider(n).fenced(providers.fence_on(cfg, n, p), cfg.get("restrictions") or {})
+               for n in names)
 
 
 def _moved_template(h: Path, base: str) -> str:
@@ -15125,6 +15279,10 @@ In this harness repo:
    the file, after its `# --- project-local imports below ---` line where it ends with one, never inside
    or next to upstream's `from . import ...` lists, and keep upstream's lists as upstream ships them:
    later upgrades then merge cleanly with no task.
+   A command this project added to the sandbox's freed set (FENCE_FREED in runtime/ttp/hook.py,
+   FENCE_EXCLUDED in runtime/ttp/providers/claude.py: a script in harness bin/ that reaches other hosts)
+   goes into project.json's `sandbox.fence_freed_commands` instead (`ttp config {name}
+   sandbox.fence_freed_commands '["<name>"]'`): take upstream's lines there whole.
 3. Check in <tmp>: `python3 -m compileall -q runtime` and `PYTHONPATH=runtime python3 -c "import ttp.daemon, ttp.cli"`.
 4. Commit, then in <tmp>: `git merge main` (main may have moved meanwhile; resolve and check again).
 5. `ttp upgrade {name} --apply <commit>`, run on its own (never piped or masked). It fast-forwards main
@@ -15743,8 +15901,10 @@ def cmd_doctor(a) -> None:
         print(cursortiers.line(resolved, p.raw_config()))
         print(cursortiers.rate_line(cfg))
     rules = p.config().get("restrictions") or {}
-    gaps = [f"{prov.name} ({prov.write_fence(rules)})" for prov in all_providers()
-            if rules.get("no_internet") and prov.name != "fake" and prov.available() and prov.write_fence(rules)]
+    fence_off = {n for n, c in p.config()["providers"].items() if isinstance(c, dict) and c.get("write_fence") is False}
+    gaps = [f"{prov.name} ({prov.write_fence(rules) or f'turned off: providers.{prov.name}.write_fence is false'})"
+            for prov in all_providers() if prov.name != "fake" and prov.available()
+            and (prov.write_fence(rules) or prov.name in fence_off and prov.fence_optional)]
     if gaps:
         print("unfenced providers (their workers can write anywhere, project.db included): " + ", ".join(gaps))
     from . import localguard
@@ -15830,6 +15990,9 @@ def cmd_doctor(a) -> None:
         print(f"host-run: {fenced}")
     for line in hostrun.sudo_prefix_warnings((p.config().get("runner") or {}).get("host_commands")):
         print(f"host-run: {line}")
+    from . import sandbox
+    print("process sandbox for checks: " + (sandbox.notice() or ("on (own PID namespace per check command)"
+          if sandbox.opted_in() else "off (default; project.json sandbox.checks true turns it on)")))
     from .project import config_problems
     for line in config_problems(p.raw_config(), p.root, fetch=True):
         print(f"project.json: {line}")
@@ -16596,7 +16759,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("cmd", nargs=argparse.REMAINDER, help="the shard's command, after --")
     s.set_defaults(fn=cmd_pool_shard)
 
-    s = sub.add_parser("sandbox", help="run a command as it is; a pytest -n takes its workers from the host's test slots")
+    s = sub.add_parser("sandbox", help="run a command as it is (a pass-through, by default); in its own PID namespace only "
+                                       "where the project turned it on (sandbox.checks)")
     s.add_argument("cmd", nargs=argparse.REMAINDER, help="the command, after --")
     s.set_defaults(fn=cmd_sandbox)
 
@@ -16726,7 +16890,10 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--stop", type=int, metavar="TASK", help="stop this ended task's own leftover processes")
     s.add_argument("--pid", type=int, action="append", help="with --stop: only this pid (repeatable); "
                                                             "refused unless it is the task's own")
-    s.add_argument("--dry-run", action="store_true", help="with --stop: list what it would stop and refuse")
+    s.add_argument("--sandboxes", action="store_true",
+                   help="end this project's sandbox trees (bwrap with its proxy listeners) whose runs have ended and "
+                        "that nothing owns any more; the daemon also does it at start and on each sweep")
+    s.add_argument("--dry-run", action="store_true", help="with --stop or --sandboxes: list what it would stop and refuse")
     s.set_defaults(fn=cmd_leftover_procs)
 
     s = sub.add_parser("goal", help="stock goal checks, one JSON line per observation; exit 0 met, 1 not, "
@@ -16823,8 +16990,8 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_occupancy)
 
     s = sub.add_parser("host-run", help="run a command config runner.host_commands allows (a sudo read, say) "
-                                        "on the host, through the daemon", description=(
-        "A worker's sudo needs the user's password (no tty). The daemon runs a "
+                                        "outside the sandbox, through the daemon", description=(
+        "A sandboxed worker cannot gain privileges (sudo fails with 'no new privileges'). The daemon runs a "
         "command listed in config runner.host_commands (each entry: the command's first words, which the "
         "request must equal or start with, or only equal for {\"cmd\": ..., \"exact\": true}; set by the user or the "
         "coordinator) on the host, under "

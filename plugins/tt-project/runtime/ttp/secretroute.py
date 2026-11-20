@@ -1,14 +1,15 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""`ttp secret env` from a worker that cannot read the secrets store (cli.cmd_secret_env).
+"""`ttp secret env` from a sandboxed worker (cli.cmd_secret_env).
 
-Such a worker cannot get its secrets itself. Instead it queues `ttp secret env ... -- <command>` as a
-detached job (detach.enqueue), which the daemon starts (detach.tend): that served copy reads the store,
-puts the secrets into the one command's environment and masks them in its output (every stored value,
-and each given value line by line), which goes to the job's log in the run folder. The worker streams
-that log and exits with the command's exit code. The value never reaches the worker: the request, the
-job's record and the log name only the secret, and the served copy records which secrets it gave, to
-which task and when (USES, under the project's state).
+The sandbox denies reading the secrets store, so the command cannot get its secrets there. Instead the
+worker queues `ttp secret env ... -- <command>` as a detached job (detach.enqueue), which the daemon
+starts outside the sandbox (detach.tend): that served copy reads the store, puts the secrets into the
+one command's environment and masks them in its output (every stored value, and each given value
+line by line), which goes to the job's log in the run folder. The worker streams that log and exits
+with the command's exit code. The value never enters the sandbox: the request, the job's record and
+the log name only the secret, and the served copy records which secrets it gave, to which task and
+when (USES, under the project's state).
 """
 from __future__ import annotations
 
@@ -26,6 +27,7 @@ from .project import durable_append
 
 SERVED_ENV = "TTP_ROUTED_RUN"   # set in the served copy: it runs the command itself, never queues again
 # (a name detach._kept_env keeps: it drops every variable named like a secret)
+SANDBOX_ENV = "SANDBOX_RUNTIME"    # set by the Claude Code Bash sandbox
 USES = "secret-uses.jsonl"         # under the project's state: {"at", "task", "run", "secrets"} per served command
 START_WAIT_S = 90                  # unstarted by then: the daemon is down or stuck; withdraw it, well inside a
                                    # 10-min tool call, so a killed call never leaves it to run late or twice
@@ -50,11 +52,11 @@ def state_dir() -> Path | None:
 
 
 def routed() -> bool:
-    """Whether `ttp secret env` here goes through the daemon: a run of a project that cannot read the
-    secrets store, and not the served copy itself."""
+    """Whether `ttp secret env` here goes through the daemon: a sandboxed run of a project (the
+    sandbox's marker, or a store it cannot read), and not the served copy itself."""
     if os.environ.get(SERVED_ENV) or state_dir() is None:
         return False
-    return _store_denied()
+    return bool(os.environ.get(SANDBOX_ENV)) or _store_denied()
 
 
 def record_use(labels: list[str]) -> None:
@@ -74,7 +76,7 @@ def job_command(alias: str | None, specs: list[str], argv: list[str]) -> list[st
     environment: a dropped marker would make the served copy queue itself again."""
     from .cli import RUNTIME
     path = os.pathsep.join([str(RUNTIME), *filter(None, [os.environ.get("PYTHONPATH")])])
-    return ["env", f"{SERVED_ENV}=1", f"PYTHONPATH={path}", sys.executable, "-m", "ttp",
+    return ["env", "-u", SANDBOX_ENV, f"{SERVED_ENV}=1", f"PYTHONPATH={path}", sys.executable, "-m", "ttp",
             *_shown(alias, specs, argv)[1:]]
 
 

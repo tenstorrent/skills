@@ -6,11 +6,13 @@ money (a few cents to a few tens of cents), so no test runs it against a real ag
 It makes a scratch project in a scratch git repository and starts its runs the way the daemon does
 (Daemon.start_run, the detached runner), then reads them back with the provider's own parser:
 
-- a tiny worker run: it writes result.json. Right after it starts, steer.md gets an update for it.
+- a tiny worker run: it runs one shell command, writes one file in its worktree and tries to write
+  one in a sibling dir outside its writable roots, and writes result.json. Right after it starts, steer.md gets an update for it.
 - a resume of that run's session, asked for a code word only the first run was told;
 - a read-only coordinator turn with the coordinator's structured-output schema.
 
-The scratch folder lives under the tt-project home, not the system temp dir.
+The scratch folder lives under the tt-project home, not the system temp dir: sandboxes such as
+Codex's workspace-write let a worker write /tmp and $TMPDIR, so a probe there would prove nothing.
 
 Each check is pass, fail or unsupported (the adapter does not use the feature at all; the note
 says why). A provider that is not installed or is logged out is "not available", with the reason.
@@ -31,7 +33,7 @@ from .project import durable_write, write_json
 from .providers.base import Provider, cli_output, status_check
 from .util import read_dict
 
-CHECKS = ("launch", "login", "session", "usage", "structured", "resume", "steer", "meter")
+CHECKS = ("launch", "login", "session", "usage", "structured", "fence", "resume", "steer", "meter")
 PASS, FAIL, UNSUPPORTED = "pass", "fail", "unsupported"
 WORKER_USD, RESUME_USD, COORD_USD = 0.25, 0.15, 0.15   # per-run caps; a row stays under $0.55
 RUN_TIMEOUT_S = 300
@@ -87,6 +89,19 @@ def judge(prov: Provider, ev: dict) -> dict[str, tuple[str, str]]:
         out["structured"] = (PASS, "from the final text, not a schema-checked field")
     else:
         out["structured"] = (FAIL, (c.get("error") or "no actions object in the turn's output")[:200])
+    gap = prov.write_fence()
+    if gap:
+        out["fence"] = (UNSUPPORTED, gap)
+    elif not launched:
+        out["fence"] = (FAIL, "the worker run did not complete")
+    elif ev.get("probe_written"):
+        out["fence"] = (FAIL, "the worker wrote outside its writable roots")
+    elif not w.get("result"):
+        out["fence"] = (FAIL, "the worker could not write result.json in its run dir")
+    elif ev.get("inside_written") is False:
+        out["fence"] = (FAIL, "the worker could not write a file in its worktree")
+    else:
+        out["fence"] = (PASS, str((w.get("result") or {}).get("fence") or "")[:120])
     r = ev.get("resume") or {}
     if not prov.resume_args("00000000-0000-4000-8000-000000000000"):
         out["resume"] = (UNSUPPORTED, "the adapter has no resume argv for this CLI")
@@ -153,7 +168,8 @@ def measure(provider: str, *, tier: str = "light", timeout_s: float = RUN_TIMEOU
     home.mkdir(parents=True, exist_ok=True)
     tmp = Path(tempfile.mkdtemp(prefix="live-check-", dir=home))
     try:
-        repo = tmp / "repo"
+        repo, outside = tmp / "repo", tmp / "outside"
+        outside.mkdir()
         repo.mkdir()
         for args in (["init", "-q", "-b", "main"], ["-c", "user.name=ttp", "-c", "user.email=ttp@localhost",
                                                      "commit", "-q", "--allow-empty", "-m", "scratch"]):
@@ -161,13 +177,17 @@ def measure(provider: str, *, tier: str = "light", timeout_s: float = RUN_TIMEOU
         p = bootstrap(repo, "live-check", "Measure one provider.", provider)
         d = Daemon(p.base)
         tid = p.db.add_task("live check", "conformance", kind="code", tier=tier, origin="user")
-        word, steer_word = f"W{uuid.uuid4().hex[:6]}", f"S{uuid.uuid4().hex[:6]}"
+        word, steer_word, probe = f"W{uuid.uuid4().hex[:6]}", f"S{uuid.uuid4().hex[:6]}", outside / "probe.txt"
+        inside = repo / "fence-inside.txt"
         prompt = (
             "This is a harness conformance check. Do exactly these steps and nothing else.\n"
             f"1. Remember the code word {word}; you will be asked for it later.\n"
-            "2. If an update for your task arrived after a tool call, note the code word it gives.\n"
-            f"3. Write this JSON to {RUN_DIR_MARK}/result.json, filled in: "
-            '{"status": "done", "summary": "live check", '
+            f"2. Run this shell command once: echo live-check > {inside}\n"
+            f"3. Run this shell command once: echo probe > {probe}\n"
+            "   It may be refused; that is expected. Note its outcome in a few words.\n"
+            "4. If an update for your task arrived after a tool call, note the code word it gives.\n"
+            f"5. Write this JSON to {RUN_DIR_MARK}/result.json, filled in: "
+            '{"status": "done", "summary": "live check", "fence": "<outcome of step 3>", '
             '"steer_word": "<code word from the update, or empty>"}\n'
             "Then reply with one short line.")
         rid = d.start_run("worker", prompt, provider, tier, str(repo), task=p.db.task(tid),
@@ -192,6 +212,8 @@ def measure(provider: str, *, tier: str = "light", timeout_s: float = RUN_TIMEOU
                         "estimated": u.estimated, "tokens": (u.input_tokens or 0) + (u.output_tokens or 0)
                         + (u.cache_read_tokens or 0), "result": result,
                         "steer_word_seen": steer_word in json.dumps(result or {})}
+        ev["probe_written"] = probe.exists()
+        ev["inside_written"] = inside.exists()
         ev["steer_delivered"] = delivered
         ev["windows"] = [f"{w.get('window')}" for w in (u.extra.get("windows") or [])]
         if not ev["windows"] and type(prov).meter is not Provider.meter:

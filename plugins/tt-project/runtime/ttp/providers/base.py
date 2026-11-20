@@ -559,31 +559,45 @@ class Provider:
         metadata); [] when the agent has no write sandbox. `restrictions`: the project's."""
         return []
 
-    def fence_args(self, argv: list[str], dirs: list[str], cwd: str = "",
-                   restrictions: dict | None = None) -> tuple[list[str], bool]:
+    fence_optional = False   # providers.<name>.write_fence can turn the fence off (fence_args)
+    # The fence frees ssh and its kin only when they run on their own, never inside a compound command:
+    # the daemon then sets TTP_FENCE_BY_NAME, and the hook refuses such a command (hook.fenced_ssh, fenced_git).
+    fence_by_name = False
+
+    # Whether a fenced worker's commands forward the host's loopback ports into their own network
+    # namespace (loopproxy.ports_env, sourced per command): Claude Code's Bash sandbox only.
+    loopback_forward = False
+
+    def fence_args(self, argv: list[str], dirs: list[str], cwd: str = "", on: bool = True,
+                   restrictions: dict | None = None, freed=()) -> tuple[list[str], bool]:
         """`argv` with the write fence that also lets the worker write `dirs`, and whether the run is
-        fenced. `restrictions`: the project's (see writable_args)."""
+        fenced. `on` False: the project turned the fence off (providers.<name>.write_fence), where the
+        adapter's fence is optional; an adapter whose sandbox is part of its mode keeps it.
+        `restrictions`: the project's (see writable_args). `freed`: the project's own commands a fence
+        by name frees (fencefree.commands; fence_by_name adapters only)."""
         extra = self.writable_args(dirs, restrictions)
         return (argv[:-1] + extra + ["-"] if argv[-1:] == ["-"] else argv + extra), bool(extra)
 
     def write_fence(self, restrictions: dict | None = None) -> str:
         """Why this provider's workers can write outside their writable dirs, as built today; ""
-        when the no_internet restriction's OS sandbox fences them. Shown by `ttp doctor`; changes nothing."""
+        when an OS sandbox fences them. Shown by `ttp doctor`; changes nothing."""
         return "no write sandbox"
 
-    def read_only_args(self, argv: list[str], restrictions: dict | None = None) -> list[str]:
-        """`argv` of a read-only (coordinator) turn as it launches; unchanged by default."""
+    def read_only_args(self, argv: list[str], on: bool = False, restrictions: dict | None = None) -> list[str]:
+        """`argv` of a read-only (coordinator) turn as it launches: an adapter whose read-only mode is an
+        OS sandbox drops it unless the project turned its write fence on (`on`); unchanged by default."""
         return argv
 
     def launch_sandbox(self, argv: list[str]) -> str:
         """The OS sandbox launch `argv` starts the agent in, read from the argv itself ("" for none):
         recorded with each run (run.json `sandbox`, the daemon log's run start line)."""
-        return ""
+        return "bwrap" if any(os.path.basename(str(w)) == "bwrap" or str(w).startswith("--unshare")
+                              for w in argv) else ""
 
-    def fenced(self, restrictions: dict | None = None) -> bool:
-        """Whether a worker run is write-fenced, as fence_args decides it: a mode without a sandbox
-        (write_fence) leaves it off."""
-        return not self.write_fence(restrictions)
+    def fenced(self, on: bool = True, restrictions: dict | None = None) -> bool:
+        """Whether a worker run is write-fenced, as fence_args decides it: `on` False (fence_on) drops an
+        optional fence; a missing dependency or a mode without a sandbox (write_fence) leaves it off."""
+        return not self.write_fence(restrictions) and (on or not self.fence_optional)
 
     # The environment variable that sets the model the agent's own subagents run ("": it has none). A task
     # pinned to a model pins its subagents through it, unless that variable is already set explicitly.

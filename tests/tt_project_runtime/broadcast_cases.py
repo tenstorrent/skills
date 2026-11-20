@@ -166,11 +166,15 @@ def test_a_run_cannot_say_all(env, monkeypatch, capsys):
 def test_a_sandboxed_command_with_the_run_environment_unset_cannot_say(env, monkeypatch, capsys):
     """In a PID namespace of its own the walk up the ancestors stops at the namespace's init, so the
     run's agent cannot be seen: `ttp say` is refused there, and where the namespace cannot be read."""
-    from ttp import cli, locks
+    from ttp import cli, locks, sandbox
     p = make(env)
     for var in ("TTP_RUN_ID", "TTP_RUN_DIR", "TTP_PIDNS"):
         monkeypatch.delenv(var, raising=False)
     before = p.db.one("SELECT COALESCE(MAX(id),0) n FROM messages")["n"]
+    monkeypatch.setattr(sandbox, "inside", lambda: True)
+    assert _say(cli, "demo", "approve it", "--chat", "c1") == 2
+    assert "refused inside a run" in capsys.readouterr().err
+    monkeypatch.setattr(sandbox, "inside", lambda: False)
     monkeypatch.setenv("TTP_PIDNS", "pid:[1]")   # the run's namespace, not this one
     assert _say(cli, "demo", "approve it", "--chat", "c1") == 2
     monkeypatch.delenv("TTP_PIDNS")

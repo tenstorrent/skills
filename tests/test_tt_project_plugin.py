@@ -7966,14 +7966,25 @@ def test_worker_prompt_and_harness_skill_state_the_glx_reset_only_practice():
         assert part in skill, part
 
 
-def test_prompts_take_host_reports_from_a_model_free_pre_step():
-    """Runs are unsandboxed, so the worker, daily-review and coordinator prompts never say host
-    names do not resolve; a recurring report still comes from a model-free pre-step."""
+def test_prompts_and_harness_skill_run_host_reaching_commands_bare_or_from_a_model_free_pre_step():
+    """Runs are unsandboxed by default, so the worker, daily-review and coordinator
+    prompts no longer say host names do not resolve. The bare-command rule (upstream note
+    fd7ddf9490b3ed3c) lives only in the harness reference, scoped to a project that turned its
+    provider's write fence on; a recurring report still comes from a model-free pre-step."""
     prompts = PLUGIN / "template" / "prompts"
+    harness = SKILLS / "tt-project-harness"
+    assert "](references/host-reaching-commands.md)" in (harness / "SKILL.md").read_text(encoding="utf-8")
     for path in (prompts / "worker.md", prompts / "daily-review.md"):
         flat = re.sub(r"\s+", " ", path.read_text(encoding="utf-8"))
         assert "Host names do not resolve in" not in flat, path.name
         assert "model-free command schedule or pre-step writing files you read" in flat, path.name
+    reference = re.sub(r"\s+", " ", (harness / "references" / "host-reaching-commands.md").read_text(encoding="utf-8"))
+    assert "unsandboxed by default" in reference
+    assert "`providers.<name>.write_fence: true`" in reference
+    for part in ("Host names do not resolve in", "another host or GitHub", "git fetch/ls-remote/push",
+                 "one bare command", "`ttp lock <res> -- <cmd>`", "absolute paths, no cd, pipe, `;`, `&&` or subshell",
+                 "model-free", "pre-step writing files"):
+        assert part in reference, part
     coordinator = re.sub(r"\s+", " ", (prompts / "coordinator.md").read_text(encoding="utf-8"))
     sweep = coordinator[coordinator.index("A `Blocker sweep` turn"):]
     sweep = sweep[:sweep.index(". A provider")]

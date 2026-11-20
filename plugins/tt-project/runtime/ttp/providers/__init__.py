@@ -28,3 +28,13 @@ def get_provider(name: str) -> Provider:
 def all_providers() -> list[Provider]:
     _load_all()
     return [cls() for cls in _REGISTRY.values()]
+
+
+def fence_on(cfg: dict, name: str, p=None) -> bool:
+    """Whether project `p`'s workers of provider `name` run in its optional write fence
+    (providers.<name>.write_fence true, set by the user's own word since runs went unsandboxed:
+    sandboxstate.state). Off by default: workers run without an OS sandbox (no bwrap, no network or PID
+    namespace, sudo works); locks, device holds, pauses, spend caps, checks, review and Restrictions are
+    the gates."""
+    from ..sandboxstate import fence
+    return fence(p, cfg, name)[0]

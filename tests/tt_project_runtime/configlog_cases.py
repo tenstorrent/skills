@@ -93,20 +93,22 @@ def test_upgrade_migration_and_worker_never_overwrite_a_user_or_coordinator_valu
 
 
 def test_an_automated_setter_may_turn_an_owners_switch_its_safe_way_only(env, monkeypatch):
-    """The guard follows the gates' safe direction: a run may turn a user-set SAFE_WHEN_OFF switch to
-    false, never the other way."""
+    """The guard follows the gates' safe direction: a run may turn a user-set sandbox key off (the
+    unsandboxed-runs order) or a SAFE_WHEN_OFF switch to false, never the other way."""
     from ttp import configwho
     _config_clear_run_env(monkeypatch)
     p = make(env)
     worker = configwho.by("worker", task="9")
-    key = "delivery.never_force"
-    p.set_config(key, True, by=configwho.by("user"))
-    p.set_config(key, False, by=worker)
-    assert configwho.at(p.raw_config(), key) is False
-    p.set_config(key, False, by=configwho.by("user"))
-    with pytest.raises(configwho.Protected):
-        p.set_config(key, True, by=worker)
-    assert configwho.at(p.raw_config(), key) is False
+    for key, on, off in (("sandbox.checks", True, False), ("delivery.never_force", True, False)):
+        p.set_config(key, on, by=configwho.by("user"))
+        p.set_config(key, off, by=worker)
+        assert configwho.at(p.raw_config(), key) == off
+        p.set_config(key, off, by=configwho.by("user"))
+        with pytest.raises(configwho.Protected):
+            p.set_config(key, on, by=worker)
+        assert configwho.at(p.raw_config(), key) == off
+    p.set_config("sandbox.checks", True, by=configwho.by("user"))
+    assert p.unset_config("sandbox.checks", by=configwho.by("upgrade"))   # removing it is off too
 
 
 def test_a_coordinator_config_set_never_changes_a_value_the_user_set(env, monkeypatch):

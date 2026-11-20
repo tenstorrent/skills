@@ -26,7 +26,8 @@
 - ends the child's whole process group, its tools too, TERM then KILL, when the runner itself dies
   (killed outright): a watchdog process does it on every platform, and on Linux the kernel also
   sends the child SIGTERM at once (PR_SET_PDEATHSIG);
-- when the agent ends, ends what it left in its process group;
+- when the agent ends, ends what it left in its process group and the run's own sandbox trees that
+  outlived it (bwrap with its proxy listeners, which runs in its own session: sandboxreap);
 - starts the child `nice` levels below itself (run.json; workers and reviewers only), so all it
   starts runs niced too, and records the level the child ran at in exit.json (`nice`);
 - holds a slot of each resource an `exclusive:` task names from before the child starts until it
@@ -59,7 +60,7 @@ import time
 import traceback
 from pathlib import Path
 
-from . import ghhold, glmguard, glmharness, poll_s, project, serverhealth
+from . import ghhold, glmguard, glmharness, loopproxy, poll_s, project, serverhealth
 from .project import Project, durable_write, lower_priority
 
 LEASE_EVERY_S = 30
@@ -352,10 +353,12 @@ def _group_left(pgid: int, keep: set[int]) -> list[dict] | None:
     return out
 
 
-def end_leftovers(pgid: int, run_dir: Path) -> None:
+def end_leftovers(pgid: int, run_dir: Path, project: str | None) -> None:
     """Once the agent ended: what is left of its process group (tools it left running; `ttp detach`
     jobs, detached checks and pushes run in their own sessions and are not in it; a pid its hand-off
-    lists in leftover_procs with how and when it stops stays)."""
+    lists in leftover_procs with how and when it stops stays), then the sandbox trees of this run that
+    nothing owns any more (sandboxreap: bwrap with its proxy listeners, which starts its own session and
+    outlives the group)."""
     try:
         from . import leftoverprocs
         try:
@@ -372,14 +375,22 @@ def end_leftovers(pgid: int, run_dir: Path) -> None:
             print(f"runner: left process group {pgid} running: its hand-off lists leftover_procs", flush=True)
         if ended:
             print(f"runner: ended the processes left in the agent's process group {pgid}", flush=True)
+        if project:
+            from . import sandboxreap
+            mine = os.path.realpath(run_dir)
+            found, kept = sandboxreap.reap(project, lambda d: d == mine)
+            if found:
+                print(f"runner: {sandboxreap.summary(found, 'ended')}", flush=True)
+            for k in kept:
+                print(f"runner: kept sandbox tree {k['root'] or '(host scan)'}: {k['why']}", flush=True)
     except Exception as e:   # never lose the run's exit.json to a cleanup fault
         print(f"runner: could not end the run's leftover processes: {type(e).__name__}: {e}", flush=True)
 
 
-def end_leftovers_within(pgid: int, run_dir: Path) -> bool:
+def end_leftovers_within(pgid: int, run_dir: Path, project: str | None) -> bool:
     """end_leftovers in a thread, waited on for at most END_LEFTOVERS_S: a /proc read of a hung process
     never holds the run's exit.json. False when it was left running (it ends with the runner)."""
-    t = threading.Thread(target=end_leftovers, args=(pgid, run_dir), name="end leftovers", daemon=True)
+    t = threading.Thread(target=end_leftovers, args=(pgid, run_dir, project), name="end leftovers", daemon=True)
     t.start()
     t.join(END_LEFTOVERS_S)
     if t.is_alive():
@@ -570,6 +581,8 @@ def supervise(run_dir: Path) -> int:
     # The secret files go under the daemon's environment: a server's env never changes the worker's
     # PATH, PYTHONPATH, TTP_* or device mask.
     env = {**os.environ, **_env_files(spec), **env_extra}
+    # A proxy on `localhost` as 127.0.0.1 (loopproxy): in memory only, the values may carry credentials.
+    env.update(loopproxy.fixed(env))
     # gh credentials only through the run's gh wrapper, on every provider (ghhold.py)
     env = ghhold.hold(env, run_dir)
     if spec.get("waits_idle"):   # its hook turns wait calls back to a waiting hand-off (hook.idle_wait)
@@ -881,7 +894,7 @@ def supervise(run_dir: Path) -> int:
             watchdog.wait(timeout=10)
         except subprocess.TimeoutExpired:
             pass
-    end_leftovers_within(child.pid, run_dir)
+    end_leftovers_within(child.pid, run_dir, env_extra.get("TTP_PROJECT"))
     remove_files(spec.get("private_files") or [])
     remove_tmp(run_dir, spec)
     if held:

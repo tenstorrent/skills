@@ -18,7 +18,10 @@ hook stays silent inside a subagent (its payload carries `agent_id`) and leaves 
 worker's next own tool call.
 
 After a failed tool call (Claude Code's PostToolUseFailure, which replaces PostToolUse there) it hands
-over the same update and hand-off problems.
+over the same update and hand-off problems, and, when the error is the Bash sandbox's mount race
+(MOUNT_RACE: bwrap could not bind a path that vanished while it started), the hint to re-run the
+command unchanged; `ttp audit` counts the runs that hit it. In a sandboxed run, an ssh that failed with
+`kex_exchange_identification` gets the hint that a sudo ProxyCommand cannot run there (KEX_NO_NEW_PRIVS_HINT).
 
 The hand-off guard: after a tool call that changed `$TTP_RUN_DIR/result.json` (any tool: it compares
 the file's size and mtime with the last one checked), the hook parses it as the daemon does and, if
@@ -1177,6 +1180,200 @@ def harness_gh_patch(payload: dict) -> str | None:
     return None
 
 
+# Commands the Claude Code fence frees by name (providers/claude.py FENCE_EXCLUDED, also after `timeout N`):
+# only a simple command; a redirect to or from a file, a substitution anywhere in the line, a shell
+# wrapper, `&&`, `;` or a pipe keep the whole line sandboxed, where they cannot reach a host (measured).
+# A project adds its own in project.json (sandbox.fence_freed_commands, fencefree), never here.
+FENCE_FREED = {"ssh", "scp", "sftp", "rsync"}
+SUBST_RE = re.compile(r"\$\(|`")
+FILE_REDIRECT_RE = re.compile(r"<|>(?!&)")   # `2>&1` and `>&2` duplicate a descriptor: fine
+SHELL_C_RE = re.compile(r"-[A-Za-z]*c[A-Za-z]*")
+ASSIGN_RE = re.compile(r"[A-Za-z_]\w*\+?=")   # `FOO=x ssh ...`: no such line is freed (measured, CLI 2.1.296)
+
+
+def _freed_in(argv: list[str], depth: int = 0) -> str | None:
+    """The ssh-like command `argv` runs: itself, or one in its `bash -c` or `eval` script."""
+    from . import fencefree
+    name = os.path.basename(argv[0])
+    if name in FENCE_FREED or name in fencefree.names():
+        return name
+    if name not in SHELLS and name != "eval" or depth > 2:
+        return None
+    script = " ".join(argv[1:]) if name == "eval" else \
+        next((argv[i + 1] for i in range(1, len(argv) - 1) if SHELL_C_RE.fullmatch(argv[i])), None)
+    return script and next((h for s in _segments(script) if (h := _freed_in(s, depth + 1))), None)
+
+
+def fenced_ssh(segments: list[list[str]], cmd: str) -> str | None:
+    """Why a fenced worker's command `cmd` (its simple commands: `segments`) that runs ssh (or scp,
+    sftp, rsync, or a project's sandbox.fence_freed_commands) would stay in the fence: beside other commands, with a redirect to or from a file,
+    with a substitution, after a leading `VAR=value` assignment, or in a `bash -c` not run by `ttp lock ... --`.
+    None outside such a run (TTP_FENCE_BY_NAME) or for a simple command."""
+    if not os.environ.get("TTP_FENCE_BY_NAME"):
+        return None
+    hit, form, assign = None, "", ""
+    for raw in _segments(cmd, strip=False):
+        wrappers: list[list[str]] = []
+        s = _strip_prefix(raw, wrappers)
+        if s and (h := _freed_in(s)):
+            hit = hit or h
+            if (m := ASSIGN_RE.match(raw[0])) and not assign:
+                assign = (f"A leading `{m[0].rstrip('+=')}=...` before {h} keeps the line in the write fence too: "
+                          f"the sandbox frees no line that starts with an assignment. Drop the prefix and pass the "
+                          f"value as an option of the command (e.g. `ssh -o Name=value host cmd`), or set it inside "
+                          f"the quoted remote command (`ssh host 'FOO=x cmd'`).")
+            if os.path.basename(s[0]) != h and not any(w[:1] == ["lock"] for w in wrappers):
+                form = form or f"`{os.path.basename(s[0])} -c` wrapper"
+    if not hit:
+        return None
+    if len(segments) > 1:
+        form = "`&&`, `;` or pipe"
+    elif SUBST_RE.search(cmd):
+        form = "`$(...)` or backtick substitution"
+    elif FILE_REDIRECT_RE.search("".join(" " if q else c for c, (q, _) in zip(cmd, _quoting(cmd)))):
+        form = "redirect to or from a file"
+    if not form:
+        return assign and (f"{hit} cannot reach another host from this line. {assign} There host names do not "
+                           f"resolve and 127.0.0.1 is the sandbox's own loopback, so a refusal is not a host or "
+                           f"tunnel outage.")
+    return (
+        f"{hit} reaches another host only as a simple command on its own. The sandbox frees `{hit} ...` "
+        f"(also after `timeout N` or `ttp lock <res> --`) by name, but this line's {form} keeps the whole "
+        f"line in the write fence, as does any `<`, `<<`, `> file`, `$(...)`, backtick, `bash -c` wrapper, "
+        f"`&&`, `;` or pipe (`2>&1` is fine). There host names do not resolve and 127.0.0.1 is the "
+        f"sandbox's own loopback (only forwarded host ports answer), so a refusal is not a host or tunnel "
+        f"outage. Put a pipe inside the quoted remote command "
+        f"(`ssh host 'cmd | tail -20'`), or write the line into a local wrapper script (e.g. "
+        f"`ssh host 'bash -s' < remote.sh > out.txt`) and run `ttp lock <res> -- bash wrapper.sh`: a plain "
+        f"`bash wrapper.sh` stays fenced" + (f". {assign}" if assign else ""))
+
+
+def lock_privileged(cmd: str) -> str | None:
+    """Why a worker's `ttp lock <res> -- sudo ...` (or su, doas, pkexec, run0; also in a `sh -c` string) is
+    refused: `ttp lock` itself refuses it (privlock.py), and a privileged command goes through `ttp host-run`.
+    A lock inside `ttp host-run -- ...` is the daemon's, under host-run's allowlist (hostrun.unlocked)."""
+    from . import privlock
+    if not privlock.sandboxed_run():
+        return None   # an unsandboxed run may run sudo itself
+    for seg in _segments(cmd, strip=False):
+        i = next((j for j, w in enumerate(seg) if os.path.basename(w) == "ttp" and seg[j + 1:j + 2] == ["lock"]), None)
+        if i is not None and any(os.path.basename(w) == "ttp" and seg[j + 1:j + 2] == ["host-run"]
+                                 for j, w in enumerate(seg[:i])):
+            continue
+        inner = privlock.lock_command(seg[i:]) if i is not None else None
+        if inner and (why := privlock.refusal(inner)):
+            return why
+    return None
+
+
+# An argv element or command string naming an ssh-like command in a non-shell script (`["ssh", host]`)
+QUOTED_FREED_RE = re.compile(r"""["'](?:ssh|scp|sftp|rsync)(?:["']|\s)""")
+
+
+def _script_reaches_host(text: str) -> str | None:
+    """The ssh-like command (FENCE_FREED) a script's text runs: a shell command (also in `bash -c`,
+    after wrappers or `ttp lock ... --`), or a quoted argv element or command string, else None."""
+    commands, _ = _split(text)
+    lines = "\n".join(line for line in commands.split("\n") if not line.lstrip().startswith("#"))
+    hit = next((h for s in _segments(lines) if (h := _freed_in(s))), None)
+    m = hit or QUOTED_FREED_RE.search(lines)
+    return hit or (m and re.sub(r"""["'\s]""", "", m[0]))
+
+
+def fenced_script(segments: list[list[str]], cmd: str, cwd: str) -> str | None:
+    """A hint for a fenced worker's command `cmd` (its simple commands: `segments`) that runs a script
+    calling ssh (or scp, sftp, rsync) inside the fence: any line but a simple `ttp lock <res> -- <script>`
+    (in a call by itself, no redirect to a file, substitution or subshell). fenced_ssh covers ssh named
+    on the line itself. None outside such a run (TTP_FENCE_BY_NAME), for `ttp detach` (the job runs
+    elsewhere) or when no script the line runs names one."""
+    if not os.environ.get("TTP_FENCE_BY_NAME"):
+        return None
+    raws = _segments(cmd, strip=False)
+    wrappers: list[list[str]] = []
+    for raw in raws:
+        _strip_prefix(raw, wrappers)
+    if any(w[:1] == ["detach"] for w in wrappers):
+        return None
+    unquoted = "".join(" " if q else c for c, (q, _) in zip(cmd, _quoting(cmd)))
+    if len(segments) == 1 and not SUBST_RE.search(cmd) and not FILE_REDIRECT_RE.search(unquoted) \
+            and "(" not in unquoted and any(w[:1] == ["lock"] for w in wrappers):
+        return None
+    gdir = cwd
+    for s in segments:
+        if os.path.basename(s[0]) == "cd" and len(s) > 1:
+            gdir = os.path.join(gdir, os.path.expanduser(s[1]))
+        for f in _scripts([s], gdir):
+            try:
+                hit = _script_reaches_host(f.read_text(errors="replace"))
+            except OSError:
+                continue
+            if hit:
+                name = os.path.basename(s[0])
+                run = f"{name} {f}" if _interpreter_args(s) is not None else \
+                    f"bash {f}" if name in ("source", ".") else str(f)
+                return (f"{f.name} runs {hit}, which reaches another host only from a simple command on its own. "
+                        f"Run from this line (a plain script run, cd, `&&`, `;`, a pipe, a redirect to a file, "
+                        f"`$(...)` or a subshell) it stays in the sandbox's write fence, where host names do not "
+                        f"resolve, so an unresolved host is not an outage. Run it in a call by itself as "
+                        f"`ttp lock <res> -- {run}` (absolute path, nothing else on the line; put a pipe or "
+                        f"redirect inside the script), and the next step in another call")
+    return None
+
+
+# git's network commands the fence frees by name (FENCE_EXCLUDED); git runs ssh for an SSH remote.
+GIT_NET = {"fetch", "pull", "push", "ls-remote", "clone"}
+SSH_URL_RE = re.compile(r"^(?:(?:git\+)?ssh://|[\w.-]+@[\w.-]+:)")   # an argument: `HEAD:main` is a refspec
+SSH_REMOTE_RE = re.compile(r"^(?:(?:git\+)?ssh://|[\w.-]+@[\w.-]+:|[\w.-]+:(?!//))")   # a configured URL
+URL_RE = re.compile(r"^[a-z][\w+.-]*://")
+
+
+def _ssh_remote(gdir: str) -> bool:
+    """`gdir`'s repository has a remote with an SSH URL (True when that cannot be read: the refusal's
+    advice works either way)."""
+    try:
+        r = subprocess.run(["git", "-C", gdir, "config", "--get-regexp", r"^remote\..*\.(push)?url$"],
+                           capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return True
+    if r.returncode not in (0, 1):
+        return True
+    return any(SSH_REMOTE_RE.match(line.split(" ", 1)[-1].strip()) for line in r.stdout.splitlines())
+
+
+def fenced_git(segments: list[list[str]], cwd: str) -> str | None:
+    """Why a fenced worker's git network command (fetch, pull, push, ls-remote, clone, remote or
+    submodule update) against an SSH remote would fail: beside other commands, or after git options
+    such as `-C` (the fence's patterns match `git fetch ...` only). None outside such a run, for an
+    explicit non-SSH URL, or where the repository has no SSH remote."""
+    if not os.environ.get("TTP_FENCE_BY_NAME"):
+        return None
+    from . import gitguard
+    gdir = cwd
+    for s in segments:
+        if os.path.basename(s[0]) == "cd" and len(s) > 1:
+            gdir = os.path.join(gdir, os.path.expanduser(s[1]))
+        if os.path.basename(s[0]) != "git":
+            continue
+        opts, sub, rest = gitguard.split(s[1:])
+        if not (sub in GIT_NET or sub in ("remote", "submodule") and rest[:1] == ["update"]):
+            continue
+        if len(segments) < 2 and not opts:
+            continue
+        urls = [a for a in rest if SSH_URL_RE.match(a) or URL_RE.match(a)]
+        if urls:
+            ssh = any(SSH_URL_RE.match(a) for a in urls)
+        else:
+            d = next((opts[i + 1] for i, o in enumerate(opts[:-1]) if o == "-C"), "")
+            ssh = _ssh_remote(os.path.join(gdir, os.path.expanduser(d)))
+        if ssh:
+            name = f"git {sub}" + (" update" if sub in ("remote", "submodule") else "")
+            return (f"`{name}` over SSH reaches the host only when it runs on its own as `{name} ...`: inside "
+                    f"`&&`, `;` or a pipe, or after git options such as `-C`, it stays in the write fence, where "
+                    f"host names do not resolve. `cd` in a separate call, then run `{name} ...` as a command by "
+                    f"itself (under `timeout N` is fine), and the next step in another call")
+    return None
+
+
 def _deny(why: str) -> dict:
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                    "permissionDecisionReason": f"tt-project: {why}."}}
@@ -1299,6 +1496,10 @@ def _pre_tool_use(payload: dict) -> tuple[dict | None, None]:
         from . import aitag, ruleguard
         why = ruleguard.bash_refusal(cmd, _all_segments(commands), aitag.project_config(),
                                      str(payload.get("cwd") or os.getcwd()))
+    if not why:
+        why = fenced_ssh(segments, commands) or fenced_git(segments, str(payload.get("cwd") or os.getcwd()))
+    if not why:
+        why = lock_privileged(cmd)
     if not why and os.environ.get("TTP_NO_USER_SITE") == "1":   # usersite: a host of several projects
         from . import usersite
         if why := usersite.refusal(commands):
@@ -1343,7 +1544,7 @@ def _pre_tool_use(payload: dict) -> tuple[dict | None, None]:
     if not why:
         from . import fgwait
         cwd = str(payload.get("cwd") or os.getcwd())
-        hint = "\n\n".join(h for h in (wide_read(commands, cwd),
+        hint = "\n\n".join(h for h in (fenced_script(segments, commands, cwd), wide_read(commands, cwd),
                                         fgwait.reminder(cmd)) if h)
         out = {"hookEventName": "PreToolUse", **({"additionalContext": hint} if hint else {})}
         return ({"hookSpecificOutput": out} if len(out) > 1 else None), None
@@ -1911,11 +2112,44 @@ def device_command(commands: str, cmd: str = "") -> str | None:
             f"or paused) or `ttp devq`")
 
 
+# Claude Code's Bash sandbox (bwrap) binds each fenced path that exists when the command starts; one
+# that another command or a worktree removal deletes before bwrap mounts it fails the whole command
+# (measured: config.lock placeholders of concurrent sandboxes, removed `.git/worktrees/<name>` entries).
+MOUNT_RACE = re.compile(r"bwrap: Can't (?:get type of source(?: path)?|find source path|bind mount) "
+                        r"[^\n]{0,600}?: No such file or directory")
+MOUNT_RACE_HINT = ("tt-project: transient sandbox mount race (a path the sandbox binds vanished while it "
+                   "started), not a fault of your command: re-run the same command unchanged.")
+
+NO_NEW_PRIVS = re.compile(r"no new privileges|sudo\.conf is owned by uid \d+|effective uid is not 0", re.I)
+NO_NEW_PRIVS_HINT = ("tt-project: your sandbox cannot gain privileges, so sudo fails inside it. A command the project "
+                     "allows runs on the host through the daemon: `ttp host-run -- <command...>` (config "
+                     "runner.host_commands, set by the user or the coordinator). Not listed: name the exact "
+                     "command in your hand-off.")
+# An ssh whose ProxyCommand runs sudo dies before any banner where nothing can gain privileges, and ssh
+# then blames the host. Hinted only in a run the daemon started sandboxed (it sets TTP_SANDBOXED=1 there):
+# unsandboxed (the default), sudo works and the host really refused.
+KEX_FAIL = re.compile(r"kex_exchange_identification", re.I)
+SANDBOXED_ENV = "TTP_SANDBOXED"
+KEX_NO_NEW_PRIVS_HINT = ("tt-project: this run is sandboxed, so nothing in it can gain privileges (no_new_privs). "
+                         "If that host's ssh ProxyCommand runs sudo, sudo dies at once and ssh says "
+                         "'kex_exchange_identification: Connection closed by remote host': the host is not "
+                         "refusing. `ttp ssh-preflight <host>` exits 13 for this case. Run that ssh from a "
+                         "model-free command schedule or pre-step, or use a ProxyCommand without sudo or a "
+                         "ControlMaster opened outside the sandbox (tt-project-harness "
+                         "references/ssh-preflight.md).")
+
+
 def post_tool_use_failure(payload: dict) -> tuple[dict | None, Callable[[], None] | None]:
-    """A failed tool call: any coordinator update or hand-off problem PostToolUse would have delivered
-    (Claude Code sends no PostToolUse for a failed call)."""
+    """A failed tool call: the hint for a sandbox mount race, and any coordinator update or hand-off
+    problem PostToolUse would have delivered (Claude Code sends no PostToolUse for a failed call)."""
     out, delivered = post_tool_use(payload)
     parts = [out["hookSpecificOutput"]["additionalContext"]] if out else []
+    if MOUNT_RACE.search(str(payload.get("error") or "")):
+        parts.insert(0, MOUNT_RACE_HINT)
+    if NO_NEW_PRIVS.search(str(payload.get("error") or "")):
+        parts.insert(0, NO_NEW_PRIVS_HINT)
+    if KEX_FAIL.search(str(payload.get("error") or "")) and os.environ.get(SANDBOXED_ENV, "").strip() == "1":
+        parts.insert(0, KEX_NO_NEW_PRIVS_HINT)
     if not parts:
         return None, delivered
     return {"hookSpecificOutput": {"hookEventName": "PostToolUseFailure",

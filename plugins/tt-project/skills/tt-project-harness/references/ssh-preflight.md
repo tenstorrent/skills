@@ -9,10 +9,11 @@ Use it instead of a local ssh wrapper.
 ## A sudo ProxyCommand where nothing can gain privileges
 
 Signature: ssh fails at once with `kex_exchange_identification: Connection closed by remote host`. It reads like the host or its `MaxStartups` refusing, but the host never saw the connection.
-Cause: the process runs with no_new_privs (`NoNewPrivs: 1` in `/proc/self/status`), and the host's ssh config has a `ProxyCommand` that runs sudo (for example to reach a network namespace). no_new_privs makes sudo fail at once, the proxy closes, and ssh reports the closed pipe as the remote end. Calls work only while a ControlMaster connection opened outside is still alive, which makes the failure look intermittent.
-Runs are unsandboxed, so this hits only a process that has no_new_privs (Codex or Cursor under `no_internet`).
-`ttp ssh-preflight` names it: when ssh fails, no_new_privs is set and `ssh -G <host>` shows a ProxyCommand running sudo (or doas, pkexec, run0), it exits 13 and says so.
+Cause: the process runs with no_new_privs (`NoNewPrivs: 1` in `/proc/self/status`), and the host's ssh config has a `ProxyCommand` that runs sudo (for example to reach a network namespace). no_new_privs makes sudo fail at once, the proxy closes, and ssh reports the closed pipe as the remote end. A sandboxed worker run has no_new_privs, and so does every `ttp lock` command and `ttp detach` job such a run starts. Calls work only while a ControlMaster connection opened outside is still alive, which makes the failure look intermittent.
+Runs are unsandboxed by default, so this hits only a project that turns its provider's sandbox back on (`providers.<name>.write_fence: true`).
+`ttp ssh-preflight` names it: when ssh fails, no_new_privs is set and `ssh -G <host>` shows a ProxyCommand running sudo (or doas, pkexec, run0), it exits 13 and says so. In a sandboxed Claude run, a failed command whose error has `kex_exchange_identification` gets the same hint.
 Fixes, any one:
-- Run that ssh from a model-free `kind: command` schedule or pre-step that writes the files the run reads.
+- Stay unsandboxed (the default), or leave the sandbox off for the project that needs this route.
+- Run that ssh outside the sandbox: a model-free `kind: command` schedule or pre-step writes the files the run reads ([host-reaching-commands.md](host-reaching-commands.md)).
 - A forwarder that needs no privileges: a `ProxyCommand` without sudo (a jump host via `ProxyJump`, or a forwarder the host runs as a service, where the process lives in the namespace and the ProxyCommand only connects to it).
 - A ControlMaster connection opened outside the job (`ssh -o ControlMaster=yes -o ControlPersist=<time> -fN <host>`, from an unsandboxed shell or schedule): sessions in the job reuse it through its `ControlPath` and never run the ProxyCommand. Once it ends, the next call fails again, so open it for as long as the job runs. The preflight itself never uses a shared connection.

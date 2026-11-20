@@ -37,6 +37,9 @@ the project could have saved. Model-free; the review grades it.
   as 'confirmed by quiet' in the window;
 - over 7 days, each Restrictions item that only blocked work: blocked runs and asks citing it reached
   `review.rule_blocks_min` while no refused action cited it (restriction_audit.only_blocks_lines).
+- Claude runs in which a tool call failed on the sandbox's mount race (hook.MOUNT_RACE in an is_error
+  tool_result; text that only quotes it does not count),
+  of all Claude runs ended in the window;
 - the check pre-stage derived from frequent detached checks failures (checkprestage): its last list
   and the failures it caught before detaching (each a worker wake saved).
 - context gaps: what workers' hand-offs (`context_gaps`) said they needed and their spec and context
@@ -131,6 +134,40 @@ def failed_runs(db: DB, since: float) -> list[dict]:
                 "ON t.id=r.task WHERE r.role!='coordinator' AND r.ended>=? AND r.status NOT IN ('ok','running')",
                 (since,))
     return sorted([r for r in rows if budget.wasted(r)], key=lambda r: -float(r["cost_usd"] or 0))
+
+
+def _failed_tool_results(line: str):
+    """The text of each failing tool_result (is_error true) in one stream-json line of output.jsonl;
+    a line that is not such JSON yields nothing."""
+    try:
+        ev = json.loads(line)
+    except ValueError:
+        return
+    content = (ev.get("message") or {}).get("content") if isinstance(ev, dict) else None
+    for b in content if isinstance(content, list) else ():
+        if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("is_error") is True:
+            c = b.get("content")
+            if isinstance(c, list):
+                c = " ".join(str(x.get("text") or "") for x in c if isinstance(x, dict))
+            yield c if isinstance(c, str) else ""
+
+
+def mount_races(db: DB, since: float) -> dict:
+    """Claude runs ended since `since` in which a tool call failed on the Bash sandbox's mount race
+    (hook.MOUNT_RACE in an is_error tool_result, not text that only quotes it): how many runs, how many hit
+    it and the share. A run folder gone or unreadable counts as no hit."""
+    from pathlib import Path
+    from .hook import MOUNT_RACE
+    rows = db.q("SELECT id, dir FROM runs WHERE provider='claude' AND ended>=? AND dir IS NOT NULL", (since,))
+    hit = []
+    for r in rows:
+        try:
+            with open(Path(r["dir"]) / "output.jsonl", errors="replace") as f:
+                if any(MOUNT_RACE.search(t) for ln in f if "is_error" in ln for t in _failed_tool_results(ln)):
+                    hit.append(int(r["id"]))
+        except OSError:
+            continue
+    return {"runs": len(rows), "hit": len(hit), "share": len(hit) / len(rows) if rows else 0.0, "ids": hit}
 
 
 def retried_tasks(db: DB, since: float) -> list[dict]:
@@ -646,6 +683,10 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
     if leaks := outscan.refusal_counts(db, since):
         out.append(f"leak scan refusals: {sum(leaks.values())} ("
                    + ", ".join(f"{route} {n}" for route, n in leaks.items()) + ")")
+    races = mount_races(db, since)
+    if races["hit"]:
+        out.append(f"sandbox mount races: {races['hit']} of {races['runs']} Claude runs "
+                   f"({races['share']:.0%}) had a Bash call fail on a vanished bwrap mount path")
     held = overrides(p, db, now, blocked_h)
     if held:
         out.append(f"overrides held long: {len(held)}: " + "; ".join(held[:TOP]) + _more(held))
@@ -724,7 +765,7 @@ def report(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked
             "no_change_code": no_change_code(db, since), "stuck": stuck_long(db, now, blocked_h), "review_loops": review_loops(db, since),
             "reviews": {**reviewstats.summary(db, since), "rows": reviewstats.rows(db, since)},
             "overrides": overrides(p, db, now, blocked_h), "promises": obligations.promise_outcomes(db, since, now),
-            "repeated_instructions": correction.repeat_summary(db, since),
+            "repeated_instructions": correction.repeat_summary(db, since), "mount_races": mount_races(db, since),
             "context_gaps": context_gaps(db, since), "coordinator_fixes": coordfix.entries(db, since, now),
             "approval_to_landed": pushq.landing_times(db, since), "per_landed": per_landed(p, db, now),
             "outscan_refusals": outscan.refusal_counts(db, since),

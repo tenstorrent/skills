@@ -15,7 +15,8 @@ answer for a host that is gone or now presents another key). ssh's own failures 
 10 the host key did not verify (changed, or not yet known), 11 authentication failed, 255 the host
 is not reachable (12 with `classified=True`: callers that want a distinct code; retry_when probes
 keep 255, which keeps a waiting task asleep and counts towards the network-outage alert).
-13 when this process cannot gain privileges (no_new_privs: a Codex or Cursor run under restrictions.no_internet) and the host's ProxyCommand runs sudo: sudo dies at once and ssh says
+13 when this process cannot gain privileges (no_new_privs: a sandboxed run, or a `ttp lock` or
+`ttp detach` job that sets it) and the host's ProxyCommand runs sudo: sudo dies at once and ssh says
 'kex_exchange_identification: Connection closed by remote host', which reads like the host refusing.
 Waiting cannot fix that, so 13 wakes a waiting task (tt-project-harness references/ssh-preflight.md).
 14 (with `classified=True`; else 1, "not yet", which keeps a waiting task asleep without counting

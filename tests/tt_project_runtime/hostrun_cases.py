@@ -219,6 +219,20 @@ def test_a_worker_cannot_change_the_host_run_allowlist(env, monkeypatch, capfd):
     assert hostrun.request(p, ["/bin/sh"]) == hostrun.REFUSED
 
 
+@pytest.mark.parametrize("error, hinted", [
+    ("sudo: The \"no new privileges\" flag is set, which prevents sudo from running as root.", True),
+    ("sudo: /etc/sudo.conf is owned by uid 65534, should be 0", True),
+    ("sudo: a password is required", False), ("", False)])
+def test_sudo_failing_in_the_sandbox_names_the_host_run_route(monkeypatch, error, hinted):
+    from ttp import hook
+    monkeypatch.delenv("TTP_RUN_DIR", raising=False)
+    out, _ = hook.post_tool_use_failure({"tool_name": "Bash", "error": error})
+    if not hinted:
+        assert out is None
+        return
+    assert "ttp host-run --" in out["hookSpecificOutput"]["additionalContext"]
+
+
 def test_host_run_covers_a_read_only_sudo_netns_bmc_query_and_refuses_its_other_verbs(env, monkeypatch, capfd, tmp_path):
     # The shape a project allows for a read-only BMC query: sudo, then a network namespace, then
     # ipmitool reads. A stand-in `sudo` records its argv, so no real privilege is needed.
@@ -495,15 +509,11 @@ def test_a_fenced_daemon_answers_host_run_with_the_plain_reason_and_runs_nothing
 def test_fence_problem_reads_the_named_daemons_flag(env, monkeypatch, tmp_path):
     """`ttp doctor` reads the daemon's pid, not its own: a real fenced process is reported, a gone one not."""
     from ttp import hostrun, privlock
-    if shutil.which("setpriv") is None:
-        pytest.skip("needs setpriv to start a process with no_new_privs")
     p = _hostrun_setup(env, monkeypatch, ["/usr/bin/id -u"], unfenced=False)
     # lives until killed below: a stalled worker can outlast any fixed sleep, and a gone pid reads as unfenced
-    child = subprocess.Popen(["setpriv", "--no-new-privs", sys.executable, "-c", "import signal; signal.pause()"])
+    child = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"],
+                             preexec_fn=privlock.no_new_privs_preexec())
     try:
-        deadline = time.monotonic() + 10   # setpriv sets the flag after the child starts
-        while not privlock.fenced(child.pid) and time.monotonic() < deadline:
-            time.sleep(0.02)
         assert privlock.fenced(child.pid) is True
         why = hostrun.fence_problem(p, child.pid)
         assert f"the daemon (pid {child.pid}) runs with no_new_privs set" in why

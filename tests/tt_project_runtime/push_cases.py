@@ -275,6 +275,7 @@ def test_superseded_refuses_a_commit_that_cannot_carry_the_branchs_work(env, mon
     assert set(p.db.kv(dm.KV_LOCAL_ONLY) or {}) == {str(tid)}, "the undelivered work stays flagged"
 
 
+
 def test_superseded_closes_a_question_task_in_review_whose_branch_work_landed(env, monkeypatch, capsys):
     """`ttp task superseded` takes a question task in review that has a branch on the same checks as a
     code task (the commit is on the push branch and changes the branch's files) and closes it as done;
@@ -1006,6 +1007,7 @@ def test_fast_forward_also_refuses_the_push_branch_and_bad_names(env, monkeypatc
     assert "push branch" in coord.apply(p, [{**bad, "value": ["proj"]}], user_turn=True)[0]
     assert coord.apply(p, [bad], user_turn=True) == [] and p.config()["delivery"]["fast_forward_also"] == ["main"]
     assert coord.apply(p, [{**bad, "value": []}]) == []
+
 
 
 def _mirror_setup(env, monkeypatch, mirrors=None, branch="dev"):
@@ -2124,6 +2126,7 @@ def test_a_push_batch_fast_forwards_the_extra_branches_it_is_given(env, monkeypa
     assert f"  ff main {sha}" in out and "  warning: not ff old: " in out
 
 
+
 def test_a_push_batch_logs_how_long_its_merge_phase_took_and_its_slowest_entries(env, monkeypatch, capsys):
     """The replay of all entries (merges, conflict settling, entry checks, upgrade waits) is most of a
     batch's time before its checks: the batch log names its seconds and slowest entries."""
@@ -2964,6 +2967,7 @@ def test_a_push_batch_counts_requeued_conflicts_and_not_rebase_stops(env, monkey
     assert m["conflicts"] == {"entries": 3, "conflicted": 1, "auto_resolved": 0, "by_hunks": 0, "sent_back": 0}
 
 
+
 def test_an_import_conflict_whose_tip_side_is_only_a_comment_is_a_conflict_not_an_error():
     """The tip replaced an import with a comment and the head extended that import: the imports rule
     read the comment-only side as no statements and raised IndexError, which failed every batch."""
@@ -3124,6 +3128,7 @@ def test_a_push_batch_drops_an_entry_commit_a_trailer_names_on_the_target_and_re
     assert _git_out(origin, "rev-list", "--count", f"{carrier}..{pushed}") == "1", "only its own commit"
     assert f"1 of its 2 commits are on {carrier[:10]} already ({a[:10]} as {carrier[:10]}); replaying the other 1" \
         in capsys.readouterr().out
+
 
 
 def test_a_push_batch_drops_an_entry_commit_an_earlier_entry_of_the_batch_carries(env, monkeypatch):
@@ -4432,6 +4437,7 @@ def test_the_push_queue_line_counts_the_oldest_unlanded_row_the_stack_depth_and_
     assert pushq.status_line(p, now, sm).startswith("push queue: empty · ")
 
 
+
 def test_a_push_notice_names_the_branch_and_sha_and_says_when_the_work_is_not_yet_on_its_intended_target(
         env, monkeypatch, capsys):
     """'pushed' must never read as landed: with delivery.base_ref naming another branch than the one
@@ -4788,6 +4794,7 @@ def test_the_daemon_closes_code_tasks_left_in_review_whose_latest_review_pushed_
     assert res["shipped_by"] == done and res["pushed"][0]["sha"] == "cd" * 20 and res["pushed"][0]["version"] == "0.3.2"
     assert len(db.q("SELECT id FROM events WHERE kind='task_done'")) == 3
     assert pushq.settle_reviewed(db) == [] and len(db.q("SELECT id FROM events WHERE kind='task_done'")) == 3
+
 
 
 def test_settle_reviewed_closes_a_question_or_work_task_with_a_branch_whose_review_landed_it(env):
@@ -6451,6 +6458,7 @@ def test_check_commands_run_bare_pytest_with_the_repositorys_venv(tmp_path):
     assert push.check_argv("pytest -q")[-1] == "pytest -q"   # without a worktree: as written
 
 
+
 WRAPPED_PYTEST = ("launcher.py -- .venv/bin/python -m pytest -q tests/",
                   "python3 launcher.py --slots 2 -- /opt/venv/bin/python3.11 -m pytest -q tests/",
                   "launcher.py -- python -m pytest -q", "launcher.py -- pytest -q", "launcher.py -- tools/pytest -q",
@@ -6654,6 +6662,7 @@ def test_env_problem_tells_missing_dependencies_from_code_failures(tmp_path):
     assert push.env_problem("No module named 'numpy'\n", repo) is None   # not a collection or import failure
 
 
+
 def test_if_changed_is_validated_kept_in_config_and_malformed_scopes_never_skip(env):
     from ttp import push
     from ttp.project import config_problems
@@ -6757,7 +6766,7 @@ def test_an_if_changed_check_fails_when_git_cannot_give_the_diff(env, monkeypatc
         push.applicable(repo, "HEAD", check, said.append, "lone")
 
 @pytest.mark.parametrize("box", ["pidns", "cgroup"])
-def test_boxed_checks_are_queued_and_finish_model_free(env, tmp_path, monkeypatch, capsys, box):
+def test_sandboxed_checks_are_queued_and_finish_model_free(env, tmp_path, monkeypatch, capsys, box):
     from ttp import cli, detach, push
     from ttp.daemon import Daemon
     from ttp.runner import proc_start
@@ -7834,6 +7843,7 @@ def test_the_push_queue_refuses_a_head_carrying_commits_of_a_failed_review_unles
     assert pushq.check_approval(s.p, s.p.db.task(s.review), [{"branch": s.branch, "head": s.head}]).get("entries")
 
 
+
 def test_a_passed_probe_reads_the_push_queues_rejected_commit_git_before_its_finish_transaction(env, monkeypatch):
     """_probe_passed records a waiting task's on_pass inside one write transaction, and the push queue's
     rejected-commit check (pushq._inherited: `git show -p`, patch-id, rev-list), read there for a code
@@ -8811,6 +8821,7 @@ def test_ttp_checks_runs_a_subset_pytest_extra_when_its_push_check_does_not_run_
     assert ran() == 2 and "an earlier command after `--` is the same run" in out, out
 
 
+
 def _arg_logging_wrapper(path, log, rc=None):
     """A stand-in lock wrapper: logs a CALL line and each argument on its own line, then runs its
     arguments (exit `rc` instead, when given)."""
@@ -8834,7 +8845,7 @@ def test_ttp_checks_extra_commands_run_behind_checks_wrap_cmd_and_project_checks
     cli.main(["checks", "--fresh", "--", extra])
     assert out.read_text() == "a  b|c|" and not log.exists()
     assert push.with_wrap(["true"], ()) == ["true"]
-    assert push.check_argv(push.with_wrap(["true"], ())[0]) == push.check_argv("true")
+    assert push.check_argv(push.with_wrap(["true"], ())[0], isolate=False) == push.check_argv("true", isolate=False)
     capsys.readouterr()
     # Set: the extra runs as the wrapper's words then the command, as separate arguments.
     p.set_config("checks.wrap_cmd", f"{shlex.quote(str(wrapper))} --tag 'x  y'")
@@ -9354,6 +9365,7 @@ def test_ttp_sandbox_passes_the_leak_pattern_file_by_path(env, tmp_path, monkeyp
         # suite would end 0 and the drop of the env (and the leak-pattern file) would never be seen.
         raise AssertionError("sandbox.run used os.execvp: the leak-pattern env is dropped")
 
+    monkeypatch.setattr(sandbox, "wrap", lambda argv, *a, **k: list(argv))
     monkeypatch.setattr(sandbox.subprocess, "Popen", popen)
     monkeypatch.setattr(sandbox.os, "execvp", execvp)
     f, marker = _leak_file(tmp_path, monkeypatch)
@@ -16430,6 +16442,7 @@ def test_a_failed_review_at_the_review_area_cap_gets_no_fix_or_re_review_and_one
     assert len(area) == 1 and reviewcap.TRIGGER in failed["text"]
 
 
+
 def test_the_review_area_cap_event_names_each_failed_reviews_first_finding(env):
     """The re-plan of a capped area read every failed review's hand-off first. The event now carries
     each one's first finding in one line, so it needs no extra reads."""
@@ -17126,6 +17139,7 @@ def test_a_push_batch_lands_the_passing_entries_when_the_tip_fails_a_test_too(en
     assert ("tip", None, []) not in calls, "the tip is not checked alone in full"
 
 
+
 def test_a_push_batch_whose_tip_fails_a_test_another_way_pushes_the_entries_that_pass_the_rest(env, monkeypatch, capsys):
     """#7330: the tip fails _FLAKY_ID on its own, another way than at the heads (another message), and entry
     1 of 3 breaks _NEW_ID. The tip's own failure is pre-existing in the batch: it blocks nothing and no
@@ -17613,11 +17627,19 @@ def _waits_open_from_start(monkeypatch, request):
     monkeypatch.setattr(push.tempfile, "mkdtemp", mkdtemp)
 
 
+def _sandboxed_checks(monkeypatch):
+    """Push checks run in their PID-namespace sandbox as on a host, not as a no-op under the suite's own."""
+    from ttp import sandbox
+    monkeypatch.setattr(sandbox, "inside", lambda: False)
+    if not sandbox.status()[0]:
+        pytest.skip(f"no PID-namespace sandbox here: {sandbox.status()[1]}")
+
 def test_a_push_check_time_limit_counts_run_time_not_its_wait_for_a_grant(env, monkeypatch, capsys, request):
     """A check that waits 3 s for a checks lane and then runs 0.2 s passes under a 1 s limit; one that waits
     and then runs past the limit fails, saying the wait was not counted."""
     from ttp import push
     monkeypatch.setattr(push, "CHECK_POLL_S", 0.1)
+    _sandboxed_checks(monkeypatch)
     _waits_open_from_start(monkeypatch, request)
     p, repo, origin, other = _push_setup(env, monkeypatch, [_waiting_check(env, "quick", 3, 0.2)])
     p.set_config("delivery.push_checks_timeout_s", 1)
@@ -18073,6 +18095,7 @@ def test_a_push_check_still_waiting_for_a_grant_at_its_outer_bound_is_queued_not
     exits 75 (queued, not run) with a retry_when, never a failed check that would open a fix task."""
     from ttp import batch, push
     monkeypatch.setattr(push, "CHECK_POLL_S", 0.1)
+    _sandboxed_checks(monkeypatch)
     _waits_open_from_start(monkeypatch, request)
     p, repo, origin, other = _push_setup(env, monkeypatch, [_waiting_check(env, "stuck", 60, 0)])
     p.set_config("delivery.push_checks_timeout_s", 1)
@@ -18141,6 +18164,50 @@ def test_checkwait_records_only_inside_a_push_check_and_chain_keeps_the_callback
     waited, live = checkwait.state(d, t0)
     assert not live and 0.15 <= waited < 5 and seen == [True, True, False, False]
     assert checkwait.chain(None, "x") is not None   # records even without a callback of its own
+
+
+def test_checkwait_state_reads_a_wait_from_another_pid_namespace_by_its_lock_not_its_pid(tmp_path, monkeypatch):
+    """A push check runs in a PID-namespace sandbox: the pid its wait records names another process here.
+    Live while its waiter waits; counts nothing once the waiter is SIGKILLed open."""
+    import json
+    from ttp import checkwait, locks, sandbox
+    monkeypatch.setattr(sandbox, "inside", lambda: False)   # the suite's own sandbox would make wrap a no-op
+    d = tmp_path / "waits"
+    d.mkdir()
+    die = tmp_path / "die"
+    script = tmp_path / "waiter.py"
+    script.write_text(
+        "import os, signal, sys, time\n"
+        f"sys.path.insert(0, {str(RUNTIME)!r})\n"
+        "from ttp import checkwait\n"
+        "checkwait.begin('lane')\n"
+        "print(os.getpid(), flush=True)\n"
+        f"while not os.path.exists({str(die)!r}):\n"
+        "    time.sleep(0.05)\n"
+        "os.kill(os.getpid(), signal.SIGKILL)\n")
+    argv = [sys.executable, str(script)]
+    wrapped = sandbox.wrap(argv)
+    if wrapped == argv:
+        pytest.skip(f"no PID-namespace sandbox here: {sandbox.status()[1]}")
+    t0 = time.time()
+    proc = subprocess.Popen(wrapped, env={**os.environ, checkwait.ENV: str(d)}, stdout=subprocess.PIPE,
+                            text=True, start_new_session=True)
+    try:
+        inner = int(proc.stdout.readline())
+        rec = next(iter(json.loads((d / locks.WAITS_FILE).read_text()).values()))
+        assert rec["pid"] == inner != proc.pid   # a pid of the sandbox's own namespace
+        time.sleep(0.3)
+        waited, live = checkwait.state(d, t0)
+        assert live and waited >= 0.2
+        die.touch()
+        proc.wait(timeout=30)
+        assert checkwait.state(d, t0) == (0.0, False)
+        assert locks.waited(d) == 0.0
+    finally:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
 
 
 def test_an_open_wait_is_live_by_its_lock_whatever_process_its_pid_names(tmp_path, monkeypatch):
@@ -18470,7 +18537,7 @@ def test_a_push_check_pass_serves_another_worktree_of_the_tree_with_its_own_venv
     py = _interp(env["tmp"] / "python3.12", "3.12.1")
     p, (wt1, wt2), tree, cenv = _two_worktrees(env, monkeypatch, py)
     eid = pushpass.env_id(wt1, "pytest -q", cenv, "tip")
-    assert str(wt1) in " ".join(push.check_argv("pytest -q", wt1, cenv)), "the run names its worktree"
+    assert str(wt1) in " ".join(push.check_argv("pytest -q", wt1, cenv, isolate=False)), "the run names its worktree"
     assert pushpass.record(p, tree, "pytest -q", eid, "b1") == ""
     hit = pushpass.passed(p, tree, "pytest -q", pushpass.env_id(wt2, "pytest -q", cenv, "tip"))
     assert hit and hit["batch"] == "b1", "the other worktree reuses the pass"
@@ -19639,13 +19706,13 @@ def test_a_block_added_beside_a_line_the_other_side_changed_settles_with_both_si
     base = "- intro\n- A fenced worker's ssh runs outside the sandbox.\n- tail\n"
     block = "- The worker sandbox is the user's setting.\n  A project never opts out on its own.\n"
     tip = base.replace("- A fenced", block + "- A fenced")
-    change = base.replace("A fenced worker's", "A fenced worker's (port 22)")
-    want = tip.replace("A fenced worker's", "A fenced worker's (port 22)")
+    change = base.replace("A fenced worker's", "A fenced worker's (write_fence true)")
+    want = tip.replace("A fenced worker's", "A fenced worker's (write_fence true)")
     for ours, theirs in ((tip, change), (change, tip)):
         kinds: set = set()
         assert merge3(ours, base, theirs, hunks=True, kinds=kinds) == want and kinds == {"hunks"}
     after = base.replace("- tail", block.rstrip("\n") + "\n- tail")          # the block after the reworded line
-    assert merge3(after, base, change, hunks=True) == after.replace("A fenced worker's", "A fenced worker's (port 22)")
+    assert merge3(after, base, change, hunks=True) == after.replace("A fenced worker's", "A fenced worker's (write_fence true)")
     # a block whose first line repeats the edited line: before it or one line into it is a guess
     echo = base.replace("- A fenced", "- A fenced worker's ssh runs outside the sandbox.\n- note\n- A fenced")
     assert merge3(echo, base, change, hunks=True) is None
@@ -19666,13 +19733,13 @@ def test_a_push_batch_keeps_the_approval_of_a_change_whose_reworded_line_the_tip
     _commit(other, path, base)
     _git_out(other, "push", "-q", "origin", "HEAD:proj")
     heads = [_entry(repo, "e1", {path: base.replace("- A fenced", block + "- A fenced")}),
-             _entry(repo, "e2", {path: base.replace("ssh runs", "ssh (port 22) runs")})]
+             _entry(repo, "e2", {path: base.replace("ssh runs", "ssh (write_fence true) runs")})]
     rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
     assert rc == 0 and m["outcome"] == "pushed" and _statuses(m) == ["pushed", "pushed"], m
     d = m["results"][1]["detail"]
     assert d["settled"] == [path] and "hunks" in d["settled_by"], d
     got = _git_out(origin, "show", f"proj:{path}")
-    assert got.strip() == base.replace("- A fenced", block + "- A fenced").replace("ssh runs", "ssh (port 22) runs").strip()
+    assert got.strip() == base.replace("- A fenced", block + "- A fenced").replace("ssh runs", "ssh (write_fence true) runs").strip()
 
 
 def test_the_daemon_tick_steps_stay_one_per_line():
@@ -22087,6 +22154,8 @@ def test_push_cancel_of_a_queued_push_keeps_the_daemon_from_starting_it(env, mon
     push.tend(p)   # the daemon's tick never starts it
     assert json.loads(marker.read_text())["status"] == "cancelled"
     assert _ttp("push", "--free") == 0 and _git_out(origin, "rev-parse", "proj") == shared
+
+
 
 
 def test_a_reviewed_head_lands_from_a_code_task_or_the_coordinator_by_default_and_an_unreviewed_one_does_not(

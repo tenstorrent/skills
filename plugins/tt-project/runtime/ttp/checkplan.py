@@ -194,6 +194,8 @@ def run(repo: Path, definition_commit: str | None, definition_path: str, purpose
         _verify(repo, head, scope, definition_path if purpose == "harness" else "")
         print(f"check-plan: {purpose} on {head}; definition {definition_commit}:{definition_path}"
               + (" (at HEAD)" if at_head else ""), flush=True)
+        for line in push.sandbox_lines(scope["commands"]):
+            print(f"check-plan: {line}", flush=True)
         for command in scope["commands"]:
             print(f"$ {command}", flush=True)
             rc = subprocess.run(push.check_argv(command, repo), cwd=repo).returncode

@@ -34,16 +34,17 @@ def test_ssh_preflight_names_a_sudo_proxycommand_that_no_new_privs_breaks(env, t
     host refusal: the preflight exits 13 (wakes a waiting task) and says the cause and the fix."""
     sys.path.insert(0, str(RUNTIME))
     from ttp import daemon, hostmap, privlock
-    if privlock.fenced() is None or shutil.which("setpriv") is None:
-        pytest.skip("needs Linux no_new_privs and setpriv")
+    if privlock.fenced() is None or privlock._prctl() is None:
+        pytest.skip("needs Linux no_new_privs")
     p = make(env)
     path = _nnp_fake_ssh(tmp_path)
     e = {k: v for k, v in os.environ.items() if k not in ("TTP_RUN_DIR", "TTP_LOCKS_HELD", "TTP_DETACHED")}
     e.update({"TTP_PROJECT": str(p.base), "PATH": path})
 
     def run(*args):
-        return subprocess.run(["setpriv", "--no-new-privs", sys.executable, str(TTP), "ssh-preflight", *args],
-                              env=e, cwd=str(p.root), capture_output=True, text=True, timeout=30)
+        return subprocess.run([sys.executable, str(TTP), "ssh-preflight", *args], env=e, cwd=str(p.root),
+                              capture_output=True, text=True, timeout=30,
+                              preexec_fn=privlock.no_new_privs_preexec())
 
     r = run("nsbox")
     assert r.returncode == hostmap.NO_NEW_PRIVS_RC == 13, (r.returncode, r.stderr)
@@ -102,3 +103,17 @@ def test_ssh_preflight_skips_the_proxycommand_check_when_ssh_g_fails(monkeypatch
     assert hostmap.sudo_proxy("box") is False
 
 
+@pytest.mark.parametrize("sandboxed, hinted", [("1", True), ("", False), ("0", False)])
+def test_a_kex_failure_in_a_sandboxed_run_names_the_sudo_proxycommand_cause(monkeypatch, sandboxed, hinted):
+    from ttp import hook
+    monkeypatch.delenv("TTP_RUN_DIR", raising=False)
+    monkeypatch.setenv("TTP_SANDBOXED", sandboxed)
+    error = "Exit code 255\nkex_exchange_identification: Connection closed by remote host"
+    out, _ = hook.post_tool_use_failure({"tool_name": "Bash", "error": error})
+    if not hinted:
+        assert out is None, "unsandboxed, sudo works: the host really closed the connection"
+        return
+    text = out["hookSpecificOutput"]["additionalContext"]
+    assert "ProxyCommand" in text and "ttp ssh-preflight" in text and "references/ssh-preflight.md" in text
+    # Another failure in a sandboxed run gets no such hint.
+    assert hook.post_tool_use_failure({"tool_name": "Bash", "error": "Exit code 1\nNo such file"})[0] is None

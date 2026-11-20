@@ -186,7 +186,7 @@ def env_parts(wt: Path, cmd: str, env: dict, tip: str) -> dict:
     if host := push.remote_host(cmd):
         return {"host": host, "cmd": str(cmd), "env": dict(getattr(cmd, "env", ()) or ()), "tip": tip or ""}
     roots = _roots(wt)
-    argv = [_local(str(w), roots) for w in push.check_argv(cmd, wt, env)]
+    argv = [_local(str(w), roots) for w in push.check_argv(cmd, wt, env, isolate=False)]   # sandboxed or not, the same tests
     venv = _python(push.venv_python(wt, env), roots)
     path = _python(shutil.which("python3", path=env.get("PATH")), roots)
     parts = {"argv": argv, **{k: {"venv": venv[k], "python3": path[k]} for k in ("interpreter", "version", "deps")},

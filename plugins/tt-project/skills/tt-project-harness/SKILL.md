@@ -41,7 +41,7 @@ read the one for the lever you change.
 | Tiers, caps, debounce, idle wake, resources | `project.json` (defaults: `runtime/ttp/project.py`) |
 | Task pin verification | `runner.pin_verify` (`lenient` by default, or `strict`): whether an explicitly model/effort-pinned task runs when its provider cannot verify the pin. See [references/task-pin-verification.md](references/task-pin-verification.md) |
 | Providers a project may use | `providers_allowed` (unset: every configured provider): tier routing, failover and task pins never leave it. See [references/providers-allowed.md](references/providers-allowed.md) |
-| Recurring work | `schedules.json` when the harness has it (the daemon applies edits; `ttp schedules <name> --export --yes` moves them there once and commits; to only read one, `ttp schedules <name> show <schedule>`; to run a command schedule now, `ttp schedules <name> run <schedule>`), else coordinator `schedule_set` or the web app's Recurring pane. An llm schedule's `precheck` (shell, from the project root, after its budget, open-run, debounce and idle gates; `precheck_timeout_s` 120, capped at 240) skips a trigger with no model run when it exits 0 (status `skipped: precheck: <first output line>`); any other exit, a timeout or an error runs it. Use one where a script can tell the window is empty. Budgets (`budget_usd` daily, `budget_usd_run` per run), the skip history and run-now: see [references/schedule-budgets.md](references/schedule-budgets.md) |
+| Recurring work | `schedules.json` when the harness has it (the daemon applies edits; `ttp schedules <name> --export --yes` moves them there once and commits; to only read one, `ttp schedules <name> show <schedule>`; to run a command schedule now, also from a sandbox, `ttp schedules <name> run <schedule>`), else coordinator `schedule_set` or the web app's Recurring pane. An llm schedule's `precheck` (shell, from the project root, after its budget, open-run, debounce and idle gates; `precheck_timeout_s` 120, capped at 240) skips a trigger with no model run when it exits 0 (status `skipped: precheck: <first output line>`); any other exit, a timeout or an error runs it. Use one where a script can tell the window is empty. Host-reaching commands: see [references/host-reaching-commands.md](references/host-reaching-commands.md). Budgets (`budget_usd` daily, `budget_usd_run` per run), the skip history and run-now: see [references/schedule-budgets.md](references/schedule-budgets.md) |
 | De-slop | `ttp slop <name> [--diff <base>..<head>] [--paths <glob>] [--json]`: a model-free per-subsystem scan (duplicate rules, module-level state, magic numbers, long functions, comment noise). Every code review carries the diff's scan delta and fails duplicate rules, incident-diary comments and replay-only tests; `deslop.*` in `project.json` sets subsystems, targets and exclusions. See [references/de-slop.md](references/de-slop.md) |
 | Memory tidy-up | `ttp memory <name> --forget <entry>...`, `--supersedes`, `--search`; daily model-free archiving. See [references/memory-tidy-up.md](references/memory-tidy-up.md) |
 | Correction class fixes | A Course check `recurring mistake` line counts only a correction said after the earlier fix landed (push records; a harness task once done). `ttp task <name> relink-fix <correction> '#<task>' --why "<why>"` re-points a mislinked fix, done or not. A line whose class's fix task was cancelled while another task or commit fixed the class: `ttp task <name> superseded <cancelled id> '#<done task>'` (or a commit sha in the harness, the project root or `--repo`) links the later fix; the line stops while that task stays done. Open, failed or cancelled fix tasks, another project's task and unknown commits are refused. A fix followed only by llm schedules keeps a `report-only follow-up` line until a model-free gate checks the action followed. See [references/correction-class-fixes.md](references/correction-class-fixes.md) |
@@ -157,7 +157,7 @@ read the one for the lever you change.
   task whose hand-off lists the note in `resolves`, or `--task <id>`, has no landed commit in that version) (or `--wontfix "<reason>"` for a note that is not a
   plugin bug: closed, no release), or a
   code task's hand-off lists the note in `resolves` and the push queue records it with the version
-  its batch pushed. A `--resolve`, `--ack` or `--regress` that cannot write the project's records is queued in the run's directory and
+  its batch pushed. A sandboxed `--resolve`, `--ack` or `--regress` is queued in the run's directory and
   recorded when the run ends. Work
   waiting on it hands off `waiting` with retry_when `ttp upstream --fixed <fp>` (0 once this
   project's running daemon has the fix; 4 for an id never filed, which wakes the task as a broken
@@ -206,7 +206,8 @@ read the one for the lever you change.
 - Store a value of your own with `ttp secret set <name> < file` (stdin only), or a set of fresh random
   tokens with `ttp secret generate <name> --keys a,b,c`; neither prints a value.
   Give one to a command with `ttp secret env --secret <name>[:<key>]=<VAR> -- <command>`.
-  A built-in one goes only by a field: `--secret jev:key=<VAR>`.
+  A built-in one goes only by a field: `--secret jev:key=<VAR>`. In the sandbox, `ttp secret env`
+  has the daemon run the command; you get its masked output and exit code, never the value.
 - Never copy a key to another machine yourself. A shared or build box reads keys at run time from
   its store (`ttp secret store`, set up there by the user); never call its fetch command, keychain
   item or the store's environment variable directly. Push from the trusted machine over HTTPS, not
@@ -225,7 +226,7 @@ read the one for the lever you change.
   the lists per repo with the `ttp_device_fixtures` / `ttp_device_markers` ini keys or the `TTP_DEVICE_FIXTURES` /
   `TTP_DEVICE_MARKERS` variables (comma-separated).
 - Do not rely on `-m 'not device'` alone: a marker the repo does not define deselects nothing.
-- Nothing runs in a namespace sandbox: tests run as they are. `TT_VISIBLE_DEVICES` only
+- Nothing runs in a namespace sandbox by default: tests run as they are. `TT_VISIBLE_DEVICES` only
   asks, so under `TTP_NO_DEVICE=1` on a host tagged `device` the tool hook refuses device commands
   outside a device `ttp lock` (itself refused on a held or paused device) or `ttp devq`: reset, flash
   and power tools (`tt-smi` resets, `tt-flash`, `tt-topology`, `ipmitool power`),
@@ -237,16 +238,26 @@ read the one for the lever you change.
 ## Test runs never reach other processes
 
 - On a shared host a test suite's own process-kill code (cleanup by pid, `pkill` in a fixture) can
-  hit other users' live jobs; the kill guard refuses such calls by name. Checks run unsandboxed.
-- A gate or driver that other checks attach to holds an flock on a file in its folder for its whole life, probed with
+  hit other users' live jobs; the kill guard refuses such calls by name. Checks run unsandboxed by
+  default. A project that sets `sandbox.checks: true` has `ttp checks`, `delivery.push_checks` and the
+  push queue run every local check in a process sandbox: its own PID namespace and /proc, so it sees
+  and can signal only its own process tree, and nothing it starts outlives it (sudo fails inside).
+- A pid recorded inside a `ttp checks` run (`$$`, `os.getpid()`) is local to that run's PID namespace:
+  to another check or the daemon the same number is another process or none. A gate or driver that
+  other checks attach to holds an flock on a file in its folder for its whole life, probed with
   `flock -n` (`ttp detach --check <dir>` reads `<dir>/lock` so), or is started with `ttp detach`,
   which a check hands to the daemon. A gate that yields (exit 75) writes its exit code and stays
   queued, never deleted as dead.
-- `ttp sandbox -- <command>` is a plain run (it takes test slots, `TTP_TEST_SLOTS`).
+- `ttp sandbox -- <command>` stays for existing configs: a plain run unless the project turned the
+  sandbox on.
 - A reaper or cleanup script signals only processes it can prove are this project's: `TTP_PROJECT`
   (the full path of `<root>/tt-project`) or a `TTP_RUN_DIR` inside it, or its own run record with pid
   and start time. Never by a task or run id in an env, command line, run folder name or log: ids
   overlap across projects. Skip processes still writing output.
+- It needs unprivileged user namespaces and `unshare` or `bwrap`. Where the host allows none, checks
+  run as before and say why; `ttp doctor` names the setting. Under `sandbox.checks: true`,
+  `"sandbox": false` on a push_checks entry is only for a check that needs the host's process table,
+  and is reported each run.
 
 ## Resetting a Blackhole Galaxy host
 
@@ -257,8 +268,10 @@ Company-wide practice; the long form is in the `tt-project:setup-box` skill's re
   run (no root, no NOPASSWD rule for it), no reset runs and the output says so.
 - Check sudo rights with `sudo -n -l` (or `sudo -n -l <command>`), never `sudo -n true`: a host
   may grant NOPASSWD only for specific commands.
-- Runs are unsandboxed: sudo, ssh and the host's network work as in a plain shell. A privileged
-  command the project allows can also run on the host through the daemon:
+- Runs are unsandboxed by default: sudo, ssh and the host's network work as in a plain shell. Only
+  in a project that turned its provider's write fence on (`providers.<name>.write_fence: true`) do a
+  worker's sandbox and its `ttp detach` jobs not gain privileges ('no new privileges': sudo fails);
+  `ttp lock` then refuses to wrap sudo. A privileged command the project allows then runs on the host through the daemon:
   `ttp host-run -- <command...>` prints its output and exits with its code (126 refused, 124 timed
   out). Only commands in config `runner.host_commands` run, each entry the command's first words
   (name them fully, e.g. `sudo -n /usr/sbin/<tool> <read-only verb>`); the user or the coordinator
@@ -274,14 +287,28 @@ Company-wide practice; the long form is in the `tt-project:setup-box` skill's re
   `ttp host-run --result <id>` (its output, its exit code). A lock that must cover the whole run:
   `ttp detach <name> --lock <res> -- ttp host-run -- <command...>`, not `ttp lock` around `--detach`
   (which frees the lock once the run started).
-- `restrictions.no_internet` turns Codex's and Cursor's
+- The keys that turn namespace sandboxing on (`providers.<name>.write_fence`, `sandbox.checks`) are
+  user-only: only the user's own word turns one on (`ttp config` in their own shell, or the web
+  settings page). `ttp config` inside any run, a worker's or a coordinator's, and every coordinator
+  `config_set` refuse the on value, in a turn carrying a user message too; the off value (false, or
+  `''` to unset) anyone may write. `restrictions.no_internet` also turns Codex's and Cursor's
   sandbox on and is a Restriction: a run's `ttp config` refuses it on or off, and `config_set`
   cannot set it. A user's
-  harness-wide order applies to every project; a project never opts out
+  harness-wide order (such as unsandboxed runs) applies to every project; a project never opts out
   on its own judgement: it records the workaround it relied on instead.
-- A process with no_new_privs (Codex or Cursor under `no_internet`) cannot run an ssh whose
-  ProxyCommand runs sudo: it fails at once with `kex_exchange_identification: Connection closed by
-  remote host`; the host is not refusing. `ttp ssh-preflight` exits 13 for it. Run that ssh from a model-free command schedule or pre-step, or use a ProxyCommand without
+- A fenced Claude worker's (write_fence true) `ssh`, `scp`, `sftp`, `rsync` and `ttp lock` run outside the Bash sandbox
+  only as a simple command on its own (also after `timeout N`); the hook refuses them beside `&&`, `;`,
+  a pipe, a file redirect or a substitution. A project's own host-reaching command (a script in its
+  harness `bin/` that wraps ssh) is freed the same way by config `sandbox.fence_freed_commands`
+  (`["my-ssh"]`; the sandbox never frees `VAR=... my-ssh ...`, so an entry's `env` part is ignored), never
+  by editing FENCE_FREED in hook.py or FENCE_EXCLUDED in providers/claude.py: those lines belong to
+  the template, and a local edit there turns each upgrade that changes them into a merge task. A
+  name that is not an executable in the harness's `bin/`, or is a shell, wrapper, `ttp`, `git` or
+  `gh`, is left out with one daemon log line.
+- In a sandboxed run (and its `ttp lock` and `ttp detach` jobs) nothing can gain privileges, so an ssh
+  whose ProxyCommand runs sudo fails at once with `kex_exchange_identification: Connection closed by
+  remote host`; the host is not refusing. `ttp ssh-preflight` exits 13 for it. Stay unsandboxed (the
+  default), run that ssh from a model-free command schedule or pre-step, or use a ProxyCommand without
   sudo or a ControlMaster opened outside: see [references/ssh-preflight.md](references/ssh-preflight.md).
 - A reset or a single-host power cycle never affects other hosts: nothing waits on or snapshots
   them first. Only a quad serving a quad-wide workload goes down and up as a quad.
@@ -374,7 +401,7 @@ The boot is told by the kernel's boot id (on macOS, kern.bootsessionuuid, else k
   `ttp upgrade <name>`: that cancels and fences it (its `--apply` is then refused) and goes on.
 - Conflicts: keep this project's intent, take upstream fixes. Resolve them in a scratch worktree,
   never in the live harness, and apply the result with `ttp upgrade <name> --apply <commit>`.
-  Where the service manager is out of reach (no user bus), it asks the running daemon to
+  Where the service manager is out of reach (a sandboxed worker), it asks the running daemon to
   restart itself (state/restart.request) and rolls nothing back while the old daemon still ticks.
   Exit 76: applied, restart deferred to the daemon (wait for restart.request to go); exit 75: busy
   (the daemon is landing harness worktrees or another upgrade runs), nothing was changed, so retry

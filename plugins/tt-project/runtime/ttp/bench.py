@@ -625,10 +625,11 @@ TAIL_LINES = 20     # output lines a PrepFault quotes
 
 def _passes(where: Path, tests: list[tuple[str, str]], rounds: int, cmd: str, timeout: float) -> dict[str, int]:
     """{path::name: rounds passed} of `tests` run `rounds` times by pytest `cmd` in `where`, through
-    the rerun plugin (spread off). `cmd` runs
+    the rerun plugin (spread off) in a process sandbox where the host has one (ttp sandbox). `cmd` runs
     only the held-out tests' paths (_held_cmd), so a broken test module elsewhere in the tree is never
     collected. The run's {"rc", "argv", "tail", "selected", "ran", "timed_out"} is kept on the result's
     `run` attribute (a dict subclass) for validate."""
+    from . import sandbox
     out = where.parent / f"{where.name}.jsonl"
     log = where.parent / f"{where.name}.out"
     env = addedtests.env(tests, out, {**os.environ, "PWD": str(where)}, rounds)
@@ -637,7 +638,7 @@ def _passes(where: Path, tests: list[tuple[str, str]], rounds: int, cmd: str, ti
     timed_out = False
     with open(log, "wb") as sink:
         # own session: the test run is killed whole (its group) once past the timeout
-        proc = subprocess.Popen(argv, cwd=where, env=env, start_new_session=True,
+        proc = subprocess.Popen(sandbox.wrap(argv, env=env), cwd=where, env=env, start_new_session=True,
                                 stdin=subprocess.DEVNULL, stdout=sink, stderr=subprocess.STDOUT)
         try:
             proc.wait(timeout=timeout)

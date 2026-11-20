@@ -182,6 +182,8 @@ def _checks(p: Project, wt: Path, new: str, base: str, say: Callable[[str], None
         steps.go("checks")
         started = time.time()
         env = {**env, **slot.env()}
+        for line in push.sandbox_lines(todo):
+            say(line)
         for cmd in todo:
             cmd, rc = push._run_or_here(cmd, wt, env, say, {},
                                         lambda: push.check_slot(new, say, proj=p, priority=_slot_key(wt, branch)))

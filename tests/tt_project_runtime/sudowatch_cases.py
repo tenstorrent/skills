@@ -189,6 +189,8 @@ def test_a_check_gets_the_sudo_wrapper_and_its_report_never_fails_it(tmp_path, m
 def test_ttp_sandbox_reports_the_commands_sudo_on_stderr_and_keeps_its_exit_code(tmp_path, monkeypatch, capfd):
     from ttp import sandbox, sudowatch
     path, calls = _sudo_path(tmp_path)
+    monkeypatch.setattr(sandbox, "wrap", lambda argv, *a, **k: list(argv))
+    monkeypatch.setattr(sandbox, "notice", lambda *a: "")
     monkeypatch.setattr(sudowatch, "processes", lambda: [])
     monkeypatch.setattr(sudowatch, "observe", lambda lines, key, start=None: False)
     monkeypatch.setenv("PATH", path)

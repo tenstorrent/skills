@@ -156,3 +156,87 @@ def test_root_ref_lock_holder_counts_unreadable_git_of_this_user_only_and_resolv
     assert check(row(7, cwd=str(repo / "a" / "b"), start=None)).startswith("pid 7 works"), "unknown start: may own it"
     assert check(row(8, cwd=str(repo / "a"), start=201.5)).startswith("pid 8 works"), "clock slack"
     assert check(row(9, fds={str(lock)}, start=900.0)) == "pid 9 has it open"
+
+
+def _placeholder(gdir: pathlib.Path, mtime: float, body: str = "", mode: int = 0o444) -> pathlib.Path:
+    path = gdir / "config.lock"
+    if path.exists():
+        path.chmod(0o644)
+    path.write_text(body)
+    path.chmod(mode)
+    os.utime(path, (mtime, mtime))
+    return path
+
+
+@pytest.mark.skipif(not os.path.isdir("/proc/self/fd"), reason="needs /proc")
+def test_root_ref_sweep_moves_a_stale_sandbox_config_lock_placeholder_and_keeps_any_git_may_own(tmp_path):
+    sys.path.insert(0, str(RUNTIME))
+    from ttp import gitlocks
+    repo, gdir = _root_repo(tmp_path)
+    old = time.time() - 7200
+    # Non-empty, writable or young: possibly a real git config write, never a candidate.
+    for body, mode, mtime in (("[core]\n", 0o444, old), ("", 0o644, old), ("", 0o600, old),
+                              ("", 0o444, time.time() - 600)):
+        lock = _placeholder(gdir, mtime, body, mode)
+        assert gitlocks.clear_root_refs(repo, 3600) == ([], []), (body, oct(mode), mtime)
+        assert lock.exists() and lock.read_text() == body
+    # Held open by any process: kept.
+    lock = _placeholder(gdir, old)
+    holder = subprocess.Popen([sys.executable, "-c", "import sys,time; f=open(sys.argv[1]); time.sleep(60)",
+                               str(lock)], cwd=str(tmp_path))
+    try:
+        deadline = time.time() + 10
+        while str(lock) not in gitlocks._open_fds(holder.pid) and time.time() < deadline:
+            time.sleep(0.05)
+        moved, kept = gitlocks.clear_root_refs(repo, 3600)
+        assert moved == [] and [(p, why) for p, _, why in kept] == [(lock, f"pid {holder.pid} has it open")]
+    finally:
+        holder.kill()
+        holder.wait()
+    # A live git process working in the repository that started before the placeholder: kept. A
+    # non-git one (a long session whose sandbox made it) does not count.
+    git_proc = subprocess.Popen(["git", "cat-file", "--batch"], cwd=str(repo), stdin=subprocess.PIPE,
+                                stdout=subprocess.DEVNULL)
+    other = subprocess.Popen(["sleep", "60"], cwd=str(repo))
+    try:
+        time.sleep(0.2)
+        young = time.time() + 5
+        os.utime(lock, (young, young))
+        moved, kept = gitlocks.clear_root_refs(repo, 3600, now=young + 7200)
+        assert moved == [] and [why for _, _, why in kept] == [
+            f"pid {git_proc.pid} works in the repository and started before the lock"]
+    finally:
+        git_proc.kill()
+        git_proc.wait()
+    try:
+        moved, kept = gitlocks.clear_root_refs(repo, 3600, now=young + 7200)
+        assert [p for p, _, _ in moved] == [lock] and kept == [], "only git processes count for it"
+    finally:
+        other.kill()
+        other.wait()
+    # The stale placeholder: moved aside, never deleted; git config writes work again.
+    lock = _placeholder(gdir, old)
+    moved, kept = gitlocks.clear_root_refs(repo, 3600)
+    assert [p for p, _, _ in moved] == [lock] and kept == [] and not lock.exists()
+    assert sorted(x.name for x in (gdir / gitlocks.KEEP_DIR).rglob("config.lock")) == ["config.lock"] * 2
+    subprocess.run(["git", "-C", str(repo), "config", "ttp.test", "1"], check=True)
+    assert gitlocks.clear_root_refs(repo, 3600, now=time.time() + 7200) == ([], []), "git's own config is no lock"
+
+
+def test_root_lock_holder_git_only_counts_only_git_working_in_the_repository(tmp_path):
+    sys.path.insert(0, str(RUNTIME))
+    from ttp import gitlocks
+    repo = tmp_path / "root"
+    roots, lock, me = [repo, repo / ".git"], repo / ".git" / "config.lock", os.getuid()
+
+    def row(pid, **kw):
+        return {"pid": pid, "uid": me, "start": 100.0, "comm": "claude", "cwd": str(repo), "gitdirs": [],
+                "fds": set(), **kw}
+
+    check = lambda *rows: gitlocks.ref_lock_holder(lock, 200.0, roots, list(rows), git_only=True)
+    assert check(row(1), row(2, gitdirs=[str(repo / ".git")])) == ""
+    assert check(row(3, comm="git")).startswith("pid 3 works in the repository")
+    assert check(row(4, comm="git-upload-pack", start=None)).startswith("pid 4 works")
+    assert check(row(5, comm="git", start=500.0)) == "", "started after the lock"
+    assert check(row(6, comm="git", cwd=None)) == "pid 6 cannot be checked"
+    assert check(row(7, fds={str(lock)})) == "pid 7 has it open", "any opener counts"

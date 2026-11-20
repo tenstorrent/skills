@@ -67,7 +67,7 @@ import uuid
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
-from . import locks, machines, shorttmp
+from . import locks, loopproxy, machines, privlock, shorttmp
 from .project import FOLDER, Project, durable_append, durable_write, nice_level, renice, write_json
 
 QUEUE = "detach-queue"   # under the project's state: <run>-<name>.json per job a sandboxed command or a check queued
@@ -455,8 +455,9 @@ def _drop(record: Path) -> None:
 
 def start(rc: Path, log: Path, cmd: list, cwd: str, env: dict, lock, *, check: bool = False) -> int:
     """Start the job's wrapper in a session of its own, holding `lock` (its job lock, which the
-    caller took and closes after), with a fresh temp dir of its own, whoever starts it (a worker, or the
-    daemon for a queued, relaunched or heal fix job). A `check`'s queued
+    caller took and closes after), with a fresh temp dir of its own, fenced with no_new_privs: no
+    process of the job gains privileges (sudo fails), whoever starts it (a worker, or the daemon for a
+    queued, relaunched or heal fix job); a privileged step goes through `ttp host-run`. A `check`'s queued
     job whose cwd went with its push starts in its work dir; any other job's gone cwd fails it. Returns its pid."""
     record = scratch(rc)
     if record.exists() and not record.is_symlink():   # left by an earlier start of it that never ran
@@ -481,7 +482,8 @@ def start(rc: Path, log: Path, cmd: list, cwd: str, env: dict, lock, *, check: b
                              str(locks.job_lock(rc)), *cmd],
                             cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
-                            pass_fds=(lock.fileno(),))
+                            pass_fds=(lock.fileno(),),
+                            preexec_fn=privlock.no_new_privs_preexec() if privlock.sandboxed_run() else None)
     # Inherited on purpose, unlike a `ttp lock` command's locks: the job lock means "a process of this job
     # lives", even one that left its group, and jobstop finds and ends those through it (jobstop._free).
     # Every reader takes the .rc first, so a leftover never makes an ended job look running; the kernel
@@ -517,6 +519,9 @@ def enqueue(state: Path, rc: Path, log: Path, cmd: list, cwd: str, env: dict, *,
     rc = Path(rc)
     q = Path(state) / QUEUE / f"{rc.parent.name}-{rc.stem}.json"
     keep = _kept_env(env)
+    if dropped := loopproxy.sandbox_only(env):   # names only: a proxy URL may carry credentials
+        print(f"ttp detach: the queued job leaves out {', '.join(dropped)} (a loopback proxy of this "
+              f"sandbox; the daemon's own environment applies)", file=sys.stderr)
     rid = uuid.uuid4().hex
     now = time.time()
     with _locked(q.parent):
@@ -582,12 +587,16 @@ def bound(p: Project, now: float | None = None) -> None:
 
 
 def _kept_env(env: dict) -> dict:
-    """What a queued or resumable job keeps of `env`: no sandbox markers or secrets."""
-    return {k: v for k, v in env.items() if k not in _SKIP_ENV and not _SECRET_ENV.search(k)}
+    """What a queued or resumable job keeps of `env`: no sandbox markers, secrets or loopback proxies
+    (loopproxy.sandbox_only: the sandbox's bridge, unreachable where the daemon starts the job; the
+    daemon's own environment supplies its proxies, if any)."""
+    drop = set(loopproxy.sandbox_only(env))
+    return {k: v for k, v in env.items() if k not in _SKIP_ENV and k not in drop and not _SECRET_ENV.search(k)}
 
 
 def _job_env(saved) -> dict:
-    """The daemon's environment with a queued or resume record's `env` over it."""
+    """The daemon's environment with a queued or resume record's `env` over it, loopback proxies left
+    out of the record's (one written before _kept_env dropped them)."""
     own = {k: v for k, v in os.environ.items() if k not in _SKIP_ENV}   # a daemon started from a check, say
     return machines.mask_devices({**own, **_kept_env(saved if isinstance(saved, dict) else {})})
 
@@ -850,7 +859,7 @@ def foreign_pidns() -> bool:
     """This process runs in a PID namespace other than the one /proc shows (a namespace no TTP_PIDNS
     marks, as `unshare --pid` without --mount-proc makes): a pid it would record (a child's, a wrapper's
     $$) names another process, or none, on the host, and the namespace ends its processes with its
-    first. Linux only."""
+    first. A namespace with its own /proc (`ttp sandbox`) is told by sandbox.inside() instead. Linux only."""
     try:
         return int(os.readlink("/proc/self")) != os.getpid()
     except (OSError, ValueError):

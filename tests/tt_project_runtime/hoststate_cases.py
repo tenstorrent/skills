@@ -136,6 +136,8 @@ def test_ttp_sandbox_fails_a_command_that_changed_the_host_and_restores_it(tmp_p
     from ttp import sandbox
     cron, tabf, _ = _fake_host(tmp_path, monkeypatch, "a\n")
     _ledger(monkeypatch)
+    monkeypatch.setattr(sandbox, "wrap", lambda argv, *a, **kw: list(argv))
+    monkeypatch.setattr(sandbox, "notice", lambda *a: "")
     old = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
     try:
         assert sandbox.run(["sh", "-c", "crontab -r && reboot"]) == 0   # stand-ins: the real one untouched
