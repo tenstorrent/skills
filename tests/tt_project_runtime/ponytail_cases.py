@@ -101,7 +101,9 @@ def test_ponytail_size_and_verdict_rules(env, tmp_path, monkeypatch):
     run = tmp_path / "run"
     run.mkdir()
     assert ponytail.size_problem(cfg, 20, "", run) == ""
-    assert "needs a `why this size" in ponytail.size_problem(cfg, 30, "", run)
+    why = ponytail.size_problem(cfg, 30, "", run)
+    assert "on its own line, starting with `why this size:` and followed by the reason" in why, why
+    assert ponytail.size_problem(cfg, 30, "Noted, why this size: one parser.", run) == why   # mid-line: not read
     assert "ponytail_pr_lines (10)" in ponytail.size_problem(cfg, 15, "", run, pr=True)
     assert "recorded no verdict" in ponytail.size_problem(cfg, 30, "- why this size: a table", run, head)
     (run / ponytail.FILE).write_text(json.dumps({"verdict": "pass", "head": base}))

@@ -119,8 +119,9 @@ def size_problem(cfg: dict, added: int | None, text: str, run_dir, head: str = "
         return ""
     key = "review.ponytail_pr_lines" if pr else "review.ponytail_land_lines"
     if not WHY.search(text or ""):
-        return (f"it adds {added} lines, over {key} ({cap}): its spec or hand-off needs a `why this size: "
-                f"<reason>` line, and a passed ponytail lane (skill tt-ponytail-review, verdict in "
+        return (f"it adds {added} lines, over {key} ({cap}): its spec or hand-off needs the reason on its own "
+                f"line, starting with `why this size:` and followed by the reason (the phrase mid-line is not "
+                f"read), and a passed ponytail lane (skill tt-ponytail-review, verdict in "
                 f"$TTP_RUN_DIR/{FILE}); else make it smaller")
     if why := lane_problem(run_dir, head):
         return f"it adds {added} lines, over {key} ({cap}), and {why}"
