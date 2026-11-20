@@ -1,0 +1,17 @@
+/goal Use $vllm-integration, $agentic-serving, $benchmark-model, $reference-accuracy and $tt-device-usage for HF_MODEL.
+
+Subagents are authorized and recommended for independent work (adapter, prefix reuse, benchmark grid).
+
+This goal serves the model from the lean model goal through vLLM, fast for agentic traffic, and measures the serving rates goal 12 plans from. The approach is yours; the outputs below are fixed.
+
+Goal completion requirements:
+- tt/generator_vllm.py delegates to the full-model generator and its split-sampling path; tenstorrent/vllm-tt-plugin at its recommended vLLM; registration resolves to this adapter; vLLM owns the cache.
+- The served precision is the model goal's baseline; the $reference-accuracy served tier passes (served equals standalone).
+- Prefix reuse: vLLM prefix caching, or session continuation for recurrent-state models ($vllm-integration prefill features); hit rate on growing multi-turn traffic in doc/agentic_serving.json.
+- Batched prefill passes its burst check. The KV pool is the model goal's tested size, reported by the generator.
+- The readiness stages (serve, sampling, qualitative, benchmark, prefix_cache, prefill_burst) pass with their artifacts under readiness_vllm/.
+- doc/benchmark/serving_rates.json holds the $benchmark-model grid at every batch, for the input lengths goal 12 needs.
+- doc/full_model/serving_contract.json maps every plugin call, capability and request feature.
+- $stage-review returns `clean-pass` once, at the end. Local commits, never push, tag bringup/<model>/serve; log SHAs.
+
+Unmet requirements, review findings, failed gates: work. Stop only after `$autofix` fails.

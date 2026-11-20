@@ -86,6 +86,9 @@ The [goal templates](../../prompts/model_bringup_multigoal) run in order:
 11. Benchmarks — `benchmark-model`
 12. Agentic evals — `agentic-serving`
 
+A lean alternative runs three outcome-defined goals instead: [`model_bringup_lean`](../../prompts/model_bringup_lean)
+`1-model` (stages 1–8, `lean-model`), `2-serve` (stages 9–11), then `12-agentic-evals`.
+
 For an optional standalone TTI release handoff once serving is ready, use
 [`tti-release`](../tti-release/SKILL.md).
 
