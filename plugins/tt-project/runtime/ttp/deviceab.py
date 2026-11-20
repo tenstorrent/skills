@@ -310,18 +310,10 @@ def device_names(task: dict, cfg: dict | None) -> list[str]:
     """The devices the task may change: its write resources (never `read:` ones) that are a `*-device` lock, a
     configured device lock or a machine tagged `device`. A resource every task names (a project host with no device
     tag) is not one; a task that only reads state (a question, a report or status task) changes none."""
-    from . import effort, locks, machines
+    from . import effort
     if task.get("kind") == "question" or READ_ONLY_TITLE.match(str(task.get("title") or "")):
         return []
-    names = [n for n in effort._resource_names(task) if n]
-    out = [n for n in names if n.endswith("-device")]
-    try:
-        out += [n for n in names if n in locks.device_locks(cfg or {})]
-        known = machines.load()
-        out += [n for n in names if "device" in machines.tag_list((known.get(n) or {}).get("tags"))]
-    except Exception:   # an unreadable machines list names no device
-        pass
-    return sorted(set(out))
+    return sorted(set(effort.device_resources([n for n in effort._resource_names(task) if n], cfg)))
 
 
 WATCHER = re.compile(r"(?i)(device|machine|broker|hardware|power|chip|board|box|health)")

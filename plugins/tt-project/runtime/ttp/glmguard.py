@@ -291,50 +291,16 @@ def _roots(cwd: str, run_dir: str, scratch: str = "") -> list[str]:
     return out
 
 
-def _substitutions(cmd: str) -> list[str]:
-    """The commands of the `$(...)` and backtick substitutions in `cmd` outside single quotes, nested ones too: inside
-    double quotes they run all the same. A backslash-escaped `$` or backtick is text."""
-    out: list[str] = []
-
-    def until(i: int, close: str) -> int:   # the index of the `close` ending the text from i ("": the end)
-        quote, depth = "", 0
-        while i < len(cmd):
-            c = cmd[i]
-            if c == "\\" and quote != "'":
-                i += 1
-            elif close == "`" and c == "`":
-                return i
-            elif quote == "'":
-                quote = "" if c == "'" else quote
-            elif c == "'" and not quote:
-                quote = "'"
-            elif c == '"':
-                quote = "" if quote else '"'
-            elif c == "`" or cmd.startswith("$(", i):
-                start = i + (1 if c == "`" else 2)
-                i = until(start, "`" if c == "`" else ")")
-                out.append(cmd[start:i])
-            elif close == ")" and not quote and c in "()":
-                if c == ")" and not depth:
-                    return i
-                depth += 1 if c == "(" else -1
-            i += 1
-        return len(cmd)
-
-    until(0, "")
-    return out
-
-
 def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None, remote: bool = False) -> str | None:
     """Why a shell command of a GLM-arm run is refused (before it runs), else None. `remote`: the command an
     ssh call runs on another host, whose paths are not this host's."""
-    from . import hook, sidefx
+    from . import hook, pathguard, sidefx
     e = os.environ if env is None else env
     if TAMPER.search(cmd):
         return "a command may not edit the run's identity or the guard's own files"
     if STATE_DB.search(cmd):
         return "a run on the GLM arm may not read or write the project's database or machine records by hand"
-    for sub in _substitutions(cmd):   # "$(...)" runs a command too: checked like the command line itself
+    for sub in pathguard._substitutions(cmd):   # "$(...)" runs a command too: checked like the command line itself
         if why := shell_refusal(sub, cwd, run_dir, e, remote):
             return why
     commands, _ = hook._split(cmd)
@@ -428,33 +394,20 @@ def run_env(provider: str, note, device: bool = False) -> dict[str, str]:
 
 
 def device_task(task: dict | None, cfg: dict | None = None) -> bool:
-    """Whether `task` is device work: labelled `needs_device`, or a resource it names (its resource, exclusive and
-    read labels, or a `resources` list) is a device lock (`*-device`, or one of `cfg`'s device locks) or a machine
-    the machine list tags `device`. A CPU-only machine or any other resource is not; an unreadable machine list
-    counts as device work, so the stricter guard holds."""
-    from . import locks, machines
+    """Whether `task` is device work: labelled `needs_device`, or a resource it names (its resource, exclusive
+    and read labels) is a device lock (`*-device`, or one of `cfg`'s device locks) or a machine the machine list
+    tags `device`. A CPU-only machine or any other resource is not; an unreadable machine list counts as device
+    work, so the stricter guard holds."""
+    from . import effort
     from .coordinator import task_resources
     from .util import task_labels
     t = task or {}
-    names = set(task_resources(t))
-    for k in ("resources", "resources_read"):
-        raw = t.get(k)
-        try:
-            got = json.loads(raw) if isinstance(raw, str) else raw
-        except ValueError:
-            got = raw
-        names |= {str(n) for n in ([got] if isinstance(got, str) else got or []) if n}
     if "needs_device" in task_labels(t):
         return True
+    names = task_resources(t)
     if not names:
         return False
-    if any(n.endswith("-device") for n in names) or names & locks.device_locks(cfg or {}):
-        return True
-    try:
-        known = machines.load()
-    except Exception:
-        return True
-    return any("device" in machines.tag_list((known.get(n) or {}).get("tags")) for n in names)
+    return bool(effort.device_resources(names, cfg, unreadable_is_device=True))
 
 
 def gate_lines(spec: str) -> list[str]:

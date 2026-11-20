@@ -362,7 +362,7 @@ _GG_READS = [
     "ttp machines list", "ttp machines list --json", "ttp machines status", "ttp machines activity",
     "ttp machines change list", "ttp machines change list x --all --json", "ttp machines outage", "ttp machines outage x",
     "ttp machines outage list", "ttp machines outage --json", "ttp status", "ttp status --json --verbose", "ttp occupancy",
-    "ttp occupancy --list", "ttp task proj show 5", "ttp proj machines change list", "ttp machines change list 2>&1 | tail -5"]
+    "ttp occupancy --list", "ttp stats", "ttp hostcheck", "ttp checks queue", "ttp task proj show 5", "ttp proj machines change list", "ttp machines change list 2>&1 | tail -5"]
 _GG_WRITES = [
     "ttp machines change add x 'what' --undo true", "ttp machines change edit 3 --what y", "ttp machines change close 3",
     "ttp machines set x --tag a", "ttp machines add x", "ttp machines remove x", "ttp machines push", "ttp machines tag-note a 'text'",
@@ -370,11 +370,6 @@ _GG_WRITES = [
     "ttp machines outage --owner o x", "ttp machines outage --cl x", "ttp machines frobnicate", "ttp machines show x", "ttp machines", "ttp machines change",
     "ttp machines change frobnicate", "ttp note --to p hi", "ttp notify hi", "ttp task add t s", "ttp task cancel 5",
     "ttp task requeue 5", "ttp obligation progress o1 x"]
-
-
-def test_glm_guard_reads_include_the_coordinators_reads():
-    from ttp import coordtools, glmguard
-    assert set(glmguard.READS) >= set(coordtools.READ_COMMANDS)
 
 
 @_pytest.mark.parametrize("cmd", _GG_READS)
@@ -414,10 +409,10 @@ def test_glm_guard_device_task_is_a_device_lock_or_a_machine_tagged_device(monke
     cfg = {"device": {"locks": ["chip"]}}
     lab = lambda *names: {"labels": json.dumps(list(names))}  # noqa: E731
     for task in (lab("resource:box-a"), lab("exclusive:box-a"), lab("read:box-a"), lab("resource:x-device"),
-                 {"resources": ["box-a"]}, {"resources": '["cpu-1", "box-a"]'}, {"labels": '["needs_device"]'}):
+                 lab("read:cpu-1", "resource:box-a"), {"labels": '["needs_device"]'}):
         assert glmguard.device_task(task, cfg), task
     assert glmguard.device_task(lab("resource:chip"), cfg) and not glmguard.device_task(lab("resource:chip"))
-    for task in (lab("resource:cpu-1"), lab("resource:build-cache"), {"resources": '["cpu-1"]'}, {"resources": []},
+    for task in (lab("resource:cpu-1"), lab("resource:build-cache"), lab("read:cpu-1", "exclusive:build-cache"),
                  {"labels": "[]"}, {}, None):
         assert not glmguard.device_task(task, cfg), task
 

@@ -74,20 +74,26 @@ def _resource_names(task: dict) -> list[str]:
     return [lb.split(":", 1)[1] for lb in task_labels(task) if lb.startswith(("resource:", "exclusive:"))]
 
 
+def device_resources(names, cfg: dict | None = None, unreadable_is_device: bool = False) -> list[str]:
+    """The names in `names` that name a device: a `*-device` lock, one of `cfg`'s device locks, or a
+    machine the machine list tags `device`. An unreadable machine list makes every name a device when
+    `unreadable_is_device` (the stricter guard holds), else it names none."""
+    from . import locks
+    out = [n for n in names if str(n).endswith("-device")]
+    try:
+        out += [n for n in names if n in locks.device_locks(cfg or {})]
+        known = machines.load()
+        out += [n for n in names if "device" in machines.tag_list((known.get(n) or {}).get("tags"))]
+    except Exception:
+        return list(names) if unreadable_is_device else out
+    return out
+
+
 def device_task(task: dict) -> bool:
     """Tagged `needs_device`, or names a `*-device` resource or a machine tagged `device`."""
     if "needs_device" in task_labels(task):
         return True
-    names = _resource_names(task)
-    if any(n.endswith("-device") for n in names):
-        return True
-    if not names:
-        return False
-    try:
-        known = machines.load()
-        return any("device" in machines.tag_list((known.get(n) or {}).get("tags")) for n in names)
-    except Exception:   # an unreadable machines list must never hold a task back
-        return False
+    return bool(device_resources(_resource_names(task)))
 
 
 def wants_deep(result) -> bool:
