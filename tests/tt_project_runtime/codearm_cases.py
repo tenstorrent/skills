@@ -1469,3 +1469,56 @@ def test_glm_guard_runs_everything_off_the_denylist(cmd, tmp_path):
     wt, rd = _gg_run(tmp_path)
     e = {**_GG_RUN_ENV, "TMPDIR": str(rd / "tmp")}
     assert glmguard.shell_refusal(cmd, str(wt), str(rd), e) is None, cmd
+
+
+# A name the guard protects, in a quoted heredoc body only written to a file, opens nothing; anywhere else in the
+# command's text (an unquoted heredoc body runs its `$(...)` and backticks) it is refused, quoted or not.
+_GG_MENTION_ALLOWED = [
+    "cat >> tests/x.py <<'EOF'\np = state / \"project.db\"\nEOF",   # test code that names the database file
+    "cat > t.py <<'EOF'\nenv = dict(TTP_RUN_DIR='x', TTP_TASK='3')\nEOF",
+    "cat > notes.md <<'EOF'\nthe guard writes glm_guard.json and reads machine-workers.json\nEOF",
+    "cat > tests/t.py <<'EOF'\nenv = {'TTP_CODE_ARM_GUARD': '1'}\nEOF"]
+_GG_MENTION_REFUSED = [
+    "sqlite3 $TTP_PROJECT/state/project.db 'x'", "grep x project.db", "grep -f project.db x",
+    "cat project.db | grep x", "cd state && sqlite3 project.db .tables", "cat glm_guard.json",
+    "grep x $TTP_RUN_DIR/glm_guard.json",
+    "python3 - <<'EOF'\nimport sqlite3\nsqlite3.connect('/x/project.db')\nEOF",
+    "bash <<'EOF'\nsqlite3 project.db .tables\nEOF",
+    "cat > s.sh <<'EOF'\nsqlite3 project.db .x\nEOF\nbash s.sh",
+    "echo > \"$TTP_RUN_DIR/glm_guard.on\"", "printf '' > \"$TTP_RUN_DIR/glm_guard.json\"",
+    "cat /dev/null > \"$TTP_RUN_DIR/glm_guard.on\"", "cat > \"$TTP_RUN_DIR/glm_guard.on\" <<'EOF'\noff\nEOF",
+    "echo x >> 'project.db'", "cat \"$TTP_PROJECT/state/project.db\"",
+    "TTP_CODE_ARM_GUARD=10 ls", "TTP_CODE_ARM_GUARD=1.5 ls", "unset TTP_CODE_ARM_GUARD", "export TTP_CODE_ARM_GUARD=1 TTP_RUN_DIR=x",
+    "TTP_CODE_ARM_GUARD=1 TTP_RUN_DIR=x ls", "bash -c 'unset TTP_RUN_DIR'", "TTP_CODE_ARM_GUARD=0 ttp notify x",
+    "cat > t.py <<EOF\n$(sqlite3 $TTP_PROJECT/state/project.db \"delete from tasks\")\nEOF",
+    "cat > t.py <<EOF\n$(rm $TTP_RUN_DIR/glm_guard.on)\nEOF", "echo x > t.txt <<EOF\n`unset TTP_RUN_DIR`\nEOF",
+    "TTP_CODE_ARM_GUARD=1\"0\" ls", "TTP_CODE_ARM_GUARD=1 ls", "export TTP_CODE_ARM_GUARD=1",
+    "TTP_CODE_ARM_GUARD=1 python3 -m pytest -q tests/x.py", "bash <<'EOF'\nrm $TTP_RUN_DIR/glm_guard.on\nEOF"]
+
+
+@_pytest.mark.parametrize("cmd", _GG_MENTION_ALLOWED)
+def test_glm_guard_allows_a_protected_name_in_a_heredoc_body_only_written_to_a_file(cmd, tmp_path):
+    from ttp import glmguard
+    wt, rd = _gg_run(tmp_path)
+    e = {"TTP_PROJECT": str(tmp_path / "proj"), "TMPDIR": str(rd / "tmp"), **_GG_RUN_ENV}
+    assert glmguard.shell_refusal(cmd, str(wt), str(rd), e) is None, cmd
+
+
+@_pytest.mark.parametrize("cmd", _GG_MENTION_REFUSED)
+def test_glm_guard_refuses_a_protected_name_anywhere_else_in_the_command(cmd, tmp_path):
+    from ttp import glmguard
+    wt, rd = _gg_run(tmp_path)
+    e = {"TTP_PROJECT": str(tmp_path / "proj"), "TMPDIR": str(rd / "tmp"), **_GG_RUN_ENV}
+    assert glmguard.shell_refusal(cmd, str(wt), str(rd), e), cmd
+
+
+@_pytest.mark.parametrize("cmd", [
+    "TMPDIR=/tmp; echo hi > $TMPDIR/out", "export \"TMPDIR=/tmp\"; echo hi > $TMPDIR/out",
+    "unset TMPDIR; echo hi > $TMPDIR/out", "python3 -c 'import os' TMP=/tmp; echo hi > $TMP/out",
+    "export 'TMPDIR'=/tmp; echo hi > $TMPDIR/x", "declare -x \"TMPDIR\"=/tmp; echo hi > $TMPDIR/x",
+    "read 'TMPDIR' <<< /tmp; echo hi > $TMPDIR/x"])
+def test_glm_guard_reads_scratch_as_tmp_where_the_command_names_tmpdir(cmd, tmp_path):
+    from ttp import glmguard
+    wt, rd = _gg_run(tmp_path)
+    e = {"TTP_PROJECT": str(tmp_path / "proj"), "TMPDIR": str(rd / "tmp"), **_GG_RUN_ENV}
+    assert glmguard.shell_refusal(cmd, str(wt), str(rd), e), cmd

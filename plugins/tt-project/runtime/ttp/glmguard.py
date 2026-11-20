@@ -29,7 +29,11 @@ everything else runs, with Opus's plan and the post-run audit as the backstop (d
 - every connector tool, and a Write or Edit outside the run's folders (tool_refusal).
 A script file run by its path (`bash s.sh`, `bash < s.sh`, `ssh box bash < s.sh`) is opaque to the guard: its
 contents are not read, and neither is a `$(...)` in a heredoc body a program other than a shell reads. Opus's
-plan and the post-run audit are the backstop there.
+plan and the post-run audit are the backstop there. Protected names are read in the command's raw text, all but a
+quoted heredoc body (`<<'EOF'`) only written to a file; an unquoted body is checked like command text. A search for
+one (`grep project.db`, `git log -S glm_guard.json`) is refused, so is setting the guard flag
+(`TTP_CODE_ARM_GUARD=1`) like any other mention, and so is a `$TMPDIR` write after interpreter code that names
+TMPDIR (`os.environ["TMPDIR"]` reads as setting it).
 The hook (hook.pre_tool_use, Claude Code and any provider with hooks), `ttp` itself (cli.glm_gate) and the
 command layer of a harness without hooks (glmenv, for mini-swe-agent) ask it before each call.
 
@@ -346,9 +350,16 @@ def shell_refusal(cmd: str, cwd: str, run_dir: str = "", env=None, remote: bool 
     host. `writes` and `services`: False skips those checks (a step of Opus's plan, deviceplan._static)."""
     from . import credguard, hook, pathguard
     e = os.environ if env is None else env
-    if TAMPER.search(cmd):
+    lines, bodies = hook._heredocs(cmd)
+    # a quoted heredoc body (`<<'EOF'`, no expansion) only written to a file (`cat > t.py <<'EOF' ... project.db ...`)
+    # is data that opens nothing; an unquoted one runs its `$(...)` and backticks, so it stays checked
+    named = "\n".join(lines + [ln for i, body, pos in bodies
+                               if not (hook.HEREDOC_RE.match(lines[i], pos)[2]
+                                       and hook._data_only(*hook._piece_at(lines[i], pos), "\n".join(lines)))
+                               for ln in body])
+    if TAMPER.search(named):
         return "a command may not edit the run's identity or the guard's own files"
-    if STATE_DB.search(cmd):
+    if STATE_DB.search(named):
         return "a run on the GLM arm may not read or write the project's database or machine records by hand"
     if services and (svc := SERVICE_RE.search(cmd)):
         return f"{SERVICE_WHY}: {svc.group(0)[:120]}"

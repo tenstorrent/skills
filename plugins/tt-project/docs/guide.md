@@ -1288,7 +1288,12 @@ guard that refuses a side effect outside the run's own hand-off (a `ttp` command
 `git push`, a GitHub write, an HTTP post, ssh or mail, a state or database write, a write outside the worktree, a
 read of stored secrets) and ends the run as a hand-back to Opus. A script file run by its path (`bash s.sh`, `bash < s.sh`,
 `ssh box bash < s.sh`) and a `$(...)` in a heredoc body a program other than a shell reads are opaque to the GLM
-guards; Opus's device plan and the post-run audit are the backstop there. A plain `ttp note "<text>"` is allowed and goes
+guards; Opus's device plan and the post-run audit are the backstop there. The GLM guard reads protected names in
+the command's raw text, all but a quoted heredoc body (`<<'EOF'`) only written to a file; an unquoted body is
+checked like command text. A search for one (`grep project.db`, `git log -S glm_guard.json`) is refused, so is
+setting the guard flag (`TTP_CODE_ARM_GUARD=1`) like any other mention, and so is a `$TMPDIR` write after
+interpreter code that names TMPDIR
+(`os.environ["TMPDIR"]`), which reads as setting it. A plain `ttp note "<text>"` is allowed and goes
 only to the run's own task log; every route from a note to a person, a chat or another project (`--to`, `--reply`,
 `--urgent`, `--severity`, `--confirms`, `--status`) and `ttp notify` stay refused, so the coordinator decides what
 reaches a chat. The arm's prompt lists the commands its guard allows. A live share on any other harness (Claude Code
