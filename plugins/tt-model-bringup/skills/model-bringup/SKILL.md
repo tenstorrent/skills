@@ -48,7 +48,7 @@ or replace acceptance criteria with a review plugin's criteria.
    characters replaced by underscores>`. Do not acquire hardware just because a plugin was installed.
    Record any serving-plugin interface change that the operator authorizes for this run.
    Record the run's `scope` and `base_commit` in `bringup/agentic_evals/inputs.json` under the model folder.
-   `release` (default): the model ships through tt-metal, so nothing outside `models/autoports/<model>/` and
+   `contained` (default): nothing outside `models/autoports/<model>/` and
    `bringup/` changes; when a ttnn op blocks or is wrong, work around it inside the model (model-local kernels
    are fine), keep a minimal repro and note it for an issue. `open`: the model may carry its own versions of
    ops, kernels and shared code, never meant for main; each changed op still has a test at model shapes, and
