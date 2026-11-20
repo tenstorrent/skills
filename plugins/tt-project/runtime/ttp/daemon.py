@@ -21105,7 +21105,7 @@ class Daemon:
     def _join_shared_review(self, task: dict, review: dict) -> bool:
         """Code task `task` finished on a branch a still queued review already covers for another
         member (a batch, `pr_branch:` lines, overlap routing): it joins that review rather than getting
-        one of its own (user msgs #2407, #2414). The review then depends on it too, records the head it
+        one of its own. The review then depends on it too, records the head it
         handed off (integrate.record_member_head: its commits are fork point..that head) and lists every
         member with its acceptance criteria (integrate.members_block), so each finding names its task.
         A fix of a failed review is no new member: its re-review already covers it. A change on a
@@ -21712,7 +21712,7 @@ class Daemon:
         if rounds > cap:
             self._nofix = f"{rounds} reviews of this stack failed (the daemon fixes at most {cap} round(s))"
             # A shared branch whose failed members are past their fix hop: revert them forward so the
-            # others land, and requeue each alone (user msgs #2269, #2407).
+            # others land, and requeue each alone.
             vs = integrate.verdicts([m["id"] for m in integrate.members(db, review)],
                                     load_result(review.get("result")), fups)
             if vs and "pass" in vs.values():

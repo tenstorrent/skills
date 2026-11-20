@@ -216,7 +216,7 @@ def test_replies_and_notifies_to_the_user_go_out_untagged_while_posts_to_others_
 
 
 def test_text_for_other_people_answers_what_was_asked_in_one_shared_wording(env):
-    """User msgs #2465, #2466: posts and post-ready drafts for people other than the user answer what
+    """Posts and post-ready drafts for people other than the user answer what
     was asked like a colleague and leave out side details; numbers and lists stay allowed when relevant, so
     there is no sentence cap. One wording in the worker prompt, both coordinator modes and the relay
     skill, next to the tag rule it leaves as it was; guidance only, no gate checks a post's length."""

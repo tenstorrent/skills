@@ -780,6 +780,11 @@ def test_public_scan_refuses_local_names_and_chat_references_only_in_its_paths(e
     _commit_in_harness_tree(repo, "plugins/mine/done.md", f"Landed in task #{40 + 3}.\n")
     why = outscan.public_problem(repo, head, "HEAD", on)
     assert "adds a reference to one of the project's tasks (task #<digits>)" in why and str(43) not in why, why
+    for at, line, kind in (("plural-msgs.md", f"Both rules (user msgs #{40 + 5}, #{40 + 6}).\n", "a user's chat message"),
+                           ("plural-tasks.md", f"Landed in tasks #{40 + 7}.\n", "one of the project's tasks")):
+        head = _git_out(repo, "rev-parse", "HEAD")
+        _commit_in_harness_tree(repo, f"plugins/mine/{at}", line)
+        assert kind in outscan.public_problem(repo, head, "HEAD", on), line
 
 
 def test_public_scan_reads_only_comments_and_docstrings_of_python_for_task_and_message_ids(env, tmp_path,

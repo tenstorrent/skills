@@ -1,5 +1,4 @@
-"""The not-run check of every bench that grades cells (bench v2 daily, harness A/B, replay, optimization arms;
-user msgs #3135 and #3137), model-free.
+"""The not-run check of every bench that grades cells (bench v2 daily, harness A/B, replay, optimization arms), model-free.
 
 A cell is `not_run`, never `done`, when no model ran in it:
   - it never launched (exit.json `launched` is false: the agent could not start, the endpoint was not set),

@@ -1,4 +1,4 @@
-# The not-run check of the benches that grade cells (benchnotrun.py, user msgs #3135 and #3137) of
+# The not-run check of the benches that grade cells (benchnotrun.py) of
 # tests/test_tt_project_runtime.py, which runs this file in its own namespace (see _include_cases there).
 # Add new not-run tests here.
 from __future__ import annotations

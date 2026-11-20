@@ -110,7 +110,7 @@ def covered(have: str, text: str) -> bool:
 
 
 def message_ids(text: str) -> list[int]:
-    """The message ids `text` cites as `msg #<id>` (also `user msgs #1, #2 and #3`), in order, once each."""
+    """The message ids `text` cites as `msg #<id>` (also `user msgs #N, #M`), in order, once each."""
     out: list[int] = []
     for m in _MSG_RUN.finditer(text or ""):
         for n in [m.group(1), *re.findall(r"\d+", m.group(2) or "")]:

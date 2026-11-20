@@ -1,5 +1,4 @@
-"""Shared-branch integration: compatible changes share one branch and one review (user msgs #2407,
-#2414). Model-free helpers the daemon uses:
+"""Shared-branch integration: compatible changes share one branch and one review. Model-free helpers the daemon uses:
 
 - integration_branch: the one branch per repo reviewed changes land on: the push branch on a
   push-branch project, else delivery.integration_branch (INTEGRATION_DEFAULT), carried by one draft PR.

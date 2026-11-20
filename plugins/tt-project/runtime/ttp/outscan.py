@@ -544,7 +544,7 @@ def history_problem(repo, base: str, head: str = "HEAD", p=None) -> str | None:
 PUBLIC_KEY = "public_scan_paths"   # delivery.<key>: repo globs a public repository publishes; unset: off
 # A reference to one of this user's chat messages or to one of the project's tasks. In Python only its
 # comments and docstrings are read: the harness's own output says `task #<n>` and tests assert on it.
-PROVENANCE = re.compile(r"\b(?:(?:user )?msg|task) #\d+")
+PROVENANCE = re.compile(r"\b(?:(?:user )?msgs?|tasks?) #\d+")
 _EDGE = r"[\w-]"   # a term matches only whole: no word character or hyphen on either side
 
 

@@ -698,7 +698,7 @@ def test_coord_session_stats_without_session_wakes_say_so(env, capsys):
 # session-only `self_change` row of coordinator.md's action table (1300, selfimprove.py), plus the
 # session prompt's Tools section (800, coordtools.py), plus its Running workers line (140, #6311),
 # plus handover item 5's verbatim-check rule (130, #6502), plus the workers' start-context line (270,
-# ctxfork.py, user msgs #2116, #2119), plus 170 of session-prompt text the batch-1 merge (142) and the
+# ctxfork.py), plus 170 of session-prompt text the batch-1 merge (142) and the
 # full-harness line (28, #7760) added, plus its lines on update acks and order fan-out to running
 # tasks (360, #6313); the stateless role's cap is untouched.
 # Session mode only; it never widens coordinator_role(p)'s cap.

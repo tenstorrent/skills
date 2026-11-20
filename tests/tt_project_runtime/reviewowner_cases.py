@@ -167,7 +167,7 @@ def test_an_open_continuation_in_the_project_root_owns_nothing_so_the_done_task_
 
 
 def test_o424_a_done_code_task_whose_review_enqueue_timed_out_gets_its_review_from_the_backstop(env, monkeypatch):
-    """Replay of o424 (fix tasks #7413, #7418): the hand-off's diff read hit an expired git deadline
+    """Replay of o424: the hand-off's diff read hit an expired git deadline
     ('timed out after 0 seconds'), so no review was queued and the task ended done. The model-free
     backstop (sweep_unreviewed) queues exactly one review on a later pass."""
     import subprocess

@@ -1418,7 +1418,7 @@ def _finish(row: dict, bench_dir: Path, task: dict, ws: Path, run: Path, keep: P
         if ((ended.get("bridge") or {}).get("busy") or {}).get("gave_up"):
             row["capacity_stop"] = True   # the bridge waited out the model's 429s as far as allowed
     server_status(row, ended, opts)
-    benchnotrun.apply(row, ended, diff)   # no model ran in the cell: not run, never done (user msgs #3135, #3137)
+    benchnotrun.apply(row, ended, diff)   # no model ran in the cell: not run, never done
     keep.mkdir(parents=True, exist_ok=True)
     for name in ("output.jsonl", "exit.json", "result.json", "run.json", "runner.log", "stderr.log",
                  "trajectory.json", "opencode.json", "mini.yaml", "harness.sh", "codexproxy.log"):

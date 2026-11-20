@@ -96,7 +96,7 @@ def test_a_worker_run_forks_the_coordinator_session_and_never_writes_into_it(env
 
 
 def test_the_shipped_default_forks_a_coordinator_session_of_any_size(env, monkeypatch, tmp_path):
-    """No size cap by default (owner's order, user msgs #2116, #2040): a session far past the old 120k cap
+    """No size cap by default (owner's order): a session far past the old 120k cap
     still forks for workers and reviews; the run compacts in place if it must. A cap of 0 or below is none."""
     from ttp import coordsession
     p, d, cfg_dir, run = _fork_daemon(env, monkeypatch, tmp_path)
