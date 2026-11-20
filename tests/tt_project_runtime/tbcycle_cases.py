@@ -86,20 +86,20 @@ def test_terminalbench_a_newly_served_model_waits_new_model_h_then_runs_at_the_s
 
 
 def test_terminalbench_owner_schedule_is_additive_owner_only_and_follows_the_on_setting(env):
-    from ttp import benchowner
+    from ttp import modelbench
     p = make(env)
     sched = lambda n: p.db.one("SELECT enabled, every_s, payload FROM schedules WHERE name=?", (n,))
-    assert benchowner.ensure_tb(p, p.db, False, True) == "", "a non-owner with no schedule: nothing"
-    assert benchowner.ensure_tb(p, p.db, True, True) == "on"
-    row = sched(benchowner.TB_SCHEDULE)
+    assert modelbench.ensure_tb(p, p.db, False, True) == "", "a non-owner with no schedule: nothing"
+    assert modelbench.ensure_tb(p, p.db, True, True) == "on"
+    row = sched(modelbench.TB_SCHEDULE)
     assert row["enabled"] and row["every_s"] == 3600
     assert json.loads(row["payload"])["command"] == "ttp model-bench terminalbench --detach"
-    assert sched(benchowner.SCHEDULE) is None, "separate from the daily model-bench schedule"
-    assert benchowner.ensure_tb(p, p.db, True, True) == "", "unchanged: no rewrite"
-    assert benchowner.ensure_tb(p, p.db, True, False) == "off", "model_bench.terminalbench.on false"
-    assert benchowner.ensure_tb(p, p.db, True, True) == "on"
-    assert benchowner.ensure_tb(p, p.db, False, True) == "off", "the lease moved away"
-    assert not sched(benchowner.TB_SCHEDULE)["enabled"]
+    assert sched(modelbench.SCHEDULE) is None, "separate from the daily model-bench schedule"
+    assert modelbench.ensure_tb(p, p.db, True, True) == "", "unchanged: no rewrite"
+    assert modelbench.ensure_tb(p, p.db, True, False) == "off", "model_bench.terminalbench.on false"
+    assert modelbench.ensure_tb(p, p.db, True, True) == "on"
+    assert modelbench.ensure_tb(p, p.db, False, True) == "off", "the lease moved away"
+    assert not sched(modelbench.TB_SCHEDULE)["enabled"]
 
 
 def test_terminalbench_detached_child_keeps_its_action_and_models():
@@ -252,8 +252,8 @@ def test_terminalbench_step_without_compose_stops_before_any_trial_with_one_mess
     err = capsys.readouterr().err.strip()
     assert len(err.splitlines()) == 1 and "docker compose is missing" in err
     assert started == [], "no step, no runner launched"
-    from ttp import benchowner, modelbench
-    assert json.loads((modelbench.home() / f"streak-{benchowner.TB_SCHEDULE}.json").read_text())["fails"] == 1, \
+    from ttp import modelbench
+    assert json.loads((modelbench.home() / f"streak-{modelbench.TB_SCHEDULE}.json").read_text())["fails"] == 1, \
         "the failure is counted"
 
 
@@ -533,7 +533,7 @@ def test_bench_parity_marks_rows_with_a_different_limit_task_set_or_rerun_rule_n
 
 def test_every_scheduled_bench_cycle_raises_one_event_naming_its_cause_on_the_third_failure_in_a_row(env, monkeypatch, capsys):
     import argparse as ap
-    from ttp import benchowner, cli, modelbench
+    from ttp import modelbench, cli
     d, cfg, clock, sleeps, sleep = _tb_setup(env, monkeypatch)
     p = make(env)
     events = lambda: [r["text"] for r in p.db.q("SELECT text FROM events WHERE source = 'model-bench'")]
@@ -564,7 +564,7 @@ def test_every_scheduled_bench_cycle_raises_one_event_naming_its_cause_on_the_th
         def fn():
             if fail:
                 cli.die("model-bench suite: no complete bench folder pair")
-        return lambda: cli._bench_cycle(p, benchowner.SUITE_SCHEDULE, clock["t"], fn)
+        return lambda: cli._bench_cycle(p, modelbench.SUITE_SCHEDULE, clock["t"], fn)
     for _ in range(3):
         with pytest.raises(SystemExit):
             suite(True)()
@@ -576,12 +576,12 @@ def test_every_scheduled_bench_cycle_raises_one_event_naming_its_cause_on_the_th
         raise RuntimeError("step broke")
     for _ in range(3):   # a Terminal-Bench step that crashes counts in the same streak as its pre-flight
         with pytest.raises(RuntimeError):
-            cli._bench_cycle(p, benchowner.TB_SCHEDULE, clock["t"], crash, dies=False)
+            cli._bench_cycle(p, modelbench.TB_SCHEDULE, clock["t"], crash, dies=False)
     ev = [t for t in events() if "terminalbench" in t]
     assert len(ev) == 1 and "RuntimeError: step broke" in ev[0], ev
     for _ in range(3):
         with pytest.raises(SystemExit):   # its pre-flight already counted a die: not counted twice
-            cli._bench_cycle(p, benchowner.TB_SCHEDULE, clock["t"] + 10, lambda: cli.die("off"), dies=False)
+            cli._bench_cycle(p, modelbench.TB_SCHEDULE, clock["t"] + 10, lambda: cli.die("off"), dies=False)
     assert json.loads((modelbench.home() / "streak-terminalbench.json").read_text())["fails"] == 3
 
 
@@ -708,15 +708,15 @@ def test_terminalbench_chat_model_withdrawn_mid_row_ends_the_row_after_the_bound
 
 
 def test_terminalbench_schedule_stays_off_while_held_and_once_turned_off_on_purpose(env):
-    from ttp import benchowner, schedule
+    from ttp import modelbench, schedule
     p = make(env)
-    sched = lambda: p.db.one("SELECT enabled FROM schedules WHERE name=?", (benchowner.TB_SCHEDULE,))
-    assert benchowner.ensure_tb(p, p.db, True, True) == "on"
-    assert benchowner.ensure_tb(p, p.db, True, True, hold="model_bench.hold is on") == "off"
-    assert benchowner.ensure_tb(p, p.db, True, True, hold="model_bench.hold is on") == "", "held: stays off"
-    assert benchowner.ensure_tb(p, p.db, True, True) == "on", "the hold ended: back on"
-    schedule.set_enabled(p.db, benchowner.TB_SCHEDULE, False)   # someone turns it off on purpose
-    assert benchowner.ensure_tb(p, p.db, True, True) == "" and not sched()["enabled"], "never re-enabled"
+    sched = lambda: p.db.one("SELECT enabled FROM schedules WHERE name=?", (modelbench.TB_SCHEDULE,))
+    assert modelbench.ensure_tb(p, p.db, True, True) == "on"
+    assert modelbench.ensure_tb(p, p.db, True, True, hold="model_bench.hold is on") == "off"
+    assert modelbench.ensure_tb(p, p.db, True, True, hold="model_bench.hold is on") == "", "held: stays off"
+    assert modelbench.ensure_tb(p, p.db, True, True) == "on", "the hold ended: back on"
+    schedule.set_enabled(p.db, modelbench.TB_SCHEDULE, False)   # someone turns it off on purpose
+    assert modelbench.ensure_tb(p, p.db, True, True) == "" and not sched()["enabled"], "never re-enabled"
 
 
 def _tb_refusing(pct, peaks=None):

@@ -71,13 +71,79 @@ later promise to the same chat with an earlier due) or justified on record (the 
 `obligation` action with `key` and `justify`, kept for that due). It never pages the user."""
 from __future__ import annotations
 
+import math
+import os
 import re
 import statistics
 import time
 from pathlib import Path
 
-from . import cells, etahist
+from . import cells
 from .util import task_labels
+
+# ETA statistics: percentiles, the spec-size bucket and the bounded load and queue-depth factors.
+
+MIN_SIZE = 5           # samples of one (kind, size) before it replaces the (kind, tier) samples
+SIZE_EDGES = (1500, 4000)   # spec characters: below the first is short, below the second medium
+SIZES = ("short", "medium", "long")
+MAX_LOAD_X = 1.5       # the most the host load adds to a run leg
+MAX_DEPTH_X = 2.0      # the most the queue depth adds to a queue-wait leg
+P90 = 0.9
+
+
+def pct(xs, q: float) -> float | None:
+    """The q-quantile (0..1, out of range clamped) of the finite numbers in `xs` by linear
+    interpolation; None for none. q=0.5 equals statistics.median."""
+    v = sorted(float(x) for x in xs or [] if isinstance(x, (int, float)) and not isinstance(x, bool)
+               and math.isfinite(x))
+    if not v:
+        return None
+    q = 0.0 if not isinstance(q, (int, float)) or q != q else min(1.0, max(0.0, float(q)))
+    k = (len(v) - 1) * q
+    lo = math.floor(k)
+    hi = min(lo + 1, len(v) - 1)
+    return v[lo] + (v[hi] - v[lo]) * (k - lo)
+
+
+def size_of(n) -> str:
+    """The size bucket of a spec of `n` characters (a spec text works too); a bad length is medium."""
+    if isinstance(n, str):
+        n = len(n)
+    if not isinstance(n, (int, float)) or isinstance(n, bool) or n != n or n < 0:
+        return SIZES[1]
+    return SIZES[0] if n < SIZE_EDGES[0] else SIZES[1] if n < SIZE_EDGES[1] else SIZES[2]
+
+
+def load_factor(per_core) -> float:
+    """The run-leg multiplier for a host load per core: 1.0 at or below one busy process per core, then
+    +0.25 per extra, at most MAX_LOAD_X. None or a bad number: 1.0."""
+    if not isinstance(per_core, (int, float)) or isinstance(per_core, bool) or per_core != per_core:
+        return 1.0
+    return min(MAX_LOAD_X, max(1.0, 1.0 + 0.25 * (float(per_core) - 1.0)))
+
+
+def depth_factor(queued, running) -> float:
+    """The queue-wait multiplier for `queued` tasks waiting against `running` workers: 1.0 up to one
+    queued task per running worker, then +1 per further worker's worth, at most MAX_DEPTH_X."""
+    try:
+        q, r = max(0, int(queued)), max(1, int(running))
+    except (TypeError, ValueError):
+        return 1.0
+    return min(MAX_DEPTH_X, max(1.0, 1.0 + (q - r) / r))
+
+
+def host_load() -> float | None:
+    """This host's 1-minute load per core, or None where it cannot be read or `TTP_ETA_LOAD=off`."""
+    raw = os.environ.get("TTP_ETA_LOAD")
+    if raw is not None:
+        try:
+            v = float(raw)
+        except ValueError:
+            return None   # `off` or anything unreadable: no adjustment
+        return v if math.isfinite(v) and v >= 0 else None
+    from . import hostload
+    ld = hostload.loads()
+    return ld[0] / max(1, os.cpu_count() or 1) if ld else None
 
 WINDOW_S = 14 * 86400
 LONG_H = 2.0
@@ -145,7 +211,7 @@ def history(db, now: float | None = None) -> dict:
         d = float(r["e"]) - float(r["s"])
         h["run"].setdefault((r["k"], r["tr"]), []).append(d)
         h["kind"].setdefault(r["k"], []).append(d)
-        h["size"].setdefault((r["k"], etahist.size_of(r["n"])), []).append(d)
+        h["size"].setdefault((r["k"], size_of(r["n"])), []).append(d)
     for r in db.q("SELECT t.kind k, t.spec spec, SUM(r.ended-r.started) d FROM runs r JOIN tasks t ON t.id=r.task "
                   "WHERE r.role!='coordinator' AND r.ended>? AND r.started IS NOT NULL AND r.ended>r.started "
                   "AND t.status='done' AND t.spec LIKE '%cells:%' GROUP BY t.id ORDER BY t.id DESC LIMIT ?",
@@ -276,7 +342,7 @@ class _Est:
         one). `load`: this host's load per core (AUTO: read it, None: no adjustment); `depth`: (queued,
         running) workers (AUTO: counted from the database)."""
         self.db, self.now, self.q = db, now, q
-        self.load = etahist.host_load() if load is AUTO else load
+        self.load = host_load() if load is AUTO else load
         self._depth_in = depth
         self._hi = None
         self.delivery = delivery or {}   # the project's delivery config: push_batch_max, push_age_s (_push_ahead)
@@ -291,13 +357,13 @@ class _Est:
 
     def _m(self, xs: list[float]) -> float | None:
         """The leg statistic of samples `xs`: their q-quantile (the median at q=0.5)."""
-        return etahist.pct(xs, self.q)
+        return pct(xs, self.q)
 
     def _loadx(self) -> float:
-        return etahist.load_factor(self.load)
+        return load_factor(self.load)
 
     def _depthx(self) -> float:
-        """The queue-wait multiplier of the runnable queued tasks against the running workers (etahist)."""
+        """The queue-wait multiplier of the runnable queued tasks against the running workers (depth_factor)."""
         if self._depth_in is AUTO:
             try:
                 qd = self.db.one("SELECT COUNT(*) n FROM tasks WHERE status='queued' AND (depends_on IS NULL OR "
@@ -306,13 +372,13 @@ class _Est:
             except Exception:
                 qd = rn = 0
             self._depth_in = (qd, rn)
-        return etahist.depth_factor(*self._depth_in)
+        return depth_factor(*self._depth_in)
 
     def p90(self, tid: int) -> float | None:
         """The conservative end of task `tid`: the same walk with every leg at its 90th percentile (None
         when it has no estimate)."""
         if self._hi is None:
-            self._hi = _Est(self.db, self.now, self.h, self.core, self.delivery, etahist.P90, self.load,
+            self._hi = _Est(self.db, self.now, self.h, self.core, self.delivery, P90, self.load,
                             self._depth_in)
         e = self._hi.task(int(tid))
         return None if e["why"] or not e.get("end") else e["end"]
@@ -358,10 +424,10 @@ class _Est:
         return self._none(tid, f"#{tid} is held by the spend cap until {clears}")
 
     def _run(self, t: dict) -> list[float]:
-        """The run samples of a task: its kind and size when there are etahist.MIN_SIZE of them, else its
+        """The run samples of a task: its kind and size when there are MIN_SIZE of them, else its
         kind and tier, else its kind."""
-        by_size = (self.h.get("size") or {}).get((t["kind"], etahist.size_of(t.get("spec") or "")))
-        if by_size and len(by_size) >= etahist.MIN_SIZE:
+        by_size = (self.h.get("size") or {}).get((t["kind"], size_of(t.get("spec") or "")))
+        if by_size and len(by_size) >= MIN_SIZE:
             return by_size
         return self.h["run"].get((t["kind"], t["tier"])) or self.h["kind"].get(t["kind"]) or []
 

@@ -32,7 +32,7 @@ def test_queue_wait_fires_on_a_full_checks_queue_with_options_then_clears(env):
     """Criterion: '4 running (cap 4), 20 queued' with a task of this project queued 40 min raises one must-act
     item naming the queue, cap, occupancy, holders and options; the same mark never raises twice; an end
     of the wait settles it and the daily metric counts it."""
-    from ttp import mustact, pagesev, queuewait
+    from ttp import mustact, alerts, queuewait
     p = make(env)
     now = time.time()
     host = _qw_host(p, now, now - 40 * 60)
@@ -41,7 +41,7 @@ def test_queue_wait_fires_on_a_full_checks_queue_with_options_then_clears(env):
     assert len(fps) == 1 and queuewait.scan(p, QW_CFG, now + 60, host, cores=64) == []
     ev = _qw_events(p)[0]
     assert ev["kind"] in mustact.KINDS and ev["task"] == 7
-    assert ev["severity"] == "normal" and pagesev.rides_along(ev)   # every host slot taken: host-held
+    assert ev["severity"] == "normal" and alerts.rides_along(ev)   # every host slot taken: host-held
     t = ev["text"]
     assert "qwait-7-checks" in t and "41 min" in t and "4 running (cap 4), 20 queued" in t, t   # as of the rescan
     assert "other task #90" in t and "raise the host-wide checks cap from 4 to 6 (host limit 8)" in t, t
@@ -599,7 +599,7 @@ def test_queue_wait_raises_again_only_on_a_changed_cause_or_a_doubled_wait(env):
 def test_queue_wait_checks_wait_with_a_free_slot_is_not_host_held(env):
     """A checks wait while a host slot is free is no host hold: it is raised high and starts a turn; with
     every slot taken it is raised at normal and rides along."""
-    from ttp import pagesev, queuewait
+    from ttp import alerts, queuewait
     p = make(env)
     now = time.time()
     tid = p.db.add_task("t", "s", kind="code")
@@ -608,7 +608,7 @@ def test_queue_wait_checks_wait_with_a_free_slot_is_not_host_held(env):
             "queued": lab, "queued_at": [now - 40 * 60]}
     queuewait.scan(p, QW_CFG, now, free)
     ev = _qw_events(p)[0]
-    assert ev["severity"] == "high" and not pagesev.rides_along(ev)
+    assert ev["severity"] == "high" and not alerts.rides_along(ev)
     assert not queuewait.host_held({"queue": "checks", "cap": 4, "running": ["a"]})
     assert queuewait.host_held({"queue": "checks", "cap": 4, "running": ["a"] * 4})
     assert queuewait.host_held({"queue": "checks", "cap": None, "running": []})

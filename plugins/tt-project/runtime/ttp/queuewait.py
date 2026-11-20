@@ -23,7 +23,7 @@ queue is one episode (`<task>:<queue>`) from its earliest start, so a start that
 never reopens it; it ends only after GRACE_S with no sign of the wait. Not acted on, it is raised again only
 when its cause (queue, resource, host-held, options left) changes or the wait has doubled since the last raise.
 A checks wait the host-wide checks slots hold (host_held: no coordinator action lifts it) is raised at normal
-and rides along (pagesev.RIDE_ALONG). With no option left the user is told once. Once the episode ends its
+and rides along (alerts.RIDE_ALONG). With no option left the user is told once. Once the episode ends its
 open events are settled. daily_line() is the daily review's metric.
 Each event's data carries `fold` (FOLD): the parts the coordinator's NEW EVENTS joins into one line per queue.
 An act on a wait's item with no fix owner also answers its queue's cause (the KV's `answers`: the cap and whether
@@ -505,7 +505,7 @@ def _settle(db, ep: str) -> None:
 def scan(p, cfg: dict, now: float | None = None, host: dict | None = None, device: set | None = None,
          cores: int = 0, hold=None) -> list[str]:
     """Raise, re-raise and clear queue-wait items; returns the fingerprints raised. `hold`: collect's."""
-    from . import pagesev
+    from . import alerts
     now = time.time() if now is None else now
     db, thr = p.db, threshold_s(cfg)
     if thr <= 0:
@@ -573,7 +573,7 @@ def scan(p, cfg: dict, now: float | None = None, host: dict | None = None, devic
         data = {"must_act": {"key": k, "chat": "all", "tasks": [w["task"]], "kind": KIND, "episode": ep},
                 FOLD: fold(w, opts, now, note)}
         if held:
-            data[pagesev.RIDE_ALONG] = True   # no coordinator action lifts it: joins the next turn
+            data[alerts.RIDE_ALONG] = True   # no coordinator action lifts it: joins the next turn
         # the episode's open time keeps a later episode of the same task and queue off this one's fingerprints
         fp = f"{KIND}:{ep}:{int(rec.get('opened') or rec['since'])}:{n}"
         if len(raised) < MAX_RAISE and obligations._raise(db, now, fp, KIND, msg, w["task"], data,

@@ -539,7 +539,7 @@ coordinator with that evidence.
   change add ... --expect <fingerprint|down|held>`); and a review's failed hand-off counts once, as
   "failed review". `coordinator.effort_skip_triggers` (none by default) lists trigger labels, as
   recorded in the note, that never count.
-  Three daemon events that rarely need a decision are high only when it matters (pagesev.py). A
+  Three daemon events that rarely need a decision are high only when it matters (alerts.py). A
   done task's `continue:` follow-up no task took up (`continue_unqueued`) is normal and rides
   along with the next turn due anyway, at most an hour later. A task the daemon or the push queue
   blocks (`task_blocked`) is normal; the same task blocked again for the same reason within 6 h is
@@ -991,7 +991,7 @@ coordinator with that evidence.
   from `waiting_since` in the hand-off, from the line's time in `ttp progress report ... --expected-wait-s
   <n> --eta-basis "<how measured>"`): the finish is that long after, with the same rules; one already
   past gives no finish.
-- ETA numbers from history (eta.py, etahist.py, `ttp eta`): the likely time is the p50 of this project's
+- ETA numbers from history (eta.py, `ttp eta`): the likely time is the p50 of this project's
   last 14 days, the conservative time the p90, both by task kind and size, for run time, queue wait,
   review, landing and push batches. Size is the spec length (short under 1500 characters, medium under
   4000, long above): a task's run samples are those of its kind and size once there are 5, else its kind
@@ -1241,27 +1241,14 @@ model, never Anthropic. `score <dir> <item>
 that the labels reproduce from the seed, then writes the labels, seed and per-arm totals into
 batch.json, so the scores can be audited. After that the batch takes no more scores.
 
-### Effort A/B for standard-tier code tasks
+### Jev's effort pick for standard-tier code tasks
 
-Standard code runs default to high effort. To measure whether medium effort holds quality, the A/B
-runs by default (`effort_ab.enabled`, on unless a project sets it to false; a coordinator may set it
-from chat). Each code task queued at standard with no effort pin of its own then goes in the `high` or
-`medium` arm, by a hash of its lineage's first task id. Its retries, review fixes and continuations
-keep that arm. The arm changes only standard-tier runs whose tier effort is high; a deep retry still
-runs at max. Each run's note records the arm (`effort_ab`).
-
-`ttp stats <name> --effort-ab --days 30` compares the arms: cost per landed change, output tokens
-and model calls per run, thinking tokens (n/a where the provider's usage does not break them out), review and checks fail rates, fix-review hops and tier-up retries.
-End rule: make medium the standard effort (`providers.<p>.tiers.standard.effort medium`) only once
-each arm has at least 60 landed changes and medium's review and checks fail rates are each no more
-than 3 points worse than high's; otherwise keep high. The report prints which applies, and the
-daemon applies it: it records the winner (`effort_ab.winner`), turns the split off and runs code tasks
-the A/B covered at the winning effort.
-
-After the A/B, `effort_ab.jev_pick true` lets Jev choose medium or high per code task from its
-spec instead (once per lineage; the tier's effort when Jev is off or does not answer). Its pick goes
-in the run note and in Jev's call log, which records the task's outcome. It is off by default and
-yields to the A/B while that is on.
+Standard code runs default to high effort. `effort_ab.jev_pick true` lets Jev choose medium or high
+per code task queued at standard with no effort pin of its own, from its spec (once per lineage; the
+tier's effort when Jev is off or does not answer). The pick changes only standard-tier runs whose tier
+effort is high; a deep retry still runs at max. Its pick goes in the run note (`effort_ab`) and in
+Jev's call log, which records the task's outcome. It is off by default; a coordinator may set it from
+chat.
 
 Standard code tasks take Sonnet at high effort by kind (`route.code_sonnet`; a canary share of 0.2 by
 default, `share 1` for all). Set it for every project with `ttp config --account route.code_sonnet
@@ -1772,7 +1759,7 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    more runs later, parks it for a week with one low alert; then it is tried again from scratch.
    One shared daily bench per machine (`ttp model-bench run`, `runtime/ttp/modelbench.py`) keeps these
    verdicts current. One project on the machine owns it (`~/.tt-project/model-bench/owner.json`,
-   `runtime/ttp/benchowner.py`): at first the first eligible project by name, where eligible means a live
+   `runtime/ttp/modelbench.py`): at first the first eligible project by name, where eligible means a live
    daemon, a `chat` endpoint, not paused and no `model_bench.opt_out`. The owner keeps a model-free command
    schedule `model-bench` that starts `ttp model-bench run --detach` daily at `model_bench.bench_at`
    (default 02:00 home time); every other project's is off. Every daemon checks the lease hourly without a
@@ -4662,8 +4649,7 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   `both_hold` text that permits what it bans), or `over` retires one, the daemon queues one
   priority-1 harness task per change naming the project's tools (bin/, hooks/, schedule commands,
   prechecks and heal checks, open tasks' `start_when` probes) that still carry the old item's terms,
-  and a `restriction_tools` event says so; the digest shows a "Guards behind the charter" line while
-  that task is open. It never edits a tool. A tool is picked only by the item's distinctive terms:
+  and a `restriction_tools` event says so. It never edits a tool. A tool is picked only by the item's distinctive terms:
   identifiers, quoted phrases, user-message cites (#N), values with a unit (900 W), machine and
   resource names, or two of its words with one rare in the tool tree. The harness's own words
   (item, Restrictions, scope, limit, exception) never count, and for a removed item neither does a

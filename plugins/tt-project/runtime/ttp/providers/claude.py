@@ -603,9 +603,6 @@ class Claude(Provider):
                 u.cache_write_tokens = int(usage.get("cache_creation_input_tokens") or 0)
                 if ids := model_usage_ids(ev):   # the model ids the run really used (pricing: daemon._list_cost)
                     u.extra["model_usage"] = ids
-                thinking = (usage.get("output_tokens_details") or {}).get("thinking_tokens")
-                if isinstance(thinking, int) and not isinstance(thinking, bool):
-                    u.extra["thinking_tokens"] = thinking   # part of output_tokens (effortab.report)
                 u.final_text = ev.get("result") if isinstance(ev.get("result"), str) else json.dumps(ev.get("result"))
                 u.structured = drop_nulls(ev.get("structured_output"), sparse=True)
                 if ev.get("is_error"):

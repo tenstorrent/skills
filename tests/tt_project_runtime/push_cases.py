@@ -22617,30 +22617,30 @@ def test_a_release_cut_whose_install_check_runs_through_ttp_can_move_the_channel
     """`ttp install-check <commit>` fetches the project's own installer at that commit and runs it in a
     fresh HOME model-free: the run stays unmarked, the result names the commit, exit code and installed
     version, and the cut then moves its channel tag. A failing installer records a fail."""
-    from ttp import coordinator as coord, coordtools, hook, installcheck, untrusted
+    from ttp import coordinator as coord, coordtools, hook, release, untrusted
     p, repo, origin, c = _channel_setup(env, monkeypatch)
     assert coord.apply(p, [{"type": "config_set", "key": "delivery.channel_tags", "value": ["chan"]}]) == []
     run = tmp_path / "run"
     run.mkdir()
     monkeypatch.setenv("TTP_RUN_DIR", str(run))
     monkeypatch.setenv(coordtools.ROLE_ENV, "worker")
-    monkeypatch.setattr(installcheck, "slug", lambda repo, cfg: "o/r")
+    monkeypatch.setattr(release, "install_slug", lambda repo, cfg: "o/r")
     urls = []
-    monkeypatch.setattr(installcheck, "_fetch", lambda url, dest: (urls.append(url), dest.write_text(_FAKE_INSTALLER)))
+    monkeypatch.setattr(release, "_install_fetch", lambda url, dest: (urls.append(url), dest.write_text(_FAKE_INSTALLER)))
     hook.mark_untrusted({"tool_name": "Bash", "tool_input": {"command": f"ttp install-check {c['M']}"}}, str(run))
     assert _ttp("install-check", c["M"]) == 0
     assert "install check passed" in capsys.readouterr().out
-    rec = json.loads((run / installcheck.RESULT).read_text())
+    rec = json.loads((run / release.INSTALL_RESULT).read_text())
     assert rec["passed"] and rec["rc"] == 0 and rec["commit"] == c["M"] and c["M"][:12] in rec["version"]
     assert urls == [f"https://raw.githubusercontent.com/o/r/{c['M']}/plugins/tt-project/install.sh"]
-    assert json.loads((p.state / installcheck.LOG).read_text().splitlines()[-1])["commit"] == c["M"]
+    assert json.loads((p.state / release.INSTALL_LOG).read_text().splitlines()[-1])["commit"] == c["M"]
     assert untrusted.marked(run) == [] and not untrusted.active(dict(os.environ))
     assert _ttp("push", "--move-tag", "chan", c["M"]) == 0, capsys.readouterr().err
     assert _git_out(origin, "rev-parse", "chan") == c["M"]
     monkeypatch.setenv("FAKE_RC", "1")
     assert _ttp("install-check", c["M"]) == 1
     assert "install check FAILED" in capsys.readouterr().out
-    assert json.loads((run / installcheck.RESULT).read_text())["rc"] == 1
+    assert json.loads((run / release.INSTALL_RESULT).read_text())["rc"] == 1
 
 
 def test_a_release_cut_that_downloads_the_installer_itself_is_still_refused_every_tag(env, monkeypatch, tmp_path, capsys):
@@ -22668,15 +22668,15 @@ def test_a_release_cut_that_downloads_the_installer_itself_is_still_refused_ever
 
 
 def test_the_install_check_reads_its_repository_only_from_a_github_remote(tmp_path):
-    from ttp import installcheck
+    from ttp import release
     repo = tmp_path / "r"
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
-    assert installcheck.slug(repo, {}) == ""
+    assert release.install_slug(repo, {}) == ""
     subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", "https://github.com/o/r.git"], check=True)
-    assert installcheck.slug(repo, {}) == "o/r"
+    assert release.install_slug(repo, {}) == "o/r"
     subprocess.run(["git", "-C", str(repo), "remote", "set-url", "origin", "https://example.com/o/r.git"], check=True)
-    assert installcheck.slug(repo, {}) == ""
-    rec = installcheck.run(None, repo, "HEAD", tmp_path / "out")
+    assert release.install_slug(repo, {}) == ""
+    rec = release.install_check(None, repo, "HEAD", tmp_path / "out")
     assert not rec["passed"] and "no commit" in rec["error"]
 
 

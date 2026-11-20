@@ -2267,13 +2267,6 @@ def cmd_stats(a) -> None:
         s = glmshare.report(p, _stats_time(a.since, tz, "--since") or until - a.days * 86400, until)
         print(json.dumps(s, indent=1) if a.json else glmshare.text(s))
         return
-    if a.effort_ab:
-        from . import effortab
-        tz = timefmt.home(p)
-        s = effortab.report(p, a.days, _stats_time(a.since, tz, "--since"), _stats_time(a.until, tz, "--until"))
-        s["winner"] = effortab.winner(p.config())
-        print(json.dumps(s, indent=1) if a.json else effortab.report_text(s))
-        return
     if a.landing:
         from . import trainstats
         from . import landed
@@ -8518,11 +8511,11 @@ def cmd_killscan(a) -> None:
     running them: such a kill can match the worker's own tool shell. Exits 1 when one is found.
     `--shim <dir>` writes logging stand-ins for those commands; put <dir> first on PATH to run the
     script without them killing anything."""
-    from . import killscan
+    from . import svcscan
     if a.shim:
         folder = Path(a.shim).resolve()
-        killscan.write_shims(folder)
-        print(f"shims for {', '.join(killscan.SHIMMED)} in {folder}; calls are logged to "
+        svcscan.write_kill_shims(folder)
+        print(f"shims for {', '.join(svcscan.KILL_SHIMMED)} in {folder}; calls are logged to "
               f"{folder / 'killscan.log'}. Run the script with: PATH={shlex.quote(str(folder))}:\"$PATH\" <script>")
     hits = 0
     for name in a.files:
@@ -8530,7 +8523,7 @@ def cmd_killscan(a) -> None:
             text = Path(name).read_text(errors="replace")
         except OSError as e:
             die(f"ttp killscan: cannot read {name}: {e.strerror or e}")
-        for n, reason, line in killscan.scan(text):
+        for n, reason, line in svcscan.kill_scan(text):
             hits += 1
             print(f"{name}:{n}: {reason}: {line}")
     if a.files:
@@ -9443,13 +9436,13 @@ def cmd_land(a) -> None:
 
 
 def cmd_express(a) -> None:
-    """Land one small, urgent, reviewed head alone, ahead of the push queue (express.py): 0 started or
+    """Land one small, urgent, reviewed head alone, ahead of the push queue (pushq.py): 0 started or
     landed, 2 refused (each reason printed), 1 failed."""
-    from . import express
+    from . import pushq
     p = here()
     if not p:
         die("ttp express: no project here (run it in a project or with TTP_PROJECT set)")
-    sys.exit(express.main(p, a.ref, a.why, dry_run=a.dry_run, wait_s=a.wait))
+    sys.exit(pushq.express_main(p, a.ref, a.why, dry_run=a.dry_run, wait_s=a.wait))
 
 
 def cmd_model_bench(a) -> None:
@@ -9485,7 +9478,7 @@ def cmd_model_bench(a) -> None:
         print(f"model {a.action if a.action != 'run' else 'bench'} started (pid {child.pid}; log {log})", file=sys.stderr)
         return
     now = _t.time()
-    from .benchowner import SCHEDULE, SUITE_SCHEDULE, TB_SCHEDULE
+    from .modelbench import SCHEDULE, SUITE_SCHEDULE, TB_SCHEDULE
     if a.action == "suite":
         if a.dry_run or getattr(a, "reaudit", False) or getattr(a, "reference_from", None):
             return _model_suite(p, a, now)
@@ -9519,24 +9512,24 @@ class _LastLine:
 
 
 def _bench_cycle(p, schedule: str, now: float, fn, dies: bool = True):
-    """Run one cycle of the bench owner's `schedule` and count it in benchowner.streak: an exception, a
+    """Run one cycle of the bench owner's `schedule` and count it in modelbench.streak: an exception, a
     non-zero exit (only with `dies`; the cause is the last line it printed to stderr) or a returned cause (a
     string) is a failure, None a pass, and a skip (`fn` returns False) leaves the count alone."""
-    from . import benchowner
+    from . import modelbench
     tee = sys.stderr = _LastLine(sys.stderr)
     try:
         got = fn()
     except SystemExit as e:
         if dies and e.code not in (0, None):
-            benchowner.streak(p, schedule, tee.last.removeprefix("ttp: ") or f"exit {e.code}", now)
+            modelbench.streak(p, schedule, tee.last.removeprefix("ttp: ") or f"exit {e.code}", now)
         raise
     except Exception as e:
-        benchowner.streak(p, schedule, f"{type(e).__name__}: {e}", now)
+        modelbench.streak(p, schedule, f"{type(e).__name__}: {e}", now)
         raise
     finally:
         sys.stderr = tee.inner
     if got is not False:
-        benchowner.streak(p, schedule, got if isinstance(got, str) else "", now)
+        modelbench.streak(p, schedule, got if isinstance(got, str) else "", now)
 
 
 def _model_bench_argv(a) -> list[str]:
@@ -9556,12 +9549,12 @@ def _model_bench_argv(a) -> list[str]:
 
 def _terminalbench(p, a, now: float) -> None:
     """`ttp model-bench terminalbench`: the model-free step, or (--runner) one model's paced runner (tbcycle.py)."""
-    from . import benchowner, endpoint, harborslice, tbcycle
+    from . import modelbench, endpoint, harborslice, tbcycle
     cfg = p.config()
     if not tbcycle.settings(cfg)["on"]:
         die("model-bench terminalbench: off (model_bench.terminalbench.on is false)")
-    if not getattr(a, "reference", False) and (why := benchowner.held(cfg, now)):
-        print(json.dumps({"held": why}))   # a normal run that starts nothing (benchowner.held)
+    if not getattr(a, "reference", False) and (why := modelbench.held(cfg, now)):
+        print(json.dumps({"held": why}))   # a normal run that starts nothing (modelbench.held)
         return
     if getattr(a, "reference", False):
         return _terminalbench_reference(p, a, cfg)
@@ -9583,7 +9576,7 @@ def _terminalbench(p, a, now: float) -> None:
         if extra is None:
             fail(why)
         print(json.dumps({"model": a.runner, "trials": tbcycle.runner(
-            cfg, a.runner, {**env, **extra}, stop=lambda: benchowner.trial_stop(p),
+            cfg, a.runner, {**env, **extra}, stop=lambda: modelbench.trial_stop(p),
             rerun_server=max(0, int(getattr(a, "rerun_server", 0) or 0)))}))
         return
     extra, why = tbcycle.compose(cfg)
@@ -9601,7 +9594,7 @@ def _terminalbench_reference(p, a, cfg: dict) -> None:
     A model in reference.bridge goes through the claude CLI, one in reference.chat through the chat endpoint's
     relay, and neither needs a reference endpoint; any other needs the saved one: none saved, one plain line,
     nothing started."""
-    from . import benchowner, endpoint, harborslice, tbcycle
+    from . import modelbench, endpoint, harborslice, tbcycle
     st = tbcycle.settings(cfg)
     ref = st["reference"]
     alias = ref["endpoint"]
@@ -9620,7 +9613,7 @@ def _terminalbench_reference(p, a, cfg: dict) -> None:
         if extra is None:
             die(f"model-bench terminalbench --reference: {why}")
         print(json.dumps({"model": a.runner, "reference": True, "trials": tbcycle.ref_runner(
-            cfg, a.runner, {**env, **extra}, stop=lambda: benchowner.trial_stop(p))}))
+            cfg, a.runner, {**env, **extra}, stop=lambda: modelbench.trial_stop(p))}))
         return
     ids = None
     if got:
@@ -13156,7 +13149,7 @@ def cmd_config(a) -> None:
     if a.chat_settable:
         return cmd_chat_settable(a.name, a.key)
     if a.account:
-        if a.value is not None:
+        if a.value is not None or a.add is not None:
             die("usage: ttp config --account KEY [VALUE]")
         from .coordinator import NEEDS_USER
         if run and a.key is not None and a.name in NEEDS_USER:
@@ -13181,7 +13174,7 @@ def cmd_config(a) -> None:
     else:
         p = need(a.name, sys.argv[1:])
     if a.add is not None:
-        if a.value is not None or not a.key or a.account:
+        if a.value is not None or not a.key:
             die("usage: ttp config [NAME] KEY --add VALUE")
         node = p.config()
         for part in a.key.split("."):
@@ -13756,9 +13749,9 @@ def shim_text(python: str, launcher: Path, pinned_ok: bool = True) -> str:
 
 def cmd_install_check(a) -> None:
     """`ttp install-check [<commit>]`: a release cut's fresh one-line install, run model-free by ttp so the
-    run that reads the result stays unmarked and may move its channel tag (installcheck.py)."""
-    from . import installcheck
-    installcheck.command(a)
+    run that reads the result stays unmarked and may move its channel tag (release.py)."""
+    from . import release
+    release.install_command(a)
 
 
 def cmd_setup(a) -> None:
@@ -16424,7 +16417,7 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=checkplan.command)
 
     s = sub.add_parser("install-check", help="a release candidate's fresh one-line install, run by ttp itself in a "
-                                             "temporary HOME at a commit; records pass or fail (installcheck.py)")
+                                             "temporary HOME at a commit; records pass or fail (release.py)")
     s.add_argument("commit", nargs="?", default="HEAD", help="the candidate commit (default HEAD)")
     s.add_argument("--out", help="folder for the result, log and temp HOME (default: the run folder, else a temp dir)")
     s.set_defaults(fn=cmd_install_check)
@@ -16554,9 +16547,6 @@ def main(argv: list[str] | None = None) -> None:
                         "in-turn dry run and refused after the turn, over --days")
     s.add_argument("--wakes", action="store_true",
                    help="task wakes per day by reason instead: runs, $, re-waits and who chose the tier")
-    s.add_argument("--effort-ab", action="store_true",
-                   help="the effort A/B instead (effort_ab.enabled): per arm, $ per landed change, output tokens and "
-                        "calls per run, review and checks fail rates, fix-review hops, tier-up retries, end rule")
     s.add_argument("--chat", action="store_true",
                    help="coordinator chat posts instead, per chat: sent at once, held for the digest, digests "
                         "posted and held now (coordinator.chat_digest_h)")

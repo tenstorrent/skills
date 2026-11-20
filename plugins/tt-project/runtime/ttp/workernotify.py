@@ -1,6 +1,6 @@
 """A worker's normal `ttp notify` from a run that ended blocked, waiting, failed or needs_review goes
 to the coordinator first, so it cannot duplicate or contradict what the coordinator then tells the user.
-It is queued as a ride-along `worker_notify` event (pagesev.RIDE_ALONG: it joins the turn the run's
+It is queued as a ride-along `worker_notify` event (alerts.RIDE_ALONG: it joins the turn the run's
 hand-off starts, never one of its own) and kept in a kv list. The coordinator takes it up by an ask,
 reply or notify naming the task (#<id>), or drops it with a task_update whose text starts DROPPED
 (handled). Otherwise, once notify.hold_s has passed, post_due posts it unchanged and model-free. The
@@ -24,7 +24,7 @@ import json
 import re
 import time
 
-from . import pagesev
+from . import alerts
 
 KIND = "worker_notify"
 KV = "worker_notify_hold"   # kv: [{event, task, text, severity, due}] notifies held for the coordinator
@@ -91,7 +91,7 @@ def _hold(db, task: dict, text: str, end: str, hold_for: float, now: float, fp: 
             f"first, or drop it with task_update #{task['id']} text '{DROPPED} <why>'.")
     eid = db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?,?)",
                (now, f"worker:{task['id']}", KIND, fp, "normal", body[:4000],
-                json.dumps({pagesev.RIDE_ALONG: True, "task": task["id"], "text": text}), "queued", task["id"]))
+                json.dumps({alerts.RIDE_ALONG: True, "task": task["id"], "text": text}), "queued", task["id"]))
     db.set_kv(KV, _entries(db) + [{"event": eid, "task": task["id"], "text": text, "severity": "normal",
                                     "due": now + hold_for}])
 
@@ -145,7 +145,7 @@ def release_unqueued(db, task_id: int, now: float | None = None) -> int:
     with db.tx():
         evs = db.q("SELECT severity, data FROM events WHERE task=? AND status='queued' AND kind!=?",
                    (task_id, KIND))
-        if any(not pagesev.rides_along(dict(e)) for e in evs):
+        if any(not alerts.rides_along(dict(e)) for e in evs):
             return 0
         entries = _entries(db)
         return _post(db, entries, [e for e in entries if e.get("task") == task_id], now)
