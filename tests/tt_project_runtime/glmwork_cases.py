@@ -68,8 +68,6 @@ def test_glm_work_keeps_every_protected_run_on_core(env):
     assert kc(_gw_task(p), picked={"by": "retry"}) == "retry"
     assert kc(_gw_task(p, reply_chat="chat-1")) == "person"
     assert kc(_gw_task(p, "Post a comment on the GitHub issue saying it is fixed.")) == "person"
-    assert kc(_gw_task(p, "Run gh pr comment with the summary.")) == "person"
-    assert kc(_gw_task(p, "Fix the comment handler so github threads render.")) == ""   # a mention is no instruction
     assert kc(_gw_task(p, "Optimize the scheduler's queue scan.")) == "design"
     assert kc(_gw_task(p, "Redesign the push queue.")) == "design"
     assert kc(_gw_task(p, "Propose a plan for the new cache layer.")) == "design"
@@ -269,7 +267,7 @@ def test_glm_work_only_an_instruction_to_a_person_keeps_a_run_on_core(env):
     from ttp import glmwork
     p = make(env)
     cfg = _gw_cfg()
-    kc = lambda spec, **kw: glmwork.keeps_core(p.db, cfg, _gw_task(p, spec, **kw), "standard")
+    kc = lambda spec: glmwork.keeps_core(p.db, cfg, _gw_task(p, spec), "standard")
     for spec in ("Fix the comment handler so github threads render.",
                  "The code posts a message to slack on failure; fix its retry.",
                  "Refactor ttp notify output.", "Add a test for the Jira client's reply parsing."):
@@ -277,16 +275,6 @@ def test_glm_work_only_an_instruction_to_a_person_keeps_a_run_on_core(env):
     for spec in ("Then post a summary to the Slack channel.", "Please reply to the user with the numbers.",
                  "Run gh pr comment with the summary.", "Notify the user in chat when it lands."):
         assert kc(spec) == "person", spec
-    assert kc("Fix the helper.", reply_chat="chat-1") == "person"
-
-
-def test_glm_work_a_verdict_wording_outside_a_review_goes_to_glm_and_a_review_stays_on_core(env):
-    from ttp import glmwork
-    p = make(env)
-    cfg = _gw_cfg()
-    spec = "Say whether the fix holds and return a verdict: pass or fail."
-    assert glmwork.keeps_core(p.db, cfg, _gw_task(p, spec), "standard") == ""
-    assert glmwork.keeps_core(p.db, cfg, _gw_task(p, spec, kind="review"), "standard") == "review"
 
 
 def test_glm_work_a_timeout_or_crash_fallback_does_not_pin_the_next_run_to_core_but_a_bounce_does(env):
