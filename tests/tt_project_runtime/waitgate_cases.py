@@ -1110,17 +1110,22 @@ def test_a_dormant_spec_edit_on_a_still_failing_wait_starts_no_turn_at_its_due_w
     assert not d.wake and "spec" not in d.reason, d
 
 
-@pytest.mark.parametrize("case", ["escalated", "woke_spec_pass", "answered", "failed_job"])
+@pytest.mark.parametrize("case", ["escalated", "spec_same_pass", "answered", "failed_job"])
 def test_a_dormant_spec_edit_still_wakes_with_wake_now_an_urgent_line_or_a_changed_result(env, tmp_path, case):
     # wake_now and an added `urgent:` line wake through the daemon's spec wake (an escalated wake); a probe
-    # pass under a changed spec carries that in its wake reason; a probe that answered wakes on its own path.
+    # pass under a changed spec wakes even with the answer its last turn saw; a probe that answered wakes.
     p = make(env)
+    from ttp import waitgate
     tid = _gate_task(p, tmp_path, note={"spec_sha": "old"})
     kw = {"probe": (1, "not yet"), "spec_sha": "new", "jev": _GateJev(needed=0.1)}
     if case == "escalated":
         _gate_set(p, tid, escalated_wake=True)
-    elif case == "woke_spec_pass":
-        _gate_set(p, tid, woke="probe passed, but its spec changed: act on what the change adds")
+    elif case == "spec_same_pass":   # a pass with the answer the last turn saw still applies the edit
+        hand = json.loads(p.db.task(tid)["result"])
+        _gate_set(p, tid, woke="probe passed")
+        gate = {"seen": waitgate.evidence(0, "done"), "key": waitgate.wait_key(hand)}
+        p.db.x("UPDATE runs SET note=? WHERE task=?", (json.dumps({"spec_sha": "old", "wake_gate": gate}), tid))
+        assert not _gate_decide(p, tid, probe=(0, "done"), spec_sha="old").wake   # unchanged spec: skipped
         kw["probe"] = (0, "done")
     elif case == "answered":
         kw["probe"] = (0, "job finished rc=0")

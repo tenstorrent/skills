@@ -374,8 +374,9 @@ def decide(p, cfg: dict, task: dict, prev: dict, now: float, probe: tuple | None
                      extra={"hold": "checks"})
     elif held and held[0] == "ended" and int(gate.get("end_skips") or 0) < int(s["max_skips"]):
         d = Decision(False, "rule", held[1], extra={"delay_s": 60.0, "hold": "checks", "ended": True})
-    # A plain spec edit is no event: it sleeps with the task and applies at the next real wake. Its
-    # wake_now or `urgent:` line wakes through the daemon's spec wake (escalated). [note 304aeeb6c165c1df]
+    # A plain spec edit is no event: it sleeps with the task and applies at the next real wake (a probe
+    # pass, even with an answer its last turn saw). Its wake_now or `urgent:` line wakes through the
+    # daemon's spec wake (escalated). [note 304aeeb6c165c1df]
     elif gate.get("seen") and seen and gate["seen"] != seen and not matchwait:
         d = Decision(True, "event", "its probe's answer changed since the gate's last skip")
     elif cap and hard:
@@ -391,7 +392,9 @@ def decide(p, cfg: dict, task: dict, prev: dict, now: float, probe: tuple | None
             d.reason = f"at the cap ({capped}): {got.reason}"[:300]
     elif woke == "probe passed":
         lg = last.get("wake_gate") if isinstance(last.get("wake_gate"), dict) else {}
-        if seen and lg.get("seen") == seen and lg.get("key") == wait_key(prev):
+        if spec_sha and last.get("spec_sha") and last["spec_sha"] != spec_sha:
+            d = Decision(True, "event", "its probe passed and its spec changed since the last turn")
+        elif seen and lg.get("seen") == seen and lg.get("key") == wait_key(prev):
             d = Decision(False, "rule", "its probe passed with the answer its last turn already saw and waited on")
         else:
             d = Decision(True, "event", "its probe passed")
