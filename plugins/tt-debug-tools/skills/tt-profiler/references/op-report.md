@@ -43,7 +43,14 @@ are inflated. The test has to iterate at least twice; analyse only the
 second iteration. This is not a `tt-perf-report` flag — it is how the test
 must be written.
 
-Device columns also count one-time weight preparation: `warm-window.md`.
+Device columns also count one-time weight preparation (permutes, tilizes),
+which can lead a whole-process ranking though it ran once. Unless the question
+is cold start or load time, run a warm-up forward, then
+`ttnn.synchronize_device(mesh)` and `ttnn.ReadDeviceProfiler(mesh)`, then one
+more forward, and analyse only that window. If the harness cannot draw that
+line, mark it with a Tracy signpost (`from tracy import signpost`;
+`signpost(header="warm")`) or keep rows whose `HOST START TS` is after the
+warm-up.
 
 ## Analyse
 
@@ -86,9 +93,6 @@ peers names the bound.
 | `NOC-stall` | BRISC and NCRISC both high, TRISC low. Data movement saturates the NoC. |
 | `under-parallelized` | Low `CORE COUNT` versus device grid, high per-core duration. Reach for sharding or a wider dispatch grid. |
 | `host-dominated` | `FW` short but `HOST DURATION [ns]` large past the first iteration. Points to Python or dispatch overhead, not the kernel. |
-
-`PM FPU UTIL (%)` is a perf-model estimate, not a measurement; see
-`perf-counters.md` for the measured per-engine counters.
 
 ## Matmul: op-level DRAM% × FLOPs%
 
