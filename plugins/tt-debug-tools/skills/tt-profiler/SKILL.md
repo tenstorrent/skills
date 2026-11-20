@@ -65,20 +65,17 @@ TT_METAL_DEVICE_PROFILER=1 ./build/programming_examples/profiler/test_full_buffe
 Post-processing knobs — `_SUM`, `_ACCUMULATE`, `_SYNC`,
 `_DISABLE_DUMP_TO_FILES`, `_DISABLE_PUSH_TO_TRACY`, `_CPP_POST_PROCESS`,
 `_TRACE_TRACKING`, `_PROGRAM_SUPPORT_COUNT` — in `references/capture.md`, along
-with the Tracy entry points (`python -m tracy`, `tracy-capture`).
+with the Tracy entry points (`python -m tracy`, `tracy-capture`) and long runs,
+traced replay and many-chip meshes, where the buffer overflows.
 
 For the workflow question "which op dominates?" the answer is the ranked
 `tt-perf-report` on the ops-perf-results CSV that Tracy writes with
 `-p -r -v -m pytest`, one folder per run under
 `generated/profiler/reports/<timestamp>/`. Recipe, pandas fallback and the
-per-RISC bottleneck tags: `references/op-report.md`. For measured FPU, SFPU and
-Math utilisation per op (not the estimated `PM FPU UTIL (%)`):
-`references/perf-counters.md`. NoC, DRAM and Ethernet bandwidth columns, which
-need tt-npe: `references/noc-bandwidth.md`.
-
-Profile a warm forward, not model load: `references/op-report.md`. Long runs,
-traced replay and many-chip meshes, where the buffer overflows:
-`references/capture.md`.
+per-RISC bottleneck tags, and profiling a warm forward rather than model load:
+`references/op-report.md`. For measured FPU, SFPU and Math utilisation per op
+(not the estimated `PM FPU UTIL (%)`): `references/perf-counters.md`. NoC, DRAM
+and Ethernet bandwidth columns, which need tt-npe: `references/noc-bandwidth.md`.
 
 In-kernel, after `#include <tools/profiler/kernel_profiler.hpp>`:
 
@@ -143,4 +140,3 @@ rather than assuming positions.
 
 **Volume.** `test_full_buffer` alone produces over 1.6 million rows. Filter by
 zone name and core before reading, and never open it whole in an agent context.
-

@@ -45,12 +45,11 @@ must be written.
 
 Device columns also count one-time weight preparation (permutes, tilizes),
 which can lead a whole-process ranking though it ran once. Unless the question
-is cold start or load time, run a warm-up forward, then
-`ttnn.synchronize_device(mesh)` and `ttnn.ReadDeviceProfiler(mesh)`, then one
-more forward, and analyse only that window. If the harness cannot draw that
-line, mark it with a Tracy signpost (`from tracy import signpost`;
-`signpost(header="warm")`) or keep rows whose `HOST START TS` is after the
-warm-up.
+is cold start or load time, end the warm-up with
+`ttnn.synchronize_device(mesh)` and `ttnn.ReadDeviceProfiler(mesh)`. If the
+harness cannot draw that line, mark it with a Tracy signpost
+(`from tracy import signpost`; `signpost(header="warm")`) or keep rows whose
+`HOST START TS` is after the warm-up.
 
 ## Analyse
 

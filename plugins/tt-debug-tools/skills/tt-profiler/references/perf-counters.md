@@ -20,11 +20,11 @@ python -m tracy -p -r --profiler-capture-perf-counters all --perf-counter-multip
 ```
 
 `fpu` captures the FPU, SFPU and Math counters in one pass; there is no `sfpu`
-group. `all` needs `--perf-counter-multipass`, which replays the workload once
-per pass, so every pass must run the same ops.
+group. All columns blank means no counters were captured: re-run with `fpu`.
+`all` needs `--perf-counter-multipass`, which replays the workload once per
+pass, so every pass must run the same ops.
 
-Counters are latched per kernel zone, not sampled over time. There is no
-per-microsecond view.
+Counters are latched per kernel zone, not sampled over time.
 
 ## Read the columns
 
@@ -35,9 +35,4 @@ per-microsecond view.
 | `Avg Math util on full grid (%)` | Math thread (TRISC1) | all math instructions |
 
 Each is busy cycles ÷ kernel cycles × 100, averaged over the cores that
-reported. A matmul reads high FPU and low SFPU; a norm or activation the
-reverse.
-
-## When the columns are blank
-
-All columns blank means the run captured no counters. Re-run with `fpu`.
+reported.
