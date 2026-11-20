@@ -565,16 +565,16 @@ def signals(g: dict, b: dict, before: dict, after: dict, corrections: int, st: d
     return out
 
 
-def _fmt(v) -> str:
+def _rate_txt(v) -> str:
     """A rate for a why line: '-' when unmeasured."""
     return "-" if v is None else f"{v:g}"
 
 
 def _says(s: dict) -> str:
     if s["signal"] == "user corrections":
-        return f"user corrections {s['glm']} in {CORR_DAYS} days (holds above {_fmt(s['advance'])})"
-    tail = "" if s["verdict"] == "unmeasured" else f", worse by {_fmt(s['worse_by'])}"
-    return f"{s['signal']} GLM {_fmt(s['glm'])} vs Claude {_fmt(s['base'])}{tail} ({s['verdict']})"
+        return f"user corrections {s['glm']} in {CORR_DAYS} days (holds above {_rate_txt(s['advance'])})"
+    tail = "" if s["verdict"] == "unmeasured" else f", worse by {_rate_txt(s['worse_by'])}"
+    return f"{s['signal']} GLM {_rate_txt(s['glm'])} vs Claude {_rate_txt(s['base'])}{tail} ({s['verdict']})"
 
 
 def judge(p, cfg: dict, now: float) -> dict:
@@ -614,9 +614,9 @@ def judge(p, cfg: dict, now: float) -> dict:
     sig = signals(g, b, before, after, corr, st)
     n = g["decided"]
     frm = datetime.datetime.fromtimestamp(lo, datetime.timezone.utc)
-    nums = (f"GLM {n} tasks with an outcome, first review pass {_fmt(g['first_pass_pct'])}%; Claude baseline "
+    nums = (f"GLM {n} tasks with an outcome, first review pass {_rate_txt(g['first_pass_pct'])}%; Claude baseline "
             f"{b['decided']} with an outcome since {frm:%Y-%m-%d %H:%M} UTC, first review pass "
-            f"{_fmt(b['first_pass_pct'])}%; "
+            f"{_rate_txt(b['first_pass_pct'])}%; "
             + "; ".join(_says(s) for s in sig))
     out = lambda state, why: {"state": state, "why": f"{why}; {nums}", "n": n, "signals": sig,   # noqa: E731
                               "glm_pct": g["first_pass_pct"], "base_pct": b["first_pass_pct"],
